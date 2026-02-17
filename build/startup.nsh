@@ -1,0 +1,4 @@
+FS0:
+cd EFI
+cd BOOT
+BOOTX64.EF
