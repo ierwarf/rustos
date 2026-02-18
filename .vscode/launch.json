@@ -2,11 +2,35 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Release",
+            "name": "QEMU (Release)",
             "type": "node-terminal",
             "request": "launch",
             "preLaunchTask": "Build OS",
-            "command": "exec /usr/bin/qemu-system-x86_64 -bios OVMF.fd -drive if=pflash,format=raw,readonly=on,file=OVMF.fd -drive file=fat:rw:build,format=raw -net none -m 1G -monitor none -debugcon stdio -global isa-debugcon.iobase=0xe9 -d int -D qemu_interrupt.log",
+            "command": "exec ./run.sh",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "KVM (Release)",
+            "type": "node-terminal",
+            "request": "launch",
+            "preLaunchTask": "Build OS",
+            "command": "exec ./run.sh -enable-kvm",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "QEMU x86 (Release)",
+            "type": "node-terminal",
+            "request": "launch",
+            "preLaunchTask": "Build OS",
+            "command": "exec ./run_x86.sh",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "KVM x86 (Release)",
+            "type": "node-terminal",
+            "request": "launch",
+            "preLaunchTask": "Build OS",
+            "command": "exec ./run_x86.sh -enable-kvm",
             "cwd": "${workspaceFolder}"
         }
     ]
