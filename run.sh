@@ -7,4 +7,4 @@ qemu-system-x86_64 \
     -net none \
     -m 1G \
     -monitor stdio \
-    -d int -D log.txt
+    -d int -D qemu_interrupt.log
