@@ -4,6 +4,5 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-uefi = "0.26"
-uefi-services = "0.23"
-xmas-elf = "0.9"
+uefi = { version = "0.36.1", features = ["alloc"] }
+xmas-elf = "0.10.0"
