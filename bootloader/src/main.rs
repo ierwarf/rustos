@@ -11,6 +11,7 @@ mod error;
 
 use crate::boot::boot_kernel;
 use crate::error::BootError;
+use raw_cpuid::CpuId;
 use uefi::prelude::*;
 
 #[entry]
@@ -20,6 +21,18 @@ fn main() -> Status {
     }
 
     uefi::println!("rustos bootloader started");
+
+    let cpuid = CpuId::new();
+
+    if let Some(topology) = cpuid.get_extended_topology_info() {
+        for level in topology {
+            uefi::println!(
+                "Level: {:?}, CPUs: {}",
+                level.level_type(),
+                level.processors()
+            );
+        }
+    }
 
     match boot_kernel() {
         Ok(()) => Status::SUCCESS,

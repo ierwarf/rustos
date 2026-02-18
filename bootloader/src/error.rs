@@ -11,9 +11,9 @@ pub enum BootError {
 impl BootError {
     pub const fn status(self) -> Status {
         match self {
-            Self::OpenFileSystem(status) | Self::ReadKernel(status) | Self::SegmentAlloc(status) => {
-                status
-            }
+            Self::OpenFileSystem(status)
+            | Self::ReadKernel(status)
+            | Self::SegmentAlloc(status) => status,
             Self::InvalidElf(_) => Status::LOAD_ERROR,
         }
     }

@@ -3,12 +3,13 @@
 ## 패키지 설치
 
 ```bash
-sudo update
+sudo apt update
 
 sudo apt install -y rustup
 
-rustup -y default nightly
-rustup -y component add rust-src llvm-tools-preview
+rustup default nightly
+rustup component add rust-src llvm-tools-preview
+rustup target add x86_64-unknown-uefi
 
 sudo apt install -y make qemu-system-x86 ovmf
 ```
