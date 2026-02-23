@@ -12,7 +12,7 @@
             "miDebuggerPath": "/usr/bin/gdb",
             "miDebuggerServerAddress": "localhost:1234",
             "debugServerPath": "${workspaceFolder}/run.sh",
-            "debugServerArgs": "-s -S",
+            "debugServerArgs": "-s -S -action reboot=shutdown -action shutdown=pause",
             "stopAtEntry": false,
             "externalConsole": false,
             "internalConsoleOptions": "openOnSessionStart",

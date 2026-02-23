@@ -19,12 +19,16 @@ pub fn print(s: &str) {
     }
 }
 
-pub fn println(s: &str) {
-    for byte in s.bytes() {
-        print_byte(byte);
-    }
-    print("\r\n");
+macro_rules! println {
+    () => {
+        $crate::debug::print_fmt(format_args!("\n"));
+    };
+    ($($arg:tt)*) => {
+        $crate::debug::print_fmt(format_args!("{}\n", format_args!($($arg)*)));
+    };
 }
+
+pub(crate) use println;
 
 struct DebugWriter;
 

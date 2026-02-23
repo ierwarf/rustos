@@ -3,19 +3,19 @@ use core::panic::PanicInfo;
 
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {
-    debug::println("");
-    debug::println("[PANIC]");
-    debug::print_fmt(format_args!("message: {}\r\n", info.message()));
+    debug::println!("");
+    debug::println!("[PANIC]");
+    debug::println!("message: {}", info.message());
 
     if let Some(location) = info.location() {
-        debug::print_fmt(format_args!(
-            "location: {}:{}:{}\r\n",
+        debug::println!(
+            "location: {}:{}:{}",
             location.file(),
             location.line(),
             location.column()
-        ));
+        );
     } else {
-        debug::println("location: <unknown>");
+        debug::println!("location: <unknown>");
     }
 
     loop {
