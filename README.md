@@ -1,8 +1,19 @@
-# 개요
+# 📖 개요
 
-Rust 를 활용한 생산적이고 효율적인 OS 개발 프로젝트입니다.
+- [📖 개요](#-개요)
+- [📦 패키지 설치](#-패키지-설치)
+- [🛠 Visual Studio code](#-visual-studio-code)
+  - [빌드 및 실행](#빌드-및-실행)
+  - [디버그](#디버그)
+- [🖥 터미널](#-터미널)
+  - [빌드 및 실행](#빌드-및-실행-1)
+  - [빌드 삭제](#빌드-삭제)
 
-## 패키지 설치
+</details>
+
+<br>
+
+# 📦 패키지 설치
 
 ```bash
 sudo apt update
@@ -16,7 +27,7 @@ rustup target add x86_64-unknown-uefi
 sudo apt install -y make qemu-system-x86 ovmf
 ```
 
-# Visual Studio code
+# 🛠 Visual Studio code
 
 ## 빌드 및 실행
 
@@ -38,7 +49,7 @@ sudo apt install -y make qemu-system-x86 ovmf
 
 <br>
 
-# 터미널
+# 🖥 터미널
 
 터미널에서 개발하는 것은 가급적 권장하지 않습니다.
 
