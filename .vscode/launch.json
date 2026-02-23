@@ -2,6 +2,40 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "QEMU (Debug)",
+            "type": "cppdbg",
+            "request": "launch",
+            "preLaunchTask": "Build OS (Debug Symbols)",
+            "program": "${workspaceFolder}/build/kernel.elf",
+            "cwd": "${workspaceFolder}",
+            "MIMode": "gdb",
+            "miDebuggerPath": "/usr/bin/gdb",
+            "miDebuggerServerAddress": "localhost:1234",
+            "debugServerPath": "${workspaceFolder}/run.sh",
+            "debugServerArgs": "-s -S",
+            "stopAtEntry": false,
+            "externalConsole": false,
+            "internalConsoleOptions": "openOnSessionStart",
+            "launchCompleteCommand": "None",
+            "setupCommands": [
+                {
+                    "description": "Keep breakpoints inserted while running",
+                    "text": "set breakpoint always-inserted on",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Allow pending breakpoints",
+                    "text": "set breakpoint pending on",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
             "name": "QEMU (Release)",
             "type": "node-terminal",
             "request": "launch",
@@ -15,22 +49,6 @@
             "request": "launch",
             "preLaunchTask": "Build OS",
             "command": "exec ./run.sh -enable-kvm",
-            "cwd": "${workspaceFolder}"
-        },
-        {
-            "name": "QEMU x86 (Release)",
-            "type": "node-terminal",
-            "request": "launch",
-            "preLaunchTask": "Build OS",
-            "command": "exec ./run_x86.sh",
-            "cwd": "${workspaceFolder}"
-        },
-        {
-            "name": "KVM x86 (Release)",
-            "type": "node-terminal",
-            "request": "launch",
-            "preLaunchTask": "Build OS",
-            "command": "exec ./run_x86.sh -enable-kvm",
             "cwd": "${workspaceFolder}"
         }
     ]

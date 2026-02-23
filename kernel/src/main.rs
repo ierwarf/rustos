@@ -3,21 +3,38 @@
 #![no_main]
 
 mod debug;
-mod descriptor;
+mod gdt;
+mod handlers;
+mod idt;
+mod pic;
+mod pit;
 
 use core::arch::asm;
-use x86_64::instructions::port::Port;
+
+fn init() {
+    debug::println("RUST OS loaded.");
+
+    gdt::init();
+    debug::println("GDT loaded.");
+
+    idt::init();
+    debug::println("IDT loaded.");
+
+    pic::init();
+    debug::println("PIC initialized.");
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
-    debug::print("RUST OS sucess.");
+    init();
 
-    descriptor::idt::init();
-    debug::print("IDT loaded");
-
-    x86_64::instructions::interrupts::int3();
+    let a = 7 / zero();
 
     loop {
         core::hint::spin_loop();
     }
+}
+
+fn zero() -> i32 {
+    0
 }

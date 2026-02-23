@@ -19,6 +19,13 @@ pub fn print(s: &str) {
     }
 }
 
+pub fn println(s: &str) {
+    for byte in s.bytes() {
+        print_byte(byte);
+    }
+    print("\r\n");
+}
+
 struct DebugWriter;
 
 impl Write for DebugWriter {

@@ -12,3 +12,4 @@ lazy_static = { version = "1.4", features = ["spin_no_std"] }
 spin = "0.10.0"
 volatile = "0.6.1"
 x86_64 = { version = "0.15.4", default-features = false, features = ["instructions", "abi_x86_interrupt"] }
+pic8259 = "0.11.0"
