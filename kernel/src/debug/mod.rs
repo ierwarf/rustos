@@ -2,9 +2,11 @@
 pub mod panic;
 
 use core::fmt::{self, Write};
+use spin::Mutex;
 use x86_64::instructions::port::Port;
 
 const DEBUGCON_PORT: u16 = 0x00e9;
+static DEBUG_LOCK: Mutex<()> = Mutex::new(());
 
 fn print_byte(byte: u8) {
     unsafe {
@@ -13,20 +15,39 @@ fn print_byte(byte: u8) {
     }
 }
 
-pub fn print(s: &str) {
+fn print_unlocked(s: &str) {
     for byte in s.bytes() {
         print_byte(byte);
     }
 }
 
+fn print_fmt_unlocked(args: fmt::Arguments<'_>) {
+    let mut writer = DebugWriter;
+    let _ = writer.write_fmt(args);
+}
+
+pub fn println_newline() {
+    let _guard = DEBUG_LOCK.lock();
+    print_unlocked("\r\n");
+}
+
+pub fn println_fmt(args: fmt::Arguments<'_>) {
+    let _guard = DEBUG_LOCK.lock();
+    print_fmt_unlocked(args);
+    print_unlocked("\r\n");
+}
+
 macro_rules! println {
-    () => {
-        $crate::debug::print("\r\n");
-    };
-    ($($arg:tt)*) => {
-        $crate::debug::print_fmt(format_args!($($arg)*));
-        $crate::debug::print("\r\n");
-    };
+    () => {{
+        x86_64::instructions::interrupts::without_interrupts( || {
+        $crate::debug::println_newline();
+        });
+    }};
+    ($($arg:tt)*) => {{
+        x86_64::instructions::interrupts::without_interrupts( || {
+        $crate::debug::println_fmt(format_args!($($arg)*));
+        });
+    }};
 }
 
 pub(crate) use println;
@@ -35,12 +56,7 @@ struct DebugWriter;
 
 impl Write for DebugWriter {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        print(s);
+        print_unlocked(s);
         Ok(())
     }
-}
-
-pub fn print_fmt(args: fmt::Arguments<'_>) {
-    let mut writer = DebugWriter;
-    let _ = writer.write_fmt(args);
 }

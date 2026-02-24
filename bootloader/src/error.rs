@@ -6,6 +6,9 @@ pub enum BootError {
     ReadKernel(Status),
     InvalidElf(&'static str),
     SegmentAlloc(Status),
+    Graphics(Status),
+    GraphicsMode(&'static str),
+    BootInfoAlloc(Status),
 }
 
 impl BootError {
@@ -13,8 +16,10 @@ impl BootError {
         match self {
             Self::OpenFileSystem(status)
             | Self::ReadKernel(status)
-            | Self::SegmentAlloc(status) => status,
-            Self::InvalidElf(_) => Status::LOAD_ERROR,
+            | Self::SegmentAlloc(status)
+            | Self::Graphics(status)
+            | Self::BootInfoAlloc(status) => status,
+            Self::InvalidElf(_) | Self::GraphicsMode(_) => Status::LOAD_ERROR,
         }
     }
 }

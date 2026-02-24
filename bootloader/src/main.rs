@@ -8,6 +8,7 @@ mod alloc_panic;
 mod boot;
 mod elf_loader;
 mod error;
+mod gui;
 
 use crate::boot::boot_kernel;
 use crate::error::BootError;
@@ -44,6 +45,9 @@ fn report_boot_error(err: BootError) -> Status {
     match err {
         BootError::InvalidElf(reason) => {
             uefi::println!("boot error: invalid ELF ({reason})");
+        }
+        BootError::GraphicsMode(reason) => {
+            uefi::println!("boot error: unsupported graphics mode ({reason})");
         }
         _ => uefi::println!("boot error: {:?}", err),
     }

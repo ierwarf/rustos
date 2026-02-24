@@ -57,13 +57,18 @@ pub fn enable_irq(irq: u8) {
     set_irq_enabled(irq, true);
 }
 
+#[allow(dead_code)]
 pub fn disable_irq(irq: u8) {
     set_irq_enabled(irq, false);
 }
 
 pub fn send_eoi(interrupt_vector: u8) {
-    if interrupt_vector - PIC_1_OFFSET > MAX_IRQ {
-        panic!("IRQ must be between 0 and 15");
+    let max_vector = PIC_1_OFFSET + MAX_IRQ;
+    if !(PIC_1_OFFSET..=max_vector).contains(&interrupt_vector) {
+        panic!(
+            "interrupt vector must be between {:#x} and {:#x}",
+            PIC_1_OFFSET, max_vector
+        );
     }
 
     unsafe {
