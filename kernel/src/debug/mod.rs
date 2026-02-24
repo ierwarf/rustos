@@ -6,7 +6,7 @@ use x86_64::instructions::port::Port;
 
 const DEBUGCON_PORT: u16 = 0x00e9;
 
-pub fn print_byte(byte: u8) {
+fn print_byte(byte: u8) {
     unsafe {
         let mut port = Port::new(DEBUGCON_PORT);
         port.write(byte);
@@ -21,10 +21,11 @@ pub fn print(s: &str) {
 
 macro_rules! println {
     () => {
-        $crate::debug::print_fmt(format_args!("\n"));
+        $crate::debug::print("\r\n");
     };
     ($($arg:tt)*) => {
-        $crate::debug::print_fmt(format_args!("{}\n", format_args!($($arg)*)));
+        $crate::debug::print_fmt(format_args!($($arg)*));
+        $crate::debug::print("\r\n");
     };
 }
 

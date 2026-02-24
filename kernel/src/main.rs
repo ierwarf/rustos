@@ -1,20 +1,37 @@
 #![feature(abi_x86_interrupt)]
+#![feature(alloc_error_handler)]
 #![no_std]
 #![no_main]
 
+mod asmbly;
 mod debug;
 mod gdt;
 mod handlers;
+mod heap;
 mod idt;
+mod multitask;
 mod pic;
 mod pit;
 
-use core::arch::asm;
-use core::sync::atomic::{AtomicU64, Ordering};
-use x86_64::set_general_handler;
-use x86_64::structures::idt::InterruptStackFrame;
+extern crate alloc;
+
+use alloc::boxed::Box;
+use core::sync::atomic::AtomicU64;
+use multitask::Thread;
 
 static TICK: AtomicU64 = AtomicU64::new(0);
+
+fn work1(id: u16) {
+    loop {
+        debug::println!("0");
+    }
+}
+
+fn work2(id: u16) {
+    loop {
+        debug::println!("1");
+    }
+}
 
 fn init() {
     debug::println!("RUST OS loaded.");
@@ -28,21 +45,23 @@ fn init() {
     pic::init();
     debug::println!("PIC initialized.");
 
-    pic::enable_irq(0);
-    pit::start(0, 1);
-}
+    heap::init_heap();
+    debug::println!("Heap initialized.");
 
-fn ticktick(_stack_frame: InterruptStackFrame, index: u8, error_code: Option<u64>) {
-    let tick = TICK.fetch_add(1, Ordering::Relaxed) + 1;
+    let x = Box::new("Complete");
+    debug::println!("Heap alloc test: {}", *x);
 
-    debug::println!("Tick: {}", tick);
+    multitask::init();
+    debug::println!("Multitask initialized.");
 
-    unsafe {
-        use x86_64::instructions::port::Port;
+    let th1 = Thread::new(work1, 1);
+    th1.start();
+    let th2 = Thread::new(work2, 2);
+    th2.start();
 
-        let mut pic_cmd = Port::<u8>::new(0x20);
-        pic_cmd.write(0x20); // EOI
-    }
+    multitask::start_scheduler(1);
+
+    debug::println!("aaa");
 }
 
 #[unsafe(no_mangle)]

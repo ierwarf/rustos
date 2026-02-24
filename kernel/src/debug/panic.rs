@@ -3,7 +3,7 @@ use core::panic::PanicInfo;
 
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {
-    debug::println!("");
+    debug::println!();
     debug::println!("[PANIC]");
     debug::println!("message: {}", info.message());
 
