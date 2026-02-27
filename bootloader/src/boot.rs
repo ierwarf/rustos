@@ -8,7 +8,15 @@ use crate::elf_loader::load_kernel_elf;
 use crate::error::BootError;
 use crate::gui;
 
-const KERNEL_CANDIDATE_PATHS: [&uefi::CStr16; 2] = [cstr16!("\\kernel.elf"), cstr16!("kernel.elf")];
+const KERNEL_CANDIDATE_PATHS: [(&str, &uefi::CStr16); 4] = [
+    ("\\kernel.elf", cstr16!("\\kernel.elf")),
+    ("kernel.elf", cstr16!("kernel.elf")),
+    (
+        "\\EFI\\BOOT\\kernel.elf",
+        cstr16!("\\EFI\\BOOT\\kernel.elf"),
+    ),
+    ("EFI\\BOOT\\kernel.elf", cstr16!("EFI\\BOOT\\kernel.elf")),
+];
 
 pub fn boot_kernel() -> Result<(), BootError> {
     let kernel_image = read_kernel_image()?;
@@ -39,9 +47,15 @@ fn read_kernel_image() -> Result<Vec<u8>, BootError> {
         .map_err(|err| BootError::OpenFileSystem(err.status()))?;
 
     let mut fs = FileSystem::new(sfs);
-    for path in KERNEL_CANDIDATE_PATHS {
+    for (display_path, path) in KERNEL_CANDIDATE_PATHS {
         match fs.read(path) {
-            Ok(kernel_image) => return Ok(kernel_image),
+            Ok(kernel_image) => {
+                uefi::println!(
+                    "kernel image found: {display_path} ({} bytes)",
+                    kernel_image.len()
+                );
+                return Ok(kernel_image);
+            }
             Err(err) => {
                 let status = fs_error_status(&err);
                 if status != Status::NOT_FOUND {
@@ -49,6 +63,11 @@ fn read_kernel_image() -> Result<Vec<u8>, BootError> {
                 }
             }
         }
+    }
+
+    uefi::println!("kernel image not found; tried:");
+    for (display_path, _) in KERNEL_CANDIDATE_PATHS {
+        uefi::println!("  - {display_path}");
     }
 
     Err(BootError::ReadKernel(Status::NOT_FOUND))

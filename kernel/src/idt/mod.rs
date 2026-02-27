@@ -13,8 +13,9 @@ lazy_static! {
 
         set_general_handler!(&mut idt, default_handler, 0..=31);
         unsafe {
-            idt[TIMER_INTERRUPT_VECTOR]
-                .set_handler_addr(VirtAddr::new(crate::multitask::timer_interrupt_handler_addr()));
+            idt[TIMER_INTERRUPT_VECTOR].set_handler_addr(VirtAddr::new(
+                crate::multitask::timer_interrupt_handler_addr(),
+            ));
         }
         idt[RTC_INTERRUPT_VECTOR].set_handler_fn(rtc_interrupt_handler);
 

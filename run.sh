@@ -18,7 +18,7 @@ Starting QEMU...
     -drive if=pflash,format=raw,readonly=on,file=OVMF.fd \
     -drive file=fat:rw:build,format=raw \
     -net none \
-    -m 1G \
+    -m 2G \
     -monitor none \
     -debugcon stdio \
     -global isa-debugcon.iobase=0xe9 \

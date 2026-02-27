@@ -81,12 +81,11 @@ global_asm!(
         SAVE_CONTEXT
 
         cld
-        mov r15, rsp
         mov rdi, rsp
         and rsp, -16
         sub rsp, 8
         call timer_interrupt_dispatch
-        mov rsp, r15
+        mov rsp, rax
 
         RESTORE_CONTEXT
         iretq
@@ -94,3 +93,59 @@ global_asm!(
     .size timer_interrupt_handler, . - timer_interrupt_handler
 "#
 );
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+pub unsafe fn copy_sse2(src: *const u8, dst: *mut u8, len: usize) {
+    use core::arch::x86_64::*;
+    use core::ptr;
+
+    if len == 0 || src == dst {
+        return;
+    }
+
+    let src_addr = src as usize;
+    let dst_addr = dst as usize;
+    let overlap = match (src_addr.checked_add(len), dst_addr.checked_add(len)) {
+        (Some(src_end), Some(dst_end)) => src_addr < dst_end && dst_addr < src_end,
+        _ => true,
+    };
+    if overlap {
+        unsafe {
+            ptr::copy(src, dst, len);
+        }
+        return;
+    }
+
+    let mut i = 0usize;
+    let mut used_stream_store = false;
+
+    unsafe {
+        // Align destination to 16 bytes for streaming stores.
+        while i < len && ((dst.add(i) as usize) & 0xF) != 0 {
+            ptr::write(dst.add(i), ptr::read(src.add(i)));
+            i += 1;
+        }
+
+        while i + 64 <= len {
+            let a = _mm_loadu_si128(src.add(i) as *const __m128i);
+            let b = _mm_loadu_si128(src.add(i + 16) as *const __m128i);
+            let c = _mm_loadu_si128(src.add(i + 32) as *const __m128i);
+            let d = _mm_loadu_si128(src.add(i + 48) as *const __m128i);
+
+            _mm_stream_si128(dst.add(i) as *mut __m128i, a);
+            _mm_stream_si128(dst.add(i + 16) as *mut __m128i, b);
+            _mm_stream_si128(dst.add(i + 32) as *mut __m128i, c);
+            _mm_stream_si128(dst.add(i + 48) as *mut __m128i, d);
+            i += 64;
+            used_stream_store = true;
+        }
+
+        if i < len {
+            ptr::copy_nonoverlapping(src.add(i), dst.add(i), len - i);
+        }
+        if used_stream_store {
+            _mm_sfence();
+        }
+    }
+}

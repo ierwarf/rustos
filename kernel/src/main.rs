@@ -3,53 +3,30 @@
 #![no_std]
 #![no_main]
 
+mod asmtools;
 mod debug;
 mod gdt;
 mod gui;
 mod heap;
 mod idt;
 mod multitask;
+mod paging;
 mod pic;
 mod pit;
 mod rtc;
 
 extern crate alloc;
 
-use alloc::boxed::Box;
-use multitask::Thread;
+use embedded_graphics::pixelcolor::Rgb888;
 use x86_64::instructions::interrupts;
 
-fn work1(_id: u16) {
-    loop {
-        debug::println!("0");
-        rtc::sleep(1000);
-    }
-}
+use crate::multitask::Thread;
 
-fn work2(_id: u16) {
-    loop {
-        debug::println!("1");
-        rtc::sleep(1000);
-    }
-}
-
-fn work3(_id: u16) {
-    loop {
-        debug::println!("2");
-        rtc::sleep(1000);
-    }
-}
+const RECT_SIZE: u32 = 300;
+const RECT_DELAY_MS: u64 = 4;
 
 fn init(boot_info_ptr: *const gui::BootInfo) {
     debug::println!("RUST OS loaded.");
-
-    let gui_ready = if let Err(reason) = gui::init(boot_info_ptr) {
-        debug::println!("GUI init failed: {}", reason);
-        false
-    } else {
-        debug::println!("GUI metadata loaded.");
-        true
-    };
 
     gdt::init();
     debug::println!("GDT loaded.");
@@ -57,46 +34,69 @@ fn init(boot_info_ptr: *const gui::BootInfo) {
     idt::init();
     debug::println!("IDT loaded.");
 
+    paging::init();
+    debug::println!("Paging initialized.");
+
+    gui::init(boot_info_ptr);
+    debug::println!("GUI Initialized.");
+
     pic::init();
     debug::println!("PIC initialized.");
+
     rtc::init();
     debug::println!("RTC initialized.");
 
     heap::init_heap();
     debug::println!("Heap initialized.");
 
-    if gui_ready {
-        if let Err(reason) = gui::enable_double_buffer() {
-            debug::println!("GUI double buffer failed: {}", reason);
-        }
-        gui::render_boot_screen();
-        if gui::is_double_buffer_enabled() {
-            debug::println!("GUI initialized (double buffer).");
-        } else {
-            debug::println!("GUI initialized (single buffer).");
-        }
-    }
-
-    let x = Box::new("Complete");
-    debug::println!("Heap alloc test: {}", *x);
-
-    multitask::init(0.1);
+    multitask::init(1.0);
     interrupts::enable();
     debug::println!("Multitask initialized.");
-
-    let th1 = Thread::new(work1, 1);
-    th1.start();
-    let th2 = Thread::new(work2, 2);
-    th2.start();
-    let th3 = Thread::new(work3, 3);
-    th3.start();
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(boot_info_ptr: *const gui::BootInfo) -> ! {
     init(boot_info_ptr);
 
+    let threads = [
+        Thread::new(gui_update, 90),
+        Thread::new(gui2, 44),
+        Thread::new(gui3, 55),
+    ];
+    for thread in &threads {
+        thread.start();
+    }
+
     loop {
         core::hint::spin_loop();
+    }
+}
+
+fn gui2(_id: u16) {
+    animate_rect(0, 0, |value| Rgb888::new(value, 0, 0));
+}
+
+fn gui3(_id: u16) {
+    animate_rect(300, 300, |value| Rgb888::new(0, value, 0));
+}
+
+fn animate_rect(x: i64, y: i64, color: fn(u8) -> Rgb888) {
+    loop {
+        use gui::GOP_SCREEN;
+
+        for value in (0..=255).chain((0..=255).rev()) {
+            GOP_SCREEN
+                .lock()
+                .fill_rect(x, y, RECT_SIZE, RECT_SIZE, color(value), 255);
+            rtc::sleep(RECT_DELAY_MS);
+        }
+    }
+}
+
+fn gui_update(_id: u16) {
+    let fps = 10;
+    loop {
+        rtc::sleep(1000 / fps);
+        gui::GOP_SCREEN.lock().refresh();
     }
 }

@@ -7,7 +7,7 @@ RUSTUP ?= rustup
 KERNEL_PACKAGE ?= kernel
 KERNEL_TARGET ?= x86_64-unknown-linux-gnu
 KERNEL_CARGO_ZFLAGS ?= -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem
-KERNEL_RUSTC_ARGS ?= -C link-arg=-nostartfiles -C link-arg=-no-pie -C link-arg=-static
+KERNEL_RUSTC_ARGS ?= -C no-redzone -C link-arg=-nostartfiles -C link-arg=-no-pie -C link-arg=-static
 
 BUILD_DIR ?= build
 EFI_BOOT_DIR ?= $(BUILD_DIR)/EFI/BOOT

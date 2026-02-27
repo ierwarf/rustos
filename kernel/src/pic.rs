@@ -33,19 +33,21 @@ fn set_irq_enabled(irq: u8, enabled: bool) {
         let [mut mask1, mut mask2] = pics.read_masks();
 
         if irq < 8 {
+            let bit = 1u8 << irq;
             if enabled {
-                mask1 &= !(1u8 << irq);
+                mask1 &= !bit;
             } else {
-                mask1 |= 1u8 << irq;
+                mask1 |= bit;
             }
         } else {
             let slave_irq = irq - 8;
+            let bit = 1u8 << slave_irq;
             if enabled {
-                mask2 &= !(1u8 << slave_irq);
+                mask2 &= !bit;
                 // Keep cascade line enabled when using slave PIC IRQs.
                 mask1 &= !(1u8 << CASCADE_IRQ);
             } else {
-                mask2 |= 1u8 << slave_irq;
+                mask2 |= bit;
             }
         }
 

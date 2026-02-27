@@ -62,7 +62,9 @@ pub fn sleep(milliseconds: u64) {
 
     let ticks_needed = (milliseconds.saturating_mul(RTC_TICKS_PER_SEC) + 999) / 1000;
     let ticks_needed = core::cmp::max(1, ticks_needed);
-    let target = RTC_TICKS.load(Ordering::Acquire).saturating_add(ticks_needed);
+    let target = RTC_TICKS
+        .load(Ordering::Acquire)
+        .saturating_add(ticks_needed);
 
     let restore_disabled = !interrupts::are_enabled();
     while RTC_TICKS.load(Ordering::Acquire) < target {

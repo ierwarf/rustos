@@ -26,27 +26,32 @@ fn print_fmt_unlocked(args: fmt::Arguments<'_>) {
     let _ = writer.write_fmt(args);
 }
 
+fn with_debug_output_lock<F: FnOnce()>(f: F) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let _guard = DEBUG_LOCK.try_lock();
+        f();
+    });
+}
+
 pub fn println_newline() {
-    let _guard = DEBUG_LOCK.lock();
-    print_unlocked("\r\n");
+    with_debug_output_lock(|| {
+        print_unlocked("\r\n");
+    });
 }
 
 pub fn println_fmt(args: fmt::Arguments<'_>) {
-    let _guard = DEBUG_LOCK.lock();
-    print_fmt_unlocked(args);
-    print_unlocked("\r\n");
+    with_debug_output_lock(|| {
+        print_fmt_unlocked(args);
+        print_unlocked("\r\n");
+    });
 }
 
 macro_rules! println {
     () => {{
-        x86_64::instructions::interrupts::without_interrupts( || {
         $crate::debug::println_newline();
-        });
     }};
     ($($arg:tt)*) => {{
-        x86_64::instructions::interrupts::without_interrupts( || {
         $crate::debug::println_fmt(format_args!($($arg)*));
-        });
     }};
 }
 

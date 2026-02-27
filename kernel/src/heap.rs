@@ -25,10 +25,8 @@ fn heap_start() -> usize {
 }
 
 pub fn init_heap() {
-    HEAP_INIT.call_once(|| {
-        unsafe {
-            HEAP.lock().init(heap_start(), HEAP_SIZE);
-        }
+    HEAP_INIT.call_once(|| unsafe {
+        HEAP.lock().init(heap_start(), HEAP_SIZE);
     });
 }
 
