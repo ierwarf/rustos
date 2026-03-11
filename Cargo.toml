@@ -1,6 +1,6 @@
 [workspace]
 
-members = ["bootloader", "kernel"]
+members = ["bootloader", "bootloader/boot-protocol", "kernel"]
 resolver = "3"
 
 [profile.release]

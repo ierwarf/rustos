@@ -4,6 +4,7 @@ use uefi::boot;
 use uefi::fs::{Error as FsError, FileSystem};
 use uefi::prelude::*;
 
+use crate::boot_info::BootInfo;
 use crate::elf_loader::load_kernel_elf;
 use crate::error::BootError;
 use crate::gui;
@@ -80,10 +81,10 @@ fn fs_error_status(err: &FsError) -> Status {
     }
 }
 
-fn exit_boot_services_and_jump(entry_point: usize, boot_info_ptr: *const gui::BootInfo) -> ! {
+fn exit_boot_services_and_jump(entry_point: usize, boot_info_ptr: *const BootInfo) -> ! {
     unsafe {
         let _memory_map = boot::exit_boot_services(None);
-        let kernel_entry: extern "sysv64" fn(*const gui::BootInfo) -> ! =
+        let kernel_entry: extern "sysv64" fn(*const BootInfo) -> ! =
             core::mem::transmute(entry_point);
         kernel_entry(boot_info_ptr);
     }

@@ -104,6 +104,116 @@ impl BlockDevice for MemBlockDevice {
     }
 }
 
+/// Maps a whole device to a logical slice `[start_lba, start_lba + sectors)`.
+struct LbaSliceDevice<D: BlockDevice> {
+    inner: D,
+    start_lba: u64,
+    sectors: u64,
+}
+
+impl<D: BlockDevice> LbaSliceDevice<D> {
+    fn new(inner: D, start_lba: u64, sectors: u64) -> IoResult<Self> {
+        let total = inner.sector_count();
+        if sectors == 0 {
+            return Err(DiskIoError::InvalidInput);
+        }
+        let end = start_lba
+            .checked_add(sectors)
+            .ok_or(DiskIoError::InvalidInput)?;
+        if end > total {
+            return Err(DiskIoError::InvalidInput);
+        }
+        Ok(Self {
+            inner,
+            start_lba,
+            sectors,
+        })
+    }
+}
+
+impl<D: BlockDevice> BlockDevice for LbaSliceDevice<D> {
+    fn sector_count(&self) -> u64 {
+        self.sectors
+    }
+
+    fn read_sector(&mut self, lba: u64, out: &mut [u8; FAT_SECTOR_SIZE]) -> IoResult<()> {
+        if lba >= self.sectors {
+            return Err(DiskIoError::InvalidInput);
+        }
+        self.inner.read_sector(self.start_lba + lba, out)
+    }
+
+    fn write_sector(&mut self, lba: u64, input: &[u8; FAT_SECTOR_SIZE]) -> IoResult<()> {
+        if lba >= self.sectors {
+            return Err(DiskIoError::InvalidInput);
+        }
+        self.inner.write_sector(self.start_lba + lba, input)
+    }
+
+    fn flush(&mut self) -> IoResult<()> {
+        self.inner.flush()
+    }
+}
+
+fn is_probable_fat_boot_sector(sector0: &[u8; FAT_SECTOR_SIZE]) -> bool {
+    let has_jump = matches!(sector0[0], 0xEB | 0xE9);
+    let sig_ok = sector0[510] == 0x55 && sector0[511] == 0xAA;
+    let bytes_per_sector = u16::from_le_bytes([sector0[11], sector0[12]]);
+    has_jump && sig_ok && bytes_per_sector == FAT_SECTOR_SIZE as u16
+}
+
+/// Detects where a FAT volume starts.
+/// - superfloppy (boot sector at LBA 0): returns `(0, total_sectors)`
+/// - MBR disk image: returns first valid partition `(start_lba, partition_sectors)`
+fn detect_fat_volume_slice<D: BlockDevice>(dev: &mut D) -> IoResult<(u64, u64)> {
+    let total = dev.sector_count();
+    if total == 0 {
+        return Err(DiskIoError::NotPresent);
+    }
+
+    let mut sector0 = [0_u8; FAT_SECTOR_SIZE];
+    dev.read_sector(0, &mut sector0)?;
+
+    if is_probable_fat_boot_sector(&sector0) {
+        return Ok((0, total));
+    }
+
+    let sig_ok = sector0[510] == 0x55 && sector0[511] == 0xAA;
+    if !sig_ok {
+        return Err(DiskIoError::InvalidInput);
+    }
+
+    for idx in 0..4 {
+        let off = 446 + idx * 16;
+        let part_type = sector0[off + 4];
+        let start_lba = u32::from_le_bytes([
+            sector0[off + 8],
+            sector0[off + 9],
+            sector0[off + 10],
+            sector0[off + 11],
+        ]) as u64;
+        let sectors = u32::from_le_bytes([
+            sector0[off + 12],
+            sector0[off + 13],
+            sector0[off + 14],
+            sector0[off + 15],
+        ]) as u64;
+
+        if part_type == 0 || start_lba == 0 || sectors == 0 {
+            continue;
+        }
+
+        let end = start_lba
+            .checked_add(sectors)
+            .ok_or(DiskIoError::InvalidInput)?;
+        if end <= total {
+            return Ok((start_lba, sectors));
+        }
+    }
+
+    Err(DiskIoError::InvalidInput)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AtaDrive {
     Master,
@@ -576,15 +686,17 @@ impl<D: BlockDevice> Seek for FatDisk<D> {
 /// Minimal FAT usage example with an explicit device:
 /// mount -> create file -> write bytes -> unmount.
 pub fn mount_and_create_hello_file_with_device<D: BlockDevice>(
-    dev: D,
+    mut dev: D,
 ) -> core::result::Result<(), fatfs::Error<DiskIoError>> {
-    let disk = FatDisk::new(dev);
+    let (start_lba, sectors) = detect_fat_volume_slice(&mut dev)?;
+    let disk_dev = LbaSliceDevice::new(dev, start_lba, sectors)?;
+    let disk = FatDisk::new(disk_dev);
     let fs = fatfs::FileSystem::new(disk, fatfs::FsOptions::new())?;
     {
         let root = fs.root_dir();
-        let mut file = root.create_file("HELLO.TXT")?;
+        let mut file = root.create_file("asdf.TXT")?;
         file.truncate()?;
-        file.write_all(b"hello from rustos\n")?;
+        file.write_all(b"asdf\n")?;
         file.flush()?;
     }
     fs.unmount()?;
@@ -600,4 +712,10 @@ pub fn mount_and_create_hello_file() -> core::result::Result<(), fatfs::Error<Di
         Ok(dev) => mount_and_create_hello_file_with_device(dev),
         Err(_) => Err(fatfs::Error::Io(DiskIoError::NotPresent)),
     }
+}
+
+/// Basic `fatfs` example for no_std:
+/// mount real ATA disk -> create file -> unmount.
+pub fn demo() -> core::result::Result<(), fatfs::Error<DiskIoError>> {
+    mount_and_create_hello_file()
 }

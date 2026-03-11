@@ -3,44 +3,13 @@ use core::ptr;
 use uefi::boot::{self, AllocateType, MemoryType};
 use uefi::proto::console::gop::{FrameBuffer, GraphicsOutput, PixelFormat};
 
+use crate::boot_info::{
+    BootInfo, BootPixelFormat, FramebufferInfo, BOOT_INFO_MAGIC, BOOT_INFO_VERSION,
+};
 use crate::error::BootError;
+use crate::random;
 
-pub const BOOT_INFO_MAGIC: u64 = 0x5255_5354_4F53_4749; // "RUSTOSGI"
-pub const BOOT_INFO_VERSION: u32 = 1;
 const PAGE_SIZE: usize = 4096;
-
-#[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BootPixelFormat {
-    Rgb = 0,
-    Bgr = 1,
-    Bitmask = 2,
-    Unknown = 0xff,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct FramebufferInfo {
-    pub addr: u64,
-    pub size: u64,
-    pub back_buffer_addr: u64,
-    pub back_buffer_size: u64,
-    pub width: u32,
-    pub height: u32,
-    pub stride: u32,
-    pub pixel_format: BootPixelFormat,
-    pub bytes_per_pixel: u8,
-    pub _reserved: [u8; 3],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct BootInfo {
-    pub magic: u64,
-    pub version: u32,
-    pub _reserved0: u32,
-    pub framebuffer: FramebufferInfo,
-}
 
 pub fn prepare_boot_info() -> Result<BootInfo, BootError> {
     let handle = boot::get_handle_for_protocol::<GraphicsOutput>()
@@ -58,6 +27,7 @@ pub fn prepare_boot_info() -> Result<BootInfo, BootError> {
     let front_size = frame_buffer.size();
 
     let (back_addr, back_size) = allocate_back_buffer_and_seed(&mut frame_buffer, front_size);
+    let rng_seed = random::generate_seed(front_addr, front_size as u64, back_addr, back_size);
 
     let fb_info = FramebufferInfo {
         addr: front_addr,
@@ -76,6 +46,7 @@ pub fn prepare_boot_info() -> Result<BootInfo, BootError> {
         magic: BOOT_INFO_MAGIC,
         version: BOOT_INFO_VERSION,
         _reserved0: 0,
+        rng_seed,
         framebuffer: fb_info,
     })
 }

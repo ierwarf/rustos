@@ -6,9 +6,11 @@ extern crate alloc;
 #[cfg(not(test))]
 mod alloc_panic;
 mod boot;
+mod boot_info;
 mod elf_loader;
 mod error;
 mod gui;
+mod random;
 
 use crate::boot::boot_kernel;
 use crate::error::BootError;

@@ -5,6 +5,7 @@
 
 mod asmtools;
 mod debug;
+mod fat;
 mod gdt;
 mod gui;
 mod heap;
@@ -13,19 +14,22 @@ mod multitask;
 mod paging;
 mod pic;
 mod pit;
+mod random;
 mod rtc;
 
 extern crate alloc;
 
 use embedded_graphics::pixelcolor::Rgb888;
+use random::Random;
 use x86_64::instructions::interrupts;
 
 use crate::multitask::Thread;
+use boot_protocol::BootInfo;
 
 const RECT_SIZE: u32 = 300;
 const RECT_DELAY_MS: u64 = 4;
 
-fn init(boot_info_ptr: *const gui::BootInfo) {
+fn init(boot_info_ptr: *const BootInfo) {
     debug::println!("RUST OS loaded.");
 
     gdt::init();
@@ -49,47 +53,27 @@ fn init(boot_info_ptr: *const gui::BootInfo) {
     heap::init_heap();
     debug::println!("Heap initialized.");
 
-    multitask::init(1.0);
+    random::init(boot_info_ptr);
+    debug::println!("Random initialized.");
+
+    multitask::init(0.1);
     interrupts::enable();
     debug::println!("Multitask initialized.");
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(boot_info_ptr: *const gui::BootInfo) -> ! {
+pub extern "C" fn _start(boot_info_ptr: *const BootInfo) -> ! {
     init(boot_info_ptr);
 
-    let threads = [
-        Thread::new(gui_update, 90),
-        Thread::new(gui2, 44),
-        Thread::new(gui3, 55),
-    ];
-    for thread in &threads {
-        thread.start();
-    }
+    debug::println!("asdf");
+
+    let th1 = Thread::new(gui_update, 10);
+    th1.start();
+
+    gui::GOP_SCREEN.lock().fill(Rgb888::new(0, 0, 0));
 
     loop {
         core::hint::spin_loop();
-    }
-}
-
-fn gui2(_id: u16) {
-    animate_rect(0, 0, |value| Rgb888::new(value, 0, 0));
-}
-
-fn gui3(_id: u16) {
-    animate_rect(300, 300, |value| Rgb888::new(0, value, 0));
-}
-
-fn animate_rect(x: i64, y: i64, color: fn(u8) -> Rgb888) {
-    loop {
-        use gui::GOP_SCREEN;
-
-        for value in (0..=255).chain((0..=255).rev()) {
-            GOP_SCREEN
-                .lock()
-                .fill_rect(x, y, RECT_SIZE, RECT_SIZE, color(value), 255);
-            rtc::sleep(RECT_DELAY_MS);
-        }
     }
 }
 

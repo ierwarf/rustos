@@ -1,5 +1,8 @@
 use core::ptr;
 
+use boot_protocol::{
+    BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootInfo, BootPixelFormat, FramebufferInfo,
+};
 use embedded_graphics::pixelcolor::Rgb888;
 use embedded_graphics::prelude::RgbColor;
 use spin::Mutex;
@@ -7,8 +10,6 @@ use x86_64::instructions::interrupts;
 
 use crate::paging;
 
-pub const BOOT_INFO_MAGIC: u64 = 0x5255_5354_4F53_4749; // "RUSTOSGI"
-pub const BOOT_INFO_VERSION: u32 = 1;
 const HUGE_2MIB: u64 = 2 * 1024 * 1024;
 
 pub static GOP_SCREEN: Mutex<Framebuffer> = Mutex::new(Framebuffer {
@@ -22,39 +23,6 @@ pub static GOP_SCREEN: Mutex<Framebuffer> = Mutex::new(Framebuffer {
     format: BootPixelFormat::Unknown,
     use_double_buffer: false,
 });
-
-#[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BootPixelFormat {
-    Rgb = 0,
-    Bgr = 1,
-    Bitmask = 2,
-    Unknown = 0xff,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct FramebufferInfo {
-    pub addr: u64,
-    pub size: u64,
-    pub back_buffer_addr: u64,
-    pub back_buffer_size: u64,
-    pub width: u32,
-    pub height: u32,
-    pub stride: u32,
-    pub pixel_format: BootPixelFormat,
-    pub bytes_per_pixel: u8,
-    pub _reserved: [u8; 3],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct BootInfo {
-    pub magic: u64,
-    pub version: u32,
-    pub _reserved0: u32,
-    pub framebuffer: FramebufferInfo,
-}
 
 pub struct Framebuffer {
     front_base: *mut u8,
