@@ -48,7 +48,7 @@
             "type": "node-terminal",
             "request": "launch",
             "preLaunchTask": "Build OS",
-            "command": "exec ./run.sh -enable-kvm",
+            "command": "exec ./run.sh -machine accel=kvm -cpu host",
             "cwd": "${workspaceFolder}"
         }
     ]

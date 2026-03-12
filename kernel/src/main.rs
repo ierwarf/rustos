@@ -3,42 +3,35 @@
 #![no_std]
 #![no_main]
 
-mod asmtools;
+mod arch;
 mod debug;
-mod fat;
-mod gdt;
-mod gui;
-mod heap;
-mod idt;
+mod input;
+mod io;
+mod memory;
 mod multitask;
-mod paging;
-mod pic;
-mod pit;
-mod random;
-mod rtc;
+mod storage;
+mod user;
+mod util;
+
+pub(crate) use arch::{asmtools, gdt, idt, pic, pit, rtc};
+pub(crate) use input::keyboard;
+pub(crate) use io::{console, gui, tty};
+pub(crate) use memory::{heap, paging};
+pub(crate) use storage::fat;
+pub(crate) use user::{demo, process, syscall, win32};
+pub(crate) use util::{random, ring};
 
 extern crate alloc;
 
-use embedded_graphics::pixelcolor::Rgb888;
-use random::Random;
-use x86_64::instructions::interrupts;
-
-use crate::multitask::Thread;
 use boot_protocol::BootInfo;
 
-const RECT_SIZE: u32 = 300;
-const RECT_DELAY_MS: u64 = 4;
-
 fn init(boot_info_ptr: *const BootInfo) {
-    debug::println!("RUST OS loaded.");
-
-    gdt::init();
+    debug::println!(
+        "RUST OS loaded in higher half: rip={:#x}",
+        asmtools::current_rip()
+    );
     debug::println!("GDT loaded.");
-
-    idt::init();
     debug::println!("IDT loaded.");
-
-    paging::init();
     debug::println!("Paging initialized.");
 
     gui::init(boot_info_ptr);
@@ -47,40 +40,48 @@ fn init(boot_info_ptr: *const BootInfo) {
     pic::init();
     debug::println!("PIC initialized.");
 
+    keyboard::init();
+    debug::println!("Keyboard initialized.");
+
+    console::init();
+    debug::println!("Console initialized.");
+
+    tty::init();
+    debug::println!("TTY initialized.");
+
     rtc::init();
     debug::println!("RTC initialized.");
 
     heap::init_heap();
     debug::println!("Heap initialized.");
 
+    paging::smoke_test();
+
     random::init(boot_info_ptr);
     debug::println!("Random initialized.");
 
-    multitask::init(0.1);
-    interrupts::enable();
+    multitask::init();
     debug::println!("Multitask initialized.");
+
+    syscall::init();
+    debug::println!("Syscall initialized.");
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(boot_info_ptr: *const BootInfo) -> ! {
-    init(boot_info_ptr);
+    gdt::init();
+    idt::init();
+    paging::init();
 
-    debug::println!("asdf");
-
-    let th1 = Thread::new(gui_update, 10);
-    th1.start();
-
-    gui::GOP_SCREEN.lock().fill(Rgb888::new(0, 0, 0));
-
-    loop {
-        core::hint::spin_loop();
+    unsafe {
+        asmtools::enter_higher_half(
+            paging::higher_half_addr(kernel_main_high as *const () as usize as u64),
+            boot_info_ptr as u64,
+        );
     }
 }
 
-fn gui_update(_id: u16) {
-    let fps = 10;
-    loop {
-        rtc::sleep(1000 / fps);
-        gui::GOP_SCREEN.lock().refresh();
-    }
+extern "C" fn kernel_main_high(boot_info_ptr: *const BootInfo) -> ! {
+    init(boot_info_ptr);
+    demo::run()
 }

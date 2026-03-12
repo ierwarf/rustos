@@ -1,6 +1,7 @@
 # 📖 개요
 
 - [📖 개요](#-개요)
+- [🗂 소스 구조](#-소스-구조)
 - [📦 패키지 설치](#-패키지-설치)
 - [🛠 Visual Studio code](#-visual-studio-code)
   - [빌드 및 실행](#빌드-및-실행)
@@ -12,6 +13,22 @@
 </details>
 
 <br>
+
+# 🗂 소스 구조
+
+- `bootloader/src/boot/`: UEFI 부트 체인, ELF 적재, 부트 정보, 오류 처리
+- `bootloader/src/platform/`: UEFI 디버그 출력, GOP 초기화, RNG 시드
+- `bootloader/src/runtime/`: panic/alloc 같은 런타임 핸들러
+- `prekernel/src/load/`: `kernel.elf` 적재
+- `prekernel/src/runtime/`: prekernel 디버그/힙 초기화
+- `kernel/src/arch/`: GDT, IDT, PIC/PIT/RTC, 저수준 asm 진입점
+- `kernel/src/input/`: 키보드 드라이버
+- `kernel/src/io/`: GUI 콘솔, TTY, 콘솔 출력 계층
+- `kernel/src/memory/`: 힙과 가상 메모리
+- `kernel/src/storage/`: FAT 부트 볼륨 접근
+- `kernel/src/user/`: 데모 실행, ELF/PE 프로세스 로드, syscall/Win32 shim
+- `kernel/src/util/`: 랜덤, 링 버퍼 같은 범용 유틸리티
+- `kernel/src/debug/`, `kernel/src/multitask/`: 디버그 및 스케줄러는 별도 디렉터리 유지
 
 # 📦 패키지 설치
 
@@ -66,6 +83,10 @@ make build
 
 run.sh 는 기본적으로 빌드를 포함하고 있지 않습니다.
 make build 를 반드시 함께 실행하세요.
+실행 시에는 `build/` 를 `/tmp` 임시 디렉터리로 복제한 뒤 그 복제본을 vvfat 디스크로 사용합니다.
+QEMU/UEFI, 특히 KVM 경로에서 `build/` 를 vvfat 로 직접 물리면 호스트의 `kernel.elf`,
+`BOOTX64.EFI`, `startup.nsh`, `NvVars` 같은 빌드 산물의 timestamp/metadata 가 오염됩니다.
+임시 복제본을 쓰는 이유는 호스트 `build/` 를 그대로 보존하기 위해서입니다.
 
 ## 빌드 삭제
 

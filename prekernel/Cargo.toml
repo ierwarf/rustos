@@ -1,0 +1,11 @@
+[package]
+name = "prekernel"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+boot-protocol = { path = "../bootloader/boot-protocol" }
+buddy_system_allocator = "0.12.0"
+fatfs = { git = "https://github.com/rafalh/rust-fatfs", default-features = false, features = ["alloc"] }
+spin = "0.10.0"
+x86_64 = { version = "0.15.4", default-features = false, features = ["instructions"] }

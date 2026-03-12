@@ -1,7 +1,10 @@
 [workspace]
 
-members = ["bootloader", "bootloader/boot-protocol", "kernel"]
+members = ["bootloader", "bootloader/boot-protocol", "kernel", "module-tests", "prekernel"]
 resolver = "3"
 
 [profile.release]
+panic = "abort"
+
+[profile.dev]
 panic = "abort"

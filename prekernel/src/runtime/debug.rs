@@ -1,5 +1,3 @@
-pub mod panic;
-
 use core::fmt::{self, Write};
 use spin::Mutex;
 use x86_64::instructions::port::Port;
@@ -16,13 +14,6 @@ fn print_byte(byte: u8) {
 
 fn print_unlocked(s: &str) {
     for byte in s.bytes() {
-        print_byte(byte);
-    }
-}
-
-#[allow(dead_code)]
-fn print_bytes_unlocked(bytes: &[u8]) {
-    for &byte in bytes {
         print_byte(byte);
     }
 }
@@ -49,13 +40,6 @@ pub fn println_fmt(args: fmt::Arguments<'_>) {
     with_debug_output_lock(|| {
         print_fmt_unlocked(args);
         print_unlocked("\r\n");
-    });
-}
-
-#[allow(dead_code)]
-pub fn write_bytes(bytes: &[u8]) {
-    with_debug_output_lock(|| {
-        print_bytes_unlocked(bytes);
     });
 }
 

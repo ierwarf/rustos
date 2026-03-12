@@ -21,3 +21,4 @@ pic8259 = "0.11.0"
 
 rand_chacha = { version = "0.10", default-features = false }
 rand_core = { version = "0.10", default-features = false }
+xmas-elf = { version = "0.9", default-features = false }
