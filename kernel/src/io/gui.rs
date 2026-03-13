@@ -174,7 +174,7 @@ impl ConsoleBackground {
                 let wx = (src_x & 0xffff) as u32;
 
                 let rgb = sample_bilinear_rgb(image, x0, x1, y0, y1, wx, wy);
-                let dimmed = Rgb888::new(rgb.r() >> 1, rgb.g() >> 1, rgb.b() >> 1);
+                let dimmed = Rgb888::new(rgb.r(), rgb.g(), rgb.b());
                 let (c0, c1, c2) = framebuffer.color_bytes(dimmed);
                 let dst = dst_y * self.stride_bytes + dst_x * self.bpp;
                 self.pixels[dst] = c0;
