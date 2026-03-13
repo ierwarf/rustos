@@ -1,13 +1,14 @@
 use alloc::boxed::Box;
 use core::{mem, ptr};
 
-use x86_64::{PhysAddr, VirtAddr};
+use x86_64::PhysAddr;
 
 use crate::asmtools::{FxSaveArea, restore_fxstate, save_fxstate};
 use crate::debug;
 use crate::paging::ProcessAddressSpace;
 
 use super::context::{SAVED_CONTEXT_BYTES, SavedContext};
+use super::UserTaskBootstrap;
 
 pub(super) const MAX_TASK: usize = 32;
 const TASK_STACK_SIZE: usize = 16 * 1024;
@@ -199,14 +200,11 @@ impl Scheduler {
         &mut self,
         id: u64,
         address_space: ProcessAddressSpace,
-        entry: VirtAddr,
-        user_stack_top: VirtAddr,
+        bootstrap: UserTaskBootstrap,
         pit_divisor: u16,
         user_cs: u64,
         user_ss: u64,
         rflags: u64,
-        arg0: u64,
-        arg1: u64,
         idle_entry: fn(u64),
     ) -> Option<usize> {
         for slot in 1..MAX_TASK {
@@ -219,13 +217,10 @@ impl Scheduler {
                 self.contexts[slot] = Some(TaskContext {
                     saved_rsp: self.init_user_task_context(
                         slot,
-                        entry,
-                        user_stack_top,
+                        bootstrap,
                         user_cs,
                         user_ss,
                         rflags,
-                        arg0,
-                        arg1,
                     ),
                     ready: true,
                     pit_divisor,
@@ -282,13 +277,10 @@ impl Scheduler {
     fn init_user_task_context(
         &mut self,
         slot: usize,
-        entry: VirtAddr,
-        user_stack_top: VirtAddr,
+        bootstrap: UserTaskBootstrap,
         user_cs: u64,
         user_ss: u64,
         rflags: u64,
-        arg0: u64,
-        arg1: u64,
     ) -> usize {
         let stack_top = self.stack_top(slot);
         let context_ptr = stack_top - mem::size_of::<SavedContext>();
@@ -296,11 +288,24 @@ impl Scheduler {
 
         unsafe {
             ptr::write_bytes(context as *mut u8, 0, mem::size_of::<SavedContext>());
-            (*context).rdi = arg0;
-            (*context).rsi = arg1;
-            (*context).rsp = user_stack_top.as_u64();
+            (*context).rax = bootstrap.registers.rax;
+            (*context).rbx = bootstrap.registers.rbx;
+            (*context).rcx = bootstrap.registers.rcx;
+            (*context).rdx = bootstrap.registers.rdx;
+            (*context).rsi = bootstrap.registers.rsi;
+            (*context).rdi = bootstrap.registers.rdi;
+            (*context).rbp = bootstrap.registers.rbp;
+            (*context).r8 = bootstrap.registers.r8;
+            (*context).r9 = bootstrap.registers.r9;
+            (*context).r10 = bootstrap.registers.r10;
+            (*context).r11 = bootstrap.registers.r11;
+            (*context).r12 = bootstrap.registers.r12;
+            (*context).r13 = bootstrap.registers.r13;
+            (*context).r14 = bootstrap.registers.r14;
+            (*context).r15 = bootstrap.registers.r15;
+            (*context).rsp = bootstrap.stack_pointer.as_u64();
             (*context).ss = user_ss;
-            (*context).rip = entry.as_u64();
+            (*context).rip = bootstrap.entry.as_u64();
             (*context).cs = user_cs;
             (*context).rflags = rflags;
         }

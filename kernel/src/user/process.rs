@@ -121,6 +121,75 @@ pub struct SpawnedProcess {
     pub entry: VirtAddr,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProcessStartRegisters {
+    pub rax: u64,
+    pub rbx: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub rbp: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+}
+
+impl ProcessStartRegisters {
+    pub const fn with_sysv_args(arg0: u64, arg1: u64) -> Self {
+        Self {
+            rdi: arg0,
+            rsi: arg1,
+            ..Self::new()
+        }
+    }
+
+    pub const fn new() -> Self {
+        Self {
+            rax: 0,
+            rbx: 0,
+            rcx: 0,
+            rdx: 0,
+            rsi: 0,
+            rdi: 0,
+            rbp: 0,
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+        }
+    }
+
+    fn into_task_registers(self) -> multitask::UserTaskRegisters {
+        multitask::UserTaskRegisters {
+            rax: self.rax,
+            rbx: self.rbx,
+            rcx: self.rcx,
+            rdx: self.rdx,
+            rsi: self.rsi,
+            rdi: self.rdi,
+            rbp: self.rbp,
+            r8: self.r8,
+            r9: self.r9,
+            r10: self.r10,
+            r11: self.r11,
+            r12: self.r12,
+            r13: self.r13,
+            r14: self.r14,
+            r15: self.r15,
+        }
+    }
+}
+
 pub fn load_elf(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadError> {
     let elf = ElfFile::new(image).map_err(ProcessLoadError::InvalidElf)?;
     validate_elf_header(&elf)?;
@@ -895,6 +964,18 @@ pub fn spawn_process(
     arg0: u64,
     arg1: u64,
 ) -> Result<SpawnedProcess, ProcessLoadError> {
+    spawn_process_with_registers(
+        image,
+        weight_micros,
+        ProcessStartRegisters::with_sysv_args(arg0, arg1),
+    )
+}
+
+pub fn spawn_process_with_registers(
+    image: &[u8],
+    weight_micros: u64,
+    registers: ProcessStartRegisters,
+) -> Result<SpawnedProcess, ProcessLoadError> {
     let mut loaded = load_image(image)?;
 
     let stack_span_pages = USER_STACK_GUARD_PAGES + USER_STACK_PAGES;
@@ -915,14 +996,13 @@ pub fn spawn_process(
         PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE,
     )?;
     let user_stack_top = initial_user_stack_top(stack_region.end())?;
+    let mut bootstrap = multitask::UserTaskBootstrap::new(loaded.entry, user_stack_top);
+    bootstrap.registers = registers.into_task_registers();
 
     let pid = multitask::spawn_user_process(
         loaded.address_space,
-        loaded.entry,
-        user_stack_top,
+        bootstrap,
         weight_micros,
-        arg0,
-        arg1,
     )?;
 
     Ok(SpawnedProcess {

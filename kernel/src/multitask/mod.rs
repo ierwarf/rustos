@@ -48,6 +48,42 @@ impl SpawnTaskError {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UserTaskRegisters {
+    pub rax: u64,
+    pub rbx: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub rbp: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct UserTaskBootstrap {
+    pub entry: VirtAddr,
+    pub stack_pointer: VirtAddr,
+    pub registers: UserTaskRegisters,
+}
+
+impl UserTaskBootstrap {
+    pub fn new(entry: VirtAddr, stack_pointer: VirtAddr) -> Self {
+        Self {
+            entry,
+            stack_pointer,
+            registers: UserTaskRegisters::default(),
+        }
+    }
+}
+
 pub struct Thread {
     entry: fn(u64),
     id: u64,
@@ -104,11 +140,8 @@ impl Thread {
 
 pub fn spawn_user_process(
     address_space: ProcessAddressSpace,
-    entry: VirtAddr,
-    user_stack_top: VirtAddr,
+    bootstrap: UserTaskBootstrap,
     weight_micros: u64,
-    arg0: u64,
-    arg1: u64,
 ) -> Result<u64, SpawnTaskError> {
     let id = NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed);
     let pit_divisor = checked_thread_pit_divisor(weight_micros)?;
@@ -121,14 +154,11 @@ pub fn spawn_user_process(
             .allocate_user_slot(
                 id,
                 address_space,
-                entry,
-                user_stack_top,
+                bootstrap,
                 pit_divisor,
                 user_cs,
                 user_ss,
                 rflags,
-                arg0,
-                arg1,
                 noop_task_entry,
             )
             .ok_or(SpawnTaskError::NoFreeTaskSlot)
