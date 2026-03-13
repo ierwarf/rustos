@@ -15,6 +15,9 @@ use x86_64::registers::segmentation::{CS, SS, Segment};
 use self::context::SavedContext;
 use self::scheduler::Scheduler;
 use crate::paging::ProcessAddressSpace;
+use crate::session::ConsoleSessionId;
+use crate::user::abi::UserAbi;
+use crate::user::linux::LinuxTaskState;
 
 const MAIN_THREAD_SLICE_MICROS: u64 = 1_000;
 const MIN_THREAD_WEIGHT_MICROS: u64 = 1;
@@ -69,17 +72,23 @@ pub struct UserTaskRegisters {
 
 #[derive(Debug, Clone, Copy)]
 pub struct UserTaskBootstrap {
+    pub abi: UserAbi,
     pub entry: VirtAddr,
     pub stack_pointer: VirtAddr,
     pub registers: UserTaskRegisters,
+    pub linux_state: Option<LinuxTaskState>,
+    pub console_session: ConsoleSessionId,
 }
 
 impl UserTaskBootstrap {
-    pub fn new(entry: VirtAddr, stack_pointer: VirtAddr) -> Self {
+    pub fn new(abi: UserAbi, entry: VirtAddr, stack_pointer: VirtAddr) -> Self {
         Self {
+            abi,
             entry,
             stack_pointer,
             registers: UserTaskRegisters::default(),
+            linux_state: None,
+            console_session: ConsoleSessionId::PRIMARY,
         }
     }
 }
@@ -244,6 +253,24 @@ pub fn current_user_address_space() -> Option<&'static ProcessAddressSpace> {
     })
 }
 
+pub fn current_user_abi() -> Option<UserAbi> {
+    interrupts::without_interrupts(|| unsafe { scheduler_ref().current_user_abi() })
+}
+
+pub fn current_user_id() -> Option<u64> {
+    interrupts::without_interrupts(|| unsafe { scheduler_ref().current_user_id() })
+}
+
+pub fn current_console_session() -> ConsoleSessionId {
+    interrupts::without_interrupts(|| unsafe { scheduler_ref().current_console_session() })
+}
+
+pub fn with_current_user_process_mut<R>(
+    f: impl FnOnce(u64, UserAbi, &mut ProcessAddressSpace, &mut Option<LinuxTaskState>) -> R,
+) -> Option<R> {
+    interrupts::without_interrupts(|| unsafe { scheduler_mut().with_current_user_process_mut(f) })
+}
+
 pub fn retire_current_user_task_due_to_fault(
     vector: u8,
     error_code: Option<u64>,
@@ -278,6 +305,10 @@ pub fn set_current_last_error(value: u32) {
     });
 }
 
+pub fn service_deferred_work() -> usize {
+    interrupts::without_interrupts(|| unsafe { scheduler_mut().reap_inactive_retired_slots() })
+}
+
 unsafe extern "C" {
     fn timer_interrupt_handler();
 }
@@ -295,12 +326,10 @@ extern "C" fn timer_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut S
         let (next_rsp, next_pit_divisor) = scheduler.on_timer_interrupt(current_rsp);
         crate::pit::set_divisor(0, next_pit_divisor);
         scheduler.prepare_current_task_execution();
-        scheduler.reap_inactive_retired_slots();
         scheduler.restore_current_fx_state();
         next_rsp
     };
 
-    crate::input::poll_fallback();
     crate::pic::send_eoi(crate::pic::PIC_1_OFFSET);
     next_rsp as *mut SavedContext
 }

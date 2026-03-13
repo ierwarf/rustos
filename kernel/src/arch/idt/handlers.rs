@@ -43,7 +43,6 @@ fn is_user_mode(stack_frame: &InterruptStackFrame) -> bool {
 
 pub extern "x86-interrupt" fn rtc_interrupt_handler(_stack_frame: InterruptStackFrame) {
     crate::rtc::on_interrupt();
-    crate::input::poll_fallback();
     crate::pic::send_eoi(RTC_INTERRUPT_VECTOR);
 }
 

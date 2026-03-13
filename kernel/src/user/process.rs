@@ -5,12 +5,16 @@ use core::convert::TryFrom;
 use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
 use xmas_elf::ElfFile;
+use xmas_elf::dynamic::Tag as DynamicTag;
 use xmas_elf::header::{Class, Data, Machine, Type as ElfType};
-use xmas_elf::program::{ProgramHeader, Type as ProgramType};
+use xmas_elf::program::{ProgramHeader, SegmentData, Type as ProgramType};
 
 use crate::debug;
 use crate::multitask;
 use crate::paging::{self, AddressSpaceError, ProcessAddressSpace};
+use crate::session::ConsoleSessionId;
+use crate::user::abi::UserAbi;
+use crate::user::linux::{self, LinuxProcessImageInfo, LinuxProcessLaunch};
 use crate::win32;
 
 const PAGE_SIZE: u64 = 4096;
@@ -18,7 +22,12 @@ const MAX_LOAD_SEGMENTS: usize = 32;
 const USER_STACK_GUARD_PAGES: usize = 1;
 const USER_STACK_PAGES: usize = 8;
 const USER_STACK_TOP_EXCLUSIVE: u64 = paging::USER_SPACE_END_EXCLUSIVE;
+const ELF_DYN_LOAD_BASE: u64 = paging::USER_SPACE_BASE + 0x0040_0000;
 const PE_DEFAULT_LOAD_BASE: u64 = paging::USER_SPACE_BASE + 0x0040_0000;
+const ELF_RELOC_X86_64_RELATIVE: u32 = 8;
+const ELF_RELOC_X86_64_IRELATIVE: u32 = 37;
+const LINUX_STACK_RANDOM_BYTES: usize = 16;
+const LINUX_STACK_CLOCK_TICKS: u64 = 100;
 
 const PE_MACHINE_AMD64: u16 = 0x8664;
 const PE_MAGIC_PE32_PLUS: u16 = 0x20b;
@@ -112,11 +121,14 @@ impl ProcessLoadError {
 }
 
 pub struct LoadedProcessImage {
+    pub abi: UserAbi,
     pub address_space: ProcessAddressSpace,
     pub entry: VirtAddr,
+    runtime: LoadedProcessRuntime,
 }
 
 pub struct SpawnedProcess {
+    pub abi: UserAbi,
     pub pid: u64,
     pub entry: VirtAddr,
 }
@@ -141,6 +153,7 @@ pub struct ProcessStartRegisters {
 }
 
 impl ProcessStartRegisters {
+    #[allow(dead_code)]
     pub const fn with_sysv_args(arg0: u64, arg1: u64) -> Self {
         Self {
             rdi: arg0,
@@ -190,15 +203,62 @@ impl ProcessStartRegisters {
     }
 }
 
+#[derive(Clone, Copy)]
+enum LoadedProcessRuntime {
+    Linux(LinuxProcessImageInfo),
+    Windows,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessLaunchOptions<'a> {
+    pub registers: ProcessStartRegisters,
+    pub linux: LinuxProcessLaunch<'a>,
+    pub console_session: ConsoleSessionId,
+}
+
+impl<'a> Default for ProcessLaunchOptions<'a> {
+    fn default() -> Self {
+        Self {
+            registers: ProcessStartRegisters::new(),
+            linux: LinuxProcessLaunch::new(""),
+            console_session: ConsoleSessionId::PRIMARY,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ElfImageType {
+    Executable,
+    StaticPie,
+}
+
+#[derive(Clone, Copy)]
+struct ElfDynamicRelocationInfo {
+    rela_address: u64,
+    rela_size: u64,
+    rela_entry_size: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Rela64 {
+    offset: u64,
+    info: u64,
+    addend: i64,
+}
+
 pub fn load_elf(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadError> {
     let elf = ElfFile::new(image).map_err(ProcessLoadError::InvalidElf)?;
-    validate_elf_header(&elf)?;
+    let elf_image_type = validate_elf_header(&elf)?;
+    ensure_static_elf_policy(&elf)?;
+    let load_bias = choose_elf_load_bias(&elf, elf_image_type)?;
 
-    let entry = validate_entry_point(&elf)?;
+    let entry = validate_entry_point(&elf, load_bias)?;
     let mut address_space = ProcessAddressSpace::new()?;
 
     let mut loaded_segments = 0usize;
     let mut executable_entry_covered = false;
+    let mut max_loaded_end = 0_u64;
     let mut mapped_page_ranges = [(0_u64, 0_u64); MAX_LOAD_SEGMENTS];
 
     for ph in elf.program_iter() {
@@ -215,7 +275,7 @@ pub fn load_elf(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadError> {
         }
 
         validate_segment_policy(&ph)?;
-        let segment = validated_segment_bounds(image, &ph)?;
+        let segment = validated_segment_bounds(image, &ph, load_bias)?;
         if page_ranges_overlap(
             segment.page_base,
             segment.page_end,
@@ -224,6 +284,7 @@ pub fn load_elf(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadError> {
             return Err(ProcessLoadError::InvalidElf("PT_LOAD page ranges overlap"));
         }
         mapped_page_ranges[loaded_segments] = (segment.page_base, segment.page_end);
+        max_loaded_end = max_loaded_end.max(segment.end);
 
         if ph.flags().is_execute() && (segment.addr..segment.end).contains(&entry.as_u64()) {
             executable_entry_covered = true;
@@ -254,9 +315,17 @@ pub fn load_elf(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadError> {
         ));
     }
 
+    if matches!(elf_image_type, ElfImageType::StaticPie) {
+        apply_elf_dynamic_relocations(&elf, image, &address_space, load_bias)?;
+    }
+
+    let linux_image = build_linux_process_image(&elf, load_bias, max_loaded_end, entry.as_u64())?;
+
     Ok(LoadedProcessImage {
+        abi: UserAbi::Linux,
         address_space,
         entry,
+        runtime: LoadedProcessRuntime::Linux(linux_image),
     })
 }
 
@@ -334,8 +403,10 @@ fn load_pe(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadError> {
     resolve_pe_imports(image, &pe, &mut address_space, load_base)?;
 
     Ok(LoadedProcessImage {
+        abi: UserAbi::Windows,
         address_space,
         entry,
+        runtime: LoadedProcessRuntime::Windows,
     })
 }
 
@@ -958,23 +1029,108 @@ fn make_unsupported_import_error(dll_name: &[u8], function_name: &[u8]) -> Proce
     }
 }
 
+#[allow(dead_code)]
 pub fn spawn_process(
     image: &[u8],
     weight_micros: u64,
     arg0: u64,
     arg1: u64,
 ) -> Result<SpawnedProcess, ProcessLoadError> {
-    spawn_process_with_registers(
-        image,
-        weight_micros,
-        ProcessStartRegisters::with_sysv_args(arg0, arg1),
-    )
+    let launch = ProcessLaunchOptions {
+        registers: ProcessStartRegisters::with_sysv_args(arg0, arg1),
+        console_session: multitask::current_console_session(),
+        ..ProcessLaunchOptions::default()
+    };
+    spawn_process_with_launch(image, weight_micros, launch)
 }
 
+#[allow(dead_code)]
 pub fn spawn_process_with_registers(
     image: &[u8],
     weight_micros: u64,
     registers: ProcessStartRegisters,
+) -> Result<SpawnedProcess, ProcessLoadError> {
+    let launch = ProcessLaunchOptions {
+        registers,
+        console_session: multitask::current_console_session(),
+        ..ProcessLaunchOptions::default()
+    };
+    spawn_process_with_launch(image, weight_micros, launch)
+}
+
+/// Spawn a Linux user process with default registers, `argv[0] = exec_path`, and an empty env.
+pub fn spawn_linux_process(
+    image: &[u8],
+    weight_micros: u64,
+    exec_path: &str,
+) -> Result<SpawnedProcess, ProcessLoadError> {
+    spawn_linux_process_in_session(
+        image,
+        weight_micros,
+        exec_path,
+        multitask::current_console_session(),
+    )
+}
+
+pub fn spawn_linux_process_in_session(
+    image: &[u8],
+    weight_micros: u64,
+    exec_path: &str,
+    console_session: ConsoleSessionId,
+) -> Result<SpawnedProcess, ProcessLoadError> {
+    let argv = [exec_path];
+    spawn_linux_process_with_args_in_session(
+        image,
+        weight_micros,
+        exec_path,
+        &argv,
+        &[],
+        console_session,
+    )
+}
+
+/// Spawn a Linux user process with explicit `argv` and `env`.
+pub fn spawn_linux_process_with_args(
+    image: &[u8],
+    weight_micros: u64,
+    exec_path: &str,
+    argv: &[&str],
+    env: &[&str],
+) -> Result<SpawnedProcess, ProcessLoadError> {
+    spawn_linux_process_with_args_in_session(
+        image,
+        weight_micros,
+        exec_path,
+        argv,
+        env,
+        multitask::current_console_session(),
+    )
+}
+
+pub fn spawn_linux_process_with_args_in_session(
+    image: &[u8],
+    weight_micros: u64,
+    exec_path: &str,
+    argv: &[&str],
+    env: &[&str],
+    console_session: ConsoleSessionId,
+) -> Result<SpawnedProcess, ProcessLoadError> {
+    let launch = ProcessLaunchOptions {
+        linux: LinuxProcessLaunch {
+            exec_path,
+            argv,
+            env,
+        },
+        console_session,
+        ..ProcessLaunchOptions::default()
+    };
+    spawn_process_with_launch(image, weight_micros, launch)
+}
+
+pub fn spawn_process_with_launch(
+    image: &[u8],
+    weight_micros: u64,
+    launch: ProcessLaunchOptions<'_>,
 ) -> Result<SpawnedProcess, ProcessLoadError> {
     let mut loaded = load_image(image)?;
 
@@ -995,20 +1151,52 @@ pub fn spawn_process_with_registers(
         USER_STACK_PAGES,
         PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE,
     )?;
-    let user_stack_top = initial_user_stack_top(stack_region.end())?;
-    let mut bootstrap = multitask::UserTaskBootstrap::new(loaded.entry, user_stack_top);
-    bootstrap.registers = registers.into_task_registers();
-
-    let pid = multitask::spawn_user_process(
-        loaded.address_space,
-        bootstrap,
-        weight_micros,
+    let bootstrap = build_process_bootstrap(
+        loaded.runtime,
+        loaded.abi,
+        loaded.entry,
+        &loaded.address_space,
+        stack_region.end(),
+        launch,
     )?;
 
+    let pid = multitask::spawn_user_process(loaded.address_space, bootstrap, weight_micros)?;
+
     Ok(SpawnedProcess {
+        abi: loaded.abi,
         pid,
         entry: loaded.entry,
     })
+}
+
+fn build_process_bootstrap(
+    runtime: LoadedProcessRuntime,
+    abi: UserAbi,
+    entry: VirtAddr,
+    address_space: &ProcessAddressSpace,
+    stack_end: VirtAddr,
+    launch: ProcessLaunchOptions<'_>,
+) -> Result<multitask::UserTaskBootstrap, ProcessLoadError> {
+    let (stack_pointer, linux_state) = match (abi, runtime) {
+        (UserAbi::Linux, LoadedProcessRuntime::Linux(image)) => (
+            initialize_linux_user_stack(address_space, stack_end, image, launch.linux)?,
+            Some(image.initial_task_state()),
+        ),
+        (UserAbi::Windows, LoadedProcessRuntime::Windows) => {
+            (initial_user_stack_top(stack_end)?, None)
+        }
+        _ => {
+            return Err(ProcessLoadError::InvalidElf(
+                "process runtime metadata does not match ABI",
+            ));
+        }
+    };
+
+    let mut bootstrap = multitask::UserTaskBootstrap::new(abi, entry, stack_pointer);
+    bootstrap.registers = launch.registers.into_task_registers();
+    bootstrap.linux_state = linux_state;
+    bootstrap.console_session = launch.console_session;
+    Ok(bootstrap)
 }
 
 struct SegmentLoadInfo {
@@ -1020,7 +1208,7 @@ struct SegmentLoadInfo {
     file_end: usize,
 }
 
-fn validate_elf_header(elf: &ElfFile<'_>) -> Result<(), ProcessLoadError> {
+fn validate_elf_header(elf: &ElfFile<'_>) -> Result<ElfImageType, ProcessLoadError> {
     if elf.header.pt1.class() != Class::SixtyFour {
         return Err(ProcessLoadError::InvalidElf("ELF class is not 64-bit"));
     }
@@ -1032,14 +1220,67 @@ fn validate_elf_header(elf: &ElfFile<'_>) -> Result<(), ProcessLoadError> {
     if elf.header.pt2.machine().as_machine() != Machine::X86_64 {
         return Err(ProcessLoadError::InvalidElf("ELF machine is not x86_64"));
     }
-    if elf.header.pt2.type_().as_type() != ElfType::Executable {
-        return Err(ProcessLoadError::InvalidElf("ELF type is not executable"));
+
+    match elf.header.pt2.type_().as_type() {
+        ElfType::Executable => Ok(ElfImageType::Executable),
+        ElfType::SharedObject => Ok(ElfImageType::StaticPie),
+        _ => Err(ProcessLoadError::InvalidElf(
+            "ELF type is not executable or static PIE",
+        )),
     }
+}
+
+fn ensure_static_elf_policy(elf: &ElfFile<'_>) -> Result<(), ProcessLoadError> {
+    for ph in elf.program_iter() {
+        let ph_type = ph.get_type().map_err(ProcessLoadError::InvalidElf)?;
+        if ph_type == ProgramType::Interp {
+            return Err(ProcessLoadError::InvalidElf(
+                "dynamic loaders are not supported; use a static ELF",
+            ));
+        }
+    }
+
     Ok(())
 }
 
-fn validate_entry_point(elf: &ElfFile<'_>) -> Result<VirtAddr, ProcessLoadError> {
-    let entry = elf.header.pt2.entry_point();
+fn choose_elf_load_bias(
+    elf: &ElfFile<'_>,
+    image_type: ElfImageType,
+) -> Result<u64, ProcessLoadError> {
+    match image_type {
+        ElfImageType::Executable => Ok(0),
+        ElfImageType::StaticPie => {
+            let mut min_load_addr = u64::MAX;
+            for ph in elf.program_iter() {
+                let ph_type = ph.get_type().map_err(ProcessLoadError::InvalidElf)?;
+                if ph_type != ProgramType::Load || ph.mem_size() == 0 {
+                    continue;
+                }
+                min_load_addr = min_load_addr.min(align_down(ph.virtual_addr(), PAGE_SIZE));
+            }
+
+            if min_load_addr == u64::MAX {
+                return Err(ProcessLoadError::InvalidElf(
+                    "ELF does not contain PT_LOAD segments",
+                ));
+            }
+
+            ELF_DYN_LOAD_BASE
+                .checked_sub(min_load_addr)
+                .ok_or(ProcessLoadError::InvalidElf(
+                    "static PIE load bias underflow",
+                ))
+        }
+    }
+}
+
+fn validate_entry_point(elf: &ElfFile<'_>, load_bias: u64) -> Result<VirtAddr, ProcessLoadError> {
+    let entry = elf
+        .header
+        .pt2
+        .entry_point()
+        .checked_add(load_bias)
+        .ok_or(ProcessLoadError::InvalidElf("entry point address overflow"))?;
     if !(paging::USER_SPACE_BASE..paging::USER_SPACE_END_EXCLUSIVE).contains(&entry) {
         return Err(ProcessLoadError::InvalidElf(
             "entry point is outside the supported user range",
@@ -1051,6 +1292,7 @@ fn validate_entry_point(elf: &ElfFile<'_>) -> Result<VirtAddr, ProcessLoadError>
 fn validated_segment_bounds(
     image: &[u8],
     ph: &ProgramHeader<'_>,
+    load_bias: u64,
 ) -> Result<SegmentLoadInfo, ProcessLoadError> {
     validate_segment_alignment(ph)?;
 
@@ -1081,7 +1323,10 @@ fn validated_segment_bounds(
         ));
     }
 
-    let addr = ph.virtual_addr();
+    let addr = ph
+        .virtual_addr()
+        .checked_add(load_bias)
+        .ok_or(ProcessLoadError::InvalidElf("segment address overflow"))?;
     if !(paging::USER_SPACE_BASE..paging::USER_SPACE_END_EXCLUSIVE).contains(&addr) {
         return Err(ProcessLoadError::InvalidElf(
             "segment address is outside the supported user range",
@@ -1110,6 +1355,266 @@ fn validated_segment_bounds(
         file_offset,
         file_end,
     })
+}
+
+fn build_linux_process_image(
+    elf: &ElfFile<'_>,
+    load_bias: u64,
+    max_loaded_end: u64,
+    entry: u64,
+) -> Result<LinuxProcessImageInfo, ProcessLoadError> {
+    let program_headers = program_header_table_addr(elf, load_bias)?;
+    let brk_start = align_up(max_loaded_end, PAGE_SIZE).ok_or(ProcessLoadError::InvalidElf(
+        "initial brk calculation overflow",
+    ))?;
+
+    Ok(LinuxProcessImageInfo {
+        entry,
+        program_headers,
+        program_header_entry_size: elf.header.pt2.ph_entry_size() as u64,
+        program_header_count: elf.header.pt2.ph_count() as u64,
+        brk_start,
+    })
+}
+
+fn program_header_table_addr(elf: &ElfFile<'_>, load_bias: u64) -> Result<u64, ProcessLoadError> {
+    for ph in elf.program_iter() {
+        let ph_type = ph.get_type().map_err(ProcessLoadError::InvalidElf)?;
+        if ph_type == ProgramType::Phdr {
+            return ph
+                .virtual_addr()
+                .checked_add(load_bias)
+                .ok_or(ProcessLoadError::InvalidElf(
+                    "program header address overflow",
+                ));
+        }
+    }
+
+    let ph_offset = elf.header.pt2.ph_offset();
+    let ph_size = (elf.header.pt2.ph_entry_size() as u64)
+        .checked_mul(elf.header.pt2.ph_count() as u64)
+        .ok_or(ProcessLoadError::InvalidElf(
+            "program header table size overflow",
+        ))?;
+    let ph_end = ph_offset
+        .checked_add(ph_size)
+        .ok_or(ProcessLoadError::InvalidElf(
+            "program header table bounds overflow",
+        ))?;
+
+    for ph in elf.program_iter() {
+        let ph_type = ph.get_type().map_err(ProcessLoadError::InvalidElf)?;
+        if ph_type != ProgramType::Load || ph.file_size() == 0 {
+            continue;
+        }
+
+        let file_start = ph.offset();
+        let file_end = file_start
+            .checked_add(ph.file_size())
+            .ok_or(ProcessLoadError::InvalidElf("PT_LOAD file bounds overflow"))?;
+        if ph_offset < file_start || ph_end > file_end {
+            continue;
+        }
+
+        let table_delta = ph_offset - file_start;
+        return ph
+            .virtual_addr()
+            .checked_add(table_delta)
+            .and_then(|value| value.checked_add(load_bias))
+            .ok_or(ProcessLoadError::InvalidElf(
+                "program header table address overflow",
+            ));
+    }
+
+    Err(ProcessLoadError::InvalidElf(
+        "program header table is not mapped by PT_LOAD",
+    ))
+}
+
+fn apply_elf_dynamic_relocations(
+    elf: &ElfFile<'_>,
+    image: &[u8],
+    address_space: &ProcessAddressSpace,
+    load_bias: u64,
+) -> Result<(), ProcessLoadError> {
+    let Some(relocations) = parse_elf_dynamic_relocations(elf)? else {
+        return Ok(());
+    };
+
+    if relocations.rela_entry_size != core::mem::size_of::<Rela64>() as u64 {
+        return Err(ProcessLoadError::InvalidElf(
+            "ELF RELA entry size is not supported",
+        ));
+    }
+
+    let rela_size = usize::try_from(relocations.rela_size)
+        .map_err(|_| ProcessLoadError::InvalidElf("ELF RELA size is out of range"))?;
+    let rela_bytes =
+        elf_file_slice_from_virtual_address(image, elf, relocations.rela_address, rela_size)?;
+    if rela_bytes.len() % core::mem::size_of::<Rela64>() != 0 {
+        return Err(ProcessLoadError::InvalidElf(
+            "ELF RELA table size is not aligned",
+        ));
+    }
+
+    for chunk in rela_bytes.chunks_exact(core::mem::size_of::<Rela64>()) {
+        let relocation = read_rela64(chunk);
+        let relocation_type = relocation.info as u32;
+        if relocation_type == ELF_RELOC_X86_64_IRELATIVE {
+            return Err(ProcessLoadError::InvalidElf(
+                "IFUNC relocations are not supported for static PIE",
+            ));
+        }
+        if relocation_type != ELF_RELOC_X86_64_RELATIVE {
+            return Err(ProcessLoadError::InvalidElf(
+                "unsupported static PIE relocation type",
+            ));
+        }
+        if (relocation.info >> 32) != 0 {
+            return Err(ProcessLoadError::InvalidElf(
+                "static PIE relocation unexpectedly references a symbol",
+            ));
+        }
+
+        let target_addr =
+            relocation
+                .offset
+                .checked_add(load_bias)
+                .ok_or(ProcessLoadError::InvalidElf(
+                    "relocation target address overflow",
+                ))?;
+        let relocated = add_signed_u64(load_bias, relocation.addend)
+            .ok_or(ProcessLoadError::InvalidElf("relocation value overflow"))?;
+        address_space
+            .initialize_user_bytes(VirtAddr::new(target_addr), &relocated.to_le_bytes())?;
+    }
+
+    Ok(())
+}
+
+fn parse_elf_dynamic_relocations(
+    elf: &ElfFile<'_>,
+) -> Result<Option<ElfDynamicRelocationInfo>, ProcessLoadError> {
+    let Some(dynamic_segment) = elf.program_iter().find(|ph| {
+        ph.get_type()
+            .map(|kind| kind == ProgramType::Dynamic)
+            .unwrap_or(false)
+    }) else {
+        return Ok(None);
+    };
+
+    let mut info = ElfDynamicRelocationInfo {
+        rela_address: 0,
+        rela_size: 0,
+        rela_entry_size: 0,
+    };
+
+    let entries = match dynamic_segment
+        .get_data(elf)
+        .map_err(ProcessLoadError::InvalidElf)?
+    {
+        SegmentData::Dynamic64(entries) => entries,
+        _ => {
+            return Err(ProcessLoadError::InvalidElf(
+                "dynamic segment is not 64-bit",
+            ));
+        }
+    };
+
+    for entry in entries {
+        match entry.get_tag().map_err(ProcessLoadError::InvalidElf)? {
+            DynamicTag::Rela => {
+                info.rela_address = entry.get_ptr().map_err(ProcessLoadError::InvalidElf)?;
+            }
+            DynamicTag::RelaSize => {
+                info.rela_size = entry.get_val().map_err(ProcessLoadError::InvalidElf)?;
+            }
+            DynamicTag::RelaEnt => {
+                info.rela_entry_size = entry.get_val().map_err(ProcessLoadError::InvalidElf)?;
+            }
+            DynamicTag::Null => break,
+            _ => {}
+        }
+    }
+
+    if info.rela_size == 0 {
+        return Ok(None);
+    }
+    if info.rela_address == 0 || info.rela_entry_size == 0 {
+        return Err(ProcessLoadError::InvalidElf(
+            "dynamic relocation metadata is incomplete",
+        ));
+    }
+
+    Ok(Some(info))
+}
+
+fn elf_file_slice_from_virtual_address<'a>(
+    image: &'a [u8],
+    elf: &ElfFile<'_>,
+    virtual_address: u64,
+    len: usize,
+) -> Result<&'a [u8], ProcessLoadError> {
+    let end = virtual_address
+        .checked_add(len as u64)
+        .ok_or(ProcessLoadError::InvalidElf(
+            "ELF virtual slice bounds overflow",
+        ))?;
+
+    for ph in elf.program_iter() {
+        let ph_type = ph.get_type().map_err(ProcessLoadError::InvalidElf)?;
+        if ph_type != ProgramType::Load || ph.file_size() == 0 {
+            continue;
+        }
+
+        let segment_start = ph.virtual_addr();
+        let segment_end =
+            segment_start
+                .checked_add(ph.file_size())
+                .ok_or(ProcessLoadError::InvalidElf(
+                    "ELF PT_LOAD file-backed range overflow",
+                ))?;
+        if virtual_address < segment_start || end > segment_end {
+            continue;
+        }
+
+        let delta = usize::try_from(virtual_address - segment_start)
+            .map_err(|_| ProcessLoadError::InvalidElf("ELF virtual slice is out of range"))?;
+        let file_offset = usize::try_from(ph.offset())
+            .map_err(|_| ProcessLoadError::InvalidElf("ELF file offset is out of range"))?;
+        let start = file_offset
+            .checked_add(delta)
+            .ok_or(ProcessLoadError::InvalidElf(
+                "ELF file slice offset overflow",
+            ))?;
+        let end = start.checked_add(len).ok_or(ProcessLoadError::InvalidElf(
+            "ELF file slice bounds overflow",
+        ))?;
+        return image
+            .get(start..end)
+            .ok_or(ProcessLoadError::InvalidElf("ELF file slice is truncated"));
+    }
+
+    Err(ProcessLoadError::InvalidElf(
+        "ELF virtual slice is not covered by a PT_LOAD segment",
+    ))
+}
+
+fn read_rela64(bytes: &[u8]) -> Rela64 {
+    debug_assert_eq!(bytes.len(), core::mem::size_of::<Rela64>());
+    Rela64 {
+        offset: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+        info: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+        addend: i64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+    }
+}
+
+fn add_signed_u64(base: u64, delta: i64) -> Option<u64> {
+    if delta >= 0 {
+        base.checked_add(delta as u64)
+    } else {
+        base.checked_sub(delta.unsigned_abs())
+    }
 }
 
 fn page_ranges_overlap(page_base: u64, page_end: u64, existing_ranges: &[(u64, u64)]) -> bool {
@@ -1190,6 +1695,176 @@ fn initial_user_stack_top(stack_end: VirtAddr) -> Result<VirtAddr, ProcessLoadEr
             "user stack top calculation underflow",
         ))?;
     Ok(VirtAddr::new(user_stack_top))
+}
+
+fn initialize_linux_user_stack(
+    address_space: &ProcessAddressSpace,
+    stack_end: VirtAddr,
+    image: LinuxProcessImageInfo,
+    launch: LinuxProcessLaunch<'_>,
+) -> Result<VirtAddr, ProcessLoadError> {
+    let aligned_top = align_down(stack_end.as_u64(), 16);
+    let mut cursor = aligned_top;
+    let mut random_bytes = [0_u8; LINUX_STACK_RANDOM_BYTES];
+    crate::random::Random::new().fill_bytes(&mut random_bytes);
+    let random_addr = push_stack_bytes(
+        address_space,
+        &mut cursor,
+        &random_bytes,
+        16,
+        "linux AT_RANDOM placement overflow",
+    )?;
+
+    let exec_path = launch.exec_path;
+    let execfn_addr = if exec_path.is_empty() {
+        0
+    } else {
+        push_stack_c_string(
+            address_space,
+            &mut cursor,
+            exec_path,
+            "linux execfn placement overflow",
+        )?
+    };
+
+    let env_ptrs = push_stack_c_string_list(
+        address_space,
+        &mut cursor,
+        launch.env,
+        "linux env string placement overflow",
+    )?;
+
+    let argv_storage;
+    let argv_values = if launch.argv.is_empty() {
+        if exec_path.is_empty() {
+            &[][..]
+        } else {
+            argv_storage = vec![exec_path];
+            &argv_storage[..]
+        }
+    } else {
+        launch.argv
+    };
+    let argv_ptrs = push_stack_c_string_list(
+        address_space,
+        &mut cursor,
+        argv_values,
+        "linux argv string placement overflow",
+    )?;
+
+    let auxv = [
+        linux::AT_PHDR,
+        image.program_headers,
+        linux::AT_PHENT,
+        image.program_header_entry_size,
+        linux::AT_PHNUM,
+        image.program_header_count,
+        linux::AT_PAGESZ,
+        PAGE_SIZE,
+        linux::AT_BASE,
+        0,
+        linux::AT_FLAGS,
+        0,
+        linux::AT_ENTRY,
+        image.entry,
+        linux::AT_UID,
+        0,
+        linux::AT_EUID,
+        0,
+        linux::AT_GID,
+        0,
+        linux::AT_EGID,
+        0,
+        linux::AT_CLKTCK,
+        LINUX_STACK_CLOCK_TICKS,
+        linux::AT_SECURE,
+        0,
+        linux::AT_RANDOM,
+        random_addr,
+        linux::AT_HWCAP2,
+        0,
+        linux::AT_EXECFN,
+        execfn_addr,
+        linux::AT_NULL,
+        0,
+    ];
+
+    let mut stack_words = Vec::with_capacity(2 + argv_ptrs.len() + env_ptrs.len() + auxv.len());
+    stack_words.push(argv_ptrs.len() as u64);
+    stack_words.extend_from_slice(&argv_ptrs);
+    stack_words.push(0);
+    stack_words.extend_from_slice(&env_ptrs);
+    stack_words.push(0);
+    stack_words.extend_from_slice(&auxv);
+
+    let stack_bytes_len = stack_words
+        .len()
+        .checked_mul(core::mem::size_of::<u64>())
+        .ok_or(ProcessLoadError::InvalidElf(
+            "linux user stack size overflow",
+        ))? as u64;
+    let stack_start = align_down(
+        cursor
+            .checked_sub(stack_bytes_len)
+            .ok_or(ProcessLoadError::InvalidElf(
+                "linux user stack calculation underflow",
+            ))?,
+        16,
+    );
+    let mut stack_bytes = Vec::with_capacity(stack_words.len() * core::mem::size_of::<u64>());
+    for word in stack_words {
+        stack_bytes.extend_from_slice(&word.to_le_bytes());
+    }
+
+    address_space.initialize_user_bytes(VirtAddr::new(stack_start), &stack_bytes)?;
+    Ok(VirtAddr::new(stack_start))
+}
+
+fn push_stack_c_string_list(
+    address_space: &ProcessAddressSpace,
+    cursor: &mut u64,
+    values: &[&str],
+    overflow_reason: &'static str,
+) -> Result<Vec<u64>, ProcessLoadError> {
+    let mut pointers = Vec::with_capacity(values.len());
+    for value in values.iter().rev() {
+        pointers.push(push_stack_c_string(
+            address_space,
+            cursor,
+            value,
+            overflow_reason,
+        )?);
+    }
+    pointers.reverse();
+    Ok(pointers)
+}
+
+fn push_stack_c_string(
+    address_space: &ProcessAddressSpace,
+    cursor: &mut u64,
+    value: &str,
+    overflow_reason: &'static str,
+) -> Result<u64, ProcessLoadError> {
+    let mut bytes = Vec::with_capacity(value.len() + 1);
+    bytes.extend_from_slice(value.as_bytes());
+    bytes.push(0);
+    push_stack_bytes(address_space, cursor, &bytes, 1, overflow_reason)
+}
+
+fn push_stack_bytes(
+    address_space: &ProcessAddressSpace,
+    cursor: &mut u64,
+    bytes: &[u8],
+    align: u64,
+    overflow_reason: &'static str,
+) -> Result<u64, ProcessLoadError> {
+    let next = cursor
+        .checked_sub(bytes.len() as u64)
+        .ok_or(ProcessLoadError::InvalidElf(overflow_reason))?;
+    let aligned = align_down(next, align.max(1));
+    address_space.initialize_user_bytes(VirtAddr::new(aligned), bytes)?;
+    *cursor = aligned;
+    Ok(aligned)
 }
 
 fn align_down(value: u64, align: u64) -> u64 {

@@ -2,13 +2,18 @@ use alloc::boxed::Box;
 use core::{mem, ptr};
 
 use x86_64::PhysAddr;
+use x86_64::VirtAddr;
+use x86_64::registers::model_specific::FsBase;
 
 use crate::asmtools::{FxSaveArea, restore_fxstate, save_fxstate};
 use crate::debug;
 use crate::paging::ProcessAddressSpace;
+use crate::session::ConsoleSessionId;
+use crate::user::abi::UserAbi;
+use crate::user::linux::LinuxTaskState;
 
-use super::context::{SAVED_CONTEXT_BYTES, SavedContext};
 use super::UserTaskBootstrap;
+use super::context::{SAVED_CONTEXT_BYTES, SavedContext};
 
 pub(super) const MAX_TASK: usize = 32;
 const TASK_STACK_SIZE: usize = 16 * 1024;
@@ -36,6 +41,9 @@ struct TaskContext {
     address_space_root: u64,
     kernel_stack_top: u64,
     user_mode: bool,
+    user_abi: Option<UserAbi>,
+    linux_state: Option<LinuxTaskState>,
+    console_session: ConsoleSessionId,
     address_space_owner: *mut ProcessAddressSpace,
 }
 
@@ -53,6 +61,7 @@ pub(super) struct Scheduler {
     fx_states: [FxSaveArea; MAX_TASK],
     starts: [Option<TaskStart>; MAX_TASK],
     current_task: usize,
+    pending_reap: bool,
     stacks: [[u8; TASK_STACK_SIZE]; MAX_TASK],
 }
 
@@ -66,6 +75,7 @@ impl Scheduler {
             fx_states: [FxSaveArea::new(); MAX_TASK],
             starts: [None; MAX_TASK],
             current_task: 0,
+            pending_reap: false,
             stacks: [[0; TASK_STACK_SIZE]; MAX_TASK],
         }
     }
@@ -80,6 +90,7 @@ impl Scheduler {
         self.retire_reasons = [None; MAX_TASK];
         self.last_errors = [0; MAX_TASK];
         self.current_task = 0;
+        self.pending_reap = false;
         self.contexts[0] = Some(TaskContext {
             saved_rsp: 0,
             ready: true,
@@ -87,6 +98,9 @@ impl Scheduler {
             address_space_root: crate::paging::kernel_root_phys().as_u64(),
             kernel_stack_top: 0,
             user_mode: false,
+            user_abi: None,
+            linux_state: None,
+            console_session: ConsoleSessionId::PRIMARY,
             address_space_owner: ptr::null_mut(),
         });
 
@@ -110,6 +124,28 @@ impl Scheduler {
         self.last_errors[slot] = 0;
         self.fx_states[slot] = FxSaveArea::new();
         self.starts[slot] = None;
+    }
+
+    fn mark_slot_ready(&mut self, slot: usize, saved_rsp: usize, ready: bool) {
+        let Some(context) = self.contexts[slot].as_mut() else {
+            return;
+        };
+
+        context.saved_rsp = saved_rsp;
+        context.ready = ready;
+    }
+
+    fn retire_slot(&mut self, slot: usize, reason: TaskRetireReason) {
+        if slot == 0 {
+            panic!("scheduler bootstrap task cannot be retired");
+        }
+
+        self.retired[slot] = true;
+        self.pending_reap = true;
+        if let Some(context) = self.contexts[slot].as_mut() {
+            context.ready = false;
+        }
+        self.retire_reasons[slot] = Some(reason);
     }
 
     fn stack_bounds(&self, slot: usize) -> (usize, usize) {
@@ -185,6 +221,9 @@ impl Scheduler {
                     address_space_root: crate::paging::kernel_root_phys().as_u64(),
                     kernel_stack_top,
                     user_mode: false,
+                    user_abi: None,
+                    linux_state: None,
+                    console_session: ConsoleSessionId::PRIMARY,
                     address_space_owner: ptr::null_mut(),
                 });
                 self.fx_states[slot] = FxSaveArea::new();
@@ -215,18 +254,16 @@ impl Scheduler {
                 let kernel_stack_top = self.stack_top(slot) as u64;
 
                 self.contexts[slot] = Some(TaskContext {
-                    saved_rsp: self.init_user_task_context(
-                        slot,
-                        bootstrap,
-                        user_cs,
-                        user_ss,
-                        rflags,
-                    ),
+                    saved_rsp: self
+                        .init_user_task_context(slot, bootstrap, user_cs, user_ss, rflags),
                     ready: true,
                     pit_divisor,
                     address_space_root: root_phys,
                     kernel_stack_top,
                     user_mode: true,
+                    user_abi: Some(bootstrap.abi),
+                    linux_state: bootstrap.linux_state,
+                    console_session: bootstrap.console_session,
                     address_space_owner: raw_space,
                 });
                 self.fx_states[slot] = FxSaveArea::new();
@@ -314,20 +351,11 @@ impl Scheduler {
     }
 
     fn retire_slot_due_to_invalid_context(&mut self, slot: usize, saved_rsp: usize) {
-        let Some(_context) = self.contexts[slot] else {
+        if self.contexts[slot].is_none() {
             return;
-        };
-
-        if slot == 0 {
-            panic!("scheduler bootstrap task saved rsp is invalid: {saved_rsp:#x}");
         }
-
-        if let Some(current) = self.contexts[slot].as_mut() {
-            current.saved_rsp = saved_rsp;
-            current.ready = false;
-        }
-        self.retired[slot] = true;
-        self.retire_reasons[slot] = Some(TaskRetireReason::CorruptedContext { saved_rsp });
+        self.mark_slot_ready(slot, saved_rsp, false);
+        self.retire_slot(slot, TaskRetireReason::CorruptedContext { saved_rsp });
     }
 
     fn retire_invalid_ready_tasks(&mut self) {
@@ -349,15 +377,9 @@ impl Scheduler {
     pub(super) fn on_timer_interrupt(&mut self, current_rsp: usize) -> (usize, u16) {
         let current_slot = self.current_task;
         if self.retired[current_slot] {
-            if let Some(current) = self.contexts[current_slot].as_mut() {
-                current.saved_rsp = current_rsp;
-                current.ready = false;
-            }
+            self.mark_slot_ready(current_slot, current_rsp, false);
         } else if self.is_valid_saved_rsp(current_slot, current_rsp) {
-            if let Some(current) = self.contexts[current_slot].as_mut() {
-                current.saved_rsp = current_rsp;
-                current.ready = true;
-            }
+            self.mark_slot_ready(current_slot, current_rsp, true);
         } else {
             self.retire_slot_due_to_invalid_context(current_slot, current_rsp);
         }
@@ -396,10 +418,20 @@ impl Scheduler {
             crate::gdt::set_privilege_stack(current.kernel_stack_top);
             crate::syscall::set_kernel_stack_top(current.kernel_stack_top);
         }
+
+        let fs_base = current.linux_state.map(|state| state.fs_base).unwrap_or(0);
+        FsBase::write(VirtAddr::new(fs_base));
+        crate::syscall::prepare_for_context_return(self.context_returns_to_user(current));
     }
 
-    pub(super) fn reap_inactive_retired_slots(&mut self) {
+    pub(super) fn reap_inactive_retired_slots(&mut self) -> usize {
+        if !self.pending_reap {
+            return 0;
+        }
+
         let active_root = self.contexts[self.current_task].map(|ctx| ctx.address_space_root);
+        let mut still_pending = false;
+        let mut reaped = 0;
 
         for slot in 1..MAX_TASK {
             if !self.retired[slot] {
@@ -412,12 +444,17 @@ impl Scheduler {
             };
 
             if context.user_mode && Some(context.address_space_root) == active_root {
+                still_pending = true;
                 continue;
             }
 
             self.log_retired_slot(slot, context);
             self.clear_slot(slot);
+            reaped += 1;
         }
+
+        self.pending_reap = still_pending;
+        reaped
     }
 
     pub(super) fn save_current_fx_state(&mut self) {
@@ -441,6 +478,46 @@ impl Scheduler {
         Some(unsafe { &*context.address_space_owner })
     }
 
+    pub(super) fn current_user_abi(&self) -> Option<UserAbi> {
+        let context = self.contexts[self.current_task]?;
+        if !context.user_mode {
+            return None;
+        }
+
+        context.user_abi
+    }
+
+    pub(super) fn current_user_id(&self) -> Option<u64> {
+        let context = self.contexts[self.current_task]?;
+        if !context.user_mode {
+            return None;
+        }
+
+        self.starts[self.current_task].map(|start| start.id)
+    }
+
+    pub(super) fn current_console_session(&self) -> ConsoleSessionId {
+        self.contexts[self.current_task]
+            .map(|context| context.console_session)
+            .unwrap_or(ConsoleSessionId::PRIMARY)
+    }
+
+    pub(super) fn with_current_user_process_mut<R>(
+        &mut self,
+        f: impl FnOnce(u64, UserAbi, &mut ProcessAddressSpace, &mut Option<LinuxTaskState>) -> R,
+    ) -> Option<R> {
+        let slot = self.current_task;
+        let context = self.contexts[slot].as_mut()?;
+        if !context.user_mode || context.address_space_owner.is_null() {
+            return None;
+        }
+
+        let abi = context.user_abi?;
+        let id = self.starts[slot].map(|start| start.id)?;
+        let address_space = unsafe { &mut *context.address_space_owner };
+        Some(f(id, abi, address_space, &mut context.linux_state))
+    }
+
     pub(super) fn retire_current_user_task_due_to_fault(
         &mut self,
         vector: u8,
@@ -456,16 +533,15 @@ impl Scheduler {
             return false;
         }
 
-        self.retired[slot] = true;
-        if let Some(current) = self.contexts[slot].as_mut() {
-            current.ready = false;
-        }
-        self.retire_reasons[slot] = Some(TaskRetireReason::UserFault {
-            vector,
-            error_code,
-            cr2,
-            rip,
-        });
+        self.retire_slot(
+            slot,
+            TaskRetireReason::UserFault {
+                vector,
+                error_code,
+                cr2,
+                rip,
+            },
+        );
         true
     }
 
@@ -478,21 +554,22 @@ impl Scheduler {
     }
 
     pub(super) fn exit_current_task(&mut self) {
-        if self.contexts[self.current_task]
-            .map(|ctx| ctx.user_mode)
-            .unwrap_or(false)
-        {
-            self.retired[self.current_task] = true;
-            if let Some(current) = self.contexts[self.current_task].as_mut() {
-                current.ready = false;
-            }
-            if self.retire_reasons[self.current_task].is_none() {
-                self.retire_reasons[self.current_task] = Some(TaskRetireReason::Exited);
-            }
-            return;
+        let slot = self.current_task;
+        if slot == 0 {
+            panic!("scheduler bootstrap task cannot exit");
         }
 
-        self.clear_slot(self.current_task);
+        self.mark_slot_ready(
+            slot,
+            self.contexts[slot].map(|ctx| ctx.saved_rsp).unwrap_or(0),
+            false,
+        );
+        if self.retire_reasons[slot].is_none() {
+            self.retire_slot(slot, TaskRetireReason::Exited);
+        } else {
+            self.retired[slot] = true;
+            self.pending_reap = true;
+        }
     }
 
     fn log_retired_slot(&self, slot: usize, context: TaskContext) {
@@ -530,9 +607,10 @@ impl Scheduler {
             }
             Some(TaskRetireReason::Exited) => {
                 debug::println!(
-                    "scheduler: reaped exited user task pid={} slot={}",
+                    "scheduler: reaped exited task pid={} slot={} user_mode={}",
                     id,
-                    slot
+                    slot,
+                    context.user_mode,
                 );
             }
             None => {
@@ -544,5 +622,18 @@ impl Scheduler {
                 );
             }
         }
+    }
+
+    fn context_returns_to_user(&self, context: TaskContext) -> bool {
+        Self::saved_context_returns_to_user(context.saved_rsp)
+    }
+
+    fn saved_context_returns_to_user(saved_rsp: usize) -> bool {
+        if saved_rsp == 0 {
+            return false;
+        }
+
+        let saved = unsafe { &*(saved_rsp as *const SavedContext) };
+        (saved.cs & 0x3) == 0x3
     }
 }

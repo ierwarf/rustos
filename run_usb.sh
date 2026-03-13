@@ -32,6 +32,8 @@ qemu-system-x86_64 \
   -drive if=ide,index=0,media=disk,format=raw,file="$USB_DEV" \
   -net none \
   -m 2G \
+  -device qemu-xhci,id=xhci,p2=15,p3=15 \
+  -device usb-mouse,bus=xhci.0 \
   -monitor none \
   -debugcon stdio \
   -global isa-debugcon.iobase=0xe9 \

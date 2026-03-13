@@ -275,10 +275,10 @@ pub fn pop_event() -> Option<KeyboardEvent> {
     interrupts::without_interrupts(|| KEYBOARD.lock().pop_event())
 }
 
-pub fn drain_events_to_tty() -> usize {
+pub fn drain_events(mut sink: impl FnMut(KeyboardEvent)) -> usize {
     let mut flushed = 0;
     while let Some(event) = pop_event() {
-        crate::tty::on_key_event(event);
+        sink(event);
         flushed += 1;
     }
     flushed

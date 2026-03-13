@@ -9,13 +9,14 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use spin::Mutex;
 use x86_64::instructions::interrupts;
 
+use super::mouse;
 use crate::arch::pci::{self, PciDevice, UsbHostControllerKind};
 use crate::keyboard::{self, KeyCode};
 
 const USB_POLL_INTERVAL_TICKS: u8 = 2;
 const XHCI_POLL_SPINS: usize = 5_000_000;
 const XHCI_RING_TRBS: usize = 256;
-const USB_REPORT_LEN: usize = 8;
+const MAX_HID_REPORT_LEN: usize = 8;
 const MAX_CONTROL_BUFFER: usize = 512;
 
 const CAP_HCSPARAMS1: usize = 0x04;
@@ -97,9 +98,10 @@ const DESC_ENDPOINT: u8 = 0x05;
 const HID_CLASS: u8 = 0x03;
 const HID_SUBCLASS_BOOT: u8 = 0x01;
 const HID_PROTOCOL_KEYBOARD: u8 = 0x01;
+const HID_PROTOCOL_MOUSE: u8 = 0x02;
 const ENDPOINT_ATTR_INTERRUPT: u8 = 0x03;
 
-static USB_KEYBOARD: Mutex<Option<UsbKeyboardDriver>> = Mutex::new(None);
+static USB_INPUTS: Mutex<Vec<UsbControllerDriver>> = Mutex::new(Vec::new());
 static USB_POLL_TICKS: AtomicU8 = AtomicU8::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -109,62 +111,156 @@ pub(crate) struct UsbKeyboardInfo {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum UsbKeyboardInitResult {
-    Ready(UsbKeyboardInfo),
-    Unavailable(&'static str),
+pub(crate) struct UsbMouseInfo {
+    pub controller: PciDevice,
+    pub port_id: u8,
 }
 
-pub fn init() -> UsbKeyboardInitResult {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct UsbInputInitResult {
+    pub keyboard: Option<UsbKeyboardInfo>,
+    pub mouse: Option<UsbMouseInfo>,
+    pub error: Option<&'static str>,
+}
+
+pub fn init() -> UsbInputInitResult {
     interrupts::without_interrupts(|| {
-        let mut guard = USB_KEYBOARD.lock();
-        match UsbKeyboardDriver::new() {
-            Ok(driver) => {
-                let info = driver.info();
-                *guard = Some(driver);
-                UsbKeyboardInitResult::Ready(info)
+        let mut summary = ProbeSummary::new();
+        let mut drivers = Vec::new();
+        let mut keyboard = None;
+        let mut mouse = None;
+
+        pci::visit_usb_controllers(|pci, kind| {
+            summary.record_controller(kind);
+            match kind {
+                UsbHostControllerKind::Xhci => match UsbControllerDriver::new_on_controller(pci) {
+                    Ok(Some(driver)) => {
+                        if keyboard.is_none() {
+                            keyboard = driver.keyboard_info();
+                        }
+                        if mouse.is_none() {
+                            mouse = driver.mouse_info();
+                        }
+                        drivers.push(driver);
+                    }
+                    Ok(None) => {
+                        summary.record_inputless_xhci();
+                        crate::debug::println!(
+                            "xHCI {:04x}:{:04x} on {:04x}:{:02x}:{:02x}.{} has no HID boot keyboard or mouse.",
+                            pci.vendor_id(),
+                            pci.device_id(),
+                            pci.segment,
+                            pci.bus,
+                            pci.device,
+                            pci.function,
+                        );
+                    }
+                    Err(err) => {
+                        summary.record_xhci_error(err);
+                        crate::debug::println!(
+                            "xHCI {:04x}:{:04x} on {:04x}:{:02x}:{:02x}.{} probe failed: {}",
+                            pci.vendor_id(),
+                            pci.device_id(),
+                            pci.segment,
+                            pci.bus,
+                            pci.device,
+                            pci.function,
+                            err,
+                        );
+                    }
+                },
+                other => {
+                    crate::debug::println!(
+                        "{} {:04x}:{:04x} on {:04x}:{:02x}:{:02x}.{} is present but unsupported by the current USB input backend.",
+                        other.name(),
+                        pci.vendor_id(),
+                        pci.device_id(),
+                        pci.segment,
+                        pci.bus,
+                        pci.device,
+                        pci.function,
+                    );
+                }
             }
-            Err(err) => {
-                *guard = None;
-                UsbKeyboardInitResult::Unavailable(err)
-            }
+            false
+        });
+
+        *USB_INPUTS.lock() = drivers;
+        UsbInputInitResult {
+            keyboard,
+            mouse,
+            error: if keyboard.is_none() && mouse.is_none() {
+                Some(summary.error())
+            } else {
+                None
+            },
         }
     })
 }
 
-pub fn poll_fallback() {
+pub fn poll_fallback() -> usize {
     let ticks = USB_POLL_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     if ticks < USB_POLL_INTERVAL_TICKS {
-        return;
+        return 0;
     }
 
     USB_POLL_TICKS.store(0, Ordering::Relaxed);
-    poll();
+    poll()
 }
 
-pub fn poll() {
+pub fn poll() -> usize {
     interrupts::without_interrupts(|| {
-        let mut guard = USB_KEYBOARD.lock();
-        if let Some(driver) = guard.as_mut() {
-            driver.poll();
+        let mut total = 0;
+        let mut guard = USB_INPUTS.lock();
+        for driver in guard.iter_mut() {
+            total += driver.poll();
         }
-    });
+        total
+    })
 }
 
-struct UsbKeyboardDriver {
+struct UsbControllerDriver {
     controller: XhciController,
-    slot_id: u8,
-    port_id: u8,
+    slots: Vec<UsbSlotDriver>,
+}
+
+struct UsbSlotDriver {
+    slot: XhciSlotResources,
+    keyboard: Option<UsbKeyboardEndpoint>,
+    mouse: Option<UsbMouseEndpoint>,
+}
+
+struct UsbKeyboardEndpoint {
     interrupt_dci: u8,
     report_buffer: DmaBlock,
-    last_report: [u8; USB_REPORT_LEN],
+    report_len: usize,
+    last_report: [u8; MAX_HID_REPORT_LEN],
     transfer_armed: bool,
+    ring: ProducerRing,
+}
+
+struct UsbMouseEndpoint {
+    interrupt_dci: u8,
+    report_buffer: DmaBlock,
+    report_len: usize,
+    last_buttons: u8,
+    transfer_armed: bool,
+    ring: ProducerRing,
+}
+
+struct XhciSlotResources {
+    slot_id: u8,
+    port_id: u8,
+    speed: u8,
+    device_context: DmaBlock,
+    ep0_ring: ProducerRing,
 }
 
 struct ProbeSummary {
     found_usb_controller: bool,
     found_xhci_controller: bool,
     found_legacy_usb_controller: bool,
-    found_keyboardless_controller: bool,
+    found_inputless_xhci: bool,
     last_xhci_error: &'static str,
 }
 
@@ -174,7 +270,7 @@ impl ProbeSummary {
             found_usb_controller: false,
             found_xhci_controller: false,
             found_legacy_usb_controller: false,
-            found_keyboardless_controller: false,
+            found_inputless_xhci: false,
             last_xhci_error: "no xHCI controller",
         }
     }
@@ -190,8 +286,8 @@ impl ProbeSummary {
         }
     }
 
-    fn record_keyboardless_xhci(&mut self) {
-        self.found_keyboardless_controller = true;
+    fn record_inputless_xhci(&mut self) {
+        self.found_inputless_xhci = true;
     }
 
     fn record_xhci_error(&mut self, err: &'static str) {
@@ -199,14 +295,14 @@ impl ProbeSummary {
     }
 
     fn error(self) -> &'static str {
-        if self.found_keyboardless_controller {
-            return "no HID boot keyboard found on any xHCI controller";
+        if self.found_inputless_xhci {
+            return "no HID boot keyboard or mouse found on any xHCI controller";
         }
         if self.found_xhci_controller {
             return self.last_xhci_error;
         }
         if self.found_legacy_usb_controller {
-            return "found only legacy USB controllers (UHCI/OHCI/EHCI); non-xHCI USB keyboard support is not implemented";
+            return "found only legacy USB controllers (UHCI/OHCI/EHCI); non-xHCI USB input support is not implemented";
         }
         if self.found_usb_controller {
             return "found only unsupported USB host controllers";
@@ -215,235 +311,320 @@ impl ProbeSummary {
     }
 }
 
-impl UsbKeyboardDriver {
-    fn new() -> Result<Self, &'static str> {
-        let mut summary = ProbeSummary::new();
-        let mut driver = None;
-
-        pci::visit_usb_controllers(|pci, kind| {
-            summary.record_controller(kind);
-            match kind {
-                UsbHostControllerKind::Xhci => match Self::new_on_controller(pci) {
-                    Ok(Some(candidate)) => {
-                        driver = Some(candidate);
-                        true
-                    }
-                    Ok(None) => {
-                        summary.record_keyboardless_xhci();
-                        crate::debug::println!(
-                            "xHCI {:04x}:{:04x} on {:04x}:{:02x}:{:02x}.{} has no HID boot keyboard.",
-                            pci.vendor_id(),
-                            pci.device_id(),
-                            pci.segment,
-                            pci.bus,
-                            pci.device,
-                            pci.function,
-                        );
-                        false
-                    }
-                    Err(err) => {
-                        summary.record_xhci_error(err);
-                        crate::debug::println!(
-                            "xHCI {:04x}:{:04x} on {:04x}:{:02x}:{:02x}.{} probe failed: {}",
-                            pci.vendor_id(),
-                            pci.device_id(),
-                            pci.segment,
-                            pci.bus,
-                            pci.device,
-                            pci.function,
-                            err,
-                        );
-                        false
-                    }
-                },
-                other => {
-                    crate::debug::println!(
-                        "{} {:04x}:{:04x} on {:04x}:{:02x}:{:02x}.{} is present but unsupported by the current USB keyboard backend.",
-                        other.name(),
-                        pci.vendor_id(),
-                        pci.device_id(),
-                        pci.segment,
-                        pci.bus,
-                        pci.device,
-                        pci.function,
-                    );
-                    false
-                }
-            }
-        });
-
-        if let Some(driver) = driver {
-            return Ok(driver);
-        }
-
-        Err(summary.error())
-    }
-
+impl UsbControllerDriver {
     fn new_on_controller(pci: PciDevice) -> Result<Option<Self>, &'static str> {
-        let mut controller = XhciController::new(pci)?;
-        let report_buffer = DmaBlock::new(USB_REPORT_LEN, 64)?;
+        let controller = XhciController::new(pci)?;
+        let mut driver = Self {
+            controller,
+            slots: Vec::new(),
+        };
         let control_buffer = DmaBlock::new(MAX_CONTROL_BUFFER, 64)?;
 
-        for port_id in 1..=controller.max_ports {
-            if let Some(device) =
-                Self::try_enumerate_keyboard(&mut controller, port_id, &control_buffer)?
-            {
-                let mut driver = Self {
-                    controller,
-                    slot_id: device.slot_id,
-                    port_id,
-                    interrupt_dci: device.interrupt_dci,
-                    report_buffer,
-                    last_report: [0; USB_REPORT_LEN],
-                    transfer_armed: false,
-                };
-                driver.arm_interrupt_transfer()?;
-                return Ok(Some(driver));
+        for port_id in 1..=driver.controller.max_ports {
+            match driver.try_enumerate_port(port_id, &control_buffer) {
+                Ok(Some(slot)) => driver.slots.push(slot),
+                Ok(None) => {}
+                Err(err) => {
+                    crate::debug::println!("USB input probe on port {} failed: {}", port_id, err,);
+                    driver.controller.clear_port_changes(port_id);
+                }
             }
         }
 
-        Ok(None)
-    }
-
-    fn info(&self) -> UsbKeyboardInfo {
-        UsbKeyboardInfo {
-            controller: self.controller.pci,
-            port_id: self.port_id,
+        if driver.slots.is_empty() {
+            return Ok(None);
         }
+
+        driver.arm_interrupt_transfers()?;
+        Ok(Some(driver))
     }
 
-    fn try_enumerate_keyboard(
-        controller: &mut XhciController,
+    fn keyboard_info(&self) -> Option<UsbKeyboardInfo> {
+        self.slots.iter().find_map(|slot| {
+            slot.keyboard.as_ref().map(|_| UsbKeyboardInfo {
+                controller: self.controller.pci,
+                port_id: slot.slot.port_id,
+            })
+        })
+    }
+
+    fn mouse_info(&self) -> Option<UsbMouseInfo> {
+        self.slots.iter().find_map(|slot| {
+            slot.mouse.as_ref().map(|_| UsbMouseInfo {
+                controller: self.controller.pci,
+                port_id: slot.slot.port_id,
+            })
+        })
+    }
+
+    fn arm_interrupt_transfers(&mut self) -> Result<(), &'static str> {
+        for slot in self.slots.iter_mut() {
+            if let Some(keyboard) = slot.keyboard.as_mut() {
+                keyboard.arm_interrupt_transfer(&mut self.controller, slot.slot.slot_id)?;
+            }
+            if let Some(mouse) = slot.mouse.as_mut() {
+                mouse.arm_interrupt_transfer(&mut self.controller, slot.slot.slot_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn try_enumerate_port(
+        &mut self,
         port_id: u8,
         control_buffer: &DmaBlock,
-    ) -> Result<Option<UsbKeyboardDevice>, &'static str> {
-        let portsc = controller.read_portsc(port_id);
+    ) -> Result<Option<UsbSlotDriver>, &'static str> {
+        let portsc = self.controller.read_portsc(port_id);
         if portsc & PORTSC_CCS == 0 {
             return Ok(None);
         }
 
-        controller.reset_port(port_id)?;
-        let speed = controller.port_speed(port_id);
+        self.controller.reset_port(port_id)?;
+        let speed = self.controller.port_speed(port_id);
         if speed == 0 {
             return Ok(None);
         }
 
-        let slot_id = controller.enable_slot()?;
-        if controller.address_device(slot_id, port_id, speed)? == 0 {
-            controller.disable_slot(slot_id)?;
-            return Ok(None);
-        }
+        let slot_id = self.controller.enable_slot()?;
+        let mut slot = XhciSlotResources::new(slot_id, port_id, speed, self.controller.ctx_size)?;
+        let result = (|| -> Result<Option<UsbSlotDriver>, &'static str> {
+            self.controller.address_device(&mut slot)?;
 
-        let initial_device = controller.get_descriptor(
-            slot_id,
-            control_buffer,
-            0x80,
-            REQ_GET_DESCRIPTOR,
-            ((DESC_DEVICE as u16) << 8) | 0,
-            0,
-            8,
-        )?;
-        let max_packet = match speed {
-            4.. => {
-                let exp = *initial_device.get(7).ok_or("short device descriptor")?;
-                1_u16 << min(exp, 15)
+            let initial_device = self.controller.get_descriptor(
+                &mut slot,
+                control_buffer,
+                0x80,
+                REQ_GET_DESCRIPTOR,
+                ((DESC_DEVICE as u16) << 8) | 0,
+                0,
+                8,
+            )?;
+            let max_packet = match speed {
+                4.. => {
+                    let exp = *initial_device.get(7).ok_or("short device descriptor")?;
+                    1_u16 << min(exp, 15)
+                }
+                _ => *initial_device.get(7).ok_or("short device descriptor")? as u16,
+            };
+            self.controller
+                .update_ep0_max_packet(&mut slot, max_packet)?;
+
+            let config_header = self.controller.get_descriptor(
+                &mut slot,
+                control_buffer,
+                0x80,
+                REQ_GET_DESCRIPTOR,
+                ((DESC_CONFIGURATION as u16) << 8) | 0,
+                0,
+                9,
+            )?;
+            if config_header.len() < 9 {
+                return Ok(None);
             }
-            _ => *initial_device.get(7).ok_or("short device descriptor")? as u16,
-        };
-        controller.update_ep0_max_packet(slot_id, port_id, speed, max_packet)?;
 
-        let config_header = controller.get_descriptor(
-            slot_id,
-            control_buffer,
-            0x80,
-            REQ_GET_DESCRIPTOR,
-            ((DESC_CONFIGURATION as u16) << 8) | 0,
-            0,
-            9,
-        )?;
-        if config_header.len() < 9 {
-            controller.disable_slot(slot_id)?;
-            return Ok(None);
+            let total_length = u16::from_le_bytes([config_header[2], config_header[3]]) as usize;
+            if total_length == 0 || total_length > MAX_CONTROL_BUFFER {
+                return Ok(None);
+            }
+
+            let config = self.controller.get_descriptor(
+                &mut slot,
+                control_buffer,
+                0x80,
+                REQ_GET_DESCRIPTOR,
+                ((DESC_CONFIGURATION as u16) << 8) | 0,
+                0,
+                total_length as u16,
+            )?;
+            let interfaces = parse_boot_hid_interfaces(config);
+            if interfaces.configuration_value == 0
+                || (interfaces.keyboard.is_none() && interfaces.mouse.is_none())
+            {
+                return Ok(None);
+            }
+
+            let mut keyboard = None;
+            let mut usb_mouse = None;
+            let mut endpoints = Vec::new();
+
+            if let Some(descriptor) = interfaces.keyboard {
+                let endpoint = UsbKeyboardEndpoint::new(descriptor)?;
+                endpoints.push(endpoint.setup(descriptor));
+                keyboard = Some(endpoint);
+            }
+            if let Some(descriptor) = interfaces.mouse {
+                let endpoint = UsbMouseEndpoint::new(descriptor)?;
+                endpoints.push(endpoint.setup(descriptor));
+                usb_mouse = Some(endpoint);
+            }
+
+            if endpoints.is_empty() {
+                return Ok(None);
+            }
+
+            self.controller
+                .configure_interrupt_endpoints(&mut slot, &endpoints)?;
+            self.controller.control_no_data(
+                &mut slot,
+                0x00,
+                REQ_SET_CONFIGURATION,
+                interfaces.configuration_value as u16,
+                0,
+            )?;
+
+            if let Some(descriptor) = interfaces.keyboard {
+                let _ = self.controller.control_no_data(
+                    &mut slot,
+                    0x21,
+                    HID_REQ_SET_PROTOCOL,
+                    0,
+                    descriptor.interface_number as u16,
+                );
+                let _ = self.controller.control_no_data(
+                    &mut slot,
+                    0x21,
+                    HID_REQ_SET_IDLE,
+                    0,
+                    descriptor.interface_number as u16,
+                );
+            }
+            if let Some(descriptor) = interfaces.mouse {
+                let _ = self.controller.control_no_data(
+                    &mut slot,
+                    0x21,
+                    HID_REQ_SET_PROTOCOL,
+                    0,
+                    descriptor.interface_number as u16,
+                );
+                let _ = self.controller.control_no_data(
+                    &mut slot,
+                    0x21,
+                    HID_REQ_SET_IDLE,
+                    0,
+                    descriptor.interface_number as u16,
+                );
+            }
+
+            Ok(Some(UsbSlotDriver {
+                slot,
+                keyboard,
+                mouse: usb_mouse,
+            }))
+        })();
+
+        match result {
+            Ok(Some(slot)) => Ok(Some(slot)),
+            Ok(None) => {
+                let _ = self.controller.disable_slot(slot_id);
+                self.controller.clear_slot_pointer(slot_id);
+                Ok(None)
+            }
+            Err(err) => {
+                let _ = self.controller.disable_slot(slot_id);
+                self.controller.clear_slot_pointer(slot_id);
+                Err(err)
+            }
         }
-        let total_length = u16::from_le_bytes([config_header[2], config_header[3]]) as usize;
-        if total_length == 0 || total_length > MAX_CONTROL_BUFFER {
-            controller.disable_slot(slot_id)?;
-            return Ok(None);
-        }
-
-        let config = controller.get_descriptor(
-            slot_id,
-            control_buffer,
-            0x80,
-            REQ_GET_DESCRIPTOR,
-            ((DESC_CONFIGURATION as u16) << 8) | 0,
-            0,
-            total_length as u16,
-        )?;
-        let Some(descriptor) = parse_boot_keyboard_interface(&config) else {
-            controller.disable_slot(slot_id)?;
-            return Ok(None);
-        };
-
-        controller.configure_interrupt_endpoint(slot_id, port_id, speed, &descriptor)?;
-        controller.control_no_data(
-            slot_id,
-            0x00,
-            REQ_SET_CONFIGURATION,
-            descriptor.configuration_value as u16,
-            0,
-        )?;
-        let _ = controller.control_no_data(
-            slot_id,
-            0x21,
-            HID_REQ_SET_PROTOCOL,
-            0,
-            descriptor.interface_number as u16,
-        );
-        let _ = controller.control_no_data(
-            slot_id,
-            0x21,
-            HID_REQ_SET_IDLE,
-            0,
-            descriptor.interface_number as u16,
-        );
-
-        Ok(Some(UsbKeyboardDevice {
-            slot_id,
-            interrupt_dci: endpoint_dci(descriptor.endpoint_address),
-        }))
     }
 
-    fn arm_interrupt_transfer(&mut self) -> Result<(), &'static str> {
-        let trb = Trb::normal(self.report_buffer.phys(), USB_REPORT_LEN as u32, true);
-        self.controller
-            .queue_transfer(self.slot_id, self.interrupt_dci, trb);
+    fn poll(&mut self) -> usize {
+        let mut work = 0;
+        while let Some(event) = self.controller.next_event() {
+            match event.trb_type() {
+                TRB_TYPE_TRANSFER_EVENT => work += self.handle_transfer_event(event),
+                TRB_TYPE_PORT_STATUS_CHANGE => {
+                    self.controller
+                        .clear_port_changes(self.controller.port_from_event(event));
+                    work += 1;
+                }
+                _ => {}
+            }
+        }
+        work
+    }
+
+    fn handle_transfer_event(&mut self, event: Trb) -> usize {
+        for slot in self.slots.iter_mut() {
+            if slot.slot.slot_id != event.slot_id() {
+                continue;
+            }
+
+            if let Some(keyboard) = slot.keyboard.as_mut() {
+                if keyboard.interrupt_dci == event.endpoint_id() {
+                    return keyboard.handle_transfer_event(
+                        &mut self.controller,
+                        slot.slot.slot_id,
+                        event,
+                    );
+                }
+            }
+            if let Some(mouse) = slot.mouse.as_mut() {
+                if mouse.interrupt_dci == event.endpoint_id() {
+                    return mouse.handle_transfer_event(
+                        &mut self.controller,
+                        slot.slot.slot_id,
+                        event,
+                    );
+                }
+            }
+            return 0;
+        }
+        0
+    }
+}
+
+impl UsbKeyboardEndpoint {
+    fn new(descriptor: BootHidDescriptor) -> Result<Self, &'static str> {
+        let report_len = descriptor.max_packet_size as usize;
+        if report_len == 0 || report_len > MAX_HID_REPORT_LEN {
+            return Err("USB boot keyboard report is too large");
+        }
+
+        Ok(Self {
+            interrupt_dci: endpoint_dci(descriptor.endpoint_address),
+            report_buffer: DmaBlock::new(report_len, 64)?,
+            report_len,
+            last_report: [0; MAX_HID_REPORT_LEN],
+            transfer_armed: false,
+            ring: ProducerRing::new(XHCI_RING_TRBS)?,
+        })
+    }
+
+    fn setup(&self, descriptor: BootHidDescriptor) -> InterruptEndpointSetup {
+        InterruptEndpointSetup {
+            dci: self.interrupt_dci,
+            max_packet_size: descriptor.max_packet_size,
+            interval: descriptor.interval,
+            ring_phys: self.ring.base_phys(),
+        }
+    }
+
+    fn arm_interrupt_transfer(
+        &mut self,
+        controller: &mut XhciController,
+        slot_id: u8,
+    ) -> Result<(), &'static str> {
+        let trb = Trb::normal(self.report_buffer.phys(), self.report_len as u32, true);
+        controller.queue_transfer(slot_id, self.interrupt_dci, &mut self.ring, trb);
         self.transfer_armed = true;
         Ok(())
     }
 
-    fn poll(&mut self) {
-        while let Some(event) = self.controller.next_event() {
-            match event.trb_type() {
-                TRB_TYPE_TRANSFER_EVENT => self.handle_transfer_event(event),
-                TRB_TYPE_PORT_STATUS_CHANGE => self.controller.clear_port_changes(self.port_id),
-                _ => {}
-            }
-        }
-    }
-
-    fn handle_transfer_event(&mut self, event: Trb) {
-        if event.slot_id() != self.slot_id || event.endpoint_id() != self.interrupt_dci {
-            return;
-        }
-
+    fn handle_transfer_event(
+        &mut self,
+        controller: &mut XhciController,
+        slot_id: u8,
+        event: Trb,
+    ) -> usize {
         self.transfer_armed = false;
         let completion = event.completion_code();
+        let mut work = 0;
+
         if matches!(completion, COMPLETION_SUCCESS | COMPLETION_SHORT_PACKET) {
-            let report = self.report_buffer.as_slice::<u8>(USB_REPORT_LEN);
-            let mut snapshot = [0_u8; USB_REPORT_LEN];
-            snapshot.copy_from_slice(report);
-            self.apply_report(snapshot);
+            let report = self.report_buffer.as_slice::<u8>(self.report_len);
+            let mut snapshot = [0_u8; MAX_HID_REPORT_LEN];
+            snapshot[..self.report_len].copy_from_slice(report);
+            work = self.apply_report(snapshot);
         } else {
             crate::debug::println!(
                 "USB keyboard transfer event failed: code={}, slot={}, ep={}",
@@ -453,42 +634,155 @@ impl UsbKeyboardDriver {
             );
         }
 
-        let _ = self.arm_interrupt_transfer();
+        let _ = self.arm_interrupt_transfer(controller, slot_id);
+        work.max(1)
     }
 
-    fn apply_report(&mut self, report: [u8; USB_REPORT_LEN]) {
-        let Some(current) = decode_boot_report(&report) else {
-            return;
+    fn apply_report(&mut self, report: [u8; MAX_HID_REPORT_LEN]) -> usize {
+        let Some(current) = decode_boot_keyboard_report(&report) else {
+            self.last_report = report;
+            return 0;
         };
-        let previous = decode_boot_report(&self.last_report).unwrap_or_default();
+        let previous = decode_boot_keyboard_report(&self.last_report).unwrap_or_default();
+        let mut changes = 0;
 
         for code in previous.iter().copied() {
             if !current.contains(&code) {
                 keyboard::inject_key_transition(code, true);
+                changes += 1;
             }
         }
         for code in current.iter().copied() {
             if !previous.contains(&code) {
                 keyboard::inject_key_transition(code, false);
+                changes += 1;
             }
         }
 
         self.last_report = report;
+        changes
     }
 }
 
-struct UsbKeyboardDevice {
-    slot_id: u8,
-    interrupt_dci: u8,
+impl UsbMouseEndpoint {
+    fn new(descriptor: BootHidDescriptor) -> Result<Self, &'static str> {
+        let report_len = descriptor.max_packet_size as usize;
+        if !(3..=MAX_HID_REPORT_LEN).contains(&report_len) {
+            return Err("USB boot mouse report size is unsupported");
+        }
+
+        Ok(Self {
+            interrupt_dci: endpoint_dci(descriptor.endpoint_address),
+            report_buffer: DmaBlock::new(report_len, 64)?,
+            report_len,
+            last_buttons: 0,
+            transfer_armed: false,
+            ring: ProducerRing::new(XHCI_RING_TRBS)?,
+        })
+    }
+
+    fn setup(&self, descriptor: BootHidDescriptor) -> InterruptEndpointSetup {
+        InterruptEndpointSetup {
+            dci: self.interrupt_dci,
+            max_packet_size: descriptor.max_packet_size,
+            interval: descriptor.interval,
+            ring_phys: self.ring.base_phys(),
+        }
+    }
+
+    fn arm_interrupt_transfer(
+        &mut self,
+        controller: &mut XhciController,
+        slot_id: u8,
+    ) -> Result<(), &'static str> {
+        let trb = Trb::normal(self.report_buffer.phys(), self.report_len as u32, true);
+        controller.queue_transfer(slot_id, self.interrupt_dci, &mut self.ring, trb);
+        self.transfer_armed = true;
+        Ok(())
+    }
+
+    fn handle_transfer_event(
+        &mut self,
+        controller: &mut XhciController,
+        slot_id: u8,
+        event: Trb,
+    ) -> usize {
+        self.transfer_armed = false;
+        let completion = event.completion_code();
+        let mut work = 0;
+
+        if matches!(completion, COMPLETION_SUCCESS | COMPLETION_SHORT_PACKET) {
+            let report = self.report_buffer.as_slice::<u8>(self.report_len);
+            let mut snapshot = [0_u8; MAX_HID_REPORT_LEN];
+            snapshot[..self.report_len].copy_from_slice(report);
+            work = self.apply_report(&snapshot[..self.report_len]) as usize;
+        } else {
+            crate::debug::println!(
+                "USB mouse transfer event failed: code={}, slot={}, ep={}",
+                completion,
+                event.slot_id(),
+                event.endpoint_id(),
+            );
+        }
+
+        let _ = self.arm_interrupt_transfer(controller, slot_id);
+        work.max(1)
+    }
+
+    fn apply_report(&mut self, report: &[u8]) -> bool {
+        let Some((buttons, dx, dy)) = decode_boot_mouse_report(report) else {
+            return false;
+        };
+
+        let mut changed = false;
+        let left_pressed = (buttons & 0x01) != 0;
+        let previous_left_pressed = (self.last_buttons & 0x01) != 0;
+        if left_pressed != previous_left_pressed {
+            changed |= mouse::on_left_button_changed(left_pressed);
+        }
+        self.last_buttons = buttons;
+
+        if dx != 0 || dy != 0 {
+            changed |= mouse::on_relative_motion(dx, dy);
+        }
+
+        changed
+    }
+}
+
+impl XhciSlotResources {
+    fn new(slot_id: u8, port_id: u8, speed: u8, ctx_size: usize) -> Result<Self, &'static str> {
+        Ok(Self {
+            slot_id,
+            port_id,
+            speed,
+            device_context: DmaBlock::new(ctx_size * 32, 64)?,
+            ep0_ring: ProducerRing::new(XHCI_RING_TRBS)?,
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
-struct BootKeyboardDescriptor {
-    configuration_value: u8,
+struct BootHidDescriptor {
     interface_number: u8,
     endpoint_address: u8,
     max_packet_size: u16,
     interval: u8,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ParsedBootInterfaces {
+    configuration_value: u8,
+    keyboard: Option<BootHidDescriptor>,
+    mouse: Option<BootHidDescriptor>,
+}
+
+#[derive(Clone, Copy)]
+struct InterruptEndpointSetup {
+    dci: u8,
+    max_packet_size: u16,
+    interval: u8,
+    ring_phys: u64,
 }
 
 struct XhciController {
@@ -505,17 +799,12 @@ struct XhciController {
     dcbaa: DmaBlock,
     scratchpad_array: Option<DmaBlock>,
     scratchpads: Vec<DmaBlock>,
-    device_context: DmaBlock,
     input_context: DmaBlock,
-    ep0_ring: ProducerRing,
-    interrupt_ring: ProducerRing,
 }
 
 impl XhciController {
     fn new(pci: PciDevice) -> Result<Self, &'static str> {
         let mmio_phys = pci.bar0().ok_or("xHCI BAR0 unavailable")?;
-        // Many laptops expose xHCI MMIO above the identity-mapped window, so
-        // route all controller accesses through the kernel MMIO window.
         let mmio_base = crate::paging::mmio_addr(mmio_phys).ok_or("xHCI BAR0 is not mapped")?;
         pci.enable_memory_bus_master();
 
@@ -541,10 +830,7 @@ impl XhciController {
             dcbaa: DmaBlock::new((max_slots as usize + 1) * core::mem::size_of::<u64>(), 64)?,
             scratchpad_array: None,
             scratchpads: Vec::new(),
-            device_context: DmaBlock::new(ctx_size * 32, 64)?,
             input_context: DmaBlock::new(ctx_size * 33, 64)?,
-            ep0_ring: ProducerRing::new(XHCI_RING_TRBS)?,
-            interrupt_ring: ProducerRing::new(XHCI_RING_TRBS)?,
         };
 
         controller.take_ownership(hccparams1);
@@ -653,11 +939,15 @@ impl XhciController {
         Ok(())
     }
 
-    fn address_device(&mut self, slot_id: u8, port_id: u8, speed: u8) -> Result<u16, &'static str> {
-        self.device_context.clear();
+    fn clear_slot_pointer(&mut self, slot_id: u8) {
+        self.dcbaa.as_mut_slice::<u64>(self.max_slots as usize + 1)[slot_id as usize] = 0;
+    }
+
+    fn address_device(&mut self, slot: &mut XhciSlotResources) -> Result<(), &'static str> {
+        slot.device_context.clear();
         self.input_context.clear();
-        self.dcbaa.as_mut_slice::<u64>(self.max_slots as usize + 1)[slot_id as usize] =
-            self.device_context.phys();
+        self.dcbaa.as_mut_slice::<u64>(self.max_slots as usize + 1)[slot.slot_id as usize] =
+            slot.device_context.phys();
 
         let input = self
             .input_context
@@ -666,13 +956,14 @@ impl XhciController {
         input[1] = (1 << 0) | (1 << 1);
 
         let slot_base = self.ctx_size / 4;
-        input[slot_base] = ((speed as u32) << 20) | (1 << 27);
-        input[slot_base + 1] = (port_id as u32) << 16;
+        input[slot_base] = ((slot.speed as u32) << 20) | (1 << 27);
+        input[slot_base + 1] = (slot.port_id as u32) << 16;
 
         let ep_base = (1 + 1) * (self.ctx_size / 4);
-        let ep0_phys = self.ep0_ring.base_phys();
-        input[ep_base + 1] =
-            (3 << 1) | (EP_TYPE_CONTROL << 3) | ((default_ep0_packet_size(speed) as u32) << 16);
+        let ep0_phys = slot.ep0_ring.base_phys();
+        input[ep_base + 1] = (3 << 1)
+            | (EP_TYPE_CONTROL << 3)
+            | ((default_ep0_packet_size(slot.speed) as u32) << 16);
         input[ep_base + 2] = (ep0_phys as u32) | 1;
         input[ep_base + 3] = (ep0_phys >> 32) as u32;
         input[ep_base + 4] = 8;
@@ -680,20 +971,18 @@ impl XhciController {
         let completion = self.issue_command(Trb::command(
             TRB_TYPE_ADDRESS_DEVICE,
             self.input_context.phys(),
-            (slot_id as u32) << TRB_SLOT_ID_SHIFT,
+            (slot.slot_id as u32) << TRB_SLOT_ID_SHIFT,
         ))?;
         if completion.completion_code() != COMPLETION_SUCCESS {
             return Err("Address Device failed");
         }
 
-        Ok(default_ep0_packet_size(speed))
+        Ok(())
     }
 
     fn update_ep0_max_packet(
         &mut self,
-        slot_id: u8,
-        port_id: u8,
-        speed: u8,
+        slot: &mut XhciSlotResources,
         max_packet: u16,
     ) -> Result<(), &'static str> {
         self.input_context.clear();
@@ -704,11 +993,11 @@ impl XhciController {
         input[1] = 1 << 1;
 
         let slot_base = self.ctx_size / 4;
-        input[slot_base] = ((speed as u32) << 20) | (1 << 27);
-        input[slot_base + 1] = (port_id as u32) << 16;
+        input[slot_base] = ((slot.speed as u32) << 20) | (1 << 27);
+        input[slot_base + 1] = (slot.port_id as u32) << 16;
 
         let ep_base = (1 + 1) * (self.ctx_size / 4);
-        let ep0_phys = self.ep0_ring.base_phys();
+        let ep0_phys = slot.ep0_ring.base_phys();
         input[ep_base + 1] = (3 << 1) | (EP_TYPE_CONTROL << 3) | ((max_packet as u32) << 16);
         input[ep_base + 2] = (ep0_phys as u32) | 1;
         input[ep_base + 3] = (ep0_phys >> 32) as u32;
@@ -717,7 +1006,7 @@ impl XhciController {
         let completion = self.issue_command(Trb::command(
             TRB_TYPE_EVALUATE_CONTEXT,
             self.input_context.phys(),
-            (slot_id as u32) << TRB_SLOT_ID_SHIFT,
+            (slot.slot_id as u32) << TRB_SLOT_ID_SHIFT,
         ))?;
         if completion.completion_code() != COMPLETION_SUCCESS {
             return Err("Evaluate Context failed");
@@ -726,47 +1015,56 @@ impl XhciController {
         Ok(())
     }
 
-    fn configure_interrupt_endpoint(
+    fn configure_interrupt_endpoints(
         &mut self,
-        slot_id: u8,
-        port_id: u8,
-        speed: u8,
-        descriptor: &BootKeyboardDescriptor,
+        slot: &mut XhciSlotResources,
+        endpoints: &[InterruptEndpointSetup],
     ) -> Result<(), &'static str> {
+        if endpoints.is_empty() {
+            return Err("no interrupt endpoints to configure");
+        }
+
         self.input_context.clear();
         unsafe {
             ptr::copy_nonoverlapping(
-                self.device_context.ptr.as_ptr(),
+                slot.device_context.ptr.as_ptr(),
                 self.input_context.ptr.as_ptr().add(self.ctx_size),
                 self.ctx_size,
             );
         }
 
-        let dci = endpoint_dci(descriptor.endpoint_address);
         let input = self
             .input_context
             .as_mut_slice::<u32>(self.input_context.size / 4);
         input[0] = 0;
-        input[1] = (1 << 0) | (1 << dci);
+
+        let mut add_flags = 1 << 0;
+        let mut max_dci = 1_u8;
+        for endpoint in endpoints {
+            add_flags |= 1 << endpoint.dci;
+            max_dci = max_dci.max(endpoint.dci);
+        }
+        input[1] = add_flags;
 
         let slot_base = self.ctx_size / 4;
-        input[slot_base] = ((speed as u32) << 20) | ((dci as u32) << 27);
-        input[slot_base + 1] = (port_id as u32) << 16;
+        input[slot_base] = ((slot.speed as u32) << 20) | ((max_dci as u32) << 27);
+        input[slot_base + 1] = (slot.port_id as u32) << 16;
 
-        let ep_base = (1 + dci as usize) * (self.ctx_size / 4);
-        let ring_phys = self.interrupt_ring.base_phys();
-        input[ep_base] = interval_value(speed, descriptor.interval) << 16;
-        input[ep_base + 1] =
-            (3 << 1) | (EP_TYPE_INTERRUPT_IN << 3) | ((descriptor.max_packet_size as u32) << 16);
-        input[ep_base + 2] = (ring_phys as u32) | 1;
-        input[ep_base + 3] = (ring_phys >> 32) as u32;
-        input[ep_base + 4] =
-            descriptor.max_packet_size as u32 | ((descriptor.max_packet_size as u32) << 16);
+        for endpoint in endpoints {
+            let ep_base = (1 + endpoint.dci as usize) * (self.ctx_size / 4);
+            input[ep_base] = interval_value(slot.speed, endpoint.interval) << 16;
+            input[ep_base + 1] =
+                (3 << 1) | (EP_TYPE_INTERRUPT_IN << 3) | ((endpoint.max_packet_size as u32) << 16);
+            input[ep_base + 2] = (endpoint.ring_phys as u32) | 1;
+            input[ep_base + 3] = (endpoint.ring_phys >> 32) as u32;
+            input[ep_base + 4] =
+                endpoint.max_packet_size as u32 | ((endpoint.max_packet_size as u32) << 16);
+        }
 
         let completion = self.issue_command(Trb::command(
             TRB_TYPE_CONFIGURE_ENDPOINT,
             self.input_context.phys(),
-            (slot_id as u32) << TRB_SLOT_ID_SHIFT,
+            (slot.slot_id as u32) << TRB_SLOT_ID_SHIFT,
         ))?;
         if completion.completion_code() != COMPLETION_SUCCESS {
             return Err("Configure Endpoint failed");
@@ -777,7 +1075,7 @@ impl XhciController {
 
     fn get_descriptor<'a>(
         &mut self,
-        slot_id: u8,
+        slot: &mut XhciSlotResources,
         buffer: &'a DmaBlock,
         request_type: u8,
         request: u8,
@@ -790,24 +1088,24 @@ impl XhciController {
             *byte = 0;
         }
 
-        self.control_transfer(slot_id, request_type, request, value, index, target, true)?;
+        self.control_transfer(slot, request_type, request, value, index, target, true)?;
         Ok(target)
     }
 
     fn control_no_data(
         &mut self,
-        slot_id: u8,
+        slot: &mut XhciSlotResources,
         request_type: u8,
         request: u8,
         value: u16,
         index: u16,
     ) -> Result<(), &'static str> {
-        self.control_transfer(slot_id, request_type, request, value, index, &mut [], false)
+        self.control_transfer(slot, request_type, request, value, index, &mut [], false)
     }
 
     fn control_transfer(
         &mut self,
-        slot_id: u8,
+        slot: &mut XhciSlotResources,
         request_type: u8,
         request: u8,
         value: u16,
@@ -816,24 +1114,24 @@ impl XhciController {
         direction_in: bool,
     ) -> Result<(), &'static str> {
         let setup = setup_packet(request_type, request, value, index, buffer.len() as u16);
-        self.ep0_ring.enqueue(Trb::setup(
+        slot.ep0_ring.enqueue(Trb::setup(
             u64::from_le_bytes(setup),
             buffer.is_empty(),
             direction_in,
         ));
 
         if !buffer.is_empty() {
-            self.ep0_ring.enqueue(Trb::data(
+            slot.ep0_ring.enqueue(Trb::data(
                 virt_to_phys(buffer.as_mut_ptr() as u64),
                 buffer.len() as u32,
                 direction_in,
             ));
         }
 
-        let status_phys = self.ep0_ring.enqueue(Trb::status(!direction_in));
-        self.ring_doorbell(slot_id, 1);
+        let status_phys = slot.ep0_ring.enqueue(Trb::status(!direction_in));
+        self.ring_doorbell(slot.slot_id, 1);
 
-        let completion = self.wait_for_transfer(slot_id, 1, status_phys)?;
+        let completion = self.wait_for_transfer(slot.slot_id, 1, status_phys)?;
         if !matches!(
             completion.completion_code(),
             COMPLETION_SUCCESS | COMPLETION_SHORT_PACKET
@@ -844,8 +1142,8 @@ impl XhciController {
         Ok(())
     }
 
-    fn queue_transfer(&mut self, slot_id: u8, endpoint_id: u8, trb: Trb) {
-        self.interrupt_ring.enqueue(trb);
+    fn queue_transfer(&mut self, slot_id: u8, endpoint_id: u8, ring: &mut ProducerRing, trb: Trb) {
+        ring.enqueue(trb);
         self.ring_doorbell(slot_id, endpoint_id);
     }
 
@@ -1220,8 +1518,8 @@ impl DmaBlock {
     }
 }
 
-fn parse_boot_keyboard_interface(config: &[u8]) -> Option<BootKeyboardDescriptor> {
-    let mut configuration_value = 0;
+fn parse_boot_hid_interfaces(config: &[u8]) -> ParsedBootInterfaces {
+    let mut parsed = ParsedBootInterfaces::default();
     let mut current_interface = None;
     let mut index = 0;
 
@@ -1232,35 +1530,44 @@ fn parse_boot_keyboard_interface(config: &[u8]) -> Option<BootKeyboardDescriptor
         }
 
         match config[index + 1] {
-            DESC_CONFIGURATION if len >= 6 => configuration_value = config[index + 5],
+            DESC_CONFIGURATION if len >= 6 => parsed.configuration_value = config[index + 5],
             DESC_INTERFACE if len >= 9 => {
                 let interface_number = config[index + 2];
                 let alternate_setting = config[index + 3];
                 let class = config[index + 5];
                 let subclass = config[index + 6];
                 let protocol = config[index + 7];
-                current_interface = (alternate_setting == 0
-                    && class == HID_CLASS
-                    && subclass == HID_SUBCLASS_BOOT
-                    && protocol == HID_PROTOCOL_KEYBOARD)
-                    .then_some(interface_number);
+                current_interface =
+                    (alternate_setting == 0 && class == HID_CLASS && subclass == HID_SUBCLASS_BOOT)
+                        .then_some((interface_number, protocol));
             }
             DESC_ENDPOINT if len >= 7 => {
-                if let Some(interface_number) = current_interface {
-                    let endpoint_address = config[index + 2];
-                    let attributes = config[index + 3] & 0x3;
-                    if endpoint_address & 0x80 != 0 && attributes == ENDPOINT_ATTR_INTERRUPT {
-                        return Some(BootKeyboardDescriptor {
-                            configuration_value,
-                            interface_number,
-                            endpoint_address,
-                            max_packet_size: u16::from_le_bytes([
-                                config[index + 4],
-                                config[index + 5],
-                            ]) & 0x07ff,
-                            interval: config[index + 6],
-                        });
+                let Some((interface_number, protocol)) = current_interface else {
+                    index += len;
+                    continue;
+                };
+                let endpoint_address = config[index + 2];
+                let attributes = config[index + 3] & 0x3;
+                if endpoint_address & 0x80 == 0 || attributes != ENDPOINT_ATTR_INTERRUPT {
+                    index += len;
+                    continue;
+                }
+
+                let descriptor = BootHidDescriptor {
+                    interface_number,
+                    endpoint_address,
+                    max_packet_size: u16::from_le_bytes([config[index + 4], config[index + 5]])
+                        & 0x07ff,
+                    interval: config[index + 6],
+                };
+                match protocol {
+                    HID_PROTOCOL_KEYBOARD if parsed.keyboard.is_none() => {
+                        parsed.keyboard = Some(descriptor);
                     }
+                    HID_PROTOCOL_MOUSE if parsed.mouse.is_none() => {
+                        parsed.mouse = Some(descriptor);
+                    }
+                    _ => {}
                 }
             }
             _ => {}
@@ -1269,12 +1576,10 @@ fn parse_boot_keyboard_interface(config: &[u8]) -> Option<BootKeyboardDescriptor
         index += len;
     }
 
-    None
+    parsed
 }
 
-fn decode_boot_report(report: &[u8; USB_REPORT_LEN]) -> Option<Vec<KeyCode>> {
-    // HID boot keyboards report rollover/error states with reserved usages.
-    // Ignore those reports so we do not synthesize mass key releases.
+fn decode_boot_keyboard_report(report: &[u8; MAX_HID_REPORT_LEN]) -> Option<Vec<KeyCode>> {
     if report[2..]
         .iter()
         .any(|usage| matches!(*usage, 0x01..=0x03))
@@ -1302,6 +1607,21 @@ fn decode_boot_report(report: &[u8; USB_REPORT_LEN]) -> Option<Vec<KeyCode>> {
     }
 
     Some(keys)
+}
+
+fn decode_boot_mouse_report(report: &[u8]) -> Option<(u8, i8, i8)> {
+    if report.len() < 3 {
+        return None;
+    }
+
+    let buttons = report[0];
+    let dx = report[1] as i8;
+    let dy = report[2] as i8;
+    if buttons == 0 && dx == 0 && dy == 0 {
+        return None;
+    }
+
+    Some((buttons, dx, dy))
 }
 
 fn modifier_keys() -> [Option<KeyCode>; 8] {

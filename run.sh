@@ -55,6 +55,8 @@ case "$QEMU_PROFILE" in
     QEMU_PROFILE_ARGS=(
       -drive file=fat:rw:"$BUILD_MIRROR_DIR",format=raw
       -m 2G
+      -device qemu-xhci,id=xhci,p2=15,p3=15
+      -device usb-mouse,bus=xhci.0
     )
     ;;
   g14)
@@ -73,8 +75,7 @@ case "$QEMU_PROFILE" in
       -m 8G
       -rtc base=localtime,clock=host
       -device qemu-xhci,id=xhci,p2=15,p3=15
-      -device usb-kbd,bus=xhci.0
-      -device usb-tablet,bus=xhci.0
+      -device usb-mouse,bus=xhci.0
     )
     ;;
   *)

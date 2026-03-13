@@ -15,7 +15,7 @@ mod util;
 
 pub(crate) use arch::{acpi, asmtools, gdt, idt, pic, pit, rtc};
 pub(crate) use input::keyboard;
-pub(crate) use io::{console, gui, jpeg, tty};
+pub(crate) use io::{console, gui, jpeg, session, tty};
 pub(crate) use memory::{heap, paging};
 pub(crate) use storage::fat;
 pub(crate) use user::{demo, process, syscall, win32};
@@ -27,7 +27,7 @@ use boot_protocol::BootInfo;
 
 fn announce_ready(name: &str, console_line: &[u8]) {
     debug::println!("{name} initialized.");
-    gui::write_console(console_line);
+    console::write(console_line);
 }
 
 fn init(boot_info_ptr: *const BootInfo) {

@@ -152,8 +152,7 @@ global_asm!(
     .global timer_interrupt_handler
     .type timer_interrupt_handler, @function
     timer_interrupt_handler:
-        mov rax, [rsp + 8]
-        test al, 0x3
+        test byte ptr [rsp + 8], 0x3
         jnz 1f
         push 0
         push 1
@@ -182,8 +181,7 @@ global_asm!(
         call timer_interrupt_dispatch
         mov rsp, rax
 
-        mov rax, [rsp + 0x190]
-        test al, 0x3
+        test byte ptr [rsp + 0x190], 0x3
         jz 3f
         mov rax, [rsp + 0x178]
         mov rcx, [rsp + 0x180]

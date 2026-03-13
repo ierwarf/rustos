@@ -45,78 +45,10 @@ read_loop:
     test ecx, ecx
     jz read_loop
 
-    lea rsi, [rel input_buffer]
-    lea rdi, [rel token_buffer]
-    xor edx, edx
-
-skip_leading_ws:
-    test ecx, ecx
-    jz read_loop
-    mov al, [rsi]
-    cmp al, ' '
-    je consume_leading_ws
-    cmp al, 9
-    je consume_leading_ws
-    cmp al, 10
-    je consume_leading_ws
-    cmp al, 11
-    je consume_leading_ws
-    cmp al, 12
-    je consume_leading_ws
-    cmp al, 13
-    je consume_leading_ws
-    jmp collect_token
-
-consume_leading_ws:
-    inc rsi
-    dec ecx
-    jmp skip_leading_ws
-
-collect_token:
-    test ecx, ecx
-    jz flush_token
-    mov al, [rsi]
-    cmp al, ' '
-    je flush_token
-    cmp al, 9
-    je flush_token
-    cmp al, 10
-    je flush_token
-    cmp al, 11
-    je flush_token
-    cmp al, 12
-    je flush_token
-    cmp al, 13
-    je flush_token
-
-    cmp edx, 255
-    jae skip_store
-    mov [rdi + rdx], al
-    inc edx
-
-skip_store:
-    inc rsi
-    dec ecx
-    jmp collect_token
-
-flush_token:
-    test edx, edx
-    jz read_loop
-    mov [rel token_len], edx
-
     sub rsp, 40
     mov rcx, [rel stdout_handle]
-    lea rdx, [rel token_buffer]
-    mov r8d, [rel token_len]
-    lea r9, [rel bytes_io]
-    mov qword [rsp + 32], 0
-    call [rel iat_WriteFile]
-    add rsp, 40
-
-    sub rsp, 40
-    mov rcx, [rel stdout_handle]
-    lea rdx, [rel newline]
-    mov r8d, newline_len
+    lea rdx, [rel input_buffer]
+    mov r8d, [rel bytes_io]
     lea r9, [rel bytes_io]
     mov qword [rsp + 32], 0
     call [rel iat_WriteFile]
@@ -131,22 +63,16 @@ exit_process:
 
 section .rdata
 banner:
-    db "console ready from win32", 13, 10
+    db "win32 echo ready", 13, 10
 banner_len equ $ - banner
-
-newline:
-    db 10
-newline_len equ $ - newline
 
 section .data
 stdin_handle dq 0
 stdout_handle dq 0
 bytes_io dd 0
-token_len dd 0
 
 section .bss
 input_buffer resb 256
-token_buffer resb 256
 
 section .idata$2 data readable writeable
 align 8

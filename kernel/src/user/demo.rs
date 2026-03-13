@@ -3,8 +3,10 @@ use core::fmt;
 use core::fmt::Write;
 use x86_64::instructions::{hlt, interrupts};
 
+use crate::console;
 use crate::debug;
-use crate::{fat, process};
+use crate::fat;
+use crate::user::console_host;
 
 const USER_DEMO_EXE_PATH: &str = "USERDEMO.EXE";
 const USER_DEMO_ELF_PATH: &str = "USERDEMO.ELF";
@@ -20,28 +22,23 @@ pub fn run() -> ! {
         )),
     };
 
-    write_status_line(format_args!("Spawning USERDEMO..."));
-    let spawned = match process::spawn_process(&userdemo_image, USER_DEMO_WEIGHT_MICROS, 0, 0) {
-        Ok(spawned) => spawned,
-        Err(err) => {
-            err.log_debug_details();
-            fatal(format_args!(
-                "failed to spawn {}: {} ({:?})",
-                userdemo_path,
-                err.summary(),
-                err
-            ))
-        }
-    };
-
-    debug::println!(
-        "Ring3 process spawned: pid={} entry={:#x} weight={}us path={}",
-        spawned.pid,
-        spawned.entry.as_u64(),
+    write_status_line(format_args!("Spawning USERDEMO sessions..."));
+    let program = console_host::ConsoleProgramSpec::new(
+        &userdemo_image,
+        userdemo_path,
         USER_DEMO_WEIGHT_MICROS,
-        userdemo_path
     );
-    write_status_line(format_args!("USERDEMO spawned."));
+    if let Err(err) = console_host::spawn_program_on_all_sessions(program) {
+        err.log_debug_details();
+        fatal(format_args!(
+            "failed to spawn {} for {} session: {} ({:?})",
+            userdemo_path,
+            err.session().name(),
+            err.summary(),
+            err
+        ));
+    }
+    write_status_line(format_args!("USERDEMO sessions spawned."));
 
     interrupts::enable();
     loop {
@@ -77,8 +74,8 @@ fn fatal(args: fmt::Arguments<'_>) -> ! {
 fn write_status_line(args: fmt::Arguments<'_>) {
     let mut line = StatusLine::new();
     let _ = line.write_fmt(args);
-    crate::gui::write_console(line.as_bytes());
-    crate::gui::write_console(b"\r\n");
+    console::write(line.as_bytes());
+    console::write(b"\r\n");
 }
 
 struct StatusLine {
