@@ -4,7 +4,10 @@ use core::cell::UnsafeCell;
 use spin::Once;
 
 const HEAP_ORDER: usize = 32;
-const HEAP_SIZE: usize = 1024 * 1024; // 1 MiB
+// Runtime assets like the decoded console backdrop need more headroom than the
+// early text-only kernel did, but the largest JPEG scratch buffer is kept out
+// of the heap.
+const HEAP_SIZE: usize = 32 * 1024 * 1024; // 32 MiB
 
 #[repr(align(4096))]
 struct HeapBytes([u8; HEAP_SIZE]);
@@ -28,6 +31,10 @@ pub fn init_heap() {
     HEAP_INIT.call_once(|| unsafe {
         HEAP.lock().init(heap_start(), HEAP_SIZE);
     });
+}
+
+pub fn is_initialized() -> bool {
+    HEAP_INIT.is_completed()
 }
 
 #[alloc_error_handler]

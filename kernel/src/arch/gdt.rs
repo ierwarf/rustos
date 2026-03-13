@@ -21,10 +21,9 @@ struct TssMemory(UnsafeCell<TaskStateSegment>);
 
 unsafe impl Sync for TssMemory {}
 
-static RING0_STACK: PrivilegeStackMemory =
-    PrivilegeStackMemory(UnsafeCell::new(PrivilegeStack {
-        _bytes: [0; KERNEL_PRIVILEGE_STACK_SIZE],
-    }));
+static RING0_STACK: PrivilegeStackMemory = PrivilegeStackMemory(UnsafeCell::new(PrivilegeStack {
+    _bytes: [0; KERNEL_PRIVILEGE_STACK_SIZE],
+}));
 static TSS: TssMemory = TssMemory(UnsafeCell::new(TaskStateSegment::new()));
 
 struct Selectors {
@@ -42,7 +41,8 @@ lazy_static! {
         let kernel_data = gdt.append(Descriptor::kernel_data_segment());
         let user_data = gdt.append(Descriptor::user_data_segment());
         let user_code = gdt.append(Descriptor::user_code_segment());
-        let tss = unsafe { gdt.append(Descriptor::tss_segment_unchecked(TSS.0.get().cast_const())) };
+        let tss =
+            unsafe { gdt.append(Descriptor::tss_segment_unchecked(TSS.0.get().cast_const())) };
 
         (
             gdt,

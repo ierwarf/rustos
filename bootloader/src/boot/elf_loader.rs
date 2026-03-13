@@ -135,11 +135,7 @@ fn load_segment(image: &[u8], ph: &ProgramHeader<'_>) -> Result<(), BootError> {
 
     unsafe {
         ptr::write_bytes(segment_memory.as_ptr(), 0, page_count * PAGE_SIZE);
-        ptr::copy_nonoverlapping(
-            image.as_ptr().add(file_offset),
-            segment_dest,
-            file_size,
-        );
+        ptr::copy_nonoverlapping(image.as_ptr().add(file_offset), segment_dest, file_size);
     }
 
     Ok(())

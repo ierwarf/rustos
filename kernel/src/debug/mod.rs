@@ -1,3 +1,4 @@
+pub mod boot_trace;
 pub mod panic;
 
 use core::fmt::{self, Write};

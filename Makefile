@@ -4,7 +4,7 @@ BOOTLOADER_PACKAGE ?= $(PACKAGE)
 CARGO ?= cargo
 RUSTUP ?= rustup
 LD ?= ld
-CC ?= cc
+CC = gcc
 
 KERNEL_PACKAGE ?= kernel
 KERNEL_TARGET ?= x86_64-unknown-linux-gnu
@@ -23,15 +23,18 @@ PREKERNEL_ELF ?= $(BUILD_DIR)/prekernel.elf
 KERNEL_ELF ?= $(BUILD_DIR)/kernel.elf
 USER_BUILD_DIR ?= target/userdemo
 USER_SOURCE ?= $(USER_BUILD_DIR)/USERDEMO.ELF
-USER_OBJECT ?= $(USER_BUILD_DIR)/userdemo.o
-USER_ASM_SOURCE ?= userdemo/main.S
+USER_C_SOURCES ?= $(wildcard userdemo/*.c)
+USER_OBJECTS ?= $(patsubst userdemo/%.c,$(USER_BUILD_DIR)/%.o,$(USER_C_SOURCES))
 USER_LINKER_SCRIPT ?= userdemo/linker.ld
+USER_HEADERS ?= userdemo/runtime.h
 USER_ELF ?= $(BUILD_DIR)/USERDEMO.ELF
 WIN_USER_OBJECT ?= $(USER_BUILD_DIR)/userdemo-win.obj
 WIN_USER_SOURCE ?= $(USER_BUILD_DIR)/USERDEMO.EXE
 WIN_USER_ASM_SOURCE ?= userdemo/winmain.asm
 WIN_USER_EXE ?= $(BUILD_DIR)/USERDEMO.EXE
 STARTUP_NSH ?= $(BUILD_DIR)/startup.nsh
+USER_CFLAGS ?= -m64 -mcmodel=large -O2 -Wall -Wextra -fno-pie -fno-stack-protector -mno-red-zone -fno-asynchronous-unwind-tables -Iuserdemo
+USER_LDFLAGS ?= -nostdlib -static -no-pie -Wl,--build-id=none -Wl,-z,max-page-size=0x1000 -Wl,-z,noexecstack -Wl,-T,$(USER_LINKER_SCRIPT)
 
 .PHONY: all target build build-efi build-kernel stage check clean
 
@@ -58,12 +61,15 @@ build-kernel:
 build-prekernel:
 	$(CARGO) rustc $(KERNEL_CARGO_ZFLAGS) -p $(PREKERNEL_PACKAGE) --target $(KERNEL_TARGET) --release -- $(PREKERNEL_RUSTC_ARGS)
 
-build-user:
+build-user: $(USER_OBJECTS)
 	mkdir -p $(USER_BUILD_DIR)
-	$(CC) -c -m64 -nostdlib -ffreestanding -o $(USER_OBJECT) $(USER_ASM_SOURCE)
-	$(LD) -nostdlib -static --build-id=none -z max-page-size=0x1000 -z noexecstack -T $(USER_LINKER_SCRIPT) -o $(USER_SOURCE) $(USER_OBJECT)
+	$(CC) $(USER_LDFLAGS) -o $(USER_SOURCE) $(USER_OBJECTS)
 	nasm -f win64 -o $(WIN_USER_OBJECT) $(WIN_USER_ASM_SOURCE)
 	$(LD) -mi386pep --subsystem console --image-base 0x8000400000 -e start -o $(WIN_USER_SOURCE) $(WIN_USER_OBJECT)
+
+$(USER_BUILD_DIR)/%.o: userdemo/%.c $(USER_HEADERS)
+	mkdir -p $(USER_BUILD_DIR)
+	$(CC) $(USER_CFLAGS) -c -o $@ $<
 
 stage:
 	mkdir -p $(EFI_BOOT_DIR)

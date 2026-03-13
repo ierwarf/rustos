@@ -24,6 +24,7 @@ impl<T: Copy, const CAPACITY: usize> RingBuffer<T, CAPACITY> {
     }
 
     pub fn push(&mut self, value: T) -> bool {
+        self.normalize_head();
         if self.len == CAPACITY {
             return false;
         }
@@ -35,10 +36,12 @@ impl<T: Copy, const CAPACITY: usize> RingBuffer<T, CAPACITY> {
     }
 
     pub fn push_overwrite(&mut self, value: T) {
+        self.normalize_head();
         if self.len == CAPACITY {
             self.data[self.head] = None;
             self.head = (self.head + 1) % CAPACITY;
             self.len -= 1;
+            self.normalize_head();
         }
 
         let tail = (self.head + self.len) % CAPACITY;
@@ -54,6 +57,7 @@ impl<T: Copy, const CAPACITY: usize> RingBuffer<T, CAPACITY> {
     }
 
     pub fn pop(&mut self) -> Option<T> {
+        self.normalize_head();
         if self.len == 0 {
             return None;
         }
@@ -65,20 +69,34 @@ impl<T: Copy, const CAPACITY: usize> RingBuffer<T, CAPACITY> {
     }
 
     pub fn pop_into(&mut self, dest: &mut [T]) -> usize {
-        let count = min(dest.len(), self.len);
-        for slot in dest.iter_mut().take(count) {
-            *slot = self.pop().expect("ring buffer length must match stored entries");
+        let mut count = 0;
+        for slot in dest.iter_mut() {
+            let Some(value) = self.pop() else {
+                break;
+            };
+            *slot = value;
+            count += 1;
         }
         count
     }
 
     pub fn copy_into(&self, dest: &mut [T]) -> usize {
-        let count = min(dest.len(), self.len);
-        for (index, slot) in dest.iter_mut().take(count).enumerate() {
-            *slot = self.data[(self.head + index) % CAPACITY]
-                .expect("ring buffer length must match stored entries");
+        let mut count = 0;
+        for index in 0..min(dest.len(), self.len) {
+            let Some(value) = self.data[(self.head + index) % CAPACITY] else {
+                break;
+            };
+            dest[index] = value;
+            count += 1;
         }
         count
+    }
+
+    fn normalize_head(&mut self) {
+        while self.len != 0 && self.data[self.head].is_none() {
+            self.head = (self.head + 1) % CAPACITY;
+            self.len -= 1;
+        }
     }
 }
 

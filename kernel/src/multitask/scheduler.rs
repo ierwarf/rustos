@@ -491,7 +491,9 @@ impl Scheduler {
     }
 
     fn log_retired_slot(&self, slot: usize, context: TaskContext) {
-        let id = self.starts[slot].map(|start| start.id).unwrap_or(slot as u64);
+        let id = self.starts[slot]
+            .map(|start| start.id)
+            .unwrap_or(slot as u64);
         match self.retire_reasons[slot] {
             Some(TaskRetireReason::UserFault {
                 vector,
@@ -522,7 +524,11 @@ impl Scheduler {
                 );
             }
             Some(TaskRetireReason::Exited) => {
-                debug::println!("scheduler: reaped exited user task pid={} slot={}", id, slot);
+                debug::println!(
+                    "scheduler: reaped exited user task pid={} slot={}",
+                    id,
+                    slot
+                );
             }
             None => {
                 debug::println!(

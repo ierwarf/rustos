@@ -1,28 +1,26 @@
 use alloc::vec::Vec;
-use embedded_graphics::pixelcolor::Rgb888;
-use core::{convert::TryFrom, fmt};
-use fatfs::{Read, Seek, SeekFrom};
+use core::fmt;
+use core::fmt::Write;
 use x86_64::instructions::{hlt, interrupts};
 
 use crate::debug;
-use crate::{fat, gui, process};
+use crate::{fat, process};
 
 const USER_DEMO_EXE_PATH: &str = "USERDEMO.EXE";
 const USER_DEMO_ELF_PATH: &str = "USERDEMO.ELF";
 const USER_DEMO_WEIGHT_MICROS: u64 = 50;
 
 pub fn run() -> ! {
-    gui::GOP_SCREEN.lock().fill(Rgb888::new(0, 0, 0));
-
+    write_status_line(format_args!("Loading USERDEMO..."));
     let (userdemo_path, userdemo_image) = match read_preferred_user_demo() {
         Ok(value) => value,
         Err(err) => fatal(format_args!(
             "failed to read {} or {} from boot volume: {:?}",
-            USER_DEMO_EXE_PATH,
-            USER_DEMO_ELF_PATH,
-            err
+            USER_DEMO_EXE_PATH, USER_DEMO_ELF_PATH, err
         )),
     };
+
+    write_status_line(format_args!("Spawning USERDEMO..."));
     let spawned = match process::spawn_process(&userdemo_image, USER_DEMO_WEIGHT_MICROS, 0, 0) {
         Ok(spawned) => spawned,
         Err(err) => {
@@ -43,6 +41,7 @@ pub fn run() -> ! {
         USER_DEMO_WEIGHT_MICROS,
         userdemo_path
     );
+    write_status_line(format_args!("USERDEMO spawned."));
 
     interrupts::enable();
     loop {
@@ -51,48 +50,71 @@ pub fn run() -> ! {
 }
 
 fn read_boot_file(path: &str) -> core::result::Result<Vec<u8>, fatfs::Error<fat::DiskIoError>> {
-    let volume = fat::BootVolume::open()?;
-    let result = {
-        let mut file = volume.open_file(path)?;
-        let file_len = file.seek(SeekFrom::End(0))?;
-        let capacity =
-            usize::try_from(file_len).map_err(|_| fatfs::Error::Io(fat::DiskIoError::InvalidInput))?;
-        file.seek(SeekFrom::Start(0))?;
-
-        let mut bytes = Vec::with_capacity(capacity);
-        let mut chunk = [0_u8; 4096];
-        loop {
-            let read = file.read(&mut chunk)?;
-            if read == 0 {
-                break;
-            }
-            bytes.extend_from_slice(&chunk[..read]);
-        }
-
-        Ok(bytes)
-    };
-
-    match (result, volume.close()) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(err)) => Err(err),
-        (Err(err), _) => Err(err),
-    }
+    fat::read_file_to_vec(path)
 }
 
-fn read_preferred_user_demo(
-) -> core::result::Result<(&'static str, Vec<u8>), fatfs::Error<fat::DiskIoError>> {
-    match read_boot_file(USER_DEMO_EXE_PATH) {
-        Ok(image) => Ok((USER_DEMO_EXE_PATH, image)),
-        Err(_) => read_boot_file(USER_DEMO_ELF_PATH).map(|image| (USER_DEMO_ELF_PATH, image)),
+fn read_preferred_user_demo()
+-> core::result::Result<(&'static str, Vec<u8>), fatfs::Error<fat::DiskIoError>> {
+    match read_boot_file(USER_DEMO_ELF_PATH) {
+        Ok(image) => Ok((USER_DEMO_ELF_PATH, image)),
+        Err(_) => read_boot_file(USER_DEMO_EXE_PATH).map(|image| (USER_DEMO_EXE_PATH, image)),
     }
 }
 
 fn fatal(args: fmt::Arguments<'_>) -> ! {
+    write_status_line(format_args!(""));
+    write_status_line(format_args!("[KERNEL FATAL]"));
+    write_status_line(args);
     debug::println!();
     debug::println!("[KERNEL FATAL]");
     debug::println!("{}", args);
     interrupts::disable();
     loop {
         hlt();
+    }
+}
+
+fn write_status_line(args: fmt::Arguments<'_>) {
+    let mut line = StatusLine::new();
+    let _ = line.write_fmt(args);
+    crate::gui::write_console(line.as_bytes());
+    crate::gui::write_console(b"\r\n");
+}
+
+struct StatusLine {
+    bytes: [u8; 256],
+    len: usize,
+}
+
+impl StatusLine {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; 256],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, byte: u8) {
+        if self.len < self.bytes.len() {
+            self.bytes[self.len] = byte;
+            self.len += 1;
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+impl Write for StatusLine {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for ch in s.chars() {
+            match ch {
+                '\n' | '\r' | '\t' => self.push(b' '),
+                ' '..='~' => self.push(ch as u8),
+                _ => self.push(b'?'),
+            }
+        }
+        Ok(())
     }
 }

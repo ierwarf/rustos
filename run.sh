@@ -8,6 +8,8 @@ cd "$SCRIPT_DIR"
 BUILD_MIRROR_DIR="$(mktemp -d /tmp/rustos-qemu.XXXXXX)"
 DEBUGCON_LOG=""
 DEBUGCON_TAIL_PID=""
+QEMU_PROFILE="${RUSTOS_QEMU_PROFILE:-default}"
+QEMU_ACCEL="${RUSTOS_QEMU_ACCEL:-}"
 
 cleanup() {
   if [[ -n "$DEBUGCON_TAIL_PID" ]]; then
@@ -25,6 +27,61 @@ trap cleanup EXIT
 # QEMU's vvfat backend touches host-side file metadata when it is pointed at
 # build/ directly, so run from an isolated mirror instead.
 cp -a build/. "$BUILD_MIRROR_DIR/"
+
+QEMU_PROFILE_ARGS=()
+QEMU_PASSTHRU_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -profile|--profile)
+      QEMU_PROFILE="${2:-}"
+      shift 2
+      ;;
+    -accel-profile|--accel-profile)
+      QEMU_ACCEL="${2:-}"
+      shift 2
+      ;;
+    *)
+      QEMU_PASSTHRU_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+set -- "${QEMU_PASSTHRU_ARGS[@]}"
+
+case "$QEMU_PROFILE" in
+  default)
+    QEMU_PROFILE_ARGS=(
+      -drive file=fat:rw:"$BUILD_MIRROR_DIR",format=raw
+      -m 2G
+    )
+    ;;
+  g14)
+    MACHINE_ARG="q35"
+    CPU_ARG="EPYC-v4"
+    if [[ "$QEMU_ACCEL" == "kvm" ]]; then
+      MACHINE_ARG="${MACHINE_ARG},accel=kvm"
+      CPU_ARG="host"
+    fi
+
+    QEMU_PROFILE_ARGS=(
+      -drive file=fat:rw:"$BUILD_MIRROR_DIR",format=raw
+      -machine "$MACHINE_ARG"
+      -cpu "$CPU_ARG"
+      -smp 8,sockets=1,cores=8,threads=1
+      -m 8G
+      -rtc base=localtime,clock=host
+      -device qemu-xhci,id=xhci,p2=15,p3=15
+      -device usb-kbd,bus=xhci.0
+      -device usb-tablet,bus=xhci.0
+    )
+    ;;
+  *)
+    echo "unknown RUSTOS_QEMU_PROFILE: $QEMU_PROFILE" >&2
+    exit 1
+    ;;
+esac
 
 USE_DEBUGCON_FILE=false
 EXPECT_STDIO_TARGET=""
@@ -71,9 +128,8 @@ set +e
 qemu-system-x86_64 \
   -bios OVMF.fd \
   -drive if=pflash,format=raw,readonly=on,file=OVMF.fd \
-  -drive file=fat:rw:"$BUILD_MIRROR_DIR",format=raw \
+  "${QEMU_PROFILE_ARGS[@]}" \
   -net none \
-  -m 2G \
   -monitor none \
   "${DEBUGCON_ARGS[@]}" \
   -global isa-debugcon.iobase=0xe9 \

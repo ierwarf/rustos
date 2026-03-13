@@ -1,15 +1,27 @@
 use alloc::string::String;
 #[cfg(test)]
 use alloc::vec;
-#[cfg(test)]
 use alloc::vec::Vec;
+use boot_protocol::{BootFileEntry, BootFileManifest, BootInfo};
 use core::cmp::min;
 use core::hint::spin_loop;
+use core::ptr;
+use core::slice;
+use core::str;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 use fatfs::{IoBase, IoError, Read, Seek, SeekFrom, Write};
 use x86_64::instructions::{interrupts, port::Port};
 
 pub const FAT_SECTOR_SIZE: usize = 512;
+const FAT_VOLUME_SIG_OFFSET: usize = FAT_SECTOR_SIZE - 2;
+const GPT_HEADER_LBA: u64 = 1;
+const GPT_SIGNATURE: [u8; 8] = *b"EFI PART";
+const MBR_PARTITION_TABLE_OFFSET: usize = 446;
+const MBR_PARTITION_ENTRY_LEN: usize = 16;
+
+static BOOT_INFO_PTR: AtomicPtr<BootInfo> = AtomicPtr::new(ptr::null_mut());
+
 pub type IoResult<T> = core::result::Result<T, DiskIoError>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,6 +49,97 @@ impl IoError for DiskIoError {
     fn new_write_zero_error() -> Self {
         Self::WriteZero
     }
+}
+
+pub(crate) fn init_boot_info(boot_info_ptr: *const BootInfo) {
+    BOOT_INFO_PTR.store(boot_info_ptr.cast_mut(), Ordering::Release);
+}
+
+fn boot_info() -> Option<&'static BootInfo> {
+    let boot_info_ptr = BOOT_INFO_PTR.load(Ordering::Acquire);
+    if boot_info_ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { &*boot_info_ptr.cast_const() })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CachedBootVolume {
+    manifest: BootFileManifest,
+}
+
+impl CachedBootVolume {
+    fn from_boot_info() -> Option<Self> {
+        let boot_info = boot_info()?;
+        if boot_info.boot_files.entry_count == 0 {
+            return None;
+        }
+        Some(Self {
+            manifest: boot_info.boot_files,
+        })
+    }
+
+    fn open_file(&self, normalized_path: &str) -> Option<CachedBootFile> {
+        let entries = boot_file_entries(&self.manifest)?;
+        for entry in entries {
+            let path = boot_file_path(entry)?;
+            if fat_paths_match(normalized_path, path) {
+                return Some(CachedBootFile {
+                    data: boot_file_data(entry)?,
+                    pos: 0,
+                });
+            }
+        }
+        None
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CachedBootFile {
+    data: &'static [u8],
+    pos: usize,
+}
+
+fn boot_file_entries(manifest: &BootFileManifest) -> Option<&'static [BootFileEntry]> {
+    if manifest.entry_count == 0 {
+        return Some(&[]);
+    }
+    if manifest.entries_ptr == 0 {
+        return None;
+    }
+
+    Some(unsafe {
+        slice::from_raw_parts(
+            manifest.entries_ptr as *const BootFileEntry,
+            manifest.entry_count as usize,
+        )
+    })
+}
+
+fn boot_file_path(entry: &BootFileEntry) -> Option<&'static str> {
+    if entry.path_len == 0 || entry.path_ptr == 0 {
+        return None;
+    }
+
+    let bytes =
+        unsafe { slice::from_raw_parts(entry.path_ptr as *const u8, entry.path_len as usize) };
+    str::from_utf8(bytes).ok()
+}
+
+fn boot_file_data(entry: &BootFileEntry) -> Option<&'static [u8]> {
+    if entry.data_len == 0 {
+        return Some(&[]);
+    }
+    if entry.data_ptr == 0 {
+        return None;
+    }
+
+    Some(unsafe { slice::from_raw_parts(entry.data_ptr as *const u8, entry.data_len as usize) })
+}
+
+fn fat_paths_match(lhs: &str, rhs: &str) -> bool {
+    lhs.eq_ignore_ascii_case(rhs)
 }
 
 /// FAT adapter target: provide raw sector read/write for your storage backend.
@@ -163,16 +266,266 @@ impl<D: BlockDevice> BlockDevice for LbaSliceDevice<D> {
     }
 }
 
-fn is_probable_fat_boot_sector(sector0: &[u8; FAT_SECTOR_SIZE]) -> bool {
-    let has_jump = matches!(sector0[0], 0xEB | 0xE9);
-    let sig_ok = sector0[510] == 0x55 && sector0[511] == 0xAA;
-    let bytes_per_sector = u16::from_le_bytes([sector0[11], sector0[12]]);
-    has_jump && sig_ok && bytes_per_sector == FAT_SECTOR_SIZE as u16
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FatType {
+    Fat12,
+    Fat16,
+    Fat32,
 }
 
-/// Detects where a FAT volume starts.
-/// - superfloppy (boot sector at LBA 0): returns `(0, total_sectors)`
-/// - MBR disk image: returns first valid partition `(start_lba, partition_sectors)`
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FatVolumeMetadata {
+    bytes_per_sector: u16,
+    sectors_per_cluster: u8,
+    total_sectors: u32,
+    cluster_count: u32,
+    fat_type: FatType,
+}
+
+fn le_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
+}
+
+fn le_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])
+}
+
+fn le_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+        bytes[offset + 4],
+        bytes[offset + 5],
+        bytes[offset + 6],
+        bytes[offset + 7],
+    ])
+}
+
+fn parse_fat_volume_metadata(
+    boot_sector: &[u8; FAT_SECTOR_SIZE],
+    available_sectors: u64,
+) -> Option<FatVolumeMetadata> {
+    let has_jump = matches!(boot_sector[0], 0xEB | 0xE9);
+    let sig_ok = boot_sector[FAT_VOLUME_SIG_OFFSET] == 0x55
+        && boot_sector[FAT_VOLUME_SIG_OFFSET + 1] == 0xAA;
+    if !has_jump || !sig_ok {
+        return None;
+    }
+
+    let bytes_per_sector = le_u16(boot_sector, 11);
+    if !matches!(bytes_per_sector, 512 | 1024 | 2048 | 4096) {
+        return None;
+    }
+
+    let sectors_per_cluster = boot_sector[13];
+    if sectors_per_cluster == 0 || !sectors_per_cluster.is_power_of_two() {
+        return None;
+    }
+
+    let reserved_sectors = le_u16(boot_sector, 14);
+    let fat_count = boot_sector[16];
+    let root_entry_count = le_u16(boot_sector, 17);
+    if reserved_sectors == 0 || fat_count == 0 {
+        return None;
+    }
+
+    let total_sectors16 = le_u16(boot_sector, 19);
+    let total_sectors32 = le_u32(boot_sector, 32);
+    let total_sectors = match (total_sectors16, total_sectors32) {
+        (0, 0) => return None,
+        (0, total) => total,
+        (total, 0) => total as u32,
+        (total16, total32) => (total16 as u32).min(total32),
+    };
+    if total_sectors == 0 || u64::from(total_sectors) > available_sectors {
+        return None;
+    }
+
+    let sectors_per_fat16 = le_u16(boot_sector, 22) as u32;
+    let sectors_per_fat32 = le_u32(boot_sector, 36);
+    let sectors_per_fat = if sectors_per_fat16 != 0 {
+        sectors_per_fat16
+    } else {
+        sectors_per_fat32
+    };
+    if sectors_per_fat == 0 {
+        return None;
+    }
+
+    let root_dir_bytes = (root_entry_count as u32).checked_mul(32)?;
+    let root_dir_sectors = root_dir_bytes.div_ceil(bytes_per_sector as u32);
+    let fat_area_sectors = (fat_count as u32).checked_mul(sectors_per_fat)?;
+    let first_data_sector = (reserved_sectors as u32)
+        .checked_add(fat_area_sectors)?
+        .checked_add(root_dir_sectors)?;
+    if first_data_sector >= total_sectors {
+        return None;
+    }
+
+    let data_sectors = total_sectors - first_data_sector;
+    let cluster_count = data_sectors / sectors_per_cluster as u32;
+    if cluster_count == 0 {
+        return None;
+    }
+
+    let fat_type = if cluster_count < 4_085 {
+        FatType::Fat12
+    } else if cluster_count < 65_525 {
+        FatType::Fat16
+    } else {
+        FatType::Fat32
+    };
+
+    match fat_type {
+        FatType::Fat32 => {
+            if root_entry_count != 0 || sectors_per_fat32 == 0 || le_u32(boot_sector, 44) < 2 {
+                return None;
+            }
+        }
+        FatType::Fat12 | FatType::Fat16 => {
+            if root_entry_count == 0 || sectors_per_fat16 == 0 {
+                return None;
+            }
+        }
+    }
+
+    Some(FatVolumeMetadata {
+        bytes_per_sector,
+        sectors_per_cluster,
+        total_sectors,
+        cluster_count,
+        fat_type,
+    })
+}
+
+#[cfg(test)]
+fn is_probable_fat_boot_sector(sector0: &[u8; FAT_SECTOR_SIZE], available_sectors: u64) -> bool {
+    parse_fat_volume_metadata(sector0, available_sectors).is_some()
+}
+
+fn probe_fat_volume_slice<D: BlockDevice>(
+    dev: &mut D,
+    start_lba: u64,
+    available_sectors: u64,
+) -> IoResult<Option<u64>> {
+    if available_sectors == 0 {
+        return Ok(None);
+    }
+
+    let mut boot_sector = [0_u8; FAT_SECTOR_SIZE];
+    dev.read_sector(start_lba, &mut boot_sector)?;
+    Ok(parse_fat_volume_metadata(&boot_sector, available_sectors)
+        .map(|metadata| u64::from(metadata.total_sectors)))
+}
+
+fn read_device_bytes<D: BlockDevice>(dev: &mut D, offset: u64, out: &mut [u8]) -> IoResult<()> {
+    if out.is_empty() {
+        return Ok(());
+    }
+
+    let mut scratch = [0_u8; FAT_SECTOR_SIZE];
+    let mut copied = 0usize;
+    while copied < out.len() {
+        let absolute = offset
+            .checked_add(copied as u64)
+            .ok_or(DiskIoError::InvalidInput)?;
+        let lba = absolute / FAT_SECTOR_SIZE as u64;
+        let sector_offset = (absolute as usize) % FAT_SECTOR_SIZE;
+        dev.read_sector(lba, &mut scratch)?;
+
+        let chunk = min(FAT_SECTOR_SIZE - sector_offset, out.len() - copied);
+        out[copied..copied + chunk].copy_from_slice(&scratch[sector_offset..sector_offset + chunk]);
+        copied += chunk;
+    }
+
+    Ok(())
+}
+
+fn detect_gpt_fat_volume_slice<D: BlockDevice>(
+    dev: &mut D,
+    total_sectors: u64,
+) -> IoResult<Option<(u64, u64)>> {
+    if total_sectors <= GPT_HEADER_LBA {
+        return Ok(None);
+    }
+
+    let mut header = [0_u8; FAT_SECTOR_SIZE];
+    dev.read_sector(GPT_HEADER_LBA, &mut header)?;
+    if header[..GPT_SIGNATURE.len()] != GPT_SIGNATURE {
+        return Ok(None);
+    }
+
+    let header_size = le_u32(&header, 12) as usize;
+    if !(92..=FAT_SECTOR_SIZE).contains(&header_size) {
+        return Ok(None);
+    }
+
+    let entries_lba = le_u64(&header, 72);
+    let entry_count = le_u32(&header, 80) as u64;
+    let entry_size = le_u32(&header, 84) as u64;
+    if entry_count == 0 || entry_size < 128 || entry_size % 8 != 0 {
+        return Ok(None);
+    }
+
+    let Some(table_offset) = entries_lba.checked_mul(FAT_SECTOR_SIZE as u64) else {
+        return Ok(None);
+    };
+    let Some(table_bytes) = entry_count.checked_mul(entry_size) else {
+        return Ok(None);
+    };
+    let Some(table_end) = table_offset.checked_add(table_bytes) else {
+        return Ok(None);
+    };
+    let Some(disk_bytes) = total_sectors.checked_mul(FAT_SECTOR_SIZE as u64) else {
+        return Ok(None);
+    };
+    if table_end > disk_bytes {
+        return Ok(None);
+    }
+
+    let mut entry_prefix = [0_u8; 48];
+    for index in 0..entry_count {
+        let Some(entry_offset) = index
+            .checked_mul(entry_size)
+            .and_then(|offset| table_offset.checked_add(offset))
+        else {
+            continue;
+        };
+        read_device_bytes(dev, entry_offset, &mut entry_prefix)?;
+        if entry_prefix[..16].iter().all(|byte| *byte == 0) {
+            continue;
+        }
+
+        let first_lba = le_u64(&entry_prefix, 32);
+        let last_lba = le_u64(&entry_prefix, 40);
+        let Some(sectors) = last_lba
+            .checked_sub(first_lba)
+            .and_then(|delta| delta.checked_add(1))
+        else {
+            continue;
+        };
+        let Some(end_lba) = first_lba.checked_add(sectors) else {
+            continue;
+        };
+        if first_lba == 0 || end_lba > total_sectors {
+            continue;
+        }
+
+        if let Some(volume_sectors) = probe_fat_volume_slice(dev, first_lba, sectors)? {
+            return Ok(Some((first_lba, volume_sectors)));
+        }
+    }
+
+    Ok(None)
+}
+
 fn detect_fat_volume_slice<D: BlockDevice>(dev: &mut D) -> IoResult<(u64, u64)> {
     let total = dev.sector_count();
     if total == 0 {
@@ -181,41 +534,49 @@ fn detect_fat_volume_slice<D: BlockDevice>(dev: &mut D) -> IoResult<(u64, u64)> 
 
     let mut sector0 = [0_u8; FAT_SECTOR_SIZE];
     dev.read_sector(0, &mut sector0)?;
-
-    if is_probable_fat_boot_sector(&sector0) {
-        return Ok((0, total));
+    if let Some(metadata) = parse_fat_volume_metadata(&sector0, total) {
+        return Ok((0, u64::from(metadata.total_sectors)));
     }
 
-    let sig_ok = sector0[510] == 0x55 && sector0[511] == 0xAA;
+    let sig_ok =
+        sector0[FAT_VOLUME_SIG_OFFSET] == 0x55 && sector0[FAT_VOLUME_SIG_OFFSET + 1] == 0xAA;
     if !sig_ok {
         return Err(DiskIoError::InvalidInput);
     }
 
+    let mut gpt_checked = false;
     for idx in 0..4 {
-        let off = 446 + idx * 16;
+        let off = MBR_PARTITION_TABLE_OFFSET + idx * MBR_PARTITION_ENTRY_LEN;
         let part_type = sector0[off + 4];
-        let start_lba = u32::from_le_bytes([
-            sector0[off + 8],
-            sector0[off + 9],
-            sector0[off + 10],
-            sector0[off + 11],
-        ]) as u64;
-        let sectors = u32::from_le_bytes([
-            sector0[off + 12],
-            sector0[off + 13],
-            sector0[off + 14],
-            sector0[off + 15],
-        ]) as u64;
-
-        if part_type == 0 || start_lba == 0 || sectors == 0 {
+        if part_type == 0 {
             continue;
         }
 
-        let end = start_lba
-            .checked_add(sectors)
-            .ok_or(DiskIoError::InvalidInput)?;
-        if end <= total {
-            return Ok((start_lba, sectors));
+        if part_type == 0xEE && !gpt_checked {
+            gpt_checked = true;
+            if let Some(volume) = detect_gpt_fat_volume_slice(dev, total)? {
+                return Ok(volume);
+            }
+            continue;
+        }
+
+        let start_lba = le_u32(&sector0, off + 8) as u64;
+        let sectors = le_u32(&sector0, off + 12) as u64;
+        let Some(end_lba) = start_lba.checked_add(sectors) else {
+            continue;
+        };
+        if start_lba == 0 || sectors == 0 || end_lba > total {
+            continue;
+        }
+
+        if let Some(volume_sectors) = probe_fat_volume_slice(dev, start_lba, sectors)? {
+            return Ok((start_lba, volume_sectors));
+        }
+    }
+
+    if !gpt_checked {
+        if let Some(volume) = detect_gpt_fat_volume_slice(dev, total)? {
+            return Ok(volume);
         }
     }
 
@@ -280,6 +641,14 @@ impl AtaPioDevice {
 
     pub fn primary_slave() -> IoResult<Self> {
         Self::new(0x1F0, 0x3F6, AtaDrive::Slave)
+    }
+
+    pub fn secondary_master() -> IoResult<Self> {
+        Self::new(0x170, 0x376, AtaDrive::Master)
+    }
+
+    pub fn secondary_slave() -> IoResult<Self> {
+        Self::new(0x170, 0x376, AtaDrive::Slave)
     }
 
     pub fn new(io_base: u16, ctrl_base: u16, drive: AtaDrive) -> IoResult<Self> {
@@ -694,26 +1063,97 @@ impl<D: BlockDevice> Seek for FatDisk<D> {
 type BootVolumeDevice = LbaSliceDevice<AtaPioDevice>;
 type BootVolumeDisk = FatDisk<BootVolumeDevice>;
 type BootVolumeFs = fatfs::FileSystem<BootVolumeDisk>;
-pub(crate) type BootVolumeFile<'a> =
+type AtaBootVolumeFile<'a> =
     fatfs::File<'a, BootVolumeDisk, fatfs::DefaultTimeProvider, fatfs::LossyOemCpConverter>;
 
+fn open_ata_boot_volume() -> core::result::Result<BootVolumeFs, fatfs::Error<DiskIoError>> {
+    let dev = AtaPioDevice::primary_master()
+        .or_else(|_| AtaPioDevice::primary_slave())
+        .or_else(|_| AtaPioDevice::secondary_master())
+        .or_else(|_| AtaPioDevice::secondary_slave());
+    let mut dev = match dev {
+        Ok(dev) => dev,
+        Err(_) => return Err(fatfs::Error::Io(DiskIoError::NotPresent)),
+    };
+
+    let (start_lba, sectors) = detect_fat_volume_slice(&mut dev)?;
+    let disk_dev = LbaSliceDevice::new(dev, start_lba, sectors)?;
+    let disk = FatDisk::new(disk_dev);
+    fatfs::FileSystem::new(disk, fatfs::FsOptions::new())
+}
+
+pub(crate) enum BootVolumeFile<'a> {
+    Cached(CachedBootFile),
+    Fat(AtaBootVolumeFile<'a>),
+}
+
+impl IoBase for BootVolumeFile<'_> {
+    type Error = fatfs::Error<DiskIoError>;
+}
+
+impl Read for BootVolumeFile<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> core::result::Result<usize, fatfs::Error<DiskIoError>> {
+        match self {
+            Self::Cached(file) => {
+                if buf.is_empty() || file.pos >= file.data.len() {
+                    return Ok(0);
+                }
+
+                let read = min(buf.len(), file.data.len() - file.pos);
+                buf[..read].copy_from_slice(&file.data[file.pos..file.pos + read]);
+                file.pos += read;
+                Ok(read)
+            }
+            Self::Fat(file) => file.read(buf),
+        }
+    }
+}
+
+impl Seek for BootVolumeFile<'_> {
+    fn seek(&mut self, pos: SeekFrom) -> core::result::Result<u64, fatfs::Error<DiskIoError>> {
+        match self {
+            Self::Cached(file) => {
+                let len = file.data.len() as i128;
+                let cur = file.pos as i128;
+                let next = match pos {
+                    SeekFrom::Start(offset) => offset as i128,
+                    SeekFrom::End(delta) => len
+                        .checked_add(delta as i128)
+                        .ok_or(fatfs::Error::InvalidInput)?,
+                    SeekFrom::Current(delta) => cur
+                        .checked_add(delta as i128)
+                        .ok_or(fatfs::Error::InvalidInput)?,
+                };
+                if next < 0 || next > len {
+                    return Err(fatfs::Error::InvalidInput);
+                }
+
+                file.pos = next as usize;
+                Ok(next as u64)
+            }
+            Self::Fat(file) => file.seek(pos),
+        }
+    }
+}
+
 pub(crate) struct BootVolume {
-    fs: BootVolumeFs,
+    cached: Option<CachedBootVolume>,
+    fs: Option<BootVolumeFs>,
 }
 
 impl BootVolume {
     pub(crate) fn open() -> core::result::Result<Self, fatfs::Error<DiskIoError>> {
-        let dev = AtaPioDevice::primary_master().or_else(|_| AtaPioDevice::primary_slave());
-        let mut dev = match dev {
-            Ok(dev) => dev,
-            Err(_) => return Err(fatfs::Error::Io(DiskIoError::NotPresent)),
-        };
+        let cached = CachedBootVolume::from_boot_info()
+            .filter(|volume| boot_file_entries(&volume.manifest).is_some());
+        if cached.is_some() {
+            return Ok(Self { cached, fs: None });
+        }
 
-        let (start_lba, sectors) = detect_fat_volume_slice(&mut dev)?;
-        let disk_dev = LbaSliceDevice::new(dev, start_lba, sectors)?;
-        let disk = FatDisk::new(disk_dev);
-        let fs = fatfs::FileSystem::new(disk, fatfs::FsOptions::new())?;
-        Ok(Self { fs })
+        let fs = open_ata_boot_volume()?;
+        Ok(Self {
+            cached: None,
+            fs: Some(fs),
+        })
     }
 
     pub(crate) fn open_file(
@@ -721,20 +1161,72 @@ impl BootVolume {
         path: &str,
     ) -> core::result::Result<BootVolumeFile<'_>, fatfs::Error<DiskIoError>> {
         let normalized_path = normalize_fat_path(path);
-        let root = self.fs.root_dir();
+        if let Some(cached) = self.cached {
+            return cached
+                .open_file(normalized_path.as_str())
+                .map(BootVolumeFile::Cached)
+                .ok_or(fatfs::Error::NotFound);
+        }
+
+        let fs = self
+            .fs
+            .as_ref()
+            .ok_or(fatfs::Error::Io(DiskIoError::NotPresent))?;
+        let root = fs.root_dir();
         root.open_file(normalized_path.as_str())
+            .map(BootVolumeFile::Fat)
     }
 
     pub(crate) fn close(self) -> core::result::Result<(), fatfs::Error<DiskIoError>> {
-        self.fs.unmount()
+        match self.fs {
+            Some(fs) => fs.unmount(),
+            None => Ok(()),
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn read_file_to_vec(
+    path: &str,
+) -> core::result::Result<Vec<u8>, fatfs::Error<DiskIoError>> {
+    let volume = BootVolume::open()?;
+    let result = {
+        let mut file = volume.open_file(path)?;
+        let file_len = file.seek(SeekFrom::End(0))?;
+        let capacity =
+            usize::try_from(file_len).map_err(|_| fatfs::Error::Io(DiskIoError::InvalidInput))?;
+        file.seek(SeekFrom::Start(0))?;
+
+        let mut bytes = Vec::with_capacity(capacity);
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let read = file.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+
+        Ok(bytes)
+    };
+
+    match (result, volume.close()) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(err)) => Err(err),
+        (Err(err), _) => Err(err),
     }
 }
 
 fn normalize_fat_path(path: &str) -> String {
-    let trimmed = path.trim_start_matches(['/', '\\']);
-    let mut normalized = String::with_capacity(trimmed.len());
-    for ch in trimmed.chars() {
-        normalized.push(if ch == '\\' { '/' } else { ch });
+    let mut normalized = String::with_capacity(path.len());
+    for component in path.split(['/', '\\']) {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if !normalized.is_empty() {
+            normalized.push('/');
+        }
+        normalized.push_str(component);
     }
     normalized
 }
@@ -743,10 +1235,18 @@ fn normalize_fat_path(path: &str) -> String {
 mod tests {
     use super::*;
 
-    fn fat_boot_sector() -> [u8; FAT_SECTOR_SIZE] {
+    fn fat_boot_sector(total_sectors: u16, bytes_per_sector: u16) -> [u8; FAT_SECTOR_SIZE] {
         let mut sector = [0_u8; FAT_SECTOR_SIZE];
         sector[0] = 0xEB;
-        sector[11..13].copy_from_slice(&(FAT_SECTOR_SIZE as u16).to_le_bytes());
+        sector[2] = 0x90;
+        sector[11..13].copy_from_slice(&bytes_per_sector.to_le_bytes());
+        sector[13] = 1;
+        sector[14..16].copy_from_slice(&1_u16.to_le_bytes());
+        sector[16] = 2;
+        sector[17..19].copy_from_slice(&32_u16.to_le_bytes());
+        sector[19..21].copy_from_slice(&total_sectors.to_le_bytes());
+        sector[21] = 0xF8;
+        sector[22..24].copy_from_slice(&1_u16.to_le_bytes());
         sector[510] = 0x55;
         sector[511] = 0xAA;
         sector
@@ -755,7 +1255,7 @@ mod tests {
     #[test]
     fn detects_superfloppy_volume_at_lba_zero() {
         let mut disk = MemBlockDevice::new_zeroed(8);
-        let sector = fat_boot_sector();
+        let sector = fat_boot_sector(8, FAT_SECTOR_SIZE as u16);
         disk.write_sector(0, &sector).expect("write sector 0");
 
         assert_eq!(detect_fat_volume_slice(&mut disk), Ok((0, 8)));
@@ -772,6 +1272,9 @@ mod tests {
         mbr[510] = 0x55;
         mbr[511] = 0xAA;
         disk.write_sector(0, &mbr).expect("write MBR");
+        let boot_sector = fat_boot_sector(64, FAT_SECTOR_SIZE as u16);
+        disk.write_sector(32, &boot_sector)
+            .expect("write partition boot sector");
 
         assert_eq!(detect_fat_volume_slice(&mut disk), Ok((32, 64)));
     }
@@ -788,9 +1291,59 @@ mod tests {
     #[test]
     fn normalize_fat_path_unifies_separators() {
         assert_eq!(
-            normalize_fat_path("\\EFI\\BOOT\\BOOTX64.EFI"),
+            normalize_fat_path("//EFI\\\\BOOT/./BOOTX64.EFI"),
             "EFI/BOOT/BOOTX64.EFI"
         );
         assert_eq!(normalize_fat_path("/kernel.elf"), "kernel.elf");
+    }
+
+    #[test]
+    fn detects_partitioned_volume_from_gpt_entry() {
+        let mut disk = MemBlockDevice::new_zeroed(256);
+
+        let mut protective_mbr = [0_u8; FAT_SECTOR_SIZE];
+        protective_mbr[446 + 4] = 0xEE;
+        protective_mbr[446 + 8..446 + 12].copy_from_slice(&1_u32.to_le_bytes());
+        protective_mbr[446 + 12..446 + 16].copy_from_slice(&255_u32.to_le_bytes());
+        protective_mbr[510] = 0x55;
+        protective_mbr[511] = 0xAA;
+        disk.write_sector(0, &protective_mbr)
+            .expect("write protective MBR");
+
+        let mut gpt_header = [0_u8; FAT_SECTOR_SIZE];
+        gpt_header[..8].copy_from_slice(b"EFI PART");
+        gpt_header[8..12].copy_from_slice(&0x0001_0000_u32.to_le_bytes());
+        gpt_header[12..16].copy_from_slice(&92_u32.to_le_bytes());
+        gpt_header[72..80].copy_from_slice(&2_u64.to_le_bytes());
+        gpt_header[80..84].copy_from_slice(&1_u32.to_le_bytes());
+        gpt_header[84..88].copy_from_slice(&128_u32.to_le_bytes());
+        disk.write_sector(1, &gpt_header).expect("write GPT header");
+
+        let mut entry_sector = [0_u8; FAT_SECTOR_SIZE];
+        entry_sector[0] = 1;
+        entry_sector[32..40].copy_from_slice(&40_u64.to_le_bytes());
+        entry_sector[40..48].copy_from_slice(&103_u64.to_le_bytes());
+        disk.write_sector(2, &entry_sector)
+            .expect("write GPT entry sector");
+
+        let boot_sector = fat_boot_sector(64, FAT_SECTOR_SIZE as u16);
+        disk.write_sector(40, &boot_sector)
+            .expect("write GPT partition boot sector");
+
+        assert_eq!(detect_fat_volume_slice(&mut disk), Ok((40, 64)));
+    }
+
+    #[test]
+    fn accepts_fat_boot_sector_with_4k_logical_sectors() {
+        let sector = fat_boot_sector(128, 4096);
+        assert!(is_probable_fat_boot_sector(&sector, 128));
+    }
+
+    #[test]
+    fn cached_paths_match_case_insensitively() {
+        assert!(fat_paths_match(
+            "efi/boot/bootx64.efi",
+            "EFI/BOOT/BOOTX64.EFI"
+        ));
     }
 }

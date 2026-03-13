@@ -2,9 +2,12 @@ use core::ptr;
 
 use uefi::boot::{self, AllocateType, MemoryType};
 use uefi::proto::console::gop::{FrameBuffer, GraphicsOutput, PixelFormat};
+use uefi::system;
+use uefi::table::cfg::ConfigTableEntry;
 
 use crate::boot_info::{
-    BootInfo, BootPixelFormat, FramebufferInfo, BOOT_INFO_MAGIC, BOOT_INFO_VERSION,
+    BootFileManifest, BootInfo, BootPixelFormat, FramebufferInfo, BOOT_INFO_MAGIC,
+    BOOT_INFO_VERSION,
 };
 use crate::debug;
 use crate::error::BootError;
@@ -50,6 +53,11 @@ pub fn prepare_boot_info() -> Result<BootInfo, BootError> {
     debug::println!("bootloader: prepare_boot_info: generating RNG seed");
     let rng_seed = random::generate_seed(front_addr, front_size as u64, back_addr, back_size);
     debug::println!("bootloader: prepare_boot_info: RNG seed ready");
+    let acpi_rsdp_addr = locate_acpi_rsdp();
+    debug::println!(
+        "bootloader: prepare_boot_info: ACPI RSDP={:#x}",
+        acpi_rsdp_addr
+    );
 
     let fb_info = FramebufferInfo {
         addr: front_addr,
@@ -69,7 +77,9 @@ pub fn prepare_boot_info() -> Result<BootInfo, BootError> {
         version: BOOT_INFO_VERSION,
         _reserved0: 0,
         rng_seed,
+        acpi_rsdp_addr,
         framebuffer: fb_info,
+        boot_files: BootFileManifest::empty(),
     })
 }
 
@@ -115,4 +125,19 @@ fn map_pixel_format(pixel_format: PixelFormat) -> BootPixelFormat {
         PixelFormat::Bitmask => BootPixelFormat::Bitmask,
         PixelFormat::BltOnly => BootPixelFormat::Unknown,
     }
+}
+
+fn locate_acpi_rsdp() -> u64 {
+    system::with_config_table(|entries| {
+        entries
+            .iter()
+            .find(|entry| entry.guid == ConfigTableEntry::ACPI2_GUID)
+            .or_else(|| {
+                entries
+                    .iter()
+                    .find(|entry| entry.guid == ConfigTableEntry::ACPI_GUID)
+            })
+            .map(|entry| entry.address as u64)
+            .unwrap_or(0)
+    })
 }

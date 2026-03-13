@@ -270,6 +270,7 @@ extern "C" fn timer_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut S
         next_rsp
     };
 
+    crate::input::poll_fallback();
     crate::pic::send_eoi(crate::pic::PIC_1_OFFSET);
     next_rsp as *mut SavedContext
 }

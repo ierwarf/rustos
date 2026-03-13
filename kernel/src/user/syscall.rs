@@ -13,6 +13,7 @@ const SYSCALL_CONSOLE_WRITE: u64 = 1;
 const SYSCALL_CONSOLE_READ: u64 = 2;
 const SYSCALL_CONSOLE_POLL_INPUT: u64 = 3;
 const SYSCALL_SLEEP_MS: u64 = 4;
+const SYSCALL_PROCESS_EXIT: u64 = 5;
 const SYSCALL_STACK_SIZE: usize = 16 * 1024;
 const MAX_CONSOLE_IO_LEN: usize = 256;
 const CONSOLE_IO_CHUNK_LEN: usize = 256;
@@ -54,7 +55,8 @@ static mut SYSCALL_CPU_LOCAL: SyscallCpuLocal = SyscallCpuLocal {
     kernel_stack_top: 0,
     user_rsp: 0,
 };
-static mut SYSCALL_FALLBACK_STACK: SyscallFallbackStack = SyscallFallbackStack([0; SYSCALL_STACK_SIZE]);
+static mut SYSCALL_FALLBACK_STACK: SyscallFallbackStack =
+    SyscallFallbackStack([0; SYSCALL_STACK_SIZE]);
 
 global_asm!(
     r#"
@@ -121,8 +123,7 @@ pub fn init() {
         SYSCALL_CPU_LOCAL.kernel_stack_top = stack_base + SYSCALL_STACK_SIZE as u64;
     }
 
-    let entry_addr =
-        paging::higher_half_addr(syscall_entry as *const () as usize as u64);
+    let entry_addr = paging::higher_half_addr(syscall_entry as *const () as usize as u64);
     let syscall_mask = RFlags::INTERRUPT_FLAG | RFlags::TRAP_FLAG | RFlags::DIRECTION_FLAG;
 
     unsafe {
@@ -167,13 +168,7 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
 
 fn dispatch_syscall(frame: &SyscallFrame) -> u64 {
     if let Some(result) = crate::win32::dispatch_syscall(
-        frame.rax,
-        frame.rdi,
-        frame.rsi,
-        frame.rdx,
-        frame.r8,
-        frame.r9,
-        frame.r10,
+        frame.rax, frame.rdi, frame.rsi, frame.rdx, frame.r8, frame.r9, frame.r10,
     ) {
         return result;
     }
@@ -183,6 +178,7 @@ fn dispatch_syscall(frame: &SyscallFrame) -> u64 {
         SYSCALL_CONSOLE_READ => syscall_console_read(frame.rdi, frame.rsi),
         SYSCALL_CONSOLE_POLL_INPUT => tty::pending_input_len() as u64,
         SYSCALL_SLEEP_MS => syscall_sleep_ms(frame.rdi),
+        SYSCALL_PROCESS_EXIT => syscall_process_exit(frame.rdi),
         _ => SYSCALL_ERR_INVALID,
     }
 }
@@ -225,13 +221,13 @@ fn syscall_console_read(user_ptr: u64, user_len: u64) -> u64 {
     match console_read_into_user(user_ptr, len) {
         Ok(read) => read as u64,
         Err(err) => {
-        debug::println!(
-            "syscall console_read fault: user_ptr={:#x} len={} err={:?}",
-            user_ptr,
+            debug::println!(
+                "syscall console_read fault: user_ptr={:#x} len={} err={:?}",
+                user_ptr,
                 len,
-            err,
-        );
-        return SYSCALL_ERR_FAULT;
+                err,
+            );
+            return SYSCALL_ERR_FAULT;
         }
     }
 }
@@ -239,6 +235,11 @@ fn syscall_console_read(user_ptr: u64, user_len: u64) -> u64 {
 fn syscall_sleep_ms(milliseconds: u64) -> u64 {
     sleep_ms(milliseconds);
     0
+}
+
+fn syscall_process_exit(status: u64) -> u64 {
+    let _ = status;
+    multitask::exit_current_user_task()
 }
 
 pub(crate) fn console_write_from_user(
@@ -302,10 +303,7 @@ pub(crate) fn console_read_into_user(
     Ok(total_read)
 }
 
-pub(crate) fn write_user_u32(
-    user_ptr: u64,
-    value: u32,
-) -> Result<(), paging::AddressSpaceError> {
+pub(crate) fn write_user_u32(user_ptr: u64, value: u32) -> Result<(), paging::AddressSpaceError> {
     let Some(address_space) = multitask::current_user_address_space() else {
         return Err(paging::AddressSpaceError::NotMapped);
     };

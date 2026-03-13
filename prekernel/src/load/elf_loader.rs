@@ -44,7 +44,8 @@ where
         "failed to read program header table",
     )?;
 
-    let entry_point = usize::try_from(header.entry_point).map_err(|_| "entry point out of range")?;
+    let entry_point =
+        usize::try_from(header.entry_point).map_err(|_| "entry point out of range")?;
     validate_kernel_entry(entry_point)?;
 
     let mut loaded_segments = 0usize;
@@ -54,7 +55,8 @@ where
 
     for index in 0..header.program_header_count {
         let offset = index * ELF64_PROGRAM_HEADER_SIZE;
-        let ph = parse_program_header(&program_headers[offset..offset + ELF64_PROGRAM_HEADER_SIZE])?;
+        let ph =
+            parse_program_header(&program_headers[offset..offset + ELF64_PROGRAM_HEADER_SIZE])?;
         if ph.ty != ELF_PT_LOAD {
             continue;
         }
@@ -194,16 +196,17 @@ fn parse_program_header(bytes: &[u8]) -> Result<ProgramHeader, &'static str> {
     })
 }
 
-fn load_segment<R>(
-    reader: &mut R,
-    segment: &SegmentLoadInfo,
-) -> Result<(), &'static str>
+fn load_segment<R>(reader: &mut R, segment: &SegmentLoadInfo) -> Result<(), &'static str>
 where
     R: Read + Seek + IoBase<Error = fatfs::Error<DiskIoError>>,
 {
     unsafe {
         // The destination range was validated to lie in the supported kernel load window.
-        ptr::write_bytes(segment.page_base as *mut u8, 0, segment.page_end - segment.page_base);
+        ptr::write_bytes(
+            segment.page_base as *mut u8,
+            0,
+            segment.page_end - segment.page_base,
+        );
     }
 
     if segment.file_size == 0 {
@@ -269,7 +272,9 @@ fn validated_segment_bounds(
         return Err("segment address is below minimum kernel load address");
     }
 
-    let end = addr.checked_add(mem_size).ok_or("segment address overflow")?;
+    let end = addr
+        .checked_add(mem_size)
+        .ok_or("segment address overflow")?;
     if end > MAX_KERNEL_LOAD_END_EXCLUSIVE {
         return Err("segment address exceeds maximum kernel load range");
     }

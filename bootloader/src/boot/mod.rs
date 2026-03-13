@@ -1,6 +1,7 @@
 pub(crate) mod boot_info;
 pub(crate) mod elf_loader;
 pub(crate) mod error;
+mod file_cache;
 
 use alloc::vec::Vec;
 
@@ -8,11 +9,11 @@ use uefi::boot;
 use uefi::fs::{Error as FsError, FileSystem};
 use uefi::prelude::*;
 
-use crate::debug;
-use crate::gui;
 use self::boot_info::BootInfo;
 use self::elf_loader::load_elf_image;
 use self::error::BootError;
+use crate::debug;
+use crate::gui;
 
 const PREKERNEL_CANDIDATE_PATHS: [(&str, &uefi::CStr16); 4] = [
     ("\\prekernel.elf", cstr16!("\\prekernel.elf")),
@@ -43,7 +44,9 @@ pub fn boot_prekernel() -> Result<(), BootError> {
     if segment_count == 0 {
         return Err(BootError::InvalidElf("no PT_LOAD segments"));
     }
-    let boot_info = gui::prepare_boot_info()?;
+    let boot_files = file_cache::snapshot_boot_volume()?;
+    let mut boot_info = gui::prepare_boot_info()?;
+    boot_info.boot_files = boot_files;
     let boot_info_ptr = gui::allocate_boot_info(boot_info)?;
     debug::println!(
         "bootloader: boot info prepared, fb={:#x}, back={:#x}",

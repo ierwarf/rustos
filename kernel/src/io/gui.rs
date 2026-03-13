@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use core::convert::Infallible;
 use core::ptr;
 use core::str;
@@ -6,19 +7,20 @@ use core::sync::atomic::{AtomicU16, Ordering};
 use boot_protocol::{
     BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootInfo, BootPixelFormat, FramebufferInfo,
 };
+use embedded_graphics::Drawable;
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::geometry::{OriginDimensions, Point, Size};
-use embedded_graphics::mono_font::{ascii::FONT_9X18_BOLD, MonoTextStyle};
+use embedded_graphics::mono_font::{MonoTextStyle, ascii::FONT_9X18_BOLD};
 use embedded_graphics::pixelcolor::Rgb888;
 use embedded_graphics::prelude::{Pixel, RgbColor};
 use embedded_graphics::text::{Baseline, Text};
-use embedded_graphics::Drawable;
 use spin::Mutex;
 use x86_64::instructions::interrupts;
 
-use crate::paging;
+use crate::{debug, fat, heap, jpeg, paging};
 
 const HUGE_2MIB: u64 = 2 * 1024 * 1024;
+const BACKGROUND_IMAGE_PATH: &str = "background.jpg";
 const CONSOLE_PADDING_X: usize = 12;
 const CONSOLE_PADDING_Y: usize = 12;
 const CONSOLE_TAB_WIDTH: usize = 4;
@@ -40,6 +42,7 @@ pub static GOP_SCREEN: Mutex<Framebuffer> = Mutex::new(Framebuffer {
     use_double_buffer: false,
 });
 static GUI_CONSOLE: Mutex<TextConsole> = Mutex::new(TextConsole::new());
+static GUI_BACKGROUND: Mutex<ConsoleBackground> = Mutex::new(ConsoleBackground::new());
 static CURSOR_BLINK_TICKS: AtomicU16 = AtomicU16::new(0);
 
 pub struct Framebuffer {
@@ -55,6 +58,197 @@ pub struct Framebuffer {
 }
 
 unsafe impl Send for Framebuffer {}
+
+struct ConsoleBackground {
+    width: usize,
+    height: usize,
+    stride_bytes: usize,
+    bpp: usize,
+    pixels: Vec<u8>,
+    ready: bool,
+}
+
+impl ConsoleBackground {
+    const fn new() -> Self {
+        Self {
+            width: 0,
+            height: 0,
+            stride_bytes: 0,
+            bpp: 0,
+            pixels: Vec::new(),
+            ready: false,
+        }
+    }
+
+    fn ensure_loaded(&mut self, framebuffer: &Framebuffer) {
+        if self.matches(framebuffer) {
+            return;
+        }
+
+        if !heap::is_initialized() {
+            return;
+        }
+
+        self.clear();
+
+        let encoded = match fat::read_file_to_vec(BACKGROUND_IMAGE_PATH) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                debug::println!(
+                    "GUI background disabled: failed to read {}: {:?}",
+                    BACKGROUND_IMAGE_PATH,
+                    err,
+                );
+                return;
+            }
+        };
+        let load_result = jpeg::with_decoded_rgb(&encoded, |decoded| {
+            self.populate_scaled(framebuffer, &decoded)
+                .map(|()| (decoded.width, decoded.height))
+        });
+        match load_result {
+            Ok(Ok((src_width, src_height))) => {
+                debug::println!(
+                    "GUI background loaded: {}x{} -> {}x{} (50% brightness)",
+                    src_width,
+                    src_height,
+                    framebuffer.width,
+                    framebuffer.height,
+                );
+            }
+            Ok(Err(reason)) => {
+                debug::println!("GUI background disabled: {}", reason);
+            }
+            Err(err) => {
+                debug::println!(
+                    "GUI background disabled: failed to decode {}: {:?}",
+                    BACKGROUND_IMAGE_PATH,
+                    err,
+                );
+            }
+        }
+    }
+
+    fn populate_scaled(
+        &mut self,
+        framebuffer: &Framebuffer,
+        image: &jpeg::JpegImageView<'_>,
+    ) -> Result<(), &'static str> {
+        if image.width == 0 || image.height == 0 {
+            return Err("background image dimensions are invalid");
+        }
+
+        let buffer_len = framebuffer
+            .stride_bytes
+            .checked_mul(framebuffer.height)
+            .ok_or("background buffer size overflow")?;
+        self.pixels.resize(buffer_len, 0);
+        self.width = framebuffer.width;
+        self.height = framebuffer.height;
+        self.stride_bytes = framebuffer.stride_bytes;
+        self.bpp = framebuffer.bpp;
+
+        let src_max_x = image.width.saturating_sub(1);
+        let src_max_y = image.height.saturating_sub(1);
+        let dst_den_x = self.width.saturating_sub(1).max(1) as u64;
+        let dst_den_y = self.height.saturating_sub(1).max(1) as u64;
+
+        for dst_y in 0..self.height {
+            let src_y = if image.height == 1 {
+                0
+            } else {
+                ((dst_y as u64) * (src_max_y as u64) << 16) / dst_den_y
+            };
+            let y0 = (src_y >> 16) as usize;
+            let y1 = (y0 + 1).min(src_max_y);
+            let wy = (src_y & 0xffff) as u32;
+
+            for dst_x in 0..self.width {
+                let src_x = if image.width == 1 {
+                    0
+                } else {
+                    ((dst_x as u64) * (src_max_x as u64) << 16) / dst_den_x
+                };
+                let x0 = (src_x >> 16) as usize;
+                let x1 = (x0 + 1).min(src_max_x);
+                let wx = (src_x & 0xffff) as u32;
+
+                let rgb = sample_bilinear_rgb(image, x0, x1, y0, y1, wx, wy);
+                let dimmed = Rgb888::new(rgb.r() >> 1, rgb.g() >> 1, rgb.b() >> 1);
+                let (c0, c1, c2) = framebuffer.color_bytes(dimmed);
+                let dst = dst_y * self.stride_bytes + dst_x * self.bpp;
+                self.pixels[dst] = c0;
+                self.pixels[dst + 1] = c1;
+                self.pixels[dst + 2] = c2;
+                if self.bpp == 4 {
+                    self.pixels[dst + 3] = 0;
+                }
+            }
+        }
+
+        self.ready = true;
+        Ok(())
+    }
+
+    fn draw_fullscreen(&self, framebuffer: &Framebuffer) {
+        if !self.matches(framebuffer) {
+            framebuffer.fill(console_background());
+            return;
+        }
+
+        unsafe {
+            ptr::copy_nonoverlapping(
+                self.pixels.as_ptr(),
+                framebuffer.active_buffer(),
+                self.pixels.len(),
+            );
+        }
+    }
+
+    fn draw_rect(&self, framebuffer: &Framebuffer, x: i64, y: i64, w: u32, h: u32) {
+        let Some((x0, y0, x1, y1)) = framebuffer.clipped_rect(x, y, w, h) else {
+            return;
+        };
+        if !self.matches(framebuffer) {
+            framebuffer.fill_rect(x, y, w, h, console_background(), 255);
+            return;
+        }
+
+        let copy_len = (x1 - x0) * self.bpp;
+        unsafe {
+            let mut src_row = self
+                .pixels
+                .as_ptr()
+                .add(y0 * self.stride_bytes + x0 * self.bpp);
+            let mut dst_row = framebuffer
+                .active_buffer()
+                .add(y0 * framebuffer.stride_bytes + x0 * framebuffer.bpp);
+            for _ in y0..y1 {
+                ptr::copy_nonoverlapping(src_row, dst_row, copy_len);
+                src_row = src_row.add(self.stride_bytes);
+                dst_row = dst_row.add(framebuffer.stride_bytes);
+            }
+        }
+    }
+
+    fn matches(&self, framebuffer: &Framebuffer) -> bool {
+        self.ready
+            && self.width == framebuffer.width
+            && self.height == framebuffer.height
+            && self.stride_bytes == framebuffer.stride_bytes
+            && self.bpp == framebuffer.bpp
+            && self.pixels.len() == framebuffer.stride_bytes * framebuffer.height
+    }
+
+    fn clear(&mut self) {
+        self.width = 0;
+        self.height = 0;
+        self.stride_bytes = 0;
+        self.bpp = 0;
+        self.ready = false;
+        self.pixels.clear();
+    }
+}
 
 impl Framebuffer {
     fn color_bytes(&self, color: Rgb888) -> (u8, u8, u8) {
@@ -278,7 +472,7 @@ pub fn init_console() {
     interrupts::without_interrupts(|| {
         let mut framebuffer = GOP_SCREEN.lock();
         let mut console = GUI_CONSOLE.lock();
-        console.reset(&mut framebuffer);
+        console.ensure_layout(&mut framebuffer);
         framebuffer.refresh();
     });
 }
@@ -296,6 +490,26 @@ pub fn write_console(bytes: &[u8]) {
         console.write_bytes(&mut framebuffer, bytes);
         framebuffer.refresh();
     });
+}
+
+pub fn try_write_console(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return true;
+    }
+
+    reset_cursor_blink();
+    interrupts::without_interrupts(|| {
+        let Some(mut framebuffer) = GOP_SCREEN.try_lock() else {
+            return false;
+        };
+        let Some(mut console) = GUI_CONSOLE.try_lock() else {
+            return false;
+        };
+        console.ensure_layout(&mut framebuffer);
+        console.write_bytes(&mut framebuffer, bytes);
+        framebuffer.refresh();
+        true
+    })
 }
 
 pub fn tick_console_cursor() {
@@ -462,6 +676,7 @@ impl TextConsole {
         self.cursor_visible = true;
         self.initialized = true;
         self.clear_cells();
+        GUI_BACKGROUND.lock().ensure_loaded(framebuffer);
         self.redraw_full(framebuffer);
     }
 
@@ -555,7 +770,7 @@ impl TextConsole {
     }
 
     fn redraw_full(&self, framebuffer: &mut Framebuffer) {
-        framebuffer.fill(console_background());
+        GUI_BACKGROUND.lock().draw_fullscreen(framebuffer);
         for row in 0..self.rows {
             for col in 0..self.cols {
                 self.draw_cell(framebuffer, row, col);
@@ -568,13 +783,12 @@ impl TextConsole {
 
     fn draw_cell(&self, framebuffer: &mut Framebuffer, row: usize, col: usize) {
         let (x, y) = cell_origin(row, col);
-        framebuffer.fill_rect(
+        GUI_BACKGROUND.lock().draw_rect(
+            framebuffer,
             x as i64,
             y as i64,
             FONT_9X18_BOLD.character_size.width,
             FONT_9X18_BOLD.character_size.height,
-            console_background(),
-            255,
         );
 
         let byte = self.cell(row, col);
@@ -585,13 +799,8 @@ impl TextConsole {
         let glyph = [byte];
         let style = MonoTextStyle::new(&FONT_9X18_BOLD, console_foreground());
         let text = unsafe { str::from_utf8_unchecked(&glyph) };
-        let _ = Text::with_baseline(
-            text,
-            Point::new(x as i32, y as i32),
-            style,
-            Baseline::Top,
-        )
-        .draw(framebuffer);
+        let _ = Text::with_baseline(text, Point::new(x as i32, y as i32), style, Baseline::Top)
+            .draw(framebuffer);
     }
 
     fn toggle_cursor(&mut self, framebuffer: &mut Framebuffer) -> bool {
@@ -673,6 +882,45 @@ fn cell_origin(row: usize, col: usize) -> (usize, usize) {
 
 fn reset_cursor_blink() {
     CURSOR_BLINK_TICKS.store(0, Ordering::Relaxed);
+}
+
+fn sample_bilinear_rgb(
+    image: &jpeg::JpegImageView<'_>,
+    x0: usize,
+    x1: usize,
+    y0: usize,
+    y1: usize,
+    wx: u32,
+    wy: u32,
+) -> Rgb888 {
+    let c00 = rgb_at(image, x0, y0);
+    let c10 = rgb_at(image, x1, y0);
+    let c01 = rgb_at(image, x0, y1);
+    let c11 = rgb_at(image, x1, y1);
+
+    Rgb888::new(
+        bilinear_channel(c00.r(), c10.r(), c01.r(), c11.r(), wx, wy),
+        bilinear_channel(c00.g(), c10.g(), c01.g(), c11.g(), wx, wy),
+        bilinear_channel(c00.b(), c10.b(), c01.b(), c11.b(), wx, wy),
+    )
+}
+
+fn rgb_at(image: &jpeg::JpegImageView<'_>, x: usize, y: usize) -> Rgb888 {
+    let offset = (y * image.width + x) * 3;
+    Rgb888::new(
+        image.pixels[offset],
+        image.pixels[offset + 1],
+        image.pixels[offset + 2],
+    )
+}
+
+fn bilinear_channel(c00: u8, c10: u8, c01: u8, c11: u8, wx: u32, wy: u32) -> u8 {
+    let inv_x = 0x1_0000_u64 - wx as u64;
+    let inv_y = 0x1_0000_u64 - wy as u64;
+    let top = c00 as u64 * inv_x + c10 as u64 * wx as u64;
+    let bottom = c01 as u64 * inv_x + c11 as u64 * wx as u64;
+    let blended = top * inv_y + bottom * wy as u64;
+    ((blended + (1_u64 << 31)) >> 32) as u8
 }
 
 fn console_background() -> Rgb888 {

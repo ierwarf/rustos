@@ -4,6 +4,7 @@ use uefi::prelude::*;
 pub enum BootError {
     OpenFileSystem(Status),
     ReadStage(Status),
+    CacheBootVolume(Status),
     InvalidElf(&'static str),
     SegmentAlloc(Status),
     Graphics(Status),
@@ -16,6 +17,7 @@ impl BootError {
         match self {
             Self::OpenFileSystem(status)
             | Self::ReadStage(status)
+            | Self::CacheBootVolume(status)
             | Self::SegmentAlloc(status)
             | Self::Graphics(status)
             | Self::BootInfoAlloc(status) => status,
@@ -27,6 +29,7 @@ impl BootError {
         match self {
             Self::OpenFileSystem(_) => "failed to open the boot filesystem",
             Self::ReadStage(_) => "failed to read prekernel.elf",
+            Self::CacheBootVolume(_) => "failed to cache the boot volume",
             Self::InvalidElf(_) => "invalid ELF image",
             Self::SegmentAlloc(_) => "failed to reserve the requested load range",
             Self::Graphics(_) => "graphics initialization failed",

@@ -22,12 +22,16 @@ const KERNEL_PML4_SIZE_GB: usize = 512;
 const ADDRESS_SPACE_LIMIT: u64 = 512 * 1024 * 1024 * 1024;
 const MAX_PAGE_BLOCK: u64 = ADDRESS_SPACE_LIMIT / HUGE_2MIB;
 const KERNEL_HIGHER_HALF_PML4_INDEX: usize = 256;
+const MMIO_WINDOW_PML4_INDEX: usize = KERNEL_HIGHER_HALF_PML4_INDEX + 1;
+const MMIO_WINDOW_SLOTS: usize = 16;
 const USER_PML4_INDEX: usize = 1;
 pub const KERNEL_VIRT_OFFSET: u64 = 0xffff_8000_0000_0000;
+const MMIO_WINDOW_BASE: u64 = KERNEL_VIRT_OFFSET + (1_u64 << 39);
 pub const USER_SPACE_BASE: u64 = (USER_PML4_INDEX as u64) << 39;
 pub const USER_SPACE_END_EXCLUSIVE: u64 = ((USER_PML4_INDEX + 1) as u64) << 39;
 const PROCESS_FRAME_POOL_PAGES: usize = 512;
 const PROCESS_FRAME_BITMAP_WORDS: usize = (PROCESS_FRAME_POOL_PAGES + 63) / 64;
+const MMIO_UNMAPPED_BLOCK: u64 = u64::MAX;
 
 // 2 MiB huge-page PDE uses bit 12 as the PAT selector bit.
 pub const WRITE_COMBINE_BIT: PageTableFlags = PageTableFlags::from_bits_retain(1 << 12);
@@ -36,6 +40,9 @@ pub static KERNEL_PML4: Mutex<PML4<KERNEL_PML4_SIZE_GB>> = Mutex::new(PML4 {
     pml4: PageTable::new(),
     pdp: PageTable::new(),
     pd: [const { PageTable::new() }; KERNEL_PML4_SIZE_GB],
+    mmio_pdp: PageTable::new(),
+    mmio_pd: PageTable::new(),
+    mmio_blocks: [MMIO_UNMAPPED_BLOCK; MMIO_WINDOW_SLOTS],
 });
 
 #[repr(align(4096))]
@@ -160,6 +167,9 @@ pub struct PML4<const SIZE_GB: usize> {
     pml4: PageTable,
     pdp: PageTable,
     pd: [PageTable; SIZE_GB],
+    mmio_pdp: PageTable,
+    mmio_pd: PageTable,
+    mmio_blocks: [u64; MMIO_WINDOW_SLOTS],
 }
 
 impl<const SIZE_GB: usize> PML4<SIZE_GB> {
@@ -167,9 +177,14 @@ impl<const SIZE_GB: usize> PML4<SIZE_GB> {
         self.pml4 = PageTable::new();
         self.pdp = PageTable::new();
         self.pd = [const { PageTable::new() }; SIZE_GB];
+        self.mmio_pdp = PageTable::new();
+        self.mmio_pd = PageTable::new();
+        self.mmio_blocks = [MMIO_UNMAPPED_BLOCK; MMIO_WINDOW_SLOTS];
 
         self.pml4.zero();
         self.pdp.zero();
+        self.mmio_pdp.zero();
+        self.mmio_pd.zero();
 
         let table_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
         let huge_flags = table_flags | PageTableFlags::HUGE_PAGE;
@@ -177,6 +192,10 @@ impl<const SIZE_GB: usize> PML4<SIZE_GB> {
         let pdp_phys = PhysAddr::new(addr_of_mut!(self.pdp) as u64);
         self.pml4[0].set_addr(pdp_phys, table_flags);
         self.pml4[KERNEL_HIGHER_HALF_PML4_INDEX].set_addr(pdp_phys, table_flags);
+        let mmio_pdp_phys = PhysAddr::new(addr_of_mut!(self.mmio_pdp) as u64);
+        let mmio_pd_phys = PhysAddr::new(addr_of_mut!(self.mmio_pd) as u64);
+        self.pml4[MMIO_WINDOW_PML4_INDEX].set_addr(mmio_pdp_phys, table_flags);
+        self.mmio_pdp[0].set_addr(mmio_pd_phys, table_flags);
 
         for pdp_index in 0..SIZE_GB {
             self.pd[pdp_index].zero();
@@ -190,6 +209,26 @@ impl<const SIZE_GB: usize> PML4<SIZE_GB> {
                 self.pd[pdp_index][pd_index].set_addr(phys, huge_flags);
             }
         }
+    }
+
+    fn map_mmio_block(&mut self, phys_block: u64) -> Option<u64> {
+        let table_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        let huge_flags = table_flags | PageTableFlags::HUGE_PAGE;
+
+        for (slot, mapped_block) in self.mmio_blocks.iter().copied().enumerate() {
+            if mapped_block == phys_block {
+                return Some(mmio_slot_base(slot));
+            }
+        }
+
+        let slot = self
+            .mmio_blocks
+            .iter()
+            .position(|&mapped_block| mapped_block == MMIO_UNMAPPED_BLOCK)?;
+        self.mmio_blocks[slot] = phys_block;
+        self.mmio_pd[slot].set_addr(PhysAddr::new(phys_block * HUGE_2MIB), huge_flags);
+        tlb::flush(VirtAddr::new(mmio_slot_base(slot)));
+        Some(mmio_slot_base(slot))
     }
 
     fn block_check(&self, page_block: u64) {
@@ -474,11 +513,7 @@ impl ProcessAddressSpace {
         self.read_user_bytes(start, dest)
     }
 
-    fn read_user_bytes(
-        &self,
-        start: VirtAddr,
-        dest: &mut [u8],
-    ) -> Result<(), AddressSpaceError> {
+    fn read_user_bytes(&self, start: VirtAddr, dest: &mut [u8]) -> Result<(), AddressSpaceError> {
         if dest.is_empty() {
             return Ok(());
         }
@@ -917,6 +952,10 @@ fn kernel_virtual_to_physical(addr: u64) -> u64 {
     }
 }
 
+fn mmio_slot_base(slot: usize) -> u64 {
+    MMIO_WINDOW_BASE + slot as u64 * HUGE_2MIB
+}
+
 pub fn init() {
     unsafe {
         set_pat_wc_slot4();
@@ -953,6 +992,20 @@ pub fn higher_half_addr(addr: u64) -> u64 {
     } else {
         addr + KERNEL_VIRT_OFFSET
     }
+}
+
+pub fn mmio_addr(phys_addr: u64) -> Option<u64> {
+    if phys_addr < ADDRESS_SPACE_LIMIT {
+        return Some(phys_addr);
+    }
+
+    let phys_block = phys_addr / HUGE_2MIB;
+    let offset = phys_addr % HUGE_2MIB;
+    interrupts::without_interrupts(|| {
+        let mut pml4 = KERNEL_PML4.lock();
+        pml4.map_mmio_block(phys_block)
+            .map(|virt_base| virt_base + offset)
+    })
 }
 
 pub fn smoke_test() {

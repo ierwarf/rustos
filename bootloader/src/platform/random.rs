@@ -7,12 +7,7 @@ use uefi::proto::rng::Rng;
 
 use crate::debug;
 
-pub fn generate_seed(
-    front_addr: u64,
-    front_size: u64,
-    back_addr: u64,
-    back_size: u64,
-) -> [u8; 32] {
+pub fn generate_seed(front_addr: u64, front_size: u64, back_addr: u64, back_size: u64) -> [u8; 32] {
     debug::println!("bootloader: random: trying UEFI RNG");
     if let Some(seed) = try_seed_from_uefi_rng() {
         debug::println!("bootloader: random: using UEFI RNG");

@@ -196,13 +196,7 @@ fn get_std_handle(std_handle: u64) -> u64 {
     }
 }
 
-fn write_file(
-    handle: u64,
-    buffer: u64,
-    len: u64,
-    bytes_written_ptr: u64,
-    overlapped: u64,
-) -> u64 {
+fn write_file(handle: u64, buffer: u64, len: u64, bytes_written_ptr: u64, overlapped: u64) -> u64 {
     if overlapped != 0 {
         set_last_error(ERROR_INVALID_PARAMETER);
         return BOOL_FALSE;
@@ -250,13 +244,7 @@ fn write_file(
     }
 }
 
-fn read_file(
-    handle: u64,
-    buffer: u64,
-    len: u64,
-    bytes_read_ptr: u64,
-    overlapped: u64,
-) -> u64 {
+fn read_file(handle: u64, buffer: u64, len: u64, bytes_read_ptr: u64, overlapped: u64) -> u64 {
     if overlapped != 0 {
         set_last_error(ERROR_INVALID_PARAMETER);
         return BOOL_FALSE;

@@ -137,6 +137,9 @@ pub fn load_elf(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadError> {
         if ph_type != ProgramType::Load {
             continue;
         }
+        if ph.mem_size() == 0 && ph.file_size() == 0 {
+            continue;
+        }
 
         if loaded_segments >= MAX_LOAD_SEGMENTS {
             return Err(ProcessLoadError::InvalidElf("too many PT_LOAD segments"));

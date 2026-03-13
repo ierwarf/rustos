@@ -14,6 +14,24 @@ mod gui {
     pub fn init_console() {}
 
     pub fn write_console(_bytes: &[u8]) {}
+
+    pub fn try_write_console(_bytes: &[u8]) -> bool {
+        true
+    }
+
+    pub fn tick_console_cursor() {}
+}
+
+mod multitask {
+    pub struct Thread;
+
+    impl Thread {
+        pub fn new(_entry: fn(u64), _weight_micros: u64) -> Self {
+            Self
+        }
+
+        pub fn start(&self) {}
+    }
 }
 
 #[path = "../../kernel/src/util/ring.rs"]

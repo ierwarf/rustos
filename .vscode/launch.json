@@ -36,6 +36,40 @@
             ]
         },
         {
+            "name": "QEMU (G14 Debug)",
+            "type": "cppdbg",
+            "request": "launch",
+            "preLaunchTask": "Build OS (Debug Symbols)",
+            "program": "${workspaceFolder}/build/kernel.elf",
+            "cwd": "${workspaceFolder}",
+            "MIMode": "gdb",
+            "miDebuggerPath": "/usr/bin/gdb",
+            "miDebuggerServerAddress": "localhost:1234",
+            "debugServerPath": "${workspaceFolder}/run.sh",
+            "debugServerArgs": "-profile g14 -s -S -action reboot=shutdown -action shutdown=pause",
+            "stopAtEntry": false,
+            "externalConsole": false,
+            "internalConsoleOptions": "openOnSessionStart",
+            "launchCompleteCommand": "None",
+            "setupCommands": [
+                {
+                    "description": "Keep breakpoints inserted while running",
+                    "text": "set breakpoint always-inserted on",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Allow pending breakpoints",
+                    "text": "set breakpoint pending on",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
             "name": "QEMU (Release)",
             "type": "node-terminal",
             "request": "launch",
@@ -49,6 +83,22 @@
             "request": "launch",
             "preLaunchTask": "Build OS",
             "command": "exec ./run.sh -machine accel=kvm -cpu host",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "QEMU (G14 Release)",
+            "type": "node-terminal",
+            "request": "launch",
+            "preLaunchTask": "Build OS",
+            "command": "exec ./run.sh -profile g14",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "KVM (G14 Release)",
+            "type": "node-terminal",
+            "request": "launch",
+            "preLaunchTask": "Build OS",
+            "command": "exec ./run.sh -profile g14 -accel-profile kvm",
             "cwd": "${workspaceFolder}"
         }
     ]
