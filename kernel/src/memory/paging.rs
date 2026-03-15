@@ -29,7 +29,11 @@ pub const KERNEL_VIRT_OFFSET: u64 = 0xffff_8000_0000_0000;
 const MMIO_WINDOW_BASE: u64 = KERNEL_VIRT_OFFSET + (1_u64 << 39);
 pub const USER_SPACE_BASE: u64 = (USER_PML4_INDEX as u64) << 39;
 pub const USER_SPACE_END_EXCLUSIVE: u64 = ((USER_PML4_INDEX + 1) as u64) << 39;
-const PROCESS_FRAME_POOL_PAGES: usize = 512;
+// User-space graphics surfaces now live in normal process address spaces, so
+// the fixed process frame pool must comfortably hold at least one laptop-class
+// full-screen compositor buffer plus task images, stacks, and page tables.
+// 16_384 pages = 64 MiB, which is enough for a 4K BGRA surface with headroom.
+const PROCESS_FRAME_POOL_PAGES: usize = 16_384;
 const PROCESS_FRAME_BITMAP_WORDS: usize = (PROCESS_FRAME_POOL_PAGES + 63) / 64;
 const MMIO_UNMAPPED_BLOCK: u64 = u64::MAX;
 
@@ -396,6 +400,50 @@ impl ProcessAddressSpace {
         Ok(region)
     }
 
+    pub fn unmap_user_bytes(
+        &mut self,
+        start: VirtAddr,
+        byte_len: usize,
+    ) -> Result<usize, AddressSpaceError> {
+        let page_count = byte_len_to_page_count(byte_len)?;
+        self.unmap_user_pages_at(start, page_count)
+    }
+
+    pub fn unmap_user_pages_at(
+        &mut self,
+        start: VirtAddr,
+        page_count: usize,
+    ) -> Result<usize, AddressSpaceError> {
+        validate_user_page_range(start, page_count)?;
+
+        let mut frames = Vec::with_capacity(page_count);
+        for page_index in 0..page_count {
+            let virt = page_addr(start, page_index)?;
+            let phys = self
+                .translate_user(virt)
+                .ok_or(AddressSpaceError::NotMapped)?;
+            let frame_index =
+                process_frame_index_from_phys(phys).ok_or(AddressSpaceError::NotMapped)?;
+            frames.push(frame_index);
+        }
+
+        for page_index in 0..page_count {
+            let virt = page_addr(start, page_index)?;
+            let unmapped = self
+                .unmap_user_page(virt)
+                .ok_or(AddressSpaceError::NotMapped)?;
+            debug_assert_eq!(Some(unmapped), frames.get(page_index).copied());
+        }
+
+        for frame_index in frames {
+            remove_owned_frame(&mut self.owned_frames, frame_index)?;
+            free_process_frame(frame_index);
+        }
+
+        self.subtract_region_range(start, page_count)?;
+        Ok(page_count)
+    }
+
     pub fn translate_user(&self, virt: VirtAddr) -> Option<PhysAddr> {
         if !is_user_addr(virt.as_u64()) {
             return None;
@@ -709,6 +757,56 @@ impl ProcessAddressSpace {
         self.flush_if_active(virt);
         frame_index
     }
+
+    fn subtract_region_range(
+        &mut self,
+        start: VirtAddr,
+        page_count: usize,
+    ) -> Result<(), AddressSpaceError> {
+        let end = page_addr(start, page_count)?;
+        let start_u64 = start.as_u64();
+        let end_u64 = end.as_u64();
+        let mut updated = Vec::with_capacity(self.regions.len() + 1);
+        let mut touched = false;
+
+        for region in self.regions.iter().copied() {
+            let region_start = region.start.as_u64();
+            let region_end = region.end().as_u64();
+            if end_u64 <= region_start || start_u64 >= region_end {
+                updated.push(region);
+                continue;
+            }
+
+            touched = true;
+
+            if start_u64 > region_start {
+                let left_pages = ((start_u64 - region_start) / PAGE_4KIB_U64) as usize;
+                if left_pages != 0 {
+                    updated.push(UserRegion {
+                        start: region.start,
+                        page_count: left_pages,
+                    });
+                }
+            }
+
+            if end_u64 < region_end {
+                let right_pages = ((region_end - end_u64) / PAGE_4KIB_U64) as usize;
+                if right_pages != 0 {
+                    updated.push(UserRegion {
+                        start: VirtAddr::new(end_u64),
+                        page_count: right_pages,
+                    });
+                }
+            }
+        }
+
+        if !touched {
+            return Err(AddressSpaceError::NotMapped);
+        }
+
+        self.regions = updated;
+        Ok(())
+    }
 }
 
 impl Drop for ProcessAddressSpace {
@@ -732,6 +830,17 @@ fn rollback_user_pages(space: &mut ProcessAddressSpace, pages: &[(VirtAddr, usiz
         }
         free_process_frame(frame_index);
     }
+}
+
+fn remove_owned_frame(
+    owned_frames: &mut Vec<usize>,
+    frame_index: usize,
+) -> Result<(), AddressSpaceError> {
+    let Some(position) = owned_frames.iter().position(|owned| *owned == frame_index) else {
+        return Err(AddressSpaceError::NotMapped);
+    };
+    owned_frames.swap_remove(position);
+    Ok(())
 }
 
 fn alloc_process_frame() -> Result<usize, AddressSpaceError> {

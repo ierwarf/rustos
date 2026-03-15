@@ -198,6 +198,105 @@ global_asm!(
         RESTORE_CONTEXT_AND_IRET 0x188
 
     .size timer_interrupt_handler, . - timer_interrupt_handler
+
+    .global rtc_scheduler_interrupt_handler
+    .type rtc_scheduler_interrupt_handler, @function
+    rtc_scheduler_interrupt_handler:
+        test byte ptr [rsp + 8], 0x3
+        jnz 4f
+        push 0
+        push 1
+4:
+        SAVE_CONTEXT
+
+        mov rax, [rsp + 0x178]
+        cmp rax, 1
+        je 5f
+        mov rax, [rsp + 0x178]
+        mov rcx, [rsp + 0x180]
+        mov rdx, [rsp + 0x188]
+        mov rsi, [rsp + 0x190]
+        mov rdi, [rsp + 0x198]
+        mov [rsp + 0x178], rsi
+        mov [rsp + 0x180], rdi
+        mov [rsp + 0x188], rax
+        mov [rsp + 0x190], rcx
+        mov [rsp + 0x198], rdx
+5:
+
+        cld
+        mov rdi, rsp
+        and rsp, -16
+        // SysV x86_64 requires 16-byte alignment before `call`.
+        call rtc_interrupt_dispatch
+        mov rsp, rax
+
+        test byte ptr [rsp + 0x190], 0x3
+        jz 6f
+        mov rax, [rsp + 0x178]
+        mov rcx, [rsp + 0x180]
+        mov rdx, [rsp + 0x188]
+        mov rsi, [rsp + 0x190]
+        mov rdi, [rsp + 0x198]
+        mov [rsp + 0x178], rdx
+        mov [rsp + 0x180], rsi
+        mov [rsp + 0x188], rdi
+        mov [rsp + 0x190], rax
+        mov [rsp + 0x198], rcx
+        RESTORE_CONTEXT_AND_IRET 0x178
+6:
+        RESTORE_CONTEXT_AND_IRET 0x188
+
+    .size rtc_scheduler_interrupt_handler, . - rtc_scheduler_interrupt_handler
+
+    .global software_schedule_interrupt_handler
+    .type software_schedule_interrupt_handler, @function
+    software_schedule_interrupt_handler:
+        test byte ptr [rsp + 8], 0x3
+        jnz 7f
+        push 0
+        push 1
+7:
+        SAVE_CONTEXT
+
+        mov rax, [rsp + 0x178]
+        cmp rax, 1
+        je 8f
+        mov rax, [rsp + 0x178]
+        mov rcx, [rsp + 0x180]
+        mov rdx, [rsp + 0x188]
+        mov rsi, [rsp + 0x190]
+        mov rdi, [rsp + 0x198]
+        mov [rsp + 0x178], rsi
+        mov [rsp + 0x180], rdi
+        mov [rsp + 0x188], rax
+        mov [rsp + 0x190], rcx
+        mov [rsp + 0x198], rdx
+8:
+
+        cld
+        mov rdi, rsp
+        and rsp, -16
+        call software_schedule_interrupt_dispatch
+        mov rsp, rax
+
+        test byte ptr [rsp + 0x190], 0x3
+        jz 9f
+        mov rax, [rsp + 0x178]
+        mov rcx, [rsp + 0x180]
+        mov rdx, [rsp + 0x188]
+        mov rsi, [rsp + 0x190]
+        mov rdi, [rsp + 0x198]
+        mov [rsp + 0x178], rdx
+        mov [rsp + 0x180], rsi
+        mov [rsp + 0x188], rdi
+        mov [rsp + 0x190], rax
+        mov [rsp + 0x198], rcx
+        RESTORE_CONTEXT_AND_IRET 0x178
+9:
+        RESTORE_CONTEXT_AND_IRET 0x188
+
+    .size software_schedule_interrupt_handler, . - software_schedule_interrupt_handler
 "#
 );
 

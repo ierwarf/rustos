@@ -11,6 +11,7 @@ use crate::paging::ProcessAddressSpace;
 use crate::session::ConsoleSessionId;
 use crate::user::abi::UserAbi;
 use crate::user::linux::LinuxTaskState;
+use crate::user::process_state::UserProcessState;
 
 use super::UserTaskBootstrap;
 use super::context::{SAVED_CONTEXT_BYTES, SavedContext};
@@ -27,6 +28,9 @@ enum TaskRetireReason {
         cr2: u64,
         rip: u64,
     },
+    Terminated {
+        requested_by_pid: Option<u64>,
+    },
     CorruptedContext {
         saved_rsp: usize,
     },
@@ -42,9 +46,8 @@ struct TaskContext {
     kernel_stack_top: u64,
     user_mode: bool,
     user_abi: Option<UserAbi>,
-    linux_state: Option<LinuxTaskState>,
     console_session: ConsoleSessionId,
-    address_space_owner: *mut ProcessAddressSpace,
+    process_state_owner: *mut UserProcessState,
 }
 
 #[derive(Clone, Copy)]
@@ -99,9 +102,8 @@ impl Scheduler {
             kernel_stack_top: 0,
             user_mode: false,
             user_abi: None,
-            linux_state: None,
             console_session: ConsoleSessionId::PRIMARY,
-            address_space_owner: ptr::null_mut(),
+            process_state_owner: ptr::null_mut(),
         });
 
         unsafe {
@@ -111,9 +113,9 @@ impl Scheduler {
 
     pub(super) fn clear_slot(&mut self, slot: usize) {
         if let Some(context) = self.contexts[slot] {
-            if !context.address_space_owner.is_null() {
+            if !context.process_state_owner.is_null() {
                 unsafe {
-                    drop(Box::from_raw(context.address_space_owner));
+                    drop(Box::from_raw(context.process_state_owner));
                 }
             }
         }
@@ -222,9 +224,8 @@ impl Scheduler {
                     kernel_stack_top,
                     user_mode: false,
                     user_abi: None,
-                    linux_state: None,
                     console_session: ConsoleSessionId::PRIMARY,
-                    address_space_owner: ptr::null_mut(),
+                    process_state_owner: ptr::null_mut(),
                 });
                 self.fx_states[slot] = FxSaveArea::new();
                 self.starts[slot] = Some(TaskStart { entry, id });
@@ -248,9 +249,13 @@ impl Scheduler {
     ) -> Option<usize> {
         for slot in 1..MAX_TASK {
             if self.contexts[slot].is_none() {
-                let boxed_space = Box::new(address_space);
-                let root_phys = boxed_space.root_phys().as_u64();
-                let raw_space = Box::into_raw(boxed_space);
+                let boxed_state = Box::new(UserProcessState::new(
+                    address_space,
+                    bootstrap.linux_state,
+                    bootstrap.logical_admin,
+                ));
+                let root_phys = boxed_state.address_space().root_phys().as_u64();
+                let raw_state = Box::into_raw(boxed_state);
                 let kernel_stack_top = self.stack_top(slot) as u64;
 
                 self.contexts[slot] = Some(TaskContext {
@@ -262,9 +267,8 @@ impl Scheduler {
                     kernel_stack_top,
                     user_mode: true,
                     user_abi: Some(bootstrap.abi),
-                    linux_state: bootstrap.linux_state,
                     console_session: bootstrap.console_session,
-                    address_space_owner: raw_space,
+                    process_state_owner: raw_state,
                 });
                 self.fx_states[slot] = FxSaveArea::new();
                 self.starts[slot] = Some(TaskStart {
@@ -419,7 +423,16 @@ impl Scheduler {
             crate::syscall::set_kernel_stack_top(current.kernel_stack_top);
         }
 
-        let fs_base = current.linux_state.map(|state| state.fs_base).unwrap_or(0);
+        let fs_base = if current.process_state_owner.is_null() {
+            0
+        } else {
+            unsafe {
+                (*current.process_state_owner)
+                    .linux_state()
+                    .map(|state| state.fs_base)
+                    .unwrap_or(0)
+            }
+        };
         FsBase::write(VirtAddr::new(fs_base));
         crate::syscall::prepare_for_context_return(self.context_returns_to_user(current));
     }
@@ -471,11 +484,11 @@ impl Scheduler {
 
     pub(super) fn current_user_address_space(&self) -> Option<&ProcessAddressSpace> {
         let context = self.contexts[self.current_task]?;
-        if !context.user_mode || context.address_space_owner.is_null() {
+        if !context.user_mode || context.process_state_owner.is_null() {
             return None;
         }
 
-        Some(unsafe { &*context.address_space_owner })
+        Some(unsafe { (*context.process_state_owner).address_space() })
     }
 
     pub(super) fn current_user_abi(&self) -> Option<UserAbi> {
@@ -506,16 +519,26 @@ impl Scheduler {
         &mut self,
         f: impl FnOnce(u64, UserAbi, &mut ProcessAddressSpace, &mut Option<LinuxTaskState>) -> R,
     ) -> Option<R> {
+        self.with_current_user_process_state_mut(|id, abi, process_state| {
+            let (address_space, linux_state) = process_state.address_space_and_linux_state_mut();
+            f(id, abi, address_space, linux_state)
+        })
+    }
+
+    pub(super) fn with_current_user_process_state_mut<R>(
+        &mut self,
+        f: impl FnOnce(u64, UserAbi, &mut UserProcessState) -> R,
+    ) -> Option<R> {
         let slot = self.current_task;
         let context = self.contexts[slot].as_mut()?;
-        if !context.user_mode || context.address_space_owner.is_null() {
+        if !context.user_mode || context.process_state_owner.is_null() {
             return None;
         }
 
         let abi = context.user_abi?;
         let id = self.starts[slot].map(|start| start.id)?;
-        let address_space = unsafe { &mut *context.address_space_owner };
-        Some(f(id, abi, address_space, &mut context.linux_state))
+        let process_state = unsafe { &mut *context.process_state_owner };
+        Some(f(id, abi, process_state))
     }
 
     pub(super) fn retire_current_user_task_due_to_fault(
@@ -547,6 +570,30 @@ impl Scheduler {
 
     pub(super) fn current_last_error(&self) -> u32 {
         self.last_errors[self.current_task]
+    }
+
+    pub(super) fn is_user_task_alive(&self, task_id: u64) -> bool {
+        let Some(slot) = self.find_user_task_slot(task_id) else {
+            return false;
+        };
+
+        self.contexts[slot].is_some() && !self.retired[slot]
+    }
+
+    pub(super) fn terminate_user_task(
+        &mut self,
+        task_id: u64,
+        requested_by_pid: Option<u64>,
+    ) -> bool {
+        let Some(slot) = self.find_user_task_slot(task_id) else {
+            return false;
+        };
+        if self.retired[slot] {
+            return false;
+        }
+
+        self.retire_slot(slot, TaskRetireReason::Terminated { requested_by_pid });
+        true
     }
 
     pub(super) fn set_current_last_error(&mut self, value: u32) {
@@ -605,6 +652,15 @@ impl Scheduler {
                     stack_top,
                 );
             }
+            Some(TaskRetireReason::Terminated { requested_by_pid }) => {
+                debug::println!(
+                    "scheduler: reaped terminated task pid={} slot={} user_mode={} requested_by={:?}",
+                    id,
+                    slot,
+                    context.user_mode,
+                    requested_by_pid,
+                );
+            }
             Some(TaskRetireReason::Exited) => {
                 debug::println!(
                     "scheduler: reaped exited task pid={} slot={} user_mode={}",
@@ -635,5 +691,21 @@ impl Scheduler {
 
         let saved = unsafe { &*(saved_rsp as *const SavedContext) };
         (saved.cs & 0x3) == 0x3
+    }
+
+    fn find_user_task_slot(&self, task_id: u64) -> Option<usize> {
+        for slot in 1..MAX_TASK {
+            let Some(context) = self.contexts[slot] else {
+                continue;
+            };
+            if !context.user_mode {
+                continue;
+            }
+            if self.starts[slot].map(|start| start.id) == Some(task_id) {
+                return Some(slot);
+            }
+        }
+
+        None
     }
 }

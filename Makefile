@@ -21,16 +21,24 @@ SOURCE_EFI ?= target/$(TARGET)/release/$(BOOTLOADER_PACKAGE).efi
 KERNEL_SOURCE ?= target/$(KERNEL_TARGET)/release/$(KERNEL_PACKAGE)
 PREKERNEL_ELF ?= $(BUILD_DIR)/prekernel.elf
 KERNEL_ELF ?= $(BUILD_DIR)/kernel.elf
-USER_BUILD_DIR ?= target/userdemo
-USER_SOURCE ?= $(USER_BUILD_DIR)/USERDEMO.ELF
-USER_ELF_SOURCE ?= userdemo/main.c
-USER_ELF_BUILD_SCRIPT ?= tools/build-userdemo-elf.sh
-USER_ELF ?= $(BUILD_DIR)/USERDEMO.ELF
-WIN_USER_OBJECT ?= $(USER_BUILD_DIR)/userdemo-win.obj
-WIN_USER_SOURCE ?= $(USER_BUILD_DIR)/USERDEMO.EXE
-WIN_USER_ASM_SOURCE ?= userdemo/winmain.asm
-WIN_USER_EXE ?= $(BUILD_DIR)/USERDEMO.EXE
+USER_BUILD_DIR ?= target/uiserver
+USER_SOURCE ?= $(USER_BUILD_DIR)/UISERVER.ELF
+USER_ELF_SOURCES ?= uiserver/main.c uiserver/app.c uiserver/render.c
+USER_ELF_BUILD_SCRIPT ?= tools/build-uiserver-elf.sh
+USER_ELF_LINKAGE ?= static
+USER_ELF ?= $(BUILD_DIR)/UISERVER.ELF
+WIN_USER_OBJECT ?= $(USER_BUILD_DIR)/uiserver-win.obj
+WIN_USER_SOURCE ?= $(USER_BUILD_DIR)/UISERVER.EXE
+WIN_USER_ASM_SOURCE ?= uiserver/winmain.asm
+WIN_USER_EXE ?= $(BUILD_DIR)/UISERVER.EXE
 STARTUP_NSH ?= $(BUILD_DIR)/startup.nsh
+BOOT_FILE_LIST ?= $(BUILD_DIR)/BOOTFILES.TXT
+GLIBC_RUNTIME_DIR ?= $(BUILD_DIR)/linux
+GLIBC_INTERPRETER_SOURCE ?= $(GLIBC_RUNTIME_DIR)/ld-linux-x86-64.so.2
+GLIBC_LIBC_SOURCE ?= $(GLIBC_RUNTIME_DIR)/libc.so.6
+GLIBC_INTERPRETER_DEST ?= $(BUILD_DIR)/lib64/ld-linux-x86-64.so.2
+GLIBC_LIBC_PRIMARY_DEST ?= $(BUILD_DIR)/lib/x86_64-linux-gnu/libc.so.6
+GLIBC_LIBC_FALLBACK_DEST ?= $(BUILD_DIR)/lib64/libc.so.6
 
 .PHONY: all target build build-efi build-kernel stage check clean
 
@@ -47,6 +55,7 @@ build: target build-efi build-prekernel build-kernel build-user stage
 	@echo "User ELF ready: $(USER_ELF)"
 	@echo "User EXE ready: $(WIN_USER_EXE)"
 	@echo "UEFI startup script ready: $(STARTUP_NSH)"
+	@if [ -f "$(BOOT_FILE_LIST)" ]; then echo "Boot file manifest ready: $(BOOT_FILE_LIST)"; fi
 
 build-efi:
 	$(CARGO) build -p $(BOOTLOADER_PACKAGE) --target $(TARGET) --release
@@ -59,7 +68,7 @@ build-prekernel:
 
 build-user:
 	mkdir -p $(USER_BUILD_DIR)
-	bash $(USER_ELF_BUILD_SCRIPT) $(USER_SOURCE) $(USER_ELF_SOURCE)
+	USER_ELF_LINKAGE=$(USER_ELF_LINKAGE) bash $(USER_ELF_BUILD_SCRIPT) $(USER_SOURCE) $(USER_ELF_SOURCES)
 	nasm -f win64 -o $(WIN_USER_OBJECT) $(WIN_USER_ASM_SOURCE)
 	$(LD) -mi386pep --subsystem console --image-base 0x8000400000 -e start -o $(WIN_USER_SOURCE) $(WIN_USER_OBJECT)
 
@@ -70,6 +79,21 @@ stage:
 	cp $(KERNEL_SOURCE) $(KERNEL_ELF)
 	cp $(USER_SOURCE) $(USER_ELF)
 	cp $(WIN_USER_SOURCE) $(WIN_USER_EXE)
+	rm -f $(BOOT_FILE_LIST)
+	@if [ -f "$(GLIBC_INTERPRETER_SOURCE)" ]; then \
+		mkdir -p "$$(dirname "$(GLIBC_INTERPRETER_DEST)")"; \
+		cp "$(GLIBC_INTERPRETER_SOURCE)" "$(GLIBC_INTERPRETER_DEST)"; \
+		printf 'lib64/ld-linux-x86-64.so.2\r\n' >> "$(BOOT_FILE_LIST)"; \
+	fi
+	@if [ -f "$(GLIBC_LIBC_SOURCE)" ]; then \
+		mkdir -p "$$(dirname "$(GLIBC_LIBC_PRIMARY_DEST)")"; \
+		mkdir -p "$$(dirname "$(GLIBC_LIBC_FALLBACK_DEST)")"; \
+		cp "$(GLIBC_LIBC_SOURCE)" "$(GLIBC_LIBC_PRIMARY_DEST)"; \
+		cp "$(GLIBC_LIBC_SOURCE)" "$(GLIBC_LIBC_FALLBACK_DEST)"; \
+		printf 'lib/x86_64-linux-gnu/libc.so.6\r\n' >> "$(BOOT_FILE_LIST)"; \
+		printf 'lib64/libc.so.6\r\n' >> "$(BOOT_FILE_LIST)"; \
+	fi
+	@if [ ! -s "$(BOOT_FILE_LIST)" ]; then rm -f "$(BOOT_FILE_LIST)"; fi
 	printf '\\EFI\\BOOT\\BOOTX64.EFI\r\n' > $(STARTUP_NSH)
 
 check: target

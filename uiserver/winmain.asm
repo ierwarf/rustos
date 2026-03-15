@@ -63,7 +63,7 @@ exit_process:
 
 section .rdata
 banner:
-    db "win32 echo ready", 13, 10
+    db "win32 uiserver stub ready", 13, 10
 banner_len equ $ - banner
 
 section .data

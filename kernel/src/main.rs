@@ -10,15 +10,17 @@ mod io;
 mod memory;
 mod multitask;
 mod storage;
+mod system;
 mod user;
 mod util;
 
 pub(crate) use arch::{acpi, asmtools, gdt, idt, pic, pit, rtc};
 pub(crate) use input::keyboard;
-pub(crate) use io::{console, gui, jpeg, session, tty};
+pub(crate) use io::{console, gui, session, tty, ui_service};
 pub(crate) use memory::{heap, paging};
 pub(crate) use storage::fat;
-pub(crate) use user::{demo, process, syscall, win32};
+pub(crate) use user::syscall::windows as win32;
+pub(crate) use user::{demo, process, syscall};
 pub(crate) use util::{random, ring};
 
 extern crate alloc;
@@ -67,9 +69,8 @@ fn init(boot_info_ptr: *const BootInfo) {
     announce_ready("Random", b"Random initialized.\r\n");
 
     multitask::init();
-    input::start_worker();
-    console::start_worker();
     announce_ready("Multitask", b"Multitask initialized.\r\n");
+    input::start_worker();
 
     syscall::init();
     announce_ready("Syscall", b"Syscall initialized.\r\n");
@@ -77,6 +78,10 @@ fn init(boot_info_ptr: *const BootInfo) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(boot_info_ptr: *const BootInfo) -> ! {
+    // Do not inherit interrupt state from firmware/bootloader.
+    // The kernel enables interrupts only after the scheduler and handlers are ready.
+    x86_64::instructions::interrupts::disable();
+
     debug::boot_trace::init(boot_info_ptr);
     debug::boot_trace::println_fmt(format_args!("kernel: _start"));
     gdt::init();
@@ -95,7 +100,9 @@ pub extern "C" fn _start(boot_info_ptr: *const BootInfo) -> ! {
 }
 
 extern "C" fn kernel_main_high(boot_info_ptr: *const BootInfo) -> ! {
+    x86_64::instructions::interrupts::disable();
     debug::boot_trace::println_fmt(format_args!("kernel: higher half entry"));
     init(boot_info_ptr);
-    demo::run()
+    system::bootstrap_desktop_runtime(demo::bootstrap);
+    system::run_service_loop()
 }

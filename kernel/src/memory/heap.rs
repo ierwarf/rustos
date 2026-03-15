@@ -4,10 +4,9 @@ use core::cell::UnsafeCell;
 use spin::Once;
 
 const HEAP_ORDER: usize = 32;
-// Runtime assets like the decoded console backdrop need more headroom than the
-// early text-only kernel did, but the largest JPEG scratch buffer is kept out
-// of the heap.
-const HEAP_SIZE: usize = 32 * 1024 * 1024; // 32 MiB
+// Runtime assets like the decoded console backdrop and full-screen user-space
+// frame presents need substantially more headroom on high-resolution panels.
+const HEAP_SIZE: usize = 96 * 1024 * 1024; // 96 MiB
 
 #[repr(align(4096))]
 struct HeapBytes([u8; HEAP_SIZE]);

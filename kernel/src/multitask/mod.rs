@@ -2,6 +2,7 @@ mod context;
 mod scheduler;
 
 use core::{
+    arch::asm,
     cell::Cell,
     mem, ptr,
     sync::atomic::{AtomicU64, Ordering},
@@ -18,10 +19,12 @@ use crate::paging::ProcessAddressSpace;
 use crate::session::ConsoleSessionId;
 use crate::user::abi::UserAbi;
 use crate::user::linux::LinuxTaskState;
+use crate::user::process_state::UserProcessState;
 
 const MAIN_THREAD_SLICE_MICROS: u64 = 1_000;
 const MIN_THREAD_WEIGHT_MICROS: u64 = 1;
 const MAX_THREAD_WEIGHT_MICROS: u64 = 100;
+pub const DEFAULT_USER_TASK_WEIGHT_MICROS: u64 = 50;
 
 static mut SCHEDULER: Scheduler = Scheduler::new();
 static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(0);
@@ -78,6 +81,7 @@ pub struct UserTaskBootstrap {
     pub registers: UserTaskRegisters,
     pub linux_state: Option<LinuxTaskState>,
     pub console_session: ConsoleSessionId,
+    pub logical_admin: bool,
 }
 
 impl UserTaskBootstrap {
@@ -89,6 +93,7 @@ impl UserTaskBootstrap {
             registers: UserTaskRegisters::default(),
             linux_state: None,
             console_session: ConsoleSessionId::PRIMARY,
+            logical_admin: false,
         }
     }
 }
@@ -177,11 +182,15 @@ pub fn spawn_user_process(
 }
 
 fn checked_thread_pit_divisor(weight_micros: u64) -> Result<u16, SpawnTaskError> {
-    if !(MIN_THREAD_WEIGHT_MICROS..=MAX_THREAD_WEIGHT_MICROS).contains(&weight_micros) {
+    if !thread_weight_is_valid(weight_micros) {
         return Err(SpawnTaskError::InvalidWeightMicros);
     }
 
     Ok(crate::pit::divisor_from_micros(weight_micros))
+}
+
+pub const fn thread_weight_is_valid(weight_micros: u64) -> bool {
+    weight_micros >= MIN_THREAD_WEIGHT_MICROS && weight_micros <= MAX_THREAD_WEIGHT_MICROS
 }
 
 fn initial_task_rflags() -> RFlags {
@@ -261,6 +270,17 @@ pub fn current_user_id() -> Option<u64> {
     interrupts::without_interrupts(|| unsafe { scheduler_ref().current_user_id() })
 }
 
+pub fn is_user_task_alive(task_id: u64) -> bool {
+    interrupts::without_interrupts(|| unsafe { scheduler_ref().is_user_task_alive(task_id) })
+}
+
+pub fn terminate_user_task(task_id: u64) -> bool {
+    interrupts::without_interrupts(|| unsafe {
+        let requested_by_pid = scheduler_ref().current_user_id();
+        scheduler_mut().terminate_user_task(task_id, requested_by_pid)
+    })
+}
+
 pub fn current_console_session() -> ConsoleSessionId {
     interrupts::without_interrupts(|| unsafe { scheduler_ref().current_console_session() })
 }
@@ -269,6 +289,14 @@ pub fn with_current_user_process_mut<R>(
     f: impl FnOnce(u64, UserAbi, &mut ProcessAddressSpace, &mut Option<LinuxTaskState>) -> R,
 ) -> Option<R> {
     interrupts::without_interrupts(|| unsafe { scheduler_mut().with_current_user_process_mut(f) })
+}
+
+pub fn with_current_user_process_state_mut<R>(
+    f: impl FnOnce(u64, UserAbi, &mut UserProcessState) -> R,
+) -> Option<R> {
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().with_current_user_process_state_mut(f)
+    })
 }
 
 pub fn retire_current_user_task_due_to_fault(
@@ -311,10 +339,22 @@ pub fn service_deferred_work() -> usize {
 
 unsafe extern "C" {
     fn timer_interrupt_handler();
+    fn rtc_scheduler_interrupt_handler();
+    fn software_schedule_interrupt_handler();
 }
 
 pub fn timer_interrupt_handler_addr() -> u64 {
     crate::paging::higher_half_addr(timer_interrupt_handler as *const () as usize as u64)
+}
+
+pub fn rtc_interrupt_handler_addr() -> u64 {
+    crate::paging::higher_half_addr(rtc_scheduler_interrupt_handler as *const () as usize as u64)
+}
+
+pub fn software_schedule_interrupt_handler_addr() -> u64 {
+    crate::paging::higher_half_addr(
+        software_schedule_interrupt_handler as *const () as usize as u64,
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -332,4 +372,48 @@ extern "C" fn timer_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut S
 
     crate::pic::send_eoi(crate::pic::PIC_1_OFFSET);
     next_rsp as *mut SavedContext
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn rtc_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut SavedContext {
+    let current_rsp = context_ptr as usize;
+    let next_rsp = unsafe {
+        let scheduler = scheduler_mut();
+        scheduler.save_current_fx_state();
+        let (next_rsp, _next_pit_divisor) = scheduler.on_timer_interrupt(current_rsp);
+        scheduler.prepare_current_task_execution();
+        scheduler.restore_current_fx_state();
+        next_rsp
+    };
+
+    crate::rtc::on_interrupt();
+    crate::pic::send_eoi(crate::pic::PIC_2_OFFSET);
+    next_rsp as *mut SavedContext
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn software_schedule_interrupt_dispatch(
+    context_ptr: *mut SavedContext,
+) -> *mut SavedContext {
+    let current_rsp = context_ptr as usize;
+    let next_rsp = unsafe {
+        let scheduler = scheduler_mut();
+        scheduler.save_current_fx_state();
+        let (next_rsp, _next_pit_divisor) = scheduler.on_timer_interrupt(current_rsp);
+        scheduler.prepare_current_task_execution();
+        scheduler.restore_current_fx_state();
+        next_rsp
+    };
+
+    next_rsp as *mut SavedContext
+}
+
+pub fn yield_now() {
+    interrupts::without_interrupts(|| unsafe {
+        asm!(
+            "int {vector}",
+            vector = const crate::arch::idt::SOFTWARE_SCHEDULE_VECTOR,
+            options(nostack),
+        );
+    });
 }

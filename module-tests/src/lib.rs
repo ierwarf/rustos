@@ -36,6 +36,8 @@ mod gui {
 
     pub fn tick_console_cursor() {}
 
+    pub fn sync_desktop_windows() {}
+
     pub fn focused_console_session() -> ConsoleSessionId {
         ConsoleSessionId::PRIMARY
     }
@@ -88,6 +90,18 @@ mod gui {
     pub fn last_mouse_left_button() -> bool {
         MOUSE_LEFT_BUTTON.load(Ordering::Acquire)
     }
+}
+
+mod desktop {
+    pub fn sync_all_console_windows() {}
+}
+
+mod ui_service {
+    use crate::keyboard::KeyboardEvent;
+
+    pub fn push_keyboard_event(_event: KeyboardEvent) {}
+    pub fn push_pointer_motion(_dx: i16, _dy: i16) {}
+    pub fn push_pointer_button_left(_pressed: bool) {}
 }
 
 mod multitask {

@@ -1,57 +1,43 @@
-use core::sync::atomic::{AtomicBool, Ordering};
-
 use spin::Mutex;
 use x86_64::instructions::interrupts;
 
 use crate::ring::RingBuffer;
-use crate::session::{CONSOLE_SESSION_COUNT, ConsoleSessionId};
+use crate::session::{ConsoleSessionId, MAX_CONSOLE_SESSIONS, active_console_sessions};
 
 const OUTPUT_BUFFER_CAPACITY: usize = 4096;
 const PENDING_BUFFER_CAPACITY: usize = 4096;
 const FLUSH_CHUNK_CAPACITY: usize = 256;
-const CONSOLE_THREAD_WEIGHT_MICROS: u64 = 10;
 
 static CONSOLE: Mutex<ConsoleState> = Mutex::new(ConsoleState::new());
-static CONSOLE_THREAD: Mutex<Option<crate::multitask::Thread>> = Mutex::new(None);
-static CONSOLE_THREAD_STARTED: AtomicBool = AtomicBool::new(false);
 
 pub fn init() {
     crate::gui::init_console();
 }
 
 pub fn start_worker() {
-    interrupts::without_interrupts(|| {
-        if CONSOLE_THREAD_STARTED.load(Ordering::Acquire) {
-            return;
-        }
-
-        let thread =
-            crate::multitask::Thread::new(console_thread_main, CONSOLE_THREAD_WEIGHT_MICROS);
-        thread.start();
-        *CONSOLE_THREAD.lock() = Some(thread);
-        CONSOLE_THREAD_STARTED.store(true, Ordering::Release);
-    });
+    // Console rendering is serviced cooperatively from the kernel main loop.
+    // Spawning a dedicated console worker thread regressed stability on real hardware.
 }
 
 #[allow(dead_code)]
 pub fn write(bytes: &[u8]) -> usize {
     let written = with_console_state(|console| console.write_broadcast(bytes));
-    if !CONSOLE_THREAD_STARTED.load(Ordering::Acquire) {
-        while flush_pending_once() {}
-    }
+    while flush_pending_once() {}
     written
 }
 
 pub(crate) fn write_to_session(session: ConsoleSessionId, bytes: &[u8]) -> usize {
     let written = with_console_state(|console| console.write_to_session(session, bytes));
-    if !CONSOLE_THREAD_STARTED.load(Ordering::Acquire) {
-        while flush_pending_once() {}
-    }
+    while flush_pending_once() {}
     written
 }
 
 pub(crate) fn write_from_tty(session: ConsoleSessionId, bytes: &[u8]) -> usize {
     write_to_session(session, bytes)
+}
+
+pub(crate) fn reset_session(session: ConsoleSessionId) {
+    with_console_state(|console| console.reset_session(session));
 }
 
 #[allow(dead_code)]
@@ -67,8 +53,6 @@ pub fn copy_recent_output_for_session(session: ConsoleSessionId, dest: &mut [u8]
 #[cfg(test)]
 pub(crate) fn reset_for_tests() {
     *CONSOLE.lock() = ConsoleState::new();
-    *CONSOLE_THREAD.lock() = None;
-    CONSOLE_THREAD_STARTED.store(false, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -88,20 +72,13 @@ fn flush_pending_once() -> bool {
     true
 }
 
-fn console_thread_main(_id: u64) {
-    loop {
-        let mut drained = false;
-        while flush_pending_once() {
-            drained = true;
-        }
-
-        let housekeeping = crate::multitask::service_deferred_work();
-
-        if !drained && housekeeping == 0 {
-            crate::gui::tick_console_cursor();
-            interrupts::enable_and_hlt();
-        }
+pub fn service() -> usize {
+    let mut work = 0;
+    while flush_pending_once() {
+        work += 1;
     }
+    crate::gui::tick_console_cursor();
+    work
 }
 
 fn with_console_state<R>(f: impl FnOnce(&mut ConsoleState) -> R) -> R {
@@ -117,14 +94,14 @@ fn with_console_state<R>(f: impl FnOnce(&mut ConsoleState) -> R) -> R {
 }
 
 struct ConsoleState {
-    sessions: [ConsoleSessionState; CONSOLE_SESSION_COUNT],
+    sessions: [ConsoleSessionState; MAX_CONSOLE_SESSIONS],
     next_flush_session: usize,
 }
 
 impl ConsoleState {
     const fn new() -> Self {
         Self {
-            sessions: [ConsoleSessionState::new(), ConsoleSessionState::new()],
+            sessions: [const { ConsoleSessionState::new() }; MAX_CONSOLE_SESSIONS],
             next_flush_session: 0,
         }
     }
@@ -134,7 +111,7 @@ impl ConsoleState {
             return 0;
         }
 
-        for session in ConsoleSessionId::all() {
+        for session in active_console_sessions().iter() {
             let _ = self.sessions[session.index()].write(bytes);
         }
         bytes.len()
@@ -145,14 +122,21 @@ impl ConsoleState {
     }
 
     fn drain_pending(&mut self, dest: &mut [u8]) -> Option<(ConsoleSessionId, usize)> {
-        for offset in 0..CONSOLE_SESSION_COUNT {
-            let index = (self.next_flush_session + offset) % CONSOLE_SESSION_COUNT;
+        let active_sessions = active_console_sessions();
+        for offset in 0..MAX_CONSOLE_SESSIONS {
+            let index = (self.next_flush_session + offset) % MAX_CONSOLE_SESSIONS;
+            if !active_sessions
+                .iter()
+                .any(|session| session.index() == index)
+            {
+                continue;
+            }
             let len = self.sessions[index].drain_pending(dest);
             if len == 0 {
                 continue;
             }
 
-            self.next_flush_session = (index + 1) % CONSOLE_SESSION_COUNT;
+            self.next_flush_session = (index + 1) % MAX_CONSOLE_SESSIONS;
             return Some((
                 ConsoleSessionId::from_index(index).expect("session index"),
                 len,
@@ -164,6 +148,13 @@ impl ConsoleState {
 
     fn copy_recent_output(&self, session: ConsoleSessionId, dest: &mut [u8]) -> usize {
         self.sessions[session.index()].copy_recent_output(dest)
+    }
+
+    fn reset_session(&mut self, session: ConsoleSessionId) {
+        self.sessions[session.index()].reset();
+        if self.next_flush_session == session.index() {
+            self.next_flush_session = (self.next_flush_session + 1) % MAX_CONSOLE_SESSIONS;
+        }
     }
 }
 
@@ -196,6 +187,10 @@ impl ConsoleSessionState {
 
     fn copy_recent_output(&self, dest: &mut [u8]) -> usize {
         self.output.copy_into(dest)
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
     }
 }
 

@@ -1,6 +1,31 @@
+use alloc::vec::Vec;
+
 use crate::debug;
+use crate::fat;
 use crate::process::{self, ProcessLoadError, SpawnedProcess};
 use crate::session::ConsoleSessionId;
+
+#[derive(Clone, Copy)]
+pub struct ExecutableImage {
+    pub primary_path: &'static str,
+    pub fallback_path: Option<&'static str>,
+}
+
+impl ExecutableImage {
+    pub const fn new(primary_path: &'static str) -> Self {
+        Self {
+            primary_path,
+            fallback_path: None,
+        }
+    }
+
+    pub const fn preferred(primary_path: &'static str, fallback_path: &'static str) -> Self {
+        Self {
+            primary_path,
+            fallback_path: Some(fallback_path),
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 pub struct ConsoleProgramSpec<'a> {
@@ -22,7 +47,6 @@ impl<'a> ConsoleProgramSpec<'a> {
         }
     }
 
-    #[allow(dead_code)]
     pub const fn with_args(mut self, argv: &'a [&'a str], env: &'a [&'a str]) -> Self {
         self.argv = argv;
         self.env = env;
@@ -32,6 +56,11 @@ impl<'a> ConsoleProgramSpec<'a> {
 
 #[derive(Debug)]
 pub enum ConsoleHostError {
+    Load {
+        path: &'static str,
+        fallback_path: Option<&'static str>,
+        error: fatfs::Error<fat::DiskIoError>,
+    },
     Spawn {
         session: ConsoleSessionId,
         error: ProcessLoadError,
@@ -39,20 +68,28 @@ pub enum ConsoleHostError {
 }
 
 impl ConsoleHostError {
-    pub fn summary(&self) -> &'static str {
-        match self {
-            Self::Spawn { error, .. } => error.summary(),
-        }
-    }
-
-    pub fn session(&self) -> ConsoleSessionId {
-        match self {
-            Self::Spawn { session, .. } => *session,
-        }
-    }
-
     pub fn log_debug_details(&self) {
         match self {
+            Self::Load {
+                path,
+                fallback_path,
+                error,
+            } => {
+                if let Some(fallback_path) = fallback_path {
+                    debug::println!(
+                        "failed to load boot program image from {} or {}: {:?}",
+                        path,
+                        fallback_path,
+                        error,
+                    );
+                } else {
+                    debug::println!(
+                        "failed to load boot program image from {}: {:?}",
+                        path,
+                        error
+                    );
+                }
+            }
             Self::Spawn { error, .. } => error.log_debug_details(),
         }
     }
@@ -80,24 +117,27 @@ pub fn spawn_program_in_session(
     .map_err(|error| ConsoleHostError::Spawn { session, error })
 }
 
-pub fn spawn_program_on_all_sessions(
-    program: ConsoleProgramSpec<'_>,
-) -> Result<(), ConsoleHostError> {
-    for session in ConsoleSessionId::all() {
-        let spawned = spawn_program_in_session(session, program)?;
-        log_spawn(session, program, &spawned);
-    }
-    Ok(())
-}
+pub fn load_executable_image(
+    image: ExecutableImage,
+) -> Result<(&'static str, Vec<u8>), ConsoleHostError> {
+    match fat::read_file_to_vec(image.primary_path) {
+        Ok(bytes) => Ok((image.primary_path, bytes)),
+        Err(primary_error) => {
+            let Some(fallback_path) = image.fallback_path else {
+                return Err(ConsoleHostError::Load {
+                    path: image.primary_path,
+                    fallback_path: None,
+                    error: primary_error,
+                });
+            };
 
-fn log_spawn(session: ConsoleSessionId, program: ConsoleProgramSpec<'_>, spawned: &SpawnedProcess) {
-    debug::println!(
-        "Console session spawned: session={} pid={} entry={:#x} weight={}us path={} abi={}",
-        session.name(),
-        spawned.pid,
-        spawned.entry.as_u64(),
-        program.weight_micros,
-        program.exec_path,
-        spawned.abi.name(),
-    );
+            fat::read_file_to_vec(fallback_path)
+                .map(|bytes| (fallback_path, bytes))
+                .map_err(|fallback_error| ConsoleHostError::Load {
+                    path: image.primary_path,
+                    fallback_path: Some(fallback_path),
+                    error: fallback_error,
+                })
+        }
+    }
 }

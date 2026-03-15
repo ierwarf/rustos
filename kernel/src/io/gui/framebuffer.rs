@@ -223,6 +223,18 @@ impl Framebuffer {
         self.height
     }
 
+    pub(crate) fn stride_bytes(&self) -> usize {
+        self.stride_bytes
+    }
+
+    pub(crate) fn bytes_per_pixel(&self) -> usize {
+        self.bpp
+    }
+
+    pub(crate) fn pixel_format(&self) -> BootPixelFormat {
+        self.format
+    }
+
     pub(crate) fn clip_rect(
         &self,
         x: i64,
@@ -489,6 +501,68 @@ impl Framebuffer {
         self.write_pixel(self.active_buffer(), idx, color, alpha);
 
         self.mark_dirty_tile_for_point(x, y);
+    }
+
+    pub(crate) fn draw_bgra8888_frame(
+        &mut self,
+        width: usize,
+        height: usize,
+        stride_bytes: usize,
+        bytes: &[u8],
+    ) -> bool {
+        if width != self.width || height != self.height || self.front_base.is_null() {
+            return false;
+        }
+
+        let Some(min_stride) = width.checked_mul(4) else {
+            return false;
+        };
+        if stride_bytes < min_stride {
+            return false;
+        }
+
+        let Some(required_len) = stride_bytes.checked_mul(height) else {
+            return false;
+        };
+        if bytes.len() < required_len {
+            return false;
+        }
+
+        unsafe {
+            let mut src_row = bytes.as_ptr();
+            let mut dst_row = self.active_buffer();
+            for _ in 0..height {
+                let mut src = src_row;
+                let mut dst = dst_row;
+                for _ in 0..width {
+                    let b = ptr::read(src);
+                    let g = ptr::read(src.add(1));
+                    let r = ptr::read(src.add(2));
+                    match self.format {
+                        BootPixelFormat::Rgb => {
+                            ptr::write(dst, r);
+                            ptr::write(dst.add(1), g);
+                            ptr::write(dst.add(2), b);
+                        }
+                        _ => {
+                            ptr::write(dst, b);
+                            ptr::write(dst.add(1), g);
+                            ptr::write(dst.add(2), r);
+                        }
+                    }
+                    if self.bpp == 4 {
+                        ptr::write(dst.add(3), 0);
+                    }
+                    src = src.add(4);
+                    dst = dst.add(self.bpp);
+                }
+                src_row = src_row.add(stride_bytes);
+                dst_row = dst_row.add(self.stride_bytes);
+            }
+        }
+
+        self.mark_all_dirty();
+        true
     }
 
     pub(crate) fn draw_overlay_pixel(&mut self, x: usize, y: usize, color: Rgb888, alpha: u8) {

@@ -4,7 +4,7 @@ use x86_64::instructions::interrupts;
 use crate::console;
 use crate::keyboard::{KeyAction, KeyCode, KeyboardEvent};
 use crate::ring::RingBuffer;
-use crate::session::{CONSOLE_SESSION_COUNT, ConsoleSessionId};
+use crate::session::{ConsoleSessionId, MAX_CONSOLE_SESSIONS};
 
 const INPUT_BUFFER_CAPACITY: usize = 1024;
 const EDIT_BUFFER_CAPACITY: usize = 256;
@@ -59,14 +59,18 @@ pub fn write_to_session(session: ConsoleSessionId, bytes: &[u8]) -> usize {
     interrupts::without_interrupts(|| TTY.lock().session_mut(session).write(session, bytes))
 }
 
+pub(crate) fn reset_session(session: ConsoleSessionId) {
+    interrupts::without_interrupts(|| TTY.lock().session_mut(session).reset());
+}
+
 struct TtyCollection {
-    sessions: [TtySessionState; CONSOLE_SESSION_COUNT],
+    sessions: [TtySessionState; MAX_CONSOLE_SESSIONS],
 }
 
 impl TtyCollection {
     const fn new() -> Self {
         Self {
-            sessions: [TtySessionState::new(), TtySessionState::new()],
+            sessions: [const { TtySessionState::new() }; MAX_CONSOLE_SESSIONS],
         }
     }
 
@@ -273,6 +277,10 @@ impl TtySessionState {
 
         sequence[len] = direction;
         console::write_from_tty(session, &sequence[..=len]);
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
     }
 }
 

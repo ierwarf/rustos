@@ -185,6 +185,14 @@ pub fn seed() -> u64 {
     })
 }
 
+pub fn ticks() -> u64 {
+    RTC_TICKS.load(Ordering::Acquire)
+}
+
+pub const fn ticks_per_second() -> u64 {
+    RTC_TICKS_PER_SEC
+}
+
 pub fn init() {
     interrupts::without_interrupts(|| {
         // Program RTC periodic interrupt rate to 1024 Hz.

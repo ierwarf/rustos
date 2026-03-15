@@ -1,4 +1,4 @@
-use crate::{debug, gui};
+use crate::{console, debug, gui};
 use core::fmt::{self, Write};
 use core::panic::PanicInfo;
 
@@ -37,6 +37,8 @@ fn panic(info: &PanicInfo<'_>) -> ! {
 fn gui_panic_line(args: fmt::Arguments<'_>) {
     let mut line = PanicLine::new();
     let _ = line.write_fmt(args);
+    let _ = console::write(line.as_bytes());
+    let _ = console::write(b"\r\n");
     let _ = gui::try_write_console(line.as_bytes());
     let _ = gui::try_write_console(b"\r\n");
 }

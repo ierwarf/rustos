@@ -18,6 +18,7 @@ pub fn on_relative_motion(dx: i8, dy: i8) -> bool {
         return false;
     }
 
+    crate::ui_service::push_pointer_motion(dx as i16, dy as i16);
     crate::gui::move_mouse_cursor_relative(dx as i16, dy as i16)
 }
 
@@ -26,6 +27,7 @@ pub fn on_left_button_changed(pressed: bool) -> bool {
         return false;
     }
 
+    crate::ui_service::push_pointer_button_left(pressed);
     crate::gui::set_mouse_left_button(pressed)
 }
 

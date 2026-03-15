@@ -6,6 +6,7 @@ use x86_64::structures::idt::InterruptDescriptorTable;
 const TIMER_INTERRUPT_VECTOR: u8 = crate::pic::PIC_1_OFFSET;
 const KEYBOARD_INTERRUPT_VECTOR: u8 = crate::pic::PIC_1_OFFSET + 1;
 const RTC_INTERRUPT_VECTOR: u8 = crate::pic::PIC_2_OFFSET;
+pub(crate) const SOFTWARE_SCHEDULE_VECTOR: u8 = 0x30;
 
 lazy_static! {
     pub static ref IDT: InterruptDescriptorTable = {
@@ -17,9 +18,13 @@ lazy_static! {
             idt[TIMER_INTERRUPT_VECTOR].set_handler_addr(VirtAddr::new(
                 crate::multitask::timer_interrupt_handler_addr(),
             ));
+            idt[RTC_INTERRUPT_VECTOR]
+                .set_handler_addr(VirtAddr::new(crate::multitask::rtc_interrupt_handler_addr()));
+            idt[SOFTWARE_SCHEDULE_VECTOR].set_handler_addr(VirtAddr::new(
+                crate::multitask::software_schedule_interrupt_handler_addr(),
+            ));
         }
         idt[KEYBOARD_INTERRUPT_VECTOR].set_handler_fn(keyboard_interrupt_handler);
-        idt[RTC_INTERRUPT_VECTOR].set_handler_fn(rtc_interrupt_handler);
 
         idt
     };
