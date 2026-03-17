@@ -5,6 +5,7 @@
 
 mod arch;
 mod debug;
+mod driver;
 mod input;
 mod io;
 mod memory;
@@ -15,8 +16,9 @@ mod user;
 mod util;
 
 pub(crate) use arch::{acpi, asmtools, gdt, idt, pic, pit, rtc};
+pub(crate) use driver_abi::{DriverBus, DriverClass};
 pub(crate) use input::keyboard;
-pub(crate) use io::{console, gui, session, tty, ui_service};
+pub(crate) use io::{console, gui, session, tty};
 pub(crate) use memory::{heap, paging};
 pub(crate) use storage::fat;
 pub(crate) use user::syscall::windows as win32;
@@ -44,6 +46,7 @@ fn init(boot_info_ptr: *const BootInfo) {
     gui::init(boot_info_ptr);
     fat::init_boot_info(boot_info_ptr);
     heap::init_heap();
+    driver::register_kernel_builtin("uefi-gop", DriverClass::Display, DriverBus::Platform);
     announce_ready("GUI", b"GUI initialized.\r\n");
     announce_ready("Heap", b"Heap initialized.\r\n");
 
@@ -67,10 +70,6 @@ fn init(boot_info_ptr: *const BootInfo) {
 
     random::init(boot_info_ptr);
     announce_ready("Random", b"Random initialized.\r\n");
-
-    multitask::init();
-    announce_ready("Multitask", b"Multitask initialized.\r\n");
-    input::start_worker();
 
     syscall::init();
     announce_ready("Syscall", b"Syscall initialized.\r\n");
@@ -104,5 +103,7 @@ extern "C" fn kernel_main_high(boot_info_ptr: *const BootInfo) -> ! {
     debug::boot_trace::println_fmt(format_args!("kernel: higher half entry"));
     init(boot_info_ptr);
     system::bootstrap_desktop_runtime(demo::bootstrap);
+    multitask::init();
+    announce_ready("Multitask", b"Multitask initialized.\r\n");
     system::run_service_loop()
 }

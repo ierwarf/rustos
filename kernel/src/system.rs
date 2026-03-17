@@ -23,7 +23,12 @@ pub(crate) fn run_service_loop() -> ! {
 }
 
 pub(crate) fn service_once() -> usize {
-    runtime::service_pending_requests() + multitask::service_deferred_work() + console::service()
+    runtime::service_pending_requests()
+        + crate::input::service_pending()
+        + crate::driver::serio::service_pending()
+        + multitask::service_deferred_work()
+        + crate::driver::linux::workqueue::service_pending()
+        + console::service()
 }
 
 fn fatal_desktop_runtime_bootstrap(err: runtime::DesktopRuntimeError) -> ! {

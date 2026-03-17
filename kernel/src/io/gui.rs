@@ -1,24 +1,25 @@
+mod backend;
 mod framebuffer;
 mod terminal;
 
-use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicU8, Ordering};
 
-use boot_protocol::{BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootInfo, FramebufferInfo};
+use boot_protocol::{BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootInfo};
 use spin::Mutex;
-use x86_64::instructions::interrupts;
 
-use self::framebuffer::{Framebuffer, FramebufferRect, build_framebuffer};
+use self::framebuffer::{Framebuffer, FramebufferRect};
 use self::terminal::{TerminalRenderer, TerminalState};
-use crate::paging;
 use crate::session::ConsoleSessionId;
 
-const HUGE_2MIB: u64 = 2 * 1024 * 1024;
 const CURSOR_BLINK_TOGGLE_TICKS: u16 = 512;
 
-pub static GOP_SCREEN: Mutex<Framebuffer> = Mutex::new(Framebuffer::empty());
 static EMERGENCY_CONSOLE: Mutex<EmergencyConsoleUi> = Mutex::new(EmergencyConsoleUi::new());
 static CURSOR_BLINK_TICKS: AtomicU16 = AtomicU16::new(0);
-static USERSPACE_DISPLAY_ACTIVE: AtomicBool = AtomicBool::new(false);
+static USERSPACE_DISPLAY_MODE: AtomicU8 = AtomicU8::new(DISPLAY_MODE_BOOT_CONSOLE);
+
+const DISPLAY_MODE_BOOT_CONSOLE: u8 = 0;
+const DISPLAY_MODE_USER_TRANSITION: u8 = 1;
+const DISPLAY_MODE_USER_ACTIVE: u8 = 2;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GuiDisplayInfo {
@@ -75,10 +76,9 @@ impl EmergencyConsoleUi {
 
 pub fn init_console() {
     reset_cursor_blink();
-    interrupts::without_interrupts(|| {
-        let mut framebuffer = GOP_SCREEN.lock();
+    let _ = backend::with_framebuffer(|framebuffer| {
         let mut console = EMERGENCY_CONSOLE.lock();
-        console.init(&mut framebuffer);
+        console.init(framebuffer);
         framebuffer.present_scene();
     });
 }
@@ -90,10 +90,9 @@ pub fn write_console_session(session: ConsoleSessionId, bytes: &[u8]) {
     }
 
     reset_cursor_blink();
-    interrupts::without_interrupts(|| {
-        let mut framebuffer = GOP_SCREEN.lock();
+    let _ = backend::with_framebuffer(|framebuffer| {
         let mut console = EMERGENCY_CONSOLE.lock();
-        console.write(&mut framebuffer, bytes);
+        console.write(framebuffer, bytes);
         framebuffer.present_scene();
     });
 }
@@ -104,17 +103,15 @@ pub fn try_write_console(bytes: &[u8]) -> bool {
     }
 
     reset_cursor_blink();
-    interrupts::without_interrupts(|| {
-        let Some(mut framebuffer) = GOP_SCREEN.try_lock() else {
-            return false;
-        };
+    backend::try_with_framebuffer(|framebuffer| {
         let Some(mut console) = EMERGENCY_CONSOLE.try_lock() else {
             return false;
         };
-        console.write(&mut framebuffer, bytes);
+        console.write(framebuffer, bytes);
         framebuffer.present_scene();
         true
     })
+    .unwrap_or(false)
 }
 
 pub fn tick_console_cursor() {
@@ -128,49 +125,20 @@ pub fn tick_console_cursor() {
     }
     CURSOR_BLINK_TICKS.store(0, Ordering::Relaxed);
 
-    interrupts::without_interrupts(|| {
-        let mut framebuffer = GOP_SCREEN.lock();
+    let _ = backend::with_framebuffer(|framebuffer| {
         let mut console = EMERGENCY_CONSOLE.lock();
-        let _ = console.toggle_cursor(&mut framebuffer);
+        let _ = console.toggle_cursor(framebuffer);
         framebuffer.present_scene();
     });
 }
 
-pub fn show_mouse_cursor() -> bool {
-    false
-}
-
-pub fn move_mouse_cursor_relative(dx: i16, dy: i16) -> bool {
-    let _ = (dx, dy);
-    false
-}
-
-pub fn set_mouse_left_button(pressed: bool) -> bool {
-    let _ = pressed;
-    false
-}
-
 pub fn init(boot_info_ptr: *const BootInfo) {
     let boot_info = boot_info_from_ptr(boot_info_ptr);
-    let framebuffer = build_framebuffer(boot_info.framebuffer);
-    mark_framebuffer_write_combine(boot_info.framebuffer);
-    *GOP_SCREEN.lock() = framebuffer;
+    backend::init_gop(boot_info.framebuffer);
 }
 
 pub fn display_info() -> Option<GuiDisplayInfo> {
-    interrupts::without_interrupts(|| {
-        let framebuffer = GOP_SCREEN.lock();
-        if framebuffer.width() == 0 || framebuffer.height() == 0 {
-            return None;
-        }
-
-        Some(GuiDisplayInfo {
-            width: framebuffer.width() as u32,
-            height: framebuffer.height() as u32,
-            stride_bytes: framebuffer.stride_bytes() as u32,
-            bytes_per_pixel: framebuffer.bytes_per_pixel() as u32,
-        })
-    })
+    backend::display_info()
 }
 
 pub fn present_userspace_frame_bgra8888(
@@ -179,19 +147,40 @@ pub fn present_userspace_frame_bgra8888(
     stride_bytes: usize,
     bytes: &[u8],
 ) -> bool {
-    interrupts::without_interrupts(|| {
-        let mut framebuffer = GOP_SCREEN.lock();
-        if !framebuffer.draw_bgra8888_frame(width, height, stride_bytes, bytes) {
-            return false;
-        }
-        framebuffer.present_scene();
-        USERSPACE_DISPLAY_ACTIVE.store(true, Ordering::Release);
-        true
-    })
+    let claimed_boot_console = begin_userspace_display_transition();
+    let presented = backend::present_bgra8888(width, height, stride_bytes, bytes);
+    if presented {
+        finish_userspace_display_transition();
+    } else if claimed_boot_console {
+        USERSPACE_DISPLAY_MODE.store(DISPLAY_MODE_BOOT_CONSOLE, Ordering::Release);
+    }
+    presented
+}
+
+pub fn present_userspace_frame_from_user_bgra8888(
+    address_space: &crate::paging::ProcessAddressSpace,
+    user_ptr: u64,
+    width: usize,
+    height: usize,
+    stride_bytes: usize,
+) -> Result<bool, crate::paging::AddressSpaceError> {
+    let claimed_boot_console = begin_userspace_display_transition();
+    let presented =
+        backend::present_bgra8888_from_user(address_space, user_ptr, width, height, stride_bytes)?;
+    if presented {
+        finish_userspace_display_transition();
+    } else if claimed_boot_console {
+        USERSPACE_DISPLAY_MODE.store(DISPLAY_MODE_BOOT_CONSOLE, Ordering::Release);
+    }
+    Ok(presented)
 }
 
 fn userspace_display_active() -> bool {
-    USERSPACE_DISPLAY_ACTIVE.load(Ordering::Acquire)
+    USERSPACE_DISPLAY_MODE.load(Ordering::Acquire) != DISPLAY_MODE_BOOT_CONSOLE
+}
+
+pub fn is_userspace_display_active() -> bool {
+    userspace_display_active()
 }
 
 fn boot_info_from_ptr(boot_info_ptr: *const BootInfo) -> &'static BootInfo {
@@ -210,24 +199,25 @@ fn boot_info_from_ptr(boot_info_ptr: *const BootInfo) -> &'static BootInfo {
     boot_info
 }
 
-fn mark_framebuffer_write_combine(info: FramebufferInfo) {
-    let end_addr = info
-        .addr
-        .checked_add(info.size.saturating_sub(1))
-        .expect("framebuffer end address overflow");
-    let start_block = info.addr / HUGE_2MIB;
-    let end_block = end_addr / HUGE_2MIB;
-
-    use crate::paging::KERNEL_PML4;
-
-    interrupts::without_interrupts(|| {
-        let mut pml4 = KERNEL_PML4.lock();
-        for block_index in start_block..=end_block {
-            pml4.add_flags(block_index, paging::WRITE_COMBINE_BIT);
-        }
-    });
-}
-
 fn reset_cursor_blink() {
     CURSOR_BLINK_TICKS.store(0, Ordering::Relaxed);
+}
+
+fn begin_userspace_display_transition() -> bool {
+    USERSPACE_DISPLAY_MODE
+        .compare_exchange(
+            DISPLAY_MODE_BOOT_CONSOLE,
+            DISPLAY_MODE_USER_TRANSITION,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+fn finish_userspace_display_transition() {
+    if USERSPACE_DISPLAY_MODE.swap(DISPLAY_MODE_USER_ACTIVE, Ordering::AcqRel)
+        != DISPLAY_MODE_USER_ACTIVE
+    {
+        crate::debug::println!("userspace display active");
+    }
 }

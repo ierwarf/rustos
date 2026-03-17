@@ -53,6 +53,7 @@ pub struct DesktopProgramRegistration {
     pub image: ExecutableImage,
     pub exec_path: Option<&'static str>,
     pub weight_micros: u64,
+    pub logical_admin: bool,
     pub argv: &'static [&'static str],
     pub env: &'static [&'static str],
 }
@@ -68,9 +69,15 @@ impl DesktopProgramRegistration {
             image,
             exec_path: None,
             weight_micros,
+            logical_admin: false,
             argv: &[],
             env: &[],
         }
+    }
+
+    pub const fn with_logical_admin(mut self, logical_admin: bool) -> Self {
+        self.logical_admin = logical_admin;
+        self
     }
 
     pub const fn with_exec_path(mut self, exec_path: &'static str) -> Self {
@@ -198,6 +205,7 @@ struct RegisteredDesktopProgram {
     image: ExecutableImage,
     exec_path: &'static str,
     weight_micros: u64,
+    logical_admin: bool,
     argv: &'static [&'static str],
     env: &'static [&'static str],
 }
@@ -247,6 +255,7 @@ struct LaunchRequestProgram {
     image: ExecutableImage,
     exec_path: &'static str,
     weight_micros: u64,
+    logical_admin: bool,
     argv: &'static [&'static str],
     env: &'static [&'static str],
 }
@@ -283,6 +292,7 @@ pub fn register_program(
             image: registration.image,
             exec_path,
             weight_micros: registration.weight_micros,
+            logical_admin: registration.logical_admin,
             argv: registration.argv,
             env: registration.env,
         });
@@ -511,6 +521,7 @@ fn handle_launch_request(program_id: DesktopProgramId, session: ConsoleSessionId
             image: program.image,
             exec_path: program.exec_path,
             weight_micros: program.weight_micros,
+            logical_admin: program.logical_admin,
             argv: program.argv,
             env: program.env,
         })
@@ -543,7 +554,8 @@ fn handle_launch_request(program_id: DesktopProgramId, session: ConsoleSessionId
 
     let launch =
         console_host::ConsoleProgramSpec::new(&image, program.exec_path, program.weight_micros)
-            .with_args(program.argv, program.env);
+            .with_args(program.argv, program.env)
+            .with_logical_admin(program.logical_admin);
 
     match console_host::spawn_program_in_session(session, launch) {
         Ok(spawned) => {

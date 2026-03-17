@@ -3,11 +3,11 @@ use core::convert::TryFrom;
 use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
 
+use crate::debug;
 use crate::io::device::{self as device_ns};
 use crate::multitask;
 use crate::paging;
-use crate::user::abi::device::DisplayInfo;
-use crate::user::handles::{DisplaySurfaceHandle, KernelHandle};
+use crate::user::handles::{DisplaySurfaceHandle, FIRST_DYNAMIC_FD, KernelHandle};
 use crate::user::linux as linux_abi;
 use crate::user::process_state::UserProcessState;
 const PAGE_SIZE: u64 = 4096;
@@ -29,23 +29,47 @@ impl From<paging::AddressSpaceError> for DeviceSysopError {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct LegacySurfaceAllocation {
-    pub address: u64,
-    pub len: u64,
-    pub width: u32,
-    pub height: u32,
-    pub stride_bytes: u32,
-    pub bytes_per_pixel: u32,
-    pub pixel_format: u32,
-}
-
-pub(crate) fn open_path_for_current_process(path: &str) -> Result<u64, DeviceSysopError> {
+pub(crate) fn open_path_for_current_process(
+    path: &str,
+    open_flags: u64,
+) -> Result<u64, DeviceSysopError> {
+    let trace_runtime = multitask::current_user_id() == Some(1);
     let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
+        let occupied_before = (FIRST_DYNAMIC_FD as u64..FIRST_DYNAMIC_FD as u64 + 8)
+            .filter(|fd| process_state.handles().get(*fd).is_some())
+            .count();
+        let fd3_before = debug_handle_name(process_state.handles().get(3));
+        let fd4_before = debug_handle_name(process_state.handles().get(4));
+        let fd5_before = debug_handle_name(process_state.handles().get(5));
         let handle = device_ns::open(path)
             .map(KernelHandle::Device)
             .map_err(map_lookup_error)?;
-        Ok(process_state.handles_mut().install(handle))
+        let fd = process_state
+            .handles_mut()
+            .install_with_open_flags(handle, open_flags);
+        let occupied_after = (FIRST_DYNAMIC_FD as u64..FIRST_DYNAMIC_FD as u64 + 8)
+            .filter(|fd| process_state.handles().get(*fd).is_some())
+            .count();
+        let fd3_after = debug_handle_name(process_state.handles().get(3));
+        let fd4_after = debug_handle_name(process_state.handles().get(4));
+        let fd5_after = debug_handle_name(process_state.handles().get(5));
+        if trace_runtime {
+            debug::println!(
+                "device open: path={} flags={:#x} assigned_fd={} occupied_before={} occupied_after={} fd3:{}->{} fd4:{}->{} fd5:{}->{}",
+                path,
+                open_flags,
+                fd,
+                occupied_before,
+                occupied_after,
+                fd3_before,
+                fd3_after,
+                fd4_before,
+                fd4_after,
+                fd5_before,
+                fd5_after,
+            );
+        }
+        Ok(fd)
     }) else {
         return Err(DeviceSysopError::Unsupported);
     };
@@ -172,66 +196,6 @@ pub(crate) fn munmap_current_process_range(
     result
 }
 
-pub(crate) fn allocate_legacy_surface_to_current_process(
-    width: u64,
-    height: u64,
-    pixel_format: u64,
-) -> Result<LegacySurfaceAllocation, DeviceSysopError> {
-    let width = u32::try_from(width).map_err(|_| DeviceSysopError::InvalidArgument)?;
-    let height = u32::try_from(height).map_err(|_| DeviceSysopError::InvalidArgument)?;
-    let pixel_format =
-        u32::try_from(pixel_format).map_err(|_| DeviceSysopError::InvalidArgument)?;
-    let mut surface = DisplaySurfaceHandle::new(width, height, pixel_format)
-        .ok_or(DeviceSysopError::InvalidArgument)?;
-
-    let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
-        let mapping_len = surface.mapping_len();
-        let address = map_surface(
-            process_state,
-            &mut surface,
-            mapping_len,
-            linux_abi::PROT_READ | linux_abi::PROT_WRITE,
-            0,
-        )?;
-        Ok(LegacySurfaceAllocation {
-            address,
-            len: surface.mapping_len(),
-            width: surface.width(),
-            height: surface.height(),
-            stride_bytes: surface.stride_bytes(),
-            bytes_per_pixel: surface.bytes_per_pixel(),
-            pixel_format: surface.pixel_format(),
-        })
-    }) else {
-        return Err(DeviceSysopError::Unsupported);
-    };
-
-    result
-}
-
-pub(crate) fn query_display_info() -> Result<DisplayInfo, DeviceSysopError> {
-    device_ns::display_info().map_err(map_device_error)
-}
-
-pub(crate) fn present_legacy_frame(
-    address_space: &paging::ProcessAddressSpace,
-    user_ptr: u64,
-    width: u64,
-    height: u64,
-    stride_bytes: u64,
-    pixel_format: u64,
-) -> Result<(), DeviceSysopError> {
-    device_ns::present_frame_from_user(
-        address_space,
-        user_ptr,
-        width,
-        height,
-        stride_bytes,
-        pixel_format,
-    )
-    .map_err(map_device_error)
-}
-
 fn map_surface(
     process_state: &mut UserProcessState,
     surface: &mut DisplaySurfaceHandle,
@@ -257,6 +221,17 @@ fn map_surface(
     let region = process_state.map_zeroed_pages_from_mapping_cursor(page_count, page_flags)?;
     surface.set_mapped_region(region);
     Ok(region.start.as_u64())
+}
+
+fn debug_handle_name(handle: Option<&KernelHandle>) -> &'static str {
+    match handle {
+        None => "-",
+        Some(KernelHandle::Console(_)) => "console",
+        Some(KernelHandle::Device(device)) => device.device_id().path(),
+        Some(KernelHandle::BootFile(_)) => "file",
+        Some(KernelHandle::BootDirectory(_)) => "dir",
+        Some(KernelHandle::DisplaySurface(_)) => "surface",
+    }
 }
 
 fn surface_page_flags(prot: u64) -> PageTableFlags {

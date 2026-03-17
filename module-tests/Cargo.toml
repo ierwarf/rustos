@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 boot-protocol = { path = "../bootloader/boot-protocol" }
+driver-abi = { path = "../driver-abi" }
+rustos-keyboard-driver = { path = "../drivers/input/keyboard" }
 bitflags = { version = "2.11", default-features = false }
 fatfs = { git = "https://github.com/rafalh/rust-fatfs", default-features = false, features = ["alloc", "lfn"] }
 spin = "0.10.0"

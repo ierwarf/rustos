@@ -23,8 +23,8 @@ cleanup() {
 trap cleanup EXIT
 
 # QEMU's vvfat backend touches host-side file metadata when it is pointed at
-# build/ directly, so run from an isolated mirror instead.
-cp -a build/. "$BUILD_MIRROR_DIR/"
+# the boot image directly, so run from an isolated mirror instead.
+cp -a build/image/. "$BUILD_MIRROR_DIR/"
 
 USE_DEBUGCON_FILE=false
 EXPECT_STDIO_TARGET=""
@@ -77,7 +77,6 @@ qemu-system-i386 \
   -monitor none \
   "${DEBUGCON_ARGS[@]}" \
   -global isa-debugcon.iobase=0xe9 \
-  -d int -D qemu_interrupt.log \
   "$@"
 QEMU_EXIT_CODE=$?
 set -e

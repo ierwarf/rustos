@@ -38,6 +38,10 @@ mod gui {
 
     pub fn sync_desktop_windows() {}
 
+    pub fn is_userspace_display_active() -> bool {
+        false
+    }
+
     pub fn focused_console_session() -> ConsoleSessionId {
         ConsoleSessionId::PRIMARY
     }
@@ -96,12 +100,57 @@ mod desktop {
     pub fn sync_all_console_windows() {}
 }
 
-mod ui_service {
-    use crate::keyboard::KeyboardEvent;
+mod driver {
+    pub mod input {
+        use driver_abi::PointerPacket;
 
-    pub fn push_keyboard_event(_event: KeyboardEvent) {}
-    pub fn push_pointer_motion(_dx: i16, _dy: i16) {}
-    pub fn push_pointer_button_left(_pressed: bool) {}
+        pub fn reset_pointer_state() {}
+
+        pub fn submit_pointer_packet(_packet: PointerPacket) -> bool {
+            true
+        }
+    }
+
+    pub mod serio {
+        use driver_abi::SerioPortInfo;
+
+        #[derive(Clone, Copy, Default)]
+        pub struct SerioPortOps {
+            pub open: Option<fn() -> i32>,
+            pub close: Option<fn()>,
+            pub write_byte: Option<fn(u8) -> i32>,
+            pub ps2_command: Option<fn(u8, &[u8], &mut [u8]) -> i32>,
+            pub drain: Option<fn(usize, u32)>,
+        }
+
+        pub fn register_port(_info: SerioPortInfo) {}
+
+        pub fn register_port_with_ops(_info: SerioPortInfo, _ops: SerioPortOps) {}
+
+        pub fn receive_byte(_port_id: u32, _byte: u8, _flags: u32) -> bool {
+            true
+        }
+    }
+}
+
+mod input {
+    pub mod dispatcher {
+        use crate::keyboard::KeyboardEvent;
+
+        pub fn dispatch_keyboard_event(event: KeyboardEvent) {
+            super::event_queue::push_keyboard_event(event);
+        }
+    }
+
+    pub mod event_queue {
+        use crate::keyboard::KeyboardEvent;
+
+        pub fn push_keyboard_event(_event: KeyboardEvent) {}
+        pub fn push_pointer_motion(_dx: i16, _dy: i16) {}
+        pub fn push_pointer_scroll(_vertical: i16, _horizontal: i16) {}
+        pub fn push_pointer_button_left(_pressed: bool) {}
+        pub fn push_pointer_button(_code: u32, _pressed: bool) {}
+    }
 }
 
 mod multitask {
@@ -118,6 +167,20 @@ mod multitask {
     pub fn service_deferred_work() -> usize {
         0
     }
+
+    pub fn current_user_id() -> Option<u64> {
+        None
+    }
+
+    pub fn block_current_user_task() -> bool {
+        false
+    }
+
+    pub fn yield_now() {}
+
+    pub fn wake_user_task(_task_id: u64) -> bool {
+        false
+    }
 }
 
 #[path = "../../kernel/src/util/ring.rs"]
@@ -131,9 +194,6 @@ mod tty;
 
 #[path = "../../kernel/src/input/keyboard.rs"]
 mod keyboard;
-
-#[path = "../../kernel/src/input/mouse.rs"]
-mod mouse;
 
 #[path = "../../kernel/src/storage/fat.rs"]
 mod fat;

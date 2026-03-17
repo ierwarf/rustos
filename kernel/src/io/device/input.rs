@@ -2,7 +2,7 @@ use alloc::vec;
 use core::mem::{align_of, size_of};
 use core::slice;
 
-use crate::io::ui_service;
+use crate::input::event_queue;
 use crate::user::abi::{device, ui};
 use crate::user::process_state::UserProcessState;
 
@@ -16,7 +16,7 @@ pub fn read_events(dest: &mut [device::InputEvent]) -> usize {
     let legacy_dest = unsafe {
         slice::from_raw_parts_mut(dest.as_mut_ptr().cast::<ui::UiInputEvent>(), dest.len())
     };
-    ui_service::read_input_events(legacy_dest)
+    event_queue::read_input_events(legacy_dest)
 }
 
 pub(crate) fn read_to_user(

@@ -29,11 +29,11 @@ pub const KERNEL_VIRT_OFFSET: u64 = 0xffff_8000_0000_0000;
 const MMIO_WINDOW_BASE: u64 = KERNEL_VIRT_OFFSET + (1_u64 << 39);
 pub const USER_SPACE_BASE: u64 = (USER_PML4_INDEX as u64) << 39;
 pub const USER_SPACE_END_EXCLUSIVE: u64 = ((USER_PML4_INDEX + 1) as u64) << 39;
-// User-space graphics surfaces now live in normal process address spaces, so
-// the fixed process frame pool must comfortably hold at least one laptop-class
-// full-screen compositor buffer plus task images, stacks, and page tables.
-// 16_384 pages = 64 MiB, which is enough for a 4K BGRA surface with headroom.
-const PROCESS_FRAME_POOL_PAGES: usize = 16_384;
+// User-space graphics surfaces, glibc, and predecoded media assets now live in
+// normal process address spaces, so the fixed process frame pool must hold more
+// than a single full-screen surface. 65_536 pages = 256 MiB, which leaves room
+// for a predecoded 800x600x48-frame GIF cache plus loader/runtime overhead.
+const PROCESS_FRAME_POOL_PAGES: usize = 65_536;
 const PROCESS_FRAME_BITMAP_WORDS: usize = (PROCESS_FRAME_POOL_PAGES + 63) / 64;
 const MMIO_UNMAPPED_BLOCK: u64 = u64::MAX;
 
@@ -444,6 +444,33 @@ impl ProcessAddressSpace {
         Ok(page_count)
     }
 
+    pub fn protect_user_bytes(
+        &mut self,
+        start: VirtAddr,
+        byte_len: usize,
+        flags: PageTableFlags,
+    ) -> Result<(), AddressSpaceError> {
+        let page_count = byte_len_to_page_count(byte_len)?;
+        self.protect_user_pages_at(start, page_count, flags)
+    }
+
+    pub fn protect_user_pages_at(
+        &mut self,
+        start: VirtAddr,
+        page_count: usize,
+        flags: PageTableFlags,
+    ) -> Result<(), AddressSpaceError> {
+        validate_user_page_range(start, page_count)?;
+        let page_flags = normalize_user_page_flags(flags)?;
+
+        for page_index in 0..page_count {
+            let virt = page_addr(start, page_index)?;
+            self.protect_user_page(virt, page_flags)?;
+        }
+
+        Ok(())
+    }
+
     pub fn translate_user(&self, virt: VirtAddr) -> Option<PhysAddr> {
         if !is_user_addr(virt.as_u64()) {
             return None;
@@ -719,6 +746,42 @@ impl ProcessAddressSpace {
         }
 
         entry.set_addr(phys, flags);
+        self.flush_if_active(virt);
+        Ok(())
+    }
+
+    fn protect_user_page(
+        &mut self,
+        virt: VirtAddr,
+        flags: PageTableFlags,
+    ) -> Result<(), AddressSpaceError> {
+        validate_user_page_range(virt, 1)?;
+
+        let root = unsafe { process_frame_table_mut(self.pml4_frame) };
+        let pml4_entry = &mut root[p4_index(virt)];
+        if pml4_entry.is_unused() || pml4_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            return Err(AddressSpaceError::NotMapped);
+        }
+
+        let pdpt = unsafe { phys_to_table_mut(pml4_entry.addr()) };
+        let pdpt_entry = &mut pdpt[p3_index(virt)];
+        if pdpt_entry.is_unused() || pdpt_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            return Err(AddressSpaceError::NotMapped);
+        }
+
+        let pd = unsafe { phys_to_table_mut(pdpt_entry.addr()) };
+        let pd_entry = &mut pd[p2_index(virt)];
+        if pd_entry.is_unused() || pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            return Err(AddressSpaceError::NotMapped);
+        }
+
+        let pt = unsafe { phys_to_table_mut(pd_entry.addr()) };
+        let pt_entry = &mut pt[p1_index(virt)];
+        if pt_entry.is_unused() || pt_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            return Err(AddressSpaceError::NotMapped);
+        }
+
+        pt_entry.set_addr(pt_entry.addr(), flags);
         self.flush_if_active(virt);
         Ok(())
     }
@@ -1100,6 +1163,14 @@ pub fn higher_half_addr(addr: u64) -> u64 {
         addr
     } else {
         addr + KERNEL_VIRT_OFFSET
+    }
+}
+
+pub fn lower_half_addr(addr: u64) -> u64 {
+    if addr >= KERNEL_VIRT_OFFSET {
+        addr - KERNEL_VIRT_OFFSET
+    } else {
+        addr
     }
 }
 

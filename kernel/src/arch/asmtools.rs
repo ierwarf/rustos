@@ -33,17 +33,18 @@ pub fn current_rip() -> u64 {
 
 pub unsafe fn enter_higher_half(entry: u64, boot_info_ptr: u64) -> ! {
     unsafe {
+        // Pin inputs to fixed registers so the compiler cannot alias the jump
+        // target with the ABI argument register during debug builds.
         asm!(
-            "mov rdi, {boot_info_ptr}",
-            "add rsp, {virt_offset}",
+            "add rsp, rcx",
             "test rsp, 8",
             "jnz 2f",
             "sub rsp, 8",
             "2:",
-            "jmp {entry}",
-            boot_info_ptr = in(reg) boot_info_ptr,
-            virt_offset = in(reg) crate::paging::KERNEL_VIRT_OFFSET,
-            entry = in(reg) entry,
+            "jmp rax",
+            in("rax") entry,
+            in("rdi") boot_info_ptr,
+            in("rcx") crate::paging::KERNEL_VIRT_OFFSET,
             options(noreturn),
         );
     }
@@ -297,6 +298,13 @@ global_asm!(
         RESTORE_CONTEXT_AND_IRET 0x188
 
     .size software_schedule_interrupt_handler, . - software_schedule_interrupt_handler
+
+    .global software_schedule_trap
+    .type software_schedule_trap, @function
+    software_schedule_trap:
+        int 0x30
+        ret
+    .size software_schedule_trap, . - software_schedule_trap
 "#
 );
 

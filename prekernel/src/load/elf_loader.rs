@@ -15,14 +15,28 @@ const ELF_MACHINE_X86_64: u16 = 62;
 const ELF64_HEADER_SIZE: usize = 64;
 const ELF64_PROGRAM_HEADER_SIZE: usize = 56;
 const ELF_PT_LOAD: u32 = 1;
+const ELF_PT_DYNAMIC: u32 = 2;
 const ELF_PF_X: u32 = 1;
 const MAX_PROGRAM_HEADERS: usize = 32;
 const PAGE_SIZE: usize = 0x1000;
 const MIN_KERNEL_LOAD_ADDR: usize = 0x0020_0000;
 const MAX_KERNEL_LOAD_END_EXCLUSIVE: usize = 512 * 1024 * 1024 * 1024;
 const LOAD_CHUNK_SIZE: usize = 4096;
+const KERNEL_PIE_LOAD_BIAS: usize = MIN_KERNEL_LOAD_ADDR;
+const MAX_KERNEL_PHYSICAL_KASLR_SLIDE: usize = 0x0020_0000;
+const ELF64_DYNAMIC_ENTRY_SIZE: usize = 16;
+const ELF64_RELA_ENTRY_SIZE: usize = 24;
+const DT_NULL: i64 = 0;
+const DT_RELA: i64 = 7;
+const DT_RELASZ: i64 = 8;
+const DT_RELAENT: i64 = 9;
+const R_X86_64_RELATIVE: u32 = 8;
 
-pub fn load_kernel_elf<R>(reader: &mut R, file_len: u64) -> Result<(usize, usize), &'static str>
+pub fn load_kernel_elf<R>(
+    reader: &mut R,
+    file_len: u64,
+    physical_slide: usize,
+) -> Result<(usize, usize, usize), &'static str>
 where
     R: Read + Seek + IoBase<Error = fatfs::Error<DiskIoError>>,
 {
@@ -44,24 +58,30 @@ where
         "failed to read program header table",
     )?;
 
-    let entry_point =
-        usize::try_from(header.entry_point).map_err(|_| "entry point out of range")?;
+    let load_alignment = required_load_alignment(&program_headers[..ph_table_size], &header)?;
+    let load_bias = kernel_load_bias(&header, physical_slide, load_alignment)?;
+    let entry_point = relocate_image_addr(&header, header.entry_point, load_bias)?;
     validate_kernel_entry(entry_point)?;
 
     let mut loaded_segments = 0usize;
     let mut executable_entry_covered = false;
     let mut loaded_ranges = [(0usize, 0usize); MAX_PROGRAM_HEADERS];
     let mut loaded_range_count = 0usize;
+    let mut dynamic_segment = None;
 
     for index in 0..header.program_header_count {
         let offset = index * ELF64_PROGRAM_HEADER_SIZE;
         let ph =
             parse_program_header(&program_headers[offset..offset + ELF64_PROGRAM_HEADER_SIZE])?;
+        if ph.ty == ELF_PT_DYNAMIC {
+            dynamic_segment = Some(dynamic_segment_info(&header, &ph, load_bias)?);
+            continue;
+        }
         if ph.ty != ELF_PT_LOAD {
             continue;
         }
 
-        let segment = validated_segment_bounds(&ph, file_len)?;
+        let segment = validated_segment_bounds(&header, &ph, file_len, load_bias)?;
         reject_overlapping_segment(
             segment.addr,
             segment.end,
@@ -84,12 +104,22 @@ where
     if !executable_entry_covered {
         return Err("entry point is not inside an executable PT_LOAD segment");
     }
+    if header.elf_type == ELF_TYPE_DYN {
+        let dynamic_segment = dynamic_segment.ok_or("ET_DYN image is missing PT_DYNAMIC")?;
+        apply_dynamic_relocations(
+            &header,
+            &dynamic_segment,
+            load_bias,
+            &loaded_ranges[..loaded_range_count],
+        )?;
+    }
 
-    Ok((entry_point, loaded_segments))
+    Ok((entry_point, loaded_segments, load_bias))
 }
 
 #[derive(Clone, Copy)]
 struct ElfHeader {
+    elf_type: u16,
     entry_point: u64,
     program_header_offset: u64,
     program_header_size: usize,
@@ -105,6 +135,7 @@ struct ProgramHeader {
     physical_addr: u64,
     file_size: u64,
     mem_size: u64,
+    align: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -117,12 +148,25 @@ struct SegmentLoadInfo {
     file_size: usize,
 }
 
+#[derive(Clone, Copy)]
+struct DynamicSegmentInfo {
+    addr: usize,
+    size: usize,
+}
+
+#[derive(Clone, Copy)]
+struct DynamicRelocationTable {
+    addr: usize,
+    size: usize,
+}
+
 fn parse_elf_header(header: &[u8; ELF64_HEADER_SIZE]) -> Result<ElfHeader, &'static str> {
     if header[..4] != ELF_MAGIC {
         return Err("invalid ELF magic");
     }
 
     Ok(ElfHeader {
+        elf_type: read_u16(header, 16),
         entry_point: read_u64(header, 24),
         program_header_offset: read_u64(header, 32),
         program_header_size: usize::from(read_u16(header, 54)),
@@ -142,8 +186,7 @@ fn validate_elf_header(
         return Err("ELF endianness is not little-endian");
     }
 
-    let elf_type = read_u16(raw_header, 16);
-    if !matches!(elf_type, ELF_TYPE_EXEC | ELF_TYPE_DYN) {
+    if !matches!(header.elf_type, ELF_TYPE_EXEC | ELF_TYPE_DYN) {
         return Err("ELF type is not executable/shared object");
     }
     if read_u16(raw_header, 18) != ELF_MACHINE_X86_64 {
@@ -193,6 +236,7 @@ fn parse_program_header(bytes: &[u8]) -> Result<ProgramHeader, &'static str> {
         physical_addr: read_u64(bytes, 24),
         file_size: read_u64(bytes, 32),
         mem_size: read_u64(bytes, 40),
+        align: read_u64(bytes, 48),
     })
 }
 
@@ -247,8 +291,10 @@ fn validate_kernel_entry(entry_point: usize) -> Result<(), &'static str> {
 }
 
 fn validated_segment_bounds(
+    header: &ElfHeader,
     ph: &ProgramHeader,
     file_len: u64,
+    load_bias: usize,
 ) -> Result<SegmentLoadInfo, &'static str> {
     let file_size = usize::try_from(ph.file_size).map_err(|_| "segment file size out of range")?;
     let mem_size = usize::try_from(ph.mem_size).map_err(|_| "segment memory size out of range")?;
@@ -267,7 +313,7 @@ fn validated_segment_bounds(
         return Err("segment file range is outside ELF image");
     }
 
-    let addr = segment_addr(ph)?;
+    let addr = segment_addr(header, ph, load_bias)?;
     if addr < MIN_KERNEL_LOAD_ADDR {
         return Err("segment address is below minimum kernel load address");
     }
@@ -292,6 +338,26 @@ fn validated_segment_bounds(
     })
 }
 
+fn dynamic_segment_info(
+    header: &ElfHeader,
+    ph: &ProgramHeader,
+    load_bias: usize,
+) -> Result<DynamicSegmentInfo, &'static str> {
+    let size = usize::try_from(ph.mem_size).map_err(|_| "dynamic segment size is out of range")?;
+    if size == 0 {
+        return Err("PT_DYNAMIC segment has zero size");
+    }
+    let addr = relocate_image_addr(header, ph.virtual_addr, load_bias)?;
+    let end = addr
+        .checked_add(size)
+        .ok_or("dynamic segment address overflow")?;
+    if addr < MIN_KERNEL_LOAD_ADDR || end > MAX_KERNEL_LOAD_END_EXCLUSIVE {
+        return Err("dynamic segment is outside the supported kernel load range");
+    }
+
+    Ok(DynamicSegmentInfo { addr, size })
+}
+
 fn reject_overlapping_segment(
     segment_addr: usize,
     segment_end: usize,
@@ -305,7 +371,15 @@ fn reject_overlapping_segment(
     Ok(())
 }
 
-fn segment_addr(ph: &ProgramHeader) -> Result<usize, &'static str> {
+fn segment_addr(
+    header: &ElfHeader,
+    ph: &ProgramHeader,
+    load_bias: usize,
+) -> Result<usize, &'static str> {
+    if header.elf_type == ELF_TYPE_DYN {
+        return relocate_image_addr(header, ph.virtual_addr, load_bias);
+    }
+
     let physical_addr =
         usize::try_from(ph.physical_addr).map_err(|_| "segment physical address out of range")?;
     if physical_addr != 0 {
@@ -313,6 +387,240 @@ fn segment_addr(ph: &ProgramHeader) -> Result<usize, &'static str> {
     }
 
     usize::try_from(ph.virtual_addr).map_err(|_| "segment virtual address out of range")
+}
+
+fn kernel_load_bias(
+    header: &ElfHeader,
+    physical_slide: usize,
+    load_alignment: usize,
+) -> Result<usize, &'static str> {
+    if header.elf_type == ELF_TYPE_DYN {
+        if physical_slide > MAX_KERNEL_PHYSICAL_KASLR_SLIDE {
+            return Err("kernel physical slide exceeds the supported KASLR window");
+        }
+
+        let applied_slide = align_down(physical_slide, load_alignment);
+        KERNEL_PIE_LOAD_BIAS
+            .checked_add(applied_slide)
+            .ok_or("kernel load bias overflow")
+    } else {
+        Ok(0)
+    }
+}
+
+fn required_load_alignment(
+    program_headers: &[u8],
+    header: &ElfHeader,
+) -> Result<usize, &'static str> {
+    let mut required_alignment = PAGE_SIZE;
+
+    for index in 0..header.program_header_count {
+        let offset = index
+            .checked_mul(ELF64_PROGRAM_HEADER_SIZE)
+            .ok_or("program header offset overflow")?;
+        let ph =
+            parse_program_header(&program_headers[offset..offset + ELF64_PROGRAM_HEADER_SIZE])?;
+        if ph.ty != ELF_PT_LOAD {
+            continue;
+        }
+
+        let segment_alignment =
+            usize::try_from(ph.align).map_err(|_| "segment alignment out of range")?;
+        if segment_alignment == 0 {
+            continue;
+        }
+        if !segment_alignment.is_power_of_two() {
+            return Err("segment alignment is not a power of two");
+        }
+        required_alignment = required_alignment.max(segment_alignment);
+    }
+
+    Ok(required_alignment)
+}
+
+fn relocate_image_addr(
+    header: &ElfHeader,
+    raw_addr: u64,
+    load_bias: usize,
+) -> Result<usize, &'static str> {
+    let addr = usize::try_from(raw_addr).map_err(|_| "image address is out of range")?;
+    if header.elf_type == ELF_TYPE_DYN {
+        load_bias
+            .checked_add(addr)
+            .ok_or("image address overflow after relocation")
+    } else {
+        Ok(addr)
+    }
+}
+
+fn apply_dynamic_relocations(
+    header: &ElfHeader,
+    dynamic_segment: &DynamicSegmentInfo,
+    load_bias: usize,
+    loaded_ranges: &[(usize, usize)],
+) -> Result<(), &'static str> {
+    let dynamic_end = dynamic_segment
+        .addr
+        .checked_add(dynamic_segment.size)
+        .ok_or("dynamic segment address overflow")?;
+    require_range_covered(
+        dynamic_segment.addr,
+        dynamic_end,
+        loaded_ranges,
+        "dynamic segment is not inside a PT_LOAD segment",
+    )?;
+
+    let relocations = parse_dynamic_relocation_table(header, dynamic_segment, load_bias)?;
+    if relocations.size == 0 {
+        return Ok(());
+    }
+    let rela_end = relocations
+        .addr
+        .checked_add(relocations.size)
+        .ok_or("Rela table address overflow")?;
+    require_range_covered(
+        relocations.addr,
+        rela_end,
+        loaded_ranges,
+        "dynamic relocation table is not inside a PT_LOAD segment",
+    )?;
+
+    let rela_count = relocations.size / ELF64_RELA_ENTRY_SIZE;
+    for index in 0..rela_count {
+        let entry_addr = relocations
+            .addr
+            .checked_add(index * ELF64_RELA_ENTRY_SIZE)
+            .ok_or("Rela entry address overflow")?;
+        let offset = read_u64_from_memory(entry_addr);
+        let info = read_u64_from_memory(entry_addr + 8);
+        let addend = read_i64_from_memory(entry_addr + 16);
+
+        let relocation_type = info as u32;
+        if relocation_type != R_X86_64_RELATIVE {
+            return Err("unsupported dynamic relocation type");
+        }
+
+        let target = relocate_image_addr(header, offset, load_bias)?;
+        let target_end = target
+            .checked_add(core::mem::size_of::<u64>())
+            .ok_or("relocation target overflow")?;
+        require_range_covered(
+            target,
+            target_end,
+            loaded_ranges,
+            "dynamic relocation target is not inside a PT_LOAD segment",
+        )?;
+
+        let relocated_value = relative_relocation_value(header, load_bias, addend)?;
+        write_u64_to_memory(target, relocated_value);
+    }
+
+    Ok(())
+}
+
+fn parse_dynamic_relocation_table(
+    header: &ElfHeader,
+    dynamic_segment: &DynamicSegmentInfo,
+    load_bias: usize,
+) -> Result<DynamicRelocationTable, &'static str> {
+    let mut rela_addr = None;
+    let mut rela_size = None;
+    let mut rela_ent = None;
+
+    let entry_count = dynamic_segment.size / ELF64_DYNAMIC_ENTRY_SIZE;
+    for index in 0..entry_count {
+        let entry_addr = dynamic_segment
+            .addr
+            .checked_add(index * ELF64_DYNAMIC_ENTRY_SIZE)
+            .ok_or("dynamic entry address overflow")?;
+        let tag = read_i64_from_memory(entry_addr);
+        let value = read_u64_from_memory(entry_addr + 8);
+
+        match tag {
+            DT_NULL => break,
+            DT_RELA => {
+                rela_addr = Some(relocate_image_addr(header, value, load_bias)?);
+            }
+            DT_RELASZ => {
+                rela_size = Some(
+                    usize::try_from(value)
+                        .map_err(|_| "dynamic relocation table size is out of range")?,
+                );
+            }
+            DT_RELAENT => {
+                rela_ent = Some(
+                    usize::try_from(value)
+                        .map_err(|_| "dynamic relocation entry size is out of range")?,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let rela_addr = match (rela_addr, rela_size) {
+        (Some(addr), Some(size)) if size != 0 => {
+            if let Some(entry_size) = rela_ent {
+                if entry_size != ELF64_RELA_ENTRY_SIZE {
+                    return Err("unsupported Rela entry size");
+                }
+            }
+            if size % ELF64_RELA_ENTRY_SIZE != 0 {
+                return Err("dynamic relocation table size is not aligned");
+            }
+            addr
+        }
+        _ => return Ok(DynamicRelocationTable { addr: 0, size: 0 }),
+    };
+    let rela_size = rela_size.unwrap_or(0);
+
+    Ok(DynamicRelocationTable {
+        addr: rela_addr,
+        size: rela_size,
+    })
+}
+
+fn require_range_covered(
+    start: usize,
+    end: usize,
+    loaded_ranges: &[(usize, usize)],
+    error_message: &'static str,
+) -> Result<(), &'static str> {
+    for &(range_start, range_end) in loaded_ranges {
+        if start >= range_start && end <= range_end {
+            return Ok(());
+        }
+    }
+
+    Err(error_message)
+}
+
+fn relative_relocation_value(
+    header: &ElfHeader,
+    load_bias: usize,
+    addend: i64,
+) -> Result<u64, &'static str> {
+    let base = if header.elf_type == ELF_TYPE_DYN {
+        load_bias as i128
+    } else {
+        0
+    };
+    let value = base + i128::from(addend);
+    if !(0..=u64::MAX as i128).contains(&value) {
+        return Err("relocation value is out of range");
+    }
+    Ok(value as u64)
+}
+
+fn read_i64_from_memory(addr: usize) -> i64 {
+    unsafe { ptr::read_unaligned(addr as *const i64) }
+}
+
+fn read_u64_from_memory(addr: usize) -> u64 {
+    unsafe { ptr::read_unaligned(addr as *const u64) }
+}
+
+fn write_u64_to_memory(addr: usize, value: u64) {
+    unsafe { ptr::write_unaligned(addr as *mut u64, value) }
 }
 
 fn align_down(value: usize, align: usize) -> usize {
@@ -381,12 +689,12 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
 mod tests {
     use super::*;
 
-    fn valid_header() -> [u8; ELF64_HEADER_SIZE] {
+    fn valid_header(elf_type: u16) -> [u8; ELF64_HEADER_SIZE] {
         let mut header = [0_u8; ELF64_HEADER_SIZE];
         header[..4].copy_from_slice(&ELF_MAGIC);
         header[4] = ELF_CLASS_64;
         header[5] = ELF_DATA_LITTLE_ENDIAN;
-        header[16..18].copy_from_slice(&ELF_TYPE_EXEC.to_le_bytes());
+        header[16..18].copy_from_slice(&elf_type.to_le_bytes());
         header[18..20].copy_from_slice(&ELF_MACHINE_X86_64.to_le_bytes());
         header[24..32].copy_from_slice(&(MIN_KERNEL_LOAD_ADDR as u64).to_le_bytes());
         header[32..40].copy_from_slice(&(ELF64_HEADER_SIZE as u64).to_le_bytes());
@@ -405,12 +713,13 @@ mod tests {
             physical_addr: MIN_KERNEL_LOAD_ADDR as u64,
             file_size: 0x200,
             mem_size: 0x400,
+            align: PAGE_SIZE as u64,
         }
     }
 
     #[test]
     fn validate_elf_header_accepts_minimal_valid_header() {
-        let header_bytes = valid_header();
+        let header_bytes = valid_header(ELF_TYPE_EXEC);
         let header = parse_elf_header(&header_bytes).expect("header should parse");
 
         assert_eq!(header.entry_point, MIN_KERNEL_LOAD_ADDR as u64);
@@ -424,7 +733,7 @@ mod tests {
 
     #[test]
     fn validate_elf_header_rejects_short_program_table() {
-        let header_bytes = valid_header();
+        let header_bytes = valid_header(ELF_TYPE_EXEC);
         let header = parse_elf_header(&header_bytes).expect("header should parse");
 
         let err = validate_elf_header(&header_bytes, &header, ELF64_HEADER_SIZE as u64)
@@ -434,7 +743,9 @@ mod tests {
 
     #[test]
     fn validated_segment_bounds_accepts_supported_range() {
-        let segment = validated_segment_bounds(&valid_program_header(), 0x4000)
+        let header_bytes = valid_header(ELF_TYPE_EXEC);
+        let header = parse_elf_header(&header_bytes).expect("header should parse");
+        let segment = validated_segment_bounds(&header, &valid_program_header(), 0x4000, 0)
             .expect("segment should validate");
 
         assert_eq!(segment.addr, MIN_KERNEL_LOAD_ADDR);
@@ -445,11 +756,27 @@ mod tests {
 
     #[test]
     fn validated_segment_bounds_rejects_low_address() {
-        let mut header = valid_program_header();
-        header.physical_addr = (MIN_KERNEL_LOAD_ADDR - 0x1000) as u64;
+        let header_bytes = valid_header(ELF_TYPE_EXEC);
+        let elf_header = parse_elf_header(&header_bytes).expect("header should parse");
+        let mut program_header = valid_program_header();
+        program_header.physical_addr = (MIN_KERNEL_LOAD_ADDR - 0x1000) as u64;
 
-        let err = validated_segment_bounds(&header, 0x4000).expect_err("low segment should fail");
+        let err = validated_segment_bounds(&elf_header, &program_header, 0x4000, 0)
+            .expect_err("low segment should fail");
         assert_eq!(err, "segment address is below minimum kernel load address");
+    }
+
+    #[test]
+    fn dyn_entry_is_relocated_by_kernel_bias() {
+        let mut header_bytes = valid_header(ELF_TYPE_DYN);
+        header_bytes[24..32].copy_from_slice(&(0x8c2f0_u64).to_le_bytes());
+        let header = parse_elf_header(&header_bytes).expect("header should parse");
+
+        let load_bias =
+            kernel_load_bias(&header, 0x1234, PAGE_SIZE).expect("load bias should compute");
+        let entry = relocate_image_addr(&header, header.entry_point, load_bias)
+            .expect("entry relocation should succeed");
+        assert_eq!(entry, KERNEL_PIE_LOAD_BIAS + 0x1000 + 0x8c2f0);
     }
 
     #[test]

@@ -77,6 +77,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "driver-abi"
+version = "0.1.0"
+
+[[package]]
 name = "embedded-graphics"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -126,6 +130,7 @@ dependencies = [
  "buddy_system_allocator",
  "byteorder",
  "crc32fast",
+ "driver-abi",
  "embedded-graphics",
  "fatfs",
  "lazy_static",
@@ -133,6 +138,7 @@ dependencies = [
  "pic8259",
  "rand_chacha",
  "rand_core",
+ "rustos-keyboard-driver",
  "spin 0.10.0",
  "volatile 0.6.1",
  "x86_64",
@@ -177,7 +183,9 @@ version = "0.1.0"
 dependencies = [
  "bitflags",
  "boot-protocol",
+ "driver-abi",
  "fatfs",
+ "rustos-keyboard-driver",
  "spin 0.10.0",
  "x86_64",
 ]
@@ -217,6 +225,8 @@ dependencies = [
  "buddy_system_allocator",
  "embedded-graphics",
  "fatfs",
+ "rand_chacha",
+ "rand_core",
  "spin 0.10.0",
  "x86_64",
 ]
@@ -282,6 +292,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
 dependencies = [
  "bitflags",
+]
+
+[[package]]
+name = "rustos-keyboard-driver"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "driver-abi",
 ]
 
 [[package]]
@@ -373,6 +391,13 @@ name = "uguid"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c8352f8c05e47892e7eaf13b34abd76a7f4aeaf817b716e88789381927f199c"
+
+[[package]]
+name = "uiserver"
+version = "0.1.0"
+dependencies = [
+ "embedded-graphics",
+]
 
 [[package]]
 name = "unicode-ident"

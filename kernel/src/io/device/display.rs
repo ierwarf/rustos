@@ -1,7 +1,4 @@
-use alloc::vec;
 use core::convert::TryFrom;
-
-use x86_64::VirtAddr;
 
 use crate::io::gui;
 use crate::paging;
@@ -111,33 +108,38 @@ pub(crate) fn present_bgra8888(
     Ok(())
 }
 
-pub(crate) fn present_legacy_frame(
+pub(crate) fn present_bgra8888_from_user(
     address_space: &paging::ProcessAddressSpace,
     user_ptr: u64,
-    width: u64,
-    height: u64,
-    stride_bytes: u64,
-    pixel_format: u64,
-) -> Result<(), DeviceError> {
-    if pixel_format != PIXEL_FORMAT_BGRA8888 as u64 {
-        return Err(DeviceError::InvalidArgument);
+    width: usize,
+    height: usize,
+    stride_bytes: usize,
+) -> Result<(), DisplayError> {
+    let display = snapshot_info().ok_or(DisplayError::Unavailable)?;
+    if width != display.width as usize || height != display.height as usize {
+        return Err(DisplayError::InvalidDimensions);
     }
 
-    let width = usize::try_from(width).map_err(|_| DeviceError::InvalidArgument)?;
-    let height = usize::try_from(height).map_err(|_| DeviceError::InvalidArgument)?;
-    let stride_bytes = usize::try_from(stride_bytes).map_err(|_| DeviceError::InvalidArgument)?;
-    if width == 0 || height == 0 {
-        return Err(DeviceError::InvalidArgument);
+    let min_stride = width
+        .checked_mul(display.bytes_per_pixel as usize)
+        .ok_or(DisplayError::InvalidStride)?;
+    if stride_bytes < min_stride {
+        return Err(DisplayError::InvalidStride);
     }
 
-    let frame_len = stride_bytes
-        .checked_mul(height)
-        .ok_or(DeviceError::InvalidArgument)?;
-    address_space.validate_user_read_buffer(VirtAddr::new(user_ptr), frame_len)?;
+    let presented = gui::present_userspace_frame_from_user_bgra8888(
+        address_space,
+        user_ptr,
+        width,
+        height,
+        stride_bytes,
+    )
+    .map_err(|_| DisplayError::BufferTooSmall)?;
+    if !presented {
+        return Err(DisplayError::Unavailable);
+    }
 
-    let mut frame = vec![0_u8; frame_len];
-    address_space.copy_from_user(VirtAddr::new(user_ptr), &mut frame)?;
-    present_bgra8888(width, height, stride_bytes, &frame).map_err(map_display_error)
+    Ok(())
 }
 
 pub(crate) fn present_surface(
@@ -147,17 +149,12 @@ pub(crate) fn present_surface(
     let region = surface
         .mapped_region()
         .ok_or(DeviceError::InvalidArgument)?;
-    let frame_len =
-        usize::try_from(surface.frame_len()).map_err(|_| DeviceError::InvalidArgument)?;
-    let mut frame = vec![0_u8; frame_len];
-    address_space.validate_user_read_buffer(region.start, frame_len)?;
-    address_space.copy_from_user(region.start, &mut frame)?;
-
-    present_bgra8888(
+    present_bgra8888_from_user(
+        address_space,
+        region.start.as_u64(),
         surface.width() as usize,
         surface.height() as usize,
         surface.stride_bytes() as usize,
-        &frame,
     )
     .map_err(map_display_error)
 }

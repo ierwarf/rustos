@@ -12,6 +12,8 @@ pub(crate) use runtime::{debug, heap, panic_screen};
 
 #[path = "../../kernel/src/storage/fat.rs"]
 mod fat;
+#[path = "../../kernel/src/util/random.rs"]
+mod random;
 
 use boot_protocol::BootInfo;
 use core::fmt;
@@ -20,6 +22,7 @@ use fatfs::{Seek, SeekFrom};
 use x86_64::instructions::{hlt, interrupts};
 
 const KERNEL_PATH: &str = "kernel.elf";
+const MAX_KERNEL_PHYSICAL_KASLR_SLIDE: i64 = 0x20_0000;
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {
     panic_screen::reset();
@@ -61,6 +64,7 @@ pub extern "C" fn _start(boot_info_ptr: *const BootInfo) -> ! {
     }
     panic_screen::init(boot_info_ptr);
     fat::init_boot_info(boot_info_ptr);
+    random::init(boot_info_ptr);
     panic_screen::println_fmt(format_args!("prekernel: start"));
 
     let volume = match fat::BootVolume::open() {
@@ -85,8 +89,19 @@ pub extern "C" fn _start(boot_info_ptr: *const BootInfo) -> ! {
         kernel_size
     ));
 
-    let (entry_point, segment_count) =
-        match elf_loader::load_kernel_elf(&mut kernel_file, kernel_size) {
+    let kernel_physical_slide =
+        random::Random::new().randint(0, MAX_KERNEL_PHYSICAL_KASLR_SLIDE + 1) as usize;
+    debug::println!(
+        "prekernel: kernel physical slide(raw)={:#x}",
+        kernel_physical_slide
+    );
+    panic_screen::println_fmt(format_args!(
+        "prekernel: kernel physical slide(raw)={:#x}",
+        kernel_physical_slide
+    ));
+
+    let (entry_point, segment_count, load_bias) =
+        match elf_loader::load_kernel_elf(&mut kernel_file, kernel_size, kernel_physical_slide) {
             Ok(loaded) => loaded,
             Err(reason) => fatal(format_args!("failed to load {}: {}", KERNEL_PATH, reason)),
         };
@@ -95,15 +110,18 @@ pub extern "C" fn _start(boot_info_ptr: *const BootInfo) -> ! {
         fatal(format_args!("failed to close boot volume: {:?}", err));
     }
 
+    let applied_slide = load_bias.saturating_sub(0x0020_0000);
     debug::println!(
-        "prekernel: kernel ELF loaded, entry={:#x}, segments={}",
+        "prekernel: kernel ELF loaded, entry={:#x}, segments={}, load_bias={:#x}, applied_slide={:#x}",
         entry_point,
-        segment_count
+        segment_count,
+        load_bias,
+        applied_slide
     );
     debug::println!("prekernel: jumping to kernel");
     panic_screen::println_fmt(format_args!(
-        "prekernel: kernel ELF loaded, entry={:#x}, segments={}",
-        entry_point, segment_count
+        "prekernel: kernel ELF loaded, entry={:#x}, segments={}, load_bias={:#x}, applied_slide={:#x}",
+        entry_point, segment_count, load_bias, applied_slide
     ));
     panic_screen::println_fmt(format_args!("prekernel: jumping to kernel"));
 

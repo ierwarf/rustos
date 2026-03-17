@@ -14,19 +14,20 @@ pub fn init() {
     crate::gui::init_console();
 }
 
-pub fn start_worker() {
-    // Console rendering is serviced cooperatively from the kernel main loop.
-    // Spawning a dedicated console worker thread regressed stability on real hardware.
-}
-
 #[allow(dead_code)]
 pub fn write(bytes: &[u8]) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
     let written = with_console_state(|console| console.write_broadcast(bytes));
     while flush_pending_once() {}
     written
 }
 
 pub(crate) fn write_to_session(session: ConsoleSessionId, bytes: &[u8]) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
     let written = with_console_state(|console| console.write_to_session(session, bytes));
     while flush_pending_once() {}
     written
@@ -40,14 +41,12 @@ pub(crate) fn reset_session(session: ConsoleSessionId) {
     with_console_state(|console| console.reset_session(session));
 }
 
-#[allow(dead_code)]
-pub fn copy_recent_output(dest: &mut [u8]) -> usize {
-    copy_recent_output_for_session(ConsoleSessionId::PRIMARY, dest)
+pub(crate) fn snapshot_recent_output(session: ConsoleSessionId, dest: &mut [u8]) -> usize {
+    with_console_state(|console| console.copy_recent_output(session, dest))
 }
 
-#[allow(dead_code)]
-pub fn copy_recent_output_for_session(session: ConsoleSessionId, dest: &mut [u8]) -> usize {
-    with_console_state(|console| console.copy_recent_output(session, dest))
+pub(crate) fn snapshot_output_generations() -> [u64; MAX_CONSOLE_SESSIONS] {
+    with_console_state(|console| console.output_generations())
 }
 
 #[cfg(test)]
@@ -64,7 +63,8 @@ pub(crate) fn copy_recent_output_for_tests(dest: &mut [u8]) -> usize {
 
 fn flush_pending_once() -> bool {
     let mut chunk = [0_u8; FLUSH_CHUNK_CAPACITY];
-    let Some((session, len)) = CONSOLE.lock().drain_pending(&mut chunk) else {
+    let Some((session, len)) = with_console_state(|console| console.drain_pending(&mut chunk))
+    else {
         return false;
     };
 
@@ -150,6 +150,14 @@ impl ConsoleState {
         self.sessions[session.index()].copy_recent_output(dest)
     }
 
+    fn output_generations(&self) -> [u64; MAX_CONSOLE_SESSIONS] {
+        let mut generations = [0_u64; MAX_CONSOLE_SESSIONS];
+        for (index, session) in self.sessions.iter().enumerate() {
+            generations[index] = session.output_generation();
+        }
+        generations
+    }
+
     fn reset_session(&mut self, session: ConsoleSessionId) {
         self.sessions[session.index()].reset();
         if self.next_flush_session == session.index() {
@@ -161,6 +169,7 @@ impl ConsoleState {
 struct ConsoleSessionState {
     output: RingBuffer<u8, OUTPUT_BUFFER_CAPACITY>,
     pending: RingBuffer<u8, PENDING_BUFFER_CAPACITY>,
+    output_generation: u64,
 }
 
 impl ConsoleSessionState {
@@ -168,6 +177,7 @@ impl ConsoleSessionState {
         Self {
             output: RingBuffer::new(),
             pending: RingBuffer::new(),
+            output_generation: 0,
         }
     }
 
@@ -178,6 +188,7 @@ impl ConsoleSessionState {
 
         let written = self.output.extend_overwrite(bytes);
         self.pending.extend_overwrite(bytes);
+        self.output_generation = self.output_generation.wrapping_add(1);
         written
     }
 
@@ -189,8 +200,14 @@ impl ConsoleSessionState {
         self.output.copy_into(dest)
     }
 
+    fn output_generation(&self) -> u64 {
+        self.output_generation
+    }
+
     fn reset(&mut self) {
-        *self = Self::new();
+        self.output = RingBuffer::new();
+        self.pending = RingBuffer::new();
+        self.output_generation = self.output_generation.wrapping_add(1);
     }
 }
 

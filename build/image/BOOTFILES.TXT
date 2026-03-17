@@ -1,0 +1,11 @@
+lib64/ld-linux-x86-64.so.2
+lib/x86_64-linux-gnu/libc.so.6
+lib64/libc.so.6
+lib/x86_64-linux-gnu/libgcc_s.so.1
+lib64/libgcc_s.so.1
+etc/ld.so.cache
+system/apps/uiserver/uiserver.elf
+system/apps/uiserver/uiserver.exe
+system/apps/printfdemo/printfdemo.elf
+system/drivers/input/psmouse.ko
+etc/ld.so.preload

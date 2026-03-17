@@ -1,5 +1,4 @@
 use core::arch::global_asm;
-
 use x86_64::VirtAddr;
 use x86_64::registers::control::{Efer, EferFlags};
 use x86_64::registers::model_specific::{GsBase, KernelGsBase, LStar, SFMask, Star};
@@ -61,7 +60,6 @@ static mut SYSCALL_CPU_LOCAL: SyscallCpuLocal = SyscallCpuLocal {
 };
 static mut SYSCALL_FALLBACK_STACK: SyscallFallbackStack =
     SyscallFallbackStack([0; SYSCALL_STACK_SIZE]);
-
 global_asm!(
     r#"
     .global syscall_entry

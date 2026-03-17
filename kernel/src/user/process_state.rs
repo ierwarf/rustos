@@ -1,13 +1,16 @@
+use core::convert::TryFrom;
+
 use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
 
 use crate::paging::{self, AddressSpaceError, ProcessAddressSpace, UserRegion};
 use crate::user::handles::HandleTable;
-use crate::user::linux::LinuxTaskState;
+use crate::user::linux::{LinuxProcessState, LinuxSigAction, MAX_SIGNAL_NUMBER};
 
 const PAGE_SIZE: u64 = 4096;
 const DEFAULT_MAPPING_GAP: u64 = 16 * 1024 * 1024;
 const ADMIN_REQUEST_PATH_CAPACITY: usize = 96;
+const PROCESS_EXEC_PATH_CAPACITY: usize = 192;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PendingAdminRequestKind {
@@ -77,19 +80,23 @@ impl ProcessSecurityContext {
 
 pub struct UserProcessState {
     address_space: ProcessAddressSpace,
-    linux_state: Option<LinuxTaskState>,
+    linux_process_state: Option<LinuxProcessState>,
+    linux_sigactions: [LinuxSigAction; MAX_SIGNAL_NUMBER + 1],
     handles: HandleTable,
     security: ProcessSecurityContext,
     mapping_cursor: u64,
+    exec_path: [u8; PROCESS_EXEC_PATH_CAPACITY],
+    exec_path_len: usize,
 }
 
 impl UserProcessState {
     pub fn new(
         address_space: ProcessAddressSpace,
-        linux_state: Option<LinuxTaskState>,
+        linux_process_state: Option<LinuxProcessState>,
         logical_admin: bool,
+        exec_path: &str,
     ) -> Self {
-        let default_cursor = if let Some(state) = linux_state {
+        let default_cursor = if let Some(state) = linux_process_state {
             align_up(state.mmap_next)
         } else {
             let highest_region_end = address_space
@@ -103,11 +110,15 @@ impl UserProcessState {
 
         let mut state = Self {
             address_space,
-            linux_state,
+            linux_process_state,
+            linux_sigactions: [LinuxSigAction::default(); MAX_SIGNAL_NUMBER + 1],
             handles: HandleTable::new(),
             security: ProcessSecurityContext::new(logical_admin),
             mapping_cursor: default_cursor,
+            exec_path: [0; PROCESS_EXEC_PATH_CAPACITY],
+            exec_path_len: 0,
         };
+        state.set_exec_path(exec_path);
         state.sync_linux_mapping_cursor();
         state
     }
@@ -116,18 +127,22 @@ impl UserProcessState {
         &self.address_space
     }
 
+    pub fn address_space_root(&self) -> u64 {
+        self.address_space.root_phys().as_u64()
+    }
+
     pub fn address_space_mut(&mut self) -> &mut ProcessAddressSpace {
         &mut self.address_space
     }
 
-    pub fn linux_state(&self) -> Option<&LinuxTaskState> {
-        self.linux_state.as_ref()
+    pub fn linux_process_state(&self) -> Option<&LinuxProcessState> {
+        self.linux_process_state.as_ref()
     }
 
-    pub fn address_space_and_linux_state_mut(
+    pub fn address_space_and_linux_process_state_mut(
         &mut self,
-    ) -> (&mut ProcessAddressSpace, &mut Option<LinuxTaskState>) {
-        (&mut self.address_space, &mut self.linux_state)
+    ) -> (&mut ProcessAddressSpace, &mut Option<LinuxProcessState>) {
+        (&mut self.address_space, &mut self.linux_process_state)
     }
 
     pub fn handles(&self) -> &HandleTable {
@@ -138,8 +153,23 @@ impl UserProcessState {
         &mut self.handles
     }
 
+    pub fn linux_signal_action(&self, signal: u64) -> Option<LinuxSigAction> {
+        let index = usize::try_from(signal).ok()?;
+        self.linux_sigactions.get(index).copied()
+    }
+
+    pub fn set_linux_signal_action(&mut self, signal: u64, action: LinuxSigAction) -> Option<()> {
+        let index = usize::try_from(signal).ok()?;
+        *self.linux_sigactions.get_mut(index)? = action;
+        Some(())
+    }
+
     pub fn security(&self) -> ProcessSecurityContext {
         self.security
+    }
+
+    pub fn exec_path(&self) -> &str {
+        core::str::from_utf8(&self.exec_path[..self.exec_path_len]).unwrap_or("")
     }
 
     pub fn require_logical_admin_for_file_access(&mut self, path: &str) -> bool {
@@ -174,8 +204,8 @@ impl UserProcessState {
             .checked_add(span)
             .ok_or(AddressSpaceError::AddressOverflow)?;
 
-        if let Some(linux_state) = self.linux_state.as_ref() {
-            if end > linux_state.brk_limit() || start < linux_state.brk_mapped_end {
+        if let Some(linux_process_state) = self.linux_process_state.as_ref() {
+            if end > linux_process_state.brk_limit() || start < linux_process_state.brk_mapped_end {
                 return Err(AddressSpaceError::OutOfFrames);
             }
         }
@@ -188,9 +218,64 @@ impl UserProcessState {
     }
 
     fn sync_linux_mapping_cursor(&mut self) {
-        if let Some(linux_state) = self.linux_state.as_mut() {
-            linux_state.mmap_next = self.mapping_cursor;
+        if let Some(linux_process_state) = self.linux_process_state.as_mut() {
+            linux_process_state.mmap_next = self.mapping_cursor;
         }
+    }
+
+    fn set_exec_path(&mut self, exec_path: &str) {
+        self.exec_path.fill(0);
+        self.exec_path_len = 0;
+        for byte in exec_path.bytes() {
+            if self.exec_path_len == self.exec_path.len() {
+                break;
+            }
+            self.exec_path[self.exec_path_len] = match byte {
+                b' '..=b'~' => byte,
+                _ => b'?',
+            };
+            self.exec_path_len += 1;
+        }
+    }
+}
+
+pub struct SharedUserProcessState {
+    process_id: u64,
+    ref_count: usize,
+    state: UserProcessState,
+}
+
+impl SharedUserProcessState {
+    pub fn new(process_id: u64, state: UserProcessState) -> Self {
+        Self {
+            process_id,
+            ref_count: 1,
+            state,
+        }
+    }
+
+    pub fn process_id(&self) -> u64 {
+        self.process_id
+    }
+
+    pub fn state(&self) -> &UserProcessState {
+        &self.state
+    }
+
+    pub fn state_mut(&mut self) -> &mut UserProcessState {
+        &mut self.state
+    }
+
+    pub fn retain(&mut self) {
+        self.ref_count = self.ref_count.saturating_add(1);
+    }
+
+    pub fn release(&mut self) -> bool {
+        debug_assert!(self.ref_count != 0);
+        if self.ref_count != 0 {
+            self.ref_count -= 1;
+        }
+        self.ref_count == 0
     }
 }
 

@@ -10,3 +10,5 @@ embedded-graphics = { version = "0.8", default-features = false }
 fatfs = { git = "https://github.com/rafalh/rust-fatfs", default-features = false, features = ["alloc", "lfn"] }
 spin = "0.10.0"
 x86_64 = { version = "0.15.4", default-features = false, features = ["instructions"] }
+rand_chacha = { version = "0.10", default-features = false }
+rand_core = { version = "0.10", default-features = false }

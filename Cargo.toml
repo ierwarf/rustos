@@ -1,6 +1,15 @@
 [workspace]
 
-members = ["bootloader", "bootloader/boot-protocol", "kernel", "module-tests", "prekernel"]
+members = [
+    "bootloader",
+    "bootloader/boot-protocol",
+    "driver-abi",
+    "drivers/input/keyboard",
+    "kernel",
+    "module-tests",
+    "prekernel",
+    "uiserver",
+]
 resolver = "3"
 
 [profile.release]

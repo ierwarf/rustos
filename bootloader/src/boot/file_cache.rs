@@ -23,8 +23,14 @@ const MAX_BOOT_TOTAL_BYTES: usize = 512 * 1024 * 1024;
 const PRIORITY_BOOT_FILES: [PriorityBootFile; 4] = [
     PriorityBootFile::required("kernel.elf", cstr16!("\\kernel.elf")),
     PriorityBootFile::optional("background.jpg", cstr16!("\\background.jpg")),
-    PriorityBootFile::optional("UISERVER.EXE", cstr16!("\\UISERVER.EXE")),
-    PriorityBootFile::optional("UISERVER.ELF", cstr16!("\\UISERVER.ELF")),
+    PriorityBootFile::optional(
+        "system/apps/uiserver/uiserver.exe",
+        cstr16!("\\system\\apps\\uiserver\\uiserver.exe"),
+    ),
+    PriorityBootFile::optional(
+        "system/apps/uiserver/uiserver.elf",
+        cstr16!("\\system\\apps\\uiserver\\uiserver.elf"),
+    ),
 ];
 
 const BOOT_FILE_LIST_PATHS: [&uefi::CStr16; 4] = [

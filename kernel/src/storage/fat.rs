@@ -93,6 +93,35 @@ impl CachedBootVolume {
         }
         None
     }
+
+    fn metadata(&self, normalized_path: &str) -> Option<BootVolumeMetadata> {
+        if normalized_path.is_empty() {
+            return Some(BootVolumeMetadata {
+                kind: BootVolumeNodeKind::Directory,
+                len: 0,
+            });
+        }
+
+        let entries = boot_file_entries(&self.manifest)?;
+        let mut has_child = false;
+        for entry in entries {
+            let path = boot_file_path(entry)?;
+            if fat_paths_match(normalized_path, path) {
+                return Some(BootVolumeMetadata {
+                    kind: BootVolumeNodeKind::File,
+                    len: entry.data_len,
+                });
+            }
+            if fat_path_has_directory_prefix(path, normalized_path) {
+                has_child = true;
+            }
+        }
+
+        has_child.then_some(BootVolumeMetadata {
+            kind: BootVolumeNodeKind::Directory,
+            len: 0,
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -140,6 +169,15 @@ fn boot_file_data(entry: &BootFileEntry) -> Option<&'static [u8]> {
 
 fn fat_paths_match(lhs: &str, rhs: &str) -> bool {
     lhs.eq_ignore_ascii_case(rhs)
+}
+
+fn fat_path_has_directory_prefix(path: &str, directory: &str) -> bool {
+    if directory.is_empty() {
+        return true;
+    }
+    path.len() > directory.len()
+        && path[..directory.len()].eq_ignore_ascii_case(directory)
+        && path.as_bytes()[directory.len()] == b'/'
 }
 
 /// FAT adapter target: provide raw sector read/write for your storage backend.
@@ -1141,6 +1179,18 @@ pub(crate) struct BootVolume {
     fs: Option<BootVolumeFs>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BootVolumeNodeKind {
+    File,
+    Directory,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BootVolumeMetadata {
+    pub kind: BootVolumeNodeKind,
+    pub len: u64,
+}
+
 impl BootVolume {
     pub(crate) fn open() -> core::result::Result<Self, fatfs::Error<DiskIoError>> {
         let cached = CachedBootVolume::from_boot_info()
@@ -1175,6 +1225,48 @@ impl BootVolume {
         let root = fs.root_dir();
         root.open_file(normalized_path.as_str())
             .map(BootVolumeFile::Fat)
+    }
+
+    pub(crate) fn metadata(
+        &self,
+        path: &str,
+    ) -> core::result::Result<BootVolumeMetadata, fatfs::Error<DiskIoError>> {
+        let normalized_path = normalize_fat_path(path);
+        if let Some(cached) = self.cached {
+            return cached
+                .metadata(normalized_path.as_str())
+                .ok_or(fatfs::Error::NotFound);
+        }
+
+        let fs = self
+            .fs
+            .as_ref()
+            .ok_or(fatfs::Error::Io(DiskIoError::NotPresent))?;
+        let root = fs.root_dir();
+
+        if normalized_path.is_empty() {
+            return Ok(BootVolumeMetadata {
+                kind: BootVolumeNodeKind::Directory,
+                len: 0,
+            });
+        }
+
+        if let Ok(mut file) = root.open_file(normalized_path.as_str()) {
+            let len = file.seek(SeekFrom::End(0))?;
+            return Ok(BootVolumeMetadata {
+                kind: BootVolumeNodeKind::File,
+                len,
+            });
+        }
+
+        if root.open_dir(normalized_path.as_str()).is_ok() {
+            return Ok(BootVolumeMetadata {
+                kind: BootVolumeNodeKind::Directory,
+                len: 0,
+            });
+        }
+
+        Err(fatfs::Error::NotFound)
     }
 
     pub(crate) fn close(self) -> core::result::Result<(), fatfs::Error<DiskIoError>> {

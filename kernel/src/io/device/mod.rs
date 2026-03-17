@@ -1,3 +1,4 @@
+pub(crate) mod console;
 pub(crate) mod display;
 pub(crate) mod input;
 pub(crate) mod runtime;
@@ -8,11 +9,12 @@ use core::slice;
 use x86_64::VirtAddr;
 
 use crate::paging;
-use crate::user::abi::{device as device_abi, runtime as runtime_abi};
+use crate::user::abi::{console as console_abi, device as device_abi, runtime as runtime_abi};
 use crate::user::process_state::UserProcessState;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DeviceId {
+    Console,
     Display,
     Input,
     Runtime,
@@ -21,18 +23,11 @@ pub(crate) enum DeviceId {
 impl DeviceId {
     pub(crate) const fn path(self) -> &'static str {
         match self {
+            Self::Console => console_abi::CONSOLE_PATH,
             Self::Display => device_abi::DISPLAY_PATH,
             Self::Input => device_abi::INPUT_PATH,
             Self::Runtime => runtime_abi::RUNTIME_PATH,
         }
-    }
-
-    pub(crate) const fn supports_read(self) -> bool {
-        matches!(self, Self::Input)
-    }
-
-    pub(crate) const fn supports_ioctl(self) -> bool {
-        matches!(self, Self::Display | Self::Runtime)
     }
 }
 
@@ -79,7 +74,11 @@ impl From<paging::AddressSpaceError> for DeviceError {
     }
 }
 
-const DEVICE_DESCRIPTORS: [DeviceDescriptor; 3] = [
+const DEVICE_DESCRIPTORS: [DeviceDescriptor; 4] = [
+    DeviceDescriptor {
+        id: DeviceId::Console,
+        path: DeviceId::Console.path(),
+    },
     DeviceDescriptor {
         id: DeviceId::Display,
         path: DeviceId::Display.path(),
@@ -115,7 +114,7 @@ pub(crate) fn read_to_user(
 ) -> Result<usize, DeviceError> {
     match handle.device_id() {
         DeviceId::Input => input::read_to_user(process_state, user_ptr, user_len),
-        DeviceId::Display | DeviceId::Runtime => Err(DeviceError::Unsupported),
+        DeviceId::Console | DeviceId::Display | DeviceId::Runtime => Err(DeviceError::Unsupported),
     }
 }
 
@@ -126,32 +125,11 @@ pub(crate) fn ioctl_from_user(
     arg: u64,
 ) -> Result<u64, DeviceError> {
     match handle.device_id() {
+        DeviceId::Console => console::ioctl(process_state, request, arg),
         DeviceId::Display => display::ioctl(process_state, request, arg),
         DeviceId::Runtime => runtime::ioctl(process_state, request, arg),
         DeviceId::Input => Err(DeviceError::Unsupported),
     }
-}
-
-pub(crate) fn display_info() -> Result<device_abi::DisplayInfo, DeviceError> {
-    display::query_info()
-}
-
-pub(crate) fn present_frame_from_user(
-    address_space: &paging::ProcessAddressSpace,
-    user_ptr: u64,
-    width: u64,
-    height: u64,
-    stride_bytes: u64,
-    pixel_format: u64,
-) -> Result<(), DeviceError> {
-    display::present_legacy_frame(
-        address_space,
-        user_ptr,
-        width,
-        height,
-        stride_bytes,
-        pixel_format,
-    )
 }
 
 pub(super) fn read_user_struct<T: Copy>(
@@ -200,6 +178,7 @@ fn normalize_device_path(path: &str) -> Result<&str, DeviceLookupError> {
     }
 
     Ok(match name {
+        "console0" => DeviceId::Console.path(),
         "display0" => DeviceId::Display.path(),
         "input0" => DeviceId::Input.path(),
         "runtime0" => DeviceId::Runtime.path(),
@@ -213,6 +192,7 @@ mod tests {
 
     #[test]
     fn lookup_accepts_registered_device_paths() {
+        assert_eq!(lookup("/dev/console0").unwrap().id, DeviceId::Console);
         assert_eq!(lookup("/dev/display0").unwrap().id, DeviceId::Display);
         assert_eq!(lookup("/dev/input0").unwrap().id, DeviceId::Input);
         assert_eq!(lookup("/dev/runtime0").unwrap().id, DeviceId::Runtime);

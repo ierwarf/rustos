@@ -15,7 +15,10 @@ mod windows;
 const PAGE_SIZE: u64 = 4096;
 const MAX_LOAD_SEGMENTS: usize = 32;
 const USER_STACK_GUARD_PAGES: usize = 1;
-const USER_STACK_PAGES: usize = 8;
+const USER_STACK_RESERVE_PAGES: usize = 256;
+// Rust std userspace binaries can reserve tens of KiB in a single frame,
+// especially around Vec/array-heavy state synchronization paths.
+const USER_STACK_INITIAL_COMMIT_PAGES: usize = 64;
 const USER_STACK_TOP_EXCLUSIVE: u64 = paging::USER_SPACE_END_EXCLUSIVE;
 
 #[derive(Debug)]
@@ -349,33 +352,46 @@ pub fn spawn_process_with_launch(
         loaded.entry.as_u64()
     );
 
-    let stack_span_pages = USER_STACK_GUARD_PAGES + USER_STACK_PAGES;
-    let guard_start = VirtAddr::new(USER_STACK_TOP_EXCLUSIVE - stack_span_pages as u64 * PAGE_SIZE);
+    debug_assert!(USER_STACK_RESERVE_PAGES > USER_STACK_INITIAL_COMMIT_PAGES);
+    debug_assert!(
+        USER_STACK_RESERVE_PAGES - USER_STACK_INITIAL_COMMIT_PAGES >= USER_STACK_GUARD_PAGES
+    );
+
+    let reserve_start =
+        VirtAddr::new(USER_STACK_TOP_EXCLUSIVE - USER_STACK_RESERVE_PAGES as u64 * PAGE_SIZE);
     ensure_unmapped_user_pages(
         &loaded.address_space,
-        guard_start,
-        USER_STACK_GUARD_PAGES,
-        "user stack guard page address overflow",
-        "user stack guard page overlaps an existing mapping",
+        reserve_start,
+        USER_STACK_RESERVE_PAGES,
+        "user stack reserve address overflow",
+        "user stack reserve overlaps an existing mapping",
     )?;
 
-    let stack_start =
-        VirtAddr::new(guard_start.as_u64() + USER_STACK_GUARD_PAGES as u64 * PAGE_SIZE);
+    let stack_state = multitask::UserStackState::new(
+        reserve_start.as_u64(),
+        USER_STACK_TOP_EXCLUSIVE,
+        USER_STACK_TOP_EXCLUSIVE - USER_STACK_INITIAL_COMMIT_PAGES as u64 * PAGE_SIZE,
+    );
+    let stack_start = VirtAddr::new(stack_state.committed_start);
     let stack_region = loaded.address_space.map_zeroed_user_pages_at(
         stack_start,
-        USER_STACK_PAGES,
+        USER_STACK_INITIAL_COMMIT_PAGES,
         PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE,
     )?;
     debug::println!(
-        "process spawn: user stack mapped at {:#x}",
-        stack_start.as_u64()
+        "process spawn: user stack reserve=[{:#x}, {:#x}) initial_commit=[{:#x}, {:#x})",
+        stack_state.reserve_start,
+        stack_state.reserve_end,
+        stack_start.as_u64(),
+        stack_region.end().as_u64(),
     );
     let bootstrap = build_process_bootstrap(
         loaded.runtime,
         loaded.abi,
         loaded.entry,
-        &loaded.address_space,
+        &mut loaded.address_space,
         stack_region.end(),
+        Some(stack_state),
         launch,
     )?;
     debug::println!(
@@ -397,17 +413,22 @@ fn build_process_bootstrap(
     runtime: LoadedProcessRuntime,
     abi: UserAbi,
     entry: VirtAddr,
-    address_space: &ProcessAddressSpace,
+    address_space: &mut ProcessAddressSpace,
     stack_end: VirtAddr,
+    user_stack: Option<multitask::UserStackState>,
     launch: ProcessLaunchOptions<'_>,
 ) -> Result<multitask::UserTaskBootstrap, ProcessLoadError> {
-    let (stack_pointer, linux_state) = match (abi, runtime) {
-        (UserAbi::Linux, LoadedProcessRuntime::Linux(image)) => (
-            linux::initialize_linux_user_stack(address_space, stack_end, image, launch.linux)?,
-            Some(image.initial_task_state()),
-        ),
+    let (stack_pointer, mut linux_process_state, linux_thread_state) = match (abi, runtime) {
+        (UserAbi::Linux, LoadedProcessRuntime::Linux(image)) => {
+            linux::initialize_linux_initial_tls(address_space, image)?;
+            (
+                linux::initialize_linux_user_stack(address_space, stack_end, image, launch.linux)?,
+                Some(image.initial_process_state()),
+                Some(image.initial_thread_state()),
+            )
+        }
         (UserAbi::Windows, LoadedProcessRuntime::Windows) => {
-            (initial_user_stack_top(stack_end)?, None)
+            (initial_user_stack_top(stack_end)?, None, None)
         }
         _ => {
             return Err(ProcessLoadError::InvalidElf(
@@ -418,9 +439,19 @@ fn build_process_bootstrap(
 
     let mut bootstrap = multitask::UserTaskBootstrap::new(abi, entry, stack_pointer);
     bootstrap.registers = launch.registers.into_task_registers();
-    bootstrap.linux_state = linux_state;
+    bootstrap.user_stack = user_stack;
+    if let (Some(stack), Some(state)) = (user_stack, linux_process_state.as_mut()) {
+        state
+            .reserve_range(stack.reserve_start, stack.committed_start)
+            .map_err(|_| {
+                ProcessLoadError::InvalidElf("failed to reserve Linux user stack range")
+            })?;
+    }
+    bootstrap.linux_process_state = linux_process_state;
+    bootstrap.linux_thread_state = linux_thread_state;
     bootstrap.console_session = launch.console_session;
     bootstrap.logical_admin = launch.logical_admin;
+    bootstrap.set_exec_path(launch.linux.exec_path);
     Ok(bootstrap)
 }
 

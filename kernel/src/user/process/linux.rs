@@ -1,5 +1,6 @@
 use alloc::vec;
 use alloc::vec::Vec;
+use core::cmp;
 use core::convert::TryFrom;
 
 use x86_64::VirtAddr;
@@ -13,7 +14,9 @@ use crate::debug;
 use crate::fat;
 use crate::paging::{self, ProcessAddressSpace};
 use crate::user::abi::UserAbi;
-use crate::user::linux::{self as linux_abi, LinuxProcessImageInfo, LinuxProcessLaunch};
+use crate::user::linux::{
+    self as linux_abi, LinuxInitialTlsInfo, LinuxProcessImageInfo, LinuxProcessLaunch,
+};
 
 use super::{
     LoadedProcessImage, LoadedProcessRuntime, MAX_LOAD_SEGMENTS, PAGE_SIZE, ProcessLoadError,
@@ -26,6 +29,9 @@ const ELF_RELOC_X86_64_RELATIVE: u32 = 8;
 const ELF_RELOC_X86_64_IRELATIVE: u32 = 37;
 const LINUX_STACK_RANDOM_BYTES: usize = 16;
 const LINUX_STACK_CLOCK_TICKS: u64 = 100;
+const INITIAL_TLS_TCB_ALIGN: u64 = 16;
+const INITIAL_TLS_TCB_SIZE: u64 = 64;
+const INITIAL_TLS_DTV_SIZE: u64 = 32;
 
 #[derive(Clone, Copy)]
 enum ElfImageType {
@@ -62,6 +68,14 @@ struct MappedElfImage {
     entry: VirtAddr,
     load_bias: u64,
     max_loaded_end: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ElfTlsTemplateInfo {
+    template_addr: u64,
+    template_size: u64,
+    mem_size: u64,
+    align: u64,
 }
 
 pub(super) fn load_elf(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadError> {
@@ -115,6 +129,7 @@ pub(super) fn load_elf(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadEr
 
     let linux_image = build_linux_process_image(
         &elf,
+        image,
         main_image.load_bias,
         max_loaded_end,
         main_image.entry.as_u64(),
@@ -429,15 +444,32 @@ fn validated_segment_bounds(
 
 fn build_linux_process_image(
     elf: &ElfFile<'_>,
+    image: &[u8],
     load_bias: u64,
     max_loaded_end: u64,
     entry: u64,
     interpreter_base: u64,
 ) -> Result<LinuxProcessImageInfo, ProcessLoadError> {
     let program_headers = program_header_table_addr(elf, load_bias)?;
-    let brk_start = align_up(max_loaded_end, PAGE_SIZE).ok_or(ProcessLoadError::InvalidElf(
-        "initial brk calculation overflow",
-    ))?;
+    // Dynamic ELF relies on the userspace interpreter to build the initial thread
+    // pointer and module TLS layout. For direct ELF entry we provide a minimal
+    // kernel-side static TLS/TCB so runtimes have a valid initial FS base.
+    let initial_tls = if interpreter_base == 0 {
+        elf_initial_tls_info(elf, image, load_bias, max_loaded_end)?
+    } else {
+        None
+    };
+    let brk_start = if let Some(tls) = initial_tls {
+        tls.mapping_base
+            .checked_add(tls.mapping_size)
+            .ok_or(ProcessLoadError::InvalidElf(
+                "initial brk calculation overflow",
+            ))?
+    } else {
+        align_up(max_loaded_end, PAGE_SIZE).ok_or(ProcessLoadError::InvalidElf(
+            "initial brk calculation overflow",
+        ))?
+    };
 
     Ok(LinuxProcessImageInfo {
         entry,
@@ -446,7 +478,133 @@ fn build_linux_process_image(
         program_header_entry_size: elf.header.pt2.ph_entry_size() as u64,
         program_header_count: elf.header.pt2.ph_count() as u64,
         brk_start,
+        initial_tls,
     })
+}
+
+fn elf_initial_tls_info(
+    elf: &ElfFile<'_>,
+    image: &[u8],
+    load_bias: u64,
+    max_loaded_end: u64,
+) -> Result<Option<LinuxInitialTlsInfo>, ProcessLoadError> {
+    let Some(template) = elf_tls_template_info(elf, image, load_bias)? else {
+        return Ok(None);
+    };
+
+    elf_initial_tls_info_from_template(template, max_loaded_end)
+        .map(Some)
+        .ok_or(ProcessLoadError::InvalidElf(
+            "PT_TLS layout calculation overflow",
+        ))
+}
+
+fn elf_initial_tls_info_from_template(
+    template: ElfTlsTemplateInfo,
+    max_loaded_end: u64,
+) -> Option<LinuxInitialTlsInfo> {
+    let mapping_base = align_up(max_loaded_end, PAGE_SIZE)?;
+    let tls_align = template.align.max(1);
+    let tls_block_size = align_up(template.mem_size, tls_align)?;
+    let thread_pointer_align = cmp::max(tls_align, INITIAL_TLS_TCB_ALIGN);
+    let tls_end_hint = mapping_base.checked_add(tls_block_size)?;
+    let thread_pointer = align_up(tls_end_hint, thread_pointer_align)?;
+    let tls_block_base = thread_pointer.checked_sub(tls_block_size)?;
+    let tcb_base = thread_pointer;
+    let dtv_base = tcb_base.checked_add(INITIAL_TLS_TCB_SIZE)?;
+    let mapping_end_hint = dtv_base.checked_add(INITIAL_TLS_DTV_SIZE)?;
+    let mapping_end = align_up(mapping_end_hint, PAGE_SIZE)?;
+    if mapping_end > paging::USER_SPACE_END_EXCLUSIVE {
+        return None;
+    }
+
+    Some(LinuxInitialTlsInfo {
+        template_addr: template.template_addr,
+        template_size: template.template_size,
+        mem_size: template.mem_size,
+        align: tls_align,
+        mapping_base,
+        mapping_size: mapping_end - mapping_base,
+        tls_block_base,
+        thread_pointer,
+        tcb_base,
+        dtv_base,
+    })
+}
+
+fn elf_tls_template_info(
+    elf: &ElfFile<'_>,
+    image: &[u8],
+    load_bias: u64,
+) -> Result<Option<ElfTlsTemplateInfo>, ProcessLoadError> {
+    let mut tls_template = None;
+
+    for ph in elf.program_iter() {
+        let ph_type = ph.get_type().map_err(ProcessLoadError::InvalidElf)?;
+        if ph_type != ProgramType::Tls {
+            continue;
+        }
+        if tls_template.is_some() {
+            return Err(ProcessLoadError::InvalidElf(
+                "multiple PT_TLS segments are not supported",
+            ));
+        }
+
+        let template_size = ph.file_size();
+        let mem_size = ph.mem_size();
+        if mem_size == 0 {
+            continue;
+        }
+        if template_size > mem_size {
+            return Err(ProcessLoadError::InvalidElf(
+                "PT_TLS file size exceeds memory size",
+            ));
+        }
+
+        let align = ph.align().max(1);
+        if !align.is_power_of_two() {
+            return Err(ProcessLoadError::InvalidElf(
+                "PT_TLS alignment must be zero, one, or a power of two",
+            ));
+        }
+
+        let template_addr =
+            ph.virtual_addr()
+                .checked_add(load_bias)
+                .ok_or(ProcessLoadError::InvalidElf(
+                    "PT_TLS template address overflow",
+                ))?;
+        let template_end =
+            template_addr
+                .checked_add(template_size)
+                .ok_or(ProcessLoadError::InvalidElf(
+                    "PT_TLS template bounds overflow",
+                ))?;
+        if template_end > paging::USER_SPACE_END_EXCLUSIVE {
+            return Err(ProcessLoadError::InvalidElf(
+                "PT_TLS template is outside the supported user range",
+            ));
+        }
+        if template_size != 0 {
+            let _ = elf_file_slice_from_virtual_address(
+                image,
+                elf,
+                ph.virtual_addr(),
+                usize::try_from(template_size).map_err(|_| {
+                    ProcessLoadError::InvalidElf("PT_TLS template size is out of range")
+                })?,
+            )?;
+        }
+
+        tls_template = Some(ElfTlsTemplateInfo {
+            template_addr,
+            template_size,
+            mem_size,
+            align,
+        });
+    }
+
+    Ok(tls_template)
 }
 
 fn program_header_table_addr(elf: &ElfFile<'_>, load_bias: u64) -> Result<u64, ProcessLoadError> {
@@ -727,6 +885,41 @@ fn segment_page_flags(ph: &ProgramHeader<'_>) -> PageTableFlags {
     flags
 }
 
+pub(super) fn initialize_linux_initial_tls(
+    address_space: &mut ProcessAddressSpace,
+    image: LinuxProcessImageInfo,
+) -> Result<(), ProcessLoadError> {
+    let Some(tls) = image.initial_tls else {
+        return Ok(());
+    };
+
+    address_space.map_zeroed_user_bytes_at(
+        VirtAddr::new(tls.mapping_base),
+        usize::try_from(tls.mapping_size)
+            .map_err(|_| ProcessLoadError::InvalidElf("PT_TLS mapping size is out of range"))?,
+        PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE,
+    )?;
+
+    if tls.template_size != 0 {
+        let mut template = vec![
+            0_u8;
+            usize::try_from(tls.template_size).map_err(|_| {
+                ProcessLoadError::InvalidElf("PT_TLS template size is out of range")
+            })?
+        ];
+        address_space.copy_from_user(VirtAddr::new(tls.template_addr), &mut template)?;
+        address_space.initialize_user_bytes(VirtAddr::new(tls.tls_block_base), &template)?;
+    }
+
+    let mut tcb_head = [0_u8; INITIAL_TLS_TCB_SIZE as usize];
+    tcb_head[0..8].copy_from_slice(&tls.thread_pointer.to_le_bytes());
+    tcb_head[8..16].copy_from_slice(&tls.dtv_base.to_le_bytes());
+    tcb_head[16..24].copy_from_slice(&tls.thread_pointer.to_le_bytes());
+    address_space.initialize_user_bytes(VirtAddr::new(tls.tcb_base), &tcb_head)?;
+
+    Ok(())
+}
+
 pub(super) fn initialize_linux_user_stack(
     address_space: &ProcessAddressSpace,
     stack_end: VirtAddr,
@@ -910,5 +1103,33 @@ fn make_interpreter_load_error(
         path: stored_path,
         path_len,
         error,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ELF_DYN_LOAD_BASE, ElfTlsTemplateInfo, INITIAL_TLS_TCB_ALIGN, INITIAL_TLS_TCB_SIZE,
+        elf_initial_tls_info_from_template,
+    };
+    use crate::paging::USER_SPACE_BASE;
+
+    #[test]
+    fn initial_tls_layout_places_tls_before_thread_pointer() {
+        let template = ElfTlsTemplateInfo {
+            template_addr: ELF_DYN_LOAD_BASE + 0x2000,
+            template_size: 24,
+            mem_size: 48,
+            align: 32,
+        };
+        let tls = elf_initial_tls_info_from_template(template, USER_SPACE_BASE + 0x12345)
+            .expect("tls layout");
+        assert_eq!(tls.thread_pointer, tls.tcb_base);
+        assert_eq!(tls.thread_pointer & (INITIAL_TLS_TCB_ALIGN - 1), 0);
+        assert_eq!(tls.tls_block_base & (template.align - 1), 0);
+        assert!(tls.tls_block_base >= tls.mapping_base);
+        assert_eq!(tls.thread_pointer - tls.tls_block_base, 64);
+        assert_eq!(tls.dtv_base, tls.tcb_base + INITIAL_TLS_TCB_SIZE);
+        assert_eq!(tls.mapping_size % 4096, 0);
     }
 }

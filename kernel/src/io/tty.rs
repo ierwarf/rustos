@@ -5,6 +5,7 @@ use crate::console;
 use crate::keyboard::{KeyAction, KeyCode, KeyboardEvent};
 use crate::ring::RingBuffer;
 use crate::session::{ConsoleSessionId, MAX_CONSOLE_SESSIONS};
+use crate::user::linux as linux_abi;
 
 const INPUT_BUFFER_CAPACITY: usize = 1024;
 const EDIT_BUFFER_CAPACITY: usize = 256;
@@ -31,6 +32,30 @@ pub fn read_input_for_session(session: ConsoleSessionId, dest: &mut [u8]) -> usi
     interrupts::without_interrupts(|| TTY.lock().session_mut(session).read_input(dest))
 }
 
+pub fn has_pending_input_for_session(session: ConsoleSessionId) -> bool {
+    interrupts::without_interrupts(|| TTY.lock().session_mut(session).has_pending_input())
+}
+
+pub fn pending_input_len_for_session(session: ConsoleSessionId) -> usize {
+    interrupts::without_interrupts(|| TTY.lock().session_mut(session).pending_input_len())
+}
+
+pub fn termios_for_session(session: ConsoleSessionId) -> linux_abi::LinuxTermios {
+    interrupts::without_interrupts(|| TTY.lock().session_mut(session).termios())
+}
+
+pub fn set_termios_for_session(
+    session: ConsoleSessionId,
+    termios: linux_abi::LinuxTermios,
+    flush_input: bool,
+) {
+    interrupts::without_interrupts(|| {
+        TTY.lock()
+            .session_mut(session)
+            .set_termios(termios, flush_input)
+    });
+}
+
 pub fn read_input_blocking(dest: &mut [u8]) -> usize {
     read_input_blocking_for_session(ConsoleSessionId::PRIMARY, dest)
 }
@@ -40,14 +65,37 @@ pub fn read_input_blocking_for_session(session: ConsoleSessionId, dest: &mut [u8
         return 0;
     }
 
+    let current_task_id = crate::multitask::current_user_id();
+
     loop {
-        let read =
-            interrupts::without_interrupts(|| TTY.lock().session_mut(session).read_input(dest));
-        if read != 0 {
-            return read;
+        enum ReadDisposition {
+            Ready(usize),
+            Blocked,
         }
 
-        interrupts::enable_and_hlt();
+        let disposition = interrupts::without_interrupts(|| {
+            let mut tty = TTY.lock();
+            let session_state = tty.session_mut(session);
+            let read = session_state.read_input(dest);
+            if read != 0 {
+                return ReadDisposition::Ready(read);
+            }
+
+            let Some(task_id) = current_task_id else {
+                return ReadDisposition::Ready(0);
+            };
+            if !crate::multitask::block_current_user_task() {
+                return ReadDisposition::Ready(0);
+            }
+
+            session_state.input_waiter = Some(task_id);
+            ReadDisposition::Blocked
+        });
+
+        match disposition {
+            ReadDisposition::Ready(read) => return read,
+            ReadDisposition::Blocked => crate::multitask::yield_now(),
+        }
     }
 }
 
@@ -84,6 +132,8 @@ struct TtySessionState {
     edit_buffer: [u8; EDIT_BUFFER_CAPACITY],
     edit_len: usize,
     edit_cursor: usize,
+    termios: linux_abi::LinuxTermios,
+    input_waiter: Option<u64>,
 }
 
 impl TtySessionState {
@@ -93,6 +143,8 @@ impl TtySessionState {
             edit_buffer: [0; EDIT_BUFFER_CAPACITY],
             edit_len: 0,
             edit_cursor: 0,
+            termios: linux_abi::LinuxTermios::default_console(),
+            input_waiter: None,
         }
     }
 
@@ -101,6 +153,14 @@ impl TtySessionState {
             return;
         }
 
+        if self.termios.is_canonical() {
+            self.on_canonical_key_event(session, event);
+        } else {
+            self.on_noncanonical_key_event(session, event);
+        }
+    }
+
+    fn on_canonical_key_event(&mut self, session: ConsoleSessionId, event: KeyboardEvent) {
         match event.code {
             KeyCode::ArrowLeft => self.move_cursor_left(session),
             KeyCode::ArrowRight => self.move_cursor_right(session),
@@ -121,8 +181,44 @@ impl TtySessionState {
         }
     }
 
+    fn on_noncanonical_key_event(&mut self, session: ConsoleSessionId, event: KeyboardEvent) {
+        let Some((bytes, len)) = self.noncanonical_input_bytes(event) else {
+            return;
+        };
+        let bytes = &bytes[..len];
+        if !self.push_input_bytes_exact(bytes) {
+            return;
+        }
+
+        if self.termios.echo_enabled() {
+            self.echo_noncanonical_input(session, bytes);
+        }
+    }
+
     fn read_input(&mut self, dest: &mut [u8]) -> usize {
         self.input.pop_into(dest)
+    }
+
+    fn has_pending_input(&self) -> bool {
+        self.input.len() != 0
+    }
+
+    fn pending_input_len(&self) -> usize {
+        self.input.len()
+    }
+
+    fn termios(&self) -> linux_abi::LinuxTermios {
+        self.termios
+    }
+
+    fn set_termios(&mut self, termios: linux_abi::LinuxTermios, flush_input: bool) {
+        if flush_input {
+            self.clear_pending_input();
+        } else if self.termios.is_canonical() && !termios.is_canonical() {
+            self.release_edit_buffer_to_input();
+        }
+
+        self.termios = termios;
     }
 
     fn write(&mut self, session: ConsoleSessionId, bytes: &[u8]) -> usize {
@@ -130,30 +226,34 @@ impl TtySessionState {
             return 0;
         }
 
-        let redraw_edit_buffer = self.edit_len != 0;
+        let redraw_edit_buffer = self.should_redraw_edit_buffer();
         if redraw_edit_buffer {
             console::write_from_tty(session, b"\r\n");
         }
 
-        let mut chunk_start = 0;
-        let mut previous = None;
+        if self.termios.maps_output_newline_to_crlf() {
+            let mut chunk_start = 0;
+            let mut previous = None;
 
-        for (index, &byte) in bytes.iter().enumerate() {
-            if byte != b'\n' || previous == Some(b'\r') {
+            for (index, &byte) in bytes.iter().enumerate() {
+                if byte != b'\n' || previous == Some(b'\r') {
+                    previous = Some(byte);
+                    continue;
+                }
+
+                if chunk_start < index {
+                    console::write_from_tty(session, &bytes[chunk_start..index]);
+                }
+                console::write_from_tty(session, b"\r\n");
+                chunk_start = index + 1;
                 previous = Some(byte);
-                continue;
             }
 
-            if chunk_start < index {
-                console::write_from_tty(session, &bytes[chunk_start..index]);
+            if chunk_start < bytes.len() {
+                console::write_from_tty(session, &bytes[chunk_start..]);
             }
-            console::write_from_tty(session, b"\r\n");
-            chunk_start = index + 1;
-            previous = Some(byte);
-        }
-
-        if chunk_start < bytes.len() {
-            console::write_from_tty(session, &bytes[chunk_start..]);
+        } else {
+            console::write_from_tty(session, bytes);
         }
 
         if redraw_edit_buffer {
@@ -175,7 +275,9 @@ impl TtySessionState {
             self.edit_buffer[self.edit_len] = byte;
             self.edit_len += 1;
             self.edit_cursor += 1;
-            console::write_from_tty(session, &[byte]);
+            if self.should_echo_canonical_input() {
+                console::write_from_tty(session, &[byte]);
+            }
             return;
         }
 
@@ -183,9 +285,11 @@ impl TtySessionState {
             .copy_within(self.edit_cursor..self.edit_len, self.edit_cursor + 1);
         self.edit_buffer[self.edit_cursor] = byte;
         self.edit_len += 1;
-        console::write_from_tty(session, &self.edit_buffer[self.edit_cursor..self.edit_len]);
         self.edit_cursor += 1;
-        self.move_visual_cursor_left(session, self.edit_len - self.edit_cursor);
+        if self.should_echo_canonical_input() {
+            console::write_from_tty(session, &self.edit_buffer[self.edit_cursor - 1..self.edit_len]);
+            self.move_visual_cursor_left(session, self.edit_len - self.edit_cursor);
+        }
     }
 
     fn handle_backspace(&mut self, session: ConsoleSessionId) {
@@ -196,7 +300,9 @@ impl TtySessionState {
         if self.edit_cursor == self.edit_len {
             self.edit_len -= 1;
             self.edit_cursor -= 1;
-            console::write_from_tty(session, b"\x08 \x08");
+            if self.should_echo_canonical_input() {
+                console::write_from_tty(session, b"\x08 \x08");
+            }
             return;
         }
 
@@ -205,10 +311,12 @@ impl TtySessionState {
             .copy_within(self.edit_cursor..self.edit_len, delete_at);
         self.edit_len -= 1;
         self.edit_cursor -= 1;
-        self.move_visual_cursor_left(session, 1);
-        console::write_from_tty(session, &self.edit_buffer[delete_at..self.edit_len]);
-        console::write_from_tty(session, b" ");
-        self.move_visual_cursor_left(session, self.edit_len - delete_at + 1);
+        if self.should_echo_canonical_input() {
+            self.move_visual_cursor_left(session, 1);
+            console::write_from_tty(session, &self.edit_buffer[delete_at..self.edit_len]);
+            console::write_from_tty(session, b" ");
+            self.move_visual_cursor_left(session, self.edit_len - delete_at + 1);
+        }
     }
 
     fn move_cursor_left(&mut self, session: ConsoleSessionId) {
@@ -217,7 +325,9 @@ impl TtySessionState {
         }
 
         self.edit_cursor -= 1;
-        self.move_visual_cursor_left(session, 1);
+        if self.should_echo_canonical_input() {
+            self.move_visual_cursor_left(session, 1);
+        }
     }
 
     fn move_cursor_right(&mut self, session: ConsoleSessionId) {
@@ -226,7 +336,9 @@ impl TtySessionState {
         }
 
         self.edit_cursor += 1;
-        self.move_visual_cursor_right(session, 1);
+        if self.should_echo_canonical_input() {
+            self.move_visual_cursor_right(session, 1);
+        }
     }
 
     fn commit_line(&mut self, session: ConsoleSessionId) {
@@ -235,13 +347,16 @@ impl TtySessionState {
             return;
         }
 
-        console::write_from_tty(session, b"\r\n");
+        if self.should_echo_canonical_input() {
+            console::write_from_tty(session, b"\r\n");
+        }
         for &byte in self.edit_buffer[..self.edit_len].iter() {
             let _ = self.input.push(byte);
         }
         let _ = self.input.push(b'\n');
         self.edit_len = 0;
         self.edit_cursor = 0;
+        self.wake_input_waiter();
     }
 
     fn redraw_edit_buffer_on_fresh_line(&self, session: ConsoleSessionId) {
@@ -282,6 +397,111 @@ impl TtySessionState {
     fn reset(&mut self) {
         *self = Self::new();
     }
+
+    fn should_echo_canonical_input(&self) -> bool {
+        self.termios.is_canonical() && self.termios.echo_enabled()
+    }
+
+    fn should_redraw_edit_buffer(&self) -> bool {
+        self.should_echo_canonical_input() && self.edit_len != 0
+    }
+
+    fn noncanonical_input_bytes(&self, event: KeyboardEvent) -> Option<([u8; 4], usize)> {
+        let mut bytes = [0_u8; 4];
+        let len = match event.code {
+            KeyCode::Backspace => {
+                bytes[0] = self.termios.erase_byte();
+                1
+            }
+            KeyCode::Enter | KeyCode::NumpadEnter => {
+                bytes[0] = b'\n';
+                1
+            }
+            KeyCode::ArrowUp => copy_bytes(&mut bytes, b"\x1b[A"),
+            KeyCode::ArrowDown => copy_bytes(&mut bytes, b"\x1b[B"),
+            KeyCode::ArrowRight => copy_bytes(&mut bytes, b"\x1b[C"),
+            KeyCode::ArrowLeft => copy_bytes(&mut bytes, b"\x1b[D"),
+            KeyCode::Home => copy_bytes(&mut bytes, b"\x1b[H"),
+            KeyCode::End => copy_bytes(&mut bytes, b"\x1b[F"),
+            KeyCode::Insert => copy_bytes(&mut bytes, b"\x1b[2~"),
+            KeyCode::Delete => copy_bytes(&mut bytes, b"\x1b[3~"),
+            KeyCode::PageUp => copy_bytes(&mut bytes, b"\x1b[5~"),
+            KeyCode::PageDown => copy_bytes(&mut bytes, b"\x1b[6~"),
+            KeyCode::Escape => {
+                bytes[0] = 0x1b;
+                1
+            }
+            _ => {
+                bytes[0] = event.text?;
+                1
+            }
+        };
+        Some((bytes, len))
+    }
+
+    fn echo_noncanonical_input(&self, session: ConsoleSessionId, bytes: &[u8]) {
+        if bytes.len() != 1 {
+            return;
+        }
+
+        match bytes[0] {
+            b'\n' => {
+                console::write_from_tty(session, b"\r\n");
+            }
+            0x08 | 0x7f => {
+                console::write_from_tty(session, b"\x08 \x08");
+            }
+            b'\t' | 0x20..=0x7e => {
+                console::write_from_tty(session, bytes);
+            }
+            byte if self.termios.echoes_control_chars() => {
+                let mut echoed = [b'^', b'?'];
+                echoed[1] = if byte == 0x7f { b'?' } else { byte.saturating_add(64) };
+                console::write_from_tty(session, &echoed);
+            }
+            _ => {}
+        }
+    }
+
+    fn push_input_bytes_exact(&mut self, bytes: &[u8]) -> bool {
+        if bytes.is_empty() || self.input.remaining_capacity() < bytes.len() {
+            return false;
+        }
+
+        for &byte in bytes {
+            let _ = self.input.push(byte);
+        }
+        self.wake_input_waiter();
+        true
+    }
+
+    fn release_edit_buffer_to_input(&mut self) {
+        let mut pushed = false;
+        for &byte in self.edit_buffer[..self.edit_len].iter() {
+            if !self.input.push(byte) {
+                break;
+            }
+            pushed = true;
+        }
+        self.edit_len = 0;
+        self.edit_cursor = 0;
+        if pushed {
+            self.wake_input_waiter();
+        }
+    }
+
+    fn clear_pending_input(&mut self) {
+        self.input = RingBuffer::new();
+        self.edit_len = 0;
+        self.edit_cursor = 0;
+    }
+
+    fn wake_input_waiter(&mut self) {
+        let Some(task_id) = self.input_waiter.take() else {
+            return;
+        };
+        let _ = crate::multitask::wake_user_task(task_id);
+    }
 }
 
 fn ends_at_fresh_line(bytes: &[u8]) -> bool {
@@ -308,12 +528,19 @@ fn write_decimal_ascii(dest: &mut [u8], mut value: usize) -> usize {
     len
 }
 
+fn copy_bytes(dest: &mut [u8], source: &[u8]) -> usize {
+    let len = source.len().min(dest.len());
+    dest[..len].copy_from_slice(&source[..len]);
+    len
+}
+
 #[cfg(test)]
 mod tests {
     use super::TtySessionState;
     use crate::console;
     use crate::keyboard::{KeyAction, KeyCode, KeyboardEvent, Modifiers};
     use crate::session::ConsoleSessionId;
+    use crate::user::linux as linux_abi;
 
     fn text_event(code: KeyCode, byte: u8) -> KeyboardEvent {
         KeyboardEvent {
@@ -437,5 +664,58 @@ mod tests {
         let mut output = [0_u8; 32];
         let len = console::copy_recent_output_for_tests(&mut output);
         assert_eq!(&output[..len], b"ac\x1b[D\r\nout\r\nac\x1b[D");
+    }
+
+    #[test]
+    fn noncanonical_mode_queues_input_immediately_without_local_echo() {
+        console::reset_for_tests();
+        let mut tty = TtySessionState::new();
+        let mut raw = linux_abi::LinuxTermios::default_console();
+        raw.c_lflag &= !(linux_abi::ICANON | linux_abi::ECHO);
+        raw.c_oflag = 0;
+        tty.set_termios(raw, false);
+
+        tty.on_key_event(ConsoleSessionId::PRIMARY, text_event(KeyCode::A, b'a'));
+        tty.on_key_event(ConsoleSessionId::PRIMARY, key_event(KeyCode::ArrowLeft));
+        tty.on_key_event(ConsoleSessionId::PRIMARY, key_event(KeyCode::Enter));
+
+        let mut input = [0_u8; 8];
+        assert_eq!(tty.read_input(&mut input), 5);
+        assert_eq!(&input[..5], b"a\x1b[D\n");
+
+        let mut output = [0_u8; 8];
+        assert_eq!(console::copy_recent_output_for_tests(&mut output), 0);
+    }
+
+    #[test]
+    fn tcsetsf_style_flush_discards_pending_canonical_input() {
+        console::reset_for_tests();
+        let mut tty = TtySessionState::new();
+        tty.on_key_event(ConsoleSessionId::PRIMARY, text_event(KeyCode::A, b'a'));
+        tty.on_key_event(ConsoleSessionId::PRIMARY, text_event(KeyCode::B, b'b'));
+
+        let raw = linux_abi::LinuxTermios {
+            c_lflag: linux_abi::ISIG,
+            ..linux_abi::LinuxTermios::default_console()
+        };
+        tty.set_termios(raw, true);
+
+        let mut input = [0_u8; 8];
+        assert_eq!(tty.read_input(&mut input), 0);
+    }
+
+    #[test]
+    fn output_honors_disabled_onlcr_translation() {
+        console::reset_for_tests();
+        let mut tty = TtySessionState::new();
+        let mut termios = tty.termios();
+        termios.c_oflag = 0;
+        tty.set_termios(termios, false);
+
+        assert_eq!(tty.write(ConsoleSessionId::PRIMARY, b"out\nnext"), 8);
+
+        let mut output = [0_u8; 16];
+        let len = console::copy_recent_output_for_tests(&mut output);
+        assert_eq!(&output[..len], b"out\nnext");
     }
 }

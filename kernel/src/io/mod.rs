@@ -3,4 +3,3 @@ pub(crate) mod device;
 pub(crate) mod gui;
 pub(crate) mod session;
 pub(crate) mod tty;
-pub(crate) mod ui_service;

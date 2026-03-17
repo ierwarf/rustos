@@ -19,6 +19,7 @@ pub mod ui {
     pub const INPUT_KIND_KEYBOARD: u16 = 1;
     pub const INPUT_KIND_POINTER_MOTION: u16 = 2;
     pub const INPUT_KIND_POINTER_BUTTON: u16 = 3;
+    pub const INPUT_KIND_POINTER_SCROLL: u16 = 4;
 
     pub const INPUT_ACTION_NONE: u16 = 0;
     pub const INPUT_ACTION_PRESSED: u16 = 1;
@@ -26,6 +27,10 @@ pub mod ui {
     pub const INPUT_ACTION_REPEATED: u16 = 3;
 
     pub const POINTER_BUTTON_LEFT: u32 = 1;
+    pub const POINTER_BUTTON_RIGHT: u32 = 2;
+    pub const POINTER_BUTTON_MIDDLE: u32 = 4;
+    pub const POINTER_BUTTON_X1: u32 = 8;
+    pub const POINTER_BUTTON_X2: u32 = 16;
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default)]
@@ -182,6 +187,50 @@ pub mod runtime {
         pub reserved: u16,
         pub reserved2: u32,
         pub target_value: u64,
+    }
+}
+
+pub mod console {
+    pub const CONSOLE_PATH: &str = "/dev/console0";
+    pub const CONSOLE_SESSION_CAPACITY: usize = 8;
+
+    pub const CONSOLE_IOCTL_GET_STATE: u64 = 0x434f_0001;
+    pub const CONSOLE_IOCTL_SNAPSHOT_SESSION_OUTPUT: u64 = 0x434f_0002;
+    pub const CONSOLE_IOCTL_SET_FOCUS: u64 = 0x434f_0003;
+    pub const CONSOLE_IOCTL_SEND_INPUT_EVENT: u64 = 0x434f_0004;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct ConsoleStateInfo {
+        pub active_session_mask: u64,
+        pub focused_session_index: u32,
+        pub reserved: u32,
+        pub output_generations: [u64; CONSOLE_SESSION_CAPACITY],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct ConsoleSnapshotSessionOutputRequest {
+        pub session_index: u32,
+        pub reserved: u32,
+        pub bytes_ptr: u64,
+        pub capacity: u64,
+        pub count: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct ConsoleSetFocusRequest {
+        pub session_index: u32,
+        pub reserved: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct ConsoleSendInputEventRequest {
+        pub session_index: u32,
+        pub reserved: u32,
+        pub event: super::ui::UiInputEvent,
     }
 }
 

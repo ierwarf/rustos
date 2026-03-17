@@ -1,145 +1,205 @@
-use core::sync::atomic::{AtomicBool, Ordering};
+use rustos_keyboard_driver::KEYBOARD_DRIVER_NAME;
 
+use crate::driver;
+use driver_abi::{DriverBus, DriverClass};
 use spin::Mutex;
-use x86_64::instructions::interrupts;
 
 pub(crate) mod dispatcher;
+pub(crate) mod event_queue;
+pub(crate) mod i8042;
 pub(crate) mod keyboard;
-pub(crate) mod mouse;
-pub(crate) mod usb;
 
-const INPUT_THREAD_WEIGHT_MICROS: u64 = 10;
+const PSMOUSE_DRIVER_NAME: &str = "psmouse";
+const PSMOUSE_DRIVER_MODULE_PATH: &str = "system/drivers/input/psmouse.ko";
+const AUX_TRANSPORT_START_DELAY_MS: u64 = 1200;
+const LOADABLE_MOUSE_DRIVER_START_DELAY_MS: u64 = 800;
 
-static INPUT_THREAD: Mutex<Option<crate::multitask::Thread>> = Mutex::new(None);
-static INPUT_THREAD_STARTED: AtomicBool = AtomicBool::new(false);
+static DEFERRED_INPUT_STATE: Mutex<DeferredInputState> = Mutex::new(DeferredInputState::new());
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeferredInputStage {
+    WaitingForUserspaceDisplay,
+    WaitingForAuxBringUp,
+    WaitingForLoadableMouseDriver,
+    Completed,
+}
+
+struct DeferredInputState {
+    stage: DeferredInputStage,
+    deadline_tick: u64,
+}
+
+impl DeferredInputState {
+    const fn new() -> Self {
+        Self {
+            stage: DeferredInputStage::WaitingForUserspaceDisplay,
+            deadline_tick: 0,
+        }
+    }
+}
 
 pub fn init() {
-    let _ = crate::gui::show_mouse_cursor();
-    let legacy_ready = report_legacy_keyboard(keyboard::init());
-    let usb = usb::init();
-    let usb_keyboard_ready = report_usb_keyboard(usb.keyboard);
-    let usb_mouse_ready = report_usb_mouse(usb.mouse, usb.error);
-    mouse::set_available(usb_mouse_ready);
+    driver::register_kernel_builtin(KEYBOARD_DRIVER_NAME, DriverClass::Input, DriverBus::Serio);
+    driver::register_loadable_elf(
+        PSMOUSE_DRIVER_NAME,
+        DriverClass::Input,
+        DriverBus::Serio,
+        PSMOUSE_DRIVER_MODULE_PATH,
+    );
 
-    if !legacy_ready && !usb_keyboard_ready && !usb_mouse_ready {
-        crate::debug::println!("No keyboard or mouse backend became ready.");
-        crate::console::write(b"No keyboard or mouse backend ready.\r\n");
-    }
+    report_legacy_keyboard_transport(i8042::init_keyboard_port());
 }
 
 pub fn on_legacy_keyboard_interrupt() {
-    keyboard::on_interrupt();
+    i8042::on_keyboard_interrupt();
 }
 
-pub fn start_worker() {
-    interrupts::without_interrupts(|| {
-        if INPUT_THREAD_STARTED.load(Ordering::Acquire) {
-            return;
-        }
+pub fn on_legacy_mouse_interrupt() {
+    i8042::on_aux_interrupt();
+}
 
-        let thread = crate::multitask::Thread::new(input_thread_main, INPUT_THREAD_WEIGHT_MICROS);
-        thread.start();
-        *INPUT_THREAD.lock() = Some(thread);
-        INPUT_THREAD_STARTED.store(true, Ordering::Release);
-    });
+pub fn service_pending() -> usize {
+    enum Action {
+        None,
+        ScheduleAuxBringUp,
+        InitializeAuxTransport,
+        InitializeLoadableModules,
+    }
+
+    let mut work = i8042::service_pending();
+    work += dispatcher::service_pending();
+
+    let action = {
+        let mut state = DEFERRED_INPUT_STATE.lock();
+        match state.stage {
+            DeferredInputStage::WaitingForUserspaceDisplay => {
+                if !crate::gui::is_userspace_display_active() {
+                    Action::None
+                } else {
+                    state.stage = DeferredInputStage::WaitingForAuxBringUp;
+                    state.deadline_tick = deadline_after_ms(AUX_TRANSPORT_START_DELAY_MS);
+                    Action::ScheduleAuxBringUp
+                }
+            }
+            DeferredInputStage::WaitingForAuxBringUp => {
+                if crate::rtc::ticks() < state.deadline_tick {
+                    Action::None
+                } else {
+                    Action::InitializeAuxTransport
+                }
+            }
+            DeferredInputStage::WaitingForLoadableMouseDriver => {
+                if crate::rtc::ticks() < state.deadline_tick {
+                    Action::None
+                } else {
+                    state.stage = DeferredInputStage::Completed;
+                    Action::InitializeLoadableModules
+                }
+            }
+            DeferredInputStage::Completed => Action::None,
+        }
+    };
+
+    match action {
+        Action::None => work,
+        Action::ScheduleAuxBringUp => {
+            crate::debug::println!(
+                "Deferred input service: userspace display active, aux bring-up scheduled"
+            );
+            work += 1;
+            work
+        }
+        Action::InitializeAuxTransport => {
+            let aux_ready = initialize_deferred_aux_transport();
+            let mut state = DEFERRED_INPUT_STATE.lock();
+            state.stage = if aux_ready {
+                state.deadline_tick = deadline_after_ms(LOADABLE_MOUSE_DRIVER_START_DELAY_MS);
+                DeferredInputStage::WaitingForLoadableMouseDriver
+            } else {
+                DeferredInputStage::Completed
+            };
+            work += 1;
+            work
+        }
+        Action::InitializeLoadableModules => {
+            crate::debug::println!("Deferred input service: loading serio mouse modules");
+            driver::initialize_loadable_modules();
+            work += 1;
+            work
+        }
+    }
 }
 
 #[allow(dead_code)]
-pub fn poll_fallback() {
-    if INPUT_THREAD_STARTED.load(Ordering::Acquire) {
-        return;
+pub fn poll_fallback() {}
+
+fn deadline_after_ms(milliseconds: u64) -> u64 {
+    if milliseconds == 0 {
+        return crate::rtc::ticks();
     }
 
-    let _ = service_once();
+    let ticks_per_second = crate::rtc::ticks_per_second().max(1);
+    let ticks_needed = (milliseconds.saturating_mul(ticks_per_second) + 999) / 1000;
+    let ticks_needed = core::cmp::max(1, ticks_needed);
+    crate::rtc::ticks().saturating_add(ticks_needed)
 }
 
-fn input_thread_main(_id: u64) {
-    loop {
-        let work = service_once() + crate::multitask::service_deferred_work();
-        if work == 0 {
-            interrupts::enable_and_hlt();
+fn report_legacy_keyboard_transport(result: i8042::LegacyKeyboardTransportInitResult) {
+    match result {
+        i8042::LegacyKeyboardTransportInitResult::Ready(info) => {
+            keyboard::configure_legacy_transport(info.translated);
+            crate::debug::println!(
+                "Legacy PS/2 keyboard transport ready: translated={}, self_test={}, port_test={}",
+                info.translated,
+                info.controller_self_test_passed,
+                info.first_port_test_passed,
+            );
+            crate::console::write(b"Legacy PS/2 keyboard transport ready.\r\n");
+        }
+        i8042::LegacyKeyboardTransportInitResult::Unavailable(reason) => {
+            crate::debug::println!("Legacy PS/2 keyboard transport unavailable: {}", reason);
+            crate::console::write(b"Legacy PS/2 keyboard transport unavailable.\r\n");
         }
     }
 }
 
-fn service_once() -> usize {
-    keyboard::poll_fallback();
-    let usb_work = usb::poll_fallback();
-    let keyboard_work = keyboard::drain_events(dispatcher::dispatch_keyboard_event);
-    usb_work + keyboard_work
+fn report_legacy_aux_transport(result: i8042::LegacyAuxTransportInitResult) {
+    match result {
+        i8042::LegacyAuxTransportInitResult::Ready(info) => {
+            crate::debug::println!(
+                "Legacy PS/2 aux serio port ready: configured={}, port_test={}",
+                info.controller_configured,
+                info.second_port_test_passed,
+            );
+            if !crate::gui::is_userspace_display_active() {
+                crate::console::write(b"Legacy PS/2 aux serio port ready.\r\n");
+            }
+        }
+        i8042::LegacyAuxTransportInitResult::Unavailable(reason) => {
+            crate::debug::println!("Legacy PS/2 aux serio port unavailable: {}", reason);
+            if !crate::gui::is_userspace_display_active() {
+                crate::console::write(b"Legacy PS/2 aux serio port unavailable.\r\n");
+            }
+        }
+    }
 }
 
-fn report_legacy_keyboard(result: keyboard::LegacyKeyboardInitResult) -> bool {
-    match result {
-        keyboard::LegacyKeyboardInitResult::Ready(info) => {
+fn initialize_deferred_aux_transport() -> bool {
+    match i8042::init_aux_mouse_port() {
+        i8042::LegacyAuxTransportInitResult::Ready(info) => {
             crate::debug::println!(
-                "Legacy keyboard ready: scan_set={}, translated={}",
-                info.scan_set.name(),
-                info.translated,
+                "Deferred input service: aux transport ready"
             );
-            crate::console::write(b"Legacy keyboard ready.\r\n");
+            report_legacy_aux_transport(i8042::LegacyAuxTransportInitResult::Ready(info));
             true
         }
-        keyboard::LegacyKeyboardInitResult::Unavailable(reason) => {
-            crate::debug::println!("Legacy keyboard unavailable: {}", reason);
-            crate::console::write(b"Legacy keyboard unavailable.\r\n");
+        i8042::LegacyAuxTransportInitResult::Unavailable(reason) => {
+            crate::debug::println!(
+                "Deferred input service: aux transport unavailable: {}",
+                reason
+            );
+            report_legacy_aux_transport(i8042::LegacyAuxTransportInitResult::Unavailable(reason));
             false
         }
-    }
-}
-
-fn report_usb_keyboard(info: Option<usb::UsbKeyboardInfo>) -> bool {
-    let Some(info) = info else {
-        crate::debug::println!("USB keyboard unavailable.");
-        crate::console::write(b"USB keyboard unavailable.\r\n");
-        return false;
-    };
-
-    crate::debug::println!(
-        "USB keyboard ready via xHCI {:04x}:{:04x} on {:04x}:{:02x}:{:02x}.{} port {}",
-        info.controller.vendor_id(),
-        info.controller.device_id(),
-        info.controller.segment,
-        info.controller.bus,
-        info.controller.device,
-        info.controller.function,
-        info.port_id,
-    );
-    crate::console::write(b"USB keyboard ready.\r\n");
-    true
-}
-
-fn report_usb_mouse(info: Option<usb::UsbMouseInfo>, error: Option<&'static str>) -> bool {
-    let Some(info) = info else {
-        if let Some(reason) = error {
-            crate::debug::println!("USB mouse unavailable: {}", reason);
-        } else {
-            crate::debug::println!("USB mouse unavailable.");
-        }
-        crate::console::write(b"USB mouse unavailable.\r\n");
-        return false;
-    };
-
-    crate::debug::println!(
-        "USB mouse ready via xHCI {:04x}:{:04x} on {:04x}:{:02x}:{:02x}.{} port {}",
-        info.controller.vendor_id(),
-        info.controller.device_id(),
-        info.controller.segment,
-        info.controller.bus,
-        info.controller.device,
-        info.controller.function,
-        info.port_id,
-    );
-    crate::console::write(b"USB mouse ready.\r\n");
-    true
-}
-
-#[cfg(test)]
-mod tests {
-    use super::report_usb_mouse;
-
-    #[test]
-    fn usb_mouse_error_without_device_is_not_ready() {
-        assert!(!report_usb_mouse(None, Some("missing")));
     }
 }

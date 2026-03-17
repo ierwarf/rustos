@@ -2,8 +2,9 @@ use alloc::vec::Vec;
 
 use crate::debug;
 use crate::fat;
-use crate::process::{self, ProcessLoadError, SpawnedProcess};
+use crate::process::{self, ProcessLaunchOptions, ProcessLoadError, SpawnedProcess};
 use crate::session::ConsoleSessionId;
+use crate::user::linux::LinuxProcessLaunch;
 
 #[derive(Clone, Copy)]
 pub struct ExecutableImage {
@@ -32,6 +33,7 @@ pub struct ConsoleProgramSpec<'a> {
     pub image: &'a [u8],
     pub exec_path: &'a str,
     pub weight_micros: u64,
+    pub logical_admin: bool,
     pub argv: &'a [&'a str],
     pub env: &'a [&'a str],
 }
@@ -42,6 +44,7 @@ impl<'a> ConsoleProgramSpec<'a> {
             image,
             exec_path,
             weight_micros,
+            logical_admin: false,
             argv: &[],
             env: &[],
         }
@@ -50,6 +53,11 @@ impl<'a> ConsoleProgramSpec<'a> {
     pub const fn with_args(mut self, argv: &'a [&'a str], env: &'a [&'a str]) -> Self {
         self.argv = argv;
         self.env = env;
+        self
+    }
+
+    pub const fn with_logical_admin(mut self, logical_admin: bool) -> Self {
+        self.logical_admin = logical_admin;
         self
     }
 }
@@ -106,15 +114,19 @@ pub fn spawn_program_in_session(
         program.argv
     };
 
-    process::spawn_linux_process_with_args_in_session(
-        program.image,
-        program.weight_micros,
-        program.exec_path,
-        argv,
-        program.env,
-        session,
-    )
-    .map_err(|error| ConsoleHostError::Spawn { session, error })
+    let launch = ProcessLaunchOptions {
+        linux: LinuxProcessLaunch {
+            exec_path: program.exec_path,
+            argv,
+            env: program.env,
+        },
+        console_session: session,
+        logical_admin: program.logical_admin,
+        ..ProcessLaunchOptions::default()
+    };
+
+    process::spawn_process_with_launch(program.image, program.weight_micros, launch)
+        .map_err(|error| ConsoleHostError::Spawn { session, error })
 }
 
 pub fn load_executable_image(

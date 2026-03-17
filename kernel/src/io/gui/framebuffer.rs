@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use core::cmp::min;
 use core::convert::Infallible;
 use core::ptr;
 
@@ -7,6 +8,9 @@ use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::geometry::Size;
 use embedded_graphics::pixelcolor::Rgb888;
 use embedded_graphics::prelude::{OriginDimensions, Pixel, RgbColor};
+use x86_64::VirtAddr;
+
+use crate::paging::{self, ProcessAddressSpace};
 
 const DIRTY_TILE_WIDTH: usize = 32;
 const DIRTY_TILE_HEIGHT: usize = 32;
@@ -15,6 +19,7 @@ const MAX_FRAMEBUFFER_HEIGHT: usize = 4320;
 const MAX_DIRTY_COLS: usize = MAX_FRAMEBUFFER_WIDTH.div_ceil(DIRTY_TILE_WIDTH);
 const MAX_DIRTY_ROWS: usize = MAX_FRAMEBUFFER_HEIGHT.div_ceil(DIRTY_TILE_HEIGHT);
 pub(crate) const MAX_FRAMEBUFFER_BYTES_PER_PIXEL: usize = 4;
+const USER_PRESENT_BGRA_PIXELS_PER_CHUNK: usize = 256;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FramebufferRect {
@@ -532,30 +537,7 @@ impl Framebuffer {
             let mut src_row = bytes.as_ptr();
             let mut dst_row = self.active_buffer();
             for _ in 0..height {
-                let mut src = src_row;
-                let mut dst = dst_row;
-                for _ in 0..width {
-                    let b = ptr::read(src);
-                    let g = ptr::read(src.add(1));
-                    let r = ptr::read(src.add(2));
-                    match self.format {
-                        BootPixelFormat::Rgb => {
-                            ptr::write(dst, r);
-                            ptr::write(dst.add(1), g);
-                            ptr::write(dst.add(2), b);
-                        }
-                        _ => {
-                            ptr::write(dst, b);
-                            ptr::write(dst.add(1), g);
-                            ptr::write(dst.add(2), r);
-                        }
-                    }
-                    if self.bpp == 4 {
-                        ptr::write(dst.add(3), 0);
-                    }
-                    src = src.add(4);
-                    dst = dst.add(self.bpp);
-                }
+                self.blit_bgra8888_row(dst_row, src_row, width);
                 src_row = src_row.add(stride_bytes);
                 dst_row = dst_row.add(self.stride_bytes);
             }
@@ -563,6 +545,65 @@ impl Framebuffer {
 
         self.mark_all_dirty();
         true
+    }
+
+    pub(crate) fn draw_bgra8888_frame_from_user(
+        &mut self,
+        address_space: &ProcessAddressSpace,
+        user_ptr: u64,
+        width: usize,
+        height: usize,
+        stride_bytes: usize,
+    ) -> Result<bool, paging::AddressSpaceError> {
+        if width != self.width || height != self.height {
+            return Ok(false);
+        }
+
+        let Some(min_stride) = width.checked_mul(4) else {
+            return Ok(false);
+        };
+        if stride_bytes < min_stride {
+            return Ok(false);
+        }
+
+        let Some(required_len) = stride_bytes.checked_mul(height) else {
+            return Ok(false);
+        };
+        address_space.validate_user_read_buffer(VirtAddr::new(user_ptr), required_len)?;
+
+        let mut chunk = [0_u8; USER_PRESENT_BGRA_PIXELS_PER_CHUNK * 4];
+        unsafe {
+            let mut dst_row = self.active_buffer();
+            for row in 0..height {
+                let row_offset = row
+                    .checked_mul(stride_bytes)
+                    .ok_or(paging::AddressSpaceError::AddressOverflow)?;
+                let row_base = user_ptr
+                    .checked_add(row_offset as u64)
+                    .ok_or(paging::AddressSpaceError::AddressOverflow)?;
+                let mut pixel_offset = 0usize;
+                let mut dst = dst_row;
+
+                while pixel_offset < width {
+                    let chunk_pixels =
+                        min(width - pixel_offset, USER_PRESENT_BGRA_PIXELS_PER_CHUNK);
+                    let chunk_bytes = chunk_pixels * 4;
+                    let src_ptr = row_base
+                        .checked_add((pixel_offset * 4) as u64)
+                        .ok_or(paging::AddressSpaceError::AddressOverflow)?;
+                    address_space
+                        .copy_from_user(VirtAddr::new(src_ptr), &mut chunk[..chunk_bytes])?;
+                    self.blit_bgra8888_row(dst, chunk.as_ptr(), chunk_pixels);
+                    dst = dst.add(chunk_pixels * self.bpp);
+                    pixel_offset += chunk_pixels;
+                }
+
+                dst_row = dst_row.add(self.stride_bytes);
+            }
+        }
+
+        self.mark_all_dirty();
+        Ok(true)
     }
 
     pub(crate) fn draw_overlay_pixel(&mut self, x: usize, y: usize, color: Rgb888, alpha: u8) {
@@ -737,6 +778,33 @@ impl Framebuffer {
             );
             if self.bpp == 4 {
                 ptr::write(base.add(idx + 3), 0);
+            }
+        }
+    }
+
+    unsafe fn blit_bgra8888_row(&self, mut dst: *mut u8, mut src: *const u8, pixels: usize) {
+        unsafe {
+            for _ in 0..pixels {
+                let b = ptr::read(src);
+                let g = ptr::read(src.add(1));
+                let r = ptr::read(src.add(2));
+                match self.format {
+                    BootPixelFormat::Rgb => {
+                        ptr::write(dst, r);
+                        ptr::write(dst.add(1), g);
+                        ptr::write(dst.add(2), b);
+                    }
+                    _ => {
+                        ptr::write(dst, b);
+                        ptr::write(dst.add(1), g);
+                        ptr::write(dst.add(2), r);
+                    }
+                }
+                if self.bpp == 4 {
+                    ptr::write(dst.add(3), 0);
+                }
+                src = src.add(4);
+                dst = dst.add(self.bpp);
             }
         }
     }

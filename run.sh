@@ -25,8 +25,8 @@ cleanup() {
 trap cleanup EXIT
 
 # QEMU's vvfat backend touches host-side file metadata when it is pointed at
-# build/ directly, so run from an isolated mirror instead.
-cp -a build/. "$BUILD_MIRROR_DIR/"
+# the boot image directly, so run from an isolated mirror instead.
+cp -a build/image/. "$BUILD_MIRROR_DIR/"
 
 QEMU_PROFILE_ARGS=()
 QEMU_PASSTHRU_ARGS=()
@@ -55,8 +55,6 @@ case "$QEMU_PROFILE" in
     QEMU_PROFILE_ARGS=(
       -drive file=fat:rw:"$BUILD_MIRROR_DIR",format=raw
       -m 2G
-      -device qemu-xhci,id=xhci,p2=15,p3=15
-      -device usb-mouse,bus=xhci.0
     )
     ;;
   g14)
@@ -74,8 +72,6 @@ case "$QEMU_PROFILE" in
       -smp 8,sockets=1,cores=8,threads=1
       -m 8G
       -rtc base=localtime,clock=host
-      -device qemu-xhci,id=xhci,p2=15,p3=15
-      -device usb-mouse,bus=xhci.0
     )
     ;;
   *)
@@ -134,7 +130,6 @@ qemu-system-x86_64 \
   -monitor none \
   "${DEBUGCON_ARGS[@]}" \
   -global isa-debugcon.iobase=0xe9 \
-  -d int -D qemu_interrupt.log \
   "$@"
 QEMU_EXIT_CODE=$?
 set -e
