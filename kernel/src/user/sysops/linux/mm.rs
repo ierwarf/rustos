@@ -485,7 +485,7 @@ fn mmap_current_process_file(
         };
         process_state.set_mapping_cursor(region.end().as_u64());
 
-        let (file_len, file_path) = match process_state.handles().get(fd) {
+        let (file_len, _file_path) = match process_state.handles().get(fd) {
             Some(KernelHandle::BootFile(file)) => (file.len(), file.path()),
             Some(_) => return Ok(None),
             None => return Err(LinuxSysopError::BadFileDescriptor),

@@ -47,14 +47,14 @@ pub fn init() {
         PSMOUSE_DRIVER_MODULE_PATH,
     );
 
-    report_legacy_keyboard_transport(i8042::init_keyboard_port());
+    report_keyboard_transport(i8042::init_keyboard_port());
 }
 
-pub fn on_legacy_keyboard_interrupt() {
+pub fn on_keyboard_interrupt() {
     i8042::on_keyboard_interrupt();
 }
 
-pub fn on_legacy_mouse_interrupt() {
+pub fn on_mouse_interrupt() {
     i8042::on_aux_interrupt();
 }
 
@@ -130,9 +130,6 @@ pub fn service_pending() -> usize {
     }
 }
 
-#[allow(dead_code)]
-pub fn poll_fallback() {}
-
 fn deadline_after_ms(milliseconds: u64) -> u64 {
     if milliseconds == 0 {
         return crate::rtc::ticks();
@@ -144,41 +141,41 @@ fn deadline_after_ms(milliseconds: u64) -> u64 {
     crate::rtc::ticks().saturating_add(ticks_needed)
 }
 
-fn report_legacy_keyboard_transport(result: i8042::LegacyKeyboardTransportInitResult) {
+fn report_keyboard_transport(result: i8042::KeyboardTransportInitResult) {
     match result {
-        i8042::LegacyKeyboardTransportInitResult::Ready(info) => {
-            keyboard::configure_legacy_transport(info.translated);
+        i8042::KeyboardTransportInitResult::Ready(info) => {
+            keyboard::configure_scancode_transport(info.translated);
             crate::debug::println!(
-                "Legacy PS/2 keyboard transport ready: translated={}, self_test={}, port_test={}",
+                "PS/2 keyboard transport ready: translated={}, self_test={}, port_test={}",
                 info.translated,
                 info.controller_self_test_passed,
                 info.first_port_test_passed,
             );
-            crate::console::write(b"Legacy PS/2 keyboard transport ready.\r\n");
+            crate::console::write(b"PS/2 keyboard transport ready.\r\n");
         }
-        i8042::LegacyKeyboardTransportInitResult::Unavailable(reason) => {
-            crate::debug::println!("Legacy PS/2 keyboard transport unavailable: {}", reason);
-            crate::console::write(b"Legacy PS/2 keyboard transport unavailable.\r\n");
+        i8042::KeyboardTransportInitResult::Unavailable(reason) => {
+            crate::debug::println!("PS/2 keyboard transport unavailable: {}", reason);
+            crate::console::write(b"PS/2 keyboard transport unavailable.\r\n");
         }
     }
 }
 
-fn report_legacy_aux_transport(result: i8042::LegacyAuxTransportInitResult) {
+fn report_aux_transport(result: i8042::AuxTransportInitResult) {
     match result {
-        i8042::LegacyAuxTransportInitResult::Ready(info) => {
+        i8042::AuxTransportInitResult::Ready(info) => {
             crate::debug::println!(
-                "Legacy PS/2 aux serio port ready: configured={}, port_test={}",
+                "PS/2 aux serio port ready: configured={}, port_test={}",
                 info.controller_configured,
                 info.second_port_test_passed,
             );
             if !crate::gui::is_userspace_display_active() {
-                crate::console::write(b"Legacy PS/2 aux serio port ready.\r\n");
+                crate::console::write(b"PS/2 aux serio port ready.\r\n");
             }
         }
-        i8042::LegacyAuxTransportInitResult::Unavailable(reason) => {
-            crate::debug::println!("Legacy PS/2 aux serio port unavailable: {}", reason);
+        i8042::AuxTransportInitResult::Unavailable(reason) => {
+            crate::debug::println!("PS/2 aux serio port unavailable: {}", reason);
             if !crate::gui::is_userspace_display_active() {
-                crate::console::write(b"Legacy PS/2 aux serio port unavailable.\r\n");
+                crate::console::write(b"PS/2 aux serio port unavailable.\r\n");
             }
         }
     }
@@ -186,19 +183,19 @@ fn report_legacy_aux_transport(result: i8042::LegacyAuxTransportInitResult) {
 
 fn initialize_deferred_aux_transport() -> bool {
     match i8042::init_aux_mouse_port() {
-        i8042::LegacyAuxTransportInitResult::Ready(info) => {
+        i8042::AuxTransportInitResult::Ready(info) => {
             crate::debug::println!(
                 "Deferred input service: aux transport ready"
             );
-            report_legacy_aux_transport(i8042::LegacyAuxTransportInitResult::Ready(info));
+            report_aux_transport(i8042::AuxTransportInitResult::Ready(info));
             true
         }
-        i8042::LegacyAuxTransportInitResult::Unavailable(reason) => {
+        i8042::AuxTransportInitResult::Unavailable(reason) => {
             crate::debug::println!(
                 "Deferred input service: aux transport unavailable: {}",
                 reason
             );
-            report_legacy_aux_transport(i8042::LegacyAuxTransportInitResult::Unavailable(reason));
+            report_aux_transport(i8042::AuxTransportInitResult::Unavailable(reason));
             false
         }
     }

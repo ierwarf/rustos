@@ -230,7 +230,7 @@ pub mod console {
     pub struct ConsoleSendInputEventRequest {
         pub session_index: u32,
         pub reserved: u32,
-        pub event: super::ui::UiInputEvent,
+        pub event: super::device::InputEvent,
     }
 }
 
@@ -243,6 +243,19 @@ pub mod device {
     pub const DISPLAY_IOCTL_PRESENT: u64 = 0x4453_0003;
 
     pub const PIXEL_FORMAT_BGRA8888: u32 = super::ui::PIXEL_FORMAT_BGRA8888;
+    pub const INPUT_KIND_KEYBOARD: u16 = super::ui::INPUT_KIND_KEYBOARD;
+    pub const INPUT_KIND_POINTER_MOTION: u16 = super::ui::INPUT_KIND_POINTER_MOTION;
+    pub const INPUT_KIND_POINTER_BUTTON: u16 = super::ui::INPUT_KIND_POINTER_BUTTON;
+    pub const INPUT_KIND_POINTER_SCROLL: u16 = super::ui::INPUT_KIND_POINTER_SCROLL;
+    pub const INPUT_ACTION_NONE: u16 = super::ui::INPUT_ACTION_NONE;
+    pub const INPUT_ACTION_PRESSED: u16 = super::ui::INPUT_ACTION_PRESSED;
+    pub const INPUT_ACTION_RELEASED: u16 = super::ui::INPUT_ACTION_RELEASED;
+    pub const INPUT_ACTION_REPEATED: u16 = super::ui::INPUT_ACTION_REPEATED;
+    pub const POINTER_BUTTON_LEFT: u32 = super::ui::POINTER_BUTTON_LEFT;
+    pub const POINTER_BUTTON_RIGHT: u32 = super::ui::POINTER_BUTTON_RIGHT;
+    pub const POINTER_BUTTON_MIDDLE: u32 = super::ui::POINTER_BUTTON_MIDDLE;
+    pub const POINTER_BUTTON_X1: u32 = super::ui::POINTER_BUTTON_X1;
+    pub const POINTER_BUTTON_X2: u32 = super::ui::POINTER_BUTTON_X2;
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default)]
@@ -255,17 +268,7 @@ pub mod device {
         pub reserved: u32,
     }
 
-    #[repr(C)]
-    #[derive(Clone, Copy, Debug, Default)]
-    pub struct InputEvent {
-        pub kind: u16,
-        pub action: u16,
-        pub code: u32,
-        pub value0: i32,
-        pub value1: i32,
-        pub modifiers: u32,
-        pub text: u32,
-    }
+    pub type InputEvent = super::ui::UiInputEvent;
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default)]

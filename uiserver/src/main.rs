@@ -33,7 +33,6 @@ const MAX_REGISTERED_PROGRAMS: usize = 16;
 const IDLE_SLEEP: Duration = Duration::from_millis(16);
 const RUNTIME_POLL_SLEEP: Duration = Duration::from_millis(32);
 const HIDDEN_RUNTIME_PROGRAM_TITLES: &[&str] = &["UI Server"];
-const AUTO_LAUNCH_PROGRAM_TITLES: &[&str] = &["printf demo"];
 
 #[derive(Clone)]
 struct RuntimeState {
@@ -105,7 +104,6 @@ pub(crate) struct AppState {
     pub(crate) cursor_y: u32,
     pub(crate) left_button_down: bool,
     pub(crate) focused_session_index: u32,
-    pub(crate) runtime_generation: u64,
     pub(crate) launcher_programs: Vec<LauncherProgram>,
     pub(crate) console_windows: Vec<ConsoleWindow>,
     dragging_window_session: Option<u32>,
@@ -175,7 +173,6 @@ impl AppState {
             cursor_y: display.height / 2,
             left_button_down: false,
             focused_session_index: console_state.focused_session_index,
-            runtime_generation: 0,
             launcher_programs: Vec::new(),
             console_windows: Vec::new(),
             dragging_window_session: None,
@@ -190,7 +187,6 @@ impl AppState {
             return false;
         }
 
-        self.runtime_generation = runtime_state.generation;
         let mut changed = self.sync_launcher_programs(
             &runtime_state.registered_programs
                 [..runtime_state.registered_program_count.min(MAX_REGISTERED_PROGRAMS)],
@@ -577,7 +573,6 @@ fn run() -> Result<(), i32> {
     render_frame(&mut state);
     state.present()?;
 
-    let _ = ensure_auto_launch_programs(&runtime_fd, &runtime_state);
     spawn_runtime_thread(runtime_state.clone());
 
     loop {
@@ -609,43 +604,6 @@ fn main() {
     }
     std::process::exit(exit_code);
 }
-
-fn ensure_auto_launch_programs(
-    runtime_fd: &OwnedFd,
-    runtime_state: &Arc<Mutex<RuntimeState>>,
-) -> Result<(), i32> {
-    let mut programs = [RuntimeProgram::default(); MAX_REGISTERED_PROGRAMS];
-    let count = runtime_snapshot_programs(runtime_fd.as_raw_fd(), &mut programs)?;
-
-    let running_titles: Vec<String> = {
-        let state = runtime_state.lock().unwrap();
-        state.running_programs[..state.running_program_count]
-            .iter()
-            .map(runtime_program_title)
-            .collect()
-    };
-
-    for auto_launch_title in AUTO_LAUNCH_PROGRAM_TITLES {
-        if running_titles
-            .iter()
-            .any(|title| title == auto_launch_title)
-        {
-            continue;
-        }
-
-        let Some(program) = programs[..count]
-            .iter()
-            .find(|program| runtime_program_name(program) == *auto_launch_title)
-        else {
-            continue;
-        };
-
-        runtime_request_launch_first_available(runtime_fd.as_raw_fd(), program.program_id)?;
-    }
-
-    Ok(())
-}
-
 fn runtime_program_name(program: &RuntimeProgram) -> std::borrow::Cow<'_, str> {
     let end = program
         .display_name

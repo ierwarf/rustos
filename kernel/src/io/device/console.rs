@@ -5,7 +5,7 @@ use crate::session::{
 };
 use crate::tty;
 use crate::user::abi::console as console_abi;
-use crate::user::abi::ui;
+use crate::user::abi::device as device_abi;
 use crate::user::process_state::UserProcessState;
 use x86_64::VirtAddr;
 
@@ -79,7 +79,7 @@ pub(crate) fn ioctl(
             let session = ConsoleSessionId::from_index(request.session_index as usize)
                 .ok_or(DeviceError::InvalidArgument)?;
             let event =
-                keyboard_event_from_ui(request.event).ok_or(DeviceError::InvalidArgument)?;
+                keyboard_event_from_input(request.event).ok_or(DeviceError::InvalidArgument)?;
             tty::on_key_event_for_session(session, event);
             Ok(0)
         }
@@ -87,15 +87,15 @@ pub(crate) fn ioctl(
     }
 }
 
-fn keyboard_event_from_ui(event: ui::UiInputEvent) -> Option<KeyboardEvent> {
-    if event.kind != ui::INPUT_KIND_KEYBOARD {
+fn keyboard_event_from_input(event: device_abi::InputEvent) -> Option<KeyboardEvent> {
+    if event.kind != device_abi::INPUT_KIND_KEYBOARD {
         return None;
     }
 
     let action = match event.action {
-        ui::INPUT_ACTION_PRESSED => KeyAction::Pressed,
-        ui::INPUT_ACTION_RELEASED => KeyAction::Released,
-        ui::INPUT_ACTION_REPEATED => KeyAction::Repeated,
+        device_abi::INPUT_ACTION_PRESSED => KeyAction::Pressed,
+        device_abi::INPUT_ACTION_RELEASED => KeyAction::Released,
+        device_abi::INPUT_ACTION_REPEATED => KeyAction::Repeated,
         _ => return None,
     };
     let code = KeyCode::from_u32(event.code)?;

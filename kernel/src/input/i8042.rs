@@ -64,7 +64,7 @@ static DEFERRED_KEYBOARD_BYTES: Mutex<RingBuffer<u8, DEFERRED_KEYBOARD_BYTES_CAP
     Mutex::new(RingBuffer::new());
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct LegacyKeyboardTransportInfo {
+pub(crate) struct KeyboardTransportInfo {
     pub translated: bool,
     pub controller_configured: bool,
     pub controller_self_test_passed: bool,
@@ -72,39 +72,39 @@ pub(crate) struct LegacyKeyboardTransportInfo {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum LegacyKeyboardTransportInitResult {
-    Ready(LegacyKeyboardTransportInfo),
+pub(crate) enum KeyboardTransportInitResult {
+    Ready(KeyboardTransportInfo),
     Unavailable(&'static str),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct LegacyAuxTransportInfo {
+pub(crate) struct AuxTransportInfo {
     pub controller_configured: bool,
     pub second_port_test_passed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum LegacyAuxTransportInitResult {
-    Ready(LegacyAuxTransportInfo),
+pub(crate) enum AuxTransportInitResult {
+    Ready(AuxTransportInfo),
     Unavailable(&'static str),
 }
 
-pub(crate) fn init_keyboard_port() -> LegacyKeyboardTransportInitResult {
+pub(crate) fn init_keyboard_port() -> KeyboardTransportInitResult {
     let result = with_controller_access(init_keyboard_port_inner);
     match result {
         Ok(info) => {
             KEYBOARD_TRANSPORT_ACTIVE.store(true, Ordering::Release);
             crate::pic::enable_irq(KEYBOARD_IRQ);
-            LegacyKeyboardTransportInitResult::Ready(info)
+            KeyboardTransportInitResult::Ready(info)
         }
         Err(reason) => {
             KEYBOARD_TRANSPORT_ACTIVE.store(false, Ordering::Release);
-            LegacyKeyboardTransportInitResult::Unavailable(reason)
+            KeyboardTransportInitResult::Unavailable(reason)
         }
     }
 }
 
-pub(crate) fn init_aux_mouse_port() -> LegacyAuxTransportInitResult {
+pub(crate) fn init_aux_mouse_port() -> AuxTransportInitResult {
     let result = with_controller_access(init_aux_mouse_port_inner);
     match result {
         Ok(info) => {
@@ -119,11 +119,11 @@ pub(crate) fn init_aux_mouse_port() -> LegacyAuxTransportInitResult {
                     drain: Some(serio_drain_aux),
                 },
             );
-            LegacyAuxTransportInitResult::Ready(info)
+            AuxTransportInitResult::Ready(info)
         }
         Err(reason) => {
             AUX_TRANSPORT_ACTIVE.store(false, Ordering::Release);
-            LegacyAuxTransportInitResult::Unavailable(reason)
+            AuxTransportInitResult::Unavailable(reason)
         }
     }
 }
@@ -142,7 +142,7 @@ pub(crate) fn on_aux_interrupt() {
     interrupts::without_interrupts(poll_aux_controller);
 }
 
-fn init_keyboard_port_inner() -> Result<LegacyKeyboardTransportInfo, &'static str> {
+fn init_keyboard_port_inner() -> Result<KeyboardTransportInfo, &'static str> {
     let _ = write_command(I8042_DISABLE_SECOND_PORT);
     let _ = write_command(I8042_DISABLE_FIRST_PORT);
     drain_output_buffer();
@@ -157,7 +157,7 @@ fn init_keyboard_port_inner() -> Result<LegacyKeyboardTransportInfo, &'static st
     }
     drain_output_buffer();
 
-    Ok(LegacyKeyboardTransportInfo {
+    Ok(KeyboardTransportInfo {
         translated,
         controller_configured,
         controller_self_test_passed,
@@ -165,7 +165,7 @@ fn init_keyboard_port_inner() -> Result<LegacyKeyboardTransportInfo, &'static st
     })
 }
 
-fn init_aux_mouse_port_inner() -> Result<LegacyAuxTransportInfo, &'static str> {
+fn init_aux_mouse_port_inner() -> Result<AuxTransportInfo, &'static str> {
     if !write_command(I8042_ENABLE_SECOND_PORT) {
         return Err("i8042 enable-second-port command timed out");
     }
@@ -183,7 +183,7 @@ fn init_aux_mouse_port_inner() -> Result<LegacyAuxTransportInfo, &'static str> {
     // poison the later psmouse probe/open command sequence.
     let parked = park_aux_port(keyboard_enabled);
 
-    Ok(LegacyAuxTransportInfo {
+    Ok(AuxTransportInfo {
         controller_configured: controller_configured && parked,
         second_port_test_passed,
     })
@@ -428,7 +428,7 @@ fn send_aux_command_sequence(command: u8, data: &[u8], response: &mut [u8]) -> R
     for (index, slot) in response.iter_mut().enumerate() {
         match read_aux_response_byte() {
             Ok(value) => *slot = value,
-            Err(status) if command == PS2_CMD_GETID && index != 0 => {
+            Err(_status) if command == PS2_CMD_GETID && index != 0 => {
                 for tail in &mut response[index..] {
                     *tail = 0;
                 }

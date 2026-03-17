@@ -258,6 +258,7 @@ pub(crate) fn initialize_loadable_modules() {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn snapshot_registered_drivers(dest: &mut [DriverRecord]) -> usize {
     let registry = DRIVER_REGISTRY.lock();
     let count = dest.len().min(registry.len());

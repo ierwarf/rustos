@@ -149,7 +149,7 @@ pub(crate) unsafe extern "C" fn queue_delayed_work_on(
     let Some(wq_ptr) = ptr_to_usize(wq) else {
         return false;
     };
-    let Some(dwork_ptr) = ptr_to_usize(dwork.cast::<c_void>()) else {
+    let Some(_dwork_ptr) = ptr_to_usize(dwork.cast::<c_void>()) else {
         return false;
     };
 

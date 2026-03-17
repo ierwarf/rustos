@@ -5,7 +5,7 @@ use rustos_keyboard_driver::{KeyboardDriver, ScanCodeSet};
 
 static KEYBOARD_DRIVER: Mutex<KeyboardDriver> = Mutex::new(KeyboardDriver::new());
 
-pub(crate) fn configure_legacy_transport(translated: bool) {
+pub(crate) fn configure_scancode_transport(translated: bool) {
     let scan_set = if translated {
         ScanCodeSet::Set1
     } else {

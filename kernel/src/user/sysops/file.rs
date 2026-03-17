@@ -5,7 +5,6 @@ use core::convert::TryFrom;
 
 use x86_64::VirtAddr;
 
-use crate::debug;
 use crate::fat::{self, BootVolumeNodeKind};
 use crate::multitask;
 use crate::paging;

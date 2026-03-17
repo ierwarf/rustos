@@ -14,16 +14,14 @@ const PRINTF_CONSOLE_PROGRAM: DesktopProgramRegistration = DesktopProgramRegistr
     ExecutableImage::new("system/apps/printfdemo/printfdemo.elf"),
     multitask::DEFAULT_USER_TASK_WEIGHT_MICROS,
 );
-const BOOT_TARGET: DesktopLaunchTarget = DesktopLaunchTarget::FirstAvailableSession;
-
 pub fn bootstrap() -> Result<(), runtime::DesktopRuntimeError> {
     runtime::bootstrap()?;
 
     let ui_server_program_id = runtime::register_program(UI_SERVER_PROGRAM)?;
-    runtime::request_launch(ui_server_program_id, BOOT_TARGET)?;
+    runtime::request_launch(ui_server_program_id, DesktopLaunchTarget::FirstAvailableSession)?;
 
+    // The launcher can open multiple sessions from the same registered program.
     let _ = runtime::register_program(PRINTF_CONSOLE_PROGRAM)?;
-    let __ = runtime::register_program(PRINTF_CONSOLE_PROGRAM)?;
 
     Ok(())
 }

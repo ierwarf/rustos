@@ -1,22 +1,17 @@
 use alloc::vec;
-use core::mem::{align_of, size_of};
+use core::mem::size_of;
 use core::slice;
 
 use crate::input::event_queue;
-use crate::user::abi::{device, ui};
+use crate::user::abi::device;
 use crate::user::process_state::UserProcessState;
 
 use super::DeviceError;
 
-const _: [(); size_of::<device::InputEvent>()] = [(); size_of::<ui::UiInputEvent>()];
-const _: [(); align_of::<device::InputEvent>()] = [(); align_of::<ui::UiInputEvent>()];
 const MAX_INPUT_EVENTS_PER_READ: usize = 64;
 
 pub fn read_events(dest: &mut [device::InputEvent]) -> usize {
-    let legacy_dest = unsafe {
-        slice::from_raw_parts_mut(dest.as_mut_ptr().cast::<ui::UiInputEvent>(), dest.len())
-    };
-    event_queue::read_input_events(legacy_dest)
+    event_queue::read_input_events(dest)
 }
 
 pub(crate) fn read_to_user(

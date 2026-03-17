@@ -70,11 +70,11 @@ pub extern "x86-interrupt" fn rtc_interrupt_handler(_stack_frame: InterruptStack
 }
 
 pub extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    crate::input::on_legacy_keyboard_interrupt();
+    crate::input::on_keyboard_interrupt();
     crate::pic::send_eoi(KEYBOARD_INTERRUPT_VECTOR);
 }
 
 pub extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    crate::input::on_legacy_mouse_interrupt();
+    crate::input::on_mouse_interrupt();
     crate::pic::send_eoi(MOUSE_INTERRUPT_VECTOR);
 }
