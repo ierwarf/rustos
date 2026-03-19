@@ -1,6 +1,6 @@
-use crate::io::device as device_ns;
 use crate::multitask;
 use crate::user::handles::KernelHandle;
+use crate::vfs;
 
 use super::file;
 
@@ -69,14 +69,14 @@ pub(crate) fn for_fd(fd: u64) -> Result<KernelStat, StatLookupError> {
 
         let stat = match handle {
             KernelHandle::Console(_) | KernelHandle::Device(_) => build_device_stat(fd),
-            KernelHandle::BootDirectory(directory) => {
+            KernelHandle::VfsDirectory(directory) => {
                 let metadata = file::metadata_for_current_process_path(directory.path())?;
                 build_path_stat(directory.path().as_bytes(), metadata)
             }
             KernelHandle::DisplaySurface(surface) => {
                 build_regular_file_stat(fd, surface.frame_len())
             }
-            KernelHandle::BootFile(file) => {
+            KernelHandle::VfsFile(file) => {
                 let path = file.path();
                 build_regular_file_stat(path_inode_seed(path.as_bytes()), file.len() as u64)
             }
@@ -90,25 +90,8 @@ pub(crate) fn for_fd(fd: u64) -> Result<KernelStat, StatLookupError> {
 }
 
 pub(crate) fn for_absolute_path(absolute_path: &str) -> Result<KernelStat, StatLookupError> {
-    if absolute_path == "/dev" {
-        return Ok(build_directory_stat(
-            path_inode_seed(absolute_path.as_bytes()),
-            0,
-        ));
-    }
-
-    if absolute_path.starts_with("/dev/") {
-        return match device_ns::lookup(absolute_path) {
-            Ok(descriptor) => Ok(build_device_stat(device_inode_seed(
-                descriptor.path.as_bytes(),
-            ))),
-            Err(device_ns::DeviceLookupError::NotFound) => Err(StatLookupError::NotFound),
-            Err(device_ns::DeviceLookupError::InvalidPath) => Err(StatLookupError::InvalidArgument),
-        };
-    }
-
-    let metadata = file::metadata_for_current_process_path(absolute_path)?;
-    Ok(build_path_stat(absolute_path.as_bytes(), metadata))
+    let metadata = vfs::metadata_for_current_process_path(absolute_path).map_err(map_vfs_error_to_stat)?;
+    Ok(kernel_stat_from_vfs_metadata(metadata))
 }
 
 fn build_regular_file_stat(inode: u64, len: u64) -> KernelStat {
@@ -160,11 +143,46 @@ fn build_path_stat(path: &[u8], metadata: file::FileMetadata) -> KernelStat {
     }
 }
 
-fn path_inode_seed(path: &[u8]) -> u64 {
-    fnv1a64(path)
+fn kernel_stat_from_vfs_metadata(metadata: vfs::VfsMetadata) -> KernelStat {
+    KernelStat {
+        inode: metadata.inode.max(1),
+        kind: match metadata.kind {
+            vfs::VfsNodeKind::File => KernelNodeKind::File,
+            vfs::VfsNodeKind::Directory => KernelNodeKind::Directory,
+            vfs::VfsNodeKind::Device => KernelNodeKind::Device,
+        },
+        link_count: metadata.link_count,
+        size: metadata.len,
+        block_size: metadata.block_size,
+        blocks: metadata.blocks,
+        atime: KernelTimestamp {
+            sec: metadata.atime.sec,
+            nsec: metadata.atime.nsec,
+        },
+        mtime: KernelTimestamp {
+            sec: metadata.mtime.sec,
+            nsec: metadata.mtime.nsec,
+        },
+        ctime: KernelTimestamp {
+            sec: metadata.ctime.sec,
+            nsec: metadata.ctime.nsec,
+        },
+    }
 }
 
-fn device_inode_seed(path: &[u8]) -> u64 {
+fn map_vfs_error_to_stat(err: vfs::VfsError) -> StatLookupError {
+    match err {
+        vfs::VfsError::BadFileDescriptor => StatLookupError::BadFileDescriptor,
+        vfs::VfsError::InvalidArgument => StatLookupError::InvalidArgument,
+        vfs::VfsError::NotFound => StatLookupError::NotFound,
+        vfs::VfsError::NotDirectory => StatLookupError::NotDirectory,
+        vfs::VfsError::PermissionDenied => StatLookupError::PermissionDenied,
+        vfs::VfsError::ReadOnlyFilesystem => StatLookupError::PermissionDenied,
+        vfs::VfsError::Unsupported => StatLookupError::Unsupported,
+    }
+}
+
+fn path_inode_seed(path: &[u8]) -> u64 {
     fnv1a64(path)
 }
 

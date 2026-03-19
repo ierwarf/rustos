@@ -3,11 +3,10 @@ use core::convert::TryFrom;
 use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
 
-use crate::debug;
 use crate::io::device::{self as device_ns};
 use crate::multitask;
 use crate::paging;
-use crate::user::handles::{DisplaySurfaceHandle, FIRST_DYNAMIC_FD, KernelHandle};
+use crate::user::handles::{DisplaySurfaceHandle, KernelHandle};
 use crate::user::linux as linux_abi;
 use crate::user::process_state::UserProcessState;
 const PAGE_SIZE: u64 = 4096;
@@ -27,54 +26,6 @@ impl From<paging::AddressSpaceError> for DeviceSysopError {
     fn from(value: paging::AddressSpaceError) -> Self {
         Self::AddressSpace(value)
     }
-}
-
-pub(crate) fn open_path_for_current_process(
-    path: &str,
-    open_flags: u64,
-) -> Result<u64, DeviceSysopError> {
-    let trace_runtime = multitask::current_user_id() == Some(1);
-    let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
-        let occupied_before = (FIRST_DYNAMIC_FD as u64..FIRST_DYNAMIC_FD as u64 + 8)
-            .filter(|fd| process_state.handles().get(*fd).is_some())
-            .count();
-        let fd3_before = debug_handle_name(process_state.handles().get(3));
-        let fd4_before = debug_handle_name(process_state.handles().get(4));
-        let fd5_before = debug_handle_name(process_state.handles().get(5));
-        let handle = device_ns::open(path)
-            .map(KernelHandle::Device)
-            .map_err(map_lookup_error)?;
-        let fd = process_state
-            .handles_mut()
-            .install_with_open_flags(handle, open_flags);
-        let occupied_after = (FIRST_DYNAMIC_FD as u64..FIRST_DYNAMIC_FD as u64 + 8)
-            .filter(|fd| process_state.handles().get(*fd).is_some())
-            .count();
-        let fd3_after = debug_handle_name(process_state.handles().get(3));
-        let fd4_after = debug_handle_name(process_state.handles().get(4));
-        let fd5_after = debug_handle_name(process_state.handles().get(5));
-        if trace_runtime {
-            debug::println!(
-                "device open: path={} flags={:#x} assigned_fd={} occupied_before={} occupied_after={} fd3:{}->{} fd4:{}->{} fd5:{}->{}",
-                path,
-                open_flags,
-                fd,
-                occupied_before,
-                occupied_after,
-                fd3_before,
-                fd3_after,
-                fd4_before,
-                fd4_after,
-                fd5_before,
-                fd5_after,
-            );
-        }
-        Ok(fd)
-    }) else {
-        return Err(DeviceSysopError::Unsupported);
-    };
-
-    result
 }
 
 pub(crate) fn close_current_process_handle(fd: u64) -> Result<(), DeviceSysopError> {
@@ -117,20 +68,13 @@ pub(crate) fn read_current_process_handle(
     result
 }
 
-pub(crate) fn ioctl_current_process_handle(
-    fd: u64,
+pub(crate) fn ioctl_current_process_device_handle(
+    device_handle: device_ns::DeviceHandle,
     request: u64,
     arg: u64,
 ) -> Result<u64, DeviceSysopError> {
     let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
-        match process_state.handles().get(fd) {
-            Some(KernelHandle::Device(device_handle)) => {
-                device_ns::ioctl_from_user(*device_handle, process_state, request, arg)
-                    .map_err(map_device_error)
-            }
-            Some(_) => Err(DeviceSysopError::Unsupported),
-            None => Err(DeviceSysopError::BadFileDescriptor),
-        }
+        device_ns::ioctl_from_user(device_handle, process_state, request, arg).map_err(map_device_error)
     }) else {
         return Err(DeviceSysopError::Unsupported);
     };
@@ -223,30 +167,12 @@ fn map_surface(
     Ok(region.start.as_u64())
 }
 
-fn debug_handle_name(handle: Option<&KernelHandle>) -> &'static str {
-    match handle {
-        None => "-",
-        Some(KernelHandle::Console(_)) => "console",
-        Some(KernelHandle::Device(device)) => device.device_id().path(),
-        Some(KernelHandle::BootFile(_)) => "file",
-        Some(KernelHandle::BootDirectory(_)) => "dir",
-        Some(KernelHandle::DisplaySurface(_)) => "surface",
-    }
-}
-
 fn surface_page_flags(prot: u64) -> PageTableFlags {
     let mut flags = PageTableFlags::NO_EXECUTE;
     if prot & linux_abi::PROT_WRITE != 0 {
         flags |= PageTableFlags::WRITABLE;
     }
     flags
-}
-
-fn map_lookup_error(err: device_ns::DeviceLookupError) -> DeviceSysopError {
-    match err {
-        device_ns::DeviceLookupError::InvalidPath => DeviceSysopError::InvalidArgument,
-        device_ns::DeviceLookupError::NotFound => DeviceSysopError::NotFound,
-    }
 }
 
 fn map_device_error(err: device_ns::DeviceError) -> DeviceSysopError {

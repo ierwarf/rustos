@@ -23,6 +23,16 @@ pub enum Api {
     GetConsoleMode = 12,
     SetConsoleMode = 13,
     RtlExitUserProcess = 14,
+    GetProcessHeap = 15,
+    HeapAlloc = 16,
+    HeapFree = 17,
+    HeapReAlloc = 18,
+    VirtualAlloc = 19,
+    VirtualFree = 20,
+    VirtualProtect = 21,
+    RtlAllocateHeap = 22,
+    RtlFreeHeap = 23,
+    RtlReAllocateHeap = 24,
 }
 
 impl Api {
@@ -33,27 +43,19 @@ impl Api {
 
 pub fn resolve_import(dll_name: &[u8], function_name: &[u8]) -> Option<Api> {
     if dll_name_eq(dll_name, b"kernel32.dll") {
-        return match function_name {
-            b"ExitProcess" => Some(Api::ExitProcess),
-            b"GetStdHandle" => Some(Api::GetStdHandle),
-            b"WriteFile" => Some(Api::WriteFile),
-            b"ReadFile" => Some(Api::ReadFile),
-            b"Sleep" => Some(Api::Sleep),
-            b"CloseHandle" => Some(Api::CloseHandle),
-            b"GetLastError" => Some(Api::GetLastError),
-            b"SetLastError" => Some(Api::SetLastError),
-            b"WriteConsoleA" => Some(Api::WriteConsoleA),
-            b"ReadConsoleA" => Some(Api::ReadConsoleA),
-            b"GetFileType" => Some(Api::GetFileType),
-            b"GetConsoleMode" => Some(Api::GetConsoleMode),
-            b"SetConsoleMode" => Some(Api::SetConsoleMode),
-            _ => None,
-        };
+        return resolve_kernel32_import(function_name);
+    }
+
+    if dll_name_eq(dll_name, b"kernelbase.dll") {
+        return resolve_kernel32_import(function_name);
     }
 
     if dll_name_eq(dll_name, b"ntdll.dll") {
         return match function_name {
             b"RtlExitUserProcess" => Some(Api::RtlExitUserProcess),
+            b"RtlAllocateHeap" => Some(Api::RtlAllocateHeap),
+            b"RtlFreeHeap" => Some(Api::RtlFreeHeap),
+            b"RtlReAllocateHeap" => Some(Api::RtlReAllocateHeap),
             _ => None,
         };
     }
@@ -134,6 +136,15 @@ pub(super) fn dispatch_syscall(frame: &SyscallFrame) -> u64 {
         Api::GetFileType => win32_ops::get_file_type(arg0),
         Api::GetConsoleMode => win32_ops::get_console_mode(arg0, arg1),
         Api::SetConsoleMode => win32_ops::set_console_mode(arg0, arg1),
+        Api::GetProcessHeap => win32_ops::get_process_heap(),
+        Api::HeapAlloc | Api::RtlAllocateHeap => win32_ops::heap_alloc(arg0, arg1, arg2),
+        Api::HeapFree | Api::RtlFreeHeap => win32_ops::heap_free(arg0, arg1, arg2),
+        Api::HeapReAlloc | Api::RtlReAllocateHeap => {
+            win32_ops::heap_realloc(arg0, arg1, arg2, arg3)
+        }
+        Api::VirtualAlloc => win32_ops::virtual_alloc(arg0, arg1, arg2, arg3),
+        Api::VirtualFree => win32_ops::virtual_free(arg0, arg1, arg2),
+        Api::VirtualProtect => win32_ops::virtual_protect(arg0, arg1, arg2, arg3),
     }
 }
 
@@ -174,8 +185,44 @@ fn api_from_syscall_number(syscall_number: u64) -> Option<Api> {
         Some(12) => Api::GetConsoleMode,
         Some(13) => Api::SetConsoleMode,
         Some(14) => Api::RtlExitUserProcess,
+        Some(15) => Api::GetProcessHeap,
+        Some(16) => Api::HeapAlloc,
+        Some(17) => Api::HeapFree,
+        Some(18) => Api::HeapReAlloc,
+        Some(19) => Api::VirtualAlloc,
+        Some(20) => Api::VirtualFree,
+        Some(21) => Api::VirtualProtect,
+        Some(22) => Api::RtlAllocateHeap,
+        Some(23) => Api::RtlFreeHeap,
+        Some(24) => Api::RtlReAllocateHeap,
         _ => return None,
     })
+}
+
+fn resolve_kernel32_import(function_name: &[u8]) -> Option<Api> {
+    match function_name {
+        b"ExitProcess" => Some(Api::ExitProcess),
+        b"GetStdHandle" => Some(Api::GetStdHandle),
+        b"WriteFile" => Some(Api::WriteFile),
+        b"ReadFile" => Some(Api::ReadFile),
+        b"Sleep" => Some(Api::Sleep),
+        b"CloseHandle" => Some(Api::CloseHandle),
+        b"GetLastError" => Some(Api::GetLastError),
+        b"SetLastError" => Some(Api::SetLastError),
+        b"WriteConsoleA" => Some(Api::WriteConsoleA),
+        b"ReadConsoleA" => Some(Api::ReadConsoleA),
+        b"GetFileType" => Some(Api::GetFileType),
+        b"GetConsoleMode" => Some(Api::GetConsoleMode),
+        b"SetConsoleMode" => Some(Api::SetConsoleMode),
+        b"GetProcessHeap" => Some(Api::GetProcessHeap),
+        b"HeapAlloc" => Some(Api::HeapAlloc),
+        b"HeapFree" => Some(Api::HeapFree),
+        b"HeapReAlloc" => Some(Api::HeapReAlloc),
+        b"VirtualAlloc" => Some(Api::VirtualAlloc),
+        b"VirtualFree" => Some(Api::VirtualFree),
+        b"VirtualProtect" => Some(Api::VirtualProtect),
+        _ => None,
+    }
 }
 
 fn dll_name_eq(actual: &[u8], expected_ascii_lower: &[u8]) -> bool {

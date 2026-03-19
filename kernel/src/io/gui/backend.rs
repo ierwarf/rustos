@@ -2,18 +2,18 @@ use boot_protocol::FramebufferInfo;
 use spin::Mutex;
 use x86_64::instructions::interrupts;
 
+use super::framebuffer::{build_framebuffer, Framebuffer, FramebufferRect};
 use super::GuiDisplayInfo;
-use super::framebuffer::{Framebuffer, build_framebuffer};
 use crate::paging::{self, ProcessAddressSpace};
 
 const HUGE_2MIB: u64 = 2 * 1024 * 1024;
 
 enum BackendInstance {
     Unavailable,
-    Gop(GopDisplayBackend),
+    Framebuffer(FramebufferDisplayBackend),
 }
 
-struct GopDisplayBackend {
+struct FramebufferDisplayBackend {
     framebuffer: Framebuffer,
 }
 
@@ -31,8 +31,12 @@ impl DisplayBackend {
     }
 
     fn init_gop(&mut self, info: FramebufferInfo) {
+        self.install_framebuffer(info);
+    }
+
+    fn install_framebuffer(&mut self, info: FramebufferInfo) {
         mark_framebuffer_write_combine(info);
-        self.instance = BackendInstance::Gop(GopDisplayBackend {
+        self.instance = BackendInstance::Framebuffer(FramebufferDisplayBackend {
             framebuffer: build_framebuffer(info),
         });
     }
@@ -40,14 +44,14 @@ impl DisplayBackend {
     fn with_framebuffer<R>(&mut self, f: impl FnOnce(&mut Framebuffer) -> R) -> Option<R> {
         match &mut self.instance {
             BackendInstance::Unavailable => None,
-            BackendInstance::Gop(backend) => Some(f(&mut backend.framebuffer)),
+            BackendInstance::Framebuffer(backend) => Some(f(&mut backend.framebuffer)),
         }
     }
 
     fn display_info(&self) -> Option<GuiDisplayInfo> {
         match &self.instance {
             BackendInstance::Unavailable => None,
-            BackendInstance::Gop(backend) => Some(GuiDisplayInfo {
+            BackendInstance::Framebuffer(backend) => Some(GuiDisplayInfo {
                 width: backend.framebuffer.width() as u32,
                 height: backend.framebuffer.height() as u32,
                 stride_bytes: backend.framebuffer.stride_bytes() as u32,
@@ -60,6 +64,12 @@ impl DisplayBackend {
 pub(crate) fn init_gop(info: FramebufferInfo) {
     interrupts::without_interrupts(|| {
         DISPLAY_BACKEND.lock().init_gop(info);
+    });
+}
+
+pub(crate) fn install_driver_framebuffer(info: FramebufferInfo) {
+    interrupts::without_interrupts(|| {
+        DISPLAY_BACKEND.lock().install_framebuffer(info);
     });
 }
 
@@ -111,6 +121,34 @@ pub(crate) fn present_bgra8888_from_user(
             width,
             height,
             stride_bytes,
+        )?;
+        if drawn {
+            framebuffer.present_scene();
+        }
+        Ok(drawn)
+    }) else {
+        return Ok(false);
+    };
+
+    result
+}
+
+pub(crate) fn present_bgra8888_rect_from_user(
+    address_space: &ProcessAddressSpace,
+    user_ptr: u64,
+    width: usize,
+    height: usize,
+    stride_bytes: usize,
+    rect: FramebufferRect,
+) -> Result<bool, paging::AddressSpaceError> {
+    let Some(result) = DISPLAY_BACKEND.lock().with_framebuffer(|framebuffer| {
+        let drawn = framebuffer.draw_bgra8888_frame_rect_from_user(
+            address_space,
+            user_ptr,
+            width,
+            height,
+            stride_bytes,
+            rect,
         )?;
         if drawn {
             framebuffer.present_scene();

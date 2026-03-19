@@ -1,10 +1,10 @@
 use core::str;
 
-use embedded_graphics::Drawable;
 use embedded_graphics::geometry::Point;
-use embedded_graphics::mono_font::{MonoTextStyle, ascii::FONT_9X18_BOLD};
+use embedded_graphics::mono_font::{ascii::FONT_9X18_BOLD, MonoTextStyle};
 use embedded_graphics::pixelcolor::Rgb888;
 use embedded_graphics::text::{Baseline, Text};
+use embedded_graphics::Drawable;
 
 use super::framebuffer::{Framebuffer, FramebufferRect};
 

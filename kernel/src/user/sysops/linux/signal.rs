@@ -165,13 +165,5 @@ pub(crate) fn tgkill(tgid: u64, tid: u64, signal: u64) -> Result<(), LinuxSysopE
         return Ok(());
     }
 
-    if multitask::current_user_id() == Some(1) {
-        debug::println!(
-            "linux tgkill: self-targeted signal delivery deferred pid={} tid={} sig={}",
-            current_pid,
-            current_tid,
-            signal,
-        );
-    }
     Ok(())
 }

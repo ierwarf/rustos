@@ -1,3 +1,6 @@
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use crate::paging;
 pub const SYS_READ: u64 = 0;
 pub const SYS_WRITE: u64 = 1;
@@ -449,19 +452,284 @@ pub struct LinuxInitialTlsInfo {
     pub dtv_base: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct LinuxVmaFlags {
+    pub read: bool,
+    pub write: bool,
+    pub execute: bool,
+    pub private: bool,
+}
+
+impl LinuxVmaFlags {
+    pub const fn new(read: bool, write: bool, execute: bool, private: bool) -> Self {
+        Self {
+            read,
+            write,
+            execute,
+            private,
+        }
+    }
+
+    pub const fn private_anon(read: bool, write: bool, execute: bool) -> Self {
+        Self::new(read, write, execute, true)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum LinuxImageMappingPathKind {
+    None,
+    Executable,
+    Interpreter,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct LinuxImageMapping {
+    pub start: u64,
+    pub end: u64,
+    pub offset: u64,
+    pub flags: LinuxVmaFlags,
+    pub path_kind: LinuxImageMappingPathKind,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum LinuxVmaName {
+    None,
+    Path(String),
+    Label(&'static str),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LinuxVma {
+    pub start: u64,
+    pub end: u64,
+    pub offset: u64,
+    pub flags: LinuxVmaFlags,
+    pub name: LinuxVmaName,
+}
+
+impl LinuxVma {
+    pub fn new(
+        start: u64,
+        end: u64,
+        offset: u64,
+        flags: LinuxVmaFlags,
+        name: LinuxVmaName,
+    ) -> Option<Self> {
+        if start >= end {
+            return None;
+        }
+
+        Some(Self {
+            start,
+            end,
+            offset,
+            flags,
+            name,
+        })
+    }
+
+    fn overlaps(&self, start: u64, end: u64) -> bool {
+        self.start < end && start < self.end
+    }
+
+    fn contains_range(&self, start: u64, end: u64) -> bool {
+        self.start <= start && end <= self.end
+    }
+
+    fn subrange(&self, start: u64, end: u64) -> Option<Self> {
+        if !self.contains_range(start, end) || start >= end {
+            return None;
+        }
+
+        Some(Self {
+            start,
+            end,
+            offset: self.offset.checked_add(start.saturating_sub(self.start))?,
+            flags: self.flags,
+            name: self.name.clone(),
+        })
+    }
+
+    fn can_merge_with(&self, next: &Self) -> bool {
+        self.end == next.start
+            && self.flags == next.flags
+            && self.name == next.name
+            && self
+                .offset
+                .checked_add(self.end.saturating_sub(self.start))
+                == Some(next.offset)
+    }
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct LinuxMemoryMapState {
+    areas: Vec<LinuxVma>,
+}
+
+impl LinuxMemoryMapState {
+    pub fn new() -> Self {
+        Self { areas: Vec::new() }
+    }
+
+    pub fn areas(&self) -> &[LinuxVma] {
+        &self.areas
+    }
+
+    pub fn insert_area(&mut self, area: LinuxVma) -> Result<(), ()> {
+        if self
+            .areas
+            .iter()
+            .any(|existing| existing.overlaps(area.start, area.end))
+        {
+            return Err(());
+        }
+
+        self.areas.push(area);
+        self.normalize();
+        Ok(())
+    }
+
+    pub fn replace_area(&mut self, area: LinuxVma) {
+        self.unmap_range(area.start, area.end);
+        self.areas.push(area);
+        self.normalize();
+    }
+
+    pub fn unmap_range(&mut self, start: u64, end: u64) {
+        if start >= end {
+            return;
+        }
+
+        let mut updated = Vec::with_capacity(self.areas.len() + 1);
+        for area in self.areas.drain(..) {
+            if !area.overlaps(start, end) {
+                updated.push(area);
+                continue;
+            }
+
+            if start > area.start {
+                if let Some(left) = area.subrange(area.start, start.min(area.end)) {
+                    updated.push(left);
+                }
+            }
+            if end < area.end {
+                if let Some(right) = area.subrange(end.max(area.start), area.end) {
+                    updated.push(right);
+                }
+            }
+        }
+
+        self.areas = updated;
+        self.normalize();
+    }
+
+    pub fn protect_range(
+        &mut self,
+        start: u64,
+        end: u64,
+        flags: LinuxVmaFlags,
+    ) -> Result<(), ()> {
+        if start >= end {
+            return Ok(());
+        }
+
+        let original = self.areas.clone();
+        let mut cursor = start;
+        let mut updated = Vec::with_capacity(original.len() + 2);
+        let mut covered = false;
+
+        for area in original.iter().cloned() {
+            if !area.overlaps(start, end) {
+                updated.push(area);
+                continue;
+            }
+
+            let overlap_start = area.start.max(start);
+            let overlap_end = area.end.min(end);
+            if cursor < overlap_start {
+                self.areas = original;
+                return Err(());
+            }
+
+            if area.start < overlap_start {
+                if let Some(left) = area.subrange(area.start, overlap_start) {
+                    updated.push(left);
+                }
+            }
+
+            let mut middle = area.subrange(overlap_start, overlap_end).ok_or(())?;
+            middle.flags = LinuxVmaFlags::new(
+                flags.read,
+                flags.write,
+                flags.execute,
+                area.flags.private,
+            );
+            updated.push(middle);
+            covered = true;
+            cursor = overlap_end;
+
+            if overlap_end < area.end {
+                if let Some(right) = area.subrange(overlap_end, area.end) {
+                    updated.push(right);
+                }
+            }
+        }
+
+        if !covered || cursor < end {
+            self.areas = original;
+            return Err(());
+        }
+
+        self.areas = updated;
+        self.normalize();
+        Ok(())
+    }
+
+    pub fn set_heap_range(&mut self, start: u64, end: u64) {
+        self.areas.retain(|area| area.name != LinuxVmaName::Label("[heap]"));
+        if let Some(area) = LinuxVma::new(
+            start,
+            end,
+            0,
+            LinuxVmaFlags::private_anon(true, true, false),
+            LinuxVmaName::Label("[heap]"),
+        ) {
+            self.areas.push(area);
+            self.normalize();
+        }
+    }
+
+    fn normalize(&mut self) {
+        self.areas.sort_by_key(|area| area.start);
+        let mut merged: Vec<LinuxVma> = Vec::with_capacity(self.areas.len());
+        for area in self.areas.drain(..) {
+            if let Some(previous) = merged.last_mut() {
+                if previous.can_merge_with(&area) {
+                    previous.end = area.end;
+                    continue;
+                }
+            }
+            merged.push(area);
+        }
+        self.areas = merged;
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct LinuxProcessImageInfo {
     pub entry: u64,
     pub interpreter_base: u64,
+    pub interpreter_path: Option<String>,
     pub program_headers: u64,
     pub program_header_entry_size: u64,
     pub program_header_count: u64,
     pub brk_start: u64,
     pub initial_tls: Option<LinuxInitialTlsInfo>,
+    pub image_mappings: Vec<LinuxImageMapping>,
 }
 
 impl LinuxProcessImageInfo {
-    pub fn initial_process_state(self) -> LinuxProcessState {
+    pub fn initial_process_state(&self) -> LinuxProcessState {
         LinuxProcessState {
             brk_start: self.brk_start,
             brk_current: self.brk_start,
@@ -471,7 +739,7 @@ impl LinuxProcessImageInfo {
         }
     }
 
-    pub fn initial_thread_state(self) -> LinuxThreadState {
+    pub fn initial_thread_state(&self) -> LinuxThreadState {
         LinuxThreadState {
             fs_base: self.initial_tls.map(|tls| tls.thread_pointer).unwrap_or(0),
             clear_child_tid: 0,
@@ -628,6 +896,84 @@ impl LinuxProcessState {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::string::String;
+
+    use super::{LinuxMemoryMapState, LinuxVma, LinuxVmaFlags, LinuxVmaName};
+
+    #[test]
+    fn memory_map_unmap_splits_and_adjusts_offsets() {
+        let mut maps = LinuxMemoryMapState::new();
+        maps.insert_area(
+            LinuxVma::new(
+                0x1000,
+                0x4000,
+                0,
+                LinuxVmaFlags::private_anon(true, false, true),
+                LinuxVmaName::Path(String::from("/bin/test")),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        maps.unmap_range(0x2000, 0x3000);
+
+        assert_eq!(maps.areas().len(), 2);
+        assert_eq!(maps.areas()[0].start, 0x1000);
+        assert_eq!(maps.areas()[0].end, 0x2000);
+        assert_eq!(maps.areas()[0].offset, 0);
+        assert_eq!(maps.areas()[1].start, 0x3000);
+        assert_eq!(maps.areas()[1].end, 0x4000);
+        assert_eq!(maps.areas()[1].offset, 0x2000);
+    }
+
+    #[test]
+    fn memory_map_protect_splits_middle_range() {
+        let mut maps = LinuxMemoryMapState::new();
+        maps.insert_area(
+            LinuxVma::new(
+                0x1000,
+                0x4000,
+                0,
+                LinuxVmaFlags::private_anon(true, true, false),
+                LinuxVmaName::None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        maps.protect_range(
+            0x2000,
+            0x3000,
+            LinuxVmaFlags::private_anon(true, false, false),
+        )
+        .unwrap();
+
+        assert_eq!(maps.areas().len(), 3);
+        assert_eq!(maps.areas()[1].start, 0x2000);
+        assert_eq!(maps.areas()[1].end, 0x3000);
+        assert!(!maps.areas()[1].flags.write);
+        assert_eq!(maps.areas()[1].offset, 0x1000);
+    }
+
+    #[test]
+    fn memory_map_merges_adjacent_identical_ranges() {
+        let mut maps = LinuxMemoryMapState::new();
+        let flags = LinuxVmaFlags::private_anon(true, false, true);
+        let name = LinuxVmaName::Path(String::from("/bin/test"));
+
+        maps.insert_area(LinuxVma::new(0x1000, 0x2000, 0, flags, name.clone()).unwrap())
+            .unwrap();
+        maps.insert_area(LinuxVma::new(0x2000, 0x3000, 0x1000, flags, name).unwrap())
+            .unwrap();
+
+        assert_eq!(maps.areas().len(), 1);
+        assert_eq!(maps.areas()[0].start, 0x1000);
+        assert_eq!(maps.areas()[0].end, 0x3000);
     }
 }
 

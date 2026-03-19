@@ -1,3 +1,4 @@
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp;
@@ -12,10 +13,13 @@ use xmas_elf::program::{ProgramHeader, SegmentData, Type as ProgramType};
 
 use crate::debug;
 use crate::fat;
+use crate::multitask::UserStackState;
 use crate::paging::{self, ProcessAddressSpace};
 use crate::user::abi::UserAbi;
 use crate::user::linux::{
-    self as linux_abi, LinuxInitialTlsInfo, LinuxProcessImageInfo, LinuxProcessLaunch,
+    self as linux_abi, LinuxImageMapping, LinuxImageMappingPathKind, LinuxInitialTlsInfo,
+    LinuxMemoryMapState, LinuxProcessImageInfo, LinuxProcessLaunch, LinuxVma, LinuxVmaFlags,
+    LinuxVmaName,
 };
 
 use super::{
@@ -84,6 +88,7 @@ pub(super) fn load_elf(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadEr
     let interpreter_path = elf_interpreter_path(image, &elf)?;
     let load_bias = choose_elf_load_bias(&elf, elf_image_type, ELF_DYN_LOAD_BASE)?;
     let mut address_space = ProcessAddressSpace::new()?;
+    let mut image_mappings = Vec::new();
 
     let mut loaded_segments = 0usize;
     let mut mapped_page_ranges = [(0_u64, 0_u64); MAX_LOAD_SEGMENTS];
@@ -92,12 +97,15 @@ pub(super) fn load_elf(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadEr
         image,
         elf_image_type,
         load_bias,
+        LinuxImageMappingPathKind::Executable,
         &mut address_space,
         &mut mapped_page_ranges,
         &mut loaded_segments,
+        &mut image_mappings,
         interpreter_path.is_none(),
     )?;
 
+    let interpreter_path_owned = interpreter_path.map(String::from);
     let (entry, interpreter_base, max_loaded_end) = if let Some(interpreter_path) = interpreter_path
     {
         let interpreter_image = fat::read_file_to_vec(interpreter_path)
@@ -113,9 +121,11 @@ pub(super) fn load_elf(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadEr
             interpreter_image.as_slice(),
             interpreter_type,
             interpreter_load_bias,
+            LinuxImageMappingPathKind::Interpreter,
             &mut address_space,
             &mut mapped_page_ranges,
             &mut loaded_segments,
+            &mut image_mappings,
             false,
         )?;
         (
@@ -134,6 +144,8 @@ pub(super) fn load_elf(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadEr
         max_loaded_end,
         main_image.entry.as_u64(),
         interpreter_base,
+        interpreter_path_owned,
+        image_mappings,
     )?;
 
     Ok(LoadedProcessImage {
@@ -287,9 +299,11 @@ fn map_elf_image(
     image: &[u8],
     image_type: ElfImageType,
     load_bias: u64,
+    path_kind: LinuxImageMappingPathKind,
     address_space: &mut ProcessAddressSpace,
     mapped_page_ranges: &mut [(u64, u64); MAX_LOAD_SEGMENTS],
     loaded_segments: &mut usize,
+    image_mappings: &mut Vec<LinuxImageMapping>,
     apply_kernel_relocations: bool,
 ) -> Result<MappedElfImage, ProcessLoadError> {
     let entry = validate_entry_point(elf, load_bias)?;
@@ -347,6 +361,18 @@ fn map_elf_image(
             VirtAddr::new(segment.addr),
             &image[segment.file_offset..segment.file_end],
         )?;
+        image_mappings.push(LinuxImageMapping {
+            start: segment.page_base,
+            end: segment.page_end,
+            offset: align_down(ph.offset(), PAGE_SIZE),
+            flags: LinuxVmaFlags::new(
+                ph.flags().is_read(),
+                ph.flags().is_write(),
+                ph.flags().is_execute(),
+                true,
+            ),
+            path_kind,
+        });
         debug::println!("process load_elf: segment {} initialized", *loaded_segments);
         *loaded_segments += 1;
         image_loaded_segments += 1;
@@ -449,6 +475,8 @@ fn build_linux_process_image(
     max_loaded_end: u64,
     entry: u64,
     interpreter_base: u64,
+    interpreter_path: Option<String>,
+    image_mappings: Vec<LinuxImageMapping>,
 ) -> Result<LinuxProcessImageInfo, ProcessLoadError> {
     let program_headers = program_header_table_addr(elf, load_bias)?;
     // Dynamic ELF relies on the userspace interpreter to build the initial thread
@@ -474,12 +502,68 @@ fn build_linux_process_image(
     Ok(LinuxProcessImageInfo {
         entry,
         interpreter_base,
+        interpreter_path,
         program_headers,
         program_header_entry_size: elf.header.pt2.ph_entry_size() as u64,
         program_header_count: elf.header.pt2.ph_count() as u64,
         brk_start,
         initial_tls,
+        image_mappings,
     })
+}
+
+pub(super) fn build_initial_memory_map(
+    image: &LinuxProcessImageInfo,
+    exec_path: &str,
+    user_stack: Option<UserStackState>,
+) -> LinuxMemoryMapState {
+    let mut maps = LinuxMemoryMapState::new();
+
+    for mapping in &image.image_mappings {
+        let name = match mapping.path_kind {
+            LinuxImageMappingPathKind::None => LinuxVmaName::None,
+            LinuxImageMappingPathKind::Executable if exec_path.is_empty() => LinuxVmaName::None,
+            LinuxImageMappingPathKind::Executable => LinuxVmaName::Path(String::from(exec_path)),
+            LinuxImageMappingPathKind::Interpreter => image
+                .interpreter_path
+                .as_ref()
+                .map(|path| LinuxVmaName::Path(path.clone()))
+                .unwrap_or(LinuxVmaName::None),
+        };
+        let area = LinuxVma::new(mapping.start, mapping.end, mapping.offset, mapping.flags, name)
+            .expect("initial ELF VMA bounds are invalid");
+        maps.insert_area(area)
+            .expect("initial ELF VMA ranges unexpectedly overlap");
+    }
+
+    if let Some(tls) = image.initial_tls {
+        let tls_end = tls.mapping_base.saturating_add(tls.mapping_size);
+        if let Some(area) = LinuxVma::new(
+            tls.mapping_base,
+            tls_end,
+            0,
+            LinuxVmaFlags::private_anon(true, true, false),
+            LinuxVmaName::None,
+        ) {
+            maps.insert_area(area)
+                .expect("initial TLS mapping overlaps an existing VMA");
+        }
+    }
+
+    if let Some(stack) = user_stack {
+        if let Some(area) = LinuxVma::new(
+            stack.reserve_start,
+            stack.reserve_end,
+            0,
+            LinuxVmaFlags::private_anon(true, true, false),
+            LinuxVmaName::Label("[stack]"),
+        ) {
+            maps.insert_area(area)
+                .expect("initial stack mapping overlaps an existing VMA");
+        }
+    }
+
+    maps
 }
 
 fn elf_initial_tls_info(
@@ -887,7 +971,7 @@ fn segment_page_flags(ph: &ProgramHeader<'_>) -> PageTableFlags {
 
 pub(super) fn initialize_linux_initial_tls(
     address_space: &mut ProcessAddressSpace,
-    image: LinuxProcessImageInfo,
+    image: &LinuxProcessImageInfo,
 ) -> Result<(), ProcessLoadError> {
     let Some(tls) = image.initial_tls else {
         return Ok(());
@@ -923,7 +1007,7 @@ pub(super) fn initialize_linux_initial_tls(
 pub(super) fn initialize_linux_user_stack(
     address_space: &ProcessAddressSpace,
     stack_end: VirtAddr,
-    image: LinuxProcessImageInfo,
+    image: &LinuxProcessImageInfo,
     launch: LinuxProcessLaunch<'_>,
 ) -> Result<VirtAddr, ProcessLoadError> {
     let aligned_top = align_down(stack_end.as_u64(), 16);

@@ -1,6 +1,6 @@
 use driver_abi::{PointerPacket, SerioDriverRegistration};
 
-use super::{input, linux, serio};
+use super::{input, linux, module_registry, serio};
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rustos_register_serio_driver(
@@ -83,6 +83,6 @@ pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
         }
         "rustos_serio_get_drvdata" => Some(rustos_serio_get_drvdata as *const () as usize),
         "rustos_serio_set_drvdata" => Some(rustos_serio_set_drvdata as *const () as usize),
-        _ => linux::resolve_symbol(name),
+        _ => linux::resolve_symbol(name).or_else(|| module_registry::resolve_symbol(name)),
     }
 }

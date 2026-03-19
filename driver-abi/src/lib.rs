@@ -3,7 +3,7 @@
 use core::ffi::{c_char, c_void};
 use core::str;
 
-pub const DRIVER_MODULE_ABI_VERSION: u32 = 3;
+pub const DRIVER_MODULE_ABI_VERSION: u32 = 4;
 pub const DRIVER_NAME_MAX: usize = 32;
 pub const DRIVER_PATH_MAX: usize = 128;
 pub const RUSTOS_DRIVER_HEADER_SYMBOL: &str = "RUSTOS_DRIVER_HEADER";
@@ -45,6 +45,35 @@ pub enum DriverBus {
     Pci = 4,
     Virtio = 5,
 }
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DisplayPixelFormat {
+    Rgb = 0,
+    Bgr = 1,
+    Bitmask = 2,
+    Unknown = 0xff,
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DriverLogLevel {
+    Error = 1,
+    Warn = 2,
+    Info = 3,
+    Debug = 4,
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DriverMmioCachePolicy {
+    Uncached = 0,
+    WriteCombine = 1,
+}
+
+pub const PCI_BAR_FLAG_IO_SPACE: u32 = 1 << 0;
+pub const PCI_BAR_FLAG_PREFETCHABLE: u32 = 1 << 1;
+pub const PCI_BAR_FLAG_64BIT: u32 = 1 << 2;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -520,6 +549,98 @@ impl DriverModuleHeader {
 pub type RegisterSerioDriverFn =
     unsafe extern "C" fn(driver: *const SerioDriverRegistration) -> i32;
 pub type ReportPointerPacketFn = unsafe extern "C" fn(packet: *const PointerPacket) -> i32;
+pub type RegisterDisplayFramebufferFn =
+    unsafe extern "C" fn(framebuffer: *const DisplayFramebufferRegistration) -> i32;
+pub type DriverLogFn =
+    unsafe extern "C" fn(level: u32, message_ptr: *const u8, message_len: u32) -> i32;
+pub type PciFindDeviceFn = unsafe extern "C" fn(
+    vendor_id: u16,
+    device_id: u16,
+    index: u32,
+    out_info: *mut DriverPciDeviceInfo,
+) -> i32;
+pub type PciReadConfigU32Fn = unsafe extern "C" fn(
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+    offset: u32,
+    out_value: *mut u32,
+) -> i32;
+pub type PciWriteConfigU32Fn = unsafe extern "C" fn(
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+    offset: u32,
+    value: u32,
+) -> i32;
+pub type PciGetBarInfoFn = unsafe extern "C" fn(
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+    bar_index: u32,
+    out_info: *mut DriverPciBarInfo,
+) -> i32;
+pub type MapMmioFn = unsafe extern "C" fn(
+    phys_addr: u64,
+    size: u64,
+    cache_policy: u32,
+    out_virt_addr: *mut u64,
+) -> i32;
+pub type ReadBootFileFn = unsafe extern "C" fn(
+    path_ptr: *const u8,
+    path_len: u32,
+    dst: *mut u8,
+    dst_len: u64,
+    out_read_len: *mut u64,
+) -> i32;
+pub type QueryBootFramebufferFn =
+    unsafe extern "C" fn(out_info: *mut DisplayFramebufferRegistration) -> i32;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DriverPciDeviceInfo {
+    pub segment: u16,
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+    pub revision: u8,
+    pub prog_if: u8,
+    pub subclass: u8,
+    pub class_code: u8,
+    pub subsystem_vendor_id: u16,
+    pub subsystem_device_id: u16,
+    pub interrupt_line: u8,
+    pub interrupt_pin: u8,
+    pub config_size: u16,
+    pub reserved0: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DriverPciBarInfo {
+    pub base: u64,
+    pub size: u64,
+    pub flags: u32,
+    pub reserved0: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DisplayFramebufferRegistration {
+    pub addr: u64,
+    pub size: u64,
+    pub back_buffer_addr: u64,
+    pub back_buffer_size: u64,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub pixel_format: u32,
+    pub bytes_per_pixel: u8,
+    pub reserved: [u8; 3],
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -528,18 +649,45 @@ pub struct DriverKernelApiV1 {
     pub struct_size: u32,
     pub register_serio_driver: Option<RegisterSerioDriverFn>,
     pub report_pointer_packet: Option<ReportPointerPacketFn>,
+    pub register_display_framebuffer: Option<RegisterDisplayFramebufferFn>,
+    pub log: Option<DriverLogFn>,
+    pub pci_find_device: Option<PciFindDeviceFn>,
+    pub pci_read_config_u32: Option<PciReadConfigU32Fn>,
+    pub pci_write_config_u32: Option<PciWriteConfigU32Fn>,
+    pub pci_get_bar_info: Option<PciGetBarInfoFn>,
+    pub map_mmio: Option<MapMmioFn>,
+    pub read_boot_file: Option<ReadBootFileFn>,
+    pub query_boot_framebuffer: Option<QueryBootFramebufferFn>,
 }
 
 impl DriverKernelApiV1 {
     pub const fn new(
         register_serio_driver: Option<RegisterSerioDriverFn>,
         report_pointer_packet: Option<ReportPointerPacketFn>,
+        register_display_framebuffer: Option<RegisterDisplayFramebufferFn>,
+        log: Option<DriverLogFn>,
+        pci_find_device: Option<PciFindDeviceFn>,
+        pci_read_config_u32: Option<PciReadConfigU32Fn>,
+        pci_write_config_u32: Option<PciWriteConfigU32Fn>,
+        pci_get_bar_info: Option<PciGetBarInfoFn>,
+        map_mmio: Option<MapMmioFn>,
+        read_boot_file: Option<ReadBootFileFn>,
+        query_boot_framebuffer: Option<QueryBootFramebufferFn>,
     ) -> Self {
         Self {
             abi_version: DRIVER_MODULE_ABI_VERSION,
             struct_size: core::mem::size_of::<Self>() as u32,
             register_serio_driver,
             report_pointer_packet,
+            register_display_framebuffer,
+            log,
+            pci_find_device,
+            pci_read_config_u32,
+            pci_write_config_u32,
+            pci_get_bar_info,
+            map_mmio,
+            read_boot_file,
+            query_boot_framebuffer,
         }
     }
 }

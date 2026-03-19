@@ -1,8 +1,14 @@
 mod bus;
 mod class;
+mod devres;
+mod dma;
 mod export;
 pub(crate) mod input;
+pub(crate) mod irq;
 pub(crate) mod linux;
+mod mmio;
+mod module_registry;
+pub(crate) mod pci;
 pub(crate) mod serio;
 
 use alloc::alloc::{Layout, alloc_zeroed, dealloc};
@@ -10,9 +16,12 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
 use core::ptr::{self, NonNull};
+use core::{slice, str};
 
 use driver_abi::{
-    DriverBus, DriverClass, DriverInitFn, DriverKernelApiV1, DriverModuleHeader,
+    DisplayFramebufferRegistration, DriverBus, DriverClass, DriverInitFn, DriverKernelApiV1,
+    DriverLogLevel, DriverMmioCachePolicy, DriverModuleHeader, DriverPciBarInfo,
+    DriverPciDeviceInfo, PCI_BAR_FLAG_64BIT, PCI_BAR_FLAG_IO_SPACE, PCI_BAR_FLAG_PREFETCHABLE,
     RUSTOS_DRIVER_ABI_VERSION_SYMBOL, RUSTOS_DRIVER_HEADER_SYMBOL, RUSTOS_DRIVER_INIT_SYMBOL,
 };
 use spin::Mutex;
@@ -56,6 +65,15 @@ static KERNEL_COMPAT_TRAMPOLINES: Mutex<Vec<KernelCompatTrampoline>> = Mutex::ne
 static DRIVER_KERNEL_API: DriverKernelApiV1 = DriverKernelApiV1::new(
     Some(serio::register_driver),
     Some(input::report_pointer_packet),
+    Some(register_display_framebuffer),
+    Some(driver_log),
+    Some(driver_pci_find_device),
+    Some(driver_pci_read_config_u32),
+    Some(driver_pci_write_config_u32),
+    Some(driver_pci_get_bar_info),
+    Some(driver_map_mmio),
+    Some(driver_read_boot_file),
+    Some(driver_query_boot_framebuffer),
 );
 
 const R_X86_64_64: u32 = 1;
@@ -148,7 +166,15 @@ pub(crate) fn register_loadable_elf(
 }
 
 pub(crate) fn initialize_loadable_modules() {
-    let candidates = {
+    initialize_loadable_modules_matching(|_| true);
+}
+
+pub(crate) fn initialize_loadable_modules_for_class(class: DriverClass) {
+    initialize_loadable_modules_matching(|record| record.class == class);
+}
+
+fn initialize_loadable_modules_matching(filter: impl Fn(&DriverRecord) -> bool) {
+    let mut pending = {
         let registry = DRIVER_REGISTRY.lock();
         let mut pending = Vec::new();
         for record in registry.iter() {
@@ -156,6 +182,9 @@ pub(crate) fn initialize_loadable_modules() {
                 continue;
             }
             if record.module_state != Some(DriverModuleState::Validated) {
+                continue;
+            }
+            if !filter(record) {
                 continue;
             }
             let Some(image_path) = record.image_path else {
@@ -168,77 +197,91 @@ pub(crate) fn initialize_loadable_modules() {
 
     crate::debug::println!(
         "driver module initialization start: candidates={}",
-        candidates.len()
+        pending.len()
     );
 
-    for (name, class, bus, image_path) in candidates {
-        match load_module_image(name, class, bus, image_path) {
-            Ok(module) => {
-                let mut registry = DRIVER_REGISTRY.lock();
-                if let Some(record) = registry.iter_mut().find(|record| {
-                    record.name == name
-                        && record.model == DriverExecutionModel::LoadableElf
-                        && record.image_path == Some(image_path)
-                }) {
-                    record.module_state = Some(DriverModuleState::Loaded);
-                    record.validation_error = None;
-                }
-                drop(registry);
+    while !pending.is_empty() {
+        let mut progress = false;
+        let mut deferred = Vec::new();
 
-                crate::debug::println!(
-                    "driver module loaded: name={} class={} bus={} path={} base={:#x} host={:#x}",
-                    module.name,
-                    class::name(class),
-                    bus::name(bus),
-                    module.image_path,
-                    module.memory.runtime_base(),
-                    module.memory.host_base() as usize
-                );
-                LOADED_MODULES.lock().push(module);
-            }
-            Err(error) => {
-                if error == "module references unsupported external symbol" {
+        for (name, class, bus, image_path) in pending.into_iter() {
+            match load_module_image(name, class, bus, image_path) {
+                Ok(module) => {
                     let mut registry = DRIVER_REGISTRY.lock();
                     if let Some(record) = registry.iter_mut().find(|record| {
                         record.name == name
                             && record.model == DriverExecutionModel::LoadableElf
                             && record.image_path == Some(image_path)
                     }) {
-                        record.module_state = Some(DriverModuleState::Deferred);
-                        record.validation_error = Some(error);
+                        record.module_state = Some(DriverModuleState::Loaded);
+                        record.validation_error = None;
                     }
                     drop(registry);
 
                     crate::debug::println!(
-                        "driver module deferred: name={} class={} bus={} path={} reason={}",
+                        "driver module loaded: name={} class={} bus={} path={} base={:#x} host={:#x}",
+                        module.name,
+                        class::name(class),
+                        bus::name(bus),
+                        module.image_path,
+                        module.memory.runtime_base(),
+                        module.memory.host_base() as usize
+                    );
+                    LOADED_MODULES.lock().push(module);
+                    progress = true;
+                }
+                Err(error) => {
+                    if error == "module references unsupported external symbol" {
+                        let mut registry = DRIVER_REGISTRY.lock();
+                        if let Some(record) = registry.iter_mut().find(|record| {
+                            record.name == name
+                                && record.model == DriverExecutionModel::LoadableElf
+                                && record.image_path == Some(image_path)
+                        }) {
+                            record.module_state = Some(DriverModuleState::Deferred);
+                            record.validation_error = Some(error);
+                        }
+                        drop(registry);
+
+                        deferred.push((name, class, bus, image_path));
+                        continue;
+                    }
+
+                    crate::debug::println!(
+                        "driver module load failed: name={} class={} bus={} path={} error={}",
                         name,
                         class::name(class),
                         bus::name(bus),
                         image_path,
                         error
                     );
-                    continue;
-                }
-
-                crate::debug::println!(
-                    "driver module load failed: name={} class={} bus={} path={} error={}",
-                    name,
-                    class::name(class),
-                    bus::name(bus),
-                    image_path,
-                    error
-                );
-                let mut registry = DRIVER_REGISTRY.lock();
-                if let Some(record) = registry.iter_mut().find(|record| {
-                    record.name == name
-                        && record.model == DriverExecutionModel::LoadableElf
-                        && record.image_path == Some(image_path)
-                }) {
-                    record.module_state = Some(DriverModuleState::LoadFailed);
-                    record.validation_error = Some(error);
+                    let mut registry = DRIVER_REGISTRY.lock();
+                    if let Some(record) = registry.iter_mut().find(|record| {
+                        record.name == name
+                            && record.model == DriverExecutionModel::LoadableElf
+                            && record.image_path == Some(image_path)
+                    }) {
+                        record.module_state = Some(DriverModuleState::LoadFailed);
+                        record.validation_error = Some(error);
+                    }
                 }
             }
         }
+
+        if !progress {
+            for (name, class, bus, image_path) in deferred.iter().copied() {
+                crate::debug::println!(
+                    "driver module deferred: name={} class={} bus={} path={} reason=module references unsupported external symbol",
+                    name,
+                    class::name(class),
+                    bus::name(bus),
+                    image_path
+                );
+            }
+            break;
+        }
+
+        pending = deferred;
     }
 
     let registry = DRIVER_REGISTRY.lock();
@@ -255,6 +298,330 @@ pub(crate) fn initialize_loadable_modules() {
             record.module_state,
             record.validation_error.unwrap_or("-")
         );
+    }
+}
+
+unsafe extern "C" fn register_display_framebuffer(
+    framebuffer: *const DisplayFramebufferRegistration,
+) -> i32 {
+    unsafe { crate::gui::register_driver_framebuffer(framebuffer) }
+}
+
+unsafe extern "C" fn driver_log(level: u32, message_ptr: *const u8, message_len: u32) -> i32 {
+    if message_len == 0 {
+        return 0;
+    }
+    if message_ptr.is_null() {
+        return -14;
+    }
+
+    let bytes = unsafe { slice::from_raw_parts(message_ptr, message_len as usize) };
+    let Ok(message) = str::from_utf8(bytes) else {
+        return -22;
+    };
+
+    match level {
+        value if value == DriverLogLevel::Error as u32 => {
+            crate::debug::println!("driver[error]: {}", message);
+        }
+        value if value == DriverLogLevel::Warn as u32 => {
+            crate::debug::println!("driver[warn]: {}", message);
+        }
+        value if value == DriverLogLevel::Info as u32 => {
+            crate::debug::println!("driver[info]: {}", message);
+        }
+        value if value == DriverLogLevel::Debug as u32 => {
+            crate::debug::println!("driver[debug]: {}", message);
+        }
+        _ => return -22,
+    }
+
+    0
+}
+
+unsafe extern "C" fn driver_pci_find_device(
+    vendor_id: u16,
+    device_id: u16,
+    index: u32,
+    out_info: *mut DriverPciDeviceInfo,
+) -> i32 {
+    if out_info.is_null() {
+        return -14;
+    }
+
+    let mut match_index = 0_u32;
+    let mut found = None;
+    crate::arch::pci::visit_devices(|device| {
+        if device.vendor_id() != vendor_id || device.device_id() != device_id {
+            return false;
+        }
+        if match_index == index {
+            found = Some(device);
+            return true;
+        }
+        match_index = match_index.saturating_add(1);
+        false
+    });
+
+    let Some(device) = found else {
+        return -19;
+    };
+
+    unsafe {
+        ptr::write(out_info, driver_pci_device_info(device));
+    }
+    0
+}
+
+unsafe extern "C" fn driver_pci_read_config_u32(
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+    offset: u32,
+    out_value: *mut u32,
+) -> i32 {
+    if out_value.is_null() {
+        return -14;
+    }
+    let Ok(offset) = u8::try_from(offset) else {
+        return -22;
+    };
+    if (offset & 0x3) != 0 {
+        return -22;
+    }
+
+    let device = match driver_pci_device(segment, bus, device, function) {
+        Ok(device) => device,
+        Err(status) => return status,
+    };
+    if usize::from(offset) >= device.config_size() as usize {
+        return -22;
+    }
+
+    unsafe {
+        ptr::write(out_value, device.read_u32(offset));
+    }
+    0
+}
+
+unsafe extern "C" fn driver_pci_write_config_u32(
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+    offset: u32,
+    value: u32,
+) -> i32 {
+    let Ok(offset) = u8::try_from(offset) else {
+        return -22;
+    };
+    if (offset & 0x3) != 0 {
+        return -22;
+    }
+
+    let device = match driver_pci_device(segment, bus, device, function) {
+        Ok(device) => device,
+        Err(status) => return status,
+    };
+    if usize::from(offset) >= device.config_size() as usize {
+        return -22;
+    }
+
+    device.write_u32(offset, value);
+    0
+}
+
+unsafe extern "C" fn driver_pci_get_bar_info(
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+    bar_index: u32,
+    out_info: *mut DriverPciBarInfo,
+) -> i32 {
+    if out_info.is_null() {
+        return -14;
+    }
+
+    let device = match driver_pci_device(segment, bus, device, function) {
+        Ok(device) => device,
+        Err(status) => return status,
+    };
+
+    let Some(resource) = device.resource(bar_index as usize) else {
+        return -19;
+    };
+
+    let mut flags = 0_u32;
+    if resource.is_io {
+        flags |= PCI_BAR_FLAG_IO_SPACE;
+    }
+    if resource.prefetchable {
+        flags |= PCI_BAR_FLAG_PREFETCHABLE;
+    }
+    if resource.is_64bit {
+        flags |= PCI_BAR_FLAG_64BIT;
+    }
+
+    unsafe {
+        ptr::write(
+            out_info,
+            DriverPciBarInfo {
+                base: resource.start,
+                size: resource.size,
+                flags,
+                reserved0: 0,
+            },
+        );
+    }
+    0
+}
+
+unsafe extern "C" fn driver_map_mmio(
+    phys_addr: u64,
+    size: u64,
+    cache_policy: u32,
+    out_virt_addr: *mut u64,
+) -> i32 {
+    if out_virt_addr.is_null() {
+        return -14;
+    }
+    let Ok(size) = usize::try_from(size) else {
+        return -22;
+    };
+    if size == 0 {
+        return -22;
+    }
+
+    let write_combine = match cache_policy {
+        value if value == DriverMmioCachePolicy::Uncached as u32 => false,
+        value if value == DriverMmioCachePolicy::WriteCombine as u32 => true,
+        _ => return -22,
+    };
+
+    let addr = crate::driver::mmio::map(phys_addr, size, write_combine);
+    if addr.is_null() {
+        return -12;
+    }
+
+    unsafe {
+        ptr::write(out_virt_addr, addr as usize as u64);
+    }
+    0
+}
+
+unsafe extern "C" fn driver_read_boot_file(
+    path_ptr: *const u8,
+    path_len: u32,
+    dst: *mut u8,
+    dst_len: u64,
+    out_read_len: *mut u64,
+) -> i32 {
+    if path_len == 0 || path_ptr.is_null() {
+        return -22;
+    }
+
+    let path_bytes = unsafe { slice::from_raw_parts(path_ptr, path_len as usize) };
+    let Ok(path) = str::from_utf8(path_bytes) else {
+        return -22;
+    };
+
+    let bytes = match crate::fat::read_file_to_vec(path) {
+        Ok(bytes) => bytes,
+        Err(_) => return -2,
+    };
+
+    if !out_read_len.is_null() {
+        unsafe {
+            ptr::write(out_read_len, bytes.len() as u64);
+        }
+    }
+
+    if dst.is_null() {
+        return if dst_len == 0 { 0 } else { -14 };
+    }
+    if bytes.len() > dst_len as usize {
+        return -75;
+    }
+
+    unsafe {
+        ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+    }
+    0
+}
+
+unsafe extern "C" fn driver_query_boot_framebuffer(
+    out_info: *mut DisplayFramebufferRegistration,
+) -> i32 {
+    if out_info.is_null() {
+        return -14;
+    }
+    let Some(info) = crate::fat::boot_framebuffer_info() else {
+        return -19;
+    };
+
+    let pixel_format = match info.pixel_format {
+        boot_protocol::BootPixelFormat::Rgb => driver_abi::DisplayPixelFormat::Rgb as u32,
+        boot_protocol::BootPixelFormat::Bgr => driver_abi::DisplayPixelFormat::Bgr as u32,
+        boot_protocol::BootPixelFormat::Bitmask => driver_abi::DisplayPixelFormat::Bitmask as u32,
+        boot_protocol::BootPixelFormat::Unknown => driver_abi::DisplayPixelFormat::Unknown as u32,
+    };
+
+    unsafe {
+        ptr::write(
+            out_info,
+            DisplayFramebufferRegistration {
+                addr: info.addr,
+                size: info.size,
+                back_buffer_addr: info.back_buffer_addr,
+                back_buffer_size: info.back_buffer_size,
+                width: info.width,
+                height: info.height,
+                stride: info.stride,
+                pixel_format,
+                bytes_per_pixel: info.bytes_per_pixel,
+                reserved: [0; 3],
+            },
+        );
+    }
+    0
+}
+
+fn driver_pci_device(
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+) -> Result<crate::arch::pci::PciDevice, i32> {
+    let device = crate::arch::pci::PciDevice {
+        segment,
+        bus,
+        device,
+        function,
+    };
+    if !device.is_present() {
+        return Err(-19);
+    }
+    Ok(device)
+}
+
+fn driver_pci_device_info(device: crate::arch::pci::PciDevice) -> DriverPciDeviceInfo {
+    DriverPciDeviceInfo {
+        segment: device.segment,
+        bus: device.bus,
+        device: device.device,
+        function: device.function,
+        revision: device.revision(),
+        prog_if: device.prog_if(),
+        subclass: device.subclass(),
+        class_code: device.class_code(),
+        subsystem_vendor_id: device.subsystem_vendor_id(),
+        subsystem_device_id: device.subsystem_device_id(),
+        interrupt_line: device.interrupt_line(),
+        interrupt_pin: device.interrupt_pin(),
+        config_size: device.config_size() as u16,
+        reserved0: 0,
     }
 }
 
@@ -511,6 +878,16 @@ fn load_module_image(
         return Err("driver module init returned failure");
     }
 
+    let exported = module_registry::register_module_exports(name, &elf, &memory, &layout)?;
+    if exported != 0 {
+        crate::debug::println!(
+            "driver module exports registered: name={} path={} count={}",
+            name,
+            image_path,
+            exported
+        );
+    }
+
     Ok(LoadedDriverModule {
         name,
         image_path,
@@ -665,8 +1042,7 @@ fn apply_module_relocations(
     layout: &ModuleLoadLayout,
 ) -> Result<(), &'static str> {
     let symbols = symbol_table_entries(elf)?;
-    let mut resolved_symbols =
-        vec![[None; SymbolResolveFlavor::COUNT]; symbols.len()];
+    let mut resolved_symbols = vec![[None; SymbolResolveFlavor::COUNT]; symbols.len()];
 
     for reloc_section in elf.section_iter() {
         if !matches!(reloc_section.get_type(), Ok(ShType::Rela)) {
@@ -1068,9 +1444,10 @@ fn find_named_section<'a>(
 }
 
 fn symbol_string_table<'a>(elf: &'a ElfFile<'a>) -> Result<&'a [u8], &'static str> {
-    let section = find_named_section(elf, ".symtab")?.ok_or("module ELF does not contain .symtab")?;
-    let string_table_index =
-        u16::try_from(section.link()).map_err(|_| "module ELF symtab string table index overflow")?;
+    let section =
+        find_named_section(elf, ".symtab")?.ok_or("module ELF does not contain .symtab")?;
+    let string_table_index = u16::try_from(section.link())
+        .map_err(|_| "module ELF symtab string table index overflow")?;
     let string_table = elf
         .section_header(string_table_index)
         .map_err(|_| "module ELF symtab string table is invalid")?;
@@ -1100,7 +1477,8 @@ fn symbol_name_from_table<'a>(
 fn symbol_table_entries<'a>(
     elf: &'a ElfFile<'a>,
 ) -> Result<&'a [xmas_elf::symbol_table::Entry64], &'static str> {
-    let section = find_named_section(elf, ".symtab")?.ok_or("module ELF does not contain .symtab")?;
+    let section =
+        find_named_section(elf, ".symtab")?.ok_or("module ELF does not contain .symtab")?;
     let SectionData::SymbolTable64(entries) = section
         .get_data(elf)
         .map_err(|_| "module ELF symtab could not be parsed")?

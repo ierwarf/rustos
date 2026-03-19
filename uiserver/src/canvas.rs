@@ -5,9 +5,14 @@ use embedded_graphics::geometry::{OriginDimensions, Size};
 use embedded_graphics::pixelcolor::Rgb888;
 use embedded_graphics::prelude::{Pixel, RgbColor};
 
+use crate::simd;
+
 const COLOR_CURSOR_FILL: u32 = 0x00ff_ffff;
 const COLOR_CURSOR_OUTLINE: u32 = 0x0000_0000;
 const COLOR_CURSOR_SHADOW: u32 = 0x0026_313f;
+const CURSOR_BITMAP_WIDTH: usize = 32;
+const CURSOR_BITMAP_HEIGHT: usize = 32;
+const CURSOR_SHADOW_OFFSET: usize = 1;
 const CURSOR_BITMAP: [&[u8]; 32] = [
     b"X...............................",
     b"XX..............................",
@@ -69,6 +74,60 @@ impl Rect {
             && px < self.x.saturating_add(self.width)
             && py < self.y.saturating_add(self.height)
     }
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.width == 0 || self.height == 0
+    }
+
+    pub(crate) fn intersect(&self, other: Rect) -> Rect {
+        let start_x = self.x.max(other.x);
+        let start_y = self.y.max(other.y);
+        let end_x = self
+            .x
+            .saturating_add(self.width)
+            .min(other.x.saturating_add(other.width));
+        let end_y = self
+            .y
+            .saturating_add(self.height)
+            .min(other.y.saturating_add(other.height));
+        if start_x >= end_x || start_y >= end_y {
+            return Rect::empty();
+        }
+
+        Rect {
+            x: start_x,
+            y: start_y,
+            width: end_x - start_x,
+            height: end_y - start_y,
+        }
+    }
+
+    pub(crate) fn union(&self, other: Rect) -> Rect {
+        if self.is_empty() {
+            return other;
+        }
+        if other.is_empty() {
+            return *self;
+        }
+
+        let start_x = self.x.min(other.x);
+        let start_y = self.y.min(other.y);
+        let end_x = self
+            .x
+            .saturating_add(self.width)
+            .max(other.x.saturating_add(other.width));
+        let end_y = self
+            .y
+            .saturating_add(self.height)
+            .max(other.y.saturating_add(other.height));
+
+        Rect {
+            x: start_x,
+            y: start_y,
+            width: end_x.saturating_sub(start_x),
+            height: end_y.saturating_sub(start_y),
+        }
+    }
 }
 
 pub(crate) struct SurfaceCanvas<'a> {
@@ -76,6 +135,7 @@ pub(crate) struct SurfaceCanvas<'a> {
     width: u32,
     height: u32,
     stride_pixels: usize,
+    clip_rect: Rect,
 }
 
 impl<'a> SurfaceCanvas<'a> {
@@ -85,36 +145,60 @@ impl<'a> SurfaceCanvas<'a> {
         height: u32,
         stride_pixels: usize,
     ) -> Self {
+        let clip_rect = Rect {
+            x: 0,
+            y: 0,
+            width: width as usize,
+            height: height as usize,
+        };
+
         Self {
             pixels,
             width,
             height,
             stride_pixels,
+            clip_rect,
+        }
+    }
+
+    pub(crate) fn with_clip(
+        pixels: &'a mut [u32],
+        width: u32,
+        height: u32,
+        stride_pixels: usize,
+        clip_rect: Rect,
+    ) -> Self {
+        let screen_rect = Rect {
+            x: 0,
+            y: 0,
+            width: width as usize,
+            height: height as usize,
+        };
+
+        Self {
+            pixels,
+            width,
+            height,
+            stride_pixels,
+            clip_rect: screen_rect.intersect(clip_rect),
         }
     }
 
     pub(crate) fn fill_rect(&mut self, rect: Rect, color: u32) {
-        if rect.width == 0 || rect.height == 0 {
+        let rect = rect.intersect(self.clip_rect);
+        if rect.is_empty() {
             return;
         }
 
-        let start_x = rect.x.min(self.width as usize);
-        let start_y = rect.y.min(self.height as usize);
-        let end_x = rect.x.saturating_add(rect.width).min(self.width as usize);
-        let end_y = rect.y.saturating_add(rect.height).min(self.height as usize);
-        if start_x >= end_x || start_y >= end_y {
-            return;
-        }
-
-        for row in start_y..end_y {
-            let row_start = row * self.stride_pixels + start_x;
-            let row_end = row * self.stride_pixels + end_x;
+        for row in rect.y..rect.y.saturating_add(rect.height) {
+            let row_start = row * self.stride_pixels + rect.x;
+            let row_end = row_start + rect.width;
             self.pixels[row_start..row_end].fill(color);
         }
     }
 
     pub(crate) fn fill_rect_alpha(&mut self, rect: Rect, color: u32, alpha: u8) {
-        if rect.width == 0 || rect.height == 0 || alpha == 0 {
+        if alpha == 0 {
             return;
         }
         if alpha == u8::MAX {
@@ -122,20 +206,15 @@ impl<'a> SurfaceCanvas<'a> {
             return;
         }
 
-        let start_x = rect.x.min(self.width as usize);
-        let start_y = rect.y.min(self.height as usize);
-        let end_x = rect.x.saturating_add(rect.width).min(self.width as usize);
-        let end_y = rect.y.saturating_add(rect.height).min(self.height as usize);
-        if start_x >= end_x || start_y >= end_y {
+        let rect = rect.intersect(self.clip_rect);
+        if rect.is_empty() {
             return;
         }
 
-        for row in start_y..end_y {
-            let row_start = row * self.stride_pixels + start_x;
-            let row_end = row * self.stride_pixels + end_x;
-            for pixel in &mut self.pixels[row_start..row_end] {
-                *pixel = blend_bgr(*pixel, color, alpha);
-            }
+        for row in rect.y..rect.y.saturating_add(rect.height) {
+            let row_start = row * self.stride_pixels + rect.x;
+            let row_end = row_start + rect.width;
+            simd::blend_solid_bgr(&mut self.pixels[row_start..row_end], color, alpha);
         }
     }
 
@@ -147,15 +226,18 @@ impl<'a> SurfaceCanvas<'a> {
         let bottom_g = ((bottom >> 8) & 0xff) as i64;
         let bottom_r = ((bottom >> 16) & 0xff) as i64;
         let denom = self.height.saturating_sub(1).max(1) as i64;
+        if self.clip_rect.is_empty() {
+            return;
+        }
 
-        for y in 0..self.height {
+        for y in self.clip_rect.y..self.clip_rect.y.saturating_add(self.clip_rect.height) {
             let y_i64 = y as i64;
             let b = top_b + ((bottom_b - top_b) * y_i64) / denom;
             let g = top_g + ((bottom_g - top_g) * y_i64) / denom;
             let r = top_r + ((bottom_r - top_r) * y_i64) / denom;
             let color = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
-            let row_start = y as usize * self.stride_pixels;
-            let row_end = row_start + self.width as usize;
+            let row_start = y * self.stride_pixels + self.clip_rect.x;
+            let row_end = row_start + self.clip_rect.width;
             self.pixels[row_start..row_end].fill(color);
         }
     }
@@ -169,8 +251,47 @@ impl<'a> SurfaceCanvas<'a> {
         self.draw_cursor_layer(base_x, base_y, Some(b'O'), COLOR_CURSOR_FILL);
     }
 
+    pub(crate) fn draw_surface(
+        &mut self,
+        src_pixels: &[u32],
+        src_width: usize,
+        src_height: usize,
+        src_stride_pixels: usize,
+        dst_x: usize,
+        dst_y: usize,
+    ) {
+        if src_width == 0 || src_height == 0 {
+            return;
+        }
+
+        let dst_rect = Rect {
+            x: dst_x,
+            y: dst_y,
+            width: src_width,
+            height: src_height,
+        }
+        .intersect(self.clip_rect);
+        if dst_rect.is_empty() {
+            return;
+        }
+
+        let src_x = dst_rect.x.saturating_sub(dst_x);
+        let src_y = dst_rect.y.saturating_sub(dst_y);
+
+        for row in 0..dst_rect.height {
+            let src_row = (src_y + row) * src_stride_pixels + src_x;
+            let dst_row = (dst_rect.y + row) * self.stride_pixels + dst_rect.x;
+            let src = &src_pixels[src_row..src_row + dst_rect.width];
+            let dst = &mut self.pixels[dst_row..dst_row + dst_rect.width];
+            simd::copy_u32s(src, dst);
+        }
+    }
+
     fn put_pixel(&mut self, x: i32, y: i32, color: u32) {
         if x < 0 || y < 0 || x as u32 >= self.width || y as u32 >= self.height {
+            return;
+        }
+        if !self.clip_rect.contains(x as u32, y as u32) {
             return;
         }
 
@@ -204,17 +325,11 @@ impl DrawTarget for SurfaceCanvas<'_> {
         I: IntoIterator<Item = Pixel<Self::Color>>,
     {
         for Pixel(point, color) in pixels {
-            if point.x < 0
-                || point.y < 0
-                || point.x >= self.width as i32
-                || point.y >= self.height as i32
-            {
-                continue;
-            }
-
-            let index = point.y as usize * self.stride_pixels + point.x as usize;
-            self.pixels[index] =
-                ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | color.b() as u32;
+            self.put_pixel(
+                point.x,
+                point.y,
+                ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | color.b() as u32,
+            );
         }
         Ok(())
     }
@@ -226,20 +341,17 @@ impl OriginDimensions for SurfaceCanvas<'_> {
     }
 }
 
-fn blend_bgr(dst: u32, src: u32, alpha: u8) -> u32 {
-    let alpha = alpha as u32;
-    let inv_alpha = 255_u32.saturating_sub(alpha);
-
-    let dst_b = dst & 0xff;
-    let dst_g = (dst >> 8) & 0xff;
-    let dst_r = (dst >> 16) & 0xff;
-    let src_b = src & 0xff;
-    let src_g = (src >> 8) & 0xff;
-    let src_r = (src >> 16) & 0xff;
-
-    let out_b = (src_b * alpha + dst_b * inv_alpha) / 255;
-    let out_g = (src_g * alpha + dst_g * inv_alpha) / 255;
-    let out_r = (src_r * alpha + dst_r * inv_alpha) / 255;
-
-    (out_r << 16) | (out_g << 8) | out_b
+pub(crate) fn cursor_dirty_rect(cursor_x: u32, cursor_y: u32, width: u32, height: u32) -> Rect {
+    Rect {
+        x: cursor_x as usize,
+        y: cursor_y as usize,
+        width: CURSOR_BITMAP_WIDTH + CURSOR_SHADOW_OFFSET,
+        height: CURSOR_BITMAP_HEIGHT + CURSOR_SHADOW_OFFSET,
+    }
+    .intersect(Rect {
+        x: 0,
+        y: 0,
+        width: width as usize,
+        height: height as usize,
+    })
 }

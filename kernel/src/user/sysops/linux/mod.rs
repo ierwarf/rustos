@@ -15,7 +15,8 @@ use crate::paging;
 use crate::rtc;
 use crate::user::abi::UserAbi;
 use crate::user::handles::{
-    BootFileSeekWhence, ConsoleStreamKind, FD_CLOEXEC, FIRST_DYNAMIC_FD, HandleEntry, KernelHandle,
+    ConsoleStreamKind, FD_CLOEXEC, FIRST_DYNAMIC_FD, FileHandleSeekWhence, HandleEntry,
+    KernelHandle,
 };
 use crate::user::linux as linux_abi;
 

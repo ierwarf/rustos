@@ -273,11 +273,6 @@ fn syscall_linux_lseek(fd: u64, offset: i64, whence: u64) -> u64 {
 }
 
 fn syscall_linux_writev(fd: u64, iov_ptr: u64, iov_count: u64) -> u64 {
-    if fd == 2 && crate::multitask::current_user_id() == Some(1) {
-        if let Some(preview) = debug_user_iov_text(iov_ptr, iov_count) {
-            debug::println!("uiserver stderr: {}", preview);
-        }
-    }
     match linux_ops::writev(fd, iov_ptr, iov_count) {
         Ok(written) => written as u64,
         Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
@@ -847,63 +842,6 @@ fn debug_user_path(path_ptr: u64) -> String {
         Ok(path) => path,
         Err(_) => String::from("<invalid>"),
     }
-}
-
-fn debug_user_iov_text(iov_ptr: u64, iov_count: u64) -> Option<String> {
-    let iov_count = usize::try_from(iov_count).ok()?.min(8);
-    if iov_count == 0 {
-        return None;
-    }
-
-    let mut bytes = [0_u8; 256];
-    let mut written = 0usize;
-    for index in 0..iov_count {
-        let iovec_ptr =
-            iov_ptr.checked_add((index * core::mem::size_of::<linux_abi::LinuxIovec>()) as u64)?;
-        let mut iovec = linux_abi::LinuxIovec::default();
-        let iovec_bytes = unsafe {
-            core::slice::from_raw_parts_mut(
-                core::ptr::addr_of_mut!(iovec).cast::<u8>(),
-                core::mem::size_of::<linux_abi::LinuxIovec>(),
-            )
-        };
-        usermem::copy_from_current_user_exact(iovec_ptr, iovec_bytes).ok()?;
-
-        let available = bytes.len().saturating_sub(written);
-        if available == 0 {
-            break;
-        }
-
-        let chunk_len = usize::try_from(iovec.iov_len).ok()?.min(available);
-        if chunk_len == 0 {
-            continue;
-        }
-
-        usermem::copy_from_current_user_exact(
-            iovec.iov_base,
-            &mut bytes[written..written + chunk_len],
-        )
-        .ok()?;
-        written += chunk_len;
-        if written == bytes.len() {
-            break;
-        }
-    }
-
-    if written == 0 {
-        return None;
-    }
-
-    Some(
-        bytes[..written]
-            .iter()
-            .map(|byte| match byte {
-                b'\r' | b'\n' => ' ',
-                0x20..=0x7e => *byte as char,
-                _ => '?',
-            })
-            .collect(),
-    )
 }
 
 fn address_space_error_to_linux_errno(err: paging::AddressSpaceError) -> i64 {

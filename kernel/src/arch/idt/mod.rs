@@ -15,6 +15,11 @@ lazy_static! {
         use handlers::*;
 
         set_general_handler!(&mut idt, default_handler, 0..=31);
+        set_general_handler!(
+            &mut idt,
+            pic_interrupt_handler,
+            crate::pic::PIC_1_OFFSET..=crate::pic::PIC_2_OFFSET + 7
+        );
         unsafe {
             idt.double_fault
                 .set_handler_fn(double_fault_handler)

@@ -41,7 +41,9 @@ pub(crate) fn readlinkat(
 ) -> Result<usize, LinuxSysopError> {
     let path = usermem::read_current_user_c_string(path_ptr, 256)?;
     let absolute_path = file::resolve_path_for_current_process(dirfd, &path)?;
-    let target = symlink_target_for_current_process(absolute_path.as_str())?;
+    let target = crate::vfs::readlink_for_current_process(absolute_path.as_str())
+        .map_err(file::FileSysopError::from)
+        .map_err(LinuxSysopError::from)?;
     if user_len == 0 {
         return Ok(0);
     }
@@ -75,9 +77,9 @@ pub(crate) fn lseek(fd: u64, offset: i64, whence: u64) -> Result<u64, LinuxSysop
     }
 
     let whence = match whence {
-        linux_abi::SEEK_SET => BootFileSeekWhence::Start,
-        linux_abi::SEEK_CUR => BootFileSeekWhence::Current,
-        linux_abi::SEEK_END => BootFileSeekWhence::End,
+        linux_abi::SEEK_SET => FileHandleSeekWhence::Start,
+        linux_abi::SEEK_CUR => FileHandleSeekWhence::Current,
+        linux_abi::SEEK_END => FileHandleSeekWhence::End,
         _ => return Err(LinuxSysopError::InvalidArgument),
     };
 
@@ -132,34 +134,6 @@ pub(crate) fn statx(
     let stat = stat_for_path_or_fd(dirfd, path.as_deref(), flags)?;
     let statx = linux_stat_to_statx(&stat, mask);
     write_linux_statx(statx_ptr, &statx)
-}
-
-fn symlink_target_for_current_process(
-    path: &str,
-) -> Result<alloc::string::String, LinuxSysopError> {
-    match path {
-        "/proc/self/cwd" => return Ok(alloc::string::String::from("/")),
-        "/proc/self/exe" => return file::current_process_exec_path().map_err(Into::into),
-        _ => {}
-    }
-
-    if let Some(fd) = parse_self_fd_link(path) {
-        return file::path_for_current_process_fd(fd)
-            .map_err(LinuxSysopError::from)?
-            .ok_or(LinuxSysopError::NotFound);
-    }
-
-    Err(LinuxSysopError::NotFound)
-}
-
-fn parse_self_fd_link(path: &str) -> Option<u64> {
-    let suffix = path
-        .strip_prefix("/proc/self/fd/")
-        .or_else(|| path.strip_prefix("/dev/fd/"))?;
-    if suffix.is_empty() || suffix.bytes().any(|byte| !byte.is_ascii_digit()) {
-        return None;
-    }
-    suffix.parse::<u64>().ok()
 }
 
 fn write_linux_stat(stat_ptr: u64, stat: &linux_abi::LinuxStat) -> Result<(), LinuxSysopError> {
@@ -292,23 +266,5 @@ fn check_access_path(dirfd: u64, path: &str, mode: u64, flags: u64) -> Result<()
     }
 
     let absolute_path = file::resolve_path_for_current_process(dirfd, path)?;
-
-    if absolute_path.starts_with("/dev/") {
-        if mode & !(linux_abi::R_OK | linux_abi::W_OK | linux_abi::X_OK | linux_abi::F_OK) != 0 {
-            return Err(LinuxSysopError::InvalidArgument);
-        }
-        match device_ns::lookup(absolute_path.as_str()) {
-            Ok(_) => {
-                if mode & (linux_abi::W_OK | linux_abi::X_OK) != 0 {
-                    Err(LinuxSysopError::PermissionDenied)
-                } else {
-                    Ok(())
-                }
-            }
-            Err(device_ns::DeviceLookupError::NotFound) => Err(LinuxSysopError::NotFound),
-            Err(device_ns::DeviceLookupError::InvalidPath) => Err(LinuxSysopError::InvalidArgument),
-        }
-    } else {
-        file::check_access_for_current_process(absolute_path.as_str(), mode).map_err(Into::into)
-    }
+    file::check_access_for_current_process(absolute_path.as_str(), mode).map_err(Into::into)
 }

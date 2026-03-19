@@ -202,7 +202,7 @@ impl ProcessStartRegisters {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum LoadedProcessRuntime {
     Linux(LinuxProcessImageInfo),
     Windows,
@@ -418,17 +418,23 @@ fn build_process_bootstrap(
     user_stack: Option<multitask::UserStackState>,
     launch: ProcessLaunchOptions<'_>,
 ) -> Result<multitask::UserTaskBootstrap, ProcessLoadError> {
-    let (stack_pointer, mut linux_process_state, linux_thread_state) = match (abi, runtime) {
+    let (stack_pointer, mut linux_process_state, linux_memory_map, linux_thread_state) =
+        match (abi, runtime) {
         (UserAbi::Linux, LoadedProcessRuntime::Linux(image)) => {
-            linux::initialize_linux_initial_tls(address_space, image)?;
+            linux::initialize_linux_initial_tls(address_space, &image)?;
             (
-                linux::initialize_linux_user_stack(address_space, stack_end, image, launch.linux)?,
+                linux::initialize_linux_user_stack(address_space, stack_end, &image, launch.linux)?,
                 Some(image.initial_process_state()),
+                Some(linux::build_initial_memory_map(
+                    &image,
+                    launch.linux.exec_path,
+                    user_stack,
+                )),
                 Some(image.initial_thread_state()),
             )
         }
         (UserAbi::Windows, LoadedProcessRuntime::Windows) => {
-            (initial_user_stack_top(stack_end)?, None, None)
+            (initial_user_stack_top(stack_end)?, None, None, None)
         }
         _ => {
             return Err(ProcessLoadError::InvalidElf(
@@ -448,6 +454,7 @@ fn build_process_bootstrap(
             })?;
     }
     bootstrap.linux_process_state = linux_process_state;
+    bootstrap.linux_memory_map = linux_memory_map;
     bootstrap.linux_thread_state = linux_thread_state;
     bootstrap.console_session = launch.console_session;
     bootstrap.logical_admin = launch.logical_admin;

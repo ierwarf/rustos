@@ -17,7 +17,7 @@ use self::scheduler::Scheduler;
 use crate::paging::ProcessAddressSpace;
 use crate::session::ConsoleSessionId;
 use crate::user::abi::UserAbi;
-use crate::user::linux::{LinuxProcessState, LinuxThreadState};
+use crate::user::linux::{LinuxMemoryMapState, LinuxProcessState, LinuxThreadState};
 use crate::user::process_state::UserProcessState;
 
 const MAIN_THREAD_SLICE_MICROS: u64 = 1_000;
@@ -123,7 +123,7 @@ impl UserStackState {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct UserTaskBootstrap {
     pub abi: UserAbi,
     pub entry: VirtAddr,
@@ -131,6 +131,7 @@ pub struct UserTaskBootstrap {
     pub registers: UserTaskRegisters,
     pub user_stack: Option<UserStackState>,
     pub linux_process_state: Option<LinuxProcessState>,
+    pub linux_memory_map: Option<LinuxMemoryMapState>,
     pub linux_thread_state: Option<LinuxThreadState>,
     pub console_session: ConsoleSessionId,
     pub logical_admin: bool,
@@ -147,6 +148,7 @@ impl UserTaskBootstrap {
             registers: UserTaskRegisters::default(),
             user_stack: None,
             linux_process_state: None,
+            linux_memory_map: None,
             linux_thread_state: None,
             console_session: ConsoleSessionId::PRIMARY,
             logical_admin: false,
@@ -338,15 +340,15 @@ pub fn init() {
     crate::pit::start_micros(0, MAIN_THREAD_SLICE_MICROS);
 }
 
-pub fn save_current_fx_state() {
+pub fn save_current_simd_state() {
     interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().save_current_fx_state();
+        scheduler_mut().save_current_simd_state();
     });
 }
 
-pub fn restore_current_fx_state() {
+pub fn restore_current_simd_state() {
     interrupts::without_interrupts(|| unsafe {
-        scheduler_ref().restore_current_fx_state();
+        scheduler_ref().restore_current_simd_state();
     });
 }
 
@@ -493,11 +495,11 @@ extern "C" fn timer_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut S
     let next_rsp = unsafe {
         let scheduler = scheduler_mut();
         crate::driver::linux::runtime::tick_jiffies(1);
-        scheduler.save_current_fx_state();
+        scheduler.save_current_simd_state();
         let (next_rsp, next_pit_divisor) = scheduler.on_timer_interrupt(current_rsp);
         crate::pit::set_divisor(0, next_pit_divisor);
         scheduler.prepare_current_task_execution();
-        scheduler.restore_current_fx_state();
+        scheduler.restore_current_simd_state();
         next_rsp
     };
 
@@ -517,10 +519,10 @@ extern "C" fn rtc_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut Sav
     let next_rsp = unsafe {
         let scheduler = scheduler_mut();
         crate::driver::linux::runtime::tick_jiffies(1);
-        scheduler.save_current_fx_state();
+        scheduler.save_current_simd_state();
         let (next_rsp, _next_pit_divisor) = scheduler.on_timer_interrupt(current_rsp);
         scheduler.prepare_current_task_execution();
-        scheduler.restore_current_fx_state();
+        scheduler.restore_current_simd_state();
         next_rsp
     };
 
@@ -540,10 +542,10 @@ extern "C" fn software_schedule_interrupt_dispatch(
     let current_rsp = context_ptr as usize;
     let next_rsp = unsafe {
         let scheduler = scheduler_mut();
-        scheduler.save_current_fx_state();
+        scheduler.save_current_simd_state();
         let (next_rsp, _next_pit_divisor) = scheduler.on_timer_interrupt(current_rsp);
         scheduler.prepare_current_task_execution();
-        scheduler.restore_current_fx_state();
+        scheduler.restore_current_simd_state();
         next_rsp
     };
 

@@ -16,6 +16,7 @@ build: target build-efi build-prekernel build-kernel build-user build-console-de
 	@echo "User ELF ready: $(IMAGE_USER_ELF)"
 	@echo "User EXE ready: $(IMAGE_WIN_USER_EXE)"
 	@echo "Console demo ELF ready: $(IMAGE_PRINTF_DEMO_ELF)"
+	@echo "AMDGPU driver module ready: $(IMAGE_AMDGPU_KO)"
 	@echo "PS/2 mouse driver module ready: $(IMAGE_PSMOUSE_KO)"
 	@echo "UEFI startup script ready: $(STARTUP_NSH)"
 	@if [ -f "$(BOOT_FILE_LIST)" ]; then echo "Boot file manifest ready: $(BOOT_FILE_LIST)"; fi
@@ -39,7 +40,7 @@ build-driver-modules:
 	$(MAKE) -C $(ROOT_DIR)/drivers ROOT_DIR=$(ROOT_DIR) build-driver-modules
 
 stage:
-	$(MAKE) -C $(ROOT_DIR)/tools ROOT_DIR=$(ROOT_DIR) stage
+	$(CARGO) xtask stage
 
 check: target
 	$(MAKE) -C $(ROOT_DIR)/bootloader ROOT_DIR=$(ROOT_DIR) check

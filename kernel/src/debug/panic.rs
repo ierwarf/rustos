@@ -4,8 +4,7 @@ use core::panic::PanicInfo;
 
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {
-    gui_panic_line(format_args!(""));
-    gui_panic_line(format_args!("[PANIC]"));
+    let _ = gui::try_present_panic_blackout();
     debug::println!();
     debug::println!("[PANIC]");
     debug::println!("message: {}", info.message());

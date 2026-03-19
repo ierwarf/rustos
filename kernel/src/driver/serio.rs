@@ -167,7 +167,10 @@ pub(crate) unsafe extern "C" fn register_linux_driver(driver: *mut LinuxCompatSe
         }
     }
 
-    crate::debug::println!("serio register linux driver: schedule rescan name={}", driver_name);
+    crate::debug::println!(
+        "serio register linux driver: schedule rescan name={}",
+        driver_name
+    );
     request_bind_rescan();
     0
 }
@@ -262,7 +265,10 @@ pub(crate) fn register_port_with_ops(info: SerioPortInfo, ops: SerioPortOps) {
     request_bind_rescan();
 }
 
-pub(crate) unsafe fn register_linux_port(info: SerioPortInfo, linux_port: *mut LinuxCompatSerio) -> i32 {
+pub(crate) unsafe fn register_linux_port(
+    info: SerioPortInfo,
+    linux_port: *mut LinuxCompatSerio,
+) -> i32 {
     if linux_port.is_null() {
         return -22;
     }
@@ -408,7 +414,9 @@ pub(crate) fn open(port_id: u32) -> i32 {
             OpenPrepare::Snapshot(OpenSnapshot::Native(open))
         } else {
             match linux_port_open_callback(port.linux_port.as_ptr()) {
-                Some(open) => OpenPrepare::Snapshot(OpenSnapshot::Linux(port.linux_port.as_ptr(), open)),
+                Some(open) => {
+                    OpenPrepare::Snapshot(OpenSnapshot::Linux(port.linux_port.as_ptr(), open))
+                }
                 None => OpenPrepare::Snapshot(OpenSnapshot::None),
             }
         }
@@ -470,7 +478,9 @@ pub(crate) fn close(port_id: u32) {
             ClosePrepare::Snapshot(CloseSnapshot::Native(close))
         } else {
             match linux_port_close_callback(port.linux_port.as_ptr()) {
-                Some(close) => ClosePrepare::Snapshot(CloseSnapshot::Linux(port.linux_port.as_ptr(), close)),
+                Some(close) => {
+                    ClosePrepare::Snapshot(CloseSnapshot::Linux(port.linux_port.as_ptr(), close))
+                }
                 None => ClosePrepare::Snapshot(CloseSnapshot::None),
             }
         }

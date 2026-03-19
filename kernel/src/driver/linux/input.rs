@@ -86,7 +86,10 @@ pub(crate) unsafe extern "C" fn free_device(dev: *mut LinuxCompatInputDev) {
     };
 
     let close = if device.opened {
-        device.dev.close.map(|close| (device.dev.as_ref() as *const _ as usize, close))
+        device
+            .dev
+            .close
+            .map(|close| (device.dev.as_ref() as *const _ as usize, close))
     } else {
         None
     };
@@ -136,10 +139,7 @@ pub(crate) unsafe extern "C" fn register_device(dev: *mut LinuxCompatInputDev) -
         return -19;
     }
 
-    crate::debug::println!(
-        "linux input_register_device done: dev={:#x}",
-        dev as usize
-    );
+    crate::debug::println!("linux input_register_device done: dev={:#x}", dev as usize);
     0
 }
 
@@ -349,10 +349,9 @@ pub(crate) fn consumer_acquire() {
     if !failed.is_empty() {
         with_input_devices(|devices| {
             for failed_ptr in failed {
-                if let Some(device) = devices
-                    .iter_mut()
-                    .find(|device| ptr_eq(device.dev.as_ref(), failed_ptr as *mut LinuxCompatInputDev))
-                {
+                if let Some(device) = devices.iter_mut().find(|device| {
+                    ptr_eq(device.dev.as_ref(), failed_ptr as *mut LinuxCompatInputDev)
+                }) {
                     device.opened = false;
                 }
             }

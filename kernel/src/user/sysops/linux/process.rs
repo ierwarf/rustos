@@ -68,11 +68,16 @@ pub(crate) fn getrandom(
 }
 
 pub(crate) fn ioctl(fd: u64, _request: u64, _arg: u64) -> Result<u64, LinuxSysopError> {
-    if let Some(stream) = console_stream_for_fd(fd)? {
-        return console_tty_ioctl(stream, _request, _arg);
+    match super::fd::current_handle(fd)? {
+        KernelHandle::Console(stream) => console_tty_ioctl(stream, _request, _arg),
+        KernelHandle::Device(device_handle) => {
+            device::ioctl_current_process_device_handle(device_handle, _request, _arg)
+                .map_err(Into::into)
+        }
+        KernelHandle::VfsFile(_)
+        | KernelHandle::VfsDirectory(_)
+        | KernelHandle::DisplaySurface(_) => Err(LinuxSysopError::Unsupported),
     }
-
-    device::ioctl_current_process_handle(fd, _request, _arg).map_err(Into::into)
 }
 
 pub(crate) fn getpid() -> u64 {
@@ -149,30 +154,6 @@ fn write_uts_field(dest: &mut [u8; 65], value: &[u8]) {
     let len = value.len().min(dest.len().saturating_sub(1));
     dest[..len].copy_from_slice(&value[..len]);
     dest[len] = 0;
-}
-
-fn console_stream_for_fd(fd: u64) -> Result<Option<ConsoleStreamKind>, LinuxSysopError> {
-    let stream = match fd {
-        0 => Some(ConsoleStreamKind::Input),
-        1 => Some(ConsoleStreamKind::Output),
-        2 => Some(ConsoleStreamKind::Error),
-        _ => {
-            let Some(result) =
-                multitask::with_current_user_process_state_mut(|_, _, process_state| {
-                    Ok(match process_state.handles().get(fd) {
-                        Some(KernelHandle::Console(stream)) => Some(*stream),
-                        Some(_) => None,
-                        None => return Err(LinuxSysopError::BadFileDescriptor),
-                    })
-                })
-            else {
-                return Err(LinuxSysopError::Unsupported);
-            };
-            result?
-        }
-    };
-
-    Ok(stream)
 }
 
 fn console_tty_ioctl(

@@ -55,6 +55,10 @@ pub(crate) fn init_boot_info(boot_info_ptr: *const BootInfo) {
     BOOT_INFO_PTR.store(boot_info_ptr.cast_mut(), Ordering::Release);
 }
 
+pub(crate) fn boot_framebuffer_info() -> Option<boot_protocol::FramebufferInfo> {
+    boot_info().map(|info| info.framebuffer)
+}
+
 fn boot_info() -> Option<&'static BootInfo> {
     let boot_info_ptr = BOOT_INFO_PTR.load(Ordering::Acquire);
     if boot_info_ptr.is_null() {

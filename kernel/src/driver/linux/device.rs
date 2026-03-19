@@ -3,6 +3,8 @@ use core::ffi::{c_char, c_void};
 use core::ptr;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use super::compat::LinuxCompatDevice;
+
 #[repr(C)]
 struct OpaqueHandle(usize);
 
@@ -113,6 +115,22 @@ pub(crate) unsafe extern "C" fn i2c_unregister_device(_client: *mut c_void) {}
 
 pub(crate) unsafe extern "C" fn pm_wakeup_dev_event(_dev: *mut c_void, _msec: u32, _hard: bool) {}
 
+pub(crate) unsafe extern "C" fn dev_set_drvdata(dev: *mut c_void, data: *mut c_void) {
+    if dev.is_null() {
+        return;
+    }
+    unsafe {
+        (*(dev as *mut LinuxCompatDevice)).driver_data = data;
+    }
+}
+
+pub(crate) unsafe extern "C" fn dev_get_drvdata(dev: *const c_void) -> *mut c_void {
+    if dev.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe { (*(dev as *const LinuxCompatDevice)).driver_data }
+}
+
 pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
     match name {
         "bus_register_notifier" => Some(bus_register_notifier as *const () as usize),
@@ -136,6 +154,8 @@ pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
         "i2c_new_scanned_device" => Some(i2c_new_scanned_device as *const () as usize),
         "i2c_unregister_device" => Some(i2c_unregister_device as *const () as usize),
         "pm_wakeup_dev_event" => Some(pm_wakeup_dev_event as *const () as usize),
+        "dev_set_drvdata" => Some(dev_set_drvdata as *const () as usize),
+        "dev_get_drvdata" => Some(dev_get_drvdata as *const () as usize),
         _ => None,
     }
 }

@@ -4,11 +4,13 @@ members = [
     "bootloader",
     "bootloader/boot-protocol",
     "driver-abi",
+    "drivers/display/amdgpu",
     "drivers/input/keyboard",
     "kernel",
     "module-tests",
     "prekernel",
     "uiserver",
+    "xtask",
 ]
 resolver = "3"
 

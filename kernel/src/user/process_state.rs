@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use core::convert::TryFrom;
 
 use x86_64::VirtAddr;
@@ -5,7 +6,9 @@ use x86_64::structures::paging::PageTableFlags;
 
 use crate::paging::{self, AddressSpaceError, ProcessAddressSpace, UserRegion};
 use crate::user::handles::HandleTable;
-use crate::user::linux::{LinuxProcessState, LinuxSigAction, MAX_SIGNAL_NUMBER};
+use crate::user::linux::{
+    LinuxMemoryMapState, LinuxProcessState, LinuxSigAction, MAX_SIGNAL_NUMBER,
+};
 
 const PAGE_SIZE: u64 = 4096;
 const DEFAULT_MAPPING_GAP: u64 = 16 * 1024 * 1024;
@@ -81,18 +84,56 @@ impl ProcessSecurityContext {
 pub struct UserProcessState {
     address_space: ProcessAddressSpace,
     linux_process_state: Option<LinuxProcessState>,
+    linux_memory_map: Option<LinuxMemoryMapState>,
     linux_sigactions: [LinuxSigAction; MAX_SIGNAL_NUMBER + 1],
     handles: HandleTable,
     security: ProcessSecurityContext,
     mapping_cursor: u64,
+    windows_allocations: Vec<WindowsAllocation>,
     exec_path: [u8; PROCESS_EXEC_PATH_CAPACITY],
     exec_path_len: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowsAllocationKind {
+    Heap,
+    Virtual,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WindowsAllocation {
+    pub base: u64,
+    pub len: u64,
+    pub protect: u32,
+    pub kind: WindowsAllocationKind,
+}
+
+impl WindowsAllocation {
+    pub const fn new(base: u64, len: u64, protect: u32, kind: WindowsAllocationKind) -> Self {
+        Self {
+            base,
+            len,
+            protect,
+            kind,
+        }
+    }
+
+    pub fn contains_range(self, start: u64, len: u64) -> bool {
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        let Some(allocation_end) = self.base.checked_add(self.len) else {
+            return false;
+        };
+        start >= self.base && end <= allocation_end
+    }
 }
 
 impl UserProcessState {
     pub fn new(
         address_space: ProcessAddressSpace,
         linux_process_state: Option<LinuxProcessState>,
+        linux_memory_map: Option<LinuxMemoryMapState>,
         logical_admin: bool,
         exec_path: &str,
     ) -> Self {
@@ -111,10 +152,12 @@ impl UserProcessState {
         let mut state = Self {
             address_space,
             linux_process_state,
+            linux_memory_map,
             linux_sigactions: [LinuxSigAction::default(); MAX_SIGNAL_NUMBER + 1],
             handles: HandleTable::new(),
             security: ProcessSecurityContext::new(logical_admin),
             mapping_cursor: default_cursor,
+            windows_allocations: Vec::new(),
             exec_path: [0; PROCESS_EXEC_PATH_CAPACITY],
             exec_path_len: 0,
         };
@@ -137,6 +180,18 @@ impl UserProcessState {
 
     pub fn linux_process_state(&self) -> Option<&LinuxProcessState> {
         self.linux_process_state.as_ref()
+    }
+
+    pub fn linux_process_state_mut(&mut self) -> Option<&mut LinuxProcessState> {
+        self.linux_process_state.as_mut()
+    }
+
+    pub fn linux_memory_map(&self) -> Option<&LinuxMemoryMapState> {
+        self.linux_memory_map.as_ref()
+    }
+
+    pub fn linux_memory_map_mut(&mut self) -> Option<&mut LinuxMemoryMapState> {
+        self.linux_memory_map.as_mut()
     }
 
     pub fn address_space_and_linux_process_state_mut(
@@ -215,6 +270,54 @@ impl UserProcessState {
                 .map_zeroed_user_pages_at(VirtAddr::new(start), page_count, flags)?;
         self.set_mapping_cursor(region.end().as_u64());
         Ok(region)
+    }
+
+    pub fn record_windows_allocation(&mut self, allocation: WindowsAllocation) {
+        if let Some(existing) = self
+            .windows_allocations
+            .iter_mut()
+            .find(|existing| existing.base == allocation.base)
+        {
+            *existing = allocation;
+            return;
+        }
+        self.windows_allocations.push(allocation);
+    }
+
+    pub fn windows_allocation(&self, base: u64) -> Option<WindowsAllocation> {
+        self.windows_allocations
+            .iter()
+            .copied()
+            .find(|allocation| allocation.base == base)
+    }
+
+    pub fn windows_allocation_containing(
+        &self,
+        start: u64,
+        len: u64,
+    ) -> Option<WindowsAllocation> {
+        self.windows_allocations
+            .iter()
+            .copied()
+            .find(|allocation| allocation.contains_range(start, len))
+    }
+
+    pub fn update_windows_allocation_protect(&mut self, base: u64, protect: u32) -> Option<u32> {
+        let allocation = self
+            .windows_allocations
+            .iter_mut()
+            .find(|allocation| allocation.base == base)?;
+        let previous = allocation.protect;
+        allocation.protect = protect;
+        Some(previous)
+    }
+
+    pub fn remove_windows_allocation(&mut self, base: u64) -> Option<WindowsAllocation> {
+        let index = self
+            .windows_allocations
+            .iter()
+            .position(|allocation| allocation.base == base)?;
+        Some(self.windows_allocations.swap_remove(index))
     }
 
     fn sync_linux_mapping_cursor(&mut self) {

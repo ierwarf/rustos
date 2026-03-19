@@ -157,11 +157,6 @@ pub(crate) fn openat(
 ) -> Result<u64, LinuxSysopError> {
     let path = usermem::read_current_user_c_string(path_ptr, 128)?;
     let absolute_path = file::resolve_path_for_current_process(dirfd, &path)?;
-    if absolute_path.starts_with("/dev/") {
-        return device::open_path_for_current_process(absolute_path.as_str(), flags)
-            .map_err(Into::into);
-    }
-
     file::open_path_for_current_process(absolute_path.as_str(), flags, mode).map_err(Into::into)
 }
 
@@ -340,19 +335,17 @@ fn set_status_flags(fd: u64, flags: u64) -> Result<(), LinuxSysopError> {
     result
 }
 
-fn is_console_input_fd(fd: u64) -> Result<bool, LinuxSysopError> {
-    if fd == 0 {
-        return Ok(true);
-    }
+pub(super) fn current_handle(fd: u64) -> Result<KernelHandle, LinuxSysopError> {
     if fd < 3 {
-        return Ok(false);
+        return console_stream_handle_for_fd(fd);
     }
 
     let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
-        Ok(matches!(
-            process_state.handles().get(fd),
-            Some(KernelHandle::Console(ConsoleStreamKind::Input))
-        ))
+        process_state
+            .handles()
+            .get(fd)
+            .cloned()
+            .ok_or(LinuxSysopError::BadFileDescriptor)
     }) else {
         return Err(LinuxSysopError::Unsupported);
     };
@@ -360,26 +353,18 @@ fn is_console_input_fd(fd: u64) -> Result<bool, LinuxSysopError> {
     result
 }
 
+fn is_console_input_fd(fd: u64) -> Result<bool, LinuxSysopError> {
+    Ok(matches!(
+        current_handle(fd)?,
+        KernelHandle::Console(ConsoleStreamKind::Input)
+    ))
+}
+
 fn is_console_output_fd(fd: u64) -> Result<bool, LinuxSysopError> {
-    if matches!(fd, 1 | 2) {
-        return Ok(true);
-    }
-    if fd < 3 {
-        return Ok(false);
-    }
-
-    let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
-        Ok(matches!(
-            process_state.handles().get(fd),
-            Some(KernelHandle::Console(
-                ConsoleStreamKind::Output | ConsoleStreamKind::Error
-            ))
-        ))
-    }) else {
-        return Err(LinuxSysopError::Unsupported);
-    };
-
-    result
+    Ok(matches!(
+        current_handle(fd)?,
+        KernelHandle::Console(ConsoleStreamKind::Output | ConsoleStreamKind::Error)
+    ))
 }
 
 fn console_stream_handle_for_fd(fd: u64) -> Result<KernelHandle, LinuxSysopError> {
@@ -464,7 +449,7 @@ fn poll_revents_for_handle(
         KernelHandle::Console(ConsoleStreamKind::Output | ConsoleStreamKind::Error) => {
             requested & linux_abi::POLLOUT
         }
-        KernelHandle::BootFile(_) | KernelHandle::BootDirectory(_) => {
+        KernelHandle::VfsFile(_) | KernelHandle::VfsDirectory(_) => {
             requested & (linux_abi::POLLIN | linux_abi::POLLOUT)
         }
         KernelHandle::DisplaySurface(_) => requested & linux_abi::POLLOUT,

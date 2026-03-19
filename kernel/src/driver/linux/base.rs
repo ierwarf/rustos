@@ -236,6 +236,18 @@ pub(crate) unsafe extern "C" fn msleep(milliseconds: u32) {
     crate::rtc::sleep(milliseconds as u64);
 }
 
+pub(crate) unsafe extern "C" fn virt_to_phys(addr: *const c_void) -> u64 {
+    if addr.is_null() {
+        0
+    } else {
+        crate::paging::kernel_virtual_to_physical_addr(addr as u64)
+    }
+}
+
+pub(crate) unsafe extern "C" fn phys_to_virt(addr: u64) -> *mut c_void {
+    crate::paging::higher_half_addr(addr) as *mut c_void
+}
+
 pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
     match name {
         "strlen" => Some(strlen as *const () as usize),
@@ -257,6 +269,8 @@ pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
         "param_ops_int" => Some(&PARAM_OPS_INT as *const LinuxKernelParamOps as usize),
         "param_ops_uint" => Some(&PARAM_OPS_UINT as *const LinuxKernelParamOps as usize),
         "msleep" => Some(msleep as *const () as usize),
+        "virt_to_phys" => Some(virt_to_phys as *const () as usize),
+        "phys_to_virt" => Some(phys_to_virt as *const () as usize),
         _ => None,
     }
 }

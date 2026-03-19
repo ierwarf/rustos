@@ -20,6 +20,10 @@ pub fn on_key_event(event: KeyboardEvent) {
 }
 
 pub fn on_key_event_for_session(session: ConsoleSessionId, event: KeyboardEvent) {
+    if !session_accepts_user_input(session) {
+        return;
+    }
+
     interrupts::without_interrupts(|| TTY.lock().session_mut(session).on_key_event(session, event))
 }
 
@@ -109,6 +113,21 @@ pub fn write_to_session(session: ConsoleSessionId, bytes: &[u8]) -> usize {
 
 pub(crate) fn reset_session(session: ConsoleSessionId) {
     interrupts::without_interrupts(|| TTY.lock().session_mut(session).reset());
+}
+
+fn session_accepts_user_input(session: ConsoleSessionId) -> bool {
+    #[cfg(test)]
+    {
+        let _ = session;
+        true
+    }
+
+    #[cfg(not(test))]
+    {
+        // The boot emergency console is a write-only status surface. Dropping keyboard input
+        // here avoids accumulating unread TTY state before the userspace desktop takes over.
+        session != ConsoleSessionId::PRIMARY || crate::gui::is_userspace_display_active()
+    }
 }
 
 struct TtyCollection {
@@ -287,7 +306,10 @@ impl TtySessionState {
         self.edit_len += 1;
         self.edit_cursor += 1;
         if self.should_echo_canonical_input() {
-            console::write_from_tty(session, &self.edit_buffer[self.edit_cursor - 1..self.edit_len]);
+            console::write_from_tty(
+                session,
+                &self.edit_buffer[self.edit_cursor - 1..self.edit_len],
+            );
             self.move_visual_cursor_left(session, self.edit_len - self.edit_cursor);
         }
     }
@@ -456,7 +478,11 @@ impl TtySessionState {
             }
             byte if self.termios.echoes_control_chars() => {
                 let mut echoed = [b'^', b'?'];
-                echoed[1] = if byte == 0x7f { b'?' } else { byte.saturating_add(64) };
+                echoed[1] = if byte == 0x7f {
+                    b'?'
+                } else {
+                    byte.saturating_add(64)
+                };
                 console::write_from_tty(session, &echoed);
             }
             _ => {}

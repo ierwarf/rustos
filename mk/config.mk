@@ -49,6 +49,11 @@ ARTIFACT_PRINTF_DEMO_ELF ?= $(ARTIFACT_DIR)/system/apps/printfdemo/printfdemo.el
 IMAGE_PRINTF_DEMO_ELF ?= $(IMAGE_DIR)/system/apps/printfdemo/printfdemo.elf
 
 DRIVER_MODULE_TARGET_DIR ?= $(ROOT_DIR)/target/driver-modules
+ARTIFACT_AMDGPU_KO ?= $(ARTIFACT_DIR)/system/drivers/display/amdgpu.ko
+IMAGE_AMDGPU_KO ?= $(IMAGE_DIR)/system/drivers/display/amdgpu.ko
+AMDGPU_FIRMWARE_DIR ?= /lib/firmware/amdgpu
+AMDGPU_IMAGE_FIRMWARE_DIR ?= $(IMAGE_DIR)/system/firmware/amdgpu
+AMDGPU_REQUIRED_FIRMWARE_BASENAMES ?= dcn_3_1_4_dmcub.bin psp_13_0_10_sos.bin psp_13_0_10_ta.bin smu_13_0_10.bin
 ARTIFACT_PSMOUSE_KO ?= $(ARTIFACT_DIR)/system/drivers/input/psmouse.ko
 IMAGE_PSMOUSE_KO ?= $(IMAGE_DIR)/system/drivers/input/psmouse.ko
 

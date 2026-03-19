@@ -19,7 +19,6 @@ const MAX_FRAMEBUFFER_HEIGHT: usize = 4320;
 const MAX_DIRTY_COLS: usize = MAX_FRAMEBUFFER_WIDTH.div_ceil(DIRTY_TILE_WIDTH);
 const MAX_DIRTY_ROWS: usize = MAX_FRAMEBUFFER_HEIGHT.div_ceil(DIRTY_TILE_HEIGHT);
 pub(crate) const MAX_FRAMEBUFFER_BYTES_PER_PIXEL: usize = 4;
-const USER_PRESENT_BGRA_PIXELS_PER_CHUNK: usize = 256;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FramebufferRect {
@@ -565,13 +564,6 @@ impl Framebuffer {
         if stride_bytes < min_stride {
             return Ok(false);
         }
-
-        let Some(required_len) = stride_bytes.checked_mul(height) else {
-            return Ok(false);
-        };
-        address_space.validate_user_read_buffer(VirtAddr::new(user_ptr), required_len)?;
-
-        let mut chunk = [0_u8; USER_PRESENT_BGRA_PIXELS_PER_CHUNK * 4];
         unsafe {
             let mut dst_row = self.active_buffer();
             for row in 0..height {
@@ -581,28 +573,70 @@ impl Framebuffer {
                 let row_base = user_ptr
                     .checked_add(row_offset as u64)
                     .ok_or(paging::AddressSpaceError::AddressOverflow)?;
-                let mut pixel_offset = 0usize;
-                let mut dst = dst_row;
-
-                while pixel_offset < width {
-                    let chunk_pixels =
-                        min(width - pixel_offset, USER_PRESENT_BGRA_PIXELS_PER_CHUNK);
-                    let chunk_bytes = chunk_pixels * 4;
-                    let src_ptr = row_base
-                        .checked_add((pixel_offset * 4) as u64)
-                        .ok_or(paging::AddressSpaceError::AddressOverflow)?;
-                    address_space
-                        .copy_from_user(VirtAddr::new(src_ptr), &mut chunk[..chunk_bytes])?;
-                    self.blit_bgra8888_row(dst, chunk.as_ptr(), chunk_pixels);
-                    dst = dst.add(chunk_pixels * self.bpp);
-                    pixel_offset += chunk_pixels;
-                }
+                self.blit_bgra8888_row_from_user(address_space, row_base, dst_row, width)?;
 
                 dst_row = dst_row.add(self.stride_bytes);
             }
         }
 
         self.mark_all_dirty();
+        Ok(true)
+    }
+
+    pub(crate) fn draw_bgra8888_frame_rect_from_user(
+        &mut self,
+        address_space: &ProcessAddressSpace,
+        user_ptr: u64,
+        width: usize,
+        height: usize,
+        stride_bytes: usize,
+        rect: FramebufferRect,
+    ) -> Result<bool, paging::AddressSpaceError> {
+        if width != self.width || height != self.height {
+            return Ok(false);
+        }
+
+        let Some(min_stride) = width.checked_mul(4) else {
+            return Ok(false);
+        };
+        if stride_bytes < min_stride {
+            return Ok(false);
+        }
+
+        let Some(rect) = rect.intersection(FramebufferRect {
+            x: 0,
+            y: 0,
+            width: self.width,
+            height: self.height,
+        }) else {
+            return Ok(true);
+        };
+
+        unsafe {
+            let mut dst_row = self
+                .active_buffer()
+                .add(rect.y * self.stride_bytes + rect.x * self.bpp);
+            for row in 0..rect.height {
+                let source_row = rect
+                    .y
+                    .checked_add(row)
+                    .ok_or(paging::AddressSpaceError::AddressOverflow)?;
+                let row_offset = source_row
+                    .checked_mul(stride_bytes)
+                    .ok_or(paging::AddressSpaceError::AddressOverflow)?;
+                let row_base = user_ptr
+                    .checked_add(row_offset as u64)
+                    .ok_or(paging::AddressSpaceError::AddressOverflow)?;
+                let row_start = row_base
+                    .checked_add((rect.x * 4) as u64)
+                    .ok_or(paging::AddressSpaceError::AddressOverflow)?;
+                self.blit_bgra8888_row_from_user(address_space, row_start, dst_row, rect.width)?;
+
+                dst_row = dst_row.add(self.stride_bytes);
+            }
+        }
+
+        self.mark_dirty_rect(rect);
         Ok(true)
     }
 
@@ -727,11 +761,72 @@ impl Framebuffer {
                 .front_base
                 .add(rect.y * self.stride_bytes + rect.x * self.bpp);
             for _ in 0..rect.height {
-                ptr::copy_nonoverlapping(src_row, dst_row, copy_len);
+                crate::simd::copy_fast(src_row, dst_row, copy_len);
                 src_row = src_row.add(self.stride_bytes);
                 dst_row = dst_row.add(self.stride_bytes);
             }
         }
+    }
+
+    fn blit_bgra8888_row_from_user(
+        &self,
+        address_space: &ProcessAddressSpace,
+        user_ptr: u64,
+        mut dst: *mut u8,
+        pixels: usize,
+    ) -> Result<(), paging::AddressSpaceError> {
+        let byte_len = pixels
+            .checked_mul(4)
+            .ok_or(paging::AddressSpaceError::AddressOverflow)?;
+        let mut carry = [0_u8; 4];
+        let mut carry_len = 0usize;
+
+        address_space.visit_user_read_spans(VirtAddr::new(user_ptr), byte_len, |src, chunk| {
+            let mut src = src;
+            let mut remaining = chunk;
+
+            if carry_len != 0 {
+                let take = min(4 - carry_len, remaining);
+                unsafe {
+                    ptr::copy_nonoverlapping(src, carry.as_mut_ptr().add(carry_len), take);
+                    src = src.add(take);
+                }
+                carry_len += take;
+                remaining -= take;
+
+                if carry_len == 4 {
+                    unsafe {
+                        self.blit_bgra8888_row(dst, carry.as_ptr(), 1);
+                        dst = dst.add(self.bpp);
+                    }
+                    carry_len = 0;
+                }
+            }
+
+            let chunk_pixels = remaining / 4;
+            unsafe {
+                if chunk_pixels != 0 {
+                    self.blit_bgra8888_row(dst, src, chunk_pixels);
+                    dst = dst.add(chunk_pixels * self.bpp);
+                    src = src.add(chunk_pixels * 4);
+                    remaining -= chunk_pixels * 4;
+                }
+
+                if remaining != 0 {
+                    ptr::copy_nonoverlapping(src, carry.as_mut_ptr(), remaining);
+                    carry_len = remaining;
+                }
+            }
+
+            Ok(())
+        })?;
+
+        debug_assert_eq!(carry_len, 0);
+        if carry_len != 0 {
+            return Err(paging::AddressSpaceError::AddressOverflow);
+        }
+
+        Ok(())
     }
 
     fn pixel_index(&self, x: usize, y: usize) -> Option<usize> {
@@ -782,30 +877,15 @@ impl Framebuffer {
         }
     }
 
-    unsafe fn blit_bgra8888_row(&self, mut dst: *mut u8, mut src: *const u8, pixels: usize) {
+    unsafe fn blit_bgra8888_row(&self, dst: *mut u8, src: *const u8, pixels: usize) {
         unsafe {
-            for _ in 0..pixels {
-                let b = ptr::read(src);
-                let g = ptr::read(src.add(1));
-                let r = ptr::read(src.add(2));
-                match self.format {
-                    BootPixelFormat::Rgb => {
-                        ptr::write(dst, r);
-                        ptr::write(dst.add(1), g);
-                        ptr::write(dst.add(2), b);
-                    }
-                    _ => {
-                        ptr::write(dst, b);
-                        ptr::write(dst.add(1), g);
-                        ptr::write(dst.add(2), r);
-                    }
-                }
-                if self.bpp == 4 {
-                    ptr::write(dst.add(3), 0);
-                }
-                src = src.add(4);
-                dst = dst.add(self.bpp);
-            }
+            crate::simd::blit_bgra8888_row(
+                dst,
+                src,
+                pixels,
+                self.bpp,
+                matches!(self.format, BootPixelFormat::Rgb),
+            );
         }
     }
 }

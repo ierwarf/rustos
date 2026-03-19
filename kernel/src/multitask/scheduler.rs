@@ -5,10 +5,10 @@ use x86_64::PhysAddr;
 use x86_64::VirtAddr;
 use x86_64::registers::model_specific::FsBase;
 
-use crate::asmtools::{FxSaveArea, restore_fxstate, save_fxstate};
 use crate::debug;
 use crate::paging::ProcessAddressSpace;
 use crate::session::ConsoleSessionId;
+use crate::simd::{SimdState, restore_state, save_state};
 use crate::user::abi::UserAbi;
 use crate::user::linux::{LinuxProcessState, LinuxThreadState};
 use crate::user::process_state::{SharedUserProcessState, UserProcessState};
@@ -67,7 +67,7 @@ pub(super) struct Scheduler {
     retired: [bool; MAX_TASK],
     retire_reasons: [Option<TaskRetireReason>; MAX_TASK],
     last_errors: [u32; MAX_TASK],
-    fx_states: [FxSaveArea; MAX_TASK],
+    simd_states: [SimdState; MAX_TASK],
     starts: [Option<TaskStart>; MAX_TASK],
     current_task: usize,
     pending_reap: bool,
@@ -81,7 +81,7 @@ impl Scheduler {
             retired: [false; MAX_TASK],
             retire_reasons: [None; MAX_TASK],
             last_errors: [0; MAX_TASK],
-            fx_states: [FxSaveArea::new(); MAX_TASK],
+            simd_states: [SimdState::new(); MAX_TASK],
             starts: [None; MAX_TASK],
             current_task: 0,
             pending_reap: false,
@@ -94,7 +94,7 @@ impl Scheduler {
             self.clear_slot(slot);
         }
 
-        self.fx_states = [FxSaveArea::new(); MAX_TASK];
+        self.simd_states = [SimdState::new(); MAX_TASK];
         self.retired = [false; MAX_TASK];
         self.retire_reasons = [None; MAX_TASK];
         self.last_errors = [0; MAX_TASK];
@@ -116,7 +116,7 @@ impl Scheduler {
         });
 
         unsafe {
-            save_fxstate(&mut self.fx_states[0]);
+            save_state(&mut self.simd_states[0]);
         }
     }
 
@@ -139,7 +139,7 @@ impl Scheduler {
         self.retired[slot] = false;
         self.retire_reasons[slot] = None;
         self.last_errors[slot] = 0;
-        self.fx_states[slot] = FxSaveArea::new();
+        self.simd_states[slot] = SimdState::new();
         self.starts[slot] = None;
     }
 
@@ -245,7 +245,7 @@ impl Scheduler {
                     user_stack: None,
                     linux_thread_state: None,
                 });
-                self.fx_states[slot] = FxSaveArea::new();
+                self.simd_states[slot] = SimdState::new();
                 self.starts[slot] = Some(TaskStart { entry, id });
                 return Some(slot);
             }
@@ -267,11 +267,14 @@ impl Scheduler {
     ) -> Option<usize> {
         for slot in 1..MAX_TASK {
             if self.contexts[slot].is_none() {
+                let saved_rsp = self.init_user_task_context(slot, &bootstrap, user_cs, user_ss, rflags);
+                let exec_path = alloc::string::String::from(bootstrap.exec_path());
                 let boxed_state = UserProcessState::new(
                     address_space,
                     bootstrap.linux_process_state,
+                    bootstrap.linux_memory_map,
                     bootstrap.logical_admin,
-                    bootstrap.exec_path(),
+                    exec_path.as_str(),
                 );
                 let root_phys = boxed_state.address_space().root_phys().as_u64();
                 let raw_state =
@@ -279,8 +282,7 @@ impl Scheduler {
                 let kernel_stack_top = self.stack_top(slot) as u64;
 
                 self.contexts[slot] = Some(TaskContext {
-                    saved_rsp: self
-                        .init_user_task_context(slot, bootstrap, user_cs, user_ss, rflags),
+                    saved_rsp,
                     ready: true,
                     blocked: false,
                     pit_divisor,
@@ -293,7 +295,7 @@ impl Scheduler {
                     user_stack: bootstrap.user_stack,
                     linux_thread_state: bootstrap.linux_thread_state,
                 });
-                self.fx_states[slot] = FxSaveArea::new();
+                self.simd_states[slot] = SimdState::new();
                 self.starts[slot] = Some(TaskStart {
                     entry: idle_entry,
                     id,
@@ -329,7 +331,7 @@ impl Scheduler {
                 let kernel_stack_top = self.stack_top(slot) as u64;
                 self.contexts[slot] = Some(TaskContext {
                     saved_rsp: self
-                        .init_user_task_context(slot, bootstrap, user_cs, user_ss, rflags),
+                        .init_user_task_context(slot, &bootstrap, user_cs, user_ss, rflags),
                     ready: true,
                     blocked: false,
                     pit_divisor,
@@ -342,7 +344,7 @@ impl Scheduler {
                     user_stack: bootstrap.user_stack,
                     linux_thread_state: bootstrap.linux_thread_state,
                 });
-                self.fx_states[slot] = FxSaveArea::new();
+                self.simd_states[slot] = SimdState::new();
                 self.starts[slot] = Some(TaskStart {
                     entry: super::noop_task_entry,
                     id,
@@ -390,7 +392,7 @@ impl Scheduler {
     fn init_user_task_context(
         &mut self,
         slot: usize,
-        bootstrap: UserTaskBootstrap,
+        bootstrap: &UserTaskBootstrap,
         user_cs: u64,
         user_ss: u64,
         rflags: u64,
@@ -541,15 +543,15 @@ impl Scheduler {
         reaped
     }
 
-    pub(super) fn save_current_fx_state(&mut self) {
+    pub(super) fn save_current_simd_state(&mut self) {
         unsafe {
-            save_fxstate(&mut self.fx_states[self.current_task]);
+            save_state(&mut self.simd_states[self.current_task]);
         }
     }
 
-    pub(super) fn restore_current_fx_state(&self) {
+    pub(super) fn restore_current_simd_state(&self) {
         unsafe {
-            restore_fxstate(&self.fx_states[self.current_task]);
+            restore_state(&self.simd_states[self.current_task]);
         }
     }
 

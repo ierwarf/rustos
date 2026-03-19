@@ -118,6 +118,139 @@ impl Default for LinuxCompatDevice {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LinuxCompatResource {
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+    pub(crate) name: *const c_char,
+    pub(crate) flags: usize,
+    pub(crate) desc: usize,
+    pub(crate) parent: *mut LinuxCompatResource,
+    pub(crate) sibling: *mut LinuxCompatResource,
+    pub(crate) child: *mut LinuxCompatResource,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct LinuxCompatPciDeviceId {
+    pub(crate) vendor: u32,
+    pub(crate) device: u32,
+    pub(crate) subvendor: u32,
+    pub(crate) subdevice: u32,
+    pub(crate) class: u32,
+    pub(crate) class_mask: u32,
+    pub(crate) driver_data: usize,
+    pub(crate) override_only: u32,
+}
+
+impl LinuxCompatPciDeviceId {
+    pub(crate) const fn is_terminator(self) -> bool {
+        self.vendor == 0
+            && self.device == 0
+            && self.subvendor == 0
+            && self.subdevice == 0
+            && self.class == 0
+            && self.class_mask == 0
+            && self.driver_data == 0
+            && self.override_only == 0
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LinuxCompatPciDriver {
+    pub(crate) name: *const c_char,
+    pub(crate) id_table: *const LinuxCompatPciDeviceId,
+    pub(crate) probe: Option<LinuxCompatPciProbeFn>,
+    pub(crate) remove: Option<LinuxCompatPciRemoveFn>,
+    pub(crate) suspend: *const c_void,
+    pub(crate) resume: *const c_void,
+    pub(crate) shutdown: *const c_void,
+    pub(crate) sriov_configure: *const c_void,
+    pub(crate) sriov_set_msix_vec_count: *const c_void,
+    pub(crate) sriov_get_vf_total_msix: *const c_void,
+    pub(crate) err_handler: *const c_void,
+    pub(crate) groups: *const *const c_void,
+    pub(crate) dev_groups: *const *const c_void,
+    pub(crate) driver: LinuxCompatDeviceDriver,
+    pub(crate) _pad0: [u8; 24],
+    pub(crate) driver_managed_dma: bool,
+    pub(crate) _pad1: [u8; 7],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LinuxCompatPciDev {
+    pub(crate) bus_list: [u8; 16],
+    pub(crate) bus: *mut c_void,
+    pub(crate) subordinate: *mut c_void,
+    pub(crate) sysdata: *mut c_void,
+    pub(crate) procent: *mut c_void,
+    pub(crate) slot: *mut c_void,
+    pub(crate) devfn: u32,
+    pub(crate) vendor: u16,
+    pub(crate) device: u16,
+    pub(crate) subsystem_vendor: u16,
+    pub(crate) subsystem_device: u16,
+    pub(crate) class: u32,
+    pub(crate) revision: u8,
+    pub(crate) hdr_type: u8,
+    pub(crate) _pad0: [u8; 40],
+    pub(crate) rom_base_reg: u8,
+    pub(crate) pin: u8,
+    pub(crate) pcie_flags_reg: u16,
+    pub(crate) dma_alias_mask: u64,
+    pub(crate) driver: *mut LinuxCompatPciDriver,
+    pub(crate) dma_mask: u64,
+    pub(crate) dma_parms: [u8; 16],
+    pub(crate) current_state: u32,
+    pub(crate) _pad1: [u8; 36],
+    pub(crate) dev: LinuxCompatDevice,
+    pub(crate) _pad2: [u8; 0],
+    pub(crate) cfg_size: i32,
+    pub(crate) irq: u32,
+    pub(crate) resource: [LinuxCompatResource; 17],
+    pub(crate) tail: [u8; 624],
+}
+
+impl Default for LinuxCompatPciDev {
+    fn default() -> Self {
+        Self {
+            bus_list: [0; 16],
+            bus: core::ptr::null_mut(),
+            subordinate: core::ptr::null_mut(),
+            sysdata: core::ptr::null_mut(),
+            procent: core::ptr::null_mut(),
+            slot: core::ptr::null_mut(),
+            devfn: 0,
+            vendor: 0,
+            device: 0,
+            subsystem_vendor: 0,
+            subsystem_device: 0,
+            class: 0,
+            revision: 0,
+            hdr_type: 0,
+            _pad0: [0; 40],
+            rom_base_reg: 0,
+            pin: 0,
+            pcie_flags_reg: 0,
+            dma_alias_mask: 0,
+            driver: core::ptr::null_mut(),
+            dma_mask: 0,
+            dma_parms: [0; 16],
+            current_state: 0,
+            _pad1: [0; 36],
+            dev: LinuxCompatDevice::default(),
+            _pad2: [0; 0],
+            cfg_size: 0,
+            irq: 0,
+            resource: [LinuxCompatResource::default(); 17],
+            tail: [0; 624],
+        }
+    }
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct LinuxCompatInputId {
     pub(crate) bustype: u16,
@@ -128,6 +261,9 @@ pub(crate) struct LinuxCompatInputId {
 
 pub(crate) type LinuxCompatInputOpenFn = unsafe extern "C" fn(dev: *mut LinuxCompatInputDev) -> i32;
 pub(crate) type LinuxCompatInputCloseFn = unsafe extern "C" fn(dev: *mut LinuxCompatInputDev);
+pub(crate) type LinuxCompatPciProbeFn =
+    unsafe extern "C" fn(dev: *mut LinuxCompatPciDev, id: *const LinuxCompatPciDeviceId) -> i32;
+pub(crate) type LinuxCompatPciRemoveFn = unsafe extern "C" fn(dev: *mut LinuxCompatPciDev);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -332,6 +468,12 @@ pub(crate) struct LinuxCompatPs2Dev {
 
 unsafe impl Send for LinuxCompatSerio {}
 unsafe impl Send for LinuxCompatPs2Dev {}
+unsafe impl Send for LinuxCompatPciDev {}
+
+const _: [(); 64] = [(); core::mem::size_of::<LinuxCompatResource>()];
+const _: [(); 40] = [(); core::mem::size_of::<LinuxCompatPciDeviceId>()];
+const _: [(); 280] = [(); core::mem::size_of::<LinuxCompatPciDriver>()];
+const _: [(); 2704] = [(); core::mem::size_of::<LinuxCompatPciDev>()];
 
 pub(crate) fn compat_cstr(ptr: *const c_char) -> Option<&'static str> {
     if ptr.is_null() {

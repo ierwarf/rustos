@@ -69,12 +69,24 @@ pub extern "x86-interrupt" fn rtc_interrupt_handler(_stack_frame: InterruptStack
     crate::pic::send_eoi(RTC_INTERRUPT_VECTOR);
 }
 
+pub fn pic_interrupt_handler(
+    _stack_frame: InterruptStackFrame,
+    index: u8,
+    _error_code: Option<u64>,
+) {
+    let irq = index.saturating_sub(crate::pic::PIC_1_OFFSET);
+    let _ = crate::driver::irq::dispatch_pic_irq(irq);
+    crate::pic::send_eoi(index);
+}
+
 pub extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
     crate::input::on_keyboard_interrupt();
+    let _ = crate::driver::irq::dispatch_pic_irq(1);
     crate::pic::send_eoi(KEYBOARD_INTERRUPT_VECTOR);
 }
 
 pub extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFrame) {
     crate::input::on_mouse_interrupt();
+    let _ = crate::driver::irq::dispatch_pic_irq(12);
     crate::pic::send_eoi(MOUSE_INTERRUPT_VECTOR);
 }

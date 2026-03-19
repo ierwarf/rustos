@@ -295,6 +295,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustos-amdgpu-driver"
+version = "0.1.0"
+dependencies = [
+ "driver-abi",
+]
+
+[[package]]
 name = "rustos-keyboard-driver"
 version = "0.1.0"
 dependencies = [
@@ -447,6 +454,10 @@ checksum = "18245fcbb8b3de8dd198ce7944fdd4096986fd6cd306b0fcfa27df817bd545d6"
 dependencies = [
  "zero",
 ]
+
+[[package]]
+name = "xtask"
+version = "0.1.0"
 
 [[package]]
 name = "zero"

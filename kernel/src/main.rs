@@ -14,8 +14,9 @@ mod storage;
 mod system;
 mod user;
 mod util;
+mod vfs;
 
-pub(crate) use arch::{acpi, asmtools, gdt, idt, pic, pit, rtc};
+pub(crate) use arch::{acpi, asmtools, gdt, idt, pic, pit, rtc, simd};
 pub(crate) use driver_abi::{DriverBus, DriverClass};
 pub(crate) use input::keyboard;
 pub(crate) use io::{console, gui, session, tty};
@@ -28,6 +29,9 @@ pub(crate) use util::{random, ring};
 extern crate alloc;
 
 use boot_protocol::BootInfo;
+
+const AMDGPU_DRIVER_NAME: &str = "amdgpu";
+const AMDGPU_DRIVER_MODULE_PATH: &str = "system/drivers/display/amdgpu.ko";
 
 fn announce_ready(name: &str, console_line: &[u8]) {
     debug::println!("{name} initialized.");
@@ -42,11 +46,20 @@ fn init(boot_info_ptr: *const BootInfo) {
     debug::println!("GDT loaded.");
     debug::println!("IDT loaded.");
     debug::println!("Paging initialized.");
+    simd::init();
+    debug::println!("SIMD initialized ({}).", simd::mode_name());
 
     gui::init(boot_info_ptr);
     fat::init_boot_info(boot_info_ptr);
+    vfs::init();
     heap::init_heap();
     driver::register_kernel_builtin("uefi-gop", DriverClass::Display, DriverBus::Platform);
+    driver::register_loadable_elf(
+        AMDGPU_DRIVER_NAME,
+        DriverClass::Display,
+        DriverBus::Pci,
+        AMDGPU_DRIVER_MODULE_PATH,
+    );
     announce_ready("GUI", b"GUI initialized.\r\n");
     announce_ready("Heap", b"Heap initialized.\r\n");
 
@@ -65,6 +78,8 @@ fn init(boot_info_ptr: *const BootInfo) {
     tty::init();
     rtc::init();
     announce_ready("RTC", b"RTC initialized.\r\n");
+    driver::initialize_loadable_modules_for_class(DriverClass::Display);
+    announce_ready("Display Drivers", b"Display driver modules initialized.\r\n");
 
     paging::smoke_test();
 

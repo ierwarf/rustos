@@ -6,3 +6,4 @@ pub(crate) mod pci;
 pub(crate) mod pic;
 pub(crate) mod pit;
 pub(crate) mod rtc;
+pub(crate) mod simd;

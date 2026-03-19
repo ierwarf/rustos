@@ -1,10 +1,11 @@
 mod canvas;
 mod render;
+mod simd;
 mod sys;
 mod terminal;
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::string::String;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -13,12 +14,12 @@ use std::vec::Vec;
 
 use render::{
     clamp_console_window_rect, console_window_title_bar_rect, default_console_window_rect,
-    launcher_button_rect, render_frame, taskbar_slot_rect,
+    launcher_button_rect, render_cursor_only, render_frame, render_rect, taskbar_slot_rect,
 };
 use sys::{
     console_get_state, console_set_focus, console_snapshot_session_output, display_create_surface,
-    display_get_info, display_present, map_surface, open_console, open_display, open_input,
-    open_runtime, raw_stderr_line, read_input, runtime_generation,
+    display_get_info, display_present, display_present_rect, map_surface, open_console,
+    open_display, open_input, open_runtime, raw_stderr_line, read_input, runtime_generation,
     runtime_request_launch_first_available, runtime_snapshot_programs,
     runtime_snapshot_running_programs, DisplayInfo, DisplaySurfaceCreate, InputEvent,
     RuntimeProgram, RuntimeRunningProgram, SurfaceMapping, INPUT_ACTION_RELEASED,
@@ -27,12 +28,45 @@ use sys::{
 };
 use terminal::TerminalState;
 
-const INPUT_EVENT_BATCH: usize = 32;
+// Match the kernel-side per-read cap so mouse motion does not spill
+// into avoidable extra UI frames under load.
+const INPUT_EVENT_BATCH: usize = 64;
 const MAX_RUNNING_PROGRAMS: usize = 8;
 const MAX_REGISTERED_PROGRAMS: usize = 16;
 const IDLE_SLEEP: Duration = Duration::from_millis(16);
 const RUNTIME_POLL_SLEEP: Duration = Duration::from_millis(32);
 const HIDDEN_RUNTIME_PROGRAM_TITLES: &[&str] = &["UI Server"];
+
+#[derive(Clone, Copy, Debug, Default)]
+struct InputProcessingResult {
+    previous_cursor_x: u32,
+    previous_cursor_y: u32,
+    cursor_moved: bool,
+    needs_full_redraw: bool,
+    partial_redraw_rect: canvas::Rect,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RedrawRequest {
+    needs_full_redraw: bool,
+    partial_redraw_rect: canvas::Rect,
+}
+
+impl RedrawRequest {
+    fn full() -> Self {
+        Self {
+            needs_full_redraw: true,
+            partial_redraw_rect: canvas::Rect::empty(),
+        }
+    }
+
+    fn partial(rect: canvas::Rect) -> Self {
+        Self {
+            needs_full_redraw: false,
+            partial_redraw_rect: rect,
+        }
+    }
+}
 
 #[derive(Clone)]
 struct RuntimeState {
@@ -63,6 +97,23 @@ pub(crate) struct LauncherProgram {
     pub(crate) title: String,
 }
 
+#[derive(Default)]
+pub(crate) struct WindowSurfaceCache {
+    pub(crate) pixels: Vec<u32>,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) focused: bool,
+    pub(crate) valid: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct DesktopSurfaceCache {
+    pub(crate) pixels: Vec<u32>,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) valid: bool,
+}
+
 pub(crate) struct ConsoleWindow {
     pub(crate) session_index: u32,
     pub(crate) title: String,
@@ -71,15 +122,11 @@ pub(crate) struct ConsoleWindow {
     pub(crate) output_cache: Vec<u8>,
     pub(crate) output_generation: u64,
     pub(crate) terminal_dirty: bool,
+    pub(crate) surface_cache: WindowSurfaceCache,
 }
 
 impl ConsoleWindow {
-    fn new(
-        session_index: u32,
-        title: String,
-        frame: canvas::Rect,
-        output_generation: u64,
-    ) -> Self {
+    fn new(session_index: u32, title: String, frame: canvas::Rect, output_generation: u64) -> Self {
         Self {
             session_index,
             title,
@@ -88,7 +135,12 @@ impl ConsoleWindow {
             output_cache: Vec::new(),
             output_generation,
             terminal_dirty: true,
+            surface_cache: WindowSurfaceCache::default(),
         }
+    }
+
+    fn invalidate_surface(&mut self) {
+        self.surface_cache.valid = false;
     }
 }
 
@@ -104,6 +156,7 @@ pub(crate) struct AppState {
     pub(crate) cursor_y: u32,
     pub(crate) left_button_down: bool,
     pub(crate) focused_session_index: u32,
+    pub(crate) desktop_cache: DesktopSurfaceCache,
     pub(crate) launcher_programs: Vec<LauncherProgram>,
     pub(crate) console_windows: Vec<ConsoleWindow>,
     dragging_window_session: Option<u32>,
@@ -173,6 +226,7 @@ impl AppState {
             cursor_y: display.height / 2,
             left_button_down: false,
             focused_session_index: console_state.focused_session_index,
+            desktop_cache: DesktopSurfaceCache::default(),
             launcher_programs: Vec::new(),
             console_windows: Vec::new(),
             dragging_window_session: None,
@@ -188,12 +242,14 @@ impl AppState {
         }
 
         let mut changed = self.sync_launcher_programs(
-            &runtime_state.registered_programs
-                [..runtime_state.registered_program_count.min(MAX_REGISTERED_PROGRAMS)],
+            &runtime_state.registered_programs[..runtime_state
+                .registered_program_count
+                .min(MAX_REGISTERED_PROGRAMS)],
         );
         changed |= self.sync_windows_from_runtime(
-            &runtime_state.running_programs
-                [..runtime_state.running_program_count.min(MAX_RUNNING_PROGRAMS)],
+            &runtime_state.running_programs[..runtime_state
+                .running_program_count
+                .min(MAX_RUNNING_PROGRAMS)],
         );
         runtime_state.dirty = false;
         changed || self.bring_window_to_front(self.focused_session_index)
@@ -206,7 +262,10 @@ impl AppState {
             if runtime_title_is_hidden(title.as_str()) {
                 continue;
             }
-            if next.iter().any(|existing: &LauncherProgram| existing.title == title) {
+            if next
+                .iter()
+                .any(|existing: &LauncherProgram| existing.title == title)
+            {
                 continue;
             }
             next.push(LauncherProgram {
@@ -220,6 +279,7 @@ impl AppState {
         }
 
         self.launcher_programs = next;
+        self.desktop_cache.valid = false;
         true
     }
 
@@ -245,6 +305,7 @@ impl AppState {
             let new_title = runtime_program_title(program);
             if window.title != new_title {
                 window.title = new_title;
+                window.invalidate_surface();
                 changed = true;
             }
             kept_sessions.push(window.session_index);
@@ -252,8 +313,7 @@ impl AppState {
         }
 
         for program in programs {
-            if runtime_program_is_hidden(program)
-                || kept_sessions.contains(&program.session_index)
+            if runtime_program_is_hidden(program) || kept_sessions.contains(&program.session_index)
             {
                 continue;
             }
@@ -291,7 +351,8 @@ impl AppState {
                 .iter()
                 .all(|window| window.session_index != self.focused_session_index)
         {
-            let fallback_session = self.console_windows[self.console_windows.len() - 1].session_index;
+            let fallback_session =
+                self.console_windows[self.console_windows.len() - 1].session_index;
             console_set_focus(self.console_fd.as_raw_fd(), fallback_session)?;
             self.focused_session_index = fallback_session;
             changed = true;
@@ -318,6 +379,7 @@ impl AppState {
                 window.output_cache.clear();
                 window.output_cache.extend_from_slice(&snapshot[..count]);
                 window.terminal_dirty = true;
+                window.invalidate_surface();
                 changed = true;
             }
             window.output_generation = session_generation;
@@ -326,24 +388,40 @@ impl AppState {
         Ok(changed)
     }
 
-    fn handle_input_event(&mut self, runtime_fd: RawFd, event: &InputEvent) -> Result<bool, i32> {
+    fn handle_input_event(
+        &mut self,
+        runtime_fd: RawFd,
+        event: &InputEvent,
+    ) -> Result<RedrawRequest, i32> {
         match event.kind {
-            INPUT_KIND_KEYBOARD => Ok(event.action != INPUT_ACTION_RELEASED),
+            INPUT_KIND_KEYBOARD => Ok(if event.action != INPUT_ACTION_RELEASED {
+                RedrawRequest::full()
+            } else {
+                RedrawRequest::default()
+            }),
             INPUT_KIND_POINTER_MOTION => {
                 let next_x = (self.cursor_x as i32 + event.value0).max(0) as u32;
                 let next_y = (self.cursor_y as i32 + event.value1).max(0) as u32;
                 self.cursor_x = next_x.min(self.display.width.saturating_sub(1));
                 self.cursor_y = next_y.min(self.display.height.saturating_sub(1));
-                Ok(self.drag_window_to_cursor() || event.value0 != 0 || event.value1 != 0)
+                Ok(self
+                    .drag_window_to_cursor()
+                    .map(RedrawRequest::partial)
+                    .unwrap_or_default())
             }
             INPUT_KIND_POINTER_BUTTON if event.code == POINTER_BUTTON_LEFT => {
                 self.left_button_down = event.action == sys::INPUT_ACTION_PRESSED;
                 if self.left_button_down {
-                    return self.handle_left_press(runtime_fd);
+                    return Ok(if self.handle_left_press(runtime_fd)? {
+                        RedrawRequest::full()
+                    } else {
+                        RedrawRequest::default()
+                    });
                 }
-                Ok(self.dragging_window_session.take().is_some())
+                self.dragging_window_session = None;
+                Ok(RedrawRequest::default())
             }
-            _ => Ok(false),
+            _ => Ok(RedrawRequest::default()),
         }
     }
 
@@ -447,9 +525,9 @@ impl AppState {
         self.drag_offset_y = self.cursor_y.saturating_sub(window.frame.y as u32) as usize;
     }
 
-    fn drag_window_to_cursor(&mut self) -> bool {
+    fn drag_window_to_cursor(&mut self) -> Option<canvas::Rect> {
         let Some(session_index) = self.dragging_window_session else {
-            return false;
+            return None;
         };
 
         let Some(window) = self
@@ -458,9 +536,10 @@ impl AppState {
             .find(|window| window.session_index == session_index)
         else {
             self.dragging_window_session = None;
-            return false;
+            return None;
         };
 
+        let previous_frame = window.frame;
         let next_x = self.cursor_x.saturating_sub(self.drag_offset_x as u32) as usize;
         let next_y = self.cursor_y.saturating_sub(self.drag_offset_y as u32) as usize;
         let next_frame = clamp_console_window_rect(
@@ -473,16 +552,32 @@ impl AppState {
             },
         );
         if window.frame == next_frame {
-            return false;
+            return None;
         }
 
         window.frame = next_frame;
-        true
+        Some(previous_frame.union(next_frame))
     }
 
     fn present(&self) -> Result<(), i32> {
         let _keep_surface_alive = self.surface_fd.as_raw_fd();
         display_present(self.display_fd.as_raw_fd(), self.surface.handle)
+    }
+
+    fn present_rect(&self, rect: canvas::Rect) -> Result<(), i32> {
+        if rect.is_empty() {
+            return Ok(());
+        }
+
+        let _keep_surface_alive = self.surface_fd.as_raw_fd();
+        display_present_rect(
+            self.display_fd.as_raw_fd(),
+            self.surface.handle,
+            rect.x as u32,
+            rect.y as u32,
+            rect.width as u32,
+            rect.height as u32,
+        )
     }
 }
 
@@ -517,6 +612,55 @@ fn refresh_runtime_state(
     shared_state.registered_program_count = registered_count;
     shared_state.dirty = true;
     Ok(true)
+}
+
+fn process_pending_input(
+    state: &mut AppState,
+    runtime_fd: RawFd,
+    events: &mut [InputEvent],
+) -> Result<InputProcessingResult, i32> {
+    let previous_cursor_x = state.cursor_x;
+    let previous_cursor_y = state.cursor_y;
+    let mut needs_full_redraw = false;
+    let mut partial_redraw_rect = canvas::Rect::empty();
+
+    loop {
+        let read_count = read_input(state.input_fd.as_raw_fd(), events)?;
+        if read_count == 0 {
+            break;
+        }
+
+        for event in &events[..read_count] {
+            let redraw = state.handle_input_event(runtime_fd, event)?;
+            needs_full_redraw |= redraw.needs_full_redraw;
+            partial_redraw_rect = partial_redraw_rect.union(redraw.partial_redraw_rect);
+        }
+    }
+
+    let cursor_moved = state.cursor_x != previous_cursor_x || state.cursor_y != previous_cursor_y;
+    if cursor_moved && !partial_redraw_rect.is_empty() {
+        partial_redraw_rect = partial_redraw_rect
+            .union(canvas::cursor_dirty_rect(
+                previous_cursor_x,
+                previous_cursor_y,
+                state.surface.width,
+                state.surface.height,
+            ))
+            .union(canvas::cursor_dirty_rect(
+                state.cursor_x,
+                state.cursor_y,
+                state.surface.width,
+                state.surface.height,
+            ));
+    }
+
+    Ok(InputProcessingResult {
+        previous_cursor_x,
+        previous_cursor_y,
+        cursor_moved,
+        needs_full_redraw,
+        partial_redraw_rect,
+    })
 }
 
 fn spawn_runtime_thread(runtime_state: Arc<Mutex<RuntimeState>>) {
@@ -576,17 +720,38 @@ fn run() -> Result<(), i32> {
     spawn_runtime_thread(runtime_state.clone());
 
     loop {
-        let mut changed = false;
-        let read_count = read_input(state.input_fd.as_raw_fd(), &mut events)?;
-        for event in &events[..read_count] {
-            changed |= state.handle_input_event(runtime_fd.as_raw_fd(), event)?;
-        }
-
-        changed |= state.apply_runtime_state(&runtime_state);
-        changed |= state.refresh_console_windows()?;
-        if changed {
+        let input = process_pending_input(&mut state, runtime_fd.as_raw_fd(), &mut events)?;
+        let mut needs_full_redraw = input.needs_full_redraw;
+        needs_full_redraw |= state.apply_runtime_state(&runtime_state);
+        needs_full_redraw |= state.refresh_console_windows()?;
+        if needs_full_redraw {
             render_frame(&mut state);
             state.present()?;
+            continue;
+        }
+        if !input.partial_redraw_rect.is_empty() {
+            render_rect(&mut state, input.partial_redraw_rect);
+            state.present_rect(input.partial_redraw_rect)?;
+            continue;
+        }
+        if input.cursor_moved {
+            let previous_rect = canvas::cursor_dirty_rect(
+                input.previous_cursor_x,
+                input.previous_cursor_y,
+                state.surface.width,
+                state.surface.height,
+            );
+            let current_rect = canvas::cursor_dirty_rect(
+                state.cursor_x,
+                state.cursor_y,
+                state.surface.width,
+                state.surface.height,
+            );
+            render_cursor_only(&mut state, previous_rect, current_rect);
+            state.present_rect(previous_rect)?;
+            if current_rect != previous_rect {
+                state.present_rect(current_rect)?;
+            }
             continue;
         }
 

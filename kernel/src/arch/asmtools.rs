@@ -1,23 +1,5 @@
 use core::arch::{asm, global_asm};
 
-#[repr(C, align(16))]
-#[derive(Clone, Copy)]
-pub struct FxSaveArea {
-    bytes: [u8; 512],
-}
-
-impl FxSaveArea {
-    pub const fn new() -> Self {
-        let mut bytes = [0u8; 512];
-        // Default x87 control word and MXCSR state for a fresh task.
-        bytes[0] = 0x7f;
-        bytes[1] = 0x03;
-        bytes[24] = 0x80;
-        bytes[25] = 0x1f;
-        Self { bytes }
-    }
-}
-
 #[inline]
 pub fn current_rip() -> u64 {
     let rip: u64;
@@ -46,30 +28,6 @@ pub unsafe fn enter_higher_half(entry: u64, boot_info_ptr: u64) -> ! {
             in("rdi") boot_info_ptr,
             in("rcx") crate::paging::KERNEL_VIRT_OFFSET,
             options(noreturn),
-        );
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-pub unsafe fn save_fxstate(area: &mut FxSaveArea) {
-    unsafe {
-        asm!(
-            "fxsave64 [{ptr}]",
-            ptr = in(reg) area,
-            options(nostack, preserves_flags),
-        );
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-pub unsafe fn restore_fxstate(area: &FxSaveArea) {
-    unsafe {
-        asm!(
-            "fxrstor64 [{ptr}]",
-            ptr = in(reg) area,
-            options(nostack, preserves_flags),
         );
     }
 }
@@ -307,59 +265,3 @@ global_asm!(
     .size software_schedule_trap, . - software_schedule_trap
 "#
 );
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse2")]
-pub unsafe fn copy_sse2(src: *const u8, dst: *mut u8, len: usize) {
-    use core::arch::x86_64::*;
-    use core::ptr;
-
-    if len == 0 || src == dst {
-        return;
-    }
-
-    let src_addr = src as usize;
-    let dst_addr = dst as usize;
-    let overlap = match (src_addr.checked_add(len), dst_addr.checked_add(len)) {
-        (Some(src_end), Some(dst_end)) => src_addr < dst_end && dst_addr < src_end,
-        _ => true,
-    };
-    if overlap {
-        unsafe {
-            ptr::copy(src, dst, len);
-        }
-        return;
-    }
-
-    let mut i = 0usize;
-    let mut used_stream_store = false;
-
-    unsafe {
-        // Align destination to 16 bytes for streaming stores.
-        while i < len && ((dst.add(i) as usize) & 0xF) != 0 {
-            ptr::write(dst.add(i), ptr::read(src.add(i)));
-            i += 1;
-        }
-
-        while i + 64 <= len {
-            let a = _mm_loadu_si128(src.add(i) as *const __m128i);
-            let b = _mm_loadu_si128(src.add(i + 16) as *const __m128i);
-            let c = _mm_loadu_si128(src.add(i + 32) as *const __m128i);
-            let d = _mm_loadu_si128(src.add(i + 48) as *const __m128i);
-
-            _mm_stream_si128(dst.add(i) as *mut __m128i, a);
-            _mm_stream_si128(dst.add(i + 16) as *mut __m128i, b);
-            _mm_stream_si128(dst.add(i + 32) as *mut __m128i, c);
-            _mm_stream_si128(dst.add(i + 48) as *mut __m128i, d);
-            i += 64;
-            used_stream_store = true;
-        }
-
-        if i < len {
-            ptr::copy_nonoverlapping(src.add(i), dst.add(i), len - i);
-        }
-        if used_stream_store {
-            _mm_sfence();
-        }
-    }
-}

@@ -178,9 +178,9 @@ unsafe extern "C" {
 #[unsafe(no_mangle)]
 extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
     let frame = unsafe { &mut *frame };
-    multitask::save_current_fx_state();
+    multitask::save_current_simd_state();
     let result = dispatch_syscall(frame);
-    multitask::restore_current_fx_state();
+    multitask::restore_current_simd_state();
     result
 }
 

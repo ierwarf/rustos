@@ -241,6 +241,7 @@ pub mod device {
     pub const DISPLAY_IOCTL_GET_INFO: u64 = 0x4453_0001;
     pub const DISPLAY_IOCTL_CREATE_SURFACE: u64 = 0x4453_0002;
     pub const DISPLAY_IOCTL_PRESENT: u64 = 0x4453_0003;
+    pub const DISPLAY_IOCTL_PRESENT_RECT: u64 = 0x4453_0004;
 
     pub const PIXEL_FORMAT_BGRA8888: u32 = super::ui::PIXEL_FORMAT_BGRA8888;
     pub const INPUT_KIND_KEYBOARD: u16 = super::ui::INPUT_KIND_KEYBOARD;
@@ -289,6 +290,17 @@ pub mod device {
     pub struct DisplayPresentRequest {
         pub surface_handle: u32,
         pub reserved: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct DisplayPresentRectRequest {
+        pub surface_handle: u32,
+        pub reserved: u32,
+        pub x: u32,
+        pub y: u32,
+        pub width: u32,
+        pub height: u32,
     }
 }
 

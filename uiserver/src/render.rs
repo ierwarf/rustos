@@ -5,7 +5,7 @@ use embedded_graphics::text::{Baseline, Text};
 use embedded_graphics::Drawable;
 
 use crate::canvas::{Rect, SurfaceCanvas};
-use crate::AppState;
+use crate::{AppState, ConsoleWindow, DesktopSurfaceCache};
 
 const COLOR_BG_TOP: u32 = 0x0015_2038;
 const COLOR_BG_BOTTOM: u32 = 0x000b_101f;
@@ -130,55 +130,136 @@ pub(crate) fn taskbar_slot_rect(width: u32, height: u32, index: usize) -> Rect {
 }
 
 pub(crate) fn render_frame(state: &mut AppState) {
+    refresh_desktop_surface(state);
+
     let width = state.surface.width;
     let height = state.surface.height;
     let stride_pixels = state.surface.stride_bytes as usize / 4;
+    let cursor_x = state.cursor_x;
+    let cursor_y = state.cursor_y;
+    let focused_session_index = state.focused_session_index;
+    let desktop_cache = &state.desktop_cache;
+    let console_windows = &mut state.console_windows;
     let pixels = state.frame.pixels_mut();
     let mut canvas = SurfaceCanvas::new(pixels, width, height, stride_pixels);
 
-    canvas.draw_vertical_gradient(COLOR_BG_TOP, COLOR_BG_BOTTOM);
-
-    canvas.fill_rect_alpha(
-        Rect {
-            x: 0,
-            y: 0,
-            width: width as usize,
-            height: TOPBAR_HEIGHT,
-        },
-        COLOR_TOPBAR,
-        220,
+    render_scene(
+        &mut canvas,
+        width,
+        height,
+        cursor_x,
+        cursor_y,
+        focused_session_index,
+        desktop_cache,
+        console_windows,
     );
-    canvas.fill_rect_alpha(
-        Rect {
-            x: 0,
-            y: height as usize - TASKBAR_HEIGHT,
-            width: width as usize,
-            height: TASKBAR_HEIGHT,
-        },
-        COLOR_TASKBAR,
-        220,
-    );
+}
 
-    for (index, program) in state.launcher_programs.iter().enumerate() {
-        draw_launcher_button(
+pub(crate) fn render_rect(state: &mut AppState, rect: Rect) {
+    if rect.is_empty() {
+        return;
+    }
+
+    refresh_desktop_surface(state);
+
+    let width = state.surface.width;
+    let height = state.surface.height;
+    let stride_pixels = state.surface.stride_bytes as usize / 4;
+    let cursor_x = state.cursor_x;
+    let cursor_y = state.cursor_y;
+    let focused_session_index = state.focused_session_index;
+    let desktop_cache = &state.desktop_cache;
+    let console_windows = &mut state.console_windows;
+    let pixels = state.frame.pixels_mut();
+    let mut canvas = SurfaceCanvas::with_clip(pixels, width, height, stride_pixels, rect);
+
+    render_scene(
+        &mut canvas,
+        width,
+        height,
+        cursor_x,
+        cursor_y,
+        focused_session_index,
+        desktop_cache,
+        console_windows,
+    );
+}
+
+pub(crate) fn render_cursor_only(state: &mut AppState, previous_rect: Rect, current_rect: Rect) {
+    refresh_desktop_surface(state);
+
+    let width = state.surface.width;
+    let height = state.surface.height;
+    let stride_pixels = state.surface.stride_bytes as usize / 4;
+    let cursor_x = state.cursor_x;
+    let cursor_y = state.cursor_y;
+    let focused_session_index = state.focused_session_index;
+    let desktop_cache = &state.desktop_cache;
+    let console_windows = &mut state.console_windows;
+    let pixels = state.frame.pixels_mut();
+
+    if !previous_rect.is_empty() {
+        let mut canvas =
+            SurfaceCanvas::with_clip(pixels, width, height, stride_pixels, previous_rect);
+        render_scene(
             &mut canvas,
-            launcher_button_rect(width, index),
-            program.title.as_str(),
+            width,
+            height,
+            cursor_x,
+            cursor_y,
+            focused_session_index,
+            desktop_cache,
+            console_windows,
         );
     }
 
-    for (index, window) in state.console_windows.iter_mut().enumerate() {
-        let focused = window.session_index == state.focused_session_index;
-        draw_console_window(&mut canvas, window, focused);
-        draw_taskbar_slot(
+    if current_rect != previous_rect && !current_rect.is_empty() {
+        let mut canvas =
+            SurfaceCanvas::with_clip(pixels, width, height, stride_pixels, current_rect);
+        render_scene(
             &mut canvas,
+            width,
+            height,
+            cursor_x,
+            cursor_y,
+            focused_session_index,
+            desktop_cache,
+            console_windows,
+        );
+    }
+}
+
+fn render_scene(
+    canvas: &mut SurfaceCanvas<'_>,
+    width: u32,
+    height: u32,
+    cursor_x: u32,
+    cursor_y: u32,
+    focused_session_index: u32,
+    desktop_cache: &DesktopSurfaceCache,
+    console_windows: &mut [ConsoleWindow],
+) {
+    canvas.draw_surface(
+        &desktop_cache.pixels,
+        desktop_cache.width,
+        desktop_cache.height,
+        desktop_cache.width,
+        0,
+        0,
+    );
+
+    for (index, window) in console_windows.iter_mut().enumerate() {
+        let focused = window.session_index == focused_session_index;
+        draw_console_window(canvas, window, focused);
+        draw_taskbar_slot(
+            canvas,
             taskbar_slot_rect(width, height, index),
             window.title.as_str(),
             focused,
         );
     }
 
-    canvas.draw_cursor(state.cursor_x, state.cursor_y);
+    canvas.draw_cursor(cursor_x, cursor_y);
 }
 
 fn draw_launcher_button(canvas: &mut SurfaceCanvas<'_>, rect: Rect, title: &str) {
@@ -210,66 +291,18 @@ fn draw_console_window(
     window: &mut crate::ConsoleWindow,
     focused: bool,
 ) {
-    let rect = window.frame;
-    let border_color = if focused {
-        COLOR_WINDOW_FOCUS
-    } else {
-        COLOR_WINDOW_UNFOCUSED
-    };
-    let title_color = if focused {
-        COLOR_TITLE_FOCUS
-    } else {
-        COLOR_TITLE_UNFOCUSED
-    };
-
-    canvas.fill_rect(rect, border_color);
-    let inner = Rect {
-        x: rect.x + WINDOW_BORDER,
-        y: rect.y + WINDOW_BORDER,
-        width: rect.width.saturating_sub(WINDOW_BORDER * 2),
-        height: rect.height.saturating_sub(WINDOW_BORDER * 2),
-    };
-    canvas.fill_rect(inner, COLOR_WINDOW);
-
-    let title_rect = Rect {
-        x: inner.x,
-        y: inner.y,
-        width: inner.width,
-        height: WINDOW_TITLE_HEIGHT,
-    };
-    canvas.fill_rect(title_rect, title_color);
-    draw_label(
-        canvas,
-        (title_rect.x + 10) as i32,
-        (title_rect.y + 7) as i32,
-        window.title.as_str(),
-        COLOR_TITLE_TEXT,
+    refresh_window_surface(window, focused);
+    canvas.draw_surface(
+        &window.surface_cache.pixels,
+        window.surface_cache.width,
+        window.surface_cache.height,
+        window.surface_cache.width,
+        window.frame.x,
+        window.frame.y,
     );
-
-    let client_rect = Rect {
-        x: inner.x + 6,
-        y: inner.y + WINDOW_TITLE_HEIGHT + 6,
-        width: inner.width.saturating_sub(12),
-        height: inner.height.saturating_sub(WINDOW_TITLE_HEIGHT + 12),
-    };
-    if window.terminal_dirty || window.terminal.needs_layout_rebuild(client_rect) {
-        window
-            .terminal
-            .rebuild_from_bytes(client_rect, focused, &window.output_cache);
-        window.terminal_dirty = false;
-    } else {
-        window.terminal.set_client_rect(client_rect);
-        window.terminal.set_focused(focused);
-    }
-    window.terminal.render(canvas);
 }
 
-fn draw_taskbar_slot(
-    canvas: &mut SurfaceCanvas<'_>,
-    rect: Rect,
-    title: &str,
-    focused: bool,
-) {
+fn draw_taskbar_slot(canvas: &mut SurfaceCanvas<'_>, rect: Rect, title: &str, focused: bool) {
     if rect.width == 0 || rect.height == 0 {
         return;
     }
@@ -294,4 +327,154 @@ fn draw_taskbar_slot(
 fn draw_label(canvas: &mut SurfaceCanvas<'_>, x: i32, y: i32, text: &str, color: Rgb888) {
     let style = MonoTextStyle::new(&FONT_9X18_BOLD, color);
     let _ = Text::with_baseline(text, Point::new(x, y), style, Baseline::Top).draw(canvas);
+}
+
+fn refresh_desktop_surface(state: &mut AppState) {
+    let width = state.surface.width as usize;
+    let height = state.surface.height as usize;
+    let resized = state.desktop_cache.width != width || state.desktop_cache.height != height;
+    if resized {
+        state.desktop_cache.width = width;
+        state.desktop_cache.height = height;
+        state.desktop_cache
+            .pixels
+            .resize(width.saturating_mul(height), 0);
+        state.desktop_cache.valid = false;
+    }
+    if state.desktop_cache.valid {
+        return;
+    }
+
+    let mut canvas = SurfaceCanvas::new(
+        state.desktop_cache.pixels.as_mut_slice(),
+        width as u32,
+        height as u32,
+        width,
+    );
+    canvas.draw_vertical_gradient(COLOR_BG_TOP, COLOR_BG_BOTTOM);
+    canvas.fill_rect_alpha(
+        Rect {
+            x: 0,
+            y: 0,
+            width,
+            height: TOPBAR_HEIGHT,
+        },
+        COLOR_TOPBAR,
+        220,
+    );
+    canvas.fill_rect_alpha(
+        Rect {
+            x: 0,
+            y: height.saturating_sub(TASKBAR_HEIGHT),
+            width,
+            height: TASKBAR_HEIGHT,
+        },
+        COLOR_TASKBAR,
+        220,
+    );
+
+    for (index, program) in state.launcher_programs.iter().enumerate() {
+        draw_launcher_button(
+            &mut canvas,
+            launcher_button_rect(width as u32, index),
+            program.title.as_str(),
+        );
+    }
+
+    state.desktop_cache.valid = true;
+}
+
+fn refresh_window_surface(window: &mut ConsoleWindow, focused: bool) {
+    let width = window.frame.width;
+    let height = window.frame.height;
+    if width == 0 || height == 0 {
+        window.surface_cache.valid = false;
+        return;
+    }
+
+    let resized = window.surface_cache.width != width || window.surface_cache.height != height;
+    if resized {
+        window.surface_cache.width = width;
+        window.surface_cache.height = height;
+        window.surface_cache.pixels.resize(width.saturating_mul(height), 0);
+        window.surface_cache.valid = false;
+    }
+
+    let inner = Rect {
+        x: WINDOW_BORDER,
+        y: WINDOW_BORDER,
+        width: width.saturating_sub(WINDOW_BORDER * 2),
+        height: height.saturating_sub(WINDOW_BORDER * 2),
+    };
+    let client_rect = Rect {
+        x: inner.x + 6,
+        y: inner.y + WINDOW_TITLE_HEIGHT + 6,
+        width: inner.width.saturating_sub(12),
+        height: inner.height.saturating_sub(WINDOW_TITLE_HEIGHT + 12),
+    };
+    let terminal_needs_rebuild =
+        window.terminal_dirty || window.terminal.needs_layout_rebuild(client_rect);
+
+    if window.surface_cache.valid && window.surface_cache.focused == focused && !terminal_needs_rebuild
+    {
+        window.terminal.set_client_rect(client_rect);
+        window.terminal.set_focused(focused);
+        return;
+    }
+
+    let border_color = if focused {
+        COLOR_WINDOW_FOCUS
+    } else {
+        COLOR_WINDOW_UNFOCUSED
+    };
+    let title_color = if focused {
+        COLOR_TITLE_FOCUS
+    } else {
+        COLOR_TITLE_UNFOCUSED
+    };
+    let title_rect = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: WINDOW_TITLE_HEIGHT,
+    };
+
+    let mut canvas = SurfaceCanvas::new(
+        window.surface_cache.pixels.as_mut_slice(),
+        width as u32,
+        height as u32,
+        width,
+    );
+    canvas.fill_rect(
+        Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        },
+        border_color,
+    );
+    canvas.fill_rect(inner, COLOR_WINDOW);
+    canvas.fill_rect(title_rect, title_color);
+    draw_label(
+        &mut canvas,
+        (title_rect.x + 10) as i32,
+        (title_rect.y + 7) as i32,
+        window.title.as_str(),
+        COLOR_TITLE_TEXT,
+    );
+
+    if terminal_needs_rebuild {
+        window
+            .terminal
+            .rebuild_from_bytes(client_rect, focused, &window.output_cache);
+        window.terminal_dirty = false;
+    } else {
+        window.terminal.set_client_rect(client_rect);
+        window.terminal.set_focused(focused);
+    }
+    window.terminal.render(&mut canvas);
+
+    window.surface_cache.focused = focused;
+    window.surface_cache.valid = true;
 }

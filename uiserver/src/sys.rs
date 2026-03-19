@@ -25,6 +25,7 @@ const MAP_SHARED: usize = 0x01;
 const DISPLAY_IOCTL_GET_INFO: usize = 0x4453_0001;
 const DISPLAY_IOCTL_CREATE_SURFACE: usize = 0x4453_0002;
 const DISPLAY_IOCTL_PRESENT: usize = 0x4453_0003;
+const DISPLAY_IOCTL_PRESENT_RECT: usize = 0x4453_0004;
 const CONSOLE_IOCTL_GET_STATE: usize = 0x434f_0001;
 const CONSOLE_IOCTL_SNAPSHOT_SESSION_OUTPUT: usize = 0x434f_0002;
 const CONSOLE_IOCTL_SET_FOCUS: usize = 0x434f_0003;
@@ -79,6 +80,17 @@ pub(crate) struct DisplaySurfaceCreate {
 struct DisplayPresentRequest {
     surface_handle: u32,
     reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct DisplayPresentRectRequest {
+    surface_handle: u32,
+    reserved: u32,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
 }
 
 #[repr(C)]
@@ -258,6 +270,25 @@ pub(crate) fn display_present(fd: RawFd, surface_handle: u32) -> Result<(), i32>
         reserved: 0,
     };
     ioctl_with_mut(fd, DISPLAY_IOCTL_PRESENT, &mut request)
+}
+
+pub(crate) fn display_present_rect(
+    fd: RawFd,
+    surface_handle: u32,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> Result<(), i32> {
+    let mut request = DisplayPresentRectRequest {
+        surface_handle,
+        reserved: 0,
+        x,
+        y,
+        width,
+        height,
+    };
+    ioctl_with_mut(fd, DISPLAY_IOCTL_PRESENT_RECT, &mut request)
 }
 
 pub(crate) fn map_surface(surface_fd: RawFd, mapping_len: usize) -> Result<SurfaceMapping, i32> {
