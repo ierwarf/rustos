@@ -87,7 +87,7 @@ pub(crate) fn alloc_coherent(
         return ptr::null_mut();
     }
 
-    let phys = crate::paging::kernel_virtual_to_physical_addr(cpu_ptr as u64);
+    let phys = crate::memory::paging::kernel_virtual_to_physical_addr(cpu_ptr as u64);
     let coherent_mask = irq_safe(|| coherent_mask_for(device as usize));
     let end = phys.saturating_add(size.saturating_sub(1) as u64);
     if end > coherent_mask {
@@ -117,7 +117,7 @@ pub(crate) fn map_single(device: *mut c_void, cpu_addr: *mut c_void, size: usize
         return DMA_MAPPING_ERROR;
     }
 
-    let dma_addr = crate::paging::kernel_virtual_to_physical_addr(cpu_addr as u64);
+    let dma_addr = crate::memory::paging::kernel_virtual_to_physical_addr(cpu_addr as u64);
     if exceeds_mask(dma_addr, size, irq_safe(|| dma_mask_for(device as usize))) {
         return DMA_MAPPING_ERROR;
     }

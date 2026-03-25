@@ -43,8 +43,10 @@ pub(crate) fn map(phys_start: u64, size: usize, write_combine: bool) -> *mut c_v
         }
 
         let virt_start = match cache_mode {
-            MmioCacheMode::Uncached => crate::paging::map_mmio_range(phys_start, size),
-            MmioCacheMode::WriteCombine => crate::paging::map_mmio_range_wc(phys_start, size),
+            MmioCacheMode::Uncached => crate::memory::paging::map_mmio_range(phys_start, size),
+            MmioCacheMode::WriteCombine => {
+                crate::memory::paging::map_mmio_range_wc(phys_start, size)
+            }
         };
         let Some(virt_start) = virt_start else {
             return core::ptr::null_mut();
@@ -79,7 +81,7 @@ pub(crate) fn unmap(addr: *mut c_void) {
     });
 
     if let Some(mapping) = removed {
-        let _ = crate::paging::unmap_mmio_range(mapping.virt_start as u64, mapping.size);
+        let _ = crate::memory::paging::unmap_mmio_range(mapping.virt_start as u64, mapping.size);
     }
 }
 

@@ -1,7 +1,11 @@
-use crate::{console, debug, gui};
+#[cfg(not(test))]
+use crate::debug;
+use crate::io::{console, gui};
 use core::fmt::{self, Write};
+#[cfg(not(test))]
 use core::panic::PanicInfo;
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {
     let _ = gui::try_present_panic_blackout();

@@ -541,7 +541,7 @@ fn read_u16(address: crate::arch::pci::PciDevice, offset: usize) -> Option<u16> 
 
 fn read_u32(address: crate::arch::pci::PciDevice, offset: usize) -> Option<u32> {
     if offset > u8::MAX as usize {
-        let addr = crate::acpi::pci_config_address(
+        let addr = crate::arch::acpi::pci_config_address(
             address.segment,
             address.bus,
             address.device,
@@ -600,7 +600,7 @@ fn write_u32(address: crate::arch::pci::PciDevice, offset: i32, value: u32) -> i
 
     let offset = offset as usize;
     if offset > u8::MAX as usize {
-        let Some(addr) = crate::acpi::pci_config_address(
+        let Some(addr) = crate::arch::acpi::pci_config_address(
             address.segment,
             address.bus,
             address.device,

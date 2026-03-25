@@ -1,10 +1,13 @@
 use alloc::string::String;
 use core::convert::TryFrom;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::debug;
+use crate::memory::paging;
+use crate::multitask;
 use crate::user::linux as linux_abi;
 use crate::user::sysops::linux as linux_ops;
 use crate::user::sysops::usermem;
-use crate::{debug, paging};
 
 use super::SyscallFrame;
 
@@ -23,12 +26,49 @@ const LINUX_ENOTDIR: i64 = 20;
 const LINUX_ENOTTY: i64 = 25;
 const LINUX_EROFS: i64 = 30;
 const LINUX_ESPIPE: i64 = 29;
+const LINUX_ESTALE: i64 = 116;
 const LINUX_ENOSYS: i64 = 38;
+const SECONDARY_LINUX_SYSCALL_DEBUG_LIMIT: usize = 0;
+
+static SECONDARY_LINUX_SYSCALL_DEBUG_LOGS: AtomicUsize = AtomicUsize::new(0);
+
+fn debug_log_secondary_linux_syscall(message: impl FnOnce() -> alloc::string::String) {
+    if multitask::current_console_session().is_system() {
+        return;
+    }
+
+    if SECONDARY_LINUX_SYSCALL_DEBUG_LOGS.fetch_add(1, Ordering::Relaxed)
+        >= SECONDARY_LINUX_SYSCALL_DEBUG_LIMIT
+    {
+        return;
+    }
+
+    let pid = multitask::current_user_id().unwrap_or(0);
+    let session = multitask::current_console_session();
+    debug::println!(
+        "secondary linux syscall: pid={} session={} {}",
+        pid,
+        session.raw(),
+        message(),
+    );
+}
 
 pub(super) fn dispatch_linux_syscall(frame: &SyscallFrame) -> u64 {
     if let Err(error) = syscall_check(frame) {
         return error;
     }
+
+    debug_log_secondary_linux_syscall(|| {
+        alloc::format!(
+            "nr={} rip={:#x} rdi={:#x} rsi={:#x} rdx={:#x} r10={:#x}",
+            frame.rax,
+            frame.user_rip,
+            frame.rdi,
+            frame.rsi,
+            frame.rdx,
+            frame.r10,
+        )
+    });
 
     match frame.rax {
         linux_abi::SYS_READ => syscall_linux_read(frame.rdi, frame.rsi, frame.rdx),
@@ -73,7 +113,7 @@ pub(super) fn dispatch_linux_syscall(frame: &SyscallFrame) -> u64 {
         linux_abi::SYS_FCNTL => syscall_linux_fcntl(frame.rdi, frame.rsi, frame.rdx),
         linux_abi::SYS_READLINK => syscall_linux_readlink(frame.rdi, frame.rsi, frame.rdx),
         linux_abi::SYS_FUTEX => syscall_linux_futex(
-            frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
+            frame, frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
         ),
         linux_abi::SYS_ARCH_PRCTL => syscall_linux_arch_prctl(frame.rdi, frame.rsi),
         linux_abi::SYS_SET_TID_ADDRESS => syscall_linux_set_tid_address(frame.rdi),
@@ -199,6 +239,9 @@ fn syscall_process_exit(status: u64) -> u64 {
 }
 
 fn syscall_linux_write(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
+    debug_log_secondary_linux_syscall(|| {
+        alloc::format!("write fd={} ptr={:#x} len={}", fd, user_ptr, user_len)
+    });
     match linux_ops::write(fd, user_ptr, user_len) {
         Ok(written) => written as u64,
         Err(err) => {
@@ -215,6 +258,9 @@ fn syscall_linux_write(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
 }
 
 fn syscall_linux_read(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
+    debug_log_secondary_linux_syscall(|| {
+        alloc::format!("read fd={} ptr={:#x} len={}", fd, user_ptr, user_len)
+    });
     match linux_ops::read(fd, user_ptr, user_len) {
         Ok(read) => read as u64,
         Err(err) => {
@@ -245,6 +291,14 @@ fn syscall_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
 }
 
 fn syscall_linux_poll(pollfds_ptr: u64, nfds: u64, timeout_millis: i32) -> u64 {
+    debug_log_secondary_linux_syscall(|| {
+        alloc::format!(
+            "poll pollfds={:#x} nfds={} timeout_ms={}",
+            pollfds_ptr,
+            nfds,
+            timeout_millis
+        )
+    });
     match linux_ops::poll(pollfds_ptr, nfds, timeout_millis) {
         Ok(ready) => ready,
         Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
@@ -273,9 +327,21 @@ fn syscall_linux_lseek(fd: u64, offset: i64, whence: u64) -> u64 {
 }
 
 fn syscall_linux_writev(fd: u64, iov_ptr: u64, iov_count: u64) -> u64 {
+    debug_log_secondary_linux_syscall(|| {
+        alloc::format!("writev fd={} iov={:#x} iovcnt={}", fd, iov_ptr, iov_count)
+    });
     match linux_ops::writev(fd, iov_ptr, iov_count) {
         Ok(written) => written as u64,
-        Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
+        Err(err) => {
+            debug::println!(
+                "linux writev rejected: fd={} iov_ptr={:#x} iov_count={} err={:?}",
+                fd,
+                iov_ptr,
+                iov_count,
+                err,
+            );
+            linux_errno(linux_sysop_error_to_errno(err))
+        }
     }
 }
 
@@ -659,6 +725,7 @@ fn syscall_linux_getegid() -> u64 {
 }
 
 fn syscall_linux_futex(
+    frame: &SyscallFrame,
     uaddr: u64,
     op: u64,
     val: u64,
@@ -666,6 +733,32 @@ fn syscall_linux_futex(
     uaddr2: u64,
     val3: u64,
 ) -> u64 {
+    if !multitask::current_console_session().is_system() {
+        let user_rsp = frame.user_rsp;
+        let return_rip = if user_rsp != 0 {
+            let mut bytes = [0_u8; 8];
+            match usermem::copy_from_current_user_exact(user_rsp, &mut bytes) {
+                Ok(()) => u64::from_le_bytes(bytes),
+                Err(_) => 0,
+            }
+        } else {
+            0
+        };
+        debug_log_secondary_linux_syscall(|| {
+            alloc::format!(
+                "futex entry uaddr={:#x} op={:#x} val={:#x} timeout_ptr={:#x} uaddr2={:#x} val3={:#x} user_rsp={:#x} return_rip={:#x}",
+                uaddr,
+                op,
+                val,
+                timeout_ptr,
+                uaddr2,
+                val3,
+                user_rsp,
+                return_rip
+            )
+        });
+    }
+
     match linux_ops::futex(uaddr, op, val, timeout_ptr, uaddr2, val3) {
         Ok(value) => value,
         Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
@@ -873,6 +966,7 @@ fn linux_sysop_error_to_errno(err: linux_ops::LinuxSysopError) -> i64 {
         linux_ops::LinuxSysopError::NotTty => LINUX_ENOTTY,
         linux_ops::LinuxSysopError::PermissionDenied => LINUX_EACCES,
         linux_ops::LinuxSysopError::ReadOnlyFilesystem => LINUX_EROFS,
+        linux_ops::LinuxSysopError::Stale => LINUX_ESTALE,
         linux_ops::LinuxSysopError::TryAgain => LINUX_EAGAIN,
         linux_ops::LinuxSysopError::Unsupported => LINUX_ENOSYS,
     }

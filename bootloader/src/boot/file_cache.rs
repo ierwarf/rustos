@@ -17,12 +17,14 @@ use super::error::BootError;
 
 const PAGE_SIZE: usize = 4096;
 const MAX_BOOT_FILE_COUNT: usize = 4096;
-const MAX_BOOT_FILE_BYTES: usize = 128 * 1024 * 1024;
-const MAX_BOOT_TOTAL_BYTES: usize = 512 * 1024 * 1024;
+// Allow substantially larger staged modules to stay in the boot manifest so the
+// kernel can borrow them without transient heap copies during load.
+const MAX_BOOT_FILE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_BOOT_TOTAL_BYTES: usize = 768 * 1024 * 1024;
+const BOOT_FILE_DATA_ALIGN: usize = 16;
 
-const PRIORITY_BOOT_FILES: [PriorityBootFile; 4] = [
+const PRIORITY_BOOT_FILES: [PriorityBootFile; 3] = [
     PriorityBootFile::required("kernel.elf", cstr16!("\\kernel.elf")),
-    PriorityBootFile::optional("background.jpg", cstr16!("\\background.jpg")),
     PriorityBootFile::optional(
         "system/apps/uiserver/uiserver.exe",
         cstr16!("\\system\\apps\\uiserver\\uiserver.exe"),
@@ -137,22 +139,22 @@ impl BootFileSnapshot {
         }
 
         let path_bytes = path.as_bytes();
-        let blob_len = path_bytes
-            .len()
+        let data_offset = align_up(path_bytes.len(), BOOT_FILE_DATA_ALIGN)?;
+        let blob_len = data_offset
             .checked_add(bytes.len())
             .ok_or(Status::OUT_OF_RESOURCES)?;
         let blob = allocate_loader_bytes(blob_len)?;
 
         unsafe {
             ptr::copy_nonoverlapping(path_bytes.as_ptr(), blob, path_bytes.len());
-            ptr::copy_nonoverlapping(bytes.as_ptr(), blob.add(path_bytes.len()), bytes.len());
+            ptr::copy_nonoverlapping(bytes.as_ptr(), blob.add(data_offset), bytes.len());
         }
 
         self.entries.push(BootFileEntry {
             path_ptr: blob as u64,
             path_len: path_bytes.len() as u32,
             _reserved0: 0,
-            data_ptr: unsafe { blob.add(path_bytes.len()) } as u64,
+            data_ptr: unsafe { blob.add(data_offset) } as u64,
             data_len: bytes.len() as u64,
         });
         self.known_paths.push(path.to_owned());
@@ -184,6 +186,17 @@ impl BootFileSnapshot {
             total_bytes: self.total_bytes as u64,
         })
     }
+}
+
+fn align_up(value: usize, align: usize) -> Result<usize, Status> {
+    if align == 0 || !align.is_power_of_two() {
+        return Err(Status::OUT_OF_RESOURCES);
+    }
+
+    value
+        .checked_add(align - 1)
+        .map(|rounded| rounded & !(align - 1))
+        .ok_or(Status::OUT_OF_RESOURCES)
 }
 
 fn cache_priority_file(

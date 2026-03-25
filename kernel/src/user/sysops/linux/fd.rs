@@ -436,7 +436,7 @@ fn poll_revents_for_fd(fd: u64, requested: i16) -> Result<i16, LinuxSysopError> 
 fn poll_revents_for_handle(
     handle: KernelHandle,
     requested: i16,
-    console_session: crate::session::ConsoleSessionId,
+    console_session: crate::io::session::ConsoleSessionHandle,
 ) -> i16 {
     match handle {
         KernelHandle::Console(ConsoleStreamKind::Input) => {

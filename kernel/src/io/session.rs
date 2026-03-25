@@ -1,269 +1,442 @@
-use core::sync::atomic::{AtomicU8, Ordering};
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use spin::Mutex;
 #[cfg(not(test))]
 use x86_64::instructions::interrupts;
 
-pub(crate) const MAX_CONSOLE_SESSIONS: usize = 8;
+pub(crate) const MAX_LIVE_CONSOLE_SESSIONS: usize = 32;
+pub(crate) const CONSOLE_SESSION_TITLE_CAPACITY: usize = 48;
+pub(crate) const CONSOLE_SESSION_PATH_CAPACITY: usize = 64;
 
-static SESSION_REGISTRY: Mutex<ConsoleSessionRegistry> = Mutex::new(ConsoleSessionRegistry::new());
-static FOCUSED_CONSOLE_SESSION: AtomicU8 = AtomicU8::new(ConsoleSessionId::PRIMARY.0);
+static SESSION_MANAGER: Mutex<ConsoleSessionManager> = Mutex::new(ConsoleSessionManager::new());
+static NEXT_SESSION_CREATED_GENERATION: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct ConsoleSessionId(u8);
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub(crate) struct ConsoleSessionHandle(u64);
 
-impl ConsoleSessionId {
-    pub(crate) const PRIMARY: Self = Self(0);
-    pub(crate) const SECONDARY: Self = Self(1);
+impl ConsoleSessionHandle {
+    pub(crate) const SYSTEM: Self = Self(0);
 
-    pub(crate) const fn index(self) -> usize {
-        self.0 as usize
+    pub(crate) const fn from_raw(raw: u64) -> Self {
+        Self(raw)
     }
 
-    pub(crate) const fn name(self) -> &'static str {
-        match self.0 {
-            0 => "primary",
-            1 => "secondary",
-            _ => "console",
-        }
+    pub(crate) const fn raw(self) -> u64 {
+        self.0
     }
 
-    pub(crate) fn from_index(index: usize) -> Option<Self> {
-        if index < MAX_CONSOLE_SESSIONS {
-            Some(Self(index as u8))
-        } else {
+    pub(crate) const fn is_system(self) -> bool {
+        self.0 == 0
+    }
+
+    pub(crate) const fn slot_index(self) -> Option<usize> {
+        if self.0 == 0 {
             None
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct ActiveConsoleSessions {
-    sessions: [Option<ConsoleSessionId>; MAX_CONSOLE_SESSIONS],
-}
-
-impl ActiveConsoleSessions {
-    const fn empty() -> Self {
-        Self {
-            sessions: [None; MAX_CONSOLE_SESSIONS],
+        } else {
+            Some((self.0 as u32) as usize)
         }
     }
 
-    pub(crate) fn iter(&self) -> impl Iterator<Item = ConsoleSessionId> + '_ {
-        self.sessions.iter().copied().flatten()
+    pub(crate) const fn generation(self) -> u32 {
+        (self.0 >> 32) as u32
     }
 
-    pub(crate) fn count(&self) -> usize {
-        self.iter().count()
-    }
-}
-
-pub(crate) fn active_console_sessions() -> ActiveConsoleSessions {
-    with_registry(|registry| registry.snapshot())
-}
-
-pub(crate) fn active_console_session_count() -> usize {
-    with_registry(|registry| registry.active_count)
-}
-
-pub(crate) fn is_console_session_active(session: ConsoleSessionId) -> bool {
-    with_registry(|registry| registry.is_active(session))
-}
-
-pub(crate) fn ensure_console_session(session: ConsoleSessionId) -> bool {
-    with_registry(|registry| registry.ensure_registered(session))
-}
-
-pub(crate) fn allocate_console_session() -> Option<ConsoleSessionId> {
-    with_registry(|registry| registry.allocate())
-}
-
-pub(crate) fn release_console_session(session: ConsoleSessionId) -> bool {
-    let released = with_registry(|registry| registry.release(session));
-    if !released {
-        return false;
-    }
-
-    let focused = focused_console_session();
-    if focused == session {
-        let replacement = active_console_sessions()
-            .iter()
-            .next()
-            .unwrap_or(ConsoleSessionId::PRIMARY);
-        FOCUSED_CONSOLE_SESSION.store(replacement.0, Ordering::Release);
-    }
-
-    true
-}
-
-pub(crate) fn focused_console_session() -> ConsoleSessionId {
-    let focused =
-        ConsoleSessionId::from_index(FOCUSED_CONSOLE_SESSION.load(Ordering::Acquire) as usize)
-            .unwrap_or(ConsoleSessionId::PRIMARY);
-    if is_console_session_active(focused) {
-        return focused;
-    }
-
-    active_console_sessions()
-        .iter()
-        .next()
-        .unwrap_or(ConsoleSessionId::PRIMARY)
-}
-
-pub(crate) fn set_focused_console_session(session: ConsoleSessionId) -> bool {
-    if !is_console_session_active(session) {
-        return false;
-    }
-
-    FOCUSED_CONSOLE_SESSION.swap(session.0, Ordering::AcqRel) != session.0
-}
-
-#[cfg(test)]
-pub(crate) fn reset_focus_for_tests() {
-    with_registry(|registry| registry.reset_for_tests());
-    FOCUSED_CONSOLE_SESSION.store(ConsoleSessionId::PRIMARY.0, Ordering::Release);
-}
-
-struct ConsoleSessionRegistry {
-    active: [bool; MAX_CONSOLE_SESSIONS],
-    active_count: usize,
-}
-
-impl ConsoleSessionRegistry {
-    const fn new() -> Self {
-        let mut active = [false; MAX_CONSOLE_SESSIONS];
-        active[ConsoleSessionId::PRIMARY.index()] = true;
-        Self {
-            active,
-            active_count: 1,
-        }
-    }
-
-    fn snapshot(&self) -> ActiveConsoleSessions {
-        let mut snapshot = ActiveConsoleSessions::empty();
-        let mut slot = 0;
-        let mut index = 0;
-        while index < MAX_CONSOLE_SESSIONS {
-            if self.active[index] {
-                snapshot.sessions[slot] =
-                    Some(ConsoleSessionId::from_index(index).expect("session index"));
-                slot += 1;
-            }
-            index += 1;
-        }
-        snapshot
-    }
-
-    fn is_active(&self, session: ConsoleSessionId) -> bool {
-        self.active.get(session.index()).copied().unwrap_or(false)
-    }
-
-    fn ensure_registered(&mut self, session: ConsoleSessionId) -> bool {
-        let Some(active) = self.active.get_mut(session.index()) else {
-            return false;
-        };
-        if *active {
-            return true;
-        }
-
-        *active = true;
-        self.active_count += 1;
-        true
-    }
-
-    fn allocate(&mut self) -> Option<ConsoleSessionId> {
-        for index in 0..MAX_CONSOLE_SESSIONS {
-            if self.active[index] {
-                continue;
-            }
-
-            self.active[index] = true;
-            self.active_count += 1;
-            return ConsoleSessionId::from_index(index);
-        }
-
-        None
-    }
-
-    fn release(&mut self, session: ConsoleSessionId) -> bool {
-        if session == ConsoleSessionId::PRIMARY {
-            return false;
-        }
-
-        let Some(active) = self.active.get_mut(session.index()) else {
-            return false;
-        };
-        if !*active {
-            return false;
-        }
-
-        *active = false;
-        self.active_count = self.active_count.saturating_sub(1);
-        true
+    const fn from_parts(slot_index: u32, generation: u32) -> Self {
+        Self(((generation as u64) << 32) | slot_index as u64)
     }
 
     #[cfg(test)]
-    fn reset_for_tests(&mut self) {
-        *self = Self::new();
+    pub(crate) const fn for_tests(slot_index: u32, generation: u32) -> Self {
+        Self::from_parts(slot_index, generation)
     }
 }
 
-fn with_registry<R>(f: impl FnOnce(&mut ConsoleSessionRegistry) -> R) -> R {
+#[repr(u16)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ConsoleSessionState {
+    #[default]
+    Queued = 1,
+    LoadingImage = 2,
+    Spawning = 3,
+    Running = 4,
+    Closing = 5,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ConsoleSessionInfo {
+    pub(crate) handle: ConsoleSessionHandle,
+    pub(crate) program_id: u32,
+    pub(crate) pid: Option<u64>,
+    pub(crate) focused: bool,
+    pub(crate) state: ConsoleSessionState,
+    pub(crate) created_generation: u64,
+    pub(crate) focus_order: u64,
+    pub(crate) title: [u8; CONSOLE_SESSION_TITLE_CAPACITY],
+    pub(crate) exec_path: [u8; CONSOLE_SESSION_PATH_CAPACITY],
+}
+
+impl Default for ConsoleSessionInfo {
+    fn default() -> Self {
+        Self {
+            handle: ConsoleSessionHandle::SYSTEM,
+            program_id: 0,
+            pid: None,
+            focused: false,
+            state: ConsoleSessionState::Queued,
+            created_generation: 0,
+            focus_order: 0,
+            title: [0; CONSOLE_SESSION_TITLE_CAPACITY],
+            exec_path: [0; CONSOLE_SESSION_PATH_CAPACITY],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CreateConsoleSessionError {
+    NoCapacity,
+}
+
+struct ConsoleSessionRecord {
+    handle: ConsoleSessionHandle,
+    program_id: u32,
+    pid: Option<u64>,
+    focus_order: u64,
+    created_generation: u64,
+    state: ConsoleSessionState,
+    title: [u8; CONSOLE_SESSION_TITLE_CAPACITY],
+    exec_path: [u8; CONSOLE_SESSION_PATH_CAPACITY],
+}
+
+struct SessionSlot {
+    generation: u32,
+    record: Option<ConsoleSessionRecord>,
+}
+
+struct ConsoleSessionManager {
+    slots: Vec<SessionSlot>,
+    free_slots: Vec<u32>,
+    next_focus_order: u64,
+}
+
+impl ConsoleSessionManager {
+    const fn new() -> Self {
+        Self {
+            slots: Vec::new(),
+            free_slots: Vec::new(),
+            next_focus_order: 1,
+        }
+    }
+
+    fn create_session(
+        &mut self,
+        program_id: u32,
+        title: &str,
+        exec_path: &str,
+    ) -> Result<ConsoleSessionHandle, CreateConsoleSessionError> {
+        let slot_index = if let Some(slot_index) = self.free_slots.pop() {
+            slot_index
+        } else {
+            if self.slots.len() >= MAX_LIVE_CONSOLE_SESSIONS {
+                return Err(CreateConsoleSessionError::NoCapacity);
+            }
+            self.slots.push(SessionSlot {
+                generation: 1,
+                record: None,
+            });
+            (self.slots.len() - 1) as u32
+        };
+
+        let created_generation = NEXT_SESSION_CREATED_GENERATION.fetch_add(1, Ordering::Relaxed);
+        let focus_order = self.bump_focus_order();
+        let slot = self
+            .slots
+            .get_mut(slot_index as usize)
+            .expect("session slot index must exist");
+        let generation = slot.generation.max(1);
+        let handle = ConsoleSessionHandle::from_parts(slot_index, generation);
+        slot.record = Some(ConsoleSessionRecord {
+            handle,
+            program_id,
+            pid: None,
+            focus_order,
+            created_generation,
+            state: ConsoleSessionState::Queued,
+            title: ascii_array(title),
+            exec_path: ascii_array(exec_path),
+        });
+        Ok(handle)
+    }
+
+    fn remove_session(&mut self, handle: ConsoleSessionHandle) -> bool {
+        let Some(slot_index) = handle.slot_index() else {
+            return false;
+        };
+        let Some(slot) = self.slots.get_mut(slot_index) else {
+            return false;
+        };
+        let Some(record) = slot.record.as_ref() else {
+            return false;
+        };
+        if record.handle != handle {
+            return false;
+        }
+
+        slot.record = None;
+        slot.generation = slot.generation.wrapping_add(1).max(1);
+        self.free_slots.push(slot_index as u32);
+        true
+    }
+
+    fn contains(&self, handle: ConsoleSessionHandle) -> bool {
+        self.record(handle).is_some()
+    }
+
+    fn record(&self, handle: ConsoleSessionHandle) -> Option<&ConsoleSessionRecord> {
+        let slot_index = handle.slot_index()?;
+        let slot = self.slots.get(slot_index)?;
+        let record = slot.record.as_ref()?;
+        (record.handle == handle).then_some(record)
+    }
+
+    fn record_mut(&mut self, handle: ConsoleSessionHandle) -> Option<&mut ConsoleSessionRecord> {
+        let slot_index = handle.slot_index()?;
+        let slot = self.slots.get_mut(slot_index)?;
+        let record = slot.record.as_mut()?;
+        (record.handle == handle).then_some(record)
+    }
+
+    fn bump_focus_order(&mut self) -> u64 {
+        let focus_order = self.next_focus_order;
+        self.next_focus_order = self.next_focus_order.wrapping_add(1).max(1);
+        focus_order
+    }
+
+    fn focus_session(&mut self, handle: ConsoleSessionHandle) -> bool {
+        let focus_order = self.bump_focus_order();
+        let Some(record) = self.record_mut(handle) else {
+            return false;
+        };
+        if record.state == ConsoleSessionState::Closing {
+            return false;
+        }
+        record.focus_order = focus_order;
+        true
+    }
+
+    fn focused_session(&self) -> Option<ConsoleSessionHandle> {
+        self.slots
+            .iter()
+            .filter_map(|slot| slot.record.as_ref())
+            .filter(|record| record.state != ConsoleSessionState::Closing)
+            .max_by_key(|record| record.focus_order)
+            .map(|record| record.handle)
+    }
+
+    fn transition_state(
+        &mut self,
+        handle: ConsoleSessionHandle,
+        state: ConsoleSessionState,
+    ) -> bool {
+        let Some(record) = self.record_mut(handle) else {
+            return false;
+        };
+        record.state = state;
+        true
+    }
+
+    fn assign_pid(&mut self, handle: ConsoleSessionHandle, pid: Option<u64>) -> bool {
+        let Some(record) = self.record_mut(handle) else {
+            return false;
+        };
+        record.pid = pid;
+        true
+    }
+
+    fn snapshot_infos(&self, dest: &mut [ConsoleSessionInfo]) -> usize {
+        let focused = self.focused_session();
+        let mut count = 0;
+        for slot in &self.slots {
+            let Some(record) = slot.record.as_ref() else {
+                continue;
+            };
+            if count == dest.len() {
+                break;
+            }
+            dest[count] = ConsoleSessionInfo {
+                handle: record.handle,
+                program_id: record.program_id,
+                pid: record.pid,
+                focused: Some(record.handle) == focused,
+                state: record.state,
+                created_generation: record.created_generation,
+                focus_order: record.focus_order,
+                title: record.title,
+                exec_path: record.exec_path,
+            };
+            count += 1;
+        }
+        count
+    }
+
+    fn snapshot_handles(&self, dest: &mut [ConsoleSessionHandle]) -> usize {
+        let mut count = 0;
+        for slot in &self.slots {
+            let Some(record) = slot.record.as_ref() else {
+                continue;
+            };
+            if count == dest.len() {
+                break;
+            }
+            dest[count] = record.handle;
+            count += 1;
+        }
+        count
+    }
+}
+
+pub(crate) fn create_console_session(
+    program_id: u32,
+    title: &str,
+    exec_path: &str,
+) -> Result<ConsoleSessionHandle, CreateConsoleSessionError> {
+    with_manager(|manager| manager.create_session(program_id, title, exec_path))
+}
+
+pub(crate) fn remove_console_session(handle: ConsoleSessionHandle) -> bool {
+    with_manager(|manager| manager.remove_session(handle))
+}
+
+pub(crate) fn is_console_session_active(handle: ConsoleSessionHandle) -> bool {
+    if handle.is_system() {
+        return false;
+    }
+    with_manager(|manager| manager.contains(handle))
+}
+
+pub(crate) fn focused_console_session() -> Option<ConsoleSessionHandle> {
+    with_manager(|manager| manager.focused_session())
+}
+
+pub(crate) fn set_focused_console_session(handle: ConsoleSessionHandle) -> bool {
+    if handle.is_system() {
+        return false;
+    }
+    with_manager(|manager| manager.focus_session(handle))
+}
+
+pub(crate) fn transition_console_session_state(
+    handle: ConsoleSessionHandle,
+    state: ConsoleSessionState,
+) -> bool {
+    if handle.is_system() {
+        return false;
+    }
+    with_manager(|manager| manager.transition_state(handle, state))
+}
+
+pub(crate) fn assign_console_session_pid(handle: ConsoleSessionHandle, pid: Option<u64>) -> bool {
+    if handle.is_system() {
+        return false;
+    }
+    with_manager(|manager| manager.assign_pid(handle, pid))
+}
+
+pub(crate) fn snapshot_console_sessions(dest: &mut [ConsoleSessionInfo]) -> usize {
+    with_manager(|manager| manager.snapshot_infos(dest))
+}
+
+pub(crate) fn snapshot_console_session_handles(dest: &mut [ConsoleSessionHandle]) -> usize {
+    with_manager(|manager| manager.snapshot_handles(dest))
+}
+
+fn ascii_array<const N: usize>(value: &str) -> [u8; N] {
+    let mut stored = [0_u8; N];
+    let mut len = 0usize;
+    for byte in value.bytes() {
+        if len == stored.len() {
+            break;
+        }
+        stored[len] = match byte {
+            b' '..=b'~' => byte,
+            _ => b'?',
+        };
+        len += 1;
+    }
+    stored
+}
+
+fn with_manager<R>(f: impl FnOnce(&mut ConsoleSessionManager) -> R) -> R {
     #[cfg(test)]
     {
-        f(&mut SESSION_REGISTRY.lock())
+        f(&mut SESSION_MANAGER.lock())
     }
 
     #[cfg(not(test))]
     {
-        interrupts::without_interrupts(|| f(&mut SESSION_REGISTRY.lock()))
+        interrupts::without_interrupts(|| f(&mut SESSION_MANAGER.lock()))
     }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_for_tests() {
+    *SESSION_MANAGER.lock() = ConsoleSessionManager::new();
+    NEXT_SESSION_CREATED_GENERATION.store(1, Ordering::Relaxed);
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ConsoleSessionId, active_console_sessions, allocate_console_session,
-        focused_console_session, release_console_session, reset_focus_for_tests,
-        set_focused_console_session,
+        ConsoleSessionHandle, ConsoleSessionState, create_console_session, focused_console_session,
+        remove_console_session, reset_for_tests, set_focused_console_session,
+        snapshot_console_sessions, transition_console_session_state,
     };
 
     #[test]
-    fn focus_defaults_to_primary() {
-        reset_focus_for_tests();
-        assert_eq!(focused_console_session(), ConsoleSessionId::PRIMARY);
+    fn stale_handle_is_not_reused() {
+        reset_for_tests();
+        let handle = create_console_session(1, "printf demo", "/bin/printf").expect("session");
+        assert!(remove_console_session(handle));
+        let replacement =
+            create_console_session(2, "printf demo 2", "/bin/printf2").expect("replacement");
+        assert_ne!(handle, replacement);
     }
 
     #[test]
-    fn focus_can_switch_between_sessions() {
-        reset_focus_for_tests();
-        let secondary = allocate_console_session().expect("secondary session");
-        assert_eq!(secondary, ConsoleSessionId::SECONDARY);
-        assert!(set_focused_console_session(ConsoleSessionId::SECONDARY));
-        assert_eq!(focused_console_session(), ConsoleSessionId::SECONDARY);
-        assert!(set_focused_console_session(ConsoleSessionId::PRIMARY));
-        assert_eq!(focused_console_session(), ConsoleSessionId::PRIMARY);
+    fn focus_falls_back_to_latest_live_session() {
+        reset_for_tests();
+        let first = create_console_session(1, "one", "/one").expect("first");
+        let second = create_console_session(2, "two", "/two").expect("second");
+        assert_eq!(focused_console_session(), Some(second));
+        assert!(set_focused_console_session(first));
+        assert_eq!(focused_console_session(), Some(first));
+        assert!(remove_console_session(first));
+        assert_eq!(focused_console_session(), Some(second));
     }
 
     #[test]
-    fn releasing_focused_session_falls_back_to_primary() {
-        reset_focus_for_tests();
-        let secondary = allocate_console_session().expect("secondary session");
-        assert!(set_focused_console_session(secondary));
-        assert!(release_console_session(secondary));
-        assert_eq!(focused_console_session(), ConsoleSessionId::PRIMARY);
+    fn snapshots_include_state_and_focus() {
+        reset_for_tests();
+        let handle = create_console_session(7, "demo", "/demo").expect("session");
+        assert!(transition_console_session_state(
+            handle,
+            ConsoleSessionState::Running
+        ));
+        let mut sessions = [super::ConsoleSessionInfo::default(); 4];
+        let count = snapshot_console_sessions(&mut sessions);
+        assert_eq!(count, 1);
+        assert_eq!(sessions[0].handle, handle);
+        assert_eq!(sessions[0].program_id, 7);
+        assert_eq!(sessions[0].state, ConsoleSessionState::Running);
+        assert!(sessions[0].focused);
+        assert_eq!(sessions[0].title[0], b'd');
     }
 
     #[test]
-    fn active_sessions_expand_dynamically() {
-        reset_focus_for_tests();
-        let secondary = allocate_console_session().expect("secondary session");
-        let tertiary = allocate_console_session().expect("tertiary session");
-        let sessions = active_console_sessions();
-        let mut iter = sessions.iter();
-        assert_eq!(iter.next(), Some(ConsoleSessionId::PRIMARY));
-        assert_eq!(iter.next(), Some(secondary));
-        assert_eq!(iter.next(), Some(tertiary));
-        assert_eq!(iter.next(), None);
+    fn system_handle_is_not_a_live_session() {
+        reset_for_tests();
+        assert_eq!(focused_console_session(), None);
+        assert!(!set_focused_console_session(ConsoleSessionHandle::SYSTEM));
+        assert!(!remove_console_session(ConsoleSessionHandle::SYSTEM));
     }
 }

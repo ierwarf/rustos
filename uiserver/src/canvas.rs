@@ -145,12 +145,8 @@ impl<'a> SurfaceCanvas<'a> {
         height: u32,
         stride_pixels: usize,
     ) -> Self {
-        let clip_rect = Rect {
-            x: 0,
-            y: 0,
-            width: width as usize,
-            height: height as usize,
-        };
+        let (width, height, clip_rect) =
+            sanitized_surface_geometry(pixels.len(), width, height, stride_pixels);
 
         Self {
             pixels,
@@ -168,12 +164,8 @@ impl<'a> SurfaceCanvas<'a> {
         stride_pixels: usize,
         clip_rect: Rect,
     ) -> Self {
-        let screen_rect = Rect {
-            x: 0,
-            y: 0,
-            width: width as usize,
-            height: height as usize,
-        };
+        let (width, height, screen_rect) =
+            sanitized_surface_geometry(pixels.len(), width, height, stride_pixels);
 
         Self {
             pixels,
@@ -191,9 +183,19 @@ impl<'a> SurfaceCanvas<'a> {
         }
 
         for row in rect.y..rect.y.saturating_add(rect.height) {
-            let row_start = row * self.stride_pixels + rect.x;
-            let row_end = row_start + rect.width;
-            self.pixels[row_start..row_end].fill(color);
+            let Some(row_start) = row
+                .checked_mul(self.stride_pixels)
+                .and_then(|offset| offset.checked_add(rect.x))
+            else {
+                return;
+            };
+            let Some(row_end) = row_start.checked_add(rect.width) else {
+                return;
+            };
+            let Some(row_pixels) = self.pixels.get_mut(row_start..row_end) else {
+                return;
+            };
+            row_pixels.fill(color);
         }
     }
 
@@ -212,9 +214,19 @@ impl<'a> SurfaceCanvas<'a> {
         }
 
         for row in rect.y..rect.y.saturating_add(rect.height) {
-            let row_start = row * self.stride_pixels + rect.x;
-            let row_end = row_start + rect.width;
-            simd::blend_solid_bgr(&mut self.pixels[row_start..row_end], color, alpha);
+            let Some(row_start) = row
+                .checked_mul(self.stride_pixels)
+                .and_then(|offset| offset.checked_add(rect.x))
+            else {
+                return;
+            };
+            let Some(row_end) = row_start.checked_add(rect.width) else {
+                return;
+            };
+            let Some(row_pixels) = self.pixels.get_mut(row_start..row_end) else {
+                return;
+            };
+            simd::blend_solid_bgr(row_pixels, color, alpha);
         }
     }
 
@@ -236,9 +248,19 @@ impl<'a> SurfaceCanvas<'a> {
             let g = top_g + ((bottom_g - top_g) * y_i64) / denom;
             let r = top_r + ((bottom_r - top_r) * y_i64) / denom;
             let color = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
-            let row_start = y * self.stride_pixels + self.clip_rect.x;
-            let row_end = row_start + self.clip_rect.width;
-            self.pixels[row_start..row_end].fill(color);
+            let Some(row_start) = y
+                .checked_mul(self.stride_pixels)
+                .and_then(|offset| offset.checked_add(self.clip_rect.x))
+            else {
+                return;
+            };
+            let Some(row_end) = row_start.checked_add(self.clip_rect.width) else {
+                return;
+            };
+            let Some(row_pixels) = self.pixels.get_mut(row_start..row_end) else {
+                return;
+            };
+            row_pixels.fill(color);
         }
     }
 
@@ -263,6 +285,18 @@ impl<'a> SurfaceCanvas<'a> {
         if src_width == 0 || src_height == 0 {
             return;
         }
+        if src_stride_pixels < src_width {
+            return;
+        }
+        let Some(required_len) = src_stride_pixels
+            .checked_mul(src_height.saturating_sub(1))
+            .and_then(|prefix| prefix.checked_add(src_width))
+        else {
+            return;
+        };
+        if src_pixels.len() < required_len {
+            return;
+        }
 
         let dst_rect = Rect {
             x: dst_x,
@@ -279,10 +313,29 @@ impl<'a> SurfaceCanvas<'a> {
         let src_y = dst_rect.y.saturating_sub(dst_y);
 
         for row in 0..dst_rect.height {
-            let src_row = (src_y + row) * src_stride_pixels + src_x;
-            let dst_row = (dst_rect.y + row) * self.stride_pixels + dst_rect.x;
-            let src = &src_pixels[src_row..src_row + dst_rect.width];
-            let dst = &mut self.pixels[dst_row..dst_row + dst_rect.width];
+            let Some(src_row) = (src_y + row)
+                .checked_mul(src_stride_pixels)
+                .and_then(|offset| offset.checked_add(src_x))
+            else {
+                return;
+            };
+            let Some(dst_row) = (dst_rect.y + row)
+                .checked_mul(self.stride_pixels)
+                .and_then(|offset| offset.checked_add(dst_rect.x))
+            else {
+                return;
+            };
+            let Some(src_end) = src_row.checked_add(dst_rect.width) else {
+                return;
+            };
+            let Some(dst_end) = dst_row.checked_add(dst_rect.width) else {
+                return;
+            };
+            if src_end > src_pixels.len() || dst_end > self.pixels.len() {
+                return;
+            }
+            let src = &src_pixels[src_row..src_end];
+            let dst = &mut self.pixels[dst_row..dst_end];
             simd::copy_u32s(src, dst);
         }
     }
@@ -295,8 +348,15 @@ impl<'a> SurfaceCanvas<'a> {
             return;
         }
 
-        let index = y as usize * self.stride_pixels + x as usize;
-        self.pixels[index] = color;
+        let Some(index) = (y as usize)
+            .checked_mul(self.stride_pixels)
+            .and_then(|offset| offset.checked_add(x as usize))
+        else {
+            return;
+        };
+        if let Some(pixel) = self.pixels.get_mut(index) {
+            *pixel = color;
+        }
     }
 
     fn draw_cursor_layer(&mut self, base_x: i32, base_y: i32, only: Option<u8>, color: u32) {
@@ -354,4 +414,33 @@ pub(crate) fn cursor_dirty_rect(cursor_x: u32, cursor_y: u32, width: u32, height
         width: width as usize,
         height: height as usize,
     })
+}
+
+fn sanitized_surface_geometry(
+    pixels_len: usize,
+    width: u32,
+    height: u32,
+    stride_pixels: usize,
+) -> (u32, u32, Rect) {
+    if stride_pixels == 0 || pixels_len == 0 {
+        return (0, 0, Rect::empty());
+    }
+
+    let requested_width = width as usize;
+    let requested_height = height as usize;
+    let safe_width = requested_width.min(stride_pixels);
+    let safe_height = requested_height.min(pixels_len / stride_pixels);
+    let safe_width_u32 = safe_width.min(u32::MAX as usize) as u32;
+    let safe_height_u32 = safe_height.min(u32::MAX as usize) as u32;
+
+    (
+        safe_width_u32,
+        safe_height_u32,
+        Rect {
+            x: 0,
+            y: 0,
+            width: safe_width,
+            height: safe_height,
+        },
+    )
 }

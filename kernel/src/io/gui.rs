@@ -3,12 +3,12 @@ mod framebuffer;
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use boot_protocol::{BootInfo, BOOT_INFO_MAGIC, BOOT_INFO_VERSION};
+use boot_protocol::{BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootInfo};
 use driver_abi::{DisplayFramebufferRegistration, DisplayPixelFormat};
 use embedded_graphics::pixelcolor::Rgb888;
 
 use self::framebuffer::FramebufferRect;
-use crate::session::ConsoleSessionId;
+use crate::io::session::ConsoleSessionHandle;
 
 static USERSPACE_DISPLAY_MODE: AtomicU8 = AtomicU8::new(DISPLAY_MODE_BOOT_CONSOLE);
 
@@ -22,13 +22,14 @@ pub struct GuiDisplayInfo {
     pub height: u32,
     pub stride_bytes: u32,
     pub bytes_per_pixel: u32,
+    pub generation: u64,
 }
 
 pub fn init_console() {
     // Boot and fatal output are routed to the debug log instead of a framebuffer terminal.
 }
 
-pub fn write_console_session(session: ConsoleSessionId, bytes: &[u8]) {
+pub fn write_console_session(session: ConsoleSessionHandle, bytes: &[u8]) {
     let _ = session;
     let _ = bytes;
 }
@@ -50,8 +51,7 @@ pub fn try_present_panic_blackout() -> bool {
 pub fn tick_console_cursor() {}
 
 pub fn init(boot_info_ptr: *const BootInfo) {
-    let boot_info = boot_info_from_ptr(boot_info_ptr);
-    backend::init_gop(boot_info.framebuffer);
+    let _ = boot_info_from_ptr(boot_info_ptr);
 }
 
 pub(crate) unsafe extern "C" fn register_driver_framebuffer(
@@ -102,29 +102,13 @@ pub fn display_info() -> Option<GuiDisplayInfo> {
     backend::display_info()
 }
 
-pub fn present_userspace_frame_bgra8888(
-    width: usize,
-    height: usize,
-    stride_bytes: usize,
-    bytes: &[u8],
-) -> bool {
-    let claimed_boot_console = begin_userspace_display_transition();
-    let presented = backend::present_bgra8888(width, height, stride_bytes, bytes);
-    if presented {
-        finish_userspace_display_transition();
-    } else if claimed_boot_console {
-        USERSPACE_DISPLAY_MODE.store(DISPLAY_MODE_BOOT_CONSOLE, Ordering::Release);
-    }
-    presented
-}
-
 pub fn present_userspace_frame_from_user_bgra8888(
-    address_space: &crate::paging::ProcessAddressSpace,
+    address_space: &crate::memory::paging::ProcessAddressSpace,
     user_ptr: u64,
     width: usize,
     height: usize,
     stride_bytes: usize,
-) -> Result<bool, crate::paging::AddressSpaceError> {
+) -> Result<bool, crate::memory::paging::AddressSpaceError> {
     let claimed_boot_console = begin_userspace_display_transition();
     let presented =
         backend::present_bgra8888_from_user(address_space, user_ptr, width, height, stride_bytes)?;
@@ -137,7 +121,7 @@ pub fn present_userspace_frame_from_user_bgra8888(
 }
 
 pub fn present_userspace_frame_rect_from_user_bgra8888(
-    address_space: &crate::paging::ProcessAddressSpace,
+    address_space: &crate::memory::paging::ProcessAddressSpace,
     user_ptr: u64,
     width: usize,
     height: usize,
@@ -146,7 +130,7 @@ pub fn present_userspace_frame_rect_from_user_bgra8888(
     y: usize,
     rect_width: usize,
     rect_height: usize,
-) -> Result<bool, crate::paging::AddressSpaceError> {
+) -> Result<bool, crate::memory::paging::AddressSpaceError> {
     let claimed_boot_console = begin_userspace_display_transition();
     let presented = backend::present_bgra8888_rect_from_user(
         address_space,

@@ -5,8 +5,8 @@ use core::convert::TryFrom;
 
 use x86_64::VirtAddr;
 
+use crate::memory::paging;
 use crate::multitask;
-use crate::paging;
 use crate::user::handles::{
     FileHandleSeekError, FileHandleSeekWhence, FileHandleWriteError, KernelHandle,
 };
@@ -82,7 +82,9 @@ pub(crate) fn open_path_for_current_process(
     flags: u64,
     mode: u64,
 ) -> Result<u64, FileSysopError> {
-    vfs::open_path_for_current_process(absolute_path, flags, mode).map_err(Into::into)
+    let fd = vfs::open_path_for_current_process(absolute_path, flags, mode)
+        .map_err(FileSysopError::from)?;
+    Ok(fd)
 }
 
 pub(crate) fn read_current_process_file(

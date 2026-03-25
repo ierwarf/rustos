@@ -21,34 +21,40 @@ const PROT_READ: usize = 0x1;
 const PROT_WRITE: usize = 0x2;
 
 const MAP_SHARED: usize = 0x01;
+const PAGE_SIZE: usize = 4096;
 
 const DISPLAY_IOCTL_GET_INFO: usize = 0x4453_0001;
 const DISPLAY_IOCTL_CREATE_SURFACE: usize = 0x4453_0002;
 const DISPLAY_IOCTL_PRESENT: usize = 0x4453_0003;
 const DISPLAY_IOCTL_PRESENT_RECT: usize = 0x4453_0004;
 const CONSOLE_IOCTL_GET_STATE: usize = 0x434f_0001;
+const CONSOLE_IOCTL_SNAPSHOT_SESSIONS: usize = 0x434f_0005;
 const CONSOLE_IOCTL_SNAPSHOT_SESSION_OUTPUT: usize = 0x434f_0002;
 const CONSOLE_IOCTL_SET_FOCUS: usize = 0x434f_0003;
-const CONSOLE_SESSION_CAPACITY: usize = 8;
+const CONSOLE_IOCTL_SEND_INPUT_EVENT: usize = 0x434f_0004;
+pub(crate) const CONSOLE_SESSION_CAPACITY: usize = 32;
+const CONSOLE_SESSION_TITLE_CAPACITY: usize = 48;
 
 const RUNTIME_IOCTL_GET_GENERATION: usize = 0x5254_0001;
 const RUNTIME_IOCTL_SNAPSHOT_PROGRAMS: usize = 0x5254_0002;
 const RUNTIME_IOCTL_SNAPSHOT_RUNNING_PROGRAMS: usize = 0x5254_0003;
 const RUNTIME_IOCTL_REQUEST_LAUNCH: usize = 0x5254_0004;
 
-const LAUNCH_TARGET_FIRST_AVAILABLE: u16 = 2;
+const LAUNCH_TARGET_NEW_SESSION: u16 = 2;
 
 pub(crate) const PIXEL_FORMAT_BGRA8888: u32 = 1;
 pub(crate) const INPUT_KIND_KEYBOARD: u16 = 1;
 pub(crate) const INPUT_KIND_POINTER_MOTION: u16 = 2;
 pub(crate) const INPUT_KIND_POINTER_BUTTON: u16 = 3;
+pub(crate) const INPUT_KIND_POINTER_POSITION: u16 = 5;
 pub(crate) const INPUT_ACTION_PRESSED: u16 = 1;
-pub(crate) const INPUT_ACTION_RELEASED: u16 = 2;
 pub(crate) const POINTER_BUTTON_LEFT: u32 = 1;
 pub(crate) const RUNNING_PROGRAM_NAME_CAPACITY: usize = 48;
 pub(crate) const PROGRAM_NAME_CAPACITY: usize = 48;
 pub(crate) const PROGRAM_PATH_CAPACITY: usize = 64;
 pub(crate) const MAX_CONSOLE_SNAPSHOT_BYTES: usize = 4096;
+pub(crate) const ESTALE: i32 = 116;
+pub(crate) type ConsoleSessionHandle = u64;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -59,6 +65,7 @@ pub(crate) struct DisplayInfo {
     pub(crate) bytes_per_pixel: u32,
     pub(crate) pixel_format: u32,
     pub(crate) reserved: u32,
+    pub(crate) generation: u64,
 }
 
 #[repr(C)]
@@ -73,6 +80,7 @@ pub(crate) struct DisplaySurfaceCreate {
     pub(crate) stride_bytes: u32,
     pub(crate) reserved: u32,
     pub(crate) mapping_len: u64,
+    pub(crate) generation: u64,
 }
 
 #[repr(C)]
@@ -108,17 +116,47 @@ pub(crate) struct InputEvent {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ConsoleStateInfo {
-    pub(crate) active_session_mask: u64,
-    pub(crate) focused_session_index: u32,
+    pub(crate) focused_session_handle: u64,
+    pub(crate) session_count: u32,
     pub(crate) reserved: u32,
-    pub(crate) output_generations: [u64; CONSOLE_SESSION_CAPACITY],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ConsoleSessionInfo {
+    pub(crate) session_handle: u64,
+    pub(crate) state: u16,
+    pub(crate) focused: u16,
+    pub(crate) reserved: u32,
+    pub(crate) output_generation: u64,
+    pub(crate) title: [u8; CONSOLE_SESSION_TITLE_CAPACITY],
+}
+
+impl Default for ConsoleSessionInfo {
+    fn default() -> Self {
+        Self {
+            session_handle: 0,
+            state: 0,
+            focused: 0,
+            reserved: 0,
+            output_generation: 0,
+            title: [0; CONSOLE_SESSION_TITLE_CAPACITY],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct ConsoleSnapshotSessionsRequest {
+    sessions_ptr: u64,
+    capacity: u64,
+    count: u64,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 struct ConsoleSnapshotSessionOutputRequest {
-    session_index: u32,
-    reserved: u32,
+    session_handle: u64,
     bytes_ptr: u64,
     capacity: u64,
     count: u64,
@@ -127,8 +165,14 @@ struct ConsoleSnapshotSessionOutputRequest {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 struct ConsoleSetFocusRequest {
-    session_index: u32,
-    reserved: u32,
+    session_handle: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct ConsoleSendInputEventRequest {
+    session_handle: u64,
+    event: InputEvent,
 }
 
 #[repr(C)]
@@ -136,7 +180,8 @@ struct ConsoleSetFocusRequest {
 pub(crate) struct RuntimeRunningProgram {
     pub(crate) pid: u64,
     pub(crate) program_id: u32,
-    pub(crate) session_index: u32,
+    pub(crate) reserved: u32,
+    pub(crate) session_handle: u64,
     pub(crate) display_name: [u8; RUNNING_PROGRAM_NAME_CAPACITY],
 }
 
@@ -167,7 +212,8 @@ impl Default for RuntimeRunningProgram {
         Self {
             pid: 0,
             program_id: 0,
-            session_index: 0,
+            reserved: 0,
+            session_handle: 0,
             display_name: [0; RUNNING_PROGRAM_NAME_CAPACITY],
         }
     }
@@ -292,6 +338,9 @@ pub(crate) fn display_present_rect(
 }
 
 pub(crate) fn map_surface(surface_fd: RawFd, mapping_len: usize) -> Result<SurfaceMapping, i32> {
+    if mapping_len == 0 || mapping_len % PAGE_SIZE != 0 || mapping_len % size_of::<u32>() != 0 {
+        return Err(22);
+    }
     let mapped = mmap(
         core::ptr::null_mut(),
         mapping_len,
@@ -325,28 +374,54 @@ pub(crate) fn console_get_state(fd: RawFd) -> Result<ConsoleStateInfo, i32> {
     Ok(state)
 }
 
+pub(crate) fn console_snapshot_sessions(
+    fd: RawFd,
+    sessions: &mut [ConsoleSessionInfo],
+) -> Result<usize, i32> {
+    let mut request = ConsoleSnapshotSessionsRequest {
+        sessions_ptr: sessions.as_mut_ptr() as u64,
+        capacity: sessions.len() as u64,
+        count: 0,
+    };
+    ioctl_with_mut(fd, CONSOLE_IOCTL_SNAPSHOT_SESSIONS, &mut request)?;
+    let count = usize::try_from(request.count).unwrap_or(sessions.len());
+    Ok(count.min(sessions.len()))
+}
+
 pub(crate) fn console_snapshot_session_output(
     fd: RawFd,
-    session_index: u32,
+    session_handle: ConsoleSessionHandle,
     bytes: &mut [u8],
 ) -> Result<usize, i32> {
     let mut request = ConsoleSnapshotSessionOutputRequest {
-        session_index,
-        reserved: 0,
+        session_handle,
         bytes_ptr: bytes.as_mut_ptr() as u64,
         capacity: bytes.len() as u64,
         count: 0,
     };
     ioctl_with_mut(fd, CONSOLE_IOCTL_SNAPSHOT_SESSION_OUTPUT, &mut request)?;
-    Ok(request.count as usize)
+    let count = usize::try_from(request.count).unwrap_or(bytes.len());
+    Ok(count.min(bytes.len()))
 }
 
-pub(crate) fn console_set_focus(fd: RawFd, session_index: u32) -> Result<(), i32> {
-    let mut request = ConsoleSetFocusRequest {
-        session_index,
-        reserved: 0,
-    };
+pub(crate) fn console_set_focus(
+    fd: RawFd,
+    session_handle: ConsoleSessionHandle,
+) -> Result<(), i32> {
+    let mut request = ConsoleSetFocusRequest { session_handle };
     ioctl_with_mut(fd, CONSOLE_IOCTL_SET_FOCUS, &mut request)
+}
+
+pub(crate) fn console_send_input_event(
+    fd: RawFd,
+    session_handle: ConsoleSessionHandle,
+    event: InputEvent,
+) -> Result<(), i32> {
+    let mut request = ConsoleSendInputEventRequest {
+        session_handle,
+        event,
+    };
+    ioctl_with_mut(fd, CONSOLE_IOCTL_SEND_INPUT_EVENT, &mut request)
 }
 
 pub(crate) fn runtime_generation(fd: RawFd) -> Result<u64, i32> {
@@ -365,7 +440,8 @@ pub(crate) fn runtime_snapshot_running_programs(
         count: 0,
     };
     ioctl_with_mut(fd, RUNTIME_IOCTL_SNAPSHOT_RUNNING_PROGRAMS, &mut request)?;
-    Ok(request.count as usize)
+    let count = usize::try_from(request.count).unwrap_or(programs.len());
+    Ok(count.min(programs.len()))
 }
 
 pub(crate) fn runtime_snapshot_programs(
@@ -378,16 +454,14 @@ pub(crate) fn runtime_snapshot_programs(
         count: 0,
     };
     ioctl_with_mut(fd, RUNTIME_IOCTL_SNAPSHOT_PROGRAMS, &mut request)?;
-    Ok(request.count as usize)
+    let count = usize::try_from(request.count).unwrap_or(programs.len());
+    Ok(count.min(programs.len()))
 }
 
-pub(crate) fn runtime_request_launch_first_available(
-    fd: RawFd,
-    program_id: u32,
-) -> Result<(), i32> {
+pub(crate) fn runtime_request_launch_new_session(fd: RawFd, program_id: u32) -> Result<(), i32> {
     let mut request = RuntimeLaunchRequest {
         program_id: program_id as u64,
-        target_kind: LAUNCH_TARGET_FIRST_AVAILABLE,
+        target_kind: LAUNCH_TARGET_NEW_SESSION,
         reserved: 0,
         reserved2: 0,
         target_value: 0,

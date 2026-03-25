@@ -39,9 +39,13 @@ pub(crate) fn open_path_for_current_process(
     let mount = resolve_mount(absolute_path)?;
     let Some(result) = multitask::with_current_user_process_state_mut(|_, abi, process_state| {
         let mut context = VfsContext { abi, process_state };
-        let opened = mount
-            .backend
-            .open(absolute_path, mount.relative_path.as_str(), flags, mode, &mut context)?;
+        let opened = mount.backend.open(
+            absolute_path,
+            mount.relative_path.as_str(),
+            flags,
+            mode,
+            &mut context,
+        )?;
         install_open_result(process_state, opened, flags)
     }) else {
         return Err(VfsError::Unsupported);
@@ -73,9 +77,12 @@ pub(crate) fn check_access_for_current_process(
     let mount = resolve_mount(absolute_path)?;
     let Some(result) = multitask::with_current_user_process_state_mut(|_, abi, process_state| {
         let mut context = VfsContext { abi, process_state };
-        mount
-            .backend
-            .check_access(absolute_path, mount.relative_path.as_str(), mode, &mut context)
+        mount.backend.check_access(
+            absolute_path,
+            mount.relative_path.as_str(),
+            mode,
+            &mut context,
+        )
     }) else {
         return Err(VfsError::Unsupported);
     };
@@ -312,10 +319,9 @@ fn install_open_result(
     open_flags: u64,
 ) -> Result<u64, VfsError> {
     Ok(match opened {
-        VfsOpenResult::File(handle) => process_state.handles_mut().install_with_open_flags(
-            KernelHandle::VfsFile(handle),
-            open_flags,
-        ),
+        VfsOpenResult::File(handle) => process_state
+            .handles_mut()
+            .install_with_open_flags(KernelHandle::VfsFile(handle), open_flags),
         VfsOpenResult::Directory(handle) => process_state
             .handles_mut()
             .install_with_open_flags(KernelHandle::VfsDirectory(handle), open_flags),

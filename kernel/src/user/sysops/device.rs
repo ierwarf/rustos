@@ -4,8 +4,8 @@ use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
 
 use crate::io::device::{self as device_ns};
+use crate::memory::paging;
 use crate::multitask;
-use crate::paging;
 use crate::user::handles::{DisplaySurfaceHandle, KernelHandle};
 use crate::user::linux as linux_abi;
 use crate::user::process_state::UserProcessState;
@@ -19,6 +19,7 @@ pub(crate) enum DeviceSysopError {
     InvalidArgument,
     DisplayUnavailable,
     NotFound,
+    StaleSurface,
     Unsupported,
 }
 
@@ -55,10 +56,57 @@ pub(crate) fn read_current_process_handle(
     let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
         match process_state.handles().get(fd) {
             Some(KernelHandle::Device(device_handle)) => {
-                device_ns::read_to_user(*device_handle, process_state, user_ptr, user_len)
-                    .map_err(map_device_error)
+                let device_id = device_handle.device_id();
+                let result =
+                    device_ns::read_to_user(*device_handle, process_state, user_ptr, user_len)
+                        .map_err(map_device_error);
+                if matches!(result, Err(DeviceSysopError::Unsupported)) {
+                    crate::debug::println!(
+                        "device read unsupported: fd={} device={:?} user_ptr={:#x} len={}",
+                        fd,
+                        device_id,
+                        user_ptr,
+                        user_len,
+                    );
+                }
+                result
             }
-            Some(_) => Err(DeviceSysopError::Unsupported),
+            Some(KernelHandle::Console(_)) => {
+                crate::debug::println!(
+                    "device read wrong-handle: fd={} handle=console user_ptr={:#x} len={}",
+                    fd,
+                    user_ptr,
+                    user_len,
+                );
+                Err(DeviceSysopError::Unsupported)
+            }
+            Some(KernelHandle::VfsFile(_)) => {
+                crate::debug::println!(
+                    "device read wrong-handle: fd={} handle=vfs-file user_ptr={:#x} len={}",
+                    fd,
+                    user_ptr,
+                    user_len,
+                );
+                Err(DeviceSysopError::Unsupported)
+            }
+            Some(KernelHandle::VfsDirectory(_)) => {
+                crate::debug::println!(
+                    "device read wrong-handle: fd={} handle=vfs-dir user_ptr={:#x} len={}",
+                    fd,
+                    user_ptr,
+                    user_len,
+                );
+                Err(DeviceSysopError::Unsupported)
+            }
+            Some(KernelHandle::DisplaySurface(_)) => {
+                crate::debug::println!(
+                    "device read wrong-handle: fd={} handle=display-surface user_ptr={:#x} len={}",
+                    fd,
+                    user_ptr,
+                    user_len,
+                );
+                Err(DeviceSysopError::Unsupported)
+            }
             None => Err(DeviceSysopError::BadFileDescriptor),
         }
     }) else {
@@ -74,7 +122,8 @@ pub(crate) fn ioctl_current_process_device_handle(
     arg: u64,
 ) -> Result<u64, DeviceSysopError> {
     let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
-        device_ns::ioctl_from_user(device_handle, process_state, request, arg).map_err(map_device_error)
+        device_ns::ioctl_from_user(device_handle, process_state, request, arg)
+            .map_err(map_device_error)
     }) else {
         return Err(DeviceSysopError::Unsupported);
     };
@@ -182,6 +231,7 @@ fn map_device_error(err: device_ns::DeviceError) -> DeviceSysopError {
         device_ns::DeviceError::DisplayUnavailable => DeviceSysopError::DisplayUnavailable,
         device_ns::DeviceError::InvalidArgument => DeviceSysopError::InvalidArgument,
         device_ns::DeviceError::NotFound => DeviceSysopError::NotFound,
+        device_ns::DeviceError::StaleSurface => DeviceSysopError::StaleSurface,
         device_ns::DeviceError::Unsupported => DeviceSysopError::Unsupported,
     }
 }

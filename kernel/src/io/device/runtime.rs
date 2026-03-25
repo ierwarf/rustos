@@ -95,6 +95,7 @@ fn map_runtime_request_error(err: runtime_api::RuntimeRequestError) -> DeviceErr
             DesktopRuntimeError::RequestQueueFull
             | DesktopRuntimeError::NoAvailableSession
             | DesktopRuntimeError::SessionBusy { .. } => DeviceError::Busy,
+            DesktopRuntimeError::SessionNotFound { .. } => DeviceError::NotFound,
         },
     }
 }

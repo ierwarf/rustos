@@ -4,15 +4,15 @@ use x86_64::registers::control::{Efer, EferFlags};
 use x86_64::registers::model_specific::{GsBase, KernelGsBase, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
 
-use crate::gdt;
+use crate::arch::gdt;
+use crate::memory::paging;
 use crate::multitask;
-use crate::paging;
 use crate::user::abi::UserAbi;
 
 pub(crate) mod linux;
 pub(crate) mod windows;
 
-const SYSCALL_STACK_SIZE: usize = 16 * 1024;
+const SYSCALL_STACK_SIZE: usize = 64 * 1024;
 const SYSCALL_ERR_INVALID: u64 = u64::MAX;
 const USER_GS_BASE_DEFAULT: u64 = 0;
 const USER_RFLAGS_RESERVED_BIT_1: u64 = 1 << 1;

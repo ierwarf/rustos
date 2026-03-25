@@ -1,0 +1,9 @@
+[package]
+name = "keyboard-core"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+bitflags = { version = "2.11", default-features = false }
+pc-keyboard = { version = "0.8", default-features = false }

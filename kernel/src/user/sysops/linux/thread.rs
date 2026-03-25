@@ -1,4 +1,28 @@
 use super::*;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+const SECONDARY_FUTEX_DEBUG_LIMIT: usize = 128;
+
+static SECONDARY_FUTEX_DEBUG_LOGS: AtomicUsize = AtomicUsize::new(0);
+
+fn debug_log_secondary_futex(message: impl FnOnce() -> alloc::string::String) {
+    if multitask::current_console_session().is_system() {
+        return;
+    }
+
+    if SECONDARY_FUTEX_DEBUG_LOGS.fetch_add(1, Ordering::Relaxed) >= SECONDARY_FUTEX_DEBUG_LIMIT {
+        return;
+    }
+
+    let pid = multitask::current_user_id().unwrap_or(0);
+    let session = multitask::current_console_session();
+    debug::println!(
+        "secondary futex: pid={} session={} {}",
+        pid,
+        session.raw(),
+        message(),
+    );
+}
 
 pub(crate) fn futex(
     uaddr: u64,
@@ -431,6 +455,16 @@ fn futex_wait(
     }
 
     let actual = usermem::read_current_user_u32(uaddr)?;
+    debug_log_secondary_futex(|| {
+        alloc::format!(
+            "wait uaddr={:#x} expected={:#x} actual={:#x} timeout_ptr={:#x} bitset={:#x}",
+            uaddr,
+            expected,
+            actual,
+            timeout_ptr,
+            bitset
+        )
+    });
     if actual != expected {
         return Err(LinuxSysopError::TryAgain);
     }
@@ -448,8 +482,10 @@ fn futex_wait(
         return Err(LinuxSysopError::Unsupported);
     }
 
+    debug_log_secondary_futex(|| alloc::format!("blocked task_id={} uaddr={:#x}", task_id, uaddr));
     multitask::yield_now();
     clear_futex_waiter(task_id, key);
+    debug_log_secondary_futex(|| alloc::format!("resumed task_id={} uaddr={:#x}", task_id, uaddr));
     Ok(0)
 }
 
@@ -461,7 +497,17 @@ fn futex_wake(uaddr: u64, max_wake: u64, bitset: u32) -> Result<u64, LinuxSysopE
 
     let (_, mut key) = current_futex_waiter_context()?;
     key.uaddr = uaddr;
-    Ok(wake_futex_waiters(key, max_wake, bitset) as u64)
+    let woke = wake_futex_waiters(key, max_wake, bitset) as u64;
+    debug_log_secondary_futex(|| {
+        alloc::format!(
+            "wake uaddr={:#x} max_wake={} bitset={:#x} woke={}",
+            uaddr,
+            max_wake,
+            bitset,
+            woke
+        )
+    });
+    Ok(woke)
 }
 
 fn current_futex_waiter_context() -> Result<(u64, FutexKey), LinuxSysopError> {

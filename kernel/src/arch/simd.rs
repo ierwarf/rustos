@@ -1,6 +1,6 @@
 use core::arch::asm;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::{__cpuid, __cpuid_count};
@@ -22,13 +22,16 @@ const XFEATURE_YMM: u64 = 1 << 2;
 const SIMD_MODE_FXSAVE: u8 = 1;
 const SIMD_MODE_XSAVE: u8 = 2;
 
-const SIMD_STATE_BYTES: usize = 832;
+const SIMD_STATE_BYTES: usize = 4096;
+const FXSAVE_STATE_BYTES: usize = 512;
 const XMM_COPY_THRESHOLD_BYTES: usize = 256;
 const YMM_COPY_THRESHOLD_BYTES: usize = 512;
 const BGRA_BLIT_AVX2_THRESHOLD_PIXELS: usize = 16;
+const ENABLE_SIMD_BGRA_BLIT: bool = true;
 
 static SIMD_MODE: AtomicU8 = AtomicU8::new(SIMD_MODE_FXSAVE);
 static XSTATE_MASK: AtomicU64 = AtomicU64::new(XFEATURE_X87 | XFEATURE_SSE);
+static SIMD_STATE_REQUIRED_BYTES: AtomicUsize = AtomicUsize::new(FXSAVE_STATE_BYTES);
 static AVX_ENABLED: AtomicBool = AtomicBool::new(false);
 static AVX2_ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -58,6 +61,7 @@ pub fn init() {
         let max_leaf = __cpuid(0).eax;
         let leaf1 = __cpuid(1);
         if (leaf1.ecx & CPUID_FEATURE_XSAVE) == 0 || max_leaf < 0xD {
+            SIMD_STATE_REQUIRED_BYTES.store(FXSAVE_STATE_BYTES, Ordering::Release);
             return;
         }
 
@@ -85,6 +89,16 @@ pub fn init() {
         AVX_ENABLED.store(avx_enabled, Ordering::Release);
         AVX2_ENABLED.store(avx2_enabled, Ordering::Release);
         SIMD_MODE.store(SIMD_MODE_XSAVE, Ordering::Release);
+
+        let xsave_leaf = __cpuid_count(0xD, 0);
+        let required_bytes = (xsave_leaf.eax.max(xsave_leaf.ebx) as usize).max(FXSAVE_STATE_BYTES);
+        if required_bytes > SIMD_STATE_BYTES {
+            panic!(
+                "SIMD xsave state requires {} bytes but buffer is only {} bytes",
+                required_bytes, SIMD_STATE_BYTES,
+            );
+        }
+        SIMD_STATE_REQUIRED_BYTES.store(required_bytes, Ordering::Release);
     }
 }
 
@@ -95,6 +109,10 @@ pub fn mode_name() -> &'static str {
         SIMD_MODE_XSAVE => "xsave-sse",
         _ => "fxsave-sse",
     }
+}
+
+pub fn state_bytes() -> usize {
+    SIMD_STATE_REQUIRED_BYTES.load(Ordering::Acquire)
 }
 
 pub fn avx_enabled() -> bool {
@@ -163,7 +181,11 @@ pub unsafe fn blit_bgra8888_row(
     }
 
     #[cfg(target_arch = "x86_64")]
-    if dst_bpp == 4 && avx2_enabled() && pixels >= BGRA_BLIT_AVX2_THRESHOLD_PIXELS {
+    if ENABLE_SIMD_BGRA_BLIT
+        && dst_bpp == 4
+        && avx2_enabled()
+        && pixels >= BGRA_BLIT_AVX2_THRESHOLD_PIXELS
+    {
         unsafe {
             if rgb_format {
                 blit_bgra8888_to_rgbx_ymm(dst, src, pixels);
@@ -196,33 +218,22 @@ pub unsafe fn copy_xmm(src: *const u8, dst: *mut u8, len: usize) {
     }
 
     let mut i = 0usize;
-    let mut used_stream_store = false;
-
     unsafe {
-        while i < len && ((dst.add(i) as usize) & 0xF) != 0 {
-            ptr::write(dst.add(i), ptr::read(src.add(i)));
-            i += 1;
-        }
-
         while i + 64 <= len {
             let a = _mm_loadu_si128(src.add(i) as *const __m128i);
             let b = _mm_loadu_si128(src.add(i + 16) as *const __m128i);
             let c = _mm_loadu_si128(src.add(i + 32) as *const __m128i);
             let d = _mm_loadu_si128(src.add(i + 48) as *const __m128i);
 
-            _mm_stream_si128(dst.add(i) as *mut __m128i, a);
-            _mm_stream_si128(dst.add(i + 16) as *mut __m128i, b);
-            _mm_stream_si128(dst.add(i + 32) as *mut __m128i, c);
-            _mm_stream_si128(dst.add(i + 48) as *mut __m128i, d);
+            _mm_storeu_si128(dst.add(i) as *mut __m128i, a);
+            _mm_storeu_si128(dst.add(i + 16) as *mut __m128i, b);
+            _mm_storeu_si128(dst.add(i + 32) as *mut __m128i, c);
+            _mm_storeu_si128(dst.add(i + 48) as *mut __m128i, d);
             i += 64;
-            used_stream_store = true;
         }
 
         if i < len {
             ptr::copy_nonoverlapping(src.add(i), dst.add(i), len - i);
-        }
-        if used_stream_store {
-            _mm_sfence();
         }
     }
 }
@@ -244,33 +255,22 @@ pub unsafe fn copy_ymm(src: *const u8, dst: *mut u8, len: usize) {
     }
 
     let mut i = 0usize;
-    let mut used_stream_store = false;
-
     unsafe {
-        while i < len && ((dst.add(i) as usize) & 0x1F) != 0 {
-            ptr::write(dst.add(i), ptr::read(src.add(i)));
-            i += 1;
-        }
-
         while i + 128 <= len {
             let a = _mm256_loadu_si256(src.add(i) as *const __m256i);
             let b = _mm256_loadu_si256(src.add(i + 32) as *const __m256i);
             let c = _mm256_loadu_si256(src.add(i + 64) as *const __m256i);
             let d = _mm256_loadu_si256(src.add(i + 96) as *const __m256i);
 
-            _mm256_stream_si256(dst.add(i) as *mut __m256i, a);
-            _mm256_stream_si256(dst.add(i + 32) as *mut __m256i, b);
-            _mm256_stream_si256(dst.add(i + 64) as *mut __m256i, c);
-            _mm256_stream_si256(dst.add(i + 96) as *mut __m256i, d);
+            _mm256_storeu_si256(dst.add(i) as *mut __m256i, a);
+            _mm256_storeu_si256(dst.add(i + 32) as *mut __m256i, b);
+            _mm256_storeu_si256(dst.add(i + 64) as *mut __m256i, c);
+            _mm256_storeu_si256(dst.add(i + 96) as *mut __m256i, d);
             i += 128;
-            used_stream_store = true;
         }
 
         if i < len {
             ptr::copy_nonoverlapping(src.add(i), dst.add(i), len - i);
-        }
-        if used_stream_store {
-            _mm_sfence();
         }
         _mm256_zeroupper();
     }

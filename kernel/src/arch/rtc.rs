@@ -1,5 +1,5 @@
 use core::hint::spin_loop;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use x86_64::instructions::{hlt, interrupts, port::Port};
 
 const CMOS_INDEX_PORT: u16 = 0x70;
@@ -22,6 +22,7 @@ const RTC_RATE_1024_HZ: u8 = 6;
 const RTC_TICKS_PER_SEC: u64 = 1024;
 
 static RTC_TICKS: AtomicU64 = AtomicU64::new(0);
+static RTC_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RtcDateTime {
@@ -32,18 +33,6 @@ pub struct RtcDateTime {
     pub hour: u8,
     pub minute: u8,
     pub second: u8,
-}
-
-impl RtcDateTime {
-    fn pack(self) -> u64 {
-        ((self.year as u64) << 48)
-            | ((self.month as u64) << 40)
-            | ((self.day as u64) << 32)
-            | ((self.weekday as u64) << 24)
-            | ((self.hour as u64) << 16)
-            | ((self.minute as u64) << 8)
-            | (self.second as u64)
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,24 +154,8 @@ fn read_stable_datetime() -> RtcDateTime {
     }
 }
 
-fn splitmix64(mut state: u64) -> u64 {
-    state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
-
 pub fn now() -> RtcDateTime {
     interrupts::without_interrupts(read_stable_datetime)
-}
-
-pub fn seed() -> u64 {
-    interrupts::without_interrupts(|| {
-        let datetime = read_stable_datetime().pack();
-        let ticks = RTC_TICKS.load(Ordering::Acquire);
-        splitmix64(datetime ^ ticks.rotate_left(21) ^ ticks.wrapping_mul(0xA076_1D64_78BD_642F))
-    })
 }
 
 pub fn ticks() -> u64 {
@@ -191,6 +164,10 @@ pub fn ticks() -> u64 {
 
 pub const fn ticks_per_second() -> u64 {
     RTC_TICKS_PER_SEC
+}
+
+pub fn is_initialized() -> bool {
+    RTC_INITIALIZED.load(Ordering::Acquire)
 }
 
 pub fn init() {
@@ -206,7 +183,8 @@ pub fn init() {
         let _ = cmos_read(RTC_REG_C);
     });
 
-    crate::pic::enable_irq(8);
+    RTC_INITIALIZED.store(true, Ordering::Release);
+    crate::arch::pic::enable_irq(8);
 }
 
 pub fn on_interrupt() {

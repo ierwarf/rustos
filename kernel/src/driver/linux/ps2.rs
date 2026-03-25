@@ -1,5 +1,6 @@
 use alloc::vec::Vec;
 use core::slice;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use spin::Mutex;
 #[cfg(not(test))]
@@ -18,6 +19,7 @@ struct RegisteredPs2Dev {
 unsafe impl Send for RegisteredPs2Dev {}
 
 static PS2_DEVS: Mutex<Vec<RegisteredPs2Dev>> = Mutex::new(Vec::new());
+static PS2_INTERRUPT_DEBUG_REMAINING: AtomicUsize = AtomicUsize::new(64);
 
 fn with_ps2_devs<R>(f: impl FnOnce(&mut Vec<RegisteredPs2Dev>) -> R) -> R {
     #[cfg(test)]
@@ -226,6 +228,25 @@ pub(crate) unsafe extern "C" fn ps2_interrupt(
     });
     if ps2dev.is_null() {
         return 0;
+    }
+
+    let remaining = PS2_INTERRUPT_DEBUG_REMAINING.load(Ordering::Relaxed);
+    if remaining != 0
+        && PS2_INTERRUPT_DEBUG_REMAINING
+            .compare_exchange(
+                remaining,
+                remaining - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    {
+        crate::debug::println!(
+            "linux ps2_interrupt: port={} data={:#x} flags={:#x}",
+            port_id,
+            data,
+            flags
+        );
     }
 
     let disposition = match unsafe { (*ps2dev).pre_receive_handler } {

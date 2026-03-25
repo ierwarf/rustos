@@ -1,7 +1,7 @@
 #![no_std]
 
 pub const BOOT_INFO_MAGIC: u64 = 0x5255_5354_4F53_4749; // "RUSTOSGI"
-pub const BOOT_INFO_VERSION: u32 = 7;
+pub const BOOT_INFO_VERSION: u32 = 8;
 pub const BOOT_FILE_MANIFEST_TRUNCATED: u32 = 1 << 0;
 
 #[repr(u32)]
@@ -58,6 +58,44 @@ impl BootFileManifest {
     }
 }
 
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BootMemoryKind {
+    Usable = 0,
+    Reserved = 1,
+    AcpiReclaim = 2,
+    AcpiNvs = 3,
+    Mmio = 4,
+    Framebuffer = 5,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct BootMemoryRegion {
+    pub phys_start: u64,
+    pub page_count: u64,
+    pub kind: BootMemoryKind,
+    pub _reserved0: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct BootMemoryMap {
+    pub entries_ptr: u64,
+    pub entry_count: u32,
+    pub _reserved0: u32,
+}
+
+impl BootMemoryMap {
+    pub const fn empty() -> Self {
+        Self {
+            entries_ptr: 0,
+            entry_count: 0,
+            _reserved0: 0,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct BootInfo {
@@ -67,5 +105,6 @@ pub struct BootInfo {
     pub rng_seed: [u8; 32],
     pub acpi_rsdp_addr: u64,
     pub framebuffer: FramebufferInfo,
+    pub memory_map: BootMemoryMap,
     pub boot_files: BootFileManifest,
 }

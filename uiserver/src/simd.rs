@@ -5,16 +5,20 @@ use std::sync::OnceLock;
 
 const COPY_U32_AVX2_THRESHOLD: usize = 32;
 const BLEND_U32_AVX2_THRESHOLD: usize = 32;
+const ENABLE_UI_SIMD_FAST_PATHS: bool = true;
 
 #[inline]
 pub(crate) fn copy_u32s(src: &[u32], dst: &mut [u32]) {
+    let len = src.len().min(dst.len());
     debug_assert_eq!(src.len(), dst.len());
-    if src.is_empty() {
+    if len == 0 {
         return;
     }
+    let src = &src[..len];
+    let dst = &mut dst[..len];
 
     #[cfg(target_arch = "x86_64")]
-    if avx2_enabled() && src.len() >= COPY_U32_AVX2_THRESHOLD {
+    if ENABLE_UI_SIMD_FAST_PATHS && avx2_enabled() && src.len() >= COPY_U32_AVX2_THRESHOLD {
         unsafe {
             copy_u32s_avx2(src.as_ptr(), dst.as_mut_ptr(), src.len());
         }
@@ -35,7 +39,7 @@ pub(crate) fn blend_solid_bgr(dst: &mut [u32], src_color: u32, alpha: u8) {
     }
 
     #[cfg(target_arch = "x86_64")]
-    if avx2_enabled() && dst.len() >= BLEND_U32_AVX2_THRESHOLD {
+    if ENABLE_UI_SIMD_FAST_PATHS && avx2_enabled() && dst.len() >= BLEND_U32_AVX2_THRESHOLD {
         unsafe {
             blend_solid_bgr_avx2(dst.as_mut_ptr(), dst.len(), src_color, alpha);
         }
@@ -120,14 +124,10 @@ unsafe fn blend_solid_bgr_avx2(dst: *mut u32, len: usize, src_color: u32, alpha:
 
             let adj_lo = _mm256_add_epi16(acc_lo, bias);
             let adj_hi = _mm256_add_epi16(acc_hi, bias);
-            let out_lo = _mm256_srli_epi16(
-                _mm256_add_epi16(adj_lo, _mm256_srli_epi16(adj_lo, 8)),
-                8,
-            );
-            let out_hi = _mm256_srli_epi16(
-                _mm256_add_epi16(adj_hi, _mm256_srli_epi16(adj_hi, 8)),
-                8,
-            );
+            let out_lo =
+                _mm256_srli_epi16(_mm256_add_epi16(adj_lo, _mm256_srli_epi16(adj_lo, 8)), 8);
+            let out_hi =
+                _mm256_srli_epi16(_mm256_add_epi16(adj_hi, _mm256_srli_epi16(adj_hi, 8)), 8);
             let packed = _mm256_packus_epi16(out_lo, out_hi);
 
             _mm256_storeu_si256(dst.add(i) as *mut __m256i, packed);
@@ -135,7 +135,11 @@ unsafe fn blend_solid_bgr_avx2(dst: *mut u32, len: usize, src_color: u32, alpha:
         }
 
         if i < len {
-            blend_solid_bgr_scalar(core::slice::from_raw_parts_mut(dst.add(i), len - i), src_color, alpha);
+            blend_solid_bgr_scalar(
+                core::slice::from_raw_parts_mut(dst.add(i), len - i),
+                src_color,
+                alpha,
+            );
         }
         _mm256_zeroupper();
     }

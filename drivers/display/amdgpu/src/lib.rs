@@ -1,16 +1,24 @@
 #![no_std]
 
+#[cfg(feature = "module-image")]
 mod api;
+#[cfg(feature = "module-image")]
 mod dcn;
+#[cfg(feature = "module-image")]
 mod fw;
+#[cfg(feature = "module-image")]
 mod mmio;
+#[cfg(feature = "module-image")]
 mod probe;
+#[cfg(feature = "module-image")]
 mod scanout;
 
 #[cfg(feature = "module-image")]
 use driver_abi::{DriverBus, DriverClass, DriverKernelApiV1, DriverModuleHeader};
 
+#[cfg(feature = "module-image")]
 pub const AMDGPU_DRIVER_NAME: &str = "amdgpu";
+#[cfg(feature = "module-image")]
 pub const AMDGPU_DRIVER_MODULE_PATH: &str = "system/drivers/display/amdgpu.ko";
 
 #[cfg(feature = "module-image")]

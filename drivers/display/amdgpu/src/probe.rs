@@ -15,7 +15,6 @@ const MIN_REGISTER_BAR_BYTES: u64 = 512 * 1024;
 
 #[derive(Clone, Copy)]
 pub struct Phoenix3Device {
-    pub pci: DriverPciDeviceInfo,
     pub framebuffer_bar: DriverPciBarInfo,
     pub register_bar: DriverPciBarInfo,
 }
@@ -45,7 +44,6 @@ pub fn probe_phoenix3() -> Option<Phoenix3Device> {
     }
 
     Some(Phoenix3Device {
-        pci,
         framebuffer_bar,
         register_bar,
     })

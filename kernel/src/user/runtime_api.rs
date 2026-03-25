@@ -1,15 +1,14 @@
-use alloc::vec;
 use core::convert::TryFrom;
 use core::mem::size_of;
 use core::slice;
 
 use x86_64::VirtAddr;
 
-use crate::paging;
-use crate::session::ConsoleSessionId;
-use crate::session::MAX_CONSOLE_SESSIONS;
+use crate::io::session::ConsoleSessionHandle;
+use crate::memory::paging;
+use crate::user::abi::console::MAX_CONSOLE_SESSIONS;
 use crate::user::abi::runtime::{
-    LAUNCH_TARGET_ALL_SESSIONS, LAUNCH_TARGET_FIRST_AVAILABLE, LAUNCH_TARGET_SESSION,
+    LAUNCH_TARGET_ALL_SESSIONS, LAUNCH_TARGET_NEW_SESSION, LAUNCH_TARGET_SESSION,
     RuntimeProgramInfo, RuntimeRunningProgramInfo, TERMINATE_TARGET_ALL_SESSIONS,
     TERMINATE_TARGET_PID, TERMINATE_TARGET_SESSION,
 };
@@ -26,6 +25,8 @@ pub enum RuntimeRequestError {
     InvalidArgument,
     Runtime(runtime::DesktopRuntimeError),
 }
+
+const MAX_RUNTIME_SNAPSHOT_PROGRAMS: usize = 64;
 
 impl From<paging::AddressSpaceError> for RuntimeApiError {
     fn from(value: paging::AddressSpaceError) -> Self {
@@ -44,7 +45,7 @@ pub fn generation() -> u64 {
 }
 
 pub fn snapshot_programs_to_user(
-    address_space: &crate::paging::ProcessAddressSpace,
+    address_space: &crate::memory::paging::ProcessAddressSpace,
     user_ptr: u64,
     capacity: u64,
 ) -> Result<usize, RuntimeApiError> {
@@ -53,17 +54,15 @@ pub fn snapshot_programs_to_user(
         return Ok(0);
     }
 
-    let mut programs = vec![
-        runtime::DesktopProgramInfo {
-            id: runtime::DesktopProgramId::from_index(0),
-            display_name: "",
-            exec_path: "",
-            weight_micros: 0,
-        };
-        capacity
-    ];
-    let count = runtime::snapshot_programs(&mut programs);
-    let mut snapshot = vec![RuntimeProgramInfo::default(); count];
+    let copy_capacity = capacity.min(MAX_RUNTIME_SNAPSHOT_PROGRAMS);
+    let mut programs = [runtime::DesktopProgramInfo {
+        id: runtime::DesktopProgramId::from_index(0),
+        display_name: "",
+        exec_path: "",
+        weight_micros: 0,
+    }; MAX_RUNTIME_SNAPSHOT_PROGRAMS];
+    let count = runtime::snapshot_programs(&mut programs[..copy_capacity]).min(copy_capacity);
+    let mut snapshot = [RuntimeProgramInfo::default(); MAX_RUNTIME_SNAPSHOT_PROGRAMS];
     for (dest, source) in snapshot.iter_mut().zip(programs.into_iter().take(count)) {
         dest.program_id = source.id.index() as u32;
         dest.weight_micros = source.weight_micros;
@@ -85,7 +84,7 @@ pub fn snapshot_programs_to_user(
 }
 
 pub fn snapshot_running_programs_to_user(
-    address_space: &crate::paging::ProcessAddressSpace,
+    address_space: &crate::memory::paging::ProcessAddressSpace,
     user_ptr: u64,
     capacity: u64,
 ) -> Result<usize, RuntimeApiError> {
@@ -94,14 +93,15 @@ pub fn snapshot_running_programs_to_user(
         return Ok(0);
     }
 
-    let mut running =
-        vec![runtime::DesktopRunningProgramInfo::default(); capacity.min(MAX_CONSOLE_SESSIONS)];
-    let count = runtime::snapshot_running_programs(&mut running);
-    let mut snapshot = vec![RuntimeRunningProgramInfo::default(); count];
+    let copy_capacity = capacity.min(MAX_CONSOLE_SESSIONS);
+    let mut running = [runtime::DesktopRunningProgramInfo::default(); MAX_CONSOLE_SESSIONS];
+    let count =
+        runtime::snapshot_running_programs(&mut running[..copy_capacity]).min(copy_capacity);
+    let mut snapshot = [RuntimeRunningProgramInfo::default(); MAX_CONSOLE_SESSIONS];
     for (dest, source) in snapshot.iter_mut().zip(running.into_iter().take(count)) {
         dest.pid = source.pid;
         dest.program_id = source.program_id.index() as u32;
-        dest.session_index = source.session.index() as u32;
+        dest.session_handle = source.session_handle.raw();
         dest.set_display_name(source.display_name);
     }
 
@@ -126,12 +126,10 @@ pub fn request_launch(
     let program_id = runtime::DesktopProgramId::from_index(program_id as usize);
     let target = match target_kind as u16 {
         LAUNCH_TARGET_SESSION => {
-            let Some(session) = ConsoleSessionId::from_index(target_value as usize) else {
-                return Err(RuntimeRequestError::InvalidArgument);
-            };
+            let session = ConsoleSessionHandle::from_raw(target_value);
             runtime::DesktopLaunchTarget::Session(session)
         }
-        LAUNCH_TARGET_FIRST_AVAILABLE => runtime::DesktopLaunchTarget::FirstAvailableSession,
+        LAUNCH_TARGET_NEW_SESSION => runtime::DesktopLaunchTarget::NewSession,
         LAUNCH_TARGET_ALL_SESSIONS => runtime::DesktopLaunchTarget::AllSessions,
         _ => return Err(RuntimeRequestError::InvalidArgument),
     };
@@ -142,10 +140,7 @@ pub fn request_launch(
 pub fn request_terminate(target_kind: u64, target_value: u64) -> Result<(), RuntimeRequestError> {
     let target = match target_kind as u16 {
         TERMINATE_TARGET_SESSION => {
-            let Some(session) = ConsoleSessionId::from_index(target_value as usize) else {
-                return Err(RuntimeRequestError::InvalidArgument);
-            };
-            runtime::DesktopTerminateTarget::Session(session)
+            runtime::DesktopTerminateTarget::Session(ConsoleSessionHandle::from_raw(target_value))
         }
         TERMINATE_TARGET_PID => runtime::DesktopTerminateTarget::ProcessId(target_value),
         TERMINATE_TARGET_ALL_SESSIONS => runtime::DesktopTerminateTarget::AllSessions,

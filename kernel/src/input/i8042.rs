@@ -1,12 +1,12 @@
 use core::hint::spin_loop;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use driver_abi::SerioPortInfo;
 use spin::Mutex;
 use x86_64::instructions::{interrupts, port::Port};
 
 use crate::driver::serio::SerioPortOps;
-use crate::ring::RingBuffer;
+use crate::util::ring::RingBuffer;
 
 const KEYBOARD_IRQ: u8 = 1;
 const MOUSE_IRQ: u8 = 12;
@@ -48,8 +48,10 @@ const DEVICE_RESPONSE_RESEND: u8 = 0xFE;
 const DEVICE_RESPONSE_SELF_TEST_PASSED: u8 = 0xAA;
 const DEVICE_SEND_RETRIES: usize = 1;
 const DEVICE_RESPONSE_READ_RETRIES: usize = 1;
+const AUX_COMMAND_NOISE_BUDGET: usize = 32;
 const MAX_BYTES_PER_INTERRUPT: usize = 32;
-const DEFERRED_KEYBOARD_BYTES_CAPACITY: usize = 64;
+const DEFERRED_KEYBOARD_BYTES_CAPACITY: usize = 256;
+const DEFERRED_KEYBOARD_DROP_LOG_INTERVAL: u64 = 64;
 const PS2_CMD_GETID: u8 = 0xF2;
 
 pub(crate) const I8042_KEYBOARD_PORT_ID: u32 = 0;
@@ -59,9 +61,43 @@ static KEYBOARD_TRANSPORT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static AUX_TRANSPORT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CONTROLLER_ACCESS_ACTIVE: AtomicBool = AtomicBool::new(false);
 static AUX_INTERRUPT_SUPPRESSED: AtomicBool = AtomicBool::new(false);
+static AUX_DEBUG_BYTES_REMAINING: AtomicUsize = AtomicUsize::new(64);
 static CONTROLLER_ACCESS_LOCK: Mutex<()> = Mutex::new(());
-static DEFERRED_KEYBOARD_BYTES: Mutex<RingBuffer<u8, DEFERRED_KEYBOARD_BYTES_CAPACITY>> =
-    Mutex::new(RingBuffer::new());
+static DEFERRED_KEYBOARD_BYTES: Mutex<DeferredKeyboardBytesState> =
+    Mutex::new(DeferredKeyboardBytesState::new());
+
+struct DeferredKeyboardBytesState {
+    queued: RingBuffer<u8, DEFERRED_KEYBOARD_BYTES_CAPACITY>,
+    dropped_bytes: u64,
+}
+
+impl DeferredKeyboardBytesState {
+    const fn new() -> Self {
+        Self {
+            queued: RingBuffer::new(),
+            dropped_bytes: 0,
+        }
+    }
+
+    fn push_deferred_byte(&mut self, byte: u8) {
+        if self.queued.push(byte) {
+            return;
+        }
+
+        self.dropped_bytes = self.dropped_bytes.saturating_add(1);
+        if self.dropped_bytes % DEFERRED_KEYBOARD_DROP_LOG_INTERVAL == 0 {
+            crate::debug::println!(
+                "i8042 deferred keyboard overflow: dropped={} queued={}",
+                self.dropped_bytes,
+                self.queued.len()
+            );
+        }
+    }
+
+    fn pop_into(&mut self, dest: &mut [u8]) -> usize {
+        self.queued.pop_into(dest)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct KeyboardTransportInfo {
@@ -94,7 +130,7 @@ pub(crate) fn init_keyboard_port() -> KeyboardTransportInitResult {
     match result {
         Ok(info) => {
             KEYBOARD_TRANSPORT_ACTIVE.store(true, Ordering::Release);
-            crate::pic::enable_irq(KEYBOARD_IRQ);
+            crate::arch::pic::enable_irq(KEYBOARD_IRQ);
             KeyboardTransportInitResult::Ready(info)
         }
         Err(reason) => {
@@ -300,12 +336,12 @@ fn serio_write_keyboard_byte(byte: u8) -> i32 {
 }
 
 fn serio_keyboard_ps2_command(command: u8, data: &[u8], response: &mut [u8]) -> i32 {
-    with_controller_access(|| {
-        match send_keyboard_command_sequence(command, data, response) {
+    with_controller_access(
+        || match send_keyboard_command_sequence(command, data, response) {
             Ok(()) => 0,
             Err(status) => status,
-        }
-    })
+        },
+    )
 }
 
 fn serio_write_aux_byte(byte: u8) -> i32 {
@@ -322,14 +358,17 @@ fn serio_aux_ps2_command(command: u8, data: &[u8], response: &mut [u8]) -> i32 {
     let aux_irq_enabled = AUX_TRANSPORT_ACTIVE.load(Ordering::Acquire);
     AUX_INTERRUPT_SUPPRESSED.store(true, Ordering::Release);
     if aux_irq_enabled {
-        crate::pic::disable_irq(MOUSE_IRQ);
+        crate::arch::pic::disable_irq(MOUSE_IRQ);
     }
-    let status = with_controller_access(|| match send_aux_command_sequence(command, data, response) {
-        Ok(()) => 0,
-        Err(status) => status,
-    });
+    let status =
+        with_controller_access(
+            || match send_aux_command_sequence(command, data, response) {
+                Ok(()) => 0,
+                Err(status) => status,
+            },
+        );
     if aux_irq_enabled && AUX_TRANSPORT_ACTIVE.load(Ordering::Acquire) {
-        crate::pic::enable_irq(MOUSE_IRQ);
+        crate::arch::pic::enable_irq(MOUSE_IRQ);
     }
     AUX_INTERRUPT_SUPPRESSED.store(false, Ordering::Release);
     status
@@ -369,13 +408,13 @@ fn serio_open_aux_port() -> i32 {
         0
     });
     if status == 0 {
-        crate::pic::enable_irq(MOUSE_IRQ);
+        crate::arch::pic::enable_irq(MOUSE_IRQ);
     }
     status
 }
 
 fn serio_close_aux_port() {
-    crate::pic::disable_irq(MOUSE_IRQ);
+    crate::arch::pic::disable_irq(MOUSE_IRQ);
     with_controller_access(|| {
         if !AUX_TRANSPORT_ACTIVE.swap(false, Ordering::AcqRel) {
             return;
@@ -421,6 +460,7 @@ fn send_keyboard_command_sequence(
 }
 
 fn send_aux_command_sequence(command: u8, data: &[u8], response: &mut [u8]) -> Result<(), i32> {
+    drain_aux_output_buffer(I8042_DRAIN_LIMIT, 0);
     send_aux_byte_and_expect_ack(command)?;
     for byte in data.iter().copied() {
         send_aux_byte_and_expect_ack(byte)?;
@@ -463,11 +503,16 @@ fn send_aux_byte_and_expect_ack(byte: u8) -> Result<(), i32> {
         if !write_second_port_data_byte(byte) {
             return Err(-110);
         }
+        let mut noise_budget = AUX_COMMAND_NOISE_BUDGET;
         for _ in 0..DEVICE_RESPONSE_READ_RETRIES {
             match read_aux_data_byte_blocking() {
                 Some(DEVICE_RESPONSE_ACK) => return Ok(()),
                 Some(DEVICE_RESPONSE_RESEND) => break,
                 Some(value) if is_ignorable_command_response(value) => continue,
+                Some(_value) if noise_budget != 0 => {
+                    noise_budget -= 1;
+                    continue;
+                }
                 Some(_value) => return Err(-5),
                 None => return Err(-110),
             }
@@ -611,6 +656,24 @@ fn dispatch_controller_byte(data: ControllerByte) {
             return;
         }
         if AUX_TRANSPORT_ACTIVE.load(Ordering::Acquire) {
+            let remaining = AUX_DEBUG_BYTES_REMAINING.load(Ordering::Relaxed);
+            if remaining != 0
+                && AUX_DEBUG_BYTES_REMAINING
+                    .compare_exchange(
+                        remaining,
+                        remaining - 1,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
+                crate::debug::println!(
+                    "i8042 aux byte: data={:#x} active={} suppressed={}",
+                    data.byte,
+                    true,
+                    false
+                );
+            }
             let _ = crate::driver::serio::receive_byte(I8042_AUX_MOUSE_PORT_ID, data.byte, 0);
         }
         return;
@@ -618,7 +681,7 @@ fn dispatch_controller_byte(data: ControllerByte) {
 
     if KEYBOARD_TRANSPORT_ACTIVE.load(Ordering::Acquire) {
         if CONTROLLER_ACCESS_ACTIVE.load(Ordering::Acquire) {
-            DEFERRED_KEYBOARD_BYTES.lock().push_overwrite(data.byte);
+            DEFERRED_KEYBOARD_BYTES.lock().push_deferred_byte(data.byte);
         } else {
             crate::input::keyboard::on_scancode(data.byte);
         }
@@ -627,7 +690,8 @@ fn dispatch_controller_byte(data: ControllerByte) {
 
 pub(crate) fn service_pending() -> usize {
     let mut bytes = [0_u8; DEFERRED_KEYBOARD_BYTES_CAPACITY];
-    let count = interrupts::without_interrupts(|| DEFERRED_KEYBOARD_BYTES.lock().pop_into(&mut bytes));
+    let count =
+        interrupts::without_interrupts(|| DEFERRED_KEYBOARD_BYTES.lock().pop_into(&mut bytes));
     for &byte in &bytes[..count] {
         crate::input::keyboard::on_scancode(byte);
     }

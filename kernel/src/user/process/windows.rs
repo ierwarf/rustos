@@ -5,9 +5,9 @@ use core::convert::TryFrom;
 use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
 
-use crate::paging::{self, ProcessAddressSpace};
+use crate::memory::paging::{self, ProcessAddressSpace};
 use crate::user::abi::UserAbi;
-use crate::win32;
+use crate::user::syscall::windows as win32;
 
 use super::{
     LoadedProcessImage, LoadedProcessRuntime, PAGE_SIZE, ProcessLoadError, align_down, align_up,

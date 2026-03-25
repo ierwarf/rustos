@@ -180,7 +180,7 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{days_from_civil, unix_seconds_from_rtc};
-    use crate::rtc::RtcDateTime;
+    use crate::arch::rtc::RtcDateTime;
 
     #[test]
     fn unix_epoch_day_is_zero() {

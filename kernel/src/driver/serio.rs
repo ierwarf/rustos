@@ -133,8 +133,24 @@ pub(crate) unsafe extern "C" fn register_linux_driver(driver: *mut LinuxCompatSe
         return -22;
     }
 
-    let driver_name = unsafe { compat_cstr((*driver).driver.name).unwrap_or("invalid") };
+    let driver_name_ptr = unsafe { (*driver).driver.name };
+    let description_ptr = unsafe { (*driver).description };
     let id_table = unsafe { (*driver).id_table };
+    let connect_ptr = unsafe {
+        (*driver)
+            .connect
+            .map(|func| func as *const () as usize)
+            .unwrap_or(0)
+    };
+    crate::debug::println!(
+        "serio register linux driver raw: driver_ptr={:#x} desc={:#x} name_ptr={:#x} id_table={:#x} connect={:#x}",
+        driver as usize,
+        description_ptr as usize,
+        driver_name_ptr as usize,
+        id_table as usize,
+        connect_ptr
+    );
+    let driver_name = compat_cstr(driver_name_ptr).unwrap_or("invalid");
 
     {
         let mut drivers = LINUX_SERIO_DRIVERS.lock();

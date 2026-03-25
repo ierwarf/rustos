@@ -122,8 +122,14 @@ impl PciDevice {
     }
 
     pub fn config_size(self) -> i32 {
-        if crate::acpi::pci_config_address(self.segment, self.bus, self.device, self.function, 0x100)
-            .is_some()
+        if crate::arch::acpi::pci_config_address(
+            self.segment,
+            self.bus,
+            self.device,
+            self.function,
+            0x100,
+        )
+        .is_some()
         {
             4096
         } else {
@@ -137,22 +143,6 @@ impl PciDevice {
 
     pub fn enable_memory_bus_master(self) {
         self.update_command_bits(COMMAND_MEMORY_SPACE | COMMAND_BUS_MASTER, 0);
-    }
-
-    pub fn bar0(self) -> Option<u64> {
-        let low = self.read_u32(BAR0_OFFSET);
-        if low == 0 || (low & 1) != 0 {
-            return None;
-        }
-
-        let bar_type = (low >> 1) & 0x3;
-        let addr_low = (low & !0xf) as u64;
-        if bar_type == 0x2 {
-            let high = self.read_u32(BAR0_OFFSET + 4) as u64;
-            Some((high << 32) | addr_low)
-        } else {
-            Some(addr_low)
-        }
     }
 
     pub fn standard_bar_count(self) -> usize {
@@ -198,7 +188,7 @@ impl PciDevice {
     }
 
     pub fn read_u32(self, offset: u8) -> u32 {
-        if let Some(addr) = crate::acpi::pci_config_address(
+        if let Some(addr) = crate::arch::acpi::pci_config_address(
             self.segment,
             self.bus,
             self.device,
@@ -241,7 +231,7 @@ impl PciDevice {
     }
 
     pub fn write_u32(self, offset: u8, value: u32) {
-        if let Some(addr) = crate::acpi::pci_config_address(
+        if let Some(addr) = crate::arch::acpi::pci_config_address(
             self.segment,
             self.bus,
             self.device,
@@ -310,18 +300,6 @@ pub enum UsbHostControllerKind {
     Unknown(u8),
 }
 
-impl UsbHostControllerKind {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Uhci => "UHCI",
-            Self::Ohci => "OHCI",
-            Self::Ehci => "EHCI",
-            Self::Xhci => "xHCI",
-            Self::Unknown(_) => "USB",
-        }
-    }
-}
-
 fn usb_host_controller_kind(prog_if: u8) -> UsbHostControllerKind {
     match prog_if {
         PROG_IF_UHCI => UsbHostControllerKind::Uhci,
@@ -333,7 +311,7 @@ fn usb_host_controller_kind(prog_if: u8) -> UsbHostControllerKind {
 }
 
 pub fn visit_devices(mut visit: impl FnMut(PciDevice) -> bool) {
-    crate::acpi::for_each_pci_bus_region(|segment, start_bus, end_bus| {
+    crate::arch::acpi::for_each_pci_bus_region(|segment, start_bus, end_bus| {
         for bus in start_bus..=end_bus {
             for device in 0..32 {
                 let function0 = PciDevice {
@@ -414,11 +392,21 @@ fn decode_mem_resource(
     mask_high: u32,
     is_64bit: bool,
 ) -> Option<PciResource> {
+    let low_mask = (mask_low & PCI_BAR_MEM_ADDRESS_MASK) as u64;
+    let mut high_mask = if is_64bit { mask_high as u64 } else { 0 };
+
+    // Some firmware/QEMU combinations report an all-zero upper size probe for 64-bit BARs
+    // even when the assigned BAR lives above 4GiB. Treat that as "all upper address bits are
+    // implemented" so the computed size is driven by the meaningful low dword mask.
+    if is_64bit && high_mask == 0 && original_high != 0 && low_mask != 0 {
+        high_mask = u32::MAX as u64;
+    }
+
     let mask = if is_64bit {
-        ((mask_high as u64) << 32) | mask_low as u64
+        (high_mask << 32) | low_mask
     } else {
-        mask_low as u64
-    } & PCI_BAR_MEM_ADDRESS_MASK as u64;
+        low_mask
+    };
     if mask == 0 {
         return None;
     }

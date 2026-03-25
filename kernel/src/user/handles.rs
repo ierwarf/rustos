@@ -5,12 +5,16 @@ use core::fmt::Debug;
 use spin::Mutex;
 
 use crate::io::device::DeviceHandle;
-use crate::paging::UserRegion;
+use crate::memory::paging::UserRegion;
 use crate::user::abi::device::PIXEL_FORMAT_BGRA8888;
 use crate::user::linux as linux_abi;
 
 pub const FIRST_DYNAMIC_FD: u32 = 3;
 const PAGE_SIZE: u64 = 4096;
+const MAX_DISPLAY_SURFACE_WIDTH: u32 = 7680;
+const MAX_DISPLAY_SURFACE_HEIGHT: u32 = 4320;
+const MAX_DISPLAY_SURFACE_BYTES: u64 =
+    MAX_DISPLAY_SURFACE_WIDTH as u64 * MAX_DISPLAY_SURFACE_HEIGHT as u64 * 4;
 pub const FD_CLOEXEC: u32 = 0x1;
 const STATUS_FLAG_MASK: u64 =
     linux_abi::O_ACCMODE | linux_abi::O_APPEND | linux_abi::O_NONBLOCK | linux_abi::O_NOCTTY;
@@ -22,20 +26,30 @@ pub struct DisplaySurfaceHandle {
     stride_bytes: u32,
     bytes_per_pixel: u32,
     pixel_format: u32,
+    generation: u64,
     frame_len: u64,
     mapping_len: u64,
     mapped_region: Option<UserRegion>,
 }
 
 impl DisplaySurfaceHandle {
-    pub fn new(width: u32, height: u32, pixel_format: u32) -> Option<Self> {
-        if width == 0 || height == 0 || pixel_format != PIXEL_FORMAT_BGRA8888 {
+    pub fn new(width: u32, height: u32, pixel_format: u32, generation: u64) -> Option<Self> {
+        if width == 0
+            || height == 0
+            || width > MAX_DISPLAY_SURFACE_WIDTH
+            || height > MAX_DISPLAY_SURFACE_HEIGHT
+            || pixel_format != PIXEL_FORMAT_BGRA8888
+            || generation == 0
+        {
             return None;
         }
 
         let bytes_per_pixel = 4_u32;
         let stride_bytes = width.checked_mul(bytes_per_pixel)?;
         let frame_len = (stride_bytes as u64).checked_mul(height as u64)?;
+        if frame_len == 0 || frame_len > MAX_DISPLAY_SURFACE_BYTES {
+            return None;
+        }
         let mapping_len = align_up(frame_len, PAGE_SIZE)?;
 
         Some(Self {
@@ -44,6 +58,7 @@ impl DisplaySurfaceHandle {
             stride_bytes,
             bytes_per_pixel,
             pixel_format,
+            generation,
             frame_len,
             mapping_len,
             mapped_region: None,
@@ -68,6 +83,10 @@ impl DisplaySurfaceHandle {
 
     pub fn pixel_format(self) -> u32 {
         self.pixel_format
+    }
+
+    pub fn generation(self) -> u64 {
+        self.generation
     }
 
     pub fn frame_len(self) -> u64 {

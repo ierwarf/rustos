@@ -15,6 +15,10 @@ pub(crate) unsafe extern "C" fn __serio_register_driver(
     _owner: *mut c_void,
     _mod_name: *const c_char,
 ) -> i32 {
+    crate::debug::println!(
+        "__serio_register_driver enter: driver_ptr={:#x}",
+        driver as usize
+    );
     unsafe { crate::driver::serio::register_linux_driver(driver) }
 }
 
@@ -97,7 +101,8 @@ pub(crate) unsafe fn apply_port_driver(
     driver: *mut LinuxCompatSerioDriver,
 ) {
     port.drv = driver;
-    port.dev.driver = &mut (*driver).driver;
+    let driver = unsafe { &mut *driver };
+    port.dev.driver = &mut driver.driver;
 }
 
 pub(crate) fn clear_port_driver(port: &mut LinuxCompatSerio) {
@@ -109,9 +114,14 @@ pub(crate) unsafe fn connect_driver(
     port: *mut LinuxCompatSerio,
     driver: *mut LinuxCompatSerioDriver,
 ) -> i32 {
-    let connect = (*driver).connect;
+    crate::debug::println!(
+        "serio connect_driver enter: port={:#x} driver={:#x}",
+        port as usize,
+        driver as usize
+    );
+    let connect = unsafe { (*driver).connect };
     if let Some(connect) = connect {
-        connect(port, driver)
+        unsafe { connect(port, driver) }
     } else {
         0
     }
@@ -121,7 +131,8 @@ pub(crate) fn driver_name(driver: *mut LinuxCompatSerioDriver) -> &'static str {
     if driver.is_null() {
         return "invalid";
     }
-    unsafe { compat_cstr((*driver).driver.name).unwrap_or("invalid") }
+    let name_ptr = unsafe { (*driver).driver.name };
+    compat_cstr(name_ptr).unwrap_or("invalid")
 }
 
 pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {

@@ -3,20 +3,15 @@ use core::convert::TryFrom;
 use core::ptr;
 
 use fatfs::{IoBase, Read, Seek, SeekFrom};
+use object::elf::{
+    self as objelf, FileHeader64 as RawElfHeader, ProgramHeader64 as RawProgramHeader,
+};
+use object::{FileKind, LittleEndian};
 
 use crate::fat::DiskIoError;
 
-const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
-const ELF_CLASS_64: u8 = 2;
-const ELF_DATA_LITTLE_ENDIAN: u8 = 1;
-const ELF_TYPE_EXEC: u16 = 2;
-const ELF_TYPE_DYN: u16 = 3;
-const ELF_MACHINE_X86_64: u16 = 62;
 const ELF64_HEADER_SIZE: usize = 64;
 const ELF64_PROGRAM_HEADER_SIZE: usize = 56;
-const ELF_PT_LOAD: u32 = 1;
-const ELF_PT_DYNAMIC: u32 = 2;
-const ELF_PF_X: u32 = 1;
 const MAX_PROGRAM_HEADERS: usize = 32;
 const PAGE_SIZE: usize = 0x1000;
 const MIN_KERNEL_LOAD_ADDR: usize = 0x0020_0000;
@@ -31,6 +26,7 @@ const DT_RELA: i64 = 7;
 const DT_RELASZ: i64 = 8;
 const DT_RELAENT: i64 = 9;
 const R_X86_64_RELATIVE: u32 = 8;
+const ELF_ENDIAN: LittleEndian = LittleEndian;
 
 pub fn load_kernel_elf<R>(
     reader: &mut R,
@@ -58,7 +54,11 @@ where
         "failed to read program header table",
     )?;
 
-    let load_alignment = required_load_alignment(&program_headers[..ph_table_size], &header)?;
+    let program_headers = parse_program_headers(
+        &program_headers[..ph_table_size],
+        header.program_header_count,
+    )?;
+    let load_alignment = required_load_alignment(&program_headers)?;
     let load_bias = kernel_load_bias(&header, physical_slide, load_alignment)?;
     let entry_point = relocate_image_addr(&header, header.entry_point, load_bias)?;
     validate_kernel_entry(entry_point)?;
@@ -69,15 +69,12 @@ where
     let mut loaded_range_count = 0usize;
     let mut dynamic_segment = None;
 
-    for index in 0..header.program_header_count {
-        let offset = index * ELF64_PROGRAM_HEADER_SIZE;
-        let ph =
-            parse_program_header(&program_headers[offset..offset + ELF64_PROGRAM_HEADER_SIZE])?;
-        if ph.ty == ELF_PT_DYNAMIC {
+    for ph in program_headers.iter() {
+        if ph.ty == objelf::PT_DYNAMIC {
             dynamic_segment = Some(dynamic_segment_info(&header, &ph, load_bias)?);
             continue;
         }
-        if ph.ty != ELF_PT_LOAD {
+        if ph.ty != objelf::PT_LOAD {
             continue;
         }
 
@@ -90,7 +87,7 @@ where
         loaded_ranges[loaded_range_count] = (segment.addr, segment.end);
         loaded_range_count += 1;
 
-        if ph.flags & ELF_PF_X != 0 && (segment.addr..segment.end).contains(&entry_point) {
+        if ph.flags & objelf::PF_X != 0 && (segment.addr..segment.end).contains(&entry_point) {
             executable_entry_covered = true;
         }
 
@@ -104,7 +101,7 @@ where
     if !executable_entry_covered {
         return Err("entry point is not inside an executable PT_LOAD segment");
     }
-    if header.elf_type == ELF_TYPE_DYN {
+    if header.elf_type == objelf::ET_DYN {
         let dynamic_segment = dynamic_segment.ok_or("ET_DYN image is missing PT_DYNAMIC")?;
         apply_dynamic_relocations(
             &header,
@@ -126,7 +123,7 @@ struct ElfHeader {
     program_header_count: usize,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct ProgramHeader {
     ty: u32,
     flags: u32,
@@ -161,16 +158,14 @@ struct DynamicRelocationTable {
 }
 
 fn parse_elf_header(header: &[u8; ELF64_HEADER_SIZE]) -> Result<ElfHeader, &'static str> {
-    if header[..4] != ELF_MAGIC {
-        return Err("invalid ELF magic");
-    }
+    let header = read_raw_elf_header(header);
 
     Ok(ElfHeader {
-        elf_type: read_u16(header, 16),
-        entry_point: read_u64(header, 24),
-        program_header_offset: read_u64(header, 32),
-        program_header_size: usize::from(read_u16(header, 54)),
-        program_header_count: usize::from(read_u16(header, 56)),
+        elf_type: header.e_type.get(ELF_ENDIAN),
+        entry_point: header.e_entry.get(ELF_ENDIAN),
+        program_header_offset: header.e_phoff.get(ELF_ENDIAN),
+        program_header_size: usize::from(header.e_phentsize.get(ELF_ENDIAN)),
+        program_header_count: usize::from(header.e_phnum.get(ELF_ENDIAN)),
     })
 }
 
@@ -179,20 +174,34 @@ fn validate_elf_header(
     header: &ElfHeader,
     file_len: u64,
 ) -> Result<(), &'static str> {
-    if raw_header[4] != ELF_CLASS_64 {
+    let raw = read_raw_elf_header(raw_header);
+    match FileKind::parse(&raw_header[..16]).map_err(|_| "invalid ELF image")? {
+        FileKind::Elf64 => {}
+        _ => return Err("ELF image is not 64-bit"),
+    }
+    if raw.e_ident.magic != objelf::ELFMAG {
+        return Err("invalid ELF magic");
+    }
+    if raw.e_ident.class != objelf::ELFCLASS64 {
         return Err("ELF class is not 64-bit");
     }
-    if raw_header[5] != ELF_DATA_LITTLE_ENDIAN {
+    if raw.e_ident.data != objelf::ELFDATA2LSB {
         return Err("ELF endianness is not little-endian");
     }
+    if raw.e_ident.version != objelf::EV_CURRENT {
+        return Err("ELF ident version is invalid");
+    }
+    if raw.e_version.get(ELF_ENDIAN) != objelf::EV_CURRENT as u32 {
+        return Err("ELF version is invalid");
+    }
 
-    if !matches!(header.elf_type, ELF_TYPE_EXEC | ELF_TYPE_DYN) {
+    if !matches!(header.elf_type, objelf::ET_EXEC | objelf::ET_DYN) {
         return Err("ELF type is not executable/shared object");
     }
-    if read_u16(raw_header, 18) != ELF_MACHINE_X86_64 {
+    if raw.e_machine.get(ELF_ENDIAN) != objelf::EM_X86_64 {
         return Err("ELF machine is not x86_64");
     }
-    if usize::from(read_u16(raw_header, 52)) != ELF64_HEADER_SIZE {
+    if usize::from(raw.e_ehsize.get(ELF_ENDIAN)) != ELF64_HEADER_SIZE {
         return Err("ELF header size is invalid");
     }
     if header.program_header_size != ELF64_PROGRAM_HEADER_SIZE {
@@ -223,21 +232,37 @@ fn validate_elf_header(
     Ok(())
 }
 
-fn parse_program_header(bytes: &[u8]) -> Result<ProgramHeader, &'static str> {
-    if bytes.len() != ELF64_PROGRAM_HEADER_SIZE {
+fn parse_program_headers(
+    bytes: &[u8],
+    count: usize,
+) -> Result<[ProgramHeader; MAX_PROGRAM_HEADERS], &'static str> {
+    if bytes.len() != count * ELF64_PROGRAM_HEADER_SIZE {
         return Err("invalid program header size");
     }
 
-    Ok(ProgramHeader {
-        ty: read_u32(bytes, 0),
-        flags: read_u32(bytes, 4),
-        offset: read_u64(bytes, 8),
-        virtual_addr: read_u64(bytes, 16),
-        physical_addr: read_u64(bytes, 24),
-        file_size: read_u64(bytes, 32),
-        mem_size: read_u64(bytes, 40),
-        align: read_u64(bytes, 48),
-    })
+    let mut parsed = [ProgramHeader::default(); MAX_PROGRAM_HEADERS];
+    for (index, slot) in parsed.iter_mut().take(count).enumerate() {
+        let offset = index
+            .checked_mul(ELF64_PROGRAM_HEADER_SIZE)
+            .ok_or("program header offset overflow")?;
+        let raw = read_raw_program_header(
+            bytes[offset..offset + ELF64_PROGRAM_HEADER_SIZE]
+                .try_into()
+                .map_err(|_| "invalid program header size")?,
+        );
+        *slot = ProgramHeader {
+            ty: raw.p_type.get(ELF_ENDIAN),
+            flags: raw.p_flags.get(ELF_ENDIAN),
+            offset: raw.p_offset.get(ELF_ENDIAN),
+            virtual_addr: raw.p_vaddr.get(ELF_ENDIAN),
+            physical_addr: raw.p_paddr.get(ELF_ENDIAN),
+            file_size: raw.p_filesz.get(ELF_ENDIAN),
+            mem_size: raw.p_memsz.get(ELF_ENDIAN),
+            align: raw.p_align.get(ELF_ENDIAN),
+        };
+    }
+
+    Ok(parsed)
 }
 
 fn load_segment<R>(reader: &mut R, segment: &SegmentLoadInfo) -> Result<(), &'static str>
@@ -376,7 +401,7 @@ fn segment_addr(
     ph: &ProgramHeader,
     load_bias: usize,
 ) -> Result<usize, &'static str> {
-    if header.elf_type == ELF_TYPE_DYN {
+    if header.elf_type == objelf::ET_DYN {
         return relocate_image_addr(header, ph.virtual_addr, load_bias);
     }
 
@@ -394,7 +419,7 @@ fn kernel_load_bias(
     physical_slide: usize,
     load_alignment: usize,
 ) -> Result<usize, &'static str> {
-    if header.elf_type == ELF_TYPE_DYN {
+    if header.elf_type == objelf::ET_DYN {
         if physical_slide > MAX_KERNEL_PHYSICAL_KASLR_SLIDE {
             return Err("kernel physical slide exceeds the supported KASLR window");
         }
@@ -408,19 +433,11 @@ fn kernel_load_bias(
     }
 }
 
-fn required_load_alignment(
-    program_headers: &[u8],
-    header: &ElfHeader,
-) -> Result<usize, &'static str> {
+fn required_load_alignment(program_headers: &[ProgramHeader]) -> Result<usize, &'static str> {
     let mut required_alignment = PAGE_SIZE;
 
-    for index in 0..header.program_header_count {
-        let offset = index
-            .checked_mul(ELF64_PROGRAM_HEADER_SIZE)
-            .ok_or("program header offset overflow")?;
-        let ph =
-            parse_program_header(&program_headers[offset..offset + ELF64_PROGRAM_HEADER_SIZE])?;
-        if ph.ty != ELF_PT_LOAD {
+    for ph in program_headers {
+        if ph.ty != objelf::PT_LOAD {
             continue;
         }
 
@@ -444,7 +461,7 @@ fn relocate_image_addr(
     load_bias: usize,
 ) -> Result<usize, &'static str> {
     let addr = usize::try_from(raw_addr).map_err(|_| "image address is out of range")?;
-    if header.elf_type == ELF_TYPE_DYN {
+    if header.elf_type == objelf::ET_DYN {
         load_bias
             .checked_add(addr)
             .ok_or("image address overflow after relocation")
@@ -599,7 +616,7 @@ fn relative_relocation_value(
     load_bias: usize,
     addend: i64,
 ) -> Result<u64, &'static str> {
-    let base = if header.elf_type == ELF_TYPE_DYN {
+    let base = if header.elf_type == objelf::ET_DYN {
         load_bias as i128
     } else {
         0
@@ -668,21 +685,14 @@ where
     Ok(())
 }
 
-fn read_u16(bytes: &[u8], offset: usize) -> u16 {
-    let chunk = &bytes[offset..offset + 2];
-    u16::from_le_bytes([chunk[0], chunk[1]])
+fn read_raw_elf_header(bytes: &[u8; ELF64_HEADER_SIZE]) -> RawElfHeader<LittleEndian> {
+    unsafe { ptr::read_unaligned(bytes.as_ptr() as *const RawElfHeader<LittleEndian>) }
 }
 
-fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-    let chunk = &bytes[offset..offset + 4];
-    u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
-}
-
-fn read_u64(bytes: &[u8], offset: usize) -> u64 {
-    let chunk = &bytes[offset..offset + 8];
-    u64::from_le_bytes([
-        chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-    ])
+fn read_raw_program_header(
+    bytes: &[u8; ELF64_PROGRAM_HEADER_SIZE],
+) -> RawProgramHeader<LittleEndian> {
+    unsafe { ptr::read_unaligned(bytes.as_ptr() as *const RawProgramHeader<LittleEndian>) }
 }
 
 #[cfg(test)]
@@ -691,11 +701,13 @@ mod tests {
 
     fn valid_header(elf_type: u16) -> [u8; ELF64_HEADER_SIZE] {
         let mut header = [0_u8; ELF64_HEADER_SIZE];
-        header[..4].copy_from_slice(&ELF_MAGIC);
-        header[4] = ELF_CLASS_64;
-        header[5] = ELF_DATA_LITTLE_ENDIAN;
+        header[..4].copy_from_slice(objelf::ELFMAG);
+        header[4] = objelf::ELFCLASS64;
+        header[5] = objelf::ELFDATA2LSB;
+        header[6] = objelf::EV_CURRENT;
         header[16..18].copy_from_slice(&elf_type.to_le_bytes());
-        header[18..20].copy_from_slice(&ELF_MACHINE_X86_64.to_le_bytes());
+        header[18..20].copy_from_slice(&objelf::EM_X86_64.to_le_bytes());
+        header[20..24].copy_from_slice(&(objelf::EV_CURRENT as u32).to_le_bytes());
         header[24..32].copy_from_slice(&(MIN_KERNEL_LOAD_ADDR as u64).to_le_bytes());
         header[32..40].copy_from_slice(&(ELF64_HEADER_SIZE as u64).to_le_bytes());
         header[52..54].copy_from_slice(&(ELF64_HEADER_SIZE as u16).to_le_bytes());
@@ -706,8 +718,8 @@ mod tests {
 
     fn valid_program_header() -> ProgramHeader {
         ProgramHeader {
-            ty: ELF_PT_LOAD,
-            flags: ELF_PF_X,
+            ty: objelf::PT_LOAD,
+            flags: objelf::PF_X,
             offset: 0x1000,
             virtual_addr: MIN_KERNEL_LOAD_ADDR as u64,
             physical_addr: MIN_KERNEL_LOAD_ADDR as u64,
@@ -719,7 +731,7 @@ mod tests {
 
     #[test]
     fn validate_elf_header_accepts_minimal_valid_header() {
-        let header_bytes = valid_header(ELF_TYPE_EXEC);
+        let header_bytes = valid_header(objelf::ET_EXEC);
         let header = parse_elf_header(&header_bytes).expect("header should parse");
 
         assert_eq!(header.entry_point, MIN_KERNEL_LOAD_ADDR as u64);
@@ -733,7 +745,7 @@ mod tests {
 
     #[test]
     fn validate_elf_header_rejects_short_program_table() {
-        let header_bytes = valid_header(ELF_TYPE_EXEC);
+        let header_bytes = valid_header(objelf::ET_EXEC);
         let header = parse_elf_header(&header_bytes).expect("header should parse");
 
         let err = validate_elf_header(&header_bytes, &header, ELF64_HEADER_SIZE as u64)
@@ -743,7 +755,7 @@ mod tests {
 
     #[test]
     fn validated_segment_bounds_accepts_supported_range() {
-        let header_bytes = valid_header(ELF_TYPE_EXEC);
+        let header_bytes = valid_header(objelf::ET_EXEC);
         let header = parse_elf_header(&header_bytes).expect("header should parse");
         let segment = validated_segment_bounds(&header, &valid_program_header(), 0x4000, 0)
             .expect("segment should validate");
@@ -756,7 +768,7 @@ mod tests {
 
     #[test]
     fn validated_segment_bounds_rejects_low_address() {
-        let header_bytes = valid_header(ELF_TYPE_EXEC);
+        let header_bytes = valid_header(objelf::ET_EXEC);
         let elf_header = parse_elf_header(&header_bytes).expect("header should parse");
         let mut program_header = valid_program_header();
         program_header.physical_addr = (MIN_KERNEL_LOAD_ADDR - 0x1000) as u64;
@@ -768,7 +780,7 @@ mod tests {
 
     #[test]
     fn dyn_entry_is_relocated_by_kernel_bias() {
-        let mut header_bytes = valid_header(ELF_TYPE_DYN);
+        let mut header_bytes = valid_header(objelf::ET_DYN);
         header_bytes[24..32].copy_from_slice(&(0x8c2f0_u64).to_le_bytes());
         let header = parse_elf_header(&header_bytes).expect("header should parse");
 

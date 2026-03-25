@@ -5,10 +5,10 @@ use x86_64::PhysAddr;
 use x86_64::VirtAddr;
 use x86_64::registers::model_specific::FsBase;
 
+use crate::arch::simd::{SimdState, restore_state, save_state};
 use crate::debug;
-use crate::paging::ProcessAddressSpace;
-use crate::session::ConsoleSessionId;
-use crate::simd::{SimdState, restore_state, save_state};
+use crate::io::session::ConsoleSessionHandle;
+use crate::memory::paging::ProcessAddressSpace;
 use crate::user::abi::UserAbi;
 use crate::user::linux::{LinuxProcessState, LinuxThreadState};
 use crate::user::process_state::{SharedUserProcessState, UserProcessState};
@@ -18,10 +18,13 @@ use super::{UserFaultDisposition, UserStackState, UserTaskBootstrap};
 
 pub(super) const MAX_TASK: usize = 32;
 // Kernel worker threads run fairly deep Rust call chains during process/module
-// bring-up, so 16 KiB stacks are too tight and can corrupt adjacent task stacks.
-const TASK_STACK_SIZE: usize = 64 * 1024;
+// bring-up, so smaller stacks can corrupt adjacent task stacks.
+const TASK_STACK_SIZE: usize = 256 * 1024;
+const TASK_STACK_GUARD_BYTES: usize = 256;
+const STACK_CANARY_WORD: u64 = 0x5343_4844_554c_4552;
 const TASK_ENTRY_STACK_RESERVE_QWORDS: usize = 3;
 const PAGE_FAULT_VECTOR: u8 = 14;
+const RFLAGS_RESERVED_BIT_1: u64 = 1 << 1;
 
 #[derive(Clone, Copy)]
 enum TaskRetireReason {
@@ -36,6 +39,7 @@ enum TaskRetireReason {
     },
     CorruptedContext {
         saved_rsp: usize,
+        reason: &'static str,
     },
     Exited,
 }
@@ -50,8 +54,8 @@ struct TaskContext {
     kernel_stack_top: u64,
     user_mode: bool,
     user_abi: Option<UserAbi>,
-    console_session: ConsoleSessionId,
-    process_state_owner: *mut SharedUserProcessState,
+    console_session: ConsoleSessionHandle,
+    process_state_owner: Option<ptr::NonNull<SharedUserProcessState>>,
     user_stack: Option<UserStackState>,
     linux_thread_state: Option<LinuxThreadState>,
 }
@@ -70,6 +74,7 @@ pub(super) struct Scheduler {
     simd_states: [SimdState; MAX_TASK],
     starts: [Option<TaskStart>; MAX_TASK],
     current_task: usize,
+    bootstrap_context_captured: bool,
     pending_reap: bool,
     stacks: [[u8; TASK_STACK_SIZE]; MAX_TASK],
 }
@@ -84,6 +89,7 @@ impl Scheduler {
             simd_states: [SimdState::new(); MAX_TASK],
             starts: [None; MAX_TASK],
             current_task: 0,
+            bootstrap_context_captured: false,
             pending_reap: false,
             stacks: [[0; TASK_STACK_SIZE]; MAX_TASK],
         }
@@ -99,18 +105,19 @@ impl Scheduler {
         self.retire_reasons = [None; MAX_TASK];
         self.last_errors = [0; MAX_TASK];
         self.current_task = 0;
+        self.bootstrap_context_captured = false;
         self.pending_reap = false;
         self.contexts[0] = Some(TaskContext {
             saved_rsp: 0,
             ready: true,
             blocked: false,
             pit_divisor: main_thread_pit_divisor,
-            address_space_root: crate::paging::kernel_root_phys().as_u64(),
+            address_space_root: crate::memory::paging::kernel_root_phys().as_u64(),
             kernel_stack_top: 0,
             user_mode: false,
             user_abi: None,
-            console_session: ConsoleSessionId::PRIMARY,
-            process_state_owner: ptr::null_mut(),
+            console_session: ConsoleSessionHandle::SYSTEM,
+            process_state_owner: None,
             user_stack: None,
             linux_thread_state: None,
         });
@@ -126,10 +133,10 @@ impl Scheduler {
 
     pub(super) fn clear_slot(&mut self, slot: usize) {
         if let Some(context) = self.contexts[slot] {
-            if !context.process_state_owner.is_null() {
+            if let Some(mut owner) = context.process_state_owner {
                 unsafe {
-                    if (*context.process_state_owner).release() {
-                        drop(Box::from_raw(context.process_state_owner));
+                    if owner.as_mut().release() {
+                        drop(Box::from_raw(owner.as_ptr()));
                     }
                 }
             }
@@ -141,6 +148,7 @@ impl Scheduler {
         self.last_errors[slot] = 0;
         self.simd_states[slot] = SimdState::new();
         self.starts[slot] = None;
+        self.reset_stack_storage(slot);
     }
 
     fn mark_slot_ready(&mut self, slot: usize, saved_rsp: usize, ready: bool) {
@@ -150,6 +158,9 @@ impl Scheduler {
 
         context.saved_rsp = saved_rsp;
         context.ready = ready;
+        if slot == 0 && saved_rsp != 0 {
+            self.bootstrap_context_captured = true;
+        }
     }
 
     fn retire_slot(&mut self, slot: usize, reason: TaskRetireReason) {
@@ -165,9 +176,53 @@ impl Scheduler {
         self.retire_reasons[slot] = Some(reason);
     }
 
+    fn reset_stack_storage(&mut self, slot: usize) {
+        self.stacks[slot].fill(0);
+        let canary_words = TASK_STACK_GUARD_BYTES / mem::size_of::<u64>();
+        let base = self.stacks[slot].as_mut_ptr() as *mut u64;
+        for index in 0..canary_words {
+            unsafe {
+                ptr::write(base.add(index), STACK_CANARY_WORD);
+            }
+        }
+    }
+
+    fn stack_canary_intact(&self, slot: usize) -> bool {
+        let canary_words = TASK_STACK_GUARD_BYTES / mem::size_of::<u64>();
+        let base = self.stacks[slot].as_ptr() as *const u64;
+        for index in 0..canary_words {
+            let value = unsafe { ptr::read(base.add(index)) };
+            if value != STACK_CANARY_WORD {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn scheduler_storage_bounds(&self) -> (usize, usize) {
+        let base = self as *const Self as usize;
+        (base, base + mem::size_of::<Self>())
+    }
+
+    fn scheduler_storage_contains(&self, addr: usize) -> bool {
+        let (base, end) = self.scheduler_storage_bounds();
+        if addr >= base && addr < end {
+            return true;
+        }
+
+        let virt_offset = crate::memory::paging::KERNEL_VIRT_OFFSET as usize;
+        if base >= virt_offset {
+            let low_base = base - virt_offset;
+            let low_end = end - virt_offset;
+            return addr >= low_base && addr < low_end;
+        }
+
+        false
+    }
+
     fn stack_bounds(&self, slot: usize) -> (usize, usize) {
         let base = self.stacks[slot].as_ptr() as usize;
-        (base, base + TASK_STACK_SIZE)
+        (base + TASK_STACK_GUARD_BYTES, base + TASK_STACK_SIZE)
     }
 
     fn stack_top(&self, slot: usize) -> usize {
@@ -184,10 +239,6 @@ impl Scheduler {
             return false;
         }
 
-        if slot == 0 {
-            return true;
-        }
-
         if slot >= MAX_TASK {
             return false;
         }
@@ -197,14 +248,154 @@ impl Scheduler {
             return false;
         };
 
+        if slot == 0 {
+            let last_byte = frame_end.saturating_sub(1);
+            let kernel_base = crate::memory::paging::KERNEL_VIRT_OFFSET as usize;
+            return saved_rsp >= kernel_base
+                && last_byte >= kernel_base
+                && Self::is_canonical_address(saved_rsp as u64)
+                && Self::is_canonical_address(last_byte as u64)
+                && !self.scheduler_storage_contains(saved_rsp)
+                && !self.scheduler_storage_contains(last_byte);
+        }
+
         saved_rsp >= base && frame_end <= top
+    }
+
+    fn context_validation_error(
+        &self,
+        slot: usize,
+        context: TaskContext,
+        saved_rsp: usize,
+    ) -> Option<&'static str> {
+        self.validate_saved_context(slot, context.user_mode, saved_rsp)
+            .err()
+    }
+
+    fn validate_context_slot(&self, slot: usize) -> Result<TaskContext, &'static str> {
+        let context = self.contexts[slot].ok_or("task context is missing")?;
+        if self.is_bootstrap_context_placeholder(slot, context) {
+            return Ok(context);
+        }
+        self.validate_saved_context(slot, context.user_mode, context.saved_rsp)?;
+        Ok(context)
+    }
+
+    fn bootstrap_context(&self) -> TaskContext {
+        self.contexts[0].expect("scheduler lost the bootstrap task context")
+    }
+
+    fn saved_context_ref(saved_rsp: usize) -> Option<&'static SavedContext> {
+        if saved_rsp == 0 || (saved_rsp & (mem::align_of::<SavedContext>() - 1)) != 0 {
+            return None;
+        }
+
+        Some(unsafe { &*(saved_rsp as *const SavedContext) })
+    }
+
+    fn is_canonical_address(addr: u64) -> bool {
+        let upper = addr >> 48;
+        if ((addr >> 47) & 1) == 0 {
+            upper == 0
+        } else {
+            upper == 0xFFFF
+        }
+    }
+
+    fn validate_saved_context(
+        &self,
+        slot: usize,
+        user_mode_task: bool,
+        saved_rsp: usize,
+    ) -> Result<(), &'static str> {
+        if !self.is_valid_saved_rsp(slot, saved_rsp) {
+            return Err("saved context pointer is outside the task stack");
+        }
+        if slot != 0 && !self.stack_canary_intact(slot) {
+            return Err("kernel stack guard was corrupted");
+        }
+
+        let saved = Self::saved_context_ref(saved_rsp).ok_or("saved context pointer is invalid")?;
+        if (saved.rflags & RFLAGS_RESERVED_BIT_1) == 0 {
+            return Err("saved rflags lost the reserved bit");
+        }
+
+        let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
+        let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
+        let kernel_cs = crate::arch::gdt::kernel_code_selector().0 as u64;
+        let kernel_ss = crate::arch::gdt::kernel_data_selector().0 as u64;
+
+        if saved.cs == user_cs {
+            if !user_mode_task {
+                return Err("kernel task cannot return directly to user mode");
+            }
+            if saved.ss != user_ss {
+                return Err("user return frame carries an unexpected stack selector");
+            }
+            if !Self::is_canonical_address(saved.rip)
+                || !Self::is_canonical_address(saved.rsp)
+                || saved.rip >= crate::memory::paging::USER_SPACE_END_EXCLUSIVE
+                || saved.rsp < crate::memory::paging::USER_SPACE_BASE
+                || saved.rsp >= crate::memory::paging::USER_SPACE_END_EXCLUSIVE
+            {
+                return Err("user return frame points outside user space");
+            }
+            return Ok(());
+        }
+
+        if saved.cs != kernel_cs {
+            return Err("saved code selector does not match any supported return mode");
+        }
+        if !Self::is_canonical_address(saved.rip) {
+            return Err("kernel return RIP is not canonical");
+        }
+        if saved.rip >= crate::memory::paging::USER_SPACE_BASE
+            && saved.rip < crate::memory::paging::USER_SPACE_END_EXCLUSIVE
+        {
+            return Err("kernel return RIP points into user space");
+        }
+        if self.scheduler_storage_contains(saved.rip as usize) {
+            return Err("kernel return RIP points into scheduler storage");
+        }
+
+        let kernel_interrupt_frame = saved.rsp == 1 && saved.ss == 0;
+        let initial_kernel_frame =
+            saved.ss == kernel_ss && Self::is_canonical_address(saved.rsp) && saved.rsp != 0;
+        if !kernel_interrupt_frame && !initial_kernel_frame {
+            return Err("kernel return frame has an invalid stack layout");
+        }
+
+        if initial_kernel_frame && slot != 0 {
+            let (stack_base, stack_top) = self.stack_bounds(slot);
+            let rsp = saved.rsp as usize;
+            if rsp < stack_base || rsp > stack_top {
+                return Err("kernel return RSP does not belong to the task stack");
+            }
+        }
+
+        Ok(())
+    }
+
+    fn is_bootstrap_context_placeholder(&self, slot: usize, context: TaskContext) -> bool {
+        slot == 0
+            && !self.bootstrap_context_captured
+            && !context.user_mode
+            && context.saved_rsp == 0
+            && context.kernel_stack_top == 0
+            && context.process_state_owner.is_none()
+            && self.starts[0].is_none()
+    }
+
+    fn context_is_schedulable(&self, slot: usize, context: TaskContext) -> bool {
+        self.context_validation_error(slot, context, context.saved_rsp)
+            .is_none()
     }
 
     fn next_ready_task_index(&self, current: usize) -> Option<usize> {
         for offset in 1..=MAX_TASK {
             let idx = (current + offset) % MAX_TASK;
             if let Some(ctx) = self.contexts[idx] {
-                if ctx.ready && self.is_valid_saved_rsp(idx, ctx.saved_rsp) {
+                if ctx.ready && self.context_is_schedulable(idx, ctx) {
                     return Some(idx);
                 }
             }
@@ -224,6 +415,7 @@ impl Scheduler {
     ) -> Option<usize> {
         for slot in 1..MAX_TASK {
             if self.contexts[slot].is_none() {
+                self.reset_stack_storage(slot);
                 let kernel_stack_top = self.stack_top(slot) as u64;
                 self.contexts[slot] = Some(TaskContext {
                     saved_rsp: self.init_kernel_task_context(
@@ -236,12 +428,12 @@ impl Scheduler {
                     ready: true,
                     blocked: false,
                     pit_divisor,
-                    address_space_root: crate::paging::kernel_root_phys().as_u64(),
+                    address_space_root: crate::memory::paging::kernel_root_phys().as_u64(),
                     kernel_stack_top,
                     user_mode: false,
                     user_abi: None,
-                    console_session: ConsoleSessionId::PRIMARY,
-                    process_state_owner: ptr::null_mut(),
+                    console_session: ConsoleSessionHandle::SYSTEM,
+                    process_state_owner: None,
                     user_stack: None,
                     linux_thread_state: None,
                 });
@@ -267,7 +459,9 @@ impl Scheduler {
     ) -> Option<usize> {
         for slot in 1..MAX_TASK {
             if self.contexts[slot].is_none() {
-                let saved_rsp = self.init_user_task_context(slot, &bootstrap, user_cs, user_ss, rflags);
+                self.reset_stack_storage(slot);
+                let saved_rsp =
+                    self.init_user_task_context(slot, &bootstrap, user_cs, user_ss, rflags);
                 let exec_path = alloc::string::String::from(bootstrap.exec_path());
                 let boxed_state = UserProcessState::new(
                     address_space,
@@ -291,7 +485,10 @@ impl Scheduler {
                     user_mode: true,
                     user_abi: Some(bootstrap.abi),
                     console_session: bootstrap.console_session,
-                    process_state_owner: raw_state,
+                    process_state_owner: Some(
+                        ptr::NonNull::new(raw_state)
+                            .expect("boxed process state pointer must not be null"),
+                    ),
                     user_stack: bootstrap.user_stack,
                     linux_thread_state: bootstrap.linux_thread_state,
                 });
@@ -317,17 +514,20 @@ impl Scheduler {
         rflags: u64,
     ) -> Option<usize> {
         let current = self.contexts[self.current_task]?;
-        if !current.user_mode || current.process_state_owner.is_null() {
+        if !current.user_mode {
             return None;
         }
 
         let root_phys = current.address_space_root;
-        let process_state_owner = current.process_state_owner;
+        let Some(mut process_state_owner) = current.process_state_owner else {
+            return None;
+        };
         for slot in 1..MAX_TASK {
             if self.contexts[slot].is_none() {
                 unsafe {
-                    (*process_state_owner).retain();
+                    process_state_owner.as_mut().retain();
                 }
+                self.reset_stack_storage(slot);
                 let kernel_stack_top = self.stack_top(slot) as u64;
                 self.contexts[slot] = Some(TaskContext {
                     saved_rsp: self
@@ -340,7 +540,7 @@ impl Scheduler {
                     user_mode: true,
                     user_abi: Some(bootstrap.abi),
                     console_session: bootstrap.console_session,
-                    process_state_owner,
+                    process_state_owner: Some(process_state_owner),
                     user_stack: bootstrap.user_stack,
                     linux_thread_state: bootstrap.linux_thread_state,
                 });
@@ -428,27 +628,32 @@ impl Scheduler {
         context_ptr
     }
 
-    fn retire_slot_due_to_invalid_context(&mut self, slot: usize, saved_rsp: usize) {
+    fn retire_slot_due_to_invalid_context(
+        &mut self,
+        slot: usize,
+        saved_rsp: usize,
+        reason: &'static str,
+    ) {
         if self.contexts[slot].is_none() {
             return;
         }
         self.mark_slot_ready(slot, saved_rsp, false);
-        self.retire_slot(slot, TaskRetireReason::CorruptedContext { saved_rsp });
+        self.retire_slot(
+            slot,
+            TaskRetireReason::CorruptedContext { saved_rsp, reason },
+        );
     }
 
     fn retire_invalid_ready_tasks(&mut self) {
-        for slot in 0..MAX_TASK {
+        for slot in 1..MAX_TASK {
             let Some(context) = self.contexts[slot] else {
                 continue;
             };
-            if !context.ready {
-                continue;
+            if let Err(reason) =
+                self.validate_saved_context(slot, context.user_mode, context.saved_rsp)
+            {
+                self.retire_slot_due_to_invalid_context(slot, context.saved_rsp, reason);
             }
-            if self.is_valid_saved_rsp(slot, context.saved_rsp) {
-                continue;
-            }
-
-            self.retire_slot_due_to_invalid_context(slot, context.saved_rsp);
         }
     }
 
@@ -461,10 +666,19 @@ impl Scheduler {
             .unwrap_or(false)
         {
             self.mark_slot_ready(current_slot, current_rsp, false);
-        } else if self.is_valid_saved_rsp(current_slot, current_rsp) {
+        } else if self.contexts[current_slot]
+            .and_then(|ctx| self.context_validation_error(current_slot, ctx, current_rsp))
+            .is_none()
+        {
             self.mark_slot_ready(current_slot, current_rsp, true);
         } else {
-            self.retire_slot_due_to_invalid_context(current_slot, current_rsp);
+            let reason = self.contexts[current_slot]
+                .and_then(|ctx| self.context_validation_error(current_slot, ctx, current_rsp))
+                .unwrap_or("current task context is missing");
+            if current_slot == 0 {
+                panic!("scheduler bootstrap context is corrupted: {}", reason);
+            }
+            self.retire_slot_due_to_invalid_context(current_slot, current_rsp, reason);
         }
 
         self.retire_invalid_ready_tasks();
@@ -472,18 +686,23 @@ impl Scheduler {
         let next_idx = self.next_ready_task_index(self.current_task).unwrap_or(0);
 
         if let Some(next) = self.contexts[next_idx] {
-            if self.is_valid_saved_rsp(next_idx, next.saved_rsp) {
-                self.current_task = next_idx;
-                return (next.saved_rsp, next.pit_divisor);
+            match self.context_validation_error(next_idx, next, next.saved_rsp) {
+                None => {
+                    self.current_task = next_idx;
+                    return (next.saved_rsp, next.pit_divisor);
+                }
+                Some(reason) if next_idx == 0 => {
+                    panic!("scheduler bootstrap context is corrupted: {}", reason);
+                }
+                Some(reason) => {
+                    self.retire_slot_due_to_invalid_context(next_idx, next.saved_rsp, reason);
+                }
             }
         }
 
-        let pit_divisor = self.contexts[current_slot]
-            .map(|ctx| ctx.pit_divisor)
-            .or_else(|| self.contexts[0].map(|ctx| ctx.pit_divisor))
-            .expect("scheduler must keep slot 0 alive");
-
-        (current_rsp, pit_divisor)
+        let bootstrap = self.bootstrap_context();
+        self.current_task = 0;
+        (bootstrap.saved_rsp, bootstrap.pit_divisor)
     }
 
     pub(super) fn current_task_start(&self) -> Option<TaskStart> {
@@ -495,11 +714,17 @@ impl Scheduler {
     }
 
     pub(super) fn prepare_current_task_execution(&self) {
-        let current = self.contexts[self.current_task].expect("current task context missing");
-        crate::paging::load_address_space_phys(PhysAddr::new(current.address_space_root));
+        let current =
+            self.contexts[self.current_task].expect("scheduler selected a missing task context");
+        let placeholder = self.is_bootstrap_context_placeholder(self.current_task, current);
+        if !placeholder {
+            self.validate_saved_context(self.current_task, current.user_mode, current.saved_rsp)
+                .expect("scheduler selected an invalid task context");
+        }
+        crate::memory::paging::load_address_space_phys(PhysAddr::new(current.address_space_root));
         if current.kernel_stack_top != 0 {
-            crate::gdt::set_privilege_stack(current.kernel_stack_top);
-            crate::syscall::set_kernel_stack_top(current.kernel_stack_top);
+            crate::arch::gdt::set_privilege_stack(current.kernel_stack_top);
+            crate::user::syscall::set_kernel_stack_top(current.kernel_stack_top);
         }
 
         let fs_base = current
@@ -507,7 +732,9 @@ impl Scheduler {
             .map(|state| state.fs_base)
             .unwrap_or(0);
         FsBase::write(VirtAddr::new(fs_base));
-        crate::syscall::prepare_for_context_return(self.context_returns_to_user(current));
+        crate::user::syscall::prepare_for_context_return(
+            !placeholder && self.context_returns_to_user(current),
+        );
     }
 
     pub(super) fn reap_inactive_retired_slots(&mut self) -> usize {
@@ -557,11 +784,12 @@ impl Scheduler {
 
     pub(super) fn current_user_address_space(&self) -> Option<&ProcessAddressSpace> {
         let context = self.contexts[self.current_task]?;
-        if !context.user_mode || context.process_state_owner.is_null() {
+        if !context.user_mode {
             return None;
         }
 
-        Some(unsafe { (*context.process_state_owner).state().address_space() })
+        let owner = context.process_state_owner?;
+        Some(unsafe { owner.as_ref().state().address_space() })
     }
 
     pub(super) fn current_user_abi(&self) -> Option<UserAbi> {
@@ -584,17 +812,18 @@ impl Scheduler {
 
     pub(super) fn current_user_process_id(&self) -> Option<u64> {
         let context = self.contexts[self.current_task]?;
-        if !context.user_mode || context.process_state_owner.is_null() {
+        if !context.user_mode {
             return None;
         }
 
-        Some(unsafe { (*context.process_state_owner).process_id() })
+        let owner = context.process_state_owner?;
+        Some(unsafe { owner.as_ref().process_id() })
     }
 
-    pub(super) fn current_console_session(&self) -> ConsoleSessionId {
+    pub(super) fn current_console_session(&self) -> ConsoleSessionHandle {
         self.contexts[self.current_task]
             .map(|context| context.console_session)
-            .unwrap_or(ConsoleSessionId::PRIMARY)
+            .unwrap_or(ConsoleSessionHandle::SYSTEM)
     }
 
     pub(super) fn with_current_user_linux_state_mut<R>(
@@ -610,15 +839,16 @@ impl Scheduler {
     ) -> Option<R> {
         let slot = self.current_task;
         let context = self.contexts[slot].as_mut()?;
-        if !context.user_mode || context.process_state_owner.is_null() {
+        if !context.user_mode {
             return None;
         }
 
         let abi = context.user_abi?;
         let tid = self.starts[slot].map(|start| start.id)?;
-        let process_id = unsafe { (*context.process_state_owner).process_id() };
+        let mut owner = context.process_state_owner?;
+        let process_id = unsafe { owner.as_ref().process_id() };
         let thread_state_ptr = ptr::addr_of_mut!(context.linux_thread_state);
-        let process_state = unsafe { (*context.process_state_owner).state_mut() };
+        let process_state = unsafe { owner.as_mut().state_mut() };
         let (address_space, linux_process_state) =
             process_state.address_space_and_linux_process_state_mut();
         let linux_thread_state = unsafe { &mut *thread_state_ptr };
@@ -638,13 +868,14 @@ impl Scheduler {
     ) -> Option<R> {
         let slot = self.current_task;
         let context = self.contexts[slot].as_mut()?;
-        if !context.user_mode || context.process_state_owner.is_null() {
+        if !context.user_mode {
             return None;
         }
 
         let abi = context.user_abi?;
         let id = self.starts[slot].map(|start| start.id)?;
-        let process_state = unsafe { (*context.process_state_owner).state_mut() };
+        let mut owner = context.process_state_owner?;
+        let process_state = unsafe { owner.as_mut().state_mut() };
         Some(f(id, abi, process_state))
     }
 
@@ -663,7 +894,7 @@ impl Scheduler {
         let Some(context) = self.contexts[slot].as_mut() else {
             return false;
         };
-        if !context.user_mode || context.process_state_owner.is_null() {
+        if !context.user_mode {
             return false;
         }
 
@@ -682,7 +913,10 @@ impl Scheduler {
         let process_id = self.starts[slot]
             .map(|start| start.id)
             .unwrap_or(slot as u64);
-        let process_state = unsafe { (*context.process_state_owner).state_mut() };
+        let Some(mut owner) = context.process_state_owner else {
+            return false;
+        };
+        let process_state = unsafe { owner.as_mut().state_mut() };
         let (address_space, linux_process_state) =
             process_state.address_space_and_linux_process_state_mut();
         let map_result = address_space.map_zeroed_user_pages_at(
@@ -796,18 +1030,27 @@ impl Scheduler {
             return false;
         }
 
-        let saved_rsp = match self.contexts[slot] {
-            Some(context) => context.saved_rsp,
+        let (saved_rsp, user_mode) = match self.contexts[slot] {
+            Some(context) => (context.saved_rsp, context.user_mode),
             None => return false,
         };
-        let is_valid_saved_rsp = self.is_valid_saved_rsp(slot, saved_rsp);
+        let invalid_reason = self
+            .validate_saved_context(slot, user_mode, saved_rsp)
+            .err();
 
-        let Some(context) = self.contexts[slot].as_mut() else {
-            return false;
-        };
-        context.blocked = false;
-        if is_valid_saved_rsp {
-            context.ready = true;
+        {
+            let Some(context) = self.contexts[slot].as_mut() else {
+                return false;
+            };
+            context.blocked = false;
+            context.ready = invalid_reason.is_none();
+        }
+
+        if let Some(reason) = invalid_reason {
+            if slot == 0 {
+                panic!("scheduler bootstrap context is corrupted: {}", reason);
+            }
+            self.retire_slot_due_to_invalid_context(slot, saved_rsp, reason);
         }
         true
     }
@@ -856,16 +1099,17 @@ impl Scheduler {
                     rip,
                 );
             }
-            Some(TaskRetireReason::CorruptedContext { saved_rsp }) => {
+            Some(TaskRetireReason::CorruptedContext { saved_rsp, reason }) => {
                 let (stack_base, stack_top) = self.stack_bounds(slot);
                 debug::println!(
-                    "scheduler: reaped corrupted task pid={} slot={} user_mode={} saved_rsp={:#x} stack=[{:#x}, {:#x})",
+                    "scheduler: reaped corrupted task pid={} slot={} user_mode={} saved_rsp={:#x} stack=[{:#x}, {:#x}) reason={}",
                     id,
                     slot,
                     context.user_mode,
                     saved_rsp,
                     stack_base,
                     stack_top,
+                    reason,
                 );
             }
             Some(TaskRetireReason::Terminated { requested_by_pid }) => {
@@ -897,16 +1141,17 @@ impl Scheduler {
     }
 
     fn context_returns_to_user(&self, context: TaskContext) -> bool {
+        if self.is_bootstrap_context_placeholder(self.current_task, context) {
+            return false;
+        }
         Self::saved_context_returns_to_user(context.saved_rsp)
     }
 
     fn saved_context_returns_to_user(saved_rsp: usize) -> bool {
-        if saved_rsp == 0 {
+        let Some(saved) = Self::saved_context_ref(saved_rsp) else {
             return false;
-        }
-
-        let saved = unsafe { &*(saved_rsp as *const SavedContext) };
-        (saved.cs & 0x3) == 0x3
+        };
+        saved.cs == crate::arch::gdt::user_code_selector().0 as u64
     }
 
     fn find_user_task_slot(&self, task_id: u64) -> Option<usize> {

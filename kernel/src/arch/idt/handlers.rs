@@ -1,9 +1,9 @@
 use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::InterruptStackFrame;
 
-const KEYBOARD_INTERRUPT_VECTOR: u8 = crate::pic::PIC_1_OFFSET + 1;
-const MOUSE_INTERRUPT_VECTOR: u8 = crate::pic::PIC_2_OFFSET + 4;
-const RTC_INTERRUPT_VECTOR: u8 = crate::pic::PIC_2_OFFSET;
+const KEYBOARD_INTERRUPT_VECTOR: u8 = crate::arch::pic::PIC_1_OFFSET + 1;
+const MOUSE_INTERRUPT_VECTOR: u8 = crate::arch::pic::PIC_2_OFFSET + 4;
+const RTC_INTERRUPT_VECTOR: u8 = crate::arch::pic::PIC_2_OFFSET;
 
 pub fn default_handler(stack_frame: InterruptStackFrame, index: u8, error_code: Option<u64>) {
     let cr2 = Cr2::read().map(|addr| addr.as_u64()).unwrap_or(u64::MAX);
@@ -65,8 +65,8 @@ fn is_user_mode(stack_frame: &InterruptStackFrame) -> bool {
 }
 
 pub extern "x86-interrupt" fn rtc_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    crate::rtc::on_interrupt();
-    crate::pic::send_eoi(RTC_INTERRUPT_VECTOR);
+    crate::arch::rtc::on_interrupt();
+    crate::arch::pic::send_eoi(RTC_INTERRUPT_VECTOR);
 }
 
 pub fn pic_interrupt_handler(
@@ -74,19 +74,19 @@ pub fn pic_interrupt_handler(
     index: u8,
     _error_code: Option<u64>,
 ) {
-    let irq = index.saturating_sub(crate::pic::PIC_1_OFFSET);
+    let irq = index.saturating_sub(crate::arch::pic::PIC_1_OFFSET);
     let _ = crate::driver::irq::dispatch_pic_irq(irq);
-    crate::pic::send_eoi(index);
+    crate::arch::pic::send_eoi(index);
 }
 
 pub extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
     crate::input::on_keyboard_interrupt();
     let _ = crate::driver::irq::dispatch_pic_irq(1);
-    crate::pic::send_eoi(KEYBOARD_INTERRUPT_VECTOR);
+    crate::arch::pic::send_eoi(KEYBOARD_INTERRUPT_VECTOR);
 }
 
 pub extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFrame) {
     crate::input::on_mouse_interrupt();
     let _ = crate::driver::irq::dispatch_pic_irq(12);
-    crate::pic::send_eoi(MOUSE_INTERRUPT_VECTOR);
+    crate::arch::pic::send_eoi(MOUSE_INTERRUPT_VECTOR);
 }

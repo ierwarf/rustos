@@ -52,7 +52,7 @@ pub(crate) fn getrandom(
         return Ok(0);
     }
 
-    let mut rng = crate::random::Random::new();
+    let mut rng = crate::util::random::Random::new();
     let mut copied = 0usize;
     let mut chunk = [0_u8; 256];
     while copied < len {

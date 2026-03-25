@@ -2,19 +2,5 @@ target/
 
 *.log
 
-/build/artifacts/
-/build/image/
-/build/EFI/
-/build/etc/
-/build/lib/
-/build/lib64/
-/build/linux/
-/build/BOOTFILES.TXT
-/build/startup.nsh
-/build/kernel.elf
-/build/prekernel.elf
-/build/UISERVER.ELF
-/build/UISERVER.EXE
-/build/PRINTFDEMO.ELF
-/build/USERDEMO.ELF
-/build/USERDEMO.EXE
+/build/
+.vscode/settings.json

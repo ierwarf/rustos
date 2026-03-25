@@ -3,10 +3,13 @@ use alloc::vec::Vec;
 use core::str;
 
 use spin::Mutex;
-use xmas_elf::ElfFile;
 
-use super::{ModuleLoadLayout, ModuleMemory};
+use super::loader::{
+    ModuleElf, ModuleLoadLayout, ModuleMemory, ModuleSectionHeader, add_signed_usize,
+    read_string_table_entry, section_header_entries, section_header_string_table,
+};
 
+const MAX_DISCOVERED_EXPORTS: usize = 8192;
 const RELATIVE_EXPORT_ENTRY_SIZE: usize = 12;
 const ABSOLUTE_EXPORT_ENTRY_SIZE: usize = 24;
 const EXPORT_SECTION_NAMES: [&str; 2] = ["__ksymtab", "__ksymtab_gpl"];
@@ -29,7 +32,7 @@ pub(super) fn resolve_symbol(name: &str) -> Option<usize> {
 
 pub(super) fn register_module_exports(
     module_name: &str,
-    elf: &ElfFile<'_>,
+    elf: &ModuleElf<'_>,
     memory: &ModuleMemory,
     layout: &ModuleLoadLayout,
 ) -> Result<usize, &'static str> {
@@ -42,6 +45,9 @@ pub(super) fn register_module_exports(
             memory,
             layout,
         )?);
+        if discovered.len() > MAX_DISCOVERED_EXPORTS {
+            return Err("module export count exceeds hard cap");
+        }
     }
 
     if discovered.is_empty() {
@@ -76,7 +82,7 @@ pub(super) fn register_module_exports(
 fn parse_export_section(
     module_name: &str,
     section_name: &str,
-    elf: &ElfFile<'_>,
+    elf: &ModuleElf<'_>,
     memory: &ModuleMemory,
     layout: &ModuleLoadLayout,
 ) -> Result<Vec<ModuleExportRecord>, &'static str> {
@@ -116,19 +122,19 @@ fn parse_export_section(
 
 fn loaded_section_view(
     expected_name: &str,
-    elf: &ElfFile<'_>,
+    elf: &ModuleElf<'_>,
     memory: &ModuleMemory,
     layout: &ModuleLoadLayout,
 ) -> Result<Option<(usize, usize, usize, *const u8)>, &'static str> {
-    let section_names = super::section_header_string_table(elf)?;
+    let section_names = section_header_string_table(elf)?;
 
-    for (section_index, section) in elf.section_iter().enumerate() {
+    for (section_index, section) in section_header_entries(elf)?.into_iter().enumerate() {
         if !section_name_matches(expected_name, section_names, &section)? {
             continue;
         }
 
         let section_size =
-            usize::try_from(section.size()).map_err(|_| "module export section too large")?;
+            usize::try_from(section.size).map_err(|_| "module export section too large")?;
         let Some(section_layout) = layout.sections.get(section_index).and_then(|entry| *entry)
         else {
             return Err("module export section is not loaded");
@@ -152,11 +158,11 @@ fn loaded_section_view(
 fn section_name_matches(
     expected_name: &str,
     section_names: &[u8],
-    section: &xmas_elf::sections::SectionHeader<'_>,
+    section: &ModuleSectionHeader,
 ) -> Result<bool, &'static str> {
-    let name = super::read_string_table_entry(
+    let name = read_string_table_entry(
         section_names,
-        section.name(),
+        section.name,
         "module section name offset is out of range",
         "module section name is not UTF-8",
     )?;
@@ -189,10 +195,9 @@ fn parse_relative_export_entries(
             .checked_add(8)
             .ok_or("module export namespace field address overflow")?;
 
-        let value_addr = super::add_signed_usize(value_field_runtime, value_rel as i64)?;
-        let name_addr = super::add_signed_usize(name_field_runtime, name_rel as i64)?;
-        let namespace_addr =
-            super::add_signed_usize(namespace_field_runtime, namespace_rel as i64)?;
+        let value_addr = add_signed_usize(value_field_runtime, value_rel as i64)?;
+        let name_addr = add_signed_usize(name_field_runtime, name_rel as i64)?;
+        let namespace_addr = add_signed_usize(namespace_field_runtime, namespace_rel as i64)?;
 
         let name = read_runtime_c_string(memory, name_addr)?;
         if !name.is_empty() {
@@ -252,7 +257,7 @@ fn read_runtime_c_string(
     let bytes = unsafe {
         core::slice::from_raw_parts(
             memory.host_base().add(offset).cast_const(),
-            memory.size - offset,
+            memory.size() - offset,
         )
     };
     let end = bytes
@@ -270,7 +275,7 @@ fn runtime_to_host_offset(
     let offset = runtime_addr
         .checked_sub(memory.runtime_base())
         .ok_or("module export address is outside the loaded image")?;
-    if offset >= memory.size {
+    if offset >= memory.size() {
         return Err("module export address is outside the loaded image");
     }
     Ok(offset)

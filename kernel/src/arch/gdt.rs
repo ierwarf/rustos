@@ -6,8 +6,8 @@ use x86_64::instructions::tables::load_tss;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
 use x86_64::structures::tss::TaskStateSegment;
 
-const KERNEL_PRIVILEGE_STACK_SIZE: usize = 64 * 1024;
-const DOUBLE_FAULT_STACK_SIZE: usize = 64 * 1024;
+const KERNEL_PRIVILEGE_STACK_SIZE: usize = 256 * 1024;
+const DOUBLE_FAULT_STACK_SIZE: usize = 128 * 1024;
 pub(crate) const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
 #[repr(align(16))]

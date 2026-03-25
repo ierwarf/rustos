@@ -69,7 +69,7 @@ pub(crate) fn request_threaded_irq(
         }
         slot.push(action);
         if (flags & IRQF_NO_AUTOEN) == 0 {
-            crate::pic::enable_irq(irq as u8);
+            crate::arch::pic::enable_irq(irq as u8);
         }
         0
     })
@@ -101,7 +101,7 @@ pub(crate) fn free_irq(irq: u32, dev_id: *mut c_void) -> *const c_void {
         };
         let removed = slot.remove(index);
         if slot.is_empty() {
-            crate::pic::disable_irq(irq as u8);
+            crate::arch::pic::disable_irq(irq as u8);
         }
         removed.dev_id as *const c_void
     })
@@ -111,14 +111,14 @@ pub(crate) fn enable_irq(irq: u32) {
     if irq as usize >= PIC_IRQ_COUNT {
         return;
     }
-    crate::pic::enable_irq(irq as u8);
+    crate::arch::pic::enable_irq(irq as u8);
 }
 
 pub(crate) fn disable_irq(irq: u32) {
     if irq as usize >= PIC_IRQ_COUNT {
         return;
     }
-    crate::pic::disable_irq(irq as u8);
+    crate::arch::pic::disable_irq(irq as u8);
 }
 
 pub(crate) fn wake_thread(irq: u32, dev_id: *mut c_void) {

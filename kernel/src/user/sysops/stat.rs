@@ -90,7 +90,8 @@ pub(crate) fn for_fd(fd: u64) -> Result<KernelStat, StatLookupError> {
 }
 
 pub(crate) fn for_absolute_path(absolute_path: &str) -> Result<KernelStat, StatLookupError> {
-    let metadata = vfs::metadata_for_current_process_path(absolute_path).map_err(map_vfs_error_to_stat)?;
+    let metadata =
+        vfs::metadata_for_current_process_path(absolute_path).map_err(map_vfs_error_to_stat)?;
     Ok(kernel_stat_from_vfs_metadata(metadata))
 }
 

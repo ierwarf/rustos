@@ -2,11 +2,12 @@ use boot_protocol::FramebufferInfo;
 use spin::Mutex;
 use x86_64::instructions::interrupts;
 
-use super::framebuffer::{build_framebuffer, Framebuffer, FramebufferRect};
 use super::GuiDisplayInfo;
-use crate::paging::{self, ProcessAddressSpace};
+use super::framebuffer::{Framebuffer, FramebufferRect, build_framebuffer};
+use crate::memory::paging::{self, ProcessAddressSpace};
 
 const HUGE_2MIB: u64 = 2 * 1024 * 1024;
+const ENABLE_FRAMEBUFFER_WRITE_COMBINE: bool = false;
 
 enum BackendInstance {
     Unavailable,
@@ -19,6 +20,7 @@ struct FramebufferDisplayBackend {
 
 pub(crate) struct DisplayBackend {
     instance: BackendInstance,
+    generation: u64,
 }
 
 static DISPLAY_BACKEND: Mutex<DisplayBackend> = Mutex::new(DisplayBackend::empty());
@@ -27,15 +29,15 @@ impl DisplayBackend {
     const fn empty() -> Self {
         Self {
             instance: BackendInstance::Unavailable,
+            generation: 0,
         }
     }
 
-    fn init_gop(&mut self, info: FramebufferInfo) {
-        self.install_framebuffer(info);
-    }
-
     fn install_framebuffer(&mut self, info: FramebufferInfo) {
-        mark_framebuffer_write_combine(info);
+        if ENABLE_FRAMEBUFFER_WRITE_COMBINE {
+            mark_framebuffer_write_combine(info);
+        }
+        self.generation = next_display_generation(self.generation);
         self.instance = BackendInstance::Framebuffer(FramebufferDisplayBackend {
             framebuffer: build_framebuffer(info),
         });
@@ -56,25 +58,21 @@ impl DisplayBackend {
                 height: backend.framebuffer.height() as u32,
                 stride_bytes: backend.framebuffer.stride_bytes() as u32,
                 bytes_per_pixel: backend.framebuffer.bytes_per_pixel() as u32,
+                generation: self.generation,
             }),
         }
     }
 }
 
-pub(crate) fn init_gop(info: FramebufferInfo) {
-    interrupts::without_interrupts(|| {
-        DISPLAY_BACKEND.lock().init_gop(info);
-    });
+fn next_display_generation(current: u64) -> u64 {
+    let next = current.wrapping_add(1);
+    if next == 0 { 1 } else { next }
 }
 
 pub(crate) fn install_driver_framebuffer(info: FramebufferInfo) {
     interrupts::without_interrupts(|| {
         DISPLAY_BACKEND.lock().install_framebuffer(info);
     });
-}
-
-pub(crate) fn with_framebuffer<R>(f: impl FnOnce(&mut Framebuffer) -> R) -> Option<R> {
-    interrupts::without_interrupts(|| DISPLAY_BACKEND.lock().with_framebuffer(f))
 }
 
 pub(crate) fn try_with_framebuffer<R>(f: impl FnOnce(&mut Framebuffer) -> R) -> Option<R> {
@@ -85,26 +83,7 @@ pub(crate) fn try_with_framebuffer<R>(f: impl FnOnce(&mut Framebuffer) -> R) -> 
 }
 
 pub(crate) fn display_info() -> Option<GuiDisplayInfo> {
-    interrupts::without_interrupts(|| DISPLAY_BACKEND.lock().display_info())
-}
-
-pub(crate) fn present_bgra8888(
-    width: usize,
-    height: usize,
-    stride_bytes: usize,
-    bytes: &[u8],
-) -> bool {
-    let Some(presented) = DISPLAY_BACKEND.lock().with_framebuffer(|framebuffer| {
-        if framebuffer.draw_bgra8888_frame(width, height, stride_bytes, bytes) {
-            framebuffer.present_scene();
-            return true;
-        }
-        false
-    }) else {
-        return false;
-    };
-
-    presented
+    DISPLAY_BACKEND.lock().display_info()
 }
 
 pub(crate) fn present_bgra8888_from_user(
@@ -123,9 +102,9 @@ pub(crate) fn present_bgra8888_from_user(
             stride_bytes,
         )?;
         if drawn {
-            framebuffer.present_scene();
+            return Ok(framebuffer.present_scene());
         }
-        Ok(drawn)
+        Ok(false)
     }) else {
         return Ok(false);
     };
@@ -151,9 +130,9 @@ pub(crate) fn present_bgra8888_rect_from_user(
             rect,
         )?;
         if drawn {
-            framebuffer.present_scene();
+            return Ok(framebuffer.present_scene());
         }
-        Ok(drawn)
+        Ok(false)
     }) else {
         return Ok(false);
     };
@@ -169,7 +148,7 @@ fn mark_framebuffer_write_combine(info: FramebufferInfo) {
     let start_block = info.addr / HUGE_2MIB;
     let end_block = end_addr / HUGE_2MIB;
 
-    use crate::paging::KERNEL_PML4;
+    use crate::memory::paging::KERNEL_PML4;
 
     interrupts::without_interrupts(|| {
         let mut pml4 = KERNEL_PML4.lock();

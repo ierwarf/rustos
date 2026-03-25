@@ -10,6 +10,7 @@ pub enum BootError {
     Graphics(Status),
     GraphicsMode(&'static str),
     BootInfoAlloc(Status),
+    BootMemoryMapAlloc(Status),
 }
 
 impl BootError {
@@ -20,7 +21,8 @@ impl BootError {
             | Self::CacheBootVolume(status)
             | Self::SegmentAlloc(status)
             | Self::Graphics(status)
-            | Self::BootInfoAlloc(status) => status,
+            | Self::BootInfoAlloc(status)
+            | Self::BootMemoryMapAlloc(status) => status,
             Self::InvalidElf(_) | Self::GraphicsMode(_) => Status::LOAD_ERROR,
         }
     }
@@ -35,6 +37,7 @@ impl BootError {
             Self::Graphics(_) => "graphics initialization failed",
             Self::GraphicsMode(_) => "unsupported graphics mode",
             Self::BootInfoAlloc(_) => "failed to allocate boot info",
+            Self::BootMemoryMapAlloc(_) => "failed to allocate boot memory map",
         }
     }
 }

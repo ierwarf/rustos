@@ -1,6 +1,6 @@
 use alloc::string::String;
 
-use crate::fat::{self, BootVolumeNodeKind};
+use crate::storage::fat::{self, BootVolumeNodeKind};
 use crate::user::handles::{VfsDirectoryHandle, VfsFileHandle};
 
 use super::{VfsBackend, VfsContext, VfsError, VfsMetadata, VfsNodeKind, VfsOpenResult};

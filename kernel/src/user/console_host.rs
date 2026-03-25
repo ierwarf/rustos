@@ -1,10 +1,10 @@
 use alloc::vec::Vec;
 
 use crate::debug;
-use crate::fat;
-use crate::process::{self, ProcessLaunchOptions, ProcessLoadError, SpawnedProcess};
-use crate::session::ConsoleSessionId;
+use crate::io::session::ConsoleSessionHandle;
+use crate::storage::fat;
 use crate::user::linux::LinuxProcessLaunch;
+use crate::user::process::{self, ProcessLaunchOptions, ProcessLoadError, SpawnedProcess};
 
 #[derive(Clone, Copy)]
 pub struct ExecutableImage {
@@ -70,7 +70,7 @@ pub enum ConsoleHostError {
         error: fatfs::Error<fat::DiskIoError>,
     },
     Spawn {
-        session: ConsoleSessionId,
+        session: ConsoleSessionHandle,
         error: ProcessLoadError,
     },
 }
@@ -104,7 +104,7 @@ impl ConsoleHostError {
 }
 
 pub fn spawn_program_in_session(
-    session: ConsoleSessionId,
+    session: ConsoleSessionHandle,
     program: ConsoleProgramSpec<'_>,
 ) -> Result<SpawnedProcess, ConsoleHostError> {
     let default_argv = [program.exec_path];

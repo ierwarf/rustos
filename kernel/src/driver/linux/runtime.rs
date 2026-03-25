@@ -15,6 +15,11 @@ static X86_HYPER_TYPE: i32 = 0;
 static IRQ_SPIN_LOCKS: Mutex<Vec<&'static CompatLockState>> = Mutex::new(Vec::new());
 static MUTEX_LOCKS: Mutex<Vec<&'static CompatLockState>> = Mutex::new(Vec::new());
 static IRQ_LOCK_OWNERS: Mutex<Vec<IrqOwnerState>> = Mutex::new(Vec::new());
+#[repr(C)]
+struct LinuxTimespec64 {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
 
 struct CompatLockState {
     key: usize,
@@ -63,6 +68,12 @@ pub(crate) unsafe extern "C" fn _raw_spin_lock_irq(lock: *mut c_void) {
     }
 }
 
+pub(crate) unsafe extern "C" fn _raw_spin_lock(lock: *mut c_void) {
+    let owner = current_lock_owner_token();
+    let state = compat_lock_state(&IRQ_SPIN_LOCKS, lock as usize);
+    acquire_compat_lock(state, owner);
+}
+
 pub(crate) unsafe extern "C" fn _raw_spin_unlock_irq(lock: *mut c_void) {
     let owner = current_lock_owner_token();
     let state = compat_lock_state(&IRQ_SPIN_LOCKS, lock as usize);
@@ -75,6 +86,35 @@ pub(crate) unsafe extern "C" fn _raw_spin_unlock_irq(lock: *mut c_void) {
     }
 }
 
+pub(crate) unsafe extern "C" fn _raw_spin_unlock(lock: *mut c_void) {
+    let owner = current_lock_owner_token();
+    let state = compat_lock_state(&IRQ_SPIN_LOCKS, lock as usize);
+    release_compat_lock(state, owner);
+}
+
+pub(crate) unsafe extern "C" fn _raw_spin_lock_irqsave(lock: *mut c_void) -> usize {
+    let flags = interrupts::are_enabled() as usize;
+    unsafe { _raw_spin_lock_irq(lock) };
+    flags
+}
+
+pub(crate) unsafe extern "C" fn _raw_spin_unlock_irqrestore(lock: *mut c_void, flags: usize) {
+    let owner = current_lock_owner_token();
+    let state = compat_lock_state(&IRQ_SPIN_LOCKS, lock as usize);
+    release_compat_lock(state, owner);
+
+    if unregister_irq_lock_owner(owner) && flags != 0 {
+        interrupts::enable();
+    }
+}
+
+pub(crate) unsafe extern "C" fn __mutex_init(
+    _lock: *mut c_void,
+    _name: *const c_char,
+    _key: *mut c_void,
+) {
+}
+
 pub(crate) unsafe extern "C" fn mutex_lock(lock: *mut c_void) {
     let owner = current_lock_owner_token();
     let state = compat_lock_state(&MUTEX_LOCKS, lock as usize);
@@ -82,6 +122,11 @@ pub(crate) unsafe extern "C" fn mutex_lock(lock: *mut c_void) {
 }
 
 pub(crate) unsafe extern "C" fn mutex_lock_interruptible(lock: *mut c_void) -> i32 {
+    unsafe { mutex_lock(lock) };
+    0
+}
+
+pub(crate) unsafe extern "C" fn mutex_lock_killable(lock: *mut c_void) -> i32 {
     unsafe { mutex_lock(lock) };
     0
 }
@@ -100,9 +145,37 @@ pub(crate) unsafe extern "C" fn usleep_range_state(
     let sleep_us = min_microseconds.max(max_microseconds);
     let sleep_ms = sleep_us.div_ceil(1000) as u64;
     if sleep_ms != 0 {
-        crate::rtc::sleep(sleep_ms);
+        crate::arch::rtc::sleep(sleep_ms);
         tick_jiffies(sleep_ms);
     }
+}
+
+pub(crate) unsafe extern "C" fn schedule() {
+    sync_jiffies_from_rtc();
+    service_compat_pending();
+}
+
+pub(crate) unsafe extern "C" fn schedule_timeout(timeout: i64) -> i64 {
+    if timeout > 0 {
+        let ticks = timeout as u64;
+        let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
+        let milliseconds = ticks.saturating_mul(1000).div_ceil(ticks_per_second);
+        if milliseconds != 0 {
+            crate::arch::rtc::sleep(milliseconds);
+        }
+        tick_jiffies(ticks);
+    } else {
+        sync_jiffies_from_rtc();
+    }
+    service_compat_pending();
+    0
+}
+
+pub(crate) unsafe extern "C" fn __msecs_to_jiffies(milliseconds: u32) -> u64 {
+    let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
+    (milliseconds as u64)
+        .saturating_mul(ticks_per_second)
+        .div_ceil(1000)
 }
 
 pub(crate) unsafe extern "C" fn _printk(fmt: *const c_char) -> i32 {
@@ -159,14 +232,43 @@ pub(crate) unsafe extern "C" fn vmware_tdx_hypercall() -> i64 {
     -38
 }
 
+pub(crate) unsafe extern "C" fn ktime_get_coarse_ts64(ts: *mut LinuxTimespec64) {
+    if ts.is_null() {
+        return;
+    }
+    let (seconds, nanoseconds) = monotonic_time_parts();
+    unsafe {
+        (*ts).tv_sec = seconds;
+        (*ts).tv_nsec = nanoseconds;
+    }
+}
+
+pub(crate) unsafe extern "C" fn ktime_get_mono_fast_ns() -> u64 {
+    let (seconds, nanoseconds) = monotonic_time_parts();
+    (seconds.max(0) as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(nanoseconds.max(0) as u64)
+}
+
+pub(crate) unsafe extern "C" fn refcount_warn_saturate(_ptr: *mut c_void, _type_: i32) {}
+
 pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
     match name {
+        "_raw_spin_lock" => Some(_raw_spin_lock as *const () as usize),
         "_raw_spin_lock_irq" => Some(_raw_spin_lock_irq as *const () as usize),
+        "_raw_spin_lock_irqsave" => Some(_raw_spin_lock_irqsave as *const () as usize),
+        "_raw_spin_unlock" => Some(_raw_spin_unlock as *const () as usize),
         "_raw_spin_unlock_irq" => Some(_raw_spin_unlock_irq as *const () as usize),
+        "_raw_spin_unlock_irqrestore" => Some(_raw_spin_unlock_irqrestore as *const () as usize),
+        "__mutex_init" => Some(__mutex_init as *const () as usize),
         "mutex_lock" => Some(mutex_lock as *const () as usize),
         "mutex_lock_interruptible" => Some(mutex_lock_interruptible as *const () as usize),
+        "mutex_lock_killable" => Some(mutex_lock_killable as *const () as usize),
         "mutex_unlock" => Some(mutex_unlock as *const () as usize),
         "usleep_range_state" => Some(usleep_range_state as *const () as usize),
+        "schedule" => Some(schedule as *const () as usize),
+        "schedule_timeout" => Some(schedule_timeout as *const () as usize),
+        "__msecs_to_jiffies" => Some(__msecs_to_jiffies as *const () as usize),
         "_printk" => Some(_printk as *const () as usize),
         "_dev_printk" => Some(_dev_printk as *const () as usize),
         "_dev_err" => Some(_dev_err as *const () as usize),
@@ -176,6 +278,9 @@ pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
         "__dynamic_dev_dbg" => Some(__dynamic_dev_dbg as *const () as usize),
         "snprintf" => Some(snprintf as *const () as usize),
         "sprintf" => Some(sprintf as *const () as usize),
+        "ktime_get_coarse_ts64" => Some(ktime_get_coarse_ts64 as *const () as usize),
+        "ktime_get_mono_fast_ns" => Some(ktime_get_mono_fast_ns as *const () as usize),
+        "refcount_warn_saturate" => Some(refcount_warn_saturate as *const () as usize),
         "jiffies" => Some(&JIFFIES as *const AtomicU64 as usize),
         "boot_cpu_data" => Some(&BOOT_CPU_DATA as *const [u8; 256] as usize),
         "x86_hyper_type" => Some(&X86_HYPER_TYPE as *const i32 as usize),
@@ -202,6 +307,20 @@ fn copy_format_string(dest: *mut c_char, size: usize, fmt: *const c_char) -> i32
         *dest.add(copy_len) = 0;
     }
     copy_len as i32
+}
+
+pub(crate) fn service_compat_pending() {
+    const MAX_SERVICE_PASSES: usize = 16;
+
+    for _ in 0..MAX_SERVICE_PASSES {
+        let usb_work = crate::usb::service_pending();
+        let serio_work = crate::driver::serio::service_pending();
+        let workqueue_work = crate::driver::linux::workqueue::service_pending();
+        let work = usb_work + serio_work + workqueue_work;
+        if work == 0 {
+            break;
+        }
+    }
 }
 
 fn write_cstr(fmt: *const c_char) {
@@ -237,6 +356,24 @@ fn current_lock_owner_token() -> usize {
     }
     let task = crate::multitask::current_user_id().unwrap_or(0) as usize;
     (task << 12) ^ (rsp & !0xfffusize)
+}
+
+fn monotonic_time_parts() -> (i64, i64) {
+    let ticks = crate::arch::rtc::ticks();
+    let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
+    let seconds = ticks / ticks_per_second;
+    let tick_remainder = ticks % ticks_per_second;
+    let nanoseconds =
+        ((tick_remainder as u128) * 1_000_000_000u128 / (ticks_per_second as u128)) as i64;
+    (seconds.min(i64::MAX as u64) as i64, nanoseconds)
+}
+
+fn sync_jiffies_from_rtc() {
+    let ticks = crate::arch::rtc::ticks();
+    let current = JIFFIES.load(Ordering::Acquire);
+    if ticks > current {
+        JIFFIES.store(ticks, Ordering::Release);
+    }
 }
 
 fn compat_lock_state(

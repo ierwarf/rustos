@@ -5,9 +5,7 @@ edition = "2024"
 
 [dependencies]
 boot-protocol = { path = "../bootloader/boot-protocol" }
+boot-random = { path = "../crates/boot-random" }
+boot-storage = { path = "../crates/boot-storage" }
 driver-abi = { path = "../driver-abi" }
-rustos-keyboard-driver = { path = "../drivers/input/keyboard" }
-bitflags = { version = "2.11", default-features = false }
-fatfs = { git = "https://github.com/rafalh/rust-fatfs", default-features = false, features = ["alloc", "lfn"] }
-spin = "0.10.0"
-x86_64 = { version = "0.15.4", default-features = false, features = ["instructions"] }
+keyboard-core = { path = "../crates/keyboard-core" }

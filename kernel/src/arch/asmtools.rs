@@ -26,7 +26,7 @@ pub unsafe fn enter_higher_half(entry: u64, boot_info_ptr: u64) -> ! {
             "jmp rax",
             in("rax") entry,
             in("rdi") boot_info_ptr,
-            in("rcx") crate::paging::KERNEL_VIRT_OFFSET,
+            in("rcx") crate::memory::paging::KERNEL_VIRT_OFFSET,
             options(noreturn),
         );
     }

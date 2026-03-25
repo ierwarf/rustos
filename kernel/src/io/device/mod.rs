@@ -8,7 +8,7 @@ use core::slice;
 
 use x86_64::VirtAddr;
 
-use crate::paging;
+use crate::memory::paging;
 use crate::user::abi::{console as console_abi, device as device_abi, runtime as runtime_abi};
 use crate::user::process_state::UserProcessState;
 
@@ -65,6 +65,7 @@ pub(crate) enum DeviceError {
     DisplayUnavailable,
     InvalidArgument,
     NotFound,
+    StaleSurface,
     Unsupported,
 }
 

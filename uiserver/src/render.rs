@@ -1,3 +1,4 @@
+use crate::app::{AppState, ConsoleWindow, DesktopSurfaceCache};
 use embedded_graphics::geometry::Point;
 use embedded_graphics::mono_font::{ascii::FONT_9X18_BOLD, MonoTextStyle};
 use embedded_graphics::pixelcolor::Rgb888;
@@ -5,7 +6,7 @@ use embedded_graphics::text::{Baseline, Text};
 use embedded_graphics::Drawable;
 
 use crate::canvas::{Rect, SurfaceCanvas};
-use crate::{AppState, ConsoleWindow, DesktopSurfaceCache};
+use crate::sys::ConsoleSessionHandle;
 
 const COLOR_BG_TOP: u32 = 0x0015_2038;
 const COLOR_BG_BOTTOM: u32 = 0x000b_101f;
@@ -137,7 +138,7 @@ pub(crate) fn render_frame(state: &mut AppState) {
     let stride_pixels = state.surface.stride_bytes as usize / 4;
     let cursor_x = state.cursor_x;
     let cursor_y = state.cursor_y;
-    let focused_session_index = state.focused_session_index;
+    let focused_session_handle = state.focused_session_handle;
     let desktop_cache = &state.desktop_cache;
     let console_windows = &mut state.console_windows;
     let pixels = state.frame.pixels_mut();
@@ -149,7 +150,7 @@ pub(crate) fn render_frame(state: &mut AppState) {
         height,
         cursor_x,
         cursor_y,
-        focused_session_index,
+        focused_session_handle,
         desktop_cache,
         console_windows,
     );
@@ -167,7 +168,7 @@ pub(crate) fn render_rect(state: &mut AppState, rect: Rect) {
     let stride_pixels = state.surface.stride_bytes as usize / 4;
     let cursor_x = state.cursor_x;
     let cursor_y = state.cursor_y;
-    let focused_session_index = state.focused_session_index;
+    let focused_session_handle = state.focused_session_handle;
     let desktop_cache = &state.desktop_cache;
     let console_windows = &mut state.console_windows;
     let pixels = state.frame.pixels_mut();
@@ -179,54 +180,10 @@ pub(crate) fn render_rect(state: &mut AppState, rect: Rect) {
         height,
         cursor_x,
         cursor_y,
-        focused_session_index,
+        focused_session_handle,
         desktop_cache,
         console_windows,
     );
-}
-
-pub(crate) fn render_cursor_only(state: &mut AppState, previous_rect: Rect, current_rect: Rect) {
-    refresh_desktop_surface(state);
-
-    let width = state.surface.width;
-    let height = state.surface.height;
-    let stride_pixels = state.surface.stride_bytes as usize / 4;
-    let cursor_x = state.cursor_x;
-    let cursor_y = state.cursor_y;
-    let focused_session_index = state.focused_session_index;
-    let desktop_cache = &state.desktop_cache;
-    let console_windows = &mut state.console_windows;
-    let pixels = state.frame.pixels_mut();
-
-    if !previous_rect.is_empty() {
-        let mut canvas =
-            SurfaceCanvas::with_clip(pixels, width, height, stride_pixels, previous_rect);
-        render_scene(
-            &mut canvas,
-            width,
-            height,
-            cursor_x,
-            cursor_y,
-            focused_session_index,
-            desktop_cache,
-            console_windows,
-        );
-    }
-
-    if current_rect != previous_rect && !current_rect.is_empty() {
-        let mut canvas =
-            SurfaceCanvas::with_clip(pixels, width, height, stride_pixels, current_rect);
-        render_scene(
-            &mut canvas,
-            width,
-            height,
-            cursor_x,
-            cursor_y,
-            focused_session_index,
-            desktop_cache,
-            console_windows,
-        );
-    }
 }
 
 fn render_scene(
@@ -235,7 +192,7 @@ fn render_scene(
     height: u32,
     cursor_x: u32,
     cursor_y: u32,
-    focused_session_index: u32,
+    focused_session_handle: ConsoleSessionHandle,
     desktop_cache: &DesktopSurfaceCache,
     console_windows: &mut [ConsoleWindow],
 ) {
@@ -249,7 +206,7 @@ fn render_scene(
     );
 
     for (index, window) in console_windows.iter_mut().enumerate() {
-        let focused = window.session_index == focused_session_index;
+        let focused = window.session_handle == focused_session_handle;
         draw_console_window(canvas, window, focused);
         draw_taskbar_slot(
             canvas,
@@ -286,11 +243,7 @@ fn draw_launcher_button(canvas: &mut SurfaceCanvas<'_>, rect: Rect, title: &str)
     );
 }
 
-fn draw_console_window(
-    canvas: &mut SurfaceCanvas<'_>,
-    window: &mut crate::ConsoleWindow,
-    focused: bool,
-) {
+fn draw_console_window(canvas: &mut SurfaceCanvas<'_>, window: &mut ConsoleWindow, focused: bool) {
     refresh_window_surface(window, focused);
     canvas.draw_surface(
         &window.surface_cache.pixels,
@@ -336,7 +289,8 @@ fn refresh_desktop_surface(state: &mut AppState) {
     if resized {
         state.desktop_cache.width = width;
         state.desktop_cache.height = height;
-        state.desktop_cache
+        state
+            .desktop_cache
             .pixels
             .resize(width.saturating_mul(height), 0);
         state.desktop_cache.valid = false;
@@ -396,7 +350,10 @@ fn refresh_window_surface(window: &mut ConsoleWindow, focused: bool) {
     if resized {
         window.surface_cache.width = width;
         window.surface_cache.height = height;
-        window.surface_cache.pixels.resize(width.saturating_mul(height), 0);
+        window
+            .surface_cache
+            .pixels
+            .resize(width.saturating_mul(height), 0);
         window.surface_cache.valid = false;
     }
 
@@ -415,7 +372,9 @@ fn refresh_window_surface(window: &mut ConsoleWindow, focused: bool) {
     let terminal_needs_rebuild =
         window.terminal_dirty || window.terminal.needs_layout_rebuild(client_rect);
 
-    if window.surface_cache.valid && window.surface_cache.focused == focused && !terminal_needs_rebuild
+    if window.surface_cache.valid
+        && window.surface_cache.focused == focused
+        && !terminal_needs_rebuild
     {
         window.terminal.set_client_rect(client_rect);
         window.terminal.set_focused(focused);

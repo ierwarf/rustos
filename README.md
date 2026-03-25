@@ -1,97 +1,81 @@
-# 📖 개요
+# RustOS
 
-- [📖 개요](#-개요)
-- [🗂 소스 구조](#-소스-구조)
-- [📦 패키지 설치](#-패키지-설치)
-- [🛠 Visual Studio code](#-visual-studio-code)
-  - [빌드 및 실행](#빌드-및-실행)
-  - [디버그](#디버그)
-- [🖥 터미널](#-터미널)
-  - [빌드 및 실행](#빌드-및-실행-1)
-  - [빌드 삭제](#빌드-삭제)
+## 개요
 
-</details>
+현재 기본 개발 흐름은 `cargo xtask build` / `cargo xtask run` 과 VS Code launch 구성을 기준으로 맞춰져 있습니다. 부팅 볼륨의 기준 디렉터리는 `build/image` 이고, 실제 UEFI 기본 엔트리는 `build/image/EFI/BOOT/BOOTX64.EFI` 입니다.
 
-<br>
+## 디렉터리 역할
 
-# 🗂 소스 구조
+- `assets/image/`: staged 부팅 이미지에 그대로 덮어쓸 정적 overlay
+- `bootloader/`: UEFI 부트로더와 boot protocol
+- `crates/`: boot chain, keyboard core, driver module runtime 같은 공용 crate
+- `docs/`: 구조 문서와 README 이미지 자산
+- `drivers/`: first-party `.ko` 드라이버 소스
+- `kernel/`: 커널 본체
+- `module-tests/`: 공용 crate와 모듈 ABI를 검증하는 통합 테스트
+- `prekernel/`: `kernel.elf` 적재와 초기 KASLR 적용
+- `uiserver/`: userspace UI 서버
+- `vendor/`: git 에 유지하는 외부 바이너리 자산과 prebuilt `.ko`, OVMF
+- `build/artifacts/`: 컴파일 산출물 보관소
+- `build/image/`: 실제 부팅 볼륨 루트
+- `build/logs/`: QEMU interrupt/debug 로그
 
-- `bootloader/src/boot/`: UEFI 부트 체인, ELF 적재, 부트 정보, 오류 처리
-- `bootloader/src/platform/`: UEFI 디버그 출력, GOP 초기화, RNG 시드
-- `bootloader/src/runtime/`: panic/alloc 같은 런타임 핸들러
-- `prekernel/src/load/`: `kernel.elf` 적재
-- `prekernel/src/runtime/`: prekernel 디버그/힙 초기화
-- `kernel/src/arch/`: GDT, IDT, PIC/PIT/RTC, 저수준 asm 진입점
-- `kernel/src/input/`: 키보드 드라이버
-- `kernel/src/io/`: GUI 콘솔, TTY, 콘솔 출력 계층
-- `kernel/src/memory/`: 힙과 가상 메모리
-- `kernel/src/storage/`: FAT 부트 볼륨 접근
-- `kernel/src/user/`: 데모 실행, ELF/PE 프로세스 로드, syscall/Win32 shim
-- `kernel/src/util/`: 랜덤, 링 버퍼 같은 범용 유틸리티
-- `kernel/src/debug/`, `kernel/src/multitask/`: 디버그 및 스케줄러는 별도 디렉터리 유지
+추가 구조 설명은 [`docs/structure.md`](docs/structure.md) 에 정리돼 있습니다.
 
-# 📦 패키지 설치
+## 준비
 
 ```bash
 sudo apt update
-
-sudo apt install -y rustup
+sudo apt install -y rustup gcc nasm qemu-system-x86 ovmf
 
 rustup default nightly
 rustup component add rust-src llvm-tools-preview
 rustup target add x86_64-unknown-uefi
-
-sudo apt install -y make qemu-system-x86 ovmf
 ```
 
-# 🛠 Visual Studio code
+## VS Code
 
-## 빌드 및 실행
+공용 launch 는 `QEMU`, `KVM`, `G14` 세 가지입니다.
 
-<img src="readme/openfolder.png" alt="demo" width="300" />
+- `QEMU`: 실행 전 `Build OS (QEMU)`를 돌리고, `opt-level=0` 빌드 후 QEMU를 실행합니다.
+- `KVM`, `G14`: 기본 release 최적화 빌드를 사용합니다.
+- QEMU interrupt 로그는 기본적으로 `build/logs/qemu_interrupt.log` 에 남깁니다.
 
-여기에서 프로젝트 폴더를 열어주세요.
+<img src="docs/assets/openfolder.png" alt="open folder" width="300" />
 
-<img src="readme/run.png" alt="demo" width="300" />
+<img src="docs/assets/run.png" alt="run" width="300" />
 
-버튼을 눌러 실행하시면 자동으로 빌드 및 실행이 이루어집니다.
-
-## 디버그
-
-반드시 실행 시 ```QEMU (Debug)``` 로 하셔야 합니다.
-
-디버그 방법은 기본적으로 응용프로그램과 동일하며, 소스코드 좌측의 중단점을 기반으로 작동합니다.
-
-<img src="readme/debug.png" alt="demo" width="430" />
-
-<br>
-
-# 🖥 터미널
-
-터미널에서 개발하는 것은 가급적 권장하지 않습니다.
-
-그래도 필요하다면 아래의 절차를 밟아주세요.
-
-## 빌드 및 실행
-
-프로젝트 루트에서 아래 명령을 실행하세요.
+## 터미널
 
 ```bash
-make build
-./run.sh
+cargo xtask build
+cargo xtask run
 ```
 
-run.sh 는 기본적으로 빌드를 포함하고 있지 않습니다.
-make build 를 반드시 함께 실행하세요.
-실행 시에는 `build/` 를 `/tmp` 임시 디렉터리로 복제한 뒤 그 복제본을 vvfat 디스크로 사용합니다.
-QEMU/UEFI, 특히 KVM 경로에서 `build/` 를 vvfat 로 직접 물리면 호스트의 `kernel.elf`,
-`BOOTX64.EFI`, `startup.nsh`, `NvVars` 같은 빌드 산물의 timestamp/metadata 가 오염됩니다.
-임시 복제본을 쓰는 이유는 호스트 `build/` 를 그대로 보존하기 위해서입니다.
+`cargo xtask run` 은 staged image를 자동으로 새로 만들지 않으므로, 보통 `cargo xtask build` 다음에 실행합니다.
 
-## 빌드 삭제
+유용한 명령:
 
-빌드의 산물을 삭제하려면 아래 명령을 실행하세요.
+- `cargo xtask check`
+- `cargo xtask stage`
+- `cargo xtask clean`
+- `cargo test -p module-tests`
 
-```bash
-make clean
-```
+## 자산 배치 규칙
+
+- first-party 드라이버 소스는 `drivers/...` 에 둡니다.
+- third-party 또는 prebuilt `.ko`, firmware, OVMF 는 `vendor/...` 에 둡니다.
+- staged image에 정적으로 포함할 overlay 파일만 `assets/image/...` 에 둡니다.
+- `assets/image` 아래 경로는 boot volume 내부 경로와 동일해야 합니다.
+
+예시:
+
+- `vendor/modules/input/usbhid.ko` -> stage 시 `system/drivers/input/usbhid.ko`
+- `vendor/ovmf/OVMF.fd` -> QEMU firmware
+- `assets/image/system/config/foo.txt` -> `build/image/system/config/foo.txt`
+
+## 로그와 산출물
+
+- build 산출물은 `build/` 아래만 사용합니다.
+- QEMU debugcon 로그는 필요 시 `build/logs/debugcon.log` 에 기록됩니다.
+- repo 루트에는 실행 로그나 firmware 바이너리를 직접 두지 않습니다.

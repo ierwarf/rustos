@@ -3,7 +3,6 @@ use alloc::vec::Vec;
 use core::ffi::{c_char, c_void};
 use core::ptr;
 use core::slice;
-
 #[repr(C)]
 struct LinuxKernelParamOps {
     flags: u32,
@@ -17,6 +16,7 @@ struct CompatAllocHeader {
     base: *mut u8,
     total_size: usize,
     layout_align: usize,
+    requested_size: usize,
 }
 
 static KMALLOC_CACHES: [usize; 1] = [0];
@@ -39,6 +39,20 @@ static PARAM_OPS_UINT: LinuxKernelParamOps = LinuxKernelParamOps {
     get: 0,
     free: 0,
 };
+static PARAM_OPS_CHARP: LinuxKernelParamOps = LinuxKernelParamOps {
+    flags: 0,
+    set: 0,
+    get: 0,
+    free: 0,
+};
+static PARAM_ARRAY_OPS: LinuxKernelParamOps = LinuxKernelParamOps {
+    flags: 0,
+    set: 0,
+    get: 0,
+    free: 0,
+};
+const ZERO_SIZE_PTR: usize = 16;
+const __GFP_ZERO: u32 = 1 << 8;
 
 pub(crate) unsafe extern "C" fn strlen(s: *const c_char) -> usize {
     c_strlen(s)
@@ -126,7 +140,7 @@ pub(crate) unsafe extern "C" fn simple_strtoul(
 }
 
 pub(crate) unsafe extern "C" fn kfree(ptr: *const c_void) {
-    if ptr.is_null() {
+    if zero_or_null_ptr(ptr) {
         return;
     }
 
@@ -148,10 +162,26 @@ pub(crate) unsafe extern "C" fn kfree(ptr: *const c_void) {
 
 pub(crate) unsafe extern "C" fn __kmalloc_cache_noprof(
     _cache: *const c_void,
+    gfp: u32,
     size: usize,
-    _gfp: u32,
 ) -> *mut c_void {
-    allocate_bytes(size, core::mem::align_of::<usize>()) as *mut c_void
+    allocate_bytes_with_flags(size, core::mem::align_of::<usize>(), gfp) as *mut c_void
+}
+
+pub(crate) unsafe extern "C" fn __kmalloc_noprof(size: usize, gfp: u32) -> *mut c_void {
+    allocate_bytes_with_flags(size, core::mem::align_of::<usize>(), gfp) as *mut c_void
+}
+
+pub(crate) unsafe extern "C" fn __kmalloc_large_noprof(size: usize, gfp: u32) -> *mut c_void {
+    unsafe { __kmalloc_noprof(size, gfp) }
+}
+
+pub(crate) unsafe extern "C" fn __kvmalloc_node_noprof(
+    size: usize,
+    gfp: u32,
+    _node: i32,
+) -> *mut c_void {
+    allocate_bytes_with_flags(size, core::mem::align_of::<usize>(), gfp) as *mut c_void
 }
 
 pub(crate) unsafe extern "C" fn kmemdup_noprof(
@@ -232,20 +262,231 @@ pub(crate) unsafe extern "C" fn kstrtobool(s: *const c_char, out: *mut bool) -> 
     0
 }
 
+pub(crate) unsafe extern "C" fn krealloc_noprof(
+    ptr: *const c_void,
+    new_size: usize,
+    _gfp: u32,
+) -> *mut c_void {
+    if zero_or_null_ptr(ptr) {
+        return allocate_bytes(new_size, core::mem::align_of::<usize>()) as *mut c_void;
+    }
+
+    let old_size = allocation_requested_size(ptr).unwrap_or(0);
+    let new_ptr = allocate_bytes(new_size, core::mem::align_of::<usize>());
+    if new_ptr.is_null() {
+        return ptr::null_mut();
+    }
+    let copy_len = core::cmp::min(old_size, new_size);
+    if copy_len != 0 {
+        unsafe {
+            ptr::copy_nonoverlapping(ptr.cast::<u8>(), new_ptr, copy_len);
+        }
+    }
+    unsafe { kfree(ptr) };
+    new_ptr.cast()
+}
+
+pub(crate) unsafe extern "C" fn kvfree(ptr: *const c_void) {
+    unsafe { kfree(ptr) };
+}
+
+pub(crate) unsafe extern "C" fn vzalloc_noprof(size: usize) -> *mut c_void {
+    let ptr = allocate_bytes(size, core::mem::align_of::<usize>());
+    if ptr.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe {
+        ptr::write_bytes(ptr, 0, size);
+    }
+    ptr.cast()
+}
+
+pub(crate) unsafe extern "C" fn vfree(ptr: *const c_void) {
+    unsafe { kfree(ptr) };
+}
+
+pub(crate) unsafe extern "C" fn memcpy(
+    dest: *mut c_void,
+    src: *const c_void,
+    len: usize,
+) -> *mut c_void {
+    if dest.is_null() || src.is_null() || len == 0 {
+        return dest;
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(src.cast::<u8>(), dest.cast::<u8>(), len);
+    }
+    dest
+}
+
+pub(crate) unsafe extern "C" fn memset(dest: *mut c_void, value: i32, len: usize) -> *mut c_void {
+    if dest.is_null() || len == 0 {
+        return dest;
+    }
+    unsafe {
+        ptr::write_bytes(dest.cast::<u8>(), value as u8, len);
+    }
+    dest
+}
+
+pub(crate) unsafe extern "C" fn memcmp(lhs: *const c_void, rhs: *const c_void, len: usize) -> i32 {
+    if lhs.is_null() || rhs.is_null() || len == 0 {
+        return 0;
+    }
+    let lhs = unsafe { slice::from_raw_parts(lhs.cast::<u8>(), len) };
+    let rhs = unsafe { slice::from_raw_parts(rhs.cast::<u8>(), len) };
+    for (left, right) in lhs.iter().zip(rhs.iter()) {
+        if left != right {
+            return (*left as i32) - (*right as i32);
+        }
+    }
+    0
+}
+
+pub(crate) unsafe extern "C" fn strnlen(s: *const c_char, max_len: usize) -> usize {
+    c_strlen_bounded(s, max_len)
+}
+
+pub(crate) unsafe extern "C" fn strrchr(s: *const c_char, ch: i32) -> *mut c_char {
+    if s.is_null() {
+        return ptr::null_mut();
+    }
+    let target = ch as u8;
+    let mut last = ptr::null_mut();
+    let mut cursor = s;
+    loop {
+        let byte = unsafe { *cursor as u8 };
+        if byte == target {
+            last = cursor as *mut c_char;
+        }
+        if byte == 0 {
+            break;
+        }
+        cursor = unsafe { cursor.add(1) };
+    }
+    last
+}
+
+pub(crate) unsafe extern "C" fn sscanf(_buffer: *const c_char, _format: *const c_char) -> i32 {
+    0
+}
+
+pub(crate) unsafe extern "C" fn memdup_user(src: *const c_void, len: usize) -> *mut c_void {
+    let dest = allocate_bytes(len, 1);
+    if dest.is_null() {
+        return ptr::null_mut();
+    }
+    if !src.is_null() && len != 0 {
+        unsafe {
+            ptr::copy_nonoverlapping(src.cast::<u8>(), dest, len);
+        }
+    }
+    dest.cast()
+}
+
+pub(crate) unsafe extern "C" fn __get_user_4(out: *mut u32, src: *const u32) -> i32 {
+    if out.is_null() || src.is_null() {
+        return -14;
+    }
+    unsafe {
+        *out = src.read_unaligned();
+    }
+    0
+}
+
+pub(crate) unsafe extern "C" fn __put_user_4(value: u32, dst: *mut u32) -> i32 {
+    if dst.is_null() {
+        return -14;
+    }
+    unsafe {
+        dst.write_unaligned(value);
+    }
+    0
+}
+
+pub(crate) unsafe extern "C" fn __copy_overflow(_size: usize, _count: usize) -> ! {
+    panic!("linux compat module triggered __copy_overflow");
+}
+
+pub(crate) unsafe extern "C" fn sized_strscpy(
+    dest: *mut c_char,
+    src: *const c_char,
+    count: usize,
+) -> isize {
+    if dest.is_null() || count == 0 {
+        return -22;
+    }
+    let Some(bytes) = trimmed_cstr_bytes(src) else {
+        unsafe {
+            *dest = 0;
+        }
+        return -22;
+    };
+    if bytes.len() >= count {
+        let copy_len = count.saturating_sub(1);
+        unsafe {
+            ptr::copy_nonoverlapping(bytes.as_ptr(), dest.cast::<u8>(), copy_len);
+            *dest.add(copy_len) = 0;
+        }
+        return -7;
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(bytes.as_ptr(), dest.cast::<u8>(), bytes.len());
+        *dest.add(bytes.len()) = 0;
+    }
+    bytes.len() as isize
+}
+
+pub(crate) unsafe extern "C" fn _find_next_zero_bit(
+    addr: *const usize,
+    size: usize,
+    offset: usize,
+) -> usize {
+    if addr.is_null() || offset >= size {
+        return size;
+    }
+    let bits_per_word = usize::BITS as usize;
+    let words = size.div_ceil(bits_per_word);
+    let slice = unsafe { slice::from_raw_parts(addr, words) };
+    let mut bit = offset;
+    while bit < size {
+        let word = slice[bit / bits_per_word];
+        if (word & (1usize << (bit % bits_per_word))) == 0 {
+            return bit;
+        }
+        bit += 1;
+    }
+    size
+}
+
 pub(crate) unsafe extern "C" fn msleep(milliseconds: u32) {
-    crate::rtc::sleep(milliseconds as u64);
+    const SERVICE_QUANTUM_MS: u64 = 10;
+
+    let mut remaining = milliseconds as u64;
+    while remaining != 0 {
+        let slice = remaining.min(SERVICE_QUANTUM_MS);
+        if crate::arch::rtc::is_initialized() {
+            crate::arch::rtc::sleep(slice);
+        } else {
+            for _ in 0..(slice * 10_000) {
+                core::hint::spin_loop();
+            }
+        }
+        crate::driver::linux::runtime::service_compat_pending();
+        remaining -= slice;
+    }
 }
 
 pub(crate) unsafe extern "C" fn virt_to_phys(addr: *const c_void) -> u64 {
     if addr.is_null() {
         0
     } else {
-        crate::paging::kernel_virtual_to_physical_addr(addr as u64)
+        crate::memory::paging::kernel_virtual_to_physical_addr(addr as u64)
     }
 }
 
 pub(crate) unsafe extern "C" fn phys_to_virt(addr: u64) -> *mut c_void {
-    crate::paging::higher_half_addr(addr) as *mut c_void
+    crate::memory::paging::higher_half_addr(addr) as *mut c_void
 }
 
 pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
@@ -258,9 +499,28 @@ pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
         "simple_strtoul" => Some(simple_strtoul as *const () as usize),
         "kfree" => Some(kfree as *const () as usize),
         "__kmalloc_cache_noprof" => Some(__kmalloc_cache_noprof as *const () as usize),
+        "__kmalloc_noprof" => Some(__kmalloc_noprof as *const () as usize),
+        "__kmalloc_large_noprof" => Some(__kmalloc_large_noprof as *const () as usize),
+        "__kvmalloc_node_noprof" => Some(__kvmalloc_node_noprof as *const () as usize),
         "kmalloc_caches" => Some(&KMALLOC_CACHES as *const [usize; 1] as usize),
         "random_kmalloc_seed" => Some(&RANDOM_KMALLOC_SEED as *const u64 as usize),
         "kmemdup_noprof" => Some(kmemdup_noprof as *const () as usize),
+        "krealloc_noprof" => Some(krealloc_noprof as *const () as usize),
+        "kvfree" => Some(kvfree as *const () as usize),
+        "vzalloc_noprof" => Some(vzalloc_noprof as *const () as usize),
+        "vfree" => Some(vfree as *const () as usize),
+        "memcpy" => Some(memcpy as *const () as usize),
+        "memset" => Some(memset as *const () as usize),
+        "memcmp" => Some(memcmp as *const () as usize),
+        "strnlen" => Some(strnlen as *const () as usize),
+        "strrchr" => Some(strrchr as *const () as usize),
+        "sscanf" => Some(sscanf as *const () as usize),
+        "memdup_user" => Some(memdup_user as *const () as usize),
+        "__get_user_4" => Some(__get_user_4 as *const () as usize),
+        "__put_user_4" => Some(__put_user_4 as *const () as usize),
+        "__copy_overflow" => Some(__copy_overflow as *const () as usize),
+        "sized_strscpy" => Some(sized_strscpy as *const () as usize),
+        "_find_next_zero_bit" => Some(_find_next_zero_bit as *const () as usize),
         "kstrndup" => Some(kstrndup as *const () as usize),
         "kstrtou8" => Some(kstrtou8 as *const () as usize),
         "kstrtouint" => Some(kstrtouint as *const () as usize),
@@ -268,6 +528,8 @@ pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
         "param_ops_bool" => Some(&PARAM_OPS_BOOL as *const LinuxKernelParamOps as usize),
         "param_ops_int" => Some(&PARAM_OPS_INT as *const LinuxKernelParamOps as usize),
         "param_ops_uint" => Some(&PARAM_OPS_UINT as *const LinuxKernelParamOps as usize),
+        "param_ops_charp" => Some(&PARAM_OPS_CHARP as *const LinuxKernelParamOps as usize),
+        "param_array_ops" => Some(&PARAM_ARRAY_OPS as *const LinuxKernelParamOps as usize),
         "msleep" => Some(msleep as *const () as usize),
         "virt_to_phys" => Some(virt_to_phys as *const () as usize),
         "phys_to_virt" => Some(phys_to_virt as *const () as usize),
@@ -305,9 +567,34 @@ fn allocate_bytes(size: usize, align: usize) -> *mut u8 {
             base,
             total_size,
             layout_align,
+            requested_size: size,
         });
     }
     user_start as *mut u8
+}
+
+fn allocate_bytes_with_flags(size: usize, align: usize, gfp: u32) -> *mut u8 {
+    let ptr = allocate_bytes(size, align);
+    if ptr.is_null() {
+        return ptr;
+    }
+    if (gfp & __GFP_ZERO) != 0 {
+        unsafe {
+            ptr::write_bytes(ptr, 0, size.max(1));
+        }
+    }
+    ptr
+}
+
+fn allocation_requested_size(ptr: *const c_void) -> Option<usize> {
+    if zero_or_null_ptr(ptr) {
+        return None;
+    }
+    let user_ptr = ptr.cast::<u8>();
+    let header = unsafe {
+        user_ptr.sub(core::mem::size_of::<CompatAllocHeader>()) as *const CompatAllocHeader
+    };
+    Some(unsafe { (*header).requested_size })
 }
 
 fn align_up(value: usize, align: usize) -> usize {
@@ -316,6 +603,10 @@ fn align_up(value: usize, align: usize) -> usize {
     }
     let mask = align - 1;
     (value + mask) & !mask
+}
+
+fn zero_or_null_ptr(ptr: *const c_void) -> bool {
+    (ptr as usize) <= ZERO_SIZE_PTR
 }
 
 fn c_strlen(s: *const c_char) -> usize {

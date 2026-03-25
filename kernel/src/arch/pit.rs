@@ -54,7 +54,7 @@ pub fn start_micros(pit_number: u8, microseconds: u64) {
     program(pit_number, divisor);
 
     if pit_number == 0 {
-        crate::pic::enable_irq(0);
+        crate::arch::pic::enable_irq(0);
     }
 }
 

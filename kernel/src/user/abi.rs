@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserAbi {
     Linux,
@@ -20,6 +22,7 @@ pub mod ui {
     pub const INPUT_KIND_POINTER_MOTION: u16 = 2;
     pub const INPUT_KIND_POINTER_BUTTON: u16 = 3;
     pub const INPUT_KIND_POINTER_SCROLL: u16 = 4;
+    pub const INPUT_KIND_POINTER_POSITION: u16 = 5;
 
     pub const INPUT_ACTION_NONE: u16 = 0;
     pub const INPUT_ACTION_PRESSED: u16 = 1;
@@ -79,7 +82,7 @@ pub mod runtime {
     pub const RUNTIME_IOCTL_REQUEST_TERMINATE: u64 = 0x5254_0005;
 
     pub const LAUNCH_TARGET_SESSION: u16 = 1;
-    pub const LAUNCH_TARGET_FIRST_AVAILABLE: u16 = 2;
+    pub const LAUNCH_TARGET_NEW_SESSION: u16 = 2;
     pub const LAUNCH_TARGET_ALL_SESSIONS: u16 = 3;
 
     pub const TERMINATE_TARGET_SESSION: u16 = 1;
@@ -127,7 +130,8 @@ pub mod runtime {
     pub struct RuntimeRunningProgramInfo {
         pub pid: u64,
         pub program_id: u32,
-        pub session_index: u32,
+        pub reserved: u32,
+        pub session_handle: u64,
         pub display_name: [u8; RUNNING_PROGRAM_NAME_CAPACITY],
     }
 
@@ -136,7 +140,8 @@ pub mod runtime {
             Self {
                 pid: 0,
                 program_id: 0,
-                session_index: 0,
+                reserved: 0,
+                session_handle: 0,
                 display_name: [0; RUNNING_PROGRAM_NAME_CAPACITY],
             }
         }
@@ -192,27 +197,65 @@ pub mod runtime {
 
 pub mod console {
     pub const CONSOLE_PATH: &str = "/dev/console0";
-    pub const CONSOLE_SESSION_CAPACITY: usize = 8;
+    pub const MAX_CONSOLE_SESSIONS: usize = 32;
+    pub const CONSOLE_SESSION_TITLE_CAPACITY: usize = 48;
 
     pub const CONSOLE_IOCTL_GET_STATE: u64 = 0x434f_0001;
     pub const CONSOLE_IOCTL_SNAPSHOT_SESSION_OUTPUT: u64 = 0x434f_0002;
     pub const CONSOLE_IOCTL_SET_FOCUS: u64 = 0x434f_0003;
     pub const CONSOLE_IOCTL_SEND_INPUT_EVENT: u64 = 0x434f_0004;
+    pub const CONSOLE_IOCTL_SNAPSHOT_SESSIONS: u64 = 0x434f_0005;
+
+    pub const CONSOLE_SESSION_STATE_QUEUED: u16 = 1;
+    pub const CONSOLE_SESSION_STATE_LOADING_IMAGE: u16 = 2;
+    pub const CONSOLE_SESSION_STATE_SPAWNING: u16 = 3;
+    pub const CONSOLE_SESSION_STATE_RUNNING: u16 = 4;
+    pub const CONSOLE_SESSION_STATE_CLOSING: u16 = 5;
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default)]
     pub struct ConsoleStateInfo {
-        pub active_session_mask: u64,
-        pub focused_session_index: u32,
+        pub focused_session_handle: u64,
+        pub session_count: u32,
         pub reserved: u32,
-        pub output_generations: [u64; CONSOLE_SESSION_CAPACITY],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug)]
+    pub struct ConsoleSessionInfo {
+        pub session_handle: u64,
+        pub state: u16,
+        pub focused: u16,
+        pub reserved: u32,
+        pub output_generation: u64,
+        pub title: [u8; CONSOLE_SESSION_TITLE_CAPACITY],
+    }
+
+    impl Default for ConsoleSessionInfo {
+        fn default() -> Self {
+            Self {
+                session_handle: 0,
+                state: 0,
+                focused: 0,
+                reserved: 0,
+                output_generation: 0,
+                title: [0; CONSOLE_SESSION_TITLE_CAPACITY],
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct ConsoleSnapshotSessionsRequest {
+        pub sessions_ptr: u64,
+        pub capacity: u64,
+        pub count: u64,
     }
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default)]
     pub struct ConsoleSnapshotSessionOutputRequest {
-        pub session_index: u32,
-        pub reserved: u32,
+        pub session_handle: u64,
         pub bytes_ptr: u64,
         pub capacity: u64,
         pub count: u64,
@@ -221,15 +264,13 @@ pub mod console {
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default)]
     pub struct ConsoleSetFocusRequest {
-        pub session_index: u32,
-        pub reserved: u32,
+        pub session_handle: u64,
     }
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default)]
     pub struct ConsoleSendInputEventRequest {
-        pub session_index: u32,
-        pub reserved: u32,
+        pub session_handle: u64,
         pub event: super::device::InputEvent,
     }
 }
@@ -248,6 +289,7 @@ pub mod device {
     pub const INPUT_KIND_POINTER_MOTION: u16 = super::ui::INPUT_KIND_POINTER_MOTION;
     pub const INPUT_KIND_POINTER_BUTTON: u16 = super::ui::INPUT_KIND_POINTER_BUTTON;
     pub const INPUT_KIND_POINTER_SCROLL: u16 = super::ui::INPUT_KIND_POINTER_SCROLL;
+    pub const INPUT_KIND_POINTER_POSITION: u16 = super::ui::INPUT_KIND_POINTER_POSITION;
     pub const INPUT_ACTION_NONE: u16 = super::ui::INPUT_ACTION_NONE;
     pub const INPUT_ACTION_PRESSED: u16 = super::ui::INPUT_ACTION_PRESSED;
     pub const INPUT_ACTION_RELEASED: u16 = super::ui::INPUT_ACTION_RELEASED;
@@ -267,6 +309,7 @@ pub mod device {
         pub bytes_per_pixel: u32,
         pub pixel_format: u32,
         pub reserved: u32,
+        pub generation: u64,
     }
 
     pub type InputEvent = super::ui::UiInputEvent;
@@ -283,6 +326,7 @@ pub mod device {
         pub stride_bytes: u32,
         pub reserved: u32,
         pub mapping_len: u64,
+        pub generation: u64,
     }
 
     #[repr(C)]

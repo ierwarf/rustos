@@ -1,7 +1,7 @@
 use spin::Mutex;
 
-pub use rustos_keyboard_driver::{KeyAction, KeyCode, KeyboardEvent, Modifiers};
-use rustos_keyboard_driver::{KeyboardDriver, ScanCodeSet};
+pub use keyboard_core::{KeyAction, KeyCode, KeyboardEvent, Modifiers};
+use keyboard_core::{KeyboardDriver, ScanCodeSet};
 
 static KEYBOARD_DRIVER: Mutex<KeyboardDriver> = Mutex::new(KeyboardDriver::new());
 
@@ -28,6 +28,14 @@ pub(crate) fn on_scancode(scancode: u8) {
         let Some(event) = maybe_event else {
             break;
         };
+        crate::input::dispatcher::dispatch_keyboard_event(event);
+    }
+}
+
+pub(crate) fn inject_key_transition(code: KeyCode, released: bool) {
+    let mut driver = KEYBOARD_DRIVER.lock();
+    driver.inject_key_transition(code, released);
+    while let Some(event) = driver.pop_event() {
         crate::input::dispatcher::dispatch_keyboard_event(event);
     }
 }

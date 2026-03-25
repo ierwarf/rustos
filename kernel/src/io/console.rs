@@ -1,8 +1,11 @@
+use alloc::vec::Vec;
+
 use spin::Mutex;
+#[cfg(not(test))]
 use x86_64::instructions::interrupts;
 
-use crate::ring::RingBuffer;
-use crate::session::{ConsoleSessionId, MAX_CONSOLE_SESSIONS, active_console_sessions};
+use crate::io::session::ConsoleSessionHandle;
+use crate::util::ring::RingBuffer;
 
 const OUTPUT_BUFFER_CAPACITY: usize = 4096;
 const PENDING_BUFFER_CAPACITY: usize = 4096;
@@ -11,7 +14,7 @@ const FLUSH_CHUNK_CAPACITY: usize = 256;
 static CONSOLE: Mutex<ConsoleState> = Mutex::new(ConsoleState::new());
 
 pub fn init() {
-    crate::gui::init_console();
+    crate::io::gui::init_console();
 }
 
 #[allow(dead_code)]
@@ -19,12 +22,10 @@ pub fn write(bytes: &[u8]) -> usize {
     if bytes.is_empty() {
         return 0;
     }
-    let written = with_console_state(|console| console.write_broadcast(bytes));
-    while flush_pending_once() {}
-    written
+    with_console_state(|console| console.system.write(bytes))
 }
 
-pub(crate) fn write_to_session(session: ConsoleSessionId, bytes: &[u8]) -> usize {
+pub(crate) fn write_to_session(session: ConsoleSessionHandle, bytes: &[u8]) -> usize {
     if bytes.is_empty() {
         return 0;
     }
@@ -33,20 +34,20 @@ pub(crate) fn write_to_session(session: ConsoleSessionId, bytes: &[u8]) -> usize
     written
 }
 
-pub(crate) fn write_from_tty(session: ConsoleSessionId, bytes: &[u8]) -> usize {
+pub(crate) fn write_from_tty(session: ConsoleSessionHandle, bytes: &[u8]) -> usize {
     write_to_session(session, bytes)
 }
 
-pub(crate) fn reset_session(session: ConsoleSessionId) {
+pub(crate) fn reset_session(session: ConsoleSessionHandle) {
     with_console_state(|console| console.reset_session(session));
 }
 
-pub(crate) fn snapshot_recent_output(session: ConsoleSessionId, dest: &mut [u8]) -> usize {
+pub(crate) fn snapshot_recent_output(session: ConsoleSessionHandle, dest: &mut [u8]) -> usize {
     with_console_state(|console| console.copy_recent_output(session, dest))
 }
 
-pub(crate) fn snapshot_output_generations() -> [u64; MAX_CONSOLE_SESSIONS] {
-    with_console_state(|console| console.output_generations())
+pub(crate) fn session_output_generation(session: ConsoleSessionHandle) -> u64 {
+    with_console_state(|console| console.output_generation(session))
 }
 
 #[cfg(test)]
@@ -58,7 +59,7 @@ pub(crate) fn reset_for_tests() {
 pub(crate) fn copy_recent_output_for_tests(dest: &mut [u8]) -> usize {
     CONSOLE
         .lock()
-        .copy_recent_output(ConsoleSessionId::PRIMARY, dest)
+        .copy_recent_output(ConsoleSessionHandle::SYSTEM, dest)
 }
 
 fn flush_pending_once() -> bool {
@@ -68,7 +69,7 @@ fn flush_pending_once() -> bool {
         return false;
     };
 
-    crate::gui::write_console_session(session, &chunk[..len]);
+    crate::io::gui::write_console_session(session, &chunk[..len]);
     true
 }
 
@@ -77,7 +78,7 @@ pub fn service() -> usize {
     while flush_pending_once() {
         work += 1;
     }
-    crate::gui::tick_console_cursor();
+    crate::io::gui::tick_console_cursor();
     work
 }
 
@@ -94,76 +95,147 @@ fn with_console_state<R>(f: impl FnOnce(&mut ConsoleState) -> R) -> R {
 }
 
 struct ConsoleState {
-    sessions: [ConsoleSessionState; MAX_CONSOLE_SESSIONS],
-    next_flush_session: usize,
+    system: ConsoleSessionState,
+    sessions: Vec<Option<BoundConsoleSessionState>>,
+    next_flush_slot: usize,
 }
 
 impl ConsoleState {
     const fn new() -> Self {
         Self {
-            sessions: [const { ConsoleSessionState::new() }; MAX_CONSOLE_SESSIONS],
-            next_flush_session: 0,
+            system: ConsoleSessionState::new(),
+            sessions: Vec::new(),
+            next_flush_slot: 0,
         }
     }
 
-    fn write_broadcast(&mut self, bytes: &[u8]) -> usize {
-        if bytes.is_empty() {
-            return 0;
+    fn write_to_session(&mut self, session: ConsoleSessionHandle, bytes: &[u8]) -> usize {
+        if session.is_system() {
+            return self.system.write(bytes);
         }
-
-        for session in active_console_sessions().iter() {
-            let _ = self.sessions[session.index()].write(bytes);
-        }
-        bytes.len()
+        self.ensure_session(session).write(bytes)
     }
 
-    fn write_to_session(&mut self, session: ConsoleSessionId, bytes: &[u8]) -> usize {
-        self.sessions[session.index()].write(bytes)
-    }
+    fn drain_pending(&mut self, dest: &mut [u8]) -> Option<(ConsoleSessionHandle, usize)> {
+        if self.sessions.is_empty() {
+            return None;
+        }
 
-    fn drain_pending(&mut self, dest: &mut [u8]) -> Option<(ConsoleSessionId, usize)> {
-        let active_sessions = active_console_sessions();
-        for offset in 0..MAX_CONSOLE_SESSIONS {
-            let index = (self.next_flush_session + offset) % MAX_CONSOLE_SESSIONS;
-            if !active_sessions
-                .iter()
-                .any(|session| session.index() == index)
-            {
+        let session_count = self.sessions.len();
+
+        for offset in 0..session_count {
+            let index = (self.next_flush_slot + offset) % session_count;
+            let Some(handle) = self
+                .sessions
+                .get(index)
+                .and_then(|entry| entry.as_ref())
+                .map(|bound| bound.handle)
+            else {
+                continue;
+            };
+            if !crate::io::session::is_console_session_active(handle) {
                 continue;
             }
-            let len = self.sessions[index].drain_pending(dest);
+
+            let Some(bound) = self.sessions[index].as_mut() else {
+                continue;
+            };
+
+            let len = bound.state.drain_pending(dest);
             if len == 0 {
                 continue;
             }
 
-            self.next_flush_session = (index + 1) % MAX_CONSOLE_SESSIONS;
-            return Some((
-                ConsoleSessionId::from_index(index).expect("session index"),
-                len,
-            ));
+            self.next_flush_slot = (index + 1) % session_count;
+            return Some((handle, len));
         }
 
         None
     }
 
-    fn copy_recent_output(&self, session: ConsoleSessionId, dest: &mut [u8]) -> usize {
-        self.sessions[session.index()].copy_recent_output(dest)
+    fn copy_recent_output(&self, session: ConsoleSessionHandle, dest: &mut [u8]) -> usize {
+        if session.is_system() {
+            return self.system.copy_recent_output(dest);
+        }
+        let Some(slot_index) = session.slot_index() else {
+            return 0;
+        };
+        let Some(Some(bound)) = self.sessions.get(slot_index) else {
+            return 0;
+        };
+        if bound.handle != session {
+            return 0;
+        }
+        bound.state.copy_recent_output(dest)
     }
 
-    fn output_generations(&self) -> [u64; MAX_CONSOLE_SESSIONS] {
-        let mut generations = [0_u64; MAX_CONSOLE_SESSIONS];
-        for (index, session) in self.sessions.iter().enumerate() {
-            generations[index] = session.output_generation();
+    fn output_generation(&self, session: ConsoleSessionHandle) -> u64 {
+        if session.is_system() {
+            return self.system.output_generation();
         }
-        generations
+        let Some(slot_index) = session.slot_index() else {
+            return 0;
+        };
+        let Some(Some(bound)) = self.sessions.get(slot_index) else {
+            return 0;
+        };
+        if bound.handle != session {
+            return 0;
+        }
+        bound.state.output_generation()
     }
 
-    fn reset_session(&mut self, session: ConsoleSessionId) {
-        self.sessions[session.index()].reset();
-        if self.next_flush_session == session.index() {
-            self.next_flush_session = (self.next_flush_session + 1) % MAX_CONSOLE_SESSIONS;
+    fn reset_session(&mut self, session: ConsoleSessionHandle) {
+        if session.is_system() {
+            self.system.reset();
+            return;
+        }
+        let Some(slot_index) = session.slot_index() else {
+            return;
+        };
+        let Some(entry) = self.sessions.get_mut(slot_index) else {
+            return;
+        };
+        let Some(bound) = entry.as_ref() else {
+            return;
+        };
+        if bound.handle != session {
+            return;
+        }
+        *entry = None;
+        if self.next_flush_slot >= self.sessions.len().saturating_sub(1) {
+            self.next_flush_slot = 0;
         }
     }
+
+    fn ensure_session(&mut self, session: ConsoleSessionHandle) -> &mut ConsoleSessionState {
+        let slot_index = session
+            .slot_index()
+            .expect("non-system console session must have a slot index");
+        if self.sessions.len() <= slot_index {
+            self.sessions.resize_with(slot_index + 1, || None);
+        }
+
+        let needs_reset = !matches!(
+            self.sessions[slot_index].as_ref(),
+            Some(bound) if bound.handle == session
+        );
+        if needs_reset {
+            self.sessions[slot_index] = Some(BoundConsoleSessionState {
+                handle: session,
+                state: ConsoleSessionState::new(),
+            });
+        }
+        &mut self.sessions[slot_index]
+            .as_mut()
+            .expect("console session state")
+            .state
+    }
+}
+
+struct BoundConsoleSessionState {
+    handle: ConsoleSessionHandle,
+    state: ConsoleSessionState,
 }
 
 struct ConsoleSessionState {
@@ -205,30 +277,25 @@ impl ConsoleSessionState {
     }
 
     fn reset(&mut self) {
-        self.output = RingBuffer::new();
-        self.pending = RingBuffer::new();
-        self.output_generation = self.output_generation.wrapping_add(1);
+        *self = Self {
+            output_generation: self.output_generation.wrapping_add(1),
+            ..Self::new()
+        };
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ConsoleState;
-    use crate::session::ConsoleSessionId;
+    use super::{ConsoleSessionHandle, ConsoleState};
 
     #[test]
     fn stores_recent_output() {
         let mut console = ConsoleState::new();
-        assert_eq!(
-            console.write_to_session(ConsoleSessionId::PRIMARY, b"asdf\r\n"),
-            6
-        );
+        let session = ConsoleSessionHandle::for_tests(1, 1);
+        assert_eq!(console.write_to_session(session, b"asdf\r\n"), 6);
 
         let mut output = [0_u8; 8];
-        assert_eq!(
-            console.copy_recent_output(ConsoleSessionId::PRIMARY, &mut output),
-            6
-        );
+        assert_eq!(console.copy_recent_output(session, &mut output), 6);
         assert_eq!(&output[..6], b"asdf\r\n");
     }
 }

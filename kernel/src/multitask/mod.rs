@@ -14,8 +14,8 @@ use x86_64::registers::segmentation::{CS, SS, Segment};
 
 use self::context::SavedContext;
 use self::scheduler::Scheduler;
-use crate::paging::ProcessAddressSpace;
-use crate::session::ConsoleSessionId;
+use crate::io::session::ConsoleSessionHandle;
+use crate::memory::paging::ProcessAddressSpace;
 use crate::user::abi::UserAbi;
 use crate::user::linux::{LinuxMemoryMapState, LinuxProcessState, LinuxThreadState};
 use crate::user::process_state::UserProcessState;
@@ -133,7 +133,7 @@ pub struct UserTaskBootstrap {
     pub linux_process_state: Option<LinuxProcessState>,
     pub linux_memory_map: Option<LinuxMemoryMapState>,
     pub linux_thread_state: Option<LinuxThreadState>,
-    pub console_session: ConsoleSessionId,
+    pub console_session: ConsoleSessionHandle,
     pub logical_admin: bool,
     exec_path: [u8; USER_TASK_EXEC_PATH_CAPACITY],
     exec_path_len: usize,
@@ -150,7 +150,7 @@ impl UserTaskBootstrap {
             linux_process_state: None,
             linux_memory_map: None,
             linux_thread_state: None,
-            console_session: ConsoleSessionId::PRIMARY,
+            console_session: ConsoleSessionHandle::SYSTEM,
             logical_admin: false,
             exec_path: [0; USER_TASK_EXEC_PATH_CAPACITY],
             exec_path_len: 0,
@@ -238,8 +238,8 @@ pub fn spawn_user_process(
 ) -> Result<u64, SpawnTaskError> {
     let id = NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed);
     let pit_divisor = checked_thread_pit_divisor(weight_micros)?;
-    let user_cs = crate::gdt::user_code_selector().0 as u64;
-    let user_ss = crate::gdt::user_data_selector().0 as u64;
+    let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
+    let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
     let rflags = initial_task_rflags().bits();
 
     interrupts::without_interrupts(|| unsafe {
@@ -266,8 +266,8 @@ pub fn spawn_user_thread(
 ) -> Result<u64, SpawnTaskError> {
     let id = NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed);
     let pit_divisor = checked_thread_pit_divisor(weight_micros)?;
-    let user_cs = crate::gdt::user_code_selector().0 as u64;
-    let user_ss = crate::gdt::user_data_selector().0 as u64;
+    let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
+    let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
     let rflags = initial_task_rflags().bits();
 
     interrupts::without_interrupts(|| unsafe {
@@ -284,7 +284,7 @@ fn checked_thread_pit_divisor(weight_micros: u64) -> Result<u16, SpawnTaskError>
         return Err(SpawnTaskError::InvalidWeightMicros);
     }
 
-    Ok(crate::pit::divisor_from_micros(weight_micros))
+    Ok(crate::arch::pit::divisor_from_micros(weight_micros))
 }
 
 pub const fn thread_weight_is_valid(weight_micros: u64) -> bool {
@@ -297,12 +297,12 @@ fn initial_task_rflags() -> RFlags {
 }
 
 fn kernel_fn_in_higher_half(entry: fn(u64)) -> fn(u64) {
-    let high_addr = crate::paging::higher_half_addr(entry as usize as u64);
+    let high_addr = crate::memory::paging::higher_half_addr(entry as usize as u64);
     unsafe { mem::transmute::<usize, fn(u64)>(high_addr as usize) }
 }
 
 fn kernel_task_entry_trampoline_addr() -> u64 {
-    crate::paging::higher_half_addr(task_entry_trampoline as *const () as usize as u64)
+    crate::memory::paging::higher_half_addr(task_entry_trampoline as *const () as usize as u64)
 }
 
 fn noop_task_entry(_id: u64) {
@@ -333,11 +333,13 @@ fn exit_current_task() -> ! {
 
 pub fn init() {
     unsafe {
-        scheduler_mut().reset(crate::pit::divisor_from_micros(MAIN_THREAD_SLICE_MICROS));
+        scheduler_mut().reset(crate::arch::pit::divisor_from_micros(
+            MAIN_THREAD_SLICE_MICROS,
+        ));
         scheduler_mut().prepare_current_task_execution();
     }
 
-    crate::pit::start_micros(0, MAIN_THREAD_SLICE_MICROS);
+    crate::arch::pit::start_micros(0, MAIN_THREAD_SLICE_MICROS);
 }
 
 pub fn save_current_simd_state() {
@@ -391,7 +393,7 @@ pub fn wake_user_task(task_id: u64) -> bool {
     interrupts::without_interrupts(|| unsafe { scheduler_mut().wake_user_task(task_id) })
 }
 
-pub fn current_console_session() -> ConsoleSessionId {
+pub fn current_console_session() -> ConsoleSessionHandle {
     interrupts::without_interrupts(|| unsafe { scheduler_ref().current_console_session() })
 }
 
@@ -471,15 +473,17 @@ unsafe extern "C" {
 }
 
 pub fn timer_interrupt_handler_addr() -> u64 {
-    crate::paging::higher_half_addr(timer_interrupt_handler as *const () as usize as u64)
+    crate::memory::paging::higher_half_addr(timer_interrupt_handler as *const () as usize as u64)
 }
 
 pub fn rtc_interrupt_handler_addr() -> u64 {
-    crate::paging::higher_half_addr(rtc_scheduler_interrupt_handler as *const () as usize as u64)
+    crate::memory::paging::higher_half_addr(
+        rtc_scheduler_interrupt_handler as *const () as usize as u64,
+    )
 }
 
 pub fn software_schedule_interrupt_handler_addr() -> u64 {
-    crate::paging::higher_half_addr(
+    crate::memory::paging::higher_half_addr(
         software_schedule_interrupt_handler as *const () as usize as u64,
     )
 }
@@ -487,7 +491,7 @@ pub fn software_schedule_interrupt_handler_addr() -> u64 {
 #[unsafe(no_mangle)]
 extern "C" fn timer_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut SavedContext {
     if !scheduler_bootstrap_ready() {
-        crate::pic::send_eoi(crate::pic::PIC_1_OFFSET);
+        crate::arch::pic::send_eoi(crate::arch::pic::PIC_1_OFFSET);
         return context_ptr;
     }
 
@@ -497,21 +501,21 @@ extern "C" fn timer_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut S
         crate::driver::linux::runtime::tick_jiffies(1);
         scheduler.save_current_simd_state();
         let (next_rsp, next_pit_divisor) = scheduler.on_timer_interrupt(current_rsp);
-        crate::pit::set_divisor(0, next_pit_divisor);
+        crate::arch::pit::set_divisor(0, next_pit_divisor);
         scheduler.prepare_current_task_execution();
         scheduler.restore_current_simd_state();
         next_rsp
     };
 
-    crate::pic::send_eoi(crate::pic::PIC_1_OFFSET);
+    crate::arch::pic::send_eoi(crate::arch::pic::PIC_1_OFFSET);
     next_rsp as *mut SavedContext
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn rtc_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut SavedContext {
     if !scheduler_bootstrap_ready() {
-        crate::rtc::on_interrupt();
-        crate::pic::send_eoi(crate::pic::PIC_2_OFFSET);
+        crate::arch::rtc::on_interrupt();
+        crate::arch::pic::send_eoi(crate::arch::pic::PIC_2_OFFSET);
         return context_ptr;
     }
 
@@ -526,8 +530,8 @@ extern "C" fn rtc_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut Sav
         next_rsp
     };
 
-    crate::rtc::on_interrupt();
-    crate::pic::send_eoi(crate::pic::PIC_2_OFFSET);
+    crate::arch::rtc::on_interrupt();
+    crate::arch::pic::send_eoi(crate::arch::pic::PIC_2_OFFSET);
     next_rsp as *mut SavedContext
 }
 

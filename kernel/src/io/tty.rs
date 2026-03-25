@@ -1,25 +1,30 @@
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 use x86_64::instructions::interrupts;
 
-use crate::console;
-use crate::keyboard::{KeyAction, KeyCode, KeyboardEvent};
-use crate::ring::RingBuffer;
-use crate::session::{ConsoleSessionId, MAX_CONSOLE_SESSIONS};
+use crate::input::keyboard::{KeyAction, KeyCode, KeyboardEvent};
+use crate::io::console;
+use crate::io::session::ConsoleSessionHandle;
 use crate::user::linux as linux_abi;
+use crate::util::ring::RingBuffer;
 
 const INPUT_BUFFER_CAPACITY: usize = 1024;
 const EDIT_BUFFER_CAPACITY: usize = 256;
 const CURSOR_MOVE_SEQUENCE_MAX_LEN: usize = 16;
+const TTY_DEBUG_LOG_LIMIT: usize = 32;
 
 static TTY: Mutex<TtyCollection> = Mutex::new(TtyCollection::new());
+static TTY_COMMIT_DEBUG_LOGS: AtomicUsize = AtomicUsize::new(0);
+static TTY_WAKE_DEBUG_LOGS: AtomicUsize = AtomicUsize::new(0);
 
 pub fn init() {}
 
 pub fn on_key_event(event: KeyboardEvent) {
-    on_key_event_for_session(ConsoleSessionId::PRIMARY, event);
+    on_key_event_for_session(ConsoleSessionHandle::SYSTEM, event);
 }
 
-pub fn on_key_event_for_session(session: ConsoleSessionId, event: KeyboardEvent) {
+pub fn on_key_event_for_session(session: ConsoleSessionHandle, event: KeyboardEvent) {
     if !session_accepts_user_input(session) {
         return;
     }
@@ -29,27 +34,27 @@ pub fn on_key_event_for_session(session: ConsoleSessionId, event: KeyboardEvent)
 
 #[allow(dead_code)]
 pub fn read_input(dest: &mut [u8]) -> usize {
-    read_input_for_session(ConsoleSessionId::PRIMARY, dest)
+    read_input_for_session(ConsoleSessionHandle::SYSTEM, dest)
 }
 
-pub fn read_input_for_session(session: ConsoleSessionId, dest: &mut [u8]) -> usize {
+pub fn read_input_for_session(session: ConsoleSessionHandle, dest: &mut [u8]) -> usize {
     interrupts::without_interrupts(|| TTY.lock().session_mut(session).read_input(dest))
 }
 
-pub fn has_pending_input_for_session(session: ConsoleSessionId) -> bool {
+pub fn has_pending_input_for_session(session: ConsoleSessionHandle) -> bool {
     interrupts::without_interrupts(|| TTY.lock().session_mut(session).has_pending_input())
 }
 
-pub fn pending_input_len_for_session(session: ConsoleSessionId) -> usize {
+pub fn pending_input_len_for_session(session: ConsoleSessionHandle) -> usize {
     interrupts::without_interrupts(|| TTY.lock().session_mut(session).pending_input_len())
 }
 
-pub fn termios_for_session(session: ConsoleSessionId) -> linux_abi::LinuxTermios {
+pub fn termios_for_session(session: ConsoleSessionHandle) -> linux_abi::LinuxTermios {
     interrupts::without_interrupts(|| TTY.lock().session_mut(session).termios())
 }
 
 pub fn set_termios_for_session(
-    session: ConsoleSessionId,
+    session: ConsoleSessionHandle,
     termios: linux_abi::LinuxTermios,
     flush_input: bool,
 ) {
@@ -61,10 +66,10 @@ pub fn set_termios_for_session(
 }
 
 pub fn read_input_blocking(dest: &mut [u8]) -> usize {
-    read_input_blocking_for_session(ConsoleSessionId::PRIMARY, dest)
+    read_input_blocking_for_session(ConsoleSessionHandle::SYSTEM, dest)
 }
 
-pub fn read_input_blocking_for_session(session: ConsoleSessionId, dest: &mut [u8]) -> usize {
+pub fn read_input_blocking_for_session(session: ConsoleSessionHandle, dest: &mut [u8]) -> usize {
     if dest.is_empty() {
         return 0;
     }
@@ -104,18 +109,18 @@ pub fn read_input_blocking_for_session(session: ConsoleSessionId, dest: &mut [u8
 }
 
 pub fn write(bytes: &[u8]) -> usize {
-    write_to_session(ConsoleSessionId::PRIMARY, bytes)
+    write_to_session(ConsoleSessionHandle::SYSTEM, bytes)
 }
 
-pub fn write_to_session(session: ConsoleSessionId, bytes: &[u8]) -> usize {
+pub fn write_to_session(session: ConsoleSessionHandle, bytes: &[u8]) -> usize {
     interrupts::without_interrupts(|| TTY.lock().session_mut(session).write(session, bytes))
 }
 
-pub(crate) fn reset_session(session: ConsoleSessionId) {
-    interrupts::without_interrupts(|| TTY.lock().session_mut(session).reset());
+pub(crate) fn reset_session(session: ConsoleSessionHandle) {
+    interrupts::without_interrupts(|| TTY.lock().reset_session(session));
 }
 
-fn session_accepts_user_input(session: ConsoleSessionId) -> bool {
+fn session_accepts_user_input(session: ConsoleSessionHandle) -> bool {
     #[cfg(test)]
     {
         let _ = session;
@@ -126,24 +131,74 @@ fn session_accepts_user_input(session: ConsoleSessionId) -> bool {
     {
         // The boot emergency console is a write-only status surface. Dropping keyboard input
         // here avoids accumulating unread TTY state before the userspace desktop takes over.
-        session != ConsoleSessionId::PRIMARY || crate::gui::is_userspace_display_active()
+        !session.is_system() && crate::io::gui::is_userspace_display_active()
     }
 }
 
 struct TtyCollection {
-    sessions: [TtySessionState; MAX_CONSOLE_SESSIONS],
+    system: TtySessionState,
+    sessions: Vec<Option<BoundTtySessionState>>,
 }
 
 impl TtyCollection {
     const fn new() -> Self {
         Self {
-            sessions: [const { TtySessionState::new() }; MAX_CONSOLE_SESSIONS],
+            system: TtySessionState::new(),
+            sessions: Vec::new(),
         }
     }
 
-    fn session_mut(&mut self, session: ConsoleSessionId) -> &mut TtySessionState {
-        &mut self.sessions[session.index()]
+    fn session_mut(&mut self, session: ConsoleSessionHandle) -> &mut TtySessionState {
+        if session.is_system() {
+            return &mut self.system;
+        }
+
+        let slot_index = session
+            .slot_index()
+            .expect("non-system TTY session must have a slot index");
+        if self.sessions.len() <= slot_index {
+            self.sessions.resize_with(slot_index + 1, || None);
+        }
+
+        let needs_reset = !matches!(
+            self.sessions[slot_index].as_ref(),
+            Some(bound) if bound.handle == session
+        );
+        if needs_reset {
+            self.sessions[slot_index] = Some(BoundTtySessionState {
+                handle: session,
+                state: TtySessionState::new(),
+            });
+        }
+        &mut self.sessions[slot_index]
+            .as_mut()
+            .expect("tty session state")
+            .state
     }
+
+    fn reset_session(&mut self, session: ConsoleSessionHandle) {
+        if session.is_system() {
+            self.system.reset();
+            return;
+        }
+        let Some(slot_index) = session.slot_index() else {
+            return;
+        };
+        let Some(entry) = self.sessions.get_mut(slot_index) else {
+            return;
+        };
+        let Some(bound) = entry.as_ref() else {
+            return;
+        };
+        if bound.handle == session {
+            *entry = None;
+        }
+    }
+}
+
+struct BoundTtySessionState {
+    handle: ConsoleSessionHandle,
+    state: TtySessionState,
 }
 
 struct TtySessionState {
@@ -167,7 +222,7 @@ impl TtySessionState {
         }
     }
 
-    fn on_key_event(&mut self, session: ConsoleSessionId, event: KeyboardEvent) {
+    fn on_key_event(&mut self, session: ConsoleSessionHandle, event: KeyboardEvent) {
         if matches!(event.action, KeyAction::Released) {
             return;
         }
@@ -179,7 +234,7 @@ impl TtySessionState {
         }
     }
 
-    fn on_canonical_key_event(&mut self, session: ConsoleSessionId, event: KeyboardEvent) {
+    fn on_canonical_key_event(&mut self, session: ConsoleSessionHandle, event: KeyboardEvent) {
         match event.code {
             KeyCode::ArrowLeft => self.move_cursor_left(session),
             KeyCode::ArrowRight => self.move_cursor_right(session),
@@ -200,7 +255,7 @@ impl TtySessionState {
         }
     }
 
-    fn on_noncanonical_key_event(&mut self, session: ConsoleSessionId, event: KeyboardEvent) {
+    fn on_noncanonical_key_event(&mut self, session: ConsoleSessionHandle, event: KeyboardEvent) {
         let Some((bytes, len)) = self.noncanonical_input_bytes(event) else {
             return;
         };
@@ -240,7 +295,7 @@ impl TtySessionState {
         self.termios = termios;
     }
 
-    fn write(&mut self, session: ConsoleSessionId, bytes: &[u8]) -> usize {
+    fn write(&mut self, session: ConsoleSessionHandle, bytes: &[u8]) -> usize {
         if bytes.is_empty() {
             return 0;
         }
@@ -285,7 +340,7 @@ impl TtySessionState {
         bytes.len()
     }
 
-    fn insert_edit_byte(&mut self, session: ConsoleSessionId, byte: u8) {
+    fn insert_edit_byte(&mut self, session: ConsoleSessionHandle, byte: u8) {
         if self.edit_len == EDIT_BUFFER_CAPACITY {
             return;
         }
@@ -314,7 +369,7 @@ impl TtySessionState {
         }
     }
 
-    fn handle_backspace(&mut self, session: ConsoleSessionId) {
+    fn handle_backspace(&mut self, session: ConsoleSessionHandle) {
         if self.edit_cursor == 0 {
             return;
         }
@@ -341,7 +396,7 @@ impl TtySessionState {
         }
     }
 
-    fn move_cursor_left(&mut self, session: ConsoleSessionId) {
+    fn move_cursor_left(&mut self, session: ConsoleSessionHandle) {
         if self.edit_cursor == 0 {
             return;
         }
@@ -352,7 +407,7 @@ impl TtySessionState {
         }
     }
 
-    fn move_cursor_right(&mut self, session: ConsoleSessionId) {
+    fn move_cursor_right(&mut self, session: ConsoleSessionHandle) {
         if self.edit_cursor >= self.edit_len {
             return;
         }
@@ -363,7 +418,7 @@ impl TtySessionState {
         }
     }
 
-    fn commit_line(&mut self, session: ConsoleSessionId) {
+    fn commit_line(&mut self, session: ConsoleSessionHandle) {
         let required = self.edit_len + 1;
         if self.input.remaining_capacity() < required {
             return;
@@ -378,10 +433,19 @@ impl TtySessionState {
         let _ = self.input.push(b'\n');
         self.edit_len = 0;
         self.edit_cursor = 0;
+        if !session.is_system()
+            && TTY_COMMIT_DEBUG_LOGS.fetch_add(1, Ordering::Relaxed) < TTY_DEBUG_LOG_LIMIT
+        {
+            crate::debug::println!(
+                "tty commit: session={} queued_len={}",
+                session.raw(),
+                self.input.len(),
+            );
+        }
         self.wake_input_waiter();
     }
 
-    fn redraw_edit_buffer_on_fresh_line(&self, session: ConsoleSessionId) {
+    fn redraw_edit_buffer_on_fresh_line(&self, session: ConsoleSessionHandle) {
         if self.edit_len == 0 {
             return;
         }
@@ -390,15 +454,20 @@ impl TtySessionState {
         self.move_visual_cursor_left(session, self.edit_len - self.edit_cursor);
     }
 
-    fn move_visual_cursor_left(&self, session: ConsoleSessionId, count: usize) {
+    fn move_visual_cursor_left(&self, session: ConsoleSessionHandle, count: usize) {
         self.write_cursor_move_sequence(session, count, b'D');
     }
 
-    fn move_visual_cursor_right(&self, session: ConsoleSessionId, count: usize) {
+    fn move_visual_cursor_right(&self, session: ConsoleSessionHandle, count: usize) {
         self.write_cursor_move_sequence(session, count, b'C');
     }
 
-    fn write_cursor_move_sequence(&self, session: ConsoleSessionId, count: usize, direction: u8) {
+    fn write_cursor_move_sequence(
+        &self,
+        session: ConsoleSessionHandle,
+        count: usize,
+        direction: u8,
+    ) {
         if count == 0 {
             return;
         }
@@ -461,7 +530,7 @@ impl TtySessionState {
         Some((bytes, len))
     }
 
-    fn echo_noncanonical_input(&self, session: ConsoleSessionId, bytes: &[u8]) {
+    fn echo_noncanonical_input(&self, session: ConsoleSessionHandle, bytes: &[u8]) {
         if bytes.len() != 1 {
             return;
         }
@@ -526,7 +595,10 @@ impl TtySessionState {
         let Some(task_id) = self.input_waiter.take() else {
             return;
         };
-        let _ = crate::multitask::wake_user_task(task_id);
+        let woke = crate::multitask::wake_user_task(task_id);
+        if TTY_WAKE_DEBUG_LOGS.fetch_add(1, Ordering::Relaxed) < TTY_DEBUG_LOG_LIMIT {
+            crate::debug::println!("tty wake: task_id={} woke={}", task_id, woke);
+        }
     }
 }
 
@@ -563,10 +635,16 @@ fn copy_bytes(dest: &mut [u8], source: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::TtySessionState;
-    use crate::console;
-    use crate::keyboard::{KeyAction, KeyCode, KeyboardEvent, Modifiers};
-    use crate::session::ConsoleSessionId;
+    use crate::input::keyboard::{KeyAction, KeyCode, KeyboardEvent, Modifiers};
+    use crate::io::console;
+    use crate::io::session::ConsoleSessionHandle;
     use crate::user::linux as linux_abi;
+
+    const TEST_SESSION: ConsoleSessionHandle = ConsoleSessionHandle::for_tests(1, 1);
+
+    fn isolated() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_support::exclusive_test()
+    }
 
     fn text_event(code: KeyCode, byte: u8) -> KeyboardEvent {
         KeyboardEvent {
@@ -588,35 +666,37 @@ mod tests {
 
     #[test]
     fn canonical_input_echoes_and_commits_on_enter() {
+        let _guard = isolated();
         console::reset_for_tests();
         let mut tty = TtySessionState::new();
-        tty.on_key_event(ConsoleSessionId::PRIMARY, text_event(KeyCode::A, b'a'));
-        tty.on_key_event(ConsoleSessionId::PRIMARY, text_event(KeyCode::S, b's'));
-        tty.on_key_event(ConsoleSessionId::PRIMARY, text_event(KeyCode::D, b'd'));
-        tty.on_key_event(ConsoleSessionId::PRIMARY, text_event(KeyCode::F, b'f'));
-        tty.on_key_event(ConsoleSessionId::PRIMARY, text_event(KeyCode::Enter, b'\n'));
+        tty.on_key_event(TEST_SESSION, text_event(KeyCode::A, b'a'));
+        tty.on_key_event(TEST_SESSION, text_event(KeyCode::S, b's'));
+        tty.on_key_event(TEST_SESSION, text_event(KeyCode::D, b'd'));
+        tty.on_key_event(TEST_SESSION, text_event(KeyCode::F, b'f'));
+        tty.on_key_event(TEST_SESSION, text_event(KeyCode::Enter, b'\n'));
 
         let mut input = [0_u8; 8];
         assert_eq!(tty.read_input(&mut input), 5);
         assert_eq!(&input[..5], b"asdf\n");
 
         let mut output = [0_u8; 8];
-        assert_eq!(console::copy_recent_output_for_tests(&mut output), 6);
+        assert_eq!(
+            console::snapshot_recent_output(TEST_SESSION, &mut output),
+            6
+        );
         assert_eq!(&output[..6], b"asdf\r\n");
     }
 
     #[test]
     fn backspace_edits_current_line_before_commit() {
+        let _guard = isolated();
         console::reset_for_tests();
         let mut tty = TtySessionState::new();
-        tty.on_key_event(ConsoleSessionId::PRIMARY, text_event(KeyCode::A, b'a'));
-        tty.on_key_event(ConsoleSessionId::PRIMARY, text_event(KeyCode::B, b'b'));
-        tty.on_key_event(
-            ConsoleSessionId::PRIMARY,
-            text_event(KeyCode::Backspace, 0x08),
-        );
-        tty.on_key_event(ConsoleSessionId::PRIMARY, text_event(KeyCode::C, b'c'));
-        tty.on_key_event(ConsoleSessionId::PRIMARY, text_event(KeyCode::Enter, b'\n'));
+        tty.on_key_event(TEST_SESSION, text_event(KeyCode::A, b'a'));
+        tty.on_key_event(TEST_SESSION, text_event(KeyCode::B, b'b'));
+        tty.on_key_event(TEST_SESSION, text_event(KeyCode::Backspace, 0x08));
+        tty.on_key_event(TEST_SESSION, text_event(KeyCode::C, b'c'));
+        tty.on_key_event(TEST_SESSION, text_event(KeyCode::Enter, b'\n'));
 
         let mut input = [0_u8; 8];
         assert_eq!(tty.read_input(&mut input), 3);
@@ -625,75 +705,83 @@ mod tests {
 
     #[test]
     fn output_redraws_pending_input_on_clean_line() {
+        let _guard = isolated();
         console::reset_for_tests();
         let mut tty = TtySessionState::new();
-        tty.on_key_event(ConsoleSessionId::PRIMARY, text_event(KeyCode::A, b'a'));
-        tty.on_key_event(ConsoleSessionId::PRIMARY, text_event(KeyCode::S, b's'));
-        assert_eq!(tty.write(ConsoleSessionId::PRIMARY, b"out\n"), 4);
+        tty.on_key_event(TEST_SESSION, text_event(KeyCode::A, b'a'));
+        tty.on_key_event(TEST_SESSION, text_event(KeyCode::S, b's'));
+        assert_eq!(tty.write(TEST_SESSION, b"out\n"), 4);
 
         let mut output = [0_u8; 16];
-        assert_eq!(console::copy_recent_output_for_tests(&mut output), 11);
+        assert_eq!(
+            console::snapshot_recent_output(TEST_SESSION, &mut output),
+            11
+        );
         assert_eq!(&output[..11], b"as\r\nout\r\nas");
     }
 
     #[test]
     fn arrow_keys_move_cursor_for_middle_insertion() {
+        let _guard = isolated();
         console::reset_for_tests();
         let mut tty = TtySessionState::new();
-        tty.on_key_event(ConsoleSessionId::PRIMARY, text_event(KeyCode::A, b'a'));
-        tty.on_key_event(ConsoleSessionId::PRIMARY, text_event(KeyCode::C, b'c'));
-        tty.on_key_event(ConsoleSessionId::PRIMARY, key_event(KeyCode::ArrowLeft));
-        tty.on_key_event(ConsoleSessionId::PRIMARY, text_event(KeyCode::B, b'b'));
-        tty.on_key_event(ConsoleSessionId::PRIMARY, key_event(KeyCode::Enter));
+        tty.on_key_event(TEST_SESSION, text_event(KeyCode::A, b'a'));
+        tty.on_key_event(TEST_SESSION, text_event(KeyCode::C, b'c'));
+        tty.on_key_event(TEST_SESSION, key_event(KeyCode::ArrowLeft));
+        tty.on_key_event(TEST_SESSION, text_event(KeyCode::B, b'b'));
+        tty.on_key_event(TEST_SESSION, key_event(KeyCode::Enter));
 
         let mut input = [0_u8; 8];
         assert_eq!(tty.read_input(&mut input), 4);
         assert_eq!(&input[..4], b"abc\n");
 
         let mut output = [0_u8; 32];
-        let len = console::copy_recent_output_for_tests(&mut output);
+        let len = console::snapshot_recent_output(TEST_SESSION, &mut output);
         assert_eq!(&output[..len], b"ac\x1b[Dbc\x1b[D\r\n");
     }
 
     #[test]
     fn backspace_updates_middle_of_line() {
+        let _guard = isolated();
         console::reset_for_tests();
         let mut tty = TtySessionState::new();
-        tty.on_key_event(ConsoleSessionId::PRIMARY, text_event(KeyCode::A, b'a'));
-        tty.on_key_event(ConsoleSessionId::PRIMARY, text_event(KeyCode::B, b'b'));
-        tty.on_key_event(ConsoleSessionId::PRIMARY, text_event(KeyCode::C, b'c'));
-        tty.on_key_event(ConsoleSessionId::PRIMARY, text_event(KeyCode::D, b'd'));
-        tty.on_key_event(ConsoleSessionId::PRIMARY, key_event(KeyCode::ArrowLeft));
-        tty.on_key_event(ConsoleSessionId::PRIMARY, key_event(KeyCode::ArrowLeft));
-        tty.on_key_event(ConsoleSessionId::PRIMARY, key_event(KeyCode::Backspace));
-        tty.on_key_event(ConsoleSessionId::PRIMARY, key_event(KeyCode::Enter));
+        tty.on_key_event(TEST_SESSION, text_event(KeyCode::A, b'a'));
+        tty.on_key_event(TEST_SESSION, text_event(KeyCode::B, b'b'));
+        tty.on_key_event(TEST_SESSION, text_event(KeyCode::C, b'c'));
+        tty.on_key_event(TEST_SESSION, text_event(KeyCode::D, b'd'));
+        tty.on_key_event(TEST_SESSION, key_event(KeyCode::ArrowLeft));
+        tty.on_key_event(TEST_SESSION, key_event(KeyCode::ArrowLeft));
+        tty.on_key_event(TEST_SESSION, key_event(KeyCode::Backspace));
+        tty.on_key_event(TEST_SESSION, key_event(KeyCode::Enter));
 
         let mut input = [0_u8; 8];
         assert_eq!(tty.read_input(&mut input), 4);
         assert_eq!(&input[..4], b"acd\n");
 
         let mut output = [0_u8; 48];
-        let len = console::copy_recent_output_for_tests(&mut output);
+        let len = console::snapshot_recent_output(TEST_SESSION, &mut output);
         assert_eq!(&output[..len], b"abcd\x1b[D\x1b[D\x1b[Dcd \x1b[3D\r\n");
     }
 
     #[test]
     fn redraw_preserves_cursor_after_output() {
+        let _guard = isolated();
         console::reset_for_tests();
         let mut tty = TtySessionState::new();
-        tty.on_key_event(ConsoleSessionId::PRIMARY, text_event(KeyCode::A, b'a'));
-        tty.on_key_event(ConsoleSessionId::PRIMARY, text_event(KeyCode::C, b'c'));
-        tty.on_key_event(ConsoleSessionId::PRIMARY, key_event(KeyCode::ArrowLeft));
+        tty.on_key_event(TEST_SESSION, text_event(KeyCode::A, b'a'));
+        tty.on_key_event(TEST_SESSION, text_event(KeyCode::C, b'c'));
+        tty.on_key_event(TEST_SESSION, key_event(KeyCode::ArrowLeft));
 
-        assert_eq!(tty.write(ConsoleSessionId::PRIMARY, b"out"), 3);
+        assert_eq!(tty.write(TEST_SESSION, b"out"), 3);
 
         let mut output = [0_u8; 32];
-        let len = console::copy_recent_output_for_tests(&mut output);
+        let len = console::snapshot_recent_output(TEST_SESSION, &mut output);
         assert_eq!(&output[..len], b"ac\x1b[D\r\nout\r\nac\x1b[D");
     }
 
     #[test]
     fn noncanonical_mode_queues_input_immediately_without_local_echo() {
+        let _guard = isolated();
         console::reset_for_tests();
         let mut tty = TtySessionState::new();
         let mut raw = linux_abi::LinuxTermios::default_console();
@@ -701,24 +789,28 @@ mod tests {
         raw.c_oflag = 0;
         tty.set_termios(raw, false);
 
-        tty.on_key_event(ConsoleSessionId::PRIMARY, text_event(KeyCode::A, b'a'));
-        tty.on_key_event(ConsoleSessionId::PRIMARY, key_event(KeyCode::ArrowLeft));
-        tty.on_key_event(ConsoleSessionId::PRIMARY, key_event(KeyCode::Enter));
+        tty.on_key_event(TEST_SESSION, text_event(KeyCode::A, b'a'));
+        tty.on_key_event(TEST_SESSION, key_event(KeyCode::ArrowLeft));
+        tty.on_key_event(TEST_SESSION, key_event(KeyCode::Enter));
 
         let mut input = [0_u8; 8];
         assert_eq!(tty.read_input(&mut input), 5);
         assert_eq!(&input[..5], b"a\x1b[D\n");
 
         let mut output = [0_u8; 8];
-        assert_eq!(console::copy_recent_output_for_tests(&mut output), 0);
+        assert_eq!(
+            console::snapshot_recent_output(TEST_SESSION, &mut output),
+            0
+        );
     }
 
     #[test]
     fn tcsetsf_style_flush_discards_pending_canonical_input() {
+        let _guard = isolated();
         console::reset_for_tests();
         let mut tty = TtySessionState::new();
-        tty.on_key_event(ConsoleSessionId::PRIMARY, text_event(KeyCode::A, b'a'));
-        tty.on_key_event(ConsoleSessionId::PRIMARY, text_event(KeyCode::B, b'b'));
+        tty.on_key_event(TEST_SESSION, text_event(KeyCode::A, b'a'));
+        tty.on_key_event(TEST_SESSION, text_event(KeyCode::B, b'b'));
 
         let raw = linux_abi::LinuxTermios {
             c_lflag: linux_abi::ISIG,
@@ -732,16 +824,17 @@ mod tests {
 
     #[test]
     fn output_honors_disabled_onlcr_translation() {
+        let _guard = isolated();
         console::reset_for_tests();
         let mut tty = TtySessionState::new();
         let mut termios = tty.termios();
         termios.c_oflag = 0;
         tty.set_termios(termios, false);
 
-        assert_eq!(tty.write(ConsoleSessionId::PRIMARY, b"out\nnext"), 8);
+        assert_eq!(tty.write(TEST_SESSION, b"out\nnext"), 8);
 
         let mut output = [0_u8; 16];
-        let len = console::copy_recent_output_for_tests(&mut output);
+        let len = console::snapshot_recent_output(TEST_SESSION, &mut output);
         assert_eq!(&output[..len], b"out\nnext");
     }
 }

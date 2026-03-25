@@ -10,10 +10,8 @@ mod runtime;
 pub(crate) use load::elf_loader;
 pub(crate) use runtime::{debug, heap, panic_screen};
 
-#[path = "../../kernel/src/storage/fat.rs"]
-mod fat;
-#[path = "../../kernel/src/util/random.rs"]
-mod random;
+use boot_random as random;
+use boot_storage as fat;
 
 use boot_protocol::BootInfo;
 use core::fmt;

@@ -1,4 +1,3 @@
-use alloc::vec::Vec;
 use core::cmp::min;
 use core::convert::Infallible;
 use core::ptr;
@@ -10,7 +9,7 @@ use embedded_graphics::pixelcolor::Rgb888;
 use embedded_graphics::prelude::{OriginDimensions, Pixel, RgbColor};
 use x86_64::VirtAddr;
 
-use crate::paging::{self, ProcessAddressSpace};
+use crate::memory::paging::{self, ProcessAddressSpace};
 
 const DIRTY_TILE_WIDTH: usize = 32;
 const DIRTY_TILE_HEIGHT: usize = 32;
@@ -18,7 +17,7 @@ const MAX_FRAMEBUFFER_WIDTH: usize = 7680;
 const MAX_FRAMEBUFFER_HEIGHT: usize = 4320;
 const MAX_DIRTY_COLS: usize = MAX_FRAMEBUFFER_WIDTH.div_ceil(DIRTY_TILE_WIDTH);
 const MAX_DIRTY_ROWS: usize = MAX_FRAMEBUFFER_HEIGHT.div_ceil(DIRTY_TILE_HEIGHT);
-pub(crate) const MAX_FRAMEBUFFER_BYTES_PER_PIXEL: usize = 4;
+const ENABLE_FRAMEBUFFER_DOUBLE_BUFFER: bool = false;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FramebufferRect {
@@ -97,91 +96,6 @@ impl FramebufferRect {
     }
 }
 
-pub(crate) struct FramebufferImage {
-    width: usize,
-    height: usize,
-    stride_bytes: usize,
-    bpp: usize,
-    pixels: Vec<u8>,
-}
-
-pub(crate) struct FramebufferFrontSnapshot<const CAPACITY: usize> {
-    rect: Option<FramebufferRect>,
-    len: usize,
-    bytes: [u8; CAPACITY],
-}
-
-impl<const CAPACITY: usize> FramebufferFrontSnapshot<CAPACITY> {
-    pub(crate) const fn empty() -> Self {
-        Self {
-            rect: None,
-            len: 0,
-            bytes: [0; CAPACITY],
-        }
-    }
-
-    pub(crate) fn clear(&mut self) {
-        self.rect = None;
-        self.len = 0;
-    }
-}
-
-impl FramebufferImage {
-    pub(crate) const fn new() -> Self {
-        Self {
-            width: 0,
-            height: 0,
-            stride_bytes: 0,
-            bpp: 0,
-            pixels: Vec::new(),
-        }
-    }
-
-    pub(crate) fn allocate_for_framebuffer(
-        &mut self,
-        framebuffer: &Framebuffer,
-    ) -> Result<(), &'static str> {
-        let buffer_len = framebuffer
-            .stride_bytes
-            .checked_mul(framebuffer.height)
-            .ok_or("background buffer size overflow")?;
-        self.pixels.resize(buffer_len, 0);
-        self.width = framebuffer.width;
-        self.height = framebuffer.height;
-        self.stride_bytes = framebuffer.stride_bytes;
-        self.bpp = framebuffer.bpp;
-        Ok(())
-    }
-
-    pub(crate) fn matches_framebuffer(&self, framebuffer: &Framebuffer) -> bool {
-        self.width == framebuffer.width
-            && self.height == framebuffer.height
-            && self.stride_bytes == framebuffer.stride_bytes
-            && self.bpp == framebuffer.bpp
-            && self.pixels.len() == framebuffer.stride_bytes * framebuffer.height
-    }
-
-    pub(crate) fn clear(&mut self) {
-        self.width = 0;
-        self.height = 0;
-        self.stride_bytes = 0;
-        self.bpp = 0;
-        self.pixels.clear();
-    }
-
-    pub(crate) fn pixels_mut(&mut self) -> &mut [u8] {
-        &mut self.pixels
-    }
-
-    pub(crate) fn stride_bytes(&self) -> usize {
-        self.stride_bytes
-    }
-
-    pub(crate) fn bpp(&self) -> usize {
-        self.bpp
-    }
-}
-
 pub(crate) struct Framebuffer {
     front_base: *mut u8,
     back_base: *mut u8,
@@ -201,24 +115,6 @@ pub(crate) struct Framebuffer {
 unsafe impl Send for Framebuffer {}
 
 impl Framebuffer {
-    pub(crate) const fn empty() -> Self {
-        Self {
-            front_base: ptr::null_mut(),
-            back_base: ptr::null_mut(),
-            size: 0,
-            width: 0,
-            height: 0,
-            stride_bytes: 0,
-            bpp: 4,
-            format: BootPixelFormat::Unknown,
-            use_double_buffer: false,
-            dirty_cols: 0,
-            dirty_rows: 0,
-            dirty_any: false,
-            dirty_tiles: [[false; MAX_DIRTY_COLS]; MAX_DIRTY_ROWS],
-        }
-    }
-
     pub(crate) fn width(&self) -> usize {
         self.width
     }
@@ -233,10 +129,6 @@ impl Framebuffer {
 
     pub(crate) fn bytes_per_pixel(&self) -> usize {
         self.bpp
-    }
-
-    pub(crate) fn pixel_format(&self) -> BootPixelFormat {
-        self.format
     }
 
     pub(crate) fn clip_rect(
@@ -254,139 +146,6 @@ impl Framebuffer {
             BootPixelFormat::Rgb => (color.r(), color.g(), color.b()),
             _ => (color.b(), color.g(), color.r()),
         }
-    }
-
-    pub(crate) fn capture_scene_snapshot<const CAPACITY: usize>(
-        &self,
-        rect: FramebufferRect,
-        snapshot: &mut FramebufferFrontSnapshot<CAPACITY>,
-    ) -> bool {
-        if rect.width == 0 || rect.height == 0 {
-            snapshot.clear();
-            return false;
-        }
-
-        let Some(row_bytes) = rect.width.checked_mul(self.bpp) else {
-            snapshot.clear();
-            return false;
-        };
-        let Some(total_bytes) = row_bytes.checked_mul(rect.height) else {
-            snapshot.clear();
-            return false;
-        };
-        if snapshot.bytes.len() < total_bytes {
-            snapshot.clear();
-            return false;
-        }
-
-        unsafe {
-            let mut src_row = self
-                .scene_buffer()
-                .add(rect.y * self.stride_bytes + rect.x * self.bpp);
-            let mut dst_row = snapshot.bytes.as_mut_ptr();
-            for _ in 0..rect.height {
-                ptr::copy_nonoverlapping(src_row, dst_row, row_bytes);
-                src_row = src_row.add(self.stride_bytes);
-                dst_row = dst_row.add(row_bytes);
-            }
-        }
-
-        snapshot.rect = Some(rect);
-        snapshot.len = total_bytes;
-        true
-    }
-
-    pub(crate) fn restore_front_snapshot<const CAPACITY: usize>(
-        &mut self,
-        snapshot: &mut FramebufferFrontSnapshot<CAPACITY>,
-    ) -> bool {
-        let Some(rect) = snapshot.rect.take() else {
-            snapshot.len = 0;
-            return false;
-        };
-        if rect.width == 0 || rect.height == 0 {
-            snapshot.len = 0;
-            return false;
-        }
-
-        let Some(row_bytes) = rect.width.checked_mul(self.bpp) else {
-            snapshot.len = 0;
-            return false;
-        };
-        let Some(total_bytes) = row_bytes.checked_mul(rect.height) else {
-            snapshot.len = 0;
-            return false;
-        };
-        if snapshot.len < total_bytes || snapshot.bytes.len() < total_bytes {
-            snapshot.len = 0;
-            return false;
-        }
-
-        unsafe {
-            let mut src_row = snapshot.bytes.as_ptr();
-            let mut dst_row = self
-                .front_base
-                .add(rect.y * self.stride_bytes + rect.x * self.bpp);
-            for _ in 0..rect.height {
-                ptr::copy_nonoverlapping(src_row, dst_row, row_bytes);
-                src_row = src_row.add(row_bytes);
-                dst_row = dst_row.add(self.stride_bytes);
-            }
-        }
-
-        snapshot.len = 0;
-        true
-    }
-
-    pub(crate) fn draw_image(&mut self, image: &FramebufferImage) -> bool {
-        if !image.matches_framebuffer(self) {
-            return false;
-        }
-
-        unsafe {
-            ptr::copy_nonoverlapping(
-                image.pixels.as_ptr(),
-                self.active_buffer(),
-                image.pixels.len(),
-            );
-        }
-        self.mark_all_dirty();
-        true
-    }
-
-    pub(crate) fn draw_image_rect(
-        &mut self,
-        image: &FramebufferImage,
-        x: i64,
-        y: i64,
-        width: u32,
-        height: u32,
-    ) -> bool {
-        let Some(rect) = self.clip_rect(x, y, width, height) else {
-            return false;
-        };
-        if !image.matches_framebuffer(self) {
-            return false;
-        }
-
-        let copy_len = rect.width * image.bpp;
-        unsafe {
-            let mut src_row = image
-                .pixels
-                .as_ptr()
-                .add(rect.y * image.stride_bytes + rect.x * image.bpp);
-            let mut dst_row = self
-                .active_buffer()
-                .add(rect.y * self.stride_bytes + rect.x * self.bpp);
-            for _ in 0..rect.height {
-                ptr::copy_nonoverlapping(src_row, dst_row, copy_len);
-                src_row = src_row.add(image.stride_bytes);
-                dst_row = dst_row.add(self.stride_bytes);
-            }
-        }
-
-        self.mark_dirty_rect(rect);
-        true
     }
 
     pub(crate) fn fill_rect(
@@ -507,45 +266,6 @@ impl Framebuffer {
         self.mark_dirty_tile_for_point(x, y);
     }
 
-    pub(crate) fn draw_bgra8888_frame(
-        &mut self,
-        width: usize,
-        height: usize,
-        stride_bytes: usize,
-        bytes: &[u8],
-    ) -> bool {
-        if width != self.width || height != self.height || self.front_base.is_null() {
-            return false;
-        }
-
-        let Some(min_stride) = width.checked_mul(4) else {
-            return false;
-        };
-        if stride_bytes < min_stride {
-            return false;
-        }
-
-        let Some(required_len) = stride_bytes.checked_mul(height) else {
-            return false;
-        };
-        if bytes.len() < required_len {
-            return false;
-        }
-
-        unsafe {
-            let mut src_row = bytes.as_ptr();
-            let mut dst_row = self.active_buffer();
-            for _ in 0..height {
-                self.blit_bgra8888_row(dst_row, src_row, width);
-                src_row = src_row.add(stride_bytes);
-                dst_row = dst_row.add(self.stride_bytes);
-            }
-        }
-
-        self.mark_all_dirty();
-        true
-    }
-
     pub(crate) fn draw_bgra8888_frame_from_user(
         &mut self,
         address_space: &ProcessAddressSpace,
@@ -563,6 +283,29 @@ impl Framebuffer {
         };
         if stride_bytes < min_stride {
             return Ok(false);
+        }
+        if self
+            .rect_copy_bounds(FramebufferRect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            })
+            .is_none()
+        {
+            crate::debug::println!(
+                "framebuffer present rejected: user frame exceeds bounds width={} height={} stride={} size={}",
+                width,
+                height,
+                self.stride_bytes,
+                self.size
+            );
+            return Ok(false);
+        }
+        if self.can_bulk_copy_full_frame_from_user_bgra8888(user_ptr, width, height, stride_bytes) {
+            self.blit_bgra8888_frame_from_user_contiguous(address_space, user_ptr, width, height)?;
+            self.mark_all_dirty();
+            return Ok(true);
         }
         unsafe {
             let mut dst_row = self.active_buffer();
@@ -611,6 +354,18 @@ impl Framebuffer {
         }) else {
             return Ok(true);
         };
+        if self.rect_copy_bounds(rect).is_none() {
+            crate::debug::println!(
+                "framebuffer present rejected: rect exceeds bounds x={} y={} width={} height={} stride={} size={}",
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+                self.stride_bytes,
+                self.size
+            );
+            return Ok(false);
+        }
 
         unsafe {
             let mut dst_row = self
@@ -640,20 +395,9 @@ impl Framebuffer {
         Ok(true)
     }
 
-    pub(crate) fn draw_overlay_pixel(&mut self, x: usize, y: usize, color: Rgb888, alpha: u8) {
-        if alpha == 0 || x >= self.width || y >= self.height {
-            return;
-        }
-
-        let Some(idx) = self.pixel_index(x, y) else {
-            return;
-        };
-        self.write_pixel(self.front_base, idx, color, alpha);
-    }
-
-    pub(crate) fn present_scene(&mut self) {
+    pub(crate) fn present_scene(&mut self) -> bool {
         if !self.use_double_buffer || !self.dirty_any {
-            return;
+            return true;
         }
 
         for tile_row in 0..self.dirty_rows {
@@ -666,17 +410,23 @@ impl Framebuffer {
 
                 let start_col = tile_col;
                 while tile_col < self.dirty_cols && self.dirty_tiles[tile_row][tile_col] {
-                    self.dirty_tiles[tile_row][tile_col] = false;
                     tile_col += 1;
                 }
 
-                self.copy_back_to_front_rect(
-                    self.dirty_rect_for_run(tile_row, start_col, tile_col),
-                );
+                if !self
+                    .copy_back_to_front_rect(self.dirty_rect_for_run(tile_row, start_col, tile_col))
+                {
+                    self.mark_all_dirty();
+                    return false;
+                }
+                for col in start_col..tile_col {
+                    self.dirty_tiles[tile_row][col] = false;
+                }
             }
         }
 
         self.dirty_any = false;
+        true
     }
 
     fn active_buffer(&self) -> *mut u8 {
@@ -687,8 +437,29 @@ impl Framebuffer {
         }
     }
 
-    fn scene_buffer(&self) -> *mut u8 {
-        self.active_buffer()
+    fn rect_copy_bounds(&self, rect: FramebufferRect) -> Option<(usize, usize)> {
+        if rect.width == 0 || rect.height == 0 {
+            return None;
+        }
+
+        let row_bytes = rect.width.checked_mul(self.bpp)?;
+        let start = rect.y.checked_mul(self.stride_bytes).and_then(|offset| {
+            rect.x
+                .checked_mul(self.bpp)
+                .and_then(|xoff| offset.checked_add(xoff))
+        })?;
+        let last_row_offset = rect
+            .height
+            .checked_sub(1)
+            .and_then(|rows| rows.checked_mul(self.stride_bytes))?;
+        let end = start
+            .checked_add(last_row_offset)
+            .and_then(|offset| offset.checked_add(row_bytes))?;
+        if end > self.size {
+            return None;
+        }
+
+        Some((start, row_bytes))
     }
 
     fn mark_all_dirty(&mut self) {
@@ -751,21 +522,98 @@ impl Framebuffer {
         }
     }
 
-    fn copy_back_to_front_rect(&self, rect: FramebufferRect) {
-        let copy_len = rect.width * self.bpp;
+    fn copy_back_to_front_rect(&self, rect: FramebufferRect) -> bool {
+        let Some((offset, copy_len)) = self.rect_copy_bounds(rect) else {
+            crate::debug::println!(
+                "framebuffer present rejected: dirty rect exceeds bounds x={} y={} width={} height={} stride={} size={}",
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+                self.stride_bytes,
+                self.size
+            );
+            return false;
+        };
         unsafe {
-            let mut src_row = self
-                .back_base
-                .add(rect.y * self.stride_bytes + rect.x * self.bpp);
-            let mut dst_row = self
-                .front_base
-                .add(rect.y * self.stride_bytes + rect.x * self.bpp);
+            let mut src_row = self.back_base.add(offset);
+            let mut dst_row = self.front_base.add(offset);
             for _ in 0..rect.height {
-                crate::simd::copy_fast(src_row, dst_row, copy_len);
+                // The front buffer can behave like device memory under QEMU, so
+                // keep presents on a plain byte-copy path instead of XMM/AVX stores.
+                ptr::copy_nonoverlapping(src_row, dst_row, copy_len);
                 src_row = src_row.add(self.stride_bytes);
                 dst_row = dst_row.add(self.stride_bytes);
             }
         }
+        true
+    }
+
+    fn can_bulk_copy_full_frame_from_user_bgra8888(
+        &self,
+        user_ptr: u64,
+        width: usize,
+        height: usize,
+        stride_bytes: usize,
+    ) -> bool {
+        if height == 0 || (user_ptr & 0x3) != 0 {
+            return false;
+        }
+        let Some(src_row_bytes) = width.checked_mul(4) else {
+            return false;
+        };
+        let Some(dst_row_bytes) = width.checked_mul(self.bpp) else {
+            return false;
+        };
+        stride_bytes == src_row_bytes && self.stride_bytes == dst_row_bytes
+    }
+
+    fn blit_bgra8888_frame_from_user_contiguous(
+        &self,
+        address_space: &ProcessAddressSpace,
+        user_ptr: u64,
+        width: usize,
+        height: usize,
+    ) -> Result<(), paging::AddressSpaceError> {
+        let row_src_bytes = width
+            .checked_mul(4)
+            .ok_or(paging::AddressSpaceError::AddressOverflow)?;
+        let total_bytes = row_src_bytes
+            .checked_mul(height)
+            .ok_or(paging::AddressSpaceError::AddressOverflow)?;
+
+        let mut dst = self.active_buffer();
+        let mut remaining_pixels_in_row = width;
+
+        address_space.visit_user_read_spans(
+            VirtAddr::new(user_ptr),
+            total_bytes,
+            |src, chunk| {
+                if (chunk & 0x3) != 0 {
+                    return Err(paging::AddressSpaceError::AddressOverflow);
+                }
+
+                let mut src = src;
+                let mut remaining_pixels = chunk / 4;
+                while remaining_pixels != 0 {
+                    let pixels = remaining_pixels.min(remaining_pixels_in_row);
+                    unsafe {
+                        self.blit_bgra8888_row(dst, src, pixels);
+                        dst = dst.add(pixels * self.bpp);
+                        src = src.add(pixels * 4);
+                    }
+                    remaining_pixels -= pixels;
+                    remaining_pixels_in_row -= pixels;
+                    if remaining_pixels_in_row == 0 {
+                        remaining_pixels_in_row = width;
+                    }
+                }
+
+                Ok(())
+            },
+        )?;
+
+        Ok(())
     }
 
     fn blit_bgra8888_row_from_user(
@@ -879,7 +727,7 @@ impl Framebuffer {
 
     unsafe fn blit_bgra8888_row(&self, dst: *mut u8, src: *const u8, pixels: usize) {
         unsafe {
-            crate::simd::blit_bgra8888_row(
+            crate::arch::simd::blit_bgra8888_row(
                 dst,
                 src,
                 pixels,
@@ -952,12 +800,13 @@ pub(crate) fn build_framebuffer(src: FramebufferInfo) -> Framebuffer {
         panic!("framebuffer size is smaller than geometry");
     }
 
-    let use_double_buffer = can_use_double_buffer(
-        src.addr,
-        src.back_buffer_addr,
-        size,
-        src.back_buffer_size as usize,
-    );
+    let use_double_buffer = ENABLE_FRAMEBUFFER_DOUBLE_BUFFER
+        && can_use_double_buffer(
+            src.addr,
+            src.back_buffer_addr,
+            size,
+            src.back_buffer_size as usize,
+        );
     let dirty_cols = width.div_ceil(DIRTY_TILE_WIDTH);
     let dirty_rows = height.div_ceil(DIRTY_TILE_HEIGHT);
 

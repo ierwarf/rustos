@@ -2,10 +2,10 @@ use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
 
 use crate::debug;
-use crate::fat;
+use crate::io::session::ConsoleSessionHandle;
+use crate::memory::paging::{self, AddressSpaceError, ProcessAddressSpace};
 use crate::multitask;
-use crate::paging::{self, AddressSpaceError, ProcessAddressSpace};
-use crate::session::ConsoleSessionId;
+use crate::storage::fat;
 use crate::user::abi::UserAbi;
 use crate::user::linux::{LinuxProcessImageInfo, LinuxProcessLaunch};
 
@@ -152,15 +152,6 @@ pub struct ProcessStartRegisters {
 }
 
 impl ProcessStartRegisters {
-    #[allow(dead_code)]
-    pub const fn with_sysv_args(arg0: u64, arg1: u64) -> Self {
-        Self {
-            rdi: arg0,
-            rsi: arg1,
-            ..Self::new()
-        }
-    }
-
     pub const fn new() -> Self {
         Self {
             rax: 0,
@@ -212,7 +203,7 @@ enum LoadedProcessRuntime {
 pub struct ProcessLaunchOptions<'a> {
     pub registers: ProcessStartRegisters,
     pub linux: LinuxProcessLaunch<'a>,
-    pub console_session: ConsoleSessionId,
+    pub console_session: ConsoleSessionHandle,
     pub logical_admin: bool,
 }
 
@@ -221,14 +212,10 @@ impl<'a> Default for ProcessLaunchOptions<'a> {
         Self {
             registers: ProcessStartRegisters::new(),
             linux: LinuxProcessLaunch::new(""),
-            console_session: ConsoleSessionId::PRIMARY,
+            console_session: ConsoleSessionHandle::SYSTEM,
             logical_admin: false,
         }
     }
-}
-
-pub fn load_elf(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadError> {
-    linux::load_elf(image)
 }
 
 pub fn load_image(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadError> {
@@ -242,102 +229,6 @@ pub fn load_image(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadError> 
     Err(ProcessLoadError::InvalidPe(
         "unknown executable image format",
     ))
-}
-
-#[allow(dead_code)]
-pub fn spawn_process(
-    image: &[u8],
-    weight_micros: u64,
-    arg0: u64,
-    arg1: u64,
-) -> Result<SpawnedProcess, ProcessLoadError> {
-    let launch = ProcessLaunchOptions {
-        registers: ProcessStartRegisters::with_sysv_args(arg0, arg1),
-        console_session: multitask::current_console_session(),
-        ..ProcessLaunchOptions::default()
-    };
-    spawn_process_with_launch(image, weight_micros, launch)
-}
-
-#[allow(dead_code)]
-pub fn spawn_process_with_registers(
-    image: &[u8],
-    weight_micros: u64,
-    registers: ProcessStartRegisters,
-) -> Result<SpawnedProcess, ProcessLoadError> {
-    let launch = ProcessLaunchOptions {
-        registers,
-        console_session: multitask::current_console_session(),
-        ..ProcessLaunchOptions::default()
-    };
-    spawn_process_with_launch(image, weight_micros, launch)
-}
-
-pub fn spawn_linux_process(
-    image: &[u8],
-    weight_micros: u64,
-    exec_path: &str,
-) -> Result<SpawnedProcess, ProcessLoadError> {
-    spawn_linux_process_in_session(
-        image,
-        weight_micros,
-        exec_path,
-        multitask::current_console_session(),
-    )
-}
-
-pub fn spawn_linux_process_in_session(
-    image: &[u8],
-    weight_micros: u64,
-    exec_path: &str,
-    console_session: ConsoleSessionId,
-) -> Result<SpawnedProcess, ProcessLoadError> {
-    let argv = [exec_path];
-    spawn_linux_process_with_args_in_session(
-        image,
-        weight_micros,
-        exec_path,
-        &argv,
-        &[],
-        console_session,
-    )
-}
-
-pub fn spawn_linux_process_with_args(
-    image: &[u8],
-    weight_micros: u64,
-    exec_path: &str,
-    argv: &[&str],
-    env: &[&str],
-) -> Result<SpawnedProcess, ProcessLoadError> {
-    spawn_linux_process_with_args_in_session(
-        image,
-        weight_micros,
-        exec_path,
-        argv,
-        env,
-        multitask::current_console_session(),
-    )
-}
-
-pub fn spawn_linux_process_with_args_in_session(
-    image: &[u8],
-    weight_micros: u64,
-    exec_path: &str,
-    argv: &[&str],
-    env: &[&str],
-    console_session: ConsoleSessionId,
-) -> Result<SpawnedProcess, ProcessLoadError> {
-    let launch = ProcessLaunchOptions {
-        linux: LinuxProcessLaunch {
-            exec_path,
-            argv,
-            env,
-        },
-        console_session,
-        ..ProcessLaunchOptions::default()
-    };
-    spawn_process_with_launch(image, weight_micros, launch)
 }
 
 pub fn spawn_process_with_launch(
@@ -420,28 +311,33 @@ fn build_process_bootstrap(
 ) -> Result<multitask::UserTaskBootstrap, ProcessLoadError> {
     let (stack_pointer, mut linux_process_state, linux_memory_map, linux_thread_state) =
         match (abi, runtime) {
-        (UserAbi::Linux, LoadedProcessRuntime::Linux(image)) => {
-            linux::initialize_linux_initial_tls(address_space, &image)?;
-            (
-                linux::initialize_linux_user_stack(address_space, stack_end, &image, launch.linux)?,
-                Some(image.initial_process_state()),
-                Some(linux::build_initial_memory_map(
-                    &image,
-                    launch.linux.exec_path,
-                    user_stack,
-                )),
-                Some(image.initial_thread_state()),
-            )
-        }
-        (UserAbi::Windows, LoadedProcessRuntime::Windows) => {
-            (initial_user_stack_top(stack_end)?, None, None, None)
-        }
-        _ => {
-            return Err(ProcessLoadError::InvalidElf(
-                "process runtime metadata does not match ABI",
-            ));
-        }
-    };
+            (UserAbi::Linux, LoadedProcessRuntime::Linux(image)) => {
+                linux::initialize_linux_initial_tls(address_space, &image)?;
+                (
+                    linux::initialize_linux_user_stack(
+                        address_space,
+                        stack_end,
+                        &image,
+                        launch.linux,
+                    )?,
+                    Some(image.initial_process_state()),
+                    Some(linux::build_initial_memory_map(
+                        &image,
+                        launch.linux.exec_path,
+                        user_stack,
+                    )),
+                    Some(image.initial_thread_state()),
+                )
+            }
+            (UserAbi::Windows, LoadedProcessRuntime::Windows) => {
+                (initial_user_stack_top(stack_end)?, None, None, None)
+            }
+            _ => {
+                return Err(ProcessLoadError::InvalidElf(
+                    "process runtime metadata does not match ABI",
+                ));
+            }
+        };
 
     let mut bootstrap = multitask::UserTaskBootstrap::new(abi, entry, stack_pointer);
     bootstrap.registers = launch.registers.into_task_registers();

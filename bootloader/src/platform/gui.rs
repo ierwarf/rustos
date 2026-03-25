@@ -6,7 +6,7 @@ use uefi::system;
 use uefi::table::cfg::ConfigTableEntry;
 
 use crate::boot_info::{
-    BootFileManifest, BootInfo, BootPixelFormat, FramebufferInfo, BOOT_INFO_MAGIC,
+    BootFileManifest, BootInfo, BootMemoryMap, BootPixelFormat, FramebufferInfo, BOOT_INFO_MAGIC,
     BOOT_INFO_VERSION,
 };
 use crate::debug;
@@ -79,6 +79,7 @@ pub fn prepare_boot_info() -> Result<BootInfo, BootError> {
         rng_seed,
         acpi_rsdp_addr,
         framebuffer: fb_info,
+        memory_map: BootMemoryMap::empty(),
         boot_files: BootFileManifest::empty(),
     })
 }

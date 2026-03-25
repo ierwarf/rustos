@@ -1,5 +1,5 @@
-use crate::console;
 use crate::debug;
+use crate::io::console;
 use crate::multitask;
 use crate::user::runtime;
 
@@ -25,6 +25,7 @@ pub(crate) fn run_service_loop() -> ! {
 pub(crate) fn service_once() -> usize {
     runtime::service_pending_requests()
         + crate::input::service_pending()
+        + crate::usb::service_pending()
         + crate::driver::serio::service_pending()
         + multitask::service_deferred_work()
         + crate::driver::linux::workqueue::service_pending()

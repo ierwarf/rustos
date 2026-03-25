@@ -3,8 +3,8 @@ use core::convert::TryFrom;
 use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
 
+use crate::memory::paging;
 use crate::multitask;
-use crate::paging;
 use crate::user::abi::UserAbi;
 use crate::user::process_state::{UserProcessState, WindowsAllocation, WindowsAllocationKind};
 
@@ -186,7 +186,7 @@ pub(crate) fn read_file(
 }
 
 pub(crate) fn sleep(milliseconds: u64) -> u64 {
-    crate::rtc::sleep(milliseconds);
+    crate::arch::rtc::sleep(milliseconds);
     set_last_error(ERROR_SUCCESS);
     0
 }
@@ -259,8 +259,7 @@ pub(crate) fn heap_alloc(heap: u64, flags: u64, len: u64) -> u64 {
         set_last_error(ERROR_INVALID_HANDLE);
         return 0;
     }
-    if flags & !(HEAP_NO_SERIALIZE | HEAP_ZERO_MEMORY) != 0
-        || flags & HEAP_GENERATE_EXCEPTIONS != 0
+    if flags & !(HEAP_NO_SERIALIZE | HEAP_ZERO_MEMORY) != 0 || flags & HEAP_GENERATE_EXCEPTIONS != 0
     {
         set_last_error(ERROR_INVALID_PARAMETER);
         return 0;
@@ -310,8 +309,7 @@ pub(crate) fn heap_realloc(heap: u64, flags: u64, base: u64, len: u64) -> u64 {
         set_last_error(ERROR_INVALID_HANDLE);
         return 0;
     }
-    if flags & !(HEAP_NO_SERIALIZE | HEAP_ZERO_MEMORY) != 0
-        || flags & HEAP_GENERATE_EXCEPTIONS != 0
+    if flags & !(HEAP_NO_SERIALIZE | HEAP_ZERO_MEMORY) != 0 || flags & HEAP_GENERATE_EXCEPTIONS != 0
     {
         set_last_error(ERROR_INVALID_PARAMETER);
         return 0;
@@ -343,7 +341,12 @@ pub(crate) fn virtual_alloc(base: u64, len: u64, allocation_type: u64, protect: 
     }
 
     let exact_base = if base == 0 { None } else { Some(base) };
-    match allocate_windows_memory(len, protect as u32, exact_base, WindowsAllocationKind::Virtual) {
+    match allocate_windows_memory(
+        len,
+        protect as u32,
+        exact_base,
+        WindowsAllocationKind::Virtual,
+    ) {
         Ok(addr) => {
             set_last_error(ERROR_SUCCESS);
             addr
@@ -525,7 +528,8 @@ fn protect_windows_memory(
 }
 
 fn reallocate_heap_block(base: u64, new_len: u64) -> Result<u64, u32> {
-    let (page_count, mapped_len) = normalized_mapping_size(new_len).ok_or(ERROR_INVALID_PARAMETER)?;
+    let (page_count, mapped_len) =
+        normalized_mapping_size(new_len).ok_or(ERROR_INVALID_PARAMETER)?;
     let Some(result) = multitask::with_current_user_process_state_mut(|_, abi, process_state| {
         if abi != UserAbi::Windows {
             return Err(ERROR_INVALID_FUNCTION);
@@ -543,7 +547,10 @@ fn reallocate_heap_block(base: u64, new_len: u64) -> Result<u64, u32> {
         }
 
         let new_region = process_state
-            .map_zeroed_pages_from_mapping_cursor(page_count, PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE)
+            .map_zeroed_pages_from_mapping_cursor(
+                page_count,
+                PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE,
+            )
             .map_err(address_space_error_to_win32)?;
         let new_base = new_region.start.as_u64();
 
@@ -591,13 +598,19 @@ fn copy_user_region(
         let chunk_len = (len - copied).min(chunk.len());
         address_space
             .copy_from_user(
-                VirtAddr::new(src.checked_add(copied as u64).ok_or(ERROR_INVALID_PARAMETER)?),
+                VirtAddr::new(
+                    src.checked_add(copied as u64)
+                        .ok_or(ERROR_INVALID_PARAMETER)?,
+                ),
                 &mut chunk[..chunk_len],
             )
             .map_err(address_space_error_to_win32)?;
         address_space
             .initialize_user_bytes(
-                VirtAddr::new(dst.checked_add(copied as u64).ok_or(ERROR_INVALID_PARAMETER)?),
+                VirtAddr::new(
+                    dst.checked_add(copied as u64)
+                        .ok_or(ERROR_INVALID_PARAMETER)?,
+                ),
                 &chunk[..chunk_len],
             )
             .map_err(address_space_error_to_win32)?;

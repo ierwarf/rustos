@@ -75,6 +75,11 @@ struct PendingTimer {
 static WORKQUEUES: Mutex<Vec<WorkqueueRecord>> = Mutex::new(Vec::new());
 static PENDING_WORK: Mutex<Vec<PendingWork>> = Mutex::new(Vec::new());
 static PENDING_TIMERS: Mutex<Vec<PendingTimer>> = Mutex::new(Vec::new());
+static SYSTEM_WORKQUEUE: LinuxWorkqueueStruct = LinuxWorkqueueStruct {
+    magic: 0x5255_5354_4f53_5751,
+    flags: 0,
+    max_active: 0,
+};
 
 pub(crate) unsafe extern "C" fn alloc_workqueue(
     _fmt: *const c_char,
@@ -233,11 +238,44 @@ pub(crate) unsafe extern "C" fn mod_timer(timer: *mut LinuxTimerList, expires: u
     was_pending as i32
 }
 
+pub(crate) unsafe extern "C" fn cancel_work_sync(work: *mut LinuxWorkStruct) -> bool {
+    let Some(work_ptr) = ptr_to_usize(work.cast::<c_void>()) else {
+        return false;
+    };
+    let removed = {
+        let mut pending = PENDING_WORK.lock();
+        if let Some(index) = pending.iter().position(|entry| entry.work == work_ptr) {
+            pending.swap_remove(index);
+            true
+        } else {
+            false
+        }
+    };
+    if removed {
+        set_work_pending(work_ptr, false);
+    }
+    removed
+}
+
+pub(crate) unsafe extern "C" fn timer_init_key(
+    timer: *mut LinuxTimerList,
+    func: Option<LinuxTimerFunc>,
+    flags: u32,
+    name: *const c_char,
+    key: *mut c_void,
+) {
+    unsafe { init_timer_key(timer, func, flags, name, key) };
+}
+
 pub(crate) unsafe extern "C" fn timer_delete(timer: *mut LinuxTimerList) -> i32 {
     delete_timer(timer)
 }
 
 pub(crate) unsafe extern "C" fn timer_shutdown_sync(timer: *mut LinuxTimerList) -> i32 {
+    delete_timer(timer)
+}
+
+pub(crate) unsafe extern "C" fn timer_delete_sync(timer: *mut LinuxTimerList) -> i32 {
     delete_timer(timer)
 }
 
@@ -264,9 +302,13 @@ pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
         "queue_delayed_work_on" => Some(queue_delayed_work_on as *const () as usize),
         "delayed_work_timer_fn" => Some(delayed_work_timer_fn as *const () as usize),
         "init_timer_key" => Some(init_timer_key as *const () as usize),
+        "timer_init_key" => Some(timer_init_key as *const () as usize),
         "mod_timer" => Some(mod_timer as *const () as usize),
+        "cancel_work_sync" => Some(cancel_work_sync as *const () as usize),
         "timer_delete" => Some(timer_delete as *const () as usize),
+        "timer_delete_sync" => Some(timer_delete_sync as *const () as usize),
         "timer_shutdown_sync" => Some(timer_shutdown_sync as *const () as usize),
+        "system_wq" => Some(&SYSTEM_WORKQUEUE as *const LinuxWorkqueueStruct as usize),
         _ => None,
     }
 }
@@ -451,9 +493,14 @@ fn timer_ptr(timer: &mut LinuxTimerList) -> usize {
 }
 
 unsafe fn delayed_work_from_timer<'a>(timer: *mut LinuxTimerList) -> &'a mut LinuxDelayedWork {
-    let delayed_work_ptr =
-        (timer as *mut u8).sub(offset_of!(LinuxDelayedWork, timer)) as *mut LinuxDelayedWork;
+    let delayed_work_ptr = unsafe {
+        (timer as *mut u8).sub(offset_of!(LinuxDelayedWork, timer)) as *mut LinuxDelayedWork
+    };
     unsafe { &mut *delayed_work_ptr }
+}
+
+fn delayed_work_timer_fn_addr() -> usize {
+    delayed_work_timer_fn as *const () as usize
 }
 
 fn delayed_work_item_from_timer(timer_ptr: usize) -> Option<usize> {
@@ -461,7 +508,7 @@ fn delayed_work_item_from_timer(timer_ptr: usize) -> Option<usize> {
         return None;
     }
     let timer = unsafe { &*(timer_ptr as *const LinuxTimerList) };
-    if timer.function.map(|func| func as usize) != Some(delayed_work_timer_fn as usize) {
+    if timer.function.map(|func| func as *const () as usize) != Some(delayed_work_timer_fn_addr()) {
         return None;
     }
     let delayed_work = unsafe { delayed_work_from_timer(timer_ptr as *mut LinuxTimerList) };
@@ -473,7 +520,7 @@ fn delayed_work_queue_from_timer(timer_ptr: usize) -> Option<usize> {
         return None;
     }
     let timer = unsafe { &*(timer_ptr as *const LinuxTimerList) };
-    if timer.function.map(|func| func as usize) != Some(delayed_work_timer_fn as usize) {
+    if timer.function.map(|func| func as *const () as usize) != Some(delayed_work_timer_fn_addr()) {
         return None;
     }
     let delayed_work = unsafe { delayed_work_from_timer(timer_ptr as *mut LinuxTimerList) };

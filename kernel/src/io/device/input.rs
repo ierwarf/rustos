@@ -1,4 +1,3 @@
-use alloc::vec;
 use core::mem::size_of;
 use core::slice;
 
@@ -8,7 +7,7 @@ use crate::user::process_state::UserProcessState;
 
 use super::DeviceError;
 
-const MAX_INPUT_EVENTS_PER_READ: usize = 64;
+const MAX_INPUT_EVENTS_PER_READ: usize = 1024;
 
 pub fn read_events(dest: &mut [device::InputEvent]) -> usize {
     event_queue::read_input_events(dest)
@@ -26,8 +25,8 @@ pub(crate) fn read_to_user(
     }
 
     let capacity = capacity.min(MAX_INPUT_EVENTS_PER_READ);
-    let mut events = vec![device::InputEvent::default(); capacity];
-    let read = read_events(&mut events);
+    let mut events = [device::InputEvent::default(); MAX_INPUT_EVENTS_PER_READ];
+    let read = read_events(&mut events[..capacity]);
     let bytes_len = read
         .checked_mul(event_size)
         .ok_or(DeviceError::InvalidArgument)?;

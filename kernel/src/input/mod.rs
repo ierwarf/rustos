@@ -1,5 +1,3 @@
-use rustos_keyboard_driver::KEYBOARD_DRIVER_NAME;
-
 use crate::driver;
 use driver_abi::{DriverBus, DriverClass};
 use spin::Mutex;
@@ -9,10 +7,14 @@ pub(crate) mod event_queue;
 pub(crate) mod i8042;
 pub(crate) mod keyboard;
 
+const KEYBOARD_DRIVER_NAME: &str = "rustos-keyboard";
 const PSMOUSE_DRIVER_NAME: &str = "psmouse";
 const PSMOUSE_DRIVER_MODULE_PATH: &str = "system/drivers/input/psmouse.ko";
-const AUX_TRANSPORT_START_DELAY_MS: u64 = 1200;
-const LOADABLE_MOUSE_DRIVER_START_DELAY_MS: u64 = 800;
+// QEMU TCG is sensitive to long deferred waits during early userspace/input
+// bring-up. Zero-delay deadlines still defer work to the next service pass
+// without depending on RTC progress.
+const AUX_TRANSPORT_START_DELAY_MS: u64 = 0;
+const LOADABLE_MOUSE_DRIVER_START_DELAY_MS: u64 = 0;
 
 static DEFERRED_INPUT_STATE: Mutex<DeferredInputState> = Mutex::new(DeferredInputState::new());
 
@@ -73,7 +75,7 @@ pub fn service_pending() -> usize {
         let mut state = DEFERRED_INPUT_STATE.lock();
         match state.stage {
             DeferredInputStage::WaitingForUserspaceDisplay => {
-                if !crate::gui::is_userspace_display_active() {
+                if !crate::io::gui::is_userspace_display_active() {
                     Action::None
                 } else {
                     state.stage = DeferredInputStage::WaitingForAuxBringUp;
@@ -82,14 +84,14 @@ pub fn service_pending() -> usize {
                 }
             }
             DeferredInputStage::WaitingForAuxBringUp => {
-                if crate::rtc::ticks() < state.deadline_tick {
+                if crate::arch::rtc::ticks() < state.deadline_tick {
                     Action::None
                 } else {
                     Action::InitializeAuxTransport
                 }
             }
             DeferredInputStage::WaitingForLoadableMouseDriver => {
-                if crate::rtc::ticks() < state.deadline_tick {
+                if crate::arch::rtc::ticks() < state.deadline_tick {
                     Action::None
                 } else {
                     state.stage = DeferredInputStage::Completed;
@@ -123,7 +125,7 @@ pub fn service_pending() -> usize {
         }
         Action::InitializeLoadableModules => {
             crate::debug::println!("Deferred input service: loading serio mouse modules");
-            driver::initialize_loadable_modules();
+            driver::initialize_loadable_modules_for_bus(DriverBus::Serio);
             work += 1;
             work
         }
@@ -132,13 +134,13 @@ pub fn service_pending() -> usize {
 
 fn deadline_after_ms(milliseconds: u64) -> u64 {
     if milliseconds == 0 {
-        return crate::rtc::ticks();
+        return crate::arch::rtc::ticks();
     }
 
-    let ticks_per_second = crate::rtc::ticks_per_second().max(1);
+    let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
     let ticks_needed = (milliseconds.saturating_mul(ticks_per_second) + 999) / 1000;
     let ticks_needed = core::cmp::max(1, ticks_needed);
-    crate::rtc::ticks().saturating_add(ticks_needed)
+    crate::arch::rtc::ticks().saturating_add(ticks_needed)
 }
 
 fn report_keyboard_transport(result: i8042::KeyboardTransportInitResult) {
@@ -151,11 +153,11 @@ fn report_keyboard_transport(result: i8042::KeyboardTransportInitResult) {
                 info.controller_self_test_passed,
                 info.first_port_test_passed,
             );
-            crate::console::write(b"PS/2 keyboard transport ready.\r\n");
+            crate::io::console::write(b"PS/2 keyboard transport ready.\r\n");
         }
         i8042::KeyboardTransportInitResult::Unavailable(reason) => {
             crate::debug::println!("PS/2 keyboard transport unavailable: {}", reason);
-            crate::console::write(b"PS/2 keyboard transport unavailable.\r\n");
+            crate::io::console::write(b"PS/2 keyboard transport unavailable.\r\n");
         }
     }
 }
@@ -168,14 +170,14 @@ fn report_aux_transport(result: i8042::AuxTransportInitResult) {
                 info.controller_configured,
                 info.second_port_test_passed,
             );
-            if !crate::gui::is_userspace_display_active() {
-                crate::console::write(b"PS/2 aux serio port ready.\r\n");
+            if !crate::io::gui::is_userspace_display_active() {
+                crate::io::console::write(b"PS/2 aux serio port ready.\r\n");
             }
         }
         i8042::AuxTransportInitResult::Unavailable(reason) => {
             crate::debug::println!("PS/2 aux serio port unavailable: {}", reason);
-            if !crate::gui::is_userspace_display_active() {
-                crate::console::write(b"PS/2 aux serio port unavailable.\r\n");
+            if !crate::io::gui::is_userspace_display_active() {
+                crate::io::console::write(b"PS/2 aux serio port unavailable.\r\n");
             }
         }
     }
@@ -184,9 +186,7 @@ fn report_aux_transport(result: i8042::AuxTransportInitResult) {
 fn initialize_deferred_aux_transport() -> bool {
     match i8042::init_aux_mouse_port() {
         i8042::AuxTransportInitResult::Ready(info) => {
-            crate::debug::println!(
-                "Deferred input service: aux transport ready"
-            );
+            crate::debug::println!("Deferred input service: aux transport ready");
             report_aux_transport(i8042::AuxTransportInitResult::Ready(info));
             true
         }

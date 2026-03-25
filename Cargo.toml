@@ -3,7 +3,12 @@
 members = [
     "bootloader",
     "bootloader/boot-protocol",
+    "crates/boot-random",
+    "crates/boot-storage",
+    "crates/driver-module-runtime",
+    "crates/keyboard-core",
     "driver-abi",
+    "drivers/display/bootfb",
     "drivers/display/amdgpu",
     "drivers/input/keyboard",
     "kernel",

@@ -34,41 +34,40 @@ pub(crate) fn mmap(
         }
         let mapped_addr = device::mmap_current_process_handle(fd, user_len, prot, flags, offset)
             .map_err(LinuxSysopError::from)?;
-        let record_result = multitask::with_current_user_process_state_mut(|_, abi, process_state| {
-            if abi != UserAbi::Linux {
-                return Err(LinuxSysopError::Unsupported);
-            }
+        let record_result =
+            multitask::with_current_user_process_state_mut(|_, abi, process_state| {
+                if abi != UserAbi::Linux {
+                    return Err(LinuxSysopError::Unsupported);
+                }
 
-            let mapping_name = match process_state.handles().get(fd) {
-                Some(KernelHandle::DisplaySurface(_)) => {
-                    linux_abi::LinuxVmaName::Label("anon_inode:[rustos-display-surface]")
-                }
-                Some(KernelHandle::Device(device)) => {
-                    linux_abi::LinuxVmaName::Path(alloc::string::String::from(
-                        device.device_id().path(),
-                    ))
-                }
-                Some(_) => linux_abi::LinuxVmaName::None,
-                None => return Err(LinuxSysopError::BadFileDescriptor),
-            };
-            let mapped_end = mapped_addr
-                .checked_add(align_up(user_len, PAGE_SIZE))
+                let mapping_name = match process_state.handles().get(fd) {
+                    Some(KernelHandle::DisplaySurface(_)) => {
+                        linux_abi::LinuxVmaName::Label("anon_inode:[rustos-display-surface]")
+                    }
+                    Some(KernelHandle::Device(device)) => linux_abi::LinuxVmaName::Path(
+                        alloc::string::String::from(device.device_id().path()),
+                    ),
+                    Some(_) => linux_abi::LinuxVmaName::None,
+                    None => return Err(LinuxSysopError::BadFileDescriptor),
+                };
+                let mapped_end = mapped_addr
+                    .checked_add(align_up(user_len, PAGE_SIZE))
+                    .ok_or(LinuxSysopError::InvalidArgument)?;
+                let area = linux_abi::LinuxVma::new(
+                    mapped_addr,
+                    mapped_end,
+                    offset,
+                    linux_vma_flags_from_mmap(prot, flags),
+                    mapping_name,
+                )
                 .ok_or(LinuxSysopError::InvalidArgument)?;
-            let area = linux_abi::LinuxVma::new(
-                mapped_addr,
-                mapped_end,
-                offset,
-                linux_vma_flags_from_mmap(prot, flags),
-                mapping_name,
-            )
-            .ok_or(LinuxSysopError::InvalidArgument)?;
-            let memory_map = process_state
-                .linux_memory_map_mut()
-                .ok_or(LinuxSysopError::Unsupported)?;
-            memory_map.replace_area(area);
-            Ok(())
-        })
-        .ok_or(LinuxSysopError::Unsupported)?;
+                let memory_map = process_state
+                    .linux_memory_map_mut()
+                    .ok_or(LinuxSysopError::Unsupported)?;
+                memory_map.replace_area(area);
+                Ok(())
+            })
+            .ok_or(LinuxSysopError::Unsupported)?;
 
         if let Err(err) = record_result {
             let _ = device::munmap_current_process_range(mapped_addr, user_len);
@@ -263,8 +262,7 @@ pub(crate) fn mprotect(start: u64, user_len: u64, prot: u64) -> Result<(), Linux
             .protect_range(start, end, linux_vma_flags_from_prot(prot, false))
             .map_err(|_| LinuxSysopError::AddressSpace(paging::AddressSpaceError::NotMapped))?;
         Ok(())
-    })
-    else {
+    }) else {
         return Err(LinuxSysopError::Unsupported);
     };
 
@@ -362,7 +360,7 @@ fn map_linux_user_region(
     fixed_mapping: bool,
     page_count: usize,
     page_flags: PageTableFlags,
-) -> Result<crate::paging::UserRegion, LinuxSysopError> {
+) -> Result<crate::memory::paging::UserRegion, LinuxSysopError> {
     let span = (page_count as u64)
         .checked_mul(PAGE_SIZE)
         .ok_or(LinuxSysopError::NoMemory)?;
@@ -412,7 +410,7 @@ fn reserve_linux_user_region(
     requested_addr: u64,
     fixed_mapping: bool,
     page_count: usize,
-) -> Result<crate::paging::UserRegion, LinuxSysopError> {
+) -> Result<crate::memory::paging::UserRegion, LinuxSysopError> {
     let span = (page_count as u64)
         .checked_mul(PAGE_SIZE)
         .ok_or(LinuxSysopError::NoMemory)?;
@@ -458,7 +456,7 @@ fn map_linux_user_region_at(
     page_count: usize,
     page_flags: PageTableFlags,
     replace_existing: bool,
-) -> Result<crate::paging::UserRegion, LinuxSysopError> {
+) -> Result<crate::memory::paging::UserRegion, LinuxSysopError> {
     let end = start.checked_add(span).ok_or(LinuxSysopError::NoMemory)?;
     if end > linux_process_state.brk_limit() || end <= linux_process_state.brk_mapped_end {
         return Err(LinuxSysopError::NoMemory);
@@ -498,7 +496,7 @@ fn reserve_linux_user_region_at(
     start: u64,
     span: u64,
     page_count: usize,
-) -> Result<crate::paging::UserRegion, LinuxSysopError> {
+) -> Result<crate::memory::paging::UserRegion, LinuxSysopError> {
     let end = start.checked_add(span).ok_or(LinuxSysopError::NoMemory)?;
     if end > linux_process_state.brk_limit() || end <= linux_process_state.brk_mapped_end {
         return Err(LinuxSysopError::NoMemory);
@@ -521,7 +519,7 @@ fn reserve_linux_user_region_at(
     if end > linux_process_state.mmap_next {
         linux_process_state.mmap_next = align_up(end, PAGE_SIZE);
     }
-    Ok(crate::paging::UserRegion {
+    Ok(crate::memory::paging::UserRegion {
         start: VirtAddr::new(start),
         page_count,
     })
@@ -593,8 +591,7 @@ fn mmap_current_process_file(
             while copied < copy_len {
                 let chunk_len = (copy_len - copied).min(chunk.len());
                 let read = {
-                    let Some(KernelHandle::VfsFile(file)) =
-                        process_state.handles_mut().get_mut(fd)
+                    let Some(KernelHandle::VfsFile(file)) = process_state.handles_mut().get_mut(fd)
                     else {
                         return Err(LinuxSysopError::BadFileDescriptor);
                     };

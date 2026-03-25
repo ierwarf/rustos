@@ -1,7 +1,7 @@
 use x86_64::VirtAddr;
 
+use crate::memory::paging::{self, ProcessAddressSpace};
 use crate::multitask;
-use crate::paging::{self, ProcessAddressSpace};
 
 pub(crate) fn current_user_address_space()
 -> Result<&'static ProcessAddressSpace, paging::AddressSpaceError> {

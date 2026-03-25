@@ -1,208 +1,83 @@
-#![allow(dead_code)]
+#[cfg(test)]
+mod tests {
+    use boot_protocol::{
+        BootFileManifest, BootInfo, BootMemoryMap, BootPixelFormat, FramebufferInfo,
+    };
+    use boot_random::{Random, init as init_random};
+    use driver_abi::{DRIVER_MODULE_ABI_VERSION, DriverBus, DriverClass, DriverModuleHeader};
+    use keyboard_core::{KeyAction, KeyCode, KeyboardDriver, Modifiers, ScanCodeSet};
 
-extern crate alloc;
+    #[test]
+    fn keyboard_core_decodes_basic_typing() {
+        let mut keyboard = KeyboardDriver::new();
+        keyboard.feed_scancode(0x1e);
 
-mod pic {
-    pub fn enable_irq(_irq: u8) {}
-}
-
-mod debug {
-    pub fn write_bytes(_bytes: &[u8]) {}
-}
-
-#[path = "../../kernel/src/io/session.rs"]
-mod session;
-
-mod gui {
-    use core::sync::atomic::{AtomicBool, AtomicI16, AtomicUsize, Ordering};
-
-    use crate::session::ConsoleSessionId;
-
-    static MOUSE_VISIBLE: AtomicBool = AtomicBool::new(false);
-    static MOUSE_LEFT_BUTTON: AtomicBool = AtomicBool::new(false);
-    static MOUSE_MOVE_X: AtomicI16 = AtomicI16::new(0);
-    static MOUSE_MOVE_Y: AtomicI16 = AtomicI16::new(0);
-    static MOUSE_SHOW_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-    pub fn init_console() {}
-
-    pub fn write_console(_bytes: &[u8]) {}
-
-    pub fn write_console_session(_session: ConsoleSessionId, _bytes: &[u8]) {}
-
-    pub fn try_write_console(_bytes: &[u8]) -> bool {
-        true
+        let event = keyboard.pop_event().expect("keyboard event");
+        assert_eq!(event.code, KeyCode::A);
+        assert_eq!(event.action, KeyAction::Pressed);
+        assert_eq!(event.modifiers, Modifiers::empty());
+        assert_eq!(event.text, Some(b'a'));
     }
 
-    pub fn tick_console_cursor() {}
+    #[test]
+    fn keyboard_core_decodes_set2_extended_key() {
+        let mut keyboard = KeyboardDriver::new();
+        keyboard.set_scan_code_set(ScanCodeSet::Set2);
+        keyboard.feed_scancode(0xe0);
+        keyboard.feed_scancode(0x75);
 
-    pub fn sync_desktop_windows() {}
-
-    pub fn is_userspace_display_active() -> bool {
-        false
+        let event = keyboard.pop_event().expect("keyboard event");
+        assert_eq!(event.code, KeyCode::ArrowUp);
+        assert_eq!(event.action, KeyAction::Pressed);
+        assert_eq!(event.text, None);
     }
 
-    pub fn focused_console_session() -> ConsoleSessionId {
-        ConsoleSessionId::PRIMARY
+    #[test]
+    fn driver_module_header_round_trips_strings() {
+        let header = DriverModuleHeader::new(
+            DriverClass::Input,
+            DriverBus::Usb,
+            "system/drivers/input/usbhid.ko",
+            "usbhid",
+        );
+
+        assert_eq!(header.abi_version, DRIVER_MODULE_ABI_VERSION);
+        assert_eq!(header.class, DriverClass::Input);
+        assert_eq!(header.bus, DriverBus::Usb);
+        assert_eq!(
+            header.module_path_str().unwrap(),
+            "system/drivers/input/usbhid.ko"
+        );
+        assert_eq!(header.name_str().unwrap(), "usbhid");
     }
 
-    pub fn show_mouse_cursor() -> bool {
-        MOUSE_VISIBLE.store(true, Ordering::Release);
-        MOUSE_SHOW_COUNT.fetch_add(1, Ordering::Relaxed);
-        true
-    }
+    #[test]
+    fn boot_random_uses_boot_seed_for_ranges() {
+        let boot_info = BootInfo {
+            magic: 0,
+            version: 0,
+            _reserved0: 0,
+            rng_seed: [0x5a; 32],
+            acpi_rsdp_addr: 0,
+            framebuffer: FramebufferInfo {
+                addr: 0,
+                size: 0,
+                back_buffer_addr: 0,
+                back_buffer_size: 0,
+                width: 0,
+                height: 0,
+                stride: 0,
+                pixel_format: BootPixelFormat::Unknown,
+                bytes_per_pixel: 0,
+                _reserved: [0; 3],
+            },
+            memory_map: BootMemoryMap::empty(),
+            boot_files: BootFileManifest::empty(),
+        };
 
-    pub fn move_mouse_cursor_relative(dx: i16, dy: i16) -> bool {
-        MOUSE_MOVE_X.store(dx, Ordering::Release);
-        MOUSE_MOVE_Y.store(dy, Ordering::Release);
-        true
-    }
-
-    pub fn set_mouse_left_button(pressed: bool) -> bool {
-        MOUSE_LEFT_BUTTON.store(pressed, Ordering::Release);
-        true
-    }
-
-    #[allow(dead_code)]
-    pub fn reset_mouse_state() {
-        MOUSE_VISIBLE.store(false, Ordering::Release);
-        MOUSE_LEFT_BUTTON.store(false, Ordering::Release);
-        MOUSE_MOVE_X.store(0, Ordering::Release);
-        MOUSE_MOVE_Y.store(0, Ordering::Release);
-        MOUSE_SHOW_COUNT.store(0, Ordering::Release);
-    }
-
-    #[allow(dead_code)]
-    pub fn mouse_visible() -> bool {
-        MOUSE_VISIBLE.load(Ordering::Acquire)
-    }
-
-    #[allow(dead_code)]
-    pub fn last_mouse_move() -> (i16, i16) {
-        (
-            MOUSE_MOVE_X.load(Ordering::Acquire),
-            MOUSE_MOVE_Y.load(Ordering::Acquire),
-        )
-    }
-
-    #[allow(dead_code)]
-    pub fn mouse_show_count() -> usize {
-        MOUSE_SHOW_COUNT.load(Ordering::Acquire)
-    }
-
-    #[allow(dead_code)]
-    pub fn last_mouse_left_button() -> bool {
-        MOUSE_LEFT_BUTTON.load(Ordering::Acquire)
+        init_random(&boot_info);
+        let mut rng = Random::new();
+        let value = rng.randint(-8, 24);
+        assert!((-8..24).contains(&value));
     }
 }
-
-mod desktop {
-    pub fn sync_all_console_windows() {}
-}
-
-mod driver {
-    pub mod input {
-        use driver_abi::PointerPacket;
-
-        pub fn reset_pointer_state() {}
-
-        pub fn submit_pointer_packet(_packet: PointerPacket) -> bool {
-            true
-        }
-    }
-
-    pub mod serio {
-        use driver_abi::SerioPortInfo;
-
-        #[derive(Clone, Copy, Default)]
-        pub struct SerioPortOps {
-            pub open: Option<fn() -> i32>,
-            pub close: Option<fn()>,
-            pub write_byte: Option<fn(u8) -> i32>,
-            pub ps2_command: Option<fn(u8, &[u8], &mut [u8]) -> i32>,
-            pub drain: Option<fn(usize, u32)>,
-        }
-
-        pub fn register_port(_info: SerioPortInfo) {}
-
-        pub fn register_port_with_ops(_info: SerioPortInfo, _ops: SerioPortOps) {}
-
-        pub fn receive_byte(_port_id: u32, _byte: u8, _flags: u32) -> bool {
-            true
-        }
-    }
-}
-
-mod input {
-    pub mod dispatcher {
-        use crate::keyboard::KeyboardEvent;
-
-        pub fn dispatch_keyboard_event(event: KeyboardEvent) {
-            super::event_queue::push_keyboard_event(event);
-        }
-    }
-
-    pub mod event_queue {
-        use crate::keyboard::KeyboardEvent;
-
-        pub fn push_keyboard_event(_event: KeyboardEvent) {}
-        pub fn push_pointer_motion(_dx: i16, _dy: i16) {}
-        pub fn push_pointer_scroll(_vertical: i16, _horizontal: i16) {}
-        pub fn push_pointer_button_left(_pressed: bool) {}
-        pub fn push_pointer_button(_code: u32, _pressed: bool) {}
-    }
-}
-
-mod multitask {
-    pub struct Thread;
-
-    impl Thread {
-        pub fn new(_entry: fn(u64), _weight_micros: u64) -> Self {
-            Self
-        }
-
-        pub fn start(&self) {}
-    }
-
-    pub fn service_deferred_work() -> usize {
-        0
-    }
-
-    pub fn current_user_id() -> Option<u64> {
-        None
-    }
-
-    pub fn block_current_user_task() -> bool {
-        false
-    }
-
-    pub fn yield_now() {}
-
-    pub fn wake_user_task(_task_id: u64) -> bool {
-        false
-    }
-}
-
-#[path = "../../kernel/src/util/ring.rs"]
-mod ring;
-
-#[path = "../../kernel/src/io/console.rs"]
-mod console;
-
-#[path = "../../kernel/src/io/tty.rs"]
-mod tty;
-
-#[path = "../../kernel/src/input/keyboard.rs"]
-mod keyboard;
-
-#[path = "../../kernel/src/storage/fat.rs"]
-mod fat;
-
-#[path = "../../kernel/src/arch/pit.rs"]
-mod pit;
-
-#[path = "../../kernel/src/arch/rtc.rs"]
-mod rtc;
-
-#[path = "../../prekernel/src/load/elf_loader.rs"]
-mod prekernel_elf_loader;

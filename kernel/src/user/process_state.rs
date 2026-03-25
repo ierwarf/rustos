@@ -4,7 +4,7 @@ use core::convert::TryFrom;
 use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
 
-use crate::paging::{self, AddressSpaceError, ProcessAddressSpace, UserRegion};
+use crate::memory::paging::{self, AddressSpaceError, ProcessAddressSpace, UserRegion};
 use crate::user::handles::HandleTable;
 use crate::user::linux::{
     LinuxMemoryMapState, LinuxProcessState, LinuxSigAction, MAX_SIGNAL_NUMBER,
@@ -291,11 +291,7 @@ impl UserProcessState {
             .find(|allocation| allocation.base == base)
     }
 
-    pub fn windows_allocation_containing(
-        &self,
-        start: u64,
-        len: u64,
-    ) -> Option<WindowsAllocation> {
+    pub fn windows_allocation_containing(&self, start: u64, len: u64) -> Option<WindowsAllocation> {
         self.windows_allocations
             .iter()
             .copied()
@@ -370,14 +366,18 @@ impl SharedUserProcessState {
     }
 
     pub fn retain(&mut self) {
-        self.ref_count = self.ref_count.saturating_add(1);
+        self.ref_count = self
+            .ref_count
+            .checked_add(1)
+            .expect("shared process state refcount overflow");
     }
 
     pub fn release(&mut self) -> bool {
-        debug_assert!(self.ref_count != 0);
-        if self.ref_count != 0 {
-            self.ref_count -= 1;
-        }
+        assert!(
+            self.ref_count != 0,
+            "shared process state refcount underflow"
+        );
+        self.ref_count -= 1;
         self.ref_count == 0
     }
 }

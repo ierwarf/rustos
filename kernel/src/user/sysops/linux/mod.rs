@@ -7,12 +7,12 @@ use x86_64::VirtAddr;
 use x86_64::registers::model_specific::FsBase;
 use x86_64::structures::paging::PageTableFlags;
 
+use crate::arch::rtc;
 use crate::debug;
 use crate::input::event_queue;
 use crate::io::{device as device_ns, tty};
+use crate::memory::paging;
 use crate::multitask;
-use crate::paging;
-use crate::rtc;
 use crate::user::abi::UserAbi;
 use crate::user::handles::{
     ConsoleStreamKind, FD_CLOEXEC, FIRST_DYNAMIC_FD, FileHandleSeekWhence, HandleEntry,
@@ -91,6 +91,7 @@ pub(crate) enum LinuxSysopError {
     NotTty,
     PermissionDenied,
     ReadOnlyFilesystem,
+    Stale,
     TryAgain,
     Unsupported,
 }
@@ -110,6 +111,7 @@ impl From<device::DeviceSysopError> for LinuxSysopError {
             device::DeviceSysopError::InvalidArgument => Self::InvalidArgument,
             device::DeviceSysopError::DisplayUnavailable => Self::DisplayUnavailable,
             device::DeviceSysopError::NotFound => Self::NotFound,
+            device::DeviceSysopError::StaleSurface => Self::Stale,
             device::DeviceSysopError::Unsupported => Self::Unsupported,
         }
     }

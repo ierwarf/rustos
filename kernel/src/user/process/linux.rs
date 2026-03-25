@@ -3,18 +3,21 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp;
 use core::convert::TryFrom;
+use core::ptr;
 
+use object::LittleEndian;
+use object::elf::{self as objelf, FileHeader64 as RawElfHeader};
+use object::read::FileKind;
 use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
 use xmas_elf::ElfFile;
 use xmas_elf::dynamic::Tag as DynamicTag;
-use xmas_elf::header::{Class, Data, Machine, Type as ElfType};
 use xmas_elf::program::{ProgramHeader, SegmentData, Type as ProgramType};
 
 use crate::debug;
-use crate::fat;
+use crate::memory::paging::{self, ProcessAddressSpace};
 use crate::multitask::UserStackState;
-use crate::paging::{self, ProcessAddressSpace};
+use crate::storage::fat;
 use crate::user::abi::UserAbi;
 use crate::user::linux::{
     self as linux_abi, LinuxImageMapping, LinuxImageMappingPathKind, LinuxInitialTlsInfo,
@@ -36,11 +39,23 @@ const LINUX_STACK_CLOCK_TICKS: u64 = 100;
 const INITIAL_TLS_TCB_ALIGN: u64 = 16;
 const INITIAL_TLS_TCB_SIZE: u64 = 64;
 const INITIAL_TLS_DTV_SIZE: u64 = 32;
+const ELF64_HEADER_SIZE: usize = 64;
+const ELF64_PROGRAM_HEADER_SIZE: u64 = 56;
+const ELF_ENDIAN: LittleEndian = LittleEndian;
 
 #[derive(Clone, Copy)]
 enum ElfImageType {
     Executable,
     StaticPie,
+}
+
+#[derive(Clone, Copy)]
+struct ElfHeaderInfo {
+    image_type: ElfImageType,
+    entry_point: u64,
+    program_header_offset: u64,
+    program_header_entry_size: u64,
+    program_header_count: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -83,10 +98,11 @@ struct ElfTlsTemplateInfo {
 }
 
 pub(super) fn load_elf(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadError> {
+    validate_elf_kind(image)?;
+    let header = validate_elf_header(image)?;
     let elf = ElfFile::new(image).map_err(ProcessLoadError::InvalidElf)?;
-    let elf_image_type = validate_elf_header(&elf)?;
     let interpreter_path = elf_interpreter_path(image, &elf)?;
-    let load_bias = choose_elf_load_bias(&elf, elf_image_type, ELF_DYN_LOAD_BASE)?;
+    let load_bias = choose_elf_load_bias(&elf, header.image_type, ELF_DYN_LOAD_BASE)?;
     let mut address_space = ProcessAddressSpace::new()?;
     let mut image_mappings = Vec::new();
 
@@ -94,8 +110,9 @@ pub(super) fn load_elf(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadEr
     let mut mapped_page_ranges = [(0_u64, 0_u64); MAX_LOAD_SEGMENTS];
     let main_image = map_elf_image(
         &elf,
+        &header,
         image,
-        elf_image_type,
+        header.image_type,
         load_bias,
         LinuxImageMappingPathKind::Executable,
         &mut address_space,
@@ -110,16 +127,21 @@ pub(super) fn load_elf(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadEr
     {
         let interpreter_image = fat::read_file_to_vec(interpreter_path)
             .map_err(|error| make_interpreter_load_error(interpreter_path, error))?;
+        validate_elf_kind(interpreter_image.as_slice())?;
+        let interpreter_header = validate_elf_header(interpreter_image.as_slice())?;
         let interpreter_elf =
             ElfFile::new(interpreter_image.as_slice()).map_err(ProcessLoadError::InvalidElf)?;
-        let interpreter_type = validate_elf_header(&interpreter_elf)?;
         ensure_no_elf_interpreter(&interpreter_elf)?;
-        let interpreter_load_bias =
-            choose_elf_load_bias(&interpreter_elf, interpreter_type, ELF_INTERP_LOAD_BASE)?;
+        let interpreter_load_bias = choose_elf_load_bias(
+            &interpreter_elf,
+            interpreter_header.image_type,
+            ELF_INTERP_LOAD_BASE,
+        )?;
         let interpreter = map_elf_image(
             &interpreter_elf,
+            &interpreter_header,
             interpreter_image.as_slice(),
-            interpreter_type,
+            interpreter_header.image_type,
             interpreter_load_bias,
             LinuxImageMappingPathKind::Interpreter,
             &mut address_space,
@@ -139,6 +161,7 @@ pub(super) fn load_elf(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadEr
 
     let linux_image = build_linux_process_image(
         &elf,
+        &header,
         image,
         main_image.load_bias,
         max_loaded_end,
@@ -156,26 +179,59 @@ pub(super) fn load_elf(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadEr
     })
 }
 
-fn validate_elf_header(elf: &ElfFile<'_>) -> Result<ElfImageType, ProcessLoadError> {
-    if elf.header.pt1.class() != Class::SixtyFour {
+fn validate_elf_kind(image: &[u8]) -> Result<(), ProcessLoadError> {
+    match FileKind::parse(image).map_err(|_| ProcessLoadError::InvalidElf("invalid ELF image"))? {
+        FileKind::Elf64 => Ok(()),
+        _ => Err(ProcessLoadError::InvalidElf("ELF image is not 64-bit")),
+    }
+}
+
+fn validate_elf_header(image: &[u8]) -> Result<ElfHeaderInfo, ProcessLoadError> {
+    let header = read_raw_elf_header(image)?;
+    if header.e_ident.magic != objelf::ELFMAG {
+        return Err(ProcessLoadError::InvalidElf("invalid ELF magic"));
+    }
+    if header.e_ident.class != objelf::ELFCLASS64 {
         return Err(ProcessLoadError::InvalidElf("ELF class is not 64-bit"));
     }
-    if elf.header.pt1.data() != Data::LittleEndian {
+    if header.e_ident.data != objelf::ELFDATA2LSB {
         return Err(ProcessLoadError::InvalidElf(
             "ELF endianness is not little-endian",
         ));
     }
-    if elf.header.pt2.machine().as_machine() != Machine::X86_64 {
+    if header.e_ident.version != objelf::EV_CURRENT {
+        return Err(ProcessLoadError::InvalidElf("ELF ident version is invalid"));
+    }
+    if header.e_version.get(ELF_ENDIAN) != objelf::EV_CURRENT as u32 {
+        return Err(ProcessLoadError::InvalidElf("ELF version is invalid"));
+    }
+    if header.e_machine.get(ELF_ENDIAN) != objelf::EM_X86_64 {
         return Err(ProcessLoadError::InvalidElf("ELF machine is not x86_64"));
     }
+    if usize::from(header.e_ehsize.get(ELF_ENDIAN)) != ELF64_HEADER_SIZE {
+        return Err(ProcessLoadError::InvalidElf("ELF header size is invalid"));
+    }
+    if u64::from(header.e_phentsize.get(ELF_ENDIAN)) != ELF64_PROGRAM_HEADER_SIZE {
+        return Err(ProcessLoadError::InvalidElf(
+            "ELF program header size is invalid",
+        ));
+    }
 
-    match elf.header.pt2.type_().as_type() {
-        ElfType::Executable => Ok(ElfImageType::Executable),
-        ElfType::SharedObject => Ok(ElfImageType::StaticPie),
+    let image_type = match header.e_type.get(ELF_ENDIAN) {
+        objelf::ET_EXEC => ElfImageType::Executable,
+        objelf::ET_DYN => ElfImageType::StaticPie,
         _ => Err(ProcessLoadError::InvalidElf(
             "ELF type is not executable or static PIE",
-        )),
-    }
+        ))?,
+    };
+
+    Ok(ElfHeaderInfo {
+        image_type,
+        entry_point: header.e_entry.get(ELF_ENDIAN),
+        program_header_offset: header.e_phoff.get(ELF_ENDIAN),
+        program_header_entry_size: u64::from(header.e_phentsize.get(ELF_ENDIAN)),
+        program_header_count: u64::from(header.e_phnum.get(ELF_ENDIAN)),
+    })
 }
 
 fn ensure_no_elf_interpreter(elf: &ElfFile<'_>) -> Result<(), ProcessLoadError> {
@@ -230,17 +286,18 @@ fn choose_elf_load_bias(
     }
 }
 
-fn validate_entry_point(elf: &ElfFile<'_>, load_bias: u64) -> Result<VirtAddr, ProcessLoadError> {
-    let entry = elf
-        .header
-        .pt2
-        .entry_point()
+fn validate_entry_point(
+    header: &ElfHeaderInfo,
+    load_bias: u64,
+) -> Result<VirtAddr, ProcessLoadError> {
+    let entry = header
+        .entry_point
         .checked_add(load_bias)
         .ok_or(ProcessLoadError::InvalidElf("entry point address overflow"))?;
     if !(paging::USER_SPACE_BASE..paging::USER_SPACE_END_EXCLUSIVE).contains(&entry) {
         debug::println!(
             "process load_elf: entry out of range raw={:#x} load_bias={:#x} entry={:#x} user=[{:#x}, {:#x})",
-            elf.header.pt2.entry_point(),
+            header.entry_point,
             load_bias,
             entry,
             paging::USER_SPACE_BASE,
@@ -252,7 +309,7 @@ fn validate_entry_point(elf: &ElfFile<'_>, load_bias: u64) -> Result<VirtAddr, P
     }
     debug::println!(
         "process load_elf: entry raw={:#x} final={:#x}",
-        elf.header.pt2.entry_point(),
+        header.entry_point,
         entry,
     );
     Ok(VirtAddr::new(entry))
@@ -296,6 +353,7 @@ fn elf_interpreter_path<'a>(
 
 fn map_elf_image(
     elf: &ElfFile<'_>,
+    header: &ElfHeaderInfo,
     image: &[u8],
     image_type: ElfImageType,
     load_bias: u64,
@@ -306,7 +364,7 @@ fn map_elf_image(
     image_mappings: &mut Vec<LinuxImageMapping>,
     apply_kernel_relocations: bool,
 ) -> Result<MappedElfImage, ProcessLoadError> {
-    let entry = validate_entry_point(elf, load_bias)?;
+    let entry = validate_entry_point(header, load_bias)?;
     let mut executable_entry_covered = false;
     let mut max_loaded_end = 0_u64;
     let mut image_loaded_segments = 0usize;
@@ -470,6 +528,7 @@ fn validated_segment_bounds(
 
 fn build_linux_process_image(
     elf: &ElfFile<'_>,
+    header: &ElfHeaderInfo,
     image: &[u8],
     load_bias: u64,
     max_loaded_end: u64,
@@ -478,7 +537,7 @@ fn build_linux_process_image(
     interpreter_path: Option<String>,
     image_mappings: Vec<LinuxImageMapping>,
 ) -> Result<LinuxProcessImageInfo, ProcessLoadError> {
-    let program_headers = program_header_table_addr(elf, load_bias)?;
+    let program_headers = program_header_table_addr(elf, header, load_bias)?;
     // Dynamic ELF relies on the userspace interpreter to build the initial thread
     // pointer and module TLS layout. For direct ELF entry we provide a minimal
     // kernel-side static TLS/TCB so runtimes have a valid initial FS base.
@@ -504,8 +563,8 @@ fn build_linux_process_image(
         interpreter_base,
         interpreter_path,
         program_headers,
-        program_header_entry_size: elf.header.pt2.ph_entry_size() as u64,
-        program_header_count: elf.header.pt2.ph_count() as u64,
+        program_header_entry_size: header.program_header_entry_size,
+        program_header_count: header.program_header_count,
         brk_start,
         initial_tls,
         image_mappings,
@@ -530,8 +589,14 @@ pub(super) fn build_initial_memory_map(
                 .map(|path| LinuxVmaName::Path(path.clone()))
                 .unwrap_or(LinuxVmaName::None),
         };
-        let area = LinuxVma::new(mapping.start, mapping.end, mapping.offset, mapping.flags, name)
-            .expect("initial ELF VMA bounds are invalid");
+        let area = LinuxVma::new(
+            mapping.start,
+            mapping.end,
+            mapping.offset,
+            mapping.flags,
+            name,
+        )
+        .expect("initial ELF VMA bounds are invalid");
         maps.insert_area(area)
             .expect("initial ELF VMA ranges unexpectedly overlap");
     }
@@ -691,7 +756,11 @@ fn elf_tls_template_info(
     Ok(tls_template)
 }
 
-fn program_header_table_addr(elf: &ElfFile<'_>, load_bias: u64) -> Result<u64, ProcessLoadError> {
+fn program_header_table_addr(
+    elf: &ElfFile<'_>,
+    header: &ElfHeaderInfo,
+    load_bias: u64,
+) -> Result<u64, ProcessLoadError> {
     for ph in elf.program_iter() {
         let ph_type = ph.get_type().map_err(ProcessLoadError::InvalidElf)?;
         if ph_type == ProgramType::Phdr {
@@ -704,9 +773,10 @@ fn program_header_table_addr(elf: &ElfFile<'_>, load_bias: u64) -> Result<u64, P
         }
     }
 
-    let ph_offset = elf.header.pt2.ph_offset();
-    let ph_size = (elf.header.pt2.ph_entry_size() as u64)
-        .checked_mul(elf.header.pt2.ph_count() as u64)
+    let ph_offset = header.program_header_offset;
+    let ph_size = header
+        .program_header_entry_size
+        .checked_mul(header.program_header_count)
         .ok_or(ProcessLoadError::InvalidElf(
             "program header table size overflow",
         ))?;
@@ -969,6 +1039,15 @@ fn segment_page_flags(ph: &ProgramHeader<'_>) -> PageTableFlags {
     flags
 }
 
+fn read_raw_elf_header(image: &[u8]) -> Result<RawElfHeader<LittleEndian>, ProcessLoadError> {
+    let bytes: &[u8; ELF64_HEADER_SIZE] = image
+        .get(..ELF64_HEADER_SIZE)
+        .ok_or(ProcessLoadError::InvalidElf("ELF header is truncated"))?
+        .try_into()
+        .map_err(|_| ProcessLoadError::InvalidElf("ELF header is truncated"))?;
+    Ok(unsafe { ptr::read_unaligned(bytes.as_ptr() as *const RawElfHeader<LittleEndian>) })
+}
+
 pub(super) fn initialize_linux_initial_tls(
     address_space: &mut ProcessAddressSpace,
     image: &LinuxProcessImageInfo,
@@ -1013,7 +1092,7 @@ pub(super) fn initialize_linux_user_stack(
     let aligned_top = align_down(stack_end.as_u64(), 16);
     let mut cursor = aligned_top;
     let mut random_bytes = [0_u8; LINUX_STACK_RANDOM_BYTES];
-    crate::random::Random::new().fill_bytes(&mut random_bytes);
+    crate::util::random::Random::new().fill_bytes(&mut random_bytes);
     let random_addr = push_stack_bytes(
         address_space,
         &mut cursor,
@@ -1196,7 +1275,7 @@ mod tests {
         ELF_DYN_LOAD_BASE, ElfTlsTemplateInfo, INITIAL_TLS_TCB_ALIGN, INITIAL_TLS_TCB_SIZE,
         elf_initial_tls_info_from_template,
     };
-    use crate::paging::USER_SPACE_BASE;
+    use crate::memory::paging::USER_SPACE_BASE;
 
     #[test]
     fn initial_tls_layout_places_tls_before_thread_pointer() {

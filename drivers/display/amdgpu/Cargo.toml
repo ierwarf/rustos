@@ -12,4 +12,5 @@ path = "src/lib.rs"
 crate-type = ["rlib"]
 
 [dependencies]
+driver-module-runtime = { path = "../../../crates/driver-module-runtime" }
 driver-abi = { path = "../../../driver-abi" }

@@ -5,12 +5,12 @@ use embedded_graphics::mono_font::{ascii::FONT_9X18_BOLD, MonoTextStyle};
 use embedded_graphics::pixelcolor::Rgb888;
 use embedded_graphics::text::{Baseline, Text};
 use embedded_graphics::Drawable;
+use vte::{Params, Parser, Perform};
 
 use crate::canvas::{Rect, SurfaceCanvas};
 
 const TERMINAL_PADDING_X: usize = 14;
 const TERMINAL_PADDING_Y: usize = 12;
-const CONSOLE_TAB_WIDTH: usize = 4;
 const MAX_CONSOLE_COLS: usize = 240;
 const MAX_CONSOLE_ROWS: usize = 128;
 const MAX_CONSOLE_CELLS: usize = MAX_CONSOLE_COLS * MAX_CONSOLE_ROWS;
@@ -81,32 +81,25 @@ impl TerminalLayout {
     }
 }
 
-#[derive(Clone, Copy)]
-enum EscapeState {
-    Ground,
-    Escape,
-    Csi { param: usize, has_param: bool },
-}
-
 pub(crate) struct TerminalState {
     layout: TerminalLayout,
     cursor_col: usize,
     cursor_row: usize,
     cells: [u8; MAX_CONSOLE_CELLS],
-    escape_state: EscapeState,
+    parser: Parser,
     cursor_visible: bool,
     focused: bool,
     initialized: bool,
 }
 
 impl TerminalState {
-    pub(crate) const fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             layout: TerminalLayout::empty(),
             cursor_col: 0,
             cursor_row: 0,
             cells: [b' '; MAX_CONSOLE_CELLS],
-            escape_state: EscapeState::Ground,
+            parser: Parser::new(),
             cursor_visible: true,
             focused: false,
             initialized: false,
@@ -117,7 +110,7 @@ impl TerminalState {
         let layout = TerminalLayout::for_client_rect(client_rect);
         self.reset(layout, focused);
         for &byte in bytes {
-            self.write_byte(byte);
+            self.advance_parser(byte);
         }
     }
 
@@ -144,6 +137,25 @@ impl TerminalState {
 
     pub(crate) fn set_focused(&mut self, focused: bool) {
         self.focused = focused;
+    }
+
+    pub(crate) fn show_cursor(&mut self) -> bool {
+        if !self.initialized || self.layout.cols == 0 || self.layout.rows == 0 {
+            return false;
+        }
+        if self.cursor_visible {
+            return false;
+        }
+        self.cursor_visible = true;
+        true
+    }
+
+    pub(crate) fn toggle_cursor(&mut self) -> bool {
+        if !self.initialized || self.layout.cols == 0 || self.layout.rows == 0 {
+            return false;
+        }
+        self.cursor_visible = !self.cursor_visible;
+        true
     }
 
     pub(crate) fn render(&self, canvas: &mut SurfaceCanvas<'_>) {
@@ -196,67 +208,17 @@ impl TerminalState {
         self.layout = layout;
         self.cursor_col = 0;
         self.cursor_row = 0;
-        self.escape_state = EscapeState::Ground;
+        self.parser = Parser::new();
         self.cursor_visible = true;
         self.focused = focused;
         self.initialized = true;
         self.cells = [b' '; MAX_CONSOLE_CELLS];
     }
 
-    fn write_byte(&mut self, byte: u8) {
-        match self.escape_state {
-            EscapeState::Ground => {}
-            EscapeState::Escape => {
-                self.escape_state = match byte {
-                    b'[' => EscapeState::Csi {
-                        param: 0,
-                        has_param: false,
-                    },
-                    0x1b => EscapeState::Escape,
-                    _ => EscapeState::Ground,
-                };
-                return;
-            }
-            EscapeState::Csi {
-                mut param,
-                mut has_param,
-            } => {
-                match byte {
-                    b'0'..=b'9' => {
-                        param = param
-                            .saturating_mul(10)
-                            .saturating_add((byte - b'0') as usize);
-                        has_param = true;
-                        self.escape_state = EscapeState::Csi { param, has_param };
-                    }
-                    b'C' => {
-                        self.escape_state = EscapeState::Ground;
-                        self.move_cursor_forward(if has_param { param.max(1) } else { 1 });
-                    }
-                    b'D' => {
-                        self.escape_state = EscapeState::Ground;
-                        self.move_cursor_backward(if has_param { param.max(1) } else { 1 });
-                    }
-                    _ => self.escape_state = EscapeState::Ground,
-                }
-                return;
-            }
-        }
-
-        match byte {
-            0x1b => self.escape_state = EscapeState::Escape,
-            b'\r' => self.cursor_col = 0,
-            b'\n' => self.new_line(),
-            0x08 => self.backspace(),
-            b'\t' => {
-                let spaces = CONSOLE_TAB_WIDTH - (self.cursor_col % CONSOLE_TAB_WIDTH);
-                for _ in 0..spaces {
-                    self.put_char(b' ');
-                }
-            }
-            0x20..=0x7e => self.put_char(byte),
-            _ => {}
-        }
+    fn advance_parser(&mut self, byte: u8) {
+        let mut parser = core::mem::take(&mut self.parser);
+        parser.advance(self, core::slice::from_ref(&byte));
+        self.parser = parser;
     }
 
     fn put_char(&mut self, byte: u8) {
@@ -365,6 +327,52 @@ impl TerminalState {
         let index = self.cell_index(row, col);
         self.cells[index] = byte;
     }
+}
+
+impl Perform for TerminalState {
+    fn print(&mut self, c: char) {
+        if c.is_ascii_graphic() || c == ' ' {
+            self.put_char(c as u8);
+        }
+    }
+
+    fn execute(&mut self, byte: u8) {
+        match byte {
+            b'\r' => self.cursor_col = 0,
+            b'\n' | 0x0b | 0x0c => self.new_line(),
+            0x08 => self.backspace(),
+            b'\t' => {
+                let next_stop = ((self.cursor_col / 8) + 1) * 8;
+                let spaces = next_stop.saturating_sub(self.cursor_col).max(1);
+                for _ in 0..spaces {
+                    self.put_char(b' ');
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+        if ignore || !intermediates.is_empty() {
+            return;
+        }
+
+        let count = first_csi_param(params).max(1);
+        match action {
+            'C' => self.move_cursor_forward(count),
+            'D' => self.move_cursor_backward(count),
+            _ => {}
+        }
+    }
+}
+
+fn first_csi_param(params: &Params) -> usize {
+    params
+        .iter()
+        .next()
+        .and_then(|param| param.first().copied())
+        .map(usize::from)
+        .unwrap_or(0)
 }
 
 fn terminal_background_color() -> u32 {
