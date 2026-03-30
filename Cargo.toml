@@ -1,21 +1,21 @@
 [workspace]
 
 members = [
-    "bootloader",
-    "bootloader/boot-protocol",
-    "crates/boot-random",
-    "crates/boot-storage",
-    "crates/driver-module-runtime",
-    "crates/keyboard-core",
-    "driver-abi",
+    "boot/bootloader",
+    "boot/bootloader/boot-protocol",
+    "boot/prekernel",
+    "boot/boot-random",
+    "boot/boot-storage",
+    "core/kernel",
+    "system/packages/uiserver",
+    "drivers/driver-abi",
+    "drivers/driver-module-runtime",
     "drivers/display/bootfb",
     "drivers/display/amdgpu",
+    "drivers/input/keyboard-core",
     "drivers/input/keyboard",
-    "kernel",
-    "module-tests",
-    "prekernel",
-    "uiserver",
-    "xtask",
+    "tests/module-tests",
+    "tools/xtask",
 ]
 resolver = "3"
 

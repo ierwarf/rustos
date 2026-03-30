@@ -13,5 +13,5 @@ crate-type = ["rlib"]
 
 [dependencies]
 bitflags = { version = "2.11", default-features = false }
-driver-abi = { path = "../../../driver-abi" }
-keyboard-core = { path = "../../../crates/keyboard-core" }
+driver-abi = { path = "../../driver-abi" }
+keyboard-core = { path = "../keyboard-core" }

@@ -1,0 +1,13 @@
+LIBRARY vcruntime140.dll
+EXPORTS
+    __C_specific_handler
+    __current_exception
+    __current_exception_context
+    __security_check_cookie
+    __security_cookie DATA
+    __security_cookie_complement DATA
+    __security_init_cookie
+    _crt_atexit
+    _initterm
+    _initterm_e
+    _register_thread_local_exe_atexit_callback

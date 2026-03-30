@@ -1,0 +1,20 @@
+id = "userdemo2"
+kind = "sample"
+profiles = ["default"]
+
+[build]
+builder = "mingw-c-exe"
+source = "winmain.c"
+output_name = "userdemo2.exe"
+
+[install]
+path = "samples/windows/userdemo2/userdemo2.exe"
+
+[boot]
+preload = true
+required = false
+priority = 120
+
+[[desktop.entries]]
+display_name = "userdemo2.exe"
+weight_micros = 50

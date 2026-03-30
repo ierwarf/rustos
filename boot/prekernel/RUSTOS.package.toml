@@ -1,0 +1,15 @@
+id = "prekernel"
+kind = "boot"
+profiles = ["default"]
+
+[build]
+builder = "prekernel-rustc"
+package = "prekernel"
+
+[install]
+path = "prekernel.elf"
+
+[boot]
+preload = false
+required = true
+priority = -2000

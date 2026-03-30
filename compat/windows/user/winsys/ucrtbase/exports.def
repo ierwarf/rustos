@@ -1,0 +1,65 @@
+LIBRARY ucrtbase.dll
+EXPORTS
+    __C_specific_handler
+    __acrt_iob_func
+    __getmainargs
+    __initenv DATA
+    __p___argc
+    __p___argv
+    __p__commode
+    __p__environ
+    __p__fmode
+    _acmdln DATA
+    _cexit
+    _commode DATA
+    _configure_narrow_argv
+    _errno
+    _fmode DATA
+    _get_initial_narrow_environment
+    _get_narrow_winmain_command_line
+    _initialize_narrow_environment
+    _initialize_onexit_table
+    _execute_onexit_table
+    _initterm
+    _initterm_e
+    _lock
+    _onexit
+    _register_onexit_function
+    _unlock
+    abort
+    calloc
+    exit
+    fflush
+    fprintf
+    fgets
+    fputc
+    fwrite
+    free
+    getchar
+    getc
+    isspace
+    isxdigit
+    localeconv
+    malloc
+    memcpy
+    memset
+    printf
+    putchar
+    puts
+    realloc
+    scanf
+    signal
+    stderr DATA
+    stdin DATA
+    stdout DATA
+    strerror
+    strlen
+    strncmp
+    strtol
+    strtoul
+    tolower
+    ungetc
+    vfprintf
+    wcslen
+    __stdio_common_vfprintf
+    __stdio_common_vfscanf

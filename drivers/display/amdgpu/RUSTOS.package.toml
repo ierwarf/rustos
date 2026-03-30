@@ -1,0 +1,24 @@
+id = "amdgpu"
+kind = "driver"
+profiles = ["default"]
+
+[build]
+builder = "module-image"
+package = "rustos-amdgpu-driver"
+crate_name = "rustos_amdgpu_driver"
+dependency_crates = ["driver_module_runtime", "driver_abi"]
+
+[install]
+path = "system/drivers/display/amdgpu.ko"
+
+[boot]
+preload = true
+required = false
+priority = -300
+
+[autoload]
+name = "amdgpu"
+class = "display"
+bus = "pci"
+priority = 0
+when = "vfs-ready"

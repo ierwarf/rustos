@@ -7,14 +7,17 @@
 ## 디렉터리 역할
 
 - `assets/image/`: staged 부팅 이미지에 그대로 덮어쓸 정적 overlay
-- `bootloader/`: UEFI 부트로더와 boot protocol
-- `crates/`: boot chain, keyboard core, driver module runtime 같은 공용 crate
+- `boot/bootloader/`: UEFI 부트로더와 boot protocol
+- `boot/prekernel/`: `kernel.elf` 적재와 초기 KASLR 적용
+- `core/kernel/`: 커널 본체
+- `system/packages/`: native 서비스와 앱 소스
+- `compat/windows/user/`: Windows userland 호환 DLL/runtime 소스
+- `samples/`: demo, smoke, validation 프로그램 소스
+- `tests/`: 통합 테스트 crate
+- `tools/xtask/`: host-side build, stage, run orchestrator
+- `boot/`: boot chain 바이너리와 boot-owned 공용 crate
+- `drivers/`: first-party `.ko` 드라이버와 driver ABI/runtime 공용 crate
 - `docs/`: 구조 문서와 README 이미지 자산
-- `drivers/`: first-party `.ko` 드라이버 소스
-- `kernel/`: 커널 본체
-- `module-tests/`: 공용 crate와 모듈 ABI를 검증하는 통합 테스트
-- `prekernel/`: `kernel.elf` 적재와 초기 KASLR 적용
-- `uiserver/`: userspace UI 서버
 - `vendor/`: git 에 유지하는 외부 바이너리 자산과 prebuilt `.ko`, OVMF
 - `build/artifacts/`: 컴파일 산출물 보관소
 - `build/image/`: 실제 부팅 볼륨 루트
@@ -64,6 +67,7 @@ cargo xtask run
 ## 자산 배치 규칙
 
 - first-party 드라이버 소스는 `drivers/...` 에 둡니다.
+- deployable 패키지 정책은 각 패키지 루트의 `RUSTOS.package.toml` 이 source of truth 입니다.
 - third-party 또는 prebuilt `.ko`, firmware, OVMF 는 `vendor/...` 에 둡니다.
 - staged image에 정적으로 포함할 overlay 파일만 `assets/image/...` 에 둡니다.
 - `assets/image` 아래 경로는 boot volume 내부 경로와 동일해야 합니다.
@@ -71,6 +75,8 @@ cargo xtask run
 예시:
 
 - `vendor/modules/input/usbhid.ko` -> stage 시 `system/drivers/input/usbhid.ko`
+- `system/packages/uiserver/RUSTOS.package.toml` -> stage 시 `system/packages/uiserver/uiserver.elf`
+- `samples/windows/userdemo2/RUSTOS.package.toml` -> stage 시 `samples/windows/userdemo2/userdemo2.exe`
 - `vendor/ovmf/OVMF.fd` -> QEMU firmware
 - `assets/image/system/config/foo.txt` -> `build/image/system/config/foo.txt`
 

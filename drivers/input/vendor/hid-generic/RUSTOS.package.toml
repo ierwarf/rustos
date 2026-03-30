@@ -1,0 +1,24 @@
+id = "hid-generic"
+kind = "driver"
+profiles = ["default"]
+
+[build]
+builder = "external-copy"
+source = "vendor/modules/input/hid-generic.ko"
+source_env = "VENDOR_HID_GENERIC_KO"
+optional = true
+
+[install]
+path = "system/drivers/input/hid-generic.ko"
+
+[boot]
+preload = true
+required = false
+priority = 220
+
+[autoload]
+name = "hid-generic"
+class = "input"
+bus = "usb"
+priority = 110
+when = "vfs-ready"

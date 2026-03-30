@@ -1,0 +1,22 @@
+id = "uiserver"
+kind = "system-app"
+profiles = ["default"]
+
+[build]
+builder = "cargo-kernel-binary"
+package = "uiserver"
+
+[install]
+path = "system/packages/uiserver/uiserver.elf"
+
+[boot]
+preload = true
+required = false
+priority = -500
+
+[[desktop.entries]]
+display_name = "UI Server"
+weight_micros = 50
+logical_admin = true
+console_hosted = false
+launch = "new-session"

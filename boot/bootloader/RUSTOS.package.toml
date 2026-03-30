@@ -1,0 +1,15 @@
+id = "bootloader"
+kind = "boot"
+profiles = ["default"]
+
+[build]
+builder = "bootloader-uefi"
+package = "bootloader"
+
+[install]
+path = "EFI/BOOT/BOOTX64.EFI"
+
+[boot]
+preload = false
+required = false
+priority = 0

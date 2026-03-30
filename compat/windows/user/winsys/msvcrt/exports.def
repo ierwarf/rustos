@@ -1,0 +1,63 @@
+LIBRARY msvcrt.dll
+EXPORTS
+    __C_specific_handler
+    ___lc_codepage_func
+    ___mb_cur_max_func
+    __acrt_iob_func
+    __getmainargs
+    __iob_func
+    __initenv DATA
+    __p___argc
+    __p___argv
+    __p__environ
+    __set_app_type
+    __setusermatherr
+    _acmdln DATA
+    _amsg_exit
+    _cexit
+    _commode DATA
+    _errno
+    _exit
+    _fmode DATA
+    _get_initial_narrow_environment
+    _initterm
+    _lock
+    _onexit
+    _strtoi64
+    _strtoui64
+    _unlock
+    abort
+    calloc
+    exit
+    fflush
+    fprintf
+    fgets
+    fputc
+    fwrite
+    free
+    getchar
+    getc
+    isspace
+    isxdigit
+    localeconv
+    malloc
+    memcpy
+    memset
+    printf
+    putchar
+    puts
+    realloc
+    scanf
+    signal
+    stderr DATA
+    stdin DATA
+    stdout DATA
+    strerror
+    strlen
+    strncmp
+    strtol
+    strtoul
+    tolower
+    ungetc
+    vfprintf
+    wcslen

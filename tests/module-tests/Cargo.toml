@@ -1,0 +1,11 @@
+[package]
+name = "module-tests"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+boot-protocol = { path = "../../boot/bootloader/boot-protocol" }
+boot-random = { path = "../../boot/boot-random" }
+boot-storage = { path = "../../boot/boot-storage" }
+driver-abi = { path = "../../drivers/driver-abi" }
+keyboard-core = { path = "../../drivers/input/keyboard-core" }
