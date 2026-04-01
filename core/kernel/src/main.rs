@@ -5,12 +5,13 @@
 
 mod arch;
 mod debug;
-mod generated_registry;
 mod driver;
+mod generated_registry;
 mod input;
 mod io;
 mod memory;
 mod multitask;
+#[path = "../../../settings.rs"]
 mod settings;
 mod storage;
 mod system;

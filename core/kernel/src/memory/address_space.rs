@@ -169,6 +169,41 @@ impl ProcessAddressSpace {
         Ok(region)
     }
 
+    pub fn map_existing_user_pages_at(
+        &mut self,
+        start: VirtAddr,
+        frames: &[u64],
+        flags: PageTableFlags,
+    ) -> Result<UserRegion, AddressSpaceError> {
+        if frames.is_empty() {
+            return Err(AddressSpaceError::ZeroSizedAllocation);
+        }
+
+        validate_user_page_range(start, frames.len())?;
+        let page_flags = normalize_user_page_flags(flags)?;
+        let mut mapped_pages = Vec::with_capacity(frames.len());
+
+        for (page_index, frame_phys) in frames.iter().copied().enumerate() {
+            let virt = page_addr(start, page_index)?;
+            if self.translate_user(virt).is_some() {
+                rollback_external_user_pages(self, &mapped_pages);
+                return Err(AddressSpaceError::AlreadyMapped);
+            }
+            if let Err(err) = self.map_user_page(virt, PhysAddr::new(frame_phys), page_flags) {
+                rollback_external_user_pages(self, &mapped_pages);
+                return Err(err);
+            }
+            mapped_pages.push(virt);
+        }
+
+        let region = UserRegion {
+            start,
+            page_count: frames.len(),
+        };
+        self.regions.push(region);
+        Ok(region)
+    }
+
     pub fn unmap_user_bytes(
         &mut self,
         start: VirtAddr,
@@ -208,6 +243,23 @@ impl ProcessAddressSpace {
         for frame_phys in frames {
             remove_owned_frame(&mut self.owned_frames, frame_phys)?;
             phys::free_frame(PhysAddr::new(frame_phys));
+        }
+
+        self.subtract_region_range(start, page_count)?;
+        Ok(page_count)
+    }
+
+    pub fn unmap_user_pages_without_free_at(
+        &mut self,
+        start: VirtAddr,
+        page_count: usize,
+    ) -> Result<usize, AddressSpaceError> {
+        validate_user_page_range(start, page_count)?;
+
+        for page_index in 0..page_count {
+            let virt = page_addr(start, page_index)?;
+            self.unmap_user_page(virt)
+                .ok_or(AddressSpaceError::NotMapped)?;
         }
 
         self.subtract_region_range(start, page_count)?;
@@ -713,6 +765,12 @@ fn rollback_user_pages(space: &mut ProcessAddressSpace, pages: &[(VirtAddr, u64)
             panic!("user page rollback mismatch");
         }
         phys::free_frame(PhysAddr::new(frame_phys));
+    }
+}
+
+fn rollback_external_user_pages(space: &mut ProcessAddressSpace, pages: &[VirtAddr]) {
+    for &virt in pages.iter().rev() {
+        let _ = space.unmap_user_page(virt);
     }
 }
 

@@ -6,6 +6,7 @@ extern crate alloc;
 mod boot;
 mod platform;
 mod runtime;
+#[path = "../../../settings.rs"]
 mod settings;
 
 pub(crate) use boot::{boot_info, error};

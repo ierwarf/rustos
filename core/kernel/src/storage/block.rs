@@ -89,7 +89,9 @@ pub(crate) fn init() {
 
 pub(crate) fn register_boot_volume_opener() {
     crate::storage::boot_volume::set_boot_block_device_opener(open_boot_block_device);
-    crate::storage::boot_volume::set_physical_boot_block_device_opener(open_physical_boot_block_device);
+    crate::storage::boot_volume::set_physical_boot_block_device_opener(
+        open_physical_boot_block_device,
+    );
 }
 
 pub(crate) fn current_boot_volume_handle() -> Option<BlockDeviceHandle> {
@@ -243,8 +245,8 @@ impl SharedBlockDevice for FatRegistryDevice {
 }
 
 #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
-fn open_boot_block_device(
-) -> core::result::Result<Box<dyn SharedBlockDevice>, fatfs::Error<DiskIoError>> {
+fn open_boot_block_device()
+-> core::result::Result<Box<dyn SharedBlockDevice>, fatfs::Error<DiskIoError>> {
     let handle = open_boot_handle().map_err(fatfs::Error::Io)?;
     Ok(Box::new(FatRegistryDevice::new(handle)) as Box<dyn SharedBlockDevice>)
 }
@@ -325,11 +327,16 @@ fn flush_uncached(device_id: u32) -> IoResult<()> {
     flush_from_records(&devices, device_id)
 }
 
-fn device_logical_block_size_locked(devices: &[BlockDeviceRecord], device_id: u32) -> Option<usize> {
+fn device_logical_block_size_locked(
+    devices: &[BlockDeviceRecord],
+    device_id: u32,
+) -> Option<usize> {
     let record = devices.iter().find(|device| device.id == device_id)?;
     match &record.kind {
         BlockDeviceKind::Root(device) => Some(device.lock().logical_block_size()),
-        BlockDeviceKind::Slice { parent_id, .. } => device_logical_block_size_locked(devices, *parent_id),
+        BlockDeviceKind::Slice { parent_id, .. } => {
+            device_logical_block_size_locked(devices, *parent_id)
+        }
     }
 }
 
@@ -396,9 +403,8 @@ fn boot_transport_from_block(transport: BlockTransportKind) -> BootVolumeTranspo
 fn open_boot_handle() -> IoResult<BlockDeviceHandle> {
     ensure_initialized();
     crate::debug::println!("storage: boot volume fallback opener invoked");
-    let transport_hint =
-        crate::storage::boot_volume::boot_volume_transport_hint()
-            .unwrap_or(BootVolumeTransport::Unknown);
+    let transport_hint = crate::storage::boot_volume::boot_volume_transport_hint()
+        .unwrap_or(BootVolumeTransport::Unknown);
 
     let mut root_ids = {
         let devices = BLOCK_DEVICES.lock();
@@ -587,7 +593,12 @@ fn read_blocks_from_records(
     match &record.kind {
         BlockDeviceKind::Root(device) => {
             let mut device = device.lock();
-            validate_block_io_exact(device.logical_block_size(), lba, device.block_count(), out.len())?;
+            validate_block_io_exact(
+                device.logical_block_size(),
+                lba,
+                device.block_count(),
+                out.len(),
+            )?;
             device.read_blocks(lba, out)
         }
         BlockDeviceKind::Slice {
@@ -619,7 +630,12 @@ fn write_blocks_from_records(
     match &record.kind {
         BlockDeviceKind::Root(device) => {
             let mut device = device.lock();
-            validate_block_io_exact(device.logical_block_size(), lba, device.block_count(), input.len())?;
+            validate_block_io_exact(
+                device.logical_block_size(),
+                lba,
+                device.block_count(),
+                input.len(),
+            )?;
             device.write_blocks(lba, input)
         }
         BlockDeviceKind::Slice {
@@ -723,9 +739,10 @@ fn candidate_partitions(root: &mut RegistryRootBlockDevice) -> IoResult<Vec<Shar
 fn detect_fat_boot_partition_handle(
     root_id: u32,
 ) -> IoResult<Option<(BlockDeviceHandle, SharedPartitionInfo)>> {
-    let (logical_block_size, block_count) = descriptor_without_init(BlockDeviceHandle::new(root_id))
-        .map(|device| (device.logical_block_size, device.block_count))
-        .ok_or(DiskIoError::NotPresent)?;
+    let (logical_block_size, block_count) =
+        descriptor_without_init(BlockDeviceHandle::new(root_id))
+            .map(|device| (device.logical_block_size, device.block_count))
+            .ok_or(DiskIoError::NotPresent)?;
     let mut root = RegistryRootBlockDevice {
         root_id,
         logical_block_size,
@@ -734,15 +751,16 @@ fn detect_fat_boot_partition_handle(
     let Some(partition) = storage_core::detect_fat_boot_partition(&mut root)? else {
         return Ok(None);
     };
-    let handle = find_device_handle_for_partition(root_id, partition)
-        .ok_or(DiskIoError::NotPresent)?;
+    let handle =
+        find_device_handle_for_partition(root_id, partition).ok_or(DiskIoError::NotPresent)?;
     Ok(Some((handle, partition)))
 }
 
 fn detect_partitions(root_id: u32) -> IoResult<Vec<SharedPartitionInfo>> {
-    let (logical_block_size, block_count) = descriptor_without_init(BlockDeviceHandle::new(root_id))
-        .map(|device| (device.logical_block_size, device.block_count))
-        .ok_or(DiskIoError::NotPresent)?;
+    let (logical_block_size, block_count) =
+        descriptor_without_init(BlockDeviceHandle::new(root_id))
+            .map(|device| (device.logical_block_size, device.block_count))
+            .ok_or(DiskIoError::NotPresent)?;
     if block_count == 0 {
         return Ok(Vec::new());
     }
@@ -797,10 +815,10 @@ mod tests {
     use storage_core::BlockDevice as SharedBlockDevice;
 
     use super::{
-        cache_lookup, descriptors, flush, lookup, open_boot_block_device,
-        open_physical_boot_block_device, read_cached_block, register_root_device,
-        write_cached_block, BlockDeviceOps, BlockTransportKind, BLOCK_CACHE, BLOCK_DEVICES,
-        BLOCK_INIT_DONE, MBR_PARTITION_TABLE_OFFSET, MIN_LOGICAL_BLOCK_SIZE,
+        BLOCK_CACHE, BLOCK_DEVICES, BLOCK_INIT_DONE, BlockDeviceOps, BlockTransportKind,
+        MBR_PARTITION_TABLE_OFFSET, MIN_LOGICAL_BLOCK_SIZE, cache_lookup, descriptors, flush,
+        lookup, open_boot_block_device, open_physical_boot_block_device, read_cached_block,
+        register_root_device, write_cached_block,
     };
     use crate::storage::fat::{DiskIoError, IoResult};
 
@@ -835,12 +853,7 @@ mod tests {
             device
         }
 
-        fn with_fat_partition(
-            start_lba: u32,
-            blocks: u32,
-            volume_id: u32,
-            readonly: bool,
-        ) -> Self {
+        fn with_fat_partition(start_lba: u32, blocks: u32, volume_id: u32, readonly: bool) -> Self {
             let device = Self::with_mbr_partition(start_lba, blocks, readonly);
             {
                 let mut all_blocks = device.blocks.lock();

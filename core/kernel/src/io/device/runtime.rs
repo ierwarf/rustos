@@ -6,7 +6,7 @@ use crate::user::process_state::UserProcessState;
 use crate::user::runtime::DesktopRuntimeError;
 use crate::user::runtime_api;
 
-use super::{read_user_struct, write_user_struct, DeviceError};
+use super::{DeviceError, read_user_struct, write_user_struct};
 
 pub(crate) fn ioctl(
     process_state: &mut UserProcessState,

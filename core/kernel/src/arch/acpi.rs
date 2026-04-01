@@ -1,4 +1,4 @@
-use boot_protocol::{BootInfo, BOOT_INFO_MAGIC, BOOT_INFO_VERSION};
+use boot_protocol::{BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootInfo};
 use spin::Mutex;
 
 const RSDP_V1_LEN: usize = 20;

@@ -9,7 +9,7 @@ use crate::user::abi::device::{
 use crate::user::handles::{DisplaySurfaceHandle, KernelHandle};
 use crate::user::process_state::UserProcessState;
 
-use super::{read_user_struct, write_user_struct, DeviceError};
+use super::{DeviceError, read_user_struct, write_user_struct};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DisplayError {

@@ -235,9 +235,9 @@ pub(crate) fn reset_for_tests() {
 #[cfg(test)]
 mod tests {
     use super::{
+        DriverBus, DriverClass, DriverExecutionModel, DriverModuleState, DriverRecord,
         register_kernel_builtin, register_loadable_elf, reset_for_tests,
-        snapshot_registered_drivers, DriverBus, DriverClass, DriverExecutionModel,
-        DriverModuleState, DriverRecord,
+        snapshot_registered_drivers,
     };
 
     fn isolated() -> std::sync::MutexGuard<'static, ()> {

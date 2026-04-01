@@ -16,6 +16,10 @@ pub(crate) fn write(fd: u64, user_ptr: u64, user_len: u64) -> Result<usize, Linu
         return Ok(written);
     }
 
+    if let Some(written) = socket::write_current_process_socket(fd, user_ptr, user_len)? {
+        return Ok(written);
+    }
+
     Err(LinuxSysopError::BadFileDescriptor)
 }
 
@@ -30,6 +34,10 @@ pub(crate) fn read(fd: u64, user_ptr: u64, user_len: u64) -> Result<usize, Linux
     }
 
     if let Some(read) = file::read_current_process_file(fd, user_ptr, user_len)? {
+        return Ok(read);
+    }
+
+    if let Some(read) = socket::read_current_process_socket(fd, user_ptr, user_len)? {
         return Ok(read);
     }
 
@@ -161,6 +169,10 @@ pub(crate) fn openat(
 }
 
 pub(crate) fn fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, LinuxSysopError> {
+    if let Some(result) = memfd::memfd_fcntl(fd, cmd, arg)? {
+        return Ok(result);
+    }
+
     match cmd {
         linux_abi::F_DUPFD => duplicate_fd(fd, arg, false),
         linux_abi::F_DUPFD_CLOEXEC => duplicate_fd(fd, arg, true),
@@ -449,9 +461,10 @@ fn poll_revents_for_handle(
         KernelHandle::Console(ConsoleStreamKind::Output | ConsoleStreamKind::Error) => {
             requested & linux_abi::POLLOUT
         }
-        KernelHandle::VfsFile(_) | KernelHandle::VfsDirectory(_) => {
+        KernelHandle::Memfd(_) | KernelHandle::VfsFile(_) | KernelHandle::VfsDirectory(_) => {
             requested & (linux_abi::POLLIN | linux_abi::POLLOUT)
         }
+        KernelHandle::Socket(socket) => socket.poll_revents(requested),
         KernelHandle::DisplaySurface(_) => requested & linux_abi::POLLOUT,
         KernelHandle::Device(handle) => match handle.device_id() {
             device_ns::DeviceId::Input => {

@@ -391,9 +391,9 @@ pub(crate) fn reset_for_tests() {
 #[cfg(test)]
 mod tests {
     use super::{
-        create_console_session, focused_console_session, remove_console_session, reset_for_tests,
-        set_focused_console_session, snapshot_console_sessions, transition_console_session_state,
-        ConsoleSessionHandle, ConsoleSessionState,
+        ConsoleSessionHandle, ConsoleSessionState, create_console_session, focused_console_session,
+        remove_console_session, reset_for_tests, set_focused_console_session,
+        snapshot_console_sessions, transition_console_session_state,
     };
 
     #[test]

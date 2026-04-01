@@ -1,13 +1,13 @@
-use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
+use x86_64::structures::paging::PageTableFlags;
 
 use crate::multitask;
 use crate::user::abi::UserAbi;
 use crate::user::process_state::{WindowsAllocation, WindowsAllocationKind};
 
 use super::constants::{
-    MemoryBasicInformation, BOOL_FALSE, BOOL_TRUE, ERROR_INVALID_ADDRESS, ERROR_INVALID_FUNCTION,
-    ERROR_INVALID_PARAMETER, ERROR_SUCCESS, MEM_COMMIT, MEM_IMAGE, MEM_PRIVATE, MEM_RELEASE,
+    BOOL_FALSE, BOOL_TRUE, ERROR_INVALID_ADDRESS, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER,
+    ERROR_SUCCESS, MEM_COMMIT, MEM_IMAGE, MEM_PRIVATE, MEM_RELEASE, MemoryBasicInformation,
     PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
     PAGE_SIZE,
 };

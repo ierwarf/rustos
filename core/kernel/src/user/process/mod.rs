@@ -1,5 +1,5 @@
-use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
+use x86_64::structures::paging::PageTableFlags;
 
 use crate::debug;
 use crate::io::session::ConsoleSessionHandle;
@@ -347,7 +347,13 @@ fn build_process_bootstrap(
     user_stack: Option<multitask::UserStackState>,
     launch: ProcessLaunchOptions<'_>,
 ) -> Result<multitask::UserTaskBootstrap, ProcessLoadError> {
-    let (stack_pointer, mut linux_process_state, linux_memory_map, linux_thread_state) =
+    let (
+        stack_pointer,
+        mut linux_process_state,
+        linux_memory_map,
+        linux_runtime_profile,
+        linux_thread_state,
+    ) =
         match (abi, runtime) {
             (UserAbi::Linux, LoadedProcessRuntime::Linux(image)) => {
                 linux::initialize_linux_initial_tls(address_space, &image)?;
@@ -364,6 +370,7 @@ fn build_process_bootstrap(
                         launch.linux.exec_path,
                         user_stack,
                     )),
+                    Some(linux::build_runtime_profile(&image, launch.linux)),
                     Some(image.initial_thread_state()),
                 )
             }
@@ -405,6 +412,7 @@ fn build_process_bootstrap(
     }
     bootstrap.linux_process_state = linux_process_state;
     bootstrap.linux_memory_map = linux_memory_map;
+    bootstrap.linux_runtime_profile = linux_runtime_profile;
     bootstrap.linux_thread_state = linux_thread_state;
     bootstrap.console_session = launch.console_session;
     bootstrap.logical_admin = launch.logical_admin;

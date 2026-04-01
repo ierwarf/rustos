@@ -185,7 +185,12 @@ impl<D: BlockDevice> BlockDevice for BlockSlice<D> {
     }
 
     fn write_blocks(&mut self, lba: u64, input: &[u8]) -> IoResult<()> {
-        validate_block_io(self.logical_block_size(), lba, self.block_count, input.len())?;
+        validate_block_io(
+            self.logical_block_size(),
+            lba,
+            self.block_count,
+            input.len(),
+        )?;
         self.inner.write_blocks(self.start_lba + lba, input)
     }
 
@@ -228,9 +233,7 @@ impl MemBlockDevice {
         let start = (lba as usize)
             .checked_mul(self.block_size)
             .ok_or(StorageError::InvalidInput)?;
-        let end = start
-            .checked_add(len)
-            .ok_or(StorageError::InvalidInput)?;
+        let end = start.checked_add(len).ok_or(StorageError::InvalidInput)?;
         if end > self.data.len() {
             return Err(StorageError::InvalidInput);
         }
@@ -380,7 +383,10 @@ fn detect_gpt_partitions<D: BlockDevice>(
             return Err(StorageError::InvalidInput);
         }
         dev.read_blocks(lba, &mut entry_block)?;
-        let entries_in_this_block = min(entries_per_block, entry_count - block_index * entries_per_block);
+        let entries_in_this_block = min(
+            entries_per_block,
+            entry_count - block_index * entries_per_block,
+        );
         for entry_index in 0..entries_in_this_block {
             let off = entry_index * entry_size;
             if entry_block[off..off + 16].iter().all(|byte| *byte == 0) {
@@ -416,7 +422,10 @@ struct FatVolumeMetadata {
     volume_id: u32,
 }
 
-fn parse_fat_volume_metadata(boot_sector: &[u8], available_blocks: u64) -> Option<FatVolumeMetadata> {
+fn parse_fat_volume_metadata(
+    boot_sector: &[u8],
+    available_blocks: u64,
+) -> Option<FatVolumeMetadata> {
     if boot_sector.len() < 512 {
         return None;
     }
@@ -503,17 +512,10 @@ fn parse_fat_volume_metadata(boot_sector: &[u8], available_blocks: u64) -> Optio
         le_u32(boot_sector, 39)
     };
 
-    Some(FatVolumeMetadata {
-        volume_id,
-    })
+    Some(FatVolumeMetadata { volume_id })
 }
 
-fn validate_block_io(
-    block_size: usize,
-    lba: u64,
-    total_blocks: u64,
-    len: usize,
-) -> IoResult<()> {
+fn validate_block_io(block_size: usize, lba: u64, total_blocks: u64, len: usize) -> IoResult<()> {
     if block_size < 512 || len == 0 || len % block_size != 0 {
         return Err(StorageError::InvalidInput);
     }

@@ -9,6 +9,7 @@ use core::ptr;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use spin::Mutex;
+use xhci::Registers as XhciRegisters;
 use xhci::accessor::Mapper;
 use xhci::context::{EndpointType, Input32Byte, Input64Byte, InputHandler};
 use xhci::registers::capability::StructuralParameters2;
@@ -22,8 +23,7 @@ use xhci::ring::trb::event::{Allowed as EventTrb, CompletionCode};
 use xhci::ring::trb::transfer::{
     DataStage, Direction as TrbDirection, Normal, SetupStage, StatusStage, TransferType,
 };
-use xhci::ring::trb::{Link as LinkTrb, BYTES as XHCI_TRB_BYTES};
-use xhci::Registers as XhciRegisters;
+use xhci::ring::trb::{BYTES as XHCI_TRB_BYTES, Link as LinkTrb};
 
 use super::host::UsbHostControllerInfo;
 

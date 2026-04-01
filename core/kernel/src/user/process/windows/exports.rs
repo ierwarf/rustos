@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 
 use super::super::ProcessLoadError;
 use super::pe::{
-    read_c_string_at_rva, read_u16, read_u32, rva_to_file_offset, PeImage, PE_DIRECTORY_EXPORT,
+    PE_DIRECTORY_EXPORT, PeImage, read_c_string_at_rva, read_u16, read_u32, rva_to_file_offset,
 };
 
 #[derive(Clone, Copy)]
@@ -97,9 +97,9 @@ pub(super) fn build_export_cache(
         let function_rva = read_function_rva(image, pe, &directory, function_index)?;
         let target = classify_export_target(image, pe, &directory, function_rva)?;
         if let ExportTarget::Forwarder(forwarder) = target {
-            function_targets.push(CachedExportTarget::Forwarder(
-                cache_forwarder_target(forwarder)?,
-            ));
+            function_targets.push(CachedExportTarget::Forwarder(cache_forwarder_target(
+                forwarder,
+            )?));
         } else if let ExportTarget::Address(rva) = target {
             function_targets.push(CachedExportTarget::Address(rva));
         }
@@ -433,12 +433,12 @@ fn parse_ascii_u32(bytes: &[u8]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_export_cache, lookup_cached_export_by_name, lookup_cached_export_by_ordinal,
-        lookup_export_by_name, lookup_export_by_ordinal, lookup_named_export, read_export_directory,
-        validate_export_directory, CachedExportTarget, CachedForwarderSymbol,
-        CachedForwarderTarget, ExportTarget, ForwarderSymbol, ForwarderTarget,
+        CachedExportTarget, CachedForwarderSymbol, CachedForwarderTarget, ExportTarget,
+        ForwarderSymbol, ForwarderTarget, build_export_cache, lookup_cached_export_by_name,
+        lookup_cached_export_by_ordinal, lookup_export_by_name, lookup_export_by_ordinal,
+        lookup_named_export, read_export_directory, validate_export_directory,
     };
-    use crate::user::process::windows::pe::{PeDataDirectory, PeImage, PE_DIRECTORY_EXPORT};
+    use crate::user::process::windows::pe::{PE_DIRECTORY_EXPORT, PeDataDirectory, PeImage};
 
     fn synthetic_export_image(
         function_rva: u32,

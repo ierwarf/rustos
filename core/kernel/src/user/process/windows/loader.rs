@@ -4,12 +4,12 @@ use x86_64::VirtAddr;
 use crate::memory::paging::ProcessAddressSpace;
 use crate::user::process_state::{WindowsLoadedModule, WindowsProcessRuntimeState};
 
-use super::super::{align_up, ProcessLoadError, PAGE_SIZE};
+use super::super::{PAGE_SIZE, ProcessLoadError, align_up};
+use super::WindowsLoadedModuleImage;
 use super::dll_search::file_name_from_windows_path;
 use super::exports;
 use super::pe;
 use super::system_dll;
-use super::WindowsLoadedModuleImage;
 
 const MAX_FORWARDER_DEPTH: usize = 16;
 
@@ -87,9 +87,11 @@ pub(super) fn preload_builtin_system_dlls_at(
         });
 
         next_base = align_up(
-            load_base.checked_add(image_size).ok_or(
-                ProcessLoadError::InvalidPe("builtin DLL image range overflow"),
-            )?,
+            load_base
+                .checked_add(image_size)
+                .ok_or(ProcessLoadError::InvalidPe(
+                    "builtin DLL image range overflow",
+                ))?,
             PAGE_SIZE,
         )
         .ok_or(ProcessLoadError::InvalidPe(
@@ -97,7 +99,11 @@ pub(super) fn preload_builtin_system_dlls_at(
         ))?;
     }
 
-    resolve_preloaded_system_dll_imports(address_space, modules.as_slice(), module_images.as_slice())?;
+    resolve_preloaded_system_dll_imports(
+        address_space,
+        modules.as_slice(),
+        module_images.as_slice(),
+    )?;
 
     Ok(PreloadedSystemDlls {
         modules,
@@ -172,7 +178,14 @@ pub(super) fn initialize_preloaded_system_dlls(
             b"__initenv",
             runtime.environ_ptr,
         )?;
-        patch_export_i32(address_space, module, modules, module_images, b"_commode", 0)?;
+        patch_export_i32(
+            address_space,
+            module,
+            modules,
+            module_images,
+            b"_commode",
+            0,
+        )?;
         patch_export_i32(address_space, module, modules, module_images, b"_fmode", 0)?;
     }
     Ok(())
@@ -186,8 +199,13 @@ fn patch_export_u64(
     symbol: &[u8],
     value: u64,
 ) -> Result<(), ProcessLoadError> {
-    let Some(address) =
-        resolve_module_export(module, modules, module_images, WindowsExportLookup::Name(symbol), 0)?
+    let Some(address) = resolve_module_export(
+        module,
+        modules,
+        module_images,
+        WindowsExportLookup::Name(symbol),
+        0,
+    )?
     else {
         return Ok(());
     };
@@ -203,8 +221,13 @@ fn patch_export_i32(
     symbol: &[u8],
     value: i32,
 ) -> Result<(), ProcessLoadError> {
-    let Some(address) =
-        resolve_module_export(module, modules, module_images, WindowsExportLookup::Name(symbol), 0)?
+    let Some(address) = resolve_module_export(
+        module,
+        modules,
+        module_images,
+        WindowsExportLookup::Name(symbol),
+        0,
+    )?
     else {
         return Ok(());
     };
@@ -260,10 +283,14 @@ fn resolve_module_export_by_index(
     }
     let module = modules
         .get(module_index)
-        .ok_or(ProcessLoadError::InvalidPe("loaded module cache index is invalid"))?;
+        .ok_or(ProcessLoadError::InvalidPe(
+            "loaded module cache index is invalid",
+        ))?;
     let cached = module_images
         .get(module_index)
-        .ok_or(ProcessLoadError::InvalidPe("loaded module image cache is invalid"))?;
+        .ok_or(ProcessLoadError::InvalidPe(
+            "loaded module image cache is invalid",
+        ))?;
     let target = match lookup {
         WindowsExportLookup::Name(name) => {
             exports::lookup_cached_export_by_name(cached.export_cache.as_ref(), name)
@@ -329,10 +356,14 @@ fn patch_loaded_module_imports(
 ) -> Result<(), ProcessLoadError> {
     let module = modules
         .get(module_index)
-        .ok_or(ProcessLoadError::InvalidPe("loaded module cache index is invalid"))?;
+        .ok_or(ProcessLoadError::InvalidPe(
+            "loaded module cache index is invalid",
+        ))?;
     let cached = module_images
         .get(module_index)
-        .ok_or(ProcessLoadError::InvalidPe("loaded module image cache is invalid"))?;
+        .ok_or(ProcessLoadError::InvalidPe(
+            "loaded module image cache is invalid",
+        ))?;
     let image = cached.image.as_slice();
     let pe_image = &cached.pe;
     let import_dir = pe_image.directories[pe::PE_DIRECTORY_IMPORT];

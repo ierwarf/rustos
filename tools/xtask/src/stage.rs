@@ -1,22 +1,21 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use xshell::cmd;
-
+use crate::Result;
 use crate::config::Config;
 use crate::package_manifest::{
-    load_manifests, BuilderKind, DesktopLaunchMode, InstallLayout, PackageManifest,
-    DEFAULT_PROFILE,
+    BuilderKind, DEFAULT_PROFILE, DesktopLaunchMode, InstallLayout, PackageManifest, load_manifests,
 };
 use crate::util::{
-    copy_or_unpack_firmware, copy_with_parent, maybe_copy_dual_host_runtime,
-    maybe_copy_host_runtime, remove_dir_if_exists, remove_file_if_exists, shell,
+    command_in_path, copy_or_unpack_firmware, copy_with_parent, remove_dir_if_exists,
+    remove_file_if_exists, run_command,
 };
-use crate::Result;
 
 const DRIVER_REGISTRY_PATH: &str = "system/registry/kernel/loadable-drivers.tsv";
 const DESKTOP_REGISTRY_PATH: &str = "system/registry/system/desktop-programs.tsv";
 const WINDOWS_DLL_REGISTRY_PATH: &str = "system/registry/compat/windows-system-dlls.txt";
+const LD_SO_CONF_PATH: &str = "etc/ld.so.conf";
 
 pub(crate) fn stage(config: &Config) -> Result<()> {
     let manifests = selected_manifests(config)?;
@@ -36,48 +35,10 @@ pub(crate) fn stage(config: &Config) -> Result<()> {
         copy_or_unpack_firmware(&config.amdgpu_firmware_dir, basename, &dst)?;
     }
 
-    maybe_copy_host_runtime(
-        &config.glibc_interpreter_source,
-        &config.glibc_interpreter_dest,
-    )?;
-    maybe_copy_dual_host_runtime(
-        &config.glibc_libc_source,
-        &config.glibc_libc_primary_dest,
-        &config.glibc_libc_fallback_dest,
-    )?;
-    maybe_copy_dual_host_runtime(
-        &config.glibc_libgcc_source,
-        &config.glibc_libgcc_primary_dest,
-        &config.glibc_libgcc_fallback_dest,
-    )?;
-
-    if let Some(ldconfig) = config.ldconfig.as_ref() {
-        if config.glibc_libc_primary_dest.is_file() {
-            let sh = shell()?;
-            let ldso_cache_parent = config
-                .glibc_ldso_cache_dest
-                .parent()
-                .ok_or("ld.so.cache destination has no parent")?;
-            fs::create_dir_all(ldso_cache_parent)?;
-            let ldso_conf = config.image_dir.join("etc/ld.so.conf");
-            fs::write(&ldso_conf, "include /etc/ld.so.conf.d/*.conf\n")?;
-            fs::create_dir_all(config.image_dir.join("etc/ld.so.conf.d"))?;
-            let root = &config.image_dir;
-            cmd!(sh, "{ldconfig} -r {root} -C /etc/ld.so.cache").run()?;
-        }
-    }
-
-    fs::create_dir_all(
-        config
-            .glibc_ldso_preload_dest
-            .parent()
-            .ok_or("ld.so.preload destination has no parent")?,
-    )?;
-    fs::write(&config.glibc_ldso_preload_dest, [])?;
-
     write_driver_registry(config, &manifests)?;
     write_desktop_registry(config, &manifests)?;
     write_windows_dll_registry(config, &manifests)?;
+    generate_dynamic_linker_cache(&config.image_dir)?;
     Ok(())
 }
 
@@ -121,10 +82,7 @@ fn stage_manifest(config: &Config, manifest: &PackageManifest) -> Result<()> {
     .into())
 }
 
-fn stage_directory_manifest(
-    src_root: &Path,
-    dst_root: &Path,
-) -> Result<()> {
+fn stage_directory_manifest(src_root: &Path, dst_root: &Path) -> Result<()> {
     let mut stack = vec![(src_root.to_path_buf(), dst_root.to_path_buf())];
 
     while let Some((src_dir, dst_dir)) = stack.pop() {
@@ -182,7 +140,8 @@ fn write_desktop_registry(config: &Config, manifests: &[PackageManifest]) -> Res
             let args = if entry.args.is_empty() {
                 String::new()
             } else {
-                entry.args
+                entry
+                    .args
                     .iter()
                     .map(|arg| registry_value(arg))
                     .collect::<Result<Vec<_>>>()?
@@ -191,7 +150,8 @@ fn write_desktop_registry(config: &Config, manifests: &[PackageManifest]) -> Res
             let env = if entry.env.is_empty() {
                 String::new()
             } else {
-                entry.env
+                entry
+                    .env
                     .iter()
                     .map(|item| registry_value(item))
                     .collect::<Result<Vec<_>>>()?
@@ -229,7 +189,8 @@ fn write_windows_dll_registry(config: &Config, manifests: &[PackageManifest]) ->
         if !artifact_dir.is_dir() {
             continue;
         }
-        let mut entries = fs::read_dir(&artifact_dir)?.collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut entries =
+            fs::read_dir(&artifact_dir)?.collect::<std::result::Result<Vec<_>, _>>()?;
         entries.sort_by_key(|entry| entry.path());
         for entry in entries {
             if !entry.file_type()?.is_file() {
@@ -344,4 +305,21 @@ fn stage_image_asset_overlay_recursive(
     }
 
     Ok(())
+}
+
+fn generate_dynamic_linker_cache(image_dir: &Path) -> Result<()> {
+    let ld_so_conf = image_dir.join(LD_SO_CONF_PATH);
+    if !ld_so_conf.is_file() {
+        return Ok(());
+    }
+
+    let Some(ldconfig) = command_in_path("ldconfig") else {
+        return Err(format!(
+            "missing ldconfig required to generate dynamic linker cache from {}",
+            ld_so_conf.display()
+        )
+        .into());
+    };
+
+    run_command(Command::new(ldconfig).arg("-r").arg(image_dir))
 }

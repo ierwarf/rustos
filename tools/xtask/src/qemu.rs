@@ -197,8 +197,12 @@ fn run_qemu_with_options(config: &Config, options: RunOptions) -> Result<()> {
     let vfio_args = configure_vfio_args(&mut profile_args, &vfio_hosts, options.vfio_force)?;
     let usb_args = configure_usb_args(options.usb_input, &options.qemu_user_args);
     let display_args = configure_display_args(&options.qemu_user_args);
-    let debugcon_args =
-        configure_debugcon(config, &options.qemu_user_args, &mut session, options.debugcon)?;
+    let debugcon_args = configure_debugcon(
+        config,
+        &options.qemu_user_args,
+        &mut session,
+        options.debugcon,
+    )?;
 
     println!(
         "\n====================================\nStarting QEMU...\n====================================\n"
@@ -742,8 +746,12 @@ fn run_display_probe(config: &Config, options: RunOptions) -> Result<()> {
     let vfio_args = configure_vfio_args(&mut profile_args, &vfio_hosts, options.vfio_force)?;
     let usb_args = configure_usb_args(options.usb_input, &options.qemu_user_args);
     let display_args = configure_display_args(&options.qemu_user_args);
-    let debugcon_args =
-        configure_debugcon(config, &options.qemu_user_args, &mut session, options.debugcon)?;
+    let debugcon_args = configure_debugcon(
+        config,
+        &options.qemu_user_args,
+        &mut session,
+        options.debugcon,
+    )?;
     let qmp_socket = session.temp_dir.join("qmp.sock");
     let mut qmp_args = Vec::new();
     qmp_args.push(OsString::from("-qmp"));

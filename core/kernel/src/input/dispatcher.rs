@@ -137,9 +137,8 @@ fn dispatch_keyboard_event_locked(event: KeyboardEvent) {
 #[cfg(test)]
 mod tests {
     use super::{
-        dispatch_keyboard_event, dispatch_keyboard_event_locked, PendingTtyKeyboardEvent,
-        PendingTtyKeyboardEventState, PENDING_TTY_KEYBOARD_EVENTS,
-        PENDING_TTY_KEYBOARD_EVENTS_CAPACITY,
+        PENDING_TTY_KEYBOARD_EVENTS, PENDING_TTY_KEYBOARD_EVENTS_CAPACITY, PendingTtyKeyboardEvent,
+        PendingTtyKeyboardEventState, dispatch_keyboard_event, dispatch_keyboard_event_locked,
     };
     use crate::input::keyboard::{KeyAction, KeyCode, KeyboardEvent, Modifiers};
     fn isolated() -> std::sync::MutexGuard<'static, ()> {

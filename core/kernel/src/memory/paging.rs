@@ -1,5 +1,5 @@
 pub use crate::memory::address_space::{
-    AddressSpaceError, ProcessAddressSpace, UserRegion, USER_SPACE_BASE, USER_SPACE_END_EXCLUSIVE,
+    AddressSpaceError, ProcessAddressSpace, USER_SPACE_BASE, USER_SPACE_END_EXCLUSIVE, UserRegion,
 };
 pub use crate::memory::kernel_vm::{KERNEL_PML4, KERNEL_VIRT_OFFSET, WRITE_COMBINE_BIT};
 

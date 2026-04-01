@@ -9,8 +9,7 @@ use core::fmt;
 use storage_core::{BlockDevice, BootVolumeLocator, PartitionInfo};
 
 pub(crate) type DiskIoError = storage_core::StorageError;
-pub(crate) type BootVolume =
-    storage_fat::FatVolume<storage_core::BlockSlice<BootBlockDevice>>;
+pub(crate) type BootVolume = storage_fat::FatVolume<storage_core::BlockSlice<BootBlockDevice>>;
 
 pub(crate) enum BootBlockDevice {
     Ahci(ahci::AhciBlockDevice),
@@ -91,7 +90,9 @@ impl fmt::Display for BootStorageError {
     }
 }
 
-pub(crate) fn open_boot_volume(identity: BootVolumeIdentity) -> Result<BootVolume, BootStorageError> {
+pub(crate) fn open_boot_volume(
+    identity: BootVolumeIdentity,
+) -> Result<BootVolume, BootStorageError> {
     let locator = BootVolumeLocator::new(identity);
     let mut devices = probe_devices();
     let transport_hint = identity.transport();
@@ -125,7 +126,10 @@ pub(crate) fn open_boot_volume(identity: BootVolumeIdentity) -> Result<BootVolum
                 locator
                     .matches_partition(&mut devices[index], partition)
                     .map_err(|err| {
-                        crate::debug::println!("prekernel storage: boot volume identity mismatch probe error: {:?}", err);
+                        crate::debug::println!(
+                            "prekernel storage: boot volume identity mismatch probe error: {:?}",
+                            err
+                        );
                         BootStorageError::PartitionScan(err)
                     })?
             } else {
@@ -173,7 +177,10 @@ fn probe_devices() -> Vec<BootBlockDevice> {
     devices
 }
 
-fn sort_devices_by_transport_hint(devices: &mut [BootBlockDevice], transport_hint: BootVolumeTransport) {
+fn sort_devices_by_transport_hint(
+    devices: &mut [BootBlockDevice],
+    transport_hint: BootVolumeTransport,
+) {
     if transport_hint == BootVolumeTransport::Unknown {
         return;
     }
@@ -192,8 +199,12 @@ fn candidate_partitions<D: BlockDevice>(dev: &mut D) -> Result<Vec<PartitionInfo
     Ok(partitions)
 }
 
-fn partition_is_fat<D: BlockDevice>(dev: &mut D, partition: PartitionInfo) -> Result<bool, DiskIoError> {
-    let mut slice = storage_core::BlockSlice::new(&mut *dev, partition.start_lba, partition.block_count)?;
+fn partition_is_fat<D: BlockDevice>(
+    dev: &mut D,
+    partition: PartitionInfo,
+) -> Result<bool, DiskIoError> {
+    let mut slice =
+        storage_core::BlockSlice::new(&mut *dev, partition.start_lba, partition.block_count)?;
     let block_size = slice.logical_block_size();
     if block_size < 512 {
         return Err(DiskIoError::InvalidInput);

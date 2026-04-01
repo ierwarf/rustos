@@ -1,11 +1,13 @@
 mod bootfs;
 mod devfs;
 mod procfs;
+mod runtime;
 
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
 use crate::io::device::DeviceHandle;
@@ -22,6 +24,7 @@ const SUPPORTED_MOUNT_FLAGS: u64 = crate::user::linux::MS_RDONLY;
 
 static MOUNTS: Mutex<Vec<VfsMount>> = Mutex::new(Vec::new());
 static FILESYSTEMS: Mutex<Vec<&'static dyn FilesystemProvider>> = Mutex::new(Vec::new());
+static MOUNT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn init() {
     crate::debug::println!("vfs: register filesystem proc");
@@ -45,7 +48,7 @@ pub(crate) fn init() {
                 "fat",
                 MountSource::BlockDevice(handle),
                 crate::user::linux::MS_RDONLY,
-                Some("access=boot"),
+                Some("role=system-image"),
                 true,
             ) {
                 crate::debug::println!("vfs: mount / failed: {:?}", error);
@@ -143,6 +146,7 @@ pub(crate) fn umount_for_current_process(target_path: &str) -> Result<(), MountE
         return Err(MountError::NotFound);
     };
     mounts.remove(index);
+    bump_mount_generation();
     Ok(())
 }
 
@@ -158,6 +162,7 @@ fn mount_internal(
     if !path.starts_with('/') {
         return Err(MountError::InvalidArgument);
     }
+    let mount_options = parse_mount_options(options)?;
 
     let provider = {
         let filesystems = FILESYSTEMS.lock();
@@ -168,7 +173,7 @@ fn mount_internal(
             .ok_or(MountError::UnsupportedFilesystem)?
     };
 
-    let backend = provider.mount(source, flags, options)?;
+    let backend = provider.mount(source, flags, mount_options.backend_options.as_deref())?;
     let mut mounts = MOUNTS.lock();
     if mounts.iter().any(|mount| mount.path == path) {
         return Err(MountError::Busy);
@@ -177,8 +182,10 @@ fn mount_internal(
         path: String::from(path),
         backend,
         filesystem_type: String::from(filesystem_type),
+        role: mount_options.role,
         pinned,
     });
+    bump_mount_generation();
     Ok(())
 }
 
@@ -189,6 +196,7 @@ pub(crate) fn open_path_for_current_process(
 ) -> Result<u64, VfsError> {
     let mount = resolve_mount(absolute_path)?;
     let Some(result) = multitask::with_current_user_process_state_mut(|_, abi, process_state| {
+        ensure_user_mount_access(&mount, absolute_path, abi, process_state)?;
         let mut context = VfsContext::new_user(abi, process_state);
         let opened = mount.backend.open(
             absolute_path,
@@ -210,6 +218,7 @@ pub(crate) fn metadata_for_current_process_path(
 ) -> Result<VfsMetadata, VfsError> {
     let mount = resolve_mount(absolute_path)?;
     let Some(result) = multitask::with_current_user_process_state_mut(|_, abi, process_state| {
+        ensure_user_mount_access(&mount, absolute_path, abi, process_state)?;
         let mut context = VfsContext::new_user(abi, process_state);
         mount
             .backend
@@ -267,6 +276,22 @@ pub(crate) fn read_path_to_vec_for_kernel(absolute_path: &str) -> Result<Vec<u8>
     }
 }
 
+pub(super) fn read_dir_names_for_kernel(absolute_path: &str) -> Result<Vec<String>, VfsError> {
+    let absolute_path = normalize_kernel_path(absolute_path)?;
+    let mount = resolve_mount(absolute_path.as_str())?;
+    let mut context = VfsContext::new_kernel();
+    Ok(mount
+        .backend
+        .read_dir(
+            absolute_path.as_str(),
+            mount.relative_path.as_str(),
+            &mut context,
+        )?
+        .into_iter()
+        .map(|entry| entry.name().to_string())
+        .collect())
+}
+
 pub(crate) fn normalize_kernel_path(path: &str) -> Result<String, VfsError> {
     if path.is_empty() {
         return Err(VfsError::InvalidArgument);
@@ -283,6 +308,7 @@ pub(crate) fn check_access_for_current_process(
 ) -> Result<(), VfsError> {
     let mount = resolve_mount(absolute_path)?;
     let Some(result) = multitask::with_current_user_process_state_mut(|_, abi, process_state| {
+        ensure_user_mount_access(&mount, absolute_path, abi, process_state)?;
         let mut context = VfsContext::new_user(abi, process_state);
         mount.backend.check_access(
             absolute_path,
@@ -312,6 +338,7 @@ pub(crate) fn readlink_for_current_process(absolute_path: &str) -> Result<String
 
     let mount = resolve_mount(absolute_path)?;
     let Some(result) = multitask::with_current_user_process_state_mut(|_, abi, process_state| {
+        ensure_user_mount_access(&mount, absolute_path, abi, process_state)?;
         let mut context = VfsContext::new_user(abi, process_state);
         mount
             .backend
@@ -473,6 +500,13 @@ pub(crate) enum MountSource {
     BlockDevice(block::BlockDeviceHandle),
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum VfsMountRole {
+    #[default]
+    Standard,
+    SystemImage,
+}
+
 pub(crate) trait FilesystemProvider: Sync {
     fn name(&self) -> &'static str;
     fn mount(
@@ -537,10 +571,12 @@ impl<'a> VfsContext<'a> {
         self.process_state.as_deref()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn process_state_mut(&mut self) -> Option<&mut UserProcessState> {
         self.process_state.as_deref_mut()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn is_kernel(&self) -> bool {
         self.process_state.is_none()
     }
@@ -550,6 +586,7 @@ struct VfsMount {
     path: String,
     backend: Arc<dyn VfsBackend>,
     filesystem_type: String,
+    role: VfsMountRole,
     pinned: bool,
 }
 
@@ -559,6 +596,7 @@ struct ResolvedMount {
     mount_path: String,
     #[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code))]
     filesystem_type: String,
+    role: VfsMountRole,
     relative_path: String,
 }
 
@@ -589,6 +627,7 @@ fn resolve_mount(absolute_path: &str) -> Result<ResolvedMount, VfsError> {
         backend: Arc::clone(&best.backend),
         mount_path: best.path.clone(),
         filesystem_type: best.filesystem_type.clone(),
+        role: best.role,
         relative_path: path_relative_to_mount(absolute_path, best.path.as_str()),
     })
 }
@@ -598,6 +637,74 @@ fn validate_mount_flags(flags: u64) -> Result<(), MountError> {
         return Err(MountError::UnsupportedMountFlags);
     }
     Ok(())
+}
+
+struct ParsedMountOptions {
+    role: VfsMountRole,
+    backend_options: Option<String>,
+}
+
+fn parse_mount_options(options: Option<&str>) -> Result<ParsedMountOptions, MountError> {
+    let Some(options) = options else {
+        return Ok(ParsedMountOptions {
+            role: VfsMountRole::Standard,
+            backend_options: None,
+        });
+    };
+
+    let mut role = VfsMountRole::Standard;
+    let mut backend = String::new();
+    for option in options.split(',') {
+        let option = option.trim();
+        if option.is_empty() {
+            continue;
+        }
+
+        match option {
+            "role=standard" => role = VfsMountRole::Standard,
+            "role=system-image" => role = VfsMountRole::SystemImage,
+            _ => {
+                if !backend.is_empty() {
+                    backend.push(',');
+                }
+                backend.push_str(option);
+            }
+        }
+    }
+
+    Ok(ParsedMountOptions {
+        role,
+        backend_options: (!backend.is_empty()).then_some(backend),
+    })
+}
+
+fn ensure_user_mount_access(
+    mount: &ResolvedMount,
+    absolute_path: &str,
+    abi: UserAbi,
+    process_state: &mut UserProcessState,
+) -> Result<(), VfsError> {
+    if mount.role != VfsMountRole::SystemImage {
+        return Ok(());
+    }
+
+    if runtime::linux_runtime_access_allows_path(absolute_path, abi, process_state) {
+        return Ok(());
+    }
+
+    if process_state.require_logical_admin_for_file_access(absolute_path) {
+        Ok(())
+    } else {
+        Err(VfsError::PermissionDenied)
+    }
+}
+
+fn bump_mount_generation() {
+    MOUNT_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(super) fn current_mount_generation() -> u64 {
+    MOUNT_GENERATION.load(Ordering::Relaxed)
 }
 
 fn install_open_result(
@@ -719,10 +826,10 @@ mod tests {
     use crate::user::handles::{VfsDirectoryEntry, VfsDirectoryHandle, VfsFileHandle};
 
     use super::{
-        mount_internal, normalize_kernel_path, path_is_within_mount, path_relative_to_mount,
-        read_path_to_vec_for_kernel, resolve_mount, umount_for_current_process, FilesystemProvider,
-        MountError, MountSource, VfsBackend, VfsContext, VfsError, VfsMetadata, VfsNodeKind,
-        VfsOpenResult, FILESYSTEMS, MOUNTS,
+        FILESYSTEMS, FilesystemProvider, MOUNTS, MountError, MountSource, VfsBackend, VfsContext,
+        VfsError, VfsMetadata, VfsNodeKind, VfsOpenResult, mount_internal, normalize_kernel_path,
+        path_is_within_mount, path_relative_to_mount, read_path_to_vec_for_kernel, resolve_mount,
+        umount_for_current_process,
     };
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());

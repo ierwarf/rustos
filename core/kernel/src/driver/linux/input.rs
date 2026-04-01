@@ -4,9 +4,9 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use driver_abi::{
-    PointerPacket, BTN_EXTRA, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE, EV_KEY, EV_REL, EV_SYN,
+    BTN_EXTRA, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE, EV_KEY, EV_REL, EV_SYN,
     POINTER_BUTTON_LEFT, POINTER_BUTTON_MIDDLE, POINTER_BUTTON_RIGHT, POINTER_BUTTON_X1,
-    POINTER_BUTTON_X2, REL_HWHEEL, REL_WHEEL, REL_X, REL_Y, SYN_REPORT,
+    POINTER_BUTTON_X2, PointerPacket, REL_HWHEEL, REL_WHEEL, REL_X, REL_Y, SYN_REPORT,
 };
 use spin::{Mutex, MutexGuard};
 #[cfg(not(test))]

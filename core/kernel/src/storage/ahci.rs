@@ -341,7 +341,6 @@ impl AhciBlockDevice {
     fn issue_and_wait(&self) -> IoResult<()> {
         issue_port_command(self.controller.as_ref(), self.port)
     }
-
 }
 fn probe_controller(pci: PciDevice) -> Result<Vec<Box<dyn BlockDeviceOps>>, DiskIoError> {
     let abar = pci

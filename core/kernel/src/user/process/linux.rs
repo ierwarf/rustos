@@ -1,18 +1,18 @@
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp;
 use core::convert::TryFrom;
 use core::ptr;
 
+use object::LittleEndian;
 use object::elf::{self as objelf, FileHeader64 as RawElfHeader};
 use object::read::FileKind;
-use object::LittleEndian;
-use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
+use x86_64::structures::paging::PageTableFlags;
+use xmas_elf::ElfFile;
 use xmas_elf::dynamic::Tag as DynamicTag;
 use xmas_elf::program::{ProgramHeader, SegmentData, Type as ProgramType};
-use xmas_elf::ElfFile;
 
 use crate::debug;
 use crate::memory::paging::{self, ProcessAddressSpace};
@@ -20,14 +20,14 @@ use crate::multitask::UserStackState;
 use crate::user::abi::UserAbi;
 use crate::user::linux::{
     self as linux_abi, LinuxImageMapping, LinuxImageMappingPathKind, LinuxInitialTlsInfo,
-    LinuxMemoryMapState, LinuxProcessImageInfo, LinuxProcessLaunch, LinuxVma, LinuxVmaFlags,
-    LinuxVmaName,
+    LinuxMemoryMapState, LinuxProcessImageInfo, LinuxProcessLaunch, LinuxRuntimeProfile,
+    LinuxVma, LinuxVmaFlags, LinuxVmaName,
 };
 use crate::vfs;
 
 use super::{
-    align_down, align_up, page_ranges_overlap, LoadedProcessImage, LoadedProcessRuntime,
-    ProcessLoadError, MAX_LOAD_SEGMENTS, PAGE_SIZE,
+    LoadedProcessImage, LoadedProcessRuntime, MAX_LOAD_SEGMENTS, PAGE_SIZE, ProcessLoadError,
+    align_down, align_up, page_ranges_overlap,
 };
 
 const ELF_DYN_LOAD_BASE: u64 = paging::USER_SPACE_BASE + 0x0040_0000;
@@ -102,6 +102,7 @@ pub(super) fn load_elf(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadEr
     let header = validate_elf_header(image)?;
     let elf = ElfFile::new(image).map_err(ProcessLoadError::InvalidElf)?;
     let interpreter_path = elf_interpreter_path(image, &elf)?;
+    let runtime_search_paths = elf_runtime_search_paths(image, &elf)?;
     let load_bias = choose_elf_load_bias(&elf, header.image_type, ELF_DYN_LOAD_BASE)?;
     let mut address_space = ProcessAddressSpace::new()?;
     let mut image_mappings = Vec::new();
@@ -169,6 +170,7 @@ pub(super) fn load_elf(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadEr
         interpreter_base,
         interpreter_path_owned,
         image_mappings,
+        runtime_search_paths,
     )?;
 
     Ok(LoadedProcessImage {
@@ -536,6 +538,7 @@ fn build_linux_process_image(
     interpreter_base: u64,
     interpreter_path: Option<String>,
     image_mappings: Vec<LinuxImageMapping>,
+    runtime_search_paths: Vec<String>,
 ) -> Result<LinuxProcessImageInfo, ProcessLoadError> {
     let program_headers = program_header_table_addr(elf, header, load_bias)?;
     // Dynamic ELF relies on the userspace interpreter to build the initial thread
@@ -568,7 +571,31 @@ fn build_linux_process_image(
         brk_start,
         initial_tls,
         image_mappings,
+        runtime_search_paths,
     })
+}
+
+pub(super) fn build_runtime_profile(
+    image: &LinuxProcessImageInfo,
+    launch: LinuxProcessLaunch<'_>,
+) -> LinuxRuntimeProfile {
+    let mut profile = LinuxRuntimeProfile::new();
+
+    for entry in &image.runtime_search_paths {
+        for path in expand_runtime_search_entry(entry.as_str(), launch.exec_path) {
+            profile.allow_search_dir(path.as_str());
+        }
+    }
+
+    if let Some(value) = linux_env_value(launch.env, "LD_LIBRARY_PATH") {
+        for entry in value.split(':') {
+            for path in expand_runtime_search_entry(entry, launch.exec_path) {
+                profile.allow_search_dir(path.as_str());
+            }
+        }
+    }
+
+    profile
 }
 
 pub(super) fn build_initial_memory_map(
@@ -933,6 +960,162 @@ fn parse_elf_dynamic_relocations(
     Ok(Some(info))
 }
 
+fn elf_runtime_search_paths(
+    image: &[u8],
+    elf: &ElfFile<'_>,
+) -> Result<Vec<String>, ProcessLoadError> {
+    let Some(dynamic_segment) = elf.program_iter().find(|ph| {
+        ph.get_type()
+            .map(|kind| kind == ProgramType::Dynamic)
+            .unwrap_or(false)
+    }) else {
+        return Ok(Vec::new());
+    };
+
+    let entries = match dynamic_segment
+        .get_data(elf)
+        .map_err(ProcessLoadError::InvalidElf)?
+    {
+        SegmentData::Dynamic64(entries) => entries,
+        _ => {
+            return Err(ProcessLoadError::InvalidElf(
+                "dynamic segment is not 64-bit",
+            ));
+        }
+    };
+
+    let mut strtab_addr = 0_u64;
+    let mut strtab_size = 0_u64;
+    let mut rpath_offset = None;
+    let mut runpath_offset = None;
+    for entry in entries {
+        match entry.get_tag().map_err(ProcessLoadError::InvalidElf)? {
+            DynamicTag::StrTab => {
+                strtab_addr = entry.get_ptr().map_err(ProcessLoadError::InvalidElf)?;
+            }
+            DynamicTag::StrSize => {
+                strtab_size = entry.get_val().map_err(ProcessLoadError::InvalidElf)?;
+            }
+            DynamicTag::RPath => {
+                rpath_offset = Some(entry.get_val().map_err(ProcessLoadError::InvalidElf)?);
+            }
+            DynamicTag::RunPath => {
+                runpath_offset = Some(entry.get_val().map_err(ProcessLoadError::InvalidElf)?);
+            }
+            DynamicTag::Null => break,
+            _ => {}
+        }
+    }
+
+    let Some(search_offset) = runpath_offset.or(rpath_offset) else {
+        return Ok(Vec::new());
+    };
+    if strtab_addr == 0 || strtab_size == 0 {
+        return Err(ProcessLoadError::InvalidElf(
+            "dynamic string table metadata is incomplete",
+        ));
+    }
+
+    let strtab = elf_file_slice_from_virtual_address(
+        image,
+        elf,
+        strtab_addr,
+        usize::try_from(strtab_size)
+            .map_err(|_| ProcessLoadError::InvalidElf("dynamic string table is too large"))?,
+    )?;
+    let encoded = elf_dynamic_string(
+        strtab,
+        usize::try_from(search_offset)
+            .map_err(|_| ProcessLoadError::InvalidElf("runtime search path offset is invalid"))?,
+    )?;
+
+    let mut paths = Vec::new();
+    for entry in encoded.split(':') {
+        let entry = entry.trim();
+        if entry.is_empty() || paths.iter().any(|current| current == entry) {
+            continue;
+        }
+        paths.push(entry.to_string());
+    }
+    Ok(paths)
+}
+
+fn elf_dynamic_string<'a>(strtab: &'a [u8], offset: usize) -> Result<&'a str, ProcessLoadError> {
+    let bytes = strtab
+        .get(offset..)
+        .ok_or(ProcessLoadError::InvalidElf(
+            "runtime search path offset is outside the string table",
+        ))?;
+    let Some(len) = bytes.iter().position(|&byte| byte == 0) else {
+        return Err(ProcessLoadError::InvalidElf(
+            "dynamic string table entry is not terminated",
+        ));
+    };
+    core::str::from_utf8(&bytes[..len])
+        .map_err(|_| ProcessLoadError::InvalidElf("dynamic string table entry is not valid UTF-8"))
+}
+
+fn linux_env_value<'a>(env: &'a [&'a str], key: &str) -> Option<&'a str> {
+    env.iter().find_map(|entry| {
+        let (name, value) = entry.split_once('=')?;
+        if name == key { Some(value) } else { None }
+    })
+}
+
+fn expand_runtime_search_entry(entry: &str, exec_path: &str) -> Vec<String> {
+    let entry = entry.trim();
+    if entry.is_empty() {
+        return Vec::new();
+    }
+
+    let origin = runtime_search_origin(exec_path);
+    let expanded = entry.replace("${ORIGIN}", origin.as_str());
+    let expanded = expanded.replace("$ORIGIN", origin.as_str());
+    let Some(path) = normalize_absolute_runtime_path(expanded.as_str()) else {
+        return Vec::new();
+    };
+    vec![path]
+}
+
+fn runtime_search_origin(exec_path: &str) -> String {
+    if exec_path == "/" || exec_path.is_empty() {
+        return String::from("/");
+    }
+    match exec_path.rsplit_once('/') {
+        Some(("", _)) => String::from("/"),
+        Some((parent, _)) if !parent.is_empty() => parent.to_string(),
+        _ => String::from("/"),
+    }
+}
+
+fn normalize_absolute_runtime_path(path: &str) -> Option<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || !trimmed.starts_with('/') {
+        return None;
+    }
+
+    let mut components = Vec::new();
+    for component in trimmed.split('/') {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if component == ".." {
+            components.pop();
+            continue;
+        }
+        components.push(component);
+    }
+
+    let mut normalized = String::from("/");
+    for (index, component) in components.iter().enumerate() {
+        if index != 0 {
+            normalized.push('/');
+        }
+        normalized.push_str(component);
+    }
+    Some(normalized)
+}
+
 fn elf_file_slice_from_virtual_address<'a>(
     image: &'a [u8],
     elf: &ElfFile<'_>,
@@ -1271,8 +1454,9 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::{
-        build_linux_initial_stack_words, elf_initial_tls_info_from_template, ElfTlsTemplateInfo,
-        ELF_DYN_LOAD_BASE, INITIAL_TLS_TCB_ALIGN, INITIAL_TLS_TCB_SIZE,
+        ELF_DYN_LOAD_BASE, ElfTlsTemplateInfo, INITIAL_TLS_TCB_ALIGN, INITIAL_TLS_TCB_SIZE,
+        build_linux_initial_stack_words, build_runtime_profile, elf_initial_tls_info_from_template,
+        expand_runtime_search_entry,
     };
     use crate::memory::paging::USER_SPACE_BASE;
     use crate::user::linux as linux_abi;
@@ -1309,6 +1493,7 @@ mod tests {
             brk_start: 0x500000,
             initial_tls: None,
             image_mappings: Vec::new(),
+            runtime_search_paths: Vec::new(),
         };
         let env_ptrs = [0x9000_u64];
         let words = build_linux_initial_stack_words(&image, &[], &env_ptrs, 0x7000, 0x8000);
@@ -1324,5 +1509,48 @@ mod tests {
             .position(|pair| pair[0] == linux_abi::AT_EXECFN)
             .expect("AT_EXECFN present");
         assert_eq!(auxv[execfn_index * 2 + 1], 0x8000);
+    }
+
+    #[test]
+    fn runtime_search_entries_expand_origin_and_ignore_relative_paths() {
+        assert_eq!(
+            expand_runtime_search_entry("$ORIGIN/../lib", "/system/packages/uiserver/uiserver.elf"),
+            vec![String::from("/system/packages/lib")]
+        );
+        assert!(expand_runtime_search_entry("relative/lib", "/system/app.elf").is_empty());
+    }
+
+    #[test]
+    fn runtime_profile_uses_runpath_and_ld_library_path() {
+        let image = LinuxProcessImageInfo {
+            entry: 0,
+            interpreter_base: 0,
+            interpreter_path: None,
+            program_headers: 0,
+            program_header_entry_size: 0,
+            program_header_count: 0,
+            brk_start: 0,
+            initial_tls: None,
+            image_mappings: Vec::new(),
+            runtime_search_paths: vec![String::from("$ORIGIN/../lib")],
+        };
+
+        let profile = build_runtime_profile(
+            &image,
+            linux_abi::LinuxProcessLaunch {
+                exec_path: "/system/packages/uiserver/uiserver.elf",
+                argv: &[],
+                env: &["LD_LIBRARY_PATH=/opt/rustos/lib:/tmp/relative"],
+            },
+        );
+
+        assert_eq!(
+            profile.search_dirs(),
+            &[
+                String::from("/system/packages/lib"),
+                String::from("/opt/rustos/lib"),
+                String::from("/tmp/relative"),
+            ]
+        );
     }
 }

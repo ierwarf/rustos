@@ -2,7 +2,7 @@ use super::compat::{
     LinuxCompatUrb, LinuxCompatUsbClassDriver, LinuxCompatUsbDevice, LinuxCompatUsbDriver,
     LinuxCompatUsbInterface,
 };
-use alloc::alloc::{alloc, dealloc, Layout};
+use alloc::alloc::{Layout, alloc, dealloc};
 use alloc::boxed::Box;
 use core::ffi::{c_char, c_void};
 use core::ptr;
@@ -27,8 +27,7 @@ pub(crate) unsafe extern "C" fn usb_register_driver(
             (*driver).driver.name = (*driver).name;
         }
         (*driver).driver.bus = bus_type_ptr();
-        let _driver_name =
-            crate::driver::linux::compat::compat_cstr((*driver).name).unwrap_or("?");
+        let _driver_name = crate::driver::linux::compat::compat_cstr((*driver).name).unwrap_or("?");
         crate::debug::println!(
             "usb_register_driver: driver={:#x} name={} probe={:#x} disconnect={:#x} id_table={:#x}",
             driver as usize,

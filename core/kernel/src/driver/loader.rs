@@ -8,11 +8,11 @@ use driver_abi::{
     DriverBus, DriverClass, DriverInitFn, DriverModuleHeader, RUSTOS_DRIVER_ABI_VERSION_SYMBOL,
     RUSTOS_DRIVER_HEADER_SYMBOL, RUSTOS_DRIVER_INIT_SYMBOL,
 };
+use object::LittleEndian;
 use object::elf::{
     self as objelf, FileHeader64 as RawElfHeader, Rela64 as RawRela,
     SectionHeader64 as RawSectionHeader, Sym64 as RawSym,
 };
-use object::LittleEndian;
 use spin::Mutex;
 use x86_64::PhysAddr;
 

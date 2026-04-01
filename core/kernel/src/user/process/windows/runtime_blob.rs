@@ -2,8 +2,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::mem::size_of;
 
-use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
+use x86_64::structures::paging::PageTableFlags;
 
 use crate::memory::paging::ProcessAddressSpace;
 use crate::user::process_state::{
@@ -11,7 +11,7 @@ use crate::user::process_state::{
 };
 use crate::user::windows::WindowsProcessLaunch;
 
-use super::super::{align_up, ensure_unmapped_user_pages, ProcessLoadError, PAGE_SIZE};
+use super::super::{PAGE_SIZE, ProcessLoadError, align_up, ensure_unmapped_user_pages};
 use super::dll_search::{directory_name_from_windows_path, file_name_from_windows_path};
 use super::{InitializedWindowsRuntime, WindowsProcessImageInfo};
 

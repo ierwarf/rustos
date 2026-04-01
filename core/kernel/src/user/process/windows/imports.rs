@@ -5,11 +5,11 @@ use x86_64::VirtAddr;
 use crate::memory::paging::ProcessAddressSpace;
 use crate::user::process_state::WindowsLoadedModule;
 
-use super::super::{align_up, ProcessLoadError, PAGE_SIZE};
+use super::super::{PAGE_SIZE, ProcessLoadError, align_up};
 use super::loader;
 use super::pe::{
-    read_c_string_at_rva, read_import_name_at_rva, read_u32, read_u64, rva_to_file_offset, PeImage,
-    PE_DIRECTORY_IMPORT,
+    PE_DIRECTORY_IMPORT, PeImage, read_c_string_at_rva, read_import_name_at_rva, read_u32,
+    read_u64, rva_to_file_offset,
 };
 use super::{WindowsLoadedModuleImage, WindowsProcessImageInfo};
 
@@ -121,12 +121,8 @@ fn collect_pe_imports(
                 let name_rva = (entry & 0x7fff_ffff) as u32;
                 WindowsImportLookup::Name(read_import_name_at_rva(image, pe, name_rva)?)
             };
-            let target_address = resolve_import_target(
-                dll_name,
-                lookup,
-                loaded_modules,
-                loaded_module_images,
-            )?;
+            let target_address =
+                resolve_import_target(dll_name, lookup, loaded_modules, loaded_module_images)?;
             imports.push(ResolvedImport {
                 first_thunk_rva,
                 target_address,
@@ -161,8 +157,7 @@ fn resolve_import_target(
         loaded_module_images,
         dll_name,
         export_lookup,
-    )?
-    {
+    )? {
         return Ok(address);
     }
 

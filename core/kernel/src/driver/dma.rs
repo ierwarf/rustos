@@ -3,8 +3,8 @@ use core::ffi::c_void;
 use core::ptr;
 
 use spin::Mutex;
-use x86_64::instructions::interrupts;
 use x86_64::PhysAddr;
+use x86_64::instructions::interrupts;
 
 const DMA_PAGE_SIZE: usize = 4096;
 
@@ -155,11 +155,7 @@ pub(crate) fn unmap_single(device: *mut c_void, dma_addr: u64, size: usize) {
 }
 
 pub(crate) fn mapping_error(dma_addr: u64) -> i32 {
-    if dma_addr == DMA_MAPPING_ERROR {
-        1
-    } else {
-        0
-    }
+    if dma_addr == DMA_MAPPING_ERROR { 1 } else { 0 }
 }
 
 pub(crate) fn sync_single_for_cpu(_device: *mut c_void, _dma_addr: u64, _size: usize) {}

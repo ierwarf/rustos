@@ -5,11 +5,7 @@ pub(super) fn file_name_from_windows_path(path: &str) -> &str {
             last = &path[index + 1..];
         }
     }
-    if last.is_empty() {
-        path
-    } else {
-        last
-    }
+    if last.is_empty() { path } else { last }
 }
 
 pub(super) fn directory_name_from_windows_path(path: &str) -> &str {

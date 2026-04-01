@@ -5,9 +5,10 @@
 extern crate alloc;
 
 mod load;
-mod storage;
 mod runtime;
+#[path = "../../../settings.rs"]
 mod settings;
+mod storage;
 
 pub(crate) use load::elf_loader;
 pub(crate) use runtime::{debug, heap, panic_screen};

@@ -1412,7 +1412,7 @@ fn with_injection(f: impl FnOnce()) {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_hid_layout, HidReportLayout};
+    use super::{HidReportLayout, parse_hid_layout};
 
     #[test]
     fn parses_qemu_usb_keyboard_layout() {

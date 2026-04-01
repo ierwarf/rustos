@@ -133,11 +133,12 @@ pub fn spawn_program_in_session(
         ..ProcessLaunchOptions::default()
     };
 
-    process::spawn_process_with_launch(program.image, program.weight_micros, launch)
-        .map_err(|error| {
+    process::spawn_process_with_launch(program.image, program.weight_micros, launch).map_err(
+        |error| {
             let _ = session;
             ConsoleHostError::Spawn { error }
-        })
+        },
+    )
 }
 
 pub fn load_executable_image(

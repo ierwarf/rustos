@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use xshell::{cmd, Shell};
+use xshell::{Shell, cmd};
 
-use crate::{config::Config, Result};
+use crate::{Result, config::Config};
 
 pub(crate) fn default_root_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -79,28 +79,6 @@ pub(crate) fn copy_with_parent(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn maybe_copy_host_runtime(
-    src: &Option<PathBuf>,
-    dst: &Path,
-) -> Result<()> {
-    if let Some(src) = src.as_ref().filter(|path| path.is_file()) {
-        copy_with_parent(src, dst)?;
-    }
-    Ok(())
-}
-
-pub(crate) fn maybe_copy_dual_host_runtime(
-    src: &Option<PathBuf>,
-    primary_dst: &Path,
-    fallback_dst: &Path,
-) -> Result<()> {
-    if let Some(src) = src.as_ref().filter(|path| path.is_file()) {
-        copy_with_parent(src, primary_dst)?;
-        copy_with_parent(src, fallback_dst)?;
-    }
-    Ok(())
-}
-
 pub(crate) fn copy_or_unpack_firmware(
     firmware_dir: &Path,
     basename: &str,
@@ -160,24 +138,6 @@ pub(crate) fn remove_file_if_exists(path: &Path) -> Result<()> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err.into()),
     }
-}
-
-pub(crate) fn compiler_print_file_name(cc: &OsStr, file_name: &str) -> Option<PathBuf> {
-    let output = Command::new(cc)
-        .arg(format!("-print-file-name={file_name}"))
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let candidate = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if candidate.is_empty() || candidate == file_name {
-        return None;
-    }
-
-    let path = PathBuf::from(candidate);
-    path.is_file().then_some(path)
 }
 
 pub(crate) fn command_in_path(name: &str) -> Option<PathBuf> {

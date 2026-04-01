@@ -176,6 +176,10 @@ pub(crate) fn read_fd_link(
     match handle {
         KernelHandle::Console(_) => Ok(String::from("/dev/tty")),
         KernelHandle::Device(device) => Ok(String::from(device.device_id().path())),
+        KernelHandle::Memfd(memfd) => Ok(memfd.path()),
+        KernelHandle::Socket(socket) => Ok(socket
+            .bound_path()
+            .unwrap_or_else(|| String::from("socket:[rustos-unix-stream]"))),
         KernelHandle::VfsFile(file) => Ok(file.path()),
         KernelHandle::VfsDirectory(directory) => Ok(String::from(directory.path())),
         KernelHandle::DisplaySurface(_) => Ok(String::from("anon_inode:[rustos-display-surface]")),

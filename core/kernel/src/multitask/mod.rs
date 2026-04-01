@@ -7,17 +7,19 @@ use core::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use x86_64::VirtAddr;
 use x86_64::instructions::{hlt, interrupts};
 use x86_64::registers::rflags::RFlags;
-use x86_64::registers::segmentation::{Segment, CS, SS};
-use x86_64::VirtAddr;
+use x86_64::registers::segmentation::{CS, SS, Segment};
 
 use self::context::SavedContext;
 use self::scheduler::Scheduler;
 use crate::io::session::ConsoleSessionHandle;
 use crate::memory::paging::ProcessAddressSpace;
 use crate::user::abi::UserAbi;
-use crate::user::linux::{LinuxMemoryMapState, LinuxProcessState, LinuxThreadState};
+use crate::user::linux::{
+    LinuxMemoryMapState, LinuxProcessState, LinuxRuntimeProfile, LinuxThreadState,
+};
 use crate::user::process_state::{
     UserProcessState, WindowsProcessRuntimeState, WindowsThreadRuntimeState,
 };
@@ -137,6 +139,7 @@ pub struct UserTaskBootstrap {
     pub user_stack: Option<UserStackState>,
     pub linux_process_state: Option<LinuxProcessState>,
     pub linux_memory_map: Option<LinuxMemoryMapState>,
+    pub linux_runtime_profile: Option<LinuxRuntimeProfile>,
     pub linux_thread_state: Option<LinuxThreadState>,
     pub windows_runtime: Option<WindowsProcessRuntimeState>,
     pub windows_thread_state: Option<WindowsThreadRuntimeState>,
@@ -156,6 +159,7 @@ impl UserTaskBootstrap {
             user_stack: None,
             linux_process_state: None,
             linux_memory_map: None,
+            linux_runtime_profile: None,
             linux_thread_state: None,
             windows_runtime: None,
             windows_thread_state: None,

@@ -1,6 +1,6 @@
 use core::ffi::{c_char, c_void};
 
-use driver_abi::{SerioPortInfo, SERIO_ANY};
+use driver_abi::{SERIO_ANY, SerioPortInfo};
 
 pub(crate) type LinuxCompatSerioWriteWakeupFn = unsafe extern "C" fn(serio: *mut LinuxCompatSerio);
 pub(crate) type LinuxCompatSerioWriteFn =

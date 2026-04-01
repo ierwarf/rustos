@@ -12,9 +12,7 @@ use storage_core::BlockDevice;
 
 use crate::storage::fat::{self, DiskIoError};
 
-pub use crate::storage::fat::{
-    BootVolumeDirEntry, BootVolumeMetadata,
-};
+pub use crate::storage::fat::{BootVolumeDirEntry, BootVolumeMetadata};
 
 static BOOT_INFO_PTR: AtomicPtr<BootInfo> = AtomicPtr::new(ptr::null_mut());
 static mut BOOT_BLOCK_DEVICE_OPENER: Option<BootBlockDeviceOpener> = None;
@@ -232,17 +230,11 @@ impl PhysicalBootVolume {
         self.fs.create_dir(path)
     }
 
-    pub fn remove_file(
-        &self,
-        path: &str,
-    ) -> core::result::Result<(), fatfs::Error<DiskIoError>> {
+    pub fn remove_file(&self, path: &str) -> core::result::Result<(), fatfs::Error<DiskIoError>> {
         self.fs.remove_file(path)
     }
 
-    pub fn remove_dir(
-        &self,
-        path: &str,
-    ) -> core::result::Result<(), fatfs::Error<DiskIoError>> {
+    pub fn remove_dir(&self, path: &str) -> core::result::Result<(), fatfs::Error<DiskIoError>> {
         self.fs.remove_dir(path)
     }
 

@@ -193,7 +193,7 @@ fn normalize_device_path(path: &str) -> Result<&str, DeviceLookupError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{lookup, open, DeviceId, DeviceLookupError};
+    use super::{DeviceId, DeviceLookupError, lookup, open};
 
     #[test]
     fn lookup_accepts_registered_device_paths() {

@@ -8,6 +8,7 @@ pub(crate) fn mmap(
     fd: u64,
     offset: u64,
 ) -> Result<u64, LinuxSysopError> {
+    let flags = linux_mmap_effective_flags(flags);
     let supported_prot = linux_abi::PROT_READ | linux_abi::PROT_WRITE | linux_abi::PROT_EXEC;
     if prot & !supported_prot != 0 {
         return Err(LinuxSysopError::InvalidArgument);
@@ -23,64 +24,40 @@ pub(crate) fn mmap(
     }
 
     if !linux_mmap_fd_is_anonymous(fd) {
-        if let Some(mapped_addr) =
-            mmap_current_process_file(fd, requested_addr, user_len, prot, flags, offset)?
-        {
-            return Ok(mapped_addr);
-        }
-
-        if requested_addr != 0 {
-            return Err(LinuxSysopError::InvalidArgument);
-        }
-        let mapped_addr = device::mmap_current_process_handle(fd, user_len, prot, flags, offset)
-            .map_err(LinuxSysopError::from)?;
-        let record_result =
-            multitask::with_current_user_process_state_mut(|_, abi, process_state| {
-                if abi != UserAbi::Linux {
-                    return Err(LinuxSysopError::Unsupported);
-                }
-
-                let mapping_name = match process_state.handles().get(fd) {
-                    Some(KernelHandle::DisplaySurface(_)) => {
-                        linux_abi::LinuxVmaName::Label("anon_inode:[rustos-display-surface]")
-                    }
-                    Some(KernelHandle::Device(device)) => linux_abi::LinuxVmaName::Path(
-                        alloc::string::String::from(device.device_id().path()),
-                    ),
-                    Some(_) => linux_abi::LinuxVmaName::None,
-                    None => return Err(LinuxSysopError::BadFileDescriptor),
-                };
-                let mapped_end = mapped_addr
-                    .checked_add(align_up(user_len, PAGE_SIZE))
-                    .ok_or(LinuxSysopError::InvalidArgument)?;
-                let area = linux_abi::LinuxVma::new(
-                    mapped_addr,
-                    mapped_end,
-                    offset,
-                    linux_vma_flags_from_mmap(prot, flags),
-                    mapping_name,
-                )
-                .ok_or(LinuxSysopError::InvalidArgument)?;
-                let memory_map = process_state
-                    .linux_memory_map_mut()
-                    .ok_or(LinuxSysopError::Unsupported)?;
-                memory_map.replace_area(area);
-                Ok(())
-            })
-            .ok_or(LinuxSysopError::Unsupported)?;
-
-        if let Err(err) = record_result {
-            let _ = device::munmap_current_process_range(mapped_addr, user_len);
-            return Err(err);
-        }
-
-        return Ok(mapped_addr);
+        return match current_process_mmap_handle_kind(fd)? {
+            LinuxMmapHandleKind::Memfd => mmap_current_process_memfd(
+                fd,
+                requested_addr,
+                user_len,
+                prot,
+                flags,
+                offset,
+            )?
+            .ok_or(LinuxSysopError::BadFileDescriptor),
+            LinuxMmapHandleKind::File => mmap_current_process_file(
+                fd,
+                requested_addr,
+                user_len,
+                prot,
+                flags,
+                offset,
+            )?
+            .ok_or(LinuxSysopError::BadFileDescriptor),
+            LinuxMmapHandleKind::Device => mmap_current_process_device(
+                fd,
+                requested_addr,
+                user_len,
+                prot,
+                flags,
+                offset,
+            ),
+        };
     }
 
     if offset != 0 {
         return Err(LinuxSysopError::InvalidArgument);
     }
-    if flags & linux_abi::MAP_PRIVATE == 0 || flags & linux_abi::MAP_ANONYMOUS == 0 {
+    if !linux_mmap_is_private(flags) || flags & linux_abi::MAP_ANONYMOUS == 0 {
         return Err(LinuxSysopError::InvalidArgument);
     }
 
@@ -156,6 +133,115 @@ fn linux_mmap_fd_is_anonymous(fd: u64) -> bool {
     fd == u64::MAX || fd == u32::MAX as u64
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LinuxMmapHandleKind {
+    Memfd,
+    File,
+    Device,
+}
+
+fn current_process_mmap_handle_kind(fd: u64) -> Result<LinuxMmapHandleKind, LinuxSysopError> {
+    let Some(result) = multitask::with_current_user_process_state_mut(|_, abi, process_state| {
+        if abi != UserAbi::Linux {
+            return Err(LinuxSysopError::Unsupported);
+        }
+
+        match process_state.handles().get(fd) {
+            Some(KernelHandle::Memfd(_)) => Ok(LinuxMmapHandleKind::Memfd),
+            Some(KernelHandle::VfsFile(_)) => Ok(LinuxMmapHandleKind::File),
+            Some(KernelHandle::Device(_) | KernelHandle::DisplaySurface(_)) => {
+                Ok(LinuxMmapHandleKind::Device)
+            }
+            Some(_) => Err(LinuxSysopError::BadFileDescriptor),
+            None => Err(LinuxSysopError::BadFileDescriptor),
+        }
+    }) else {
+        return Err(LinuxSysopError::Unsupported);
+    };
+
+    result
+}
+
+fn linux_mmap_effective_flags(flags: u64) -> u64 {
+    // glibc still passes legacy bookkeeping flags such as MAP_DENYWRITE and
+    // MAP_EXECUTABLE for ELF segments; Linux ignores them for mmap semantics.
+    flags & !(linux_abi::MAP_DENYWRITE | linux_abi::MAP_EXECUTABLE)
+}
+
+fn linux_mmap_mapping_type(flags: u64) -> u64 {
+    flags & linux_abi::MAP_TYPE
+}
+
+fn linux_mmap_is_shared(flags: u64) -> bool {
+    matches!(
+        linux_mmap_mapping_type(flags),
+        linux_abi::MAP_SHARED | linux_abi::MAP_SHARED_VALIDATE
+    )
+}
+
+fn linux_mmap_is_private(flags: u64) -> bool {
+    linux_mmap_mapping_type(flags) == linux_abi::MAP_PRIVATE
+}
+
+fn mmap_current_process_device(
+    fd: u64,
+    requested_addr: u64,
+    user_len: u64,
+    prot: u64,
+    flags: u64,
+    offset: u64,
+) -> Result<u64, LinuxSysopError> {
+    if requested_addr != 0 {
+        return Err(LinuxSysopError::InvalidArgument);
+    }
+
+    let mapped_addr = device::mmap_current_process_handle(fd, user_len, prot, flags, offset)
+        .map_err(LinuxSysopError::from)?;
+    let record_result = multitask::with_current_user_process_state_mut(|_, abi, process_state| {
+        if abi != UserAbi::Linux {
+            return Err(LinuxSysopError::Unsupported);
+        }
+
+        let mapping_name = match process_state.handles().get(fd) {
+            Some(KernelHandle::DisplaySurface(_)) => {
+                linux_abi::LinuxVmaName::Label("anon_inode:[rustos-display-surface]")
+            }
+            Some(KernelHandle::Device(device)) => {
+                linux_abi::LinuxVmaName::Path(alloc::string::String::from(device.device_id().path()))
+            }
+            Some(_) => return Err(LinuxSysopError::BadFileDescriptor),
+            None => return Err(LinuxSysopError::BadFileDescriptor),
+        };
+        let mapped_end = mapped_addr
+            .checked_add(align_up(user_len, PAGE_SIZE))
+            .ok_or(LinuxSysopError::InvalidArgument)?;
+        let area = linux_abi::LinuxVma::new(
+            mapped_addr,
+            mapped_end,
+            offset,
+            linux_vma_flags_from_mmap(prot, flags),
+            mapping_name,
+        )
+        .ok_or(LinuxSysopError::InvalidArgument)?;
+        let memory_map = process_state
+            .linux_memory_map_mut()
+            .ok_or(LinuxSysopError::Unsupported)?;
+        memory_map.replace_area(area);
+        Ok(())
+    });
+
+    let Some(record_result) = record_result else {
+        let _ = device::munmap_current_process_range(mapped_addr, user_len);
+        return Err(LinuxSysopError::Unsupported);
+    };
+    if let Err(err) = record_result {
+        let _ = device::munmap_current_process_range(mapped_addr, user_len);
+        return Err(err);
+    }
+
+    Ok(mapped_addr)
+}
+
 pub(crate) fn munmap(start: u64, user_len: u64) -> Result<(), LinuxSysopError> {
     let len = usize::try_from(user_len).map_err(|_| LinuxSysopError::InvalidArgument)?;
     if len == 0 {
@@ -170,7 +256,8 @@ pub(crate) fn munmap(start: u64, user_len: u64) -> Result<(), LinuxSysopError> {
             return Err(LinuxSysopError::Unsupported);
         }
 
-        let unmapped_len = {
+        let shared_segments = process_state.shared_memfd_overlap_segments(start, end);
+        let unmapped_len = if shared_segments.is_empty() {
             let (address_space, linux_process_state) =
                 process_state.address_space_and_linux_process_state_mut();
             match address_space.unmap_user_bytes(VirtAddr::new(start), len) {
@@ -190,6 +277,16 @@ pub(crate) fn munmap(start: u64, user_len: u64) -> Result<(), LinuxSysopError> {
                 }
                 Err(err) => return Err(LinuxSysopError::AddressSpace(err)),
             }
+        } else {
+            for (segment_start, segment_len) in &shared_segments {
+                let page_count = segment_len.div_ceil(PAGE_SIZE as usize);
+                process_state
+                    .address_space_mut()
+                    .unmap_user_pages_without_free_at(VirtAddr::new(*segment_start), page_count)
+                    .map_err(LinuxSysopError::AddressSpace)?;
+            }
+            process_state.release_shared_memfd_mappings_in_range(start, end);
+            Some(user_len)
         };
 
         if let Some(unmapped_len) = unmapped_len {
@@ -345,7 +442,7 @@ fn linux_vma_flags_from_prot(prot: u64, private: bool) -> linux_abi::LinuxVmaFla
 }
 
 fn linux_vma_flags_from_mmap(prot: u64, flags: u64) -> linux_abi::LinuxVmaFlags {
-    linux_vma_flags_from_prot(prot, flags & linux_abi::MAP_SHARED == 0)
+    linux_vma_flags_from_prot(prot, !linux_mmap_is_shared(flags))
 }
 
 fn align_up(value: u64, align: u64) -> u64 {
@@ -552,7 +649,7 @@ fn mmap_current_process_file(
         if offset & (PAGE_SIZE - 1) != 0 {
             return Err(LinuxSysopError::InvalidArgument);
         }
-        if flags & linux_abi::MAP_ANONYMOUS != 0 || flags & linux_abi::MAP_PRIVATE == 0 {
+        if flags & linux_abi::MAP_ANONYMOUS != 0 || !linux_mmap_is_private(flags) {
             return Err(LinuxSysopError::InvalidArgument);
         }
         if fixed_mapping && (requested_addr == 0 || requested_addr & (PAGE_SIZE - 1) != 0) {
@@ -565,6 +662,7 @@ fn mmap_current_process_file(
             let (address_space, linux_process_state) =
                 process_state.address_space_and_linux_process_state_mut();
             let Some(state) = linux_process_state.as_mut() else {
+                crate::debug::println!("linux file mmap rejected: missing Linux process state");
                 return Err(LinuxSysopError::Unsupported);
             };
             map_linux_user_region(
@@ -622,9 +720,10 @@ fn mmap_current_process_file(
             linux_abi::LinuxVmaName::Path(file_path),
         )
         .ok_or(LinuxSysopError::InvalidArgument)?;
-        let memory_map = process_state
-            .linux_memory_map_mut()
-            .ok_or(LinuxSysopError::Unsupported)?;
+        let Some(memory_map) = process_state.linux_memory_map_mut() else {
+            crate::debug::println!("linux file mmap rejected: missing Linux memory map");
+            return Err(LinuxSysopError::Unsupported);
+        };
         if fixed_mapping {
             memory_map.replace_area(area);
         } else {
@@ -632,6 +731,83 @@ fn mmap_current_process_file(
                 .insert_area(area)
                 .map_err(|_| LinuxSysopError::NoMemory)?;
         }
+
+        Ok(Some(region.start.as_u64()))
+    }) else {
+        return Err(LinuxSysopError::Unsupported);
+    };
+
+    result
+}
+
+fn mmap_current_process_memfd(
+    fd: u64,
+    requested_addr: u64,
+    user_len: u64,
+    prot: u64,
+    flags: u64,
+    offset: u64,
+) -> Result<Option<u64>, LinuxSysopError> {
+    let file_map_len = usize::try_from(user_len).map_err(|_| LinuxSysopError::InvalidArgument)?;
+    let page_count = usize::try_from(user_len.div_ceil(PAGE_SIZE))
+        .map_err(|_| LinuxSysopError::InvalidArgument)?;
+    let fixed_mapping = flags & linux_abi::MAP_FIXED != 0;
+    if fixed_mapping {
+        return Err(LinuxSysopError::Unsupported);
+    }
+    if flags & linux_abi::MAP_ANONYMOUS != 0 || !linux_mmap_is_shared(flags) {
+        return Ok(None);
+    }
+    if offset & (PAGE_SIZE - 1) != 0 {
+        return Err(LinuxSysopError::InvalidArgument);
+    }
+
+    let Some(result) = multitask::with_current_user_process_state_mut(|_, abi, process_state| {
+        if abi != UserAbi::Linux {
+            return Err(LinuxSysopError::Unsupported);
+        }
+
+        let Some(handle) = process_state.handles().get(fd).cloned() else {
+            return Err(LinuxSysopError::BadFileDescriptor);
+        };
+        let KernelHandle::Memfd(memfd) = handle else {
+            return Ok(None);
+        };
+
+        let offset = usize::try_from(offset).map_err(|_| LinuxSysopError::InvalidArgument)?;
+        let (frames, hold) = memfd.acquire_mapping(offset, file_map_len)?;
+        let page_flags = linux_mmap_page_flags(prot);
+        let region = {
+            let (address_space, linux_process_state) =
+                process_state.address_space_and_linux_process_state_mut();
+            let Some(state) = linux_process_state.as_mut() else {
+                crate::debug::println!("linux memfd mmap rejected: missing Linux process state");
+                return Err(LinuxSysopError::Unsupported);
+            };
+            let region =
+                reserve_linux_user_region(address_space, state, requested_addr, false, page_count)?;
+            address_space
+                .map_existing_user_pages_at(region.start, &frames, page_flags)
+                .map_err(LinuxSysopError::AddressSpace)?
+        };
+        process_state.set_mapping_cursor(region.end().as_u64());
+        process_state.record_shared_memfd_mapping(region.start.as_u64(), user_len, hold.clone());
+
+        let area = linux_abi::LinuxVma::new(
+            region.start.as_u64(),
+            region.end().as_u64(),
+            offset as u64,
+            linux_vma_flags_from_mmap(prot, flags),
+            linux_abi::LinuxVmaName::Path(hold.path()),
+        )
+        .ok_or(LinuxSysopError::InvalidArgument)?;
+        let Some(memory_map) = process_state.linux_memory_map_mut() else {
+            crate::debug::println!("linux memfd mmap rejected: missing Linux memory map");
+            return Err(LinuxSysopError::Unsupported);
+        };
+        memory_map
+            .insert_area(area)
+            .map_err(|_| LinuxSysopError::NoMemory)?;
 
         Ok(Some(region.start.as_u64()))
     }) else {

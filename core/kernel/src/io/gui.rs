@@ -4,14 +4,14 @@ mod framebuffer;
 use core::str;
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use boot_protocol::{BootInfo, BOOT_INFO_MAGIC, BOOT_INFO_VERSION};
+use boot_protocol::{BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootInfo};
 use driver_abi::{DisplayFramebufferRegistration, DisplayPixelFormat};
+use embedded_graphics::Drawable;
 use embedded_graphics::geometry::Point;
-use embedded_graphics::mono_font::{ascii::FONT_9X18_BOLD, MonoTextStyle};
+use embedded_graphics::mono_font::{MonoTextStyle, ascii::FONT_9X18_BOLD};
 use embedded_graphics::pixelcolor::Rgb888;
 use embedded_graphics::prelude::RgbColor;
 use embedded_graphics::text::{Baseline, Text};
-use embedded_graphics::Drawable;
 use spin::Mutex;
 
 use self::framebuffer::{Framebuffer, FramebufferRect};

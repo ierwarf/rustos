@@ -2,38 +2,6 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "Build OS (QEMU)",
-      "type": "process",
-      "command": "cargo",
-      "args": [
-        "xtask",
-        "build"
-      ],
-      "options": {
-        "cwd": "${workspaceFolder}",
-        "env": {
-          "CARGO_PROFILE_RELEASE_OPT_LEVEL": "0"
-        }
-      },
-      "problemMatcher": []
-    },
-    {
-      "label": "Build OS (KVM no optimized)",
-      "type": "process",
-      "command": "cargo",
-      "args": [
-        "xtask",
-        "build"
-      ],
-      "options": {
-        "cwd": "${workspaceFolder}",
-        "env": {
-          "CARGO_PROFILE_RELEASE_OPT_LEVEL": "0"
-        }
-      },
-      "problemMatcher": []
-    },
-    {
       "label": "Build OS",
       "type": "process",
       "command": "cargo",

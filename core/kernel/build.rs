@@ -1,15 +1,15 @@
 use std::fs;
+use std::path::PathBuf;
 
 fn main() {
-    println!("cargo:rerun-if-changed=src/settings.rs");
+    let settings_path = PathBuf::from("../../settings.rs");
+    println!("cargo:rerun-if-changed={}", settings_path.display());
     println!("cargo:rustc-check-cfg=cfg(rustos_debug_print_enabled)");
     println!("cargo:rustc-check-cfg=cfg(rustos_boot_trace_enabled)");
 
-    let settings = fs::read_to_string("src/settings.rs").expect("failed to read kernel settings");
-    if parse_bool(&settings, "DEBUG_PRINT_ENABLED") {
+    let settings = fs::read_to_string(&settings_path).expect("failed to read shared settings");
+    if parse_bool(&settings, "DEBUG_LOG_ENABLED") {
         println!("cargo:rustc-cfg=rustos_debug_print_enabled");
-    }
-    if parse_bool(&settings, "BOOT_TRACE_ENABLED") {
         println!("cargo:rustc-cfg=rustos_boot_trace_enabled");
     }
 }

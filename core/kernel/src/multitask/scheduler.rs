@@ -2,11 +2,11 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use core::{mem, ptr};
 
-use x86_64::registers::model_specific::FsBase;
 use x86_64::PhysAddr;
 use x86_64::VirtAddr;
+use x86_64::registers::model_specific::FsBase;
 
-use crate::arch::simd::{restore_state, save_state, SimdState};
+use crate::arch::simd::{SimdState, restore_state, save_state};
 use crate::debug;
 use crate::io::session::ConsoleSessionHandle;
 use crate::memory::paging::ProcessAddressSpace;
@@ -17,7 +17,7 @@ use crate::user::process_state::{
     SharedUserProcessState, UserProcessState, WindowsThreadRuntimeState,
 };
 
-use super::context::{SavedContext, SAVED_CONTEXT_BYTES};
+use super::context::{SAVED_CONTEXT_BYTES, SavedContext};
 use super::{UserFaultDisposition, UserStackState, UserTaskBootstrap};
 
 pub(super) const MAX_TASK: usize = 32;
@@ -476,6 +476,7 @@ impl Scheduler {
                     address_space,
                     bootstrap.linux_process_state,
                     bootstrap.linux_memory_map,
+                    bootstrap.linux_runtime_profile,
                     bootstrap.windows_runtime,
                     bootstrap.logical_admin,
                     exec_path.as_str(),
@@ -1005,6 +1006,9 @@ impl Scheduler {
         let Some(linux_memory_map) = bootstrap.linux_memory_map.take() else {
             return false;
         };
+        let Some(linux_runtime_profile) = bootstrap.linux_runtime_profile.take() else {
+            return false;
+        };
 
         let process_id = unsafe { owner.as_ref().process_id() };
         let exec_path = String::from(bootstrap.exec_path());
@@ -1043,6 +1047,7 @@ impl Scheduler {
                 address_space,
                 linux_process_state,
                 linux_memory_map,
+                linux_runtime_profile,
                 exec_path.as_str(),
             );
         }
@@ -1382,7 +1387,7 @@ mod tests {
     use core::mem::MaybeUninit;
     use core::ptr::NonNull;
 
-    use super::{ConsoleSessionHandle, Scheduler, SharedUserProcessState, TaskContext, MAX_TASK};
+    use super::{ConsoleSessionHandle, MAX_TASK, Scheduler, SharedUserProcessState, TaskContext};
     use crate::user::abi::UserAbi;
 
     fn test_user_context(owner: NonNull<SharedUserProcessState>) -> TaskContext {

@@ -8,6 +8,8 @@ use crate::io::device::DeviceHandle;
 use crate::memory::paging::UserRegion;
 use crate::user::abi::device::PIXEL_FORMAT_BGRA8888;
 use crate::user::linux as linux_abi;
+use crate::user::memfd::MemfdHandle;
+use crate::user::socket::SocketHandle;
 
 pub const FIRST_DYNAMIC_FD: u32 = 3;
 const PAGE_SIZE: u64 = 4096;
@@ -333,6 +335,8 @@ pub enum ConsoleStreamKind {
 pub enum KernelHandle {
     Console(ConsoleStreamKind),
     Device(DeviceHandle),
+    Memfd(MemfdHandle),
+    Socket(SocketHandle),
     VfsFile(VfsFileHandle),
     VfsDirectory(VfsDirectoryHandle),
     DisplaySurface(DisplaySurfaceHandle),
@@ -595,8 +599,8 @@ mod tests {
     use alloc::vec;
 
     use super::{
-        FileHandleSeekError, FileHandleSeekWhence, HandleEntry, HandleTable, KernelHandle,
-        VfsFileHandle, FD_CLOEXEC,
+        FD_CLOEXEC, FileHandleSeekError, FileHandleSeekWhence, HandleEntry, HandleTable,
+        KernelHandle, VfsFileHandle,
     };
 
     #[test]

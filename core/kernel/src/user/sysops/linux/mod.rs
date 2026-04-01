@@ -3,9 +3,9 @@ use core::mem::size_of;
 use core::slice;
 
 use spin::Mutex;
+use x86_64::VirtAddr;
 use x86_64::registers::model_specific::FsBase;
 use x86_64::structures::paging::PageTableFlags;
-use x86_64::VirtAddr;
 
 use crate::arch::rtc;
 use crate::debug;
@@ -15,8 +15,8 @@ use crate::memory::paging;
 use crate::multitask;
 use crate::user::abi::UserAbi;
 use crate::user::handles::{
-    ConsoleStreamKind, FileHandleSeekWhence, HandleEntry, KernelHandle, FD_CLOEXEC,
-    FIRST_DYNAMIC_FD,
+    ConsoleStreamKind, FD_CLOEXEC, FIRST_DYNAMIC_FD, FileHandleSeekWhence, HandleEntry,
+    KernelHandle,
 };
 use crate::user::linux as linux_abi;
 
@@ -29,18 +29,22 @@ use super::usermem;
 mod exec;
 mod fd;
 mod fs;
+mod memfd;
 mod mm;
 mod process;
 mod signal;
+mod socket;
 mod thread;
 mod time;
 
 pub(crate) use exec::*;
 pub(crate) use fd::*;
 pub(crate) use fs::*;
+pub(crate) use memfd::*;
 pub(crate) use mm::*;
 pub(crate) use process::*;
 pub(crate) use signal::*;
+pub(crate) use socket::*;
 pub(crate) use thread::*;
 pub(crate) use time::*;
 
@@ -88,8 +92,12 @@ pub(crate) struct LinuxExecTransition {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum LinuxSysopError {
     AddressSpace(paging::AddressSpaceError),
+    AddressFamilyNotSupported,
+    AddressInUse,
+    AlreadyConnected,
     BadFileDescriptor,
     Busy,
+    ConnectionRefused,
     DisplayUnavailable,
     IllegalSeek,
     InvalidArgument,
@@ -97,8 +105,11 @@ pub(crate) enum LinuxSysopError {
     ExecFormat,
     NotFound,
     NotDirectory,
+    NotConnected,
+    NotSocket,
     NoSuchProcess,
     NotTty,
+    OperationNotSupported,
     PermissionDenied,
     ReadOnlyFilesystem,
     Stale,
@@ -139,6 +150,32 @@ impl From<file::FileSysopError> for LinuxSysopError {
             file::FileSysopError::PermissionDenied => Self::PermissionDenied,
             file::FileSysopError::ReadOnlyFilesystem => Self::ReadOnlyFilesystem,
             file::FileSysopError::Unsupported => Self::Unsupported,
+        }
+    }
+}
+
+impl From<crate::user::socket::SocketError> for LinuxSysopError {
+    fn from(value: crate::user::socket::SocketError) -> Self {
+        match value {
+            crate::user::socket::SocketError::AddressInUse => Self::AddressInUse,
+            crate::user::socket::SocketError::ConnectionRefused => Self::ConnectionRefused,
+            crate::user::socket::SocketError::InvalidArgument => Self::InvalidArgument,
+            crate::user::socket::SocketError::IsConnected => Self::AlreadyConnected,
+            crate::user::socket::SocketError::NotConnected => Self::NotConnected,
+            crate::user::socket::SocketError::NotFound => Self::NotFound,
+            crate::user::socket::SocketError::TryAgain => Self::TryAgain,
+            crate::user::socket::SocketError::Unsupported => Self::OperationNotSupported,
+        }
+    }
+}
+
+impl From<crate::user::memfd::MemfdError> for LinuxSysopError {
+    fn from(value: crate::user::memfd::MemfdError) -> Self {
+        match value {
+            crate::user::memfd::MemfdError::Busy => Self::Busy,
+            crate::user::memfd::MemfdError::InvalidArgument => Self::InvalidArgument,
+            crate::user::memfd::MemfdError::NoMemory => Self::NoMemory,
+            crate::user::memfd::MemfdError::PermissionDenied => Self::PermissionDenied,
         }
     }
 }

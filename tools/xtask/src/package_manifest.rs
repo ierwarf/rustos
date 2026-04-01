@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::config::Config;
 use crate::Result;
+use crate::config::Config;
 
 pub(crate) const PACKAGE_MANIFEST_NAME: &str = "RUSTOS.package.toml";
 pub(crate) const DEFAULT_PROFILE: &str = "default";
@@ -249,7 +249,11 @@ fn validate_manifests(manifests: &[PackageManifest]) -> Result<()> {
 
     for manifest in manifests {
         if manifest.id.trim().is_empty() {
-            return Err(format!("package id is empty in {}", manifest.manifest_path.display()).into());
+            return Err(format!(
+                "package id is empty in {}",
+                manifest.manifest_path.display()
+            )
+            .into());
         }
         if !ids.insert(manifest.id.as_str()) {
             return Err(format!("duplicate package id: {}", manifest.id).into());
@@ -269,7 +273,8 @@ fn validate_manifests(manifests: &[PackageManifest]) -> Result<()> {
             )
             .into());
         }
-        if let Some(previous) = install_paths.insert(&manifest.install.path, &manifest.manifest_path)
+        if let Some(previous) =
+            install_paths.insert(&manifest.install.path, &manifest.manifest_path)
         {
             return Err(format!(
                 "install path collision for {} between {} and {}",
@@ -286,7 +291,13 @@ fn validate_manifests(manifests: &[PackageManifest]) -> Result<()> {
             | BuilderKind::KernelRustc
             | BuilderKind::CargoKernelBinary
             | BuilderKind::ModuleImage => {
-                if manifest.build.package.as_deref().unwrap_or_default().is_empty() {
+                if manifest
+                    .build
+                    .package
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty()
+                {
                     return Err(format!(
                         "package {} missing build.package in {}",
                         manifest.id,

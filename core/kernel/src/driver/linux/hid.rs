@@ -1,4 +1,4 @@
-use alloc::alloc::{alloc, Layout};
+use alloc::alloc::{Layout, alloc};
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -8,8 +8,8 @@ use core::ptr;
 use spin::Mutex;
 
 use super::compat::{
-    compat_cstr, LinuxCompatHidDevice, LinuxCompatHidDeviceId, LinuxCompatHidDriver,
-    LinuxCompatHidField, LinuxCompatHidReport,
+    LinuxCompatHidDevice, LinuxCompatHidDeviceId, LinuxCompatHidDriver, LinuxCompatHidField,
+    LinuxCompatHidReport, compat_cstr,
 };
 
 const HID_BUS_ANY: u16 = 0xffff;

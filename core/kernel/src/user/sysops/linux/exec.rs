@@ -9,7 +9,7 @@ use crate::user::linux as linux_abi;
 use crate::user::process::{self, ProcessLaunchOptions, ProcessLoadError};
 use crate::user::windows::WindowsProcessLaunch;
 
-use super::{file, usermem, LinuxExecTransition, LinuxSysopError};
+use super::{LinuxExecTransition, LinuxSysopError, file, usermem};
 
 const MAX_EXEC_PATH_LEN: usize = 256;
 const MAX_EXEC_ARG_COUNT: usize = 256;

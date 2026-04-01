@@ -6,8 +6,8 @@ use uefi::system;
 use uefi::table::cfg::ConfigTableEntry;
 
 use crate::boot_info::{
-    BootInfo, BootMemoryMap, BootPixelFormat, BootVolumeIdentity, FramebufferInfo,
-    BOOT_INFO_MAGIC, BOOT_INFO_VERSION,
+    BootInfo, BootMemoryMap, BootPixelFormat, BootVolumeIdentity, FramebufferInfo, BOOT_INFO_MAGIC,
+    BOOT_INFO_VERSION,
 };
 use crate::debug;
 use crate::error::BootError;

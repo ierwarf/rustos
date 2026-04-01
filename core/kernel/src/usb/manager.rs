@@ -4,7 +4,7 @@ use driver_abi::DriverBus;
 use spin::Mutex;
 
 use super::emulation;
-use super::host::{controller_kind_name, UsbHostControllerInfo};
+use super::host::{UsbHostControllerInfo, controller_kind_name};
 use super::xhci;
 const USB_SERVICE_ROUNDS: usize = 4;
 

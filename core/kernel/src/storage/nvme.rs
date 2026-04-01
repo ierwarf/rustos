@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::hint::spin_loop;
 use core::ptr;
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{Ordering, fence};
 
 use spin::Mutex;
 use storage_core::BlockDevice as SharedBlockDevice;
@@ -321,7 +321,8 @@ impl NvmeQueue {
 
 impl NvmeBlockDevice {
     fn read_block(&mut self, lba: u64, buffer: &mut [u8]) -> IoResult<()> {
-        if self.logical_block_size > NVME_DATA_BUFFER_BYTES || buffer.len() != self.logical_block_size
+        if self.logical_block_size > NVME_DATA_BUFFER_BYTES
+            || buffer.len() != self.logical_block_size
         {
             return Err(DiskIoError::Unsupported);
         }
@@ -343,7 +344,8 @@ impl NvmeBlockDevice {
     }
 
     fn write_block(&mut self, lba: u64, buffer: &[u8]) -> IoResult<()> {
-        if self.logical_block_size > NVME_DATA_BUFFER_BYTES || buffer.len() != self.logical_block_size
+        if self.logical_block_size > NVME_DATA_BUFFER_BYTES
+            || buffer.len() != self.logical_block_size
         {
             return Err(DiskIoError::Unsupported);
         }

@@ -108,6 +108,7 @@ fn write_debug_bytes(bytes: &[u8]) {
     with_debug_output_lock(|| {
         print_bytes_unlocked(bytes);
         crate::io::gui::write_debug_bytes(bytes);
+        mirror_debug_bytes_to_terminal(bytes);
     });
 }
 
@@ -123,12 +124,26 @@ impl DebugWriter {
     fn write_bytes(&mut self, bytes: &[u8]) {
         print_bytes_unlocked(bytes);
         crate::io::gui::write_debug_bytes(bytes);
+        mirror_debug_bytes_to_terminal(bytes);
     }
 
     fn finish_line(&mut self) {
         print_bytes_unlocked(b"\r\n");
         crate::io::gui::write_debug_bytes(b"\r\n");
+        mirror_debug_bytes_to_terminal(b"\r\n");
     }
+}
+
+#[cfg(rustos_debug_print_enabled)]
+fn mirror_debug_bytes_to_terminal(bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+
+    let Some(session) = crate::io::session::focused_console_session() else {
+        return;
+    };
+    let _ = crate::io::console::write_to_session(session, bytes);
 }
 
 #[cfg(rustos_debug_print_enabled)]

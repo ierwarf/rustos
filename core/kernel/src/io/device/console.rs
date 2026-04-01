@@ -7,7 +7,7 @@ use crate::user::abi::device as device_abi;
 use crate::user::process_state::UserProcessState;
 use x86_64::VirtAddr;
 
-use super::{read_user_struct, write_user_struct, DeviceError};
+use super::{DeviceError, read_user_struct, write_user_struct};
 
 const MAX_CONSOLE_SNAPSHOT_BYTES: usize = 4096;
 

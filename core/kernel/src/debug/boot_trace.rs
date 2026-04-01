@@ -1,18 +1,18 @@
 use boot_protocol::{
-    BootInfo, BootPixelFormat, FramebufferInfo, BOOT_INFO_MAGIC, BOOT_INFO_VERSION,
+    BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootInfo, BootPixelFormat, FramebufferInfo,
 };
 use core::fmt::{self, Write};
 use core::ptr;
 use core::str;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
+use embedded_graphics::Drawable;
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::geometry::{OriginDimensions, Point, Size};
-use embedded_graphics::mono_font::{ascii::FONT_9X18_BOLD, MonoTextStyle};
+use embedded_graphics::mono_font::{MonoTextStyle, ascii::FONT_9X18_BOLD};
 use embedded_graphics::pixelcolor::Rgb888;
 use embedded_graphics::prelude::RgbColor;
 use embedded_graphics::text::{Baseline, Text};
-use embedded_graphics::Drawable;
 use spin::Mutex;
 
 static BOOT_INFO_PTR: AtomicPtr<BootInfo> = AtomicPtr::new(ptr::null_mut());

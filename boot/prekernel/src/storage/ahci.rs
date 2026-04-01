@@ -1,4 +1,4 @@
-use alloc::alloc::{alloc_zeroed, dealloc, Layout};
+use alloc::alloc::{Layout, alloc_zeroed, dealloc};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -222,7 +222,11 @@ impl BlockDevice for AhciBlockDevice {
                 return Err(StorageError::InvalidInput);
             }
             unsafe {
-                ptr::copy_nonoverlapping(chunk.as_ptr(), self.runtime.dma_buffer_cpu, LOGICAL_BLOCK_SIZE);
+                ptr::copy_nonoverlapping(
+                    chunk.as_ptr(),
+                    self.runtime.dma_buffer_cpu,
+                    LOGICAL_BLOCK_SIZE,
+                );
             }
             self.execute_dma_command(ATA_CMD_WRITE_DMA_EXT, lba, true)?;
         }
@@ -574,7 +578,9 @@ fn alloc_dma(supports_64bit_dma: bool, size: usize) -> IoResult<(*mut u8, u64)> 
         return Err(StorageError::NotPresent);
     }
     let dma_addr = cpu_ptr as u64;
-    if !supports_64bit_dma && dma_addr.saturating_add(size.saturating_sub(1) as u64) > u32::MAX as u64 {
+    if !supports_64bit_dma
+        && dma_addr.saturating_add(size.saturating_sub(1) as u64) > u32::MAX as u64
+    {
         unsafe {
             dealloc(cpu_ptr, layout);
         }
@@ -657,7 +663,11 @@ fn prepare_port_command(
 
     unsafe {
         ptr::write_bytes(runtime.command_list_cpu, 0, COMMAND_LIST_BYTES);
-        ptr::write_bytes(runtime.command_table_cpu.cast::<u8>(), 0, COMMAND_TABLE_BYTES);
+        ptr::write_bytes(
+            runtime.command_table_cpu.cast::<u8>(),
+            0,
+            COMMAND_TABLE_BYTES,
+        );
     }
 
     let header = runtime.command_list_cpu.cast::<AhciCommandHeader>();

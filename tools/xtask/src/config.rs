@@ -1,11 +1,8 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use crate::util::{
-    command_in_path, compiler_print_file_name, default_root_dir, env_os, env_path, env_string,
-    split_whitespace_owned,
-};
 use crate::Result;
+use crate::util::{default_root_dir, env_os, env_path, env_string, split_whitespace_owned};
 
 pub(crate) struct Config {
     pub(crate) root_dir: PathBuf,
@@ -64,18 +61,7 @@ pub(crate) struct Config {
     pub(crate) amdgpu_firmware_dir: PathBuf,
     pub(crate) amdgpu_image_firmware_dir: PathBuf,
     pub(crate) amdgpu_required_firmware_basenames: Vec<String>,
-    pub(crate) glibc_interpreter_source: Option<PathBuf>,
-    pub(crate) glibc_libc_source: Option<PathBuf>,
-    pub(crate) glibc_libgcc_source: Option<PathBuf>,
-    pub(crate) glibc_interpreter_dest: PathBuf,
-    pub(crate) glibc_libc_primary_dest: PathBuf,
-    pub(crate) glibc_libc_fallback_dest: PathBuf,
-    pub(crate) glibc_libgcc_primary_dest: PathBuf,
-    pub(crate) glibc_libgcc_fallback_dest: PathBuf,
-    pub(crate) glibc_ldso_cache_dest: PathBuf,
-    pub(crate) glibc_ldso_preload_dest: PathBuf,
     pub(crate) ovmf_path: PathBuf,
-    pub(crate) ldconfig: Option<OsString>,
 }
 
 impl Config {
@@ -141,14 +127,6 @@ impl Config {
                 split_whitespace_owned(
                     "-C no-redzone -C relocation-model=pic -C link-arg=-nostartfiles -C link-arg=-shared -C link-arg=-static -C link-arg=-Wl,-Bsymbolic -C link-arg=-Wl,-e,_start",
                 )
-            });
-
-        let ldconfig = env_os("LDCONFIG")
-            .filter(|value| !value.is_empty())
-            .or_else(|| {
-                command_in_path("ldconfig")
-                    .map(PathBuf::into_os_string)
-                    .filter(|value| !value.is_empty())
             });
 
         Ok(Self {
@@ -229,26 +207,6 @@ impl Config {
                         String::from("smu_13_0_10.bin"),
                     ]
                 }),
-            glibc_interpreter_source: env_path("GLIBC_INTERPRETER_SOURCE")
-                .or_else(|| compiler_print_file_name(&cc, "ld-linux-x86-64.so.2")),
-            glibc_libc_source: env_path("GLIBC_LIBC_SOURCE")
-                .or_else(|| compiler_print_file_name(&cc, "libc.so.6")),
-            glibc_libgcc_source: env_path("GLIBC_LIBGCC_SOURCE")
-                .or_else(|| compiler_print_file_name(&cc, "libgcc_s.so.1")),
-            glibc_interpreter_dest: env_path("GLIBC_INTERPRETER_DEST")
-                .unwrap_or_else(|| image_dir.join("lib64/ld-linux-x86-64.so.2")),
-            glibc_libc_primary_dest: env_path("GLIBC_LIBC_PRIMARY_DEST")
-                .unwrap_or_else(|| image_dir.join("lib/x86_64-linux-gnu/libc.so.6")),
-            glibc_libc_fallback_dest: env_path("GLIBC_LIBC_FALLBACK_DEST")
-                .unwrap_or_else(|| image_dir.join("lib64/libc.so.6")),
-            glibc_libgcc_primary_dest: env_path("GLIBC_LIBGCC_PRIMARY_DEST")
-                .unwrap_or_else(|| image_dir.join("lib/x86_64-linux-gnu/libgcc_s.so.1")),
-            glibc_libgcc_fallback_dest: env_path("GLIBC_LIBGCC_FALLBACK_DEST")
-                .unwrap_or_else(|| image_dir.join("lib64/libgcc_s.so.1")),
-            glibc_ldso_cache_dest: env_path("GLIBC_LDSO_CACHE_DEST")
-                .unwrap_or_else(|| image_dir.join("etc/ld.so.cache")),
-            glibc_ldso_preload_dest: env_path("GLIBC_LDSO_PRELOAD_DEST")
-                .unwrap_or_else(|| image_dir.join("etc/ld.so.preload")),
             ovmf_path: env_path("OVMF_PATH").unwrap_or_else(|| vendor_dir.join("ovmf/OVMF.fd")),
             root_dir,
             workspace_manifest,
@@ -275,7 +233,6 @@ impl Config {
             logs_dir,
             image_dir,
             user_build_dir,
-            ldconfig,
         })
     }
     pub(crate) fn kernel_release_deps_dir(&self) -> PathBuf {

@@ -1,13 +1,13 @@
 use core::ptr::{addr_of, addr_of_mut};
 
 use spin::Mutex;
+use x86_64::PhysAddr;
+use x86_64::VirtAddr;
 use x86_64::instructions::{interrupts, tlb};
 use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::registers::model_specific::Msr;
 use x86_64::structures::paging::page_table::PageTableEntry;
 use x86_64::structures::paging::{PageTable, PageTableFlags, PhysFrame};
-use x86_64::PhysAddr;
-use x86_64::VirtAddr;
 
 const ENTRIES_PER_TABLE: usize = 512;
 const HUGE_2MIB: u64 = 2 * 1024 * 1024;

@@ -1,8 +1,10 @@
 #![allow(dead_code)]
 
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use linux_raw_sys::{auxvec as linux_auxvec, general as linux, ioctl as linux_ioctl};
+use linux_raw_sys::{
+    auxvec as linux_auxvec, general as linux, ioctl as linux_ioctl, net as linux_net,
+};
 
 use crate::memory::paging;
 
@@ -40,6 +42,9 @@ raw_u64! {
     SYS_READ = linux::__NR_read;
     SYS_WRITE = linux::__NR_write;
     SYS_CLOSE = linux::__NR_close;
+    SYS_SOCKET = linux::__NR_socket;
+    SYS_ACCEPT = linux::__NR_accept;
+    SYS_FTRUNCATE = linux::__NR_ftruncate;
     SYS_FSTAT = linux::__NR_fstat;
     SYS_POLL = linux::__NR_poll;
     SYS_LSEEK = linux::__NR_lseek;
@@ -82,6 +87,13 @@ raw_u64! {
     SYS_EXIT_GROUP = linux::__NR_exit_group;
     SYS_TGKILL = linux::__NR_tgkill;
     SYS_OPENAT = linux::__NR_openat;
+    SYS_SOCKETPAIR = linux::__NR_socketpair;
+    SYS_BIND = linux::__NR_bind;
+    SYS_CONNECT = linux::__NR_connect;
+    SYS_LISTEN = linux::__NR_listen;
+    SYS_ACCEPT4 = linux::__NR_accept4;
+    SYS_SENDMSG = linux::__NR_sendmsg;
+    SYS_RECVMSG = linux::__NR_recvmsg;
     SYS_GETDENTS64 = linux::__NR_getdents64;
     SYS_EXECVEAT = linux::__NR_execveat;
     SYS_NEWFSTATAT = linux::__NR_newfstatat;
@@ -95,6 +107,7 @@ raw_u64! {
     SYS_STATX = linux::__NR_statx;
     SYS_RSEQ = linux::__NR_rseq;
     SYS_CLONE3 = linux::__NR_clone3;
+    SYS_MEMFD_CREATE = linux::__NR_memfd_create;
     TCGETS = linux_ioctl::TCGETS;
     TCSETS = linux_ioctl::TCSETS;
     TCSETSW = linux_ioctl::TCSETSW;
@@ -113,12 +126,28 @@ raw_u64! {
     O_APPEND = linux::O_APPEND;
     O_DIRECTORY = linux::O_DIRECTORY;
     O_CLOEXEC = linux::O_CLOEXEC;
+    AF_UNIX = linux_net::AF_UNIX;
+    SOCK_STREAM = linux_net::SOCK_STREAM;
+    SOCK_NONBLOCK = linux::O_NONBLOCK;
+    SOCK_CLOEXEC = linux::O_CLOEXEC;
+    MSG_DONTWAIT = linux_net::MSG_DONTWAIT;
+    MSG_NOSIGNAL = linux_net::MSG_NOSIGNAL;
+    MSG_CMSG_CLOEXEC = linux_net::MSG_CMSG_CLOEXEC;
+    MSG_CTRUNC = linux_net::MSG_CTRUNC;
+    SOL_SOCKET = linux_net::SOL_SOCKET;
+    SCM_RIGHTS = linux_net::SCM_RIGHTS;
     F_DUPFD = linux::F_DUPFD;
     F_GETFD = linux::F_GETFD;
     F_SETFD = linux::F_SETFD;
     F_GETFL = linux::F_GETFL;
     F_SETFL = linux::F_SETFL;
     F_DUPFD_CLOEXEC = linux::F_DUPFD_CLOEXEC;
+    F_ADD_SEALS = linux::F_ADD_SEALS;
+    F_GET_SEALS = linux::F_GET_SEALS;
+    F_SEAL_SEAL = linux::F_SEAL_SEAL;
+    F_SEAL_SHRINK = linux::F_SEAL_SHRINK;
+    F_SEAL_GROW = linux::F_SEAL_GROW;
+    F_SEAL_WRITE = linux::F_SEAL_WRITE;
     ARCH_SET_FS = linux::ARCH_SET_FS;
     F_OK = linux::F_OK;
     X_OK = linux::X_OK;
@@ -155,10 +184,14 @@ raw_u64! {
     PROT_READ = linux::PROT_READ;
     PROT_WRITE = linux::PROT_WRITE;
     PROT_EXEC = linux::PROT_EXEC;
+    MAP_TYPE = linux::MAP_TYPE;
     MAP_PRIVATE = linux::MAP_PRIVATE;
     MAP_SHARED = linux::MAP_SHARED;
+    MAP_SHARED_VALIDATE = linux::MAP_SHARED_VALIDATE;
     MAP_FIXED = linux::MAP_FIXED;
     MAP_ANONYMOUS = linux::MAP_ANONYMOUS;
+    MAP_DENYWRITE = linux::MAP_DENYWRITE;
+    MAP_EXECUTABLE = linux::MAP_EXECUTABLE;
     CLOCK_REALTIME = linux::CLOCK_REALTIME;
     CLOCK_MONOTONIC = linux::CLOCK_MONOTONIC;
     TIMER_ABSTIME = linux::TIMER_ABSTIME;
@@ -189,6 +222,8 @@ raw_u64! {
     DT_CHR = linux::DT_CHR;
     DT_DIR = linux::DT_DIR;
     DT_REG = linux::DT_REG;
+    MFD_CLOEXEC = linux::MFD_CLOEXEC;
+    MFD_ALLOW_SEALING = linux::MFD_ALLOW_SEALING;
 }
 
 raw_u32! {
@@ -273,6 +308,8 @@ pub const DEVICE_FILE_MODE_BITS: u32 = S_IFCHR | 0o600;
 pub const MAX_SIGNAL_NUMBER: usize = 64;
 pub const SIG_DFL: u64 = 0;
 pub const SIG_IGN: u64 = 1;
+pub const SOCK_TYPE_MASK: u64 = 0xf;
+pub const UNIX_PATH_MAX: usize = 108;
 
 const DEFAULT_MMAP_GAP: u64 = 16 * 1024 * 1024;
 const MMAP_COLLISION_GUARD: u64 = 64 * 1024 * 1024;
@@ -290,6 +327,44 @@ pub struct LinuxTimespec {
 pub struct LinuxIovec {
     pub iov_base: u64,
     pub iov_len: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LinuxSockaddrUn {
+    pub sun_family: u16,
+    pub sun_path: [u8; UNIX_PATH_MAX],
+}
+
+impl Default for LinuxSockaddrUn {
+    fn default() -> Self {
+        Self {
+            sun_family: 0,
+            sun_path: [0; UNIX_PATH_MAX],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LinuxMsghdr {
+    pub msg_name: u64,
+    pub msg_namelen: u32,
+    pub __pad0: u32,
+    pub msg_iov: u64,
+    pub msg_iovlen: u64,
+    pub msg_control: u64,
+    pub msg_controllen: u64,
+    pub msg_flags: u32,
+    pub __pad1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LinuxCmsghdr {
+    pub cmsg_len: u64,
+    pub cmsg_level: u32,
+    pub cmsg_type: u32,
 }
 
 #[repr(C)]
@@ -754,6 +829,28 @@ impl LinuxMemoryMapState {
     }
 }
 
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct LinuxRuntimeProfile {
+    search_dirs: Vec<String>,
+}
+
+impl LinuxRuntimeProfile {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn search_dirs(&self) -> &[String] {
+        &self.search_dirs
+    }
+
+    pub fn allow_search_dir(&mut self, path: &str) {
+        let Some(path) = normalize_runtime_search_dir(path) else {
+            return;
+        };
+        push_unique_runtime_dir(&mut self.search_dirs, path.as_str());
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LinuxProcessImageInfo {
     pub entry: u64,
@@ -765,6 +862,7 @@ pub struct LinuxProcessImageInfo {
     pub brk_start: u64,
     pub initial_tls: Option<LinuxInitialTlsInfo>,
     pub image_mappings: Vec<LinuxImageMapping>,
+    pub runtime_search_paths: Vec<String>,
 }
 
 impl LinuxProcessImageInfo {
@@ -1050,14 +1148,62 @@ fn align_up(value: u64, align: u64) -> u64 {
     value.saturating_add(align - 1) & !(align - 1)
 }
 
+fn normalize_runtime_search_dir(path: &str) -> Option<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || !trimmed.starts_with('/') {
+        return None;
+    }
+
+    let mut components = Vec::new();
+    for component in trimmed.split('/') {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if component == ".." {
+            components.pop();
+            continue;
+        }
+        components.push(component);
+    }
+
+    let mut normalized = String::from("/");
+    for (index, component) in components.iter().enumerate() {
+        if index != 0 {
+            normalized.push('/');
+        }
+        normalized.push_str(component);
+    }
+    Some(normalized)
+}
+
+fn push_unique_runtime_dir(dest: &mut Vec<String>, value: &str) {
+    if dest.iter().any(|current| current == value) {
+        return;
+    }
+    dest.push(value.to_string());
+}
+
 #[cfg(test)]
 mod tests {
     use core::mem::size_of;
 
-    use super::LinuxStatx;
+    use super::{LinuxRuntimeProfile, LinuxStatx};
 
     #[test]
     fn linux_statx_matches_uapi_size() {
         assert_eq!(size_of::<LinuxStatx>(), 0x100);
+    }
+
+    #[test]
+    fn runtime_profile_normalizes_and_deduplicates_search_dirs() {
+        let mut profile = LinuxRuntimeProfile::new();
+        profile.allow_search_dir("/lib64");
+        profile.allow_search_dir("/usr/lib/../lib64/");
+        profile.allow_search_dir("relative/path");
+
+        assert_eq!(
+            profile.search_dirs(),
+            &[String::from("/lib64"), String::from("/usr/lib64")]
+        );
     }
 }

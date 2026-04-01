@@ -1,9 +1,9 @@
-use alloc::alloc::{alloc_zeroed, Layout};
+use alloc::alloc::{Layout, alloc_zeroed};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::hint::spin_loop;
 use core::ptr;
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{Ordering, fence};
 
 use storage_core::{BlockDevice, IoResult, StorageError};
 use x86_64::instructions::port::Port;
@@ -258,7 +258,9 @@ impl BlockDevice for NvmeBlockDevice {
             cdw14: 0,
             cdw15: 0,
         };
-        self.controller.submit_and_wait(&mut self.io, cmd).map(|_| ())
+        self.controller
+            .submit_and_wait(&mut self.io, cmd)
+            .map(|_| ())
     }
 }
 
@@ -494,7 +496,9 @@ impl NvmeQueue {
 
 impl NvmeBlockDevice {
     fn read_block(&mut self, lba: u64, buffer: &mut [u8]) -> IoResult<()> {
-        if self.logical_block_size > NVME_DATA_BUFFER_BYTES || buffer.len() != self.logical_block_size {
+        if self.logical_block_size > NVME_DATA_BUFFER_BYTES
+            || buffer.len() != self.logical_block_size
+        {
             return Err(StorageError::Unsupported);
         }
         let cmd = NvmeSubmission {
@@ -519,7 +523,9 @@ impl NvmeBlockDevice {
     }
 
     fn write_block(&mut self, lba: u64, buffer: &[u8]) -> IoResult<()> {
-        if self.logical_block_size > NVME_DATA_BUFFER_BYTES || buffer.len() != self.logical_block_size {
+        if self.logical_block_size > NVME_DATA_BUFFER_BYTES
+            || buffer.len() != self.logical_block_size
+        {
             return Err(StorageError::Unsupported);
         }
         unsafe {
@@ -659,7 +665,8 @@ fn allocate_queue(qid: u16, entry_count: u16) -> IoResult<NvmeQueue> {
 }
 
 fn alloc_dma(size: usize) -> IoResult<*mut u8> {
-    let layout = Layout::from_size_align(size.max(4096), 4096).map_err(|_| StorageError::InvalidInput)?;
+    let layout =
+        Layout::from_size_align(size.max(4096), 4096).map_err(|_| StorageError::InvalidInput)?;
     let ptr = unsafe { alloc_zeroed(layout) };
     if ptr.is_null() {
         Err(StorageError::NotPresent)

@@ -2,8 +2,8 @@ use boot_protocol::FramebufferInfo;
 use spin::Mutex;
 use x86_64::instructions::interrupts;
 
-use super::framebuffer::{build_framebuffer, Framebuffer, FramebufferRect};
 use super::GuiDisplayInfo;
+use super::framebuffer::{Framebuffer, FramebufferRect, build_framebuffer};
 use crate::memory::paging::{self, ProcessAddressSpace};
 
 const HUGE_2MIB: u64 = 2 * 1024 * 1024;
@@ -70,11 +70,7 @@ impl DisplayBackend {
 
 fn next_display_generation(current: u64) -> u64 {
     let next = current.wrapping_add(1);
-    if next == 0 {
-        1
-    } else {
-        next
-    }
+    if next == 0 { 1 } else { next }
 }
 
 pub(crate) fn install_boot_framebuffer(info: FramebufferInfo) -> bool {

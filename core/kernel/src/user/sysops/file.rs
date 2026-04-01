@@ -12,6 +12,7 @@ use crate::user::handles::{
     FileHandleSeekError, FileHandleSeekWhence, FileHandleWriteError, KernelHandle,
 };
 use crate::user::linux as linux_abi;
+use crate::user::memfd::MemfdError;
 use crate::vfs;
 
 const FILE_IO_CHUNK_LEN: usize = 512;
@@ -102,15 +103,31 @@ pub(crate) fn read_path_for_current_process_to_vec(
         let _ = process_state.handles_mut().close(fd);
 
         let handle = handle?;
-        let KernelHandle::VfsFile(file) = handle else {
-            return Err(FileSysopError::PermissionDenied);
+        let (file_len, mut read_at): (
+            usize,
+            alloc::boxed::Box<dyn FnMut(usize, &mut [u8]) -> usize>,
+        ) = match handle {
+            KernelHandle::VfsFile(file) => {
+                let len = file.len();
+                (
+                    len,
+                    alloc::boxed::Box::new(move |offset, dest| file.read_at(offset, dest)),
+                )
+            }
+            KernelHandle::Memfd(file) => {
+                let len = file.len();
+                (
+                    len,
+                    alloc::boxed::Box::new(move |offset, dest| file.read_at(offset, dest)),
+                )
+            }
+            _ => return Err(FileSysopError::PermissionDenied),
         };
 
-        let file_len = file.len();
         let mut bytes = vec![0_u8; file_len];
         let mut copied = 0usize;
         while copied < bytes.len() {
-            let read = file.read_at(copied, &mut bytes[copied..]);
+            let read = read_at(copied, &mut bytes[copied..]);
             if read == 0 {
                 bytes.truncate(copied);
                 break;
@@ -139,7 +156,7 @@ pub(crate) fn read_current_process_file(
     let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
         if !matches!(
             process_state.handles().get(fd),
-            Some(KernelHandle::VfsFile(_))
+            Some(KernelHandle::VfsFile(_) | KernelHandle::Memfd(_))
         ) {
             return Ok(None);
         }
@@ -152,11 +169,11 @@ pub(crate) fn read_current_process_file(
         while copied < user_len {
             let chunk_len = min(user_len - copied, chunk.len());
             let read = {
-                let Some(KernelHandle::VfsFile(file)) = process_state.handles_mut().get_mut(fd)
-                else {
-                    return Err(FileSysopError::BadFileDescriptor);
-                };
-                file.read_into(&mut chunk[..chunk_len])
+                match process_state.handles_mut().get_mut(fd) {
+                    Some(KernelHandle::VfsFile(file)) => file.read_into(&mut chunk[..chunk_len]),
+                    Some(KernelHandle::Memfd(file)) => file.read_into(&mut chunk[..chunk_len]),
+                    Some(_) | None => return Err(FileSysopError::BadFileDescriptor),
+                }
             };
             if read == 0 {
                 break;
@@ -194,7 +211,7 @@ pub(crate) fn pread_current_process_file(
     let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
         if !matches!(
             process_state.handles().get(fd),
-            Some(KernelHandle::VfsFile(_))
+            Some(KernelHandle::VfsFile(_) | KernelHandle::Memfd(_))
         ) {
             return Ok(None);
         }
@@ -207,14 +224,18 @@ pub(crate) fn pread_current_process_file(
         while copied < user_len {
             let chunk_len = min(user_len - copied, chunk.len());
             let read = {
-                let Some(KernelHandle::VfsFile(file)) = process_state.handles_mut().get_mut(fd)
-                else {
-                    return Err(FileSysopError::BadFileDescriptor);
-                };
                 let chunk_offset = offset
                     .checked_add(copied)
                     .ok_or(FileSysopError::InvalidArgument)?;
-                file.read_at(chunk_offset, &mut chunk[..chunk_len])
+                match process_state.handles_mut().get_mut(fd) {
+                    Some(KernelHandle::VfsFile(file)) => {
+                        file.read_at(chunk_offset, &mut chunk[..chunk_len])
+                    }
+                    Some(KernelHandle::Memfd(file)) => {
+                        file.read_at(chunk_offset, &mut chunk[..chunk_len])
+                    }
+                    Some(_) | None => return Err(FileSysopError::BadFileDescriptor),
+                }
             };
             if read == 0 {
                 break;
@@ -250,7 +271,7 @@ pub(crate) fn write_current_process_file(
     let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
         if !matches!(
             process_state.handles().get(fd),
-            Some(KernelHandle::VfsFile(_))
+            Some(KernelHandle::VfsFile(_) | KernelHandle::Memfd(_))
         ) {
             return Ok(None);
         }
@@ -270,11 +291,13 @@ pub(crate) fn write_current_process_file(
                 .copy_from_user(VirtAddr::new(chunk_ptr), &mut chunk[..chunk_len])?;
 
             let write_result = {
-                let Some(KernelHandle::VfsFile(file)) = process_state.handles_mut().get_mut(fd)
-                else {
-                    return Err(FileSysopError::BadFileDescriptor);
-                };
-                file.write_from(&chunk[..chunk_len])
+                match process_state.handles_mut().get_mut(fd) {
+                    Some(KernelHandle::VfsFile(file)) => file.write_from(&chunk[..chunk_len]),
+                    Some(KernelHandle::Memfd(file)) => file
+                        .write_from(&chunk[..chunk_len])
+                        .map_err(map_memfd_write_error),
+                    Some(_) | None => return Err(FileSysopError::BadFileDescriptor),
+                }
             };
 
             match write_result {
@@ -306,11 +329,15 @@ pub(crate) fn seek_current_process_file(
             return Err(FileSysopError::BadFileDescriptor);
         };
 
-        let KernelHandle::VfsFile(file) = handle else {
-            return Ok(None);
-        };
-
-        file.seek(offset, whence).map(Some).map_err(map_seek_error)
+        match handle {
+            KernelHandle::VfsFile(file) => {
+                file.seek(offset, whence).map(Some).map_err(map_seek_error)
+            }
+            KernelHandle::Memfd(file) => {
+                file.seek(offset, whence).map(Some).map_err(map_seek_error)
+            }
+            _ => Ok(None),
+        }
     }) else {
         return Err(FileSysopError::Unsupported);
     };
@@ -352,6 +379,7 @@ fn resolve_base_path_for_dirfd(dirfd: u64) -> Result<String, FileSysopError> {
         match handle {
             KernelHandle::VfsDirectory(directory) => Ok(String::from(directory.path())),
             KernelHandle::VfsFile(_) => Err(FileSysopError::NotDirectory),
+            KernelHandle::Memfd(_) => Err(FileSysopError::NotDirectory),
             _ => Err(FileSysopError::InvalidArgument),
         }
     }) else {
@@ -410,6 +438,15 @@ fn linux_at_fdcwd_sign_extended() -> u64 {
 fn map_seek_error(err: FileHandleSeekError) -> FileSysopError {
     match err {
         FileHandleSeekError::InvalidPosition => FileSysopError::InvalidArgument,
+    }
+}
+
+fn map_memfd_write_error(err: MemfdError) -> FileHandleWriteError {
+    match err {
+        MemfdError::PermissionDenied => FileHandleWriteError::ReadOnly,
+        MemfdError::Busy | MemfdError::InvalidArgument | MemfdError::NoMemory => {
+            FileHandleWriteError::Unsupported
+        }
     }
 }
 

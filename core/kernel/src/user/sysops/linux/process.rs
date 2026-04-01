@@ -75,7 +75,9 @@ pub(crate) fn ioctl(fd: u64, _request: u64, _arg: u64) -> Result<u64, LinuxSysop
                 .map_err(Into::into)
         }
         KernelHandle::VfsFile(_)
+        | KernelHandle::Memfd(_)
         | KernelHandle::VfsDirectory(_)
+        | KernelHandle::Socket(_)
         | KernelHandle::DisplaySurface(_) => Err(LinuxSysopError::Unsupported),
     }
 }

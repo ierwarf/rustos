@@ -1,8 +1,8 @@
 use driver_abi::{
-    PointerPacket, POINTER_BUTTON_LEFT as POINTER_BUTTON_MASK_LEFT,
+    POINTER_BUTTON_LEFT as POINTER_BUTTON_MASK_LEFT,
     POINTER_BUTTON_MIDDLE as POINTER_BUTTON_MASK_MIDDLE,
     POINTER_BUTTON_RIGHT as POINTER_BUTTON_MASK_RIGHT, POINTER_BUTTON_X1 as POINTER_BUTTON_MASK_X1,
-    POINTER_BUTTON_X2 as POINTER_BUTTON_MASK_X2,
+    POINTER_BUTTON_X2 as POINTER_BUTTON_MASK_X2, PointerPacket,
 };
 use spin::{Mutex, MutexGuard};
 #[cfg(not(test))]
@@ -10,10 +10,9 @@ use x86_64::instructions::interrupts;
 
 use super::keyboard::{KeyAction, KeyboardEvent};
 use crate::user::abi::device::{
-    InputEvent, INPUT_ACTION_NONE, INPUT_ACTION_PRESSED, INPUT_ACTION_RELEASED,
-    INPUT_ACTION_REPEATED, INPUT_KIND_KEYBOARD, INPUT_KIND_POINTER_BUTTON,
-    INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION, INPUT_KIND_POINTER_SCROLL,
-    POINTER_BUTTON_LEFT,
+    INPUT_ACTION_NONE, INPUT_ACTION_PRESSED, INPUT_ACTION_RELEASED, INPUT_ACTION_REPEATED,
+    INPUT_KIND_KEYBOARD, INPUT_KIND_POINTER_BUTTON, INPUT_KIND_POINTER_MOTION,
+    INPUT_KIND_POINTER_POSITION, INPUT_KIND_POINTER_SCROLL, InputEvent, POINTER_BUTTON_LEFT,
 };
 use crate::util::ring::RingBuffer;
 
@@ -512,11 +511,11 @@ fn with_event_queue<R>(f: impl FnOnce(&mut InputEventQueueState) -> R) -> R {
 #[cfg(test)]
 mod tests {
     use super::{
-        has_pending_input_events, push_pointer_button_left, push_pointer_motion,
-        push_pointer_position, push_pointer_scroll, read_input_events, reset_for_tests,
         INPUT_ACTION_NONE, INPUT_ACTION_PRESSED, INPUT_KIND_POINTER_BUTTON,
         INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION, INPUT_KIND_POINTER_SCROLL,
-        POINTER_BUTTON_LEFT,
+        POINTER_BUTTON_LEFT, has_pending_input_events, push_pointer_button_left,
+        push_pointer_motion, push_pointer_position, push_pointer_scroll, read_input_events,
+        reset_for_tests,
     };
 
     fn isolated() -> std::sync::MutexGuard<'static, ()> {

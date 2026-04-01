@@ -5,14 +5,14 @@ use std::process::Command;
 
 use xshell::cmd;
 
+use crate::Result;
 use crate::config::Config;
-use crate::package_manifest::{load_manifests, BuilderKind, PackageManifest, DEFAULT_PROFILE};
+use crate::package_manifest::{BuilderKind, DEFAULT_PROFILE, PackageManifest, load_manifests};
 use crate::stage;
 use crate::util::{
     command_in_path, copy_with_parent, create_temp_dir, remove_dir_if_exists,
     remove_file_if_exists, run_cargo_kernel_check, run_cargo_kernel_rustc, run_command, shell,
 };
-use crate::Result;
 
 pub(crate) fn build(config: &Config) -> Result<()> {
     let manifests = selected_manifests(config)?;
@@ -111,8 +111,8 @@ pub(crate) fn check(config: &Config) -> Result<()> {
         sh,
         "{cargo} check --workspace --exclude bootloader --exclude prekernel --exclude kernel"
     )
-        .env("CARGO_TARGET_DIR", &config.cargo_target_dir)
-        .run()?;
+    .env("CARGO_TARGET_DIR", &config.cargo_target_dir)
+    .run()?;
 
     Ok(())
 }
@@ -339,9 +339,12 @@ fn build_mingw_c_exe(config: &Config, manifest: &PackageManifest) -> Result<()> 
         .as_deref()
         .unwrap_or("program.exe");
     let output = config.user_build_dir.join(output_name.to_ascii_uppercase());
-    let parent = output
-        .parent()
-        .ok_or_else(|| format!("Windows executable path has no parent: {}", output.display()))?;
+    let parent = output.parent().ok_or_else(|| {
+        format!(
+            "Windows executable path has no parent: {}",
+            output.display()
+        )
+    })?;
     fs::create_dir_all(parent)?;
 
     run_command(
@@ -369,7 +372,12 @@ fn build_c_demo_manifest(config: &Config, manifest: &PackageManifest) -> Result<
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
-    build_c_demo(&config.cc, &source, &manifest.artifact_path(config), &extra_args)
+    build_c_demo(
+        &config.cc,
+        &source,
+        &manifest.artifact_path(config),
+        &extra_args,
+    )
 }
 
 fn build_module_image_manifest(config: &Config, manifest: &PackageManifest) -> Result<()> {
@@ -411,7 +419,10 @@ fn build_external_copy_manifest(config: &Config, manifest: &PackageManifest) -> 
         )
         .into());
     } else {
-        eprintln!("xtask: warning: optional vendor module not found: {}", manifest.id);
+        eprintln!(
+            "xtask: warning: optional vendor module not found: {}",
+            manifest.id
+        );
     }
     Ok(())
 }
@@ -422,7 +433,13 @@ fn resolve_external_copy_source(config: &Config, manifest: &PackageManifest) -> 
         .source_env
         .as_deref()
         .and_then(crate::util::env_path)
-        .or_else(|| manifest.build.source.as_ref().map(|path| config.root_dir.join(path)))
+        .or_else(|| {
+            manifest
+                .build
+                .source
+                .as_ref()
+                .map(|path| config.root_dir.join(path))
+        })
 }
 
 fn build_rust_module_image(

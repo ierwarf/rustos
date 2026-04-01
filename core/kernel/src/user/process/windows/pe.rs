@@ -1,11 +1,11 @@
 use alloc::vec::Vec;
 
-use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
+use x86_64::structures::paging::PageTableFlags;
 
 use crate::memory::paging::{self, ProcessAddressSpace};
 
-use super::super::{align_down, align_up, page_ranges_overlap, ProcessLoadError, PAGE_SIZE};
+use super::super::{PAGE_SIZE, ProcessLoadError, align_down, align_up, page_ranges_overlap};
 
 const PE_DEFAULT_LOAD_BASE: u64 = paging::USER_SPACE_BASE + 0x0040_0000;
 const PE_MACHINE_AMD64: u16 = 0x8664;
@@ -532,7 +532,7 @@ pub(super) fn missing_base_relocations_are_fatal(pe: &PeImage, load_base: u64) -
 
 #[cfg(test)]
 mod tests {
-    use super::{missing_base_relocations_are_fatal, PeDataDirectory, PeImage};
+    use super::{PeDataDirectory, PeImage, missing_base_relocations_are_fatal};
 
     #[test]
     fn relocationless_pe_without_relocs_stripped_flag_is_accepted() {

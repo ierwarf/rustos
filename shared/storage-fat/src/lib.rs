@@ -179,19 +179,24 @@ impl<D: BlockDevice> FatVolume<D> {
         start_lba: u64,
         block_count: u64,
     ) -> Result<FatVolume<BlockSlice<D>>, FatError> {
-        let slice = BlockSlice::new(device, start_lba, block_count)
-            .map_err(fatfs::Error::Io)?;
+        let slice = BlockSlice::new(device, start_lba, block_count).map_err(fatfs::Error::Io)?;
         FatVolume::new(slice)
     }
 
     pub fn open_file(&self, path: &str) -> Result<FatFile<'_, D>, FatError> {
         let normalized = normalize_fat_path(path);
-        self.fs.root_dir().open_file(normalized.as_str()).map(FatFile)
+        self.fs
+            .root_dir()
+            .open_file(normalized.as_str())
+            .map(FatFile)
     }
 
     pub fn create_file(&self, path: &str) -> Result<FatFile<'_, D>, FatError> {
         let normalized = normalize_fat_path(path);
-        self.fs.root_dir().create_file(normalized.as_str()).map(FatFile)
+        self.fs
+            .root_dir()
+            .create_file(normalized.as_str())
+            .map(FatFile)
     }
 
     pub fn metadata(&self, path: &str) -> Result<FatMetadata, FatError> {
@@ -271,7 +276,8 @@ impl<D: BlockDevice> FatVolume<D> {
     pub fn rename(&self, src: &str, dst: &str) -> Result<(), FatError> {
         let src = normalize_fat_path(src);
         let dst = normalize_fat_path(dst);
-        let (dst_parent, dst_name) = split_parent_child(dst.as_str()).ok_or(fatfs::Error::InvalidInput)?;
+        let (dst_parent, dst_name) =
+            split_parent_child(dst.as_str()).ok_or(fatfs::Error::InvalidInput)?;
         let root = self.fs.root_dir();
         let dst_dir = if dst_parent.is_empty() {
             root.clone()
@@ -284,7 +290,8 @@ impl<D: BlockDevice> FatVolume<D> {
     pub fn read_file_to_vec(&self, path: &str) -> Result<Vec<u8>, FatError> {
         let mut file = self.open_file(path)?;
         let len = file.seek(SeekFrom::End(0))?;
-        let capacity = usize::try_from(len).map_err(|_| fatfs::Error::Io(StorageError::InvalidInput))?;
+        let capacity =
+            usize::try_from(len).map_err(|_| fatfs::Error::Io(StorageError::InvalidInput))?;
         file.seek(SeekFrom::Start(0))?;
         let mut bytes = vec![0_u8; capacity];
         let mut read = 0usize;
@@ -383,7 +390,9 @@ mod tests {
         let volume = FatVolume::new(disk).expect("open FAT volume");
         volume.create_dir("logs").expect("create logs dir");
         {
-            let mut file = volume.create_file("logs/test.txt").expect("create log file");
+            let mut file = volume
+                .create_file("logs/test.txt")
+                .expect("create log file");
             assert_eq!(file.write(b"old boot\n").expect("write log"), 9);
             file.flush().expect("flush log");
         }
@@ -406,7 +415,9 @@ mod tests {
         let volume = FatVolume::new(disk).expect("open FAT volume");
         volume.create_dir("configs").expect("create configs dir");
         {
-            let mut file = volume.create_file("configs/system.ini").expect("create file");
+            let mut file = volume
+                .create_file("configs/system.ini")
+                .expect("create file");
             file.write(b"[boot]\n").expect("write file");
             file.flush().expect("flush file");
         }
@@ -416,7 +427,9 @@ mod tests {
         let entries = volume.read_dir("configs").expect("read configs dir");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "system.old");
-        volume.remove_file("configs/system.old").expect("remove file");
+        volume
+            .remove_file("configs/system.old")
+            .expect("remove file");
         volume.remove_dir("configs").expect("remove dir");
         volume.unmount().expect("unmount");
     }
@@ -435,8 +448,7 @@ mod tests {
             let mut file = volume
                 .create_file("//configs/very-long-config-name.toml")
                 .expect("create long filename");
-            file.write(b"title = \"kernel\"\n")
-                .expect("write config");
+            file.write(b"title = \"kernel\"\n").expect("write config");
             file.flush().expect("flush config");
         }
 
@@ -471,7 +483,9 @@ mod tests {
         }
 
         assert!(volume.remove_dir("logs").is_err());
-        volume.remove_file("logs/boot.txt").expect("remove nested file");
+        volume
+            .remove_file("logs/boot.txt")
+            .expect("remove nested file");
         volume.remove_dir("logs").expect("remove empty dir");
         volume.unmount().expect("unmount");
     }
@@ -481,7 +495,9 @@ mod tests {
         let disk = format_disk(4096, 1024, 0x0bad_cafe);
         let volume = FatVolume::new(disk).expect("open FAT volume");
         {
-            let mut file = volume.create_file("kernel.elf").expect("create kernel file");
+            let mut file = volume
+                .create_file("kernel.elf")
+                .expect("create kernel file");
             file.write(b"ELF").expect("write kernel");
             file.flush().expect("flush kernel");
         }
@@ -499,9 +515,7 @@ mod tests {
             let mut file = volume.create_file("system.bin").expect("create file");
             let mut written = 0usize;
             while written < expected.len() {
-                let count = file
-                    .write(&expected[written..])
-                    .expect("write large file");
+                let count = file.write(&expected[written..]).expect("write large file");
                 assert!(count != 0);
                 written += count;
             }

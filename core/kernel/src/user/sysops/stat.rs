@@ -68,7 +68,13 @@ pub(crate) fn for_fd(fd: u64) -> Result<KernelStat, StatLookupError> {
         };
 
         let stat = match handle {
-            KernelHandle::Console(_) | KernelHandle::Device(_) => build_device_stat(fd),
+            KernelHandle::Console(_) | KernelHandle::Device(_) | KernelHandle::Socket(_) => {
+                build_device_stat(fd)
+            }
+            KernelHandle::Memfd(file) => {
+                let path = file.path();
+                build_regular_file_stat(path_inode_seed(path.as_bytes()), file.len() as u64)
+            }
             KernelHandle::VfsDirectory(directory) => {
                 let metadata = file::metadata_for_current_process_path(directory.path())?;
                 build_path_stat(directory.path().as_bytes(), metadata)

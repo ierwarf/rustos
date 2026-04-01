@@ -25,7 +25,14 @@ const LINUX_EFAULT: i64 = 14;
 const LINUX_EINVAL: i64 = 22;
 const LINUX_ENODEV: i64 = 19;
 const LINUX_ENOTDIR: i64 = 20;
+const LINUX_ENOTSOCK: i64 = 88;
 const LINUX_ENOTTY: i64 = 25;
+const LINUX_EOPNOTSUPP: i64 = 95;
+const LINUX_EAFNOSUPPORT: i64 = 97;
+const LINUX_EADDRINUSE: i64 = 98;
+const LINUX_EISCONN: i64 = 106;
+const LINUX_ENOTCONN: i64 = 107;
+const LINUX_ECONNREFUSED: i64 = 111;
 const LINUX_EROFS: i64 = 30;
 const LINUX_ESPIPE: i64 = 29;
 const LINUX_ESTALE: i64 = 116;
@@ -77,6 +84,9 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         linux_abi::SYS_READ => syscall_linux_read(frame.rdi, frame.rsi, frame.rdx),
         linux_abi::SYS_WRITE => syscall_linux_write(frame.rdi, frame.rsi, frame.rdx),
         linux_abi::SYS_CLOSE => syscall_linux_close(frame.rdi),
+        linux_abi::SYS_SOCKET => syscall_linux_socket(frame.rdi, frame.rsi, frame.rdx),
+        linux_abi::SYS_ACCEPT => syscall_linux_accept(frame.rdi, frame.rsi, frame.rdx),
+        linux_abi::SYS_FTRUNCATE => syscall_linux_ftruncate(frame.rdi, frame.rsi),
         linux_abi::SYS_FSTAT => syscall_linux_fstat(frame.rdi, frame.rsi),
         linux_abi::SYS_POLL => syscall_linux_poll(frame.rdi, frame.rsi, (frame.rdx as u32) as i32),
         linux_abi::SYS_DUP => syscall_linux_dup(frame.rdi),
@@ -131,6 +141,15 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         linux_abi::SYS_EXECVE => syscall_linux_execve(frame),
         linux_abi::SYS_TGKILL => syscall_linux_tgkill(frame.rdi, frame.rsi, frame.rdx),
         linux_abi::SYS_OPENAT => syscall_linux_openat(frame.rdi, frame.rsi, frame.rdx, frame.r10),
+        linux_abi::SYS_SOCKETPAIR => {
+            syscall_linux_socketpair(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+        }
+        linux_abi::SYS_BIND => syscall_linux_bind(frame.rdi, frame.rsi, frame.rdx),
+        linux_abi::SYS_CONNECT => syscall_linux_connect(frame.rdi, frame.rsi, frame.rdx),
+        linux_abi::SYS_LISTEN => syscall_linux_listen(frame.rdi, frame.rsi),
+        linux_abi::SYS_ACCEPT4 => syscall_linux_accept4(frame.rdi, frame.rsi, frame.rdx, frame.r10),
+        linux_abi::SYS_SENDMSG => syscall_linux_sendmsg(frame.rdi, frame.rsi, frame.rdx),
+        linux_abi::SYS_RECVMSG => syscall_linux_recvmsg(frame.rdi, frame.rsi, frame.rdx),
         linux_abi::SYS_GETDENTS64 => syscall_linux_getdents64(frame.rdi, frame.rsi, frame.rdx),
         linux_abi::SYS_EXECVEAT => syscall_linux_execveat(frame),
         linux_abi::SYS_NEWFSTATAT => {
@@ -154,6 +173,7 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         }
         linux_abi::SYS_RSEQ => syscall_linux_rseq(frame.rdi, frame.rsi, frame.rdx, frame.r10),
         linux_abi::SYS_CLONE3 => syscall_linux_clone3(frame),
+        linux_abi::SYS_MEMFD_CREATE => syscall_linux_memfd_create(frame.rdi, frame.rsi),
         linux_abi::SYS_EXIT | linux_abi::SYS_EXIT_GROUP => syscall_process_exit(frame.rdi),
         _ => unreachable!("linux syscall_check allowed an unknown syscall"),
     }
@@ -193,6 +213,9 @@ fn linux_syscall_number_supported(syscall_number: u64) -> bool {
         linux_abi::SYS_READ
             | linux_abi::SYS_WRITE
             | linux_abi::SYS_CLOSE
+            | linux_abi::SYS_SOCKET
+            | linux_abi::SYS_ACCEPT
+            | linux_abi::SYS_FTRUNCATE
             | linux_abi::SYS_FSTAT
             | linux_abi::SYS_POLL
             | linux_abi::SYS_DUP
@@ -233,6 +256,13 @@ fn linux_syscall_number_supported(syscall_number: u64) -> bool {
             | linux_abi::SYS_CLOCK_NANOSLEEP
             | linux_abi::SYS_TGKILL
             | linux_abi::SYS_OPENAT
+            | linux_abi::SYS_SOCKETPAIR
+            | linux_abi::SYS_BIND
+            | linux_abi::SYS_CONNECT
+            | linux_abi::SYS_LISTEN
+            | linux_abi::SYS_ACCEPT4
+            | linux_abi::SYS_SENDMSG
+            | linux_abi::SYS_RECVMSG
             | linux_abi::SYS_GETDENTS64
             | linux_abi::SYS_EXECVEAT
             | linux_abi::SYS_NEWFSTATAT
@@ -246,6 +276,7 @@ fn linux_syscall_number_supported(syscall_number: u64) -> bool {
             | linux_abi::SYS_STATX
             | linux_abi::SYS_RSEQ
             | linux_abi::SYS_CLONE3
+            | linux_abi::SYS_MEMFD_CREATE
             | linux_abi::SYS_EXIT
             | linux_abi::SYS_EXIT_GROUP
     )
@@ -296,6 +327,83 @@ fn syscall_linux_read(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
 fn syscall_linux_close(fd: u64) -> u64 {
     match linux_ops::close(fd) {
         Ok(()) => 0,
+        Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
+    }
+}
+
+fn syscall_linux_socket(domain: u64, type_: u64, protocol: u64) -> u64 {
+    match linux_ops::socket(domain, type_, protocol) {
+        Ok(fd) => fd,
+        Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
+    }
+}
+
+fn syscall_linux_memfd_create(name_ptr: u64, flags: u64) -> u64 {
+    match linux_ops::memfd_create(name_ptr, flags) {
+        Ok(fd) => fd,
+        Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
+    }
+}
+
+fn syscall_linux_socketpair(domain: u64, type_: u64, protocol: u64, sv_ptr: u64) -> u64 {
+    match linux_ops::socketpair(domain, type_, protocol, sv_ptr) {
+        Ok(()) => 0,
+        Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
+    }
+}
+
+fn syscall_linux_ftruncate(fd: u64, len: u64) -> u64 {
+    match linux_ops::ftruncate(fd, len) {
+        Ok(()) => 0,
+        Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
+    }
+}
+
+fn syscall_linux_bind(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
+    match linux_ops::bind(fd, addr_ptr, addr_len) {
+        Ok(()) => 0,
+        Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
+    }
+}
+
+fn syscall_linux_listen(fd: u64, backlog: u64) -> u64 {
+    match linux_ops::listen(fd, backlog) {
+        Ok(()) => 0,
+        Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
+    }
+}
+
+fn syscall_linux_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
+    match linux_ops::accept(fd, addr_ptr, addr_len_ptr) {
+        Ok(new_fd) => new_fd,
+        Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
+    }
+}
+
+fn syscall_linux_accept4(fd: u64, addr_ptr: u64, addr_len_ptr: u64, flags: u64) -> u64 {
+    match linux_ops::accept4(fd, addr_ptr, addr_len_ptr, flags) {
+        Ok(new_fd) => new_fd,
+        Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
+    }
+}
+
+fn syscall_linux_connect(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
+    match linux_ops::connect(fd, addr_ptr, addr_len) {
+        Ok(()) => 0,
+        Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
+    }
+}
+
+fn syscall_linux_sendmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
+    match linux_ops::sendmsg(fd, msghdr_ptr, flags) {
+        Ok(written) => written as u64,
+        Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
+    }
+}
+
+fn syscall_linux_recvmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
+    match linux_ops::recvmsg(fd, msghdr_ptr, flags) {
+        Ok(read) => read as u64,
         Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
     }
 }
@@ -1079,8 +1187,12 @@ fn address_space_error_to_linux_errno(err: paging::AddressSpaceError) -> i64 {
 fn linux_sysop_error_to_errno(err: linux_ops::LinuxSysopError) -> i64 {
     match err {
         linux_ops::LinuxSysopError::AddressSpace(err) => address_space_error_to_linux_errno(err),
+        linux_ops::LinuxSysopError::AddressFamilyNotSupported => LINUX_EAFNOSUPPORT,
+        linux_ops::LinuxSysopError::AddressInUse => LINUX_EADDRINUSE,
+        linux_ops::LinuxSysopError::AlreadyConnected => LINUX_EISCONN,
         linux_ops::LinuxSysopError::BadFileDescriptor => LINUX_EBADF,
         linux_ops::LinuxSysopError::Busy => LINUX_EBUSY,
+        linux_ops::LinuxSysopError::ConnectionRefused => LINUX_ECONNREFUSED,
         linux_ops::LinuxSysopError::DisplayUnavailable => LINUX_ENODEV,
         linux_ops::LinuxSysopError::ExecFormat => LINUX_ENOEXEC,
         linux_ops::LinuxSysopError::IllegalSeek => LINUX_ESPIPE,
@@ -1088,8 +1200,11 @@ fn linux_sysop_error_to_errno(err: linux_ops::LinuxSysopError) -> i64 {
         linux_ops::LinuxSysopError::NoMemory => LINUX_ENOMEM,
         linux_ops::LinuxSysopError::NotFound => LINUX_ENOENT,
         linux_ops::LinuxSysopError::NotDirectory => LINUX_ENOTDIR,
+        linux_ops::LinuxSysopError::NotConnected => LINUX_ENOTCONN,
+        linux_ops::LinuxSysopError::NotSocket => LINUX_ENOTSOCK,
         linux_ops::LinuxSysopError::NoSuchProcess => LINUX_ESRCH,
         linux_ops::LinuxSysopError::NotTty => LINUX_ENOTTY,
+        linux_ops::LinuxSysopError::OperationNotSupported => LINUX_EOPNOTSUPP,
         linux_ops::LinuxSysopError::PermissionDenied => LINUX_EACCES,
         linux_ops::LinuxSysopError::ReadOnlyFilesystem => LINUX_EROFS,
         linux_ops::LinuxSysopError::Stale => LINUX_ESTALE,

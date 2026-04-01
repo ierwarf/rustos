@@ -1,13 +1,13 @@
 use boot_protocol::{
-    BootInfo, BootMemoryKind, BootMemoryRegion, BOOT_INFO_MAGIC, BOOT_INFO_VERSION,
+    BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootInfo, BootMemoryKind, BootMemoryRegion,
 };
 use core::ptr;
 
 use spin::Mutex;
-use x86_64::instructions::interrupts;
 use x86_64::PhysAddr;
+use x86_64::instructions::interrupts;
 
-use crate::memory::kernel_vm::{higher_half_addr, DIRECT_MAP_PHYS_LIMIT};
+use crate::memory::kernel_vm::{DIRECT_MAP_PHYS_LIMIT, higher_half_addr};
 
 const PAGE_SIZE: u64 = 4096;
 const BITS_PER_WORD: usize = 64;
@@ -121,15 +121,13 @@ impl PhysAllocatorState {
             page_count,
             bounded_frame_count,
         )
-        .or_else(|| {
-            self.find_contiguous_free_range(0, start_hint, page_count, bounded_frame_count)
+        .or_else(|| self.find_contiguous_free_range(0, start_hint, page_count, bounded_frame_count))
+        .map(|start_frame| {
+            self.mark_range_used(start_frame, page_count);
+            self.free_frames = self.free_frames.saturating_sub(page_count);
+            self.next_hint = start_frame.saturating_add(page_count);
+            PhysAddr::new(start_frame as u64 * PAGE_SIZE)
         })
-            .map(|start_frame| {
-                self.mark_range_used(start_frame, page_count);
-                self.free_frames = self.free_frames.saturating_sub(page_count);
-                self.next_hint = start_frame.saturating_add(page_count);
-                PhysAddr::new(start_frame as u64 * PAGE_SIZE)
-            })
     }
 
     fn find_contiguous_free_range(
@@ -278,7 +276,8 @@ pub fn alloc_contiguous_below(page_count: usize, max_phys_addr_inclusive: u64) -
         let Some(max_end_exclusive) = max_phys_addr_inclusive.checked_add(1) else {
             return state.alloc_contiguous_locked(page_count);
         };
-        let max_frame_exclusive = usize::try_from(max_end_exclusive / PAGE_SIZE).unwrap_or(usize::MAX);
+        let max_frame_exclusive =
+            usize::try_from(max_end_exclusive / PAGE_SIZE).unwrap_or(usize::MAX);
         state.alloc_contiguous_bounded_locked(page_count, max_frame_exclusive)
     })
 }

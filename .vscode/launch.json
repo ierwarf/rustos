@@ -5,8 +5,8 @@
       "name": "QEMU",
       "type": "node-terminal",
       "request": "launch",
-      "preLaunchTask": "Build OS (QEMU)",
-      "command": "cargo xtask run --profile nvme --usb-input --debugcon null",
+      "preLaunchTask": "Build OS",
+      "command": "cargo xtask run --profile nvme --usb-input --debugcon stdio",
       "cwd": "${workspaceFolder}"
     },
     {
@@ -14,15 +14,7 @@
       "type": "node-terminal",
       "request": "launch",
       "preLaunchTask": "Build OS",
-      "command": "cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon null",
-      "cwd": "${workspaceFolder}"
-    },
-    {
-      "name": "KVM (no optimized)",
-      "type": "node-terminal",
-      "request": "launch",
-      "preLaunchTask": "Build OS (KVM no optimized)",
-      "command": "cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon null",
+      "command": "cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon stdio",
       "cwd": "${workspaceFolder}"
     },
     {
@@ -30,7 +22,7 @@
       "type": "node-terminal",
       "request": "launch",
       "preLaunchTask": "Build OS",
-      "command": "cargo xtask run --profile g14 --usb-input --debugcon null",
+      "command": "cargo xtask run --profile g14 --usb-input --debugcon stdio",
       "cwd": "${workspaceFolder}"
     }
   ]

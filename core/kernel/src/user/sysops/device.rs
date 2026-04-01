@@ -1,7 +1,7 @@
 use core::convert::TryFrom;
 
-use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
+use x86_64::structures::paging::PageTableFlags;
 
 use crate::io::device::{self as device_ns};
 use crate::memory::paging;
@@ -93,6 +93,24 @@ pub(crate) fn read_current_process_handle(
             Some(KernelHandle::VfsDirectory(_)) => {
                 crate::debug::println!(
                     "device read wrong-handle: fd={} handle=vfs-dir user_ptr={:#x} len={}",
+                    fd,
+                    user_ptr,
+                    user_len,
+                );
+                Err(DeviceSysopError::Unsupported)
+            }
+            Some(KernelHandle::Memfd(_)) => {
+                crate::debug::println!(
+                    "device read wrong-handle: fd={} handle=memfd user_ptr={:#x} len={}",
+                    fd,
+                    user_ptr,
+                    user_len,
+                );
+                Err(DeviceSysopError::Unsupported)
+            }
+            Some(KernelHandle::Socket(_)) => {
+                crate::debug::println!(
+                    "device read wrong-handle: fd={} handle=socket user_ptr={:#x} len={}",
                     fd,
                     user_ptr,
                     user_len,

@@ -2,14 +2,16 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::convert::TryFrom;
 
-use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
+use x86_64::structures::paging::PageTableFlags;
 
 use crate::memory::paging::{self, AddressSpaceError, ProcessAddressSpace, UserRegion};
 use crate::user::handles::HandleTable;
 use crate::user::linux::{
-    LinuxMemoryMapState, LinuxProcessState, LinuxSigAction, MAX_SIGNAL_NUMBER, SIG_IGN,
+    LinuxMemoryMapState, LinuxProcessState, LinuxRuntimeProfile, LinuxSigAction,
+    MAX_SIGNAL_NUMBER, SIG_IGN,
 };
+use crate::user::memfd::MemfdMappingHold;
 
 const PAGE_SIZE: u64 = 4096;
 const DEFAULT_MAPPING_GAP: u64 = 16 * 1024 * 1024;
@@ -89,12 +91,14 @@ pub struct UserProcessState {
     address_space: ProcessAddressSpace,
     linux_process_state: Option<LinuxProcessState>,
     linux_memory_map: Option<LinuxMemoryMapState>,
+    linux_runtime_profile: Option<LinuxRuntimeProfile>,
     linux_sigactions: [LinuxSigAction; MAX_SIGNAL_NUMBER + 1],
     windows_runtime: Option<WindowsProcessRuntimeState>,
     handles: HandleTable,
     security: ProcessSecurityContext,
     mapping_cursor: u64,
     windows_allocations: Vec<WindowsAllocation>,
+    shared_memfd_mappings: Vec<SharedMemfdMapping>,
     cwd: String,
     exec_path: [u8; PROCESS_EXEC_PATH_CAPACITY],
     exec_path_len: usize,
@@ -218,6 +222,19 @@ pub struct WindowsThreadRuntimeState {
     pub tls_values: [u64; WINDOWS_TLS_SLOT_COUNT],
 }
 
+#[derive(Clone, Debug)]
+pub struct SharedMemfdMapping {
+    start: u64,
+    len: u64,
+    hold: MemfdMappingHold,
+}
+
+impl SharedMemfdMapping {
+    fn end(&self) -> u64 {
+        self.start.saturating_add(self.len)
+    }
+}
+
 impl WindowsThreadRuntimeState {
     pub const fn new(thread_id: u64, teb_address: u64) -> Self {
         Self {
@@ -233,6 +250,7 @@ impl UserProcessState {
         address_space: ProcessAddressSpace,
         linux_process_state: Option<LinuxProcessState>,
         linux_memory_map: Option<LinuxMemoryMapState>,
+        linux_runtime_profile: Option<LinuxRuntimeProfile>,
         windows_runtime: Option<WindowsProcessRuntimeState>,
         logical_admin: bool,
         exec_path: &str,
@@ -255,12 +273,14 @@ impl UserProcessState {
             address_space,
             linux_process_state,
             linux_memory_map,
+            linux_runtime_profile,
             linux_sigactions: [LinuxSigAction::default(); MAX_SIGNAL_NUMBER + 1],
             windows_runtime,
             handles: HandleTable::new(),
             security: ProcessSecurityContext::new(logical_admin),
             mapping_cursor: default_cursor,
             windows_allocations: Vec::new(),
+            shared_memfd_mappings: Vec::new(),
             cwd: String::from("/"),
             exec_path: [0; PROCESS_EXEC_PATH_CAPACITY],
             exec_path_len: 0,
@@ -300,6 +320,10 @@ impl UserProcessState {
         self.linux_memory_map.as_mut()
     }
 
+    pub fn linux_runtime_profile(&self) -> Option<&LinuxRuntimeProfile> {
+        self.linux_runtime_profile.as_ref()
+    }
+
     pub fn address_space_and_linux_process_state_mut(
         &mut self,
     ) -> (&mut ProcessAddressSpace, &mut Option<LinuxProcessState>) {
@@ -312,6 +336,51 @@ impl UserProcessState {
 
     pub fn handles_mut(&mut self) -> &mut HandleTable {
         &mut self.handles
+    }
+
+    pub fn record_shared_memfd_mapping(&mut self, start: u64, len: u64, hold: MemfdMappingHold) {
+        self.shared_memfd_mappings
+            .push(SharedMemfdMapping { start, len, hold });
+    }
+
+    pub fn shared_memfd_overlap_segments(&self, start: u64, end: u64) -> Vec<(u64, usize)> {
+        let mut overlaps = Vec::new();
+        for mapping in &self.shared_memfd_mappings {
+            let overlap_start = start.max(mapping.start);
+            let overlap_end = end.min(mapping.end());
+            if overlap_start >= overlap_end {
+                continue;
+            }
+            overlaps.push((overlap_start, (overlap_end - overlap_start) as usize));
+        }
+        overlaps
+    }
+
+    pub fn release_shared_memfd_mappings_in_range(&mut self, start: u64, end: u64) {
+        let mut updated = Vec::with_capacity(self.shared_memfd_mappings.len() + 1);
+        for mapping in self.shared_memfd_mappings.drain(..) {
+            let mapping_end = mapping.end();
+            if end <= mapping.start || start >= mapping_end {
+                updated.push(mapping);
+                continue;
+            }
+
+            if start > mapping.start {
+                updated.push(SharedMemfdMapping {
+                    start: mapping.start,
+                    len: start - mapping.start,
+                    hold: mapping.hold.clone(),
+                });
+            }
+            if end < mapping_end {
+                updated.push(SharedMemfdMapping {
+                    start: end,
+                    len: mapping_end - end,
+                    hold: mapping.hold.clone(),
+                });
+            }
+        }
+        self.shared_memfd_mappings = updated;
     }
 
     pub fn linux_signal_action(&self, signal: u64) -> Option<LinuxSigAction> {
@@ -370,6 +439,7 @@ impl UserProcessState {
         address_space: ProcessAddressSpace,
         linux_process_state: LinuxProcessState,
         linux_memory_map: LinuxMemoryMapState,
+        linux_runtime_profile: LinuxRuntimeProfile,
         exec_path: &str,
     ) {
         let preserved_ignored = self
@@ -384,6 +454,7 @@ impl UserProcessState {
             address_space,
             Some(linux_process_state),
             Some(linux_memory_map),
+            Some(linux_runtime_profile),
             None,
             logical_admin,
             exec_path,
