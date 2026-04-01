@@ -21,6 +21,8 @@ impl ExecutableImage {
         }
     }
 
+    // Preferred/fallback pairs remain part of the launch contract for staged images.
+    #[allow(dead_code)]
     pub const fn preferred(primary_path: &'static str, fallback_path: &'static str) -> Self {
         Self {
             primary_path,
@@ -71,12 +73,12 @@ pub enum ConsoleHostError {
         error: vfs::VfsError,
     },
     Spawn {
-        session: ConsoleSessionHandle,
         error: ProcessLoadError,
     },
 }
 
 impl ConsoleHostError {
+    #[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code, unused_variables))]
     pub fn log_debug_details(&self) {
         match self {
             Self::Load {
@@ -132,7 +134,10 @@ pub fn spawn_program_in_session(
     };
 
     process::spawn_process_with_launch(program.image, program.weight_micros, launch)
-        .map_err(|error| ConsoleHostError::Spawn { session, error })
+        .map_err(|error| {
+            let _ = session;
+            ConsoleHostError::Spawn { error }
+        })
 }
 
 pub fn load_executable_image(

@@ -79,6 +79,7 @@ static KERNEL_COMPAT_TRAMPOLINE_PAGES: Mutex<Vec<KernelCompatTrampolinePage>> =
 static MODULE_ARENA_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy)]
+#[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code))]
 pub(super) struct LoadedModuleInfo {
     pub(super) name: &'static str,
     pub(super) image_path: &'static str,
@@ -463,6 +464,7 @@ impl ModuleAbi {
 
 #[derive(Clone, Copy)]
 struct SymbolResolvePolicy {
+    #[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code))]
     module_name: &'static str,
     class: DriverClass,
     bus: DriverBus,

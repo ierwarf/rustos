@@ -43,6 +43,7 @@ pub(crate) fn close_current_process_handle(fd: u64) -> Result<(), DeviceSysopErr
     result
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 pub(crate) fn read_current_process_handle(
     fd: u64,
     user_ptr: u64,

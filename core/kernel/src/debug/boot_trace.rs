@@ -30,6 +30,8 @@ pub fn init(boot_info_ptr: *const BootInfo) {
 pub fn println_fmt(args: fmt::Arguments<'_>) {
     let mut line = LineBuffer::new();
     let _ = line.write_fmt(args);
+    super::write_bytes(line.as_str().as_bytes());
+    super::println_newline();
 
     if let Some(mut framebuffer) = framebuffer_from_boot_info() {
         let mut console = TRACE_CONSOLE.lock();

@@ -240,6 +240,7 @@ impl VfsFileHandle {
         self.inner.lock().file.len()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn cursor(&self) -> usize {
         self.inner.lock().cursor
     }
@@ -304,6 +305,8 @@ impl VfsFileObject for ReadOnlyMemoryFile {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileHandleWriteError {
     ReadOnly,
+    // Retained for writable backends that reject writes without being strictly read-only.
+    #[allow(dead_code)]
     Unsupported,
 }
 

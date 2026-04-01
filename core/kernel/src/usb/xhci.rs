@@ -130,6 +130,8 @@ struct XhciControlSetup {
 }
 
 #[derive(Clone, Copy, Debug)]
+// Retained as a rich controller inventory surface for future diagnostics and registries.
+#[allow(dead_code)]
 pub(crate) struct XhciControllerRecord {
     pub(crate) bdf: crate::arch::pci::PciDevice,
     pub(crate) mmio_base: usize,
@@ -214,6 +216,8 @@ pub(crate) fn initialize(controllers: &[UsbHostControllerInfo]) -> usize {
     initialized
 }
 
+// Retained as an inspection surface for future USB diagnostics.
+#[allow(dead_code)]
 pub(crate) fn controllers() -> Vec<XhciControllerRecord> {
     XHCI_CONTROLLERS
         .lock()
@@ -395,13 +399,13 @@ fn allocate_controller_state(
         for slot in entries.iter_mut() {
             *slot = 0;
         }
-        for (index, entry) in entries.iter_mut().enumerate() {
+        for (_index, entry) in entries.iter_mut().enumerate() {
             let buffer = dma_buffer_alloc(device_ptr, 4096)?;
             *entry = buffer.dma_addr;
             scratchpad_buffers.push(buffer);
             crate::debug::println!(
                 "xhci scratchpad allocated: index={} dma={:#x}",
-                index,
+                _index,
                 *entry
             );
         }
@@ -848,6 +852,7 @@ fn service_controller(controller: &mut XhciControllerState, budget: usize) -> us
     work.saturating_add(port_log_work)
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 fn handle_async_event(controller: &mut XhciControllerState, event: XhciEvent) {
     match event {
         XhciEvent::Transfer {
@@ -1129,6 +1134,7 @@ fn control_no_data(
     control_transfer(controller, device, setup, None, false).map(|_| ())
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 fn control_transfer(
     controller: &mut XhciControllerState,
     device: &mut XhciEnumeratedDevice,
@@ -1265,6 +1271,7 @@ fn submit_interrupt_poll(
     true
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 fn command_enable_slot(controller: &mut XhciControllerState) -> Option<u8> {
     let trb_dma = enqueue_trb(
         &mut controller.command_ring,
@@ -1309,6 +1316,7 @@ fn command_enable_slot(controller: &mut XhciControllerState) -> Option<u8> {
     }
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 fn command_address_device(
     controller: &mut XhciControllerState,
     slot_id: u8,
@@ -1365,6 +1373,7 @@ fn command_address_device(
     }
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 fn command_configure_endpoint(
     controller: &mut XhciControllerState,
     slot_id: u8,
@@ -1437,6 +1446,7 @@ fn wait_for_event(
     None
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 fn poll_event(controller: &mut XhciControllerState) -> Option<XhciEvent> {
     let event_ring = dma_trb_slice_mut(&controller.event_ring, XHCI_EVENT_RING_TRBS)?;
     let trb = event_ring

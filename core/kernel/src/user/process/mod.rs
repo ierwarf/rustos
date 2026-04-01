@@ -54,6 +54,7 @@ impl From<multitask::SpawnTaskError> for ProcessLoadError {
 }
 
 impl ProcessLoadError {
+    #[allow(dead_code)]
     pub fn summary(&self) -> &'static str {
         match self {
             Self::InvalidElf(reason) => reason,
@@ -89,6 +90,7 @@ impl ProcessLoadError {
         }
     }
 
+    #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
     pub fn log_debug_details(&self) {
         match self {
             Self::InterpreterLoad {
@@ -127,6 +129,9 @@ pub struct LoadedProcessImage {
     runtime: LoadedProcessRuntime,
 }
 
+// Spawn metadata stays richer than current call sites so loader/runtime APIs can grow without
+// reshaping this return type.
+#[allow(dead_code)]
 pub struct SpawnedProcess {
     pub abi: UserAbi,
     pub pid: u64,

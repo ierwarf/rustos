@@ -20,6 +20,7 @@ static TTY_WAKE_DEBUG_LOGS: AtomicUsize = AtomicUsize::new(0);
 
 pub fn init() {}
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn on_key_event(event: KeyboardEvent) {
     on_key_event_for_session(ConsoleSessionHandle::SYSTEM, event);
 }
@@ -65,6 +66,7 @@ pub fn set_termios_for_session(
     });
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn read_input_blocking(dest: &mut [u8]) -> usize {
     read_input_blocking_for_session(ConsoleSessionHandle::SYSTEM, dest)
 }
@@ -108,6 +110,7 @@ pub fn read_input_blocking_for_session(session: ConsoleSessionHandle, dest: &mut
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn write(bytes: &[u8]) -> usize {
     write_to_session(ConsoleSessionHandle::SYSTEM, bytes)
 }
@@ -595,9 +598,9 @@ impl TtySessionState {
         let Some(task_id) = self.input_waiter.take() else {
             return;
         };
-        let woke = crate::multitask::wake_user_task(task_id);
+        let _woke = crate::multitask::wake_user_task(task_id);
         if TTY_WAKE_DEBUG_LOGS.fetch_add(1, Ordering::Relaxed) < TTY_DEBUG_LOG_LIMIT {
-            crate::debug::println!("tty wake: task_id={} woke={}", task_id, woke);
+            crate::debug::println!("tty wake: task_id={} woke={}", task_id, _woke);
         }
     }
 }

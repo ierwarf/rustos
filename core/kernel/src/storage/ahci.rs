@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -8,10 +9,11 @@ use core::slice;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use spin::Mutex;
+use storage_core::BlockDevice as SharedBlockDevice;
 
 use crate::arch::pci::PciDevice;
 use crate::storage::block::{BlockDeviceOps, BlockTransportKind};
-use crate::storage::fat::{DiskIoError, IoResult, FAT_SECTOR_SIZE};
+use crate::storage::fat::{DiskIoError, IoResult};
 
 const PCI_CLASS_MASS_STORAGE: u8 = 0x01;
 const PCI_SUBCLASS_SATA: u8 = 0x06;
@@ -71,6 +73,7 @@ const DMA_BUFFER_BYTES: usize = 4096;
 const COMMAND_SLOT: u32 = 0;
 const AHCI_WAIT_SPINS: usize = 1_000_000;
 const AHCI_READ_LOG_LIMIT: usize = 32;
+const LOGICAL_BLOCK_SIZE: usize = 512;
 
 static AHCI_READ_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -101,7 +104,6 @@ struct AhciCommandTable {
 }
 
 struct AhciController {
-    pci: PciDevice,
     mmio_base: usize,
     mmio_len: usize,
     dma_key: *mut c_void,
@@ -113,7 +115,7 @@ unsafe impl Sync for AhciController {}
 struct AhciPortRuntime {
     command_list_cpu: *mut u8,
     command_list_dma: u64,
-    received_fis_cpu: *mut u8,
+    _received_fis_cpu: *mut u8,
     received_fis_dma: u64,
     command_table_cpu: *mut AhciCommandTable,
     command_table_dma: u64,
@@ -127,6 +129,7 @@ struct AhciBlockDevice {
     controller: Arc<AhciController>,
     port: u8,
     sector_count: u64,
+    #[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code))]
     model: String,
     runtime: Mutex<AhciPortRuntime>,
 }
@@ -134,7 +137,7 @@ struct AhciBlockDevice {
 unsafe impl Send for AhciBlockDevice {}
 unsafe impl Sync for AhciBlockDevice {}
 
-pub(crate) fn probe_devices() -> Vec<Arc<dyn BlockDeviceOps>> {
+pub(crate) fn probe_devices() -> Vec<Box<dyn BlockDeviceOps>> {
     let mut devices = Vec::new();
     crate::arch::pci::visit_devices(|pci| {
         if pci.class_code() != PCI_CLASS_MASS_STORAGE
@@ -145,13 +148,13 @@ pub(crate) fn probe_devices() -> Vec<Arc<dyn BlockDeviceOps>> {
         }
         match probe_controller(pci) {
             Ok(mut found) => devices.append(&mut found),
-            Err(error) => {
+            Err(_error) => {
                 crate::debug::println!(
                     "ahci: controller {:02x}:{:02x}.{} skipped: {:?}",
                     pci.bus,
                     pci.device,
                     pci.function,
-                    error
+                    _error
                 );
             }
         }
@@ -160,69 +163,96 @@ pub(crate) fn probe_devices() -> Vec<Arc<dyn BlockDeviceOps>> {
     devices
 }
 
-impl BlockDeviceOps for AhciBlockDevice {
-    fn transport_kind(&self) -> BlockTransportKind {
-        BlockTransportKind::Ahci
+impl SharedBlockDevice for AhciBlockDevice {
+    fn logical_block_size(&self) -> usize {
+        LOGICAL_BLOCK_SIZE
     }
 
-    fn sector_count(&self) -> u64 {
+    fn block_count(&self) -> u64 {
         self.sector_count
     }
 
-    fn read_sector(&self, lba: u64, out: &mut [u8; FAT_SECTOR_SIZE]) -> IoResult<()> {
-        if lba >= self.sector_count {
+    fn read_blocks(&mut self, lba: u64, out: &mut [u8]) -> IoResult<()> {
+        if out.is_empty() || out.len() % LOGICAL_BLOCK_SIZE != 0 {
             return Err(DiskIoError::InvalidInput);
         }
-        let read_index = AHCI_READ_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-        if read_index < AHCI_READ_LOG_LIMIT || lba == 0 {
-            crate::debug::println!(
-                "ahci: read begin model={} port={} lba={} sectors={}",
-                self.model,
-                self.port,
-                lba,
-                self.sector_count
-            );
-        }
         let mut runtime = self.runtime.lock();
-        let result = self.execute_dma_command(&mut runtime, ATA_CMD_READ_DMA_EXT, lba, false);
-        if let Err(error) = result {
-            crate::debug::println!(
-                "ahci: read failed model={} port={} lba={} error={:?}",
-                self.model,
-                self.port,
-                lba,
-                error
-            );
-            return Err(error);
-        }
-        unsafe {
-            ptr::copy_nonoverlapping(
-                runtime.dma_buffer_cpu.cast_const(),
-                out.as_mut_ptr(),
-                FAT_SECTOR_SIZE,
-            );
-        }
-        if read_index < AHCI_READ_LOG_LIMIT || lba == 0 {
-            crate::debug::println!("ahci: read done port={} lba={}", self.port, lba);
+        for (index, chunk) in out.chunks_exact_mut(LOGICAL_BLOCK_SIZE).enumerate() {
+            let block_lba = lba
+                .checked_add(index as u64)
+                .ok_or(DiskIoError::InvalidInput)?;
+            if block_lba >= self.sector_count {
+                return Err(DiskIoError::InvalidInput);
+            }
+            let read_index = AHCI_READ_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+            if read_index < AHCI_READ_LOG_LIMIT || block_lba == 0 {
+                crate::debug::println!(
+                    "ahci: read begin model={} port={} lba={} blocks={}",
+                    self.model,
+                    self.port,
+                    block_lba,
+                    self.sector_count
+                );
+            }
+            let result =
+                self.execute_dma_command(&mut runtime, ATA_CMD_READ_DMA_EXT, block_lba, false);
+            if let Err(error) = result {
+                crate::debug::println!(
+                    "ahci: read failed model={} port={} lba={} error={:?}",
+                    self.model,
+                    self.port,
+                    block_lba,
+                    error
+                );
+                return Err(error);
+            }
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    runtime.dma_buffer_cpu.cast_const(),
+                    chunk.as_mut_ptr(),
+                    LOGICAL_BLOCK_SIZE,
+                );
+            }
+            if read_index < AHCI_READ_LOG_LIMIT || block_lba == 0 {
+                crate::debug::println!("ahci: read done port={} lba={}", self.port, block_lba);
+            }
         }
         Ok(())
     }
 
-    fn write_sector(&self, lba: u64, input: &[u8; FAT_SECTOR_SIZE]) -> IoResult<()> {
-        if lba >= self.sector_count {
+    fn write_blocks(&mut self, lba: u64, input: &[u8]) -> IoResult<()> {
+        if input.is_empty() || input.len() % LOGICAL_BLOCK_SIZE != 0 {
             return Err(DiskIoError::InvalidInput);
         }
         let mut runtime = self.runtime.lock();
-        unsafe {
-            ptr::copy_nonoverlapping(input.as_ptr(), runtime.dma_buffer_cpu, FAT_SECTOR_SIZE);
+        for (index, chunk) in input.chunks_exact(LOGICAL_BLOCK_SIZE).enumerate() {
+            let block_lba = lba
+                .checked_add(index as u64)
+                .ok_or(DiskIoError::InvalidInput)?;
+            if block_lba >= self.sector_count {
+                return Err(DiskIoError::InvalidInput);
+            }
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    chunk.as_ptr(),
+                    runtime.dma_buffer_cpu,
+                    LOGICAL_BLOCK_SIZE,
+                );
+            }
+            self.execute_dma_command(&mut runtime, ATA_CMD_WRITE_DMA_EXT, block_lba, true)?;
         }
-        self.execute_dma_command(&mut runtime, ATA_CMD_WRITE_DMA_EXT, lba, true)?;
         Ok(())
     }
 
-    fn flush(&self) -> IoResult<()> {
+    fn flush(&mut self) -> IoResult<()> {
         let mut runtime = self.runtime.lock();
         self.execute_non_data_command(&mut runtime, ATA_CMD_FLUSH_CACHE_EXT)
+    }
+}
+
+impl BlockDeviceOps for AhciBlockDevice {
+    fn transport_kind(&self) -> BlockTransportKind {
+        BlockTransportKind::Ahci
     }
 
     fn readonly(&self) -> bool {
@@ -266,6 +296,7 @@ impl AhciController {
         self.read_u32(HBA_PI)
     }
 
+    #[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code))]
     fn version(&self) -> u32 {
         self.read_u32(HBA_VS)
     }
@@ -284,7 +315,7 @@ impl AhciBlockDevice {
         lba: u64,
         is_write: bool,
     ) -> IoResult<()> {
-        self.prepare_command(runtime, command, lba, is_write, FAT_SECTOR_SIZE)?;
+        self.prepare_command(runtime, command, lba, is_write, LOGICAL_BLOCK_SIZE)?;
         self.issue_and_wait()
     }
 
@@ -311,19 +342,8 @@ impl AhciBlockDevice {
         issue_port_command(self.controller.as_ref(), self.port)
     }
 
-    fn wait_port_idle(&self) -> IoResult<()> {
-        if wait_until(|| {
-            let tfd = self.controller.read_port_u32(self.port, PORT_TFD);
-            (tfd & (PORT_TFD_BSY | PORT_TFD_DRQ)) == 0
-        }) {
-            Ok(())
-        } else {
-            Err(DiskIoError::Timeout)
-        }
-    }
 }
-
-fn probe_controller(pci: PciDevice) -> Result<Vec<Arc<dyn BlockDeviceOps>>, DiskIoError> {
+fn probe_controller(pci: PciDevice) -> Result<Vec<Box<dyn BlockDeviceOps>>, DiskIoError> {
     let abar = pci
         .resource(AHCI_BAR_INDEX)
         .filter(|resource| !resource.is_io && resource.size >= 0x200)
@@ -336,7 +356,6 @@ fn probe_controller(pci: PciDevice) -> Result<Vec<Arc<dyn BlockDeviceOps>>, Disk
     }
 
     let controller = Arc::new(AhciController {
-        pci,
         mmio_base: mmio as usize,
         mmio_len: abar.size as usize,
         dma_key: mmio,
@@ -365,7 +384,7 @@ fn probe_controller(pci: PciDevice) -> Result<Vec<Arc<dyn BlockDeviceOps>>, Disk
             continue;
         }
         if let Some(device) = probe_port(controller.clone(), port as u8)? {
-            devices.push(device as Arc<dyn BlockDeviceOps>);
+            devices.push(Box::new(device) as Box<dyn BlockDeviceOps>);
         }
     }
 
@@ -375,7 +394,7 @@ fn probe_controller(pci: PciDevice) -> Result<Vec<Arc<dyn BlockDeviceOps>>, Disk
 fn probe_port(
     controller: Arc<AhciController>,
     port: u8,
-) -> Result<Option<Arc<AhciBlockDevice>>, DiskIoError> {
+) -> Result<Option<AhciBlockDevice>, DiskIoError> {
     if !port_has_sata_device(&controller, port) {
         return Ok(None);
     }
@@ -393,13 +412,13 @@ fn probe_port(
         model
     );
 
-    Ok(Some(Arc::new(AhciBlockDevice {
+    Ok(Some(AhciBlockDevice {
         controller,
         port,
         sector_count,
         model,
         runtime: Mutex::new(runtime),
-    })))
+    }))
 }
 
 fn port_has_sata_device(controller: &AhciController, port: u8) -> bool {
@@ -482,7 +501,7 @@ fn allocate_port_runtime(controller: &AhciController) -> IoResult<AhciPortRuntim
     Ok(AhciPortRuntime {
         command_list_cpu,
         command_list_dma,
-        received_fis_cpu,
+        _received_fis_cpu: received_fis_cpu,
         received_fis_dma,
         command_table_cpu,
         command_table_dma,
@@ -513,7 +532,7 @@ fn identify_port(
         ATA_CMD_IDENTIFY_DEVICE,
         0,
         false,
-        FAT_SECTOR_SIZE,
+        LOGICAL_BLOCK_SIZE,
     )?;
     issue_port_command(controller.as_ref(), port)?;
 
@@ -609,7 +628,11 @@ fn prepare_port_command(
         (*table).cfis[9] = ((lba >> 32) & 0xff) as u8;
         (*table).cfis[10] = ((lba >> 40) & 0xff) as u8;
         (*table).cfis[11] = 0;
-        (*table).cfis[12] = if byte_count == 0 { 0 } else { 1 };
+        (*table).cfis[12] = if byte_count == 0 {
+            0
+        } else {
+            (byte_count / LOGICAL_BLOCK_SIZE) as u8
+        };
         (*table).cfis[13] = 0;
 
         if byte_count != 0 {

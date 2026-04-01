@@ -11,7 +11,7 @@ use super::pe::{
     read_c_string_at_rva, read_import_name_at_rva, read_u32, read_u64, rva_to_file_offset, PeImage,
     PE_DIRECTORY_IMPORT,
 };
-use super::WindowsProcessImageInfo;
+use super::{WindowsLoadedModuleImage, WindowsProcessImageInfo};
 
 #[derive(Clone, Copy)]
 struct ResolvedImport {
@@ -41,7 +41,12 @@ pub(super) fn resolve_pe_imports(
         "PE builtin DLL base alignment overflow",
     ))?;
     let preloaded = loader::preload_builtin_system_dlls_at(address_space, builtin_dll_base)?;
-    let imports = collect_pe_imports(image, pe, preloaded.modules.as_slice())?;
+    let imports = collect_pe_imports(
+        image,
+        pe,
+        preloaded.modules.as_slice(),
+        preloaded.module_images.as_slice(),
+    )?;
 
     for import in &imports {
         let iat_addr = load_base
@@ -59,6 +64,7 @@ pub(super) fn resolve_pe_imports(
         entry_point,
         runtime_base_hint: preloaded.next_base,
         loaded_modules: preloaded.modules,
+        loaded_module_images: preloaded.module_images,
     })
 }
 
@@ -66,6 +72,7 @@ fn collect_pe_imports(
     image: &[u8],
     pe: &PeImage,
     loaded_modules: &[WindowsLoadedModule],
+    loaded_module_images: &[WindowsLoadedModuleImage],
 ) -> Result<Vec<ResolvedImport>, ProcessLoadError> {
     let import_dir = pe.directories[PE_DIRECTORY_IMPORT];
     if import_dir.rva == 0 || import_dir.size == 0 {
@@ -114,7 +121,12 @@ fn collect_pe_imports(
                 let name_rva = (entry & 0x7fff_ffff) as u32;
                 WindowsImportLookup::Name(read_import_name_at_rva(image, pe, name_rva)?)
             };
-            let target_address = resolve_import_target(dll_name, lookup, loaded_modules)?;
+            let target_address = resolve_import_target(
+                dll_name,
+                lookup,
+                loaded_modules,
+                loaded_module_images,
+            )?;
             imports.push(ResolvedImport {
                 first_thunk_rva,
                 target_address,
@@ -138,13 +150,18 @@ fn resolve_import_target(
     dll_name: &[u8],
     lookup: WindowsImportLookup<'_>,
     loaded_modules: &[WindowsLoadedModule],
+    loaded_module_images: &[WindowsLoadedModuleImage],
 ) -> Result<u64, ProcessLoadError> {
     let export_lookup = match lookup {
         WindowsImportLookup::Name(name) => loader::WindowsExportLookup::Name(name),
         WindowsImportLookup::Ordinal(ordinal) => loader::WindowsExportLookup::Ordinal(ordinal),
     };
-    if let Some(address) =
-        loader::resolve_preloaded_system_export(loaded_modules, dll_name, export_lookup)?
+    if let Some(address) = loader::resolve_preloaded_system_export(
+        loaded_modules,
+        loaded_module_images,
+        dll_name,
+        export_lookup,
+    )?
     {
         return Ok(address);
     }

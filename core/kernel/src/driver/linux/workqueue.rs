@@ -26,14 +26,14 @@ type LinuxWorkFunc = unsafe extern "C" fn(work: *mut LinuxWorkStruct);
 type LinuxTimerFunc = unsafe extern "C" fn(timer: *mut LinuxTimerList);
 
 #[repr(C)]
-struct LinuxWorkStruct {
+pub(crate) struct LinuxWorkStruct {
     data: u64,
     entry: LinuxListHead,
     func: Option<LinuxWorkFunc>,
 }
 
 #[repr(C)]
-struct LinuxTimerList {
+pub(crate) struct LinuxTimerList {
     entry: LinuxHListNode,
     expires: u64,
     function: Option<LinuxTimerFunc>,
@@ -48,7 +48,7 @@ struct LinuxWorkqueueStruct {
 }
 
 #[repr(C)]
-struct LinuxDelayedWork {
+pub(crate) struct LinuxDelayedWork {
     work: LinuxWorkStruct,
     timer: LinuxTimerList,
     wq: *mut LinuxWorkqueueStruct,

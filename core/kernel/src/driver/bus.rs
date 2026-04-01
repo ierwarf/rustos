@@ -45,6 +45,8 @@ pub(crate) fn is_supported(bus: DriverBus) -> bool {
     descriptor(bus).is_some()
 }
 
+// Bus names are currently consumed by diagnostics and generated registry validation.
+#[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code))]
 pub(crate) fn name(bus: DriverBus) -> &'static str {
     descriptor(bus)
         .map(|descriptor| descriptor.name)

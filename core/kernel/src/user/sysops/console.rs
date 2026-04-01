@@ -15,6 +15,7 @@ const CONSOLE_IO_DEBUG_LOG_LIMIT: usize = 0;
 static CONSOLE_READ_DEBUG_LOGS: AtomicUsize = AtomicUsize::new(0);
 static CONSOLE_WRITE_DEBUG_LOGS: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 pub(crate) fn write_from_current_process(
     user_ptr: u64,
     len: usize,
@@ -53,6 +54,7 @@ pub(crate) fn write_from_current_process(
     Ok(total_written)
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 pub(crate) fn read_into_current_process(
     user_ptr: u64,
     len: usize,

@@ -27,11 +27,12 @@ pub(crate) unsafe extern "C" fn usb_register_driver(
             (*driver).driver.name = (*driver).name;
         }
         (*driver).driver.bus = bus_type_ptr();
-        let driver_name = crate::driver::linux::compat::compat_cstr((*driver).name).unwrap_or("?");
+        let _driver_name =
+            crate::driver::linux::compat::compat_cstr((*driver).name).unwrap_or("?");
         crate::debug::println!(
             "usb_register_driver: driver={:#x} name={} probe={:#x} disconnect={:#x} id_table={:#x}",
             driver as usize,
-            driver_name,
+            _driver_name,
             (*driver).probe.map(|f| f as usize).unwrap_or(0),
             (*driver).disconnect.map(|f| f as usize).unwrap_or(0),
             (*driver).id_table as usize,

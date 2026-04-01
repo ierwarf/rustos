@@ -16,7 +16,7 @@ static IRQ_SPIN_LOCKS: Mutex<Vec<&'static CompatLockState>> = Mutex::new(Vec::ne
 static MUTEX_LOCKS: Mutex<Vec<&'static CompatLockState>> = Mutex::new(Vec::new());
 static IRQ_LOCK_OWNERS: Mutex<Vec<IrqOwnerState>> = Mutex::new(Vec::new());
 #[repr(C)]
-struct LinuxTimespec64 {
+pub(crate) struct LinuxTimespec64 {
     tv_sec: i64,
     tv_nsec: i64,
 }

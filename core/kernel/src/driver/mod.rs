@@ -6,6 +6,7 @@ mod devres;
 pub(crate) mod dma;
 mod export;
 pub(crate) mod input;
+pub(crate) mod iommu;
 pub(crate) mod irq;
 mod kernel_api;
 pub(crate) mod linux;
@@ -42,6 +43,9 @@ pub(crate) fn register_kernel_builtin(name: &'static str, class: DriverClass, bu
     registry::insert_kernel_builtin(name, class, bus);
 }
 
+// Thin compatibility wrapper retained for tests and generated registries that do not need
+// explicit load priority.
+#[allow(dead_code)]
 pub(crate) fn register_loadable_elf(
     name: &'static str,
     class: DriverClass,
@@ -95,6 +99,8 @@ pub(crate) fn register_loadable_elf_with_priority(
     );
 }
 
+// Retained as a convenience entry point for broad "load everything" bring-up flows.
+#[allow(dead_code)]
 pub(crate) fn initialize_loadable_modules() {
     initialize_loadable_modules_matching(|_| true);
 }
@@ -127,7 +133,7 @@ fn initialize_loadable_modules_matching(filter: impl Fn(&DriverRecord) -> bool) 
             match x86_64::instructions::interrupts::without_interrupts(|| {
                 load_module_image(name, class, bus, image_path)
             }) {
-                Ok(module) => {
+                Ok(_module) => {
                     registry::update_loadable_module_status(
                         name,
                         image_path,
@@ -137,12 +143,12 @@ fn initialize_loadable_modules_matching(filter: impl Fn(&DriverRecord) -> bool) 
 
                     crate::debug::println!(
                         "driver module loaded: name={} class={} bus={} path={} base={:#x} host={:#x}",
-                        module.name,
+                        _module.name,
                         class::name(class),
                         bus::name(bus),
-                        module.image_path,
-                        module.runtime_base,
-                        module.host_base
+                        _module.image_path,
+                        _module.runtime_base,
+                        _module.host_base
                     );
                     progress = true;
                 }
@@ -180,13 +186,13 @@ fn initialize_loadable_modules_matching(filter: impl Fn(&DriverRecord) -> bool) 
         }
 
         if !progress {
-            for candidate in deferred.iter().copied() {
+            for _candidate in deferred.iter().copied() {
                 crate::debug::println!(
                     "driver module deferred: name={} class={} bus={} path={} reason=module references unsupported external symbol",
-                    candidate.name,
-                    class::name(candidate.class),
-                    bus::name(candidate.bus),
-                    candidate.image_path
+                    _candidate.name,
+                    class::name(_candidate.class),
+                    bus::name(_candidate.bus),
+                    _candidate.image_path
                 );
             }
             break;
@@ -195,15 +201,15 @@ fn initialize_loadable_modules_matching(filter: impl Fn(&DriverRecord) -> bool) 
         pending = deferred;
     }
 
-    for record in registry::loadable_records() {
+    for _record in registry::loadable_records() {
         crate::debug::println!(
             "driver module status: name={} class={} bus={} path={} state={:?} error={}",
-            record.name,
-            class::name(record.class),
-            bus::name(record.bus),
-            record.image_path.unwrap_or("-"),
-            record.module_state,
-            record.validation_error.unwrap_or("-")
+            _record.name,
+            class::name(_record.class),
+            bus::name(_record.bus),
+            _record.image_path.unwrap_or("-"),
+            _record.module_state,
+            _record.validation_error.unwrap_or("-")
         );
     }
 }

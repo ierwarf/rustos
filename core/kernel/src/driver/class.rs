@@ -30,6 +30,8 @@ pub(crate) fn is_supported(class: DriverClass) -> bool {
     descriptor(class).is_some()
 }
 
+// Class names are currently consumed by diagnostics and generated registry validation.
+#[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code))]
 pub(crate) fn name(class: DriverClass) -> &'static str {
     descriptor(class)
         .map(|descriptor| descriptor.name)

@@ -3,13 +3,13 @@ use x86_64::VirtAddr;
 
 use crate::memory::paging::ProcessAddressSpace;
 use crate::user::process_state::{WindowsLoadedModule, WindowsProcessRuntimeState};
-use crate::vfs;
 
 use super::super::{align_up, ProcessLoadError, PAGE_SIZE};
 use super::dll_search::file_name_from_windows_path;
 use super::exports;
 use super::pe;
 use super::system_dll;
+use super::WindowsLoadedModuleImage;
 
 const MAX_FORWARDER_DEPTH: usize = 16;
 
@@ -22,6 +22,7 @@ pub(super) enum WindowsExportLookup<'a> {
 #[derive(Debug)]
 pub(super) struct PreloadedSystemDlls {
     pub modules: Vec<WindowsLoadedModule>,
+    pub module_images: Vec<WindowsLoadedModuleImage>,
     pub next_base: u64,
 }
 
@@ -34,9 +35,10 @@ pub(super) fn preload_builtin_system_dlls_at(
     ))?;
     let builtin_dlls = system_dll::builtin_system_dll_paths();
     let mut modules = Vec::with_capacity(builtin_dlls.len());
+    let mut module_images = Vec::with_capacity(builtin_dlls.len());
 
     for path in builtin_dlls {
-        let image = vfs::read_path_to_vec_for_kernel(path)
+        let image = crate::vfs::read_path_to_vec_for_kernel(path)
             .map_err(|_| ProcessLoadError::InvalidPe("failed to read builtin system DLL"))?;
         let pe_image = pe::parse_pe_image(&image)?;
         if !pe_image.is_dll {
@@ -44,7 +46,7 @@ pub(super) fn preload_builtin_system_dlls_at(
                 "builtin system image is not marked as a DLL",
             ));
         }
-        exports::validate_export_directory(&image, &pe_image)?;
+        let export_cache = exports::build_export_cache(&image, &pe_image)?;
 
         let load_base = next_base;
         let entry_point =
@@ -69,17 +71,23 @@ pub(super) fn preload_builtin_system_dlls_at(
             &mut mapped_ranges,
         )?;
         pe::apply_pe_relocations(&image, &pe_image, address_space, load_base)?;
+        let image_size = pe_image.size_of_image as u64;
 
         modules.push(WindowsLoadedModule::new(
             load_base,
-            pe_image.size_of_image as u64,
+            image_size,
             entry_point,
             path,
             file_name_from_windows_path(path),
         ));
+        module_images.push(WindowsLoadedModuleImage {
+            image,
+            pe: pe_image,
+            export_cache,
+        });
 
         next_base = align_up(
-            load_base.checked_add(pe_image.size_of_image as u64).ok_or(
+            load_base.checked_add(image_size).ok_or(
                 ProcessLoadError::InvalidPe("builtin DLL image range overflow"),
             )?,
             PAGE_SIZE,
@@ -89,26 +97,32 @@ pub(super) fn preload_builtin_system_dlls_at(
         ))?;
     }
 
-    resolve_preloaded_system_dll_imports(address_space, modules.as_slice())?;
+    resolve_preloaded_system_dll_imports(address_space, modules.as_slice(), module_images.as_slice())?;
 
-    Ok(PreloadedSystemDlls { modules, next_base })
+    Ok(PreloadedSystemDlls {
+        modules,
+        module_images,
+        next_base,
+    })
 }
 
 pub(super) fn resolve_preloaded_system_export(
     modules: &[WindowsLoadedModule],
+    module_images: &[WindowsLoadedModuleImage],
     dll_name: &[u8],
     lookup: WindowsExportLookup<'_>,
 ) -> Result<Option<u64>, ProcessLoadError> {
     let Some(canonical_name) = system_dll::canonical_system_dll_name_bytes(dll_name) else {
         return Ok(None);
     };
-    resolve_loaded_system_export(modules, canonical_name, lookup, 0)
+    resolve_loaded_system_export(modules, module_images, canonical_name, lookup, 0)
 }
 
 pub(super) fn initialize_preloaded_system_dlls(
     address_space: &mut ProcessAddressSpace,
     runtime: &WindowsProcessRuntimeState,
     modules: &[WindowsLoadedModule],
+    module_images: &[WindowsLoadedModuleImage],
 ) -> Result<(), ProcessLoadError> {
     for crt_name in ["msvcrt.dll", "ucrtbase.dll"] {
         let Some(module) = modules
@@ -122,6 +136,7 @@ pub(super) fn initialize_preloaded_system_dlls(
             address_space,
             module,
             modules,
+            module_images,
             b"stdin",
             runtime.stdin_file_ptr,
         )?;
@@ -129,6 +144,7 @@ pub(super) fn initialize_preloaded_system_dlls(
             address_space,
             module,
             modules,
+            module_images,
             b"stdout",
             runtime.stdout_file_ptr,
         )?;
@@ -136,6 +152,7 @@ pub(super) fn initialize_preloaded_system_dlls(
             address_space,
             module,
             modules,
+            module_images,
             b"stderr",
             runtime.stderr_file_ptr,
         )?;
@@ -143,6 +160,7 @@ pub(super) fn initialize_preloaded_system_dlls(
             address_space,
             module,
             modules,
+            module_images,
             b"_acmdln",
             runtime.command_line_a_ptr,
         )?;
@@ -150,11 +168,12 @@ pub(super) fn initialize_preloaded_system_dlls(
             address_space,
             module,
             modules,
+            module_images,
             b"__initenv",
             runtime.environ_ptr,
         )?;
-        patch_export_i32(address_space, module, modules, b"_commode", 0)?;
-        patch_export_i32(address_space, module, modules, b"_fmode", 0)?;
+        patch_export_i32(address_space, module, modules, module_images, b"_commode", 0)?;
+        patch_export_i32(address_space, module, modules, module_images, b"_fmode", 0)?;
     }
     Ok(())
 }
@@ -163,11 +182,12 @@ fn patch_export_u64(
     address_space: &mut ProcessAddressSpace,
     module: &WindowsLoadedModule,
     modules: &[WindowsLoadedModule],
+    module_images: &[WindowsLoadedModuleImage],
     symbol: &[u8],
     value: u64,
 ) -> Result<(), ProcessLoadError> {
     let Some(address) =
-        resolve_module_export(module, modules, WindowsExportLookup::Name(symbol), 0)?
+        resolve_module_export(module, modules, module_images, WindowsExportLookup::Name(symbol), 0)?
     else {
         return Ok(());
     };
@@ -179,11 +199,12 @@ fn patch_export_i32(
     address_space: &mut ProcessAddressSpace,
     module: &WindowsLoadedModule,
     modules: &[WindowsLoadedModule],
+    module_images: &[WindowsLoadedModuleImage],
     symbol: &[u8],
     value: i32,
 ) -> Result<(), ProcessLoadError> {
     let Some(address) =
-        resolve_module_export(module, modules, WindowsExportLookup::Name(symbol), 0)?
+        resolve_module_export(module, modules, module_images, WindowsExportLookup::Name(symbol), 0)?
     else {
         return Ok(());
     };
@@ -193,21 +214,42 @@ fn patch_export_i32(
 
 fn resolve_loaded_system_export(
     modules: &[WindowsLoadedModule],
+    module_images: &[WindowsLoadedModuleImage],
     canonical_name: &str,
     lookup: WindowsExportLookup<'_>,
     depth: usize,
 ) -> Result<Option<u64>, ProcessLoadError> {
-    let Some(module) = modules.iter().find(|module| {
+    let Some(module_index) = modules.iter().position(|module| {
         system_dll::module_name_matches_request(module.base_name.as_str(), canonical_name)
     }) else {
         return Ok(None);
     };
-    resolve_module_export(module, modules, lookup, depth)
+    resolve_module_export_by_index(module_index, modules, module_images, lookup, depth)
 }
 
 fn resolve_module_export(
     module: &WindowsLoadedModule,
     modules: &[WindowsLoadedModule],
+    module_images: &[WindowsLoadedModuleImage],
+    lookup: WindowsExportLookup<'_>,
+    depth: usize,
+) -> Result<Option<u64>, ProcessLoadError> {
+    let Some(module_index) = modules.iter().position(|candidate| {
+        candidate.base_address == module.base_address
+            && candidate.image_size == module.image_size
+            && candidate.full_path == module.full_path
+    }) else {
+        return Err(ProcessLoadError::InvalidPe(
+            "loaded module is not present in the preload cache",
+        ));
+    };
+    resolve_module_export_by_index(module_index, modules, module_images, lookup, depth)
+}
+
+fn resolve_module_export_by_index(
+    module_index: usize,
+    modules: &[WindowsLoadedModule],
+    module_images: &[WindowsLoadedModuleImage],
     lookup: WindowsExportLookup<'_>,
     depth: usize,
 ) -> Result<Option<u64>, ProcessLoadError> {
@@ -216,41 +258,53 @@ fn resolve_module_export(
             "PE export forwarder chain is too deep",
         ));
     }
-
-    let image = vfs::read_path_to_vec_for_kernel(module.full_path.as_str())
-        .map_err(|_| ProcessLoadError::InvalidPe("failed to read PE image for export lookup"))?;
-    let pe_image = pe::parse_pe_image(&image)?;
-    exports::validate_export_directory(&image, &pe_image)?;
-
+    let module = modules
+        .get(module_index)
+        .ok_or(ProcessLoadError::InvalidPe("loaded module cache index is invalid"))?;
+    let cached = module_images
+        .get(module_index)
+        .ok_or(ProcessLoadError::InvalidPe("loaded module image cache is invalid"))?;
     let target = match lookup {
-        WindowsExportLookup::Name(name) => exports::lookup_export_by_name(&image, &pe_image, name)?,
+        WindowsExportLookup::Name(name) => {
+            exports::lookup_cached_export_by_name(cached.export_cache.as_ref(), name)
+        }
         WindowsExportLookup::Ordinal(ordinal) => {
-            exports::lookup_export_by_ordinal(&image, &pe_image, ordinal)?
+            exports::lookup_cached_export_by_ordinal(cached.export_cache.as_ref(), ordinal)
         }
     };
 
     match target {
-        Some(exports::ExportTarget::Address(rva)) if rva != 0 => {
+        Some(exports::CachedExportTarget::Address(rva)) if *rva != 0 => {
             let address = module
                 .base_address
-                .checked_add(rva as u64)
+                .checked_add(*rva as u64)
                 .ok_or(ProcessLoadError::InvalidPe("PE export address overflow"))?;
             Ok(Some(address))
         }
-        Some(exports::ExportTarget::Address(_)) => Ok(None),
-        Some(exports::ExportTarget::Forwarder(forwarder)) => {
+        Some(exports::CachedExportTarget::Address(_)) => Ok(None),
+        Some(exports::CachedExportTarget::Forwarder(forwarder)) => {
             let Some(canonical_name) =
-                system_dll::canonical_system_dll_name_bytes(forwarder.dll_name)
+                system_dll::canonical_system_dll_name_bytes(forwarder.dll_name.as_slice())
             else {
                 return Err(ProcessLoadError::InvalidPe(
                     "PE forwarded export references unsupported DLL",
                 ));
             };
-            let forwarded_lookup = match forwarder.symbol {
-                exports::ForwarderSymbol::Name(name) => WindowsExportLookup::Name(name),
-                exports::ForwarderSymbol::Ordinal(ordinal) => WindowsExportLookup::Ordinal(ordinal),
+            let forwarded_lookup = match &forwarder.symbol {
+                exports::CachedForwarderSymbol::Name(name) => {
+                    WindowsExportLookup::Name(name.as_slice())
+                }
+                exports::CachedForwarderSymbol::Ordinal(ordinal) => {
+                    WindowsExportLookup::Ordinal(*ordinal)
+                }
             };
-            resolve_loaded_system_export(modules, canonical_name, forwarded_lookup, depth + 1)
+            resolve_loaded_system_export(
+                modules,
+                module_images,
+                canonical_name,
+                forwarded_lookup,
+                depth + 1,
+            )
         }
         None => Ok(None),
     }
@@ -259,28 +313,35 @@ fn resolve_module_export(
 fn resolve_preloaded_system_dll_imports(
     address_space: &mut ProcessAddressSpace,
     modules: &[WindowsLoadedModule],
+    module_images: &[WindowsLoadedModuleImage],
 ) -> Result<(), ProcessLoadError> {
-    for module in modules {
-        patch_loaded_module_imports(address_space, module, modules)?;
+    for module_index in 0..modules.len() {
+        patch_loaded_module_imports(address_space, module_index, modules, module_images)?;
     }
     Ok(())
 }
 
 fn patch_loaded_module_imports(
     address_space: &mut ProcessAddressSpace,
-    module: &WindowsLoadedModule,
+    module_index: usize,
     modules: &[WindowsLoadedModule],
+    module_images: &[WindowsLoadedModuleImage],
 ) -> Result<(), ProcessLoadError> {
-    let image = vfs::read_path_to_vec_for_kernel(module.full_path.as_str())
-        .map_err(|_| ProcessLoadError::InvalidPe("failed to read builtin DLL image"))?;
-    let pe_image = pe::parse_pe_image(&image)?;
+    let module = modules
+        .get(module_index)
+        .ok_or(ProcessLoadError::InvalidPe("loaded module cache index is invalid"))?;
+    let cached = module_images
+        .get(module_index)
+        .ok_or(ProcessLoadError::InvalidPe("loaded module image cache is invalid"))?;
+    let image = cached.image.as_slice();
+    let pe_image = &cached.pe;
     let import_dir = pe_image.directories[pe::PE_DIRECTORY_IMPORT];
     if import_dir.rva == 0 || import_dir.size == 0 {
         return Ok(());
     }
 
     let mut descriptor_offset =
-        pe::rva_to_file_offset(&pe_image, import_dir.rva, image.len() as u32)?;
+        pe::rva_to_file_offset(pe_image, import_dir.rva, image.len() as u32)?;
     let descriptor_limit = descriptor_offset
         .checked_add(import_dir.size as usize)
         .ok_or(ProcessLoadError::InvalidPe(
@@ -327,9 +388,10 @@ fn patch_loaded_module_imports(
                 WindowsExportLookup::Ordinal((entry & 0xffff) as u32)
             } else {
                 let name_rva = (entry & 0x7fff_ffff) as u32;
-                WindowsExportLookup::Name(pe::read_import_name_at_rva(&image, &pe_image, name_rva)?)
+                WindowsExportLookup::Name(pe::read_import_name_at_rva(image, pe_image, name_rva)?)
             };
-            let Some(target) = resolve_loaded_system_export(modules, canonical_name, lookup, 0)?
+            let Some(target) =
+                resolve_loaded_system_export(modules, module_images, canonical_name, lookup, 0)?
             else {
                 let function_name = match lookup {
                     WindowsExportLookup::Name(name) => name,

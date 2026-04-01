@@ -103,21 +103,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "boot-storage"
-version = "0.1.0"
-dependencies = [
- "boot-protocol",
- "fatfs",
- "x86_64",
-]
-
-[[package]]
 name = "bootloader"
 version = "0.1.0"
 dependencies = [
  "boot-protocol",
- "boot-storage",
  "raw-cpuid",
+ "storage-core",
  "uefi",
  "xmas-elf 0.10.0",
 ]
@@ -306,7 +297,6 @@ dependencies = [
  "bitflags",
  "boot-protocol",
  "boot-random",
- "boot-storage",
  "buddy_system_allocator",
  "byteorder",
  "crc32fast",
@@ -321,6 +311,8 @@ dependencies = [
  "object",
  "pic8259",
  "spin 0.10.0",
+ "storage-core",
+ "storage-fat",
  "volatile 0.6.1",
  "vte",
  "x86_64",
@@ -386,7 +378,6 @@ version = "0.1.0"
 dependencies = [
  "boot-protocol",
  "boot-random",
- "boot-storage",
  "driver-abi",
  "keyboard-core",
 ]
@@ -462,12 +453,13 @@ version = "0.1.0"
 dependencies = [
  "boot-protocol",
  "boot-random",
- "boot-storage",
  "buddy_system_allocator",
  "embedded-graphics",
  "fatfs",
  "object",
  "spin 0.10.0",
+ "storage-core",
+ "storage-fat",
  "x86_64",
 ]
 
@@ -623,6 +615,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d5fe4ccb98d9c292d56fec89a5e07da7fc4cf0dc11e156b41793132775d3e591"
 dependencies = [
  "lock_api",
+]
+
+[[package]]
+name = "storage-core"
+version = "0.1.0"
+dependencies = [
+ "boot-protocol",
+ "fatfs",
+]
+
+[[package]]
+name = "storage-fat"
+version = "0.1.0"
+dependencies = [
+ "fatfs",
+ "storage-core",
 ]
 
 [[package]]

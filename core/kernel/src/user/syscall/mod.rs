@@ -35,7 +35,7 @@ struct SyscallCpuLocal {
 struct SyscallFallbackStack([u8; SYSCALL_STACK_SIZE]);
 
 #[repr(C)]
-struct SyscallFrame {
+pub(crate) struct SyscallFrame {
     user_rsp: u64,
     user_rip: u64,
     user_rflags: u64,

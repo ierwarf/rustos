@@ -10,7 +10,7 @@ use crate::util::ring::RingBuffer;
 
 const KEYBOARD_IRQ: u8 = 1;
 const MOUSE_IRQ: u8 = 12;
-const PIT_TIMER_IRQ: u8 = 0;
+#[allow(dead_code)]
 const RTC_TIMER_IRQ: u8 = 8;
 const DATA_PORT: u16 = 0x60;
 const STATUS_PORT: u16 = 0x64;
@@ -54,6 +54,7 @@ const DEFERRED_KEYBOARD_BYTES_CAPACITY: usize = 256;
 const DEFERRED_KEYBOARD_DROP_LOG_INTERVAL: u64 = 64;
 const PS2_CMD_GETID: u8 = 0xF2;
 
+#[allow(dead_code)]
 pub(crate) const I8042_KEYBOARD_PORT_ID: u32 = 0;
 pub(crate) const I8042_AUX_MOUSE_PORT_ID: u32 = 1;
 
@@ -331,10 +332,12 @@ fn second_port_test() -> bool {
     )
 }
 
+#[allow(dead_code)]
 fn serio_write_keyboard_byte(byte: u8) -> i32 {
     with_controller_access(|| if write_data_byte(byte) { 0 } else { -110 })
 }
 
+#[allow(dead_code)]
 fn serio_keyboard_ps2_command(command: u8, data: &[u8], response: &mut [u8]) -> i32 {
     with_controller_access(
         || match send_keyboard_command_sequence(command, data, response) {
@@ -435,6 +438,7 @@ fn with_controller_access<T>(f: impl FnOnce() -> T) -> T {
     })
 }
 
+#[allow(dead_code)]
 fn send_keyboard_command_sequence(
     command: u8,
     data: &[u8],
@@ -480,6 +484,7 @@ fn send_aux_command_sequence(command: u8, data: &[u8], response: &mut [u8]) -> R
     Ok(())
 }
 
+#[allow(dead_code)]
 fn send_keyboard_byte_and_expect_ack(byte: u8) -> Result<(), i32> {
     for _ in 0..DEVICE_SEND_RETRIES {
         if !write_data_byte(byte) {
@@ -521,6 +526,7 @@ fn send_aux_byte_and_expect_ack(byte: u8) -> Result<(), i32> {
     Err(-5)
 }
 
+#[allow(dead_code)]
 fn read_keyboard_response_byte() -> Result<u8, i32> {
     for _ in 0..DEVICE_RESPONSE_READ_RETRIES {
         match read_keyboard_data_byte_blocking() {

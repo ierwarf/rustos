@@ -82,12 +82,9 @@ pub(crate) fn copy_with_parent(src: &Path, dst: &Path) -> Result<()> {
 pub(crate) fn maybe_copy_host_runtime(
     src: &Option<PathBuf>,
     dst: &Path,
-    boot_entry: &str,
-    boot_entries: &mut Vec<String>,
 ) -> Result<()> {
     if let Some(src) = src.as_ref().filter(|path| path.is_file()) {
         copy_with_parent(src, dst)?;
-        push_boot_entry_unique(boot_entries, boot_entry);
     }
     Ok(())
 }
@@ -96,36 +93,12 @@ pub(crate) fn maybe_copy_dual_host_runtime(
     src: &Option<PathBuf>,
     primary_dst: &Path,
     fallback_dst: &Path,
-    primary_boot_entry: &str,
-    fallback_boot_entry: &str,
-    boot_entries: &mut Vec<String>,
 ) -> Result<()> {
     if let Some(src) = src.as_ref().filter(|path| path.is_file()) {
         copy_with_parent(src, primary_dst)?;
         copy_with_parent(src, fallback_dst)?;
-        push_boot_entry_unique(boot_entries, primary_boot_entry);
-        push_boot_entry_unique(boot_entries, fallback_boot_entry);
     }
     Ok(())
-}
-
-pub(crate) fn maybe_copy_optional_file(
-    src: &Path,
-    dst: &Path,
-    boot_entry: &str,
-    boot_entries: &mut Vec<String>,
-) -> Result<()> {
-    if src.is_file() {
-        copy_with_parent(src, dst)?;
-        push_boot_entry_unique(boot_entries, boot_entry);
-    }
-    Ok(())
-}
-
-pub(crate) fn push_boot_entry_unique(entries: &mut Vec<String>, entry: &str) {
-    if !entries.iter().any(|existing| existing == entry) {
-        entries.push(String::from(entry));
-    }
 }
 
 pub(crate) fn copy_or_unpack_firmware(
@@ -170,20 +143,6 @@ pub(crate) fn copy_or_unpack_firmware(
         return Err(format!("failed to unpack {}", src_zst.display()).into());
     }
 
-    Ok(())
-}
-
-pub(crate) fn write_boot_file_list(path: &Path, entries: &[String]) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("boot file list path has no parent: {}", path.display()))?;
-    fs::create_dir_all(parent)?;
-    let mut content = String::new();
-    for entry in entries {
-        content.push_str(entry);
-        content.push_str("\r\n");
-    }
-    fs::write(path, content)?;
     Ok(())
 }
 

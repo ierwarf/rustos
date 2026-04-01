@@ -51,6 +51,7 @@ impl PendingAdminRequest {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn kind(self) -> PendingAdminRequestKind {
         self.kind
     }
@@ -74,6 +75,7 @@ impl ProcessSecurityContext {
         self.logical_admin
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn pending_admin_request(self) -> Option<PendingAdminRequest> {
         self.pending_admin_request
     }
@@ -127,6 +129,7 @@ impl WindowsLoadedModule {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WindowsAllocationKind {
+    #[allow(dead_code)]
     Heap,
     Virtual,
 }
@@ -279,10 +282,12 @@ impl UserProcessState {
         &mut self.address_space
     }
 
+    #[allow(dead_code)]
     pub fn linux_process_state(&self) -> Option<&LinuxProcessState> {
         self.linux_process_state.as_ref()
     }
 
+    #[allow(dead_code)]
     pub fn linux_process_state_mut(&mut self) -> Option<&mut LinuxProcessState> {
         self.linux_process_state.as_mut()
     }

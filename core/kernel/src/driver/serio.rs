@@ -134,9 +134,9 @@ pub(crate) unsafe extern "C" fn register_linux_driver(driver: *mut LinuxCompatSe
     }
 
     let driver_name_ptr = unsafe { (*driver).driver.name };
-    let description_ptr = unsafe { (*driver).description };
+    let _description_ptr = unsafe { (*driver).description };
     let id_table = unsafe { (*driver).id_table };
-    let connect_ptr = unsafe {
+    let _connect_ptr = unsafe {
         (*driver)
             .connect
             .map(|func| func as *const () as usize)
@@ -145,12 +145,12 @@ pub(crate) unsafe extern "C" fn register_linux_driver(driver: *mut LinuxCompatSe
     crate::debug::println!(
         "serio register linux driver raw: driver_ptr={:#x} desc={:#x} name_ptr={:#x} id_table={:#x} connect={:#x}",
         driver as usize,
-        description_ptr as usize,
+        _description_ptr as usize,
         driver_name_ptr as usize,
         id_table as usize,
-        connect_ptr
+        _connect_ptr
     );
-    let driver_name = compat_cstr(driver_name_ptr).unwrap_or("invalid");
+    let _driver_name = compat_cstr(driver_name_ptr).unwrap_or("invalid");
 
     {
         let mut drivers = LINUX_SERIO_DRIVERS.lock();
@@ -162,7 +162,7 @@ pub(crate) unsafe extern "C" fn register_linux_driver(driver: *mut LinuxCompatSe
 
     crate::debug::println!(
         "serio register linux driver: name={} driver_ptr={:#x} id_table={:#x}",
-        driver_name,
+        _driver_name,
         driver as usize,
         id_table as usize
     );
@@ -185,7 +185,7 @@ pub(crate) unsafe extern "C" fn register_linux_driver(driver: *mut LinuxCompatSe
 
     crate::debug::println!(
         "serio register linux driver: schedule rescan name={}",
-        driver_name
+        _driver_name
     );
     request_bind_rescan();
     0
@@ -842,19 +842,20 @@ fn try_bind_port(port_id: u32) {
     );
     irq_safe(|| {
         let ports = SERIO_PORTS.lock();
-        if let Some(port) = ports.iter().find(|port| port.info.port_id == port_id) {
+        if let Some(_port) = ports.iter().find(|port| port.info.port_id == port_id) {
             crate::debug::println!(
                 "serio no match: port={} type={} proto={} id={} extra={}",
-                port.info.port_id,
-                port.info.type_,
-                port.info.proto,
-                port.info.id,
-                port.info.extra
+                _port.info.port_id,
+                _port.info.type_,
+                _port.info.proto,
+                _port.info.id,
+                _port.info.extra
             );
         }
     });
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 fn first_matching_native_driver(
     port_id: u32,
     port_info: SerioPortInfo,
@@ -919,7 +920,7 @@ fn bind_native_port(
 
     irq_safe(|| {
         let ports = SERIO_PORTS.lock();
-        let Some(port) = ports
+        let Some(_port) = ports
             .iter()
             .find(|entry| entry.info.port_id == port_id && entry.bound_driver == Some(binding))
         else {
@@ -927,9 +928,9 @@ fn bind_native_port(
         };
         crate::debug::println!(
             "serio bound: port={} type={} proto={} driver={}",
-            port.info.port_id,
-            port.info.type_,
-            port.info.proto,
+            _port.info.port_id,
+            _port.info.type_,
+            _port.info.proto,
             registration.name_str().unwrap_or("invalid")
         );
     });
@@ -962,7 +963,7 @@ fn bind_linux_port(
 
     irq_safe(|| {
         let ports = SERIO_PORTS.lock();
-        let Some(entry) = ports
+        let Some(_entry) = ports
             .iter()
             .find(|entry| entry.info.port_id == port_id && entry.bound_driver == Some(binding))
         else {
@@ -970,9 +971,9 @@ fn bind_linux_port(
         };
         crate::debug::println!(
             "serio bound: port={} type={} proto={} driver={}",
-            entry.info.port_id,
-            entry.info.type_,
-            entry.info.proto,
+            _entry.info.port_id,
+            _entry.info.type_,
+            _entry.info.proto,
             super::linux::serio::driver_name(driver)
         );
     });
@@ -1004,7 +1005,7 @@ fn apply_bound_driver_state(
     state_applied
 }
 
-fn rollback_bound_driver_state(port_id: u32, binding: BoundSerioDriver, connect_status: i32) {
+fn rollback_bound_driver_state(port_id: u32, binding: BoundSerioDriver, _connect_status: i32) {
     interrupts::without_interrupts(|| {
         let mut ports = SERIO_PORTS.lock();
         if let Some(entry) = ports
@@ -1016,7 +1017,7 @@ fn rollback_bound_driver_state(port_id: u32, binding: BoundSerioDriver, connect_
                 entry.info.port_id,
                 entry.info.type_,
                 entry.info.proto,
-                connect_status
+                _connect_status
             );
             entry.bound_driver = None;
             unsafe {

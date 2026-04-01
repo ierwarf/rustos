@@ -22,7 +22,7 @@ const PE_SCN_MEM_WRITE: u32 = 0x8000_0000;
 const PE_REL_BASED_ABSOLUTE: u16 = 0;
 const PE_REL_BASED_DIR64: u16 = 10;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(super) struct PeSection {
     pub virtual_address: u32,
     pub virtual_size: u32,
@@ -31,12 +31,13 @@ pub(super) struct PeSection {
     pub characteristics: u32,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(super) struct PeDataDirectory {
     pub rva: u32,
     pub size: u32,
 }
 
+#[derive(Clone, Debug)]
 pub(super) struct PeImage {
     pub entry_rva: u32,
     pub preferred_base: u64,

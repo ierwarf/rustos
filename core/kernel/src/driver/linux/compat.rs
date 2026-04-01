@@ -474,6 +474,8 @@ impl LinuxCompatSerio {
         }
     }
 
+    // Resolver/export surface used by Linux-compat modules without static Rust call sites.
+    #[allow(dead_code)]
     pub(crate) fn driver_name_ptr(&self) -> *const c_char {
         if self.drv.is_null() {
             core::ptr::null()

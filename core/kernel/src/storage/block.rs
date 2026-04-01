@@ -1,19 +1,21 @@
 use alloc::boxed::Box;
 use alloc::string::String;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
-use boot_protocol::BootVolumeIdentity;
-use core::cmp::min;
+use boot_protocol::{BootVolumeIdentity, BootVolumeTransport};
 use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
+use storage_core::{
+    BlockDevice as SharedBlockDevice, BootVolumeLocator, PartitionInfo as SharedPartitionInfo,
+};
 
-use crate::storage::fat::{BlockDevice as FatBlockDevice, DiskIoError, IoResult, FAT_SECTOR_SIZE};
+use crate::storage::fat::{DiskIoError, IoResult};
 
-const GPT_HEADER_LBA: u64 = 1;
-const GPT_SIGNATURE: [u8; 8] = *b"EFI PART";
-const MBR_PARTITION_TABLE_OFFSET: usize = 446;
-const MBR_PARTITION_ENTRY_LEN: usize = 16;
+pub(crate) use storage_core::TransportKind as BlockTransportKind;
+
 const BLOCK_CACHE_CAPACITY: usize = 256;
+const MIN_LOGICAL_BLOCK_SIZE: usize = 512;
+#[cfg(test)]
+const MBR_PARTITION_TABLE_OFFSET: usize = 446;
 
 static BLOCK_DEVICES: Mutex<Vec<BlockDeviceRecord>> = Mutex::new(Vec::new());
 static BLOCK_CACHE: Mutex<Vec<BlockCacheEntry>> = Mutex::new(Vec::new());
@@ -41,31 +43,22 @@ pub(crate) struct BlockDeviceDescriptor {
     pub(crate) path: String,
     pub(crate) transport: BlockTransportKind,
     pub(crate) readonly: bool,
-    pub(crate) start_lba: u64,
-    pub(crate) sector_count: u64,
+    pub(crate) logical_block_size: usize,
+    pub(crate) start_block: u64,
+    pub(crate) block_count: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BlockTransportKind {
-    Ahci,
-    Nvme,
-}
-
-pub(crate) trait BlockDeviceOps: Send + Sync {
+pub(crate) trait BlockDeviceOps: SharedBlockDevice + Send {
     fn transport_kind(&self) -> BlockTransportKind;
-    fn sector_count(&self) -> u64;
-    fn read_sector(&self, lba: u64, out: &mut [u8; FAT_SECTOR_SIZE]) -> IoResult<()>;
-    fn write_sector(&self, lba: u64, input: &[u8; FAT_SECTOR_SIZE]) -> IoResult<()>;
-    fn flush(&self) -> IoResult<()>;
     fn readonly(&self) -> bool;
 }
 
 enum BlockDeviceKind {
-    Root(Arc<dyn BlockDeviceOps>),
+    Root(Mutex<Box<dyn BlockDeviceOps>>),
     Slice {
         parent_id: u32,
-        start_lba: u64,
-        sectors: u64,
+        start_block: u64,
+        block_count: u64,
     },
 }
 
@@ -81,7 +74,13 @@ struct BlockDeviceRecord {
 struct BlockCacheEntry {
     device_id: u32,
     lba: u64,
-    data: [u8; FAT_SECTOR_SIZE],
+    data: Vec<u8>,
+}
+
+struct RegistryRootBlockDevice {
+    root_id: u32,
+    logical_block_size: usize,
+    block_count: u64,
 }
 
 pub(crate) fn init() {
@@ -89,8 +88,20 @@ pub(crate) fn init() {
 }
 
 pub(crate) fn register_boot_volume_opener() {
-    crate::storage::fat::set_boot_block_device_opener(open_boot_block_device);
-    crate::storage::fat::set_physical_boot_block_device_opener(open_physical_boot_block_device);
+    crate::storage::boot_volume::set_boot_block_device_opener(open_boot_block_device);
+    crate::storage::boot_volume::set_physical_boot_block_device_opener(open_physical_boot_block_device);
+}
+
+pub(crate) fn current_boot_volume_handle() -> Option<BlockDeviceHandle> {
+    ensure_initialized();
+
+    if let Some(identity) = crate::storage::boot_volume::boot_volume_identity() {
+        if let Ok(handle) = open_physical_boot_handle(identity) {
+            return Some(handle);
+        }
+    }
+
+    open_boot_handle().ok()
 }
 
 fn ensure_initialized() {
@@ -115,13 +126,17 @@ fn initialize_root_devices() {
 
     #[cfg(not(test))]
     {
-        let mut registered = 0usize;
+        let mut _registered = 0usize;
         for device in crate::storage::ahci::probe_devices() {
             register_root_device(device);
-            registered += 1;
+            _registered += 1;
+        }
+        for device in crate::storage::nvme::probe_devices() {
+            register_root_device(device);
+            _registered += 1;
         }
 
-        crate::debug::println!("storage: registered {} block device(s)", registered);
+        crate::debug::println!("storage: registered {} block device(s)", _registered);
     }
 }
 
@@ -135,8 +150,9 @@ pub(crate) fn descriptors() -> Vec<BlockDeviceDescriptor> {
             path: device.path.clone(),
             transport: device.transport,
             readonly: device.readonly,
-            start_lba: device_start_lba_locked(&devices, device.id).unwrap_or(0),
-            sector_count: device_sector_count_locked(&devices, device.id).unwrap_or(0),
+            logical_block_size: device_logical_block_size_locked(&devices, device.id).unwrap_or(0),
+            start_block: device_start_block_locked(&devices, device.id).unwrap_or(0),
+            block_count: device_block_count_locked(&devices, device.id).unwrap_or(0),
         })
         .collect()
 }
@@ -163,36 +179,10 @@ fn descriptor_without_init(handle: BlockDeviceHandle) -> Option<BlockDeviceDescr
         path: record.path.clone(),
         transport: record.transport,
         readonly: record.readonly,
-        start_lba: device_start_lba_locked(&devices, handle.id()).unwrap_or(0),
-        sector_count: device_sector_count_locked(&devices, handle.id()).unwrap_or(0),
+        logical_block_size: device_logical_block_size_locked(&devices, handle.id()).unwrap_or(0),
+        start_block: device_start_block_locked(&devices, handle.id()).unwrap_or(0),
+        block_count: device_block_count_locked(&devices, handle.id()).unwrap_or(0),
     })
-}
-
-pub(crate) fn read_sector(
-    handle: BlockDeviceHandle,
-    lba: u64,
-    out: &mut [u8; FAT_SECTOR_SIZE],
-) -> IoResult<()> {
-    ensure_initialized();
-    if let Some(cached) = cache_lookup(handle.id(), lba) {
-        out.copy_from_slice(&cached);
-        return Ok(());
-    }
-
-    read_sector_uncached(handle.id(), lba, out)?;
-    cache_store(handle.id(), lba, out);
-    Ok(())
-}
-
-pub(crate) fn write_sector(
-    handle: BlockDeviceHandle,
-    lba: u64,
-    input: &[u8; FAT_SECTOR_SIZE],
-) -> IoResult<()> {
-    ensure_initialized();
-    write_sector_uncached(handle.id(), lba, input)?;
-    cache_store(handle.id(), lba, input);
-    Ok(())
 }
 
 pub(crate) fn flush(handle: BlockDeviceHandle) -> IoResult<()> {
@@ -216,19 +206,35 @@ impl FatRegistryDevice {
     }
 }
 
-impl FatBlockDevice for FatRegistryDevice {
-    fn sector_count(&self) -> u64 {
+impl SharedBlockDevice for FatRegistryDevice {
+    fn logical_block_size(&self) -> usize {
         descriptor(self.handle)
-            .map(|device| device.sector_count)
+            .map(|device| device.logical_block_size)
             .unwrap_or(0)
     }
 
-    fn read_sector(&mut self, lba: u64, out: &mut [u8; FAT_SECTOR_SIZE]) -> IoResult<()> {
-        read_sector(self.handle, lba, out)
+    fn block_count(&self) -> u64 {
+        descriptor(self.handle)
+            .map(|device| device.block_count)
+            .unwrap_or(0)
     }
 
-    fn write_sector(&mut self, lba: u64, input: &[u8; FAT_SECTOR_SIZE]) -> IoResult<()> {
-        write_sector(self.handle, lba, input)
+    fn read_blocks(&mut self, lba: u64, out: &mut [u8]) -> IoResult<()> {
+        let block_size = self.logical_block_size();
+        validate_block_io_exact(block_size, lba, self.block_count(), out.len())?;
+        for (index, chunk) in out.chunks_exact_mut(block_size).enumerate() {
+            read_cached_block(self.handle.id(), lba + index as u64, chunk)?;
+        }
+        Ok(())
+    }
+
+    fn write_blocks(&mut self, lba: u64, input: &[u8]) -> IoResult<()> {
+        let block_size = self.logical_block_size();
+        validate_block_io_exact(block_size, lba, self.block_count(), input.len())?;
+        for (index, chunk) in input.chunks_exact(block_size).enumerate() {
+            write_cached_block(self.handle.id(), lba + index as u64, chunk)?;
+        }
+        Ok(())
     }
 
     fn flush(&mut self) -> IoResult<()> {
@@ -236,123 +242,33 @@ impl FatBlockDevice for FatRegistryDevice {
     }
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 fn open_boot_block_device(
-) -> core::result::Result<Box<dyn FatBlockDevice>, fatfs::Error<DiskIoError>> {
-    ensure_initialized();
-    crate::debug::println!("storage: boot volume fallback opener invoked");
-
-    for descriptor in descriptors() {
-        let handle = BlockDeviceHandle::new(descriptor.id);
-        crate::debug::println!(
-            "storage: probing FAT candidate id={} path={} transport={:?} readonly={} start_lba={} sectors={}",
-            descriptor.id,
-            descriptor.path,
-            descriptor.transport,
-            descriptor.readonly,
-            descriptor.start_lba,
-            descriptor.sector_count
-        );
-        if fatfs::FileSystem::new(
-            crate::storage::fat::FatDisk::new(FatRegistryDevice::new(handle)),
-            fatfs::FsOptions::new(),
-        )
-        .is_ok()
-        {
-            crate::debug::println!(
-                "storage: selected FAT boot candidate id={} path={} start_lba={} sectors={}",
-                descriptor.id,
-                descriptor.path,
-                descriptor.start_lba,
-                descriptor.sector_count
-            );
-            return Ok(Box::new(FatRegistryDevice::new(handle)) as Box<dyn FatBlockDevice>);
-        }
-        crate::debug::println!(
-            "storage: rejected FAT candidate id={} path={}",
-            descriptor.id,
-            descriptor.path
-        );
-    }
-
-    crate::debug::println!("storage: no FAT boot candidate matched");
-    Err(fatfs::Error::Io(DiskIoError::NotPresent))
+) -> core::result::Result<Box<dyn SharedBlockDevice>, fatfs::Error<DiskIoError>> {
+    let handle = open_boot_handle().map_err(fatfs::Error::Io)?;
+    Ok(Box::new(FatRegistryDevice::new(handle)) as Box<dyn SharedBlockDevice>)
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 fn open_physical_boot_block_device(
     identity: BootVolumeIdentity,
-) -> core::result::Result<Box<dyn FatBlockDevice>, fatfs::Error<DiskIoError>> {
-    ensure_initialized();
-    if !identity.is_present() {
-        crate::debug::println!("storage: physical boot opener requested without identity");
-        return Err(fatfs::Error::Io(DiskIoError::NotPresent));
-    }
-    crate::debug::println!(
-        "storage: physical boot opener identity serial={:#010x} start_lba={} sectors={}",
-        identity.fat_volume_id,
-        identity.volume_start_lba,
-        identity.volume_sector_count
-    );
-
-    for descriptor in descriptors() {
-        if descriptor.start_lba != identity.volume_start_lba
-            || descriptor.sector_count != identity.volume_sector_count
-        {
-            continue;
-        }
-
-        let handle = BlockDeviceHandle::new(descriptor.id);
-        crate::debug::println!(
-            "storage: physical opener candidate id={} path={} start_lba={} sectors={}",
-            descriptor.id,
-            descriptor.path,
-            descriptor.start_lba,
-            descriptor.sector_count
-        );
-        let mut sector0 = [0_u8; FAT_SECTOR_SIZE];
-        if read_sector(handle, 0, &mut sector0).is_err() {
-            crate::debug::println!(
-                "storage: physical opener candidate id={} path={} sector0 read failed",
-                descriptor.id,
-                descriptor.path
-            );
-            continue;
-        }
-        if crate::storage::fat::fat_volume_id_from_boot_sector(&sector0)
-            != Some(identity.fat_volume_id)
-        {
-            crate::debug::println!(
-                "storage: physical opener candidate id={} path={} serial mismatch actual={:#010x}",
-                descriptor.id,
-                descriptor.path,
-                crate::storage::fat::fat_volume_id_from_boot_sector(&sector0).unwrap_or(0)
-            );
-            continue;
-        }
-
-        crate::debug::println!(
-            "storage: physical opener matched id={} path={}",
-            descriptor.id,
-            descriptor.path
-        );
-        return Ok(Box::new(FatRegistryDevice::new(handle)) as Box<dyn FatBlockDevice>);
-    }
-
-    crate::debug::println!("storage: physical boot opener found no exact match");
-    Err(fatfs::Error::Io(DiskIoError::NotPresent))
+) -> core::result::Result<Box<dyn SharedBlockDevice>, fatfs::Error<DiskIoError>> {
+    let handle = open_physical_boot_handle(identity).map_err(fatfs::Error::Io)?;
+    Ok(Box::new(FatRegistryDevice::new(handle)) as Box<dyn SharedBlockDevice>)
 }
 
-fn register_root_device(device: Arc<dyn BlockDeviceOps>) {
+fn register_root_device(device: Box<dyn BlockDeviceOps>) {
+    let transport = device.transport_kind();
+    let readonly = device.readonly();
     let root_id = {
         let mut devices = BLOCK_DEVICES.lock();
         let id = devices.len() as u32;
-        let transport = device.transport_kind();
-        let readonly = device.readonly();
         devices.push(BlockDeviceRecord {
             id,
             path: alloc::format!("/dev/block{id}"),
             transport,
             readonly,
-            kind: BlockDeviceKind::Root(device.clone()),
+            kind: BlockDeviceKind::Root(Mutex::new(device)),
         });
         id
     };
@@ -387,21 +303,21 @@ fn register_partitions(root_id: u32) {
             readonly,
             kind: BlockDeviceKind::Slice {
                 parent_id: root_id,
-                start_lba: partition.start_lba,
-                sectors: partition.sectors,
+                start_block: partition.start_lba,
+                block_count: partition.block_count,
             },
         });
     }
 }
 
-fn read_sector_uncached(device_id: u32, lba: u64, out: &mut [u8; FAT_SECTOR_SIZE]) -> IoResult<()> {
+fn read_blocks_uncached(device_id: u32, lba: u64, out: &mut [u8]) -> IoResult<()> {
     let devices = BLOCK_DEVICES.lock();
-    read_sector_from_records(&devices, device_id, lba, out)
+    read_blocks_from_records(&devices, device_id, lba, out)
 }
 
-fn write_sector_uncached(device_id: u32, lba: u64, input: &[u8; FAT_SECTOR_SIZE]) -> IoResult<()> {
+fn write_blocks_uncached(device_id: u32, lba: u64, input: &[u8]) -> IoResult<()> {
     let devices = BLOCK_DEVICES.lock();
-    write_sector_from_records(&devices, device_id, lba, input)
+    write_blocks_from_records(&devices, device_id, lba, input)
 }
 
 fn flush_uncached(device_id: u32) -> IoResult<()> {
@@ -409,56 +325,289 @@ fn flush_uncached(device_id: u32) -> IoResult<()> {
     flush_from_records(&devices, device_id)
 }
 
-fn device_sector_count_locked(devices: &[BlockDeviceRecord], device_id: u32) -> Option<u64> {
+fn device_logical_block_size_locked(devices: &[BlockDeviceRecord], device_id: u32) -> Option<usize> {
     let record = devices.iter().find(|device| device.id == device_id)?;
     match &record.kind {
-        BlockDeviceKind::Root(device) => Some(device.sector_count()),
-        BlockDeviceKind::Slice { sectors, .. } => Some(*sectors),
+        BlockDeviceKind::Root(device) => Some(device.lock().logical_block_size()),
+        BlockDeviceKind::Slice { parent_id, .. } => device_logical_block_size_locked(devices, *parent_id),
     }
 }
 
-fn device_start_lba_locked(devices: &[BlockDeviceRecord], device_id: u32) -> Option<u64> {
+fn device_block_count_locked(devices: &[BlockDeviceRecord], device_id: u32) -> Option<u64> {
+    let record = devices.iter().find(|device| device.id == device_id)?;
+    match &record.kind {
+        BlockDeviceKind::Root(device) => Some(device.lock().block_count()),
+        BlockDeviceKind::Slice { block_count, .. } => Some(*block_count),
+    }
+}
+
+fn device_start_block_locked(devices: &[BlockDeviceRecord], device_id: u32) -> Option<u64> {
     let record = devices.iter().find(|device| device.id == device_id)?;
     match &record.kind {
         BlockDeviceKind::Root(_) => Some(0),
         BlockDeviceKind::Slice {
             parent_id,
-            start_lba,
+            start_block,
             ..
-        } => Some(device_start_lba_locked(devices, *parent_id)?.saturating_add(*start_lba)),
+        } => Some(device_start_block_locked(devices, *parent_id)?.saturating_add(*start_block)),
     }
 }
 
-fn read_sector_from_records(
+fn device_root_id_locked(devices: &[BlockDeviceRecord], device_id: u32) -> Option<u32> {
+    let record = devices.iter().find(|device| device.id == device_id)?;
+    match &record.kind {
+        BlockDeviceKind::Root(_) => Some(record.id),
+        BlockDeviceKind::Slice { parent_id, .. } => device_root_id_locked(devices, *parent_id),
+    }
+}
+
+fn root_device_ids_locked(devices: &[BlockDeviceRecord]) -> Vec<u32> {
+    devices
+        .iter()
+        .filter_map(|device| match &device.kind {
+            BlockDeviceKind::Root(_) => Some(device.id),
+            BlockDeviceKind::Slice { .. } => None,
+        })
+        .collect()
+}
+
+fn sort_root_ids_by_transport_hint(root_ids: &mut [u32], transport_hint: BootVolumeTransport) {
+    if transport_hint == BootVolumeTransport::Unknown {
+        return;
+    }
+
+    root_ids.sort_by_key(|root_id| {
+        let device_transport = descriptor_without_init(BlockDeviceHandle::new(*root_id))
+            .map(|descriptor| boot_transport_from_block(descriptor.transport))
+            .unwrap_or(BootVolumeTransport::Unknown);
+        (device_transport != transport_hint) as u8
+    });
+}
+
+fn boot_transport_from_block(transport: BlockTransportKind) -> BootVolumeTransport {
+    match transport {
+        BlockTransportKind::Ahci => BootVolumeTransport::Ahci,
+        BlockTransportKind::Nvme => BootVolumeTransport::Nvme,
+        BlockTransportKind::Usb => BootVolumeTransport::Usb,
+    }
+}
+
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
+fn open_boot_handle() -> IoResult<BlockDeviceHandle> {
+    ensure_initialized();
+    crate::debug::println!("storage: boot volume fallback opener invoked");
+    let transport_hint =
+        crate::storage::boot_volume::boot_volume_transport_hint()
+            .unwrap_or(BootVolumeTransport::Unknown);
+
+    let mut root_ids = {
+        let devices = BLOCK_DEVICES.lock();
+        root_device_ids_locked(&devices)
+    };
+    sort_root_ids_by_transport_hint(&mut root_ids, transport_hint);
+    if transport_hint != BootVolumeTransport::Unknown {
+        crate::debug::println!(
+            "storage: boot volume fallback prefers {:?} candidates",
+            transport_hint
+        );
+    }
+
+    for root_id in root_ids {
+        let Some(descriptor) = descriptor_without_init(BlockDeviceHandle::new(root_id)) else {
+            continue;
+        };
+        crate::debug::println!(
+            "storage: probing FAT candidate id={} path={} transport={:?} readonly={} block_size={} start_block={} blocks={}",
+            root_id,
+            descriptor.path,
+            descriptor.transport,
+            descriptor.readonly,
+            descriptor.logical_block_size,
+            descriptor.start_block,
+            descriptor.block_count
+        );
+
+        let detected = match detect_fat_boot_partition_handle(root_id) {
+            Ok(value) => value,
+            Err(err) => {
+                crate::debug::println!(
+                    "storage: rejected FAT candidate id={} path={} detect error={:?}",
+                    root_id,
+                    descriptor.path,
+                    err
+                );
+                continue;
+            }
+        };
+
+        let Some((handle, partition)) = detected else {
+            crate::debug::println!(
+                "storage: rejected FAT candidate id={} path={}",
+                root_id,
+                descriptor.path
+            );
+            continue;
+        };
+
+        if let Some(selected) = descriptor_without_init(handle) {
+            crate::debug::println!(
+                "storage: selected FAT boot candidate id={} path={} start_block={} blocks={}",
+                selected.id,
+                selected.path,
+                partition.start_lba,
+                partition.block_count
+            );
+        }
+        return Ok(handle);
+    }
+
+    crate::debug::println!("storage: no FAT boot candidate matched");
+    Err(DiskIoError::NotPresent)
+}
+
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
+fn open_physical_boot_handle(identity: BootVolumeIdentity) -> IoResult<BlockDeviceHandle> {
+    ensure_initialized();
+    let Some(locator) = BootVolumeLocator::new(identity) else {
+        crate::debug::println!("storage: physical boot opener requested without identity");
+        return Err(DiskIoError::NotPresent);
+    };
+    crate::debug::println!(
+        "storage: physical boot opener identity transport={:?} serial={:#010x} start_lba={} sectors={}",
+        identity.transport(),
+        identity.fat_volume_id,
+        identity.volume_start_lba,
+        identity.volume_sector_count
+    );
+
+    let mut root_ids = {
+        let devices = BLOCK_DEVICES.lock();
+        root_device_ids_locked(&devices)
+    };
+    sort_root_ids_by_transport_hint(&mut root_ids, identity.transport());
+
+    for root_id in root_ids {
+        let Some(descriptor) = descriptor_without_init(BlockDeviceHandle::new(root_id)) else {
+            continue;
+        };
+
+        crate::debug::println!(
+            "storage: physical opener candidate id={} path={} block_size={} start_block={} blocks={}",
+            root_id,
+            descriptor.path,
+            descriptor.logical_block_size,
+            descriptor.start_block,
+            descriptor.block_count
+        );
+
+        let mut root = RegistryRootBlockDevice {
+            root_id,
+            logical_block_size: descriptor.logical_block_size,
+            block_count: descriptor.block_count,
+        };
+        let partitions = match candidate_partitions(&mut root) {
+            Ok(partitions) => partitions,
+            Err(err) => {
+                crate::debug::println!(
+                    "storage: physical opener candidate id={} path={} partition scan error={:?}",
+                    root_id,
+                    descriptor.path,
+                    err
+                );
+                continue;
+            }
+        };
+
+        for partition in partitions {
+            let is_match = match locator.matches_partition(&mut root, partition) {
+                Ok(result) => result,
+                Err(err) => {
+                    crate::debug::println!(
+                        "storage: physical opener candidate id={} path={} identity probe error={:?}",
+                        root_id,
+                        descriptor.path,
+                        err
+                    );
+                    break;
+                }
+            };
+            if !is_match {
+                continue;
+            }
+
+            let Some(handle) = find_device_handle_for_partition(root_id, partition) else {
+                crate::debug::println!(
+                    "storage: physical opener candidate id={} path={} matched but no handle was registered",
+                    root_id,
+                    descriptor.path
+                );
+                break;
+            };
+
+            if let Some(selected) = descriptor_without_init(handle) {
+                crate::debug::println!(
+                    "storage: physical boot opener matched id={} path={}",
+                    selected.id,
+                    selected.path
+                );
+            }
+            return Ok(handle);
+        }
+    }
+
+    crate::debug::println!("storage: physical boot opener found no exact match");
+    Err(DiskIoError::NotPresent)
+}
+
+fn find_device_handle_for_partition(
+    root_id: u32,
+    partition: SharedPartitionInfo,
+) -> Option<BlockDeviceHandle> {
+    let devices = BLOCK_DEVICES.lock();
+    devices
+        .iter()
+        .find(|device| {
+            device_root_id_locked(&devices, device.id) == Some(root_id)
+                && device_start_block_locked(&devices, device.id) == Some(partition.start_lba)
+                && device_block_count_locked(&devices, device.id) == Some(partition.block_count)
+        })
+        .map(|device| BlockDeviceHandle::new(device.id))
+}
+
+fn read_blocks_from_records(
     devices: &[BlockDeviceRecord],
     device_id: u32,
     lba: u64,
-    out: &mut [u8; FAT_SECTOR_SIZE],
+    out: &mut [u8],
 ) -> IoResult<()> {
     let record = devices
         .iter()
         .find(|device| device.id == device_id)
         .ok_or(DiskIoError::NotPresent)?;
     match &record.kind {
-        BlockDeviceKind::Root(device) => device.read_sector(lba, out),
+        BlockDeviceKind::Root(device) => {
+            let mut device = device.lock();
+            validate_block_io_exact(device.logical_block_size(), lba, device.block_count(), out.len())?;
+            device.read_blocks(lba, out)
+        }
         BlockDeviceKind::Slice {
             parent_id,
-            start_lba,
-            sectors,
+            start_block,
+            block_count,
         } => {
-            if lba >= *sectors {
-                return Err(DiskIoError::InvalidInput);
-            }
-            read_sector_from_records(devices, *parent_id, start_lba + lba, out)
+            let block_size = device_logical_block_size_locked(devices, device_id)
+                .ok_or(DiskIoError::NotPresent)?;
+            validate_block_io_exact(block_size, lba, *block_count, out.len())?;
+            read_blocks_from_records(devices, *parent_id, start_block + lba, out)
         }
     }
 }
 
-fn write_sector_from_records(
+fn write_blocks_from_records(
     devices: &[BlockDeviceRecord],
     device_id: u32,
     lba: u64,
-    input: &[u8; FAT_SECTOR_SIZE],
+    input: &[u8],
 ) -> IoResult<()> {
     let record = devices
         .iter()
@@ -468,16 +617,20 @@ fn write_sector_from_records(
         return Err(DiskIoError::InvalidInput);
     }
     match &record.kind {
-        BlockDeviceKind::Root(device) => device.write_sector(lba, input),
+        BlockDeviceKind::Root(device) => {
+            let mut device = device.lock();
+            validate_block_io_exact(device.logical_block_size(), lba, device.block_count(), input.len())?;
+            device.write_blocks(lba, input)
+        }
         BlockDeviceKind::Slice {
             parent_id,
-            start_lba,
-            sectors,
+            start_block,
+            block_count,
         } => {
-            if lba >= *sectors {
-                return Err(DiskIoError::InvalidInput);
-            }
-            write_sector_from_records(devices, *parent_id, start_lba + lba, input)
+            let block_size = device_logical_block_size_locked(devices, device_id)
+                .ok_or(DiskIoError::NotPresent)?;
+            validate_block_io_exact(block_size, lba, *block_count, input.len())?;
+            write_blocks_from_records(devices, *parent_id, start_block + lba, input)
         }
     }
 }
@@ -488,26 +641,62 @@ fn flush_from_records(devices: &[BlockDeviceRecord], device_id: u32) -> IoResult
         .find(|device| device.id == device_id)
         .ok_or(DiskIoError::NotPresent)?;
     match &record.kind {
-        BlockDeviceKind::Root(device) => device.flush(),
+        BlockDeviceKind::Root(device) => device.lock().flush(),
         BlockDeviceKind::Slice { parent_id, .. } => flush_from_records(devices, *parent_id),
     }
 }
 
-fn cache_lookup(device_id: u32, lba: u64) -> Option<[u8; FAT_SECTOR_SIZE]> {
+fn validate_block_io_exact(
+    block_size: usize,
+    lba: u64,
+    total_blocks: u64,
+    len: usize,
+) -> IoResult<()> {
+    if block_size < MIN_LOGICAL_BLOCK_SIZE || len == 0 || len % block_size != 0 {
+        return Err(DiskIoError::InvalidInput);
+    }
+    let blocks = (len / block_size) as u64;
+    let end = lba.checked_add(blocks).ok_or(DiskIoError::InvalidInput)?;
+    if end > total_blocks {
+        return Err(DiskIoError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn read_cached_block(device_id: u32, lba: u64, out: &mut [u8]) -> IoResult<()> {
+    if let Some(cached) = cache_lookup(device_id, lba) {
+        if cached.len() == out.len() {
+            out.copy_from_slice(&cached);
+            return Ok(());
+        }
+    }
+    read_blocks_uncached(device_id, lba, out)?;
+    cache_store(device_id, lba, out);
+    Ok(())
+}
+
+fn write_cached_block(device_id: u32, lba: u64, input: &[u8]) -> IoResult<()> {
+    write_blocks_uncached(device_id, lba, input)?;
+    cache_store(device_id, lba, input);
+    Ok(())
+}
+
+fn cache_lookup(device_id: u32, lba: u64) -> Option<Vec<u8>> {
     let cache = BLOCK_CACHE.lock();
     cache
         .iter()
         .find(|entry| entry.device_id == device_id && entry.lba == lba)
-        .map(|entry| entry.data)
+        .map(|entry| entry.data.clone())
 }
 
-fn cache_store(device_id: u32, lba: u64, data: &[u8; FAT_SECTOR_SIZE]) {
+fn cache_store(device_id: u32, lba: u64, data: &[u8]) {
     let mut cache = BLOCK_CACHE.lock();
     if let Some(entry) = cache
         .iter_mut()
         .find(|entry| entry.device_id == device_id && entry.lba == lba)
     {
-        entry.data.copy_from_slice(data);
+        entry.data.clear();
+        entry.data.extend_from_slice(data);
         return;
     }
     if cache.len() >= BLOCK_CACHE_CAPACITY {
@@ -516,272 +705,209 @@ fn cache_store(device_id: u32, lba: u64, data: &[u8; FAT_SECTOR_SIZE]) {
     cache.push(BlockCacheEntry {
         device_id,
         lba,
-        data: *data,
+        data: data.to_vec(),
     });
 }
 
-#[derive(Clone, Copy)]
-struct PartitionInfo {
-    start_lba: u64,
-    sectors: u64,
-}
-
-fn detect_partitions(root_id: u32) -> IoResult<Vec<PartitionInfo>> {
-    let total = descriptor_without_init(BlockDeviceHandle::new(root_id))
-        .map(|device| device.sector_count)
-        .ok_or(DiskIoError::NotPresent)?;
-    if total == 0 {
-        return Ok(Vec::new());
-    }
-
-    let mut sector0 = [0_u8; FAT_SECTOR_SIZE];
-    read_sector_uncached(root_id, 0, &mut sector0)?;
-
-    let mut partitions = detect_gpt_partitions(root_id, total)?;
-    if !partitions.is_empty() {
-        return Ok(partitions);
-    }
-
-    let sig_ok = sector0[FAT_SECTOR_SIZE - 2] == 0x55 && sector0[FAT_SECTOR_SIZE - 1] == 0xAA;
-    if !sig_ok {
-        return Ok(Vec::new());
-    }
-
-    for idx in 0..4 {
-        let off = MBR_PARTITION_TABLE_OFFSET + idx * MBR_PARTITION_ENTRY_LEN;
-        let part_type = sector0[off + 4];
-        if part_type == 0 || part_type == 0xEE {
-            continue;
-        }
-
-        let start_lba = le_u32(&sector0, off + 8) as u64;
-        let sectors = le_u32(&sector0, off + 12) as u64;
-        let Some(end_lba) = start_lba.checked_add(sectors) else {
-            continue;
-        };
-        if start_lba == 0 || sectors == 0 || end_lba > total {
-            continue;
-        }
-        partitions.push(PartitionInfo { start_lba, sectors });
-    }
-
-    Ok(partitions)
-}
-
-fn detect_gpt_partitions(root_id: u32, total_sectors: u64) -> IoResult<Vec<PartitionInfo>> {
-    if total_sectors <= GPT_HEADER_LBA {
-        return Ok(Vec::new());
-    }
-
-    let mut header = [0_u8; FAT_SECTOR_SIZE];
-    read_sector_uncached(root_id, GPT_HEADER_LBA, &mut header)?;
-    if header[..GPT_SIGNATURE.len()] != GPT_SIGNATURE {
-        return Ok(Vec::new());
-    }
-
-    let header_size = le_u32(&header, 12) as usize;
-    if !(92..=FAT_SECTOR_SIZE).contains(&header_size) {
-        return Ok(Vec::new());
-    }
-
-    let entries_lba = le_u64(&header, 72);
-    let entry_count = le_u32(&header, 80) as u64;
-    let entry_size = le_u32(&header, 84) as u64;
-    if entry_count == 0 || entry_size < 128 || entry_size % 8 != 0 {
-        return Ok(Vec::new());
-    }
-
-    let table_offset = entries_lba
-        .checked_mul(FAT_SECTOR_SIZE as u64)
-        .ok_or(DiskIoError::InvalidInput)?;
-    let table_bytes = entry_count
-        .checked_mul(entry_size)
-        .ok_or(DiskIoError::InvalidInput)?;
-    let table_end = table_offset
-        .checked_add(table_bytes)
-        .ok_or(DiskIoError::InvalidInput)?;
-    let disk_bytes = total_sectors
-        .checked_mul(FAT_SECTOR_SIZE as u64)
-        .ok_or(DiskIoError::InvalidInput)?;
-    if table_end > disk_bytes {
-        return Ok(Vec::new());
-    }
-
-    let mut partitions = Vec::new();
-    let mut entry_prefix = [0_u8; 48];
-    for index in 0..entry_count {
-        let Some(entry_offset) = index
-            .checked_mul(entry_size)
-            .and_then(|offset| table_offset.checked_add(offset))
-        else {
-            continue;
-        };
-        read_device_bytes(root_id, entry_offset, &mut entry_prefix)?;
-        if entry_prefix[..16].iter().all(|byte| *byte == 0) {
-            continue;
-        }
-
-        let first_lba = le_u64(&entry_prefix, 32);
-        let last_lba = le_u64(&entry_prefix, 40);
-        let Some(sectors) = last_lba
-            .checked_sub(first_lba)
-            .and_then(|delta| delta.checked_add(1))
-        else {
-            continue;
-        };
-        let Some(end_lba) = first_lba.checked_add(sectors) else {
-            continue;
-        };
-        if first_lba == 0 || end_lba > total_sectors {
-            continue;
-        }
-        partitions.push(PartitionInfo {
-            start_lba: first_lba,
-            sectors,
+fn candidate_partitions(root: &mut RegistryRootBlockDevice) -> IoResult<Vec<SharedPartitionInfo>> {
+    let mut partitions = storage_core::detect_partitions(root)?;
+    if root.block_count != 0 && partitions.is_empty() {
+        partitions.push(SharedPartitionInfo {
+            start_lba: 0,
+            block_count: root.block_count,
         });
     }
-
     Ok(partitions)
 }
 
-fn read_device_bytes(device_id: u32, offset: u64, out: &mut [u8]) -> IoResult<()> {
-    if out.is_empty() {
-        return Ok(());
-    }
-
-    let mut scratch = [0_u8; FAT_SECTOR_SIZE];
-    let mut copied = 0usize;
-    while copied < out.len() {
-        let absolute = offset
-            .checked_add(copied as u64)
-            .ok_or(DiskIoError::InvalidInput)?;
-        let lba = absolute / FAT_SECTOR_SIZE as u64;
-        let sector_offset = (absolute as usize) % FAT_SECTOR_SIZE;
-        read_sector_uncached(device_id, lba, &mut scratch)?;
-
-        let chunk = min(FAT_SECTOR_SIZE - sector_offset, out.len() - copied);
-        out[copied..copied + chunk].copy_from_slice(&scratch[sector_offset..sector_offset + chunk]);
-        copied += chunk;
-    }
-
-    Ok(())
+fn detect_fat_boot_partition_handle(
+    root_id: u32,
+) -> IoResult<Option<(BlockDeviceHandle, SharedPartitionInfo)>> {
+    let (logical_block_size, block_count) = descriptor_without_init(BlockDeviceHandle::new(root_id))
+        .map(|device| (device.logical_block_size, device.block_count))
+        .ok_or(DiskIoError::NotPresent)?;
+    let mut root = RegistryRootBlockDevice {
+        root_id,
+        logical_block_size,
+        block_count,
+    };
+    let Some(partition) = storage_core::detect_fat_boot_partition(&mut root)? else {
+        return Ok(None);
+    };
+    let handle = find_device_handle_for_partition(root_id, partition)
+        .ok_or(DiskIoError::NotPresent)?;
+    Ok(Some((handle, partition)))
 }
 
-fn le_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes([
-        bytes[offset],
-        bytes[offset + 1],
-        bytes[offset + 2],
-        bytes[offset + 3],
-    ])
+fn detect_partitions(root_id: u32) -> IoResult<Vec<SharedPartitionInfo>> {
+    let (logical_block_size, block_count) = descriptor_without_init(BlockDeviceHandle::new(root_id))
+        .map(|device| (device.logical_block_size, device.block_count))
+        .ok_or(DiskIoError::NotPresent)?;
+    if block_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut root = RegistryRootBlockDevice {
+        root_id,
+        logical_block_size,
+        block_count,
+    };
+    candidate_partitions(&mut root).map(|partitions| {
+        partitions
+            .into_iter()
+            .filter(|partition| {
+                partition.start_lba != 0 || partition.block_count != root.block_count
+            })
+            .collect()
+    })
 }
 
-fn le_u64(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes([
-        bytes[offset],
-        bytes[offset + 1],
-        bytes[offset + 2],
-        bytes[offset + 3],
-        bytes[offset + 4],
-        bytes[offset + 5],
-        bytes[offset + 6],
-        bytes[offset + 7],
-    ])
+impl storage_core::BlockDevice for RegistryRootBlockDevice {
+    fn logical_block_size(&self) -> usize {
+        self.logical_block_size
+    }
+
+    fn block_count(&self) -> u64 {
+        self.block_count
+    }
+
+    fn read_blocks(&mut self, lba: u64, out: &mut [u8]) -> storage_core::IoResult<()> {
+        validate_block_io_exact(self.logical_block_size, lba, self.block_count, out.len())?;
+        read_blocks_uncached(self.root_id, lba, out)
+    }
+
+    fn write_blocks(&mut self, lba: u64, input: &[u8]) -> storage_core::IoResult<()> {
+        validate_block_io_exact(self.logical_block_size, lba, self.block_count, input.len())?;
+        write_blocks_uncached(self.root_id, lba, input)
+    }
+
+    fn flush(&mut self) -> storage_core::IoResult<()> {
+        flush_uncached(self.root_id)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use alloc::sync::Arc;
+    use alloc::boxed::Box;
     use alloc::vec;
+    use alloc::vec::Vec;
     use boot_protocol::BootVolumeIdentity;
     use core::sync::atomic::Ordering;
     use spin::Mutex;
+    use storage_core::BlockDevice as SharedBlockDevice;
 
     use super::{
-        cache_lookup, descriptors, flush, lookup, open_physical_boot_block_device, read_sector,
-        register_root_device, write_sector, BlockDeviceOps, BlockTransportKind, BLOCK_CACHE,
-        BLOCK_DEVICES, BLOCK_INIT_DONE, FAT_SECTOR_SIZE, MBR_PARTITION_TABLE_OFFSET,
+        cache_lookup, descriptors, flush, lookup, open_boot_block_device,
+        open_physical_boot_block_device, read_cached_block, register_root_device,
+        write_cached_block, BlockDeviceOps, BlockTransportKind, BLOCK_CACHE, BLOCK_DEVICES,
+        BLOCK_INIT_DONE, MBR_PARTITION_TABLE_OFFSET, MIN_LOGICAL_BLOCK_SIZE,
     };
     use crate::storage::fat::{DiskIoError, IoResult};
 
+    const TEST_BLOCK_SIZE: usize = MIN_LOGICAL_BLOCK_SIZE;
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     struct MockBlockDevice {
-        sectors: Mutex<Vec<[u8; FAT_SECTOR_SIZE]>>,
+        blocks: Mutex<Vec<[u8; TEST_BLOCK_SIZE]>>,
         readonly: bool,
     }
 
     impl MockBlockDevice {
-        fn new(sector_count: usize, readonly: bool) -> Self {
+        fn new(block_count: usize, readonly: bool) -> Self {
             Self {
-                sectors: Mutex::new(vec![[0_u8; FAT_SECTOR_SIZE]; sector_count]),
+                blocks: Mutex::new(vec![[0_u8; TEST_BLOCK_SIZE]; block_count]),
                 readonly,
             }
         }
 
-        fn with_mbr_partition(start_lba: u32, sectors: u32, readonly: bool) -> Self {
-            let device = Self::new((start_lba + sectors + 2) as usize, readonly);
+        fn with_mbr_partition(start_lba: u32, blocks: u32, readonly: bool) -> Self {
+            let device = Self::new((start_lba + blocks + 2) as usize, readonly);
             {
-                let mut all_sectors = device.sectors.lock();
-                let sector0 = &mut all_sectors[0];
-                sector0[FAT_SECTOR_SIZE - 2] = 0x55;
-                sector0[FAT_SECTOR_SIZE - 1] = 0xAA;
+                let mut all_blocks = device.blocks.lock();
+                let block0 = &mut all_blocks[0];
+                block0[TEST_BLOCK_SIZE - 2] = 0x55;
+                block0[TEST_BLOCK_SIZE - 1] = 0xAA;
                 let off = MBR_PARTITION_TABLE_OFFSET;
-                sector0[off + 4] = 0x83;
-                sector0[off + 8..off + 12].copy_from_slice(&start_lba.to_le_bytes());
-                sector0[off + 12..off + 16].copy_from_slice(&sectors.to_le_bytes());
+                block0[off + 4] = 0x83;
+                block0[off + 8..off + 12].copy_from_slice(&start_lba.to_le_bytes());
+                block0[off + 12..off + 16].copy_from_slice(&blocks.to_le_bytes());
             }
             device
         }
 
         fn with_fat_partition(
             start_lba: u32,
-            sectors: u32,
+            blocks: u32,
             volume_id: u32,
             readonly: bool,
         ) -> Self {
-            let device = Self::with_mbr_partition(start_lba, sectors, readonly);
+            let device = Self::with_mbr_partition(start_lba, blocks, readonly);
             {
-                let mut all_sectors = device.sectors.lock();
-                all_sectors[start_lba as usize] =
-                    fat_boot_sector(sectors as u16, FAT_SECTOR_SIZE as u16, volume_id);
+                let mut all_blocks = device.blocks.lock();
+                all_blocks[start_lba as usize] =
+                    fat_boot_sector(blocks as u16, TEST_BLOCK_SIZE as u16, volume_id);
             }
             device
+        }
+
+        fn with_fat_superfloppy(blocks: u32, volume_id: u32, readonly: bool) -> Self {
+            let device = Self::new(blocks as usize, readonly);
+            {
+                let mut all_blocks = device.blocks.lock();
+                all_blocks[0] = fat_boot_sector(blocks as u16, TEST_BLOCK_SIZE as u16, volume_id);
+            }
+            device
+        }
+    }
+
+    impl SharedBlockDevice for MockBlockDevice {
+        fn logical_block_size(&self) -> usize {
+            TEST_BLOCK_SIZE
+        }
+
+        fn block_count(&self) -> u64 {
+            self.blocks.lock().len() as u64
+        }
+
+        fn read_blocks(&mut self, lba: u64, out: &mut [u8]) -> IoResult<()> {
+            if out.is_empty() || out.len() % TEST_BLOCK_SIZE != 0 {
+                return Err(DiskIoError::InvalidInput);
+            }
+            let blocks = self.blocks.lock();
+            for (index, chunk) in out.chunks_exact_mut(TEST_BLOCK_SIZE).enumerate() {
+                let Some(data) = blocks.get(lba as usize + index) else {
+                    return Err(DiskIoError::InvalidInput);
+                };
+                chunk.copy_from_slice(data);
+            }
+            Ok(())
+        }
+
+        fn write_blocks(&mut self, lba: u64, input: &[u8]) -> IoResult<()> {
+            if input.is_empty() || input.len() % TEST_BLOCK_SIZE != 0 {
+                return Err(DiskIoError::InvalidInput);
+            }
+            if self.readonly {
+                return Err(DiskIoError::InvalidInput);
+            }
+            let mut blocks = self.blocks.lock();
+            for (index, chunk) in input.chunks_exact(TEST_BLOCK_SIZE).enumerate() {
+                let Some(data) = blocks.get_mut(lba as usize + index) else {
+                    return Err(DiskIoError::InvalidInput);
+                };
+                data.copy_from_slice(chunk);
+            }
+            Ok(())
+        }
+
+        fn flush(&mut self) -> IoResult<()> {
+            Ok(())
         }
     }
 
     impl BlockDeviceOps for MockBlockDevice {
         fn transport_kind(&self) -> BlockTransportKind {
             BlockTransportKind::Ahci
-        }
-
-        fn sector_count(&self) -> u64 {
-            self.sectors.lock().len() as u64
-        }
-
-        fn read_sector(&self, lba: u64, out: &mut [u8; FAT_SECTOR_SIZE]) -> IoResult<()> {
-            let sectors = self.sectors.lock();
-            let Some(data) = sectors.get(lba as usize) else {
-                return Err(DiskIoError::InvalidInput);
-            };
-            out.copy_from_slice(data);
-            Ok(())
-        }
-
-        fn write_sector(&self, lba: u64, input: &[u8; FAT_SECTOR_SIZE]) -> IoResult<()> {
-            if self.readonly {
-                return Err(DiskIoError::InvalidInput);
-            }
-            let mut sectors = self.sectors.lock();
-            let Some(data) = sectors.get_mut(lba as usize) else {
-                return Err(DiskIoError::InvalidInput);
-            };
-            data.copy_from_slice(input);
-            Ok(())
-        }
-
-        fn flush(&self) -> IoResult<()> {
-            Ok(())
         }
 
         fn readonly(&self) -> bool {
@@ -796,25 +922,25 @@ mod tests {
     }
 
     fn fat_boot_sector(
-        total_sectors: u16,
+        total_blocks: u16,
         bytes_per_sector: u16,
         volume_id: u32,
-    ) -> [u8; FAT_SECTOR_SIZE] {
-        let mut sector = [0_u8; FAT_SECTOR_SIZE];
-        sector[0] = 0xEB;
-        sector[2] = 0x90;
-        sector[11..13].copy_from_slice(&bytes_per_sector.to_le_bytes());
-        sector[13] = 1;
-        sector[14..16].copy_from_slice(&1_u16.to_le_bytes());
-        sector[16] = 2;
-        sector[17..19].copy_from_slice(&32_u16.to_le_bytes());
-        sector[19..21].copy_from_slice(&total_sectors.to_le_bytes());
-        sector[21] = 0xF8;
-        sector[22..24].copy_from_slice(&1_u16.to_le_bytes());
-        sector[39..43].copy_from_slice(&volume_id.to_le_bytes());
-        sector[510] = 0x55;
-        sector[511] = 0xAA;
-        sector
+    ) -> [u8; TEST_BLOCK_SIZE] {
+        let mut block = [0_u8; TEST_BLOCK_SIZE];
+        block[0] = 0xEB;
+        block[2] = 0x90;
+        block[11..13].copy_from_slice(&bytes_per_sector.to_le_bytes());
+        block[13] = 1;
+        block[14..16].copy_from_slice(&1_u16.to_le_bytes());
+        block[16] = 2;
+        block[17..19].copy_from_slice(&32_u16.to_le_bytes());
+        block[19..21].copy_from_slice(&total_blocks.to_le_bytes());
+        block[21] = 0xF8;
+        block[22..24].copy_from_slice(&1_u16.to_le_bytes());
+        block[39..43].copy_from_slice(&volume_id.to_le_bytes());
+        block[510] = 0x55;
+        block[511] = 0xAA;
+        block
     }
 
     #[test]
@@ -822,7 +948,7 @@ mod tests {
         let _guard = TEST_LOCK.lock();
         reset_for_tests();
 
-        register_root_device(Arc::new(MockBlockDevice::with_mbr_partition(1, 3, false)));
+        register_root_device(Box::new(MockBlockDevice::with_mbr_partition(1, 3, false)));
 
         let descriptors = descriptors();
         assert_eq!(descriptors.len(), 2);
@@ -835,21 +961,21 @@ mod tests {
         let _guard = TEST_LOCK.lock();
         reset_for_tests();
 
-        register_root_device(Arc::new(MockBlockDevice::with_mbr_partition(2, 2, false)));
+        register_root_device(Box::new(MockBlockDevice::with_mbr_partition(2, 2, false)));
 
         let root = lookup("/dev/block0").expect("root block device");
         let partition = lookup("/dev/block0p1").expect("partition block device");
 
-        let mut sector = [0_u8; FAT_SECTOR_SIZE];
+        let mut sector = [0_u8; TEST_BLOCK_SIZE];
         sector[0] = 0xAA;
-        sector[FAT_SECTOR_SIZE - 1] = 0x55;
-        write_sector(partition, 0, &sector).expect("partition write");
+        sector[TEST_BLOCK_SIZE - 1] = 0x55;
+        write_cached_block(partition.id(), 0, &sector).expect("partition write");
         flush(partition).expect("flush partition");
 
-        let mut root_sector = [0_u8; FAT_SECTOR_SIZE];
-        read_sector(root, 2, &mut root_sector).expect("read parent sector");
+        let mut root_sector = [0_u8; TEST_BLOCK_SIZE];
+        read_cached_block(root.id(), 2, &mut root_sector).expect("read parent block");
         assert_eq!(root_sector, sector);
-        assert_eq!(cache_lookup(root.id(), 2), Some(sector));
+        assert_eq!(cache_lookup(root.id(), 2), Some(sector.to_vec()));
     }
 
     #[test]
@@ -857,7 +983,7 @@ mod tests {
         let _guard = TEST_LOCK.lock();
         reset_for_tests();
 
-        register_root_device(Arc::new(MockBlockDevice::with_mbr_partition(1, 2, true)));
+        register_root_device(Box::new(MockBlockDevice::with_mbr_partition(1, 2, true)));
         let descriptors = descriptors();
         assert!(descriptors.iter().all(|descriptor| descriptor.readonly));
     }
@@ -870,7 +996,7 @@ mod tests {
         let start_lba = 8;
         let sectors = 16;
         let volume_id = 0xCAFE_BABE;
-        register_root_device(Arc::new(MockBlockDevice::with_fat_partition(
+        register_root_device(Box::new(MockBlockDevice::with_fat_partition(
             start_lba, sectors, volume_id, false,
         )));
 
@@ -890,5 +1016,45 @@ mod tests {
             open_physical_boot_block_device(mismatched),
             Err(fatfs::Error::Io(DiskIoError::NotPresent))
         ));
+    }
+
+    #[test]
+    fn physical_boot_opener_matches_superfloppy_identity() {
+        let _guard = TEST_LOCK.lock();
+        reset_for_tests();
+
+        let sectors = 32;
+        let volume_id = 0xABCD_1234;
+        register_root_device(Box::new(MockBlockDevice::with_fat_superfloppy(
+            sectors, volume_id, false,
+        )));
+
+        let identity = BootVolumeIdentity {
+            fat_volume_id: volume_id,
+            _reserved0: 0,
+            volume_start_lba: 0,
+            volume_sector_count: sectors as u64,
+        };
+
+        assert!(open_physical_boot_block_device(identity).is_ok());
+    }
+
+    #[test]
+    fn boot_opener_returns_detected_partition_extent() {
+        let _guard = TEST_LOCK.lock();
+        reset_for_tests();
+
+        let start_lba = 8;
+        let sectors = 16;
+        register_root_device(Box::new(MockBlockDevice::with_fat_partition(
+            start_lba,
+            sectors,
+            0x1111_2222,
+            false,
+        )));
+
+        let device = open_boot_block_device().expect("open detected FAT device");
+        assert_eq!(device.logical_block_size(), TEST_BLOCK_SIZE);
+        assert_eq!(device.block_count(), sectors as u64);
     }
 }

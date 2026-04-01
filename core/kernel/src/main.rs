@@ -30,7 +30,7 @@ use crate::io::{console, gui, tty};
 #[cfg(not(test))]
 use crate::memory::{heap, paging, phys};
 #[cfg(not(test))]
-use crate::storage::fat;
+use crate::storage::boot_volume;
 #[cfg(not(test))]
 use crate::user::{demo, syscall};
 #[cfg(not(test))]
@@ -38,17 +38,19 @@ use crate::util::random;
 #[cfg(not(test))]
 use boot_protocol::BootInfo;
 #[cfg(not(test))]
+use boot_protocol::BootVolumeTransport;
+#[cfg(not(test))]
 use driver_abi::DriverClass;
 
 #[cfg(not(test))]
-fn announce_ready(name: &str, console_line: &[u8]) {
-    debug::println!("{name} initialized.");
+fn announce_ready(_name: &str, console_line: &[u8]) {
+    debug::println!("{_name} initialized.");
     console::write(console_line);
 }
 
 #[cfg(not(test))]
 fn init(boot_info_ptr: *const BootInfo) {
-    let boot_info = unsafe { &*boot_info_ptr };
+    let _boot_info = unsafe { &*boot_info_ptr };
     gui::init(boot_info_ptr);
     debug::println!(
         "RUST OS loaded in higher half: rip={:#x}",
@@ -68,33 +70,35 @@ fn init(boot_info_ptr: *const BootInfo) {
     simd::init();
     debug::println!("SIMD initialized ({}).", simd::mode_name());
 
-    fat::init_boot_info(boot_info_ptr);
-    debug::println!(
-        "boot manifest: entries={} total_bytes={} flags={:#x}",
-        boot_info.boot_files.entry_count,
-        boot_info.boot_files.total_bytes,
-        boot_info.boot_files.flags
-    );
-    match fat::boot_volume_identity() {
-        Some(identity) => debug::println!(
-            "boot volume identity: serial={:#010x} start_lba={} sectors={}",
-            identity.fat_volume_id,
-            identity.volume_start_lba,
-            identity.volume_sector_count
+    boot_volume::init_boot_info(boot_info_ptr);
+    let transport_hint =
+        boot_volume::boot_volume_transport_hint().unwrap_or(BootVolumeTransport::Unknown);
+    match boot_volume::boot_volume_identity() {
+        Some(_identity) => debug::println!(
+            "boot volume identity: transport={:?} serial={:#010x} start_lba={} sectors={}",
+            _identity.transport(),
+            _identity.fat_volume_id,
+            _identity.volume_start_lba,
+            _identity.volume_sector_count
+        ),
+        None if transport_hint != BootVolumeTransport::Unknown => debug::println!(
+            "boot volume identity: unavailable, transport hint={:?}",
+            transport_hint
         ),
         None => debug::println!("boot volume identity: unavailable"),
     }
     crate::storage::block::register_boot_volume_opener();
     crate::storage::block::init();
-    for descriptor in crate::storage::block::descriptors() {
+    for _descriptor in crate::storage::block::descriptors() {
         debug::println!(
-            "storage descriptor: id={} path={} transport={:?} readonly={} start_lba={} sectors={}",
-            descriptor.id,
-            descriptor.path,
-            descriptor.transport,
-            descriptor.readonly,
-            descriptor.start_lba,
-            descriptor.sector_count
+            "storage descriptor: id={} path={} transport={:?} readonly={} block_size={} start_block={} blocks={}",
+            _descriptor.id,
+            _descriptor.path,
+            _descriptor.transport,
+            _descriptor.readonly,
+            _descriptor.logical_block_size,
+            _descriptor.start_block,
+            _descriptor.block_count
         );
     }
     driver::linux::init_cpu_local_symbols();
@@ -108,11 +112,11 @@ fn init(boot_info_ptr: *const BootInfo) {
     vfs::init();
     debug::println!("init stage: vfs::init done");
     debug::println!("init stage: driver registry load begin");
-    let registered_driver_count =
+    let _registered_driver_count =
         generated_registry::register_loadable_drivers().unwrap_or_else(|error| panic!("{error}"));
     debug::println!(
         "init stage: driver registry load done (registered={})",
-        registered_driver_count
+        _registered_driver_count
     );
     announce_ready("GUI", b"GUI initialized.\r\n");
     announce_ready("Heap", b"Heap initialized.\r\n");

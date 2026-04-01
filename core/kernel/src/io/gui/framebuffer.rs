@@ -28,6 +28,7 @@ pub(crate) struct FramebufferRect {
 }
 
 impl FramebufferRect {
+    #[allow(dead_code)]
     pub(crate) const fn empty() -> Self {
         Self {
             x: 0,

@@ -4,7 +4,7 @@ use driver_abi::DriverBus;
 use spin::Mutex;
 
 use super::emulation;
-use super::host::UsbHostControllerInfo;
+use super::host::{controller_kind_name, UsbHostControllerInfo};
 use super::xhci;
 const USB_SERVICE_ROUNDS: usize = 4;
 
@@ -32,6 +32,7 @@ impl UsbSubsystemState {
 
 static USB_STATE: Mutex<UsbSubsystemState> = Mutex::new(UsbSubsystemState::new());
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 pub(crate) fn init() {
     emulation::prepare();
     let found_xhci = scan_host_controllers();
@@ -89,6 +90,7 @@ pub(crate) fn host_controllers() -> Vec<UsbHostControllerInfo> {
     USB_STATE.lock().controllers.clone()
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 fn scan_host_controllers() -> bool {
     let mut controllers = Vec::new();
     let mut found_xhci = false;

@@ -29,6 +29,14 @@ pub(super) struct WindowsProcessImageInfo {
     pub entry_point: u64,
     pub runtime_base_hint: u64,
     pub loaded_modules: alloc::vec::Vec<WindowsLoadedModule>,
+    pub loaded_module_images: alloc::vec::Vec<WindowsLoadedModuleImage>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct WindowsLoadedModuleImage {
+    image: alloc::vec::Vec<u8>,
+    pe: pe::PeImage,
+    export_cache: Option<exports::ExportCache>,
 }
 
 pub(super) fn load_pe(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadError> {
@@ -95,6 +103,7 @@ pub(super) fn initialize_windows_runtime(
         address_space,
         &initialized.runtime,
         image.loaded_modules.as_slice(),
+        image.loaded_module_images.as_slice(),
     )?;
     Ok(initialized)
 }

@@ -127,6 +127,7 @@ pub(crate) unsafe fn connect_driver(
     }
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code))]
 pub(crate) fn driver_name(driver: *mut LinuxCompatSerioDriver) -> &'static str {
     if driver.is_null() {
         return "invalid";

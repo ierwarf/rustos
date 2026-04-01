@@ -278,6 +278,8 @@ impl Scheduler {
             .err()
     }
 
+    // This validator is retained as a standalone probe for future scheduler self-tests.
+    #[allow(dead_code)]
     fn validate_context_slot(&self, slot: usize) -> Result<TaskContext, &'static str> {
         let context = self.contexts[slot].ok_or("task context is missing")?;
         if self.is_bootstrap_context_placeholder(slot, context) {
@@ -526,6 +528,7 @@ impl Scheduler {
         None
     }
 
+    #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
     pub(super) fn allocate_user_thread_slot(
         &mut self,
         id: u64,
@@ -742,6 +745,8 @@ impl Scheduler {
         (bootstrap.saved_rsp, bootstrap.pit_divisor)
     }
 
+    // Kernel-thread start metadata is kept for upcoming worker-thread instrumentation.
+    #[allow(dead_code)]
     pub(super) fn current_task_start(&self) -> Option<TaskStart> {
         self.starts[self.current_task].filter(|_| {
             self.contexts[self.current_task]
@@ -921,6 +926,8 @@ impl Scheduler {
         Some(f(id, abi, process_state))
     }
 
+    // Windows thread state mutation is a staged API even before more callers land.
+    #[allow(dead_code)]
     pub(super) fn with_current_user_windows_thread_state_mut<R>(
         &mut self,
         f: impl FnOnce(u64, &mut WindowsThreadRuntimeState) -> R,
@@ -1074,6 +1081,7 @@ impl Scheduler {
         (slots, count)
     }
 
+    #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
     fn try_grow_current_user_stack_on_fault(
         &mut self,
         vector: u8,
@@ -1175,6 +1183,7 @@ impl Scheduler {
         UserFaultDisposition::Retired
     }
 
+    #[allow(dead_code)]
     pub(super) fn current_last_error(&self) -> u32 {
         self.last_errors[self.current_task]
     }
@@ -1273,6 +1282,7 @@ impl Scheduler {
         }
     }
 
+    #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
     fn log_retired_slot(&self, slot: usize, context: TaskContext) {
         let id = self.starts[slot]
             .map(|start| start.id)

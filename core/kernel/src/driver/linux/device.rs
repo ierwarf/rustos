@@ -2,7 +2,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ffi::{c_char, c_void};
 use core::ptr;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use spin::Mutex;
 
@@ -45,7 +45,6 @@ static I2C_BUS_TYPE: [u8; 64] = [0; 64];
 static I2C_ADAPTER_TYPE: [u8; 64] = [0; 64];
 static I2C_CLIENT_TYPE: [u8; 64] = [0; 64];
 static NEXT_HANDLE_ID: AtomicUsize = AtomicUsize::new(1);
-static NEXT_CHRDEV: AtomicU32 = AtomicU32::new(0x200);
 static REGISTERED_BUSES: Mutex<Vec<RegisteredBus>> = Mutex::new(Vec::new());
 static REGISTERED_CLASSES: Mutex<Vec<RegisteredClass>> = Mutex::new(Vec::new());
 static REGISTERED_DRIVERS: Mutex<Vec<RegisteredDriver>> = Mutex::new(Vec::new());

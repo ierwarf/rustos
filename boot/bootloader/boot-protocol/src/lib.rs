@@ -1,8 +1,7 @@
 #![no_std]
 
 pub const BOOT_INFO_MAGIC: u64 = 0x5255_5354_4F53_4749; // "RUSTOSGI"
-pub const BOOT_INFO_VERSION: u32 = 9;
-pub const BOOT_FILE_MANIFEST_TRUNCATED: u32 = 1 << 0;
+pub const BOOT_INFO_VERSION: u32 = 11;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,36 +25,6 @@ pub struct FramebufferInfo {
     pub pixel_format: BootPixelFormat,
     pub bytes_per_pixel: u8,
     pub _reserved: [u8; 3],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct BootFileEntry {
-    pub path_ptr: u64,
-    pub path_len: u32,
-    pub _reserved0: u32,
-    pub data_ptr: u64,
-    pub data_len: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct BootFileManifest {
-    pub entries_ptr: u64,
-    pub entry_count: u32,
-    pub flags: u32,
-    pub total_bytes: u64,
-}
-
-impl BootFileManifest {
-    pub const fn empty() -> Self {
-        Self {
-            entries_ptr: 0,
-            entry_count: 0,
-            flags: 0,
-            total_bytes: 0,
-        }
-    }
 }
 
 #[repr(u32)]
@@ -105,6 +74,27 @@ pub struct BootVolumeIdentity {
     pub volume_sector_count: u64,
 }
 
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BootVolumeTransport {
+    #[default]
+    Unknown = 0,
+    Ahci = 1,
+    Nvme = 2,
+    Usb = 3,
+}
+
+impl BootVolumeTransport {
+    pub const fn from_raw(value: u32) -> Self {
+        match value {
+            1 => Self::Ahci,
+            2 => Self::Nvme,
+            3 => Self::Usb,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 impl BootVolumeIdentity {
     pub const fn empty() -> Self {
         Self {
@@ -117,6 +107,15 @@ impl BootVolumeIdentity {
 
     pub const fn is_present(&self) -> bool {
         self.fat_volume_id != 0 || self.volume_start_lba != 0 || self.volume_sector_count != 0
+    }
+
+    pub const fn transport(self) -> BootVolumeTransport {
+        BootVolumeTransport::from_raw(self._reserved0)
+    }
+
+    pub const fn with_transport(mut self, transport: BootVolumeTransport) -> Self {
+        self._reserved0 = transport as u32;
+        self
     }
 }
 
@@ -131,5 +130,4 @@ pub struct BootInfo {
     pub boot_volume: BootVolumeIdentity,
     pub framebuffer: FramebufferInfo,
     pub memory_map: BootMemoryMap,
-    pub boot_files: BootFileManifest,
 }

@@ -79,13 +79,6 @@ pub(crate) fn build(config: &Config) -> Result<()> {
         &config.vendor_usbhid_ko,
         &config.image_usbhid_ko,
     );
-    if config.boot_file_list.is_file() {
-        println!(
-            "Boot file manifest ready: {}",
-            config.boot_file_list.display()
-        );
-    }
-
     Ok(())
 }
 

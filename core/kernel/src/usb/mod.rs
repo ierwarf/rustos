@@ -19,6 +19,8 @@ pub(crate) fn service_pending() -> usize {
     manager::service_pending()
 }
 
+// Kept as a stable inspection hook for upcoming USB storage and diagnostics work.
+#[allow(dead_code)]
 pub(crate) fn host_controllers() -> Vec<UsbHostControllerInfo> {
     manager::host_controllers()
 }
@@ -41,6 +43,8 @@ pub(crate) fn register_owned_interface(
     core::register_owned_interface(registration)
 }
 
+// Hot-unplug support is staged but not yet wired into the current runtime path.
+#[allow(dead_code)]
 pub(crate) fn unregister_owned_interface(
     interface: *mut crate::driver::linux::compat::LinuxCompatUsbInterface,
 ) -> bool {

@@ -64,7 +64,11 @@ pub fn tick_console_cursor() {}
 pub fn init(boot_info_ptr: *const BootInfo) {
     let boot_info = boot_info_from_ptr(boot_info_ptr);
     let mut console = EMERGENCY_CONSOLE.lock();
-    console.start_live_session();
+    if emergency_console_live_output_enabled() {
+        console.start_live_session();
+    } else {
+        console.deactivate_live_session();
+    }
     drop(console);
 
     if backend::install_boot_framebuffer(boot_info.framebuffer) {
@@ -218,6 +222,7 @@ fn finish_userspace_display_transition() {
     }
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code))]
 pub(crate) fn write_debug_bytes(bytes: &[u8]) {
     let _ = write_emergency_console(bytes, EmergencyWriteMode::Live);
 }
@@ -262,6 +267,10 @@ fn disable_emergency_console_live_output() {
     if let Some(mut console) = EMERGENCY_CONSOLE.try_lock() {
         console.deactivate_live_session();
     }
+}
+
+const fn emergency_console_live_output_enabled() -> bool {
+    cfg!(rustos_debug_print_enabled)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

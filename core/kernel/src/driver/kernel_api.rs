@@ -41,22 +41,22 @@ unsafe extern "C" fn driver_log(level: u32, message_ptr: *const u8, message_len:
     }
 
     let bytes = unsafe { slice::from_raw_parts(message_ptr, message_len as usize) };
-    let Ok(message) = str::from_utf8(bytes) else {
+    let Ok(_message) = str::from_utf8(bytes) else {
         return -22;
     };
 
     match level {
         value if value == DriverLogLevel::Error as u32 => {
-            crate::debug::println!("driver[error]: {}", message);
+            crate::debug::println!("driver[error]: {}", _message);
         }
         value if value == DriverLogLevel::Warn as u32 => {
-            crate::debug::println!("driver[warn]: {}", message);
+            crate::debug::println!("driver[warn]: {}", _message);
         }
         value if value == DriverLogLevel::Info as u32 => {
-            crate::debug::println!("driver[info]: {}", message);
+            crate::debug::println!("driver[info]: {}", _message);
         }
         value if value == DriverLogLevel::Debug as u32 => {
-            crate::debug::println!("driver[debug]: {}", message);
+            crate::debug::println!("driver[debug]: {}", _message);
         }
         _ => return -22,
     }
@@ -282,7 +282,7 @@ unsafe extern "C" fn driver_query_boot_framebuffer(
     if out_info.is_null() {
         return -14;
     }
-    let Some(info) = crate::storage::fat::boot_framebuffer_info() else {
+    let Some(info) = crate::storage::boot_volume::boot_framebuffer_info() else {
         return -19;
     };
 

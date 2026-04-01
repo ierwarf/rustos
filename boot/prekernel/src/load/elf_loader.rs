@@ -8,7 +8,7 @@ use object::elf::{
 };
 use object::{FileKind, LittleEndian};
 
-use crate::fat::DiskIoError;
+use crate::storage::DiskIoError;
 
 const ELF64_HEADER_SIZE: usize = 64;
 const ELF64_PROGRAM_HEADER_SIZE: usize = 56;

@@ -29,6 +29,7 @@ const MMIO_WRITE_COMBINE_FLAGS: PageTableFlags = WRITE_COMBINE_BIT;
 #[derive(Clone, Copy)]
 struct MmioWindowSlot {
     phys_block: u64,
+    #[allow(dead_code)]
     flags_bits: u64,
 }
 
@@ -257,6 +258,8 @@ pub fn load_address_space_phys(root_phys: PhysAddr) {
     });
 }
 
+// Kept as explicit arch hooks even when current callers go through higher-level paging wrappers.
+#[allow(dead_code)]
 pub fn load_kernel_address_space() {
     load_address_space_phys(kernel_root_phys());
 }
@@ -308,10 +311,12 @@ pub fn unmap_mmio_range(virt_addr: u64, size: usize) -> bool {
     })
 }
 
+#[allow(dead_code)]
 pub fn mmio_addr(phys_addr: u64) -> Option<u64> {
     map_mmio_range(phys_addr, 1)
 }
 
+#[allow(dead_code)]
 pub fn mmio_addr_wc(phys_addr: u64) -> Option<u64> {
     map_mmio_range_wc(phys_addr, 1)
 }

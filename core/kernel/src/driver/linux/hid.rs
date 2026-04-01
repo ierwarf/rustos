@@ -563,14 +563,14 @@ fn bind_device_to_driver(dev: *mut LinuxCompatHidDevice, driver: *mut LinuxCompa
     let Some(id) = match_id(dev, unsafe { (*driver).id_table }) else {
         return -19;
     };
-    let driver_name = unsafe { compat_cstr((*driver).name).unwrap_or("invalid") };
+    let _driver_name = unsafe { compat_cstr((*driver).name).unwrap_or("invalid") };
     unsafe {
         (*dev).driver = driver;
         (*dev).dev.driver = &mut (*driver).driver;
     }
     crate::debug::println!(
         "hid bind probe begin: driver={} dev={:#x} vendor={:04x} product={:04x}",
-        driver_name,
+        _driver_name,
         dev as usize,
         unsafe { (*dev).vendor },
         unsafe { (*dev).product }
@@ -582,7 +582,7 @@ fn bind_device_to_driver(dev: *mut LinuxCompatHidDevice, driver: *mut LinuxCompa
     };
     crate::debug::println!(
         "hid bind probe end: driver={} dev={:#x} status={}",
-        driver_name,
+        _driver_name,
         dev as usize,
         status
     );
@@ -592,12 +592,12 @@ fn bind_device_to_driver(dev: *mut LinuxCompatHidDevice, driver: *mut LinuxCompa
             (*dev).dev.driver = ptr::null_mut();
         }
     } else {
-        let open_status = unsafe { hid_hw_open(dev) };
+        let _open_status = unsafe { hid_hw_open(dev) };
         crate::debug::println!(
             "hid bind auto-open: driver={} dev={:#x} status={}",
-            driver_name,
+            _driver_name,
             dev as usize,
-            open_status
+            _open_status
         );
     }
     status
@@ -912,6 +912,7 @@ fn ensure_report(
     report_ptr
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code))]
 fn report_count(dev: *mut LinuxCompatHidDevice, report_type: u32) -> usize {
     if dev.is_null() || report_type as usize >= HID_REPORT_TYPE_COUNT {
         return 0;

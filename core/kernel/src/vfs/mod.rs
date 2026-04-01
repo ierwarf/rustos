@@ -38,14 +38,21 @@ pub(crate) fn init() {
     let _ = mount_internal("/dev", "devfs", MountSource::None, 0, None, true);
     crate::debug::println!("vfs: mount /dev done");
     crate::debug::println!("vfs: mount / begin");
-    let _ = mount_internal(
-        "/",
-        "fat",
-        MountSource::BootVolume,
-        crate::user::linux::MS_RDONLY,
-        None,
-        true,
-    );
+    match block::current_boot_volume_handle() {
+        Some(handle) => {
+            if let Err(error) = mount_internal(
+                "/",
+                "fat",
+                MountSource::BlockDevice(handle),
+                crate::user::linux::MS_RDONLY,
+                Some("access=boot"),
+                true,
+            ) {
+                crate::debug::println!("vfs: mount / failed: {:?}", error);
+            }
+        }
+        None => crate::debug::println!("vfs: mount / skipped: no boot volume block handle"),
+    }
     crate::debug::println!("vfs: mount / done");
 }
 
@@ -170,7 +177,6 @@ fn mount_internal(
         path: String::from(path),
         backend,
         filesystem_type: String::from(filesystem_type),
-        flags,
         pinned,
     });
     Ok(())
@@ -464,7 +470,6 @@ pub(crate) trait VfsBackend: Send + Sync {
 #[derive(Clone, Copy)]
 pub(crate) enum MountSource {
     None,
-    BootVolume,
     BlockDevice(block::BlockDeviceHandle),
 }
 
@@ -545,13 +550,14 @@ struct VfsMount {
     path: String,
     backend: Arc<dyn VfsBackend>,
     filesystem_type: String,
-    flags: u64,
     pinned: bool,
 }
 
 struct ResolvedMount {
     backend: Arc<dyn VfsBackend>,
+    #[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code))]
     mount_path: String,
+    #[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code))]
     filesystem_type: String,
     relative_path: String,
 }

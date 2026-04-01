@@ -85,6 +85,8 @@ pub(crate) enum SyntheticHidKind {
 }
 
 #[derive(Clone, Copy)]
+// Retained as a full synthetic-HID descriptor bundle for future transport-backed injection.
+#[allow(dead_code)]
 pub(crate) struct SyntheticHidDescriptors {
     pub(crate) endpoint_address: u8,
     pub(crate) max_packet_size: u16,

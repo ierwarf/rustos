@@ -5,6 +5,7 @@ const SECONDARY_FUTEX_DEBUG_LIMIT: usize = 128;
 
 static SECONDARY_FUTEX_DEBUG_LOGS: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 fn debug_log_secondary_futex(message: impl FnOnce() -> alloc::string::String) {
     if multitask::current_console_session().is_system() {
         return;

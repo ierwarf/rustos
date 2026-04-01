@@ -146,8 +146,8 @@ fn report_keyboard_transport(result: i8042::KeyboardTransportInitResult) {
             );
             crate::io::console::write(b"PS/2 keyboard transport ready.\r\n");
         }
-        i8042::KeyboardTransportInitResult::Unavailable(reason) => {
-            crate::debug::println!("PS/2 keyboard transport unavailable: {}", reason);
+        i8042::KeyboardTransportInitResult::Unavailable(_reason) => {
+            crate::debug::println!("PS/2 keyboard transport unavailable: {}", _reason);
             crate::io::console::write(b"PS/2 keyboard transport unavailable.\r\n");
         }
     }
@@ -155,18 +155,18 @@ fn report_keyboard_transport(result: i8042::KeyboardTransportInitResult) {
 
 fn report_aux_transport(result: i8042::AuxTransportInitResult) {
     match result {
-        i8042::AuxTransportInitResult::Ready(info) => {
+        i8042::AuxTransportInitResult::Ready(_info) => {
             crate::debug::println!(
                 "PS/2 aux serio port ready: configured={}, port_test={}",
-                info.controller_configured,
-                info.second_port_test_passed,
+                _info.controller_configured,
+                _info.second_port_test_passed,
             );
             if !crate::io::gui::is_userspace_display_active() {
                 crate::io::console::write(b"PS/2 aux serio port ready.\r\n");
             }
         }
-        i8042::AuxTransportInitResult::Unavailable(reason) => {
-            crate::debug::println!("PS/2 aux serio port unavailable: {}", reason);
+        i8042::AuxTransportInitResult::Unavailable(_reason) => {
+            crate::debug::println!("PS/2 aux serio port unavailable: {}", _reason);
             if !crate::io::gui::is_userspace_display_active() {
                 crate::io::console::write(b"PS/2 aux serio port unavailable.\r\n");
             }

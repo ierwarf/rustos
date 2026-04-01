@@ -38,6 +38,7 @@ impl ConsoleSessionHandle {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) const fn generation(self) -> u32 {
         (self.0 >> 32) as u32
     }
@@ -63,6 +64,9 @@ pub(crate) enum ConsoleSessionState {
     Closing = 5,
 }
 
+// This is copied into the console device ABI and therefore intentionally keeps fields that the
+// kernel itself does not read back.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ConsoleSessionInfo {
     pub(crate) handle: ConsoleSessionHandle,

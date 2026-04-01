@@ -614,15 +614,6 @@ fn new_handle() -> *mut c_void {
     Box::into_raw(Box::new(NEXT_HANDLE_ID.fetch_add(1, Ordering::Relaxed))) as *mut c_void
 }
 
-fn semaphore_state(key: usize) -> isize {
-    let mut semaphores = SEMAPHORES.lock();
-    if let Some(existing) = semaphores.iter().find(|existing| existing.key == key) {
-        return existing.count;
-    }
-    semaphores.push(SemaphoreState { key, count: 1 });
-    1
-}
-
 fn take_semaphore(sem: *mut c_void) -> bool {
     let Some(key) = ptr_key(sem) else {
         return false;

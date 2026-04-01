@@ -94,18 +94,36 @@ impl PhysAllocatorState {
     }
 
     fn alloc_contiguous_locked(&mut self, page_count: usize) -> Option<PhysAddr> {
+        self.alloc_contiguous_bounded_locked(page_count, self.frame_count)
+    }
+
+    fn alloc_contiguous_bounded_locked(
+        &mut self,
+        page_count: usize,
+        max_frame_exclusive: usize,
+    ) -> Option<PhysAddr> {
         if !self.initialized || page_count == 0 || page_count > self.free_frames {
             return None;
         }
-        if page_count > self.frame_count {
+        let bounded_frame_count = self.frame_count.min(max_frame_exclusive);
+        if page_count > bounded_frame_count {
             return None;
         }
 
-        let limit = self.frame_count.checked_sub(page_count)?.saturating_add(1);
-        let start_hint = self.next_hint.min(limit.saturating_sub(1));
+        let last_start_exclusive = bounded_frame_count
+            .checked_sub(page_count)?
+            .saturating_add(1);
+        let start_hint = self.next_hint.min(last_start_exclusive.saturating_sub(1));
 
-        self.find_contiguous_free_range(start_hint, limit, page_count)
-            .or_else(|| self.find_contiguous_free_range(0, start_hint, page_count))
+        self.find_contiguous_free_range(
+            start_hint,
+            last_start_exclusive,
+            page_count,
+            bounded_frame_count,
+        )
+        .or_else(|| {
+            self.find_contiguous_free_range(0, start_hint, page_count, bounded_frame_count)
+        })
             .map(|start_frame| {
                 self.mark_range_used(start_frame, page_count);
                 self.free_frames = self.free_frames.saturating_sub(page_count);
@@ -119,6 +137,7 @@ impl PhysAllocatorState {
         start: usize,
         end: usize,
         page_count: usize,
+        max_frame_exclusive: usize,
     ) -> Option<usize> {
         if start >= end || page_count == 0 {
             return None;
@@ -132,7 +151,10 @@ impl PhysAllocatorState {
             }
 
             let mut run_len = 1usize;
-            while run_len < page_count && frame + run_len < end && !self.is_used(frame + run_len) {
+            while run_len < page_count
+                && frame + run_len < max_frame_exclusive
+                && !self.is_used(frame + run_len)
+            {
                 run_len += 1;
             }
 
@@ -250,6 +272,17 @@ pub fn alloc_contiguous(page_count: usize) -> Option<PhysAddr> {
     interrupts::without_interrupts(|| PHYS_ALLOCATOR.lock().alloc_contiguous_locked(page_count))
 }
 
+pub fn alloc_contiguous_below(page_count: usize, max_phys_addr_inclusive: u64) -> Option<PhysAddr> {
+    interrupts::without_interrupts(|| {
+        let mut state = PHYS_ALLOCATOR.lock();
+        let Some(max_end_exclusive) = max_phys_addr_inclusive.checked_add(1) else {
+            return state.alloc_contiguous_locked(page_count);
+        };
+        let max_frame_exclusive = usize::try_from(max_end_exclusive / PAGE_SIZE).unwrap_or(usize::MAX);
+        state.alloc_contiguous_bounded_locked(page_count, max_frame_exclusive)
+    })
+}
+
 pub fn free_frame(phys: PhysAddr) {
     interrupts::without_interrupts(|| PHYS_ALLOCATOR.lock().free_frame_locked(phys));
 }
@@ -258,6 +291,7 @@ pub fn usable_bytes() -> u64 {
     interrupts::without_interrupts(|| PHYS_ALLOCATOR.lock().usable_frames as u64 * PAGE_SIZE)
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code))]
 pub fn free_bytes() -> u64 {
     interrupts::without_interrupts(|| PHYS_ALLOCATOR.lock().free_frames as u64 * PAGE_SIZE)
 }
@@ -393,5 +427,67 @@ mod tests {
         state.free_frame_locked(first);
         let reused = state.alloc_contiguous_locked(1).unwrap();
         assert_eq!(reused.as_u64(), 0);
+    }
+
+    #[test]
+    fn bounded_allocator_stays_under_limit() {
+        let mut bitmap = [u64::MAX; 1];
+        let regions = [BootMemoryRegion {
+            phys_start: 0,
+            page_count: 8,
+            kind: BootMemoryKind::Usable,
+            _reserved0: 0,
+        }];
+
+        let mut state = PhysAllocatorState {
+            initialized: true,
+            bitmap_ptr: bitmap.as_mut_ptr(),
+            bitmap_words: 1,
+            frame_count: 8,
+            usable_frames: 8,
+            free_frames: 8,
+            next_hint: 6,
+            memory_map_ptr: regions.as_ptr(),
+            memory_map_count: regions.len(),
+            bitmap_phys_start: 0,
+            bitmap_page_count: 0,
+        };
+        state.mark_range_free(0, 8);
+
+        let allocated = state
+            .alloc_contiguous_bounded_locked(2, 4)
+            .expect("bounded allocation should succeed");
+        assert_eq!(allocated.as_u64(), PAGE_SIZE * 2);
+    }
+
+    #[test]
+    fn allocator_can_use_last_possible_contiguous_block() {
+        let mut bitmap = [u64::MAX; 1];
+        let regions = [BootMemoryRegion {
+            phys_start: 0,
+            page_count: 8,
+            kind: BootMemoryKind::Usable,
+            _reserved0: 0,
+        }];
+
+        let mut state = PhysAllocatorState {
+            initialized: true,
+            bitmap_ptr: bitmap.as_mut_ptr(),
+            bitmap_words: 1,
+            frame_count: 8,
+            usable_frames: 8,
+            free_frames: 8,
+            next_hint: 6,
+            memory_map_ptr: regions.as_ptr(),
+            memory_map_count: regions.len(),
+            bitmap_phys_start: 0,
+            bitmap_page_count: 0,
+        };
+        state.mark_range_free(0, 8);
+
+        let allocated = state
+            .alloc_contiguous_locked(2)
+            .expect("allocator should use the last valid contiguous range");
+        assert_eq!(allocated.as_u64(), PAGE_SIZE * 6);
     }
 }

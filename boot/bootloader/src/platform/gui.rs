@@ -6,8 +6,8 @@ use uefi::system;
 use uefi::table::cfg::ConfigTableEntry;
 
 use crate::boot_info::{
-    BootFileManifest, BootInfo, BootMemoryMap, BootPixelFormat, BootVolumeIdentity,
-    FramebufferInfo, BOOT_INFO_MAGIC, BOOT_INFO_VERSION,
+    BootInfo, BootMemoryMap, BootPixelFormat, BootVolumeIdentity, FramebufferInfo,
+    BOOT_INFO_MAGIC, BOOT_INFO_VERSION,
 };
 use crate::debug;
 use crate::error::BootError;
@@ -81,7 +81,6 @@ pub fn prepare_boot_info() -> Result<BootInfo, BootError> {
         boot_volume: BootVolumeIdentity::empty(),
         framebuffer: fb_info,
         memory_map: BootMemoryMap::empty(),
-        boot_files: BootFileManifest::empty(),
     })
 }
 

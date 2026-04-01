@@ -124,6 +124,7 @@ pub struct DesktopRunningProgramInfo {
 pub enum DesktopRuntimeError {
     AlreadyBootstrapped,
     InvalidProgramWeight {
+        #[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code))]
         weight_micros: u64,
     },
     Load {
@@ -132,6 +133,7 @@ pub enum DesktopRuntimeError {
         error: crate::vfs::VfsError,
     },
     ProgramNotFound {
+        #[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code))]
         program_id: DesktopProgramId,
     },
     RequestQueueFull,
@@ -150,6 +152,7 @@ pub enum DesktopRuntimeError {
 }
 
 impl DesktopRuntimeError {
+    #[allow(dead_code)]
     pub fn summary(&self) -> &'static str {
         match self {
             Self::AlreadyBootstrapped => "desktop runtime already bootstrapped",
@@ -166,6 +169,7 @@ impl DesktopRuntimeError {
         }
     }
 
+    #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
     pub fn log_debug_details(&self) {
         match self {
             Self::Load {

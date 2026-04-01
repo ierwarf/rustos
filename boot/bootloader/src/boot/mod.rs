@@ -49,10 +49,17 @@ pub fn boot_prekernel() -> Result<(), BootError> {
     if segment_count == 0 {
         return Err(BootError::InvalidElf("no PT_LOAD segments"));
     }
-    let boot_volume = file_cache::snapshot_boot_volume()?;
     let mut boot_info = gui::prepare_boot_info()?;
-    boot_info.boot_files = boot_volume.manifest;
-    boot_info.boot_volume = boot_volume.identity;
+    boot_info.boot_volume = match file_cache::extract_boot_volume_identity() {
+        Ok(identity) => identity,
+        Err(err) => {
+            debug::println!(
+                "bootloader: boot volume identity unavailable: {:?}; continuing with runtime probe",
+                err
+            );
+            boot_info::BootVolumeIdentity::empty()
+        }
+    };
     let boot_info_ptr = gui::allocate_boot_info(boot_info)?;
     let boot_memory_map_storage = allocate_boot_memory_map_storage()?;
     debug::println!(

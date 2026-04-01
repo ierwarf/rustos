@@ -3,6 +3,8 @@ use x86_64::structures::idt::InterruptStackFrame;
 
 const KEYBOARD_INTERRUPT_VECTOR: u8 = crate::arch::pic::PIC_1_OFFSET + 1;
 const MOUSE_INTERRUPT_VECTOR: u8 = crate::arch::pic::PIC_2_OFFSET + 4;
+// RTC scheduling remains wired in the IDT layout even when current platforms do not use it.
+#[allow(dead_code)]
 const RTC_INTERRUPT_VECTOR: u8 = crate::arch::pic::PIC_2_OFFSET;
 
 pub fn default_handler(stack_frame: InterruptStackFrame, index: u8, error_code: Option<u64>) {
@@ -64,6 +66,7 @@ fn is_user_mode(stack_frame: &InterruptStackFrame) -> bool {
     (stack_frame.code_segment.0 & 0x3) == 0x3
 }
 
+#[allow(dead_code)]
 pub extern "x86-interrupt" fn rtc_interrupt_handler(_stack_frame: InterruptStackFrame) {
     crate::arch::rtc::on_interrupt();
     crate::arch::pic::send_eoi(RTC_INTERRUPT_VECTOR);

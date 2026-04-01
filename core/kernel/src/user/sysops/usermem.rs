@@ -39,12 +39,6 @@ pub(crate) fn read_current_user_u32(user_ptr: u64) -> Result<u32, paging::Addres
     Ok(u32::from_le_bytes(bytes))
 }
 
-pub(crate) fn read_current_user_u64(user_ptr: u64) -> Result<u64, paging::AddressSpaceError> {
-    let mut bytes = [0_u8; 8];
-    copy_from_current_user_exact(user_ptr, &mut bytes)?;
-    Ok(u64::from_le_bytes(bytes))
-}
-
 pub(crate) fn read_current_user_c_string(
     user_ptr: u64,
     max_len: usize,

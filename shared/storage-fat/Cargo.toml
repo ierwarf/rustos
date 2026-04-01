@@ -1,0 +1,10 @@
+[package]
+name = "storage-fat"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+storage-core = { path = "../storage-core" }
+fatfs = { git = "https://github.com/rafalh/rust-fatfs", default-features = false, features = ["alloc", "lfn"] }
+

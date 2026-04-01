@@ -46,6 +46,8 @@ fn scheduler_bootstrap_ready() -> bool {
     interrupts::without_interrupts(|| unsafe { scheduler_ref().bootstrap_context_ready() })
 }
 
+// Exposed for future bootstrap/health probes even when the current runtime does not query it.
+#[allow(dead_code)]
 pub fn is_initialized() -> bool {
     scheduler_bootstrap_ready()
 }
@@ -57,6 +59,7 @@ pub enum SpawnTaskError {
 }
 
 impl SpawnTaskError {
+    #[allow(dead_code)]
     pub fn summary(&self) -> &'static str {
         match self {
             Self::InvalidWeightMicros => "thread weight is outside the supported range",
@@ -190,6 +193,9 @@ pub struct Thread {
     slot: Cell<Option<usize>>,
 }
 
+// Native kernel threads are kept as a first-class API even though current boot mostly uses
+// user tasks plus deferred work.
+#[allow(dead_code)]
 impl Thread {
     pub fn new(entry: fn(u64), weight_micros: u64) -> Self {
         Self {
@@ -302,11 +308,13 @@ fn initial_task_rflags() -> RFlags {
     RFlags::from_bits_retain(RESERVED_BIT_1 | RFlags::INTERRUPT_FLAG.bits())
 }
 
+#[allow(dead_code)]
 fn kernel_fn_in_higher_half(entry: fn(u64)) -> fn(u64) {
     let high_addr = crate::memory::paging::higher_half_addr(entry as usize as u64);
     unsafe { mem::transmute::<usize, fn(u64)>(high_addr as usize) }
 }
 
+#[allow(dead_code)]
 fn kernel_task_entry_trampoline_addr() -> u64 {
     crate::memory::paging::higher_half_addr(task_entry_trampoline as *const () as usize as u64)
 }
@@ -317,6 +325,7 @@ fn noop_task_entry(_id: u64) {
     }
 }
 
+#[allow(dead_code)]
 extern "C" fn task_entry_trampoline() -> ! {
     let task = interrupts::without_interrupts(|| unsafe { scheduler_ref().current_task_start() });
     let Some(task) = task else {
@@ -327,6 +336,7 @@ extern "C" fn task_entry_trampoline() -> ! {
     exit_current_task();
 }
 
+#[allow(dead_code)]
 fn exit_current_task() -> ! {
     interrupts::without_interrupts(|| unsafe {
         scheduler_mut().exit_current_task();
@@ -380,6 +390,7 @@ pub fn current_user_process_id() -> Option<u64> {
     interrupts::without_interrupts(|| unsafe { scheduler_ref().current_user_process_id() })
 }
 
+#[allow(dead_code)]
 pub fn current_user_thread_id() -> Option<u64> {
     interrupts::without_interrupts(|| unsafe { scheduler_ref().current_user_id() })
 }
@@ -439,6 +450,7 @@ pub fn with_current_user_process_state_mut<R>(
     })
 }
 
+#[allow(dead_code)]
 pub fn with_current_user_windows_thread_state_mut<R>(
     f: impl FnOnce(u64, &mut WindowsThreadRuntimeState) -> R,
 ) -> Option<R> {
@@ -483,6 +495,7 @@ pub fn exit_current_user_task() -> ! {
     halt_current_retired_task()
 }
 
+#[allow(dead_code)]
 pub fn current_last_error() -> u32 {
     interrupts::without_interrupts(|| unsafe { scheduler_ref().current_last_error() })
 }

@@ -113,8 +113,8 @@ pub(crate) unsafe extern "C" fn ps2_begin_command(ps2dev: *mut LinuxCompatPs2Dev
     if ps2dev.is_null() {
         return;
     }
-    if let Some(port_id) = ps2dev_port_id(ps2dev) {
-        crate::debug::println!("linux ps2_begin_command: port={}", port_id);
+    if let Some(_port_id) = ps2dev_port_id(ps2dev) {
+        crate::debug::println!("linux ps2_begin_command: port={}", _port_id);
     }
     unsafe {
         (*ps2dev).cmdcnt = 0;

@@ -16,6 +16,7 @@ struct RunOptions {
     profile: String,
     accel: String,
     usb_input: bool,
+    debugcon: DebugconMode,
     vfio_force: bool,
     auto_phoenix3_passthrough: bool,
     vfio_hosts: Vec<String>,
@@ -28,6 +29,7 @@ impl RunOptions {
             profile: env_string("RUSTOS_QEMU_PROFILE").unwrap_or_else(|| String::from("default")),
             accel: env_string("RUSTOS_QEMU_ACCEL").unwrap_or_default(),
             usb_input: false,
+            debugcon: DebugconMode::File,
             vfio_force: false,
             auto_phoenix3_passthrough: false,
             vfio_hosts: Vec::new(),
@@ -39,6 +41,24 @@ impl RunOptions {
 struct RunSession {
     temp_dir: PathBuf,
     debugcon_tail: Option<Child>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DebugconMode {
+    File,
+    Stdio,
+    Null,
+}
+
+impl DebugconMode {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "file" => Some(Self::File),
+            "stdio" => Some(Self::Stdio),
+            "null" | "off" => Some(Self::Null),
+            _ => None,
+        }
+    }
 }
 
 impl RunSession {
@@ -113,6 +133,11 @@ where
                 options.accel = next_required_arg(args, arg.as_str())?;
             }
             "--usb-input" => options.usb_input = true,
+            "--debugcon" => {
+                let value = next_required_arg(args, "--debugcon")?;
+                options.debugcon = DebugconMode::parse(value.as_str())
+                    .ok_or_else(|| format!("invalid --debugcon value: {value}"))?;
+            }
             "--vfio-pci" => {
                 let host = next_required_arg(args, "--vfio-pci")?;
                 append_unique_string(&mut options.vfio_hosts, host);
@@ -172,7 +197,8 @@ fn run_qemu_with_options(config: &Config, options: RunOptions) -> Result<()> {
     let vfio_args = configure_vfio_args(&mut profile_args, &vfio_hosts, options.vfio_force)?;
     let usb_args = configure_usb_args(options.usb_input, &options.qemu_user_args);
     let display_args = configure_display_args(&options.qemu_user_args);
-    let debugcon_args = configure_debugcon(config, &options.qemu_user_args, &mut session, false)?;
+    let debugcon_args =
+        configure_debugcon(config, &options.qemu_user_args, &mut session, options.debugcon)?;
 
     println!(
         "\n====================================\nStarting QEMU...\n====================================\n"
@@ -212,10 +238,11 @@ pub(crate) fn print_run_help() {
 usage: cargo xtask run [options] [-- qemu args...]
 
 options:
-  -profile, --profile <name>         qemu profile (default, g14)
+  -profile, --profile <name>         qemu profile (default, g14, nvme)
   -accel-profile, --accel-profile <name>
                                      accelerator profile; use \"kvm\" for host CPU
   --usb-input                        attach qemu-xhci + usb-kbd + usb-tablet for USB HID testing
+  --debugcon <file|stdio|null>       route debugcon to file, terminal, or disable it
   --vfio-pci <0000:bb:dd.f>          attach a vfio-pci host device to qemu (repeatable)
   --phoenix3-passthrough             auto-attach host Phoenix3 VGA function and same-slot audio
   --vfio-force                       allow devices that currently drive an active host display
@@ -230,10 +257,11 @@ fn print_probe_display_help() {
 usage: cargo xtask probe-display [options] [-- qemu args...]
 
 options:
-  -profile, --profile <name>         qemu profile (default, g14)
+  -profile, --profile <name>         qemu profile (default, g14, nvme)
   -accel-profile, --accel-profile <name>
                                      accelerator profile; use \"kvm\" for host CPU
   --usb-input                        attach qemu-xhci + usb-kbd + usb-tablet for USB HID testing
+  --debugcon <file|stdio|null>       route debugcon to file, terminal, or disable it
   --vfio-pci <0000:bb:dd.f>          attach a vfio-pci host device to qemu (repeatable)
   --phoenix3-passthrough             auto-attach host Phoenix3 VGA function and same-slot audio
   --vfio-force                       allow devices that currently drive an active host display
@@ -320,6 +348,19 @@ fn build_run_profile_args(options: &RunOptions, boot_dir: &Path) -> Result<Vec<O
             args.push(OsString::from("-rtc"));
             args.push(OsString::from("base=localtime,clock=host"));
         }
+        "nvme" => {
+            append_nvme_boot_disk_args(&mut args, boot_dir);
+            args.push(OsString::from("-m"));
+            args.push(OsString::from("2G"));
+            args.push(OsString::from("-machine"));
+            if options.accel == "kvm" {
+                args.push(machine_option("q35,accel=kvm", options.usb_input));
+                args.push(OsString::from("-cpu"));
+                args.push(OsString::from("host"));
+            } else {
+                args.push(machine_option("q35", options.usb_input));
+            }
+        }
         _ => return Err(format!("unknown qemu profile: {}", options.profile).into()),
     }
     Ok(args)
@@ -335,6 +376,16 @@ fn append_ahci_boot_disk_args(args: &mut Vec<OsString>, boot_dir: &Path) {
     )));
     args.push(OsString::from("-device"));
     args.push(OsString::from("ide-hd,drive=bootdisk,bus=ahci.0"));
+}
+
+fn append_nvme_boot_disk_args(args: &mut Vec<OsString>, boot_dir: &Path) {
+    args.push(OsString::from("-drive"));
+    args.push(OsString::from(format!(
+        "id=bootdisk,if=none,file=fat:rw:{},format=raw",
+        boot_dir.display()
+    )));
+    args.push(OsString::from("-device"));
+    args.push(OsString::from("nvme,serial=RUSTOSNVME01,drive=bootdisk"));
 }
 
 fn machine_option(base: &str, disable_i8042: bool) -> OsString {
@@ -531,28 +582,17 @@ fn configure_debugcon(
     config: &Config,
     qemu_user_args: &[String],
     session: &mut RunSession,
-    force_debugcon_file: bool,
+    mode: DebugconMode,
 ) -> Result<Vec<OsString>> {
-    let mut use_debugcon_file = force_debugcon_file;
-    let mut expect_stdio_target = false;
-    for arg in qemu_user_args {
-        if expect_stdio_target {
-            if arg == "stdio" || arg == "mon:stdio" {
-                use_debugcon_file = true;
-            }
-            expect_stdio_target = false;
-            continue;
+    let _ = qemu_user_args;
+    match mode {
+        DebugconMode::Null => {
+            return Ok(vec![OsString::from("-debugcon"), OsString::from("null")]);
         }
-
-        match arg.as_str() {
-            "-nographic" => use_debugcon_file = true,
-            "-serial" | "-monitor" => expect_stdio_target = true,
-            _ => {}
+        DebugconMode::Stdio => {
+            return Ok(vec![OsString::from("-debugcon"), OsString::from("stdio")]);
         }
-    }
-
-    if !use_debugcon_file {
-        return Ok(vec![OsString::from("-debugcon"), OsString::from("stdio")]);
+        DebugconMode::File => {}
     }
 
     fs::create_dir_all(&config.logs_dir)?;
@@ -702,7 +742,8 @@ fn run_display_probe(config: &Config, options: RunOptions) -> Result<()> {
     let vfio_args = configure_vfio_args(&mut profile_args, &vfio_hosts, options.vfio_force)?;
     let usb_args = configure_usb_args(options.usb_input, &options.qemu_user_args);
     let display_args = configure_display_args(&options.qemu_user_args);
-    let debugcon_args = configure_debugcon(config, &options.qemu_user_args, &mut session, true)?;
+    let debugcon_args =
+        configure_debugcon(config, &options.qemu_user_args, &mut session, options.debugcon)?;
     let qmp_socket = session.temp_dir.join("qmp.sock");
     let mut qmp_args = Vec::new();
     qmp_args.push(OsString::from("-qmp"));

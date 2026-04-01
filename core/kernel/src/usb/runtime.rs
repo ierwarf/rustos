@@ -269,6 +269,8 @@ pub(crate) fn register_device(
     );
 }
 
+// Retained for future USB hot-unplug cleanup once runtime HID detachment is wired up.
+#[allow(dead_code)]
 pub(crate) fn unregister_interface(
     interface: *mut crate::driver::linux::compat::LinuxCompatUsbInterface,
 ) {
@@ -455,6 +457,7 @@ pub(crate) fn submit_urb(urb: *mut LinuxCompatUrb) -> i32 {
     };
 
     if URB_SUBMIT_LOGS.fetch_add(1, Ordering::Relaxed) < URB_SUBMIT_LOG_LIMIT {
+        #[cfg(rustos_debug_print_enabled)]
         unsafe {
             crate::debug::println!(
                 "usb runtime urb submit: urb={:#x} dev={:#x} pipe={:#x} len={} ep={:#x}",
@@ -509,6 +512,7 @@ pub(crate) fn cancel_urb(urb: *mut LinuxCompatUrb) -> bool {
     cancelled
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 pub(crate) fn hid_input_report(
     dev: *mut LinuxCompatHidDevice,
     data: *mut u8,
@@ -810,6 +814,7 @@ fn hid_report_descriptor(dev: *mut LinuxCompatHidDevice) -> Option<&'static [u8]
     Some(unsafe { core::slice::from_raw_parts(ptr, size as usize) })
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 fn classify_runtime_hid_layout(
     dev: *mut LinuxCompatHidDevice,
     report_len: usize,

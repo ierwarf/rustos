@@ -89,11 +89,16 @@ pub(crate) struct InstallSpec {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[allow(dead_code)]
 pub(crate) struct BootSpec {
     #[serde(default)]
     pub(crate) preload: bool,
+    // Parsed today to keep the package schema stable while boot policy migration catches up.
+    #[allow(dead_code)]
     #[serde(default)]
     pub(crate) required: bool,
+    // Parsed today to keep manifest-driven boot ordering forward-compatible.
+    #[allow(dead_code)]
     #[serde(default)]
     pub(crate) priority: i32,
 }
@@ -147,12 +152,15 @@ pub(crate) struct PackageManifest {
     pub(crate) profiles: Vec<String>,
     pub(crate) build: BuildSpec,
     pub(crate) install: InstallSpec,
+    #[allow(dead_code)]
     #[serde(default)]
     pub(crate) boot: BootSpec,
     #[serde(default)]
     pub(crate) autoload: Option<AutoloadSpec>,
     #[serde(default)]
     pub(crate) desktop: DesktopSection,
+    // Runtime dependency enforcement is planned, but the current orchestrator only records it.
+    #[allow(dead_code)]
     #[serde(default)]
     pub(crate) runtime_deps: Vec<String>,
     #[serde(skip)]

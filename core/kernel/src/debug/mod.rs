@@ -59,6 +59,7 @@ pub fn println_newline() {
 }
 
 #[cfg(not(rustos_debug_print_enabled))]
+#[allow(dead_code)]
 pub fn println_newline() {}
 
 #[cfg(rustos_debug_print_enabled)]
@@ -71,6 +72,7 @@ pub fn println_fmt(args: fmt::Arguments<'_>) {
 }
 
 #[cfg(not(rustos_debug_print_enabled))]
+#[allow(dead_code)]
 pub fn println_fmt(_args: fmt::Arguments<'_>) {}
 
 #[cfg(rustos_debug_print_enabled)]
@@ -110,6 +112,7 @@ fn write_debug_bytes(bytes: &[u8]) {
 }
 
 #[cfg(not(rustos_debug_print_enabled))]
+#[allow(dead_code)]
 fn write_debug_bytes(_bytes: &[u8]) {}
 
 #[cfg(rustos_debug_print_enabled)]

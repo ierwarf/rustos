@@ -223,9 +223,9 @@ pub(crate) unsafe extern "C" fn set_capability(
     event_type: u32,
     code: u32,
 ) -> i32 {
-    let mut rsp = 0usize;
+    let mut _rsp = 0usize;
     unsafe {
-        asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags));
+        asm!("mov {}, rsp", out(reg) _rsp, options(nomem, nostack, preserves_flags));
     }
     let remaining = INPUT_CALL_DEBUG_REMAINING.load(Ordering::Relaxed);
     if remaining != 0
@@ -240,7 +240,7 @@ pub(crate) unsafe extern "C" fn set_capability(
     {
         crate::debug::println!(
             "linux input_set_capability enter: rsp_mod16={} dev={:#x} type={} code={}",
-            rsp & 0xf,
+            _rsp & 0xf,
             dev as usize,
             event_type,
             code

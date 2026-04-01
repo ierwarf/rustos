@@ -410,26 +410,27 @@ impl InputEventQueueState {
 
 static INPUT_EVENTS: Mutex<InputEventQueueState> = Mutex::new(InputEventQueueState::new());
 
-pub(crate) fn push_keyboard_event(event: KeyboardEvent) {
-    with_event_queue(|events| events.push_keyboard_event(event));
-}
-
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn push_pointer_motion(dx: i16, dy: i16) {
     with_event_queue(|events| events.push_pointer_motion(dx, dy));
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn push_pointer_position(x: u32, y: u32) {
     with_event_queue(|events| events.push_pointer_position(x, y));
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn push_pointer_button(code: u32, pressed: bool) {
     with_event_queue(|events| events.push_pointer_button(code, pressed));
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn push_pointer_scroll(vertical: i16, horizontal: i16) {
     with_event_queue(|events| events.push_pointer_scroll(vertical, horizontal));
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn push_pointer_button_left(pressed: bool) {
     push_pointer_button(POINTER_BUTTON_LEFT, pressed);
 }

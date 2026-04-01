@@ -13,9 +13,6 @@ use crate::driver::linux::compat::{
 const USB_DT_DEVICE: u8 = 0x01;
 const USB_DT_ENDPOINT: u8 = 0x05;
 const USB_DT_INTERFACE: u8 = 0x04;
-const USB_DT_HID: u8 = 0x21;
-const USB_DT_REPORT: u8 = 0x22;
-const USB_ENDPOINT_XFER_INT: u8 = 0x03;
 const USB_DIR_IN: u8 = 0x80;
 const USB_DEVICE_STATE_CONFIGURED: u32 = 7;
 const USB_DEVICE_FLAG_CAN_SUBMIT: u32 = 1 << 0;
@@ -72,15 +69,15 @@ struct RegisteredUsbDriver {
 
 struct OwnedUsbDeviceRecord {
     compat: Box<LinuxCompatUsbDevice>,
-    manufacturer: Option<Box<[u8]>>,
-    product: Option<Box<[u8]>>,
-    serial: Option<Box<[u8]>>,
+    _manufacturer: Option<Box<[u8]>>,
+    _product: Option<Box<[u8]>>,
+    _serial: Option<Box<[u8]>>,
 }
 
 struct RegisteredUsbInterface {
     ptr: usize,
     device_ptr: usize,
-    altsetting_ptr: usize,
+    _altsetting_ptr: usize,
     vendor_id: u16,
     product_id: u16,
     device_bcd: u16,
@@ -97,9 +94,9 @@ struct RegisteredUsbInterface {
 
 struct OwnedUsbInterfaceRecord {
     compat: Box<LinuxCompatUsbInterface>,
-    altsetting: Box<LinuxCompatUsbHostInterface>,
-    endpoint: Box<LinuxCompatUsbHostEndpoint>,
-    extra: Option<Box<[u8]>>,
+    _altsetting: Box<LinuxCompatUsbHostInterface>,
+    _endpoint: Box<LinuxCompatUsbHostEndpoint>,
+    _extra: Option<Box<[u8]>>,
 }
 
 unsafe impl Send for RegisteredUsbDriver {}
@@ -295,22 +292,22 @@ pub(crate) fn register_owned_interface(
 
     USB_DEVICES.lock().push(OwnedUsbDeviceRecord {
         compat: device,
-        manufacturer,
-        product,
-        serial,
+        _manufacturer: manufacturer,
+        _product: product,
+        _serial: serial,
     });
     USB_OWNED_INTERFACES.lock().push(OwnedUsbInterfaceRecord {
         compat: interface,
-        altsetting,
-        endpoint,
-        extra,
+        _altsetting: altsetting,
+        _endpoint: endpoint,
+        _extra: extra,
     });
     let interface_index = {
         let mut interfaces = USB_INTERFACES.lock();
         interfaces.push(RegisteredUsbInterface {
             ptr: interface_ptr as usize,
             device_ptr: device_ptr as usize,
-            altsetting_ptr: altsetting_ptr as usize,
+            _altsetting_ptr: altsetting_ptr as usize,
             vendor_id: registration.vendor_id,
             product_id: registration.product_id,
             device_bcd: registration.device_bcd,
@@ -345,6 +342,8 @@ pub(crate) fn register_owned_interface(
     interface_ptr
 }
 
+// Future hot-unplug paths will consume this directly.
+#[allow(dead_code)]
 pub(crate) fn unregister_owned_interface(interface: *mut LinuxCompatUsbInterface) -> bool {
     if interface.is_null() {
         return false;
@@ -519,7 +518,7 @@ fn try_bind_interface_to_driver(
 
     let status = unsafe {
         let alt = (*interface_ptr).cur_altsetting;
-        let endpoint = if alt.is_null() {
+        let _endpoint = if alt.is_null() {
             ptr::null_mut()
         } else {
             (*alt).endpoint
@@ -531,26 +530,26 @@ fn try_bind_interface_to_driver(
             id_match as usize,
             alt as usize,
             if alt.is_null() { 0 } else { (*alt).desc[4] },
-            endpoint as usize,
-            if endpoint.is_null() {
+            _endpoint as usize,
+            if _endpoint.is_null() {
                 0
             } else {
-                (*endpoint).desc[0]
+                (*_endpoint).desc[0]
             },
-            if endpoint.is_null() {
+            if _endpoint.is_null() {
                 0
             } else {
-                (*endpoint).desc[1]
+                (*_endpoint).desc[1]
             },
-            if endpoint.is_null() {
+            if _endpoint.is_null() {
                 0
             } else {
-                (*endpoint).desc[2]
+                (*_endpoint).desc[2]
             },
-            if endpoint.is_null() {
+            if _endpoint.is_null() {
                 0
             } else {
-                (*endpoint).desc[3]
+                (*_endpoint).desc[3]
             },
         );
         if let Some(probe) = (*driver).probe {
@@ -673,6 +672,7 @@ fn c_string_bytes(value: &str) -> Box<[u8]> {
     bytes.into_boxed_slice()
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code))]
 fn interface_vendor_id(interface_ptr: *mut LinuxCompatUsbInterface) -> u16 {
     let device = unsafe { (*interface_ptr).usb_dev };
     if device.is_null() {
@@ -682,6 +682,7 @@ fn interface_vendor_id(interface_ptr: *mut LinuxCompatUsbInterface) -> u16 {
     u16::from_le_bytes([descriptor[8], descriptor[9]])
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code))]
 fn interface_product_id(interface_ptr: *mut LinuxCompatUsbInterface) -> u16 {
     let device = unsafe { (*interface_ptr).usb_dev };
     if device.is_null() {

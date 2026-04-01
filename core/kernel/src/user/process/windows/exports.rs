@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 use super::super::ProcessLoadError;
 use super::pe::{
     read_c_string_at_rva, read_u16, read_u32, rva_to_file_offset, PeImage, PE_DIRECTORY_EXPORT,
@@ -22,6 +24,37 @@ pub(super) enum ExportTarget<'a> {
     Forwarder(ForwarderTarget<'a>),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum CachedExportTarget {
+    Address(u32),
+    Forwarder(CachedForwarderTarget),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CachedForwarderTarget {
+    pub dll_name: Vec<u8>,
+    pub symbol: CachedForwarderSymbol,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum CachedForwarderSymbol {
+    Name(Vec<u8>),
+    Ordinal(u32),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ExportCache {
+    ordinal_base: u32,
+    function_targets: Vec<CachedExportTarget>,
+    named_exports: Vec<CachedNamedExport>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CachedNamedExport {
+    name: Vec<u8>,
+    function_index: u32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ForwarderTarget<'a> {
     pub dll_name: &'a [u8],
@@ -38,8 +71,16 @@ pub(super) fn validate_export_directory(
     image: &[u8],
     pe: &PeImage,
 ) -> Result<(), ProcessLoadError> {
+    let _ = build_export_cache(image, pe)?;
+    Ok(())
+}
+
+pub(super) fn build_export_cache(
+    image: &[u8],
+    pe: &PeImage,
+) -> Result<Option<ExportCache>, ProcessLoadError> {
     let Some(directory) = read_export_directory(image, pe)? else {
-        return Ok(());
+        return Ok(None);
     };
 
     let _ordinal_limit = directory
@@ -51,42 +92,66 @@ pub(super) fn validate_export_directory(
 
     let _ = read_c_string_at_rva(image, pe, directory.name_rva)?;
 
+    let mut function_targets = Vec::with_capacity(directory.function_count as usize);
     for function_index in 0..directory.function_count {
         let function_rva = read_function_rva(image, pe, &directory, function_index)?;
-        if let ExportTarget::Forwarder(forwarder) =
-            classify_export_target(image, pe, &directory, function_rva)?
-        {
-            match forwarder.symbol {
-                ForwarderSymbol::Name(symbol) if symbol.is_empty() => {
-                    return Err(ProcessLoadError::InvalidPe(
-                        "PE export forwarder string is invalid",
-                    ));
-                }
-                ForwarderSymbol::Ordinal(0) => {
-                    return Err(ProcessLoadError::InvalidPe(
-                        "PE export forwarder ordinal is invalid",
-                    ));
-                }
-                _ => {}
-            }
+        let target = classify_export_target(image, pe, &directory, function_rva)?;
+        if let ExportTarget::Forwarder(forwarder) = target {
+            function_targets.push(CachedExportTarget::Forwarder(
+                cache_forwarder_target(forwarder)?,
+            ));
+        } else if let ExportTarget::Address(rva) = target {
+            function_targets.push(CachedExportTarget::Address(rva));
         }
     }
 
+    let mut named_exports = Vec::with_capacity(directory.name_count as usize);
     for name_index in 0..directory.name_count {
         let export_name = read_export_name(image, pe, &directory, name_index)?;
-        match lookup_named_export(image, pe, &directory, export_name)? {
-            Some(_) => {}
-            None => {
-                return Err(ProcessLoadError::InvalidPe(
-                    "PE named export lookup returned no target",
-                ));
-            }
+        let function_index = read_name_function_index(image, pe, &directory, name_index)?;
+        if function_targets.get(function_index as usize).is_none() {
+            return Err(ProcessLoadError::InvalidPe(
+                "PE named export lookup returned no target",
+            ));
         }
+        named_exports.push(CachedNamedExport {
+            name: export_name.to_vec(),
+            function_index,
+        });
     }
 
-    Ok(())
+    Ok(Some(ExportCache {
+        ordinal_base: directory.ordinal_base,
+        function_targets,
+        named_exports,
+    }))
 }
 
+pub(super) fn lookup_cached_export_by_name<'a>(
+    cache: Option<&'a ExportCache>,
+    wanted_name: &[u8],
+) -> Option<&'a CachedExportTarget> {
+    let cache = cache?;
+    let named = cache
+        .named_exports
+        .iter()
+        .find(|entry| entry.name.as_slice() == wanted_name)?;
+    cache.function_targets.get(named.function_index as usize)
+}
+
+pub(super) fn lookup_cached_export_by_ordinal<'a>(
+    cache: Option<&'a ExportCache>,
+    ordinal: u32,
+) -> Option<&'a CachedExportTarget> {
+    let cache = cache?;
+    if ordinal < cache.ordinal_base {
+        return None;
+    }
+    let function_index = ordinal - cache.ordinal_base;
+    cache.function_targets.get(function_index as usize)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn lookup_export_by_name<'a>(
     image: &'a [u8],
     pe: &PeImage,
@@ -98,6 +163,7 @@ pub(super) fn lookup_export_by_name<'a>(
     lookup_named_export(image, pe, &directory, name)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn lookup_export_by_ordinal<'a>(
     image: &'a [u8],
     pe: &PeImage,
@@ -165,6 +231,7 @@ fn read_export_directory(
     }))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn lookup_named_export<'a>(
     image: &'a [u8],
     pe: &PeImage,
@@ -190,6 +257,7 @@ fn lookup_named_export<'a>(
     Ok(None)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn lookup_ordinal_export<'a>(
     image: &'a [u8],
     pe: &PeImage,
@@ -324,6 +392,32 @@ fn parse_forwarder_target<'a>(
     Ok(ForwarderTarget { dll_name, symbol })
 }
 
+fn cache_forwarder_target(
+    forwarder: ForwarderTarget<'_>,
+) -> Result<CachedForwarderTarget, ProcessLoadError> {
+    let symbol = match forwarder.symbol {
+        ForwarderSymbol::Name(name) => {
+            if name.is_empty() {
+                return Err(ProcessLoadError::InvalidPe(
+                    "PE export forwarder string is invalid",
+                ));
+            }
+            CachedForwarderSymbol::Name(name.to_vec())
+        }
+        ForwarderSymbol::Ordinal(0) => {
+            return Err(ProcessLoadError::InvalidPe(
+                "PE export forwarder ordinal is invalid",
+            ));
+        }
+        ForwarderSymbol::Ordinal(ordinal) => CachedForwarderSymbol::Ordinal(ordinal),
+    };
+
+    Ok(CachedForwarderTarget {
+        dll_name: forwarder.dll_name.to_vec(),
+        symbol,
+    })
+}
+
 fn parse_ascii_u32(bytes: &[u8]) -> Option<u32> {
     let mut value = 0_u32;
     for byte in bytes {
@@ -339,9 +433,10 @@ fn parse_ascii_u32(bytes: &[u8]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        lookup_export_by_name, lookup_export_by_ordinal, lookup_named_export,
-        read_export_directory, validate_export_directory, ExportTarget, ForwarderSymbol,
-        ForwarderTarget,
+        build_export_cache, lookup_cached_export_by_name, lookup_cached_export_by_ordinal,
+        lookup_export_by_name, lookup_export_by_ordinal, lookup_named_export, read_export_directory,
+        validate_export_directory, CachedExportTarget, CachedForwarderSymbol,
+        CachedForwarderTarget, ExportTarget, ForwarderSymbol, ForwarderTarget,
     };
     use crate::user::process::windows::pe::{PeDataDirectory, PeImage, PE_DIRECTORY_EXPORT};
 
@@ -422,6 +517,27 @@ mod tests {
             Some(ExportTarget::Forwarder(ForwarderTarget {
                 dll_name: b"ntdll",
                 symbol: ForwarderSymbol::Ordinal(12345),
+            }))
+        );
+    }
+
+    #[test]
+    fn cached_lookup_matches_direct_export_resolution() {
+        let (image, pe) = synthetic_export_image(0x1d0, 0);
+        let cache = build_export_cache(&image, &pe).unwrap().unwrap();
+
+        assert_eq!(
+            lookup_cached_export_by_name(Some(&cache), b"demo"),
+            Some(&CachedExportTarget::Forwarder(CachedForwarderTarget {
+                dll_name: b"KERNEL32".to_vec(),
+                symbol: CachedForwarderSymbol::Name(b"Sleep".to_vec()),
+            }))
+        );
+        assert_eq!(
+            lookup_cached_export_by_ordinal(Some(&cache), 1),
+            Some(&CachedExportTarget::Forwarder(CachedForwarderTarget {
+                dll_name: b"KERNEL32".to_vec(),
+                symbol: CachedForwarderSymbol::Name(b"Sleep".to_vec()),
             }))
         );
     }

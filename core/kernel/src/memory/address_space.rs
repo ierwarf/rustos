@@ -3,11 +3,11 @@ use alloc::vec::Vec;
 use core::cmp::min;
 use core::ptr;
 
+use x86_64::PhysAddr;
+use x86_64::VirtAddr;
 use x86_64::instructions::{interrupts, tlb};
 use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::structures::paging::{PageTable, PageTableFlags, PhysFrame};
-use x86_64::PhysAddr;
-use x86_64::VirtAddr;
 
 use crate::memory::{kernel_vm, phys};
 
@@ -437,6 +437,8 @@ impl ProcessAddressSpace {
         Ok(())
     }
 
+    // Retained for future user-mode memset paths and zero-fill sysops.
+    #[allow(dead_code)]
     pub fn zero_user_bytes(
         &self,
         start: VirtAddr,
@@ -446,6 +448,7 @@ impl ProcessAddressSpace {
         self.zero_user_bytes_unchecked(start, byte_len)
     }
 
+    #[allow(dead_code)]
     pub fn zero_user_bytes_unchecked(
         &self,
         start: VirtAddr,
@@ -523,6 +526,8 @@ impl ProcessAddressSpace {
         Ok(())
     }
 
+    // Retained for future per-process CR3 switching outside the current scheduler path.
+    #[allow(dead_code)]
     pub unsafe fn load(&self) {
         let frame = PhysFrame::containing_address(self.root_phys());
         unsafe {

@@ -5,6 +5,7 @@
 extern crate alloc;
 
 mod load;
+mod storage;
 mod runtime;
 mod settings;
 
@@ -12,7 +13,6 @@ pub(crate) use load::elf_loader;
 pub(crate) use runtime::{debug, heap, panic_screen};
 
 use boot_random as random;
-use boot_storage as fat;
 
 use boot_protocol::BootInfo;
 use core::fmt;
@@ -62,13 +62,13 @@ pub extern "C" fn _start(boot_info_ptr: *const BootInfo) -> ! {
         fatal(format_args!("boot info pointer is null"));
     }
     panic_screen::init(boot_info_ptr);
-    fat::init_boot_info(boot_info_ptr);
     random::init(boot_info_ptr);
     panic_screen::println_fmt(format_args!("prekernel: start"));
 
-    let volume = match fat::BootVolume::open() {
+    let boot_info = unsafe { &*boot_info_ptr };
+    let volume = match storage::open_boot_volume(boot_info.boot_volume) {
         Ok(volume) => volume,
-        Err(err) => fatal(format_args!("failed to open boot volume: {:?}", err)),
+        Err(err) => fatal(format_args!("failed to open boot volume: {}", err)),
     };
     let mut kernel_file = match volume.open_file(KERNEL_PATH) {
         Ok(file) => file,
@@ -108,7 +108,7 @@ pub extern "C" fn _start(boot_info_ptr: *const BootInfo) -> ! {
             Err(reason) => fatal(format_args!("failed to load {}: {}", KERNEL_PATH, reason)),
         };
     drop(kernel_file);
-    if let Err(err) = volume.close() {
+    if let Err(err) = volume.unmount() {
         fatal(format_args!("failed to close boot volume: {:?}", err));
     }
 

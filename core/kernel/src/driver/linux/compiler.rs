@@ -2,7 +2,6 @@ use core::arch::global_asm;
 
 global_asm!(
     r#"
-    .intel_syntax noprefix
     .global __x86_indirect_thunk_rax
 __x86_indirect_thunk_rax:
     jmp rax
@@ -30,7 +29,6 @@ __x86_indirect_thunk_r15:
     .global __x86_return_thunk
 __x86_return_thunk:
     ret
-    .att_syntax prefix
 "#
 );
 

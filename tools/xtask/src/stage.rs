@@ -10,15 +10,13 @@ use crate::package_manifest::{
 };
 use crate::util::{
     copy_or_unpack_firmware, copy_with_parent, maybe_copy_dual_host_runtime,
-    maybe_copy_host_runtime, push_boot_entry_unique, remove_dir_if_exists, remove_file_if_exists,
-    shell, write_boot_file_list,
+    maybe_copy_host_runtime, remove_dir_if_exists, remove_file_if_exists, shell,
 };
 use crate::Result;
 
 const DRIVER_REGISTRY_PATH: &str = "system/registry/kernel/loadable-drivers.tsv";
 const DESKTOP_REGISTRY_PATH: &str = "system/registry/system/desktop-programs.tsv";
 const WINDOWS_DLL_REGISTRY_PATH: &str = "system/registry/compat/windows-system-dlls.txt";
-const LEGACY_BOOT_FILE_LIST_PATH: &str = "BOOTFILES.TXT";
 
 pub(crate) fn stage(config: &Config) -> Result<()> {
     let manifests = selected_manifests(config)?;
@@ -26,48 +24,31 @@ pub(crate) fn stage(config: &Config) -> Result<()> {
     remove_dir_if_exists(&config.image_dir)?;
     cleanup_legacy_build_layout(config)?;
 
-    let mut boot_entries = Vec::new();
-    stage_image_asset_overlay(
-        &config.image_asset_overlay_dir,
-        &config.image_dir,
-        &mut boot_entries,
-    )?;
+    stage_image_asset_overlay(&config.image_asset_overlay_dir, &config.image_dir)?;
 
     for manifest in &manifests {
-        stage_manifest(config, manifest, &mut boot_entries)?;
+        stage_manifest(config, manifest)?;
     }
 
     fs::create_dir_all(&config.amdgpu_image_firmware_dir)?;
     for basename in &config.amdgpu_required_firmware_basenames {
         let dst = config.amdgpu_image_firmware_dir.join(basename);
         copy_or_unpack_firmware(&config.amdgpu_firmware_dir, basename, &dst)?;
-        push_boot_entry_unique(
-            &mut boot_entries,
-            &format!("system/firmware/amdgpu/{basename}"),
-        );
     }
 
     maybe_copy_host_runtime(
         &config.glibc_interpreter_source,
         &config.glibc_interpreter_dest,
-        "lib64/ld-linux-x86-64.so.2",
-        &mut boot_entries,
     )?;
     maybe_copy_dual_host_runtime(
         &config.glibc_libc_source,
         &config.glibc_libc_primary_dest,
         &config.glibc_libc_fallback_dest,
-        "lib/x86_64-linux-gnu/libc.so.6",
-        "lib64/libc.so.6",
-        &mut boot_entries,
     )?;
     maybe_copy_dual_host_runtime(
         &config.glibc_libgcc_source,
         &config.glibc_libgcc_primary_dest,
         &config.glibc_libgcc_fallback_dest,
-        "lib/x86_64-linux-gnu/libgcc_s.so.1",
-        "lib64/libgcc_s.so.1",
-        &mut boot_entries,
     )?;
 
     if let Some(ldconfig) = config.ldconfig.as_ref() {
@@ -83,7 +64,6 @@ pub(crate) fn stage(config: &Config) -> Result<()> {
             fs::create_dir_all(config.image_dir.join("etc/ld.so.conf.d"))?;
             let root = &config.image_dir;
             cmd!(sh, "{ldconfig} -r {root} -C /etc/ld.so.cache").run()?;
-            push_boot_entry_unique(&mut boot_entries, "etc/ld.so.cache");
         }
     }
 
@@ -94,23 +74,10 @@ pub(crate) fn stage(config: &Config) -> Result<()> {
             .ok_or("ld.so.preload destination has no parent")?,
     )?;
     fs::write(&config.glibc_ldso_preload_dest, [])?;
-    push_boot_entry_unique(&mut boot_entries, "etc/ld.so.preload");
 
     write_driver_registry(config, &manifests)?;
     write_desktop_registry(config, &manifests)?;
     write_windows_dll_registry(config, &manifests)?;
-    push_boot_entry_unique(&mut boot_entries, DRIVER_REGISTRY_PATH);
-    push_boot_entry_unique(&mut boot_entries, DESKTOP_REGISTRY_PATH);
-    push_boot_entry_unique(&mut boot_entries, WINDOWS_DLL_REGISTRY_PATH);
-
-    boot_entries.sort();
-    if boot_entries.is_empty() {
-        remove_file_if_exists(&config.boot_file_list)?;
-        remove_file_if_exists(&config.image_dir.join(LEGACY_BOOT_FILE_LIST_PATH))?;
-    } else {
-        write_boot_file_list(&config.boot_file_list, &boot_entries)?;
-        write_boot_file_list(&config.image_dir.join(LEGACY_BOOT_FILE_LIST_PATH), &boot_entries)?;
-    }
     Ok(())
 }
 
@@ -121,11 +88,7 @@ fn selected_manifests(config: &Config) -> Result<Vec<PackageManifest>> {
         .collect())
 }
 
-fn stage_manifest(
-    config: &Config,
-    manifest: &PackageManifest,
-    boot_entries: &mut Vec<String>,
-) -> Result<()> {
+fn stage_manifest(config: &Config, manifest: &PackageManifest) -> Result<()> {
     let artifact = manifest.artifact_path(config);
     let image = manifest.image_path(config);
 
@@ -133,15 +96,12 @@ fn stage_manifest(
         InstallLayout::File => {
             if artifact.is_file() {
                 copy_with_parent(&artifact, &image)?;
-                if manifest.boot.preload {
-                    push_boot_entry_unique(boot_entries, &manifest.install.path);
-                }
                 return Ok(());
             }
         }
         InstallLayout::Directory => {
             if artifact.is_dir() {
-                stage_directory_manifest(&artifact, &image, &manifest.install.path, manifest, boot_entries)?;
+                stage_directory_manifest(&artifact, &image)?;
                 return Ok(());
             }
         }
@@ -164,9 +124,6 @@ fn stage_manifest(
 fn stage_directory_manifest(
     src_root: &Path,
     dst_root: &Path,
-    install_prefix: &str,
-    manifest: &PackageManifest,
-    boot_entries: &mut Vec<String>,
 ) -> Result<()> {
     let mut stack = vec![(src_root.to_path_buf(), dst_root.to_path_buf())];
 
@@ -185,13 +142,6 @@ fn stage_directory_manifest(
                 continue;
             }
             copy_with_parent(&src_path, &dst_path)?;
-            if manifest.boot.preload {
-                let relative = dst_path
-                    .strip_prefix(dst_root)
-                    .map_err(|_| format!("failed to relativize {}", dst_path.display()))?;
-                let boot_entry = path_join_unix(install_prefix, relative)?;
-                push_boot_entry_unique(boot_entries, &boot_entry);
-            }
         }
     }
 
@@ -337,8 +287,6 @@ fn cleanup_legacy_build_layout(config: &Config) -> Result<()> {
     }
 
     for path in [
-        config.boot_file_list.clone(),
-        config.image_dir.join(LEGACY_BOOT_FILE_LIST_PATH),
         config.image_dir.join("startup.nsh"),
         config.build_dir.join("kernel.elf"),
         config.build_dir.join("prekernel.elf"),
@@ -361,23 +309,18 @@ fn cleanup_legacy_build_layout(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn stage_image_asset_overlay(
-    src_root: &Path,
-    dst_root: &Path,
-    boot_entries: &mut Vec<String>,
-) -> Result<()> {
+fn stage_image_asset_overlay(src_root: &Path, dst_root: &Path) -> Result<()> {
     if !src_root.is_dir() {
         return Ok(());
     }
 
-    stage_image_asset_overlay_recursive(src_root, src_root, dst_root, boot_entries)
+    stage_image_asset_overlay_recursive(src_root, src_root, dst_root)
 }
 
 fn stage_image_asset_overlay_recursive(
     src_root: &Path,
     current_dir: &Path,
     dst_root: &Path,
-    boot_entries: &mut Vec<String>,
 ) -> Result<()> {
     let mut entries = fs::read_dir(current_dir)?.collect::<std::result::Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.path());
@@ -386,7 +329,7 @@ fn stage_image_asset_overlay_recursive(
         let src_path = entry.path();
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            stage_image_asset_overlay_recursive(src_root, &src_path, dst_root, boot_entries)?;
+            stage_image_asset_overlay_recursive(src_root, &src_path, dst_root)?;
             continue;
         }
         if !file_type.is_file() {
@@ -398,12 +341,6 @@ fn stage_image_asset_overlay_recursive(
             .map_err(|_| format!("asset path escaped overlay root: {}", src_path.display()))?;
         let dst_path = dst_root.join(relative);
         copy_with_parent(&src_path, &dst_path)?;
-
-        let boot_entry = relative
-            .to_str()
-            .ok_or_else(|| format!("non-utf8 asset path is unsupported: {}", relative.display()))?
-            .replace('\\', "/");
-        push_boot_entry_unique(boot_entries, &boot_entry);
     }
 
     Ok(())

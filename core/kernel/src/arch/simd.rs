@@ -24,7 +24,10 @@ const SIMD_MODE_XSAVE: u8 = 2;
 
 const SIMD_STATE_BYTES: usize = 4096;
 const FXSAVE_STATE_BYTES: usize = 512;
+// These thresholds remain part of the staged memcpy fast-path even before all call sites switch.
+#[allow(dead_code)]
 const XMM_COPY_THRESHOLD_BYTES: usize = 256;
+#[allow(dead_code)]
 const YMM_COPY_THRESHOLD_BYTES: usize = 512;
 const BGRA_BLIT_AVX2_THRESHOLD_PIXELS: usize = 16;
 const ENABLE_SIMD_BGRA_BLIT: bool = true;
@@ -102,6 +105,7 @@ pub fn init() {
     }
 }
 
+#[allow(dead_code)]
 pub fn mode_name() -> &'static str {
     match SIMD_MODE.load(Ordering::Acquire) {
         SIMD_MODE_XSAVE if avx2_enabled() => "xsave-avx2",
@@ -111,10 +115,12 @@ pub fn mode_name() -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 pub fn state_bytes() -> usize {
     SIMD_STATE_REQUIRED_BYTES.load(Ordering::Acquire)
 }
 
+#[allow(dead_code)]
 pub fn avx_enabled() -> bool {
     AVX_ENABLED.load(Ordering::Acquire)
 }
@@ -140,6 +146,7 @@ pub unsafe fn restore_state(area: &SimdState) {
 }
 
 #[inline]
+#[allow(dead_code)]
 pub unsafe fn copy_fast(src: *const u8, dst: *mut u8, len: usize) {
     if len == 0 || src == dst {
         return;
@@ -203,6 +210,7 @@ pub unsafe fn blit_bgra8888_row(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
+#[allow(dead_code)]
 pub unsafe fn copy_xmm(src: *const u8, dst: *mut u8, len: usize) {
     use core::arch::x86_64::*;
 
@@ -240,6 +248,7 @@ pub unsafe fn copy_xmm(src: *const u8, dst: *mut u8, len: usize) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx")]
+#[allow(dead_code)]
 pub unsafe fn copy_ymm(src: *const u8, dst: *mut u8, len: usize) {
     use core::arch::x86_64::*;
 

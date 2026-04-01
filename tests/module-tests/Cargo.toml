@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 boot-protocol = { path = "../../boot/bootloader/boot-protocol" }
-boot-random = { path = "../../boot/boot-random" }
-boot-storage = { path = "../../boot/boot-storage" }
+boot-random = { path = "../../shared/boot-random" }
 driver-abi = { path = "../../drivers/driver-abi" }
 keyboard-core = { path = "../../drivers/input/keyboard-core" }

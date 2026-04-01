@@ -32,7 +32,6 @@ pub(crate) struct Config {
     pub(crate) artifact_dir: PathBuf,
     pub(crate) logs_dir: PathBuf,
     pub(crate) image_dir: PathBuf,
-    pub(crate) efi_boot_dir: PathBuf,
     pub(crate) image_asset_overlay_dir: PathBuf,
     pub(crate) boot_efi: PathBuf,
     pub(crate) source_efi: PathBuf,
@@ -44,27 +43,15 @@ pub(crate) struct Config {
     pub(crate) artifact_kernel_elf: PathBuf,
     pub(crate) kernel_elf: PathBuf,
     pub(crate) user_build_dir: PathBuf,
-    pub(crate) user_binary: PathBuf,
-    pub(crate) user_source: PathBuf,
-    pub(crate) artifact_user_elf: PathBuf,
     pub(crate) image_user_elf: PathBuf,
     pub(crate) userdemo2_exe: PathBuf,
-    pub(crate) userdemo2_c_source: PathBuf,
     pub(crate) userdemo2_import_audit_log: PathBuf,
-    pub(crate) artifact_userdemo2_exe: PathBuf,
     pub(crate) image_userdemo2_exe: PathBuf,
     pub(crate) winsys_dir: PathBuf,
     pub(crate) artifact_winsys_dir: PathBuf,
     pub(crate) image_winsys_dir: PathBuf,
-    pub(crate) shell_source: PathBuf,
-    pub(crate) artifact_shell_elf: PathBuf,
     pub(crate) image_shell_elf: PathBuf,
-    pub(crate) exec_smoke_source: PathBuf,
-    pub(crate) artifact_exec_smoke_elf: PathBuf,
-    pub(crate) image_exec_smoke_elf: PathBuf,
-    pub(crate) artifact_bootfb_ko: PathBuf,
     pub(crate) image_bootfb_ko: PathBuf,
-    pub(crate) artifact_amdgpu_ko: PathBuf,
     pub(crate) image_amdgpu_ko: PathBuf,
     pub(crate) vendor_psmouse_ko: PathBuf,
     pub(crate) image_psmouse_ko: PathBuf,
@@ -77,7 +64,6 @@ pub(crate) struct Config {
     pub(crate) amdgpu_firmware_dir: PathBuf,
     pub(crate) amdgpu_image_firmware_dir: PathBuf,
     pub(crate) amdgpu_required_firmware_basenames: Vec<String>,
-    pub(crate) boot_file_list: PathBuf,
     pub(crate) glibc_interpreter_source: Option<PathBuf>,
     pub(crate) glibc_libc_source: Option<PathBuf>,
     pub(crate) glibc_libgcc_source: Option<PathBuf>,
@@ -187,23 +173,12 @@ impl Config {
             artifact_kernel_elf: env_path("ARTIFACT_KERNEL_ELF")
                 .unwrap_or_else(|| artifact_dir.join("kernel.elf")),
             kernel_elf: env_path("KERNEL_ELF").unwrap_or_else(|| image_dir.join("kernel.elf")),
-            user_binary: env_path("USER_SOURCE").unwrap_or_else(|| {
-                cargo_target_dir.join(format!("{kernel_target}/release/{user_elf_package}"))
-            }),
-            user_source: env_path("USER_BUILD_ELF")
-                .unwrap_or_else(|| user_build_dir.join("UISERVER.ELF")),
-            artifact_user_elf: env_path("ARTIFACT_USER_ELF")
-                .unwrap_or_else(|| artifact_dir.join("system/packages/uiserver/uiserver.elf")),
             image_user_elf: env_path("IMAGE_USER_ELF")
                 .unwrap_or_else(|| image_dir.join("system/packages/uiserver/uiserver.elf")),
             userdemo2_exe: env_path("USERDEMO2_EXE")
                 .unwrap_or_else(|| user_build_dir.join("USERDEMO2.EXE")),
-            userdemo2_c_source: env_path("USERDEMO2_C_SOURCE")
-                .unwrap_or_else(|| root_dir.join("samples/windows/userdemo2/winmain.c")),
             userdemo2_import_audit_log: env_path("USERDEMO2_IMPORT_AUDIT_LOG")
                 .unwrap_or_else(|| logs_dir.join("userdemo2-imports.txt")),
-            artifact_userdemo2_exe: env_path("ARTIFACT_USERDEMO2_EXE")
-                .unwrap_or_else(|| artifact_dir.join("samples/windows/userdemo2/userdemo2.exe")),
             image_userdemo2_exe: env_path("IMAGE_USERDEMO2_EXE")
                 .unwrap_or_else(|| image_dir.join("samples/windows/userdemo2/userdemo2.exe")),
             winsys_dir: env_path("WINSYS_DIR")
@@ -212,24 +187,10 @@ impl Config {
                 .unwrap_or_else(|| artifact_dir.join("compat/windows/System32")),
             image_winsys_dir: env_path("IMAGE_WINSYS_DIR")
                 .unwrap_or_else(|| image_dir.join("compat/windows/System32")),
-            shell_source: env_path("SHELL_SOURCE")
-                .unwrap_or_else(|| root_dir.join("samples/shell/shell.c")),
-            artifact_shell_elf: env_path("ARTIFACT_SHELL_ELF")
-                .unwrap_or_else(|| artifact_dir.join("samples/shell/shell.elf")),
             image_shell_elf: env_path("IMAGE_SHELL_ELF")
                 .unwrap_or_else(|| image_dir.join("samples/shell/shell.elf")),
-            exec_smoke_source: env_path("EXEC_SMOKE_SOURCE")
-                .unwrap_or_else(|| root_dir.join("samples/execsmoke/exec_smoke.c")),
-            artifact_exec_smoke_elf: env_path("ARTIFACT_EXEC_SMOKE_ELF")
-                .unwrap_or_else(|| artifact_dir.join("samples/execsmoke/execsmoke.elf")),
-            image_exec_smoke_elf: env_path("IMAGE_EXEC_SMOKE_ELF")
-                .unwrap_or_else(|| image_dir.join("samples/execsmoke/execsmoke.elf")),
-            artifact_bootfb_ko: env_path("ARTIFACT_BOOTFB_KO")
-                .unwrap_or_else(|| artifact_dir.join("system/drivers/display/bootfb.ko")),
             image_bootfb_ko: env_path("IMAGE_BOOTFB_KO")
                 .unwrap_or_else(|| image_dir.join("system/drivers/display/bootfb.ko")),
-            artifact_amdgpu_ko: env_path("ARTIFACT_AMDGPU_KO")
-                .unwrap_or_else(|| artifact_dir.join("system/drivers/display/amdgpu.ko")),
             image_amdgpu_ko: env_path("IMAGE_AMDGPU_KO")
                 .unwrap_or_else(|| image_dir.join("system/drivers/display/amdgpu.ko")),
             vendor_psmouse_ko: env_path("VENDOR_PSMOUSE_KO")
@@ -268,8 +229,6 @@ impl Config {
                         String::from("smu_13_0_10.bin"),
                     ]
                 }),
-            boot_file_list: env_path("BOOT_FILE_LIST")
-                .unwrap_or_else(|| image_dir.join("system/registry/boot/bootfiles.txt")),
             glibc_interpreter_source: env_path("GLIBC_INTERPRETER_SOURCE")
                 .or_else(|| compiler_print_file_name(&cc, "ld-linux-x86-64.so.2")),
             glibc_libc_source: env_path("GLIBC_LIBC_SOURCE")
@@ -315,7 +274,6 @@ impl Config {
             artifact_dir,
             logs_dir,
             image_dir,
-            efi_boot_dir,
             user_build_dir,
             ldconfig,
         })

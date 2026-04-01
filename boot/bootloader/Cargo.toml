@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 boot-protocol = { path = "boot-protocol" }
-boot-storage = { path = "../boot-storage" }
+storage-core = { path = "../../shared/storage-core" }
 uefi = { version = "0.36.1", features = ["alloc"] }
 xmas-elf = "0.10.0"
 raw-cpuid = "11.6.0"

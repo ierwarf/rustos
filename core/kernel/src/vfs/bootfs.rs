@@ -1,8 +1,6 @@
 use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
-use fatfs::{Read, Seek};
 
 use crate::storage::block;
 use crate::storage::fat::{self, BootVolumeNodeKind};
@@ -18,14 +16,15 @@ pub(crate) static FAT_PROVIDER: FatFilesystemProvider = FatFilesystemProvider;
 pub(crate) struct FatFilesystemProvider;
 
 #[derive(Clone, Copy)]
-enum FatMountSource {
-    BootVolume,
-    BlockDevice(block::BlockDeviceHandle),
+enum FatAccessPolicy {
+    Standard,
+    Boot,
 }
 
 pub(crate) struct FatFsBackend {
-    source: FatMountSource,
+    handle: block::BlockDeviceHandle,
     _readonly: bool,
+    access_policy: FatAccessPolicy,
 }
 
 impl FilesystemProvider for FatFilesystemProvider {
@@ -37,22 +36,18 @@ impl FilesystemProvider for FatFilesystemProvider {
         &self,
         source: MountSource,
         flags: u64,
-        _options: Option<&str>,
+        options: Option<&str>,
     ) -> Result<Arc<dyn VfsBackend>, MountError> {
-        let source = match source {
-            MountSource::BootVolume => FatMountSource::BootVolume,
-            MountSource::BlockDevice(handle) => FatMountSource::BlockDevice(handle),
+        let handle = match source {
+            MountSource::BlockDevice(handle) => handle,
             MountSource::None => return Err(MountError::InvalidSource),
         };
-        let readonly = match source {
-            FatMountSource::BootVolume => true,
-            FatMountSource::BlockDevice(handle) => {
-                flags & crate::user::linux::MS_RDONLY != 0 || block::is_readonly(handle)
-            }
-        };
+        let readonly = flags & crate::user::linux::MS_RDONLY != 0 || block::is_readonly(handle);
+        let access_policy = parse_mount_access_policy(options)?;
         Ok(Arc::new(FatFsBackend {
-            source,
+            handle,
             _readonly: readonly,
+            access_policy,
         }))
     }
 }
@@ -69,7 +64,7 @@ impl VfsBackend for FatFsBackend {
         super::validate_read_only_open_flags(flags)?;
 
         let normalized = normalize_fat_path(relative_path)?;
-        ensure_boot_volume_access(context, normalized.as_str())?;
+        ensure_mount_access(context, normalized.as_str(), self.access_policy)?;
 
         let metadata = self.metadata(absolute_path, relative_path, context)?;
         match metadata.kind {
@@ -98,7 +93,7 @@ impl VfsBackend for FatFsBackend {
         context: &mut VfsContext<'_>,
     ) -> Result<VfsMetadata, VfsError> {
         let normalized = normalize_fat_path(relative_path)?;
-        ensure_boot_volume_access(context, normalized.as_str())?;
+        ensure_mount_access(context, normalized.as_str(), self.access_policy)?;
         self.query_metadata(absolute_path, normalized.as_str())
     }
 
@@ -112,7 +107,7 @@ impl VfsBackend for FatFsBackend {
         super::ensure_read_access_only(mode)?;
 
         let normalized = normalize_fat_path(relative_path)?;
-        ensure_boot_volume_access(context, normalized.as_str())?;
+        ensure_mount_access(context, normalized.as_str(), self.access_policy)?;
         let _ = self.query_metadata(relative_path, normalized.as_str())?;
         Ok(())
     }
@@ -133,7 +128,7 @@ impl VfsBackend for FatFsBackend {
         context: &mut VfsContext<'_>,
     ) -> Result<Vec<VfsDirectoryEntry>, VfsError> {
         let normalized = normalize_fat_path(relative_path)?;
-        ensure_boot_volume_access(context, normalized.as_str())?;
+        ensure_mount_access(context, normalized.as_str(), self.access_policy)?;
         let mut entries = self
             .read_dir_entries(normalized.as_str())?
             .into_iter()
@@ -159,49 +154,21 @@ impl VfsBackend for FatFsBackend {
 
 impl FatFsBackend {
     fn read_file_to_vec(&self, path: &str) -> Result<Vec<u8>, VfsError> {
-        crate::debug::println!(
-            "bootfs read begin: source={} path={}",
-            self.source_name(),
-            path
-        );
-        match self.source {
-            FatMountSource::BootVolume => {
-                let bytes = fat::read_file_to_vec(path).map_err(map_fat_error)?;
-                crate::debug::println!(
-                    "bootfs read done: source=boot path={} bytes={}",
-                    path,
-                    bytes.len()
-                );
-                Ok(bytes)
-            }
-            FatMountSource::BlockDevice(handle) => {
-                let descriptor = block::descriptor(handle);
-                if let Some(descriptor) = descriptor.as_ref() {
-                    crate::debug::println!(
-                        "bootfs registry read: handle={} dev={} start_lba={} sectors={}",
-                        handle.id(),
-                        descriptor.path,
-                        descriptor.start_lba,
-                        descriptor.sector_count
-                    );
-                }
-                let file_metadata = open_registry_metadata(handle, path)?;
-                let fs = open_registry_filesystem(handle)?;
-                let root = fs.root_dir();
-                let mut file = root.open_file(path).map_err(map_fat_error)?;
-                let file_len =
-                    usize::try_from(file_metadata.len).map_err(|_| VfsError::InvalidArgument)?;
-                let mut bytes = vec![0_u8; file_len];
-                let read = file.read(&mut bytes).map_err(map_fat_error)?;
-                bytes.truncate(read);
-                crate::debug::println!(
-                    "bootfs read done: source=block path={} bytes={}",
-                    path,
-                    bytes.len()
-                );
-                Ok(bytes)
-            }
+        let descriptor = block::descriptor(self.handle);
+        if let Some(_descriptor) = descriptor.as_ref() {
+            crate::debug::println!(
+                "bootfs read: handle={} dev={} path={} block_size={} start_block={} blocks={}",
+                self.handle.id(),
+                _descriptor.path,
+                path,
+                _descriptor.logical_block_size,
+                _descriptor.start_block,
+                _descriptor.block_count
+            );
         }
+        with_registry_volume(self.handle, |volume| {
+            volume.read_file_to_vec(path).map_err(map_fat_error)
+        })
     }
 
     fn query_metadata(
@@ -209,68 +176,52 @@ impl FatFsBackend {
         absolute_path: &str,
         normalized_path: &str,
     ) -> Result<VfsMetadata, VfsError> {
-        crate::debug::println!(
-            "bootfs metadata begin: source={} absolute={} path={}",
-            self.source_name(),
+        let metadata = open_registry_metadata(self.handle, normalized_path)?;
+        let metadata = super::default_metadata(
             absolute_path,
-            normalized_path
+            match metadata.kind {
+                BootVolumeNodeKind::File => VfsNodeKind::File,
+                BootVolumeNodeKind::Directory => VfsNodeKind::Directory,
+            },
+            metadata.len,
         );
-        match self.source {
-            FatMountSource::BootVolume => {
-                let metadata = query_boot_volume_file_metadata(absolute_path, normalized_path)?;
-                crate::debug::println!(
-                    "bootfs metadata done: source=boot absolute={} kind={:?} len={}",
-                    absolute_path,
-                    metadata.kind,
-                    metadata.len
-                );
-                Ok(metadata)
-            }
-            FatMountSource::BlockDevice(handle) => {
-                let metadata = open_registry_metadata(handle, normalized_path)?;
-                let metadata = super::default_metadata(
-                    absolute_path,
-                    match metadata.kind {
-                        BootVolumeNodeKind::File => VfsNodeKind::File,
-                        BootVolumeNodeKind::Directory => VfsNodeKind::Directory,
-                    },
-                    metadata.len,
-                );
-                crate::debug::println!(
-                    "bootfs metadata done: source=block absolute={} kind={:?} len={}",
-                    absolute_path,
-                    metadata.kind,
-                    metadata.len
-                );
-                Ok(metadata)
-            }
-        }
+        crate::debug::println!(
+            "bootfs metadata: handle={} absolute={} kind={:?} len={}",
+            self.handle.id(),
+            absolute_path,
+            metadata.kind,
+            metadata.len
+        );
+        Ok(metadata)
     }
 
     fn read_dir_entries(
         &self,
         normalized_path: &str,
     ) -> Result<Vec<fat::BootVolumeDirEntry>, VfsError> {
-        match self.source {
-            FatMountSource::BootVolume => {
-                let volume = fat::BootVolume::open().map_err(map_fat_error)?;
-                let result = volume.read_dir(normalized_path).map_err(map_fat_error);
-                match (result, volume.close()) {
-                    (Ok(value), Ok(())) => Ok(value),
-                    (Ok(_), Err(err)) => Err(map_fat_error(err)),
-                    (Err(err), _) => Err(err),
-                }
-            }
-            FatMountSource::BlockDevice(handle) => open_registry_dir(handle, normalized_path),
+        open_registry_dir(self.handle, normalized_path)
+    }
+}
+
+fn parse_mount_access_policy(options: Option<&str>) -> Result<FatAccessPolicy, MountError> {
+    let mut access_policy = FatAccessPolicy::Standard;
+    let Some(options) = options else {
+        return Ok(access_policy);
+    };
+
+    for option in options.split(',') {
+        let option = option.trim();
+        if option.is_empty() {
+            continue;
+        }
+        match option {
+            "access=standard" => access_policy = FatAccessPolicy::Standard,
+            "access=boot" => access_policy = FatAccessPolicy::Boot,
+            _ => return Err(MountError::InvalidArgument),
         }
     }
 
-    fn source_name(&self) -> &'static str {
-        match self.source {
-            FatMountSource::BootVolume => "boot",
-            FatMountSource::BlockDevice(_) => "block",
-        }
-    }
+    Ok(access_policy)
 }
 
 fn normalize_fat_path(path: &str) -> Result<String, VfsError> {
@@ -280,7 +231,15 @@ fn normalize_fat_path(path: &str) -> Result<String, VfsError> {
     Ok(String::from(path.trim_start_matches('/')))
 }
 
-fn ensure_boot_volume_access(context: &mut VfsContext<'_>, path: &str) -> Result<(), VfsError> {
+fn ensure_mount_access(
+    context: &mut VfsContext<'_>,
+    path: &str,
+    access_policy: FatAccessPolicy,
+) -> Result<(), VfsError> {
+    if !matches!(access_policy, FatAccessPolicy::Boot) {
+        return Ok(());
+    }
+
     if context.is_kernel() || is_runtime_library_path(path) {
         return Ok(());
     }
@@ -296,105 +255,37 @@ fn ensure_boot_volume_access(context: &mut VfsContext<'_>, path: &str) -> Result
     }
 }
 
-fn query_boot_volume_file_metadata(
-    absolute_path: &str,
-    normalized_path: &str,
-) -> Result<VfsMetadata, VfsError> {
-    let volume = fat::BootVolume::open().map_err(map_fat_error)?;
-    let result = {
-        let metadata = volume.metadata(normalized_path).map_err(map_fat_error)?;
-        Ok(super::default_metadata(
-            absolute_path,
-            match metadata.kind {
-                BootVolumeNodeKind::File => VfsNodeKind::File,
-                BootVolumeNodeKind::Directory => VfsNodeKind::Directory,
-            },
-            metadata.len,
-        ))
-    };
-
-    match (result, volume.close()) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(err)) => Err(map_fat_error(err)),
-        (Err(err), _) => Err(err),
-    }
-}
-
 fn open_registry_metadata(
     handle: block::BlockDeviceHandle,
     path: &str,
 ) -> Result<fat::BootVolumeMetadata, VfsError> {
-    let fs = open_registry_filesystem(handle)?;
-    let root = fs.root_dir();
-    if path.is_empty() {
-        return Ok(fat::BootVolumeMetadata {
-            kind: BootVolumeNodeKind::Directory,
-            len: 0,
-        });
-    }
-
-    if let Ok(dir) = root.open_dir(path) {
-        let _ = dir;
-        return Ok(fat::BootVolumeMetadata {
-            kind: BootVolumeNodeKind::Directory,
-            len: 0,
-        });
-    }
-
-    let mut file = root.open_file(path).map_err(map_fat_error)?;
-    let len = file.seek(fatfs::SeekFrom::End(0)).map_err(map_fat_error)?;
-    Ok(fat::BootVolumeMetadata {
-        kind: BootVolumeNodeKind::File,
-        len,
-    })
+    with_registry_volume(handle, |volume| volume.metadata(path).map_err(map_fat_error))
 }
 
 fn open_registry_dir(
     handle: block::BlockDeviceHandle,
     path: &str,
 ) -> Result<Vec<fat::BootVolumeDirEntry>, VfsError> {
-    let fs = open_registry_filesystem(handle)?;
-    let root = fs.root_dir();
-    let dir = if path.is_empty() {
-        root
-    } else {
-        root.open_dir(path).map_err(map_fat_error)?
-    };
-
-    let mut entries = Vec::new();
-    for entry_result in dir.iter() {
-        let entry = entry_result.map_err(map_fat_error)?;
-        let name = entry.file_name();
-        if name == "." || name == ".." {
-            continue;
-        }
-        entries.push(fat::BootVolumeDirEntry {
-            name,
-            kind: if entry.is_dir() {
-                BootVolumeNodeKind::Directory
-            } else {
-                BootVolumeNodeKind::File
-            },
-        });
-    }
-    Ok(entries)
+    with_registry_volume(handle, |volume| volume.read_dir(path).map_err(map_fat_error))
 }
 
-fn open_registry_filesystem(
+fn open_registry_volume(
     handle: block::BlockDeviceHandle,
-) -> Result<
-    fatfs::FileSystem<
-        fat::FatDisk<block::FatRegistryDevice>,
-        fatfs::DefaultTimeProvider,
-        fatfs::LossyOemCpConverter,
-    >,
-    VfsError,
-> {
-    fatfs::FileSystem::new(
-        fat::FatDisk::new(block::FatRegistryDevice::new(handle)),
-        fatfs::FsOptions::new(),
-    )
-    .map_err(map_fat_error)
+) -> Result<fat::MountedFatVolume<block::FatRegistryDevice>, VfsError> {
+    fat::open_volume(block::FatRegistryDevice::new(handle)).map_err(map_fat_error)
+}
+
+fn with_registry_volume<T>(
+    handle: block::BlockDeviceHandle,
+    f: impl FnOnce(&fat::MountedFatVolume<block::FatRegistryDevice>) -> Result<T, VfsError>,
+) -> Result<T, VfsError> {
+    let volume = open_registry_volume(handle)?;
+    let result = f(&volume);
+    match (result, volume.unmount().map_err(map_fat_error)) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(err)) => Err(err),
+        (Err(err), _) => Err(err),
+    }
 }
 
 fn is_runtime_library_path(path: &str) -> bool {
@@ -419,5 +310,43 @@ fn map_fat_error(err: fatfs::Error<fat::DiskIoError>) -> VfsError {
         fatfs::Error::InvalidInput => VfsError::InvalidArgument,
         fatfs::Error::Io(fat::DiskIoError::InvalidInput) => VfsError::InvalidArgument,
         _ => VfsError::Unsupported,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_mount_access_policy, FatAccessPolicy};
+    use crate::vfs::MountError;
+
+    #[test]
+    fn parse_mount_access_policy_defaults_to_standard() {
+        assert!(matches!(
+            parse_mount_access_policy(None).unwrap(),
+            FatAccessPolicy::Standard
+        ));
+        assert!(matches!(
+            parse_mount_access_policy(Some("")).unwrap(),
+            FatAccessPolicy::Standard
+        ));
+    }
+
+    #[test]
+    fn parse_mount_access_policy_accepts_boot_and_standard() {
+        assert!(matches!(
+            parse_mount_access_policy(Some("access=boot")).unwrap(),
+            FatAccessPolicy::Boot
+        ));
+        assert!(matches!(
+            parse_mount_access_policy(Some("access=boot,access=standard")).unwrap(),
+            FatAccessPolicy::Standard
+        ));
+    }
+
+    #[test]
+    fn parse_mount_access_policy_rejects_unknown_options() {
+        assert!(matches!(
+            parse_mount_access_policy(Some("rw")),
+            Err(MountError::InvalidArgument)
+        ));
     }
 }

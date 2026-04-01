@@ -34,6 +34,7 @@ const SECONDARY_LINUX_SYSCALL_DEBUG_LIMIT: usize = 0;
 
 static SECONDARY_LINUX_SYSCALL_DEBUG_LOGS: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 fn debug_log_secondary_linux_syscall(message: impl FnOnce() -> alloc::string::String) {
     if multitask::current_console_session().is_system() {
         return;
@@ -1053,6 +1054,7 @@ fn linux_errno(errno: i64) -> u64 {
     (-errno) as u64
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code))]
 fn debug_user_path(path_ptr: u64) -> String {
     match usermem::read_current_user_c_string(path_ptr, 256) {
         Ok(path) => path,
