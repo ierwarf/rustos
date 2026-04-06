@@ -1,0 +1,23 @@
+id = "inputd"
+kind = "service"
+execution_domain = "user"
+profiles = ["default"]
+startup = "session"
+
+[build]
+builder = "cargo-kernel-binary"
+package = "inputd"
+
+[install]
+path = "services/inputd/inputd.elf"
+
+[boot]
+preload = true
+required = false
+priority = -540
+
+[[desktop.entries]]
+display_name = "inputd"
+weight_micros = 50
+logical_admin = true
+console_hosted = false

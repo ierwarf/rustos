@@ -1,0 +1,23 @@
+id = "initd"
+kind = "service"
+execution_domain = "user"
+profiles = ["default"]
+startup = "init"
+
+[build]
+builder = "cargo-kernel-binary"
+package = "initd"
+
+[install]
+path = "services/initd/initd.elf"
+
+[boot]
+preload = true
+required = false
+priority = -600
+
+[[desktop.entries]]
+display_name = "initd"
+weight_micros = 50
+logical_admin = true
+console_hosted = false

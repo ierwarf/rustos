@@ -1,0 +1,10 @@
+[package]
+name = "wayclick"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+libc = "0.2"
+wayland-client = "0.31.14"
+wayland-protocols = { version = "0.32.12", features = ["client"] }

@@ -1,0 +1,23 @@
+id = "sessiond"
+kind = "service"
+execution_domain = "user"
+profiles = ["default"]
+startup = "session"
+
+[build]
+builder = "cargo-kernel-binary"
+package = "sessiond"
+
+[install]
+path = "services/sessiond/sessiond.elf"
+
+[boot]
+preload = true
+required = false
+priority = -550
+
+[[desktop.entries]]
+display_name = "sessiond"
+weight_micros = 50
+logical_admin = true
+console_hosted = false

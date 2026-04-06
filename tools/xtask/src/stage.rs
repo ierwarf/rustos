@@ -5,20 +5,38 @@ use std::process::Command;
 use crate::Result;
 use crate::config::Config;
 use crate::package_manifest::{
-    BuilderKind, DEFAULT_PROFILE, DesktopLaunchMode, InstallLayout, PackageManifest, load_manifests,
+    BuilderKind, DesktopLaunchMode, InstallLayout, PackageManifest, StartupMode,
+    load_default_manifests,
 };
 use crate::util::{
-    command_in_path, copy_or_unpack_firmware, copy_with_parent, remove_dir_if_exists,
-    remove_file_if_exists, run_command,
+    command_in_path, copy_or_unpack_firmware, copy_tree_files, copy_with_parent,
+    remove_dir_if_exists, remove_file_if_exists, run_command,
 };
 
 const DRIVER_REGISTRY_PATH: &str = "system/registry/kernel/loadable-drivers.tsv";
 const DESKTOP_REGISTRY_PATH: &str = "system/registry/system/desktop-programs.tsv";
+const STARTUP_REGISTRY_PATH: &str = "system/registry/system/startup-programs.tsv";
 const WINDOWS_DLL_REGISTRY_PATH: &str = "system/registry/compat/windows-system-dlls.txt";
 const LD_SO_CONF_PATH: &str = "etc/ld.so.conf";
+const LEGACY_BUILD_DIRS: &[&str] = &["EFI", "etc", "lib", "lib64", "linux", "SYSTEM"];
+const LEGACY_BUILD_FILES: &[&str] = &[
+    "kernel.elf",
+    "prekernel.elf",
+    "UISERVER.ELF",
+    "UISERVER.EXE",
+    "SHELL.ELF",
+    "EXECSMOKE.ELF",
+    "USERDEMO.ELF",
+    "USERDEMO.EXE",
+    "NvVars",
+    "artifacts/boot/BOOTX64.EFI",
+    "background.jpg",
+    "sonic.gif",
+];
+const LEGACY_ROOT_FILES: &[&str] = &["debugcon.log", "qemu_interrupt.log"];
 
 pub(crate) fn stage(config: &Config) -> Result<()> {
-    let manifests = selected_manifests(config)?;
+    let manifests = load_default_manifests(&config.root_dir)?;
 
     remove_dir_if_exists(&config.image_dir)?;
     cleanup_legacy_build_layout(config)?;
@@ -29,24 +47,19 @@ pub(crate) fn stage(config: &Config) -> Result<()> {
         stage_manifest(config, manifest)?;
     }
 
-    fs::create_dir_all(&config.amdgpu_image_firmware_dir)?;
+    let amdgpu_image_firmware_dir = config.amdgpu_image_firmware_dir();
+    fs::create_dir_all(&amdgpu_image_firmware_dir)?;
     for basename in &config.amdgpu_required_firmware_basenames {
-        let dst = config.amdgpu_image_firmware_dir.join(basename);
+        let dst = amdgpu_image_firmware_dir.join(basename);
         copy_or_unpack_firmware(&config.amdgpu_firmware_dir, basename, &dst)?;
     }
 
     write_driver_registry(config, &manifests)?;
     write_desktop_registry(config, &manifests)?;
+    write_startup_registry(config, &manifests)?;
     write_windows_dll_registry(config, &manifests)?;
     generate_dynamic_linker_cache(&config.image_dir)?;
     Ok(())
-}
-
-fn selected_manifests(config: &Config) -> Result<Vec<PackageManifest>> {
-    Ok(load_manifests(&config.root_dir)?
-        .into_iter()
-        .filter(|manifest| manifest.profile_enabled(DEFAULT_PROFILE))
-        .collect())
 }
 
 fn stage_manifest(config: &Config, manifest: &PackageManifest) -> Result<()> {
@@ -83,27 +96,7 @@ fn stage_manifest(config: &Config, manifest: &PackageManifest) -> Result<()> {
 }
 
 fn stage_directory_manifest(src_root: &Path, dst_root: &Path) -> Result<()> {
-    let mut stack = vec![(src_root.to_path_buf(), dst_root.to_path_buf())];
-
-    while let Some((src_dir, dst_dir)) = stack.pop() {
-        let mut entries = fs::read_dir(&src_dir)?.collect::<std::result::Result<Vec<_>, _>>()?;
-        entries.sort_by_key(|entry| entry.path());
-        for entry in entries.into_iter().rev() {
-            let src_path = entry.path();
-            let dst_path = dst_dir.join(entry.file_name());
-            let file_type = entry.file_type()?;
-            if file_type.is_dir() {
-                stack.push((src_path, dst_path));
-                continue;
-            }
-            if !file_type.is_file() {
-                continue;
-            }
-            copy_with_parent(&src_path, &dst_path)?;
-        }
-    }
-
-    Ok(())
+    copy_tree_files(src_root, dst_root)
 }
 
 fn write_driver_registry(config: &Config, manifests: &[PackageManifest]) -> Result<()> {
@@ -179,6 +172,43 @@ fn write_desktop_registry(config: &Config, manifests: &[PackageManifest]) -> Res
     write_registry_lines(config.image_dir.join(DESKTOP_REGISTRY_PATH), &lines)
 }
 
+fn write_startup_registry(config: &Config, manifests: &[PackageManifest]) -> Result<()> {
+    let mut lines = Vec::new();
+    for manifest in manifests {
+        if matches!(manifest.startup, StartupMode::None) || !manifest.artifact_path(config).exists()
+        {
+            continue;
+        }
+        let entry = manifest.desktop.entries.first().ok_or_else(|| {
+            format!(
+                "package {} has startup mode but no desktop entries",
+                manifest.id
+            )
+        })?;
+        let image = entry.image.as_deref().unwrap_or(&manifest.install.path);
+        let exec = entry.exec.as_deref().unwrap_or(image);
+        let launch = match entry.launch {
+            DesktopLaunchMode::None => "none",
+            DesktopLaunchMode::NewSession => "new-session",
+            DesktopLaunchMode::AllSessions => "all-sessions",
+        };
+        let mode = match manifest.startup {
+            StartupMode::None => "none",
+            StartupMode::Init => "init",
+            StartupMode::Session => "session",
+            StartupMode::Desktop => "desktop",
+        };
+        lines.push(format!(
+            "mode={}\tdisplay_name={}\texec={}\tlaunch={}",
+            mode,
+            registry_value(&entry.display_name)?,
+            registry_value(exec)?,
+            launch,
+        ));
+    }
+    write_registry_lines(config.image_dir.join(STARTUP_REGISTRY_PATH), &lines)
+}
+
 fn write_windows_dll_registry(config: &Config, manifests: &[PackageManifest]) -> Result<()> {
     let mut lines = Vec::new();
     for manifest in manifests
@@ -236,75 +266,25 @@ fn path_join_unix(prefix: &str, suffix: &Path) -> Result<String> {
 }
 
 fn cleanup_legacy_build_layout(config: &Config) -> Result<()> {
-    for path in [
-        config.build_dir.join("EFI"),
-        config.build_dir.join("etc"),
-        config.build_dir.join("lib"),
-        config.build_dir.join("lib64"),
-        config.build_dir.join("linux"),
-        config.build_dir.join("SYSTEM"),
-    ] {
-        remove_dir_if_exists(&path)?;
+    for relative in LEGACY_BUILD_DIRS {
+        remove_dir_if_exists(&config.build_dir.join(relative))?;
     }
 
-    for path in [
-        config.image_dir.join("startup.nsh"),
-        config.build_dir.join("kernel.elf"),
-        config.build_dir.join("prekernel.elf"),
-        config.build_dir.join("UISERVER.ELF"),
-        config.build_dir.join("UISERVER.EXE"),
-        config.build_dir.join("SHELL.ELF"),
-        config.build_dir.join("EXECSMOKE.ELF"),
-        config.build_dir.join("USERDEMO.ELF"),
-        config.build_dir.join("USERDEMO.EXE"),
-        config.build_dir.join("NvVars"),
-        config.build_dir.join("artifacts/boot/BOOTX64.EFI"),
-        config.build_dir.join("background.jpg"),
-        config.build_dir.join("sonic.gif"),
-        config.root_dir.join("debugcon.log"),
-        config.root_dir.join("qemu_interrupt.log"),
-    ] {
-        remove_file_if_exists(&path)?;
+    remove_file_if_exists(&config.image_dir.join("startup.nsh"))?;
+
+    for relative in LEGACY_BUILD_FILES {
+        remove_file_if_exists(&config.build_dir.join(relative))?;
+    }
+
+    for relative in LEGACY_ROOT_FILES {
+        remove_file_if_exists(&config.root_dir.join(relative))?;
     }
 
     Ok(())
 }
 
 fn stage_image_asset_overlay(src_root: &Path, dst_root: &Path) -> Result<()> {
-    if !src_root.is_dir() {
-        return Ok(());
-    }
-
-    stage_image_asset_overlay_recursive(src_root, src_root, dst_root)
-}
-
-fn stage_image_asset_overlay_recursive(
-    src_root: &Path,
-    current_dir: &Path,
-    dst_root: &Path,
-) -> Result<()> {
-    let mut entries = fs::read_dir(current_dir)?.collect::<std::result::Result<Vec<_>, _>>()?;
-    entries.sort_by_key(|entry| entry.path());
-
-    for entry in entries {
-        let src_path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            stage_image_asset_overlay_recursive(src_root, &src_path, dst_root)?;
-            continue;
-        }
-        if !file_type.is_file() {
-            continue;
-        }
-
-        let relative = src_path
-            .strip_prefix(src_root)
-            .map_err(|_| format!("asset path escaped overlay root: {}", src_path.display()))?;
-        let dst_path = dst_root.join(relative);
-        copy_with_parent(&src_path, &dst_path)?;
-    }
-
-    Ok(())
+    copy_tree_files(src_root, dst_root)
 }
 
 fn generate_dynamic_linker_cache(image_dir: &Path) -> Result<()> {

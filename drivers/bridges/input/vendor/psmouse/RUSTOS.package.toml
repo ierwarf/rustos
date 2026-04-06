@@ -1,0 +1,27 @@
+id = "psmouse"
+kind = "bridge-driver"
+execution_domain = "kernel"
+profiles = ["default"]
+
+[build]
+builder = "external-copy"
+source = "vendor/modules/input/psmouse.ko"
+source_env = "VENDOR_PSMOUSE_KO"
+optional = true
+
+[install]
+path = "system/drivers/input/psmouse.ko"
+
+[boot]
+preload = true
+required = false
+priority = 200
+
+startup = "none"
+
+[autoload]
+name = "psmouse"
+class = "input"
+bus = "serio"
+priority = 0
+when = "vfs-ready"

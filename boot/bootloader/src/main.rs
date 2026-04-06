@@ -12,7 +12,7 @@ mod settings;
 pub(crate) use boot::{boot_info, error};
 pub(crate) use platform::{debug, gui, random};
 
-use crate::boot::boot_prekernel;
+use crate::boot::boot_kernel;
 use crate::error::BootError;
 use raw_cpuid::CpuId;
 use uefi::prelude::*;
@@ -38,7 +38,7 @@ fn main() -> Status {
         }
     }
 
-    match boot_prekernel() {
+    match boot_kernel() {
         Ok(()) => Status::SUCCESS,
         Err(err) => report_boot_error(err),
     }

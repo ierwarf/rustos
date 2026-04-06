@@ -51,6 +51,7 @@ pub(crate) fn run_cargo_kernel_rustc(
         "{cargo} rustc --manifest-path {manifest} {zflags...} -p {package} --target {target} --release -- {rustc_args...}"
     )
     .env("CARGO_TARGET_DIR", &config.cargo_target_dir)
+    .env("RUSTFLAGS", kernel_rustflags_env())
     .run()?;
     Ok(())
 }
@@ -66,8 +67,18 @@ pub(crate) fn run_cargo_kernel_check(config: &Config, package: &str) -> Result<(
         "{cargo} check --manifest-path {manifest} {zflags...} -p {package} --target {target}"
     )
     .env("CARGO_TARGET_DIR", &config.cargo_target_dir)
+    .env("RUSTFLAGS", kernel_rustflags_env())
     .run()?;
     Ok(())
+}
+
+pub(crate) fn kernel_rustflags_env() -> String {
+    let mut rustflags = env_string("RUSTFLAGS").unwrap_or_default();
+    if !rustflags.is_empty() {
+        rustflags.push(' ');
+    }
+    rustflags.push_str("-C no-redzone");
+    rustflags
 }
 
 pub(crate) fn copy_with_parent(src: &Path, dst: &Path) -> Result<()> {
@@ -76,6 +87,32 @@ pub(crate) fn copy_with_parent(src: &Path, dst: &Path) -> Result<()> {
         .ok_or_else(|| format!("destination has no parent: {}", dst.display()))?;
     fs::create_dir_all(parent)?;
     fs::copy(src, dst)?;
+    Ok(())
+}
+
+pub(crate) fn copy_tree_files(src_root: &Path, dst_root: &Path) -> Result<()> {
+    if !src_root.is_dir() {
+        return Ok(());
+    }
+
+    let mut stack = vec![(src_root.to_path_buf(), dst_root.to_path_buf())];
+    while let Some((src_dir, dst_dir)) = stack.pop() {
+        let mut entries = fs::read_dir(&src_dir)?.collect::<std::result::Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.path());
+        for entry in entries.into_iter().rev() {
+            let src_path = entry.path();
+            let dst_path = dst_dir.join(entry.file_name());
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                stack.push((src_path, dst_path));
+                continue;
+            }
+            if file_type.is_file() {
+                copy_with_parent(&src_path, &dst_path)?;
+            }
+        }
+    }
+
     Ok(())
 }
 

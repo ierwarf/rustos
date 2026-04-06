@@ -1,0 +1,27 @@
+id = "usbhid"
+kind = "bridge-driver"
+execution_domain = "kernel"
+profiles = ["default"]
+
+[build]
+builder = "external-copy"
+source = "vendor/modules/input/usbhid.ko"
+source_env = "VENDOR_USBHID_KO"
+optional = true
+
+[install]
+path = "system/drivers/input/usbhid.ko"
+
+[boot]
+preload = true
+required = false
+priority = 230
+
+startup = "none"
+
+[autoload]
+name = "usbhid"
+class = "input"
+bus = "usb"
+priority = 120
+when = "vfs-ready"

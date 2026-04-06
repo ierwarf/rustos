@@ -1,7 +1,7 @@
 #![no_std]
 
 pub const BOOT_INFO_MAGIC: u64 = 0x5255_5354_4F53_4749; // "RUSTOSGI"
-pub const BOOT_INFO_VERSION: u32 = 11;
+pub const BOOT_INFO_VERSION: u32 = 12;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +62,30 @@ impl BootMemoryMap {
             entry_count: 0,
             _reserved0: 0,
         }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KernelImageInfo {
+    pub phys_start: u64,
+    pub size: u64,
+    pub load_bias: u64,
+    pub entry_point: u64,
+}
+
+impl KernelImageInfo {
+    pub const fn empty() -> Self {
+        Self {
+            phys_start: 0,
+            size: 0,
+            load_bias: 0,
+            entry_point: 0,
+        }
+    }
+
+    pub const fn is_present(&self) -> bool {
+        self.size != 0 && self.load_bias != 0 && self.entry_point != 0
     }
 }
 
@@ -129,5 +153,6 @@ pub struct BootInfo {
     pub acpi_rsdp_addr: u64,
     pub boot_volume: BootVolumeIdentity,
     pub framebuffer: FramebufferInfo,
+    pub kernel_image: KernelImageInfo,
     pub memory_map: BootMemoryMap,
 }

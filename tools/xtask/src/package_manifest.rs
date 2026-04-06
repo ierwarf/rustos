@@ -15,12 +15,45 @@ pub(crate) const DEFAULT_PROFILE: &str = "default";
 pub(crate) enum PackageKind {
     Boot,
     Kernel,
-    Driver,
-    SystemApp,
-    SystemLib,
-    CompatKernel,
-    CompatUser,
-    Sample,
+    #[serde(alias = "driver")]
+    BridgeDriver,
+    UserDriver,
+    #[serde(alias = "system-app")]
+    Service,
+    #[serde(alias = "sample")]
+    App,
+    #[serde(alias = "compat-user")]
+    #[serde(alias = "compat-kernel")]
+    Compat,
+}
+
+impl PackageKind {
+    pub(crate) fn is_driver(&self) -> bool {
+        matches!(self, Self::BridgeDriver | Self::UserDriver)
+    }
+
+    pub(crate) fn default_execution_domain(&self) -> ExecutionDomain {
+        match self {
+            Self::Boot | Self::Kernel | Self::BridgeDriver => ExecutionDomain::Kernel,
+            Self::UserDriver | Self::Service | Self::App | Self::Compat => ExecutionDomain::User,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ExecutionDomain {
+    Kernel,
+    User,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum StartupMode {
+    None,
+    Init,
+    Session,
+    Desktop,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -44,6 +77,10 @@ pub(crate) enum DesktopLaunchMode {
 
 fn default_desktop_launch_mode() -> DesktopLaunchMode {
     DesktopLaunchMode::None
+}
+
+fn default_startup_mode() -> StartupMode {
+    StartupMode::None
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -71,8 +108,6 @@ pub(crate) struct BuildSpec {
     pub(crate) source: Option<String>,
     #[serde(default)]
     pub(crate) source_env: Option<String>,
-    #[serde(default)]
-    pub(crate) output_name: Option<String>,
     #[serde(default)]
     pub(crate) dependency_crates: Vec<String>,
     #[serde(default)]
@@ -148,10 +183,14 @@ pub(crate) struct DesktopSection {
 pub(crate) struct PackageManifest {
     pub(crate) id: String,
     pub(crate) kind: PackageKind,
+    #[serde(default)]
+    pub(crate) execution_domain: Option<ExecutionDomain>,
     #[serde(default = "default_profiles")]
     pub(crate) profiles: Vec<String>,
     pub(crate) build: BuildSpec,
     pub(crate) install: InstallSpec,
+    #[serde(default = "default_startup_mode")]
+    pub(crate) startup: StartupMode,
     #[allow(dead_code)]
     #[serde(default)]
     pub(crate) boot: BootSpec,
@@ -174,6 +213,11 @@ fn default_profiles() -> Vec<String> {
 }
 
 impl PackageManifest {
+    pub(crate) fn execution_domain(&self) -> ExecutionDomain {
+        self.execution_domain
+            .unwrap_or_else(|| self.kind.default_execution_domain())
+    }
+
     pub(crate) fn artifact_path(&self, config: &Config) -> PathBuf {
         config.artifact_dir.join(&self.install.path)
     }
@@ -217,6 +261,30 @@ pub(crate) fn load_manifests(root_dir: &Path) -> Result<Vec<PackageManifest>> {
     Ok(manifests)
 }
 
+pub(crate) fn load_profile_manifests(
+    root_dir: &Path,
+    profile: &str,
+) -> Result<Vec<PackageManifest>> {
+    Ok(load_manifests(root_dir)?
+        .into_iter()
+        .filter(|manifest| manifest.profile_enabled(profile))
+        .collect())
+}
+
+pub(crate) fn load_default_manifests(root_dir: &Path) -> Result<Vec<PackageManifest>> {
+    load_profile_manifests(root_dir, DEFAULT_PROFILE)
+}
+
+pub(crate) fn required_manifest<'a>(
+    manifests: &'a [PackageManifest],
+    id: &str,
+) -> Result<&'a PackageManifest> {
+    manifests
+        .iter()
+        .find(|manifest| manifest.id == id)
+        .ok_or_else(|| format!("missing package manifest: {id}").into())
+}
+
 fn scan_manifest_paths(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     let mut entries = fs::read_dir(dir)?.collect::<std::result::Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.path());
@@ -248,6 +316,7 @@ fn validate_manifests(manifests: &[PackageManifest]) -> Result<()> {
     let mut install_paths = BTreeMap::<&str, &Path>::new();
 
     for manifest in manifests {
+        let execution_domain = manifest.execution_domain();
         if manifest.id.trim().is_empty() {
             return Err(format!(
                 "package id is empty in {}",
@@ -336,13 +405,133 @@ fn validate_manifests(manifests: &[PackageManifest]) -> Result<()> {
             }
         }
 
-        if manifest.autoload.is_some() && manifest.kind != PackageKind::Driver {
+        if manifest.autoload.is_some() && !manifest.kind.is_driver() {
             return Err(format!(
                 "package {} defines autoload metadata but is not a driver",
                 manifest.id
             )
             .into());
         }
+
+        match manifest.kind {
+            PackageKind::Boot | PackageKind::Kernel | PackageKind::BridgeDriver
+                if execution_domain != ExecutionDomain::Kernel =>
+            {
+                return Err(format!(
+                    "package {} must use execution_domain = \"kernel\"",
+                    manifest.id
+                )
+                .into());
+            }
+            PackageKind::UserDriver
+            | PackageKind::Service
+            | PackageKind::App
+            | PackageKind::Compat
+                if execution_domain != ExecutionDomain::User =>
+            {
+                return Err(format!(
+                    "package {} must use execution_domain = \"user\"",
+                    manifest.id
+                )
+                .into());
+            }
+            _ => {}
+        }
+
+        validate_manifest_location(manifest)?;
+        validate_install_taxonomy(manifest)?;
+
+        if matches!(
+            manifest.startup,
+            StartupMode::Init | StartupMode::Session | StartupMode::Desktop
+        ) && manifest.desktop.entries.is_empty()
+        {
+            return Err(format!(
+                "package {} uses startup mode {:?} but defines no desktop entries",
+                manifest.id, manifest.startup
+            )
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_manifest_location(manifest: &PackageManifest) -> Result<()> {
+    let relative = manifest.manifest_path.to_string_lossy().replace('\\', "/");
+
+    let expected_root = match manifest.kind {
+        PackageKind::Boot => "boot/",
+        PackageKind::Kernel => "kernel/",
+        PackageKind::BridgeDriver => "drivers/bridges/",
+        PackageKind::UserDriver => "drivers/user/",
+        PackageKind::Service => "services/",
+        PackageKind::App => "apps/",
+        PackageKind::Compat => "compat/",
+    };
+
+    if relative.contains(&format!("/{expected_root}")) || relative.starts_with(expected_root) {
+        return Ok(());
+    }
+
+    Err(format!(
+        "package {} has kind {:?} but manifest is outside {}: {}",
+        manifest.id,
+        manifest.kind,
+        expected_root,
+        manifest.manifest_path.display()
+    )
+    .into())
+}
+
+fn validate_install_taxonomy(manifest: &PackageManifest) -> Result<()> {
+    let path = manifest.install.path.as_str();
+
+    match manifest.kind {
+        PackageKind::BridgeDriver => {
+            if !path.starts_with("system/drivers/") || !path.ends_with(".ko") {
+                return Err(format!(
+                    "bridge driver {} must install to system/drivers/*.ko, got {}",
+                    manifest.id, path
+                )
+                .into());
+            }
+        }
+        PackageKind::UserDriver => {
+            if !path.starts_with("drivers/user/") {
+                return Err(format!(
+                    "user driver {} must install under drivers/user/, got {}",
+                    manifest.id, path
+                )
+                .into());
+            }
+        }
+        PackageKind::Service => {
+            if !path.starts_with("services/") {
+                return Err(format!(
+                    "service {} must install under services/, got {}",
+                    manifest.id, path
+                )
+                .into());
+            }
+        }
+        PackageKind::App => {
+            if !path.starts_with("apps/") {
+                return Err(
+                    format!("app {} must install under apps/, got {}", manifest.id, path).into(),
+                );
+            }
+        }
+        PackageKind::Compat => {
+            if !path.starts_with("compat/") {
+                return Err(format!(
+                    "compat package {} must install under compat/, got {}",
+                    manifest.id, path
+                )
+                .into());
+            }
+        }
+        PackageKind::Boot | PackageKind::Kernel => {}
     }
 
     Ok(())

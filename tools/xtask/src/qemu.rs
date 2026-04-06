@@ -17,6 +17,7 @@ struct RunOptions {
     accel: String,
     usb_input: bool,
     debugcon: DebugconMode,
+    qemu_log: QemuLogMode,
     vfio_force: bool,
     auto_phoenix3_passthrough: bool,
     vfio_hosts: Vec<String>,
@@ -30,6 +31,7 @@ impl RunOptions {
             accel: env_string("RUSTOS_QEMU_ACCEL").unwrap_or_default(),
             usb_input: false,
             debugcon: DebugconMode::File,
+            qemu_log: QemuLogMode::None,
             vfio_force: false,
             auto_phoenix3_passthrough: false,
             vfio_hosts: Vec::new(),
@@ -41,6 +43,34 @@ impl RunOptions {
 struct RunSession {
     temp_dir: PathBuf,
     debugcon_tail: Option<Child>,
+}
+
+struct PreparedRun {
+    qemu_bin: PathBuf,
+    session: RunSession,
+    profile_args: Vec<OsString>,
+    vfio_args: Vec<OsString>,
+    usb_args: Vec<OsString>,
+    display_args: Vec<OsString>,
+    debugcon_args: Vec<OsString>,
+    qemu_log_args: Vec<OsString>,
+    qemu_user_args: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+enum QemuBootDisk {
+    Ahci,
+    Nvme,
+}
+
+#[derive(Clone, Copy)]
+struct QemuProfileSpec {
+    boot_disk: QemuBootDisk,
+    memory: &'static str,
+    cpu_when_kvm: Option<&'static str>,
+    cpu_other: Option<&'static str>,
+    smp: Option<&'static str>,
+    rtc: Option<&'static str>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,6 +86,22 @@ impl DebugconMode {
             "file" => Some(Self::File),
             "stdio" => Some(Self::Stdio),
             "null" | "off" => Some(Self::Null),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QemuLogMode {
+    None,
+    Interrupt,
+}
+
+impl QemuLogMode {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "none" | "null" | "off" => Some(Self::None),
+            "int" | "interrupt" => Some(Self::Interrupt),
             _ => None,
         }
     }
@@ -88,10 +134,11 @@ const PROBE_BAD_MARKERS: [&str; 5] = [
     "xhci event: type=0",
     "stale display surface detected, rebuilding",
 ];
-const PROBE_BOOT_TIMEOUT: Duration = Duration::from_secs(30);
+const PROBE_BOOT_TIMEOUT_DEFAULT: Duration = Duration::from_secs(30);
 const PROBE_QMP_TIMEOUT: Duration = Duration::from_secs(10);
-const PROBE_STRESS_STEPS: usize = 96;
 const PROBE_STEP_DELAY: Duration = Duration::from_millis(25);
+const PROBE_STRESS_DURATION_DEFAULT: Duration = Duration::from_secs(20);
+const PROBE_HEARTBEAT_STALL_DEFAULT: Duration = Duration::from_millis(2500);
 
 pub(crate) fn run_qemu_command<I>(config: &Config, mut args: I) -> Result<()>
 where
@@ -138,6 +185,11 @@ where
                 options.debugcon = DebugconMode::parse(value.as_str())
                     .ok_or_else(|| format!("invalid --debugcon value: {value}"))?;
             }
+            "--qemu-log" => {
+                let value = next_required_arg(args, "--qemu-log")?;
+                options.qemu_log = QemuLogMode::parse(value.as_str())
+                    .ok_or_else(|| format!("invalid --qemu-log value: {value}"))?;
+            }
             "--vfio-pci" => {
                 let host = next_required_arg(args, "--vfio-pci")?;
                 append_unique_string(&mut options.vfio_hosts, host);
@@ -156,67 +208,22 @@ where
 }
 
 fn run_qemu_with_options(config: &Config, options: RunOptions) -> Result<()> {
-    let qemu_bin = resolve_command_path(&config.qemu_bin).ok_or_else(|| {
-        format!(
-            "missing QEMU binary: {}",
-            Path::new(&config.qemu_bin).display()
-        )
-    })?;
-
-    if !config.image_dir.is_dir() {
-        return Err(format!(
-            "missing build image directory: {} (run `cargo xtask build` first)",
-            config.image_dir.display()
-        )
-        .into());
-    }
-    if !config.boot_efi.is_file() {
-        return Err(format!(
-            "missing staged bootloader image: {} (run `cargo xtask build` first)",
-            config.boot_efi.display()
-        )
-        .into());
-    }
-    if !config.ovmf_path.is_file() {
-        return Err(format!(
-            "missing OVMF firmware image: {}",
-            config.ovmf_path.display()
-        )
-        .into());
-    }
-
-    let mut session = RunSession::create()?;
-    let mut profile_args = build_run_profile_args(&options, &config.image_dir)?;
-    let mut vfio_hosts = options.vfio_hosts.clone();
-    if options.auto_phoenix3_passthrough {
-        for bdf in detect_phoenix3_devices()? {
-            append_unique_string(&mut vfio_hosts, bdf);
-        }
-    }
-
-    let vfio_args = configure_vfio_args(&mut profile_args, &vfio_hosts, options.vfio_force)?;
-    let usb_args = configure_usb_args(options.usb_input, &options.qemu_user_args);
-    let display_args = configure_display_args(&options.qemu_user_args);
-    let debugcon_args = configure_debugcon(
-        config,
-        &options.qemu_user_args,
-        &mut session,
-        options.debugcon,
-    )?;
+    let prepared = prepare_run(config, options)?;
 
     println!(
         "\n====================================\nStarting QEMU...\n====================================\n"
     );
 
-    let mut command = base_qemu_command(config, &qemu_bin);
+    let mut command = base_qemu_command(config, &prepared.qemu_bin);
     append_qemu_args(
         &mut command,
-        &profile_args,
-        &vfio_args,
-        &usb_args,
-        &display_args,
-        &debugcon_args,
-        &options.qemu_user_args,
+        &prepared.profile_args,
+        &prepared.vfio_args,
+        &prepared.usb_args,
+        &prepared.display_args,
+        &prepared.debugcon_args,
+        &prepared.qemu_log_args,
+        &prepared.qemu_user_args,
     );
 
     let status = command.status()?;
@@ -236,6 +243,72 @@ fn run_qemu_with_options(config: &Config, options: RunOptions) -> Result<()> {
     }
 }
 
+fn ensure_qemu_prerequisites(config: &Config) -> Result<()> {
+    if !config.image_dir.is_dir() {
+        return Err(format!(
+            "missing build image directory: {} (run `cargo xtask build` first)",
+            config.image_dir.display()
+        )
+        .into());
+    }
+
+    let boot_efi = config.boot_efi_path();
+    if !boot_efi.is_file() {
+        return Err(format!(
+            "missing staged bootloader image: {} (run `cargo xtask build` first)",
+            boot_efi.display()
+        )
+        .into());
+    }
+
+    if !config.ovmf_path.is_file() {
+        return Err(format!(
+            "missing OVMF firmware image: {}",
+            config.ovmf_path.display()
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+fn prepare_run(config: &Config, options: RunOptions) -> Result<PreparedRun> {
+    ensure_qemu_prerequisites(config)?;
+    let qemu_bin = resolve_command_path(&config.qemu_bin).ok_or_else(|| {
+        format!(
+            "missing QEMU binary: {}",
+            Path::new(&config.qemu_bin).display()
+        )
+    })?;
+
+    let mut session = RunSession::create()?;
+    let mut profile_args = build_run_profile_args(&options, &config.image_dir)?;
+    let mut vfio_hosts = options.vfio_hosts.clone();
+    if options.auto_phoenix3_passthrough {
+        for bdf in detect_phoenix3_devices()? {
+            append_unique_string(&mut vfio_hosts, bdf);
+        }
+    }
+
+    let vfio_args = configure_vfio_args(&mut profile_args, &vfio_hosts, options.vfio_force)?;
+    let usb_args = configure_usb_args(options.usb_input, &options.qemu_user_args);
+    let display_args = configure_display_args(&options.qemu_user_args);
+    let debugcon_args = configure_debugcon(config, &mut session, options.debugcon)?;
+    let qemu_log_args = configure_qemu_log(config, options.qemu_log)?;
+
+    Ok(PreparedRun {
+        qemu_bin,
+        session,
+        profile_args,
+        vfio_args,
+        usb_args,
+        display_args,
+        debugcon_args,
+        qemu_log_args,
+        qemu_user_args: options.qemu_user_args,
+    })
+}
+
 pub(crate) fn print_run_help() {
     println!(
         "\
@@ -247,6 +320,7 @@ options:
                                      accelerator profile; use \"kvm\" for host CPU
   --usb-input                        attach qemu-xhci + usb-kbd + usb-tablet for USB HID testing
   --debugcon <file|stdio|null>       route debugcon to file, terminal, or disable it
+  --qemu-log <int|null>              write QEMU trace log to logs/qemu_interrupt.log or disable it
   --vfio-pci <0000:bb:dd.f>          attach a vfio-pci host device to qemu (repeatable)
   --phoenix3-passthrough             auto-attach host Phoenix3 VGA function and same-slot audio
   --vfio-force                       allow devices that currently drive an active host display
@@ -266,6 +340,7 @@ options:
                                      accelerator profile; use \"kvm\" for host CPU
   --usb-input                        attach qemu-xhci + usb-kbd + usb-tablet for USB HID testing
   --debugcon <file|stdio|null>       route debugcon to file, terminal, or disable it
+  --qemu-log <int|null>              write QEMU trace log to logs/qemu_interrupt.log or disable it
   --vfio-pci <0000:bb:dd.f>          attach a vfio-pci host device to qemu (repeatable)
   --phoenix3-passthrough             auto-attach host Phoenix3 VGA function and same-slot audio
   --vfio-force                       allow devices that currently drive an active host display
@@ -316,80 +391,81 @@ fn append_default_arg_pair(args: &mut Vec<String>, option: &str, value: &str) {
 }
 
 fn build_run_profile_args(options: &RunOptions, boot_dir: &Path) -> Result<Vec<OsString>> {
+    let spec = qemu_profile_spec(options.profile.as_str())?;
     let mut args = Vec::new();
-    match options.profile.as_str() {
-        "default" => {
-            append_ahci_boot_disk_args(&mut args, boot_dir);
-            args.push(OsString::from("-m"));
-            args.push(OsString::from("2G"));
-            args.push(OsString::from("-machine"));
-            if options.accel == "kvm" {
-                args.push(machine_option("q35,accel=kvm", options.usb_input));
-                args.push(OsString::from("-cpu"));
-                args.push(OsString::from("host"));
-            } else {
-                args.push(machine_option("q35", options.usb_input));
-            }
-        }
-        "g14" => {
-            append_ahci_boot_disk_args(&mut args, boot_dir);
-            args.push(OsString::from("-machine"));
-            if options.accel == "kvm" {
-                args.push(machine_option("q35,accel=kvm", options.usb_input));
-            } else {
-                args.push(machine_option("q35", options.usb_input));
-            }
-            args.push(OsString::from("-cpu"));
-            if options.accel == "kvm" {
-                args.push(OsString::from("host"));
-            } else {
-                args.push(OsString::from("EPYC-v4"));
-            }
-            args.push(OsString::from("-smp"));
-            args.push(OsString::from("8,sockets=1,cores=8,threads=1"));
-            args.push(OsString::from("-m"));
-            args.push(OsString::from("8G"));
-            args.push(OsString::from("-rtc"));
-            args.push(OsString::from("base=localtime,clock=host"));
-        }
-        "nvme" => {
-            append_nvme_boot_disk_args(&mut args, boot_dir);
-            args.push(OsString::from("-m"));
-            args.push(OsString::from("2G"));
-            args.push(OsString::from("-machine"));
-            if options.accel == "kvm" {
-                args.push(machine_option("q35,accel=kvm", options.usb_input));
-                args.push(OsString::from("-cpu"));
-                args.push(OsString::from("host"));
-            } else {
-                args.push(machine_option("q35", options.usb_input));
-            }
-        }
-        _ => return Err(format!("unknown qemu profile: {}", options.profile).into()),
+    append_boot_disk_args(&mut args, boot_dir, spec.boot_disk);
+    args.push(OsString::from("-m"));
+    args.push(OsString::from(spec.memory));
+    args.push(OsString::from("-machine"));
+    if options.accel == "kvm" {
+        args.push(machine_option("q35,accel=kvm", options.usb_input));
+    } else {
+        args.push(machine_option("q35", options.usb_input));
+    }
+    if let Some(cpu) = if options.accel == "kvm" {
+        spec.cpu_when_kvm
+    } else {
+        spec.cpu_other
+    } {
+        args.push(OsString::from("-cpu"));
+        args.push(OsString::from(cpu));
+    }
+    if let Some(smp) = spec.smp {
+        args.push(OsString::from("-smp"));
+        args.push(OsString::from(smp));
+    }
+    if let Some(rtc) = spec.rtc {
+        args.push(OsString::from("-rtc"));
+        args.push(OsString::from(rtc));
     }
     Ok(args)
 }
 
-fn append_ahci_boot_disk_args(args: &mut Vec<OsString>, boot_dir: &Path) {
-    args.push(OsString::from("-device"));
-    args.push(OsString::from("ich9-ahci,id=ahci"));
-    args.push(OsString::from("-drive"));
-    args.push(OsString::from(format!(
-        "id=bootdisk,if=none,file=fat:rw:{},format=raw",
-        boot_dir.display()
-    )));
-    args.push(OsString::from("-device"));
-    args.push(OsString::from("ide-hd,drive=bootdisk,bus=ahci.0"));
+fn qemu_profile_spec(profile: &str) -> Result<QemuProfileSpec> {
+    match profile {
+        "default" => Ok(QemuProfileSpec {
+            boot_disk: QemuBootDisk::Ahci,
+            memory: "2G",
+            cpu_when_kvm: Some("host"),
+            cpu_other: None,
+            smp: None,
+            rtc: None,
+        }),
+        "g14" => Ok(QemuProfileSpec {
+            boot_disk: QemuBootDisk::Ahci,
+            memory: "8G",
+            cpu_when_kvm: Some("host"),
+            cpu_other: Some("EPYC-v4"),
+            smp: Some("8,sockets=1,cores=8,threads=1"),
+            rtc: Some("base=localtime,clock=host"),
+        }),
+        "nvme" => Ok(QemuProfileSpec {
+            boot_disk: QemuBootDisk::Nvme,
+            memory: "2G",
+            cpu_when_kvm: Some("host"),
+            cpu_other: None,
+            smp: None,
+            rtc: None,
+        }),
+        _ => Err(format!("unknown qemu profile: {profile}").into()),
+    }
 }
 
-fn append_nvme_boot_disk_args(args: &mut Vec<OsString>, boot_dir: &Path) {
+fn append_boot_disk_args(args: &mut Vec<OsString>, boot_dir: &Path, boot_disk: QemuBootDisk) {
+    if matches!(boot_disk, QemuBootDisk::Ahci) {
+        args.push(OsString::from("-device"));
+        args.push(OsString::from("ich9-ahci,id=ahci"));
+    }
     args.push(OsString::from("-drive"));
     args.push(OsString::from(format!(
         "id=bootdisk,if=none,file=fat:rw:{},format=raw",
         boot_dir.display()
     )));
     args.push(OsString::from("-device"));
-    args.push(OsString::from("nvme,serial=RUSTOSNVME01,drive=bootdisk"));
+    args.push(match boot_disk {
+        QemuBootDisk::Ahci => OsString::from("ide-hd,drive=bootdisk,bus=ahci.0"),
+        QemuBootDisk::Nvme => OsString::from("nvme,serial=RUSTOSNVME01,drive=bootdisk"),
+    });
 }
 
 fn machine_option(base: &str, disable_i8042: bool) -> OsString {
@@ -584,11 +660,9 @@ fn device_drives_active_host_display(bdf: &str) -> Result<bool> {
 
 fn configure_debugcon(
     config: &Config,
-    qemu_user_args: &[String],
     session: &mut RunSession,
     mode: DebugconMode,
 ) -> Result<Vec<OsString>> {
-    let _ = qemu_user_args;
     match mode {
         DebugconMode::Null => {
             return Ok(vec![OsString::from("-debugcon"), OsString::from("null")]);
@@ -621,6 +695,23 @@ fn configure_debugcon(
         OsString::from("-debugcon"),
         OsString::from(format!("file:{}", debugcon_log.display())),
     ])
+}
+
+fn configure_qemu_log(config: &Config, mode: QemuLogMode) -> Result<Vec<OsString>> {
+    match mode {
+        QemuLogMode::None => Ok(Vec::new()),
+        QemuLogMode::Interrupt => {
+            fs::create_dir_all(&config.logs_dir)?;
+            let interrupt_log = config.logs_dir.join("qemu_interrupt.log");
+            fs::File::create(&interrupt_log)?;
+            Ok(vec![
+                OsString::from("-d"),
+                OsString::from("int"),
+                OsString::from("-D"),
+                interrupt_log.into_os_string(),
+            ])
+        }
+    }
 }
 
 fn configure_display_args(qemu_user_args: &[String]) -> Vec<OsString> {
@@ -681,6 +772,10 @@ fn configure_usb_args(enable_usb_input: bool, qemu_user_args: &[String]) -> Vec<
 fn base_qemu_command(config: &Config, qemu_bin: &Path) -> Command {
     let mut command = Command::new(qemu_bin);
     command.current_dir(&config.root_dir);
+    // QEMU's vvfat backend creates temporary files via the host tmpdir. Some
+    // sandboxed runs expose /var/tmp read-only, so force the QEMU child onto
+    // /tmp where the workspace tooling is allowed to create sockets/files.
+    command.env("TMPDIR", "/tmp");
     command.arg("-bios").arg(&config.ovmf_path);
     command
 }
@@ -692,6 +787,7 @@ fn append_qemu_args(
     usb_args: &[OsString],
     display_args: &[OsString],
     debugcon_args: &[OsString],
+    qemu_log_args: &[OsString],
     qemu_user_args: &[String],
 ) {
     command.args(profile_args);
@@ -699,60 +795,15 @@ fn append_qemu_args(
     command.args(usb_args);
     command.args(display_args);
     command.args(debugcon_args);
+    command.args(qemu_log_args);
     command.args(qemu_user_args);
 }
 
 fn run_display_probe(config: &Config, options: RunOptions) -> Result<()> {
-    let qemu_bin = resolve_command_path(&config.qemu_bin).ok_or_else(|| {
-        format!(
-            "missing QEMU binary: {}",
-            Path::new(&config.qemu_bin).display()
-        )
-    })?;
-
-    if !config.image_dir.is_dir() {
-        return Err(format!(
-            "missing build image directory: {} (run `cargo xtask build` first)",
-            config.image_dir.display()
-        )
-        .into());
-    }
-    if !config.boot_efi.is_file() {
-        return Err(format!(
-            "missing staged bootloader image: {} (run `cargo xtask build` first)",
-            config.boot_efi.display()
-        )
-        .into());
-    }
-    if !config.ovmf_path.is_file() {
-        return Err(format!(
-            "missing OVMF firmware image: {}",
-            config.ovmf_path.display()
-        )
-        .into());
-    }
-
-    let mut session = RunSession::create()?;
+    let prepared = prepare_run(config, options)?;
     fs::create_dir_all(&config.logs_dir)?;
 
-    let mut profile_args = build_run_profile_args(&options, &config.image_dir)?;
-    let mut vfio_hosts = options.vfio_hosts.clone();
-    if options.auto_phoenix3_passthrough {
-        for bdf in detect_phoenix3_devices()? {
-            append_unique_string(&mut vfio_hosts, bdf);
-        }
-    }
-
-    let vfio_args = configure_vfio_args(&mut profile_args, &vfio_hosts, options.vfio_force)?;
-    let usb_args = configure_usb_args(options.usb_input, &options.qemu_user_args);
-    let display_args = configure_display_args(&options.qemu_user_args);
-    let debugcon_args = configure_debugcon(
-        config,
-        &options.qemu_user_args,
-        &mut session,
-        options.debugcon,
-    )?;
-    let qmp_socket = session.temp_dir.join("qmp.sock");
+    let qmp_socket = prepared.session.temp_dir.join("qmp.sock");
     let mut qmp_args = Vec::new();
     qmp_args.push(OsString::from("-qmp"));
     qmp_args.push(OsString::from(format!(
@@ -764,15 +815,16 @@ fn run_display_probe(config: &Config, options: RunOptions) -> Result<()> {
         "\n====================================\nStarting headless display probe...\n====================================\n"
     );
 
-    let mut command = base_qemu_command(config, &qemu_bin);
+    let mut command = base_qemu_command(config, &prepared.qemu_bin);
     append_qemu_args(
         &mut command,
-        &profile_args,
-        &vfio_args,
-        &usb_args,
-        &display_args,
-        &debugcon_args,
-        &options.qemu_user_args,
+        &prepared.profile_args,
+        &prepared.vfio_args,
+        &prepared.usb_args,
+        &prepared.display_args,
+        &prepared.debugcon_args,
+        &prepared.qemu_log_args,
+        &prepared.qemu_user_args,
     );
     command.args(&qmp_args);
     command.stdout(Stdio::inherit());
@@ -785,10 +837,10 @@ fn run_display_probe(config: &Config, options: RunOptions) -> Result<()> {
         wait_for_boot_marker(
             &debugcon_log,
             "userspace display active",
-            PROBE_BOOT_TIMEOUT,
+            probe_duration_env("RUSTOS_PROBE_BOOT_TIMEOUT_MS", PROBE_BOOT_TIMEOUT_DEFAULT),
         )?;
 
-        let baseline_dump = session.temp_dir.join("probe-baseline.ppm");
+        let baseline_dump = prepared.session.temp_dir.join("probe-baseline.ppm");
         qmp_screendump(&mut qmp, &baseline_dump)?;
         let baseline = read_ppm_dimensions(&baseline_dump)?;
 
@@ -800,9 +852,9 @@ fn run_display_probe(config: &Config, options: RunOptions) -> Result<()> {
             .into());
         }
 
-        run_probe_mouse_stress(&mut qmp)?;
+        run_probe_mouse_stress(&mut qmp, &debugcon_log)?;
 
-        let stressed_dump = session.temp_dir.join("probe-stressed.ppm");
+        let stressed_dump = prepared.session.temp_dir.join("probe-stressed.ppm");
         qmp_screendump(&mut qmp, &stressed_dump)?;
         let stressed = read_ppm_dimensions(&stressed_dump)?;
         if stressed != baseline {
@@ -876,22 +928,126 @@ fn wait_for_boot_marker(log_path: &Path, marker: &str, timeout: Duration) -> Res
     }
 }
 
-fn run_probe_mouse_stress(qmp: &mut UnixStream) -> Result<()> {
-    let deadline = Instant::now() + PROBE_QMP_TIMEOUT;
-    for step in 0..PROBE_STRESS_STEPS {
-        let dx = if step % 2 == 0 { 24 } else { -19 };
-        let dy = if step % 3 == 0 { 11 } else { -7 };
-        qmp_hmp(qmp, &format!("mouse_move {dx} {dy}"), deadline)?;
-        if step % 16 == 0 {
-            qmp_hmp(qmp, "mouse_button 1", deadline)?;
-        } else if step % 16 == 8 {
-            qmp_hmp(qmp, "mouse_button 0", deadline)?;
+fn run_probe_mouse_stress(qmp: &mut UnixStream, debugcon_log: &Path) -> Result<()> {
+    let stress_duration =
+        probe_duration_env("RUSTOS_PROBE_STRESS_MS", PROBE_STRESS_DURATION_DEFAULT);
+    let heartbeat_stall = probe_duration_env(
+        "RUSTOS_PROBE_HEARTBEAT_STALL_MS",
+        PROBE_HEARTBEAT_STALL_DEFAULT,
+    );
+    let end = Instant::now() + stress_duration;
+    let mut step = 0usize;
+    let mut last_heartbeat_second = latest_kernel_alive_second(debugcon_log);
+    let mut last_heartbeat_at = Instant::now();
+    let mut x = 0x4000_i32;
+    let mut y = 0x3000_i32;
+    let mut dx = 1400_i32;
+    let mut dy = 900_i32;
+    const ABS_MIN: i32 = 0;
+    const ABS_MAX: i32 = 0x7fff;
+
+    while Instant::now() < end {
+        let log = fs::read_to_string(debugcon_log).unwrap_or_default();
+        for marker in PROBE_BAD_MARKERS {
+            if log.contains(marker) {
+                return Err(format!("probe detected bad marker in debugcon log: {marker}").into());
+            }
         }
+
+        if let Some(second) = latest_kernel_alive_second(debugcon_log) {
+            if last_heartbeat_second != Some(second) {
+                last_heartbeat_second = Some(second);
+                last_heartbeat_at = Instant::now();
+            }
+        }
+
+        if Instant::now().saturating_duration_since(last_heartbeat_at) > heartbeat_stall {
+            return Err(format!(
+                "probe detected stalled kernel heartbeat after {:?} (last second={})",
+                heartbeat_stall,
+                last_heartbeat_second
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| String::from("none"))
+            )
+            .into());
+        }
+
+        x += dx;
+        y += dy;
+        if !(ABS_MIN..=ABS_MAX).contains(&x) {
+            dx = -dx;
+            x = x.clamp(ABS_MIN, ABS_MAX);
+        }
+        if !(ABS_MIN..=ABS_MAX).contains(&y) {
+            dy = -dy;
+            y = y.clamp(ABS_MIN, ABS_MAX);
+        }
+
+        let button = if step % 16 == 0 {
+            Some(true)
+        } else if step % 16 == 8 {
+            Some(false)
+        } else {
+            None
+        };
+        qmp_input_send_pointer_abs(
+            qmp,
+            x as u16,
+            y as u16,
+            button,
+            Instant::now() + PROBE_QMP_TIMEOUT,
+        )?;
         thread::sleep(PROBE_STEP_DELAY);
+        step += 1;
     }
-    qmp_hmp(qmp, "mouse_button 0", deadline)?;
+    qmp_input_send_pointer_abs(
+        qmp,
+        x as u16,
+        y as u16,
+        Some(false),
+        Instant::now() + PROBE_QMP_TIMEOUT,
+    )?;
     thread::sleep(Duration::from_millis(200));
     Ok(())
+}
+
+fn qmp_input_send_pointer_abs(
+    qmp: &mut UnixStream,
+    x: u16,
+    y: u16,
+    button_down: Option<bool>,
+    deadline: Instant,
+) -> Result<()> {
+    let mut events = format!(
+        r#"{{"type":"abs","data":{{"axis":"x","value":{x}}}}},{{"type":"abs","data":{{"axis":"y","value":{y}}}}}"#
+    );
+    if let Some(down) = button_down {
+        events.push_str(&format!(
+            r#",{{"type":"btn","data":{{"down":{},"button":"left"}}}}"#,
+            if down { "true" } else { "false" }
+        ));
+    }
+    let command = format!(
+        r#"{{"execute":"input-send-event","arguments":{{"events":[{}]}}}}"#,
+        events
+    );
+    qmp_execute(qmp, &command, deadline)
+}
+
+fn latest_kernel_alive_second(log_path: &Path) -> Option<u64> {
+    let log = fs::read_to_string(log_path).ok()?;
+    log.lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("kernel alive: second="))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn probe_duration_env(name: &str, default: Duration) -> Duration {
+    env_string(name)
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(default)
 }
 
 fn qmp_screendump(qmp: &mut UnixStream, path: &Path) -> Result<()> {

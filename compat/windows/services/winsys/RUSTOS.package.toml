@@ -1,0 +1,18 @@
+id = "winsys"
+kind = "compat"
+execution_domain = "user"
+profiles = ["default"]
+
+[build]
+builder = "winsys-dll-bundle"
+
+[install]
+path = "compat/windows/System32"
+layout = "directory"
+
+[boot]
+preload = true
+required = false
+priority = -200
+
+startup = "none"

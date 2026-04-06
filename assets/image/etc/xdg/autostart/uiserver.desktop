@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=UI Server
+Exec=services/uiserver/uiserver.elf
+OnlyShowIn=RustOS;
+X-GNOME-Autostart-enabled=false

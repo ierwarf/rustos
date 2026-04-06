@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=shell
+Exec=apps/shell/shell.elf
+OnlyShowIn=RustOS;
+Terminal=true
+X-GNOME-Autostart-enabled=true

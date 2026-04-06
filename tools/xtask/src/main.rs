@@ -1,6 +1,7 @@
 mod build;
 mod cli;
 mod config;
+mod layering;
 mod package_manifest;
 mod qemu;
 mod stage;

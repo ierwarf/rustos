@@ -1,0 +1,22 @@
+id = "userdemo2"
+kind = "app"
+execution_domain = "user"
+profiles = ["default"]
+
+[build]
+builder = "mingw-c-exe"
+source = "winmain.c"
+
+[install]
+path = "apps/windows/userdemo2/userdemo2.exe"
+
+[boot]
+preload = true
+required = false
+priority = 120
+
+startup = "none"
+
+[[desktop.entries]]
+display_name = "userdemo2.exe"
+weight_micros = 50

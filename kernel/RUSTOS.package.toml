@@ -1,0 +1,18 @@
+id = "kernel"
+kind = "kernel"
+execution_domain = "kernel"
+profiles = ["default"]
+
+[build]
+builder = "kernel-rustc"
+package = "kernel"
+
+[install]
+path = "kernel.elf"
+
+[boot]
+preload = true
+required = true
+priority = -1900
+
+startup = "none"

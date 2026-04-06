@@ -7,17 +7,24 @@ use xshell::cmd;
 
 use crate::Result;
 use crate::config::Config;
-use crate::package_manifest::{BuilderKind, DEFAULT_PROFILE, PackageManifest, load_manifests};
+use crate::layering::validate_workspace_layering;
+use crate::package_manifest::{
+    BuilderKind, PackageManifest, load_default_manifests, required_manifest,
+};
 use crate::stage;
 use crate::util::{
-    command_in_path, copy_with_parent, create_temp_dir, remove_dir_if_exists,
+    command_in_path, copy_with_parent, create_temp_dir, kernel_rustflags_env, remove_dir_if_exists,
     remove_file_if_exists, run_cargo_kernel_check, run_cargo_kernel_rustc, run_command, shell,
 };
 
 pub(crate) fn build(config: &Config) -> Result<()> {
-    let manifests = selected_manifests(config)?;
+    validate_workspace_layering(&config.root_dir)?;
+    let manifests = load_default_manifests(&config.root_dir)?;
     ensure_targets(config)?;
-    validate_winsys_export_contracts(config)?;
+    let winsys_root = required_manifest(&manifests, "winsys")?
+        .package_root
+        .clone();
+    validate_winsys_export_contracts(winsys_root.as_path())?;
     build_efi(config)?;
     build_prekernel(config)?;
     build_kernel(config)?;
@@ -37,53 +44,17 @@ pub(crate) fn build(config: &Config) -> Result<()> {
         )
     })?;
     stage::stage(config)?;
-
-    println!("UEFI image ready: {}", config.boot_efi.display());
-    println!("Prekernel ELF ready: {}", config.prekernel_elf.display());
-    println!("Kernel ELF ready: {}", config.kernel_elf.display());
-    println!("User ELF ready: {}", config.image_user_elf.display());
+    print_staged_manifest_summary(config, &manifests);
     println!(
-        "Userdemo2 EXE ready: {}",
-        config.image_userdemo2_exe.display()
-    );
-    println!(
-        "Windows system DLLs ready: {}",
-        config.image_winsys_dir.display()
-    );
-    println!("Shell ELF ready: {}", config.image_shell_elf.display());
-    println!(
-        "Boot framebuffer driver module ready: {}",
-        config.image_bootfb_ko.display()
-    );
-    println!(
-        "AMDGPU driver module ready: {}",
-        config.image_amdgpu_ko.display()
-    );
-    print_vendor_module_status(
-        "PS/2 mouse driver module",
-        &config.vendor_psmouse_ko,
-        &config.image_psmouse_ko,
-    );
-    print_vendor_module_status(
-        "HID core module",
-        &config.vendor_hid_ko,
-        &config.image_hid_ko,
-    );
-    print_vendor_module_status(
-        "HID generic module",
-        &config.vendor_hid_generic_ko,
-        &config.image_hid_generic_ko,
-    );
-    print_vendor_module_status(
-        "USB HID module",
-        &config.vendor_usbhid_ko,
-        &config.image_usbhid_ko,
+        "AMDGPU firmware ready: {}",
+        config.amdgpu_image_firmware_dir().display()
     );
     Ok(())
 }
 
 pub(crate) fn check(config: &Config) -> Result<()> {
-    let _ = selected_manifests(config)?;
+    validate_workspace_layering(&config.root_dir)?;
+    let _ = load_default_manifests(&config.root_dir)?;
     ensure_targets(config)?;
     let sh = shell()?;
     let cargo = &config.cargo;
@@ -153,8 +124,9 @@ pub(crate) fn build_efi(config: &Config) -> Result<()> {
     )
     .env("CARGO_TARGET_DIR", &config.cargo_target_dir)
     .run()?;
-    remove_file_if_exists(&config.build_dir.join("artifacts/boot/BOOTX64.EFI"))?;
-    copy_with_parent(&config.source_efi, &config.artifact_boot_efi)
+    let artifact = config.artifact_boot_efi_path();
+    remove_file_if_exists(&artifact)?;
+    copy_with_parent(&config.bootloader_source_efi_path(), &artifact)
 }
 
 pub(crate) fn build_prekernel(config: &Config) -> Result<()> {
@@ -163,16 +135,22 @@ pub(crate) fn build_prekernel(config: &Config) -> Result<()> {
         &config.prekernel_package,
         &config.prekernel_rustc_args,
     )?;
-    copy_with_parent(&config.prekernel_source, &config.artifact_prekernel_elf)
+    copy_with_parent(
+        &config.prekernel_source_path(),
+        &config.artifact_prekernel_elf_path(),
+    )
 }
 
 pub(crate) fn build_kernel(config: &Config) -> Result<()> {
     run_cargo_kernel_rustc(config, &config.kernel_package, &config.kernel_rustc_args)?;
-    copy_with_parent(&config.kernel_source, &config.artifact_kernel_elf)
+    copy_with_parent(
+        &config.kernel_source_path(),
+        &config.artifact_kernel_elf_path(),
+    )
 }
 
 pub(crate) fn build_user(config: &Config) -> Result<()> {
-    let manifests = selected_manifests(config)?;
+    let manifests = load_default_manifests(&config.root_dir)?;
     build_manifests_matching(config, &manifests, |manifest| {
         matches!(
             manifest.build.builder,
@@ -182,28 +160,31 @@ pub(crate) fn build_user(config: &Config) -> Result<()> {
 }
 
 pub(crate) fn build_console_demo(config: &Config) -> Result<()> {
-    let manifests = selected_manifests(config)?;
+    let manifests = load_default_manifests(&config.root_dir)?;
     build_manifests_matching(config, &manifests, |manifest| {
         matches!(manifest.build.builder, BuilderKind::CDemo)
     })
 }
 
-fn build_windows_system_dlls(config: &Config) -> Result<()> {
-    fs::create_dir_all(&config.artifact_winsys_dir)?;
-    remove_dir_if_exists(&config.artifact_winsys_dir.join(".importlibs"))?;
+fn build_windows_system_dlls(config: &Config, manifest: &PackageManifest) -> Result<()> {
+    let artifact_dir = manifest.artifact_path(config);
+    let winsys_dir = &manifest.package_root;
+
+    fs::create_dir_all(&artifact_dir)?;
+    remove_dir_if_exists(&artifact_dir.join(".importlibs"))?;
     let import_lib_dir = config.build_dir.join("intermediates/winsys-importlibs");
     remove_dir_if_exists(&import_lib_dir)?;
     fs::create_dir_all(&import_lib_dir)?;
 
     for (index, spec) in winsys_dll_specs().iter().enumerate() {
-        let mut sources = winsys_c_sources(&config.winsys_dir.join(spec.dir))?;
-        let exports = config.winsys_dir.join(spec.dir).join("exports.def");
-        let output = config.artifact_winsys_dir.join(spec.file_name);
+        let mut sources = winsys_c_sources(&winsys_dir.join(spec.dir))?;
+        let exports = winsys_dir.join(spec.dir).join("exports.def");
+        let output = artifact_dir.join(spec.file_name);
         let import_lib = import_lib_dir.join(format!("{}.a", spec.file_name));
         remove_file_if_exists(&output)?;
         remove_file_if_exists(&import_lib)?;
         for shared_source in spec.shared_sources {
-            sources.push(config.winsys_dir.join(shared_source));
+            sources.push(winsys_dir.join(shared_source));
         }
 
         let image_base = 0x7000_0000_u64 + (index as u64) * 0x0010_0000_u64;
@@ -215,7 +196,7 @@ fn build_windows_system_dlls(config: &Config) -> Result<()> {
             .arg("-fno-builtin")
             .arg("-fno-stack-protector")
             .arg("-I")
-            .arg(config.winsys_dir.join("common"))
+            .arg(winsys_dir.join("common"))
             .arg("-Wl,--entry,DllMain")
             .arg(format!("-Wl,--image-base=0x{image_base:x}"))
             .arg(format!("-Wl,--out-implib={}", import_lib.display()))
@@ -261,20 +242,13 @@ fn winsys_c_sources(dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 pub(crate) fn build_driver_modules(config: &Config) -> Result<()> {
-    let manifests = selected_manifests(config)?;
+    let manifests = load_default_manifests(&config.root_dir)?;
     build_manifests_matching(config, &manifests, |manifest| {
         matches!(
             manifest.build.builder,
             BuilderKind::ModuleImage | BuilderKind::ExternalCopy
         )
     })
-}
-
-fn selected_manifests(config: &Config) -> Result<Vec<PackageManifest>> {
-    Ok(load_manifests(&config.root_dir)?
-        .into_iter()
-        .filter(|manifest| manifest.profile_enabled(DEFAULT_PROFILE))
-        .collect())
 }
 
 fn build_manifests_matching(
@@ -297,7 +271,7 @@ fn build_manifest(config: &Config, manifest: &PackageManifest) -> Result<()> {
         BuilderKind::MingwCExe => build_mingw_c_exe(config, manifest),
         BuilderKind::CDemo => build_c_demo_manifest(config, manifest),
         BuilderKind::ModuleImage => build_module_image_manifest(config, manifest),
-        BuilderKind::WinsysDllBundle => build_windows_system_dlls(config),
+        BuilderKind::WinsysDllBundle => build_windows_system_dlls(config, manifest),
         BuilderKind::ExternalCopy => build_external_copy_manifest(config, manifest),
     }
 }
@@ -333,12 +307,7 @@ fn build_mingw_c_exe(config: &Config, manifest: &PackageManifest) -> Result<()> 
     let source = manifest
         .resolved_source_path()
         .ok_or_else(|| format!("package {} missing build.source", manifest.id))?;
-    let output_name = manifest
-        .build
-        .output_name
-        .as_deref()
-        .unwrap_or("program.exe");
-    let output = config.user_build_dir.join(output_name.to_ascii_uppercase());
+    let output = manifest.artifact_path(config);
     let parent = output.parent().ok_or_else(|| {
         format!(
             "Windows executable path has no parent: {}",
@@ -346,6 +315,7 @@ fn build_mingw_c_exe(config: &Config, manifest: &PackageManifest) -> Result<()> 
         )
     })?;
     fs::create_dir_all(parent)?;
+    remove_file_if_exists(&output)?;
 
     run_command(
         Command::new(&config.mingw_cc)
@@ -357,9 +327,12 @@ fn build_mingw_c_exe(config: &Config, manifest: &PackageManifest) -> Result<()> 
             .arg(&source),
     )?;
     if manifest.id == "userdemo2" {
-        audit_userdemo2_imports_for_path(config, &output)?;
+        let winsys_root = required_manifest(&load_default_manifests(&config.root_dir)?, "winsys")?
+            .package_root
+            .clone();
+        audit_userdemo2_imports_for_path(config, winsys_root.as_path(), &output)?;
     }
-    copy_with_parent(&output, &manifest.artifact_path(config))
+    Ok(())
 }
 
 fn build_c_demo_manifest(config: &Config, manifest: &PackageManifest) -> Result<()> {
@@ -459,6 +432,7 @@ fn build_rust_module_image(
 
     let mut command = Command::new(&config.cargo);
     command.env("CARGO_TARGET_DIR", &config.cargo_target_dir);
+    command.env("RUSTFLAGS", kernel_rustflags_env());
     command.arg("rustc");
     for flag in &config.kernel_cargo_zflags {
         command.arg(flag);
@@ -550,7 +524,11 @@ fn build_c_demo(
     run_command(&mut command)
 }
 
-fn audit_userdemo2_imports_for_path(config: &Config, executable: &Path) -> Result<()> {
+fn audit_userdemo2_imports_for_path(
+    config: &Config,
+    winsys_root: &Path,
+    executable: &Path,
+) -> Result<()> {
     let output = Command::new(&config.objdump)
         .arg("-p")
         .arg(executable)
@@ -559,18 +537,18 @@ fn audit_userdemo2_imports_for_path(config: &Config, executable: &Path) -> Resul
         return Err(format!("objdump failed for {}", executable.display()).into());
     }
 
-    fs::write(&config.userdemo2_import_audit_log, &output.stdout)?;
+    fs::write(config.userdemo2_import_audit_log_path(), &output.stdout)?;
     let text = String::from_utf8_lossy(&output.stdout);
     let imports = parse_objdump_imports(text.as_ref());
-    validate_imports_exported_by_winsys(config, &imports)?;
+    validate_imports_exported_by_winsys(winsys_root, &imports)?;
     Ok(())
 }
 
 fn validate_imports_exported_by_winsys(
-    config: &Config,
+    winsys_root: &Path,
     imports: &[(String, String)],
 ) -> Result<()> {
-    let exports_by_dll = winsys_import_contracts(config)?;
+    let exports_by_dll = winsys_import_contracts(winsys_root)?;
 
     let mut missing = Vec::new();
     for (dll, symbol) in imports {
@@ -592,12 +570,7 @@ fn validate_imports_exported_by_winsys(
             .map(|(dll, symbol)| format!("{dll}!{symbol}"))
             .collect::<Vec<_>>()
             .join(", ");
-        return Err(format!(
-            "winsys export contract mismatch for {}: {}",
-            config.userdemo2_exe.display(),
-            details
-        )
-        .into());
+        return Err(format!("winsys export contract mismatch: {}", details).into());
     }
 
     Ok(())
@@ -714,11 +687,14 @@ fn extract_archive_objects(
     Ok(())
 }
 
-fn print_vendor_module_status(label: &str, src: &Path, dst: &Path) {
-    if src.is_file() {
-        println!("{label} ready: {}", dst.display());
-    } else {
-        println!("{label} skipped: {}", src.display());
+fn print_staged_manifest_summary(config: &Config, manifests: &[PackageManifest]) {
+    for manifest in manifests {
+        let image = manifest.image_path(config);
+        if image.exists() {
+            println!("staged {}: {}", manifest.id, image.display());
+        } else if manifest.build.optional {
+            println!("staged {}: skipped", manifest.id);
+        }
     }
 }
 
@@ -775,10 +751,10 @@ const fn winsys_dll_specs() -> &'static [WinsysDllSpec] {
     ]
 }
 
-fn winsys_import_contracts(config: &Config) -> Result<BTreeMap<String, Vec<DefExport>>> {
+fn winsys_import_contracts(winsys_root: &Path) -> Result<BTreeMap<String, Vec<DefExport>>> {
     let mut exports_by_dll = BTreeMap::<String, Vec<DefExport>>::new();
     for spec in winsys_dll_specs() {
-        let exports_path = config.winsys_dir.join(spec.dir).join("exports.def");
+        let exports_path = winsys_root.join(spec.dir).join("exports.def");
         exports_by_dll.insert(
             spec.file_name.to_ascii_lowercase(),
             parse_def_exports(&exports_path)?,
@@ -830,8 +806,8 @@ const fn winsys_import_aliases() -> &'static [(&'static str, &'static str)] {
     ]
 }
 
-fn validate_winsys_export_contracts(config: &Config) -> Result<()> {
-    let exports_by_dll = winsys_import_contracts(config)?;
+fn validate_winsys_export_contracts(winsys_root: &Path) -> Result<()> {
+    let exports_by_dll = winsys_import_contracts(winsys_root)?;
 
     for (dll_name, exports) in &exports_by_dll {
         if winsys_import_aliases()

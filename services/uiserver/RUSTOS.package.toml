@@ -1,0 +1,23 @@
+id = "uiserver"
+kind = "service"
+execution_domain = "user"
+profiles = ["default"]
+startup = "desktop"
+
+[build]
+builder = "cargo-kernel-binary"
+package = "uiserver"
+
+[install]
+path = "services/uiserver/uiserver.elf"
+
+[boot]
+preload = true
+required = false
+priority = -500
+
+[[desktop.entries]]
+display_name = "UI Server"
+weight_micros = 50
+logical_admin = false
+console_hosted = false

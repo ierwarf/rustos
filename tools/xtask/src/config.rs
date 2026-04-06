@@ -30,36 +30,7 @@ pub(crate) struct Config {
     pub(crate) logs_dir: PathBuf,
     pub(crate) image_dir: PathBuf,
     pub(crate) image_asset_overlay_dir: PathBuf,
-    pub(crate) boot_efi: PathBuf,
-    pub(crate) source_efi: PathBuf,
-    pub(crate) artifact_boot_efi: PathBuf,
-    pub(crate) prekernel_source: PathBuf,
-    pub(crate) artifact_prekernel_elf: PathBuf,
-    pub(crate) prekernel_elf: PathBuf,
-    pub(crate) kernel_source: PathBuf,
-    pub(crate) artifact_kernel_elf: PathBuf,
-    pub(crate) kernel_elf: PathBuf,
-    pub(crate) user_build_dir: PathBuf,
-    pub(crate) image_user_elf: PathBuf,
-    pub(crate) userdemo2_exe: PathBuf,
-    pub(crate) userdemo2_import_audit_log: PathBuf,
-    pub(crate) image_userdemo2_exe: PathBuf,
-    pub(crate) winsys_dir: PathBuf,
-    pub(crate) artifact_winsys_dir: PathBuf,
-    pub(crate) image_winsys_dir: PathBuf,
-    pub(crate) image_shell_elf: PathBuf,
-    pub(crate) image_bootfb_ko: PathBuf,
-    pub(crate) image_amdgpu_ko: PathBuf,
-    pub(crate) vendor_psmouse_ko: PathBuf,
-    pub(crate) image_psmouse_ko: PathBuf,
-    pub(crate) vendor_hid_ko: PathBuf,
-    pub(crate) image_hid_ko: PathBuf,
-    pub(crate) vendor_hid_generic_ko: PathBuf,
-    pub(crate) image_hid_generic_ko: PathBuf,
-    pub(crate) vendor_usbhid_ko: PathBuf,
-    pub(crate) image_usbhid_ko: PathBuf,
     pub(crate) amdgpu_firmware_dir: PathBuf,
-    pub(crate) amdgpu_image_firmware_dir: PathBuf,
     pub(crate) amdgpu_required_firmware_basenames: Vec<String>,
     pub(crate) ovmf_path: PathBuf,
 }
@@ -97,15 +68,10 @@ impl Config {
 
         let assets_dir = env_path("ASSETS_DIR").unwrap_or_else(|| root_dir.join("assets"));
         let build_dir = env_path("BUILD_DIR").unwrap_or_else(|| root_dir.join("build"));
-        let logs_dir = env_path("LOGS_DIR").unwrap_or_else(|| build_dir.join("logs"));
-        let vendor_dir = env_path("VENDOR_DIR").unwrap_or_else(|| root_dir.join("vendor"));
+        let logs_dir = env_path("LOGS_DIR").unwrap_or_else(|| root_dir.join("logs"));
         let artifact_dir = env_path("ARTIFACT_DIR").unwrap_or_else(|| build_dir.join("artifacts"));
         let image_dir = env_path("IMAGE_DIR").unwrap_or_else(|| build_dir.join("image"));
-        let efi_boot_dir = env_path("EFI_BOOT_DIR").unwrap_or_else(|| image_dir.join("EFI/BOOT"));
-        let user_build_dir =
-            env_path("USER_BUILD_DIR").unwrap_or_else(|| root_dir.join("target/uiserver"));
-        let vendor_input_modules_dir = env_path("VENDOR_INPUT_MODULES_DIR")
-            .unwrap_or_else(|| vendor_dir.join("modules/input"));
+        let vendor_dir = env_path("VENDOR_DIR").unwrap_or_else(|| root_dir.join("vendor"));
 
         let kernel_cargo_zflags = env_string("KERNEL_CARGO_ZFLAGS")
             .map(|value| split_whitespace_owned(&value))
@@ -132,65 +98,8 @@ impl Config {
         Ok(Self {
             image_asset_overlay_dir: env_path("IMAGE_ASSET_OVERLAY_DIR")
                 .unwrap_or_else(|| assets_dir.join("image")),
-            boot_efi: env_path("BOOT_EFI").unwrap_or_else(|| efi_boot_dir.join("BOOTX64.EFI")),
-            source_efi: env_path("SOURCE_EFI").unwrap_or_else(|| {
-                cargo_target_dir.join(format!("{target}/release/{bootloader_package}.efi"))
-            }),
-            artifact_boot_efi: env_path("ARTIFACT_BOOT_EFI")
-                .unwrap_or_else(|| artifact_dir.join("EFI/BOOT/BOOTX64.EFI")),
-            prekernel_source: env_path("PREKERNEL_SOURCE").unwrap_or_else(|| {
-                cargo_target_dir.join(format!("{kernel_target}/release/{prekernel_package}"))
-            }),
-            artifact_prekernel_elf: env_path("ARTIFACT_PREKERNEL_ELF")
-                .unwrap_or_else(|| artifact_dir.join("prekernel.elf")),
-            prekernel_elf: env_path("PREKERNEL_ELF")
-                .unwrap_or_else(|| image_dir.join("prekernel.elf")),
-            kernel_source: env_path("KERNEL_SOURCE").unwrap_or_else(|| {
-                cargo_target_dir.join(format!("{kernel_target}/release/{kernel_package}"))
-            }),
-            artifact_kernel_elf: env_path("ARTIFACT_KERNEL_ELF")
-                .unwrap_or_else(|| artifact_dir.join("kernel.elf")),
-            kernel_elf: env_path("KERNEL_ELF").unwrap_or_else(|| image_dir.join("kernel.elf")),
-            image_user_elf: env_path("IMAGE_USER_ELF")
-                .unwrap_or_else(|| image_dir.join("system/packages/uiserver/uiserver.elf")),
-            userdemo2_exe: env_path("USERDEMO2_EXE")
-                .unwrap_or_else(|| user_build_dir.join("USERDEMO2.EXE")),
-            userdemo2_import_audit_log: env_path("USERDEMO2_IMPORT_AUDIT_LOG")
-                .unwrap_or_else(|| logs_dir.join("userdemo2-imports.txt")),
-            image_userdemo2_exe: env_path("IMAGE_USERDEMO2_EXE")
-                .unwrap_or_else(|| image_dir.join("samples/windows/userdemo2/userdemo2.exe")),
-            winsys_dir: env_path("WINSYS_DIR")
-                .unwrap_or_else(|| root_dir.join("compat/windows/user/winsys")),
-            artifact_winsys_dir: env_path("ARTIFACT_WINSYS_DIR")
-                .unwrap_or_else(|| artifact_dir.join("compat/windows/System32")),
-            image_winsys_dir: env_path("IMAGE_WINSYS_DIR")
-                .unwrap_or_else(|| image_dir.join("compat/windows/System32")),
-            image_shell_elf: env_path("IMAGE_SHELL_ELF")
-                .unwrap_or_else(|| image_dir.join("samples/shell/shell.elf")),
-            image_bootfb_ko: env_path("IMAGE_BOOTFB_KO")
-                .unwrap_or_else(|| image_dir.join("system/drivers/display/bootfb.ko")),
-            image_amdgpu_ko: env_path("IMAGE_AMDGPU_KO")
-                .unwrap_or_else(|| image_dir.join("system/drivers/display/amdgpu.ko")),
-            vendor_psmouse_ko: env_path("VENDOR_PSMOUSE_KO")
-                .unwrap_or_else(|| vendor_input_modules_dir.join("psmouse.ko")),
-            image_psmouse_ko: env_path("IMAGE_PSMOUSE_KO")
-                .unwrap_or_else(|| image_dir.join("system/drivers/input/psmouse.ko")),
-            vendor_hid_ko: env_path("VENDOR_HID_KO")
-                .unwrap_or_else(|| vendor_input_modules_dir.join("hid.ko")),
-            image_hid_ko: env_path("IMAGE_HID_KO")
-                .unwrap_or_else(|| image_dir.join("system/drivers/input/hid.ko")),
-            vendor_hid_generic_ko: env_path("VENDOR_HID_GENERIC_KO")
-                .unwrap_or_else(|| vendor_input_modules_dir.join("hid-generic.ko")),
-            image_hid_generic_ko: env_path("IMAGE_HID_GENERIC_KO")
-                .unwrap_or_else(|| image_dir.join("system/drivers/input/hid-generic.ko")),
-            vendor_usbhid_ko: env_path("VENDOR_USBHID_KO")
-                .unwrap_or_else(|| vendor_input_modules_dir.join("usbhid.ko")),
-            image_usbhid_ko: env_path("IMAGE_USBHID_KO")
-                .unwrap_or_else(|| image_dir.join("system/drivers/input/usbhid.ko")),
             amdgpu_firmware_dir: env_path("AMDGPU_FIRMWARE_DIR")
                 .unwrap_or_else(|| PathBuf::from("/lib/firmware/amdgpu")),
-            amdgpu_image_firmware_dir: env_path("AMDGPU_IMAGE_FIRMWARE_DIR")
-                .unwrap_or_else(|| image_dir.join("system/firmware/amdgpu")),
             amdgpu_required_firmware_basenames: env_string("AMDGPU_REQUIRED_FIRMWARE_BASENAMES")
                 .map(|value| {
                     value
@@ -207,7 +116,14 @@ impl Config {
                         String::from("smu_13_0_10.bin"),
                     ]
                 }),
-            ovmf_path: env_path("OVMF_PATH").unwrap_or_else(|| vendor_dir.join("ovmf/OVMF.fd")),
+            ovmf_path: env_path("OVMF_PATH").unwrap_or_else(|| {
+                let new_path = vendor_dir.join("firmware/ovmf/OVMF.fd");
+                if new_path.is_file() {
+                    new_path
+                } else {
+                    vendor_dir.join("ovmf/OVMF.fd")
+                }
+            }),
             root_dir,
             workspace_manifest,
             cargo_target_dir,
@@ -232,9 +148,54 @@ impl Config {
             artifact_dir,
             logs_dir,
             image_dir,
-            user_build_dir,
         })
     }
+
+    pub(crate) fn boot_efi_path(&self) -> PathBuf {
+        self.image_dir.join("EFI/BOOT/BOOTX64.EFI")
+    }
+
+    pub(crate) fn bootloader_source_efi_path(&self) -> PathBuf {
+        self.cargo_target_dir.join(format!(
+            "{}/release/{}.efi",
+            self.target, self.bootloader_package
+        ))
+    }
+
+    pub(crate) fn artifact_boot_efi_path(&self) -> PathBuf {
+        self.artifact_dir.join("EFI/BOOT/BOOTX64.EFI")
+    }
+
+    pub(crate) fn prekernel_source_path(&self) -> PathBuf {
+        self.cargo_target_dir.join(format!(
+            "{}/release/{}",
+            self.kernel_target, self.prekernel_package
+        ))
+    }
+
+    pub(crate) fn artifact_prekernel_elf_path(&self) -> PathBuf {
+        self.artifact_dir.join("prekernel.elf")
+    }
+
+    pub(crate) fn kernel_source_path(&self) -> PathBuf {
+        self.cargo_target_dir.join(format!(
+            "{}/release/{}",
+            self.kernel_target, self.kernel_package
+        ))
+    }
+
+    pub(crate) fn artifact_kernel_elf_path(&self) -> PathBuf {
+        self.artifact_dir.join("kernel.elf")
+    }
+
+    pub(crate) fn amdgpu_image_firmware_dir(&self) -> PathBuf {
+        self.image_dir.join("system/firmware/amdgpu")
+    }
+
+    pub(crate) fn userdemo2_import_audit_log_path(&self) -> PathBuf {
+        self.logs_dir.join("userdemo2-imports.txt")
+    }
+
     pub(crate) fn kernel_release_deps_dir(&self) -> PathBuf {
         self.cargo_target_dir
             .join(format!("{}/release/deps", self.kernel_target))

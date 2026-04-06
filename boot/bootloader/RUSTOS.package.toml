@@ -1,5 +1,6 @@
 id = "bootloader"
 kind = "boot"
+execution_domain = "kernel"
 profiles = ["default"]
 
 [build]
@@ -13,3 +14,5 @@ path = "EFI/BOOT/BOOTX64.EFI"
 preload = false
 required = false
 priority = 0
+
+startup = "none"

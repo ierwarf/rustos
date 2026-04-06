@@ -1,0 +1,27 @@
+id = "bootfb"
+kind = "bridge-driver"
+execution_domain = "kernel"
+profiles = ["default"]
+
+[build]
+builder = "module-image"
+package = "rustos-bootfb-driver"
+crate_name = "rustos_bootfb_driver"
+dependency_crates = ["driver_module_runtime", "driver_abi"]
+
+[install]
+path = "system/drivers/display/bootfb.ko"
+
+[boot]
+preload = true
+required = false
+priority = -400
+
+startup = "none"
+
+[autoload]
+name = "bootfb"
+class = "display"
+bus = "platform"
+priority = -100
+when = "vfs-ready"

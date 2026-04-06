@@ -3,53 +3,69 @@ pub(crate) mod elf_loader;
 pub(crate) mod error;
 mod file_cache;
 
-use alloc::vec::Vec;
 use core::ptr;
 
 use uefi::boot;
-use uefi::fs::{Error as FsError, FileSystem};
 use uefi::mem::memory_map::{MemoryMap, MemoryMapOwned, MemoryType};
 use uefi::prelude::*;
+use uefi::proto::media::file::{File, FileAttribute, FileInfo, FileMode};
 
-use self::boot_info::{BootInfo, BootMemoryKind, BootMemoryRegion};
-use self::elf_loader::load_elf_image;
+use self::boot_info::{BootInfo, BootMemoryKind, BootMemoryRegion, KernelImageInfo};
+use self::elf_loader::{load_kernel_elf, UefiKernelFile};
 use self::error::BootError;
 use crate::debug;
 use crate::gui;
+#[cfg(rustos_kernel_physical_kaslr_enabled)]
+use crate::settings;
 
 const PAGE_SIZE: usize = 4096;
 const BOOT_MEMORY_MAP_STORAGE_PAGES: usize = 32;
 
-const PREKERNEL_CANDIDATE_PATHS: [(&str, &uefi::CStr16); 4] = [
-    ("\\prekernel.elf", cstr16!("\\prekernel.elf")),
-    ("prekernel.elf", cstr16!("prekernel.elf")),
+const KERNEL_CANDIDATE_PATHS: [(&str, &uefi::CStr16); 4] = [
+    ("\\kernel.elf", cstr16!("\\kernel.elf")),
+    ("kernel.elf", cstr16!("kernel.elf")),
     (
-        "\\EFI\\BOOT\\prekernel.elf",
-        cstr16!("\\EFI\\BOOT\\prekernel.elf"),
+        "\\EFI\\BOOT\\kernel.elf",
+        cstr16!("\\EFI\\BOOT\\kernel.elf"),
     ),
-    (
-        "EFI\\BOOT\\prekernel.elf",
-        cstr16!("EFI\\BOOT\\prekernel.elf"),
-    ),
+    ("EFI\\BOOT\\kernel.elf", cstr16!("EFI\\BOOT\\kernel.elf")),
 ];
 
-pub fn boot_prekernel() -> Result<(), BootError> {
-    debug::println!("bootloader: reading prekernel image");
-    let prekernel_image = read_stage_image()?;
+pub fn boot_kernel() -> Result<(), BootError> {
+    debug::println!("bootloader: locating kernel image");
+    let mut boot_info = gui::prepare_boot_info()?;
+    let (kernel_path, mut kernel_file, kernel_size) = open_kernel_file()?;
     debug::println!(
-        "bootloader: prekernel image loaded, {} bytes",
-        prekernel_image.len()
+        "bootloader: kernel image found at {}, {} bytes",
+        kernel_path,
+        kernel_size
     );
-    let (entry_point, segment_count) = load_elf_image(&prekernel_image)?;
+    let kernel_physical_slide = choose_kernel_physical_slide(boot_info.rng_seed);
     debug::println!(
-        "bootloader: ELF loaded, entry={:#x}, segments={}",
+        "bootloader: kernel physical slide(raw)={:#x}",
+        kernel_physical_slide
+    );
+    let (entry_point, segment_count, load_bias, kernel_phys_start, kernel_size_bytes) =
+        load_kernel_elf(&mut kernel_file, kernel_size, kernel_physical_slide)?;
+    let applied_slide = load_bias.saturating_sub(0x0020_0000);
+    boot_info.kernel_image = KernelImageInfo {
+        phys_start: kernel_phys_start as u64,
+        size: kernel_size_bytes as u64,
+        load_bias: load_bias as u64,
+        entry_point: entry_point as u64,
+    };
+    debug::println!(
+        "bootloader: kernel ELF loaded, entry={:#x}, segments={}, load_bias={:#x}, image=[{:#x}, {:#x}), applied_slide={:#x}",
         entry_point,
-        segment_count
+        segment_count,
+        load_bias,
+        kernel_phys_start,
+        kernel_phys_start.saturating_add(kernel_size_bytes),
+        applied_slide
     );
     if segment_count == 0 {
         return Err(BootError::InvalidElf("no PT_LOAD segments"));
     }
-    let mut boot_info = gui::prepare_boot_info()?;
     boot_info.boot_volume = match file_cache::extract_boot_volume_identity() {
         Ok(identity) => identity,
         Err(err) => {
@@ -60,6 +76,7 @@ pub fn boot_prekernel() -> Result<(), BootError> {
             boot_info::BootVolumeIdentity::empty()
         }
     };
+
     let boot_info_ptr = gui::allocate_boot_info(boot_info)?;
     let boot_memory_map_storage = allocate_boot_memory_map_storage()?;
     debug::println!(
@@ -68,8 +85,8 @@ pub fn boot_prekernel() -> Result<(), BootError> {
         boot_info.framebuffer.back_buffer_addr
     );
 
-    uefi::println!("prekernel entry point: {entry_point:#x}");
-    uefi::println!("prekernel loaded segments: {segment_count}");
+    uefi::println!("kernel entry point: {entry_point:#x}");
+    uefi::println!("kernel loaded segments: {segment_count}");
     uefi::println!(
         "framebuffer: {}x{} stride={} base={:#x} back={:#x}",
         boot_info.framebuffer.width,
@@ -84,44 +101,64 @@ pub fn boot_prekernel() -> Result<(), BootError> {
     exit_boot_services_and_jump(entry_point, boot_info_ptr, boot_memory_map_storage)
 }
 
-fn read_stage_image() -> Result<Vec<u8>, BootError> {
-    let sfs = boot::get_image_file_system(boot::image_handle())
+fn open_kernel_file() -> Result<(&'static str, UefiKernelFile, u64), BootError> {
+    let mut sfs = boot::get_image_file_system(boot::image_handle())
+        .map_err(|err| BootError::OpenFileSystem(err.status()))?;
+    let mut root = sfs
+        .open_volume()
         .map_err(|err| BootError::OpenFileSystem(err.status()))?;
 
-    let mut fs = FileSystem::new(sfs);
-    for (display_path, path) in PREKERNEL_CANDIDATE_PATHS {
-        match fs.read(path) {
-            Ok(stage_image) => {
-                debug::println!("bootloader: found prekernel at {}", display_path);
-                uefi::println!(
-                    "prekernel image found: {display_path} ({} bytes)",
-                    stage_image.len()
-                );
-                return Ok(stage_image);
-            }
-            Err(err) => {
-                let status = fs_error_status(&err);
-                if status != Status::NOT_FOUND {
-                    return Err(BootError::ReadStage(status));
-                }
-            }
-        }
+    for (display_path, path) in KERNEL_CANDIDATE_PATHS {
+        let handle = match root.open(path, FileMode::Read, FileAttribute::empty()) {
+            Ok(handle) => handle,
+            Err(err) if err.status() == Status::NOT_FOUND => continue,
+            Err(err) => return Err(BootError::ReadKernel(err.status())),
+        };
+        let mut file = handle
+            .into_regular_file()
+            .ok_or(BootError::ReadKernel(Status::LOAD_ERROR))?;
+        let info = file
+            .get_boxed_info::<FileInfo>()
+            .map_err(|err| BootError::ReadKernel(err.status()))?;
+        debug::println!("bootloader: found kernel at {}", display_path);
+        return Ok((display_path, UefiKernelFile::new(file), info.file_size()));
     }
 
-    uefi::println!("prekernel image not found; tried:");
-    debug::println!("bootloader: prekernel image not found");
-    for (display_path, _) in PREKERNEL_CANDIDATE_PATHS {
+    uefi::println!("kernel image not found; tried:");
+    debug::println!("bootloader: kernel image not found");
+    for (display_path, _) in KERNEL_CANDIDATE_PATHS {
         uefi::println!("  - {display_path}");
     }
-
-    Err(BootError::ReadStage(Status::NOT_FOUND))
+    Err(BootError::ReadKernel(Status::NOT_FOUND))
 }
 
-fn fs_error_status(err: &FsError) -> Status {
-    match err {
-        FsError::Io(io) => io.uefi_error.status(),
-        FsError::Path(_) | FsError::Utf8Encoding(_) => Status::LOAD_ERROR,
+#[cfg(rustos_kernel_physical_kaslr_enabled)]
+fn choose_kernel_physical_slide(seed: [u8; 32]) -> usize {
+    let mut value = 0_u64;
+    for chunk in seed.chunks_exact(8) {
+        value ^= u64::from_le_bytes(chunk.try_into().unwrap());
+        value = splitmix64(value);
     }
+    let max_slide = u64::try_from(settings::MAX_KERNEL_PHYSICAL_KASLR_SLIDE.max(0)).unwrap_or(0);
+    if max_slide == 0 {
+        0
+    } else {
+        (value % (max_slide + 1)) as usize
+    }
+}
+
+#[cfg(not(rustos_kernel_physical_kaslr_enabled))]
+fn choose_kernel_physical_slide(_seed: [u8; 32]) -> usize {
+    0
+}
+
+#[cfg(rustos_kernel_physical_kaslr_enabled)]
+fn splitmix64(mut state: u64) -> u64 {
+    state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 fn allocate_boot_memory_map_storage() -> Result<*mut BootMemoryRegion, BootError> {

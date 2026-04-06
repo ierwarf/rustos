@@ -1,0 +1,16 @@
+[package]
+name = "rustos-amdgpu-driver"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+module-image = []
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[dependencies]
+driver-module-runtime = { path = "../../../libs/driver-module-runtime" }
+driver-abi = { path = "../../../libs/driver-abi" }

@@ -1,0 +1,657 @@
+use std::ffi::CString;
+use std::io;
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::ptr;
+use std::thread;
+use std::time::Duration;
+
+use wayland_client::protocol::{
+    wl_buffer, wl_callback, wl_compositor, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool,
+    wl_surface,
+};
+use wayland_client::{
+    delegate_noop, ConnectError, Connection, Dispatch, Proxy, QueueHandle, WEnum,
+};
+use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
+
+const WIDTH: u32 = 800;
+const HEIGHT: u32 = 520;
+const HUD_HEIGHT: u32 = 56;
+const TARGET_GOAL: u32 = 20;
+const BTN_LEFT: u32 = 0x110;
+const SHM_BUFFER_COUNT: usize = 2;
+
+fn raw_stderr_line(message: &str) {
+    eprintln!("{message}");
+}
+
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        raw_stderr_line(&format!("wayclick panic: {info}"));
+    }));
+}
+
+fn connect_wayland_with_retry() -> Result<Connection, ConnectError> {
+    const MAX_CONNECT_ATTEMPTS: usize = 20;
+    const CONNECT_RETRY_DELAY_MILLIS: u64 = 100;
+
+    let mut last_error = None;
+    for attempt in 0..MAX_CONNECT_ATTEMPTS {
+        match Connection::connect_to_env() {
+            Ok(connection) => return Ok(connection),
+            Err(err) => {
+                if attempt + 1 == MAX_CONNECT_ATTEMPTS {
+                    return Err(err);
+                }
+                last_error = Some(err);
+                thread::sleep(Duration::from_millis(CONNECT_RETRY_DELAY_MILLIS));
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or(ConnectError::NoCompositor))
+}
+
+fn main() {
+    raw_stderr_line("wayclick: main enter");
+    install_panic_hook();
+    raw_stderr_line("wayclick: panic hook installed");
+    let conn = match connect_wayland_with_retry() {
+        Ok(conn) => conn,
+        Err(err) => {
+            raw_stderr_line(&format!("wayclick: connect failed: {err:?}"));
+            return;
+        }
+    };
+    raw_stderr_line("wayclick: connected");
+    let mut event_queue = conn.new_event_queue();
+    let qh = event_queue.handle();
+    conn.display().get_registry(&qh, ());
+    raw_stderr_line("wayclick: registry requested");
+
+    let mut state = GameState::new();
+    while state.running {
+        if let Err(err) = event_queue.blocking_dispatch(&mut state) {
+            raw_stderr_line(&format!("wayclick: dispatch failed: {err:?}"));
+            break;
+        }
+    }
+}
+
+struct GameState {
+    running: bool,
+    configured: bool,
+    surface: Option<wl_surface::WlSurface>,
+    xdg_surface: Option<xdg_surface::XdgSurface>,
+    toplevel: Option<xdg_toplevel::XdgToplevel>,
+    wm_base: Option<xdg_wm_base::XdgWmBase>,
+    buffers: Vec<ShmBuffer>,
+    buffer_available: Vec<bool>,
+    frame_callback: Option<wl_callback::WlCallback>,
+    redraw_pending: bool,
+    pointer: Option<wl_pointer::WlPointer>,
+    cursor_x: f64,
+    cursor_y: f64,
+    pointer_inside: bool,
+    score: u32,
+    misses: u32,
+    streak: u32,
+    won: bool,
+    rng: u64,
+    target_x: i32,
+    target_y: i32,
+    target_radius: i32,
+}
+
+impl GameState {
+    fn new() -> Self {
+        let mut state = Self {
+            running: true,
+            configured: false,
+            surface: None,
+            xdg_surface: None,
+            toplevel: None,
+            wm_base: None,
+            buffers: Vec::new(),
+            buffer_available: Vec::new(),
+            frame_callback: None,
+            redraw_pending: false,
+            pointer: None,
+            cursor_x: 0.0,
+            cursor_y: 0.0,
+            pointer_inside: false,
+            score: 0,
+            misses: 0,
+            streak: 0,
+            won: false,
+            rng: 0x5eed_cafe_d15c_a11e,
+            target_x: 0,
+            target_y: 0,
+            target_radius: 34,
+        };
+        state.reseed_target();
+        state
+    }
+
+    fn init_shell(&mut self, qh: &QueueHandle<Self>) {
+        if self.xdg_surface.is_some() {
+            return;
+        }
+        let Some(wm_base) = self.wm_base.as_ref() else {
+            return;
+        };
+        let Some(surface) = self.surface.as_ref() else {
+            return;
+        };
+
+        let xdg_surface = wm_base.get_xdg_surface(surface, qh, ());
+        let toplevel = xdg_surface.get_toplevel(qh, ());
+        self.update_title(&toplevel);
+        surface.commit();
+        self.xdg_surface = Some(xdg_surface);
+        self.toplevel = Some(toplevel);
+    }
+
+    fn update_title(&self, toplevel: &xdg_toplevel::XdgToplevel) {
+        let title = if self.won {
+            format!(
+                "WayClick Clear - {}/{} hits, {} misses",
+                self.score, TARGET_GOAL, self.misses
+            )
+        } else {
+            format!(
+                "WayClick - hits {}/{}  misses {}  streak {}",
+                self.score, TARGET_GOAL, self.misses, self.streak
+            )
+        };
+        toplevel.set_title(title);
+    }
+
+    fn request_redraw(&mut self, qh: &QueueHandle<Self>) {
+        self.redraw_pending = true;
+        self.try_redraw(qh);
+    }
+
+    fn try_redraw(&mut self, qh: &QueueHandle<Self>) {
+        if !self.redraw_pending || !self.configured || self.frame_callback.is_some() {
+            return;
+        }
+
+        let Some(surface) = self.surface.clone() else {
+            return;
+        };
+        let Some(buffer_index) = self
+            .buffer_available
+            .iter()
+            .position(|available| *available)
+        else {
+            return;
+        };
+
+        let score = self.score;
+        let streak = self.streak;
+        let won = self.won;
+        let pointer_inside = self.pointer_inside;
+        let cursor_x = self.cursor_x;
+        let cursor_y = self.cursor_y;
+        let target_x = self.target_x;
+        let target_y = self.target_y;
+        let target_radius = self.target_radius;
+
+        let Some(buffer) = self.buffers.get_mut(buffer_index) else {
+            return;
+        };
+        buffer.clear(0xFF0A0F16);
+        buffer.fill_rect(0, 0, WIDTH as i32, HUD_HEIGHT as i32, 0xFF101B2A);
+        buffer.fill_rect(0, HUD_HEIGHT as i32 - 1, WIDTH as i32, 1, 0xFF37506A);
+
+        let progress_w = ((WIDTH - 32) * score.min(TARGET_GOAL)) / TARGET_GOAL;
+        buffer.fill_rect(16, 16, (WIDTH - 32) as i32, 12, 0xFF1A2737);
+        buffer.fill_rect(16, 16, progress_w as i32, 12, 0xFF66D4FF);
+        buffer.fill_rect(16, 36, (WIDTH - 32) as i32, 6, 0xFF122030);
+        buffer.fill_rect(
+            16,
+            36,
+            ((WIDTH - 32) * streak.min(10) / 10) as i32,
+            6,
+            0xFF7CF29E,
+        );
+
+        if won {
+            for stripe in 0..12 {
+                let y = HUD_HEIGHT as i32 + stripe * 32;
+                let color = if stripe % 2 == 0 {
+                    0xFF102538
+                } else {
+                    0xFF0D1E2D
+                };
+                buffer.fill_rect(0, y, WIDTH as i32, 18, color);
+            }
+            draw_target(buffer, target_x, target_y, target_radius, true);
+        } else {
+            draw_target(buffer, target_x, target_y, target_radius, false);
+        }
+
+        if pointer_inside {
+            let px = cursor_x as i32;
+            let py = cursor_y as i32;
+            buffer.fill_rect(px - 10, py, 21, 1, 0xFFCFF8FF);
+            buffer.fill_rect(px, py - 10, 1, 21, 0xFFCFF8FF);
+        }
+
+        let Some(wl_buffer) = buffer.wl_buffer.as_ref().cloned() else {
+            return;
+        };
+        self.buffer_available[buffer_index] = false;
+        self.redraw_pending = false;
+        self.frame_callback = Some(surface.frame(qh, ()));
+        surface.attach(Some(&wl_buffer), 0, 0);
+        surface.damage(0, 0, WIDTH as i32, HEIGHT as i32);
+        surface.commit();
+    }
+}
+
+fn draw_target(
+    buffer: &mut ShmBuffer,
+    target_x: i32,
+    target_y: i32,
+    target_radius: i32,
+    cleared: bool,
+) {
+    let outer = if cleared { 44 } else { target_radius };
+    let inner = if cleared { 18 } else { target_radius / 2 };
+    let glow = if cleared { 0xFF7CF29E } else { 0xFF69D5FF };
+    let core = if cleared { 0xFFE9FFF2 } else { 0xFFEAF8FF };
+    buffer.fill_circle(target_x, target_y, outer + 10, 0x33163D56);
+    buffer.fill_circle(target_x, target_y, outer, glow);
+    buffer.fill_circle(target_x, target_y, inner, core);
+    buffer.fill_rect(
+        target_x - outer - 12,
+        target_y,
+        outer * 2 + 25,
+        1,
+        0xFF0B1724,
+    );
+    buffer.fill_rect(
+        target_x,
+        target_y - outer - 12,
+        1,
+        outer * 2 + 25,
+        0xFF0B1724,
+    );
+}
+
+impl GameState {
+    fn next_random(&mut self) -> u32 {
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng = x;
+        (x >> 16) as u32
+    }
+
+    fn reseed_target(&mut self) {
+        let radius = 34_i32.saturating_sub((self.score as i32 / 3) * 2).max(18);
+        self.target_radius = radius;
+        let min_x = radius + 24;
+        let max_x = WIDTH as i32 - radius - 24;
+        let min_y = HUD_HEIGHT as i32 + radius + 24;
+        let max_y = HEIGHT as i32 - radius - 24;
+        let span_x = (max_x - min_x).max(1) as u32;
+        let span_y = (max_y - min_y).max(1) as u32;
+        self.target_x = min_x + (self.next_random() % span_x) as i32;
+        self.target_y = min_y + (self.next_random() % span_y) as i32;
+    }
+
+    fn handle_click(&mut self, qh: &QueueHandle<Self>) {
+        if self.won || !self.pointer_inside {
+            return;
+        }
+        let dx = self.cursor_x as i32 - self.target_x;
+        let dy = self.cursor_y as i32 - self.target_y;
+        let hit = dx * dx + dy * dy <= self.target_radius * self.target_radius;
+        if hit {
+            self.score += 1;
+            self.streak += 1;
+            if self.score >= TARGET_GOAL {
+                self.won = true;
+            } else {
+                self.reseed_target();
+            }
+        } else {
+            self.misses += 1;
+            self.streak = 0;
+        }
+        if let Some(toplevel) = self.toplevel.as_ref() {
+            self.update_title(toplevel);
+        }
+        self.request_redraw(qh);
+    }
+}
+
+impl Dispatch<wl_registry::WlRegistry, ()> for GameState {
+    fn event(
+        state: &mut Self,
+        registry: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let wl_registry::Event::Global {
+            name, interface, ..
+        } = event
+        {
+            match interface.as_str() {
+                "wl_compositor" => {
+                    let compositor =
+                        registry.bind::<wl_compositor::WlCompositor, _, _>(name, 1, qh, ());
+                    state.surface = Some(compositor.create_surface(qh, ()));
+                    state.init_shell(qh);
+                }
+                "wl_shm" => {
+                    let shm = registry.bind::<wl_shm::WlShm, _, _>(name, 1, qh, ());
+                    state.buffers.clear();
+                    state.buffer_available.clear();
+                    for index in 0..SHM_BUFFER_COUNT {
+                        let buffer =
+                            ShmBuffer::new(&shm, WIDTH, HEIGHT, qh, index).expect("shm buffer");
+                        state.buffers.push(buffer);
+                        state.buffer_available.push(true);
+                    }
+                    if state.configured {
+                        state.request_redraw(qh);
+                    }
+                }
+                "wl_seat" => {
+                    registry.bind::<wl_seat::WlSeat, _, _>(name, 1, qh, ());
+                }
+                "xdg_wm_base" => {
+                    state.wm_base =
+                        Some(registry.bind::<xdg_wm_base::XdgWmBase, _, _>(name, 1, qh, ()));
+                    state.init_shell(qh);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+delegate_noop!(GameState: ignore wl_compositor::WlCompositor);
+delegate_noop!(GameState: ignore wl_surface::WlSurface);
+delegate_noop!(GameState: ignore wl_shm::WlShm);
+delegate_noop!(GameState: ignore wl_shm_pool::WlShmPool);
+
+impl Dispatch<xdg_wm_base::XdgWmBase, ()> for GameState {
+    fn event(
+        _: &mut Self,
+        wm_base: &xdg_wm_base::XdgWmBase,
+        event: xdg_wm_base::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let xdg_wm_base::Event::Ping { serial } = event {
+            wm_base.pong(serial);
+        }
+    }
+}
+
+impl Dispatch<xdg_surface::XdgSurface, ()> for GameState {
+    fn event(
+        state: &mut Self,
+        xdg_surface: &xdg_surface::XdgSurface,
+        event: xdg_surface::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let xdg_surface::Event::Configure { serial } = event {
+            xdg_surface.ack_configure(serial);
+            state.configured = true;
+            state.request_redraw(qh);
+        }
+    }
+}
+
+impl Dispatch<xdg_toplevel::XdgToplevel, ()> for GameState {
+    fn event(
+        state: &mut Self,
+        _: &xdg_toplevel::XdgToplevel,
+        event: xdg_toplevel::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let xdg_toplevel::Event::Close = event {
+            state.running = false;
+        }
+    }
+}
+
+impl Dispatch<wl_seat::WlSeat, ()> for GameState {
+    fn event(
+        state: &mut Self,
+        seat: &wl_seat::WlSeat,
+        event: wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let wl_seat::Event::Capabilities {
+            capabilities: WEnum::Value(capabilities),
+        } = event
+        {
+            if capabilities.contains(wl_seat::Capability::Pointer) && state.pointer.is_none() {
+                state.pointer = Some(seat.get_pointer(qh, ()));
+            }
+        }
+    }
+}
+
+impl Dispatch<wl_pointer::WlPointer, ()> for GameState {
+    fn event(
+        state: &mut Self,
+        _: &wl_pointer::WlPointer,
+        event: wl_pointer::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_pointer::Event::Enter {
+                surface_x,
+                surface_y,
+                ..
+            } => {
+                state.pointer_inside = true;
+                state.cursor_x = surface_x;
+                state.cursor_y = surface_y;
+                state.request_redraw(qh);
+            }
+            wl_pointer::Event::Leave { .. } => {
+                state.pointer_inside = false;
+                state.request_redraw(qh);
+            }
+            wl_pointer::Event::Motion {
+                surface_x,
+                surface_y,
+                ..
+            } => {
+                state.cursor_x = surface_x;
+                state.cursor_y = surface_y;
+                state.request_redraw(qh);
+            }
+            wl_pointer::Event::Button {
+                button,
+                state: WEnum::Value(wl_pointer::ButtonState::Pressed),
+                ..
+            } if button == BTN_LEFT => {
+                state.handle_click(qh);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_callback::WlCallback, ()> for GameState {
+    fn event(
+        state: &mut Self,
+        callback: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let wl_callback::Event::Done { .. } = event {
+            let in_flight = state
+                .frame_callback
+                .as_ref()
+                .is_some_and(|current| current.id() == callback.id());
+            if in_flight {
+                state.frame_callback = None;
+                state.try_redraw(qh);
+            }
+        }
+    }
+}
+
+impl Dispatch<wl_buffer::WlBuffer, usize> for GameState {
+    fn event(
+        state: &mut Self,
+        _: &wl_buffer::WlBuffer,
+        event: wl_buffer::Event,
+        index: &usize,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let wl_buffer::Event::Release = event {
+            if let Some(available) = state.buffer_available.get_mut(*index) {
+                *available = true;
+            }
+            state.try_redraw(qh);
+        }
+    }
+}
+
+struct ShmBuffer {
+    wl_buffer: Option<wl_buffer::WlBuffer>,
+    fd: OwnedFd,
+    ptr: *mut u32,
+    len_pixels: usize,
+    width: u32,
+    height: u32,
+}
+
+impl ShmBuffer {
+    fn new(
+        shm: &wl_shm::WlShm,
+        width: u32,
+        height: u32,
+        qh: &QueueHandle<GameState>,
+        buffer_index: usize,
+    ) -> io::Result<Self> {
+        let len_bytes = usize::try_from(width)
+            .unwrap()
+            .saturating_mul(usize::try_from(height).unwrap())
+            .saturating_mul(4);
+        let fd = create_memfd("wayclick-buffer")?;
+        let rc = unsafe { libc::ftruncate(fd.as_raw_fd(), len_bytes as libc::off_t) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mapped = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                len_bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        let pool = shm.create_pool(fd.as_fd(), len_bytes as i32, qh, ());
+        let wl_buffer = pool.create_buffer(
+            0,
+            width as i32,
+            height as i32,
+            (width * 4) as i32,
+            wl_shm::Format::Argb8888,
+            qh,
+            buffer_index,
+        );
+        Ok(Self {
+            wl_buffer: Some(wl_buffer),
+            fd,
+            ptr: mapped.cast::<u32>(),
+            len_pixels: len_bytes / 4,
+            width,
+            height,
+        })
+    }
+
+    fn pixels_mut(&mut self) -> &mut [u32] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len_pixels) }
+    }
+
+    fn clear(&mut self, color: u32) {
+        self.pixels_mut().fill(color);
+    }
+
+    fn fill_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: u32) {
+        let start_x = x.max(0).min(self.width as i32);
+        let start_y = y.max(0).min(self.height as i32);
+        let end_x = (x + w).max(0).min(self.width as i32);
+        let end_y = (y + h).max(0).min(self.height as i32);
+        if start_x >= end_x || start_y >= end_y {
+            return;
+        }
+        let width = self.width as usize;
+        let pixels = self.pixels_mut();
+        for row in start_y as usize..end_y as usize {
+            let row_start = row * width;
+            for col in start_x as usize..end_x as usize {
+                pixels[row_start + col] = color;
+            }
+        }
+    }
+
+    fn fill_circle(&mut self, cx: i32, cy: i32, radius: i32, color: u32) {
+        let r2 = radius * radius;
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                if dx * dx + dy * dy <= r2 {
+                    self.fill_rect(cx + dx, cy + dy, 1, 1, color);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ShmBuffer {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe {
+                libc::munmap(
+                    self.ptr.cast::<libc::c_void>(),
+                    self.len_pixels * std::mem::size_of::<u32>(),
+                );
+            }
+        }
+        let _ = self.wl_buffer.take();
+        let _ = &self.fd;
+    }
+}
+
+fn create_memfd(name: &str) -> io::Result<OwnedFd> {
+    let name = CString::new(name).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}

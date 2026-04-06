@@ -1,0 +1,22 @@
+id = "shell"
+kind = "app"
+execution_domain = "user"
+profiles = ["default"]
+
+[build]
+builder = "c-demo"
+source = "shell.c"
+
+[install]
+path = "apps/shell/shell.elf"
+
+[boot]
+preload = true
+required = false
+priority = 100
+
+startup = "none"
+
+[[desktop.entries]]
+display_name = "shell"
+weight_micros = 50

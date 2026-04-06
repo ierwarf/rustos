@@ -1,0 +1,39 @@
+id = "execsmoke"
+kind = "app"
+execution_domain = "user"
+profiles = ["default"]
+
+[build]
+builder = "c-demo"
+source = "exec_smoke.c"
+extra_args = ["-pthread"]
+
+[install]
+path = "apps/execsmoke/execsmoke.elf"
+
+[boot]
+preload = true
+required = false
+priority = 110
+
+startup = "none"
+
+[[desktop.entries]]
+display_name = "execve smoke"
+weight_micros = 50
+args = ["apps/execsmoke/execsmoke.elf", "execve"]
+
+[[desktop.entries]]
+display_name = "execveat smoke"
+weight_micros = 50
+args = ["apps/execsmoke/execsmoke.elf", "execveat"]
+
+[[desktop.entries]]
+display_name = "exec thread smoke"
+weight_micros = 50
+args = ["apps/execsmoke/execsmoke.elf", "thread-execve"]
+
+[[desktop.entries]]
+display_name = "exec empty argv smoke"
+weight_micros = 50
+args = ["apps/execsmoke/execsmoke.elf", "empty-argv"]

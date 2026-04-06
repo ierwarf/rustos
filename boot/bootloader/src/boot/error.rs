@@ -3,7 +3,7 @@ use uefi::prelude::*;
 #[derive(Debug, Clone, Copy)]
 pub enum BootError {
     OpenFileSystem(Status),
-    ReadStage(Status),
+    ReadKernel(Status),
     CacheBootVolume(Status),
     InvalidElf(&'static str),
     SegmentAlloc(Status),
@@ -17,7 +17,7 @@ impl BootError {
     pub const fn status(self) -> Status {
         match self {
             Self::OpenFileSystem(status)
-            | Self::ReadStage(status)
+            | Self::ReadKernel(status)
             | Self::CacheBootVolume(status)
             | Self::SegmentAlloc(status)
             | Self::Graphics(status)
@@ -30,7 +30,7 @@ impl BootError {
     pub const fn summary(self) -> &'static str {
         match self {
             Self::OpenFileSystem(_) => "failed to open the boot filesystem",
-            Self::ReadStage(_) => "failed to read prekernel.elf",
+            Self::ReadKernel(_) => "failed to read kernel.elf",
             Self::CacheBootVolume(_) => "failed to cache the boot volume",
             Self::InvalidElf(_) => "invalid ELF image",
             Self::SegmentAlloc(_) => "failed to reserve the requested load range",

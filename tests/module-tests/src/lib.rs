@@ -2,6 +2,7 @@
 mod tests {
     use boot_protocol::{
         BootInfo, BootMemoryMap, BootPixelFormat, BootVolumeIdentity, FramebufferInfo,
+        KernelImageInfo,
     };
     use boot_random::{Random, init as init_random};
     use driver_abi::{DRIVER_MODULE_ABI_VERSION, DriverBus, DriverClass, DriverModuleHeader};
@@ -72,6 +73,7 @@ mod tests {
                 bytes_per_pixel: 0,
                 _reserved: [0; 3],
             },
+            kernel_image: KernelImageInfo::empty(),
             memory_map: BootMemoryMap::empty(),
         };
 

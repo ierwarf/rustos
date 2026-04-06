@@ -3,28 +3,41 @@
 ## 디렉터리 역할
 
 - `boot/`: bootloader, prekernel, boot protocol
-- `core/`: kernel 및 핵심 런타임
-- `system/`: native 서비스와 앱
+- `kernel/`: scheduler, VM, trap/IRQ, syscall, task, handle, broker 같은 커널 메커니즘
+- `services/`: `initd`, `uiserver` 같은 system service ELF
+- `apps/`: demo, smoke, desktop app ELF
 - `compat/`: 호환 계층 소스
-- `samples/`: demo, smoke, validation 프로그램
+- `libs/`: 여러 제품 계층이 공유하는 일반-purpose crate
 - `tests/`: 통합 테스트
 - `tools/`: host-side build/run 도구
 - `assets/image/`: 부팅 이미지 overlay
 - `build/artifacts/`: 컴파일 결과 보관
 - `build/image/`: staged 부팅 볼륨 루트
-- `build/logs/`: QEMU 및 디버그 로그
-- `drivers/`: first-party `.ko` 모듈과 driver ABI/runtime 공용 crate
+- `logs/`: QEMU 및 디버그 로그
+- `drivers/bridges/`: kernel address space에 남는 `.ko` bridge
+- `drivers/user/`: user-mode driver/service ELF
+- `drivers/libs/`: driver ABI/runtime/helper 공용 crate
 - `vendor/`: 외부 바이너리, firmware, prebuilt `.ko`, OVMF
 
 ## 새 코드 배치 규칙
 
 - 배포 단위 정책은 각 패키지 루트의 `RUSTOS.package.toml` 에 둡니다.
-- boot/core/system/compat/samples/tests/tools 중 어떤 제품 계층이 소유하는 코드인지 먼저 결정합니다.
+- 먼저 소유 계층을 결정합니다: `boot`, `kernel`, `services`, `apps`, `compat`, `drivers/bridges`, `drivers/user`, `libs`, `drivers/libs`.
 - boot chain 공용 로직은 `boot/` 아래 crate에 둡니다.
-- driver ABI/runtime 또는 특정 버스/디바이스 공용 로직은 `drivers/` 아래 crate에 둡니다.
-- 하드웨어나 ABI entrypoint가 필요한 코드는 `core/` 또는 `drivers/` 아래에 둡니다.
+- driver ABI/runtime 또는 특정 버스/디바이스 공용 로직은 `drivers/libs/` 아래 crate에 둡니다.
+- 하드웨어 IRQ/MMIO/DMA bridge가 필요한 코드는 `drivers/bridges/` 아래에 둡니다.
+- 재시작 가능하고 정책 중심인 로직은 `services/` 또는 `drivers/user/` 아래에 둡니다.
+- 하드웨어나 ABI entrypoint가 필요한 코드만 `kernel/` 아래에 둡니다.
 - 단순 staged asset 은 `assets/image/` 로 갑니다.
 - 외부에서 가져온 바이너리 파일은 `vendor/` 로 갑니다.
+
+## 계층 규칙
+
+- `kernel` 은 `libs/` 와 `drivers/libs/` 에만 의존합니다.
+- `services` 는 `libs/`, `compat/`, `drivers/libs/` 에만 의존합니다.
+- `apps` 는 `libs/` 와 `compat/` 에만 의존합니다.
+- `drivers/bridges` 는 `kernel/` ABI 와 `libs/`, `drivers/libs/` 에만 의존합니다.
+- 이 규칙은 문서가 아니라 `cargo xtask check` 의 layering check 로 강제합니다.
 
 ## vendor / assets / build 구분
 
@@ -34,8 +47,9 @@
 
 ## 새 모듈 추가 절차
 
-1. source 기반 first-party 모듈이면 `drivers/...` 에 crate를 추가합니다.
-2. 공용 driver API bind/log helper가 필요하면 `drivers/driver-module-runtime` 을 사용합니다.
-3. deployable 단위라면 해당 패키지 루트에 `RUSTOS.package.toml` 을 추가합니다.
-4. `cargo xtask build` 후 `build/image/system/registry/...` generated registry를 확인합니다.
-5. README나 이 문서에 경로 규칙이 바뀌면 같이 갱신합니다.
+1. source 기반 first-party kernel bridge 면 `drivers/bridges/...` 에 crate를 추가합니다.
+2. user-mode driver/service 면 `drivers/user/...` 또는 `services/...` 에 crate를 추가합니다.
+3. 공용 driver API/helper 가 필요하면 `drivers/libs/...` 를 사용합니다.
+4. deployable 단위라면 해당 패키지 루트에 `RUSTOS.package.toml` 을 추가하고 `kind`, `execution_domain`, `startup` 을 명시합니다.
+5. `cargo xtask check` 로 layering/package taxonomy 검사를 통과시키고, `cargo xtask build` 후 `build/image/system/registry/...` generated registry를 확인합니다.
+6. README나 이 문서에 경로 규칙이 바뀌면 같이 갱신합니다.

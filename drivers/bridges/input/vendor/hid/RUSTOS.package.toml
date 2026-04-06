@@ -1,0 +1,27 @@
+id = "hid"
+kind = "bridge-driver"
+execution_domain = "kernel"
+profiles = ["default"]
+
+[build]
+builder = "external-copy"
+source = "vendor/modules/input/hid.ko"
+source_env = "VENDOR_HID_KO"
+optional = true
+
+[install]
+path = "system/drivers/input/hid.ko"
+
+[boot]
+preload = true
+required = false
+priority = 210
+
+startup = "none"
+
+[autoload]
+name = "hid"
+class = "input"
+bus = "usb"
+priority = 100
+when = "vfs-ready"
