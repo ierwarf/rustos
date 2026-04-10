@@ -6,7 +6,7 @@
       "type": "node-terminal",
       "request": "launch",
       "preLaunchTask": "Build OS",
-      "command": "cargo xtask run --profile nvme --usb-input --debugcon file",
+      "command": "exec cargo xtask run --profile nvme --usb-input --debugcon file",
       "cwd": "${workspaceFolder}"
     },
     {
@@ -14,7 +14,7 @@
       "type": "node-terminal",
       "request": "launch",
       "preLaunchTask": "Build OS",
-      "command": "cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file",
+      "command": "exec cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file",
       "cwd": "${workspaceFolder}"
     },
     {
@@ -22,7 +22,7 @@
       "type": "node-terminal",
       "request": "launch",
       "preLaunchTask": "Build OS (no opt)",
-      "command": "cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file --qemu-log int",
+      "command": "exec cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file --qemu-log int",
       "cwd": "${workspaceFolder}"
     },
     {
@@ -30,7 +30,7 @@
       "type": "node-terminal",
       "request": "launch",
       "preLaunchTask": "Build OS",
-      "command": "cargo xtask run --profile g14 --usb-input --debugcon file",
+      "command": "exec cargo xtask run --profile g14 --usb-input --debugcon file",
       "cwd": "${workspaceFolder}"
     }
   ]
