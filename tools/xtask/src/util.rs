@@ -41,18 +41,30 @@ pub(crate) fn run_cargo_kernel_rustc(
     package: &str,
     rustc_args: &[String],
 ) -> Result<()> {
-    let sh = shell()?;
-    let cargo = &config.cargo;
-    let manifest = &config.workspace_manifest;
-    let zflags = &config.kernel_cargo_zflags;
-    let target = &config.kernel_target;
-    cmd!(
-        sh,
-        "{cargo} rustc --manifest-path {manifest} {zflags...} -p {package} --target {target} --release -- {rustc_args...}"
-    )
-    .env("CARGO_TARGET_DIR", &config.cargo_target_dir)
-    .env("RUSTFLAGS", kernel_rustflags_env())
-    .run()?;
+    let mut command = Command::new(&config.cargo);
+    command
+        .arg("rustc")
+        .arg("--manifest-path")
+        .arg(&config.workspace_manifest);
+    for flag in &config.kernel_cargo_zflags {
+        command.arg(flag);
+    }
+    command
+        .arg("-p")
+        .arg(package)
+        .arg("--bin")
+        .arg(package)
+        .arg("--target")
+        .arg(&config.kernel_target)
+        .arg("--release")
+        .arg("--");
+    for arg in rustc_args {
+        command.arg(arg);
+    }
+    command
+        .env("CARGO_TARGET_DIR", &config.cargo_target_dir)
+        .env("RUSTFLAGS", kernel_rustflags_env());
+    run_command(&mut command)?;
     Ok(())
 }
 
@@ -88,6 +100,16 @@ pub(crate) fn copy_with_parent(src: &Path, dst: &Path) -> Result<()> {
     fs::create_dir_all(parent)?;
     fs::copy(src, dst)?;
     Ok(())
+}
+
+pub(crate) fn strip_elf_artifact_if_available(path: &Path) -> Result<()> {
+    let Some(strip) = command_in_path("strip").or_else(|| command_in_path("llvm-strip")) else {
+        return Ok(());
+    };
+
+    let mut command = Command::new(strip);
+    command.arg("--strip-unneeded").arg(path);
+    run_command(&mut command)
 }
 
 pub(crate) fn copy_tree_files(src_root: &Path, dst_root: &Path) -> Result<()> {

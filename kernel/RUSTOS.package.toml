@@ -1,14 +1,14 @@
-id = "kernel"
+id = "nucleus"
 kind = "kernel"
 execution_domain = "kernel"
 profiles = ["default"]
 
 [build]
 builder = "kernel-rustc"
-package = "kernel"
+package = "nucleus"
 
 [install]
-path = "kernel.elf"
+path = "nucleus.elf"
 
 [boot]
 preload = true

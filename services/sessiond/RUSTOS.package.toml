@@ -2,7 +2,7 @@ id = "sessiond"
 kind = "service"
 execution_domain = "user"
 profiles = ["default"]
-startup = "session"
+startup = "none"
 
 [build]
 builder = "cargo-kernel-binary"

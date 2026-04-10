@@ -18,13 +18,13 @@ pub(crate) struct Config {
     pub(crate) target: String,
     pub(crate) kernel_target: String,
     pub(crate) bootloader_package: String,
-    pub(crate) kernel_package: String,
+    pub(crate) nucleus_package: String,
     pub(crate) prekernel_package: String,
     pub(crate) user_elf_package: String,
     pub(crate) user_elf_linkage: String,
     pub(crate) kernel_cargo_zflags: Vec<String>,
     pub(crate) prekernel_rustc_args: Vec<String>,
-    pub(crate) kernel_rustc_args: Vec<String>,
+    pub(crate) nucleus_rustc_args: Vec<String>,
     pub(crate) build_dir: PathBuf,
     pub(crate) artifact_dir: PathBuf,
     pub(crate) logs_dir: PathBuf,
@@ -58,7 +58,9 @@ impl Config {
             env_string("KERNEL_TARGET").unwrap_or_else(|| String::from("x86_64-unknown-linux-gnu"));
         let bootloader_package =
             env_string("BOOTLOADER_PACKAGE").unwrap_or_else(|| String::from("bootloader"));
-        let kernel_package = env_string("KERNEL_PACKAGE").unwrap_or_else(|| String::from("kernel"));
+        let nucleus_package = env_string("NUCLEUS_PACKAGE")
+            .or_else(|| env_string("KERNEL_PACKAGE"))
+            .unwrap_or_else(|| String::from("nucleus"));
         let prekernel_package =
             env_string("PREKERNEL_PACKAGE").unwrap_or_else(|| String::from("prekernel"));
         let user_elf_package =
@@ -87,14 +89,14 @@ impl Config {
                     "-C no-redzone -C link-arg=-nostartfiles -C link-arg=-no-pie -C link-arg=-static -C link-arg=-Wl,--image-base=0x100000",
                 )
             });
-        let kernel_rustc_args = env_string("KERNEL_RUSTC_ARGS")
+        let nucleus_rustc_args = env_string("NUCLEUS_RUSTC_ARGS")
+            .or_else(|| env_string("KERNEL_RUSTC_ARGS"))
             .map(|value| split_whitespace_owned(&value))
             .unwrap_or_else(|| {
                 split_whitespace_owned(
                     "-C no-redzone -C relocation-model=pic -C link-arg=-nostartfiles -C link-arg=-shared -C link-arg=-static -C link-arg=-Wl,-Bsymbolic -C link-arg=-Wl,-e,_start",
                 )
             });
-
         Ok(Self {
             image_asset_overlay_dir: env_path("IMAGE_ASSET_OVERLAY_DIR")
                 .unwrap_or_else(|| assets_dir.join("image")),
@@ -137,13 +139,13 @@ impl Config {
             target,
             kernel_target,
             bootloader_package,
-            kernel_package,
+            nucleus_package,
             prekernel_package,
             user_elf_package,
             user_elf_linkage,
             kernel_cargo_zflags,
             prekernel_rustc_args,
-            kernel_rustc_args,
+            nucleus_rustc_args,
             build_dir,
             artifact_dir,
             logs_dir,
@@ -177,15 +179,15 @@ impl Config {
         self.artifact_dir.join("prekernel.elf")
     }
 
-    pub(crate) fn kernel_source_path(&self) -> PathBuf {
+    pub(crate) fn nucleus_source_path(&self) -> PathBuf {
         self.cargo_target_dir.join(format!(
             "{}/release/{}",
-            self.kernel_target, self.kernel_package
+            self.kernel_target, self.nucleus_package
         ))
     }
 
-    pub(crate) fn artifact_kernel_elf_path(&self) -> PathBuf {
-        self.artifact_dir.join("kernel.elf")
+    pub(crate) fn artifact_nucleus_elf_path(&self) -> PathBuf {
+        self.artifact_dir.join("nucleus.elf")
     }
 
     pub(crate) fn amdgpu_image_firmware_dir(&self) -> PathBuf {

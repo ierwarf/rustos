@@ -1,5 +1,5 @@
-#![no_std]
-#![no_main]
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
 
 extern crate alloc;
 
@@ -12,13 +12,15 @@ mod settings;
 pub(crate) use boot::{boot_info, error};
 pub(crate) use platform::{debug, gui, random};
 
-use crate::boot::boot_kernel;
 use crate::error::BootError;
-use raw_cpuid::CpuId;
 use uefi::prelude::*;
 
+#[cfg(not(test))]
 #[entry]
 fn main() -> Status {
+    use crate::boot::boot_kernel;
+    use raw_cpuid::CpuId;
+
     if let Err(err) = uefi::helpers::init() {
         return err.status();
     }
@@ -48,6 +50,9 @@ fn report_boot_error(err: BootError) -> Status {
     debug::println!("bootloader: error: {:?}", err);
     match err {
         BootError::InvalidElf(reason) => {
+            uefi::println!("boot error: {} ({reason})", err.summary());
+        }
+        BootError::InvalidBootInfo(reason) => {
             uefi::println!("boot error: {} ({reason})", err.summary());
         }
         BootError::GraphicsMode(reason) => {

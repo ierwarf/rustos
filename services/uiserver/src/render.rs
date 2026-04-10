@@ -1,14 +1,13 @@
-use std::string::String;
-
 use crate::app::{AppState, ConsoleWindow, DesktopSurfaceCache};
 use crate::canvas::{Rect, SurfaceCanvas};
 use crate::font::{self, TextStyle};
 use crate::sys::ConsoleSessionHandle;
 use crate::wayland::WaylandWindowSnapshot;
 
-const COLOR_BG_BASE: u32 = 0x000a_0f16;
-const COLOR_GRID: u32 = 0x0018_2533;
-const COLOR_GRID_MAJOR: u32 = 0x001f_3041;
+const COLOR_BOOT_BG_BASE: u32 = 0x0011_1623;
+const COLOR_DESKTOP_BG_BASE: u32 = 0x0010_1826;
+const COLOR_GRID: u32 = 0x001a_2636;
+const COLOR_GRID_MAJOR: u32 = 0x0021_3044;
 const COLOR_PANEL_GLASS: u32 = 0x0012_1c28;
 const COLOR_PANEL_INNER: u32 = 0x0016_2434;
 const COLOR_ACCENT_FOCUS: u32 = 0x0069_d5ff;
@@ -39,6 +38,12 @@ const WINDOW_PADDING_X: usize = 16;
 const WINDOW_PADDING_Y: usize = 14;
 const WINDOW_FOCUS_STRIP_WIDTH: usize = 3;
 const WINDOW_SHADOW_STEPS: usize = 6;
+const WINDOW_BUTTON_SIZE: usize = 18;
+const WINDOW_BUTTON_GAP: usize = 8;
+const WINDOW_BUTTON_MARGIN_RIGHT: usize = 12;
+const COLOR_BUTTON_IDLE: u32 = 0x0021_3142;
+const COLOR_BUTTON_MINIMIZE: u32 = 0x00f0_c44a;
+const COLOR_BUTTON_CLOSE: u32 = 0x00ef_6b73;
 
 const DEFAULT_WINDOW_WIDTH: usize = 640;
 const DEFAULT_WINDOW_HEIGHT: usize = 400;
@@ -103,12 +108,51 @@ pub(crate) fn clamp_console_window_rect(width: u32, height: u32, rect: Rect) -> 
     }
 }
 
-pub(crate) fn console_window_title_bar_rect(rect: Rect) -> Rect {
+pub(crate) fn window_title_bar_rect(rect: Rect) -> Rect {
     Rect {
         x: rect.x + WINDOW_BORDER,
         y: rect.y + WINDOW_BORDER,
         width: rect.width.saturating_sub(WINDOW_BORDER * 2),
         height: WINDOW_TITLE_HEIGHT,
+    }
+}
+
+pub(crate) fn console_window_title_bar_rect(rect: Rect) -> Rect {
+    window_title_bar_rect(rect)
+}
+
+pub(crate) fn wayland_window_outer_rect(window: &WaylandWindowSnapshot) -> Rect {
+    Rect {
+        x: window.frame.x,
+        y: window.frame.y,
+        width: window.width + WINDOW_BORDER * 2,
+        height: window.height + WINDOW_TITLE_HEIGHT + WINDOW_BORDER * 2,
+    }
+}
+
+pub(crate) fn window_close_button_rect(outer: Rect) -> Rect {
+    let title_rect = window_title_bar_rect(outer);
+    let x = title_rect
+        .x
+        .saturating_add(title_rect.width)
+        .saturating_sub(WINDOW_BUTTON_MARGIN_RIGHT + WINDOW_BUTTON_SIZE);
+    Rect {
+        x,
+        y: title_rect.y + (title_rect.height.saturating_sub(WINDOW_BUTTON_SIZE)) / 2,
+        width: WINDOW_BUTTON_SIZE,
+        height: WINDOW_BUTTON_SIZE,
+    }
+}
+
+pub(crate) fn window_minimize_button_rect(outer: Rect) -> Rect {
+    let close_rect = window_close_button_rect(outer);
+    Rect {
+        x: close_rect
+            .x
+            .saturating_sub(WINDOW_BUTTON_GAP + WINDOW_BUTTON_SIZE),
+        y: close_rect.y,
+        width: WINDOW_BUTTON_SIZE,
+        height: WINDOW_BUTTON_SIZE,
     }
 }
 
@@ -149,6 +193,7 @@ pub(crate) fn render_frame(state: &mut AppState) {
     let cursor_x = state.cursor_x;
     let cursor_y = state.cursor_y;
     let focused_session_handle = state.focused_session_handle;
+    let focused_wayland_surface_id = state.focused_wayland_surface_id;
     let desktop_cache = &state.desktop_cache;
     let console_windows = &mut state.console_windows;
     let wayland_windows = &state.wayland_windows;
@@ -162,10 +207,36 @@ pub(crate) fn render_frame(state: &mut AppState) {
         cursor_x,
         cursor_y,
         focused_session_handle,
+        focused_wayland_surface_id,
         desktop_cache,
         console_windows,
         wayland_windows,
     );
+}
+
+pub(crate) fn render_boot_frame(state: &mut AppState) {
+    let pixels = state.frame.pixels_mut();
+    pixels.fill(COLOR_BOOT_BG_BASE);
+}
+
+pub(crate) fn render_debug_white_box(state: &mut AppState) {
+    render_boot_frame(state);
+
+    let width = state.surface.width;
+    let height = state.surface.height;
+    let stride_pixels = state.surface.stride_bytes as usize / 4;
+    let pixels = state.frame.pixels_mut();
+    let mut canvas = SurfaceCanvas::new(pixels, width, height, stride_pixels);
+
+    let box_width = ((width as usize) / 3).clamp(160, 400);
+    let box_height = ((height as usize) / 3).clamp(120, 320);
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width: box_width,
+        height: box_height,
+    };
+    canvas.fill_rect(rect, 0x00ff_ffff);
 }
 
 pub(crate) fn render_rect(state: &mut AppState, rect: Rect) {
@@ -181,6 +252,7 @@ pub(crate) fn render_rect(state: &mut AppState, rect: Rect) {
     let cursor_x = state.cursor_x;
     let cursor_y = state.cursor_y;
     let focused_session_handle = state.focused_session_handle;
+    let focused_wayland_surface_id = state.focused_wayland_surface_id;
     let desktop_cache = &state.desktop_cache;
     let console_windows = &mut state.console_windows;
     let wayland_windows = &state.wayland_windows;
@@ -194,6 +266,7 @@ pub(crate) fn render_rect(state: &mut AppState, rect: Rect) {
         cursor_x,
         cursor_y,
         focused_session_handle,
+        focused_wayland_surface_id,
         desktop_cache,
         console_windows,
         wayland_windows,
@@ -207,10 +280,12 @@ fn render_scene(
     cursor_x: u32,
     cursor_y: u32,
     focused_session_handle: ConsoleSessionHandle,
+    focused_wayland_surface_id: Option<u32>,
     desktop_cache: &DesktopSurfaceCache,
     console_windows: &mut [ConsoleWindow],
     wayland_windows: &[WaylandWindowSnapshot],
 ) {
+    let clip_rect = canvas.clip_rect();
     canvas.draw_surface(
         &desktop_cache.pixels,
         desktop_cache.width,
@@ -221,36 +296,107 @@ fn render_scene(
     );
 
     for window in wayland_windows {
-        draw_wayland_window(canvas, window);
+        if window.minimized || Some(window.surface_id) == focused_wayland_surface_id {
+            continue;
+        }
+        if !rect_intersects_clip(
+            clip_rect,
+            shadow_bounds(wayland_window_outer_rect(window), WINDOW_SHADOW_STEPS),
+        ) {
+            continue;
+        }
+        draw_wayland_window(
+            canvas,
+            window,
+            Some(window.surface_id) == focused_wayland_surface_id,
+        );
     }
 
     for window in console_windows.iter_mut() {
-        let focused = window.session_handle == focused_session_handle;
-        draw_console_window(canvas, window, focused);
+        if window.minimized || window.session_handle == focused_session_handle {
+            continue;
+        }
+        if !rect_intersects_clip(clip_rect, shadow_bounds(window.frame, WINDOW_SHADOW_STEPS)) {
+            continue;
+        }
+        draw_console_window(canvas, window, false);
+    }
+
+    if let Some(surface_id) = focused_wayland_surface_id {
+        if let Some(window) = wayland_windows
+            .iter()
+            .find(|window| !window.minimized && window.surface_id == surface_id)
+        {
+            if rect_intersects_clip(
+                clip_rect,
+                shadow_bounds(wayland_window_outer_rect(window), WINDOW_SHADOW_STEPS),
+            ) {
+            draw_wayland_window(canvas, window, true);
+            }
+        }
+    }
+
+    if focused_wayland_surface_id.is_none() && focused_session_handle != 0 {
+        if let Some(window) = console_windows
+            .iter_mut()
+            .find(|window| !window.minimized && window.session_handle == focused_session_handle)
+        {
+            if rect_intersects_clip(clip_rect, shadow_bounds(window.frame, WINDOW_SHADOW_STEPS)) {
+                draw_console_window(canvas, window, true);
+            }
+        }
     }
 
     for (index, window) in console_windows.iter().enumerate() {
-        draw_taskbar_slot(
-            canvas,
-            taskbar_slot_rect(width, height, index),
-            window.title.as_str(),
-            window.session_handle == focused_session_handle,
-        );
+        let rect = taskbar_slot_rect(width, height, index);
+        if rect_intersects_clip(clip_rect, shadow_bounds(rect, 2)) {
+            draw_taskbar_slot(
+                canvas,
+                rect,
+                window.title.as_str(),
+                !window.minimized && window.session_handle == focused_session_handle,
+            );
+        }
     }
     for (index, window) in wayland_windows.iter().enumerate() {
-        draw_taskbar_slot(
-            canvas,
-            taskbar_slot_rect(width, height, console_windows.len().saturating_add(index)),
-            if window.title.is_empty() {
-                "Wayland App"
-            } else {
-                window.title.as_str()
-            },
-            false,
-        );
+        let rect = taskbar_slot_rect(width, height, console_windows.len().saturating_add(index));
+        if rect_intersects_clip(clip_rect, shadow_bounds(rect, 2)) {
+            draw_taskbar_slot(
+                canvas,
+                rect,
+                if window.title.is_empty() {
+                    "Wayland App"
+                } else {
+                    window.title.as_str()
+                },
+                !window.minimized && Some(window.surface_id) == focused_wayland_surface_id,
+            );
+        }
     }
 
-    canvas.draw_cursor(cursor_x, cursor_y);
+    if rect_intersects_clip(
+        clip_rect,
+        crate::canvas::cursor_dirty_rect(cursor_x, cursor_y, width, height),
+    ) {
+        canvas.draw_cursor(cursor_x, cursor_y);
+    }
+}
+
+fn rect_intersects_clip(clip_rect: Rect, rect: Rect) -> bool {
+    !clip_rect.intersect(rect).is_empty()
+}
+
+fn shadow_bounds(rect: Rect, steps: usize) -> Rect {
+    if rect.is_empty() {
+        return rect;
+    }
+
+    Rect {
+        x: rect.x.saturating_sub(steps),
+        y: rect.y.saturating_sub(steps),
+        width: rect.width.saturating_add(steps.saturating_mul(2).saturating_add(1)),
+        height: rect.height.saturating_add(steps.saturating_mul(2).saturating_add(1)),
+    }
 }
 
 fn draw_console_window(canvas: &mut SurfaceCanvas<'_>, window: &mut ConsoleWindow, focused: bool) {
@@ -266,23 +412,37 @@ fn draw_console_window(canvas: &mut SurfaceCanvas<'_>, window: &mut ConsoleWindo
     );
 }
 
-fn draw_wayland_window(canvas: &mut SurfaceCanvas<'_>, window: &WaylandWindowSnapshot) {
+fn draw_wayland_window(
+    canvas: &mut SurfaceCanvas<'_>,
+    window: &WaylandWindowSnapshot,
+    focused: bool,
+) {
     if window.width == 0 || window.height == 0 {
         return;
     }
 
-    let outer = Rect {
-        x: window.frame.x,
-        y: window.frame.y,
-        width: window.width + WINDOW_BORDER * 2,
-        height: window.height + WINDOW_TITLE_HEIGHT + WINDOW_BORDER * 2,
-    };
+    let outer = wayland_window_outer_rect(window);
     let title = if window.title.is_empty() {
         "Wayland App"
     } else {
         window.title.as_str()
     };
-    let (_, client_rect) = paint_window_chrome(canvas, outer, title, false);
+    let client_rect = window_client_rect(outer);
+    let clipped_outer = outer.intersect(canvas.clip_rect());
+    let clipped_client = client_rect.intersect(canvas.clip_rect());
+    if !clipped_outer.is_empty() && clipped_outer == clipped_client {
+        canvas.draw_surface(
+            window.pixels.as_slice(),
+            window.width,
+            window.height,
+            window.stride_pixels,
+            client_rect.x,
+            client_rect.y,
+        );
+        return;
+    }
+
+    let (_, client_rect) = paint_window_chrome(canvas, outer, title, focused);
     canvas.draw_surface(
         window.pixels.as_slice(),
         window.width,
@@ -346,8 +506,14 @@ fn draw_taskbar_slot(canvas: &mut SurfaceCanvas<'_>, rect: Rect, title: &str, fo
     } else {
         COLOR_TEXT_DIM
     });
-    let text = truncate_text(title, rect.width.saturating_sub(20), style);
-    font::draw_text(canvas, rect.x + 10, rect.y + 5, &text, style);
+    font::draw_text_clipped(
+        canvas,
+        rect.x + 10,
+        rect.y + 5,
+        title,
+        rect.width.saturating_sub(20),
+        style,
+    );
 }
 
 fn draw_launcher_button(canvas: &mut SurfaceCanvas<'_>, rect: Rect, title: &str) {
@@ -388,8 +554,14 @@ fn draw_launcher_button(canvas: &mut SurfaceCanvas<'_>, rect: Rect, title: &str)
     );
 
     let style = TextStyle::ui_medium(COLOR_TEXT_PRIMARY);
-    let text = truncate_text(title, rect.width.saturating_sub(18), style);
-    font::draw_text(canvas, rect.x + 9, rect.y + 4, &text, style);
+    font::draw_text_clipped(
+        canvas,
+        rect.x + 9,
+        rect.y + 4,
+        title,
+        rect.width.saturating_sub(18),
+        style,
+    );
 }
 
 fn refresh_desktop_surface(state: &mut AppState) {
@@ -409,43 +581,44 @@ fn refresh_desktop_surface(state: &mut AppState) {
         return;
     }
 
-    let mut canvas = SurfaceCanvas::new(
-        state.desktop_cache.pixels.as_mut_slice(),
-        width as u32,
-        height as u32,
-        width,
-    );
-    let screen = Rect {
-        x: 0,
-        y: 0,
-        width,
-        height,
-    };
-    canvas.fill_rect(screen, COLOR_BG_BASE);
-    canvas.fill_pattern_grid(screen, 28, COLOR_GRID, 34);
-    canvas.fill_pattern_grid(screen, 112, COLOR_GRID_MAJOR, 48);
-
-    let topbar = topbar_rail_rect(width);
-    let taskbar = taskbar_rail_rect(width, height);
-    draw_rail_panel(&mut canvas, topbar);
-    draw_rail_panel(&mut canvas, taskbar);
-
-    font::draw_text(
-        &mut canvas,
-        topbar.x + topbar.width.saturating_sub(198),
-        topbar.y + 6,
-        "WAYLAND // AERO HUD",
-        TextStyle::ui_small(COLOR_TEXT_DIM),
-    );
-
-    for (index, program) in state.launcher_programs.iter().enumerate() {
-        draw_launcher_button(
-            &mut canvas,
-            launcher_button_rect(width as u32, index),
-            program.title.as_str(),
+    {
+        let mut canvas = SurfaceCanvas::new(
+            state.desktop_cache.pixels.as_mut_slice(),
+            width as u32,
+            height as u32,
+            width,
         );
-    }
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        canvas.fill_rect(screen, COLOR_DESKTOP_BG_BASE);
+        canvas.fill_pattern_grid(screen, 28, COLOR_GRID, 34);
+        canvas.fill_pattern_grid(screen, 112, COLOR_GRID_MAJOR, 48);
 
+        let topbar = topbar_rail_rect(width);
+        let taskbar = taskbar_rail_rect(width, height);
+        draw_rail_panel(&mut canvas, topbar);
+        draw_rail_panel(&mut canvas, taskbar);
+
+        font::draw_text(
+            &mut canvas,
+            topbar.x + topbar.width.saturating_sub(198),
+            topbar.y + 6,
+            "WAYLAND // AERO HUD",
+            TextStyle::ui_small(COLOR_TEXT_DIM),
+        );
+
+        for (index, program) in state.launcher_programs.iter().enumerate() {
+            draw_launcher_button(
+                &mut canvas,
+                launcher_button_rect(width as u32, index),
+                program.title.as_str(),
+            );
+        }
+    }
     state.desktop_cache.valid = true;
 }
 
@@ -576,16 +749,45 @@ fn paint_window_chrome(
     } else {
         COLOR_TEXT_DIM
     });
-    let truncated = truncate_text(title, title_rect.width.saturating_sub(26), style);
-    font::draw_text(
+    let button_cluster_width =
+        WINDOW_BUTTON_MARGIN_RIGHT + WINDOW_BUTTON_SIZE * 2 + WINDOW_BUTTON_GAP + 12;
+    font::draw_text_clipped(
         canvas,
         title_rect.x + 12,
         title_rect.y + 8,
-        &truncated,
+        title,
+        title_rect.width.saturating_sub(button_cluster_width),
         style,
     );
+    draw_window_controls(canvas, outer);
 
     (title_rect, client_rect)
+}
+
+fn draw_window_controls(canvas: &mut SurfaceCanvas<'_>, outer: Rect) {
+    let minimize_rect = window_minimize_button_rect(outer);
+    let close_rect = window_close_button_rect(outer);
+    draw_window_button(canvas, minimize_rect, COLOR_BUTTON_MINIMIZE, "_");
+    draw_window_button(canvas, close_rect, COLOR_BUTTON_CLOSE, "X");
+}
+
+fn draw_window_button(canvas: &mut SurfaceCanvas<'_>, rect: Rect, accent: u32, label: &str) {
+    canvas.fill_rect_alpha(rect, COLOR_BUTTON_IDLE, 230);
+    canvas.stroke_rect(rect, accent);
+    canvas.fill_rect_alpha(
+        Rect {
+            x: rect.x + 1,
+            y: rect.y + 1,
+            width: rect.width.saturating_sub(2),
+            height: 1,
+        },
+        accent,
+        140,
+    );
+    let style = TextStyle::ui_small(COLOR_TEXT_PRIMARY);
+    let text_x = rect.x + rect.width.saturating_sub(8) / 2;
+    let text_y = rect.y + rect.height.saturating_sub(12) / 2;
+    font::draw_text(canvas, text_x, text_y, label, style);
 }
 
 fn draw_rail_panel(canvas: &mut SurfaceCanvas<'_>, rect: Rect) {
@@ -682,28 +884,4 @@ fn draw_shadow(canvas: &mut SurfaceCanvas<'_>, rect: Rect, steps: usize, base_al
             alpha,
         );
     }
-}
-
-fn truncate_text(text: &str, max_width: usize, style: TextStyle) -> String {
-    if font::measure_text(text, style) <= max_width {
-        return text.to_string();
-    }
-
-    let ellipsis = "...";
-    let ellipsis_width = font::measure_text(ellipsis, style);
-    if ellipsis_width >= max_width {
-        return ellipsis.to_string();
-    }
-
-    let mut out = String::new();
-    for ch in text.chars() {
-        let next_len = out.len();
-        out.push(ch);
-        if font::measure_text(out.as_str(), style).saturating_add(ellipsis_width) > max_width {
-            out.truncate(next_len);
-            break;
-        }
-    }
-    out.push_str(ellipsis);
-    out
 }

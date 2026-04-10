@@ -12,6 +12,7 @@ use core::cmp::min;
 use fatfs::IoError;
 
 pub type IoResult<T> = core::result::Result<T, StorageError>;
+const MAX_GPT_PARTITION_ENTRIES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StorageError {
@@ -112,7 +113,10 @@ pub struct BootVolumeLocator {
 
 impl BootVolumeLocator {
     pub fn new(identity: BootVolumeIdentity) -> Option<Self> {
-        identity.is_present().then_some(Self { identity })
+        identity
+            .validate()
+            .ok()
+            .and_then(|_| identity.is_present().then_some(Self { identity }))
     }
 
     pub fn identity(&self) -> BootVolumeIdentity {
@@ -363,7 +367,11 @@ fn detect_gpt_partitions<D: BlockDevice>(
     let entry_lba = le_u64(&header, 72);
     let entry_count = le_u32(&header, 80) as usize;
     let entry_size = le_u32(&header, 84) as usize;
-    if entry_count == 0 || entry_size < 56 || entry_size > block_size {
+    if entry_count == 0
+        || entry_count > MAX_GPT_PARTITION_ENTRIES
+        || entry_size < 56
+        || entry_size > block_size
+    {
         return Err(StorageError::InvalidInput);
     }
 
@@ -620,5 +628,26 @@ mod tests {
         sector[..512].copy_from_slice(&boot);
         sector[39..43].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
         assert_eq!(fat_volume_id_from_boot_sector(&sector), Some(0x1234_5678));
+    }
+
+    #[test]
+    fn rejects_gpt_with_excessive_partition_count() {
+        let mut disk = MemBlockDevice::new_zeroed(512, 4096);
+        let mut mbr = [0_u8; 512];
+        mbr[446 + 4] = 0xEE;
+        mbr[510] = 0x55;
+        mbr[511] = 0xAA;
+        disk.write_blocks(0, &mbr).expect("write protective MBR");
+
+        let mut gpt = [0_u8; 512];
+        gpt[..8].copy_from_slice(b"EFI PART");
+        gpt[80..84].copy_from_slice(&((MAX_GPT_PARTITION_ENTRIES as u32) + 1).to_le_bytes());
+        gpt[84..88].copy_from_slice(&(128u32).to_le_bytes());
+        disk.write_blocks(1, &gpt).expect("write GPT header");
+
+        assert_eq!(
+            detect_partitions(&mut disk),
+            Err(StorageError::InvalidInput)
+        );
     }
 }

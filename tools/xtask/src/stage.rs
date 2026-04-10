@@ -13,14 +13,17 @@ use crate::util::{
     remove_dir_if_exists, remove_file_if_exists, run_command,
 };
 
+const APPLICATIONS_DIR: &str = "usr/share/applications";
 const DRIVER_REGISTRY_PATH: &str = "system/registry/kernel/loadable-drivers.tsv";
 const DESKTOP_REGISTRY_PATH: &str = "system/registry/system/desktop-programs.tsv";
+const RUNTIME_LAUNCH_REGISTRY_PATH: &str = "system/registry/system/runtime-launch-programs.tsv";
 const STARTUP_REGISTRY_PATH: &str = "system/registry/system/startup-programs.tsv";
 const WINDOWS_DLL_REGISTRY_PATH: &str = "system/registry/compat/windows-system-dlls.txt";
 const LD_SO_CONF_PATH: &str = "etc/ld.so.conf";
 const LEGACY_BUILD_DIRS: &[&str] = &["EFI", "etc", "lib", "lib64", "linux", "SYSTEM"];
 const LEGACY_BUILD_FILES: &[&str] = &[
     "kernel.elf",
+    "nucleus.elf",
     "prekernel.elf",
     "UISERVER.ELF",
     "UISERVER.EXE",
@@ -55,7 +58,9 @@ pub(crate) fn stage(config: &Config) -> Result<()> {
     }
 
     write_driver_registry(config, &manifests)?;
+    write_application_desktop_files(config, &manifests)?;
     write_desktop_registry(config, &manifests)?;
+    write_runtime_launch_registry(config, &manifests)?;
     write_startup_registry(config, &manifests)?;
     write_windows_dll_registry(config, &manifests)?;
     generate_dynamic_linker_cache(&config.image_dir)?;
@@ -121,13 +126,71 @@ fn write_driver_registry(config: &Config, manifests: &[PackageManifest]) -> Resu
     write_registry_lines(config.image_dir.join(DRIVER_REGISTRY_PATH), &lines)
 }
 
+fn write_application_desktop_files(config: &Config, manifests: &[PackageManifest]) -> Result<()> {
+    let applications_dir = config.image_dir.join(APPLICATIONS_DIR);
+    fs::create_dir_all(&applications_dir)?;
+
+    for manifest in manifests {
+        if !manifest.artifact_path(config).exists() {
+            continue;
+        }
+
+        for (index, entry) in manifest.desktop.entries.iter().enumerate() {
+            let desktop_file_id = desktop_file_id(manifest, index);
+            if !should_generate_application_desktop(config, manifest, &desktop_file_id) {
+                continue;
+            }
+            let exec = entry.exec.as_deref().unwrap_or(&manifest.install.path);
+            let argv = if entry.args.is_empty() {
+                vec![exec.to_string()]
+            } else {
+                entry.args.clone()
+            };
+            let content = format!(
+                "[Desktop Entry]\nType=Application\nName={name}\nExec={exec_line}\nTerminal={terminal}\nOnlyShowIn=RustOS;\nNoDisplay={no_display}\nX-RustOS-DesktopId={desktop_id}\nX-RustOS-Startup={startup}\nX-RustOS-WeightMicros={weight}\nX-RustOS-LogicalAdmin={logical_admin}\nX-RustOS-ConsoleHosted={console_hosted}\nX-RustOS-Argv={argv}\nX-RustOS-Env={env}\n",
+                name = desktop_value(&entry.display_name)?,
+                exec_line = desktop_exec_line(&argv)?,
+                terminal = desktop_bool(entry.console_hosted),
+                no_display =
+                    desktop_bool(manifest.kind == crate::package_manifest::PackageKind::Service),
+                desktop_id = desktop_value(&desktop_file_id)?,
+                startup = desktop_startup_mode(manifest.startup),
+                weight = entry.weight_micros,
+                logical_admin = desktop_bool(entry.logical_admin),
+                console_hosted = desktop_bool(entry.console_hosted),
+                argv = desktop_value(&entry.args.join("|"))?,
+                env = desktop_value(&entry.env.join("|"))?,
+            );
+            fs::write(applications_dir.join(&desktop_file_id), content)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn should_generate_application_desktop(
+    config: &Config,
+    manifest: &PackageManifest,
+    desktop_file_id: &str,
+) -> bool {
+    if !matches!(manifest.startup, StartupMode::None) {
+        return true;
+    }
+    config
+        .image_dir
+        .join("etc/xdg/autostart")
+        .join(desktop_file_id)
+        .is_file()
+}
+
 fn write_desktop_registry(config: &Config, manifests: &[PackageManifest]) -> Result<()> {
     let mut lines = Vec::new();
     for manifest in manifests {
         if !manifest.artifact_path(config).exists() {
             continue;
         }
-        for entry in &manifest.desktop.entries {
+        for (index, entry) in manifest.desktop.entries.iter().enumerate() {
+            let desktop_id = desktop_file_id(manifest, index);
             let image = entry.image.as_deref().unwrap_or(&manifest.install.path);
             let exec = entry.exec.as_deref().unwrap_or(image);
             let args = if entry.args.is_empty() {
@@ -155,14 +218,22 @@ fn write_desktop_registry(config: &Config, manifests: &[PackageManifest]) -> Res
                 DesktopLaunchMode::NewSession => "new-session",
                 DesktopLaunchMode::AllSessions => "all-sessions",
             };
+            let startup = desktop_startup_mode(manifest.startup);
+            let no_display = manifest.kind == crate::package_manifest::PackageKind::Service;
+            let autostart_enabled = desktop_autostart_enabled(config, &desktop_id)?;
             lines.push(format!(
-                "display_name={}\timage={}\texec={}\tweight={}\tlogical_admin={}\tconsole_hosted={}\tlaunch={}\targs={}\tenv={}",
+                "desktop_id={}\tstartup={}\tdisplay_name={}\timage={}\texec={}\tweight={}\tlogical_admin={}\tconsole_hosted={}\tterminal={}\thidden=0\tno_display={}\tautostart_enabled={}\tlaunch={}\targs={}\tenv={}",
+                registry_value(&desktop_id)?,
+                startup,
                 registry_value(&entry.display_name)?,
                 registry_value(image)?,
                 registry_value(exec)?,
                 entry.weight_micros,
                 if entry.logical_admin { 1 } else { 0 },
                 if entry.console_hosted { 1 } else { 0 },
+                if entry.console_hosted { 1 } else { 0 },
+                if no_display { 1 } else { 0 },
+                if autostart_enabled { 1 } else { 0 },
                 launch,
                 args,
                 env,
@@ -170,6 +241,137 @@ fn write_desktop_registry(config: &Config, manifests: &[PackageManifest]) -> Res
         }
     }
     write_registry_lines(config.image_dir.join(DESKTOP_REGISTRY_PATH), &lines)
+}
+
+fn write_runtime_launch_registry(config: &Config, manifests: &[PackageManifest]) -> Result<()> {
+    let mut lines = Vec::new();
+    for manifest in manifests {
+        if !manifest.artifact_path(config).exists() {
+            continue;
+        }
+        for (index, entry) in manifest.desktop.entries.iter().enumerate() {
+            let desktop_id = desktop_file_id(manifest, index);
+            let autostart_enabled = desktop_autostart_enabled(config, &desktop_id)?;
+            let startup_mode = manifest.startup;
+            if matches!(startup_mode, StartupMode::None) && !autostart_enabled {
+                continue;
+            }
+
+            let image = entry.image.as_deref().unwrap_or(&manifest.install.path);
+            let exec = entry.exec.as_deref().unwrap_or(image);
+            let args = if entry.args.is_empty() {
+                String::new()
+            } else {
+                entry
+                    .args
+                    .iter()
+                    .map(|arg| registry_value(arg))
+                    .collect::<Result<Vec<_>>>()?
+                    .join("|")
+            };
+            let env = if entry.env.is_empty() {
+                String::new()
+            } else {
+                entry
+                    .env
+                    .iter()
+                    .map(|item| registry_value(item))
+                    .collect::<Result<Vec<_>>>()?
+                    .join("|")
+            };
+            let launch = match entry.launch {
+                DesktopLaunchMode::None => "none",
+                DesktopLaunchMode::NewSession => "new-session",
+                DesktopLaunchMode::AllSessions => "all-sessions",
+            };
+            let no_display = manifest.kind == crate::package_manifest::PackageKind::Service;
+            lines.push(format!(
+                "desktop_id={}\tstartup={}\tdisplay_name={}\timage={}\texec={}\tweight={}\tlogical_admin={}\tconsole_hosted={}\tterminal={}\thidden=0\tno_display={}\tautostart_enabled={}\tlaunch={}\targs={}\tenv={}",
+                registry_value(&desktop_id)?,
+                desktop_startup_mode(startup_mode),
+                registry_value(&entry.display_name)?,
+                registry_value(image)?,
+                registry_value(exec)?,
+                entry.weight_micros,
+                if entry.logical_admin { 1 } else { 0 },
+                if entry.console_hosted { 1 } else { 0 },
+                if entry.console_hosted { 1 } else { 0 },
+                if no_display { 1 } else { 0 },
+                if autostart_enabled { 1 } else { 0 },
+                launch,
+                args,
+                env,
+            ));
+        }
+    }
+
+    write_registry_lines(config.image_dir.join(RUNTIME_LAUNCH_REGISTRY_PATH), &lines)
+}
+
+fn desktop_file_id(manifest: &PackageManifest, index: usize) -> String {
+    if manifest.desktop.entries.len() <= 1 {
+        return format!("{}.desktop", manifest.id);
+    }
+    format!("{}-{}.desktop", manifest.id, index + 1)
+}
+
+fn desktop_exec_line(argv: &[String]) -> Result<String> {
+    let mut tokens = Vec::with_capacity(argv.len());
+    for arg in argv {
+        let value = desktop_value(arg)?;
+        if value.contains(char::is_whitespace) {
+            tokens.push(format!("\"{}\"", value.replace('"', "\\\"")));
+        } else {
+            tokens.push(value);
+        }
+    }
+    Ok(tokens.join(" "))
+}
+
+fn desktop_startup_mode(mode: StartupMode) -> &'static str {
+    match mode {
+        StartupMode::None => "none",
+        StartupMode::Init => "init",
+        StartupMode::Session => "session",
+        StartupMode::Desktop => "desktop",
+    }
+}
+
+fn desktop_bool(value: bool) -> &'static str {
+    if value { "true" } else { "false" }
+}
+
+fn desktop_autostart_enabled(config: &Config, desktop_file_id: &str) -> Result<bool> {
+    let path = config
+        .image_dir
+        .join("etc/xdg/autostart")
+        .join(desktop_file_id);
+    if !path.is_file() {
+        return Ok(false);
+    }
+
+    let contents = fs::read_to_string(&path)?;
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() == "X-GNOME-Autostart-enabled" {
+            return Ok(matches!(value.trim(), "1" | "true" | "True" | "yes" | "Yes"));
+        }
+    }
+
+    Ok(true)
+}
+
+fn desktop_value(value: &str) -> Result<String> {
+    if value.contains('\n') || value.contains('\r') {
+        return Err(format!("desktop value contains unsupported newline: {value:?}").into());
+    }
+    Ok(value.to_owned())
 }
 
 fn write_startup_registry(config: &Config, manifests: &[PackageManifest]) -> Result<()> {
@@ -198,8 +400,10 @@ fn write_startup_registry(config: &Config, manifests: &[PackageManifest]) -> Res
             StartupMode::Session => "session",
             StartupMode::Desktop => "desktop",
         };
+        let desktop_id = desktop_file_id(manifest, 0);
         lines.push(format!(
-            "mode={}\tdisplay_name={}\texec={}\tlaunch={}",
+            "desktop_id={}\tmode={}\tdisplay_name={}\texec={}\tlaunch={}",
+            registry_value(&desktop_id)?,
             mode,
             registry_value(&entry.display_name)?,
             registry_value(exec)?,

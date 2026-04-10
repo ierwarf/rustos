@@ -1,0 +1,12 @@
+[package]
+name = "kernel-compat"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+kernel-base = { path = "../base" }
+kernel-mm = { path = "../mm" }
+kernel-object = { path = "../object" }
+kernel-ipc-runtime = { path = "../ipc-runtime" }
+kernel-ps = { path = "../ps" }
+kernel-io-manager = { path = "../io-manager" }

@@ -1,3 +1,4 @@
+use std::arch::asm;
 use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
@@ -20,9 +21,54 @@ const HUD_HEIGHT: u32 = 56;
 const TARGET_GOAL: u32 = 20;
 const BTN_LEFT: u32 = 0x110;
 const SHM_BUFFER_COUNT: usize = 2;
+const SYS_RUSTOS_DEBUG_PRINT: usize = 0x5255_0001;
+
+fn auto_exit_after_first_frame() -> bool {
+    match std::env::var("RUSTOS_WAYCLICK_AUTO_EXIT") {
+        Ok(value) => !matches!(value.as_str(), "0" | "false" | "False" | "FALSE"),
+        Err(_) => false,
+    }
+}
 
 fn raw_stderr_line(message: &str) {
+    if raw_debug_write(message.as_bytes()).is_ok() && raw_debug_write(b"\n").is_ok() {
+        return;
+    }
     eprintln!("{message}");
+}
+
+fn raw_debug_write(buffer: &[u8]) -> Result<usize, i32> {
+    let result = unsafe {
+        syscall2(
+            SYS_RUSTOS_DEBUG_PRINT,
+            buffer.as_ptr() as usize,
+            buffer.len(),
+        )
+    };
+    syscall_usize(result)
+}
+
+fn syscall_usize(result: isize) -> Result<usize, i32> {
+    if result < 0 && result >= -4095 {
+        return Err((-result) as i32);
+    }
+    usize::try_from(result).map_err(|_| 22)
+}
+
+unsafe fn syscall2(number: usize, arg0: usize, arg1: usize) -> isize {
+    let result: isize;
+    unsafe {
+        asm!(
+            "syscall",
+            inlateout("rax") number as isize => result,
+            in("rdi") arg0 as isize,
+            in("rsi") arg1 as isize,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    result
 }
 
 fn install_panic_hook() {
@@ -76,10 +122,13 @@ fn main() {
             break;
         }
     }
+    raw_stderr_line("wayclick: main exit");
 }
 
 struct GameState {
     running: bool,
+    auto_exit_after_first_frame: bool,
+    first_frame_presented: bool,
     configured: bool,
     surface: Option<wl_surface::WlSurface>,
     xdg_surface: Option<xdg_surface::XdgSurface>,
@@ -107,6 +156,8 @@ impl GameState {
     fn new() -> Self {
         let mut state = Self {
             running: true,
+            auto_exit_after_first_frame: auto_exit_after_first_frame(),
+            first_frame_presented: false,
             configured: false,
             surface: None,
             xdg_surface: None,
@@ -425,6 +476,7 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for GameState {
         _: &QueueHandle<Self>,
     ) {
         if let xdg_toplevel::Event::Close = event {
+            raw_stderr_line("wayclick: received close");
             state.running = false;
         }
     }
@@ -511,6 +563,14 @@ impl Dispatch<wl_callback::WlCallback, ()> for GameState {
                 .is_some_and(|current| current.id() == callback.id());
             if in_flight {
                 state.frame_callback = None;
+                if !state.first_frame_presented {
+                    state.first_frame_presented = true;
+                    if state.auto_exit_after_first_frame {
+                        raw_stderr_line("wayclick: auto-exit after first frame");
+                        state.running = false;
+                        return;
+                    }
+                }
                 state.try_redraw(qh);
             }
         }

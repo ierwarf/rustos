@@ -1,0 +1,14 @@
+[package]
+name = "kernel-ps"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+kernel-base = { path = "../base" }
+kernel-lowlevel = { path = "../lowlevel" }
+kernel-mm = { path = "../mm" }
+kernel-object = { path = "../object" }
+diag-abi = { path = "../../libs/diag-abi" }
+trace-loc-macro = { path = "../../libs/trace-loc-macro" }
+spin = "0.10.0"
+x86_64 = { version = "0.15.4", default-features = false, features = ["instructions", "abi_x86_interrupt"] }

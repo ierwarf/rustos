@@ -10,7 +10,7 @@ use uefi::mem::memory_map::{MemoryMap, MemoryMapOwned, MemoryType};
 use uefi::prelude::*;
 use uefi::proto::media::file::{File, FileAttribute, FileInfo, FileMode};
 
-use self::boot_info::{BootInfo, BootMemoryKind, BootMemoryRegion, KernelImageInfo};
+use self::boot_info::{BootInfo, BootMemoryKind, BootMemoryRegion, NucleusImageInfo};
 use self::elf_loader::{load_kernel_elf, UefiKernelFile};
 use self::error::BootError;
 use crate::debug;
@@ -21,24 +21,24 @@ use crate::settings;
 const PAGE_SIZE: usize = 4096;
 const BOOT_MEMORY_MAP_STORAGE_PAGES: usize = 32;
 
-const KERNEL_CANDIDATE_PATHS: [(&str, &uefi::CStr16); 4] = [
-    ("\\kernel.elf", cstr16!("\\kernel.elf")),
-    ("kernel.elf", cstr16!("kernel.elf")),
+const NUCLEUS_CANDIDATE_PATHS: [(&str, &uefi::CStr16); 4] = [
+    ("\\nucleus.elf", cstr16!("\\nucleus.elf")),
+    ("nucleus.elf", cstr16!("nucleus.elf")),
     (
-        "\\EFI\\BOOT\\kernel.elf",
-        cstr16!("\\EFI\\BOOT\\kernel.elf"),
+        "\\EFI\\BOOT\\nucleus.elf",
+        cstr16!("\\EFI\\BOOT\\nucleus.elf"),
     ),
-    ("EFI\\BOOT\\kernel.elf", cstr16!("EFI\\BOOT\\kernel.elf")),
+    ("EFI\\BOOT\\nucleus.elf", cstr16!("EFI\\BOOT\\nucleus.elf")),
 ];
 
 pub fn boot_kernel() -> Result<(), BootError> {
-    debug::println!("bootloader: locating kernel image");
+    debug::println!("bootloader: locating nucleus image");
     let mut boot_info = gui::prepare_boot_info()?;
-    let (kernel_path, mut kernel_file, kernel_size) = open_kernel_file()?;
+    let (nucleus_path, mut nucleus_file, nucleus_size) = open_kernel_file()?;
     debug::println!(
-        "bootloader: kernel image found at {}, {} bytes",
-        kernel_path,
-        kernel_size
+        "bootloader: nucleus image found at {}, {} bytes",
+        nucleus_path,
+        nucleus_size
     );
     let kernel_physical_slide = choose_kernel_physical_slide(boot_info.rng_seed);
     debug::println!(
@@ -46,9 +46,9 @@ pub fn boot_kernel() -> Result<(), BootError> {
         kernel_physical_slide
     );
     let (entry_point, segment_count, load_bias, kernel_phys_start, kernel_size_bytes) =
-        load_kernel_elf(&mut kernel_file, kernel_size, kernel_physical_slide)?;
+        load_kernel_elf(&mut nucleus_file, nucleus_size, kernel_physical_slide)?;
     let applied_slide = load_bias.saturating_sub(0x0020_0000);
-    boot_info.kernel_image = KernelImageInfo {
+    boot_info.nucleus_image = NucleusImageInfo {
         phys_start: kernel_phys_start as u64,
         size: kernel_size_bytes as u64,
         load_bias: load_bias as u64,
@@ -108,7 +108,7 @@ fn open_kernel_file() -> Result<(&'static str, UefiKernelFile, u64), BootError> 
         .open_volume()
         .map_err(|err| BootError::OpenFileSystem(err.status()))?;
 
-    for (display_path, path) in KERNEL_CANDIDATE_PATHS {
+    for (display_path, path) in NUCLEUS_CANDIDATE_PATHS {
         let handle = match root.open(path, FileMode::Read, FileAttribute::empty()) {
             Ok(handle) => handle,
             Err(err) if err.status() == Status::NOT_FOUND => continue,
@@ -120,13 +120,13 @@ fn open_kernel_file() -> Result<(&'static str, UefiKernelFile, u64), BootError> 
         let info = file
             .get_boxed_info::<FileInfo>()
             .map_err(|err| BootError::ReadKernel(err.status()))?;
-        debug::println!("bootloader: found kernel at {}", display_path);
+        debug::println!("bootloader: found nucleus at {}", display_path);
         return Ok((display_path, UefiKernelFile::new(file), info.file_size()));
     }
 
-    uefi::println!("kernel image not found; tried:");
-    debug::println!("bootloader: kernel image not found");
-    for (display_path, _) in KERNEL_CANDIDATE_PATHS {
+    uefi::println!("nucleus image not found; tried:");
+    debug::println!("bootloader: nucleus image not found");
+    for (display_path, _) in NUCLEUS_CANDIDATE_PATHS {
         uefi::println!("  - {display_path}");
     }
     Err(BootError::ReadKernel(Status::NOT_FOUND))
@@ -134,9 +134,15 @@ fn open_kernel_file() -> Result<(&'static str, UefiKernelFile, u64), BootError> 
 
 #[cfg(rustos_kernel_physical_kaslr_enabled)]
 fn choose_kernel_physical_slide(seed: [u8; 32]) -> usize {
+    if !boot_protocol::rng_seed_usable(seed) {
+        return 0;
+    }
+
     let mut value = 0_u64;
     for chunk in seed.chunks_exact(8) {
-        value ^= u64::from_le_bytes(chunk.try_into().unwrap());
+        let mut word = [0u8; 8];
+        word.copy_from_slice(chunk);
+        value ^= u64::from_le_bytes(word);
         value = splitmix64(value);
     }
     let max_slide = u64::try_from(settings::MAX_KERNEL_PHYSICAL_KASLR_SLIDE.max(0)).unwrap_or(0);
@@ -192,6 +198,15 @@ fn exit_boot_services_and_jump(
         );
         boot_info.memory_map.entries_ptr = boot_memory_map_storage as u64;
         boot_info.memory_map.entry_count = entry_count as u32;
+        if let Err(error) = boot_info.validate() {
+            debug::println!(
+                "bootloader: refusing to jump with invalid boot info: {}",
+                error.as_str()
+            );
+            loop {
+                core::hint::spin_loop();
+            }
+        }
         debug::println!(
             "bootloader: memory map summarized: regions={}",
             boot_info.memory_map.entry_count

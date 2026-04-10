@@ -1,20 +1,17 @@
 use std::os::fd::AsRawFd;
 use std::vec::Vec;
 
-use super::{
-    AppState, ConsoleWindow, LauncherProgram, MAX_REGISTERED_PROGRAMS, MAX_RUNNING_PROGRAMS,
-};
+use super::{AppState, ConsoleWindow, DragTarget, MAX_RUNNING_PROGRAMS};
 use crate::canvas;
 use crate::render::{self, default_console_window_rect, taskbar_slot_rect};
-use crate::runtime_sync::{
-    runtime_program_is_hidden, runtime_program_name, runtime_program_title,
-    runtime_title_is_hidden, RuntimeState,
-};
+use crate::runtime_sync::{runtime_program_is_hidden, runtime_program_title, RuntimeState};
 use crate::sys::{
     console_get_state, console_set_focus, console_snapshot_session_output,
-    console_snapshot_sessions, ConsoleSessionHandle, ConsoleSessionInfo, RuntimeProgram,
-    RuntimeRunningProgram, MAX_CONSOLE_SNAPSHOT_BYTES,
+    console_snapshot_sessions, ConsoleSessionHandle, ConsoleSessionInfo,
+    MAX_CONSOLE_SNAPSHOT_BYTES,
 };
+use crate::wayland::WaylandCompositor;
+use runtime_control::RuntimeRunningProgram;
 
 impl AppState {
     pub(crate) fn apply_runtime_state(&mut self, runtime_state: &mut RuntimeState) -> bool {
@@ -22,12 +19,7 @@ impl AppState {
             return false;
         }
 
-        let mut changed = self.sync_launcher_programs(
-            &runtime_state.registered_programs[..runtime_state
-                .registered_program_count
-                .min(MAX_REGISTERED_PROGRAMS)],
-        );
-        changed |= self.sync_windows_from_runtime(
+        let changed = self.sync_windows_from_runtime(
             &runtime_state.running_programs[..runtime_state
                 .running_program_count
                 .min(MAX_RUNNING_PROGRAMS)],
@@ -48,11 +40,13 @@ impl AppState {
                 .iter()
                 .any(|session| session.session_handle == session_handle)
         });
+        self.clamp_console_snapshot_index();
         changed |= self.reconcile_console_focus(state.focused_session_handle)?;
 
         let mut snapshot = [0_u8; MAX_CONSOLE_SNAPSHOT_BYTES];
         let mut stale_sessions = Vec::new();
-        for window in &mut self.console_windows {
+        let mut snapshot_candidates = Vec::new();
+        for (index, window) in self.console_windows.iter_mut().enumerate() {
             let Some(session) = sessions
                 .iter()
                 .find(|session| session.session_handle == window.session_handle)
@@ -69,9 +63,14 @@ impl AppState {
                 window.invalidate_surface();
                 changed = true;
             }
+            snapshot_candidates.push(index);
+        }
+
+        if let Some(index) = self.select_console_snapshot_candidate(&snapshot_candidates) {
+            let session_handle = self.console_windows[index].session_handle;
             let count = match console_snapshot_session_output(
                 self.console_fd.as_raw_fd(),
-                window.session_handle,
+                session_handle,
                 &mut snapshot,
             ) {
                 Ok(count) => count,
@@ -81,56 +80,39 @@ impl AppState {
                         crate::sys::ENOENT | crate::sys::EINVAL | crate::sys::ESTALE
                     ) =>
                 {
-                    stale_sessions.push(window.session_handle);
-                    continue;
+                    stale_sessions.push(session_handle);
+                    0
                 }
                 Err(err) => return Err(err),
             };
-            if window.output_cache.as_slice() != &snapshot[..count] {
-                window.output_cache.clear();
-                window.output_cache.extend_from_slice(&snapshot[..count]);
-                window.terminal_dirty = true;
-                window.invalidate_surface();
-                changed = true;
+            if stale_sessions.is_empty() {
+                let window = &mut self.console_windows[index];
+                if window.output_cache.as_slice() != &snapshot[..count] {
+                    window.output_cache.clear();
+                    window.output_cache.extend_from_slice(&snapshot[..count]);
+                    window.terminal_dirty = true;
+                    window.invalidate_surface();
+                    changed = true;
+                }
+                window.output_generation = sessions
+                    .iter()
+                    .find(|session| session.session_handle == session_handle)
+                    .map(|session| session.output_generation)
+                    .unwrap_or(window.output_generation);
+                self.next_console_snapshot_index = (index + 1) % self.console_windows.len().max(1);
             }
-            window.output_generation = session_generation;
+        } else {
+            self.clamp_console_snapshot_index();
         }
 
         if !stale_sessions.is_empty() {
             changed |=
                 self.prune_windows(|session_handle| !stale_sessions.contains(&session_handle));
+            self.clamp_console_snapshot_index();
             changed |= self.reconcile_console_focus(0)?;
         }
 
         Ok(changed)
-    }
-
-    fn sync_launcher_programs(&mut self, programs: &[RuntimeProgram]) -> bool {
-        let mut next = Vec::new();
-        for program in programs {
-            let title = runtime_program_name(program).into_owned();
-            if runtime_title_is_hidden(title.as_str()) {
-                continue;
-            }
-            if next
-                .iter()
-                .any(|existing: &LauncherProgram| existing.title == title)
-            {
-                continue;
-            }
-            next.push(LauncherProgram {
-                program_id: program.program_id,
-                title,
-            });
-        }
-
-        if self.launcher_programs == next {
-            return false;
-        }
-
-        self.launcher_programs = next;
-        self.desktop_cache.valid = false;
-        true
     }
 
     fn sync_windows_from_runtime(&mut self, programs: &[RuntimeRunningProgram]) -> bool {
@@ -179,12 +161,12 @@ impl AppState {
             changed = true;
         }
 
-        if let Some(session_handle) = self.dragging_window_session {
+        if let Some(DragTarget::Console(session_handle)) = self.dragging_window {
             if next
                 .iter()
                 .all(|window| window.session_handle != session_handle)
             {
-                self.dragging_window_session = None;
+                self.dragging_window = None;
                 changed = true;
             }
         }
@@ -208,7 +190,16 @@ impl AppState {
         kernel_focused_session: ConsoleSessionHandle,
     ) -> Result<bool, i32> {
         let previous_focused = self.focused_session_handle;
+        let wayland_focused = self.focused_wayland_surface_id.is_some()
+            && self.wayland_windows.iter().any(|window| {
+                !window.minimized && Some(window.surface_id) == self.focused_wayland_surface_id
+            });
         if self.console_windows.is_empty() {
+            self.focused_session_handle = 0;
+            return Ok(previous_focused != 0);
+        }
+
+        if wayland_focused {
             self.focused_session_handle = 0;
             return Ok(previous_focused != 0);
         }
@@ -216,7 +207,7 @@ impl AppState {
         self.focused_session_handle = if self
             .console_windows
             .iter()
-            .any(|window| window.session_handle == kernel_focused_session)
+            .any(|window| window.session_handle == kernel_focused_session && !window.minimized)
         {
             kernel_focused_session
         } else {
@@ -225,8 +216,15 @@ impl AppState {
 
         let mut changed = self.focused_session_handle != previous_focused;
         while self.focused_session_handle == 0 && !self.console_windows.is_empty() {
-            let fallback_session =
-                self.console_windows[self.console_windows.len() - 1].session_handle;
+            let Some(fallback_session) = self
+                .console_windows
+                .iter()
+                .rev()
+                .find(|window| !window.minimized)
+                .map(|window| window.session_handle)
+            else {
+                break;
+            };
             match console_set_focus(self.console_fd.as_raw_fd(), fallback_session) {
                 Ok(()) => {
                     self.focused_session_handle = fallback_session;
@@ -251,12 +249,40 @@ impl AppState {
         Ok(changed)
     }
 
+    pub(crate) fn recover_focus_after_wayland_change(
+        &mut self,
+        _wayland: Option<&mut WaylandCompositor>,
+    ) -> Result<bool, i32> {
+        let previous_wayland_focus = self.focused_wayland_surface_id;
+        let wayland_focused = self.focused_wayland_surface_id.is_some()
+            && self.wayland_windows.iter().any(|window| {
+                !window.minimized && Some(window.surface_id) == self.focused_wayland_surface_id
+            });
+        if wayland_focused {
+            return Ok(false);
+        }
+
+        self.focused_wayland_surface_id = None;
+
+        let console_focused = self.focused_session_handle != 0
+            && self.console_windows.iter().any(|window| {
+                !window.minimized && window.session_handle == self.focused_session_handle
+            });
+        if console_focused {
+            return Ok(previous_wayland_focus.is_some());
+        }
+
+        let console_refocused = self.refocus_visible_console_window()?;
+        Ok(previous_wayland_focus.is_some() || console_refocused)
+    }
+
     fn prune_windows(&mut self, mut keep: impl FnMut(ConsoleSessionHandle) -> bool) -> bool {
         let previous_len = self.console_windows.len();
         let previous_focused = self.focused_session_handle;
-        let previous_dragging = self.dragging_window_session;
+        let previous_dragging = self.dragging_window;
         self.console_windows
             .retain(|window| keep(window.session_handle));
+        self.clamp_console_snapshot_index();
 
         if self
             .console_windows
@@ -266,25 +292,56 @@ impl AppState {
             self.focused_session_handle = 0;
         }
 
-        if let Some(session_handle) = self.dragging_window_session {
+        if let Some(DragTarget::Console(session_handle)) = self.dragging_window {
             if self
                 .console_windows
                 .iter()
                 .all(|window| window.session_handle != session_handle)
             {
-                self.dragging_window_session = None;
+                self.dragging_window = None;
             }
         }
 
         previous_len != self.console_windows.len()
             || previous_focused != self.focused_session_handle
-            || previous_dragging != self.dragging_window_session
+            || previous_dragging != self.dragging_window
+    }
+
+    fn select_console_snapshot_candidate(&self, candidates: &[usize]) -> Option<usize> {
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let start = self
+            .next_console_snapshot_index
+            .min(self.console_windows.len().saturating_sub(1));
+        candidates
+            .iter()
+            .copied()
+            .find(|index| *index >= start)
+            .or_else(|| candidates.first().copied())
+    }
+
+    fn clamp_console_snapshot_index(&mut self) {
+        if self.console_windows.is_empty() {
+            self.next_console_snapshot_index = 0;
+        } else if self.next_console_snapshot_index >= self.console_windows.len() {
+            self.next_console_snapshot_index %= self.console_windows.len();
+        }
     }
 
     pub(super) fn focus_window(
         &mut self,
         session_handle: ConsoleSessionHandle,
     ) -> Result<canvas::Rect, i32> {
+        if let Some(window) = self
+            .console_windows
+            .iter_mut()
+            .find(|window| window.session_handle == session_handle)
+        {
+            window.minimized = false;
+        }
+        self.focused_wayland_surface_id = None;
         let previous_focused = self.focused_session_handle;
         let mut dirty_rect = self.window_rect_for_session(previous_focused);
         dirty_rect = dirty_rect.union(self.window_rect_for_session(session_handle));
@@ -338,10 +395,32 @@ impl AppState {
         true
     }
 
+    pub(super) fn refocus_visible_console_window(&mut self) -> Result<bool, i32> {
+        let previous_focused = self.focused_session_handle;
+        let Some(session_handle) = self
+            .console_windows
+            .iter()
+            .rev()
+            .find(|window| !window.minimized)
+            .map(|window| window.session_handle)
+        else {
+            self.focused_session_handle = 0;
+            return Ok(previous_focused != 0);
+        };
+
+        if self.focused_session_handle != session_handle {
+            console_set_focus(self.console_fd.as_raw_fd(), session_handle)?;
+            self.focused_session_handle = session_handle;
+        }
+
+        let reordered = self.bring_window_to_front(session_handle);
+        Ok(previous_focused != self.focused_session_handle || reordered)
+    }
+
     fn window_rect_for_session(&self, session_handle: ConsoleSessionHandle) -> canvas::Rect {
         self.console_windows
             .iter()
-            .find(|window| window.session_handle == session_handle)
+            .find(|window| window.session_handle == session_handle && !window.minimized)
             .map(|window| window.frame)
             .unwrap_or_default()
     }
@@ -359,7 +438,11 @@ impl AppState {
         self.console_windows
             .iter()
             .fold(canvas::Rect::empty(), |dirty, window| {
-                dirty.union(window.frame)
+                if window.minimized {
+                    dirty
+                } else {
+                    dirty.union(window.frame)
+                }
             })
     }
 

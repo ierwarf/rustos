@@ -1,0 +1,17 @@
+[package]
+name = "kernel-executive"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+kernel-base = { path = "../base" }
+kernel-hal = { path = "../hal" }
+kernel-mm = { path = "../mm" }
+kernel-object = { path = "../object" }
+kernel-ps = { path = "../ps" }
+kernel-io-manager = { path = "../io-manager" }
+kernel-compat = { path = "../compat" }
+boot-protocol = { path = "../../boot/bootloader/boot-protocol" }
+diag-abi = { path = "../../libs/diag-abi" }
+driver-abi = { path = "../../drivers/libs/driver-abi" }
+x86_64 = { version = "0.15.4", default-features = false, features = ["instructions", "abi_x86_interrupt"] }

@@ -15,12 +15,11 @@ use crate::wayland::WaylandWindowSnapshot;
 pub(crate) const INPUT_EVENT_BATCH: usize = 256;
 pub(crate) const MAX_INPUT_READ_BATCHES_PER_TICK: usize = 4;
 pub(crate) const MAX_RUNNING_PROGRAMS: usize = 8;
-pub(crate) const MAX_REGISTERED_PROGRAMS: usize = 16;
 pub(crate) const IDLE_SLEEP: Duration = Duration::from_millis(16);
 pub(crate) const INPUT_PROCESS_BUDGET: Duration = Duration::from_millis(2);
 pub(crate) const TARGET_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 pub(crate) const RUNTIME_POLL_SLEEP: Duration = Duration::from_millis(32);
-pub(crate) const CONSOLE_POLL_SLEEP: Duration = Duration::from_millis(32);
+pub(crate) const CONSOLE_POLL_SLEEP: Duration = Duration::from_millis(64);
 pub(crate) const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 pub(crate) const HIDDEN_RUNTIME_PROGRAM_TITLES: &[&str] = &["UI Server"];
 
@@ -135,7 +134,7 @@ fn rect_area(rect: canvas::Rect) -> u64 {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LauncherProgram {
-    pub(crate) program_id: u32,
+    pub(crate) desktop_file_id: String,
     pub(crate) title: String,
 }
 
@@ -160,6 +159,7 @@ pub(crate) struct ConsoleWindow {
     pub(crate) session_handle: ConsoleSessionHandle,
     pub(crate) title: String,
     pub(crate) frame: canvas::Rect,
+    pub(crate) minimized: bool,
     pub(crate) terminal: TerminalState,
     pub(crate) output_cache: Vec<u8>,
     pub(crate) output_generation: u64,
@@ -178,6 +178,7 @@ impl ConsoleWindow {
             session_handle,
             title,
             frame,
+            minimized: false,
             terminal: TerminalState::new(),
             output_cache: Vec::new(),
             output_generation,
@@ -189,6 +190,34 @@ impl ConsoleWindow {
     pub(crate) fn invalidate_surface(&mut self) {
         self.surface_cache.valid = false;
     }
+
+    fn repaint_cursor_surface(&mut self) -> Option<canvas::Rect> {
+        if !self.surface_cache.valid || self.surface_cache.width == 0 || self.surface_cache.height == 0
+        {
+            return None;
+        }
+        let rect = self.terminal.cursor_cell_rect()?;
+        let mut canvas = canvas::SurfaceCanvas::with_clip(
+            self.surface_cache.pixels.as_mut_slice(),
+            self.surface_cache.width as u32,
+            self.surface_cache.height as u32,
+            self.surface_cache.width,
+            rect,
+        );
+        self.terminal.render_cursor_cell(&mut canvas);
+        Some(canvas::Rect {
+            x: self.frame.x + rect.x,
+            y: self.frame.y + rect.y,
+            width: rect.width,
+            height: rect.height,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DragTarget {
+    Console(ConsoleSessionHandle),
+    Wayland(u32),
 }
 
 impl AppState {
@@ -200,8 +229,10 @@ impl AppState {
         if !window.terminal.show_cursor() {
             return None;
         }
-        window.invalidate_surface();
-        Some(window.frame)
+        window.repaint_cursor_surface().or_else(|| {
+            window.invalidate_surface();
+            Some(window.frame)
+        })
     }
 
     pub(crate) fn toggle_focused_terminal_cursor(&mut self) -> Option<canvas::Rect> {
@@ -212,8 +243,10 @@ impl AppState {
         if !window.terminal.toggle_cursor() {
             return None;
         }
-        window.invalidate_surface();
-        Some(window.frame)
+        window.repaint_cursor_surface().or_else(|| {
+            window.invalidate_surface();
+            Some(window.frame)
+        })
     }
 }
 
@@ -221,7 +254,7 @@ pub(crate) struct AppState {
     pub(crate) display: DisplayInfo,
     pub(crate) surface: DisplaySurfaceCreate,
     display_fd: OwnedFd,
-    pub(crate) input_fd: OwnedFd,
+    pub(crate) input_fds: Vec<OwnedFd>,
     console_fd: OwnedFd,
     surface_fd: OwnedFd,
     pub(crate) frame: SurfaceMapping,
@@ -229,11 +262,13 @@ pub(crate) struct AppState {
     pub(crate) cursor_y: u32,
     pub(crate) left_button_down: bool,
     pub(crate) focused_session_handle: ConsoleSessionHandle,
+    pub(crate) focused_wayland_surface_id: Option<u32>,
     pub(crate) desktop_cache: DesktopSurfaceCache,
     pub(crate) launcher_programs: Vec<LauncherProgram>,
     pub(crate) console_windows: Vec<ConsoleWindow>,
+    pub(crate) next_console_snapshot_index: usize,
     pub(crate) wayland_windows: Vec<WaylandWindowSnapshot>,
-    dragging_window_session: Option<ConsoleSessionHandle>,
+    dragging_window: Option<DragTarget>,
     drag_offset_x: usize,
     drag_offset_y: usize,
 }
@@ -252,7 +287,28 @@ fn align_up(value: usize, align: usize) -> Option<usize> {
 
 impl AppState {
     pub(crate) fn sync_wayland_windows(&mut self, windows: Vec<WaylandWindowSnapshot>) -> bool {
-        if self.wayland_windows == windows {
+        let previous_dragging = self.dragging_window;
+        let previous_focus = self.focused_wayland_surface_id;
+        if let Some(DragTarget::Wayland(surface_id)) = self.dragging_window {
+            if windows
+                .iter()
+                .all(|window| window.surface_id != surface_id || window.minimized)
+            {
+                self.dragging_window = None;
+            }
+        }
+        if let Some(surface_id) = self.focused_wayland_surface_id {
+            if windows
+                .iter()
+                .all(|window| window.surface_id != surface_id || window.minimized)
+            {
+                self.focused_wayland_surface_id = None;
+            }
+        }
+        if self.wayland_windows == windows
+            && previous_dragging == self.dragging_window
+            && previous_focus == self.focused_wayland_surface_id
+        {
             return false;
         }
         self.wayland_windows = windows;

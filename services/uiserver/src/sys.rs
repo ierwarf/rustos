@@ -4,10 +4,14 @@ use core::mem::size_of;
 use core::ptr::NonNull;
 use core::slice;
 use std::ffi::CString;
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::fs;
+use std::io::Write;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::{Mutex, OnceLock};
+
+use keyboard_core::{KeyAction, KeyCode, KeyboardDriver};
 
 const SYS_READ: usize = 0;
-const SYS_WRITE: usize = 1;
 const SYS_MMAP: usize = 9;
 const SYS_MUNMAP: usize = 11;
 const SYS_IOCTL: usize = 16;
@@ -16,50 +20,92 @@ const SYS_OPENAT: usize = 257;
 const AT_FDCWD: isize = -100;
 const O_RDONLY: usize = 0;
 const O_RDWR: usize = 2;
+const O_NONBLOCK: usize = 0o4000;
 
 const PROT_READ: usize = 0x1;
 const PROT_WRITE: usize = 0x2;
 
 const MAP_SHARED: usize = 0x01;
 const PAGE_SIZE: usize = 4096;
-
-const DISPLAY_IOCTL_GET_INFO: usize = 0x4453_0001;
-const DISPLAY_IOCTL_CREATE_SURFACE: usize = 0x4453_0002;
-const DISPLAY_IOCTL_PRESENT: usize = 0x4453_0003;
-const DISPLAY_IOCTL_PRESENT_RECT: usize = 0x4453_0004;
-const CONSOLE_IOCTL_GET_STATE: usize = 0x434f_0001;
-const CONSOLE_IOCTL_SNAPSHOT_SESSIONS: usize = 0x434f_0005;
-const CONSOLE_IOCTL_SNAPSHOT_SESSION_OUTPUT: usize = 0x434f_0002;
-const CONSOLE_IOCTL_SET_FOCUS: usize = 0x434f_0003;
-const CONSOLE_IOCTL_SEND_INPUT_EVENT: usize = 0x434f_0004;
+const MAX_EVDEV_EVENTS_PER_READ: usize = 512;
+const EV_SYN: u16 = 0x00;
+const EV_KEY: u16 = 0x01;
+const EV_REL: u16 = 0x02;
+const EV_ABS: u16 = 0x03;
+const SYN_REPORT: u16 = 0;
+const REL_X: u16 = 0x00;
+const REL_Y: u16 = 0x01;
+const REL_HWHEEL: u16 = 0x06;
+const REL_WHEEL: u16 = 0x08;
+const ABS_X: u16 = 0x00;
+const ABS_Y: u16 = 0x01;
+const BTN_LEFT: u16 = 0x110;
+const BTN_RIGHT: u16 = 0x111;
+const BTN_MIDDLE: u16 = 0x112;
+const BTN_SIDE: u16 = 0x113;
+const BTN_EXTRA: u16 = 0x114;
+const LINUX_IOC_NRBITS: usize = 8;
+const LINUX_IOC_TYPEBITS: usize = 8;
+const LINUX_IOC_SIZEBITS: usize = 14;
+const LINUX_IOC_NRSHIFT: usize = 0;
+const LINUX_IOC_TYPESHIFT: usize = LINUX_IOC_NRSHIFT + LINUX_IOC_NRBITS;
+const LINUX_IOC_SIZESHIFT: usize = LINUX_IOC_TYPESHIFT + LINUX_IOC_TYPEBITS;
+const LINUX_IOC_DIRSHIFT: usize = LINUX_IOC_SIZESHIFT + LINUX_IOC_SIZEBITS;
+const LINUX_IOC_WRITE: usize = 1;
+const LINUX_IOC_READ: usize = 2;
+const DISPLAY_IOCTL_TYPE: u8 = b'D';
+const CONSOLE_IOCTL_TYPE: u8 = b'C';
 pub(crate) const CONSOLE_SESSION_CAPACITY: usize = 32;
 const CONSOLE_SESSION_TITLE_CAPACITY: usize = 48;
-
-const RUNTIME_IOCTL_GET_GENERATION: usize = 0x5254_0001;
-const RUNTIME_IOCTL_SNAPSHOT_PROGRAMS: usize = 0x5254_0002;
-const RUNTIME_IOCTL_SNAPSHOT_RUNNING_PROGRAMS: usize = 0x5254_0003;
-const RUNTIME_IOCTL_REQUEST_LAUNCH: usize = 0x5254_0004;
-
-const LAUNCH_TARGET_NEW_SESSION: u16 = 2;
 
 pub(crate) const PIXEL_FORMAT_BGRA8888: u32 = 1;
 pub(crate) const INPUT_KIND_KEYBOARD: u16 = 1;
 pub(crate) const INPUT_KIND_POINTER_MOTION: u16 = 2;
 pub(crate) const INPUT_KIND_POINTER_BUTTON: u16 = 3;
+pub(crate) const INPUT_KIND_POINTER_SCROLL: u16 = 4;
 pub(crate) const INPUT_KIND_POINTER_POSITION: u16 = 5;
 pub(crate) const INPUT_ACTION_NONE: u16 = 0;
 pub(crate) const INPUT_ACTION_PRESSED: u16 = 1;
 pub(crate) const INPUT_ACTION_RELEASED: u16 = 2;
 pub(crate) const INPUT_ACTION_REPEATED: u16 = 3;
 pub(crate) const POINTER_BUTTON_LEFT: u32 = 1;
-pub(crate) const RUNNING_PROGRAM_NAME_CAPACITY: usize = 48;
-pub(crate) const PROGRAM_NAME_CAPACITY: usize = 48;
-pub(crate) const PROGRAM_PATH_CAPACITY: usize = 64;
+pub(crate) const POINTER_BUTTON_RIGHT: u32 = 2;
+pub(crate) const POINTER_BUTTON_MIDDLE: u32 = 4;
+pub(crate) const POINTER_BUTTON_X1: u32 = 8;
+pub(crate) const POINTER_BUTTON_X2: u32 = 16;
 pub(crate) const MAX_CONSOLE_SNAPSHOT_BYTES: usize = 4096;
+const EAGAIN: i32 = 11;
 pub(crate) const ENOENT: i32 = 2;
 pub(crate) const EINVAL: i32 = 22;
 pub(crate) const ESTALE: i32 = 116;
 pub(crate) type ConsoleSessionHandle = u64;
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct LinuxInputTimeval {
+    tv_sec: i64,
+    tv_usec: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct LinuxInputEvent {
+    time: LinuxInputTimeval,
+    kind: u16,
+    code: u16,
+    value: i32,
+}
+
+#[derive(Default)]
+struct InputTranslationState {
+    keyboard: KeyboardDriver,
+    abs_x: i32,
+    abs_y: i32,
+}
+
+fn input_translation_state() -> &'static Mutex<InputTranslationState> {
+    static STATE: OnceLock<Mutex<InputTranslationState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(InputTranslationState::default()))
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -180,81 +226,39 @@ struct ConsoleSendInputEventRequest {
     event: InputEvent,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeRunningProgram {
-    pub(crate) pid: u64,
-    pub(crate) program_id: u32,
-    pub(crate) reserved: u32,
-    pub(crate) session_handle: u64,
-    pub(crate) display_name: [u8; RUNNING_PROGRAM_NAME_CAPACITY],
+const fn linux_ioc(dir: usize, type_: u8, nr: u8, size: usize) -> usize {
+    (dir << LINUX_IOC_DIRSHIFT)
+        | ((type_ as usize) << LINUX_IOC_TYPESHIFT)
+        | ((nr as usize) << LINUX_IOC_NRSHIFT)
+        | (size << LINUX_IOC_SIZESHIFT)
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeProgram {
-    pub(crate) program_id: u32,
-    pub(crate) reserved: u32,
-    pub(crate) weight_micros: u64,
-    pub(crate) display_name: [u8; PROGRAM_NAME_CAPACITY],
-    pub(crate) exec_path: [u8; PROGRAM_PATH_CAPACITY],
+const fn linux_ior<T>(type_: u8, nr: u8) -> usize {
+    linux_ioc(LINUX_IOC_READ, type_, nr, size_of::<T>())
 }
 
-impl Default for RuntimeProgram {
-    fn default() -> Self {
-        Self {
-            program_id: 0,
-            reserved: 0,
-            weight_micros: 0,
-            display_name: [0; PROGRAM_NAME_CAPACITY],
-            exec_path: [0; PROGRAM_PATH_CAPACITY],
-        }
-    }
+const fn linux_iow<T>(type_: u8, nr: u8) -> usize {
+    linux_ioc(LINUX_IOC_WRITE, type_, nr, size_of::<T>())
 }
 
-impl Default for RuntimeRunningProgram {
-    fn default() -> Self {
-        Self {
-            pid: 0,
-            program_id: 0,
-            reserved: 0,
-            session_handle: 0,
-            display_name: [0; RUNNING_PROGRAM_NAME_CAPACITY],
-        }
-    }
+const fn linux_iowr<T>(type_: u8, nr: u8) -> usize {
+    linux_ioc(LINUX_IOC_READ | LINUX_IOC_WRITE, type_, nr, size_of::<T>())
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct RuntimeGeneration {
-    generation: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct RuntimeSnapshotRunningProgramsRequest {
-    programs_ptr: u64,
-    capacity: u64,
-    count: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct RuntimeSnapshotProgramsRequest {
-    programs_ptr: u64,
-    capacity: u64,
-    count: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct RuntimeLaunchRequest {
-    program_id: u64,
-    target_kind: u16,
-    reserved: u16,
-    reserved2: u32,
-    target_value: u64,
-}
+const DISPLAY_IOCTL_GET_INFO: usize = linux_ior::<DisplayInfo>(DISPLAY_IOCTL_TYPE, 1);
+const DISPLAY_IOCTL_CREATE_SURFACE: usize =
+    linux_iowr::<DisplaySurfaceCreate>(DISPLAY_IOCTL_TYPE, 2);
+const DISPLAY_IOCTL_PRESENT: usize = linux_iow::<DisplayPresentRequest>(DISPLAY_IOCTL_TYPE, 3);
+const DISPLAY_IOCTL_PRESENT_RECT: usize =
+    linux_iow::<DisplayPresentRectRequest>(DISPLAY_IOCTL_TYPE, 4);
+const CONSOLE_IOCTL_GET_STATE: usize = linux_ior::<ConsoleStateInfo>(CONSOLE_IOCTL_TYPE, 1);
+const CONSOLE_IOCTL_SNAPSHOT_SESSION_OUTPUT: usize =
+    linux_iowr::<ConsoleSnapshotSessionOutputRequest>(CONSOLE_IOCTL_TYPE, 2);
+const CONSOLE_IOCTL_SET_FOCUS: usize = linux_iow::<ConsoleSetFocusRequest>(CONSOLE_IOCTL_TYPE, 3);
+const CONSOLE_IOCTL_SEND_INPUT_EVENT: usize =
+    linux_iow::<ConsoleSendInputEventRequest>(CONSOLE_IOCTL_TYPE, 4);
+const CONSOLE_IOCTL_SNAPSHOT_SESSIONS: usize =
+    linux_iowr::<ConsoleSnapshotSessionsRequest>(CONSOLE_IOCTL_TYPE, 5);
 
 pub(crate) struct SurfaceMapping {
     base: NonNull<u32>,
@@ -298,24 +302,66 @@ impl Drop for SharedFdMapping {
 }
 
 pub(crate) fn open_display() -> Result<OwnedFd, i32> {
-    open_device("/dev/display0", O_RDWR)
+    open_first_device("/dev/dri", "card", O_RDWR, "/dev/dri/card0")
 }
 
 pub(crate) fn open_console() -> Result<OwnedFd, i32> {
     open_device("/dev/console0", O_RDWR)
 }
 
-pub(crate) fn open_input() -> Result<OwnedFd, i32> {
-    open_device("/dev/input0", O_RDONLY)
+pub(crate) fn open_input() -> Result<Vec<OwnedFd>, i32> {
+    if running_on_rustos() {
+        return open_device("/dev/input0", O_RDONLY | O_NONBLOCK).map(|fd| vec![fd]);
+    }
+    open_all_devices(
+        "/dev/input",
+        "event",
+        O_RDONLY | O_NONBLOCK,
+        "/dev/input/event0",
+    )
 }
 
-pub(crate) fn open_runtime() -> Result<OwnedFd, i32> {
-    open_device("/dev/runtime0", O_RDWR)
+pub(crate) fn diag_line(message: &str) {
+    diag_client::emit_text(
+        "uiserver",
+        diag_client::diag_abi::DiagLevel::Info,
+        0,
+        0,
+        0,
+        message,
+    );
 }
 
-pub(crate) fn raw_stderr_line(message: &str) {
-    let _ = raw_write(2, message.as_bytes());
-    let _ = raw_write(2, b"\n");
+pub(crate) fn boot_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("RUSTOS_UI_BOOT_TRACE") {
+        Ok(value) => matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"),
+        Err(_) => false,
+    })
+}
+
+pub(crate) fn ui_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("RUSTOS_UI_PROFILE") {
+        Ok(value) => matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"),
+        Err(_) => false,
+    })
+}
+
+pub(crate) fn boot_line(message: &str) {
+    if !boot_trace_enabled() {
+        return;
+    }
+    let _ = std::io::stderr().write_all(message.as_bytes());
+    let _ = std::io::stderr().write_all(b"\n");
+}
+
+pub(crate) fn profile_line(message: &str) {
+    if !ui_profile_enabled() {
+        return;
+    }
+    let _ = std::io::stderr().write_all(message.as_bytes());
+    let _ = std::io::stderr().write_all(b"\n");
 }
 
 pub(crate) fn display_get_info(fd: RawFd) -> Result<DisplayInfo, i32> {
@@ -407,16 +453,303 @@ pub(crate) fn map_shared_fd_readable(
     })
 }
 
-pub(crate) fn read_input(fd: RawFd, events: &mut [InputEvent]) -> Result<usize, i32> {
-    let bytes = read(
-        fd,
-        events.as_mut_ptr().cast::<c_void>(),
-        std::mem::size_of_val(events),
-    )?;
-    if bytes % size_of::<InputEvent>() != 0 {
-        return Err(5);
+pub(crate) fn read_input(fds: &[OwnedFd], events: &mut [InputEvent]) -> Result<usize, i32> {
+    if fds.is_empty() {
+        return Ok(0);
     }
-    Ok(bytes / size_of::<InputEvent>())
+    if running_on_rustos() {
+        let fd = fds[0].as_raw_fd();
+        let bytes = match read(fd, events.as_mut_ptr().cast::<c_void>(), std::mem::size_of_val(events))
+        {
+            Ok(bytes) => bytes,
+            Err(EAGAIN) => return Ok(0),
+            Err(err) => return Err(err),
+        };
+        if bytes == 0 {
+            return Ok(0);
+        }
+        if bytes % size_of::<InputEvent>() != 0 {
+            return Err(5);
+        }
+        return Ok(bytes / size_of::<InputEvent>());
+    }
+
+    let mut raw_events = [LinuxInputEvent::default(); MAX_EVDEV_EVENTS_PER_READ];
+    let mut written = 0usize;
+    let mut state = input_translation_state().lock().unwrap();
+    for fd in fds {
+        if written >= events.len() {
+            break;
+        }
+
+        let bytes = match read(
+            fd.as_raw_fd(),
+            raw_events.as_mut_ptr().cast::<c_void>(),
+            std::mem::size_of_val(&raw_events),
+        ) {
+            Ok(bytes) => bytes,
+            Err(EAGAIN) => continue,
+            Err(err) => return Err(err),
+        };
+        if bytes == 0 {
+            continue;
+        }
+        if bytes % size_of::<LinuxInputEvent>() != 0 {
+            return Err(5);
+        }
+        let count = bytes / size_of::<LinuxInputEvent>();
+        for raw in &raw_events[..count] {
+            if written >= events.len() {
+                break;
+            }
+            if let Some(event) = translate_linux_input_event(&mut state, *raw) {
+                events[written] = event;
+                written += 1;
+            }
+        }
+    }
+    Ok(written)
+}
+
+fn translate_linux_input_event(
+    state: &mut InputTranslationState,
+    raw: LinuxInputEvent,
+) -> Option<InputEvent> {
+    match raw.kind {
+        EV_KEY => {
+            if raw.code >= BTN_LEFT {
+                let code = linux_pointer_button_to_rustos(raw.code)?;
+                return Some(InputEvent {
+                    kind: INPUT_KIND_POINTER_BUTTON,
+                    action: linux_key_value_to_action(raw.value)?,
+                    code,
+                    value0: 0,
+                    value1: 0,
+                    modifiers: 0,
+                    text: 0,
+                });
+            }
+
+            let key_code = linux_key_code_to_rustos(u32::from(raw.code))?;
+            state
+                .keyboard
+                .inject_key_transition(key_code, raw.value == 0);
+            let keyboard_event = state.keyboard.pop_event()?;
+            Some(InputEvent {
+                kind: INPUT_KIND_KEYBOARD,
+                action: keyboard_action_to_input(keyboard_event.action),
+                code: keyboard_event.code as u32,
+                value0: 0,
+                value1: 0,
+                modifiers: keyboard_event.modifiers.bits() as u32,
+                text: keyboard_event.text.unwrap_or(0) as u32,
+            })
+        }
+        EV_REL => match raw.code {
+            REL_X => Some(InputEvent {
+                kind: INPUT_KIND_POINTER_MOTION,
+                action: INPUT_ACTION_NONE,
+                code: 0,
+                value0: raw.value,
+                value1: 0,
+                modifiers: 0,
+                text: 0,
+            }),
+            REL_Y => Some(InputEvent {
+                kind: INPUT_KIND_POINTER_MOTION,
+                action: INPUT_ACTION_NONE,
+                code: 0,
+                value0: 0,
+                value1: raw.value,
+                modifiers: 0,
+                text: 0,
+            }),
+            REL_WHEEL => Some(InputEvent {
+                kind: INPUT_KIND_POINTER_SCROLL,
+                action: INPUT_ACTION_NONE,
+                code: 0,
+                value0: raw.value,
+                value1: 0,
+                modifiers: 0,
+                text: 0,
+            }),
+            REL_HWHEEL => Some(InputEvent {
+                kind: INPUT_KIND_POINTER_SCROLL,
+                action: INPUT_ACTION_NONE,
+                code: 0,
+                value0: 0,
+                value1: raw.value,
+                modifiers: 0,
+                text: 0,
+            }),
+            _ => None,
+        },
+        EV_ABS => match raw.code {
+            ABS_X => {
+                state.abs_x = raw.value;
+                Some(InputEvent {
+                    kind: INPUT_KIND_POINTER_POSITION,
+                    action: INPUT_ACTION_NONE,
+                    code: 0,
+                    value0: state.abs_x,
+                    value1: state.abs_y,
+                    modifiers: 0,
+                    text: 0,
+                })
+            }
+            ABS_Y => {
+                state.abs_y = raw.value;
+                Some(InputEvent {
+                    kind: INPUT_KIND_POINTER_POSITION,
+                    action: INPUT_ACTION_NONE,
+                    code: 0,
+                    value0: state.abs_x,
+                    value1: state.abs_y,
+                    modifiers: 0,
+                    text: 0,
+                })
+            }
+            _ => None,
+        },
+        EV_SYN if raw.code == SYN_REPORT => None,
+        _ => None,
+    }
+}
+
+fn linux_key_value_to_action(value: i32) -> Option<u16> {
+    match value {
+        0 => Some(INPUT_ACTION_RELEASED),
+        1 => Some(INPUT_ACTION_PRESSED),
+        2 => Some(INPUT_ACTION_REPEATED),
+        _ => None,
+    }
+}
+
+fn keyboard_action_to_input(action: KeyAction) -> u16 {
+    match action {
+        KeyAction::Pressed => INPUT_ACTION_PRESSED,
+        KeyAction::Released => INPUT_ACTION_RELEASED,
+        KeyAction::Repeated => INPUT_ACTION_REPEATED,
+    }
+}
+
+fn linux_pointer_button_to_rustos(code: u16) -> Option<u32> {
+    Some(match code {
+        BTN_LEFT => POINTER_BUTTON_LEFT,
+        BTN_RIGHT => POINTER_BUTTON_RIGHT,
+        BTN_MIDDLE => POINTER_BUTTON_MIDDLE,
+        BTN_SIDE => POINTER_BUTTON_X1,
+        BTN_EXTRA => POINTER_BUTTON_X2,
+        _ => return None,
+    })
+}
+
+fn linux_key_code_to_rustos(code: u32) -> Option<KeyCode> {
+    Some(match code {
+        1 => KeyCode::Escape,
+        2 => KeyCode::Digit1,
+        3 => KeyCode::Digit2,
+        4 => KeyCode::Digit3,
+        5 => KeyCode::Digit4,
+        6 => KeyCode::Digit5,
+        7 => KeyCode::Digit6,
+        8 => KeyCode::Digit7,
+        9 => KeyCode::Digit8,
+        10 => KeyCode::Digit9,
+        11 => KeyCode::Digit0,
+        12 => KeyCode::Minus,
+        13 => KeyCode::Equal,
+        14 => KeyCode::Backspace,
+        15 => KeyCode::Tab,
+        16 => KeyCode::Q,
+        17 => KeyCode::W,
+        18 => KeyCode::E,
+        19 => KeyCode::R,
+        20 => KeyCode::T,
+        21 => KeyCode::Y,
+        22 => KeyCode::U,
+        23 => KeyCode::I,
+        24 => KeyCode::O,
+        25 => KeyCode::P,
+        26 => KeyCode::LeftBracket,
+        27 => KeyCode::RightBracket,
+        28 => KeyCode::Enter,
+        29 => KeyCode::LeftCtrl,
+        30 => KeyCode::A,
+        31 => KeyCode::S,
+        32 => KeyCode::D,
+        33 => KeyCode::F,
+        34 => KeyCode::G,
+        35 => KeyCode::H,
+        36 => KeyCode::J,
+        37 => KeyCode::K,
+        38 => KeyCode::L,
+        39 => KeyCode::Semicolon,
+        40 => KeyCode::Apostrophe,
+        41 => KeyCode::Grave,
+        42 => KeyCode::LeftShift,
+        43 => KeyCode::Backslash,
+        44 => KeyCode::Z,
+        45 => KeyCode::X,
+        46 => KeyCode::C,
+        47 => KeyCode::V,
+        48 => KeyCode::B,
+        49 => KeyCode::N,
+        50 => KeyCode::M,
+        51 => KeyCode::Comma,
+        52 => KeyCode::Dot,
+        53 => KeyCode::Slash,
+        54 => KeyCode::RightShift,
+        55 => KeyCode::NumpadStar,
+        56 => KeyCode::LeftAlt,
+        57 => KeyCode::Space,
+        58 => KeyCode::CapsLock,
+        59 => KeyCode::F1,
+        60 => KeyCode::F2,
+        61 => KeyCode::F3,
+        62 => KeyCode::F4,
+        63 => KeyCode::F5,
+        64 => KeyCode::F6,
+        65 => KeyCode::F7,
+        66 => KeyCode::F8,
+        67 => KeyCode::F9,
+        68 => KeyCode::F10,
+        69 => KeyCode::NumLock,
+        70 => KeyCode::ScrollLock,
+        71 => KeyCode::Numpad7,
+        72 => KeyCode::Numpad8,
+        73 => KeyCode::Numpad9,
+        74 => KeyCode::NumpadMinus,
+        75 => KeyCode::Numpad4,
+        76 => KeyCode::Numpad5,
+        77 => KeyCode::Numpad6,
+        78 => KeyCode::NumpadPlus,
+        79 => KeyCode::Numpad1,
+        80 => KeyCode::Numpad2,
+        81 => KeyCode::Numpad3,
+        82 => KeyCode::Numpad0,
+        83 => KeyCode::NumpadDot,
+        87 => KeyCode::F11,
+        88 => KeyCode::F12,
+        96 => KeyCode::NumpadEnter,
+        97 => KeyCode::RightCtrl,
+        98 => KeyCode::NumpadSlash,
+        100 => KeyCode::RightAlt,
+        102 => KeyCode::Home,
+        103 => KeyCode::ArrowUp,
+        104 => KeyCode::PageUp,
+        105 => KeyCode::ArrowLeft,
+        106 => KeyCode::ArrowRight,
+        107 => KeyCode::End,
+        108 => KeyCode::ArrowDown,
+        109 => KeyCode::PageDown,
+        110 => KeyCode::Insert,
+        111 => KeyCode::Delete,
+        125 => KeyCode::LeftMeta,
+        126 => KeyCode::RightMeta,
+        127 => KeyCode::Menu,
+        _ => return None,
+    })
 }
 
 pub(crate) fn console_get_state(fd: RawFd) -> Result<ConsoleStateInfo, i32> {
@@ -475,56 +808,85 @@ pub(crate) fn console_send_input_event(
     ioctl_with_mut(fd, CONSOLE_IOCTL_SEND_INPUT_EVENT, &mut request)
 }
 
-pub(crate) fn runtime_generation(fd: RawFd) -> Result<u64, i32> {
-    let mut request = RuntimeGeneration { generation: 0 };
-    ioctl_with_mut(fd, RUNTIME_IOCTL_GET_GENERATION, &mut request)?;
-    Ok(request.generation)
-}
-
-pub(crate) fn runtime_snapshot_running_programs(
-    fd: RawFd,
-    programs: &mut [RuntimeRunningProgram],
-) -> Result<usize, i32> {
-    let mut request = RuntimeSnapshotRunningProgramsRequest {
-        programs_ptr: programs.as_mut_ptr() as u64,
-        capacity: programs.len() as u64,
-        count: 0,
-    };
-    ioctl_with_mut(fd, RUNTIME_IOCTL_SNAPSHOT_RUNNING_PROGRAMS, &mut request)?;
-    let count = usize::try_from(request.count).unwrap_or(programs.len());
-    Ok(count.min(programs.len()))
-}
-
-pub(crate) fn runtime_snapshot_programs(
-    fd: RawFd,
-    programs: &mut [RuntimeProgram],
-) -> Result<usize, i32> {
-    let mut request = RuntimeSnapshotProgramsRequest {
-        programs_ptr: programs.as_mut_ptr() as u64,
-        capacity: programs.len() as u64,
-        count: 0,
-    };
-    ioctl_with_mut(fd, RUNTIME_IOCTL_SNAPSHOT_PROGRAMS, &mut request)?;
-    let count = usize::try_from(request.count).unwrap_or(programs.len());
-    Ok(count.min(programs.len()))
-}
-
-pub(crate) fn runtime_request_launch_new_session(fd: RawFd, program_id: u32) -> Result<(), i32> {
-    let mut request = RuntimeLaunchRequest {
-        program_id: program_id as u64,
-        target_kind: LAUNCH_TARGET_NEW_SESSION,
-        reserved: 0,
-        reserved2: 0,
-        target_value: 0,
-    };
-    ioctl_with_mut(fd, RUNTIME_IOCTL_REQUEST_LAUNCH, &mut request)
-}
-
 fn open_device(path: &str, flags: usize) -> Result<OwnedFd, i32> {
     let path = CString::new(path).map_err(|_| 22)?;
     let raw_fd = openat(AT_FDCWD, &path, flags, 0)?;
     let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
     Ok(fd)
+}
+
+fn open_first_device(
+    directory: &str,
+    prefix: &str,
+    flags: usize,
+    fallback: &str,
+) -> Result<OwnedFd, i32> {
+    if let Ok(fd) = open_device(fallback, flags) {
+        return Ok(fd);
+    }
+    let mut last_err = ENOENT;
+    for path in enumerate_device_paths(directory, prefix, fallback) {
+        if path == fallback {
+            continue;
+        }
+        match open_device(path.as_str(), flags) {
+            Ok(fd) => return Ok(fd),
+            Err(err) => last_err = err,
+        }
+    }
+    Err(last_err)
+}
+
+fn open_all_devices(
+    directory: &str,
+    prefix: &str,
+    flags: usize,
+    fallback: &str,
+) -> Result<Vec<OwnedFd>, i32> {
+    let mut opened = Vec::new();
+    let mut last_err = ENOENT;
+    if let Ok(fd) = open_device(fallback, flags) {
+        opened.push(fd);
+        last_err = 0;
+    }
+    for path in enumerate_device_paths(directory, prefix, fallback) {
+        if path == fallback {
+            continue;
+        }
+        match open_device(path.as_str(), flags) {
+            Ok(fd) => opened.push(fd),
+            Err(err) => last_err = err,
+        }
+    }
+    if opened.is_empty() {
+        return Err(last_err);
+    }
+    Ok(opened)
+}
+
+fn enumerate_device_paths(directory: &str, prefix: &str, fallback: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    paths.push(String::from(fallback));
+    if let Ok(entries) = fs::read_dir(directory) {
+        let mut discovered = entries
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.starts_with(prefix))
+            .map(|name| format!("{directory}/{name}"))
+            .collect::<Vec<_>>();
+        discovered.sort();
+        for path in discovered {
+            if !paths.iter().any(|existing| existing == &path) {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+}
+
+fn running_on_rustos() -> bool {
+    static IS_RUSTOS: OnceLock<bool> = OnceLock::new();
+    *IS_RUSTOS.get_or_init(|| open_device("/dev/console0", O_RDWR).is_ok())
 }
 
 fn ioctl_with_mut<T>(fd: RawFd, request: usize, arg: &mut T) -> Result<(), i32> {
@@ -547,18 +909,6 @@ fn openat(dirfd: isize, path: &CString, flags: usize, mode: usize) -> Result<Raw
 
 fn read(fd: RawFd, buffer: *mut c_void, len: usize) -> Result<usize, i32> {
     let result = unsafe { syscall3(SYS_READ, fd as usize, buffer as usize, len) };
-    syscall_usize(result)
-}
-
-fn raw_write(fd: RawFd, buffer: &[u8]) -> Result<usize, i32> {
-    let result = unsafe {
-        syscall3(
-            SYS_WRITE,
-            fd as usize,
-            buffer.as_ptr() as usize,
-            buffer.len(),
-        )
-    };
     syscall_usize(result)
 }
 

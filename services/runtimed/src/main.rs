@@ -1,0 +1,1280 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::CString;
+use std::io::{Read, Write};
+use std::mem::size_of;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use runtime_control::{
+    load_desktop_program_entries, load_runtime_launch_program_entries, DesktopProgramEntry,
+    RuntimeRunningProgram, StartupMode, DEFAULT_APPLICATIONS_DIR,
+    DEFAULT_RUNTIME_LAUNCH_REGISTRY_PATH, DEFAULT_RUNTIME_SOCKET_PATH,
+};
+
+const WAYLAND_DISPLAY: &str = "WAYLAND_DISPLAY=wayland-0";
+const DEFAULT_XDG_RUNTIME_DIR_ENV: &str = "XDG_RUNTIME_DIR=/run/user/1000";
+const DEFAULT_PATH_ENV: &str = "PATH=/bin:/usr/bin:/usr/local/bin";
+const DEFAULT_HOME_ENV: &str = "HOME=/home/user";
+const DEFAULT_USER_TASK_WEIGHT_MICROS: u64 = 50;
+const XDG_SESSION_TYPE: &str = "XDG_SESSION_TYPE=wayland";
+const XDG_CURRENT_DESKTOP: &str = "XDG_CURRENT_DESKTOP=RustOS";
+const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const RETRY_BACKOFF: Duration = Duration::from_secs(1);
+const PROTOCOL_VERSION: u16 = 1;
+const OP_SNAPSHOT_RUNNING_PROGRAMS: u16 = 1;
+const OP_REQUEST_LAUNCH_PATH: u16 = 2;
+const OP_REQUEST_TERMINATE: u16 = 3;
+const OP_NOTIFY_READY: u16 = 4;
+const LAUNCH_TARGET_NEW_SESSION: u16 = 2;
+const TERMINATE_TARGET_SESSION: u16 = 1;
+const TERMINATE_TARGET_PID: u16 = 2;
+const READY_COMPONENT_UI_SERVER: u16 = 1;
+const MAX_REQUEST_PATH_BYTES: usize = 128;
+const SYS_IOCTL: usize = 16;
+const SYS_OPENAT: usize = 257;
+const AT_FDCWD: isize = -100;
+const O_RDWR: usize = 2;
+const LINUX_IOC_NRBITS: usize = 8;
+const LINUX_IOC_TYPEBITS: usize = 8;
+const LINUX_IOC_SIZEBITS: usize = 14;
+const LINUX_IOC_NRSHIFT: usize = 0;
+const LINUX_IOC_TYPESHIFT: usize = LINUX_IOC_NRSHIFT + LINUX_IOC_NRBITS;
+const LINUX_IOC_SIZESHIFT: usize = LINUX_IOC_TYPESHIFT + LINUX_IOC_TYPEBITS;
+const LINUX_IOC_DIRSHIFT: usize = LINUX_IOC_SIZESHIFT + LINUX_IOC_SIZEBITS;
+const LINUX_IOC_WRITE: usize = 1;
+const LINUX_IOC_READ: usize = 2;
+const CONSOLE_IOCTL_TYPE: u8 = b'C';
+const CONSOLE_SESSION_STATE_LOADING_IMAGE: u16 = 2;
+const CONSOLE_SESSION_STATE_SPAWNING: u16 = 3;
+const CONSOLE_SESSION_STATE_RUNNING: u16 = 4;
+const CONSOLE_PATH: &str = "/dev/console0";
+const UI_SERVER_DESKTOP_FILE_ID: &str = "uiserver.desktop";
+const UI_SERVER_DISPLAY_NAME: &str = "UI Server";
+const UI_SERVER_EXEC_PATH: &str = "services/uiserver/uiserver.elf";
+const BOOT_TRACE_ENABLED: bool = true;
+const SYS_RUSTOS_SPAWN_EXEC: libc::c_long = 0x5255_0002;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct RuntimeRequest {
+    version: u16,
+    op: u16,
+    target_kind: u16,
+    reserved0: u16,
+    text_len: u32,
+    target_value: u64,
+    text: [u8; MAX_REQUEST_PATH_BYTES],
+}
+
+impl Default for RuntimeRequest {
+    fn default() -> Self {
+        Self {
+            version: 0,
+            op: 0,
+            target_kind: 0,
+            reserved0: 0,
+            text_len: 0,
+            target_value: 0,
+            text: [0; MAX_REQUEST_PATH_BYTES],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct RuntimeResponse {
+    version: u16,
+    op: u16,
+    status: i32,
+    count: u32,
+}
+
+const fn linux_ioc(dir: usize, type_: u8, nr: u8, size: usize) -> usize {
+    (dir << LINUX_IOC_DIRSHIFT)
+        | ((type_ as usize) << LINUX_IOC_TYPESHIFT)
+        | ((nr as usize) << LINUX_IOC_NRSHIFT)
+        | (size << LINUX_IOC_SIZESHIFT)
+}
+
+const fn linux_iow<T>(type_: u8, nr: u8) -> usize {
+    linux_ioc(LINUX_IOC_WRITE, type_, nr, size_of::<T>())
+}
+
+const fn linux_iowr<T>(type_: u8, nr: u8) -> usize {
+    linux_ioc(LINUX_IOC_READ | LINUX_IOC_WRITE, type_, nr, size_of::<T>())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct LaunchEntry {
+    desktop_file_id: String,
+    display_name: String,
+    exec: String,
+    restart: bool,
+    weight_micros: u64,
+    logical_admin: bool,
+    console_hosted: bool,
+    args: Vec<String>,
+    env: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct RunningProcess {
+    pid: i32,
+    desktop_file_id: String,
+    display_name: String,
+    exec: String,
+    session_handle: u64,
+    restart: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ProgramMetadata {
+    desktop_file_id: String,
+    display_name: String,
+    exec: String,
+    startup: StartupMode,
+    weight_micros: u64,
+    logical_admin: bool,
+    console_hosted: bool,
+    args: Vec<String>,
+    env: Vec<String>,
+}
+
+struct BrokerState {
+    console_fd: Option<OwnedFd>,
+    running: BTreeMap<i32, RunningProcess>,
+    launched_once: BTreeSet<String>,
+    retry_after: BTreeMap<String, Instant>,
+    launch_entries: Vec<LaunchEntry>,
+    programs: BTreeMap<String, ProgramMetadata>,
+    ui_ready: bool,
+    launch_catalog_loaded: bool,
+}
+
+fn boot_line(message: &str) {
+    if !BOOT_TRACE_ENABLED {
+        return;
+    }
+    let _ = std::io::stderr().write_all(message.as_bytes());
+    let _ = std::io::stderr().write_all(b"\n");
+}
+
+fn main() {
+    stderr_line("runtimed: service start");
+    boot_line("runtimed: service start");
+    let listener = match bind_listener(DEFAULT_RUNTIME_SOCKET_PATH) {
+        Ok(listener) => listener,
+        Err(err) => {
+            diag_client::diag_error!(
+                "runtimed",
+                "bind {} failed: errno={err}",
+                DEFAULT_RUNTIME_SOCKET_PATH
+            );
+            return;
+        }
+    };
+    stderr_line("runtimed: runtime socket ready");
+    boot_line("runtimed: runtime socket ready");
+
+    let mut state = BrokerState {
+        console_fd: None,
+        running: BTreeMap::new(),
+        launched_once: BTreeSet::new(),
+        retry_after: BTreeMap::new(),
+        launch_entries: Vec::new(),
+        programs: BTreeMap::new(),
+        ui_ready: false,
+        launch_catalog_loaded: false,
+    };
+    stderr_line("runtimed: bootstrap ui begin");
+    boot_line("runtimed: bootstrap ui begin");
+    if let Err(err) = bootstrap_ui_server(&mut state) {
+        diag_client::diag_error!(
+            "runtimed",
+            "bootstrap {} failed: errno={err}",
+            UI_SERVER_EXEC_PATH
+        );
+    } else {
+        stderr_line("runtimed: bootstrap ui done");
+        boot_line("runtimed: bootstrap ui done");
+    }
+    loop {
+        let mut did_work = false;
+        did_work |= reap_children(&mut state);
+        did_work |= service_listener(&listener, &mut state);
+        did_work |= maybe_load_launch_catalog(&mut state);
+        did_work |= ensure_policy_launches(&mut state);
+        if did_work {
+            continue;
+        }
+        thread::sleep(next_idle_delay(&state));
+    }
+}
+
+fn maybe_load_launch_catalog(state: &mut BrokerState) -> bool {
+    if state.launch_catalog_loaded {
+        return false;
+    }
+    if !state.ui_ready {
+        return false;
+    }
+
+    boot_line("runtimed: launch catalog load begin");
+    let started_at = Instant::now();
+    let (programs, launch_entries) = load_launch_catalog();
+    diag_client::diag_info!(
+        "runtimed",
+        "launch catalog summary programs={} policies={} elapsed_ms={}",
+        programs.len(),
+        launch_entries.len(),
+        started_at.elapsed().as_millis()
+    );
+    boot_line(
+        format!(
+            "runtimed: launch catalog summary programs={} policies={} elapsed_ms={}",
+            programs.len(),
+            launch_entries.len(),
+            started_at.elapsed().as_millis()
+        )
+        .as_str(),
+    );
+    state.programs = programs;
+    state.launch_entries = launch_entries;
+    state.launch_catalog_loaded = true;
+    boot_line("runtimed: launch catalog load done");
+    ensure_policy_launches(state);
+    true
+}
+
+fn bootstrap_ui_server(state: &mut BrokerState) -> Result<(), i32> {
+    spawn_tracked_process(
+        state,
+        LaunchEntry {
+            desktop_file_id: String::from(UI_SERVER_DESKTOP_FILE_ID),
+            display_name: String::from(UI_SERVER_DISPLAY_NAME),
+            exec: String::from(UI_SERVER_EXEC_PATH),
+            restart: true,
+            weight_micros: DEFAULT_USER_TASK_WEIGHT_MICROS,
+            logical_admin: false,
+            console_hosted: false,
+            args: Vec::new(),
+            env: Vec::new(),
+        },
+    )
+}
+
+fn bind_listener(path: &str) -> Result<UnixListener, i32> {
+    let started_at = Instant::now();
+    boot_line("runtimed: bind listener begin");
+
+    let socket_fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if socket_fd < 0 {
+        return Err(last_errno());
+    }
+    boot_line(
+        format!(
+            "runtimed: bind listener socket elapsed_ms={}",
+            started_at.elapsed().as_millis()
+        )
+        .as_str(),
+    );
+
+    let path = CString::new(path).map_err(|_| libc::EINVAL)?;
+    let unlink_rc = unsafe { libc::unlink(path.as_ptr()) };
+    if unlink_rc < 0 {
+        let err = last_errno();
+        if err != libc::ENOENT {
+            let _ = unsafe { libc::close(socket_fd) };
+            return Err(err);
+        }
+    }
+    boot_line(
+        format!(
+            "runtimed: bind listener unlink elapsed_ms={}",
+            started_at.elapsed().as_millis()
+        )
+        .as_str(),
+    );
+
+    let path_bytes = path.as_bytes_with_nul();
+    let mut addr = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    if path_bytes.len() > addr.sun_path.len() {
+        let _ = unsafe { libc::close(socket_fd) };
+        return Err(libc::ENAMETOOLONG);
+    }
+    for (index, byte) in path_bytes.iter().enumerate() {
+        addr.sun_path[index] = *byte as libc::c_char;
+    }
+
+    let bind_rc = unsafe {
+        libc::bind(
+            socket_fd,
+            (&addr as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+            size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    };
+    if bind_rc < 0 {
+        let err = last_errno();
+        let _ = unsafe { libc::close(socket_fd) };
+        return Err(err);
+    }
+    boot_line(
+        format!(
+            "runtimed: bind listener bind elapsed_ms={}",
+            started_at.elapsed().as_millis()
+        )
+        .as_str(),
+    );
+
+    if unsafe { libc::listen(socket_fd, 16) } < 0 {
+        let err = last_errno();
+        let _ = unsafe { libc::close(socket_fd) };
+        return Err(err);
+    }
+    boot_line(
+        format!(
+            "runtimed: bind listener listen elapsed_ms={}",
+            started_at.elapsed().as_millis()
+        )
+        .as_str(),
+    );
+
+    Ok(unsafe { UnixListener::from_raw_fd(socket_fd) })
+}
+
+fn service_listener(listener: &UnixListener, state: &mut BrokerState) -> bool {
+    let mut did_work = false;
+    loop {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                did_work = true;
+                if let Err(err) = service_stream(&mut stream, state) {
+                    let _ = write_response(
+                        &mut stream,
+                        RuntimeResponse {
+                            version: PROTOCOL_VERSION,
+                            op: 0,
+                            status: -err,
+                            count: 0,
+                        },
+                    );
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(err) => {
+                diag_client::diag_error!("runtimed", "accept failed: errno={}", io_errno(err));
+                break;
+            }
+        }
+    }
+    did_work
+}
+
+fn service_stream(stream: &mut UnixStream, state: &mut BrokerState) -> Result<(), i32> {
+    let mut request = RuntimeRequest::default();
+    stream
+        .read_exact(as_bytes_mut(&mut request))
+        .map_err(io_errno)?;
+    if request.version != PROTOCOL_VERSION {
+        return Err(libc::EPROTO);
+    }
+
+    match request.op {
+        OP_SNAPSHOT_RUNNING_PROGRAMS => handle_snapshot(stream, state),
+        OP_REQUEST_LAUNCH_PATH => handle_launch(stream, state, request),
+        OP_REQUEST_TERMINATE => handle_terminate(stream, state, request),
+        OP_NOTIFY_READY => handle_ready(stream, state, request),
+        _ => Err(libc::EINVAL),
+    }
+}
+
+fn handle_snapshot(stream: &mut UnixStream, state: &BrokerState) -> Result<(), i32> {
+    let mut programs = state
+        .running
+        .values()
+        .map(|program| {
+            let mut snapshot = RuntimeRunningProgram::default();
+            snapshot.pid = program.pid as u64;
+            snapshot.program_id = 0;
+            snapshot.session_handle = program.session_handle;
+            copy_ascii_into(&mut snapshot.desktop_file_id, &program.desktop_file_id);
+            copy_ascii_into(&mut snapshot.display_name, &program.display_name);
+            copy_ascii_into(&mut snapshot.exec_path, &program.exec);
+            snapshot
+        })
+        .collect::<Vec<_>>();
+    programs.sort_by_key(|program| program.pid);
+
+    write_response(
+        stream,
+        RuntimeResponse {
+            version: PROTOCOL_VERSION,
+            op: OP_SNAPSHOT_RUNNING_PROGRAMS,
+            status: 0,
+            count: u32::try_from(programs.len()).unwrap_or(u32::MAX),
+        },
+    )?;
+    if !programs.is_empty() {
+        stream
+            .write_all(unsafe {
+                std::slice::from_raw_parts(
+                    programs.as_ptr().cast::<u8>(),
+                    std::mem::size_of_val(programs.as_slice()),
+                )
+            })
+            .map_err(io_errno)?;
+    }
+    Ok(())
+}
+
+fn handle_launch(
+    stream: &mut UnixStream,
+    state: &mut BrokerState,
+    request: RuntimeRequest,
+) -> Result<(), i32> {
+    if request.target_kind != LAUNCH_TARGET_NEW_SESSION {
+        return Err(libc::EOPNOTSUPP);
+    }
+    let target = request_path(&request)?;
+    let metadata = resolve_program_request(state, target.as_str());
+    spawn_tracked_process(
+        state,
+        LaunchEntry {
+            desktop_file_id: metadata.desktop_file_id,
+            display_name: metadata.display_name,
+            exec: metadata.exec,
+            restart: false,
+            weight_micros: metadata.weight_micros,
+            logical_admin: metadata.logical_admin,
+            console_hosted: metadata.console_hosted,
+            args: metadata.args,
+            env: metadata.env,
+        },
+    )?;
+    write_response(
+        stream,
+        RuntimeResponse {
+            version: PROTOCOL_VERSION,
+            op: OP_REQUEST_LAUNCH_PATH,
+            status: 0,
+            count: 0,
+        },
+    )
+}
+
+fn handle_terminate(
+    stream: &mut UnixStream,
+    state: &mut BrokerState,
+    request: RuntimeRequest,
+) -> Result<(), i32> {
+    let mut terminated = false;
+    match request.target_kind {
+        TERMINATE_TARGET_PID => {
+            let pid = i32::try_from(request.target_value).map_err(|_| libc::EINVAL)?;
+            terminate_pid(pid)?;
+            terminated = true;
+        }
+        TERMINATE_TARGET_SESSION => {
+            if request.target_value == 0 {
+                return Err(libc::EINVAL);
+            }
+            let pids = state
+                .running
+                .values()
+                .filter(|program| program.session_handle == request.target_value)
+                .map(|program| program.pid)
+                .collect::<Vec<_>>();
+            for pid in pids {
+                terminate_pid(pid)?;
+                terminated = true;
+            }
+            if !terminated
+                && close_console_session(ensure_console_fd(state)?, request.target_value)?
+            {
+                terminated = true;
+            }
+        }
+        _ => return Err(libc::EOPNOTSUPP),
+    }
+
+    if !terminated {
+        return Err(libc::ESRCH);
+    }
+
+    write_response(
+        stream,
+        RuntimeResponse {
+            version: PROTOCOL_VERSION,
+            op: OP_REQUEST_TERMINATE,
+            status: 0,
+            count: 0,
+        },
+    )
+}
+
+fn handle_ready(
+    stream: &mut UnixStream,
+    state: &mut BrokerState,
+    request: RuntimeRequest,
+) -> Result<(), i32> {
+    if request.target_kind != READY_COMPONENT_UI_SERVER {
+        return Err(libc::EOPNOTSUPP);
+    }
+    state.ui_ready = true;
+    diag_client::diag_info!("runtimed", "ui ready received");
+    boot_line("runtimed: ui ready received");
+    write_response(
+        stream,
+        RuntimeResponse {
+            version: PROTOCOL_VERSION,
+            op: OP_NOTIFY_READY,
+            status: 0,
+            count: 0,
+        },
+    )
+}
+
+fn ensure_policy_launches(state: &mut BrokerState) -> bool {
+    let now = Instant::now();
+    let running_programs = state
+        .running
+        .values()
+        .map(|program| program.desktop_file_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut pending_service_launch = false;
+    let mut pending_desktop_launch = false;
+    let mut launched_any = false;
+    for entry in &state.launch_entries {
+        if state
+            .retry_after
+            .get(entry.desktop_file_id.as_str())
+            .is_some_and(|deadline| now < *deadline)
+        {
+            continue;
+        }
+        let already_satisfied = if entry.restart {
+            running_programs.contains(&entry.desktop_file_id)
+        } else {
+            running_programs.contains(&entry.desktop_file_id)
+                || state.launched_once.contains(entry.desktop_file_id.as_str())
+        };
+        if already_satisfied {
+            continue;
+        }
+        if entry.exec.starts_with("services/") {
+            pending_service_launch = true;
+        } else {
+            pending_desktop_launch = true;
+        }
+    }
+
+    for entry in state.launch_entries.clone() {
+        if state
+            .retry_after
+            .get(entry.desktop_file_id.as_str())
+            .is_some_and(|deadline| now < *deadline)
+        {
+            continue;
+        }
+        if pending_service_launch
+            && !entry.exec.starts_with("services/")
+            && (!state.ui_ready || !pending_desktop_launch)
+        {
+            continue;
+        }
+        if !state.ui_ready && entry.exec != UI_SERVER_EXEC_PATH {
+            continue;
+        }
+        if state.ui_ready
+            && pending_desktop_launch
+            && entry.exec.starts_with("services/")
+            && entry.exec != UI_SERVER_EXEC_PATH
+        {
+            continue;
+        }
+
+        if entry.restart {
+            if running_programs.contains(&entry.desktop_file_id) {
+                continue;
+            }
+        } else if running_programs.contains(&entry.desktop_file_id)
+            || state.launched_once.contains(entry.desktop_file_id.as_str())
+        {
+            continue;
+        }
+
+        match spawn_tracked_process(state, entry.clone()) {
+            Ok(()) => {
+                diag_client::diag_info!(
+                    "runtimed",
+                    "launched {} ({})",
+                    entry.desktop_file_id,
+                    entry.exec
+                );
+                launched_any = true;
+                if !entry.restart {
+                    state.launched_once.insert(entry.desktop_file_id);
+                }
+            }
+            Err(err) => {
+                diag_client::diag_error!(
+                    "runtimed",
+                    "launch {} ({}) failed: errno={err}",
+                    entry.desktop_file_id,
+                    entry.exec
+                );
+                state
+                    .retry_after
+                    .insert(entry.desktop_file_id, Instant::now() + RETRY_BACKOFF);
+            }
+        }
+    }
+    launched_any
+}
+
+fn spawn_tracked_process(state: &mut BrokerState, entry: LaunchEntry) -> Result<(), i32> {
+    boot_line(
+        format!(
+            "runtimed: spawn begin desktop_id={} exec={} console_hosted={} logical_admin={}",
+            entry.desktop_file_id, entry.exec, entry.console_hosted, entry.logical_admin
+        )
+        .as_str(),
+    );
+    let session_handle = if entry.console_hosted {
+        let console_fd = ensure_console_fd(state)?;
+        let session = create_console_session(
+            console_fd,
+            0,
+            entry.display_name.as_str(),
+            entry.exec.as_str(),
+        )?;
+        set_console_session_state(console_fd, session, CONSOLE_SESSION_STATE_LOADING_IMAGE)?;
+        Some(session)
+    } else {
+        None
+    };
+    let pid = match spawn_exec(
+        entry.exec.as_str(),
+        entry.args.as_slice(),
+        entry.env.as_slice(),
+        entry.logical_admin,
+        session_handle.unwrap_or(0),
+    ) {
+        Ok(pid) => pid,
+        Err(err) => {
+            if let Some(session) = session_handle {
+                let _ = close_console_session(ensure_console_fd(state)?, session);
+            }
+            diag_client::diag_error!(
+                "runtimed",
+                "spawn exec failed desktop_id={} exec={} errno={err}",
+                entry.desktop_file_id,
+                entry.exec
+            );
+            return Err(err);
+        }
+    };
+    boot_line(
+        format!(
+            "runtimed: spawned desktop_id={} exec={} pid={}",
+            entry.desktop_file_id, entry.exec, pid
+        )
+        .as_str(),
+    );
+    state.retry_after.remove(entry.desktop_file_id.as_str());
+    if let Some(session) = session_handle {
+        let console_fd = ensure_console_fd(state)?;
+        set_console_session_state(console_fd, session, CONSOLE_SESSION_STATE_SPAWNING)?;
+        set_console_session_state(console_fd, session, CONSOLE_SESSION_STATE_RUNNING)?;
+        let _ = console_set_focus(console_fd, session);
+    }
+    state.running.insert(
+        pid,
+        RunningProcess {
+            pid,
+            desktop_file_id: entry.desktop_file_id,
+            display_name: entry.display_name,
+            exec: entry.exec,
+            session_handle: session_handle.unwrap_or(0),
+            restart: entry.restart,
+        },
+    );
+    Ok(())
+}
+
+fn reap_children(state: &mut BrokerState) -> bool {
+    let mut reaped_any = false;
+    loop {
+        let mut status = 0_i32;
+        let pid = unsafe {
+            libc::syscall(
+                libc::SYS_wait4 as libc::c_long,
+                -1_i32,
+                &mut status as *mut i32,
+                libc::WNOHANG,
+                std::ptr::null_mut::<libc::rusage>(),
+            ) as i32
+        };
+        if pid > 0 {
+            reaped_any = true;
+            if let Some(process) = state.running.remove(&pid) {
+                if process.session_handle != 0 {
+                    if let Ok(console_fd) = ensure_console_fd(state) {
+                        let _ = close_console_session(console_fd, process.session_handle);
+                    }
+                }
+                if process.restart {
+                    state
+                        .retry_after
+                        .insert(process.desktop_file_id, Instant::now() + RETRY_BACKOFF);
+                }
+            }
+            continue;
+        }
+        if pid == 0 || (pid == -1 && last_errno() == libc::ECHILD) {
+            break;
+        }
+        break;
+    }
+    reaped_any
+}
+
+fn next_idle_delay(state: &BrokerState) -> Duration {
+    let now = Instant::now();
+    let retry_delay = state
+        .retry_after
+        .values()
+        .map(|deadline| deadline.saturating_duration_since(now))
+        .min()
+        .unwrap_or(IDLE_POLL_INTERVAL);
+    retry_delay.min(IDLE_POLL_INTERVAL)
+}
+
+fn spawn_exec(
+    exec_path: &str,
+    argv: &[String],
+    env: &[String],
+    logical_admin: bool,
+    session_handle: u64,
+) -> Result<i32, i32> {
+    boot_line(format!("runtimed: spawn syscall begin exec={}", exec_path).as_str());
+    let path = CString::new(exec_path).unwrap_or_else(|_| CString::new("/").unwrap());
+    let argv_storage = build_exec_argv(exec_path, argv);
+    let env_storage = build_exec_env(env);
+    let mut argvp = argv_storage
+        .iter()
+        .map(|value| value.as_ptr())
+        .collect::<Vec<_>>();
+    argvp.push(std::ptr::null());
+    let mut envp = env_storage
+        .iter()
+        .map(|value| value.as_ptr())
+        .collect::<Vec<_>>();
+    envp.push(std::ptr::null());
+    let flags = u64::from(logical_admin);
+    let pid = unsafe {
+        libc::syscall(
+            SYS_RUSTOS_SPAWN_EXEC,
+            path.as_ptr(),
+            argvp.as_ptr(),
+            envp.as_ptr(),
+            flags,
+            session_handle,
+            DEFAULT_USER_TASK_WEIGHT_MICROS,
+        ) as i32
+    };
+    if pid < 0 {
+        return Err(last_errno());
+    }
+    boot_line(format!("runtimed: spawn syscall returned exec={} pid={}", exec_path, pid).as_str());
+    Ok(pid)
+}
+
+fn stderr_line(message: &str) {
+    let mut line = message.as_bytes().to_vec();
+    line.push(b'\n');
+    unsafe {
+        libc::write(
+            libc::STDERR_FILENO,
+            line.as_ptr().cast::<libc::c_void>(),
+            line.len(),
+        );
+    }
+}
+
+fn terminate_pid(pid: i32) -> Result<(), i32> {
+    let rc =
+        unsafe { libc::syscall(libc::SYS_tgkill as libc::c_long, pid, pid, libc::SIGKILL) as i32 };
+    if rc < 0 {
+        return Err(last_errno());
+    }
+    Ok(())
+}
+
+fn load_launch_catalog() -> (BTreeMap<String, ProgramMetadata>, Vec<LaunchEntry>) {
+    let load_started = Instant::now();
+    let registry_entries =
+        load_runtime_launch_program_entries(DEFAULT_RUNTIME_LAUNCH_REGISTRY_PATH).unwrap_or_default();
+    let registry_elapsed = load_started.elapsed().as_millis();
+    diag_client::diag_info!(
+        "runtimed",
+        "launch registry entries={} elapsed_ms={}",
+        registry_entries.len(),
+        registry_elapsed
+    );
+    boot_line(
+        format!(
+            "runtimed: launch registry entries={} elapsed_ms={}",
+            registry_entries.len(),
+            registry_elapsed
+        )
+        .as_str(),
+    );
+
+    let mut programs = BTreeMap::new();
+    for entry in registry_entries.iter().cloned() {
+        insert_program_metadata(&mut programs, entry);
+    }
+    let autostart_entries = registry_entries
+        .iter()
+        .filter(|entry| entry.autostart_enabled && !entry.hidden && !entry.no_display)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let launch_started = Instant::now();
+    let launch_entries = load_launch_entries(&programs, autostart_entries);
+    let launch_elapsed = launch_started.elapsed().as_millis();
+    diag_client::diag_info!(
+        "runtimed",
+        "launch policies={} elapsed_ms={}",
+        launch_entries.len(),
+        launch_elapsed
+    );
+    boot_line(
+        format!(
+            "runtimed: launch policies={} elapsed_ms={}",
+            launch_entries.len(),
+            launch_elapsed
+        )
+        .as_str(),
+    );
+
+    (programs, launch_entries)
+}
+
+fn load_launch_entries(
+    programs: &BTreeMap<String, ProgramMetadata>,
+    autostart_entries: Vec<DesktopProgramEntry>,
+) -> Vec<LaunchEntry> {
+    let mut seen = BTreeSet::<String>::new();
+    let mut entries = Vec::<LaunchEntry>::new();
+
+    for metadata in programs.values() {
+        if !matches!(
+            metadata.startup,
+            StartupMode::Session | StartupMode::Desktop
+        ) {
+            continue;
+        }
+        if !seen.insert(metadata.desktop_file_id.clone()) {
+            continue;
+        }
+        entries.push(LaunchEntry {
+            desktop_file_id: metadata.desktop_file_id.clone(),
+            display_name: metadata.display_name.clone(),
+            exec: metadata.exec.clone(),
+            restart: metadata.exec.starts_with("services/"),
+            weight_micros: metadata.weight_micros,
+            logical_admin: metadata.logical_admin,
+            console_hosted: metadata.console_hosted,
+            args: metadata.args.clone(),
+            env: metadata.env.clone(),
+        });
+    }
+
+    for entry in autostart_entries {
+        if !seen.insert(entry.desktop_file_id.clone()) {
+            continue;
+        }
+        let metadata = programs
+            .get(entry.desktop_file_id.as_str())
+            .cloned()
+            .unwrap_or_else(|| program_metadata_from_desktop_entry(entry.clone()));
+        entries.push(LaunchEntry {
+            desktop_file_id: metadata.desktop_file_id,
+            display_name: metadata.display_name,
+            exec: metadata.exec.clone(),
+            restart: metadata.exec.starts_with("services/"),
+            weight_micros: metadata.weight_micros,
+            logical_admin: metadata.logical_admin,
+            console_hosted: metadata.console_hosted,
+            args: metadata.args,
+            env: metadata.env,
+        });
+    }
+
+    entries.sort_by(|lhs, rhs| {
+        launch_entry_priority(lhs)
+            .cmp(&launch_entry_priority(rhs))
+            .then_with(|| lhs.desktop_file_id.cmp(&rhs.desktop_file_id))
+            .then_with(|| lhs.display_name.cmp(&rhs.display_name))
+            .then_with(|| lhs.exec.cmp(&rhs.exec))
+    });
+
+    entries
+}
+
+fn launch_entry_priority(entry: &LaunchEntry) -> (u8, u8, &str) {
+    let service_rank = if entry.exec == UI_SERVER_EXEC_PATH {
+        0
+    } else if entry.exec.starts_with("services/") {
+        3
+    } else if entry.console_hosted {
+        2
+    } else {
+        1
+    };
+    let restart_rank = u8::from(entry.restart);
+    (service_rank, restart_rank, entry.desktop_file_id.as_str())
+}
+
+fn load_program_metadata() -> BTreeMap<String, ProgramMetadata> {
+    let mut map = BTreeMap::new();
+    if let Ok(entries) = load_desktop_program_entries(DEFAULT_APPLICATIONS_DIR) {
+        for entry in entries {
+            insert_program_metadata(&mut map, entry);
+        }
+    }
+    map
+}
+
+fn load_program_metadata_for_target(target: &str) -> Option<ProgramMetadata> {
+    let mut programs = load_program_metadata();
+    programs
+        .remove(target)
+        .or_else(|| programs.into_values().find(|program| program.exec == target))
+}
+
+fn insert_program_metadata(
+    map: &mut BTreeMap<String, ProgramMetadata>,
+    entry: DesktopProgramEntry,
+) {
+    let key = entry.desktop_file_id.clone();
+    map.entry(key)
+        .or_insert_with(|| program_metadata_from_desktop_entry(entry));
+}
+
+fn program_metadata_from_desktop_entry(entry: DesktopProgramEntry) -> ProgramMetadata {
+    ProgramMetadata {
+        desktop_file_id: entry.desktop_file_id,
+        display_name: if entry.display_name.is_empty() {
+            fallback_display_name(entry.exec.as_str())
+        } else {
+            entry.display_name
+        },
+        exec: entry.exec,
+        startup: entry.startup,
+        weight_micros: entry.weight_micros,
+        logical_admin: entry.logical_admin,
+        console_hosted: entry.console_hosted,
+        args: entry.args,
+        env: entry.env,
+    }
+}
+
+fn resolve_program_request(state: &BrokerState, target: &str) -> ProgramMetadata {
+    state
+        .programs
+        .get(target)
+        .cloned()
+        .or_else(|| {
+            state
+                .programs
+                .values()
+                .find(|program| program.exec == target)
+                .cloned()
+        })
+        .or_else(|| load_program_metadata_for_target(target))
+        .unwrap_or_else(|| ProgramMetadata {
+            desktop_file_id: target.to_string(),
+            display_name: fallback_display_name(target),
+            exec: target.to_string(),
+            startup: StartupMode::None,
+            weight_micros: DEFAULT_USER_TASK_WEIGHT_MICROS,
+            logical_admin: false,
+            console_hosted: false,
+            args: Vec::new(),
+            env: Vec::new(),
+        })
+}
+
+fn fallback_display_name(exec: &str) -> String {
+    Path::new(exec)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or(exec)
+        .to_string()
+}
+
+fn request_path(request: &RuntimeRequest) -> Result<String, i32> {
+    let len = usize::try_from(request.text_len).map_err(|_| libc::EINVAL)?;
+    if len > request.text.len() {
+        return Err(libc::EINVAL);
+    }
+    String::from_utf8(request.text[..len].to_vec()).map_err(|_| libc::EINVAL)
+}
+
+fn write_response(stream: &mut UnixStream, response: RuntimeResponse) -> Result<(), i32> {
+    stream.write_all(as_bytes(&response)).map_err(io_errno)
+}
+
+fn copy_ascii_into(dest: &mut [u8], value: &str) {
+    dest.fill(0);
+    for (index, byte) in value.bytes().enumerate() {
+        if index >= dest.len() {
+            break;
+        }
+        dest[index] = match byte {
+            b' '..=b'~' => byte,
+            _ => b'?',
+        };
+    }
+}
+
+fn io_errno(err: std::io::Error) -> i32 {
+    err.raw_os_error().unwrap_or(libc::EIO)
+}
+
+fn last_errno() -> i32 {
+    std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EIO)
+}
+
+fn build_exec_argv(exec_path: &str, argv: &[String]) -> Vec<CString> {
+    if argv.is_empty() {
+        return vec![c_string_or_fallback(exec_path, "/")];
+    }
+
+    let mut storage = argv
+        .iter()
+        .filter_map(|arg| CString::new(arg.as_str()).ok())
+        .collect::<Vec<_>>();
+    if storage.is_empty() {
+        storage.push(c_string_or_fallback(exec_path, "/"));
+    }
+    storage
+}
+
+fn build_exec_env(extra_env: &[String]) -> Vec<CString> {
+    let mut env = extra_env.to_vec();
+    push_env_if_missing(&mut env, DEFAULT_PATH_ENV);
+    push_env_if_missing(&mut env, DEFAULT_HOME_ENV);
+    push_env_if_missing(&mut env, DEFAULT_XDG_RUNTIME_DIR_ENV);
+    push_env_if_missing(&mut env, WAYLAND_DISPLAY);
+    push_env_if_missing(&mut env, XDG_SESSION_TYPE);
+    push_env_if_missing(&mut env, XDG_CURRENT_DESKTOP);
+    env.into_iter()
+        .filter_map(|item| CString::new(item).ok())
+        .collect()
+}
+
+fn push_env_if_missing(env: &mut Vec<String>, item: &str) {
+    let key = env_key(item);
+    if env.iter().any(|candidate| env_key(candidate) == key) {
+        return;
+    }
+    env.push(item.to_string());
+}
+
+fn env_key(value: &str) -> &str {
+    value.split_once('=').map(|(key, _)| key).unwrap_or(value)
+}
+
+fn c_string_or_fallback(value: &str, fallback: &str) -> CString {
+    CString::new(value).unwrap_or_else(|_| CString::new(fallback).unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_exec_argv, build_exec_env, DEFAULT_HOME_ENV, DEFAULT_PATH_ENV,
+        DEFAULT_XDG_RUNTIME_DIR_ENV, WAYLAND_DISPLAY, XDG_CURRENT_DESKTOP, XDG_SESSION_TYPE,
+    };
+
+    #[test]
+    fn build_exec_argv_defaults_to_exec_path() {
+        let argv = build_exec_argv("apps/demo/demo.elf", &[]);
+        assert_eq!(argv.len(), 1);
+        assert_eq!(argv[0].to_str().unwrap(), "apps/demo/demo.elf");
+    }
+
+    #[test]
+    fn build_exec_env_preserves_explicit_values_and_adds_defaults() {
+        let env = build_exec_env(&[
+            String::from("PATH=/custom/bin"),
+            String::from("XDG_RUNTIME_DIR=/run/custom"),
+        ]);
+        let values = env
+            .iter()
+            .map(|item| item.to_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert!(values.iter().any(|item| item == "PATH=/custom/bin"));
+        assert!(values
+            .iter()
+            .any(|item| item == "XDG_RUNTIME_DIR=/run/custom"));
+        assert!(values.iter().any(|item| item == DEFAULT_HOME_ENV));
+        assert!(values.iter().any(|item| item == WAYLAND_DISPLAY));
+        assert!(values.iter().any(|item| item == XDG_SESSION_TYPE));
+        assert!(values.iter().any(|item| item == XDG_CURRENT_DESKTOP));
+        assert!(!values.iter().any(|item| item == DEFAULT_PATH_ENV));
+        assert!(!values
+            .iter()
+            .any(|item| item == DEFAULT_XDG_RUNTIME_DIR_ENV));
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct ConsoleCreateSessionRequest {
+    program_id: u32,
+    reserved: u32,
+    title_ptr: u64,
+    title_len: u64,
+    exec_path_ptr: u64,
+    exec_path_len: u64,
+    session_handle: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct ConsoleCloseSessionRequest {
+    session_handle: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct ConsoleSetFocusRequest {
+    session_handle: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct ConsoleSetSessionStateRequest {
+    session_handle: u64,
+    state: u16,
+    reserved: u16,
+}
+
+const CONSOLE_IOCTL_SET_FOCUS: usize = linux_iow::<ConsoleSetFocusRequest>(CONSOLE_IOCTL_TYPE, 3);
+const CONSOLE_IOCTL_CREATE_SESSION: usize =
+    linux_iowr::<ConsoleCreateSessionRequest>(CONSOLE_IOCTL_TYPE, 6);
+const CONSOLE_IOCTL_CLOSE_SESSION: usize =
+    linux_iow::<ConsoleCloseSessionRequest>(CONSOLE_IOCTL_TYPE, 7);
+const CONSOLE_IOCTL_SET_SESSION_STATE: usize =
+    linux_iow::<ConsoleSetSessionStateRequest>(CONSOLE_IOCTL_TYPE, 9);
+
+fn create_console_session(
+    console_fd: RawFd,
+    program_id: u32,
+    title: &str,
+    exec_path: &str,
+) -> Result<u64, i32> {
+    let mut request = ConsoleCreateSessionRequest {
+        program_id,
+        title_ptr: title.as_ptr() as u64,
+        title_len: title.len() as u64,
+        exec_path_ptr: exec_path.as_ptr() as u64,
+        exec_path_len: exec_path.len() as u64,
+        session_handle: 0,
+        reserved: 0,
+    };
+    ioctl_with_mut(console_fd, CONSOLE_IOCTL_CREATE_SESSION, &mut request)?;
+    Ok(request.session_handle)
+}
+
+fn close_console_session(console_fd: RawFd, session_handle: u64) -> Result<bool, i32> {
+    let mut request = ConsoleCloseSessionRequest { session_handle };
+    match ioctl_with_mut(console_fd, CONSOLE_IOCTL_CLOSE_SESSION, &mut request) {
+        Ok(()) => Ok(true),
+        Err(err) if err == libc::ENOENT || err == libc::EINVAL => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+fn set_console_session_state(
+    console_fd: RawFd,
+    session_handle: u64,
+    state: u16,
+) -> Result<(), i32> {
+    let mut request = ConsoleSetSessionStateRequest {
+        session_handle,
+        state,
+        reserved: 0,
+    };
+    ioctl_with_mut(console_fd, CONSOLE_IOCTL_SET_SESSION_STATE, &mut request)
+}
+
+fn console_set_focus(console_fd: RawFd, session_handle: u64) -> Result<(), i32> {
+    let mut request = ConsoleSetFocusRequest { session_handle };
+    ioctl_with_mut(console_fd, CONSOLE_IOCTL_SET_FOCUS, &mut request)
+}
+
+fn open_device(path: &str, flags: usize) -> Result<OwnedFd, i32> {
+    let path = CString::new(path).map_err(|_| libc::EINVAL)?;
+    let raw_fd = unsafe {
+        libc::syscall(
+            SYS_OPENAT as libc::c_long,
+            AT_FDCWD,
+            path.as_ptr(),
+            flags,
+            0usize,
+        ) as i32
+    };
+    if raw_fd < 0 {
+        return Err(last_errno());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
+}
+
+fn ensure_console_fd(state: &mut BrokerState) -> Result<RawFd, i32> {
+    if state.console_fd.is_none() {
+        stderr_line("runtimed: console open begin");
+        boot_line("runtimed: console open begin");
+        let fd = open_device(CONSOLE_PATH, O_RDWR)?;
+        stderr_line("runtimed: console open done");
+        boot_line("runtimed: console ready");
+        state.console_fd = Some(fd);
+    }
+    Ok(state
+        .console_fd
+        .as_ref()
+        .map(|fd| fd.as_raw_fd())
+        .unwrap_or(-1))
+}
+
+fn ioctl_with_mut<T>(fd: RawFd, request: usize, arg: &mut T) -> Result<(), i32> {
+    let rc = unsafe { libc::syscall(SYS_IOCTL as libc::c_long, fd, request, arg as *mut T) as i32 };
+    if rc < 0 {
+        return Err(last_errno());
+    }
+    Ok(())
+}
+
+fn as_bytes<T>(value: &T) -> &[u8] {
+    unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
+}
+
+fn as_bytes_mut<T>(value: &mut T) -> &mut [u8] {
+    unsafe { std::slice::from_raw_parts_mut((value as *mut T).cast::<u8>(), size_of::<T>()) }
+}

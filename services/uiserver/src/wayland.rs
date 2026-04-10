@@ -20,7 +20,7 @@ use wayland_server::{
 
 use crate::canvas::Rect;
 use crate::sys::{
-    map_shared_fd_readable, raw_stderr_line, InputEvent, SharedFdMapping, INPUT_ACTION_PRESSED,
+    diag_line, map_shared_fd_readable, InputEvent, SharedFdMapping, INPUT_ACTION_PRESSED,
     INPUT_ACTION_RELEASED, INPUT_ACTION_REPEATED, INPUT_KIND_KEYBOARD,
 };
 
@@ -35,7 +35,7 @@ const MAX_WAYLAND_BUFFER_DIMENSION: usize = 8192;
 const MAX_WAYLAND_BUFFER_PIXELS: usize = MAX_WAYLAND_SHM_POOL_BYTES / 4;
 
 fn post_protocol_error<I: Resource>(resource: &I, message: String) {
-    raw_stderr_line(&format!("uiserver: wayland protocol error: {message}"));
+    diag_line(&format!("uiserver: wayland protocol error: {message}"));
     resource.post_error(0_u32, message);
 }
 
@@ -44,6 +44,7 @@ pub(crate) struct WaylandWindowSnapshot {
     pub(crate) surface_id: u32,
     pub(crate) title: String,
     pub(crate) frame: Rect,
+    pub(crate) minimized: bool,
     pub(crate) pixels: Arc<Vec<u32>>,
     pub(crate) width: usize,
     pub(crate) height: usize,
@@ -63,14 +64,14 @@ impl WaylandCompositor {
         let display = match Display::new() {
             Ok(display) => display,
             Err(err) => {
-                raw_stderr_line(&format!("uiserver: wayland display init failed: {err}"));
+                diag_line(&format!("uiserver: wayland display init failed: {err}"));
                 return None;
             }
         };
         let listener = match bind_wayland_listener(runtime_dir.as_str(), socket_path.as_str()) {
             Ok(listener) => listener,
             Err(err) => {
-                raw_stderr_line(&format!(
+                diag_line(&format!(
                     "uiserver: wayland socket bind failed path={} err={err}",
                     socket_path
                 ));
@@ -78,7 +79,7 @@ impl WaylandCompositor {
             }
         };
         if let Err(err) = listener.set_nonblocking(true) {
-            raw_stderr_line(&format!(
+            diag_line(&format!(
                 "uiserver: wayland listener nonblocking failed: {err}"
             ));
             return None;
@@ -97,7 +98,7 @@ impl WaylandCompositor {
                 (),
             );
         }
-        raw_stderr_line(&format!(
+        diag_line(&format!(
             "uiserver: wayland compositor ready on {}/{}",
             runtime_dir, WAYLAND_SOCKET_NAME
         ));
@@ -113,29 +114,35 @@ impl WaylandCompositor {
         loop {
             match self.listener.accept() {
                 Ok((stream, _)) => {
+                    if let Err(err) = stream.set_nonblocking(true) {
+                        diag_line(&format!(
+                            "uiserver: accepted wayland client nonblocking failed: {err}"
+                        ));
+                        continue;
+                    }
                     if let Err(err) = self
                         .display
                         .handle()
                         .insert_client(stream, Arc::new(WaylandClientState))
                     {
-                        raw_stderr_line(&format!("uiserver: wayland insert_client failed: {err}"));
+                        diag_line(&format!("uiserver: wayland insert_client failed: {err}"));
                     } else {
                         self.state.dirty = true;
                     }
                 }
                 Err(err) if err.kind() == ErrorKind::WouldBlock => break,
                 Err(err) => {
-                    raw_stderr_line(&format!("uiserver: wayland accept failed: {err}"));
+                    diag_line(&format!("uiserver: wayland accept failed: {err}"));
                     break;
                 }
             }
         }
 
         if let Err(err) = self.display.dispatch_clients(&mut self.state) {
-            raw_stderr_line(&format!("uiserver: wayland dispatch failed: {err}"));
+            diag_line(&format!("uiserver: wayland dispatch failed: {err}"));
         }
         if let Err(err) = self.display.flush_clients() {
-            raw_stderr_line(&format!("uiserver: wayland flush failed: {err}"));
+            diag_line(&format!("uiserver: wayland flush failed: {err}"));
         }
 
         self.state.take_dirty()
@@ -156,10 +163,30 @@ impl WaylandCompositor {
     pub(crate) fn keyboard_input(&mut self, event: InputEvent) -> bool {
         self.state.keyboard_input(event)
     }
+
+    pub(crate) fn focus_surface(&mut self, surface_id: u32) -> bool {
+        self.state.focus_surface(surface_id)
+    }
+
+    pub(crate) fn move_surface(&mut self, surface_id: u32, x: usize, y: usize) -> bool {
+        self.state.move_surface(surface_id, x, y)
+    }
+
+    pub(crate) fn set_surface_minimized(&mut self, surface_id: u32, minimized: bool) -> bool {
+        self.state.set_surface_minimized(surface_id, minimized)
+    }
+
+    pub(crate) fn close_surface(&mut self, surface_id: u32) -> bool {
+        self.state.close_surface(surface_id)
+    }
+
+    pub(crate) fn clear_focus(&mut self) {
+        self.state.clear_focus();
+    }
 }
 
 fn current_runtime_dir() -> String {
-    std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| String::from("/run/user/1000"))
+    std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| String::from("/run"))
 }
 
 fn bind_wayland_listener(runtime_dir: &str, socket_path: &str) -> std::io::Result<UnixListener> {
@@ -386,6 +413,7 @@ impl WaylandState {
                     .unwrap_or(0),
                 title: surface.title.clone(),
                 frame: surface.frame,
+                minimized: surface.minimized,
                 pixels: surface.pixels.clone(),
                 width: surface.width,
                 height: surface.height,
@@ -519,7 +547,7 @@ impl WaylandState {
             let Ok(surface) = surface.shared.lock() else {
                 continue;
             };
-            if !surface.alive || surface.width == 0 || surface.height == 0 {
+            if !surface.alive || surface.minimized || surface.width == 0 || surface.height == 0 {
                 continue;
             }
             let Some(resource) = surface.resource.clone() else {
@@ -755,6 +783,187 @@ impl WaylandState {
         let surface = self.surfaces.remove(index);
         self.surfaces.push(surface);
     }
+
+    fn find_surface_by_protocol_id(
+        &self,
+        surface_id: u32,
+    ) -> Option<Arc<Mutex<WaylandSurfaceState>>> {
+        self.surfaces.iter().find_map(|surface| {
+            let state = surface.shared.lock().ok()?;
+            let resource = state.resource.as_ref()?;
+            if resource.id().protocol_id() == surface_id {
+                Some(surface.shared.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn clear_focus_for_surface(&mut self, surface_id: u32) {
+        let pointer_matches = self
+            .pointer_focus
+            .as_ref()
+            .map(|focus| focus.surface.id().protocol_id() == surface_id)
+            .unwrap_or(false);
+        if pointer_matches {
+            self.update_pointer_focus(None);
+        }
+
+        let keyboard_matches = self
+            .keyboard_focus
+            .as_ref()
+            .map(|focus| focus.surface.id().protocol_id() == surface_id)
+            .unwrap_or(false);
+        if keyboard_matches {
+            self.set_keyboard_focus(None);
+        }
+    }
+
+    fn retire_surface(
+        &mut self,
+        shared: &Arc<Mutex<WaylandSurfaceState>>,
+        surface_id: u32,
+    ) -> bool {
+        diag_line(&format!(
+            "uiserver: retire_surface begin surface={surface_id}"
+        ));
+        self.clear_focus_for_surface(surface_id);
+        self.pointer_button_down = false;
+        self.sync_surface_output(shared, false);
+        let Ok(mut state) = shared.lock() else {
+            diag_line(&format!(
+                "uiserver: retire_surface lock failed surface={surface_id}"
+            ));
+            return false;
+        };
+        diag_line(&format!(
+            "uiserver: retire_surface state surface={} title={} alive={} minimized={} size={}x{} callbacks={}",
+            surface_id,
+            state.title,
+            state.alive,
+            state.minimized,
+            state.width,
+            state.height,
+            state.pending_callbacks.len()
+        ));
+        state.alive = false;
+        state.minimized = true;
+        state.pixels = Arc::default();
+        state.width = 0;
+        state.height = 0;
+        state.stride_pixels = 0;
+        state.pending_buffer = None;
+        state.pending_callbacks.clear();
+        state.on_output = false;
+        state.needs_initial_configure = false;
+        drop(state);
+        self.mark_dirty();
+        diag_line(&format!(
+            "uiserver: retire_surface end surface={surface_id}"
+        ));
+        true
+    }
+
+    fn focus_surface(&mut self, surface_id: u32) -> bool {
+        let Some(shared) = self.find_surface_by_protocol_id(surface_id) else {
+            return false;
+        };
+        let (resource, client_id) = {
+            let Ok(state) = shared.lock() else {
+                return false;
+            };
+            let Some(resource) = state.resource.clone() else {
+                return false;
+            };
+            let Some(client_id) = state.client_id.clone() else {
+                return false;
+            };
+            (resource, client_id)
+        };
+        self.bring_surface_to_front(resource.id().clone());
+        self.set_keyboard_focus(Some(KeyboardFocus {
+            surface: resource.clone(),
+            client_id,
+        }));
+        self.mark_dirty();
+        true
+    }
+
+    fn move_surface(&mut self, surface_id: u32, x: usize, y: usize) -> bool {
+        let Some(shared) = self.find_surface_by_protocol_id(surface_id) else {
+            return false;
+        };
+        let Ok(mut state) = shared.lock() else {
+            return false;
+        };
+        if state.frame.x == x && state.frame.y == y {
+            return false;
+        }
+        state.frame.x = x;
+        state.frame.y = y;
+        drop(state);
+        self.mark_dirty();
+        true
+    }
+
+    fn set_surface_minimized(&mut self, surface_id: u32, minimized: bool) -> bool {
+        let Some(shared) = self.find_surface_by_protocol_id(surface_id) else {
+            return false;
+        };
+        let Ok(mut state) = shared.lock() else {
+            return false;
+        };
+        if state.minimized == minimized {
+            return false;
+        }
+        state.minimized = minimized;
+        let object_id = state
+            .resource
+            .as_ref()
+            .map(|resource| resource.id().clone());
+        drop(state);
+        if minimized {
+            self.clear_focus_for_surface(surface_id);
+        } else if let Some(object_id) = object_id {
+            self.bring_surface_to_front(object_id);
+        }
+        self.mark_dirty();
+        true
+    }
+
+    fn close_surface(&mut self, surface_id: u32) -> bool {
+        diag_line(&format!(
+            "uiserver: close_surface begin surface={surface_id}"
+        ));
+        let Some(shared) = self.find_surface_by_protocol_id(surface_id) else {
+            diag_line(&format!(
+                "uiserver: close_surface missing surface={surface_id}"
+            ));
+            return false;
+        };
+        let toplevel = shared.lock().ok().and_then(|state| state.toplevel.clone());
+        let retired = self.retire_surface(&shared, surface_id);
+        diag_line(&format!(
+            "uiserver: close_surface retired surface={} retired={} has_toplevel={}",
+            surface_id,
+            retired,
+            toplevel.is_some()
+        ));
+        let Some(toplevel) = toplevel else {
+            return retired;
+        };
+        toplevel.close();
+        diag_line(&format!(
+            "uiserver: close_surface close_sent surface={surface_id}"
+        ));
+        retired
+    }
+
+    fn clear_focus(&mut self) {
+        self.update_pointer_focus(None);
+        self.set_keyboard_focus(None);
+        self.pointer_button_down = false;
+    }
 }
 
 #[derive(Clone)]
@@ -817,6 +1026,7 @@ impl PointerFocus {
 struct WaylandSurfaceState {
     title: String,
     frame: Rect,
+    minimized: bool,
     resource: Option<wl_surface::WlSurface>,
     client_id: Option<ClientId>,
     xdg_surface: Option<xdg_surface::XdgSurface>,
@@ -1396,7 +1606,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
                                         height.max(surface.frame.height.min(height));
                                     mapped = true;
                                 } else {
-                                    raw_stderr_line(
+                                    diag_line(
                                         "uiserver: rejecting wl_shm buffer during commit due to invalid layout",
                                     );
                                 }
@@ -1436,17 +1646,14 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
     fn destroyed(
         state: &mut Self,
         _client: wayland_server::backend::ClientId,
-        _resource: &wl_surface::WlSurface,
+        resource: &wl_surface::WlSurface,
         data: &SurfaceData,
     ) {
-        state.sync_surface_output(&data.shared, false);
-        if let Ok(mut surface) = data.shared.lock() {
-            surface.alive = false;
-            surface.pixels = Arc::default();
-            surface.pending_callbacks.clear();
-            surface.on_output = false;
-        }
-        state.mark_dirty();
+        diag_line(&format!(
+            "uiserver: wl_surface destroyed surface={}",
+            resource.id().protocol_id()
+        ));
+        let _ = state.retire_surface(&data.shared, resource.id().protocol_id());
     }
 }
 
@@ -1574,17 +1781,24 @@ impl Dispatch<xdg_toplevel::XdgToplevel, SurfaceData> for WaylandState {
                 state.send_toplevel_configure(&data.shared);
             }
             xdg_toplevel::Request::Destroy => {
-                state.sync_surface_output(&data.shared, false);
+                let surface_id = data.shared.lock().ok().and_then(|surface| {
+                    surface
+                        .resource
+                        .as_ref()
+                        .map(|resource| resource.id().protocol_id())
+                });
+                diag_line(&format!(
+                    "uiserver: xdg_toplevel destroy surface={:?}",
+                    surface_id
+                ));
                 if let Ok(mut surface) = data.shared.lock() {
                     surface.toplevel = None;
-                    surface.pixels = Arc::default();
-                    surface.width = 0;
-                    surface.height = 0;
-                    surface.stride_pixels = 0;
-                    surface.on_output = false;
-                    surface.needs_initial_configure = false;
                 }
-                state.mark_dirty();
+                if let Some(surface_id) = surface_id {
+                    let _ = state.retire_surface(&data.shared, surface_id);
+                } else {
+                    state.mark_dirty();
+                }
             }
             _ => {}
         }

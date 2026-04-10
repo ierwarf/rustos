@@ -1,69 +1,87 @@
-use std::os::fd::{AsRawFd, OwnedFd};
 use std::string::String;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
-use crate::app::{HIDDEN_RUNTIME_PROGRAM_TITLES, MAX_REGISTERED_PROGRAMS, MAX_RUNNING_PROGRAMS};
-use crate::sys::{
-    runtime_generation, runtime_snapshot_programs, runtime_snapshot_running_programs,
-    RuntimeProgram, RuntimeRunningProgram,
-};
+use runtime_control::{decode_c_string, RuntimeClient, RuntimeRunningProgram};
+
+use crate::app::{HIDDEN_RUNTIME_PROGRAM_TITLES, MAX_RUNNING_PROGRAMS};
+
+const RUNTIME_SYNC_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 pub(crate) struct RuntimeState {
-    pub(crate) generation: u64,
     pub(crate) running_programs: [RuntimeRunningProgram; MAX_RUNNING_PROGRAMS],
     pub(crate) running_program_count: usize,
-    pub(crate) registered_programs: [RuntimeProgram; MAX_REGISTERED_PROGRAMS],
-    pub(crate) registered_program_count: usize,
+    pub(crate) generation: u64,
     pub(crate) dirty: bool,
 }
 
 impl Default for RuntimeState {
     fn default() -> Self {
         Self {
-            generation: 0,
             running_programs: [RuntimeRunningProgram::default(); MAX_RUNNING_PROGRAMS],
             running_program_count: 0,
-            registered_programs: [RuntimeProgram::default(); MAX_REGISTERED_PROGRAMS],
-            registered_program_count: 0,
+            generation: 0,
             dirty: false,
         }
     }
 }
 
+#[derive(Clone, Default)]
+struct SharedRuntimeState {
+    running_programs: [RuntimeRunningProgram; MAX_RUNNING_PROGRAMS],
+    running_program_count: usize,
+    generation: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct RuntimeSyncHandle {
+    shared: Arc<Mutex<SharedRuntimeState>>,
+}
+
+pub(crate) fn start_runtime_sync(runtime: RuntimeClient) -> RuntimeSyncHandle {
+    let shared = Arc::new(Mutex::new(SharedRuntimeState::default()));
+    let worker_shared = Arc::clone(&shared);
+    thread::spawn(move || runtime_sync_worker(runtime, worker_shared));
+    RuntimeSyncHandle { shared }
+}
+
 pub(crate) fn refresh_runtime_state(
-    runtime_fd: &OwnedFd,
+    sync: &RuntimeSyncHandle,
     runtime_state: &mut RuntimeState,
 ) -> Result<bool, i32> {
-    let generation = runtime_generation(runtime_fd.as_raw_fd())?;
-    if generation == runtime_state.generation && runtime_state.generation != 0 {
+    let snapshot = sync.shared.lock().unwrap().clone();
+    if snapshot.generation == runtime_state.generation {
         return Ok(false);
     }
 
-    let mut registered_programs = [RuntimeProgram::default(); MAX_REGISTERED_PROGRAMS];
-    let registered_count =
-        runtime_snapshot_programs(runtime_fd.as_raw_fd(), &mut registered_programs)?
-            .min(MAX_REGISTERED_PROGRAMS);
-    let mut running_programs = [RuntimeRunningProgram::default(); MAX_RUNNING_PROGRAMS];
-    let running_count =
-        runtime_snapshot_running_programs(runtime_fd.as_raw_fd(), &mut running_programs)?
-            .min(MAX_RUNNING_PROGRAMS);
-    let running_changed = generation != runtime_state.generation
-        || running_count != runtime_state.running_program_count
-        || runtime_state.running_programs[..running_count] != running_programs[..running_count];
-    let registered_changed = registered_count != runtime_state.registered_program_count
-        || runtime_state.registered_programs[..registered_count]
-            != registered_programs[..registered_count];
-    if !running_changed && !registered_changed {
-        return Ok(false);
-    }
-
-    runtime_state.generation = generation;
-    runtime_state.running_programs = running_programs;
-    runtime_state.running_program_count = running_count;
-    runtime_state.registered_programs = registered_programs;
-    runtime_state.registered_program_count = registered_count;
+    runtime_state.running_programs = snapshot.running_programs;
+    runtime_state.running_program_count = snapshot.running_program_count;
+    runtime_state.generation = snapshot.generation;
     runtime_state.dirty = true;
     Ok(true)
+}
+
+fn runtime_sync_worker(runtime: RuntimeClient, shared: Arc<Mutex<SharedRuntimeState>>) {
+    loop {
+        if let Ok(snapshot) = runtime.snapshot_running_programs() {
+            let mut running_programs = [RuntimeRunningProgram::default(); MAX_RUNNING_PROGRAMS];
+            let running_count = snapshot.len().min(MAX_RUNNING_PROGRAMS);
+            running_programs[..running_count].copy_from_slice(&snapshot[..running_count]);
+
+            let mut shared = shared.lock().unwrap();
+            let changed = running_count != shared.running_program_count
+                || shared.running_programs[..running_count] != running_programs[..running_count];
+            if changed {
+                shared.running_programs = running_programs;
+                shared.running_program_count = running_count;
+                shared.generation = shared.generation.wrapping_add(1).max(1);
+            }
+        }
+
+        thread::sleep(RUNTIME_SYNC_INTERVAL);
+    }
 }
 
 pub(crate) fn runtime_program_title(program: &RuntimeRunningProgram) -> String {
@@ -84,21 +102,5 @@ pub(crate) fn runtime_title_is_hidden(title: &str) -> bool {
 pub(crate) fn runtime_program_display_name(
     program: &RuntimeRunningProgram,
 ) -> std::borrow::Cow<'_, str> {
-    let end = program
-        .display_name
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(program.display_name.len());
-    let bytes = &program.display_name[..end];
-    String::from_utf8_lossy(bytes)
-}
-
-pub(crate) fn runtime_program_name(program: &RuntimeProgram) -> std::borrow::Cow<'_, str> {
-    let end = program
-        .display_name
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(program.display_name.len());
-    let bytes = &program.display_name[..end];
-    String::from_utf8_lossy(bytes)
+    std::borrow::Cow::Owned(decode_c_string(&program.display_name))
 }

@@ -1,0 +1,7 @@
+[package]
+name = "kernel-lowlevel"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+x86_64 = { version = "0.15.4", default-features = false, features = ["instructions", "abi_x86_interrupt"] }

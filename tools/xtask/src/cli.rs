@@ -22,6 +22,10 @@ enum XtaskCommand {
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         args: Vec<String>,
     },
+    Debug {
+        #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
+        args: Vec<String>,
+    },
     #[command(name = "probe-display")]
     ProbeDisplay {
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
@@ -60,6 +64,7 @@ pub(crate) fn run() -> Result<()> {
         Some(XtaskCommand::Check) => build::check(&config),
         Some(XtaskCommand::Clean) => build::clean(&config),
         Some(XtaskCommand::Run { args }) => qemu::run_qemu_command(&config, args.into_iter()),
+        Some(XtaskCommand::Debug { args }) => qemu::debug_qemu_command(&config, args.into_iter()),
         Some(XtaskCommand::ProbeDisplay { args }) => {
             qemu::probe_display_command(&config, args.into_iter())
         }
@@ -67,7 +72,7 @@ pub(crate) fn run() -> Result<()> {
         Some(XtaskCommand::Targets) => build::ensure_targets(&config),
         Some(XtaskCommand::BuildEfi) => build::build_efi(&config),
         Some(XtaskCommand::BuildPrekernel) => build::build_prekernel(&config),
-        Some(XtaskCommand::BuildKernel) => build::build_kernel(&config),
+        Some(XtaskCommand::BuildKernel) => build::build_nucleus(&config),
         Some(XtaskCommand::BuildUser) => build::build_user(&config),
         Some(XtaskCommand::BuildConsoleDemo) => build::build_console_demo(&config),
         Some(XtaskCommand::BuildDriverModules) => build::build_driver_modules(&config),

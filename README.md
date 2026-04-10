@@ -8,7 +8,7 @@
 
 - `assets/image/`: staged 부팅 이미지에 그대로 덮어쓸 정적 overlay
 - `boot/bootloader/`: UEFI 부트로더와 boot protocol
-- `boot/prekernel/`: `kernel.elf` 적재와 초기 KASLR 적용
+- `boot/prekernel/`: `nucleus.elf` 적재와 초기 KASLR 적용
 - `core/kernel/`: 커널 본체
 - `system/packages/`: native 서비스와 앱 소스
 - `compat/windows/user/`: Windows userland 호환 DLL/runtime 소스

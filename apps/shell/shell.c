@@ -6,6 +6,29 @@
 #include <string.h>
 #include <unistd.h>
 
+#define SYS_RUSTOS_DEBUG_PRINT 0x52550001UL
+
+static void debug_line(const char *message) {
+    size_t len = strlen(message);
+    if (len != 0) {
+        long ignored;
+        __asm__ volatile(
+            "syscall"
+            : "=a"(ignored)
+            : "a"(SYS_RUSTOS_DEBUG_PRINT), "D"(message), "S"(len)
+            : "rcx", "r11", "memory");
+    }
+    {
+        static const char newline = '\n';
+        long ignored;
+        __asm__ volatile(
+            "syscall"
+            : "=a"(ignored)
+            : "a"(SYS_RUSTOS_DEBUG_PRINT), "D"(&newline), "S"(1UL)
+            : "rcx", "r11", "memory");
+    }
+}
+
 static void print_prompt(void) {
     char cwd[PATH_MAX];
     if (getcwd(cwd, sizeof(cwd)) == NULL) {
@@ -53,6 +76,11 @@ static void command_pwd(void) {
 int main(void) {
     char line[256];
 
+    fprintf(stderr, "shell: main enter\n");
+    fflush(stderr);
+    debug_line("shell: main enter");
+    fprintf(stderr, "shell: stdio ready\n");
+    fflush(stderr);
     printf("rustos shell ready\r\n");
     printf("builtins: cd, ls, pwd, exit\r\n");
     fflush(stdout);

@@ -97,6 +97,9 @@ checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 [[package]]
 name = "boot-protocol"
 version = "0.1.0"
+dependencies = [
+ "diag-abi",
+]
 
 [[package]]
 name = "boot-random"
@@ -113,6 +116,7 @@ name = "bootloader"
 version = "0.1.0"
 dependencies = [
  "boot-protocol",
+ "diag-abi",
  "object",
  "raw-cpuid",
  "storage-core",
@@ -137,9 +141,9 @@ checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
 name = "cc"
-version = "1.2.58"
+version = "1.2.59"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1e928d4b69e3077709075a938a05ffbedfa53a84c8f766efbf8220bb1ff60e1"
+checksum = "b7a4d3ec6524d28a329fc53654bbadc9bdd7b0431f5d65f1a56ffb28a1ee5283"
 dependencies = [
  "find-msvc-tools",
  "shlex",
@@ -199,9 +203,9 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "const_fn"
-version = "0.4.11"
+version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f8a2ca5ac02d09563609681103aada9e1777d54fc57a5acd7a41404f9c93b6e"
+checksum = "413d67b29ef1021b4d60f4aa1e925ca031751e213832b4b1d588fae623c05c60"
 
 [[package]]
 name = "crc32fast"
@@ -210,6 +214,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "debugctl"
+version = "0.1.0"
+dependencies = [
+ "diag-abi",
+ "libc",
+]
+
+[[package]]
+name = "debugd"
+version = "0.1.0"
+dependencies = [
+ "diag-abi",
+ "libc",
+]
+
+[[package]]
+name = "diag-abi"
+version = "0.1.0"
+
+[[package]]
+name = "diag-client"
+version = "0.1.0"
+dependencies = [
+ "diag-abi",
+ "libc",
 ]
 
 [[package]]
@@ -271,7 +303,7 @@ dependencies = [
 [[package]]
 name = "fatfs"
 version = "0.4.0"
-source = "git+https://github.com/rafalh/rust-fatfs#4eccb50d011146fbed20e133d33b22f3c27292e7"
+source = "git+https://github.com/rafalh/rust-fatfs#c4b88477b22ca7e5131fbd8891f62a5deaa88e6e"
 dependencies = [
  "bitflags",
  "log",
@@ -342,9 +374,9 @@ dependencies = [
 
 [[package]]
 name = "indexmap"
-version = "2.13.0"
+version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7714e70437a7dc3ac8eb7e6f8df75fd8eb422675fc7678aff7364301092b1017"
+checksum = "45a8a2b9cb3e0b0c1803dbb0758ffac5de2f425b23c28f518faabd9d805342ff"
 dependencies = [
  "equivalent",
  "hashbrown 0.16.1",
@@ -354,12 +386,17 @@ dependencies = [
 name = "initd"
 version = "0.1.0"
 dependencies = [
+ "diag-client",
+ "libc",
  "runtime-control",
 ]
 
 [[package]]
 name = "inputd"
 version = "0.1.0"
+dependencies = [
+ "diag-client",
+]
 
 [[package]]
 name = "is_terminal_polyfill"
@@ -368,7 +405,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
-name = "kernel"
+name = "kernel-base"
 version = "0.1.0"
 dependencies = [
  "bitflags",
@@ -377,10 +414,12 @@ dependencies = [
  "buddy_system_allocator",
  "byteorder",
  "crc32fast",
+ "diag-abi",
  "driver-abi",
  "embedded-graphics",
  "fatfs",
  "hidreport",
+ "kernel-lowlevel",
  "keyboard-core",
  "lazy_static",
  "linux-raw-sys",
@@ -398,6 +437,117 @@ dependencies = [
  "xmas-elf 0.9.1",
  "zune-core",
  "zune-jpeg",
+]
+
+[[package]]
+name = "kernel-compat"
+version = "0.1.0"
+dependencies = [
+ "kernel-base",
+ "kernel-io-manager",
+ "kernel-ipc-runtime",
+ "kernel-mm",
+ "kernel-object",
+ "kernel-ps",
+]
+
+[[package]]
+name = "kernel-executive"
+version = "0.1.0"
+dependencies = [
+ "boot-protocol",
+ "diag-abi",
+ "driver-abi",
+ "kernel-base",
+ "kernel-compat",
+ "kernel-hal",
+ "kernel-io-manager",
+ "kernel-mm",
+ "kernel-object",
+ "kernel-ps",
+ "x86_64",
+]
+
+[[package]]
+name = "kernel-hal"
+version = "0.1.0"
+dependencies = [
+ "boot-protocol",
+ "diag-abi",
+ "kernel-base",
+ "kernel-lowlevel",
+ "lazy_static",
+ "pic8259",
+ "spin 0.10.0",
+ "x86_64",
+]
+
+[[package]]
+name = "kernel-io-manager"
+version = "0.1.0"
+dependencies = [
+ "boot-protocol",
+ "driver-abi",
+ "kernel-base",
+ "kernel-ipc-runtime",
+ "kernel-mm",
+ "kernel-object",
+ "kernel-ps",
+ "keyboard-core",
+ "storage-core",
+]
+
+[[package]]
+name = "kernel-ipc-runtime"
+version = "0.1.0"
+dependencies = [
+ "kernel-base",
+ "kernel-mm",
+ "kernel-object",
+ "spin 0.10.0",
+ "x86_64",
+]
+
+[[package]]
+name = "kernel-lowlevel"
+version = "0.1.0"
+dependencies = [
+ "x86_64",
+]
+
+[[package]]
+name = "kernel-mm"
+version = "0.1.0"
+dependencies = [
+ "boot-protocol",
+ "buddy_system_allocator",
+ "kernel-base",
+ "kernel-hal",
+ "kernel-lowlevel",
+ "object",
+ "spin 0.10.0",
+ "x86_64",
+]
+
+[[package]]
+name = "kernel-object"
+version = "0.1.0"
+dependencies = [
+ "kernel-base",
+]
+
+[[package]]
+name = "kernel-ps"
+version = "0.1.0"
+dependencies = [
+ "diag-abi",
+ "kernel-base",
+ "kernel-lowlevel",
+ "kernel-mm",
+ "kernel-object",
+ "spin 0.10.0",
+ "trace-loc-macro",
+ "x86_64",
 ]
 
 [[package]]
@@ -464,6 +614,18 @@ dependencies = [
  "boot-random",
  "driver-abi",
  "keyboard-core",
+]
+
+[[package]]
+name = "nucleus"
+version = "0.1.0"
+dependencies = [
+ "boot-protocol",
+ "kernel-base",
+ "kernel-executive",
+ "kernel-hal",
+ "kernel-mm",
+ "x86_64",
 ]
 
 [[package]]
@@ -544,6 +706,7 @@ dependencies = [
  "boot-protocol",
  "boot-random",
  "buddy_system_allocator",
+ "diag-abi",
  "embedded-graphics",
  "fatfs",
  "object",
@@ -630,6 +793,15 @@ name = "runtime-control"
 version = "0.1.0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "runtimed"
+version = "0.1.0"
+dependencies = [
+ "diag-client",
+ "libc",
+ "runtime-control",
 ]
 
 [[package]]
@@ -725,6 +897,7 @@ dependencies = [
 name = "sessiond"
 version = "0.1.0"
 dependencies = [
+ "diag-client",
  "runtime-control",
 ]
 
@@ -774,6 +947,9 @@ dependencies = [
 [[package]]
 name = "storaged"
 version = "0.1.0"
+dependencies = [
+ "diag-client",
+]
 
 [[package]]
 name = "strsim"
@@ -935,8 +1111,11 @@ checksum = "0c8352f8c05e47892e7eaf13b34abd76a7f4aeaf817b716e88789381927f199c"
 name = "uiserver"
 version = "0.1.0"
 dependencies = [
+ "diag-client",
  "embedded-graphics",
  "fontdue",
+ "keyboard-core",
+ "runtime-control",
  "vte",
  "wayland-protocols",
  "wayland-server",
@@ -1157,18 +1336,18 @@ checksum = "2fe21bcc34ca7fe6dd56cc2cb1261ea59d6b93620215aefb5ea6032265527784"
 
 [[package]]
 name = "zerocopy"
-version = "0.8.42"
+version = "0.8.48"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2578b716f8a7a858b7f02d5bd870c14bf4ddbbcf3a4c05414ba6503640505e3"
+checksum = "eed437bf9d6692032087e337407a86f04cd8d6a16a37199ed57949d415bd68e9"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.42"
+version = "0.8.48"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e6cc098ea4d3bd6246687de65af3f920c430e236bee1e3bf2e441463f08a02f"
+checksum = "70e3cd084b1788766f53af483dd21f93881ff30d7320490ec3ef7526d203bad4"
 dependencies = [
  "proc-macro2",
  "quote",

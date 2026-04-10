@@ -1,0 +1,23 @@
+id = "debugd"
+kind = "service"
+execution_domain = "user"
+profiles = ["default"]
+startup = "init"
+
+[build]
+builder = "cargo-kernel-binary"
+package = "debugd"
+
+[install]
+path = "services/debugd/debugd.elf"
+
+[boot]
+preload = true
+required = false
+priority = -700
+
+[[desktop.entries]]
+display_name = "debugd"
+weight_micros = 50
+logical_admin = true
+console_hosted = false

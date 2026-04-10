@@ -115,6 +115,7 @@ pub(crate) fn terminal_line_height() -> usize {
     TERMINAL_ATLAS.line_height
 }
 
+#[allow(dead_code)]
 pub(crate) fn measure_text(text: &str, style: TextStyle) -> usize {
     let atlas = atlas_for_style(style);
     let mut width = 0usize;
@@ -161,6 +162,51 @@ pub(crate) fn draw_text(
         } else {
             glyph.advance.saturating_add(style.tracking_px)
         });
+    }
+}
+
+pub(crate) fn draw_text_clipped(
+    canvas: &mut SurfaceCanvas<'_>,
+    x: usize,
+    y: usize,
+    text: &str,
+    max_width: usize,
+    style: TextStyle,
+) {
+    let atlas = atlas_for_style(style);
+    let mut cursor_x = x;
+    let limit_x = x.saturating_add(max_width);
+    for ch in text.chars() {
+        let glyph = atlas.glyph(ch);
+        let advance = if atlas.monospace {
+            atlas.cell_width
+        } else {
+            glyph.advance.saturating_add(style.tracking_px)
+        };
+        if cursor_x >= limit_x {
+            break;
+        }
+        let draw_width = if atlas.monospace {
+            atlas.cell_width
+        } else {
+            glyph.width
+        };
+        if cursor_x.saturating_add(draw_width) > limit_x {
+            break;
+        }
+        let start = glyph.atlas_offset;
+        let end = start.saturating_add(glyph.width.saturating_mul(glyph.height));
+        if end <= atlas.alpha.len() && glyph.width != 0 && glyph.height != 0 {
+            canvas.blit_alpha_mask(
+                &atlas.alpha[start..end],
+                glyph.width,
+                glyph.height,
+                cursor_x,
+                y,
+                style.color,
+            );
+        }
+        cursor_x = cursor_x.saturating_add(advance);
     }
 }
 

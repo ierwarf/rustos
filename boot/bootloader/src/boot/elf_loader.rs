@@ -20,6 +20,7 @@ const MAX_KERNEL_LOAD_END_EXCLUSIVE: usize = 512 * 1024 * 1024 * 1024;
 const LOAD_CHUNK_SIZE: usize = 4096;
 const ELF64_DYNAMIC_ENTRY_SIZE: usize = 16;
 const ELF64_RELA_ENTRY_SIZE: usize = 24;
+const MAX_DYNAMIC_RELOCATIONS: usize = 262144;
 const DT_NULL: i64 = 0;
 const DT_RELA: i64 = 7;
 const DT_RELASZ: i64 = 8;
@@ -104,6 +105,11 @@ pub(crate) fn load_kernel_elf(
 
     for ph in program_headers.iter() {
         if ph.ty == objelf::PT_DYNAMIC {
+            if dynamic_segment.is_some() {
+                return Err(BootError::InvalidElf(
+                    "ELF contains multiple PT_DYNAMIC segments",
+                ));
+            }
             dynamic_segment = Some(dynamic_segment_info(&header, ph, load_bias)?);
             continue;
         }
@@ -187,13 +193,13 @@ struct SegmentLoadInfo {
     file_size: usize,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct DynamicSegmentInfo {
     addr: usize,
     size: usize,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct DynamicRelocationTable {
     addr: usize,
     size: usize,
@@ -438,6 +444,11 @@ fn dynamic_segment_info(
         .map_err(|_| BootError::InvalidElf("dynamic segment size is out of range"))?;
     if size == 0 {
         return Err(BootError::InvalidElf("PT_DYNAMIC segment has zero size"));
+    }
+    if size % ELF64_DYNAMIC_ENTRY_SIZE != 0 {
+        return Err(BootError::InvalidElf(
+            "PT_DYNAMIC segment size is not entry aligned",
+        ));
     }
     let addr = relocate_image_addr(header, ph.virtual_addr, load_bias)?;
     let end = addr
@@ -799,6 +810,11 @@ fn parse_dynamic_relocation_table(
         _ => return Ok(DynamicRelocationTable { addr: 0, size: 0 }),
     };
     let rela_size = rela_size.unwrap_or(0);
+    if rela_size / ELF64_RELA_ENTRY_SIZE > MAX_DYNAMIC_RELOCATIONS {
+        return Err(BootError::InvalidElf(
+            "dynamic relocation table exceeds hard cap",
+        ));
+    }
     Ok(DynamicRelocationTable {
         addr: rela_addr,
         size: rela_size,
@@ -846,6 +862,68 @@ fn read_u64_from_memory(addr: usize) -> u64 {
 
 fn write_u64_to_memory(addr: usize, value: u64) {
     unsafe { ptr::write_unaligned(addr as *mut u64, value) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_header(elf_type: u16) -> ElfHeader {
+        ElfHeader {
+            elf_type,
+            entry_point: MIN_KERNEL_LOAD_ADDR as u64,
+            program_header_offset: ELF64_HEADER_SIZE as u64,
+            program_header_size: ELF64_PROGRAM_HEADER_SIZE,
+            program_header_count: 1,
+        }
+    }
+
+    #[test]
+    fn dynamic_segment_rejects_misaligned_size() {
+        let header = valid_header(objelf::ET_DYN);
+        let ph = ProgramHeader {
+            ty: objelf::PT_DYNAMIC,
+            flags: 0,
+            offset: 0,
+            virtual_addr: 0x2000,
+            physical_addr: 0,
+            file_size: 0,
+            mem_size: (ELF64_DYNAMIC_ENTRY_SIZE + 1) as u64,
+            align: 8,
+        };
+
+        let err = dynamic_segment_info(&header, &ph, 0x40_0000).expect_err("misaligned PT_DYNAMIC");
+        assert!(matches!(
+            err,
+            BootError::InvalidElf("PT_DYNAMIC segment size is not entry aligned")
+        ));
+    }
+
+    #[test]
+    fn dynamic_relocation_table_rejects_hard_cap_overflow() {
+        let header = valid_header(objelf::ET_DYN);
+        let mut dynamic = [0u8; ELF64_DYNAMIC_ENTRY_SIZE * 3];
+        dynamic[0..8].copy_from_slice(&DT_RELA.to_le_bytes());
+        dynamic[8..16].copy_from_slice(&(0x1000u64).to_le_bytes());
+        dynamic[16..24].copy_from_slice(&DT_RELASZ.to_le_bytes());
+        dynamic[24..32].copy_from_slice(
+            &(((MAX_DYNAMIC_RELOCATIONS + 1) * ELF64_RELA_ENTRY_SIZE) as u64).to_le_bytes(),
+        );
+        dynamic[32..40].copy_from_slice(&DT_RELAENT.to_le_bytes());
+        dynamic[40..48].copy_from_slice(&(ELF64_RELA_ENTRY_SIZE as u64).to_le_bytes());
+
+        let dynamic_segment = DynamicSegmentInfo {
+            addr: dynamic.as_ptr() as usize,
+            size: dynamic.len(),
+        };
+
+        let err = parse_dynamic_relocation_table(&header, &dynamic_segment, 0)
+            .expect_err("oversized relocation table must fail");
+        assert!(matches!(
+            err,
+            BootError::InvalidElf("dynamic relocation table exceeds hard cap")
+        ));
+    }
 }
 
 fn align_down(value: usize, align: usize) -> usize {

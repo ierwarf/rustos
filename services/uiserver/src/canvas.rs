@@ -176,6 +176,10 @@ impl<'a> SurfaceCanvas<'a> {
         }
     }
 
+    pub(crate) fn clip_rect(&self) -> Rect {
+        self.clip_rect
+    }
+
     pub(crate) fn fill_rect(&mut self, rect: Rect, color: u32) {
         let rect = rect.intersect(self.clip_rect);
         if rect.is_empty() {

@@ -161,6 +161,19 @@ where
     run_display_probe(config, options)
 }
 
+pub(crate) fn debug_qemu_command<I>(config: &Config, mut args: I) -> Result<()>
+where
+    I: Iterator<Item = String>,
+{
+    let Some(mut options) = parse_run_options(&mut args, print_run_help)? else {
+        return Ok(());
+    };
+    append_unique_string(&mut options.qemu_user_args, String::from("-s"));
+    append_unique_string(&mut options.qemu_user_args, String::from("-S"));
+    write_gdb_helper(config)?;
+    run_qemu_with_options(config, options)
+}
+
 fn parse_run_options<I>(args: &mut I, help: fn()) -> Result<Option<RunOptions>>
 where
     I: Iterator<Item = String>,
@@ -241,6 +254,35 @@ fn run_qemu_with_options(config: &Config, options: RunOptions) -> Result<()> {
     } else {
         Err(format!("QEMU exited with status {status}").into())
     }
+}
+
+fn write_gdb_helper(config: &Config) -> Result<()> {
+    fs::create_dir_all(&config.logs_dir)?;
+    let script_path = config.logs_dir.join("rustos-debug.gdb");
+    let script = format!(
+        "\
+set pagination off
+set confirm off
+set architecture i386:x86-64
+file {}
+target remote :1234
+
+# Prekernel is linked at a fixed image base by xtask.
+add-symbol-file {} 0x100000
+
+echo Connected to RustOS debug target.\n
+echo Nucleus symbols: {}\n
+echo Prekernel symbols: {}\n
+echo Module symbols can be loaded from /dev/debug0 snapshots once the guest is up.\n
+",
+        config.artifact_nucleus_elf_path().display(),
+        config.artifact_prekernel_elf_path().display(),
+        config.artifact_nucleus_elf_path().display(),
+        config.artifact_prekernel_elf_path().display(),
+    );
+    fs::write(&script_path, script)?;
+    println!("gdb helper written to {}", script_path.display());
+    Ok(())
 }
 
 fn ensure_qemu_prerequisites(config: &Config) -> Result<()> {
@@ -852,7 +894,20 @@ fn run_display_probe(config: &Config, options: RunOptions) -> Result<()> {
             .into());
         }
 
-        run_probe_mouse_stress(&mut qmp, &debugcon_log)?;
+        if let Ok(info) = qmp_hmp_capture(&mut qmp, "info mice", Instant::now() + PROBE_QMP_TIMEOUT)
+        {
+            println!("probe info mice:\n{info}");
+        }
+
+        run_probe_mouse_stress(
+            &mut qmp,
+            &debugcon_log,
+            if prepared.usb_args.is_empty() {
+                None
+            } else {
+                Some("usbtablet")
+            },
+        )?;
 
         let stressed_dump = prepared.session.temp_dir.join("probe-stressed.ppm");
         qmp_screendump(&mut qmp, &stressed_dump)?;
@@ -928,7 +983,11 @@ fn wait_for_boot_marker(log_path: &Path, marker: &str, timeout: Duration) -> Res
     }
 }
 
-fn run_probe_mouse_stress(qmp: &mut UnixStream, debugcon_log: &Path) -> Result<()> {
+fn run_probe_mouse_stress(
+    qmp: &mut UnixStream,
+    debugcon_log: &Path,
+    input_device: Option<&str>,
+) -> Result<()> {
     let stress_duration =
         probe_duration_env("RUSTOS_PROBE_STRESS_MS", PROBE_STRESS_DURATION_DEFAULT);
     let heartbeat_stall = probe_duration_env(
@@ -995,6 +1054,7 @@ fn run_probe_mouse_stress(qmp: &mut UnixStream, debugcon_log: &Path) -> Result<(
             x as u16,
             y as u16,
             button,
+            input_device,
             Instant::now() + PROBE_QMP_TIMEOUT,
         )?;
         thread::sleep(PROBE_STEP_DELAY);
@@ -1005,6 +1065,7 @@ fn run_probe_mouse_stress(qmp: &mut UnixStream, debugcon_log: &Path) -> Result<(
         x as u16,
         y as u16,
         Some(false),
+        input_device,
         Instant::now() + PROBE_QMP_TIMEOUT,
     )?;
     thread::sleep(Duration::from_millis(200));
@@ -1016,6 +1077,7 @@ fn qmp_input_send_pointer_abs(
     x: u16,
     y: u16,
     button_down: Option<bool>,
+    _input_device: Option<&str>,
     deadline: Instant,
 ) -> Result<()> {
     let mut events = format!(
@@ -1027,20 +1089,35 @@ fn qmp_input_send_pointer_abs(
             if down { "true" } else { "false" }
         ));
     }
+
     let command = format!(
-        r#"{{"execute":"input-send-event","arguments":{{"events":[{}]}}}}"#,
-        events
+        r#"{{"execute":"input-send-event","arguments":{{{}}}}}"#,
+        format!(r#""events":[{}]"#, events)
     );
     qmp_execute(qmp, &command, deadline)
 }
 
 fn latest_kernel_alive_second(log_path: &Path) -> Option<u64> {
     let log = fs::read_to_string(log_path).ok()?;
-    log.lines()
-        .rev()
-        .find_map(|line| line.strip_prefix("kernel alive: second="))
-        .and_then(|rest| rest.split_whitespace().next())
-        .and_then(|value| value.parse::<u64>().ok())
+    log.lines().rev().find_map(parse_kernel_alive_second)
+}
+
+fn parse_kernel_alive_second(line: &str) -> Option<u64> {
+    if let Some(rest) = line.strip_prefix("kernel alive: second=") {
+        return rest
+            .split_whitespace()
+            .next()
+            .and_then(|value| value.parse::<u64>().ok());
+    }
+
+    if let Some(rest) = line.strip_prefix("second=") {
+        return rest
+            .split_whitespace()
+            .next()
+            .and_then(|value| value.parse::<u64>().ok());
+    }
+
+    None
 }
 
 fn probe_duration_env(name: &str, default: Duration) -> Duration {
@@ -1068,26 +1145,28 @@ fn qmp_quit(qmp: &mut UnixStream) -> Result<()> {
     Ok(())
 }
 
-fn qmp_hmp(qmp: &mut UnixStream, command_line: &str, deadline: Instant) -> Result<()> {
+fn qmp_hmp_capture(qmp: &mut UnixStream, command_line: &str, deadline: Instant) -> Result<String> {
     let command = format!(
         r#"{{"execute":"human-monitor-command","arguments":{{"command-line":"{}"}}}}"#,
         json_escape(command_line)
     );
-    qmp_execute(qmp, &command, deadline)
+    qmp.write_all(command.as_bytes())?;
+    qmp.write_all(b"\n")?;
+    wait_for_qmp_return_message(qmp, deadline)
 }
 
 fn qmp_execute(qmp: &mut UnixStream, command: &str, deadline: Instant) -> Result<()> {
     qmp.write_all(command.as_bytes())?;
     qmp.write_all(b"\n")?;
-    wait_for_qmp_return(qmp, deadline)?;
+    let _ = wait_for_qmp_return_message(qmp, deadline)?;
     Ok(())
 }
 
-fn wait_for_qmp_return(qmp: &mut UnixStream, deadline: Instant) -> Result<()> {
+fn wait_for_qmp_return_message(qmp: &mut UnixStream, deadline: Instant) -> Result<String> {
     loop {
         let message = read_qmp_message(qmp, deadline)?;
         if message.contains("\"return\"") {
-            return Ok(());
+            return Ok(message);
         }
         if message.contains("\"error\"") {
             return Err(format!("QMP command failed: {message}").into());

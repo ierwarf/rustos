@@ -15,6 +15,7 @@ use crate::stage;
 use crate::util::{
     command_in_path, copy_with_parent, create_temp_dir, kernel_rustflags_env, remove_dir_if_exists,
     remove_file_if_exists, run_cargo_kernel_check, run_cargo_kernel_rustc, run_command, shell,
+    strip_elf_artifact_if_available,
 };
 
 pub(crate) fn build(config: &Config) -> Result<()> {
@@ -27,7 +28,7 @@ pub(crate) fn build(config: &Config) -> Result<()> {
     validate_winsys_export_contracts(winsys_root.as_path())?;
     build_efi(config)?;
     build_prekernel(config)?;
-    build_kernel(config)?;
+    build_nucleus(config)?;
     build_manifests_matching(config, &manifests, |manifest| {
         matches!(
             manifest.build.builder,
@@ -70,7 +71,7 @@ pub(crate) fn check(config: &Config) -> Result<()> {
     .run()?;
 
     run_cargo_kernel_check(config, &config.prekernel_package)?;
-    run_cargo_kernel_check(config, &config.kernel_package)?;
+    run_cargo_kernel_check(config, &config.nucleus_package)?;
 
     let package = &config.user_elf_package;
     let target = &config.kernel_target;
@@ -80,7 +81,7 @@ pub(crate) fn check(config: &Config) -> Result<()> {
 
     cmd!(
         sh,
-        "{cargo} check --workspace --exclude bootloader --exclude prekernel --exclude kernel"
+        "{cargo} check --workspace --exclude bootloader --exclude prekernel --exclude nucleus"
     )
     .env("CARGO_TARGET_DIR", &config.cargo_target_dir)
     .run()?;
@@ -135,18 +136,16 @@ pub(crate) fn build_prekernel(config: &Config) -> Result<()> {
         &config.prekernel_package,
         &config.prekernel_rustc_args,
     )?;
-    copy_with_parent(
-        &config.prekernel_source_path(),
-        &config.artifact_prekernel_elf_path(),
-    )
+    let artifact = config.artifact_prekernel_elf_path();
+    copy_with_parent(&config.prekernel_source_path(), &artifact)?;
+    strip_elf_artifact_if_available(&artifact)
 }
 
-pub(crate) fn build_kernel(config: &Config) -> Result<()> {
-    run_cargo_kernel_rustc(config, &config.kernel_package, &config.kernel_rustc_args)?;
-    copy_with_parent(
-        &config.kernel_source_path(),
-        &config.artifact_kernel_elf_path(),
-    )
+pub(crate) fn build_nucleus(config: &Config) -> Result<()> {
+    run_cargo_kernel_rustc(config, &config.nucleus_package, &config.nucleus_rustc_args)?;
+    let artifact = config.artifact_nucleus_elf_path();
+    copy_with_parent(&config.nucleus_source_path(), &artifact)?;
+    strip_elf_artifact_if_available(&artifact)
 }
 
 pub(crate) fn build_user(config: &Config) -> Result<()> {
@@ -266,7 +265,7 @@ fn build_manifest(config: &Config, manifest: &PackageManifest) -> Result<()> {
     match manifest.build.builder {
         BuilderKind::BootloaderUefi => build_efi(config),
         BuilderKind::PrekernelRustc => build_prekernel(config),
-        BuilderKind::KernelRustc => build_kernel(config),
+        BuilderKind::KernelRustc => build_nucleus(config),
         BuilderKind::CargoKernelBinary => build_cargo_kernel_binary(config, manifest),
         BuilderKind::MingwCExe => build_mingw_c_exe(config, manifest),
         BuilderKind::CDemo => build_c_demo_manifest(config, manifest),

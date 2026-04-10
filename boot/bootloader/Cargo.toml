@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 boot-protocol = { path = "boot-protocol" }
+diag-abi = { path = "../../libs/diag-abi" }
 storage-core = { path = "../../libs/storage-core" }
 uefi = { version = "0.36.1", features = ["alloc"] }
 xmas-elf = "0.10.0"

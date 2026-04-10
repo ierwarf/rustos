@@ -1,8 +1,9 @@
 #[cfg(test)]
 mod tests {
     use boot_protocol::{
-        BootInfo, BootMemoryMap, BootPixelFormat, BootVolumeIdentity, FramebufferInfo,
-        KernelImageInfo,
+        BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootDiagBufferInfo, BootInfo, BootMemoryKind,
+        BootMemoryMap, BootMemoryRegion, BootPixelFormat, BootVolumeIdentity, CrashStoreInfo,
+        FramebufferInfo, NucleusImageInfo,
     };
     use boot_random::{Random, init as init_random};
     use driver_abi::{DRIVER_MODULE_ABI_VERSION, DriverBus, DriverClass, DriverModuleHeader};
@@ -54,27 +55,44 @@ mod tests {
 
     #[test]
     fn boot_random_uses_boot_seed_for_ranges() {
+        let memory_map = [BootMemoryRegion {
+            phys_start: 0x1000,
+            page_count: 16,
+            kind: BootMemoryKind::Usable,
+            _reserved0: 0,
+        }];
         let boot_info = BootInfo {
-            magic: 0,
-            version: 0,
+            magic: BOOT_INFO_MAGIC,
+            version: BOOT_INFO_VERSION,
             _reserved0: 0,
             rng_seed: [0x5a; 32],
             acpi_rsdp_addr: 0,
             boot_volume: BootVolumeIdentity::empty(),
             framebuffer: FramebufferInfo {
-                addr: 0,
-                size: 0,
+                addr: 0x8000,
+                size: 16 * 16 * 4,
                 back_buffer_addr: 0,
                 back_buffer_size: 0,
-                width: 0,
-                height: 0,
-                stride: 0,
-                pixel_format: BootPixelFormat::Unknown,
-                bytes_per_pixel: 0,
+                width: 16,
+                height: 16,
+                stride: 16,
+                pixel_format: BootPixelFormat::Rgb,
+                bytes_per_pixel: 4,
                 _reserved: [0; 3],
             },
-            kernel_image: KernelImageInfo::empty(),
-            memory_map: BootMemoryMap::empty(),
+            nucleus_image: NucleusImageInfo {
+                phys_start: 0x20_0000,
+                size: 0x2000,
+                load_bias: 0x20_0000,
+                entry_point: 0x20_1000,
+            },
+            memory_map: BootMemoryMap {
+                entries_ptr: memory_map.as_ptr() as u64,
+                entry_count: memory_map.len() as u32,
+                _reserved0: 0,
+            },
+            boot_diag: BootDiagBufferInfo::default(),
+            crash_store: CrashStoreInfo::default(),
         };
 
         init_random(&boot_info);

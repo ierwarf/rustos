@@ -152,6 +152,25 @@ impl TerminalState {
         true
     }
 
+    pub(crate) fn cursor_cell_rect(&self) -> Option<Rect> {
+        if !self.initialized
+            || self.layout.cols == 0
+            || self.layout.rows == 0
+            || self.cursor_row >= self.layout.rows
+            || self.cursor_col >= self.layout.cols
+        {
+            return None;
+        }
+        Some(self.layout.cell_rect(self.cursor_row, self.cursor_col))
+    }
+
+    pub(crate) fn render_cursor_cell(&self, canvas: &mut SurfaceCanvas<'_>) {
+        if !self.initialized || self.layout.cols == 0 || self.layout.rows == 0 {
+            return;
+        }
+        self.render_cell(canvas, self.cursor_row, self.cursor_col);
+    }
+
     pub(crate) fn render(&self, canvas: &mut SurfaceCanvas<'_>) {
         if !self.initialized || self.layout.cols == 0 || self.layout.rows == 0 {
             return;
@@ -161,36 +180,7 @@ impl TerminalState {
 
         for row in 0..self.layout.rows {
             for col in 0..self.layout.cols {
-                let cell_rect = self.layout.cell_rect(row, col);
-
-                let byte = self.cell(row, col);
-                if byte != b' ' {
-                    font::draw_terminal_glyph(
-                        canvas,
-                        cell_rect.x,
-                        cell_rect.y,
-                        byte,
-                        terminal_foreground(),
-                    );
-                }
-
-                if self.focused
-                    && self.cursor_visible
-                    && row == self.cursor_row
-                    && col == self.cursor_col
-                {
-                    let underline_height = CURSOR_UNDERLINE_HEIGHT.min(cell_rect.height);
-                    let underline_y = cell_rect.y + cell_rect.height - underline_height;
-                    canvas.fill_rect(
-                        Rect {
-                            x: cell_rect.x,
-                            y: underline_y,
-                            width: cell_rect.width,
-                            height: underline_height,
-                        },
-                        terminal_cursor_color(),
-                    );
-                }
+                self.render_cell(canvas, row, col);
             }
         }
     }
@@ -317,6 +307,40 @@ impl TerminalState {
     fn set_cell(&mut self, row: usize, col: usize, byte: u8) {
         let index = self.cell_index(row, col);
         self.cells[index] = byte;
+    }
+
+    fn render_cell(&self, canvas: &mut SurfaceCanvas<'_>, row: usize, col: usize) {
+        let cell_rect = self.layout.cell_rect(row, col);
+        canvas.fill_rect(cell_rect, terminal_background_color());
+
+        let byte = self.cell(row, col);
+        if byte != b' ' {
+            font::draw_terminal_glyph(
+                canvas,
+                cell_rect.x,
+                cell_rect.y,
+                byte,
+                terminal_foreground(),
+            );
+        }
+
+        if self.focused
+            && self.cursor_visible
+            && row == self.cursor_row
+            && col == self.cursor_col
+        {
+            let underline_height = CURSOR_UNDERLINE_HEIGHT.min(cell_rect.height);
+            let underline_y = cell_rect.y + cell_rect.height - underline_height;
+            canvas.fill_rect(
+                Rect {
+                    x: cell_rect.x,
+                    y: underline_y,
+                    width: cell_rect.width,
+                    height: underline_height,
+                },
+                terminal_cursor_color(),
+            );
+        }
     }
 }
 

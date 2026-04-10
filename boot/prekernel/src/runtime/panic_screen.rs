@@ -1,6 +1,4 @@
-use boot_protocol::{
-    BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootInfo, BootPixelFormat, FramebufferInfo,
-};
+use boot_protocol::{BootInfo, BootPixelFormat, FramebufferInfo};
 use core::fmt::{self, Write};
 use core::ptr;
 use core::str;
@@ -49,15 +47,7 @@ pub fn println_fmt(args: fmt::Arguments<'_>) {
 
 fn framebuffer_from_boot_info() -> Option<Framebuffer> {
     let boot_info_ptr = BOOT_INFO_PTR.load(Ordering::Acquire);
-    if boot_info_ptr.is_null() {
-        return None;
-    }
-
-    let boot_info = unsafe { &*boot_info_ptr.cast_const() };
-    if boot_info.magic != BOOT_INFO_MAGIC || boot_info.version != BOOT_INFO_VERSION {
-        return None;
-    }
-
+    let boot_info = unsafe { BootInfo::from_ptr(boot_info_ptr.cast_const()) }.ok()?;
     Framebuffer::from_info(boot_info.framebuffer)
 }
 
@@ -73,6 +63,7 @@ struct Framebuffer {
 
 impl Framebuffer {
     fn from_info(info: FramebufferInfo) -> Option<Self> {
+        info.validate().ok()?;
         let base = info.addr as *mut u8;
         let size = info.size as usize;
         let width = info.width as usize;

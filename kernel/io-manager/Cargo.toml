@@ -1,0 +1,15 @@
+[package]
+name = "kernel-io-manager"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+kernel-base = { path = "../base" }
+kernel-mm = { path = "../mm" }
+kernel-object = { path = "../object" }
+kernel-ipc-runtime = { path = "../ipc-runtime" }
+kernel-ps = { path = "../ps" }
+boot-protocol = { path = "../../boot/bootloader/boot-protocol" }
+driver-abi = { path = "../../drivers/libs/driver-abi" }
+keyboard-core = { path = "../../drivers/libs/keyboard-core" }
+storage-core = { path = "../../libs/storage-core" }

@@ -1,7 +1,7 @@
 id = "inputd"
 kind = "service"
 execution_domain = "user"
-profiles = ["default"]
+profiles = ["legacy-services"]
 startup = "session"
 
 [build]

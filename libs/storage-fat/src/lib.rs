@@ -14,7 +14,7 @@ use fatfs::{IoBase, Read, Seek, SeekFrom, Write};
 use storage_core::{BlockDevice, BlockSlice, IoResult, StorageError};
 
 pub type FatError = fatfs::Error<StorageError>;
-const FILE_READ_CHUNK_CAP: usize = 4 * 1024;
+const FILE_READ_CHUNK_CAP: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FatNodeKind {
@@ -313,23 +313,41 @@ impl<D: BlockDevice> FatVolume<D> {
         let expected_len =
             usize::try_from(self.metadata(path)?.len).map_err(|_| fatfs::Error::InvalidInput)?;
         let mut file = self.open_file(path)?;
-        let mut bytes = Vec::with_capacity(expected_len);
-        let mut chunk = [0_u8; 4096];
-        let mut remaining = expected_len;
-        while remaining != 0 {
-            let chunk_len = remaining.min(chunk.len());
-            let count = file.read(&mut chunk[..chunk_len])?;
+        let mut bytes = vec![0_u8; expected_len];
+        let mut done = 0usize;
+        while done < bytes.len() {
+            let chunk_len = (bytes.len() - done).min(FILE_READ_CHUNK_CAP);
+            let count = file.read(&mut bytes[done..done + chunk_len])?;
             if count == 0 {
                 return Err(fatfs::Error::InvalidInput);
             }
-            bytes.extend_from_slice(&chunk[..count]);
-            remaining = remaining.saturating_sub(count);
+            done += count;
         }
         Ok(bytes)
     }
 
     pub fn read_file_into(&self, path: &str, dest: &mut [u8]) -> Result<usize, FatError> {
         let mut file = self.open_file(path)?;
+        let mut done = 0usize;
+        while done < dest.len() {
+            let chunk_len = (dest.len() - done).min(FILE_READ_CHUNK_CAP);
+            let count = file.read(&mut dest[done..done + chunk_len])?;
+            if count == 0 {
+                break;
+            }
+            done += count;
+        }
+        Ok(done)
+    }
+
+    pub fn read_file_range_into(
+        &self,
+        path: &str,
+        offset: u64,
+        dest: &mut [u8],
+    ) -> Result<usize, FatError> {
+        let mut file = self.open_file(path)?;
+        file.seek(SeekFrom::Start(offset))?;
         let mut done = 0usize;
         while done < dest.len() {
             let chunk_len = (dest.len() - done).min(FILE_READ_CHUNK_CAP);
@@ -540,12 +558,14 @@ mod tests {
         let volume = FatVolume::new(disk).expect("open FAT volume");
         {
             let mut file = volume
-                .create_file("kernel.elf")
-                .expect("create kernel file");
-            file.write(b"ELF").expect("write kernel");
-            file.flush().expect("flush kernel");
+                .create_file("nucleus.elf")
+                .expect("create nucleus file");
+            file.write(b"ELF").expect("write nucleus");
+            file.flush().expect("flush nucleus");
         }
-        let bytes = volume.read_file_to_vec("kernel.elf").expect("read kernel");
+        let bytes = volume
+            .read_file_to_vec("nucleus.elf")
+            .expect("read nucleus");
         assert_eq!(bytes, b"ELF");
         volume.unmount().expect("unmount");
     }
@@ -597,6 +617,31 @@ mod tests {
         assert_eq!(read, expected.len());
         assert_eq!(&actual[..read], expected.as_slice());
         assert!(actual[read..].iter().all(|byte| *byte == 0));
+        volume.unmount().expect("unmount");
+    }
+
+    #[test]
+    fn read_file_range_into_reads_middle_window() {
+        let disk = format_disk(512, 16384, 0xfeed_beee);
+        let volume = FatVolume::new(disk).expect("open FAT volume");
+        let expected = (0..(192 * 1024)).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+        {
+            let mut file = volume.create_file("range.bin").expect("create file");
+            let mut written = 0usize;
+            while written < expected.len() {
+                let count = file.write(&expected[written..]).expect("write large file");
+                assert!(count != 0);
+                written += count;
+            }
+            file.flush().expect("flush large file");
+        }
+
+        let mut actual = vec![0_u8; 64 * 1024];
+        let read = volume
+            .read_file_range_into("range.bin", 73_211, &mut actual)
+            .expect("read range into");
+        assert_eq!(read, actual.len());
+        assert_eq!(&actual[..], &expected[73_211..73_211 + actual.len()]);
         volume.unmount().expect("unmount");
     }
 

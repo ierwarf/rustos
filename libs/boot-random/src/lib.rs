@@ -18,8 +18,11 @@ static RNG_SEED: Mutex<[u8; 32]> = Mutex::new([0; 32]);
 static RNG_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn init(boot_info_ptr: *const BootInfo) {
-    let boot_info = unsafe { &*boot_info_ptr };
-    *RNG_SEED.lock() = boot_info.rng_seed;
+    let mut seed = [0u8; 32];
+    if let Ok(boot_info) = unsafe { BootInfo::from_ptr(boot_info_ptr) } {
+        seed = boot_info.rng_seed;
+    }
+    *RNG_SEED.lock() = seed;
 }
 
 impl Random {

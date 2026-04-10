@@ -701,7 +701,7 @@ mod tests {
 
     fn valid_header(elf_type: u16) -> [u8; ELF64_HEADER_SIZE] {
         let mut header = [0_u8; ELF64_HEADER_SIZE];
-        header[..4].copy_from_slice(objelf::ELFMAG);
+        header[..4].copy_from_slice(&objelf::ELFMAG);
         header[4] = objelf::ELFCLASS64;
         header[5] = objelf::ELFDATA2LSB;
         header[6] = objelf::EV_CURRENT;

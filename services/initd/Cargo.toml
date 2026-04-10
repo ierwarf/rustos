@@ -5,4 +5,6 @@ edition = "2021"
 publish = false
 
 [dependencies]
+diag-client = { path = "../../libs/diag-client" }
+libc = "0.2"
 runtime-control = { path = "../../libs/runtime-control" }

@@ -8,7 +8,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(rustos_boot_trace_enabled)");
 
     let settings = fs::read_to_string(&settings_path).expect("failed to read shared settings");
-    if parse_bool(&settings, "DEBUG_LOG_ENABLED") {
+    if parse_bool(&settings, "DIAG_ENABLED") {
         println!("cargo:rustc-cfg=rustos_debug_print_enabled");
         println!("cargo:rustc-cfg=rustos_boot_trace_enabled");
     }

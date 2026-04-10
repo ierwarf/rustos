@@ -1,0 +1,18 @@
+id = "debugctl"
+kind = "app"
+execution_domain = "user"
+profiles = ["default"]
+startup = "none"
+
+[build]
+builder = "cargo-kernel-binary"
+package = "debugctl"
+
+[install]
+path = "apps/debugctl/debugctl.elf"
+
+[[desktop.entries]]
+display_name = "debugctl"
+weight_micros = 50
+logical_admin = true
+console_hosted = true

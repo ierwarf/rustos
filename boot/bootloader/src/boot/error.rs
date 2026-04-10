@@ -6,6 +6,7 @@ pub enum BootError {
     ReadKernel(Status),
     CacheBootVolume(Status),
     InvalidElf(&'static str),
+    InvalidBootInfo(&'static str),
     SegmentAlloc(Status),
     Graphics(Status),
     GraphicsMode(&'static str),
@@ -23,16 +24,19 @@ impl BootError {
             | Self::Graphics(status)
             | Self::BootInfoAlloc(status)
             | Self::BootMemoryMapAlloc(status) => status,
-            Self::InvalidElf(_) | Self::GraphicsMode(_) => Status::LOAD_ERROR,
+            Self::InvalidElf(_) | Self::InvalidBootInfo(_) | Self::GraphicsMode(_) => {
+                Status::LOAD_ERROR
+            }
         }
     }
 
     pub const fn summary(self) -> &'static str {
         match self {
             Self::OpenFileSystem(_) => "failed to open the boot filesystem",
-            Self::ReadKernel(_) => "failed to read kernel.elf",
+            Self::ReadKernel(_) => "failed to read nucleus.elf",
             Self::CacheBootVolume(_) => "failed to cache the boot volume",
             Self::InvalidElf(_) => "invalid ELF image",
+            Self::InvalidBootInfo(_) => "invalid boot info",
             Self::SegmentAlloc(_) => "failed to reserve the requested load range",
             Self::Graphics(_) => "graphics initialization failed",
             Self::GraphicsMode(_) => "unsupported graphics mode",
