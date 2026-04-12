@@ -2,10 +2,9 @@ use core::fmt;
 #[cfg(rustos_debug_print_enabled)]
 use core::fmt::Write;
 
-use diag_abi::{
-    BootDiagBufferInfo, DiagLevel, DiagProvider, DiagRecord, DiagSharedBufferHeader, DiagStage,
-    DIAG_BOOT_BUFFER_RECORD_CAPACITY,
-};
+use diag_abi::{BootDiagBufferInfo, DiagSharedBufferHeader, DIAG_BOOT_BUFFER_RECORD_CAPACITY};
+#[cfg(rustos_debug_print_enabled)]
+use diag_abi::{DiagLevel, DiagProvider, DiagRecord, DiagStage};
 
 #[cfg(rustos_debug_print_enabled)]
 const DEBUGCON_PORT: u16 = 0x00e9;
@@ -51,6 +50,7 @@ pub fn install_boot_diag_buffer(buffer: BootDiagBufferInfo) {
     }
 }
 
+#[cfg(rustos_debug_print_enabled)]
 fn record_line(line: &str) {
     unsafe {
         if BOOT_DIAG_BUFFER.addr == 0 || BOOT_DIAG_BUFFER.record_capacity == 0 {
@@ -87,6 +87,7 @@ pub fn println_fmt(args: fmt::Arguments<'_>) {
 }
 
 #[cfg(not(rustos_debug_print_enabled))]
+#[allow(dead_code)]
 pub fn println_fmt(_args: fmt::Arguments<'_>) {}
 
 #[cfg(rustos_debug_print_enabled)]

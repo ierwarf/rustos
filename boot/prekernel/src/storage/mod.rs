@@ -17,6 +17,7 @@ pub(crate) enum BootBlockDevice {
 }
 
 impl BootBlockDevice {
+    #[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code))]
     fn transport_name(&self) -> &'static str {
         match self {
             Self::Ahci(_) => "AHCI",

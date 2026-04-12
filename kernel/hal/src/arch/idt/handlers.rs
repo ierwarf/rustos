@@ -60,6 +60,7 @@ pub fn default_handler(stack_frame: InterruptStackFrame, index: u8, error_code: 
     );
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 pub extern "x86-interrupt" fn non_maskable_interrupt_handler(stack_frame: InterruptStackFrame) {
     let cr2 = Cr2::read().map(|addr| addr.as_u64()).unwrap_or(u64::MAX);
     crate::debug::println!(
@@ -85,6 +86,7 @@ pub extern "x86-interrupt" fn non_maskable_interrupt_handler(stack_frame: Interr
     crate::debug::dump_recent_trace_locations("nmi");
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 fn log_general_protection_details(error_code: u64, rip: u64, rsp: u64) {
     crate::debug::println!(
         "general protection detail: ec={:#x} rip={:#x}",
@@ -104,6 +106,7 @@ fn log_general_protection_details(error_code: u64, rip: u64, rsp: u64) {
     }
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 fn log_page_fault_details(error_code: u64, cr2: u64, rip: u64, rsp: u64) {
     let present = (error_code & 0x1) != 0;
     let write = (error_code & 0x2) != 0;

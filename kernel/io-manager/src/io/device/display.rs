@@ -220,6 +220,7 @@ pub(crate) fn present_surface(
     Ok(())
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 fn log_present_surface_sample(
     address_space: &paging::ProcessAddressSpace,
     surface: DisplaySurfaceHandle,

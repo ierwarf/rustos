@@ -1873,6 +1873,7 @@ fn ring_doorbell_at(registers: &mut XhciRegisters<XhciMmioMapper>, slot_id: u8, 
         .write_volatile_at(slot_id as usize, doorbell);
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 fn build_doorbell_register(slot_id: u8, target: usize) -> Option<DoorbellRegister> {
     let target = match u8::try_from(target) {
         Ok(target) => target,

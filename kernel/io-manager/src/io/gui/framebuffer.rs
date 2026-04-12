@@ -589,6 +589,7 @@ impl Framebuffer {
         )
     }
 
+    #[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code))]
     pub(crate) fn debug_uses_double_buffer(&self) -> bool {
         self.use_double_buffer
     }

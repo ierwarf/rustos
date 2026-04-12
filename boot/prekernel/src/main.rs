@@ -2,17 +2,25 @@
 #![cfg_attr(all(not(test), rustos_boot_image), no_std)]
 #![cfg_attr(all(not(test), rustos_boot_image), no_main)]
 
+#[cfg(all(not(test), rustos_boot_image))]
 extern crate alloc;
 
+#[cfg(all(not(test), rustos_boot_image))]
 mod load;
+#[cfg(all(not(test), rustos_boot_image))]
 mod runtime;
+#[cfg(all(not(test), rustos_boot_image))]
 #[path = "../../../settings.rs"]
 mod settings;
+#[cfg(all(not(test), rustos_boot_image))]
 mod storage;
 
+#[cfg(all(not(test), rustos_boot_image))]
 pub(crate) use load::elf_loader;
+#[cfg(all(not(test), rustos_boot_image))]
 pub(crate) use runtime::{debug, heap, panic_screen};
 
+#[cfg(all(not(test), rustos_boot_image))]
 use boot_random as random;
 
 #[cfg(all(not(test), rustos_boot_image))]

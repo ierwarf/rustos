@@ -1,18 +1,27 @@
 #![cfg_attr(all(not(test), rustos_boot_image), no_std)]
 #![cfg_attr(all(not(test), rustos_boot_image), no_main)]
 
+#[cfg(all(not(test), rustos_boot_image))]
 extern crate alloc;
 
+#[cfg(all(not(test), rustos_boot_image))]
 mod boot;
+#[cfg(all(not(test), rustos_boot_image))]
 mod platform;
+#[cfg(all(not(test), rustos_boot_image))]
 mod runtime;
+#[cfg(all(not(test), rustos_boot_image))]
 #[path = "../../../settings.rs"]
 mod settings;
 
+#[cfg(all(not(test), rustos_boot_image))]
 pub(crate) use boot::{boot_info, error};
+#[cfg(all(not(test), rustos_boot_image))]
 pub(crate) use platform::{debug, gui, random};
 
+#[cfg(all(not(test), rustos_boot_image))]
 use crate::error::BootError;
+#[cfg(all(not(test), rustos_boot_image))]
 use uefi::prelude::*;
 
 #[cfg(all(not(test), rustos_boot_image))]
@@ -49,6 +58,7 @@ fn main() -> Status {
 #[cfg(any(test, not(rustos_boot_image)))]
 fn main() {}
 
+#[cfg(all(not(test), rustos_boot_image))]
 fn report_boot_error(err: BootError) -> Status {
     debug::println!("bootloader: error: {:?}", err);
     match err {

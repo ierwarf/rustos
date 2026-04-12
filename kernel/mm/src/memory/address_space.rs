@@ -376,6 +376,7 @@ impl ProcessAddressSpace {
         }
     }
 
+    #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
     pub fn debug_dump_user_page_state(&self, virt: VirtAddr, reason: &str) {
         match self.lookup_user_page_state(virt) {
             UserPageLookup::NotUser => crate::debug::println!(
@@ -866,6 +867,7 @@ impl ProcessAddressSpace {
 }
 
 impl Drop for ProcessAddressSpace {
+    #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
     fn drop(&mut self) {
         if self.pml4_frame_phys == 0 {
             // Unit tests may use synthetic address spaces that do not have privileged CR3

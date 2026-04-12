@@ -3,6 +3,7 @@ use alloc::vec::Vec;
 use spin::Mutex;
 
 use super::emulation;
+#[allow(unused_imports)]
 use super::host::{UsbHostControllerInfo, controller_kind_name};
 use super::xhci;
 

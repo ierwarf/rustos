@@ -169,6 +169,7 @@ pub fn initialize_loadable_modules_for_class(class: DriverClass) -> bool {
     true
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 fn ensure_loadable_driver_registry_loaded() -> bool {
     if LOADABLE_DRIVER_REGISTRY_LOADED.load(Ordering::Acquire) {
         return true;

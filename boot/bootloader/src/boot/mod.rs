@@ -31,6 +31,7 @@ const NUCLEUS_CANDIDATE_PATHS: [(&str, &uefi::CStr16); 4] = [
     ("EFI\\BOOT\\nucleus.elf", cstr16!("EFI\\BOOT\\nucleus.elf")),
 ];
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 pub fn boot_kernel() -> Result<(), BootError> {
     debug::println!("bootloader: locating nucleus image");
     let mut boot_info = gui::prepare_boot_info()?;
@@ -180,6 +181,7 @@ fn allocate_boot_memory_map_storage() -> Result<*mut BootMemoryRegion, BootError
     Ok(ptr.as_ptr().cast())
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 fn exit_boot_services_and_jump(
     entry_point: usize,
     boot_info_ptr: *const BootInfo,

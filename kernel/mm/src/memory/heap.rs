@@ -258,6 +258,7 @@ impl AllocationTracker {
 }
 
 #[derive(Clone, Copy)]
+#[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code))]
 struct TrackerOccupancy {
     active_count: usize,
     peak_active_count: usize,

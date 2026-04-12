@@ -55,6 +55,7 @@ fn should_trace_boot_path(path: &str) -> bool {
         || path.starts_with("/lib64/")
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 fn ensure_bootstrap_fs_access(path: &str) -> core::result::Result<(), fatfs::Error<DiskIoError>> {
     if kernel_vfs_runtime_active() {
         crate::debug::println!(

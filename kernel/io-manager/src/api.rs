@@ -227,6 +227,7 @@ pub mod boot {
 }
 
 pub mod console {
+    #[allow(unused_imports)]
     pub use crate::io::console::*;
 
     pub fn init() {

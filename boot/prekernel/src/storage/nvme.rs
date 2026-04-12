@@ -113,6 +113,7 @@ struct NvmeController {
     mmio_base: usize,
     mmio_len: usize,
     doorbell_stride: usize,
+    #[allow(dead_code)]
     version: u32,
 }
 
@@ -149,6 +150,7 @@ pub(crate) struct NvmeBlockDevice {
 
 unsafe impl Send for NvmeBlockDevice {}
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 pub(crate) fn probe_devices() -> Vec<NvmeBlockDevice> {
     let mut devices = Vec::new();
     let mut saw_qemu_nvme = false;

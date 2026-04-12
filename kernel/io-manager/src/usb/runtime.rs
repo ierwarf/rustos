@@ -330,6 +330,7 @@ pub(crate) fn unregister_interface(
     );
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 pub(crate) fn enqueue_report(usb_device: *mut LinuxCompatUsbDevice, report: &[u8]) {
     if usb_device.is_null() || report.is_empty() {
         return;

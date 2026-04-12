@@ -383,9 +383,9 @@ pub(crate) fn mprotect(start: u64, user_len: u64, prot: u64) -> Result<(), Linux
 fn log_unexpected_mprotect_not_mapped(
     address_space: &crate::memory::paging::ProcessAddressSpace,
     len: usize,
-    exec_path: &str,
+    _exec_path: &str,
     start: u64,
-    end: u64,
+    _end: u64,
     covering_vma: Option<&linux_abi::LinuxVma>,
 ) {
     if MPROTECT_NOT_MAPPED_DIAG_BUDGET
@@ -404,7 +404,7 @@ fn log_unexpected_mprotect_not_mapped(
         start,
         end,
     );
-    if let Some(area) = covering_vma {
+    if let Some(_area) = covering_vma {
         crate::debug::println!(
             "linux mprotect unexpected NotMapped: vma=[{:#x},{:#x}) flags=R{}W{}X{}P{}",
             area.start,

@@ -2,9 +2,8 @@ use std::fs;
 use std::path::PathBuf;
 
 fn main() {
-    let settings_path = PathBuf::from("../settings.rs");
+    let settings_path = PathBuf::from("../../settings.rs");
     println!("cargo:rerun-if-changed={}", settings_path.display());
-    println!("cargo:rustc-check-cfg=cfg(rustos_boot_image)");
     println!("cargo:rustc-check-cfg=cfg(rustos_debug_print_enabled)");
     println!("cargo:rustc-check-cfg=cfg(rustos_boot_trace_enabled)");
 

@@ -275,6 +275,7 @@ impl RootCache {
     }
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 pub fn init() {
     crate::debug::println!("vfs: mount /proc begin");
     let _ = mount_internal("/proc", "proc", 0, None, true);

@@ -121,6 +121,7 @@ pub(crate) fn present_bgra8888_from_user(
     result
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 fn log_backend_present_sample(framebuffer: &Framebuffer, drawn: bool) {
     let sample_index = BACKEND_PRESENT_SAMPLE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if sample_index >= MAX_BACKEND_PRESENT_SAMPLE_LOGS {

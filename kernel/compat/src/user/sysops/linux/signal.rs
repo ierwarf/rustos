@@ -249,7 +249,7 @@ pub(crate) fn deliver_pending_signals_for_current_thread() {
             PendingSignalAction::Terminate(signal) => {
                 super::thread::exit_current_process(128 + signal);
             }
-            PendingSignalAction::UnsupportedHandler(signal) => {
+            PendingSignalAction::UnsupportedHandler(_signal) => {
                 debug::println!(
                     "linux signal delivery remains partial: signal={} custom handlers are not installed yet",
                     signal

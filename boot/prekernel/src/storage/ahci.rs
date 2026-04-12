@@ -155,6 +155,7 @@ pub(crate) struct AhciBlockDevice {
 
 unsafe impl Send for AhciBlockDevice {}
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 pub(crate) fn probe_devices() -> Vec<AhciBlockDevice> {
     let mut devices = Vec::new();
     for pci in visit_pci_devices() {

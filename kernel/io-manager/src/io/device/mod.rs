@@ -197,7 +197,7 @@ pub(crate) fn descriptors() -> &'static [DeviceDescriptor] {
     &DEVICE_DESCRIPTORS
 }
 
-pub fn lookup(path: &str) -> Result<DeviceDescriptor, DeviceLookupError> {
+pub(crate) fn lookup(path: &str) -> Result<DeviceDescriptor, DeviceLookupError> {
     Ok(normalize_device_path(path)?.descriptor)
 }
 

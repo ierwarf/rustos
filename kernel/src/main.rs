@@ -10,7 +10,9 @@ use core::cell::UnsafeCell;
 
 #[cfg(all(not(test), rustos_boot_image))]
 use boot_protocol::BootInfo;
+#[cfg(all(not(test), rustos_boot_image))]
 use kernel_executive::boot;
+#[cfg(all(not(test), rustos_boot_image))]
 use kernel_hal::api as hal_api;
 #[cfg(all(not(test), rustos_boot_image))]
 use kernel_mm::api as mm_api;

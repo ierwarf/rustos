@@ -68,12 +68,12 @@ pub(crate) fn write_from_current_process(
 }
 
 fn log_console_user_buffer_failure(
-    stage: &str,
-    user_ptr: u64,
-    len: usize,
+    _stage: &str,
+    _user_ptr: u64,
+    _len: usize,
     fault_ptr: u64,
     fault_len: usize,
-    err: paging::AddressSpaceError,
+    _err: paging::AddressSpaceError,
 ) {
     let Some(buffer_state) = multitask::with_current_mm(|address_space| {
         let end_addr = fault_ptr.saturating_add(fault_len.saturating_sub(1) as u64);
@@ -94,10 +94,10 @@ fn log_console_user_buffer_failure(
         );
         return;
     };
-    let (address_space_root, start, end) = buffer_state;
-    let end_addr = fault_ptr.saturating_add(fault_len.saturating_sub(1) as u64);
-    let snapshot = multitask::current_user_snapshot();
-    if let Some((tid, abi, exec_path)) =
+    let (_address_space_root, _start, _end) = buffer_state;
+    let _end_addr = fault_ptr.saturating_add(fault_len.saturating_sub(1) as u64);
+    let _snapshot = multitask::current_user_snapshot();
+    if let Some((_tid, _abi, _exec_path)) =
         multitask::with_current_user_process_state(|tid, abi, process_state| {
             (tid, abi, String::from(process_state.exec_path()))
         })

@@ -507,6 +507,7 @@ fn try_acquire_compat_lock(state: &'static CompatLockState, owner: usize) -> boo
     true
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 fn log_compat_lock_spin(state: &'static CompatLockState, owner: usize) {
     crate::debug::println!(
         "linux compat lock spin: key={:#x} owner={} current_owner={} depth={} irq_enabled={}",
@@ -518,6 +519,7 @@ fn log_compat_lock_spin(state: &'static CompatLockState, owner: usize) {
     );
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 fn log_mutex_event(phase: &str, key: usize, owner: usize, current_owner: usize, depth: usize) {
     let remaining = MUTEX_DEBUG_REMAINING.load(Ordering::Relaxed);
     if remaining == 0 {

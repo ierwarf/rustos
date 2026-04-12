@@ -306,7 +306,7 @@ impl ConsoleSessionManager {
     }
 }
 
-pub fn create_console_session(
+pub(crate) fn create_console_session(
     program_id: u32,
     title: &str,
     exec_path: &str,

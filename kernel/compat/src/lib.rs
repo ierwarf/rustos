@@ -33,12 +33,8 @@ pub(crate) mod debug {
 
 pub(crate) mod io {
     pub(crate) mod device {
-        pub(crate) use kernel_io_manager::api::device::{DeviceError, DeviceLookupError};
-        pub(crate) use kernel_object::api::device::{DeviceAccessKind, DeviceHandle, DeviceId};
-
-        pub fn open(path: &str) -> Result<DeviceHandle, DeviceLookupError> {
-            kernel_io_manager::api::device::open(path).map(Into::into)
-        }
+        pub(crate) use kernel_io_manager::api::device::DeviceError;
+        pub(crate) use kernel_object::api::device::{DeviceHandle, DeviceId};
 
         pub fn read_to_current_user(
             handle: DeviceHandle,
@@ -142,14 +138,6 @@ pub(crate) mod storage {
 
 pub(crate) mod vfs {
     pub use kernel_io_manager::api::{MountError, VfsError, VfsMetadata, VfsNodeKind};
-
-    pub fn init() {
-        kernel_io_manager::api::vfs::init();
-    }
-
-    pub fn path_inode(path: &[u8]) -> u64 {
-        kernel_io_manager::api::vfs::path_inode(path)
-    }
 
     pub fn normalize_kernel_path(path: &str) -> Result<alloc::string::String, VfsError> {
         kernel_io_manager::api::vfs::normalize_kernel_path(path)
