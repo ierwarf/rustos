@@ -1,66 +1,64 @@
 #![feature(abi_x86_interrupt)]
 #![feature(alloc_error_handler)]
-#![cfg_attr(not(test), no_std)]
-#![cfg_attr(not(test), no_main)]
+#![cfg_attr(all(not(test), rustos_boot_image), no_std)]
+#![cfg_attr(all(not(test), rustos_boot_image), no_main)]
 
-#[cfg(not(test))]
+#[cfg(all(not(test), rustos_boot_image))]
 use core::alloc::Layout;
-#[cfg(not(test))]
+#[cfg(all(not(test), rustos_boot_image))]
 use core::cell::UnsafeCell;
 
-#[cfg(not(test))]
+#[cfg(all(not(test), rustos_boot_image))]
 use boot_protocol::BootInfo;
-#[cfg(not(test))]
-use kernel_base::debug;
-#[cfg(not(test))]
 use kernel_executive::boot;
-#[cfg(not(test))]
 use kernel_hal::api as hal_api;
-#[cfg(not(test))]
+#[cfg(all(not(test), rustos_boot_image))]
 use kernel_mm::api as mm_api;
+#[cfg(all(not(test), rustos_boot_image))]
+use nucleus_core::debug;
 
-#[cfg(not(test))]
+#[cfg(all(not(test), rustos_boot_image))]
 #[global_allocator]
 static KERNEL_ALLOCATOR: mm_api::KernelAllocator = mm_api::KernelAllocator;
 
-#[cfg(not(test))]
+#[cfg(all(not(test), rustos_boot_image))]
 const BOOTSTRAP_STACK_SIZE: usize = 2 * 1024 * 1024;
 
-#[cfg(not(test))]
+#[cfg(all(not(test), rustos_boot_image))]
 #[repr(align(16))]
 struct BootstrapStack {
     #[allow(dead_code)]
     bytes: [u8; BOOTSTRAP_STACK_SIZE],
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), rustos_boot_image))]
 struct BootstrapStackMemory(UnsafeCell<BootstrapStack>);
 
-#[cfg(not(test))]
+#[cfg(all(not(test), rustos_boot_image))]
 unsafe impl Sync for BootstrapStackMemory {}
 
-#[cfg(not(test))]
+#[cfg(all(not(test), rustos_boot_image))]
 static BOOTSTRAP_STACK: BootstrapStackMemory =
     BootstrapStackMemory(UnsafeCell::new(BootstrapStack {
         bytes: [0; BOOTSTRAP_STACK_SIZE],
     }));
 
-#[cfg(test)]
+#[cfg(any(test, not(rustos_boot_image)))]
 fn main() {}
 
-#[cfg(not(test))]
+#[cfg(all(not(test), rustos_boot_image))]
 #[alloc_error_handler]
 fn alloc_error_handler(layout: Layout) -> ! {
     mm_api::handle_alloc_error(layout)
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), rustos_boot_image))]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
-    kernel_base::debug::panic::handle_kernel_panic(info)
+    boot::handle_kernel_panic(info)
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), rustos_boot_image))]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(boot_info_ptr: *const BootInfo) -> ! {
     // Do not inherit interrupt state from firmware/bootloader.
@@ -84,7 +82,7 @@ pub extern "C" fn _start(boot_info_ptr: *const BootInfo) -> ! {
     }
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), rustos_boot_image))]
 extern "C" fn kernel_main_high(boot_info_ptr: *const BootInfo) -> ! {
     let bootstrap_stack_top = {
         let base = BOOTSTRAP_STACK.0.get() as *const BootstrapStack as u64;
@@ -99,7 +97,7 @@ extern "C" fn kernel_main_high(boot_info_ptr: *const BootInfo) -> ! {
     }
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), rustos_boot_image))]
 extern "C" fn kernel_main_bootstrap(boot_info_ptr: *const BootInfo) -> ! {
     boot::kernel_main_bootstrap(boot_info_ptr)
 }

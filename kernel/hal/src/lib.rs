@@ -3,19 +3,19 @@
 
 extern crate alloc;
 
-pub use kernel_lowlevel as lowlevel;
+pub(crate) use kernel_lowlevel as lowlevel;
 
 #[allow(unused_imports, unused_macros)]
-pub mod debug {
-    pub use kernel_base::debug::*;
+pub(crate) mod debug {
+    pub(crate) use nucleus_core::debug::*;
 
     #[cfg(rustos_debug_print_enabled)]
     macro_rules! println {
         () => {{
-            kernel_base::debug::println_newline();
+            nucleus_core::debug::println_newline();
         }};
         ($($arg:tt)*) => {{
-            kernel_base::debug::println_fmt(format_args!($($arg)*));
+            nucleus_core::debug::println_fmt(format_args!($($arg)*));
         }};
     }
 
@@ -28,13 +28,8 @@ pub mod debug {
     pub(crate) use println;
 }
 
-pub use kernel_base::arch;
-pub use kernel_base::driver;
-pub use kernel_base::input;
-pub use kernel_base::io;
-pub use kernel_base::memory;
-pub use kernel_base::multitask;
-pub use kernel_base::usb;
-pub use kernel_base::user;
+mod arch;
+mod hooks;
+mod interrupt_stubs;
 
 pub mod api;

@@ -256,7 +256,10 @@ pub fn decode_c_string(bytes: &[u8]) -> String {
 }
 
 pub fn load_startup_entries(path: &str) -> Result<Vec<StartupEntry>, std::io::Error> {
-    if matches!(path, DEFAULT_APPLICATIONS_DIR | DEFAULT_STARTUP_REGISTRY_PATH) {
+    if matches!(
+        path,
+        DEFAULT_APPLICATIONS_DIR | DEFAULT_STARTUP_REGISTRY_PATH
+    ) {
         if let Some(entries) = cached_startup_registry_entries() {
             return Ok(entries);
         }
@@ -737,8 +740,8 @@ fn as_bytes_mut<T>(value: &mut T) -> &mut [u8] {
 #[cfg(test)]
 mod tests {
     use super::{
-        DesktopLoadMode, StartupMode, parse_desktop_program_entry, parse_exec_tokens,
-        parse_startup_registry_entry,
+        parse_desktop_program_entry, parse_exec_tokens, parse_startup_registry_entry,
+        DesktopLoadMode, StartupMode,
     };
     use std::path::Path;
 

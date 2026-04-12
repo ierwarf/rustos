@@ -324,11 +324,7 @@ impl TerminalState {
             );
         }
 
-        if self.focused
-            && self.cursor_visible
-            && row == self.cursor_row
-            && col == self.cursor_col
-        {
+        if self.focused && self.cursor_visible && row == self.cursor_row && col == self.cursor_col {
             let underline_height = CURSOR_UNDERLINE_HEIGHT.min(cell_rect.height);
             let underline_y = cell_rect.y + cell_rect.height - underline_height;
             canvas.fill_rect(

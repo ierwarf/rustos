@@ -38,7 +38,11 @@ static SLOW_CONSOLE_REFRESH_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SLOW_PRESENT_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SLOW_RUNTIME_REFRESH_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-fn cursor_move_update(state: &AppState, presented_cursor_x: u32, presented_cursor_y: u32) -> VisualUpdate {
+fn cursor_move_update(
+    state: &AppState,
+    presented_cursor_x: u32,
+    presented_cursor_y: u32,
+) -> VisualUpdate {
     if presented_cursor_x == state.cursor_x && presented_cursor_y == state.cursor_y {
         return VisualUpdate::default();
     }
@@ -304,7 +308,10 @@ fn run() -> Result<(), i32> {
         loop_count = loop_count.saturating_add(1);
         if !launcher_programs_loaded {
             if state.populate_launcher_programs() {
-                pending_update.request_full();
+                pending_update.absorb(VisualUpdate::partial(render::launcher_dirty_rect(
+                    state.surface.width,
+                    state.surface.height,
+                )));
             }
             launcher_programs_loaded = true;
         }
@@ -322,7 +329,8 @@ fn run() -> Result<(), i32> {
             if now >= next_runtime_poll {
                 let refresh_started = Instant::now();
                 let runtime_changed = refresh_runtime_state(&runtime_sync, &mut runtime_state)?;
-                let apply_changed = state.apply_runtime_state(&mut runtime_state);
+                let apply_dirty = state.apply_runtime_state(&mut runtime_state);
+                let apply_changed = !apply_dirty.is_empty();
                 let refresh_elapsed = refresh_started.elapsed();
                 if refresh_elapsed >= SLOW_RUNTIME_REFRESH_THRESHOLD {
                     log_slow_runtime_refresh(
@@ -333,26 +341,20 @@ fn run() -> Result<(), i32> {
                     );
                 }
                 next_runtime_poll = now + RUNTIME_POLL_SLEEP;
-                if apply_changed {
-                    pending_update.request_full();
-                }
+                pending_update.absorb(VisualUpdate::partial(apply_dirty));
             }
             if let Some(compositor) = wayland.as_mut() {
                 if compositor.tick() {
-                    let wayland_changed = state.sync_wayland_windows(compositor.window_snapshots());
-                    let focus_changed =
-                        state.recover_focus_after_wayland_change(Some(compositor))?;
-                    if wayland_changed || focus_changed {
-                        pending_update.request_full();
-                    }
+                    let wayland_dirty = state.sync_wayland_windows(compositor.window_snapshots());
+                    let focus_dirty = state.recover_focus_after_wayland_change(Some(compositor))?;
+                    pending_update.absorb(VisualUpdate::partial(wayland_dirty.union(focus_dirty)));
                 }
             }
             if now >= next_console_poll {
                 let refresh_started = Instant::now();
-                let changed = state.refresh_console_windows()?;
-                if changed {
-                    pending_update.request_full();
-                }
+                let dirty_rect = state.refresh_console_windows()?;
+                let changed = !dirty_rect.is_empty();
+                pending_update.absorb(VisualUpdate::partial(dirty_rect));
                 let refresh_elapsed = refresh_started.elapsed();
                 profile::record_console_refresh(refresh_elapsed, changed);
                 if refresh_elapsed >= SLOW_CONSOLE_REFRESH_THRESHOLD {
@@ -450,8 +452,7 @@ fn run() -> Result<(), i32> {
             let primary_rect = drawable_update.partial_redraw_rect;
             render_rect(&mut state, drawable_update.partial_redraw_rect);
             let mut rect_count = 1_u64;
-            let mut pixel_count =
-                primary_rect.width.saturating_mul(primary_rect.height) as u64;
+            let mut pixel_count = primary_rect.width.saturating_mul(primary_rect.height) as u64;
             let first_present_started = Instant::now();
             match state.present_rect(drawable_update.partial_redraw_rect) {
                 Ok(()) => {}
@@ -486,7 +487,13 @@ fn run() -> Result<(), i32> {
                 present_elapsed += second_present_started.elapsed();
             }
             let render_elapsed = render_started.elapsed().saturating_sub(present_elapsed);
-            profile::record_present(false, rect_count, pixel_count, render_elapsed, present_elapsed);
+            profile::record_present(
+                false,
+                rect_count,
+                pixel_count,
+                render_elapsed,
+                present_elapsed,
+            );
             let total_elapsed = render_elapsed + present_elapsed;
             if total_elapsed >= SLOW_PRESENT_THRESHOLD {
                 log_slow_present(&state, total_elapsed, false, Some(primary_rect));

@@ -360,7 +360,10 @@ fn desktop_autostart_enabled(config: &Config, desktop_file_id: &str) -> Result<b
             continue;
         };
         if key.trim() == "X-GNOME-Autostart-enabled" {
-            return Ok(matches!(value.trim(), "1" | "true" | "True" | "yes" | "Yes"));
+            return Ok(matches!(
+                value.trim(),
+                "1" | "true" | "True" | "yes" | "Yes"
+            ));
         }
     }
 

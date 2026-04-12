@@ -878,7 +878,7 @@ fn run_display_probe(config: &Config, options: RunOptions) -> Result<()> {
         let mut qmp = connect_qmp(&qmp_socket, PROBE_QMP_TIMEOUT)?;
         wait_for_boot_marker(
             &debugcon_log,
-            "userspace display active",
+            &["userspace display active", "userspace_display=true"],
             probe_duration_env("RUSTOS_PROBE_BOOT_TIMEOUT_MS", PROBE_BOOT_TIMEOUT_DEFAULT),
         )?;
 
@@ -969,15 +969,17 @@ fn connect_qmp(path: &Path, timeout: Duration) -> Result<UnixStream> {
     }
 }
 
-fn wait_for_boot_marker(log_path: &Path, marker: &str, timeout: Duration) -> Result<()> {
+fn wait_for_boot_marker(log_path: &Path, markers: &[&str], timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
         let contents = fs::read_to_string(log_path).unwrap_or_default();
-        if contents.contains(marker) {
+        if markers.iter().any(|marker| contents.contains(marker)) {
             return Ok(());
         }
         if Instant::now() >= deadline {
-            return Err(format!("timed out waiting for boot marker: {marker}").into());
+            return Err(
+                format!("timed out waiting for boot markers: {}", markers.join(" | ")).into(),
+            );
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -1049,25 +1051,43 @@ fn run_probe_mouse_stress(
         } else {
             None
         };
+        if input_device.is_some() {
+            qmp_input_send_pointer_abs(
+                qmp,
+                x as u16,
+                y as u16,
+                button,
+                Instant::now() + PROBE_QMP_TIMEOUT,
+            )?;
+        } else {
+            qmp_input_send_pointer_rel(
+                qmp,
+                (dx / 175).clamp(-32, 32) as i16,
+                (dy / 175).clamp(-32, 32) as i16,
+                button,
+                Instant::now() + PROBE_QMP_TIMEOUT,
+            )?;
+        }
+        thread::sleep(PROBE_STEP_DELAY);
+        step += 1;
+    }
+    if input_device.is_some() {
         qmp_input_send_pointer_abs(
             qmp,
             x as u16,
             y as u16,
-            button,
-            input_device,
+            Some(false),
             Instant::now() + PROBE_QMP_TIMEOUT,
         )?;
-        thread::sleep(PROBE_STEP_DELAY);
-        step += 1;
+    } else {
+        qmp_input_send_pointer_rel(
+            qmp,
+            0,
+            0,
+            Some(false),
+            Instant::now() + PROBE_QMP_TIMEOUT,
+        )?;
     }
-    qmp_input_send_pointer_abs(
-        qmp,
-        x as u16,
-        y as u16,
-        Some(false),
-        input_device,
-        Instant::now() + PROBE_QMP_TIMEOUT,
-    )?;
     thread::sleep(Duration::from_millis(200));
     Ok(())
 }
@@ -1077,11 +1097,34 @@ fn qmp_input_send_pointer_abs(
     x: u16,
     y: u16,
     button_down: Option<bool>,
-    _input_device: Option<&str>,
     deadline: Instant,
 ) -> Result<()> {
     let mut events = format!(
         r#"{{"type":"abs","data":{{"axis":"x","value":{x}}}}},{{"type":"abs","data":{{"axis":"y","value":{y}}}}}"#
+    );
+    if let Some(down) = button_down {
+        events.push_str(&format!(
+            r#",{{"type":"btn","data":{{"down":{},"button":"left"}}}}"#,
+            if down { "true" } else { "false" }
+        ));
+    }
+
+    let command = format!(
+        r#"{{"execute":"input-send-event","arguments":{{{}}}}}"#,
+        format!(r#""events":[{}]"#, events)
+    );
+    qmp_execute(qmp, &command, deadline)
+}
+
+fn qmp_input_send_pointer_rel(
+    qmp: &mut UnixStream,
+    dx: i16,
+    dy: i16,
+    button_down: Option<bool>,
+    deadline: Instant,
+) -> Result<()> {
+    let mut events = format!(
+        r#"{{"type":"rel","data":{{"axis":"x","value":{dx}}}}},{{"type":"rel","data":{{"axis":"y","value":{dy}}}}}"#
     );
     if let Some(down) = button_down {
         events.push_str(&format!(
@@ -1103,6 +1146,10 @@ fn latest_kernel_alive_second(log_path: &Path) -> Option<u64> {
 }
 
 fn parse_kernel_alive_second(line: &str) -> Option<u64> {
+    if let Some(rest) = line.strip_prefix("[heartbeat] ") {
+        return parse_kernel_alive_second(rest);
+    }
+
     if let Some(rest) = line.strip_prefix("kernel alive: second=") {
         return rest
             .split_whitespace()

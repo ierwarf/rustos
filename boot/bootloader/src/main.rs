@@ -1,5 +1,5 @@
-#![cfg_attr(not(test), no_std)]
-#![cfg_attr(not(test), no_main)]
+#![cfg_attr(all(not(test), rustos_boot_image), no_std)]
+#![cfg_attr(all(not(test), rustos_boot_image), no_main)]
 
 extern crate alloc;
 
@@ -15,7 +15,7 @@ pub(crate) use platform::{debug, gui, random};
 use crate::error::BootError;
 use uefi::prelude::*;
 
-#[cfg(not(test))]
+#[cfg(all(not(test), rustos_boot_image))]
 #[entry]
 fn main() -> Status {
     use crate::boot::boot_kernel;
@@ -45,6 +45,9 @@ fn main() -> Status {
         Err(err) => report_boot_error(err),
     }
 }
+
+#[cfg(any(test, not(rustos_boot_image)))]
+fn main() {}
 
 fn report_boot_error(err: BootError) -> Status {
     debug::println!("bootloader: error: {:?}", err);

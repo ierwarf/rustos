@@ -89,6 +89,7 @@ pub(crate) fn kernel_rustflags_env() -> String {
     if !rustflags.is_empty() {
         rustflags.push(' ');
     }
+    rustflags.push_str("--cfg rustos_boot_image ");
     rustflags.push_str("-C no-redzone");
     rustflags
 }

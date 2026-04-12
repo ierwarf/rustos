@@ -140,10 +140,7 @@ impl AppState {
                     self.focused_wayland_surface_id = None;
                     self.restore_console_window(session_handle)
                 }
-                TaskbarHit::Wayland(surface_id) => {
-                    self.restore_wayland_window(surface_id, wayland);
-                    Ok(VisualUpdate::full())
-                }
+                TaskbarHit::Wayland(surface_id) => self.restore_wayland_window(surface_id, wayland),
             };
         }
 
@@ -306,46 +303,52 @@ impl AppState {
                 };
                 match chrome_hit {
                     WindowChromeHit::Close => {
+                        let before_dirty = self.wayland_visual_dirty_rect();
                         wayland.close_surface(surface_id);
-                        self.sync_wayland_windows(wayland.window_snapshots());
+                        let wayland_dirty = self.sync_wayland_windows(wayland.window_snapshots());
                         if self.focused_wayland_surface_id == Some(surface_id) {
                             self.focused_wayland_surface_id = None;
                         }
                         if self.dragging_window == Some(DragTarget::Wayland(surface_id)) {
                             self.dragging_window = None;
                         }
-                        let focus_changed =
-                            self.recover_focus_after_wayland_change(Some(wayland))?;
-                        let _ = focus_changed;
-                        Ok(VisualUpdate::full())
+                        let focus_dirty = self.recover_focus_after_wayland_change(Some(wayland))?;
+                        Ok(VisualUpdate::partial(
+                            before_dirty.union(wayland_dirty).union(focus_dirty),
+                        ))
                     }
                     WindowChromeHit::Minimize => {
+                        let before_dirty = self.wayland_visual_dirty_rect();
                         wayland.set_surface_minimized(surface_id, true);
-                        self.sync_wayland_windows(wayland.window_snapshots());
+                        let wayland_dirty = self.sync_wayland_windows(wayland.window_snapshots());
                         if self.focused_wayland_surface_id == Some(surface_id) {
                             self.focused_wayland_surface_id = None;
                         }
                         if self.dragging_window == Some(DragTarget::Wayland(surface_id)) {
                             self.dragging_window = None;
                         }
-                        let _ = self.recover_focus_after_wayland_change(Some(wayland))?;
-                        Ok(VisualUpdate::full())
+                        let focus_dirty = self.recover_focus_after_wayland_change(Some(wayland))?;
+                        Ok(VisualUpdate::partial(
+                            before_dirty.union(wayland_dirty).union(focus_dirty),
+                        ))
                     }
                     WindowChromeHit::TitleBar => {
+                        let before_dirty = self.wayland_visual_dirty_rect();
                         wayland.focus_surface(surface_id);
-                        self.sync_wayland_windows(wayland.window_snapshots());
+                        let wayland_dirty = self.sync_wayland_windows(wayland.window_snapshots());
                         self.focused_wayland_surface_id = Some(surface_id);
                         self.focused_session_handle = 0;
                         self.start_wayland_window_drag(surface_id);
-                        Ok(VisualUpdate::full())
+                        Ok(VisualUpdate::partial(before_dirty.union(wayland_dirty)))
                     }
                     WindowChromeHit::Client => {
+                        let before_dirty = self.wayland_visual_dirty_rect();
                         wayland.focus_surface(surface_id);
-                        self.sync_wayland_windows(wayland.window_snapshots());
+                        let wayland_dirty = self.sync_wayland_windows(wayland.window_snapshots());
                         self.focused_wayland_surface_id = Some(surface_id);
                         self.focused_session_handle = 0;
                         if wayland.pointer_button(POINTER_BUTTON_LEFT, true) {
-                            return Ok(VisualUpdate::full());
+                            return Ok(VisualUpdate::partial(before_dirty.union(wayland_dirty)));
                         }
                         Ok(VisualUpdate::default())
                     }
@@ -447,15 +450,21 @@ impl AppState {
         Ok(VisualUpdate::full())
     }
 
-    fn restore_wayland_window(&mut self, surface_id: u32, wayland: Option<&mut WaylandCompositor>) {
+    fn restore_wayland_window(
+        &mut self,
+        surface_id: u32,
+        wayland: Option<&mut WaylandCompositor>,
+    ) -> Result<VisualUpdate, i32> {
         let Some(wayland) = wayland else {
-            return;
+            return Ok(VisualUpdate::default());
         };
+        let before_dirty = self.wayland_visual_dirty_rect();
         wayland.set_surface_minimized(surface_id, false);
         wayland.focus_surface(surface_id);
-        self.sync_wayland_windows(wayland.window_snapshots());
+        let wayland_dirty = self.sync_wayland_windows(wayland.window_snapshots());
         self.focused_wayland_surface_id = Some(surface_id);
         self.focused_session_handle = 0;
+        Ok(VisualUpdate::partial(before_dirty.union(wayland_dirty)))
     }
 
     fn drag_window_to_cursor(&mut self, wayland: Option<&mut WaylandCompositor>) -> VisualUpdate {
@@ -516,11 +525,12 @@ impl AppState {
                     window.frame.x = next_outer.x;
                     window.frame.y = next_outer.y;
                 }
+                let next_dirty = self.wayland_window_rect_for_surface(surface_id);
                 if let Some(wayland) = wayland {
                     wayland.move_surface(surface_id, next_outer.x, next_outer.y);
                     self.sync_wayland_windows(wayland.window_snapshots());
                 }
-                VisualUpdate::full()
+                VisualUpdate::partial(previous_outer.union(next_outer).union(next_dirty))
             }
             None => VisualUpdate::default(),
         }

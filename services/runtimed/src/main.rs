@@ -796,7 +796,13 @@ fn spawn_exec(
     if pid < 0 {
         return Err(last_errno());
     }
-    boot_line(format!("runtimed: spawn syscall returned exec={} pid={}", exec_path, pid).as_str());
+    boot_line(
+        format!(
+            "runtimed: spawn syscall returned exec={} pid={}",
+            exec_path, pid
+        )
+        .as_str(),
+    );
     Ok(pid)
 }
 
@@ -824,7 +830,8 @@ fn terminate_pid(pid: i32) -> Result<(), i32> {
 fn load_launch_catalog() -> (BTreeMap<String, ProgramMetadata>, Vec<LaunchEntry>) {
     let load_started = Instant::now();
     let registry_entries =
-        load_runtime_launch_program_entries(DEFAULT_RUNTIME_LAUNCH_REGISTRY_PATH).unwrap_or_default();
+        load_runtime_launch_program_entries(DEFAULT_RUNTIME_LAUNCH_REGISTRY_PATH)
+            .unwrap_or_default();
     let registry_elapsed = load_started.elapsed().as_millis();
     diag_client::diag_info!(
         "runtimed",
@@ -960,9 +967,11 @@ fn load_program_metadata() -> BTreeMap<String, ProgramMetadata> {
 
 fn load_program_metadata_for_target(target: &str) -> Option<ProgramMetadata> {
     let mut programs = load_program_metadata();
-    programs
-        .remove(target)
-        .or_else(|| programs.into_values().find(|program| program.exec == target))
+    programs.remove(target).or_else(|| {
+        programs
+            .into_values()
+            .find(|program| program.exec == target)
+    })
 }
 
 fn insert_program_metadata(

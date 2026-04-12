@@ -2,53 +2,155 @@
 
 extern crate alloc;
 
+use alloc::format;
+
 #[macro_export]
 macro_rules! executive_debug_println {
     () => {{
-        kernel_base::debug::println_newline();
+        nucleus_core::debug::println_newline();
     }};
     ($($arg:tt)*) => {{
-        kernel_base::debug::println_fmt(format_args!($($arg)*));
+        nucleus_core::debug::println_fmt(format_args!($($arg)*));
     }};
 }
 
+#[allow(unused_imports, unused_macros)]
 pub mod debug {
     pub use crate::executive_debug_println as println;
-    pub use kernel_base::debug::*;
+    pub use nucleus_core::debug::*;
 }
 
-pub mod compat_api {
-    pub use kernel_compat::api::*;
+fn emit_flow(level: diag_abi::DiagLevel, event_id: u16, message: &str) {
+    debug::emit_text(
+        diag_abi::DiagProvider::Service,
+        level,
+        event_id,
+        0,
+        0,
+        message,
+    );
 }
 
-pub mod hal_api {
-    pub use kernel_hal::api::*;
+pub(crate) fn flow_info(event_id: u16, message: &str) {
+    emit_flow(diag_abi::DiagLevel::Info, event_id, message);
 }
 
-pub mod io_manager_api {
-    pub use kernel_io_manager::api::*;
+pub(crate) fn flow_debug(event_id: u16, message: &str) {
+    emit_flow(diag_abi::DiagLevel::Debug, event_id, message);
 }
 
-pub mod mm_api {
-    pub use kernel_mm::api::*;
+pub(crate) fn announce_ready(name: &str, console_line: &[u8]) {
+    flow_info(20, format!("{name} initialized").as_str());
+    debug::println!("{name} initialized.");
+    crate::io_services::console_write(console_line);
 }
 
-pub mod ps_api {
-    pub use kernel_ps::api::*;
-}
+mod hal_hooks {
+    use kernel_compat::api as compat_api;
+    use kernel_hal::api as hal_api;
+    use kernel_io_manager::api as io_api;
+    use kernel_ps::api as ps_api;
 
-pub mod user {
-    pub mod console_host {
-        pub use kernel_compat::api::console_host::*;
+    fn retire_current_user_task_due_to_fault(
+        vector: u8,
+        error_code: Option<u64>,
+        cr2: u64,
+        rip: u64,
+        rsp: u64,
+    ) -> hal_api::UserFaultDisposition {
+        match ps_api::retire_current_user_task_due_to_fault(vector, error_code, cr2, rip, rsp) {
+            ps_api::UserFaultDisposition::Resumed => hal_api::UserFaultDisposition::Resumed,
+            ps_api::UserFaultDisposition::Retired => hal_api::UserFaultDisposition::Retired,
+            ps_api::UserFaultDisposition::Unhandled => hal_api::UserFaultDisposition::Unhandled,
+        }
+    }
+
+    fn current_user_snapshot() -> Option<hal_api::CurrentUserSnapshot> {
+        ps_api::current_user_snapshot().map(|snapshot| hal_api::CurrentUserSnapshot {
+            abi: snapshot.abi(),
+            thread_id: snapshot.thread_id(),
+            process_id: snapshot.process_id(),
+            console_session_raw: snapshot.console_session().raw(),
+        })
+    }
+
+    fn dispatch_pic_irq(irq: u8) -> bool {
+        compat_api::syscall::with_kernel_gs_base(|| crate::io_services::dispatch_pic_irq(irq))
+    }
+
+    fn handle_keyboard_interrupt() {
+        compat_api::syscall::with_kernel_gs_base(|| {
+            crate::io_services::on_keyboard_interrupt();
+            let _ = crate::io_services::dispatch_pic_irq(1);
+        });
+    }
+
+    fn handle_mouse_interrupt() {
+        compat_api::syscall::with_kernel_gs_base(|| {
+            crate::io_services::on_mouse_interrupt();
+            let _ = crate::io_services::dispatch_pic_irq(12);
+        });
+    }
+
+    fn heartbeat_snapshot() -> hal_api::HeartbeatSnapshot {
+        let input = crate::io_services::input_debug_snapshot();
+        let (linux_irq_owner_count, linux_irq_total_depth) =
+            crate::io_services::debug_irq_lock_snapshot();
+        let (linux_input_lock_active, linux_input_lock_last_seq) =
+            crate::io_services::debug_input_lock_snapshot();
+        hal_api::HeartbeatSnapshot {
+            userspace_display_active: crate::io_services::userspace_display_active(),
+            xhci_transfer_count: crate::io_services::debug_transfer_event_count(),
+            hid_pointer_report_count: crate::io_services::debug_pointer_report_count(),
+            input: hal_api::InputEventQueueDebugSnapshot {
+                pointer_packet_submits: input.pointer_packet_submits,
+                pointer_absolute_submits: input.pointer_absolute_submits,
+                read_calls: input.read_calls,
+                read_events: input.read_events,
+                lock_active: input.lock_active,
+                lock_last_seq: input.lock_last_seq,
+                queued: input.queued,
+                pending_coalesced: input.pending_coalesced,
+                pending_pointer_position: input.pending_pointer_position,
+                dropped_discrete: input.dropped_discrete,
+                dropped_lossy: input.dropped_lossy,
+            },
+            linux_irq_owner_count,
+            linux_irq_total_depth: linux_irq_total_depth as u64,
+            linux_input_lock_active: linux_input_lock_active != 0,
+            linux_input_lock_last_seq,
+        }
+    }
+
+    pub fn register() {
+        ps_api::register_tick_jiffies_hook(crate::io_services::tick_jiffies);
+        ps_api::register_input_consumer_hooks(
+            io_api::driver::linux::input::consumer_acquire,
+            io_api::driver::linux::input::consumer_release,
+        );
+        hal_api::register_task_hooks(hal_api::TaskHooks {
+            retire_current_user_task_due_to_fault: Some(retire_current_user_task_due_to_fault),
+            halt_current_retired_task: Some(ps_api::halt_current_retired_task),
+            current_user_snapshot: Some(current_user_snapshot),
+            is_scheduler_initialized: Some(ps_api::is_initialized),
+            current_user_thread_id: Some(ps_api::current_user_id),
+            block_current_user_task: Some(ps_api::block_current_user_task),
+            wake_user_task: Some(ps_api::wake_user_task),
+            yield_now: Some(ps_api::yield_now),
+        });
+        hal_api::register_interrupt_hooks(hal_api::InterruptHooks {
+            dispatch_pic_irq: Some(dispatch_pic_irq),
+            handle_keyboard_interrupt: Some(handle_keyboard_interrupt),
+            handle_mouse_interrupt: Some(handle_mouse_interrupt),
+        });
+        hal_api::register_heartbeat_hooks(hal_api::HeartbeatHooks {
+            snapshot: Some(heartbeat_snapshot),
+        });
     }
 }
 
-pub mod util {
-    pub mod random {
-        pub use kernel_base::util::random::*;
-    }
-}
-
-mod internal;
+mod fatal;
+mod io_services;
+mod tasks;
 
 pub mod boot;

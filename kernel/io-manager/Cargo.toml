@@ -3,13 +3,27 @@ name = "kernel-io-manager"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+rustos_export_driver_symbols = []
+
 [dependencies]
-kernel-base = { path = "../base" }
+nucleus-core = { path = "../nucleus-core" }
+kernel-hal = { path = "../hal" }
 kernel-mm = { path = "../mm" }
 kernel-object = { path = "../object" }
 kernel-ipc-runtime = { path = "../ipc-runtime" }
 kernel-ps = { path = "../ps" }
 boot-protocol = { path = "../../boot/bootloader/boot-protocol" }
+diag-abi = { path = "../../libs/diag-abi" }
 driver-abi = { path = "../../drivers/libs/driver-abi" }
 keyboard-core = { path = "../../drivers/libs/keyboard-core" }
 storage-core = { path = "../../libs/storage-core" }
+storage-fat = { path = "../../libs/storage-fat" }
+embedded-graphics = { version = "0.8", default-features = false }
+fatfs = { git = "https://github.com/rafalh/rust-fatfs", default-features = false, features = ["alloc", "lfn"] }
+hidreport = { version = "0.6.0", default-features = false }
+object = { version = "0.38.1", default-features = false, features = ["read_core", "elf"] }
+spin = "0.10.0"
+vte = { version = "0.15.0", default-features = false }
+x86_64 = { version = "0.15.4", default-features = false, features = ["instructions", "abi_x86_interrupt"] }
+xhci = { version = "0.9.2", default-features = false }

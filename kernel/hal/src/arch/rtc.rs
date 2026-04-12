@@ -245,13 +245,14 @@ pub fn on_interrupt() {
             let _ = cmos_read(RTC_REG_C);
             return;
         }
-        let xhci_transfer_count = crate::usb::debug_transfer_event_count();
-        let hid_pointer_report_count = crate::usb::debug_pointer_report_count();
-        let input_snapshot = crate::input::event_queue::debug_snapshot();
-        let (linux_irq_owner_count, linux_irq_total_depth) =
-            crate::driver::linux::runtime::debug_irq_lock_snapshot();
-        let (linux_input_lock_active, linux_input_lock_last_seq) =
-            crate::driver::linux::input::debug_lock_snapshot();
+        let snapshot = crate::hooks::heartbeat_snapshot();
+        let xhci_transfer_count = snapshot.xhci_transfer_count;
+        let hid_pointer_report_count = snapshot.hid_pointer_report_count;
+        let input_snapshot = snapshot.input;
+        let linux_irq_owner_count = snapshot.linux_irq_owner_count;
+        let linux_irq_total_depth = snapshot.linux_irq_total_depth as usize;
+        let linux_input_lock_active = snapshot.linux_input_lock_active;
+        let linux_input_lock_last_seq = snapshot.linux_input_lock_last_seq;
         let xhci_delta = xhci_transfer_count.saturating_sub(
             RTC_LAST_XHCI_TRANSFER_COUNT.swap(xhci_transfer_count, Ordering::AcqRel),
         );
@@ -284,7 +285,7 @@ pub fn on_interrupt() {
             alloc::format!(
                 "second={} userspace_display={} xhci_delta={} hid_ptr_delta={} input_packet_delta={} input_abs_delta={} input_read_calls_delta={} input_read_events_delta={} linux_irq_owners={} linux_irq_depth={} linux_irq_depth_delta={} input_lock_active={} input_lock_last_seq={} eventq_lock_active={} eventq_lock_last_seq={} queued={} pending_coalesced={} pending_pointer_position={} dropped_discrete={} dropped_lossy={}",
                 current_second,
-                crate::io::gui::is_userspace_display_active(),
+                snapshot.userspace_display_active,
                 xhci_delta,
                 hid_pointer_delta,
                 input_packet_delta,
@@ -331,8 +332,8 @@ pub fn sleep(milliseconds: u64) {
             interrupts::enable();
             hlt();
             interrupts::disable();
-        } else if crate::multitask::is_initialized() {
-            crate::multitask::yield_now();
+        } else if crate::hooks::is_scheduler_initialized() {
+            crate::hooks::yield_now();
         } else {
             hlt();
         }
@@ -341,11 +342,11 @@ pub fn sleep(milliseconds: u64) {
 }
 
 fn block_current_user_until(target: u64) -> bool {
-    if !crate::multitask::is_initialized() {
+    if !crate::hooks::is_scheduler_initialized() {
         return false;
     }
 
-    let Some(task_id) = crate::multitask::current_user_id() else {
+    let Some(task_id) = crate::hooks::current_user_thread_id() else {
         return false;
     };
 
@@ -353,7 +354,7 @@ fn block_current_user_until(target: u64) -> bool {
         if RTC_TICKS.load(Ordering::Acquire) >= target {
             return true;
         }
-        if !crate::multitask::block_current_user_task() {
+        if !crate::hooks::block_current_user_task() {
             return false;
         }
         register_sleep_waiter(task_id, target);
@@ -363,7 +364,7 @@ fn block_current_user_until(target: u64) -> bool {
         return false;
     }
 
-    crate::multitask::yield_now();
+    crate::hooks::yield_now();
     true
 }
 
@@ -385,7 +386,7 @@ fn wake_ready_sleepers(now: u64) {
             };
             waiters.swap_remove(index).task_id
         };
-        let _ = crate::multitask::wake_user_task(task_id);
+        let _ = crate::hooks::wake_user_task(task_id);
     }
 }
 

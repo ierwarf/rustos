@@ -459,8 +459,11 @@ pub(crate) fn read_input(fds: &[OwnedFd], events: &mut [InputEvent]) -> Result<u
     }
     if running_on_rustos() {
         let fd = fds[0].as_raw_fd();
-        let bytes = match read(fd, events.as_mut_ptr().cast::<c_void>(), std::mem::size_of_val(events))
-        {
+        let bytes = match read(
+            fd,
+            events.as_mut_ptr().cast::<c_void>(),
+            std::mem::size_of_val(events),
+        ) {
             Ok(bytes) => bytes,
             Err(EAGAIN) => return Ok(0),
             Err(err) => return Err(err),

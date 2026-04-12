@@ -9,7 +9,7 @@ use crate::Result;
 enum LayerOwner {
     Boot,
     Core,
-    KernelCore,
+    KernelNucleusCore,
     KernelLowlevel,
     KernelMonolith,
     KernelHal,
@@ -87,7 +87,7 @@ pub(crate) fn validate_workspace_layering(root_dir: &Path) -> Result<()> {
 fn is_validated_owner(owner: LayerOwner) -> bool {
     matches!(
         owner,
-        LayerOwner::KernelCore
+        LayerOwner::KernelNucleusCore
             | LayerOwner::KernelLowlevel
             | LayerOwner::KernelMonolith
             | LayerOwner::KernelHal
@@ -167,8 +167,8 @@ fn classify_owner(root_dir: &Path, path: &Path) -> LayerOwner {
     let relative = path.strip_prefix(root_dir).unwrap_or(path);
     let relative = relative.to_string_lossy().replace('\\', "/");
 
-    if relative == "kernel/base" || relative.starts_with("kernel/base/") {
-        LayerOwner::KernelCore
+    if relative == "kernel/nucleus-core" || relative.starts_with("kernel/nucleus-core/") {
+        LayerOwner::KernelNucleusCore
     } else if relative == "kernel/lowlevel" || relative.starts_with("kernel/lowlevel/") {
         LayerOwner::KernelLowlevel
     } else if relative == "kernel/hal" || relative.starts_with("kernel/hal/") {
@@ -219,7 +219,7 @@ fn classify_owner(root_dir: &Path, path: &Path) -> LayerOwner {
 
 fn dependency_allowed(owner: LayerOwner, dep_owner: LayerOwner) -> bool {
     match owner {
-        LayerOwner::KernelCore => matches!(
+        LayerOwner::KernelNucleusCore => matches!(
             dep_owner,
             LayerOwner::Boot
                 | LayerOwner::Core
@@ -235,7 +235,7 @@ fn dependency_allowed(owner: LayerOwner, dep_owner: LayerOwner) -> bool {
             dep_owner,
             LayerOwner::Boot
                 | LayerOwner::Core
-                | LayerOwner::KernelCore
+                | LayerOwner::KernelNucleusCore
                 | LayerOwner::KernelLowlevel
                 | LayerOwner::KernelHal
                 | LayerOwner::KernelMm
@@ -249,7 +249,7 @@ fn dependency_allowed(owner: LayerOwner, dep_owner: LayerOwner) -> bool {
                 | LayerOwner::Core
                 | LayerOwner::Libs
                 | LayerOwner::DriversLibs
-                | LayerOwner::KernelCore
+                | LayerOwner::KernelNucleusCore
                 | LayerOwner::KernelLowlevel
         ),
         LayerOwner::KernelMm => matches!(
@@ -258,19 +258,21 @@ fn dependency_allowed(owner: LayerOwner, dep_owner: LayerOwner) -> bool {
                 | LayerOwner::Core
                 | LayerOwner::Libs
                 | LayerOwner::DriversLibs
-                | LayerOwner::KernelCore
+                | LayerOwner::KernelNucleusCore
                 | LayerOwner::KernelLowlevel
                 | LayerOwner::KernelHal
         ),
         LayerOwner::KernelObject => matches!(
             dep_owner,
-            LayerOwner::Core | LayerOwner::Libs | LayerOwner::KernelCore
+            LayerOwner::Core
+                | LayerOwner::Libs
+                | LayerOwner::KernelNucleusCore
         ),
         LayerOwner::KernelIpcRuntime => matches!(
             dep_owner,
             LayerOwner::Core
                 | LayerOwner::Libs
-                | LayerOwner::KernelCore
+                | LayerOwner::KernelNucleusCore
                 | LayerOwner::KernelObject
                 | LayerOwner::KernelMm
         ),
@@ -278,10 +280,12 @@ fn dependency_allowed(owner: LayerOwner, dep_owner: LayerOwner) -> bool {
             dep_owner,
             LayerOwner::Core
                 | LayerOwner::Libs
-                | LayerOwner::KernelCore
+                | LayerOwner::KernelNucleusCore
                 | LayerOwner::KernelObject
                 | LayerOwner::KernelLowlevel
+                | LayerOwner::KernelHal
                 | LayerOwner::KernelMm
+                | LayerOwner::KernelIpcRuntime
         ),
         LayerOwner::KernelIoManager => matches!(
             dep_owner,
@@ -289,8 +293,9 @@ fn dependency_allowed(owner: LayerOwner, dep_owner: LayerOwner) -> bool {
                 | LayerOwner::Core
                 | LayerOwner::Libs
                 | LayerOwner::DriversLibs
-                | LayerOwner::KernelCore
+                | LayerOwner::KernelNucleusCore
                 | LayerOwner::KernelObject
+                | LayerOwner::KernelHal
                 | LayerOwner::KernelMm
                 | LayerOwner::KernelIpcRuntime
                 | LayerOwner::KernelPs
@@ -299,8 +304,9 @@ fn dependency_allowed(owner: LayerOwner, dep_owner: LayerOwner) -> bool {
             dep_owner,
             LayerOwner::Core
                 | LayerOwner::Libs
-                | LayerOwner::KernelCore
+                | LayerOwner::KernelNucleusCore
                 | LayerOwner::KernelObject
+                | LayerOwner::KernelHal
                 | LayerOwner::KernelMm
                 | LayerOwner::KernelIpcRuntime
                 | LayerOwner::KernelPs
@@ -312,7 +318,7 @@ fn dependency_allowed(owner: LayerOwner, dep_owner: LayerOwner) -> bool {
                 | LayerOwner::Core
                 | LayerOwner::Libs
                 | LayerOwner::DriversLibs
-                | LayerOwner::KernelCore
+                | LayerOwner::KernelNucleusCore
                 | LayerOwner::KernelHal
                 | LayerOwner::KernelObject
                 | LayerOwner::KernelMm
@@ -374,18 +380,8 @@ fn validate_kernel_source_boundaries(root_dir: &Path) -> Result<()> {
             );
         }
     }
-    for shim in [
-        "kernel/base/src/hal_api.rs",
-        "kernel/base/src/mm_api.rs",
-        "kernel/base/src/object_api.rs",
-        "kernel/base/src/ipc_runtime_api.rs",
-        "kernel/base/src/ps_api.rs",
-        "kernel/base/src/io_manager_api.rs",
-        "kernel/base/src/compat_api.rs",
-    ] {
-        if root_dir.join(shim).exists() {
-            return Err(format!("{shim} must be removed after ownership distribution").into());
-        }
+    if root_dir.join("kernel/base").exists() {
+        return Err("kernel/base must be removed after ownership distribution".into());
     }
 
     let main_rs = fs::read_to_string(root_dir.join("kernel/src/main.rs"))?;
@@ -420,19 +416,19 @@ fn validate_kernel_source_boundaries(root_dir: &Path) -> Result<()> {
         .into());
     }
 
-    let executive_mod = fs::read_to_string(root_dir.join("kernel/executive/src/internal/mod.rs"))?;
-    if executive_mod.contains("kernel_host::") || executive_mod.contains("crate::kernel_host") {
+    let executive_lib = fs::read_to_string(root_dir.join("kernel/executive/src/lib.rs"))?;
+    if executive_lib.contains("kernel_host::") || executive_lib.contains("crate::kernel_host") {
         return Err("kernel executive must not reference kernel_host runtime glue".into());
     }
-    if executive_mod.contains("bootstrap_kernel_hosts")
-        || executive_mod.contains("validate_named_host_barrier")
-        || executive_mod.contains("load_staged_hosts")
+    if executive_lib.contains("bootstrap_kernel_hosts")
+        || executive_lib.contains("validate_named_host_barrier")
+        || executive_lib.contains("load_staged_hosts")
     {
         return Err("kernel executive must not include host bootstrap flow".into());
     }
     assert_source_not_contains_any(
-        &executive_mod,
-        "kernel/executive/src/internal/mod.rs",
+        &executive_lib,
+        "kernel/executive/src/lib.rs",
         &[
             "use crate::arch::",
             "use crate::driver;",
@@ -447,11 +443,10 @@ fn validate_kernel_source_boundaries(root_dir: &Path) -> Result<()> {
         ],
     )?;
 
-    let executive_boot =
-        fs::read_to_string(root_dir.join("kernel/executive/src/internal/boot.rs"))?;
+    let executive_boot = fs::read_to_string(root_dir.join("kernel/executive/src/boot.rs"))?;
     assert_source_not_contains_any(
         &executive_boot,
-        "kernel/executive/src/internal/boot.rs",
+        "kernel/executive/src/boot.rs",
         &[
             "crate::storage::boot_volume::init_boot_info",
             "crate::storage::block::",
@@ -467,58 +462,94 @@ fn validate_kernel_source_boundaries(root_dir: &Path) -> Result<()> {
         ],
     )?;
 
-    let executive_tasks =
-        fs::read_to_string(root_dir.join("kernel/executive/src/internal/tasks.rs"))?;
+    let executive_tasks = fs::read_to_string(root_dir.join("kernel/executive/src/tasks.rs"))?;
     assert_source_not_contains_any(
         &executive_tasks,
-        "kernel/executive/src/internal/tasks.rs",
+        "kernel/executive/src/tasks.rs",
         &["multitask::yield_now"],
     )?;
 
-    let executive_lib = fs::read_to_string(root_dir.join("kernel/executive/src/lib.rs"))?;
     assert_source_not_contains_any(
         &executive_lib,
         "kernel/executive/src/lib.rs",
-        &["kernel_base::user::console_host::", "pub mod bootstrap_fs"],
+        &[
+            concat!("kernel_base", "::user::console_host::"),
+            concat!("kernel_base", "::debug::"),
+            "pub mod bootstrap_fs",
+        ],
     )?;
 
     let io_manager_api = fs::read_to_string(root_dir.join("kernel/io-manager/src/api.rs"))?;
     assert_source_not_contains_any(
         &io_manager_api,
         "kernel/io-manager/src/api.rs",
-        &["pub use kernel_base::storage::boot_volume::BootstrapPhase;"],
+        &[concat!(
+            "pub use ",
+            "kernel_base",
+            "::storage::boot_volume::BootstrapPhase;"
+        )],
     )?;
     assert_source_not_contains_any(
         &io_manager_api,
         "kernel/io-manager/src/api.rs",
-        &["kernel_base::vfs_core::"],
+        &[concat!("kernel_base", "::")],
     )?;
     assert_source_not_contains_any(
         &io_manager_api,
         "kernel/io-manager/src/api.rs",
-        &["kernel_base::bootstrap_fs::"],
+        &[concat!("kernel_base", "::vfs_core::")],
+    )?;
+    assert_source_not_contains_any(
+        &io_manager_api,
+        "kernel/io-manager/src/api.rs",
+        &[concat!("kernel_base", "::bootstrap_fs::")],
     )?;
 
     let ipc_runtime_lib = fs::read_to_string(root_dir.join("kernel/ipc-runtime/src/lib.rs"))?;
     assert_source_not_contains_any(
         &ipc_runtime_lib,
         "kernel/ipc-runtime/src/lib.rs",
-        &["pub use kernel_base::ipc_core;"],
+        &[concat!("pub use ", "kernel_base", "::ipc_core;")],
     )?;
 
     let compat_console_host =
-        fs::read_to_string(root_dir.join("kernel/compat/src/internal/user/console_host.rs"))?;
+        fs::read_to_string(root_dir.join("kernel/compat/src/user/console_host.rs"))?;
     assert_source_not_contains_any(
         &compat_console_host,
-        "kernel/compat/src/internal/user/console_host.rs",
+        "kernel/compat/src/user/console_host.rs",
         &["bootstrap_fs::"],
+    )?;
+
+    let compat_api = fs::read_to_string(root_dir.join("kernel/compat/src/api.rs"))?;
+    assert_source_not_contains_any(
+        &compat_api,
+        "kernel/compat/src/api.rs",
+        &[concat!("kernel_base", "::")],
+    )?;
+
+    let compat_user_mod =
+        fs::read_to_string(root_dir.join("kernel/compat/src/user/mod.rs"))?;
+    assert_source_not_contains_any(
+        &compat_user_mod,
+        "kernel/compat/src/user/mod.rs",
+        &[
+            "#[cfg(rustos_building_kernel_compat)]",
+            "#[cfg(not(rustos_building_kernel_compat))]",
+        ],
     )?;
 
     let hal_lib = fs::read_to_string(root_dir.join("kernel/hal/src/lib.rs"))?;
     assert_source_not_contains_any(
         &hal_lib,
         "kernel/hal/src/lib.rs",
-        &["pub use kernel_mm::", "pub use kernel_ps::"],
+        &[
+            concat!("kernel_base", "::debug::"),
+            "pub use kernel_mm::",
+            "pub use kernel_ps::",
+            concat!("pub use ", "kernel_base", "::"),
+            "pub mod debug",
+            "pub use kernel_lowlevel as lowlevel",
+        ],
     )?;
 
     let hal_idt_mod = fs::read_to_string(root_dir.join("kernel/hal/src/arch/idt/mod.rs"))?;
@@ -537,33 +568,110 @@ fn validate_kernel_source_boundaries(root_dir: &Path) -> Result<()> {
     )?;
 
     let hal_rtc = fs::read_to_string(root_dir.join("kernel/hal/src/arch/rtc.rs"))?;
-    assert_source_not_contains_any(
-        &hal_rtc,
-        "kernel/hal/src/arch/rtc.rs",
-        &["kernel_ps::"],
-    )?;
+    assert_source_not_contains_any(&hal_rtc, "kernel/hal/src/arch/rtc.rs", &["kernel_ps::"])?;
 
-    let handles_rs =
-        fs::read_to_string(root_dir.join("kernel/compat/src/internal/user/handles.rs"))?;
+    let handles_rs = fs::read_to_string(root_dir.join("kernel/compat/src/user/handles.rs"))?;
+    assert_source_not_contains_any(
+        &handles_rs,
+        "kernel/compat/src/user/handles.rs",
+        &[
+            "#[cfg(rustos_building_kernel_compat)]",
+            "#[cfg(not(rustos_building_kernel_compat))]",
+            "crate::object_tokens::",
+            "kernel_object::api::{",
+        ],
+    )?;
     if handles_rs.lines().count() > 250 {
         return Err("kernel compat handles.rs remains too large after object split".into());
     }
 
+    let compat_abi = fs::read_to_string(root_dir.join("kernel/compat/src/user/abi.rs"))?;
+    assert_source_not_contains_any(
+        &compat_abi,
+        "kernel/compat/src/user/abi.rs",
+        &[
+            "#[cfg(rustos_building_kernel_compat)]",
+            "#[cfg(not(rustos_building_kernel_compat))]",
+            concat!("kernel_base", "::user_abi::UserAbi"),
+            "crate::user_abi::UserAbi",
+        ],
+    )?;
+
+    let kernel_vm = fs::read_to_string(root_dir.join("kernel/mm/src/memory/kernel_vm.rs"))?;
+    assert_source_not_contains_any(
+        &kernel_vm,
+        "kernel/mm/src/memory/kernel_vm.rs",
+        &["crate::settings::", concat!("kernel_base", "::settings::")],
+    )?;
+
+    for shared_util_file in [
+        "kernel/io-manager/src/input/i8042.rs",
+        "kernel/io-manager/src/input/dispatcher.rs",
+        "kernel/io-manager/src/io/console.rs",
+        "kernel/io-manager/src/io/tty.rs",
+        "kernel/compat/src/user/process/linux.rs",
+        "kernel/compat/src/user/sysops/linux/process.rs",
+    ] {
+        let source = fs::read_to_string(root_dir.join(shared_util_file))?;
+        assert_source_not_contains_any(
+            &source,
+            shared_util_file,
+            &[
+                "crate::util::random::",
+                "crate::util::ring::",
+                concat!("kernel_base", "::util::"),
+            ],
+        )?;
+    }
+
+    let io_gui = fs::read_to_string(root_dir.join("kernel/io-manager/src/io/gui.rs"))?;
+    assert_source_not_contains_any(
+        &io_gui,
+        "kernel/io-manager/src/io/gui.rs",
+        &["crate::settings::", concat!("kernel_base", "::settings::")],
+    )?;
+
+    for api_file in [
+        "kernel/hal/src/api.rs",
+        "kernel/mm/src/api.rs",
+        "kernel/object/src/api.rs",
+        "kernel/ipc-runtime/src/api.rs",
+        "kernel/ps/src/api.rs",
+        "kernel/io-manager/src/api.rs",
+        "kernel/compat/src/api.rs",
+    ] {
+        let source = fs::read_to_string(root_dir.join(api_file))?;
+        assert_source_not_contains_any(&source, api_file, &["pub mod api {"])?;
+    }
+
+    for manager_dir in [
+        "kernel/hal/src",
+        "kernel/mm/src",
+        "kernel/object/src",
+        "kernel/ipc-runtime/src",
+        "kernel/ps/src",
+        "kernel/io-manager/src",
+        "kernel/compat/src",
+        "kernel/executive/src",
+    ] {
+        assert_no_cross_crate_path_imports(&root_dir.join(manager_dir), root_dir)?;
+    }
+
     assert_max_lines(root_dir, "kernel/src/main.rs", 120)?;
-    assert_max_lines(root_dir, "kernel/executive/src/internal/mod.rs", 80)?;
+    assert_max_lines(root_dir, "kernel/executive/src/lib.rs", 180)?;
     assert_max_lines(
         root_dir,
-        "kernel/compat/src/internal/user/syscall/linux.rs",
+        "kernel/compat/src/user/syscall/linux.rs",
         600,
     )?;
     assert_max_lines(
         root_dir,
-        "kernel/io-manager/src/internal/storage/block.rs",
+        "kernel/io-manager/src/storage/block.rs",
         500,
     )?;
     assert_max_lines(
         root_dir,
-        "kernel/ps/src/internal_lowlevel/multitask/mod.rs",
+        "kernel/ps/src/multitask/mod.rs",
         500,
     )?;
 
@@ -583,16 +691,52 @@ fn validate_kernel_source_boundaries(root_dir: &Path) -> Result<()> {
         }
     }
 
-    let kernel_base_lib = fs::read_to_string(root_dir.join("kernel/base/src/lib.rs"))?;
-    if kernel_base_lib.contains("pub mod kernel_host") {
-        return Err("kernel/base must not compile the kernel_host module".into());
-    }
+    let mm_lib = fs::read_to_string(root_dir.join("kernel/mm/src/lib.rs"))?;
+    assert_source_not_contains_any(
+        &mm_lib,
+        "kernel/mm/src/lib.rs",
+        &[
+            concat!("kernel_base", "::debug::"),
+            concat!("pub use ", "kernel_base", "::"),
+            "pub mod debug",
+            "pub use kernel_lowlevel as lowlevel",
+        ],
+    )?;
+
+    let ps_lib = fs::read_to_string(root_dir.join("kernel/ps/src/lib.rs"))?;
+    assert_source_not_contains_any(
+        &ps_lib,
+        "kernel/ps/src/lib.rs",
+        &[
+            concat!("kernel_base", "::debug::"),
+            concat!("pub use ", "kernel_base", "::"),
+            "pub mod debug",
+            "pub use kernel_lowlevel as lowlevel",
+            "pub use kernel_mm::memory",
+            concat!("pub use ", "kernel_base", "::multitask"),
+        ],
+    )?;
+
+    let kernel_main = fs::read_to_string(root_dir.join("kernel/src/main.rs"))?;
+    assert_source_not_contains_any(
+        &kernel_main,
+        "kernel/src/main.rs",
+        &[
+            concat!("kernel_base", "::debug::"),
+            concat!("use ", "kernel_base", "::debug;"),
+        ],
+    )?;
 
     let workspace_cargo = fs::read_to_string(root_dir.join("Cargo.toml"))?;
     if workspace_cargo.contains("core/kernel-host-runtime")
         || workspace_cargo.contains("kernel/hosts/")
     {
         return Err("workspace must not include kernel host crates or kernel-host-runtime".into());
+    }
+
+    let kernel_cargo = fs::read_to_string(root_dir.join("kernel/Cargo.toml"))?;
+    if kernel_cargo.contains("kernel-base =") {
+        return Err("kernel/Cargo.toml must not depend on kernel-base".into());
     }
 
     Ok(())
@@ -625,6 +769,38 @@ fn assert_source_not_contains_any(
     Ok(())
 }
 
+fn assert_no_cross_crate_path_imports(dir: &Path, root_dir: &Path) -> Result<()> {
+    let mut entries = fs::read_dir(dir)?.collect::<std::result::Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            assert_no_cross_crate_path_imports(&path, root_dir)?;
+            continue;
+        }
+        if path.extension().and_then(|value| value.to_str()) != Some("rs") {
+            continue;
+        }
+
+        let source = fs::read_to_string(&path)?;
+        if source.contains("#[path = \"../../") || source.contains("#[path = \"../../../") {
+            let relative = path
+                .strip_prefix(root_dir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            return Err(format!(
+                "{relative} must not pull source from another crate via #[path = ...]"
+            )
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{LayerOwner, classify_owner, dependency_allowed};
@@ -634,8 +810,8 @@ mod tests {
     fn classifies_kernel_internal_crates_before_kernel_monolith() {
         let root = Path::new("/repo");
         assert_eq!(
-            classify_owner(root, Path::new("/repo/kernel/base/Cargo.toml")),
-            LayerOwner::KernelCore
+            classify_owner(root, Path::new("/repo/kernel/nucleus-core/Cargo.toml")),
+            LayerOwner::KernelNucleusCore
         );
         assert_eq!(
             classify_owner(root, Path::new("/repo/kernel/hal/Cargo.toml")),

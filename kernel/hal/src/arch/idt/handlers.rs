@@ -25,18 +25,18 @@ pub fn default_handler(stack_frame: InterruptStackFrame, index: u8, error_code: 
         );
     }
     if is_user_mode(&stack_frame) {
-        match crate::multitask::retire_current_user_task_due_to_fault(
+        match crate::hooks::retire_current_user_task_due_to_fault(
             index,
             error_code,
             cr2,
             stack_frame.instruction_pointer.as_u64(),
             stack_frame.stack_pointer.as_u64(),
         ) {
-            crate::multitask::UserFaultDisposition::Resumed => return,
-            crate::multitask::UserFaultDisposition::Retired => {
-                crate::multitask::halt_current_retired_task();
+            crate::hooks::UserFaultDisposition::Resumed => return,
+            crate::hooks::UserFaultDisposition::Retired => {
+                crate::hooks::halt_current_retired_task();
             }
-            crate::multitask::UserFaultDisposition::Unhandled => {}
+            crate::hooks::UserFaultDisposition::Unhandled => {}
         }
 
         panic!(
@@ -71,13 +71,13 @@ pub extern "x86-interrupt" fn non_maskable_interrupt_handler(stack_frame: Interr
         stack_frame.stack_pointer.as_u64(),
         stack_frame.stack_segment.0,
     );
-    if let Some(snapshot) = crate::multitask::current_user_snapshot() {
+    if let Some(snapshot) = crate::hooks::current_user_snapshot() {
         crate::debug::println!(
             "NMI: current user abi={:?} pid={} tid={} session={:?}",
-            snapshot.abi(),
-            snapshot.process_id(),
-            snapshot.thread_id(),
-            snapshot.console_session(),
+            snapshot.abi,
+            snapshot.process_id,
+            snapshot.thread_id,
+            snapshot.console_session_raw,
         );
     } else {
         crate::debug::println!("NMI: no current user task");
@@ -169,22 +169,16 @@ pub fn pic_interrupt_handler(
     _error_code: Option<u64>,
 ) {
     let irq = index.saturating_sub(crate::arch::pic::PIC_1_OFFSET);
-    let _ = crate::user::syscall::with_kernel_gs_base(|| crate::driver::irq::dispatch_pic_irq(irq));
+    let _ = crate::hooks::dispatch_pic_irq(irq);
     crate::arch::pic::send_eoi(index);
 }
 
 pub extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    crate::user::syscall::with_kernel_gs_base(|| {
-        crate::input::on_keyboard_interrupt();
-        let _ = crate::driver::irq::dispatch_pic_irq(1);
-    });
+    crate::hooks::handle_keyboard_interrupt();
     crate::arch::pic::send_eoi(KEYBOARD_INTERRUPT_VECTOR);
 }
 
 pub extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    crate::user::syscall::with_kernel_gs_base(|| {
-        crate::input::on_mouse_interrupt();
-        let _ = crate::driver::irq::dispatch_pic_irq(12);
-    });
+    crate::hooks::handle_mouse_interrupt();
     crate::arch::pic::send_eoi(MOUSE_INTERRUPT_VECTOR);
 }

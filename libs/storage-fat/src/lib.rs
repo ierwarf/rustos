@@ -624,7 +624,9 @@ mod tests {
     fn read_file_range_into_reads_middle_window() {
         let disk = format_disk(512, 16384, 0xfeed_beee);
         let volume = FatVolume::new(disk).expect("open FAT volume");
-        let expected = (0..(192 * 1024)).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+        let expected = (0..(192 * 1024))
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<_>>();
         {
             let mut file = volume.create_file("range.bin").expect("create file");
             let mut written = 0usize;

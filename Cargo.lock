@@ -208,15 +208,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "413d67b29ef1021b4d60f4aa1e925ca031751e213832b4b1d588fae623c05c60"
 
 [[package]]
-name = "crc32fast"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
-dependencies = [
- "cfg-if",
-]
-
-[[package]]
 name = "debugctl"
 version = "0.1.0"
 dependencies = [
@@ -405,50 +396,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
-name = "kernel-base"
-version = "0.1.0"
-dependencies = [
- "bitflags",
- "boot-protocol",
- "boot-random",
- "buddy_system_allocator",
- "byteorder",
- "crc32fast",
- "diag-abi",
- "driver-abi",
- "embedded-graphics",
- "fatfs",
- "hidreport",
- "kernel-lowlevel",
- "keyboard-core",
- "lazy_static",
- "linux-raw-sys",
- "log",
- "object",
- "pic8259",
- "spin 0.10.0",
- "storage-core",
- "storage-fat",
- "trace-loc-macro",
- "volatile 0.6.1",
- "vte",
- "x86_64",
- "xhci",
- "xmas-elf 0.9.1",
- "zune-core",
- "zune-jpeg",
-]
-
-[[package]]
 name = "kernel-compat"
 version = "0.1.0"
 dependencies = [
- "kernel-base",
+ "diag-abi",
+ "kernel-hal",
  "kernel-io-manager",
  "kernel-ipc-runtime",
  "kernel-mm",
  "kernel-object",
  "kernel-ps",
+ "lazy_static",
+ "linux-raw-sys",
+ "nucleus-core",
+ "object",
+ "spin 0.10.0",
+ "trace-loc-macro",
+ "x86_64",
+ "xmas-elf 0.9.1",
 ]
 
 [[package]]
@@ -458,13 +423,14 @@ dependencies = [
  "boot-protocol",
  "diag-abi",
  "driver-abi",
- "kernel-base",
  "kernel-compat",
  "kernel-hal",
  "kernel-io-manager",
  "kernel-mm",
  "kernel-object",
  "kernel-ps",
+ "nucleus-core",
+ "storage-core",
  "x86_64",
 ]
 
@@ -474,9 +440,9 @@ version = "0.1.0"
 dependencies = [
  "boot-protocol",
  "diag-abi",
- "kernel-base",
  "kernel-lowlevel",
  "lazy_static",
+ "nucleus-core",
  "pic8259",
  "spin 0.10.0",
  "x86_64",
@@ -487,21 +453,31 @@ name = "kernel-io-manager"
 version = "0.1.0"
 dependencies = [
  "boot-protocol",
+ "diag-abi",
  "driver-abi",
- "kernel-base",
+ "embedded-graphics",
+ "fatfs",
+ "hidreport",
+ "kernel-hal",
  "kernel-ipc-runtime",
  "kernel-mm",
  "kernel-object",
  "kernel-ps",
  "keyboard-core",
+ "nucleus-core",
+ "object",
+ "spin 0.10.0",
  "storage-core",
+ "storage-fat",
+ "vte",
+ "x86_64",
+ "xhci",
 ]
 
 [[package]]
 name = "kernel-ipc-runtime"
 version = "0.1.0"
 dependencies = [
- "kernel-base",
  "kernel-mm",
  "kernel-object",
  "spin 0.10.0",
@@ -521,9 +497,8 @@ version = "0.1.0"
 dependencies = [
  "boot-protocol",
  "buddy_system_allocator",
- "kernel-base",
- "kernel-hal",
  "kernel-lowlevel",
+ "nucleus-core",
  "object",
  "spin 0.10.0",
  "x86_64",
@@ -533,7 +508,8 @@ dependencies = [
 name = "kernel-object"
 version = "0.1.0"
 dependencies = [
- "kernel-base",
+ "diag-abi",
+ "nucleus-core",
 ]
 
 [[package]]
@@ -541,10 +517,14 @@ name = "kernel-ps"
 version = "0.1.0"
 dependencies = [
  "diag-abi",
- "kernel-base",
+ "kernel-hal",
+ "kernel-ipc-runtime",
  "kernel-lowlevel",
  "kernel-mm",
  "kernel-object",
+ "lazy_static",
+ "linux-raw-sys",
+ "nucleus-core",
  "spin 0.10.0",
  "trace-loc-macro",
  "x86_64",
@@ -621,10 +601,23 @@ name = "nucleus"
 version = "0.1.0"
 dependencies = [
  "boot-protocol",
- "kernel-base",
  "kernel-executive",
  "kernel-hal",
  "kernel-mm",
+ "nucleus-core",
+ "x86_64",
+]
+
+[[package]]
+name = "nucleus-core"
+version = "0.1.0"
+dependencies = [
+ "boot-protocol",
+ "boot-random",
+ "diag-abi",
+ "embedded-graphics",
+ "spin 0.10.0",
+ "trace-loc-macro",
  "x86_64",
 ]
 
@@ -1140,12 +1133,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "442887c63f2c839b346c192d047a7c87e73d0689c9157b00b53dcc27dd5ea793"
 
 [[package]]
-name = "volatile"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af8ca9a5d4debca0633e697c88269395493cebf2e10db21ca2dbde37c1356452"
-
-[[package]]
 name = "vte"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1269,7 +1256,7 @@ dependencies = [
  "bitflags",
  "const_fn",
  "rustversion",
- "volatile 0.4.6",
+ "volatile",
 ]
 
 [[package]]
@@ -1352,19 +1339,4 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "zune-core"
-version = "0.4.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f423a2c17029964870cfaabb1f13dfab7d092a62a29a89264f4d36990ca414a"
-
-[[package]]
-name = "zune-jpeg"
-version = "0.4.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29ce2c8a9384ad323cf564b67da86e21d3cfdff87908bc1223ed5c99bc792713"
-dependencies = [
- "zune-core",
 ]

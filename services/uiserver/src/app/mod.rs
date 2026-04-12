@@ -192,7 +192,9 @@ impl ConsoleWindow {
     }
 
     fn repaint_cursor_surface(&mut self) -> Option<canvas::Rect> {
-        if !self.surface_cache.valid || self.surface_cache.width == 0 || self.surface_cache.height == 0
+        if !self.surface_cache.valid
+            || self.surface_cache.width == 0
+            || self.surface_cache.height == 0
         {
             return None;
         }
@@ -286,7 +288,13 @@ fn align_up(value: usize, align: usize) -> Option<usize> {
 }
 
 impl AppState {
-    pub(crate) fn sync_wayland_windows(&mut self, windows: Vec<WaylandWindowSnapshot>) -> bool {
+    pub(crate) fn sync_wayland_windows(
+        &mut self,
+        windows: Vec<WaylandWindowSnapshot>,
+    ) -> canvas::Rect {
+        let before_dirty = self
+            .wayland_stack_dirty_rect()
+            .union(self.wayland_taskbar_dirty_rect());
         let previous_dragging = self.dragging_window;
         let previous_focus = self.focused_wayland_surface_id;
         if let Some(DragTarget::Wayland(surface_id)) = self.dragging_window {
@@ -309,9 +317,40 @@ impl AppState {
             && previous_dragging == self.dragging_window
             && previous_focus == self.focused_wayland_surface_id
         {
-            return false;
+            return canvas::Rect::empty();
         }
         self.wayland_windows = windows;
-        true
+        before_dirty
+            .union(self.wayland_stack_dirty_rect())
+            .union(self.wayland_taskbar_dirty_rect())
+    }
+
+    pub(crate) fn wayland_stack_dirty_rect(&self) -> canvas::Rect {
+        self.wayland_windows
+            .iter()
+            .fold(canvas::Rect::empty(), |dirty, window| {
+                if window.minimized {
+                    dirty
+                } else {
+                    dirty.union(crate::render::wayland_window_dirty_rect(window))
+                }
+            })
+    }
+
+    pub(crate) fn wayland_taskbar_dirty_rect(&self) -> canvas::Rect {
+        crate::render::taskbar_dirty_rect(self.display.width, self.display.height)
+    }
+
+    pub(crate) fn wayland_window_rect_for_surface(&self, surface_id: u32) -> canvas::Rect {
+        self.wayland_windows
+            .iter()
+            .find(|window| !window.minimized && window.surface_id == surface_id)
+            .map(crate::render::wayland_window_dirty_rect)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn wayland_visual_dirty_rect(&self) -> canvas::Rect {
+        self.wayland_stack_dirty_rect()
+            .union(self.wayland_taskbar_dirty_rect())
     }
 }

@@ -61,6 +61,22 @@ const TASKBAR_SLOT_WIDTH: usize = 172;
 const TASKBAR_SLOT_HEIGHT: usize = 30;
 const TASKBAR_SLOT_GAP: usize = 12;
 
+pub(crate) fn launcher_dirty_rect(width: u32, _height: u32) -> Rect {
+    shadow_bounds(topbar_rail_rect(width as usize), 2)
+}
+
+pub(crate) fn taskbar_dirty_rect(width: u32, height: u32) -> Rect {
+    shadow_bounds(taskbar_rail_rect(width as usize, height as usize), 2)
+}
+
+pub(crate) fn console_window_dirty_rect(rect: Rect) -> Rect {
+    shadow_bounds(rect, WINDOW_SHADOW_STEPS)
+}
+
+pub(crate) fn wayland_window_dirty_rect(window: &WaylandWindowSnapshot) -> Rect {
+    shadow_bounds(wayland_window_outer_rect(window), WINDOW_SHADOW_STEPS)
+}
+
 pub(crate) fn desktop_bounds(width: u32, height: u32) -> Rect {
     Rect {
         x: DESKTOP_MARGIN_X,
@@ -331,7 +347,7 @@ fn render_scene(
                 clip_rect,
                 shadow_bounds(wayland_window_outer_rect(window), WINDOW_SHADOW_STEPS),
             ) {
-            draw_wayland_window(canvas, window, true);
+                draw_wayland_window(canvas, window, true);
             }
         }
     }
@@ -394,8 +410,12 @@ fn shadow_bounds(rect: Rect, steps: usize) -> Rect {
     Rect {
         x: rect.x.saturating_sub(steps),
         y: rect.y.saturating_sub(steps),
-        width: rect.width.saturating_add(steps.saturating_mul(2).saturating_add(1)),
-        height: rect.height.saturating_add(steps.saturating_mul(2).saturating_add(1)),
+        width: rect
+            .width
+            .saturating_add(steps.saturating_mul(2).saturating_add(1)),
+        height: rect
+            .height
+            .saturating_add(steps.saturating_mul(2).saturating_add(1)),
     }
 }
 

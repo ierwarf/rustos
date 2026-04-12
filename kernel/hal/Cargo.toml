@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-kernel-base = { path = "../base" }
+nucleus-core = { path = "../nucleus-core" }
 kernel-lowlevel = { path = "../lowlevel" }
 boot-protocol = { path = "../../boot/bootloader/boot-protocol" }
 diag-abi = { path = "../../libs/diag-abi" }

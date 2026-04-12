@@ -1,6 +1,6 @@
 #![feature(alloc_error_handler)]
-#![cfg_attr(not(test), no_std)]
-#![cfg_attr(not(test), no_main)]
+#![cfg_attr(all(not(test), rustos_boot_image), no_std)]
+#![cfg_attr(all(not(test), rustos_boot_image), no_main)]
 
 extern crate alloc;
 
@@ -15,15 +15,21 @@ pub(crate) use runtime::{debug, heap, panic_screen};
 
 use boot_random as random;
 
+#[cfg(all(not(test), rustos_boot_image))]
 use boot_protocol::BootInfo;
+#[cfg(all(not(test), rustos_boot_image))]
 use core::fmt;
+#[cfg(all(not(test), rustos_boot_image))]
 use core::panic::PanicInfo;
+#[cfg(all(not(test), rustos_boot_image))]
 use fatfs::{Seek, SeekFrom};
+#[cfg(all(not(test), rustos_boot_image))]
 use x86_64::instructions::{hlt, interrupts};
 
+#[cfg(all(not(test), rustos_boot_image))]
 const NUCLEUS_PATH: &str = "nucleus.elf";
 
-#[cfg(not(test))]
+#[cfg(all(not(test), rustos_boot_image))]
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {
     panic_screen::reset();
@@ -54,7 +60,7 @@ fn panic(info: &PanicInfo<'_>) -> ! {
     }
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), rustos_boot_image))]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(boot_info_ptr: *const BootInfo) -> ! {
     interrupts::disable();
@@ -141,6 +147,10 @@ pub extern "C" fn _start(boot_info_ptr: *const BootInfo) -> ! {
     }
 }
 
+#[cfg(any(test, not(rustos_boot_image)))]
+fn main() {}
+
+#[cfg(all(not(test), rustos_boot_image))]
 fn fatal(args: fmt::Arguments<'_>) -> ! {
     panic_screen::reset();
     debug::println!();

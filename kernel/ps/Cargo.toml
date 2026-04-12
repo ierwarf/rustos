@@ -4,11 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-kernel-base = { path = "../base" }
+nucleus-core = { path = "../nucleus-core" }
 kernel-lowlevel = { path = "../lowlevel" }
+kernel-hal = { path = "../hal" }
 kernel-mm = { path = "../mm" }
+kernel-ipc-runtime = { path = "../ipc-runtime" }
 kernel-object = { path = "../object" }
 diag-abi = { path = "../../libs/diag-abi" }
 trace-loc-macro = { path = "../../libs/trace-loc-macro" }
+lazy_static = { version = "1.4", features = ["spin_no_std"] }
+linux-raw-sys = { version = "0.12.1", default-features = false, features = ["no_std", "general", "ioctl", "auxvec", "net"] }
 spin = "0.10.0"
 x86_64 = { version = "0.15.4", default-features = false, features = ["instructions", "abi_x86_interrupt"] }

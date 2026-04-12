@@ -1,0 +1,13 @@
+[package]
+name = "nucleus-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+boot-protocol = { path = "../../boot/bootloader/boot-protocol" }
+boot-random = { path = "../../libs/boot-random" }
+diag-abi = { path = "../../libs/diag-abi" }
+trace-loc-macro = { path = "../../libs/trace-loc-macro" }
+embedded-graphics = { version = "0.8", default-features = false }
+spin = "0.10.0"
+x86_64 = { version = "0.15.4", default-features = false, features = ["instructions", "abi_x86_interrupt"] }

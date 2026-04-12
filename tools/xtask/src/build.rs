@@ -68,6 +68,7 @@ pub(crate) fn check(config: &Config) -> Result<()> {
         "{cargo} check --manifest-path {workspace_manifest} -p {package} --target {target}"
     )
     .env("CARGO_TARGET_DIR", &config.cargo_target_dir)
+    .env("RUSTFLAGS", kernel_rustflags_env())
     .run()?;
 
     run_cargo_kernel_check(config, &config.prekernel_package)?;
@@ -124,6 +125,7 @@ pub(crate) fn build_efi(config: &Config) -> Result<()> {
         "{cargo} build --manifest-path {manifest} -p {package} --target {target} --release"
     )
     .env("CARGO_TARGET_DIR", &config.cargo_target_dir)
+    .env("RUSTFLAGS", kernel_rustflags_env())
     .run()?;
     let artifact = config.artifact_boot_efi_path();
     remove_file_if_exists(&artifact)?;

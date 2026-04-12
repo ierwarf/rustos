@@ -4,21 +4,23 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
-pub use kernel_lowlevel as lowlevel;
+pub(crate) use kernel_lowlevel as lowlevel;
+pub(crate) use kernel_hal::api::arch;
+pub(crate) use kernel_ipc_runtime::api as ipc;
+pub(crate) use kernel_mm::api as memory;
 
-pub use kernel_base::arch;
 #[allow(unused_imports, unused_macros)]
-pub mod debug {
-    pub use kernel_base::debug::*;
+pub(crate) mod debug {
+    pub(crate) use nucleus_core::debug::*;
     pub(crate) use trace_loc_macro::trace_loc;
 
     #[cfg(rustos_debug_print_enabled)]
     macro_rules! println {
         () => {{
-            kernel_base::debug::println_newline();
+            nucleus_core::debug::println_newline();
         }};
         ($($arg:tt)*) => {{
-            kernel_base::debug::println_fmt(format_args!($($arg)*));
+            nucleus_core::debug::println_fmt(format_args!($($arg)*));
         }};
     }
 
@@ -31,10 +33,22 @@ pub mod debug {
     pub(crate) use println;
 }
 
-pub use kernel_base::driver;
-pub use kernel_base::io;
-pub use kernel_base::memory;
-pub use kernel_base::multitask;
-pub use kernel_base::user;
+pub(crate) mod io {
+    pub(crate) mod device {
+        pub(crate) use kernel_object::api::device::{
+            DeviceAccessKind, DeviceHandle, DeviceId,
+        };
+    }
+
+    pub(crate) mod session {
+        pub(crate) use kernel_object::api::session::ConsoleSessionHandle;
+    }
+}
 
 pub mod api;
+pub mod user;
+
+mod linux_runtime_hooks;
+
+#[path = "multitask/mod.rs"]
+pub mod multitask;

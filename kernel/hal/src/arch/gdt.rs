@@ -1,10 +1,10 @@
 use core::cell::UnsafeCell;
 
 use lazy_static::lazy_static;
-use x86_64::VirtAddr;
 use x86_64::instructions::tables::load_tss;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
 use x86_64::structures::tss::TaskStateSegment;
+use x86_64::VirtAddr;
 
 const KERNEL_PRIVILEGE_STACK_SIZE: usize = 256 * 1024;
 const DOUBLE_FAULT_STACK_SIZE: usize = 128 * 1024;
@@ -73,7 +73,7 @@ lazy_static! {
 }
 
 pub fn init() {
-    use x86_64::instructions::segmentation::{CS, DS, ES, FS, GS, SS, Segment};
+    use x86_64::instructions::segmentation::{Segment, CS, DS, ES, FS, GS, SS};
 
     set_privilege_stack(default_ring0_stack_top());
     set_interrupt_stack(DOUBLE_FAULT_IST_INDEX, double_fault_stack_top());

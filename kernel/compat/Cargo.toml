@@ -4,9 +4,18 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-kernel-base = { path = "../base" }
+kernel-hal = { path = "../hal" }
+kernel-io-manager = { path = "../io-manager" }
 kernel-mm = { path = "../mm" }
 kernel-object = { path = "../object" }
 kernel-ipc-runtime = { path = "../ipc-runtime" }
 kernel-ps = { path = "../ps" }
-kernel-io-manager = { path = "../io-manager" }
+nucleus-core = { path = "../nucleus-core" }
+diag-abi = { path = "../../libs/diag-abi" }
+trace-loc-macro = { path = "../../libs/trace-loc-macro" }
+lazy_static = { version = "1.4", features = ["spin_no_std"] }
+linux-raw-sys = { version = "0.12.1", default-features = false, features = ["no_std", "general", "ioctl", "auxvec", "net"] }
+object = { version = "0.38.1", default-features = false, features = ["read_core", "elf"] }
+spin = "0.10.0"
+x86_64 = { version = "0.15.4", default-features = false, features = ["instructions", "abi_x86_interrupt"] }
+xmas-elf = { version = "0.9", default-features = false }

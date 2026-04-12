@@ -1,31 +1,39 @@
 pub mod linux {
-    pub fn init_cpu_local_symbols() {
-        kernel_base::driver::linux::init_cpu_local_symbols();
-    }
+    pub use crate::user::linux::*;
 
     pub fn current_task_offset() -> usize {
-        kernel_base::user::syscall::linux_compat_current_task_offset()
+        crate::user::syscall::linux_compat_current_task_offset()
     }
 
     pub fn stack_guard_offset() -> usize {
-        kernel_base::user::syscall::linux_compat_stack_guard_offset()
+        crate::user::syscall::linux_compat_stack_guard_offset()
     }
 }
 
-pub mod windows {}
+pub mod windows {
+    pub use crate::windows::*;
+}
+
+pub mod shared {
+    pub mod console_host {
+        pub use crate::user::console_host::*;
+    }
+}
 
 pub mod console_host {
-    pub use kernel_base::user::console_host::{
-        ConsoleHostError, ConsoleProgramSpec, ExecutableImage, LoadedExecutableImage,
-        load_executable_image, load_executable_image_by_path, prime_executable_image,
-        spawn_program_in_session,
+    pub use crate::user::console_host::*;
+}
+
+pub mod syscall {
+    pub use crate::user::syscall::{
+        activate_linux_compat_cpu_local, init, linux_compat_current_task_offset,
+        linux_compat_stack_guard_offset, set_linux_compat_current_task_ptr,
+        set_linux_compat_stack_guard, with_kernel_gs_base,
     };
+
+    pub fn service_pending() {
+        kernel_io_manager::api::driver::linux::runtime::service_compat_pending();
+    }
 }
 
-pub fn init_syscalls() {
-    kernel_base::user::syscall::init();
-}
-
-pub fn service_pending() {
-    kernel_base::driver::linux::runtime::service_compat_pending();
-}
+pub use syscall::{init as init_syscalls, service_pending};

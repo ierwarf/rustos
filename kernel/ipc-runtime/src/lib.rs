@@ -4,13 +4,11 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
-pub use kernel_base::memory;
-pub use kernel_base::user;
-
 pub mod api;
 
-mod ipc_shim {
-    pub use kernel_base::ipc::*;
-}
+#[path = "ipc/mod.rs"]
+pub mod ipc;
+#[path = "ipc_core.rs"]
+pub mod ipc_core;
 
-pub(crate) use ipc_shim as ipc;
+pub(crate) use kernel_mm::api as memory;
