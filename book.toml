@@ -1,0 +1,9 @@
+[book]
+title = "RustOS Documentation"
+authors = ["RustOS contributors"]
+src = "docs"
+language = "en"
+multilingual = false
+
+[build]
+build-dir = "build/mdbook"

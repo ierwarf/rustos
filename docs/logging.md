@@ -1,0 +1,574 @@
+# Logging Guide
+
+[English](#english) | [한국어](#korean)
+
+<a id="english"></a>
+
+## English
+
+This guide documents RustOS logging configuration, where logs go, and how to
+add new log lines without making the boot path noisy.
+
+### Configuration File
+
+The shared logging policy lives in [config/logging.toml](../config/logging.toml).
+Most settings are consumed by crate `build.rs` scripts through
+[tools/build_log_cfg.rs](../tools/build_log_cfg.rs), so changing the file
+requires rebuilding the affected crates.
+
+```toml
+enabled = true
+boot_trace_enabled = true
+serial_mirror = true
+ring_buffer_bytes = 16384
+min_level = "info"
+
+[categories]
+boot = "info"
+panic = "fatal"
+memory = "info"
+sched = "info"
+syscall = "off"
+process = "info"
+driver = "info"
+storage = "info"
+usb = "info"
+input = "info"
+display = "info"
+vfs = "info"
+console = "info"
+service = "info"
+compat = "info"
+debug = "info"
+heartbeat = "info"
+```
+
+### Fields
+
+- `enabled`: enables structured category logging. When this is `false`, the
+  category log cfgs are not emitted.
+- `boot_trace_enabled`: emits `rustos_boot_trace_enabled` for early boot trace
+  paths. This is intentionally separate from `enabled`.
+- `serial_mirror`: mirrors kernel structured log lines to QEMU debugcon port
+  `0xe9` in addition to keeping them in the kernel text ring.
+- `ring_buffer_bytes`: byte capacity of the kernel structured log ring.
+- `min_level`: default threshold for every category before per-category
+  overrides are applied.
+- `[categories]`: per-category thresholds.
+
+Supported levels are `off`, `trace`, `debug`, `info`, `warn`, `error`, and
+`fatal`. The threshold is inclusive. For example, `storage = "warn"` enables
+`warn`, `error`, and `fatal` storage logs, but filters out `info`, `debug`,
+and `trace`.
+
+### Categories
+
+The canonical category list is defined in
+[libs/rustos-observability/src/lib.rs](../libs/rustos-observability/src/lib.rs)
+and duplicated by the build helper for cfg generation.
+
+- `boot`: bootloader, prekernel, kernel boot sequencing
+- `panic`: panic and fatal crash reporting
+- `memory`: physical memory, paging, heap, VM
+- `sched`: scheduler and task switching
+- `syscall`: Linux/compat syscall entry and exit paths
+- `process`: process and thread lifecycle
+- `driver`: driver loading and driver runtime
+- `storage`: block devices, boot volume, filesystem paths
+- `usb`: USB host/controller/device work
+- `input`: keyboard, pointer, HID input
+- `display`: framebuffer, DRM, GPU, presentation paths
+- `vfs`: VFS lookup/open/read/write paths
+- `console`: console host and terminal sessions
+- `service`: userspace system services
+- `compat`: Linux/Windows compatibility layer
+- `debug`: breadcrumbs, diagnostics, internal debug helpers
+- `heartbeat`: low-volume liveness markers
+
+### Build-Time Behavior
+
+The logging config is compiled into cfg flags such as:
+
+- `rustos_debug_print_enabled`
+- `rustos_boot_trace_enabled`
+- `rustos_log_storage_debug`
+- `rustos_log_service_info`
+
+Kernel crates use generated macros from
+`kernel/nucleus-core/src/debug/kdiag_macros.rs`. Userspace services use
+generated helpers from `libs/observability-client`.
+
+After changing [config/logging.toml](../config/logging.toml), rebuild:
+
+```bash
+cargo xtask build
+```
+
+For a quicker userspace-only feedback loop:
+
+```bash
+cargo xtask build-user
+```
+
+For kernel logging changes, prefer the full build because several kernel crates
+emit the same cfgs from their `build.rs` files.
+
+### Kernel Logging
+
+Kernel-side logging is exposed through `crate::debug` in kernel crates:
+
+```rust
+crate::debug::info!(storage, "mounted boot volume sectors={}", sector_count);
+crate::debug::warn!(driver, "driver probe failed name={} err={}", name, err);
+crate::debug::error_ratelimited!(usb, "xhci event ring stalled");
+```
+
+Useful APIs:
+
+- `crate::debug::enabled!(category, level)`: check whether a log site is enabled
+  before doing expensive formatting or probing.
+- `crate::debug::warn_ratelimited!` and `crate::debug::error_ratelimited!`:
+  one log per site per default interval.
+- `crate::debug::snapshot_structured_log_bytes()`: snapshot the in-kernel text
+  ring for diagnostics.
+- `crate::debug::report_panic(info)`: panic reporting path.
+
+Kernel structured log lines are rendered like:
+
+```text
+seq=17 ts_us=102399 tick=409596 lvl=info cat=storage mod=... line=42 pid=- tid=- msg="..."
+```
+
+When `serial_mirror = true`, those structured lines are also written to QEMU
+debugcon. When the ring wraps, snapshots include a synthetic warning line:
+
+```text
+msg="oldest logs dropped"
+```
+
+### Userspace Service Logging
+
+Userspace Rust services use `observability-client`:
+
+```rust
+observability_client::info!("runtimed", service, "ui ready received");
+observability_client::warn!("sessiond", service, "session restart requested");
+observability_client::error!("uiserver", display, "present failed errno={}", err);
+```
+
+The first argument is the service name string. The second argument is a category
+identifier, not a string. It must be one of the configured categories.
+
+Userspace log output is written to stderr using `os_observatory`. In QEMU runs,
+this normally appears through the guest process stderr path and debug console
+plumbing.
+
+### Boot Trace And Ad-Hoc Lines
+
+There are two related but different paths:
+
+- Structured logging: category/level controlled by `enabled`, `min_level`, and
+  `[categories]`.
+- Boot trace: early bring-up messages controlled by `boot_trace_enabled` in
+  kernel code, plus a few service-local boot trace helpers.
+
+Kernel boot trace uses `rustos_boot_trace_enabled`. Some userspace services
+still have local `boot_line` helpers for early bootstrap debugging. `uiserver`
+also supports:
+
+```bash
+RUSTOS_UI_BOOT_TRACE=1
+RUSTOS_UI_PROFILE=1
+```
+
+These service-local helpers are useful during bring-up, but normal diagnostics
+should use structured logging so category filtering works.
+
+### Reading Logs
+
+Host-side QEMU logs are written under `logs/`.
+
+- `logs/debugcon.log`: default QEMU debugcon output for `cargo xtask run`
+- `logs/qemu_interrupt.log`: QEMU interrupt trace when `--qemu-log int` is used
+- `logs/rustos-debug.gdb`: helper generated by `cargo xtask debug`
+
+Common commands:
+
+```bash
+cargo xtask run
+cargo xtask run --debugcon stdio
+cargo xtask run --qemu-log int
+cargo xtask debug
+```
+
+`--debugcon stdio` is useful when the debug stream itself is the main thing
+being investigated. The default file mode is better for normal UI/QEMU runs.
+
+### Recommended Profiles
+
+Quiet default:
+
+```toml
+enabled = true
+boot_trace_enabled = true
+serial_mirror = true
+ring_buffer_bytes = 16384
+min_level = "info"
+
+[categories]
+syscall = "off"
+heartbeat = "info"
+```
+
+Storage debugging:
+
+```toml
+min_level = "info"
+
+[categories]
+storage = "debug"
+vfs = "debug"
+driver = "info"
+```
+
+Syscall debugging:
+
+```toml
+min_level = "info"
+
+[categories]
+syscall = "trace"
+compat = "debug"
+process = "debug"
+```
+
+Scheduler debugging:
+
+```toml
+min_level = "warn"
+
+[categories]
+sched = "debug"
+process = "debug"
+heartbeat = "off"
+```
+
+For very noisy categories such as `syscall`, `sched`, and `vfs`, increase
+`ring_buffer_bytes` if you need useful history after a failure.
+
+### Adding A New Category
+
+Add a category only when existing categories cannot describe the log source
+cleanly. A new category must be added in all of these places:
+
+1. `libs/rustos-observability/src/lib.rs`
+2. `tools/build_log_cfg.rs`
+3. `config/logging.toml`
+4. this guide
+
+Then run:
+
+```bash
+cargo fmt --check
+cargo test -p module-tests
+cargo xtask check
+```
+
+### Logging Hygiene
+
+- Prefer `debug` or `trace` for loops, interrupts, syscalls, scheduler ticks,
+  or packet/block paths.
+- Use `info` for lifecycle events: service start, device ready, mount complete,
+  UI ready.
+- Use `warn` for recoverable failures or degraded fallback.
+- Use `error` for failed operations that likely break a user-visible path.
+- Use `fatal` only for panic/crash class events.
+- Use ratelimited macros for repeated hardware, scheduler, or IO errors.
+- Guard expensive log payloads with `enabled!`.
+- Do not log raw untrusted buffers, large payloads, secrets, or full memory
+  dumps through normal structured logs.
+
+<a id="korean"></a>
+
+## 한국어
+
+이 가이드는 RustOS logging 설정, log가 기록되는 위치, boot path를 과도하게
+시끄럽게 만들지 않고 새 log line을 추가하는 방법을 설명합니다.
+
+### 설정 파일
+
+공유 logging 정책은 [config/logging.toml](../config/logging.toml)에 있습니다.
+대부분의 설정은 crate `build.rs`가 [tools/build_log_cfg.rs](../tools/build_log_cfg.rs)를
+통해 읽습니다. 따라서 이 파일을 바꾸면 영향을 받는 crate를 다시 빌드해야
+합니다.
+
+```toml
+enabled = true
+boot_trace_enabled = true
+serial_mirror = true
+ring_buffer_bytes = 16384
+min_level = "info"
+
+[categories]
+boot = "info"
+panic = "fatal"
+memory = "info"
+sched = "info"
+syscall = "off"
+process = "info"
+driver = "info"
+storage = "info"
+usb = "info"
+input = "info"
+display = "info"
+vfs = "info"
+console = "info"
+service = "info"
+compat = "info"
+debug = "info"
+heartbeat = "info"
+```
+
+### 필드
+
+- `enabled`: structured category logging을 켭니다. `false`이면 category log
+  cfg가 생성되지 않습니다.
+- `boot_trace_enabled`: early boot trace path에 쓰이는
+  `rustos_boot_trace_enabled`를 생성합니다. `enabled`와 의도적으로 분리되어
+  있습니다.
+- `serial_mirror`: kernel structured log line을 kernel text ring에 저장하는
+  것과 별도로 QEMU debugcon port `0xe9`에도 미러링합니다.
+- `ring_buffer_bytes`: kernel structured log ring의 byte capacity입니다.
+- `min_level`: category override가 적용되기 전 모든 category의 기본 threshold입니다.
+- `[categories]`: category별 threshold입니다.
+
+지원 level은 `off`, `trace`, `debug`, `info`, `warn`, `error`, `fatal`입니다.
+threshold는 inclusive입니다. 예를 들어 `storage = "warn"`은 storage의
+`warn`, `error`, `fatal` log를 켜고 `info`, `debug`, `trace`는 걸러냅니다.
+
+### 카테고리
+
+canonical category list는
+[libs/rustos-observability/src/lib.rs](../libs/rustos-observability/src/lib.rs)에
+정의되어 있고, cfg 생성을 위해 build helper에도 같은 목록이 있습니다.
+
+- `boot`: bootloader, prekernel, kernel boot sequencing
+- `panic`: panic과 fatal crash reporting
+- `memory`: physical memory, paging, heap, VM
+- `sched`: scheduler와 task switching
+- `syscall`: Linux/compat syscall entry/exit path
+- `process`: process/thread lifecycle
+- `driver`: driver loading과 driver runtime
+- `storage`: block device, boot volume, filesystem path
+- `usb`: USB host/controller/device 작업
+- `input`: keyboard, pointer, HID input
+- `display`: framebuffer, DRM, GPU, presentation path
+- `vfs`: VFS lookup/open/read/write path
+- `console`: console host와 terminal session
+- `service`: userspace system service
+- `compat`: Linux/Windows compatibility layer
+- `debug`: breadcrumb, diagnostic, internal debug helper
+- `heartbeat`: low-volume liveness marker
+
+### 빌드 타임 동작
+
+logging config는 다음과 같은 cfg flag로 컴파일됩니다.
+
+- `rustos_debug_print_enabled`
+- `rustos_boot_trace_enabled`
+- `rustos_log_storage_debug`
+- `rustos_log_service_info`
+
+Kernel crate는 `kernel/nucleus-core/src/debug/kdiag_macros.rs`에서 생성된
+macro를 사용합니다. Userspace service는 `libs/observability-client`의 생성
+helper를 사용합니다.
+
+[config/logging.toml](../config/logging.toml)을 바꾼 뒤에는 다시 빌드하세요.
+
+```bash
+cargo xtask build
+```
+
+userspace만 빠르게 확인하려면:
+
+```bash
+cargo xtask build-user
+```
+
+kernel logging 변경은 여러 kernel crate의 `build.rs`가 같은 cfg를 내보내므로
+full build를 권장합니다.
+
+### Kernel Logging
+
+Kernel-side logging은 kernel crate 안에서 `crate::debug`로 노출됩니다.
+
+```rust
+crate::debug::info!(storage, "mounted boot volume sectors={}", sector_count);
+crate::debug::warn!(driver, "driver probe failed name={} err={}", name, err);
+crate::debug::error_ratelimited!(usb, "xhci event ring stalled");
+```
+
+유용한 API:
+
+- `crate::debug::enabled!(category, level)`: 비싼 formatting/probing 전에 log
+  site가 켜져 있는지 확인합니다.
+- `crate::debug::warn_ratelimited!`, `crate::debug::error_ratelimited!`: site별
+  default interval당 한 번만 기록합니다.
+- `crate::debug::snapshot_structured_log_bytes()`: in-kernel text ring을
+  diagnostic 용도로 snapshot합니다.
+- `crate::debug::report_panic(info)`: panic reporting path입니다.
+
+Kernel structured log line은 다음 형태로 출력됩니다.
+
+```text
+seq=17 ts_us=102399 tick=409596 lvl=info cat=storage mod=... line=42 pid=- tid=- msg="..."
+```
+
+`serial_mirror = true`이면 이 structured line이 QEMU debugcon에도 기록됩니다.
+ring이 wrap되면 snapshot에 synthetic warning line이 포함됩니다.
+
+```text
+msg="oldest logs dropped"
+```
+
+### Userspace Service Logging
+
+Rust userspace service는 `observability-client`를 사용합니다.
+
+```rust
+observability_client::info!("runtimed", service, "ui ready received");
+observability_client::warn!("sessiond", service, "session restart requested");
+observability_client::error!("uiserver", display, "present failed errno={}", err);
+```
+
+첫 번째 인자는 service name string입니다. 두 번째 인자는 string이 아니라
+category identifier이며, 설정된 category 중 하나여야 합니다.
+
+Userspace log output은 `os_observatory`를 통해 stderr에 기록됩니다. QEMU
+실행에서는 보통 guest process stderr path와 debug console plumbing을 통해
+확인됩니다.
+
+### Boot Trace와 임시 Line
+
+관련 있지만 다른 path가 두 개 있습니다.
+
+- Structured logging: `enabled`, `min_level`, `[categories]`가 제어하는
+  category/level log
+- Boot trace: kernel code의 `boot_trace_enabled`와 일부 service-local boot
+  trace helper가 제어하는 early bring-up message
+
+Kernel boot trace는 `rustos_boot_trace_enabled`를 사용합니다. 일부 userspace
+service에는 early bootstrap debugging용 local `boot_line` helper가 아직
+있습니다. `uiserver`는 다음 환경변수도 지원합니다.
+
+```bash
+RUSTOS_UI_BOOT_TRACE=1
+RUSTOS_UI_PROFILE=1
+```
+
+이 service-local helper들은 bring-up 때 유용하지만, 일반 diagnostic은
+category filtering이 동작하도록 structured logging을 사용하세요.
+
+### Log 읽기
+
+Host-side QEMU log는 `logs/` 아래에 기록됩니다.
+
+- `logs/debugcon.log`: `cargo xtask run`의 기본 QEMU debugcon output
+- `logs/qemu_interrupt.log`: `--qemu-log int` 사용 시 QEMU interrupt trace
+- `logs/rustos-debug.gdb`: `cargo xtask debug`가 생성하는 helper
+
+자주 쓰는 명령:
+
+```bash
+cargo xtask run
+cargo xtask run --debugcon stdio
+cargo xtask run --qemu-log int
+cargo xtask debug
+```
+
+debug stream 자체를 조사할 때는 `--debugcon stdio`가 유용합니다. 일반적인
+UI/QEMU 실행에는 기본 file mode가 더 적합합니다.
+
+### 추천 Profile
+
+조용한 기본 설정:
+
+```toml
+enabled = true
+boot_trace_enabled = true
+serial_mirror = true
+ring_buffer_bytes = 16384
+min_level = "info"
+
+[categories]
+syscall = "off"
+heartbeat = "info"
+```
+
+Storage debugging:
+
+```toml
+min_level = "info"
+
+[categories]
+storage = "debug"
+vfs = "debug"
+driver = "info"
+```
+
+Syscall debugging:
+
+```toml
+min_level = "info"
+
+[categories]
+syscall = "trace"
+compat = "debug"
+process = "debug"
+```
+
+Scheduler debugging:
+
+```toml
+min_level = "warn"
+
+[categories]
+sched = "debug"
+process = "debug"
+heartbeat = "off"
+```
+
+`syscall`, `sched`, `vfs`처럼 매우 시끄러운 category를 켠다면 failure 이후
+쓸 만한 history가 남도록 `ring_buffer_bytes`를 늘리세요.
+
+### 새 Category 추가
+
+기존 category로 log source를 명확히 설명할 수 없을 때만 category를 추가하세요.
+새 category는 다음 위치에 모두 추가해야 합니다.
+
+1. `libs/rustos-observability/src/lib.rs`
+2. `tools/build_log_cfg.rs`
+3. `config/logging.toml`
+4. 이 가이드
+
+그 뒤 실행합니다.
+
+```bash
+cargo fmt --check
+cargo test -p module-tests
+cargo xtask check
+```
+
+### Logging Hygiene
+
+- loop, interrupt, syscall, scheduler tick, packet/block path에는 `debug` 또는
+  `trace`를 선호하세요.
+- service start, device ready, mount complete, UI ready 같은 lifecycle
+  event에는 `info`를 사용하세요.
+- recoverable failure나 degraded fallback에는 `warn`을 사용하세요.
+- user-visible path를 깨뜨릴 가능성이 높은 실패에는 `error`를 사용하세요.
+- panic/crash class event에만 `fatal`을 사용하세요.
+- 반복되는 hardware, scheduler, IO error에는 ratelimited macro를 사용하세요.
+- 비싼 log payload는 `enabled!`로 guard하세요.
+- raw untrusted buffer, 큰 payload, secret, full memory dump는 일반 structured
+  log로 기록하지 마세요.

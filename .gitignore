@@ -1,6 +1,28 @@
-target/
+# Rust / Cargo outputs
+/target/
 
+# RustOS generated images, artifacts, registries, and mdBook output
+/build/
+
+# Runtime and debug logs
+/logs/
 *.log
 
-/build/
-.vscode/settings.json
+# Debugger and profiling byproducts
+/.gdb_history
+/perf.data
+/perf.data.old
+*.profraw
+*.profdata
+
+# Local editor settings
+/.vscode/settings.json
+/.idea/
+*.swp
+*.swo
+*~
+
+# Local agent/tool state
+/.codex
+/.codex/
+/.agents/
