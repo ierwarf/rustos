@@ -14,7 +14,7 @@ This documentation is split by audience:
   and runtime control.
 - **Guides:** decision-complete workflows for adding services, apps, and drivers.
 - **Reference:** stable paths and environment variables.
-- **AI Agent Context:** compact machine-oriented context under `docs/ai/`.
+- **AI Agent Reference:** compact machine-oriented context under `docs/ai/`.
 
 Recommended reading order:
 
@@ -38,7 +38,7 @@ Recommended reading order:
   runtime control
 - **Guides:** service, app, driver 추가를 위한 decision-complete workflow
 - **Reference:** 안정적인 path와 environment variable
-- **AI Agent Context:** `docs/ai/` 아래의 짧은 machine-oriented context
+- **AI Agent Reference:** `docs/ai/` 아래의 짧은 machine-oriented context
 
 추천 읽기 순서:
 

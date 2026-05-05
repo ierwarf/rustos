@@ -1,0 +1,34 @@
+name: Bug report
+description: Report a reproducible RustOS issue.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What failed, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Include commands, QEMU profile, firmware path, and relevant logs.
+      placeholder: |
+        1. cargo xtask build
+        2. cargo xtask run
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: |
+        OS:
+        rustc:
+        QEMU:
+        OVMF:
+    validations:
+      required: false

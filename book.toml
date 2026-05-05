@@ -7,3 +7,7 @@ multilingual = false
 
 [build]
 build-dir = "build/mdbook"
+
+[output.html]
+git-repository-url = "https://github.com/ierwarf/rustos"
+site-url = "/rustos/"

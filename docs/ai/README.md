@@ -1,4 +1,4 @@
-# AI Agent Context
+# AI Agent Reference
 
 This directory is optimized for AI agents, not human onboarding.
 

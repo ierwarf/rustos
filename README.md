@@ -1,8 +1,14 @@
 # RustOS
 
+[![Rust](https://github.com/ierwarf/rustos/actions/workflows/rust.yml/badge.svg)](https://github.com/ierwarf/rustos/actions/workflows/rust.yml)
+[![Docs](https://img.shields.io/badge/docs-mdBook-informational)](https://ierwarf.github.io/rustos/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 RustOS is an experimental Rust-first operating system workspace with a UEFI
 boot chain, layered kernel crates, userspace services, a framebuffer desktop
 UI, compatibility work, and manifest-driven image staging.
+
+![RustOS desktop UI](docs/assets/debug.png)
 
 [English](#english) | [한국어](#korean)
 
@@ -26,7 +32,19 @@ Start here:
 - [Logging Guide](docs/logging.md)
 - [Kernel API](docs/api/kernel.md)
 - [OS Developer APIs](docs/api/xtask.md)
-- [AI Agent Context](docs/ai/README.md)
+- [AI Agent Reference](docs/ai/README.md)
+
+Current status:
+
+| Area | Status |
+| --- | --- |
+| UEFI boot chain | Present |
+| Layered kernel crates | Present |
+| Manifest-driven image staging | Present |
+| Userspace services | Present |
+| Framebuffer desktop UI | Present |
+| Compatibility layer work | In progress |
+| Public release artifacts | Planned |
 
 Quick commands:
 
@@ -59,7 +77,19 @@ cargo xtask build -> build/image -> cargo xtask run -> QEMU boot
 - [로깅 가이드](docs/logging.md)
 - [Kernel API](docs/api/kernel.md)
 - [OS 개발 API](docs/api/xtask.md)
-- [AI Agent Context](docs/ai/README.md)
+- [AI Agent Reference](docs/ai/README.md)
+
+현재 상태:
+
+| 영역 | 상태 |
+| --- | --- |
+| UEFI boot chain | 구현됨 |
+| layered kernel crates | 구현됨 |
+| manifest 기반 image staging | 구현됨 |
+| userspace services | 구현됨 |
+| framebuffer desktop UI | 구현됨 |
+| compatibility layer | 진행 중 |
+| public release artifacts | 예정 |
 
 빠른 실행 명령:
 

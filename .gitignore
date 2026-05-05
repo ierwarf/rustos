@@ -7,6 +7,7 @@
 # Runtime and debug logs
 /logs/
 *.log
+/{qmp_path}
 
 # Debugger and profiling byproducts
 /.gdb_history
@@ -16,11 +17,14 @@
 *.profdata
 
 # Local editor settings
-/.vscode/settings.json
+/.vscode/
 /.idea/
 *.swp
 *.swo
 *~
+
+# Local scratch files
+/settings.rs
 
 # Local agent/tool state
 /.codex
