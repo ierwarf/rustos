@@ -857,56 +857,55 @@ impl Scheduler {
             return;
         }
 
-        let from_context = self.contexts.get(from_slot).and_then(|context| *context);
-        let to_context = self.contexts.get(to_slot).and_then(|context| *context);
-        let from_user = from_context
-            .map(|context| context.user_mode)
-            .unwrap_or(false);
-        let to_user = to_context.map(|context| context.user_mode).unwrap_or(false);
-        let from_rip = from_context
-            .and_then(|context| saved_context_rip(context.saved_rsp))
-            .unwrap_or(0);
-        let to_rip = to_context
-            .and_then(|context| saved_context_rip(context.saved_rsp))
-            .unwrap_or(0);
-        let from_rsp = from_context.map(|context| context.saved_rsp).unwrap_or(0);
-        let to_rsp = to_context.map(|context| context.saved_rsp).unwrap_or(0);
-        let from_id = self
-            .starts
-            .get(from_slot)
-            .and_then(|start| *start)
-            .map(|start| start.id);
-        let to_id = self
-            .starts
-            .get(to_slot)
-            .and_then(|start| *start)
-            .map(|start| start.id);
+        #[cfg(rustos_log_sched_debug)]
+        {
+            let from_context = self.contexts.get(from_slot).and_then(|context| *context);
+            let to_context = self.contexts.get(to_slot).and_then(|context| *context);
+            let from_user = from_context
+                .map(|context| context.user_mode)
+                .unwrap_or(false);
+            let to_user = to_context.map(|context| context.user_mode).unwrap_or(false);
+            let from_rip = from_context
+                .and_then(|context| saved_context_rip(context.saved_rsp))
+                .unwrap_or(0);
+            let to_rip = to_context
+                .and_then(|context| saved_context_rip(context.saved_rsp))
+                .unwrap_or(0);
+            let from_rsp = from_context.map(|context| context.saved_rsp).unwrap_or(0);
+            let to_rsp = to_context.map(|context| context.saved_rsp).unwrap_or(0);
+            let from_id = self
+                .starts
+                .get(from_slot)
+                .and_then(|start| *start)
+                .map(|start| start.id);
+            let to_id = self
+                .starts
+                .get(to_slot)
+                .and_then(|start| *start)
+                .map(|start| start.id);
 
-        if !debug::should_emit(diag_abi::DiagProvider::Sched, diag_abi::DiagLevel::Debug) {
-            return;
+            if !debug::enabled!(sched, debug) {
+                return;
+            }
+
+            debug::debug!(
+                sched,
+                alloc::format!(
+                    "switch slot {} ({:?}, user={}, rip={:#x}, rsp={:#x}) -> slot {} ({:?}, user={}, rip={:#x}, rsp={:#x})",
+                    from_slot,
+                    from_id,
+                    from_user,
+                    from_rip,
+                    from_rsp,
+                    to_slot,
+                    to_id,
+                    to_user,
+                    to_rip,
+                    to_rsp
+                )
+                .as_str()
+            );
         }
-
-        debug::emit_text(
-            diag_abi::DiagProvider::Sched,
-            diag_abi::DiagLevel::Debug,
-            0,
-            0,
-            to_id.unwrap_or(0),
-            alloc::format!(
-                "switch slot {} ({:?}, user={}, rip={:#x}, rsp={:#x}) -> slot {} ({:?}, user={}, rip={:#x}, rsp={:#x})",
-                from_slot,
-                from_id,
-                from_user,
-                from_rip,
-                from_rsp,
-                to_slot,
-                to_id,
-                to_user,
-                to_rip,
-                to_rsp
-            )
-            .as_str(),
-        );
     }
 
     // Kernel-thread start metadata is kept for upcoming worker-thread instrumentation.
@@ -1709,6 +1708,7 @@ impl Scheduler {
     }
 }
 
+#[cfg(rustos_log_sched_debug)]
 fn saved_context_rip(saved_rsp: usize) -> Option<u64> {
     if saved_rsp == 0 {
         return None;

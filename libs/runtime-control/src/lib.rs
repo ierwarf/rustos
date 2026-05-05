@@ -104,14 +104,17 @@ pub enum StartupMode {
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct StartupEntry {
+    pub package_id: String,
     pub mode: StartupMode,
     pub desktop_file_id: String,
     pub display_name: String,
     pub exec: String,
+    pub runtime_deps: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct DesktopProgramEntry {
+    pub package_id: String,
     pub desktop_file_id: String,
     pub display_name: String,
     pub exec: String,
@@ -123,6 +126,7 @@ pub struct DesktopProgramEntry {
     pub console_hosted: bool,
     pub args: Vec<String>,
     pub env: Vec<String>,
+    pub runtime_deps: Vec<String>,
     pub hidden: bool,
     pub no_display: bool,
 }
@@ -275,10 +279,12 @@ pub fn load_startup_entries(path: &str) -> Result<Vec<StartupEntry>, std::io::Er
         .into_iter()
         .filter(|entry| entry.startup != StartupMode::None)
         .map(|entry| StartupEntry {
+            package_id: entry.package_id,
             mode: entry.startup,
             desktop_file_id: entry.desktop_file_id,
             display_name: entry.display_name,
             exec: entry.exec,
+            runtime_deps: entry.runtime_deps,
         })
         .collect::<Vec<_>>();
     entries.sort_by(|lhs, rhs| {
@@ -420,19 +426,32 @@ fn parse_startup_registry_entry(line: &str) -> Option<StartupEntry> {
     let desktop_file_id = registry_field(line, "desktop_id")
         .map(str::to_string)
         .unwrap_or_else(|| fallback_startup_desktop_file_id(exec.as_str()));
+    let package_id = registry_field(line, "package_id")
+        .map(str::to_string)
+        .unwrap_or_else(|| fallback_package_id(&desktop_file_id, exec.as_str()));
     let display_name = registry_field(line, "display_name")?.to_string();
     let mode = parse_startup_mode(registry_field(line, "mode")?)?;
+    let runtime_deps = registry_field(line, "deps")
+        .map(parse_registry_deps)
+        .unwrap_or_default();
 
     Some(StartupEntry {
+        package_id,
         mode,
         desktop_file_id,
         display_name,
         exec,
+        runtime_deps,
     })
 }
 
 fn parse_desktop_registry_entry(line: &str) -> Option<DesktopProgramEntry> {
     let desktop_file_id = registry_field(line, "desktop_id")?.to_string();
+    let package_id = registry_field(line, "package_id")
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            fallback_package_id(&desktop_file_id, registry_field(line, "exec").unwrap_or(""))
+        });
     let display_name = registry_field(line, "display_name")?.to_string();
     let exec = registry_field(line, "exec")?.to_string();
     let startup = parse_startup_mode(registry_field(line, "startup")?)?;
@@ -454,6 +473,9 @@ fn parse_desktop_registry_entry(line: &str) -> Option<DesktopProgramEntry> {
     let env = registry_field(line, "env")
         .map(parse_registry_list)
         .unwrap_or_default();
+    let runtime_deps = registry_field(line, "deps")
+        .map(parse_registry_deps)
+        .unwrap_or_default();
     let autostart_enabled = registry_field(line, "autostart_enabled")
         .map(parse_registry_bool)
         .unwrap_or(false);
@@ -465,6 +487,7 @@ fn parse_desktop_registry_entry(line: &str) -> Option<DesktopProgramEntry> {
         .unwrap_or(false);
 
     Some(DesktopProgramEntry {
+        package_id,
         desktop_file_id,
         display_name,
         exec,
@@ -476,6 +499,7 @@ fn parse_desktop_registry_entry(line: &str) -> Option<DesktopProgramEntry> {
         console_hosted,
         args,
         env,
+        runtime_deps,
         hidden,
         no_display,
     })
@@ -502,6 +526,8 @@ fn parse_desktop_program_entry(
     let mut console_hosted = None::<bool>;
     let mut args = None::<Vec<String>>;
     let mut env = Vec::<String>::new();
+    let mut package_id = None::<String>;
+    let mut runtime_deps = Vec::<String>::new();
 
     for raw_line in contents.lines() {
         let line = raw_line.trim();
@@ -538,6 +564,8 @@ fn parse_desktop_program_entry(
             "X-RustOS-ConsoleHosted" => console_hosted = Some(parse_desktop_bool(value)),
             "X-RustOS-Argv" => args = Some(parse_desktop_list(value)),
             "X-RustOS-Env" => env = parse_desktop_list(value),
+            "X-RustOS-PackageId" => package_id = Some(value.to_string()),
+            "X-RustOS-Deps" => runtime_deps = parse_desktop_deps(value),
             _ => {}
         }
     }
@@ -561,10 +589,12 @@ fn parse_desktop_program_entry(
         .cloned()
         .or_else(|| exec_tokens.first().cloned())?;
     let desktop_file_id = path.file_name()?.to_str()?.to_string();
+    let package_id = package_id.unwrap_or_else(|| fallback_package_id(&desktop_file_id, &exec));
     let display_name =
         display_name.unwrap_or_else(|| fallback_display_name(&desktop_file_id, &exec));
 
     Some(DesktopProgramEntry {
+        package_id,
         desktop_file_id,
         display_name,
         exec,
@@ -576,6 +606,7 @@ fn parse_desktop_program_entry(
         console_hosted: console_hosted.unwrap_or(terminal),
         args,
         env,
+        runtime_deps,
         hidden,
         no_display,
     })
@@ -657,6 +688,17 @@ fn parse_desktop_list(value: &str) -> Vec<String> {
         .collect()
 }
 
+fn parse_desktop_deps(value: &str) -> Vec<String> {
+    if value.is_empty() {
+        return Vec::new();
+    }
+    value
+        .split(',')
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn parse_registry_bool(value: &str) -> bool {
     matches!(value, "1" | "true" | "True")
 }
@@ -670,6 +712,10 @@ fn parse_registry_list(value: &str) -> Vec<String> {
         .filter(|item| !item.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+fn parse_registry_deps(value: &str) -> Vec<String> {
+    parse_desktop_deps(value)
 }
 
 fn registry_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
@@ -686,6 +732,21 @@ fn fallback_startup_desktop_file_id(exec: &str) -> String {
         .filter(|value| !value.is_empty())
         .map(|value| format!("{value}.desktop"))
         .unwrap_or_else(|| exec.to_string())
+}
+
+fn fallback_package_id(desktop_file_id: &str, exec: &str) -> String {
+    Path::new(desktop_file_id)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            Path::new(exec)
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or(exec)
+        .to_string()
 }
 
 fn desktop_list_contains(value: &str, entry: &str) -> bool {
@@ -754,11 +815,12 @@ mod tests {
     #[test]
     fn parse_desktop_program_entry_reads_generated_metadata() {
         let entry = parse_desktop_program_entry(
-            "[Desktop Entry]\nType=Application\nName=WayClick\nExec=apps/wayclick/wayclick.elf\nTerminal=false\nOnlyShowIn=RustOS;\nX-RustOS-Startup=none\nX-RustOS-WeightMicros=50\nX-RustOS-LogicalAdmin=false\nX-RustOS-ConsoleHosted=false\nX-RustOS-Argv=apps/wayclick/wayclick.elf|--test\nX-RustOS-Env=A=1|B=2\n",
+            "[Desktop Entry]\nType=Application\nName=WayClick\nExec=apps/wayclick/wayclick.elf\nTerminal=false\nOnlyShowIn=RustOS;\nX-RustOS-PackageId=wayclick\nX-RustOS-Startup=none\nX-RustOS-Deps=runtimed,sessiond\nX-RustOS-WeightMicros=50\nX-RustOS-LogicalAdmin=false\nX-RustOS-ConsoleHosted=false\nX-RustOS-Argv=apps/wayclick/wayclick.elf|--test\nX-RustOS-Env=A=1|B=2\n",
             Path::new("/usr/share/applications/wayclick.desktop"),
             DesktopLoadMode::Applications,
         )
         .expect("desktop entry");
+        assert_eq!(entry.package_id, "wayclick");
         assert_eq!(entry.desktop_file_id, "wayclick.desktop");
         assert_eq!(entry.display_name, "WayClick");
         assert_eq!(entry.exec, "apps/wayclick/wayclick.elf");
@@ -767,6 +829,7 @@ mod tests {
         assert!(!entry.console_hosted);
         assert_eq!(entry.args, vec!["apps/wayclick/wayclick.elf", "--test"]);
         assert_eq!(entry.env, vec!["A=1", "B=2"]);
+        assert_eq!(entry.runtime_deps, vec!["runtimed", "sessiond"]);
     }
 
     #[test]
@@ -782,11 +845,23 @@ mod tests {
     #[test]
     fn parse_startup_registry_entry_reads_desktop_id() {
         let entry = parse_startup_registry_entry(
-            "desktop_id=runtimed.desktop\tmode=init\tdisplay_name=runtimed\texec=services/runtimed/runtimed.elf\tlaunch=none",
+            "desktop_id=runtimed.desktop\tpackage_id=runtimed\tmode=init\tdisplay_name=runtimed\texec=services/runtimed/runtimed.elf\tlaunch=none\tdeps=bootd,storaged",
         )
         .expect("startup entry");
+        assert_eq!(entry.package_id, "runtimed");
         assert_eq!(entry.desktop_file_id, "runtimed.desktop");
         assert_eq!(entry.mode, StartupMode::Init);
         assert_eq!(entry.exec, "services/runtimed/runtimed.elf");
+        assert_eq!(entry.runtime_deps, vec!["bootd", "storaged"]);
+    }
+
+    #[test]
+    fn parse_registry_entries_default_to_empty_deps() {
+        let entry = parse_startup_registry_entry(
+            "desktop_id=runtimed.desktop\tmode=init\tdisplay_name=runtimed\texec=services/runtimed/runtimed.elf\tlaunch=none",
+        )
+        .expect("startup entry");
+        assert_eq!(entry.package_id, "runtimed");
+        assert!(entry.runtime_deps.is_empty());
     }
 }

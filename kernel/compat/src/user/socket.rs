@@ -10,6 +10,7 @@ use spin::Mutex;
 use crate::arch::rtc;
 use crate::user::handles::KernelHandle;
 use crate::user::linux as linux_abi;
+use kernel_object::api::handle::HandleRights;
 
 const MAX_LISTEN_BACKLOG: usize = 128;
 const SOCKET_BUFFER_CAPACITY: usize = 1024 * 1024;
@@ -70,6 +71,7 @@ struct ConnectedState {
 pub(crate) struct PassedHandle {
     handle: KernelHandle,
     status_flags: u64,
+    rights: HandleRights,
 }
 
 #[derive(Clone, Debug)]
@@ -647,9 +649,19 @@ impl SocketHandle {
 
 impl PassedHandle {
     pub(crate) fn new(handle: KernelHandle, status_flags: u64) -> Self {
+        let rights = handle.default_rights(status_flags);
+        Self::new_with_rights(handle, status_flags, rights)
+    }
+
+    pub(crate) fn new_with_rights(
+        handle: KernelHandle,
+        status_flags: u64,
+        rights: HandleRights,
+    ) -> Self {
         Self {
             handle,
             status_flags,
+            rights,
         }
     }
 
@@ -659,6 +671,10 @@ impl PassedHandle {
 
     pub(crate) fn status_flags(&self) -> u64 {
         self.status_flags
+    }
+
+    pub(crate) fn rights(&self) -> HandleRights {
+        self.rights
     }
 }
 
@@ -1023,13 +1039,11 @@ mod tests {
             SocketHandle::new_unix_stream_with_owner(SocketCredentials::new(1, 1000, 1000));
         listener.bind("/run/user/1000/unlink-test.sock").unwrap();
 
-        assert!(
-            unlink_bound_path(
-                "/run/user/1000/unlink-test.sock",
-                SocketCredentials::new(1, 1000, 1000)
-            )
-            .is_ok()
-        );
+        assert!(unlink_bound_path(
+            "/run/user/1000/unlink-test.sock",
+            SocketCredentials::new(1, 1000, 1000)
+        )
+        .is_ok());
         assert!(listener.bound_path().is_none());
     }
 }

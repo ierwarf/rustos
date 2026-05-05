@@ -405,12 +405,7 @@ impl UserProcessState {
         &mut self.handles
     }
 
-    pub fn record_shared_memfd_mapping(
-        &mut self,
-        start: u64,
-        len: u64,
-        hold: MemfdMappingHold,
-    ) {
+    pub fn record_shared_memfd_mapping(&mut self, start: u64, len: u64, hold: MemfdMappingHold) {
         self.shared_memfd_mappings
             .push(SharedMemfdMapping { start, len, hold });
     }

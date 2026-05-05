@@ -440,10 +440,22 @@ impl AppState {
         runtime: &RuntimeClient,
         session_handle: ConsoleSessionHandle,
     ) -> Result<VisualUpdate, i32> {
-        runtime.request_terminate_session(session_handle)?;
-        if self.focused_session_handle == session_handle {
-            self.focused_session_handle = 0;
+        self.mark_console_session_closing(session_handle);
+        let closed_was_focused = self.focused_session_handle == session_handle;
+        self.console_windows
+            .retain(|window| window.session_handle != session_handle);
+        if self.console_windows.is_empty() {
+            self.next_console_snapshot_index = 0;
+        } else if self.next_console_snapshot_index >= self.console_windows.len() {
+            self.next_console_snapshot_index %= self.console_windows.len();
         }
+        if closed_was_focused {
+            self.focused_session_handle = 0;
+            for window in &mut self.console_windows {
+                window.minimized = true;
+            }
+        }
+        let _ = runtime.request_terminate_session(session_handle);
         if self.dragging_window == Some(DragTarget::Console(session_handle)) {
             self.dragging_window = None;
         }

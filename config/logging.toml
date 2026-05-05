@@ -1,0 +1,24 @@
+enabled = true
+boot_trace_enabled = true
+serial_mirror = true
+ring_buffer_bytes = 16384
+min_level = "info"
+
+[categories]
+boot = "info"
+panic = "fatal"
+memory = "info"
+sched = "info"
+syscall = "off"
+process = "info"
+driver = "info"
+storage = "info"
+usb = "info"
+input = "info"
+display = "info"
+vfs = "info"
+console = "info"
+service = "info"
+compat = "info"
+debug = "info"
+heartbeat = "info"

@@ -53,15 +53,17 @@ const NVME_IDENTIFY_BYTES: usize = 4096;
 const NVME_DATA_BUFFER_BYTES: usize = 4096;
 const NVME_WAIT_SPINS: usize = 5_000_000;
 
-fn emit_nvme(level: diag_abi::DiagLevel, event_id: u16, object_id: u64, message: String) {
-    crate::debug::emit_text(
-        diag_abi::DiagProvider::Io,
-        level,
-        event_id,
-        0,
-        object_id,
-        message.as_str(),
-    );
+fn emit_nvme(level: crate::debug::LogLevel, event_id: u16, object_id: u64, message: String) {
+    let _ = (event_id, object_id);
+    match level {
+        crate::debug::LogLevel::Trace => crate::debug::trace!(storage, "{}", message),
+        crate::debug::LogLevel::Debug => crate::debug::debug!(storage, "{}", message),
+        crate::debug::LogLevel::Info => crate::debug::info!(storage, "{}", message),
+        crate::debug::LogLevel::Warn => crate::debug::warn!(storage, "{}", message),
+        crate::debug::LogLevel::Error | crate::debug::LogLevel::Fatal => {
+            crate::debug::error!(storage, "{}", message)
+        }
+    }
 }
 
 #[repr(C)]
@@ -156,25 +158,28 @@ pub(crate) fn probe_devices() -> Vec<Box<dyn BlockDeviceOps>> {
         let prog_if = pci.prog_if();
         let qemu_nvme = vendor == 0x1b36 && device == 0x0010;
 
-        if (class_code == PCI_CLASS_MASS_STORAGE || qemu_nvme)
-            && crate::debug::should_emit(diag_abi::DiagProvider::Io, diag_abi::DiagLevel::Debug)
+        #[cfg(rustos_log_storage_debug)]
         {
-            emit_nvme(
-                diag_abi::DiagLevel::Debug,
-                0,
-                0,
-                format!(
-                    "nvme: pci {:02x}:{:02x}.{} vendor={:04x} device={:04x} class={:02x}/{:02x}/{:02x}",
-                    pci.bus,
-                    pci.device,
-                    pci.function,
-                    vendor,
-                    device,
-                    class_code,
-                    subclass,
-                    prog_if
-                ),
-            );
+            if (class_code == PCI_CLASS_MASS_STORAGE || qemu_nvme)
+                && crate::debug::enabled!(storage, debug)
+            {
+                emit_nvme(
+                    crate::debug::LogLevel::Debug,
+                    0,
+                    0,
+                    format!(
+                        "nvme: pci {:02x}:{:02x}.{} vendor={:04x} device={:04x} class={:02x}/{:02x}/{:02x}",
+                        pci.bus,
+                        pci.device,
+                        pci.function,
+                        vendor,
+                        device,
+                        class_code,
+                        subclass,
+                        prog_if
+                    ),
+                );
+            }
         }
 
         if !(class_code == PCI_CLASS_MASS_STORAGE
@@ -187,23 +192,22 @@ pub(crate) fn probe_devices() -> Vec<Box<dyn BlockDeviceOps>> {
         match probe_controller(pci) {
             Ok(Some(device)) => devices.push(Box::new(device) as Box<dyn BlockDeviceOps>),
             Ok(None) => {}
-            Err(_err)
-                if crate::debug::should_emit(
-                    diag_abi::DiagProvider::Io,
-                    diag_abi::DiagLevel::Warn,
-                ) =>
-            {
-                emit_nvme(
-                    diag_abi::DiagLevel::Warn,
-                    1,
-                    0,
-                    format!(
-                        "nvme: controller {:02x}:{:02x}.{} skipped: {:?}",
-                        pci.bus, pci.device, pci.function, _err
-                    ),
-                );
+            Err(_err) => {
+                #[cfg(rustos_log_storage_warn)]
+                {
+                    if crate::debug::enabled!(storage, warn) {
+                        emit_nvme(
+                            crate::debug::LogLevel::Warn,
+                            1,
+                            0,
+                            format!(
+                                "nvme: controller {:02x}:{:02x}.{} skipped: {:?}",
+                                pci.bus, pci.device, pci.function, _err
+                            ),
+                        );
+                    }
+                }
             }
-            Err(_) => {}
         }
         false
     });
@@ -220,11 +224,13 @@ impl SharedBlockDevice for NvmeBlockDevice {
     }
 
     fn read_blocks(&mut self, lba: u64, out: &mut [u8]) -> IoResult<()> {
-        let trace =
-            crate::debug::should_emit(diag_abi::DiagProvider::Io, diag_abi::DiagLevel::Debug);
+        #[cfg(rustos_log_storage_debug)]
+        let trace = crate::debug::enabled!(storage, debug);
+        #[cfg(not(rustos_log_storage_debug))]
+        let trace = false;
         if trace {
             emit_nvme(
-                diag_abi::DiagLevel::Debug,
+                crate::debug::LogLevel::Debug,
                 2,
                 self.namespace_id as u64,
                 format!(
@@ -281,7 +287,7 @@ impl SharedBlockDevice for NvmeBlockDevice {
         }
         if trace {
             emit_nvme(
-                diag_abi::DiagLevel::Debug,
+                crate::debug::LogLevel::Debug,
                 3,
                 self.namespace_id as u64,
                 format!(
@@ -488,22 +494,25 @@ fn probe_controller(pci: PciDevice) -> Result<Option<NvmeBlockDevice>, DiskIoErr
         return Err(DiskIoError::Unsupported);
     }
 
-    if crate::debug::should_emit(diag_abi::DiagProvider::Io, diag_abi::DiagLevel::Info) {
-        emit_nvme(
-            diag_abi::DiagLevel::Info,
-            4,
-            namespace_id as u64,
-            format!(
-                "nvme: controller {:02x}:{:02x}.{} version={:#x} blocks={} block_size={} model={}",
-                pci.bus,
-                pci.device,
-                pci.function,
-                controller.version,
-                block_count,
-                logical_block_size,
-                model
-            ),
-        );
+    #[cfg(rustos_log_storage_info)]
+    {
+        if crate::debug::enabled!(storage, info) {
+            emit_nvme(
+                crate::debug::LogLevel::Info,
+                4,
+                namespace_id as u64,
+                format!(
+                    "nvme: controller {:02x}:{:02x}.{} version={:#x} blocks={} block_size={} model={}",
+                    pci.bus,
+                    pci.device,
+                    pci.function,
+                    controller.version,
+                    block_count,
+                    logical_block_size,
+                    model
+                ),
+            );
+        }
     }
 
     Ok(Some(NvmeBlockDevice {

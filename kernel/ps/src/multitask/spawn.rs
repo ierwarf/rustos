@@ -1,4 +1,3 @@
-use diag_abi::{DiagLevel, DiagProvider};
 use x86_64::VirtAddr;
 use x86_64::instructions::interrupts;
 
@@ -114,16 +113,9 @@ pub fn init() {
     }
 
     crate::arch::pit::start_micros(0, MAIN_THREAD_SLICE_MICROS);
-    crate::debug::emit_text(
-        DiagProvider::Sched,
-        DiagLevel::Info,
-        10,
-        0,
-        0,
-        "scheduler initialized",
-    );
-    crate::debug::println!(
-        "multitask: scheduler initialized slice_micros={}",
+    crate::debug::info!(
+        sched,
+        "scheduler initialized slice_micros={}",
         MAIN_THREAD_SLICE_MICROS
     );
 }

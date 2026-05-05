@@ -63,6 +63,11 @@ pub(crate) fn service_pending() -> usize {
     total
 }
 
+pub(crate) fn host_controllers_available() -> bool {
+    let state = USB_STATE.lock();
+    state.runtime_initialized && !state.controllers.is_empty()
+}
+
 #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 fn scan_host_controllers() -> Vec<UsbHostControllerInfo> {
     let mut controllers = Vec::new();

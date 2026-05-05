@@ -11,6 +11,8 @@ use x86_64::instructions::interrupts;
 
 static JIFFIES: AtomicU64 = AtomicU64::new(0);
 static BOOT_CPU_DATA: [u8; 256] = [0; 256];
+static CPU_NUMBER: i32 = 0;
+static THIS_CPU_OFF: usize = 0;
 static X86_HYPER_TYPE: i32 = 0;
 static IRQ_SPIN_LOCKS: Mutex<Vec<&'static CompatLockState>> = Mutex::new(Vec::new());
 static MUTEX_LOCKS: Mutex<Vec<&'static CompatLockState>> = Mutex::new(Vec::new());
@@ -90,6 +92,26 @@ pub(crate) unsafe extern "C" fn _raw_spin_unlock(lock: *mut c_void) {
     let state = compat_lock_state(&IRQ_SPIN_LOCKS, lock as usize);
     release_compat_lock(state, owner);
 }
+
+pub(crate) unsafe extern "C" fn _raw_spin_lock_bh(lock: *mut c_void) {
+    unsafe { _raw_spin_lock(lock) };
+}
+
+pub(crate) unsafe extern "C" fn _raw_spin_unlock_bh(lock: *mut c_void) {
+    unsafe { _raw_spin_unlock(lock) };
+}
+
+pub(crate) unsafe extern "C" fn _raw_spin_trylock(lock: *mut c_void) -> i32 {
+    let owner = current_lock_owner_token();
+    let state = compat_lock_state(&IRQ_SPIN_LOCKS, lock as usize);
+    i32::from(try_acquire_compat_lock(state, owner))
+}
+
+pub(crate) unsafe extern "C" fn __local_bh_enable_ip(_ip: usize, _cnt: u32) {}
+
+pub(crate) unsafe extern "C" fn __rcu_read_lock() {}
+
+pub(crate) unsafe extern "C" fn __rcu_read_unlock() {}
 
 pub(crate) unsafe extern "C" fn _raw_spin_lock_irqsave(lock: *mut c_void) -> usize {
     let flags = interrupts::are_enabled() as usize;
@@ -199,9 +221,7 @@ pub(crate) unsafe extern "C" fn __msecs_to_jiffies(milliseconds: u32) -> u64 {
 }
 
 pub(crate) unsafe extern "C" fn _printk(fmt: *const c_char) -> i32 {
-    crate::debug::write_debugcon_only_line(b"linux compat: _printk begin");
-    write_cstr(fmt);
-    crate::debug::write_debugcon_only_line(b"linux compat: _printk end");
+    emit_linux_printk(b"linux printk: ", fmt);
     0
 }
 
@@ -210,27 +230,27 @@ pub(crate) unsafe extern "C" fn _dev_printk(
     _dev: *mut c_void,
     fmt: *const c_char,
 ) -> i32 {
-    write_cstr(fmt);
+    emit_linux_printk(b"linux dev: ", fmt);
     0
 }
 
 pub(crate) unsafe extern "C" fn _dev_err(_dev: *mut c_void, fmt: *const c_char) -> i32 {
-    write_cstr(fmt);
+    emit_linux_printk(b"linux dev_err: ", fmt);
     0
 }
 
 pub(crate) unsafe extern "C" fn _dev_warn(_dev: *mut c_void, fmt: *const c_char) -> i32 {
-    write_cstr(fmt);
+    emit_linux_printk(b"linux dev_warn: ", fmt);
     0
 }
 
 pub(crate) unsafe extern "C" fn _dev_notice(_dev: *mut c_void, fmt: *const c_char) -> i32 {
-    write_cstr(fmt);
+    emit_linux_printk(b"linux dev_notice: ", fmt);
     0
 }
 
 pub(crate) unsafe extern "C" fn _dev_info(_dev: *mut c_void, fmt: *const c_char) -> i32 {
-    write_cstr(fmt);
+    emit_linux_printk(b"linux dev_info: ", fmt);
     0
 }
 
@@ -272,16 +292,48 @@ pub(crate) unsafe extern "C" fn ktime_get_mono_fast_ns() -> u64 {
         .saturating_add(nanoseconds.max(0) as u64)
 }
 
+pub(crate) unsafe extern "C" fn ktime_get() -> i64 {
+    unsafe { ktime_get_mono_fast_ns() as i64 }
+}
+
+pub(crate) unsafe extern "C" fn sched_clock() -> u64 {
+    unsafe { ktime_get_mono_fast_ns() }
+}
+
+pub(crate) unsafe extern "C" fn get_random_bytes(dest: *mut c_void, len: usize) {
+    if dest.is_null() || len == 0 {
+        return;
+    }
+    let mut state = unsafe { ktime_get_mono_fast_ns() } ^ 0x9e37_79b9_7f4a_7c15;
+    let bytes = unsafe { slice::from_raw_parts_mut(dest.cast::<u8>(), len) };
+    for byte in bytes {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        *byte = state as u8;
+    }
+}
+
+pub(crate) unsafe extern "C" fn sg_init_table(_sgl: *mut c_void, _nents: u32) {}
+
+pub(crate) unsafe extern "C" fn sg_init_one(_sg: *mut c_void, _buf: *const c_void, _buflen: u32) {}
+
 pub(crate) unsafe extern "C" fn refcount_warn_saturate(_ptr: *mut c_void, _type_: i32) {}
 
 pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
     match name {
         "_raw_spin_lock" => Some(_raw_spin_lock as *const () as usize),
+        "_raw_spin_lock_bh" => Some(_raw_spin_lock_bh as *const () as usize),
         "_raw_spin_lock_irq" => Some(_raw_spin_lock_irq as *const () as usize),
         "_raw_spin_lock_irqsave" => Some(_raw_spin_lock_irqsave as *const () as usize),
+        "_raw_spin_trylock" => Some(_raw_spin_trylock as *const () as usize),
         "_raw_spin_unlock" => Some(_raw_spin_unlock as *const () as usize),
+        "_raw_spin_unlock_bh" => Some(_raw_spin_unlock_bh as *const () as usize),
         "_raw_spin_unlock_irq" => Some(_raw_spin_unlock_irq as *const () as usize),
         "_raw_spin_unlock_irqrestore" => Some(_raw_spin_unlock_irqrestore as *const () as usize),
+        "__local_bh_enable_ip" => Some(__local_bh_enable_ip as *const () as usize),
+        "__rcu_read_lock" => Some(__rcu_read_lock as *const () as usize),
+        "__rcu_read_unlock" => Some(__rcu_read_unlock as *const () as usize),
         "__mutex_init" => Some(__mutex_init as *const () as usize),
         "mutex_lock" => Some(mutex_lock as *const () as usize),
         "mutex_lock_interruptible" => Some(mutex_lock_interruptible as *const () as usize),
@@ -301,10 +353,17 @@ pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
         "snprintf" => Some(snprintf as *const () as usize),
         "sprintf" => Some(sprintf as *const () as usize),
         "ktime_get_coarse_ts64" => Some(ktime_get_coarse_ts64 as *const () as usize),
+        "ktime_get" => Some(ktime_get as *const () as usize),
         "ktime_get_mono_fast_ns" => Some(ktime_get_mono_fast_ns as *const () as usize),
+        "sched_clock" => Some(sched_clock as *const () as usize),
+        "get_random_bytes" => Some(get_random_bytes as *const () as usize),
+        "sg_init_table" => Some(sg_init_table as *const () as usize),
+        "sg_init_one" => Some(sg_init_one as *const () as usize),
         "refcount_warn_saturate" => Some(refcount_warn_saturate as *const () as usize),
         "jiffies" => Some(&JIFFIES as *const AtomicU64 as usize),
         "boot_cpu_data" => Some(&BOOT_CPU_DATA as *const [u8; 256] as usize),
+        "cpu_number" => Some(&CPU_NUMBER as *const i32 as usize),
+        "this_cpu_off" => Some(&THIS_CPU_OFF as *const usize as usize),
         "x86_hyper_type" => Some(&X86_HYPER_TYPE as *const i32 as usize),
         "vmware_tdx_hypercall" => Some(vmware_tdx_hypercall as *const () as usize),
         _ => None,
@@ -352,16 +411,26 @@ pub fn debug_irq_lock_snapshot() -> (usize, usize) {
     (owner_count, total_depth)
 }
 
-fn write_cstr(fmt: *const c_char) {
+fn emit_linux_printk(prefix: &[u8], fmt: *const c_char) {
     let Some(bytes) = cstr_bytes(fmt) else {
         return;
     };
-    if !bytes.is_empty() {
-        // Linux driver printk paths must not contend with the interactive
-        // console lock during probe/interrupt handling. Route them to the
-        // debug channel only so driver diagnostics cannot deadlock console I/O.
-        crate::debug::write_bytes(bytes);
+    let bytes = trim_trailing_line_endings(strip_linux_log_level_prefix(bytes));
+    if bytes.is_empty() {
+        return;
     }
+
+    crate::debug::write_debugcon_only_parts_line(&[prefix, bytes]);
+}
+
+fn strip_linux_log_level_prefix(bytes: &[u8]) -> &[u8] {
+    if bytes.len() >= 2 && bytes[0] == 0x01 {
+        match bytes[1] {
+            b'0'..=b'7' | b'c' | b'd' => return &bytes[2..],
+            _ => {}
+        }
+    }
+    bytes
 }
 
 fn cstr_bytes<'a>(fmt: *const c_char) -> Option<&'a [u8]> {
@@ -376,6 +445,14 @@ fn cstr_bytes<'a>(fmt: *const c_char) -> Option<&'a [u8]> {
         cursor = unsafe { cursor.add(1) };
     }
     Some(unsafe { slice::from_raw_parts(fmt as *const u8, len) })
+}
+
+fn trim_trailing_line_endings(bytes: &[u8]) -> &[u8] {
+    let mut len = bytes.len();
+    while len != 0 && matches!(bytes[len - 1], b'\n' | b'\r') {
+        len -= 1;
+    }
+    &bytes[..len]
 }
 
 fn current_lock_owner_token() -> usize {

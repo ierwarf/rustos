@@ -1,12 +1,13 @@
 use alloc::vec;
 use alloc::vec::Vec;
+use core::arch::asm;
+use core::cell::UnsafeCell;
 use core::mem::size_of;
 use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use diag_abi::DebugModuleInfo;
 use driver_abi::{
-    DriverBus, DriverClass, DriverInitFn, DriverModuleHeader, RUSTOS_DRIVER_ABI_VERSION_SYMBOL,
+    DriverBus, DriverClass, DriverModuleHeader, RUSTOS_DRIVER_ABI_VERSION_SYMBOL,
     RUSTOS_DRIVER_HEADER_SYMBOL, RUSTOS_DRIVER_INIT_SYMBOL,
 };
 use object::LittleEndian;
@@ -21,14 +22,14 @@ use super::{bus, class, export, module_registry, registry};
 
 macro_rules! driver_diag {
     ($level:expr, $event_id:expr, $object_id:expr, $($arg:tt)*) => {{
-        if crate::debug::should_emit(diag_abi::DiagProvider::Driver, $level) {
-            crate::debug::emit_text(
-                diag_abi::DiagProvider::Driver,
+        let _ = ($event_id, $object_id);
+        if crate::debug::should_emit(crate::debug::LogCategory::Driver, $level) {
+            crate::debug::log_args_site(
+                crate::debug::LogCategory::Driver,
                 $level,
-                $event_id,
-                0,
-                $object_id,
-                &alloc::format!($($arg)*),
+                module_path!(),
+                line!(),
+                format_args!($($arg)*),
             );
         }
     }};
@@ -44,8 +45,9 @@ const MAX_MODULE_RELOCATIONS: usize = 262144;
 const MAX_MODULE_SECTION_ALIGN: usize = 64 * 1024;
 const MAX_MODULE_ARENA_BYTES: usize = 128 * 1024 * 1024;
 const MAX_COMPAT_TRAMPOLINES: usize = 4096;
-const TRAMPOLINE_SIZE: usize = 16;
+const TRAMPOLINE_SIZE: usize = 32;
 const TRAMPOLINES_PER_PAGE: usize = MODULE_PAGE_SIZE / TRAMPOLINE_SIZE;
+const MODULE_INIT_STACK_SIZE: usize = 16 * 1024 * 1024;
 
 const R_X86_64_64: u32 = 1;
 const R_X86_64_PC32: u32 = 2;
@@ -93,7 +95,76 @@ static PENDING_MODULE_EXEC_RANGES: Mutex<Vec<PendingModuleExecRange>> = Mutex::n
 static KERNEL_COMPAT_TRAMPOLINES: Mutex<Vec<KernelCompatTrampoline>> = Mutex::new(Vec::new());
 static KERNEL_COMPAT_TRAMPOLINE_PAGES: Mutex<Vec<KernelCompatTrampolinePage>> =
     Mutex::new(Vec::new());
+static MODULE_INIT_STACK_LOCK: Mutex<()> = Mutex::new(());
 static MODULE_ARENA_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+#[repr(align(16))]
+struct ModuleInitStack {
+    #[allow(dead_code)]
+    bytes: [u8; MODULE_INIT_STACK_SIZE],
+}
+
+struct ModuleInitStackMemory(UnsafeCell<ModuleInitStack>);
+
+unsafe impl Sync for ModuleInitStackMemory {}
+
+static MODULE_INIT_STACK: ModuleInitStackMemory =
+    ModuleInitStackMemory(UnsafeCell::new(ModuleInitStack {
+        bytes: [0; MODULE_INIT_STACK_SIZE],
+    }));
+
+#[inline(always)]
+fn module_init_stack_top() -> usize {
+    let base = MODULE_INIT_STACK.0.get() as *const ModuleInitStack as usize;
+    base + MODULE_INIT_STACK_SIZE
+}
+
+#[inline(always)]
+unsafe fn call_with_module_init_stack0(entry: usize) -> i32 {
+    let _guard = MODULE_INIT_STACK_LOCK.lock();
+    let mut result: i32;
+    let stack_top = module_init_stack_top();
+    unsafe {
+        asm!(
+            "push rbx",
+            "mov rbx, rsp",
+            "mov rsp, rdx",
+            "and rsp, -16",
+            "call rax",
+            "mov rsp, rbx",
+            "pop rbx",
+            in("rax") entry,
+            in("rdx") stack_top,
+            lateout("eax") result,
+            clobber_abi("C"),
+        );
+    }
+    result
+}
+
+#[inline(always)]
+unsafe fn call_with_module_init_stack1(entry: usize, arg0: usize) -> i32 {
+    let _guard = MODULE_INIT_STACK_LOCK.lock();
+    let mut result: i32;
+    let stack_top = module_init_stack_top();
+    unsafe {
+        asm!(
+            "push rbx",
+            "mov rbx, rsp",
+            "mov rsp, rdx",
+            "and rsp, -16",
+            "call rax",
+            "mov rsp, rbx",
+            "pop rbx",
+            in("rax") entry,
+            in("rdi") arg0,
+            in("rdx") stack_top,
+            lateout("eax") result,
+            clobber_abi("C"),
+        );
+    }
+    result
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ModuleMemoryClass {
@@ -192,7 +263,7 @@ pub(super) fn validate_module_image(
     expected_bus: DriverBus,
 ) -> Result<DriverModuleHeader, &'static str> {
     driver_diag!(
-        diag_abi::DiagLevel::Debug,
+        crate::debug::LogLevel::Debug,
         1,
         0,
         "driver validate begin: name={} class={} bus={} path={}",
@@ -204,7 +275,7 @@ pub(super) fn validate_module_image(
     let image = crate::vfs::read_path_to_vec_for_kernel(image_path)
         .map_err(|_| "module image not found")?;
     driver_diag!(
-        diag_abi::DiagLevel::Debug,
+        crate::debug::LogLevel::Debug,
         2,
         0,
         "driver validate read complete: path={} bytes={}",
@@ -220,7 +291,7 @@ pub(super) fn validate_module_image(
     )?
     .header;
     driver_diag!(
-        diag_abi::DiagLevel::Debug,
+        crate::debug::LogLevel::Debug,
         9,
         0,
         "driver validate header done: path={} abi_version={} class={} bus={}",
@@ -281,7 +352,10 @@ pub(super) fn load_module_image_explicit(
     bus: DriverBus,
     image_path: &'static str,
 ) -> Result<LoadedModuleInfo, &'static str> {
-    crate::debug::println!(
+    driver_diag!(
+        crate::debug::LogLevel::Debug,
+        10,
+        0,
         "driver loader: read begin name={} class={} bus={} path={}",
         name,
         class::name(class),
@@ -290,7 +364,10 @@ pub(super) fn load_module_image_explicit(
     );
     let image = crate::vfs::read_path_to_vec_for_kernel(image_path)
         .map_err(|_| "module image not found")?;
-    crate::debug::println!(
+    driver_diag!(
+        crate::debug::LogLevel::Debug,
+        11,
+        0,
         "driver loader: read done name={} bytes={} path={}",
         name,
         image.len(),
@@ -298,14 +375,20 @@ pub(super) fn load_module_image_explicit(
     );
     let ValidatedModuleImage { elf, abi, header } =
         parse_validated_module_image(image.as_ref(), name, class, bus, image_path)?;
-    crate::debug::println!(
+    driver_diag!(
+        crate::debug::LogLevel::Debug,
+        12,
+        0,
         "driver loader: validate done name={} path={}",
         name,
         image_path,
     );
     let policy = SymbolResolvePolicy::new(name, class, bus, abi);
     let (mut memory, layout) = allocate_module_memory(&elf)?;
-    crate::debug::println!(
+    driver_diag!(
+        crate::debug::LogLevel::Debug,
+        13,
+        memory.runtime_base() as u64,
         "driver loader: allocate done name={} base={:#x} size={:#x} path={}",
         name,
         memory.runtime_base(),
@@ -320,7 +403,10 @@ pub(super) fn load_module_image_explicit(
         &layout,
         policy,
     )?;
-    crate::debug::println!(
+    driver_diag!(
+        crate::debug::LogLevel::Debug,
+        14,
+        memory.runtime_base() as u64,
         "driver loader: relocations done name={} path={}",
         name,
         image_path,
@@ -339,7 +425,7 @@ pub(super) fn load_module_image_explicit(
                 ModuleSymbolType::Func,
             )?;
             driver_diag!(
-                diag_abi::DiagLevel::Info,
+                crate::debug::LogLevel::Info,
                 20,
                 memory.runtime_base() as u64,
                 "driver module init begin: name={} abi=rustos path={} base={:#x} host={:#x} entry={:#x}",
@@ -349,23 +435,27 @@ pub(super) fn load_module_image_explicit(
                 memory.host_base() as usize,
                 init_addr
             );
-            crate::debug::println!(
+            driver_diag!(
+                crate::debug::LogLevel::Info,
+                24,
+                memory.runtime_base() as u64,
                 "driver module init call: name={} abi=rustos path={} entry={:#x}",
                 name,
                 image_path,
                 init_addr
             );
-            crate::debug::write_debugcon_only_line(
-                alloc::format!(
-                    "driver raw init call: name={} abi=rustos path={} entry={:#x}",
-                    name,
-                    image_path,
-                    init_addr
-                )
-                .as_bytes(),
+            driver_diag!(
+                crate::debug::LogLevel::Debug,
+                25,
+                memory.runtime_base() as u64,
+                "driver module init raw-call: name={} abi=rustos path={} entry={:#x}",
+                name,
+                image_path,
+                init_addr
             );
-            let init: DriverInitFn = unsafe { core::mem::transmute(init_addr) };
-            unsafe { init(super::exported_kernel_api()) }
+            unsafe {
+                call_with_module_init_stack1(init_addr, super::exported_kernel_api() as usize)
+            }
         }
         ModuleAbi::LinuxCompat(_) => {
             let init_addr = resolve_named_symbol_addr(
@@ -376,7 +466,7 @@ pub(super) fn load_module_image_explicit(
                 ModuleSymbolType::Func,
             )?;
             driver_diag!(
-                diag_abi::DiagLevel::Info,
+                crate::debug::LogLevel::Info,
                 21,
                 memory.runtime_base() as u64,
                 "driver module init begin: name={} abi=linux path={} base={:#x} host={:#x} entry={:#x}",
@@ -386,37 +476,42 @@ pub(super) fn load_module_image_explicit(
                 memory.host_base() as usize,
                 init_addr
             );
-            crate::debug::println!(
+            driver_diag!(
+                crate::debug::LogLevel::Info,
+                26,
+                memory.runtime_base() as u64,
                 "driver module init call: name={} abi=linux path={} entry={:#x}",
                 name,
                 image_path,
                 init_addr
             );
-            crate::debug::write_debugcon_only_line(
-                alloc::format!(
-                    "driver raw init call: name={} abi=linux path={} entry={:#x}",
-                    name,
-                    image_path,
-                    init_addr
-                )
-                .as_bytes(),
+            driver_diag!(
+                crate::debug::LogLevel::Debug,
+                27,
+                memory.runtime_base() as u64,
+                "driver module init raw-call: name={} abi=linux path={} entry={:#x}",
+                name,
+                image_path,
+                init_addr
             );
-            let init: unsafe extern "C" fn() -> i32 = unsafe { core::mem::transmute(init_addr) };
-            unsafe { init() }
+            unsafe { call_with_module_init_stack0(init_addr) }
         }
     };
-    crate::debug::write_debugcon_only_line(
-        alloc::format!(
-            "driver raw init return: name={} class={} bus={} path={} status={}",
-            name,
-            class::name(class),
-            bus::name(bus),
-            image_path,
-            status
-        )
-        .as_bytes(),
+    driver_diag!(
+        crate::debug::LogLevel::Debug,
+        28,
+        memory.runtime_base() as u64,
+        "driver module init raw-return: name={} class={} bus={} path={} status={}",
+        name,
+        class::name(class),
+        bus::name(bus),
+        image_path,
+        status
     );
-    crate::debug::println!(
+    driver_diag!(
+        crate::debug::LogLevel::Info,
+        29,
+        memory.runtime_base() as u64,
         "driver module init return: name={} class={} bus={} path={} status={}",
         name,
         class::name(class),
@@ -425,7 +520,7 @@ pub(super) fn load_module_image_explicit(
         status
     );
     driver_diag!(
-        diag_abi::DiagLevel::Info,
+        crate::debug::LogLevel::Info,
         22,
         memory.runtime_base() as u64,
         "driver module init status: name={} class={} bus={} path={} status={}",
@@ -444,7 +539,7 @@ pub(super) fn load_module_image_explicit(
     let exported = module_registry::register_module_exports(name, &elf, &memory, &layout)?;
     if exported != 0 {
         driver_diag!(
-            diag_abi::DiagLevel::Info,
+            crate::debug::LogLevel::Info,
             23,
             memory.runtime_base() as u64,
             "driver module exports registered: name={} path={} count={}",
@@ -564,20 +659,6 @@ pub(crate) fn runtime_executable_addr_is_known(addr: usize) -> bool {
         .lock()
         .iter()
         .any(|entry| entry.runtime_addr == addr)
-}
-
-pub(crate) fn snapshot_loaded_modules(dest: &mut [DebugModuleInfo]) -> usize {
-    let modules = LOADED_MODULES.lock();
-    let count = dest.len().min(modules.len());
-    for (slot, module) in dest.iter_mut().zip(modules.iter()).take(count) {
-        *slot = DebugModuleInfo::empty();
-        slot.runtime_base = module._memory.runtime_base() as u64;
-        slot.host_base = module._memory.host_base() as usize as u64;
-        slot.size = module._memory.size() as u64;
-        diag_abi::encode_fixed(&mut slot.name, module._name);
-        diag_abi::encode_fixed(&mut slot.image_path, module._image_path);
-    }
-    count
 }
 
 pub(super) struct ModuleMemory {
@@ -892,18 +973,18 @@ fn debug_probe_module_memory(
         let flags = crate::memory::kernel_vm::debug_direct_map_flags_for_addr(phys)
             .map(|entry| entry.bits())
             .unwrap_or(0);
-        crate::debug::write_debugcon_only_line(
-            alloc::format!(
-                "driver module probe: name={} class={:?} runtime_off={:#x} used={:#x} mapped={:#x} phys={:#x} flags={:#x}",
-                name,
-                class,
-                region.runtime_offset,
-                region.used_size,
-                mapped_size,
-                phys,
-                flags,
-            )
-            .as_bytes(),
+        driver_diag!(
+            crate::debug::LogLevel::Debug,
+            30,
+            memory.runtime_base() as u64,
+            "driver module probe: name={} class={:?} runtime_off={:#x} used={:#x} mapped={:#x} phys={:#x} flags={:#x}",
+            name,
+            class,
+            region.runtime_offset,
+            region.used_size,
+            mapped_size,
+            phys,
+            flags,
         );
     }
 
@@ -1024,18 +1105,18 @@ fn debug_probe_writable_symbol_u32(
         ptr::write_volatile(host_ptr, before);
     }
     let after = unsafe { ptr::read_volatile(host_ptr) };
-    crate::debug::write_debugcon_only_line(
-        alloc::format!(
-            "driver module probe: name={} symbol={} runtime={:#x} host={:#x} before={:#x} after={:#x} flags={:#x}",
-            module_name,
-            symbol_name,
-            runtime_addr,
-            host_ptr as usize,
-            before,
-            after,
-            flags,
-        )
-        .as_bytes(),
+    driver_diag!(
+        crate::debug::LogLevel::Debug,
+        31,
+        runtime_addr as u64,
+        "driver module probe: name={} symbol={} runtime={:#x} host={:#x} before={:#x} after={:#x} flags={:#x}",
+        module_name,
+        symbol_name,
+        runtime_addr,
+        host_ptr as usize,
+        before,
+        after,
+        flags,
     );
 }
 
@@ -1148,20 +1229,20 @@ fn debug_probe_relocation_target(
                     crate::memory::paging::higher_half_addr(patched_target as u64) as *const u64,
                 )
             };
-            crate::debug::write_debugcon_only_line(
-                alloc::format!(
-                    "driver module probe: name={} reloc_section={} symbol={} write={:#x} disp={:#x} patched_target={:#x} resolved_target={:#x} trampoline_target={:#x} target_head={:#x}",
-                    module_name,
-                    relocation_section_name,
-                    symbol_name,
-                    write_runtime_addr,
-                    displacement,
-                    patched_target,
-                    resolved_target,
-                    trampoline_target,
-                    target_head,
-                )
-                .as_bytes(),
+            driver_diag!(
+                crate::debug::LogLevel::Debug,
+                32,
+                write_runtime_addr as u64,
+                "driver module probe: name={} reloc_section={} symbol={} write={:#x} disp={:#x} patched_target={:#x} resolved_target={:#x} trampoline_target={:#x} target_head={:#x}",
+                module_name,
+                relocation_section_name,
+                symbol_name,
+                write_runtime_addr,
+                displacement,
+                patched_target,
+                resolved_target,
+                trampoline_target,
+                target_head,
             );
             if symbol_name != "__x86_return_thunk" {
                 return;
@@ -1220,7 +1301,7 @@ fn parse_validated_module_image<'a>(
     }
 
     driver_diag!(
-        diag_abi::DiagLevel::Debug,
+        crate::debug::LogLevel::Debug,
         3,
         0,
         "driver validate parse begin: path={}",
@@ -1228,14 +1309,14 @@ fn parse_validated_module_image<'a>(
     );
     let elf = ModuleElf::parse(input)?;
     driver_diag!(
-        diag_abi::DiagLevel::Debug,
+        crate::debug::LogLevel::Debug,
         4,
         0,
         "driver validate parse done: path={}",
         image_path
     );
     driver_diag!(
-        diag_abi::DiagLevel::Debug,
+        crate::debug::LogLevel::Debug,
         5,
         0,
         "driver validate elf header begin: path={}",
@@ -1243,7 +1324,7 @@ fn parse_validated_module_image<'a>(
     );
     let elf_header = module_elf_header(&elf)?;
     driver_diag!(
-        diag_abi::DiagLevel::Debug,
+        crate::debug::LogLevel::Debug,
         6,
         0,
         "driver validate elf header done: path={} type={:#x} machine={:#x} shnum={} shentsize={} shoff={:#x}",
@@ -1262,7 +1343,7 @@ fn parse_validated_module_image<'a>(
     }
 
     driver_diag!(
-        diag_abi::DiagLevel::Debug,
+        crate::debug::LogLevel::Debug,
         7,
         0,
         "driver validate abi detect begin: path={}",
@@ -1276,7 +1357,7 @@ fn parse_validated_module_image<'a>(
         image_path,
     )?;
     driver_diag!(
-        diag_abi::DiagLevel::Debug,
+        crate::debug::LogLevel::Debug,
         8,
         0,
         "driver validate abi detect done: path={}",
@@ -1746,7 +1827,7 @@ fn copy_alloc_sections(
         let source = section_data_bytes_raw(elf, &section, "module section data is invalid")?;
         if source.len() < layout.size {
             driver_diag!(
-                diag_abi::DiagLevel::Warn,
+                crate::debug::LogLevel::Warn,
                 24,
                 index as u64,
                 "driver module section truncated: index={} type={:#x} offset={:#x} source_len={:#x} expected={:#x}",
@@ -2055,7 +2136,7 @@ fn resolve_external_symbol(
             }
             if is_optional_weak_symbol(name) {
                 driver_diag!(
-                    diag_abi::DiagLevel::Warn,
+                    crate::debug::LogLevel::Warn,
                     25,
                     0,
                     "driver module unresolved optional weak external: symbol={}",
@@ -2064,7 +2145,7 @@ fn resolve_external_symbol(
                 return Ok(0);
             }
             driver_diag!(
-                diag_abi::DiagLevel::Warn,
+                crate::debug::LogLevel::Warn,
                 26,
                 0,
                 "driver module unresolved weak external: symbol={}",
@@ -2083,7 +2164,7 @@ fn resolve_external_symbol(
     let Some(address) = address else {
         if policy.is_linux_compat() && !is_allowed_linux_external_symbol(name, policy) {
             driver_diag!(
-                diag_abi::DiagLevel::Warn,
+                crate::debug::LogLevel::Warn,
                 27,
                 0,
                 "driver module disallowed external: module={} symbol={} class={} bus={}",
@@ -2095,7 +2176,7 @@ fn resolve_external_symbol(
             return Err("module references disallowed external symbol");
         }
         driver_diag!(
-            diag_abi::DiagLevel::Warn,
+            crate::debug::LogLevel::Warn,
             28,
             0,
             "driver module unresolved external: symbol={} type={:?} binding={:?}",
@@ -2159,7 +2240,11 @@ fn resolve_linux_allowed_symbol(name: &str, policy: SymbolResolvePolicy) -> Opti
         .or_else(|| super::linux::workqueue::resolve_symbol(name))
         .or_else(|| super::linux::irq::resolve_symbol(name))
         .or_else(|| super::linux::mmio::resolve_symbol(name))
+        .or_else(|| super::linux::netdev::resolve_symbol(name))
+        .or_else(|| super::linux::skbuff::resolve_symbol(name))
+        .or_else(|| super::linux::pci::resolve_symbol(name))
         .or_else(|| super::linux::input::resolve_symbol(name))
+        .or_else(|| super::linux::virtio_drm::resolve_symbol(name))
         .or_else(|| module_registry::resolve_symbol(name));
 
     if common.is_some() {
@@ -2171,6 +2256,10 @@ fn resolve_linux_allowed_symbol(name: &str, policy: SymbolResolvePolicy) -> Opti
             .or_else(|| super::linux::usb::resolve_symbol(name)),
         (DriverClass::Input, DriverBus::Serio) => super::linux::serio::resolve_symbol(name)
             .or_else(|| super::linux::ps2::resolve_symbol(name)),
+        (DriverClass::Network, DriverBus::Virtio) => super::linux::virtio::resolve_symbol(name)
+            .or_else(|| super::linux::netdev::resolve_symbol(name))
+            .or_else(|| super::linux::skbuff::resolve_symbol(name))
+            .or_else(|| super::linux::pci::resolve_symbol(name)),
         _ => None,
     }
 }
@@ -2190,7 +2279,11 @@ fn is_allowed_linux_external_symbol(name: &str, policy: SymbolResolvePolicy) -> 
         || super::linux::workqueue::resolve_symbol(name).is_some()
         || super::linux::irq::resolve_symbol(name).is_some()
         || super::linux::mmio::resolve_symbol(name).is_some()
-        || super::linux::input::resolve_symbol(name).is_some();
+        || super::linux::netdev::resolve_symbol(name).is_some()
+        || super::linux::skbuff::resolve_symbol(name).is_some()
+        || super::linux::pci::resolve_symbol(name).is_some()
+        || super::linux::input::resolve_symbol(name).is_some()
+        || super::linux::virtio_drm::resolve_symbol(name).is_some();
     if common_allowed {
         return true;
     }
@@ -2203,6 +2296,12 @@ fn is_allowed_linux_external_symbol(name: &str, policy: SymbolResolvePolicy) -> 
         (DriverClass::Input, DriverBus::Serio) => {
             super::linux::serio::resolve_symbol(name).is_some()
                 || super::linux::ps2::resolve_symbol(name).is_some()
+        }
+        (DriverClass::Network, DriverBus::Virtio) => {
+            super::linux::virtio::resolve_symbol(name).is_some()
+                || super::linux::netdev::resolve_symbol(name).is_some()
+                || super::linux::skbuff::resolve_symbol(name).is_some()
+                || super::linux::pci::resolve_symbol(name).is_some()
         }
         _ => false,
     }
@@ -2254,20 +2353,21 @@ fn compat_trampoline_addr(target_addr: usize) -> Result<usize, &'static str> {
 
     unsafe {
         let code = host_ptr;
-        // Preserve the original SysV call-frame layout from the imported
-        // module. The module already reaches this trampoline via a normal
-        // `call`, so a plain `jmp` keeps the callee entry stack aligned the
-        // way Rust's extern "C" code expects.
-        // movabs r11, imm64 ; jmp r11
+        // Tail-jump into the resolved kernel handler so the compat module's
+        // original return address and any stack-passed arguments remain in
+        // the exact SysV layout the callee expects.
+        //
+        // movabs r11, imm64
+        // jmp r11
         code.add(0).write(0x49);
         code.add(1).write(0xBB);
         (code.add(2) as *mut u64).write_unaligned(target_addr as u64);
         code.add(10).write(0x41);
         code.add(11).write(0xFF);
         code.add(12).write(0xE3);
-        code.add(13).write(0x90);
-        code.add(14).write(0x90);
-        code.add(15).write(0x90);
+        for offset in 13..TRAMPOLINE_SIZE {
+            code.add(offset).write(0x90);
+        }
     }
 
     {

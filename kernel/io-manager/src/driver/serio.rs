@@ -262,6 +262,10 @@ pub(crate) fn has_native_drivers() -> bool {
     irq_safe(|| !SERIO_DRIVERS.lock().is_empty())
 }
 
+pub(crate) fn ports_available() -> bool {
+    irq_safe(|| !SERIO_PORTS.lock().is_empty())
+}
+
 pub(crate) fn register_port_with_ops(info: SerioPortInfo, ops: SerioPortOps) {
     irq_safe(|| {
         let mut ports = SERIO_PORTS.lock();

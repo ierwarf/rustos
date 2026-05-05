@@ -12,17 +12,17 @@ pub(crate) use kernel_ps::api as user;
 pub(crate) mod debug {
     pub(crate) use nucleus_core::debug::*;
 
-    #[cfg(rustos_debug_print_enabled)]
+    #[cfg(all(rustos_debug_print_enabled, rustos_log_debug_info))]
     macro_rules! println {
         () => {{
             nucleus_core::debug::println_newline();
         }};
         ($($arg:tt)*) => {{
-            nucleus_core::debug::println_fmt(format_args!($($arg)*));
+            nucleus_core::debug::info!(debug, $($arg)*);
         }};
     }
 
-    #[cfg(not(rustos_debug_print_enabled))]
+    #[cfg(not(all(rustos_debug_print_enabled, rustos_log_debug_info)))]
     macro_rules! println {
         () => {{}};
         ($($arg:tt)*) => {{}};
@@ -41,6 +41,8 @@ pub mod input;
 pub mod input_core;
 #[path = "io/mod.rs"]
 pub mod io;
+#[path = "network/mod.rs"]
+pub mod network;
 #[path = "storage/mod.rs"]
 pub mod storage;
 #[path = "usb/mod.rs"]

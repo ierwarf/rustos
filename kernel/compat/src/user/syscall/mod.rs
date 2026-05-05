@@ -240,18 +240,15 @@ fn user_address_is_sysret_safe(addr: u64) -> bool {
         && ((addr >> 47) & 0x1) == 0
 }
 
+#[cfg(rustos_log_syscall_debug)]
 fn trace_syscall_entry(frame: &SyscallFrame, abi: UserAbi) {
-    if !debug::should_emit(diag_abi::DiagProvider::Syscall, diag_abi::DiagLevel::Debug) {
+    if !debug::enabled!(syscall, debug) {
         return;
     }
 
     let Some(snapshot) = multitask::current_user_snapshot() else {
-        debug::emit_text(
-            diag_abi::DiagProvider::Syscall,
-            diag_abi::DiagLevel::Debug,
-            frame.rax as u16,
-            0,
-            0,
+        debug::debug!(
+            syscall,
             alloc::format!(
                 "entry abi={:?} pid=? tid=? nr={:#x} rip={:#x} rsp={:#x} rflags={:#x}",
                 abi,
@@ -260,17 +257,13 @@ fn trace_syscall_entry(frame: &SyscallFrame, abi: UserAbi) {
                 frame.user_rsp,
                 frame.user_rflags,
             )
-            .as_str(),
+            .as_str()
         );
         return;
     };
 
-    debug::emit_text(
-        diag_abi::DiagProvider::Syscall,
-        diag_abi::DiagLevel::Debug,
-        frame.rax as u16,
-        0,
-        snapshot.process_id(),
+    debug::debug!(
+        syscall,
         alloc::format!(
             "entry abi={:?} pid={} tid={} nr={:#x} rip={:#x} rsp={:#x} rflags={:#x}",
             abi,
@@ -281,22 +274,22 @@ fn trace_syscall_entry(frame: &SyscallFrame, abi: UserAbi) {
             frame.user_rsp,
             frame.user_rflags,
         )
-        .as_str(),
+        .as_str()
     );
 }
 
+#[cfg(not(rustos_log_syscall_debug))]
+fn trace_syscall_entry(_frame: &SyscallFrame, _abi: UserAbi) {}
+
+#[cfg(rustos_log_syscall_debug)]
 fn trace_syscall_exit(frame: &SyscallFrame, abi: UserAbi, result: u64) {
-    if !debug::should_emit(diag_abi::DiagProvider::Syscall, diag_abi::DiagLevel::Debug) {
+    if !debug::enabled!(syscall, debug) {
         return;
     }
 
     let Some(snapshot) = multitask::current_user_snapshot() else {
-        debug::emit_text(
-            diag_abi::DiagProvider::Syscall,
-            diag_abi::DiagLevel::Debug,
-            frame.rax as u16,
-            0,
-            0,
+        debug::debug!(
+            syscall,
             alloc::format!(
                 "exit abi={:?} nr={:#x} ret={:#x} rip={:#x} rsp={:#x} rflags={:#x}",
                 abi,
@@ -306,17 +299,13 @@ fn trace_syscall_exit(frame: &SyscallFrame, abi: UserAbi, result: u64) {
                 frame.user_rsp,
                 frame.user_rflags,
             )
-            .as_str(),
+            .as_str()
         );
         return;
     };
 
-    debug::emit_text(
-        diag_abi::DiagProvider::Syscall,
-        diag_abi::DiagLevel::Debug,
-        frame.rax as u16,
-        0,
-        snapshot.process_id(),
+    debug::debug!(
+        syscall,
         alloc::format!(
             "exit abi={:?} pid={} tid={} nr={:#x} ret={:#x} rip={:#x} rsp={:#x} rflags={:#x}",
             abi,
@@ -328,9 +317,12 @@ fn trace_syscall_exit(frame: &SyscallFrame, abi: UserAbi, result: u64) {
             frame.user_rsp,
             frame.user_rflags,
         )
-        .as_str(),
+        .as_str()
     );
 }
+
+#[cfg(not(rustos_log_syscall_debug))]
+fn trace_syscall_exit(_frame: &SyscallFrame, _abi: UserAbi, _result: u64) {}
 
 #[cfg(test)]
 mod tests {

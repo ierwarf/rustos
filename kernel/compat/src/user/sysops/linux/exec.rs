@@ -1,4 +1,3 @@
-use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -166,12 +165,14 @@ fn trace_exec_stage(stage: &str, path: &str, started_ticks: u64) {
     let elapsed_ticks = crate::arch::rtc::ticks().saturating_sub(started_ticks);
     let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
     let elapsed_ms = elapsed_ticks.saturating_mul(1000) / ticks_per_second;
-    crate::debug::write_debugcon_only_line(
-        format!(
-            "linux exec: stage={} path={} elapsed_ms={} ticks={}",
-            stage, path, elapsed_ms, elapsed_ticks
-        )
-        .as_bytes(),
+    let _ = (stage, path, elapsed_ms, elapsed_ticks);
+    crate::debug::debug!(
+        process,
+        "linux exec: stage={} path={} elapsed_ms={} ticks={}",
+        stage,
+        path,
+        elapsed_ms,
+        elapsed_ticks
     );
 }
 
@@ -179,12 +180,14 @@ fn trace_spawn_stage(stage: &str, path: &str, started_ticks: u64) {
     let elapsed_ticks = crate::arch::rtc::ticks().saturating_sub(started_ticks);
     let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
     let elapsed_ms = elapsed_ticks.saturating_mul(1000) / ticks_per_second;
-    crate::debug::write_debugcon_only_line(
-        format!(
-            "linux spawn: stage={} path={} elapsed_ms={} ticks={}",
-            stage, path, elapsed_ms, elapsed_ticks
-        )
-        .as_bytes(),
+    let _ = (stage, path, elapsed_ms, elapsed_ticks);
+    crate::debug::debug!(
+        process,
+        "linux spawn: stage={} path={} elapsed_ms={} ticks={}",
+        stage,
+        path,
+        elapsed_ms,
+        elapsed_ticks
     );
 }
 

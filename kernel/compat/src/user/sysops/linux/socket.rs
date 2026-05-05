@@ -6,12 +6,25 @@ use core::mem::size_of;
 use core::slice;
 
 use crate::multitask;
-use crate::user::handles::{FD_CLOEXEC, HandleEntry, KernelHandle};
+use crate::user::handles::{FD_CLOEXEC, HandleEntry, InetSocketHandle, KernelHandle};
 use crate::user::socket::{PassedHandle, SocketCredentials, SocketHandle};
 
 use super::*;
 
 pub(crate) fn socket(domain: u64, type_: u64, protocol: u64) -> Result<u64, LinuxSysopError> {
+    if domain == linux_abi::AF_INET {
+        let (status_flags, fd_flags, base_type) = parse_inet_socket_type(type_)?;
+        if !matches!(base_type, value if value == linux_abi::SOCK_STREAM || value == linux_abi::SOCK_DGRAM)
+        {
+            return Err(LinuxSysopError::OperationNotSupported);
+        }
+        return install_inet_socket(
+            InetSocketHandle::new(domain, base_type, protocol),
+            status_flags,
+            fd_flags,
+        );
+    }
+
     if domain != linux_abi::AF_UNIX {
         return Err(LinuxSysopError::AddressFamilyNotSupported);
     }
@@ -25,6 +38,24 @@ pub(crate) fn socket(domain: u64, type_: u64, protocol: u64) -> Result<u64, Linu
         status_flags,
         fd_flags,
     )
+}
+
+fn install_inet_socket(
+    socket: InetSocketHandle,
+    status_flags: u64,
+    fd_flags: u32,
+) -> Result<u64, LinuxSysopError> {
+    let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
+        Ok(process_state.handles_mut().install_entry(HandleEntry::new(
+            KernelHandle::InetSocket(socket),
+            fd_flags,
+            status_flags,
+        )))
+    }) else {
+        return Err(LinuxSysopError::Unsupported);
+    };
+
+    result
 }
 
 pub(crate) fn socketpair(
@@ -459,6 +490,7 @@ fn current_socket_for_fd(fd: u64) -> Result<Option<(SocketHandle, u64)>, LinuxSy
         };
         match entry.handle() {
             KernelHandle::Socket(socket) => Ok(Some((socket.clone(), entry.status_flags()))),
+            KernelHandle::InetSocket(_) => Err(LinuxSysopError::OperationNotSupported),
             _ => Ok(None),
         }
     }) else {
@@ -479,6 +511,7 @@ fn socket_handle_for_fd(fd: u64) -> Result<(SocketHandle, u64), LinuxSysopError>
         };
         match entry.handle() {
             KernelHandle::Socket(socket) => Ok((socket.clone(), entry.status_flags())),
+            KernelHandle::InetSocket(_) => Err(LinuxSysopError::OperationNotSupported),
             _ => Err(LinuxSysopError::NotSocket),
         }
     }) else {
@@ -507,6 +540,24 @@ fn parse_stream_socket_type(type_: u64) -> Result<(u64, u32), LinuxSysopError> {
         fd_flags |= FD_CLOEXEC;
     }
     Ok((status_flags, fd_flags))
+}
+
+fn parse_inet_socket_type(type_: u64) -> Result<(u64, u32, u64), LinuxSysopError> {
+    let base_type = type_ & linux_abi::SOCK_TYPE_MASK;
+    let flags = type_ & !linux_abi::SOCK_TYPE_MASK;
+    if flags & !(linux_abi::SOCK_NONBLOCK | linux_abi::SOCK_CLOEXEC) != 0 {
+        return Err(LinuxSysopError::InvalidArgument);
+    }
+
+    let mut status_flags = linux_abi::O_RDWR;
+    let mut fd_flags = 0_u32;
+    if flags & linux_abi::SOCK_NONBLOCK != 0 {
+        status_flags |= linux_abi::O_NONBLOCK;
+    }
+    if flags & linux_abi::SOCK_CLOEXEC != 0 {
+        fd_flags |= FD_CLOEXEC;
+    }
+    Ok((status_flags, fd_flags, base_type))
 }
 
 fn parse_accept4_flags(flags: u64) -> Result<(u64, u32), LinuxSysopError> {
@@ -828,12 +879,15 @@ fn write_passed_handles_to_control(
     let Some(result): Option<Result<(), LinuxSysopError>> =
         multitask::with_current_user_process_state_mut(|_, _, process_state| {
             for right in rights {
-                ensure_handle_transfer_allowed(right.handle())?;
-                let fd = process_state.handles_mut().install_entry(HandleEntry::new(
-                    right.handle().clone(),
-                    fd_flags,
-                    right.status_flags(),
-                ));
+                ensure_handle_transfer_allowed(right.handle(), right.rights())?;
+                let fd = process_state
+                    .handles_mut()
+                    .install_entry(HandleEntry::new_with_rights(
+                        right.handle().clone(),
+                        right.rights(),
+                        fd_flags,
+                        right.status_flags(),
+                    ));
                 received_fds.push(i32::try_from(fd).map_err(|_| LinuxSysopError::InvalidArgument)?);
             }
             Ok(())
@@ -870,10 +924,11 @@ fn passed_handle_for_fd(fd: u64) -> Result<PassedHandle, LinuxSysopError> {
         let Some(entry) = process_state.handles().get_entry(fd) else {
             return Err(LinuxSysopError::BadFileDescriptor);
         };
-        ensure_handle_transfer_allowed(entry.handle())?;
-        Ok(PassedHandle::new(
+        ensure_handle_transfer_allowed(entry.handle(), entry.rights())?;
+        Ok(PassedHandle::new_with_rights(
             entry.handle().clone(),
             entry.status_flags(),
+            entry.rights(),
         ))
     }) else {
         return Err(LinuxSysopError::Unsupported);
@@ -881,8 +936,11 @@ fn passed_handle_for_fd(fd: u64) -> Result<PassedHandle, LinuxSysopError> {
     result
 }
 
-fn ensure_handle_transfer_allowed(handle: &KernelHandle) -> Result<(), LinuxSysopError> {
-    if handle.supports_descriptor_transfer() {
+fn ensure_handle_transfer_allowed(
+    handle: &KernelHandle,
+    rights: kernel_object::api::handle::HandleRights,
+) -> Result<(), LinuxSysopError> {
+    if handle.supports_descriptor_transfer(rights) {
         Ok(())
     } else {
         Err(LinuxSysopError::PermissionDenied)
@@ -931,52 +989,52 @@ mod tests {
     };
     use crate::user::memfd::MemfdHandle;
     use crate::user::socket::SocketHandle;
+    use alloc::vec;
+    use kernel_object::api::handle::{FileHandleRights, HandleRights};
+
+    fn transfer_allowed(handle: &KernelHandle) -> bool {
+        ensure_handle_transfer_allowed(handle, handle.default_rights(0)).is_ok()
+    }
 
     #[test]
     fn scm_rights_whitelist_allows_only_safe_handle_classes() {
-        assert!(
-            ensure_handle_transfer_allowed(&KernelHandle::Socket(
-                SocketHandle::socketpair(Default::default()).0,
-            ))
-            .is_ok()
-        );
-        assert!(
-            ensure_handle_transfer_allowed(&KernelHandle::Memfd(MemfdHandle::new(
-                "test".into(),
-                true,
-            )))
-            .is_ok()
-        );
-        assert!(
-            ensure_handle_transfer_allowed(&KernelHandle::VfsFile(
-                VfsFileHandle::read_only_memory("/test".into(), vec![]),
-            ))
-            .is_ok()
-        );
+        assert!(transfer_allowed(&KernelHandle::Socket(
+            SocketHandle::socketpair(Default::default()).0,
+        )));
+        assert!(transfer_allowed(&KernelHandle::Memfd(MemfdHandle::new(
+            "test".into(),
+            true,
+        ))));
+        assert!(transfer_allowed(&KernelHandle::VfsFile(
+            VfsFileHandle::read_only_memory("/test".into(), vec![]),
+        )));
 
+        assert!(!transfer_allowed(&KernelHandle::Console(
+            ConsoleStreamKind::Output,
+        )));
+        assert!(!transfer_allowed(&KernelHandle::Epoll(EpollHandle::new())));
+        assert!(!transfer_allowed(&KernelHandle::VfsDirectory(
+            VfsDirectoryHandle::new("/test".into(), vec![]),
+        )));
+        assert!(!transfer_allowed(&KernelHandle::DisplaySurface(
+            DisplaySurfaceHandle::new(16, 16, crate::user::abi::device::PIXEL_FORMAT_BGRA8888, 1)
+                .expect("surface"),
+        )));
+    }
+
+    #[test]
+    fn scm_rights_rejects_transferable_class_without_transfer_right() {
+        let handle = KernelHandle::VfsFile(VfsFileHandle::read_only_memory("/test".into(), vec![]));
         assert!(
-            ensure_handle_transfer_allowed(&KernelHandle::Console(ConsoleStreamKind::Output,))
+            ensure_handle_transfer_allowed(&handle, HandleRights::File(FileHandleRights::READ))
                 .is_err()
         );
-        assert!(ensure_handle_transfer_allowed(&KernelHandle::Epoll(EpollHandle::new())).is_err());
         assert!(
-            ensure_handle_transfer_allowed(&KernelHandle::VfsDirectory(VfsDirectoryHandle::new(
-                "/test".into(),
-                vec![]
-            ),))
-            .is_err()
-        );
-        assert!(
-            ensure_handle_transfer_allowed(&KernelHandle::DisplaySurface(
-                DisplaySurfaceHandle::new(
-                    16,
-                    16,
-                    crate::user::abi::device::PIXEL_FORMAT_BGRA8888,
-                    1
-                )
-                .expect("surface"),
-            ))
-            .is_err()
+            ensure_handle_transfer_allowed(
+                &handle,
+                HandleRights::File(FileHandleRights::READ.union(FileHandleRights::TRANSFER))
+            )
+            .is_ok()
         );
     }
 }

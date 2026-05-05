@@ -1,5 +1,4 @@
 pub(crate) mod console;
-pub(crate) mod debug;
 pub(crate) mod display;
 pub(crate) mod input;
 
@@ -15,7 +14,6 @@ use crate::user::process_state::UserProcessState;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeviceId {
     Console,
-    Debug,
     Display,
     Input,
 }
@@ -24,7 +22,6 @@ impl DeviceId {
     pub const fn path(self) -> &'static str {
         match self {
             Self::Console => console_abi::CONSOLE_PATH,
-            Self::Debug => diag_abi::DIAG_DEVICE_PATH,
             Self::Display => device_abi::DISPLAY_PATH,
             Self::Input => device_abi::INPUT_PATH,
         }
@@ -35,7 +32,6 @@ impl From<DeviceId> for kernel_object::api::device::DeviceId {
     fn from(value: DeviceId) -> Self {
         match value {
             DeviceId::Console => Self::Console,
-            DeviceId::Debug => Self::Debug,
             DeviceId::Display => Self::Display,
             DeviceId::Input => Self::Input,
         }
@@ -46,7 +42,6 @@ impl From<kernel_object::api::device::DeviceId> for DeviceId {
     fn from(value: kernel_object::api::device::DeviceId) -> Self {
         match value {
             kernel_object::api::device::DeviceId::Console => Self::Console,
-            kernel_object::api::device::DeviceId::Debug => Self::Debug,
             kernel_object::api::device::DeviceId::Display => Self::Display,
             kernel_object::api::device::DeviceId::Input => Self::Input,
         }
@@ -107,7 +102,6 @@ impl DeviceHandle {
         kernel_object::api::device::DeviceHandle::with_access(
             match self.device_id {
                 DeviceId::Console => kernel_object::api::device::DeviceId::Console,
-                DeviceId::Debug => kernel_object::api::device::DeviceId::Debug,
                 DeviceId::Display => kernel_object::api::device::DeviceId::Display,
                 DeviceId::Input => kernel_object::api::device::DeviceId::Input,
             },
@@ -122,7 +116,6 @@ impl DeviceHandle {
         Self::from_parts(
             match handle.device_id() {
                 kernel_object::api::device::DeviceId::Console => DeviceId::Console,
-                kernel_object::api::device::DeviceId::Debug => DeviceId::Debug,
                 kernel_object::api::device::DeviceId::Display => DeviceId::Display,
                 kernel_object::api::device::DeviceId::Input => DeviceId::Input,
             },
@@ -174,14 +167,10 @@ impl From<paging::AddressSpaceError> for DeviceError {
     }
 }
 
-const DEVICE_DESCRIPTORS: [DeviceDescriptor; 4] = [
+const DEVICE_DESCRIPTORS: [DeviceDescriptor; 3] = [
     DeviceDescriptor {
         id: DeviceId::Console,
         path: DeviceId::Console.path(),
-    },
-    DeviceDescriptor {
-        id: DeviceId::Debug,
-        path: DeviceId::Debug.path(),
     },
     DeviceDescriptor {
         id: DeviceId::Display,
@@ -216,7 +205,6 @@ pub fn read_to_user(
     user_len: usize,
 ) -> Result<usize, DeviceError> {
     match handle.device_id() {
-        DeviceId::Debug => debug::read_to_user(process_state, user_ptr, user_len),
         DeviceId::Input => match handle.access_kind() {
             DeviceAccessKind::Native => input::read_to_user(process_state, user_ptr, user_len),
             DeviceAccessKind::Evdev => input::read_evdev_to_user(process_state, user_ptr, user_len),
@@ -231,7 +219,6 @@ pub fn read_to_current_user(
     user_len: usize,
 ) -> Result<usize, DeviceError> {
     match handle.device_id() {
-        DeviceId::Debug => debug::read_to_current_user(user_ptr, user_len),
         DeviceId::Input => match handle.access_kind() {
             DeviceAccessKind::Native => input::read_to_current_user(user_ptr, user_len),
             DeviceAccessKind::Evdev => input::read_evdev_to_current_user(user_ptr, user_len),
@@ -248,7 +235,6 @@ pub fn ioctl_from_user(
 ) -> Result<u64, DeviceError> {
     match handle.device_id() {
         DeviceId::Console => console::ioctl(process_state, request, arg),
-        DeviceId::Debug => debug::ioctl(process_state, request, arg),
         DeviceId::Display => display::ioctl(process_state, request, arg),
         DeviceId::Input => Err(DeviceError::Unsupported),
     }
@@ -304,20 +290,16 @@ fn normalize_device_path(path: &str) -> Result<NormalizedDevicePath, DeviceLooku
             descriptor: DEVICE_DESCRIPTORS[0],
             access_kind: DeviceAccessKind::Native,
         }),
-        ["dev", "debug0"] => Ok(NormalizedDevicePath {
+        ["dev", "display0"] | ["dev", "dri", "card0"] => Ok(NormalizedDevicePath {
             descriptor: DEVICE_DESCRIPTORS[1],
             access_kind: DeviceAccessKind::Native,
         }),
-        ["dev", "display0"] | ["dev", "dri", "card0"] => Ok(NormalizedDevicePath {
+        ["dev", "input0"] => Ok(NormalizedDevicePath {
             descriptor: DEVICE_DESCRIPTORS[2],
             access_kind: DeviceAccessKind::Native,
         }),
-        ["dev", "input0"] => Ok(NormalizedDevicePath {
-            descriptor: DEVICE_DESCRIPTORS[3],
-            access_kind: DeviceAccessKind::Native,
-        }),
         ["dev", "input", "event0"] => Ok(NormalizedDevicePath {
-            descriptor: DEVICE_DESCRIPTORS[3],
+            descriptor: DEVICE_DESCRIPTORS[2],
             access_kind: DeviceAccessKind::Evdev,
         }),
         _ => Err(DeviceLookupError::NotFound),
@@ -331,7 +313,6 @@ mod tests {
     #[test]
     fn lookup_accepts_registered_device_paths() {
         assert_eq!(lookup("/dev/console0").unwrap().id, DeviceId::Console);
-        assert_eq!(lookup("/dev/debug0").unwrap().id, DeviceId::Debug);
         assert_eq!(lookup("/dev/display0").unwrap().id, DeviceId::Display);
         assert_eq!(lookup("/dev/input0").unwrap().id, DeviceId::Input);
         assert_eq!(lookup("/dev/dri/card0").unwrap().id, DeviceId::Display);

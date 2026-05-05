@@ -240,8 +240,7 @@ pub fn on_interrupt() {
             )
             .is_ok()
     {
-        if !crate::debug::should_emit(diag_abi::DiagProvider::Heartbeat, diag_abi::DiagLevel::Info)
-        {
+        if !crate::debug::enabled!(heartbeat, info) {
             let _ = cmos_read(RTC_REG_C);
             return;
         }
@@ -276,12 +275,8 @@ pub fn on_interrupt() {
         let linux_irq_depth_delta = (linux_irq_total_depth as u64).saturating_sub(
             RTC_LAST_LINUX_IRQ_LOCK_DEPTH.swap(linux_irq_total_depth as u64, Ordering::AcqRel),
         );
-        crate::debug::emit_text(
-            diag_abi::DiagProvider::Heartbeat,
-            diag_abi::DiagLevel::Info,
-            0,
-            current_second,
-            linux_irq_total_depth as u64,
+        crate::debug::info!(
+            heartbeat,
             alloc::format!(
                 "second={} userspace_display={} xhci_delta={} hid_ptr_delta={} input_packet_delta={} input_abs_delta={} input_read_calls_delta={} input_read_events_delta={} linux_irq_owners={} linux_irq_depth={} linux_irq_depth_delta={} input_lock_active={} input_lock_last_seq={} eventq_lock_active={} eventq_lock_last_seq={} queued={} pending_coalesced={} pending_pointer_position={} dropped_discrete={} dropped_lossy={}",
                 current_second,
@@ -305,7 +300,7 @@ pub fn on_interrupt() {
                 input_snapshot.dropped_discrete,
                 input_snapshot.dropped_lossy
             )
-            .as_str(),
+            .as_str()
         );
     }
     // Must read register C to acknowledge and re-arm RTC interrupts.

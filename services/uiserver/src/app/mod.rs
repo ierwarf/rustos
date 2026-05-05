@@ -268,6 +268,7 @@ pub(crate) struct AppState {
     pub(crate) desktop_cache: DesktopSurfaceCache,
     pub(crate) launcher_programs: Vec<LauncherProgram>,
     pub(crate) console_windows: Vec<ConsoleWindow>,
+    closing_console_sessions: Vec<ConsoleSessionHandle>,
     pub(crate) next_console_snapshot_index: usize,
     pub(crate) wayland_windows: Vec<WaylandWindowSnapshot>,
     dragging_window: Option<DragTarget>,

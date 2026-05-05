@@ -109,6 +109,13 @@ static USB_DEVICES: Mutex<Vec<OwnedUsbDeviceRecord>> = Mutex::new(Vec::new());
 static USB_INTERFACES: Mutex<Vec<RegisteredUsbInterface>> = Mutex::new(Vec::new());
 static USB_OWNED_INTERFACES: Mutex<Vec<OwnedUsbInterfaceRecord>> = Mutex::new(Vec::new());
 
+pub(crate) fn hid_interfaces_available() -> bool {
+    USB_INTERFACES
+        .lock()
+        .iter()
+        .any(|interface| interface.interface_class == 0x03)
+}
+
 pub(crate) fn register_linux_driver(driver: *mut LinuxCompatUsbDriver) -> i32 {
     if driver.is_null() {
         return -22;
@@ -129,14 +136,12 @@ pub(crate) fn register_linux_driver(driver: *mut LinuxCompatUsbDriver) -> i32 {
         }
     };
 
-    crate::debug::write_debugcon_only_line(
-        alloc::format!(
-            "usb core register driver: driver={:#x} index={} interfaces={}",
-            driver as usize,
-            driver_index,
-            USB_INTERFACES.lock().len(),
-        )
-        .as_bytes(),
+    crate::debug::debug!(
+        usb,
+        "usb core register driver: driver={:#x} index={} interfaces={}",
+        driver as usize,
+        driver_index,
+        USB_INTERFACES.lock().len(),
     );
     bind_driver_to_interfaces(driver_index, driver);
     0
@@ -257,6 +262,16 @@ pub(crate) fn register_owned_interface(
     if let Some(extra) = extra.as_ref() {
         altsetting.extra = extra.as_ptr() as *mut u8;
         altsetting.extralen = extra.len() as i32;
+        crate::debug::write_debugcon_only_line(
+            alloc::format!(
+                "usb core interface extra: intf={} ptr={:#x} len={} bytes={:02x?}",
+                registration.interface_number,
+                altsetting.extra as usize,
+                altsetting.extralen,
+                extra
+            )
+            .as_bytes(),
+        );
     }
 
     let device_ptr = device.as_mut() as *mut LinuxCompatUsbDevice;
@@ -326,18 +341,16 @@ pub(crate) fn register_owned_interface(
         });
         interfaces.len() - 1
     };
-    crate::debug::write_debugcon_only_line(
-        alloc::format!(
-            "usb core interface registered: index={} intf={:#x} vendor={:04x} product={:04x} class={:#x}/{:#x}/{:#x}",
-            interface_index,
-            interface_ptr as usize,
-            registration.vendor_id,
-            registration.product_id,
-            registration.interface_class,
-            registration.interface_sub_class,
-            registration.interface_protocol,
-        )
-        .as_bytes(),
+    crate::debug::debug!(
+        usb,
+        "usb core interface registered: index={} intf={:#x} vendor={:04x} product={:04x} class={:#x}/{:#x}/{:#x}",
+        interface_index,
+        interface_ptr as usize,
+        registration.vendor_id,
+        registration.product_id,
+        registration.interface_class,
+        registration.interface_sub_class,
+        registration.interface_protocol,
     );
 
     if let Some(kind) = registration.synthetic_hid_kind {

@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 boot-protocol = { path = "../bootloader/boot-protocol" }
 boot-random = { path = "../../libs/boot-random" }
-diag-abi = { path = "../../libs/diag-abi" }
 storage-core = { path = "../../libs/storage-core" }
 storage-fat = { path = "../../libs/storage-fat" }
 buddy_system_allocator = "0.12.0"

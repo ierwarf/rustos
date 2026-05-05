@@ -109,9 +109,11 @@ const fn linux_iowr<T>(type_: u8, nr: u8) -> usize {
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct LaunchEntry {
+    package_id: String,
     desktop_file_id: String,
     display_name: String,
     exec: String,
+    runtime_deps: Vec<String>,
     restart: bool,
     weight_micros: u64,
     logical_admin: bool,
@@ -123,6 +125,7 @@ struct LaunchEntry {
 #[derive(Clone, Debug)]
 struct RunningProcess {
     pid: i32,
+    package_id: String,
     desktop_file_id: String,
     display_name: String,
     exec: String,
@@ -132,9 +135,11 @@ struct RunningProcess {
 
 #[derive(Clone, Debug)]
 struct ProgramMetadata {
+    package_id: String,
     desktop_file_id: String,
     display_name: String,
     exec: String,
+    runtime_deps: Vec<String>,
     startup: StartupMode,
     weight_micros: u64,
     logical_admin: bool,
@@ -168,8 +173,9 @@ fn main() {
     let listener = match bind_listener(DEFAULT_RUNTIME_SOCKET_PATH) {
         Ok(listener) => listener,
         Err(err) => {
-            diag_client::diag_error!(
+            observability_client::error!(
                 "runtimed",
+                service,
                 "bind {} failed: errno={err}",
                 DEFAULT_RUNTIME_SOCKET_PATH
             );
@@ -192,8 +198,9 @@ fn main() {
     stderr_line("runtimed: bootstrap ui begin");
     boot_line("runtimed: bootstrap ui begin");
     if let Err(err) = bootstrap_ui_server(&mut state) {
-        diag_client::diag_error!(
+        observability_client::error!(
             "runtimed",
+            service,
             "bootstrap {} failed: errno={err}",
             UI_SERVER_EXEC_PATH
         );
@@ -225,8 +232,9 @@ fn maybe_load_launch_catalog(state: &mut BrokerState) -> bool {
     boot_line("runtimed: launch catalog load begin");
     let started_at = Instant::now();
     let (programs, launch_entries) = load_launch_catalog();
-    diag_client::diag_info!(
+    observability_client::info!(
         "runtimed",
+        service,
         "launch catalog summary programs={} policies={} elapsed_ms={}",
         programs.len(),
         launch_entries.len(),
@@ -254,8 +262,10 @@ fn bootstrap_ui_server(state: &mut BrokerState) -> Result<(), i32> {
         state,
         LaunchEntry {
             desktop_file_id: String::from(UI_SERVER_DESKTOP_FILE_ID),
+            package_id: String::from("uiserver"),
             display_name: String::from(UI_SERVER_DISPLAY_NAME),
             exec: String::from(UI_SERVER_EXEC_PATH),
+            runtime_deps: Vec::new(),
             restart: true,
             weight_micros: DEFAULT_USER_TASK_WEIGHT_MICROS,
             logical_admin: false,
@@ -372,7 +382,12 @@ fn service_listener(listener: &UnixListener, state: &mut BrokerState) -> bool {
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(err) => {
-                diag_client::diag_error!("runtimed", "accept failed: errno={}", io_errno(err));
+                observability_client::error!(
+                    "runtimed",
+                    service,
+                    "accept failed: errno={}",
+                    io_errno(err)
+                );
                 break;
             }
         }
@@ -447,12 +462,21 @@ fn handle_launch(
     }
     let target = request_path(&request)?;
     let metadata = resolve_program_request(state, target.as_str());
+    if !runtime_deps_satisfied(
+        &metadata.runtime_deps,
+        &running_packages(state),
+        &state.launched_once,
+    ) {
+        return Err(libc::EAGAIN);
+    }
     spawn_tracked_process(
         state,
         LaunchEntry {
+            package_id: metadata.package_id,
             desktop_file_id: metadata.desktop_file_id,
             display_name: metadata.display_name,
             exec: metadata.exec,
+            runtime_deps: metadata.runtime_deps,
             restart: false,
             weight_micros: metadata.weight_micros,
             logical_admin: metadata.logical_admin,
@@ -495,12 +519,15 @@ fn handle_terminate(
                 .map(|program| program.pid)
                 .collect::<Vec<_>>();
             for pid in pids {
-                terminate_pid(pid)?;
-                terminated = true;
+                match terminate_pid(pid) {
+                    Ok(()) => terminated = true,
+                    Err(err) if err == libc::ESRCH => {
+                        state.running.remove(&pid);
+                    }
+                    Err(err) => return Err(err),
+                }
             }
-            if !terminated
-                && close_console_session(ensure_console_fd(state)?, request.target_value)?
-            {
+            if close_console_session(ensure_console_fd(state)?, request.target_value)? {
                 terminated = true;
             }
         }
@@ -531,7 +558,7 @@ fn handle_ready(
         return Err(libc::EOPNOTSUPP);
     }
     state.ui_ready = true;
-    diag_client::diag_info!("runtimed", "ui ready received");
+    observability_client::info!("runtimed", service, "ui ready received");
     boot_line("runtimed: ui ready received");
     write_response(
         stream,
@@ -551,6 +578,7 @@ fn ensure_policy_launches(state: &mut BrokerState) -> bool {
         .values()
         .map(|program| program.desktop_file_id.clone())
         .collect::<BTreeSet<_>>();
+    let running_packages = running_packages(state);
     let mut pending_service_launch = false;
     let mut pending_desktop_launch = false;
     let mut launched_any = false;
@@ -563,12 +591,15 @@ fn ensure_policy_launches(state: &mut BrokerState) -> bool {
             continue;
         }
         let already_satisfied = if entry.restart {
-            running_programs.contains(&entry.desktop_file_id)
+            running_packages.contains(&entry.package_id)
         } else {
             running_programs.contains(&entry.desktop_file_id)
-                || state.launched_once.contains(entry.desktop_file_id.as_str())
+                || state.launched_once.contains(entry.package_id.as_str())
         };
         if already_satisfied {
+            continue;
+        }
+        if !runtime_deps_satisfied(&entry.runtime_deps, &running_packages, &state.launched_once) {
             continue;
         }
         if entry.exec.starts_with("services/") {
@@ -604,31 +635,36 @@ fn ensure_policy_launches(state: &mut BrokerState) -> bool {
         }
 
         if entry.restart {
-            if running_programs.contains(&entry.desktop_file_id) {
+            if running_packages.contains(&entry.package_id) {
                 continue;
             }
         } else if running_programs.contains(&entry.desktop_file_id)
-            || state.launched_once.contains(entry.desktop_file_id.as_str())
+            || state.launched_once.contains(entry.package_id.as_str())
         {
+            continue;
+        }
+        if !runtime_deps_satisfied(&entry.runtime_deps, &running_packages, &state.launched_once) {
             continue;
         }
 
         match spawn_tracked_process(state, entry.clone()) {
             Ok(()) => {
-                diag_client::diag_info!(
+                observability_client::info!(
                     "runtimed",
+                    service,
                     "launched {} ({})",
                     entry.desktop_file_id,
                     entry.exec
                 );
                 launched_any = true;
                 if !entry.restart {
-                    state.launched_once.insert(entry.desktop_file_id);
+                    state.launched_once.insert(entry.package_id);
                 }
             }
             Err(err) => {
-                diag_client::diag_error!(
+                observability_client::error!(
                     "runtimed",
+                    service,
                     "launch {} ({}) failed: errno={err}",
                     entry.desktop_file_id,
                     entry.exec
@@ -675,8 +711,9 @@ fn spawn_tracked_process(state: &mut BrokerState, entry: LaunchEntry) -> Result<
             if let Some(session) = session_handle {
                 let _ = close_console_session(ensure_console_fd(state)?, session);
             }
-            diag_client::diag_error!(
+            observability_client::error!(
                 "runtimed",
+                service,
                 "spawn exec failed desktop_id={} exec={} errno={err}",
                 entry.desktop_file_id,
                 entry.exec
@@ -702,6 +739,7 @@ fn spawn_tracked_process(state: &mut BrokerState, entry: LaunchEntry) -> Result<
         pid,
         RunningProcess {
             pid,
+            package_id: entry.package_id,
             desktop_file_id: entry.desktop_file_id,
             display_name: entry.display_name,
             exec: entry.exec,
@@ -833,8 +871,9 @@ fn load_launch_catalog() -> (BTreeMap<String, ProgramMetadata>, Vec<LaunchEntry>
         load_runtime_launch_program_entries(DEFAULT_RUNTIME_LAUNCH_REGISTRY_PATH)
             .unwrap_or_default();
     let registry_elapsed = load_started.elapsed().as_millis();
-    diag_client::diag_info!(
+    observability_client::info!(
         "runtimed",
+        service,
         "launch registry entries={} elapsed_ms={}",
         registry_entries.len(),
         registry_elapsed
@@ -861,8 +900,9 @@ fn load_launch_catalog() -> (BTreeMap<String, ProgramMetadata>, Vec<LaunchEntry>
     let launch_started = Instant::now();
     let launch_entries = load_launch_entries(&programs, autostart_entries);
     let launch_elapsed = launch_started.elapsed().as_millis();
-    diag_client::diag_info!(
+    observability_client::info!(
         "runtimed",
+        service,
         "launch policies={} elapsed_ms={}",
         launch_entries.len(),
         launch_elapsed
@@ -897,9 +937,11 @@ fn load_launch_entries(
             continue;
         }
         entries.push(LaunchEntry {
+            package_id: metadata.package_id.clone(),
             desktop_file_id: metadata.desktop_file_id.clone(),
             display_name: metadata.display_name.clone(),
             exec: metadata.exec.clone(),
+            runtime_deps: metadata.runtime_deps.clone(),
             restart: metadata.exec.starts_with("services/"),
             weight_micros: metadata.weight_micros,
             logical_admin: metadata.logical_admin,
@@ -918,9 +960,11 @@ fn load_launch_entries(
             .cloned()
             .unwrap_or_else(|| program_metadata_from_desktop_entry(entry.clone()));
         entries.push(LaunchEntry {
+            package_id: metadata.package_id,
             desktop_file_id: metadata.desktop_file_id,
             display_name: metadata.display_name,
             exec: metadata.exec.clone(),
+            runtime_deps: metadata.runtime_deps,
             restart: metadata.exec.starts_with("services/"),
             weight_micros: metadata.weight_micros,
             logical_admin: metadata.logical_admin,
@@ -985,6 +1029,7 @@ fn insert_program_metadata(
 
 fn program_metadata_from_desktop_entry(entry: DesktopProgramEntry) -> ProgramMetadata {
     ProgramMetadata {
+        package_id: entry.package_id,
         desktop_file_id: entry.desktop_file_id,
         display_name: if entry.display_name.is_empty() {
             fallback_display_name(entry.exec.as_str())
@@ -992,6 +1037,7 @@ fn program_metadata_from_desktop_entry(entry: DesktopProgramEntry) -> ProgramMet
             entry.display_name
         },
         exec: entry.exec,
+        runtime_deps: entry.runtime_deps,
         startup: entry.startup,
         weight_micros: entry.weight_micros,
         logical_admin: entry.logical_admin,
@@ -1015,9 +1061,11 @@ fn resolve_program_request(state: &BrokerState, target: &str) -> ProgramMetadata
         })
         .or_else(|| load_program_metadata_for_target(target))
         .unwrap_or_else(|| ProgramMetadata {
+            package_id: package_id_from_target(target),
             desktop_file_id: target.to_string(),
             display_name: fallback_display_name(target),
             exec: target.to_string(),
+            runtime_deps: Vec::new(),
             startup: StartupMode::None,
             weight_micros: DEFAULT_USER_TASK_WEIGHT_MICROS,
             logical_admin: false,
@@ -1033,6 +1081,38 @@ fn fallback_display_name(exec: &str) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or(exec)
         .to_string()
+}
+
+fn package_id_from_target(target: &str) -> String {
+    Path::new(target)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or(target)
+        .strip_suffix(".desktop")
+        .unwrap_or_else(|| {
+            Path::new(target)
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or(target)
+        })
+        .to_string()
+}
+
+fn running_packages(state: &BrokerState) -> BTreeSet<String> {
+    state
+        .running
+        .values()
+        .map(|program| program.package_id.clone())
+        .collect()
+}
+
+fn runtime_deps_satisfied(
+    deps: &[String],
+    running_packages: &BTreeSet<String>,
+    launched_once_packages: &BTreeSet<String>,
+) -> bool {
+    deps.iter()
+        .all(|dep| running_packages.contains(dep) || launched_once_packages.contains(dep))
 }
 
 fn request_path(request: &RuntimeRequest) -> Result<String, i32> {

@@ -15,6 +15,14 @@ pub(crate) fn service_pending() -> usize {
     manager::service_pending()
 }
 
+pub(crate) fn host_controllers_available() -> bool {
+    manager::host_controllers_available()
+}
+
+pub(crate) fn hid_interfaces_available() -> bool {
+    core::hid_interfaces_available()
+}
+
 pub fn debug_transfer_event_count() -> u64 {
     xhci::debug_transfer_event_count()
 }

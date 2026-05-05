@@ -130,7 +130,8 @@ pub fn halt_current_retired_task() -> ! {
 }
 
 pub fn current_user_snapshot() -> Option<CurrentUserSnapshot> {
-    HOOKS.read()
+    HOOKS
+        .read()
         .task
         .current_user_snapshot
         .and_then(|hook| hook())

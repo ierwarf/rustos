@@ -322,14 +322,8 @@ pub(crate) fn open_input() -> Result<Vec<OwnedFd>, i32> {
 }
 
 pub(crate) fn diag_line(message: &str) {
-    diag_client::emit_text(
-        "uiserver",
-        diag_client::diag_abi::DiagLevel::Info,
-        0,
-        0,
-        0,
-        message,
-    );
+    let _ = message;
+    observability_client::info!("uiserver", service, "{}", message);
 }
 
 pub(crate) fn boot_trace_enabled() -> bool {

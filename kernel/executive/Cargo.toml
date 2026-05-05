@@ -2,6 +2,7 @@
 name = "kernel-executive"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 
 [dependencies]
 nucleus-core = { path = "../nucleus-core" }
@@ -12,7 +13,6 @@ kernel-ps = { path = "../ps" }
 kernel-io-manager = { path = "../io-manager", default-features = false }
 kernel-compat = { path = "../compat" }
 boot-protocol = { path = "../../boot/bootloader/boot-protocol" }
-diag-abi = { path = "../../libs/diag-abi" }
 driver-abi = { path = "../../drivers/libs/driver-abi" }
 storage-core = { path = "../../libs/storage-core" }
 x86_64 = { version = "0.15.4", default-features = false, features = ["instructions", "abi_x86_interrupt"] }

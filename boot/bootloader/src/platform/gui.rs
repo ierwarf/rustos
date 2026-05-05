@@ -1,9 +1,4 @@
 use core::ptr;
-
-use diag_abi::{
-    crash_store_bytes, diag_buffer_bytes, BootDiagBufferInfo, CrashStoreInfo,
-    DIAG_BOOT_BUFFER_RECORD_CAPACITY, DIAG_CRASH_RECORD_CAPACITY,
-};
 use uefi::boot::{self, AllocateType, MemoryType};
 use uefi::proto::console::gop::{FrameBuffer, GraphicsOutput, PixelFormat};
 use uefi::system;
@@ -20,14 +15,6 @@ use crate::random;
 const PAGE_SIZE: usize = 4096;
 
 pub fn prepare_boot_info() -> Result<BootInfo, BootError> {
-    let boot_diag = allocate_buffer(diag_buffer_bytes(DIAG_BOOT_BUFFER_RECORD_CAPACITY))?;
-    debug::install_boot_diag_buffer(BootDiagBufferInfo {
-        addr: boot_diag.0,
-        bytes_len: boot_diag.1,
-        record_capacity: DIAG_BOOT_BUFFER_RECORD_CAPACITY as u32,
-        reserved: 0,
-    });
-    let crash_store = allocate_buffer(crash_store_bytes(DIAG_CRASH_RECORD_CAPACITY))?;
     debug::println!("bootloader: prepare_boot_info: locating GOP");
     let handle = boot::get_handle_for_protocol::<GraphicsOutput>()
         .map_err(|err| BootError::Graphics(err.status()))?;
@@ -97,16 +84,6 @@ pub fn prepare_boot_info() -> Result<BootInfo, BootError> {
         framebuffer: fb_info,
         nucleus_image: NucleusImageInfo::empty(),
         memory_map: BootMemoryMap::empty(),
-        boot_diag: BootDiagBufferInfo {
-            addr: boot_diag.0,
-            bytes_len: boot_diag.1,
-            record_capacity: DIAG_BOOT_BUFFER_RECORD_CAPACITY as u32,
-            reserved: 0,
-        },
-        crash_store: CrashStoreInfo {
-            addr: crash_store.0,
-            bytes_len: crash_store.1,
-        },
     };
     boot_info
         .validate_staged()
@@ -150,19 +127,6 @@ fn allocate_back_buffer_and_seed(
     }
 
     (ptr.as_ptr() as u64, (page_count * PAGE_SIZE) as u64)
-}
-
-fn allocate_buffer(bytes: usize) -> Result<(u64, u64), BootError> {
-    if bytes == 0 {
-        return Ok((0, 0));
-    }
-    let page_count = bytes.div_ceil(PAGE_SIZE);
-    let ptr = boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, page_count)
-        .map_err(|err| BootError::BootInfoAlloc(err.status()))?;
-    unsafe {
-        ptr::write_bytes(ptr.as_ptr(), 0, page_count * PAGE_SIZE);
-    }
-    Ok((ptr.as_ptr() as u64, (page_count * PAGE_SIZE) as u64))
 }
 
 fn map_pixel_format(pixel_format: PixelFormat) -> BootPixelFormat {

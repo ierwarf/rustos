@@ -44,12 +44,18 @@ mod backend {
 
     fn map_bootstrap_phase(phase: kernel_io_manager::api::BootstrapPhase) -> BootstrapPhase {
         match phase {
-            kernel_io_manager::api::BootstrapPhase::EarlyBootstrap => BootstrapPhase::EarlyBootstrap,
+            kernel_io_manager::api::BootstrapPhase::EarlyBootstrap => {
+                BootstrapPhase::EarlyBootstrap
+            }
             kernel_io_manager::api::BootstrapPhase::CoreHostsLaunching => {
                 BootstrapPhase::CoreHostsLaunching
             }
-            kernel_io_manager::api::BootstrapPhase::KernelVfsReady => BootstrapPhase::KernelVfsReady,
-            kernel_io_manager::api::BootstrapPhase::UserspaceReady => BootstrapPhase::UserspaceReady,
+            kernel_io_manager::api::BootstrapPhase::KernelVfsReady => {
+                BootstrapPhase::KernelVfsReady
+            }
+            kernel_io_manager::api::BootstrapPhase::UserspaceReady => {
+                BootstrapPhase::UserspaceReady
+            }
         }
     }
 
@@ -214,7 +220,8 @@ mod backend {
         kernel_io_manager::api::vfs::init();
     }
 
-    pub(crate) fn system_console_session_raw() -> kernel_object::api::session::ConsoleSessionHandle {
+    pub(crate) fn system_console_session_raw() -> kernel_object::api::session::ConsoleSessionHandle
+    {
         kernel_io_manager::api::session::ConsoleSessionHandle::SYSTEM.into()
     }
 }
@@ -222,9 +229,9 @@ mod backend {
 pub(crate) use backend::{
     block_descriptors, boot_volume_identity, boot_volume_transport_hint, bootstrap_phase,
     console_init, console_service, console_write, debug_input_lock_snapshot,
-    debug_irq_lock_snapshot, debug_pointer_report_count, debug_transfer_event_count, dispatch_pic_irq,
-    enter_kernel_vfs_runtime, enter_userspace_runtime, gui_flush_debug_console, gui_init,
-    gui_try_present_panic_blackout, init_block_devices, init_boot_info, init_input,
+    debug_irq_lock_snapshot, debug_pointer_report_count, debug_transfer_event_count,
+    dispatch_pic_irq, enter_kernel_vfs_runtime, enter_userspace_runtime, gui_flush_debug_console,
+    gui_init, gui_try_present_panic_blackout, init_block_devices, init_boot_info, init_input,
     init_linux_cpu_local_symbols, init_usb, init_vfs, initialize_loadable_modules_for_class,
     input_debug_snapshot, input_service_pending, on_keyboard_interrupt, on_mouse_interrupt,
     register_boot_volume_opener, system_console_session_raw, tick_jiffies, tty_init,

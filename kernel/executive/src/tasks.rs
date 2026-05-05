@@ -1,10 +1,9 @@
 use kernel_ps::api as ps_api;
 
-use crate::{boot, debug, flow_debug, flow_info, io_services};
+use crate::{boot, flow_debug, flow_info, io_services};
 
 pub(super) fn init_bootstrap_task(_id: u64) {
     flow_debug(50, "init bootstrap task entered");
-    debug::println!("init bootstrap task: entered");
     ps_api::yield_now();
     io_services::enter_userspace_runtime();
     flow_info(51, "userspace runtime phase entered");
@@ -13,7 +12,6 @@ pub(super) fn init_bootstrap_task(_id: u64) {
 
 pub(super) fn nucleus_housekeeping_task(_id: u64) {
     flow_debug(60, "housekeeping task entered");
-    debug::println!("nucleus loop: housekeeping task entered");
     loop {
         x86_64::instructions::interrupts::enable();
         let work = boot::housekeeping_once();

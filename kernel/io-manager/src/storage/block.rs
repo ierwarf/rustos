@@ -11,7 +11,6 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use boot_protocol::BootVolumeIdentity;
 use core::sync::atomic::{AtomicBool, Ordering};
-use diag_abi::{DiagLevel, DiagProvider};
 use spin::Mutex;
 use storage_core::BlockDevice as SharedBlockDevice;
 
@@ -231,17 +230,13 @@ fn log_boot_volume_handle_once(handle: BlockDeviceHandle) {
         return;
     }
     if let Some(descriptor) = descriptor_without_init(handle) {
-        crate::debug::emit_text(
-            DiagProvider::Io,
-            DiagLevel::Info,
-            30,
-            0,
-            descriptor.id as u64,
+        crate::debug::info!(
+            storage,
             format!(
                 "boot volume handle selected id={} path={} transport={:?}",
                 descriptor.id, descriptor.path, descriptor.transport
             )
-            .as_str(),
+            .as_str()
         );
         crate::debug::println!(
             "storage: boot volume handle selected id={} path={} transport={:?}",

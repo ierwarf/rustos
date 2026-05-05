@@ -208,7 +208,8 @@ impl<const SIZE_GB: usize> PML4<SIZE_GB> {
     }
 
     fn ensure_current_root_mmio_window_entry(&self) {
-        let kernel_root_phys = PhysAddr::new(kernel_virtual_to_physical(addr_of!(self.pml4) as u64));
+        let kernel_root_phys =
+            PhysAddr::new(kernel_virtual_to_physical(addr_of!(self.pml4) as u64));
         let (current_root, _) = Cr3::read();
         if current_root.start_address() == kernel_root_phys {
             return;
@@ -221,7 +222,9 @@ impl<const SIZE_GB: usize> PML4<SIZE_GB> {
 
         let current_root = unsafe { phys_to_table_mut(current_root.start_address()) };
         let current_entry = &mut current_root[MMIO_WINDOW_PML4_INDEX];
-        if current_entry.addr() == kernel_entry.addr() && current_entry.flags() == kernel_entry.flags() {
+        if current_entry.addr() == kernel_entry.addr()
+            && current_entry.flags() == kernel_entry.flags()
+        {
             return;
         }
 

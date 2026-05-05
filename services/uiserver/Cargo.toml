@@ -8,7 +8,7 @@ publish = false
 fontdue = "0.9.3"
 
 [dependencies]
-diag-client = { path = "../../libs/diag-client" }
+observability-client = { path = "../../libs/observability-client" }
 embedded-graphics = "0.8"
 keyboard-core = { path = "../../drivers/libs/keyboard-core" }
 runtime-control = { path = "../../libs/runtime-control" }

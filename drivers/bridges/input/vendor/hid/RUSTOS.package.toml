@@ -25,3 +25,4 @@ class = "input"
 bus = "usb"
 priority = 100
 when = "vfs-ready"
+provider_group = "input-hid-core"

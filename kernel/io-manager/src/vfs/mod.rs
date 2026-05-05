@@ -821,10 +821,22 @@ fn virtual_directory_entries(path: &str) -> Result<Option<Vec<VfsDirectoryEntry>
             path_inode(b"/dev/dri/card0").max(1),
             VfsDirectoryEntryKind::Device,
         )],
-        "/proc" => vec![VfsDirectoryEntry::new(
-            String::from("self"),
-            path_inode(b"/proc/self").max(1),
-            VfsDirectoryEntryKind::Directory,
+        "/proc" => vec![
+            VfsDirectoryEntry::new(
+                String::from("rustos"),
+                path_inode(procfs::PROC_RUSTOS_DIR_PATH.as_bytes()).max(1),
+                VfsDirectoryEntryKind::Directory,
+            ),
+            VfsDirectoryEntry::new(
+                String::from("self"),
+                path_inode(b"/proc/self").max(1),
+                VfsDirectoryEntryKind::Directory,
+            ),
+        ],
+        "/proc/rustos" => vec![VfsDirectoryEntry::new(
+            String::from("log"),
+            path_inode(procfs::PROC_RUSTOS_LOG_PATH.as_bytes()).max(1),
+            VfsDirectoryEntryKind::File,
         )],
         "/proc/self" => vec![
             VfsDirectoryEntry::new(
@@ -948,6 +960,7 @@ fn is_virtual_directory(path: &str) -> bool {
             | "/dev/input"
             | "/dev/dri"
             | "/proc"
+            | "/proc/rustos"
             | "/proc/self"
             | "/proc/self/fd"
             | "/dev/fd"
@@ -1173,9 +1186,10 @@ fn install_open_result(
         VfsOpenResult::Directory(handle) => process_state
             .handles_mut()
             .install_with_open_flags(KernelHandle::VfsDirectory(handle), open_flags),
-        VfsOpenResult::Device(handle) => process_state
-            .handles_mut()
-            .install_with_open_flags(KernelHandle::Device(legacy_device_handle(handle)), open_flags),
+        VfsOpenResult::Device(handle) => process_state.handles_mut().install_with_open_flags(
+            KernelHandle::Device(legacy_device_handle(handle)),
+            open_flags,
+        ),
     })
 }
 
@@ -1189,7 +1203,6 @@ fn legacy_device_handle(handle: DeviceHandle) -> kernel_object::api::device::Dev
 fn legacy_device_id(id: crate::io::device::DeviceId) -> kernel_object::api::device::DeviceId {
     match id {
         crate::io::device::DeviceId::Console => kernel_object::api::device::DeviceId::Console,
-        crate::io::device::DeviceId::Debug => kernel_object::api::device::DeviceId::Debug,
         crate::io::device::DeviceId::Display => kernel_object::api::device::DeviceId::Display,
         crate::io::device::DeviceId::Input => kernel_object::api::device::DeviceId::Input,
     }
@@ -1199,8 +1212,12 @@ fn legacy_device_access_kind(
     kind: crate::io::device::DeviceAccessKind,
 ) -> kernel_object::api::device::DeviceAccessKind {
     match kind {
-        crate::io::device::DeviceAccessKind::Native => kernel_object::api::device::DeviceAccessKind::Native,
-        crate::io::device::DeviceAccessKind::Evdev => kernel_object::api::device::DeviceAccessKind::Evdev,
+        crate::io::device::DeviceAccessKind::Native => {
+            kernel_object::api::device::DeviceAccessKind::Native
+        }
+        crate::io::device::DeviceAccessKind::Evdev => {
+            kernel_object::api::device::DeviceAccessKind::Evdev
+        }
     }
 }
 

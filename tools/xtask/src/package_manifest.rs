@@ -147,6 +147,14 @@ pub(crate) struct AutoloadSpec {
     pub(crate) priority: i32,
     #[serde(default)]
     pub(crate) when: Option<String>,
+    #[serde(default)]
+    pub(crate) aliases: Vec<String>,
+    #[serde(default)]
+    pub(crate) softdeps: Vec<String>,
+    #[serde(default)]
+    pub(crate) provider_group: Option<String>,
+    #[serde(default)]
+    pub(crate) fallback_only: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -265,10 +273,17 @@ pub(crate) fn load_profile_manifests(
     root_dir: &Path,
     profile: &str,
 ) -> Result<Vec<PackageManifest>> {
-    Ok(load_manifests(root_dir)?
+    let manifests = load_manifests(root_dir)?;
+    let known_ids = manifests
+        .iter()
+        .map(|manifest| manifest.id.clone())
+        .collect::<BTreeSet<_>>();
+    let profile_manifests = manifests
         .into_iter()
         .filter(|manifest| manifest.profile_enabled(profile))
-        .collect())
+        .collect::<Vec<_>>();
+    validate_profile_runtime_deps(&profile_manifests, profile, &known_ids)?;
+    Ok(profile_manifests)
 }
 
 pub(crate) fn load_default_manifests(root_dir: &Path) -> Result<Vec<PackageManifest>> {
@@ -457,6 +472,97 @@ fn validate_manifests(manifests: &[PackageManifest]) -> Result<()> {
     Ok(())
 }
 
+fn validate_profile_runtime_deps(
+    manifests: &[PackageManifest],
+    profile: &str,
+    known_ids: &BTreeSet<String>,
+) -> Result<()> {
+    let active_ids = manifests
+        .iter()
+        .map(|manifest| manifest.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let manifest_by_id = manifests
+        .iter()
+        .map(|manifest| (manifest.id.as_str(), manifest))
+        .collect::<BTreeMap<_, _>>();
+
+    for manifest in manifests {
+        for dep in &manifest.runtime_deps {
+            if dep == &manifest.id {
+                return Err(format!("package {} runtime_deps includes itself", manifest.id).into());
+            }
+            if !known_ids.contains(dep.as_str()) {
+                return Err(format!(
+                    "package {} runtime_deps includes missing package {}",
+                    manifest.id, dep
+                )
+                .into());
+            }
+            if !active_ids.contains(dep.as_str()) {
+                return Err(format!(
+                    "package {} runtime_deps includes package {} outside profile {}",
+                    manifest.id, dep, profile
+                )
+                .into());
+            }
+        }
+    }
+
+    let mut state = BTreeMap::<&str, VisitState>::new();
+    let mut stack = Vec::<&str>::new();
+    for manifest in manifests {
+        detect_runtime_dep_cycle(
+            manifest.id.as_str(),
+            &manifest_by_id,
+            &mut state,
+            &mut stack,
+        )?;
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VisitState {
+    Visiting,
+    Visited,
+}
+
+fn detect_runtime_dep_cycle<'a>(
+    id: &'a str,
+    manifest_by_id: &BTreeMap<&'a str, &'a PackageManifest>,
+    state: &mut BTreeMap<&'a str, VisitState>,
+    stack: &mut Vec<&'a str>,
+) -> Result<()> {
+    match state.get(id).copied() {
+        Some(VisitState::Visited) => return Ok(()),
+        Some(VisitState::Visiting) => {
+            let start = stack
+                .iter()
+                .position(|candidate| *candidate == id)
+                .unwrap_or(0);
+            let mut cycle = stack[start..].to_vec();
+            cycle.push(id);
+            return Err(format!("runtime_deps cycle detected: {}", cycle.join(" -> ")).into());
+        }
+        None => {}
+    }
+
+    state.insert(id, VisitState::Visiting);
+    stack.push(id);
+
+    let manifest = manifest_by_id
+        .get(id)
+        .ok_or_else(|| format!("runtime dependency graph missing package {id}"))?;
+    for dep in &manifest.runtime_deps {
+        detect_runtime_dep_cycle(dep.as_str(), manifest_by_id, state, stack)?;
+    }
+
+    stack.pop();
+    state.insert(id, VisitState::Visited);
+    Ok(())
+}
+
 fn validate_manifest_location(manifest: &PackageManifest) -> Result<()> {
     let relative = manifest.manifest_path.to_string_lossy().replace('\\', "/");
 
@@ -535,4 +641,108 @@ fn validate_install_taxonomy(manifest: &PackageManifest) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest(id: &str, profiles: &[&str], runtime_deps: &[&str]) -> PackageManifest {
+        PackageManifest {
+            id: id.to_string(),
+            kind: PackageKind::Service,
+            execution_domain: Some(ExecutionDomain::User),
+            profiles: profiles.iter().map(|profile| profile.to_string()).collect(),
+            build: BuildSpec {
+                builder: BuilderKind::CargoKernelBinary,
+                package: Some(id.to_string()),
+                crate_name: None,
+                source: None,
+                source_env: None,
+                dependency_crates: Vec::new(),
+                extra_args: Vec::new(),
+                optional: false,
+            },
+            install: InstallSpec {
+                path: format!("services/{id}/{id}.elf"),
+                layout: InstallLayout::File,
+            },
+            startup: StartupMode::None,
+            boot: BootSpec::default(),
+            autoload: None,
+            desktop: DesktopSection::default(),
+            runtime_deps: runtime_deps.iter().map(|dep| dep.to_string()).collect(),
+            manifest_path: PathBuf::from(format!("services/{id}/RUSTOS.package.toml")),
+            package_root: PathBuf::from(format!("services/{id}")),
+        }
+    }
+
+    fn validate_profile(
+        manifests: &[PackageManifest],
+        profile: &str,
+    ) -> std::result::Result<(), String> {
+        let known_ids = manifests
+            .iter()
+            .map(|manifest| manifest.id.clone())
+            .collect::<BTreeSet<_>>();
+        let profile_manifests = manifests
+            .iter()
+            .filter(|manifest| manifest.profile_enabled(profile))
+            .cloned()
+            .collect::<Vec<_>>();
+        validate_profile_runtime_deps(&profile_manifests, profile, &known_ids)
+            .map_err(|err| err.to_string())
+    }
+
+    #[test]
+    fn accepts_valid_runtime_dependency_graph() {
+        let manifests = vec![
+            manifest("runtimed", &["default"], &[]),
+            manifest("uiserver", &["default"], &["runtimed"]),
+        ];
+
+        validate_profile(&manifests, "default").expect("valid runtime deps");
+    }
+
+    #[test]
+    fn rejects_missing_runtime_dependency_package() {
+        let manifests = vec![manifest("uiserver", &["default"], &["runtimed"])];
+
+        let err = validate_profile(&manifests, "default").expect_err("missing dep");
+        assert!(err.contains("uiserver runtime_deps includes missing package runtimed"));
+    }
+
+    #[test]
+    fn rejects_self_runtime_dependency() {
+        let manifests = vec![manifest("uiserver", &["default"], &["uiserver"])];
+
+        let err = validate_profile(&manifests, "default").expect_err("self dep");
+        assert!(err.contains("uiserver runtime_deps includes itself"));
+    }
+
+    #[test]
+    fn rejects_runtime_dependency_cycle() {
+        let manifests = vec![
+            manifest("runtimed", &["default"], &["uiserver"]),
+            manifest("uiserver", &["default"], &["runtimed"]),
+        ];
+
+        let err = validate_profile(&manifests, "default").expect_err("cycle");
+        assert!(err.contains("runtime_deps cycle detected"));
+        assert!(err.contains("runtimed"));
+        assert!(err.contains("uiserver"));
+    }
+
+    #[test]
+    fn rejects_runtime_dependency_outside_selected_profile() {
+        let manifests = vec![
+            manifest("storaged", &["legacy-services"], &[]),
+            manifest("uiserver", &["default"], &["storaged"]),
+        ];
+
+        let err = validate_profile(&manifests, "default").expect_err("profile dep");
+        assert!(
+            err.contains("uiserver runtime_deps includes package storaged outside profile default")
+        );
+    }
 }

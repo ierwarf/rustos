@@ -75,7 +75,8 @@ pub mod cpu {
 
 pub mod interrupts {
     use crate::hooks::{
-        HeartbeatHooks, InterruptHooks, TaskHooks, register_heartbeat_hooks as install_heartbeat_hooks,
+        HeartbeatHooks, InterruptHooks, TaskHooks,
+        register_heartbeat_hooks as install_heartbeat_hooks,
         register_interrupt_hooks as install_interrupt_hooks,
         register_task_hooks as install_task_hooks,
     };
@@ -114,12 +115,12 @@ pub mod time {
     }
 }
 
-pub use boot::{call_with_stack, enter_higher_half, init_acpi, init_gdt, init_idt};
-pub use cpu::{current_rip, init_simd, simd_mode_name};
 pub use crate::hooks::{
     CurrentUserSnapshot, HeartbeatHooks, HeartbeatSnapshot, InputEventQueueDebugSnapshot,
     InterruptHooks, TaskHooks, UserFaultDisposition,
 };
+pub use boot::{call_with_stack, enter_higher_half, init_acpi, init_gdt, init_idt};
+pub use cpu::{current_rip, init_simd, simd_mode_name};
 pub use interrupts::{
     disable_interrupts, init_pic, register_heartbeat_hooks, register_interrupt_hooks,
     register_task_hooks,

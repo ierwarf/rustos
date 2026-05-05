@@ -25,3 +25,6 @@ class = "input"
 bus = "usb"
 priority = 110
 when = "vfs-ready"
+aliases = ["hid:b*g*v*p*"]
+softdeps = ["hid"]
+provider_group = "input-hid-device"

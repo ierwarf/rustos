@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-diag-abi = { path = "../../../libs/diag-abi" }
 
 [lib]
 path = "src/lib.rs"

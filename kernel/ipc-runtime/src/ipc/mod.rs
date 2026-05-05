@@ -686,10 +686,10 @@ pub fn channel_queue_len(channel: KernelChannelHandle) -> Option<usize> {
 mod tests {
     use super::{
         ConsoleStreamKind, IpcError, IpcHeader, KernelHandle, accept_channel, connect_named_port,
-        connect_port, create_channel_pair, create_event, create_named_port,
-        create_shared_region, dequeue_message, dequeue_message_with_limits, enqueue_message,
-        event_signal_count, lookup_named_port, map_shared_region, port_name,
-        queue_channel_for_accept, shared_region_len, signal_event,
+        connect_port, create_channel_pair, create_event, create_named_port, create_shared_region,
+        dequeue_message, dequeue_message_with_limits, enqueue_message, event_signal_count,
+        lookup_named_port, map_shared_region, port_name, queue_channel_for_accept,
+        shared_region_len, signal_event,
     };
     use spin::Mutex;
 

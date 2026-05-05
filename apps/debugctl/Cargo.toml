@@ -1,9 +1,0 @@
-[package]
-name = "debugctl"
-version = "0.1.0"
-edition = "2021"
-publish = false
-
-[dependencies]
-diag-abi = { path = "../../libs/diag-abi" }
-libc = "0.2"

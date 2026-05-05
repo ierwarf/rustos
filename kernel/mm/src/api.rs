@@ -85,8 +85,8 @@ pub mod virt {
     }
 }
 
-pub use address_space::{debug_direct_map_flags_for_addr, PageTableFlags, ProcessAddressSpace};
-pub use alloc::{handle_alloc_error, init_heap, KernelAllocator};
+pub use address_space::{PageTableFlags, ProcessAddressSpace, debug_direct_map_flags_for_addr};
+pub use alloc::{KernelAllocator, handle_alloc_error, init_heap};
 pub use boot::{init_paging, init_phys, paging_smoke_test};
 pub use phys::{alloc_frame, free_bytes, free_frame, usable_bytes};
 pub use virt::{higher_half_addr, kernel_virt_offset};

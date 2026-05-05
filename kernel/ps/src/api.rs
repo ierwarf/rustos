@@ -1,7 +1,7 @@
 pub use crate::multitask::{
-    CurrentUserSnapshot, RetainedCurrentUserAddressSpace, RetainedCurrentUserProcessState,
-    SpawnTaskError, Thread, UserFaultDisposition, UserStackState, UserTaskBootstrap,
-    UserTaskRegisters, WaitChildResult, DEFAULT_USER_TASK_WEIGHT_MICROS,
+    CurrentUserSnapshot, DEFAULT_USER_TASK_WEIGHT_MICROS, RetainedCurrentUserAddressSpace,
+    RetainedCurrentUserProcessState, SpawnTaskError, Thread, UserFaultDisposition, UserStackState,
+    UserTaskBootstrap, UserTaskRegisters, WaitChildResult,
 };
 pub use crate::multitask::{
     block_current_user_task, current_last_error, current_linux_thread_state,
@@ -17,8 +17,8 @@ pub use crate::multitask::{
 pub use crate::user::abi::UserAbi;
 pub use crate::user::epoll::{EpollError, EpollHandle, EpollInterestSnapshot};
 pub use crate::user::handles::{
-    ConsoleStreamKind, DisplaySurfaceHandle, FD_CLOEXEC, FileHandleSeekError,
-    FileHandleSeekWhence, FIRST_DYNAMIC_FD, HandleEntry, HandleTable, KernelHandle,
+    ConsoleStreamKind, DisplaySurfaceHandle, FD_CLOEXEC, FIRST_DYNAMIC_FD, FileHandleSeekError,
+    FileHandleSeekWhence, HandleEntry, HandleTable, InetSocketHandle, KernelHandle,
     VfsDirectoryEntry, VfsDirectoryEntryKind, VfsDirectoryHandle, VfsFileHandle, VfsFileObject,
 };
 pub use crate::user::linux::{
@@ -208,9 +208,7 @@ pub mod snapshot {
         crate::multitask::with_process_state_by_pid_mut(process_id, f)
     }
 
-    pub fn any_user_process_state(
-        f: impl FnMut(u64, &UserProcessState) -> bool,
-    ) -> bool {
+    pub fn any_user_process_state(f: impl FnMut(u64, &UserProcessState) -> bool) -> bool {
         crate::multitask::any_user_process_state(f)
     }
 

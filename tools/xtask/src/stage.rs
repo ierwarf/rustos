@@ -113,14 +113,20 @@ fn write_driver_registry(config: &Config, manifests: &[PackageManifest]) -> Resu
         if !manifest.artifact_path(config).is_file() {
             continue;
         }
+        let aliases = registry_list(&autoload.aliases)?;
+        let softdeps = registry_list(&autoload.softdeps)?;
         lines.push(format!(
-            "name={}\tclass={}\tbus={}\tpriority={}\tpath={}\twhen={}",
+            "name={}\tclass={}\tbus={}\tpriority={}\tpath={}\twhen={}\taliases={}\tsoftdeps={}\tprovider_group={}\tfallback_only={}",
             registry_value(&autoload.name)?,
             registry_value(&autoload.class)?,
             registry_value(&autoload.bus)?,
             autoload.priority,
             registry_value(&manifest.install.path)?,
             registry_value(autoload.when.as_deref().unwrap_or("vfs-ready"))?,
+            aliases,
+            softdeps,
+            registry_value(autoload.provider_group.as_deref().unwrap_or(""))?,
+            if autoload.fallback_only { 1 } else { 0 },
         ));
     }
     write_registry_lines(config.image_dir.join(DRIVER_REGISTRY_PATH), &lines)
@@ -141,20 +147,23 @@ fn write_application_desktop_files(config: &Config, manifests: &[PackageManifest
                 continue;
             }
             let exec = entry.exec.as_deref().unwrap_or(&manifest.install.path);
+            let deps = registry_deps(&manifest.runtime_deps)?;
             let argv = if entry.args.is_empty() {
                 vec![exec.to_string()]
             } else {
                 entry.args.clone()
             };
             let content = format!(
-                "[Desktop Entry]\nType=Application\nName={name}\nExec={exec_line}\nTerminal={terminal}\nOnlyShowIn=RustOS;\nNoDisplay={no_display}\nX-RustOS-DesktopId={desktop_id}\nX-RustOS-Startup={startup}\nX-RustOS-WeightMicros={weight}\nX-RustOS-LogicalAdmin={logical_admin}\nX-RustOS-ConsoleHosted={console_hosted}\nX-RustOS-Argv={argv}\nX-RustOS-Env={env}\n",
+                "[Desktop Entry]\nType=Application\nName={name}\nExec={exec_line}\nTerminal={terminal}\nOnlyShowIn=RustOS;\nNoDisplay={no_display}\nX-RustOS-DesktopId={desktop_id}\nX-RustOS-PackageId={package_id}\nX-RustOS-Startup={startup}\nX-RustOS-Deps={deps}\nX-RustOS-WeightMicros={weight}\nX-RustOS-LogicalAdmin={logical_admin}\nX-RustOS-ConsoleHosted={console_hosted}\nX-RustOS-Argv={argv}\nX-RustOS-Env={env}\n",
                 name = desktop_value(&entry.display_name)?,
                 exec_line = desktop_exec_line(&argv)?,
                 terminal = desktop_bool(entry.console_hosted),
                 no_display =
                     desktop_bool(manifest.kind == crate::package_manifest::PackageKind::Service),
                 desktop_id = desktop_value(&desktop_file_id)?,
+                package_id = desktop_value(&manifest.id)?,
                 startup = desktop_startup_mode(manifest.startup),
+                deps = desktop_value(&deps)?,
                 weight = entry.weight_micros,
                 logical_admin = desktop_bool(entry.logical_admin),
                 console_hosted = desktop_bool(entry.console_hosted),
@@ -221,9 +230,11 @@ fn write_desktop_registry(config: &Config, manifests: &[PackageManifest]) -> Res
             let startup = desktop_startup_mode(manifest.startup);
             let no_display = manifest.kind == crate::package_manifest::PackageKind::Service;
             let autostart_enabled = desktop_autostart_enabled(config, &desktop_id)?;
+            let deps = registry_deps(&manifest.runtime_deps)?;
             lines.push(format!(
-                "desktop_id={}\tstartup={}\tdisplay_name={}\timage={}\texec={}\tweight={}\tlogical_admin={}\tconsole_hosted={}\tterminal={}\thidden=0\tno_display={}\tautostart_enabled={}\tlaunch={}\targs={}\tenv={}",
+                "desktop_id={}\tpackage_id={}\tstartup={}\tdisplay_name={}\timage={}\texec={}\tweight={}\tlogical_admin={}\tconsole_hosted={}\tterminal={}\thidden=0\tno_display={}\tautostart_enabled={}\tlaunch={}\tdeps={}\targs={}\tenv={}",
                 registry_value(&desktop_id)?,
+                registry_value(&manifest.id)?,
                 startup,
                 registry_value(&entry.display_name)?,
                 registry_value(image)?,
@@ -235,6 +246,7 @@ fn write_desktop_registry(config: &Config, manifests: &[PackageManifest]) -> Res
                 if no_display { 1 } else { 0 },
                 if autostart_enabled { 1 } else { 0 },
                 launch,
+                deps,
                 args,
                 env,
             ));
@@ -285,9 +297,11 @@ fn write_runtime_launch_registry(config: &Config, manifests: &[PackageManifest])
                 DesktopLaunchMode::AllSessions => "all-sessions",
             };
             let no_display = manifest.kind == crate::package_manifest::PackageKind::Service;
+            let deps = registry_deps(&manifest.runtime_deps)?;
             lines.push(format!(
-                "desktop_id={}\tstartup={}\tdisplay_name={}\timage={}\texec={}\tweight={}\tlogical_admin={}\tconsole_hosted={}\tterminal={}\thidden=0\tno_display={}\tautostart_enabled={}\tlaunch={}\targs={}\tenv={}",
+                "desktop_id={}\tpackage_id={}\tstartup={}\tdisplay_name={}\timage={}\texec={}\tweight={}\tlogical_admin={}\tconsole_hosted={}\tterminal={}\thidden=0\tno_display={}\tautostart_enabled={}\tlaunch={}\tdeps={}\targs={}\tenv={}",
                 registry_value(&desktop_id)?,
+                registry_value(&manifest.id)?,
                 desktop_startup_mode(startup_mode),
                 registry_value(&entry.display_name)?,
                 registry_value(image)?,
@@ -299,6 +313,7 @@ fn write_runtime_launch_registry(config: &Config, manifests: &[PackageManifest])
                 if no_display { 1 } else { 0 },
                 if autostart_enabled { 1 } else { 0 },
                 launch,
+                deps,
                 args,
                 env,
             ));
@@ -404,13 +419,16 @@ fn write_startup_registry(config: &Config, manifests: &[PackageManifest]) -> Res
             StartupMode::Desktop => "desktop",
         };
         let desktop_id = desktop_file_id(manifest, 0);
+        let deps = registry_deps(&manifest.runtime_deps)?;
         lines.push(format!(
-            "desktop_id={}\tmode={}\tdisplay_name={}\texec={}\tlaunch={}",
+            "desktop_id={}\tpackage_id={}\tmode={}\tdisplay_name={}\texec={}\tlaunch={}\tdeps={}",
             registry_value(&desktop_id)?,
+            registry_value(&manifest.id)?,
             mode,
             registry_value(&entry.display_name)?,
             registry_value(exec)?,
             launch,
+            deps,
         ));
     }
     write_registry_lines(config.image_dir.join(STARTUP_REGISTRY_PATH), &lines)
@@ -464,6 +482,18 @@ fn registry_value(value: &str) -> Result<String> {
     Ok(value.to_owned())
 }
 
+fn registry_deps(deps: &[String]) -> Result<String> {
+    registry_list(deps)
+}
+
+fn registry_list(values: &[String]) -> Result<String> {
+    values
+        .iter()
+        .map(|value| registry_value(value))
+        .collect::<Result<Vec<_>>>()
+        .map(|values| values.join(","))
+}
+
 fn path_join_unix(prefix: &str, suffix: &Path) -> Result<String> {
     let suffix = suffix
         .to_str()
@@ -509,4 +539,43 @@ fn generate_dynamic_linker_cache(image_dir: &Path) -> Result<()> {
     };
 
     run_command(Command::new(ldconfig).arg("-r").arg(image_dir))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{registry_deps, registry_list};
+
+    #[test]
+    fn registry_deps_join_package_ids_with_commas() {
+        let deps = vec!["runtimed".to_string(), "sessiond".to_string()];
+
+        assert_eq!(registry_deps(&deps).unwrap(), "runtimed,sessiond");
+    }
+
+    #[test]
+    fn registry_deps_allow_empty_dependency_list() {
+        let deps = Vec::new();
+
+        assert_eq!(registry_deps(&deps).unwrap(), "");
+    }
+
+    #[test]
+    fn registry_deps_reject_registry_whitespace() {
+        let deps = vec!["bad\tdep".to_string()];
+
+        assert!(registry_deps(&deps).is_err());
+    }
+
+    #[test]
+    fn registry_list_join_driver_metadata_with_commas() {
+        let aliases = vec![
+            "virtio:d00000010v*".to_string(),
+            "platform:bootfb".to_string(),
+        ];
+
+        assert_eq!(
+            registry_list(&aliases).unwrap(),
+            "virtio:d00000010v*,platform:bootfb"
+        );
+    }
 }

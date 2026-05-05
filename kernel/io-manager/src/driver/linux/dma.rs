@@ -188,7 +188,9 @@ pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
         "dma_unmap_single_attrs" => Some(dma_unmap_single_attrs as *const () as usize),
         "dma_mapping_error" => Some(dma_mapping_error as *const () as usize),
         "dma_sync_single_for_cpu" => Some(dma_sync_single_for_cpu as *const () as usize),
+        "__dma_sync_single_for_cpu" => Some(dma_sync_single_for_cpu as *const () as usize),
         "dma_sync_single_for_device" => Some(dma_sync_single_for_device as *const () as usize),
+        "__dma_sync_single_for_device" => Some(dma_sync_single_for_device as *const () as usize),
         "dma_sync_single_range_for_cpu" => {
             Some(dma_sync_single_range_for_cpu as *const () as usize)
         }

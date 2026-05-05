@@ -593,6 +593,8 @@ pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
             Some(&SCHED_SET_STATE_TRACEPOINT as *const usize as usize)
         }
         "__SCT__might_resched" => Some(&MAY_RESCHED_SECTION as *const u8 as usize),
+        "__SCT__cond_resched" => Some(&MAY_RESCHED_SECTION as *const u8 as usize),
+        "__SCT__preempt_schedule_notrace" => Some(&MAY_RESCHED_SECTION as *const u8 as usize),
         _ => None,
     }
 }

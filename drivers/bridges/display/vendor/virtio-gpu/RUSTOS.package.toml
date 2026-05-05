@@ -1,0 +1,30 @@
+id = "virtio-gpu"
+kind = "bridge-driver"
+execution_domain = "kernel"
+profiles = ["default"]
+
+[build]
+builder = "external-copy"
+source = "vendor/modules/display/virtio-gpu.ko"
+source_env = "VENDOR_VIRTIO_GPU_KO"
+optional = true
+
+[install]
+path = "system/drivers/display/virtio-gpu.ko"
+
+[boot]
+preload = true
+required = false
+priority = -290
+
+startup = "none"
+
+[autoload]
+name = "virtio-gpu"
+class = "display"
+bus = "virtio"
+priority = 20
+when = "vfs-ready"
+aliases = ["virtio:d00000010v*"]
+softdeps = ["virtio_dma_buf"]
+provider_group = "display-primary"

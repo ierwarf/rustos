@@ -2425,6 +2425,8 @@ fn load_interpreter_image(path: &str) -> Result<Vec<u8>, ProcessLoadError> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::string::String;
+    use alloc::vec;
     use alloc::vec::Vec;
 
     use super::{

@@ -1,7 +1,6 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeviceId {
     Console,
-    Debug,
     Display,
     Input,
 }
@@ -10,7 +9,6 @@ impl DeviceId {
     pub const fn path(self) -> &'static str {
         match self {
             Self::Console => "/dev/console0",
-            Self::Debug => diag_abi::DIAG_DEVICE_PATH,
             Self::Display => "/dev/display0",
             Self::Input => "/dev/input0",
         }

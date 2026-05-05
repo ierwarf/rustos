@@ -23,5 +23,7 @@ startup = "none"
 name = "amdgpu"
 class = "display"
 bus = "pci"
-priority = 0
+priority = 10
 when = "vfs-ready"
+aliases = ["pci:vendor=0x1002,class=0x03", "pci:v00001002d*sv*sd*bc03sc*i*"]
+provider_group = "display-primary"

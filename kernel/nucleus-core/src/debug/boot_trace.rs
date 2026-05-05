@@ -1,14 +1,12 @@
-#[cfg(rustos_boot_trace_enabled)]
-use boot_protocol::{BootPixelFormat, FramebufferInfo};
 use boot_protocol::BootInfo;
 #[cfg(rustos_boot_trace_enabled)]
-use core::fmt::Write;
+use boot_protocol::{BootPixelFormat, FramebufferInfo};
 use core::fmt;
+#[cfg(rustos_boot_trace_enabled)]
+use core::fmt::Write;
 use core::ptr;
 use core::str;
 use core::sync::atomic::{AtomicPtr, Ordering};
-#[cfg(rustos_boot_trace_enabled)]
-use diag_abi::{DiagLevel, DiagProvider, DiagRecord, DiagSharedBufferHeader, DiagStage};
 
 #[cfg(rustos_boot_trace_enabled)]
 use embedded_graphics::Drawable;
@@ -46,7 +44,6 @@ pub fn init(boot_info_ptr: *const BootInfo) {
 pub fn println_fmt(args: fmt::Arguments<'_>) {
     let mut line = LineBuffer::new();
     let _ = line.write_fmt(args);
-    record_boot_line(line.as_str());
     super::write_bytes(line.as_str().as_bytes());
     super::println_newline();
 
@@ -66,45 +63,6 @@ fn framebuffer_from_boot_info() -> Option<Framebuffer> {
     let boot_info = unsafe { BootInfo::from_ptr(boot_info_ptr.cast_const()) }.ok()?;
     Framebuffer::from_info(boot_info.framebuffer)
 }
-
-#[cfg(rustos_boot_trace_enabled)]
-fn record_boot_line(line: &str) {
-    let boot_info_ptr = BOOT_INFO_PTR.load(Ordering::Acquire);
-    let Ok(boot_info) = (unsafe { BootInfo::from_ptr(boot_info_ptr.cast_const()) }) else {
-        return;
-    };
-    if boot_info.boot_diag.addr == 0 || boot_info.boot_diag.record_capacity == 0 {
-        return;
-    }
-
-    unsafe {
-        let header = &mut *(boot_info.boot_diag.addr as *mut DiagSharedBufferHeader);
-        if header.magic != diag_abi::DIAG_BUFFER_MAGIC {
-            *header = DiagSharedBufferHeader::empty(boot_info.boot_diag.record_capacity as u16);
-        }
-        let capacity = usize::from(header.record_capacity);
-        if capacity == 0 {
-            return;
-        }
-        let records_base = (boot_info.boot_diag.addr as usize
-            + core::mem::size_of::<DiagSharedBufferHeader>())
-            as *mut DiagRecord;
-        let sequence = header.next_sequence;
-        let slot = (sequence as usize) % capacity;
-        let record = &mut *records_base.add(slot);
-        *record = DiagRecord::empty();
-        record.header.stage = DiagStage::KernelBoot as u8;
-        record.header.level = DiagLevel::Info as u8;
-        record.header.provider = DiagProvider::Boot as u16;
-        record.header.sequence = sequence;
-        record.set_payload_bytes(line.as_bytes());
-        header.next_sequence = header.next_sequence.wrapping_add(1);
-    }
-}
-
-#[cfg(not(rustos_boot_trace_enabled))]
-#[allow(dead_code)]
-fn record_boot_line(_line: &str) {}
 
 #[cfg(rustos_boot_trace_enabled)]
 struct Framebuffer {

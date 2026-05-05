@@ -51,7 +51,7 @@ pub(crate) unsafe extern "C" fn __dynamic_pr_debug() -> i32 {
 }
 
 pub(crate) unsafe extern "C" fn __stack_chk_fail() -> ! {
-    crate::debug::write_debugcon_only_line(b"linux compat: __stack_chk_fail");
+    crate::debug::error!(compat, "linux compat: __stack_chk_fail");
     panic!("linux compat module triggered __stack_chk_fail");
 }
 

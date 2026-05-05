@@ -193,6 +193,15 @@ pub(crate) unsafe extern "C" fn hid_parse_report(
     if dev.is_null() {
         return -22;
     }
+    crate::debug::write_debugcon_only_line(
+        alloc::format!(
+            "hid_parse_report: begin dev={:#x} start={:#x} size={}",
+            dev as usize,
+            start as usize,
+            size
+        )
+        .as_bytes(),
+    );
     unsafe {
         if !start.is_null() {
             (*dev).dev_rdesc = start;
@@ -209,6 +218,14 @@ pub(crate) unsafe extern "C" fn hid_parse_report(
             (*dev).status |= HID_STAT_PARSED;
         }
     }
+    crate::debug::write_debugcon_only_line(
+        alloc::format!(
+            "hid_parse_report: end dev={:#x} status={}",
+            dev as usize,
+            status
+        )
+        .as_bytes(),
+    );
     status
 }
 
@@ -390,6 +407,16 @@ pub(crate) unsafe extern "C" fn hid_lookup_quirk(dev: *const LinuxCompatHidDevic
     if dev.is_null() {
         return 0;
     }
+    crate::debug::write_debugcon_only_line(
+        alloc::format!(
+            "hid_lookup_quirk: begin dev={:#x} vendor={:04x} product={:04x} bus={:04x}",
+            dev as usize,
+            unsafe { (*dev).vendor },
+            unsafe { (*dev).product },
+            unsafe { (*dev).bus }
+        )
+        .as_bytes(),
+    );
     let mut quirks = unsafe { ((*dev).initial_quirks | (*dev).quirks) as u64 };
     if (quirks & HID_QUIRK_NO_IGNORE) != 0 {
         quirks &= !HID_QUIRK_IGNORE;
@@ -407,6 +434,14 @@ pub(crate) unsafe extern "C" fn hid_lookup_quirk(dev: *const LinuxCompatHidDevic
         );
         quirks &= !HID_QUIRK_IGNORE;
     }
+    crate::debug::write_debugcon_only_line(
+        alloc::format!(
+            "hid_lookup_quirk: end dev={:#x} quirks={:#x}",
+            dev as usize,
+            quirks
+        )
+        .as_bytes(),
+    );
     quirks
 }
 
@@ -416,18 +451,58 @@ pub(crate) unsafe extern "C" fn hid_open_report(_dev: *mut LinuxCompatHidDevice)
     }
     let ll = unsafe { (*_dev).ll_driver };
     let populated = report_lists_populated(_dev);
+    crate::debug::write_debugcon_only_line(
+        alloc::format!(
+            "hid_open_report: begin dev={:#x} ll={:#x} populated={}",
+            _dev as usize,
+            ll as usize,
+            populated
+        )
+        .as_bytes(),
+    );
     if populated {
+        crate::debug::write_debugcon_only_line(
+            alloc::format!(
+                "hid_open_report: already populated dev={:#x}",
+                _dev as usize
+            )
+            .as_bytes(),
+        );
         return 0;
     }
     if !ll.is_null() {
         if let Some(parse) = unsafe { (*ll).parse } {
+            crate::debug::write_debugcon_only_line(
+                alloc::format!(
+                    "hid_open_report: ll.parse begin dev={:#x} ll={:#x} parse={:#x}",
+                    _dev as usize,
+                    ll as usize,
+                    parse as usize
+                )
+                .as_bytes(),
+            );
             let status = unsafe { parse(_dev) };
+            crate::debug::write_debugcon_only_line(
+                alloc::format!(
+                    "hid_open_report: ll.parse end dev={:#x} status={}",
+                    _dev as usize,
+                    status
+                )
+                .as_bytes(),
+            );
             if status != 0 {
                 return status;
             }
         }
     }
     if report_lists_populated(_dev) {
+        crate::debug::write_debugcon_only_line(
+            alloc::format!(
+                "hid_open_report: populated after ll.parse dev={:#x}",
+                _dev as usize
+            )
+            .as_bytes(),
+        );
         return 0;
     }
     let (rdesc, rsize) = unsafe {
@@ -444,9 +519,36 @@ pub(crate) unsafe extern "C" fn hid_open_report(_dev: *mut LinuxCompatHidDevice)
         (rdesc, rsize)
     };
     if rdesc.is_null() || rsize == 0 {
+        crate::debug::write_debugcon_only_line(
+            alloc::format!(
+                "hid_open_report: missing descriptor dev={:#x} rdesc={:#x} rsize={}",
+                _dev as usize,
+                rdesc as usize,
+                rsize
+            )
+            .as_bytes(),
+        );
         return -22;
     }
-    unsafe { hid_parse_report(_dev, rdesc, rsize) }
+    crate::debug::write_debugcon_only_line(
+        alloc::format!(
+            "hid_open_report: fallback parse dev={:#x} rdesc={:#x} rsize={}",
+            _dev as usize,
+            rdesc as usize,
+            rsize
+        )
+        .as_bytes(),
+    );
+    let status = unsafe { hid_parse_report(_dev, rdesc, rsize) };
+    crate::debug::write_debugcon_only_line(
+        alloc::format!(
+            "hid_open_report: end dev={:#x} status={}",
+            _dev as usize,
+            status
+        )
+        .as_bytes(),
+    );
+    status
 }
 
 pub(crate) unsafe extern "C" fn hid_alloc_report_buf(
@@ -513,8 +615,7 @@ pub(crate) unsafe extern "C" fn hid_driver_reset_resume(dev: *mut LinuxCompatHid
 }
 
 pub(crate) unsafe extern "C" fn hid_quirks_init(_count: usize) -> i32 {
-    crate::debug::write_debugcon_only_line(b"linux compat: hid_quirks_init begin");
-    crate::debug::write_debugcon_only_line(b"linux compat: hid_quirks_init end");
+    crate::debug::write_debugcon_only_line(b"linux compat: hid_quirks_init");
     0
 }
 
@@ -867,6 +968,9 @@ fn rebuild_hid_reports(dev: *mut LinuxCompatHidDevice) -> i32 {
     if dev.is_null() {
         return -22;
     }
+    crate::debug::write_debugcon_only_line(
+        alloc::format!("rebuild_hid_reports: begin dev={:#x}", dev as usize).as_bytes(),
+    );
 
     let (rdesc, rsize) = unsafe {
         let rdesc = if !(*dev).rdesc.is_null() {
@@ -882,6 +986,15 @@ fn rebuild_hid_reports(dev: *mut LinuxCompatHidDevice) -> i32 {
         (rdesc, rsize)
     };
     if rdesc.is_null() || rsize == 0 {
+        crate::debug::write_debugcon_only_line(
+            alloc::format!(
+                "rebuild_hid_reports: missing descriptor dev={:#x} rdesc={:#x} rsize={}",
+                dev as usize,
+                rdesc as usize,
+                rsize
+            )
+            .as_bytes(),
+        );
         return -22;
     }
 
@@ -978,6 +1091,17 @@ fn rebuild_hid_reports(dev: *mut LinuxCompatHidDevice) -> i32 {
         }
     }
 
+    crate::debug::write_debugcon_only_line(
+        alloc::format!(
+            "rebuild_hid_reports: end dev={:#x} size={} input0={:#x} output0={:#x} feature0={:#x}",
+            dev as usize,
+            rsize,
+            unsafe { (*dev).report_enum[HID_INPUT_REPORT as usize].report_id_hash[0] as usize },
+            unsafe { (*dev).report_enum[HID_OUTPUT_REPORT as usize].report_id_hash[0] as usize },
+            unsafe { (*dev).report_enum[HID_FEATURE_REPORT as usize].report_id_hash[0] as usize }
+        )
+        .as_bytes(),
+    );
     0
 }
 

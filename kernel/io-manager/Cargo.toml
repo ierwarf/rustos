@@ -15,7 +15,6 @@ kernel-object = { path = "../object" }
 kernel-ipc-runtime = { path = "../ipc-runtime" }
 kernel-ps = { path = "../ps" }
 boot-protocol = { path = "../../boot/bootloader/boot-protocol" }
-diag-abi = { path = "../../libs/diag-abi" }
 driver-abi = { path = "../../drivers/libs/driver-abi" }
 keyboard-core = { path = "../../drivers/libs/keyboard-core" }
 storage-core = { path = "../../libs/storage-core" }
@@ -24,6 +23,7 @@ embedded-graphics = { version = "0.8", default-features = false }
 fatfs = { git = "https://github.com/rafalh/rust-fatfs", default-features = false, features = ["alloc", "lfn"] }
 hidreport = { version = "0.6.0", default-features = false }
 object = { version = "0.38.1", default-features = false, features = ["read_core", "elf"] }
+smoltcp = { version = "=0.13.0", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp"] }
 spin = "0.10.0"
 vte = { version = "0.15.0", default-features = false }
 x86_64 = { version = "0.15.4", default-features = false, features = ["instructions", "abi_x86_interrupt"] }

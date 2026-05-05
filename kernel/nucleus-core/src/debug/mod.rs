@@ -1,139 +1,194 @@
 pub mod boot_trace;
+mod kdiag_macros;
 
-extern crate alloc;
-
+use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 use boot_protocol::BootInfo;
 use core::fmt;
 #[cfg(rustos_debug_print_enabled)]
-use core::fmt::Write;
-#[cfg(all(rustos_debug_print_enabled, not(test)))]
+use core::fmt::Write as _;
+#[cfg(rustos_debug_print_enabled)]
 use core::sync::atomic::{AtomicU64, Ordering};
 #[cfg(rustos_debug_print_enabled)]
-use diag_abi::{
-    CrashStoreHeader, CrashStoreInfo, DebugConfigureRequest, DebugDeviceState, DiagLevel,
-    DiagProvider, DiagRecord, DiagSharedBufferHeader, DiagStage,
-};
-#[cfg(not(rustos_debug_print_enabled))]
-use diag_abi::{DebugConfigureRequest, DebugDeviceState, DiagRecord};
+use os_observatory::sink::{RingBufferSink as ObservatoryRingBufferSink, Sink as ObservatorySink};
+pub use rustos_observability::{LogCategory, LogLevel};
 #[cfg(rustos_debug_print_enabled)]
-use spin::Mutex;
+use spin::{Mutex, RwLock};
 #[cfg(all(rustos_debug_print_enabled, not(test)))]
 use x86_64::instructions::port::Port;
 
 #[cfg(rustos_debug_print_enabled)]
+include!(concat!(env!("OUT_DIR"), "/logging_build.rs"));
+
+pub use crate::__rustos_debug_debug as debug;
+pub use crate::__rustos_debug_enabled as enabled;
+pub use crate::__rustos_debug_error as error;
+pub use crate::__rustos_debug_error_ratelimited as error_ratelimited;
+pub use crate::__rustos_debug_info as info;
+pub use crate::__rustos_debug_log as log;
+pub use crate::__rustos_debug_trace as trace;
+pub use crate::__rustos_debug_warn as warn;
+pub use crate::__rustos_debug_warn_ratelimited as warn_ratelimited;
+
+#[cfg(all(rustos_debug_print_enabled, not(test)))]
 const DEBUGCON_PORT: u16 = 0x00e9;
 #[cfg(rustos_debug_print_enabled)]
-const DIAG_RING_CAPACITY: usize = 512;
+const TEXT_RING_CAPACITY: usize = RUSTOS_LOGGING_RING_BUFFER_BYTES;
+#[cfg(rustos_debug_print_enabled)]
+const SYNTHETIC_WARNING_MODULE_PATH: &str = "nucleus_core::debug";
 
-#[cfg(rustos_debug_print_enabled)]
-static DEBUG_LOCK: Mutex<()> = Mutex::new(());
-#[cfg(rustos_debug_print_enabled)]
-static DIAG_STATE: Mutex<DiagState> = Mutex::new(DiagState::new());
-#[cfg(all(rustos_debug_print_enabled, not(test)))]
-static TIMESTAMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CurrentUserLogContext {
+    pub process_id: u64,
+    pub thread_id: u64,
+}
 
-#[cfg(rustos_debug_print_enabled)]
-struct DiagState {
-    enabled: bool,
-    min_level: u8,
-    provider_mask: u64,
-    next_sequence: u64,
-    read_sequence: u64,
-    dropped_records: u64,
-    crash_store: CrashStoreInfo,
-    crash_available: bool,
-    crash_bytes: usize,
-    ring: [DiagRecord; DIAG_RING_CAPACITY],
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DebugRuntimeHooks {
+    pub ticks: Option<fn() -> u64>,
+    pub ticks_per_second: Option<fn() -> u64>,
+    pub current_user_context: Option<fn() -> Option<CurrentUserLogContext>>,
+}
+
+impl DebugRuntimeHooks {
+    pub const fn new() -> Self {
+        Self {
+            ticks: None,
+            ticks_per_second: None,
+            current_user_context: None,
+        }
+    }
 }
 
 #[cfg(rustos_debug_print_enabled)]
-impl DiagState {
+struct KernelTextRing<const N: usize> {
+    inner: ObservatoryRingBufferSink<N>,
+    total_written: AtomicU64,
+}
+
+#[cfg(rustos_debug_print_enabled)]
+impl<const N: usize> KernelTextRing<N> {
     const fn new() -> Self {
         Self {
-            enabled: true,
-            min_level: DiagLevel::Trace as u8,
-            provider_mask: u64::MAX,
-            next_sequence: 0,
-            read_sequence: 0,
-            dropped_records: 0,
-            crash_store: CrashStoreInfo {
-                addr: 0,
-                bytes_len: 0,
-            },
-            crash_available: false,
-            crash_bytes: 0,
-            ring: [const { DiagRecord::empty() }; DIAG_RING_CAPACITY],
+            inner: ObservatoryRingBufferSink::new(),
+            total_written: AtomicU64::new(0),
         }
     }
 
-    fn should_emit(&self, provider: DiagProvider, level: DiagLevel) -> bool {
-        self.enabled
-            && (level as u8) >= self.min_level
-            && (self.provider_mask & provider.bit()) != 0
-    }
-
-    fn push_record(&mut self, mut record: DiagRecord) {
-        let slot = (self.next_sequence as usize) % self.ring.len();
-        record.header.sequence = self.next_sequence;
-        self.ring[slot] = record;
-        self.next_sequence = self.next_sequence.wrapping_add(1);
-        if self.next_sequence.saturating_sub(self.read_sequence) > self.ring.len() as u64 {
-            self.read_sequence = self.next_sequence.saturating_sub(self.ring.len() as u64);
-            self.dropped_records = self.dropped_records.saturating_add(1);
+    fn snapshot_bytes(&self) -> Vec<u8> {
+        let total_written = self.total_written.load(Ordering::Acquire);
+        let used = (total_written as usize).min(N);
+        if used == 0 {
+            return Vec::new();
         }
-    }
 
-    fn import_record(&mut self, record: &DiagRecord) {
-        self.push_record(*record);
-    }
+        let mut snapshot = vec![0_u8; used];
+        let copied = self.inner.snapshot(snapshot.as_mut_slice()).min(used);
+        snapshot.truncate(copied);
 
-    fn drain_records(&mut self, max_records: usize) -> Vec<DiagRecord> {
-        let available = self.next_sequence.saturating_sub(self.read_sequence);
-        let count = available.min(max_records as u64) as usize;
-        let mut records = Vec::with_capacity(count);
-        for seq in self.read_sequence..self.read_sequence + count as u64 {
-            records.push(self.ring[(seq as usize) % self.ring.len()]);
+        if total_written <= N as u64 {
+            return snapshot;
         }
-        self.read_sequence = self.read_sequence.saturating_add(count as u64);
-        records
-    }
 
-    fn snapshot_recent_records(&self, max_records: usize) -> Vec<DiagRecord> {
-        let retained = self.next_sequence.min(self.ring.len() as u64);
-        let count = retained.min(max_records as u64) as usize;
-        let start = self.next_sequence.saturating_sub(count as u64);
-        let mut records = Vec::with_capacity(count);
-        for seq in start..self.next_sequence {
-            records.push(self.ring[(seq as usize) % self.ring.len()]);
+        if let Some(newline_index) = snapshot.iter().position(|&byte| byte == b'\n') {
+            snapshot.drain(..=newline_index);
+        } else {
+            snapshot.clear();
         }
-        records
-    }
 
-    fn device_state(&self) -> DebugDeviceState {
-        DebugDeviceState {
-            record_size: core::mem::size_of::<DiagRecord>() as u32,
-            ring_capacity: DIAG_RING_CAPACITY as u32,
-            records_available: self.next_sequence.saturating_sub(self.read_sequence),
-            total_sequence: self.next_sequence,
-            dropped_records: self.dropped_records,
-            filter_mask: self.provider_mask,
-            min_level: self.min_level,
-            enabled: u8::from(self.enabled),
-            reserved0: 0,
-            crash_available: u32::from(self.crash_available),
-            crash_bytes: self.crash_bytes as u32,
+        let mut prefixed = synthetic_warning_line();
+        prefixed.extend_from_slice(snapshot.as_slice());
+        prefixed
+    }
+}
+
+#[cfg(rustos_debug_print_enabled)]
+impl<const N: usize> ObservatorySink for KernelTextRing<N> {
+    fn write_str(&self, s: &str) -> usize {
+        let written = self.inner.write_str(s);
+        self.total_written
+            .fetch_add(written as u64, Ordering::Relaxed);
+        written
+    }
+}
+
+#[cfg(rustos_debug_print_enabled)]
+static TEXT_RING: KernelTextRing<TEXT_RING_CAPACITY> = KernelTextRing::new();
+#[cfg(rustos_debug_print_enabled)]
+static KERNEL_LOG_SINK: KernelLogSink = KernelLogSink;
+#[cfg(rustos_debug_print_enabled)]
+static DEBUG_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(rustos_debug_print_enabled)]
+static LOG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+#[cfg(rustos_debug_print_enabled)]
+static RATE_LIMIT_FALLBACK_MICROS: AtomicU64 =
+    AtomicU64::new(DEFAULT_LOG_RATE_LIMIT_INTERVAL_MICROS);
+#[cfg(rustos_debug_print_enabled)]
+static RUNTIME_HOOKS: RwLock<DebugRuntimeHooks> = RwLock::new(DebugRuntimeHooks::new());
+
+#[cfg(rustos_debug_print_enabled)]
+struct KernelLogSink;
+
+#[cfg(rustos_debug_print_enabled)]
+struct DebugconSink;
+
+#[cfg(rustos_debug_print_enabled)]
+struct SinkWriter<'a, S: ObservatorySink>(&'a S);
+
+#[cfg(rustos_debug_print_enabled)]
+impl<'a, S: ObservatorySink> fmt::Write for SinkWriter<'a, S> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let _ = self.0.write_str(s);
+        Ok(())
+    }
+}
+
+#[cfg(rustos_debug_print_enabled)]
+struct DebugconWriter;
+
+#[cfg(rustos_debug_print_enabled)]
+impl fmt::Write for DebugconWriter {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        if !s.is_empty() {
+            print_bytes_unlocked(s.as_bytes());
         }
+        Ok(())
     }
+}
 
-    fn configure(&mut self, request: DebugConfigureRequest) {
-        self.enabled = request.enabled != 0;
-        self.min_level = request.min_level;
-        self.provider_mask = request.provider_mask;
+#[cfg(rustos_debug_print_enabled)]
+#[derive(Clone, Copy)]
+struct RenderedLogMetadata<'a> {
+    seq: u64,
+    ts_us: u64,
+    tick: u64,
+    category: LogCategory,
+    level: LogLevel,
+    module_path: &'a str,
+    line: u32,
+    process_id: Option<u64>,
+    thread_id: Option<u64>,
+}
+
+#[cfg(rustos_debug_print_enabled)]
+impl ObservatorySink for KernelLogSink {
+    fn write_str(&self, s: &str) -> usize {
+        let written = TEXT_RING.write_str(s);
+        if RUSTOS_LOGGING_SERIAL_MIRROR && !s.is_empty() {
+            print_bytes_unlocked(s.as_bytes());
+        }
+        written
     }
+}
 
-    fn filter_allows(&self, provider: DiagProvider, level: DiagLevel) -> bool {
-        self.should_emit(provider, level)
+#[cfg(rustos_debug_print_enabled)]
+impl ObservatorySink for DebugconSink {
+    fn write_str(&self, s: &str) -> usize {
+        if !s.is_empty() {
+            print_bytes_unlocked(s.as_bytes());
+        }
+        s.len()
     }
 }
 
@@ -163,285 +218,268 @@ fn print_bytes_unlocked(bytes: &[u8]) {
 fn with_debug_output_lock<F: FnOnce()>(f: F) {
     #[cfg(not(test))]
     x86_64::instructions::interrupts::without_interrupts(|| {
-        let _guard = DEBUG_LOCK.try_lock();
-        f();
+        if let Some(_guard) = DEBUG_LOCK.try_lock() {
+            f();
+        }
     });
 
     #[cfg(test)]
     {
-        let _guard = DEBUG_LOCK.try_lock();
+        let _guard = DEBUG_LOCK.lock();
         f();
     }
 }
 
 #[cfg(rustos_debug_print_enabled)]
-fn with_diag_state_lock<R, F: FnOnce(&mut DiagState) -> R>(f: F) -> R {
-    #[cfg(not(test))]
-    {
-        x86_64::instructions::interrupts::without_interrupts(|| {
-            let mut state = DIAG_STATE.lock();
-            f(&mut state)
-        })
-    }
+fn current_runtime_hooks() -> DebugRuntimeHooks {
+    *RUNTIME_HOOKS.read()
+}
 
-    #[cfg(test)]
-    {
-        let mut state = DIAG_STATE.lock();
-        f(&mut state)
+#[cfg(rustos_debug_print_enabled)]
+fn ticks_to_micros(ticks: u64, ticks_per_second: u64) -> u64 {
+    if ticks_per_second == 0 {
+        return 0;
+    }
+    ticks
+        .saturating_mul(1_000_000)
+        .saturating_div(ticks_per_second)
+}
+
+#[cfg(rustos_debug_print_enabled)]
+fn current_tick_and_micros() -> (u64, u64) {
+    let hooks = current_runtime_hooks();
+    let tick = hooks.ticks.map(|ticks| ticks()).unwrap_or(0);
+    let ticks_per_second = hooks
+        .ticks_per_second
+        .map(|ticks_per_second| ticks_per_second())
+        .unwrap_or(0);
+    (tick, ticks_to_micros(tick, ticks_per_second))
+}
+
+#[cfg(rustos_debug_print_enabled)]
+fn current_user_context() -> Option<CurrentUserLogContext> {
+    current_runtime_hooks()
+        .current_user_context
+        .and_then(|snapshot| snapshot())
+}
+
+#[cfg(rustos_debug_print_enabled)]
+fn render_log_line<W: fmt::Write>(
+    writer: &mut W,
+    metadata: RenderedLogMetadata<'_>,
+    args: fmt::Arguments<'_>,
+) -> fmt::Result {
+    write!(
+        writer,
+        "seq={} ts_us={} tick={} lvl={} cat={} mod={} line={} pid=",
+        metadata.seq,
+        metadata.ts_us,
+        metadata.tick,
+        metadata.level.as_str(),
+        metadata.category.as_str(),
+        metadata.module_path,
+        metadata.line,
+    )?;
+    match metadata.process_id {
+        Some(process_id) => write!(writer, "{process_id}")?,
+        None => writer.write_str("-")?,
+    }
+    writer.write_str(" tid=")?;
+    match metadata.thread_id {
+        Some(thread_id) => write!(writer, "{thread_id}")?,
+        None => writer.write_str("-")?,
+    }
+    writer.write_str(" msg=\"")?;
+    let mut escaped = EscapedMessageWriter { writer };
+    fmt::write(&mut escaped, args)?;
+    escaped.writer.write_str("\"\n")
+}
+
+#[cfg(rustos_debug_print_enabled)]
+struct EscapedMessageWriter<'a, W: fmt::Write> {
+    writer: &'a mut W,
+}
+
+#[cfg(rustos_debug_print_enabled)]
+impl<'a, W: fmt::Write> fmt::Write for EscapedMessageWriter<'a, W> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for ch in s.chars() {
+            match ch {
+                '\\' => self.writer.write_str("\\\\")?,
+                '"' => self.writer.write_str("\\\"")?,
+                '\n' => self.writer.write_str("\\n")?,
+                '\r' => self.writer.write_str("\\r")?,
+                '\t' => self.writer.write_str("\\t")?,
+                _ => self.writer.write_char(ch)?,
+            }
+        }
+        Ok(())
     }
 }
 
 #[cfg(rustos_debug_print_enabled)]
-pub fn init(boot_info_ptr: *const BootInfo) {
-    let Ok(boot_info) = (unsafe { BootInfo::from_ptr(boot_info_ptr) }) else {
-        return;
-    };
-    with_diag_state_lock(|state| {
-        state.crash_store = boot_info.crash_store;
-        import_boot_records_locked(state, boot_info);
-    });
+fn synthetic_warning_line() -> Vec<u8> {
+    let mut line = String::new();
+    let _ = render_log_line(
+        &mut line,
+        RenderedLogMetadata {
+            seq: 0,
+            ts_us: 0,
+            tick: 0,
+            category: LogCategory::Debug,
+            level: LogLevel::Warn,
+            module_path: SYNTHETIC_WARNING_MODULE_PATH,
+            line: 0,
+            process_id: None,
+            thread_id: None,
+        },
+        format_args!("oldest logs dropped"),
+    );
+    line.into_bytes()
 }
 
-#[cfg(not(rustos_debug_print_enabled))]
+#[cfg(rustos_debug_print_enabled)]
+fn rate_limit_clock_micros() -> u64 {
+    let (_, ts_us) = current_tick_and_micros();
+    if ts_us != 0 {
+        return ts_us;
+    }
+    RATE_LIMIT_FALLBACK_MICROS.fetch_add(DEFAULT_LOG_RATE_LIMIT_INTERVAL_MICROS, Ordering::Relaxed)
+}
+
+pub const DEFAULT_LOG_RATE_LIMIT_INTERVAL_MICROS: u64 = 1_000_000;
+
 pub fn init(_boot_info_ptr: *const BootInfo) {}
 
 #[cfg(rustos_debug_print_enabled)]
-fn import_boot_records_locked(state: &mut DiagState, boot_info: &BootInfo) {
-    if boot_info.boot_diag.addr == 0 || boot_info.boot_diag.record_capacity == 0 {
-        return;
-    }
-
-    let header = unsafe { &*(boot_info.boot_diag.addr as *const DiagSharedBufferHeader) };
-    if header.magic != diag_abi::DIAG_BUFFER_MAGIC || header.record_capacity == 0 {
-        return;
-    }
-
-    let capacity = usize::from(header.record_capacity);
-    let next_sequence = header.next_sequence;
-    let start = next_sequence.saturating_sub(capacity as u64);
-    let records_base = (boot_info.boot_diag.addr as usize
-        + core::mem::size_of::<DiagSharedBufferHeader>())
-        as *const DiagRecord;
-
-    for seq in start..next_sequence {
-        let record = unsafe { &*records_base.add((seq as usize) % capacity) };
-        if record.header.magic == diag_abi::DIAG_RECORD_MAGIC {
-            state.import_record(record);
-        }
-    }
-}
-
-#[cfg(all(rustos_debug_print_enabled, not(test)))]
-fn timestamp_micros() -> u64 {
-    TIMESTAMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-}
-
-#[cfg(all(rustos_debug_print_enabled, test))]
-fn timestamp_micros() -> u64 {
-    0
-}
-
-#[cfg(rustos_debug_print_enabled)]
-fn current_diag_subject_ids() -> (u64, u64) {
-    (0, 0)
-}
-
-#[cfg(rustos_debug_print_enabled)]
-pub fn emit_text(
-    provider: DiagProvider,
-    level: DiagLevel,
-    event_id: u16,
-    span_id: u64,
-    object_id: u64,
-    message: &str,
-) {
-    let mut record = DiagRecord::empty();
-    record.header.stage = DiagStage::Kernel as u8;
-    record.header.level = level as u8;
-    record.header.provider = provider as u16;
-    record.header.event_id = event_id;
-    record.header.timestamp_micros = timestamp_micros();
-    record.header.span_id = span_id;
-    record.header.object_id = object_id;
-    let (process_id, thread_id) = current_diag_subject_ids();
-    record.header.process_id = process_id;
-    record.header.thread_id = thread_id;
-    record.set_payload_bytes(message.as_bytes());
-
-    let should_mirror = with_diag_state_lock(|state| {
-        let should_emit = state.should_emit(provider, level);
-        if should_emit {
-            state.push_record(record);
-        }
-        should_emit && should_mirror_early_boot_record(provider, level)
-    });
-    if should_mirror {
-        mirror_diag_record_to_debugcon(provider, message);
-    }
+pub fn register_runtime_hooks(hooks: DebugRuntimeHooks) {
+    *RUNTIME_HOOKS.write() = hooks;
 }
 
 #[cfg(not(rustos_debug_print_enabled))]
-pub fn emit_text(
-    _provider: diag_abi::DiagProvider,
-    _level: diag_abi::DiagLevel,
-    _event_id: u16,
-    _span_id: u64,
-    _object_id: u64,
-    _message: &str,
+pub fn register_runtime_hooks(_hooks: DebugRuntimeHooks) {}
+
+#[cfg(rustos_debug_print_enabled)]
+pub fn should_emit(category: LogCategory, level: LogLevel) -> bool {
+    compiled_level_enabled(category, level)
+}
+
+#[cfg(not(rustos_debug_print_enabled))]
+pub fn should_emit(_category: LogCategory, _level: LogLevel) -> bool {
+    false
+}
+
+#[cfg(rustos_debug_print_enabled)]
+pub fn log_args_site(
+    category: LogCategory,
+    level: LogLevel,
+    module_path: &'static str,
+    line: u32,
+    args: fmt::Arguments<'_>,
+) {
+    if !compiled_level_enabled(category, level) {
+        return;
+    }
+
+    let (tick, ts_us) = current_tick_and_micros();
+    let user_context = current_user_context();
+    let metadata = RenderedLogMetadata {
+        seq: LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        ts_us,
+        tick,
+        category,
+        level,
+        module_path,
+        line,
+        process_id: user_context.map(|context| context.process_id),
+        thread_id: user_context.map(|context| context.thread_id),
+    };
+
+    with_debug_output_lock(|| {
+        let mut writer = SinkWriter(&KERNEL_LOG_SINK);
+        let _ = render_log_line(&mut writer, metadata, args);
+    });
+}
+
+#[cfg(not(rustos_debug_print_enabled))]
+pub fn log_args_site(
+    _category: LogCategory,
+    _level: LogLevel,
+    _module_path: &'static str,
+    _line: u32,
+    _args: fmt::Arguments<'_>,
 ) {
 }
 
 #[cfg(rustos_debug_print_enabled)]
-fn should_mirror_early_boot_record(provider: DiagProvider, level: DiagLevel) -> bool {
-    if matches!(provider, DiagProvider::Panic) {
-        return true;
-    }
-    if matches!(provider, DiagProvider::Heartbeat) {
-        return level >= DiagLevel::Info;
-    }
-    if level < DiagLevel::Info {
+pub fn log_args(category: LogCategory, level: LogLevel, args: fmt::Arguments<'_>) {
+    log_args_site(category, level, SYNTHETIC_WARNING_MODULE_PATH, 0, args);
+}
+
+#[cfg(not(rustos_debug_print_enabled))]
+pub fn log_args(_category: LogCategory, _level: LogLevel, _args: fmt::Arguments<'_>) {}
+
+#[cfg(rustos_debug_print_enabled)]
+pub fn rate_limit_permit(
+    last_emit_micros: &core::sync::atomic::AtomicU64,
+    interval_micros: u64,
+) -> bool {
+    let now = rate_limit_clock_micros();
+    let last = last_emit_micros.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < interval_micros {
         return false;
     }
-    matches!(
-        provider,
-        DiagProvider::Boot
-            | DiagProvider::Driver
-            | DiagProvider::Module
-            | DiagProvider::Service
-    )
+    last_emit_micros.store(now, Ordering::Relaxed);
+    true
 }
 
 #[cfg(not(rustos_debug_print_enabled))]
-#[allow(dead_code)]
-fn should_mirror_early_boot_record(
-    _provider: diag_abi::DiagProvider,
-    _level: diag_abi::DiagLevel,
+pub fn rate_limit_permit(
+    _last_emit_micros: &core::sync::atomic::AtomicU64,
+    _interval_micros: u64,
 ) -> bool {
     false
 }
 
 #[cfg(rustos_debug_print_enabled)]
-fn mirror_diag_record_to_debugcon(provider: DiagProvider, message: &str) {
-    let prefix = match provider {
-        DiagProvider::Boot => "[boot] ",
-        DiagProvider::Driver => "[driver] ",
-        DiagProvider::Module => "[module] ",
-        DiagProvider::Heartbeat => "[heartbeat] ",
-        DiagProvider::Service => "[service] ",
-        DiagProvider::Panic => "[panic] ",
-        _ => "",
-    };
+pub fn report_panic(info: &core::panic::PanicInfo<'_>) {
+    if should_emit(LogCategory::Panic, LogLevel::Fatal) {
+        if let Some(location) = info.location() {
+            log_args_site(
+                LogCategory::Panic,
+                LogLevel::Fatal,
+                module_path!(),
+                line!(),
+                format_args!(
+                    "panic location={}:{}:{} message={}",
+                    location.file(),
+                    location.line(),
+                    location.column(),
+                    info.message()
+                ),
+            );
+        } else {
+            log_args_site(
+                LogCategory::Panic,
+                LogLevel::Fatal,
+                module_path!(),
+                line!(),
+                format_args!("panic location=<unknown> message={}", info.message()),
+            );
+        }
+    }
+
     with_debug_output_lock(|| {
-        print_bytes_unlocked(prefix.as_bytes());
-        print_bytes_unlocked(message.as_bytes());
-        print_bytes_unlocked(b"\r\n");
+        os_observatory::panic::report_panic(&DebugconSink, info);
     });
 }
 
 #[cfg(not(rustos_debug_print_enabled))]
-#[allow(dead_code)]
-fn mirror_diag_record_to_debugcon(_provider: diag_abi::DiagProvider, _message: &str) {}
-
-#[cfg(rustos_debug_print_enabled)]
-pub fn should_emit(provider: DiagProvider, level: DiagLevel) -> bool {
-    with_diag_state_lock(|state| state.filter_allows(provider, level))
-}
-
-#[cfg(not(rustos_debug_print_enabled))]
-pub fn should_emit(_provider: diag_abi::DiagProvider, _level: diag_abi::DiagLevel) -> bool {
-    false
-}
-
-#[cfg(rustos_debug_print_enabled)]
-pub fn configure(request: DebugConfigureRequest) {
-    with_diag_state_lock(|state| state.configure(request));
-}
-
-#[cfg(not(rustos_debug_print_enabled))]
-pub fn configure(_request: DebugConfigureRequest) {}
-
-#[cfg(rustos_debug_print_enabled)]
-pub fn device_state() -> DebugDeviceState {
-    with_diag_state_lock(|state| state.device_state())
-}
-
-#[cfg(not(rustos_debug_print_enabled))]
-pub fn device_state() -> DebugDeviceState {
-    DebugDeviceState::empty()
-}
-
-#[cfg(rustos_debug_print_enabled)]
-pub fn drain_records(max_records: usize) -> Vec<DiagRecord> {
-    with_diag_state_lock(|state| state.drain_records(max_records))
-}
-
-#[cfg(not(rustos_debug_print_enabled))]
-pub fn drain_records(_max_records: usize) -> Vec<DiagRecord> {
-    Vec::new()
-}
-
-#[cfg(rustos_debug_print_enabled)]
-pub fn snapshot_crash_bytes() -> Vec<u8> {
-    with_diag_state_lock(|state| {
-        if state.crash_store.addr == 0 || state.crash_bytes == 0 {
-            return Vec::new();
-        }
-        let bytes = unsafe {
-            core::slice::from_raw_parts(state.crash_store.addr as *const u8, state.crash_bytes)
-        };
-        bytes.to_vec()
-    })
-}
-
-#[cfg(not(rustos_debug_print_enabled))]
-pub fn snapshot_crash_bytes() -> Vec<u8> {
-    Vec::new()
-}
-
-#[cfg(rustos_debug_print_enabled)]
-pub fn capture_crash_snapshot(panic_text: &str) {
-    with_diag_state_lock(|state| {
-        if state.crash_store.addr == 0 || state.crash_store.bytes_len == 0 {
-            return;
-        }
-        let header_ptr = state.crash_store.addr as *mut CrashStoreHeader;
-        let records_ptr = (state.crash_store.addr as usize
-            + core::mem::size_of::<CrashStoreHeader>())
-            as *mut DiagRecord;
-        let recent = state.snapshot_recent_records(diag_abi::DIAG_CRASH_RECORD_CAPACITY);
-        let text_ptr = (records_ptr as usize
-            + diag_abi::DIAG_CRASH_RECORD_CAPACITY * core::mem::size_of::<DiagRecord>())
-            as *mut u8;
-        let text_bytes = panic_text.as_bytes();
-        let text_len = text_bytes.len().min(diag_abi::DIAG_CRASH_TEXT_BYTES);
-
-        unsafe {
-            *header_ptr = CrashStoreHeader::empty();
-            (*header_ptr).record_count = recent.len() as u32;
-            (*header_ptr).panic_text_len = text_len as u32;
-            (*header_ptr).last_sequence = state.next_sequence;
-            for (index, record) in recent.iter().enumerate() {
-                *records_ptr.add(index) = *record;
-            }
-            core::ptr::write_bytes(text_ptr, 0, diag_abi::DIAG_CRASH_TEXT_BYTES);
-            if text_len != 0 {
-                core::ptr::copy_nonoverlapping(text_bytes.as_ptr(), text_ptr, text_len);
-            }
-        }
-
-        state.crash_available = true;
-        state.crash_bytes = core::mem::size_of::<CrashStoreHeader>()
-            + recent.len() * core::mem::size_of::<DiagRecord>()
-            + text_len;
-    });
-}
-
-#[cfg(not(rustos_debug_print_enabled))]
-pub fn capture_crash_snapshot(_panic_text: &str) {}
+pub fn report_panic(_info: &core::panic::PanicInfo<'_>) {}
 
 #[cfg(rustos_debug_print_enabled)]
 pub fn println_newline() {
-    write_debug_bytes(b"\r\n");
+    write_debugcon_only_line(b"");
 }
 
 #[cfg(not(rustos_debug_print_enabled))]
@@ -450,17 +488,9 @@ pub fn println_newline() {}
 #[cfg(rustos_debug_print_enabled)]
 pub fn println_fmt(args: fmt::Arguments<'_>) {
     with_debug_output_lock(|| {
-        let mut writer = DebugWriter::new();
+        let mut writer = DebugconWriter;
         let _ = writer.write_fmt(args);
-        writer.finish_line();
-        emit_text(
-            DiagProvider::Legacy,
-            DiagLevel::Info,
-            0,
-            0,
-            0,
-            writer.as_str(),
-        );
+        let _ = writer.write_str("\r\n");
     });
 }
 
@@ -472,6 +502,9 @@ pub fn record_trace_location(file: &'static str, line: u32, column: u32) {
     record_trace_location_with_note(file, line, column, None);
 }
 
+#[cfg(not(rustos_debug_print_enabled))]
+pub fn record_trace_location(_file: &'static str, _line: u32, _column: u32) {}
+
 #[cfg(rustos_debug_print_enabled)]
 pub fn record_trace_location_with_note(
     file: &'static str,
@@ -479,27 +512,23 @@ pub fn record_trace_location_with_note(
     column: u32,
     note: Option<&'static str>,
 ) {
-    let mut writer = DebugWriter::new();
-    let _ = match note {
-        Some(note) => write!(
-            &mut writer,
-            "breadcrumb {}:{}:{} {}",
-            file, line, column, note
+    match note {
+        Some(note) => log_args_site(
+            LogCategory::Debug,
+            LogLevel::Debug,
+            module_path!(),
+            line!(),
+            format_args!("breadcrumb {}:{}:{} {}", file, line, column, note),
         ),
-        None => write!(&mut writer, "breadcrumb {}:{}:{}", file, line, column),
-    };
-    emit_text(
-        DiagProvider::Breadcrumb,
-        DiagLevel::Debug,
-        0,
-        0,
-        0,
-        writer.as_str(),
-    );
+        None => log_args_site(
+            LogCategory::Debug,
+            LogLevel::Debug,
+            module_path!(),
+            line!(),
+            format_args!("breadcrumb {}:{}:{}", file, line, column),
+        ),
+    }
 }
-
-#[cfg(not(rustos_debug_print_enabled))]
-pub fn record_trace_location(_file: &'static str, _line: u32, _column: u32) {}
 
 #[cfg(not(rustos_debug_print_enabled))]
 pub fn record_trace_location_with_note(
@@ -512,7 +541,13 @@ pub fn record_trace_location_with_note(
 
 #[cfg(rustos_debug_print_enabled)]
 pub fn dump_recent_trace_locations(reason: &str) {
-    emit_text(DiagProvider::Breadcrumb, DiagLevel::Warn, 1, 0, 0, reason);
+    log_args_site(
+        LogCategory::Debug,
+        LogLevel::Warn,
+        module_path!(),
+        line!(),
+        format_args!("breadcrumb dump requested: {}", reason),
+    );
 }
 
 #[cfg(not(rustos_debug_print_enabled))]
@@ -520,7 +555,7 @@ pub fn dump_recent_trace_locations(_reason: &str) {}
 
 #[cfg(rustos_debug_print_enabled)]
 pub fn write_bytes(bytes: &[u8]) {
-    write_debug_bytes(bytes);
+    write_debugcon_only(bytes);
 }
 
 #[cfg(not(rustos_debug_print_enabled))]
@@ -531,9 +566,7 @@ pub fn write_debugcon_only(bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
-    with_debug_output_lock(|| {
-        print_bytes_unlocked(bytes);
-    });
+    with_debug_output_lock(|| print_bytes_unlocked(bytes));
 }
 
 #[cfg(not(rustos_debug_print_enabled))]
@@ -553,50 +586,162 @@ pub fn write_debugcon_only_line(bytes: &[u8]) {
 pub fn write_debugcon_only_line(_bytes: &[u8]) {}
 
 #[cfg(rustos_debug_print_enabled)]
-fn write_debug_bytes(bytes: &[u8]) {
+pub fn write_debugcon_only_parts_line(parts: &[&[u8]]) {
     with_debug_output_lock(|| {
-        print_bytes_unlocked(bytes);
+        for part in parts {
+            if !part.is_empty() {
+                print_bytes_unlocked(part);
+            }
+        }
+        print_bytes_unlocked(b"\r\n");
     });
 }
 
 #[cfg(not(rustos_debug_print_enabled))]
-#[allow(dead_code)]
-fn write_debug_bytes(_bytes: &[u8]) {}
+pub fn write_debugcon_only_parts_line(_parts: &[&[u8]]) {}
 
 #[cfg(rustos_debug_print_enabled)]
-struct DebugWriter {
-    bytes: [u8; diag_abi::DIAG_PAYLOAD_BYTES],
-    len: usize,
+pub fn snapshot_structured_log_bytes() -> Vec<u8> {
+    TEXT_RING.snapshot_bytes()
 }
 
-#[cfg(rustos_debug_print_enabled)]
-impl DebugWriter {
-    const fn new() -> Self {
-        Self {
-            bytes: [0; diag_abi::DIAG_PAYLOAD_BYTES],
-            len: 0,
-        }
-    }
-
-    fn as_str(&self) -> &str {
-        core::str::from_utf8(&self.bytes[..self.len]).unwrap_or("")
-    }
-
-    fn finish_line(&mut self) {
-        print_bytes_unlocked(b"\r\n");
-    }
+#[cfg(not(rustos_debug_print_enabled))]
+pub fn snapshot_structured_log_bytes() -> Vec<u8> {
+    Vec::new()
 }
 
-#[cfg(rustos_debug_print_enabled)]
-impl Write for DebugWriter {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        let bytes = s.as_bytes();
-        let copy_len = bytes.len().min(self.bytes.len().saturating_sub(self.len));
-        if copy_len != 0 {
-            self.bytes[self.len..self.len + copy_len].copy_from_slice(&bytes[..copy_len]);
-            self.len += copy_len;
-        }
-        print_bytes_unlocked(bytes);
-        Ok(())
+#[macro_export]
+macro_rules! diag_trace {
+    ($category:expr, $($arg:tt)+) => {{
+        $crate::debug::log_args_site(
+            $category,
+            $crate::debug::LogLevel::Trace,
+            module_path!(),
+            line!(),
+            format_args!($($arg)+),
+        );
+    }};
+}
+
+#[macro_export]
+macro_rules! diag_debug {
+    ($category:expr, $($arg:tt)+) => {{
+        $crate::debug::log_args_site(
+            $category,
+            $crate::debug::LogLevel::Debug,
+            module_path!(),
+            line!(),
+            format_args!($($arg)+),
+        );
+    }};
+}
+
+#[macro_export]
+macro_rules! diag_info {
+    ($category:expr, $($arg:tt)+) => {{
+        $crate::debug::log_args_site(
+            $category,
+            $crate::debug::LogLevel::Info,
+            module_path!(),
+            line!(),
+            format_args!($($arg)+),
+        );
+    }};
+}
+
+#[macro_export]
+macro_rules! diag_warn {
+    ($category:expr, $($arg:tt)+) => {{
+        $crate::debug::log_args_site(
+            $category,
+            $crate::debug::LogLevel::Warn,
+            module_path!(),
+            line!(),
+            format_args!($($arg)+),
+        );
+    }};
+}
+
+#[macro_export]
+macro_rules! diag_error {
+    ($category:expr, $($arg:tt)+) => {{
+        $crate::debug::log_args_site(
+            $category,
+            $crate::debug::LogLevel::Error,
+            module_path!(),
+            line!(),
+            format_args!($($arg)+),
+        );
+    }};
+}
+
+#[cfg(all(test, rustos_debug_print_enabled))]
+mod tests {
+    use alloc::string::String;
+
+    use super::*;
+
+    #[test]
+    fn render_log_line_uses_fixed_field_order() {
+        let mut line = String::new();
+        let _ = render_log_line(
+            &mut line,
+            RenderedLogMetadata {
+                seq: 7,
+                ts_us: 19,
+                tick: 23,
+                category: LogCategory::Usb,
+                level: LogLevel::Warn,
+                module_path: "kernel::usb::core",
+                line: 41,
+                process_id: Some(100),
+                thread_id: Some(200),
+            },
+            format_args!("controller ready"),
+        );
+
+        assert_eq!(
+            line,
+            "seq=7 ts_us=19 tick=23 lvl=warn cat=usb mod=kernel::usb::core line=41 pid=100 tid=200 msg=\"controller ready\"\n"
+        );
+    }
+
+    #[test]
+    fn render_log_line_escapes_message_text() {
+        let mut line = String::new();
+        let _ = render_log_line(
+            &mut line,
+            RenderedLogMetadata {
+                seq: 1,
+                ts_us: 2,
+                tick: 3,
+                category: LogCategory::Debug,
+                level: LogLevel::Info,
+                module_path: "kernel::debug",
+                line: 9,
+                process_id: None,
+                thread_id: None,
+            },
+            format_args!("quote=\" path=\\ newline=\n tab=\t"),
+        );
+
+        assert_eq!(
+            line,
+            "seq=1 ts_us=2 tick=3 lvl=info cat=debug mod=kernel::debug line=9 pid=- tid=- msg=\"quote=\\\" path=\\\\ newline=\\n tab=\\t\"\n"
+        );
+    }
+
+    #[test]
+    fn wrapped_snapshot_prepends_drop_warning() {
+        let ring = KernelTextRing::<24>::new();
+        let _ = ObservatorySink::write_str(&ring, "alpha line is long enough\n");
+        let _ = ObservatorySink::write_str(&ring, "beta line is also long\n");
+        let _ = ObservatorySink::write_str(&ring, "gamma\n");
+
+        let snapshot = String::from_utf8(ring.snapshot_bytes()).unwrap();
+        assert!(snapshot.starts_with(
+            "seq=0 ts_us=0 tick=0 lvl=warn cat=debug mod=nucleus_core::debug line=0 pid=- tid=- msg=\"oldest logs dropped\"\n"
+        ));
+        assert!(snapshot.contains("gamma"));
     }
 }

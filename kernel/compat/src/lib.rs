@@ -12,17 +12,17 @@ pub(crate) mod debug {
     pub(crate) use nucleus_core::debug::*;
     pub(crate) use trace_loc_macro::trace_loc;
 
-    #[cfg(rustos_debug_print_enabled)]
+    #[cfg(all(rustos_debug_print_enabled, rustos_log_compat_info))]
     macro_rules! println {
         () => {{
             nucleus_core::debug::println_newline();
         }};
         ($($arg:tt)*) => {{
-            nucleus_core::debug::println_fmt(format_args!($($arg)*));
+            nucleus_core::debug::info!(compat, $($arg)*);
         }};
     }
 
-    #[cfg(not(rustos_debug_print_enabled))]
+    #[cfg(not(all(rustos_debug_print_enabled, rustos_log_compat_info)))]
     macro_rules! println {
         () => {{}};
         ($($arg:tt)*) => {{}};
@@ -175,15 +175,22 @@ pub(crate) mod vfs {
         kernel_io_manager::api::vfs::metadata_for_current_process_path(absolute_path)
     }
 
-    pub fn check_access_for_current_process(absolute_path: &str, mode: u64) -> Result<(), VfsError> {
+    pub fn check_access_for_current_process(
+        absolute_path: &str,
+        mode: u64,
+    ) -> Result<(), VfsError> {
         kernel_io_manager::api::vfs::check_access_for_current_process(absolute_path, mode)
     }
 
-    pub fn read_path_to_vec_for_kernel(absolute_path: &str) -> Result<alloc::vec::Vec<u8>, VfsError> {
+    pub fn read_path_to_vec_for_kernel(
+        absolute_path: &str,
+    ) -> Result<alloc::vec::Vec<u8>, VfsError> {
         kernel_io_manager::api::vfs::read_path_to_vec_for_kernel(absolute_path)
     }
 
-    pub fn readlink_for_current_process(absolute_path: &str) -> Result<alloc::string::String, VfsError> {
+    pub fn readlink_for_current_process(
+        absolute_path: &str,
+    ) -> Result<alloc::string::String, VfsError> {
         kernel_io_manager::api::vfs::readlink_for_current_process(absolute_path)
     }
 }

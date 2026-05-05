@@ -1,0 +1,12 @@
+[package]
+name = "observability-client"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+libc = "0.2"
+os_observatory = { version = "0.1.1", default-features = false }
+rustos-observability = { path = "../rustos-observability" }
+
+[build-dependencies]

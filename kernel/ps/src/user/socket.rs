@@ -10,6 +10,7 @@ use spin::Mutex;
 use crate::arch::rtc;
 use crate::user::handles::KernelHandle;
 use crate::user::linux as linux_abi;
+use kernel_object::api::handle::HandleRights;
 
 const MAX_LISTEN_BACKLOG: usize = 128;
 const SOCKET_BUFFER_CAPACITY: usize = 1024 * 1024;
@@ -70,6 +71,7 @@ struct ConnectedState {
 pub struct PassedHandle {
     pub handle: KernelHandle,
     pub status_flags: u64,
+    pub rights: HandleRights,
 }
 
 #[derive(Clone, Debug)]
@@ -647,9 +649,15 @@ impl SocketHandle {
 
 impl PassedHandle {
     pub fn new(handle: KernelHandle, status_flags: u64) -> Self {
+        let rights = handle.default_rights(status_flags);
+        Self::new_with_rights(handle, status_flags, rights)
+    }
+
+    pub fn new_with_rights(handle: KernelHandle, status_flags: u64, rights: HandleRights) -> Self {
         Self {
             handle,
             status_flags,
+            rights,
         }
     }
 
@@ -659,6 +667,10 @@ impl PassedHandle {
 
     pub fn status_flags(&self) -> u64 {
         self.status_flags
+    }
+
+    pub fn rights(&self) -> HandleRights {
+        self.rights
     }
 }
 
@@ -874,10 +886,7 @@ fn prune_dead_bindings(bindings: &mut Vec<UnixBinding>) {
     bindings.retain(|binding| binding.socket.upgrade().is_some());
 }
 
-pub fn unlink_bound_path(
-    path: &str,
-    requester: SocketCredentials,
-) -> Result<(), SocketError> {
+pub fn unlink_bound_path(path: &str, requester: SocketCredentials) -> Result<(), SocketError> {
     let path = validate_bind_path(path, requester)?;
 
     let binding = {
@@ -909,6 +918,8 @@ pub fn unlink_bound_path(
 mod tests {
     use super::*;
     use crate::user::handles::{KernelHandle, VfsFileHandle};
+    use alloc::vec;
+    use kernel_object::api::handle::{FileHandleRights, HandleRights};
 
     #[test]
     fn stream_reads_can_span_multiple_writes() {
@@ -950,7 +961,29 @@ mod tests {
         let (read, rights) = right.recv_with_rights(&mut second, false).unwrap();
         assert_eq!(read, 1);
         assert_eq!(rights.len(), 1);
+        assert!(rights[0].rights().allows_transfer());
         assert_eq!(&second, b"c");
+    }
+
+    #[test]
+    fn passed_handle_preserves_explicit_rights() {
+        let rights = HandleRights::File(FileHandleRights::READ);
+        let passed = PassedHandle::new_with_rights(
+            KernelHandle::VfsFile(VfsFileHandle::read_only_memory(
+                String::from("/test"),
+                Vec::new(),
+            )),
+            linux_abi::O_RDONLY,
+            rights,
+        );
+        let (left, right) = SocketHandle::socketpair(SocketCredentials::default());
+
+        left.send_message(vec![b'x'], vec![passed], false)
+            .expect("send");
+        let mut byte = [0_u8; 1];
+        let (_, received) = right.recv_with_rights(&mut byte, false).expect("recv");
+
+        assert_eq!(received[0].rights(), rights);
     }
 
     #[test]

@@ -4,16 +4,13 @@ use std::io::Write;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use runtime_control::{load_startup_entries, StartupMode, DEFAULT_APPLICATIONS_DIR};
+use runtime_control::{load_startup_entries, StartupEntry, StartupMode, DEFAULT_APPLICATIONS_DIR};
 
 const INITD_EXEC_PATH: &str = "services/initd/initd.elf";
 const RUNTIMED_EXEC_PATH: &str = "services/runtimed/runtimed.elf";
 const STORAGED_EXEC_PATH: &str = "services/storaged/storaged.elf";
-const DEBUGD_EXEC_PATH: &str = "services/debugd/debugd.elf";
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const RETRY_BACKOFF: Duration = Duration::from_secs(1);
-const NONCRITICAL_INIT_DELAY: Duration = Duration::from_secs(20);
-const DEBUGD_DEFER_AFTER_RUNTIMED: Duration = Duration::from_secs(30);
 const DEFAULT_PATH_ENV: &str = "PATH=/bin:/usr/bin:/usr/local/bin";
 const DEFAULT_HOME_ENV: &str = "HOME=/home/user";
 const XDG_RUNTIME_DIR: &str = "XDG_RUNTIME_DIR=/run/user/1000";
@@ -23,12 +20,15 @@ const SYS_RUSTOS_SPAWN_EXEC: libc::c_long = 0x5255_0002;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StartupLaunchEntry {
+    package_id: String,
     exec: String,
+    runtime_deps: Vec<String>,
     restart: bool,
 }
 
 #[derive(Clone, Debug)]
 struct RunningService {
+    package_id: String,
     exec: String,
     restart: bool,
 }
@@ -46,34 +46,26 @@ fn main() {
         )
         .as_str(),
     );
-    diag_client::diag_info!("initd", "init services={}", startup_entries.len());
+    observability_client::info!("initd", service, "init services={}", startup_entries.len());
 
     let mut running = BTreeMap::<i32, RunningService>::new();
-    let mut launched_once = BTreeSet::new();
+    let mut launched_once_packages = BTreeSet::new();
     let mut retry_after = BTreeMap::<String, Instant>::new();
-    let mut noncritical_after = None::<Instant>;
 
     loop {
         reap_children(&mut running, &mut retry_after);
 
-        let running_execs = running
+        let running_packages = running
             .values()
-            .map(|service| service.exec.clone())
+            .map(|service| service.package_id.clone())
             .collect::<BTreeSet<_>>();
         let now = Instant::now();
-        if runtimed_started(&running_execs, &launched_once) && noncritical_after.is_none() {
-            noncritical_after = Some(now + NONCRITICAL_INIT_DELAY);
-        }
-        let noncritical_ready = noncritical_after.is_some_and(|deadline| now >= deadline);
-        let debugd_ready = noncritical_after
-            .map(|deadline| deadline + DEBUGD_DEFER_AFTER_RUNTIMED)
-            .is_some_and(|deadline| now >= deadline);
-
         for entry in startup_entries.clone() {
-            if entry.exec != RUNTIMED_EXEC_PATH && !noncritical_ready {
-                continue;
-            }
-            if entry.exec == DEBUGD_EXEC_PATH && !debugd_ready {
+            if !runtime_deps_satisfied(
+                &entry.runtime_deps,
+                &running_packages,
+                &launched_once_packages,
+            ) {
                 continue;
             }
 
@@ -85,11 +77,11 @@ fn main() {
             }
 
             if entry.restart {
-                if running_execs.contains(&entry.exec) {
+                if running_packages.contains(&entry.package_id) {
                     continue;
                 }
-            } else if running_execs.contains(&entry.exec)
-                || launched_once.contains(entry.exec.as_str())
+            } else if running_packages.contains(&entry.package_id)
+                || launched_once_packages.contains(entry.package_id.as_str())
             {
                 continue;
             }
@@ -99,18 +91,24 @@ fn main() {
                     running.insert(
                         pid,
                         RunningService {
+                            package_id: entry.package_id.clone(),
                             exec: entry.exec.clone(),
                             restart: entry.restart,
                         },
                     );
                     retry_after.remove(entry.exec.as_str());
                     if !entry.restart {
-                        launched_once.insert(entry.exec);
+                        launched_once_packages.insert(entry.package_id);
                     }
                     thread::yield_now();
                 }
                 Err(err) => {
-                    diag_client::diag_error!("initd", "launch {} failed: errno={err}", entry.exec);
+                    observability_client::error!(
+                        "initd",
+                        service,
+                        "launch {} failed: errno={err}",
+                        entry.exec
+                    );
                     retry_after.insert(entry.exec, Instant::now() + RETRY_BACKOFF);
                 }
             }
@@ -120,14 +118,11 @@ fn main() {
     }
 }
 
-fn runtimed_started(running_execs: &BTreeSet<String>, launched_once: &BTreeSet<String>) -> bool {
-    running_execs.contains(RUNTIMED_EXEC_PATH) || launched_once.contains(RUNTIMED_EXEC_PATH)
-}
-
 fn load_init_entries() -> Vec<StartupLaunchEntry> {
     let Ok(entries) = load_startup_entries(DEFAULT_APPLICATIONS_DIR) else {
-        diag_client::diag_warn!(
+        observability_client::warn!(
             "initd",
+            service,
             "application desktop dir unavailable: {DEFAULT_APPLICATIONS_DIR}"
         );
         return Vec::new();
@@ -137,10 +132,7 @@ fn load_init_entries() -> Vec<StartupLaunchEntry> {
         .into_iter()
         .filter(|entry| entry.mode == StartupMode::Init)
         .filter(|entry| entry.exec != INITD_EXEC_PATH)
-        .map(|entry| StartupLaunchEntry {
-            restart: entry.exec.starts_with("services/"),
-            exec: entry.exec,
-        })
+        .map(startup_launch_entry)
         .collect::<Vec<_>>();
     launch_entries.sort_by(|lhs, rhs| {
         rhs.restart
@@ -153,13 +145,30 @@ fn load_init_entries() -> Vec<StartupLaunchEntry> {
     launch_entries
 }
 
+fn startup_launch_entry(entry: StartupEntry) -> StartupLaunchEntry {
+    StartupLaunchEntry {
+        package_id: entry.package_id,
+        restart: entry.exec.starts_with("services/"),
+        exec: entry.exec,
+        runtime_deps: entry.runtime_deps,
+    }
+}
+
 fn init_exec_priority(exec: &str) -> u8 {
     match exec {
         RUNTIMED_EXEC_PATH => 0,
         STORAGED_EXEC_PATH => 1,
-        DEBUGD_EXEC_PATH => 2,
-        _ => 3,
+        _ => 2,
     }
+}
+
+fn runtime_deps_satisfied(
+    deps: &[String],
+    running_packages: &BTreeSet<String>,
+    launched_once_packages: &BTreeSet<String>,
+) -> bool {
+    deps.iter()
+        .all(|dep| running_packages.contains(dep) || launched_once_packages.contains(dep))
 }
 
 fn reap_children(

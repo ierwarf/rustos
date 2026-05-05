@@ -137,12 +137,21 @@ impl AppState {
         let before_dirty = self
             .console_stack_dirty_rect()
             .union(self.taskbar_dirty_rect());
+        self.closing_console_sessions.retain(|session_handle| {
+            programs
+                .iter()
+                .any(|program| program.session_handle == *session_handle)
+        });
         let existing = std::mem::take(&mut self.console_windows);
         let mut next = Vec::with_capacity(programs.len());
         let mut changed = false;
         let mut kept_sessions = Vec::with_capacity(programs.len());
 
         for mut window in existing {
+            if self.is_console_session_closing(window.session_handle) {
+                changed = true;
+                continue;
+            }
             let Some(program) = programs
                 .iter()
                 .find(|program| program.session_handle == window.session_handle)
@@ -168,6 +177,7 @@ impl AppState {
         for program in programs {
             if runtime_program_is_hidden(program)
                 || program.session_handle == 0
+                || self.is_console_session_closing(program.session_handle)
                 || kept_sessions.contains(&program.session_handle)
             {
                 continue;
@@ -327,6 +337,21 @@ impl AppState {
         } else {
             console_refocused
         })
+    }
+
+    pub(super) fn mark_console_session_closing(&mut self, session_handle: ConsoleSessionHandle) {
+        if session_handle == 0 || self.is_console_session_closing(session_handle) {
+            return;
+        }
+        self.closing_console_sessions.push(session_handle);
+        if self.closing_console_sessions.len() > MAX_RUNNING_PROGRAMS {
+            let overflow = self.closing_console_sessions.len() - MAX_RUNNING_PROGRAMS;
+            self.closing_console_sessions.drain(..overflow);
+        }
+    }
+
+    fn is_console_session_closing(&self, session_handle: ConsoleSessionHandle) -> bool {
+        self.closing_console_sessions.contains(&session_handle)
     }
 
     fn prune_windows(&mut self, mut keep: impl FnMut(ConsoleSessionHandle) -> bool) -> bool {

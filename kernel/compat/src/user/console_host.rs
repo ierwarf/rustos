@@ -10,15 +10,15 @@ use crate::user::process::{self, ProcessLaunchOptions, ProcessLoadError, Spawned
 use crate::user::windows::WindowsProcessLaunch;
 use crate::vfs;
 
-fn emit_console(level: diag_abi::DiagLevel, event_id: u16, object_id: u64, message: String) {
-    debug::emit_text(
-        diag_abi::DiagProvider::Console,
-        level,
-        event_id,
-        0,
-        object_id,
-        message.as_str(),
-    );
+fn emit_console(level: debug::LogLevel, event_id: u16, object_id: u64, message: String) {
+    let _ = (event_id, object_id);
+    match level {
+        debug::LogLevel::Trace => debug::trace!(console, "{}", message),
+        debug::LogLevel::Debug => debug::debug!(console, "{}", message),
+        debug::LogLevel::Info => debug::info!(console, "{}", message),
+        debug::LogLevel::Warn => debug::warn!(console, "{}", message),
+        debug::LogLevel::Error | debug::LogLevel::Fatal => debug::error!(console, "{}", message),
+    }
 }
 
 #[derive(Clone)]
@@ -111,7 +111,7 @@ impl ConsoleHostError {
     pub fn log_debug_details(&self) {
         match self {
             Self::BootstrapBlocked => emit_console(
-                diag_abi::DiagLevel::Warn,
+                debug::LogLevel::Warn,
                 0,
                 0,
                 String::from("userspace startup blocked before UserspaceReady"),
@@ -123,7 +123,7 @@ impl ConsoleHostError {
             } => {
                 if let Some(fallback_path) = fallback_path {
                     emit_console(
-                        diag_abi::DiagLevel::Warn,
+                        debug::LogLevel::Warn,
                         0,
                         0,
                         alloc::format!(
@@ -135,7 +135,7 @@ impl ConsoleHostError {
                     );
                 } else {
                     emit_console(
-                        diag_abi::DiagLevel::Warn,
+                        debug::LogLevel::Warn,
                         0,
                         0,
                         alloc::format!(
@@ -161,7 +161,7 @@ pub fn spawn_program_in_session(
     let trace = reserve_console_host_trace();
     if trace {
         emit_console(
-            diag_abi::DiagLevel::Debug,
+            debug::LogLevel::Debug,
             1,
             session.raw(),
             alloc::format!(
@@ -201,7 +201,7 @@ pub fn spawn_program_in_session(
         .map(|spawned| {
             if trace {
                 emit_console(
-                    diag_abi::DiagLevel::Debug,
+                    debug::LogLevel::Debug,
                     2,
                     spawned.pid,
                     alloc::format!(
@@ -226,7 +226,7 @@ pub fn load_executable_image(
     let trace = reserve_console_host_trace();
     if trace {
         emit_console(
-            diag_abi::DiagLevel::Debug,
+            debug::LogLevel::Debug,
             3,
             0,
             alloc::format!(
@@ -240,7 +240,7 @@ pub fn load_executable_image(
         Ok(loaded) => {
             if trace {
                 emit_console(
-                    diag_abi::DiagLevel::Debug,
+                    debug::LogLevel::Debug,
                     4,
                     0,
                     alloc::format!(
@@ -266,7 +266,7 @@ pub fn load_executable_image_by_path(
     let trace = reserve_console_host_trace();
     if trace {
         emit_console(
-            diag_abi::DiagLevel::Debug,
+            debug::LogLevel::Debug,
             5,
             0,
             alloc::format!(
@@ -280,7 +280,7 @@ pub fn load_executable_image_by_path(
         Ok(loaded) => {
             if trace {
                 emit_console(
-                    diag_abi::DiagLevel::Debug,
+                    debug::LogLevel::Debug,
                     6,
                     0,
                     alloc::format!(
@@ -300,7 +300,7 @@ pub fn prime_executable_image(image: ExecutableImage) -> Result<(), ConsoleHostE
     let loaded = load_executable_image_uncached(image)?;
     if reserve_console_host_trace() {
         emit_console(
-            diag_abi::DiagLevel::Debug,
+            debug::LogLevel::Debug,
             7,
             0,
             alloc::format!(
@@ -318,7 +318,7 @@ pub fn prime_executable_image(image: ExecutableImage) -> Result<(), ConsoleHostE
 }
 
 fn reserve_console_host_trace() -> bool {
-    debug::should_emit(diag_abi::DiagProvider::Console, diag_abi::DiagLevel::Debug)
+    debug::enabled!(console, debug)
 }
 
 fn load_executable_image_uncached(
@@ -331,7 +331,8 @@ fn load_executable_image_path_uncached(
     primary_path: &str,
     fallback_path: Option<&str>,
 ) -> Result<LoadedExecutableImage, ConsoleHostError> {
-    crate::debug::println!(
+    crate::debug::debug!(
+        console,
         "console host: primary read begin path={} fallback={}",
         primary_path,
         fallback_path.unwrap_or("-"),
@@ -342,7 +343,8 @@ fn load_executable_image_path_uncached(
             bytes,
         }),
         Err(primary_error) => {
-            crate::debug::println!(
+            crate::debug::warn!(
+                console,
                 "console host: primary read failed path={} err={:?}",
                 primary_path,
                 primary_error,
@@ -355,7 +357,11 @@ fn load_executable_image_path_uncached(
                 });
             };
 
-            crate::debug::println!("console host: fallback read begin path={}", fallback_path);
+            crate::debug::debug!(
+                console,
+                "console host: fallback read begin path={}",
+                fallback_path
+            );
             vfs::read_path_to_vec_for_kernel(fallback_path)
                 .map(|bytes| LoadedExecutableImage {
                     path: Box::leak(fallback_path.to_string().into_boxed_str()),

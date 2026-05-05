@@ -75,6 +75,7 @@ pub(crate) fn for_fd(fd: u64) -> Result<KernelStat, StatLookupError> {
     match handle {
         KernelHandle::Console(_)
         | KernelHandle::Device(_)
+        | KernelHandle::InetSocket(_)
         | KernelHandle::Socket(_)
         | KernelHandle::Epoll(_)
         | KernelHandle::SharedRegion(_) => Ok(build_device_stat(fd)),

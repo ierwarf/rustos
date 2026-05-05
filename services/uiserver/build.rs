@@ -5,6 +5,10 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+mod shared {
+    include!("../../tools/build_log_cfg.rs");
+}
+
 const ASCII_START: u8 = 32;
 const ASCII_END: u8 = 126;
 
@@ -39,8 +43,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         .and_then(Path::parent)
         .ok_or("failed to resolve repo root from CARGO_MANIFEST_DIR")?;
     let fonts_dir = repo_root.join("assets/ui/fonts");
+    let logging_path = repo_root.join("config/logging.toml");
+    let log_cfg_path = repo_root.join("tools/build_log_cfg.rs");
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
     let out_path = out_dir.join("generated_fonts.rs");
+
+    println!("cargo:rerun-if-changed={}", logging_path.display());
+    println!("cargo:rerun-if-changed={}", log_cfg_path.display());
+    let logging = fs::read_to_string(&logging_path)?;
+    shared::emit_log_cfgs(&logging);
 
     let specs = [
         AtlasSpec {

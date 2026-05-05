@@ -47,44 +47,16 @@ unsafe extern "C" fn driver_log(level: u32, message_ptr: *const u8, message_len:
 
     match level {
         value if value == DriverLogLevel::Error as u32 => {
-            crate::debug::emit_text(
-                diag_abi::DiagProvider::Driver,
-                diag_abi::DiagLevel::Error,
-                0,
-                0,
-                0,
-                _message,
-            );
+            crate::debug::error!(driver, "{}", _message);
         }
         value if value == DriverLogLevel::Warn as u32 => {
-            crate::debug::emit_text(
-                diag_abi::DiagProvider::Driver,
-                diag_abi::DiagLevel::Warn,
-                0,
-                0,
-                0,
-                _message,
-            );
+            crate::debug::warn!(driver, "{}", _message);
         }
         value if value == DriverLogLevel::Info as u32 => {
-            crate::debug::emit_text(
-                diag_abi::DiagProvider::Driver,
-                diag_abi::DiagLevel::Info,
-                0,
-                0,
-                0,
-                _message,
-            );
+            crate::debug::info!(driver, "{}", _message);
         }
         value if value == DriverLogLevel::Debug as u32 => {
-            crate::debug::emit_text(
-                diag_abi::DiagProvider::Driver,
-                diag_abi::DiagLevel::Debug,
-                0,
-                0,
-                0,
-                _message,
-            );
+            crate::debug::debug!(driver, "{}", _message);
         }
         _ => return -22,
     }

@@ -506,11 +506,15 @@ pub mod vfs {
         crate::vfs::check_access_for_current_process(absolute_path, mode).map_err(map_vfs_error)
     }
 
-    pub fn read_path_to_vec_for_kernel(absolute_path: &str) -> Result<alloc::vec::Vec<u8>, VfsError> {
+    pub fn read_path_to_vec_for_kernel(
+        absolute_path: &str,
+    ) -> Result<alloc::vec::Vec<u8>, VfsError> {
         crate::vfs::read_path_to_vec_for_kernel(absolute_path).map_err(map_vfs_error)
     }
 
-    pub fn readlink_for_current_process(absolute_path: &str) -> Result<alloc::string::String, VfsError> {
+    pub fn readlink_for_current_process(
+        absolute_path: &str,
+    ) -> Result<alloc::string::String, VfsError> {
         crate::vfs::readlink_for_current_process(absolute_path).map_err(map_vfs_error)
     }
 }

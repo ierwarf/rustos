@@ -20,28 +20,18 @@ pub mod debug {
     pub use nucleus_core::debug::*;
 }
 
-fn emit_flow(level: diag_abi::DiagLevel, event_id: u16, message: &str) {
-    debug::emit_text(
-        diag_abi::DiagProvider::Service,
-        level,
-        event_id,
-        0,
-        0,
-        message,
-    );
+pub(crate) fn flow_info(event_id: u16, _message: &str) {
+    let _ = event_id;
+    debug::info!(service, "{}", _message);
 }
 
-pub(crate) fn flow_info(event_id: u16, message: &str) {
-    emit_flow(diag_abi::DiagLevel::Info, event_id, message);
-}
-
-pub(crate) fn flow_debug(event_id: u16, message: &str) {
-    emit_flow(diag_abi::DiagLevel::Debug, event_id, message);
+pub(crate) fn flow_debug(event_id: u16, _message: &str) {
+    let _ = event_id;
+    debug::debug!(service, "{}", _message);
 }
 
 pub(crate) fn announce_ready(name: &str, console_line: &[u8]) {
     flow_info(20, format!("{name} initialized").as_str());
-    debug::println!("{name} initialized.");
     crate::io_services::console_write(console_line);
 }
 
@@ -71,6 +61,13 @@ mod hal_hooks {
             thread_id: snapshot.thread_id(),
             process_id: snapshot.process_id(),
             console_session_raw: snapshot.console_session().raw(),
+        })
+    }
+
+    fn current_debug_user_context() -> Option<nucleus_core::debug::CurrentUserLogContext> {
+        ps_api::current_user_snapshot().map(|snapshot| nucleus_core::debug::CurrentUserLogContext {
+            process_id: snapshot.process_id(),
+            thread_id: snapshot.thread_id(),
         })
     }
 
@@ -123,6 +120,11 @@ mod hal_hooks {
     }
 
     pub fn register() {
+        nucleus_core::debug::register_runtime_hooks(nucleus_core::debug::DebugRuntimeHooks {
+            ticks: Some(hal_api::arch::rtc::ticks),
+            ticks_per_second: Some(hal_api::arch::rtc::ticks_per_second),
+            current_user_context: Some(current_debug_user_context),
+        });
         ps_api::register_tick_jiffies_hook(crate::io_services::tick_jiffies);
         ps_api::register_input_consumer_hooks(
             io_api::driver::linux::input::consumer_acquire,

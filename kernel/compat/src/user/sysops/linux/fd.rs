@@ -2,7 +2,6 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::*;
-use crate::debug;
 use crate::user::epoll::EpollHandle;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -348,15 +347,11 @@ pub(crate) fn openat(
     flags: u64,
     mode: u64,
 ) -> Result<u64, LinuxSysopError> {
-    let trace = debug::should_emit(diag_abi::DiagProvider::Io, diag_abi::DiagLevel::Debug);
+    let trace = debug::enabled!(compat, debug);
     let path = usermem::read_current_user_c_string(path_ptr, 128)?;
     if trace {
-        debug::emit_text(
-            diag_abi::DiagProvider::Io,
-            diag_abi::DiagLevel::Debug,
-            10,
-            0,
-            dirfd,
+        debug::debug!(
+            compat,
             alloc::format!(
                 "linux openat begin dirfd={} path={} flags={:#x} mode={:#x}",
                 dirfd,
@@ -364,31 +359,17 @@ pub(crate) fn openat(
                 flags,
                 mode,
             )
-            .as_str(),
+            .as_str()
         );
     }
     let absolute_path = file::resolve_path_for_current_process(dirfd, &path)?;
     if trace {
-        debug::emit_text(
-            diag_abi::DiagProvider::Io,
-            diag_abi::DiagLevel::Debug,
-            11,
-            0,
-            dirfd,
-            alloc::format!("linux openat resolved path={}", absolute_path).as_str(),
-        );
+        debug::debug!(compat, "linux openat resolved path={}", absolute_path);
     }
     let fd = file::open_path_for_current_process(absolute_path.as_str(), flags, mode)
         .map_err(LinuxSysopError::from)?;
     if trace {
-        debug::emit_text(
-            diag_abi::DiagProvider::Io,
-            diag_abi::DiagLevel::Debug,
-            12,
-            0,
-            fd,
-            alloc::format!("linux openat end fd={}", fd).as_str(),
-        );
+        debug::debug!(compat, "linux openat end fd={}", fd);
     }
     Ok(fd)
 }
@@ -581,6 +562,24 @@ pub(super) fn current_handle(fd: u64) -> Result<KernelHandle, LinuxSysopError> {
         process_state
             .handles()
             .get(fd)
+            .cloned()
+            .ok_or(LinuxSysopError::BadFileDescriptor)
+    }) else {
+        return Err(LinuxSysopError::Unsupported);
+    };
+
+    result
+}
+
+pub(super) fn current_handle_entry(fd: u64) -> Result<HandleEntry, LinuxSysopError> {
+    if fd < 3 {
+        return Ok(HandleEntry::new(console_stream_handle_for_fd(fd)?, 0, 0));
+    }
+
+    let Some(result) = multitask::with_current_user_process_state(|_, _, process_state| {
+        process_state
+            .handles()
+            .get_entry(fd)
             .cloned()
             .ok_or(LinuxSysopError::BadFileDescriptor)
     }) else {
@@ -822,18 +821,15 @@ fn poll_revents_for_handle(
                 invalid: revents & linux_abi::POLLNVAL != 0,
             }
         }
+        KernelHandle::InetSocket(_) => HandleReadiness {
+            writable: true,
+            ..HandleReadiness::default()
+        },
         KernelHandle::DisplaySurface(_) => HandleReadiness {
             writable: true,
             ..HandleReadiness::default()
         },
         KernelHandle::Device(handle) => match handle.device_id() {
-            device_ns::DeviceId::Debug => {
-                let state = debug::device_state();
-                HandleReadiness {
-                    readable: state.records_available != 0 || state.crash_available != 0,
-                    ..HandleReadiness::default()
-                }
-            }
             device_ns::DeviceId::Input => HandleReadiness {
                 readable: crate::io::device::input::has_pending_events(),
                 priority: crate::io::device::input::has_pending_events(),

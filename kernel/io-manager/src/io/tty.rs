@@ -71,10 +71,7 @@ pub fn read_input_blocking(dest: &mut [u8]) -> usize {
     read_input_blocking_for_session(ConsoleSessionHandle::SYSTEM, dest)
 }
 
-pub fn read_input_blocking_for_session(
-    session: ConsoleSessionHandle,
-    dest: &mut [u8],
-) -> usize {
+pub fn read_input_blocking_for_session(session: ConsoleSessionHandle, dest: &mut [u8]) -> usize {
     if dest.is_empty() {
         return 0;
     }

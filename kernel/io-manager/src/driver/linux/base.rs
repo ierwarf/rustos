@@ -160,6 +160,20 @@ pub(crate) unsafe extern "C" fn kfree(ptr: *const c_void) {
     }
 }
 
+pub(crate) unsafe extern "C" fn alloc_pages_noprof(_gfp: u32, order: u32) -> *mut c_void {
+    let size = 4096usize.checked_shl(order.min(20)).unwrap_or(0);
+    if size == 0 {
+        return ptr::null_mut();
+    }
+    allocate_bytes_with_flags(size, 4096, _gfp) as *mut c_void
+}
+
+pub(crate) unsafe extern "C" fn __free_pages(page: *mut c_void, _order: u32) {
+    unsafe { kfree(page) };
+}
+
+pub(crate) unsafe extern "C" fn __folio_put(_folio: *mut c_void) {}
+
 pub(crate) unsafe extern "C" fn __kmalloc_cache_noprof(
     _cache: *const c_void,
     gfp: u32,
@@ -463,6 +477,32 @@ pub(crate) unsafe extern "C" fn _find_next_zero_bit(
     size
 }
 
+pub(crate) unsafe extern "C" fn _find_first_bit(addr: *const usize, size: usize) -> usize {
+    unsafe { _find_next_bit(addr, size, 0) }
+}
+
+pub(crate) unsafe extern "C" fn _find_next_bit(
+    addr: *const usize,
+    size: usize,
+    offset: usize,
+) -> usize {
+    if addr.is_null() || offset >= size {
+        return size;
+    }
+    let word_bits = usize::BITS as usize;
+    let word_count = size.div_ceil(word_bits);
+    let words = unsafe { slice::from_raw_parts(addr, word_count) };
+    let mut bit = offset;
+    while bit < size {
+        let word = words[bit / word_bits];
+        if ((word >> (bit % word_bits)) & 1) != 0 {
+            return bit;
+        }
+        bit += 1;
+    }
+    size
+}
+
 pub(crate) unsafe extern "C" fn msleep(milliseconds: u32) {
     const SERVICE_QUANTUM_MS: u64 = 10;
 
@@ -502,6 +542,9 @@ pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
         "strsep" => Some(strsep as *const () as usize),
         "simple_strtoul" => Some(simple_strtoul as *const () as usize),
         "kfree" => Some(kfree as *const () as usize),
+        "alloc_pages_noprof" => Some(alloc_pages_noprof as *const () as usize),
+        "__free_pages" => Some(__free_pages as *const () as usize),
+        "__folio_put" => Some(__folio_put as *const () as usize),
         "__kmalloc_cache_noprof" => Some(__kmalloc_cache_noprof as *const () as usize),
         "__kmalloc_noprof" => Some(__kmalloc_noprof as *const () as usize),
         "__kmalloc_large_noprof" => Some(__kmalloc_large_noprof as *const () as usize),
@@ -524,6 +567,8 @@ pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
         "__put_user_4" => Some(__put_user_4 as *const () as usize),
         "__copy_overflow" => Some(__copy_overflow as *const () as usize),
         "sized_strscpy" => Some(sized_strscpy as *const () as usize),
+        "_find_first_bit" => Some(_find_first_bit as *const () as usize),
+        "_find_next_bit" => Some(_find_next_bit as *const () as usize),
         "_find_next_zero_bit" => Some(_find_next_zero_bit as *const () as usize),
         "kstrndup" => Some(kstrndup as *const () as usize),
         "kstrtou8" => Some(kstrtou8 as *const () as usize),

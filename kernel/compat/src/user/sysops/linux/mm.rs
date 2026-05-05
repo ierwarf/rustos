@@ -132,10 +132,22 @@ fn current_process_mmap_handle_kind(fd: u64) -> Result<LinuxMmapHandleKind, Linu
             return Err(LinuxSysopError::Unsupported);
         }
 
-        match process_state.handles().get(fd) {
-            Some(KernelHandle::Memfd(_)) => Ok(LinuxMmapHandleKind::Memfd),
-            Some(KernelHandle::VfsFile(_)) => Ok(LinuxMmapHandleKind::File),
-            Some(KernelHandle::Device(_) | KernelHandle::DisplaySurface(_)) => {
+        match process_state.handles().get_entry(fd) {
+            Some(entry) if matches!(entry.handle(), KernelHandle::Memfd(_)) => {
+                Ok(LinuxMmapHandleKind::Memfd)
+            }
+            Some(entry) if matches!(entry.handle(), KernelHandle::VfsFile(_)) => {
+                Ok(LinuxMmapHandleKind::File)
+            }
+            Some(entry)
+                if matches!(
+                    entry.handle(),
+                    KernelHandle::Device(_) | KernelHandle::DisplaySurface(_)
+                ) =>
+            {
+                if !entry.rights().allows_shared_map() {
+                    return Err(LinuxSysopError::PermissionDenied);
+                }
                 Ok(LinuxMmapHandleKind::Device)
             }
             Some(_) => Err(LinuxSysopError::BadFileDescriptor),
@@ -383,9 +395,9 @@ pub(crate) fn mprotect(start: u64, user_len: u64, prot: u64) -> Result<(), Linux
 fn log_unexpected_mprotect_not_mapped(
     address_space: &crate::memory::paging::ProcessAddressSpace,
     len: usize,
-    _exec_path: &str,
+    exec_path: &str,
     start: u64,
-    _end: u64,
+    end: u64,
     covering_vma: Option<&linux_abi::LinuxVma>,
 ) {
     if MPROTECT_NOT_MAPPED_DIAG_BUDGET
@@ -404,7 +416,7 @@ fn log_unexpected_mprotect_not_mapped(
         start,
         end,
     );
-    if let Some(_area) = covering_vma {
+    if let Some(area) = covering_vma {
         crate::debug::println!(
             "linux mprotect unexpected NotMapped: vma=[{:#x},{:#x}) flags=R{}W{}X{}P{}",
             area.start,

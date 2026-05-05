@@ -8,17 +8,17 @@ pub(crate) use kernel_lowlevel as lowlevel;
 pub(crate) mod debug {
     pub(crate) use nucleus_core::debug::*;
 
-    #[cfg(rustos_debug_print_enabled)]
+    #[cfg(all(rustos_debug_print_enabled, rustos_log_memory_info))]
     macro_rules! println {
         () => {{
             nucleus_core::debug::println_newline();
         }};
         ($($arg:tt)*) => {{
-            nucleus_core::debug::println_fmt(format_args!($($arg)*));
+            nucleus_core::debug::info!(memory, $($arg)*);
         }};
     }
 
-    #[cfg(not(rustos_debug_print_enabled))]
+    #[cfg(not(all(rustos_debug_print_enabled, rustos_log_memory_info)))]
     macro_rules! println {
         () => {{}};
         ($($arg:tt)*) => {{}};

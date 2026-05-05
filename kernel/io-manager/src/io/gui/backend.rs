@@ -111,7 +111,11 @@ pub(crate) fn present_bgra8888_from_user(
         )?;
         log_backend_present_sample(framebuffer, drawn);
         if drawn {
-            return Ok(framebuffer.present_scene());
+            let presented = framebuffer.present_scene();
+            if presented {
+                crate::driver::virtio_gpu::flush_primary();
+            }
+            return Ok(presented);
         }
         Ok(false)
     }) else {
@@ -163,7 +167,11 @@ pub(crate) fn present_bgra8888_rect_from_user(
             rect,
         )?;
         if drawn {
-            return Ok(framebuffer.present_scene());
+            let presented = framebuffer.present_scene();
+            if presented {
+                crate::driver::virtio_gpu::flush_primary();
+            }
+            return Ok(presented);
         }
         Ok(false)
     }) else {
@@ -185,7 +193,11 @@ pub(crate) fn present_bgra8888_from_kernel(
             let drawn =
                 framebuffer.draw_bgra8888_frame_from_kernel(src_ptr, width, height, stride_bytes);
             if drawn {
-                return framebuffer.present_scene();
+                let presented = framebuffer.present_scene();
+                if presented {
+                    crate::driver::virtio_gpu::flush_primary();
+                }
+                return presented;
             }
             false
         })
@@ -210,7 +222,11 @@ pub(crate) fn present_bgra8888_rect_from_kernel(
                 rect,
             );
             if drawn {
-                return framebuffer.present_scene();
+                let presented = framebuffer.present_scene();
+                if presented {
+                    crate::driver::virtio_gpu::flush_primary();
+                }
+                return presented;
             }
             false
         })

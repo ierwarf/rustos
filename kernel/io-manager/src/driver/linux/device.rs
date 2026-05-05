@@ -557,6 +557,18 @@ pub(crate) unsafe extern "C" fn dev_get_drvdata(dev: *const c_void) -> *mut c_vo
     unsafe { (*(dev as *const LinuxCompatDevice)).driver_data }
 }
 
+pub(crate) unsafe extern "C" fn devm_kmalloc(
+    _dev: *mut c_void,
+    size: usize,
+    gfp: u32,
+) -> *mut c_void {
+    unsafe { super::base::__kmalloc_noprof(size, gfp) }
+}
+
+pub(crate) unsafe extern "C" fn devm_kfree(_dev: *mut c_void, ptr: *const c_void) {
+    unsafe { super::base::kfree(ptr) };
+}
+
 pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
     match name {
         "bus_register_notifier" => Some(bus_register_notifier as *const () as usize),
@@ -605,6 +617,8 @@ pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
         "__dev_fwnode" => Some(__dev_fwnode as *const () as usize),
         "dev_set_drvdata" => Some(dev_set_drvdata as *const () as usize),
         "dev_get_drvdata" => Some(dev_get_drvdata as *const () as usize),
+        "devm_kmalloc" => Some(devm_kmalloc as *const () as usize),
+        "devm_kfree" => Some(devm_kfree as *const () as usize),
         _ => None,
     }
 }

@@ -10,9 +10,12 @@ use crate::user::linux::LinuxVmaName;
 use super::{VfsError, VfsMetadata, VfsNodeKind, VfsOpenResult};
 
 pub(crate) const PROC_SELF_MAPS_PATH: &str = "/proc/self/maps";
+pub(crate) const PROC_RUSTOS_DIR_PATH: &str = "/proc/rustos";
+pub(crate) const PROC_RUSTOS_LOG_PATH: &str = "/proc/rustos/log";
 
 pub(crate) fn is_local_special_path(path: &str) -> bool {
     path == PROC_SELF_MAPS_PATH
+        || path == PROC_RUSTOS_LOG_PATH
         || path.starts_with("/proc/self/fd/")
         || path.starts_with("/dev/fd/")
 }
@@ -25,12 +28,33 @@ pub(crate) fn open_special_path(path: &str) -> Result<Option<VfsOpenResult>, Vfs
             bytes,
         ))));
     }
+    if path == PROC_RUSTOS_LOG_PATH {
+        let bytes = nucleus_core::debug::snapshot_structured_log_bytes();
+        return Ok(Some(VfsOpenResult::File(VfsFileHandle::read_only_memory(
+            String::from(path),
+            bytes,
+        ))));
+    }
     Ok(None)
 }
 
 pub(crate) fn metadata_for_special_path(path: &str) -> Result<Option<VfsMetadata>, VfsError> {
     if path == PROC_SELF_MAPS_PATH {
         let len = proc_self_maps_snapshot()?.len() as u64;
+        return Ok(Some(VfsMetadata {
+            inode: crate::vfs::path_inode(path.as_bytes()).max(1),
+            kind: VfsNodeKind::File,
+            len,
+            block_size: 4096,
+            blocks: len.div_ceil(512),
+            link_count: 1,
+            atime: super::VfsTimestamp::default(),
+            mtime: super::VfsTimestamp::default(),
+            ctime: super::VfsTimestamp::default(),
+        }));
+    }
+    if path == PROC_RUSTOS_LOG_PATH {
+        let len = nucleus_core::debug::snapshot_structured_log_bytes().len() as u64;
         return Ok(Some(VfsMetadata {
             inode: crate::vfs::path_inode(path.as_bytes()).max(1),
             kind: VfsNodeKind::File,

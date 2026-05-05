@@ -33,15 +33,9 @@ struct ResolvedRootDevice {
     start_block: u64,
 }
 
-fn emit_storage_read_trace(event_id: u16, object_id: u64, message: String) {
-    crate::debug::emit_text(
-        diag_abi::DiagProvider::Io,
-        diag_abi::DiagLevel::Debug,
-        event_id,
-        0,
-        object_id,
-        message.as_str(),
-    );
+fn emit_storage_read_trace(event_id: u16, object_id: u64, _message: String) {
+    let _ = (event_id, object_id);
+    crate::debug::debug!(storage, "{}", _message);
 }
 
 pub(super) fn read_blocks_uncached(device_id: u32, lba: u64, out: &mut [u8]) -> IoResult<()> {
@@ -56,7 +50,10 @@ pub(super) fn read_blocks_uncached_local(device_id: u32, lba: u64, out: &mut [u8
         resolved.block_count,
         out.len(),
     )?;
-    let trace = crate::debug::should_emit(diag_abi::DiagProvider::Io, diag_abi::DiagLevel::Debug);
+    #[cfg(rustos_log_storage_debug)]
+    let trace = crate::debug::enabled!(storage, debug);
+    #[cfg(not(rustos_log_storage_debug))]
+    let trace = false;
     if trace {
         emit_storage_read_trace(
             20,

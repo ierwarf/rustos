@@ -654,6 +654,15 @@ fn enumerate_boot_port(
         parsed.endpoint_interval,
         parsed.report_descriptor_len,
     );
+    crate::debug::write_debugcon_only_line(
+        alloc::format!(
+            "xhci hid descriptor: port={} slot={} bytes={:02x?}",
+            port + 1,
+            slot_id,
+            parsed.hid_descriptor.as_slice()
+        )
+        .as_bytes(),
+    );
     if control_no_data(
         controller,
         &mut device,

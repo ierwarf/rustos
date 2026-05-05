@@ -18,7 +18,5 @@ pub mod region {
 }
 
 pub use region::{
-    create as create_shared_region,
-    frames as shared_region_frames,
-    map as map_shared_region,
+    create as create_shared_region, frames as shared_region_frames, map as map_shared_region,
 };

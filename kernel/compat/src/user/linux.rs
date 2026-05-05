@@ -150,7 +150,9 @@ raw_u64! {
     O_DIRECTORY = linux::O_DIRECTORY;
     O_CLOEXEC = linux::O_CLOEXEC;
     AF_UNIX = linux_net::AF_UNIX;
+    AF_INET = linux_net::AF_INET;
     SOCK_STREAM = linux_net::SOCK_STREAM;
+    SOCK_DGRAM = linux_net::SOCK_DGRAM;
     SOCK_NONBLOCK = linux::O_NONBLOCK;
     SOCK_CLOEXEC = linux::O_CLOEXEC;
     MSG_DONTWAIT = linux_net::MSG_DONTWAIT;
@@ -422,6 +424,15 @@ pub struct LinuxIovec {
 pub struct LinuxSockaddrUn {
     pub sun_family: u16,
     pub sun_path: [u8; UNIX_PATH_MAX],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LinuxSockaddrIn {
+    pub sin_family: u16,
+    pub sin_port: u16,
+    pub sin_addr: u32,
+    pub sin_zero: [u8; 8],
 }
 
 impl Default for LinuxSockaddrUn {

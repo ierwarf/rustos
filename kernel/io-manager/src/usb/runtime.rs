@@ -1,7 +1,6 @@
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::ops::Range;
@@ -408,17 +407,21 @@ pub(crate) fn control_msg(
     data: *mut c_void,
     size: u16,
 ) -> i32 {
-    if dev.is_null() || data.is_null() {
+    if dev.is_null() || (size != 0 && data.is_null()) {
         return -22;
     }
 
-    let Some(response) = control_response(dev as usize, request, request_type, value, index) else {
+    let Some(copy_len) = copy_control_response(
+        dev as usize,
+        request,
+        request_type,
+        value,
+        index,
+        data.cast::<u8>(),
+        size as usize,
+    ) else {
         return -38;
     };
-    let copy_len = core::cmp::min(response.len(), size as usize);
-    unsafe {
-        core::ptr::copy_nonoverlapping(response.as_ptr(), data.cast::<u8>(), copy_len);
-    }
     copy_len as i32
 }
 
@@ -688,38 +691,51 @@ fn submit_control_urb(urb: *mut LinuxCompatUrb) -> i32 {
     0
 }
 
-fn control_response(
+fn copy_control_response(
     usb_device_ptr: usize,
     request: u8,
     request_type: u8,
     value: u16,
     index: u16,
-) -> Option<Vec<u8>> {
+    data: *mut u8,
+    size: usize,
+) -> Option<usize> {
     let devices = USB_RUNTIME_DEVICES.lock();
     let device = devices
         .iter()
         .find(|entry| entry.usb_device_ptr == usb_device_ptr)?;
 
-    match request {
+    let response: &[u8] = match request {
         USB_REQ_GET_DESCRIPTOR => match (value >> 8) as u8 {
-            USB_DT_DEVICE => Some(device.device_descriptor.to_vec()),
-            USB_DT_HID => Some(device.hid_descriptor.to_vec()),
-            USB_DT_REPORT => Some(device.report_descriptor.to_vec()),
-            _ => None,
+            USB_DT_DEVICE => &device.device_descriptor,
+            USB_DT_HID => device.hid_descriptor.as_ref(),
+            USB_DT_REPORT => device.report_descriptor.as_ref(),
+            _ => return None,
         },
-        USB_REQ_SET_CONFIGURATION if request_type == 0x00 => Some(Vec::new()),
+        USB_REQ_SET_CONFIGURATION if request_type == 0x00 => &[],
         USB_REQ_GET_INTERFACE if request_type == 0x81 && index as u8 == device.interface_number => {
-            Some(vec![0])
+            &[0]
         }
         USB_REQ_SET_INTERFACE if request_type == 0x01 && index as u8 == device.interface_number => {
-            Some(Vec::new())
+            &[]
         }
-        USB_REQ_GET_PROTOCOL if request_type == 0xA1 => Some(vec![0]),
-        USB_REQ_SET_PROTOCOL if request_type == 0x21 => Some(Vec::new()),
-        USB_REQ_GET_IDLE if request_type == 0xA1 => Some(vec![0]),
-        USB_REQ_SET_IDLE if request_type == 0x21 => Some(Vec::new()),
-        _ => None,
+        USB_REQ_GET_PROTOCOL if request_type == 0xA1 => &[0],
+        USB_REQ_SET_PROTOCOL if request_type == 0x21 => &[],
+        USB_REQ_GET_IDLE if request_type == 0xA1 => &[0],
+        USB_REQ_SET_IDLE if request_type == 0x21 => &[],
+        _ => return None,
+    };
+
+    let copy_len = core::cmp::min(response.len(), size);
+    if copy_len != 0 {
+        if data.is_null() {
+            return None;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(response.as_ptr(), data, copy_len);
+        }
     }
+    Some(copy_len)
 }
 
 fn pop_report_for_device(usb_device_ptr: usize) -> Option<RuntimeReport> {

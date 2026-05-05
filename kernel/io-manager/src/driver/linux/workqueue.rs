@@ -282,6 +282,34 @@ pub(crate) unsafe extern "C" fn cancel_work_sync(work: *mut LinuxWorkStruct) -> 
     removed
 }
 
+pub(crate) unsafe extern "C" fn flush_work(work: *mut LinuxWorkStruct) -> bool {
+    let Some(work_ptr) = ptr_to_usize(work.cast::<c_void>()) else {
+        return false;
+    };
+    let mut flushed = false;
+    loop {
+        let serviced = service_queued_work(None);
+        if serviced == 0 {
+            break;
+        }
+        flushed = true;
+        if !work_is_pending(work_ptr) {
+            break;
+        }
+    }
+    flushed
+}
+
+pub(crate) unsafe extern "C" fn cancel_delayed_work_sync(dwork: *mut LinuxDelayedWork) -> bool {
+    if dwork.is_null() {
+        return false;
+    }
+    let delayed = unsafe { &mut *dwork };
+    let timer_removed = delete_timer(&mut delayed.timer as *mut LinuxTimerList) != 0;
+    let work_removed = unsafe { cancel_work_sync(&mut delayed.work as *mut LinuxWorkStruct) };
+    timer_removed || work_removed
+}
+
 pub(crate) unsafe extern "C" fn timer_init_key(
     timer: *mut LinuxTimerList,
     func: Option<LinuxTimerFunc>,
@@ -330,6 +358,8 @@ pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
         "timer_init_key" => Some(timer_init_key as *const () as usize),
         "mod_timer" => Some(mod_timer as *const () as usize),
         "cancel_work_sync" => Some(cancel_work_sync as *const () as usize),
+        "cancel_delayed_work_sync" => Some(cancel_delayed_work_sync as *const () as usize),
+        "flush_work" => Some(flush_work as *const () as usize),
         "timer_delete" => Some(timer_delete as *const () as usize),
         "timer_delete_sync" => Some(timer_delete_sync as *const () as usize),
         "timer_shutdown_sync" => Some(timer_shutdown_sync as *const () as usize),

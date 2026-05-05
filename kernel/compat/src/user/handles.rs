@@ -5,7 +5,10 @@ use crate::user::linux as linux_abi;
 use crate::user::memfd::MemfdHandle;
 use crate::user::socket::SocketHandle;
 
-use kernel_object::api::handle::{HandleOwner, HandleToken};
+use kernel_object::api::handle::{
+    DeviceHandleRights, FileHandleRights, HandleOwner, HandleRights, HandleToken,
+    SharedRegionRights, SocketHandleRights,
+};
 
 #[path = "handles/display_surface.rs"]
 mod display_surface;
@@ -61,9 +64,8 @@ impl KernelHandle {
                 HandleOwner::Io,
                 ((match device.device_id() {
                     crate::io::device::DeviceId::Console => 0_u64,
-                    crate::io::device::DeviceId::Debug => 1_u64,
-                    crate::io::device::DeviceId::Display => 2_u64,
-                    crate::io::device::DeviceId::Input => 3_u64,
+                    crate::io::device::DeviceId::Display => 1_u64,
+                    crate::io::device::DeviceId::Input => 2_u64,
                 }) << 8)
                     | match device.access_kind() {
                         crate::io::device::DeviceAccessKind::Native => 0_u64,
@@ -112,8 +114,49 @@ impl KernelHandle {
         }
     }
 
-    pub(crate) const fn supports_descriptor_transfer(&self) -> bool {
+    pub(crate) fn default_rights(&self, status_flags: u64) -> HandleRights {
+        match self {
+            Self::Console(_) => HandleRights::Console,
+            Self::Device(device) => {
+                let mut rights = DeviceHandleRights::READ
+                    .union(DeviceHandleRights::IOCTL)
+                    .union(DeviceHandleRights::MAP);
+                if matches!(
+                    device.access_kind(),
+                    crate::io::device::DeviceAccessKind::Native
+                ) {
+                    rights = rights
+                        .union(DeviceHandleRights::WRITE)
+                        .union(DeviceHandleRights::ADMIN);
+                }
+                HandleRights::Device(rights)
+            }
+            Self::Epoll(_) => HandleRights::Epoll,
+            Self::Memfd(_) => HandleRights::Memfd(file_rights_from_status_flags(status_flags)),
+            Self::SharedRegion(_) => HandleRights::SharedRegion(
+                SharedRegionRights::READ
+                    .union(SharedRegionRights::WRITE)
+                    .union(SharedRegionRights::MAP),
+            ),
+            Self::Socket(_) => HandleRights::Socket(
+                SocketHandleRights::SEND
+                    .union(SocketHandleRights::RECV)
+                    .union(SocketHandleRights::PASS_FD)
+                    .union(SocketHandleRights::TRANSFER),
+            ),
+            Self::VfsFile(_) => HandleRights::File(file_rights_from_status_flags(status_flags)),
+            Self::VfsDirectory(_) => HandleRights::File(FileHandleRights::READ),
+            Self::DisplaySurface(_) => HandleRights::DisplaySurface(
+                SharedRegionRights::READ
+                    .union(SharedRegionRights::WRITE)
+                    .union(SharedRegionRights::MAP),
+            ),
+        }
+    }
+
+    pub(crate) fn supports_descriptor_transfer(&self, rights: HandleRights) -> bool {
         matches!(self, Self::Socket(_) | Self::Memfd(_) | Self::VfsFile(_))
+            && rights.allows_transfer()
     }
 
     pub fn socket_handle(&self) -> Option<&SocketHandle> {
@@ -142,4 +185,24 @@ impl KernelHandle {
             }
         }
     }
+}
+
+fn file_rights_from_status_flags(status_flags: u64) -> FileHandleRights {
+    let mut rights = FileHandleRights::TRANSFER;
+    match status_flags & linux_abi::O_ACCMODE {
+        linux_abi::O_WRONLY => rights = rights.union(FileHandleRights::WRITE),
+        linux_abi::O_RDWR => {
+            rights = rights
+                .union(FileHandleRights::READ)
+                .union(FileHandleRights::WRITE);
+        }
+        _ => rights = rights.union(FileHandleRights::READ),
+    }
+    if status_flags & linux_abi::O_APPEND != 0 {
+        rights = rights.union(FileHandleRights::APPEND);
+    }
+    if status_flags & linux_abi::O_NONBLOCK != 0 {
+        rights = rights.union(FileHandleRights::NONBLOCK);
+    }
+    rights
 }

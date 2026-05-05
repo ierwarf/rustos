@@ -116,6 +116,17 @@ pub unsafe extern "C" fn register_driver_framebuffer(
     0
 }
 
+pub(crate) fn install_native_driver_framebuffer(framebuffer: FramebufferInfo) -> bool {
+    if framebuffer.validate().is_err() {
+        return false;
+    }
+    if !backend::install_driver_framebuffer(framebuffer) {
+        return false;
+    }
+    emergency_console_framebuffer_changed();
+    true
+}
+
 pub fn display_info() -> Option<GuiDisplayInfo> {
     backend::display_info()
 }

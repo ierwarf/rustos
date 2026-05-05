@@ -1,13 +1,9 @@
 #![no_std]
 
-use core::mem::{align_of, size_of};
-
-use diag_abi::{crash_store_bytes, diag_buffer_bytes, CrashStoreHeader};
-
-pub use diag_abi::{BootDiagBufferInfo, CrashStoreInfo};
+use core::mem::size_of;
 
 pub const BOOT_INFO_MAGIC: u64 = 0x5255_5354_4F53_4749; // "RUSTOSGI"
-pub const BOOT_INFO_VERSION: u32 = 13;
+pub const BOOT_INFO_VERSION: u32 = 14;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -247,8 +243,6 @@ pub struct BootInfo {
     pub framebuffer: FramebufferInfo,
     pub nucleus_image: NucleusImageInfo,
     pub memory_map: BootMemoryMap,
-    pub boot_diag: BootDiagBufferInfo,
-    pub crash_store: CrashStoreInfo,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -260,8 +254,6 @@ pub enum BootInfoValidationError {
     InvalidKernelImage,
     InvalidMemoryMap,
     InvalidBootVolume,
-    InvalidBootDiag,
-    InvalidCrashStore,
 }
 
 impl BootInfoValidationError {
@@ -274,8 +266,6 @@ impl BootInfoValidationError {
             Self::InvalidKernelImage => "boot info kernel image is invalid",
             Self::InvalidMemoryMap => "boot info memory map is invalid",
             Self::InvalidBootVolume => "boot info boot volume identity is invalid",
-            Self::InvalidBootDiag => "boot info diagnostic buffer is invalid",
-            Self::InvalidCrashStore => "boot info crash store is invalid",
         }
     }
 }
@@ -291,8 +281,6 @@ impl BootInfo {
 
         self.framebuffer.validate()?;
         self.boot_volume.validate()?;
-        validate_optional_boot_diag(self.boot_diag)?;
-        validate_optional_crash_store(self.crash_store)?;
 
         if self.nucleus_image.is_present() {
             self.nucleus_image.validate()?;
@@ -340,48 +328,6 @@ pub const fn rng_seed_usable(seed: [u8; 32]) -> bool {
     false
 }
 
-fn validate_optional_boot_diag(info: BootDiagBufferInfo) -> Result<(), BootInfoValidationError> {
-    if info.addr == 0 && info.bytes_len == 0 && info.record_capacity == 0 {
-        return Ok(());
-    }
-    if info.addr == 0 || info.bytes_len == 0 || info.record_capacity == 0 {
-        return Err(BootInfoValidationError::InvalidBootDiag);
-    }
-    if info.record_capacity > u16::MAX as u32 {
-        return Err(BootInfoValidationError::InvalidBootDiag);
-    }
-    if (info.addr as usize) % align_of::<diag_abi::DiagSharedBufferHeader>() != 0 {
-        return Err(BootInfoValidationError::InvalidBootDiag);
-    }
-    let required = diag_buffer_bytes(info.record_capacity as usize) as u64;
-    if info.bytes_len < required {
-        return Err(BootInfoValidationError::InvalidBootDiag);
-    }
-    info.addr
-        .checked_add(info.bytes_len)
-        .ok_or(BootInfoValidationError::InvalidBootDiag)?;
-    Ok(())
-}
-
-fn validate_optional_crash_store(info: CrashStoreInfo) -> Result<(), BootInfoValidationError> {
-    if info.addr == 0 && info.bytes_len == 0 {
-        return Ok(());
-    }
-    if info.addr == 0 || info.bytes_len == 0 {
-        return Err(BootInfoValidationError::InvalidCrashStore);
-    }
-    if (info.addr as usize) % align_of::<CrashStoreHeader>() != 0 {
-        return Err(BootInfoValidationError::InvalidCrashStore);
-    }
-    if info.bytes_len < crash_store_bytes(1) as u64 {
-        return Err(BootInfoValidationError::InvalidCrashStore);
-    }
-    info.addr
-        .checked_add(info.bytes_len)
-        .ok_or(BootInfoValidationError::InvalidCrashStore)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,10 +339,6 @@ mod tests {
             kind: BootMemoryKind::Usable,
             _reserved0: 0,
         }];
-        let boot_diag = diag_buffer_bytes(4);
-        let crash_store = crash_store_bytes(4);
-        let mut diag = [0u8; diag_buffer_bytes(4)];
-        let mut crash = [0u8; crash_store_bytes(4)];
 
         BootInfo {
             magic: BOOT_INFO_MAGIC,
@@ -433,16 +375,6 @@ mod tests {
                 entry_count: memory_map.len() as u32,
                 _reserved0: 0,
             },
-            boot_diag: BootDiagBufferInfo {
-                addr: diag.as_mut_ptr() as u64,
-                bytes_len: boot_diag as u64,
-                record_capacity: 4,
-                reserved: 0,
-            },
-            crash_store: CrashStoreInfo {
-                addr: crash.as_mut_ptr() as u64,
-                bytes_len: crash_store as u64,
-            },
         }
     }
 
@@ -463,21 +395,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_inconsistent_diag_buffer() {
-        let mut info = valid_boot_info();
-        info.boot_diag.bytes_len = 8;
-        assert_eq!(
-            info.validate_staged(),
-            Err(BootInfoValidationError::InvalidBootDiag)
-        );
-    }
-
-    #[test]
-    fn accepts_absent_optional_volume_and_diag_regions() {
+    fn accepts_absent_optional_volume() {
         let mut info = valid_boot_info();
         info.boot_volume = BootVolumeIdentity::empty();
-        info.boot_diag = BootDiagBufferInfo::default();
-        info.crash_store = CrashStoreInfo::default();
         assert!(info.validate_staged().is_ok());
     }
 }

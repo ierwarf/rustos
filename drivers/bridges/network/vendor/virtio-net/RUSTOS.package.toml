@@ -1,0 +1,29 @@
+id = "virtio-net"
+kind = "bridge-driver"
+execution_domain = "kernel"
+profiles = ["default"]
+
+[build]
+builder = "external-copy"
+source = "vendor/network/virtio_net.ko"
+source_env = "VENDOR_VIRTIO_NET_KO"
+optional = true
+
+[install]
+path = "system/drivers/network/virtio_net.ko"
+
+[boot]
+preload = true
+required = false
+priority = 320
+
+startup = "none"
+
+[autoload]
+name = "virtio_net"
+class = "network"
+bus = "virtio"
+priority = 100
+when = "vfs-ready"
+aliases = ["virtio:d00000001v*"]
+provider_group = "network-primary"

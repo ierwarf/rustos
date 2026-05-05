@@ -1,9 +1,8 @@
 #[cfg(test)]
 mod tests {
     use boot_protocol::{
-        BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootDiagBufferInfo, BootInfo, BootMemoryKind,
-        BootMemoryMap, BootMemoryRegion, BootPixelFormat, BootVolumeIdentity, CrashStoreInfo,
-        FramebufferInfo, NucleusImageInfo,
+        BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootInfo, BootMemoryKind, BootMemoryMap,
+        BootMemoryRegion, BootPixelFormat, BootVolumeIdentity, FramebufferInfo, NucleusImageInfo,
     };
     use boot_random::{Random, init as init_random};
     use driver_abi::{DRIVER_MODULE_ABI_VERSION, DriverBus, DriverClass, DriverModuleHeader};
@@ -91,8 +90,6 @@ mod tests {
                 entry_count: memory_map.len() as u32,
                 _reserved0: 0,
             },
-            boot_diag: BootDiagBufferInfo::default(),
-            crash_store: CrashStoreInfo::default(),
         };
 
         init_random(&boot_info);

@@ -33,11 +33,22 @@
 
 ## 계층 규칙
 
-- `kernel` 은 `libs/` 와 `drivers/libs/` 에만 의존합니다.
+- `kernel/src` 는 entry-only 이며, 실제 커널 기능은 `kernel/nucleus-core`, `kernel/lowlevel`, `kernel/hal`, `kernel/mm`, `kernel/object`, `kernel/ipc-runtime`, `kernel/ps`, `kernel/io-manager`, `kernel/compat`, `kernel/executive` 로 나눕니다.
+- kernel 내부 crate 의존은 낮은 계층에서 높은 계층으로 역류하지 않도록 `cargo xtask check` 에서 세분화해 검사합니다.
+- `libs/` 는 `boot/` protocol crate 와 다른 `libs/` 에만 의존합니다. `kernel/`, `services/`, `apps/`, `drivers/bridges/` 구현 crate를 끌어오면 안 됩니다.
+- `drivers/libs/` 는 `libs/`, `drivers/libs/`, 필요한 boot protocol 에만 의존합니다. bridge driver 구현에 의존하면 안 됩니다.
 - `services` 는 `libs/`, `compat/`, `drivers/libs/` 에만 의존합니다.
 - `apps` 는 `libs/` 와 `compat/` 에만 의존합니다.
 - `drivers/bridges` 는 `kernel/` ABI 와 `libs/`, `drivers/libs/` 에만 의존합니다.
+- `tests/` 는 product crate 를 참조할 수 있지만, 계층 검사의 대상에 포함됩니다.
 - 이 규칙은 문서가 아니라 `cargo xtask check` 의 layering check 로 강제합니다.
+
+## 런타임 의존성
+
+- 실행/노출 순서가 필요한 배포 단위는 `RUSTOS.package.toml` 에 `runtime_deps = ["package-id"]` 를 선언합니다.
+- `runtime_deps` 값은 install path 나 desktop id 가 아니라 package `id` 입니다.
+- `cargo xtask check` 는 선택된 profile 기준으로 dependency 존재 여부, 같은 profile 포함 여부, 자기 자신 의존, 순환 의존을 검사합니다.
+- stage 단계는 startup/runtime registry 에 `deps=` metadata 를 기록합니다. 현재 런처 실행 순서 강제는 별도 단계에서 처리합니다.
 
 ## vendor / assets / build 구분
 

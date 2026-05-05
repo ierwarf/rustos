@@ -4,21 +4,24 @@ use crate::font::{self, TextStyle};
 use crate::sys::ConsoleSessionHandle;
 use crate::wayland::WaylandWindowSnapshot;
 
-const COLOR_BOOT_BG_BASE: u32 = 0x0011_1623;
-const COLOR_DESKTOP_BG_BASE: u32 = 0x0010_1826;
-const COLOR_GRID: u32 = 0x001a_2636;
-const COLOR_GRID_MAJOR: u32 = 0x0021_3044;
-const COLOR_PANEL_GLASS: u32 = 0x0012_1c28;
-const COLOR_PANEL_INNER: u32 = 0x0016_2434;
-const COLOR_ACCENT_FOCUS: u32 = 0x0069_d5ff;
-const COLOR_ACCENT_SOFT: u32 = 0x00bf_efff;
-const COLOR_BORDER_IDLE: u32 = 0x0034_485e;
-const COLOR_BORDER_FOCUS: u32 = 0x0069_d5ff;
-const COLOR_TEXT_PRIMARY: u32 = 0x00f3_faff;
-const COLOR_TEXT_DIM: u32 = 0x00a7_bcd0;
+const COLOR_BOOT_BG_BASE: u32 = 0x000f_141b;
+const COLOR_DESKTOP_BG_BASE: u32 = 0x0011_171f;
+const COLOR_DESKTOP_BAND: u32 = 0x0017_202b;
+const COLOR_GRID: u32 = 0x0022_2c35;
+const COLOR_GRID_MAJOR: u32 = 0x0032_424d;
+const COLOR_PANEL_GLASS: u32 = 0x0015_2027;
+const COLOR_PANEL_INNER: u32 = 0x001b_2931;
+const COLOR_PANEL_ELEVATED: u32 = 0x0021_323a;
+const COLOR_ACCENT_FOCUS: u32 = 0x0047_d6b2;
+const COLOR_ACCENT_SOFT: u32 = 0x0098_e6d3;
+const COLOR_ACCENT_WARM: u32 = 0x00f2_b84b;
+const COLOR_BORDER_IDLE: u32 = 0x0040_555d;
+const COLOR_BORDER_FOCUS: u32 = 0x0047_d6b2;
+const COLOR_TEXT_PRIMARY: u32 = 0x00f5_f7f4;
+const COLOR_TEXT_DIM: u32 = 0x00a9_b9b7;
 const COLOR_SHADOW: u32 = 0x0000_0000;
-const COLOR_CLIENT_BACKDROP: u32 = 0x0010_1724;
-const COLOR_CLIENT_DIVIDER: u32 = 0x0026_3748;
+const COLOR_CLIENT_BACKDROP: u32 = 0x0012_181f;
+const COLOR_CLIENT_DIVIDER: u32 = 0x0033_444b;
 
 const TOPBAR_MARGIN_TOP: usize = 16;
 const TOPBAR_RAIL_HEIGHT: usize = 40;
@@ -31,6 +34,8 @@ pub(crate) const TASKBAR_HEIGHT: usize = TASKBAR_MARGIN_BOTTOM + TASKBAR_RAIL_HE
 const RAIL_SIDE_MARGIN: usize = 20;
 const DESKTOP_MARGIN_X: usize = 32;
 const DESKTOP_MARGIN_Y: usize = 24;
+const TOPBAR_BRAND_WIDTH: usize = 144;
+const TOPBAR_STATUS_WIDTH: usize = 212;
 
 const WINDOW_BORDER: usize = 1;
 const WINDOW_TITLE_HEIGHT: usize = 36;
@@ -54,12 +59,12 @@ const WINDOW_CASCADE_Y: usize = 24;
 const WINDOW_CASCADE_SLOTS: usize = 6;
 
 const LAUNCHER_BUTTON_WIDTH: usize = 148;
-const LAUNCHER_BUTTON_HEIGHT: usize = 24;
-const LAUNCHER_BUTTON_GAP: usize = 10;
+const LAUNCHER_BUTTON_HEIGHT: usize = 26;
+const LAUNCHER_BUTTON_GAP: usize = 8;
 
 const TASKBAR_SLOT_WIDTH: usize = 172;
 const TASKBAR_SLOT_HEIGHT: usize = 30;
-const TASKBAR_SLOT_GAP: usize = 12;
+const TASKBAR_SLOT_GAP: usize = 8;
 
 pub(crate) fn launcher_dirty_rect(width: u32, _height: u32) -> Rect {
     shadow_bounds(topbar_rail_rect(width as usize), 2)
@@ -174,14 +179,19 @@ pub(crate) fn window_minimize_button_rect(outer: Rect) -> Rect {
 
 pub(crate) fn launcher_button_rect(width: u32, index: usize) -> Rect {
     let rail = topbar_rail_rect(width as usize);
-    let x = rail.x + 16 + index * (LAUNCHER_BUTTON_WIDTH + LAUNCHER_BUTTON_GAP);
-    if x >= rail.x.saturating_add(rail.width) {
+    let launcher_x = rail.x + 16 + TOPBAR_BRAND_WIDTH;
+    let x = launcher_x + index * (LAUNCHER_BUTTON_WIDTH + LAUNCHER_BUTTON_GAP);
+    let max_x = rail
+        .x
+        .saturating_add(rail.width)
+        .saturating_sub(TOPBAR_STATUS_WIDTH + 18);
+    if x >= max_x {
         return Rect::empty();
     }
     Rect {
         x,
         y: rail.y + (rail.height.saturating_sub(LAUNCHER_BUTTON_HEIGHT)) / 2,
-        width: LAUNCHER_BUTTON_WIDTH.min(rail.x + rail.width - x),
+        width: LAUNCHER_BUTTON_WIDTH.min(max_x - x),
         height: LAUNCHER_BUTTON_HEIGHT,
     }
 }
@@ -480,7 +490,7 @@ fn draw_taskbar_slot(canvas: &mut SurfaceCanvas<'_>, rect: Rect, title: &str, fo
     }
 
     draw_shadow(canvas, rect, 2, 18);
-    canvas.fill_rect_alpha(rect, COLOR_PANEL_GLASS, 204);
+    canvas.fill_rect_alpha(rect, COLOR_PANEL_GLASS, 208);
     canvas.fill_rect_alpha(
         Rect {
             x: rect.x + 1,
@@ -488,8 +498,12 @@ fn draw_taskbar_slot(canvas: &mut SurfaceCanvas<'_>, rect: Rect, title: &str, fo
             width: rect.width.saturating_sub(2),
             height: rect.height.saturating_sub(2),
         },
-        COLOR_PANEL_INNER,
-        214,
+        if focused {
+            COLOR_PANEL_ELEVATED
+        } else {
+            COLOR_PANEL_INNER
+        },
+        220,
     );
     canvas.stroke_rect(
         rect,
@@ -506,8 +520,12 @@ fn draw_taskbar_slot(canvas: &mut SurfaceCanvas<'_>, rect: Rect, title: &str, fo
             width: rect.width.saturating_sub(2),
             height: 1,
         },
-        COLOR_ACCENT_SOFT,
-        150,
+        if focused {
+            COLOR_ACCENT_SOFT
+        } else {
+            COLOR_BORDER_IDLE
+        },
+        145,
     );
     if focused {
         canvas.fill_rect(
@@ -520,6 +538,20 @@ fn draw_taskbar_slot(canvas: &mut SurfaceCanvas<'_>, rect: Rect, title: &str, fo
             COLOR_ACCENT_FOCUS,
         );
     }
+    canvas.fill_rect_alpha(
+        Rect {
+            x: rect.x + 7,
+            y: rect.y + 8,
+            width: 6,
+            height: rect.height.saturating_sub(16),
+        },
+        if focused {
+            COLOR_ACCENT_FOCUS
+        } else {
+            COLOR_TEXT_DIM
+        },
+        if focused { 230 } else { 100 },
+    );
 
     let style = TextStyle::ui_medium(if focused {
         COLOR_TEXT_PRIMARY
@@ -528,10 +560,10 @@ fn draw_taskbar_slot(canvas: &mut SurfaceCanvas<'_>, rect: Rect, title: &str, fo
     });
     font::draw_text_clipped(
         canvas,
-        rect.x + 10,
+        rect.x + 20,
         rect.y + 5,
         title,
-        rect.width.saturating_sub(20),
+        rect.width.saturating_sub(30),
         style,
     );
 }
@@ -541,7 +573,8 @@ fn draw_launcher_button(canvas: &mut SurfaceCanvas<'_>, rect: Rect, title: &str)
         return;
     }
 
-    canvas.fill_rect_alpha(rect, COLOR_PANEL_GLASS, 192);
+    draw_shadow(canvas, rect, 2, 12);
+    canvas.fill_rect_alpha(rect, COLOR_PANEL_GLASS, 196);
     canvas.fill_rect_alpha(
         Rect {
             x: rect.x + 1,
@@ -549,8 +582,8 @@ fn draw_launcher_button(canvas: &mut SurfaceCanvas<'_>, rect: Rect, title: &str)
             width: rect.width.saturating_sub(2),
             height: rect.height.saturating_sub(2),
         },
-        COLOR_PANEL_INNER,
-        212,
+        COLOR_PANEL_ELEVATED,
+        218,
     );
     canvas.stroke_rect(rect, COLOR_BORDER_IDLE);
     canvas.fill_rect_alpha(
@@ -572,15 +605,41 @@ fn draw_launcher_button(canvas: &mut SurfaceCanvas<'_>, rect: Rect, title: &str)
         },
         COLOR_ACCENT_FOCUS,
     );
+    draw_launcher_badge(canvas, rect, title);
 
     let style = TextStyle::ui_medium(COLOR_TEXT_PRIMARY);
     font::draw_text_clipped(
         canvas,
-        rect.x + 9,
+        rect.x + 30,
         rect.y + 4,
         title,
-        rect.width.saturating_sub(18),
+        rect.width.saturating_sub(39),
         style,
+    );
+}
+
+fn draw_launcher_badge(canvas: &mut SurfaceCanvas<'_>, rect: Rect, title: &str) {
+    let badge = Rect {
+        x: rect.x + 7,
+        y: rect.y + 5,
+        width: 16,
+        height: 16,
+    };
+    canvas.fill_rect_alpha(badge, COLOR_ACCENT_FOCUS, 210);
+    canvas.stroke_rect(badge, COLOR_ACCENT_SOFT);
+
+    let label = title
+        .chars()
+        .find(|ch| ch.is_ascii_alphanumeric())
+        .unwrap_or('>');
+    let mut text = [0_u8; 1];
+    let label = label.to_ascii_uppercase().encode_utf8(&mut text);
+    font::draw_text(
+        canvas,
+        badge.x + 5,
+        badge.y + 2,
+        label,
+        TextStyle::ui_small(COLOR_DESKTOP_BG_BASE),
     );
 }
 
@@ -615,6 +674,26 @@ fn refresh_desktop_surface(state: &mut AppState) {
             height,
         };
         canvas.fill_rect(screen, COLOR_DESKTOP_BG_BASE);
+        canvas.fill_rect_alpha(
+            Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: (height / 3).max(1),
+            },
+            COLOR_DESKTOP_BAND,
+            94,
+        );
+        canvas.fill_rect_alpha(
+            Rect {
+                x: 0,
+                y: height.saturating_sub(height / 5),
+                width,
+                height: height / 5,
+            },
+            COLOR_CLIENT_BACKDROP,
+            86,
+        );
         canvas.fill_pattern_grid(screen, 28, COLOR_GRID, 34);
         canvas.fill_pattern_grid(screen, 112, COLOR_GRID_MAJOR, 48);
 
@@ -623,13 +702,8 @@ fn refresh_desktop_surface(state: &mut AppState) {
         draw_rail_panel(&mut canvas, topbar);
         draw_rail_panel(&mut canvas, taskbar);
 
-        font::draw_text(
-            &mut canvas,
-            topbar.x + topbar.width.saturating_sub(198),
-            topbar.y + 6,
-            "WAYLAND // AERO HUD",
-            TextStyle::ui_small(COLOR_TEXT_DIM),
-        );
+        draw_brand_block(&mut canvas, topbar);
+        draw_status_block(&mut canvas, topbar, state.launcher_programs.len());
 
         for (index, program) in state.launcher_programs.iter().enumerate() {
             draw_launcher_button(
@@ -640,6 +714,82 @@ fn refresh_desktop_surface(state: &mut AppState) {
         }
     }
     state.desktop_cache.valid = true;
+}
+
+fn draw_brand_block(canvas: &mut SurfaceCanvas<'_>, topbar: Rect) {
+    let brand_rect = Rect {
+        x: topbar.x + 10,
+        y: topbar.y + 7,
+        width: TOPBAR_BRAND_WIDTH.saturating_sub(18),
+        height: topbar.height.saturating_sub(14),
+    };
+    canvas.fill_rect_alpha(brand_rect, COLOR_PANEL_ELEVATED, 208);
+    canvas.stroke_rect(brand_rect, COLOR_BORDER_IDLE);
+    canvas.fill_rect(
+        Rect {
+            x: brand_rect.x,
+            y: brand_rect.y,
+            width: 3,
+            height: brand_rect.height,
+        },
+        COLOR_ACCENT_WARM,
+    );
+    font::draw_text(
+        canvas,
+        brand_rect.x + 12,
+        brand_rect.y + 4,
+        "RustOS",
+        TextStyle::ui_medium(COLOR_TEXT_PRIMARY),
+    );
+}
+
+fn draw_status_block(canvas: &mut SurfaceCanvas<'_>, topbar: Rect, launcher_count: usize) {
+    let status_width = TOPBAR_STATUS_WIDTH.min(topbar.width.saturating_sub(24));
+    let status_rect = Rect {
+        x: topbar.x + topbar.width.saturating_sub(status_width + 10),
+        y: topbar.y + 8,
+        width: status_width,
+        height: topbar.height.saturating_sub(16),
+    };
+    if status_rect.width < 120 {
+        return;
+    }
+
+    canvas.fill_rect_alpha(status_rect, COLOR_CLIENT_BACKDROP, 168);
+    canvas.stroke_rect(status_rect, COLOR_BORDER_IDLE);
+    canvas.fill_rect_alpha(
+        Rect {
+            x: status_rect.x + 1,
+            y: status_rect.y + 1,
+            width: status_rect.width.saturating_sub(2),
+            height: 1,
+        },
+        COLOR_ACCENT_SOFT,
+        110,
+    );
+    let text = if launcher_count == 0 {
+        "WAYLAND READY"
+    } else {
+        "WAYLAND LAUNCHER"
+    };
+    font::draw_text_clipped(
+        canvas,
+        status_rect.x + 10,
+        status_rect.y + 4,
+        text,
+        status_rect.width.saturating_sub(62),
+        TextStyle::ui_small(COLOR_TEXT_DIM),
+    );
+    let apps_label = format!("{launcher_count} APPS");
+    let count_x = status_rect.x + status_rect.width.saturating_sub(58);
+    font::draw_text_clipped(
+        canvas,
+        count_x,
+        status_rect.y + 4,
+        apps_label.as_str(),
+        50,
+        TextStyle::ui_small(COLOR_ACCENT_WARM),
+    );
 }
 
 fn refresh_window_surface(window: &mut ConsoleWindow, focused: bool) {
@@ -738,6 +888,9 @@ fn paint_window_chrome(
     );
     canvas.fill_rect(inner, COLOR_PANEL_INNER);
     canvas.fill_rect_alpha(title_rect, COLOR_PANEL_GLASS, 230);
+    if focused {
+        canvas.fill_rect_alpha(title_rect, COLOR_PANEL_ELEVATED, 118);
+    }
     canvas.fill_rect_alpha(
         Rect {
             x: title_rect.x,
@@ -761,6 +914,17 @@ fn paint_window_chrome(
             COLOR_BORDER_IDLE
         },
     );
+    if focused {
+        canvas.fill_rect(
+            Rect {
+                x: title_rect.x + WINDOW_FOCUS_STRIP_WIDTH,
+                y: title_rect.y,
+                width: title_rect.width.saturating_sub(WINDOW_FOCUS_STRIP_WIDTH),
+                height: 2,
+            },
+            COLOR_ACCENT_WARM,
+        );
+    }
     canvas.fill_rect(client_rect, COLOR_CLIENT_BACKDROP);
     canvas.stroke_rect(client_rect, COLOR_CLIENT_DIVIDER);
 
@@ -794,6 +958,16 @@ fn draw_window_controls(canvas: &mut SurfaceCanvas<'_>, outer: Rect) {
 fn draw_window_button(canvas: &mut SurfaceCanvas<'_>, rect: Rect, accent: u32, label: &str) {
     canvas.fill_rect_alpha(rect, COLOR_BUTTON_IDLE, 230);
     canvas.stroke_rect(rect, accent);
+    canvas.fill_rect_alpha(
+        Rect {
+            x: rect.x + 2,
+            y: rect.y + 2,
+            width: rect.width.saturating_sub(4),
+            height: rect.height.saturating_sub(4),
+        },
+        accent,
+        38,
+    );
     canvas.fill_rect_alpha(
         Rect {
             x: rect.x + 1,

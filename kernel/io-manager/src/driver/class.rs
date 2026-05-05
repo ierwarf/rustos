@@ -18,6 +18,11 @@ const SUPPORTED_CLASS_CORES: &[ClassCoreDescriptor] = &[
         name: "input",
         devnode_namespace: Some("/dev/input"),
     },
+    ClassCoreDescriptor {
+        class: DriverClass::Network,
+        name: "network",
+        devnode_namespace: Some("/dev/net"),
+    },
 ];
 
 pub(crate) fn descriptor(class: DriverClass) -> Option<&'static ClassCoreDescriptor> {

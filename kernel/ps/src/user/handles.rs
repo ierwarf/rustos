@@ -4,8 +4,12 @@ use crate::user::epoll::EpollHandle;
 use crate::user::linux as linux_abi;
 use crate::user::memfd::MemfdHandle;
 use crate::user::socket::SocketHandle;
+use core::sync::atomic::{AtomicU64, Ordering};
 
-use kernel_object::api::handle::{HandleOwner, HandleToken};
+use kernel_object::api::handle::{
+    DeviceHandleRights, FileHandleRights, HandleOwner, HandleRights, HandleToken,
+    SharedRegionRights, SocketHandleRights,
+};
 
 #[path = "handles/display_surface.rs"]
 mod display_surface;
@@ -38,12 +42,49 @@ pub enum KernelHandle {
     Console(ConsoleStreamKind),
     Device(DeviceHandle),
     Epoll(EpollHandle),
+    InetSocket(InetSocketHandle),
     Memfd(MemfdHandle),
     SharedRegion(KernelSharedRegionHandle),
     Socket(SocketHandle),
     VfsFile(VfsFileHandle),
     VfsDirectory(VfsDirectoryHandle),
     DisplaySurface(DisplaySurfaceHandle),
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct InetSocketHandle {
+    token: u64,
+    domain: u64,
+    type_: u64,
+    protocol: u64,
+}
+
+impl InetSocketHandle {
+    pub fn new(domain: u64, type_: u64, protocol: u64) -> Self {
+        static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+        Self {
+            token: NEXT_TOKEN.fetch_add(1, Ordering::Relaxed),
+            domain,
+            type_,
+            protocol,
+        }
+    }
+
+    pub const fn token_id(self) -> u64 {
+        self.token
+    }
+
+    pub const fn domain(self) -> u64 {
+        self.domain
+    }
+
+    pub const fn type_(self) -> u64 {
+        self.type_
+    }
+
+    pub const fn protocol(self) -> u64 {
+        self.protocol
+    }
 }
 
 impl KernelHandle {
@@ -61,9 +102,8 @@ impl KernelHandle {
                 HandleOwner::Io,
                 ((match device.device_id() {
                     crate::io::device::DeviceId::Console => 0_u64,
-                    crate::io::device::DeviceId::Debug => 1_u64,
-                    crate::io::device::DeviceId::Display => 2_u64,
-                    crate::io::device::DeviceId::Input => 3_u64,
+                    crate::io::device::DeviceId::Display => 1_u64,
+                    crate::io::device::DeviceId::Input => 2_u64,
                 }) << 8)
                     | match device.access_kind() {
                         crate::io::device::DeviceAccessKind::Native => 0_u64,
@@ -71,6 +111,7 @@ impl KernelHandle {
                     },
             ),
             Self::Epoll(epoll) => HandleToken::new(HandleOwner::Compat, epoll.token_id()),
+            Self::InetSocket(socket) => HandleToken::new(HandleOwner::Compat, socket.token_id()),
             Self::Memfd(memfd) => HandleToken::new(HandleOwner::Compat, memfd.token_id()),
             Self::SharedRegion(region) => HandleToken::new(HandleOwner::Ipc, region.raw()),
             Self::Socket(socket) => HandleToken::new(HandleOwner::Compat, socket.token_id()),
@@ -89,6 +130,7 @@ impl KernelHandle {
             Self::Console(_) => "console",
             Self::Device(_) => "device",
             Self::Epoll(_) => "epoll",
+            Self::InetSocket(_) => "inet-socket",
             Self::Memfd(_) => "memfd",
             Self::SharedRegion(_) => "ipc-region",
             Self::Socket(_) => "socket",
@@ -112,8 +154,54 @@ impl KernelHandle {
         }
     }
 
-    pub const fn supports_descriptor_transfer(&self) -> bool {
+    pub fn default_rights(&self, status_flags: u64) -> HandleRights {
+        match self {
+            Self::Console(_) => HandleRights::Console,
+            Self::Device(device) => {
+                let mut rights = DeviceHandleRights::READ
+                    .union(DeviceHandleRights::IOCTL)
+                    .union(DeviceHandleRights::MAP);
+                if matches!(
+                    device.access_kind(),
+                    crate::io::device::DeviceAccessKind::Native
+                ) {
+                    rights = rights
+                        .union(DeviceHandleRights::WRITE)
+                        .union(DeviceHandleRights::ADMIN);
+                }
+                HandleRights::Device(rights)
+            }
+            Self::Epoll(_) => HandleRights::Epoll,
+            Self::InetSocket(_) => HandleRights::Socket(
+                SocketHandleRights::SEND
+                    .union(SocketHandleRights::RECV)
+                    .union(SocketHandleRights::TRANSFER),
+            ),
+            Self::Memfd(_) => HandleRights::Memfd(file_rights_from_status_flags(status_flags)),
+            Self::SharedRegion(_) => HandleRights::SharedRegion(
+                SharedRegionRights::READ
+                    .union(SharedRegionRights::WRITE)
+                    .union(SharedRegionRights::MAP),
+            ),
+            Self::Socket(_) => HandleRights::Socket(
+                SocketHandleRights::SEND
+                    .union(SocketHandleRights::RECV)
+                    .union(SocketHandleRights::PASS_FD)
+                    .union(SocketHandleRights::TRANSFER),
+            ),
+            Self::VfsFile(_) => HandleRights::File(file_rights_from_status_flags(status_flags)),
+            Self::VfsDirectory(_) => HandleRights::File(FileHandleRights::READ),
+            Self::DisplaySurface(_) => HandleRights::DisplaySurface(
+                SharedRegionRights::READ
+                    .union(SharedRegionRights::WRITE)
+                    .union(SharedRegionRights::MAP),
+            ),
+        }
+    }
+
+    pub fn supports_descriptor_transfer(&self, rights: HandleRights) -> bool {
         matches!(self, Self::Socket(_) | Self::Memfd(_) | Self::VfsFile(_))
+            && rights.allows_transfer()
     }
 
     pub fn socket_handle(&self) -> Option<&SocketHandle> {
@@ -128,6 +216,9 @@ impl KernelHandle {
             Self::Console(_) => alloc::string::String::from("/dev/tty"),
             Self::Device(device) => alloc::string::String::from(device.device_id().path()),
             Self::Epoll(epoll) => alloc::string::String::from(epoll.path()),
+            Self::InetSocket(socket) => {
+                alloc::format!("socket:[rustos-inet:{}]", socket.token_id())
+            }
             Self::Memfd(memfd) => memfd.path(),
             Self::Socket(socket) => socket.bound_path().unwrap_or_else(|| {
                 alloc::format!("socket:[rustos-unix-stream:{}]", token.object_id())
@@ -142,4 +233,24 @@ impl KernelHandle {
             }
         }
     }
+}
+
+fn file_rights_from_status_flags(status_flags: u64) -> FileHandleRights {
+    let mut rights = FileHandleRights::TRANSFER;
+    match status_flags & linux_abi::O_ACCMODE {
+        linux_abi::O_WRONLY => rights = rights.union(FileHandleRights::WRITE),
+        linux_abi::O_RDWR => {
+            rights = rights
+                .union(FileHandleRights::READ)
+                .union(FileHandleRights::WRITE);
+        }
+        _ => rights = rights.union(FileHandleRights::READ),
+    }
+    if status_flags & linux_abi::O_APPEND != 0 {
+        rights = rights.union(FileHandleRights::APPEND);
+    }
+    if status_flags & linux_abi::O_NONBLOCK != 0 {
+        rights = rights.union(FileHandleRights::NONBLOCK);
+    }
+    rights
 }

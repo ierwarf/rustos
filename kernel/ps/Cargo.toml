@@ -10,7 +10,6 @@ kernel-hal = { path = "../hal" }
 kernel-mm = { path = "../mm" }
 kernel-ipc-runtime = { path = "../ipc-runtime" }
 kernel-object = { path = "../object" }
-diag-abi = { path = "../../libs/diag-abi" }
 trace-loc-macro = { path = "../../libs/trace-loc-macro" }
 lazy_static = { version = "1.4", features = ["spin_no_std"] }
 linux-raw-sys = { version = "0.12.1", default-features = false, features = ["no_std", "general", "ioctl", "auxvec", "net"] }

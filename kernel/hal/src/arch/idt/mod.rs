@@ -1,7 +1,7 @@
 use lazy_static::lazy_static;
+use x86_64::VirtAddr;
 use x86_64::set_general_handler;
 use x86_64::structures::idt::InterruptDescriptorTable;
-use x86_64::VirtAddr;
 
 const TIMER_INTERRUPT_VECTOR: u8 = crate::arch::pic::PIC_1_OFFSET;
 const KEYBOARD_INTERRUPT_VECTOR: u8 = crate::arch::pic::PIC_1_OFFSET + 1;

@@ -20,6 +20,7 @@ struct RunOptions {
     qemu_log: QemuLogMode,
     vfio_force: bool,
     auto_phoenix3_passthrough: bool,
+    network: bool,
     vfio_hosts: Vec<String>,
     qemu_user_args: Vec<String>,
 }
@@ -34,6 +35,10 @@ impl RunOptions {
             qemu_log: QemuLogMode::None,
             vfio_force: false,
             auto_phoenix3_passthrough: false,
+            network: !matches!(
+                env_string("RUSTOS_QEMU_NETWORK").as_deref(),
+                Some("0" | "false" | "False" | "off" | "Off" | "no" | "No")
+            ),
             vfio_hosts: Vec::new(),
             qemu_user_args: Vec::new(),
         }
@@ -50,7 +55,9 @@ struct PreparedRun {
     session: RunSession,
     profile_args: Vec<OsString>,
     vfio_args: Vec<OsString>,
+    gpu_args: Vec<OsString>,
     usb_args: Vec<OsString>,
+    network_args: Vec<OsString>,
     display_args: Vec<OsString>,
     debugcon_args: Vec<OsString>,
     qemu_log_args: Vec<OsString>,
@@ -209,6 +216,7 @@ where
             }
             "--phoenix3-passthrough" => options.auto_phoenix3_passthrough = true,
             "--vfio-force" => options.vfio_force = true,
+            "--no-network" => options.network = false,
             "-h" | "--help" => {
                 help();
                 return Ok(None);
@@ -232,7 +240,9 @@ fn run_qemu_with_options(config: &Config, options: RunOptions) -> Result<()> {
         &mut command,
         &prepared.profile_args,
         &prepared.vfio_args,
+        &prepared.gpu_args,
         &prepared.usb_args,
+        &prepared.network_args,
         &prepared.display_args,
         &prepared.debugcon_args,
         &prepared.qemu_log_args,
@@ -333,7 +343,9 @@ fn prepare_run(config: &Config, options: RunOptions) -> Result<PreparedRun> {
     }
 
     let vfio_args = configure_vfio_args(&mut profile_args, &vfio_hosts, options.vfio_force)?;
+    let gpu_args = configure_default_gpu_args(&options.qemu_user_args, &vfio_hosts);
     let usb_args = configure_usb_args(options.usb_input, &options.qemu_user_args);
+    let network_args = configure_network_args(options.network, &options.qemu_user_args);
     let display_args = configure_display_args(&options.qemu_user_args);
     let debugcon_args = configure_debugcon(config, &mut session, options.debugcon)?;
     let qemu_log_args = configure_qemu_log(config, options.qemu_log)?;
@@ -343,7 +355,9 @@ fn prepare_run(config: &Config, options: RunOptions) -> Result<PreparedRun> {
         session,
         profile_args,
         vfio_args,
+        gpu_args,
         usb_args,
+        network_args,
         display_args,
         debugcon_args,
         qemu_log_args,
@@ -361,6 +375,7 @@ options:
   -accel-profile, --accel-profile <name>
                                      accelerator profile; use \"kvm\" for host CPU
   --usb-input                        attach qemu-xhci + usb-kbd + usb-tablet for USB HID testing
+  --no-network                       do not attach default usernet + virtio-net-pci
   --debugcon <file|stdio|null>       route debugcon to file, terminal, or disable it
   --qemu-log <int|null>              write QEMU trace log to logs/qemu_interrupt.log or disable it
   --vfio-pci <0000:bb:dd.f>          attach a vfio-pci host device to qemu (repeatable)
@@ -381,6 +396,7 @@ options:
   -accel-profile, --accel-profile <name>
                                      accelerator profile; use \"kvm\" for host CPU
   --usb-input                        attach qemu-xhci + usb-kbd + usb-tablet for USB HID testing
+  --no-network                       do not attach default usernet + virtio-net-pci
   --debugcon <file|stdio|null>       route debugcon to file, terminal, or disable it
   --qemu-log <int|null>              write QEMU trace log to logs/qemu_interrupt.log or disable it
   --vfio-pci <0000:bb:dd.f>          attach a vfio-pci host device to qemu (repeatable)
@@ -787,6 +803,57 @@ fn configure_display_args(qemu_user_args: &[String]) -> Vec<OsString> {
     ]
 }
 
+fn configure_default_gpu_args(qemu_user_args: &[String], vfio_hosts: &[String]) -> Vec<OsString> {
+    if !vfio_hosts.is_empty() || qemu_user_overrides_gpu(qemu_user_args) {
+        return Vec::new();
+    }
+
+    vec![
+        OsString::from("-vga"),
+        OsString::from("none"),
+        OsString::from("-device"),
+        OsString::from("virtio-vga,xres=1600,yres=900"),
+    ]
+}
+
+fn qemu_user_overrides_gpu(qemu_user_args: &[String]) -> bool {
+    let mut expect_vga_target = false;
+    let mut expect_device_target = false;
+    for arg in qemu_user_args {
+        if expect_vga_target {
+            return true;
+        }
+        if expect_device_target {
+            expect_device_target = false;
+            if qemu_device_arg_is_graphics(arg) {
+                return true;
+            }
+            continue;
+        }
+
+        match arg.as_str() {
+            "-vga" => expect_vga_target = true,
+            "-device" => expect_device_target = true,
+            value if value.starts_with("-vga") => return true,
+            value if value.starts_with("-device") && qemu_device_arg_is_graphics(value) => {
+                return true;
+            }
+            _ => {}
+        }
+    }
+
+    expect_vga_target
+}
+
+fn qemu_device_arg_is_graphics(arg: &str) -> bool {
+    arg.contains("virtio-gpu")
+        || arg.contains("virtio-vga")
+        || arg.contains("vfio-pci")
+        || arg.contains("VGA")
+        || arg.contains("bochs-display")
+        || arg.contains("ramfb")
+}
+
 fn configure_usb_args(enable_usb_input: bool, qemu_user_args: &[String]) -> Vec<OsString> {
     if !enable_usb_input {
         return Vec::new();
@@ -811,6 +878,58 @@ fn configure_usb_args(enable_usb_input: bool, qemu_user_args: &[String]) -> Vec<
     ]
 }
 
+fn configure_network_args(enable_network: bool, qemu_user_args: &[String]) -> Vec<OsString> {
+    if !enable_network || qemu_user_overrides_network(qemu_user_args) {
+        return Vec::new();
+    }
+
+    vec![
+        OsString::from("-netdev"),
+        OsString::from(
+            "user,id=net0,net=10.0.2.0/24,host=10.0.2.2,hostfwd=tcp::10080-:8080,hostfwd=udp::10080-:8080",
+        ),
+        OsString::from("-device"),
+        OsString::from("virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56"),
+    ]
+}
+
+fn qemu_user_overrides_network(qemu_user_args: &[String]) -> bool {
+    let mut expect_device_target = false;
+    for arg in qemu_user_args {
+        if expect_device_target {
+            expect_device_target = false;
+            if qemu_device_arg_is_network(arg) {
+                return true;
+            }
+            continue;
+        }
+
+        match arg.as_str() {
+            "-netdev" | "-nic" | "-net" => return true,
+            "-device" => expect_device_target = true,
+            value
+                if value.starts_with("-netdev")
+                    || value.starts_with("-nic")
+                    || value.starts_with("-net") =>
+            {
+                return true;
+            }
+            value if value.starts_with("-device") && qemu_device_arg_is_network(value) => {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn qemu_device_arg_is_network(arg: &str) -> bool {
+    arg.contains("virtio-net")
+        || arg.contains("e1000")
+        || arg.contains("rtl8139")
+        || arg.contains("vmxnet")
+}
+
 fn base_qemu_command(config: &Config, qemu_bin: &Path) -> Command {
     let mut command = Command::new(qemu_bin);
     command.current_dir(&config.root_dir);
@@ -826,7 +945,9 @@ fn append_qemu_args(
     command: &mut Command,
     profile_args: &[OsString],
     vfio_args: &[OsString],
+    gpu_args: &[OsString],
     usb_args: &[OsString],
+    network_args: &[OsString],
     display_args: &[OsString],
     debugcon_args: &[OsString],
     qemu_log_args: &[OsString],
@@ -834,7 +955,9 @@ fn append_qemu_args(
 ) {
     command.args(profile_args);
     command.args(vfio_args);
+    command.args(gpu_args);
     command.args(usb_args);
+    command.args(network_args);
     command.args(display_args);
     command.args(debugcon_args);
     command.args(qemu_log_args);
@@ -862,7 +985,9 @@ fn run_display_probe(config: &Config, options: RunOptions) -> Result<()> {
         &mut command,
         &prepared.profile_args,
         &prepared.vfio_args,
+        &prepared.gpu_args,
         &prepared.usb_args,
+        &prepared.network_args,
         &prepared.display_args,
         &prepared.debugcon_args,
         &prepared.qemu_log_args,
@@ -977,9 +1102,11 @@ fn wait_for_boot_marker(log_path: &Path, markers: &[&str], timeout: Duration) ->
             return Ok(());
         }
         if Instant::now() >= deadline {
-            return Err(
-                format!("timed out waiting for boot markers: {}", markers.join(" | ")).into(),
-            );
+            return Err(format!(
+                "timed out waiting for boot markers: {}",
+                markers.join(" | ")
+            )
+            .into());
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -1080,13 +1207,7 @@ fn run_probe_mouse_stress(
             Instant::now() + PROBE_QMP_TIMEOUT,
         )?;
     } else {
-        qmp_input_send_pointer_rel(
-            qmp,
-            0,
-            0,
-            Some(false),
-            Instant::now() + PROBE_QMP_TIMEOUT,
-        )?;
+        qmp_input_send_pointer_rel(qmp, 0, 0, Some(false), Instant::now() + PROBE_QMP_TIMEOUT)?;
     }
     thread::sleep(Duration::from_millis(200));
     Ok(())
@@ -1148,6 +1269,10 @@ fn latest_kernel_alive_second(log_path: &Path) -> Option<u64> {
 fn parse_kernel_alive_second(line: &str) -> Option<u64> {
     if let Some(rest) = line.strip_prefix("[heartbeat] ") {
         return parse_kernel_alive_second(rest);
+    }
+
+    if let Some(index) = line.find("msg=\"second=") {
+        return parse_kernel_alive_second(&line[index + "msg=\"".len()..]);
     }
 
     if let Some(rest) = line.strip_prefix("kernel alive: second=") {

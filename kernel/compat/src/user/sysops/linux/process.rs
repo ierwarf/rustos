@@ -126,7 +126,8 @@ pub(crate) fn getrandom(
 }
 
 pub(crate) fn ioctl(fd: u64, _request: u64, _arg: u64) -> Result<u64, LinuxSysopError> {
-    let handle = super::fd::current_handle(fd)?;
+    let entry = super::fd::current_handle_entry(fd)?;
+    let handle = entry.handle();
     if let Some(stream) = handle.console_stream() {
         return console_tty_ioctl(stream, _request, _arg);
     }
@@ -134,6 +135,9 @@ pub(crate) fn ioctl(fd: u64, _request: u64, _arg: u64) -> Result<u64, LinuxSysop
         return socket_ioctl(fd, _request, _arg);
     }
     if let Some(device_handle) = handle.device_handle() {
+        if !entry.rights().allows_device_ioctl() {
+            return Err(LinuxSysopError::PermissionDenied);
+        }
         return device::ioctl_current_process_device_handle(device_handle, _request, _arg)
             .map_err(Into::into);
     }

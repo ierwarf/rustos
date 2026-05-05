@@ -90,6 +90,12 @@ checksum = "1e4b40c7323adcfc0a41c4b88143ed58346ff65a288fc144329c5c45e05d70c6"
 
 [[package]]
 name = "bitflags"
+version = "1.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
+
+[[package]]
+name = "bitflags"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
@@ -97,9 +103,6 @@ checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 [[package]]
 name = "boot-protocol"
 version = "0.1.0"
-dependencies = [
- "diag-abi",
-]
 
 [[package]]
 name = "boot-random"
@@ -116,7 +119,6 @@ name = "bootloader"
 version = "0.1.0"
 dependencies = [
  "boot-protocol",
- "diag-abi",
  "object",
  "raw-cpuid",
  "storage-core",
@@ -208,31 +210,44 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "413d67b29ef1021b4d60f4aa1e925ca031751e213832b4b1d588fae623c05c60"
 
 [[package]]
-name = "debugctl"
-version = "0.1.0"
+name = "defmt"
+version = "0.3.100"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0963443817029b2024136fc4dd07a5107eb8f977eaf18fcd1fdeb11306b64ad"
 dependencies = [
- "diag-abi",
- "libc",
+ "defmt 1.0.1",
 ]
 
 [[package]]
-name = "debugd"
-version = "0.1.0"
+name = "defmt"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "548d977b6da32fa1d1fda2876453da1e7df63ad0304c8b3dae4dbe7b96f39b78"
 dependencies = [
- "diag-abi",
- "libc",
+ "bitflags 1.3.2",
+ "defmt-macros",
 ]
 
 [[package]]
-name = "diag-abi"
-version = "0.1.0"
+name = "defmt-macros"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d4fc12a85bcf441cfe44344c4b72d58493178ce635338a3f3b78943aceb258e"
+dependencies = [
+ "defmt-parser",
+ "proc-macro-error2",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
 
 [[package]]
-name = "diag-client"
-version = "0.1.0"
+name = "defmt-parser"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10d60334b3b2e7c9d91ef8150abfb6fa4c1c39ebbcf4a81c2e346aad939fee3e"
 dependencies = [
- "diag-abi",
- "libc",
+ "thiserror",
 ]
 
 [[package]]
@@ -296,7 +311,7 @@ name = "fatfs"
 version = "0.4.0"
 source = "git+https://github.com/rafalh/rust-fatfs#c4b88477b22ca7e5131fbd8891f62a5deaa88e6e"
 dependencies = [
- "bitflags",
+ "bitflags 2.11.0",
  "log",
 ]
 
@@ -332,6 +347,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hash32"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47d60b12902ba28e2730cd37e95b8c9223af2808df9e902d4df49588d1470606"
+dependencies = [
+ "byteorder",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -347,6 +371,16 @@ name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
+
+[[package]]
+name = "heapless"
+version = "0.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25ba4bd83f9415b58b4ed8dc5714c76e626a105be4646c02630ad730ad3b5aa4"
+dependencies = [
+ "hash32",
+ "stable_deref_trait",
+]
 
 [[package]]
 name = "heck"
@@ -377,8 +411,8 @@ dependencies = [
 name = "initd"
 version = "0.1.0"
 dependencies = [
- "diag-client",
  "libc",
+ "observability-client",
  "runtime-control",
 ]
 
@@ -386,7 +420,7 @@ dependencies = [
 name = "inputd"
 version = "0.1.0"
 dependencies = [
- "diag-client",
+ "observability-client",
 ]
 
 [[package]]
@@ -399,7 +433,6 @@ checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 name = "kernel-compat"
 version = "0.1.0"
 dependencies = [
- "diag-abi",
  "kernel-hal",
  "kernel-io-manager",
  "kernel-ipc-runtime",
@@ -421,7 +454,6 @@ name = "kernel-executive"
 version = "0.1.0"
 dependencies = [
  "boot-protocol",
- "diag-abi",
  "driver-abi",
  "kernel-compat",
  "kernel-hal",
@@ -439,7 +471,6 @@ name = "kernel-hal"
 version = "0.1.0"
 dependencies = [
  "boot-protocol",
- "diag-abi",
  "kernel-lowlevel",
  "lazy_static",
  "nucleus-core",
@@ -453,7 +484,6 @@ name = "kernel-io-manager"
 version = "0.1.0"
 dependencies = [
  "boot-protocol",
- "diag-abi",
  "driver-abi",
  "embedded-graphics",
  "fatfs",
@@ -466,6 +496,7 @@ dependencies = [
  "keyboard-core",
  "nucleus-core",
  "object",
+ "smoltcp",
  "spin 0.10.0",
  "storage-core",
  "storage-fat",
@@ -508,7 +539,6 @@ dependencies = [
 name = "kernel-object"
 version = "0.1.0"
 dependencies = [
- "diag-abi",
  "nucleus-core",
 ]
 
@@ -516,7 +546,6 @@ dependencies = [
 name = "kernel-ps"
 version = "0.1.0"
 dependencies = [
- "diag-abi",
  "kernel-hal",
  "kernel-ipc-runtime",
  "kernel-lowlevel",
@@ -534,7 +563,7 @@ dependencies = [
 name = "keyboard-core"
 version = "0.1.0"
 dependencies = [
- "bitflags",
+ "bitflags 2.11.0",
  "pc-keyboard",
 ]
 
@@ -573,6 +602,12 @@ name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
+
+[[package]]
+name = "managed"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ca88d725a0a943b096803bd34e73a4437208b6077654cc4ecb2947a5f91618d"
 
 [[package]]
 name = "memchr"
@@ -614,8 +649,9 @@ version = "0.1.0"
 dependencies = [
  "boot-protocol",
  "boot-random",
- "diag-abi",
  "embedded-graphics",
+ "os_observatory",
+ "rustos-observability",
  "spin 0.10.0",
  "trace-loc-macro",
  "x86_64",
@@ -651,10 +687,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "observability-client"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "os_observatory",
+ "rustos-observability",
+]
+
+[[package]]
 name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
+
+[[package]]
+name = "os_observatory"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f3fbf80edff265ba1c0b425b83d880b130196ab88a8642e650aa1b963266fcf"
 
 [[package]]
 name = "paste"
@@ -699,7 +750,6 @@ dependencies = [
  "boot-protocol",
  "boot-random",
  "buddy_system_allocator",
- "diag-abi",
  "embedded-graphics",
  "fatfs",
  "object",
@@ -707,6 +757,28 @@ dependencies = [
  "storage-core",
  "storage-fat",
  "x86_64",
+]
+
+[[package]]
+name = "proc-macro-error-attr2"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96de42df36bb9bba5542fe9f1a054b8cc87e172759a1868aa05c1f3acc89dfc5"
+dependencies = [
+ "proc-macro2",
+ "quote",
+]
+
+[[package]]
+name = "proc-macro-error2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11ec05c52be0a07b08061f7dd003e7d7092e0472bc731b4af7bb1ef876109802"
+dependencies = [
+ "proc-macro-error-attr2",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -778,7 +850,7 @@ version = "11.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
 dependencies = [
- "bitflags",
+ "bitflags 2.11.0",
 ]
 
 [[package]]
@@ -792,8 +864,8 @@ dependencies = [
 name = "runtimed"
 version = "0.1.0"
 dependencies = [
- "diag-client",
  "libc",
+ "observability-client",
  "runtime-control",
 ]
 
@@ -803,7 +875,7 @@ version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
 dependencies = [
- "bitflags",
+ "bitflags 2.11.0",
  "errno",
  "libc",
  "linux-raw-sys",
@@ -830,10 +902,14 @@ dependencies = [
 name = "rustos-keyboard-driver"
 version = "0.1.0"
 dependencies = [
- "bitflags",
+ "bitflags 2.11.0",
  "driver-abi",
  "keyboard-core",
 ]
+
+[[package]]
+name = "rustos-observability"
+version = "0.1.0"
 
 [[package]]
 name = "rustversion"
@@ -890,7 +966,7 @@ dependencies = [
 name = "sessiond"
 version = "0.1.0"
 dependencies = [
- "diag-client",
+ "observability-client",
  "runtime-control",
 ]
 
@@ -907,6 +983,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
+name = "smoltcp"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac729b0a77bd092a3f06ddaddc59fe0d67f48ba0de45a9abe707c2842c7f8767"
+dependencies = [
+ "bitflags 1.3.2",
+ "byteorder",
+ "cfg-if",
+ "defmt 0.3.100",
+ "heapless",
+ "managed",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -920,6 +1010,12 @@ checksum = "d5fe4ccb98d9c292d56fec89a5e07da7fc4cf0dc11e156b41793132775d3e591"
 dependencies = [
  "lock_api",
 ]
+
+[[package]]
+name = "stable_deref_trait"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "storage-core"
@@ -941,7 +1037,7 @@ dependencies = [
 name = "storaged"
 version = "0.1.0"
 dependencies = [
- "diag-client",
+ "observability-client",
 ]
 
 [[package]]
@@ -1063,7 +1159,7 @@ version = "0.36.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71fe9058b73ee2b6559524af9e33199c13b2485ddbf3ad1181b68051cdc50c17"
 dependencies = [
- "bitflags",
+ "bitflags 2.11.0",
  "cfg-if",
  "log",
  "ptr_meta",
@@ -1090,7 +1186,7 @@ version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f64fe59e11af447d12fd60a403c74106eb104309f34b4c6dbce6e927d97da9d"
 dependencies = [
- "bitflags",
+ "bitflags 2.11.0",
  "uguid",
 ]
 
@@ -1104,10 +1200,10 @@ checksum = "0c8352f8c05e47892e7eaf13b34abd76a7f4aeaf817b716e88789381927f199c"
 name = "uiserver"
 version = "0.1.0"
 dependencies = [
- "diag-client",
  "embedded-graphics",
  "fontdue",
  "keyboard-core",
+ "observability-client",
  "runtime-control",
  "vte",
  "wayland-protocols",
@@ -1170,7 +1266,7 @@ version = "0.31.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "645c7c96bb74690c3189b5c9cb4ca1627062bb23693a4fad9d8c3de958260144"
 dependencies = [
- "bitflags",
+ "bitflags 2.11.0",
  "rustix",
  "wayland-backend",
  "wayland-scanner",
@@ -1182,7 +1278,7 @@ version = "0.32.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "563a85523cade2429938e790815fd7319062103b9f4a2dc806e9b53b95982d8f"
 dependencies = [
- "bitflags",
+ "bitflags 2.11.0",
  "wayland-backend",
  "wayland-client",
  "wayland-scanner",
@@ -1206,7 +1302,7 @@ version = "0.31.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cc1846eb04c49182e04f4a099e2a830a2b745610bbc1d61246e206f29c7000a0"
 dependencies = [
- "bitflags",
+ "bitflags 2.11.0",
  "downcast-rs",
  "rustix",
  "wayland-backend",
@@ -1253,7 +1349,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f7841fa0098ceb15c567d93d3fae292c49e10a7662b4936d5f6a9728594555ba"
 dependencies = [
  "bit_field",
- "bitflags",
+ "bitflags 2.11.0",
  "const_fn",
  "rustversion",
  "volatile",

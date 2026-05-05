@@ -63,10 +63,7 @@ pub fn write_current_user_struct<T: Copy>(
     write_current_user_bytes(user_ptr, bytes)
 }
 
-pub fn write_current_user_u32(
-    user_ptr: u64,
-    value: u32,
-) -> Result<(), paging::AddressSpaceError> {
+pub fn write_current_user_u32(user_ptr: u64, value: u32) -> Result<(), paging::AddressSpaceError> {
     write_current_user_bytes(user_ptr, &value.to_le_bytes())
 }
 

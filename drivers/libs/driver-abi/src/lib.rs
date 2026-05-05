@@ -34,6 +34,7 @@ pub const REL_WHEEL: u32 = 0x08;
 pub enum DriverClass {
     Display = 1,
     Input = 2,
+    Network = 3,
 }
 
 #[repr(u32)]

@@ -356,7 +356,7 @@ pub(crate) fn control_msg(
     data: *mut c_void,
     size: u16,
 ) -> i32 {
-    if dev.is_null() || data.is_null() {
+    if dev.is_null() || (size != 0 && data.is_null()) {
         return -22;
     }
 
@@ -364,8 +364,10 @@ pub(crate) fn control_msg(
         return -38;
     };
     let copy_len = core::cmp::min(response.len(), size as usize);
-    unsafe {
-        core::ptr::copy_nonoverlapping(response.as_ptr(), data.cast::<u8>(), copy_len);
+    if copy_len != 0 {
+        unsafe {
+            core::ptr::copy_nonoverlapping(response.as_ptr(), data.cast::<u8>(), copy_len);
+        }
     }
     copy_len as i32
 }

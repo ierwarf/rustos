@@ -5,15 +5,28 @@ use alloc::vec::Vec;
 pub struct HandleEntry {
     handle: KernelHandle,
     token: HandleToken,
+    rights: HandleRights,
     fd_flags: u32,
     status_flags: u64,
 }
 
 impl HandleEntry {
     pub fn new(handle: KernelHandle, fd_flags: u32, status_flags: u64) -> Self {
+        let status_flags = status_flags & STATUS_FLAG_MASK;
+        let rights = handle.default_rights(status_flags);
+        Self::new_with_rights(handle, rights, fd_flags, status_flags)
+    }
+
+    pub fn new_with_rights(
+        handle: KernelHandle,
+        rights: HandleRights,
+        fd_flags: u32,
+        status_flags: u64,
+    ) -> Self {
         Self {
             token: handle.token(),
             handle,
+            rights,
             fd_flags,
             status_flags: status_flags & STATUS_FLAG_MASK,
         }
@@ -29,6 +42,10 @@ impl HandleEntry {
 
     pub fn token(&self) -> HandleToken {
         self.token
+    }
+
+    pub fn rights(&self) -> HandleRights {
+        self.rights
     }
 
     pub fn into_handle(self) -> KernelHandle {
@@ -181,23 +198,13 @@ impl HandleTable {
         }
     }
 
-    pub fn duplicate_min(
-        &mut self,
-        fd: u64,
-        min_fd: u64,
-        close_on_exec: bool,
-    ) -> Option<u64> {
+    pub fn duplicate_min(&mut self, fd: u64, min_fd: u64, close_on_exec: bool) -> Option<u64> {
         let mut entry = self.get_entry(fd)?.clone();
         entry.set_fd_flags(if close_on_exec { FD_CLOEXEC } else { 0 });
         Some(self.install_entry_min(entry, min_fd))
     }
 
-    pub fn duplicate_exact(
-        &mut self,
-        fd: u64,
-        new_fd: u64,
-        close_on_exec: bool,
-    ) -> Option<u64> {
+    pub fn duplicate_exact(&mut self, fd: u64, new_fd: u64, close_on_exec: bool) -> Option<u64> {
         if new_fd < FIRST_DYNAMIC_FD as u64 {
             return None;
         }
@@ -312,6 +319,7 @@ mod tests {
     use super::{FD_CLOEXEC, HandleEntry, HandleTable, KernelHandle, VfsFileHandle};
     use crate::memory::paging::UserRegion;
     use crate::user::linux as linux_abi;
+    use kernel_object::api::handle::{FileHandleRights, HandleRights};
     use x86_64::VirtAddr;
 
     #[test]
@@ -399,6 +407,22 @@ mod tests {
             KernelHandle::VfsFile(file) => assert_eq!(file.path(), "/source"),
             other => panic!("expected VfsFile after dup2-style replace, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn duplicate_exact_preserves_handle_rights() {
+        let mut table = HandleTable::new();
+        let rights = HandleRights::File(FileHandleRights::READ);
+        let source_fd = table.install_entry(HandleEntry::new_with_rights(
+            KernelHandle::VfsFile(VfsFileHandle::read_only_memory("/source".into(), vec![1])),
+            rights,
+            0,
+            linux_abi::O_RDONLY,
+        ));
+
+        let target_fd = table.duplicate_exact(source_fd, 10, false).expect("dup");
+
+        assert_eq!(table.get_entry(target_fd).expect("target").rights(), rights);
     }
 
     #[test]

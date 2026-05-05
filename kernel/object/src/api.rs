@@ -3,7 +3,10 @@ pub mod device {
 }
 
 pub mod handle {
-    pub use crate::handle::{HandleOwner, HandleToken};
+    pub use crate::handle::{
+        DeviceHandleRights, FileHandleRights, HandleOwner, HandleRights, HandleToken,
+        SharedRegionRights, SocketHandleRights,
+    };
 }
 
 pub mod session {
@@ -11,5 +14,8 @@ pub mod session {
 }
 
 pub use device::{DeviceAccessKind, DeviceHandle, DeviceId};
-pub use handle::{HandleOwner, HandleToken};
+pub use handle::{
+    DeviceHandleRights, FileHandleRights, HandleOwner, HandleRights, HandleToken,
+    SharedRegionRights, SocketHandleRights,
+};
 pub use session::ConsoleSessionHandle;

@@ -101,6 +101,11 @@ fn is_validated_owner(owner: LayerOwner) -> bool {
             | LayerOwner::Services
             | LayerOwner::Apps
             | LayerOwner::DriversBridges
+            | LayerOwner::DriversLibs
+            | LayerOwner::Libs
+            | LayerOwner::Compat
+            | LayerOwner::Boot
+            | LayerOwner::Tests
     )
 }
 
@@ -264,9 +269,7 @@ fn dependency_allowed(owner: LayerOwner, dep_owner: LayerOwner) -> bool {
         ),
         LayerOwner::KernelObject => matches!(
             dep_owner,
-            LayerOwner::Core
-                | LayerOwner::Libs
-                | LayerOwner::KernelNucleusCore
+            LayerOwner::Core | LayerOwner::Libs | LayerOwner::KernelNucleusCore
         ),
         LayerOwner::KernelIpcRuntime => matches!(
             dep_owner,
@@ -337,6 +340,45 @@ fn dependency_allowed(owner: LayerOwner, dep_owner: LayerOwner) -> bool {
                 | LayerOwner::Core
                 | LayerOwner::Libs
                 | LayerOwner::DriversLibs
+        ),
+        LayerOwner::DriversLibs => matches!(
+            dep_owner,
+            LayerOwner::Boot | LayerOwner::Core | LayerOwner::Libs | LayerOwner::DriversLibs
+        ),
+        LayerOwner::Libs => matches!(
+            dep_owner,
+            LayerOwner::Boot | LayerOwner::Core | LayerOwner::Libs
+        ),
+        LayerOwner::Compat => matches!(
+            dep_owner,
+            LayerOwner::Boot
+                | LayerOwner::Core
+                | LayerOwner::Libs
+                | LayerOwner::DriversLibs
+                | LayerOwner::Compat
+        ),
+        LayerOwner::Boot => matches!(
+            dep_owner,
+            LayerOwner::Boot | LayerOwner::Core | LayerOwner::Libs | LayerOwner::DriversLibs
+        ),
+        LayerOwner::Tests => matches!(
+            dep_owner,
+            LayerOwner::Boot
+                | LayerOwner::Core
+                | LayerOwner::Libs
+                | LayerOwner::DriversLibs
+                | LayerOwner::Compat
+                | LayerOwner::KernelNucleusCore
+                | LayerOwner::KernelLowlevel
+                | LayerOwner::KernelMonolith
+                | LayerOwner::KernelHal
+                | LayerOwner::KernelMm
+                | LayerOwner::KernelObject
+                | LayerOwner::KernelIpcRuntime
+                | LayerOwner::KernelPs
+                | LayerOwner::KernelIoManager
+                | LayerOwner::KernelCompat
+                | LayerOwner::KernelExecutive
         ),
         _ => true,
     }
@@ -527,8 +569,7 @@ fn validate_kernel_source_boundaries(root_dir: &Path) -> Result<()> {
         &[concat!("kernel_base", "::")],
     )?;
 
-    let compat_user_mod =
-        fs::read_to_string(root_dir.join("kernel/compat/src/user/mod.rs"))?;
+    let compat_user_mod = fs::read_to_string(root_dir.join("kernel/compat/src/user/mod.rs"))?;
     assert_source_not_contains_any(
         &compat_user_mod,
         "kernel/compat/src/user/mod.rs",
@@ -659,21 +700,9 @@ fn validate_kernel_source_boundaries(root_dir: &Path) -> Result<()> {
 
     assert_max_lines(root_dir, "kernel/src/main.rs", 120)?;
     assert_max_lines(root_dir, "kernel/executive/src/lib.rs", 180)?;
-    assert_max_lines(
-        root_dir,
-        "kernel/compat/src/user/syscall/linux.rs",
-        600,
-    )?;
-    assert_max_lines(
-        root_dir,
-        "kernel/io-manager/src/storage/block.rs",
-        500,
-    )?;
-    assert_max_lines(
-        root_dir,
-        "kernel/ps/src/multitask/mod.rs",
-        500,
-    )?;
+    assert_max_lines(root_dir, "kernel/compat/src/user/syscall/linux.rs", 600)?;
+    assert_max_lines(root_dir, "kernel/io-manager/src/storage/block.rs", 500)?;
+    assert_max_lines(root_dir, "kernel/ps/src/multitask/mod.rs", 500)?;
 
     for manager in [
         "kernel/hal/src/lib.rs",
@@ -832,6 +861,37 @@ mod tests {
         assert!(!dependency_allowed(
             LayerOwner::KernelHal,
             LayerOwner::KernelExecutive
+        ));
+    }
+
+    #[test]
+    fn shared_libraries_cannot_depend_on_product_implementation_layers() {
+        for disallowed in [
+            LayerOwner::KernelMonolith,
+            LayerOwner::KernelHal,
+            LayerOwner::Services,
+            LayerOwner::Apps,
+            LayerOwner::DriversBridges,
+        ] {
+            assert!(!dependency_allowed(LayerOwner::Libs, disallowed));
+        }
+        assert!(dependency_allowed(LayerOwner::Libs, LayerOwner::Libs));
+        assert!(dependency_allowed(LayerOwner::Libs, LayerOwner::Boot));
+    }
+
+    #[test]
+    fn driver_libraries_cannot_depend_on_bridge_driver_implementations() {
+        assert!(!dependency_allowed(
+            LayerOwner::DriversLibs,
+            LayerOwner::DriversBridges
+        ));
+        assert!(dependency_allowed(
+            LayerOwner::DriversLibs,
+            LayerOwner::Libs
+        ));
+        assert!(dependency_allowed(
+            LayerOwner::DriversLibs,
+            LayerOwner::DriversLibs
         ));
     }
 }

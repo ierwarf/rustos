@@ -3,8 +3,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use runtime_control::{
-    decode_c_string, load_autostart_program_entries, load_startup_entries, RuntimeClient,
-    StartupMode, DEFAULT_APPLICATIONS_DIR, DEFAULT_AUTOSTART_DIR,
+    decode_c_string, load_autostart_program_entries, load_startup_entries, DesktopProgramEntry,
+    RuntimeClient, StartupMode, DEFAULT_APPLICATIONS_DIR, DEFAULT_AUTOSTART_DIR,
 };
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const LAUNCH_SETTLE_DELAY: Duration = Duration::from_millis(250);
@@ -13,7 +13,9 @@ const RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct LaunchEntry {
+    package_id: String,
     desktop_file_id: String,
+    runtime_deps: Vec<String>,
     restart: bool,
 }
 
@@ -27,17 +29,27 @@ fn main() {
     let runtime = match RuntimeClient::open_default() {
         Ok(client) => client,
         Err(err) => {
-            diag_client::diag_error!("sessiond", "failed to open runtime device: errno={}", err);
+            observability_client::error!(
+                "sessiond",
+                service,
+                "failed to open runtime device: errno={}",
+                err
+            );
             return;
         }
     };
     let launch_entries = load_launch_entries();
-    diag_client::diag_info!(
+    let package_by_desktop_id = launch_entries
+        .iter()
+        .map(|entry| (entry.desktop_file_id.clone(), entry.package_id.clone()))
+        .collect::<BTreeMap<_, _>>();
+    observability_client::info!(
         "sessiond",
+        service,
         "loaded {} desktop/session entries",
         launch_entries.len()
     );
-    let mut launched_once = BTreeSet::new();
+    let mut launched_once_packages = BTreeSet::new();
     let mut pending_launch = None::<PendingLaunch>;
     let mut retry_after = BTreeMap::<String, Instant>::new();
 
@@ -45,23 +57,38 @@ fn main() {
         let running = match runtime.snapshot_running_programs() {
             Ok(running) => running,
             Err(err) => {
-                diag_client::diag_error!("sessiond", "snapshot running failed: errno={}", err);
+                observability_client::error!(
+                    "sessiond",
+                    service,
+                    "snapshot running failed: errno={}",
+                    err
+                );
                 thread::sleep(POLL_INTERVAL);
                 continue;
             }
         };
 
-        let running_execs = running
+        let running_desktop_ids = running
             .iter()
             .map(|program| decode_c_string(&program.desktop_file_id))
             .collect::<BTreeSet<_>>();
+        let running_packages = running_desktop_ids
+            .iter()
+            .map(|desktop_id| {
+                package_by_desktop_id
+                    .get(desktop_id)
+                    .cloned()
+                    .unwrap_or_else(|| package_id_from_desktop_id(desktop_id))
+            })
+            .collect::<BTreeSet<_>>();
 
         if let Some(pending) = pending_launch.as_ref() {
-            if running_execs.contains(pending.desktop_file_id.as_str()) {
+            if running_desktop_ids.contains(pending.desktop_file_id.as_str()) {
                 retry_after.remove(pending.desktop_file_id.as_str());
                 if pending.requested_at.elapsed() >= LAUNCH_SETTLE_DELAY {
-                    diag_client::diag_info!(
+                    observability_client::info!(
                         "sessiond",
+                        service,
                         "launch settled for {}",
                         pending.desktop_file_id
                     );
@@ -76,8 +103,9 @@ fn main() {
                 continue;
             }
 
-            diag_client::diag_warn!(
+            observability_client::warn!(
                 "sessiond",
+                service,
                 "launch timed out waiting for {}",
                 pending.desktop_file_id
             );
@@ -89,6 +117,13 @@ fn main() {
         }
 
         for entry in &launch_entries {
+            if !runtime_deps_satisfied(
+                &entry.runtime_deps,
+                &running_packages,
+                &launched_once_packages,
+            ) {
+                continue;
+            }
             if retry_after
                 .get(entry.desktop_file_id.as_str())
                 .is_some_and(|deadline| Instant::now() < *deadline)
@@ -96,19 +131,21 @@ fn main() {
                 continue;
             }
             if entry.restart {
-                if running_execs.contains(entry.desktop_file_id.as_str()) {
+                if running_packages.contains(entry.package_id.as_str()) {
                     continue;
                 }
-                diag_client::diag_info!(
+                observability_client::info!(
                     "sessiond",
+                    service,
                     "ensuring desktop service {}",
                     entry.desktop_file_id
                 );
-            } else if launched_once.contains(entry.desktop_file_id.as_str()) {
+            } else if launched_once_packages.contains(entry.package_id.as_str()) {
                 continue;
             } else {
-                diag_client::diag_info!(
+                observability_client::info!(
                     "sessiond",
+                    service,
                     "launching desktop app {}",
                     entry.desktop_file_id
                 );
@@ -117,11 +154,12 @@ fn main() {
             match runtime.request_launch_program_new_session(entry.desktop_file_id.as_str()) {
                 Ok(()) => {
                     if !entry.restart {
-                        launched_once.insert(entry.desktop_file_id.clone());
+                        launched_once_packages.insert(entry.package_id.clone());
                     }
                     retry_after.remove(entry.desktop_file_id.as_str());
-                    diag_client::diag_info!(
+                    observability_client::info!(
                         "sessiond",
+                        service,
                         "launch request queued for {}",
                         entry.desktop_file_id
                     );
@@ -136,8 +174,9 @@ fn main() {
                         entry.desktop_file_id.clone(),
                         Instant::now() + RETRY_BACKOFF,
                     );
-                    diag_client::diag_error!(
+                    observability_client::error!(
                         "sessiond",
+                        service,
                         "launch {} failed: errno={err}",
                         entry.desktop_file_id
                     );
@@ -170,8 +209,9 @@ fn load_launch_entries() -> Vec<LaunchEntry> {
 
 fn load_startup_registry_desktop_entries() -> Vec<LaunchEntry> {
     let Ok(entries) = load_startup_entries(DEFAULT_APPLICATIONS_DIR) else {
-        diag_client::diag_warn!(
+        observability_client::warn!(
             "sessiond",
+            service,
             "application desktop dir unavailable: {DEFAULT_APPLICATIONS_DIR}"
         );
         return Vec::new();
@@ -182,24 +222,46 @@ fn load_startup_registry_desktop_entries() -> Vec<LaunchEntry> {
         .filter(|entry| entry.mode == StartupMode::Desktop)
         .map(|entry| LaunchEntry {
             restart: entry.exec.starts_with("services/"),
+            package_id: entry.package_id,
             desktop_file_id: entry.desktop_file_id,
+            runtime_deps: entry.runtime_deps,
         })
         .collect()
 }
 
 fn load_autostart_entries() -> Vec<LaunchEntry> {
     let Ok(entries) = load_autostart_program_entries(DEFAULT_AUTOSTART_DIR) else {
-        diag_client::diag_warn!(
+        observability_client::warn!(
             "sessiond",
+            service,
             "autostart directory unavailable: {DEFAULT_AUTOSTART_DIR}"
         );
         return Vec::new();
     };
-    entries
-        .into_iter()
-        .map(|entry| LaunchEntry {
-            restart: entry.exec.starts_with("services/"),
-            desktop_file_id: entry.desktop_file_id,
-        })
-        .collect()
+    entries.into_iter().map(desktop_launch_entry).collect()
+}
+
+fn desktop_launch_entry(entry: DesktopProgramEntry) -> LaunchEntry {
+    LaunchEntry {
+        restart: entry.exec.starts_with("services/"),
+        package_id: entry.package_id,
+        desktop_file_id: entry.desktop_file_id,
+        runtime_deps: entry.runtime_deps,
+    }
+}
+
+fn runtime_deps_satisfied(
+    deps: &[String],
+    running_packages: &BTreeSet<String>,
+    launched_once_packages: &BTreeSet<String>,
+) -> bool {
+    deps.iter()
+        .all(|dep| running_packages.contains(dep) || launched_once_packages.contains(dep))
+}
+
+fn package_id_from_desktop_id(desktop_id: &str) -> String {
+    desktop_id
+        .strip_suffix(".desktop")
+        .unwrap_or(desktop_id)
+        .to_string()
 }

@@ -74,7 +74,6 @@ pub extern "C" fn _start(boot_info_ptr: *const BootInfo) -> ! {
     interrupts::disable();
     heap::init_heap();
 
-    debug::install_boot_diag(boot_info_ptr);
     let boot_info = match unsafe { BootInfo::from_ptr(boot_info_ptr) } {
         Ok(boot_info) => boot_info,
         Err(error) => fatal(format_args!("{}", error.as_str())),
