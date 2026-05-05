@@ -7,7 +7,7 @@
 ## English
 
 Runtime control is the userspace client API used to talk to `runtimed`. The
-public API lives in [libs/runtime-control/src/lib.rs](../../libs/runtime-control/src/lib.rs).
+public API lives in `libs/runtime-control/src/lib.rs`.
 
 ### Constants
 
@@ -61,7 +61,7 @@ files manually.
 ## 한국어
 
 Runtime control은 `runtimed`와 통신하는 userspace client API입니다. public API는
-[libs/runtime-control/src/lib.rs](../../libs/runtime-control/src/lib.rs)에 있습니다.
+`libs/runtime-control/src/lib.rs`에 있습니다.
 
 ### Constants
 

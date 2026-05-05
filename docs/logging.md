@@ -11,10 +11,9 @@ add new log lines without making the boot path noisy.
 
 ### Configuration File
 
-The shared logging policy lives in [config/logging.toml](../config/logging.toml).
-Most settings are consumed by crate `build.rs` scripts through
-[tools/build_log_cfg.rs](../tools/build_log_cfg.rs), so changing the file
-requires rebuilding the affected crates.
+The shared logging policy lives in `config/logging.toml`. Most settings are
+consumed by crate `build.rs` scripts through `tools/build_log_cfg.rs`, so
+changing the file requires rebuilding the affected crates.
 
 ```toml
 enabled = true
@@ -63,8 +62,7 @@ and `trace`.
 
 ### Categories
 
-The canonical category list is defined in
-[libs/rustos-observability/src/lib.rs](../libs/rustos-observability/src/lib.rs)
+The canonical category list is defined in `libs/rustos-observability/src/lib.rs`
 and duplicated by the build helper for cfg generation.
 
 - `boot`: bootloader, prekernel, kernel boot sequencing
@@ -98,7 +96,7 @@ Kernel crates use generated macros from
 `kernel/nucleus-core/src/debug/kdiag_macros.rs`. Userspace services use
 generated helpers from `libs/observability-client`.
 
-After changing [config/logging.toml](../config/logging.toml), rebuild:
+After changing `config/logging.toml`, rebuild:
 
 ```bash
 cargo xtask build
@@ -297,10 +295,9 @@ cargo xtask check
 
 ### 설정 파일
 
-공유 logging 정책은 [config/logging.toml](../config/logging.toml)에 있습니다.
-대부분의 설정은 crate `build.rs`가 [tools/build_log_cfg.rs](../tools/build_log_cfg.rs)를
-통해 읽습니다. 따라서 이 파일을 바꾸면 영향을 받는 crate를 다시 빌드해야
-합니다.
+공유 logging 정책은 `config/logging.toml`에 있습니다. 대부분의 설정은 crate
+`build.rs`가 `tools/build_log_cfg.rs`를 통해 읽습니다. 따라서 이 파일을
+바꾸면 영향을 받는 crate를 다시 빌드해야 합니다.
 
 ```toml
 enabled = true
@@ -348,9 +345,8 @@ threshold는 inclusive입니다. 예를 들어 `storage = "warn"`은 storage의
 
 ### 카테고리
 
-canonical category list는
-[libs/rustos-observability/src/lib.rs](../libs/rustos-observability/src/lib.rs)에
-정의되어 있고, cfg 생성을 위해 build helper에도 같은 목록이 있습니다.
+canonical category list는 `libs/rustos-observability/src/lib.rs`에 정의되어
+있고, cfg 생성을 위해 build helper에도 같은 목록이 있습니다.
 
 - `boot`: bootloader, prekernel, kernel boot sequencing
 - `panic`: panic과 fatal crash reporting
@@ -383,7 +379,7 @@ Kernel crate는 `kernel/nucleus-core/src/debug/kdiag_macros.rs`에서 생성된
 macro를 사용합니다. Userspace service는 `libs/observability-client`의 생성
 helper를 사용합니다.
 
-[config/logging.toml](../config/logging.toml)을 바꾼 뒤에는 다시 빌드하세요.
+`config/logging.toml`을 바꾼 뒤에는 다시 빌드하세요.
 
 ```bash
 cargo xtask build

@@ -7,7 +7,7 @@
 ## English
 
 `cargo xtask` is the host-side control surface for RustOS. The command enum is
-defined in [tools/xtask/src/cli.rs](../../tools/xtask/src/cli.rs).
+defined in `tools/xtask/src/cli.rs`.
 
 ### Commands
 
@@ -66,7 +66,7 @@ cargo xtask run -- --no-reboot
 ## 한국어
 
 `cargo xtask`는 RustOS의 host-side control surface입니다. command enum은
-[tools/xtask/src/cli.rs](../../tools/xtask/src/cli.rs)에 정의되어 있습니다.
+`tools/xtask/src/cli.rs`에 정의되어 있습니다.
 
 ### Commands
 

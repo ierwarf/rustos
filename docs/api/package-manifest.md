@@ -7,7 +7,7 @@
 ## English
 
 `RUSTOS.package.toml` is the deployment source of truth. The parser and schema
-types are in [tools/xtask/src/package_manifest.rs](../../tools/xtask/src/package_manifest.rs).
+types are in `tools/xtask/src/package_manifest.rs`.
 
 ### Minimal Shape
 
@@ -102,7 +102,7 @@ Stage writes this into `system/registry/kernel/loadable-drivers.tsv`.
 ## 한국어
 
 `RUSTOS.package.toml`은 deployment source of truth입니다. parser와 schema type은
-[tools/xtask/src/package_manifest.rs](../../tools/xtask/src/package_manifest.rs)에 있습니다.
+`tools/xtask/src/package_manifest.rs`에 있습니다.
 
 ### 최소 형태
 

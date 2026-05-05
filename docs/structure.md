@@ -103,7 +103,7 @@ source directories.
 6. Run `cargo xtask build`, then inspect generated registries under
    `build/image/system/registry/...` if startup, desktop, or driver policy
    changed.
-7. Update this document and [README.md](../README.md) when path rules or
+7. Update this document and [Documentation Home](index.md) when path rules or
    ownership boundaries change.
 
 <a id="korean"></a>
@@ -207,4 +207,4 @@ source directories.
 6. `cargo xtask build`를 실행한 뒤 startup, desktop, driver 정책이 바뀌었다면
    `build/image/system/registry/...` 아래 generated registry를 확인합니다.
 7. 경로 규칙이나 ownership boundary가 바뀌면 이 문서와
-   [README.md](../README.md)를 같이 갱신합니다.
+   [문서 홈](index.md)을 같이 갱신합니다.
