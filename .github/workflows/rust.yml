@@ -10,13 +10,30 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  check:
 
     runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+    - name: Install Rust nightly
+      run: |
+        rustup toolchain install nightly --profile minimal
+        rustup default nightly
+        rustup component add rust-src
+        rustup target add x86_64-unknown-uefi
+        rustup target add x86_64-unknown-linux-gnu
+    - name: Check OS build
+      run: cargo xtask check
+    - name: Run host tests
+      run: >
+        cargo test
+        -p xtask
+        -p runtime-control
+        -p rustos-observability
+        -p storage-core
+        -p storage-fat
+        -p trace-loc-macro
+        -p boot-random
+        -p driver-abi
+        -p keyboard-core
