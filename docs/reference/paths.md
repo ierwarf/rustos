@@ -10,7 +10,7 @@
 | --- | --- |
 | `Cargo.toml` | Workspace manifest. |
 | `config/logging.toml` | Shared logging policy. |
-| `boot/` | Bootloader, prekernel, boot protocol. |
+| `boot/` | Boot protocol crate shared by the GRUB-loaded nucleus. |
 | `kernel/` | Kernel entry and subsystem crates. |
 | `services/` | Userspace system services. |
 | `apps/` | User/demo apps. |
@@ -22,7 +22,8 @@
 | `vendor/` | External firmware/prebuilt/module inputs. |
 | `build/artifacts/` | Build artifacts copied by stage. |
 | `build/image/` | QEMU boot volume root. |
-| `build/image/EFI/BOOT/BOOTX64.EFI` | Default UEFI entry. |
+| `build/image/EFI/BOOT/BOOTX64.EFI` | GRUB-generated default UEFI entry. |
+| `build/image/nucleus.elf.sig` | Detached GPG signature for `nucleus.elf`. |
 | `build/image/system/registry/` | Generated runtime/driver registries. |
 | `logs/debugcon.log` | Default debugcon output. |
 | `logs/qemu_interrupt.log` | QEMU interrupt trace when enabled. |
@@ -46,7 +47,7 @@
 | --- | --- |
 | `Cargo.toml` | workspace manifest |
 | `config/logging.toml` | shared logging policy |
-| `boot/` | bootloader, prekernel, boot protocol |
+| `boot/` | GRUB이 로드하는 nucleus와 공유하는 boot protocol crate |
 | `kernel/` | kernel entry와 subsystem crate |
 | `services/` | userspace system service |
 | `apps/` | user/demo app |
@@ -58,7 +59,8 @@
 | `vendor/` | external firmware/prebuilt/module input |
 | `build/artifacts/` | stage가 복사하는 build artifact |
 | `build/image/` | QEMU boot volume root |
-| `build/image/EFI/BOOT/BOOTX64.EFI` | 기본 UEFI entry |
+| `build/image/EFI/BOOT/BOOTX64.EFI` | GRUB이 생성한 기본 UEFI entry |
+| `build/image/nucleus.elf.sig` | `nucleus.elf` detached GPG signature |
 | `build/image/system/registry/` | generated runtime/driver registry |
 | `logs/debugcon.log` | 기본 debugcon output |
 | `logs/qemu_interrupt.log` | 활성화 시 QEMU interrupt trace |

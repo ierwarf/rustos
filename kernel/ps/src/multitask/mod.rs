@@ -52,8 +52,8 @@ pub use self::irq::{
     timer_interrupt_handler_addr, yield_now,
 };
 pub use self::spawn::{
-    init, restore_current_simd_state, save_current_simd_state, spawn_kernel_process,
-    spawn_user_process, spawn_user_process_with_parent, spawn_user_thread,
+    restore_current_simd_state, save_current_simd_state, spawn_kernel_process, spawn_user_process,
+    spawn_user_process_with_parent, spawn_user_thread, start,
 };
 
 const MAIN_THREAD_SLICE_MICROS: u64 = 1_000;
@@ -77,13 +77,13 @@ unsafe fn scheduler_ref() -> &'static Scheduler {
     unsafe { &*ptr::addr_of!(SCHEDULER) }
 }
 
-fn scheduler_bootstrap_ready() -> bool {
-    interrupts::without_interrupts(|| unsafe { scheduler_ref().bootstrap_context_ready() })
+fn scheduler_initialized() -> bool {
+    interrupts::without_interrupts(|| unsafe { scheduler_ref().initialized() })
 }
 
 #[allow(dead_code)]
 pub fn is_initialized() -> bool {
-    scheduler_bootstrap_ready()
+    scheduler_initialized()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +113,10 @@ pub struct RetainedCurrentUserAddressSpace {
     process: process_table::ProcessRef,
 }
 
+pub struct CurrentKernelStackScope {
+    previous: (u64, u64),
+}
+
 pub enum WaitChildResult {
     Exited { pid: u64, status: i32 },
     Pending,
@@ -134,6 +138,23 @@ impl RetainedCurrentUserProcessState {
 
     pub fn address_space(&self) -> &ProcessAddressSpace {
         self.process.state().address_space()
+    }
+}
+
+impl CurrentKernelStackScope {
+    pub fn enter(base: u64, top: u64) -> Option<Self> {
+        let previous = interrupts::without_interrupts(|| unsafe {
+            scheduler_mut().set_current_alternate_kernel_stack(base, top)
+        })?;
+        Some(Self { previous })
+    }
+}
+
+impl Drop for CurrentKernelStackScope {
+    fn drop(&mut self) {
+        interrupts::without_interrupts(|| unsafe {
+            scheduler_mut().restore_current_alternate_kernel_stack(self.previous);
+        });
     }
 }
 

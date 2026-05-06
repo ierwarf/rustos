@@ -1,9 +1,7 @@
 [workspace]
 
 members = [
-    "boot/bootloader",
-    "boot/bootloader/boot-protocol",
-    "boot/prekernel",
+    "boot/boot-protocol",
     "kernel/nucleus-core",
     "libs/boot-random",
     "libs/observability-client",

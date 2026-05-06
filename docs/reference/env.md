@@ -16,8 +16,15 @@
 | `CC` | `gcc` | C compiler. |
 | `MINGW_CC` | `x86_64-w64-mingw32-gcc` | Windows PE compiler. |
 | `QEMU_BIN` | `qemu-system-x86_64` | QEMU executable. |
-| `TARGET` | `x86_64-unknown-uefi` | UEFI target. |
 | `KERNEL_TARGET` | `x86_64-unknown-linux-gnu` | Kernel/userspace target. |
+| `GRUB_MKSTANDALONE` | `grub-mkstandalone` | GRUB standalone EFI builder. |
+| `GRUB_FILE` | `grub-file` | Multiboot2 artifact validator. |
+| `GPG` | `gpg` | GPG executable used for detached kernel signatures. |
+| `RUSTOS_GRUB_PUBKEY` | required for `build`/`build-efi` | Binary GPG public key file embedded into GRUB, produced with `gpg --export`. |
+| `RUSTOS_GRUB_SIGNING_KEY` | required for `build`/`build-efi` | GPG key id or fingerprint used to sign `nucleus.elf`. |
+| `RUSTOS_GPG_HOME` | empty | Optional GPG home for signing. |
+| `RUSTOS_GRUB_SBAT` | empty | Optional SBAT metadata file passed to `grub-mkstandalone`. |
+| `RUSTOS_GRUB_MODULES` | secure boot module set | Optional GRUB module list override. |
 | `BUILD_DIR` | `build` | Build output root. |
 | `IMAGE_DIR` | `build/image` | Staged image root. |
 | `OVMF_PATH` | `vendor/firmware/ovmf/OVMF.fd` | Firmware image. |
@@ -44,8 +51,15 @@ variables are parsed by `tools/xtask/src/qemu.rs`.
 | `CC` | `gcc` | C compiler |
 | `MINGW_CC` | `x86_64-w64-mingw32-gcc` | Windows PE compiler |
 | `QEMU_BIN` | `qemu-system-x86_64` | QEMU executable |
-| `TARGET` | `x86_64-unknown-uefi` | UEFI target |
 | `KERNEL_TARGET` | `x86_64-unknown-linux-gnu` | kernel/userspace target |
+| `GRUB_MKSTANDALONE` | `grub-mkstandalone` | GRUB standalone EFI builder |
+| `GRUB_FILE` | `grub-file` | Multiboot2 artifact validator |
+| `GPG` | `gpg` | detached kernel signature 생성용 GPG executable |
+| `RUSTOS_GRUB_PUBKEY` | `build`/`build-efi`에서 필수 | `gpg --export`로 만든 GRUB embed용 binary GPG public key file |
+| `RUSTOS_GRUB_SIGNING_KEY` | `build`/`build-efi`에서 필수 | `nucleus.elf` 서명에 사용할 GPG key id/fingerprint |
+| `RUSTOS_GPG_HOME` | empty | signing에 사용할 optional GPG home |
+| `RUSTOS_GRUB_SBAT` | empty | `grub-mkstandalone`에 넘길 optional SBAT metadata file |
+| `RUSTOS_GRUB_MODULES` | secure boot module set | optional GRUB module list override |
 | `BUILD_DIR` | `build` | build output root |
 | `IMAGE_DIR` | `build/image` | staged image root |
 | `OVMF_PATH` | `vendor/firmware/ovmf/OVMF.fd` | firmware image |

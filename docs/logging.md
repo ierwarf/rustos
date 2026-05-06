@@ -65,7 +65,7 @@ and `trace`.
 The canonical category list is defined in `libs/rustos-observability/src/lib.rs`
 and duplicated by the build helper for cfg generation.
 
-- `boot`: bootloader, prekernel, kernel boot sequencing
+- `boot`: boot manager and kernel boot sequencing
 - `panic`: panic and fatal crash reporting
 - `memory`: physical memory, paging, heap, VM
 - `sched`: scheduler and task switching
@@ -274,6 +274,12 @@ cargo xtask check
 
 ### Logging Hygiene
 
+- Before adding new log sites, first check whether the existing category and
+  level controls can expose the needed signal. Prefer temporarily raising a
+  category such as `sched = "debug"` over adding one-off output.
+- When new kernel log output is needed, make it a reusable diagnostic path with
+  a stable category, level, and structured fields. Avoid local raw debugcon
+  writes unless the code runs before structured logging is available.
 - Prefer `debug` or `trace` for loops, interrupts, syscalls, scheduler ticks,
   or packet/block paths.
 - Use `info` for lifecycle events: service start, device ready, mount complete,
@@ -348,7 +354,7 @@ threshold는 inclusive입니다. 예를 들어 `storage = "warn"`은 storage의
 canonical category list는 `libs/rustos-observability/src/lib.rs`에 정의되어
 있고, cfg 생성을 위해 build helper에도 같은 목록이 있습니다.
 
-- `boot`: bootloader, prekernel, kernel boot sequencing
+- `boot`: boot manager and kernel boot sequencing
 - `panic`: panic과 fatal crash reporting
 - `memory`: physical memory, paging, heap, VM
 - `sched`: scheduler와 task switching
@@ -557,6 +563,12 @@ cargo xtask check
 
 ### Logging Hygiene
 
+- 새 log site를 추가하기 전에 기존 category와 level 조정만으로 필요한 signal을
+  볼 수 있는지 먼저 확인하세요. 일회성 출력을 추가하기보다 `sched = "debug"`처럼
+  category level을 임시로 올리는 방식을 우선합니다.
+- kernel log output을 새로 넣어야 한다면 안정적인 category, level, structured
+  field를 가진 재사용 가능한 diagnostic path로 만드세요. structured logging이
+  준비되기 전 경로가 아니라면 local raw debugcon write는 피하세요.
 - loop, interrupt, syscall, scheduler tick, packet/block path에는 `debug` 또는
   `trace`를 선호하세요.
 - service start, device ready, mount complete, UI ready 같은 lifecycle

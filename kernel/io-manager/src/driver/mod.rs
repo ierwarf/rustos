@@ -454,6 +454,9 @@ fn loadable_candidate_provider_active(candidate: registry::LoadableDriverCandida
     let Some(group) = candidate.provider_group else {
         return false;
     };
+    if group == "display-primary" {
+        return crate::io::gui::display_info().is_some();
+    }
     registry::loadable_provider_group_loaded(group)
 }
 
@@ -473,7 +476,8 @@ fn loadable_candidate_alias_matches(candidate: registry::LoadableDriverCandidate
 
 fn device_alias_present(alias: &str, class: DriverClass, bus: DriverBus) -> bool {
     if alias == "platform:bootfb" {
-        return crate::io::gui::display_info().is_some();
+        return crate::storage::boot_volume::boot_framebuffer_info()
+            .is_some_and(|framebuffer| framebuffer.validate().is_ok());
     }
 
     if alias.starts_with("pci:") {

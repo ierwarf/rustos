@@ -6,6 +6,8 @@
 #[cfg(all(not(test), rustos_boot_image))]
 use core::alloc::Layout;
 #[cfg(all(not(test), rustos_boot_image))]
+use core::arch::global_asm;
+#[cfg(all(not(test), rustos_boot_image))]
 use core::cell::UnsafeCell;
 
 #[cfg(all(not(test), rustos_boot_image))]
@@ -22,6 +24,12 @@ use nucleus_core::debug;
 #[cfg(all(not(test), rustos_boot_image))]
 #[global_allocator]
 static KERNEL_ALLOCATOR: mm_api::KernelAllocator = mm_api::KernelAllocator;
+
+#[cfg(all(not(test), rustos_boot_image))]
+global_asm!(
+    include_str!("../nucleus-core/src/multiboot2_entry.S"),
+    options(att_syntax)
+);
 
 #[cfg(all(not(test), rustos_boot_image))]
 const BOOTSTRAP_STACK_SIZE: usize = 2 * 1024 * 1024;
@@ -62,7 +70,13 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
 
 #[cfg(all(not(test), rustos_boot_image))]
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(boot_info_ptr: *const BootInfo) -> ! {
+pub extern "C" fn multiboot2_entry64(magic: u32, mbi_addr: u32) -> ! {
+    let boot_info_ptr = nucleus_core::multiboot2::build_boot_info(magic, mbi_addr);
+    kernel_start_from_boot_info(boot_info_ptr)
+}
+
+#[cfg(all(not(test), rustos_boot_image))]
+fn kernel_start_from_boot_info(boot_info_ptr: *const BootInfo) -> ! {
     // Do not inherit interrupt state from firmware/bootloader.
     // The kernel enables interrupts only after the scheduler and handlers are ready.
     hal_api::disable_interrupts();
@@ -88,7 +102,7 @@ pub extern "C" fn _start(boot_info_ptr: *const BootInfo) -> ! {
 extern "C" fn kernel_main_high(boot_info_ptr: *const BootInfo) -> ! {
     let bootstrap_stack_top = {
         let base = BOOTSTRAP_STACK.0.get() as *const BootstrapStack as u64;
-        mm_api::higher_half_addr(base) + BOOTSTRAP_STACK_SIZE as u64
+        base + BOOTSTRAP_STACK_SIZE as u64
     };
     unsafe {
         hal_api::call_with_stack(

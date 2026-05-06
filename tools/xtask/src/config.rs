@@ -15,16 +15,20 @@ pub(crate) struct Config {
     pub(crate) mingw_cc: OsString,
     pub(crate) objdump: OsString,
     pub(crate) qemu_bin: OsString,
-    pub(crate) target: String,
+    pub(crate) grub_mkstandalone: OsString,
+    pub(crate) grub_file: OsString,
+    pub(crate) gpg: OsString,
     pub(crate) kernel_target: String,
-    pub(crate) bootloader_package: String,
     pub(crate) nucleus_package: String,
-    pub(crate) prekernel_package: String,
     pub(crate) user_elf_package: String,
     pub(crate) user_elf_linkage: String,
     pub(crate) kernel_cargo_zflags: Vec<String>,
-    pub(crate) prekernel_rustc_args: Vec<String>,
     pub(crate) nucleus_rustc_args: Vec<String>,
+    pub(crate) rustos_grub_pubkey: Option<PathBuf>,
+    pub(crate) rustos_grub_signing_key: Option<String>,
+    pub(crate) rustos_gpg_home: Option<PathBuf>,
+    pub(crate) rustos_grub_sbat: Option<PathBuf>,
+    pub(crate) rustos_grub_modules: Option<String>,
     pub(crate) build_dir: PathBuf,
     pub(crate) artifact_dir: PathBuf,
     pub(crate) logs_dir: PathBuf,
@@ -52,17 +56,16 @@ impl Config {
             env_os("MINGW_CC").unwrap_or_else(|| OsString::from("x86_64-w64-mingw32-gcc"));
         let objdump = env_os("OBJDUMP").unwrap_or_else(|| OsString::from("objdump"));
         let qemu_bin = env_os("QEMU_BIN").unwrap_or_else(|| OsString::from("qemu-system-x86_64"));
+        let grub_mkstandalone =
+            env_os("GRUB_MKSTANDALONE").unwrap_or_else(|| OsString::from("grub-mkstandalone"));
+        let grub_file = env_os("GRUB_FILE").unwrap_or_else(|| OsString::from("grub-file"));
+        let gpg = env_os("GPG").unwrap_or_else(|| OsString::from("gpg"));
 
-        let target = env_string("TARGET").unwrap_or_else(|| String::from("x86_64-unknown-uefi"));
         let kernel_target =
             env_string("KERNEL_TARGET").unwrap_or_else(|| String::from("x86_64-unknown-linux-gnu"));
-        let bootloader_package =
-            env_string("BOOTLOADER_PACKAGE").unwrap_or_else(|| String::from("bootloader"));
         let nucleus_package = env_string("NUCLEUS_PACKAGE")
             .or_else(|| env_string("KERNEL_PACKAGE"))
             .unwrap_or_else(|| String::from("nucleus"));
-        let prekernel_package =
-            env_string("PREKERNEL_PACKAGE").unwrap_or_else(|| String::from("prekernel"));
         let user_elf_package =
             env_string("USER_ELF_PACKAGE").unwrap_or_else(|| String::from("uiserver"));
         let user_elf_linkage =
@@ -82,21 +85,21 @@ impl Config {
                     "-Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem",
                 )
             });
-        let prekernel_rustc_args = env_string("PREKERNEL_RUSTC_ARGS")
-            .map(|value| split_whitespace_owned(&value))
-            .unwrap_or_else(|| {
-                split_whitespace_owned(
-                    "-C no-redzone -C link-arg=-nostartfiles -C link-arg=-no-pie -C link-arg=-static -C link-arg=-Wl,--image-base=0x100000",
-                )
-            });
         let nucleus_rustc_args = env_string("NUCLEUS_RUSTC_ARGS")
             .or_else(|| env_string("KERNEL_RUSTC_ARGS"))
             .map(|value| split_whitespace_owned(&value))
             .unwrap_or_else(|| {
-                split_whitespace_owned(
-                    "-C no-redzone -C relocation-model=pic -C link-arg=-nostartfiles -C link-arg=-shared -C link-arg=-static -C link-arg=-Wl,-Bsymbolic -C link-arg=-Wl,-e,_start",
-                )
+                let linker_script = root_dir.join("kernel/linker-multiboot2.ld");
+                split_whitespace_owned(&format!(
+                    "-C no-redzone -C relocation-model=static -C link-arg=-nostartfiles -C link-arg=-no-pie -C link-arg=-static -C link-arg=-Wl,-T,{} -C link-arg=-Wl,-e,_start",
+                    linker_script.display()
+                ))
             });
+        let rustos_grub_pubkey = env_path("RUSTOS_GRUB_PUBKEY");
+        let rustos_grub_signing_key = env_string("RUSTOS_GRUB_SIGNING_KEY");
+        let rustos_gpg_home = env_path("RUSTOS_GPG_HOME");
+        let rustos_grub_sbat = env_path("RUSTOS_GRUB_SBAT");
+        let rustos_grub_modules = env_string("RUSTOS_GRUB_MODULES");
         Ok(Self {
             image_asset_overlay_dir: env_path("IMAGE_ASSET_OVERLAY_DIR")
                 .unwrap_or_else(|| assets_dir.join("image")),
@@ -136,16 +139,20 @@ impl Config {
             mingw_cc,
             objdump,
             qemu_bin,
-            target,
+            grub_mkstandalone,
+            grub_file,
+            gpg,
             kernel_target,
-            bootloader_package,
             nucleus_package,
-            prekernel_package,
             user_elf_package,
             user_elf_linkage,
             kernel_cargo_zflags,
-            prekernel_rustc_args,
             nucleus_rustc_args,
+            rustos_grub_pubkey,
+            rustos_grub_signing_key,
+            rustos_gpg_home,
+            rustos_grub_sbat,
+            rustos_grub_modules,
             build_dir,
             artifact_dir,
             logs_dir,
@@ -157,26 +164,8 @@ impl Config {
         self.image_dir.join("EFI/BOOT/BOOTX64.EFI")
     }
 
-    pub(crate) fn bootloader_source_efi_path(&self) -> PathBuf {
-        self.cargo_target_dir.join(format!(
-            "{}/release/{}.efi",
-            self.target, self.bootloader_package
-        ))
-    }
-
     pub(crate) fn artifact_boot_efi_path(&self) -> PathBuf {
         self.artifact_dir.join("EFI/BOOT/BOOTX64.EFI")
-    }
-
-    pub(crate) fn prekernel_source_path(&self) -> PathBuf {
-        self.cargo_target_dir.join(format!(
-            "{}/release/{}",
-            self.kernel_target, self.prekernel_package
-        ))
-    }
-
-    pub(crate) fn artifact_prekernel_elf_path(&self) -> PathBuf {
-        self.artifact_dir.join("prekernel.elf")
     }
 
     pub(crate) fn nucleus_source_path(&self) -> PathBuf {
@@ -188,6 +177,10 @@ impl Config {
 
     pub(crate) fn artifact_nucleus_elf_path(&self) -> PathBuf {
         self.artifact_dir.join("nucleus.elf")
+    }
+
+    pub(crate) fn artifact_nucleus_signature_path(&self) -> PathBuf {
+        self.artifact_dir.join("nucleus.elf.sig")
     }
 
     pub(crate) fn amdgpu_image_firmware_dir(&self) -> PathBuf {

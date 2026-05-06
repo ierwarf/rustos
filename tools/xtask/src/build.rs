@@ -26,9 +26,8 @@ pub(crate) fn build(config: &Config) -> Result<()> {
         .package_root
         .clone();
     validate_winsys_export_contracts(winsys_root.as_path())?;
-    build_efi(config)?;
-    build_prekernel(config)?;
     build_nucleus(config)?;
+    build_efi(config)?;
     build_manifests_matching(config, &manifests, |manifest| {
         matches!(
             manifest.build.builder,
@@ -59,20 +58,9 @@ pub(crate) fn check(config: &Config) -> Result<()> {
     ensure_targets(config)?;
     let sh = shell()?;
     let cargo = &config.cargo;
-    let workspace_manifest = &config.workspace_manifest;
 
-    let package = &config.bootloader_package;
-    let target = &config.target;
-    cmd!(
-        sh,
-        "{cargo} check --manifest-path {workspace_manifest} -p {package} --target {target}"
-    )
-    .env("CARGO_TARGET_DIR", &config.cargo_target_dir)
-    .env("RUSTFLAGS", kernel_rustflags_env())
-    .run()?;
-
-    run_cargo_kernel_check(config, &config.prekernel_package)?;
     run_cargo_kernel_check(config, &config.nucleus_package)?;
+    check_nucleus_multiboot2_if_present(config)?;
 
     let package = &config.user_elf_package;
     let target = &config.kernel_target;
@@ -82,7 +70,7 @@ pub(crate) fn check(config: &Config) -> Result<()> {
 
     cmd!(
         sh,
-        "{cargo} check --workspace --exclude bootloader --exclude prekernel --exclude nucleus"
+        "{cargo} check --workspace --exclude nucleus"
     )
     .env("CARGO_TARGET_DIR", &config.cargo_target_dir)
     .run()?;
@@ -107,47 +95,126 @@ pub(crate) fn clean(config: &Config) -> Result<()> {
 pub(crate) fn ensure_targets(config: &Config) -> Result<()> {
     let sh = shell()?;
     let rustup = &config.rustup;
-    let target = &config.target;
-    cmd!(sh, "{rustup} target add {target}").run()?;
     let target = &config.kernel_target;
     cmd!(sh, "{rustup} target add {target}").run()?;
     Ok(())
 }
 
 pub(crate) fn build_efi(config: &Config) -> Result<()> {
-    let sh = shell()?;
-    let cargo = &config.cargo;
-    let manifest = &config.workspace_manifest;
-    let package = &config.bootloader_package;
-    let target = &config.target;
-    cmd!(
-        sh,
-        "{cargo} build --manifest-path {manifest} -p {package} --target {target} --release"
-    )
-    .env("CARGO_TARGET_DIR", &config.cargo_target_dir)
-    .env("RUSTFLAGS", kernel_rustflags_env())
-    .run()?;
+    let pubkey = config
+        .rustos_grub_pubkey
+        .as_ref()
+        .ok_or("RUSTOS_GRUB_PUBKEY is required to build the GRUB EFI boot manager")?;
+    if !pubkey.is_file() {
+        return Err(format!("RUSTOS_GRUB_PUBKEY is not a file: {}", pubkey.display()).into());
+    }
+
+    sign_nucleus(config)?;
+
     let artifact = config.artifact_boot_efi_path();
     remove_file_if_exists(&artifact)?;
-    copy_with_parent(&config.bootloader_source_efi_path(), &artifact)
-}
+    let parent = artifact
+        .parent()
+        .ok_or_else(|| format!("boot artifact has no parent: {}", artifact.display()))?;
+    fs::create_dir_all(parent)?;
 
-pub(crate) fn build_prekernel(config: &Config) -> Result<()> {
-    run_cargo_kernel_rustc(
-        config,
-        &config.prekernel_package,
-        &config.prekernel_rustc_args,
+    let temp_dir = create_temp_dir("rustos-grub")?;
+    let grub_cfg = temp_dir.join("grub.cfg");
+    fs::write(
+        &grub_cfg,
+        "set check_signatures=enforce\nload_video\nset gfxmode=auto\nset gfxpayload=keep\nterminal_output gfxterm\nsearch --file --set=root /nucleus.elf\nmultiboot2 ($root)/nucleus.elf\nboot\n",
     )?;
-    let artifact = config.artifact_prekernel_elf_path();
-    copy_with_parent(&config.prekernel_source_path(), &artifact)?;
-    strip_elf_artifact_if_available(&artifact)
+    let grub_cfg_signature = temp_dir.join("grub.cfg.sig");
+    sign_detached(config, &grub_cfg, &grub_cfg_signature)?;
+
+    let mut command = Command::new(&config.grub_mkstandalone);
+    command
+        .arg("-O")
+        .arg("x86_64-efi")
+        .arg("-o")
+        .arg(&artifact)
+        .arg("--pubkey")
+        .arg(pubkey)
+        .arg("--modules")
+        .arg("memdisk tar normal pgp gcry_rsa gcry_sha256 gcry_sha512 fat part_msdos part_gpt search search_fs_file ls multiboot2 all_video video video_fb efi_gop efi_uga gfxterm")
+        .arg("--install-modules")
+        .arg(config.rustos_grub_modules.as_deref().unwrap_or(
+            "normal multiboot2 part_msdos part_gpt fat search search_fs_file ls all_video video video_fb efi_gop efi_uga gfxterm gcry_rsa gcry_sha256 gcry_sha512 pgp memdisk tar",
+        ))
+        .arg(format!("/boot/grub/grub.cfg={}", grub_cfg.display()))
+        .arg(format!(
+            "/boot/grub/grub.cfg.sig={}",
+            grub_cfg_signature.display()
+        ));
+    if let Some(sbat) = config.rustos_grub_sbat.as_ref() {
+        command.arg("--sbat").arg(sbat);
+    }
+    run_command(&mut command)
 }
 
 pub(crate) fn build_nucleus(config: &Config) -> Result<()> {
     run_cargo_kernel_rustc(config, &config.nucleus_package, &config.nucleus_rustc_args)?;
     let artifact = config.artifact_nucleus_elf_path();
     copy_with_parent(&config.nucleus_source_path(), &artifact)?;
-    strip_elf_artifact_if_available(&artifact)
+    strip_elf_artifact_if_available(&artifact)?;
+    check_nucleus_multiboot2(config)
+}
+
+fn check_nucleus_multiboot2_if_present(config: &Config) -> Result<()> {
+    if config.artifact_nucleus_elf_path().is_file() {
+        check_nucleus_multiboot2(config)?;
+    }
+    Ok(())
+}
+
+fn check_nucleus_multiboot2(config: &Config) -> Result<()> {
+    let artifact = config.artifact_nucleus_elf_path();
+    let status = Command::new(&config.grub_file)
+        .arg("--is-x86-multiboot2")
+        .arg(&artifact)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "nucleus artifact is not Multiboot2-compliant: {}",
+            artifact.display()
+        )
+        .into())
+    }
+}
+
+fn sign_nucleus(config: &Config) -> Result<()> {
+    let nucleus = config.artifact_nucleus_elf_path();
+    if !nucleus.is_file() {
+        return Err(format!("missing nucleus artifact: {}", nucleus.display()).into());
+    }
+    sign_detached(config, &nucleus, &config.artifact_nucleus_signature_path())
+}
+
+fn sign_detached(config: &Config, input: &Path, signature: &Path) -> Result<()> {
+    let signing_key = config
+        .rustos_grub_signing_key
+        .as_deref()
+        .ok_or("RUSTOS_GRUB_SIGNING_KEY is required to sign GRUB boot inputs")?;
+    remove_file_if_exists(signature)?;
+
+    let mut command = Command::new(&config.gpg);
+    if let Some(home) = config.rustos_gpg_home.as_ref() {
+        command.arg("--homedir").arg(home);
+    }
+    command
+        .arg("--batch")
+        .arg("--yes")
+        .arg("--pinentry-mode")
+        .arg("loopback")
+        .arg("--local-user")
+        .arg(signing_key)
+        .arg("--detach-sign")
+        .arg("--output")
+        .arg(signature)
+        .arg(input);
+    run_command(&mut command)
 }
 
 pub(crate) fn build_user(config: &Config) -> Result<()> {
@@ -266,7 +333,6 @@ fn build_manifests_matching(
 fn build_manifest(config: &Config, manifest: &PackageManifest) -> Result<()> {
     match manifest.build.builder {
         BuilderKind::BootloaderUefi => build_efi(config),
-        BuilderKind::PrekernelRustc => build_prekernel(config),
         BuilderKind::KernelRustc => build_nucleus(config),
         BuilderKind::CargoKernelBinary => build_cargo_kernel_binary(config, manifest),
         BuilderKind::MingwCExe => build_mingw_c_exe(config, manifest),

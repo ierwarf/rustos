@@ -11,10 +11,10 @@ unsafe extern "C" fn compat_null() -> *mut c_void {
 unsafe extern "C" fn register_virtio_driver(driver: *mut c_void) -> i32 {
     crate::debug::info!(
         driver,
-        "linux compat: virtio register driver ptr={:#x} class=network status=registered",
+        "linux compat: virtio register driver ptr={:#x} status=registered-no-bus-binding",
         driver as usize
     );
-    crate::network::note_virtio_net_driver_registered();
+    let _ = crate::driver::virtio_gpu::try_enable_primary_display();
     0
 }
 

@@ -12,11 +12,10 @@ Ubuntu/Debian baseline:
 
 ```bash
 sudo apt update
-sudo apt install -y rustup gcc nasm qemu-system-x86 ovmf mingw-w64
+sudo apt install -y rustup gcc nasm qemu-system-x86 ovmf mingw-w64 grub-efi-amd64-bin grub-common gnupg
 
 rustup default nightly
 rustup component add rust-src llvm-tools-preview
-rustup target add x86_64-unknown-uefi
 rustup target add x86_64-unknown-linux-gnu
 ```
 
@@ -31,13 +30,17 @@ Use `OVMF_PATH=/path/to/OVMF.fd` to override it.
 ### Build
 
 ```bash
+export RUSTOS_GRUB_PUBKEY=/path/to/grub-public-key.gpg # from: gpg --export <key>
+export RUSTOS_GRUB_SIGNING_KEY=<gpg-key-id-or-fingerprint>
 cargo xtask check
 cargo xtask build
 ```
 
 `cargo xtask build` validates layering, builds boot/user/kernel artifacts,
 builds modules and compatibility assets, stages the boot image, and writes
-runtime registries.
+runtime registries. The default boot manager build signs `nucleus.elf` with GPG
+and embeds `RUSTOS_GRUB_PUBKEY` into the generated GRUB EFI binary; the private
+signing key must stay outside the repository.
 
 ### Run
 
@@ -86,11 +89,10 @@ Ubuntu/Debian 기준:
 
 ```bash
 sudo apt update
-sudo apt install -y rustup gcc nasm qemu-system-x86 ovmf mingw-w64
+sudo apt install -y rustup gcc nasm qemu-system-x86 ovmf mingw-w64 grub-efi-amd64-bin grub-common gnupg
 
 rustup default nightly
 rustup component add rust-src llvm-tools-preview
-rustup target add x86_64-unknown-uefi
 rustup target add x86_64-unknown-linux-gnu
 ```
 
@@ -105,12 +107,17 @@ vendor/firmware/ovmf/OVMF.fd
 ### 빌드
 
 ```bash
+export RUSTOS_GRUB_PUBKEY=/path/to/grub-public-key.gpg # gpg --export <key> 산출물
+export RUSTOS_GRUB_SIGNING_KEY=<gpg-key-id-or-fingerprint>
 cargo xtask check
 cargo xtask build
 ```
 
 `cargo xtask build`는 layering 검사, boot/user/kernel artifact 빌드, module과
 compatibility asset 빌드, boot image staging, runtime registry 생성을 수행합니다.
+기본 boot manager build는 GPG로 `nucleus.elf`를 서명하고
+`RUSTOS_GRUB_PUBKEY`를 generated GRUB EFI binary에 embed합니다. private signing
+key는 repository 밖에 둡니다.
 
 ### 실행
 

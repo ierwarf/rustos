@@ -74,6 +74,8 @@ pub mod cpu {
 }
 
 pub mod interrupts {
+    use kernel_lowlevel::interrupts::SavedContext;
+
     use crate::hooks::{
         HeartbeatHooks, InterruptHooks, TaskHooks,
         register_heartbeat_hooks as install_heartbeat_hooks,
@@ -106,6 +108,15 @@ pub mod interrupts {
     pub fn register_heartbeat_hooks(hooks: HeartbeatHooks) {
         install_heartbeat_hooks(hooks);
     }
+
+    pub unsafe fn restore_kernel_saved_context(context: *mut SavedContext) -> ! {
+        unsafe extern "C" {
+            #[link_name = "restore_kernel_saved_context"]
+            fn restore_kernel_saved_context_raw(context: *mut SavedContext) -> !;
+        }
+
+        unsafe { restore_kernel_saved_context_raw(context) }
+    }
 }
 
 pub mod time {
@@ -123,7 +134,7 @@ pub use boot::{call_with_stack, enter_higher_half, init_acpi, init_gdt, init_idt
 pub use cpu::{current_rip, init_simd, simd_mode_name};
 pub use interrupts::{
     disable_interrupts, init_pic, register_heartbeat_hooks, register_interrupt_hooks,
-    register_task_hooks,
+    register_task_hooks, restore_kernel_saved_context,
 };
 pub use time::init_rtc;
 

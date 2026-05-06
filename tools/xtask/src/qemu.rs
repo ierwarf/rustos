@@ -277,18 +277,12 @@ set architecture i386:x86-64
 file {}
 target remote :1234
 
-# Prekernel is linked at a fixed image base by xtask.
-add-symbol-file {} 0x100000
-
 echo Connected to RustOS debug target.\n
 echo Nucleus symbols: {}\n
-echo Prekernel symbols: {}\n
 echo Module symbols can be loaded from /dev/debug0 snapshots once the guest is up.\n
 ",
         config.artifact_nucleus_elf_path().display(),
-        config.artifact_prekernel_elf_path().display(),
         config.artifact_nucleus_elf_path().display(),
-        config.artifact_prekernel_elf_path().display(),
     );
     fs::write(&script_path, script)?;
     println!("gdb helper written to {}", script_path.display());
@@ -307,7 +301,7 @@ fn ensure_qemu_prerequisites(config: &Config) -> Result<()> {
     let boot_efi = config.boot_efi_path();
     if !boot_efi.is_file() {
         return Err(format!(
-            "missing staged bootloader image: {} (run `cargo xtask build` first)",
+            "missing staged boot manager image: {} (run `cargo xtask build` first)",
             boot_efi.display()
         )
         .into());

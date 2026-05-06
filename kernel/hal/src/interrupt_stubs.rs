@@ -225,6 +225,13 @@ global_asm!(
 
     .size software_schedule_interrupt_handler, . - software_schedule_interrupt_handler
 
+    .global restore_kernel_saved_context
+    .type restore_kernel_saved_context, @function
+    restore_kernel_saved_context:
+        mov rsp, rdi
+        RESTORE_CONTEXT_AND_IRET 0x188
+    .size restore_kernel_saved_context, . - restore_kernel_saved_context
+
     .global software_schedule_trap
     .type software_schedule_trap, @function
     software_schedule_trap:

@@ -4,9 +4,9 @@
 [![Docs](https://img.shields.io/badge/docs-mdBook-informational)](https://ierwarf.github.io/rustos/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-RustOS is an experimental Rust-first operating system workspace with a UEFI
-boot chain, layered kernel crates, userspace services, a framebuffer desktop
-UI, compatibility work, and manifest-driven image staging.
+RustOS is an experimental Rust-first operating system workspace with a GRUB EFI
+boot manager path, layered kernel crates, userspace services, a framebuffer
+desktop UI, compatibility work, and manifest-driven image staging.
 
 ![RustOS desktop UI](docs/assets/debug.png)
 
@@ -38,7 +38,7 @@ Current status:
 
 | Area | Status |
 | --- | --- |
-| UEFI boot chain | Present |
+| GRUB EFI boot manager | Present |
 | Layered kernel crates | Present |
 | Manifest-driven image staging | Present |
 | Userspace services | Present |
@@ -54,8 +54,8 @@ cargo xtask build
 cargo xtask run
 ```
 
-The staged boot volume is `build/image`, and the default UEFI entry is
-`build/image/EFI/BOOT/BOOTX64.EFI`.
+The staged boot volume is `build/image`, and the default UEFI entry is the
+GRUB-generated `build/image/EFI/BOOT/BOOTX64.EFI`.
 
 <a id="korean"></a>
 
@@ -83,7 +83,7 @@ cargo xtask build -> build/image -> cargo xtask run -> QEMU boot
 
 | 영역 | 상태 |
 | --- | --- |
-| UEFI boot chain | 구현됨 |
+| GRUB EFI boot manager | 구현됨 |
 | layered kernel crates | 구현됨 |
 | manifest 기반 image staging | 구현됨 |
 | userspace services | 구현됨 |
@@ -99,5 +99,5 @@ cargo xtask build
 cargo xtask run
 ```
 
-staged boot volume은 `build/image`이며, 기본 UEFI entry는
+staged boot volume은 `build/image`이며, 기본 UEFI entry는 GRUB이 생성한
 `build/image/EFI/BOOT/BOOTX64.EFI`입니다.

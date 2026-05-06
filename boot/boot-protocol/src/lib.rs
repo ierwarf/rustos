@@ -3,7 +3,7 @@
 use core::mem::size_of;
 
 pub const BOOT_INFO_MAGIC: u64 = 0x5255_5354_4F53_4749; // "RUSTOSGI"
-pub const BOOT_INFO_VERSION: u32 = 14;
+pub const BOOT_INFO_VERSION: u32 = 15;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,7 +30,38 @@ pub struct FramebufferInfo {
 }
 
 impl FramebufferInfo {
+    pub const fn empty() -> Self {
+        Self {
+            addr: 0,
+            size: 0,
+            back_buffer_addr: 0,
+            back_buffer_size: 0,
+            width: 0,
+            height: 0,
+            stride: 0,
+            pixel_format: BootPixelFormat::Unknown,
+            bytes_per_pixel: 0,
+            _reserved: [0; 3],
+        }
+    }
+
+    pub fn is_present(&self) -> bool {
+        self.addr != 0
+            || self.size != 0
+            || self.back_buffer_addr != 0
+            || self.back_buffer_size != 0
+            || self.width != 0
+            || self.height != 0
+            || self.stride != 0
+            || !matches!(self.pixel_format, BootPixelFormat::Unknown)
+            || self.bytes_per_pixel != 0
+    }
+
     pub fn validate(&self) -> Result<(), BootInfoValidationError> {
+        if !self.is_present() {
+            return Ok(());
+        }
+
         if self.addr == 0 || self.size == 0 {
             return Err(BootInfoValidationError::InvalidFramebuffer);
         }
@@ -399,5 +430,25 @@ mod tests {
         let mut info = valid_boot_info();
         info.boot_volume = BootVolumeIdentity::empty();
         assert!(info.validate_staged().is_ok());
+    }
+
+    #[test]
+    fn accepts_absent_framebuffer() {
+        let mut info = valid_boot_info();
+        info.framebuffer = FramebufferInfo::empty();
+        assert!(info.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_partial_absent_framebuffer() {
+        let mut info = valid_boot_info();
+        info.framebuffer = FramebufferInfo {
+            addr: 0x2000,
+            ..FramebufferInfo::empty()
+        };
+        assert_eq!(
+            info.validate(),
+            Err(BootInfoValidationError::InvalidFramebuffer)
+        );
     }
 }

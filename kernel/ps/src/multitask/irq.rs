@@ -2,7 +2,7 @@ use x86_64::instructions::interrupts;
 
 use super::{
     DEFERRED_RESCHEDULE_REQUESTED, context::SavedContext, scheduler::Scheduler,
-    scheduler_bootstrap_ready, scheduler_mut,
+    scheduler_initialized, scheduler_mut,
 };
 
 pub fn timer_interrupt_handler_addr() -> u64 {
@@ -26,7 +26,7 @@ pub(crate) fn install_interrupt_dispatch_callbacks() {
 }
 
 extern "C" fn timer_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut SavedContext {
-    if !scheduler_bootstrap_ready() {
+    if !scheduler_initialized() {
         crate::arch::pic::send_eoi(crate::arch::pic::PIC_1_OFFSET);
         return context_ptr;
     }
@@ -52,7 +52,7 @@ extern "C" fn timer_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut S
 }
 
 extern "C" fn rtc_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut SavedContext {
-    if !scheduler_bootstrap_ready() {
+    if !scheduler_initialized() {
         crate::arch::rtc::on_interrupt();
         crate::arch::pic::send_eoi(crate::arch::pic::PIC_2_OFFSET);
         return context_ptr;
@@ -84,20 +84,14 @@ fn timer_interrupted_kernel_frame(context_ptr: *const SavedContext, scheduler: &
     if context.cs == crate::arch::gdt::user_code_selector().0 as u64 {
         return false;
     }
-    if scheduler.current_task_is_bootstrap_task() {
-        return false;
-    }
     if scheduler.current_task_is_retired() || scheduler.current_task_is_blocked() {
         return false;
     }
-    if scheduler.current_task_is_kernel_process() {
-        return false;
-    }
-
     if scheduler.current_task_is_user_task() {
         DEFERRED_RESCHEDULE_REQUESTED.store(1, core::sync::atomic::Ordering::Release);
+        return true;
     }
-    true
+    false
 }
 
 pub fn reschedule_if_requested() {
@@ -117,7 +111,7 @@ pub(crate) fn request_deferred_reschedule() {
 extern "C" fn software_schedule_interrupt_dispatch(
     context_ptr: *mut SavedContext,
 ) -> *mut SavedContext {
-    if !scheduler_bootstrap_ready() {
+    if !scheduler_initialized() {
         return context_ptr;
     }
 

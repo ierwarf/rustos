@@ -1,7 +1,7 @@
 pub use crate::multitask::{
-    CurrentUserSnapshot, DEFAULT_USER_TASK_WEIGHT_MICROS, RetainedCurrentUserAddressSpace,
-    RetainedCurrentUserProcessState, SpawnTaskError, Thread, UserFaultDisposition, UserStackState,
-    UserTaskBootstrap, UserTaskRegisters, WaitChildResult,
+    CurrentKernelStackScope, CurrentUserSnapshot, DEFAULT_USER_TASK_WEIGHT_MICROS,
+    RetainedCurrentUserAddressSpace, RetainedCurrentUserProcessState, SpawnTaskError, Thread,
+    UserFaultDisposition, UserStackState, UserTaskBootstrap, UserTaskRegisters, WaitChildResult,
 };
 pub use crate::multitask::{
     block_current_user_task, current_last_error, current_linux_thread_state,
@@ -82,8 +82,8 @@ pub mod sysops {
 }
 
 pub mod boot {
-    pub fn init() {
-        crate::multitask::init();
+    pub fn start(entry: fn(u64)) -> ! {
+        crate::multitask::start(entry)
     }
 
     pub fn is_initialized() -> bool {
@@ -259,7 +259,7 @@ pub mod wait {
     }
 }
 
-pub use boot::{init, is_initialized, service_deferred_work};
+pub use boot::{is_initialized, service_deferred_work, start};
 pub use fault::{halt_current_retired_task, retire_current_user_task_due_to_fault};
 pub use process::{spawn_kernel_process, spawn_user_process};
 pub use snapshot::{

@@ -9,6 +9,7 @@ static VIRTIO_NET_DRIVER_REGISTERED: AtomicBool = AtomicBool::new(false);
 static NETDEV_REGISTERED: AtomicBool = AtomicBool::new(false);
 static LINK_UP: AtomicBool = AtomicBool::new(false);
 
+#[allow(dead_code)]
 pub(crate) fn note_virtio_net_driver_registered() {
     VIRTIO_NET_DRIVER_REGISTERED.store(true, Ordering::Release);
     crate::debug::info!(driver, "virtio_net driver registered");

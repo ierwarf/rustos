@@ -46,8 +46,7 @@ console_hosted = false
 
 | `builder` | Purpose |
 | --- | --- |
-| `bootloader-uefi` | UEFI bootloader build. |
-| `prekernel-rustc` | Prekernel artifact build. |
+| `bootloader-uefi` | Compatibility alias for GRUB EFI boot manager generation. |
 | `kernel-rustc` | Kernel/nucleus artifact build. |
 | `cargo-kernel-binary` | Rust userspace service/app ELF. |
 | `mingw-c-exe` | Windows PE executable demo. |
@@ -141,8 +140,7 @@ console_hosted = false
 
 | `builder` | Purpose |
 | --- | --- |
-| `bootloader-uefi` | UEFI bootloader build |
-| `prekernel-rustc` | prekernel artifact build |
+| `bootloader-uefi` | GRUB EFI boot manager 생성용 compatibility alias |
 | `kernel-rustc` | kernel/nucleus artifact build |
 | `cargo-kernel-binary` | Rust userspace service/app ELF |
 | `mingw-c-exe` | Windows PE executable demo |

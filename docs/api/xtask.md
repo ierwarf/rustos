@@ -21,9 +21,8 @@ defined in `tools/xtask/src/cli.rs`.
 | `cargo xtask probe-display` | Headless display probe/stress path. | Probe result and debug logs. |
 | `cargo xtask clean` | Remove cargo/build outputs. | Cleaned target/build dirs. |
 | `cargo xtask targets` | Install required Rust targets. | Rust target availability. |
-| `cargo xtask build-efi` | Build UEFI bootloader only. | `build/artifacts/EFI/BOOT/BOOTX64.EFI`. |
-| `cargo xtask build-prekernel` | Build prekernel only. | `build/artifacts/prekernel.elf`. |
-| `cargo xtask build-kernel` | Build nucleus/kernel only. | `build/artifacts/nucleus.elf`. |
+| `cargo xtask build-efi` | Build GRUB EFI boot manager only. Requires `RUSTOS_GRUB_PUBKEY` and `RUSTOS_GRUB_SIGNING_KEY`. | `build/artifacts/EFI/BOOT/BOOTX64.EFI`, `build/artifacts/nucleus.elf.sig`. |
+| `cargo xtask build-kernel` | Build Multiboot2 nucleus/kernel only. | `build/artifacts/nucleus.elf`. |
 | `cargo xtask build-user` | Build userspace packages. | service/app artifacts. |
 | `cargo xtask build-console-demo` | Build C demo/smoke programs. | app artifacts. |
 | `cargo xtask build-driver-modules` | Build bridge driver modules. | `.ko` artifacts. |
@@ -53,8 +52,10 @@ cargo xtask run -- --no-reboot
 ### When To Use Each Command
 
 - Use `check` before commits that change dependencies, manifests, or layer
-  boundaries.
-- Use `build` after changing code or staged image content.
+  boundaries. It also validates an existing `build/artifacts/nucleus.elf` with
+  `grub-file --is-x86-multiboot2` when present.
+- Use `build` after changing code or staged image content. The default build
+  requires GRUB public/signing key environment variables.
 - Use `stage` after changing only `assets/image` or package install metadata
   when artifacts are already built.
 - Use `run` for normal boot testing.
@@ -80,9 +81,8 @@ cargo xtask run -- --no-reboot
 | `cargo xtask probe-display` | headless display probe/stress path를 실행합니다. | probe result와 debug logs |
 | `cargo xtask clean` | cargo/build output을 지웁니다. | 정리된 target/build dirs |
 | `cargo xtask targets` | 필요한 Rust target을 설치합니다. | Rust target availability |
-| `cargo xtask build-efi` | UEFI bootloader만 빌드합니다. | `build/artifacts/EFI/BOOT/BOOTX64.EFI` |
-| `cargo xtask build-prekernel` | prekernel만 빌드합니다. | `build/artifacts/prekernel.elf` |
-| `cargo xtask build-kernel` | nucleus/kernel만 빌드합니다. | `build/artifacts/nucleus.elf` |
+| `cargo xtask build-efi` | GRUB EFI boot manager만 빌드합니다. `RUSTOS_GRUB_PUBKEY`, `RUSTOS_GRUB_SIGNING_KEY`가 필요합니다. | `build/artifacts/EFI/BOOT/BOOTX64.EFI`, `build/artifacts/nucleus.elf.sig` |
+| `cargo xtask build-kernel` | Multiboot2 nucleus/kernel만 빌드합니다. | `build/artifacts/nucleus.elf` |
 | `cargo xtask build-user` | userspace package를 빌드합니다. | service/app artifacts |
 | `cargo xtask build-console-demo` | C demo/smoke program을 빌드합니다. | app artifacts |
 | `cargo xtask build-driver-modules` | bridge driver module을 빌드합니다. | `.ko` artifacts |
@@ -111,8 +111,11 @@ cargo xtask run -- --no-reboot
 
 ### 언제 어떤 명령을 쓰는가
 
-- dependency, manifest, layer boundary를 바꿨다면 `check`를 사용합니다.
-- code 또는 staged image content를 바꿨다면 `build`를 사용합니다.
+- dependency, manifest, layer boundary를 바꿨다면 `check`를 사용합니다. 기존
+  `build/artifacts/nucleus.elf`가 있으면 `grub-file --is-x86-multiboot2`도
+  검증합니다.
+- code 또는 staged image content를 바꿨다면 `build`를 사용합니다. 기본 build는
+  GRUB public/signing key 환경 변수가 필요합니다.
 - artifact가 이미 있고 `assets/image` 또는 install metadata만 바꿨다면 `stage`를 사용합니다.
 - 일반 boot test에는 `run`을 사용합니다.
 - GDB를 붙일 때는 `debug`를 사용합니다.

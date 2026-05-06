@@ -22,7 +22,7 @@ Core entrypoints:
 
 Ownership map:
 
-- `boot/`: UEFI bootloader, prekernel, boot protocol.
+- `boot/`: boot protocol crate shared by the GRUB-loaded nucleus.
 - `kernel/`: kernel entry and subsystem crates.
 - `services/`: userspace services (`initd`, `runtimed`, `uiserver`, etc.).
 - `apps/`: user/demo applications.

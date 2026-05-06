@@ -61,6 +61,16 @@ Debug QEMU boot:
 4. Inspect `logs/debugcon.log`, `logs/qemu_interrupt.log` if interrupt trace enabled.
 5. If display issue, run `cargo xtask probe-display`.
 
+Debug GRUB display boot:
+
+1. Check `tools/xtask/src/build.rs` embedded GRUB config before changing QEMU flags.
+2. Keep GRUB video setup conservative: `load_video`, `gfxmode=auto`, `gfxpayload=keep`.
+3. Check `kernel/nucleus-core/src/multiboot2_entry.S` for the Multiboot2 framebuffer request tag.
+4. Confirm the kernel log prints a nonzero `boot framebuffer addr`.
+5. Confirm `platform:bootfb` can match from `storage::boot_volume::boot_framebuffer_info()`, not from an already-installed GUI backend.
+6. Confirm `display-primary` fallback decisions use active display state, not just a loaded module record.
+7. For QEMU virtio-gpu, confirm `virtio-gpu native: display registered` appears after `virtio register driver`.
+
 Reduce context mid-task:
 
 1. Summarize findings into the current response before opening more files.

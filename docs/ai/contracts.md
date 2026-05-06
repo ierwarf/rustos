@@ -17,7 +17,8 @@ Stage outputs:
 - Boot image root: `build/image`.
 - Artifact root: `build/artifacts`.
 - Static overlay: `assets/image`.
-- UEFI entry: `build/image/EFI/BOOT/BOOTX64.EFI`.
+- UEFI entry: GRUB-generated `build/image/EFI/BOOT/BOOTX64.EFI`.
+- Kernel payload signature: `build/image/nucleus.elf.sig`.
 - Registries:
   - `system/registry/kernel/loadable-drivers.tsv`
   - `system/registry/system/desktop-programs.tsv`

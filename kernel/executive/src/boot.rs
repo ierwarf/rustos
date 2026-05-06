@@ -82,6 +82,18 @@ pub fn initialize_kernel(boot_info_ptr: *const BootInfo) {
     boot_log!(debug::LogLevel::Info, 101, 0, "gdt initialized");
     boot_log!(debug::LogLevel::Info, 102, 0, "idt initialized");
     boot_log!(debug::LogLevel::Info, 103, 0, "paging initialized");
+    boot_log!(
+        debug::LogLevel::Info,
+        118,
+        0,
+        "boot framebuffer addr={:#x} size={} width={} height={} stride={} bpp={}",
+        boot_info.framebuffer.addr,
+        boot_info.framebuffer.size,
+        boot_info.framebuffer.width,
+        boot_info.framebuffer.height,
+        boot_info.framebuffer.stride,
+        boot_info.framebuffer.bytes_per_pixel,
+    );
     mm_api::boot::init_phys(boot_info_ptr);
     boot_log!(
         debug::LogLevel::Info,
@@ -356,7 +368,10 @@ pub fn kernel_main_bootstrap(boot_info_ptr: *const BootInfo) -> ! {
     debug::boot_trace::println_fmt(format_args!("kernel: higher half entry"));
     flow_info(3, "kernel bootstrap higher-half entry");
     initialize_kernel(boot_info_ptr);
-    ps_api::boot::init();
+    ps_api::boot::start(scheduled_kernel_main)
+}
+
+fn scheduled_kernel_main(_id: u64) {
     flow_info(4, "multitask initialized");
     finalize_kernel_initialization();
     announce_ready("Multitask", b"Multitask initialized.\r\n");

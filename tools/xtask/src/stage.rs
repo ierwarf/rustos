@@ -24,7 +24,6 @@ const LEGACY_BUILD_DIRS: &[&str] = &["EFI", "etc", "lib", "lib64", "linux", "SYS
 const LEGACY_BUILD_FILES: &[&str] = &[
     "kernel.elf",
     "nucleus.elf",
-    "prekernel.elf",
     "UISERVER.ELF",
     "UISERVER.EXE",
     "SHELL.ELF",
@@ -49,6 +48,8 @@ pub(crate) fn stage(config: &Config) -> Result<()> {
     for manifest in &manifests {
         stage_manifest(config, manifest)?;
     }
+    stage_boot_manager(config)?;
+    stage_nucleus_signature(config)?;
 
     let amdgpu_image_firmware_dir = config.amdgpu_image_firmware_dir();
     fs::create_dir_all(&amdgpu_image_firmware_dir)?;
@@ -102,6 +103,22 @@ fn stage_manifest(config: &Config, manifest: &PackageManifest) -> Result<()> {
 
 fn stage_directory_manifest(src_root: &Path, dst_root: &Path) -> Result<()> {
     copy_tree_files(src_root, dst_root)
+}
+
+fn stage_boot_manager(config: &Config) -> Result<()> {
+    let artifact = config.artifact_boot_efi_path();
+    if artifact.is_file() {
+        copy_with_parent(&artifact, &config.boot_efi_path())?;
+    }
+    Ok(())
+}
+
+fn stage_nucleus_signature(config: &Config) -> Result<()> {
+    let signature = config.artifact_nucleus_signature_path();
+    if signature.is_file() {
+        copy_with_parent(&signature, &config.image_dir.join("nucleus.elf.sig"))?;
+    }
+    Ok(())
 }
 
 fn write_driver_registry(config: &Config, manifests: &[PackageManifest]) -> Result<()> {

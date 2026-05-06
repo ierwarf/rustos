@@ -87,7 +87,6 @@ fn default_startup_mode() -> StartupMode {
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum BuilderKind {
     BootloaderUefi,
-    PrekernelRustc,
     KernelRustc,
     CargoKernelBinary,
     MingwCExe,
@@ -371,7 +370,6 @@ fn validate_manifests(manifests: &[PackageManifest]) -> Result<()> {
 
         match manifest.build.builder {
             BuilderKind::BootloaderUefi
-            | BuilderKind::PrekernelRustc
             | BuilderKind::KernelRustc
             | BuilderKind::CargoKernelBinary
             | BuilderKind::ModuleImage => {

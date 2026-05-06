@@ -120,8 +120,18 @@ fn module_init_stack_top() -> usize {
 }
 
 #[inline(always)]
+fn module_init_stack_base() -> usize {
+    MODULE_INIT_STACK.0.get() as *const ModuleInitStack as usize
+}
+
+#[inline(always)]
 unsafe fn call_with_module_init_stack0(entry: usize) -> i32 {
     let _guard = MODULE_INIT_STACK_LOCK.lock();
+    let _stack_scope = kernel_ps::api::CurrentKernelStackScope::enter(
+        module_init_stack_base() as u64,
+        module_init_stack_top() as u64,
+    )
+    .expect("scheduler must accept module init stack bounds");
     let mut result: i32;
     let stack_top = module_init_stack_top();
     unsafe {
@@ -145,6 +155,11 @@ unsafe fn call_with_module_init_stack0(entry: usize) -> i32 {
 #[inline(always)]
 unsafe fn call_with_module_init_stack1(entry: usize, arg0: usize) -> i32 {
     let _guard = MODULE_INIT_STACK_LOCK.lock();
+    let _stack_scope = kernel_ps::api::CurrentKernelStackScope::enter(
+        module_init_stack_base() as u64,
+        module_init_stack_top() as u64,
+    )
+    .expect("scheduler must accept module init stack bounds");
     let mut result: i32;
     let stack_top = module_init_stack_top();
     unsafe {

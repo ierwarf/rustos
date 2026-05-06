@@ -36,8 +36,6 @@ enum XtaskCommand {
     Targets,
     #[command(name = "build-efi")]
     BuildEfi,
-    #[command(name = "build-prekernel")]
-    BuildPrekernel,
     #[command(name = "build-kernel")]
     BuildKernel,
     #[command(name = "build-user")]
@@ -71,7 +69,6 @@ pub(crate) fn run() -> Result<()> {
         Some(XtaskCommand::Stage) => stage::stage(&config),
         Some(XtaskCommand::Targets) => build::ensure_targets(&config),
         Some(XtaskCommand::BuildEfi) => build::build_efi(&config),
-        Some(XtaskCommand::BuildPrekernel) => build::build_prekernel(&config),
         Some(XtaskCommand::BuildKernel) => build::build_nucleus(&config),
         Some(XtaskCommand::BuildUser) => build::build_user(&config),
         Some(XtaskCommand::BuildConsoleDemo) => build::build_console_demo(&config),

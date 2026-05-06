@@ -3,7 +3,8 @@ use x86_64::instructions::interrupts;
 
 use super::{
     MAIN_THREAD_SLICE_MICROS, NEXT_TASK_ID, SpawnTaskError, UserTaskBootstrap,
-    checked_thread_pit_divisor, initial_task_rflags, noop_task_entry, scheduler_mut, scheduler_ref,
+    checked_thread_pit_divisor, initial_task_rflags, kernel_task_entry_trampoline_addr,
+    noop_task_entry, scheduler_mut, scheduler_ref,
 };
 use crate::memory::paging::ProcessAddressSpace;
 use crate::user::process_state::UserProcessState;
@@ -102,15 +103,24 @@ pub fn spawn_user_thread(
     Ok(id)
 }
 
-pub fn init() {
+pub fn start(entry: fn(u64)) -> ! {
     super::irq::install_interrupt_dispatch_callbacks();
 
-    unsafe {
-        scheduler_mut().reset(crate::arch::pit::divisor_from_micros(
-            MAIN_THREAD_SLICE_MICROS,
-        ));
-        scheduler_mut().prepare_current_task_execution();
-    }
+    let saved_rsp = interrupts::without_interrupts(|| unsafe {
+        NEXT_TASK_ID.store(1, core::sync::atomic::Ordering::Relaxed);
+        let scheduler = scheduler_mut();
+        scheduler.reset(
+            crate::arch::pit::divisor_from_micros(MAIN_THREAD_SLICE_MICROS),
+            entry,
+            0,
+            crate::arch::gdt::kernel_code_selector().0 as u64,
+            crate::arch::gdt::kernel_data_selector().0 as u64,
+            initial_task_rflags().bits(),
+            kernel_task_entry_trampoline_addr(),
+        );
+        scheduler.prepare_current_task_execution();
+        scheduler.current_saved_rsp()
+    });
 
     crate::arch::pit::start_micros(0, MAIN_THREAD_SLICE_MICROS);
     crate::debug::info!(
@@ -118,6 +128,11 @@ pub fn init() {
         "scheduler initialized slice_micros={}",
         MAIN_THREAD_SLICE_MICROS
     );
+    unsafe {
+        kernel_hal::api::restore_kernel_saved_context(
+            saved_rsp as *mut super::context::SavedContext,
+        )
+    }
 }
 
 pub fn save_current_simd_state() {

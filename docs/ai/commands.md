@@ -40,6 +40,20 @@ Fast context commands:
 - `rg -n "enum XtaskCommand|struct Config|enum PackageKind" tools/xtask/src`
 - `sed -n 'START,ENDp' path/to/file` after `rg` finds the relevant line range.
 
+GRUB Secure Boot debug environment:
+
+- `export RUSTOS_GPG_HOME=$PWD/build/dev-grub-gpg`
+- `export RUSTOS_GRUB_PUBKEY=$PWD/build/dev-grub.pub`
+- `export RUSTOS_GRUB_SIGNING_KEY=20E25476F6977B91B007E98F0A12944CD8F6DA70`
+- `grub-file --is-x86-multiboot2 build/image/nucleus.elf`
+- `gpg --homedir build/dev-grub-gpg --verify build/image/nucleus.elf.sig build/image/nucleus.elf`
+
+KVM display boot loop:
+
+- `cargo xtask build`
+- `cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file`
+- `rg -n "error: no suitable video mode|boot framebuffer|bootfb|virtio-gpu|virtio register|DisplayUnavailable|uiserver|panic|scheduler invalid" logs/debugcon.log logs/qemu*.log`
+
 Use `rg --files` instead of recursive `ls` or broad `find` when searching many files.
 
 Generated path exceptions:

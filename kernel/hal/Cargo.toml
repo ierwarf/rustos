@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 nucleus-core = { path = "../nucleus-core" }
 kernel-lowlevel = { path = "../lowlevel" }
-boot-protocol = { path = "../../boot/bootloader/boot-protocol" }
+boot-protocol = { path = "../../boot/boot-protocol" }
 lazy_static = { version = "1.4", features = ["spin_no_std"] }
 pic8259 = "0.11.0"
 spin = "0.10.0"

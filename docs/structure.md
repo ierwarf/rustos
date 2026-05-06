@@ -12,7 +12,7 @@ are enforced by `cargo xtask check`.
 
 ### Directory Roles
 
-- `boot/`: bootloader, prekernel, and boot protocol crates
+- `boot/`: boot protocol crate shared by the GRUB-loaded nucleus
 - `kernel/`: kernel entry crate plus internal kernel subsystem crates
 - `services/`: userspace system services such as `initd`, `runtimed`, and `uiserver`
 - `apps/`: demo, smoke, desktop, and compatibility test applications
@@ -116,7 +116,7 @@ source directories.
 
 ### 디렉터리 역할
 
-- `boot/`: bootloader, prekernel, boot protocol crate
+- `boot/`: GRUB이 로드하는 nucleus와 공유하는 boot protocol crate
 - `kernel/`: kernel entry crate와 내부 kernel subsystem crate
 - `services/`: `initd`, `runtimed`, `uiserver` 같은 userspace system service
 - `apps/`: demo, smoke, desktop, compatibility test application

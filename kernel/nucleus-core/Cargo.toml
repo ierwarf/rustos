@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-boot-protocol = { path = "../../boot/bootloader/boot-protocol" }
+boot-protocol = { path = "../../boot/boot-protocol" }
 boot-random = { path = "../../libs/boot-random" }
 os_observatory = { version = "0.1.1", default-features = false }
 rustos-observability = { path = "../../libs/rustos-observability" }

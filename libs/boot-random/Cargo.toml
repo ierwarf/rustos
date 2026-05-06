@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-boot-protocol = { path = "../../boot/bootloader/boot-protocol" }
+boot-protocol = { path = "../../boot/boot-protocol" }
 rand_chacha = { version = "0.10", default-features = false }
 rand_core = { version = "0.10", default-features = false }
 spin = "0.10.0"
