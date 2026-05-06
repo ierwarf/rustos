@@ -1,5 +1,4 @@
 use alloc::boxed::Box;
-use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ffi::c_void;
@@ -7,6 +6,7 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use driver_abi::PointerPacket;
+use heapless::Deque as HeaplessDeque;
 use hidreport::{ArrayField, Field, FieldAttributes, Report, ReportDescriptor};
 use spin::Mutex;
 
@@ -54,8 +54,8 @@ struct RuntimeUsbDevice {
     hid_descriptor: Box<[u8]>,
     report_descriptor: Box<[u8]>,
     layout_hint: Option<Arc<HidReportLayout>>,
-    queued_reports: VecDeque<RuntimeReport>,
-    pending_urbs: VecDeque<usize>,
+    queued_reports: HeaplessDeque<RuntimeReport, REPORT_QUEUE_CAPACITY>,
+    pending_urbs: HeaplessDeque<usize, REPORT_QUEUE_CAPACITY>,
     dropped_reports: u64,
 }
 
@@ -146,21 +146,14 @@ impl Default for HidReportState {
 
 static USB_RUNTIME_DEVICES: Mutex<Vec<RuntimeUsbDevice>> = Mutex::new(Vec::new());
 static HID_REPORT_STATES: Mutex<Vec<HidReportState>> = Mutex::new(Vec::new());
-static PENDING_COMPLETIONS: Mutex<VecDeque<UrbCompletion>> = Mutex::new(VecDeque::new());
+static PENDING_COMPLETIONS: Mutex<HeaplessDeque<UrbCompletion, PENDING_COMPLETION_CAPACITY>> =
+    Mutex::new(HeaplessDeque::new());
 static KEYBOARD_TRANSLATION_LOGS: AtomicUsize = AtomicUsize::new(0);
 static POINTER_TRANSLATION_LOGS: AtomicUsize = AtomicUsize::new(0);
 static URB_SUBMIT_LOGS: AtomicUsize = AtomicUsize::new(0);
 static REPORT_ENQUEUE_LOGS: AtomicUsize = AtomicUsize::new(0);
 static REPORT_DESCRIPTOR_LOGS: AtomicUsize = AtomicUsize::new(0);
 static HID_REPORT_ENTRY_LOGS: AtomicUsize = AtomicUsize::new(0);
-
-pub(crate) fn prepare() {
-    let mut pending = PENDING_COMPLETIONS.lock();
-    let current_capacity = pending.capacity();
-    if current_capacity < PENDING_COMPLETION_CAPACITY {
-        pending.reserve(PENDING_COMPLETION_CAPACITY - current_capacity);
-    }
-}
 
 pub(crate) fn service_pending() -> usize {
     let mut completed = 0usize;
@@ -266,8 +259,8 @@ pub(crate) fn register_device(
         hid_descriptor: hid_descriptor.to_vec().into_boxed_slice(),
         report_descriptor: report_descriptor.to_vec().into_boxed_slice(),
         layout_hint,
-        queued_reports: VecDeque::with_capacity(REPORT_QUEUE_CAPACITY.min(32)),
-        pending_urbs: VecDeque::new(),
+        queued_reports: HeaplessDeque::new(),
+        pending_urbs: HeaplessDeque::new(),
         dropped_reports: 0,
     });
 
@@ -378,7 +371,7 @@ pub(crate) fn enqueue_report(usb_device: *mut LinuxCompatUsbDevice, report: &[u8
                 }
                 return;
             }
-            device.queued_reports.push_back(report);
+            let _ = device.queued_reports.push_back(report);
             None
         }
     };
@@ -502,7 +495,9 @@ pub(crate) fn submit_urb(urb: *mut LinuxCompatUrb) -> i32 {
         if let Some(report) = device.queued_reports.pop_front() {
             completion_from_report(urb, report)
         } else {
-            device.pending_urbs.push_back(urb as usize);
+            if device.pending_urbs.push_back(urb as usize).is_err() {
+                return USB_URB_STATUS_IO_ERROR;
+            }
             None
         }
     };
@@ -543,12 +538,12 @@ pub(crate) fn cancel_urb(urb: *mut LinuxCompatUrb) -> bool {
 
     {
         let mut pending = PENDING_COMPLETIONS.lock();
-        let mut retained = VecDeque::with_capacity(pending.len());
+        let mut retained = HeaplessDeque::new();
         while let Some(completion) = pending.pop_front() {
             if completion.urb_ptr == urb_ptr {
                 cancelled = true;
             } else {
-                retained.push_back(completion);
+                let _ = retained.push_back(completion);
             }
         }
         *pending = retained;
@@ -790,7 +785,7 @@ fn queue_urb_completion(completion: Option<UrbCompletion>) {
     let Some(completion) = completion else {
         return;
     };
-    PENDING_COMPLETIONS.lock().push_back(completion);
+    let _ = PENDING_COMPLETIONS.lock().push_back(completion);
 }
 
 fn dispatch_urb_completion(completion: Option<UrbCompletion>) {

@@ -1,6 +1,10 @@
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use fatfs::Seek as FatSeek;
+use fatfs::Write as FatWrite;
 
 use crate::Result;
 use crate::config::Config;
@@ -65,6 +69,7 @@ pub(crate) fn stage(config: &Config) -> Result<()> {
     write_startup_registry(config, &manifests)?;
     write_windows_dll_registry(config, &manifests)?;
     generate_dynamic_linker_cache(&config.image_dir)?;
+    write_boot_disk_image(config)?;
     Ok(())
 }
 
@@ -121,6 +126,144 @@ fn stage_nucleus_signature(config: &Config) -> Result<()> {
     Ok(())
 }
 
+fn write_boot_disk_image(config: &Config) -> Result<()> {
+    let files = collect_image_files(&config.image_dir)?;
+    let payload_bytes = files
+        .iter()
+        .map(|file| file.len)
+        .try_fold(0_u64, |acc, len| {
+            acc.checked_add(len).ok_or("image payload is too large")
+        })?;
+    let image_bytes = boot_disk_image_len(payload_bytes);
+    if let Some(parent) = config.boot_disk_image.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let image = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(true)
+        .open(&config.boot_disk_image)?;
+    image.set_len(image_bytes)?;
+    let mut image = fatfs::StdIoWrapper::new(image);
+    fatfs::format_volume(
+        &mut image,
+        fatfs::FormatVolumeOptions::new()
+            .bytes_per_sector(512)
+            .bytes_per_cluster(32 * 1024)
+            .volume_label(*b"RUSTOS     ")
+            .volume_id(0x5255_5354),
+    )?;
+    image.seek(fatfs::SeekFrom::Start(0))?;
+    let fs = fatfs::FileSystem::new(image, fatfs::FsOptions::new())?;
+    {
+        let root = fs.root_dir();
+        for file in files {
+            ensure_fat_parent_dirs(&root, &file.relative)?;
+            let mut dst = root.create_file(file.relative.as_str())?;
+            dst.truncate()?;
+            copy_host_file_to_fat(&file.source, &mut dst)?;
+            dst.flush()?;
+        }
+    }
+    fs.unmount()?;
+    Ok(())
+}
+
+struct ImageFile {
+    source: PathBuf,
+    relative: String,
+    len: u64,
+}
+
+fn collect_image_files(image_dir: &Path) -> Result<Vec<ImageFile>> {
+    let mut files = Vec::new();
+    let mut stack = vec![image_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut entries = fs::read_dir(&dir)?.collect::<std::result::Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.path());
+        for entry in entries.into_iter().rev() {
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(image_dir)?
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            let len = entry.metadata()?.len();
+            files.push(ImageFile {
+                source: path,
+                relative,
+                len,
+            });
+        }
+    }
+    files.sort_by(|lhs, rhs| lhs.relative.cmp(&rhs.relative));
+    Ok(files)
+}
+
+fn boot_disk_image_len(payload_bytes: u64) -> u64 {
+    const MIB: u64 = 1024 * 1024;
+    const MIN_IMAGE_BYTES: u64 = 128 * MIB;
+    let requested = payload_bytes.saturating_mul(2).saturating_add(64 * MIB);
+    requested.max(MIN_IMAGE_BYTES).div_ceil(MIB) * MIB
+}
+
+fn ensure_fat_parent_dirs<D: fatfs::ReadWriteSeek>(
+    root: &fatfs::Dir<'_, D, fatfs::DefaultTimeProvider, fatfs::LossyOemCpConverter>,
+    path: &str,
+) -> Result<()>
+where
+    D::Error: std::error::Error + 'static,
+{
+    let Some((parent, _file_name)) = path.rsplit_once('/') else {
+        return Ok(());
+    };
+    let mut current = String::new();
+    for component in parent.split('/') {
+        if component.is_empty() {
+            continue;
+        }
+        if !current.is_empty() {
+            current.push('/');
+        }
+        current.push_str(component);
+        if root.open_dir(current.as_str()).is_ok() {
+            continue;
+        }
+        root.create_dir(current.as_str())?;
+    }
+    Ok(())
+}
+
+fn copy_host_file_to_fat<D: fatfs::ReadWriteSeek>(
+    src: &Path,
+    dst: &mut fatfs::File<'_, D, fatfs::DefaultTimeProvider, fatfs::LossyOemCpConverter>,
+) -> Result<()>
+where
+    D::Error: std::error::Error + 'static,
+{
+    let mut src = fs::File::open(src)?;
+    let mut buf = [0_u8; 64 * 1024];
+    loop {
+        let read = src.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        dst.write_all(&buf[..read])?;
+    }
+    Ok(())
+}
+
 fn write_driver_registry(config: &Config, manifests: &[PackageManifest]) -> Result<()> {
     let mut lines = Vec::new();
     for manifest in manifests {
@@ -131,9 +274,10 @@ fn write_driver_registry(config: &Config, manifests: &[PackageManifest]) -> Resu
             continue;
         }
         let aliases = registry_list(&autoload.aliases)?;
+        let deps = registry_list(&autoload.deps)?;
         let softdeps = registry_list(&autoload.softdeps)?;
         lines.push(format!(
-            "name={}\tclass={}\tbus={}\tpriority={}\tpath={}\twhen={}\taliases={}\tsoftdeps={}\tprovider_group={}\tfallback_only={}",
+            "name={}\tclass={}\tbus={}\tpriority={}\tpath={}\twhen={}\taliases={}\tdeps={}\tsoftdeps={}\tprovider_group={}\tfallback_only={}",
             registry_value(&autoload.name)?,
             registry_value(&autoload.class)?,
             registry_value(&autoload.bus)?,
@@ -141,6 +285,7 @@ fn write_driver_registry(config: &Config, manifests: &[PackageManifest]) -> Resu
             registry_value(&manifest.install.path)?,
             registry_value(autoload.when.as_deref().unwrap_or("vfs-ready"))?,
             aliases,
+            deps,
             softdeps,
             registry_value(autoload.provider_group.as_deref().unwrap_or(""))?,
             if autoload.fallback_only { 1 } else { 0 },

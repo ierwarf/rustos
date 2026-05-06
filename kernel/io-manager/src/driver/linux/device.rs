@@ -50,6 +50,7 @@ static REGISTERED_CLASSES: Mutex<Vec<RegisteredClass>> = Mutex::new(Vec::new());
 static REGISTERED_DRIVERS: Mutex<Vec<RegisteredDriver>> = Mutex::new(Vec::new());
 static REGISTERED_DEVICES: Mutex<Vec<RegisteredDevice>> = Mutex::new(Vec::new());
 static DEVICE_NAMES: Mutex<Vec<DeviceNameRecord>> = Mutex::new(Vec::new());
+const MAX_COMPAT_DEVICE_NAME_BYTES: usize = 256;
 
 type DeviceProbeFn = unsafe extern "C" fn(dev: *mut LinuxCompatDevice) -> i32;
 type DeviceIterFn = unsafe extern "C" fn(dev: *mut LinuxCompatDevice, data: *mut c_void) -> i32;
@@ -628,7 +629,7 @@ fn ptr_key(ptr: *mut c_void) -> Option<usize> {
 }
 
 unsafe fn callback_fn<T>(ptr: *mut c_void) -> Option<T> {
-    if ptr.is_null() {
+    if ptr.is_null() || core::mem::size_of::<T>() != core::mem::size_of::<*mut c_void>() {
         None
     } else {
         Some(unsafe { core::mem::transmute_copy::<*mut c_void, T>(&ptr) })
@@ -641,7 +642,7 @@ fn format_name_bytes(fmt: *const c_char) -> Vec<u8> {
     }
     let mut bytes = Vec::new();
     let mut cursor = fmt.cast::<u8>();
-    loop {
+    while bytes.len() < MAX_COMPAT_DEVICE_NAME_BYTES.saturating_sub(1) {
         let byte = unsafe { *cursor };
         if byte == 0 {
             break;

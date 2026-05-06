@@ -1,0 +1,24 @@
+id = "netprobe"
+kind = "app"
+execution_domain = "user"
+profiles = ["default"]
+startup = "init"
+
+[build]
+builder = "c-demo"
+source = "netprobe.c"
+
+[install]
+path = "apps/netprobe/netprobe.elf"
+
+[boot]
+preload = true
+required = false
+priority = 130
+
+[[desktop.entries]]
+display_name = "netprobe"
+weight_micros = 50
+logical_admin = true
+console_hosted = false
+no_display = true

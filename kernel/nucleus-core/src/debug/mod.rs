@@ -37,6 +37,8 @@ const DEBUGCON_PORT: u16 = 0x00e9;
 const TEXT_RING_CAPACITY: usize = RUSTOS_LOGGING_RING_BUFFER_BYTES;
 #[cfg(rustos_debug_print_enabled)]
 const SYNTHETIC_WARNING_MODULE_PATH: &str = "nucleus_core::debug";
+#[cfg(rustos_debug_print_enabled)]
+const MILESTONE_CAPACITY: usize = 128;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CurrentUserLogContext {
@@ -65,6 +67,68 @@ impl DebugRuntimeHooks {
 struct KernelTextRing<const N: usize> {
     inner: ObservatoryRingBufferSink<N>,
     total_written: AtomicU64,
+}
+
+#[cfg(rustos_debug_print_enabled)]
+#[derive(Clone, Copy)]
+struct MilestoneRecord {
+    seq: u64,
+    tick: u64,
+    ts_us: u64,
+    category: LogCategory,
+    name: &'static str,
+    arg0: u64,
+    arg1: u64,
+}
+
+#[cfg(rustos_debug_print_enabled)]
+impl MilestoneRecord {
+    const EMPTY: Self = Self {
+        seq: 0,
+        tick: 0,
+        ts_us: 0,
+        category: LogCategory::Debug,
+        name: "",
+        arg0: 0,
+        arg1: 0,
+    };
+}
+
+#[cfg(rustos_debug_print_enabled)]
+struct MilestoneRing {
+    records: [MilestoneRecord; MILESTONE_CAPACITY],
+    next: usize,
+    len: usize,
+}
+
+#[cfg(rustos_debug_print_enabled)]
+impl MilestoneRing {
+    const fn new() -> Self {
+        Self {
+            records: [MilestoneRecord::EMPTY; MILESTONE_CAPACITY],
+            next: 0,
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, record: MilestoneRecord) {
+        self.records[self.next] = record;
+        self.next = (self.next + 1) % MILESTONE_CAPACITY;
+        self.len = self.len.saturating_add(1).min(MILESTONE_CAPACITY);
+    }
+
+    fn snapshot(&self, out: &mut [MilestoneRecord; MILESTONE_CAPACITY]) -> usize {
+        let count = self.len.min(MILESTONE_CAPACITY);
+        let start = if self.len == MILESTONE_CAPACITY {
+            self.next
+        } else {
+            0
+        };
+        for index in 0..count {
+            out[index] = self.records[(start + index) % MILESTONE_CAPACITY];
+        }
+        count
+    }
 }
 
 #[cfg(rustos_debug_print_enabled)]
@@ -121,6 +185,10 @@ static KERNEL_LOG_SINK: KernelLogSink = KernelLogSink;
 static DEBUG_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(rustos_debug_print_enabled)]
 static LOG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+#[cfg(rustos_debug_print_enabled)]
+static MILESTONE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+#[cfg(rustos_debug_print_enabled)]
+static MILESTONES: Mutex<MilestoneRing> = Mutex::new(MilestoneRing::new());
 #[cfg(rustos_debug_print_enabled)]
 static RATE_LIMIT_FALLBACK_MICROS: AtomicU64 =
     AtomicU64::new(DEFAULT_LOG_RATE_LIMIT_INTERVAL_MICROS);
@@ -215,18 +283,46 @@ fn print_bytes_unlocked(bytes: &[u8]) {
 }
 
 #[cfg(rustos_debug_print_enabled)]
-fn with_debug_output_lock<F: FnOnce()>(f: F) {
+struct DebugOutputGuard {
+    _guard: spin::MutexGuard<'static, ()>,
     #[cfg(not(test))]
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        if let Some(_guard) = DEBUG_LOCK.try_lock() {
-            f();
+    restore_interrupts: bool,
+}
+
+#[cfg(all(rustos_debug_print_enabled, not(test)))]
+impl Drop for DebugOutputGuard {
+    fn drop(&mut self) {
+        if self.restore_interrupts {
+            x86_64::instructions::interrupts::enable();
         }
-    });
+    }
+}
+
+#[cfg(rustos_debug_print_enabled)]
+fn try_debug_output_lock() -> Option<DebugOutputGuard> {
+    #[cfg(not(test))]
+    {
+        let restore_interrupts = x86_64::instructions::interrupts::are_enabled();
+        x86_64::instructions::interrupts::disable();
+        match DEBUG_LOCK.try_lock() {
+            Some(guard) => Some(DebugOutputGuard {
+                _guard: guard,
+                restore_interrupts,
+            }),
+            None => {
+                if restore_interrupts {
+                    x86_64::instructions::interrupts::enable();
+                }
+                None
+            }
+        }
+    }
 
     #[cfg(test)]
     {
-        let _guard = DEBUG_LOCK.lock();
-        f();
+        Some(DebugOutputGuard {
+            _guard: DEBUG_LOCK.lock(),
+        })
     }
 }
 
@@ -395,10 +491,10 @@ pub fn log_args_site(
         thread_id: user_context.map(|context| context.thread_id),
     };
 
-    with_debug_output_lock(|| {
+    if let Some(_guard) = try_debug_output_lock() {
         let mut writer = SinkWriter(&KERNEL_LOG_SINK);
         let _ = render_log_line(&mut writer, metadata, args);
-    });
+    }
 }
 
 #[cfg(not(rustos_debug_print_enabled))]
@@ -418,6 +514,121 @@ pub fn log_args(category: LogCategory, level: LogLevel, args: fmt::Arguments<'_>
 
 #[cfg(not(rustos_debug_print_enabled))]
 pub fn log_args(_category: LogCategory, _level: LogLevel, _args: fmt::Arguments<'_>) {}
+
+#[cfg(rustos_debug_print_enabled)]
+pub fn record_milestone(category: LogCategory, name: &'static str, arg0: u64, arg1: u64) {
+    let (tick, ts_us) = current_tick_and_micros();
+    let record = MilestoneRecord {
+        seq: MILESTONE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        tick,
+        ts_us,
+        category,
+        name,
+        arg0,
+        arg1,
+    };
+    if let Some(mut milestones) = MILESTONES.try_lock() {
+        milestones.push(record);
+    }
+    emit_milestone_debugcon_line(record);
+}
+
+#[cfg(not(rustos_debug_print_enabled))]
+pub fn record_milestone(_category: LogCategory, _name: &'static str, _arg0: u64, _arg1: u64) {}
+
+#[cfg(rustos_debug_print_enabled)]
+fn emit_milestone_debugcon_line(record: MilestoneRecord) {
+    if !compiled_level_enabled(record.category, LogLevel::Info) {
+        return;
+    }
+    if !milestone_debugcon_visible(record.name) {
+        return;
+    }
+    let user_context = current_user_context();
+    if let Some(_guard) = try_debug_output_lock() {
+        let mut writer = DebugconWriter;
+        let log_seq = LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let _ = write!(
+            writer,
+            "seq={} ts_us={} tick={} lvl=info cat={} mod={} line=0 pid=",
+            log_seq,
+            record.ts_us,
+            record.tick,
+            record.category.as_str(),
+            SYNTHETIC_WARNING_MODULE_PATH,
+        );
+        match user_context.map(|context| context.process_id) {
+            Some(process_id) => {
+                let _ = write!(writer, "{process_id}");
+            }
+            None => {
+                let _ = writer.write_str("-");
+            }
+        }
+        let _ = writer.write_str(" tid=");
+        match user_context.map(|context| context.thread_id) {
+            Some(thread_id) => {
+                let _ = write!(writer, "{thread_id}");
+            }
+            None => {
+                let _ = writer.write_str("-");
+            }
+        }
+        let _ = write!(
+            writer,
+            " msg=\"milestone seq={} cat={} name={} arg0={:#x} arg1={:#x}\"\r\n",
+            record.seq,
+            record.category.as_str(),
+            record.name,
+            record.arg0,
+            record.arg1,
+        );
+    }
+}
+
+#[cfg(rustos_debug_print_enabled)]
+fn milestone_debugcon_visible(name: &str) -> bool {
+    !matches!(name, "boot" | "driver-loader")
+}
+
+#[cfg(rustos_debug_print_enabled)]
+pub fn dump_recent_milestones(reason: &str) {
+    let mut records = [MilestoneRecord::EMPTY; MILESTONE_CAPACITY];
+    let count = MILESTONES
+        .try_lock()
+        .map(|milestones| milestones.snapshot(&mut records))
+        .unwrap_or(0);
+
+    log_args_site(
+        LogCategory::Debug,
+        LogLevel::Warn,
+        module_path!(),
+        line!(),
+        format_args!("milestone dump requested: {} count={}", reason, count),
+    );
+
+    for record in records.iter().take(count) {
+        log_args_site(
+            record.category,
+            LogLevel::Warn,
+            module_path!(),
+            line!(),
+            format_args!(
+                "milestone seq={} ts_us={} tick={} cat={} name={} arg0={:#x} arg1={:#x}",
+                record.seq,
+                record.ts_us,
+                record.tick,
+                record.category.as_str(),
+                record.name,
+                record.arg0,
+                record.arg1,
+            ),
+        );
+    }
+}
+
+#[cfg(not(rustos_debug_print_enabled))]
+pub fn dump_recent_milestones(_reason: &str) {}
 
 #[cfg(rustos_debug_print_enabled)]
 pub fn rate_limit_permit(
@@ -469,9 +680,9 @@ pub fn report_panic(info: &core::panic::PanicInfo<'_>) {
         }
     }
 
-    with_debug_output_lock(|| {
+    if let Some(_guard) = try_debug_output_lock() {
         os_observatory::panic::report_panic(&DebugconSink, info);
-    });
+    }
 }
 
 #[cfg(not(rustos_debug_print_enabled))]
@@ -487,15 +698,35 @@ pub fn println_newline() {}
 
 #[cfg(rustos_debug_print_enabled)]
 pub fn println_fmt(args: fmt::Arguments<'_>) {
-    with_debug_output_lock(|| {
+    if let Some(_guard) = try_debug_output_lock() {
         let mut writer = DebugconWriter;
         let _ = writer.write_fmt(args);
         let _ = writer.write_str("\r\n");
-    });
+    }
 }
 
 #[cfg(not(rustos_debug_print_enabled))]
 pub fn println_fmt(_args: fmt::Arguments<'_>) {}
+
+#[cfg(rustos_debug_print_enabled)]
+pub fn println_emergency(args: fmt::Arguments<'_>) {
+    #[cfg(not(test))]
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut writer = DebugconWriter;
+        let _ = writer.write_fmt(args);
+        let _ = writer.write_str("\r\n");
+    });
+
+    #[cfg(test)]
+    {
+        let mut writer = DebugconWriter;
+        let _ = writer.write_fmt(args);
+        let _ = writer.write_str("\r\n");
+    }
+}
+
+#[cfg(not(rustos_debug_print_enabled))]
+pub fn println_emergency(_args: fmt::Arguments<'_>) {}
 
 #[cfg(rustos_debug_print_enabled)]
 pub fn record_trace_location(file: &'static str, line: u32, column: u32) {
@@ -548,6 +779,7 @@ pub fn dump_recent_trace_locations(reason: &str) {
         line!(),
         format_args!("breadcrumb dump requested: {}", reason),
     );
+    dump_recent_milestones(reason);
 }
 
 #[cfg(not(rustos_debug_print_enabled))]
@@ -566,7 +798,9 @@ pub fn write_debugcon_only(bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
-    with_debug_output_lock(|| print_bytes_unlocked(bytes));
+    if let Some(_guard) = try_debug_output_lock() {
+        print_bytes_unlocked(bytes);
+    }
 }
 
 #[cfg(not(rustos_debug_print_enabled))]
@@ -574,12 +808,12 @@ pub fn write_debugcon_only(_bytes: &[u8]) {}
 
 #[cfg(rustos_debug_print_enabled)]
 pub fn write_debugcon_only_line(bytes: &[u8]) {
-    with_debug_output_lock(|| {
+    if let Some(_guard) = try_debug_output_lock() {
         if !bytes.is_empty() {
             print_bytes_unlocked(bytes);
         }
         print_bytes_unlocked(b"\r\n");
-    });
+    }
 }
 
 #[cfg(not(rustos_debug_print_enabled))]
@@ -587,14 +821,14 @@ pub fn write_debugcon_only_line(_bytes: &[u8]) {}
 
 #[cfg(rustos_debug_print_enabled)]
 pub fn write_debugcon_only_parts_line(parts: &[&[u8]]) {
-    with_debug_output_lock(|| {
+    if let Some(_guard) = try_debug_output_lock() {
         for part in parts {
             if !part.is_empty() {
                 print_bytes_unlocked(part);
             }
         }
         print_bytes_unlocked(b"\r\n");
-    });
+    }
 }
 
 #[cfg(not(rustos_debug_print_enabled))]

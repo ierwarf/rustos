@@ -25,4 +25,5 @@ class = "input"
 bus = "usb"
 priority = 100
 when = "vfs-ready"
+aliases = ["usb:v*p*d*dc*dsc*dp*ic03isc*ip*in*"]
 provider_group = "input-hid-core"

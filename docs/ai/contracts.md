@@ -11,6 +11,13 @@ Package manifest:
 - Valid `startup`: `none`, `init`, `session`, `desktop`.
 - Valid `install.layout`: `file`, `directory`.
 - Valid `desktop.entries.launch`: `none`, `new-session`, `all-sessions`.
+- Driver `[autoload]` supports `deps` for required module preloads and
+  `softdeps` for best-effort preloads, matching Linux `modules.dep` and
+  `modprobe.d softdep pre:` roles.
+- Driver `[autoload].provider_group` is a mutually exclusive provider contract.
+  Once a loadable or native provider marks the group active, later candidates in
+  the same group are skipped. `fallback_only` candidates are ordered after normal
+  candidates and should be used only as lower-priority substitutes.
 
 Stage outputs:
 
@@ -49,6 +56,25 @@ Kernel API:
 - Boot order: disable interrupts -> boot trace init -> GDT -> IDT -> paging -> higher-half jump -> stack switch -> executive bootstrap.
 - Cross-crate rule: import `kernel_x::api as x_api`; do not reach into another crate's private modules when `api.rs` exposes a wrapper.
 - User-memory IO APIs belong in syscall/process-context-aware paths only.
+
+Linux network driver compat:
+
+- Linux `.ko` relocated calls into RustOS must go through the compat export ABI
+  metadata in `kernel/io-manager/src/driver/linux/mod.rs`. Keep RustOS internal
+  Rust/SysV call alignment intact; classify exported Linux compat symbols as
+  either aligned Rust calls or stack-preserving tail calls instead of changing
+  global Rust ABI rules.
+- Common netdev lifecycle is routed through `kernel/io-manager/src/network/mod.rs`
+  and `kernel/io-manager/src/driver/linux/netdev.rs`.
+- `register_netdev`/`register_netdevice` must not imply carrier/link-up.
+  Link state follows `netif_carrier_on` and `netif_carrier_off`.
+- PCI network modules, including future `e1000e.ko` packages, use the same
+  netdev/skbuff/DMA compat surface as virtio network modules plus PCI probe
+  binding in `kernel/io-manager/src/driver/pci.rs`.
+- Virtio network data path is backed by the native modern PCI virtio-net backend
+  in `kernel/io-manager/src/network/virtio_net.rs`; Linux compat module load
+  should initialize or defer to that backend instead of fabricating link or TCP
+  success.
 
 Logging:
 

@@ -155,7 +155,10 @@ pub(crate) unsafe extern "C" fn dma_sync_single_range_for_cpu(
     size: usize,
     dir: u32,
 ) {
-    crate::driver::dma::sync_single_for_cpu(dev, dma_addr.saturating_add(offset as u64), size);
+    let Some(dma_addr) = add_dma_offset(dma_addr, offset) else {
+        return;
+    };
+    crate::driver::dma::sync_single_for_cpu(dev, dma_addr, size);
     let _ = dir;
 }
 
@@ -166,8 +169,15 @@ pub(crate) unsafe extern "C" fn dma_sync_single_range_for_device(
     size: usize,
     dir: u32,
 ) {
-    crate::driver::dma::sync_single_for_device(dev, dma_addr.saturating_add(offset as u64), size);
+    let Some(dma_addr) = add_dma_offset(dma_addr, offset) else {
+        return;
+    };
+    crate::driver::dma::sync_single_for_device(dev, dma_addr, size);
     let _ = dir;
+}
+
+fn add_dma_offset(dma_addr: u64, offset: usize) -> Option<u64> {
+    dma_addr.checked_add(u64::try_from(offset).ok()?)
 }
 
 pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {

@@ -1,9 +1,13 @@
 use std::io::ErrorKind;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Component, Path},
+};
 
 use wayland_protocols::xdg::decoration::zv1::server::{
     zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
@@ -148,6 +152,13 @@ impl WaylandCompositor {
         self.state.take_dirty()
     }
 
+    pub(crate) fn frame_presented(&mut self) {
+        self.state.send_frame_callbacks();
+        if let Err(err) = self.display.flush_clients() {
+            diag_line(&format!("uiserver: wayland flush failed: {err}"));
+        }
+    }
+
     pub(crate) fn window_snapshots(&self) -> Vec<WaylandWindowSnapshot> {
         self.state.window_snapshots()
     }
@@ -186,7 +197,11 @@ impl WaylandCompositor {
 }
 
 fn current_runtime_dir() -> String {
-    std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| String::from("/run"))
+    const FALLBACK_RUNTIME_DIR: &str = "/run";
+    std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .filter(|value| safe_runtime_dir(value.as_str()))
+        .unwrap_or_else(|| String::from(FALLBACK_RUNTIME_DIR))
 }
 
 fn bind_wayland_listener(runtime_dir: &str, socket_path: &str) -> std::io::Result<UnixListener> {
@@ -211,6 +226,12 @@ fn stale_wayland_socket(runtime_dir: &str, socket_path: &str) -> std::io::Result
     if !socket.starts_with(runtime) {
         return Ok(false);
     }
+    if !fs::symlink_metadata(socket_path)
+        .map(|metadata| metadata.file_type().is_socket())
+        .unwrap_or(false)
+    {
+        return Ok(false);
+    }
 
     match UnixStream::connect(socket_path) {
         Ok(_) => Ok(false),
@@ -224,6 +245,19 @@ fn stale_wayland_socket(runtime_dir: &str, socket_path: &str) -> std::io::Result
         }
         Err(err) => Err(err),
     }
+}
+
+fn safe_runtime_dir(value: &str) -> bool {
+    let path = Path::new(value);
+    !value.is_empty()
+        && value.len() <= 108 - WAYLAND_SOCKET_NAME.len() - 1
+        && path.is_absolute()
+        && path.components().all(|component| {
+            matches!(
+                component,
+                Component::RootDir | Component::Normal(_) | Component::Prefix(_)
+            )
+        })
 }
 
 fn checked_wayland_pixel_count(width: usize, height: usize) -> Option<usize> {
@@ -262,6 +296,33 @@ fn validate_wayland_buffer_layout(
         return None;
     }
     Some(required)
+}
+
+fn surface_damage_rect(x: i32, y: i32, width: i32, height: i32) -> Option<Rect> {
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+
+    let x0 = x.max(0) as usize;
+    let y0 = y.max(0) as usize;
+    let x1 = i64::from(x)
+        .saturating_add(i64::from(width))
+        .max(0)
+        .min(MAX_WAYLAND_BUFFER_DIMENSION as i64) as usize;
+    let y1 = i64::from(y)
+        .saturating_add(i64::from(height))
+        .max(0)
+        .min(MAX_WAYLAND_BUFFER_DIMENSION as i64) as usize;
+    if x0 >= x1 || y0 >= y1 {
+        return None;
+    }
+
+    Some(Rect {
+        x: x0,
+        y: y0,
+        width: x1 - x0,
+        height: y1 - y0,
+    })
 }
 
 #[cfg(test)]
@@ -426,6 +487,21 @@ impl WaylandState {
     fn event_time_ms(&self) -> u32 {
         let millis = self.started_at.elapsed().as_millis();
         u32::try_from(millis.min(u128::from(u32::MAX))).unwrap_or(u32::MAX)
+    }
+
+    fn send_frame_callbacks(&mut self) {
+        let time = self.event_time_ms();
+        for surface in &self.surfaces {
+            let Ok(mut surface) = surface.shared.lock() else {
+                continue;
+            };
+            if !surface.alive || surface.minimized || surface.pixels.is_empty() {
+                continue;
+            }
+            for callback in surface.pending_callbacks.drain(..) {
+                callback.done(time);
+            }
+        }
     }
 
     fn prune_pointer_resources(&mut self) {
@@ -1032,6 +1108,7 @@ struct WaylandSurfaceState {
     xdg_surface: Option<xdg_surface::XdgSurface>,
     toplevel: Option<xdg_toplevel::XdgToplevel>,
     pending_buffer: Option<Option<BufferAttachment>>,
+    pending_damage: Rect,
     pending_callbacks: Vec<wl_callback::WlCallback>,
     pixels: Arc<Vec<u32>>,
     width: usize,
@@ -1586,11 +1663,30 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
                     surface.pending_callbacks.push(callback);
                 }
             }
+            wl_surface::Request::Damage {
+                x,
+                y,
+                width,
+                height,
+            }
+            | wl_surface::Request::DamageBuffer {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                if let Some(rect) = surface_damage_rect(x, y, width, height) {
+                    if let Ok(mut surface) = data.shared.lock() {
+                        surface.pending_damage = surface.pending_damage.union(rect);
+                    }
+                }
+            }
             wl_surface::Request::Commit => {
-                let time = state.next_configure_serial();
                 let mut mapped = false;
                 let mut trigger_initial_configure = false;
                 if let Ok(mut surface) = data.shared.lock() {
+                    let committed_damage = !surface.pending_damage.is_empty();
+                    surface.pending_damage = Rect::empty();
                     if let Some(pending) = surface.pending_buffer.take() {
                         match pending {
                             Some(buffer) => {
@@ -1624,15 +1720,19 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
                         }
                         state.mark_dirty();
                     }
+                    if committed_damage
+                        && !surface.pixels.is_empty()
+                        && surface.width != 0
+                        && surface.height != 0
+                    {
+                        state.mark_dirty();
+                    }
                     mapped = mapped
                         || (!surface.pixels.is_empty()
                             && surface.width != 0
                             && surface.height != 0);
                     trigger_initial_configure =
                         surface.needs_initial_configure && !mapped && surface.toplevel.is_some();
-                    for callback in surface.pending_callbacks.drain(..) {
-                        callback.done(time);
-                    }
                 }
                 state.sync_surface_output(&data.shared, mapped);
                 if trigger_initial_configure {

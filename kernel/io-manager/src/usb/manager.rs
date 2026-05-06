@@ -27,7 +27,6 @@ static USB_STATE: Mutex<UsbRuntimeState> = Mutex::new(UsbRuntimeState::new());
 
 #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 pub(crate) fn init() {
-    emulation::prepare();
     let mut state = USB_STATE.lock();
     if state.runtime_initialized {
         return;

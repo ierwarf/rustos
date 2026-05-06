@@ -3,6 +3,9 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+pub const MAX_KERNEL_PATH_LEN: usize = 4096;
+pub const MAX_MOUNT_OPTIONS_LEN: usize = 4096;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KernelPathError {
     InvalidArgument,
@@ -28,20 +31,27 @@ pub enum MountConfigError {
 }
 
 pub fn normalize_kernel_path(path: &str) -> Result<String, KernelPathError> {
-    if path.is_empty() {
-        return Err(KernelPathError::InvalidArgument);
+    validate_kernel_path_input(path)?;
+
+    if path.starts_with('/') {
+        return normalize_absolute_kernel_path(path);
     }
 
-    let absolute = if path.starts_with('/') {
-        path
-    } else {
-        return normalize_absolute_kernel_path(alloc::format!("/{path}").as_str());
-    };
-
-    normalize_absolute_kernel_path(absolute)
+    let absolute_len = path
+        .len()
+        .checked_add(1)
+        .ok_or(KernelPathError::InvalidArgument)?;
+    if absolute_len > MAX_KERNEL_PATH_LEN {
+        return Err(KernelPathError::InvalidArgument);
+    }
+    let mut absolute = String::with_capacity(absolute_len);
+    absolute.push('/');
+    absolute.push_str(path);
+    normalize_absolute_kernel_path(absolute.as_str())
 }
 
 pub fn normalize_absolute_kernel_path(path: &str) -> Result<String, KernelPathError> {
+    validate_kernel_path_input(path)?;
     if !path.starts_with('/') {
         return Err(KernelPathError::InvalidArgument);
     }
@@ -70,6 +80,14 @@ pub fn normalize_absolute_kernel_path(path: &str) -> Result<String, KernelPathEr
 
     let mut normalized = String::new();
     for component in components {
+        let next_len = normalized
+            .len()
+            .checked_add(1)
+            .and_then(|len| len.checked_add(component.len()))
+            .ok_or(KernelPathError::InvalidArgument)?;
+        if next_len > MAX_KERNEL_PATH_LEN {
+            return Err(KernelPathError::InvalidArgument);
+        }
         normalized.push('/');
         normalized.push_str(component);
     }
@@ -123,6 +141,9 @@ pub fn parse_mount_options(options: Option<&str>) -> Result<ParsedMountOptions, 
     let Some(options) = options else {
         return Ok(ParsedMountOptions::default());
     };
+    if options.len() > MAX_MOUNT_OPTIONS_LEN {
+        return Err(MountConfigError::InvalidArgument);
+    }
 
     let mut role = MountRole::Standard;
     let mut backend = String::new();
@@ -142,7 +163,16 @@ pub fn parse_mount_options(options: Option<&str>) -> Result<ParsedMountOptions, 
                 {
                     return Err(MountConfigError::InvalidArgument);
                 }
-                if !backend.is_empty() {
+                let separator_len = (!backend.is_empty()) as usize;
+                let next_len = backend
+                    .len()
+                    .checked_add(separator_len)
+                    .and_then(|len| len.checked_add(option.len()))
+                    .ok_or(MountConfigError::InvalidArgument)?;
+                if next_len > MAX_MOUNT_OPTIONS_LEN {
+                    return Err(MountConfigError::InvalidArgument);
+                }
+                if separator_len != 0 {
                     backend.push(',');
                 }
                 backend.push_str(option);
@@ -169,12 +199,26 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
+fn validate_kernel_path_input(path: &str) -> Result<(), KernelPathError> {
+    if path.is_empty() || path.len() > MAX_KERNEL_PATH_LEN {
+        return Err(KernelPathError::InvalidArgument);
+    }
+    if path
+        .bytes()
+        .any(|byte| byte == 0 || byte.is_ascii_control())
+    {
+        return Err(KernelPathError::InvalidArgument);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        KernelPathError, MountConfigError, MountRole, mount_child_name,
-        normalize_absolute_kernel_path, normalize_kernel_path, parse_mount_options, path_inode,
-        path_is_within_mount, path_relative_to_mount, validate_mount_flags,
+        KernelPathError, MAX_KERNEL_PATH_LEN, MAX_MOUNT_OPTIONS_LEN, MountConfigError, MountRole,
+        mount_child_name, normalize_absolute_kernel_path, normalize_kernel_path,
+        parse_mount_options, path_inode, path_is_within_mount, path_relative_to_mount,
+        validate_mount_flags,
     };
 
     #[test]
@@ -183,6 +227,12 @@ mod tests {
         assert_eq!(normalize_kernel_path("/a/./b/../c").unwrap(), "/a/c");
         assert_eq!(
             normalize_absolute_kernel_path("a/b"),
+            Err(KernelPathError::InvalidArgument)
+        );
+        let mut long_path = String::from("/");
+        long_path.push_str("a".repeat(MAX_KERNEL_PATH_LEN).as_str());
+        assert_eq!(
+            normalize_kernel_path(long_path.as_str()),
             Err(KernelPathError::InvalidArgument)
         );
     }
@@ -212,6 +262,12 @@ mod tests {
         let parsed = parse_mount_options(None).unwrap();
         assert_eq!(parsed.role, MountRole::Standard);
         assert_eq!(parsed.backend_options, None);
+
+        let long_options = "x".repeat(MAX_MOUNT_OPTIONS_LEN + 1);
+        assert_eq!(
+            parse_mount_options(Some(long_options.as_str())),
+            Err(MountConfigError::InvalidArgument)
+        );
     }
 
     #[test]

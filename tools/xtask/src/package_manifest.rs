@@ -149,6 +149,8 @@ pub(crate) struct AutoloadSpec {
     #[serde(default)]
     pub(crate) aliases: Vec<String>,
     #[serde(default)]
+    pub(crate) deps: Vec<String>,
+    #[serde(default)]
     pub(crate) softdeps: Vec<String>,
     #[serde(default)]
     pub(crate) provider_group: Option<String>,

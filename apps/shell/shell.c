@@ -32,7 +32,7 @@ static void debug_line(const char *message) {
 static void print_prompt(void) {
     char cwd[PATH_MAX];
     if (getcwd(cwd, sizeof(cwd)) == NULL) {
-        strcpy(cwd, "?");
+        snprintf(cwd, sizeof(cwd), "?");
     }
     printf("%s $ ", cwd);
     fflush(stdout);

@@ -55,6 +55,20 @@ pub fn try_present_panic_blackout() -> bool {
     .unwrap_or(false)
 }
 
+pub fn write_panic_console_line(bytes: &[u8]) -> bool {
+    if !emergency_console_output_enabled() {
+        return false;
+    }
+    let Some(mut console) = EMERGENCY_CONSOLE.try_lock() else {
+        return false;
+    };
+    console.activate_panic_session();
+    console.append_bytes(bytes);
+    console.commit_current_line();
+    console.render_pending = true;
+    console.render()
+}
+
 pub fn tick_console_cursor() {
     flush_debug_console();
 }
@@ -377,6 +391,17 @@ impl EmergencyConsole {
         self.rendered_line_count = 0;
     }
 
+    fn activate_panic_session(&mut self) {
+        if !self.live_enabled {
+            self.clear_history();
+        }
+        self.live_enabled = true;
+        self.initialized = false;
+        self.needs_full_redraw = true;
+        self.render_pending = true;
+        self.rendered_line_count = 0;
+    }
+
     fn deactivate_live_session(&mut self) {
         self.live_enabled = false;
         self.clear_history();
@@ -466,10 +491,11 @@ impl EmergencyConsole {
     }
 
     fn push_byte(&mut self, byte: u8) {
-        if self.current_len < self.current_line.len() {
-            self.current_line[self.current_len] = byte;
-            self.current_len += 1;
+        if self.current_len == self.current_line.len() {
+            self.commit_current_line();
         }
+        self.current_line[self.current_len] = byte;
+        self.current_len += 1;
     }
 
     fn commit_current_line(&mut self) {

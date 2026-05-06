@@ -500,6 +500,9 @@ fn run() -> Result<(), i32> {
             }
         }
 
+        if let Some(compositor) = wayland.as_mut() {
+            compositor.frame_presented();
+        }
         pending_update.clear();
         presented_cursor_x = state.cursor_x;
         presented_cursor_y = state.cursor_y;

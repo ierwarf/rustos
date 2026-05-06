@@ -18,6 +18,9 @@ struct RunOptions {
     usb_input: bool,
     debugcon: DebugconMode,
     qemu_log: QemuLogMode,
+    timeout: Option<Duration>,
+    expect_markers: Vec<String>,
+    summarize_log: bool,
     vfio_force: bool,
     auto_phoenix3_passthrough: bool,
     network: bool,
@@ -33,6 +36,9 @@ impl RunOptions {
             usb_input: false,
             debugcon: DebugconMode::File,
             qemu_log: QemuLogMode::None,
+            timeout: None,
+            expect_markers: Vec::new(),
+            summarize_log: false,
             vfio_force: false,
             auto_phoenix3_passthrough: false,
             network: !matches!(
@@ -62,6 +68,7 @@ struct PreparedRun {
     debugcon_args: Vec<OsString>,
     qemu_log_args: Vec<OsString>,
     qemu_user_args: Vec<String>,
+    debugcon_log: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy)]
@@ -146,6 +153,56 @@ const PROBE_QMP_TIMEOUT: Duration = Duration::from_secs(10);
 const PROBE_STEP_DELAY: Duration = Duration::from_millis(25);
 const PROBE_STRESS_DURATION_DEFAULT: Duration = Duration::from_secs(20);
 const PROBE_HEARTBEAT_STALL_DEFAULT: Duration = Duration::from_millis(2500);
+const QEMU_WAIT_POLL: Duration = Duration::from_millis(100);
+
+const RUN_SUMMARY_MARKERS: &[&str] = &[
+    "[PANIC]",
+    "[KERNEL FATAL]",
+    "Unhandled exception",
+    "panic",
+    "fatal",
+    "error",
+    "failed",
+    "timeout",
+    "exception",
+    "boot volume",
+    "boot-volume-handle",
+    "storage:",
+    "ahci-16m-boundary",
+    "ahci",
+    "nvme",
+    "driver loader:",
+    "driver module",
+    "module-init",
+    "module loaded",
+    ".ko",
+    "linux compat:",
+    "virtio",
+    "virtio_net",
+    "virtio-net",
+    "virtio-net-driver",
+    "virtio-net-init",
+    "virtio-net-tcp",
+    "__register_virtio_driver",
+    "netdev",
+    "netdev-register",
+    "netdev-carrier",
+    "carrier",
+    "AF_INET",
+    "af-inet",
+    "TCP connect",
+    "HTTP",
+    "google",
+    "init bootstrap",
+    "init-bootstrap",
+    "initd",
+    "runtimed",
+    "sessiond",
+    "uiserver",
+    "DisplayUnavailable",
+    "first present",
+    "wayland",
+];
 
 pub(crate) fn run_qemu_command<I>(config: &Config, mut args: I) -> Result<()>
 where
@@ -210,6 +267,21 @@ where
                 options.qemu_log = QemuLogMode::parse(value.as_str())
                     .ok_or_else(|| format!("invalid --qemu-log value: {value}"))?;
             }
+            "--timeout" => {
+                let value = next_required_arg(args, "--timeout")?;
+                let seconds = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid --timeout seconds: {value}"))?;
+                if seconds == 0 {
+                    return Err(String::from("--timeout must be greater than zero").into());
+                }
+                options.timeout = Some(Duration::from_secs(seconds));
+            }
+            "--expect" => {
+                let marker = next_required_arg(args, "--expect")?;
+                append_unique_string(&mut options.expect_markers, marker);
+            }
+            "--summarize-log" => options.summarize_log = true,
             "--vfio-pci" => {
                 let host = next_required_arg(args, "--vfio-pci")?;
                 append_unique_string(&mut options.vfio_hosts, host);
@@ -229,6 +301,9 @@ where
 }
 
 fn run_qemu_with_options(config: &Config, options: RunOptions) -> Result<()> {
+    let timeout = options.timeout;
+    let expect_markers = options.expect_markers.clone();
+    let summarize_log = options.summarize_log;
     let prepared = prepare_run(config, options)?;
 
     println!(
@@ -249,6 +324,16 @@ fn run_qemu_with_options(config: &Config, options: RunOptions) -> Result<()> {
         &prepared.qemu_user_args,
     );
 
+    if timeout.is_some() || !expect_markers.is_empty() {
+        return run_qemu_supervised(
+            &mut command,
+            timeout,
+            expect_markers.as_slice(),
+            summarize_log,
+            prepared.debugcon_log.as_deref(),
+        );
+    }
+
     let status = command.status()?;
 
     println!(
@@ -259,11 +344,164 @@ fn run_qemu_with_options(config: &Config, options: RunOptions) -> Result<()> {
             .unwrap_or_else(|| String::from("signal"))
     );
 
+    if summarize_log {
+        summarize_debugcon_log(prepared.debugcon_log.as_deref())?;
+    }
+
     if status.success() {
         Ok(())
     } else {
         Err(format!("QEMU exited with status {status}").into())
     }
+}
+
+fn run_qemu_supervised(
+    command: &mut Command,
+    timeout: Option<Duration>,
+    expect_markers: &[String],
+    summarize_log: bool,
+    debugcon_log: Option<&Path>,
+) -> Result<()> {
+    if !expect_markers.is_empty() && debugcon_log.is_none() {
+        return Err(String::from("--expect requires --debugcon file").into());
+    }
+
+    let started = Instant::now();
+    let deadline = timeout.map(|timeout| started + timeout);
+    let mut child = command.spawn()?;
+    loop {
+        if !expect_markers.is_empty()
+            && expected_markers_satisfied(debugcon_log, expect_markers)?.is_empty()
+        {
+            terminate_qemu_child(&mut child)?;
+            println!(
+                "\n====================================\nQEMU stopped after expected marker(s): {}\n====================================\n",
+                expect_markers.join(" | ")
+            );
+            if summarize_log {
+                summarize_debugcon_log(debugcon_log)?;
+            }
+            return Ok(());
+        }
+
+        if let Some(status) = child.try_wait()? {
+            println!(
+                "\n====================================\nQEMU exited with code {}\n====================================\n",
+                status
+                    .code()
+                    .map(|code: i32| code.to_string())
+                    .unwrap_or_else(|| String::from("signal"))
+            );
+            if summarize_log {
+                summarize_debugcon_log(debugcon_log)?;
+            }
+            if !status.success() {
+                return Err(format!("QEMU exited with status {status}").into());
+            }
+            let missing = expected_markers_satisfied(debugcon_log, expect_markers)?;
+            if !missing.is_empty() {
+                return Err(format!(
+                    "QEMU exited before expected marker(s): {}",
+                    missing.join(" | ")
+                )
+                .into());
+            }
+            return Ok(());
+        }
+
+        if let Some(deadline) = deadline {
+            if Instant::now() >= deadline {
+                terminate_qemu_child(&mut child)?;
+                println!(
+                    "\n====================================\nQEMU stopped after timeout {:?}\n====================================\n",
+                    timeout.unwrap_or_default()
+                );
+                if summarize_log {
+                    summarize_debugcon_log(debugcon_log)?;
+                }
+                let missing = expected_markers_satisfied(debugcon_log, expect_markers)?;
+                if !missing.is_empty() {
+                    return Err(format!(
+                        "timed out waiting for expected marker(s): {}",
+                        missing.join(" | ")
+                    )
+                    .into());
+                }
+                return Ok(());
+            }
+        }
+
+        thread::sleep(QEMU_WAIT_POLL);
+    }
+}
+
+fn terminate_qemu_child(child: &mut Child) -> Result<()> {
+    if child.try_wait()?.is_none() {
+        let _ = child.kill();
+    }
+    let _ = child.wait()?;
+    Ok(())
+}
+
+fn expected_markers_satisfied(
+    debugcon_log: Option<&Path>,
+    expect_markers: &[String],
+) -> Result<Vec<String>> {
+    if expect_markers.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(debugcon_log) = debugcon_log else {
+        return Ok(expect_markers.to_vec());
+    };
+    let contents = fs::read_to_string(debugcon_log).unwrap_or_default();
+    Ok(expect_markers
+        .iter()
+        .filter(|marker| !contents.contains(marker.as_str()))
+        .cloned()
+        .collect())
+}
+
+fn summarize_debugcon_log(debugcon_log: Option<&Path>) -> Result<()> {
+    let Some(debugcon_log) = debugcon_log else {
+        println!("debugcon summary skipped: debugcon file output is disabled.");
+        return Ok(());
+    };
+    let contents = fs::read_to_string(debugcon_log).unwrap_or_default();
+    let mut selected = Vec::<&str>::new();
+    for line in contents.lines() {
+        if RUN_SUMMARY_MARKERS
+            .iter()
+            .any(|marker| line_contains_case_insensitive(line, marker))
+        {
+            selected.push(line);
+        }
+    }
+
+    const MAX_SUMMARY_LINES: usize = 80;
+    let start = selected.len().saturating_sub(MAX_SUMMARY_LINES);
+    println!(
+        "\n====================================\nDebugcon summary: {}\n====================================",
+        debugcon_log.display()
+    );
+    if selected.is_empty() {
+        println!("No high-signal debug markers matched.");
+        return Ok(());
+    }
+    if start != 0 {
+        println!("... omitted {} earlier matching line(s) ...", start);
+    }
+    for line in &selected[start..] {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn line_contains_case_insensitive(line: &str, marker: &str) -> bool {
+    if line.contains(marker) {
+        return true;
+    }
+    let lower_line = line.to_ascii_lowercase();
+    lower_line.contains(marker.to_ascii_lowercase().as_str())
 }
 
 fn write_gdb_helper(config: &Config) -> Result<()> {
@@ -273,6 +511,7 @@ fn write_gdb_helper(config: &Config) -> Result<()> {
         "\
 set pagination off
 set confirm off
+set breakpoint pending on
 set architecture i386:x86-64
 file {}
 target remote :1234
@@ -280,6 +519,21 @@ target remote :1234
 echo Connected to RustOS debug target.\n
 echo Nucleus symbols: {}\n
 echo Module symbols can be loaded from /dev/debug0 snapshots once the guest is up.\n
+
+break handle_kernel_panic
+break fatal_init_bootstrap_load
+break fatal_init_bootstrap_spawn
+break load_module_image_explicit
+break register_virtio_driver
+break register_linux_netdev
+break set_linux_netdev_carrier
+break note_virtio_net_driver_registered
+break ensure_initialized
+break connect_inet_socket
+break connect_tcp
+break bootstrap_init_process
+
+echo RustOS breakpoint candidates installed. Missing symbols remain pending.\n
 ",
         config.artifact_nucleus_elf_path().display(),
         config.artifact_nucleus_elf_path().display(),
@@ -294,6 +548,14 @@ fn ensure_qemu_prerequisites(config: &Config) -> Result<()> {
         return Err(format!(
             "missing build image directory: {} (run `cargo xtask build` first)",
             config.image_dir.display()
+        )
+        .into());
+    }
+
+    if !config.boot_disk_image.is_file() {
+        return Err(format!(
+            "missing boot disk image: {} (run `cargo xtask build` or `cargo xtask stage` first)",
+            config.boot_disk_image.display()
         )
         .into());
     }
@@ -328,7 +590,7 @@ fn prepare_run(config: &Config, options: RunOptions) -> Result<PreparedRun> {
     })?;
 
     let mut session = RunSession::create()?;
-    let mut profile_args = build_run_profile_args(&options, &config.image_dir)?;
+    let mut profile_args = build_run_profile_args(&options, &config.boot_disk_image)?;
     let mut vfio_hosts = options.vfio_hosts.clone();
     if options.auto_phoenix3_passthrough {
         for bdf in detect_phoenix3_devices()? {
@@ -341,7 +603,7 @@ fn prepare_run(config: &Config, options: RunOptions) -> Result<PreparedRun> {
     let usb_args = configure_usb_args(options.usb_input, &options.qemu_user_args);
     let network_args = configure_network_args(options.network, &options.qemu_user_args);
     let display_args = configure_display_args(&options.qemu_user_args);
-    let debugcon_args = configure_debugcon(config, &mut session, options.debugcon)?;
+    let (debugcon_args, debugcon_log) = configure_debugcon(config, &mut session, options.debugcon)?;
     let qemu_log_args = configure_qemu_log(config, options.qemu_log)?;
 
     Ok(PreparedRun {
@@ -356,6 +618,7 @@ fn prepare_run(config: &Config, options: RunOptions) -> Result<PreparedRun> {
         debugcon_args,
         qemu_log_args,
         qemu_user_args: options.qemu_user_args,
+        debugcon_log,
     })
 }
 
@@ -372,6 +635,9 @@ options:
   --no-network                       do not attach default usernet + virtio-net-pci
   --debugcon <file|stdio|null>       route debugcon to file, terminal, or disable it
   --qemu-log <int|null>              write QEMU trace log to logs/qemu_interrupt.log or disable it
+  --timeout <seconds>                stop QEMU after this many seconds; no default timeout
+  --expect <marker>                  stop successfully once all repeated expected markers appear
+  --summarize-log                    print high-signal debugcon lines after QEMU stops
   --vfio-pci <0000:bb:dd.f>          attach a vfio-pci host device to qemu (repeatable)
   --phoenix3-passthrough             auto-attach host Phoenix3 VGA function and same-slot audio
   --vfio-force                       allow devices that currently drive an active host display
@@ -393,6 +659,9 @@ options:
   --no-network                       do not attach default usernet + virtio-net-pci
   --debugcon <file|stdio|null>       route debugcon to file, terminal, or disable it
   --qemu-log <int|null>              write QEMU trace log to logs/qemu_interrupt.log or disable it
+  --timeout <seconds>                stop QEMU after this many seconds; no default timeout
+  --expect <marker>                  stop successfully once all repeated expected markers appear
+  --summarize-log                    print high-signal debugcon lines after QEMU stops
   --vfio-pci <0000:bb:dd.f>          attach a vfio-pci host device to qemu (repeatable)
   --phoenix3-passthrough             auto-attach host Phoenix3 VGA function and same-slot audio
   --vfio-force                       allow devices that currently drive an active host display
@@ -442,10 +711,10 @@ fn append_default_arg_pair(args: &mut Vec<String>, option: &str, value: &str) {
     args.push(value.to_string());
 }
 
-fn build_run_profile_args(options: &RunOptions, boot_dir: &Path) -> Result<Vec<OsString>> {
+fn build_run_profile_args(options: &RunOptions, boot_image: &Path) -> Result<Vec<OsString>> {
     let spec = qemu_profile_spec(options.profile.as_str())?;
     let mut args = Vec::new();
-    append_boot_disk_args(&mut args, boot_dir, spec.boot_disk);
+    append_boot_disk_args(&mut args, boot_image, spec.boot_disk);
     args.push(OsString::from("-m"));
     args.push(OsString::from(spec.memory));
     args.push(OsString::from("-machine"));
@@ -503,15 +772,15 @@ fn qemu_profile_spec(profile: &str) -> Result<QemuProfileSpec> {
     }
 }
 
-fn append_boot_disk_args(args: &mut Vec<OsString>, boot_dir: &Path, boot_disk: QemuBootDisk) {
+fn append_boot_disk_args(args: &mut Vec<OsString>, boot_image: &Path, boot_disk: QemuBootDisk) {
     if matches!(boot_disk, QemuBootDisk::Ahci) {
         args.push(OsString::from("-device"));
         args.push(OsString::from("ich9-ahci,id=ahci"));
     }
     args.push(OsString::from("-drive"));
     args.push(OsString::from(format!(
-        "id=bootdisk,if=none,file=fat:rw:{},format=raw",
-        boot_dir.display()
+        "id=bootdisk,if=none,file={},format=raw",
+        boot_image.display()
     )));
     args.push(OsString::from("-device"));
     args.push(match boot_disk {
@@ -714,13 +983,19 @@ fn configure_debugcon(
     config: &Config,
     session: &mut RunSession,
     mode: DebugconMode,
-) -> Result<Vec<OsString>> {
+) -> Result<(Vec<OsString>, Option<PathBuf>)> {
     match mode {
         DebugconMode::Null => {
-            return Ok(vec![OsString::from("-debugcon"), OsString::from("null")]);
+            return Ok((
+                vec![OsString::from("-debugcon"), OsString::from("null")],
+                None,
+            ));
         }
         DebugconMode::Stdio => {
-            return Ok(vec![OsString::from("-debugcon"), OsString::from("stdio")]);
+            return Ok((
+                vec![OsString::from("-debugcon"), OsString::from("stdio")],
+                None,
+            ));
         }
         DebugconMode::File => {}
     }
@@ -743,15 +1018,26 @@ fn configure_debugcon(
         debugcon_log.display()
     );
 
-    Ok(vec![
-        OsString::from("-debugcon"),
-        OsString::from(format!("file:{}", debugcon_log.display())),
-    ])
+    Ok((
+        vec![
+            OsString::from("-debugcon"),
+            OsString::from(format!("file:{}", debugcon_log.display())),
+        ],
+        Some(debugcon_log),
+    ))
 }
 
 fn configure_qemu_log(config: &Config, mode: QemuLogMode) -> Result<Vec<OsString>> {
     match mode {
-        QemuLogMode::None => Ok(Vec::new()),
+        QemuLogMode::None => {
+            let interrupt_log = config.logs_dir.join("qemu_interrupt.log");
+            match fs::remove_file(&interrupt_log) {
+                Ok(()) => {}
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+            Ok(Vec::new())
+        }
         QemuLogMode::Interrupt => {
             fs::create_dir_all(&config.logs_dir)?;
             let interrupt_log = config.logs_dir.join("qemu_interrupt.log");

@@ -1,4 +1,3 @@
-use alloc::vec::Vec;
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex;
@@ -23,6 +22,7 @@ const RTC_UPDATE_IN_PROGRESS: u8 = 1 << 7;
 const RTC_PERIODIC_INTERRUPT_ENABLE: u8 = 1 << 6;
 const RTC_RATE_1024_HZ: u8 = 6;
 const RTC_TICKS_PER_SEC: u64 = 1024;
+const RTC_SLEEP_WAITER_CAPACITY: usize = 256;
 
 static RTC_TICKS: AtomicU64 = AtomicU64::new(0);
 static RTC_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -34,12 +34,57 @@ static RTC_LAST_INPUT_ABSOLUTE_SUBMIT_COUNT: AtomicU64 = AtomicU64::new(0);
 static RTC_LAST_INPUT_READ_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
 static RTC_LAST_INPUT_READ_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
 static RTC_LAST_LINUX_IRQ_LOCK_DEPTH: AtomicU64 = AtomicU64::new(0);
-static RTC_SLEEP_WAITERS: Mutex<Vec<SleepWaiter>> = Mutex::new(Vec::new());
+static RTC_SLEEP_WAITERS: Mutex<SleepWaiterTable> = Mutex::new(SleepWaiterTable::new());
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SleepWaiter {
     task_id: u64,
     wake_tick: u64,
+}
+
+struct SleepWaiterTable {
+    slots: [Option<SleepWaiter>; RTC_SLEEP_WAITER_CAPACITY],
+}
+
+impl SleepWaiterTable {
+    const fn new() -> Self {
+        Self {
+            slots: [None; RTC_SLEEP_WAITER_CAPACITY],
+        }
+    }
+
+    fn insert_or_update(&mut self, waiter: SleepWaiter) -> bool {
+        let mut free_index = None;
+        for (index, slot) in self.slots.iter_mut().enumerate() {
+            match slot {
+                Some(existing) if existing.task_id == waiter.task_id => {
+                    existing.wake_tick = waiter.wake_tick;
+                    return true;
+                }
+                None if free_index.is_none() => free_index = Some(index),
+                _ => {}
+            }
+        }
+
+        let Some(index) = free_index else {
+            return false;
+        };
+        self.slots[index] = Some(waiter);
+        true
+    }
+
+    fn take_ready(&mut self, now: u64) -> Option<u64> {
+        for slot in self.slots.iter_mut() {
+            let Some(waiter) = *slot else {
+                continue;
+            };
+            if waiter.wake_tick <= now {
+                *slot = None;
+                return Some(waiter.task_id);
+            }
+        }
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -365,21 +410,19 @@ fn block_current_user_until(target: u64) -> bool {
 
 fn register_sleep_waiter(task_id: u64, wake_tick: u64) {
     let mut waiters = RTC_SLEEP_WAITERS.lock();
-    if let Some(waiter) = waiters.iter_mut().find(|waiter| waiter.task_id == task_id) {
-        waiter.wake_tick = wake_tick;
-        return;
+    if !waiters.insert_or_update(SleepWaiter { task_id, wake_tick }) {
+        crate::debug::println!(
+            "rtc sleep waiter table full: task={} wake_tick={}",
+            task_id,
+            wake_tick
+        );
     }
-    waiters.push(SleepWaiter { task_id, wake_tick });
 }
 
 fn wake_ready_sleepers(now: u64) {
     loop {
-        let task_id = {
-            let mut waiters = RTC_SLEEP_WAITERS.lock();
-            let Some(index) = waiters.iter().position(|waiter| waiter.wake_tick <= now) else {
-                return;
-            };
-            waiters.swap_remove(index).task_id
+        let Some(task_id) = RTC_SLEEP_WAITERS.lock().take_ready(now) else {
+            return;
         };
         let _ = crate::hooks::wake_user_task(task_id);
     }

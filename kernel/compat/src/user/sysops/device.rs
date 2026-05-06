@@ -173,7 +173,9 @@ pub(crate) fn munmap_current_process_range(
         }
 
         for (segment_start, segment_len) in &shared_surface_segments {
-            let page_count = (*segment_len as usize).div_ceil(PAGE_SIZE as usize);
+            let segment_len =
+                usize::try_from(*segment_len).map_err(|_| DeviceSysopError::InvalidArgument)?;
+            let page_count = segment_len.div_ceil(PAGE_SIZE as usize);
             process_state
                 .address_space_mut()
                 .unmap_user_pages_without_free_at(VirtAddr::new(*segment_start), page_count)?;

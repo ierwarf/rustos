@@ -10,6 +10,7 @@ use crate::memory::kernel_vm::{DIRECT_MAP_PHYS_LIMIT, higher_half_addr};
 
 const PAGE_SIZE: u64 = 4096;
 const BITS_PER_WORD: usize = 64;
+const MAX_USABLE_RANGES: usize = 128;
 
 static PHYS_ALLOCATOR: Mutex<PhysAllocatorState> = Mutex::new(PhysAllocatorState::new());
 
@@ -43,13 +44,31 @@ struct PhysAllocatorState {
     usable_frames: usize,
     free_frames: usize,
     next_hint: usize,
-    memory_map_ptr: *const BootMemoryRegion,
-    memory_map_count: usize,
+    usable_ranges: [UsableFrameRange; MAX_USABLE_RANGES],
+    usable_range_count: usize,
     bitmap_phys_start: u64,
     bitmap_page_count: usize,
 }
 
 unsafe impl Send for PhysAllocatorState {}
+
+#[derive(Clone, Copy)]
+struct UsableFrameRange {
+    start_frame: usize,
+    page_count: usize,
+}
+
+impl UsableFrameRange {
+    const EMPTY: Self = Self {
+        start_frame: 0,
+        page_count: 0,
+    };
+
+    fn contains(self, frame_index: usize) -> bool {
+        let end = self.start_frame.saturating_add(self.page_count);
+        (self.start_frame..end).contains(&frame_index)
+    }
+}
 
 impl PhysAllocatorState {
     const fn new() -> Self {
@@ -61,8 +80,8 @@ impl PhysAllocatorState {
             usable_frames: 0,
             free_frames: 0,
             next_hint: 0,
-            memory_map_ptr: ptr::null(),
-            memory_map_count: 0,
+            usable_ranges: [UsableFrameRange::EMPTY; MAX_USABLE_RANGES],
+            usable_range_count: 0,
             bitmap_phys_start: 0,
             bitmap_page_count: 0,
         }
@@ -164,7 +183,7 @@ impl PhysAllocatorState {
 
         let mut frame = start;
         while frame < end {
-            if self.is_used(frame) {
+            if self.is_used(frame) || !frame_is_boot_usable(self, frame) {
                 frame += 1;
                 continue;
             }
@@ -173,6 +192,7 @@ impl PhysAllocatorState {
             while run_len < page_count
                 && frame + run_len < max_frame_exclusive
                 && !self.is_used(frame + run_len)
+                && frame_is_boot_usable(self, frame + run_len)
             {
                 run_len += 1;
             }
@@ -229,7 +249,11 @@ pub fn init(boot_info_ptr: *const BootInfo) {
         let memory_map = boot_memory_map(boot_info);
 
         let max_phys_end = usable_region_spans(memory_map)
-            .map(|(start_phys, page_count)| start_phys + page_count as u64 * PAGE_SIZE)
+            .filter_map(|(start_phys, page_count)| {
+                (page_count as u64)
+                    .checked_mul(PAGE_SIZE)
+                    .and_then(|bytes| start_phys.checked_add(bytes))
+            })
             .max()
             .unwrap_or(0);
         if max_phys_end == 0 {
@@ -238,7 +262,9 @@ pub fn init(boot_info_ptr: *const BootInfo) {
 
         let frame_count = (max_phys_end / PAGE_SIZE) as usize;
         let bitmap_words = frame_count.div_ceil(BITS_PER_WORD);
-        let bitmap_bytes = bitmap_words * core::mem::size_of::<u64>();
+        let bitmap_bytes = bitmap_words
+            .checked_mul(core::mem::size_of::<u64>())
+            .expect("physical allocator bitmap size overflow");
         let bitmap_pages = bitmap_bytes.div_ceil(PAGE_SIZE as usize);
         let Some(bitmap_phys) = usable_region_spans(memory_map)
             .find(|(_, page_count)| *page_count >= bitmap_pages)
@@ -260,17 +286,31 @@ pub fn init(boot_info_ptr: *const BootInfo) {
             usable_frames: 0,
             free_frames: 0,
             next_hint: 0,
-            memory_map_ptr: boot_info.memory_map.entries_ptr as *const BootMemoryRegion,
-            memory_map_count: boot_info.memory_map.entry_count as usize,
+            usable_ranges: [UsableFrameRange::EMPTY; MAX_USABLE_RANGES],
+            usable_range_count: 0,
             bitmap_phys_start: bitmap_phys,
             bitmap_page_count: bitmap_pages,
         };
 
         for (start_phys, page_count) in usable_region_spans(memory_map) {
             let start_frame = (start_phys / PAGE_SIZE) as usize;
+            if new_state.usable_range_count >= MAX_USABLE_RANGES {
+                panic!("boot memory map has too many usable ranges");
+            }
+            new_state.usable_ranges[new_state.usable_range_count] = UsableFrameRange {
+                start_frame,
+                page_count,
+            };
+            new_state.usable_range_count += 1;
             new_state.mark_range_free(start_frame, page_count);
-            new_state.usable_frames = new_state.usable_frames.saturating_add(page_count);
-            new_state.free_frames = new_state.free_frames.saturating_add(page_count);
+            new_state.usable_frames = new_state
+                .usable_frames
+                .checked_add(page_count)
+                .expect("usable frame count overflow");
+            new_state.free_frames = new_state
+                .free_frames
+                .checked_add(page_count)
+                .expect("free frame count overflow");
         }
 
         new_state.mark_range_used((bitmap_phys / PAGE_SIZE) as usize, bitmap_pages);
@@ -364,10 +404,13 @@ fn usable_region_spans<'a>(
             return None;
         }
 
-        let start = region.phys_start.min(DIRECT_MAP_PHYS_LIMIT);
+        let start = align_up(region.phys_start, PAGE_SIZE)?.min(DIRECT_MAP_PHYS_LIMIT);
         let end = region
-            .phys_start
-            .saturating_add(region.page_count.saturating_mul(PAGE_SIZE))
+            .page_count
+            .checked_mul(PAGE_SIZE)
+            .and_then(|bytes| region.phys_start.checked_add(bytes))
+            .map(|end| align_down(end, PAGE_SIZE))
+            .unwrap_or(0)
             .min(DIRECT_MAP_PHYS_LIMIT);
         if end <= start {
             return None;
@@ -378,23 +421,47 @@ fn usable_region_spans<'a>(
     })
 }
 
-fn frame_is_boot_usable(state: &PhysAllocatorState, frame_index: usize) -> bool {
-    if state.memory_map_ptr.is_null() || state.memory_map_count == 0 {
-        return false;
-    }
+fn align_down(value: u64, align: u64) -> u64 {
+    value & !(align - 1)
+}
 
-    let phys = frame_index as u64 * PAGE_SIZE;
-    let regions =
-        unsafe { core::slice::from_raw_parts(state.memory_map_ptr, state.memory_map_count) };
-    usable_region_spans(regions).any(|(start_phys, page_count)| {
-        let end_phys = start_phys + page_count as u64 * PAGE_SIZE;
-        (start_phys..end_phys).contains(&phys)
-    })
+fn align_up(value: u64, align: u64) -> Option<u64> {
+    value
+        .checked_add(align.checked_sub(1)?)
+        .map(|value| align_down(value, align))
+}
+
+fn frame_is_boot_usable(state: &PhysAllocatorState, frame_index: usize) -> bool {
+    state.usable_ranges[..state.usable_range_count]
+        .iter()
+        .any(|range| range.contains(frame_index))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_state(bitmap: &mut [u64], page_count: usize, next_hint: usize) -> PhysAllocatorState {
+        let mut state = PhysAllocatorState {
+            initialized: true,
+            bitmap_ptr: bitmap.as_mut_ptr(),
+            bitmap_words: bitmap.len(),
+            frame_count: page_count,
+            usable_frames: page_count,
+            free_frames: page_count,
+            next_hint,
+            usable_ranges: [UsableFrameRange::EMPTY; MAX_USABLE_RANGES],
+            usable_range_count: 1,
+            bitmap_phys_start: 0,
+            bitmap_page_count: 0,
+        };
+        state.usable_ranges[0] = UsableFrameRange {
+            start_frame: 0,
+            page_count,
+        };
+        state.mark_range_free(0, page_count);
+        state
+    }
 
     #[test]
     fn usable_region_spans_filter_and_trim_to_direct_map() {
@@ -429,27 +496,7 @@ mod tests {
     #[test]
     fn bitmap_allocator_reuses_freed_frames() {
         let mut bitmap = [u64::MAX; 1];
-        let regions = [BootMemoryRegion {
-            phys_start: 0,
-            page_count: 8,
-            kind: BootMemoryKind::Usable,
-            _reserved0: 0,
-        }];
-
-        let mut state = PhysAllocatorState {
-            initialized: true,
-            bitmap_ptr: bitmap.as_mut_ptr(),
-            bitmap_words: 1,
-            frame_count: 8,
-            usable_frames: 8,
-            free_frames: 8,
-            next_hint: 0,
-            memory_map_ptr: regions.as_ptr(),
-            memory_map_count: regions.len(),
-            bitmap_phys_start: 0,
-            bitmap_page_count: 0,
-        };
-        state.mark_range_free(0, 8);
+        let mut state = test_state(&mut bitmap, 8, 0);
 
         let first = state.alloc_contiguous_locked(2).unwrap();
         assert_eq!(first.as_u64(), 0);
@@ -464,27 +511,7 @@ mod tests {
     #[test]
     fn bounded_allocator_stays_under_limit() {
         let mut bitmap = [u64::MAX; 1];
-        let regions = [BootMemoryRegion {
-            phys_start: 0,
-            page_count: 8,
-            kind: BootMemoryKind::Usable,
-            _reserved0: 0,
-        }];
-
-        let mut state = PhysAllocatorState {
-            initialized: true,
-            bitmap_ptr: bitmap.as_mut_ptr(),
-            bitmap_words: 1,
-            frame_count: 8,
-            usable_frames: 8,
-            free_frames: 8,
-            next_hint: 6,
-            memory_map_ptr: regions.as_ptr(),
-            memory_map_count: regions.len(),
-            bitmap_phys_start: 0,
-            bitmap_page_count: 0,
-        };
-        state.mark_range_free(0, 8);
+        let mut state = test_state(&mut bitmap, 8, 6);
 
         let allocated = state
             .alloc_contiguous_bounded_locked(2, 4)
@@ -495,27 +522,7 @@ mod tests {
     #[test]
     fn allocator_can_use_last_possible_contiguous_block() {
         let mut bitmap = [u64::MAX; 1];
-        let regions = [BootMemoryRegion {
-            phys_start: 0,
-            page_count: 8,
-            kind: BootMemoryKind::Usable,
-            _reserved0: 0,
-        }];
-
-        let mut state = PhysAllocatorState {
-            initialized: true,
-            bitmap_ptr: bitmap.as_mut_ptr(),
-            bitmap_words: 1,
-            frame_count: 8,
-            usable_frames: 8,
-            free_frames: 8,
-            next_hint: 6,
-            memory_map_ptr: regions.as_ptr(),
-            memory_map_count: regions.len(),
-            bitmap_phys_start: 0,
-            bitmap_page_count: 0,
-        };
-        state.mark_range_free(0, 8);
+        let mut state = test_state(&mut bitmap, 8, 6);
 
         let allocated = state
             .alloc_contiguous_locked(2)

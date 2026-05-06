@@ -18,6 +18,8 @@ static IRQ_SPIN_LOCKS: Mutex<Vec<&'static CompatLockState>> = Mutex::new(Vec::ne
 static MUTEX_LOCKS: Mutex<Vec<&'static CompatLockState>> = Mutex::new(Vec::new());
 static IRQ_LOCK_OWNERS: Mutex<Vec<IrqOwnerState>> = Mutex::new(Vec::new());
 static MUTEX_DEBUG_REMAINING: AtomicUsize = AtomicUsize::new(64);
+const MAX_COMPAT_PRINTK_BYTES: usize = 4096;
+const MAX_COMPAT_RANDOM_BYTES: usize = 1 << 20;
 #[repr(C)]
 pub(crate) struct LinuxTimespec64 {
     tv_sec: i64,
@@ -304,6 +306,7 @@ pub(crate) unsafe extern "C" fn get_random_bytes(dest: *mut c_void, len: usize) 
     if dest.is_null() || len == 0 {
         return;
     }
+    let len = len.min(MAX_COMPAT_RANDOM_BYTES);
     let mut state = unsafe { ktime_get_mono_fast_ns() } ^ 0x9e37_79b9_7f4a_7c15;
     let bytes = unsafe { slice::from_raw_parts_mut(dest.cast::<u8>(), len) };
     for byte in bytes {
@@ -382,7 +385,8 @@ fn copy_format_string(dest: *mut c_char, size: usize, fmt: *const c_char) -> i32
         return 0;
     };
 
-    let copy_len = bytes.len().min(size.saturating_sub(1));
+    let copy_limit = size.saturating_sub(1).min(MAX_COMPAT_PRINTK_BYTES);
+    let copy_len = bytes.len().min(copy_limit);
     unsafe {
         ptr::copy_nonoverlapping(bytes.as_ptr(), dest as *mut u8, copy_len);
         *dest.add(copy_len) = 0;
@@ -440,7 +444,7 @@ fn cstr_bytes<'a>(fmt: *const c_char) -> Option<&'a [u8]> {
 
     let mut len = 0usize;
     let mut cursor = fmt;
-    while unsafe { *cursor } != 0 {
+    while len < MAX_COMPAT_PRINTK_BYTES && unsafe { *cursor } != 0 {
         len += 1;
         cursor = unsafe { cursor.add(1) };
     }

@@ -32,6 +32,7 @@
 
 # AI Agent Reference
 
+- [AI Map](ai-map.md)
 - [AI Agent Reference](ai/README.md)
 - [Token Policy](ai/token-policy.md)
 - [Task Router](ai/task-router.md)

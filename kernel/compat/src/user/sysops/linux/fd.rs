@@ -92,8 +92,12 @@ pub(crate) fn writev(fd: u64, iov_ptr: u64, iov_count: u64) -> Result<usize, Lin
 
     let mut total_written = 0usize;
     for index in 0..iov_count {
+        let iovec_offset = index
+            .checked_mul(size_of::<linux_abi::LinuxIovec>())
+            .and_then(|offset| u64::try_from(offset).ok())
+            .ok_or(LinuxSysopError::InvalidArgument)?;
         let iovec_ptr = iov_ptr
-            .checked_add((index * size_of::<linux_abi::LinuxIovec>()) as u64)
+            .checked_add(iovec_offset)
             .ok_or(LinuxSysopError::InvalidArgument)?;
         let mut iovec = linux_abi::LinuxIovec::default();
         let iovec_bytes = unsafe {
@@ -317,13 +321,16 @@ pub(crate) fn close(fd: u64) -> Result<(), LinuxSysopError> {
         process_state
             .handles_mut()
             .close(fd)
-            .map(|_| ())
             .ok_or(LinuxSysopError::BadFileDescriptor)
     }) else {
         return Err(LinuxSysopError::Unsupported);
     };
 
-    result
+    let handle = result?;
+    if let KernelHandle::InetSocket(socket) = handle {
+        kernel_io_manager::api::network::close_inet_socket(socket.token_id());
+    }
+    Ok(())
 }
 
 pub(crate) fn dup(fd: u64) -> Result<u64, LinuxSysopError> {
@@ -821,10 +828,16 @@ fn poll_revents_for_handle(
                 invalid: revents & linux_abi::POLLNVAL != 0,
             }
         }
-        KernelHandle::InetSocket(_) => HandleReadiness {
-            writable: true,
-            ..HandleReadiness::default()
-        },
+        KernelHandle::InetSocket(socket) => {
+            let readable = kernel_io_manager::api::network::inet_readable_bytes(socket.token_id())
+                .map(|len| len != 0)
+                .unwrap_or(false);
+            HandleReadiness {
+                readable,
+                writable: kernel_io_manager::api::network::inet_socket_writable(socket.token_id()),
+                ..HandleReadiness::default()
+            }
+        }
         KernelHandle::DisplaySurface(_) => HandleReadiness {
             writable: true,
             ..HandleReadiness::default()

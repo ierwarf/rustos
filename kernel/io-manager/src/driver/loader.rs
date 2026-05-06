@@ -10,6 +10,9 @@ use driver_abi::{
     DriverBus, DriverClass, DriverModuleHeader, RUSTOS_DRIVER_ABI_VERSION_SYMBOL,
     RUSTOS_DRIVER_HEADER_SYMBOL, RUSTOS_DRIVER_INIT_SYMBOL,
 };
+use elf::ElfBytes;
+use elf::endian::LittleEndian as ElfLittleEndian;
+use elf::file::Class as ElfClass;
 use object::LittleEndian;
 use object::elf::{
     self as objelf, FileHeader64 as RawElfHeader, Rela64 as RawRela,
@@ -22,7 +25,12 @@ use super::{bus, class, export, module_registry, registry};
 
 macro_rules! driver_diag {
     ($level:expr, $event_id:expr, $object_id:expr, $($arg:tt)*) => {{
-        let _ = ($event_id, $object_id);
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Driver,
+            "driver-loader",
+            ($event_id) as u64,
+            ($object_id) as u64,
+        );
         if crate::debug::should_emit(crate::debug::LogCategory::Driver, $level) {
             crate::debug::log_args_site(
                 crate::debug::LogCategory::Driver,
@@ -45,7 +53,7 @@ const MAX_MODULE_RELOCATIONS: usize = 262144;
 const MAX_MODULE_SECTION_ALIGN: usize = 64 * 1024;
 const MAX_MODULE_ARENA_BYTES: usize = 128 * 1024 * 1024;
 const MAX_COMPAT_TRAMPOLINES: usize = 4096;
-const TRAMPOLINE_SIZE: usize = 32;
+const TRAMPOLINE_SIZE: usize = 64;
 const TRAMPOLINES_PER_PAGE: usize = MODULE_PAGE_SIZE / TRAMPOLINE_SIZE;
 const MODULE_INIT_STACK_SIZE: usize = 16 * 1024 * 1024;
 
@@ -56,7 +64,6 @@ const R_X86_64_32: u32 = 10;
 const R_X86_64_32S: u32 = 11;
 const R_X86_64_PC64: u32 = 24;
 const SHT_X86_64_UNWIND: u32 = 0x7000_0001;
-const ELF64_HEADER_SIZE: usize = 64;
 const ELF_ENDIAN: LittleEndian = LittleEndian;
 
 #[derive(Clone, Copy)]
@@ -67,25 +74,12 @@ pub(super) struct ModuleElf<'a> {
 
 impl<'a> ModuleElf<'a> {
     fn parse(input: &'a [u8]) -> Result<Self, &'static str> {
+        let parsed = ElfBytes::<ElfLittleEndian>::minimal_parse(input)
+            .map_err(|_| "module ELF is invalid")?;
+        if parsed.ehdr.class != ElfClass::ELF64 {
+            return Err("module ELF is invalid");
+        }
         let header = read_raw_elf_header(input)?;
-        if header.e_ident.magic != objelf::ELFMAG {
-            return Err("module ELF is invalid");
-        }
-        if header.e_ident.class != objelf::ELFCLASS64 {
-            return Err("module ELF is invalid");
-        }
-        if header.e_ident.data != objelf::ELFDATA2LSB {
-            return Err("module ELF is invalid");
-        }
-        if header.e_ident.version != objelf::EV_CURRENT {
-            return Err("module ELF is invalid");
-        }
-        if header.e_version.get(ELF_ENDIAN) != objelf::EV_CURRENT as u32 {
-            return Err("module ELF is invalid");
-        }
-        if usize::from(header.e_ehsize.get(ELF_ENDIAN)) != ELF64_HEADER_SIZE {
-            return Err("module ELF header is invalid");
-        }
         Ok(Self { input, header })
     }
 }
@@ -134,12 +128,16 @@ unsafe fn call_with_module_init_stack0(entry: usize) -> i32 {
     .expect("scheduler must accept module init stack bounds");
     let mut result: i32;
     let stack_top = module_init_stack_top();
+    // x86-64 Linux kernel code is built for an 8-byte stack boundary. Enter
+    // compat module init with rsp % 16 == 0; after the CALL pushes its return
+    // address, this matches the kernel module compiler's expected parity.
     unsafe {
         asm!(
             "push rbx",
             "mov rbx, rsp",
             "mov rsp, rdx",
             "and rsp, -16",
+            "sub rsp, 8",
             "call rax",
             "mov rsp, rbx",
             "pop rbx",
@@ -468,6 +466,12 @@ pub(super) fn load_module_image_explicit(
                 image_path,
                 init_addr
             );
+            crate::debug::record_milestone(
+                crate::debug::LogCategory::Driver,
+                "module-init-rustos-call",
+                image.len() as u64,
+                init_addr as u64,
+            );
             unsafe {
                 call_with_module_init_stack1(init_addr, super::exported_kernel_api() as usize)
             }
@@ -509,9 +513,21 @@ pub(super) fn load_module_image_explicit(
                 image_path,
                 init_addr
             );
+            crate::debug::record_milestone(
+                crate::debug::LogCategory::Driver,
+                "module-init-linux-call",
+                image.len() as u64,
+                init_addr as u64,
+            );
             unsafe { call_with_module_init_stack0(init_addr) }
         }
     };
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Driver,
+        "module-init-return",
+        image.len() as u64,
+        status as u32 as u64,
+    );
     driver_diag!(
         crate::debug::LogLevel::Debug,
         28,
@@ -801,10 +817,17 @@ unsafe impl Send for LoadedDriverModule {}
 
 struct KernelCompatTrampoline {
     target_addr: usize,
+    mode: CompatTrampolineMode,
     runtime_addr: usize,
 }
 
 unsafe impl Send for KernelCompatTrampoline {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompatTrampolineMode {
+    AlignRustCall,
+    PreserveStackTail,
+}
 
 struct ModuleArenaAllocation {
     phys_start: PhysAddr,
@@ -973,7 +996,16 @@ fn debug_probe_module_memory(
     layouts: &[Option<ModuleSectionLayout>],
     policy: SymbolResolvePolicy,
 ) {
-    if !matches!(name, "hid" | "usbhid" | "psmouse") {
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Driver,
+        "module-probe-entry",
+        stable_ascii_hash(name),
+        memory.size() as u64,
+    );
+    if !matches!(
+        name,
+        "hid" | "usbhid" | "psmouse" | "virtio_net" | "virtio-net"
+    ) {
         return;
     }
 
@@ -1067,8 +1099,43 @@ fn debug_probe_module_memory(
                 policy,
             );
         }
+        "virtio_net" | "virtio-net" => {
+            crate::debug::record_milestone(
+                crate::debug::LogCategory::Driver,
+                "module-probe-virtio-net",
+                memory.runtime_base() as u64,
+                memory.size() as u64,
+            );
+            debug_probe_relocation_target(
+                name,
+                ".rela.init.text",
+                "__register_virtio_driver",
+                elf,
+                memory,
+                layouts,
+                policy,
+            );
+            debug_probe_relocation_target(
+                name,
+                ".rela.init.text",
+                "__x86_return_thunk",
+                elf,
+                memory,
+                layouts,
+                policy,
+            );
+        }
         _ => {}
     }
+}
+
+fn stable_ascii_hash(value: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in value.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn debug_probe_writable_symbol_u32(
@@ -1244,6 +1311,31 @@ fn debug_probe_relocation_target(
                     crate::memory::paging::higher_half_addr(patched_target as u64) as *const u64,
                 )
             };
+            if matches!(module_name, "virtio_net" | "virtio-net")
+                && matches!(
+                    symbol_name,
+                    "__register_virtio_driver" | "__x86_return_thunk"
+                )
+            {
+                crate::debug::record_milestone(
+                    crate::debug::LogCategory::Driver,
+                    "module-reloc-target",
+                    write_runtime_addr as u64,
+                    patched_target as u64,
+                );
+                crate::debug::record_milestone(
+                    crate::debug::LogCategory::Driver,
+                    "module-reloc-resolved",
+                    resolved_target as u64,
+                    trampoline_target as u64,
+                );
+                crate::debug::record_milestone(
+                    crate::debug::LogCategory::Driver,
+                    "module-reloc-head",
+                    target_head,
+                    relocation.relocation_type() as u64,
+                );
+            }
             driver_diag!(
                 crate::debug::LogLevel::Debug,
                 32,
@@ -2110,6 +2202,16 @@ fn resolve_symbol_addr(
             if offset > layout.size {
                 return Err("module symbol is outside section");
             }
+            if symbol.size != 0 {
+                let symbol_size =
+                    usize::try_from(symbol.size).map_err(|_| "module symbol size overflow")?;
+                let symbol_end = offset
+                    .checked_add(symbol_size)
+                    .ok_or("module symbol range overflow")?;
+                if symbol_end > layout.size {
+                    return Err("module symbol range is outside section");
+                }
+            }
             section_base
                 .checked_add(offset)
                 .ok_or("module symbol address overflow")
@@ -2212,10 +2314,9 @@ fn resolve_external_symbol_for_relocation(
 ) -> Result<usize, &'static str> {
     let resolved = resolve_external_symbol(elf, symbol, policy)?;
     if relocation_type == R_X86_64_PLT32 {
-        if matches!(symbol_name(elf, symbol), Ok("__x86_return_thunk")) {
-            return Ok(crate::memory::paging::lower_half_addr(resolved as u64) as usize);
-        }
-        return compat_trampoline_addr(resolved);
+        let name =
+            symbol_name(elf, symbol).map_err(|_| "module external symbol name is invalid")?;
+        return compat_trampoline_addr(resolved, compat_trampoline_mode_for_symbol(name));
     }
 
     if matches!(
@@ -2226,6 +2327,15 @@ fn resolve_external_symbol_for_relocation(
     }
 
     Ok(resolved)
+}
+
+fn compat_trampoline_mode_for_symbol(name: &str) -> CompatTrampolineMode {
+    match super::linux::export_abi(name) {
+        super::linux::LinuxCompatExportAbi::AlignRustCall => CompatTrampolineMode::AlignRustCall,
+        super::linux::LinuxCompatExportAbi::PreserveStackTail => {
+            CompatTrampolineMode::PreserveStackTail
+        }
+    }
 }
 
 fn resolve_allowed_external_symbol(name: &str, policy: SymbolResolvePolicy) -> Option<usize> {
@@ -2255,6 +2365,7 @@ fn resolve_linux_allowed_symbol(name: &str, policy: SymbolResolvePolicy) -> Opti
         .or_else(|| super::linux::workqueue::resolve_symbol(name))
         .or_else(|| super::linux::irq::resolve_symbol(name))
         .or_else(|| super::linux::mmio::resolve_symbol(name))
+        .or_else(|| super::linux::virtio::resolve_symbol(name))
         .or_else(|| super::linux::netdev::resolve_symbol(name))
         .or_else(|| super::linux::skbuff::resolve_symbol(name))
         .or_else(|| super::linux::pci::resolve_symbol(name))
@@ -2275,6 +2386,9 @@ fn resolve_linux_allowed_symbol(name: &str, policy: SymbolResolvePolicy) -> Opti
             .or_else(|| super::linux::netdev::resolve_symbol(name))
             .or_else(|| super::linux::skbuff::resolve_symbol(name))
             .or_else(|| super::linux::pci::resolve_symbol(name)),
+        (DriverClass::Network, DriverBus::Pci) => super::linux::pci::resolve_symbol(name)
+            .or_else(|| super::linux::netdev::resolve_symbol(name))
+            .or_else(|| super::linux::skbuff::resolve_symbol(name)),
         _ => None,
     }
 }
@@ -2294,6 +2408,7 @@ fn is_allowed_linux_external_symbol(name: &str, policy: SymbolResolvePolicy) -> 
         || super::linux::workqueue::resolve_symbol(name).is_some()
         || super::linux::irq::resolve_symbol(name).is_some()
         || super::linux::mmio::resolve_symbol(name).is_some()
+        || super::linux::virtio::resolve_symbol(name).is_some()
         || super::linux::netdev::resolve_symbol(name).is_some()
         || super::linux::skbuff::resolve_symbol(name).is_some()
         || super::linux::pci::resolve_symbol(name).is_some()
@@ -2318,6 +2433,11 @@ fn is_allowed_linux_external_symbol(name: &str, policy: SymbolResolvePolicy) -> 
                 || super::linux::skbuff::resolve_symbol(name).is_some()
                 || super::linux::pci::resolve_symbol(name).is_some()
         }
+        (DriverClass::Network, DriverBus::Pci) => {
+            super::linux::pci::resolve_symbol(name).is_some()
+                || super::linux::netdev::resolve_symbol(name).is_some()
+                || super::linux::skbuff::resolve_symbol(name).is_some()
+        }
         _ => false,
     }
 }
@@ -2334,12 +2454,15 @@ fn is_optional_weak_symbol(name: &str) -> bool {
     )
 }
 
-fn compat_trampoline_addr(target_addr: usize) -> Result<usize, &'static str> {
+fn compat_trampoline_addr(
+    target_addr: usize,
+    mode: CompatTrampolineMode,
+) -> Result<usize, &'static str> {
     {
         let trampolines = KERNEL_COMPAT_TRAMPOLINES.lock();
         if let Some(entry) = trampolines
             .iter()
-            .find(|entry| entry.target_addr == target_addr)
+            .find(|entry| entry.target_addr == target_addr && entry.mode == mode)
         {
             return Ok(entry.runtime_addr);
         }
@@ -2368,20 +2491,97 @@ fn compat_trampoline_addr(target_addr: usize) -> Result<usize, &'static str> {
 
     unsafe {
         let code = host_ptr;
-        // Tail-jump into the resolved kernel handler so the compat module's
-        // original return address and any stack-passed arguments remain in
-        // the exact SysV layout the callee expects.
-        //
-        // movabs r11, imm64
-        // jmp r11
-        code.add(0).write(0x49);
-        code.add(1).write(0xBB);
-        (code.add(2) as *mut u64).write_unaligned(target_addr as u64);
-        code.add(10).write(0x41);
-        code.add(11).write(0xFF);
-        code.add(12).write(0xE3);
-        for offset in 13..TRAMPOLINE_SIZE {
-            code.add(offset).write(0x90);
+        match mode {
+            CompatTrampolineMode::AlignRustCall => {
+                // Linux modules are built for an 8-byte stack boundary, while
+                // RustOS handlers follow the normal x86-64 Rust/SysV call
+                // alignment. For handlers without stack-passed arguments,
+                // move the module return address into a stack slot, preserve
+                // Linux callee-saved registers at the ABI boundary, keep the
+                // restore pointer in callee-saved r12, align the call into Rust,
+                // then return through the original module return address.
+                //
+                // pop r10
+                // push r10
+                // push rbx
+                // push rbp
+                // push r12
+                // push r13
+                // push r14
+                // push r15
+                // mov r12, rsp
+                // and rsp, -16
+                // movabs rax, imm64
+                // call rax
+                // mov rsp, r12
+                // pop r15
+                // pop r14
+                // pop r13
+                // pop r12
+                // pop rbp
+                // pop rbx
+                // ret
+                code.add(0).write(0x41);
+                code.add(1).write(0x5A);
+                code.add(2).write(0x41);
+                code.add(3).write(0x52);
+                code.add(4).write(0x53);
+                code.add(5).write(0x55);
+                code.add(6).write(0x41);
+                code.add(7).write(0x54);
+                code.add(8).write(0x41);
+                code.add(9).write(0x55);
+                code.add(10).write(0x41);
+                code.add(11).write(0x56);
+                code.add(12).write(0x41);
+                code.add(13).write(0x57);
+                code.add(14).write(0x49);
+                code.add(15).write(0x89);
+                code.add(16).write(0xE4);
+                code.add(17).write(0x48);
+                code.add(18).write(0x83);
+                code.add(19).write(0xE4);
+                code.add(20).write(0xF0);
+                code.add(21).write(0x48);
+                code.add(22).write(0xB8);
+                (code.add(23) as *mut u64).write_unaligned(target_addr as u64);
+                code.add(31).write(0xFF);
+                code.add(32).write(0xD0);
+                code.add(33).write(0x4C);
+                code.add(34).write(0x89);
+                code.add(35).write(0xE4);
+                code.add(36).write(0x41);
+                code.add(37).write(0x5F);
+                code.add(38).write(0x41);
+                code.add(39).write(0x5E);
+                code.add(40).write(0x41);
+                code.add(41).write(0x5D);
+                code.add(42).write(0x41);
+                code.add(43).write(0x5C);
+                code.add(44).write(0x5D);
+                code.add(45).write(0x5B);
+                code.add(46).write(0xC3);
+                for offset in 47..TRAMPOLINE_SIZE {
+                    code.add(offset).write(0x90);
+                }
+            }
+            CompatTrampolineMode::PreserveStackTail => {
+                // Tail-jump into RustOS' resolved handler. This preserves the
+                // Linux module's original return address and stack-passed
+                // arguments exactly for varargs or >6-argument helpers.
+                //
+                // movabs r11, imm64
+                // jmp r11
+                code.add(0).write(0x49);
+                code.add(1).write(0xBB);
+                (code.add(2) as *mut u64).write_unaligned(target_addr as u64);
+                code.add(10).write(0x41);
+                code.add(11).write(0xFF);
+                code.add(12).write(0xE3);
+                for offset in 13..TRAMPOLINE_SIZE {
+                    code.add(offset).write(0x90);
+                }
+            }
         }
     }
 
@@ -2400,13 +2600,14 @@ fn compat_trampoline_addr(target_addr: usize) -> Result<usize, &'static str> {
     let mut trampolines = KERNEL_COMPAT_TRAMPOLINES.lock();
     if let Some(entry) = trampolines
         .iter()
-        .find(|entry| entry.target_addr == target_addr)
+        .find(|entry| entry.target_addr == target_addr && entry.mode == mode)
     {
         return Ok(entry.runtime_addr);
     }
 
     trampolines.push(KernelCompatTrampoline {
         target_addr,
+        mode,
         runtime_addr,
     });
     Ok(runtime_addr)
@@ -2757,8 +2958,8 @@ fn module_elf_header(elf: &ModuleElf<'_>) -> Result<RawElfHeader<LittleEndian>, 
 }
 
 fn read_raw_elf_header(image: &[u8]) -> Result<RawElfHeader<LittleEndian>, &'static str> {
-    let bytes: &[u8; ELF64_HEADER_SIZE] = image
-        .get(..ELF64_HEADER_SIZE)
+    let bytes: &[u8; size_of::<RawElfHeader<LittleEndian>>()] = image
+        .get(..size_of::<RawElfHeader<LittleEndian>>())
         .ok_or("module ELF header is invalid")?
         .try_into()
         .map_err(|_| "module ELF header is invalid")?;

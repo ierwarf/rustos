@@ -20,6 +20,13 @@ QEMU args:
 - xtask args before `--`.
 - raw QEMU args after `--`.
 - Example: `cargo xtask run --profile nvme -- --no-reboot`.
+- Short KVM no-opt debug runs should use the built-in timeout and summary:
+  `cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file --timeout 35 --summarize-log -- --no-reboot`.
+- Use repeated `--expect <marker>` when a run should stop as soon as specific
+  debugcon markers appear. Without `--expect`, `--timeout` is a controlled stop.
+- Prefer `--summarize-log` and focused `rg` over opening whole log files.
+- Do not add ad hoc QEMU or kernel debug branches for one driver. Route durable
+  debug state through logging, milestones, registries, and common subsystem APIs.
 
 Do not run:
 

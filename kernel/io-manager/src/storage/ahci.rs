@@ -6,6 +6,7 @@ use core::ffi::c_void;
 use core::hint::spin_loop;
 use core::ptr;
 use core::slice;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use spin::Mutex;
 use storage_core::BlockDevice as SharedBlockDevice;
@@ -60,7 +61,9 @@ const SATA_SIGNATURE_ATA: u32 = 0x0000_0101;
 
 const FIS_TYPE_REG_H2D: u8 = 0x27;
 const ATA_CMD_IDENTIFY_DEVICE: u8 = 0xec;
+const ATA_CMD_READ_DMA: u8 = 0xc8;
 const ATA_CMD_READ_DMA_EXT: u8 = 0x25;
+const ATA_CMD_WRITE_DMA: u8 = 0xca;
 const ATA_CMD_WRITE_DMA_EXT: u8 = 0x35;
 const ATA_CMD_FLUSH_CACHE_EXT: u8 = 0xea;
 
@@ -68,10 +71,13 @@ const COMMAND_FIS_DWORDS: u16 = 5;
 const COMMAND_LIST_BYTES: usize = 1024;
 const RECEIVED_FIS_BYTES: usize = 256;
 const COMMAND_TABLE_BYTES: usize = 4096;
-const DMA_BUFFER_BYTES: usize = 4096;
+const DMA_BUFFER_BYTES: usize = 64 * 1024;
 const COMMAND_SLOT: u32 = 0;
 const AHCI_WAIT_SPINS: usize = 1_000_000;
 const LOGICAL_BLOCK_SIZE: usize = 512;
+const DEBUG_BOUNDARY_16M_LBA: u64 = (16 * 1024 * 1024) / LOGICAL_BLOCK_SIZE as u64;
+
+static AHCI_16M_BOUNDARY_LOGGED: AtomicBool = AtomicBool::new(false);
 
 #[repr(C)]
 struct AhciCommandHeader {
@@ -173,15 +179,38 @@ impl SharedBlockDevice for AhciBlockDevice {
             return Err(DiskIoError::InvalidInput);
         }
         let mut runtime = self.runtime.lock();
-        for (index, chunk) in out.chunks_exact_mut(LOGICAL_BLOCK_SIZE).enumerate() {
+        let mut offset = 0usize;
+        while offset < out.len() {
+            let block_offset = offset / LOGICAL_BLOCK_SIZE;
             let block_lba = lba
-                .checked_add(index as u64)
+                .checked_add(block_offset as u64)
                 .ok_or(DiskIoError::InvalidInput)?;
-            if block_lba >= self.sector_count {
+            let transfer_bytes = DMA_BUFFER_BYTES.min(out.len() - offset);
+            let transfer_blocks = transfer_bytes / LOGICAL_BLOCK_SIZE;
+            if transfer_blocks == 0 {
                 return Err(DiskIoError::InvalidInput);
             }
-            let result =
-                self.execute_dma_command(&mut runtime, ATA_CMD_READ_DMA_EXT, block_lba, false);
+            if block_lba
+                .checked_add(transfer_blocks as u64)
+                .ok_or(DiskIoError::InvalidInput)?
+                > self.sector_count
+            {
+                return Err(DiskIoError::InvalidInput);
+            }
+            note_ahci_16m_boundary_once(block_lba, transfer_blocks as u64, false);
+            let command = dma_command_for_range(
+                ATA_CMD_READ_DMA,
+                ATA_CMD_READ_DMA_EXT,
+                block_lba,
+                transfer_blocks,
+            )?;
+            let result = self.execute_dma_command(
+                &mut runtime,
+                command,
+                block_lba,
+                false,
+                transfer_blocks * LOGICAL_BLOCK_SIZE,
+            );
             if let Err(error) = result {
                 crate::debug::println!(
                     "ahci: read failed model={} port={} lba={} error={:?}",
@@ -195,10 +224,11 @@ impl SharedBlockDevice for AhciBlockDevice {
             unsafe {
                 crate::arch::simd::copy_fast(
                     runtime.dma_buffer_cpu.cast_const(),
-                    chunk.as_mut_ptr(),
-                    LOGICAL_BLOCK_SIZE,
+                    out[offset..offset + transfer_blocks * LOGICAL_BLOCK_SIZE].as_mut_ptr(),
+                    transfer_blocks * LOGICAL_BLOCK_SIZE,
                 );
             }
+            offset += transfer_blocks * LOGICAL_BLOCK_SIZE;
         }
         Ok(())
     }
@@ -208,21 +238,41 @@ impl SharedBlockDevice for AhciBlockDevice {
             return Err(DiskIoError::InvalidInput);
         }
         let mut runtime = self.runtime.lock();
-        for (index, chunk) in input.chunks_exact(LOGICAL_BLOCK_SIZE).enumerate() {
+        let mut offset = 0usize;
+        while offset < input.len() {
+            let block_offset = offset / LOGICAL_BLOCK_SIZE;
             let block_lba = lba
-                .checked_add(index as u64)
+                .checked_add(block_offset as u64)
                 .ok_or(DiskIoError::InvalidInput)?;
-            if block_lba >= self.sector_count {
+            let transfer_bytes = DMA_BUFFER_BYTES.min(input.len() - offset);
+            let transfer_blocks = transfer_bytes / LOGICAL_BLOCK_SIZE;
+            if transfer_blocks == 0 {
                 return Err(DiskIoError::InvalidInput);
             }
+            if block_lba
+                .checked_add(transfer_blocks as u64)
+                .ok_or(DiskIoError::InvalidInput)?
+                > self.sector_count
+            {
+                return Err(DiskIoError::InvalidInput);
+            }
+            note_ahci_16m_boundary_once(block_lba, transfer_blocks as u64, true);
+            let byte_count = transfer_blocks * LOGICAL_BLOCK_SIZE;
             unsafe {
                 crate::arch::simd::copy_fast(
-                    chunk.as_ptr(),
+                    input[offset..offset + byte_count].as_ptr(),
                     runtime.dma_buffer_cpu,
-                    LOGICAL_BLOCK_SIZE,
+                    byte_count,
                 );
             }
-            self.execute_dma_command(&mut runtime, ATA_CMD_WRITE_DMA_EXT, block_lba, true)?;
+            let command = dma_command_for_range(
+                ATA_CMD_WRITE_DMA,
+                ATA_CMD_WRITE_DMA_EXT,
+                block_lba,
+                transfer_blocks,
+            )?;
+            self.execute_dma_command(&mut runtime, command, block_lba, true, byte_count)?;
+            offset += byte_count;
         }
         Ok(())
     }
@@ -231,6 +281,29 @@ impl SharedBlockDevice for AhciBlockDevice {
         let mut runtime = self.runtime.lock();
         self.execute_non_data_command(&mut runtime, ATA_CMD_FLUSH_CACHE_EXT)
     }
+}
+
+fn note_ahci_16m_boundary_once(lba: u64, blocks: u64, is_write: bool) {
+    let end = lba.saturating_add(blocks);
+    if lba > DEBUG_BOUNDARY_16M_LBA || end <= DEBUG_BOUNDARY_16M_LBA {
+        return;
+    }
+    if AHCI_16M_BOUNDARY_LOGGED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Storage,
+        "ahci-16m-boundary",
+        lba,
+        (blocks << 1) | if is_write { 1 } else { 0 },
+    );
+    crate::debug::warn!(
+        storage,
+        "ahci: crossing 16MiB disk boundary lba={} blocks={} write={}",
+        lba,
+        blocks,
+        is_write
+    );
 }
 
 impl BlockDeviceOps for AhciBlockDevice {
@@ -297,8 +370,9 @@ impl AhciBlockDevice {
         command: u8,
         lba: u64,
         is_write: bool,
+        byte_count: usize,
     ) -> IoResult<()> {
-        self.prepare_command(runtime, command, lba, is_write, LOGICAL_BLOCK_SIZE)?;
+        self.prepare_command(runtime, command, lba, is_write, byte_count)?;
         self.issue_and_wait()
     }
 
@@ -605,17 +679,31 @@ fn prepare_port_command(
         (*table).cfis[4] = (lba & 0xff) as u8;
         (*table).cfis[5] = ((lba >> 8) & 0xff) as u8;
         (*table).cfis[6] = ((lba >> 16) & 0xff) as u8;
-        (*table).cfis[7] = 1 << 6;
-        (*table).cfis[8] = ((lba >> 24) & 0xff) as u8;
-        (*table).cfis[9] = ((lba >> 32) & 0xff) as u8;
-        (*table).cfis[10] = ((lba >> 40) & 0xff) as u8;
+        if command == ATA_CMD_READ_DMA || command == ATA_CMD_WRITE_DMA {
+            (*table).cfis[7] = 0xe0 | (((lba >> 24) & 0x0f) as u8);
+            (*table).cfis[8] = 0;
+            (*table).cfis[9] = 0;
+            (*table).cfis[10] = 0;
+        } else {
+            (*table).cfis[7] = 1 << 6;
+            (*table).cfis[8] = ((lba >> 24) & 0xff) as u8;
+            (*table).cfis[9] = ((lba >> 32) & 0xff) as u8;
+            (*table).cfis[10] = ((lba >> 40) & 0xff) as u8;
+        }
         (*table).cfis[11] = 0;
-        (*table).cfis[12] = if byte_count == 0 {
+        let sector_count = if byte_count == 0 {
             0
         } else {
-            (byte_count / LOGICAL_BLOCK_SIZE) as u8
+            if byte_count % LOGICAL_BLOCK_SIZE != 0 || byte_count > DMA_BUFFER_BYTES {
+                return Err(DiskIoError::InvalidInput);
+            }
+            byte_count / LOGICAL_BLOCK_SIZE
         };
-        (*table).cfis[13] = 0;
+        if sector_count > u16::MAX as usize {
+            return Err(DiskIoError::InvalidInput);
+        }
+        (*table).cfis[12] = (sector_count & 0xff) as u8;
+        (*table).cfis[13] = ((sector_count >> 8) & 0xff) as u8;
 
         if byte_count != 0 {
             (*table).prdt[0].dba = runtime.dma_buffer_dma as u32;
@@ -625,6 +713,17 @@ fn prepare_port_command(
         }
     }
     Ok(())
+}
+
+fn dma_command_for_range(dma28: u8, dma48: u8, lba: u64, sector_count: usize) -> IoResult<u8> {
+    let end = lba
+        .checked_add(sector_count as u64)
+        .ok_or(DiskIoError::InvalidInput)?;
+    if sector_count <= 256 && end <= (1_u64 << 28) {
+        Ok(dma28)
+    } else {
+        Ok(dma48)
+    }
 }
 
 fn issue_port_command(controller: &AhciController, port: u8) -> IoResult<()> {

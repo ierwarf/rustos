@@ -83,6 +83,7 @@ pub(crate) fn register_loadable_elf_with_priority(
         image_path,
         "",
         "",
+        "",
         None,
         false,
     );
@@ -96,18 +97,20 @@ pub(crate) fn register_loadable_elf_with_policy(
     load_priority: i32,
     image_path: &'static str,
     aliases: &'static str,
+    deps: &'static str,
     softdeps: &'static str,
     provider_group: Option<&'static str>,
     fallback_only: bool,
 ) {
     crate::debug::println!(
-        "driver module registered: name={} class={} bus={} path={} priority={} aliases={} softdeps={} provider_group={} fallback_only={}",
+        "driver module registered: name={} class={} bus={} path={} priority={} aliases={} deps={} softdeps={} provider_group={} fallback_only={}",
         name,
         class::name(class),
         bus::name(bus),
         image_path,
         load_priority,
         aliases,
+        deps,
         softdeps,
         provider_group.unwrap_or("-"),
         fallback_only
@@ -120,6 +123,7 @@ pub(crate) fn register_loadable_elf_with_policy(
         load_priority,
         image_path,
         aliases,
+        deps,
         softdeps,
         provider_group,
         fallback_only,
@@ -139,8 +143,19 @@ pub fn initialize_loadable_modules_for_class(class: DriverClass) -> bool {
     if !ensure_loadable_driver_registry_loaded() {
         return false;
     }
+    activate_builtin_providers_for_class(class);
     initialize_loadable_modules_matching(|record| record.class == class);
-    true
+    class_has_active_loadable_provider(class)
+}
+
+fn activate_builtin_providers_for_class(class: DriverClass) {
+    if class != DriverClass::Display {
+        return;
+    }
+
+    if virtio_gpu::try_enable_primary_display() {
+        registry::mark_provider_group_active("display-primary");
+    }
 }
 
 #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
@@ -215,6 +230,7 @@ fn ensure_loadable_driver_registry_loaded() -> bool {
             .and_then(|value| value.parse::<i32>().ok())
             .unwrap_or(0);
         let aliases = registry_field(line, "aliases").unwrap_or("");
+        let deps = registry_field(line, "deps").unwrap_or("");
         let softdeps = registry_field(line, "softdeps").unwrap_or("");
         let provider_group =
             registry_field(line, "provider_group").filter(|value| !value.is_empty());
@@ -242,6 +258,7 @@ fn ensure_loadable_driver_registry_loaded() -> bool {
         let leaked_name: &'static str = Box::leak(name.to_string().into_boxed_str());
         let leaked_path: &'static str = Box::leak(path.to_string().into_boxed_str());
         let leaked_aliases: &'static str = Box::leak(aliases.to_string().into_boxed_str());
+        let leaked_deps: &'static str = Box::leak(deps.to_string().into_boxed_str());
         let leaked_softdeps: &'static str = Box::leak(softdeps.to_string().into_boxed_str());
         let leaked_provider_group: Option<&'static str> = provider_group
             .map(|value| Box::leak(value.to_string().into_boxed_str()) as &'static str);
@@ -252,6 +269,7 @@ fn ensure_loadable_driver_registry_loaded() -> bool {
             priority,
             leaked_path,
             leaked_aliases,
+            leaked_deps,
             leaked_softdeps,
             leaked_provider_group,
             fallback_only,
@@ -288,126 +306,25 @@ fn initialize_loadable_modules_matching(filter: impl Fn(&DriverRecord) -> bool) 
         let mut deferred = Vec::new();
 
         for candidate in pending.into_iter() {
-            let name = candidate.name;
-            let class = candidate.class;
-            let bus = candidate.bus;
-            let image_path = candidate.image_path;
-
-            if !loadable_candidate_alias_matches(candidate) {
-                registry::update_loadable_module_status(
-                    name,
-                    image_path,
-                    DriverModuleState::Skipped,
-                    Some("no matching device"),
-                );
-                crate::debug::println!(
-                    "driver module skipped: name={} class={} bus={} path={} reason=no matching device aliases={}",
-                    name,
-                    class::name(class),
-                    bus::name(bus),
-                    image_path,
-                    candidate.aliases
-                );
-                progress = true;
-                continue;
-            }
-
-            if candidate.fallback_only && loadable_candidate_provider_active(candidate) {
-                registry::update_loadable_module_status(
-                    name,
-                    image_path,
-                    DriverModuleState::Skipped,
-                    Some("provider already active"),
-                );
-                crate::debug::println!(
-                    "driver module skipped: name={} class={} bus={} path={} reason=provider already active provider_group={}",
-                    name,
-                    class::name(class),
-                    bus::name(bus),
-                    image_path,
-                    candidate.provider_group.unwrap_or("-")
-                );
-                progress = true;
-                continue;
-            }
-
-            if !loadable_candidate_softdeps_satisfied(candidate) {
-                registry::update_loadable_module_status(
-                    name,
-                    image_path,
-                    DriverModuleState::Deferred,
-                    Some("soft dependency unavailable"),
-                );
-                deferred.push(candidate);
-                continue;
-            }
-
-            crate::debug::println!(
-                "driver module load begin: name={} class={} bus={} path={}",
-                name,
-                class::name(class),
-                bus::name(bus),
-                image_path
-            );
-            match load_module_image(name, class, bus, image_path) {
-                Ok(_module) => {
-                    registry::update_loadable_module_status(
-                        name,
-                        image_path,
-                        DriverModuleState::Loaded,
-                        None,
-                    );
-
-                    crate::debug::println!(
-                        "driver module loaded: name={} class={} bus={} path={} base={:#x} host={:#x}",
-                        _module.name,
-                        class::name(class),
-                        bus::name(bus),
-                        _module.image_path,
-                        _module.runtime_base,
-                        _module.host_base
-                    );
+            match load_candidate_with_dependencies(candidate, &mut Vec::new()) {
+                LoadAttempt::Loaded | LoadAttempt::Skipped => {
                     progress = true;
                 }
-                Err(error) => {
-                    if error == "module references unsupported external symbol"
-                        && can_defer_module_dependency(candidate)
-                    {
-                        registry::update_loadable_module_status(
-                            name,
-                            image_path,
-                            DriverModuleState::Deferred,
-                            Some(error),
-                        );
-
-                        deferred.push(candidate);
-                        continue;
-                    }
-
-                    crate::debug::println!(
-                        "driver module load failed: name={} class={} bus={} path={} error={}",
-                        name,
-                        class::name(class),
-                        bus::name(bus),
-                        image_path,
-                        error
-                    );
-                    registry::update_loadable_module_status(
-                        name,
-                        image_path,
-                        DriverModuleState::LoadFailed,
-                        Some(error),
-                    );
+                LoadAttempt::Deferred => {
+                    deferred.push(candidate);
+                }
+                LoadAttempt::Failed => {
+                    progress = true;
                 }
             }
         }
 
         if !progress {
             for _candidate in deferred.iter().copied() {
-                let reason = if loadable_candidate_softdeps_satisfied(_candidate) {
+                let reason = if loadable_candidate_deps_available(_candidate) {
                     "module references unsupported external symbol"
                 } else {
-                    "soft dependency unavailable"
+                    "dependency unavailable"
                 };
                 crate::debug::println!(
                     "driver module deferred: name={} class={} bus={} path={} reason={}",
@@ -437,17 +354,195 @@ fn initialize_loadable_modules_matching(filter: impl Fn(&DriverRecord) -> bool) 
     }
 }
 
-fn can_defer_module_dependency(record: registry::LoadableDriverCandidate) -> bool {
-    !record.softdeps.trim().is_empty()
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoadAttempt {
+    Loaded,
+    Skipped,
+    Deferred,
+    Failed,
 }
 
-fn loadable_candidate_softdeps_satisfied(candidate: registry::LoadableDriverCandidate) -> bool {
+fn load_candidate_with_dependencies(
+    candidate: registry::LoadableDriverCandidate,
+    stack: &mut Vec<&'static str>,
+) -> LoadAttempt {
+    let name = candidate.name;
+    let class = candidate.class;
+    let bus = candidate.bus;
+    let image_path = candidate.image_path;
+
+    if registry::module_dependency_available(name) {
+        return LoadAttempt::Loaded;
+    }
+
+    if stack.contains(&name) {
+        registry::update_loadable_module_status(
+            name,
+            image_path,
+            DriverModuleState::LoadFailed,
+            Some("dependency cycle"),
+        );
+        crate::debug::println!(
+            "driver module load failed: name={} class={} bus={} path={} error=dependency cycle",
+            name,
+            class::name(class),
+            bus::name(bus),
+            image_path
+        );
+        return LoadAttempt::Failed;
+    }
+
+    if !loadable_candidate_alias_matches(candidate) {
+        registry::update_loadable_module_status(
+            name,
+            image_path,
+            DriverModuleState::Skipped,
+            Some("no matching device"),
+        );
+        crate::debug::println!(
+            "driver module skipped: name={} class={} bus={} path={} reason=no matching device aliases={}",
+            name,
+            class::name(class),
+            bus::name(bus),
+            image_path,
+            candidate.aliases
+        );
+        return LoadAttempt::Skipped;
+    }
+
+    if loadable_candidate_provider_active(candidate) {
+        registry::update_loadable_module_status(
+            name,
+            image_path,
+            DriverModuleState::Skipped,
+            Some("provider already active"),
+        );
+        crate::debug::println!(
+            "driver module skipped: name={} class={} bus={} path={} reason=provider already active provider_group={}",
+            name,
+            class::name(class),
+            bus::name(bus),
+            image_path,
+            candidate.provider_group.unwrap_or("-")
+        );
+        return LoadAttempt::Skipped;
+    }
+
+    stack.push(name);
+    if !loadable_candidate_dependencies_loaded(candidate, stack) {
+        stack.pop();
+        registry::update_loadable_module_status(
+            name,
+            image_path,
+            DriverModuleState::Deferred,
+            Some("dependency unavailable"),
+        );
+        return LoadAttempt::Deferred;
+    }
+    stack.pop();
+
+    crate::debug::println!(
+        "driver module load begin: name={} class={} bus={} path={}",
+        name,
+        class::name(class),
+        bus::name(bus),
+        image_path
+    );
+    match load_module_image(name, class, bus, image_path) {
+        Ok(_module) => {
+            registry::update_loadable_module_status(
+                name,
+                image_path,
+                DriverModuleState::Loaded,
+                None,
+            );
+
+            crate::debug::println!(
+                "driver module loaded: name={} class={} bus={} path={} base={:#x} host={:#x}",
+                _module.name,
+                class::name(class),
+                bus::name(bus),
+                _module.image_path,
+                _module.runtime_base,
+                _module.host_base
+            );
+            LoadAttempt::Loaded
+        }
+        Err(error) => {
+            crate::debug::println!(
+                "driver module load failed: name={} class={} bus={} path={} error={}",
+                name,
+                class::name(class),
+                bus::name(bus),
+                image_path,
+                error
+            );
+            registry::update_loadable_module_status(
+                name,
+                image_path,
+                DriverModuleState::LoadFailed,
+                Some(error),
+            );
+            LoadAttempt::Failed
+        }
+    }
+}
+
+fn loadable_candidate_deps_available(candidate: registry::LoadableDriverCandidate) -> bool {
     candidate
-        .softdeps
+        .deps
         .split(',')
         .map(str::trim)
         .filter(|dep| !dep.is_empty())
         .all(registry::module_dependency_available)
+}
+
+fn loadable_candidate_dependencies_loaded(
+    candidate: registry::LoadableDriverCandidate,
+    stack: &mut Vec<&'static str>,
+) -> bool {
+    for dep in candidate
+        .deps
+        .split(',')
+        .map(str::trim)
+        .filter(|dep| !dep.is_empty())
+    {
+        if !load_dependency(dep, true, stack) {
+            return false;
+        }
+    }
+    for dep in candidate
+        .softdeps
+        .split(',')
+        .map(str::trim)
+        .filter(|dep| !dep.is_empty())
+    {
+        let _ = load_dependency(dep, false, stack);
+    }
+    true
+}
+
+fn load_dependency(dep: &str, required: bool, stack: &mut Vec<&'static str>) -> bool {
+    if registry::module_dependency_available(dep) {
+        return true;
+    }
+    let Some(candidate) = registry::loadable_candidate_by_name(dep) else {
+        return !required;
+    };
+    match load_candidate_with_dependencies(candidate, stack) {
+        LoadAttempt::Loaded => true,
+        LoadAttempt::Skipped | LoadAttempt::Deferred | LoadAttempt::Failed => !required,
+    }
+}
+
+fn class_has_active_loadable_provider(class: DriverClass) -> bool {
+    if class == DriverClass::Display {
+        return crate::io::gui::display_info().is_some();
+    }
+
+    registry::loadable_records().iter().any(|record| {
+        record.class == class && !matches!(record.module_state, Some(DriverModuleState::LoadFailed))
+    })
 }
 
 fn loadable_candidate_provider_active(candidate: registry::LoadableDriverCandidate) -> bool {
@@ -457,7 +552,7 @@ fn loadable_candidate_provider_active(candidate: registry::LoadableDriverCandida
     if group == "display-primary" {
         return crate::io::gui::display_info().is_some();
     }
-    registry::loadable_provider_group_loaded(group)
+    registry::provider_group_active(group)
 }
 
 fn loadable_candidate_alias_matches(candidate: registry::LoadableDriverCandidate) -> bool {
@@ -493,7 +588,7 @@ fn device_alias_present(alias: &str, class: DriverClass, bus: DriverBus) -> bool
     }
 
     if alias.starts_with("hid:") {
-        return class == DriverClass::Input;
+        return class == DriverClass::Input && crate::usb::hid_interfaces_available();
     }
 
     if alias.starts_with("serio:") {
@@ -590,6 +685,7 @@ mod tests {
             load_priority: 0,
             image_path: None,
             aliases: "",
+            deps: "",
             softdeps: "",
             provider_group: None,
             fallback_only: false,
@@ -610,6 +706,7 @@ mod tests {
                 load_priority: 0,
                 image_path: None,
                 aliases: "",
+                deps: "",
                 softdeps: "",
                 provider_group: None,
                 fallback_only: false,
@@ -628,6 +725,7 @@ mod tests {
                 load_priority: 0,
                 image_path: None,
                 aliases: "",
+                deps: "",
                 softdeps: "",
                 provider_group: None,
                 fallback_only: false,
@@ -653,6 +751,7 @@ mod tests {
             load_priority: 0,
             image_path: None,
             aliases: "",
+            deps: "",
             softdeps: "",
             provider_group: None,
             fallback_only: false,
@@ -685,6 +784,7 @@ mod tests {
             load_priority: 0,
             image_path: None,
             aliases: "",
+            deps: "",
             softdeps: "",
             provider_group: None,
             fallback_only: false,

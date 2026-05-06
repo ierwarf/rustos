@@ -170,7 +170,7 @@ fn map_bar(
     max_len: u64,
     write_combine: bool,
 ) -> *mut c_void {
-    if bar < 0 {
+    if dev.is_null() || bar < 0 {
         return core::ptr::null_mut();
     }
 
@@ -180,10 +180,13 @@ fn map_bar(
         return core::ptr::null_mut();
     }
 
-    let size = if max_len == 0 || max_len > len {
-        len as usize
+    let selected_len = if max_len == 0 || max_len > len {
+        len
     } else {
-        max_len as usize
+        max_len
+    };
+    let Some(size) = usize::try_from(selected_len).ok() else {
+        return core::ptr::null_mut();
     };
     unsafe {
         if write_combine {

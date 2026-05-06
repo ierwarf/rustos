@@ -2,13 +2,14 @@ use super::compat::{
     LinuxCompatUrb, LinuxCompatUsbClassDriver, LinuxCompatUsbDevice, LinuxCompatUsbDriver,
     LinuxCompatUsbInterface,
 };
-use alloc::alloc::{Layout, alloc, dealloc};
 use alloc::boxed::Box;
 use core::arch::asm;
 use core::ffi::{c_char, c_void};
 use core::ptr;
 
 static USB_BUS_TYPE: [u8; 128] = [0; 128];
+const MAX_USB_STRING_BYTES: usize = 256;
+const MAX_USB_EXTRA_DESCRIPTOR_BYTES: usize = 4096;
 
 #[inline(always)]
 fn current_rsp() -> usize {
@@ -43,14 +44,16 @@ pub(crate) unsafe extern "C" fn usb_register_driver(
     _owner: *mut c_void,
     _mod_name: *const c_char,
 ) -> i32 {
-    crate::debug::write_debugcon_only_line(b"linux compat: usb_register_driver raw-entry");
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Compat,
+        "usb-register-entry",
+        driver as usize as u64,
+        0,
+    );
     usb_compat_diag!(debug, "linux compat: usb_register_driver entry");
     if driver.is_null() {
         return -22;
     }
-    crate::debug::write_debugcon_only_line(b"linux compat: usb_register_driver raw-before-info");
-    crate::debug::write_debugcon_only_line(b"linux compat: usb_register_driver raw-begin");
-    crate::debug::write_debugcon_only_line(b"linux compat: usb_register_driver raw-after-info");
     usb_compat_diag!(debug, "linux compat: usb_register_driver nonnull");
 
     unsafe {
@@ -84,22 +87,28 @@ pub(crate) unsafe extern "C" fn usb_register_driver(
         }
     }
 
-    crate::debug::write_debugcon_only_line(
-        b"linux compat: usb_register_driver raw-before-bus-register",
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Compat,
+        "usb-register-bus-begin",
+        driver as usize as u64,
+        0,
     );
     let _ = unsafe { crate::driver::linux::device::bus_register(bus_type_ptr() as *mut c_void) };
-    crate::debug::write_debugcon_only_line(
-        b"linux compat: usb_register_driver raw-after-bus-register",
-    );
-    crate::debug::write_debugcon_only_line(
-        b"linux compat: usb_register_driver raw-before-driver-register",
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Compat,
+        "usb-register-driver-begin",
+        driver as usize as u64,
+        0,
     );
     let status =
         unsafe { crate::driver::linux::device::driver_register(&mut (*driver).driver as *mut _) };
-    crate::debug::write_debugcon_only_line(
-        b"linux compat: usb_register_driver raw-after-driver-register",
-    );
     if status != 0 {
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Compat,
+            "usb-register-driver-failed",
+            driver as usize as u64,
+            status as u64,
+        );
         usb_compat_diag!(
             error,
             "linux compat: usb_register_driver driver_register failed driver={:#x} status={}",
@@ -109,56 +118,29 @@ pub(crate) unsafe extern "C" fn usb_register_driver(
         return status;
     }
 
-    crate::debug::write_debugcon_only_line(
-        b"linux compat: usb_register_driver raw-before-register-linux-driver",
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Compat,
+        "usb-register-linux-begin",
+        driver as usize as u64,
+        0,
     );
     let status = crate::usb::register_linux_driver(driver);
     unsafe {
         asm!("cld", options(nomem, nostack));
     }
-    crate::debug::write_debugcon_only_line(
-        alloc::format!(
-            "linux compat: usb_register_driver raw-after-register-rsp={:#x}",
-            current_rsp()
-        )
-        .as_bytes(),
-    );
-    crate::debug::write_debugcon_only_line(
-        b"linux compat: usb_register_driver raw-after-register-linux-driver",
-    );
-    crate::debug::write_debugcon_only_line(
-        b"linux compat: usb_register_driver raw-before-end-diag",
-    );
-    crate::debug::write_debugcon_only_line(
-        b"linux compat: usb_register_driver raw-before-should-emit",
-    );
-    let should_emit = crate::debug::should_emit(
+    crate::debug::record_milestone(
         crate::debug::LogCategory::Compat,
-        crate::debug::LogLevel::Info,
+        "usb-register-done",
+        driver as usize as u64,
+        status as u64,
     );
-    crate::debug::write_debugcon_only_line(
-        b"linux compat: usb_register_driver raw-after-should-emit",
+    usb_compat_diag!(
+        info,
+        "linux compat: usb_register_driver end driver={:#x} status={} rsp={:#x}",
+        driver as usize,
+        status,
+        current_rsp()
     );
-    if false && should_emit {
-        crate::debug::write_debugcon_only_line(
-            b"linux compat: usb_register_driver raw-before-log-args-site",
-        );
-        crate::debug::log_args_site(
-            crate::debug::LogCategory::Compat,
-            crate::debug::LogLevel::Info,
-            module_path!(),
-            line!(),
-            format_args!(
-                "linux compat: usb_register_driver end driver={:#x} status={}",
-                driver as usize, status
-            ),
-        );
-        crate::debug::write_debugcon_only_line(
-            b"linux compat: usb_register_driver raw-after-log-args-site",
-        );
-    }
-    crate::debug::write_debugcon_only_line(b"linux compat: usb_register_driver raw-after-end-diag");
-    crate::debug::write_debugcon_only_line(b"linux compat: usb_register_driver raw-return");
     status
 }
 
@@ -233,6 +215,9 @@ pub(crate) unsafe extern "C" fn usb_control_msg(
     let value = value as u16;
     let index = index as u16;
     let size = size.min(u16::MAX as usize) as u16;
+    if dev.is_null() || (size != 0 && data.is_null()) {
+        return -22;
+    }
     crate::debug::write_debugcon_only_line(
         alloc::format!(
             "usb_control_msg: begin dev={:#x} req={:#x} type={:#x} value={:#x} index={:#x} data={:#x} size={}",
@@ -266,6 +251,9 @@ pub(crate) unsafe extern "C" fn usb_interrupt_msg(
     actual_length: *mut i32,
     _timeout: i32,
 ) -> i32 {
+    if dev.is_null() || data.is_null() || len < 0 {
+        return -22;
+    }
     crate::usb::interrupt_msg(dev, data, len, actual_length)
 }
 
@@ -279,10 +267,7 @@ pub(crate) unsafe extern "C" fn usb_alloc_coherent(
     _mem_flags: u32,
     dma: *mut u64,
 ) -> *mut c_void {
-    let Ok(layout) = Layout::array::<u8>(size.max(1)) else {
-        return ptr::null_mut();
-    };
-    let ptr = unsafe { alloc(layout) };
+    let ptr = unsafe { super::base::__kmalloc_noprof(size.max(1), _mem_flags) };
     if !dma.is_null() {
         unsafe {
             *dma = ptr as u64;
@@ -300,12 +285,8 @@ pub(crate) unsafe extern "C" fn usb_free_coherent(
     if addr.is_null() {
         return;
     }
-    let Ok(layout) = Layout::array::<u8>(size.max(1)) else {
-        return;
-    };
-    unsafe {
-        dealloc(addr.cast::<u8>(), layout);
-    }
+    let _ = size;
+    unsafe { super::base::kfree(addr) };
 }
 
 pub(crate) unsafe extern "C" fn usb_register_dev(
@@ -361,8 +342,9 @@ pub(crate) unsafe extern "C" fn usb_string(
         }
         return -61;
     }
+    let limit = size.min(MAX_USB_STRING_BYTES);
     let mut len = 0usize;
-    while len + 1 < size && unsafe { *source.add(len) } != 0 {
+    while len + 1 < limit && unsafe { *source.add(len) } != 0 {
         unsafe {
             *buf.add(len) = *source.add(len);
         }
@@ -403,7 +385,7 @@ pub(crate) unsafe extern "C" fn __usb_get_extra_descriptor(
             *out = ptr::null_mut();
         }
     }
-    if buffer.is_null() || size < 2 {
+    if buffer.is_null() || size < 2 || size as usize > MAX_USB_EXTRA_DESCRIPTOR_BYTES {
         crate::debug::write_debugcon_only_line(
             alloc::format!(
                 "__usb_get_extra_descriptor: invalid buffer={:#x} size={}",

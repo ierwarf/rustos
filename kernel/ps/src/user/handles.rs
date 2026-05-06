@@ -70,6 +70,15 @@ impl InetSocketHandle {
         }
     }
 
+    pub const fn from_token(token: u64, domain: u64, type_: u64, protocol: u64) -> Self {
+        Self {
+            token,
+            domain,
+            type_,
+            protocol,
+        }
+    }
+
     pub const fn token_id(self) -> u64 {
         self.token
     }

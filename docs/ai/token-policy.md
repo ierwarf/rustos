@@ -71,7 +71,15 @@ AI map in the same change:
 - runtime socket/protocol behavior
 - docs navigation or AI routing
 
-## 6. Avoid Generated And Vendor Paths By Default
+## 6. Avoid Ad Hoc And Hardcoded Policy
+
+Prefer manifest fields, registries, protocol state, and existing subsystem APIs
+over ad hoc branches or hardcoded names, paths, priorities, and ordering. If a
+temporary hardcoded fallback is unavoidable, keep it narrow, document the source
+of truth it is standing in for, and route future behavior through the stable
+contract instead of expanding the special case.
+
+## 7. Avoid Generated And Vendor Paths By Default
 
 Do not inspect these paths unless the task explicitly involves generated output
 or external binary inputs:
@@ -80,11 +88,61 @@ or external binary inputs:
 - `target/`
 - `logs/`
 - `vendor/`
+- `perf.data`
+- `Cargo.lock`
 
 Allowed exceptions:
 
 - QEMU/debug failure investigation may inspect `logs/`.
 - Stage verification may inspect `build/image/system/registry/`.
 - Firmware/module packaging may inspect specific `vendor/` paths.
+- Dependency resolution work may inspect focused `Cargo.lock` snippets.
 
 When using an exception, inspect the narrowest file/path possible.
+
+## 8. Logs And Large Files
+
+Never read whole log files by default.
+
+Preferred patterns:
+
+```bash
+tail -n 120 logs/debugcon.log
+rg -n "panic|error|failed|DisplayUnavailable" logs/debugcon.log
+sed -n 'START,ENDp' path/to/large.rs
+```
+
+For files over roughly 500 lines:
+
+- search with `rg -n` first
+- open one focused range
+- summarize findings before opening another range
+
+Avoid opening `Cargo.lock` unless dependency resolution changed. Use
+`rg -n "crate-name" Cargo.lock` before reading a range.
+
+## 9. Prompt Cache Hygiene
+
+Keep stable context stable across requests:
+
+- put durable repo instructions first
+- keep task-specific details and pasted output at the end
+- avoid rewriting stable instruction text mid-session
+- avoid adding logs or generated output to the reusable prefix
+
+OpenAI-style prompt caching works best when the beginning of the prompt is an
+exact reusable prefix. Treat this sequence as the stable prefix:
+
+1. `AGENTS.md`
+2. `docs/ai-map.md`
+3. `docs/ai/token-policy.md`
+4. `docs/ai/task-router.md`
+5. one focused `docs/ai/*` file selected by the router
+
+Put user-specific task text, command output, logs, and file snippets after that
+prefix.
+
+For Gemini-style explicit context caching, cache the same stable prefix for
+repeated repository analysis or bug-fixing sessions. Do not cache generated
+output, logs, or broad source dumps; attach those as short task-specific suffixes
+only when needed.

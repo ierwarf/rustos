@@ -3,6 +3,9 @@ use alloc::vec::Vec;
 use core::ffi::{c_char, c_void};
 use core::ptr;
 use core::slice;
+
+use spin::Mutex;
+use x86_64::instructions::interrupts;
 #[repr(C)]
 struct LinuxKernelParamOps {
     flags: u32,
@@ -13,6 +16,7 @@ struct LinuxKernelParamOps {
 
 #[repr(C)]
 struct CompatAllocHeader {
+    magic: u64,
     base: *mut u8,
     total_size: usize,
     layout_align: usize,
@@ -51,8 +55,11 @@ static PARAM_ARRAY_OPS: LinuxKernelParamOps = LinuxKernelParamOps {
     get: 0,
     free: 0,
 };
+static COMPAT_ALLOCATIONS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 const ZERO_SIZE_PTR: usize = 16;
 const __GFP_ZERO: u32 = 1 << 8;
+const COMPAT_ALLOC_MAGIC: u64 = 0x7275_7374_6f73_6b6d;
+const MAX_COMPAT_CSTR_BYTES: usize = 4096;
 
 pub(crate) unsafe extern "C" fn strlen(s: *const c_char) -> usize {
     c_strlen(s)
@@ -89,7 +96,8 @@ pub(crate) unsafe extern "C" fn strsep(
 
     let delimiters = delimiter_bytes(delim);
     let mut cursor = current;
-    loop {
+    let mut scanned = 0usize;
+    while scanned < MAX_COMPAT_CSTR_BYTES {
         let byte = unsafe { *cursor };
         if byte == 0 {
             unsafe {
@@ -107,7 +115,13 @@ pub(crate) unsafe extern "C" fn strsep(
         }
 
         cursor = unsafe { cursor.add(1) };
+        scanned += 1;
     }
+
+    unsafe {
+        *stringp = ptr::null_mut();
+    }
+    current
 }
 
 pub(crate) unsafe extern "C" fn simple_strtoul(
@@ -143,11 +157,17 @@ pub(crate) unsafe extern "C" fn kfree(ptr: *const c_void) {
     if zero_or_null_ptr(ptr) {
         return;
     }
+    if !take_compat_allocation(ptr) {
+        return;
+    }
 
     let user_ptr = ptr as *mut u8;
     let header = unsafe {
         user_ptr.sub(core::mem::size_of::<CompatAllocHeader>()) as *mut CompatAllocHeader
     };
+    if unsafe { (*header).magic } != COMPAT_ALLOC_MAGIC {
+        return;
+    }
     let layout = match Layout::from_size_align(unsafe { (*header).total_size }, unsafe {
         (*header).layout_align
     }) {
@@ -156,6 +176,7 @@ pub(crate) unsafe extern "C" fn kfree(ptr: *const c_void) {
     };
     let base = unsafe { (*header).base };
     unsafe {
+        (*header).magic = 0;
         dealloc(base, layout);
     }
 }
@@ -203,6 +224,9 @@ pub(crate) unsafe extern "C" fn kmemdup_noprof(
     len: usize,
     _gfp: u32,
 ) -> *mut c_void {
+    if src.is_null() && len != 0 {
+        return ptr::null_mut();
+    }
     let dest = allocate_bytes(len, 1);
     if dest.is_null() {
         return ptr::null_mut();
@@ -225,7 +249,10 @@ pub(crate) unsafe extern "C" fn kstrndup(
     }
 
     let len = c_strlen_bounded(s, max_len);
-    let dest = allocate_bytes(len + 1, 1);
+    let Some(alloc_len) = len.checked_add(1) else {
+        return ptr::null_mut();
+    };
+    let dest = allocate_bytes(alloc_len, 1);
     if dest.is_null() {
         return ptr::null_mut();
     }
@@ -372,7 +399,8 @@ pub(crate) unsafe extern "C" fn strrchr(s: *const c_char, ch: i32) -> *mut c_cha
     let target = ch as u8;
     let mut last = ptr::null_mut();
     let mut cursor = s;
-    loop {
+    let mut scanned = 0usize;
+    while scanned < MAX_COMPAT_CSTR_BYTES {
         let byte = unsafe { *cursor as u8 };
         if byte == target {
             last = cursor as *mut c_char;
@@ -381,6 +409,7 @@ pub(crate) unsafe extern "C" fn strrchr(s: *const c_char, ch: i32) -> *mut c_cha
             break;
         }
         cursor = unsafe { cursor.add(1) };
+        scanned += 1;
     }
     last
 }
@@ -390,6 +419,9 @@ pub(crate) unsafe extern "C" fn sscanf(_buffer: *const c_char, _format: *const c
 }
 
 pub(crate) unsafe extern "C" fn memdup_user(src: *const c_void, len: usize) -> *mut c_void {
+    if src.is_null() && len != 0 {
+        return ptr::null_mut();
+    }
     let dest = allocate_bytes(len, 1);
     if dest.is_null() {
         return ptr::null_mut();
@@ -522,14 +554,21 @@ pub(crate) unsafe extern "C" fn msleep(milliseconds: u32) {
 }
 
 pub(crate) unsafe extern "C" fn virt_to_phys(addr: *const c_void) -> u64 {
-    if addr.is_null() {
-        0
-    } else {
-        crate::memory::paging::kernel_virtual_to_physical_addr(addr as u64)
+    let addr = addr as u64;
+    if addr < crate::memory::kernel_vm::KERNEL_VIRT_OFFSET {
+        return 0;
     }
+    let phys = crate::memory::paging::kernel_virtual_to_physical_addr(addr);
+    if phys >= crate::memory::kernel_vm::DIRECT_MAP_PHYS_LIMIT {
+        return 0;
+    }
+    phys
 }
 
 pub(crate) unsafe extern "C" fn phys_to_virt(addr: u64) -> *mut c_void {
+    if addr >= crate::memory::kernel_vm::DIRECT_MAP_PHYS_LIMIT {
+        return ptr::null_mut();
+    }
     crate::memory::paging::higher_half_addr(addr) as *mut c_void
 }
 
@@ -589,9 +628,12 @@ pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
 fn allocate_bytes(size: usize, align: usize) -> *mut u8 {
     let header_size = core::mem::size_of::<CompatAllocHeader>();
     let requested_align = align.max(1);
-    let layout_align = requested_align
+    let Some(layout_align) = requested_align
         .max(core::mem::align_of::<CompatAllocHeader>())
-        .next_power_of_two();
+        .checked_next_power_of_two()
+    else {
+        return ptr::null_mut();
+    };
     let total_size = header_size
         .checked_add(size.max(1))
         .and_then(|value| value.checked_add(layout_align.saturating_sub(1)))
@@ -609,16 +651,26 @@ fn allocate_bytes(size: usize, align: usize) -> *mut u8 {
         return ptr::null_mut();
     }
 
-    let user_start = align_up(base as usize + header_size, requested_align);
+    let Some(user_start) = (base as usize)
+        .checked_add(header_size)
+        .and_then(|value| align_up(value, requested_align))
+    else {
+        unsafe {
+            dealloc(base, layout);
+        }
+        return ptr::null_mut();
+    };
     let header = (user_start - header_size) as *mut CompatAllocHeader;
     unsafe {
         header.write(CompatAllocHeader {
+            magic: COMPAT_ALLOC_MAGIC,
             base,
             total_size,
             layout_align,
             requested_size: size,
         });
     }
+    register_compat_allocation(user_start as *const c_void);
     user_start as *mut u8
 }
 
@@ -639,23 +691,65 @@ fn allocation_requested_size(ptr: *const c_void) -> Option<usize> {
     if zero_or_null_ptr(ptr) {
         return None;
     }
+    if !compat_allocation_is_registered(ptr) {
+        return None;
+    }
     let user_ptr = ptr.cast::<u8>();
     let header = unsafe {
         user_ptr.sub(core::mem::size_of::<CompatAllocHeader>()) as *const CompatAllocHeader
     };
+    if unsafe { (*header).magic } != COMPAT_ALLOC_MAGIC {
+        return None;
+    }
     Some(unsafe { (*header).requested_size })
 }
 
-fn align_up(value: usize, align: usize) -> usize {
+fn align_up(value: usize, align: usize) -> Option<usize> {
     if align <= 1 {
-        return value;
+        return Some(value);
     }
     let mask = align - 1;
-    (value + mask) & !mask
+    Some(value.checked_add(mask)? & !mask)
 }
 
 fn zero_or_null_ptr(ptr: *const c_void) -> bool {
     (ptr as usize) <= ZERO_SIZE_PTR
+}
+
+fn register_compat_allocation(ptr: *const c_void) {
+    if zero_or_null_ptr(ptr) {
+        return;
+    }
+    interrupts::without_interrupts(|| {
+        COMPAT_ALLOCATIONS.lock().push(ptr as usize);
+    });
+}
+
+fn take_compat_allocation(ptr: *const c_void) -> bool {
+    if zero_or_null_ptr(ptr) {
+        return false;
+    }
+    interrupts::without_interrupts(|| {
+        let mut allocations = COMPAT_ALLOCATIONS.lock();
+        if let Some(index) = allocations.iter().position(|entry| *entry == ptr as usize) {
+            allocations.swap_remove(index);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+fn compat_allocation_is_registered(ptr: *const c_void) -> bool {
+    if zero_or_null_ptr(ptr) {
+        return false;
+    }
+    interrupts::without_interrupts(|| {
+        COMPAT_ALLOCATIONS
+            .lock()
+            .iter()
+            .any(|entry| *entry == ptr as usize)
+    })
 }
 
 fn c_strlen(s: *const c_char) -> usize {
@@ -665,7 +759,7 @@ fn c_strlen(s: *const c_char) -> usize {
 
     let mut len = 0usize;
     let mut cursor = s;
-    while unsafe { *cursor } != 0 {
+    while len < MAX_COMPAT_CSTR_BYTES && unsafe { *cursor } != 0 {
         len += 1;
         cursor = unsafe { cursor.add(1) };
     }
@@ -679,6 +773,7 @@ fn c_strlen_bounded(s: *const c_char, max_len: usize) -> usize {
 
     let mut len = 0usize;
     let mut cursor = s;
+    let max_len = max_len.min(MAX_COMPAT_CSTR_BYTES);
     while len < max_len && unsafe { *cursor } != 0 {
         len += 1;
         cursor = unsafe { cursor.add(1) };
@@ -694,7 +789,10 @@ fn compare_cstr(
 ) -> i32 {
     let mut index = 0usize;
     loop {
-        if limit.is_some_and(|value| index >= value) {
+        let effective_limit = limit
+            .unwrap_or(MAX_COMPAT_CSTR_BYTES)
+            .min(MAX_COMPAT_CSTR_BYTES);
+        if index >= effective_limit {
             return 0;
         }
         let left = if lhs.is_null() {

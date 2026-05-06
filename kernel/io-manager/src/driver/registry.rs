@@ -26,6 +26,7 @@ pub(crate) struct DriverRecord {
     pub(crate) load_priority: i32,
     pub(crate) image_path: Option<&'static str>,
     pub(crate) aliases: &'static str,
+    pub(crate) deps: &'static str,
     pub(crate) softdeps: &'static str,
     pub(crate) provider_group: Option<&'static str>,
     pub(crate) fallback_only: bool,
@@ -42,12 +43,14 @@ pub(crate) struct LoadableDriverCandidate {
     pub(crate) image_path: &'static str,
     pub(crate) load_priority: i32,
     pub(crate) aliases: &'static str,
+    pub(crate) deps: &'static str,
     pub(crate) softdeps: &'static str,
     pub(crate) provider_group: Option<&'static str>,
     pub(crate) fallback_only: bool,
 }
 
 static DRIVER_REGISTRY: Mutex<Vec<DriverRecord>> = Mutex::new(Vec::new());
+static ACTIVE_PROVIDER_GROUPS: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
 const BUILTIN_COMPAT_MODULES: &[&str] = &["virtio_dma_buf"];
 
 pub(super) fn insert_kernel_builtin(name: &'static str, class: DriverClass, bus: DriverBus) {
@@ -67,6 +70,7 @@ pub(super) fn insert_kernel_builtin(name: &'static str, class: DriverClass, bus:
         load_priority: 0,
         image_path: None,
         aliases: "",
+        deps: "",
         softdeps: "",
         provider_group: None,
         fallback_only: false,
@@ -83,6 +87,7 @@ pub(super) fn insert_loadable_elf(
     load_priority: i32,
     image_path: &'static str,
     aliases: &'static str,
+    deps: &'static str,
     softdeps: &'static str,
     provider_group: Option<&'static str>,
     fallback_only: bool,
@@ -109,6 +114,7 @@ pub(super) fn insert_loadable_elf(
         load_priority,
         image_path: Some(image_path),
         aliases,
+        deps,
         softdeps,
         provider_group,
         fallback_only,
@@ -150,6 +156,7 @@ pub(super) fn pending_loadable_records(
             image_path,
             load_priority: record.load_priority,
             aliases: record.aliases,
+            deps: record.deps,
             softdeps: record.softdeps,
             provider_group: record.provider_group,
             fallback_only: record.fallback_only,
@@ -164,6 +171,28 @@ pub(super) fn pending_loadable_records(
         )
     });
     pending
+}
+
+pub(super) fn loadable_candidate_by_name(name: &str) -> Option<LoadableDriverCandidate> {
+    let registry = DRIVER_REGISTRY.lock();
+    registry.iter().find_map(|record| {
+        if record.model != DriverExecutionModel::LoadableElf || record.name != name {
+            return None;
+        }
+        let image_path = record.image_path?;
+        Some(LoadableDriverCandidate {
+            name: record.name,
+            class: record.class,
+            bus: record.bus,
+            image_path,
+            load_priority: record.load_priority,
+            aliases: record.aliases,
+            deps: record.deps,
+            softdeps: record.softdeps,
+            provider_group: record.provider_group,
+            fallback_only: record.fallback_only,
+        })
+    })
 }
 
 pub(super) fn update_loadable_module_status(
@@ -221,6 +250,21 @@ pub(super) fn loadable_provider_group_loaded(group: &str) -> bool {
     })
 }
 
+pub(super) fn mark_provider_group_active(group: &'static str) {
+    let mut groups = ACTIVE_PROVIDER_GROUPS.lock();
+    if !groups.contains(&group) {
+        groups.push(group);
+    }
+}
+
+pub(super) fn provider_group_active(group: &str) -> bool {
+    ACTIVE_PROVIDER_GROUPS
+        .lock()
+        .iter()
+        .any(|active| *active == group)
+        || loadable_provider_group_loaded(group)
+}
+
 pub(super) fn loadable_records() -> Vec<DriverRecord> {
     let registry = DRIVER_REGISTRY.lock();
     registry
@@ -241,4 +285,5 @@ pub(super) fn snapshot_registered_drivers(dest: &mut [DriverRecord]) -> usize {
 #[cfg(test)]
 pub(super) fn reset_for_tests() {
     DRIVER_REGISTRY.lock().clear();
+    ACTIVE_PROVIDER_GROUPS.lock().clear();
 }

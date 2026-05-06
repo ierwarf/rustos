@@ -6,8 +6,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use xshell::{Shell, cmd};
-
 use crate::{Result, config::Config};
 
 pub(crate) fn default_root_dir() -> PathBuf {
@@ -69,18 +67,22 @@ pub(crate) fn run_cargo_kernel_rustc(
 }
 
 pub(crate) fn run_cargo_kernel_check(config: &Config, package: &str) -> Result<()> {
-    let sh = shell()?;
-    let cargo = &config.cargo;
-    let manifest = &config.workspace_manifest;
-    let zflags = &config.kernel_cargo_zflags;
-    let target = &config.kernel_target;
-    cmd!(
-        sh,
-        "{cargo} check --manifest-path {manifest} {zflags...} -p {package} --target {target}"
-    )
-    .env("CARGO_TARGET_DIR", &config.cargo_target_dir)
-    .env("RUSTFLAGS", kernel_rustflags_env())
-    .run()?;
+    let mut command = Command::new(&config.cargo);
+    command
+        .arg("check")
+        .arg("--manifest-path")
+        .arg(&config.workspace_manifest);
+    for flag in &config.kernel_cargo_zflags {
+        command.arg(flag);
+    }
+    command
+        .arg("-p")
+        .arg(package)
+        .arg("--target")
+        .arg(&config.kernel_target)
+        .env("CARGO_TARGET_DIR", &config.cargo_target_dir)
+        .env("RUSTFLAGS", kernel_rustflags_env());
+    run_command(&mut command)?;
     Ok(())
 }
 
@@ -101,6 +103,33 @@ pub(crate) fn copy_with_parent(src: &Path, dst: &Path) -> Result<()> {
     fs::create_dir_all(parent)?;
     fs::copy(src, dst)?;
     Ok(())
+}
+
+pub(crate) fn output_is_fresh(output: &Path, inputs: &[PathBuf]) -> Result<bool> {
+    let output_time = match fs::metadata(output) {
+        Ok(metadata) if metadata.is_file() => metadata.modified()?,
+        Ok(_) => return Ok(false),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
+
+    for input in inputs {
+        let input_time = fs::metadata(input)?.modified()?;
+        if input_time > output_time {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+pub(crate) fn outputs_are_fresh(outputs: &[PathBuf], inputs: &[PathBuf]) -> Result<bool> {
+    for output in outputs {
+        if !output_is_fresh(output, inputs)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 pub(crate) fn strip_elf_artifact_if_available(path: &Path) -> Result<()> {
@@ -223,10 +252,6 @@ pub(crate) fn read_trimmed(path: impl AsRef<Path>) -> Result<String> {
     Ok(fs::read_to_string(path)?.trim().to_string())
 }
 
-pub(crate) fn shell() -> Result<Shell> {
-    Ok(Shell::new()?)
-}
-
 pub(crate) fn create_temp_dir(prefix: &str) -> Result<PathBuf> {
     let base = env::temp_dir();
     for attempt in 0..64u32 {
@@ -254,9 +279,22 @@ pub(crate) fn create_temp_dir(prefix: &str) -> Result<PathBuf> {
 }
 
 pub(crate) fn run_command(command: &mut Command) -> Result<()> {
-    let status = command.status()?;
-    if !status.success() {
-        return Err(format!("command failed with status {status}: {:?}", command).into());
+    let output = command.output()?;
+    if output.status.success() {
+        return Ok(());
     }
-    Ok(())
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stdout.is_empty() {
+        eprint!("{stdout}");
+    }
+    if !stderr.is_empty() {
+        eprint!("{stderr}");
+    }
+    Err(format!(
+        "command failed with status {}: {:?}",
+        output.status, command
+    )
+    .into())
 }

@@ -35,7 +35,9 @@
 | `RUSTOS_UI_PROFILE` | disabled | Enable uiserver profiling lines. |
 
 Most build variables are parsed by `tools/xtask/src/config.rs`. QEMU run
-variables are parsed by `tools/xtask/src/qemu.rs`.
+variables are parsed by `tools/xtask/src/qemu.rs`. For repeated KVM no-opt
+debugging, use `cargo xtask run --profile nvme --accel-profile kvm --usb-input
+--debugcon file --timeout 35 --summarize-log -- --no-reboot`.
 
 <a id="korean"></a>
 
@@ -70,4 +72,6 @@ variables are parsed by `tools/xtask/src/qemu.rs`.
 | `RUSTOS_UI_PROFILE` | disabled | uiserver profiling line 활성화 |
 
 대부분의 build variable은 `tools/xtask/src/config.rs`에서 읽습니다. QEMU run
-variable은 `tools/xtask/src/qemu.rs`에서 읽습니다.
+variable은 `tools/xtask/src/qemu.rs`에서 읽습니다. 반복 KVM no-opt 디버깅은
+`cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file
+--timeout 35 --summarize-log -- --no-reboot`를 사용합니다.

@@ -29,10 +29,15 @@ __x86_indirect_thunk_r15:
     .global __x86_return_thunk
 __x86_return_thunk:
     ret
+
+    .global __fentry__
+__fentry__:
+    ret
 "#
 );
 
 unsafe extern "C" {
+    fn __fentry__();
     fn __x86_indirect_thunk_rax();
     fn __x86_indirect_thunk_rdx();
     fn __x86_indirect_thunk_rcx();
@@ -43,8 +48,6 @@ unsafe extern "C" {
 }
 
 static REF_STACK_CHK_GUARD: u64 = 0x8d48_5a71_f2b3_c694;
-
-pub(crate) unsafe extern "C" fn __fentry__() {}
 
 pub(crate) unsafe extern "C" fn __dynamic_pr_debug() -> i32 {
     0

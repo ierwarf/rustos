@@ -26,6 +26,7 @@ const SUPPORTED_MOUNT_FLAGS: u64 = crate::user::linux::MS_RDONLY;
 const ROOT_FILE_CACHE_MAX_ENTRIES: usize = 32;
 const ROOT_FILE_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const ROOT_FILE_CACHE_MAX_ENTRY_BYTES: usize = 4 * 1024 * 1024;
+const ROOT_FILE_EXACT_READ_MAX_BYTES: usize = 64 * 1024 * 1024;
 const ROOT_FILE_PAGE_SIZE: usize = 64 * 1024;
 const ROOT_FILE_PAGE_CACHE_MAX_ENTRIES: usize = 512;
 const ROOT_FILE_PAGE_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
@@ -103,9 +104,28 @@ impl RootCache {
     }
 
     fn next_use(&mut self) -> u64 {
+        if self.next_use == u64::MAX {
+            self.rebase_lru_epochs();
+        }
         let current = self.next_use;
-        self.next_use = self.next_use.saturating_add(1);
+        self.next_use += 1;
         current
+    }
+
+    fn rebase_lru_epochs(&mut self) {
+        self.next_use = 1;
+        for entry in &mut self.files {
+            entry.last_used = 0;
+        }
+        for entry in &mut self.pages {
+            entry.last_used = 0;
+        }
+        for entry in &mut self.dirs {
+            entry.last_used = 0;
+        }
+        for entry in &mut self.metadata {
+            entry.last_used = 0;
+        }
     }
 
     fn lookup_file(&mut self, generation: u64, path: &str) -> Option<Arc<[u8]>> {
@@ -129,9 +149,7 @@ impl RootCache {
             self.files.remove(index);
         }
 
-        while self.files.len() >= ROOT_FILE_CACHE_MAX_ENTRIES
-            || self.total_file_bytes.saturating_add(bytes.len()) > ROOT_FILE_CACHE_MAX_BYTES
-        {
+        while self.files.len() >= ROOT_FILE_CACHE_MAX_ENTRIES || self.file_cache_full(bytes.len()) {
             let Some((index, _)) = self
                 .files
                 .iter()
@@ -147,12 +165,25 @@ impl RootCache {
         }
 
         let last_used = self.next_use();
-        self.total_file_bytes = self.total_file_bytes.saturating_add(bytes.len());
+        let Some(total_file_bytes) = self.total_file_bytes.checked_add(bytes.len()) else {
+            return;
+        };
+        if total_file_bytes > ROOT_FILE_CACHE_MAX_BYTES {
+            return;
+        }
+        self.total_file_bytes = total_file_bytes;
         self.files.push(RootFileCacheEntry {
             path: String::from(path),
             bytes,
             last_used,
         });
+    }
+
+    fn file_cache_full(&self, incoming_len: usize) -> bool {
+        self.total_file_bytes
+            .checked_add(incoming_len)
+            .map(|total| total > ROOT_FILE_CACHE_MAX_BYTES)
+            .unwrap_or(true)
     }
 
     fn lookup_page(&mut self, generation: u64, path: &str, page_index: u64) -> Option<Arc<[u8]>> {
@@ -184,7 +215,7 @@ impl RootCache {
         }
 
         while self.pages.len() >= ROOT_FILE_PAGE_CACHE_MAX_ENTRIES
-            || self.total_page_bytes.saturating_add(bytes.len()) > ROOT_FILE_PAGE_CACHE_MAX_BYTES
+            || self.page_cache_full(bytes.len())
         {
             let Some((index, _)) = self
                 .pages
@@ -201,13 +232,26 @@ impl RootCache {
         }
 
         let last_used = self.next_use();
-        self.total_page_bytes = self.total_page_bytes.saturating_add(bytes.len());
+        let Some(total_page_bytes) = self.total_page_bytes.checked_add(bytes.len()) else {
+            return;
+        };
+        if total_page_bytes > ROOT_FILE_PAGE_CACHE_MAX_BYTES {
+            return;
+        }
+        self.total_page_bytes = total_page_bytes;
         self.pages.push(RootPageCacheEntry {
             path: String::from(path),
             page_index,
             bytes,
             last_used,
         });
+    }
+
+    fn page_cache_full(&self, incoming_len: usize) -> bool {
+        self.total_page_bytes
+            .checked_add(incoming_len)
+            .map(|total| total > ROOT_FILE_PAGE_CACHE_MAX_BYTES)
+            .unwrap_or(true)
     }
 
     fn lookup_dir(&mut self, generation: u64, path: &str) -> Option<Vec<storage_fat::FatDirEntry>> {
@@ -312,8 +356,12 @@ pub fn mount_for_current_process(
     options: Option<&str>,
 ) -> Result<(), MountError> {
     validate_mount_flags(flags)?;
-    let _source = block::lookup(source_path).ok_or(MountError::InvalidSource)?;
-    let metadata = metadata_for_current_process_path(target_path).map_err(MountError::from)?;
+    let source_path = normalize_mount_path(source_path)?;
+    let target_path = normalize_mount_path(target_path)?;
+    validate_filesystem_type(filesystem_type)?;
+    let _source = block::lookup(source_path.as_str()).ok_or(MountError::InvalidSource)?;
+    let metadata =
+        metadata_for_current_process_path(target_path.as_str()).map_err(MountError::from)?;
     if metadata.kind != VfsNodeKind::Directory {
         return Err(MountError::NotDirectory);
     }
@@ -322,6 +370,8 @@ pub fn mount_for_current_process(
 }
 
 pub fn umount_for_current_process(target_path: &str) -> Result<(), MountError> {
+    let target_path = normalize_mount_path(target_path)?;
+    let target_path = target_path.as_str();
     if target_path == "/" {
         return Err(MountError::Busy);
     }
@@ -382,20 +432,16 @@ fn mount_internal(
     pinned: bool,
 ) -> Result<(), MountError> {
     validate_mount_flags(flags)?;
-    if !path.starts_with('/') {
-        return Err(MountError::InvalidArgument);
-    }
-    if filesystem_type.trim().is_empty() {
-        return Err(MountError::UnsupportedFilesystem);
-    }
+    let path = normalize_mount_path(path)?;
+    validate_filesystem_type(filesystem_type)?;
     let mount_options = parse_mount_options(options)?;
 
     let mut mounts = MOUNTS.lock();
-    if mounts.iter().any(|mount| mount.path == path) {
+    if mounts.iter().any(|mount| mount.path == path.as_str()) {
         return Err(MountError::Busy);
     }
     mounts.push(VfsMount {
-        path: String::from(path),
+        path,
         role: mount_options.role,
         pinned,
     });
@@ -504,9 +550,11 @@ impl VfsFileObject for RootFsStreamingFile {
         }
 
         let mut done = 0usize;
-        let end = offset.saturating_add(dest.len()).min(self.len);
-        while offset.saturating_add(done) < end {
-            let absolute_offset = offset + done;
+        let read_len = dest.len().min(self.len - offset);
+        while done < read_len {
+            let Some(absolute_offset) = offset.checked_add(done) else {
+                break;
+            };
             let page_index = absolute_offset / ROOT_FILE_PAGE_SIZE;
             let page_offset = absolute_offset % ROOT_FILE_PAGE_SIZE;
             let page = match read_root_file_page_shared(self.path.as_str(), self.len, page_index) {
@@ -518,7 +566,7 @@ impl VfsFileObject for RootFsStreamingFile {
             }
 
             let available = page.len() - page_offset;
-            let remaining = end - absolute_offset;
+            let remaining = read_len - done;
             let to_copy = available.min(remaining);
             dest[done..done + to_copy].copy_from_slice(&page[page_offset..page_offset + to_copy]);
             done += to_copy;
@@ -655,12 +703,133 @@ fn read_root_file_shared(absolute_path: &str) -> Result<Arc<[u8]>, VfsError> {
         return Ok(bytes);
     }
 
-    let bytes = Arc::<[u8]>::from(
-        with_root_volume(|volume| volume.read_file_to_vec(absolute_path))?.into_boxed_slice(),
-    );
+    let bytes = Arc::<[u8]>::from(read_root_file_to_vec_exact(absolute_path)?.into_boxed_slice());
     ROOT_CACHE
         .lock()
         .insert_file(generation, absolute_path, Arc::clone(&bytes));
+    Ok(bytes)
+}
+
+fn read_root_file_to_vec_exact(absolute_path: &str) -> Result<Vec<u8>, VfsError> {
+    let metadata = read_root_metadata_cached(absolute_path)?;
+    if metadata.kind != VfsNodeKind::File {
+        return Err(VfsError::PermissionDenied);
+    }
+
+    let file_len = usize::try_from(metadata.len).map_err(|_| VfsError::InvalidArgument)?;
+    if file_len > ROOT_FILE_EXACT_READ_MAX_BYTES {
+        return Err(VfsError::InvalidArgument);
+    }
+    let mut bytes = vec![0_u8; file_len];
+    let path_id = path_inode(absolute_path.as_bytes()).max(1);
+    with_root_volume(|volume| {
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Vfs,
+            "vfs-read-open",
+            file_len as u64,
+            path_id,
+        );
+        crate::debug::debug!(
+            vfs,
+            "vfs exact read open begin path={} len={}",
+            absolute_path,
+            file_len
+        );
+        let mut file = volume.open_file(absolute_path)?;
+        file.seek(SeekFrom::Start(0))?;
+        let mut done = 0usize;
+        while done < file_len {
+            let chunk_len = ROOT_FILE_PAGE_SIZE.min(file_len - done);
+            let read = match file.read(&mut bytes[done..done + chunk_len]) {
+                Ok(read) => read,
+                Err(fatfs::Error::InvalidInput) => {
+                    crate::debug::record_milestone(
+                        crate::debug::LogCategory::Vfs,
+                        "vfs-read-error",
+                        done as u64,
+                        path_id,
+                    );
+                    crate::debug::warn!(
+                        vfs,
+                        "vfs exact read invalid input path={} done={} len={}",
+                        absolute_path,
+                        done,
+                        file_len
+                    );
+                    return Err(fatfs::Error::InvalidInput);
+                }
+                Err(fatfs::Error::Io(crate::storage::fat::DiskIoError::InvalidInput)) => {
+                    crate::debug::record_milestone(
+                        crate::debug::LogCategory::Vfs,
+                        "vfs-read-io-invalid",
+                        done as u64,
+                        path_id,
+                    );
+                    return Err(fatfs::Error::Io(
+                        crate::storage::fat::DiskIoError::InvalidInput,
+                    ));
+                }
+                Err(fatfs::Error::Io(crate::storage::fat::DiskIoError::UnexpectedEof)) => {
+                    crate::debug::record_milestone(
+                        crate::debug::LogCategory::Vfs,
+                        "vfs-read-io-eof",
+                        done as u64,
+                        path_id,
+                    );
+                    return Err(fatfs::Error::Io(
+                        crate::storage::fat::DiskIoError::UnexpectedEof,
+                    ));
+                }
+                Err(fatfs::Error::Io(crate::storage::fat::DiskIoError::NotPresent)) => {
+                    crate::debug::record_milestone(
+                        crate::debug::LogCategory::Vfs,
+                        "vfs-read-not-present",
+                        done as u64,
+                        path_id,
+                    );
+                    return Err(fatfs::Error::Io(
+                        crate::storage::fat::DiskIoError::NotPresent,
+                    ));
+                }
+                Err(error) => {
+                    crate::debug::record_milestone(
+                        crate::debug::LogCategory::Vfs,
+                        "vfs-read-error-other",
+                        done as u64,
+                        path_id,
+                    );
+                    return Err(error);
+                }
+            };
+            if read == 0 {
+                crate::debug::record_milestone(
+                    crate::debug::LogCategory::Vfs,
+                    "vfs-read-short",
+                    done as u64,
+                    path_id,
+                );
+                return Err(fatfs::Error::Io(
+                    crate::storage::fat::DiskIoError::UnexpectedEof,
+                ));
+            }
+            done += read;
+            if done == file_len || done % (256 * 1024) == 0 {
+                crate::debug::record_milestone(
+                    crate::debug::LogCategory::Vfs,
+                    "vfs-read-progress",
+                    done as u64,
+                    file_len as u64,
+                );
+            }
+        }
+        crate::debug::debug!(
+            vfs,
+            "vfs exact read done path={} len={}",
+            absolute_path,
+            file_len
+        );
+        Ok(())
+    })?;
     Ok(bytes)
 }
 
@@ -1140,6 +1309,23 @@ fn validate_mount_flags(flags: u64) -> Result<(), MountError> {
 
 fn parse_mount_options(options: Option<&str>) -> Result<core_vfs::ParsedMountOptions, MountError> {
     core_vfs::parse_mount_options(options).map_err(|_| MountError::InvalidArgument)
+}
+
+fn normalize_mount_path(path: &str) -> Result<String, MountError> {
+    core_vfs::normalize_kernel_path(path).map_err(|_| MountError::InvalidArgument)
+}
+
+fn validate_filesystem_type(filesystem_type: &str) -> Result<(), MountError> {
+    let filesystem_type = filesystem_type.trim();
+    if filesystem_type.is_empty()
+        || filesystem_type.len() > 64
+        || !filesystem_type
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err(MountError::UnsupportedFilesystem);
+    }
+    Ok(())
 }
 
 fn ensure_user_mount_access(

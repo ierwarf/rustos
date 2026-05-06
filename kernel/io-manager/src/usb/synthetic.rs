@@ -1,9 +1,9 @@
-use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use driver_abi::PointerPacket;
+use heapless::Deque as HeaplessDeque;
 use spin::Mutex;
 
 use super::hid_translation::{
@@ -118,7 +118,7 @@ struct SyntheticHidDevice {
     descriptors: SyntheticHidDescriptors,
     pending_urb: Option<usize>,
     bootstrap_urb_completed: bool,
-    queued_reports: VecDeque<SyntheticReport>,
+    queued_reports: HeaplessDeque<SyntheticReport, REPORT_QUEUE_CAPACITY>,
     keyboard_state: KeyboardReportState,
     dropped_reports: u64,
 }
@@ -138,7 +138,8 @@ struct UrbCompletion {
 
 static SYNTHETIC_DEVICES: Mutex<Vec<SyntheticHidDevice>> = Mutex::new(Vec::new());
 static HID_REPORT_STATES: Mutex<Vec<HidReportState>> = Mutex::new(Vec::new());
-static PENDING_COMPLETIONS: Mutex<VecDeque<UrbCompletion>> = Mutex::new(VecDeque::new());
+static PENDING_COMPLETIONS: Mutex<HeaplessDeque<UrbCompletion, PENDING_COMPLETION_CAPACITY>> =
+    Mutex::new(HeaplessDeque::new());
 static INJECTION_DEPTH: AtomicUsize = AtomicUsize::new(0);
 static KEYBOARD_TRANSLATION_LOGS: AtomicUsize = AtomicUsize::new(0);
 static POINTER_TRANSLATION_LOGS: AtomicUsize = AtomicUsize::new(0);
@@ -172,14 +173,6 @@ pub(crate) fn descriptors_for_kind(kind: SyntheticHidKind) -> SyntheticHidDescri
     }
 }
 
-pub(crate) fn prepare() {
-    let mut pending = PENDING_COMPLETIONS.lock();
-    let current_capacity = pending.capacity();
-    if current_capacity < PENDING_COMPLETION_CAPACITY {
-        pending.reserve(PENDING_COMPLETION_CAPACITY - current_capacity);
-    }
-}
-
 pub(crate) fn register_device(
     usb_device: *mut LinuxCompatUsbDevice,
     interface: *mut crate::driver::linux::compat::LinuxCompatUsbInterface,
@@ -203,7 +196,7 @@ pub(crate) fn register_device(
         descriptors,
         pending_urb: None,
         bootstrap_urb_completed: false,
-        queued_reports: VecDeque::with_capacity(REPORT_QUEUE_CAPACITY.min(32)),
+        queued_reports: HeaplessDeque::new(),
         keyboard_state: KeyboardReportState::default(),
         dropped_reports: 0,
     });
@@ -552,12 +545,12 @@ pub(crate) fn cancel_urb(urb: *mut LinuxCompatUrb) -> bool {
 
     {
         let mut pending = PENDING_COMPLETIONS.lock();
-        let mut retained = VecDeque::with_capacity(pending.len());
+        let mut retained = HeaplessDeque::new();
         while let Some(completion) = pending.pop_front() {
             if completion.urb_ptr == urb_ptr {
                 cancelled = true;
             } else {
-                retained.push_back(completion);
+                let _ = retained.push_back(completion);
             }
         }
         *pending = retained;
@@ -651,7 +644,7 @@ fn enqueue_report_locked(
         return None;
     }
 
-    device.queued_reports.push_back(report);
+    let _ = device.queued_reports.push_back(report);
     None
 }
 
@@ -699,7 +692,7 @@ fn queue_urb_completion(completion: Option<UrbCompletion>) {
     let Some(completion) = completion else {
         return;
     };
-    PENDING_COMPLETIONS.lock().push_back(completion);
+    let _ = PENDING_COMPLETIONS.lock().push_back(completion);
 }
 
 fn queue_urb_completions(completions: Vec<UrbCompletion>) {
@@ -707,7 +700,11 @@ fn queue_urb_completions(completions: Vec<UrbCompletion>) {
         return;
     }
     let mut pending = PENDING_COMPLETIONS.lock();
-    pending.extend(completions);
+    for completion in completions {
+        if pending.push_back(completion).is_err() {
+            break;
+        }
+    }
 }
 
 fn dispatch_urb_completion(completion: Option<UrbCompletion>) {

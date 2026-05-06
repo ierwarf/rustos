@@ -261,6 +261,9 @@ fn framebuffer_info_is_valid(info: FramebufferInfo) -> bool {
     if info.addr == 0 || size == 0 {
         return false;
     }
+    if info.addr.checked_add(info.size).is_none() {
+        return false;
+    }
     if width == 0 || height == 0 || stride == 0 {
         return false;
     }
@@ -270,6 +273,24 @@ fn framebuffer_info_is_valid(info: FramebufferInfo) -> bool {
         return false;
     }
     if stride < width || !(3..=4).contains(&bpp) {
+        return false;
+    }
+    if !matches!(
+        info.pixel_format,
+        boot_protocol::BootPixelFormat::Rgb | boot_protocol::BootPixelFormat::Bgr
+    ) {
+        return false;
+    }
+    if info.back_buffer_addr == 0 && info.back_buffer_size != 0 {
+        return false;
+    }
+    if info.back_buffer_addr != 0
+        && (info.back_buffer_size < info.size
+            || info
+                .back_buffer_addr
+                .checked_add(info.back_buffer_size)
+                .is_none())
+    {
         return false;
     }
 

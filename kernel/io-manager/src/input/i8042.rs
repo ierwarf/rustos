@@ -56,6 +56,7 @@ const MAX_BYTES_PER_INTERRUPT: usize = 32;
 const DEFERRED_KEYBOARD_BYTES_CAPACITY: usize = 256;
 const DEFERRED_KEYBOARD_DROP_LOG_INTERVAL: u64 = 64;
 const PS2_CMD_GETID: u8 = 0xF2;
+const PS2_CMD_DISABLE_SCANNING: u8 = 0xF5;
 
 #[allow(dead_code)]
 pub(crate) const I8042_KEYBOARD_PORT_ID: u32 = 0;
@@ -258,6 +259,14 @@ fn init_aux_mouse_port_inner() -> Result<AuxTransportInfo, &'static str> {
     // real device detection path; spending a long time in the controller port
     // test here makes KVM bring-up look hung before userspace UI appears.
     let second_port_test_passed = second_port_test();
+    if !second_port_test_passed {
+        let _ = park_aux_port(keyboard_enabled);
+        return Err("i8042 second-port test failed");
+    }
+    if !aux_device_present() {
+        let _ = park_aux_port(keyboard_enabled);
+        return Err("i8042 aux device not present");
+    }
     drain_output_buffer();
     // Do not leave the aux device streaming while no serio driver owns it yet.
     // Early host mouse movement would otherwise queue stale bytes that can
@@ -268,6 +277,15 @@ fn init_aux_mouse_port_inner() -> Result<AuxTransportInfo, &'static str> {
         controller_configured: controller_configured && parked,
         second_port_test_passed,
     })
+}
+
+fn aux_device_present() -> bool {
+    let mut id = [0_u8; 2];
+    match send_aux_command_sequence(PS2_CMD_GETID, &[], &mut id) {
+        Ok(()) => true,
+        Err(-110) | Err(-19) => false,
+        Err(_) => false,
+    }
 }
 
 fn poll_keyboard_controller() {
@@ -339,6 +357,7 @@ fn update_controller_config(
 }
 
 fn park_aux_port(keyboard_enabled: bool) -> bool {
+    let _ = send_aux_command_sequence(PS2_CMD_DISABLE_SCANNING, &[], &mut []);
     let config_updated =
         update_controller_config(keyboard_enabled, false, keyboard_enabled, false).is_some();
     let port_disabled = write_command(I8042_DISABLE_SECOND_PORT);

@@ -20,10 +20,100 @@ pub mod virtio;
 pub mod virtio_drm;
 pub mod workqueue;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LinuxCompatExportAbi {
+    AlignRustCall,
+    PreserveStackTail,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LinuxCompatSymbol {
+    pub(crate) addr: usize,
+    pub(crate) abi: LinuxCompatExportAbi,
+}
+
+impl LinuxCompatSymbol {
+    pub(crate) const fn align_rust_call(addr: usize) -> Self {
+        Self {
+            addr,
+            abi: LinuxCompatExportAbi::AlignRustCall,
+        }
+    }
+
+    pub(crate) const fn preserve_stack_tail(addr: usize) -> Self {
+        Self {
+            addr,
+            abi: LinuxCompatExportAbi::PreserveStackTail,
+        }
+    }
+}
+
+macro_rules! linux_compat_symbols {
+    ($name:expr, { $($symbol:literal => $addr:expr $(, $abi:ident)?;)* }) => {{
+        match $name {
+            $(
+                $symbol => Some(super::linux_compat_symbols!(@symbol $addr $(, $abi)?)),
+            )*
+            _ => None,
+        }
+    }};
+    (@symbol $addr:expr, preserve_stack_tail) => {
+        super::LinuxCompatSymbol::preserve_stack_tail($addr as *const () as usize)
+    };
+    (@symbol $addr:expr, align_rust_call) => {
+        super::LinuxCompatSymbol::align_rust_call($addr as *const () as usize)
+    };
+    (@symbol $addr:expr) => {
+        super::LinuxCompatSymbol::align_rust_call($addr as *const () as usize)
+    };
+}
+
+pub(crate) use linux_compat_symbols;
+
 pub fn init_cpu_local_symbols() {
     aux::init_cpu_local_symbols();
     compiler::init_cpu_local_symbols();
     crate::user::syscall::activate_linux_compat_cpu_local();
+}
+
+pub(crate) fn export_abi(name: &str) -> LinuxCompatExportAbi {
+    virtio::symbol_abi(name)
+        .or_else(|| netdev::symbol_abi(name))
+        .or_else(|| virtio_drm::symbol_abi(name))
+        .unwrap_or_else(|| {
+            if linux_compat_preserves_module_stack(name) {
+                LinuxCompatExportAbi::PreserveStackTail
+            } else {
+                LinuxCompatExportAbi::AlignRustCall
+            }
+        })
+}
+
+fn linux_compat_preserves_module_stack(name: &str) -> bool {
+    matches!(
+        name,
+        "__fentry__"
+            | "__x86_return_thunk"
+            | "__x86_indirect_thunk_rax"
+            | "__x86_indirect_thunk_rcx"
+            | "__x86_indirect_thunk_rdx"
+            | "__x86_indirect_thunk_r9"
+            | "__x86_indirect_thunk_r13"
+            | "__x86_indirect_thunk_r15"
+            | "usb_control_msg"
+            | "usb_interrupt_msg"
+            | "snprintf"
+            | "scnprintf"
+            | "sprintf"
+            | "_printk"
+            | "_dev_err"
+            | "_dev_info"
+            | "_dev_warn"
+            | "__warn_printk"
+            | "netdev_err"
+            | "netdev_warn"
+            | "netdev_printk"
+    )
 }
 
 pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {

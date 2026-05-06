@@ -23,6 +23,7 @@ const HID_FEATURE_REPORT: u32 = 2;
 const HID_REPORT_TYPE_COUNT: usize = 3;
 const HID_MIN_BUFFER_SIZE: usize = 64;
 const HID_MAX_BUFFER_SIZE: usize = 16 * 1024;
+const HID_MAX_REPORT_DESCRIPTOR_SIZE: u32 = 4096;
 const HID_BUS_USB: u16 = 0x03;
 const HID_QUIRK_IGNORE: u64 = 1 << 2;
 const HID_QUIRK_NO_IGNORE: u64 = 1 << 30;
@@ -193,6 +194,9 @@ pub(crate) unsafe extern "C" fn hid_parse_report(
     if dev.is_null() {
         return -22;
     }
+    if size > HID_MAX_REPORT_DESCRIPTOR_SIZE || (size != 0 && start.is_null()) {
+        return -22;
+    }
     crate::debug::write_debugcon_only_line(
         alloc::format!(
             "hid_parse_report: begin dev={:#x} start={:#x} size={}",
@@ -236,6 +240,9 @@ pub(crate) unsafe extern "C" fn hid_input_report(
     size: u32,
     _interrupt: i32,
 ) -> i32 {
+    if dev.is_null() || (size != 0 && data.is_null()) || size as usize > HID_MAX_BUFFER_SIZE {
+        return -22;
+    }
     crate::usb::hid_input_report(dev, data, size)
 }
 
@@ -614,8 +621,18 @@ pub(crate) unsafe extern "C" fn hid_driver_reset_resume(dev: *mut LinuxCompatHid
     call_driver_resume(dev, true)
 }
 
-pub(crate) unsafe extern "C" fn hid_quirks_init(_count: usize) -> i32 {
-    crate::debug::write_debugcon_only_line(b"linux compat: hid_quirks_init");
+pub(crate) unsafe extern "C" fn hid_quirks_init(
+    quirks_param: *mut c_void,
+    bus: u16,
+    count: i32,
+) -> i32 {
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Compat,
+        "hid-quirks-enter",
+        quirks_param as usize as u64,
+        ((bus as u64) << 32) | count as u32 as u64,
+    );
+    crate::debug::record_milestone(crate::debug::LogCategory::Compat, "hid-quirks-return", 0, 0);
     0
 }
 

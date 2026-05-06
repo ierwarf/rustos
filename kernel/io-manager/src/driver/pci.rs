@@ -328,11 +328,17 @@ fn bind_driver_to_devices(driver_index: usize, driver: *mut LinuxCompatPciDriver
 
     let probe = unsafe { (*driver).probe };
     for (dev_ptr, id_ptr) in candidates {
+        crate::network::set_current_linux_netdev_transport(
+            crate::network::LinuxNetdevTransport::Pci,
+        );
         let status = if let Some(probe) = probe {
             unsafe { probe(dev_ptr, id_ptr) }
         } else {
             0
         };
+        crate::network::set_current_linux_netdev_transport(
+            crate::network::LinuxNetdevTransport::Unknown,
+        );
 
         if status == 0 {
             continue;

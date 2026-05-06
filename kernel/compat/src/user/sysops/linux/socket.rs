@@ -11,6 +11,9 @@ use crate::user::socket::{PassedHandle, SocketCredentials, SocketHandle};
 
 use super::*;
 
+const MAX_SOCKET_IOV_PAYLOAD_BYTES: usize = 1024 * 1024;
+const MAX_SOCKET_CONTROL_BYTES: usize = 64 * 1024;
+
 pub(crate) fn socket(domain: u64, type_: u64, protocol: u64) -> Result<u64, LinuxSysopError> {
     if domain == linux_abi::AF_INET {
         let (status_flags, fd_flags, base_type) = parse_inet_socket_type(type_)?;
@@ -18,8 +21,12 @@ pub(crate) fn socket(domain: u64, type_: u64, protocol: u64) -> Result<u64, Linu
         {
             return Err(LinuxSysopError::OperationNotSupported);
         }
+        if base_type != linux_abi::SOCK_STREAM {
+            return Err(LinuxSysopError::OperationNotSupported);
+        }
+        let token = kernel_io_manager::api::network::create_inet_socket(base_type, protocol);
         return install_inet_socket(
-            InetSocketHandle::new(domain, base_type, protocol),
+            InetSocketHandle::from_token(token, domain, base_type, protocol),
             status_flags,
             fd_flags,
         );
@@ -137,6 +144,11 @@ pub(crate) fn accept4(
 }
 
 pub(crate) fn connect(fd: u64, addr_ptr: u64, addr_len: u64) -> Result<(), LinuxSysopError> {
+    if let Some(socket) = inet_socket_handle_for_fd(fd)? {
+        let (addr, port) = read_sockaddr_in(addr_ptr, addr_len)?;
+        return kernel_io_manager::api::network::connect_inet_socket(socket.token_id(), addr, port)
+            .map_err(map_inet_error);
+    }
     let path = read_sockaddr_un_path(addr_ptr, addr_len)?;
     let (socket, _) = socket_handle_for_fd(fd)?;
     socket.connect(path.as_str()).map_err(Into::into)
@@ -343,6 +355,20 @@ pub(crate) fn sendto(
     if flags & !(linux_abi::MSG_DONTWAIT | linux_abi::MSG_NOSIGNAL) != 0 {
         return Err(LinuxSysopError::OperationNotSupported);
     }
+    if let Some(socket) = inet_socket_handle_for_fd(fd)? {
+        if addr_ptr != 0 || addr_len != 0 {
+            return Err(LinuxSysopError::OperationNotSupported);
+        }
+        let len = usize::try_from(user_len).map_err(|_| LinuxSysopError::InvalidArgument)?;
+        if len == 0 {
+            return Ok(0);
+        }
+        let mut buffer = vec![0_u8; len];
+        usermem::copy_from_current_user_exact(user_ptr, &mut buffer)?;
+        return kernel_io_manager::api::network::send_inet_socket(socket.token_id(), &buffer)
+            .map_err(map_inet_error);
+    }
+
     if addr_ptr != 0 || addr_len != 0 {
         return Err(LinuxSysopError::OperationNotSupported);
     }
@@ -370,6 +396,30 @@ pub(crate) fn recvfrom(
 ) -> Result<usize, LinuxSysopError> {
     if flags & !(linux_abi::MSG_DONTWAIT | linux_abi::MSG_NOSIGNAL) != 0 {
         return Err(LinuxSysopError::OperationNotSupported);
+    }
+
+    if let Some(socket) = inet_socket_handle_for_fd(fd)? {
+        let len = usize::try_from(user_len).map_err(|_| LinuxSysopError::InvalidArgument)?;
+        if len == 0 {
+            if addr_len_ptr != 0 {
+                usermem::write_current_user_bytes(addr_len_ptr, &0_u32.to_le_bytes())?;
+            }
+            return Ok(0);
+        }
+        let mut buffer = vec![0_u8; len];
+        let nonblocking = flags & linux_abi::MSG_DONTWAIT != 0
+            || inet_status_flags_for_fd(fd)? & linux_abi::O_NONBLOCK != 0;
+        let read = kernel_io_manager::api::network::recv_inet_socket(
+            socket.token_id(),
+            &mut buffer,
+            nonblocking,
+        )
+        .map_err(map_inet_error)?;
+        usermem::write_current_user_bytes(user_ptr, &buffer[..read])?;
+        if addr_len_ptr != 0 {
+            usermem::write_current_user_bytes(addr_len_ptr, &0_u32.to_le_bytes())?;
+        }
+        return Ok(read);
     }
 
     let (socket, status_flags) = socket_handle_for_fd(fd)?;
@@ -400,6 +450,18 @@ pub(crate) fn write_current_process_socket(
     user_ptr: u64,
     user_len: u64,
 ) -> Result<Option<usize>, LinuxSysopError> {
+    if let Some((socket, _status_flags)) = current_inet_socket_for_fd(fd)? {
+        let len = usize::try_from(user_len).map_err(|_| LinuxSysopError::InvalidArgument)?;
+        if len == 0 {
+            return Ok(Some(0));
+        }
+        let mut buffer = vec![0_u8; len];
+        usermem::copy_from_current_user_exact(user_ptr, &mut buffer)?;
+        return kernel_io_manager::api::network::send_inet_socket(socket.token_id(), &buffer)
+            .map(Some)
+            .map_err(map_inet_error);
+    }
+
     let Some((socket, status_flags)) = current_socket_for_fd(fd)? else {
         return Ok(None);
     };
@@ -423,6 +485,22 @@ pub(crate) fn read_current_process_socket(
     user_ptr: u64,
     user_len: u64,
 ) -> Result<Option<usize>, LinuxSysopError> {
+    if let Some((socket, status_flags)) = current_inet_socket_for_fd(fd)? {
+        let len = usize::try_from(user_len).map_err(|_| LinuxSysopError::InvalidArgument)?;
+        if len == 0 {
+            return Ok(Some(0));
+        }
+        let mut buffer = vec![0_u8; len];
+        let read = kernel_io_manager::api::network::recv_inet_socket(
+            socket.token_id(),
+            &mut buffer,
+            status_flags & linux_abi::O_NONBLOCK != 0,
+        )
+        .map_err(map_inet_error)?;
+        usermem::write_current_user_bytes(user_ptr, &buffer[..read])?;
+        return Ok(Some(read));
+    }
+
     let Some((socket, status_flags)) = current_socket_for_fd(fd)? else {
         return Ok(None);
     };
@@ -440,6 +518,16 @@ pub(crate) fn read_current_process_socket(
 }
 
 pub(crate) fn readable_socket_bytes_for_fd(fd: u64) -> Result<Option<u64>, LinuxSysopError> {
+    if let Some((socket, _)) = current_inet_socket_for_fd(fd)? {
+        return kernel_io_manager::api::network::inet_readable_bytes(socket.token_id())
+            .and_then(|len| {
+                u64::try_from(len)
+                    .map_err(|_| kernel_io_manager::api::network::InetSocketError::InvalidArgument)
+            })
+            .map(Some)
+            .map_err(map_inet_error);
+    }
+
     let Some((socket, _)) = current_socket_for_fd(fd)? else {
         return Ok(None);
     };
@@ -498,6 +586,36 @@ fn current_socket_for_fd(fd: u64) -> Result<Option<(SocketHandle, u64)>, LinuxSy
     };
 
     result
+}
+
+fn current_inet_socket_for_fd(fd: u64) -> Result<Option<(InetSocketHandle, u64)>, LinuxSysopError> {
+    if fd < 3 {
+        return Ok(None);
+    }
+
+    let Some(result) = multitask::with_current_user_process_state(|_, _, process_state| {
+        let Some(entry) = process_state.handles().get_entry(fd) else {
+            return Err(LinuxSysopError::BadFileDescriptor);
+        };
+        match entry.handle() {
+            KernelHandle::InetSocket(socket) => Ok(Some((*socket, entry.status_flags()))),
+            _ => Ok(None),
+        }
+    }) else {
+        return Err(LinuxSysopError::Unsupported);
+    };
+
+    result
+}
+
+fn inet_socket_handle_for_fd(fd: u64) -> Result<Option<InetSocketHandle>, LinuxSysopError> {
+    current_inet_socket_for_fd(fd).map(|entry| entry.map(|(socket, _)| socket))
+}
+
+fn inet_status_flags_for_fd(fd: u64) -> Result<u64, LinuxSysopError> {
+    Ok(current_inet_socket_for_fd(fd)?
+        .map(|(_, status_flags)| status_flags)
+        .unwrap_or(0))
 }
 
 fn socket_handle_for_fd(fd: u64) -> Result<(SocketHandle, u64), LinuxSysopError> {
@@ -606,6 +724,46 @@ fn read_sockaddr_un_path(addr_ptr: u64, addr_len: u64) -> Result<String, LinuxSy
     }
 
     Ok(String::from_utf8_lossy(&path_bytes[..path_len]).into_owned())
+}
+
+fn read_sockaddr_in(addr_ptr: u64, addr_len: u64) -> Result<([u8; 4], u16), LinuxSysopError> {
+    let len = usize::try_from(addr_len).map_err(|_| LinuxSysopError::InvalidArgument)?;
+    if addr_ptr == 0 || len < size_of::<linux_abi::LinuxSockaddrIn>() {
+        return Err(LinuxSysopError::InvalidArgument);
+    }
+
+    let mut bytes = [0_u8; size_of::<linux_abi::LinuxSockaddrIn>()];
+    usermem::copy_from_current_user_exact(addr_ptr, &mut bytes)?;
+    let family = u16::from_le_bytes([bytes[0], bytes[1]]) as u64;
+    if family != linux_abi::AF_INET {
+        return Err(LinuxSysopError::AddressFamilyNotSupported);
+    }
+
+    Ok((
+        [bytes[4], bytes[5], bytes[6], bytes[7]],
+        u16::from_be_bytes([bytes[2], bytes[3]]),
+    ))
+}
+
+fn map_inet_error(error: kernel_io_manager::api::network::InetSocketError) -> LinuxSysopError {
+    match error {
+        kernel_io_manager::api::network::InetSocketError::BadFileDescriptor => {
+            LinuxSysopError::BadFileDescriptor
+        }
+        kernel_io_manager::api::network::InetSocketError::InvalidArgument => {
+            LinuxSysopError::InvalidArgument
+        }
+        kernel_io_manager::api::network::InetSocketError::NetworkUnreachable => {
+            LinuxSysopError::NetworkUnreachable
+        }
+        kernel_io_manager::api::network::InetSocketError::NotConnected => {
+            LinuxSysopError::NotConnected
+        }
+        kernel_io_manager::api::network::InetSocketError::OperationNotSupported => {
+            LinuxSysopError::OperationNotSupported
+        }
+        kernel_io_manager::api::network::InetSocketError::TryAgain => LinuxSysopError::TryAgain,
+    }
 }
 
 fn write_accept_address(addr_ptr: u64, addr_len_ptr: u64) -> Result<(), LinuxSysopError> {
@@ -786,6 +944,9 @@ fn read_iovec_payload(iovecs: &[linux_abi::LinuxIovec]) -> Result<Vec<u8>, Linux
         payload_len = payload_len
             .checked_add(chunk_len)
             .ok_or(LinuxSysopError::InvalidArgument)?;
+        if payload_len > MAX_SOCKET_IOV_PAYLOAD_BYTES {
+            return Err(LinuxSysopError::InvalidArgument);
+        }
     }
 
     let mut payload = vec![0_u8; payload_len];
@@ -812,6 +973,9 @@ fn read_passed_handles_from_control(
     let len = usize::try_from(control_len).map_err(|_| LinuxSysopError::InvalidArgument)?;
     if len == 0 {
         return Ok(Vec::new());
+    }
+    if len > MAX_SOCKET_CONTROL_BYTES {
+        return Err(LinuxSysopError::InvalidArgument);
     }
 
     let mut bytes = vec![0_u8; len];

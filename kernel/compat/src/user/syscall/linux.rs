@@ -35,6 +35,7 @@ const LINUX_ENOTSOCK: i64 = 88;
 const LINUX_ENOTTY: i64 = 25;
 const LINUX_EOPNOTSUPP: i64 = 95;
 const LINUX_EAFNOSUPPORT: i64 = 97;
+const LINUX_ENETUNREACH: i64 = 101;
 const LINUX_EADDRINUSE: i64 = 98;
 const LINUX_EISCONN: i64 = 106;
 const LINUX_ENOTCONN: i64 = 107;
@@ -512,6 +513,7 @@ fn linux_sysop_error_to_errno(err: linux_ops::LinuxSysopError) -> i64 {
         linux_ops::LinuxSysopError::Interrupted => LINUX_EINTR,
         linux_ops::LinuxSysopError::InvalidArgument => LINUX_EINVAL,
         linux_ops::LinuxSysopError::NoMemory => LINUX_ENOMEM,
+        linux_ops::LinuxSysopError::NetworkUnreachable => LINUX_ENETUNREACH,
         linux_ops::LinuxSysopError::NotFound => LINUX_ENOENT,
         linux_ops::LinuxSysopError::NotDirectory => LINUX_ENOTDIR,
         linux_ops::LinuxSysopError::NotConnected => LINUX_ENOTCONN,

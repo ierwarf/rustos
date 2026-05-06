@@ -15,26 +15,6 @@ unsafe extern "C" fn compat_printk(_fmt: *const c_char) -> i32 {
     0
 }
 
-unsafe extern "C" fn register_virtio_driver(driver: *mut c_void) -> i32 {
-    crate::debug::println!(
-        "linux compat: virtio register driver ptr={:#x} status=registered-no-bus-binding",
-        driver as usize
-    );
-    let _ = crate::driver::virtio_gpu::try_enable_primary_display();
-    0
-}
-
-unsafe extern "C" fn unregister_virtio_driver(driver: *mut c_void) {
-    crate::debug::println!(
-        "linux compat: virtio unregister driver ptr={:#x}",
-        driver as usize
-    );
-}
-
-unsafe extern "C" fn is_virtio_device(_dev: *mut c_void) -> i32 {
-    1
-}
-
 unsafe extern "C" fn drm_dev_register(_dev: *mut c_void, _flags: u64) -> i32 {
     0
 }
@@ -88,31 +68,10 @@ unsafe extern "C" fn dma_resv_wait_timeout(
 }
 
 pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
+    if let Some(symbol) = resolve_symbol_meta(name) {
+        return Some(symbol.addr);
+    }
     match name {
-        "__register_virtio_driver" => Some(register_virtio_driver as *const () as usize),
-        "unregister_virtio_driver" => Some(unregister_virtio_driver as *const () as usize),
-        "is_virtio_device" => Some(is_virtio_device as *const () as usize),
-
-        "drm_dev_register" => Some(drm_dev_register as *const () as usize),
-        "drm_dev_unplug" => Some(drm_dev_unregister as *const () as usize),
-        "drm_dev_alloc" => Some(drm_dev_alloc as *const () as usize),
-        "drm_dev_get" => Some(drm_dev_get as *const () as usize),
-        "drm_dev_put" => Some(drm_dev_put as *const () as usize),
-        "__drm_dev_dbg"
-        | "__drm_err"
-        | "__drm_printfn_seq_file"
-        | "__drm_puts_seq_file"
-        | "drm_dev_printk" => Some(drm_printk_stub as *const () as usize),
-
-        "dma_fence_context_alloc" => Some(dma_fence_context_alloc as *const () as usize),
-        "dma_fence_signal_locked" => Some(dma_fence_signal_locked as *const () as usize),
-        "dma_fence_match_context" => Some(dma_fence_match_context as *const () as usize),
-        "dma_fence_wait_timeout" => Some(dma_fence_wait_timeout as *const () as usize),
-        "dma_resv_test_signaled" => Some(dma_resv_test_signaled as *const () as usize),
-        "dma_resv_wait_timeout" => Some(dma_resv_wait_timeout as *const () as usize),
-
-        "__warn_printk" => Some(compat_printk as *const () as usize),
-
         _ if is_virtio_drm_data_symbol(name) => Some(COMPAT_DATA.as_ptr() as usize),
         "video_firmware_drivers_only" => {
             Some((&COMPAT_VIDEO_FIRMWARE_DRIVERS_ONLY as *const i32) as usize)
@@ -121,6 +80,32 @@ pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
         _ if is_stubbed_virtio_drm_symbol(name) => Some(compat_zero as *const () as usize),
         _ => None,
     }
+}
+
+pub(crate) fn resolve_symbol_meta(name: &str) -> Option<super::LinuxCompatSymbol> {
+    super::linux_compat_symbols!(name, {
+        "drm_dev_register" => drm_dev_register;
+        "drm_dev_unplug" => drm_dev_unregister;
+        "drm_dev_alloc" => drm_dev_alloc;
+        "drm_dev_get" => drm_dev_get;
+        "drm_dev_put" => drm_dev_put;
+        "__drm_dev_dbg" => drm_printk_stub, preserve_stack_tail;
+        "__drm_err" => drm_printk_stub, preserve_stack_tail;
+        "__drm_printfn_seq_file" => drm_printk_stub, preserve_stack_tail;
+        "__drm_puts_seq_file" => drm_printk_stub, preserve_stack_tail;
+        "drm_dev_printk" => drm_printk_stub, preserve_stack_tail;
+        "dma_fence_context_alloc" => dma_fence_context_alloc;
+        "dma_fence_signal_locked" => dma_fence_signal_locked;
+        "dma_fence_match_context" => dma_fence_match_context;
+        "dma_fence_wait_timeout" => dma_fence_wait_timeout;
+        "dma_resv_test_signaled" => dma_resv_test_signaled;
+        "dma_resv_wait_timeout" => dma_resv_wait_timeout;
+        "__warn_printk" => compat_printk, preserve_stack_tail;
+    })
+}
+
+pub(crate) fn symbol_abi(name: &str) -> Option<super::LinuxCompatExportAbi> {
+    resolve_symbol_meta(name).map(|symbol| symbol.abi)
 }
 
 fn is_virtio_drm_data_symbol(name: &str) -> bool {

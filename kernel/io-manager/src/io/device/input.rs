@@ -111,13 +111,17 @@ fn read_events_to_user(
     }
 
     let capacity = capacity.min(MAX_INPUT_EVENTS_PER_READ);
+    let max_bytes_len = capacity
+        .checked_mul(event_size)
+        .ok_or(DeviceError::InvalidArgument)?;
+    validate(max_bytes_len)?;
+
     let mut events = [device::InputEvent::default(); MAX_INPUT_EVENTS_PER_READ];
     let read = read_events(&mut events[..capacity]);
     let bytes_len = read
         .checked_mul(event_size)
         .ok_or(DeviceError::InvalidArgument)?;
 
-    validate(bytes_len)?;
     if read != 0 {
         let bytes = unsafe { slice::from_raw_parts(events.as_ptr().cast::<u8>(), bytes_len) };
         write(bytes)?;
@@ -137,6 +141,11 @@ fn read_evdev_events_to_user(
     }
 
     let input_capacity = (output_capacity / 3).min(MAX_INPUT_EVENTS_PER_READ);
+    let max_bytes_len = output_capacity
+        .checked_mul(event_size)
+        .ok_or(DeviceError::InvalidArgument)?;
+    validate(max_bytes_len)?;
+
     let mut input_events = [device::InputEvent::default(); MAX_INPUT_EVENTS_PER_READ];
     let read = read_events(&mut input_events[..input_capacity]);
     if read == 0 {
@@ -152,7 +161,6 @@ fn read_evdev_events_to_user(
     let bytes_len = written
         .checked_mul(event_size)
         .ok_or(DeviceError::InvalidArgument)?;
-    validate(bytes_len)?;
     let bytes = unsafe { slice::from_raw_parts(output.as_ptr().cast::<u8>(), bytes_len) };
     write(bytes)?;
     Ok(bytes_len)

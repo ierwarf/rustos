@@ -3,8 +3,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use xshell::cmd;
-
 use crate::Result;
 use crate::config::Config;
 use crate::layering::validate_workspace_layering;
@@ -13,9 +11,9 @@ use crate::package_manifest::{
 };
 use crate::stage;
 use crate::util::{
-    command_in_path, copy_with_parent, create_temp_dir, kernel_rustflags_env, remove_dir_if_exists,
-    remove_file_if_exists, run_cargo_kernel_check, run_cargo_kernel_rustc, run_command, shell,
-    strip_elf_artifact_if_available,
+    command_in_path, copy_with_parent, create_temp_dir, kernel_rustflags_env, output_is_fresh,
+    outputs_are_fresh, remove_dir_if_exists, remove_file_if_exists, run_cargo_kernel_check,
+    run_cargo_kernel_rustc, run_command, strip_elf_artifact_if_available,
 };
 
 pub(crate) fn build(config: &Config) -> Result<()> {
@@ -44,11 +42,6 @@ pub(crate) fn build(config: &Config) -> Result<()> {
         )
     })?;
     stage::stage(config)?;
-    print_staged_manifest_summary(config, &manifests);
-    println!(
-        "AMDGPU firmware ready: {}",
-        config.amdgpu_image_firmware_dir().display()
-    );
     Ok(())
 }
 
@@ -56,48 +49,54 @@ pub(crate) fn check(config: &Config) -> Result<()> {
     validate_workspace_layering(&config.root_dir)?;
     let _ = load_default_manifests(&config.root_dir)?;
     ensure_targets(config)?;
-    let sh = shell()?;
-    let cargo = &config.cargo;
 
     run_cargo_kernel_check(config, &config.nucleus_package)?;
     check_nucleus_multiboot2_if_present(config)?;
 
-    let package = &config.user_elf_package;
-    let target = &config.kernel_target;
-    cmd!(sh, "{cargo} check -p {package} --target {target}")
-        .env("CARGO_TARGET_DIR", &config.cargo_target_dir)
-        .run()?;
+    let mut user_check = Command::new(&config.cargo);
+    user_check
+        .arg("check")
+        .arg("-p")
+        .arg(&config.user_elf_package)
+        .arg("--target")
+        .arg(&config.kernel_target)
+        .env("CARGO_TARGET_DIR", &config.cargo_target_dir);
+    run_command(&mut user_check)?;
 
-    cmd!(
-        sh,
-        "{cargo} check --workspace --exclude nucleus"
-    )
-    .env("CARGO_TARGET_DIR", &config.cargo_target_dir)
-    .run()?;
+    let mut workspace_check = Command::new(&config.cargo);
+    workspace_check
+        .arg("check")
+        .arg("--workspace")
+        .arg("--exclude")
+        .arg("nucleus")
+        .env("CARGO_TARGET_DIR", &config.cargo_target_dir);
+    run_command(&mut workspace_check)?;
 
     Ok(())
 }
 
 pub(crate) fn clean(config: &Config) -> Result<()> {
-    let sh = shell()?;
-    let cargo = &config.cargo;
-    let workspace_manifest = &config.workspace_manifest;
-    cmd!(sh, "{cargo} clean")
-        .env("CARGO_TARGET_DIR", &config.cargo_target_dir)
-        .run()?;
-    cmd!(sh, "{cargo} clean --manifest-path {workspace_manifest}")
-        .env("CARGO_TARGET_DIR", &config.cargo_target_dir)
-        .run()?;
+    let mut clean_target = Command::new(&config.cargo);
+    clean_target
+        .arg("clean")
+        .env("CARGO_TARGET_DIR", &config.cargo_target_dir);
+    run_command(&mut clean_target)?;
+
+    let mut clean_manifest = Command::new(&config.cargo);
+    clean_manifest
+        .arg("clean")
+        .arg("--manifest-path")
+        .arg(&config.workspace_manifest)
+        .env("CARGO_TARGET_DIR", &config.cargo_target_dir);
+    run_command(&mut clean_manifest)?;
     remove_dir_if_exists(&config.build_dir)?;
     Ok(())
 }
 
 pub(crate) fn ensure_targets(config: &Config) -> Result<()> {
-    let sh = shell()?;
-    let rustup = &config.rustup;
-    let target = &config.kernel_target;
-    cmd!(sh, "{rustup} target add {target}").run()?;
-    Ok(())
+    let mut command = Command::new(&config.rustup);
+    command.arg("target").arg("add").arg(&config.kernel_target);
+    run_command(&mut command)
 }
 
 pub(crate) fn build_efi(config: &Config) -> Result<()> {
@@ -241,7 +240,6 @@ fn build_windows_system_dlls(config: &Config, manifest: &PackageManifest) -> Res
     fs::create_dir_all(&artifact_dir)?;
     remove_dir_if_exists(&artifact_dir.join(".importlibs"))?;
     let import_lib_dir = config.build_dir.join("intermediates/winsys-importlibs");
-    remove_dir_if_exists(&import_lib_dir)?;
     fs::create_dir_all(&import_lib_dir)?;
 
     for (index, spec) in winsys_dll_specs().iter().enumerate() {
@@ -249,11 +247,24 @@ fn build_windows_system_dlls(config: &Config, manifest: &PackageManifest) -> Res
         let exports = winsys_dir.join(spec.dir).join("exports.def");
         let output = artifact_dir.join(spec.file_name);
         let import_lib = import_lib_dir.join(format!("{}.a", spec.file_name));
-        remove_file_if_exists(&output)?;
-        remove_file_if_exists(&import_lib)?;
         for shared_source in spec.shared_sources {
             sources.push(winsys_dir.join(shared_source));
         }
+        let mut inputs = sources.clone();
+        inputs.push(exports.clone());
+        inputs.push(manifest.manifest_path.clone());
+        inputs.extend(winsys_headers(&winsys_dir.join(spec.dir))?);
+        inputs.extend(winsys_headers(&winsys_dir.join("common"))?);
+        if winsys_dll_needs_ntdll(spec.file_name) {
+            inputs.push(import_lib_dir.join("ntdll.dll.a"));
+        }
+
+        if outputs_are_fresh(&[output.clone(), import_lib.clone()], &inputs)? {
+            continue;
+        }
+
+        remove_file_if_exists(&output)?;
+        remove_file_if_exists(&import_lib)?;
 
         let image_base = 0x7000_0000_u64 + (index as u64) * 0x0010_0000_u64;
         let mut command = Command::new(&config.mingw_cc);
@@ -281,6 +292,18 @@ fn build_windows_system_dlls(config: &Config, manifest: &PackageManifest) -> Res
     }
 
     Ok(())
+}
+
+fn winsys_headers(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("h") {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
 }
 
 fn winsys_dll_needs_ntdll(file_name: &str) -> bool {
@@ -357,17 +380,25 @@ fn build_cargo_kernel_binary(config: &Config, manifest: &PackageManifest) -> Res
         .package
         .as_deref()
         .ok_or_else(|| format!("package {} missing build.package", manifest.id))?;
-    let sh = shell()?;
-    let cargo = &config.cargo;
-    let target = &config.kernel_target;
-    cmd!(sh, "{cargo} build -p {package} --target {target} --release")
-        .env("CARGO_TARGET_DIR", &config.cargo_target_dir)
-        .run()?;
+    let mut command = Command::new(&config.cargo);
+    command
+        .arg("build")
+        .arg("-p")
+        .arg(package)
+        .arg("--target")
+        .arg(&config.kernel_target)
+        .arg("--release")
+        .env("CARGO_TARGET_DIR", &config.cargo_target_dir);
+    run_command(&mut command)?;
 
     let binary = config
         .cargo_target_dir
         .join(format!("{}/release/{package}", config.kernel_target));
-    copy_with_parent(&binary, &manifest.artifact_path(config))
+    let artifact = manifest.artifact_path(config);
+    if output_is_fresh(&artifact, &[binary.clone()])? {
+        return Ok(());
+    }
+    copy_with_parent(&binary, &artifact)
 }
 
 fn build_mingw_c_exe(config: &Config, manifest: &PackageManifest) -> Result<()> {
@@ -382,6 +413,11 @@ fn build_mingw_c_exe(config: &Config, manifest: &PackageManifest) -> Result<()> 
         )
     })?;
     fs::create_dir_all(parent)?;
+
+    if output_is_fresh(&output, &[source.clone(), manifest.manifest_path.clone()])? {
+        return Ok(());
+    }
+
     remove_file_if_exists(&output)?;
 
     run_command(
@@ -412,12 +448,11 @@ fn build_c_demo_manifest(config: &Config, manifest: &PackageManifest) -> Result<
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
-    build_c_demo(
-        &config.cc,
-        &source,
-        &manifest.artifact_path(config),
-        &extra_args,
-    )
+    let output = manifest.artifact_path(config);
+    if output_is_fresh(&output, &[source.clone(), manifest.manifest_path.clone()])? {
+        return Ok(());
+    }
+    build_c_demo(&config.cc, &source, &output, &extra_args)
 }
 
 fn build_module_image_manifest(config: &Config, manifest: &PackageManifest) -> Result<()> {
@@ -443,14 +478,21 @@ fn build_module_image_manifest(config: &Config, manifest: &PackageManifest) -> R
         crate_name,
         &manifest.artifact_path(config),
         &dependency_crates,
+        &[manifest.manifest_path.clone()],
     )
 }
 
 fn build_external_copy_manifest(config: &Config, manifest: &PackageManifest) -> Result<()> {
     let source = resolve_external_copy_source(config, manifest);
     let artifact = manifest.artifact_path(config);
-    remove_file_if_exists(&artifact)?;
     if let Some(source) = source.filter(|path| path.is_file()) {
+        if manifest.build.source_env.is_none() {
+            let inputs = vec![source.clone(), manifest.manifest_path.clone()];
+            if output_is_fresh(&artifact, &inputs)? {
+                return Ok(());
+            }
+        }
+        remove_file_if_exists(&artifact)?;
         copy_with_parent(&source, &artifact)?;
     } else if !manifest.build.optional {
         return Err(format!(
@@ -488,12 +530,12 @@ fn build_rust_module_image(
     crate_name: &str,
     output: &Path,
     dependency_crates: &[&str],
+    extra_inputs: &[PathBuf],
 ) -> Result<()> {
     let output_parent = output
         .parent()
         .ok_or_else(|| format!("module artifact path has no parent: {}", output.display()))?;
     fs::create_dir_all(output_parent)?;
-    remove_file_if_exists(output)?;
 
     let deps_dir = config.kernel_release_deps_dir();
 
@@ -523,11 +565,6 @@ fn build_rust_module_image(
         .arg("relocation-model=pic");
     run_command(&mut command)?;
 
-    let ar_bin = command_in_path("llvm-ar")
-        .or_else(|| command_in_path("ar"))
-        .ok_or("missing llvm-ar/ar for module archive extraction")?;
-    let temp_dir = create_temp_dir("rustos-module-link")?;
-    let mut link_inputs = Vec::new();
     let mut archives = dependency_crates
         .iter()
         .map(|dependency| (*dependency).to_owned())
@@ -539,6 +576,25 @@ fn build_rust_module_image(
     }
 
     let self_archive = find_latest_rlib_artifact(&deps_dir, &format!("lib{crate_name}-"))?;
+    let mut archive_paths = vec![self_archive.clone()];
+    for dependency in &archives {
+        archive_paths.push(find_latest_rlib_artifact(
+            &deps_dir,
+            &format!("lib{dependency}-"),
+        )?);
+    }
+    let mut freshness_inputs = archive_paths.clone();
+    freshness_inputs.extend(extra_inputs.iter().cloned());
+    if output_is_fresh(output, &freshness_inputs)? {
+        return Ok(());
+    }
+
+    remove_file_if_exists(output)?;
+    let ar_bin = command_in_path("llvm-ar")
+        .or_else(|| command_in_path("ar"))
+        .ok_or("missing llvm-ar/ar for module archive extraction")?;
+    let temp_dir = create_temp_dir("rustos-module-link")?;
+    let mut link_inputs = Vec::new();
     extract_archive_objects(
         &ar_bin,
         &self_archive,
@@ -546,11 +602,10 @@ fn build_rust_module_image(
         &mut link_inputs,
     )?;
 
-    for dependency in &archives {
-        let archive = find_latest_rlib_artifact(&deps_dir, &format!("lib{dependency}-"))?;
+    for (dependency, archive) in archives.iter().zip(archive_paths.iter().skip(1)) {
         extract_archive_objects(
             &ar_bin,
-            &archive,
+            archive,
             &temp_dir.join(dependency),
             &mut link_inputs,
         )?;
@@ -752,17 +807,6 @@ fn extract_archive_objects(
     )?;
     link_inputs.extend(collect_object_files(extract_dir)?);
     Ok(())
-}
-
-fn print_staged_manifest_summary(config: &Config, manifests: &[PackageManifest]) {
-    for manifest in manifests {
-        let image = manifest.image_path(config);
-        if image.exists() {
-            println!("staged {}: {}", manifest.id, image.display());
-        } else if manifest.build.optional {
-            println!("staged {}: skipped", manifest.id);
-        }
-    }
 }
 
 struct WinsysDllSpec {

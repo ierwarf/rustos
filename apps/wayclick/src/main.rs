@@ -613,9 +613,15 @@ impl ShmBuffer {
         buffer_index: usize,
     ) -> io::Result<Self> {
         let len_bytes = usize::try_from(width)
-            .unwrap()
-            .saturating_mul(usize::try_from(height).unwrap())
-            .saturating_mul(4);
+            .ok()
+            .and_then(|width| {
+                usize::try_from(height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|pixels| pixels.checked_mul(4))
+            .filter(|len| *len != 0)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
         let fd = create_memfd("wayclick-buffer")?;
         let rc = unsafe { libc::ftruncate(fd.as_raw_fd(), len_bytes as libc::off_t) };
         if rc != 0 {
@@ -665,8 +671,8 @@ impl ShmBuffer {
     fn fill_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: u32) {
         let start_x = x.max(0).min(self.width as i32);
         let start_y = y.max(0).min(self.height as i32);
-        let end_x = (x + w).max(0).min(self.width as i32);
-        let end_y = (y + h).max(0).min(self.height as i32);
+        let end_x = x.saturating_add(w).max(0).min(self.width as i32);
+        let end_y = y.saturating_add(h).max(0).min(self.height as i32);
         if start_x >= end_x || start_y >= end_y {
             return;
         }

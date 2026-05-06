@@ -429,6 +429,10 @@ pub mod io {
             crate::io::gui::try_present_panic_blackout()
         }
 
+        pub fn write_panic_console_line(bytes: &[u8]) -> bool {
+            crate::io::gui::write_panic_console_line(bytes)
+        }
+
         pub fn flush_debug_console() {
             crate::io::gui::flush_debug_console();
         }
@@ -516,6 +520,46 @@ pub mod vfs {
         absolute_path: &str,
     ) -> Result<alloc::string::String, VfsError> {
         crate::vfs::readlink_for_current_process(absolute_path).map_err(map_vfs_error)
+    }
+}
+
+pub mod network {
+    pub use crate::network::InetSocketError;
+
+    pub fn create_inet_socket(type_: u64, protocol: u64) -> u64 {
+        crate::network::create_inet_socket(type_, protocol)
+    }
+
+    pub fn close_inet_socket(token: u64) {
+        crate::network::close_inet_socket(token)
+    }
+
+    pub fn connect_inet_socket(
+        token: u64,
+        addr: [u8; 4],
+        port: u16,
+    ) -> Result<(), InetSocketError> {
+        crate::network::connect_inet_socket(token, addr, port)
+    }
+
+    pub fn send_inet_socket(token: u64, bytes: &[u8]) -> Result<usize, InetSocketError> {
+        crate::network::send_inet_socket(token, bytes)
+    }
+
+    pub fn recv_inet_socket(
+        token: u64,
+        out: &mut [u8],
+        nonblocking: bool,
+    ) -> Result<usize, InetSocketError> {
+        crate::network::recv_inet_socket(token, out, nonblocking)
+    }
+
+    pub fn inet_readable_bytes(token: u64) -> Result<usize, InetSocketError> {
+        crate::network::inet_readable_bytes(token)
+    }
+
+    pub fn inet_socket_writable(token: u64) -> bool {
+        crate::network::inet_socket_writable(token)
     }
 }
 

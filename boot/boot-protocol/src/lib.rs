@@ -1,9 +1,12 @@
 #![no_std]
 
-use core::mem::size_of;
+use core::mem::{align_of, size_of};
 
 pub const BOOT_INFO_MAGIC: u64 = 0x5255_5354_4F53_4749; // "RUSTOSGI"
 pub const BOOT_INFO_VERSION: u32 = 15;
+pub const MAX_BOOT_MEMORY_REGIONS: u32 = 4096;
+pub const MAX_BOOT_FRAMEBUFFER_WIDTH: u32 = 7680;
+pub const MAX_BOOT_FRAMEBUFFER_HEIGHT: u32 = 4320;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,12 +68,24 @@ impl FramebufferInfo {
         if self.addr == 0 || self.size == 0 {
             return Err(BootInfoValidationError::InvalidFramebuffer);
         }
+        self.addr
+            .checked_add(self.size)
+            .ok_or(BootInfoValidationError::InvalidFramebuffer)?;
 
         let width = self.width as usize;
         let height = self.height as usize;
         let stride = self.stride as usize;
         let bytes_per_pixel = self.bytes_per_pixel as usize;
         if width == 0 || height == 0 || stride < width || !(3..=4).contains(&bytes_per_pixel) {
+            return Err(BootInfoValidationError::InvalidFramebuffer);
+        }
+        if self.width > MAX_BOOT_FRAMEBUFFER_WIDTH || self.height > MAX_BOOT_FRAMEBUFFER_HEIGHT {
+            return Err(BootInfoValidationError::InvalidFramebuffer);
+        }
+        if !matches!(
+            self.pixel_format,
+            BootPixelFormat::Rgb | BootPixelFormat::Bgr
+        ) {
             return Err(BootInfoValidationError::InvalidFramebuffer);
         }
 
@@ -93,6 +108,11 @@ impl FramebufferInfo {
         }
         if self.back_buffer_addr != 0 && self.back_buffer_size < min_size as u64 {
             return Err(BootInfoValidationError::InvalidFramebuffer);
+        }
+        if self.back_buffer_addr != 0 {
+            self.back_buffer_addr
+                .checked_add(self.back_buffer_size)
+                .ok_or(BootInfoValidationError::InvalidFramebuffer)?;
         }
 
         Ok(())
@@ -140,6 +160,9 @@ impl BootMemoryMap {
         if self.entry_count == 0 || self.entries_ptr == 0 {
             return Err(BootInfoValidationError::InvalidMemoryMap);
         }
+        if self.entry_count > MAX_BOOT_MEMORY_REGIONS {
+            return Err(BootInfoValidationError::InvalidMemoryMap);
+        }
 
         let bytes = (self.entry_count as usize)
             .checked_mul(size_of::<BootMemoryRegion>())
@@ -150,6 +173,9 @@ impl BootMemoryMap {
         if (self.entries_ptr as usize) % align_of::<BootMemoryRegion>() != 0 {
             return Err(BootInfoValidationError::InvalidMemoryMap);
         }
+        self.entries_ptr
+            .checked_add(bytes as u64)
+            .ok_or(BootInfoValidationError::InvalidMemoryMap)?;
 
         Ok(())
     }
@@ -341,6 +367,9 @@ impl BootInfo {
         if ptr.is_null() {
             return Err(BootInfoValidationError::NullPointer);
         }
+        if (ptr as usize) % align_of::<Self>() != 0 {
+            return Err(BootInfoValidationError::NullPointer);
+        }
 
         let info = unsafe { &*ptr };
         info.validate()?;
@@ -446,6 +475,26 @@ mod tests {
             addr: 0x2000,
             ..FramebufferInfo::empty()
         };
+        assert_eq!(
+            info.validate(),
+            Err(BootInfoValidationError::InvalidFramebuffer)
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_boot_memory_map() {
+        let mut info = valid_boot_info();
+        info.memory_map.entry_count = MAX_BOOT_MEMORY_REGIONS + 1;
+        assert_eq!(
+            info.validate(),
+            Err(BootInfoValidationError::InvalidMemoryMap)
+        );
+    }
+
+    #[test]
+    fn rejects_present_unknown_framebuffer_format() {
+        let mut info = valid_boot_info();
+        info.framebuffer.pixel_format = BootPixelFormat::Unknown;
         assert_eq!(
             info.validate(),
             Err(BootInfoValidationError::InvalidFramebuffer)

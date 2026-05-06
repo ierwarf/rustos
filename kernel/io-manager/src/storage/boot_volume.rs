@@ -7,6 +7,7 @@ use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
 
 use fatfs::{IoBase, Read, Seek, SeekFrom, Write};
+use spin::Mutex;
 use storage_core::BlockDevice;
 
 use crate::storage::fat::{self, DiskIoError};
@@ -14,8 +15,9 @@ use crate::storage::fat::{self, DiskIoError};
 pub use crate::storage::fat::{BootVolumeDirEntry, BootVolumeMetadata};
 
 static BOOT_INFO_PTR: AtomicPtr<BootInfo> = AtomicPtr::new(ptr::null_mut());
-static mut BOOT_BLOCK_DEVICE_OPENER: Option<BootBlockDeviceOpener> = None;
-static mut PHYSICAL_BOOT_BLOCK_DEVICE_OPENER: Option<PhysicalBootBlockDeviceOpener> = None;
+static BOOT_BLOCK_DEVICE_OPENER: Mutex<Option<BootBlockDeviceOpener>> = Mutex::new(None);
+static PHYSICAL_BOOT_BLOCK_DEVICE_OPENER: Mutex<Option<PhysicalBootBlockDeviceOpener>> =
+    Mutex::new(None);
 static BOOTSTRAP_PHASE: AtomicU8 = AtomicU8::new(BootstrapPhase::EarlyBootstrap as u8);
 
 pub type BootBlockDeviceOpener =
@@ -126,15 +128,11 @@ pub fn boot_volume_transport_hint() -> Option<BootVolumeTransport> {
 }
 
 pub fn set_boot_block_device_opener(opener: BootBlockDeviceOpener) {
-    unsafe {
-        BOOT_BLOCK_DEVICE_OPENER = Some(opener);
-    }
+    *BOOT_BLOCK_DEVICE_OPENER.lock() = Some(opener);
 }
 
 pub fn set_physical_boot_block_device_opener(opener: PhysicalBootBlockDeviceOpener) {
-    unsafe {
-        PHYSICAL_BOOT_BLOCK_DEVICE_OPENER = Some(opener);
-    }
+    *PHYSICAL_BOOT_BLOCK_DEVICE_OPENER.lock() = Some(opener);
 }
 
 impl IoBase for BootVolumeFile<'_> {
@@ -188,7 +186,7 @@ impl PhysicalBootVolumeFile<'_> {
 impl BootVolume {
     pub fn open() -> core::result::Result<Self, fatfs::Error<DiskIoError>> {
         let opener =
-            unsafe { BOOT_BLOCK_DEVICE_OPENER }.ok_or(fatfs::Error::Io(DiskIoError::NotPresent))?;
+            (*BOOT_BLOCK_DEVICE_OPENER.lock()).ok_or(fatfs::Error::Io(DiskIoError::NotPresent))?;
         let device = opener()?;
         let fs = fat::open_volume(device)?;
         Ok(Self { fs })
@@ -313,7 +311,7 @@ impl PhysicalBootVolume {
         if identity.validate().is_err() || !identity.is_present() {
             return Err(fatfs::Error::Io(DiskIoError::NotPresent));
         }
-        let opener = unsafe { PHYSICAL_BOOT_BLOCK_DEVICE_OPENER }
+        let opener = (*PHYSICAL_BOOT_BLOCK_DEVICE_OPENER.lock())
             .ok_or(fatfs::Error::Io(DiskIoError::NotPresent))?;
         let device = opener(identity)?;
         let fs = fat::open_volume(device)?;

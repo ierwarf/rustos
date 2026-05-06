@@ -239,10 +239,19 @@ impl RuntimeClient {
             return Err(-response.status);
         }
 
-        let payload_len = usize::try_from(response.count)
-            .unwrap_or(0)
-            .checked_mul(size_of::<RuntimeRunningProgram>())
-            .ok_or(libc::EOVERFLOW)?;
+        let payload_len = match response.op {
+            OP_SNAPSHOT_RUNNING_PROGRAMS => {
+                let count = usize::try_from(response.count).map_err(|_| libc::EOVERFLOW)?;
+                if count > MAX_RUNTIME_PROGRAMS {
+                    return Err(libc::EOVERFLOW);
+                }
+                count
+                    .checked_mul(size_of::<RuntimeRunningProgram>())
+                    .ok_or(libc::EOVERFLOW)?
+            }
+            _ if response.count == 0 => 0,
+            _ => return Err(libc::EPROTO),
+        };
         let mut payload = vec![0_u8; payload_len];
         if payload_len != 0 {
             stream.read_exact(&mut payload).map_err(io_errno)?;
@@ -772,8 +781,17 @@ fn request_with_path(
     path: &str,
 ) -> Result<RuntimeRequest, i32> {
     let bytes = path.as_bytes();
+    if bytes.is_empty() {
+        return Err(libc::EINVAL);
+    }
     if bytes.len() > MAX_REQUEST_PATH_BYTES {
         return Err(libc::ENAMETOOLONG);
+    }
+    if !bytes
+        .iter()
+        .all(|byte| matches!(*byte, b' '..=b'~') && *byte != b'\\')
+    {
+        return Err(libc::EINVAL);
     }
     let mut request = RuntimeRequest {
         op,

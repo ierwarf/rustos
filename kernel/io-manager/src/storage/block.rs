@@ -238,11 +238,11 @@ fn log_boot_volume_handle_once(handle: BlockDeviceHandle) {
             )
             .as_str()
         );
-        crate::debug::println!(
-            "storage: boot volume handle selected id={} path={} transport={:?}",
-            descriptor.id,
-            descriptor.path,
-            descriptor.transport
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Storage,
+            "boot-volume-handle",
+            descriptor.id as u64,
+            descriptor.start_block,
         );
     }
 }

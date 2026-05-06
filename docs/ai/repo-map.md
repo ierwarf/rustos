@@ -4,6 +4,8 @@ Goal: minimize repo scan tokens.
 
 Read `token-policy.md` and `task-router.md` before using this map.
 
+For a one-screen map usable from any tool, see `docs/ai-map.md`.
+
 Core entrypoints:
 
 - Workspace: `Cargo.toml`
@@ -59,6 +61,7 @@ Avoid by default:
 - `target/`, `build/`, `logs/`: generated or run output.
 - `vendor/`: external binary inputs.
 - `Cargo.lock`: only inspect if dependency resolution changed.
+- `perf.data`: binary profiling output; never inspect as text.
 - Full `docs/logging.md` or `docs/api/kernel.md`: use AI contracts first.
 
 Allowed generated-path exceptions are defined in `token-policy.md`.

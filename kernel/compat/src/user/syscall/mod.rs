@@ -151,6 +151,7 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
     multitask::save_current_simd_state();
     let result = dispatch_syscall(frame, abi);
     multitask::restore_current_simd_state();
+    let return_abi = validate_syscall_entry_or_terminate(frame);
     let exec_transition_applied =
         frame.user_rip != user_rip_before_dispatch || frame.user_rsp != user_rsp_before_dispatch;
     if exec_transition_applied {
@@ -158,7 +159,7 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
     } else {
         multitask::reschedule_if_requested();
     }
-    trace_syscall_exit(frame, abi, result);
+    trace_syscall_exit(frame, return_abi, result);
     result
 }
 

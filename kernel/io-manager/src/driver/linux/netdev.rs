@@ -15,42 +15,68 @@ unsafe extern "C" fn compat_printk(_fmt: *const c_char) -> i32 {
 }
 
 unsafe extern "C" fn register_netdevice(dev: *mut c_void) -> i32 {
-    crate::debug::info!(
-        driver,
-        "linux compat: netdev registered dev={:#x}",
-        dev as usize
-    );
-    crate::network::note_netdev_registered();
-    0
+    if dev.is_null() {
+        return -22;
+    }
+    crate::network::register_linux_netdev(
+        dev as usize,
+        crate::network::current_linux_netdev_transport(),
+    )
 }
 
 unsafe extern "C" fn unregister_netdev(dev: *mut c_void) {
-    crate::debug::info!(
-        driver,
-        "linux compat: netdev unregistered dev={:#x}",
-        dev as usize
-    );
+    if dev.is_null() {
+        return;
+    }
+    crate::network::unregister_linux_netdev(dev as usize);
 }
 
 unsafe extern "C" fn alloc_etherdev_mqs(sizeof_priv: i32, txqs: u32, rxqs: u32) -> *mut c_void {
-    let size = core::mem::size_of::<usize>()
-        .saturating_mul(512)
-        .saturating_add(sizeof_priv.max(0) as usize)
-        .saturating_add((txqs as usize + rxqs as usize).saturating_mul(64));
-    unsafe { super::base::__kmalloc_noprof(size.max(4096), 0) }
+    let Some(queue_count) = (txqs as usize).checked_add(rxqs as usize) else {
+        return core::ptr::null_mut();
+    };
+    let Some(size) = core::mem::size_of::<usize>()
+        .checked_mul(512)
+        .and_then(|base| base.checked_add(sizeof_priv.max(0) as usize))
+        .and_then(|base| base.checked_add(queue_count.checked_mul(64)?))
+    else {
+        return core::ptr::null_mut();
+    };
+    let dev = unsafe { super::base::__kmalloc_noprof(size.max(4096), 0) };
+    if dev.is_null() {
+        return core::ptr::null_mut();
+    }
+    crate::network::allocate_linux_netdev(dev as usize, sizeof_priv.max(0) as usize, txqs, rxqs);
+    dev
 }
 
 unsafe extern "C" fn free_netdev(dev: *mut c_void) {
+    if dev.is_null() {
+        return;
+    }
+    crate::network::free_linux_netdev(dev as usize);
     unsafe { super::base::kfree(dev) };
 }
 
+unsafe extern "C" fn netif_carrier_on(dev: *mut c_void) {
+    if dev.is_null() {
+        return;
+    }
+    crate::network::set_linux_netdev_carrier(dev as usize, true);
+}
+
+unsafe extern "C" fn netif_carrier_off(dev: *mut c_void) {
+    if dev.is_null() {
+        return;
+    }
+    crate::network::set_linux_netdev_carrier(dev as usize, false);
+}
+
 pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
+    if let Some(symbol) = resolve_symbol_meta(name) {
+        return Some(symbol.addr);
+    }
     match name {
-        "alloc_etherdev_mqs" => Some(alloc_etherdev_mqs as *const () as usize),
-        "free_netdev" => Some(free_netdev as *const () as usize),
-        "register_netdevice" => Some(register_netdevice as *const () as usize),
-        "unregister_netdev" => Some(unregister_netdev as *const () as usize),
-        "unregister_netdevice_queue" => Some(unregister_netdev as *const () as usize),
         "__dynamic_netdev_dbg"
         | "netdev_printk"
         | "netdev_err"
@@ -64,6 +90,31 @@ pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
         _ if is_stubbed_netdev_symbol(name) => Some(compat_zero as *const () as usize),
         _ => None,
     }
+}
+
+pub(crate) fn resolve_symbol_meta(name: &str) -> Option<super::LinuxCompatSymbol> {
+    super::linux_compat_symbols!(name, {
+        "alloc_etherdev_mqs" => alloc_etherdev_mqs;
+        "free_netdev" => free_netdev;
+        "register_netdev" => register_netdevice;
+        "register_netdevice" => register_netdevice;
+        "unregister_netdev" => unregister_netdev;
+        "unregister_netdevice_queue" => unregister_netdev;
+        "netif_carrier_on" => netif_carrier_on;
+        "netif_carrier_off" => netif_carrier_off;
+        "__dynamic_netdev_dbg" => compat_printk, preserve_stack_tail;
+        "netdev_printk" => compat_printk, preserve_stack_tail;
+        "netdev_err" => compat_printk, preserve_stack_tail;
+        "netdev_warn" => compat_printk, preserve_stack_tail;
+        "_dev_err" => compat_printk, preserve_stack_tail;
+        "_dev_info" => compat_printk, preserve_stack_tail;
+        "_dev_warn" => compat_printk, preserve_stack_tail;
+        "__warn_printk" => compat_printk, preserve_stack_tail;
+    })
+}
+
+pub(crate) fn symbol_abi(name: &str) -> Option<super::LinuxCompatExportAbi> {
+    resolve_symbol_meta(name).map(|symbol| symbol.abi)
 }
 
 fn is_netdev_data_symbol(name: &str) -> bool {

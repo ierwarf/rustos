@@ -21,6 +21,9 @@ pub(crate) unsafe extern "C" fn ioremap_wc(offset: u64, size: usize) -> *mut c_v
 }
 
 pub(crate) unsafe extern "C" fn iounmap(addr: *mut c_void) {
+    if addr.is_null() {
+        return;
+    }
     crate::driver::mmio::unmap(addr);
 }
 
@@ -29,7 +32,10 @@ pub(crate) unsafe extern "C" fn devm_ioremap(
     offset: u64,
     size: u64,
 ) -> *mut c_void {
-    let addr = map_mmio(offset, size as usize, false);
+    let Some(size) = usize::try_from(size).ok() else {
+        return core::ptr::null_mut();
+    };
+    let addr = map_mmio(offset, size, false);
     crate::driver::devres::register_mmio(dev, addr);
     addr
 }
@@ -39,7 +45,10 @@ pub(crate) unsafe extern "C" fn devm_ioremap_uc(
     offset: u64,
     size: u64,
 ) -> *mut c_void {
-    let addr = map_mmio(offset, size as usize, false);
+    let Some(size) = usize::try_from(size).ok() else {
+        return core::ptr::null_mut();
+    };
+    let addr = map_mmio(offset, size, false);
     crate::driver::devres::register_mmio(dev, addr);
     addr
 }
@@ -49,7 +58,10 @@ pub(crate) unsafe extern "C" fn devm_ioremap_wc(
     offset: u64,
     size: u64,
 ) -> *mut c_void {
-    let addr = map_mmio(offset, size as usize, true);
+    let Some(size) = usize::try_from(size).ok() else {
+        return core::ptr::null_mut();
+    };
+    let addr = map_mmio(offset, size, true);
     crate::driver::devres::register_mmio(dev, addr);
     addr
 }
@@ -123,13 +135,24 @@ fn map_resource(res: *const LinuxCompatResource, write_combine: bool) -> *mut c_
     }
 
     let resource = unsafe { &*res };
-    let size = resource
+    if resource.end < resource.start {
+        return core::ptr::null_mut();
+    }
+
+    let Some(size) = resource
         .end
-        .saturating_sub(resource.start)
-        .saturating_add(1);
-    map_mmio(resource.start, size as usize, write_combine)
+        .checked_sub(resource.start)
+        .and_then(|length| length.checked_add(1))
+        .and_then(|length| usize::try_from(length).ok())
+    else {
+        return core::ptr::null_mut();
+    };
+    map_mmio(resource.start, size, write_combine)
 }
 
 fn map_mmio(offset: u64, size: usize, write_combine: bool) -> *mut c_void {
+    if size == 0 {
+        return core::ptr::null_mut();
+    }
     crate::driver::mmio::map(offset, size, write_combine)
 }

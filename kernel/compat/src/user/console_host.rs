@@ -11,7 +11,12 @@ use crate::user::windows::WindowsProcessLaunch;
 use crate::vfs;
 
 fn emit_console(level: debug::LogLevel, event_id: u16, object_id: u64, message: String) {
-    let _ = (event_id, object_id);
+    debug::record_milestone(
+        debug::LogCategory::Console,
+        "console-host",
+        event_id as u64,
+        object_id,
+    );
     match level {
         debug::LogLevel::Trace => debug::trace!(console, "{}", message),
         debug::LogLevel::Debug => debug::debug!(console, "{}", message),
@@ -260,9 +265,12 @@ pub fn load_executable_image_by_path(
     primary_path: &str,
     fallback_path: Option<&str>,
 ) -> Result<LoadedExecutableImage, ConsoleHostError> {
+    debug::record_milestone(debug::LogCategory::Console, "console-load-enter", 0, 0);
     if !crate::storage::boot_volume::userspace_runtime_active() {
+        debug::record_milestone(debug::LogCategory::Console, "console-load-blocked", 0, 0);
         return Err(ConsoleHostError::BootstrapBlocked);
     }
+    debug::record_milestone(debug::LogCategory::Console, "console-load-allowed", 0, 0);
     let trace = reserve_console_host_trace();
     if trace {
         emit_console(
@@ -337,12 +345,22 @@ fn load_executable_image_path_uncached(
         primary_path,
         fallback_path.unwrap_or("-"),
     );
+    debug::record_milestone(debug::LogCategory::Console, "console-read-begin", 0, 0);
     match vfs::read_path_to_vec_for_kernel(primary_path) {
-        Ok(bytes) => Ok(LoadedExecutableImage {
-            path: Box::leak(primary_path.to_string().into_boxed_str()),
-            bytes,
-        }),
+        Ok(bytes) => {
+            debug::record_milestone(
+                debug::LogCategory::Console,
+                "console-read-done",
+                bytes.len() as u64,
+                0,
+            );
+            Ok(LoadedExecutableImage {
+                path: Box::leak(primary_path.to_string().into_boxed_str()),
+                bytes,
+            })
+        }
         Err(primary_error) => {
+            debug::record_milestone(debug::LogCategory::Console, "console-read-failed", 0, 0);
             crate::debug::warn!(
                 console,
                 "console host: primary read failed path={} err={:?}",

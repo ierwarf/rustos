@@ -1,6 +1,6 @@
 enabled = true
 boot_trace_enabled = true
-serial_mirror = true
+serial_mirror = false
 ring_buffer_bytes = 16384
 min_level = "info"
 

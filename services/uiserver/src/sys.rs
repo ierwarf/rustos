@@ -27,6 +27,8 @@ const PROT_WRITE: usize = 0x2;
 
 const MAP_SHARED: usize = 0x01;
 const PAGE_SIZE: usize = 4096;
+const MAX_SURFACE_MAPPING_BYTES: usize = 128 * 1024 * 1024;
+const MAX_SHARED_FD_MAPPING_BYTES: usize = 64 * 1024 * 1024;
 const MAX_EVDEV_EVENTS_PER_READ: usize = 512;
 const EV_SYN: u16 = 0x00;
 const EV_KEY: u16 = 0x01;
@@ -407,7 +409,11 @@ pub(crate) fn display_present_rect(
 }
 
 pub(crate) fn map_surface(surface_fd: RawFd, mapping_len: usize) -> Result<SurfaceMapping, i32> {
-    if mapping_len == 0 || mapping_len % PAGE_SIZE != 0 || mapping_len % size_of::<u32>() != 0 {
+    if mapping_len == 0
+        || mapping_len > MAX_SURFACE_MAPPING_BYTES
+        || mapping_len % PAGE_SIZE != 0
+        || mapping_len % size_of::<u32>() != 0
+    {
         return Err(22);
     }
     let mapped = mmap(
@@ -429,7 +435,7 @@ pub(crate) fn map_shared_fd_readable(
     fd: RawFd,
     mapping_len: usize,
 ) -> Result<SharedFdMapping, i32> {
-    if mapping_len == 0 {
+    if mapping_len == 0 || mapping_len > MAX_SHARED_FD_MAPPING_BYTES {
         return Err(22);
     }
     let mapped = mmap(
@@ -448,7 +454,7 @@ pub(crate) fn map_shared_fd_readable(
 }
 
 pub(crate) fn read_input(fds: &[OwnedFd], events: &mut [InputEvent]) -> Result<usize, i32> {
-    if fds.is_empty() {
+    if fds.is_empty() || events.is_empty() {
         return Ok(0);
     }
     if running_on_rustos() {

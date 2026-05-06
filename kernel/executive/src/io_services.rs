@@ -101,6 +101,10 @@ mod backend {
         kernel_io_manager::api::io::gui::try_present_panic_blackout()
     }
 
+    pub(crate) fn gui_write_panic_console_line(bytes: &[u8]) -> bool {
+        kernel_io_manager::api::io::gui::write_panic_console_line(bytes)
+    }
+
     pub(crate) fn gui_flush_debug_console() {
         kernel_io_manager::api::io::gui::flush_debug_console();
     }
@@ -231,9 +235,9 @@ pub(crate) use backend::{
     console_init, console_service, console_write, debug_input_lock_snapshot,
     debug_irq_lock_snapshot, debug_pointer_report_count, debug_transfer_event_count,
     dispatch_pic_irq, enter_kernel_vfs_runtime, enter_userspace_runtime, gui_flush_debug_console,
-    gui_init, gui_try_present_panic_blackout, init_block_devices, init_boot_info, init_input,
-    init_linux_cpu_local_symbols, init_usb, init_vfs, initialize_loadable_modules_for_class,
-    input_debug_snapshot, input_service_pending, on_keyboard_interrupt, on_mouse_interrupt,
-    register_boot_volume_opener, system_console_session_raw, tick_jiffies, tty_init,
-    userspace_display_active, userspace_ready,
+    gui_init, gui_try_present_panic_blackout, gui_write_panic_console_line, init_block_devices,
+    init_boot_info, init_input, init_linux_cpu_local_symbols, init_usb, init_vfs,
+    initialize_loadable_modules_for_class, input_debug_snapshot, input_service_pending,
+    on_keyboard_interrupt, on_mouse_interrupt, register_boot_volume_opener,
+    system_console_session_raw, tick_jiffies, tty_init, userspace_display_active, userspace_ready,
 };

@@ -104,6 +104,7 @@ pub(crate) enum LinuxSysopError {
     Interrupted,
     InvalidArgument,
     NoMemory,
+    NetworkUnreachable,
     ExecFormat,
     NotFound,
     NotDirectory,

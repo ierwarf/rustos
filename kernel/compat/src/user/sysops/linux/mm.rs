@@ -86,7 +86,7 @@ pub(crate) fn mmap(
             }
         };
         let mapped_end = mapped_addr
-            .checked_add((page_count as u64).saturating_mul(PAGE_SIZE))
+            .checked_add(page_span_bytes(page_count)?)
             .ok_or(LinuxSysopError::NoMemory)?;
         let area = linux_abi::LinuxVma::new(
             mapped_addr,
@@ -211,7 +211,7 @@ fn mmap_current_process_device(
             None => return Err(LinuxSysopError::BadFileDescriptor),
         };
         let mapped_end = mapped_addr
-            .checked_add(align_up(user_len, PAGE_SIZE))
+            .checked_add(checked_align_up(user_len, PAGE_SIZE).ok_or(LinuxSysopError::NoMemory)?)
             .ok_or(LinuxSysopError::InvalidArgument)?;
         let area = linux_abi::LinuxVma::new(
             mapped_addr,
@@ -289,7 +289,9 @@ pub(crate) fn munmap(start: u64, user_len: u64) -> Result<(), LinuxSysopError> {
             }
             process_state.release_shared_memfd_mappings_in_range(start, end);
             for (segment_start, segment_len) in &surface_segments {
-                let page_count = (*segment_len as usize).div_ceil(PAGE_SIZE as usize);
+                let segment_len =
+                    usize::try_from(*segment_len).map_err(|_| LinuxSysopError::InvalidArgument)?;
+                let page_count = segment_len.div_ceil(PAGE_SIZE as usize);
                 process_state
                     .address_space_mut()
                     .unmap_user_pages_without_free_at(VirtAddr::new(*segment_start), page_count)
@@ -520,7 +522,9 @@ pub(crate) fn brk(addr: u64) -> u64 {
                 return state.brk_current;
             }
 
-            let requested_mapped_end = align_up(addr, PAGE_SIZE);
+            let Some(requested_mapped_end) = checked_align_up(addr, PAGE_SIZE) else {
+                return state.brk_current;
+            };
             if !state.can_grow_brk_to(requested_mapped_end) {
                 return state.brk_current;
             }
@@ -594,9 +598,17 @@ fn linux_vma_flags_from_mmap(prot: u64, flags: u64) -> linux_abi::LinuxVmaFlags 
     linux_vma_flags_from_prot(prot, !linux_mmap_is_shared(flags))
 }
 
-fn align_up(value: u64, align: u64) -> u64 {
+fn checked_align_up(value: u64, align: u64) -> Option<u64> {
     debug_assert!(align.is_power_of_two());
-    value.saturating_add(align - 1) & !(align - 1)
+    let mask = align.checked_sub(1)?;
+    Some(value.checked_add(mask)? & !mask)
+}
+
+fn page_span_bytes(page_count: usize) -> Result<u64, LinuxSysopError> {
+    u64::try_from(page_count)
+        .ok()
+        .and_then(|pages| pages.checked_mul(PAGE_SIZE))
+        .ok_or(LinuxSysopError::NoMemory)
 }
 
 fn map_linux_user_region(
@@ -607,10 +619,9 @@ fn map_linux_user_region(
     page_count: usize,
     page_flags: PageTableFlags,
 ) -> Result<crate::memory::paging::UserRegion, LinuxSysopError> {
-    let span = (page_count as u64)
-        .checked_mul(PAGE_SIZE)
+    let span = page_span_bytes(page_count)?;
+    let default_start = checked_align_up(linux_process_state.mmap_next, PAGE_SIZE)
         .ok_or(LinuxSysopError::NoMemory)?;
-    let default_start = align_up(linux_process_state.mmap_next, PAGE_SIZE);
 
     if fixed_mapping {
         return map_linux_user_region_at(
@@ -625,7 +636,8 @@ fn map_linux_user_region(
     }
 
     if requested_addr != 0 {
-        let hinted_start = align_up(requested_addr, PAGE_SIZE);
+        let hinted_start =
+            checked_align_up(requested_addr, PAGE_SIZE).ok_or(LinuxSysopError::NoMemory)?;
         if let Ok(region) = map_linux_user_region_at(
             address_space,
             linux_process_state,
@@ -657,10 +669,9 @@ fn reserve_linux_user_region(
     fixed_mapping: bool,
     page_count: usize,
 ) -> Result<crate::memory::paging::UserRegion, LinuxSysopError> {
-    let span = (page_count as u64)
-        .checked_mul(PAGE_SIZE)
+    let span = page_span_bytes(page_count)?;
+    let default_start = checked_align_up(linux_process_state.mmap_next, PAGE_SIZE)
         .ok_or(LinuxSysopError::NoMemory)?;
-    let default_start = align_up(linux_process_state.mmap_next, PAGE_SIZE);
 
     if fixed_mapping {
         return reserve_linux_user_region_at(
@@ -673,7 +684,8 @@ fn reserve_linux_user_region(
     }
 
     if requested_addr != 0 {
-        let hinted_start = align_up(requested_addr, PAGE_SIZE);
+        let hinted_start =
+            checked_align_up(requested_addr, PAGE_SIZE).ok_or(LinuxSysopError::NoMemory)?;
         if let Ok(region) = reserve_linux_user_region_at(
             address_space,
             linux_process_state,
@@ -731,7 +743,8 @@ fn map_linux_user_region_at(
         .map_zeroed_user_pages_at(VirtAddr::new(start), page_count, page_flags)
         .map_err(LinuxSysopError::AddressSpace)?;
     if region.end().as_u64() > linux_process_state.mmap_next {
-        linux_process_state.mmap_next = align_up(region.end().as_u64(), PAGE_SIZE);
+        linux_process_state.mmap_next =
+            checked_align_up(region.end().as_u64(), PAGE_SIZE).ok_or(LinuxSysopError::NoMemory)?;
     }
     Ok(region)
 }
@@ -763,7 +776,8 @@ fn reserve_linux_user_region_at(
         .reserve_range(start, end)
         .map_err(|_| LinuxSysopError::NoMemory)?;
     if end > linux_process_state.mmap_next {
-        linux_process_state.mmap_next = align_up(end, PAGE_SIZE);
+        linux_process_state.mmap_next =
+            checked_align_up(end, PAGE_SIZE).ok_or(LinuxSysopError::NoMemory)?;
     }
     Ok(crate::memory::paging::UserRegion {
         start: VirtAddr::new(start),

@@ -1,4 +1,5 @@
 pub use driver_abi::PointerPacket;
+use heapless::Deque as HeaplessDeque;
 pub use keyboard_core::{KeyAction, KeyCode, KeyboardEvent, Modifiers};
 
 const INPUT_EVENT_QUEUE_CAPACITY: usize = 2048;
@@ -106,7 +107,7 @@ enum PendingKind {
 }
 
 pub struct InputEventQueueState {
-    queued: RingBuffer<InputEvent, INPUT_EVENT_QUEUE_CAPACITY>,
+    queued: HeaplessDeque<InputEvent, INPUT_EVENT_QUEUE_CAPACITY>,
     pending_coalesced: Option<PendingEvent>,
     pending_pointer_position: Option<PendingEvent>,
     next_pending_sequence: u64,
@@ -118,7 +119,7 @@ pub struct InputEventQueueState {
 impl InputEventQueueState {
     pub const fn new() -> Self {
         Self {
-            queued: RingBuffer::new(),
+            queued: HeaplessDeque::new(),
             pending_coalesced: None,
             pending_pointer_position: None,
             next_pending_sequence: 0,
@@ -130,8 +131,10 @@ impl InputEventQueueState {
 
     pub fn can_accept_keyboard_event(&self, event: KeyboardEvent) -> bool {
         match event.action {
-            KeyAction::Repeated => self.queued.remaining_capacity() > INPUT_EVENT_LOSSY_RESERVE,
-            KeyAction::Pressed | KeyAction::Released => self.queued.remaining_capacity() != 0,
+            KeyAction::Repeated => {
+                queue_remaining_capacity(&self.queued) > INPUT_EVENT_LOSSY_RESERVE
+            }
+            KeyAction::Pressed | KeyAction::Released => queue_remaining_capacity(&self.queued) != 0,
         }
     }
 
@@ -272,7 +275,7 @@ impl InputEventQueueState {
     }
 
     pub fn read_input_events(&mut self, dest: &mut [InputEvent]) -> usize {
-        let mut count = self.queued.pop_into(dest);
+        let mut count = pop_events_into(&mut self.queued, dest);
         while count < dest.len() {
             let Some(event) = self.take_oldest_pending_event() else {
                 break;
@@ -317,15 +320,15 @@ impl InputEventQueueState {
     }
 
     fn push_noncritical_discrete_event(&mut self, event: InputEvent) -> bool {
-        if self.queued.remaining_capacity() <= INPUT_EVENT_LOSSY_RESERVE {
+        if queue_remaining_capacity(&self.queued) <= INPUT_EVENT_LOSSY_RESERVE {
             self.record_discrete_drop();
             return false;
         }
-        self.queued.push(event)
+        self.queued.push_back(event).is_ok()
     }
 
     fn push_critical_discrete_event(&mut self, event: InputEvent) -> bool {
-        if self.queued.push(event) {
+        if self.queued.push_back(event).is_ok() {
             return true;
         }
         self.record_discrete_drop();
@@ -384,10 +387,10 @@ impl InputEventQueueState {
             None => return true,
         };
 
-        if self.queued.remaining_capacity() <= minimum_remaining_capacity {
+        if queue_remaining_capacity(&self.queued) <= minimum_remaining_capacity {
             return false;
         }
-        if !self.queued.push(event) {
+        if self.queued.push_back(event).is_err() {
             return false;
         }
 
@@ -762,75 +765,23 @@ fn push_evdev(
     Ok(())
 }
 
-struct RingBuffer<T: Copy, const CAPACITY: usize> {
-    data: [Option<T>; CAPACITY],
-    head: usize,
-    len: usize,
+fn queue_remaining_capacity<T, const CAPACITY: usize>(queue: &HeaplessDeque<T, CAPACITY>) -> usize {
+    CAPACITY - queue.len()
 }
 
-impl<T: Copy, const CAPACITY: usize> RingBuffer<T, CAPACITY> {
-    const fn new() -> Self {
-        Self {
-            data: [None; CAPACITY],
-            head: 0,
-            len: 0,
-        }
+fn pop_events_into(
+    queue: &mut HeaplessDeque<InputEvent, INPUT_EVENT_QUEUE_CAPACITY>,
+    dest: &mut [InputEvent],
+) -> usize {
+    let mut count = 0;
+    for slot in dest.iter_mut() {
+        let Some(value) = queue.pop_front() else {
+            break;
+        };
+        *slot = value;
+        count += 1;
     }
-
-    fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn remaining_capacity(&self) -> usize {
-        CAPACITY - self.len
-    }
-
-    fn push(&mut self, value: T) -> bool {
-        self.normalize_head();
-        if self.len == CAPACITY {
-            return false;
-        }
-
-        let tail = (self.head + self.len) % CAPACITY;
-        self.data[tail] = Some(value);
-        self.len += 1;
-        true
-    }
-
-    fn pop(&mut self) -> Option<T> {
-        self.normalize_head();
-        if self.len == 0 {
-            return None;
-        }
-
-        let value = self.data[self.head].take();
-        self.head = (self.head + 1) % CAPACITY;
-        self.len -= 1;
-        value
-    }
-
-    fn pop_into(&mut self, dest: &mut [T]) -> usize {
-        let mut count = 0;
-        for slot in dest.iter_mut() {
-            let Some(value) = self.pop() else {
-                break;
-            };
-            *slot = value;
-            count += 1;
-        }
-        count
-    }
-
-    fn normalize_head(&mut self) {
-        while self.len != 0 && self.data[self.head].is_none() {
-            self.head = (self.head + 1) % CAPACITY;
-            self.len -= 1;
-        }
-    }
+    count
 }
 
 #[cfg(test)]

@@ -38,7 +38,7 @@ const COMMON_QUEUE_DEVICE: usize = 0x30;
 
 const CONTROL_QUEUE_INDEX: u16 = 0;
 const QUEUE_SIZE: u16 = 8;
-const QUEUE_MEM_SIZE: usize = 4096;
+const QUEUE_MEM_SIZE: usize = virtio_drivers::PAGE_SIZE;
 const COMMAND_MEM_SIZE: usize = 4096;
 const COMMAND_REQUEST_OFFSET: usize = 0;
 const COMMAND_RESPONSE_OFFSET: usize = 2048;

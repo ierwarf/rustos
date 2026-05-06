@@ -20,11 +20,16 @@ keyboard-core = { path = "../../drivers/libs/keyboard-core" }
 storage-core = { path = "../../libs/storage-core" }
 storage-fat = { path = "../../libs/storage-fat" }
 embedded-graphics = { version = "0.8", default-features = false }
+elf = { version = "0.8.0", default-features = false }
 fatfs = { git = "https://github.com/rafalh/rust-fatfs", default-features = false, features = ["alloc", "lfn"] }
 hidreport = { version = "0.6.0", default-features = false }
+heapless = { version = "0.9.3", default-features = false }
 object = { version = "0.38.1", default-features = false, features = ["read_core", "elf"] }
 smoltcp = { version = "=0.13.0", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp"] }
 spin = "0.10.0"
+tock-registers = { version = "0.10.1", default-features = false }
+virtio-drivers = { version = "0.13.0", default-features = false }
 vte = { version = "0.15.0", default-features = false }
 x86_64 = { version = "0.15.4", default-features = false, features = ["instructions", "abi_x86_interrupt"] }
 xhci = { version = "0.9.2", default-features = false }
+zerocopy = { version = "0.8.40", default-features = false, features = ["derive"] }

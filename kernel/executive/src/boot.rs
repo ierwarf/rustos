@@ -14,10 +14,16 @@ use x86_64::VirtAddr;
 use crate::{announce_ready, debug, fatal, flow_debug, flow_info, hal_hooks, io_services, tasks};
 
 const INITD_EXEC_PATH: &str = "services/initd/initd.elf";
+const MAX_BACKTRACE_FRAME_STEP: u64 = 1024 * 1024;
 
 macro_rules! boot_log {
     ($level:expr, $event_id:expr, $object_id:expr, $($arg:tt)+) => {{
-        let _ = ($event_id, $object_id);
+        debug::record_milestone(
+            debug::LogCategory::Boot,
+            "boot",
+            ($event_id) as u64,
+            ($object_id) as u64,
+        );
         match $level {
             debug::LogLevel::Trace => debug::trace!(boot, $($arg)+),
             debug::LogLevel::Debug => debug::debug!(boot, $($arg)+),
@@ -30,9 +36,22 @@ macro_rules! boot_log {
 
 pub fn handle_kernel_panic(info: &PanicInfo<'_>) -> ! {
     let _ = io_services::gui_try_present_panic_blackout();
+    debug::println_emergency(format_args!("[PANIC]"));
+    debug::println_emergency(format_args!("message: {}", info.message()));
+    if let Some(location) = info.location() {
+        debug::println_emergency(format_args!(
+            "location: {}:{}:{}",
+            location.file(),
+            location.line(),
+            location.column()
+        ));
+    } else {
+        debug::println_emergency(format_args!("location: <unknown>"));
+    }
     debug::report_panic(info);
     debug::println!();
     debug::println!("[PANIC]");
+    gui_panic_line(format_args!("[PANIC]"));
     debug::println!("message: {}", info.message());
     gui_panic_line(format_args!("message: {}", info.message()));
 
@@ -273,7 +292,9 @@ pub fn finalize_kernel_initialization() {
 }
 
 pub fn bootstrap_init_process() {
+    debug::record_milestone(debug::LogCategory::Boot, "init-bootstrap-enter", 0, 0);
     if !userspace_start_allowed() {
+        debug::record_milestone(debug::LogCategory::Boot, "init-bootstrap-blocked", 0, 0);
         flow_debug(30, "init bootstrap blocked until userspace runtime ready");
         boot_log!(
             debug::LogLevel::Debug,
@@ -284,6 +305,7 @@ pub fn bootstrap_init_process() {
         );
         return;
     }
+    debug::record_milestone(debug::LogCategory::Boot, "init-bootstrap-allowed", 0, 0);
     flow_info(31, "init bootstrap begin");
     boot_log!(debug::LogLevel::Info, 141, 0, "init bootstrap begin");
     io_services::console_write(b"Bootstrapping init process...\r\n");
@@ -294,6 +316,7 @@ pub fn bootstrap_init_process() {
         "init bootstrap console line written",
     );
     flow_debug(32, "init bootstrap loading initd");
+    debug::record_milestone(debug::LogCategory::Boot, "init-bootstrap-load-begin", 0, 0);
     boot_log!(
         debug::LogLevel::Info,
         143,
@@ -304,6 +327,12 @@ pub fn bootstrap_init_process() {
         Ok(loaded) => loaded,
         Err(err) => fatal::fatal_init_bootstrap_load(err),
     };
+    debug::record_milestone(
+        debug::LogCategory::Boot,
+        "init-bootstrap-load-done",
+        loaded.bytes.len() as u64,
+        0,
+    );
     boot_log!(
         debug::LogLevel::Info,
         144,
@@ -393,11 +422,9 @@ fn print_backtrace() {
         let Some(current) = frame else {
             break;
         };
-        let Some(rbp_addr) = canonical_kernel_pointer(current) else {
+        let Some((next_rbp, return_rip)) = read_backtrace_frame(current) else {
             break;
         };
-        let next_rbp = unsafe { *(rbp_addr.as_ptr::<u64>()) };
-        let return_rip = unsafe { *(rbp_addr.as_ptr::<u64>().add(1)) };
         if return_rip == 0 {
             break;
         }
@@ -407,10 +434,10 @@ fn print_backtrace() {
             index, return_rip, current
         ));
 
-        frame = if next_rbp <= current {
-            None
-        } else {
+        frame = if valid_next_frame_pointer(current, next_rbp) {
             Some(next_rbp)
+        } else {
+            None
         };
     }
 }
@@ -431,9 +458,35 @@ fn canonical_kernel_pointer(value: u64) -> Option<VirtAddr> {
     Some(addr)
 }
 
+fn read_backtrace_frame(rbp: u64) -> Option<(u64, u64)> {
+    if rbp % core::mem::align_of::<u64>() as u64 != 0 {
+        return None;
+    }
+    let frame_end = rbp.checked_add((core::mem::size_of::<u64>() * 2 - 1) as u64)?;
+    let rbp_addr = canonical_kernel_pointer(rbp)?;
+    canonical_kernel_pointer(frame_end)?;
+    let next_rbp = unsafe { core::ptr::read_volatile(rbp_addr.as_ptr::<u64>()) };
+    let return_rip = unsafe { core::ptr::read_volatile(rbp_addr.as_ptr::<u64>().add(1)) };
+    if return_rip != 0 {
+        canonical_kernel_pointer(return_rip)?;
+    }
+    Some((next_rbp, return_rip))
+}
+
+fn valid_next_frame_pointer(current: u64, next: u64) -> bool {
+    if next <= current || next - current > MAX_BACKTRACE_FRAME_STEP {
+        return false;
+    }
+    if next % core::mem::align_of::<u64>() as u64 != 0 {
+        return false;
+    }
+    canonical_kernel_pointer(next).is_some()
+}
+
 fn gui_panic_line(args: fmt::Arguments<'_>) {
     let mut line = PanicLine::new();
     let _ = line.write_fmt(args);
+    let _ = io_services::gui_write_panic_console_line(line.as_bytes());
     io_services::console_write(line.as_bytes());
     io_services::console_write(b"\r\n");
 }

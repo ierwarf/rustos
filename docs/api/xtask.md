@@ -39,6 +39,9 @@ defined in `tools/xtask/src/cli.rs`.
 | `--no-network` | Disable default usernet and `virtio-net-pci`. |
 | `--debugcon <file|stdio|null>` | Route debugcon to file, terminal, or disable it. |
 | `--qemu-log <int|null>` | Write QEMU interrupt trace or disable QEMU trace logging. |
+| `--timeout <seconds>` | Stop QEMU after a bounded run. No timeout is applied by default. |
+| `--expect <marker>` | Stop successfully once all repeated debugcon markers appear. |
+| `--summarize-log` | Print high-signal debugcon markers after QEMU stops. |
 | `--vfio-pci <BDF>` | Attach a host vfio-pci device. |
 | `--phoenix3-passthrough` | Auto-detect and attach Phoenix3 GPU functions. |
 | `--vfio-force` | Allow devices driving active host display. |
@@ -47,6 +50,13 @@ Raw QEMU args go after `--`:
 
 ```bash
 cargo xtask run -- --no-reboot
+```
+
+Bounded KVM no-opt debugging uses NVMe storage by default while AHCI boundary
+issues are isolated separately:
+
+```bash
+cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file --timeout 35 --summarize-log -- --no-reboot
 ```
 
 ### When To Use Each Command
@@ -99,6 +109,9 @@ cargo xtask run -- --no-reboot
 | `--no-network` | default usernet과 `virtio-net-pci` 비활성화 |
 | `--debugcon <file|stdio|null>` | debugcon을 file, terminal로 보내거나 끔 |
 | `--qemu-log <int|null>` | QEMU interrupt trace를 쓰거나 QEMU trace logging을 끔 |
+| `--timeout <seconds>` | 제한 시간 후 QEMU를 종료. 기본값은 timeout 없음 |
+| `--expect <marker>` | 반복 지정한 debugcon marker가 모두 나오면 성공으로 종료 |
+| `--summarize-log` | QEMU 종료 후 high-signal debugcon marker 요약 출력 |
 | `--vfio-pci <BDF>` | host vfio-pci device attach |
 | `--phoenix3-passthrough` | Phoenix3 GPU function 자동 탐지/attach |
 | `--vfio-force` | active host display를 구동 중인 device도 허용 |
@@ -107,6 +120,13 @@ Raw QEMU arg는 `--` 뒤에 둡니다.
 
 ```bash
 cargo xtask run -- --no-reboot
+```
+
+KVM no-opt bounded debugging은 AHCI boundary issue를 별도로 격리하기 위해
+우선 NVMe storage profile을 사용합니다.
+
+```bash
+cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file --timeout 35 --summarize-log -- --no-reboot
 ```
 
 ### 언제 어떤 명령을 쓰는가

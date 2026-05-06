@@ -8,11 +8,6 @@ use crate::input::keyboard::KeyboardEvent;
 use super::runtime;
 use super::synthetic;
 
-pub(crate) fn prepare() {
-    runtime::prepare();
-    synthetic::prepare();
-}
-
 pub(crate) fn service_pending() -> usize {
     runtime::service_pending() + synthetic::service_pending()
 }

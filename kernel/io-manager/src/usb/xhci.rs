@@ -24,6 +24,7 @@ use xhci::ring::trb::transfer::{
     DataStage, Direction as TrbDirection, Normal, SetupStage, StatusStage, TransferType,
 };
 use xhci::ring::trb::{BYTES as XHCI_TRB_BYTES, Link as LinkTrb};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use super::host::UsbHostControllerInfo;
 
@@ -70,7 +71,7 @@ type XhciTrb = [u32; 4];
 static XHCI_TRANSFER_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, FromBytes, Immutable, IntoBytes, KnownLayout)]
 struct XhciEventRingSegmentTableEntry {
     ring_segment_base_address: u64,
     ring_segment_size: u16,
@@ -758,6 +759,12 @@ fn enumerate_boot_port(
         serial: None,
         synthetic_hid_kind: None,
     });
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Usb,
+        "xhci-core-register",
+        slot_id as u64,
+        interface as usize as u64,
+    );
     if interface.is_null() {
         crate::debug::println!(
             "xhci: core registration failed: port={} slot={}",
@@ -768,12 +775,24 @@ fn enumerate_boot_port(
     }
 
     let usb_device = unsafe { (*interface).usb_dev };
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Usb,
+        "xhci-runtime-register-begin",
+        slot_id as u64,
+        usb_device as usize as u64,
+    );
     super::runtime::register_device(
         usb_device,
         interface,
         parsed.interface_number,
         &parsed.hid_descriptor,
         &report_desc,
+    );
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Usb,
+        "xhci-runtime-register-done",
+        slot_id as u64,
+        usb_device as usize as u64,
     );
 
     device.usb_device_ptr = usb_device as usize;
@@ -795,6 +814,12 @@ fn enumerate_boot_port(
         parsed.endpoint_interval,
     );
 
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Usb,
+        "xhci-poll-submit-begin",
+        slot_id as u64,
+        device.endpoint_address as u64,
+    );
     if !submit_interrupt_poll(&mut controller.registers, &mut device) {
         crate::debug::println!(
             "xhci: failed to submit polling transfer: port={} slot={}",
@@ -803,6 +828,12 @@ fn enumerate_boot_port(
         );
         return None;
     }
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Usb,
+        "xhci-poll-submit-done",
+        slot_id as u64,
+        device.endpoint_address as u64,
+    );
 
     Some(device)
 }

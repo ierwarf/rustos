@@ -6,15 +6,21 @@ int main()
     {
         char asdf[10];
 
-        scanf("%s", asdf);
+        if (scanf("%9s", asdf) != 1) {
+            return 0;
+        }
 
         printf("hi, %s\n\n", asdf);
 
         int a = 0;
-        scanf("%d", &a);
+        if (scanf("%d", &a) != 1) {
+            return 0;
+        }
 
         int b = 0;
-        scanf("%d", &b);
+        if (scanf("%d", &b) != 1) {
+            return 0;
+        }
 
         printf("%d\n\n", a + b);
     }

@@ -33,6 +33,11 @@ const TERMINATE_TARGET_SESSION: u16 = 1;
 const TERMINATE_TARGET_PID: u16 = 2;
 const READY_COMPONENT_UI_SERVER: u16 = 1;
 const MAX_REQUEST_PATH_BYTES: usize = 128;
+const MAX_RUNTIME_PROGRAMS: usize = 64;
+const MAX_EXEC_ARG_COUNT: usize = 32;
+const MAX_EXEC_ENV_COUNT: usize = 64;
+const MAX_EXEC_TEXT_BYTES: usize = 256;
+const DEFAULT_EXEC_ENV_COUNT: usize = 6;
 const SYS_IOCTL: usize = 16;
 const SYS_OPENAT: usize = 257;
 const AT_FDCWD: isize = -100;
@@ -403,6 +408,7 @@ fn service_stream(stream: &mut UnixStream, state: &mut BrokerState) -> Result<()
     if request.version != PROTOCOL_VERSION {
         return Err(libc::EPROTO);
     }
+    validate_runtime_request(&request)?;
 
     match request.op {
         OP_SNAPSHOT_RUNNING_PROGRAMS => handle_snapshot(stream, state),
@@ -417,6 +423,7 @@ fn handle_snapshot(stream: &mut UnixStream, state: &BrokerState) -> Result<(), i
     let mut programs = state
         .running
         .values()
+        .take(MAX_RUNTIME_PROGRAMS)
         .map(|program| {
             let mut snapshot = RuntimeRunningProgram::default();
             snapshot.pid = program.pid as u64;
@@ -1120,7 +1127,64 @@ fn request_path(request: &RuntimeRequest) -> Result<String, i32> {
     if len > request.text.len() {
         return Err(libc::EINVAL);
     }
-    String::from_utf8(request.text[..len].to_vec()).map_err(|_| libc::EINVAL)
+    let path = String::from_utf8(request.text[..len].to_vec()).map_err(|_| libc::EINVAL)?;
+    if !valid_request_text(path.as_str()) {
+        return Err(libc::EINVAL);
+    }
+    Ok(path)
+}
+
+fn validate_runtime_request(request: &RuntimeRequest) -> Result<(), i32> {
+    if request.reserved0 != 0 {
+        return Err(libc::EINVAL);
+    }
+    let text_len = usize::try_from(request.text_len).map_err(|_| libc::EINVAL)?;
+    if text_len > request.text.len() {
+        return Err(libc::EINVAL);
+    }
+    match request.op {
+        OP_SNAPSHOT_RUNNING_PROGRAMS => {
+            if request.target_kind != 0 || request.target_value != 0 || text_len != 0 {
+                return Err(libc::EINVAL);
+            }
+        }
+        OP_NOTIFY_READY => {
+            if request.target_kind != READY_COMPONENT_UI_SERVER
+                || request.target_value != 0
+                || text_len != 0
+            {
+                return Err(libc::EINVAL);
+            }
+        }
+        OP_REQUEST_TERMINATE => {
+            if !matches!(
+                request.target_kind,
+                TERMINATE_TARGET_SESSION | TERMINATE_TARGET_PID
+            ) || request.target_value == 0
+                || text_len != 0
+            {
+                return Err(libc::EINVAL);
+            }
+        }
+        OP_REQUEST_LAUNCH_PATH => {
+            if request.target_kind != LAUNCH_TARGET_NEW_SESSION
+                || request.target_value != 0
+                || text_len == 0
+            {
+                return Err(libc::EINVAL);
+            }
+        }
+        _ => return Err(libc::EINVAL),
+    }
+    Ok(())
+}
+
+fn valid_request_text(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_REQUEST_PATH_BYTES
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b' '..=b'~') && byte != b'\\')
 }
 
 fn write_response(stream: &mut UnixStream, response: RuntimeResponse) -> Result<(), i32> {
@@ -1157,6 +1221,8 @@ fn build_exec_argv(exec_path: &str, argv: &[String]) -> Vec<CString> {
 
     let mut storage = argv
         .iter()
+        .take(MAX_EXEC_ARG_COUNT)
+        .filter(|arg| valid_exec_text(arg.as_str(), false))
         .filter_map(|arg| CString::new(arg.as_str()).ok())
         .collect::<Vec<_>>();
     if storage.is_empty() {
@@ -1166,7 +1232,12 @@ fn build_exec_argv(exec_path: &str, argv: &[String]) -> Vec<CString> {
 }
 
 fn build_exec_env(extra_env: &[String]) -> Vec<CString> {
-    let mut env = extra_env.to_vec();
+    let mut env = extra_env
+        .iter()
+        .filter(|item| valid_exec_text(item.as_str(), true))
+        .take(MAX_EXEC_ENV_COUNT.saturating_sub(DEFAULT_EXEC_ENV_COUNT))
+        .cloned()
+        .collect::<Vec<_>>();
     push_env_if_missing(&mut env, DEFAULT_PATH_ENV);
     push_env_if_missing(&mut env, DEFAULT_HOME_ENV);
     push_env_if_missing(&mut env, DEFAULT_XDG_RUNTIME_DIR_ENV);
@@ -1179,6 +1250,9 @@ fn build_exec_env(extra_env: &[String]) -> Vec<CString> {
 }
 
 fn push_env_if_missing(env: &mut Vec<String>, item: &str) {
+    if env.len() >= MAX_EXEC_ENV_COUNT {
+        return;
+    }
     let key = env_key(item);
     if env.iter().any(|candidate| env_key(candidate) == key) {
         return;
@@ -1192,6 +1266,29 @@ fn env_key(value: &str) -> &str {
 
 fn c_string_or_fallback(value: &str, fallback: &str) -> CString {
     CString::new(value).unwrap_or_else(|_| CString::new(fallback).unwrap())
+}
+
+fn valid_exec_text(value: &str, require_env_assignment: bool) -> bool {
+    if value.is_empty() || value.len() > MAX_EXEC_TEXT_BYTES {
+        return false;
+    }
+    if !value
+        .bytes()
+        .all(|byte| matches!(byte, b' '..=b'~') && byte != b'\\')
+    {
+        return false;
+    }
+    !require_env_assignment || valid_env_assignment(value)
+}
+
+fn valid_env_assignment(value: &str) -> bool {
+    let Some((key, _)) = value.split_once('=') else {
+        return false;
+    };
+    !key.is_empty()
+        && key
+            .bytes()
+            .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
 }
 
 #[cfg(test)]

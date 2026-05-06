@@ -33,6 +33,7 @@ pub(crate) struct Config {
     pub(crate) artifact_dir: PathBuf,
     pub(crate) logs_dir: PathBuf,
     pub(crate) image_dir: PathBuf,
+    pub(crate) boot_disk_image: PathBuf,
     pub(crate) image_asset_overlay_dir: PathBuf,
     pub(crate) amdgpu_firmware_dir: PathBuf,
     pub(crate) amdgpu_required_firmware_basenames: Vec<String>,
@@ -76,6 +77,8 @@ impl Config {
         let logs_dir = env_path("LOGS_DIR").unwrap_or_else(|| root_dir.join("logs"));
         let artifact_dir = env_path("ARTIFACT_DIR").unwrap_or_else(|| build_dir.join("artifacts"));
         let image_dir = env_path("IMAGE_DIR").unwrap_or_else(|| build_dir.join("image"));
+        let boot_disk_image =
+            env_path("BOOT_DISK_IMAGE").unwrap_or_else(|| build_dir.join("rustos-boot.img"));
         let vendor_dir = env_path("VENDOR_DIR").unwrap_or_else(|| root_dir.join("vendor"));
 
         let kernel_cargo_zflags = env_string("KERNEL_CARGO_ZFLAGS")
@@ -157,6 +160,7 @@ impl Config {
             artifact_dir,
             logs_dir,
             image_dir,
+            boot_disk_image,
         })
     }
 
