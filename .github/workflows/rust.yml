@@ -9,6 +9,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  CARGO_BUILD_RUSTC_WRAPPER: ""
+  RUSTC_WRAPPER: ""
   RUSTOS_CONFIG: config/presets/release.toml
 
 permissions:
