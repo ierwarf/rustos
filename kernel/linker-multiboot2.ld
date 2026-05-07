@@ -6,6 +6,7 @@ PHDRS
 {
   text PT_LOAD FILEHDR PHDRS FLAGS(5);
   rodata PT_LOAD FLAGS(4);
+  relro PT_LOAD FLAGS(4);
   data PT_LOAD FLAGS(6);
 }
 
@@ -34,12 +35,12 @@ SECTIONS
   .data.rel.ro : ALIGN(4096)
   {
     *(.data.rel.ro .data.rel.ro.*)
-  } :data
+  } :relro
 
   .got : ALIGN(8)
   {
     *(.got .got.*)
-  } :data
+  } :relro
 
   .data : ALIGN(4096)
   {

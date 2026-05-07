@@ -377,6 +377,7 @@ fn run() -> Result<(), i32> {
             presented_cursor_x,
             presented_cursor_y,
         ));
+        drawable_update.coalesce_tight_partials();
         drawable_update.promote_large_partial(state.surface.width, state.surface.height);
 
         let now = Instant::now();

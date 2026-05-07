@@ -3,6 +3,9 @@ use x86_64::VirtAddr;
 use crate::memory::paging;
 use crate::multitask;
 
+const USER_C_STRING_COPY_CHUNK: usize = 256;
+const USER_PAGE_SIZE: usize = 4096;
+
 #[track_caller]
 pub fn current_user_address_space()
 -> Result<multitask::RetainedCurrentUserAddressSpace, paging::AddressSpaceError> {
@@ -79,17 +82,20 @@ pub fn read_current_user_c_string(
 ) -> Result<alloc::string::String, paging::AddressSpaceError> {
     with_current_address_space(|address_space| {
         let mut bytes = alloc::vec::Vec::new();
+        let mut chunk = [0_u8; USER_C_STRING_COPY_CHUNK];
 
-        for offset in 0..max_len {
+        while bytes.len() < max_len {
             let ptr = user_ptr
-                .checked_add(offset as u64)
+                .checked_add(bytes.len() as u64)
                 .ok_or(paging::AddressSpaceError::AddressOverflow)?;
-            let mut byte = [0_u8; 1];
-            address_space.copy_from_user(VirtAddr::new(ptr), &mut byte)?;
-            if byte[0] == 0 {
+            let page_remaining = USER_PAGE_SIZE - ((ptr as usize) & (USER_PAGE_SIZE - 1));
+            let chunk_len = (max_len - bytes.len()).min(chunk.len()).min(page_remaining);
+            address_space.copy_from_user(VirtAddr::new(ptr), &mut chunk[..chunk_len])?;
+            if let Some(nul_index) = chunk[..chunk_len].iter().position(|byte| *byte == 0) {
+                bytes.extend_from_slice(&chunk[..nul_index]);
                 return Ok(alloc::string::String::from_utf8_lossy(&bytes).into_owned());
             }
-            bytes.push(byte[0]);
+            bytes.extend_from_slice(&chunk[..chunk_len]);
         }
 
         Err(paging::AddressSpaceError::AddressOverflow)

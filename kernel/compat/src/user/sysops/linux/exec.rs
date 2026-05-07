@@ -1,5 +1,6 @@
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::mem::size_of;
 
 use x86_64::VirtAddr;
 
@@ -16,6 +17,9 @@ const MAX_EXEC_PATH_LEN: usize = 256;
 const MAX_EXEC_ARG_COUNT: usize = 256;
 const MAX_EXEC_ENV_COUNT: usize = 256;
 const MAX_EXEC_TOTAL_STRING_BYTES: usize = 64 * 1024;
+const EXEC_STRING_COPY_CHUNK: usize = 256;
+const EXEC_POINTER_COPY_ENTRIES: usize = 32;
+const USER_PAGE_SIZE: usize = 4096;
 
 pub(crate) fn execve(
     path_ptr: u64,
@@ -226,25 +230,52 @@ fn read_exec_string_array(
     let address_space = retained.address_space();
     let mut values = Vec::new();
     let mut used_bytes = 0usize;
-    for index in 0..max_count {
+    let mut index = 0usize;
+    let mut pointer_bytes = [0_u8; EXEC_POINTER_COPY_ENTRIES * size_of::<u64>()];
+    while index < max_count {
         let pointer_ptr = array_ptr
-            .checked_add((index * core::mem::size_of::<u64>()) as u64)
+            .checked_add(
+                index
+                    .checked_mul(size_of::<u64>())
+                    .ok_or(LinuxSysopError::TooBig)? as u64,
+            )
             .ok_or(LinuxSysopError::AddressSpace(
                 crate::memory::paging::AddressSpaceError::AddressOverflow,
             ))?;
-        let mut pointer_bytes = [0_u8; 8];
-        address_space.copy_from_user(VirtAddr::new(pointer_ptr), &mut pointer_bytes)?;
-        let user_ptr = u64::from_le_bytes(pointer_bytes);
-        if user_ptr == 0 {
-            return Ok(ExecStringArray { values, used_bytes });
+
+        let page_remaining = USER_PAGE_SIZE - ((pointer_ptr as usize) & (USER_PAGE_SIZE - 1));
+        let page_entries = if page_remaining < size_of::<u64>() {
+            1
+        } else {
+            page_remaining / size_of::<u64>()
+        };
+        let chunk_entries = (max_count - index)
+            .min(EXEC_POINTER_COPY_ENTRIES)
+            .min(page_entries);
+        let chunk_bytes = chunk_entries * size_of::<u64>();
+        address_space.copy_from_user(
+            VirtAddr::new(pointer_ptr),
+            &mut pointer_bytes[..chunk_bytes],
+        )?;
+
+        for pointer_index in 0..chunk_entries {
+            let start = pointer_index * size_of::<u64>();
+            let mut pointer = [0_u8; size_of::<u64>()];
+            pointer.copy_from_slice(&pointer_bytes[start..start + size_of::<u64>()]);
+            let user_ptr = u64::from_le_bytes(pointer);
+            if user_ptr == 0 {
+                return Ok(ExecStringArray { values, used_bytes });
+            }
+
+            let remaining = max_total_bytes.saturating_sub(used_bytes);
+            let (value, value_bytes) = read_exec_string(user_ptr, remaining)?;
+            used_bytes = used_bytes
+                .checked_add(value_bytes)
+                .ok_or(LinuxSysopError::TooBig)?;
+            values.push(value);
         }
 
-        let remaining = max_total_bytes.saturating_sub(used_bytes);
-        let (value, value_bytes) = read_exec_string(user_ptr, remaining)?;
-        used_bytes = used_bytes
-            .checked_add(value_bytes)
-            .ok_or(LinuxSysopError::TooBig)?;
-        values.push(value);
+        index += chunk_entries;
     }
 
     Err(LinuxSysopError::TooBig)
@@ -258,22 +289,25 @@ fn read_exec_string(user_ptr: u64, max_len: usize) -> Result<(String, usize), Li
     let retained = usermem::current_user_address_space().map_err(LinuxSysopError::AddressSpace)?;
     let address_space = retained.address_space();
     let mut bytes = Vec::new();
-    for offset in 0..max_len {
+    let mut chunk = [0_u8; EXEC_STRING_COPY_CHUNK];
+    while bytes.len() < max_len {
         let current_ptr =
             user_ptr
-                .checked_add(offset as u64)
+                .checked_add(bytes.len() as u64)
                 .ok_or(LinuxSysopError::AddressSpace(
                     crate::memory::paging::AddressSpaceError::AddressOverflow,
                 ))?;
-        let mut byte = [0_u8; 1];
-        address_space.copy_from_user(VirtAddr::new(current_ptr), &mut byte)?;
-        if byte[0] == 0 {
+        let page_remaining = USER_PAGE_SIZE - ((current_ptr as usize) & (USER_PAGE_SIZE - 1));
+        let chunk_len = (max_len - bytes.len()).min(chunk.len()).min(page_remaining);
+        address_space.copy_from_user(VirtAddr::new(current_ptr), &mut chunk[..chunk_len])?;
+        if let Some(nul_index) = chunk[..chunk_len].iter().position(|byte| *byte == 0) {
+            bytes.extend_from_slice(&chunk[..nul_index]);
             return Ok((
                 String::from_utf8_lossy(&bytes).into_owned(),
                 bytes.len() + 1,
             ));
         }
-        bytes.push(byte[0]);
+        bytes.extend_from_slice(&chunk[..chunk_len]);
     }
 
     Err(LinuxSysopError::TooBig)

@@ -1,5 +1,5 @@
 use alloc::string::String;
-use core::cell::UnsafeCell;
+use alloc::vec::Vec;
 use core::{mem, ptr};
 
 use x86_64::PhysAddr;
@@ -35,19 +35,6 @@ const STACK_CANARY_WORD: u64 = 0x5343_4844_554c_4552;
 const TASK_ENTRY_STACK_RESERVE_QWORDS: usize = 3;
 const PAGE_FAULT_VECTOR: u8 = 14;
 const RFLAGS_RESERVED_BIT_1: u64 = 1 << 1;
-#[repr(align(16))]
-struct SchedulerStackMemory {
-    bytes: [[u8; TASK_STACK_SIZE]; MAX_TASK],
-}
-
-struct SchedulerStacks(UnsafeCell<SchedulerStackMemory>);
-
-unsafe impl Sync for SchedulerStacks {}
-
-static TASK_STACKS: SchedulerStacks = SchedulerStacks(UnsafeCell::new(SchedulerStackMemory {
-    bytes: [[0; TASK_STACK_SIZE]; MAX_TASK],
-}));
-
 #[derive(Clone, Copy)]
 enum TaskRetireReason {
     UserFault {
@@ -99,6 +86,7 @@ pub(super) struct Scheduler {
     last_errors: [u32; MAX_TASK],
     simd_states: [SimdState; MAX_TASK],
     starts: [Option<TaskStart>; MAX_TASK],
+    stacks: [Option<Vec<u8>>; MAX_TASK],
     current_task: usize,
     pending_reap: bool,
 }
@@ -112,6 +100,7 @@ impl Scheduler {
             last_errors: [0; MAX_TASK],
             simd_states: [SimdState::new(); MAX_TASK],
             starts: [None; MAX_TASK],
+            stacks: [const { None }; MAX_TASK],
             current_task: 0,
             pending_reap: false,
         }
@@ -137,7 +126,8 @@ impl Scheduler {
         self.last_errors = [0; MAX_TASK];
         self.current_task = ROOT_TASK_SLOT;
         self.pending_reap = false;
-        self.reset_stack_storage(ROOT_TASK_SLOT);
+        self.reset_stack_storage(ROOT_TASK_SLOT)
+            .expect("scheduler root stack allocation failed");
         let (kernel_stack_base, kernel_stack_top) = self.stack_bounds(ROOT_TASK_SLOT);
         self.contexts[ROOT_TASK_SLOT] = Some(TaskContext {
             saved_rsp: self.init_kernel_entry_context(
@@ -189,7 +179,7 @@ impl Scheduler {
         self.last_errors[slot] = 0;
         self.simd_states[slot] = SimdState::new();
         self.starts[slot] = None;
-        self.reset_stack_storage(slot);
+        self.release_stack_storage(slot);
     }
 
     fn mark_slot_ready(&mut self, slot: usize, saved_rsp: usize, ready: bool) {
@@ -214,20 +204,43 @@ impl Scheduler {
         self.retire_reasons[slot] = Some(reason);
     }
 
-    fn reset_stack_storage(&mut self, slot: usize) {
-        Self::stack_storage_mut(slot).fill(0);
+    fn allocate_stack_storage(&mut self, slot: usize) -> Option<()> {
+        if slot >= MAX_TASK {
+            return None;
+        }
+        if self.stacks[slot].is_none() {
+            let mut storage = Vec::new();
+            storage.try_reserve_exact(TASK_STACK_SIZE).ok()?;
+            unsafe {
+                storage.set_len(TASK_STACK_SIZE);
+            }
+            self.stacks[slot] = Some(storage);
+        }
+        Some(())
+    }
+
+    fn release_stack_storage(&mut self, slot: usize) {
+        if slot < MAX_TASK {
+            self.stacks[slot] = None;
+        }
+    }
+
+    fn reset_stack_storage(&mut self, slot: usize) -> Option<()> {
+        self.allocate_stack_storage(slot)?;
+        self.stack_storage_mut(slot).fill(0);
         let canary_words = TASK_STACK_GUARD_BYTES / mem::size_of::<u64>();
-        let base = Self::stack_storage_mut(slot).as_mut_ptr() as *mut u64;
+        let base = self.stack_storage_mut(slot).as_mut_ptr() as *mut u64;
         for index in 0..canary_words {
             unsafe {
                 ptr::write(base.add(index), STACK_CANARY_WORD);
             }
         }
+        Some(())
     }
 
     fn stack_canary_intact(&self, slot: usize) -> bool {
         let canary_words = TASK_STACK_GUARD_BYTES / mem::size_of::<u64>();
-        let base = Self::stack_storage(slot).as_ptr() as *const u64;
+        let base = self.stack_storage(slot).as_ptr() as *const u64;
         for index in 0..canary_words {
             let value = unsafe { ptr::read(base.add(index)) };
             if value != STACK_CANARY_WORD {
@@ -259,18 +272,24 @@ impl Scheduler {
     }
 
     fn stack_bounds(&self, slot: usize) -> (usize, usize) {
-        let base = Self::stack_storage(slot).as_ptr() as usize;
+        let base = self.stack_storage(slot).as_ptr() as usize;
         (base + TASK_STACK_GUARD_BYTES, base + TASK_STACK_SIZE)
     }
 
-    fn stack_storage(slot: usize) -> &'static [u8; TASK_STACK_SIZE] {
+    fn stack_storage(&self, slot: usize) -> &[u8] {
         debug_assert!(slot < MAX_TASK);
-        unsafe { &(*TASK_STACKS.0.get()).bytes[slot] }
+        self.stacks[slot]
+            .as_ref()
+            .expect("scheduler task stack is allocated")
+            .as_slice()
     }
 
-    fn stack_storage_mut(slot: usize) -> &'static mut [u8; TASK_STACK_SIZE] {
+    fn stack_storage_mut(&mut self, slot: usize) -> &mut [u8] {
         debug_assert!(slot < MAX_TASK);
-        unsafe { &mut (*TASK_STACKS.0.get()).bytes[slot] }
+        self.stacks[slot]
+            .as_mut()
+            .expect("scheduler task stack is allocated")
+            .as_mut_slice()
     }
 
     fn stack_top(&self, slot: usize) -> usize {
@@ -491,7 +510,7 @@ impl Scheduler {
     ) -> Option<usize> {
         for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
             if self.contexts[slot].is_none() {
-                self.reset_stack_storage(slot);
+                self.reset_stack_storage(slot)?;
                 let (kernel_stack_base, kernel_stack_top) = self.stack_bounds(slot);
                 self.contexts[slot] = Some(TaskContext {
                     saved_rsp: self.init_kernel_entry_context(
@@ -541,7 +560,7 @@ impl Scheduler {
     ) -> Option<usize> {
         for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
             if self.contexts[slot].is_none() {
-                self.reset_stack_storage(slot);
+                self.reset_stack_storage(slot)?;
                 let saved_rsp =
                     self.init_user_task_context(slot, &bootstrap, user_cs, user_ss, rflags);
                 let exec_path = alloc::string::String::from(bootstrap.exec_path());
@@ -624,7 +643,7 @@ impl Scheduler {
     ) -> Option<usize> {
         for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
             if self.contexts[slot].is_none() {
-                self.reset_stack_storage(slot);
+                self.reset_stack_storage(slot)?;
                 let root_phys = process_state.address_space_root();
                 let _exec_path = String::from(process_state.exec_path());
                 let process_handle = process_table::create_process(id, process_state)?;
@@ -700,6 +719,7 @@ impl Scheduler {
         };
         for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
             if self.contexts[slot].is_none() {
+                self.reset_stack_storage(slot)?;
                 if let Some(thread_state) = bootstrap.windows_thread_state {
                     let init_result = process_table::with_process_state_mut(
                         process_handle,
@@ -717,7 +737,6 @@ impl Scheduler {
                     }
                 }
                 process_table::attach_task(process_handle)?;
-                self.reset_stack_storage(slot);
                 let (kernel_stack_base, kernel_stack_top) = self.stack_bounds(slot);
                 self.contexts[slot] = Some(TaskContext {
                     saved_rsp: self

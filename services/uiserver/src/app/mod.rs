@@ -15,9 +15,9 @@ use crate::wayland::WaylandWindowSnapshot;
 pub(crate) const INPUT_EVENT_BATCH: usize = 256;
 pub(crate) const MAX_INPUT_READ_BATCHES_PER_TICK: usize = 4;
 pub(crate) const MAX_RUNNING_PROGRAMS: usize = 8;
-pub(crate) const IDLE_SLEEP: Duration = Duration::from_millis(16);
+pub(crate) const IDLE_SLEEP: Duration = Duration::from_millis(4);
 pub(crate) const INPUT_PROCESS_BUDGET: Duration = Duration::from_millis(2);
-pub(crate) const TARGET_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+pub(crate) const TARGET_FRAME_INTERVAL: Duration = Duration::from_millis(8);
 pub(crate) const RUNTIME_POLL_SLEEP: Duration = Duration::from_millis(32);
 pub(crate) const CONSOLE_POLL_SLEEP: Duration = Duration::from_millis(64);
 pub(crate) const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
@@ -98,6 +98,30 @@ impl VisualUpdate {
             ));
         if dirty_area.saturating_mul(2) >= screen_area {
             self.request_full();
+        }
+    }
+
+    pub(crate) fn coalesce_tight_partials(&mut self) {
+        if self.needs_full_redraw
+            || self.partial_redraw_rect.is_empty()
+            || self.secondary_partial_redraw_rect.is_empty()
+        {
+            return;
+        }
+
+        let union = self
+            .partial_redraw_rect
+            .union(self.secondary_partial_redraw_rect);
+        let separate_area = rect_area(self.partial_redraw_rect)
+            .saturating_add(rect_area(self.secondary_partial_redraw_rect))
+            .saturating_sub(rect_area(
+                self.partial_redraw_rect
+                    .intersect(self.secondary_partial_redraw_rect),
+            ));
+        let union_area = rect_area(union);
+        if union_area <= separate_area.saturating_mul(2) {
+            self.partial_redraw_rect = union;
+            self.secondary_partial_redraw_rect = canvas::Rect::empty();
         }
     }
 

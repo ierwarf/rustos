@@ -561,13 +561,13 @@ pub fn init(boot_info_ptr: *const BootInfo) {
             crate::debug::boot_trace::println_fmt(format_args!("kernel: paging tables init begin"));
             pml4.init(boot_info_ptr);
             crate::debug::boot_trace::println_fmt(format_args!("kernel: paging tables init done"));
-            pml4.load();
-            crate::debug::boot_trace::println_fmt(format_args!("kernel: paging root loaded"));
             rebase_loaded_kernel_image_to_higher_half(boot_info_ptr)
                 .expect("kernel higher-half rebase must succeed");
             crate::debug::boot_trace::println_fmt(format_args!(
                 "kernel: paging higher-half rebase done"
             ));
+            pml4.load();
+            crate::debug::boot_trace::println_fmt(format_args!("kernel: paging root loaded"));
         });
     }
 }

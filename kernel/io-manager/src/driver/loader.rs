@@ -1,7 +1,6 @@
 use alloc::vec;
 use alloc::vec::Vec;
 use core::arch::asm;
-use core::cell::UnsafeCell;
 use core::mem::size_of;
 use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -92,42 +91,25 @@ static KERNEL_COMPAT_TRAMPOLINE_PAGES: Mutex<Vec<KernelCompatTrampolinePage>> =
 static MODULE_INIT_STACK_LOCK: Mutex<()> = Mutex::new(());
 static MODULE_ARENA_BYTES: AtomicUsize = AtomicUsize::new(0);
 
-#[repr(align(16))]
-struct ModuleInitStack {
-    #[allow(dead_code)]
-    bytes: [u8; MODULE_INIT_STACK_SIZE],
-}
-
-struct ModuleInitStackMemory(UnsafeCell<ModuleInitStack>);
-
-unsafe impl Sync for ModuleInitStackMemory {}
-
-static MODULE_INIT_STACK: ModuleInitStackMemory =
-    ModuleInitStackMemory(UnsafeCell::new(ModuleInitStack {
-        bytes: [0; MODULE_INIT_STACK_SIZE],
-    }));
-
-#[inline(always)]
-fn module_init_stack_top() -> usize {
-    let base = MODULE_INIT_STACK.0.get() as *const ModuleInitStack as usize;
-    base + MODULE_INIT_STACK_SIZE
-}
-
-#[inline(always)]
-fn module_init_stack_base() -> usize {
-    MODULE_INIT_STACK.0.get() as *const ModuleInitStack as usize
+fn allocate_module_init_stack() -> Option<Vec<u8>> {
+    let mut stack = Vec::new();
+    stack.try_reserve_exact(MODULE_INIT_STACK_SIZE).ok()?;
+    unsafe {
+        stack.set_len(MODULE_INIT_STACK_SIZE);
+    }
+    Some(stack)
 }
 
 #[inline(always)]
 unsafe fn call_with_module_init_stack0(entry: usize) -> i32 {
     let _guard = MODULE_INIT_STACK_LOCK.lock();
-    let _stack_scope = kernel_ps::api::CurrentKernelStackScope::enter(
-        module_init_stack_base() as u64,
-        module_init_stack_top() as u64,
-    )
-    .expect("scheduler must accept module init stack bounds");
+    let mut stack = allocate_module_init_stack().expect("module init stack allocation failed");
+    let stack_base = stack.as_mut_ptr() as usize;
+    let stack_top = stack_base + stack.len();
+    let _stack_scope =
+        kernel_ps::api::CurrentKernelStackScope::enter(stack_base as u64, stack_top as u64)
+            .expect("scheduler must accept module init stack bounds");
     let mut result: i32;
-    let stack_top = module_init_stack_top();
     // x86-64 Linux kernel code is built for an 8-byte stack boundary. Enter
     // compat module init with rsp % 16 == 0; after the CALL pushes its return
     // address, this matches the kernel module compiler's expected parity.
@@ -153,13 +135,13 @@ unsafe fn call_with_module_init_stack0(entry: usize) -> i32 {
 #[inline(always)]
 unsafe fn call_with_module_init_stack1(entry: usize, arg0: usize) -> i32 {
     let _guard = MODULE_INIT_STACK_LOCK.lock();
-    let _stack_scope = kernel_ps::api::CurrentKernelStackScope::enter(
-        module_init_stack_base() as u64,
-        module_init_stack_top() as u64,
-    )
-    .expect("scheduler must accept module init stack bounds");
+    let mut stack = allocate_module_init_stack().expect("module init stack allocation failed");
+    let stack_base = stack.as_mut_ptr() as usize;
+    let stack_top = stack_base + stack.len();
+    let _stack_scope =
+        kernel_ps::api::CurrentKernelStackScope::enter(stack_base as u64, stack_top as u64)
+            .expect("scheduler must accept module init stack bounds");
     let mut result: i32;
-    let stack_top = module_init_stack_top();
     unsafe {
         asm!(
             "push rbx",

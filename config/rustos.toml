@@ -1,6 +1,6 @@
 [logging]
 enabled = true
-boot_trace_enabled = true
+boot_trace_enabled = false
 serial_mirror = false
 ring_buffer_bytes = 16384
 min_level = "info"
@@ -25,11 +25,11 @@ debug = "info"
 heartbeat = "info"
 
 [kernel.build]
-# Hardened/release-oriented kernel build knobs. These are intentionally easy to
-# sweep when checking boot/runtime sensitivity.
+# Hardened/release-oriented kernel build knobs. Copy this block, or this whole
+# file, into config/rustos.toml when testing a release-shaped image.
 
-codegen_units = 256
-opt_level = "0"
+codegen_units = 1
+opt_level = "2"
 overflow_checks = true
 debug_assertions = false
 lto = "thin"

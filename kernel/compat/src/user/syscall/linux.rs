@@ -88,19 +88,21 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         return error;
     }
 
-    linux_ops::deliver_pending_signals_for_current_thread();
+    deliver_pending_signals_if_needed();
 
-    debug_log_secondary_linux_syscall(|| {
-        alloc::format!(
-            "nr={} rip={:#x} rdi={:#x} rsi={:#x} rdx={:#x} r10={:#x}",
-            frame.rax,
-            frame.user_rip,
-            frame.rdi,
-            frame.rsi,
-            frame.rdx,
-            frame.r10,
-        )
-    });
+    if SECONDARY_LINUX_SYSCALL_DEBUG_LIMIT != 0 {
+        debug_log_secondary_linux_syscall(|| {
+            alloc::format!(
+                "nr={} rip={:#x} rdi={:#x} rsi={:#x} rdx={:#x} r10={:#x}",
+                frame.rax,
+                frame.user_rip,
+                frame.rdi,
+                frame.rsi,
+                frame.rdx,
+                frame.r10,
+            )
+        });
+    }
 
     let result = match frame.rax {
         linux_abi::SYS_READ => fs_ops::syscall_linux_read(frame.rdi, frame.rsi, frame.rdx),
@@ -286,8 +288,14 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         linux_abi::SYS_EXIT | linux_abi::SYS_EXIT_GROUP => syscall_process_exit(frame.rdi),
         _ => unreachable!("linux syscall_check allowed an unknown syscall"),
     };
-    linux_ops::deliver_pending_signals_for_current_thread();
+    deliver_pending_signals_if_needed();
     result
+}
+
+fn deliver_pending_signals_if_needed() {
+    if linux_ops::current_thread_has_unblocked_pending_signal().unwrap_or(false) {
+        linux_ops::deliver_pending_signals_for_current_thread();
+    }
 }
 
 fn syscall_check(frame: &SyscallFrame) -> Result<(), u64> {
