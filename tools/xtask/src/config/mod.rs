@@ -25,7 +25,6 @@ pub(crate) struct Config {
     pub(crate) gpg: OsString,
     pub(crate) kernel_target: String,
     pub(crate) nucleus_package: String,
-    pub(crate) user_elf_package: String,
     pub(crate) user_elf_linkage: String,
     pub(crate) kernel_cargo_zflags: Vec<String>,
     pub(crate) nucleus_rustc_args: Vec<String>,
@@ -73,8 +72,6 @@ impl Config {
         let nucleus_package = env_string("NUCLEUS_PACKAGE")
             .or_else(|| env_string("KERNEL_PACKAGE"))
             .unwrap_or_else(|| String::from("nucleus"));
-        let user_elf_package =
-            env_string("USER_ELF_PACKAGE").unwrap_or_else(|| String::from("uiserver"));
         let user_elf_linkage =
             env_string("USER_ELF_LINKAGE").unwrap_or_else(|| String::from("dynamic"));
 
@@ -154,7 +151,6 @@ impl Config {
             gpg,
             kernel_target,
             nucleus_package,
-            user_elf_package,
             user_elf_linkage,
             kernel_cargo_zflags,
             nucleus_rustc_args,

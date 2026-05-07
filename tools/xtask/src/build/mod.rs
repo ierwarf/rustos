@@ -1,6 +1,6 @@
 use anyhow::{Context, anyhow, bail};
 use fs_err as fs;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -51,32 +51,75 @@ pub(crate) fn build(config: &Config) -> Result<()> {
 
 pub(crate) fn check(config: &Config) -> Result<()> {
     validate_workspace_layering(&config.root_dir)?;
-    let _ = load_default_manifests(&config.root_dir)?;
+    let manifests = load_default_manifests(&config.root_dir)?;
     ensure_targets(config)?;
 
     run_cargo_kernel_check(config, &config.nucleus_package)?;
     check_nucleus_multiboot2_if_present(config)?;
+    check_os_target_manifests(config, &manifests)?;
+    check_host_workspace(config, &manifests)?;
 
-    let mut user_check = Command::new(&config.cargo);
-    user_check
+    Ok(())
+}
+
+fn check_os_target_manifests(config: &Config, manifests: &[PackageManifest]) -> Result<()> {
+    let mut checked = BTreeSet::<String>::new();
+    for manifest in manifests {
+        let Some(package) = manifest.build.package.as_deref() else {
+            continue;
+        };
+        if !checked.insert(package.to_owned()) {
+            continue;
+        }
+        match manifest.build.builder {
+            BuilderKind::CargoKernelBinary => check_cargo_os_binary(config, package)?,
+            BuilderKind::ModuleImage => run_cargo_kernel_check(config, package)?,
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn check_cargo_os_binary(config: &Config, package: &str) -> Result<()> {
+    let mut command = Command::new(&config.cargo);
+    command
         .arg("check")
         .arg("-p")
-        .arg(&config.user_elf_package)
+        .arg(package)
         .arg("--target")
         .arg(&config.kernel_target)
         .env("CARGO_TARGET_DIR", &config.cargo_target_dir);
-    run_command(&mut user_check)?;
+    run_command(&mut command)
+}
 
+fn check_host_workspace(config: &Config, manifests: &[PackageManifest]) -> Result<()> {
     let mut workspace_check = Command::new(&config.cargo);
     workspace_check
         .arg("check")
         .arg("--workspace")
-        .arg("--exclude")
-        .arg("nucleus")
         .env("CARGO_TARGET_DIR", &config.cargo_target_dir);
+    for package in host_workspace_excludes(config, manifests) {
+        workspace_check.arg("--exclude").arg(package);
+    }
     run_command(&mut workspace_check)?;
 
     Ok(())
+}
+
+fn host_workspace_excludes(config: &Config, manifests: &[PackageManifest]) -> BTreeSet<String> {
+    let mut excludes = BTreeSet::new();
+    excludes.insert(config.nucleus_package.clone());
+    for manifest in manifests {
+        if matches!(
+            manifest.build.builder,
+            BuilderKind::CargoKernelBinary | BuilderKind::ModuleImage | BuilderKind::KernelRustc
+        ) && let Some(package) = manifest.build.package.as_deref()
+        {
+            excludes.insert(package.to_owned());
+        }
+    }
+    excludes
 }
 
 pub(crate) fn clean(config: &Config) -> Result<()> {
