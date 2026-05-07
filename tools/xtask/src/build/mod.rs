@@ -1,5 +1,6 @@
+use anyhow::{Context, anyhow, bail};
+use fs_err as fs;
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -11,10 +12,13 @@ use crate::package_manifest::{
 };
 use crate::stage;
 use crate::util::{
-    command_in_path, copy_with_parent, create_temp_dir, kernel_rustflags_env, output_is_fresh,
-    outputs_are_fresh, remove_dir_if_exists, remove_file_if_exists, run_cargo_kernel_check,
-    run_cargo_kernel_rustc, run_command, strip_elf_artifact_if_available,
+    command_in_path, copy_with_parent, create_temp_dir, output_is_fresh, outputs_are_fresh,
+    remove_dir_if_exists, remove_file_if_exists, run_command,
 };
+
+mod cargo;
+
+use cargo::{apply_kernel_cargo_env, run_cargo_kernel_check, run_cargo_kernel_rustc};
 
 pub(crate) fn build(config: &Config) -> Result<()> {
     validate_workspace_layering(&config.root_dir)?;
@@ -103,9 +107,9 @@ pub(crate) fn build_efi(config: &Config) -> Result<()> {
     let pubkey = config
         .rustos_grub_pubkey
         .as_ref()
-        .ok_or("RUSTOS_GRUB_PUBKEY is required to build the GRUB EFI boot manager")?;
+        .context("RUSTOS_GRUB_PUBKEY is required to build the GRUB EFI boot manager")?;
     if !pubkey.is_file() {
-        return Err(format!("RUSTOS_GRUB_PUBKEY is not a file: {}", pubkey.display()).into());
+        bail!("RUSTOS_GRUB_PUBKEY is not a file: {}", pubkey.display());
     }
 
     sign_nucleus(config)?;
@@ -114,7 +118,7 @@ pub(crate) fn build_efi(config: &Config) -> Result<()> {
     remove_file_if_exists(&artifact)?;
     let parent = artifact
         .parent()
-        .ok_or_else(|| format!("boot artifact has no parent: {}", artifact.display()))?;
+        .with_context(|| format!("boot artifact has no parent: {}", artifact.display()))?;
     fs::create_dir_all(parent)?;
 
     let temp_dir = create_temp_dir("rustos-grub")?;
@@ -155,8 +159,8 @@ pub(crate) fn build_nucleus(config: &Config) -> Result<()> {
     run_cargo_kernel_rustc(config, &config.nucleus_package, &config.nucleus_rustc_args)?;
     let artifact = config.artifact_nucleus_elf_path();
     copy_with_parent(&config.nucleus_source_path(), &artifact)?;
-    strip_elf_artifact_if_available(&artifact)?;
-    check_nucleus_multiboot2(config)
+    check_nucleus_multiboot2(config)?;
+    refresh_nucleus_signature_after_build(config)
 }
 
 fn check_nucleus_multiboot2_if_present(config: &Config) -> Result<()> {
@@ -175,27 +179,39 @@ fn check_nucleus_multiboot2(config: &Config) -> Result<()> {
     if status.success() {
         Ok(())
     } else {
-        Err(format!(
+        Err(anyhow!(
             "nucleus artifact is not Multiboot2-compliant: {}",
             artifact.display()
-        )
-        .into())
+        ))
     }
 }
 
-fn sign_nucleus(config: &Config) -> Result<()> {
+pub(crate) fn sign_nucleus(config: &Config) -> Result<()> {
     let nucleus = config.artifact_nucleus_elf_path();
     if !nucleus.is_file() {
-        return Err(format!("missing nucleus artifact: {}", nucleus.display()).into());
+        bail!("missing nucleus artifact: {}", nucleus.display());
     }
     sign_detached(config, &nucleus, &config.artifact_nucleus_signature_path())
+}
+
+fn refresh_nucleus_signature_after_build(config: &Config) -> Result<()> {
+    let signature = config.artifact_nucleus_signature_path();
+    remove_file_if_exists(&signature)?;
+    if config.rustos_grub_signing_key.is_some() {
+        sign_nucleus(config)?;
+    } else {
+        eprintln!(
+            "xtask: warning: removed stale nucleus signature; set RUSTOS_GRUB_SIGNING_KEY before staging a signed boot image"
+        );
+    }
+    Ok(())
 }
 
 fn sign_detached(config: &Config, input: &Path, signature: &Path) -> Result<()> {
     let signing_key = config
         .rustos_grub_signing_key
         .as_deref()
-        .ok_or("RUSTOS_GRUB_SIGNING_KEY is required to sign GRUB boot inputs")?;
+        .context("RUSTOS_GRUB_SIGNING_KEY is required to sign GRUB boot inputs")?;
     remove_file_if_exists(signature)?;
 
     let mut command = Command::new(&config.gpg);
@@ -327,7 +343,7 @@ fn winsys_c_sources(dir: &Path) -> Result<Vec<PathBuf>> {
     }
     sources.sort();
     if sources.is_empty() {
-        return Err(format!("no C sources found in {}", dir.display()).into());
+        bail!("no C sources found in {}", dir.display());
     }
     Ok(sources)
 }
@@ -368,18 +384,17 @@ fn build_manifest(config: &Config, manifest: &PackageManifest) -> Result<()> {
 
 fn build_cargo_kernel_binary(config: &Config, manifest: &PackageManifest) -> Result<()> {
     if config.user_elf_linkage != "dynamic" {
-        return Err(format!(
+        bail!(
             "Rust std userspace currently supports only USER_ELF_LINKAGE=dynamic, got {}",
             config.user_elf_linkage
-        )
-        .into());
+        );
     }
 
     let package = manifest
         .build
         .package
         .as_deref()
-        .ok_or_else(|| format!("package {} missing build.package", manifest.id))?;
+        .with_context(|| format!("package {} missing build.package", manifest.id))?;
     let mut command = Command::new(&config.cargo);
     command
         .arg("build")
@@ -404,9 +419,9 @@ fn build_cargo_kernel_binary(config: &Config, manifest: &PackageManifest) -> Res
 fn build_mingw_c_exe(config: &Config, manifest: &PackageManifest) -> Result<()> {
     let source = manifest
         .resolved_source_path()
-        .ok_or_else(|| format!("package {} missing build.source", manifest.id))?;
+        .with_context(|| format!("package {} missing build.source", manifest.id))?;
     let output = manifest.artifact_path(config);
-    let parent = output.parent().ok_or_else(|| {
+    let parent = output.parent().with_context(|| {
         format!(
             "Windows executable path has no parent: {}",
             output.display()
@@ -441,7 +456,7 @@ fn build_mingw_c_exe(config: &Config, manifest: &PackageManifest) -> Result<()> 
 fn build_c_demo_manifest(config: &Config, manifest: &PackageManifest) -> Result<()> {
     let source = manifest
         .resolved_source_path()
-        .ok_or_else(|| format!("package {} missing build.source", manifest.id))?;
+        .with_context(|| format!("package {} missing build.source", manifest.id))?;
     let extra_args = manifest
         .build
         .extra_args
@@ -460,12 +475,12 @@ fn build_module_image_manifest(config: &Config, manifest: &PackageManifest) -> R
         .build
         .package
         .as_deref()
-        .ok_or_else(|| format!("package {} missing build.package", manifest.id))?;
+        .with_context(|| format!("package {} missing build.package", manifest.id))?;
     let crate_name = manifest
         .build
         .crate_name
         .as_deref()
-        .ok_or_else(|| format!("package {} missing build.crate_name", manifest.id))?;
+        .with_context(|| format!("package {} missing build.crate_name", manifest.id))?;
     let dependency_crates = manifest
         .build
         .dependency_crates
@@ -495,11 +510,10 @@ fn build_external_copy_manifest(config: &Config, manifest: &PackageManifest) -> 
         remove_file_if_exists(&artifact)?;
         copy_with_parent(&source, &artifact)?;
     } else if !manifest.build.optional {
-        return Err(format!(
+        bail!(
             "required external package {} is missing source file",
             manifest.id
-        )
-        .into());
+        );
     } else {
         eprintln!(
             "xtask: warning: optional vendor module not found: {}",
@@ -534,14 +548,13 @@ fn build_rust_module_image(
 ) -> Result<()> {
     let output_parent = output
         .parent()
-        .ok_or_else(|| format!("module artifact path has no parent: {}", output.display()))?;
+        .with_context(|| format!("module artifact path has no parent: {}", output.display()))?;
     fs::create_dir_all(output_parent)?;
 
     let deps_dir = config.kernel_release_deps_dir();
 
     let mut command = Command::new(&config.cargo);
-    command.env("CARGO_TARGET_DIR", &config.cargo_target_dir);
-    command.env("RUSTFLAGS", kernel_rustflags_env());
+    apply_kernel_cargo_env(config, &mut command);
     command.arg("rustc");
     for flag in &config.kernel_cargo_zflags {
         command.arg(flag);
@@ -592,7 +605,7 @@ fn build_rust_module_image(
     remove_file_if_exists(output)?;
     let ar_bin = command_in_path("llvm-ar")
         .or_else(|| command_in_path("ar"))
-        .ok_or("missing llvm-ar/ar for module archive extraction")?;
+        .context("missing llvm-ar/ar for module archive extraction")?;
     let temp_dir = create_temp_dir("rustos-module-link")?;
     let mut link_inputs = Vec::new();
     extract_archive_objects(
@@ -634,7 +647,7 @@ fn build_c_demo(
 ) -> Result<()> {
     let parent = output
         .parent()
-        .ok_or_else(|| format!("demo artifact path has no parent: {}", output.display()))?;
+        .with_context(|| format!("demo artifact path has no parent: {}", output.display()))?;
     fs::create_dir_all(parent)?;
 
     let mut command = Command::new(cc);
@@ -656,7 +669,7 @@ fn audit_userdemo2_imports_for_path(
         .arg(executable)
         .output()?;
     if !output.status.success() {
-        return Err(format!("objdump failed for {}", executable.display()).into());
+        bail!("objdump failed for {}", executable.display());
     }
 
     fs::write(config.userdemo2_import_audit_log_path(), &output.stdout)?;
@@ -692,7 +705,7 @@ fn validate_imports_exported_by_winsys(
             .map(|(dll, symbol)| format!("{dll}!{symbol}"))
             .collect::<Vec<_>>()
             .join(", ");
-        return Err(format!("winsys export contract mismatch: {}", details).into());
+        bail!("winsys export contract mismatch: {}", details);
     }
 
     Ok(())
@@ -778,7 +791,7 @@ fn find_latest_rlib_artifact(dir: &Path, prefix: &str) -> Result<PathBuf> {
 
     latest
         .map(|(_, path)| path)
-        .ok_or_else(|| format!("module rlib artifact not found under {}", dir.display()).into())
+        .with_context(|| anyhow!("module rlib artifact not found under {}", dir.display()))
 }
 
 fn collect_object_files(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -875,11 +888,11 @@ fn winsys_import_contracts(winsys_root: &Path) -> Result<BTreeMap<String, Vec<De
     for (alias, target) in winsys_import_aliases() {
         let target = target.to_ascii_lowercase();
         let Some(target_exports) = exports_by_dll.get(target.as_str()).cloned() else {
-            return Err(format!(
+            bail!(
                 "winsys import alias error: {} maps to missing DLL {}",
-                alias, target
-            )
-            .into());
+                alias,
+                target
+            );
         };
         exports_by_dll.insert((*alias).to_ascii_lowercase(), target_exports);
     }
@@ -934,21 +947,24 @@ fn validate_winsys_export_contracts(winsys_root: &Path) -> Result<()> {
                 continue;
             };
             let Some(target_exports) = exports_by_dll.get(target_dll) else {
-                return Err(format!(
+                bail!(
                     "winsys export contract error: {}!{} forwards to missing DLL {}",
-                    dll_name, export.name, target_dll
-                )
-                .into());
+                    dll_name,
+                    export.name,
+                    target_dll
+                );
             };
             if !target_exports
                 .iter()
                 .any(|candidate| candidate.name.eq_ignore_ascii_case(target_symbol))
             {
-                return Err(format!(
+                bail!(
                     "winsys export contract error: {}!{} forwards to missing export {}!{}",
-                    dll_name, export.name, target_dll, target_symbol
-                )
-                .into());
+                    dll_name,
+                    export.name,
+                    target_dll,
+                    target_symbol
+                );
             }
         }
     }
@@ -977,10 +993,10 @@ fn parse_def_exports(path: &Path) -> Result<Vec<DefExport>> {
         let token = trimmed
             .split_whitespace()
             .next()
-            .ok_or_else(|| format!("invalid DEF export line in {}: {trimmed}", path.display()))?;
+            .with_context(|| format!("invalid DEF export line in {}: {trimmed}", path.display()))?;
         let (name, forward_dll, forward_symbol) =
             if let Some((name, target)) = token.split_once('=') {
-                let (dll, symbol) = target.rsplit_once('.').ok_or_else(|| {
+                let (dll, symbol) = target.rsplit_once('.').with_context(|| {
                     format!(
                         "invalid DEF forwarder target in {}: {}",
                         path.display(),
@@ -1016,7 +1032,7 @@ fn canonical_forward_dll_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{canonical_forward_dll_name, parse_def_exports, parse_objdump_imports};
-    use std::fs;
+    use fs_err as fs;
 
     #[test]
     fn parse_objdump_imports_stops_after_import_tables() {

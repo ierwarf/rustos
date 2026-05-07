@@ -11,18 +11,19 @@ add new log lines without making the boot path noisy.
 
 ### Configuration File
 
-The shared logging policy lives in `config/logging.toml`. Most settings are
+The shared logging policy lives in `config/rustos.toml` under `[logging]`. Most settings are
 consumed by crate `build.rs` scripts through `tools/build_log_cfg.rs`, so
 changing the file requires rebuilding the affected crates.
 
 ```toml
+[logging]
 enabled = true
 boot_trace_enabled = true
 serial_mirror = true
 ring_buffer_bytes = 16384
 min_level = "info"
 
-[categories]
+[logging.categories]
 boot = "info"
 panic = "fatal"
 memory = "info"
@@ -53,7 +54,7 @@ heartbeat = "info"
 - `ring_buffer_bytes`: byte capacity of the kernel structured log ring.
 - `min_level`: default threshold for every category before per-category
   overrides are applied.
-- `[categories]`: per-category thresholds.
+- `[logging.categories]`: per-category thresholds.
 
 Supported levels are `off`, `trace`, `debug`, `info`, `warn`, `error`, and
 `fatal`. The threshold is inclusive. For example, `storage = "warn"` enables
@@ -96,7 +97,7 @@ Kernel crates use generated macros from
 `kernel/nucleus-core/src/debug/kdiag_macros.rs`. Userspace services use
 generated helpers from `libs/observability-client`.
 
-After changing `config/logging.toml`, rebuild:
+After changing `config/rustos.toml`, rebuild:
 
 ```bash
 cargo xtask build
@@ -261,7 +262,7 @@ cleanly. A new category must be added in all of these places:
 
 1. `libs/rustos-observability/src/lib.rs`
 2. `tools/build_log_cfg.rs`
-3. `config/logging.toml`
+3. `config/rustos.toml`
 4. this guide
 
 Then run:
@@ -301,18 +302,19 @@ cargo xtask check
 
 ### 설정 파일
 
-공유 logging 정책은 `config/logging.toml`에 있습니다. 대부분의 설정은 crate
+공유 logging 정책은 `config/rustos.toml`의 `[logging]`에 있습니다. 대부분의 설정은 crate
 `build.rs`가 `tools/build_log_cfg.rs`를 통해 읽습니다. 따라서 이 파일을
 바꾸면 영향을 받는 crate를 다시 빌드해야 합니다.
 
 ```toml
+[logging]
 enabled = true
 boot_trace_enabled = true
 serial_mirror = true
 ring_buffer_bytes = 16384
 min_level = "info"
 
-[categories]
+[logging.categories]
 boot = "info"
 panic = "fatal"
 memory = "info"
@@ -343,7 +345,7 @@ heartbeat = "info"
   것과 별도로 QEMU debugcon port `0xe9`에도 미러링합니다.
 - `ring_buffer_bytes`: kernel structured log ring의 byte capacity입니다.
 - `min_level`: category override가 적용되기 전 모든 category의 기본 threshold입니다.
-- `[categories]`: category별 threshold입니다.
+- `[logging.categories]`: category별 threshold입니다.
 
 지원 level은 `off`, `trace`, `debug`, `info`, `warn`, `error`, `fatal`입니다.
 threshold는 inclusive입니다. 예를 들어 `storage = "warn"`은 storage의
@@ -385,7 +387,7 @@ Kernel crate는 `kernel/nucleus-core/src/debug/kdiag_macros.rs`에서 생성된
 macro를 사용합니다. Userspace service는 `libs/observability-client`의 생성
 helper를 사용합니다.
 
-`config/logging.toml`을 바꾼 뒤에는 다시 빌드하세요.
+`config/rustos.toml`을 바꾼 뒤에는 다시 빌드하세요.
 
 ```bash
 cargo xtask build
@@ -550,7 +552,7 @@ heartbeat = "off"
 
 1. `libs/rustos-observability/src/lib.rs`
 2. `tools/build_log_cfg.rs`
-3. `config/logging.toml`
+3. `config/rustos.toml`
 4. 이 가이드
 
 그 뒤 실행합니다.

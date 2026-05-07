@@ -35,6 +35,32 @@ pub const LOG_LEVELS: [(&str, u8); 6] = [
     ("fatal", LOG_LEVEL_FATAL),
 ];
 
+pub fn emit_project_config_rerun(config_path: &std::path::Path) {
+    println!(
+        "cargo:rerun-if-changed={}",
+        config_path.display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        legacy_logging_path(config_path).display()
+    );
+}
+
+pub fn read_project_config(config_path: &std::path::Path) -> std::io::Result<String> {
+    if config_path.is_file() {
+        std::fs::read_to_string(config_path)
+    } else {
+        std::fs::read_to_string(legacy_logging_path(config_path))
+    }
+}
+
+fn legacy_logging_path(config_path: &std::path::Path) -> std::path::PathBuf {
+    config_path
+        .parent()
+        .map(|parent| parent.join("logging.toml"))
+        .unwrap_or_else(|| std::path::PathBuf::from("logging.toml"))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LoggingConfig {
     pub enabled: bool,
@@ -178,6 +204,10 @@ pub fn emit_logging_env(config: &LoggingConfig) {
 }
 
 pub fn parse_logging_toml(source: &str) -> LoggingConfig {
+    try_parse_logging_toml(source).unwrap_or_else(|err| panic!("{err}"))
+}
+
+pub fn try_parse_logging_toml(source: &str) -> Result<LoggingConfig, String> {
     let mut config = LoggingConfig::default();
     config.category_levels = [config.min_level; LOG_CATEGORIES.len()];
     let mut section = "";
@@ -194,35 +224,38 @@ pub fn parse_logging_toml(source: &str) -> LoggingConfig {
         }
 
         let Some((raw_key, raw_value)) = line.split_once('=') else {
-            panic!("invalid logging.toml line: {line}");
+            return Err(format!("invalid logging config line: {line}"));
         };
         let key = raw_key.trim();
         let value = raw_value.trim();
         match section {
-            "" => match key {
-                "enabled" => config.enabled = parse_bool_value(value, key),
+            "" | "logging" => match key {
+                "enabled" => config.enabled = parse_bool_value(value, key)?,
                 "boot_trace_enabled" => {
-                    config.boot_trace_enabled = parse_bool_value(value, key)
+                    config.boot_trace_enabled = parse_bool_value(value, key)?
                 }
-                "serial_mirror" => config.serial_mirror = parse_bool_value(value, key),
-                "ring_buffer_bytes" => config.ring_buffer_bytes = parse_usize_value(value, key),
+                "serial_mirror" => config.serial_mirror = parse_bool_value(value, key)?,
+                "ring_buffer_bytes" => config.ring_buffer_bytes = parse_usize_value(value, key)?,
                 "min_level" => {
-                    config.min_level = parse_level_value(value);
+                    config.min_level = parse_level_value(value)?;
                     config.category_levels = [config.min_level; LOG_CATEGORIES.len()];
                 }
-                other => panic!("unknown logging config key: {other}"),
+                other => return Err(format!("unknown logging config key: {other}")),
             },
-            "categories" => {
+            "categories" | "logging.categories" => {
                 let Some(index) = category_index(key) else {
-                    panic!("unknown logging category: {key}");
+                    return Err(format!("unknown logging category: {key}"));
                 };
-                config.category_levels[index] = parse_level_value(value);
+                config.category_levels[index] = parse_level_value(value)?;
             }
-            other => panic!("unsupported logging.toml section: {other}"),
+            other if other.starts_with("logging.") => {
+                return Err(format!("unsupported logging config section: {other}"));
+            }
+            _ => {}
         }
     }
 
-    config
+    Ok(config)
 }
 
 #[allow(dead_code)]
@@ -254,23 +287,23 @@ fn strip_comment(line: &str) -> &str {
     line
 }
 
-fn parse_bool_value(value: &str, key: &str) -> bool {
+fn parse_bool_value(value: &str, key: &str) -> Result<bool, String> {
     match trim_string(value) {
-        "true" => true,
-        "false" => false,
-        other => panic!("invalid bool for {key}: {other}"),
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(format!("invalid bool for {key}: {other}")),
     }
 }
 
-fn parse_usize_value(value: &str, key: &str) -> usize {
+fn parse_usize_value(value: &str, key: &str) -> Result<usize, String> {
     trim_string(value)
         .parse::<usize>()
-        .unwrap_or_else(|_| panic!("invalid usize for {key}: {value}"))
+        .map_err(|_| format!("invalid usize for {key}: {value}"))
 }
 
-fn parse_level_value(value: &str) -> u8 {
+fn parse_level_value(value: &str) -> Result<u8, String> {
     let level = trim_string(value);
-    level_value(level).unwrap_or_else(|| panic!("invalid log level: {level}"))
+    level_value(level).ok_or_else(|| format!("invalid log level: {level}"))
 }
 
 fn trim_string(value: &str) -> &str {

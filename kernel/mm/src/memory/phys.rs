@@ -133,6 +133,35 @@ impl PhysAllocatorState {
         }
     }
 
+    fn reserve_phys_range(&mut self, phys_start: u64, byte_len: u64) -> usize {
+        if byte_len == 0 {
+            return 0;
+        }
+
+        let start = align_down(phys_start, PAGE_SIZE);
+        let Some(end) = phys_start
+            .checked_add(byte_len)
+            .and_then(|end| align_up(end, PAGE_SIZE))
+        else {
+            return 0;
+        };
+        if end <= start {
+            return 0;
+        }
+
+        let start_frame = (start / PAGE_SIZE) as usize;
+        let end_frame = ((end / PAGE_SIZE) as usize).min(self.frame_count);
+        let mut reserved = 0usize;
+        for frame_index in start_frame..end_frame {
+            if frame_is_boot_usable(self, frame_index) && !self.is_used(frame_index) {
+                self.set_used(frame_index);
+                reserved += 1;
+            }
+        }
+        self.free_frames = self.free_frames.saturating_sub(reserved);
+        reserved
+    }
+
     fn alloc_contiguous_locked(&mut self, page_count: usize) -> Option<PhysAddr> {
         self.alloc_contiguous_bounded_locked(page_count, self.frame_count)
     }
@@ -266,9 +295,17 @@ pub fn init(boot_info_ptr: *const BootInfo) {
             .checked_mul(core::mem::size_of::<u64>())
             .expect("physical allocator bitmap size overflow");
         let bitmap_pages = bitmap_bytes.div_ceil(PAGE_SIZE as usize);
-        let Some(bitmap_phys) = usable_region_spans(memory_map)
-            .find(|(_, page_count)| *page_count >= bitmap_pages)
-            .map(|(start_phys, _)| start_phys)
+        let image_start = align_down(boot_info.nucleus_image.phys_start, PAGE_SIZE);
+        let image_end = boot_info
+            .nucleus_image
+            .phys_start
+            .checked_add(boot_info.nucleus_image.size)
+            .and_then(|end| align_up(end, PAGE_SIZE))
+            .unwrap_or(DIRECT_MAP_PHYS_LIMIT)
+            .min(DIRECT_MAP_PHYS_LIMIT);
+
+        let Some(bitmap_phys) =
+            find_usable_span_excluding_range(memory_map, bitmap_pages, image_start, image_end)
         else {
             panic!("failed to reserve physical allocator bitmap");
         };
@@ -313,8 +350,11 @@ pub fn init(boot_info_ptr: *const BootInfo) {
                 .expect("free frame count overflow");
         }
 
-        new_state.mark_range_used((bitmap_phys / PAGE_SIZE) as usize, bitmap_pages);
-        new_state.free_frames = new_state.free_frames.saturating_sub(bitmap_pages);
+        new_state.reserve_phys_range(
+            boot_info.nucleus_image.phys_start,
+            boot_info.nucleus_image.size,
+        );
+        new_state.reserve_phys_range(bitmap_phys, bitmap_pages as u64 * PAGE_SIZE);
         new_state.initialized = true;
 
         *state = new_state;
@@ -419,6 +459,49 @@ fn usable_region_spans<'a>(
         let page_count = ((end - start) / PAGE_SIZE) as usize;
         (page_count != 0).then_some((start, page_count))
     })
+}
+
+fn find_usable_span_excluding_range(
+    regions: &[BootMemoryRegion],
+    required_pages: usize,
+    reserved_start: u64,
+    reserved_end: u64,
+) -> Option<u64> {
+    if required_pages == 0 {
+        return None;
+    }
+
+    let required_bytes = required_pages as u64 * PAGE_SIZE;
+    for (span_start, page_count) in usable_region_spans(regions) {
+        let span_end = span_start + page_count as u64 * PAGE_SIZE;
+        if reserved_start >= reserved_end
+            || reserved_end <= span_start
+            || reserved_start >= span_end
+        {
+            if span_has_pages(span_start, span_end, required_bytes) {
+                return Some(span_start);
+            }
+            continue;
+        }
+
+        let before_end = reserved_start.min(span_end);
+        if span_has_pages(span_start, before_end, required_bytes) {
+            return Some(span_start);
+        }
+
+        let after_start = reserved_end.max(span_start);
+        if span_has_pages(after_start, span_end, required_bytes) {
+            return Some(after_start);
+        }
+    }
+
+    None
+}
+
+fn span_has_pages(start: u64, end: u64, required_bytes: u64) -> bool {
+    end.checked_sub(start)
+        .map(|bytes| bytes >= required_bytes)
+        .unwrap_or(false)
 }
 
 fn align_down(value: u64, align: u64) -> u64 {
@@ -528,5 +611,32 @@ mod tests {
             .alloc_contiguous_locked(2)
             .expect("allocator should use the last valid contiguous range");
         assert_eq!(allocated.as_u64(), PAGE_SIZE * 6);
+    }
+
+    #[test]
+    fn bitmap_backing_skips_reserved_kernel_image() {
+        let regions = [BootMemoryRegion {
+            phys_start: 0x900000,
+            page_count: 0x6000,
+            kind: BootMemoryKind::Usable,
+            _reserved0: 0,
+        }];
+
+        let bitmap = find_usable_span_excluding_range(&regions, 1, 0x200000, 0x5e6f000)
+            .expect("bitmap backing should fit after kernel image");
+        assert_eq!(bitmap, 0x5e6f000);
+    }
+
+    #[test]
+    fn reserve_phys_range_removes_kernel_image_from_free_set() {
+        let mut bitmap = [u64::MAX; 2];
+        let mut state = test_state(&mut bitmap, 128, 0);
+
+        let reserved = state.reserve_phys_range(PAGE_SIZE * 4 + 1, PAGE_SIZE * 2);
+        assert_eq!(reserved, 3);
+        assert_eq!(state.free_frames, 125);
+        assert!(state.is_used(4));
+        assert!(state.is_used(5));
+        assert!(state.is_used(6));
     }
 }

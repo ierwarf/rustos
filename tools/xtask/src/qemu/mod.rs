@@ -1,6 +1,7 @@
+use anyhow::{Context, anyhow, bail};
+use fs_err as fs;
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -260,20 +261,20 @@ where
             "--debugcon" => {
                 let value = next_required_arg(args, "--debugcon")?;
                 options.debugcon = DebugconMode::parse(value.as_str())
-                    .ok_or_else(|| format!("invalid --debugcon value: {value}"))?;
+                    .with_context(|| format!("invalid --debugcon value: {value}"))?;
             }
             "--qemu-log" => {
                 let value = next_required_arg(args, "--qemu-log")?;
                 options.qemu_log = QemuLogMode::parse(value.as_str())
-                    .ok_or_else(|| format!("invalid --qemu-log value: {value}"))?;
+                    .with_context(|| format!("invalid --qemu-log value: {value}"))?;
             }
             "--timeout" => {
                 let value = next_required_arg(args, "--timeout")?;
                 let seconds = value
                     .parse::<u64>()
-                    .map_err(|_| format!("invalid --timeout seconds: {value}"))?;
+                    .map_err(|_| anyhow!("invalid --timeout seconds: {value}"))?;
                 if seconds == 0 {
-                    return Err(String::from("--timeout must be greater than zero").into());
+                    bail!("--timeout must be greater than zero");
                 }
                 options.timeout = Some(Duration::from_secs(seconds));
             }
@@ -351,7 +352,7 @@ fn run_qemu_with_options(config: &Config, options: RunOptions) -> Result<()> {
     if status.success() {
         Ok(())
     } else {
-        Err(format!("QEMU exited with status {status}").into())
+        Err(anyhow!("QEMU exited with status {status}"))
     }
 }
 
@@ -363,7 +364,7 @@ fn run_qemu_supervised(
     debugcon_log: Option<&Path>,
 ) -> Result<()> {
     if !expect_markers.is_empty() && debugcon_log.is_none() {
-        return Err(String::from("--expect requires --debugcon file").into());
+        bail!("--expect requires --debugcon file");
     }
 
     let started = Instant::now();
@@ -396,15 +397,14 @@ fn run_qemu_supervised(
                 summarize_debugcon_log(debugcon_log)?;
             }
             if !status.success() {
-                return Err(format!("QEMU exited with status {status}").into());
+                bail!("QEMU exited with status {status}");
             }
             let missing = expected_markers_satisfied(debugcon_log, expect_markers)?;
             if !missing.is_empty() {
-                return Err(format!(
+                bail!(
                     "QEMU exited before expected marker(s): {}",
                     missing.join(" | ")
-                )
-                .into());
+                );
             }
             return Ok(());
         }
@@ -421,11 +421,10 @@ fn run_qemu_supervised(
                 }
                 let missing = expected_markers_satisfied(debugcon_log, expect_markers)?;
                 if !missing.is_empty() {
-                    return Err(format!(
+                    bail!(
                         "timed out waiting for expected marker(s): {}",
                         missing.join(" | ")
-                    )
-                    .into());
+                    );
                 }
                 return Ok(());
             }
@@ -545,36 +544,32 @@ echo RustOS breakpoint candidates installed. Missing symbols remain pending.\n
 
 fn ensure_qemu_prerequisites(config: &Config) -> Result<()> {
     if !config.image_dir.is_dir() {
-        return Err(format!(
+        bail!(
             "missing build image directory: {} (run `cargo xtask build` first)",
             config.image_dir.display()
-        )
-        .into());
+        );
     }
 
     if !config.boot_disk_image.is_file() {
-        return Err(format!(
+        bail!(
             "missing boot disk image: {} (run `cargo xtask build` or `cargo xtask stage` first)",
             config.boot_disk_image.display()
-        )
-        .into());
+        );
     }
 
     let boot_efi = config.boot_efi_path();
     if !boot_efi.is_file() {
-        return Err(format!(
+        bail!(
             "missing staged boot manager image: {} (run `cargo xtask build` first)",
             boot_efi.display()
-        )
-        .into());
+        );
     }
 
     if !config.ovmf_path.is_file() {
-        return Err(format!(
+        bail!(
             "missing OVMF firmware image: {}",
             config.ovmf_path.display()
-        )
-        .into());
+        );
     }
 
     Ok(())
@@ -582,7 +577,7 @@ fn ensure_qemu_prerequisites(config: &Config) -> Result<()> {
 
 fn prepare_run(config: &Config, options: RunOptions) -> Result<PreparedRun> {
     ensure_qemu_prerequisites(config)?;
-    let qemu_bin = resolve_command_path(&config.qemu_bin).ok_or_else(|| {
+    let qemu_bin = resolve_command_path(&config.qemu_bin).with_context(|| {
         format!(
             "missing QEMU binary: {}",
             Path::new(&config.qemu_bin).display()
@@ -679,7 +674,7 @@ where
 {
     args.next()
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| format!("missing value for {option}").into())
+        .with_context(|| anyhow!("missing value for {option}"))
 }
 
 fn append_unique_string(items: &mut Vec<String>, candidate: String) {
@@ -768,7 +763,7 @@ fn qemu_profile_spec(profile: &str) -> Result<QemuProfileSpec> {
             smp: None,
             rtc: None,
         }),
-        _ => Err(format!("unknown qemu profile: {profile}").into()),
+        _ => Err(anyhow!("unknown qemu profile: {profile}")),
     }
 }
 
@@ -848,19 +843,19 @@ fn ensure_vfio_available() -> Result<()> {
     if Path::new("/dev/vfio/vfio").exists() || Path::new("/dev/vfio").exists() {
         Ok(())
     } else {
-        Err(String::from("VFIO is not available: /dev/vfio is missing.").into())
+        Err(anyhow!("VFIO is not available: /dev/vfio is missing."))
     }
 }
 
 fn validate_vfio_device(bdf: &str, vfio_force: bool) -> Result<()> {
     let devpath = Path::new("/sys/bus/pci/devices").join(bdf);
     if !devpath.is_dir() {
-        return Err(format!("VFIO host device not found: {bdf}").into());
+        bail!("VFIO host device not found: {bdf}");
     }
 
     let driver_link = devpath.join("driver");
     if !driver_link.exists() {
-        return Err(format!("VFIO host device has no bound driver: {bdf}").into());
+        bail!("VFIO host device has no bound driver: {bdf}");
     }
 
     let driver_path = fs::canonicalize(&driver_link)?;
@@ -869,10 +864,7 @@ fn validate_vfio_device(bdf: &str, vfio_force: bool) -> Result<()> {
         .and_then(|name| name.to_str())
         .unwrap_or("<unknown>");
     if driver_name != "vfio-pci" {
-        return Err(format!(
-            "VFIO host device is not bound to vfio-pci: {bdf} (current: {driver_name})"
-        )
-        .into());
+        bail!("VFIO host device is not bound to vfio-pci: {bdf} (current: {driver_name})");
     }
 
     let iommu_group_link = devpath.join("iommu_group");
@@ -881,20 +873,16 @@ fn validate_vfio_device(bdf: &str, vfio_force: bool) -> Result<()> {
         let group_name = iommu_group
             .file_name()
             .and_then(|name| name.to_str())
-            .ok_or_else(|| format!("failed to resolve IOMMU group for {bdf}"))?;
+            .with_context(|| format!("failed to resolve IOMMU group for {bdf}"))?;
         if !Path::new("/dev/vfio").join(group_name).exists() {
-            return Err(format!(
-                "VFIO IOMMU group device is missing: /dev/vfio/{group_name} for {bdf}"
-            )
-            .into());
+            bail!("VFIO IOMMU group device is missing: /dev/vfio/{group_name} for {bdf}");
         }
     }
 
     if !vfio_force && device_drives_active_host_display(bdf)? {
-        return Err(format!(
+        bail!(
             "Refusing to passthrough active host display device {bdf}. Use --vfio-force only after moving the host off this GPU."
-        )
-        .into());
+        );
     }
 
     Ok(())
@@ -935,7 +923,7 @@ fn detect_phoenix3_devices() -> Result<Vec<String>> {
         return Ok(devices);
     }
 
-    Err(String::from("Phoenix3 (1002:1900) host GPU not found.").into())
+    Err(anyhow!("Phoenix3 (1002:1900) host GPU not found."))
 }
 
 fn device_drives_active_host_display(bdf: &str) -> Result<bool> {
@@ -1292,11 +1280,11 @@ fn run_display_probe(config: &Config, options: RunOptions) -> Result<()> {
         let baseline = read_ppm_dimensions(&baseline_dump)?;
 
         if baseline.0 == 0 || baseline.1 == 0 || baseline.0 > 8192 || baseline.1 > 8192 {
-            return Err(format!(
+            bail!(
                 "probe baseline geometry is invalid: {}x{}",
-                baseline.0, baseline.1
-            )
-            .into());
+                baseline.0,
+                baseline.1
+            );
         }
 
         if let Ok(info) = qmp_hmp_capture(&mut qmp, "info mice", Instant::now() + PROBE_QMP_TIMEOUT)
@@ -1318,17 +1306,19 @@ fn run_display_probe(config: &Config, options: RunOptions) -> Result<()> {
         qmp_screendump(&mut qmp, &stressed_dump)?;
         let stressed = read_ppm_dimensions(&stressed_dump)?;
         if stressed != baseline {
-            return Err(format!(
+            bail!(
                 "display geometry changed during probe: baseline={}x{}, stressed={}x{}",
-                baseline.0, baseline.1, stressed.0, stressed.1
-            )
-            .into());
+                baseline.0,
+                baseline.1,
+                stressed.0,
+                stressed.1
+            );
         }
 
         let debugcon = fs::read_to_string(&debugcon_log).unwrap_or_default();
         for marker in PROBE_BAD_MARKERS {
             if debugcon.contains(marker) {
-                return Err(format!("probe detected bad marker in debugcon log: {marker}").into());
+                bail!("probe detected bad marker in debugcon log: {marker}");
             }
         }
 
@@ -1341,7 +1331,7 @@ fn run_display_probe(config: &Config, options: RunOptions) -> Result<()> {
         return Err(err);
     }
     if !status.success() {
-        return Err(format!("QEMU exited with status {status}").into());
+        bail!("QEMU exited with status {status}");
     }
 
     println!(
@@ -1369,7 +1359,7 @@ fn connect_qmp(path: &Path, timeout: Duration) -> Result<UnixStream> {
                     thread::sleep(Duration::from_millis(50));
                 }
             }
-            Err(err) => return Err(format!("failed to connect to QMP socket: {err}").into()),
+            Err(err) => bail!("failed to connect to QMP socket: {err}"),
         }
     }
 }
@@ -1382,11 +1372,10 @@ fn wait_for_boot_marker(log_path: &Path, markers: &[&str], timeout: Duration) ->
             return Ok(());
         }
         if Instant::now() >= deadline {
-            return Err(format!(
+            bail!(
                 "timed out waiting for boot markers: {}",
                 markers.join(" | ")
-            )
-            .into());
+            );
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -1418,7 +1407,7 @@ fn run_probe_mouse_stress(
         let log = fs::read_to_string(debugcon_log).unwrap_or_default();
         for marker in PROBE_BAD_MARKERS {
             if log.contains(marker) {
-                return Err(format!("probe detected bad marker in debugcon log: {marker}").into());
+                bail!("probe detected bad marker in debugcon log: {marker}");
             }
         }
 
@@ -1430,14 +1419,13 @@ fn run_probe_mouse_stress(
         }
 
         if Instant::now().saturating_duration_since(last_heartbeat_at) > heartbeat_stall {
-            return Err(format!(
+            bail!(
                 "probe detected stalled kernel heartbeat after {:?} (last second={})",
                 heartbeat_stall,
                 last_heartbeat_second
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| String::from("none"))
-            )
-            .into());
+            );
         }
 
         x += dx;
@@ -1621,7 +1609,7 @@ fn wait_for_qmp_return_message(qmp: &mut UnixStream, deadline: Instant) -> Resul
             return Ok(message);
         }
         if message.contains("\"error\"") {
-            return Err(format!("QMP command failed: {message}").into());
+            bail!("QMP command failed: {message}");
         }
     }
 }
@@ -1630,7 +1618,7 @@ fn read_qmp_message(qmp: &mut UnixStream, deadline: Instant) -> Result<String> {
     let mut buffer = Vec::new();
     loop {
         if Instant::now() >= deadline {
-            return Err(String::from("timed out waiting for QMP response").into());
+            bail!("timed out waiting for QMP response");
         }
 
         let mut byte = [0_u8; 1];
@@ -1652,7 +1640,7 @@ fn read_qmp_message(qmp: &mut UnixStream, deadline: Instant) -> Result<String> {
             {
                 continue;
             }
-            Err(err) => return Err(format!("failed to read QMP response: {err}").into()),
+            Err(err) => bail!("failed to read QMP response: {err}"),
         }
     }
 
@@ -1689,15 +1677,15 @@ fn read_ppm_dimensions(path: &Path) -> Result<(u32, u32)> {
     }
 
     if tokens.len() < 4 || tokens[0] != "P6" {
-        return Err(format!("invalid screendump header: {}", path.display()).into());
+        bail!("invalid screendump header: {}", path.display());
     }
 
     let width = tokens[1]
         .parse::<u32>()
-        .map_err(|_| format!("invalid screendump width: {}", tokens[1]))?;
+        .map_err(|_| anyhow!("invalid screendump width: {}", tokens[1]))?;
     let height = tokens[2]
         .parse::<u32>()
-        .map_err(|_| format!("invalid screendump height: {}", tokens[2]))?;
+        .map_err(|_| anyhow!("invalid screendump height: {}", tokens[2]))?;
     Ok((width, height))
 }
 

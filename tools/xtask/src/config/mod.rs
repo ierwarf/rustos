@@ -4,7 +4,12 @@ use std::path::PathBuf;
 use crate::Result;
 use crate::util::{default_root_dir, env_os, env_path, env_string, split_whitespace_owned};
 
+mod project;
+
+pub(crate) use project::{ProjectConfig, effective_config_toml, load_project_config};
+
 pub(crate) struct Config {
+    pub(crate) project: ProjectConfig,
     pub(crate) root_dir: PathBuf,
     pub(crate) workspace_manifest: PathBuf,
     pub(crate) cargo_target_dir: PathBuf,
@@ -43,6 +48,7 @@ pub(crate) struct Config {
 impl Config {
     pub(crate) fn from_env() -> Result<Self> {
         let root_dir = env_path("ROOT_DIR").unwrap_or_else(default_root_dir);
+        let project = load_project_config(&root_dir)?;
         let workspace_manifest = env_path("WORKSPACE_MANIFEST")
             .or_else(|| env_path("KERNEL_GROUND_MANIFEST"))
             .unwrap_or_else(|| root_dir.join("Cargo.toml"));
@@ -104,6 +110,7 @@ impl Config {
         let rustos_grub_sbat = env_path("RUSTOS_GRUB_SBAT");
         let rustos_grub_modules = env_string("RUSTOS_GRUB_MODULES");
         Ok(Self {
+            project,
             image_asset_overlay_dir: env_path("IMAGE_ASSET_OVERLAY_DIR")
                 .unwrap_or_else(|| assets_dir.join("image")),
             amdgpu_firmware_dir: env_path("AMDGPU_FIRMWARE_DIR")
@@ -199,4 +206,15 @@ impl Config {
         self.cargo_target_dir
             .join(format!("{}/release/deps", self.kernel_target))
     }
+}
+
+pub(crate) fn check(config: &Config) -> Result<()> {
+    let _ = effective_config_toml(&config.project);
+    eprintln!("xtask: config ok ({})", config.project.source.label());
+    Ok(())
+}
+
+pub(crate) fn show(config: &Config) -> Result<()> {
+    print!("{}", effective_config_toml(&config.project));
+    Ok(())
 }

@@ -7,15 +7,16 @@ mod shared {
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(rustos_boot_image)");
-    let logging_path = PathBuf::from("../../config/logging.toml");
+    let logging_path = PathBuf::from("../../config/rustos.toml");
     let log_cfg_path = PathBuf::from("../../tools/build_log_cfg.rs");
-    println!("cargo:rerun-if-changed={}", logging_path.display());
+    shared::emit_project_config_rerun(&logging_path);
     println!("cargo:rerun-if-changed={}", log_cfg_path.display());
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("missing OUT_DIR"));
     let generated_path = out_dir.join("logging_build.rs");
     let generated_macros_path = out_dir.join("logging_macros.rs");
 
-    let logging = fs::read_to_string(&logging_path).expect("failed to read shared logging config");
+    let logging =
+        shared::read_project_config(&logging_path).expect("failed to read shared RustOS config");
     let logging_config = shared::parse_logging_toml(&logging);
     shared::emit_log_cfgs(&logging);
     shared::emit_boot_trace_cfg(&logging);

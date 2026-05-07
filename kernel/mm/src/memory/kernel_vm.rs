@@ -32,6 +32,7 @@ const MMIO_WINDOW_BASE: u64 = KERNEL_VIRT_OFFSET + (1_u64 << 39);
 const MMIO_UNMAPPED_BLOCK: u64 = u64::MAX;
 const SPLIT_BLOCK_UNMAPPED: u64 = u64::MAX;
 const KERNEL_LOAD_BIAS_MIN: u64 = 0x0020_0000;
+const MAX_KERNEL_PHYSICAL_KASLR_SLIDE: u64 = 0x0020_0000;
 const ELF64_HEADER_SIZE: usize = 64;
 const ELF64_PROGRAM_HEADER_SIZE: usize = 56;
 const ELF64_DYNAMIC_ENTRY_SIZE: usize = 16;
@@ -394,6 +395,23 @@ impl<const SIZE_GB: usize> PML4<SIZE_GB> {
         let mut page_phys = start;
         while page_phys < end {
             let block_index = page_phys / HUGE_2MIB;
+            let block_end = (block_index + 1) * HUGE_2MIB;
+            if page_phys % HUGE_2MIB == 0
+                && block_end <= end
+                && self.find_split_slot(block_index).is_none()
+            {
+                let entry = self.pd_entry_mut(block_index);
+                if !entry.is_unused() && entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+                    let mut flags = entry.flags();
+                    flags.remove(remove_flags);
+                    flags |= add_flags | PageTableFlags::HUGE_PAGE;
+                    entry.set_addr(entry.addr(), flags);
+                    Self::flush_block(block_index);
+                    page_phys = block_end;
+                    continue;
+                }
+            }
+
             let page_index = ((page_phys % HUGE_2MIB) / PAGE_4KIB) as usize;
             let table = self
                 .ensure_split_block_table(block_index)
@@ -793,10 +811,8 @@ fn find_loaded_kernel_image(
         return Err("boot info kernel image load bias does not point at a valid ELF header");
     }
 
-    let max_slide =
-        u64::try_from(nucleus_core::settings::MAX_KERNEL_PHYSICAL_KASLR_SLIDE.max(0)).unwrap_or(0);
     let scan_end = KERNEL_LOAD_BIAS_MIN
-        .checked_add(max_slide)
+        .checked_add(MAX_KERNEL_PHYSICAL_KASLR_SLIDE)
         .ok_or("kernel ELF scan window overflow")?;
 
     let mut candidate = KERNEL_LOAD_BIAS_MIN;

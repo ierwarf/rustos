@@ -2,7 +2,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::Result;
 use crate::build;
-use crate::config::Config;
+use crate::config::{self as config_mod, Config};
 use crate::qemu;
 use crate::stage;
 
@@ -44,6 +44,16 @@ enum XtaskCommand {
     BuildConsoleDemo,
     #[command(name = "build-driver-modules")]
     BuildDriverModules,
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    Check,
+    Show,
 }
 
 pub(crate) fn run() -> Result<()> {
@@ -73,6 +83,10 @@ pub(crate) fn run() -> Result<()> {
         Some(XtaskCommand::BuildUser) => build::build_user(&config),
         Some(XtaskCommand::BuildConsoleDemo) => build::build_console_demo(&config),
         Some(XtaskCommand::BuildDriverModules) => build::build_driver_modules(&config),
+        Some(XtaskCommand::Config { command }) => match command {
+            ConfigCommand::Check => config_mod::check(&config),
+            ConfigCommand::Show => config_mod::show(&config),
+        },
         None => {
             Cli::command().print_help()?;
             println!();

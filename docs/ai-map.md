@@ -28,7 +28,7 @@ can reuse the prefix.
 - Kernel public surfaces: `kernel/*/src/api.rs`
 - Runtime protocol/client: `libs/runtime-control/src/lib.rs`
 - Logging cfg generator: `tools/build_log_cfg.rs`
-- Logging policy: `config/logging.toml`
+- Logging policy: `config/rustos.toml` `[logging]`
 
 ## Ownership
 

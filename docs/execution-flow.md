@@ -78,7 +78,7 @@ the UI server through framebuffer rendering.
 ### Diagnostic Flow
 
 ```text
-config/logging.toml
+config/rustos.toml
   -> build.rs cfg generation
   -> kernel ring/debugcon and userspace stderr
   -> logs/debugcon.log or --debugcon stdio
@@ -163,7 +163,7 @@ console-hosted program과 Wayland-style window는 framebuffer rendering으로 �
 ### Diagnostic Flow
 
 ```text
-config/logging.toml
+config/rustos.toml
   -> build.rs cfg generation
   -> kernel ring/debugcon and userspace stderr
   -> logs/debugcon.log or --debugcon stdio

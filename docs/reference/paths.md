@@ -9,7 +9,7 @@
 | Path | Meaning |
 | --- | --- |
 | `Cargo.toml` | Workspace manifest. |
-| `config/logging.toml` | Shared logging policy. |
+| `config/rustos.toml` | Shared RustOS operational config, including logging and kernel build knobs. |
 | `boot/` | Boot protocol crate shared by the GRUB-loaded nucleus. |
 | `kernel/` | Kernel entry and subsystem crates. |
 | `services/` | Userspace system services. |
@@ -46,7 +46,7 @@
 | Path | Meaning |
 | --- | --- |
 | `Cargo.toml` | workspace manifest |
-| `config/logging.toml` | shared logging policy |
+| `config/rustos.toml` | logging과 kernel build knob을 포함한 RustOS operational config |
 | `boot/` | GRUB이 로드하는 nucleus와 공유하는 boot protocol crate |
 | `kernel/` | kernel entry와 subsystem crate |
 | `services/` | userspace system service |

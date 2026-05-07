@@ -16,22 +16,6 @@
       "preLaunchTask": "Build OS",
       "command": "exec cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file",
       "cwd": "${workspaceFolder}"
-    },
-    {
-      "name": "KVM (no opt)",
-      "type": "node-terminal",
-      "request": "launch",
-      "preLaunchTask": "Build OS (no opt)",
-      "command": "exec cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file --qemu-log int",
-      "cwd": "${workspaceFolder}"
-    },
-    {
-      "name": "G14",
-      "type": "node-terminal",
-      "request": "launch",
-      "preLaunchTask": "Build OS",
-      "command": "exec cargo xtask run --profile g14 --usb-input --debugcon file",
-      "cwd": "${workspaceFolder}"
     }
   ]
 }

@@ -27,6 +27,7 @@ const EMERGENCY_PADDING_X: i32 = 12;
 const EMERGENCY_PADDING_Y: i32 = 12;
 const EMERGENCY_LINE_CAPACITY: usize = 240;
 const EMERGENCY_HISTORY_CAPACITY: usize = 256;
+const EMERGENCY_CONSOLE_ENABLED: bool = false;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GuiDisplayInfo {
@@ -346,7 +347,7 @@ const fn emergency_console_live_output_enabled() -> bool {
 }
 
 const fn emergency_console_output_enabled() -> bool {
-    nucleus_core::settings::EMERGENCY_CONSOLE_ENABLED
+    EMERGENCY_CONSOLE_ENABLED
 }
 
 #[allow(dead_code)]

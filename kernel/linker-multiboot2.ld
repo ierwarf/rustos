@@ -15,6 +15,7 @@ SECTIONS
 
   .text : ALIGN(8)
   {
+    KEEP(*(.multiboot2.header))
     KEEP(*(.text._start))
     *(.text .text.*)
   } :text

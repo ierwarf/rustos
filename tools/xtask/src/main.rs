@@ -7,7 +7,7 @@ mod qemu;
 mod stage;
 mod util;
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+type Result<T> = anyhow::Result<T>;
 
 fn main() {
     if let Err(err) = cli::run() {

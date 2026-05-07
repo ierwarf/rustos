@@ -41,7 +41,7 @@ Modify kernel API:
 Modify logging:
 
 1. Read `docs/logging.md` and `docs/ai/contracts.md`.
-2. Update `config/logging.toml`.
+2. Update `config/rustos.toml` `[logging]`.
 3. If adding category, update `libs/rustos-observability/src/lib.rs`, `tools/build_log_cfg.rs`, human logging docs, and AI contracts.
 4. Rebuild affected crates; prefer `cargo xtask build` for kernel logging.
 

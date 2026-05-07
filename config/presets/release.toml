@@ -1,0 +1,43 @@
+[logging]
+enabled = false
+boot_trace_enabled = false
+serial_mirror = false
+ring_buffer_bytes = 16384
+min_level = "info"
+
+[logging.categories]
+boot = "info"
+panic = "fatal"
+memory = "info"
+sched = "info"
+syscall = "off"
+process = "info"
+driver = "info"
+storage = "info"
+usb = "info"
+input = "info"
+display = "info"
+vfs = "info"
+console = "info"
+service = "info"
+compat = "info"
+debug = "info"
+heartbeat = "info"
+
+[kernel.build]
+# Hardened/release-oriented kernel build knobs. Copy this block, or this whole
+# file, into config/rustos.toml when testing a release-shaped image.
+
+codegen_units = 1
+opt_level = "2"
+overflow_checks = true
+debug_assertions = false
+lto = "thin"
+force_frame_pointers = true
+incremental = false
+debuginfo = "1"
+embed_bitcode = true
+panic = "abort"
+relocation_model = "none"
+strip = "none"
+extra_rustflags = []

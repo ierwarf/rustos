@@ -1,4 +1,5 @@
-use std::fs;
+use anyhow::{Context, anyhow, bail};
+use fs_err as fs;
 use std::path::{Path, PathBuf};
 
 use toml::Value;
@@ -47,14 +48,14 @@ pub(crate) fn validate_workspace_layering(root_dir: &Path) -> Result<()> {
 
         let text = fs::read_to_string(&manifest)?;
         let doc: Value = toml::from_str(&text).map_err(|err| {
-            format!(
+            anyhow!(
                 "failed to parse cargo manifest {}: {err}",
                 manifest.display()
             )
         })?;
         let manifest_dir = manifest
             .parent()
-            .ok_or_else(|| format!("cargo manifest has no parent: {}", manifest.display()))?;
+            .with_context(|| format!("cargo manifest has no parent: {}", manifest.display()))?;
 
         let mut deps = Vec::new();
         collect_path_dependencies(&doc, manifest_dir, &mut deps);
@@ -77,11 +78,10 @@ pub(crate) fn validate_workspace_layering(root_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    Err(format!(
+    Err(anyhow!(
         "workspace layering check failed:\n{}",
         violations.join("\n")
-    )
-    .into())
+    ))
 }
 
 fn is_validated_owner(owner: LayerOwner) -> bool {
@@ -386,26 +386,22 @@ fn dependency_allowed(owner: LayerOwner, dep_owner: LayerOwner) -> bool {
 
 fn validate_kernel_source_boundaries(root_dir: &Path) -> Result<()> {
     if root_dir.join("core").exists() {
-        return Err("top-level core/ must be removed after kernel directory rebase".into());
+        bail!("top-level core/ must be removed after kernel directory rebase");
     }
     if root_dir.join("kernel/src/lib.rs").exists() {
-        return Err("kernel/src/lib.rs must be removed after nucleus bin split".into());
+        bail!("kernel/src/lib.rs must be removed after nucleus bin split");
     }
     if root_dir.join("kernel/src/system.rs").exists() {
-        return Err("kernel/src/system.rs must be removed after executive split".into());
+        bail!("kernel/src/system.rs must be removed after executive split");
     }
     if root_dir.join("kernel/src/kernel_host/mod.rs").exists() {
-        return Err(
-            "kernel/src/kernel_host must be removed after single-kernel reunification".into(),
-        );
+        bail!("kernel/src/kernel_host must be removed after single-kernel reunification");
     }
     if root_dir.join("kernel/hosts").exists() {
-        return Err("kernel/hosts must be removed after single-kernel reunification".into());
+        bail!("kernel/hosts must be removed after single-kernel reunification");
     }
     if root_dir.join("core/kernel-host-runtime").exists() {
-        return Err(
-            "core/kernel-host-runtime must be removed after single-kernel reunification".into(),
-        );
+        bail!("core/kernel-host-runtime must be removed after single-kernel reunification");
     }
     for shim in [
         "kernel/src/hal_api.rs",
@@ -417,27 +413,25 @@ fn validate_kernel_source_boundaries(root_dir: &Path) -> Result<()> {
         "kernel/src/compat_api.rs",
     ] {
         if root_dir.join(shim).exists() {
-            return Err(
-                format!("{shim} must be removed once kernel uses manager crates directly").into(),
-            );
+            bail!("{shim} must be removed once kernel uses manager crates directly");
         }
     }
     if root_dir.join("kernel/base").exists() {
-        return Err("kernel/base must be removed after ownership distribution".into());
+        bail!("kernel/base must be removed after ownership distribution");
     }
 
     let main_rs = fs::read_to_string(root_dir.join("kernel/src/main.rs"))?;
     if main_rs.contains("nucleus::") {
-        return Err("kernel/src/main.rs must not depend on the nucleus library facade".into());
+        bail!("kernel/src/main.rs must not depend on the nucleus library facade");
     }
     if main_rs.contains("kernel_host::") || main_rs.contains("crate::kernel_host") {
-        return Err("kernel/src/main.rs must not reference kernel_host runtime glue".into());
+        bail!("kernel/src/main.rs must not reference kernel_host runtime glue");
     }
     if main_rs.contains("system::bootstrap_kernel_hosts")
         || main_rs.contains("system::finalize_kernel_initialization")
         || main_rs.contains("system::run_nucleus_loop")
     {
-        return Err("kernel/src/main.rs must enter via executive boot facade".into());
+        bail!("kernel/src/main.rs must enter via executive boot facade");
     }
 
     let kernel_src_entries =
@@ -451,22 +445,21 @@ fn validate_kernel_source_boundaries(root_dir: &Path) -> Result<()> {
         })
         .collect::<Vec<_>>();
     if !unexpected_kernel_src.is_empty() {
-        return Err(format!(
+        bail!(
             "kernel/src must be entry-only; unexpected paths remain: {}",
             unexpected_kernel_src.join(", ")
-        )
-        .into());
+        );
     }
 
     let executive_lib = fs::read_to_string(root_dir.join("kernel/executive/src/lib.rs"))?;
     if executive_lib.contains("kernel_host::") || executive_lib.contains("crate::kernel_host") {
-        return Err("kernel executive must not reference kernel_host runtime glue".into());
+        bail!("kernel executive must not reference kernel_host runtime glue");
     }
     if executive_lib.contains("bootstrap_kernel_hosts")
         || executive_lib.contains("validate_named_host_barrier")
         || executive_lib.contains("load_staged_hosts")
     {
-        return Err("kernel executive must not include host bootstrap flow".into());
+        bail!("kernel executive must not include host bootstrap flow");
     }
     assert_source_not_contains_any(
         &executive_lib,
@@ -623,7 +616,7 @@ fn validate_kernel_source_boundaries(root_dir: &Path) -> Result<()> {
         ],
     )?;
     if handles_rs.lines().count() > 250 {
-        return Err("kernel compat handles.rs remains too large after object split".into());
+        bail!("kernel compat handles.rs remains too large after object split");
     }
 
     let compat_abi = fs::read_to_string(root_dir.join("kernel/compat/src/user/abi.rs"))?;
@@ -636,13 +629,6 @@ fn validate_kernel_source_boundaries(root_dir: &Path) -> Result<()> {
             concat!("kernel_base", "::user_abi::UserAbi"),
             "crate::user_abi::UserAbi",
         ],
-    )?;
-
-    let kernel_vm = fs::read_to_string(root_dir.join("kernel/mm/src/memory/kernel_vm.rs"))?;
-    assert_source_not_contains_any(
-        &kernel_vm,
-        "kernel/mm/src/memory/kernel_vm.rs",
-        &["crate::settings::", concat!("kernel_base", "::settings::")],
     )?;
 
     for shared_util_file in [
@@ -664,13 +650,6 @@ fn validate_kernel_source_boundaries(root_dir: &Path) -> Result<()> {
             ],
         )?;
     }
-
-    let io_gui = fs::read_to_string(root_dir.join("kernel/io-manager/src/io/gui.rs"))?;
-    assert_source_not_contains_any(
-        &io_gui,
-        "kernel/io-manager/src/io/gui.rs",
-        &["crate::settings::", concat!("kernel_base", "::settings::")],
-    )?;
 
     for api_file in [
         "kernel/hal/src/api.rs",
@@ -716,7 +695,7 @@ fn validate_kernel_source_boundaries(root_dir: &Path) -> Result<()> {
     ] {
         let source = fs::read_to_string(root_dir.join(manager))?;
         if source.contains("pub use nucleus::") {
-            return Err(format!("{manager} still re-exports the nucleus crate facade").into());
+            bail!("{manager} still re-exports the nucleus crate facade");
         }
     }
 
@@ -760,12 +739,12 @@ fn validate_kernel_source_boundaries(root_dir: &Path) -> Result<()> {
     if workspace_cargo.contains("core/kernel-host-runtime")
         || workspace_cargo.contains("kernel/hosts/")
     {
-        return Err("workspace must not include kernel host crates or kernel-host-runtime".into());
+        bail!("workspace must not include kernel host crates or kernel-host-runtime");
     }
 
     let kernel_cargo = fs::read_to_string(root_dir.join("kernel/Cargo.toml"))?;
     if kernel_cargo.contains("kernel-base =") {
-        return Err("kernel/Cargo.toml must not depend on kernel-base".into());
+        bail!("kernel/Cargo.toml must not depend on kernel-base");
     }
 
     Ok(())
@@ -775,9 +754,7 @@ fn assert_max_lines(root_dir: &Path, relative_path: &str, max_lines: usize) -> R
     let source = fs::read_to_string(root_dir.join(relative_path))?;
     let line_count = source.lines().count();
     if line_count > max_lines {
-        return Err(
-            format!("{relative_path} exceeds size gate: {line_count} > {max_lines}").into(),
-        );
+        bail!("{relative_path} exceeds size gate: {line_count} > {max_lines}");
     }
     Ok(())
 }
@@ -789,10 +766,9 @@ fn assert_source_not_contains_any(
 ) -> Result<()> {
     for pattern in patterns {
         if source.contains(pattern) {
-            return Err(format!(
+            bail!(
                 "{relative_path} must use manager facade APIs instead of direct reference `{pattern}`"
-            )
-            .into());
+            );
         }
     }
     Ok(())
@@ -820,10 +796,7 @@ fn assert_no_cross_crate_path_imports(dir: &Path, root_dir: &Path) -> Result<()>
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            return Err(format!(
-                "{relative} must not pull source from another crate via #[path = ...]"
-            )
-            .into());
+            bail!("{relative} must not pull source from another crate via #[path = ...]");
         }
     }
 

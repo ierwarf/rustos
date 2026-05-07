@@ -27,8 +27,6 @@ pub(crate) mod debug {
     pub(crate) use println;
 }
 
-pub use nucleus_core::settings;
-
 #[path = "memory/mod.rs"]
 pub mod memory;
 

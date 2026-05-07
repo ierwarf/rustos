@@ -1,8 +1,10 @@
+use anyhow::{Context, anyhow, bail};
+use fs_err as fs;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use walkdir::{DirEntry, WalkDir};
 
 use crate::Result;
 use crate::config::Config;
@@ -256,10 +258,10 @@ pub(crate) fn load_manifests(root_dir: &Path) -> Result<Vec<PackageManifest>> {
     for manifest_path in manifest_paths {
         let text = fs::read_to_string(&manifest_path)?;
         let mut manifest: PackageManifest = toml::from_str(&text)
-            .map_err(|err| format!("failed to parse {}: {err}", manifest_path.display()))?;
+            .map_err(|err| anyhow!("failed to parse {}: {err}", manifest_path.display()))?;
         manifest.package_root = manifest_path
             .parent()
-            .ok_or_else(|| format!("manifest has no parent: {}", manifest_path.display()))?
+            .with_context(|| format!("manifest has no parent: {}", manifest_path.display()))?
             .to_path_buf();
         manifest.manifest_path = manifest_path;
         manifests.push(manifest);
@@ -298,33 +300,35 @@ pub(crate) fn required_manifest<'a>(
     manifests
         .iter()
         .find(|manifest| manifest.id == id)
-        .ok_or_else(|| format!("missing package manifest: {id}").into())
+        .with_context(|| anyhow!("missing package manifest: {id}"))
 }
 
 fn scan_manifest_paths(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    let mut entries = fs::read_dir(dir)?.collect::<std::result::Result<Vec<_>, _>>()?;
-    entries.sort_by_key(|entry| entry.path());
-
-    for entry in entries {
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-                continue;
-            };
-            if matches!(name, ".git" | "target" | "build") {
-                continue;
-            }
-            scan_manifest_paths(&path, out)?;
-            continue;
-        }
-        if file_type.is_file()
-            && path.file_name().and_then(|value| value.to_str()) == Some(PACKAGE_MANIFEST_NAME)
-        {
-            out.push(path);
-        }
-    }
+    out.extend(
+        WalkDir::new(dir)
+            .into_iter()
+            .filter_entry(|entry| !is_skipped_manifest_scan_dir(entry))
+            .filter_map(|entry| match entry {
+                Ok(entry)
+                    if entry.file_type().is_file()
+                        && entry.file_name().to_str() == Some(PACKAGE_MANIFEST_NAME) =>
+                {
+                    Some(Ok(entry.into_path()))
+                }
+                Ok(_) => None,
+                Err(err) => Some(Err(err)),
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+    );
     Ok(())
+}
+
+fn is_skipped_manifest_scan_dir(entry: &DirEntry) -> bool {
+    entry.file_type().is_dir()
+        && matches!(
+            entry.file_name().to_str(),
+            Some(".git" | "target" | "build")
+        )
 }
 
 fn validate_manifests(manifests: &[PackageManifest]) -> Result<()> {
@@ -334,40 +338,37 @@ fn validate_manifests(manifests: &[PackageManifest]) -> Result<()> {
     for manifest in manifests {
         let execution_domain = manifest.execution_domain();
         if manifest.id.trim().is_empty() {
-            return Err(format!(
+            bail!(
                 "package id is empty in {}",
                 manifest.manifest_path.display()
-            )
-            .into());
+            );
         }
         if !ids.insert(manifest.id.as_str()) {
-            return Err(format!("duplicate package id: {}", manifest.id).into());
+            bail!("duplicate package id: {}", manifest.id);
         }
         if manifest.profiles.is_empty() {
-            return Err(format!(
+            bail!(
                 "package {} has no build profiles in {}",
                 manifest.id,
                 manifest.manifest_path.display()
-            )
-            .into());
+            );
         }
         if manifest.install.path.starts_with('/') || manifest.install.path.is_empty() {
-            return Err(format!(
+            bail!(
                 "package {} has invalid install path {}",
-                manifest.id, manifest.install.path
-            )
-            .into());
+                manifest.id,
+                manifest.install.path
+            );
         }
         if let Some(previous) =
             install_paths.insert(&manifest.install.path, &manifest.manifest_path)
         {
-            return Err(format!(
+            bail!(
                 "install path collision for {} between {} and {}",
                 manifest.install.path,
                 previous.display(),
                 manifest.manifest_path.display()
-            )
-            .into());
+            );
         }
 
         match manifest.build.builder {
@@ -382,61 +383,55 @@ fn validate_manifests(manifests: &[PackageManifest]) -> Result<()> {
                     .unwrap_or_default()
                     .is_empty()
                 {
-                    return Err(format!(
+                    bail!(
                         "package {} missing build.package in {}",
                         manifest.id,
                         manifest.manifest_path.display()
-                    )
-                    .into());
+                    );
                 }
             }
             BuilderKind::CDemo | BuilderKind::MingwCExe => {
                 if manifest.resolved_source_path().is_none() {
-                    return Err(format!(
+                    bail!(
                         "package {} missing build.source in {}",
                         manifest.id,
                         manifest.manifest_path.display()
-                    )
-                    .into());
+                    );
                 }
             }
             BuilderKind::WinsysDllBundle => {
                 if manifest.install.layout != InstallLayout::Directory {
-                    return Err(format!(
+                    bail!(
                         "package {} must use install.layout = \"directory\"",
                         manifest.id
-                    )
-                    .into());
+                    );
                 }
             }
             BuilderKind::ExternalCopy => {
                 if manifest.build.source.is_none() && manifest.build.source_env.is_none() {
-                    return Err(format!(
+                    bail!(
                         "package {} must define build.source or build.source_env",
                         manifest.id
-                    )
-                    .into());
+                    );
                 }
             }
         }
 
         if manifest.autoload.is_some() && !manifest.kind.is_driver() {
-            return Err(format!(
+            bail!(
                 "package {} defines autoload metadata but is not a driver",
                 manifest.id
-            )
-            .into());
+            );
         }
 
         match manifest.kind {
             PackageKind::Boot | PackageKind::Kernel | PackageKind::BridgeDriver
                 if execution_domain != ExecutionDomain::Kernel =>
             {
-                return Err(format!(
+                bail!(
                     "package {} must use execution_domain = \"kernel\"",
                     manifest.id
-                )
-                .into());
+                );
             }
             PackageKind::UserDriver
             | PackageKind::Service
@@ -444,11 +439,10 @@ fn validate_manifests(manifests: &[PackageManifest]) -> Result<()> {
             | PackageKind::Compat
                 if execution_domain != ExecutionDomain::User =>
             {
-                return Err(format!(
+                bail!(
                     "package {} must use execution_domain = \"user\"",
                     manifest.id
-                )
-                .into());
+                );
             }
             _ => {}
         }
@@ -461,11 +455,11 @@ fn validate_manifests(manifests: &[PackageManifest]) -> Result<()> {
             StartupMode::Init | StartupMode::Session | StartupMode::Desktop
         ) && manifest.desktop.entries.is_empty()
         {
-            return Err(format!(
+            bail!(
                 "package {} uses startup mode {:?} but defines no desktop entries",
-                manifest.id, manifest.startup
-            )
-            .into());
+                manifest.id,
+                manifest.startup
+            );
         }
     }
 
@@ -489,21 +483,22 @@ fn validate_profile_runtime_deps(
     for manifest in manifests {
         for dep in &manifest.runtime_deps {
             if dep == &manifest.id {
-                return Err(format!("package {} runtime_deps includes itself", manifest.id).into());
+                bail!("package {} runtime_deps includes itself", manifest.id);
             }
             if !known_ids.contains(dep.as_str()) {
-                return Err(format!(
+                bail!(
                     "package {} runtime_deps includes missing package {}",
-                    manifest.id, dep
-                )
-                .into());
+                    manifest.id,
+                    dep
+                );
             }
             if !active_ids.contains(dep.as_str()) {
-                return Err(format!(
+                bail!(
                     "package {} runtime_deps includes package {} outside profile {}",
-                    manifest.id, dep, profile
-                )
-                .into());
+                    manifest.id,
+                    dep,
+                    profile
+                );
             }
         }
     }
@@ -543,7 +538,7 @@ fn detect_runtime_dep_cycle<'a>(
                 .unwrap_or(0);
             let mut cycle = stack[start..].to_vec();
             cycle.push(id);
-            return Err(format!("runtime_deps cycle detected: {}", cycle.join(" -> ")).into());
+            bail!("runtime_deps cycle detected: {}", cycle.join(" -> "));
         }
         None => {}
     }
@@ -553,7 +548,7 @@ fn detect_runtime_dep_cycle<'a>(
 
     let manifest = manifest_by_id
         .get(id)
-        .ok_or_else(|| format!("runtime dependency graph missing package {id}"))?;
+        .with_context(|| format!("runtime dependency graph missing package {id}"))?;
     for dep in &manifest.runtime_deps {
         detect_runtime_dep_cycle(dep.as_str(), manifest_by_id, state, stack)?;
     }
@@ -580,14 +575,13 @@ fn validate_manifest_location(manifest: &PackageManifest) -> Result<()> {
         return Ok(());
     }
 
-    Err(format!(
+    Err(anyhow!(
         "package {} has kind {:?} but manifest is outside {}: {}",
         manifest.id,
         manifest.kind,
         expected_root,
         manifest.manifest_path.display()
-    )
-    .into())
+    ))
 }
 
 fn validate_install_taxonomy(manifest: &PackageManifest) -> Result<()> {
@@ -596,45 +590,43 @@ fn validate_install_taxonomy(manifest: &PackageManifest) -> Result<()> {
     match manifest.kind {
         PackageKind::BridgeDriver => {
             if !path.starts_with("system/drivers/") || !path.ends_with(".ko") {
-                return Err(format!(
+                bail!(
                     "bridge driver {} must install to system/drivers/*.ko, got {}",
-                    manifest.id, path
-                )
-                .into());
+                    manifest.id,
+                    path
+                );
             }
         }
         PackageKind::UserDriver => {
             if !path.starts_with("drivers/user/") {
-                return Err(format!(
+                bail!(
                     "user driver {} must install under drivers/user/, got {}",
-                    manifest.id, path
-                )
-                .into());
+                    manifest.id,
+                    path
+                );
             }
         }
         PackageKind::Service => {
             if !path.starts_with("services/") {
-                return Err(format!(
+                bail!(
                     "service {} must install under services/, got {}",
-                    manifest.id, path
-                )
-                .into());
+                    manifest.id,
+                    path
+                );
             }
         }
         PackageKind::App => {
             if !path.starts_with("apps/") {
-                return Err(
-                    format!("app {} must install under apps/, got {}", manifest.id, path).into(),
-                );
+                bail!("app {} must install under apps/, got {}", manifest.id, path);
             }
         }
         PackageKind::Compat => {
             if !path.starts_with("compat/") {
-                return Err(format!(
+                bail!(
                     "compat package {} must install under compat/, got {}",
-                    manifest.id, path
-                )
-                .into());
+                    manifest.id,
+                    path
+                );
             }
         }
         PackageKind::Boot | PackageKind::Kernel => {}

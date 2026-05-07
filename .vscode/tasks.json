@@ -36,29 +36,6 @@
         }
       },
       "problemMatcher": []
-    },
-    {
-      "label": "Build OS (no opt)",
-      "type": "process",
-      "command": "cargo",
-      "args": [
-        "xtask",
-        "build"
-      ],
-      "dependsOn": [
-        "Prepare GRUB dev key"
-      ],
-      "dependsOrder": "sequence",
-      "options": {
-        "cwd": "${workspaceFolder}",
-        "env": {
-          "CARGO_PROFILE_RELEASE_OPT_LEVEL": "0",
-          "RUSTOS_GPG_HOME": "${workspaceFolder}/build/dev-grub-gpg",
-          "RUSTOS_GRUB_PUBKEY": "${workspaceFolder}/build/dev-grub.pub",
-          "RUSTOS_GRUB_SIGNING_KEY": "RustOS VSCode Dev <rustos-vscode-dev@example.invalid>"
-        }
-      },
-      "problemMatcher": []
     }
   ]
 }

@@ -1,12 +1,15 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::fs;
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{Result, config::Config};
+use anyhow::{Context, bail};
+use fs_err as fs;
+use walkdir::WalkDir;
+
+use crate::Result;
 
 pub(crate) fn default_root_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -34,72 +37,14 @@ pub(crate) fn split_whitespace_owned(value: &str) -> Vec<String> {
     value.split_whitespace().map(str::to_owned).collect()
 }
 
-pub(crate) fn run_cargo_kernel_rustc(
-    config: &Config,
-    package: &str,
-    rustc_args: &[String],
-) -> Result<()> {
-    let mut command = Command::new(&config.cargo);
-    command
-        .arg("rustc")
-        .arg("--manifest-path")
-        .arg(&config.workspace_manifest);
-    for flag in &config.kernel_cargo_zflags {
-        command.arg(flag);
-    }
-    command
-        .arg("-p")
-        .arg(package)
-        .arg("--bin")
-        .arg(package)
-        .arg("--target")
-        .arg(&config.kernel_target)
-        .arg("--release")
-        .arg("--");
-    for arg in rustc_args {
-        command.arg(arg);
-    }
-    command
-        .env("CARGO_TARGET_DIR", &config.cargo_target_dir)
-        .env("RUSTFLAGS", kernel_rustflags_env());
-    run_command(&mut command)?;
-    Ok(())
-}
-
-pub(crate) fn run_cargo_kernel_check(config: &Config, package: &str) -> Result<()> {
-    let mut command = Command::new(&config.cargo);
-    command
-        .arg("check")
-        .arg("--manifest-path")
-        .arg(&config.workspace_manifest);
-    for flag in &config.kernel_cargo_zflags {
-        command.arg(flag);
-    }
-    command
-        .arg("-p")
-        .arg(package)
-        .arg("--target")
-        .arg(&config.kernel_target)
-        .env("CARGO_TARGET_DIR", &config.cargo_target_dir)
-        .env("RUSTFLAGS", kernel_rustflags_env());
-    run_command(&mut command)?;
-    Ok(())
-}
-
-pub(crate) fn kernel_rustflags_env() -> String {
-    let mut rustflags = env_string("RUSTFLAGS").unwrap_or_default();
-    if !rustflags.is_empty() {
-        rustflags.push(' ');
-    }
-    rustflags.push_str("--cfg rustos_boot_image ");
-    rustflags.push_str("-C no-redzone");
-    rustflags
+pub(crate) fn path_label(path: &Path) -> String {
+    path.display().to_string()
 }
 
 pub(crate) fn copy_with_parent(src: &Path, dst: &Path) -> Result<()> {
     let parent = dst
         .parent()
-        .ok_or_else(|| format!("destination has no parent: {}", dst.display()))?;
+        .with_context(|| format!("destination has no parent: {}", dst.display()))?;
     fs::create_dir_all(parent)?;
     fs::copy(src, dst)?;
     Ok(())
@@ -132,36 +77,19 @@ pub(crate) fn outputs_are_fresh(outputs: &[PathBuf], inputs: &[PathBuf]) -> Resu
     Ok(true)
 }
 
-pub(crate) fn strip_elf_artifact_if_available(path: &Path) -> Result<()> {
-    let Some(strip) = command_in_path("strip").or_else(|| command_in_path("llvm-strip")) else {
-        return Ok(());
-    };
-
-    let mut command = Command::new(strip);
-    command.arg("--strip-unneeded").arg(path);
-    run_command(&mut command)
-}
-
 pub(crate) fn copy_tree_files(src_root: &Path, dst_root: &Path) -> Result<()> {
     if !src_root.is_dir() {
         return Ok(());
     }
 
-    let mut stack = vec![(src_root.to_path_buf(), dst_root.to_path_buf())];
-    while let Some((src_dir, dst_dir)) = stack.pop() {
-        let mut entries = fs::read_dir(&src_dir)?.collect::<std::result::Result<Vec<_>, _>>()?;
-        entries.sort_by_key(|entry| entry.path());
-        for entry in entries.into_iter().rev() {
-            let src_path = entry.path();
-            let dst_path = dst_dir.join(entry.file_name());
-            let file_type = entry.file_type()?;
-            if file_type.is_dir() {
-                stack.push((src_path, dst_path));
-                continue;
-            }
-            if file_type.is_file() {
-                copy_with_parent(&src_path, &dst_path)?;
-            }
+    let mut files = WalkDir::new(src_root)
+        .into_iter()
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    files.sort_by_key(|entry| entry.path().to_owned());
+    for entry in files {
+        if entry.file_type().is_file() {
+            let relative = entry.path().strip_prefix(src_root)?;
+            copy_with_parent(entry.path(), &dst_root.join(relative))?;
         }
     }
 
@@ -180,34 +108,34 @@ pub(crate) fn copy_or_unpack_firmware(
 
     let src_zst = firmware_dir.join(format!("{basename}.zst"));
     if !src_zst.is_file() {
-        return Err(format!("missing AMDGPU firmware blob: {}(.zst)", src_bin.display()).into());
+        bail!("missing AMDGPU firmware blob: {}(.zst)", src_bin.display());
     }
 
     let parent = dst
         .parent()
-        .ok_or_else(|| format!("firmware destination has no parent: {}", dst.display()))?;
+        .with_context(|| format!("firmware destination has no parent: {}", dst.display()))?;
     fs::create_dir_all(parent)?;
 
     let unpacker = command_in_path("zstd")
         .map(|_| OsString::from("zstd"))
         .or_else(|| command_in_path("zstdcat").map(|_| OsString::from("zstdcat")))
-        .ok_or_else(|| format!("missing zstd/zstdcat to unpack {}", src_zst.display()))?;
+        .with_context(|| format!("missing zstd/zstdcat to unpack {}", src_zst.display()))?;
 
     let status = if unpacker == OsStr::new("zstd") {
         Command::new(&unpacker)
             .arg("-dc")
             .arg(&src_zst)
-            .stdout(fs::File::create(dst)?)
+            .stdout(File::create(dst)?)
             .status()?
     } else {
         Command::new(&unpacker)
             .arg(&src_zst)
-            .stdout(fs::File::create(dst)?)
+            .stdout(File::create(dst)?)
             .status()?
     };
 
     if !status.success() {
-        return Err(format!("failed to unpack {}", src_zst.display()).into());
+        bail!("failed to unpack {}", src_zst.display());
     }
 
     Ok(())
@@ -253,29 +181,7 @@ pub(crate) fn read_trimmed(path: impl AsRef<Path>) -> Result<String> {
 }
 
 pub(crate) fn create_temp_dir(prefix: &str) -> Result<PathBuf> {
-    let base = env::temp_dir();
-    for attempt in 0..64u32 {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let candidate = base.join(format!(
-            "{prefix}.{}.{}.{}",
-            std::process::id(),
-            nanos,
-            attempt
-        ));
-        match fs::create_dir(&candidate) {
-            Ok(()) => return Ok(candidate),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(err.into()),
-        }
-    }
-    Err(format!(
-        "failed to create temporary directory under {}",
-        base.display()
-    )
-    .into())
+    Ok(tempfile::Builder::new().prefix(prefix).tempdir()?.keep())
 }
 
 pub(crate) fn run_command(command: &mut Command) -> Result<()> {
@@ -292,9 +198,9 @@ pub(crate) fn run_command(command: &mut Command) -> Result<()> {
     if !stderr.is_empty() {
         eprint!("{stderr}");
     }
-    Err(format!(
+    bail!(
         "command failed with status {}: {:?}",
-        output.status, command
+        output.status,
+        command
     )
-    .into())
 }

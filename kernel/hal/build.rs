@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::PathBuf;
 
 mod shared {
@@ -6,12 +5,13 @@ mod shared {
 }
 
 fn main() {
-    let logging_path = PathBuf::from("../../config/logging.toml");
+    let logging_path = PathBuf::from("../../config/rustos.toml");
     let log_cfg_path = PathBuf::from("../../tools/build_log_cfg.rs");
-    println!("cargo:rerun-if-changed={}", logging_path.display());
+    shared::emit_project_config_rerun(&logging_path);
     println!("cargo:rerun-if-changed={}", log_cfg_path.display());
 
-    let logging = fs::read_to_string(&logging_path).expect("failed to read shared logging config");
+    let logging =
+        shared::read_project_config(&logging_path).expect("failed to read shared RustOS config");
     shared::emit_log_cfgs(&logging);
     shared::emit_boot_trace_cfg(&logging);
 }

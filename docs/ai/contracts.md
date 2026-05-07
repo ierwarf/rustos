@@ -57,6 +57,29 @@ Kernel API:
 - Cross-crate rule: import `kernel_x::api as x_api`; do not reach into another crate's private modules when `api.rs` exposes a wrapper.
 - User-memory IO APIs belong in syscall/process-context-aware paths only.
 
+Kernel build:
+
+- Kernel-target Cargo invocations route through
+  `tools/xtask/src/build/cargo.rs::kernel_rustflags_env`.
+- RustOS operational config lives in `config/rustos.toml`.
+- Kernel build-shape defaults live under `[kernel.build]`; set
+  `KERNEL_BUILD_CONFIG` to test an alternate TOML file.
+- Default kernel `RUSTFLAGS`: `--cfg rustos_boot_image`, `-C no-redzone`,
+  `-C codegen-units=1`, `-C opt-level=2`, `-C overflow-checks=true`,
+  `-C debug-assertions=false`, `-C debuginfo=0`, `-C panic=abort`.
+- `RUSTOS_KERNEL_CODEGEN_UNITS` overrides the kernel codegen unit count for
+  experiments without changing userspace builds. `KERNEL_CODEGEN_UNITS` remains
+  a deprecated alias. The supported sweep range is `1..=256`.
+- Kernel build-shape knobs also include `lto`, `force_frame_pointers`,
+  `incremental`, `debuginfo`, `embed_bitcode`, `panic`, `relocation_model`,
+  `strip`, and `extra_rustflags`. `incremental` is applied as
+  `CARGO_INCREMENTAL` on kernel Cargo invocations.
+- Kernel Cargo invocations disable a configured `sccache` rustc wrapper because
+  kernel build-std/LTO flag probes are not accepted by sccache.
+- `embed_bitcode=true` is required whenever `lto` is `thin` or `fat`.
+- `cargo xtask config check` validates effective config; `cargo xtask config
+  show` prints the effective kernel build config.
+
 Linux network driver compat:
 
 - Linux `.ko` relocated calls into RustOS must go through the compat export ABI
@@ -78,7 +101,7 @@ Linux network driver compat:
 
 Logging:
 
-- Policy file: `config/logging.toml`.
+- Policy file: `config/rustos.toml` `[logging]`.
 - Parser/cfg emitter: `tools/build_log_cfg.rs`.
 - Canonical categories: `libs/rustos-observability/src/lib.rs`.
 - Config is mostly build-time cfg; rebuild after changes.

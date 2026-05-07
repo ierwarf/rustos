@@ -43,14 +43,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         .and_then(Path::parent)
         .ok_or("failed to resolve repo root from CARGO_MANIFEST_DIR")?;
     let fonts_dir = repo_root.join("assets/ui/fonts");
-    let logging_path = repo_root.join("config/logging.toml");
+    let logging_path = repo_root.join("config/rustos.toml");
     let log_cfg_path = repo_root.join("tools/build_log_cfg.rs");
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
     let out_path = out_dir.join("generated_fonts.rs");
 
-    println!("cargo:rerun-if-changed={}", logging_path.display());
+    shared::emit_project_config_rerun(&logging_path);
     println!("cargo:rerun-if-changed={}", log_cfg_path.display());
-    let logging = fs::read_to_string(&logging_path)?;
+    let logging = shared::read_project_config(&logging_path)?;
     shared::emit_log_cfgs(&logging);
 
     let specs = [

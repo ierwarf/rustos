@@ -17,7 +17,7 @@ Core entrypoints:
 - Package schema: `tools/xtask/src/package_manifest.rs`
 - Runtime client/protocol: `libs/runtime-control/src/lib.rs`
 - Logging config parser/cfg: `tools/build_log_cfg.rs`
-- Logging policy: `config/logging.toml`
+- Logging policy: `config/rustos.toml` `[logging]`
 - Kernel API surfaces: `kernel/*/src/api.rs`
 - Kernel boot entry: `kernel/src/main.rs`
 - Kernel orchestration: `kernel/executive/src/lib.rs`, `kernel/executive/src/boot.rs`

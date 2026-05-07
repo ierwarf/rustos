@@ -1,4 +1,4 @@
-    .section .text
+    .section .multiboot2.header, "a"
     .balign 8
     .globl rustos_multiboot2_header
 rustos_multiboot2_header:

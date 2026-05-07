@@ -1,10 +1,12 @@
-use std::fs;
+use anyhow::{Context, anyhow, bail};
+use fs_err as fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use fatfs::Seek as FatSeek;
 use fatfs::Write as FatWrite;
+use walkdir::WalkDir;
 
 use crate::Result;
 use crate::config::Config;
@@ -98,12 +100,11 @@ fn stage_manifest(config: &Config, manifest: &PackageManifest) -> Result<()> {
         return Ok(());
     }
 
-    Err(format!(
+    Err(anyhow!(
         "missing staged artifact for package {} at {}",
         manifest.id,
         artifact.display()
-    )
-    .into())
+    ))
 }
 
 fn stage_directory_manifest(src_root: &Path, dst_root: &Path) -> Result<()> {
@@ -119,10 +120,35 @@ fn stage_boot_manager(config: &Config) -> Result<()> {
 }
 
 fn stage_nucleus_signature(config: &Config) -> Result<()> {
+    let nucleus = config.artifact_nucleus_elf_path();
     let signature = config.artifact_nucleus_signature_path();
-    if signature.is_file() {
-        copy_with_parent(&signature, &config.image_dir.join("nucleus.elf.sig"))?;
+    if !nucleus.is_file() {
+        return Ok(());
     }
+
+    if !signature.is_file() {
+        bail!(
+            "missing nucleus signature for {}; run cargo xtask build-efi or set RUSTOS_GRUB_SIGNING_KEY before cargo xtask build-kernel",
+            nucleus.display()
+        );
+    }
+
+    ensure_signature_is_fresh(&nucleus, &signature)?;
+    copy_with_parent(&signature, &config.image_dir.join("nucleus.elf.sig"))?;
+    Ok(())
+}
+
+fn ensure_signature_is_fresh(input: &Path, signature: &Path) -> Result<()> {
+    let input_modified = fs::metadata(input)?.modified()?;
+    let signature_modified = fs::metadata(signature)?.modified()?;
+    if signature_modified < input_modified {
+        bail!(
+            "stale nucleus signature: {} is older than {}; run cargo xtask build-kernel or cargo xtask build-efi",
+            signature.display(),
+            input.display()
+        );
+    }
+
     Ok(())
 }
 
@@ -132,7 +158,7 @@ fn write_boot_disk_image(config: &Config) -> Result<()> {
         .iter()
         .map(|file| file.len)
         .try_fold(0_u64, |acc, len| {
-            acc.checked_add(len).ok_or("image payload is too large")
+            acc.checked_add(len).context("image payload is too large")
         })?;
     let image_bytes = boot_disk_image_len(payload_bytes);
     if let Some(parent) = config.boot_disk_image.parent() {
@@ -178,35 +204,31 @@ struct ImageFile {
 }
 
 fn collect_image_files(image_dir: &Path) -> Result<Vec<ImageFile>> {
-    let mut files = Vec::new();
-    let mut stack = vec![image_dir.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let mut entries = fs::read_dir(&dir)?.collect::<std::result::Result<Vec<_>, _>>()?;
-        entries.sort_by_key(|entry| entry.path());
-        for entry in entries.into_iter().rev() {
-            let path = entry.path();
-            let file_type = entry.file_type()?;
-            if file_type.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            if !file_type.is_file() {
-                continue;
-            }
+    let mut files = WalkDir::new(image_dir)
+        .into_iter()
+        .filter_map(|entry| match entry {
+            Ok(entry) if entry.file_type().is_file() => Some(Ok(entry)),
+            Ok(_) => None,
+            Err(err) => Some(Err(err)),
+        })
+        .map(|entry| {
+            let path = entry?.into_path();
             let relative = path
                 .strip_prefix(image_dir)?
                 .components()
                 .map(|component| component.as_os_str().to_string_lossy())
                 .collect::<Vec<_>>()
                 .join("/");
-            let len = entry.metadata()?.len();
-            files.push(ImageFile {
+            let len = fs::metadata(&path)
+                .map_err(|err| anyhow!("failed to stat image file {}: {err}", path.display()))?
+                .len();
+            Ok(ImageFile {
                 source: path,
                 relative,
                 len,
-            });
-        }
-    }
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     files.sort_by(|lhs, rhs| lhs.relative.cmp(&rhs.relative));
     Ok(files)
 }
@@ -223,7 +245,7 @@ fn ensure_fat_parent_dirs<D: fatfs::ReadWriteSeek>(
     path: &str,
 ) -> Result<()>
 where
-    D::Error: std::error::Error + 'static,
+    D::Error: std::error::Error + Send + Sync + 'static,
 {
     let Some((parent, _file_name)) = path.rsplit_once('/') else {
         return Ok(());
@@ -250,7 +272,7 @@ fn copy_host_file_to_fat<D: fatfs::ReadWriteSeek>(
     dst: &mut fatfs::File<'_, D, fatfs::DefaultTimeProvider, fatfs::LossyOemCpConverter>,
 ) -> Result<()>
 where
-    D::Error: std::error::Error + 'static,
+    D::Error: std::error::Error + Send + Sync + 'static,
 {
     let mut src = fs::File::open(src)?;
     let mut buf = [0_u8; 64 * 1024];
@@ -549,7 +571,7 @@ fn desktop_autostart_enabled(config: &Config, desktop_file_id: &str) -> Result<b
 
 fn desktop_value(value: &str) -> Result<String> {
     if value.contains('\n') || value.contains('\r') {
-        return Err(format!("desktop value contains unsupported newline: {value:?}").into());
+        bail!("desktop value contains unsupported newline: {value:?}");
     }
     Ok(value.to_owned())
 }
@@ -561,7 +583,7 @@ fn write_startup_registry(config: &Config, manifests: &[PackageManifest]) -> Res
         {
             continue;
         }
-        let entry = manifest.desktop.entries.first().ok_or_else(|| {
+        let entry = manifest.desktop.entries.first().with_context(|| {
             format!(
                 "package {} has startup mode but no desktop entries",
                 manifest.id
@@ -616,7 +638,7 @@ fn write_windows_dll_registry(config: &Config, manifests: &[PackageManifest]) ->
             let name = entry
                 .file_name()
                 .into_string()
-                .map_err(|_| format!("non-utf8 DLL name in {}", artifact_dir.display()))?;
+                .map_err(|_| anyhow!("non-utf8 DLL name in {}", artifact_dir.display()))?;
             lines.push(path_join_unix(&manifest.install.path, Path::new(&name))?);
         }
     }
@@ -626,7 +648,7 @@ fn write_windows_dll_registry(config: &Config, manifests: &[PackageManifest]) ->
 fn write_registry_lines(path: PathBuf, lines: &[String]) -> Result<()> {
     let parent = path
         .parent()
-        .ok_or_else(|| format!("registry destination has no parent: {}", path.display()))?;
+        .with_context(|| format!("registry destination has no parent: {}", path.display()))?;
     fs::create_dir_all(parent)?;
     let mut content = String::new();
     for line in lines {
@@ -639,7 +661,7 @@ fn write_registry_lines(path: PathBuf, lines: &[String]) -> Result<()> {
 
 fn registry_value(value: &str) -> Result<String> {
     if value.contains('\n') || value.contains('\r') || value.contains('\t') {
-        return Err(format!("registry value contains unsupported whitespace: {value:?}").into());
+        bail!("registry value contains unsupported whitespace: {value:?}");
     }
     Ok(value.to_owned())
 }
@@ -659,7 +681,7 @@ fn registry_list(values: &[String]) -> Result<String> {
 fn path_join_unix(prefix: &str, suffix: &Path) -> Result<String> {
     let suffix = suffix
         .to_str()
-        .ok_or_else(|| format!("non-utf8 relative path: {}", suffix.display()))?
+        .with_context(|| format!("non-utf8 relative path: {}", suffix.display()))?
         .replace('\\', "/");
     Ok(format!("{prefix}/{suffix}"))
 }
@@ -693,11 +715,10 @@ fn generate_dynamic_linker_cache(image_dir: &Path) -> Result<()> {
     }
 
     let Some(ldconfig) = command_in_path("ldconfig") else {
-        return Err(format!(
+        bail!(
             "missing ldconfig required to generate dynamic linker cache from {}",
             ld_so_conf.display()
-        )
-        .into());
+        );
     };
 
     run_command(Command::new(ldconfig).arg("-r").arg(image_dir))
