@@ -252,29 +252,29 @@ impl GameState {
         let Some(buffer) = self.buffers.get_mut(buffer_index) else {
             return;
         };
-        buffer.clear(0xFF0A0F16);
-        buffer.fill_rect(0, 0, WIDTH as i32, HUD_HEIGHT as i32, 0xFF101B2A);
-        buffer.fill_rect(0, HUD_HEIGHT as i32 - 1, WIDTH as i32, 1, 0xFF37506A);
+        buffer.clear(0xFF081F38);
+        buffer.fill_rect(0, 0, WIDTH as i32, HUD_HEIGHT as i32, 0xFF0E3A64);
+        buffer.fill_rect(0, HUD_HEIGHT as i32 - 1, WIDTH as i32, 1, 0xFF5EA8D3);
 
         let progress_w = ((WIDTH - 32) * score.min(TARGET_GOAL)) / TARGET_GOAL;
-        buffer.fill_rect(16, 16, (WIDTH - 32) as i32, 12, 0xFF1A2737);
-        buffer.fill_rect(16, 16, progress_w as i32, 12, 0xFF66D4FF);
-        buffer.fill_rect(16, 36, (WIDTH - 32) as i32, 6, 0xFF122030);
+        buffer.fill_rect(16, 16, (WIDTH - 32) as i32, 12, 0xFF174D78);
+        buffer.fill_rect(16, 16, progress_w as i32, 12, 0xFF75D9FF);
+        buffer.fill_rect(16, 36, (WIDTH - 32) as i32, 6, 0xFF103657);
         buffer.fill_rect(
             16,
             36,
             ((WIDTH - 32) * streak.min(10) / 10) as i32,
             6,
-            0xFF7CF29E,
+            0xFFB8ECFF,
         );
 
         if won {
             for stripe in 0..12 {
                 let y = HUD_HEIGHT as i32 + stripe * 32;
                 let color = if stripe % 2 == 0 {
-                    0xFF102538
+                    0xFF0F3E67
                 } else {
-                    0xFF0D1E2D
+                    0xFF0A2C4D
                 };
                 buffer.fill_rect(0, y, WIDTH as i32, 18, color);
             }
@@ -311,9 +311,9 @@ fn draw_target(
 ) {
     let outer = if cleared { 44 } else { target_radius };
     let inner = if cleared { 18 } else { target_radius / 2 };
-    let glow = if cleared { 0xFF7CF29E } else { 0xFF69D5FF };
-    let core = if cleared { 0xFFE9FFF2 } else { 0xFFEAF8FF };
-    buffer.fill_circle(target_x, target_y, outer + 10, 0x33163D56);
+    let glow = if cleared { 0xFFB8ECFF } else { 0xFF69D5FF };
+    let core = if cleared { 0xFFF3FBFF } else { 0xFFEAF8FF };
+    buffer.fill_circle(target_x, target_y, outer + 10, 0x332E82B4);
     buffer.fill_circle(target_x, target_y, outer, glow);
     buffer.fill_circle(target_x, target_y, inner, core);
     buffer.fill_rect(
@@ -321,14 +321,14 @@ fn draw_target(
         target_y,
         outer * 2 + 25,
         1,
-        0xFF0B1724,
+        0xFF08233C,
     );
     buffer.fill_rect(
         target_x,
         target_y - outer - 12,
         1,
         outer * 2 + 25,
-        0xFF0B1724,
+        0xFF08233C,
     );
 }
 

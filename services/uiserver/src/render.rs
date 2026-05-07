@@ -4,24 +4,24 @@ use crate::font::{self, TextStyle};
 use crate::sys::ConsoleSessionHandle;
 use crate::wayland::WaylandWindowSnapshot;
 
-const COLOR_BOOT_BG_BASE: u32 = 0x000f_141b;
-const COLOR_DESKTOP_BG_BASE: u32 = 0x0011_171f;
-const COLOR_DESKTOP_BAND: u32 = 0x0017_202b;
-const COLOR_GRID: u32 = 0x0022_2c35;
-const COLOR_GRID_MAJOR: u32 = 0x0032_424d;
-const COLOR_PANEL_GLASS: u32 = 0x0015_2027;
-const COLOR_PANEL_INNER: u32 = 0x001b_2931;
-const COLOR_PANEL_ELEVATED: u32 = 0x0021_323a;
-const COLOR_ACCENT_FOCUS: u32 = 0x0047_d6b2;
-const COLOR_ACCENT_SOFT: u32 = 0x0098_e6d3;
-const COLOR_ACCENT_WARM: u32 = 0x00f2_b84b;
-const COLOR_BORDER_IDLE: u32 = 0x0040_555d;
-const COLOR_BORDER_FOCUS: u32 = 0x0047_d6b2;
-const COLOR_TEXT_PRIMARY: u32 = 0x00f5_f7f4;
-const COLOR_TEXT_DIM: u32 = 0x00a9_b9b7;
+const COLOR_BOOT_BG_BASE: u32 = 0x0008_1f38;
+const COLOR_DESKTOP_BG_BASE: u32 = 0x000b_2746;
+const COLOR_DESKTOP_BAND: u32 = 0x0015_4a7d;
+const COLOR_GRID: u32 = 0x0036_6f9e;
+const COLOR_GRID_MAJOR: u32 = 0x0051_96ca;
+const COLOR_PANEL_GLASS: u32 = 0x001e_5f8b;
+const COLOR_PANEL_INNER: u32 = 0x0011_3f68;
+const COLOR_PANEL_ELEVATED: u32 = 0x0028_77aa;
+const COLOR_ACCENT_FOCUS: u32 = 0x0075_d9ff;
+const COLOR_ACCENT_SOFT: u32 = 0x00b8_ecff;
+const COLOR_ACCENT_WARM: u32 = 0x008f_ddff;
+const COLOR_BORDER_IDLE: u32 = 0x004f_86ad;
+const COLOR_BORDER_FOCUS: u32 = 0x009a_e5ff;
+const COLOR_TEXT_PRIMARY: u32 = 0x00f4_fbff;
+const COLOR_TEXT_DIM: u32 = 0x00b7_d8ec;
 const COLOR_SHADOW: u32 = 0x0000_0000;
-const COLOR_CLIENT_BACKDROP: u32 = 0x0012_181f;
-const COLOR_CLIENT_DIVIDER: u32 = 0x0033_444b;
+const COLOR_CLIENT_BACKDROP: u32 = 0x0009_1d34;
+const COLOR_CLIENT_DIVIDER: u32 = 0x0044_789d;
 
 const TOPBAR_MARGIN_TOP: usize = 16;
 const TOPBAR_RAIL_HEIGHT: usize = 40;
@@ -46,9 +46,9 @@ const WINDOW_SHADOW_STEPS: usize = 6;
 const WINDOW_BUTTON_SIZE: usize = 18;
 const WINDOW_BUTTON_GAP: usize = 8;
 const WINDOW_BUTTON_MARGIN_RIGHT: usize = 12;
-const COLOR_BUTTON_IDLE: u32 = 0x0021_3142;
-const COLOR_BUTTON_MINIMIZE: u32 = 0x00f0_c44a;
-const COLOR_BUTTON_CLOSE: u32 = 0x00ef_6b73;
+const COLOR_BUTTON_IDLE: u32 = 0x0018_4d77;
+const COLOR_BUTTON_MINIMIZE: u32 = 0x008f_ddff;
+const COLOR_BUTTON_CLOSE: u32 = 0x0057_b3ef;
 
 const DEFAULT_WINDOW_WIDTH: usize = 640;
 const DEFAULT_WINDOW_HEIGHT: usize = 400;
@@ -146,8 +146,10 @@ pub(crate) fn wayland_window_outer_rect(window: &WaylandWindowSnapshot) -> Rect 
     Rect {
         x: window.frame.x,
         y: window.frame.y,
-        width: window.width + WINDOW_BORDER * 2,
-        height: window.height + WINDOW_TITLE_HEIGHT + WINDOW_BORDER * 2,
+        width: window.width.saturating_add(WINDOW_BORDER * 2),
+        height: window
+            .height
+            .saturating_add(WINDOW_TITLE_HEIGHT + WINDOW_BORDER * 2),
     }
 }
 
@@ -457,7 +459,7 @@ fn draw_wayland_window(
     } else {
         window.title.as_str()
     };
-    let client_rect = window_client_rect(outer);
+    let client_rect = wayland_window_client_rect(outer);
     let clipped_outer = outer.intersect(canvas.clip_rect());
     let clipped_client = client_rect.intersect(canvas.clip_rect());
     if !clipped_outer.is_empty() && clipped_outer == clipped_client {
@@ -472,7 +474,13 @@ fn draw_wayland_window(
         return;
     }
 
-    let (_, client_rect) = paint_window_chrome(canvas, outer, title, focused);
+    let (_, client_rect) = paint_window_chrome_with_client_rect(
+        canvas,
+        outer,
+        wayland_window_client_rect(outer),
+        title,
+        focused,
+    );
     canvas.draw_surface(
         window.pixels.as_slice(),
         window.width,
@@ -694,8 +702,8 @@ fn refresh_desktop_surface(state: &mut AppState) {
             COLOR_CLIENT_BACKDROP,
             86,
         );
-        canvas.fill_pattern_grid(screen, 28, COLOR_GRID, 34);
-        canvas.fill_pattern_grid(screen, 112, COLOR_GRID_MAJOR, 48);
+        canvas.fill_pattern_grid(screen, 28, COLOR_GRID, 22);
+        canvas.fill_pattern_grid(screen, 112, COLOR_GRID_MAJOR, 34);
 
         let topbar = topbar_rail_rect(width);
         let taskbar = taskbar_rail_rect(width, height);
@@ -863,6 +871,16 @@ fn paint_window_chrome(
     title: &str,
     focused: bool,
 ) -> (Rect, Rect) {
+    paint_window_chrome_with_client_rect(canvas, outer, window_client_rect(outer), title, focused)
+}
+
+fn paint_window_chrome_with_client_rect(
+    canvas: &mut SurfaceCanvas<'_>,
+    outer: Rect,
+    client_rect: Rect,
+    title: &str,
+    focused: bool,
+) -> (Rect, Rect) {
     let inner = Rect {
         x: outer.x + WINDOW_BORDER,
         y: outer.y + WINDOW_BORDER,
@@ -875,7 +893,6 @@ fn paint_window_chrome(
         width: inner.width,
         height: WINDOW_TITLE_HEIGHT,
     };
-    let client_rect = window_client_rect(outer);
 
     draw_shadow(canvas, outer, WINDOW_SHADOW_STEPS, 28);
     canvas.fill_rect(
@@ -1038,6 +1055,17 @@ fn window_client_rect(outer: Rect) -> Rect {
         height: outer
             .height
             .saturating_sub(WINDOW_BORDER * 2 + WINDOW_TITLE_HEIGHT + WINDOW_PADDING_Y * 2),
+    }
+}
+
+fn wayland_window_client_rect(outer: Rect) -> Rect {
+    Rect {
+        x: outer.x + WINDOW_BORDER,
+        y: outer.y + WINDOW_BORDER + WINDOW_TITLE_HEIGHT,
+        width: outer.width.saturating_sub(WINDOW_BORDER * 2),
+        height: outer
+            .height
+            .saturating_sub(WINDOW_BORDER * 2 + WINDOW_TITLE_HEIGHT),
     }
 }
 

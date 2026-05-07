@@ -17,7 +17,6 @@
 *.profdata
 
 # Local editor settings
-/.vscode/
 /.idea/
 *.swp
 *.swo
