@@ -1,6 +1,6 @@
 # RustOS
 
-[![Rust](https://github.com/ierwarf/rustos/actions/workflows/rust.yml/badge.svg)](https://github.com/ierwarf/rustos/actions/workflows/rust.yml)
+[![Rust](https://github.com/ierwarf/rustos/actions/workflows/rust.yml/badge.svg?branch=master)](https://github.com/ierwarf/rustos/actions/workflows/rust.yml?branch=master)
 [![Docs](https://img.shields.io/badge/docs-mdBook-informational)](https://ierwarf.github.io/rustos/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
