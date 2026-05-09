@@ -272,8 +272,7 @@ pub mod console {
         }
     }
 
-    pub const CONSOLE_IOCTL_GET_STATE: u64 =
-        ioctl::ior::<ConsoleStateInfo>(CONSOLE_IOCTL_TYPE, 1);
+    pub const CONSOLE_IOCTL_GET_STATE: u64 = ioctl::ior::<ConsoleStateInfo>(CONSOLE_IOCTL_TYPE, 1);
     pub const CONSOLE_IOCTL_SNAPSHOT_SESSION_OUTPUT: u64 =
         ioctl::iowr::<ConsoleSnapshotSessionOutputRequest>(CONSOLE_IOCTL_TYPE, 2);
     pub const CONSOLE_IOCTL_SET_FOCUS: u64 =
@@ -437,8 +436,7 @@ pub mod device {
         }
     }
 
-    pub const DISPLAY_IOCTL_GET_INFO: u64 =
-        ioctl::ior::<DisplayInfo>(DISPLAY_IOCTL_TYPE, 1);
+    pub const DISPLAY_IOCTL_GET_INFO: u64 = ioctl::ior::<DisplayInfo>(DISPLAY_IOCTL_TYPE, 1);
     pub const DISPLAY_IOCTL_CREATE_SURFACE: u64 =
         ioctl::iowr::<DisplaySurfaceCreate>(DISPLAY_IOCTL_TYPE, 2);
     pub const DISPLAY_IOCTL_PRESENT: u64 =

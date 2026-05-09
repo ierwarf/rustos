@@ -1,12 +1,12 @@
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use crate::sync::KernelSpinLock as Mutex;
 use driver_abi::{
     POINTER_BUTTON_LEFT, POINTER_BUTTON_MIDDLE, POINTER_BUTTON_RIGHT, PointerPacket, SerioDeviceId,
     SerioDriverRegistration, SerioPortInfo,
 };
 use nucleus_core::util::ring::RingBuffer;
-use spin::Mutex;
 use x86_64::instructions::{interrupts, port::Port};
 
 use crate::driver::serio::SerioPortOps;

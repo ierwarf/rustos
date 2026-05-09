@@ -6,8 +6,8 @@ use boot_protocol::{BootInfo, BootVolumeIdentity, BootVolumeTransport, Framebuff
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
 
+use crate::sync::KernelSpinLock as Mutex;
 use fatfs::{IoBase, Read, Seek, SeekFrom, Write};
-use spin::Mutex;
 use storage_core::BlockDevice;
 
 use crate::storage::fat::{self, DiskIoError};

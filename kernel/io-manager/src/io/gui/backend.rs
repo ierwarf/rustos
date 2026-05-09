@@ -5,9 +5,10 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use boot_protocol::FramebufferInfo;
 use x86_64::VirtAddr;
+use x86_64::instructions::interrupts;
 
-use super::framebuffer::{build_framebuffer, Framebuffer, FramebufferRect};
 use super::GuiDisplayInfo;
+use super::framebuffer::{Framebuffer, FramebufferRect, build_framebuffer};
 use crate::memory::paging::{self, ProcessAddressSpace};
 use crate::sync::KernelWaitLock;
 
@@ -87,11 +88,7 @@ impl DisplayBackend {
 
 fn next_display_generation(current: u64) -> u64 {
     let next = current.wrapping_add(1);
-    if next == 0 {
-        1
-    } else {
-        next
-    }
+    if next == 0 { 1 } else { next }
 }
 
 pub(crate) fn install_boot_framebuffer(info: FramebufferInfo, flags: u32) -> bool {
@@ -124,6 +121,9 @@ pub(crate) fn present_bgra8888_from_user(
     height: usize,
     stride_bytes: usize,
 ) -> Result<bool, paging::AddressSpaceError> {
+    if !present_context_allows_blocking() {
+        return Ok(false);
+    }
     let presented = copy_user_bgra8888_rect_in_stripes(
         address_space,
         user_ptr,
@@ -178,6 +178,9 @@ pub(crate) fn present_bgra8888_rect_from_user(
     stride_bytes: usize,
     rect: FramebufferRect,
 ) -> Result<bool, paging::AddressSpaceError> {
+    if !present_context_allows_blocking() {
+        return Ok(false);
+    }
     let presented = copy_user_bgra8888_rect_in_stripes(
         address_space,
         user_ptr,
@@ -257,10 +260,6 @@ fn copy_user_bgra8888_rect_in_stripes(
             stripe,
             &mut scratch,
         )?;
-        let final_stripe = y
-            .checked_add(stripe_height)
-            .ok_or(paging::AddressSpaceError::AddressOverflow)?
-            >= end_y;
         let Some(result) = DISPLAY_BACKEND.lock().with_framebuffer(|framebuffer| {
             let drawn = framebuffer.draw_bgra8888_rect_from_kernel(
                 scratch[..scratch_len].as_ptr(),
@@ -268,7 +267,7 @@ fn copy_user_bgra8888_rect_in_stripes(
                 stripe,
             );
             log_backend_present_sample(framebuffer, drawn);
-            if drawn && final_stripe {
+            if drawn {
                 return Ok(framebuffer.present_scene());
             }
             Ok(drawn)
@@ -346,17 +345,21 @@ pub(crate) fn present_bgra8888_from_kernel(
     height: usize,
     stride_bytes: usize,
 ) -> bool {
-    let presented = DISPLAY_BACKEND
-        .lock()
-        .with_framebuffer(|framebuffer| {
-            let drawn =
-                framebuffer.draw_bgra8888_frame_from_kernel(src_ptr, width, height, stride_bytes);
-            if drawn {
-                return framebuffer.present_scene();
-            }
-            false
-        })
-        .unwrap_or(false);
+    if !present_context_allows_blocking() {
+        return false;
+    }
+    let presented = copy_kernel_bgra8888_rect_in_stripes(
+        src_ptr,
+        width,
+        height,
+        stride_bytes,
+        FramebufferRect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        },
+    );
     if presented {
         crate::driver::virtio_gpu::flush_primary();
     }
@@ -370,22 +373,11 @@ pub(crate) fn present_bgra8888_rect_from_kernel(
     stride_bytes: usize,
     rect: FramebufferRect,
 ) -> bool {
-    let presented = DISPLAY_BACKEND
-        .lock()
-        .with_framebuffer(|framebuffer| {
-            let drawn = framebuffer.draw_bgra8888_frame_rect_from_kernel(
-                src_ptr,
-                width,
-                height,
-                stride_bytes,
-                rect,
-            );
-            if drawn {
-                return framebuffer.present_scene();
-            }
-            false
-        })
-        .unwrap_or(false);
+    if !present_context_allows_blocking() {
+        return false;
+    }
+    let presented =
+        copy_kernel_bgra8888_rect_in_stripes(src_ptr, width, height, stride_bytes, rect);
     if presented {
         crate::driver::virtio_gpu::flush_primary_rect(
             rect.x as u32,
@@ -395,6 +387,85 @@ pub(crate) fn present_bgra8888_rect_from_kernel(
         );
     }
     presented
+}
+
+fn copy_kernel_bgra8888_rect_in_stripes(
+    src_ptr: *const u8,
+    width: usize,
+    height: usize,
+    stride_bytes: usize,
+    rect: FramebufferRect,
+) -> bool {
+    if rect.width == 0 || rect.height == 0 {
+        return true;
+    }
+    let Some(info) = display_info() else {
+        return false;
+    };
+    if width != info.width as usize || height != info.height as usize {
+        return false;
+    }
+    let Some(min_stride) = width.checked_mul(4) else {
+        return false;
+    };
+    if stride_bytes < min_stride {
+        return false;
+    }
+    let Some(rect) = rect.intersection(FramebufferRect {
+        x: 0,
+        y: 0,
+        width: info.width as usize,
+        height: info.height as usize,
+    }) else {
+        return true;
+    };
+
+    let stripe_rows = user_present_stripe_rows(rect.width);
+    let Some(end_y) = rect.y.checked_add(rect.height) else {
+        return false;
+    };
+    let mut y = rect.y;
+    let mut copied = false;
+    while y < end_y {
+        let stripe_height = stripe_rows.min(end_y - y);
+        let stripe = FramebufferRect {
+            x: rect.x,
+            y,
+            width: rect.width,
+            height: stripe_height,
+        };
+        let Some(presented) = DISPLAY_BACKEND.lock().with_framebuffer(|framebuffer| {
+            let drawn = framebuffer.draw_bgra8888_frame_rect_from_kernel(
+                src_ptr,
+                width,
+                height,
+                stride_bytes,
+                stripe,
+            );
+            if drawn {
+                return framebuffer.present_scene();
+            }
+            false
+        }) else {
+            return false;
+        };
+        if !presented {
+            return false;
+        }
+        copied = true;
+        y += stripe_height;
+    }
+    copied
+}
+
+fn present_context_allows_blocking() -> bool {
+    if !interrupts::are_enabled() {
+        return false;
+    }
+    if crate::driver::linux::runtime::irq_spinlock_held_by_current() {
+        return false;
+    }
+    true
 }
 
 fn mark_framebuffer_write_combine(info: FramebufferInfo) {

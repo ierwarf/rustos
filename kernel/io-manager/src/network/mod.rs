@@ -2,7 +2,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
-use spin::Mutex;
+use crate::sync::KernelSpinLock as Mutex;
 
 mod virtio_net;
 

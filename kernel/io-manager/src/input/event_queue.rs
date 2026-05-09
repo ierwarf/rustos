@@ -2,8 +2,8 @@ use core::mem::{align_of, size_of};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) use crate::input_core::InputEventQueueState;
+use crate::sync::{KernelSpinGuard as MutexGuard, KernelSpinLock as Mutex};
 use driver_abi::PointerPacket;
-use spin::{Mutex, MutexGuard};
 #[cfg(not(test))]
 use x86_64::instructions::interrupts;
 

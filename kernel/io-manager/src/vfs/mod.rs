@@ -1,6 +1,7 @@
 pub(crate) mod procfs;
 mod runtime;
 
+use crate::sync::KernelSpinLock as Mutex;
 use crate::vfs_core as core_vfs;
 use crate::vfs_core::MountRole;
 use alloc::string::{String, ToString};
@@ -9,7 +10,6 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use fatfs::{Read, Seek, SeekFrom};
-use spin::Mutex;
 use storage_core::BlockDevice as StorageBlockDevice;
 
 use crate::io::device::DeviceHandle;
@@ -2057,7 +2057,7 @@ fn map_bootstrap_fs_error(error: fatfs::Error<crate::storage::fat::DiskIoError>)
 
 #[cfg(test)]
 mod tests {
-    use spin::Mutex;
+    use crate::sync::KernelSpinLock as Mutex;
 
     use super::{
         MOUNTS, MountError, MountRole, mount_internal, normalize_kernel_path, path_is_within_mount,

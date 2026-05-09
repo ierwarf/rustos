@@ -4,7 +4,7 @@ use core::ffi::{c_char, c_void};
 use core::ptr;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use spin::Mutex;
+use crate::sync::KernelSpinLock as Mutex;
 
 use super::compat::{LinuxCompatDevice, LinuxCompatDeviceDriver};
 

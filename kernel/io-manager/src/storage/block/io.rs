@@ -1,3 +1,4 @@
+use crate::sync::KernelSpinLock as Mutex;
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
@@ -5,7 +6,6 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem;
 use core::sync::atomic::{AtomicBool, Ordering};
-use spin::Mutex;
 
 use crate::sync::KernelWaitLock;
 

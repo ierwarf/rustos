@@ -4,7 +4,7 @@ use core::ffi::{c_char, c_void};
 use core::mem::offset_of;
 use core::ptr;
 
-use spin::Mutex;
+use crate::sync::KernelSpinLock as Mutex;
 
 use super::runtime;
 
@@ -584,9 +584,5 @@ fn delayed_work_queue_from_timer(timer_ptr: usize) -> Option<usize> {
 
 fn ptr_to_usize(ptr: *mut c_void) -> Option<usize> {
     let value = ptr as usize;
-    if value == 0 {
-        None
-    } else {
-        Some(value)
-    }
+    if value == 0 { None } else { Some(value) }
 }

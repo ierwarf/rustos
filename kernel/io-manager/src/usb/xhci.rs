@@ -8,7 +8,7 @@ use core::num::NonZeroUsize;
 use core::ptr;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use spin::Mutex;
+use crate::sync::KernelSpinLock as Mutex;
 use xhci::Registers as XhciRegisters;
 use xhci::accessor::Mapper;
 use xhci::context::{EndpointType, Input32Byte, Input64Byte, InputHandler};

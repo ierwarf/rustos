@@ -4,7 +4,7 @@ use core::ffi::c_void;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use spin::Mutex;
+use crate::sync::KernelSpinLock as Mutex;
 use x86_64::instructions::interrupts;
 
 use super::linux::compat::{

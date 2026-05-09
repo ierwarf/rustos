@@ -2,10 +2,10 @@ use alloc::vec::Vec;
 use core::ffi::{c_char, c_void};
 use core::{ptr, slice};
 
+use crate::sync::KernelSpinLock as Mutex;
 use driver_abi::{DriverBus, DriverClass};
-use spin::Mutex;
 
-use super::compat::{compat_cstr, LinuxCompatDeviceDriver, LinuxCompatListHead};
+use super::compat::{LinuxCompatDeviceDriver, LinuxCompatListHead, compat_cstr};
 
 const ENODEV: i32 = -19;
 const EINVAL: i32 = -22;

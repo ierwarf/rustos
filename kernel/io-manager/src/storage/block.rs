@@ -4,6 +4,7 @@ mod registry;
 #[cfg(test)]
 mod tests;
 
+use crate::sync::KernelSpinLock as Mutex;
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
@@ -11,7 +12,6 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use boot_protocol::BootVolumeIdentity;
 use core::sync::atomic::{AtomicBool, Ordering};
-use spin::Mutex;
 use storage_core::BlockDevice as SharedBlockDevice;
 
 use crate::storage::fat::{DiskIoError, IoResult};

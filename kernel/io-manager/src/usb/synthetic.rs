@@ -2,9 +2,9 @@ use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::sync::KernelSpinLock as Mutex;
 use driver_abi::PointerPacket;
 use heapless::Deque as HeaplessDeque;
-use spin::Mutex;
 
 use super::hid_translation::{
     clamp_i8, hid_modifier_mask, hid_usage_to_keycode, keycode_to_hid_usage, mouse_buttons,

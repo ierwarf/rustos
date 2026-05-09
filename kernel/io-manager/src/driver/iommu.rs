@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 use core::ffi::c_void;
 
-use spin::Mutex;
+use crate::sync::KernelSpinLock as Mutex;
 #[cfg(not(test))]
 use x86_64::instructions::interrupts;
 
@@ -165,7 +165,7 @@ fn mask_for(device_ptr: usize, kind: DmaMappingKind) -> u64 {
 
 fn ensure_device_domain(
     device_ptr: usize,
-) -> spin::mutex::MutexGuard<'static, Vec<DeviceDmaDomain>> {
+) -> crate::sync::KernelSpinGuard<'static, Vec<DeviceDmaDomain>> {
     let mut domains = DEVICE_DMA_DOMAINS.lock();
     if domains.iter().all(|domain| domain.device_ptr != device_ptr) {
         domains.push(DeviceDmaDomain {

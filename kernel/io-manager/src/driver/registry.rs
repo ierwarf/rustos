@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 
+use crate::sync::KernelSpinLock as Mutex;
 use driver_abi::{DriverBus, DriverClass, DriverModuleHeader};
-use spin::Mutex;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DriverExecutionModel {

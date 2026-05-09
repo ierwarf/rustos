@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 use core::ffi::c_void;
 
-use spin::Mutex;
+use crate::sync::KernelSpinLock as Mutex;
 use x86_64::instructions::interrupts;
 
 const PIC_IRQ_COUNT: usize = 16;

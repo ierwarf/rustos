@@ -1,5 +1,5 @@
+use crate::sync::KernelSpinLock as Mutex;
 use nucleus_core::util::ring::RingBuffer;
-use spin::Mutex;
 #[cfg(not(test))]
 use x86_64::instructions::interrupts;
 

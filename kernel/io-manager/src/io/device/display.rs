@@ -13,7 +13,7 @@ use crate::user::abi::device::{
 use crate::user::handles::{DisplaySurfaceHandle, KernelHandle};
 use crate::user::process_state::UserProcessState;
 
-use super::{read_user_struct, write_user_struct, DeviceError};
+use super::{DeviceError, read_user_struct, write_user_struct};
 
 const MAX_DISPLAY_SURFACES_PER_PROCESS: usize = 4;
 
@@ -26,8 +26,6 @@ static PRESENT_SURFACE_SAMPLE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DisplayError {
     Unavailable,
-    InvalidDimensions,
-    InvalidStride,
     BufferTooSmall,
 }
 
@@ -142,33 +140,14 @@ pub(crate) fn ioctl(
     }
 }
 
-pub(crate) fn present_bgra8888_from_user(
-    address_space: &paging::ProcessAddressSpace,
-    user_ptr: u64,
-    width: usize,
-    height: usize,
-    stride_bytes: usize,
-) -> Result<(), DisplayError> {
-    let display = snapshot_info().ok_or(DisplayError::Unavailable)?;
-    if width != display.width as usize || height != display.height as usize {
-        return Err(DisplayError::InvalidDimensions);
-    }
-
-    let min_stride = width
-        .checked_mul(display.bytes_per_pixel as usize)
-        .ok_or(DisplayError::InvalidStride)?;
-    if stride_bytes < min_stride {
-        return Err(DisplayError::InvalidStride);
-    }
-
-    let presented = gui::present_userspace_frame_from_user_bgra8888(
-        address_space,
-        user_ptr,
-        width,
-        height,
-        stride_bytes,
-    )
-    .map_err(|_| DisplayError::BufferTooSmall)?;
+fn present_bgra8888_from_surface(surface: DisplaySurfaceHandle) -> Result<(), DisplayError> {
+    let (src_ptr, _) = surface_kernel_mapping(surface)?;
+    let presented = gui::present_userspace_frame_from_kernel_bgra8888(
+        src_ptr,
+        surface.width() as usize,
+        surface.height() as usize,
+        surface.stride_bytes() as usize,
+    );
     if !presented {
         return Err(DisplayError::Unavailable);
     }
@@ -176,46 +155,46 @@ pub(crate) fn present_bgra8888_from_user(
     Ok(())
 }
 
-pub(crate) fn present_bgra8888_rect_from_user(
-    address_space: &paging::ProcessAddressSpace,
-    user_ptr: u64,
-    width: usize,
-    height: usize,
-    stride_bytes: usize,
+fn present_bgra8888_rect_from_surface(
+    surface: DisplaySurfaceHandle,
     x: usize,
     y: usize,
     rect_width: usize,
     rect_height: usize,
 ) -> Result<(), DisplayError> {
-    let display = snapshot_info().ok_or(DisplayError::Unavailable)?;
-    if width != display.width as usize || height != display.height as usize {
-        return Err(DisplayError::InvalidDimensions);
-    }
-
-    let min_stride = width
-        .checked_mul(display.bytes_per_pixel as usize)
-        .ok_or(DisplayError::InvalidStride)?;
-    if stride_bytes < min_stride {
-        return Err(DisplayError::InvalidStride);
-    }
-
-    let presented = gui::present_userspace_frame_rect_from_user_bgra8888(
-        address_space,
-        user_ptr,
-        width,
-        height,
-        stride_bytes,
+    let (src_ptr, _) = surface_kernel_mapping(surface)?;
+    let presented = gui::present_userspace_frame_rect_from_kernel_bgra8888(
+        src_ptr,
+        surface.width() as usize,
+        surface.height() as usize,
+        surface.stride_bytes() as usize,
         x,
         y,
         rect_width,
         rect_height,
-    )
-    .map_err(|_| DisplayError::BufferTooSmall)?;
+    );
     if !presented {
         return Err(DisplayError::Unavailable);
     }
 
     Ok(())
+}
+
+fn surface_kernel_mapping(
+    surface: DisplaySurfaceHandle,
+) -> Result<(*const u8, usize), DisplayError> {
+    let shared_region = surface
+        .shared_region()
+        .ok_or(DisplayError::BufferTooSmall)?;
+    let (src_ptr, mapped_len) =
+        crate::ipc::map_shared_region(shared_region).ok_or(DisplayError::BufferTooSmall)?;
+    let frame_len =
+        usize::try_from(surface.frame_len()).map_err(|_| DisplayError::BufferTooSmall)?;
+    if src_ptr.is_null() || mapped_len < frame_len {
+        return Err(DisplayError::BufferTooSmall);
+    }
+
+    Ok((src_ptr.cast_const(), mapped_len))
 }
 
 pub(crate) fn present_surface(
@@ -229,14 +208,7 @@ pub(crate) fn present_surface(
         .ok_or(DeviceError::InvalidArgument)?;
     validate_surface_mapping(surface, region)?;
     log_present_surface_sample(address_space, surface, region.start.as_u64());
-    present_bgra8888_from_user(
-        address_space,
-        region.start.as_u64(),
-        surface.width() as usize,
-        surface.height() as usize,
-        surface.stride_bytes() as usize,
-    )
-    .map_err(map_display_error)?;
+    present_bgra8888_from_surface(surface).map_err(map_display_error)?;
     Ok(())
 }
 
@@ -280,7 +252,7 @@ fn log_present_surface_sample(
 }
 
 pub(crate) fn present_surface_rect(
-    address_space: &paging::ProcessAddressSpace,
+    _address_space: &paging::ProcessAddressSpace,
     surface: DisplaySurfaceHandle,
     x: usize,
     y: usize,
@@ -305,26 +277,13 @@ pub(crate) fn present_surface_rect(
         .mapped_region()
         .ok_or(DeviceError::InvalidArgument)?;
     validate_surface_mapping(surface, region)?;
-    present_bgra8888_rect_from_user(
-        address_space,
-        region.start.as_u64(),
-        surface.width() as usize,
-        surface.height() as usize,
-        surface.stride_bytes() as usize,
-        x,
-        y,
-        width,
-        height,
-    )
-    .map_err(map_display_error)
+    present_bgra8888_rect_from_surface(surface, x, y, width, height).map_err(map_display_error)
 }
 
 fn map_display_error(err: DisplayError) -> DeviceError {
     match err {
         DisplayError::Unavailable => DeviceError::DisplayUnavailable,
-        DisplayError::InvalidDimensions
-        | DisplayError::InvalidStride
-        | DisplayError::BufferTooSmall => DeviceError::InvalidArgument,
+        DisplayError::BufferTooSmall => DeviceError::InvalidArgument,
     }
 }
 

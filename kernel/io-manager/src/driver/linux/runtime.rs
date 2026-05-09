@@ -6,7 +6,7 @@ use core::ptr;
 use core::slice;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use spin::Mutex;
+use crate::sync::KernelSpinLock as Mutex;
 use x86_64::instructions::interrupts;
 
 static JIFFIES: AtomicU64 = AtomicU64::new(0);
@@ -24,6 +24,7 @@ const MAX_COMPAT_PRINTK_BYTES: usize = 4096;
 const MAX_COMPAT_RANDOM_BYTES: usize = 1 << 20;
 const MAX_COMPAT_SG_INIT_ENTRIES: usize = 4096;
 const COMPAT_LOCK_SPIN_HARD_LIMIT: usize = 5_000_000;
+const COMPAT_LOCK_IRQ_OFF_SPIN_HARD_LIMIT: usize = 100_000;
 const LINUX_SG_END: usize = 0x02;
 
 #[repr(C)]
@@ -480,6 +481,16 @@ pub fn debug_irq_lock_snapshot() -> (usize, usize) {
     (owner_count, total_depth)
 }
 
+pub(crate) fn irq_spinlock_held_by_current() -> bool {
+    let owner = current_lock_owner_token();
+    let Some(owners) = IRQ_LOCK_OWNERS.try_lock() else {
+        return true;
+    };
+    owners
+        .iter()
+        .any(|state| state.owner == owner && state.depth != 0)
+}
+
 pub(crate) fn assert_no_irq_spinlock_held(api: &str) {
     let owner = current_lock_owner_token();
     let depth = irq_lock_owner_depth(owner);
@@ -593,7 +604,12 @@ fn acquire_compat_lock(state: &'static CompatLockState, owner: usize) {
         return;
     }
 
-    for spins in 1..=COMPAT_LOCK_SPIN_HARD_LIMIT {
+    let hard_limit = if interrupts::are_enabled() {
+        COMPAT_LOCK_SPIN_HARD_LIMIT
+    } else {
+        COMPAT_LOCK_IRQ_OFF_SPIN_HARD_LIMIT
+    };
+    for spins in 1..=hard_limit {
         if matches!(spins, 1_000 | 100_000 | 1_000_000) {
             log_compat_lock_spin(state, owner);
         }

@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::ptr;
 
-use spin::Mutex;
+use crate::sync::KernelSpinLock as Mutex;
 
 use crate::driver::linux::compat::{
     LinuxCompatUsbBus, LinuxCompatUsbDevice, LinuxCompatUsbDeviceId, LinuxCompatUsbDriver,

@@ -4,7 +4,7 @@ use core::ffi::{c_char, c_void};
 use core::ptr;
 use core::slice;
 
-use spin::Mutex;
+use crate::sync::KernelSpinLock as Mutex;
 use x86_64::instructions::interrupts;
 #[repr(C)]
 struct LinuxKernelParamOps {

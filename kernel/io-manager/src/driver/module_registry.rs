@@ -2,11 +2,11 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::str;
 
-use spin::Mutex;
+use crate::sync::KernelSpinLock as Mutex;
 
 use super::loader::{
-    add_signed_usize, read_string_table_entry, section_header_entries, section_header_string_table,
-    ModuleElf, ModuleLoadLayout, ModuleMemory, ModuleSectionHeader,
+    ModuleElf, ModuleLoadLayout, ModuleMemory, ModuleSectionHeader, add_signed_usize,
+    read_string_table_entry, section_header_entries, section_header_string_table,
 };
 
 const MAX_DISCOVERED_EXPORTS: usize = 8192;

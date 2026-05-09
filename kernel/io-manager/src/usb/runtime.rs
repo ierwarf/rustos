@@ -5,10 +5,10 @@ use core::ffi::c_void;
 use core::ops::Range;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+use crate::sync::KernelSpinLock as Mutex;
 use driver_abi::PointerPacket;
 use heapless::Deque as HeaplessDeque;
 use hidreport::{ArrayField, Field, FieldAttributes, Report, ReportDescriptor};
-use spin::Mutex;
 
 use super::hid_translation::{hid_usage_to_keycode, pointer_buttons_from_report};
 use crate::driver::linux::compat::{LinuxCompatHidDevice, LinuxCompatUrb, LinuxCompatUsbDevice};

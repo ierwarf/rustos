@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail};
 use fs_err as fs;
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -9,12 +9,12 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::Result;
 use crate::config::Config;
 use crate::util::{create_temp_dir, env_string, read_trimmed, resolve_command_path};
-use crate::Result;
 
-const DEFAULT_QEMU_DISPLAY_WIDTH: u32 = 2560;
-const DEFAULT_QEMU_DISPLAY_HEIGHT: u32 = 1440;
+const DEFAULT_QEMU_DISPLAY_WIDTH: u32 = 3840;
+const DEFAULT_QEMU_DISPLAY_HEIGHT: u32 = 2160;
 
 struct RunOptions {
     profile: String,

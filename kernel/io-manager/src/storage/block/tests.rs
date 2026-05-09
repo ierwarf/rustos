@@ -1,9 +1,9 @@
+use crate::sync::KernelSpinLock as Mutex;
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 use boot_protocol::BootVolumeIdentity;
 use core::sync::atomic::Ordering;
-use spin::Mutex;
 use storage_core::BlockDevice as SharedBlockDevice;
 
 use super::io::{cache_lookup, clear_cache_for_tests, read_cached_block, write_cached_block};

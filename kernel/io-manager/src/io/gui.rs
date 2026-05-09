@@ -4,6 +4,7 @@ mod framebuffer;
 use core::str;
 use core::sync::atomic::{AtomicU8, Ordering};
 
+use crate::sync::KernelSpinLock as Mutex;
 use boot_protocol::{BootInfo, FramebufferInfo};
 use driver_abi::{
     DISPLAY_FRAMEBUFFER_FLAG_BOOT_FRAMEBUFFER, DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER,
@@ -15,7 +16,6 @@ use embedded_graphics::mono_font::{MonoTextStyle, ascii::FONT_9X18_BOLD};
 use embedded_graphics::pixelcolor::Rgb888;
 use embedded_graphics::prelude::RgbColor;
 use embedded_graphics::text::{Baseline, Text};
-use spin::Mutex;
 
 use self::framebuffer::{Framebuffer, FramebufferRect};
 use crate::io::session::ConsoleSessionHandle;

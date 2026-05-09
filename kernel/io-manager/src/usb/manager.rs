@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use spin::Mutex;
+use crate::sync::KernelSpinLock as Mutex;
 
 use super::emulation;
 #[allow(unused_imports)]

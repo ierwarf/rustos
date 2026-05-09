@@ -1,6 +1,6 @@
+use crate::sync::KernelSpinLock as Mutex;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use spin::Mutex;
 
 use crate::user::abi::UserAbi;
 use crate::user::process_state::UserProcessState;

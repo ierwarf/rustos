@@ -5,6 +5,7 @@ use core::mem::size_of;
 use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::sync::KernelSpinLock as Mutex;
 use driver_abi::{
     DriverBus, DriverClass, DriverModuleHeader, RUSTOS_DRIVER_ABI_VERSION_SYMBOL,
     RUSTOS_DRIVER_HEADER_SYMBOL, RUSTOS_DRIVER_INIT_SYMBOL,
@@ -17,7 +18,6 @@ use object::elf::{
     self as objelf, FileHeader64 as RawElfHeader, Rela64 as RawRela,
     SectionHeader64 as RawSectionHeader, Sym64 as RawSym,
 };
-use spin::Mutex;
 use x86_64::PhysAddr;
 
 use crate::sync::KernelWaitLock;

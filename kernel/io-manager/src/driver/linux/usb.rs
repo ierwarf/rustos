@@ -414,13 +414,7 @@ pub(crate) unsafe extern "C" fn __usb_get_extra_descriptor(
                 alloc::format!(
                     "__usb_get_extra_descriptor: found offset={} ptr={:#x}",
                     offset,
-                    unsafe {
-                        if out.is_null() {
-                            0
-                        } else {
-                            *out as usize
-                        }
-                    }
+                    unsafe { if out.is_null() { 0 } else { *out as usize } }
                 )
                 .as_bytes(),
             );

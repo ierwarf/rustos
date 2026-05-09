@@ -75,15 +75,15 @@ fn capture_pointer_packet(packet: PointerPacket) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        reset_pointer_state, submit_pointer_packet, POINTER_BUTTON_STATE,
-        TEST_POINTER_CAPTURE_RESULT, TEST_POINTER_EVENTS_READY,
+        POINTER_BUTTON_STATE, TEST_POINTER_CAPTURE_RESULT, TEST_POINTER_EVENTS_READY,
+        reset_pointer_state, submit_pointer_packet,
     };
     use crate::user::abi::device::{
-        InputEvent, INPUT_ACTION_PRESSED, INPUT_KIND_POINTER_BUTTON, INPUT_KIND_POINTER_MOTION,
+        INPUT_ACTION_PRESSED, INPUT_KIND_POINTER_BUTTON, INPUT_KIND_POINTER_MOTION, InputEvent,
         POINTER_BUTTON_LEFT,
     };
     use core::sync::atomic::Ordering;
-    use driver_abi::{PointerPacket, POINTER_BUTTON_LEFT as POINTER_PACKET_LEFT};
+    use driver_abi::{POINTER_BUTTON_LEFT as POINTER_PACKET_LEFT, PointerPacket};
 
     fn isolated() -> std::sync::MutexGuard<'static, ()> {
         crate::test_support::exclusive_test()

@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 use core::ffi::c_void;
 
-use spin::Mutex;
+use crate::sync::KernelSpinLock as Mutex;
 use x86_64::instructions::interrupts;
 use x86_64::structures::paging::PageTableFlags;
 

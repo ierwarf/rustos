@@ -1,4 +1,4 @@
-use spin::Mutex;
+use crate::sync::KernelSpinLock as Mutex;
 
 pub use keyboard_core::{KeyAction, KeyCode, KeyboardEvent, Modifiers};
 use keyboard_core::{KeyboardDriver, ScanCodeSet};

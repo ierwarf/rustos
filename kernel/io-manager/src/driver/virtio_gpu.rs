@@ -1,10 +1,11 @@
 use core::ptr;
-use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering, compiler_fence};
 
+use crate::sync::KernelSpinLock as Mutex;
 use boot_protocol::{
     BootPixelFormat, FramebufferInfo, MAX_BOOT_FRAMEBUFFER_HEIGHT, MAX_BOOT_FRAMEBUFFER_WIDTH,
 };
-use spin::Mutex;
+use x86_64::instructions::interrupts;
 
 const PCI_VENDOR_VIRTIO: u16 = 0x1af4;
 const PCI_DEVICE_VIRTIO_GPU_MODERN: u16 = 0x1050;
@@ -73,6 +74,7 @@ const DISPLAY_INFO_SCANOUT_COUNT: usize = 16;
 const DESC_F_NEXT: u16 = 1;
 const DESC_F_WRITE: u16 = 2;
 const COMMAND_COMPLETION_TIMEOUT_MS: u64 = 250;
+const COMMAND_COMPLETION_IRQ_OFF_SPINS: usize = 50_000;
 const COMMAND_COMPLETION_BOOT_SPINS: usize = 1_000_000;
 const COMMAND_TIMEOUT_BACKOFF_BASE_MS: u64 = 100;
 const COMMAND_TIMEOUT_BACKOFF_MAX_MS: u64 = 1_000;
@@ -352,6 +354,18 @@ impl VirtioGpuDisplay {
 }
 
 fn wait_for_queue_used(used: *mut u8, current_used_idx: u16) -> Option<u16> {
+    if !interrupts::are_enabled() {
+        for _ in 0..COMMAND_COMPLETION_IRQ_OFF_SPINS {
+            let next_used = unsafe { ptr::read_volatile(used.add(2) as *const u16) };
+            if next_used != current_used_idx {
+                return Some(next_used);
+            }
+            core::hint::spin_loop();
+        }
+        trace_native("virtio-gpu-native-command-irq-off-deferred", 0, 0);
+        return None;
+    }
+
     let start_ticks = crate::arch::rtc::ticks();
     if start_ticks != 0 {
         let timeout_ticks = milliseconds_to_ticks(COMMAND_COMPLETION_TIMEOUT_MS).max(1);
@@ -459,6 +473,11 @@ fn try_enable_primary_display_once() -> bool {
 }
 
 pub(crate) fn flush_primary() -> bool {
+    if !interrupts::are_enabled() {
+        DISPLAY_NEEDS_FULL_FLUSH.store(true, Ordering::Release);
+        trace_native("virtio-gpu-native-flush-irq-off-deferred", 0, 0);
+        return false;
+    }
     let Some(mut display) = DISPLAY.try_lock() else {
         DISPLAY_NEEDS_FULL_FLUSH.store(true, Ordering::Release);
         return false;
@@ -473,6 +492,11 @@ pub(crate) fn flush_primary() -> bool {
 }
 
 pub(crate) fn flush_primary_rect(x: u32, y: u32, width: u32, height: u32) -> bool {
+    if !interrupts::are_enabled() {
+        DISPLAY_NEEDS_FULL_FLUSH.store(true, Ordering::Release);
+        trace_native("virtio-gpu-native-flush-rect-irq-off-deferred", 0, 0);
+        return false;
+    }
     let Some(mut display) = DISPLAY.try_lock() else {
         DISPLAY_NEEDS_FULL_FLUSH.store(true, Ordering::Release);
         return false;
