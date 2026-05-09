@@ -15,6 +15,7 @@ use spin::Mutex;
 use storage_core::BlockDevice as SharedBlockDevice;
 
 use crate::storage::fat::{DiskIoError, IoResult};
+use crate::sync::KernelWaitLock;
 
 pub use storage_core::TransportKind as BlockTransportKind;
 
@@ -22,7 +23,7 @@ const MIN_LOGICAL_BLOCK_SIZE: usize = 512;
 
 static BLOCK_DEVICES: Mutex<Vec<BlockDeviceRecord>> = Mutex::new(Vec::new());
 static BLOCK_INIT_DONE: AtomicBool = AtomicBool::new(false);
-static BLOCK_INIT_LOCK: Mutex<()> = Mutex::new(());
+static BLOCK_INIT_LOCK: KernelWaitLock<()> = KernelWaitLock::new(());
 static BOOT_VOLUME_HANDLE_LOGGED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,7 +58,7 @@ pub(crate) trait BlockDeviceOps: SharedBlockDevice + Send {
 }
 
 enum BlockDeviceKind {
-    Root(Arc<Mutex<Box<dyn BlockDeviceOps>>>),
+    Root(Arc<KernelWaitLock<Box<dyn BlockDeviceOps>>>),
     Slice {
         parent_id: u32,
         start_block: u64,

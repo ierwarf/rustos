@@ -4,12 +4,12 @@ pub use crate::multitask::{
     UserFaultDisposition, UserStackState, UserTaskBootstrap, UserTaskRegisters, WaitChildResult,
 };
 pub use crate::multitask::{
-    block_current_user_task, current_last_error, current_linux_thread_state,
+    block_current_task, block_current_user_task, current_last_error, current_linux_thread_state,
     current_user_address_space, current_user_stack_state, current_user_thread_id,
     exec_current_user_process, exit_current_user_task, is_user_task_alive,
     note_process_exit_status, queue_linux_signal, restore_current_simd_state,
     save_current_simd_state, set_current_last_error, spawn_user_process_with_parent,
-    spawn_user_thread, wake_user_task, with_current_mm, with_current_process_state,
+    spawn_user_thread, wake_task, wake_user_task, with_current_mm, with_current_process_state,
     with_current_process_state_mut, with_current_user_linux_state_mut,
     with_current_user_process_and_linux_thread_state_mut, with_current_user_process_state,
     with_process_state_by_pid_mut,
@@ -154,6 +154,10 @@ pub mod snapshot {
         crate::multitask::current_user_id()
     }
 
+    pub fn current_task_id() -> Option<u64> {
+        crate::multitask::current_task_id()
+    }
+
     pub fn current_user_process_id() -> Option<u64> {
         crate::multitask::current_user_process_id()
     }
@@ -238,6 +242,14 @@ pub mod task {
         crate::multitask::yield_now();
     }
 
+    pub fn block_current_task() -> bool {
+        crate::multitask::block_current_task()
+    }
+
+    pub fn wake_task(task_id: u64) -> bool {
+        crate::multitask::wake_task(task_id)
+    }
+
     pub fn register_tick_jiffies_hook(hook: fn(u64) -> u64) {
         crate::linux_runtime_hooks::register_tick_jiffies_hook(hook);
     }
@@ -263,8 +275,8 @@ pub use boot::{is_initialized, service_deferred_work, start};
 pub use fault::{halt_current_retired_task, retire_current_user_task_due_to_fault};
 pub use process::{spawn_kernel_process, spawn_user_process};
 pub use snapshot::{
-    any_user_process_state, current_user_id, current_user_process_id, current_user_snapshot,
-    retain_current_user_process_state, with_current_process_credentials,
+    any_user_process_state, current_task_id, current_user_id, current_user_process_id,
+    current_user_snapshot, retain_current_user_process_state, with_current_process_credentials,
     with_current_user_process_state_mut,
 };
 pub use task::{

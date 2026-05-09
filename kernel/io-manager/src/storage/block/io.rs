@@ -7,6 +7,8 @@ use core::mem;
 use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
+use crate::sync::KernelWaitLock;
+
 use super::{
     BLOCK_DEVICES, BlockDeviceKind, BlockDeviceOps, BlockDeviceRecord, DiskIoError, IoResult,
     MIN_LOGICAL_BLOCK_SIZE,
@@ -26,7 +28,7 @@ struct BlockCacheEntry {
 
 #[derive(Clone)]
 struct ResolvedRootDevice {
-    device: Arc<Mutex<Box<dyn BlockDeviceOps>>>,
+    device: Arc<KernelWaitLock<Box<dyn BlockDeviceOps>>>,
     readonly: bool,
     logical_block_size: usize,
     block_count: u64,

@@ -25,6 +25,10 @@ pub fn current_user_id() -> Option<u64> {
     current_user_snapshot().map(|snapshot| snapshot.thread_id())
 }
 
+pub fn current_task_id() -> Option<u64> {
+    interrupts::without_interrupts(|| unsafe { scheduler_ref().current_task_id() })
+}
+
 pub fn current_user_process_id() -> Option<u64> {
     current_user_snapshot().map(|snapshot| snapshot.process_id())
 }
@@ -77,6 +81,14 @@ pub fn wake_user_task(task_id: u64) -> bool {
     interrupts::without_interrupts(|| unsafe { scheduler_mut().wake_user_task(task_id) })
 }
 
+pub fn block_current_task() -> bool {
+    interrupts::without_interrupts(|| unsafe { scheduler_mut().block_current_task() })
+}
+
+pub fn wake_task(task_id: u64) -> bool {
+    interrupts::without_interrupts(|| unsafe { scheduler_mut().wake_task(task_id) })
+}
+
 pub fn current_console_session() -> ConsoleSessionHandle {
     interrupts::without_interrupts(|| unsafe { scheduler_ref().current_console_session() })
 }
@@ -107,9 +119,20 @@ pub fn with_current_user_linux_state_mut<R>(
         &mut Option<LinuxThreadState>,
     ) -> R,
 ) -> Option<R> {
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().with_current_user_linux_state_mut(f)
-    })
+    let (process_id, tid, abi, mut process, mut linux_thread_state) =
+        retain_current_linux_thread_binding()?;
+    let linux_thread_state = unsafe { linux_thread_state.as_mut() };
+    let (address_space, linux_process_state) = process
+        .state_mut()
+        .address_space_and_linux_process_state_mut();
+    Some(f(
+        process_id,
+        tid,
+        abi,
+        address_space,
+        linux_process_state,
+        linux_thread_state,
+    ))
 }
 
 pub fn with_current_user_process_state_mut<R>(
@@ -182,9 +205,16 @@ pub fn with_current_process_state<R>(f: impl FnOnce(u64, &UserProcessState) -> R
 pub fn with_current_user_process_and_linux_thread_state_mut<R>(
     f: impl FnOnce(u64, u64, UserAbi, &mut UserProcessState, &mut Option<LinuxThreadState>) -> R,
 ) -> Option<R> {
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().with_current_user_process_and_linux_thread_state_mut(f)
-    })
+    let (process_id, tid, abi, mut process, mut linux_thread_state) =
+        retain_current_linux_thread_binding()?;
+    let linux_thread_state = unsafe { linux_thread_state.as_mut() };
+    Some(f(
+        process_id,
+        tid,
+        abi,
+        process.state_mut(),
+        linux_thread_state,
+    ))
 }
 
 pub fn queue_linux_signal(process_id: u64, task_id: u64, signal: u64) -> bool {
@@ -202,8 +232,19 @@ pub fn with_current_user_windows_thread_state_mut<R>(
     })
 }
 
-pub fn any_user_process_state(f: impl FnMut(u64, &UserProcessState) -> bool) -> bool {
-    interrupts::without_interrupts(|| unsafe { scheduler_mut().any_user_process_state(f) })
+pub fn any_user_process_state(mut f: impl FnMut(u64, &UserProcessState) -> bool) -> bool {
+    let (handles, len) = interrupts::without_interrupts(|| unsafe {
+        scheduler_ref().user_process_handles_snapshot()
+    });
+    for handle in handles.into_iter().take(len).flatten() {
+        let Some(process) = process_table::retain_process(handle) else {
+            continue;
+        };
+        if process.with_state(|process_id, process_state| f(process_id, process_state)) {
+            return true;
+        }
+    }
+    false
 }
 
 fn retain_current_user_process_binding() -> Option<(u64, UserAbi, process_table::ProcessRef)> {
@@ -212,6 +253,26 @@ fn retain_current_user_process_binding() -> Option<(u64, UserAbi, process_table:
     })?;
     let process = process_table::retain_process(process_handle)?;
     Some((thread_id, abi, process))
+}
+
+fn retain_current_linux_thread_binding() -> Option<(
+    u64,
+    u64,
+    UserAbi,
+    process_table::ProcessRef,
+    core::ptr::NonNull<Option<LinuxThreadState>>,
+)> {
+    let binding = interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().current_linux_thread_binding()
+    })?;
+    let process = process_table::retain_process(binding.process_handle)?;
+    Some((
+        process.process_id(),
+        binding.tid,
+        binding.abi,
+        process,
+        binding.linux_thread_state,
+    ))
 }
 
 fn retain_current_process_ref() -> Option<process_table::ProcessRef> {

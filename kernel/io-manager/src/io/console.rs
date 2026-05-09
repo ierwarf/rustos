@@ -1,17 +1,15 @@
 use alloc::vec::Vec;
 
 use nucleus_core::util::ring::RingBuffer;
-use spin::Mutex;
-#[cfg(not(test))]
-use x86_64::instructions::interrupts;
 
 use crate::io::session::ConsoleSessionHandle;
+use crate::sync::KernelWaitLock;
 
 const OUTPUT_BUFFER_CAPACITY: usize = 4096;
 const PENDING_BUFFER_CAPACITY: usize = 4096;
 const FLUSH_CHUNK_CAPACITY: usize = 256;
 
-static CONSOLE: Mutex<ConsoleState> = Mutex::new(ConsoleState::new());
+static CONSOLE: KernelWaitLock<ConsoleState> = KernelWaitLock::new(ConsoleState::new());
 
 pub fn init() {
     crate::io::gui::init_console();
@@ -83,15 +81,7 @@ pub fn service() -> usize {
 }
 
 fn with_console_state<R>(f: impl FnOnce(&mut ConsoleState) -> R) -> R {
-    #[cfg(test)]
-    {
-        f(&mut CONSOLE.lock())
-    }
-
-    #[cfg(not(test))]
-    {
-        interrupts::without_interrupts(|| f(&mut CONSOLE.lock()))
-    }
+    f(&mut CONSOLE.lock())
 }
 
 struct ConsoleState {

@@ -23,6 +23,7 @@ pub mod virtio_gpu;
 
 use driver_abi::{DriverBus, DriverClass, DriverKernelApiV1};
 
+use crate::sync::KernelWaitLock;
 use loader::load_module_image;
 pub(crate) use registry::{DriverModuleState, DriverRecord};
 
@@ -38,7 +39,7 @@ const VIRTIO_DEVICE_ID_NET: u32 = 1;
 const VIRTIO_DEVICE_ID_GPU: u32 = 16;
 
 static LOADABLE_DRIVER_REGISTRY_LOADED: AtomicBool = AtomicBool::new(false);
-static LOADABLE_DRIVER_REGISTRY_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+static LOADABLE_DRIVER_REGISTRY_LOCK: KernelWaitLock<()> = KernelWaitLock::new(());
 
 pub(crate) fn exported_kernel_api() -> *const DriverKernelApiV1 {
     kernel_api::exported_kernel_api()
@@ -704,9 +705,9 @@ pub(crate) fn reset_for_tests() {
 mod tests {
     use super::registry::DriverExecutionModel;
     use super::{
-        parse_virtio_alias_device_id, pci_virtio_device_id, register_kernel_builtin,
-        register_loadable_elf, reset_for_tests, snapshot_registered_drivers, DriverBus,
-        DriverClass, DriverRecord,
+        DriverBus, DriverClass, DriverRecord, parse_virtio_alias_device_id, pci_virtio_device_id,
+        register_kernel_builtin, register_loadable_elf, reset_for_tests,
+        snapshot_registered_drivers,
     };
 
     fn isolated() -> std::sync::MutexGuard<'static, ()> {

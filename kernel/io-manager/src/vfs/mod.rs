@@ -15,6 +15,7 @@ use storage_core::BlockDevice as StorageBlockDevice;
 use crate::io::device::DeviceHandle;
 use crate::multitask;
 use crate::storage::block;
+use crate::sync::KernelWaitLock;
 use crate::user::abi::UserAbi;
 use crate::user::handles::{
     KernelHandle, VfsDirectoryEntry, VfsDirectoryEntryKind, VfsDirectoryHandle, VfsFileHandle,
@@ -39,8 +40,9 @@ const ROOT_FILE_EXTENTS_REGISTRY_PATH: &str = "/system/registry/kernel/root-file
 
 static MOUNTS: Mutex<Vec<VfsMount>> = Mutex::new(Vec::new());
 static MOUNT_GENERATION: AtomicU64 = AtomicU64::new(1);
-static ROOT_VOLUME: Mutex<Option<crate::storage::fat::MountedFatVolume<block::FatRegistryDevice>>> =
-    Mutex::new(None);
+static ROOT_VOLUME: KernelWaitLock<
+    Option<crate::storage::fat::MountedFatVolume<block::FatRegistryDevice>>,
+> = KernelWaitLock::new(None);
 static ROOT_CACHE: Mutex<RootCache> = Mutex::new(RootCache::new());
 static ROOT_EXTENT_INDEX: Mutex<RootExtentIndex> = Mutex::new(RootExtentIndex::new());
 
@@ -768,6 +770,7 @@ impl VfsFileObject for RootFsStreamingFile {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn read_dir_names_for_kernel(absolute_path: &str) -> Result<Vec<String>, VfsError> {
     let absolute_path = normalize_kernel_path(absolute_path)?;
     Ok(read_root_dir_cached(absolute_path.as_str())?
@@ -956,27 +959,39 @@ fn open_root_file_fast(absolute_path: &str) -> Result<RootFileOpenFast, VfsError
     }
 
     let path_id = path_inode(absolute_path.as_bytes()).max(1);
+    let mut insert_miss = false;
+    let mut cache_metadata_len = None;
+    let mut cache_file = None;
     let result = with_root_volume(|volume| {
         let (mut file, file_len) = match volume.open_file_with_len(absolute_path) {
             Ok(file) => file,
             Err(fatfs::Error::NotFound | fatfs::Error::InvalidInput) => {
-                ROOT_CACHE.lock().insert_miss(generation, absolute_path);
+                insert_miss = true;
                 return Ok(RootFileOpenFast::NotFile);
             }
             Err(error) => return Err(error),
         };
         let file_len = usize::try_from(file_len).map_err(|_| fatfs::Error::InvalidInput)?;
-        cache_root_file_metadata(generation, absolute_path, file_len, path_id);
+        cache_metadata_len = Some(file_len);
         if file_len > ROOT_FILE_CACHE_MAX_ENTRY_BYTES {
             return Ok(RootFileOpenFast::Streaming { len: file_len });
         }
         let bytes = read_open_root_file_to_vec(&mut file, absolute_path, path_id, file_len)?;
         let bytes = Arc::<[u8]>::from(bytes.into_boxed_slice());
-        ROOT_CACHE
-            .lock()
-            .insert_file(generation, absolute_path, Arc::clone(&bytes));
+        cache_file = Some(Arc::clone(&bytes));
         Ok(RootFileOpenFast::Memory(bytes))
     })?;
+    if insert_miss {
+        ROOT_CACHE.lock().insert_miss(generation, absolute_path);
+    }
+    if let Some(file_len) = cache_metadata_len {
+        cache_root_file_metadata(generation, absolute_path, file_len, path_id);
+    }
+    if let Some(bytes) = cache_file {
+        ROOT_CACHE
+            .lock()
+            .insert_file(generation, absolute_path, bytes);
+    }
     Ok(result)
 }
 
@@ -1029,11 +1044,12 @@ fn read_root_file_to_vec_exact(absolute_path: &str) -> Result<Vec<u8>, VfsError>
         }
         RootExtentLookup::Unknown => {}
     }
-    let bytes = with_root_volume(|volume| {
+    let mut insert_miss = false;
+    let bytes_result = with_root_volume(|volume| {
         let (mut file, file_len) = match volume.open_file_with_len(absolute_path) {
             Ok(file) => file,
             Err(fatfs::Error::NotFound | fatfs::Error::InvalidInput) => {
-                ROOT_CACHE.lock().insert_miss(generation, absolute_path);
+                insert_miss = true;
                 return Err(fatfs::Error::NotFound);
             }
             Err(error) => return Err(error),
@@ -1043,7 +1059,16 @@ fn read_root_file_to_vec_exact(absolute_path: &str) -> Result<Vec<u8>, VfsError>
             return Err(fatfs::Error::InvalidInput);
         }
         read_open_root_file_to_vec(&mut file, absolute_path, path_id, file_len)
-    })?;
+    });
+    let bytes = match bytes_result {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            if insert_miss {
+                ROOT_CACHE.lock().insert_miss(generation, absolute_path);
+            }
+            return Err(error);
+        }
+    };
     cache_root_file_metadata(generation, absolute_path, bytes.len(), path_id);
     Ok(bytes)
 }
@@ -1364,12 +1389,13 @@ fn read_root_file_range_into(
         return Ok(0);
     }
 
-    with_root_volume(|volume| {
-        let generation = current_mount_generation();
+    let generation = current_mount_generation();
+    let mut insert_miss = false;
+    let read_result = with_root_volume(|volume| {
         let mut file = match volume.open_file(absolute_path) {
             Ok(file) => file,
             Err(fatfs::Error::NotFound | fatfs::Error::InvalidInput) => {
-                ROOT_CACHE.lock().insert_miss(generation, absolute_path);
+                insert_miss = true;
                 return Err(fatfs::Error::NotFound);
             }
             Err(error) => return Err(error),
@@ -1384,7 +1410,11 @@ fn read_root_file_range_into(
             done += count;
         }
         Ok(done)
-    })
+    });
+    if insert_miss {
+        ROOT_CACHE.lock().insert_miss(generation, absolute_path);
+    }
+    read_result
 }
 
 fn read_root_dir_cached(absolute_path: &str) -> Result<Vec<storage_fat::FatDirEntry>, VfsError> {

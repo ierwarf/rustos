@@ -1,12 +1,12 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use spin::Mutex;
 
 use super::{
     BLOCK_DEVICES, BlockDeviceHandle, BlockDeviceKind, BlockDeviceOps, BlockDeviceRecord,
     BlockTransportKind, descriptor_without_init,
 };
+use crate::sync::KernelWaitLock;
 
 pub(super) fn register_root_device(device: Box<dyn BlockDeviceOps>) {
     let transport = device.transport_kind();
@@ -19,7 +19,7 @@ pub(super) fn register_root_device(device: Box<dyn BlockDeviceOps>) {
             path: alloc::format!("/dev/block{id}"),
             transport,
             readonly,
-            kind: BlockDeviceKind::Root(Arc::new(Mutex::new(device))),
+            kind: BlockDeviceKind::Root(Arc::new(KernelWaitLock::new(device))),
         });
         id
     };

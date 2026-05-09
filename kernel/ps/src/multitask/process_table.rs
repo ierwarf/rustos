@@ -257,6 +257,27 @@ pub fn retain_process(handle: ProcessHandle) -> Option<ProcessRef> {
     })
 }
 
+pub fn retain_process_by_pid(process_id: u64) -> Option<ProcessRef> {
+    let mut table = PROCESS_TABLE.lock();
+    for (index, slot) in table.slots.iter_mut().enumerate() {
+        let generation = slot.generation;
+        let Some(object) = slot.object.as_deref_mut() else {
+            continue;
+        };
+        if object.process_id != process_id {
+            continue;
+        }
+        object.ref_count = object.ref_count.checked_add(1)?;
+        let state_ptr = object.state_ptr();
+        return Some(ProcessRef {
+            handle: ProcessHandle::new(index, generation),
+            process_id,
+            state_ptr,
+        });
+    }
+    None
+}
+
 pub fn release_process_ref(handle: ProcessHandle) {
     let mut table = PROCESS_TABLE.lock();
     let should_queue = {
@@ -312,13 +333,8 @@ pub fn with_process_state_by_pid_mut<R>(
     process_id: u64,
     f: impl FnOnce(&mut UserProcessState) -> R,
 ) -> Option<R> {
-    let mut table = PROCESS_TABLE.lock();
-    let object = table
-        .slots
-        .iter_mut()
-        .filter_map(|slot| slot.object.as_deref_mut())
-        .find(|object| object.process_id == process_id)?;
-    Some(f(unsafe { &mut *object.state.get() }))
+    let mut process = retain_process_by_pid(process_id)?;
+    Some(f(process.state_mut()))
 }
 
 pub fn replace_for_exec(

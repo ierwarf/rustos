@@ -2,14 +2,11 @@ use alloc::vec::Vec;
 use core::slice;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use spin::Mutex;
-#[cfg(not(test))]
-use x86_64::instructions::interrupts;
-
 use super::compat::{
     LinuxCompatPs2Dev, LinuxCompatPs2PreReceiveHandler, LinuxCompatPs2ReceiveHandler,
     LinuxCompatSerio,
 };
+use crate::sync::KernelWaitLock;
 
 struct RegisteredPs2Dev {
     port_id: u32,
@@ -18,19 +15,11 @@ struct RegisteredPs2Dev {
 
 unsafe impl Send for RegisteredPs2Dev {}
 
-static PS2_DEVS: Mutex<Vec<RegisteredPs2Dev>> = Mutex::new(Vec::new());
+static PS2_DEVS: KernelWaitLock<Vec<RegisteredPs2Dev>> = KernelWaitLock::new(Vec::new());
 static PS2_INTERRUPT_DEBUG_REMAINING: AtomicUsize = AtomicUsize::new(0);
 
 fn with_ps2_devs<R>(f: impl FnOnce(&mut Vec<RegisteredPs2Dev>) -> R) -> R {
-    #[cfg(test)]
-    {
-        f(&mut PS2_DEVS.lock())
-    }
-
-    #[cfg(not(test))]
-    {
-        interrupts::without_interrupts(|| f(&mut PS2_DEVS.lock()))
-    }
+    f(&mut PS2_DEVS.lock())
 }
 
 pub(crate) unsafe extern "C" fn ps2_init(

@@ -96,6 +96,10 @@ Kernel API:
 - Boot order: disable interrupts -> boot trace init -> GDT -> IDT -> paging -> higher-half jump -> stack switch -> executive bootstrap.
 - Cross-crate rule: import `kernel_x::api as x_api`; do not reach into another crate's private modules when `api.rs` exposes a wrapper.
 - User-memory IO APIs belong in syscall/process-context-aware paths only.
+- Scheduler-aware wait users should use `kernel_ps::api::{current_task_id,
+  block_current_task, wake_task}`. The `current_user_id`,
+  `block_current_user_task`, and `wake_user_task` wrappers remain userspace-task
+  helpers, not general kernel wait primitives.
 
 Kernel build:
 

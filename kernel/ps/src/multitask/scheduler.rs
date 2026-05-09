@@ -1,6 +1,6 @@
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::{mem, ptr};
+use core::{mem, ptr, ptr::NonNull};
 
 use x86_64::PhysAddr;
 use x86_64::VirtAddr;
@@ -13,7 +13,7 @@ use crate::debug;
 use crate::io::session::ConsoleSessionHandle;
 use crate::memory::paging::ProcessAddressSpace;
 use crate::user::abi::UserAbi;
-use crate::user::linux::{LinuxProcessState, LinuxThreadState};
+use crate::user::linux::LinuxThreadState;
 use crate::user::process;
 use crate::user::process_state::{UserProcessState, WindowsThreadRuntimeState};
 
@@ -35,6 +35,14 @@ const STACK_CANARY_WORD: u64 = 0x5343_4844_554c_4552;
 const TASK_ENTRY_STACK_RESERVE_QWORDS: usize = 3;
 const PAGE_FAULT_VECTOR: u8 = 14;
 const RFLAGS_RESERVED_BIT_1: u64 = 1 << 1;
+
+pub(super) struct CurrentLinuxThreadBinding {
+    pub(super) process_handle: ProcessHandle,
+    pub(super) tid: u64,
+    pub(super) abi: UserAbi,
+    pub(super) linux_thread_state: NonNull<Option<LinuxThreadState>>,
+}
+
 #[derive(Clone, Copy)]
 enum TaskRetireReason {
     UserFault {
@@ -1213,6 +1221,10 @@ impl Scheduler {
         self.starts[self.current_task].map(|start| start.id)
     }
 
+    pub(super) fn current_task_id(&self) -> Option<u64> {
+        self.starts[self.current_task].map(|start| start.id)
+    }
+
     pub(super) fn current_console_session(&self) -> ConsoleSessionHandle {
         self.contexts[self.current_task]
             .map(|context| context.console_session)
@@ -1230,17 +1242,7 @@ impl Scheduler {
         true
     }
 
-    pub(super) fn with_current_user_linux_state_mut<R>(
-        &mut self,
-        f: impl FnOnce(
-            u64,
-            u64,
-            UserAbi,
-            &mut ProcessAddressSpace,
-            &mut Option<LinuxProcessState>,
-            &mut Option<LinuxThreadState>,
-        ) -> R,
-    ) -> Option<R> {
+    pub(super) fn current_linux_thread_binding(&mut self) -> Option<CurrentLinuxThreadBinding> {
         let slot = self.current_task;
         let context = self.contexts[slot].as_mut()?;
         if !context.user_mode {
@@ -1250,69 +1252,18 @@ impl Scheduler {
         let abi = context.user_abi?;
         let tid = self.starts[slot].map(|start| start.id)?;
         let process_handle = context.process_handle?;
-        let Some(process_id) = process_table::process_id(process_handle) else {
-            return None;
-        };
-        let thread_state_ptr = ptr::addr_of_mut!(context.linux_thread_state);
-        let linux_thread_state = unsafe { &mut *thread_state_ptr };
-        process_table::with_process_state_mut(process_handle, |_, process_state| {
-            let (address_space, linux_process_state) =
-                process_state.address_space_and_linux_process_state_mut();
-            f(
-                process_id,
-                tid,
-                abi,
-                address_space,
-                linux_process_state,
-                linux_thread_state,
-            )
+        let linux_thread_state = NonNull::new(ptr::addr_of_mut!(context.linux_thread_state))?;
+        Some(CurrentLinuxThreadBinding {
+            process_handle,
+            tid,
+            abi,
+            linux_thread_state,
         })
     }
 
-    pub(super) fn with_current_user_process_and_linux_thread_state_mut<R>(
-        &mut self,
-        f: impl FnOnce(u64, u64, UserAbi, &mut UserProcessState, &mut Option<LinuxThreadState>) -> R,
-    ) -> Option<R> {
-        let slot = self.current_task;
-        let context = self.contexts[slot].as_mut()?;
-        if !context.user_mode {
-            return None;
-        }
-
-        let abi = context.user_abi?;
-        let tid = self.starts[slot].map(|start| start.id)?;
-        let process_handle = context.process_handle?;
-        let Some(process_id) = process_table::process_id(process_handle) else {
-            return None;
-        };
-        let thread_state_ptr = ptr::addr_of_mut!(context.linux_thread_state);
-        let linux_thread_state = unsafe { &mut *thread_state_ptr };
-        process_table::with_process_state_mut(process_handle, |_, process_state| {
-            f(process_id, tid, abi, process_state, linux_thread_state)
-        })
-    }
-
-    // Windows thread state mutation is a staged API even before more callers land.
-    #[allow(dead_code)]
-    pub(super) fn with_current_user_windows_thread_state_mut<R>(
-        &mut self,
-        f: impl FnOnce(u64, &mut WindowsThreadRuntimeState) -> R,
-    ) -> Option<R> {
-        let slot = self.current_task;
-        let context = self.contexts[slot].as_mut()?;
-        if !context.user_mode {
-            return None;
-        }
-
-        let tid = self.starts[slot].map(|start| start.id)?;
-        let thread_state = context.windows_thread_state.as_mut()?;
-        Some(f(tid, thread_state))
-    }
-
-    pub(super) fn any_user_process_state(
-        &mut self,
-        mut f: impl FnMut(u64, &UserProcessState) -> bool,
-    ) -> bool {
+    pub(super) fn user_process_handles_snapshot(
+        &self,
+    ) -> ([Option<ProcessHandle>; MAX_TASK], usize) {
         let mut seen = [None; MAX_TASK];
         let mut seen_count = 0usize;
         for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
@@ -1337,20 +1288,27 @@ impl Scheduler {
                 continue;
             }
 
-            let should_stop =
-                process_table::with_process_state(process_handle, |process_id, process_state| {
-                    f(process_id, process_state)
-                })
-                .unwrap_or(false);
-            if should_stop {
-                return true;
-            }
-
             seen[seen_count] = Some(process_handle);
             seen_count += 1;
         }
+        (seen, seen_count)
+    }
 
-        false
+    // Windows thread state mutation is a staged API even before more callers land.
+    #[allow(dead_code)]
+    pub(super) fn with_current_user_windows_thread_state_mut<R>(
+        &mut self,
+        f: impl FnOnce(u64, &mut WindowsThreadRuntimeState) -> R,
+    ) -> Option<R> {
+        let slot = self.current_task;
+        let context = self.contexts[slot].as_mut()?;
+        if !context.user_mode {
+            return None;
+        }
+
+        let tid = self.starts[slot].map(|start| start.id)?;
+        let thread_state = context.windows_thread_state.as_mut()?;
+        Some(f(tid, thread_state))
     }
 
     pub(super) fn exec_current_user_process(
@@ -1673,10 +1631,35 @@ impl Scheduler {
         true
     }
 
+    pub(super) fn block_current_task(&mut self) -> bool {
+        let slot = self.current_task;
+        let Some(context) = self.contexts[slot].as_mut() else {
+            return false;
+        };
+        if slot == ROOT_TASK_SLOT {
+            return false;
+        }
+
+        context.blocked = true;
+        context.ready = false;
+        true
+    }
+
     pub(super) fn wake_user_task(&mut self, task_id: u64) -> bool {
         let Some(slot) = self.find_user_task_slot(task_id) else {
             return false;
         };
+        self.wake_task_slot(slot)
+    }
+
+    pub(super) fn wake_task(&mut self, task_id: u64) -> bool {
+        let Some(slot) = self.find_task_slot(task_id) else {
+            return false;
+        };
+        self.wake_task_slot(slot)
+    }
+
+    fn wake_task_slot(&mut self, slot: usize) -> bool {
         if self.retired[slot] {
             return false;
         }
@@ -1816,6 +1799,19 @@ impl Scheduler {
                 continue;
             };
             if !context.user_mode {
+                continue;
+            }
+            if self.starts[slot].map(|start| start.id) == Some(task_id) {
+                return Some(slot);
+            }
+        }
+
+        None
+    }
+
+    fn find_task_slot(&self, task_id: u64) -> Option<usize> {
+        for slot in 0..MAX_TASK {
+            if self.retired[slot] || self.contexts[slot].is_none() {
                 continue;
             }
             if self.starts[slot].map(|start| start.id) == Some(task_id) {

@@ -53,8 +53,8 @@ const DEVICE_SEND_RETRIES: usize = 1;
 const DEVICE_RESPONSE_READ_RETRIES: usize = 1;
 const AUX_COMMAND_NOISE_BUDGET: usize = 32;
 const MAX_BYTES_PER_INTERRUPT: usize = 32;
-const DEFERRED_KEYBOARD_BYTES_CAPACITY: usize = 256;
-const DEFERRED_KEYBOARD_DROP_LOG_INTERVAL: u64 = 64;
+const DEFERRED_CONTROLLER_BYTES_CAPACITY: usize = 256;
+const DEFERRED_CONTROLLER_DROP_LOG_INTERVAL: u64 = 64;
 const PS2_CMD_GETID: u8 = 0xF2;
 const PS2_CMD_DISABLE_SCANNING: u8 = 0xF5;
 
@@ -68,8 +68,8 @@ static CONTROLLER_ACCESS_ACTIVE: AtomicBool = AtomicBool::new(false);
 static AUX_INTERRUPT_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 static AUX_DEBUG_BYTES_REMAINING: AtomicUsize = AtomicUsize::new(0);
 static CONTROLLER_ACCESS_LOCK: Mutex<()> = Mutex::new(());
-static DEFERRED_KEYBOARD_BYTES: Mutex<DeferredKeyboardBytesState> =
-    Mutex::new(DeferredKeyboardBytesState::new());
+static DEFERRED_CONTROLLER_BYTES: Mutex<DeferredControllerBytesState> =
+    Mutex::new(DeferredControllerBytesState::new());
 static PS2_MOUSE_PACKET_STATE: Mutex<Ps2MousePacketState> = Mutex::new(Ps2MousePacketState::new());
 
 const PS2_MOUSE_STATUS_LEFT: u8 = 1 << 0;
@@ -79,8 +79,8 @@ const PS2_MOUSE_STATUS_ALWAYS_ONE: u8 = 1 << 3;
 const PS2_MOUSE_STATUS_X_OVERFLOW: u8 = 1 << 6;
 const PS2_MOUSE_STATUS_Y_OVERFLOW: u8 = 1 << 7;
 
-struct DeferredKeyboardBytesState {
-    queued: RingBuffer<u8, DEFERRED_KEYBOARD_BYTES_CAPACITY>,
+struct DeferredControllerBytesState {
+    queued: RingBuffer<ControllerByte, DEFERRED_CONTROLLER_BYTES_CAPACITY>,
     dropped_bytes: u64,
 }
 
@@ -111,7 +111,7 @@ static BUILTIN_PS2_MOUSE_DRIVER: SerioDriverRegistration = SerioDriverRegistrati
     Some(builtin_ps2_mouse_interrupt),
 );
 
-impl DeferredKeyboardBytesState {
+impl DeferredControllerBytesState {
     const fn new() -> Self {
         Self {
             queued: RingBuffer::new(),
@@ -119,22 +119,22 @@ impl DeferredKeyboardBytesState {
         }
     }
 
-    fn push_deferred_byte(&mut self, byte: u8) {
+    fn push_deferred_byte(&mut self, byte: ControllerByte) {
         if self.queued.push(byte) {
             return;
         }
 
         self.dropped_bytes = self.dropped_bytes.saturating_add(1);
-        if self.dropped_bytes % DEFERRED_KEYBOARD_DROP_LOG_INTERVAL == 0 {
+        if self.dropped_bytes % DEFERRED_CONTROLLER_DROP_LOG_INTERVAL == 0 {
             crate::debug::println!(
-                "i8042 deferred keyboard overflow: dropped={} queued={}",
+                "i8042 deferred byte overflow: dropped={} queued={}",
                 self.dropped_bytes,
                 self.queued.len()
             );
         }
     }
 
-    fn pop_into(&mut self, dest: &mut [u8]) -> usize {
+    fn pop_into(&mut self, dest: &mut [ControllerByte]) -> usize {
         self.queued.pop_into(dest)
     }
 }
@@ -214,14 +214,14 @@ pub(crate) fn on_keyboard_interrupt() {
     if !KEYBOARD_TRANSPORT_ACTIVE.load(Ordering::Acquire) {
         return;
     }
-    interrupts::without_interrupts(poll_keyboard_controller);
+    interrupts::without_interrupts(capture_controller_outputs);
 }
 
 pub(crate) fn on_aux_interrupt() {
     if !AUX_TRANSPORT_ACTIVE.load(Ordering::Acquire) {
         return;
     }
-    interrupts::without_interrupts(poll_aux_controller);
+    interrupts::without_interrupts(capture_controller_outputs);
 }
 
 fn init_keyboard_port_inner() -> Result<KeyboardTransportInfo, &'static str> {
@@ -288,20 +288,12 @@ fn aux_device_present() -> bool {
     }
 }
 
-fn poll_keyboard_controller() {
-    poll_controller_outputs();
-}
-
-fn poll_aux_controller() {
-    poll_controller_outputs();
-}
-
-fn poll_controller_outputs() {
+fn capture_controller_outputs() {
     for _ in 0..MAX_BYTES_PER_INTERRUPT {
         let Some(data) = read_controller_byte_nowait() else {
             break;
         };
-        dispatch_controller_byte(data);
+        queue_deferred_controller_byte(data);
     }
 }
 
@@ -795,7 +787,19 @@ fn read_controller_byte_nowait() -> Option<ControllerByte> {
     })
 }
 
+fn queue_deferred_controller_byte(data: ControllerByte) {
+    DEFERRED_CONTROLLER_BYTES.lock().push_deferred_byte(data);
+}
+
 fn dispatch_controller_byte(data: ControllerByte) {
+    if !interrupts::are_enabled() {
+        queue_deferred_controller_byte(data);
+        return;
+    }
+    dispatch_controller_byte_lower_half(data);
+}
+
+fn dispatch_controller_byte_lower_half(data: ControllerByte) {
     if data.aux {
         if AUX_INTERRUPT_SUPPRESSED.load(Ordering::Acquire) {
             return;
@@ -825,20 +829,19 @@ fn dispatch_controller_byte(data: ControllerByte) {
     }
 
     if KEYBOARD_TRANSPORT_ACTIVE.load(Ordering::Acquire) {
-        if CONTROLLER_ACCESS_ACTIVE.load(Ordering::Acquire) {
-            DEFERRED_KEYBOARD_BYTES.lock().push_deferred_byte(data.byte);
-        } else {
-            crate::input::keyboard::on_scancode(data.byte);
-        }
+        crate::input::keyboard::on_scancode(data.byte);
     }
 }
 
 pub(crate) fn service_pending() -> usize {
-    let mut bytes = [0_u8; DEFERRED_KEYBOARD_BYTES_CAPACITY];
+    let mut bytes = [ControllerByte {
+        byte: 0,
+        aux: false,
+    }; DEFERRED_CONTROLLER_BYTES_CAPACITY];
     let count =
-        interrupts::without_interrupts(|| DEFERRED_KEYBOARD_BYTES.lock().pop_into(&mut bytes));
+        interrupts::without_interrupts(|| DEFERRED_CONTROLLER_BYTES.lock().pop_into(&mut bytes));
     for &byte in &bytes[..count] {
-        crate::input::keyboard::on_scancode(byte);
+        dispatch_controller_byte_lower_half(byte);
     }
     count
 }

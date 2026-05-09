@@ -34,6 +34,9 @@ High-risk APIs:
 - `unsafe` boot transfer helpers: `enter_higher_half`, `call_with_stack`.
 - user-memory IO: `read_to_current_user`, `read_to_user`, `ioctl_from_user`.
 - process state mutation: `with_current_user_process_state_mut`, `with_process_state_by_pid_mut`.
+- scheduler wait primitives: use `current_task_id`, `block_current_task`, and
+  `wake_task` for kernel-capable wait queues; use `*_user_*` wrappers only for
+  userspace-task waits.
 - VFS mount/unmount/open path helpers: require current process context.
 
 Docs:

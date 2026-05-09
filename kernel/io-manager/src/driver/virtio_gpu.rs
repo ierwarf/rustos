@@ -100,7 +100,7 @@ struct VirtioGpuDisplay {
     _common: *mut u8,
     notify: *mut u8,
     _device_config: *mut u8,
-    notify_multiplier: u32,
+    notify_offset: usize,
     queue: VirtQueue,
     command_cpu: *mut u8,
     command_dma: u64,
@@ -286,9 +286,25 @@ impl VirtioGpuDisplay {
             );
         }
 
-        if wait_for_queue_used(used, self.queue.used_idx) {
-            let next_used = unsafe { ptr::read_volatile(used.add(2) as *const u16) };
+        if let Some(next_used) = wait_for_queue_used(used, self.queue.used_idx) {
+            let expected_next_used = self.queue.used_idx.wrapping_add(1);
+            compiler_fence(Ordering::SeqCst);
+            let used_index = self.queue.used_idx as usize % self.queue.queue_size as usize;
+            let used_elem = unsafe { used.add(4 + used_index * 8) };
+            let used_id = unsafe { ptr::read_volatile(used_elem as *const u32) };
+            let used_len = unsafe { ptr::read_volatile(used_elem.add(4) as *const u32) };
             self.queue.used_idx = next_used;
+            if next_used != expected_next_used
+                || used_id != u32::from(head)
+                || used_len > response_len as u32
+            {
+                trace_native(
+                    "virtio-gpu-native-used-ring-invalid",
+                    u64::from(used_id),
+                    u64::from(used_len),
+                );
+                return false;
+            }
             return true;
         }
 
@@ -296,7 +312,7 @@ impl VirtioGpuDisplay {
     }
 
     fn queue_notify_offset(&self) -> usize {
-        (self.queue.notify_off as usize).saturating_mul(self.notify_multiplier as usize)
+        self.notify_offset
     }
 
     fn flush_backoff_active(&self) -> bool {
@@ -335,7 +351,7 @@ impl VirtioGpuDisplay {
     }
 }
 
-fn wait_for_queue_used(used: *mut u8, current_used_idx: u16) -> bool {
+fn wait_for_queue_used(used: *mut u8, current_used_idx: u16) -> Option<u16> {
     let start_ticks = crate::arch::rtc::ticks();
     if start_ticks != 0 {
         let timeout_ticks = milliseconds_to_ticks(COMMAND_COMPLETION_TIMEOUT_MS).max(1);
@@ -343,10 +359,10 @@ fn wait_for_queue_used(used: *mut u8, current_used_idx: u16) -> bool {
         loop {
             let next_used = unsafe { ptr::read_volatile(used.add(2) as *const u16) };
             if next_used != current_used_idx {
-                return true;
+                return Some(next_used);
             }
             if crate::arch::rtc::ticks() >= deadline {
-                return false;
+                return None;
             }
             crate::arch::rtc::sleep(1);
         }
@@ -355,11 +371,11 @@ fn wait_for_queue_used(used: *mut u8, current_used_idx: u16) -> bool {
     for _ in 0..COMMAND_COMPLETION_BOOT_SPINS {
         let next_used = unsafe { ptr::read_volatile(used.add(2) as *const u16) };
         if next_used != current_used_idx {
-            return true;
+            return Some(next_used);
         }
         core::hint::spin_loop();
     }
-    false
+    None
 }
 
 fn milliseconds_to_ticks(milliseconds: u64) -> u64 {
@@ -542,6 +558,20 @@ fn probe_and_init() -> Option<VirtioGpuDisplay> {
         crate::debug::println!("virtio-gpu native: control queue setup failed");
         return None;
     };
+    let Some(notify_offset) =
+        checked_queue_notify_offset(queue.notify_off, caps.notify_multiplier, caps.notify.length)
+    else {
+        trace_native(
+            "virtio-gpu-native-notify-offset-invalid",
+            pci_bdf_key(pci),
+            0,
+        );
+        crate::debug::println!("virtio-gpu native: notify offset outside mapped capability");
+        unsafe {
+            mark_driver_failed(common);
+        }
+        return None;
+    };
     let Some((command_cpu, command_dma)) = alloc_dma(COMMAND_MEM_SIZE) else {
         trace_native(
             "virtio-gpu-native-command-alloc-failed",
@@ -556,7 +586,7 @@ fn probe_and_init() -> Option<VirtioGpuDisplay> {
         _common: common,
         notify,
         _device_config: device_config,
-        notify_multiplier: caps.notify_multiplier,
+        notify_offset,
         queue,
         command_cpu,
         command_dma,
@@ -648,6 +678,16 @@ fn pci_device_is_virtio_gpu(device_id: u16) -> bool {
         device_id,
         PCI_DEVICE_VIRTIO_GPU_MODERN | PCI_DEVICE_VIRTIO_GPU_TRANSITIONAL
     )
+}
+
+fn checked_queue_notify_offset(
+    notify_off: u16,
+    notify_multiplier: u32,
+    notify_region_len: usize,
+) -> Option<usize> {
+    let offset = (notify_off as usize).checked_mul(notify_multiplier as usize)?;
+    let end = offset.checked_add(core::mem::size_of::<u16>())?;
+    (end <= notify_region_len).then_some(offset)
 }
 
 fn trace_native(name: &'static str, arg0: u64, arg1: u64) {
@@ -935,6 +975,10 @@ fn map_region(
         return None;
     }
     let size = region.length.max(4);
+    let end = region.offset.checked_add(size as u64)?;
+    if end > resource.size {
+        return None;
+    }
     let ptr = crate::driver::mmio::map(
         resource.start.checked_add(region.offset)?,
         size,

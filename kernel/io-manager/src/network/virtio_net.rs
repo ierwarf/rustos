@@ -9,8 +9,9 @@ use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxT
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address};
-use spin::Mutex;
 use tock_registers::register_bitfields;
+
+use crate::sync::KernelWaitLock;
 
 use super::{
     InetSocketError, LinuxNetdevTransport, STATIC_IPV4_ADDR, STATIC_IPV4_GATEWAY,
@@ -78,9 +79,9 @@ const ETHERNET_MTU: usize = 1514;
 const TCP_RX_BUFFER_SIZE: usize = 8192;
 const TCP_TX_BUFFER_SIZE: usize = 8192;
 const TCP_CONNECT_TIMEOUT_MS: u64 = 5_000;
-const TCP_IO_POLL_SPINS: usize = 20_000;
+const TCP_IO_POLL_ATTEMPTS: usize = 20_000;
 
-static STACK: Mutex<Option<NetworkStack>> = Mutex::new(None);
+static STACK: KernelWaitLock<Option<NetworkStack>> = KernelWaitLock::new(None);
 
 #[derive(Clone, Copy)]
 struct VirtioPciCaps {
@@ -327,22 +328,26 @@ pub(super) fn recv_tcp(
     nonblocking: bool,
 ) -> Result<usize, InetSocketError> {
     ensure_initialized()?;
-    let mut stack = STACK.lock();
-    let stack = stack.as_mut().ok_or(InetSocketError::NetworkUnreachable)?;
-    let handle = find_tcp_socket(stack, token)?;
-    let spins = if nonblocking { 1 } else { TCP_IO_POLL_SPINS };
-    for _ in 0..spins {
-        poll_stack(stack);
-        let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
-        if socket.can_recv() {
-            return socket
-                .recv_slice(out)
-                .map_err(|_| InetSocketError::OperationNotSupported);
+    let attempts = if nonblocking { 1 } else { TCP_IO_POLL_ATTEMPTS };
+    for _ in 0..attempts {
+        {
+            let mut stack = STACK.lock();
+            let stack = stack.as_mut().ok_or(InetSocketError::NetworkUnreachable)?;
+            let handle = find_tcp_socket(stack, token)?;
+            poll_stack(stack);
+            let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
+            if socket.can_recv() {
+                return socket
+                    .recv_slice(out)
+                    .map_err(|_| InetSocketError::OperationNotSupported);
+            }
+            if !socket.may_recv() {
+                return Ok(0);
+            }
         }
-        if !socket.may_recv() {
-            return Ok(0);
+        if !nonblocking {
+            crate::multitask::yield_now();
         }
-        core::hint::spin_loop();
     }
     Err(InetSocketError::TryAgain)
 }

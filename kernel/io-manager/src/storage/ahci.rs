@@ -8,12 +8,12 @@ use core::ptr;
 use core::slice;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use spin::Mutex;
 use storage_core::BlockDevice as SharedBlockDevice;
 
 use crate::arch::pci::PciDevice;
 use crate::storage::block::{BlockDeviceOps, BlockTransportKind};
 use crate::storage::fat::{DiskIoError, IoResult};
+use crate::sync::KernelWaitLock;
 
 const PCI_CLASS_MASS_STORAGE: u8 = 0x01;
 const PCI_SUBCLASS_SATA: u8 = 0x06;
@@ -133,7 +133,7 @@ struct AhciBlockDevice {
     sector_count: u64,
     #[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code))]
     model: String,
-    runtime: Mutex<AhciPortRuntime>,
+    runtime: KernelWaitLock<AhciPortRuntime>,
 }
 
 unsafe impl Send for AhciBlockDevice {}
@@ -473,7 +473,7 @@ fn probe_port(
         port,
         sector_count,
         model,
-        runtime: Mutex::new(runtime),
+        runtime: KernelWaitLock::new(runtime),
     }))
 }
 

@@ -1,12 +1,11 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use nucleus_core::util::ring::RingBuffer;
-use spin::Mutex;
-use x86_64::instructions::interrupts;
 
 use crate::input::keyboard::{KeyAction, KeyCode, KeyboardEvent};
 use crate::io::console;
 use crate::io::session::ConsoleSessionHandle;
+use crate::sync::KernelWaitLock;
 use crate::user::linux as linux_abi;
 
 const INPUT_BUFFER_CAPACITY: usize = 1024;
@@ -14,7 +13,7 @@ const EDIT_BUFFER_CAPACITY: usize = 256;
 const CURSOR_MOVE_SEQUENCE_MAX_LEN: usize = 16;
 const TTY_DEBUG_LOG_LIMIT: usize = 32;
 
-static TTY: Mutex<TtyCollection> = Mutex::new(TtyCollection::new());
+static TTY: KernelWaitLock<TtyCollection> = KernelWaitLock::new(TtyCollection::new());
 static TTY_COMMIT_DEBUG_LOGS: AtomicUsize = AtomicUsize::new(0);
 static TTY_WAKE_DEBUG_LOGS: AtomicUsize = AtomicUsize::new(0);
 
@@ -30,7 +29,7 @@ pub fn on_key_event_for_session(session: ConsoleSessionHandle, event: KeyboardEv
         return;
     }
 
-    interrupts::without_interrupts(|| TTY.lock().session_mut(session).on_key_event(session, event))
+    TTY.lock().session_mut(session).on_key_event(session, event);
 }
 
 #[allow(dead_code)]
@@ -39,19 +38,19 @@ pub fn read_input(dest: &mut [u8]) -> usize {
 }
 
 pub fn read_input_for_session(session: ConsoleSessionHandle, dest: &mut [u8]) -> usize {
-    interrupts::without_interrupts(|| TTY.lock().session_mut(session).read_input(dest))
+    TTY.lock().session_mut(session).read_input(dest)
 }
 
 pub fn has_pending_input_for_session(session: ConsoleSessionHandle) -> bool {
-    interrupts::without_interrupts(|| TTY.lock().session_mut(session).has_pending_input())
+    TTY.lock().session_mut(session).has_pending_input()
 }
 
 pub fn pending_input_len_for_session(session: ConsoleSessionHandle) -> usize {
-    interrupts::without_interrupts(|| TTY.lock().session_mut(session).pending_input_len())
+    TTY.lock().session_mut(session).pending_input_len()
 }
 
 pub fn termios_for_session(session: ConsoleSessionHandle) -> linux_abi::LinuxTermios {
-    interrupts::without_interrupts(|| TTY.lock().session_mut(session).termios())
+    TTY.lock().session_mut(session).termios()
 }
 
 pub fn set_termios_for_session(
@@ -59,11 +58,9 @@ pub fn set_termios_for_session(
     termios: linux_abi::LinuxTermios,
     flush_input: bool,
 ) {
-    interrupts::without_interrupts(|| {
-        TTY.lock()
-            .session_mut(session)
-            .set_termios(termios, flush_input)
-    });
+    TTY.lock()
+        .session_mut(session)
+        .set_termios(termios, flush_input);
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -84,24 +81,23 @@ pub fn read_input_blocking_for_session(session: ConsoleSessionHandle, dest: &mut
             Blocked,
         }
 
-        let disposition = interrupts::without_interrupts(|| {
+        let disposition = {
             let mut tty = TTY.lock();
             let session_state = tty.session_mut(session);
             let read = session_state.read_input(dest);
             if read != 0 {
-                return ReadDisposition::Ready(read);
+                ReadDisposition::Ready(read)
+            } else if let Some(task_id) = current_task_id {
+                if crate::multitask::block_current_user_task() {
+                    session_state.input_waiter = Some(task_id);
+                    ReadDisposition::Blocked
+                } else {
+                    ReadDisposition::Ready(0)
+                }
+            } else {
+                ReadDisposition::Ready(0)
             }
-
-            let Some(task_id) = current_task_id else {
-                return ReadDisposition::Ready(0);
-            };
-            if !crate::multitask::block_current_user_task() {
-                return ReadDisposition::Ready(0);
-            }
-
-            session_state.input_waiter = Some(task_id);
-            ReadDisposition::Blocked
-        });
+        };
 
         match disposition {
             ReadDisposition::Ready(read) => return read,
@@ -116,11 +112,11 @@ pub fn write(bytes: &[u8]) -> usize {
 }
 
 pub fn write_to_session(session: ConsoleSessionHandle, bytes: &[u8]) -> usize {
-    interrupts::without_interrupts(|| TTY.lock().session_mut(session).write(session, bytes))
+    TTY.lock().session_mut(session).write(session, bytes)
 }
 
 pub(crate) fn reset_session(session: ConsoleSessionHandle) {
-    interrupts::without_interrupts(|| TTY.lock().reset_session(session));
+    TTY.lock().reset_session(session);
 }
 
 fn session_accepts_user_input(session: ConsoleSessionHandle) -> bool {

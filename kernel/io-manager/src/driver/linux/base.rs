@@ -1,4 +1,4 @@
-use alloc::alloc::{alloc, dealloc, Layout};
+use alloc::alloc::{Layout, alloc, dealloc};
 use alloc::vec::Vec;
 use core::ffi::{c_char, c_void};
 use core::ptr;
@@ -538,6 +538,7 @@ pub(crate) unsafe extern "C" fn _find_next_bit(
 pub(crate) unsafe extern "C" fn msleep(milliseconds: u32) {
     const SERVICE_QUANTUM_MS: u64 = 10;
 
+    crate::driver::linux::runtime::assert_no_irq_spinlock_held("msleep");
     let mut remaining = milliseconds as u64;
     while remaining != 0 {
         let slice = remaining.min(SERVICE_QUANTUM_MS);

@@ -8,12 +8,12 @@ use core::hint::spin_loop;
 use core::ptr;
 use core::sync::atomic::{Ordering, fence};
 
-use spin::Mutex;
 use storage_core::BlockDevice as SharedBlockDevice;
 
 use crate::arch::pci::PciDevice;
 use crate::storage::block::{BlockDeviceOps, BlockTransportKind};
 use crate::storage::fat::{DiskIoError, IoResult};
+use crate::sync::KernelWaitLock;
 
 const PCI_CLASS_MASS_STORAGE: u8 = 0x01;
 const PCI_SUBCLASS_NVM: u8 = 0x08;
@@ -142,7 +142,7 @@ struct NvmeBlockDevice {
     logical_block_size: usize,
     #[allow(dead_code)]
     model: String,
-    runtime: Mutex<NvmeRuntime>,
+    runtime: KernelWaitLock<NvmeRuntime>,
 }
 
 unsafe impl Send for NvmeBlockDevice {}
@@ -521,7 +521,7 @@ fn probe_controller(pci: PciDevice) -> Result<Option<NvmeBlockDevice>, DiskIoErr
         block_count,
         logical_block_size,
         model,
-        runtime: Mutex::new(NvmeRuntime {
+        runtime: KernelWaitLock::new(NvmeRuntime {
             admin,
             io,
             identify_cpu,

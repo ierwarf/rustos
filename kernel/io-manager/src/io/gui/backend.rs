@@ -1,17 +1,20 @@
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use alloc::vec::Vec;
+#[cfg(rustos_debug_print_enabled)]
+use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use boot_protocol::FramebufferInfo;
-use spin::Mutex;
-use x86_64::instructions::interrupts;
+use x86_64::VirtAddr;
 
+use super::framebuffer::{build_framebuffer, Framebuffer, FramebufferRect};
 use super::GuiDisplayInfo;
-use super::framebuffer::{Framebuffer, FramebufferRect, build_framebuffer};
 use crate::memory::paging::{self, ProcessAddressSpace};
+use crate::sync::KernelWaitLock;
 
-const HUGE_2MIB: u64 = 2 * 1024 * 1024;
 const ENABLE_FRAMEBUFFER_WRITE_COMBINE: bool = false;
+#[cfg(rustos_debug_print_enabled)]
 const MAX_BACKEND_PRESENT_SAMPLE_LOGS: usize = 8;
-const USER_PRESENT_STRIPE_BYTES: usize = 256 * 1024;
+const USER_PRESENT_STRIPE_BYTES: usize = 1024 * 1024;
 
 enum BackendInstance {
     Unavailable,
@@ -28,7 +31,9 @@ pub(crate) struct DisplayBackend {
     generation: u64,
 }
 
-static DISPLAY_BACKEND: Mutex<DisplayBackend> = Mutex::new(DisplayBackend::empty());
+static DISPLAY_BACKEND: KernelWaitLock<DisplayBackend> =
+    KernelWaitLock::new(DisplayBackend::empty());
+#[cfg(rustos_debug_print_enabled)]
 static BACKEND_PRESENT_SAMPLE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static DISPLAY_WIDTH: AtomicU32 = AtomicU32::new(0);
 static DISPLAY_HEIGHT: AtomicU32 = AtomicU32::new(0);
@@ -82,7 +87,11 @@ impl DisplayBackend {
 
 fn next_display_generation(current: u64) -> u64 {
     let next = current.wrapping_add(1);
-    if next == 0 { 1 } else { next }
+    if next == 0 {
+        1
+    } else {
+        next
+    }
 }
 
 pub(crate) fn install_boot_framebuffer(info: FramebufferInfo, flags: u32) -> bool {
@@ -134,7 +143,7 @@ pub(crate) fn present_bgra8888_from_user(
     Ok(presented)
 }
 
-#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
+#[cfg(rustos_debug_print_enabled)]
 fn log_backend_present_sample(framebuffer: &Framebuffer, drawn: bool) {
     let sample_index = BACKEND_PRESENT_SAMPLE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if sample_index >= MAX_BACKEND_PRESENT_SAMPLE_LOGS {
@@ -157,6 +166,9 @@ fn log_backend_present_sample(framebuffer: &Framebuffer, drawn: bool) {
         framebuffer.debug_uses_double_buffer(),
     );
 }
+
+#[cfg(not(rustos_debug_print_enabled))]
+fn log_backend_present_sample(_framebuffer: &Framebuffer, _drawn: bool) {}
 
 pub(crate) fn present_bgra8888_rect_from_user(
     address_space: &ProcessAddressSpace,
@@ -196,6 +208,26 @@ fn copy_user_bgra8888_rect_in_stripes(
     if rect.width == 0 || rect.height == 0 {
         return Ok(true);
     }
+    let Some(info) = display_info() else {
+        return Ok(false);
+    };
+    if width != info.width as usize || height != info.height as usize {
+        return Ok(false);
+    }
+    let Some(min_stride) = width.checked_mul(4) else {
+        return Ok(false);
+    };
+    if stride_bytes < min_stride {
+        return Ok(false);
+    }
+    let Some(rect) = rect.intersection(FramebufferRect {
+        x: 0,
+        y: 0,
+        width: info.width as usize,
+        height: info.height as usize,
+    }) else {
+        return Ok(true);
+    };
 
     let stripe_rows = user_present_stripe_rows(rect.width);
     let end_y = rect
@@ -203,6 +235,7 @@ fn copy_user_bgra8888_rect_in_stripes(
         .checked_add(rect.height)
         .ok_or(paging::AddressSpaceError::AddressOverflow)?;
     let mut y = rect.y;
+    let mut scratch = Vec::new();
     let mut copied = false;
 
     while y < end_y {
@@ -213,16 +246,31 @@ fn copy_user_bgra8888_rect_in_stripes(
             width: rect.width,
             height: stripe_height,
         };
+        let row_bytes = stripe
+            .width
+            .checked_mul(4)
+            .ok_or(paging::AddressSpaceError::AddressOverflow)?;
+        let scratch_len = copy_user_bgra8888_rect_to_scratch(
+            address_space,
+            user_ptr,
+            stride_bytes,
+            stripe,
+            &mut scratch,
+        )?;
+        let final_stripe = y
+            .checked_add(stripe_height)
+            .ok_or(paging::AddressSpaceError::AddressOverflow)?
+            >= end_y;
         let Some(result) = DISPLAY_BACKEND.lock().with_framebuffer(|framebuffer| {
-            let drawn = framebuffer.draw_bgra8888_frame_rect_from_user(
-                address_space,
-                user_ptr,
-                width,
-                height,
-                stride_bytes,
+            let drawn = framebuffer.draw_bgra8888_rect_from_kernel(
+                scratch[..scratch_len].as_ptr(),
+                row_bytes,
                 stripe,
-            )?;
+            );
             log_backend_present_sample(framebuffer, drawn);
+            if drawn && final_stripe {
+                return Ok(framebuffer.present_scene());
+            }
             Ok(drawn)
         }) else {
             return Ok(false);
@@ -235,17 +283,56 @@ fn copy_user_bgra8888_rect_in_stripes(
         y += stripe_height;
     }
 
-    if !copied {
-        return Ok(false);
-    }
+    Ok(copied)
+}
 
-    let Some(presented) = DISPLAY_BACKEND
-        .lock()
-        .with_framebuffer(|framebuffer| framebuffer.present_scene())
-    else {
-        return Ok(false);
-    };
-    Ok(presented)
+fn copy_user_bgra8888_rect_to_scratch(
+    address_space: &ProcessAddressSpace,
+    user_ptr: u64,
+    stride_bytes: usize,
+    rect: FramebufferRect,
+    scratch: &mut Vec<u8>,
+) -> Result<usize, paging::AddressSpaceError> {
+    let row_bytes = rect
+        .width
+        .checked_mul(4)
+        .ok_or(paging::AddressSpaceError::AddressOverflow)?;
+    let total_bytes = row_bytes
+        .checked_mul(rect.height)
+        .ok_or(paging::AddressSpaceError::AddressOverflow)?;
+    if scratch.capacity() < total_bytes {
+        scratch
+            .try_reserve_exact(total_bytes - scratch.capacity())
+            .map_err(|_| paging::AddressSpaceError::OutOfFrames)?;
+    }
+    scratch.resize(total_bytes, 0);
+    for row in 0..rect.height {
+        let source_row = rect
+            .y
+            .checked_add(row)
+            .ok_or(paging::AddressSpaceError::AddressOverflow)?;
+        let row_offset = source_row
+            .checked_mul(stride_bytes)
+            .ok_or(paging::AddressSpaceError::AddressOverflow)?;
+        let source_offset = row_offset
+            .checked_add(
+                rect.x
+                    .checked_mul(4)
+                    .ok_or(paging::AddressSpaceError::AddressOverflow)?,
+            )
+            .ok_or(paging::AddressSpaceError::AddressOverflow)?;
+        let source = user_ptr
+            .checked_add(source_offset as u64)
+            .ok_or(paging::AddressSpaceError::AddressOverflow)?;
+        let dest_offset = row
+            .checked_mul(row_bytes)
+            .ok_or(paging::AddressSpaceError::AddressOverflow)?;
+        address_space.copy_from_user(
+            VirtAddr::new(source),
+            &mut scratch[dest_offset..dest_offset + row_bytes],
+        )?;
+    }
+    Ok(total_bytes)
 }
 
 fn user_present_stripe_rows(width: usize) -> usize {
@@ -311,21 +398,12 @@ pub(crate) fn present_bgra8888_rect_from_kernel(
 }
 
 fn mark_framebuffer_write_combine(info: FramebufferInfo) {
-    let end_addr = info
-        .addr
-        .checked_add(info.size.saturating_sub(1))
-        .expect("framebuffer end address overflow");
-    let start_block = info.addr / HUGE_2MIB;
-    let end_block = end_addr / HUGE_2MIB;
-
-    use crate::memory::paging::KERNEL_PML4;
-
-    interrupts::without_interrupts(|| {
-        let mut pml4 = KERNEL_PML4.lock();
-        for block_index in start_block..=end_block {
-            pml4.add_flags(block_index, paging::WRITE_COMBINE_BIT);
-        }
-    });
+    let _ = crate::memory::paging::update_direct_map_range_flags(
+        info.addr,
+        info.size as usize,
+        paging::WRITE_COMBINE_BIT,
+        x86_64::structures::paging::PageTableFlags::empty(),
+    );
 }
 
 fn framebuffer_info_is_valid(info: FramebufferInfo) -> bool {

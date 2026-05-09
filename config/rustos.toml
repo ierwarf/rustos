@@ -28,8 +28,8 @@ heartbeat = "info"
 # Hardened/release-oriented kernel build knobs. Copy this block, or this whole
 # file, into config/rustos.toml when testing a release-shaped image.
 
-codegen_units = 1
-opt_level = "2"
+codegen_units = 256
+opt_level = "0"
 overflow_checks = true
 debug_assertions = false
 lto = "thin"

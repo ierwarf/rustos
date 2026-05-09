@@ -20,6 +20,7 @@ use x86_64::structures::paging::{PageTable, PageTableFlags, PhysFrame};
 const ENTRIES_PER_TABLE: usize = 512;
 const HUGE_2MIB: u64 = 2 * 1024 * 1024;
 const PAGE_4KIB: u64 = 4096;
+const DIRECT_MAP_UPDATE_BATCH_BYTES: u64 = HUGE_2MIB;
 const KERNEL_PML4_SIZE_GB: usize = 512;
 pub const DIRECT_MAP_PHYS_LIMIT: u64 = 512 * 1024 * 1024 * 1024;
 const MAX_PAGE_BLOCK: u64 = DIRECT_MAP_PHYS_LIMIT / HUGE_2MIB;
@@ -639,66 +640,71 @@ pub fn update_direct_map_range_flags(
     add_flags: PageTableFlags,
     remove_flags: PageTableFlags,
 ) -> bool {
-    if size == 0 {
-        return false;
-    }
+    update_direct_map_range_flags_batched(phys_addr, size, add_flags, remove_flags)
+}
 
-    interrupts::without_interrupts(|| {
-        let mut pml4 = KERNEL_PML4.lock();
-        pml4.update_page_range_flags(phys_addr, size as u64, add_flags, remove_flags)
-            .is_ok()
-    })
+fn update_direct_map_range_flags_batched(
+    phys_addr: u64,
+    size: usize,
+    add_flags: PageTableFlags,
+    remove_flags: PageTableFlags,
+) -> bool {
+    let Some((mut cursor, end)) = direct_map_update_bounds(phys_addr, size) else {
+        return false;
+    };
+
+    while cursor < end {
+        let chunk_end = cursor
+            .saturating_add(DIRECT_MAP_UPDATE_BATCH_BYTES)
+            .min(end);
+        let chunk_size = (chunk_end - cursor) as usize;
+        let updated = interrupts::without_interrupts(|| {
+            let mut pml4 = KERNEL_PML4.lock();
+            pml4.update_page_range_flags(cursor, chunk_size as u64, add_flags, remove_flags)
+                .is_ok()
+        });
+        if !updated {
+            return false;
+        }
+        cursor = chunk_end;
+    }
+    true
 }
 
 pub fn mark_direct_map_range_executable(phys_addr: u64, size: usize) -> bool {
-    if size == 0 {
-        return false;
-    }
-
-    interrupts::without_interrupts(|| {
-        let mut pml4 = KERNEL_PML4.lock();
-        pml4.update_page_range_flags(
-            phys_addr,
-            size as u64,
-            PageTableFlags::empty(),
-            PageTableFlags::NO_EXECUTE | PageTableFlags::WRITABLE,
-        )
-        .is_ok()
-    })
+    update_direct_map_range_flags(
+        phys_addr,
+        size,
+        PageTableFlags::empty(),
+        PageTableFlags::NO_EXECUTE | PageTableFlags::WRITABLE,
+    )
 }
 
 pub fn mark_direct_map_range_writable_noexec(phys_addr: u64, size: usize) -> bool {
-    if size == 0 {
-        return false;
-    }
-
-    interrupts::without_interrupts(|| {
-        let mut pml4 = KERNEL_PML4.lock();
-        pml4.update_page_range_flags(
-            phys_addr,
-            size as u64,
-            PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE,
-            PageTableFlags::empty(),
-        )
-        .is_ok()
-    })
+    update_direct_map_range_flags(
+        phys_addr,
+        size,
+        PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE,
+        PageTableFlags::empty(),
+    )
 }
 
 pub fn mark_direct_map_range_readonly_noexec(phys_addr: u64, size: usize) -> bool {
-    if size == 0 {
-        return false;
-    }
+    update_direct_map_range_flags(
+        phys_addr,
+        size,
+        PageTableFlags::NO_EXECUTE,
+        PageTableFlags::WRITABLE,
+    )
+}
 
-    interrupts::without_interrupts(|| {
-        let mut pml4 = KERNEL_PML4.lock();
-        pml4.update_page_range_flags(
-            phys_addr,
-            size as u64,
-            PageTableFlags::NO_EXECUTE,
-            PageTableFlags::WRITABLE,
-        )
-        .is_ok()
-    })
+fn direct_map_update_bounds(phys_addr: u64, size: usize) -> Option<(u64, u64)> {
+    if size == 0 {
+        return None;
+    }
+    let start = align_down(phys_addr, PAGE_4KIB);
+    let end = align_up(phys_addr.checked_add(size as u64)?, PAGE_4KIB)?;
+    (end <= DIRECT_MAP_PHYS_LIMIT && start < end).then_some((start, end))
 }
 
 pub fn direct_map_phys_is_executable(phys_addr: u64) -> bool {

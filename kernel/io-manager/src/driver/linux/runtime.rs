@@ -23,6 +23,7 @@ static MUTEX_DEBUG_REMAINING: AtomicUsize = AtomicUsize::new(64);
 const MAX_COMPAT_PRINTK_BYTES: usize = 4096;
 const MAX_COMPAT_RANDOM_BYTES: usize = 1 << 20;
 const MAX_COMPAT_SG_INIT_ENTRIES: usize = 4096;
+const COMPAT_LOCK_SPIN_HARD_LIMIT: usize = 5_000_000;
 const LINUX_SG_END: usize = 0x02;
 
 #[repr(C)]
@@ -201,6 +202,7 @@ pub(crate) unsafe extern "C" fn usleep_range_state(
     max_microseconds: u32,
     _state: u32,
 ) {
+    assert_no_irq_spinlock_held("usleep_range_state");
     let sleep_us = min_microseconds.max(max_microseconds);
     let sleep_ms = sleep_us.div_ceil(1000) as u64;
     if sleep_ms != 0 {
@@ -215,6 +217,7 @@ pub(crate) unsafe extern "C" fn schedule() {
 }
 
 pub(crate) unsafe extern "C" fn schedule_timeout(timeout: i64) -> i64 {
+    assert_no_irq_spinlock_held("schedule_timeout");
     if timeout > 0 {
         let ticks = timeout as u64;
         let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
@@ -454,8 +457,9 @@ pub fn service_compat_pending() {
     for _ in 0..MAX_SERVICE_PASSES {
         let usb_work = crate::usb::service_pending();
         let serio_work = crate::input::serio_lower_half_service_pending();
+        let threaded_irq_work = crate::driver::irq::service_threaded_irqs();
         let workqueue_work = crate::driver::linux::workqueue::service_pending();
-        let work = usb_work + serio_work + workqueue_work;
+        let work = usb_work + serio_work + threaded_irq_work + workqueue_work;
         if work == 0 {
             break;
         }
@@ -474,6 +478,21 @@ pub fn debug_irq_lock_snapshot() -> (usize, usize) {
     IRQ_LOCK_SNAPSHOT_OWNER_COUNT.store(owner_count, Ordering::Release);
     IRQ_LOCK_SNAPSHOT_TOTAL_DEPTH.store(total_depth, Ordering::Release);
     (owner_count, total_depth)
+}
+
+pub(crate) fn assert_no_irq_spinlock_held(api: &str) {
+    let owner = current_lock_owner_token();
+    let depth = irq_lock_owner_depth(owner);
+    if depth == 0 {
+        return;
+    }
+    panic!(
+        "linux compat {} called while irq spinlock held: owner={} depth={} irq_enabled={}",
+        api,
+        owner,
+        depth,
+        interrupts::are_enabled()
+    );
 }
 
 fn emit_linux_printk(prefix: &[u8], fmt: *const c_char) {
@@ -570,14 +589,20 @@ fn compat_lock_state(
 }
 
 fn acquire_compat_lock(state: &'static CompatLockState, owner: usize) {
-    let mut spins = 0usize;
-    while !try_acquire_compat_lock(state, owner) {
-        spins = spins.saturating_add(1);
+    if try_acquire_compat_lock(state, owner) {
+        return;
+    }
+
+    for spins in 1..=COMPAT_LOCK_SPIN_HARD_LIMIT {
         if matches!(spins, 1_000 | 100_000 | 1_000_000) {
             log_compat_lock_spin(state, owner);
         }
         spin_loop();
+        if try_acquire_compat_lock(state, owner) {
+            return;
+        }
     }
+    panic_compat_lock_timeout(state, owner);
 }
 
 fn acquire_compat_lock_irq(state: &'static CompatLockState, owner: usize) {
@@ -587,8 +612,7 @@ fn acquire_compat_lock_irq(state: &'static CompatLockState, owner: usize) {
         return;
     }
 
-    let mut spins = 0usize;
-    loop {
+    for spins in 1..=COMPAT_LOCK_SPIN_HARD_LIMIT {
         interrupts::disable();
         if try_acquire_compat_lock(state, owner) {
             register_irq_lock_owner(owner, true);
@@ -596,12 +620,12 @@ fn acquire_compat_lock_irq(state: &'static CompatLockState, owner: usize) {
         }
         interrupts::enable();
 
-        spins = spins.saturating_add(1);
         if matches!(spins, 1_000 | 100_000 | 1_000_000) {
             log_compat_lock_spin(state, owner);
         }
         spin_loop();
     }
+    panic_compat_lock_timeout(state, owner);
 }
 
 fn release_compat_lock(state: &'static CompatLockState, owner: usize) {
@@ -653,6 +677,17 @@ fn try_acquire_compat_lock(state: &'static CompatLockState, owner: usize) -> boo
 fn log_compat_lock_spin(state: &'static CompatLockState, owner: usize) {
     crate::debug::println!(
         "linux compat lock spin: key={:#x} owner={} current_owner={} depth={} irq_enabled={}",
+        state.key,
+        owner,
+        state.owner.load(Ordering::Relaxed),
+        state.depth.load(Ordering::Relaxed),
+        interrupts::are_enabled()
+    );
+}
+
+fn panic_compat_lock_timeout(state: &'static CompatLockState, owner: usize) -> ! {
+    panic!(
+        "linux compat lock spin hard limit exceeded: key={:#x} owner={} current_owner={} depth={} irq_enabled={}",
         state.key,
         owner,
         state.owner.load(Ordering::Relaxed),

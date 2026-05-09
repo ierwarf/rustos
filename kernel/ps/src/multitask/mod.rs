@@ -28,13 +28,13 @@ use crate::user::process_state::{
 };
 
 pub use self::current::{
-    any_user_process_state, block_current_user_task, current_last_error,
-    current_linux_thread_state, current_user_address_space, current_user_id,
+    any_user_process_state, block_current_task, block_current_user_task, current_last_error,
+    current_linux_thread_state, current_task_id, current_user_address_space, current_user_id,
     current_user_process_id, current_user_snapshot, current_user_stack_state,
     current_user_thread_id, exec_current_user_process, exit_current_user_task,
     halt_current_retired_task, is_user_task_alive, note_process_exit_status, queue_linux_signal,
     retain_current_user_process_state, retire_current_user_task_due_to_fault,
-    service_deferred_work, set_current_last_error, terminate_user_task, wait_for_child,
+    service_deferred_work, set_current_last_error, terminate_user_task, wait_for_child, wake_task,
     wake_user_task, with_current_mm, with_current_process_credentials, with_current_process_state,
     with_current_process_state_mut, with_current_user_linux_state_mut,
     with_current_user_process_and_linux_thread_state_mut, with_current_user_process_state,

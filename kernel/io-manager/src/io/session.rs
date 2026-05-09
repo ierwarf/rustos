@@ -1,15 +1,14 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use spin::Mutex;
-#[cfg(not(test))]
-use x86_64::instructions::interrupts;
+use crate::sync::KernelWaitLock;
 
 pub(crate) const MAX_LIVE_CONSOLE_SESSIONS: usize = 32;
 pub(crate) const CONSOLE_SESSION_TITLE_CAPACITY: usize = 48;
 pub(crate) const CONSOLE_SESSION_PATH_CAPACITY: usize = 64;
 
-static SESSION_MANAGER: Mutex<ConsoleSessionManager> = Mutex::new(ConsoleSessionManager::new());
+static SESSION_MANAGER: KernelWaitLock<ConsoleSessionManager> =
+    KernelWaitLock::new(ConsoleSessionManager::new());
 static NEXT_SESSION_CREATED_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
@@ -374,15 +373,7 @@ fn ascii_array<const N: usize>(value: &str) -> [u8; N] {
 }
 
 fn with_manager<R>(f: impl FnOnce(&mut ConsoleSessionManager) -> R) -> R {
-    #[cfg(test)]
-    {
-        f(&mut SESSION_MANAGER.lock())
-    }
-
-    #[cfg(not(test))]
-    {
-        interrupts::without_interrupts(|| f(&mut SESSION_MANAGER.lock()))
-    }
+    f(&mut SESSION_MANAGER.lock())
 }
 
 #[cfg(test)]
@@ -393,18 +384,14 @@ pub fn reset_for_tests() {
 
 #[cfg(test)]
 mod tests {
-    use spin::Mutex;
-
     use super::{
         ConsoleSessionHandle, ConsoleSessionState, create_console_session, focused_console_session,
         remove_console_session, reset_for_tests, set_focused_console_session,
         snapshot_console_sessions, transition_console_session_state,
     };
 
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
     fn with_isolated_session_test(f: impl FnOnce()) {
-        let _guard = TEST_LOCK.lock();
+        let _guard = crate::test_support::exclusive_test();
         reset_for_tests();
         f();
     }

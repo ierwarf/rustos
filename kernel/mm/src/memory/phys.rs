@@ -11,6 +11,7 @@ use crate::memory::kernel_vm::{DIRECT_MAP_PHYS_LIMIT, higher_half_addr};
 const PAGE_SIZE: u64 = 4096;
 const BITS_PER_WORD: usize = 64;
 const MAX_USABLE_RANGES: usize = 128;
+const PHYS_ALLOC_SCAN_MILESTONE_FRAMES: usize = 64 * 1024;
 
 static PHYS_ALLOCATOR: Mutex<PhysAllocatorState> = Mutex::new(PhysAllocatorState::new());
 
@@ -210,30 +211,90 @@ impl PhysAllocatorState {
             return None;
         }
 
-        let mut frame = start;
-        while frame < end {
-            if self.is_used(frame) || !frame_is_boot_usable(self, frame) {
-                frame += 1;
+        let mut scanned = 0usize;
+        for range in &self.usable_ranges[..self.usable_range_count] {
+            let range_start = range.start_frame.max(start);
+            let range_end = range
+                .start_frame
+                .saturating_add(range.page_count)
+                .min(max_frame_exclusive);
+            let start_limit_end = end.min(range_end);
+            if range_start >= start_limit_end {
                 continue;
             }
 
-            let mut run_len = 1usize;
-            while run_len < page_count
-                && frame + run_len < max_frame_exclusive
-                && !self.is_used(frame + run_len)
-                && frame_is_boot_usable(self, frame + run_len)
-            {
-                run_len += 1;
-            }
+            let mut frame = range_start;
+            while let Some(candidate) = self.next_free_frame_in_range(frame, start_limit_end) {
+                scanned = scanned.saturating_add(candidate.saturating_sub(frame) + 1);
+                let run_len = self.free_run_len_from(candidate, range_end, page_count);
 
-            if run_len == page_count {
-                return Some(frame);
-            }
+                if run_len == page_count {
+                    self.record_scan_milestone(scanned);
+                    return Some(candidate);
+                }
 
-            frame += run_len.saturating_add(1);
+                frame = candidate.saturating_add(run_len).saturating_add(1);
+            }
         }
 
+        self.record_scan_milestone(scanned);
         None
+    }
+
+    fn next_free_frame_in_range(&self, mut frame: usize, end: usize) -> Option<usize> {
+        while frame < end {
+            let word_index = frame / BITS_PER_WORD;
+            let bit_index = frame % BITS_PER_WORD;
+            let before_frame_mask = if bit_index == 0 {
+                0
+            } else {
+                (1_u64 << bit_index) - 1
+            };
+            let word = self.bitmap()[word_index] | before_frame_mask;
+            if word != u64::MAX {
+                let candidate = word_index * BITS_PER_WORD + (!word).trailing_zeros() as usize;
+                if candidate < end {
+                    return Some(candidate);
+                }
+            }
+            frame = (word_index + 1) * BITS_PER_WORD;
+        }
+        None
+    }
+
+    fn free_run_len_from(&self, mut frame: usize, end: usize, limit: usize) -> usize {
+        let mut run_len = 0usize;
+        while frame < end && run_len < limit {
+            let word_index = frame / BITS_PER_WORD;
+            let bit_index = frame % BITS_PER_WORD;
+            let remaining_word_bits = BITS_PER_WORD - bit_index;
+            let remaining_range_bits = end - frame;
+            let remaining_limit_bits = limit - run_len;
+            let max_bits = remaining_word_bits
+                .min(remaining_range_bits)
+                .min(remaining_limit_bits);
+            let shifted = self.bitmap()[word_index] >> bit_index;
+            let free_bits = (!shifted).trailing_ones() as usize;
+            let advance = free_bits.min(max_bits);
+            run_len += advance;
+            frame += advance;
+            if advance < max_bits {
+                break;
+            }
+        }
+        run_len
+    }
+
+    fn record_scan_milestone(&self, scanned_frames: usize) {
+        if scanned_frames < PHYS_ALLOC_SCAN_MILESTONE_FRAMES {
+            return;
+        }
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Memory,
+            "phys-contig-scan",
+            scanned_frames as u64,
+            self.free_frames as u64,
+        );
     }
 
     fn free_frame_locked(&mut self, phys: PhysAddr) -> Result<(), FreeFrameError> {

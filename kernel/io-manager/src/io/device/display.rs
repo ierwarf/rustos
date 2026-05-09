@@ -1,5 +1,7 @@
 use core::convert::TryFrom;
+#[cfg(rustos_debug_print_enabled)]
 use core::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(rustos_debug_print_enabled)]
 use x86_64::VirtAddr;
 
 use crate::io::gui;
@@ -11,11 +13,14 @@ use crate::user::abi::device::{
 use crate::user::handles::{DisplaySurfaceHandle, KernelHandle};
 use crate::user::process_state::UserProcessState;
 
-use super::{DeviceError, read_user_struct, write_user_struct};
+use super::{read_user_struct, write_user_struct, DeviceError};
 
-const MAX_PRESENT_SURFACE_SAMPLE_LOGS: usize = 8;
 const MAX_DISPLAY_SURFACES_PER_PROCESS: usize = 4;
 
+#[cfg(rustos_debug_print_enabled)]
+const MAX_PRESENT_SURFACE_SAMPLE_LOGS: usize = 8;
+
+#[cfg(rustos_debug_print_enabled)]
 static PRESENT_SURFACE_SAMPLE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -222,6 +227,7 @@ pub(crate) fn present_surface(
     let region = surface
         .mapped_region()
         .ok_or(DeviceError::InvalidArgument)?;
+    validate_surface_mapping(surface, region)?;
     log_present_surface_sample(address_space, surface, region.start.as_u64());
     present_bgra8888_from_user(
         address_space,
@@ -234,7 +240,7 @@ pub(crate) fn present_surface(
     Ok(())
 }
 
-#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
+#[cfg(rustos_debug_print_enabled)]
 fn log_present_surface_sample(
     address_space: &paging::ProcessAddressSpace,
     surface: DisplaySurfaceHandle,
@@ -265,6 +271,14 @@ fn log_present_surface_sample(
     }
 }
 
+#[cfg(not(rustos_debug_print_enabled))]
+fn log_present_surface_sample(
+    _address_space: &paging::ProcessAddressSpace,
+    _surface: DisplaySurfaceHandle,
+    _user_ptr: u64,
+) {
+}
+
 pub(crate) fn present_surface_rect(
     address_space: &paging::ProcessAddressSpace,
     surface: DisplaySurfaceHandle,
@@ -290,6 +304,7 @@ pub(crate) fn present_surface_rect(
     let region = surface
         .mapped_region()
         .ok_or(DeviceError::InvalidArgument)?;
+    validate_surface_mapping(surface, region)?;
     present_bgra8888_rect_from_user(
         address_space,
         region.start.as_u64(),
@@ -375,5 +390,24 @@ fn validate_surface_for_present(
         return Err(DeviceError::InvalidArgument);
     }
 
+    Ok(())
+}
+
+fn validate_surface_mapping(
+    surface: DisplaySurfaceHandle,
+    region: paging::UserRegion,
+) -> Result<(), DeviceError> {
+    let mapped_len = (region.page_count as u64)
+        .checked_mul(4096)
+        .ok_or(DeviceError::InvalidArgument)?;
+    if mapped_len < surface.mapping_len() {
+        return Err(DeviceError::InvalidArgument);
+    }
+
+    region
+        .start
+        .as_u64()
+        .checked_add(surface.mapping_len().saturating_sub(1))
+        .ok_or(DeviceError::InvalidArgument)?;
     Ok(())
 }

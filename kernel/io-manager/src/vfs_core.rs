@@ -214,6 +214,8 @@ fn validate_kernel_path_input(path: &str) -> Result<(), KernelPathError> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::string::String;
+
     use super::{
         KernelPathError, MAX_KERNEL_PATH_LEN, MAX_MOUNT_OPTIONS_LEN, MountConfigError, MountRole,
         mount_child_name, normalize_absolute_kernel_path, normalize_kernel_path,

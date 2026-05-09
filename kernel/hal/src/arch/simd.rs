@@ -1,6 +1,6 @@
 use core::arch::asm;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::{__cpuid, __cpuid_count};
@@ -292,6 +292,17 @@ unsafe fn blit_bgra8888_row_scalar(
     dst_bpp: usize,
     rgb_format: bool,
 ) {
+    if dst_bpp == 4 {
+        unsafe {
+            if rgb_format {
+                blit_bgra8888_to_rgbx_scalar_u32(dst, src, pixels);
+            } else {
+                blit_bgra8888_to_bgrx_scalar_u32(dst, src, pixels);
+            }
+        }
+        return;
+    }
+
     unsafe {
         for _ in 0..pixels {
             let b = ptr::read(src);
@@ -311,6 +322,30 @@ unsafe fn blit_bgra8888_row_scalar(
             }
             src = src.add(4);
             dst = dst.add(dst_bpp);
+        }
+    }
+}
+
+unsafe fn blit_bgra8888_to_bgrx_scalar_u32(mut dst: *mut u8, mut src: *const u8, pixels: usize) {
+    unsafe {
+        for _ in 0..pixels {
+            let bgra = ptr::read_unaligned(src as *const u32);
+            ptr::write_unaligned(dst as *mut u32, bgra & 0x00ff_ffff);
+            src = src.add(4);
+            dst = dst.add(4);
+        }
+    }
+}
+
+unsafe fn blit_bgra8888_to_rgbx_scalar_u32(mut dst: *mut u8, mut src: *const u8, pixels: usize) {
+    unsafe {
+        for _ in 0..pixels {
+            let bgra = ptr::read_unaligned(src as *const u32);
+            let rgbx =
+                ((bgra & 0x00ff_0000) >> 16) | (bgra & 0x0000_ff00) | ((bgra & 0x0000_00ff) << 16);
+            ptr::write_unaligned(dst as *mut u32, rgbx);
+            src = src.add(4);
+            dst = dst.add(4);
         }
     }
 }
