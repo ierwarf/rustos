@@ -18,6 +18,7 @@ use super::{
 };
 
 const PCI_VENDOR_VIRTIO: u16 = 0x1af4;
+const PCI_DEVICE_VIRTIO_NET_TRANSITIONAL: u16 = 0x1000;
 const PCI_DEVICE_VIRTIO_NET_MODERN: u16 = 0x1041;
 const PCI_CAP_STATUS: u8 = 0x06;
 const PCI_CAP_POINTER: u8 = 0x34;
@@ -110,7 +111,7 @@ struct TcpSocketRecord {
 }
 
 struct VirtioNetDevice {
-    common: *mut u8,
+    _common: *mut u8,
     notify: *mut u8,
     notify_multiplier: u32,
     rx_queue: VirtQueue,
@@ -118,6 +119,7 @@ struct VirtioNetDevice {
     rx_buffers: Vec<DmaBuffer>,
     tx_buffers: Vec<DmaBuffer>,
     rx_pending: HeaplessDeque<Vec<u8>, QUEUE_DEPTH>,
+    tx_in_use: [bool; QUEUE_DEPTH],
     tx_slot: usize,
     rx_frames: u64,
     tx_frames: u64,
@@ -127,7 +129,7 @@ struct VirtioNetDevice {
 unsafe impl Send for VirtioNetDevice {}
 
 struct VirtQueue {
-    index: u16,
+    _index: u16,
     queue_size: u16,
     notify_off: u16,
     mem_cpu: *mut u8,
@@ -398,7 +400,10 @@ impl VirtioNetDevice {
         let mut found = None;
         crate::arch::pci::visit_devices(|pci| {
             if pci.vendor_id() == PCI_VENDOR_VIRTIO
-                && (pci.device_id() == PCI_DEVICE_VIRTIO_NET_MODERN || pci.class_code() == 0x02)
+                && matches!(
+                    pci.device_id(),
+                    PCI_DEVICE_VIRTIO_NET_TRANSITIONAL | PCI_DEVICE_VIRTIO_NET_MODERN
+                )
             {
                 found = Some(pci);
                 return true;
@@ -424,7 +429,7 @@ impl VirtioNetDevice {
         let rx_queue = setup_queue(common, RX_QUEUE_INDEX)?;
         let tx_queue = setup_queue(common, TX_QUEUE_INDEX)?;
         let mut device = Self {
-            common,
+            _common: common,
             notify,
             notify_multiplier: caps.notify_multiplier,
             rx_queue,
@@ -432,6 +437,7 @@ impl VirtioNetDevice {
             rx_buffers: Vec::new(),
             tx_buffers: Vec::new(),
             rx_pending: HeaplessDeque::new(),
+            tx_in_use: [false; QUEUE_DEPTH],
             tx_slot: 0,
             rx_frames: 0,
             tx_frames: 0,
@@ -471,6 +477,7 @@ impl VirtioNetDevice {
     }
 
     fn poll_rx(&mut self) {
+        let mut requeued = false;
         while let Some((id, len)) = self.rx_queue.pop_used() {
             let index = id as usize;
             if let Some(buffer) = self.rx_buffers.get(index) {
@@ -488,7 +495,9 @@ impl VirtioNetDevice {
                             ethernet_frame_marker(frame),
                         );
                     }
-                    let _ = self.rx_pending.push_back(frame.to_vec());
+                    if self.rx_pending.len() < QUEUE_DEPTH {
+                        let _ = self.rx_pending.push_back(frame.to_vec());
+                    }
                 }
                 unsafe {
                     ptr::write_bytes(buffer.cpu, 0, buffer.size);
@@ -501,63 +510,99 @@ impl VirtioNetDevice {
                     );
                     self.rx_queue.push_avail(index as u16);
                 }
+                requeued = true;
             }
         }
-        self.notify_queue(RX_QUEUE_INDEX, self.rx_queue.notify_off);
+        if requeued {
+            self.notify_queue(RX_QUEUE_INDEX, self.rx_queue.notify_off);
+        }
     }
 
-    fn transmit_frame(&mut self, frame: &[u8]) {
-        if frame.len() + VIRTIO_NET_HDR_SIZE > TX_BUFFER_SIZE || self.tx_buffers.is_empty() {
-            return;
-        }
-        while self.tx_queue.pop_used().is_some() {
+    fn reclaim_tx_completions(&mut self) {
+        while let Some((id, _)) = self.tx_queue.pop_used() {
+            let slot = id as usize;
+            if slot < self.tx_in_use.len() {
+                self.tx_in_use[slot] = false;
+            }
             self.tx_completions = self.tx_completions.wrapping_add(1);
+            if self.tx_completions <= 8 {
+                crate::debug::record_milestone(
+                    crate::debug::LogCategory::Driver,
+                    "virtio-net-tx-complete",
+                    self.tx_completions,
+                    slot as u64,
+                );
+            }
+        }
+    }
+
+    fn has_free_tx_slot(&self) -> bool {
+        self.tx_buffers
+            .iter()
+            .enumerate()
+            .any(|(slot, _)| !self.tx_in_use[slot])
+    }
+
+    fn next_tx_slot(&mut self) -> Option<usize> {
+        self.reclaim_tx_completions();
+        if self.tx_buffers.is_empty() {
+            return None;
+        }
+        for offset in 0..self.tx_buffers.len() {
+            let slot = (self.tx_slot + offset) % self.tx_buffers.len();
+            if !self.tx_in_use[slot] {
+                self.tx_slot = slot.wrapping_add(1);
+                return Some(slot);
+            }
+        }
+        None
+    }
+
+    fn transmit_frame_from<R>(&mut self, len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+        if len
+            .checked_add(VIRTIO_NET_HDR_SIZE)
+            .is_none_or(|total| total > TX_BUFFER_SIZE)
+        {
+            let mut frame = vec![0u8; len];
+            return f(&mut frame);
+        }
+        let Some(slot) = self.next_tx_slot() else {
+            let mut frame = vec![0u8; len];
+            return f(&mut frame);
+        };
+
+        let buffer = &self.tx_buffers[slot];
+        let buffer_cpu = buffer.cpu;
+        let buffer_dma = buffer.dma;
+        unsafe {
+            ptr::write_bytes(buffer_cpu, 0, VIRTIO_NET_HDR_SIZE);
         }
 
-        let slot = self.tx_slot % self.tx_buffers.len();
-        self.tx_slot = self.tx_slot.wrapping_add(1);
-        let buffer = &self.tx_buffers[slot];
+        let (result, marker) = {
+            let frame = unsafe {
+                core::slice::from_raw_parts_mut(buffer_cpu.add(VIRTIO_NET_HDR_SIZE), len)
+            };
+            let result = f(frame);
+            (result, ethernet_frame_marker(frame))
+        };
+
         unsafe {
-            ptr::write_bytes(buffer.cpu, 0, VIRTIO_NET_HDR_SIZE);
-            ptr::copy_nonoverlapping(
-                frame.as_ptr(),
-                buffer.cpu.add(VIRTIO_NET_HDR_SIZE),
-                frame.len(),
-            );
-            self.tx_queue.write_desc(
-                slot,
-                buffer.dma,
-                (frame.len() + VIRTIO_NET_HDR_SIZE) as u32,
-                0,
-                0,
-            );
+            self.tx_queue
+                .write_desc(slot, buffer_dma, (len + VIRTIO_NET_HDR_SIZE) as u32, 0, 0);
             self.tx_queue.push_avail(slot as u16);
         }
+        self.tx_in_use[slot] = true;
         self.tx_frames = self.tx_frames.wrapping_add(1);
         if self.tx_frames <= 8 {
             crate::debug::record_milestone(
                 crate::debug::LogCategory::Driver,
                 "virtio-net-tx-frame",
                 self.tx_frames,
-                ethernet_frame_marker(frame),
+                marker,
             );
         }
         self.notify_queue(TX_QUEUE_INDEX, self.tx_queue.notify_off);
-        for _ in 0..100_000 {
-            if self.tx_queue.pop_used().is_some() {
-                self.tx_completions = self.tx_completions.wrapping_add(1);
-                if self.tx_completions <= 8 {
-                    crate::debug::record_milestone(
-                        crate::debug::LogCategory::Driver,
-                        "virtio-net-tx-complete",
-                        self.tx_completions,
-                        slot as u64,
-                    );
-                }
-                break;
-            }
-            core::hint::spin_loop();
-        }
+        result
     }
 
     fn notify_queue(&self, queue_index: u16, notify_off: u16) {
@@ -584,7 +629,12 @@ impl Device for VirtioNetDevice {
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        Some(VirtioTxToken { device: self })
+        self.reclaim_tx_completions();
+        if self.has_free_tx_slot() {
+            Some(VirtioTxToken { device: self })
+        } else {
+            None
+        }
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -618,14 +668,10 @@ impl TxToken for VirtioTxToken<'_> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut frame = vec![0u8; len];
-        let result = f(&mut frame);
-        self.device.transmit_frame(&frame);
-        result
+        self.device.transmit_frame_from(len, f)
     }
 }
 
-const DESC_F_NEXT: u16 = 1;
 const DESC_F_WRITE: u16 = 2;
 
 impl VirtQueue {
@@ -707,7 +753,7 @@ fn setup_queue(common: *mut u8, queue_index: u16) -> Option<VirtQueue> {
         write_common_u16(common, COMMON_QUEUE_ENABLE, 1);
 
         Some(VirtQueue {
-            index: queue_index,
+            _index: queue_index,
             queue_size,
             notify_off,
             mem_cpu: queue_mem.cpu,

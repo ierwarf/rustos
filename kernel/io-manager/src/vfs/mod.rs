@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use fatfs::{Read, Seek, SeekFrom};
 use spin::Mutex;
+use storage_core::BlockDevice as StorageBlockDevice;
 
 use crate::io::device::DeviceHandle;
 use crate::multitask;
@@ -23,21 +24,25 @@ use crate::user::process_state::UserProcessState;
 use storage_fat::FatNodeKind;
 
 const SUPPORTED_MOUNT_FLAGS: u64 = crate::user::linux::MS_RDONLY;
-const ROOT_FILE_CACHE_MAX_ENTRIES: usize = 32;
-const ROOT_FILE_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const ROOT_FILE_CACHE_MAX_ENTRIES: usize = 64;
+const ROOT_FILE_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
 const ROOT_FILE_CACHE_MAX_ENTRY_BYTES: usize = 4 * 1024 * 1024;
 const ROOT_FILE_EXACT_READ_MAX_BYTES: usize = 64 * 1024 * 1024;
+const ROOT_FILE_EXACT_READ_CHUNK_SIZE: usize = 256 * 1024;
 const ROOT_FILE_PAGE_SIZE: usize = 64 * 1024;
 const ROOT_FILE_PAGE_CACHE_MAX_ENTRIES: usize = 512;
 const ROOT_FILE_PAGE_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
-const ROOT_DIR_CACHE_MAX_ENTRIES: usize = 32;
-const ROOT_METADATA_CACHE_MAX_ENTRIES: usize = 128;
+const ROOT_DIR_CACHE_MAX_ENTRIES: usize = 64;
+const ROOT_METADATA_CACHE_MAX_ENTRIES: usize = 512;
+const ROOT_LOOKUP_MISS_CACHE_MAX_ENTRIES: usize = 256;
+const ROOT_FILE_EXTENTS_REGISTRY_PATH: &str = "/system/registry/kernel/root-file-extents.tsv";
 
 static MOUNTS: Mutex<Vec<VfsMount>> = Mutex::new(Vec::new());
 static MOUNT_GENERATION: AtomicU64 = AtomicU64::new(1);
 static ROOT_VOLUME: Mutex<Option<crate::storage::fat::MountedFatVolume<block::FatRegistryDevice>>> =
     Mutex::new(None);
 static ROOT_CACHE: Mutex<RootCache> = Mutex::new(RootCache::new());
+static ROOT_EXTENT_INDEX: Mutex<RootExtentIndex> = Mutex::new(RootExtentIndex::new());
 
 struct RootFileCacheEntry {
     path: String,
@@ -64,6 +69,79 @@ struct RootMetadataCacheEntry {
     last_used: u64,
 }
 
+struct RootLookupMissCacheEntry {
+    path: String,
+    last_used: u64,
+}
+
+#[derive(Clone, Copy)]
+struct RootFileExtent {
+    offset: u64,
+    len: u64,
+}
+
+#[derive(Clone)]
+struct RootExtentFileEntry {
+    path: String,
+    len: usize,
+    extents: Vec<RootFileExtent>,
+}
+
+struct RootExtentIndex {
+    generation: u64,
+    loaded: bool,
+    complete: bool,
+    entries: Vec<RootExtentFileEntry>,
+}
+
+enum RootExtentLookup {
+    Found(RootExtentFileEntry),
+    Missing,
+    Unknown,
+}
+
+impl RootExtentIndex {
+    const fn new() -> Self {
+        Self {
+            generation: 0,
+            loaded: false,
+            complete: false,
+            entries: Vec::new(),
+        }
+    }
+
+    fn prepare_generation(&mut self, generation: u64) {
+        if self.generation == generation {
+            return;
+        }
+        self.generation = generation;
+        self.loaded = false;
+        self.complete = false;
+        self.entries.clear();
+    }
+
+    fn lookup(&self, path: &str) -> RootExtentLookup {
+        if !self.loaded {
+            return RootExtentLookup::Unknown;
+        }
+        match self
+            .entries
+            .binary_search_by(|entry| entry.path.as_str().cmp(path))
+        {
+            Ok(index) => RootExtentLookup::Found(self.entries[index].clone()),
+            Err(_) if self.complete => RootExtentLookup::Missing,
+            Err(_) => RootExtentLookup::Unknown,
+        }
+    }
+
+    fn store(&mut self, generation: u64, entries: Vec<RootExtentFileEntry>, complete: bool) {
+        self.generation = generation;
+        self.loaded = true;
+        self.complete = complete;
+        self.entries = entries;
+    }
+}
+
 struct RootCache {
     generation: u64,
     next_use: u64,
@@ -73,6 +151,7 @@ struct RootCache {
     pages: Vec<RootPageCacheEntry>,
     dirs: Vec<RootDirCacheEntry>,
     metadata: Vec<RootMetadataCacheEntry>,
+    misses: Vec<RootLookupMissCacheEntry>,
 }
 
 impl RootCache {
@@ -86,6 +165,7 @@ impl RootCache {
             pages: Vec::new(),
             dirs: Vec::new(),
             metadata: Vec::new(),
+            misses: Vec::new(),
         }
     }
 
@@ -101,6 +181,7 @@ impl RootCache {
         self.pages.clear();
         self.dirs.clear();
         self.metadata.clear();
+        self.misses.clear();
     }
 
     fn next_use(&mut self) -> u64 {
@@ -126,6 +207,9 @@ impl RootCache {
         for entry in &mut self.metadata {
             entry.last_used = 0;
         }
+        for entry in &mut self.misses {
+            entry.last_used = 0;
+        }
     }
 
     fn lookup_file(&mut self, generation: u64, path: &str) -> Option<Arc<[u8]>> {
@@ -141,6 +225,7 @@ impl RootCache {
         if bytes.len() > ROOT_FILE_CACHE_MAX_ENTRY_BYTES {
             return;
         }
+        self.remove_miss(path);
 
         if let Some(index) = self.files.iter().position(|entry| entry.path == path) {
             self.total_file_bytes = self
@@ -264,6 +349,7 @@ impl RootCache {
 
     fn insert_dir(&mut self, generation: u64, path: &str, entries: Vec<storage_fat::FatDirEntry>) {
         self.prepare_generation(generation);
+        self.remove_miss(path);
         if let Some(index) = self.dirs.iter().position(|entry| entry.path == path) {
             self.dirs.remove(index);
         }
@@ -278,6 +364,22 @@ impl RootCache {
             };
             self.dirs.remove(index);
         }
+
+        for entry in &entries {
+            let child_path = root_child_path(path, entry.name.as_str());
+            let kind = match entry.kind {
+                FatNodeKind::File => VfsNodeKind::File,
+                FatNodeKind::Directory => VfsNodeKind::Directory,
+            };
+            let metadata = directory_entry_metadata(
+                child_path.as_str(),
+                kind,
+                entry.len,
+                path_inode(child_path.as_bytes()).max(1),
+            );
+            self.insert_metadata(generation, child_path.as_str(), metadata);
+        }
+
         let last_used = self.next_use();
         self.dirs.push(RootDirCacheEntry {
             path: String::from(path),
@@ -294,8 +396,39 @@ impl RootCache {
         Some(self.metadata[index].metadata)
     }
 
+    fn lookup_metadata_from_cached_parent(
+        &mut self,
+        generation: u64,
+        path: &str,
+    ) -> Option<Result<VfsMetadata, VfsError>> {
+        self.prepare_generation(generation);
+        let (parent, child) = root_parent_child_path(path)?;
+        let dir_index = self.dirs.iter().position(|entry| entry.path == parent)?;
+        let entry_index = self.dirs[dir_index]
+            .entries
+            .iter()
+            .position(|entry| entry.name == child);
+        let last_used = self.next_use();
+        self.dirs[dir_index].last_used = last_used;
+
+        let Some(entry_index) = entry_index else {
+            self.insert_miss(generation, path);
+            return Some(Err(VfsError::NotFound));
+        };
+        let entry = &self.dirs[dir_index].entries[entry_index];
+        let kind = match entry.kind {
+            FatNodeKind::File => VfsNodeKind::File,
+            FatNodeKind::Directory => VfsNodeKind::Directory,
+        };
+        let metadata =
+            directory_entry_metadata(path, kind, entry.len, path_inode(path.as_bytes()).max(1));
+        self.insert_metadata(generation, path, metadata);
+        Some(Ok(metadata))
+    }
+
     fn insert_metadata(&mut self, generation: u64, path: &str, metadata: VfsMetadata) {
         self.prepare_generation(generation);
+        self.remove_miss(path);
         if let Some(index) = self.metadata.iter().position(|entry| entry.path == path) {
             self.metadata.remove(index);
         }
@@ -316,6 +449,51 @@ impl RootCache {
             metadata,
             last_used,
         });
+    }
+
+    fn lookup_miss(&mut self, generation: u64, path: &str) -> bool {
+        self.prepare_generation(generation);
+        let last_used = self.next_use();
+        let Some(index) = self.misses.iter().position(|entry| entry.path == path) else {
+            return false;
+        };
+        self.misses[index].last_used = last_used;
+        true
+    }
+
+    fn insert_miss(&mut self, generation: u64, path: &str) {
+        self.prepare_generation(generation);
+        if self.metadata.iter().any(|entry| entry.path == path)
+            || self.files.iter().any(|entry| entry.path == path)
+            || self.dirs.iter().any(|entry| entry.path == path)
+        {
+            return;
+        }
+        if let Some(index) = self.misses.iter().position(|entry| entry.path == path) {
+            self.misses.remove(index);
+        }
+        while self.misses.len() >= ROOT_LOOKUP_MISS_CACHE_MAX_ENTRIES {
+            let Some((index, _)) = self
+                .misses
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.last_used)
+            else {
+                break;
+            };
+            self.misses.remove(index);
+        }
+        let last_used = self.next_use();
+        self.misses.push(RootLookupMissCacheEntry {
+            path: String::from(path),
+            last_used,
+        });
+    }
+
+    fn remove_miss(&mut self, path: &str) {
+        if let Some(index) = self.misses.iter().position(|entry| entry.path == path) {
+            self.misses.remove(index);
+        }
     }
 }
 
@@ -535,6 +713,12 @@ struct RootFsStreamingFile {
     len: usize,
 }
 
+enum RootFileOpenFast {
+    Memory(Arc<[u8]>),
+    Streaming { len: usize },
+    NotFile,
+}
+
 impl VfsFileObject for RootFsStreamingFile {
     fn path(&self) -> &str {
         self.path.as_str()
@@ -635,7 +819,33 @@ fn resolve_fd_link_path(path: &str) -> Result<Option<String>, VfsError> {
 
 fn open_local_path(absolute_path: &str, flags: u64, _mode: u64) -> Result<VfsOpenResult, VfsError> {
     if let Ok(device) = crate::io::device::open(absolute_path) {
+        if open_flags_require_directory(flags) {
+            return Err(VfsError::NotDirectory);
+        }
         return Ok(VfsOpenResult::Device(device));
+    }
+
+    if !open_flags_require_directory(flags)
+        && !is_virtual_directory(absolute_path)
+        && validate_read_only_open_flags(flags).is_ok()
+    {
+        match open_root_file_fast(absolute_path)? {
+            RootFileOpenFast::Memory(bytes) => {
+                return Ok(VfsOpenResult::File(VfsFileHandle::read_only_memory_shared(
+                    String::from(absolute_path),
+                    bytes,
+                )));
+            }
+            RootFileOpenFast::Streaming { len } => {
+                return Ok(VfsOpenResult::File(VfsFileHandle::new(Arc::new(
+                    RootFsStreamingFile {
+                        path: String::from(absolute_path),
+                        len,
+                    },
+                ))));
+            }
+            RootFileOpenFast::NotFile => {}
+        }
     }
 
     let metadata = metadata_local(absolute_path)?;
@@ -651,6 +861,9 @@ fn open_local_path(absolute_path: &str, flags: u64, _mode: u64) -> Result<VfsOpe
         }),
         VfsNodeKind::File => {
             validate_read_only_open_flags(flags)?;
+            if open_flags_require_directory(flags) {
+                return Err(VfsError::NotDirectory);
+            }
             let file_len = usize::try_from(metadata.len).map_err(|_| VfsError::InvalidArgument)?;
             if metadata.len <= ROOT_FILE_CACHE_MAX_ENTRY_BYTES as u64 {
                 let bytes = read_root_file_shared(absolute_path)?;
@@ -693,14 +906,94 @@ fn metadata_local(absolute_path: &str) -> Result<VfsMetadata, VfsError> {
     Ok(metadata)
 }
 
+fn open_root_file_fast(absolute_path: &str) -> Result<RootFileOpenFast, VfsError> {
+    let generation = current_mount_generation();
+    {
+        let mut cache = ROOT_CACHE.lock();
+        if let Some(bytes) = cache.lookup_file(generation, absolute_path) {
+            return Ok(RootFileOpenFast::Memory(bytes));
+        }
+        if cache.lookup_miss(generation, absolute_path) {
+            return Ok(RootFileOpenFast::NotFile);
+        }
+        if let Some(result) = cache.lookup_metadata_from_cached_parent(generation, absolute_path) {
+            match result {
+                Ok(metadata) if metadata.kind != VfsNodeKind::File => {
+                    return Ok(RootFileOpenFast::NotFile);
+                }
+                Ok(_) => {}
+                Err(VfsError::NotFound | VfsError::InvalidArgument) => {
+                    return Ok(RootFileOpenFast::NotFile);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    match lookup_root_extent_entry(absolute_path)? {
+        RootExtentLookup::Found(entry) => {
+            cache_root_file_metadata(
+                generation,
+                absolute_path,
+                entry.len,
+                path_inode(absolute_path.as_bytes()).max(1),
+            );
+            if entry.len > ROOT_FILE_CACHE_MAX_ENTRY_BYTES {
+                return Ok(RootFileOpenFast::Streaming { len: entry.len });
+            }
+            let bytes = read_root_extent_file_to_vec(&entry)?;
+            let bytes = Arc::<[u8]>::from(bytes.into_boxed_slice());
+            ROOT_CACHE
+                .lock()
+                .insert_file(generation, absolute_path, Arc::clone(&bytes));
+            return Ok(RootFileOpenFast::Memory(bytes));
+        }
+        RootExtentLookup::Missing => {
+            ROOT_CACHE.lock().insert_miss(generation, absolute_path);
+            return Ok(RootFileOpenFast::NotFile);
+        }
+        RootExtentLookup::Unknown => {}
+    }
+
+    let path_id = path_inode(absolute_path.as_bytes()).max(1);
+    let result = with_root_volume(|volume| {
+        let (mut file, file_len) = match volume.open_file_with_len(absolute_path) {
+            Ok(file) => file,
+            Err(fatfs::Error::NotFound | fatfs::Error::InvalidInput) => {
+                ROOT_CACHE.lock().insert_miss(generation, absolute_path);
+                return Ok(RootFileOpenFast::NotFile);
+            }
+            Err(error) => return Err(error),
+        };
+        let file_len = usize::try_from(file_len).map_err(|_| fatfs::Error::InvalidInput)?;
+        cache_root_file_metadata(generation, absolute_path, file_len, path_id);
+        if file_len > ROOT_FILE_CACHE_MAX_ENTRY_BYTES {
+            return Ok(RootFileOpenFast::Streaming { len: file_len });
+        }
+        let bytes = read_open_root_file_to_vec(&mut file, absolute_path, path_id, file_len)?;
+        let bytes = Arc::<[u8]>::from(bytes.into_boxed_slice());
+        ROOT_CACHE
+            .lock()
+            .insert_file(generation, absolute_path, Arc::clone(&bytes));
+        Ok(RootFileOpenFast::Memory(bytes))
+    })?;
+    Ok(result)
+}
+
 fn read_root_file_cached(absolute_path: &str) -> Result<Vec<u8>, VfsError> {
     Ok(read_root_file_shared(absolute_path)?.as_ref().to_vec())
 }
 
 fn read_root_file_shared(absolute_path: &str) -> Result<Arc<[u8]>, VfsError> {
     let generation = current_mount_generation();
-    if let Some(bytes) = ROOT_CACHE.lock().lookup_file(generation, absolute_path) {
-        return Ok(bytes);
+    {
+        let mut cache = ROOT_CACHE.lock();
+        if let Some(bytes) = cache.lookup_file(generation, absolute_path) {
+            return Ok(bytes);
+        }
+        if cache.lookup_miss(generation, absolute_path) {
+            return Err(VfsError::NotFound);
+        }
     }
 
     let bytes = Arc::<[u8]>::from(read_root_file_to_vec_exact(absolute_path)?.into_boxed_slice());
@@ -711,100 +1004,264 @@ fn read_root_file_shared(absolute_path: &str) -> Result<Arc<[u8]>, VfsError> {
 }
 
 fn read_root_file_to_vec_exact(absolute_path: &str) -> Result<Vec<u8>, VfsError> {
-    let metadata = read_root_metadata_cached(absolute_path)?;
-    if metadata.kind != VfsNodeKind::File {
-        return Err(VfsError::PermissionDenied);
+    let generation = current_mount_generation();
+    let path_id = path_inode(absolute_path.as_bytes()).max(1);
+    {
+        let mut cache = ROOT_CACHE.lock();
+        if let Some(result) = cache.lookup_metadata_from_cached_parent(generation, absolute_path) {
+            let metadata = result?;
+            if metadata.kind != VfsNodeKind::File {
+                return Err(VfsError::PermissionDenied);
+            }
+        }
+    }
+    match lookup_root_extent_entry(absolute_path)? {
+        RootExtentLookup::Found(entry) => {
+            if entry.len > ROOT_FILE_EXACT_READ_MAX_BYTES {
+                return Err(VfsError::InvalidArgument);
+            }
+            cache_root_file_metadata(generation, absolute_path, entry.len, path_id);
+            return read_root_extent_file_to_vec(&entry);
+        }
+        RootExtentLookup::Missing => {
+            ROOT_CACHE.lock().insert_miss(generation, absolute_path);
+            return Err(VfsError::NotFound);
+        }
+        RootExtentLookup::Unknown => {}
+    }
+    let bytes = with_root_volume(|volume| {
+        let (mut file, file_len) = match volume.open_file_with_len(absolute_path) {
+            Ok(file) => file,
+            Err(fatfs::Error::NotFound | fatfs::Error::InvalidInput) => {
+                ROOT_CACHE.lock().insert_miss(generation, absolute_path);
+                return Err(fatfs::Error::NotFound);
+            }
+            Err(error) => return Err(error),
+        };
+        let file_len = usize::try_from(file_len).map_err(|_| fatfs::Error::InvalidInput)?;
+        if file_len > ROOT_FILE_EXACT_READ_MAX_BYTES {
+            return Err(fatfs::Error::InvalidInput);
+        }
+        read_open_root_file_to_vec(&mut file, absolute_path, path_id, file_len)
+    })?;
+    cache_root_file_metadata(generation, absolute_path, bytes.len(), path_id);
+    Ok(bytes)
+}
+
+fn lookup_root_extent_entry(absolute_path: &str) -> Result<RootExtentLookup, VfsError> {
+    let generation = current_mount_generation();
+    {
+        let mut index = ROOT_EXTENT_INDEX.lock();
+        index.prepare_generation(generation);
+        let lookup = index.lookup(absolute_path);
+        if !matches!(lookup, RootExtentLookup::Unknown) {
+            return Ok(lookup);
+        }
+        if index.loaded {
+            return Ok(RootExtentLookup::Unknown);
+        }
     }
 
-    let file_len = usize::try_from(metadata.len).map_err(|_| VfsError::InvalidArgument)?;
-    if file_len > ROOT_FILE_EXACT_READ_MAX_BYTES {
+    let load_result = load_root_extent_index_entries();
+    let (entries, complete) = match load_result {
+        Ok(entries) => (entries, true),
+        Err(VfsError::NotFound) => (Vec::new(), false),
+        Err(error) => return Err(error),
+    };
+
+    let mut index = ROOT_EXTENT_INDEX.lock();
+    index.store(generation, entries, complete);
+    Ok(index.lookup(absolute_path))
+}
+
+fn load_root_extent_index_entries() -> Result<Vec<RootExtentFileEntry>, VfsError> {
+    let bytes = with_root_volume(|volume| {
+        volume
+            .read_file_to_vec(ROOT_FILE_EXTENTS_REGISTRY_PATH)
+            .map_err(|error| match error {
+                fatfs::Error::NotFound | fatfs::Error::InvalidInput => fatfs::Error::NotFound,
+                other => other,
+            })
+    })?;
+    let text = core::str::from_utf8(bytes.as_slice()).map_err(|_| VfsError::InvalidArgument)?;
+    let mut entries = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(entry) = parse_root_extent_index_line(line)? {
+            entries.push(entry);
+        }
+    }
+    entries.sort_by(|lhs, rhs| lhs.path.cmp(&rhs.path));
+    Ok(entries)
+}
+
+fn parse_root_extent_index_line(line: &str) -> Result<Option<RootExtentFileEntry>, VfsError> {
+    let path = registry_field(line, "path=").ok_or(VfsError::InvalidArgument)?;
+    let len = registry_field(line, "len=")
+        .ok_or(VfsError::InvalidArgument)?
+        .parse::<usize>()
+        .map_err(|_| VfsError::InvalidArgument)?;
+    let extents_text = registry_field(line, "extents=").ok_or(VfsError::InvalidArgument)?;
+    if !path.starts_with('/') || path == ROOT_FILE_EXTENTS_REGISTRY_PATH {
+        return Ok(None);
+    }
+
+    let mut extents = Vec::new();
+    if !extents_text.is_empty() {
+        for raw_extent in extents_text.split(',') {
+            let (offset, len) = raw_extent
+                .split_once(':')
+                .ok_or(VfsError::InvalidArgument)?;
+            let offset = offset
+                .parse::<u64>()
+                .map_err(|_| VfsError::InvalidArgument)?;
+            let len = len.parse::<u64>().map_err(|_| VfsError::InvalidArgument)?;
+            if len == 0 {
+                return Err(VfsError::InvalidArgument);
+            }
+            extents.push(RootFileExtent { offset, len });
+        }
+    }
+
+    Ok(Some(RootExtentFileEntry {
+        path: String::from(path),
+        len,
+        extents,
+    }))
+}
+
+fn registry_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    for field in line.split('\t') {
+        if let Some(value) = field.strip_prefix(key) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn read_root_extent_file_to_vec(entry: &RootExtentFileEntry) -> Result<Vec<u8>, VfsError> {
+    let path_id = path_inode(entry.path.as_bytes()).max(1);
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Vfs,
+        "vfs-read-open",
+        entry.len as u64,
+        path_id,
+    );
+
+    let handle = block::current_boot_volume_handle().ok_or(VfsError::NotFound)?;
+    let mut device = block::FatRegistryDevice::new(handle);
+    let block_size = device.logical_block_size();
+    if block_size == 0 {
+        return Err(VfsError::NotFound);
+    }
+    let mut bytes = vec![0_u8; entry.len];
+    let mut done = 0usize;
+    for extent in &entry.extents {
+        if extent.offset % block_size as u64 != 0 {
+            return Err(VfsError::InvalidArgument);
+        }
+        let extent_len = usize::try_from(extent.len).map_err(|_| VfsError::InvalidArgument)?;
+        let next_done = done
+            .checked_add(extent_len)
+            .ok_or(VfsError::InvalidArgument)?;
+        if next_done > bytes.len() {
+            return Err(VfsError::InvalidArgument);
+        }
+
+        let read_len = extent_len
+            .checked_add(block_size - 1)
+            .ok_or(VfsError::InvalidArgument)?
+            / block_size
+            * block_size;
+        let lba = extent.offset / block_size as u64;
+        if read_len == extent_len {
+            device
+                .read_blocks(lba, &mut bytes[done..next_done])
+                .map_err(|error| map_bootstrap_fs_error(fatfs::Error::Io(error)))?;
+        } else {
+            let mut scratch = vec![0_u8; read_len];
+            device
+                .read_blocks(lba, scratch.as_mut_slice())
+                .map_err(|error| map_bootstrap_fs_error(fatfs::Error::Io(error)))?;
+            bytes[done..next_done].copy_from_slice(&scratch[..extent_len]);
+        }
+        done = next_done;
+        if done == bytes.len() || done % ROOT_FILE_EXACT_READ_CHUNK_SIZE == 0 {
+            crate::debug::record_milestone(
+                crate::debug::LogCategory::Vfs,
+                "vfs-read-progress",
+                done as u64,
+                entry.len as u64,
+            );
+        }
+    }
+    if done != bytes.len() {
         return Err(VfsError::InvalidArgument);
     }
+    if bytes.is_empty() {
+        crate::debug::record_milestone(crate::debug::LogCategory::Vfs, "vfs-read-progress", 0, 0);
+    }
+    Ok(bytes)
+}
+
+fn read_open_root_file_to_vec(
+    file: &mut storage_fat::FatFile<'_, block::FatRegistryDevice>,
+    absolute_path: &str,
+    path_id: u64,
+    file_len: usize,
+) -> core::result::Result<Vec<u8>, fatfs::Error<crate::storage::fat::DiskIoError>> {
     let mut bytes = vec![0_u8; file_len];
-    let path_id = path_inode(absolute_path.as_bytes()).max(1);
-    with_root_volume(|volume| {
-        crate::debug::record_milestone(
-            crate::debug::LogCategory::Vfs,
-            "vfs-read-open",
-            file_len as u64,
-            path_id,
-        );
-        crate::debug::debug!(
-            vfs,
-            "vfs exact read open begin path={} len={}",
-            absolute_path,
-            file_len
-        );
-        let mut file = volume.open_file(absolute_path)?;
-        file.seek(SeekFrom::Start(0))?;
-        let mut done = 0usize;
-        while done < file_len {
-            let chunk_len = ROOT_FILE_PAGE_SIZE.min(file_len - done);
-            let read = match file.read(&mut bytes[done..done + chunk_len]) {
-                Ok(read) => read,
-                Err(fatfs::Error::InvalidInput) => {
-                    crate::debug::record_milestone(
-                        crate::debug::LogCategory::Vfs,
-                        "vfs-read-error",
-                        done as u64,
-                        path_id,
-                    );
-                    crate::debug::warn!(
-                        vfs,
-                        "vfs exact read invalid input path={} done={} len={}",
-                        absolute_path,
-                        done,
-                        file_len
-                    );
-                    return Err(fatfs::Error::InvalidInput);
-                }
-                Err(fatfs::Error::Io(crate::storage::fat::DiskIoError::InvalidInput)) => {
-                    crate::debug::record_milestone(
-                        crate::debug::LogCategory::Vfs,
-                        "vfs-read-io-invalid",
-                        done as u64,
-                        path_id,
-                    );
-                    return Err(fatfs::Error::Io(
-                        crate::storage::fat::DiskIoError::InvalidInput,
-                    ));
-                }
-                Err(fatfs::Error::Io(crate::storage::fat::DiskIoError::UnexpectedEof)) => {
-                    crate::debug::record_milestone(
-                        crate::debug::LogCategory::Vfs,
-                        "vfs-read-io-eof",
-                        done as u64,
-                        path_id,
-                    );
-                    return Err(fatfs::Error::Io(
-                        crate::storage::fat::DiskIoError::UnexpectedEof,
-                    ));
-                }
-                Err(fatfs::Error::Io(crate::storage::fat::DiskIoError::NotPresent)) => {
-                    crate::debug::record_milestone(
-                        crate::debug::LogCategory::Vfs,
-                        "vfs-read-not-present",
-                        done as u64,
-                        path_id,
-                    );
-                    return Err(fatfs::Error::Io(
-                        crate::storage::fat::DiskIoError::NotPresent,
-                    ));
-                }
-                Err(error) => {
-                    crate::debug::record_milestone(
-                        crate::debug::LogCategory::Vfs,
-                        "vfs-read-error-other",
-                        done as u64,
-                        path_id,
-                    );
-                    return Err(error);
-                }
-            };
-            if read == 0 {
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Vfs,
+        "vfs-read-open",
+        file_len as u64,
+        path_id,
+    );
+    crate::debug::debug!(
+        vfs,
+        "vfs exact read open begin path={} len={}",
+        absolute_path,
+        file_len
+    );
+    let mut done = 0usize;
+    while done < file_len {
+        let chunk_len = ROOT_FILE_EXACT_READ_CHUNK_SIZE.min(file_len - done);
+        let read = match file.read(&mut bytes[done..done + chunk_len]) {
+            Ok(read) => read,
+            Err(fatfs::Error::InvalidInput) => {
                 crate::debug::record_milestone(
                     crate::debug::LogCategory::Vfs,
-                    "vfs-read-short",
+                    "vfs-read-error",
+                    done as u64,
+                    path_id,
+                );
+                crate::debug::warn!(
+                    vfs,
+                    "vfs exact read invalid input path={} done={} len={}",
+                    absolute_path,
+                    done,
+                    file_len
+                );
+                return Err(fatfs::Error::InvalidInput);
+            }
+            Err(fatfs::Error::Io(crate::storage::fat::DiskIoError::InvalidInput)) => {
+                crate::debug::record_milestone(
+                    crate::debug::LogCategory::Vfs,
+                    "vfs-read-io-invalid",
+                    done as u64,
+                    path_id,
+                );
+                return Err(fatfs::Error::Io(
+                    crate::storage::fat::DiskIoError::InvalidInput,
+                ));
+            }
+            Err(fatfs::Error::Io(crate::storage::fat::DiskIoError::UnexpectedEof)) => {
+                crate::debug::record_milestone(
+                    crate::debug::LogCategory::Vfs,
+                    "vfs-read-io-eof",
                     done as u64,
                     path_id,
                 );
@@ -812,24 +1269,54 @@ fn read_root_file_to_vec_exact(absolute_path: &str) -> Result<Vec<u8>, VfsError>
                     crate::storage::fat::DiskIoError::UnexpectedEof,
                 ));
             }
-            done += read;
-            if done == file_len || done % (256 * 1024) == 0 {
+            Err(fatfs::Error::Io(crate::storage::fat::DiskIoError::NotPresent)) => {
                 crate::debug::record_milestone(
                     crate::debug::LogCategory::Vfs,
-                    "vfs-read-progress",
+                    "vfs-read-not-present",
                     done as u64,
-                    file_len as u64,
+                    path_id,
                 );
+                return Err(fatfs::Error::Io(
+                    crate::storage::fat::DiskIoError::NotPresent,
+                ));
             }
+            Err(error) => {
+                crate::debug::record_milestone(
+                    crate::debug::LogCategory::Vfs,
+                    "vfs-read-error-other",
+                    done as u64,
+                    path_id,
+                );
+                return Err(error);
+            }
+        };
+        if read == 0 {
+            crate::debug::record_milestone(
+                crate::debug::LogCategory::Vfs,
+                "vfs-read-short",
+                done as u64,
+                path_id,
+            );
+            return Err(fatfs::Error::Io(
+                crate::storage::fat::DiskIoError::UnexpectedEof,
+            ));
         }
-        crate::debug::debug!(
-            vfs,
-            "vfs exact read done path={} len={}",
-            absolute_path,
-            file_len
-        );
-        Ok(())
-    })?;
+        done += read;
+        if done == file_len || done % ROOT_FILE_EXACT_READ_CHUNK_SIZE == 0 {
+            crate::debug::record_milestone(
+                crate::debug::LogCategory::Vfs,
+                "vfs-read-progress",
+                done as u64,
+                file_len as u64,
+            );
+        }
+    }
+    crate::debug::debug!(
+        vfs,
+        "vfs exact read done path={} len={}",
+        absolute_path,
+        file_len
+    );
     Ok(bytes)
 }
 
@@ -878,7 +1365,15 @@ fn read_root_file_range_into(
     }
 
     with_root_volume(|volume| {
-        let mut file = volume.open_file(absolute_path)?;
+        let generation = current_mount_generation();
+        let mut file = match volume.open_file(absolute_path) {
+            Ok(file) => file,
+            Err(fatfs::Error::NotFound | fatfs::Error::InvalidInput) => {
+                ROOT_CACHE.lock().insert_miss(generation, absolute_path);
+                return Err(fatfs::Error::NotFound);
+            }
+            Err(error) => return Err(error),
+        };
         file.seek(SeekFrom::Start(offset))?;
         let mut done = 0usize;
         while done < dest.len() {
@@ -894,11 +1389,24 @@ fn read_root_file_range_into(
 
 fn read_root_dir_cached(absolute_path: &str) -> Result<Vec<storage_fat::FatDirEntry>, VfsError> {
     let generation = current_mount_generation();
-    if let Some(entries) = ROOT_CACHE.lock().lookup_dir(generation, absolute_path) {
-        return Ok(entries);
+    {
+        let mut cache = ROOT_CACHE.lock();
+        if let Some(entries) = cache.lookup_dir(generation, absolute_path) {
+            return Ok(entries);
+        }
+        if cache.lookup_miss(generation, absolute_path) {
+            return Err(VfsError::NotFound);
+        }
     }
 
-    let entries = with_root_volume(|volume| volume.read_dir(absolute_path))?;
+    let entries = match with_root_volume(|volume| volume.read_dir(absolute_path)) {
+        Ok(entries) => entries,
+        Err(VfsError::NotFound | VfsError::InvalidArgument) => {
+            ROOT_CACHE.lock().insert_miss(generation, absolute_path);
+            return Err(VfsError::NotFound);
+        }
+        Err(error) => return Err(error),
+    };
     ROOT_CACHE
         .lock()
         .insert_dir(generation, absolute_path, entries.clone());
@@ -907,11 +1415,28 @@ fn read_root_dir_cached(absolute_path: &str) -> Result<Vec<storage_fat::FatDirEn
 
 fn read_root_metadata_cached(absolute_path: &str) -> Result<VfsMetadata, VfsError> {
     let generation = current_mount_generation();
-    if let Some(metadata) = ROOT_CACHE.lock().lookup_metadata(generation, absolute_path) {
+    {
+        let mut cache = ROOT_CACHE.lock();
+        if let Some(metadata) = cache.lookup_metadata(generation, absolute_path) {
+            return Ok(metadata);
+        }
+        if cache.lookup_miss(generation, absolute_path) {
+            return Err(VfsError::NotFound);
+        }
+    }
+
+    if let Some(metadata) = read_root_metadata_from_parent_dir(generation, absolute_path)? {
         return Ok(metadata);
     }
 
-    let metadata = with_root_volume(|volume| volume.metadata(absolute_path))?;
+    let metadata = match with_root_volume(|volume| volume.metadata(absolute_path)) {
+        Ok(metadata) => metadata,
+        Err(VfsError::NotFound | VfsError::InvalidArgument) => {
+            ROOT_CACHE.lock().insert_miss(generation, absolute_path);
+            return Err(VfsError::NotFound);
+        }
+        Err(error) => return Err(error),
+    };
     let kind = match metadata.kind {
         FatNodeKind::File => VfsNodeKind::File,
         FatNodeKind::Directory => VfsNodeKind::Directory,
@@ -928,6 +1453,53 @@ fn read_root_metadata_cached(absolute_path: &str) -> Result<VfsMetadata, VfsErro
     Ok(metadata)
 }
 
+fn cache_root_file_metadata(generation: u64, absolute_path: &str, file_len: usize, path_id: u64) {
+    let metadata =
+        directory_entry_metadata(absolute_path, VfsNodeKind::File, file_len as u64, path_id);
+    ROOT_CACHE
+        .lock()
+        .insert_metadata(generation, absolute_path, metadata);
+}
+
+fn read_root_metadata_from_parent_dir(
+    generation: u64,
+    absolute_path: &str,
+) -> Result<Option<VfsMetadata>, VfsError> {
+    let Some((parent, child)) = root_parent_child_path(absolute_path) else {
+        return Ok(None);
+    };
+    let entries = match read_root_dir_cached(parent.as_str()) {
+        Ok(entries) => entries,
+        Err(VfsError::NotFound | VfsError::InvalidArgument) => {
+            ROOT_CACHE.lock().insert_miss(generation, absolute_path);
+            return Err(VfsError::NotFound);
+        }
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        if entry.name != child {
+            continue;
+        }
+        let kind = match entry.kind {
+            FatNodeKind::File => VfsNodeKind::File,
+            FatNodeKind::Directory => VfsNodeKind::Directory,
+        };
+        let metadata = directory_entry_metadata(
+            absolute_path,
+            kind,
+            entry.len,
+            path_inode(absolute_path.as_bytes()).max(1),
+        );
+        ROOT_CACHE
+            .lock()
+            .insert_metadata(generation, absolute_path, metadata);
+        return Ok(Some(metadata));
+    }
+
+    ROOT_CACHE.lock().insert_miss(generation, absolute_path);
+    Err(VfsError::NotFound)
+}
+
 fn directory_entry_metadata(path: &str, kind: VfsNodeKind, len: u64, inode: u64) -> VfsMetadata {
     let _ = path;
     VfsMetadata {
@@ -941,6 +1513,27 @@ fn directory_entry_metadata(path: &str, kind: VfsNodeKind, len: u64, inode: u64)
         mtime: VfsTimestamp::default(),
         ctime: VfsTimestamp::default(),
     }
+}
+
+fn root_child_path(parent: &str, child: &str) -> String {
+    if parent == "/" {
+        alloc::format!("/{child}")
+    } else {
+        alloc::format!("{}/{}", parent.trim_end_matches('/'), child)
+    }
+}
+
+fn root_parent_child_path(path: &str) -> Option<(String, &str)> {
+    let (parent, child) = path.rsplit_once('/')?;
+    if child.is_empty() {
+        return None;
+    }
+    let parent = if parent.is_empty() {
+        String::from("/")
+    } else {
+        String::from(parent)
+    };
+    Some((parent, child))
 }
 
 fn read_dir_entries_local(path: &str) -> Result<Vec<VfsDirectoryEntry>, VfsError> {
@@ -1045,11 +1638,7 @@ fn read_dir_entries_local_rootfs(path: &str) -> Result<Vec<VfsDirectoryEntry>, V
     Ok(entries
         .into_iter()
         .map(|entry| {
-            let child_path = if path == "/" {
-                alloc::format!("/{}", entry.name)
-            } else {
-                alloc::format!("{}/{}", path.trim_end_matches('/'), entry.name)
-            };
+            let child_path = root_child_path(path, entry.name.as_str());
             VfsDirectoryEntry::new(
                 entry.name,
                 path_inode(child_path.as_bytes()).max(1),
@@ -1170,6 +1759,10 @@ pub(crate) fn validate_read_only_open_flags(flags: u64) -> Result<(), VfsError> 
         }
         _ => Err(VfsError::InvalidArgument),
     }
+}
+
+fn open_flags_require_directory(flags: u64) -> bool {
+    flags & crate::user::linux::O_DIRECTORY != 0
 }
 
 pub(crate) fn validate_access_mode(mode: u64) -> Result<(), VfsError> {

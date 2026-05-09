@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use core::mem::size_of;
 use core::slice;
 
@@ -116,7 +117,7 @@ fn read_events_to_user(
         .ok_or(DeviceError::InvalidArgument)?;
     validate(max_bytes_len)?;
 
-    let mut events = [device::InputEvent::default(); MAX_INPUT_EVENTS_PER_READ];
+    let mut events = input_event_scratch(capacity)?;
     let read = read_events(&mut events[..capacity]);
     let bytes_len = read
         .checked_mul(event_size)
@@ -146,13 +147,13 @@ fn read_evdev_events_to_user(
         .ok_or(DeviceError::InvalidArgument)?;
     validate(max_bytes_len)?;
 
-    let mut input_events = [device::InputEvent::default(); MAX_INPUT_EVENTS_PER_READ];
+    let mut input_events = input_event_scratch(input_capacity)?;
     let read = read_events(&mut input_events[..input_capacity]);
     if read == 0 {
         return Ok(0);
     }
 
-    let mut output = [LinuxInputEvent::default(); MAX_EVDEV_EVENTS_PER_READ];
+    let mut output = evdev_event_scratch(output_capacity)?;
     let written = crate::input_core::translate_input_events_to_evdev(
         abi_events_as_input_core(&mut input_events[..read]),
         &mut output,
@@ -164,6 +165,28 @@ fn read_evdev_events_to_user(
     let bytes = unsafe { slice::from_raw_parts(output.as_ptr().cast::<u8>(), bytes_len) };
     write(bytes)?;
     Ok(bytes_len)
+}
+
+fn input_event_scratch(capacity: usize) -> Result<Vec<device::InputEvent>, DeviceError> {
+    let mut events = Vec::new();
+    events
+        .try_reserve_exact(capacity)
+        .map_err(|_| allocation_error())?;
+    events.resize(capacity, device::InputEvent::default());
+    Ok(events)
+}
+
+fn evdev_event_scratch(capacity: usize) -> Result<Vec<LinuxInputEvent>, DeviceError> {
+    let mut events = Vec::new();
+    events
+        .try_reserve_exact(capacity)
+        .map_err(|_| allocation_error())?;
+    events.resize(capacity, LinuxInputEvent::default());
+    Ok(events)
+}
+
+fn allocation_error() -> DeviceError {
+    DeviceError::AddressSpace(crate::memory::paging::AddressSpaceError::OutOfFrames)
 }
 
 type LinuxInputEvent = crate::input_core::LinuxInputEvent;

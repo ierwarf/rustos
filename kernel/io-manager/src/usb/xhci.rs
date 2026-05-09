@@ -195,7 +195,7 @@ static XHCI_TRANSFER_LOGS: AtomicUsize = AtomicUsize::new(0);
 static XHCI_POLL_SUBMIT_BEGIN_LOGS: AtomicUsize = AtomicUsize::new(0);
 static XHCI_POLL_SUBMIT_QUEUED_LOGS: AtomicUsize = AtomicUsize::new(0);
 static XHCI_POLL_SUBMIT_DONE_LOGS: AtomicUsize = AtomicUsize::new(0);
-const XHCI_EVENTS_PER_SERVICE: usize = 64;
+const XHCI_EVENTS_PER_SERVICE: usize = 16;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct XhciMmioMapper;

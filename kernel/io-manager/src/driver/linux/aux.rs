@@ -1,4 +1,4 @@
-use alloc::alloc::{Layout, alloc};
+use alloc::alloc::{alloc, Layout};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ffi::{c_char, c_void};
@@ -25,9 +25,26 @@ struct PowerSupplyState {
     drv_data: usize,
 }
 
+#[repr(C, align(64))]
+struct LinuxCompatCurrentTask {
+    state: i64,
+    flags: u64,
+    pid: i32,
+    tgid: i32,
+    comm: [u8; 16],
+    padding: [u8; 4056],
+}
+
 static NEXT_HANDLE_ID: AtomicUsize = AtomicUsize::new(1);
 static NEXT_CHRDEV: AtomicU32 = AtomicU32::new(0x100);
-static CURRENT_TASK_STUB: [u8; 4096] = [0; 4096];
+static CURRENT_TASK: LinuxCompatCurrentTask = LinuxCompatCurrentTask {
+    state: 0,
+    flags: 0,
+    pid: 2,
+    tgid: 2,
+    comm: *b"rustos-module\0\0\0",
+    padding: [0; 4056],
+};
 static SCHED_SET_STATE_TRACEPOINT: usize = 0;
 static MAY_RESCHED_SECTION: u8 = 0;
 static SEMAPHORES: Mutex<Vec<SemaphoreState>> = Mutex::new(Vec::new());
@@ -36,7 +53,7 @@ static POWER_SUPPLIES: Mutex<Vec<PowerSupplyState>> = Mutex::new(Vec::new());
 
 pub(crate) fn init_cpu_local_symbols() {
     crate::user::syscall::set_linux_compat_current_task_ptr(
-        &CURRENT_TASK_STUB as *const [u8; 4096] as usize,
+        &CURRENT_TASK as *const LinuxCompatCurrentTask as usize,
     );
 }
 
@@ -45,17 +62,26 @@ pub(crate) unsafe extern "C" fn ___ratelimit(_state: *mut c_void, _func: *const 
 }
 
 pub(crate) unsafe extern "C" fn __check_object_size(
-    _ptr: *const c_void,
-    _bytes: usize,
+    ptr: *const c_void,
+    bytes: usize,
     _to_user: bool,
 ) {
+    let _ = validate_kernel_range(ptr, bytes);
 }
 
-pub(crate) unsafe extern "C" fn validate_usercopy_range(
-    _ptr: *const c_void,
-    _bytes: usize,
-) -> bool {
-    true
+pub(crate) unsafe extern "C" fn validate_usercopy_range(ptr: *const c_void, bytes: usize) -> bool {
+    validate_kernel_range(ptr, bytes)
+}
+
+fn validate_kernel_range(ptr: *const c_void, bytes: usize) -> bool {
+    if bytes == 0 {
+        return true;
+    }
+    let start = ptr as usize;
+    if start == 0 {
+        return false;
+    }
+    start.checked_add(bytes - 1).is_some()
 }
 
 pub(crate) unsafe extern "C" fn _copy_to_user(
@@ -178,7 +204,11 @@ pub(crate) unsafe extern "C" fn down_interruptible(sem: *mut c_void) -> i32 {
 }
 
 pub(crate) unsafe extern "C" fn down_trylock(sem: *mut c_void) -> i32 {
-    if try_take_semaphore(sem) { 0 } else { 1 }
+    if try_take_semaphore(sem) {
+        0
+    } else {
+        1
+    }
 }
 
 pub(crate) unsafe extern "C" fn up(sem: *mut c_void) {

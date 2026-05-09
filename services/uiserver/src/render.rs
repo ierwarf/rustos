@@ -1,4 +1,4 @@
-use crate::app::{AppState, ConsoleWindow, DesktopSurfaceCache};
+use crate::app::{AppState, ConsoleWindow, CursorMotion, DesktopSurfaceCache};
 use crate::canvas::{Rect, SurfaceCanvas};
 use crate::font::{self, TextStyle};
 use crate::sys::ConsoleSessionHandle;
@@ -220,6 +220,7 @@ pub(crate) fn render_frame(state: &mut AppState) {
     let stride_pixels = state.surface.stride_bytes as usize / 4;
     let cursor_x = state.cursor_x;
     let cursor_y = state.cursor_y;
+    let cursor_motion = state.cursor_motion;
     let focused_session_handle = state.focused_session_handle;
     let focused_wayland_surface_id = state.focused_wayland_surface_id;
     let desktop_cache = &state.desktop_cache;
@@ -234,6 +235,7 @@ pub(crate) fn render_frame(state: &mut AppState) {
         height,
         cursor_x,
         cursor_y,
+        cursor_motion,
         focused_session_handle,
         focused_wayland_surface_id,
         desktop_cache,
@@ -279,6 +281,7 @@ pub(crate) fn render_rect(state: &mut AppState, rect: Rect) {
     let stride_pixels = state.surface.stride_bytes as usize / 4;
     let cursor_x = state.cursor_x;
     let cursor_y = state.cursor_y;
+    let cursor_motion = state.cursor_motion;
     let focused_session_handle = state.focused_session_handle;
     let focused_wayland_surface_id = state.focused_wayland_surface_id;
     let desktop_cache = &state.desktop_cache;
@@ -293,6 +296,7 @@ pub(crate) fn render_rect(state: &mut AppState, rect: Rect) {
         height,
         cursor_x,
         cursor_y,
+        cursor_motion,
         focused_session_handle,
         focused_wayland_surface_id,
         desktop_cache,
@@ -307,6 +311,7 @@ fn render_scene(
     height: u32,
     cursor_x: u32,
     cursor_y: u32,
+    cursor_motion: CursorMotion,
     focused_session_handle: ConsoleSessionHandle,
     focused_wayland_surface_id: Option<u32>,
     desktop_cache: &DesktopSurfaceCache,
@@ -406,7 +411,7 @@ fn render_scene(
         clip_rect,
         crate::canvas::cursor_dirty_rect(cursor_x, cursor_y, width, height),
     ) {
-        canvas.draw_cursor(cursor_x, cursor_y);
+        canvas.draw_cursor(cursor_x, cursor_y, cursor_motion);
     }
 }
 

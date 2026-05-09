@@ -27,6 +27,15 @@ use loader::load_module_image;
 pub(crate) use registry::{DriverModuleState, DriverRecord};
 
 const LOADABLE_DRIVER_REGISTRY_PATH: &str = "system/registry/kernel/loadable-drivers.tsv";
+const DISPLAY_PRIMARY_PROVIDER_GROUP: &str = "display-primary";
+const PCI_VENDOR_AMD: u16 = 0x1002;
+const PCI_VENDOR_VIRTIO: u16 = 0x1af4;
+const VIRTIO_PCI_MODERN_DEVICE_ID_BASE: u16 = 0x1040;
+const VIRTIO_PCI_MODERN_DEVICE_ID_LAST: u16 = 0x107f;
+const VIRTIO_PCI_LEGACY_NET_DEVICE_ID: u16 = 0x1000;
+const VIRTIO_PCI_TRANSITIONAL_GPU_DEVICE_ID: u16 = 0x1010;
+const VIRTIO_DEVICE_ID_NET: u32 = 1;
+const VIRTIO_DEVICE_ID_GPU: u32 = 16;
 
 static LOADABLE_DRIVER_REGISTRY_LOADED: AtomicBool = AtomicBool::new(false);
 static LOADABLE_DRIVER_REGISTRY_LOCK: spin::Mutex<()> = spin::Mutex::new(());
@@ -84,6 +93,7 @@ pub(crate) fn register_loadable_elf_with_priority(
         "",
         "",
         "",
+        "",
         None,
         false,
     );
@@ -99,6 +109,7 @@ pub(crate) fn register_loadable_elf_with_policy(
     aliases: &'static str,
     deps: &'static str,
     softdeps: &'static str,
+    linux_driver_names: &'static str,
     provider_group: Option<&'static str>,
     fallback_only: bool,
 ) {
@@ -125,6 +136,7 @@ pub(crate) fn register_loadable_elf_with_policy(
         aliases,
         deps,
         softdeps,
+        linux_driver_names,
         provider_group,
         fallback_only,
         None,
@@ -154,7 +166,7 @@ fn activate_builtin_providers_for_class(class: DriverClass) {
     }
 
     if virtio_gpu::try_enable_primary_display() {
-        registry::mark_provider_group_active("display-primary");
+        registry::mark_provider_group_active(DISPLAY_PRIMARY_PROVIDER_GROUP);
     }
 }
 
@@ -232,6 +244,7 @@ fn ensure_loadable_driver_registry_loaded() -> bool {
         let aliases = registry_field(line, "aliases").unwrap_or("");
         let deps = registry_field(line, "deps").unwrap_or("");
         let softdeps = registry_field(line, "softdeps").unwrap_or("");
+        let linux_driver_names = registry_field(line, "linux_driver_names").unwrap_or(name);
         let provider_group =
             registry_field(line, "provider_group").filter(|value| !value.is_empty());
         let fallback_only = registry_field(line, "fallback_only")
@@ -260,6 +273,8 @@ fn ensure_loadable_driver_registry_loaded() -> bool {
         let leaked_aliases: &'static str = Box::leak(aliases.to_string().into_boxed_str());
         let leaked_deps: &'static str = Box::leak(deps.to_string().into_boxed_str());
         let leaked_softdeps: &'static str = Box::leak(softdeps.to_string().into_boxed_str());
+        let leaked_linux_driver_names: &'static str =
+            Box::leak(linux_driver_names.to_string().into_boxed_str());
         let leaked_provider_group: Option<&'static str> = provider_group
             .map(|value| Box::leak(value.to_string().into_boxed_str()) as &'static str);
         register_loadable_elf_with_policy(
@@ -271,6 +286,7 @@ fn ensure_loadable_driver_registry_loaded() -> bool {
             leaked_aliases,
             leaked_deps,
             leaked_softdeps,
+            leaked_linux_driver_names,
             leaked_provider_group,
             fallback_only,
         );
@@ -448,7 +464,7 @@ fn load_candidate_with_dependencies(
         bus::name(bus),
         image_path
     );
-    match load_module_image(name, class, bus, image_path) {
+    match load_module_image(name, class, bus, image_path, candidate.linux_driver_names) {
         Ok(_module) => {
             registry::update_loadable_module_status(
                 name,
@@ -469,6 +485,14 @@ fn load_candidate_with_dependencies(
             LoadAttempt::Loaded
         }
         Err(error) => {
+            crate::debug::write_debugcon_only_parts_line(&[
+                b"driver module load failed: name=",
+                name.as_bytes(),
+                b" path=",
+                image_path.as_bytes(),
+                b" error=",
+                error.as_bytes(),
+            ]);
             crate::debug::println!(
                 "driver module load failed: name={} class={} bus={} path={} error={}",
                 name,
@@ -537,7 +561,7 @@ fn load_dependency(dep: &str, required: bool, stack: &mut Vec<&'static str>) -> 
 
 fn class_has_active_loadable_provider(class: DriverClass) -> bool {
     if class == DriverClass::Display {
-        return crate::io::gui::display_info().is_some();
+        return crate::io::gui::primary_display_provider_active();
     }
 
     registry::loadable_records().iter().any(|record| {
@@ -549,8 +573,8 @@ fn loadable_candidate_provider_active(candidate: registry::LoadableDriverCandida
     let Some(group) = candidate.provider_group else {
         return false;
     };
-    if group == "display-primary" {
-        return crate::io::gui::display_info().is_some();
+    if group == DISPLAY_PRIMARY_PROVIDER_GROUP {
+        return crate::io::gui::primary_display_provider_active();
     }
     registry::provider_group_active(group)
 }
@@ -602,7 +626,7 @@ fn pci_alias_present(alias: &str) -> bool {
     let mut present = false;
     crate::arch::pci::visit_devices(|device| {
         if alias.contains("vendor=0x1002,class=0x03")
-            && device.vendor_id() == 0x1002
+            && device.vendor_id() == PCI_VENDOR_AMD
             && device.class_code() == 0x03
         {
             present = true;
@@ -610,7 +634,7 @@ fn pci_alias_present(alias: &str) -> bool {
         }
 
         if alias.starts_with("pci:v00001002")
-            && device.vendor_id() == 0x1002
+            && device.vendor_id() == PCI_VENDOR_AMD
             && (!alias.contains("bc03") || device.class_code() == 0x03)
         {
             present = true;
@@ -623,28 +647,46 @@ fn pci_alias_present(alias: &str) -> bool {
 }
 
 fn virtio_alias_present(alias: &str) -> bool {
-    let wants_net = alias.starts_with("virtio:d00000001");
-    let wants_gpu = alias.starts_with("virtio:d00000010");
-    if !wants_net && !wants_gpu {
+    let Some(wanted_device_id) = parse_virtio_alias_device_id(alias) else {
         return false;
-    }
+    };
 
     let mut present = false;
     crate::arch::pci::visit_devices(|device| {
-        if device.vendor_id() != 0x1af4 {
+        if device.vendor_id() != PCI_VENDOR_VIRTIO {
             return false;
         }
-        if wants_gpu && device.class_code() == 0x03 {
-            present = true;
-            return true;
-        }
-        if wants_net && (device.device_id() == 0x1041 || device.device_id() == 0x1000) {
+        if pci_virtio_device_id(device.device_id()) == Some(wanted_device_id) {
             present = true;
             return true;
         }
         false
     });
     present
+}
+
+fn parse_virtio_alias_device_id(alias: &str) -> Option<u32> {
+    let rest = alias.strip_prefix("virtio:d")?;
+    let hex = rest.get(..8)?;
+    if !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(hex, 16).ok()
+}
+
+fn pci_virtio_device_id(pci_device_id: u16) -> Option<u32> {
+    if (VIRTIO_PCI_MODERN_DEVICE_ID_BASE..=VIRTIO_PCI_MODERN_DEVICE_ID_LAST)
+        .contains(&pci_device_id)
+    {
+        return Some(u32::from(
+            pci_device_id.saturating_sub(VIRTIO_PCI_MODERN_DEVICE_ID_BASE),
+        ));
+    }
+    match pci_device_id {
+        VIRTIO_PCI_LEGACY_NET_DEVICE_ID => Some(VIRTIO_DEVICE_ID_NET),
+        VIRTIO_PCI_TRANSITIONAL_GPU_DEVICE_ID => Some(VIRTIO_DEVICE_ID_GPU),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -662,8 +704,9 @@ pub(crate) fn reset_for_tests() {
 mod tests {
     use super::registry::DriverExecutionModel;
     use super::{
-        DriverBus, DriverClass, DriverRecord, register_kernel_builtin, register_loadable_elf,
-        reset_for_tests, snapshot_registered_drivers,
+        parse_virtio_alias_device_id, pci_virtio_device_id, register_kernel_builtin,
+        register_loadable_elf, reset_for_tests, snapshot_registered_drivers, DriverBus,
+        DriverClass, DriverRecord,
     };
 
     fn isolated() -> std::sync::MutexGuard<'static, ()> {
@@ -687,6 +730,7 @@ mod tests {
             aliases: "",
             deps: "",
             softdeps: "",
+            linux_driver_names: "",
             provider_group: None,
             fallback_only: false,
             module_state: None,
@@ -708,6 +752,7 @@ mod tests {
                 aliases: "",
                 deps: "",
                 softdeps: "",
+                linux_driver_names: "",
                 provider_group: None,
                 fallback_only: false,
                 module_state: None,
@@ -727,6 +772,7 @@ mod tests {
                 aliases: "",
                 deps: "",
                 softdeps: "",
+                linux_driver_names: "",
                 provider_group: None,
                 fallback_only: false,
                 module_state: None,
@@ -753,6 +799,7 @@ mod tests {
             aliases: "",
             deps: "",
             softdeps: "",
+            linux_driver_names: "",
             provider_group: None,
             fallback_only: false,
             module_state: None,
@@ -786,6 +833,7 @@ mod tests {
             aliases: "",
             deps: "",
             softdeps: "",
+            linux_driver_names: "",
             provider_group: None,
             fallback_only: false,
             module_state: None,
@@ -797,5 +845,21 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(records[0].module_state, None);
         assert_eq!(records[0].validation_error, None);
+    }
+
+    #[test]
+    fn virtio_alias_parser_uses_device_type() {
+        assert_eq!(parse_virtio_alias_device_id("virtio:d00000001v*"), Some(1));
+        assert_eq!(parse_virtio_alias_device_id("virtio:d00000010v*"), Some(16));
+        assert_eq!(parse_virtio_alias_device_id("virtio:d0000000xv*"), None);
+    }
+
+    #[test]
+    fn virtio_pci_device_ids_map_to_virtio_device_type() {
+        assert_eq!(pci_virtio_device_id(0x1041), Some(1));
+        assert_eq!(pci_virtio_device_id(0x1050), Some(16));
+        assert_eq!(pci_virtio_device_id(0x1000), Some(1));
+        assert_eq!(pci_virtio_device_id(0x1010), Some(16));
+        assert_eq!(pci_virtio_device_id(0x1001), None);
     }
 }

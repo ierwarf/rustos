@@ -26,4 +26,5 @@ bus = "virtio"
 priority = 100
 when = "vfs-ready"
 aliases = ["virtio:d00000001v*"]
+linux_driver_names = ["virtio_net"]
 provider_group = "network-primary"

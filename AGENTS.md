@@ -38,6 +38,17 @@ Allowed exceptions:
 Build/check commands are expected to be quiet on success. If they fail, use the
 reported command output as the primary context instead of scanning logs.
 
+## Hardening Direction
+
+- Prefer long-term hardening over symptom patches: make ownership, provider
+  choice, timeouts, queue bounds, and ABI contracts explicit in source,
+  manifests, registries, probes, or AI contracts.
+- Avoid broad catch-alls and fabricated success paths. Fail closed with bounded
+  waits and direct diagnostics when an implementation is incomplete.
+- For display, input, driver loading, and compat work, keep fallback providers
+  behind real hardware/virtio providers and add validation that catches black
+  frames, stalls, stale surfaces, and provider-order regressions.
+
 ## Repo Entrypoints
 
 - Workspace: `Cargo.toml`

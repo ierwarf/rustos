@@ -2,8 +2,8 @@ use core::{ptr, slice, str};
 
 use driver_abi::{
     DisplayFramebufferRegistration, DriverKernelApiV1, DriverLogLevel, DriverMmioCachePolicy,
-    DriverPciBarInfo, DriverPciDeviceInfo, PCI_BAR_FLAG_64BIT, PCI_BAR_FLAG_IO_SPACE,
-    PCI_BAR_FLAG_PREFETCHABLE,
+    DriverPciBarInfo, DriverPciDeviceInfo, DISPLAY_FRAMEBUFFER_FLAG_BOOT_FRAMEBUFFER,
+    PCI_BAR_FLAG_64BIT, PCI_BAR_FLAG_IO_SPACE, PCI_BAR_FLAG_PREFETCHABLE,
 };
 
 use super::{input, mmio, serio};
@@ -306,7 +306,8 @@ unsafe extern "C" fn driver_query_boot_framebuffer(
                 stride: info.stride,
                 pixel_format,
                 bytes_per_pixel: info.bytes_per_pixel,
-                reserved: [0; 3],
+                flags: DISPLAY_FRAMEBUFFER_FLAG_BOOT_FRAMEBUFFER,
+                reserved: [0; 2],
             },
         );
     }

@@ -7,9 +7,25 @@ use std::ffi::CString;
 use std::fs;
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{mpsc, Mutex, OnceLock};
+use std::thread;
 
 use keyboard_core::{KeyAction, KeyCode, KeyboardDriver};
+use rustos_user_abi::{console as console_abi, device as device_abi};
+
+use console_abi::{
+    ConsoleSendInputEventRequest, ConsoleSetFocusRequest, ConsoleSnapshotSessionOutputRequest,
+    ConsoleSnapshotSessionsRequest,
+};
+pub(crate) use console_abi::{ConsoleSessionInfo, ConsoleStateInfo};
+pub(crate) use device_abi::{
+    DisplayInfo, DisplaySurfaceCreate, InputEvent, INPUT_ACTION_NONE, INPUT_ACTION_PRESSED,
+    INPUT_ACTION_RELEASED, INPUT_ACTION_REPEATED, INPUT_KIND_KEYBOARD, INPUT_KIND_POINTER_BUTTON,
+    INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION, INPUT_KIND_POINTER_SCROLL,
+    PIXEL_FORMAT_BGRA8888, POINTER_BUTTON_LEFT, POINTER_BUTTON_MIDDLE, POINTER_BUTTON_RIGHT,
+    POINTER_BUTTON_X1, POINTER_BUTTON_X2,
+};
+use device_abi::{DisplayPresentRectRequest, DisplayPresentRequest};
 
 const SYS_READ: usize = 0;
 const SYS_MMAP: usize = 9;
@@ -46,35 +62,7 @@ const BTN_RIGHT: u16 = 0x111;
 const BTN_MIDDLE: u16 = 0x112;
 const BTN_SIDE: u16 = 0x113;
 const BTN_EXTRA: u16 = 0x114;
-const LINUX_IOC_NRBITS: usize = 8;
-const LINUX_IOC_TYPEBITS: usize = 8;
-const LINUX_IOC_SIZEBITS: usize = 14;
-const LINUX_IOC_NRSHIFT: usize = 0;
-const LINUX_IOC_TYPESHIFT: usize = LINUX_IOC_NRSHIFT + LINUX_IOC_NRBITS;
-const LINUX_IOC_SIZESHIFT: usize = LINUX_IOC_TYPESHIFT + LINUX_IOC_TYPEBITS;
-const LINUX_IOC_DIRSHIFT: usize = LINUX_IOC_SIZESHIFT + LINUX_IOC_SIZEBITS;
-const LINUX_IOC_WRITE: usize = 1;
-const LINUX_IOC_READ: usize = 2;
-const DISPLAY_IOCTL_TYPE: u8 = b'D';
-const CONSOLE_IOCTL_TYPE: u8 = b'C';
-pub(crate) const CONSOLE_SESSION_CAPACITY: usize = 32;
-const CONSOLE_SESSION_TITLE_CAPACITY: usize = 48;
-
-pub(crate) const PIXEL_FORMAT_BGRA8888: u32 = 1;
-pub(crate) const INPUT_KIND_KEYBOARD: u16 = 1;
-pub(crate) const INPUT_KIND_POINTER_MOTION: u16 = 2;
-pub(crate) const INPUT_KIND_POINTER_BUTTON: u16 = 3;
-pub(crate) const INPUT_KIND_POINTER_SCROLL: u16 = 4;
-pub(crate) const INPUT_KIND_POINTER_POSITION: u16 = 5;
-pub(crate) const INPUT_ACTION_NONE: u16 = 0;
-pub(crate) const INPUT_ACTION_PRESSED: u16 = 1;
-pub(crate) const INPUT_ACTION_RELEASED: u16 = 2;
-pub(crate) const INPUT_ACTION_REPEATED: u16 = 3;
-pub(crate) const POINTER_BUTTON_LEFT: u32 = 1;
-pub(crate) const POINTER_BUTTON_RIGHT: u32 = 2;
-pub(crate) const POINTER_BUTTON_MIDDLE: u32 = 4;
-pub(crate) const POINTER_BUTTON_X1: u32 = 8;
-pub(crate) const POINTER_BUTTON_X2: u32 = 16;
+pub(crate) const CONSOLE_SESSION_CAPACITY: usize = console_abi::MAX_CONSOLE_SESSIONS;
 pub(crate) const MAX_CONSOLE_SNAPSHOT_BYTES: usize = 4096;
 const EAGAIN: i32 = 11;
 pub(crate) const ENOENT: i32 = 2;
@@ -109,158 +97,17 @@ fn input_translation_state() -> &'static Mutex<InputTranslationState> {
     STATE.get_or_init(|| Mutex::new(InputTranslationState::default()))
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct DisplayInfo {
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) stride_bytes: u32,
-    pub(crate) bytes_per_pixel: u32,
-    pub(crate) pixel_format: u32,
-    pub(crate) reserved: u32,
-    pub(crate) generation: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct DisplaySurfaceCreate {
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) pixel_format: u32,
-    pub(crate) flags: u32,
-    pub(crate) handle: u32,
-    pub(crate) bytes_per_pixel: u32,
-    pub(crate) stride_bytes: u32,
-    pub(crate) reserved: u32,
-    pub(crate) mapping_len: u64,
-    pub(crate) generation: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct DisplayPresentRequest {
-    surface_handle: u32,
-    reserved: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct DisplayPresentRectRequest {
-    surface_handle: u32,
-    reserved: u32,
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct InputEvent {
-    pub(crate) kind: u16,
-    pub(crate) action: u16,
-    pub(crate) code: u32,
-    pub(crate) value0: i32,
-    pub(crate) value1: i32,
-    pub(crate) modifiers: u32,
-    pub(crate) text: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct ConsoleStateInfo {
-    pub(crate) focused_session_handle: u64,
-    pub(crate) session_count: u32,
-    pub(crate) reserved: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ConsoleSessionInfo {
-    pub(crate) session_handle: u64,
-    pub(crate) state: u16,
-    pub(crate) focused: u16,
-    pub(crate) reserved: u32,
-    pub(crate) output_generation: u64,
-    pub(crate) title: [u8; CONSOLE_SESSION_TITLE_CAPACITY],
-}
-
-impl Default for ConsoleSessionInfo {
-    fn default() -> Self {
-        Self {
-            session_handle: 0,
-            state: 0,
-            focused: 0,
-            reserved: 0,
-            output_generation: 0,
-            title: [0; CONSOLE_SESSION_TITLE_CAPACITY],
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct ConsoleSnapshotSessionsRequest {
-    sessions_ptr: u64,
-    capacity: u64,
-    count: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct ConsoleSnapshotSessionOutputRequest {
-    session_handle: u64,
-    bytes_ptr: u64,
-    capacity: u64,
-    count: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct ConsoleSetFocusRequest {
-    session_handle: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct ConsoleSendInputEventRequest {
-    session_handle: u64,
-    event: InputEvent,
-}
-
-const fn linux_ioc(dir: usize, type_: u8, nr: u8, size: usize) -> usize {
-    (dir << LINUX_IOC_DIRSHIFT)
-        | ((type_ as usize) << LINUX_IOC_TYPESHIFT)
-        | ((nr as usize) << LINUX_IOC_NRSHIFT)
-        | (size << LINUX_IOC_SIZESHIFT)
-}
-
-const fn linux_ior<T>(type_: u8, nr: u8) -> usize {
-    linux_ioc(LINUX_IOC_READ, type_, nr, size_of::<T>())
-}
-
-const fn linux_iow<T>(type_: u8, nr: u8) -> usize {
-    linux_ioc(LINUX_IOC_WRITE, type_, nr, size_of::<T>())
-}
-
-const fn linux_iowr<T>(type_: u8, nr: u8) -> usize {
-    linux_ioc(LINUX_IOC_READ | LINUX_IOC_WRITE, type_, nr, size_of::<T>())
-}
-
-const DISPLAY_IOCTL_GET_INFO: usize = linux_ior::<DisplayInfo>(DISPLAY_IOCTL_TYPE, 1);
-const DISPLAY_IOCTL_CREATE_SURFACE: usize =
-    linux_iowr::<DisplaySurfaceCreate>(DISPLAY_IOCTL_TYPE, 2);
-const DISPLAY_IOCTL_PRESENT: usize = linux_iow::<DisplayPresentRequest>(DISPLAY_IOCTL_TYPE, 3);
-const DISPLAY_IOCTL_PRESENT_RECT: usize =
-    linux_iow::<DisplayPresentRectRequest>(DISPLAY_IOCTL_TYPE, 4);
-const CONSOLE_IOCTL_GET_STATE: usize = linux_ior::<ConsoleStateInfo>(CONSOLE_IOCTL_TYPE, 1);
+const DISPLAY_IOCTL_GET_INFO: usize = device_abi::DISPLAY_IOCTL_GET_INFO as usize;
+const DISPLAY_IOCTL_CREATE_SURFACE: usize = device_abi::DISPLAY_IOCTL_CREATE_SURFACE as usize;
+const DISPLAY_IOCTL_PRESENT: usize = device_abi::DISPLAY_IOCTL_PRESENT as usize;
+const DISPLAY_IOCTL_PRESENT_RECT: usize = device_abi::DISPLAY_IOCTL_PRESENT_RECT as usize;
+const CONSOLE_IOCTL_GET_STATE: usize = console_abi::CONSOLE_IOCTL_GET_STATE as usize;
 const CONSOLE_IOCTL_SNAPSHOT_SESSION_OUTPUT: usize =
-    linux_iowr::<ConsoleSnapshotSessionOutputRequest>(CONSOLE_IOCTL_TYPE, 2);
-const CONSOLE_IOCTL_SET_FOCUS: usize = linux_iow::<ConsoleSetFocusRequest>(CONSOLE_IOCTL_TYPE, 3);
-const CONSOLE_IOCTL_SEND_INPUT_EVENT: usize =
-    linux_iow::<ConsoleSendInputEventRequest>(CONSOLE_IOCTL_TYPE, 4);
+    console_abi::CONSOLE_IOCTL_SNAPSHOT_SESSION_OUTPUT as usize;
+const CONSOLE_IOCTL_SET_FOCUS: usize = console_abi::CONSOLE_IOCTL_SET_FOCUS as usize;
+const CONSOLE_IOCTL_SEND_INPUT_EVENT: usize = console_abi::CONSOLE_IOCTL_SEND_INPUT_EVENT as usize;
 const CONSOLE_IOCTL_SNAPSHOT_SESSIONS: usize =
-    linux_iowr::<ConsoleSnapshotSessionsRequest>(CONSOLE_IOCTL_TYPE, 5);
+    console_abi::CONSOLE_IOCTL_SNAPSHOT_SESSIONS as usize;
 
 pub(crate) struct SurfaceMapping {
     base: NonNull<u32>,
@@ -308,12 +155,12 @@ pub(crate) fn open_display() -> Result<OwnedFd, i32> {
 }
 
 pub(crate) fn open_console() -> Result<OwnedFd, i32> {
-    open_device("/dev/console0", O_RDWR)
+    open_device(console_abi::CONSOLE_PATH, O_RDWR)
 }
 
 pub(crate) fn open_input() -> Result<Vec<OwnedFd>, i32> {
     if running_on_rustos() {
-        return open_device("/dev/input0", O_RDONLY | O_NONBLOCK).map(|fd| vec![fd]);
+        return open_device(device_abi::INPUT_PATH, O_RDONLY | O_NONBLOCK).map(|fd| vec![fd]);
     }
     open_all_devices(
         "/dev/input",
@@ -324,8 +171,17 @@ pub(crate) fn open_input() -> Result<Vec<OwnedFd>, i32> {
 }
 
 pub(crate) fn diag_line(message: &str) {
-    let _ = message;
-    observability_client::info!("uiserver", service, "{}", message);
+    static SENDER: OnceLock<mpsc::SyncSender<String>> = OnceLock::new();
+    let sender = SENDER.get_or_init(|| {
+        let (sender, receiver) = mpsc::sync_channel::<String>(128);
+        thread::spawn(move || {
+            while let Ok(message) = receiver.recv() {
+                observability_client::info!("uiserver", service, "{}", message);
+            }
+        });
+        sender
+    });
+    let _ = sender.try_send(message.to_owned());
 }
 
 pub(crate) fn boot_trace_enabled() -> bool {
@@ -371,21 +227,13 @@ pub(crate) fn display_create_surface(
     width: u32,
     height: u32,
 ) -> Result<DisplaySurfaceCreate, i32> {
-    let mut surface = DisplaySurfaceCreate {
-        width,
-        height,
-        pixel_format: PIXEL_FORMAT_BGRA8888,
-        ..DisplaySurfaceCreate::default()
-    };
+    let mut surface = DisplaySurfaceCreate::request(width, height, PIXEL_FORMAT_BGRA8888);
     ioctl_with_mut(fd, DISPLAY_IOCTL_CREATE_SURFACE, &mut surface)?;
     Ok(surface)
 }
 
 pub(crate) fn display_present(fd: RawFd, surface_handle: u32) -> Result<(), i32> {
-    let mut request = DisplayPresentRequest {
-        surface_handle,
-        reserved: 0,
-    };
+    let mut request = DisplayPresentRequest::new(surface_handle);
     ioctl_with_mut(fd, DISPLAY_IOCTL_PRESENT, &mut request)
 }
 
@@ -397,14 +245,7 @@ pub(crate) fn display_present_rect(
     width: u32,
     height: u32,
 ) -> Result<(), i32> {
-    let mut request = DisplayPresentRectRequest {
-        surface_handle,
-        reserved: 0,
-        x,
-        y,
-        width,
-        height,
-    };
+    let mut request = DisplayPresentRectRequest::new(surface_handle, x, y, width, height);
     ioctl_with_mut(fd, DISPLAY_IOCTL_PRESENT_RECT, &mut request)
 }
 
@@ -765,11 +606,8 @@ pub(crate) fn console_snapshot_sessions(
     fd: RawFd,
     sessions: &mut [ConsoleSessionInfo],
 ) -> Result<usize, i32> {
-    let mut request = ConsoleSnapshotSessionsRequest {
-        sessions_ptr: sessions.as_mut_ptr() as u64,
-        capacity: sessions.len() as u64,
-        count: 0,
-    };
+    let mut request =
+        ConsoleSnapshotSessionsRequest::new(sessions.as_mut_ptr() as u64, sessions.len() as u64);
     ioctl_with_mut(fd, CONSOLE_IOCTL_SNAPSHOT_SESSIONS, &mut request)?;
     let count = usize::try_from(request.count).unwrap_or(sessions.len());
     Ok(count.min(sessions.len()))
@@ -780,12 +618,11 @@ pub(crate) fn console_snapshot_session_output(
     session_handle: ConsoleSessionHandle,
     bytes: &mut [u8],
 ) -> Result<usize, i32> {
-    let mut request = ConsoleSnapshotSessionOutputRequest {
+    let mut request = ConsoleSnapshotSessionOutputRequest::new(
         session_handle,
-        bytes_ptr: bytes.as_mut_ptr() as u64,
-        capacity: bytes.len() as u64,
-        count: 0,
-    };
+        bytes.as_mut_ptr() as u64,
+        bytes.len() as u64,
+    );
     ioctl_with_mut(fd, CONSOLE_IOCTL_SNAPSHOT_SESSION_OUTPUT, &mut request)?;
     let count = usize::try_from(request.count).unwrap_or(bytes.len());
     Ok(count.min(bytes.len()))
@@ -795,7 +632,7 @@ pub(crate) fn console_set_focus(
     fd: RawFd,
     session_handle: ConsoleSessionHandle,
 ) -> Result<(), i32> {
-    let mut request = ConsoleSetFocusRequest { session_handle };
+    let mut request = ConsoleSetFocusRequest::new(session_handle);
     ioctl_with_mut(fd, CONSOLE_IOCTL_SET_FOCUS, &mut request)
 }
 
@@ -804,10 +641,7 @@ pub(crate) fn console_send_input_event(
     session_handle: ConsoleSessionHandle,
     event: InputEvent,
 ) -> Result<(), i32> {
-    let mut request = ConsoleSendInputEventRequest {
-        session_handle,
-        event,
-    };
+    let mut request = ConsoleSendInputEventRequest::new(session_handle, event);
     ioctl_with_mut(fd, CONSOLE_IOCTL_SEND_INPUT_EVENT, &mut request)
 }
 
@@ -889,7 +723,7 @@ fn enumerate_device_paths(directory: &str, prefix: &str, fallback: &str) -> Vec<
 
 fn running_on_rustos() -> bool {
     static IS_RUSTOS: OnceLock<bool> = OnceLock::new();
-    *IS_RUSTOS.get_or_init(|| open_device("/dev/console0", O_RDWR).is_ok())
+    *IS_RUSTOS.get_or_init(|| open_device(console_abi::CONSOLE_PATH, O_RDWR).is_ok())
 }
 
 fn ioctl_with_mut<T>(fd: RawFd, request: usize, arg: &mut T) -> Result<(), i32> {

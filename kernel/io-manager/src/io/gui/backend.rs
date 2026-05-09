@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use boot_protocol::FramebufferInfo;
 use spin::Mutex;
@@ -11,6 +11,7 @@ use crate::memory::paging::{self, ProcessAddressSpace};
 const HUGE_2MIB: u64 = 2 * 1024 * 1024;
 const ENABLE_FRAMEBUFFER_WRITE_COMBINE: bool = false;
 const MAX_BACKEND_PRESENT_SAMPLE_LOGS: usize = 8;
+const USER_PRESENT_STRIPE_BYTES: usize = 256 * 1024;
 
 enum BackendInstance {
     Unavailable,
@@ -19,6 +20,7 @@ enum BackendInstance {
 
 struct FramebufferDisplayBackend {
     framebuffer: Framebuffer,
+    flags: u32,
 }
 
 pub(crate) struct DisplayBackend {
@@ -28,6 +30,8 @@ pub(crate) struct DisplayBackend {
 
 static DISPLAY_BACKEND: Mutex<DisplayBackend> = Mutex::new(DisplayBackend::empty());
 static BACKEND_PRESENT_SAMPLE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static DISPLAY_WIDTH: AtomicU32 = AtomicU32::new(0);
+static DISPLAY_HEIGHT: AtomicU32 = AtomicU32::new(0);
 
 impl DisplayBackend {
     const fn empty() -> Self {
@@ -37,7 +41,7 @@ impl DisplayBackend {
         }
     }
 
-    fn install_framebuffer(&mut self, info: FramebufferInfo) -> bool {
+    fn install_framebuffer(&mut self, info: FramebufferInfo, flags: u32) -> bool {
         if !framebuffer_info_is_valid(info) {
             return false;
         }
@@ -47,7 +51,10 @@ impl DisplayBackend {
         self.generation = next_display_generation(self.generation);
         self.instance = BackendInstance::Framebuffer(FramebufferDisplayBackend {
             framebuffer: build_framebuffer(info),
+            flags,
         });
+        DISPLAY_WIDTH.store(info.width, Ordering::Release);
+        DISPLAY_HEIGHT.store(info.height, Ordering::Release);
         true
     }
 
@@ -66,6 +73,7 @@ impl DisplayBackend {
                 height: backend.framebuffer.height() as u32,
                 stride_bytes: backend.framebuffer.stride_bytes() as u32,
                 bytes_per_pixel: backend.framebuffer.bytes_per_pixel() as u32,
+                flags: backend.flags,
                 generation: self.generation,
             }),
         }
@@ -77,12 +85,12 @@ fn next_display_generation(current: u64) -> u64 {
     if next == 0 { 1 } else { next }
 }
 
-pub(crate) fn install_boot_framebuffer(info: FramebufferInfo) -> bool {
-    DISPLAY_BACKEND.lock().install_framebuffer(info)
+pub(crate) fn install_boot_framebuffer(info: FramebufferInfo, flags: u32) -> bool {
+    DISPLAY_BACKEND.lock().install_framebuffer(info, flags)
 }
 
-pub(crate) fn install_driver_framebuffer(info: FramebufferInfo) -> bool {
-    DISPLAY_BACKEND.lock().install_framebuffer(info)
+pub(crate) fn install_driver_framebuffer(info: FramebufferInfo, flags: u32) -> bool {
+    DISPLAY_BACKEND.lock().install_framebuffer(info, flags)
 }
 
 pub(crate) fn try_with_framebuffer<R>(f: impl FnOnce(&mut Framebuffer) -> R) -> Option<R> {
@@ -94,6 +102,12 @@ pub(crate) fn display_info() -> Option<GuiDisplayInfo> {
     DISPLAY_BACKEND.lock().display_info()
 }
 
+pub(crate) fn display_dimensions() -> Option<(u32, u32)> {
+    let width = DISPLAY_WIDTH.load(Ordering::Acquire);
+    let height = DISPLAY_HEIGHT.load(Ordering::Acquire);
+    (width != 0 && height != 0).then_some((width, height))
+}
+
 pub(crate) fn present_bgra8888_from_user(
     address_space: &ProcessAddressSpace,
     user_ptr: u64,
@@ -101,28 +115,23 @@ pub(crate) fn present_bgra8888_from_user(
     height: usize,
     stride_bytes: usize,
 ) -> Result<bool, paging::AddressSpaceError> {
-    let Some(result) = DISPLAY_BACKEND.lock().with_framebuffer(|framebuffer| {
-        let drawn = framebuffer.draw_bgra8888_frame_from_user(
-            address_space,
-            user_ptr,
+    let presented = copy_user_bgra8888_rect_in_stripes(
+        address_space,
+        user_ptr,
+        width,
+        height,
+        stride_bytes,
+        FramebufferRect {
+            x: 0,
+            y: 0,
             width,
             height,
-            stride_bytes,
-        )?;
-        log_backend_present_sample(framebuffer, drawn);
-        if drawn {
-            let presented = framebuffer.present_scene();
-            if presented {
-                crate::driver::virtio_gpu::flush_primary();
-            }
-            return Ok(presented);
-        }
-        Ok(false)
-    }) else {
-        return Ok(false);
-    };
-
-    result
+        },
+    )?;
+    if presented {
+        crate::driver::virtio_gpu::flush_primary();
+    }
+    Ok(presented)
 }
 
 #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
@@ -157,28 +166,91 @@ pub(crate) fn present_bgra8888_rect_from_user(
     stride_bytes: usize,
     rect: FramebufferRect,
 ) -> Result<bool, paging::AddressSpaceError> {
-    let Some(result) = DISPLAY_BACKEND.lock().with_framebuffer(|framebuffer| {
-        let drawn = framebuffer.draw_bgra8888_frame_rect_from_user(
-            address_space,
-            user_ptr,
-            width,
-            height,
-            stride_bytes,
-            rect,
-        )?;
-        if drawn {
-            let presented = framebuffer.present_scene();
-            if presented {
-                crate::driver::virtio_gpu::flush_primary();
-            }
-            return Ok(presented);
+    let presented = copy_user_bgra8888_rect_in_stripes(
+        address_space,
+        user_ptr,
+        width,
+        height,
+        stride_bytes,
+        rect,
+    )?;
+    if presented {
+        crate::driver::virtio_gpu::flush_primary_rect(
+            rect.x as u32,
+            rect.y as u32,
+            rect.width as u32,
+            rect.height as u32,
+        );
+    }
+    Ok(presented)
+}
+
+fn copy_user_bgra8888_rect_in_stripes(
+    address_space: &ProcessAddressSpace,
+    user_ptr: u64,
+    width: usize,
+    height: usize,
+    stride_bytes: usize,
+    rect: FramebufferRect,
+) -> Result<bool, paging::AddressSpaceError> {
+    if rect.width == 0 || rect.height == 0 {
+        return Ok(true);
+    }
+
+    let stripe_rows = user_present_stripe_rows(rect.width);
+    let end_y = rect
+        .y
+        .checked_add(rect.height)
+        .ok_or(paging::AddressSpaceError::AddressOverflow)?;
+    let mut y = rect.y;
+    let mut copied = false;
+
+    while y < end_y {
+        let stripe_height = stripe_rows.min(end_y - y);
+        let stripe = FramebufferRect {
+            x: rect.x,
+            y,
+            width: rect.width,
+            height: stripe_height,
+        };
+        let Some(result) = DISPLAY_BACKEND.lock().with_framebuffer(|framebuffer| {
+            let drawn = framebuffer.draw_bgra8888_frame_rect_from_user(
+                address_space,
+                user_ptr,
+                width,
+                height,
+                stride_bytes,
+                stripe,
+            )?;
+            log_backend_present_sample(framebuffer, drawn);
+            Ok(drawn)
+        }) else {
+            return Ok(false);
+        };
+
+        if !result? {
+            return Ok(false);
         }
-        Ok(false)
-    }) else {
+        copied = true;
+        y += stripe_height;
+    }
+
+    if !copied {
+        return Ok(false);
+    }
+
+    let Some(presented) = DISPLAY_BACKEND
+        .lock()
+        .with_framebuffer(|framebuffer| framebuffer.present_scene())
+    else {
         return Ok(false);
     };
+    Ok(presented)
+}
 
-    result
+fn user_present_stripe_rows(width: usize) -> usize {
+    let row_bytes = width.saturating_mul(4).max(1);
+    (USER_PRESENT_STRIPE_BYTES / row_bytes).max(1)
 }
 
 pub(crate) fn present_bgra8888_from_kernel(
@@ -187,21 +259,21 @@ pub(crate) fn present_bgra8888_from_kernel(
     height: usize,
     stride_bytes: usize,
 ) -> bool {
-    DISPLAY_BACKEND
+    let presented = DISPLAY_BACKEND
         .lock()
         .with_framebuffer(|framebuffer| {
             let drawn =
                 framebuffer.draw_bgra8888_frame_from_kernel(src_ptr, width, height, stride_bytes);
             if drawn {
-                let presented = framebuffer.present_scene();
-                if presented {
-                    crate::driver::virtio_gpu::flush_primary();
-                }
-                return presented;
+                return framebuffer.present_scene();
             }
             false
         })
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if presented {
+        crate::driver::virtio_gpu::flush_primary();
+    }
+    presented
 }
 
 pub(crate) fn present_bgra8888_rect_from_kernel(
@@ -211,7 +283,7 @@ pub(crate) fn present_bgra8888_rect_from_kernel(
     stride_bytes: usize,
     rect: FramebufferRect,
 ) -> bool {
-    DISPLAY_BACKEND
+    let presented = DISPLAY_BACKEND
         .lock()
         .with_framebuffer(|framebuffer| {
             let drawn = framebuffer.draw_bgra8888_frame_rect_from_kernel(
@@ -222,15 +294,20 @@ pub(crate) fn present_bgra8888_rect_from_kernel(
                 rect,
             );
             if drawn {
-                let presented = framebuffer.present_scene();
-                if presented {
-                    crate::driver::virtio_gpu::flush_primary();
-                }
-                return presented;
+                return framebuffer.present_scene();
             }
             false
         })
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if presented {
+        crate::driver::virtio_gpu::flush_primary_rect(
+            rect.x as u32,
+            rect.y as u32,
+            rect.width as u32,
+            rect.height as u32,
+        );
+    }
+    presented
 }
 
 fn mark_framebuffer_write_combine(info: FramebufferInfo) {

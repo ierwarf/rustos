@@ -26,6 +26,7 @@ pub enum FatNodeKind {
 pub struct FatDirEntry {
     pub name: String,
     pub kind: FatNodeKind,
+    pub len: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -214,6 +215,38 @@ impl<D: BlockDevice> FatVolume<D> {
             .map(FatFile)
     }
 
+    pub fn open_file_with_len(&self, path: &str) -> Result<(FatFile<'_, D>, u64), FatError> {
+        let normalized = normalize_fat_path(path);
+        let mut components = normalized
+            .split('/')
+            .filter(|component| !component.is_empty());
+        let Some(first) = components.next() else {
+            return Err(fatfs::Error::InvalidInput);
+        };
+
+        let mut dir = self.fs.root_dir();
+        let mut component = first;
+        loop {
+            let next = components.next();
+            let want_dir = next.is_some();
+            let entry = find_entry_case_insensitive(&dir, component)?;
+            if want_dir {
+                if !entry.is_dir() {
+                    return Err(fatfs::Error::InvalidInput);
+                }
+                dir = entry.to_dir();
+                component = next.unwrap();
+                continue;
+            }
+
+            if entry.is_dir() {
+                return Err(fatfs::Error::InvalidInput);
+            }
+            let len = entry.len();
+            return Ok((FatFile(entry.to_file()), len));
+        }
+    }
+
     pub fn create_file(&self, path: &str) -> Result<FatFile<'_, D>, FatError> {
         let normalized = normalize_fat_path(path);
         self.fs
@@ -268,6 +301,7 @@ impl<D: BlockDevice> FatVolume<D> {
                 } else {
                     FatNodeKind::File
                 },
+                len: if entry.is_dir() { 0 } else { entry.len() },
             });
         }
         Ok(entries)
@@ -310,9 +344,8 @@ impl<D: BlockDevice> FatVolume<D> {
     }
 
     pub fn read_file_to_vec(&self, path: &str) -> Result<Vec<u8>, FatError> {
-        let expected_len =
-            usize::try_from(self.metadata(path)?.len).map_err(|_| fatfs::Error::InvalidInput)?;
-        let mut file = self.open_file(path)?;
+        let (mut file, len) = self.open_file_with_len(path)?;
+        let expected_len = usize::try_from(len).map_err(|_| fatfs::Error::InvalidInput)?;
         let mut bytes = vec![0_u8; expected_len];
         let mut done = 0usize;
         while done < bytes.len() {
@@ -425,6 +458,22 @@ fn split_parent_child(path: &str) -> Option<(&str, &str)> {
         None if !path.is_empty() => Some(("", path)),
         _ => None,
     }
+}
+
+fn find_entry_case_insensitive<'a, D: BlockDevice>(
+    dir: &InnerDir<'a, D>,
+    name: &str,
+) -> Result<
+    fatfs::DirEntry<'a, FatDisk<D>, fatfs::DefaultTimeProvider, fatfs::LossyOemCpConverter>,
+    FatError,
+> {
+    for entry in dir.iter() {
+        let entry = entry?;
+        if entry.file_name().eq_ignore_ascii_case(name) {
+            return Ok(entry);
+        }
+    }
+    Err(fatfs::Error::NotFound)
 }
 
 #[cfg(test)]
@@ -679,6 +728,12 @@ mod tests {
                 len: 0,
             }
         );
+
+        let entries = volume.read_dir("services").expect("read services dir");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "initd.elf");
+        assert_eq!(entries[0].kind, FatNodeKind::File);
+        assert_eq!(entries[0].len, 16);
         volume.unmount().expect("unmount");
     }
 
@@ -695,9 +750,10 @@ mod tests {
             file.flush().expect("flush image");
         }
 
-        let mut file = volume
-            .open_file("services/sessiond.elf")
-            .expect("open nested image");
+        let (mut file, len) = volume
+            .open_file_with_len("services/sessiond.elf")
+            .expect("open nested image with len");
+        assert_eq!(len, 4);
         let mut buf = [0_u8; 4];
         let read = file.read(&mut buf).expect("read nested image");
         assert_eq!(read, 4);

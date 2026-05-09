@@ -2,12 +2,16 @@ mod bootstrap;
 mod input;
 mod runtime;
 
+pub(crate) use bootstrap::start_launcher_program_loader;
+pub(crate) use runtime::start_console_refresh_worker;
+
 use std::os::fd::OwnedFd;
 use std::string::String;
 use std::time::Duration;
 use std::vec::Vec;
 
 use crate::canvas;
+use crate::cursor_sprites::CURSOR_SPRITE_MAX_DISTANCE;
 use crate::sys::{ConsoleSessionHandle, DisplayInfo, DisplaySurfaceCreate, SurfaceMapping};
 use crate::terminal::TerminalState;
 use crate::wayland::WaylandWindowSnapshot;
@@ -17,15 +21,33 @@ pub(crate) const MAX_INPUT_READ_BATCHES_PER_TICK: usize = 4;
 pub(crate) const MAX_RUNNING_PROGRAMS: usize = 8;
 pub(crate) const IDLE_SLEEP: Duration = Duration::from_millis(4);
 pub(crate) const INPUT_PROCESS_BUDGET: Duration = Duration::from_millis(2);
-pub(crate) const TARGET_FRAME_INTERVAL: Duration = Duration::from_millis(8);
 pub(crate) const RUNTIME_POLL_SLEEP: Duration = Duration::from_millis(32);
 pub(crate) const CONSOLE_POLL_SLEEP: Duration = Duration::from_millis(64);
 pub(crate) const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
+pub(crate) const CURSOR_MOTION_SETTLE_INTERVAL: Duration = Duration::from_micros(8_333);
 pub(crate) const HIDDEN_RUNTIME_PROGRAM_TITLES: &[&str] = &["UI Server"];
 
 const PAGE_SIZE: usize = 4096;
 const MAX_DISPLAY_WIDTH: u32 = 7680;
 const MAX_DISPLAY_HEIGHT: u32 = 4320;
+const CURSOR_MOTION_HOLD_TICKS: u8 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CursorMotion {
+    pub(crate) dx: i32,
+    pub(crate) dy: i32,
+    pub(crate) sprite_index: u8,
+}
+
+impl CursorMotion {
+    pub(crate) const fn stationary() -> Self {
+        Self {
+            dx: 1,
+            dy: 0,
+            sprite_index: 0,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct InputProcessingResult {
@@ -286,6 +308,8 @@ pub(crate) struct AppState {
     pub(crate) frame: SurfaceMapping,
     pub(crate) cursor_x: u32,
     pub(crate) cursor_y: u32,
+    pub(crate) cursor_motion: CursorMotion,
+    cursor_motion_hold_ticks: u8,
     pub(crate) left_button_down: bool,
     pub(crate) focused_session_handle: ConsoleSessionHandle,
     pub(crate) focused_wayland_surface_id: Option<u32>,
@@ -310,6 +334,20 @@ fn align_up(value: usize, align: usize) -> Option<usize> {
     } else {
         value.checked_add(align - remainder)
     }
+}
+
+fn integer_sqrt(value: i64) -> u64 {
+    if value <= 0 {
+        return 0;
+    }
+
+    let mut estimate = value as u64;
+    let mut next = (estimate + 1) / 2;
+    while next < estimate {
+        estimate = next;
+        next = (estimate + value as u64 / estimate) / 2;
+    }
+    estimate
 }
 
 impl AppState {
@@ -348,6 +386,40 @@ impl AppState {
         before_dirty
             .union(self.wayland_stack_dirty_rect())
             .union(self.wayland_taskbar_dirty_rect())
+    }
+
+    pub(crate) fn record_cursor_motion(&mut self, previous_x: u32, previous_y: u32) {
+        if previous_x == self.cursor_x && previous_y == self.cursor_y {
+            return;
+        }
+
+        let dx = self.cursor_x as i64 - previous_x as i64;
+        let dy = self.cursor_y as i64 - previous_y as i64;
+        let distance = integer_sqrt(dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy)));
+        self.cursor_motion = CursorMotion {
+            dx: dx.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+            dy: dy.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+            sprite_index: distance.min(u64::from(CURSOR_SPRITE_MAX_DISTANCE)) as u8,
+        };
+        self.cursor_motion_hold_ticks = CURSOR_MOTION_HOLD_TICKS;
+    }
+
+    pub(crate) fn settle_cursor_motion(&mut self, width: u32, height: u32) -> canvas::Rect {
+        if self.cursor_motion.sprite_index == 0 {
+            return canvas::Rect::empty();
+        }
+        if self.cursor_motion_hold_ticks != 0 {
+            self.cursor_motion_hold_ticks = self.cursor_motion_hold_ticks.saturating_sub(1);
+            return canvas::Rect::empty();
+        }
+
+        let before = self.cursor_visual_dirty_rect(width, height);
+        self.cursor_motion = CursorMotion::stationary();
+        before.union(self.cursor_visual_dirty_rect(width, height))
+    }
+
+    pub(crate) fn cursor_visual_dirty_rect(&self, width: u32, height: u32) -> canvas::Rect {
+        canvas::cursor_dirty_rect(self.cursor_x, self.cursor_y, width, height)
     }
 
     pub(crate) fn wayland_stack_dirty_rect(&self) -> canvas::Rect {

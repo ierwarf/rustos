@@ -33,7 +33,7 @@ const USB_URB_STATUS_IO_ERROR: i32 = -5;
 const USB_URB_STATUS_UNLINKED: i32 = -2;
 const REPORT_QUEUE_CAPACITY: usize = 256;
 const PENDING_COMPLETION_CAPACITY: usize = 64;
-const COMPLETIONS_PER_SERVICE: usize = 128;
+const COMPLETIONS_PER_SERVICE: usize = 32;
 const REPORT_DROP_LOG_INTERVAL: u64 = 128;
 const MAX_REPORT_BYTES: usize = 4096;
 const KEYBOARD_TRANSLATION_LOG_LIMIT: usize = 0;
@@ -1313,31 +1313,26 @@ fn handle_pointer_report(hid_device_ptr: usize, report: &[u8], layout: &PointerL
         return 0;
     }
 
-    let (target_x, target_y, buttons) = {
+    let (display_max_x, display_max_y) = crate::io::gui::display_dimensions()
+        .map(|(width, height)| {
+            (
+                width.saturating_sub(1) as i32,
+                height.saturating_sub(1) as i32,
+            )
+        })
+        .unwrap_or((0, 0));
+    let target_x =
+        scale_absolute_coordinate(x, layout.logical_min_x, layout.logical_max_x, display_max_x);
+    let target_y =
+        scale_absolute_coordinate(y, layout.logical_min_y, layout.logical_max_y, display_max_y);
+    let buttons = {
         let mut states = HID_REPORT_STATES.lock();
         let state = ensure_hid_state(&mut states, hid_device_ptr);
-        let display = crate::io::gui::display_info();
-        let target_x = scale_absolute_coordinate(
-            x,
-            layout.logical_min_x,
-            layout.logical_max_x,
-            display
-                .map(|info| info.width.saturating_sub(1) as i32)
-                .unwrap_or(0),
-        );
-        let target_y = scale_absolute_coordinate(
-            y,
-            layout.logical_min_y,
-            layout.logical_max_y,
-            display
-                .map(|info| info.height.saturating_sub(1) as i32)
-                .unwrap_or(0),
-        );
         state.have_pointer_origin = true;
         state.last_pointer_x = target_x;
         state.last_pointer_y = target_y;
         state.last_pointer_buttons = button_bits;
-        (target_x, target_y, pointer_buttons_from_report(button_bits))
+        pointer_buttons_from_report(button_bits)
     };
 
     HID_POINTER_REPORT_COUNT.fetch_add(1, Ordering::Relaxed);

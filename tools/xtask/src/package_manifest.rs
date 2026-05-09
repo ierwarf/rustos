@@ -155,6 +155,8 @@ pub(crate) struct AutoloadSpec {
     #[serde(default)]
     pub(crate) softdeps: Vec<String>,
     #[serde(default)]
+    pub(crate) linux_driver_names: Vec<String>,
+    #[serde(default)]
     pub(crate) provider_group: Option<String>,
     #[serde(default)]
     pub(crate) fallback_only: bool,

@@ -1,5 +1,6 @@
 mod app;
 mod canvas;
+mod cursor_sprites;
 mod font;
 mod input_loop;
 mod profile;
@@ -14,8 +15,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use app::{
-    AppState, VisualUpdate, CONSOLE_POLL_SLEEP, CURSOR_BLINK_INTERVAL, IDLE_SLEEP,
-    INPUT_EVENT_BATCH, RUNTIME_POLL_SLEEP, TARGET_FRAME_INTERVAL,
+    start_console_refresh_worker, start_launcher_program_loader, AppState, VisualUpdate,
+    CONSOLE_POLL_SLEEP, CURSOR_BLINK_INTERVAL, CURSOR_MOTION_SETTLE_INTERVAL, IDLE_SLEEP,
+    INPUT_EVENT_BATCH, RUNTIME_POLL_SLEEP,
 };
 use render::{render_boot_frame, render_debug_white_box, render_frame, render_rect};
 use runtime_control::RuntimeClient;
@@ -32,6 +34,7 @@ const MAX_SLOW_CONSOLE_REFRESH_LOGS: usize = 4;
 const MAX_SLOW_PRESENT_LOGS: usize = 8;
 const SLOW_RUNTIME_REFRESH_THRESHOLD: Duration = Duration::from_millis(100);
 const MAX_SLOW_RUNTIME_REFRESH_LOGS: usize = 8;
+const WAYLAND_BACKLOG_SERVICE_INTERVAL: Duration = Duration::from_millis(4);
 
 static FRAME_SAMPLE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SLOW_CONSOLE_REFRESH_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -55,12 +58,8 @@ fn cursor_move_update(
             state.surface.width,
             state.surface.height,
         ),
-        secondary_partial_redraw_rect: canvas::cursor_dirty_rect(
-            state.cursor_x,
-            state.cursor_y,
-            state.surface.width,
-            state.surface.height,
-        ),
+        secondary_partial_redraw_rect: state
+            .cursor_visual_dirty_rect(state.surface.width, state.surface.height),
     }
 }
 
@@ -295,25 +294,27 @@ fn run() -> Result<(), i32> {
     let mut wayland = WaylandCompositor::initialize(state.display.width, state.display.height);
     boot_line("uiserver: wayland initialize done");
     boot_line("uiserver: post-present init done");
-    let mut launcher_programs_loaded = false;
+    let launcher_programs = start_launcher_program_loader();
+    let console_refreshes = start_console_refresh_worker();
     let mut events = [InputEvent::default(); INPUT_EVENT_BATCH];
     let mut next_runtime_poll = Instant::now();
     let mut next_console_poll = Instant::now() + CONSOLE_POLL_SLEEP;
-    let mut next_present_at = Instant::now() + TARGET_FRAME_INTERVAL;
     let mut next_cursor_blink = Instant::now() + CURSOR_BLINK_INTERVAL;
+    let mut next_cursor_motion_settle = Instant::now() + CURSOR_MOTION_SETTLE_INTERVAL;
     let mut next_loop_summary = Instant::now() + Duration::from_secs(1);
+    let mut next_wayland_backlog_service = Instant::now();
     let mut loop_count = 0_u64;
 
     loop {
         loop_count = loop_count.saturating_add(1);
-        if !launcher_programs_loaded {
-            if state.populate_launcher_programs() {
+
+        while let Ok(programs) = launcher_programs.try_recv() {
+            if state.apply_launcher_programs(programs) {
                 pending_update.absorb(VisualUpdate::partial(render::launcher_dirty_rect(
                     state.surface.width,
                     state.surface.height,
                 )));
             }
-            launcher_programs_loaded = true;
         }
 
         let input =
@@ -325,43 +326,52 @@ fn run() -> Result<(), i32> {
         });
 
         let now = Instant::now();
-        if !input.backlog_remaining {
-            if now >= next_runtime_poll {
-                let refresh_started = Instant::now();
-                let runtime_changed = refresh_runtime_state(&runtime_sync, &mut runtime_state)?;
-                let apply_dirty = state.apply_runtime_state(&mut runtime_state);
-                let apply_changed = !apply_dirty.is_empty();
-                let refresh_elapsed = refresh_started.elapsed();
-                if refresh_elapsed >= SLOW_RUNTIME_REFRESH_THRESHOLD {
-                    log_slow_runtime_refresh(
-                        &state,
-                        refresh_elapsed,
-                        runtime_changed,
-                        apply_changed,
-                    );
-                }
-                next_runtime_poll = now + RUNTIME_POLL_SLEEP;
-                pending_update.absorb(VisualUpdate::partial(apply_dirty));
-            }
-            if let Some(compositor) = wayland.as_mut() {
+        let service_wayland = !input.backlog_remaining || now >= next_wayland_backlog_service;
+        if let Some(compositor) = wayland.as_mut() {
+            if service_wayland {
                 if compositor.tick() {
                     let wayland_dirty = state.sync_wayland_windows(compositor.window_snapshots());
                     let focus_dirty = state.recover_focus_after_wayland_change(Some(compositor))?;
                     pending_update.absorb(VisualUpdate::partial(wayland_dirty.union(focus_dirty)));
                 }
+                pending_update.absorb(VisualUpdate::partial(
+                    compositor.pending_frame_callback_rect(),
+                ));
+                next_wayland_backlog_service = now + WAYLAND_BACKLOG_SERVICE_INTERVAL;
+            } else if input.backlog_remaining {
+                compositor.flush_clients();
             }
-            if now >= next_console_poll {
-                let refresh_started = Instant::now();
-                let dirty_rect = state.refresh_console_windows()?;
-                let changed = !dirty_rect.is_empty();
-                pending_update.absorb(VisualUpdate::partial(dirty_rect));
-                let refresh_elapsed = refresh_started.elapsed();
-                profile::record_console_refresh(refresh_elapsed, changed);
-                if refresh_elapsed >= SLOW_CONSOLE_REFRESH_THRESHOLD {
-                    log_slow_console_refresh(&state, refresh_elapsed);
-                }
-                next_console_poll = now + CONSOLE_POLL_SLEEP;
+        }
+
+        let now = Instant::now();
+        if now >= next_runtime_poll {
+            let refresh_started = Instant::now();
+            let runtime_changed = refresh_runtime_state(&runtime_sync, &mut runtime_state)?;
+            let apply_dirty = state.apply_runtime_state(&mut runtime_state);
+            let apply_changed = !apply_dirty.is_empty();
+            let refresh_elapsed = refresh_started.elapsed();
+            if refresh_elapsed >= SLOW_RUNTIME_REFRESH_THRESHOLD {
+                log_slow_runtime_refresh(&state, refresh_elapsed, runtime_changed, apply_changed);
             }
+            next_runtime_poll = now + RUNTIME_POLL_SLEEP;
+            pending_update.absorb(VisualUpdate::partial(apply_dirty));
+        }
+
+        let now = Instant::now();
+        if now >= next_console_poll {
+            let refresh_started = Instant::now();
+            let mut dirty_rect = canvas::Rect::empty();
+            while let Ok(refresh) = console_refreshes.try_recv() {
+                dirty_rect = dirty_rect.union(state.apply_console_refresh(refresh)?);
+            }
+            let changed = !dirty_rect.is_empty();
+            pending_update.absorb(VisualUpdate::partial(dirty_rect));
+            let refresh_elapsed = refresh_started.elapsed();
+            profile::record_console_refresh(refresh_elapsed, changed);
+            if refresh_elapsed >= SLOW_CONSOLE_REFRESH_THRESHOLD {
+                log_slow_console_refresh(&state, refresh_elapsed);
+            }
+            next_console_poll = now + CONSOLE_POLL_SLEEP;
         }
 
         let now = Instant::now();
@@ -371,57 +381,44 @@ fn run() -> Result<(), i32> {
             }
             next_cursor_blink = now + CURSOR_BLINK_INTERVAL;
         }
+        if now >= next_cursor_motion_settle {
+            let cursor_dirty_rect =
+                state.settle_cursor_motion(state.surface.width, state.surface.height);
+            pending_update.absorb(VisualUpdate::partial(cursor_dirty_rect));
+            next_cursor_motion_settle = now + CURSOR_MOTION_SETTLE_INTERVAL;
+        }
         let mut drawable_update = pending_update;
-        drawable_update.absorb(cursor_move_update(
-            &state,
-            presented_cursor_x,
-            presented_cursor_y,
-        ));
+        if !input.backlog_remaining || !pending_update.is_empty() {
+            drawable_update.absorb(cursor_move_update(
+                &state,
+                presented_cursor_x,
+                presented_cursor_y,
+            ));
+        }
         drawable_update.coalesce_tight_partials();
         drawable_update.promote_large_partial(state.surface.width, state.surface.height);
 
         let now = Instant::now();
         if now >= next_loop_summary {
-            diag_line(
-                format!(
-                    "uiserver: loop summary loops={} pending_update={} backlog={} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
-                    loop_count,
-                    !drawable_update.is_empty(),
-                    input.backlog_remaining,
-                    state.console_windows.len(),
-                    state.wayland_windows.len(),
-                    state.focused_session_handle,
-                    state.focused_wayland_surface_id,
-                )
-                .as_str(),
-            );
+            if profile::enabled() {
+                diag_line(
+                    format!(
+                        "uiserver: loop summary loops={} pending_update={} backlog={} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
+                        loop_count,
+                        !drawable_update.is_empty(),
+                        input.backlog_remaining,
+                        state.console_windows.len(),
+                        state.wayland_windows.len(),
+                        state.focused_session_handle,
+                        state.focused_wayland_surface_id,
+                    )
+                    .as_str(),
+                );
+            }
             next_loop_summary = now + Duration::from_secs(1);
             loop_count = 0;
         }
-        if drawable_update.is_empty() {
-            if input.backlog_remaining {
-                continue;
-            }
-            let sleep_deadline = next_runtime_poll
-                .min(next_console_poll)
-                .min(now + IDLE_SLEEP);
-            input_loop::sleep_until(sleep_deadline);
-            continue;
-        }
-
-        if now < next_present_at {
-            if input.backlog_remaining {
-                profile::record_throttle_spin();
-                continue;
-            }
-            let sleep_deadline = next_present_at
-                .min(next_runtime_poll)
-                .min(next_console_poll);
-            input_loop::sleep_until(sleep_deadline);
-            continue;
-        }
-
-        if drawable_update.needs_full_redraw {
+        let rendered = if drawable_update.needs_full_redraw {
             let render_started = Instant::now();
             render_frame(&mut state);
             let render_elapsed = render_started.elapsed();
@@ -431,7 +428,6 @@ fn run() -> Result<(), i32> {
                 Ok(()) => {}
                 Err(err) if state.recover_if_stale_surface_error(err)? => {
                     pending_update.request_full();
-                    next_present_at = Instant::now();
                     continue;
                 }
                 Err(err) => return Err(err),
@@ -448,45 +444,27 @@ fn run() -> Result<(), i32> {
             if total_elapsed >= SLOW_PRESENT_THRESHOLD {
                 log_slow_present(&state, total_elapsed, true, None);
             }
+            true
         } else if !drawable_update.partial_redraw_rect.is_empty() {
             let render_started = Instant::now();
-            let primary_rect = drawable_update.partial_redraw_rect;
-            render_rect(&mut state, drawable_update.partial_redraw_rect);
-            let mut rect_count = 1_u64;
-            let mut pixel_count = primary_rect.width.saturating_mul(primary_rect.height) as u64;
+            let render_rect_target = drawable_update
+                .partial_redraw_rect
+                .union(drawable_update.secondary_partial_redraw_rect);
+            render_rect(&mut state, render_rect_target);
+            let rect_count = 1_u64;
+            let pixel_count = render_rect_target
+                .width
+                .saturating_mul(render_rect_target.height) as u64;
             let first_present_started = Instant::now();
-            match state.present_rect(drawable_update.partial_redraw_rect) {
+            match state.present_rect(render_rect_target) {
                 Ok(()) => {}
                 Err(err) if state.recover_if_stale_surface_error(err)? => {
                     pending_update.request_full();
-                    next_present_at = Instant::now();
                     continue;
                 }
                 Err(err) => return Err(err),
             }
-            let mut present_elapsed = first_present_started.elapsed();
-            if !drawable_update.secondary_partial_redraw_rect.is_empty() {
-                rect_count = rect_count.saturating_add(1);
-                pixel_count = pixel_count.saturating_add(
-                    drawable_update
-                        .secondary_partial_redraw_rect
-                        .width
-                        .saturating_mul(drawable_update.secondary_partial_redraw_rect.height)
-                        as u64,
-                );
-                render_rect(&mut state, drawable_update.secondary_partial_redraw_rect);
-                let second_present_started = Instant::now();
-                match state.present_rect(drawable_update.secondary_partial_redraw_rect) {
-                    Ok(()) => {}
-                    Err(err) if state.recover_if_stale_surface_error(err)? => {
-                        pending_update.request_full();
-                        next_present_at = Instant::now();
-                        continue;
-                    }
-                    Err(err) => return Err(err),
-                }
-                present_elapsed += second_present_started.elapsed();
-            }
+            let present_elapsed = first_present_started.elapsed();
             let render_elapsed = render_started.elapsed().saturating_sub(present_elapsed);
             profile::record_present(
                 false,
@@ -497,17 +475,31 @@ fn run() -> Result<(), i32> {
             );
             let total_elapsed = render_elapsed + present_elapsed;
             if total_elapsed >= SLOW_PRESENT_THRESHOLD {
-                log_slow_present(&state, total_elapsed, false, Some(primary_rect));
+                log_slow_present(&state, total_elapsed, false, Some(render_rect_target));
             }
+            true
+        } else {
+            false
+        };
+
+        if rendered {
+            if let Some(compositor) = wayland.as_mut() {
+                compositor.frame_presented();
+            }
+            pending_update.clear();
+            presented_cursor_x = state.cursor_x;
+            presented_cursor_y = state.cursor_y;
         }
 
-        if let Some(compositor) = wayland.as_mut() {
-            compositor.frame_presented();
+        let now = Instant::now();
+        if !rendered && pending_update.is_empty() && !input.backlog_remaining {
+            let sleep_deadline = next_runtime_poll
+                .min(next_console_poll)
+                .min(next_cursor_blink)
+                .min(next_cursor_motion_settle)
+                .min(now + IDLE_SLEEP);
+            input_loop::sleep_until(sleep_deadline);
         }
-        pending_update.clear();
-        presented_cursor_x = state.cursor_x;
-        presented_cursor_y = state.cursor_y;
-        next_present_at = Instant::now() + TARGET_FRAME_INTERVAL;
         profile::maybe_emit();
     }
 }

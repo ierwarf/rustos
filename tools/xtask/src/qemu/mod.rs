@@ -1,4 +1,4 @@
-use anyhow::{Context, anyhow, bail};
+use anyhow::{anyhow, bail, Context};
 use fs_err as fs;
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -9,9 +9,12 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::Result;
 use crate::config::Config;
 use crate::util::{create_temp_dir, env_string, read_trimmed, resolve_command_path};
+use crate::Result;
+
+const DEFAULT_QEMU_DISPLAY_WIDTH: u32 = 2560;
+const DEFAULT_QEMU_DISPLAY_HEIGHT: u32 = 1440;
 
 struct RunOptions {
     profile: String,
@@ -594,10 +597,12 @@ fn prepare_run(config: &Config, options: RunOptions) -> Result<PreparedRun> {
     }
 
     let vfio_args = configure_vfio_args(&mut profile_args, &vfio_hosts, options.vfio_force)?;
-    let gpu_args = configure_default_gpu_args(&options.qemu_user_args, &vfio_hosts);
-    let usb_args = configure_usb_args(options.usb_input, &options.qemu_user_args);
+    let use_kvm = options.accel == "kvm";
+    let gpu_args = configure_default_gpu_args(&options.qemu_user_args, &vfio_hosts, use_kvm);
+    let use_low_latency_input = options.usb_input || options.accel == "kvm";
+    let usb_args = configure_usb_args(use_low_latency_input, &options.qemu_user_args);
     let network_args = configure_network_args(options.network, &options.qemu_user_args);
-    let display_args = configure_display_args(&options.qemu_user_args);
+    let display_args = configure_display_args(&options.qemu_user_args, use_kvm);
     let (debugcon_args, debugcon_log) = configure_debugcon(config, &mut session, options.debugcon)?;
     let qemu_log_args = configure_qemu_log(config, options.qemu_log)?;
 
@@ -713,10 +718,14 @@ fn build_run_profile_args(options: &RunOptions, boot_image: &Path) -> Result<Vec
     args.push(OsString::from("-m"));
     args.push(OsString::from(spec.memory));
     args.push(OsString::from("-machine"));
+    let use_low_latency_input = options.usb_input || options.accel == "kvm";
     if options.accel == "kvm" {
-        args.push(machine_option("q35,accel=kvm", options.usb_input));
+        args.push(machine_option(
+            "q35,accel=kvm,vmport=off",
+            use_low_latency_input,
+        ));
     } else {
-        args.push(machine_option("q35", options.usb_input));
+        args.push(machine_option("q35,vmport=off", use_low_latency_input));
     }
     if let Some(cpu) = if options.accel == "kvm" {
         spec.cpu_when_kvm
@@ -741,11 +750,11 @@ fn qemu_profile_spec(profile: &str) -> Result<QemuProfileSpec> {
     match profile {
         "default" => Ok(QemuProfileSpec {
             boot_disk: QemuBootDisk::Ahci,
-            memory: "2G",
+            memory: "4G",
             cpu_when_kvm: Some("host"),
             cpu_other: None,
-            smp: None,
-            rtc: None,
+            smp: Some("4,sockets=1,cores=4,threads=1"),
+            rtc: Some("base=localtime,clock=host"),
         }),
         "g14" => Ok(QemuProfileSpec {
             boot_disk: QemuBootDisk::Ahci,
@@ -757,11 +766,11 @@ fn qemu_profile_spec(profile: &str) -> Result<QemuProfileSpec> {
         }),
         "nvme" => Ok(QemuProfileSpec {
             boot_disk: QemuBootDisk::Nvme,
-            memory: "2G",
+            memory: "4G",
             cpu_when_kvm: Some("host"),
             cpu_other: None,
-            smp: None,
-            rtc: None,
+            smp: Some("4,sockets=1,cores=4,threads=1"),
+            rtc: Some("base=localtime,clock=host"),
         }),
         _ => Err(anyhow!("unknown qemu profile: {profile}")),
     }
@@ -1040,7 +1049,7 @@ fn configure_qemu_log(config: &Config, mode: QemuLogMode) -> Result<Vec<OsString
     }
 }
 
-fn configure_display_args(qemu_user_args: &[String]) -> Vec<OsString> {
+fn configure_display_args(qemu_user_args: &[String], _use_kvm: bool) -> Vec<OsString> {
     if env::var_os("DISPLAY").is_none() && env::var_os("WAYLAND_DISPLAY").is_none() {
         return Vec::new();
     }
@@ -1067,11 +1076,15 @@ fn configure_display_args(qemu_user_args: &[String]) -> Vec<OsString> {
 
     vec![
         OsString::from("-display"),
-        OsString::from("gtk,gl=off,grab-on-hover=on"),
+        OsString::from("gtk,gl=off,grab-on-hover=on,show-cursor=off,zoom-to-fit=on"),
     ]
 }
 
-fn configure_default_gpu_args(qemu_user_args: &[String], vfio_hosts: &[String]) -> Vec<OsString> {
+fn configure_default_gpu_args(
+    qemu_user_args: &[String],
+    vfio_hosts: &[String],
+    _use_kvm: bool,
+) -> Vec<OsString> {
     if !vfio_hosts.is_empty() || qemu_user_overrides_gpu(qemu_user_args) {
         return Vec::new();
     }
@@ -1080,7 +1093,9 @@ fn configure_default_gpu_args(qemu_user_args: &[String], vfio_hosts: &[String]) 
         OsString::from("-vga"),
         OsString::from("none"),
         OsString::from("-device"),
-        OsString::from("virtio-vga,xres=1600,yres=900"),
+        OsString::from(format!(
+            "virtio-vga,xres={DEFAULT_QEMU_DISPLAY_WIDTH},yres={DEFAULT_QEMU_DISPLAY_HEIGHT},max_outputs=1,edid=off"
+        )),
     ]
 }
 
@@ -1131,6 +1146,7 @@ fn configure_usb_args(enable_usb_input: bool, qemu_user_args: &[String]) -> Vec<
         arg.contains("qemu-xhci")
             || arg.contains("usb-kbd")
             || arg.contains("usb-tablet")
+            || arg.contains("usb-mouse")
             || arg == "-usb"
     }) {
         return Vec::new();
@@ -1271,21 +1287,31 @@ fn run_display_probe(config: &Config, options: RunOptions) -> Result<()> {
         let mut qmp = connect_qmp(&qmp_socket, PROBE_QMP_TIMEOUT)?;
         wait_for_boot_marker(
             &debugcon_log,
-            &["userspace display active", "userspace_display=true"],
+            &[
+                "userspace display active",
+                "userspace_display=true",
+                "uiserver: wayland compositor ready",
+                "uiserver: init surface meta",
+            ],
             probe_duration_env("RUSTOS_PROBE_BOOT_TIMEOUT_MS", PROBE_BOOT_TIMEOUT_DEFAULT),
         )?;
 
         let baseline_dump = prepared.session.temp_dir.join("probe-baseline.ppm");
         qmp_screendump(&mut qmp, &baseline_dump)?;
-        let baseline = read_ppm_dimensions(&baseline_dump)?;
+        let baseline = read_ppm_summary(&baseline_dump)?;
 
-        if baseline.0 == 0 || baseline.1 == 0 || baseline.0 > 8192 || baseline.1 > 8192 {
+        if baseline.width == 0
+            || baseline.height == 0
+            || baseline.width > 8192
+            || baseline.height > 8192
+        {
             bail!(
                 "probe baseline geometry is invalid: {}x{}",
-                baseline.0,
-                baseline.1
+                baseline.width,
+                baseline.height
             );
         }
+        validate_ppm_visible("baseline", baseline)?;
 
         if let Ok(info) = qmp_hmp_capture(&mut qmp, "info mice", Instant::now() + PROBE_QMP_TIMEOUT)
         {
@@ -1304,16 +1330,17 @@ fn run_display_probe(config: &Config, options: RunOptions) -> Result<()> {
 
         let stressed_dump = prepared.session.temp_dir.join("probe-stressed.ppm");
         qmp_screendump(&mut qmp, &stressed_dump)?;
-        let stressed = read_ppm_dimensions(&stressed_dump)?;
-        if stressed != baseline {
+        let stressed = read_ppm_summary(&stressed_dump)?;
+        if stressed.dimensions() != baseline.dimensions() {
             bail!(
                 "display geometry changed during probe: baseline={}x{}, stressed={}x{}",
-                baseline.0,
-                baseline.1,
-                stressed.0,
-                stressed.1
+                baseline.width,
+                baseline.height,
+                stressed.width,
+                stressed.height
             );
         }
+        validate_ppm_visible("stressed", stressed)?;
 
         let debugcon = fs::read_to_string(&debugcon_log).unwrap_or_default();
         for marker in PROBE_BAD_MARKERS {
@@ -1395,6 +1422,7 @@ fn run_probe_mouse_stress(
     let end = Instant::now() + stress_duration;
     let mut step = 0usize;
     let mut last_heartbeat_second = latest_kernel_alive_second(debugcon_log);
+    let mut heartbeat_seen = last_heartbeat_second.is_some();
     let mut last_heartbeat_at = Instant::now();
     let mut x = 0x4000_i32;
     let mut y = 0x3000_i32;
@@ -1411,14 +1439,17 @@ fn run_probe_mouse_stress(
             }
         }
 
-        if let Some(second) = latest_kernel_alive_second(debugcon_log) {
+        if let Some(second) = latest_kernel_alive_second_in_log(&log) {
+            heartbeat_seen = true;
             if last_heartbeat_second != Some(second) {
                 last_heartbeat_second = Some(second);
                 last_heartbeat_at = Instant::now();
             }
         }
 
-        if Instant::now().saturating_duration_since(last_heartbeat_at) > heartbeat_stall {
+        if heartbeat_seen
+            && Instant::now().saturating_duration_since(last_heartbeat_at) > heartbeat_stall
+        {
             bail!(
                 "probe detected stalled kernel heartbeat after {:?} (last second={})",
                 heartbeat_stall,
@@ -1531,6 +1562,10 @@ fn qmp_input_send_pointer_rel(
 
 fn latest_kernel_alive_second(log_path: &Path) -> Option<u64> {
     let log = fs::read_to_string(log_path).ok()?;
+    latest_kernel_alive_second_in_log(&log)
+}
+
+fn latest_kernel_alive_second_in_log(log: &str) -> Option<u64> {
     log.lines().rev().find_map(parse_kernel_alive_second)
 }
 
@@ -1652,7 +1687,38 @@ fn read_qmp_message(qmp: &mut UnixStream, deadline: Instant) -> Result<String> {
     }
 }
 
-fn read_ppm_dimensions(path: &Path) -> Result<(u32, u32)> {
+#[derive(Clone, Copy)]
+struct PpmSummary {
+    width: u32,
+    height: u32,
+    non_black_pixels: u64,
+}
+
+impl PpmSummary {
+    fn dimensions(self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    fn pixel_count(self) -> u64 {
+        u64::from(self.width).saturating_mul(u64::from(self.height))
+    }
+}
+
+fn validate_ppm_visible(stage: &str, summary: PpmSummary) -> Result<()> {
+    let min_visible_pixels = (summary.pixel_count() / 1000).max(64);
+    if summary.non_black_pixels < min_visible_pixels {
+        bail!(
+            "display probe captured an effectively black {stage} frame: non_black_pixels={} min_visible_pixels={} geometry={}x{}",
+            summary.non_black_pixels,
+            min_visible_pixels,
+            summary.width,
+            summary.height
+        );
+    }
+    Ok(())
+}
+
+fn read_ppm_summary(path: &Path) -> Result<PpmSummary> {
     let data = fs::read(path)?;
     let mut tokens = Vec::new();
     let mut i = 0usize;
@@ -1686,7 +1752,35 @@ fn read_ppm_dimensions(path: &Path) -> Result<(u32, u32)> {
     let height = tokens[2]
         .parse::<u32>()
         .map_err(|_| anyhow!("invalid screendump height: {}", tokens[2]))?;
-    Ok((width, height))
+    let max_value = tokens[3]
+        .parse::<u32>()
+        .map_err(|_| anyhow!("invalid screendump max value: {}", tokens[3]))?;
+    if max_value != 255 {
+        bail!("unsupported screendump max value: {max_value}");
+    }
+    if i < data.len() && data[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let expected_len = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| anyhow!("screendump dimensions overflow: {}x{}", width, height))?;
+    let pixel_end = i
+        .checked_add(expected_len)
+        .ok_or_else(|| anyhow!("screendump pixel length overflow: {}", path.display()))?;
+    let pixels = data
+        .get(i..pixel_end)
+        .ok_or_else(|| anyhow!("truncated screendump pixel data: {}", path.display()))?;
+    let non_black_pixels = pixels
+        .chunks_exact(3)
+        .filter(|pixel| pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0)
+        .count() as u64;
+
+    Ok(PpmSummary {
+        width,
+        height,
+        non_black_pixels,
+    })
 }
 
 fn json_escape(input: &str) -> String {

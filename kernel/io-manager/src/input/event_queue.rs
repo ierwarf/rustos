@@ -99,22 +99,23 @@ pub(crate) fn lock_event_queue() -> MutexGuard<'static, InputEventQueueState> {
 }
 
 pub fn debug_snapshot() -> InputEventQueueDebugSnapshot {
-    with_event_queue(|events| {
-        let snapshot = events.snapshot();
-        InputEventQueueDebugSnapshot {
-            pointer_packet_submits: POINTER_PACKET_SUBMIT_COUNT.load(Ordering::Relaxed),
-            pointer_absolute_submits: POINTER_ABSOLUTE_SUBMIT_COUNT.load(Ordering::Relaxed),
-            read_calls: INPUT_READ_CALL_COUNT.load(Ordering::Relaxed),
-            read_events: INPUT_READ_EVENT_COUNT.load(Ordering::Relaxed),
-            lock_active: EVENT_QUEUE_LOCK_ACTIVE.load(Ordering::Acquire),
-            lock_last_seq: EVENT_QUEUE_LOCK_LAST_SEQ.load(Ordering::Acquire),
-            queued: snapshot.queued,
-            pending_coalesced: snapshot.pending_coalesced,
-            pending_pointer_position: snapshot.pending_pointer_position,
-            dropped_discrete: snapshot.dropped_discrete,
-            dropped_lossy: snapshot.dropped_lossy,
-        }
-    })
+    let snapshot = INPUT_EVENTS
+        .try_lock()
+        .map(|events| events.snapshot())
+        .unwrap_or_default();
+    InputEventQueueDebugSnapshot {
+        pointer_packet_submits: POINTER_PACKET_SUBMIT_COUNT.load(Ordering::Relaxed),
+        pointer_absolute_submits: POINTER_ABSOLUTE_SUBMIT_COUNT.load(Ordering::Relaxed),
+        read_calls: INPUT_READ_CALL_COUNT.load(Ordering::Relaxed),
+        read_events: INPUT_READ_EVENT_COUNT.load(Ordering::Relaxed),
+        lock_active: EVENT_QUEUE_LOCK_ACTIVE.load(Ordering::Acquire),
+        lock_last_seq: EVENT_QUEUE_LOCK_LAST_SEQ.load(Ordering::Acquire),
+        queued: snapshot.queued,
+        pending_coalesced: snapshot.pending_coalesced,
+        pending_pointer_position: snapshot.pending_pointer_position,
+        dropped_discrete: snapshot.dropped_discrete,
+        dropped_lossy: snapshot.dropped_lossy,
+    }
 }
 
 #[cfg(test)]

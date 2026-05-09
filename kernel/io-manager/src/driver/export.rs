@@ -83,6 +83,24 @@ pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
     if rust_symbol_has_suffix(name, "4core5slice5index16slice_index_fail") {
         return Some(rust_module_slice_index_fail as *const () as usize);
     }
+    if rust_symbol_has_suffix(name, "___rustc12___rust_alloc") {
+        return Some(rust_module_alloc as *const () as usize);
+    }
+    if rust_symbol_has_suffix(name, "___rustc14___rust_dealloc") {
+        return Some(rust_module_dealloc as *const () as usize);
+    }
+    if rust_symbol_has_suffix(name, "___rustc14___rust_realloc") {
+        return Some(rust_module_realloc as *const () as usize);
+    }
+    if rust_symbol_has_suffix(name, "___rustc19___rust_alloc_zeroed") {
+        return Some(rust_module_alloc_zeroed as *const () as usize);
+    }
+    if rust_symbol_has_suffix(name, "___rustc26___rust_alloc_error_handler") {
+        return Some(rust_module_alloc_error_handler as *const () as usize);
+    }
+    if rust_symbol_has_suffix(name, "___rustc35___rust_no_alloc_shim_is_unstable_v2") {
+        return Some(rust_module_no_alloc_shim_is_unstable_v2 as *const () as usize);
+    }
 
     match name {
         "rustos_register_serio_driver" => Some(rustos_register_serio_driver as *const () as usize),
@@ -96,24 +114,6 @@ pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
         }
         "rustos_serio_get_drvdata" => Some(rustos_serio_get_drvdata as *const () as usize),
         "rustos_serio_set_drvdata" => Some(rustos_serio_set_drvdata as *const () as usize),
-        "_RNvCsaHtlzDUaK2V_7___rustc12___rust_alloc" => {
-            Some(rust_module_alloc as *const () as usize)
-        }
-        "_RNvCsaHtlzDUaK2V_7___rustc14___rust_dealloc" => {
-            Some(rust_module_dealloc as *const () as usize)
-        }
-        "_RNvCsaHtlzDUaK2V_7___rustc14___rust_realloc" => {
-            Some(rust_module_realloc as *const () as usize)
-        }
-        "_RNvCsaHtlzDUaK2V_7___rustc19___rust_alloc_zeroed" => {
-            Some(rust_module_alloc_zeroed as *const () as usize)
-        }
-        "_RNvCsaHtlzDUaK2V_7___rustc26___rust_alloc_error_handler" => {
-            Some(rust_module_alloc_error_handler as *const () as usize)
-        }
-        "_RNvCsaHtlzDUaK2V_7___rustc35___rust_no_alloc_shim_is_unstable_v2" => {
-            Some(rust_module_no_alloc_shim_is_unstable_v2 as *const () as usize)
-        }
         _ if prefer_linux_compat_symbol(name) => {
             let linux_address = linux::resolve_symbol(name);
             let module_address = module_registry::resolve_symbol(name);

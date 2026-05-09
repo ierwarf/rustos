@@ -612,6 +612,7 @@ dependencies = [
  "lazy_static",
  "linux-raw-sys",
  "nucleus-core",
+ "rustos-user-abi",
  "spin 0.10.0",
  "trace-loc-macro",
  "x86_64",
@@ -908,6 +909,7 @@ dependencies = [
  "libc",
  "observability-client",
  "runtime-control",
+ "rustos-user-abi",
 ]
 
 [[package]]
@@ -950,6 +952,10 @@ dependencies = [
 
 [[package]]
 name = "rustos-observability"
+version = "0.1.0"
+
+[[package]]
+name = "rustos-user-abi"
 version = "0.1.0"
 
 [[package]]
@@ -1250,6 +1256,7 @@ dependencies = [
  "keyboard-core",
  "observability-client",
  "runtime-control",
+ "rustos-user-abi",
  "vte",
  "wayland-protocols",
  "wayland-server",

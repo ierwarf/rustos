@@ -29,3 +29,4 @@ aliases = ["virtio:d00000010v*"]
 deps = ["virtio_dma_buf"]
 provider_group = "display-primary"
 fallback_only = true
+linux_driver_names = ["virtio_gpu"]

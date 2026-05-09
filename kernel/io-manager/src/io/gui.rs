@@ -5,7 +5,10 @@ use core::str;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use boot_protocol::{BootInfo, FramebufferInfo};
-use driver_abi::{DisplayFramebufferRegistration, DisplayPixelFormat};
+use driver_abi::{
+    DISPLAY_FRAMEBUFFER_FLAG_BOOT_FRAMEBUFFER, DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER,
+    DISPLAY_FRAMEBUFFER_KNOWN_FLAGS, DisplayFramebufferRegistration, DisplayPixelFormat,
+};
 use embedded_graphics::Drawable;
 use embedded_graphics::geometry::Point;
 use embedded_graphics::mono_font::{MonoTextStyle, ascii::FONT_9X18_BOLD};
@@ -16,6 +19,9 @@ use spin::Mutex;
 
 use self::framebuffer::{Framebuffer, FramebufferRect};
 use crate::io::session::ConsoleSessionHandle;
+use crate::user::abi::device::{
+    DISPLAY_INFO_FLAG_BOOT_FRAMEBUFFER, DISPLAY_INFO_FLAG_PRIMARY_PROVIDER,
+};
 
 static USERSPACE_DISPLAY_MODE: AtomicU8 = AtomicU8::new(DISPLAY_MODE_BOOT_CONSOLE);
 static EMERGENCY_CONSOLE: Mutex<EmergencyConsole> = Mutex::new(EmergencyConsole::new());
@@ -35,7 +41,14 @@ pub struct GuiDisplayInfo {
     pub height: u32,
     pub stride_bytes: u32,
     pub bytes_per_pixel: u32,
+    pub flags: u32,
     pub generation: u64,
+}
+
+impl GuiDisplayInfo {
+    pub const fn is_primary_provider(self) -> bool {
+        self.flags & DISPLAY_INFO_FLAG_PRIMARY_PROVIDER != 0
+    }
 }
 
 pub fn init_console() {
@@ -84,7 +97,8 @@ pub fn init(boot_info_ptr: *const BootInfo) {
     }
     drop(console);
 
-    if backend::install_boot_framebuffer(boot_info.framebuffer) {
+    if backend::install_boot_framebuffer(boot_info.framebuffer, DISPLAY_INFO_FLAG_BOOT_FRAMEBUFFER)
+    {
         emergency_console_framebuffer_changed();
     }
 }
@@ -108,7 +122,14 @@ pub unsafe extern "C" fn register_driver_framebuffer(
         _ => return -22,
     };
 
-    let boot_framebuffer = FramebufferInfo {
+    if framebuffer.reserved != [0; 2]
+        || framebuffer.flags == 0
+        || framebuffer.flags & !DISPLAY_FRAMEBUFFER_KNOWN_FLAGS != 0
+    {
+        return -22;
+    }
+
+    let driver_framebuffer = FramebufferInfo {
         addr: framebuffer.addr,
         size: framebuffer.size,
         back_buffer_addr: framebuffer.back_buffer_addr,
@@ -120,11 +141,14 @@ pub unsafe extern "C" fn register_driver_framebuffer(
         bytes_per_pixel: framebuffer.bytes_per_pixel,
         _reserved: [0; 3],
     };
-    if boot_framebuffer.validate().is_err() {
+    if driver_framebuffer.validate().is_err() {
         return -22;
     }
 
-    if !backend::install_driver_framebuffer(boot_framebuffer) {
+    if !backend::install_driver_framebuffer(
+        driver_framebuffer,
+        display_flags_from_driver_registration(framebuffer.flags),
+    ) {
         return -22;
     }
     emergency_console_framebuffer_changed();
@@ -135,7 +159,7 @@ pub(crate) fn install_native_driver_framebuffer(framebuffer: FramebufferInfo) ->
     if framebuffer.validate().is_err() {
         return false;
     }
-    if !backend::install_driver_framebuffer(framebuffer) {
+    if !backend::install_driver_framebuffer(framebuffer, DISPLAY_INFO_FLAG_PRIMARY_PROVIDER) {
         return false;
     }
     emergency_console_framebuffer_changed();
@@ -144,6 +168,25 @@ pub(crate) fn install_native_driver_framebuffer(framebuffer: FramebufferInfo) ->
 
 pub fn display_info() -> Option<GuiDisplayInfo> {
     backend::display_info()
+}
+
+pub fn display_dimensions() -> Option<(u32, u32)> {
+    backend::display_dimensions()
+}
+
+pub fn primary_display_provider_active() -> bool {
+    display_info().is_some_and(GuiDisplayInfo::is_primary_provider)
+}
+
+fn display_flags_from_driver_registration(registration_flags: u8) -> u32 {
+    let mut flags = 0;
+    if registration_flags & DISPLAY_FRAMEBUFFER_FLAG_BOOT_FRAMEBUFFER != 0 {
+        flags |= DISPLAY_INFO_FLAG_BOOT_FRAMEBUFFER;
+    }
+    if registration_flags & DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER != 0 {
+        flags |= DISPLAY_INFO_FLAG_PRIMARY_PROVIDER;
+    }
+    flags
 }
 
 pub fn present_userspace_frame_from_user_bgra8888(

@@ -4,18 +4,16 @@ use std::io::Write;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use runtime_control::{load_startup_entries, StartupEntry, StartupMode, DEFAULT_APPLICATIONS_DIR};
+use runtime_control::{
+    load_runtime_default_env, load_startup_entries, RuntimeEnvScope, StartupEntry, StartupMode,
+    DEFAULT_APPLICATIONS_DIR, DEFAULT_RUNTIME_ENV_REGISTRY_PATH,
+};
 
 const INITD_EXEC_PATH: &str = "services/initd/initd.elf";
 const RUNTIMED_EXEC_PATH: &str = "services/runtimed/runtimed.elf";
 const STORAGED_EXEC_PATH: &str = "services/storaged/storaged.elf";
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const RETRY_BACKOFF: Duration = Duration::from_secs(1);
-const DEFAULT_PATH_ENV: &str = "PATH=/bin:/usr/bin:/usr/local/bin";
-const DEFAULT_HOME_ENV: &str = "HOME=/home/user";
-const XDG_RUNTIME_DIR: &str = "XDG_RUNTIME_DIR=/run/user/1000";
-const WAYLAND_DISPLAY: &str = "WAYLAND_DISPLAY=wayland-0";
-const BOOT_TRACE_ENABLED: bool = true;
 const SYS_RUSTOS_SPAWN_EXEC: libc::c_long = 0x5255_0002;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -205,12 +203,11 @@ fn spawn_exec(exec_path: &str) -> Result<i32, i32> {
     boot_line(&format!("initd: spawn begin exec={exec_path}"));
     let path = CString::new(exec_path).unwrap_or_else(|_| CString::new("/").unwrap());
     let argv = [path.as_ptr(), std::ptr::null()];
-    let env = [
-        CString::new(DEFAULT_PATH_ENV).unwrap(),
-        CString::new(DEFAULT_HOME_ENV).unwrap(),
-        CString::new(XDG_RUNTIME_DIR).unwrap(),
-        CString::new(WAYLAND_DISPLAY).unwrap(),
-    ];
+    let env = load_runtime_default_env(DEFAULT_RUNTIME_ENV_REGISTRY_PATH, RuntimeEnvScope::Init)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|value| CString::new(value).ok())
+        .collect::<Vec<_>>();
     let mut envp = env.iter().map(|value| value.as_ptr()).collect::<Vec<_>>();
     envp.push(std::ptr::null());
     let pid = unsafe {
@@ -238,7 +235,7 @@ fn last_errno() -> i32 {
 }
 
 fn boot_line(message: &str) {
-    if !BOOT_TRACE_ENABLED {
+    if option_env!("RUSTOS_LOGGING_BOOT_TRACE_ENABLED") != Some("true") {
         return;
     }
     let _ = std::io::stderr().write_all(message.as_bytes());

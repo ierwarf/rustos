@@ -37,23 +37,45 @@ const LINUX_BTN_LEFT: u32 = 0x110;
 const MAX_WAYLAND_SHM_POOL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_WAYLAND_BUFFER_DIMENSION: usize = 8192;
 const MAX_WAYLAND_BUFFER_PIXELS: usize = MAX_WAYLAND_SHM_POOL_BYTES / 4;
+const MAX_WAYLAND_CLIENT_ACCEPTS_PER_TICK: usize = 8;
+const MAX_WAYLAND_SURFACES: usize = 64;
+const MAX_WAYLAND_OUTPUT_RESOURCES: usize = 64;
+const MAX_WAYLAND_POINTER_RESOURCES: usize = 64;
+const MAX_WAYLAND_KEYBOARD_RESOURCES: usize = 64;
+const MAX_WAYLAND_FRAME_CALLBACKS_PER_SURFACE: usize = 8;
 
 fn post_protocol_error<I: Resource>(resource: &I, message: String) {
     diag_line(&format!("uiserver: wayland protocol error: {message}"));
     resource.post_error(0_u32, message);
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct WaylandWindowSnapshot {
     pub(crate) surface_id: u32,
     pub(crate) title: String,
     pub(crate) frame: Rect,
     pub(crate) minimized: bool,
+    pub(crate) content_version: u64,
     pub(crate) pixels: Arc<Vec<u32>>,
     pub(crate) width: usize,
     pub(crate) height: usize,
     pub(crate) stride_pixels: usize,
 }
+
+impl PartialEq for WaylandWindowSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.surface_id == other.surface_id
+            && self.title == other.title
+            && self.frame == other.frame
+            && self.minimized == other.minimized
+            && self.content_version == other.content_version
+            && self.width == other.width
+            && self.height == other.height
+            && self.stride_pixels == other.stride_pixels
+    }
+}
+
+impl Eq for WaylandWindowSnapshot {}
 
 pub(crate) struct WaylandCompositor {
     display: Display<WaylandState>,
@@ -115,9 +137,11 @@ impl WaylandCompositor {
     }
 
     pub(crate) fn tick(&mut self) -> bool {
-        loop {
+        let mut accepted = 0_usize;
+        while accepted < MAX_WAYLAND_CLIENT_ACCEPTS_PER_TICK {
             match self.listener.accept() {
                 Ok((stream, _)) => {
+                    accepted = accepted.saturating_add(1);
                     if let Err(err) = stream.set_nonblocking(true) {
                         diag_line(&format!(
                             "uiserver: accepted wayland client nonblocking failed: {err}"
@@ -145,18 +169,24 @@ impl WaylandCompositor {
         if let Err(err) = self.display.dispatch_clients(&mut self.state) {
             diag_line(&format!("uiserver: wayland dispatch failed: {err}"));
         }
-        if let Err(err) = self.display.flush_clients() {
-            diag_line(&format!("uiserver: wayland flush failed: {err}"));
-        }
+        self.flush_clients();
 
         self.state.take_dirty()
     }
 
     pub(crate) fn frame_presented(&mut self) {
         self.state.send_frame_callbacks();
+        self.flush_clients();
+    }
+
+    pub(crate) fn flush_clients(&mut self) {
         if let Err(err) = self.display.flush_clients() {
             diag_line(&format!("uiserver: wayland flush failed: {err}"));
         }
+    }
+
+    pub(crate) fn pending_frame_callback_rect(&self) -> Rect {
+        self.state.pending_frame_callback_rect()
     }
 
     pub(crate) fn window_snapshots(&self) -> Vec<WaylandWindowSnapshot> {
@@ -197,7 +227,7 @@ impl WaylandCompositor {
 }
 
 fn current_runtime_dir() -> String {
-    const FALLBACK_RUNTIME_DIR: &str = "/run";
+    const FALLBACK_RUNTIME_DIR: &str = "/run/user/1000";
     std::env::var("XDG_RUNTIME_DIR")
         .ok()
         .filter(|value| safe_runtime_dir(value.as_str()))
@@ -275,6 +305,13 @@ fn checked_wayland_pixel_count(width: usize, height: usize) -> Option<usize> {
     Some(pixels)
 }
 
+fn wayland_nonnegative_i32(value: i32) -> Option<usize> {
+    if value < 0 {
+        return None;
+    }
+    usize::try_from(value).ok()
+}
+
 fn validate_wayland_buffer_layout(
     offset: usize,
     width: usize,
@@ -328,9 +365,11 @@ fn surface_damage_rect(x: i32, y: i32, width: i32, height: i32) -> Option<Rect> 
 #[cfg(test)]
 mod tests {
     use super::{
-        checked_wayland_pixel_count, validate_wayland_buffer_layout, MAX_WAYLAND_BUFFER_DIMENSION,
-        MAX_WAYLAND_SHM_POOL_BYTES,
+        checked_wayland_pixel_count, validate_wayland_buffer_layout, wayland_nonnegative_i32,
+        WaylandWindowSnapshot, MAX_WAYLAND_BUFFER_DIMENSION, MAX_WAYLAND_SHM_POOL_BYTES,
     };
+    use crate::canvas::Rect;
+    use std::sync::Arc;
 
     #[test]
     fn wayland_buffer_limits_reject_oversized_dimensions() {
@@ -351,6 +390,38 @@ mod tests {
             MAX_WAYLAND_SHM_POOL_BYTES,
         )
         .is_none());
+    }
+
+    #[test]
+    fn wayland_integer_args_reject_negative_values() {
+        assert_eq!(wayland_nonnegative_i32(0), Some(0));
+        assert_eq!(wayland_nonnegative_i32(42), Some(42));
+        assert_eq!(wayland_nonnegative_i32(-1), None);
+    }
+
+    #[test]
+    fn wayland_snapshot_equality_uses_content_version_not_pixels() {
+        let mut first = WaylandWindowSnapshot {
+            surface_id: 1,
+            title: String::from("app"),
+            frame: Rect {
+                x: 1,
+                y: 2,
+                width: 3,
+                height: 4,
+            },
+            minimized: false,
+            content_version: 7,
+            pixels: Arc::new(vec![1, 2, 3]),
+            width: 3,
+            height: 1,
+            stride_pixels: 3,
+        };
+        let mut second = first.clone();
+        second.pixels = Arc::new(vec![9, 9, 9]);
+        assert_eq!(first, second);
+        first.content_version = 8;
+        assert_ne!(first, second);
     }
 }
 
@@ -418,7 +489,11 @@ impl WaylandState {
         }
     }
 
-    fn create_surface_data(&mut self) -> SurfaceData {
+    fn create_surface_data(&mut self) -> Option<SurfaceData> {
+        self.prune_surfaces();
+        if self.surfaces.len() >= MAX_WAYLAND_SURFACES {
+            return None;
+        }
         let data = SurfaceData {
             shared: Arc::new(Mutex::new(WaylandSurfaceState {
                 title: String::from("Wayland App"),
@@ -429,7 +504,7 @@ impl WaylandState {
         };
         self.surfaces.push(data.clone());
         self.dirty = true;
-        data
+        Some(data)
     }
 
     fn mark_dirty(&mut self) {
@@ -475,6 +550,7 @@ impl WaylandState {
                 title: surface.title.clone(),
                 frame: surface.frame,
                 minimized: surface.minimized,
+                content_version: surface.content_version,
                 pixels: surface.pixels.clone(),
                 width: surface.width,
                 height: surface.height,
@@ -492,16 +568,94 @@ impl WaylandState {
     fn send_frame_callbacks(&mut self) {
         let time = self.event_time_ms();
         for surface in &self.surfaces {
-            let Ok(mut surface) = surface.shared.lock() else {
-                continue;
+            let callbacks = {
+                let Ok(mut surface) = surface.shared.lock() else {
+                    continue;
+                };
+                if !surface.alive || surface.minimized || surface.pixels.is_empty() {
+                    continue;
+                }
+                surface.pending_callbacks.drain(..).collect::<Vec<_>>()
             };
-            if !surface.alive || surface.minimized || surface.pixels.is_empty() {
-                continue;
-            }
-            for callback in surface.pending_callbacks.drain(..) {
+            for callback in callbacks {
                 callback.done(time);
             }
         }
+    }
+
+    fn prune_surfaces(&mut self) {
+        self.surfaces.retain(|surface| {
+            surface
+                .shared
+                .lock()
+                .map(|state| {
+                    state.alive
+                        && state
+                            .resource
+                            .as_ref()
+                            .map(|resource| resource.is_alive())
+                            .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        });
+    }
+
+    fn prune_surface_callbacks(surface: &mut WaylandSurfaceState) {
+        surface
+            .pending_callbacks
+            .retain(|callback| callback.is_alive());
+    }
+
+    fn surface_callback_count(surface: &mut WaylandSurfaceState) -> usize {
+        Self::prune_surface_callbacks(surface);
+        surface.pending_callbacks.len()
+    }
+
+    fn output_resource_count(&mut self) -> usize {
+        self.prune_output_resources();
+        self.output_resources.len()
+    }
+
+    fn pointer_resource_count(&mut self) -> usize {
+        self.prune_pointer_resources();
+        self.pointer_resources.len()
+    }
+
+    fn keyboard_resource_count(&mut self) -> usize {
+        self.prune_keyboard_resources();
+        self.keyboard_resources.len()
+    }
+
+    fn can_track_output_resource(&mut self) -> bool {
+        self.output_resource_count() < MAX_WAYLAND_OUTPUT_RESOURCES
+    }
+
+    fn can_track_pointer_resource(&mut self) -> bool {
+        self.pointer_resource_count() < MAX_WAYLAND_POINTER_RESOURCES
+    }
+
+    fn can_track_keyboard_resource(&mut self) -> bool {
+        self.keyboard_resource_count() < MAX_WAYLAND_KEYBOARD_RESOURCES
+    }
+
+    fn pending_frame_callback_rect(&self) -> Rect {
+        let mut rect = Rect::empty();
+        for surface in &self.surfaces {
+            let Ok(surface) = surface.shared.lock() else {
+                continue;
+            };
+            if !surface.alive
+                || surface.minimized
+                || surface.pending_callbacks.is_empty()
+                || surface.pixels.is_empty()
+                || surface.width == 0
+                || surface.height == 0
+            {
+                continue;
+            }
+            rect = rect.union(surface.frame);
+        }
+        rect
     }
 
     fn prune_pointer_resources(&mut self) {
@@ -524,8 +678,9 @@ impl WaylandState {
         client_id: ClientId,
         output: &wl_output::WlOutput,
     ) {
+        let mut enter_targets = Vec::new();
         for surface in &self.surfaces {
-            let Ok(mut state) = surface.shared.lock() else {
+            let Ok(state) = surface.shared.lock() else {
                 continue;
             };
             if !state.alive || state.width == 0 || state.height == 0 || state.pixels.is_empty() {
@@ -537,8 +692,21 @@ impl WaylandState {
             let Some(resource) = state.resource.as_ref() else {
                 continue;
             };
+            enter_targets.push((surface.shared.clone(), resource.clone()));
+        }
+
+        for (shared, resource) in enter_targets {
             resource.enter(output);
-            state.on_output = true;
+            if let Ok(mut state) = shared.lock() {
+                if state
+                    .resource
+                    .as_ref()
+                    .map(|current| current.id() == resource.id())
+                    .unwrap_or(false)
+                {
+                    state.on_output = true;
+                }
+            }
         }
     }
 
@@ -614,6 +782,7 @@ impl WaylandState {
 
         if let Ok(mut state) = surface.lock() {
             state.configured_serial = serial;
+            state.acknowledged_serial = 0;
             state.needs_initial_configure = false;
         }
     }
@@ -928,6 +1097,8 @@ impl WaylandState {
         state.width = 0;
         state.height = 0;
         state.stride_pixels = 0;
+        state.current_buffer = None;
+        state.content_version = next_content_version(state.content_version);
         state.pending_buffer = None;
         state.pending_callbacks.clear();
         state.on_output = false;
@@ -1108,12 +1279,14 @@ struct WaylandSurfaceState {
     xdg_surface: Option<xdg_surface::XdgSurface>,
     toplevel: Option<xdg_toplevel::XdgToplevel>,
     pending_buffer: Option<Option<BufferAttachment>>,
+    current_buffer: Option<BufferData>,
     pending_damage: Rect,
     pending_callbacks: Vec<wl_callback::WlCallback>,
     pixels: Arc<Vec<u32>>,
     width: usize,
     height: usize,
     stride_pixels: usize,
+    content_version: u64,
     role_assigned: bool,
     needs_initial_configure: bool,
     configured_serial: u32,
@@ -1212,6 +1385,10 @@ impl BufferData {
     }
 }
 
+fn next_content_version(current: u64) -> u64 {
+    current.wrapping_add(1).max(1)
+}
+
 impl GlobalDispatch<wl_compositor::WlCompositor, ()> for WaylandState {
     fn bind(
         _state: &mut Self,
@@ -1229,7 +1406,7 @@ impl Dispatch<wl_compositor::WlCompositor, ()> for WaylandState {
     fn request(
         state: &mut Self,
         _client: &Client,
-        _resource: &wl_compositor::WlCompositor,
+        resource: &wl_compositor::WlCompositor,
         request: wl_compositor::Request,
         _data: &(),
         _handle: &DisplayHandle,
@@ -1237,7 +1414,16 @@ impl Dispatch<wl_compositor::WlCompositor, ()> for WaylandState {
     ) {
         match request {
             wl_compositor::Request::CreateSurface { id } => {
-                let surface = state.create_surface_data();
+                let Some(surface) = state.create_surface_data() else {
+                    post_protocol_error(
+                        resource,
+                        format!(
+                            "wl_compositor.create_surface: surface limit {} reached",
+                            MAX_WAYLAND_SURFACES
+                        ),
+                    );
+                    return;
+                };
                 let resource = data_init.init(id, surface.clone());
                 let shared = surface.shared.clone();
                 {
@@ -1278,6 +1464,7 @@ impl GlobalDispatch<wl_output::WlOutput, ()> for WaylandState {
         _global_data: &(),
         data_init: &mut DataInit<'_, Self>,
     ) {
+        let can_track = state.can_track_output_resource();
         let output = data_init.init(resource, OutputData);
         output.geometry(
             0,
@@ -1307,6 +1494,13 @@ impl GlobalDispatch<wl_output::WlOutput, ()> for WaylandState {
             output.done();
         }
         if let Some(client_id) = output.client().map(|client| client.id()) {
+            if !can_track {
+                diag_line(&format!(
+                    "uiserver: wayland output resource tracking limit {} reached",
+                    MAX_WAYLAND_OUTPUT_RESOURCES
+                ));
+                return;
+            }
             state.output_resources.push(OutputResource {
                 resource: output.clone(),
                 client_id: client_id.clone(),
@@ -1351,9 +1545,9 @@ impl GlobalDispatch<wl_seat::WlSeat, ()> for WaylandState {
 
 impl Dispatch<wl_seat::WlSeat, SeatData> for WaylandState {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         _client: &Client,
-        _resource: &wl_seat::WlSeat,
+        resource: &wl_seat::WlSeat,
         request: wl_seat::Request,
         _data: &SeatData,
         _handle: &DisplayHandle,
@@ -1361,17 +1555,42 @@ impl Dispatch<wl_seat::WlSeat, SeatData> for WaylandState {
     ) {
         match request {
             wl_seat::Request::GetPointer { id } => {
+                if !state.can_track_pointer_resource() {
+                    post_protocol_error(
+                        resource,
+                        format!(
+                            "wl_seat.get_pointer: pointer resource limit {} reached",
+                            MAX_WAYLAND_POINTER_RESOURCES
+                        ),
+                    );
+                    return;
+                }
                 let pointer = data_init.init(id, PointerData);
                 if let Some(client_id) = pointer.client().map(|client| client.id()) {
-                    _state.pointer_resources.push(PointerResource {
+                    state.pointer_resources.push(PointerResource {
                         resource: pointer,
                         client_id,
                     });
                 }
             }
             wl_seat::Request::GetKeyboard { id } => {
+                if !state.can_track_keyboard_resource() {
+                    post_protocol_error(
+                        resource,
+                        format!(
+                            "wl_seat.get_keyboard: keyboard resource limit {} reached",
+                            MAX_WAYLAND_KEYBOARD_RESOURCES
+                        ),
+                    );
+                    return;
+                }
                 let keyboard = data_init.init(id, KeyboardData);
-                let _ = keyboard;
+                if let Some(client_id) = keyboard.client().map(|client| client.id()) {
+                    state.keyboard_resources.push(KeyboardResource {
+                        resource: keyboard,
+                        client_id,
+                    });
+                }
             }
             _ => {}
         }
@@ -1436,7 +1655,7 @@ impl Dispatch<wl_shm::WlShm, ()> for WaylandState {
         data_init: &mut DataInit<'_, Self>,
     ) {
         if let wl_shm::Request::CreatePool { id, fd, size } = request {
-            let Ok(size) = usize::try_from(size.max(0)) else {
+            let Some(size) = wayland_nonnegative_i32(size) else {
                 post_protocol_error(resource, "wl_shm.create_pool: invalid pool size".into());
                 return;
             };
@@ -1493,28 +1712,28 @@ impl Dispatch<wl_shm_pool::WlShmPool, ShmPoolData> for WaylandState {
                 stride,
                 format,
             } => {
-                let Ok(offset) = usize::try_from(offset.max(0)) else {
+                let Some(offset) = wayland_nonnegative_i32(offset) else {
                     post_protocol_error(
                         resource,
                         "wl_shm_pool.create_buffer: invalid offset".into(),
                     );
                     return;
                 };
-                let Ok(width) = usize::try_from(width.max(0)) else {
+                let Some(width) = wayland_nonnegative_i32(width) else {
                     post_protocol_error(
                         resource,
                         "wl_shm_pool.create_buffer: invalid width".into(),
                     );
                     return;
                 };
-                let Ok(height) = usize::try_from(height.max(0)) else {
+                let Some(height) = wayland_nonnegative_i32(height) else {
                     post_protocol_error(
                         resource,
                         "wl_shm_pool.create_buffer: invalid height".into(),
                     );
                     return;
                 };
-                let Ok(stride) = usize::try_from(stride.max(0)) else {
+                let Some(stride) = wayland_nonnegative_i32(stride) else {
                     post_protocol_error(
                         resource,
                         "wl_shm_pool.create_buffer: invalid stride".into(),
@@ -1554,27 +1773,30 @@ impl Dispatch<wl_shm_pool::WlShmPool, ShmPoolData> for WaylandState {
                     );
                     return;
                 };
-                let Ok(pool) = data.shared.lock() else {
-                    post_protocol_error(
-                        resource,
-                        "wl_shm_pool.create_buffer: pool state unavailable".into(),
-                    );
-                    return;
+                let layout_valid = {
+                    let Ok(pool) = data.shared.lock() else {
+                        post_protocol_error(
+                            resource,
+                            "wl_shm_pool.create_buffer: pool state unavailable".into(),
+                        );
+                        return;
+                    };
+                    validate_wayland_buffer_layout(
+                        offset,
+                        width,
+                        height,
+                        stride,
+                        pool.len.min(pool.mapping.len_bytes()),
+                    )
+                    .is_some()
                 };
-                let Some(_required) = validate_wayland_buffer_layout(
-                    offset,
-                    width,
-                    height,
-                    stride,
-                    pool.len.min(pool.mapping.len_bytes()),
-                ) else {
+                if !layout_valid {
                     post_protocol_error(
                         resource,
                         "wl_shm_pool.create_buffer: invalid or out-of-bounds layout".into(),
                     );
                     return;
                 };
-                drop(pool);
                 data_init.init(
                     id,
                     BufferData {
@@ -1590,17 +1812,35 @@ impl Dispatch<wl_shm_pool::WlShmPool, ShmPoolData> for WaylandState {
                 );
             }
             wl_shm_pool::Request::Resize { size } => {
-                let Ok(size) = usize::try_from(size.max(0)) else {
+                let Some(size) = wayland_nonnegative_i32(size) else {
                     post_protocol_error(resource, "wl_shm_pool.resize: invalid size".into());
                     return;
                 };
-                if let Ok(mut pool) = data.shared.lock() {
-                    pool.len = size.min(pool.mapping.len_bytes());
-                } else {
+                if size == 0 {
                     post_protocol_error(
                         resource,
-                        "wl_shm_pool.resize: pool state unavailable".into(),
+                        "wl_shm_pool.resize: pool size must be non-zero".into(),
                     );
+                    return;
+                }
+                let resize_result = {
+                    if let Ok(mut pool) = data.shared.lock() {
+                        if size > MAX_WAYLAND_SHM_POOL_BYTES || size > pool.mapping.len_bytes() {
+                            Err(format!(
+                                "wl_shm_pool.resize: size {} exceeds mapped safety limit {}",
+                                size,
+                                pool.mapping.len_bytes().min(MAX_WAYLAND_SHM_POOL_BYTES)
+                            ))
+                        } else {
+                            pool.len = size;
+                            Ok(())
+                        }
+                    } else {
+                        Err("wl_shm_pool.resize: pool state unavailable".into())
+                    }
+                };
+                if let Err(message) = resize_result {
+                    post_protocol_error(resource, message);
                 }
             }
             _ => {}
@@ -1638,7 +1878,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
     fn request(
         state: &mut Self,
         _client: &Client,
-        _resource: &wl_surface::WlSurface,
+        resource: &wl_surface::WlSurface,
         request: wl_surface::Request,
         data: &SurfaceData,
         _handle: &DisplayHandle,
@@ -1658,6 +1898,24 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
                 }
             }
             wl_surface::Request::Frame { callback } => {
+                let callback_limit_reached = if let Ok(mut surface) = data.shared.lock() {
+                    WaylandState::surface_callback_count(&mut surface)
+                        >= MAX_WAYLAND_FRAME_CALLBACKS_PER_SURFACE
+                } else {
+                    post_protocol_error(resource, "wl_surface.frame: surface unavailable".into());
+                    return;
+                };
+                if callback_limit_reached {
+                    post_protocol_error(
+                        resource,
+                        format!(
+                            "wl_surface.frame: callback limit {} reached",
+                            MAX_WAYLAND_FRAME_CALLBACKS_PER_SURFACE
+                        ),
+                    );
+                    return;
+                }
+
                 let callback = data_init.init(callback, CallbackData);
                 if let Ok(mut surface) = data.shared.lock() {
                     surface.pending_callbacks.push(callback);
@@ -1682,57 +1940,126 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
                 }
             }
             wl_surface::Request::Commit => {
-                let mut mapped = false;
-                let mut trigger_initial_configure = false;
-                if let Ok(mut surface) = data.shared.lock() {
+                let (pending_buffer, committed_damage) = {
+                    let Ok(mut surface) = data.shared.lock() else {
+                        return;
+                    };
                     let committed_damage = !surface.pending_damage.is_empty();
                     surface.pending_damage = Rect::empty();
-                    if let Some(pending) = surface.pending_buffer.take() {
-                        match pending {
-                            Some(buffer) => {
-                                if let Some((pixels, width, height, stride_pixels)) =
-                                    buffer.data.copy_pixels()
-                                {
-                                    surface.pixels = pixels;
-                                    surface.width = width;
-                                    surface.height = height;
-                                    surface.stride_pixels = stride_pixels;
-                                    surface.frame.width = width.max(surface.frame.width.min(width));
-                                    surface.frame.height =
-                                        height.max(surface.frame.height.min(height));
-                                    mapped = true;
-                                } else {
-                                    diag_line(
-                                        "uiserver: rejecting wl_shm buffer during commit due to invalid layout",
-                                    );
-                                }
-                                buffer.resource.release();
+                    (surface.pending_buffer.take(), committed_damage)
+                };
+
+                let commits_buffer = matches!(pending_buffer, Some(Some(_))) || committed_damage;
+                if commits_buffer {
+                    let commit_ready = {
+                        match data.shared.lock() {
+                            Ok(surface)
+                                if surface.toplevel.is_some()
+                                    && (surface.configured_serial == 0
+                                        || surface.acknowledged_serial
+                                            != surface.configured_serial) =>
+                            {
+                                Err(
+                                    "wl_surface.commit: xdg surface buffer committed before configure ack"
+                                        .into(),
+                                )
                             }
-                            None => {
+                            Ok(_) => Ok(()),
+                            Err(_) => Err("wl_surface.commit: surface unavailable".into()),
+                        }
+                    };
+                    if let Err(message) = commit_ready {
+                        post_protocol_error(resource, message);
+                        return;
+                    }
+                }
+
+                let mut mapped = false;
+                let mut trigger_initial_configure = false;
+                let mut dirty = false;
+                let mut copy_source = None::<BufferData>;
+                let mut release_buffer = None::<wl_buffer::WlBuffer>;
+
+                if let Some(pending) = pending_buffer {
+                    match pending {
+                        Some(buffer) => {
+                            let BufferAttachment { resource, data } = buffer;
+                            copy_source = Some(data);
+                            release_buffer = Some(resource);
+                        }
+                        None => {
+                            if let Ok(mut surface) = data.shared.lock() {
+                                surface.current_buffer = None;
                                 surface.pixels = Arc::default();
                                 surface.width = 0;
                                 surface.height = 0;
                                 surface.stride_pixels = 0;
+                                surface.content_version =
+                                    next_content_version(surface.content_version);
                                 surface.configured_serial = 0;
                                 surface.acknowledged_serial = 0;
                                 surface.needs_initial_configure = surface.toplevel.is_some();
+                                trigger_initial_configure =
+                                    surface.needs_initial_configure && surface.toplevel.is_some();
+                                dirty = true;
                             }
                         }
-                        state.mark_dirty();
                     }
-                    if committed_damage
-                        && !surface.pixels.is_empty()
-                        && surface.width != 0
-                        && surface.height != 0
-                    {
-                        state.mark_dirty();
-                    }
-                    mapped = mapped
-                        || (!surface.pixels.is_empty()
-                            && surface.width != 0
-                            && surface.height != 0);
+                } else if committed_damage {
+                    copy_source = data
+                        .shared
+                        .lock()
+                        .ok()
+                        .and_then(|surface| surface.current_buffer.clone());
+                } else if let Ok(surface) = data.shared.lock() {
+                    mapped =
+                        !surface.pixels.is_empty() && surface.width != 0 && surface.height != 0;
                     trigger_initial_configure =
                         surface.needs_initial_configure && !mapped && surface.toplevel.is_some();
+                }
+
+                if let Some(copy_source) = copy_source {
+                    let copied = copy_source.copy_pixels();
+                    if let Ok(mut surface) = data.shared.lock() {
+                        if let Some((pixels, width, height, stride_pixels)) = copied {
+                            surface.current_buffer = Some(copy_source);
+                            surface.pixels = pixels;
+                            surface.width = width;
+                            surface.height = height;
+                            surface.stride_pixels = stride_pixels;
+                            surface.content_version = next_content_version(surface.content_version);
+                            surface.frame.width = width.max(surface.frame.width.min(width));
+                            surface.frame.height = height.max(surface.frame.height.min(height));
+                            mapped = true;
+                            dirty = true;
+                        } else {
+                            diag_line(
+                                "uiserver: rejecting wl_shm buffer during commit due to invalid layout",
+                            );
+                            mapped = !surface.pixels.is_empty()
+                                && surface.width != 0
+                                && surface.height != 0;
+                        }
+                        trigger_initial_configure = surface.needs_initial_configure
+                            && !mapped
+                            && surface.toplevel.is_some();
+                    }
+                }
+
+                if let Some(buffer) = release_buffer {
+                    buffer.release();
+                }
+
+                if committed_damage && !dirty {
+                    if let Ok(surface) = data.shared.lock() {
+                        if !surface.pixels.is_empty() && surface.width != 0 && surface.height != 0 {
+                            mapped = true;
+                        }
+                    }
+                }
+
+                if dirty {
+                    state.mark_dirty();
                 }
                 state.sync_surface_output(&data.shared, mapped);
                 if trigger_initial_configure {
@@ -1790,20 +2117,20 @@ impl Dispatch<xdg_wm_base::XdgWmBase, ()> for WaylandState {
                     );
                     return;
                 };
-                if let Ok(mut wl_surface_state) = surface_data.shared.lock() {
-                    if wl_surface_state.role_assigned {
-                        post_protocol_error(
-                            resource,
-                            "xdg_wm_base.get_xdg_surface: surface already has a role".into(),
-                        );
-                        return;
+                let role_result = {
+                    if let Ok(mut wl_surface_state) = surface_data.shared.lock() {
+                        if wl_surface_state.role_assigned {
+                            Err("xdg_wm_base.get_xdg_surface: surface already has a role".into())
+                        } else {
+                            wl_surface_state.role_assigned = true;
+                            Ok(())
+                        }
+                    } else {
+                        Err("xdg_wm_base.get_xdg_surface: target surface is unavailable".into())
                     }
-                    wl_surface_state.role_assigned = true;
-                } else {
-                    post_protocol_error(
-                        resource,
-                        "xdg_wm_base.get_xdg_surface: target surface is unavailable".into(),
-                    );
+                };
+                if let Err(message) = role_result {
+                    post_protocol_error(resource, message);
                     return;
                 }
                 let xdg_surface = data_init.init(id, surface_data.clone());
@@ -1822,7 +2149,7 @@ impl Dispatch<xdg_surface::XdgSurface, SurfaceData> for WaylandState {
     fn request(
         state: &mut Self,
         _client: &Client,
-        _resource: &xdg_surface::XdgSurface,
+        resource: &xdg_surface::XdgSurface,
         request: xdg_surface::Request,
         data: &SurfaceData,
         _handle: &DisplayHandle,
@@ -1830,17 +2157,45 @@ impl Dispatch<xdg_surface::XdgSurface, SurfaceData> for WaylandState {
     ) {
         match request {
             xdg_surface::Request::GetToplevel { id } => {
+                let toplevel_result = {
+                    if let Ok(surface) = data.shared.lock() {
+                        if surface.toplevel.is_some() {
+                            Err("xdg_surface.get_toplevel: toplevel already exists".into())
+                        } else {
+                            Ok(())
+                        }
+                    } else {
+                        Err("xdg_surface.get_toplevel: surface unavailable".into())
+                    }
+                };
+                if let Err(message) = toplevel_result {
+                    post_protocol_error(resource, message);
+                    return;
+                }
                 let surface = data.clone();
                 let toplevel = data_init.init(id, surface);
                 if let Ok(mut surface) = data.shared.lock() {
                     surface.toplevel = Some(toplevel);
                     surface.needs_initial_configure = true;
                 }
+                state.send_toplevel_configure(&data.shared);
                 state.mark_dirty();
             }
             xdg_surface::Request::AckConfigure { serial } => {
-                if let Ok(mut surface) = data.shared.lock() {
-                    surface.acknowledged_serial = serial;
+                let ack_result = {
+                    if let Ok(mut surface) = data.shared.lock() {
+                        if surface.configured_serial == 0 || serial != surface.configured_serial {
+                            Err("xdg_surface.ack_configure: unknown configure serial".into())
+                        } else {
+                            surface.acknowledged_serial = serial;
+                            Ok(())
+                        }
+                    } else {
+                        Err("xdg_surface.ack_configure: surface unavailable".into())
+                    }
+                };
+                if let Err(message) = ack_result {
+                    post_protocol_error(resource, message);
                 }
             }
             xdg_surface::Request::Destroy => {

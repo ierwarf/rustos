@@ -1,11 +1,14 @@
 use core::ptr;
-use core::sync::atomic::{Ordering, compiler_fence};
+use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
-use boot_protocol::{BootPixelFormat, FramebufferInfo};
+use boot_protocol::{
+    BootPixelFormat, FramebufferInfo, MAX_BOOT_FRAMEBUFFER_HEIGHT, MAX_BOOT_FRAMEBUFFER_WIDTH,
+};
 use spin::Mutex;
 
 const PCI_VENDOR_VIRTIO: u16 = 0x1af4;
 const PCI_DEVICE_VIRTIO_GPU_MODERN: u16 = 0x1050;
+const PCI_DEVICE_VIRTIO_GPU_TRANSITIONAL: u16 = 0x1010;
 const PCI_CAP_STATUS: u8 = 0x06;
 const PCI_CAP_POINTER: u8 = 0x34;
 const PCI_STATUS_CAP_LIST: u16 = 1 << 4;
@@ -44,10 +47,12 @@ const COMMAND_REQUEST_OFFSET: usize = 0;
 const COMMAND_RESPONSE_OFFSET: usize = 2048;
 const COMMAND_RESPONSE_SIZE: usize = 1024;
 
-const FRAMEBUFFER_WIDTH_DEFAULT: u32 = 1600;
-const FRAMEBUFFER_HEIGHT_DEFAULT: u32 = 900;
+const FRAMEBUFFER_WIDTH_DEFAULT: u32 = 2560;
+const FRAMEBUFFER_HEIGHT_DEFAULT: u32 = 1440;
 const MIN_USABLE_SCANOUT_WIDTH: u32 = 1024;
 const MIN_USABLE_SCANOUT_HEIGHT: u32 = 600;
+const MAX_SCANOUT_WIDTH: u32 = MAX_BOOT_FRAMEBUFFER_WIDTH;
+const MAX_SCANOUT_HEIGHT: u32 = MAX_BOOT_FRAMEBUFFER_HEIGHT;
 const BYTES_PER_PIXEL: u32 = 4;
 const RESOURCE_ID_PRIMARY: u32 = 1;
 
@@ -67,8 +72,14 @@ const DISPLAY_INFO_SCANOUT_COUNT: usize = 16;
 
 const DESC_F_NEXT: u16 = 1;
 const DESC_F_WRITE: u16 = 2;
+const COMMAND_COMPLETION_TIMEOUT_MS: u64 = 250;
+const COMMAND_COMPLETION_BOOT_SPINS: usize = 1_000_000;
+const COMMAND_TIMEOUT_BACKOFF_BASE_MS: u64 = 100;
+const COMMAND_TIMEOUT_BACKOFF_MAX_MS: u64 = 1_000;
 
 static DISPLAY: Mutex<Option<VirtioGpuDisplay>> = Mutex::new(None);
+static DISPLAY_INITIALIZING: AtomicBool = AtomicBool::new(false);
+static DISPLAY_NEEDS_FULL_FLUSH: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
 struct VirtioGpuPciCaps {
@@ -99,6 +110,9 @@ struct VirtioGpuDisplay {
     width: u32,
     height: u32,
     stride_pixels: u32,
+    flush_backoff_until_tick: u64,
+    flush_timeout_count: u32,
+    needs_full_flush: bool,
 }
 
 unsafe impl Send for VirtioGpuDisplay {}
@@ -117,37 +131,73 @@ struct VirtQueue {
 
 impl VirtioGpuDisplay {
     fn flush_full_frame(&mut self) -> bool {
-        if !self.transfer_to_host_2d() {
-            return false;
-        }
-        self.resource_flush()
+        self.flush_region(0, 0, self.width, self.height, true)
     }
 
-    fn transfer_to_host_2d(&mut self) -> bool {
+    fn flush_rect(&mut self, x: u32, y: u32, width: u32, height: u32) -> bool {
+        if width == 0 || height == 0 || x >= self.width || y >= self.height {
+            return true;
+        }
+        let width = width.min(self.width - x);
+        let height = height.min(self.height - y);
+        if self.needs_full_flush {
+            return self.flush_full_frame();
+        }
+        self.flush_region(x, y, width, height, false)
+    }
+
+    fn flush_region(&mut self, x: u32, y: u32, width: u32, height: u32, full_frame: bool) -> bool {
+        if self.flush_backoff_active() {
+            self.needs_full_flush = true;
+            return false;
+        }
+        if !self.transfer_to_host_2d(x, y, width, height) {
+            self.needs_full_flush = true;
+            return false;
+        }
+        if !self.resource_flush(x, y, width, height) {
+            self.needs_full_flush = true;
+            return false;
+        }
+        if full_frame {
+            self.needs_full_flush = false;
+        }
+        true
+    }
+
+    fn transfer_to_host_2d(&mut self, x: u32, y: u32, width: u32, height: u32) -> bool {
+        let offset = self.framebuffer_offset(x, y);
         self.command(
             VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D,
             56,
             VIRTIO_GPU_RESP_OK_NODATA,
-            |buf, width, height| {
-                write_rect(buf, HDR_SIZE, 0, 0, width, height);
-                write_u64(buf, HDR_SIZE + RECT_SIZE, 0);
+            |buf, _, _| {
+                write_rect(buf, HDR_SIZE, x, y, width, height);
+                write_u64(buf, HDR_SIZE + RECT_SIZE, offset);
                 write_u32(buf, HDR_SIZE + RECT_SIZE + 8, RESOURCE_ID_PRIMARY);
                 write_u32(buf, HDR_SIZE + RECT_SIZE + 12, 0);
             },
         )
     }
 
-    fn resource_flush(&mut self) -> bool {
+    fn resource_flush(&mut self, x: u32, y: u32, width: u32, height: u32) -> bool {
         self.command(
             VIRTIO_GPU_CMD_RESOURCE_FLUSH,
             48,
             VIRTIO_GPU_RESP_OK_NODATA,
-            |buf, width, height| {
-                write_rect(buf, HDR_SIZE, 0, 0, width, height);
+            |buf, _, _| {
+                write_rect(buf, HDR_SIZE, x, y, width, height);
                 write_u32(buf, HDR_SIZE + RECT_SIZE, RESOURCE_ID_PRIMARY);
                 write_u32(buf, HDR_SIZE + RECT_SIZE + 4, 0);
             },
         )
+    }
+
+    fn framebuffer_offset(&self, x: u32, y: u32) -> u64 {
+        u64::from(y)
+            .saturating_mul(u64::from(self.stride_pixels))
+            .saturating_add(u64::from(x))
+            .saturating_mul(u64::from(BYTES_PER_PIXEL))
     }
 
     fn command(
@@ -176,10 +226,24 @@ impl VirtioGpuDisplay {
         response.fill(0);
 
         if !self.submit_control(request_len, COMMAND_RESPONSE_SIZE) {
+            trace_native("virtio-gpu-native-command-timeout", u64::from(ty), 0);
+            self.record_command_timeout(ty);
             return false;
         }
 
-        read_u32(response, 0) == expected_response
+        let actual_response = read_u32(response, 0);
+        let matched = actual_response == expected_response;
+        if matched {
+            self.record_command_success();
+        } else {
+            trace_native(
+                "virtio-gpu-native-command-bad-response",
+                u64::from(ty),
+                u64::from(actual_response),
+            );
+            self.record_command_timeout(ty);
+        }
+        matched
     }
 
     fn submit_control(&mut self, request_len: usize, response_len: usize) -> bool {
@@ -222,13 +286,10 @@ impl VirtioGpuDisplay {
             );
         }
 
-        for _ in 0..1_000_000 {
+        if wait_for_queue_used(used, self.queue.used_idx) {
             let next_used = unsafe { ptr::read_volatile(used.add(2) as *const u16) };
-            if next_used != self.queue.used_idx {
-                self.queue.used_idx = next_used;
-                return true;
-            }
-            core::hint::spin_loop();
+            self.queue.used_idx = next_used;
+            return true;
         }
 
         false
@@ -237,21 +298,106 @@ impl VirtioGpuDisplay {
     fn queue_notify_offset(&self) -> usize {
         (self.queue.notify_off as usize).saturating_mul(self.notify_multiplier as usize)
     }
+
+    fn flush_backoff_active(&self) -> bool {
+        let until = self.flush_backoff_until_tick;
+        if until == 0 {
+            return false;
+        }
+        let now = crate::arch::rtc::ticks();
+        now != 0 && now < until
+    }
+
+    fn record_command_success(&mut self) {
+        self.flush_timeout_count = 0;
+        self.flush_backoff_until_tick = 0;
+    }
+
+    fn record_command_timeout(&mut self, ty: u32) {
+        self.flush_timeout_count = self.flush_timeout_count.saturating_add(1).min(8);
+        let shift = self.flush_timeout_count.saturating_sub(1).min(3);
+        let backoff_ms = COMMAND_TIMEOUT_BACKOFF_BASE_MS
+            .saturating_mul(1_u64 << shift)
+            .min(COMMAND_TIMEOUT_BACKOFF_MAX_MS);
+        let now = crate::arch::rtc::ticks();
+        if now != 0 {
+            self.flush_backoff_until_tick =
+                now.saturating_add(milliseconds_to_ticks(backoff_ms).max(1));
+        }
+        if self.flush_timeout_count <= 4 {
+            crate::debug::println!(
+                "virtio-gpu native: command timeout ty={:#x} count={} backoff_ms={}",
+                ty,
+                self.flush_timeout_count,
+                backoff_ms
+            );
+        }
+    }
+}
+
+fn wait_for_queue_used(used: *mut u8, current_used_idx: u16) -> bool {
+    let start_ticks = crate::arch::rtc::ticks();
+    if start_ticks != 0 {
+        let timeout_ticks = milliseconds_to_ticks(COMMAND_COMPLETION_TIMEOUT_MS).max(1);
+        let deadline = start_ticks.saturating_add(timeout_ticks);
+        loop {
+            let next_used = unsafe { ptr::read_volatile(used.add(2) as *const u16) };
+            if next_used != current_used_idx {
+                return true;
+            }
+            if crate::arch::rtc::ticks() >= deadline {
+                return false;
+            }
+            crate::arch::rtc::sleep(1);
+        }
+    }
+
+    for _ in 0..COMMAND_COMPLETION_BOOT_SPINS {
+        let next_used = unsafe { ptr::read_volatile(used.add(2) as *const u16) };
+        if next_used != current_used_idx {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
+fn milliseconds_to_ticks(milliseconds: u64) -> u64 {
+    let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
+    milliseconds
+        .saturating_mul(ticks_per_second)
+        .saturating_add(999)
+        / 1000
 }
 
 unsafe impl Send for VirtQueue {}
 
 pub(crate) fn try_enable_primary_display() -> bool {
-    let mut display = DISPLAY.lock();
-    if display.is_some() {
+    if DISPLAY.lock().is_some() {
         return true;
     }
+
+    if DISPLAY_INITIALIZING.swap(true, Ordering::AcqRel) {
+        return DISPLAY.lock().is_some();
+    }
+
+    let enabled = try_enable_primary_display_once();
+    DISPLAY_INITIALIZING.store(false, Ordering::Release);
+    enabled
+}
+
+fn try_enable_primary_display_once() -> bool {
+    if DISPLAY.lock().is_some() {
+        return true;
+    }
+    trace_native("virtio-gpu-native-probe", 0, 0);
 
     let Some(mut controller) = probe_and_init() else {
         return false;
     };
 
     if !controller.flush_full_frame() {
+        trace_native("virtio-gpu-native-initial-flush-failed", 0, 0);
         crate::debug::println!("virtio-gpu native: initial flush failed");
         return false;
     }
@@ -270,10 +416,16 @@ pub(crate) fn try_enable_primary_display() -> bool {
     };
 
     if !crate::io::gui::install_native_driver_framebuffer(framebuffer) {
+        trace_native("virtio-gpu-native-register-failed", 0, 0);
         crate::debug::println!("virtio-gpu native: framebuffer registration failed");
         return false;
     }
 
+    trace_native(
+        "virtio-gpu-native-registered",
+        u64::from(controller.width),
+        u64::from(controller.height),
+    );
     crate::debug::println!(
         "virtio-gpu native: display registered {}x{} stride={} fb={:#x} size={:#x}",
         controller.width,
@@ -282,16 +434,40 @@ pub(crate) fn try_enable_primary_display() -> bool {
         controller.framebuffer_cpu as usize,
         controller.framebuffer_size
     );
+    let mut display = DISPLAY.lock();
+    if display.is_some() {
+        return true;
+    }
     *display = Some(controller);
     true
 }
 
 pub(crate) fn flush_primary() -> bool {
-    let mut display = DISPLAY.lock();
+    let Some(mut display) = DISPLAY.try_lock() else {
+        DISPLAY_NEEDS_FULL_FLUSH.store(true, Ordering::Release);
+        return false;
+    };
     let Some(display) = display.as_mut() else {
         return true;
     };
+    if DISPLAY_NEEDS_FULL_FLUSH.swap(false, Ordering::AcqRel) {
+        display.needs_full_flush = true;
+    }
     display.flush_full_frame()
+}
+
+pub(crate) fn flush_primary_rect(x: u32, y: u32, width: u32, height: u32) -> bool {
+    let Some(mut display) = DISPLAY.try_lock() else {
+        DISPLAY_NEEDS_FULL_FLUSH.store(true, Ordering::Release);
+        return false;
+    };
+    let Some(display) = display.as_mut() else {
+        return true;
+    };
+    if DISPLAY_NEEDS_FULL_FLUSH.swap(false, Ordering::AcqRel) {
+        display.needs_full_flush = true;
+    }
+    display.flush_rect(x, y, width, height)
 }
 
 fn probe_and_init() -> Option<VirtioGpuDisplay> {
@@ -308,28 +484,35 @@ fn probe_and_init() -> Option<VirtioGpuDisplay> {
                 pci.class()
             );
         }
-        if pci.vendor_id() == PCI_VENDOR_VIRTIO
-            && (pci.device_id() == PCI_DEVICE_VIRTIO_GPU_MODERN || pci.class_code() == 0x03)
-        {
+        if pci.vendor_id() == PCI_VENDOR_VIRTIO && pci_device_is_virtio_gpu(pci.device_id()) {
+            trace_native(
+                "virtio-gpu-native-candidate",
+                pci_bdf_key(pci),
+                u64::from(pci.device_id()),
+            );
             found = Some(pci);
             return true;
         }
         false
     });
     let Some(pci) = found else {
+        trace_native("virtio-gpu-native-no-device", 0, 0);
         crate::debug::println!("virtio-gpu native: no PCI virtio display device found");
         return None;
     };
 
     let Some(caps) = parse_virtio_pci_caps(pci) else {
+        trace_native("virtio-gpu-native-no-modern-caps", pci_bdf_key(pci), 0);
         crate::debug::println!("virtio-gpu native: modern PCI capabilities not found");
         return None;
     };
     let Some(common) = map_region(pci, caps.common, false) else {
+        trace_native("virtio-gpu-native-common-map-failed", pci_bdf_key(pci), 0);
         crate::debug::println!("virtio-gpu native: common config map failed");
         return None;
     };
     let Some(notify) = map_region(pci, caps.notify, false) else {
+        trace_native("virtio-gpu-native-notify-map-failed", pci_bdf_key(pci), 0);
         crate::debug::println!("virtio-gpu native: notify config map failed");
         return None;
     };
@@ -348,16 +531,23 @@ fn probe_and_init() -> Option<VirtioGpuDisplay> {
             VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER,
         );
         if negotiate_features(common).is_none() {
+            trace_native("virtio-gpu-native-feature-failed", pci_bdf_key(pci), 0);
             crate::debug::println!("virtio-gpu native: feature negotiation failed");
             return None;
         }
     }
 
     let Some(queue) = setup_control_queue(common) else {
+        trace_native("virtio-gpu-native-queue-failed", pci_bdf_key(pci), 0);
         crate::debug::println!("virtio-gpu native: control queue setup failed");
         return None;
     };
     let Some((command_cpu, command_dma)) = alloc_dma(COMMAND_MEM_SIZE) else {
+        trace_native(
+            "virtio-gpu-native-command-alloc-failed",
+            pci_bdf_key(pci),
+            0,
+        );
         crate::debug::println!("virtio-gpu native: command buffer allocation failed");
         return None;
     };
@@ -376,15 +566,42 @@ fn probe_and_init() -> Option<VirtioGpuDisplay> {
         width: FRAMEBUFFER_WIDTH_DEFAULT,
         height: FRAMEBUFFER_HEIGHT_DEFAULT,
         stride_pixels: FRAMEBUFFER_WIDTH_DEFAULT,
+        flush_backoff_until_tick: 0,
+        flush_timeout_count: 0,
+        needs_full_flush: false,
     };
 
+    unsafe {
+        mark_driver_ok(common);
+    }
+    trace_native("virtio-gpu-native-driver-ok", pci_bdf_key(pci), 0);
+
     let (width, height) = query_display_info(&mut controller)
-        .map(usable_scanout_size)
-        .unwrap_or((FRAMEBUFFER_WIDTH_DEFAULT, FRAMEBUFFER_HEIGHT_DEFAULT));
+        .and_then(usable_scanout_size)
+        .unwrap_or_else(default_scanout_size);
     let stride_pixels = width;
-    let framebuffer_size = width as usize * height as usize * BYTES_PER_PIXEL as usize;
+    let Some(framebuffer_size) = framebuffer_size_bytes(width, height) else {
+        trace_native(
+            "virtio-gpu-native-geometry-rejected",
+            u64::from(width),
+            u64::from(height),
+        );
+        crate::debug::println!("virtio-gpu native: framebuffer geometry rejected");
+        unsafe {
+            mark_driver_failed(common);
+        }
+        return None;
+    };
     let Some((framebuffer_cpu, framebuffer_dma)) = alloc_dma(framebuffer_size) else {
+        trace_native(
+            "virtio-gpu-native-framebuffer-alloc-failed",
+            framebuffer_size as u64,
+            0,
+        );
         crate::debug::println!("virtio-gpu native: framebuffer allocation failed");
+        unsafe {
+            mark_driver_failed(common);
+        }
         return None;
     };
     unsafe {
@@ -399,33 +616,46 @@ fn probe_and_init() -> Option<VirtioGpuDisplay> {
     controller.stride_pixels = stride_pixels;
 
     if !create_resource_2d(&mut controller) {
+        trace_native("virtio-gpu-native-create-resource-failed", 0, 0);
         crate::debug::println!("virtio-gpu native: RESOURCE_CREATE_2D failed");
         unsafe {
-            write_common_u8(common, COMMON_DEVICE_STATUS, VIRTIO_STATUS_FAILED);
+            mark_driver_failed(common);
         }
         return None;
     }
     if !attach_backing(&mut controller, framebuffer_dma) {
+        trace_native("virtio-gpu-native-attach-backing-failed", 0, 0);
         crate::debug::println!("virtio-gpu native: RESOURCE_ATTACH_BACKING failed");
         unsafe {
-            write_common_u8(common, COMMON_DEVICE_STATUS, VIRTIO_STATUS_FAILED);
+            mark_driver_failed(common);
         }
         return None;
     }
     if !set_scanout(&mut controller) {
+        trace_native("virtio-gpu-native-set-scanout-failed", 0, 0);
         crate::debug::println!("virtio-gpu native: SET_SCANOUT failed");
         unsafe {
-            write_common_u8(common, COMMON_DEVICE_STATUS, VIRTIO_STATUS_FAILED);
+            mark_driver_failed(common);
         }
         return None;
     }
 
-    unsafe {
-        let status = read_common_u8(common, COMMON_DEVICE_STATUS) | VIRTIO_STATUS_DRIVER_OK;
-        write_common_u8(common, COMMON_DEVICE_STATUS, status);
-    }
-
     Some(controller)
+}
+
+fn pci_device_is_virtio_gpu(device_id: u16) -> bool {
+    matches!(
+        device_id,
+        PCI_DEVICE_VIRTIO_GPU_MODERN | PCI_DEVICE_VIRTIO_GPU_TRANSITIONAL
+    )
+}
+
+fn trace_native(name: &'static str, arg0: u64, arg1: u64) {
+    crate::debug::record_milestone(crate::debug::LogCategory::Display, name, arg0, arg1);
+}
+
+fn pci_bdf_key(pci: crate::arch::pci::PciDevice) -> u64 {
+    (u64::from(pci.bus) << 16) | (u64::from(pci.device) << 8) | u64::from(pci.function)
 }
 
 fn create_resource_2d(controller: &mut VirtioGpuDisplay) -> bool {
@@ -500,19 +730,69 @@ fn query_display_info(controller: &mut VirtioGpuDisplay) -> Option<(u32, u32)> {
     None
 }
 
-fn usable_scanout_size((width, height): (u32, u32)) -> (u32, u32) {
+fn usable_scanout_size((width, height): (u32, u32)) -> Option<(u32, u32)> {
+    if !scanout_size_is_supported(width, height) {
+        crate::debug::println!(
+            "virtio-gpu native: rejecting unsupported host scanout {}x{}",
+            width,
+            height
+        );
+        return None;
+    }
+
+    if scanout_size_matches_boot_framebuffer(width, height) {
+        let fallback = default_scanout_size();
+        if fallback != (width, height) {
+            crate::debug::println!(
+                "virtio-gpu native: overriding inherited boot scanout {}x{} with {}x{}",
+                width,
+                height,
+                fallback.0,
+                fallback.1
+            );
+            return Some(fallback);
+        }
+    }
+
     if width < MIN_USABLE_SCANOUT_WIDTH || height < MIN_USABLE_SCANOUT_HEIGHT {
+        let fallback = default_scanout_size();
         crate::debug::println!(
             "virtio-gpu native: overriding small host scanout {}x{} with {}x{}",
             width,
             height,
-            FRAMEBUFFER_WIDTH_DEFAULT,
-            FRAMEBUFFER_HEIGHT_DEFAULT
+            fallback.0,
+            fallback.1
         );
-        return (FRAMEBUFFER_WIDTH_DEFAULT, FRAMEBUFFER_HEIGHT_DEFAULT);
+        return Some(fallback);
     }
 
-    (width, height)
+    Some((width, height))
+}
+
+fn default_scanout_size() -> (u32, u32) {
+    (FRAMEBUFFER_WIDTH_DEFAULT, FRAMEBUFFER_HEIGHT_DEFAULT)
+}
+
+fn scanout_size_matches_boot_framebuffer(width: u32, height: u32) -> bool {
+    if let Some(framebuffer) = crate::storage::boot_volume::boot_framebuffer_info() {
+        return framebuffer.validate().is_ok()
+            && framebuffer.width as u32 == width
+            && framebuffer.height as u32 == height;
+    }
+    false
+}
+
+fn scanout_size_is_supported(width: u32, height: u32) -> bool {
+    width != 0 && height != 0 && width <= MAX_SCANOUT_WIDTH && height <= MAX_SCANOUT_HEIGHT
+}
+
+fn framebuffer_size_bytes(width: u32, height: u32) -> Option<usize> {
+    if !scanout_size_is_supported(width, height) {
+        return None;
+    }
+    (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(BYTES_PER_PIXEL as usize)
 }
 
 fn setup_control_queue(common: *mut u8) -> Option<VirtQueue> {
@@ -578,6 +858,20 @@ unsafe fn negotiate_features(common: *mut u8) -> Option<()> {
             return None;
         }
         Some(())
+    }
+}
+
+unsafe fn mark_driver_ok(common: *mut u8) {
+    unsafe {
+        let status = read_common_u8(common, COMMON_DEVICE_STATUS) | VIRTIO_STATUS_DRIVER_OK;
+        write_common_u8(common, COMMON_DEVICE_STATUS, status);
+    }
+}
+
+unsafe fn mark_driver_failed(common: *mut u8) {
+    unsafe {
+        let status = read_common_u8(common, COMMON_DEVICE_STATUS) | VIRTIO_STATUS_FAILED;
+        write_common_u8(common, COMMON_DEVICE_STATUS, status);
     }
 }
 

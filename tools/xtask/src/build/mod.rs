@@ -201,7 +201,10 @@ pub(crate) fn build_efi(config: &Config) -> Result<()> {
 pub(crate) fn build_nucleus(config: &Config) -> Result<()> {
     run_cargo_kernel_rustc(config, &config.nucleus_package, &config.nucleus_rustc_args)?;
     let artifact = config.artifact_nucleus_elf_path();
-    copy_with_parent(&config.nucleus_source_path(), &artifact)?;
+    let source = config.nucleus_source_path();
+    if !output_is_fresh(&artifact, std::slice::from_ref(&source))? {
+        copy_with_parent(&source, &artifact)?;
+    }
     check_nucleus_multiboot2(config)?;
     refresh_nucleus_signature_after_build(config)
 }
@@ -238,11 +241,14 @@ pub(crate) fn sign_nucleus(config: &Config) -> Result<()> {
 }
 
 fn refresh_nucleus_signature_after_build(config: &Config) -> Result<()> {
+    let nucleus = config.artifact_nucleus_elf_path();
     let signature = config.artifact_nucleus_signature_path();
-    remove_file_if_exists(&signature)?;
     if config.rustos_grub_signing_key.is_some() {
-        sign_nucleus(config)?;
-    } else {
+        if !output_is_fresh(&signature, &[nucleus])? {
+            sign_nucleus(config)?;
+        }
+    } else if signature.is_file() && !output_is_fresh(&signature, &[nucleus])? {
+        remove_file_if_exists(&signature)?;
         eprintln!(
             "xtask: warning: removed stale nucleus signature; set RUSTOS_GRUB_SIGNING_KEY before staging a signed boot image"
         );

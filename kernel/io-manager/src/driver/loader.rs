@@ -9,14 +9,14 @@ use driver_abi::{
     DriverBus, DriverClass, DriverModuleHeader, RUSTOS_DRIVER_ABI_VERSION_SYMBOL,
     RUSTOS_DRIVER_HEADER_SYMBOL, RUSTOS_DRIVER_INIT_SYMBOL,
 };
-use elf::ElfBytes;
 use elf::endian::LittleEndian as ElfLittleEndian;
 use elf::file::Class as ElfClass;
-use object::LittleEndian;
+use elf::ElfBytes;
 use object::elf::{
     self as objelf, FileHeader64 as RawElfHeader, Rela64 as RawRela,
     SectionHeader64 as RawSectionHeader, Sym64 as RawSym,
 };
+use object::LittleEndian;
 use spin::Mutex;
 use x86_64::PhysAddr;
 
@@ -334,11 +334,12 @@ pub(super) fn load_module_image(
     class: DriverClass,
     bus: DriverBus,
     image_path: &'static str,
+    linux_driver_names: &'static str,
 ) -> Result<LoadedModuleInfo, &'static str> {
     if !registry::contains_loadable_elf(name, class, bus, image_path) {
         return Err("driver module path is not registered");
     }
-    load_module_image_explicit(name, class, bus, image_path)
+    load_module_image_explicit(name, class, bus, image_path, linux_driver_names)
 }
 
 pub(super) fn load_module_image_explicit(
@@ -346,6 +347,7 @@ pub(super) fn load_module_image_explicit(
     class: DriverClass,
     bus: DriverBus,
     image_path: &'static str,
+    linux_driver_names: &'static str,
 ) -> Result<LoadedModuleInfo, &'static str> {
     driver_diag!(
         crate::debug::LogLevel::Debug,
@@ -500,6 +502,13 @@ pub(super) fn load_module_image_explicit(
                 "module-init-linux-call",
                 image.len() as u64,
                 init_addr as u64,
+            );
+            let _policy_guard = super::linux::virtio::enter_module_init_policy(
+                super::linux::virtio::ModuleInitPolicy {
+                    class,
+                    bus,
+                    linux_driver_names,
+                },
             );
             unsafe { call_with_module_init_stack0(init_addr) }
         }
@@ -1774,6 +1783,9 @@ fn allocate_module_memory(
         if reloc_section.section_type != objelf::SHT_RELA {
             continue;
         }
+        if !relocation_target_is_loaded(&section_headers, reloc_section)? {
+            continue;
+        }
 
         let relocations = relocation_entries_by_header(elf, reloc_section)?;
         for relocation in relocations.iter().copied() {
@@ -1965,6 +1977,9 @@ fn apply_module_relocations(
         let target_index =
             usize::try_from(reloc_header.info).map_err(|_| "module relocation target overflow")?;
         let Some(target_layout) = layout.sections.get(target_index).and_then(|entry| *entry) else {
+            if !relocation_target_index_is_loaded(&section_headers, target_index)? {
+                continue;
+            }
             return Err("module relocation target section is not loaded");
         };
 
@@ -2019,6 +2034,25 @@ fn apply_module_relocations(
     }
 
     Ok(())
+}
+
+fn relocation_target_is_loaded(
+    section_headers: &[ModuleSectionHeader],
+    reloc_header: ModuleSectionHeader,
+) -> Result<bool, &'static str> {
+    let target_index =
+        usize::try_from(reloc_header.info).map_err(|_| "module relocation target overflow")?;
+    relocation_target_index_is_loaded(section_headers, target_index)
+}
+
+fn relocation_target_index_is_loaded(
+    section_headers: &[ModuleSectionHeader],
+    target_index: usize,
+) -> Result<bool, &'static str> {
+    let Some(target) = section_headers.get(target_index) else {
+        return Err("module relocation target section is out of range");
+    };
+    Ok(target.flags & u64::from(objelf::SHF_ALLOC) != 0 && target.size != 0)
 }
 
 fn resolve_symbol_addr_cached(
@@ -2262,6 +2296,16 @@ fn resolve_external_symbol(
     let address = resolve_allowed_external_symbol(name, policy);
     let Some(address) = address else {
         if policy.is_linux_compat() && !is_allowed_linux_external_symbol(name, policy) {
+            crate::debug::write_debugcon_only_parts_line(&[
+                b"driver module disallowed external: module=",
+                policy.module_name.as_bytes(),
+                b" symbol=",
+                name.as_bytes(),
+                b" class=",
+                class::name(policy.class).as_bytes(),
+                b" bus=",
+                bus::name(policy.bus).as_bytes(),
+            ]);
             driver_diag!(
                 crate::debug::LogLevel::Warn,
                 27,
@@ -2274,6 +2318,12 @@ fn resolve_external_symbol(
             );
             return Err("module references disallowed external symbol");
         }
+        crate::debug::write_debugcon_only_parts_line(&[
+            b"driver module unresolved external: module=",
+            policy.module_name.as_bytes(),
+            b" symbol=",
+            name.as_bytes(),
+        ]);
         driver_diag!(
             crate::debug::LogLevel::Warn,
             28,
@@ -3069,8 +3119,8 @@ pub(super) fn section_header_entries(
 #[cfg(test)]
 mod tests {
     use super::{
-        ModuleMemoryClass, ModuleSectionHeader, PendingModuleExecGuard, classify_module_section,
-        reset_for_tests, runtime_executable_addr_is_known, validate_module_path,
+        classify_module_section, reset_for_tests, runtime_executable_addr_is_known,
+        validate_module_path, ModuleMemoryClass, ModuleSectionHeader, PendingModuleExecGuard,
     };
     use object::elf as objelf;
 

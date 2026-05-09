@@ -5,48 +5,16 @@ use embedded_graphics::geometry::{OriginDimensions, Size};
 use embedded_graphics::pixelcolor::Rgb888;
 use embedded_graphics::prelude::{Pixel, RgbColor};
 
+use crate::app::CursorMotion;
+use crate::cursor_sprites::{
+    CURSOR_SPRITE_ALPHA, CURSOR_SPRITE_CHANNELS, CURSOR_SPRITE_MAX_DISTANCE, CURSOR_SPRITE_SIZE,
+};
 use crate::simd;
 
-const COLOR_CURSOR_FILL: u32 = 0x00ff_ffff;
-const COLOR_CURSOR_OUTLINE: u32 = 0x0000_0000;
-const COLOR_CURSOR_SHADOW: u32 = 0x0026_313f;
-const CURSOR_BITMAP_WIDTH: usize = 32;
-const CURSOR_BITMAP_HEIGHT: usize = 32;
-const CURSOR_SHADOW_OFFSET: usize = 1;
-const CURSOR_BITMAP: [&[u8]; 32] = [
-    b"X...............................",
-    b"XX..............................",
-    b"XXX.............................",
-    b"XXXX............................",
-    b"XXOXX...........................",
-    b"XXOOXX..........................",
-    b"XXOOOXX.........................",
-    b"XXOOOOXX........................",
-    b"XXOOOOOXX.......................",
-    b"XXOOOOOOXX......................",
-    b"XXOOOOOOOXX.....................",
-    b"XXOOOOOOOOXX....................",
-    b"XXOOOOOOOOOXX...................",
-    b"XXOOOOOOOOOOXX..................",
-    b"XXOOOOOOOOOOOXX.................",
-    b"XXOOOOOOOOOOOOXX................",
-    b"XXOOOOOOOOOOOOOXX...............",
-    b"XXOOOOOOOOOOOOOOXX..............",
-    b"XXOOOOOOOOOOOOOOOXX.............",
-    b"XXOOOOOOOOOOOOOOOOXX............",
-    b"XXOOOOOOXXXXXXXXXXXXX...........",
-    b"XXOOOOOXXXXXXXXXXXXXXX..........",
-    b"XXOOOOXX........................",
-    b"XXOOOXX.........................",
-    b"XXOOXX..........................",
-    b"XXOXX...........................",
-    b"XXXX............................",
-    b"XXX.............................",
-    b"XX..............................",
-    b"X...............................",
-    b"................................",
-    b"................................",
-];
+const COLOR_CURSOR_BLUE: u32 = 0x0036_94ff;
+const COLOR_CURSOR_WHITE: u32 = 0x00ec_faff;
+const CURSOR_ROTATION_FP: i32 = 1024;
+const CURSOR_VISUAL_RADIUS: usize = 72;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Rect {
@@ -318,13 +286,71 @@ impl<'a> SurfaceCanvas<'a> {
         }
     }
 
-    pub(crate) fn draw_cursor(&mut self, cursor_x: u32, cursor_y: u32) {
-        let base_x = cursor_x as i32;
-        let base_y = cursor_y as i32;
+    pub(crate) fn draw_cursor(&mut self, cursor_x: u32, cursor_y: u32, motion: CursorMotion) {
+        let sprite_index = motion.sprite_index.min(CURSOR_SPRITE_MAX_DISTANCE) as usize;
+        let sprite_area = CURSOR_SPRITE_SIZE
+            .saturating_mul(CURSOR_SPRITE_SIZE)
+            .saturating_mul(CURSOR_SPRITE_CHANNELS);
+        let sprite_offset = sprite_index.saturating_mul(sprite_area);
+        let Some(sprite_alpha) =
+            CURSOR_SPRITE_ALPHA.get(sprite_offset..sprite_offset.saturating_add(sprite_area))
+        else {
+            return;
+        };
 
-        self.draw_cursor_layer(base_x + 1, base_y + 1, None, COLOR_CURSOR_SHADOW);
-        self.draw_cursor_layer(base_x, base_y, Some(b'X'), COLOR_CURSOR_OUTLINE);
-        self.draw_cursor_layer(base_x, base_y, Some(b'O'), COLOR_CURSOR_FILL);
+        let (cos_fp, sin_fp) = cursor_motion_rotation(motion);
+        let radius = CURSOR_VISUAL_RADIUS as i32;
+        let hotspot = (CURSOR_SPRITE_SIZE / 2) as i32;
+        let center_x = cursor_x as i32;
+        let center_y = cursor_y as i32;
+        for local_y in -radius..=radius {
+            for local_x in -radius..=radius {
+                let source_x = div_round(
+                    local_x
+                        .saturating_mul(cos_fp)
+                        .saturating_add(local_y.saturating_mul(sin_fp)),
+                    CURSOR_ROTATION_FP,
+                )
+                .saturating_add(hotspot);
+                let source_y = div_round(
+                    local_y
+                        .saturating_mul(cos_fp)
+                        .saturating_sub(local_x.saturating_mul(sin_fp)),
+                    CURSOR_ROTATION_FP,
+                )
+                .saturating_add(hotspot);
+                if source_x < 0
+                    || source_y < 0
+                    || source_x as usize >= CURSOR_SPRITE_SIZE
+                    || source_y as usize >= CURSOR_SPRITE_SIZE
+                {
+                    continue;
+                }
+                let alpha_index = (source_y as usize)
+                    .saturating_mul(CURSOR_SPRITE_SIZE)
+                    .saturating_add(source_x as usize)
+                    .saturating_mul(CURSOR_SPRITE_CHANNELS);
+                let Some(blue_alpha) = sprite_alpha.get(alpha_index).copied() else {
+                    continue;
+                };
+                let white_alpha = sprite_alpha
+                    .get(alpha_index.saturating_add(1))
+                    .copied()
+                    .unwrap_or_default();
+                self.put_pixel_alpha(
+                    center_x.saturating_add(local_x),
+                    center_y.saturating_add(local_y),
+                    COLOR_CURSOR_BLUE,
+                    blue_alpha,
+                );
+                self.put_pixel_alpha(
+                    center_x.saturating_add(local_x),
+                    center_y.saturating_add(local_y),
+                    COLOR_CURSOR_WHITE,
+                    white_alpha,
+                );
+            }
+        }
     }
 
     pub(crate) fn draw_surface(
@@ -473,20 +499,57 @@ impl<'a> SurfaceCanvas<'a> {
         }
     }
 
-    fn draw_cursor_layer(&mut self, base_x: i32, base_y: i32, only: Option<u8>, color: u32) {
-        for (row, line) in CURSOR_BITMAP.iter().enumerate() {
-            for (col, &pixel) in line.iter().enumerate() {
-                if pixel == b'.' {
-                    continue;
-                }
-                if let Some(expected) = only {
-                    if pixel != expected {
-                        continue;
-                    }
-                }
-                self.put_pixel(base_x + col as i32, base_y + row as i32, color);
-            }
+    fn put_pixel_alpha(&mut self, x: i32, y: i32, color: u32, alpha: u8) {
+        if alpha == 0 || x < 0 || y < 0 || !self.clip_rect.contains(x as u32, y as u32) {
+            return;
         }
+
+        let Some(index) = (y as usize)
+            .checked_mul(self.stride_pixels)
+            .and_then(|offset| offset.checked_add(x as usize))
+        else {
+            return;
+        };
+        if let Some(pixel) = self.pixels.get_mut(index) {
+            blend_pixel(pixel, color, alpha);
+        }
+    }
+}
+
+fn cursor_motion_rotation(motion: CursorMotion) -> (i32, i32) {
+    if motion.sprite_index == 0 || (motion.dx == 0 && motion.dy == 0) {
+        return (CURSOR_ROTATION_FP, 0);
+    }
+
+    let dx = i64::from(motion.dx);
+    let dy = i64::from(motion.dy);
+    let length_sq = dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy));
+    let length = integer_sqrt(length_sq).max(1) as i64;
+    (
+        ((dx * i64::from(CURSOR_ROTATION_FP)) / length) as i32,
+        ((dy * i64::from(CURSOR_ROTATION_FP)) / length) as i32,
+    )
+}
+
+fn integer_sqrt(value: i64) -> u64 {
+    if value <= 0 {
+        return 0;
+    }
+
+    let mut estimate = value as u64;
+    let mut next = (estimate + 1) / 2;
+    while next < estimate {
+        estimate = next;
+        next = (estimate + value as u64 / estimate) / 2;
+    }
+    estimate
+}
+
+fn div_round(value: i32, divisor: i32) -> i32 {
+    if value >= 0 {
+        value.saturating_add(divisor / 2) / divisor
+    } else {
+        value.saturating_sub(divisor / 2) / divisor
     }
 }
 
@@ -539,11 +602,12 @@ impl OriginDimensions for SurfaceCanvas<'_> {
 }
 
 pub(crate) fn cursor_dirty_rect(cursor_x: u32, cursor_y: u32, width: u32, height: u32) -> Rect {
+    let radius = CURSOR_VISUAL_RADIUS;
     Rect {
-        x: cursor_x as usize,
-        y: cursor_y as usize,
-        width: CURSOR_BITMAP_WIDTH + CURSOR_SHADOW_OFFSET,
-        height: CURSOR_BITMAP_HEIGHT + CURSOR_SHADOW_OFFSET,
+        x: (cursor_x as usize).saturating_sub(radius),
+        y: (cursor_y as usize).saturating_sub(radius),
+        width: radius.saturating_mul(2).saturating_add(1),
+        height: radius.saturating_mul(2).saturating_add(1),
     }
     .intersect(Rect {
         x: 0,

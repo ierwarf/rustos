@@ -6,7 +6,7 @@
       "type": "node-terminal",
       "request": "launch",
       "preLaunchTask": "Build OS",
-      "command": "exec cargo xtask run --profile nvme --usb-input --debugcon file",
+      "command": "exec cargo xtask run",
       "cwd": "${workspaceFolder}"
     },
     {
@@ -14,7 +14,7 @@
       "type": "node-terminal",
       "request": "launch",
       "preLaunchTask": "Build OS",
-      "command": "exec cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file",
+      "command": "exec cargo xtask run --accel-profile kvm",
       "cwd": "${workspaceFolder}"
     }
   ]

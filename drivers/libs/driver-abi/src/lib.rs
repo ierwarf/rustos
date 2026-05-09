@@ -640,8 +640,14 @@ pub struct DisplayFramebufferRegistration {
     pub stride: u32,
     pub pixel_format: u32,
     pub bytes_per_pixel: u8,
-    pub reserved: [u8; 3],
+    pub flags: u8,
+    pub reserved: [u8; 2],
 }
+
+pub const DISPLAY_FRAMEBUFFER_FLAG_BOOT_FRAMEBUFFER: u8 = 1 << 0;
+pub const DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER: u8 = 1 << 1;
+pub const DISPLAY_FRAMEBUFFER_KNOWN_FLAGS: u8 =
+    DISPLAY_FRAMEBUFFER_FLAG_BOOT_FRAMEBUFFER | DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]

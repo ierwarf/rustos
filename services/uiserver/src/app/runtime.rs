@@ -1,17 +1,103 @@
+use std::collections::BTreeMap;
 use std::os::fd::AsRawFd;
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
 use std::vec::Vec;
 
-use super::{AppState, ConsoleWindow, DragTarget, MAX_RUNNING_PROGRAMS};
+use super::{AppState, ConsoleWindow, DragTarget, CONSOLE_POLL_SLEEP, MAX_RUNNING_PROGRAMS};
 use crate::canvas;
 use crate::render::{self, default_console_window_rect, taskbar_slot_rect};
 use crate::runtime_sync::{runtime_program_is_hidden, runtime_program_title, RuntimeState};
 use crate::sys::{
     console_get_state, console_set_focus, console_snapshot_session_output,
-    console_snapshot_sessions, ConsoleSessionHandle, ConsoleSessionInfo,
-    MAX_CONSOLE_SNAPSHOT_BYTES,
+    console_snapshot_sessions, open_console, ConsoleSessionHandle, ConsoleSessionInfo,
+    ConsoleStateInfo, MAX_CONSOLE_SNAPSHOT_BYTES,
 };
 use crate::wayland::WaylandCompositor;
 use runtime_control::RuntimeRunningProgram;
+
+pub(crate) struct ConsoleRefresh {
+    state: ConsoleStateInfo,
+    sessions: Vec<ConsoleSessionInfo>,
+    outputs: Vec<ConsoleSessionOutput>,
+}
+
+struct ConsoleSessionOutput {
+    session_handle: ConsoleSessionHandle,
+    output_generation: u64,
+    bytes: Vec<u8>,
+}
+
+pub(crate) fn start_console_refresh_worker() -> Receiver<ConsoleRefresh> {
+    let (sender, receiver) = mpsc::sync_channel(2);
+    thread::spawn(move || {
+        let Ok(console_fd) = open_console() else {
+            return;
+        };
+        let mut snapshot = [0_u8; MAX_CONSOLE_SNAPSHOT_BYTES];
+        let mut output_generations = BTreeMap::<ConsoleSessionHandle, u64>::new();
+        loop {
+            if let Ok(refresh) = collect_console_refresh(
+                console_fd.as_raw_fd(),
+                &mut snapshot,
+                &mut output_generations,
+            ) {
+                if sender.try_send(refresh).is_err() {
+                    output_generations.clear();
+                }
+            }
+            thread::sleep(CONSOLE_POLL_SLEEP);
+        }
+    });
+    receiver
+}
+
+fn collect_console_refresh(
+    console_fd: i32,
+    snapshot: &mut [u8; MAX_CONSOLE_SNAPSHOT_BYTES],
+    output_generations: &mut BTreeMap<ConsoleSessionHandle, u64>,
+) -> Result<ConsoleRefresh, i32> {
+    let state = console_get_state(console_fd)?;
+    let mut sessions = [ConsoleSessionInfo::default(); crate::sys::CONSOLE_SESSION_CAPACITY];
+    let session_count = console_snapshot_sessions(console_fd, &mut sessions)?
+        .min(crate::sys::CONSOLE_SESSION_CAPACITY);
+    let sessions = sessions[..session_count].to_vec();
+    output_generations.retain(|session_handle, _| {
+        sessions
+            .iter()
+            .any(|session| session.session_handle == *session_handle)
+    });
+    let mut outputs = Vec::new();
+    for session in &sessions {
+        let previous_generation = output_generations
+            .get(&session.session_handle)
+            .copied()
+            .unwrap_or(0);
+        if previous_generation == session.output_generation {
+            continue;
+        }
+        match console_snapshot_session_output(console_fd, session.session_handle, snapshot) {
+            Ok(count) => outputs.push(ConsoleSessionOutput {
+                session_handle: session.session_handle,
+                output_generation: session.output_generation,
+                bytes: snapshot[..count].to_vec(),
+            }),
+            Err(err)
+                if matches!(
+                    err,
+                    crate::sys::ENOENT | crate::sys::EINVAL | crate::sys::ESTALE
+                ) => {}
+            Err(err) => return Err(err),
+        }
+        output_generations.insert(session.session_handle, session.output_generation);
+    }
+
+    Ok(ConsoleRefresh {
+        state,
+        sessions,
+        outputs,
+    })
+}
 
 impl AppState {
     pub(crate) fn apply_runtime_state(&mut self, runtime_state: &mut RuntimeState) -> canvas::Rect {
@@ -28,43 +114,39 @@ impl AppState {
         dirty_rect.union(self.focused_window_reorder_dirty_rect())
     }
 
-    pub(crate) fn refresh_console_windows(&mut self) -> Result<canvas::Rect, i32> {
-        let state = console_get_state(self.console_fd.as_raw_fd())?;
-        let mut sessions = [ConsoleSessionInfo::default(); crate::sys::CONSOLE_SESSION_CAPACITY];
-        let session_count = console_snapshot_sessions(self.console_fd.as_raw_fd(), &mut sessions)?
-            .min(crate::sys::CONSOLE_SESSION_CAPACITY);
-        let sessions = &sessions[..session_count];
-
+    pub(crate) fn apply_console_refresh(
+        &mut self,
+        refresh: ConsoleRefresh,
+    ) -> Result<canvas::Rect, i32> {
+        let sessions = refresh.sessions.as_slice();
+        let before_dirty = self
+            .console_stack_dirty_rect()
+            .union(self.taskbar_dirty_rect());
         let mut dirty_rect = canvas::Rect::empty();
-        dirty_rect = dirty_rect.union(self.console_stack_dirty_rect());
         let pruned = self.prune_windows(|session_handle| {
             sessions
                 .iter()
                 .any(|session| session.session_handle == session_handle)
         });
-        if pruned {
+        let added = self.add_missing_console_windows(sessions);
+        if pruned || added {
             dirty_rect = dirty_rect
+                .union(before_dirty)
                 .union(self.console_stack_dirty_rect())
                 .union(self.taskbar_dirty_rect());
         }
         self.clamp_console_snapshot_index();
-        dirty_rect = dirty_rect.union(self.reconcile_console_focus(state.focused_session_handle)?);
+        dirty_rect =
+            dirty_rect.union(self.reconcile_console_focus(refresh.state.focused_session_handle)?);
 
-        let mut snapshot = [0_u8; MAX_CONSOLE_SNAPSHOT_BYTES];
-        let mut stale_sessions = Vec::new();
-        let mut snapshot_candidates = Vec::new();
         let taskbar_dirty_rect = self.taskbar_dirty_rect();
-        for (index, window) in self.console_windows.iter_mut().enumerate() {
+        for window in self.console_windows.iter_mut() {
             let Some(session) = sessions
                 .iter()
                 .find(|session| session.session_handle == window.session_handle)
             else {
                 continue;
             };
-            let session_generation = session.output_generation;
-            if session_generation == window.output_generation {
-                continue;
-            }
             let session_title = console_session_title(session);
             if !session_title.is_empty() && window.title != session_title {
                 window.title = session_title;
@@ -73,64 +155,64 @@ impl AppState {
                     .union(crate::render::console_window_dirty_rect(window.frame))
                     .union(taskbar_dirty_rect);
             }
-            snapshot_candidates.push(index);
-        }
-
-        if let Some(index) = self.select_console_snapshot_candidate(&snapshot_candidates) {
-            let session_handle = self.console_windows[index].session_handle;
-            let count = match console_snapshot_session_output(
-                self.console_fd.as_raw_fd(),
-                session_handle,
-                &mut snapshot,
-            ) {
-                Ok(count) => count,
-                Err(err)
-                    if matches!(
-                        err,
-                        crate::sys::ENOENT | crate::sys::EINVAL | crate::sys::ESTALE
-                    ) =>
-                {
-                    stale_sessions.push(session_handle);
-                    0
-                }
-                Err(err) => return Err(err),
+            if session.output_generation == window.output_generation {
+                continue;
+            }
+            let output = refresh
+                .outputs
+                .iter()
+                .find(|output| output.session_handle == window.session_handle);
+            let Some(output) = output else {
+                continue;
             };
-            if stale_sessions.is_empty() {
-                let window = &mut self.console_windows[index];
-                if window.output_cache.as_slice() != &snapshot[..count] {
-                    window.output_cache.clear();
-                    window.output_cache.extend_from_slice(&snapshot[..count]);
-                    window.terminal_dirty = true;
-                    window.invalidate_surface();
-                    dirty_rect =
-                        dirty_rect.union(crate::render::console_window_dirty_rect(window.frame));
-                }
-                window.output_generation = sessions
-                    .iter()
-                    .find(|session| session.session_handle == session_handle)
-                    .map(|session| session.output_generation)
-                    .unwrap_or(window.output_generation);
-                self.next_console_snapshot_index = (index + 1) % self.console_windows.len().max(1);
+            if window.output_cache.as_slice() != output.bytes.as_slice() {
+                window.output_cache.clear();
+                window
+                    .output_cache
+                    .extend_from_slice(output.bytes.as_slice());
+                window.terminal_dirty = true;
+                window.invalidate_surface();
+                dirty_rect =
+                    dirty_rect.union(crate::render::console_window_dirty_rect(window.frame));
             }
-        } else {
-            self.clamp_console_snapshot_index();
-        }
-
-        if !stale_sessions.is_empty() {
-            let before_stale = self.console_stack_dirty_rect();
-            let stale_pruned =
-                self.prune_windows(|session_handle| !stale_sessions.contains(&session_handle));
-            self.clamp_console_snapshot_index();
-            if stale_pruned {
-                dirty_rect = dirty_rect
-                    .union(before_stale)
-                    .union(self.console_stack_dirty_rect())
-                    .union(self.taskbar_dirty_rect());
-            }
-            dirty_rect = dirty_rect.union(self.reconcile_console_focus(0)?);
+            window.output_generation = output.output_generation;
         }
 
         Ok(dirty_rect)
+    }
+
+    fn add_missing_console_windows(&mut self, sessions: &[ConsoleSessionInfo]) -> bool {
+        let mut known_sessions = self
+            .console_windows
+            .iter()
+            .map(|window| window.session_handle)
+            .collect::<Vec<_>>();
+        let mut added = false;
+
+        for session in sessions {
+            let session_handle = session.session_handle;
+            if session_handle == 0
+                || self.is_console_session_closing(session_handle)
+                || known_sessions.contains(&session_handle)
+            {
+                continue;
+            }
+
+            self.console_windows.push(ConsoleWindow::new(
+                session_handle,
+                console_session_title(session),
+                default_console_window_rect(
+                    self.display.width,
+                    self.display.height,
+                    self.console_windows.len(),
+                ),
+                0,
+            ));
+            known_sessions.push(session_handle);
+            added = true;
+        }
+
+        added
     }
 
     fn sync_windows_from_runtime(&mut self, programs: &[RuntimeRunningProgram]) -> canvas::Rect {
@@ -383,21 +465,6 @@ impl AppState {
         previous_len != self.console_windows.len()
             || previous_focused != self.focused_session_handle
             || previous_dragging != self.dragging_window
-    }
-
-    fn select_console_snapshot_candidate(&self, candidates: &[usize]) -> Option<usize> {
-        if candidates.is_empty() {
-            return None;
-        }
-
-        let start = self
-            .next_console_snapshot_index
-            .min(self.console_windows.len().saturating_sub(1));
-        candidates
-            .iter()
-            .copied()
-            .find(|index| *index >= start)
-            .or_else(|| candidates.first().copied())
     }
 
     fn clamp_console_snapshot_index(&mut self) {

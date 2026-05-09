@@ -17,9 +17,24 @@ static X86_HYPER_TYPE: i32 = 0;
 static IRQ_SPIN_LOCKS: Mutex<Vec<&'static CompatLockState>> = Mutex::new(Vec::new());
 static MUTEX_LOCKS: Mutex<Vec<&'static CompatLockState>> = Mutex::new(Vec::new());
 static IRQ_LOCK_OWNERS: Mutex<Vec<IrqOwnerState>> = Mutex::new(Vec::new());
+static IRQ_LOCK_SNAPSHOT_OWNER_COUNT: AtomicUsize = AtomicUsize::new(0);
+static IRQ_LOCK_SNAPSHOT_TOTAL_DEPTH: AtomicUsize = AtomicUsize::new(0);
 static MUTEX_DEBUG_REMAINING: AtomicUsize = AtomicUsize::new(64);
 const MAX_COMPAT_PRINTK_BYTES: usize = 4096;
 const MAX_COMPAT_RANDOM_BYTES: usize = 1 << 20;
+const MAX_COMPAT_SG_INIT_ENTRIES: usize = 4096;
+const LINUX_SG_END: usize = 0x02;
+
+#[repr(C)]
+struct LinuxCompatScatterlist {
+    page_link: usize,
+    offset: u32,
+    length: u32,
+    dma_address: u64,
+}
+
+const _: [(); 24] = [(); core::mem::size_of::<LinuxCompatScatterlist>()];
+
 #[repr(C)]
 pub(crate) struct LinuxTimespec64 {
     tv_sec: i64,
@@ -222,6 +237,11 @@ pub(crate) unsafe extern "C" fn __msecs_to_jiffies(milliseconds: u32) -> u64 {
         .div_ceil(1000)
 }
 
+pub(crate) unsafe extern "C" fn jiffies_to_usecs(jiffies: u64) -> u64 {
+    let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
+    jiffies.saturating_mul(1_000_000) / ticks_per_second
+}
+
 pub(crate) unsafe extern "C" fn _printk(fmt: *const c_char) -> i32 {
     emit_linux_printk(b"linux printk: ", fmt);
     0
@@ -317,9 +337,42 @@ pub(crate) unsafe extern "C" fn get_random_bytes(dest: *mut c_void, len: usize) 
     }
 }
 
-pub(crate) unsafe extern "C" fn sg_init_table(_sgl: *mut c_void, _nents: u32) {}
+pub(crate) unsafe extern "C" fn sg_init_table(sgl: *mut c_void, nents: u32) {
+    if sgl.is_null() || nents == 0 {
+        return;
+    }
+    let nents = (nents as usize).min(MAX_COMPAT_SG_INIT_ENTRIES);
+    let entries = unsafe { slice::from_raw_parts_mut(sgl.cast::<LinuxCompatScatterlist>(), nents) };
+    for entry in entries.iter_mut() {
+        *entry = LinuxCompatScatterlist {
+            page_link: 0,
+            offset: 0,
+            length: 0,
+            dma_address: 0,
+        };
+    }
+    if let Some(last) = entries.last_mut() {
+        last.page_link = LINUX_SG_END;
+    }
+}
 
-pub(crate) unsafe extern "C" fn sg_init_one(_sg: *mut c_void, _buf: *const c_void, _buflen: u32) {}
+pub(crate) unsafe extern "C" fn sg_init_one(sg: *mut c_void, buf: *const c_void, buflen: u32) {
+    if sg.is_null() {
+        return;
+    }
+    let entry = sg.cast::<LinuxCompatScatterlist>();
+    unsafe {
+        ptr::write(
+            entry,
+            LinuxCompatScatterlist {
+                page_link: (buf as usize & !0x3) | LINUX_SG_END,
+                offset: (buf as usize & 0x3) as u32,
+                length: buflen,
+                dma_address: buf as u64,
+            },
+        );
+    }
+}
 
 pub(crate) unsafe extern "C" fn refcount_warn_saturate(_ptr: *mut c_void, _type_: i32) {}
 
@@ -346,6 +399,7 @@ pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
         "schedule" => Some(schedule as *const () as usize),
         "schedule_timeout" => Some(schedule_timeout as *const () as usize),
         "__msecs_to_jiffies" => Some(__msecs_to_jiffies as *const () as usize),
+        "jiffies_to_usecs" => Some(jiffies_to_usecs as *const () as usize),
         "_printk" => Some(_printk as *const () as usize),
         "_dev_printk" => Some(_dev_printk as *const () as usize),
         "_dev_err" => Some(_dev_err as *const () as usize),
@@ -395,7 +449,7 @@ fn copy_format_string(dest: *mut c_char, size: usize, fmt: *const c_char) -> i32
 }
 
 pub fn service_compat_pending() {
-    const MAX_SERVICE_PASSES: usize = 16;
+    const MAX_SERVICE_PASSES: usize = 4;
 
     for _ in 0..MAX_SERVICE_PASSES {
         let usb_work = crate::usb::service_pending();
@@ -409,9 +463,16 @@ pub fn service_compat_pending() {
 }
 
 pub fn debug_irq_lock_snapshot() -> (usize, usize) {
-    let owners = IRQ_LOCK_OWNERS.lock();
+    let Some(owners) = IRQ_LOCK_OWNERS.try_lock() else {
+        return (
+            IRQ_LOCK_SNAPSHOT_OWNER_COUNT.load(Ordering::Acquire),
+            IRQ_LOCK_SNAPSHOT_TOTAL_DEPTH.load(Ordering::Acquire),
+        );
+    };
     let owner_count = owners.len();
     let total_depth = owners.iter().map(|state| state.depth).sum();
+    IRQ_LOCK_SNAPSHOT_OWNER_COUNT.store(owner_count, Ordering::Release);
+    IRQ_LOCK_SNAPSHOT_TOTAL_DEPTH.store(total_depth, Ordering::Release);
     (owner_count, total_depth)
 }
 

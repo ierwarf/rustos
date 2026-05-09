@@ -21,13 +21,49 @@ use crate::util::{
 
 const APPLICATIONS_DIR: &str = "usr/share/applications";
 const DRIVER_REGISTRY_PATH: &str = "system/registry/kernel/loadable-drivers.tsv";
+const ROOT_FILE_EXTENTS_REGISTRY_PATH: &str = "system/registry/kernel/root-file-extents.tsv";
 const DESKTOP_REGISTRY_PATH: &str = "system/registry/system/desktop-programs.tsv";
 const RUNTIME_LAUNCH_REGISTRY_PATH: &str = "system/registry/system/runtime-launch-programs.tsv";
 const STARTUP_REGISTRY_PATH: &str = "system/registry/system/startup-programs.tsv";
+const LINUX_RUNTIME_ACCESS_REGISTRY_PATH: &str = "system/registry/system/linux-runtime-access.tsv";
+const RUNTIME_ENV_REGISTRY_PATH: &str = "system/registry/system/runtime-env.tsv";
 const WINDOWS_DLL_REGISTRY_PATH: &str = "system/registry/compat/windows-system-dlls.txt";
 const LD_SO_CONF_PATH: &str = "etc/ld.so.conf";
-const LEGACY_BUILD_DIRS: &[&str] = &["EFI", "etc", "lib", "lib64", "linux", "SYSTEM"];
-const LEGACY_BUILD_FILES: &[&str] = &[
+const DEFAULT_RUNTIME_LIBRARY_DIRS: &[&str] = &["/lib", "/lib64", "/usr/lib", "/usr/lib64"];
+const DEFAULT_RUNTIME_LINKER_FILES: &[&str] =
+    &["/etc/ld.so.cache", "/etc/ld.so.preload", "/etc/ld.so.conf"];
+const DEFAULT_RUNTIME_LINKER_INCLUDE_DIR: &str = "/etc/ld.so.conf.d";
+const DEFAULT_RUNTIME_ASSET_DIRS: &[&str] = &[
+    "/usr/lib/locale",
+    "/usr/share/locale",
+    "/usr/lib/gconv",
+    "/usr/share/zoneinfo",
+];
+const DEFAULT_RUNTIME_ASSET_FILES: &[&str] = &[
+    "/etc/nsswitch.conf",
+    "/etc/hosts",
+    "/etc/resolv.conf",
+    "/etc/localtime",
+    "/system/registry/system/desktop-programs.tsv",
+    "/system/registry/system/startup-programs.tsv",
+    "/system/registry/system/runtime-launch-programs.tsv",
+];
+const DEFAULT_INIT_ENV: &[(&str, &str)] = &[
+    ("PATH", "/bin:/usr/bin:/usr/local/bin"),
+    ("HOME", "/home/user"),
+    ("XDG_RUNTIME_DIR", "/run/user/1000"),
+    ("WAYLAND_DISPLAY", "wayland-0"),
+];
+const DEFAULT_RUNTIME_ENV: &[(&str, &str)] = &[
+    ("PATH", "/bin:/usr/bin:/usr/local/bin"),
+    ("HOME", "/home/user"),
+    ("XDG_RUNTIME_DIR", "/run/user/1000"),
+    ("WAYLAND_DISPLAY", "wayland-0"),
+    ("XDG_SESSION_TYPE", "wayland"),
+    ("XDG_CURRENT_DESKTOP", "RustOS"),
+];
+const STALE_BUILD_DIRS: &[&str] = &["EFI", "etc", "lib", "lib64", "linux", "SYSTEM"];
+const STALE_BUILD_FILES: &[&str] = &[
     "kernel.elf",
     "nucleus.elf",
     "UISERVER.ELF",
@@ -41,7 +77,7 @@ const LEGACY_BUILD_FILES: &[&str] = &[
     "background.jpg",
     "sonic.gif",
 ];
-const LEGACY_ROOT_FILES: &[&str] = &["debugcon.log", "qemu_interrupt.log"];
+const STALE_ROOT_FILES: &[&str] = &["debugcon.log", "qemu_interrupt.log"];
 
 pub(crate) fn stage(config: &Config) -> Result<()> {
     let manifests = load_default_manifests(&config.root_dir)?;
@@ -70,6 +106,8 @@ pub(crate) fn stage(config: &Config) -> Result<()> {
     write_runtime_launch_registry(config, &manifests)?;
     write_startup_registry(config, &manifests)?;
     write_windows_dll_registry(config, &manifests)?;
+    write_linux_runtime_access_registry(config)?;
+    write_runtime_env_registry(config)?;
     generate_dynamic_linker_cache(&config.image_dir)?;
     write_boot_disk_image(config)?;
     Ok(())
@@ -185,15 +223,97 @@ fn write_boot_disk_image(config: &Config) -> Result<()> {
     let fs = fatfs::FileSystem::new(image, fatfs::FsOptions::new())?;
     {
         let root = fs.root_dir();
+        let mut extent_entries = Vec::new();
         for file in files {
             ensure_fat_parent_dirs(&root, &file.relative)?;
             let mut dst = root.create_file(file.relative.as_str())?;
             dst.truncate()?;
             copy_host_file_to_fat(&file.source, &mut dst)?;
             dst.flush()?;
+            extent_entries.push(BootDiskExtentEntry {
+                path: format!("/{}", file.relative),
+                len: file.len,
+                extents: collect_fat_file_extents(&mut dst)?,
+            });
         }
+        write_root_file_extents_registry(&root, &extent_entries)?;
     }
     fs.unmount()?;
+    Ok(())
+}
+
+struct BootDiskExtentEntry {
+    path: String,
+    len: u64,
+    extents: Vec<BootDiskFileExtent>,
+}
+
+struct BootDiskFileExtent {
+    offset: u64,
+    len: u64,
+}
+
+fn collect_fat_file_extents<D: fatfs::ReadWriteSeek>(
+    file: &mut fatfs::File<'_, D, fatfs::DefaultTimeProvider, fatfs::LossyOemCpConverter>,
+) -> Result<Vec<BootDiskFileExtent>>
+where
+    D::Error: std::error::Error + Send + Sync + 'static,
+{
+    let mut extents: Vec<BootDiskFileExtent> = Vec::new();
+    for extent in file.extents() {
+        let extent = extent?;
+        let len = u64::from(extent.size);
+        if len == 0 {
+            continue;
+        }
+        if let Some(last) = extents.last_mut()
+            && last.offset.saturating_add(last.len) == extent.offset
+        {
+            last.len = last.len.saturating_add(len);
+            continue;
+        }
+        extents.push(BootDiskFileExtent {
+            offset: extent.offset,
+            len,
+        });
+    }
+    Ok(extents)
+}
+
+fn write_root_file_extents_registry<D: fatfs::ReadWriteSeek>(
+    root: &fatfs::Dir<'_, D, fatfs::DefaultTimeProvider, fatfs::LossyOemCpConverter>,
+    entries: &[BootDiskExtentEntry],
+) -> Result<()>
+where
+    D::Error: std::error::Error + Send + Sync + 'static,
+{
+    ensure_fat_parent_dirs(root, ROOT_FILE_EXTENTS_REGISTRY_PATH)?;
+    if root.open_file(ROOT_FILE_EXTENTS_REGISTRY_PATH).is_ok() {
+        root.remove(ROOT_FILE_EXTENTS_REGISTRY_PATH)?;
+    }
+
+    let mut content = String::new();
+    for entry in entries {
+        content.push_str("path=");
+        content.push_str(registry_value(entry.path.as_str())?.as_str());
+        content.push_str("\tlen=");
+        content.push_str(entry.len.to_string().as_str());
+        content.push_str("\textents=");
+        for (index, extent) in entry.extents.iter().enumerate() {
+            if index != 0 {
+                content.push(',');
+            }
+            content.push_str(extent.offset.to_string().as_str());
+            content.push(':');
+            content.push_str(extent.len.to_string().as_str());
+        }
+        content.push('\n');
+    }
+
+    let mut file = root.create_file(ROOT_FILE_EXTENTS_REGISTRY_PATH)?;
+    file.truncate()?;
+    file.write_all(content.as_bytes())?;
+    file.flush()?;
     Ok(())
 }
 
@@ -298,8 +418,13 @@ fn write_driver_registry(config: &Config, manifests: &[PackageManifest]) -> Resu
         let aliases = registry_list(&autoload.aliases)?;
         let deps = registry_list(&autoload.deps)?;
         let softdeps = registry_list(&autoload.softdeps)?;
+        let linux_driver_names = if autoload.linux_driver_names.is_empty() {
+            registry_list(std::slice::from_ref(&autoload.name))?
+        } else {
+            registry_list(&autoload.linux_driver_names)?
+        };
         lines.push(format!(
-            "name={}\tclass={}\tbus={}\tpriority={}\tpath={}\twhen={}\taliases={}\tdeps={}\tsoftdeps={}\tprovider_group={}\tfallback_only={}",
+            "name={}\tclass={}\tbus={}\tpriority={}\tpath={}\twhen={}\taliases={}\tdeps={}\tsoftdeps={}\tlinux_driver_names={}\tprovider_group={}\tfallback_only={}",
             registry_value(&autoload.name)?,
             registry_value(&autoload.class)?,
             registry_value(&autoload.bus)?,
@@ -309,6 +434,7 @@ fn write_driver_registry(config: &Config, manifests: &[PackageManifest]) -> Resu
             aliases,
             deps,
             softdeps,
+            linux_driver_names,
             registry_value(autoload.provider_group.as_deref().unwrap_or(""))?,
             if autoload.fallback_only { 1 } else { 0 },
         ));
@@ -645,6 +771,66 @@ fn write_windows_dll_registry(config: &Config, manifests: &[PackageManifest]) ->
     write_registry_lines(config.image_dir.join(WINDOWS_DLL_REGISTRY_PATH), &lines)
 }
 
+fn write_linux_runtime_access_registry(config: &Config) -> Result<()> {
+    let mut policy = RuntimeAccessRegistry::default();
+    for dir in DEFAULT_RUNTIME_LIBRARY_DIRS {
+        policy.allow_dir(dir);
+    }
+    for file in DEFAULT_RUNTIME_LINKER_FILES {
+        policy.allow_file(file);
+    }
+    policy.allow_dir(DEFAULT_RUNTIME_LINKER_INCLUDE_DIR);
+    for dir in DEFAULT_RUNTIME_ASSET_DIRS {
+        policy.allow_dir(dir);
+    }
+    for file in DEFAULT_RUNTIME_ASSET_FILES {
+        policy.allow_file(file);
+    }
+
+    let mut visited = Vec::new();
+    load_runtime_linker_config_file(
+        &config.image_dir,
+        "/etc/ld.so.conf",
+        &mut policy,
+        &mut visited,
+    );
+
+    let mut lines = Vec::new();
+    for dir in policy.dirs {
+        lines.push(format!("kind=dir\tpath={}", registry_value(&dir)?));
+    }
+    for file in policy.files {
+        lines.push(format!("kind=file\tpath={}", registry_value(&file)?));
+    }
+    write_registry_lines(
+        config.image_dir.join(LINUX_RUNTIME_ACCESS_REGISTRY_PATH),
+        &lines,
+    )
+}
+
+fn write_runtime_env_registry(config: &Config) -> Result<()> {
+    let mut lines = Vec::new();
+    push_runtime_env_scope(&mut lines, "init", DEFAULT_INIT_ENV)?;
+    push_runtime_env_scope(&mut lines, "runtime", DEFAULT_RUNTIME_ENV)?;
+    write_registry_lines(config.image_dir.join(RUNTIME_ENV_REGISTRY_PATH), &lines)
+}
+
+fn push_runtime_env_scope(
+    lines: &mut Vec<String>,
+    scope: &str,
+    entries: &[(&str, &str)],
+) -> Result<()> {
+    for (key, value) in entries {
+        lines.push(format!(
+            "scope={}\tkey={}\tvalue={}",
+            registry_value(scope)?,
+            registry_value(key)?,
+            registry_value(value)?,
+        ));
+    }
+    Ok(())
+}
+
 fn write_registry_lines(path: PathBuf, lines: &[String]) -> Result<()> {
     let parent = path
         .parent()
@@ -673,9 +859,197 @@ fn registry_deps(deps: &[String]) -> Result<String> {
 fn registry_list(values: &[String]) -> Result<String> {
     values
         .iter()
-        .map(|value| registry_value(value))
+        .map(|value| {
+            if value.contains(',') {
+                bail!("registry list value contains unsupported separator: {value:?}");
+            }
+            registry_value(value)
+        })
         .collect::<Result<Vec<_>>>()
         .map(|values| values.join(","))
+}
+
+#[derive(Default)]
+struct RuntimeAccessRegistry {
+    dirs: Vec<String>,
+    files: Vec<String>,
+}
+
+impl RuntimeAccessRegistry {
+    fn allow_dir(&mut self, path: &str) {
+        let Some(path) = normalize_runtime_access_path(path) else {
+            return;
+        };
+        push_unique_string(&mut self.dirs, path);
+    }
+
+    fn allow_file(&mut self, path: &str) {
+        let Some(path) = normalize_runtime_access_path(path) else {
+            return;
+        };
+        push_unique_string(&mut self.files, path);
+    }
+}
+
+fn load_runtime_linker_config_file(
+    image_dir: &Path,
+    path: &str,
+    policy: &mut RuntimeAccessRegistry,
+    visited: &mut Vec<String>,
+) {
+    let Some(path) = normalize_runtime_access_path(path) else {
+        return;
+    };
+    if visited.iter().any(|current| current == &path) {
+        return;
+    }
+    visited.push(path.clone());
+    policy.allow_file(path.as_str());
+
+    let host_path = image_path_for_absolute(image_dir, path.as_str());
+    let Ok(text) = fs::read_to_string(&host_path) else {
+        return;
+    };
+    for raw_line in text.lines() {
+        let line = strip_runtime_config_comment(raw_line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(include_spec) = parse_runtime_config_include(line) {
+            load_runtime_linker_config_include(image_dir, include_spec, policy, visited);
+            continue;
+        }
+        policy.allow_dir(line);
+    }
+}
+
+fn load_runtime_linker_config_include(
+    image_dir: &Path,
+    include_spec: &str,
+    policy: &mut RuntimeAccessRegistry,
+    visited: &mut Vec<String>,
+) {
+    let Some(include_path) = normalize_runtime_access_path(include_spec) else {
+        return;
+    };
+    if !include_path.contains('*') {
+        load_runtime_linker_config_file(image_dir, include_path.as_str(), policy, visited);
+        return;
+    }
+
+    let (dir, pattern) = split_runtime_include_path(include_path.as_str());
+    let host_dir = image_path_for_absolute(image_dir, dir);
+    let Ok(entries) = fs::read_dir(&host_dir) else {
+        return;
+    };
+    let mut names = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect::<Vec<_>>();
+    names.sort();
+    for name in names {
+        if !runtime_config_pattern_matches(pattern, name.as_str()) {
+            continue;
+        }
+        let child = if dir == "/" {
+            format!("/{name}")
+        } else {
+            format!("{dir}/{name}")
+        };
+        load_runtime_linker_config_file(image_dir, child.as_str(), policy, visited);
+    }
+}
+
+fn image_path_for_absolute(image_dir: &Path, path: &str) -> PathBuf {
+    image_dir.join(path.trim_start_matches('/'))
+}
+
+fn normalize_runtime_access_path(path: &str) -> Option<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || !trimmed.starts_with('/') {
+        return None;
+    }
+
+    let mut components = Vec::new();
+    for component in trimmed.split('/') {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if component == ".." {
+            components.pop();
+            continue;
+        }
+        components.push(component);
+    }
+
+    let mut normalized = String::from("/");
+    for (index, component) in components.iter().enumerate() {
+        if index != 0 {
+            normalized.push('/');
+        }
+        normalized.push_str(component);
+    }
+    Some(normalized)
+}
+
+fn split_runtime_include_path(path: &str) -> (&str, &str) {
+    path.rsplit_once('/').unwrap_or(("/", path))
+}
+
+fn strip_runtime_config_comment(line: &str) -> &str {
+    line.split_once('#')
+        .map(|(before, _)| before)
+        .unwrap_or(line)
+}
+
+fn parse_runtime_config_include(line: &str) -> Option<&str> {
+    let mut parts = line.split_whitespace();
+    let directive = parts.next()?;
+    if directive != "include" {
+        return None;
+    }
+    parts.next()
+}
+
+fn runtime_config_pattern_matches(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let text = text.as_bytes();
+    let (mut p, mut t) = (0usize, 0usize);
+    let mut star = None;
+    let mut retry_t = 0usize;
+
+    while t < text.len() {
+        if p < pattern.len() && pattern[p] == text[t] {
+            p += 1;
+            t += 1;
+            continue;
+        }
+        if p < pattern.len() && pattern[p] == b'*' {
+            star = Some(p);
+            p += 1;
+            retry_t = t;
+            continue;
+        }
+        if let Some(star_index) = star {
+            p = star_index + 1;
+            retry_t += 1;
+            t = retry_t;
+            continue;
+        }
+        return false;
+    }
+
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
+fn push_unique_string(dest: &mut Vec<String>, value: String) {
+    if dest.iter().any(|current| current == &value) {
+        return;
+    }
+    dest.push(value);
 }
 
 fn path_join_unix(prefix: &str, suffix: &Path) -> Result<String> {
@@ -687,17 +1061,19 @@ fn path_join_unix(prefix: &str, suffix: &Path) -> Result<String> {
 }
 
 fn cleanup_legacy_build_layout(config: &Config) -> Result<()> {
-    for relative in LEGACY_BUILD_DIRS {
+    // Keep staging cleanup bounded to known stale paths; a broad build tree walk
+    // makes `cargo xtask stage` slower and can remove still-valid artifacts.
+    for relative in STALE_BUILD_DIRS {
         remove_dir_if_exists(&config.build_dir.join(relative))?;
     }
 
     remove_file_if_exists(&config.image_dir.join("startup.nsh"))?;
 
-    for relative in LEGACY_BUILD_FILES {
+    for relative in STALE_BUILD_FILES {
         remove_file_if_exists(&config.build_dir.join(relative))?;
     }
 
-    for relative in LEGACY_ROOT_FILES {
+    for relative in STALE_ROOT_FILES {
         remove_file_if_exists(&config.root_dir.join(relative))?;
     }
 
@@ -760,5 +1136,12 @@ mod tests {
             registry_list(&aliases).unwrap(),
             "virtio:d00000010v*,platform:bootfb"
         );
+    }
+
+    #[test]
+    fn registry_list_rejects_embedded_commas() {
+        let aliases = vec!["virtio:d00000010v*,platform:bootfb".to_string()];
+
+        assert!(registry_list(&aliases).is_err());
     }
 }

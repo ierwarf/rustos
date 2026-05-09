@@ -29,9 +29,11 @@ pub const DEFAULT_STARTUP_REGISTRY_PATH: &str = "/system/registry/system/startup
 pub const DEFAULT_DESKTOP_REGISTRY_PATH: &str = "/system/registry/system/desktop-programs.tsv";
 pub const DEFAULT_RUNTIME_LAUNCH_REGISTRY_PATH: &str =
     "/system/registry/system/runtime-launch-programs.tsv";
+pub const DEFAULT_RUNTIME_ENV_REGISTRY_PATH: &str = "/system/registry/system/runtime-env.tsv";
 
 static STARTUP_REGISTRY_CACHE: OnceLock<Option<Vec<StartupEntry>>> = OnceLock::new();
 static DESKTOP_REGISTRY_CACHE: OnceLock<Option<Vec<DesktopProgramEntry>>> = OnceLock::new();
+static RUNTIME_ENV_REGISTRY_CACHE: OnceLock<Option<Vec<RuntimeEnvEntry>>> = OnceLock::new();
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -129,6 +131,28 @@ pub struct DesktopProgramEntry {
     pub runtime_deps: Vec<String>,
     pub hidden: bool,
     pub no_display: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeEnvScope {
+    Init,
+    Runtime,
+}
+
+impl RuntimeEnvScope {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Init => "init",
+            Self::Runtime => "runtime",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct RuntimeEnvEntry {
+    scope: String,
+    key: String,
+    value: String,
 }
 
 pub struct RuntimeClient {
@@ -340,6 +364,27 @@ pub fn load_runtime_launch_program_entries(
     Ok(entries)
 }
 
+pub fn load_runtime_default_env(
+    path: &str,
+    scope: RuntimeEnvScope,
+) -> Result<Vec<String>, std::io::Error> {
+    let entries = if path == DEFAULT_RUNTIME_ENV_REGISTRY_PATH {
+        cached_runtime_env_registry_entries().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "runtime env registry unavailable",
+            )
+        })?
+    } else {
+        load_runtime_env_registry_entries(path)?
+    };
+    Ok(entries
+        .into_iter()
+        .filter(|entry| entry.scope == scope.as_str())
+        .map(|entry| format!("{}={}", entry.key, entry.value))
+        .collect())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DesktopLoadMode {
     Applications,
@@ -428,6 +473,44 @@ fn cached_desktop_registry_entries() -> Option<Vec<DesktopProgramEntry>> {
     DESKTOP_REGISTRY_CACHE
         .get_or_init(|| load_desktop_registry_entries(DEFAULT_DESKTOP_REGISTRY_PATH).ok())
         .clone()
+}
+
+fn cached_runtime_env_registry_entries() -> Option<Vec<RuntimeEnvEntry>> {
+    RUNTIME_ENV_REGISTRY_CACHE
+        .get_or_init(|| load_runtime_env_registry_entries(DEFAULT_RUNTIME_ENV_REGISTRY_PATH).ok())
+        .clone()
+}
+
+fn load_runtime_env_registry_entries(path: &str) -> Result<Vec<RuntimeEnvEntry>, std::io::Error> {
+    let contents = fs::read_to_string(path)?;
+    let mut entries = Vec::new();
+
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(entry) = parse_runtime_env_registry_entry(line) {
+            entries.push(entry);
+        }
+    }
+
+    entries.sort();
+    Ok(entries)
+}
+
+fn parse_runtime_env_registry_entry(line: &str) -> Option<RuntimeEnvEntry> {
+    let scope = registry_field(line, "scope")?;
+    let key = registry_field(line, "key")?;
+    let value = registry_field(line, "value")?;
+    if !valid_env_key(key) || value.as_bytes().contains(&0) {
+        return None;
+    }
+    Some(RuntimeEnvEntry {
+        scope: scope.to_string(),
+        key: key.to_string(),
+        value: value.to_string(),
+    })
 }
 
 fn parse_startup_registry_entry(line: &str) -> Option<StartupEntry> {
@@ -732,6 +815,13 @@ fn registry_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
         let (candidate, value) = token.split_once('=')?;
         (candidate == key).then_some(value)
     })
+}
+
+fn valid_env_key(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .bytes()
+            .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
 }
 
 fn fallback_startup_desktop_file_id(exec: &str) -> String {

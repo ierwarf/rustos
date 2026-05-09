@@ -4,7 +4,10 @@
 mod api;
 
 #[cfg(feature = "module-image")]
-use driver_abi::{DriverBus, DriverClass, DriverKernelApiV1, DriverModuleHeader};
+use driver_abi::{
+    DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER, DriverBus, DriverClass, DriverKernelApiV1,
+    DriverModuleHeader,
+};
 
 pub const BOOTFB_DRIVER_NAME: &str = "bootfb";
 pub const BOOTFB_DRIVER_MODULE_PATH: &str = "system/drivers/display/bootfb.ko";
@@ -31,13 +34,14 @@ pub extern "C" fn rustos_driver_init(api: *const DriverKernelApiV1) -> i32 {
         return -22;
     }
 
-    let framebuffer = match api::query_boot_framebuffer() {
+    let mut framebuffer = match api::query_boot_framebuffer() {
         Ok(framebuffer) => framebuffer,
         Err(status) => {
             api::log_warn("bootfb: boot framebuffer query failed");
             return status;
         }
     };
+    framebuffer.flags |= DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER;
 
     if let Err(status) = api::register_display_framebuffer(&framebuffer) {
         api::log_warn("bootfb: framebuffer registration failed");

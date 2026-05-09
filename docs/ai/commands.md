@@ -9,7 +9,7 @@ Use from repo root.
 | `cargo xtask stage` | restage built artifacts | `build/image` | missing required artifact, bad install path |
 | `cargo xtask run` | boot current image in QEMU | `logs/`, temp dirs | missing `build/image`, missing OVMF, QEMU failure |
 | `cargo xtask debug` | QEMU with GDB stub | `logs/rustos-debug.gdb` | same as run plus debug setup |
-| `cargo xtask probe-display` | headless display probe | `logs/` | display/surface/present regression |
+| `cargo xtask probe-display` | headless display probe with screendump geometry and non-black frame validation | `logs/` | display/surface/present regression |
 | `cargo xtask build-user` | userspace packages only | `target/`, `build/artifacts` | service/app compile error |
 | `cargo xtask build-driver-modules` | bridge modules only | `target/`, `build/artifacts` | driver/module build error |
 | `cargo test -p module-tests` | module tests | `target/` | unit/module regression |

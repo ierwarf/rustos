@@ -151,6 +151,14 @@ impl HandleTable {
         self.entries.get_mut(index)?.as_mut()
     }
 
+    pub fn display_surface_count(&self) -> usize {
+        self.entries
+            .iter()
+            .flatten()
+            .filter(|entry| matches!(entry.handle(), KernelHandle::DisplaySurface(_)))
+            .count()
+    }
+
     pub fn ensure_entry_capacity(&mut self, index: usize) {
         if self.entries.len() <= index {
             self.entries.resize_with(index + 1, || None);
@@ -423,6 +431,28 @@ mod tests {
         let target_fd = table.duplicate_exact(source_fd, 10, false).expect("dup");
 
         assert_eq!(table.get_entry(target_fd).expect("target").rights(), rights);
+    }
+
+    #[test]
+    fn display_surface_count_ignores_other_handle_kinds() {
+        let mut table = HandleTable::new();
+        assert_eq!(table.display_surface_count(), 0);
+
+        table.install(KernelHandle::VfsFile(VfsFileHandle::read_only_memory(
+            "/file".into(),
+            vec![1],
+        )));
+        assert_eq!(table.display_surface_count(), 0);
+
+        let surface = super::DisplaySurfaceHandle::new(
+            16,
+            16,
+            crate::user::abi::device::PIXEL_FORMAT_BGRA8888,
+            1,
+        )
+        .expect("surface");
+        table.install(KernelHandle::DisplaySurface(surface));
+        assert_eq!(table.display_surface_count(), 1);
     }
 
     #[test]

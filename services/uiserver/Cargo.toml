@@ -9,6 +9,7 @@ fontdue = "0.9.3"
 
 [dependencies]
 observability-client = { path = "../../libs/observability-client" }
+rustos-user-abi = { path = "../../libs/rustos-user-abi" }
 embedded-graphics = "0.8"
 keyboard-core = { path = "../../drivers/libs/keyboard-core" }
 runtime-control = { path = "../../libs/runtime-control" }

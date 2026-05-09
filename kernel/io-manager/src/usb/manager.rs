@@ -7,7 +7,7 @@ use super::emulation;
 use super::host::{UsbHostControllerInfo, controller_kind_name};
 use super::xhci;
 
-const USB_SERVICE_ROUNDS: usize = 8;
+const USB_SERVICE_ROUNDS: usize = 2;
 
 struct UsbRuntimeState {
     controllers: Vec<UsbHostControllerInfo>,

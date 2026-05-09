@@ -4,13 +4,13 @@ use core::ffi::c_void;
 use core::slice;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use driver_abi::{SERIO_ANY, SerioDeviceId, SerioDriverRegistration, SerioPortInfo};
+use driver_abi::{SerioDeviceId, SerioDriverRegistration, SerioPortInfo, SERIO_ANY};
 use spin::Mutex;
 use x86_64::instructions::interrupts;
 
 use super::linux::compat::{
-    LinuxCompatSerio, LinuxCompatSerioCloseFn, LinuxCompatSerioDeviceId, LinuxCompatSerioDriver,
-    LinuxCompatSerioOpenFn, LinuxCompatSerioWriteFn, compat_cstr,
+    compat_cstr, LinuxCompatSerio, LinuxCompatSerioCloseFn, LinuxCompatSerioDeviceId,
+    LinuxCompatSerioDriver, LinuxCompatSerioOpenFn, LinuxCompatSerioWriteFn,
 };
 
 #[derive(Clone, Copy, Default)]

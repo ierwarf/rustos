@@ -1,17 +1,26 @@
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
 
 use runtime_control::{load_desktop_program_entries, StartupMode, DEFAULT_APPLICATIONS_DIR};
 
 use super::{
-    align_up, AppState, DesktopSurfaceCache, LauncherProgram, MAX_DISPLAY_HEIGHT,
+    align_up, AppState, CursorMotion, DesktopSurfaceCache, LauncherProgram, MAX_DISPLAY_HEIGHT,
     MAX_DISPLAY_WIDTH, PAGE_SIZE,
 };
 use crate::sys::{
     boot_line, diag_line, display_create_surface, display_get_info, display_present,
     display_present_rect, map_surface, open_console, open_display, open_input, DisplayInfo,
-    DisplaySurfaceCreate, ESTALE, PIXEL_FORMAT_BGRA8888,
+    DisplaySurfaceCreate, SurfaceMapping, ESTALE, PIXEL_FORMAT_BGRA8888,
 };
 const SURFACE_CREATE_RETRIES: usize = 4;
+
+struct DisplaySurfaceState {
+    display: DisplayInfo,
+    surface: DisplaySurfaceCreate,
+    surface_fd: OwnedFd,
+    frame: SurfaceMapping,
+}
 
 fn validate_display_info(display: &DisplayInfo) -> Result<usize, i32> {
     if display.width == 0
@@ -21,6 +30,7 @@ fn validate_display_info(display: &DisplayInfo) -> Result<usize, i32> {
         || display.bytes_per_pixel != 4
         || display.pixel_format != PIXEL_FORMAT_BGRA8888
         || display.generation == 0
+        || !display.is_primary_provider()
     {
         diag_line("uiserver: unsupported display format");
         return Err(14);
@@ -107,17 +117,7 @@ fn validate_surface_metadata(
     Ok(surface_mapping_len)
 }
 
-fn fetch_surface_state(
-    display_fd: i32,
-) -> Result<
-    (
-        DisplayInfo,
-        DisplaySurfaceCreate,
-        OwnedFd,
-        crate::sys::SurfaceMapping,
-    ),
-    i32,
-> {
+fn fetch_surface_state(display_fd: i32) -> Result<DisplaySurfaceState, i32> {
     for attempt in 0..SURFACE_CREATE_RETRIES {
         let display = display_get_info(display_fd).map_err(|_| {
             diag_line("uiserver: display_get_info failed");
@@ -125,13 +125,14 @@ fn fetch_surface_state(
         })?;
         diag_line(
             format!(
-                "uiserver: display_get_info attempt={} width={} height={} stride={} bpp={} fmt={} gen={}",
+                "uiserver: display_get_info attempt={} width={} height={} stride={} bpp={} fmt={} flags={:#x} gen={}",
                 attempt + 1,
                 display.width,
                 display.height,
                 display.stride_bytes,
                 display.bytes_per_pixel,
                 display.pixel_format,
+                display.flags,
                 display.generation,
             )
             .as_str(),
@@ -187,7 +188,12 @@ fn fetch_surface_state(
             diag_line("uiserver: map_surface failed");
             17
         })?;
-        return Ok((display, surface, surface_fd, frame));
+        return Ok(DisplaySurfaceState {
+            display,
+            surface,
+            surface_fd,
+            frame,
+        });
     }
 
     diag_line("uiserver: display surface generation kept changing");
@@ -216,34 +222,36 @@ impl AppState {
         boot_line("uiserver: init open_console done");
 
         boot_line("uiserver: init fetch_surface begin");
-        let (display, surface, surface_fd, frame) = fetch_surface_state(display_fd.as_raw_fd())?;
+        let surface_state = fetch_surface_state(display_fd.as_raw_fd())?;
         boot_line("uiserver: init fetch_surface done");
         diag_line(
             format!(
                 "uiserver: init surface meta display={}x{} stride={} gen={} surface={}x{} stride={} handle={} map_len={} gen={}",
-                display.width,
-                display.height,
-                display.stride_bytes,
-                display.generation,
-                surface.width,
-                surface.height,
-                surface.stride_bytes,
-                surface.handle,
-                surface.mapping_len,
-                surface.generation,
+                surface_state.display.width,
+                surface_state.display.height,
+                surface_state.display.stride_bytes,
+                surface_state.display.generation,
+                surface_state.surface.width,
+                surface_state.surface.height,
+                surface_state.surface.stride_bytes,
+                surface_state.surface.handle,
+                surface_state.surface.mapping_len,
+                surface_state.surface.generation,
             )
             .as_str(),
         );
         Ok(Self {
-            display,
-            surface,
+            display: surface_state.display,
+            surface: surface_state.surface,
             display_fd,
             input_fds,
             console_fd,
-            surface_fd,
-            frame,
-            cursor_x: display.width / 2,
-            cursor_y: display.height / 2,
+            surface_fd: surface_state.surface_fd,
+            frame: surface_state.frame,
+            cursor_x: surface_state.display.width / 2,
+            cursor_y: surface_state.display.height / 2,
+            cursor_motion: CursorMotion::stationary(),
+            cursor_motion_hold_ticks: 0,
             left_button_down: false,
             focused_session_handle: 0,
             focused_wayland_surface_id: None,
@@ -260,12 +268,11 @@ impl AppState {
     }
 
     pub(crate) fn refresh_display_surface(&mut self) -> Result<(), i32> {
-        let (display, surface, surface_fd, frame) =
-            fetch_surface_state(self.display_fd.as_raw_fd())?;
-        self.display = display;
-        self.surface = surface;
-        self.surface_fd = surface_fd;
-        self.frame = frame;
+        let surface_state = fetch_surface_state(self.display_fd.as_raw_fd())?;
+        self.display = surface_state.display;
+        self.surface = surface_state.surface;
+        self.surface_fd = surface_state.surface_fd;
+        self.frame = surface_state.frame;
         self.cursor_x = self.cursor_x.min(self.display.width.saturating_sub(1));
         self.cursor_y = self.cursor_y.min(self.display.height.saturating_sub(1));
         self.dragging_window = None;
@@ -314,8 +321,10 @@ impl AppState {
         Ok(true)
     }
 
-    pub(crate) fn populate_launcher_programs(&mut self) -> bool {
-        let launcher_programs = load_launcher_programs();
+    pub(crate) fn apply_launcher_programs(
+        &mut self,
+        launcher_programs: Vec<LauncherProgram>,
+    ) -> bool {
         if launcher_programs == self.launcher_programs {
             return false;
         }
@@ -323,6 +332,14 @@ impl AppState {
         self.desktop_cache.valid = false;
         true
     }
+}
+
+pub(crate) fn start_launcher_program_loader() -> Receiver<Vec<LauncherProgram>> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(load_launcher_programs());
+    });
+    receiver
 }
 
 fn load_launcher_programs() -> Vec<LauncherProgram> {

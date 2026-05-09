@@ -3,14 +3,6 @@ use core::ffi::{c_char, c_void};
 static COMPAT_DATA: [usize; 64] = [0; 64];
 static COMPAT_VIDEO_FIRMWARE_DRIVERS_ONLY: i32 = 0;
 
-unsafe extern "C" fn compat_zero() -> usize {
-    0
-}
-
-unsafe extern "C" fn compat_null() -> *mut c_void {
-    core::ptr::null_mut()
-}
-
 unsafe extern "C" fn compat_printk(_fmt: *const c_char) -> i32 {
     0
 }
@@ -76,8 +68,6 @@ pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
         "video_firmware_drivers_only" => {
             Some((&COMPAT_VIDEO_FIRMWARE_DRIVERS_ONLY as *const i32) as usize)
         }
-        _ if is_stubbed_virtio_drm_pointer_symbol(name) => Some(compat_null as *const () as usize),
-        _ if is_stubbed_virtio_drm_symbol(name) => Some(compat_zero as *const () as usize),
         _ => None,
     }
 }
@@ -129,94 +119,4 @@ fn is_virtio_drm_data_symbol(name: &str) -> bool {
                 | "drm_gem_shmem_vm_ops"
                 | "vmemmap_base"
         )
-}
-
-fn is_stubbed_virtio_drm_symbol(name: &str) -> bool {
-    name.starts_with("drm_")
-        || name.starts_with("__drm_")
-        || name.starts_with("__drmm_")
-        || name.starts_with("__devm_")
-        || name.starts_with("__dma_")
-        || name.starts_with("__ubsan_")
-        || name.starts_with("__vma_")
-        || name.starts_with("drmm_")
-        || name.starts_with("dma_buf_")
-        || name.starts_with("dma_fence_")
-        || name.starts_with("dma_resv_")
-        || name.starts_with("virtio_")
-        || name.starts_with("virtqueue_")
-        || name.starts_with("sync_file_")
-        || name.starts_with("ww_mutex_")
-        || name.starts_with("trace_event_")
-        || name.starts_with("perf_trace_")
-        || name.starts_with("bpf_trace_")
-        || name.starts_with("sg_")
-        || name.starts_with("seq_")
-        || name.starts_with("__traceiter_")
-        || name.starts_with("__probestub_")
-        || matches!(
-            name,
-            "aperture_remove_conflicting_pci_devices"
-                | "___ratelimit"
-                | "cachemode2protval"
-                | "cc_mkdec"
-                | "__kmem_cache_create_args"
-                | "kmem_cache_alloc_noprof"
-                | "kmem_cache_destroy"
-                | "kmem_cache_free"
-                | "strncpy_from_user"
-                | "dma_map_resource"
-                | "dma_max_mapping_size"
-                | "dma_unmap_resource"
-                | "fd_install"
-                | "finish_wait"
-                | "flush_work"
-                | "fput"
-                | "get_unused_fd_flags"
-                | "ida_alloc_range"
-                | "ida_free"
-                | "is_vmalloc_addr"
-                | "noop_llseek"
-                | "pci_dev_put"
-                | "pci_get_device"
-                | "pci_is_vga"
-                | "pgprot_writecombine"
-                | "put_unused_fd"
-                | "remap_pfn_range"
-                | "schedule"
-                | "schedule_timeout"
-                | "sync_file_create"
-                | "sync_file_get_fence"
-                | "trace_handle_return"
-                | "trace_raw_output_prep"
-                | "validate_usercopy_range"
-                | "vga_get"
-                | "vga_get_interruptible"
-                | "vga_put"
-                | "vm_get_page_prot"
-                | "vmalloc_to_page"
-                | "__trace_trigger_soft_disabled"
-                | "__wake_up"
-                | "init_wait_entry"
-                | "prepare_to_wait_event"
-                | "queue_work_on"
-        )
-}
-
-fn is_stubbed_virtio_drm_pointer_symbol(name: &str) -> bool {
-    matches!(
-        name,
-        "drm_edid_read_custom"
-            | "drm_gem_object_lookup"
-            | "drm_gem_prime_import"
-            | "drm_gem_shmem_create"
-            | "drm_syncobj_find"
-            | "drm_syncobj_find_fence"
-            | "dma_buf_dynamic_attach"
-            | "dma_buf_map_attachment"
-            | "dma_fence_unwrap_first"
-            | "dma_fence_unwrap_next"
-            | "memdup_user"
-            | "vmemdup_user"
-    )
 }

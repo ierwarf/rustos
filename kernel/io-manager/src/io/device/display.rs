@@ -14,6 +14,7 @@ use crate::user::process_state::UserProcessState;
 use super::{DeviceError, read_user_struct, write_user_struct};
 
 const MAX_PRESENT_SURFACE_SAMPLE_LOGS: usize = 8;
+const MAX_DISPLAY_SURFACES_PER_PROCESS: usize = 4;
 
 static PRESENT_SURFACE_SAMPLE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -27,15 +28,14 @@ pub enum DisplayError {
 
 pub(crate) fn snapshot_info_local() -> Option<DisplayInfo> {
     let info = gui::display_info()?;
-    Some(DisplayInfo {
-        width: info.width,
-        height: info.height,
-        stride_bytes: info.stride_bytes,
-        bytes_per_pixel: info.bytes_per_pixel,
-        pixel_format: PIXEL_FORMAT_BGRA8888,
-        reserved: 0,
-        generation: info.generation,
-    })
+    Some(DisplayInfo::bgra8888(
+        info.width,
+        info.height,
+        info.stride_bytes,
+        info.bytes_per_pixel,
+        info.generation,
+        info.flags,
+    ))
 }
 
 pub(crate) fn snapshot_info() -> Option<DisplayInfo> {
@@ -65,10 +65,18 @@ pub(crate) fn ioctl(
             let mut create =
                 read_user_struct::<DisplaySurfaceCreate>(process_state.address_space(), arg)?;
             let display = snapshot_info().ok_or(DeviceError::DisplayUnavailable)?;
+            if !display.is_primary_provider() {
+                return Err(DeviceError::DisplayUnavailable);
+            }
             if create.width != display.width
                 || create.height != display.height
                 || create.pixel_format != PIXEL_FORMAT_BGRA8888
+                || create.flags != 0
+                || create.reserved != 0
             {
+                return Err(DeviceError::InvalidArgument);
+            }
+            if process_state.handles().display_surface_count() >= MAX_DISPLAY_SURFACES_PER_PROCESS {
                 return Err(DeviceError::InvalidArgument);
             }
             let surface = create_surface_local(
@@ -93,6 +101,9 @@ pub(crate) fn ioctl(
         device::DISPLAY_IOCTL_PRESENT => {
             let request =
                 read_user_struct::<DisplayPresentRequest>(process_state.address_space(), arg)?;
+            if request.reserved != 0 {
+                return Err(DeviceError::InvalidArgument);
+            }
             let surface_fd = u64::from(request.surface_handle);
             let surface = match process_state.handles().get(surface_fd) {
                 Some(KernelHandle::DisplaySurface(surface)) => *surface,
@@ -104,6 +115,9 @@ pub(crate) fn ioctl(
         device::DISPLAY_IOCTL_PRESENT_RECT => {
             let request =
                 read_user_struct::<DisplayPresentRectRequest>(process_state.address_space(), arg)?;
+            if request.reserved != 0 {
+                return Err(DeviceError::InvalidArgument);
+            }
             let surface_fd = u64::from(request.surface_handle);
             let surface = match process_state.handles().get(surface_fd) {
                 Some(KernelHandle::DisplaySurface(surface)) => *surface,
@@ -315,10 +329,14 @@ fn create_surface_local(
     width: u32,
     height: u32,
     pixel_format: u32,
-    _flags: u32,
+    flags: u32,
     display: DisplayInfo,
 ) -> Option<DisplaySurfaceHandle> {
-    if width != display.width || height != display.height || pixel_format != display.pixel_format {
+    if flags != 0
+        || width != display.width
+        || height != display.height
+        || pixel_format != display.pixel_format
+    {
         return None;
     }
 

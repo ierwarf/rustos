@@ -9,18 +9,17 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use runtime_control::{
-    load_desktop_program_entries, load_runtime_launch_program_entries, DesktopProgramEntry,
-    RuntimeRunningProgram, StartupMode, DEFAULT_APPLICATIONS_DIR,
+    load_desktop_program_entries, load_runtime_default_env, load_runtime_launch_program_entries,
+    DesktopProgramEntry, RuntimeEnvScope, RuntimeRunningProgram, StartupMode,
+    DEFAULT_APPLICATIONS_DIR, DEFAULT_RUNTIME_ENV_REGISTRY_PATH,
     DEFAULT_RUNTIME_LAUNCH_REGISTRY_PATH, DEFAULT_RUNTIME_SOCKET_PATH,
 };
+use rustos_user_abi::console::{
+    self as console_abi, ConsoleCloseSessionRequest, ConsoleCreateSessionRequest,
+    ConsoleSetFocusRequest, ConsoleSetSessionStateRequest,
+};
 
-const WAYLAND_DISPLAY: &str = "WAYLAND_DISPLAY=wayland-0";
-const DEFAULT_XDG_RUNTIME_DIR_ENV: &str = "XDG_RUNTIME_DIR=/run/user/1000";
-const DEFAULT_PATH_ENV: &str = "PATH=/bin:/usr/bin:/usr/local/bin";
-const DEFAULT_HOME_ENV: &str = "HOME=/home/user";
 const DEFAULT_USER_TASK_WEIGHT_MICROS: u64 = 50;
-const XDG_SESSION_TYPE: &str = "XDG_SESSION_TYPE=wayland";
-const XDG_CURRENT_DESKTOP: &str = "XDG_CURRENT_DESKTOP=RustOS";
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const RETRY_BACKOFF: Duration = Duration::from_secs(1);
 const PROTOCOL_VERSION: u16 = 1;
@@ -37,29 +36,17 @@ const MAX_RUNTIME_PROGRAMS: usize = 64;
 const MAX_EXEC_ARG_COUNT: usize = 32;
 const MAX_EXEC_ENV_COUNT: usize = 64;
 const MAX_EXEC_TEXT_BYTES: usize = 256;
-const DEFAULT_EXEC_ENV_COUNT: usize = 6;
 const SYS_IOCTL: usize = 16;
 const SYS_OPENAT: usize = 257;
 const AT_FDCWD: isize = -100;
 const O_RDWR: usize = 2;
-const LINUX_IOC_NRBITS: usize = 8;
-const LINUX_IOC_TYPEBITS: usize = 8;
-const LINUX_IOC_SIZEBITS: usize = 14;
-const LINUX_IOC_NRSHIFT: usize = 0;
-const LINUX_IOC_TYPESHIFT: usize = LINUX_IOC_NRSHIFT + LINUX_IOC_NRBITS;
-const LINUX_IOC_SIZESHIFT: usize = LINUX_IOC_TYPESHIFT + LINUX_IOC_TYPEBITS;
-const LINUX_IOC_DIRSHIFT: usize = LINUX_IOC_SIZESHIFT + LINUX_IOC_SIZEBITS;
-const LINUX_IOC_WRITE: usize = 1;
-const LINUX_IOC_READ: usize = 2;
-const CONSOLE_IOCTL_TYPE: u8 = b'C';
-const CONSOLE_SESSION_STATE_LOADING_IMAGE: u16 = 2;
-const CONSOLE_SESSION_STATE_SPAWNING: u16 = 3;
-const CONSOLE_SESSION_STATE_RUNNING: u16 = 4;
-const CONSOLE_PATH: &str = "/dev/console0";
+const CONSOLE_SESSION_STATE_LOADING_IMAGE: u16 = console_abi::CONSOLE_SESSION_STATE_LOADING_IMAGE;
+const CONSOLE_SESSION_STATE_SPAWNING: u16 = console_abi::CONSOLE_SESSION_STATE_SPAWNING;
+const CONSOLE_SESSION_STATE_RUNNING: u16 = console_abi::CONSOLE_SESSION_STATE_RUNNING;
+const CONSOLE_PATH: &str = console_abi::CONSOLE_PATH;
 const UI_SERVER_DESKTOP_FILE_ID: &str = "uiserver.desktop";
 const UI_SERVER_DISPLAY_NAME: &str = "UI Server";
 const UI_SERVER_EXEC_PATH: &str = "services/uiserver/uiserver.elf";
-const BOOT_TRACE_ENABLED: bool = true;
 const SYS_RUSTOS_SPAWN_EXEC: libc::c_long = 0x5255_0002;
 
 #[repr(C)]
@@ -95,21 +82,6 @@ struct RuntimeResponse {
     op: u16,
     status: i32,
     count: u32,
-}
-
-const fn linux_ioc(dir: usize, type_: u8, nr: u8, size: usize) -> usize {
-    (dir << LINUX_IOC_DIRSHIFT)
-        | ((type_ as usize) << LINUX_IOC_TYPESHIFT)
-        | ((nr as usize) << LINUX_IOC_NRSHIFT)
-        | (size << LINUX_IOC_SIZESHIFT)
-}
-
-const fn linux_iow<T>(type_: u8, nr: u8) -> usize {
-    linux_ioc(LINUX_IOC_WRITE, type_, nr, size_of::<T>())
-}
-
-const fn linux_iowr<T>(type_: u8, nr: u8) -> usize {
-    linux_ioc(LINUX_IOC_READ | LINUX_IOC_WRITE, type_, nr, size_of::<T>())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -165,7 +137,7 @@ struct BrokerState {
 }
 
 fn boot_line(message: &str) {
-    if !BOOT_TRACE_ENABLED {
+    if option_env!("RUSTOS_LOGGING_BOOT_TRACE_ENABLED") != Some("true") {
         return;
     }
     let _ = std::io::stderr().write_all(message.as_bytes());
@@ -1232,18 +1204,22 @@ fn build_exec_argv(exec_path: &str, argv: &[String]) -> Vec<CString> {
 }
 
 fn build_exec_env(extra_env: &[String]) -> Vec<CString> {
+    let default_env =
+        load_runtime_default_env(DEFAULT_RUNTIME_ENV_REGISTRY_PATH, RuntimeEnvScope::Runtime)
+            .unwrap_or_default();
+    build_exec_env_with_defaults(extra_env, &default_env)
+}
+
+fn build_exec_env_with_defaults(extra_env: &[String], default_env: &[String]) -> Vec<CString> {
     let mut env = extra_env
         .iter()
         .filter(|item| valid_exec_text(item.as_str(), true))
-        .take(MAX_EXEC_ENV_COUNT.saturating_sub(DEFAULT_EXEC_ENV_COUNT))
+        .take(MAX_EXEC_ENV_COUNT)
         .cloned()
         .collect::<Vec<_>>();
-    push_env_if_missing(&mut env, DEFAULT_PATH_ENV);
-    push_env_if_missing(&mut env, DEFAULT_HOME_ENV);
-    push_env_if_missing(&mut env, DEFAULT_XDG_RUNTIME_DIR_ENV);
-    push_env_if_missing(&mut env, WAYLAND_DISPLAY);
-    push_env_if_missing(&mut env, XDG_SESSION_TYPE);
-    push_env_if_missing(&mut env, XDG_CURRENT_DESKTOP);
+    for item in default_env {
+        push_env_if_missing(&mut env, item);
+    }
     env.into_iter()
         .filter_map(|item| CString::new(item).ok())
         .collect()
@@ -1293,10 +1269,7 @@ fn valid_env_assignment(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_exec_argv, build_exec_env, DEFAULT_HOME_ENV, DEFAULT_PATH_ENV,
-        DEFAULT_XDG_RUNTIME_DIR_ENV, WAYLAND_DISPLAY, XDG_CURRENT_DESKTOP, XDG_SESSION_TYPE,
-    };
+    use super::{build_exec_argv, build_exec_env_with_defaults};
 
     #[test]
     fn build_exec_argv_defaults_to_exec_path() {
@@ -1307,10 +1280,21 @@ mod tests {
 
     #[test]
     fn build_exec_env_preserves_explicit_values_and_adds_defaults() {
-        let env = build_exec_env(&[
-            String::from("PATH=/custom/bin"),
-            String::from("XDG_RUNTIME_DIR=/run/custom"),
-        ]);
+        let defaults = [
+            String::from("PATH=/bin:/usr/bin:/usr/local/bin"),
+            String::from("HOME=/home/user"),
+            String::from("XDG_RUNTIME_DIR=/run/user/1000"),
+            String::from("WAYLAND_DISPLAY=wayland-0"),
+            String::from("XDG_SESSION_TYPE=wayland"),
+            String::from("XDG_CURRENT_DESKTOP=RustOS"),
+        ];
+        let env = build_exec_env_with_defaults(
+            &[
+                String::from("PATH=/custom/bin"),
+                String::from("XDG_RUNTIME_DIR=/run/custom"),
+            ],
+            &defaults,
+        );
         let values = env
             .iter()
             .map(|item| item.to_str().unwrap().to_string())
@@ -1319,56 +1303,28 @@ mod tests {
         assert!(values
             .iter()
             .any(|item| item == "XDG_RUNTIME_DIR=/run/custom"));
-        assert!(values.iter().any(|item| item == DEFAULT_HOME_ENV));
-        assert!(values.iter().any(|item| item == WAYLAND_DISPLAY));
-        assert!(values.iter().any(|item| item == XDG_SESSION_TYPE));
-        assert!(values.iter().any(|item| item == XDG_CURRENT_DESKTOP));
-        assert!(!values.iter().any(|item| item == DEFAULT_PATH_ENV));
+        assert!(values.iter().any(|item| item == "HOME=/home/user"));
+        assert!(values
+            .iter()
+            .any(|item| item == "WAYLAND_DISPLAY=wayland-0"));
+        assert!(values.iter().any(|item| item == "XDG_SESSION_TYPE=wayland"));
+        assert!(values
+            .iter()
+            .any(|item| item == "XDG_CURRENT_DESKTOP=RustOS"));
         assert!(!values
             .iter()
-            .any(|item| item == DEFAULT_XDG_RUNTIME_DIR_ENV));
+            .any(|item| item == "PATH=/bin:/usr/bin:/usr/local/bin"));
+        assert!(!values
+            .iter()
+            .any(|item| item == "XDG_RUNTIME_DIR=/run/user/1000"));
     }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct ConsoleCreateSessionRequest {
-    program_id: u32,
-    reserved: u32,
-    title_ptr: u64,
-    title_len: u64,
-    exec_path_ptr: u64,
-    exec_path_len: u64,
-    session_handle: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct ConsoleCloseSessionRequest {
-    session_handle: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct ConsoleSetFocusRequest {
-    session_handle: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct ConsoleSetSessionStateRequest {
-    session_handle: u64,
-    state: u16,
-    reserved: u16,
-}
-
-const CONSOLE_IOCTL_SET_FOCUS: usize = linux_iow::<ConsoleSetFocusRequest>(CONSOLE_IOCTL_TYPE, 3);
-const CONSOLE_IOCTL_CREATE_SESSION: usize =
-    linux_iowr::<ConsoleCreateSessionRequest>(CONSOLE_IOCTL_TYPE, 6);
-const CONSOLE_IOCTL_CLOSE_SESSION: usize =
-    linux_iow::<ConsoleCloseSessionRequest>(CONSOLE_IOCTL_TYPE, 7);
+const CONSOLE_IOCTL_SET_FOCUS: usize = console_abi::CONSOLE_IOCTL_SET_FOCUS as usize;
+const CONSOLE_IOCTL_CREATE_SESSION: usize = console_abi::CONSOLE_IOCTL_CREATE_SESSION as usize;
+const CONSOLE_IOCTL_CLOSE_SESSION: usize = console_abi::CONSOLE_IOCTL_CLOSE_SESSION as usize;
 const CONSOLE_IOCTL_SET_SESSION_STATE: usize =
-    linux_iow::<ConsoleSetSessionStateRequest>(CONSOLE_IOCTL_TYPE, 9);
+    console_abi::CONSOLE_IOCTL_SET_SESSION_STATE as usize;
 
 fn create_console_session(
     console_fd: RawFd,
@@ -1376,21 +1332,19 @@ fn create_console_session(
     title: &str,
     exec_path: &str,
 ) -> Result<u64, i32> {
-    let mut request = ConsoleCreateSessionRequest {
+    let mut request = ConsoleCreateSessionRequest::new(
         program_id,
-        title_ptr: title.as_ptr() as u64,
-        title_len: title.len() as u64,
-        exec_path_ptr: exec_path.as_ptr() as u64,
-        exec_path_len: exec_path.len() as u64,
-        session_handle: 0,
-        reserved: 0,
-    };
+        title.as_ptr() as u64,
+        title.len() as u64,
+        exec_path.as_ptr() as u64,
+        exec_path.len() as u64,
+    );
     ioctl_with_mut(console_fd, CONSOLE_IOCTL_CREATE_SESSION, &mut request)?;
     Ok(request.session_handle)
 }
 
 fn close_console_session(console_fd: RawFd, session_handle: u64) -> Result<bool, i32> {
-    let mut request = ConsoleCloseSessionRequest { session_handle };
+    let mut request = ConsoleCloseSessionRequest::new(session_handle);
     match ioctl_with_mut(console_fd, CONSOLE_IOCTL_CLOSE_SESSION, &mut request) {
         Ok(()) => Ok(true),
         Err(err) if err == libc::ENOENT || err == libc::EINVAL => Ok(false),
@@ -1403,16 +1357,12 @@ fn set_console_session_state(
     session_handle: u64,
     state: u16,
 ) -> Result<(), i32> {
-    let mut request = ConsoleSetSessionStateRequest {
-        session_handle,
-        state,
-        reserved: 0,
-    };
+    let mut request = ConsoleSetSessionStateRequest::new(session_handle, state);
     ioctl_with_mut(console_fd, CONSOLE_IOCTL_SET_SESSION_STATE, &mut request)
 }
 
 fn console_set_focus(console_fd: RawFd, session_handle: u64) -> Result<(), i32> {
-    let mut request = ConsoleSetFocusRequest { session_handle };
+    let mut request = ConsoleSetFocusRequest::new(session_handle);
     ioctl_with_mut(console_fd, CONSOLE_IOCTL_SET_FOCUS, &mut request)
 }
 

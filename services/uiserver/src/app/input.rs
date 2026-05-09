@@ -72,10 +72,13 @@ impl AppState {
                     .unwrap_or_default())
             }
             INPUT_KIND_POINTER_MOTION => {
+                let previous_x = self.cursor_x;
+                let previous_y = self.cursor_y;
                 let next_x = (self.cursor_x as i32 + event.value0).max(0) as u32;
                 let next_y = (self.cursor_y as i32 + event.value1).max(0) as u32;
                 self.cursor_x = next_x.min(self.display.width.saturating_sub(1));
                 self.cursor_y = next_y.min(self.display.height.saturating_sub(1));
+                self.record_cursor_motion(previous_x, previous_y);
                 let drag_update = self.drag_window_to_cursor(wayland.as_deref_mut());
                 if !drag_update.is_empty() {
                     return Ok(drag_update);
@@ -88,10 +91,13 @@ impl AppState {
                 Ok(VisualUpdate::default())
             }
             INPUT_KIND_POINTER_POSITION => {
+                let previous_x = self.cursor_x;
+                let previous_y = self.cursor_y;
                 self.cursor_x =
                     (event.value0.max(0) as u32).min(self.display.width.saturating_sub(1));
                 self.cursor_y =
                     (event.value1.max(0) as u32).min(self.display.height.saturating_sub(1));
+                self.record_cursor_motion(previous_x, previous_y);
                 let drag_update = self.drag_window_to_cursor(wayland.as_deref_mut());
                 if !drag_update.is_empty() {
                     return Ok(drag_update);
