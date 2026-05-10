@@ -1341,8 +1341,57 @@ fn push_unique_runtime_dir(dest: &mut Vec<String>, value: &str) {
 }
 
 // Debug-only private syscall for RustOS userspace tracing.
-pub const SYS_RUSTOS_DEBUG_PRINT: u64 = 0x5255_0001;
-pub const SYS_RUSTOS_SPAWN_EXEC: u64 = 0x5255_0002;
+pub const SYS_RUSTOS_DEBUG_PRINT: u64 = rustos_user_abi::syscall::SYS_RUSTOS_DEBUG_PRINT;
+pub const SYS_RUSTOS_SPAWN_EXEC: u64 = rustos_user_abi::syscall::SYS_RUSTOS_SPAWN_EXEC;
+pub const SYS_RUSTOS_IPC_ENDPOINT_CREATE: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_IPC_ENDPOINT_CREATE;
+pub const SYS_RUSTOS_IPC_CALL: u64 = rustos_user_abi::syscall::SYS_RUSTOS_IPC_CALL;
+pub const SYS_RUSTOS_IPC_RECV: u64 = rustos_user_abi::syscall::SYS_RUSTOS_IPC_RECV;
+pub const SYS_RUSTOS_IPC_REPLY: u64 = rustos_user_abi::syscall::SYS_RUSTOS_IPC_REPLY;
+pub const SYS_RUSTOS_IPC_REGISTER_LINUX_SYSCALL_ENDPOINT: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_IPC_REGISTER_LINUX_SYSCALL_ENDPOINT;
+pub const SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT;
+pub const SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT;
+pub const SYS_RUSTOS_IPC_CALL_WITH_HANDLES: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_IPC_CALL_WITH_HANDLES;
+pub const SYS_RUSTOS_IPC_RECV_WITH_HANDLES: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_IPC_RECV_WITH_HANDLES;
+pub const SYS_RUSTOS_IPC_REPLY_WITH_HANDLES: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_IPC_REPLY_WITH_HANDLES;
+pub const SYS_RUSTOS_FD_CLOSE_BROKER: u64 = rustos_user_abi::syscall::SYS_RUSTOS_FD_CLOSE_BROKER;
+pub const SYS_RUSTOS_FD_DUP_BROKER: u64 = rustos_user_abi::syscall::SYS_RUSTOS_FD_DUP_BROKER;
+pub const SYS_RUSTOS_FD_GETDENTS64_BROKER: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_FD_GETDENTS64_BROKER;
+pub const SYS_RUSTOS_FD_FCNTL_BROKER: u64 = rustos_user_abi::syscall::SYS_RUSTOS_FD_FCNTL_BROKER;
+pub const SYS_RUSTOS_VFS_MOUNT_BROKER: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_VFS_MOUNT_BROKER;
+pub const SYS_RUSTOS_VFS_UMOUNT_BROKER: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_VFS_UMOUNT_BROKER;
+pub const SYS_RUSTOS_PROC_PREPARE_BROKER: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_PROC_PREPARE_BROKER;
+pub const SYS_RUSTOS_PROC_MAP_FILE_BROKER: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_PROC_MAP_FILE_BROKER;
+pub const SYS_RUSTOS_PROC_MAP_ZEROED_BROKER: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_PROC_MAP_ZEROED_BROKER;
+pub const SYS_RUSTOS_PROC_COMMIT_BROKER: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_PROC_COMMIT_BROKER;
+pub const SYS_RUSTOS_PROC_ABORT_BROKER: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_PROC_ABORT_BROKER;
+pub const SYS_RUSTOS_STATX_METADATA: u64 = rustos_user_abi::syscall::SYS_RUSTOS_STATX_METADATA;
+pub const SYS_RUSTOS_STAT_METADATA: u64 = rustos_user_abi::syscall::SYS_RUSTOS_STAT_METADATA;
+pub const SYS_RUSTOS_READLINK_METADATA: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_READLINK_METADATA;
+pub const SYS_RUSTOS_ACCESS_METADATA: u64 = rustos_user_abi::syscall::SYS_RUSTOS_ACCESS_METADATA;
+pub const SYS_RUSTOS_GETCWD_METADATA: u64 = rustos_user_abi::syscall::SYS_RUSTOS_GETCWD_METADATA;
+pub const SYS_RUSTOS_CHDIR_METADATA: u64 = rustos_user_abi::syscall::SYS_RUSTOS_CHDIR_METADATA;
+pub const IPC_SERVICE_LINUX_SYSCALLD: u64 = rustos_user_abi::syscall::IPC_SERVICE_LINUX_SYSCALLD;
+pub const IPC_SERVICE_VFSD: u64 = rustos_user_abi::syscall::IPC_SERVICE_VFSD;
+pub const IPC_SERVICE_NETD: u64 = rustos_user_abi::syscall::IPC_SERVICE_NETD;
+pub const IPC_SERVICE_DEVMGRD: u64 = rustos_user_abi::syscall::IPC_SERVICE_DEVMGRD;
+pub const IPC_SERVICE_DRIVERD: u64 = rustos_user_abi::syscall::IPC_SERVICE_DRIVERD;
+pub const IPC_SERVICE_LOADERD: u64 = rustos_user_abi::syscall::IPC_SERVICE_LOADERD;
 
 #[cfg(test)]
 mod tests {

@@ -33,6 +33,7 @@ const KERNEL_BUILD_CONFIG_ENV: &str = "KERNEL_BUILD_CONFIG";
 pub(crate) struct ProjectConfig {
     pub(crate) source: ProjectConfigSource,
     pub(crate) kernel: KernelConfig,
+    pub(crate) fault_injection: FaultInjectionConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -57,6 +58,12 @@ impl ProjectConfigSource {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct KernelConfig {
     pub(crate) build: KernelBuildConfig,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FaultInjectionConfig {
+    pub(crate) enabled: bool,
+    pub(crate) rules: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -155,6 +162,7 @@ fn bool_name(value: bool) -> &'static str {
 struct ProjectConfigFile {
     logging: Option<toml::Value>,
     kernel: KernelConfigFile,
+    fault_injection: FaultInjectionConfigFile,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -183,6 +191,13 @@ struct KernelBuildConfigFile {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+struct FaultInjectionConfigFile {
+    enabled: Option<bool>,
+    rules: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 struct LegacyKernelBuildConfigFile {
     hardening: LegacyKernelHardeningConfigFile,
 }
@@ -196,10 +211,13 @@ struct LegacyKernelHardeningConfigFile {
 pub(crate) fn load_project_config(root_dir: &Path) -> Result<ProjectConfig> {
     let (mut config, source) = load_project_config_file(root_dir)?;
     apply_env_overrides(&mut config.kernel.build)?;
+    apply_fault_env_overrides(&mut config.fault_injection)?;
     validate_kernel_build(&config.kernel.build)?;
+    validate_fault_injection(&config.fault_injection)?;
     Ok(ProjectConfig {
         source,
         kernel: config.kernel,
+        fault_injection: config.fault_injection,
     })
 }
 
@@ -261,10 +279,21 @@ fn load_override_config(path: PathBuf) -> Result<(ProjectConfig, ProjectConfigSo
 
 fn parse_project_config(path: &Path) -> Result<ProjectConfig> {
     let text = fs::read_to_string(path)?;
+    validate_project_config_text(&text)
+        .map_err(|err| anyhow!("invalid RustOS config {}: {err}", path.display()))?;
     let parsed = toml::from_str::<ProjectConfigFile>(&text)
         .map_err(|err| anyhow!("invalid RustOS config {}: {err}", path.display()))?;
     validate_logging_config(&text, path)?;
     Ok(project_from_file(parsed))
+}
+
+pub(crate) fn validate_project_config_text(text: &str) -> Result<()> {
+    let parsed = toml::from_str::<ProjectConfigFile>(&text)
+        .map_err(|err| anyhow!("invalid RustOS config: {err}"))?;
+    let config = project_from_file(parsed);
+    validate_kernel_build(&config.kernel.build)?;
+    validate_fault_injection(&config.fault_injection)?;
+    Ok(())
 }
 
 fn validate_logging_config(text: &str, path: &Path) -> Result<()> {
@@ -331,6 +360,13 @@ fn project_from_file(file: ProjectConfigFile) -> ProjectConfig {
     if let Some(value) = build.extra_rustflags {
         config.kernel.build.extra_rustflags = value;
     }
+    let fault = file.fault_injection;
+    if let Some(value) = fault.enabled {
+        config.fault_injection.enabled = value;
+    }
+    if let Some(value) = fault.rules {
+        config.fault_injection.rules = value;
+    }
     config
 }
 
@@ -339,6 +375,7 @@ impl Default for ProjectConfig {
         Self {
             source: ProjectConfigSource::BuiltInDefaults,
             kernel: KernelConfig::default(),
+            fault_injection: FaultInjectionConfig::default(),
         }
     }
 }
@@ -384,6 +421,23 @@ fn apply_env_overrides(build: &mut KernelBuildConfig) -> Result<()> {
     }
     if let Some(value) = env_string("RUSTOS_KERNEL_EXTRA_RUSTFLAGS") {
         build.extra_rustflags = split_whitespace_owned(&value);
+    }
+    Ok(())
+}
+
+fn apply_fault_env_overrides(fault: &mut FaultInjectionConfig) -> Result<()> {
+    if let Some(value) = env_string("RUSTOS_FAULT_INJECTION") {
+        fault.enabled = parse_bool_env("RUSTOS_FAULT_INJECTION", &value)?;
+    }
+    if let Some(value) = env_string("RUSTOS_FAULTS") {
+        fault.enabled = true;
+        fault.rules.extend(
+            value
+                .split(';')
+                .map(str::trim)
+                .filter(|rule| !rule.is_empty())
+                .map(str::to_owned),
+        );
     }
     Ok(())
 }
@@ -455,16 +509,31 @@ fn validate_kernel_build(build: &KernelBuildConfig) -> Result<()> {
     Ok(())
 }
 
+fn validate_fault_injection(fault: &FaultInjectionConfig) -> Result<()> {
+    for rule in &fault.rules {
+        rustos_fault_injection::parse_rule(rule)
+            .map_err(|err| anyhow!("invalid fault_injection.rules entry {rule:?}: {err}"))?;
+    }
+    Ok(())
+}
+
 pub(crate) fn effective_config_toml(config: &ProjectConfig) -> String {
     let build = &config.kernel.build;
+    let fault = &config.fault_injection;
     let extra = build
         .extra_rustflags
         .iter()
         .map(|flag| format!("{flag:?}"))
         .collect::<Vec<_>>()
         .join(", ");
+    let fault_rules = fault
+        .rules
+        .iter()
+        .map(|rule| format!("{rule:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
-        "# source: {}\n[kernel.build]\ncodegen_units = {}\nopt_level = {:?}\noverflow_checks = {}\ndebug_assertions = {}\nlto = {:?}\nforce_frame_pointers = {}\nincremental = {}\ndebuginfo = {:?}\nembed_bitcode = {}\npanic = {:?}\nrelocation_model = {:?}\nstrip = {:?}\nextra_rustflags = [{}]\n",
+        "# source: {}\n[kernel.build]\ncodegen_units = {}\nopt_level = {:?}\noverflow_checks = {}\ndebug_assertions = {}\nlto = {:?}\nforce_frame_pointers = {}\nincremental = {}\ndebuginfo = {:?}\nembed_bitcode = {}\npanic = {:?}\nrelocation_model = {:?}\nstrip = {:?}\nextra_rustflags = [{}]\n\n[fault_injection]\nenabled = {}\nrules = [{}]\n",
         config.source.label(),
         build.codegen_units,
         build.opt_level,
@@ -479,5 +548,7 @@ pub(crate) fn effective_config_toml(config: &ProjectConfig) -> String {
         build.relocation_model,
         build.strip,
         extra,
+        fault.enabled,
+        fault_rules,
     )
 }

@@ -511,6 +511,10 @@ fn read_config<T: Copy>(
     if value.is_null() || offset < 0 {
         return -22;
     }
+    if nucleus_core::util::fault_injection::should_fail("pci.config.read") {
+        crate::debug::warn!(driver, "fault injection: pci.config.read failed");
+        return -5;
+    }
 
     let Some(result) = with_device(dev, |device| read(device.address, offset as usize)) else {
         return -19;

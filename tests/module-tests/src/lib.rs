@@ -5,8 +5,14 @@ mod tests {
         BootMemoryRegion, BootPixelFormat, BootVolumeIdentity, FramebufferInfo, NucleusImageInfo,
     };
     use boot_random::{Random, init as init_random};
-    use driver_abi::{DRIVER_MODULE_ABI_VERSION, DriverBus, DriverClass, DriverModuleHeader};
+    use core::mem::{align_of, size_of};
+    use driver_abi::{
+        DRIVER_MODULE_ABI_VERSION, DisplayFramebufferRegistration, DriverBus, DriverClass,
+        DriverModuleHeader, LinuxInputDev, PointerPacket,
+    };
     use keyboard_core::{KeyAction, KeyCode, KeyboardDriver, Modifiers, ScanCodeSet};
+    use rustos_fault_injection::{FaultAction, parse_rule};
+    use rustos_user_abi::{console, device, ui};
 
     #[test]
     fn keyboard_core_decodes_basic_typing() {
@@ -50,6 +56,34 @@ mod tests {
             "system/drivers/input/usbhid.ko"
         );
         assert_eq!(header.name_str().unwrap(), "usbhid");
+    }
+
+    #[test]
+    fn driver_abi_layout_is_stable() {
+        assert_eq!(size_of::<DriverModuleHeader>(), 188);
+        assert_eq!(align_of::<DriverModuleHeader>(), 4);
+        assert_eq!(size_of::<DisplayFramebufferRegistration>(), 56);
+        assert_eq!(size_of::<LinuxInputDev>(), 112);
+        assert_eq!(size_of::<PointerPacket>(), 12);
+    }
+
+    #[test]
+    fn user_abi_layout_is_stable() {
+        assert_eq!(size_of::<device::DisplayInfo>(), 32);
+        assert_eq!(size_of::<device::DisplaySurfaceCreate>(), 48);
+        assert_eq!(size_of::<device::DisplayPresentRectRequest>(), 24);
+        assert_eq!(size_of::<ui::UiInputEvent>(), 24);
+        assert_eq!(size_of::<console::ConsoleStateInfo>(), 16);
+        assert_eq!(size_of::<console::ConsoleSessionInfo>(), 72);
+        assert_eq!(size_of::<console::ConsoleCreateSessionRequest>(), 48);
+    }
+
+    #[test]
+    fn fault_injection_rules_are_contract_checked() {
+        let rule = parse_rule("display.present=drop-every:4").expect("fault rule");
+        assert_eq!(rule.location, "display.present");
+        assert_eq!(rule.action, FaultAction::DropEvery(4));
+        assert!(parse_rule("display present=fail").is_err());
     }
 
     #[test]

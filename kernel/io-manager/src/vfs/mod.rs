@@ -809,6 +809,28 @@ pub(crate) fn check_access_for_current_process(
     metadata_local(absolute_path).map(|_| ())
 }
 
+pub(crate) fn check_access_for_user_process(
+    absolute_path: &str,
+    mode: u64,
+    abi: UserAbi,
+    process_state: &mut UserProcessState,
+) -> Result<(), VfsError> {
+    if let Some(target) = resolve_fd_link_path(absolute_path)? {
+        return check_access_for_user_process(target.as_str(), mode, abi, process_state);
+    }
+
+    if procfs::is_local_special_path(absolute_path) {
+        ensure_read_access_only(mode)?;
+        let _ = metadata_for_special_case_exists(absolute_path)?;
+        return Ok(());
+    }
+
+    let mount = resolve_mount(absolute_path)?;
+    ensure_user_mount_access_for_process(&mount, absolute_path, abi, process_state)?;
+    ensure_read_access_only(mode)?;
+    metadata_local(absolute_path).map(|_| ())
+}
+
 pub(crate) fn readlink_for_current_process(absolute_path: &str) -> Result<String, VfsError> {
     if absolute_path.starts_with("/dev/fd/") || absolute_path.starts_with("/proc/self/fd/") {
         return procfs::read_fd_link(absolute_path);
@@ -1971,6 +1993,28 @@ fn ensure_user_mount_access(
         let _ = multitask::with_current_user_process_state_mut(|_, _, process_state| {
             let _ = process_state.require_logical_admin_for_file_access(absolute_path);
         });
+        Err(VfsError::PermissionDenied)
+    }
+}
+
+fn ensure_user_mount_access_for_process(
+    mount: &ResolvedMount,
+    absolute_path: &str,
+    abi: UserAbi,
+    process_state: &mut UserProcessState,
+) -> Result<(), VfsError> {
+    if mount.role != MountRole::SystemImage {
+        return Ok(());
+    }
+
+    if runtime::linux_runtime_access_allows_path(absolute_path, abi, process_state) {
+        return Ok(());
+    }
+
+    if process_state.security().is_logical_admin() {
+        Ok(())
+    } else {
+        let _ = process_state.require_logical_admin_for_file_access(absolute_path);
         Err(VfsError::PermissionDenied)
     }
 }

@@ -10,6 +10,10 @@ Use from repo root.
 | `cargo xtask run` | boot current image in QEMU | `logs/`, temp dirs | missing `build/image`, missing OVMF, QEMU failure |
 | `cargo xtask debug` | QEMU with GDB stub | `logs/rustos-debug.gdb` | same as run plus debug setup |
 | `cargo xtask probe-display` | headless display probe with screendump geometry and non-black frame validation | `logs/` | display/surface/present regression |
+| `cargo xtask qemu-scenarios --list` | list predefined QEMU regression scenarios | none | unknown local xtask binary |
+| `cargo xtask qemu-scenarios --scenario display-probe` | run one QEMU regression scenario | `logs/` | boot/display/input regression |
+| `cargo xtask selftest` | host selftests for fault parsing, ABI/layout, runtime contracts, and module tests | `target/` | contract/layout regression |
+| `cargo xtask fuzz-host --target all` | deterministic host fuzz smoke for fault rules, project config, and package manifest parsing | `logs/` on crash | parser panic or invariant bug |
 | `cargo xtask build-user` | userspace packages only | `target/`, `build/artifacts` | service/app compile error |
 | `cargo xtask build-driver-modules` | bridge modules only | `target/`, `build/artifacts` | driver/module build error |
 | `cargo test -p module-tests` | module tests | `target/` | unit/module regression |
@@ -24,6 +28,10 @@ QEMU args:
   `cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file --timeout 35 --summarize-log -- --no-reboot`.
 - Use repeated `--expect <marker>` when a run should stop as soon as specific
   debugcon markers appear. Without `--expect`, `--timeout` is a controlled stop.
+- Use repeated `--fault <location=action>` to pass a validated fault-injection
+  rule to the guest through QEMU fw_cfg (`opt/rustos/fault-injection`).
+- Fault rule examples: `display.present=drop-every:10`,
+  `block.read=fail-after:50`, `socket.send=rate:5`.
 - Prefer `--summarize-log` and focused `rg` over opening whole log files.
 - Do not add ad hoc QEMU or kernel debug branches for one driver. Route durable
   debug state through logging, milestones, registries, and common subsystem APIs.

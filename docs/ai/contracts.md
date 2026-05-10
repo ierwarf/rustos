@@ -68,6 +68,70 @@ Kernel/userspace ABI:
 - Device, console, and UI `repr(C)` structs and ioctl numbers must be defined
   in `rustos-user-abi`; services such as `uiserver` and `runtimed` should use
   that crate rather than duplicating request structs or ioctl encoding logic.
+- RustOS IPC and Linux syscall-offload ABI lives in `rustos-user-abi::syscall`.
+  Service endpoints are registered through
+  `SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT` and looked up by stable
+  `IPC_SERVICE_*` ids. Registering endpoint `0` revokes the service endpoint
+  and later lookups fail closed. `syscalld` is service id 1, `vfsd` is service
+  id 2, `netd` is service id 3, `devmgrd` is service id 4, `driverd` is
+  service id 5, and `loaderd` is service id 6. File/path Linux syscall policy
+  should route to `vfsd`; AF_UNIX and socket control policy should route to
+  `netd`; device open/ioctl policy should route to `devmgrd`; module
+  autoload/provider policy belongs in `driverd`; executable format and launch
+  policy belongs in `loaderd`. Kernel FD/socket/module/process data paths may
+  remain as brokered mechanisms until handle/cap transfer and driver-domain
+  isolation are in place.
+- Kernel IPC endpoint calls support bounded cap-transfer slots through
+  `kernel_ipc_runtime::api::KernelTransferredHandle` and the
+  `*_with_handles` endpoint APIs. Byte-only recv/take wrappers must keep failing
+  with `BufferTooSmall` when a queued message or reply contains transferred
+  handles, so older paths do not silently drop capabilities. Transferred handles
+  require an explicit nonzero transfer ticket and rights whose
+  `HandleRights::allows_transfer()` is true.
+- Process FD tables expose transfer only through
+  `kernel_ps::api::TransferredHandleEntry` and `HandleTable::{duplicate_for_transfer,
+  install_transferred}`. Export requires the source handle class and rights to
+  permit descriptor transfer; directory FDs are file capabilities and are
+  transferable for VFS service migration.
+- Userspace handle-aware IPC uses
+  `SYS_RUSTOS_IPC_{CALL,RECV,REPLY}_WITH_HANDLES` with the shared
+  `Ipc*WithHandlesArgs` structs. Send handles are Linux fd arrays; received
+  handles are installed into the receiver fd table and returned as `i32` fd
+  arrays plus a `u16` count. `recv_fd_count_ptr` is mandatory for the
+  handle-aware ABI, even when no handles are returned. Counts are bounded by
+  `IPC_MAX_TRANSFER_HANDLES`, and byte-only IPC syscalls must not silently carry
+  or discard transferred handles.
+- Linux `openat` is the first VFS fd-producing syscall that uses this
+  handle-aware path: non-policy-service callers send the normalized path request
+  to `vfsd`, `vfsd` opens through the temporary kernel VFS broker, replies with
+  one transferred fd, and the kernel installs that transferred entry in the
+  caller fd table. Policy services may still use the broker directly to avoid
+  recursive self-IPC during bootstrap. Before `vfsd` registers its endpoint,
+  the temporary broker remains available for service dynamic-loader bootstrap;
+  after registration, generic pid-based bypass is not allowed.
+- Linux `close`, `dup`/`dup2`/`dup3`, and `fcntl` route through `vfsd` before
+  mutating the app fd table. `vfsd` is the only intended caller of the
+  temporary `SYS_RUSTOS_FD_*_BROKER` syscalls; generic apps must not use them
+  directly. `LinuxSyscallOffloadRequest.arg0/arg1` are the 64-bit extension
+  slots for fd control arguments such as target fd, command, argument, and
+  flags. Do not pack pointer or flag values into the 32-bit `mask` field.
+- Linux `getdents64` also routes through `vfsd`; the temporary
+  `SYS_RUSTOS_FD_GETDENTS64_BROKER` writes directory records into the target
+  process address space selected by pid. FD broker syscalls must remain gated to
+  the `services/vfsd/vfsd.elf` process, not broad policy-service callers.
+- Linux `mount` and `umount2` must preserve Linux ELF compatibility while
+  keeping namespace policy in `vfsd`: generic app syscalls route to `vfsd`,
+  then `vfsd` calls the temporary gated `SYS_RUSTOS_VFS_*_BROKER` primitives for
+  the narrow kernel mount-table mutation. Do not reintroduce direct generic-app
+  `linux_ops::mount` or `linux_ops::umount2` paths.
+- Runtime launches should route through `loaderd`, not direct generic
+  `SYS_RUSTOS_SPAWN_EXEC` calls. `loaderd` registers `IPC_SERVICE_LOADERD`,
+  validates executable format policy, and uses the temporary gated
+  `SYS_RUSTOS_PROC_*_BROKER` primitives for kernel-owned process commit work.
+  `SYS_RUSTOS_PROC_*_BROKER` calls must fail with `EACCES` for non-loaderd
+  callers. `SYS_RUSTOS_SPAWN_EXEC` remains available for init/bootstrap
+  compatibility, but once `loaderd` is registered generic apps should not use it
+  directly.
 - `device::DisplayInfo.flags` distinguishes boot firmware framebuffers from a
   real primary display provider. Userspace display surfaces must require
   `DISPLAY_INFO_FLAG_PRIMARY_PROVIDER`; GRUB/firmware boot framebuffers are for
@@ -130,6 +194,30 @@ Kernel build:
 - Linux compat load failures should write the first disallowed or unresolved
   external symbol to debugcon directly. Do not rely only on category-filtered
   logs for module ABI diagnostics.
+
+Fault injection:
+
+- Human guide: `docs/fault-injection.md`.
+- Shared parser crate: `libs/rustos-fault-injection`.
+- Host config parser: `tools/xtask/src/config/project.rs` `[fault_injection]`.
+- QEMU handoff: `tools/xtask/src/qemu/mod.rs` passes rules through fw_cfg
+  `opt/rustos/fault-injection`.
+- Kernel runtime: `kernel/nucleus-core/src/util/fault_injection.rs`.
+- Kernel init: `kernel/executive/src/boot.rs` calls
+  `fault_injection::init_from_qemu_fw_cfg()` after heap init.
+- Rule format: `location=action`.
+- Valid actions: `off`, `fail`, `drop-every:N`, `fail-after:N`, `rate:N`,
+  `delay-ms:N`. `delay-ms` is parsed but not wired to sleep/delay yet.
+- Current fault points: `alloc.frame`, `block.read`, `block.write`,
+  `display.present`, `display.provider.register`, `driver.module.load`,
+  `input.event.enqueue`, `pci.config.read`, `process.spawn`, `socket.recv`,
+  `socket.send`, `virtio-gpu.control.submit`.
+- Add new points only at realistic failure boundaries such as allocation, block
+  IO, device registration, queue submit, process spawn, IPC/socket send/recv,
+  and driver probe/load. Do not scatter fault checks through arbitrary helper
+  functions.
+- Keep `config/rustos.toml` `fault_injection.rules` on one physical line until
+  the logging cfg scanner is separated from full-file config parsing.
 
 Linux network driver compat:
 

@@ -423,6 +423,10 @@ pub fn init(boot_info_ptr: *const BootInfo) {
 }
 
 pub fn alloc_frame() -> Option<PhysAddr> {
+    if nucleus_core::util::fault_injection::should_fail("alloc.frame") {
+        crate::debug::warn!(memory, "fault injection: alloc.frame failed");
+        return None;
+    }
     alloc_contiguous(1)
 }
 

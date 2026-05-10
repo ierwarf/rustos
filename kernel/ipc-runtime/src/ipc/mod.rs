@@ -1,16 +1,15 @@
 use alloc::collections::BTreeMap;
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 #[cfg(not(test))]
 use core::ptr;
-
-#[cfg(test)]
-use alloc::collections::VecDeque;
 
 use crate::ipc_core::SharedRegionHandle;
 #[cfg(test)]
 use crate::ipc_core::{
     ChannelHandle, EventHandle, IpcHeader, PORT_NAME_CAPACITY, PortHandle, PortName,
 };
+use kernel_object::api::handle::{HandleRights, HandleToken};
 use spin::Mutex;
 #[cfg(not(test))]
 use x86_64::instructions::interrupts;
@@ -18,8 +17,8 @@ use x86_64::instructions::interrupts;
 #[cfg(not(test))]
 use crate::memory::{kernel_vm, phys};
 
+#[cfg(not(test))]
 const PAGE_SIZE: usize = 4096;
-#[cfg(test)]
 const INITIAL_PENDING_CHANNEL_CAPACITY: usize = 4;
 #[cfg(test)]
 const INITIAL_CHANNEL_QUEUE_CAPACITY: usize = 8;
@@ -31,6 +30,10 @@ const MAX_CHANNEL_QUEUE_DEPTH: usize = 256;
 const MAX_IPC_PAYLOAD_BYTES: usize = 64 * 1024;
 #[cfg(test)]
 const MAX_IPC_ATTACHED_HANDLES: usize = 16;
+const MAX_ENDPOINT_INLINE_MESSAGE_BYTES: usize = 4096;
+const MAX_ENDPOINT_PENDING_MESSAGES: usize = 64;
+const MAX_ENDPOINT_TRANSFER_HANDLES: usize = 16;
+const MAX_ENDPOINT_WAITERS: usize = 64;
 const MAX_SHARED_REGION_BYTES: usize = 256 * 1024 * 1024;
 
 #[cfg(test)]
@@ -102,6 +105,69 @@ impl KernelSharedRegionHandle {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct KernelEndpointHandle {
+    raw: u64,
+}
+
+impl KernelEndpointHandle {
+    pub const fn from_raw(raw: u64) -> Self {
+        Self { raw }
+    }
+
+    pub const fn raw(&self) -> u64 {
+        self.raw
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct KernelReplyHandle {
+    raw: u64,
+}
+
+impl KernelReplyHandle {
+    pub const fn from_raw(raw: u64) -> Self {
+        Self { raw }
+    }
+
+    pub const fn raw(&self) -> u64 {
+        self.raw
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KernelTransferredHandle {
+    transfer_id: u64,
+    token: HandleToken,
+    rights: HandleRights,
+}
+
+impl KernelTransferredHandle {
+    pub const fn new(transfer_id: u64, token: HandleToken, rights: HandleRights) -> Self {
+        Self {
+            transfer_id,
+            token,
+            rights,
+        }
+    }
+
+    pub const fn transfer_id(self) -> u64 {
+        self.transfer_id
+    }
+
+    pub const fn token(self) -> HandleToken {
+        self.token
+    }
+
+    pub const fn rights(self) -> HandleRights {
+        self.rights
+    }
+
+    pub const fn is_transferable(self) -> bool {
+        self.transfer_id != 0 && self.rights.allows_transfer()
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct KernelEventHandle {
@@ -167,6 +233,34 @@ struct SharedRegionObject {
     page_count: usize,
 }
 
+#[derive(Default)]
+struct EndpointObject {
+    owner_task_id: Option<u64>,
+    pending_messages: VecDeque<u64>,
+    waiting_receivers: VecDeque<u64>,
+}
+
+struct EndpointMessageObject {
+    endpoint_id: u64,
+    caller_task_id: u64,
+    request: Vec<u8>,
+    attached_handles: Vec<KernelTransferredHandle>,
+    response: Option<EndpointResponse>,
+}
+
+struct ReplyObject {
+    message_id: u64,
+    used: bool,
+}
+
+enum EndpointResponse {
+    Data {
+        bytes: Vec<u8>,
+        attached_handles: Vec<KernelTransferredHandle>,
+    },
+    Error(IpcError),
+}
+
 #[cfg(test)]
 #[derive(Default)]
 struct EventObject {
@@ -182,6 +276,9 @@ struct IpcObjectTable {
     ports: BTreeMap<u64, PortObject>,
     #[cfg(test)]
     channels: BTreeMap<u64, ChannelObject>,
+    endpoints: BTreeMap<u64, EndpointObject>,
+    replies: BTreeMap<u64, ReplyObject>,
+    endpoint_messages: BTreeMap<u64, EndpointMessageObject>,
     shared_regions: BTreeMap<u64, SharedRegionObject>,
     #[cfg(test)]
     events: BTreeMap<u64, EventObject>,
@@ -197,6 +294,9 @@ impl IpcObjectTable {
             ports: BTreeMap::new(),
             #[cfg(test)]
             channels: BTreeMap::new(),
+            endpoints: BTreeMap::new(),
+            replies: BTreeMap::new(),
+            endpoint_messages: BTreeMap::new(),
             shared_regions: BTreeMap::new(),
             #[cfg(test)]
             events: BTreeMap::new(),
@@ -505,6 +605,299 @@ pub fn create_shared_region(byte_len: usize) -> Result<KernelSharedRegionHandle,
     })
 }
 
+pub fn create_endpoint() -> Result<KernelEndpointHandle, IpcError> {
+    create_endpoint_for_task(None)
+}
+
+pub fn create_endpoint_for_task(
+    owner_task_id: Option<u64>,
+) -> Result<KernelEndpointHandle, IpcError> {
+    with_ipc_objects(|objects| {
+        let id = objects.allocate_id()?;
+        objects.endpoints.insert(
+            id,
+            EndpointObject {
+                owner_task_id,
+                pending_messages: VecDeque::with_capacity(INITIAL_PENDING_CHANNEL_CAPACITY),
+                waiting_receivers: VecDeque::with_capacity(INITIAL_PENDING_CHANNEL_CAPACITY),
+            },
+        );
+        Ok(KernelEndpointHandle::from_raw(id))
+    })
+}
+
+fn validate_endpoint_transfer_handles(
+    attached_handles: &[KernelTransferredHandle],
+) -> Result<(), IpcError> {
+    if attached_handles.len() > MAX_ENDPOINT_TRANSFER_HANDLES {
+        return Err(IpcError::InvalidArgument);
+    }
+    if attached_handles
+        .iter()
+        .any(|handle| !handle.is_transferable())
+    {
+        return Err(IpcError::InvalidArgument);
+    }
+    Ok(())
+}
+
+pub fn enqueue_endpoint_call(
+    endpoint: KernelEndpointHandle,
+    caller_task_id: u64,
+    request: &[u8],
+) -> Result<(KernelReplyHandle, Option<u64>), IpcError> {
+    enqueue_endpoint_call_with_handles(endpoint, caller_task_id, request, &[])
+}
+
+pub fn enqueue_endpoint_call_with_handles(
+    endpoint: KernelEndpointHandle,
+    caller_task_id: u64,
+    request: &[u8],
+    attached_handles: &[KernelTransferredHandle],
+) -> Result<(KernelReplyHandle, Option<u64>), IpcError> {
+    if request.is_empty() || request.len() > MAX_ENDPOINT_INLINE_MESSAGE_BYTES {
+        return Err(IpcError::InvalidArgument);
+    }
+    validate_endpoint_transfer_handles(attached_handles)?;
+
+    with_ipc_objects(|objects| {
+        let Some(endpoint_object) = objects.endpoints.get(&endpoint.raw()) else {
+            return Err(IpcError::InvalidHandle);
+        };
+        if endpoint_object.pending_messages.len() >= MAX_ENDPOINT_PENDING_MESSAGES {
+            return Err(IpcError::NoMemory);
+        }
+
+        let message_id = objects.allocate_id()?;
+        let reply_id = objects.allocate_id()?;
+        objects.endpoint_messages.insert(
+            message_id,
+            EndpointMessageObject {
+                endpoint_id: endpoint.raw(),
+                caller_task_id,
+                request: request.to_vec(),
+                attached_handles: attached_handles.to_vec(),
+                response: None,
+            },
+        );
+        objects.replies.insert(
+            reply_id,
+            ReplyObject {
+                message_id,
+                used: false,
+            },
+        );
+
+        let receiver_to_wake = {
+            let endpoint_object = objects
+                .endpoints
+                .get_mut(&endpoint.raw())
+                .expect("ipc endpoint disappeared while enqueueing call");
+            endpoint_object.pending_messages.push_back(message_id);
+            endpoint_object.waiting_receivers.pop_front()
+        };
+
+        Ok((KernelReplyHandle::from_raw(reply_id), receiver_to_wake))
+    })
+}
+
+pub fn recv_endpoint(
+    endpoint: KernelEndpointHandle,
+) -> Result<Option<(KernelReplyHandle, Vec<u8>)>, IpcError> {
+    recv_endpoint_with_limits(endpoint, usize::MAX)
+}
+
+pub fn recv_endpoint_with_limits(
+    endpoint: KernelEndpointHandle,
+    request_capacity: usize,
+) -> Result<Option<(KernelReplyHandle, Vec<u8>)>, IpcError> {
+    let Some((reply, request, _handles)) =
+        recv_endpoint_with_limits_and_handles(endpoint, request_capacity, 0)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((reply, request)))
+}
+
+pub fn recv_endpoint_with_limits_and_handles(
+    endpoint: KernelEndpointHandle,
+    request_capacity: usize,
+    handle_capacity: usize,
+) -> Result<Option<(KernelReplyHandle, Vec<u8>, Vec<KernelTransferredHandle>)>, IpcError> {
+    with_ipc_objects(|objects| {
+        let Some(endpoint_object) = objects.endpoints.get_mut(&endpoint.raw()) else {
+            return Err(IpcError::InvalidHandle);
+        };
+        let Some(message_id) = endpoint_object.pending_messages.front().copied() else {
+            return Ok(None);
+        };
+
+        let Some(message) = objects.endpoint_messages.get(&message_id) else {
+            return Err(IpcError::InvalidHandle);
+        };
+        if message.request.len() > request_capacity
+            || message.attached_handles.len() > handle_capacity
+        {
+            return Err(IpcError::BufferTooSmall);
+        }
+        let Some(reply_id) = objects
+            .replies
+            .iter()
+            .find_map(|(reply_id, reply)| (reply.message_id == message_id).then_some(*reply_id))
+        else {
+            return Err(IpcError::InvalidHandle);
+        };
+        objects
+            .endpoints
+            .get_mut(&endpoint.raw())
+            .expect("ipc endpoint disappeared while dequeuing call")
+            .pending_messages
+            .pop_front();
+        Ok(Some((
+            KernelReplyHandle::from_raw(reply_id),
+            message.request.clone(),
+            message.attached_handles.clone(),
+        )))
+    })
+}
+
+pub fn add_endpoint_receiver_waiter(
+    endpoint: KernelEndpointHandle,
+    task_id: u64,
+) -> Result<(), IpcError> {
+    with_ipc_objects(|objects| {
+        let Some(endpoint_object) = objects.endpoints.get_mut(&endpoint.raw()) else {
+            return Err(IpcError::InvalidHandle);
+        };
+        if endpoint_object.waiting_receivers.contains(&task_id) {
+            return Ok(());
+        }
+        if endpoint_object.waiting_receivers.len() >= MAX_ENDPOINT_WAITERS {
+            return Err(IpcError::NoMemory);
+        }
+        endpoint_object.waiting_receivers.push_back(task_id);
+        Ok(())
+    })
+}
+
+pub fn complete_endpoint_reply(reply: KernelReplyHandle, response: &[u8]) -> Result<u64, IpcError> {
+    complete_endpoint_reply_with_handles(reply, response, &[])
+}
+
+pub fn complete_endpoint_reply_with_handles(
+    reply: KernelReplyHandle,
+    response: &[u8],
+    attached_handles: &[KernelTransferredHandle],
+) -> Result<u64, IpcError> {
+    if response.len() > MAX_ENDPOINT_INLINE_MESSAGE_BYTES {
+        return Err(IpcError::InvalidArgument);
+    }
+    validate_endpoint_transfer_handles(attached_handles)?;
+
+    with_ipc_objects(|objects| {
+        let Some(reply_object) = objects.replies.get_mut(&reply.raw()) else {
+            return Err(IpcError::InvalidHandle);
+        };
+        if reply_object.used {
+            return Err(IpcError::InvalidArgument);
+        }
+        reply_object.used = true;
+
+        let Some(message) = objects.endpoint_messages.get_mut(&reply_object.message_id) else {
+            return Err(IpcError::InvalidHandle);
+        };
+        message.response = Some(EndpointResponse::Data {
+            bytes: response.to_vec(),
+            attached_handles: attached_handles.to_vec(),
+        });
+        Ok(message.caller_task_id)
+    })
+}
+
+pub fn take_endpoint_response(reply: KernelReplyHandle) -> Result<Option<Vec<u8>>, IpcError> {
+    let Some((response, _handles)) = take_endpoint_response_with_handle_limit(reply, 0)? else {
+        return Ok(None);
+    };
+    Ok(Some(response))
+}
+
+pub fn take_endpoint_response_with_handle_limit(
+    reply: KernelReplyHandle,
+    handle_capacity: usize,
+) -> Result<Option<(Vec<u8>, Vec<KernelTransferredHandle>)>, IpcError> {
+    with_ipc_objects(|objects| {
+        let Some(reply_object) = objects.replies.get(&reply.raw()) else {
+            return Err(IpcError::InvalidHandle);
+        };
+        let message_id = reply_object.message_id;
+        let Some(message) = objects.endpoint_messages.get_mut(&message_id) else {
+            return Err(IpcError::InvalidHandle);
+        };
+        match message.response.as_ref() {
+            None => Ok(None),
+            Some(EndpointResponse::Data {
+                attached_handles, ..
+            }) if attached_handles.len() > handle_capacity => Err(IpcError::BufferTooSmall),
+            Some(EndpointResponse::Data { .. }) => {
+                let Some(EndpointResponse::Data {
+                    bytes,
+                    attached_handles,
+                }) = message.response.take()
+                else {
+                    unreachable!("response was checked above");
+                };
+                objects.endpoint_messages.remove(&message_id);
+                objects.replies.remove(&reply.raw());
+                Ok(Some((bytes, attached_handles)))
+            }
+            Some(EndpointResponse::Error(err)) => {
+                let err = *err;
+                message.response.take();
+                objects.endpoint_messages.remove(&message_id);
+                objects.replies.remove(&reply.raw());
+                Err(err)
+            }
+        }
+    })
+}
+
+pub fn fail_endpoints_owned_by_task(task_id: u64, err: IpcError) -> Vec<u64> {
+    with_ipc_objects(|objects| {
+        let endpoints = objects
+            .endpoints
+            .iter()
+            .filter_map(|(endpoint_id, endpoint)| {
+                (endpoint.owner_task_id == Some(task_id)).then_some(*endpoint_id)
+            })
+            .collect::<Vec<_>>();
+        if endpoints.is_empty() {
+            return Vec::new();
+        }
+
+        let mut callers_to_wake = Vec::new();
+        for endpoint_id in endpoints {
+            objects.endpoints.remove(&endpoint_id);
+            let message_ids = objects
+                .endpoint_messages
+                .iter()
+                .filter_map(|(message_id, message)| {
+                    (message.endpoint_id == endpoint_id).then_some(*message_id)
+                })
+                .collect::<Vec<_>>();
+            for message_id in message_ids {
+                let Some(message) = objects.endpoint_messages.get_mut(&message_id) else {
+                    continue;
+                };
+                if message.response.is_none() {
+                    message.response = Some(EndpointResponse::Error(err));
+                    callers_to_wake.push(message.caller_task_id);
+                }
+            }
+        }
+        callers_to_wake
+    })
+}
+
 #[cfg(test)]
 pub fn shared_region_len(region: KernelSharedRegionHandle) -> Option<usize> {
     with_ipc_objects_ref(|objects| {
@@ -688,9 +1081,11 @@ mod tests {
         ConsoleStreamKind, IpcError, IpcHeader, KernelHandle, accept_channel, connect_named_port,
         connect_port, create_channel_pair, create_event, create_named_port, create_shared_region,
         dequeue_message, dequeue_message_with_limits, enqueue_message, event_signal_count,
-        lookup_named_port, map_shared_region, port_name, queue_channel_for_accept,
-        shared_region_len, signal_event,
+        lookup_named_port, map_shared_region, port_name, queue_channel_for_accept, recv_endpoint,
+        recv_endpoint_with_limits, recv_endpoint_with_limits_and_handles, shared_region_len,
+        signal_event,
     };
+    use kernel_object::api::handle::{FileHandleRights, HandleOwner, HandleRights, HandleToken};
     use spin::Mutex;
 
     static IPC_TEST_GUARD: Mutex<()> = Mutex::new(());
@@ -703,6 +1098,22 @@ mod tests {
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
         }
+    }
+
+    fn transferable_file_handle(id: u64) -> super::KernelTransferredHandle {
+        super::KernelTransferredHandle::new(
+            id,
+            HandleToken::new(HandleOwner::Io, id),
+            HandleRights::File(FileHandleRights::READ.union(FileHandleRights::TRANSFER)),
+        )
+    }
+
+    fn non_transferable_file_handle(id: u64) -> super::KernelTransferredHandle {
+        super::KernelTransferredHandle::new(
+            id,
+            HandleToken::new(HandleOwner::Io, id),
+            HandleRights::File(FileHandleRights::READ),
+        )
     }
 
     #[test]
@@ -956,6 +1367,251 @@ mod tests {
                 .expect("message present");
             assert_eq!(message.payload, b"hello");
             assert_eq!(message.attached_handles.len(), 1);
+        });
+    }
+
+    #[test]
+    fn endpoint_call_recv_reply_completes_response() {
+        with_isolated_ipc_test(|| {
+            let endpoint = super::create_endpoint().expect("create endpoint");
+            let (reply, receiver) =
+                super::enqueue_endpoint_call(endpoint, 41, b"statx").expect("enqueue call");
+            assert_eq!(receiver, None);
+
+            let (server_reply, request) = recv_endpoint(endpoint)
+                .expect("recv endpoint")
+                .expect("message queued");
+            assert_eq!(server_reply, reply);
+            assert_eq!(request, b"statx");
+
+            let caller = super::complete_endpoint_reply(reply, b"ok").expect("reply");
+            assert_eq!(caller, 41);
+            let response = super::take_endpoint_response(reply)
+                .expect("take response")
+                .expect("response present");
+            assert_eq!(response, b"ok");
+            assert_eq!(
+                super::take_endpoint_response(reply),
+                Err(IpcError::InvalidHandle)
+            );
+        });
+    }
+
+    #[test]
+    fn endpoint_request_handles_require_explicit_receive_capacity() {
+        with_isolated_ipc_test(|| {
+            let endpoint = super::create_endpoint().expect("create endpoint");
+            let handle = transferable_file_handle(11);
+            let (reply, _) =
+                super::enqueue_endpoint_call_with_handles(endpoint, 41, b"open", &[handle])
+                    .expect("enqueue call with handle");
+
+            assert_eq!(
+                recv_endpoint_with_limits(endpoint, usize::MAX),
+                Err(IpcError::BufferTooSmall)
+            );
+
+            let (server_reply, request, handles) =
+                recv_endpoint_with_limits_and_handles(endpoint, usize::MAX, 1)
+                    .expect("recv endpoint")
+                    .expect("message queued");
+            assert_eq!(server_reply, reply);
+            assert_eq!(request, b"open");
+            assert_eq!(handles, alloc::vec![handle]);
+        });
+    }
+
+    #[test]
+    fn endpoint_rejects_non_transferable_request_handles() {
+        with_isolated_ipc_test(|| {
+            let endpoint = super::create_endpoint().expect("create endpoint");
+            assert_eq!(
+                super::enqueue_endpoint_call_with_handles(
+                    endpoint,
+                    41,
+                    b"open",
+                    &[non_transferable_file_handle(12)],
+                ),
+                Err(IpcError::InvalidArgument)
+            );
+            assert_eq!(
+                super::enqueue_endpoint_call_with_handles(
+                    endpoint,
+                    41,
+                    b"open",
+                    &[super::KernelTransferredHandle::new(
+                        0,
+                        HandleToken::new(HandleOwner::Io, 12),
+                        HandleRights::File(
+                            FileHandleRights::READ.union(FileHandleRights::TRANSFER),
+                        ),
+                    )],
+                ),
+                Err(IpcError::InvalidArgument)
+            );
+        });
+    }
+
+    #[test]
+    fn endpoint_request_handle_limit_is_bounded() {
+        with_isolated_ipc_test(|| {
+            let endpoint = super::create_endpoint().expect("create endpoint");
+            let mut handles = alloc::vec::Vec::new();
+            for index in 0..=super::MAX_ENDPOINT_TRANSFER_HANDLES {
+                handles.push(transferable_file_handle(index as u64 + 1));
+            }
+
+            assert_eq!(
+                super::enqueue_endpoint_call_with_handles(endpoint, 41, b"open", &handles),
+                Err(IpcError::InvalidArgument)
+            );
+        });
+    }
+
+    #[test]
+    fn endpoint_reply_handles_require_explicit_take_capacity() {
+        with_isolated_ipc_test(|| {
+            let endpoint = super::create_endpoint().expect("create endpoint");
+            let (reply, _) =
+                super::enqueue_endpoint_call(endpoint, 41, b"request").expect("enqueue call");
+            let (_server_reply, _request) = recv_endpoint(endpoint)
+                .expect("recv endpoint")
+                .expect("message queued");
+            let handle = transferable_file_handle(21);
+
+            assert_eq!(
+                super::complete_endpoint_reply_with_handles(reply, b"ok", &[handle]),
+                Ok(41)
+            );
+            assert_eq!(
+                super::take_endpoint_response(reply),
+                Err(IpcError::BufferTooSmall)
+            );
+
+            let (bytes, handles) = super::take_endpoint_response_with_handle_limit(reply, 1)
+                .expect("take response")
+                .expect("response present");
+            assert_eq!(bytes, b"ok");
+            assert_eq!(handles, alloc::vec![handle]);
+            assert_eq!(
+                super::take_endpoint_response_with_handle_limit(reply, 1),
+                Err(IpcError::InvalidHandle)
+            );
+        });
+    }
+
+    #[test]
+    fn malformed_reply_handles_do_not_consume_reply_cap() {
+        with_isolated_ipc_test(|| {
+            let endpoint = super::create_endpoint().expect("create endpoint");
+            let (reply, _) =
+                super::enqueue_endpoint_call(endpoint, 7, b"request").expect("enqueue call");
+            let (_server_reply, _request) = recv_endpoint(endpoint)
+                .expect("recv endpoint")
+                .expect("message queued");
+
+            assert_eq!(
+                super::complete_endpoint_reply_with_handles(
+                    reply,
+                    b"bad",
+                    &[non_transferable_file_handle(33)],
+                ),
+                Err(IpcError::InvalidArgument)
+            );
+            assert_eq!(super::complete_endpoint_reply(reply, b"first"), Ok(7));
+        });
+    }
+
+    #[test]
+    fn endpoint_reply_cap_is_one_shot() {
+        with_isolated_ipc_test(|| {
+            let endpoint = super::create_endpoint().expect("create endpoint");
+            let (reply, _) =
+                super::enqueue_endpoint_call(endpoint, 7, b"request").expect("enqueue call");
+            assert_eq!(super::complete_endpoint_reply(reply, b"first"), Ok(7));
+            assert_eq!(
+                super::complete_endpoint_reply(reply, b"second"),
+                Err(IpcError::InvalidArgument)
+            );
+        });
+    }
+
+    #[test]
+    fn endpoint_receiver_waiter_is_woken_by_next_call() {
+        with_isolated_ipc_test(|| {
+            let endpoint = super::create_endpoint().expect("create endpoint");
+            super::add_endpoint_receiver_waiter(endpoint, 99).expect("add waiter");
+            let (_reply, receiver) =
+                super::enqueue_endpoint_call(endpoint, 1, b"request").expect("enqueue call");
+            assert_eq!(receiver, Some(99));
+        });
+    }
+
+    #[test]
+    fn endpoint_queue_limit_is_bounded() {
+        with_isolated_ipc_test(|| {
+            let endpoint = super::create_endpoint().expect("create endpoint");
+            for index in 0..super::MAX_ENDPOINT_PENDING_MESSAGES {
+                let request = [index as u8 + 1];
+                super::enqueue_endpoint_call(endpoint, index as u64, &request)
+                    .expect("enqueue within limit");
+            }
+            assert_eq!(
+                super::enqueue_endpoint_call(endpoint, 1000, b"x"),
+                Err(IpcError::NoMemory)
+            );
+        });
+    }
+
+    #[test]
+    fn endpoint_recv_capacity_preserves_front_message() {
+        with_isolated_ipc_test(|| {
+            let endpoint = super::create_endpoint().expect("create endpoint");
+            super::enqueue_endpoint_call(endpoint, 3, b"long-request").expect("enqueue call");
+            assert_eq!(
+                recv_endpoint_with_limits(endpoint, 4),
+                Err(IpcError::BufferTooSmall)
+            );
+            let (_reply, request) = recv_endpoint(endpoint)
+                .expect("recv endpoint")
+                .expect("message queued");
+            assert_eq!(request, b"long-request");
+        });
+    }
+
+    #[test]
+    fn endpoint_rejects_malformed_message_lengths() {
+        with_isolated_ipc_test(|| {
+            let endpoint = super::create_endpoint().expect("create endpoint");
+            assert_eq!(
+                super::enqueue_endpoint_call(endpoint, 1, b""),
+                Err(IpcError::InvalidArgument)
+            );
+            let oversized = alloc::vec![0_u8; super::MAX_ENDPOINT_INLINE_MESSAGE_BYTES + 1];
+            assert_eq!(
+                super::enqueue_endpoint_call(endpoint, 1, oversized.as_slice()),
+                Err(IpcError::InvalidArgument)
+            );
+        });
+    }
+
+    #[test]
+    fn endpoint_owner_exit_fails_pending_callers() {
+        with_isolated_ipc_test(|| {
+            let endpoint = super::create_endpoint_for_task(Some(10)).expect("create endpoint");
+            let (reply, _) =
+                super::enqueue_endpoint_call(endpoint, 22, b"request").expect("enqueue call");
+
+            let callers = super::fail_endpoints_owned_by_task(10, IpcError::PeerClosed);
+            assert_eq!(callers, alloc::vec![22]);
+            assert_eq!(
+                super::take_endpoint_response(reply),
+                Err(IpcError::PeerClosed)
+            );
+            assert_eq!(
+                super::enqueue_endpoint_call(endpoint, 23, b"request"),
+                Err(IpcError::InvalidHandle)
+            );
         });
     }
 }

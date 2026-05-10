@@ -1177,7 +1177,7 @@ mod tests {
             ConsoleStreamKind::Output,
         )));
         assert!(!transfer_allowed(&KernelHandle::Epoll(EpollHandle::new())));
-        assert!(!transfer_allowed(&KernelHandle::VfsDirectory(
+        assert!(transfer_allowed(&KernelHandle::VfsDirectory(
             VfsDirectoryHandle::new("/test".into(), vec![]),
         )));
         assert!(!transfer_allowed(&KernelHandle::DisplaySurface(

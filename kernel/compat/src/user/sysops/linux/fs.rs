@@ -1,72 +1,17 @@
 use super::*;
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
 
 use linux_raw_sys::general::linux_dirent64;
 
+use crate::memory::paging;
 use crate::multitask;
 use crate::user::handles::{KernelHandle, VfsDirectoryEntry, VfsDirectoryEntryKind};
 
-pub(crate) fn access(path_ptr: u64, mode: u64) -> Result<(), LinuxSysopError> {
-    let path = usermem::read_current_user_c_string(path_ptr, 128)?;
-    check_access_path(linux_abi::AT_FDCWD as u64, &path, mode, 0)
-}
-
-pub(crate) fn getcwd(user_ptr: u64, user_len: u64) -> Result<usize, LinuxSysopError> {
-    let user_len = usize::try_from(user_len).map_err(|_| LinuxSysopError::InvalidArgument)?;
-    let cwd = current_process_cwd()?;
-    let cwd_bytes = cwd.as_bytes();
-    let required_len = cwd_bytes
-        .len()
-        .checked_add(1)
-        .ok_or(LinuxSysopError::InvalidArgument)?;
-    if user_len < required_len {
-        return Err(LinuxSysopError::InvalidArgument);
-    }
-    let mut bytes = Vec::with_capacity(required_len);
-    bytes.extend_from_slice(cwd_bytes);
-    bytes.push(0);
-    usermem::write_current_user_bytes(user_ptr, bytes.as_slice())?;
-    Ok(required_len)
-}
-
-pub(crate) fn chdir(path_ptr: u64) -> Result<(), LinuxSysopError> {
-    let path = usermem::read_current_user_c_string(path_ptr, 256)?;
-    if path.is_empty() {
-        return Err(LinuxSysopError::InvalidArgument);
-    }
-    let absolute_path = file::resolve_path_for_current_process(linux_abi::AT_FDCWD as u64, &path)?;
-    let metadata = file::metadata_for_current_process_path(absolute_path.as_str())?;
-    if metadata.kind != file::FileNodeKind::Directory {
-        return Err(LinuxSysopError::NotDirectory);
-    }
-
-    let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
-        process_state.set_cwd(absolute_path.as_str());
-        Ok(())
-    }) else {
-        return Err(LinuxSysopError::Unsupported);
-    };
-
-    result
-}
-
-pub(crate) fn mkdir(path_ptr: u64, _mode: u64) -> Result<(), LinuxSysopError> {
-    let path = usermem::read_current_user_c_string(path_ptr, 256)?;
-    if path.is_empty() {
-        return Err(LinuxSysopError::InvalidArgument);
-    }
-    let absolute_path = file::resolve_path_for_current_process(linux_abi::AT_FDCWD as u64, &path)?;
-
-    let uid = multitask::with_current_process_credentials(|security| security.euid())
-        .ok_or(LinuxSysopError::Unsupported)?;
-    if mkdir_is_supported_runtime_dir(absolute_path.as_str(), uid) {
-        return Ok(());
-    }
-
-    Err(LinuxSysopError::ReadOnlyFilesystem)
-}
+const USER_C_STRING_COPY_CHUNK: usize = 256;
+const USER_PAGE_SIZE: usize = 4096;
 
 pub(crate) fn unlink(path_ptr: u64) -> Result<(), LinuxSysopError> {
     unlinkat(linux_abi::AT_FDCWD as u64, path_ptr, 0)
@@ -87,13 +32,6 @@ pub(crate) fn unlinkat(dirfd: u64, path_ptr: u64, flags: u64) -> Result<(), Linu
         .map_err(Into::into)
 }
 
-fn mkdir_is_supported_runtime_dir(path: &str, uid: u32) -> bool {
-    if path == "/run" || path == "/run/user" {
-        return true;
-    }
-    path == alloc::format!("/run/user/{uid}")
-}
-
 fn current_socket_credentials() -> Result<crate::user::socket::SocketCredentials, LinuxSysopError> {
     multitask::with_current_user_process_state(|pid, _, process_state| {
         crate::user::socket::SocketCredentials::new(
@@ -106,12 +44,22 @@ fn current_socket_credentials() -> Result<crate::user::socket::SocketCredentials
 }
 
 pub(crate) fn getdents64(fd: u64, user_ptr: u64, user_len: u64) -> Result<usize, LinuxSysopError> {
+    let process_id = multitask::current_user_process_id().ok_or(LinuxSysopError::Unsupported)?;
+    getdents64_for_process(process_id, fd, user_ptr, user_len)
+}
+
+pub(crate) fn getdents64_for_process(
+    process_id: u64,
+    fd: u64,
+    user_ptr: u64,
+    user_len: u64,
+) -> Result<usize, LinuxSysopError> {
     let user_len = usize::try_from(user_len).map_err(|_| LinuxSysopError::InvalidArgument)?;
     if user_len < size_of::<linux_dirent64>() + 2 {
         return Err(LinuxSysopError::InvalidArgument);
     }
 
-    let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
+    let Some(result) = multitask::with_process_state_by_pid_mut(process_id, |process_state| {
         process_state
             .address_space()
             .validate_user_write_buffer(VirtAddr::new(user_ptr), user_len)?;
@@ -169,45 +117,45 @@ pub(crate) fn getdents64(fd: u64, user_ptr: u64, user_len: u64) -> Result<usize,
     result
 }
 
-pub(crate) fn faccessat(
+pub(crate) fn resolve_faccessat_absolute_path_for_current_process(
     dirfd: u64,
     path_ptr: u64,
-    mode: u64,
     flags: u64,
-) -> Result<(), LinuxSysopError> {
-    let path = usermem::read_current_user_c_string(path_ptr, 128)?;
-    check_access_path(dirfd, &path, mode, flags)
+) -> Result<String, LinuxSysopError> {
+    if flags & !linux_abi::AT_EACCESS != 0 {
+        return Err(LinuxSysopError::InvalidArgument);
+    }
+    resolve_nonempty_user_path_for_current_process(dirfd, path_ptr, 128)
 }
 
-pub(crate) fn mount(
+pub(crate) fn mount_for_process(
+    process_id: u64,
     source_ptr: u64,
-    target_ptr: u64,
+    target_path: &str,
     fstype_ptr: u64,
     flags: u64,
     data_ptr: u64,
 ) -> Result<(), LinuxSysopError> {
-    if source_ptr == 0 || target_ptr == 0 || fstype_ptr == 0 {
+    if source_ptr == 0 || fstype_ptr == 0 || target_path.is_empty() {
         return Err(LinuxSysopError::InvalidArgument);
     }
 
-    let source = usermem::read_current_user_c_string(source_ptr, 256)?;
-    let target = usermem::read_current_user_c_string(target_ptr, 256)?;
-    let filesystem_type = usermem::read_current_user_c_string(fstype_ptr, 64)?;
-    if source.is_empty() || target.is_empty() || filesystem_type.is_empty() {
+    let source = read_user_c_string_for_process(process_id, source_ptr, 256)?;
+    let filesystem_type = read_user_c_string_for_process(process_id, fstype_ptr, 64)?;
+    if source.is_empty() || filesystem_type.is_empty() {
         return Err(LinuxSysopError::InvalidArgument);
     }
 
-    let source = file::resolve_path_for_current_process(linux_abi::AT_FDCWD as u64, &source)?;
-    let target = file::resolve_path_for_current_process(linux_abi::AT_FDCWD as u64, &target)?;
+    let source = file::resolve_path_for_process(process_id, &source)?;
     let options = if data_ptr == 0 {
         None
     } else {
-        Some(usermem::read_current_user_c_string(data_ptr, 256)?)
+        Some(read_user_c_string_for_process(process_id, data_ptr, 256)?)
     };
 
     crate::vfs::mount_for_current_process(
         source.as_str(),
-        target.as_str(),
+        target_path,
         filesystem_type.as_str(),
         flags,
         options.as_deref(),
@@ -215,47 +163,15 @@ pub(crate) fn mount(
     .map_err(LinuxSysopError::from)
 }
 
-pub(crate) fn umount2(target_ptr: u64, flags: u64) -> Result<(), LinuxSysopError> {
-    if target_ptr == 0 || flags != 0 {
+pub(crate) fn umount2_for_process(
+    _process_id: u64,
+    target_path: &str,
+    flags: u64,
+) -> Result<(), LinuxSysopError> {
+    if target_path.is_empty() || flags != 0 {
         return Err(LinuxSysopError::InvalidArgument);
     }
-
-    let target = usermem::read_current_user_c_string(target_ptr, 256)?;
-    if target.is_empty() {
-        return Err(LinuxSysopError::InvalidArgument);
-    }
-    let target = file::resolve_path_for_current_process(linux_abi::AT_FDCWD as u64, &target)?;
-    crate::vfs::umount_for_current_process(target.as_str()).map_err(LinuxSysopError::from)
-}
-
-pub(crate) fn readlink(
-    path_ptr: u64,
-    user_ptr: u64,
-    user_len: u64,
-) -> Result<usize, LinuxSysopError> {
-    readlinkat(linux_abi::AT_FDCWD as u64, path_ptr, user_ptr, user_len)
-}
-
-pub(crate) fn readlinkat(
-    dirfd: u64,
-    path_ptr: u64,
-    user_ptr: u64,
-    user_len: u64,
-) -> Result<usize, LinuxSysopError> {
-    let path = usermem::read_current_user_c_string(path_ptr, 256)?;
-    let absolute_path = file::resolve_path_for_current_process(dirfd, &path)?;
-    let target = crate::vfs::readlink_for_current_process(absolute_path.as_str())
-        .map_err(file::FileSysopError::from)
-        .map_err(LinuxSysopError::from)?;
-    if user_len == 0 {
-        return Ok(0);
-    }
-
-    let user_len = usize::try_from(user_len).map_err(|_| LinuxSysopError::InvalidArgument)?;
-    let bytes = target.as_bytes();
-    let copy_len = bytes.len().min(user_len);
-    usermem::write_current_user_bytes(user_ptr, &bytes[..copy_len])?;
-    Ok(copy_len)
+    crate::vfs::umount_for_current_process(target_path).map_err(LinuxSysopError::from)
 }
 
 pub(crate) fn pread64(
@@ -297,30 +213,11 @@ pub(crate) fn fstat(fd: u64, stat_ptr: u64) -> Result<(), LinuxSysopError> {
     write_linux_stat(stat_ptr, &stat)
 }
 
-pub(crate) fn newfstatat(
-    dirfd: u64,
-    path_ptr: u64,
-    stat_ptr: u64,
-    flags: u64,
-) -> Result<(), LinuxSysopError> {
-    let supported_flags = linux_abi::AT_EMPTY_PATH;
-    if flags & !supported_flags != 0 {
-        return Err(LinuxSysopError::InvalidArgument);
-    }
-
-    let path = usermem::read_current_user_c_string(path_ptr, 128)?;
-    let stat = stat_for_path_or_fd(dirfd, Some(path.as_str()), flags)?;
-
-    write_linux_stat(stat_ptr, &stat)
-}
-
-pub(crate) fn statx(
+pub(crate) fn resolve_statx_absolute_path_for_current_process(
     dirfd: u64,
     path_ptr: u64,
     flags: u64,
-    mask: u32,
-    statx_ptr: u64,
-) -> Result<(), LinuxSysopError> {
+) -> Result<String, LinuxSysopError> {
     let supported_flags = linux_abi::AT_EMPTY_PATH
         | linux_abi::AT_SYMLINK_NOFOLLOW
         | linux_abi::AT_NO_AUTOMOUNT
@@ -328,15 +225,176 @@ pub(crate) fn statx(
     if flags & !supported_flags != 0 {
         return Err(LinuxSysopError::InvalidArgument);
     }
+    if path_ptr == 0 {
+        return Err(LinuxSysopError::OperationNotSupported);
+    }
 
-    let path = if path_ptr == 0 {
-        None
-    } else {
-        Some(usermem::read_current_user_c_string(path_ptr, 128)?)
+    let path = usermem::read_current_user_c_string(path_ptr, 128)?;
+    if path.is_empty() {
+        return Err(LinuxSysopError::OperationNotSupported);
+    }
+    file::resolve_path_for_current_process(dirfd, &path).map_err(LinuxSysopError::from)
+}
+
+pub(crate) fn resolve_newfstatat_absolute_path_for_current_process(
+    dirfd: u64,
+    path_ptr: u64,
+    flags: u64,
+) -> Result<String, LinuxSysopError> {
+    let supported_flags = linux_abi::AT_EMPTY_PATH;
+    if flags & !supported_flags != 0 {
+        return Err(LinuxSysopError::InvalidArgument);
+    }
+    resolve_nonempty_user_path_for_current_process(dirfd, path_ptr, 128)
+}
+
+pub(crate) fn resolve_readlinkat_absolute_path_for_current_process(
+    dirfd: u64,
+    path_ptr: u64,
+) -> Result<String, LinuxSysopError> {
+    resolve_nonempty_user_path_for_current_process(dirfd, path_ptr, 256)
+}
+
+pub(crate) fn statx_for_absolute_path(
+    absolute_path: &str,
+    mask: u32,
+) -> Result<linux_abi::LinuxStatx, LinuxSysopError> {
+    if !absolute_path.starts_with('/') {
+        return Err(LinuxSysopError::InvalidArgument);
+    }
+    let stat = stat::for_absolute_path(absolute_path).map_err(stat_lookup_error_to_linux)?;
+    let stat = kernel_stat_to_linux_stat(&stat);
+    Ok(linux_stat_to_statx(&stat, mask))
+}
+
+pub(crate) fn stat_for_absolute_path(
+    absolute_path: &str,
+) -> Result<linux_abi::LinuxStat, LinuxSysopError> {
+    if !absolute_path.starts_with('/') {
+        return Err(LinuxSysopError::InvalidArgument);
+    }
+    let stat = stat::for_absolute_path(absolute_path).map_err(stat_lookup_error_to_linux)?;
+    Ok(kernel_stat_to_linux_stat(&stat))
+}
+
+pub(crate) fn readlink_for_absolute_path(
+    absolute_path: &str,
+    max_len: usize,
+) -> Result<Vec<u8>, LinuxSysopError> {
+    if !absolute_path.starts_with('/') {
+        return Err(LinuxSysopError::InvalidArgument);
+    }
+    let target = crate::vfs::readlink_for_current_process(absolute_path)
+        .map_err(file::FileSysopError::from)
+        .map_err(LinuxSysopError::from)?;
+    Ok(target.as_bytes()[..target.len().min(max_len)].to_vec())
+}
+
+pub(crate) fn check_access_for_absolute_path_and_process(
+    process_id: u64,
+    absolute_path: &str,
+    mode: u64,
+) -> Result<(), LinuxSysopError> {
+    if !absolute_path.starts_with('/') {
+        return Err(LinuxSysopError::InvalidArgument);
+    }
+    multitask::with_process_state_by_pid_mut(process_id, |process_state| {
+        crate::vfs::check_access_for_user_process(
+            absolute_path,
+            mode,
+            crate::user::abi::UserAbi::Linux,
+            process_state,
+        )
+        .map_err(file::FileSysopError::from)
+        .map_err(LinuxSysopError::from)
+    })
+    .ok_or(LinuxSysopError::NoSuchProcess)?
+}
+
+pub(crate) fn cwd_for_process(process_id: u64) -> Result<String, LinuxSysopError> {
+    multitask::with_process_state_by_pid_mut(process_id, |process_state| {
+        String::from(process_state.cwd())
+    })
+    .ok_or(LinuxSysopError::NoSuchProcess)
+}
+
+pub(crate) fn chdir_absolute_path_for_process(
+    process_id: u64,
+    absolute_path: &str,
+) -> Result<(), LinuxSysopError> {
+    if !absolute_path.starts_with('/') {
+        return Err(LinuxSysopError::InvalidArgument);
+    }
+    multitask::with_process_state_by_pid_mut(process_id, |process_state| {
+        crate::vfs::check_access_for_user_process(
+            absolute_path,
+            0,
+            crate::user::abi::UserAbi::Linux,
+            process_state,
+        )
+        .map_err(file::FileSysopError::from)
+        .map_err(LinuxSysopError::from)?;
+        let stat = stat::for_absolute_path(absolute_path).map_err(stat_lookup_error_to_linux)?;
+        if stat.kind != stat::KernelNodeKind::Directory {
+            return Err(LinuxSysopError::NotDirectory);
+        }
+        process_state.set_cwd(absolute_path);
+        Ok(())
+    })
+    .ok_or(LinuxSysopError::NoSuchProcess)?
+}
+
+fn resolve_nonempty_user_path_for_current_process(
+    dirfd: u64,
+    path_ptr: u64,
+    max_len: usize,
+) -> Result<String, LinuxSysopError> {
+    if path_ptr == 0 {
+        return Err(LinuxSysopError::OperationNotSupported);
+    }
+    let path = usermem::read_current_user_c_string(path_ptr, max_len)?;
+    if path.is_empty() {
+        return Err(LinuxSysopError::OperationNotSupported);
+    }
+    file::resolve_path_for_current_process(dirfd, &path).map_err(LinuxSysopError::from)
+}
+
+fn read_user_c_string_for_process(
+    process_id: u64,
+    user_ptr: u64,
+    max_len: usize,
+) -> Result<String, LinuxSysopError> {
+    if user_ptr == 0 {
+        return Err(LinuxSysopError::InvalidArgument);
+    }
+    let Some(result) =
+        multitask::with_process_state_by_pid_mut(process_id, |process_state| {
+            let address_space = process_state.address_space();
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; USER_C_STRING_COPY_CHUNK];
+
+            while bytes.len() < max_len {
+                let ptr = user_ptr.checked_add(bytes.len() as u64).ok_or(
+                    LinuxSysopError::AddressSpace(paging::AddressSpaceError::AddressOverflow),
+                )?;
+                let page_remaining = USER_PAGE_SIZE - ((ptr as usize) & (USER_PAGE_SIZE - 1));
+                let chunk_len = (max_len - bytes.len()).min(chunk.len()).min(page_remaining);
+                address_space.copy_from_user(VirtAddr::new(ptr), &mut chunk[..chunk_len])?;
+                if let Some(nul_index) = chunk[..chunk_len].iter().position(|byte| *byte == 0) {
+                    bytes.extend_from_slice(&chunk[..nul_index]);
+                    return Ok(String::from_utf8_lossy(&bytes).into_owned());
+                }
+                bytes.extend_from_slice(&chunk[..chunk_len]);
+            }
+
+            Err(LinuxSysopError::AddressSpace(
+                paging::AddressSpaceError::AddressOverflow,
+            ))
+        })
+    else {
+        return Err(LinuxSysopError::NoSuchProcess);
     };
-    let stat = stat_for_path_or_fd(dirfd, path.as_deref(), flags)?;
-    let statx = linux_stat_to_statx(&stat, mask);
-    write_linux_statx(statx_ptr, &statx)
+    result
 }
 
 fn write_linux_stat(stat_ptr: u64, stat: &linux_abi::LinuxStat) -> Result<(), LinuxSysopError> {
@@ -350,44 +408,8 @@ fn write_linux_stat(stat_ptr: u64, stat: &linux_abi::LinuxStat) -> Result<(), Li
     Ok(())
 }
 
-fn write_linux_statx(statx_ptr: u64, statx: &linux_abi::LinuxStatx) -> Result<(), LinuxSysopError> {
-    let bytes = unsafe {
-        slice::from_raw_parts(
-            (statx as *const linux_abi::LinuxStatx).cast::<u8>(),
-            size_of::<linux_abi::LinuxStatx>(),
-        )
-    };
-    usermem::write_current_user_bytes(statx_ptr, bytes)?;
-    Ok(())
-}
-
 fn stat_for_descriptor(fd: u64) -> Result<linux_abi::LinuxStat, LinuxSysopError> {
     let stat = stat::for_fd(fd).map_err(stat_lookup_error_to_linux)?;
-    Ok(kernel_stat_to_linux_stat(&stat))
-}
-
-fn stat_for_path_or_fd(
-    dirfd: u64,
-    path: Option<&str>,
-    flags: u64,
-) -> Result<linux_abi::LinuxStat, LinuxSysopError> {
-    let Some(path) = path else {
-        if flags & linux_abi::AT_EMPTY_PATH == 0 {
-            return Err(LinuxSysopError::InvalidArgument);
-        }
-        return stat_for_descriptor(dirfd);
-    };
-
-    if path.is_empty() {
-        if flags & linux_abi::AT_EMPTY_PATH == 0 {
-            return Err(LinuxSysopError::InvalidArgument);
-        }
-        return stat_for_descriptor(dirfd);
-    }
-
-    let absolute_path = file::resolve_path_for_current_process(dirfd, path)?;
-    let stat =
-        stat::for_absolute_path(absolute_path.as_str()).map_err(stat_lookup_error_to_linux)?;
     Ok(kernel_stat_to_linux_stat(&stat))
 }
 
@@ -463,12 +485,6 @@ fn stat_lookup_error_to_linux(err: stat::StatLookupError) -> LinuxSysopError {
     }
 }
 
-fn current_process_cwd() -> Result<alloc::string::String, LinuxSysopError> {
-    let retained =
-        multitask::retain_current_user_process_state().ok_or(LinuxSysopError::Unsupported)?;
-    Ok(alloc::string::String::from(retained.process_state().cwd()))
-}
-
 fn linux_dirent_record_len(name: &str) -> Result<usize, LinuxSysopError> {
     let base_len = size_of::<linux_dirent64>();
     let len = base_len
@@ -500,13 +516,4 @@ fn linux_dirent_type(kind: VfsDirectoryEntryKind) -> u8 {
         VfsDirectoryEntryKind::Directory => linux_abi::DT_DIR as u8,
         VfsDirectoryEntryKind::Device => linux_abi::DT_CHR as u8,
     }
-}
-
-fn check_access_path(dirfd: u64, path: &str, mode: u64, flags: u64) -> Result<(), LinuxSysopError> {
-    if flags & !linux_abi::AT_EACCESS != 0 {
-        return Err(LinuxSysopError::InvalidArgument);
-    }
-
-    let absolute_path = file::resolve_path_for_current_process(dirfd, path)?;
-    file::check_access_for_current_process(absolute_path.as_str(), mode).map_err(Into::into)
 }

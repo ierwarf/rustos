@@ -19,7 +19,7 @@ mod table;
 mod vfs;
 
 pub use display_surface::DisplaySurfaceHandle;
-pub use table::{HandleEntry, HandleTable};
+pub use table::{HandleEntry, HandleTable, TransferredHandleEntry};
 pub use vfs::{
     FileHandleSeekError, FileHandleSeekWhence, FileHandleWriteError, VfsDirectoryEntry,
     VfsDirectoryEntryKind, VfsDirectoryHandle, VfsFileHandle, VfsFileObject,
@@ -169,7 +169,8 @@ impl KernelHandle {
             Self::Device(device) => {
                 let mut rights = DeviceHandleRights::READ
                     .union(DeviceHandleRights::IOCTL)
-                    .union(DeviceHandleRights::MAP);
+                    .union(DeviceHandleRights::MAP)
+                    .union(DeviceHandleRights::TRANSFER);
                 if matches!(
                     device.access_kind(),
                     crate::io::device::DeviceAccessKind::Native
@@ -199,7 +200,9 @@ impl KernelHandle {
                     .union(SocketHandleRights::TRANSFER),
             ),
             Self::VfsFile(_) => HandleRights::File(file_rights_from_status_flags(status_flags)),
-            Self::VfsDirectory(_) => HandleRights::File(FileHandleRights::READ),
+            Self::VfsDirectory(_) => {
+                HandleRights::File(FileHandleRights::READ.union(FileHandleRights::TRANSFER))
+            }
             Self::DisplaySurface(_) => HandleRights::DisplaySurface(
                 SharedRegionRights::READ
                     .union(SharedRegionRights::WRITE)
@@ -209,8 +212,14 @@ impl KernelHandle {
     }
 
     pub fn supports_descriptor_transfer(&self, rights: HandleRights) -> bool {
-        matches!(self, Self::Socket(_) | Self::Memfd(_) | Self::VfsFile(_))
-            && rights.allows_transfer()
+        matches!(
+            self,
+            Self::Socket(_)
+                | Self::Memfd(_)
+                | Self::VfsFile(_)
+                | Self::VfsDirectory(_)
+                | Self::Device(_)
+        ) && rights.allows_transfer()
     }
 
     pub fn socket_handle(&self) -> Option<&SocketHandle> {

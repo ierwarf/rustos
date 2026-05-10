@@ -1,0 +1,23 @@
+id = "devmgrd"
+kind = "service"
+execution_domain = "user"
+profiles = ["default"]
+startup = "init"
+
+[build]
+builder = "cargo-kernel-binary"
+package = "devmgrd"
+
+[install]
+path = "services/devmgrd/devmgrd.elf"
+
+[boot]
+preload = true
+required = false
+priority = -587
+
+[[desktop.entries]]
+display_name = "devmgrd"
+weight_micros = 50
+logical_admin = true
+console_hosted = false

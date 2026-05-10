@@ -50,17 +50,16 @@ fn cursor_move_update(
         return VisualUpdate::default();
     }
 
-    VisualUpdate {
-        needs_full_redraw: false,
-        partial_redraw_rect: canvas::cursor_dirty_rect(
-            presented_cursor_x,
-            presented_cursor_y,
-            state.surface.width,
-            state.surface.height,
-        ),
-        secondary_partial_redraw_rect: state
-            .cursor_visual_dirty_rect(state.surface.width, state.surface.height),
-    }
+    let mut update = VisualUpdate::partial(canvas::cursor_dirty_rect(
+        presented_cursor_x,
+        presented_cursor_y,
+        state.surface.width,
+        state.surface.height,
+    ));
+    update.add_partial_rect(
+        state.cursor_visual_dirty_rect(state.surface.width, state.surface.height),
+    );
+    update
 }
 
 fn install_panic_hook() {
@@ -319,11 +318,7 @@ fn run() -> Result<(), i32> {
 
         let input =
             input_loop::process_pending_input(&mut state, wayland.as_mut(), &runtime, &mut events)?;
-        pending_update.absorb(VisualUpdate {
-            needs_full_redraw: input.needs_full_redraw,
-            partial_redraw_rect: input.partial_redraw_rect,
-            secondary_partial_redraw_rect: input.secondary_partial_redraw_rect,
-        });
+        pending_update.absorb(input.visual_update);
 
         let now = Instant::now();
         let service_wayland = !input.backlog_remaining || now >= next_wayland_backlog_service;
@@ -332,7 +327,9 @@ fn run() -> Result<(), i32> {
                 if compositor.tick() {
                     let wayland_dirty = state.sync_wayland_windows(compositor.window_snapshots());
                     let focus_dirty = state.recover_focus_after_wayland_change(Some(compositor))?;
-                    pending_update.absorb(VisualUpdate::partial(wayland_dirty.union(focus_dirty)));
+                    let mut update = VisualUpdate::partial(wayland_dirty);
+                    update.add_partial_rect(focus_dirty);
+                    pending_update.absorb(update);
                 }
                 pending_update.absorb(VisualUpdate::partial(
                     compositor.pending_frame_callback_rect(),
@@ -387,7 +384,7 @@ fn run() -> Result<(), i32> {
             pending_update.absorb(VisualUpdate::partial(cursor_dirty_rect));
             next_cursor_motion_settle = now + CURSOR_MOTION_SETTLE_INTERVAL;
         }
-        let mut drawable_update = pending_update;
+        let mut drawable_update = pending_update.clone();
         if !input.backlog_remaining || !pending_update.is_empty() {
             drawable_update.absorb(cursor_move_update(
                 &state,
@@ -445,27 +442,39 @@ fn run() -> Result<(), i32> {
                 log_slow_present(&state, total_elapsed, true, None);
             }
             true
-        } else if !drawable_update.partial_redraw_rect.is_empty() {
-            let render_started = Instant::now();
-            let render_rect_target = drawable_update
-                .partial_redraw_rect
-                .union(drawable_update.secondary_partial_redraw_rect);
-            render_rect(&mut state, render_rect_target);
-            let rect_count = 1_u64;
-            let pixel_count = render_rect_target
-                .width
-                .saturating_mul(render_rect_target.height) as u64;
-            let first_present_started = Instant::now();
-            match state.present_rect(render_rect_target) {
-                Ok(()) => {}
-                Err(err) if state.recover_if_stale_surface_error(err)? => {
-                    pending_update.request_full();
-                    continue;
+        } else if !drawable_update.partial_rects().is_empty() {
+            let render_rects = drawable_update.partial_rects().to_vec();
+            let mut render_elapsed = Duration::ZERO;
+            let mut present_elapsed = Duration::ZERO;
+            let mut present_union = canvas::Rect::empty();
+            let mut pixel_count = 0_u64;
+            let mut recovered_stale_surface = false;
+
+            for rect in &render_rects {
+                present_union = present_union.union(*rect);
+                pixel_count =
+                    pixel_count.saturating_add(rect.width.saturating_mul(rect.height) as u64);
+
+                let render_started = Instant::now();
+                render_rect(&mut state, *rect);
+                render_elapsed += render_started.elapsed();
+
+                let present_started = Instant::now();
+                match state.present_rect(*rect) {
+                    Ok(()) => {}
+                    Err(err) if state.recover_if_stale_surface_error(err)? => {
+                        pending_update.request_full();
+                        recovered_stale_surface = true;
+                        break;
+                    }
+                    Err(err) => return Err(err),
                 }
-                Err(err) => return Err(err),
+                present_elapsed += present_started.elapsed();
             }
-            let present_elapsed = first_present_started.elapsed();
-            let render_elapsed = render_started.elapsed().saturating_sub(present_elapsed);
+            if recovered_stale_surface {
+                continue;
+            }
+            let rect_count = render_rects.len() as u64;
             profile::record_present(
                 false,
                 rect_count,
@@ -475,7 +484,7 @@ fn run() -> Result<(), i32> {
             );
             let total_elapsed = render_elapsed + present_elapsed;
             if total_elapsed >= SLOW_PRESENT_THRESHOLD {
-                log_slow_present(&state, total_elapsed, false, Some(render_rect_target));
+                log_slow_present(&state, total_elapsed, false, Some(present_union));
             }
             true
         } else {

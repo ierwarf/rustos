@@ -5,6 +5,7 @@ use std::mem::size_of;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,11 @@ use runtime_control::{
 use rustos_user_abi::console::{
     self as console_abi, ConsoleCloseSessionRequest, ConsoleCreateSessionRequest,
     ConsoleSetFocusRequest, ConsoleSetSessionStateRequest,
+};
+use rustos_user_abi::syscall::{
+    LoaderSpawnRequest, LoaderSpawnResponse, IPC_SERVICE_LOADERD, LOADER_OP_SPAWN_EXEC,
+    LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES,
+    LOADER_SPAWN_EXEC_PATH_CAPACITY, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
 };
 
 const DEFAULT_USER_TASK_WEIGHT_MICROS: u64 = 50;
@@ -47,7 +53,7 @@ const CONSOLE_PATH: &str = console_abi::CONSOLE_PATH;
 const UI_SERVER_DESKTOP_FILE_ID: &str = "uiserver.desktop";
 const UI_SERVER_DISPLAY_NAME: &str = "UI Server";
 const UI_SERVER_EXEC_PATH: &str = "services/uiserver/uiserver.elf";
-const SYS_RUSTOS_SPAWN_EXEC: libc::c_long = 0x5255_0002;
+static LOADER_ENDPOINT_CACHE: AtomicU64 = AtomicU64::new(0);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -784,43 +790,123 @@ fn spawn_exec(
     logical_admin: bool,
     session_handle: u64,
 ) -> Result<i32, i32> {
-    boot_line(format!("runtimed: spawn syscall begin exec={}", exec_path).as_str());
-    let path = CString::new(exec_path).unwrap_or_else(|_| CString::new("/").unwrap());
+    boot_line(format!("runtimed: loader request begin exec={}", exec_path).as_str());
     let argv_storage = build_exec_argv(exec_path, argv);
     let env_storage = build_exec_env(env);
-    let mut argvp = argv_storage
-        .iter()
-        .map(|value| value.as_ptr())
-        .collect::<Vec<_>>();
-    argvp.push(std::ptr::null());
-    let mut envp = env_storage
-        .iter()
-        .map(|value| value.as_ptr())
-        .collect::<Vec<_>>();
-    envp.push(std::ptr::null());
-    let flags = u64::from(logical_admin);
-    let pid = unsafe {
+    let request = build_loader_spawn_request(
+        exec_path,
+        &argv_storage,
+        &env_storage,
+        logical_admin,
+        session_handle,
+    )?;
+    let endpoint = lookup_loader_endpoint()?;
+    let mut response = LoaderSpawnResponse::default();
+    let call = unsafe {
         libc::syscall(
-            SYS_RUSTOS_SPAWN_EXEC,
-            path.as_ptr(),
-            argvp.as_ptr(),
-            envp.as_ptr(),
-            flags,
-            session_handle,
-            DEFAULT_USER_TASK_WEIGHT_MICROS,
-        ) as i32
+            SYS_RUSTOS_IPC_CALL as libc::c_long,
+            endpoint,
+            (&request as *const LoaderSpawnRequest) as u64,
+            size_of::<LoaderSpawnRequest>() as u64,
+            (&mut response as *mut LoaderSpawnResponse) as u64,
+            size_of::<LoaderSpawnResponse>() as u64,
+        ) as i64
     };
-    if pid < 0 {
-        return Err(last_errno());
+    if call < 0 {
+        LOADER_ENDPOINT_CACHE.store(0, Ordering::Relaxed);
+        return Err((-call) as i32);
     }
+    if call as usize != size_of::<LoaderSpawnResponse>()
+        || response.version != LOADER_REQUEST_ABI_VERSION
+        || response.op != LOADER_OP_SPAWN_EXEC
+    {
+        return Err(libc::EINVAL);
+    }
+    if response.status != 0 {
+        return Err(response.status);
+    }
+    let Ok(pid) = i32::try_from(response.pid) else {
+        return Err(libc::EOVERFLOW);
+    };
     boot_line(
         format!(
-            "runtimed: spawn syscall returned exec={} pid={}",
+            "runtimed: loader request returned exec={} pid={}",
             exec_path, pid
         )
         .as_str(),
     );
     Ok(pid)
+}
+
+fn build_loader_spawn_request(
+    exec_path: &str,
+    argv: &[CString],
+    env: &[CString],
+    logical_admin: bool,
+    session_handle: u64,
+) -> Result<LoaderSpawnRequest, i32> {
+    let exec_bytes = exec_path.as_bytes();
+    if exec_bytes.is_empty()
+        || exec_bytes.len() > LOADER_SPAWN_EXEC_PATH_CAPACITY
+        || exec_bytes.contains(&0)
+    {
+        return Err(libc::EINVAL);
+    }
+    let mut request = LoaderSpawnRequest {
+        version: LOADER_REQUEST_ABI_VERSION,
+        op: LOADER_OP_SPAWN_EXEC,
+        flags: u32::from(logical_admin),
+        console_session: session_handle,
+        weight_micros: DEFAULT_USER_TASK_WEIGHT_MICROS,
+        exec_path_len: exec_bytes.len() as u32,
+        argv_count: u16::try_from(argv.len()).map_err(|_| libc::E2BIG)?,
+        env_count: u16::try_from(env.len()).map_err(|_| libc::E2BIG)?,
+        ..LoaderSpawnRequest::default()
+    };
+    request.exec_path[..exec_bytes.len()].copy_from_slice(exec_bytes);
+    request.argv_bytes_len =
+        copy_cstring_blob(argv, &mut request.argv_bytes, LOADER_SPAWN_ARG_BYTES)?;
+    request.env_bytes_len = copy_cstring_blob(env, &mut request.env_bytes, LOADER_SPAWN_ENV_BYTES)?;
+    Ok(request)
+}
+
+fn copy_cstring_blob(values: &[CString], dest: &mut [u8], capacity: usize) -> Result<u32, i32> {
+    let mut offset = 0usize;
+    for value in values {
+        let bytes = value.as_bytes();
+        let next = offset
+            .checked_add(bytes.len())
+            .and_then(|value| value.checked_add(1))
+            .ok_or(libc::E2BIG)?;
+        if next > capacity || next > dest.len() {
+            return Err(libc::E2BIG);
+        }
+        dest[offset..offset + bytes.len()].copy_from_slice(bytes);
+        dest[offset + bytes.len()] = 0;
+        offset = next;
+    }
+    u32::try_from(offset).map_err(|_| libc::E2BIG)
+}
+
+fn lookup_loader_endpoint() -> Result<u64, i32> {
+    let cached = LOADER_ENDPOINT_CACHE.load(Ordering::Relaxed);
+    if cached != 0 {
+        return Ok(cached);
+    }
+    let endpoint = unsafe {
+        libc::syscall(
+            SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT as libc::c_long,
+            IPC_SERVICE_LOADERD,
+        ) as i64
+    };
+    if endpoint < 0 {
+        return Err((-endpoint) as i32);
+    }
+    let endpoint = endpoint as u64;
+    if endpoint != 0 {
+        LOADER_ENDPOINT_CACHE.store(endpoint, Ordering::Relaxed);
+    }
+    Ok(endpoint)
 }
 
 fn stderr_line(message: &str) {

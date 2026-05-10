@@ -119,6 +119,26 @@ pub(crate) fn resolve_path_for_current_process(
     normalize_absolute_path(base_path.as_str(), path)
 }
 
+pub(crate) fn resolve_path_for_process(
+    process_id: u64,
+    path: &str,
+) -> Result<String, FileSysopError> {
+    if path.is_empty() || path.len() > MAX_OPEN_PATH_LEN {
+        return Err(FileSysopError::InvalidArgument);
+    }
+
+    let base_path = if path.starts_with('/') {
+        String::from("/")
+    } else {
+        multitask::with_process_state_by_pid_mut(process_id, |process_state| {
+            String::from(process_state.cwd())
+        })
+        .ok_or(FileSysopError::NotFound)?
+    };
+
+    normalize_absolute_path(base_path.as_str(), path)
+}
+
 pub(crate) fn open_path_for_current_process(
     absolute_path: &str,
     flags: u64,
@@ -359,13 +379,6 @@ pub(crate) fn metadata_for_current_process_path(
             vfs::VfsNodeKind::Device => FileNodeKind::File,
         },
     })
-}
-
-pub(crate) fn check_access_for_current_process(
-    absolute_path: &str,
-    mode: u64,
-) -> Result<(), FileSysopError> {
-    vfs::check_access_for_current_process(absolute_path, mode).map_err(Into::into)
 }
 
 fn resolve_base_path_for_dirfd(dirfd: u64) -> Result<String, FileSysopError> {

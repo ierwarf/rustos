@@ -1,0 +1,23 @@
+id = "loaderd"
+kind = "service"
+execution_domain = "user"
+profiles = ["default"]
+startup = "init"
+
+[build]
+builder = "cargo-kernel-binary"
+package = "loaderd"
+
+[install]
+path = "services/loaderd/loaderd.elf"
+
+[boot]
+preload = true
+required = false
+priority = -565
+
+[[desktop.entries]]
+display_name = "loaderd"
+weight_micros = 50
+logical_admin = true
+console_hosted = false

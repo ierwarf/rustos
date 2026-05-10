@@ -48,8 +48,13 @@ pub(crate) fn ftruncate(fd: u64, len: u64) -> Result<(), LinuxSysopError> {
     result
 }
 
-pub(crate) fn memfd_fcntl(fd: u64, cmd: u64, arg: u64) -> Result<Option<u64>, LinuxSysopError> {
-    let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
+pub(crate) fn memfd_fcntl_for_process(
+    process_id: u64,
+    fd: u64,
+    cmd: u64,
+    arg: u64,
+) -> Result<Option<u64>, LinuxSysopError> {
+    let Some(result) = multitask::with_process_state_by_pid_mut(process_id, |process_state| {
         let Some(handle) = process_state.handles().get(fd).cloned() else {
             return Err(LinuxSysopError::BadFileDescriptor);
         };

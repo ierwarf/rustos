@@ -11,6 +11,7 @@
 
 - [Structure Guide](structure.md)
 - [Logging Guide](logging.md)
+- [Fault Injection](fault-injection.md)
 
 # OS Developer APIs
 

@@ -49,42 +49,38 @@ impl CursorMotion {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct InputProcessingResult {
-    pub(crate) needs_full_redraw: bool,
-    pub(crate) partial_redraw_rect: canvas::Rect,
-    pub(crate) secondary_partial_redraw_rect: canvas::Rect,
+    pub(crate) visual_update: VisualUpdate,
     pub(crate) backlog_remaining: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+const MAX_PARTIAL_RECTS: usize = 32;
+const FULL_REDRAW_PROMOTION_NUMERATOR: u64 = 9;
+const FULL_REDRAW_PROMOTION_DENOMINATOR: u64 = 10;
+
+#[derive(Clone, Debug, Default)]
 pub(crate) struct VisualUpdate {
     pub(crate) needs_full_redraw: bool,
-    pub(crate) partial_redraw_rect: canvas::Rect,
-    pub(crate) secondary_partial_redraw_rect: canvas::Rect,
+    partial_rects: Vec<canvas::Rect>,
 }
 
 impl VisualUpdate {
     pub(crate) fn full() -> Self {
         Self {
             needs_full_redraw: true,
-            partial_redraw_rect: canvas::Rect::empty(),
-            secondary_partial_redraw_rect: canvas::Rect::empty(),
+            partial_rects: Vec::new(),
         }
     }
 
     pub(crate) fn partial(rect: canvas::Rect) -> Self {
-        Self {
-            needs_full_redraw: false,
-            partial_redraw_rect: rect,
-            secondary_partial_redraw_rect: canvas::Rect::empty(),
-        }
+        let mut update = Self::default();
+        update.add_partial_rect(rect);
+        update
     }
 
-    pub(crate) fn is_empty(self) -> bool {
-        !self.needs_full_redraw
-            && self.partial_redraw_rect.is_empty()
-            && self.secondary_partial_redraw_rect.is_empty()
+    pub(crate) fn is_empty(&self) -> bool {
+        !self.needs_full_redraw && self.partial_rects.is_empty()
     }
 
     pub(crate) fn absorb(&mut self, other: Self) {
@@ -93,57 +89,71 @@ impl VisualUpdate {
             return;
         }
 
-        self.merge_partial_rect(other.partial_redraw_rect);
-        self.merge_partial_rect(other.secondary_partial_redraw_rect);
+        for rect in other.partial_rects {
+            self.merge_partial_rect(rect);
+        }
+    }
+
+    pub(crate) fn add_partial_rect(&mut self, rect: canvas::Rect) {
+        if self.needs_full_redraw {
+            return;
+        }
+        self.merge_partial_rect(rect);
+    }
+
+    pub(crate) fn partial_rects(&self) -> &[canvas::Rect] {
+        &self.partial_rects
     }
 
     pub(crate) fn request_full(&mut self) {
         self.needs_full_redraw = true;
-        self.partial_redraw_rect = canvas::Rect::empty();
-        self.secondary_partial_redraw_rect = canvas::Rect::empty();
+        self.partial_rects.clear();
     }
 
     pub(crate) fn promote_large_partial(&mut self, width: u32, height: u32) {
-        if self.needs_full_redraw
-            || (self.partial_redraw_rect.is_empty()
-                && self.secondary_partial_redraw_rect.is_empty())
-        {
+        if self.needs_full_redraw || self.partial_rects.is_empty() {
             return;
         }
 
         let screen_area = u64::from(width) * u64::from(height);
-        let dirty_area = rect_area(self.partial_redraw_rect)
-            .saturating_add(rect_area(self.secondary_partial_redraw_rect))
-            .saturating_sub(rect_area(
-                self.partial_redraw_rect
-                    .intersect(self.secondary_partial_redraw_rect),
-            ));
-        if dirty_area.saturating_mul(2) >= screen_area {
+        let dirty_area = self
+            .partial_rects
+            .iter()
+            .fold(0_u64, |area, rect| area.saturating_add(rect_area(*rect)));
+        if dirty_area.saturating_mul(FULL_REDRAW_PROMOTION_DENOMINATOR)
+            >= screen_area.saturating_mul(FULL_REDRAW_PROMOTION_NUMERATOR)
+        {
             self.request_full();
         }
     }
 
     pub(crate) fn coalesce_tight_partials(&mut self) {
-        if self.needs_full_redraw
-            || self.partial_redraw_rect.is_empty()
-            || self.secondary_partial_redraw_rect.is_empty()
-        {
+        if self.needs_full_redraw || self.partial_rects.len() < 2 {
             return;
         }
 
-        let union = self
-            .partial_redraw_rect
-            .union(self.secondary_partial_redraw_rect);
-        let separate_area = rect_area(self.partial_redraw_rect)
-            .saturating_add(rect_area(self.secondary_partial_redraw_rect))
-            .saturating_sub(rect_area(
-                self.partial_redraw_rect
-                    .intersect(self.secondary_partial_redraw_rect),
-            ));
-        let union_area = rect_area(union);
-        if union_area <= separate_area.saturating_mul(2) {
-            self.partial_redraw_rect = union;
-            self.secondary_partial_redraw_rect = canvas::Rect::empty();
+        let mut index = 0;
+        while index < self.partial_rects.len() {
+            let mut merged = false;
+            let mut other = index + 1;
+            while other < self.partial_rects.len() {
+                let a = self.partial_rects[index];
+                let b = self.partial_rects[other];
+                let union = a.union(b);
+                let separate_area = rect_area(a)
+                    .saturating_add(rect_area(b))
+                    .saturating_sub(rect_area(a.intersect(b)));
+                if rect_area(union) <= separate_area.saturating_mul(2) {
+                    self.partial_rects[index] = union;
+                    self.partial_rects.swap_remove(other);
+                    merged = true;
+                    break;
+                }
+                other += 1;
+            }
+            if !merged {
+                index += 1;
+            }
         }
     }
 
@@ -156,21 +166,38 @@ impl VisualUpdate {
             return;
         }
 
-        if self.partial_redraw_rect.is_empty() {
-            self.partial_redraw_rect = rect;
+        if let Some(index) = self.tight_merge_target(rect) {
+            self.partial_rects[index] = self.partial_rects[index].union(rect);
             return;
         }
 
-        if self.secondary_partial_redraw_rect.is_empty() {
-            self.secondary_partial_redraw_rect = rect;
+        if self.partial_rects.len() < MAX_PARTIAL_RECTS {
+            self.partial_rects.push(rect);
             return;
         }
 
-        self.partial_redraw_rect = self
-            .partial_redraw_rect
-            .union(self.secondary_partial_redraw_rect)
-            .union(rect);
-        self.secondary_partial_redraw_rect = canvas::Rect::empty();
+        let index = self.lowest_growth_merge_target(rect).unwrap_or(0);
+        self.partial_rects[index] = self.partial_rects[index].union(rect);
+    }
+
+    fn tight_merge_target(&self, rect: canvas::Rect) -> Option<usize> {
+        self.partial_rects.iter().position(|existing| {
+            let union = existing.union(rect);
+            let separate_area = rect_area(*existing)
+                .saturating_add(rect_area(rect))
+                .saturating_sub(rect_area(existing.intersect(rect)));
+            rect_area(union) <= separate_area.saturating_mul(2)
+        })
+    }
+
+    fn lowest_growth_merge_target(&self, rect: canvas::Rect) -> Option<usize> {
+        self.partial_rects
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, existing)| {
+                rect_area(existing.union(rect)).saturating_sub(rect_area(**existing))
+            })
+            .map(|(index, _)| index)
     }
 }
 

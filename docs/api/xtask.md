@@ -19,6 +19,9 @@ defined in `tools/xtask/src/cli.rs`.
 | `cargo xtask run` | Run current staged image in QEMU. | QEMU session, `logs/debugcon.log`. |
 | `cargo xtask debug` | Run QEMU with GDB stub. | `logs/rustos-debug.gdb`. |
 | `cargo xtask probe-display` | Headless display probe/stress path. | Probe result and debug logs. |
+| `cargo xtask qemu-scenarios` | Run named QEMU regression scenarios. | QEMU logs and scenario result. |
+| `cargo xtask selftest` | Run host selftests for contracts and hardening helpers. | Cargo test output. |
+| `cargo xtask fuzz-host` | Run deterministic host parser fuzz smoke tests. | `logs/fuzz-crash-*.bin` on crash. |
 | `cargo xtask clean` | Remove cargo/build outputs. | Cleaned target/build dirs. |
 | `cargo xtask targets` | Install required Rust targets. | Rust target availability. |
 | `cargo xtask build-efi` | Build GRUB EFI boot manager only. Requires `RUSTOS_GRUB_PUBKEY` and `RUSTOS_GRUB_SIGNING_KEY`. | `build/artifacts/EFI/BOOT/BOOTX64.EFI`, `build/artifacts/nucleus.elf.sig`. |
@@ -41,6 +44,7 @@ defined in `tools/xtask/src/cli.rs`.
 | `--qemu-log <int|null>` | Write QEMU interrupt trace or disable QEMU trace logging. |
 | `--timeout <seconds>` | Stop QEMU after a bounded run. No timeout is applied by default. |
 | `--expect <marker>` | Stop successfully once all repeated debugcon markers appear. |
+| `--fault <location=action>` | Add one validated fault-injection rule for this run. |
 | `--summarize-log` | Print high-signal debugcon markers after QEMU stops. |
 | `--vfio-pci <BDF>` | Attach a host vfio-pci device. |
 | `--phoenix3-passthrough` | Auto-detect and attach Phoenix3 GPU functions. |
@@ -58,6 +62,15 @@ issues are isolated separately:
 ```bash
 cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file --timeout 35 --summarize-log -- --no-reboot
 ```
+
+Fault injection rules can come from `config/rustos.toml` or repeated
+`--fault` arguments:
+
+```bash
+cargo xtask run --fault display.present=drop-every:10 --timeout 35 --summarize-log -- --no-reboot
+```
+
+Use `cargo xtask qemu-scenarios --list` to see the built-in scenario names.
 
 ### When To Use Each Command
 
@@ -89,6 +102,9 @@ cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file -
 | `cargo xtask run` | 현재 staged image를 QEMU에서 실행합니다. | QEMU session, `logs/debugcon.log` |
 | `cargo xtask debug` | GDB stub과 함께 QEMU를 실행합니다. | `logs/rustos-debug.gdb` |
 | `cargo xtask probe-display` | headless display probe/stress path를 실행합니다. | probe result와 debug logs |
+| `cargo xtask qemu-scenarios` | 이름이 있는 QEMU regression scenario를 실행합니다. | QEMU log와 scenario result |
+| `cargo xtask selftest` | contract와 hardening helper host selftest를 실행합니다. | Cargo test output |
+| `cargo xtask fuzz-host` | deterministic host parser fuzz smoke test를 실행합니다. | crash 시 `logs/fuzz-crash-*.bin` |
 | `cargo xtask clean` | cargo/build output을 지웁니다. | 정리된 target/build dirs |
 | `cargo xtask targets` | 필요한 Rust target을 설치합니다. | Rust target availability |
 | `cargo xtask build-efi` | GRUB EFI boot manager만 빌드합니다. `RUSTOS_GRUB_PUBKEY`, `RUSTOS_GRUB_SIGNING_KEY`가 필요합니다. | `build/artifacts/EFI/BOOT/BOOTX64.EFI`, `build/artifacts/nucleus.elf.sig` |
@@ -111,6 +127,7 @@ cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file -
 | `--qemu-log <int|null>` | QEMU interrupt trace를 쓰거나 QEMU trace logging을 끔 |
 | `--timeout <seconds>` | 제한 시간 후 QEMU를 종료. 기본값은 timeout 없음 |
 | `--expect <marker>` | 반복 지정한 debugcon marker가 모두 나오면 성공으로 종료 |
+| `--fault <location=action>` | 이번 실행에만 validated fault-injection rule 추가 |
 | `--summarize-log` | QEMU 종료 후 high-signal debugcon marker 요약 출력 |
 | `--vfio-pci <BDF>` | host vfio-pci device attach |
 | `--phoenix3-passthrough` | Phoenix3 GPU function 자동 탐지/attach |
@@ -128,6 +145,15 @@ KVM no-opt bounded debugging은 AHCI boundary issue를 별도로 격리하기 �
 ```bash
 cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file --timeout 35 --summarize-log -- --no-reboot
 ```
+
+Fault injection rule은 `config/rustos.toml`에서 오거나 반복 지정한 `--fault`
+argument에서 옵니다.
+
+```bash
+cargo xtask run --fault display.present=drop-every:10 --timeout 35 --summarize-log -- --no-reboot
+```
+
+내장 scenario 이름은 `cargo xtask qemu-scenarios --list`로 확인합니다.
 
 ### 언제 어떤 명령을 쓰는가
 

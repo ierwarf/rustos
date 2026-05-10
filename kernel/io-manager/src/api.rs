@@ -510,6 +510,16 @@ pub mod vfs {
         crate::vfs::check_access_for_current_process(absolute_path, mode).map_err(map_vfs_error)
     }
 
+    pub fn check_access_for_user_process(
+        absolute_path: &str,
+        mode: u64,
+        abi: crate::user::UserAbi,
+        process_state: &mut crate::user::UserProcessState,
+    ) -> Result<(), VfsError> {
+        crate::vfs::check_access_for_user_process(absolute_path, mode, abi, process_state)
+            .map_err(map_vfs_error)
+    }
+
     pub fn read_path_to_vec_for_kernel(
         absolute_path: &str,
     ) -> Result<alloc::vec::Vec<u8>, VfsError> {

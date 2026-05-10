@@ -64,6 +64,13 @@ pub(crate) fn push_pointer_button_left(pressed: bool) {
 
 pub(crate) fn submit_pointer_packet(packet: PointerPacket, previous_buttons: u8) -> bool {
     POINTER_PACKET_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
+    if nucleus_core::util::fault_injection::should_fail("input.event.enqueue") {
+        crate::debug::warn!(
+            input,
+            "fault injection: input.event.enqueue dropped pointer packet"
+        );
+        return false;
+    }
     with_event_queue(|events| events.submit_pointer_packet(packet, previous_buttons))
 }
 
@@ -75,6 +82,13 @@ pub(crate) fn submit_pointer_absolute(
     previous_buttons: u8,
 ) -> bool {
     POINTER_ABSOLUTE_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
+    if nucleus_core::util::fault_injection::should_fail("input.event.enqueue") {
+        crate::debug::warn!(
+            input,
+            "fault injection: input.event.enqueue dropped absolute pointer"
+        );
+        return false;
+    }
     with_event_queue(|events| {
         events.submit_pointer_absolute(x, y, buttons, wheel_vertical, previous_buttons)
     })

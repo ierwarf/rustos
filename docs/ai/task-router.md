@@ -16,6 +16,7 @@ Second step: classify the user task into one row below. Read only the
 | Kernel API/change | `kernel-api-map.md` | relevant `kernel/*/src/api.rs`, then backing module range found by symbol search |
 | Kernel boot-order change | `kernel-api-map.md`, `contracts.md` | `kernel/src/main.rs`, then exact `kernel/executive/src/boot.rs` range |
 | Logging change | `contracts.md` | `config/rustos.toml`; open `tools/build_log_cfg.rs` only after searching category/level name |
+| Fault injection change | `contracts.md`, `commands.md` | `config/rustos.toml`; exact `libs/rustos-fault-injection`, `tools/xtask/src/qemu.rs`, or `kernel/nucleus-core/src/util/fault_injection.rs` range found by `rg` |
 | Runtime launch/session issue | `contracts.md` | `libs/runtime-control/src/lib.rs`, then exact `services/runtimed/src/main.rs` range |
 | UI/rendering issue | `repo-map.md` | search `services/uiserver/src`; open only the matching `render.rs` or `app/*` range |
 | Add service/app/driver | `workflows.md` | one closest existing manifest, one closest source file, target manifest/source only |

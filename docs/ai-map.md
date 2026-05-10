@@ -29,6 +29,8 @@ can reuse the prefix.
 - Runtime protocol/client: `libs/runtime-control/src/lib.rs`
 - Logging cfg generator: `tools/build_log_cfg.rs`
 - Logging policy: `config/rustos.toml` `[logging]`
+- Fault injection policy: `config/rustos.toml` `[fault_injection]`
+- Fault injection runtime: `kernel/nucleus-core/src/util/fault_injection.rs`
 
 ## Ownership
 

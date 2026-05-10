@@ -48,6 +48,18 @@ impl HandleEntry {
         self.rights
     }
 
+    pub fn supports_transfer(&self) -> bool {
+        self.handle.supports_descriptor_transfer(self.rights)
+    }
+
+    pub fn ipc_transfer_descriptor(
+        &self,
+        transfer_id: u64,
+    ) -> Option<crate::ipc::KernelTransferredHandle> {
+        (transfer_id != 0 && self.supports_transfer())
+            .then(|| crate::ipc::KernelTransferredHandle::new(transfer_id, self.token, self.rights))
+    }
+
     pub fn into_handle(self) -> KernelHandle {
         self.handle
     }
@@ -68,6 +80,29 @@ impl HandleEntry {
         let access_mode = self.status_flags & linux_abi::O_ACCMODE;
         let mutable = status_flags & !linux_abi::O_ACCMODE;
         self.status_flags = access_mode | (mutable & STATUS_FLAG_MASK);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TransferredHandleEntry {
+    entry: HandleEntry,
+}
+
+impl TransferredHandleEntry {
+    pub fn from_entry(entry: HandleEntry) -> Option<Self> {
+        entry.supports_transfer().then_some(Self { entry })
+    }
+
+    pub fn entry(&self) -> &HandleEntry {
+        &self.entry
+    }
+
+    pub fn ipc_descriptor(&self, transfer_id: u64) -> Option<crate::ipc::KernelTransferredHandle> {
+        self.entry.ipc_transfer_descriptor(transfer_id)
+    }
+
+    pub fn into_entry(self) -> HandleEntry {
+        self.entry
     }
 }
 
@@ -149,6 +184,22 @@ impl HandleTable {
     pub fn get_entry_mut(&mut self, fd: u64) -> Option<&mut HandleEntry> {
         let index = dynamic_index(fd)?;
         self.entries.get_mut(index)?.as_mut()
+    }
+
+    pub fn duplicate_for_transfer(&self, fd: u64) -> Option<TransferredHandleEntry> {
+        TransferredHandleEntry::from_entry(self.get_entry(fd)?.clone())
+    }
+
+    pub fn install_transferred(&mut self, transferred: TransferredHandleEntry) -> u64 {
+        self.install_entry(transferred.into_entry())
+    }
+
+    pub fn install_transferred_min(
+        &mut self,
+        transferred: TransferredHandleEntry,
+        min_fd: u64,
+    ) -> u64 {
+        self.install_entry_min(transferred.into_entry(), min_fd)
     }
 
     pub fn display_surface_count(&self) -> usize {
@@ -324,10 +375,12 @@ fn on_handle_close(handle: &KernelHandle) {
 mod tests {
     use alloc::vec;
 
-    use super::{FD_CLOEXEC, HandleEntry, HandleTable, KernelHandle, VfsFileHandle};
+    use super::{
+        FD_CLOEXEC, HandleEntry, HandleTable, KernelHandle, VfsDirectoryHandle, VfsFileHandle,
+    };
     use crate::memory::paging::UserRegion;
     use crate::user::linux as linux_abi;
-    use kernel_object::api::handle::{FileHandleRights, HandleRights};
+    use kernel_object::api::handle::{FileHandleRights, HandleOwner, HandleRights};
     use x86_64::VirtAddr;
 
     #[test]
@@ -431,6 +484,76 @@ mod tests {
         let target_fd = table.duplicate_exact(source_fd, 10, false).expect("dup");
 
         assert_eq!(table.get_entry(target_fd).expect("target").rights(), rights);
+    }
+
+    #[test]
+    fn transfer_duplicate_requires_transfer_right() {
+        let mut table = HandleTable::new();
+        let source_fd = table.install_entry(HandleEntry::new_with_rights(
+            KernelHandle::VfsFile(VfsFileHandle::read_only_memory("/source".into(), vec![1])),
+            HandleRights::File(FileHandleRights::READ),
+            0,
+            linux_abi::O_RDONLY,
+        ));
+
+        assert!(table.duplicate_for_transfer(source_fd).is_none());
+    }
+
+    #[test]
+    fn transfer_install_preserves_rights_and_flags() {
+        let mut source = HandleTable::new();
+        let source_fd = source.install_entry(HandleEntry::new(
+            KernelHandle::VfsFile(VfsFileHandle::read_only_memory("/source".into(), vec![1])),
+            FD_CLOEXEC,
+            linux_abi::O_RDONLY | linux_abi::O_NONBLOCK,
+        ));
+        let transferred = source
+            .duplicate_for_transfer(source_fd)
+            .expect("transferable source fd");
+        assert!(transferred.ipc_descriptor(0).is_none());
+        let descriptor = transferred
+            .ipc_descriptor(99)
+            .expect("ipc transfer descriptor");
+        assert_eq!(descriptor.transfer_id(), 99);
+        assert_eq!(descriptor.token().owner(), HandleOwner::Io);
+        assert!(descriptor.rights().allows_transfer());
+
+        let mut target = HandleTable::new();
+        let target_fd = target.install_transferred(transferred);
+        let target_entry = target.get_entry(target_fd).expect("target fd");
+        assert_eq!(target_entry.fd_flags() & FD_CLOEXEC, FD_CLOEXEC);
+        assert_ne!(target_entry.status_flags() & linux_abi::O_NONBLOCK, 0);
+        assert!(target_entry.rights().allows_transfer());
+    }
+
+    #[test]
+    fn directory_fds_are_file_caps_for_vfs_transfer() {
+        let mut table = HandleTable::new();
+        let dir_fd = table.install(KernelHandle::VfsDirectory(VfsDirectoryHandle::new(
+            "/dir".into(),
+            vec![],
+        )));
+
+        let transferred = table
+            .duplicate_for_transfer(dir_fd)
+            .expect("directory fd should be transferable");
+        assert!(transferred.entry().rights().allows_transfer());
+    }
+
+    #[test]
+    fn device_fds_are_transferable_for_policy_brokers() {
+        let mut table = HandleTable::new();
+        let display_fd = table.install(KernelHandle::Device(
+            crate::io::device::DeviceHandle::with_access(
+                crate::io::device::DeviceId::Display,
+                crate::io::device::DeviceAccessKind::Native,
+            ),
+        ));
+
+        let transferred = table
+            .duplicate_for_transfer(display_fd)
+            .expect("device fd should be transferable after policy approval");
+        assert!(transferred.entry().rights().allows_transfer());
     }
 
     #[test]

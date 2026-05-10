@@ -5,6 +5,8 @@ use crate::build;
 use crate::config::{self as config_mod, Config};
 use crate::qemu;
 use crate::stage;
+use crate::testinfra;
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "cargo xtask", disable_version_flag = true)]
@@ -30,6 +32,27 @@ enum XtaskCommand {
     ProbeDisplay {
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         args: Vec<String>,
+    },
+    #[command(name = "qemu-scenarios")]
+    QemuScenarios {
+        #[arg(long)]
+        list: bool,
+        #[arg(long = "scenario")]
+        scenarios: Vec<String>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, default_value_t = 35)]
+        timeout: u64,
+    },
+    Selftest,
+    #[command(name = "fuzz-host")]
+    FuzzHost {
+        #[arg(long, default_value = "all")]
+        target: String,
+        #[arg(long, default_value_t = 256)]
+        iterations: usize,
+        #[arg(long)]
+        corpus: Option<PathBuf>,
     },
     Stage,
     #[command(name = "targets", visible_alias = "target")]
@@ -76,6 +99,18 @@ pub(crate) fn run() -> Result<()> {
         Some(XtaskCommand::ProbeDisplay { args }) => {
             qemu::probe_display_command(&config, args.into_iter())
         }
+        Some(XtaskCommand::QemuScenarios {
+            list,
+            scenarios,
+            dry_run,
+            timeout,
+        }) => qemu::scenarios_command(&config, list, scenarios, dry_run, timeout),
+        Some(XtaskCommand::Selftest) => testinfra::selftest(&config),
+        Some(XtaskCommand::FuzzHost {
+            target,
+            iterations,
+            corpus,
+        }) => testinfra::fuzz_host(&config, &target, iterations, corpus.as_deref()),
         Some(XtaskCommand::Stage) => stage::stage(&config),
         Some(XtaskCommand::Targets) => build::ensure_targets(&config),
         Some(XtaskCommand::BuildEfi) => build::build_efi(&config),

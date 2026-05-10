@@ -175,11 +175,18 @@ pub(crate) mod vfs {
         kernel_io_manager::api::vfs::metadata_for_current_process_path(absolute_path)
     }
 
-    pub fn check_access_for_current_process(
+    pub fn check_access_for_user_process(
         absolute_path: &str,
         mode: u64,
+        abi: crate::user::abi::UserAbi,
+        process_state: &mut crate::user::process_state::UserProcessState,
     ) -> Result<(), VfsError> {
-        kernel_io_manager::api::vfs::check_access_for_current_process(absolute_path, mode)
+        kernel_io_manager::api::vfs::check_access_for_user_process(
+            absolute_path,
+            mode,
+            abi,
+            process_state,
+        )
     }
 
     pub fn read_path_to_vec_for_kernel(

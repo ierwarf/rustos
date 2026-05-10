@@ -1,0 +1,23 @@
+id = "driverd"
+kind = "service"
+execution_domain = "user"
+profiles = ["default"]
+startup = "init"
+
+[build]
+builder = "cargo-kernel-binary"
+package = "driverd"
+
+[install]
+path = "services/driverd/driverd.elf"
+
+[boot]
+preload = true
+required = false
+priority = -586
+
+[[desktop.entries]]
+display_name = "driverd"
+weight_micros = 50
+logical_admin = true
+console_hosted = false

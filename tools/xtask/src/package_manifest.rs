@@ -274,6 +274,12 @@ pub(crate) fn load_manifests(root_dir: &Path) -> Result<Vec<PackageManifest>> {
     Ok(manifests)
 }
 
+pub(crate) fn validate_manifest_text_for_testinfra(text: &str) -> Result<()> {
+    let _: PackageManifest =
+        toml::from_str(text).map_err(|err| anyhow!("invalid package manifest: {err}"))?;
+    Ok(())
+}
+
 pub(crate) fn load_profile_manifests(
     root_dir: &Path,
     profile: &str,

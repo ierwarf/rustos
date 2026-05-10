@@ -23,6 +23,10 @@ pub fn spawn_user_process_with_parent(
     parent_process_id: Option<u64>,
     weight_micros: u64,
 ) -> Result<u64, SpawnTaskError> {
+    if nucleus_core::util::fault_injection::should_fail("process.spawn") {
+        crate::debug::warn!(process, "fault injection: process.spawn failed");
+        return Err(SpawnTaskError::NoFreeTaskSlot);
+    }
     let id = NEXT_TASK_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let pit_divisor = checked_thread_pit_divisor(weight_micros)?;
     let user_cs = crate::arch::gdt::user_code_selector().0 as u64;

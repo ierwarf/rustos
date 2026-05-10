@@ -8,6 +8,7 @@ boot-protocol = { path = "../../boot/boot-protocol" }
 boot-random = { path = "../../libs/boot-random" }
 os_observatory = { version = "0.1.1", default-features = false }
 rustos-observability = { path = "../../libs/rustos-observability" }
+rustos-fault-injection = { path = "../../libs/rustos-fault-injection" }
 trace-loc-macro = { path = "../../libs/trace-loc-macro" }
 embedded-graphics = { version = "0.8", default-features = false }
 spin = "0.10.0"

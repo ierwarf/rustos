@@ -1,5 +1,366 @@
 #![no_std]
 
+pub mod syscall {
+    pub const SYS_RUSTOS_DEBUG_PRINT: u64 = 0x5255_0001;
+    pub const SYS_RUSTOS_SPAWN_EXEC: u64 = 0x5255_0002;
+    pub const SYS_RUSTOS_IPC_ENDPOINT_CREATE: u64 = 0x5255_0003;
+    pub const SYS_RUSTOS_IPC_CALL: u64 = 0x5255_0004;
+    pub const SYS_RUSTOS_IPC_RECV: u64 = 0x5255_0005;
+    pub const SYS_RUSTOS_IPC_REPLY: u64 = 0x5255_0006;
+    pub const SYS_RUSTOS_IPC_REGISTER_LINUX_SYSCALL_ENDPOINT: u64 = 0x5255_0007;
+    pub const SYS_RUSTOS_STATX_METADATA: u64 = 0x5255_0008;
+    pub const SYS_RUSTOS_STAT_METADATA: u64 = 0x5255_0009;
+    pub const SYS_RUSTOS_READLINK_METADATA: u64 = 0x5255_000a;
+    pub const SYS_RUSTOS_ACCESS_METADATA: u64 = 0x5255_000b;
+    pub const SYS_RUSTOS_GETCWD_METADATA: u64 = 0x5255_000c;
+    pub const SYS_RUSTOS_CHDIR_METADATA: u64 = 0x5255_000d;
+    pub const SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT: u64 = 0x5255_000e;
+    pub const SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT: u64 = 0x5255_000f;
+    pub const SYS_RUSTOS_IPC_CALL_WITH_HANDLES: u64 = 0x5255_0010;
+    pub const SYS_RUSTOS_IPC_RECV_WITH_HANDLES: u64 = 0x5255_0011;
+    pub const SYS_RUSTOS_IPC_REPLY_WITH_HANDLES: u64 = 0x5255_0012;
+    pub const SYS_RUSTOS_FD_CLOSE_BROKER: u64 = 0x5255_0013;
+    pub const SYS_RUSTOS_FD_DUP_BROKER: u64 = 0x5255_0014;
+    pub const SYS_RUSTOS_FD_GETDENTS64_BROKER: u64 = 0x5255_0015;
+    pub const SYS_RUSTOS_FD_FCNTL_BROKER: u64 = 0x5255_0016;
+    pub const SYS_RUSTOS_VFS_MOUNT_BROKER: u64 = 0x5255_0017;
+    pub const SYS_RUSTOS_VFS_UMOUNT_BROKER: u64 = 0x5255_0018;
+    pub const SYS_RUSTOS_PROC_PREPARE_BROKER: u64 = 0x5255_0019;
+    pub const SYS_RUSTOS_PROC_MAP_FILE_BROKER: u64 = 0x5255_001a;
+    pub const SYS_RUSTOS_PROC_MAP_ZEROED_BROKER: u64 = 0x5255_001b;
+    pub const SYS_RUSTOS_PROC_COMMIT_BROKER: u64 = 0x5255_001c;
+    pub const SYS_RUSTOS_PROC_ABORT_BROKER: u64 = 0x5255_001d;
+
+    pub const IPC_ABI_VERSION: u16 = 1;
+    pub const IPC_MAX_INLINE_BYTES: usize = 4096;
+    pub const IPC_MAX_TRANSFER_HANDLES: usize = 16;
+    pub const IPC_SERVICE_LINUX_SYSCALLD: u64 = 1;
+    pub const IPC_SERVICE_VFSD: u64 = 2;
+    pub const IPC_SERVICE_NETD: u64 = 3;
+    pub const IPC_SERVICE_DEVMGRD: u64 = 4;
+    pub const IPC_SERVICE_DRIVERD: u64 = 5;
+    pub const IPC_SERVICE_LOADERD: u64 = 6;
+    pub const SYSCALL_OFFLOAD_ABI_VERSION: u16 = 1;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_STATX: u16 = 1;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_NEWFSTATAT: u16 = 2;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_READLINKAT: u16 = 3;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_ACCESS: u16 = 4;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_GETCWD: u16 = 5;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_CHDIR: u16 = 6;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_MKDIR: u16 = 7;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_UNAME: u16 = 8;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_PRLIMIT64: u16 = 9;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_SCHED_GETAFFINITY: u16 = 10;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_GETUID: u16 = 11;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_GETGID: u16 = 12;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_GETEUID: u16 = 13;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_GETEGID: u16 = 14;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_SETUID: u16 = 15;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_SETGID: u16 = 16;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_OPENAT: u16 = 17;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_GETDENTS64: u16 = 18;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_CLOSE: u16 = 19;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_DUP: u16 = 20;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_FCNTL: u16 = 21;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_MOUNT: u16 = 22;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_UMOUNT2: u16 = 23;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_UNLINKAT: u16 = 24;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_SOCKET: u16 = 32;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR: u16 = 33;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_BIND: u16 = 34;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_LISTEN: u16 = 35;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_ACCEPT: u16 = 36;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_CONNECT: u16 = 37;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_IOCTL: u16 = 48;
+    pub const SYSCALL_OFFLOAD_OP_DRIVER_LOAD_POLICY: u16 = 64;
+    pub const SYSCALL_OFFLOAD_PATH_CAPACITY: usize = 256;
+    pub const SYSCALL_OFFLOAD_PAYLOAD_CAPACITY: usize = 0x200;
+    pub const LINUX_STAT_SIZE: usize = 0x90;
+    pub const LINUX_STATX_SIZE: usize = 0x100;
+    pub const LINUX_RLIMIT_SIZE: usize = 0x10;
+    pub const LINUX_UTSNAME_SIZE: usize = 65 * 6;
+    pub const LINUX_CPUSET_BYTES: usize = 8;
+    pub const LINUX_DEFAULT_STACK_RLIMIT_BYTES: u64 = 8 * 1024 * 1024;
+    pub const LOADER_REQUEST_ABI_VERSION: u16 = 1;
+    pub const LOADER_OP_SPAWN_EXEC: u16 = 1;
+    pub const LOADER_SPAWN_EXEC_PATH_CAPACITY: usize = 256;
+    pub const LOADER_SPAWN_ARG_BYTES: usize = 1024;
+    pub const LOADER_SPAWN_ENV_BYTES: usize = 2048;
+    pub const LOADER_SPAWN_MAX_ARG_COUNT: usize = 32;
+    pub const LOADER_SPAWN_MAX_ENV_COUNT: usize = 64;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct IpcMessageHeader {
+        pub version: u16,
+        pub op: u16,
+        pub flags: u32,
+        pub payload_len: u32,
+        pub handle_count: u16,
+        pub reserved: u16,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct IpcCallWithHandlesArgs {
+        pub endpoint: u64,
+        pub request_ptr: u64,
+        pub request_len: u64,
+        pub reply_ptr: u64,
+        pub reply_capacity: u64,
+        pub send_fds_ptr: u64,
+        pub send_fd_count: u16,
+        pub recv_fd_capacity: u16,
+        pub reserved0: u32,
+        pub recv_fds_ptr: u64,
+        pub recv_fd_count_ptr: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct IpcRecvWithHandlesArgs {
+        pub endpoint: u64,
+        pub request_ptr: u64,
+        pub request_capacity: u64,
+        pub reply_cap_ptr: u64,
+        pub recv_fds_ptr: u64,
+        pub recv_fd_count_ptr: u64,
+        pub recv_fd_capacity: u16,
+        pub reserved0: u16,
+        pub reserved1: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct IpcReplyWithHandlesArgs {
+        pub reply_cap: u64,
+        pub response_ptr: u64,
+        pub response_len: u64,
+        pub send_fds_ptr: u64,
+        pub send_fd_count: u16,
+        pub reserved0: u16,
+        pub reserved1: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct RustosVfsMountBrokerArgs {
+        pub process_id: u64,
+        pub source_ptr: u64,
+        pub target_path_ptr: u64,
+        pub target_path_len: u64,
+        pub fstype_ptr: u64,
+        pub flags: u64,
+        pub data_ptr: u64,
+        pub reserved0: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct RustosProcPrepareBrokerArgs {
+        pub abi_version: u16,
+        pub format: u16,
+        pub flags: u32,
+        pub reserved0: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct RustosProcMapFileBrokerArgs {
+        pub prepare_handle: u64,
+        pub fd: u64,
+        pub file_offset: u64,
+        pub target_addr: u64,
+        pub file_len: u64,
+        pub mem_len: u64,
+        pub flags: u64,
+        pub reserved0: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct RustosProcMapZeroedBrokerArgs {
+        pub prepare_handle: u64,
+        pub target_addr: u64,
+        pub mem_len: u64,
+        pub flags: u64,
+        pub reserved0: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct RustosProcCommitBrokerArgs {
+        pub prepare_handle: u64,
+        pub exec_path_ptr: u64,
+        pub exec_path_len: u64,
+        pub argv_ptr: u64,
+        pub envp_ptr: u64,
+        pub flags: u64,
+        pub console_session: u64,
+        pub weight_micros: u64,
+        pub reserved0: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct RustosProcAbortBrokerArgs {
+        pub prepare_handle: u64,
+        pub reason: u64,
+        pub reserved0: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct LoaderSpawnRequest {
+        pub version: u16,
+        pub op: u16,
+        pub flags: u32,
+        pub console_session: u64,
+        pub weight_micros: u64,
+        pub exec_path_len: u32,
+        pub argv_count: u16,
+        pub env_count: u16,
+        pub argv_bytes_len: u32,
+        pub env_bytes_len: u32,
+        pub reserved0: u64,
+        pub exec_path: [u8; LOADER_SPAWN_EXEC_PATH_CAPACITY],
+        pub argv_bytes: [u8; LOADER_SPAWN_ARG_BYTES],
+        pub env_bytes: [u8; LOADER_SPAWN_ENV_BYTES],
+    }
+
+    impl Default for LoaderSpawnRequest {
+        fn default() -> Self {
+            Self {
+                version: LOADER_REQUEST_ABI_VERSION,
+                op: LOADER_OP_SPAWN_EXEC,
+                flags: 0,
+                console_session: 0,
+                weight_micros: 0,
+                exec_path_len: 0,
+                argv_count: 0,
+                env_count: 0,
+                argv_bytes_len: 0,
+                env_bytes_len: 0,
+                reserved0: 0,
+                exec_path: [0; LOADER_SPAWN_EXEC_PATH_CAPACITY],
+                argv_bytes: [0; LOADER_SPAWN_ARG_BYTES],
+                env_bytes: [0; LOADER_SPAWN_ENV_BYTES],
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct LoaderSpawnResponse {
+        pub version: u16,
+        pub op: u16,
+        pub status: i32,
+        pub pid: i64,
+        pub reserved0: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct LinuxSyscallOffloadRequest {
+        pub version: u16,
+        pub op: u16,
+        pub reserved0: u32,
+        pub pid: u64,
+        pub tid: u64,
+        pub session_handle: u64,
+        pub uid: u32,
+        pub gid: u32,
+        pub euid: u32,
+        pub egid: u32,
+        pub dirfd: u64,
+        pub flags: u64,
+        pub arg0: u64,
+        pub arg1: u64,
+        pub mask: u32,
+        pub path_len: u32,
+        pub path: [u8; SYSCALL_OFFLOAD_PATH_CAPACITY],
+    }
+
+    impl Default for LinuxSyscallOffloadRequest {
+        fn default() -> Self {
+            Self {
+                version: SYSCALL_OFFLOAD_ABI_VERSION,
+                op: SYSCALL_OFFLOAD_OP_LINUX_STATX,
+                reserved0: 0,
+                pid: 0,
+                tid: 0,
+                session_handle: 0,
+                uid: 0,
+                gid: 0,
+                euid: 0,
+                egid: 0,
+                dirfd: 0,
+                flags: 0,
+                arg0: 0,
+                arg1: 0,
+                mask: 0,
+                path_len: 0,
+                path: [0; SYSCALL_OFFLOAD_PATH_CAPACITY],
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct LinuxSyscallOffloadResponse {
+        pub version: u16,
+        pub op: u16,
+        pub status: i32,
+        pub payload_len: u32,
+        pub reserved0: u32,
+        pub payload: [u8; SYSCALL_OFFLOAD_PAYLOAD_CAPACITY],
+    }
+
+    impl Default for LinuxSyscallOffloadResponse {
+        fn default() -> Self {
+            Self {
+                version: SYSCALL_OFFLOAD_ABI_VERSION,
+                op: SYSCALL_OFFLOAD_OP_LINUX_STATX,
+                status: 0,
+                payload_len: 0,
+                reserved0: 0,
+                payload: [0; SYSCALL_OFFLOAD_PAYLOAD_CAPACITY],
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct LinuxRlimit {
+        pub rlim_cur: u64,
+        pub rlim_max: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct LinuxUtsName {
+        pub sysname: [u8; 65],
+        pub nodename: [u8; 65],
+        pub release: [u8; 65],
+        pub version: [u8; 65],
+        pub machine: [u8; 65],
+        pub domainname: [u8; 65],
+    }
+
+    impl Default for LinuxUtsName {
+        fn default() -> Self {
+            Self {
+                sysname: [0; 65],
+                nodename: [0; 65],
+                release: [0; 65],
+                version: [0; 65],
+                machine: [0; 65],
+                domainname: [0; 65],
+            }
+        }
+    }
+}
+
 pub mod ioctl {
     pub const NRBITS: u64 = 8;
     pub const TYPEBITS: u64 = 8;
@@ -88,6 +449,43 @@ pub mod ui {
         pub bytes_per_pixel: u32,
         pub pixel_format: u32,
         pub reserved: u32,
+    }
+}
+
+#[cfg(test)]
+mod syscall_tests {
+    use core::mem::size_of;
+
+    use super::syscall::{
+        IPC_MAX_INLINE_BYTES, LINUX_RLIMIT_SIZE, LINUX_STATX_SIZE, LINUX_UTSNAME_SIZE, LinuxRlimit,
+        LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, LinuxUtsName,
+        SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_STATX, SYSCALL_OFFLOAD_PATH_CAPACITY,
+        SYSCALL_OFFLOAD_PAYLOAD_CAPACITY,
+    };
+
+    #[test]
+    fn statx_offload_messages_fit_inline_ipc_v1() {
+        assert!(size_of::<LinuxSyscallOffloadRequest>() <= IPC_MAX_INLINE_BYTES);
+        assert!(size_of::<LinuxSyscallOffloadResponse>() <= IPC_MAX_INLINE_BYTES);
+        assert_eq!(LINUX_STATX_SIZE, 0x100);
+        assert_eq!(SYSCALL_OFFLOAD_PATH_CAPACITY, 256);
+        assert_eq!(SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, 0x200);
+        assert_eq!(LINUX_RLIMIT_SIZE, size_of::<LinuxRlimit>());
+        assert_eq!(LINUX_UTSNAME_SIZE, size_of::<LinuxUtsName>());
+    }
+
+    #[test]
+    fn statx_offload_defaults_are_valid_v1_headers() {
+        let request = LinuxSyscallOffloadRequest::default();
+        assert_eq!(request.version, SYSCALL_OFFLOAD_ABI_VERSION);
+        assert_eq!(request.op, SYSCALL_OFFLOAD_OP_LINUX_STATX);
+        assert_eq!(request.reserved0, 0);
+
+        let response = LinuxSyscallOffloadResponse::default();
+        assert_eq!(response.version, SYSCALL_OFFLOAD_ABI_VERSION);
+        assert_eq!(response.op, SYSCALL_OFFLOAD_OP_LINUX_STATX);
+        assert_eq!(response.reserved0, 0);
+        assert_eq!(response.payload_len, 0);
     }
 }
 
@@ -449,7 +847,7 @@ pub mod device {
 mod tests {
     use core::mem::size_of;
 
-    use super::{console, device, ui};
+    use super::{console, device, syscall, ui};
 
     #[test]
     fn display_abi_layout_is_stable() {
@@ -465,5 +863,13 @@ mod tests {
         assert_eq!(size_of::<console::ConsoleStateInfo>(), 16);
         assert_eq!(size_of::<console::ConsoleSessionInfo>(), 72);
         assert_eq!(size_of::<console::ConsoleCreateSessionRequest>(), 48);
+    }
+
+    #[test]
+    fn loader_abi_layout_fits_inline_ipc() {
+        assert_eq!(syscall::IPC_SERVICE_LOADERD, 6);
+        assert!(size_of::<syscall::LoaderSpawnRequest>() <= syscall::IPC_MAX_INLINE_BYTES);
+        assert!(size_of::<syscall::LoaderSpawnResponse>() <= syscall::IPC_MAX_INLINE_BYTES);
+        assert!(size_of::<syscall::RustosProcCommitBrokerArgs>() <= syscall::IPC_MAX_INLINE_BYTES);
     }
 }

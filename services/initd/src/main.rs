@@ -8,8 +8,18 @@ use runtime_control::{
     load_runtime_default_env, load_startup_entries, RuntimeEnvScope, StartupEntry, StartupMode,
     DEFAULT_APPLICATIONS_DIR, DEFAULT_RUNTIME_ENV_REGISTRY_PATH,
 };
+use rustos_user_abi::syscall::{
+    IPC_SERVICE_DEVMGRD, IPC_SERVICE_DRIVERD, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD,
+    IPC_SERVICE_NETD, IPC_SERVICE_VFSD, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
+};
 
 const INITD_EXEC_PATH: &str = "services/initd/initd.elf";
+const SYSCALLD_EXEC_PATH: &str = "services/syscalld/syscalld.elf";
+const VFSD_EXEC_PATH: &str = "services/vfsd/vfsd.elf";
+const NETD_EXEC_PATH: &str = "services/netd/netd.elf";
+const DEVMGRD_EXEC_PATH: &str = "services/devmgrd/devmgrd.elf";
+const DRIVERD_EXEC_PATH: &str = "services/driverd/driverd.elf";
+const LOADERD_EXEC_PATH: &str = "services/loaderd/loaderd.elf";
 const RUNTIMED_EXEC_PATH: &str = "services/runtimed/runtimed.elf";
 const STORAGED_EXEC_PATH: &str = "services/storaged/storaged.elf";
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -58,12 +68,16 @@ fn main() {
             .map(|service| service.package_id.clone())
             .collect::<BTreeSet<_>>();
         let now = Instant::now();
+        let mut launched_this_round = false;
         for entry in startup_entries.clone() {
             if !runtime_deps_satisfied(
                 &entry.runtime_deps,
                 &running_packages,
                 &launched_once_packages,
             ) {
+                continue;
+            }
+            if !launch_gate_satisfied(entry.exec.as_str()) {
                 continue;
             }
 
@@ -86,6 +100,12 @@ fn main() {
 
             match spawn_exec(entry.exec.as_str()) {
                 Ok(pid) => {
+                    observability_client::info!(
+                        "initd",
+                        service,
+                        "launch {} pid={pid}",
+                        entry.exec
+                    );
                     running.insert(
                         pid,
                         RunningService {
@@ -98,7 +118,8 @@ fn main() {
                     if !entry.restart {
                         launched_once_packages.insert(entry.package_id);
                     }
-                    thread::yield_now();
+                    launched_this_round = true;
+                    break;
                 }
                 Err(err) => {
                     observability_client::error!(
@@ -112,6 +133,9 @@ fn main() {
             }
         }
 
+        if launched_this_round {
+            thread::yield_now();
+        }
         thread::sleep(POLL_INTERVAL);
     }
 }
@@ -154,10 +178,62 @@ fn startup_launch_entry(entry: StartupEntry) -> StartupLaunchEntry {
 
 fn init_exec_priority(exec: &str) -> u8 {
     match exec {
-        RUNTIMED_EXEC_PATH => 0,
-        STORAGED_EXEC_PATH => 1,
-        _ => 2,
+        SYSCALLD_EXEC_PATH => 0,
+        VFSD_EXEC_PATH => 1,
+        NETD_EXEC_PATH => 2,
+        DEVMGRD_EXEC_PATH => 3,
+        DRIVERD_EXEC_PATH => 4,
+        LOADERD_EXEC_PATH => 5,
+        RUNTIMED_EXEC_PATH => 6,
+        STORAGED_EXEC_PATH => 7,
+        _ => 8,
     }
+}
+
+fn launch_gate_satisfied(exec: &str) -> bool {
+    match exec {
+        SYSCALLD_EXEC_PATH | VFSD_EXEC_PATH => true,
+        NETD_EXEC_PATH | DEVMGRD_EXEC_PATH | DRIVERD_EXEC_PATH => {
+            service_ready(IPC_SERVICE_LINUX_SYSCALLD) && service_ready(IPC_SERVICE_VFSD)
+        }
+        LOADERD_EXEC_PATH => core_policy_without_loader_ready(),
+        _ => core_policy_services_ready(),
+    }
+}
+
+fn core_policy_without_loader_ready() -> bool {
+    [
+        IPC_SERVICE_LINUX_SYSCALLD,
+        IPC_SERVICE_VFSD,
+        IPC_SERVICE_NETD,
+        IPC_SERVICE_DEVMGRD,
+        IPC_SERVICE_DRIVERD,
+    ]
+    .into_iter()
+    .all(service_ready)
+}
+
+fn core_policy_services_ready() -> bool {
+    [
+        IPC_SERVICE_LINUX_SYSCALLD,
+        IPC_SERVICE_VFSD,
+        IPC_SERVICE_NETD,
+        IPC_SERVICE_DEVMGRD,
+        IPC_SERVICE_DRIVERD,
+        IPC_SERVICE_LOADERD,
+    ]
+    .into_iter()
+    .all(service_ready)
+}
+
+fn service_ready(service_id: u64) -> bool {
+    let result = unsafe {
+        libc::syscall(
+            SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT as libc::c_long,
+            service_id,
+        ) as i64
+    };
+    result > 0
 }
 
 fn runtime_deps_satisfied(
@@ -186,6 +262,15 @@ fn reap_children(
         };
         if pid > 0 {
             if let Some(service) = running.remove(&pid) {
+                observability_client::warn!(
+                    "initd",
+                    service,
+                    "service exited package={} exec={} pid={} status={}",
+                    service.package_id,
+                    service.exec,
+                    pid,
+                    status
+                );
                 if service.restart {
                     retry_after.insert(service.exec, Instant::now() + RETRY_BACKOFF);
                 }
@@ -218,7 +303,7 @@ fn spawn_exec(exec_path: &str) -> Result<i32, i32> {
             envp.as_ptr(),
             1_u64,
             0_u64,
-            50_u64,
+            exec_weight_micros(exec_path),
         ) as i32
     };
     if pid < 0 {
@@ -226,6 +311,11 @@ fn spawn_exec(exec_path: &str) -> Result<i32, i32> {
     }
     boot_line(&format!("initd: spawn returned exec={exec_path} pid={pid}"));
     Ok(pid)
+}
+
+fn exec_weight_micros(exec_path: &str) -> u64 {
+    let _ = exec_path;
+    50
 }
 
 fn last_errno() -> i32 {

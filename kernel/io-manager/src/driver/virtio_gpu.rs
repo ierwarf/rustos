@@ -1,5 +1,5 @@
 use core::ptr;
-use core::sync::atomic::{AtomicBool, Ordering, compiler_fence};
+use core::sync::atomic::{AtomicBool, Ordering, compiler_fence, fence as atomic_fence};
 
 use crate::sync::KernelSpinLock as Mutex;
 use boot_protocol::{
@@ -66,6 +66,7 @@ const VIRTIO_GPU_CMD_SET_SCANOUT: u32 = 0x0103;
 const VIRTIO_GPU_RESP_OK_NODATA: u32 = 0x1100;
 const VIRTIO_GPU_RESP_OK_DISPLAY_INFO: u32 = 0x1101;
 const VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM: u32 = 2;
+const VIRTIO_GPU_FLAG_FENCE: u32 = 1 << 0;
 
 const HDR_SIZE: usize = 24;
 const RECT_SIZE: usize = 16;
@@ -115,6 +116,7 @@ struct VirtioGpuDisplay {
     flush_backoff_until_tick: u64,
     flush_timeout_count: u32,
     needs_full_flush: bool,
+    next_fence_id: u64,
 }
 
 unsafe impl Send for VirtioGpuDisplay {}
@@ -173,6 +175,7 @@ impl VirtioGpuDisplay {
             VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D,
             56,
             VIRTIO_GPU_RESP_OK_NODATA,
+            false,
             |buf, _, _| {
                 write_rect(buf, HDR_SIZE, x, y, width, height);
                 write_u64(buf, HDR_SIZE + RECT_SIZE, offset);
@@ -187,6 +190,7 @@ impl VirtioGpuDisplay {
             VIRTIO_GPU_CMD_RESOURCE_FLUSH,
             48,
             VIRTIO_GPU_RESP_OK_NODATA,
+            true,
             |buf, _, _| {
                 write_rect(buf, HDR_SIZE, x, y, width, height);
                 write_u32(buf, HDR_SIZE + RECT_SIZE, RESOURCE_ID_PRIMARY);
@@ -207,6 +211,7 @@ impl VirtioGpuDisplay {
         ty: u32,
         request_len: usize,
         expected_response: u32,
+        fence: bool,
         fill: impl FnOnce(&mut [u8], u32, u32),
     ) -> bool {
         let request = unsafe {
@@ -217,6 +222,10 @@ impl VirtioGpuDisplay {
         };
         request.fill(0);
         write_u32(request, 0, ty);
+        if fence {
+            write_u32(request, 4, VIRTIO_GPU_FLAG_FENCE);
+            write_u64(request, 8, self.allocate_fence_id());
+        }
         fill(request, self.width, self.height);
 
         let response = unsafe {
@@ -249,6 +258,15 @@ impl VirtioGpuDisplay {
     }
 
     fn submit_control(&mut self, request_len: usize, response_len: usize) -> bool {
+        if nucleus_core::util::fault_injection::should_fail("virtio-gpu.control.submit") {
+            trace_native(
+                "virtio-gpu-native-fault-submit",
+                request_len as u64,
+                response_len as u64,
+            );
+            crate::debug::warn!(display, "fault injection: virtio-gpu.control.submit failed");
+            return false;
+        }
         let desc = unsafe { self.queue.mem_cpu.add(self.queue.desc_offset) };
         let avail = unsafe { self.queue.mem_cpu.add(self.queue.avail_offset) };
         let used = unsafe { self.queue.mem_cpu.add(self.queue.used_offset) };
@@ -279,8 +297,10 @@ impl VirtioGpuDisplay {
                 head,
             );
             self.queue.avail_idx = self.queue.avail_idx.wrapping_add(1);
+            dma_ordering_barrier();
             compiler_fence(Ordering::SeqCst);
             ptr::write_volatile(avail.add(2) as *mut u16, self.queue.avail_idx);
+            dma_ordering_barrier();
             compiler_fence(Ordering::SeqCst);
             ptr::write_volatile(
                 self.notify.add(self.queue_notify_offset()) as *mut u16,
@@ -290,6 +310,7 @@ impl VirtioGpuDisplay {
 
         if let Some(next_used) = wait_for_queue_used(used, self.queue.used_idx) {
             let expected_next_used = self.queue.used_idx.wrapping_add(1);
+            dma_ordering_barrier();
             compiler_fence(Ordering::SeqCst);
             let used_index = self.queue.used_idx as usize % self.queue.queue_size as usize;
             let used_elem = unsafe { used.add(4 + used_index * 8) };
@@ -315,6 +336,12 @@ impl VirtioGpuDisplay {
 
     fn queue_notify_offset(&self) -> usize {
         self.notify_offset
+    }
+
+    fn allocate_fence_id(&mut self) -> u64 {
+        let fence_id = self.next_fence_id;
+        self.next_fence_id = self.next_fence_id.wrapping_add(1).max(1);
+        fence_id
     }
 
     fn flush_backoff_active(&self) -> bool {
@@ -400,6 +427,10 @@ fn milliseconds_to_ticks(milliseconds: u64) -> u64 {
         / 1000
 }
 
+fn dma_ordering_barrier() {
+    atomic_fence(Ordering::SeqCst);
+}
+
 unsafe impl Send for VirtQueue {}
 
 pub(crate) fn try_enable_primary_display() -> bool {
@@ -478,10 +509,7 @@ pub(crate) fn flush_primary() -> bool {
         trace_native("virtio-gpu-native-flush-irq-off-deferred", 0, 0);
         return false;
     }
-    let Some(mut display) = DISPLAY.try_lock() else {
-        DISPLAY_NEEDS_FULL_FLUSH.store(true, Ordering::Release);
-        return false;
-    };
+    let mut display = DISPLAY.lock();
     let Some(display) = display.as_mut() else {
         return true;
     };
@@ -497,10 +525,7 @@ pub(crate) fn flush_primary_rect(x: u32, y: u32, width: u32, height: u32) -> boo
         trace_native("virtio-gpu-native-flush-rect-irq-off-deferred", 0, 0);
         return false;
     }
-    let Some(mut display) = DISPLAY.try_lock() else {
-        DISPLAY_NEEDS_FULL_FLUSH.store(true, Ordering::Release);
-        return false;
-    };
+    let mut display = DISPLAY.lock();
     let Some(display) = display.as_mut() else {
         return true;
     };
@@ -623,6 +648,7 @@ fn probe_and_init() -> Option<VirtioGpuDisplay> {
         flush_backoff_until_tick: 0,
         flush_timeout_count: 0,
         needs_full_flush: false,
+        next_fence_id: 1,
     };
 
     unsafe {
@@ -727,6 +753,7 @@ fn create_resource_2d(controller: &mut VirtioGpuDisplay) -> bool {
         VIRTIO_GPU_CMD_RESOURCE_CREATE_2D,
         40,
         VIRTIO_GPU_RESP_OK_NODATA,
+        true,
         |buf, width, height| {
             write_u32(buf, HDR_SIZE, RESOURCE_ID_PRIMARY);
             write_u32(buf, HDR_SIZE + 4, VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM);
@@ -742,6 +769,7 @@ fn attach_backing(controller: &mut VirtioGpuDisplay, framebuffer_dma: u64) -> bo
         VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING,
         48,
         VIRTIO_GPU_RESP_OK_NODATA,
+        true,
         |buf, _, _| {
             write_u32(buf, HDR_SIZE, RESOURCE_ID_PRIMARY);
             write_u32(buf, HDR_SIZE + 4, 1);
@@ -757,6 +785,7 @@ fn set_scanout(controller: &mut VirtioGpuDisplay) -> bool {
         VIRTIO_GPU_CMD_SET_SCANOUT,
         48,
         VIRTIO_GPU_RESP_OK_NODATA,
+        true,
         |buf, width, height| {
             write_rect(buf, HDR_SIZE, 0, 0, width, height);
             write_u32(buf, HDR_SIZE + RECT_SIZE, 0);
@@ -770,6 +799,7 @@ fn query_display_info(controller: &mut VirtioGpuDisplay) -> Option<(u32, u32)> {
         VIRTIO_GPU_CMD_GET_DISPLAY_INFO,
         HDR_SIZE,
         VIRTIO_GPU_RESP_OK_DISPLAY_INFO,
+        false,
         |_, _, _| {},
     ) {
         return None;

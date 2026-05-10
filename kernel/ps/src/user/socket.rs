@@ -312,6 +312,9 @@ impl SocketHandle {
         if src.is_empty() {
             return Ok(0);
         }
+        if nucleus_core::util::fault_injection::should_fail("socket.send") {
+            return Err(SocketError::TryAgain);
+        }
 
         let mut sent = 0usize;
         while sent < src.len() {
@@ -413,6 +416,9 @@ impl SocketHandle {
                 Err(SocketError::InvalidArgument)
             };
         }
+        if nucleus_core::util::fault_injection::should_fail("socket.send") {
+            return Err(SocketError::TryAgain);
+        }
 
         loop {
             let peer = {
@@ -483,6 +489,9 @@ impl SocketHandle {
     ) -> Result<(usize, Vec<PassedHandle>), SocketError> {
         if dest.is_empty() {
             return Ok((0, Vec::new()));
+        }
+        if nucleus_core::util::fault_injection::should_fail("socket.recv") {
+            return Err(SocketError::TryAgain);
         }
 
         loop {

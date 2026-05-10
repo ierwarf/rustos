@@ -514,7 +514,9 @@ impl AppState {
                 }
 
                 window.frame = next_frame;
-                VisualUpdate::partial(previous_frame.union(next_frame))
+                let mut update = VisualUpdate::partial(previous_frame);
+                update.add_partial_rect(next_frame);
+                update
             }
             Some(DragTarget::Wayland(surface_id)) => {
                 let Some(index) = self
@@ -548,7 +550,10 @@ impl AppState {
                     wayland.move_surface(surface_id, next_outer.x, next_outer.y);
                     self.sync_wayland_windows(wayland.window_snapshots());
                 }
-                VisualUpdate::partial(previous_outer.union(next_outer).union(next_dirty))
+                let mut update = VisualUpdate::partial(previous_outer);
+                update.add_partial_rect(next_outer);
+                update.add_partial_rect(next_dirty);
+                update
             }
             None => VisualUpdate::default(),
         }

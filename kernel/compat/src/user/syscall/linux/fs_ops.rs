@@ -1,5 +1,5 @@
 use super::*;
-
+use rustos_user_abi::syscall::{SYSCALL_OFFLOAD_OP_LINUX_IOCTL, SYSCALL_OFFLOAD_OP_LINUX_UNLINKAT};
 pub(super) fn syscall_linux_write(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
     debug_log_secondary_linux_syscall(|| {
         alloc::format!("write fd={} ptr={:#x} len={}", fd, user_ptr, user_len)
@@ -20,6 +20,15 @@ pub(super) fn syscall_linux_write(fd: u64, user_ptr: u64, user_len: u64) -> u64 
 }
 
 pub(super) fn syscall_linux_unlink(path_ptr: u64) -> u64 {
+    if let Err(errno) = vfs_path_policy(
+        SYSCALL_OFFLOAD_OP_LINUX_UNLINKAT,
+        linux_abi::AT_FDCWD as u64,
+        path_ptr,
+        0,
+        0,
+    ) {
+        return linux_errno(errno);
+    }
     match linux_ops::unlink(path_ptr) {
         Ok(()) => 0,
         Err(err) => {
@@ -56,9 +65,15 @@ pub(super) fn syscall_linux_read(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
 }
 
 pub(super) fn syscall_linux_close(fd: u64) -> u64 {
-    match linux_ops::close(fd) {
+    if offload_ops::current_process_may_bootstrap_policy_service() {
+        return match linux_ops::close(fd) {
+            Ok(()) => 0,
+            Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
+        };
+    }
+    match offload_ops::call_vfs_close_fd(fd) {
         Ok(()) => 0,
-        Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
+        Err(errno) => linux_errno(errno),
     }
 }
 
@@ -152,16 +167,28 @@ pub(super) fn syscall_linux_epoll_pwait(
 }
 
 pub(super) fn syscall_linux_dup(fd: u64) -> u64 {
-    match linux_ops::dup(fd) {
+    if offload_ops::current_process_may_bootstrap_policy_service() {
+        return match linux_ops::dup(fd) {
+            Ok(new_fd) => new_fd,
+            Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
+        };
+    }
+    match offload_ops::call_vfs_dup_fd(fd, 0, 0, offload_ops::VFSD_DUP_MODE_DUP) {
         Ok(new_fd) => new_fd,
-        Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
+        Err(errno) => linux_errno(errno),
     }
 }
 
 pub(super) fn syscall_linux_dup2(oldfd: u64, newfd: u64) -> u64 {
-    match linux_ops::dup2(oldfd, newfd) {
+    if offload_ops::current_process_may_bootstrap_policy_service() {
+        return match linux_ops::dup2(oldfd, newfd) {
+            Ok(fd) => fd,
+            Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
+        };
+    }
+    match offload_ops::call_vfs_dup_fd(oldfd, newfd, 0, offload_ops::VFSD_DUP_MODE_DUP2) {
         Ok(fd) => fd,
-        Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
+        Err(errno) => linux_errno(errno),
     }
 }
 
@@ -191,22 +218,6 @@ pub(super) fn syscall_linux_writev(fd: u64, iov_ptr: u64, iov_count: u64) -> u64
     }
 }
 
-pub(super) fn syscall_linux_access(path_ptr: u64, mode: u64) -> u64 {
-    match linux_ops::access(path_ptr, mode) {
-        Ok(()) => 0,
-        Err(err) => {
-            debug::println!(
-                "linux access rejected: path_ptr={:#x} path={} mode={:#x} err={:?}",
-                path_ptr,
-                debug_user_path(path_ptr),
-                mode,
-                err,
-            );
-            linux_errno(linux_sysop_error_to_errno(err))
-        }
-    }
-}
-
 pub(super) fn syscall_linux_mount(
     source_ptr: u64,
     target_ptr: u64,
@@ -214,56 +225,58 @@ pub(super) fn syscall_linux_mount(
     flags: u64,
     data_ptr: u64,
 ) -> u64 {
-    match linux_ops::mount(source_ptr, target_ptr, fstype_ptr, flags, data_ptr) {
-        Ok(()) => 0,
-        Err(err) => {
-            debug::println!(
-                "linux mount rejected: source_ptr={:#x} target_ptr={:#x} fstype_ptr={:#x} flags={:#x} data_ptr={:#x} err={:?}",
-                source_ptr,
-                target_ptr,
-                fstype_ptr,
-                flags,
-                data_ptr,
-                err,
-            );
-            linux_errno(linux_sysop_error_to_errno(err))
+    if source_ptr == 0 || target_ptr == 0 || fstype_ptr == 0 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    if let Err(err) = usermem::read_current_user_c_string(source_ptr, 256) {
+        return linux_errno(address_space_error_to_linux_errno(err));
+    }
+    if let Err(err) = usermem::read_current_user_c_string(fstype_ptr, 64) {
+        return linux_errno(address_space_error_to_linux_errno(err));
+    }
+    if data_ptr != 0 {
+        if let Err(err) = usermem::read_current_user_c_string(data_ptr, 256) {
+            return linux_errno(address_space_error_to_linux_errno(err));
         }
     }
-}
-
-pub(super) fn syscall_linux_chdir(path_ptr: u64) -> u64 {
-    match linux_ops::chdir(path_ptr) {
+    let target_path = match linux_ops::resolve_readlinkat_absolute_path_for_current_process(
+        linux_abi::AT_FDCWD as u64,
+        target_ptr,
+    ) {
+        Ok(path) => path,
+        Err(err) => return linux_errno(linux_sysop_error_to_errno(err)),
+    };
+    match offload_ops::call_vfs_mount(source_ptr, &target_path, fstype_ptr, flags, data_ptr) {
         Ok(()) => 0,
-        Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
-    }
-}
-
-pub(super) fn syscall_linux_mkdir(path_ptr: u64, mode: u64) -> u64 {
-    match linux_ops::mkdir(path_ptr, mode) {
-        Ok(()) => 0,
-        Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
+        Err(errno) => linux_errno(errno),
     }
 }
 
 pub(super) fn syscall_linux_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64) -> u64 {
-    match linux_ops::openat(dirfd, path_ptr, flags, mode) {
+    if offload_ops::current_process_may_bootstrap_policy_service() {
+        return match linux_ops::openat(dirfd, path_ptr, flags, mode) {
+            Ok(fd) => fd,
+            Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
+        };
+    }
+    let absolute_path =
+        match linux_ops::resolve_readlinkat_absolute_path_for_current_process(dirfd, path_ptr) {
+            Ok(path) => path,
+            Err(err) => return linux_errno(linux_sysop_error_to_errno(err)),
+        };
+    let mode = u32::try_from(mode).unwrap_or(u32::MAX);
+    match offload_ops::call_vfs_openat_with_fd(dirfd, flags, mode, absolute_path.as_str()) {
         Ok(fd) => fd,
-        Err(err) => {
-            debug::println!(
-                "linux openat rejected: dirfd={} path_ptr={:#x} path={} flags={:#x} mode={:#x} err={:?}",
-                dirfd,
-                path_ptr,
-                debug_user_path(path_ptr),
-                flags,
-                mode,
-                err,
-            );
-            linux_errno(linux_sysop_error_to_errno(err))
-        }
+        Err(errno) => linux_errno(errno),
     }
 }
 
 pub(super) fn syscall_linux_unlinkat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
+    if let Err(errno) =
+        vfs_path_policy(SYSCALL_OFFLOAD_OP_LINUX_UNLINKAT, dirfd, path_ptr, flags, 0)
+    {
+        return linux_errno(errno);
+    }
     match linux_ops::unlinkat(dirfd, path_ptr, flags) {
         Ok(()) => 0,
         Err(err) => {
@@ -283,38 +296,42 @@ pub(super) fn syscall_linux_unlinkat(dirfd: u64, path_ptr: u64, flags: u64) -> u
 }
 
 pub(super) fn syscall_linux_getdents64(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
-    match linux_ops::getdents64(fd, user_ptr, user_len) {
-        Ok(read) => read as u64,
-        Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
+    if offload_ops::current_process_may_bootstrap_policy_service() {
+        return match linux_ops::getdents64(fd, user_ptr, user_len) {
+            Ok(read) => read as u64,
+            Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
+        };
     }
-}
-
-pub(super) fn syscall_linux_getcwd(user_ptr: u64, user_len: u64) -> u64 {
-    match linux_ops::getcwd(user_ptr, user_len) {
-        Ok(read) => read as u64,
-        Err(err) => {
-            debug::println!(
-                "linux getcwd rejected: user_ptr={:#x} len={} err={:?}",
-                user_ptr,
-                user_len,
-                err,
-            );
-            linux_errno(linux_sysop_error_to_errno(err))
-        }
+    match offload_ops::call_vfs_getdents64(fd, user_ptr, user_len) {
+        Ok(read) => read,
+        Err(errno) => linux_errno(errno),
     }
 }
 
 pub(super) fn syscall_linux_umount2(target_ptr: u64, flags: u64) -> u64 {
-    match linux_ops::umount2(target_ptr, flags) {
+    let target_path = match linux_ops::resolve_readlinkat_absolute_path_for_current_process(
+        linux_abi::AT_FDCWD as u64,
+        target_ptr,
+    ) {
+        Ok(path) => path,
+        Err(err) => return linux_errno(linux_sysop_error_to_errno(err)),
+    };
+    match offload_ops::call_vfs_umount2(&target_path, flags) {
         Ok(()) => 0,
-        Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
+        Err(errno) => linux_errno(errno),
     }
 }
 
 pub(super) fn syscall_linux_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
-    match linux_ops::fcntl(fd, cmd, arg) {
+    if offload_ops::current_process_may_bootstrap_policy_service() {
+        return match linux_ops::fcntl(fd, cmd, arg) {
+            Ok(result) => result,
+            Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
+        };
+    }
+    match offload_ops::call_vfs_fcntl(fd, cmd, arg) {
         Ok(result) => result,
-        Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
+        Err(errno) => linux_errno(errno),
     }
 }
 
@@ -325,90 +342,16 @@ pub(super) fn syscall_linux_pread64(fd: u64, user_ptr: u64, user_len: u64, offse
     }
 }
 
-pub(super) fn syscall_linux_newfstatat(
-    dirfd: u64,
-    path_ptr: u64,
-    stat_ptr: u64,
-    flags: u64,
-) -> u64 {
-    match linux_ops::newfstatat(dirfd, path_ptr, stat_ptr, flags) {
-        Ok(()) => 0,
-        Err(err) => {
-            if !matches!(err, linux_ops::LinuxSysopError::NotFound) {
-                debug::println!(
-                    "linux newfstatat rejected: dirfd={} path_ptr={:#x} path={} stat_ptr={:#x} flags={:#x} err={:?}",
-                    dirfd,
-                    path_ptr,
-                    debug_user_path(path_ptr),
-                    stat_ptr,
-                    flags,
-                    err,
-                );
-            }
-            linux_errno(linux_sysop_error_to_errno(err))
-        }
-    }
-}
-
-pub(super) fn syscall_linux_readlink(path_ptr: u64, user_ptr: u64, user_len: u64) -> u64 {
-    match linux_ops::readlink(path_ptr, user_ptr, user_len) {
-        Ok(read) => read as u64,
-        Err(err) => {
-            debug::println!(
-                "linux readlink rejected: path_ptr={:#x} path={} user_ptr={:#x} len={} err={:?}",
-                path_ptr,
-                debug_user_path(path_ptr),
-                user_ptr,
-                user_len,
-                err,
-            );
-            linux_errno(linux_sysop_error_to_errno(err))
-        }
-    }
-}
-
-pub(super) fn syscall_linux_readlinkat(
-    dirfd: u64,
-    path_ptr: u64,
-    user_ptr: u64,
-    user_len: u64,
-) -> u64 {
-    match linux_ops::readlinkat(dirfd, path_ptr, user_ptr, user_len) {
-        Ok(read) => read as u64,
-        Err(err) => {
-            debug::println!(
-                "linux readlinkat rejected: dirfd={} path_ptr={:#x} path={} user_ptr={:#x} len={} err={:?}",
-                dirfd,
-                path_ptr,
-                debug_user_path(path_ptr),
-                user_ptr,
-                user_len,
-                err,
-            );
-            linux_errno(linux_sysop_error_to_errno(err))
-        }
-    }
-}
-
-pub(super) fn syscall_linux_faccessat(dirfd: u64, path_ptr: u64, mode: u64, flags: u64) -> u64 {
-    match linux_ops::faccessat(dirfd, path_ptr, mode, flags) {
-        Ok(()) => 0,
-        Err(err) => {
-            debug::println!(
-                "linux faccessat rejected: dirfd={} path_ptr={:#x} path={} mode={:#x} flags={:#x} err={:?}",
-                dirfd,
-                path_ptr,
-                debug_user_path(path_ptr),
-                mode,
-                flags,
-                err,
-            );
-            linux_errno(linux_sysop_error_to_errno(err))
-        }
-    }
-}
-
 pub(super) fn syscall_linux_ioctl(fd: u64, request: u64, arg: u64) -> u64 {
+    if let Err(errno) = offload_ops::call_service_policy(
+        linux_abi::IPC_SERVICE_DEVMGRD,
+        SYSCALL_OFFLOAD_OP_LINUX_IOCTL,
+        fd,
+        request,
+        u32::try_from(arg).unwrap_or(u32::MAX),
+    ) {
+        return linux_errno(errno);
+    }
     match linux_ops::ioctl(fd, request, arg) {
         Ok(value) => value,
         Err(err) => {
@@ -425,8 +368,21 @@ pub(super) fn syscall_linux_ioctl(fd: u64, request: u64, arg: u64) -> u64 {
 }
 
 pub(super) fn syscall_linux_dup3(oldfd: u64, newfd: u64, flags: u64) -> u64 {
-    match linux_ops::dup3(oldfd, newfd, flags) {
-        Ok(fd) => fd,
-        Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
+    if offload_ops::current_process_may_bootstrap_policy_service() {
+        return match linux_ops::dup3(oldfd, newfd, flags) {
+            Ok(fd) => fd,
+            Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
+        };
     }
+    match offload_ops::call_vfs_dup_fd(oldfd, newfd, flags, offload_ops::VFSD_DUP_MODE_DUP3) {
+        Ok(fd) => fd,
+        Err(errno) => linux_errno(errno),
+    }
+}
+
+fn vfs_path_policy(op: u16, dirfd: u64, path_ptr: u64, flags: u64, arg0: u32) -> Result<(), i64> {
+    let absolute_path =
+        linux_ops::resolve_readlinkat_absolute_path_for_current_process(dirfd, path_ptr)
+            .map_err(linux_sysop_error_to_errno)?;
+    offload_ops::call_vfs_path_policy(op, dirfd, flags, arg0, absolute_path.as_str())
 }

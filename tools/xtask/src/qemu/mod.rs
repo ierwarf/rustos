@@ -29,6 +29,7 @@ struct RunOptions {
     auto_phoenix3_passthrough: bool,
     network: bool,
     vfio_hosts: Vec<String>,
+    fault_rules: Vec<String>,
     qemu_user_args: Vec<String>,
 }
 
@@ -50,6 +51,16 @@ impl RunOptions {
                 Some("0" | "false" | "False" | "off" | "Off" | "no" | "No")
             ),
             vfio_hosts: Vec::new(),
+            fault_rules: env_string("RUSTOS_FAULTS")
+                .map(|value| {
+                    value
+                        .split(';')
+                        .map(str::trim)
+                        .filter(|rule| !rule.is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
             qemu_user_args: Vec::new(),
         }
     }
@@ -71,6 +82,7 @@ struct PreparedRun {
     display_args: Vec<OsString>,
     debugcon_args: Vec<OsString>,
     qemu_log_args: Vec<OsString>,
+    fault_args: Vec<OsString>,
     qemu_user_args: Vec<String>,
     debugcon_log: Option<PathBuf>,
 }
@@ -158,6 +170,7 @@ const PROBE_STEP_DELAY: Duration = Duration::from_millis(25);
 const PROBE_STRESS_DURATION_DEFAULT: Duration = Duration::from_secs(20);
 const PROBE_HEARTBEAT_STALL_DEFAULT: Duration = Duration::from_millis(2500);
 const QEMU_WAIT_POLL: Duration = Duration::from_millis(100);
+const FAULT_FW_CFG_NAME: &str = "opt/rustos/fault-injection";
 
 const RUN_SUMMARY_MARKERS: &[&str] = &[
     "[PANIC]",
@@ -208,6 +221,87 @@ const RUN_SUMMARY_MARKERS: &[&str] = &[
     "wayland",
 ];
 
+#[derive(Clone, Copy)]
+enum ScenarioCommand {
+    Run,
+    ProbeDisplay,
+}
+
+struct QemuScenario {
+    name: &'static str,
+    description: &'static str,
+    command: ScenarioCommand,
+    args: fn(u64) -> Vec<String>,
+}
+
+impl QemuScenario {
+    fn command_name(&self) -> &'static str {
+        match self.command {
+            ScenarioCommand::Run => "run",
+            ScenarioCommand::ProbeDisplay => "probe-display",
+        }
+    }
+}
+
+fn qemu_scenarios() -> Vec<QemuScenario> {
+    vec![
+        QemuScenario {
+            name: "boot-smoke",
+            description: "headless AHCI boot with debug summary and no network device",
+            command: ScenarioCommand::Run,
+            args: |timeout| {
+                scenario_args(
+                    timeout,
+                    &["--no-network"],
+                    &["--no-reboot", "-display", "none"],
+                )
+            },
+        },
+        QemuScenario {
+            name: "display-probe",
+            description: "headless display probe with screendump/non-black validation",
+            command: ScenarioCommand::ProbeDisplay,
+            args: |timeout| scenario_args(timeout, &["--no-network"], &["--no-reboot"]),
+        },
+        QemuScenario {
+            name: "usb-input-display",
+            description: "display probe with USB keyboard/tablet input attached",
+            command: ScenarioCommand::ProbeDisplay,
+            args: |timeout| {
+                scenario_args(timeout, &["--usb-input", "--no-network"], &["--no-reboot"])
+            },
+        },
+        QemuScenario {
+            name: "nvme-smoke",
+            description: "headless NVMe boot profile smoke test",
+            command: ScenarioCommand::Run,
+            args: |timeout| {
+                scenario_args(
+                    timeout,
+                    &["--profile", "nvme", "--no-network"],
+                    &["--no-reboot", "-display", "none"],
+                )
+            },
+        },
+    ]
+}
+
+fn scenario_args(timeout: u64, xtask_args: &[&str], qemu_args: &[&str]) -> Vec<String> {
+    let mut args = vec![
+        "--debugcon".to_string(),
+        "file".to_string(),
+        "--timeout".to_string(),
+        timeout.to_string(),
+        "--summarize-log".to_string(),
+    ];
+    args.extend(xtask_args.iter().map(|arg| arg.to_string()));
+    if !qemu_args.is_empty() {
+        args.push("--".to_string());
+        args.extend(qemu_args.iter().map(|arg| arg.to_string()));
+    }
+    args
+}
+
 pub(crate) fn run_qemu_command<I>(config: &Config, mut args: I) -> Result<()>
 where
     I: Iterator<Item = String>,
@@ -240,6 +334,51 @@ where
     append_unique_string(&mut options.qemu_user_args, String::from("-S"));
     write_gdb_helper(config)?;
     run_qemu_with_options(config, options)
+}
+
+pub(crate) fn scenarios_command(
+    config: &Config,
+    list: bool,
+    selected: Vec<String>,
+    dry_run: bool,
+    timeout_secs: u64,
+) -> Result<()> {
+    if timeout_secs == 0 {
+        bail!("--timeout must be greater than zero");
+    }
+    let scenarios = qemu_scenarios();
+    if list {
+        for scenario in scenarios {
+            println!("{}: {}", scenario.name, scenario.description);
+        }
+        return Ok(());
+    }
+
+    let selected = if selected.is_empty() {
+        scenarios
+            .iter()
+            .map(|scenario| scenario.name)
+            .collect::<Vec<_>>()
+    } else {
+        selected.iter().map(String::as_str).collect::<Vec<_>>()
+    };
+
+    for name in selected {
+        let Some(scenario) = scenarios.iter().find(|candidate| candidate.name == name) else {
+            bail!("unknown QEMU scenario: {name}");
+        };
+        let args = (scenario.args)(timeout_secs);
+        if dry_run {
+            println!("cargo xtask {} {}", scenario.command_name(), args.join(" "));
+            continue;
+        }
+        println!("xtask: running QEMU scenario {}", scenario.name);
+        match scenario.command {
+            ScenarioCommand::Run => run_qemu_command(config, args.into_iter())?,
+            ScenarioCommand::ProbeDisplay => probe_display_command(config, args.into_iter())?,
+        }
+    }
+    Ok(())
 }
 
 fn parse_run_options<I>(args: &mut I, help: fn()) -> Result<Option<RunOptions>>
@@ -285,6 +424,12 @@ where
                 let marker = next_required_arg(args, "--expect")?;
                 append_unique_string(&mut options.expect_markers, marker);
             }
+            "--fault" => {
+                let rule = next_required_arg(args, "--fault")?;
+                rustos_fault_injection::parse_rule(&rule)
+                    .map_err(|err| anyhow!("invalid --fault rule {rule:?}: {err}"))?;
+                append_unique_string(&mut options.fault_rules, rule);
+            }
             "--summarize-log" => options.summarize_log = true,
             "--vfio-pci" => {
                 let host = next_required_arg(args, "--vfio-pci")?;
@@ -325,6 +470,7 @@ fn run_qemu_with_options(config: &Config, options: RunOptions) -> Result<()> {
         &prepared.display_args,
         &prepared.debugcon_args,
         &prepared.qemu_log_args,
+        &prepared.fault_args,
         &prepared.qemu_user_args,
     );
 
@@ -605,6 +751,7 @@ fn prepare_run(config: &Config, options: RunOptions) -> Result<PreparedRun> {
     let display_args = configure_display_args(&options.qemu_user_args, use_kvm);
     let (debugcon_args, debugcon_log) = configure_debugcon(config, &mut session, options.debugcon)?;
     let qemu_log_args = configure_qemu_log(config, options.qemu_log)?;
+    let fault_args = configure_fault_args(config, &options.fault_rules)?;
 
     Ok(PreparedRun {
         qemu_bin,
@@ -617,6 +764,7 @@ fn prepare_run(config: &Config, options: RunOptions) -> Result<PreparedRun> {
         display_args,
         debugcon_args,
         qemu_log_args,
+        fault_args,
         qemu_user_args: options.qemu_user_args,
         debugcon_log,
     })
@@ -637,6 +785,7 @@ options:
   --qemu-log <int|null>              write QEMU trace log to logs/qemu_interrupt.log or disable it
   --timeout <seconds>                stop QEMU after this many seconds; no default timeout
   --expect <marker>                  stop successfully once all repeated expected markers appear
+  --fault <location=action>          pass a validated fault-injection rule through QEMU fw_cfg
   --summarize-log                    print high-signal debugcon lines after QEMU stops
   --vfio-pci <0000:bb:dd.f>          attach a vfio-pci host device to qemu (repeatable)
   --phoenix3-passthrough             auto-attach host Phoenix3 VGA function and same-slot audio
@@ -661,6 +810,7 @@ options:
   --qemu-log <int|null>              write QEMU trace log to logs/qemu_interrupt.log or disable it
   --timeout <seconds>                stop QEMU after this many seconds; no default timeout
   --expect <marker>                  stop successfully once all repeated expected markers appear
+  --fault <location=action>          pass a validated fault-injection rule through QEMU fw_cfg
   --summarize-log                    print high-signal debugcon lines after QEMU stops
   --vfio-pci <0000:bb:dd.f>          attach a vfio-pci host device to qemu (repeatable)
   --phoenix3-passthrough             auto-attach host Phoenix3 VGA function and same-slot audio
@@ -1049,6 +1199,26 @@ fn configure_qemu_log(config: &Config, mode: QemuLogMode) -> Result<Vec<OsString
     }
 }
 
+fn configure_fault_args(config: &Config, cli_rules: &[String]) -> Result<Vec<OsString>> {
+    let mut rules = Vec::new();
+    if config.project.fault_injection.enabled {
+        rules.extend(config.project.fault_injection.rules.iter().cloned());
+    }
+    rules.extend(cli_rules.iter().cloned());
+    if rules.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let spec = rules.join(";");
+    rustos_fault_injection::parse_rules(&spec)
+        .map_err(|err| anyhow!("invalid fault injection rule set: {err}"))?;
+    println!("fault injection fw_cfg {}={}", FAULT_FW_CFG_NAME, spec);
+    Ok(vec![
+        OsString::from("-fw_cfg"),
+        OsString::from(format!("name={FAULT_FW_CFG_NAME},string={spec}")),
+    ])
+}
+
 fn configure_display_args(qemu_user_args: &[String], _use_kvm: bool) -> Vec<OsString> {
     if env::var_os("DISPLAY").is_none() && env::var_os("WAYLAND_DISPLAY").is_none() {
         return Vec::new();
@@ -1235,6 +1405,7 @@ fn append_qemu_args(
     display_args: &[OsString],
     debugcon_args: &[OsString],
     qemu_log_args: &[OsString],
+    fault_args: &[OsString],
     qemu_user_args: &[String],
 ) {
     command.args(profile_args);
@@ -1245,6 +1416,7 @@ fn append_qemu_args(
     command.args(display_args);
     command.args(debugcon_args);
     command.args(qemu_log_args);
+    command.args(fault_args);
     command.args(qemu_user_args);
 }
 
@@ -1275,6 +1447,7 @@ fn run_display_probe(config: &Config, options: RunOptions) -> Result<()> {
         &prepared.display_args,
         &prepared.debugcon_args,
         &prepared.qemu_log_args,
+        &prepared.fault_args,
         &prepared.qemu_user_args,
     );
     command.args(&qmp_args);

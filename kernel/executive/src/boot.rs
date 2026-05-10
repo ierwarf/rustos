@@ -8,7 +8,7 @@ use kernel_compat::api::console_host::{self, ConsoleProgramSpec};
 use kernel_hal::api as hal_api;
 use kernel_mm::api as mm_api;
 use kernel_ps::api as ps_api;
-use nucleus_core::util::random;
+use nucleus_core::util::{fault_injection, random};
 use x86_64::VirtAddr;
 
 use crate::{announce_ready, debug, fatal, flow_debug, flow_info, hal_hooks, io_services, tasks};
@@ -124,6 +124,16 @@ pub fn initialize_kernel(boot_info_ptr: *const BootInfo) {
     );
     mm_api::alloc::init_heap();
     boot_log!(debug::LogLevel::Info, 105, 0, "heap initialized");
+    let fault_report = fault_injection::init_from_qemu_fw_cfg();
+    boot_log!(
+        debug::LogLevel::Info,
+        119,
+        fault_report.rule_count as u64,
+        "fault injection status={:?} rules={} spec_len={}",
+        fault_report.status,
+        fault_report.rule_count,
+        fault_report.spec_len,
+    );
     hal_api::init_simd();
     boot_log!(
         debug::LogLevel::Info,

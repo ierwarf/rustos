@@ -9,7 +9,8 @@
 This documentation is split by audience:
 
 - **Start:** build, run, debug, and understand the OS execution flow.
-- **Architecture:** repository structure, layering, logging, and staging rules.
+- **Architecture:** repository structure, layering, logging, fault injection, and
+  staging rules.
 - **OS Developer APIs:** kernel crate APIs, `cargo xtask`, `RUSTOS.package.toml`,
   and runtime control.
 - **Guides:** decision-complete workflows for adding services, apps, and drivers.
@@ -25,6 +26,7 @@ Recommended reading order:
 5. [xtask API](api/xtask.md)
 6. [Package Manifest API](api/package-manifest.md)
 7. [Logging Guide](logging.md)
+8. [Fault Injection](fault-injection.md)
 
 <a id="korean"></a>
 
@@ -33,7 +35,7 @@ Recommended reading order:
 이 문서는 대상별로 나뉩니다.
 
 - **Start:** build, run, debug, OS 실행 흐름 이해
-- **Architecture:** 저장소 구조, layering, logging, staging 규칙
+- **Architecture:** 저장소 구조, layering, logging, fault injection, staging 규칙
 - **OS Developer APIs:** kernel crate API, `cargo xtask`, `RUSTOS.package.toml`,
   runtime control
 - **Guides:** service, app, driver 추가를 위한 decision-complete workflow
@@ -49,3 +51,4 @@ Recommended reading order:
 5. [xtask API](api/xtask.md)
 6. [Package Manifest API](api/package-manifest.md)
 7. [로깅 가이드](logging.md)
+8. [Fault Injection](fault-injection.md)

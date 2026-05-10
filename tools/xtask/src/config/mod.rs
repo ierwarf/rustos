@@ -6,7 +6,9 @@ use crate::util::{default_root_dir, env_os, env_path, env_string, split_whitespa
 
 mod project;
 
-pub(crate) use project::{ProjectConfig, effective_config_toml, load_project_config};
+pub(crate) use project::{
+    ProjectConfig, effective_config_toml, load_project_config, validate_project_config_text,
+};
 
 pub(crate) struct Config {
     pub(crate) project: ProjectConfig,

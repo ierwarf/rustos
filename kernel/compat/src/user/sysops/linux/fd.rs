@@ -313,11 +313,16 @@ pub(crate) fn epoll_pwait(
 }
 
 pub(crate) fn close(fd: u64) -> Result<(), LinuxSysopError> {
+    let process_id = multitask::current_user_process_id().ok_or(LinuxSysopError::Unsupported)?;
+    close_for_process(process_id, fd)
+}
+
+pub(crate) fn close_for_process(process_id: u64, fd: u64) -> Result<(), LinuxSysopError> {
     if fd <= 2 {
         return Ok(());
     }
 
-    let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
+    let Some(result) = multitask::with_process_state_by_pid_mut(process_id, |process_state| {
         process_state
             .handles_mut()
             .close(fd)
@@ -334,18 +339,48 @@ pub(crate) fn close(fd: u64) -> Result<(), LinuxSysopError> {
 }
 
 pub(crate) fn dup(fd: u64) -> Result<u64, LinuxSysopError> {
-    duplicate_fd(fd, FIRST_DYNAMIC_FD as u64, false)
+    let process_id = multitask::current_user_process_id().ok_or(LinuxSysopError::Unsupported)?;
+    dup_for_process(process_id, fd)
 }
 
 pub(crate) fn dup2(oldfd: u64, newfd: u64) -> Result<u64, LinuxSysopError> {
-    duplicate_fd_to(oldfd, newfd, false, false)
+    let process_id = multitask::current_user_process_id().ok_or(LinuxSysopError::Unsupported)?;
+    dup2_for_process(process_id, oldfd, newfd)
 }
 
 pub(crate) fn dup3(oldfd: u64, newfd: u64, flags: u64) -> Result<u64, LinuxSysopError> {
+    let process_id = multitask::current_user_process_id().ok_or(LinuxSysopError::Unsupported)?;
+    dup3_for_process(process_id, oldfd, newfd, flags)
+}
+
+pub(crate) fn dup_for_process(process_id: u64, fd: u64) -> Result<u64, LinuxSysopError> {
+    duplicate_fd_for_process(process_id, fd, FIRST_DYNAMIC_FD as u64, false)
+}
+
+pub(crate) fn dup2_for_process(
+    process_id: u64,
+    oldfd: u64,
+    newfd: u64,
+) -> Result<u64, LinuxSysopError> {
+    duplicate_fd_to_for_process(process_id, oldfd, newfd, false, false)
+}
+
+pub(crate) fn dup3_for_process(
+    process_id: u64,
+    oldfd: u64,
+    newfd: u64,
+    flags: u64,
+) -> Result<u64, LinuxSysopError> {
     if flags & !linux_abi::O_CLOEXEC != 0 {
         return Err(LinuxSysopError::InvalidArgument);
     }
-    duplicate_fd_to(oldfd, newfd, flags & linux_abi::O_CLOEXEC != 0, true)
+    duplicate_fd_to_for_process(
+        process_id,
+        oldfd,
+        newfd,
+        flags & linux_abi::O_CLOEXEC != 0,
+        true,
+    )
 }
 
 pub(crate) fn openat(
@@ -382,33 +417,48 @@ pub(crate) fn openat(
 }
 
 pub(crate) fn fcntl(fd: u64, cmd: u64, arg: u64) -> Result<u64, LinuxSysopError> {
-    if let Some(result) = memfd::memfd_fcntl(fd, cmd, arg)? {
+    let process_id = multitask::current_user_process_id().ok_or(LinuxSysopError::Unsupported)?;
+    fcntl_for_process(process_id, fd, cmd, arg)
+}
+
+pub(crate) fn fcntl_for_process(
+    process_id: u64,
+    fd: u64,
+    cmd: u64,
+    arg: u64,
+) -> Result<u64, LinuxSysopError> {
+    if let Some(result) = memfd::memfd_fcntl_for_process(process_id, fd, cmd, arg)? {
         return Ok(result);
     }
 
     match cmd {
-        linux_abi::F_DUPFD => duplicate_fd(fd, arg, false),
-        linux_abi::F_DUPFD_CLOEXEC => duplicate_fd(fd, arg, true),
-        linux_abi::F_GETFD => Ok(get_fd_flags(fd)? as u64),
+        linux_abi::F_DUPFD => duplicate_fd_for_process(process_id, fd, arg, false),
+        linux_abi::F_DUPFD_CLOEXEC => duplicate_fd_for_process(process_id, fd, arg, true),
+        linux_abi::F_GETFD => Ok(get_fd_flags_for_process(process_id, fd)? as u64),
         linux_abi::F_SETFD => {
-            set_fd_flags(fd, (arg as u32) & FD_CLOEXEC)?;
+            set_fd_flags_for_process(process_id, fd, (arg as u32) & FD_CLOEXEC)?;
             Ok(0)
         }
-        linux_abi::F_GETFL => Ok(get_status_flags(fd)?),
+        linux_abi::F_GETFL => Ok(get_status_flags_for_process(process_id, fd)?),
         linux_abi::F_SETFL => {
-            set_status_flags(fd, arg)?;
+            set_status_flags_for_process(process_id, fd, arg)?;
             Ok(0)
         }
         _ => Err(LinuxSysopError::Unsupported),
     }
 }
 
-fn duplicate_fd(fd: u64, min_newfd: u64, close_on_exec: bool) -> Result<u64, LinuxSysopError> {
+fn duplicate_fd_for_process(
+    process_id: u64,
+    fd: u64,
+    min_newfd: u64,
+    close_on_exec: bool,
+) -> Result<u64, LinuxSysopError> {
     if fd < 3 {
         let handle = console_stream_handle_for_fd(fd)?;
         let status_flags = console_stream_status_flags(fd)?;
         let fd_flags = if close_on_exec { FD_CLOEXEC } else { 0 };
-        let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
+        let Some(result) = multitask::with_process_state_by_pid_mut(process_id, |process_state| {
             Ok(process_state.handles_mut().install_entry_min(
                 crate::user::handles::HandleEntry::new(handle, fd_flags, status_flags),
                 min_newfd,
@@ -419,7 +469,7 @@ fn duplicate_fd(fd: u64, min_newfd: u64, close_on_exec: bool) -> Result<u64, Lin
         return result;
     }
 
-    let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
+    let Some(result) = multitask::with_process_state_by_pid_mut(process_id, |process_state| {
         process_state
             .handles_mut()
             .duplicate_min(fd, min_newfd, close_on_exec)
@@ -431,7 +481,8 @@ fn duplicate_fd(fd: u64, min_newfd: u64, close_on_exec: bool) -> Result<u64, Lin
     result
 }
 
-fn duplicate_fd_to(
+fn duplicate_fd_to_for_process(
+    process_id: u64,
     oldfd: u64,
     newfd: u64,
     close_on_exec: bool,
@@ -452,7 +503,7 @@ fn duplicate_fd_to(
         let handle = console_stream_handle_for_fd(oldfd)?;
         let status_flags = console_stream_status_flags(oldfd)?;
         let fd_flags = if close_on_exec { FD_CLOEXEC } else { 0 };
-        let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
+        let Some(result) = multitask::with_process_state_by_pid_mut(process_id, |process_state| {
             process_state.handles_mut().close(newfd);
             let Some(index) = newfd
                 .checked_sub(FIRST_DYNAMIC_FD as u64)
@@ -475,7 +526,7 @@ fn duplicate_fd_to(
         return result;
     }
 
-    let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
+    let Some(result) = multitask::with_process_state_by_pid_mut(process_id, |process_state| {
         process_state.handles_mut().close(newfd);
         process_state
             .handles_mut()
@@ -488,12 +539,12 @@ fn duplicate_fd_to(
     result
 }
 
-fn get_fd_flags(fd: u64) -> Result<u32, LinuxSysopError> {
+fn get_fd_flags_for_process(process_id: u64, fd: u64) -> Result<u32, LinuxSysopError> {
     if fd < 3 {
         return Ok(0);
     }
 
-    let Some(result) = multitask::with_current_user_process_state(|_, _, process_state| {
+    let Some(result) = multitask::with_process_state_by_pid_mut(process_id, |process_state| {
         process_state
             .handles()
             .get_entry(fd)
@@ -506,12 +557,12 @@ fn get_fd_flags(fd: u64) -> Result<u32, LinuxSysopError> {
     result
 }
 
-fn set_fd_flags(fd: u64, flags: u32) -> Result<(), LinuxSysopError> {
+fn set_fd_flags_for_process(process_id: u64, fd: u64, flags: u32) -> Result<(), LinuxSysopError> {
     if fd < 3 {
         return Ok(());
     }
 
-    let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
+    let Some(result) = multitask::with_process_state_by_pid_mut(process_id, |process_state| {
         let Some(entry) = process_state.handles_mut().get_entry_mut(fd) else {
             return Err(LinuxSysopError::BadFileDescriptor);
         };
@@ -524,12 +575,12 @@ fn set_fd_flags(fd: u64, flags: u32) -> Result<(), LinuxSysopError> {
     result
 }
 
-fn get_status_flags(fd: u64) -> Result<u64, LinuxSysopError> {
+fn get_status_flags_for_process(process_id: u64, fd: u64) -> Result<u64, LinuxSysopError> {
     if fd < 3 {
         return console_stream_status_flags(fd);
     }
 
-    let Some(result) = multitask::with_current_user_process_state(|_, _, process_state| {
+    let Some(result) = multitask::with_process_state_by_pid_mut(process_id, |process_state| {
         process_state
             .handles()
             .get_entry(fd)
@@ -542,12 +593,16 @@ fn get_status_flags(fd: u64) -> Result<u64, LinuxSysopError> {
     result
 }
 
-fn set_status_flags(fd: u64, flags: u64) -> Result<(), LinuxSysopError> {
+fn set_status_flags_for_process(
+    process_id: u64,
+    fd: u64,
+    flags: u64,
+) -> Result<(), LinuxSysopError> {
     if fd < 3 {
         return Ok(());
     }
 
-    let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
+    let Some(result) = multitask::with_process_state_by_pid_mut(process_id, |process_state| {
         let Some(entry) = process_state.handles_mut().get_entry_mut(fd) else {
             return Err(LinuxSysopError::BadFileDescriptor);
         };

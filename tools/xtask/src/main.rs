@@ -5,6 +5,7 @@ mod layering;
 mod package_manifest;
 mod qemu;
 mod stage;
+mod testinfra;
 mod util;
 
 type Result<T> = anyhow::Result<T>;

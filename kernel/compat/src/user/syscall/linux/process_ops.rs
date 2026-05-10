@@ -83,6 +83,11 @@ pub(super) fn syscall_linux_rustos_spawn_exec(
     console_session_raw: u64,
     weight_micros: u64,
 ) -> u64 {
+    if ipc_ops::service_endpoint(linux_abi::IPC_SERVICE_LOADERD).is_some()
+        && !current_process_may_use_legacy_spawn_exec()
+    {
+        return linux_errno(LINUX_EACCES);
+    }
     match linux_ops::spawn_exec(
         path_ptr,
         argv_ptr,
@@ -107,6 +112,19 @@ pub(super) fn syscall_linux_rustos_spawn_exec(
             linux_errno(linux_sysop_error_to_errno(err))
         }
     }
+}
+
+fn current_process_may_use_legacy_spawn_exec() -> bool {
+    multitask::with_current_user_process_state(|_, _, process_state| {
+        let exec_path = process_state.exec_path();
+        process_path_is(exec_path, "services/initd/initd.elf")
+            || process_path_is(exec_path, "services/loaderd/loaderd.elf")
+    })
+    .unwrap_or(false)
+}
+
+fn process_path_is(actual: &str, expected: &str) -> bool {
+    actual == expected || actual.strip_prefix('/') == Some(expected)
 }
 
 fn apply_exec_transition_to_frame(
@@ -284,52 +302,8 @@ pub(super) fn syscall_linux_wait4(pid: i64, status_ptr: u64, options: u64, rusag
     }
 }
 
-pub(super) fn syscall_linux_uname(buf_ptr: u64) -> u64 {
-    match linux_ops::uname(buf_ptr) {
-        Ok(()) => 0,
-        Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
-    }
-}
-
 pub(super) fn syscall_linux_gettid() -> u64 {
     linux_ops::gettid()
-}
-
-pub(super) fn syscall_linux_sched_getaffinity(pid: u64, cpusetsize: u64, mask_ptr: u64) -> u64 {
-    match linux_ops::sched_getaffinity(pid, cpusetsize, mask_ptr) {
-        Ok(len) => len,
-        Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
-    }
-}
-
-pub(super) fn syscall_linux_getuid() -> u64 {
-    linux_ops::getuid()
-}
-
-pub(super) fn syscall_linux_getgid() -> u64 {
-    linux_ops::getgid()
-}
-
-pub(super) fn syscall_linux_geteuid() -> u64 {
-    linux_ops::geteuid()
-}
-
-pub(super) fn syscall_linux_getegid() -> u64 {
-    linux_ops::getegid()
-}
-
-pub(super) fn syscall_linux_setuid(uid: u64) -> u64 {
-    match linux_ops::setuid(uid) {
-        Ok(result) => result,
-        Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
-    }
-}
-
-pub(super) fn syscall_linux_setgid(gid: u64) -> u64 {
-    match linux_ops::setgid(gid) {
-        Ok(result) => result,
-        Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
-    }
 }
 
 pub(super) fn syscall_linux_futex(
@@ -461,28 +435,6 @@ pub(super) fn syscall_linux_get_robust_list(pid: u64, head_ptr_ptr: u64, len_ptr
     }
 }
 
-pub(super) fn syscall_linux_prlimit64(
-    pid: u64,
-    resource: u64,
-    new_limit_ptr: u64,
-    old_limit_ptr: u64,
-) -> u64 {
-    match linux_ops::prlimit64(pid, resource, new_limit_ptr, old_limit_ptr) {
-        Ok(()) => 0,
-        Err(err) => {
-            debug::println!(
-                "linux prlimit64 rejected: pid={} resource={} new_limit_ptr={:#x} old_limit_ptr={:#x} err={:?}",
-                pid,
-                resource,
-                new_limit_ptr,
-                old_limit_ptr,
-                err,
-            );
-            linux_errno(linux_sysop_error_to_errno(err))
-        }
-    }
-}
-
 pub(super) fn syscall_linux_getrandom(user_ptr: u64, user_len: u64, flags: u64) -> u64 {
     match linux_ops::getrandom(user_ptr, user_len, flags) {
         Ok(read) => read as u64,
@@ -494,39 +446,6 @@ pub(super) fn syscall_linux_getrandom(user_ptr: u64, user_len: u64, flags: u64) 
                 flags,
                 err,
             );
-            linux_errno(linux_sysop_error_to_errno(err))
-        }
-    }
-}
-
-pub(super) fn syscall_linux_statx(
-    dirfd: u64,
-    path_ptr: u64,
-    flags: u64,
-    mask: u64,
-    statx_ptr: u64,
-) -> u64 {
-    match linux_ops::statx(
-        dirfd,
-        path_ptr,
-        flags,
-        u32::try_from(mask).unwrap_or(u32::MAX),
-        statx_ptr,
-    ) {
-        Ok(()) => 0,
-        Err(err) => {
-            if !matches!(err, linux_ops::LinuxSysopError::NotFound) {
-                debug::println!(
-                    "linux statx rejected: dirfd={} path_ptr={:#x} path={} flags={:#x} mask={:#x} statx_ptr={:#x} err={:?}",
-                    dirfd,
-                    path_ptr,
-                    debug_user_path(path_ptr),
-                    flags,
-                    mask,
-                    statx_ptr,
-                    err,
-                );
-            }
             linux_errno(linux_sysop_error_to_errno(err))
         }
     }

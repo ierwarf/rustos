@@ -45,6 +45,16 @@ pub(super) fn read_blocks_uncached(device_id: u32, lba: u64, out: &mut [u8]) -> 
 }
 
 pub(super) fn read_blocks_uncached_local(device_id: u32, lba: u64, out: &mut [u8]) -> IoResult<()> {
+    if nucleus_core::util::fault_injection::should_fail("block.read") {
+        crate::debug::warn!(
+            storage,
+            "fault injection: block.read failed dev={} lba={} bytes={}",
+            device_id,
+            lba,
+            out.len()
+        );
+        return Err(DiskIoError::DeviceFault);
+    }
     let resolved = resolve_root_device(device_id).ok_or(DiskIoError::NotPresent)?;
     validate_block_io_exact(
         resolved.logical_block_size,
@@ -107,6 +117,16 @@ pub(super) fn write_blocks_uncached(device_id: u32, lba: u64, input: &[u8]) -> I
 }
 
 pub(super) fn write_blocks_uncached_local(device_id: u32, lba: u64, input: &[u8]) -> IoResult<()> {
+    if nucleus_core::util::fault_injection::should_fail("block.write") {
+        crate::debug::warn!(
+            storage,
+            "fault injection: block.write failed dev={} lba={} bytes={}",
+            device_id,
+            lba,
+            input.len()
+        );
+        return Err(DiskIoError::DeviceFault);
+    }
     let resolved = resolve_root_device(device_id).ok_or(DiskIoError::NotPresent)?;
     if resolved.readonly {
         return Err(DiskIoError::InvalidInput);

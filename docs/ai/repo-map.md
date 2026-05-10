@@ -18,6 +18,8 @@ Core entrypoints:
 - Runtime client/protocol: `libs/runtime-control/src/lib.rs`
 - Logging config parser/cfg: `tools/build_log_cfg.rs`
 - Logging policy: `config/rustos.toml` `[logging]`
+- Fault injection policy: `config/rustos.toml` `[fault_injection]`
+- Fault injection runtime: `kernel/nucleus-core/src/util/fault_injection.rs`
 - Kernel API surfaces: `kernel/*/src/api.rs`
 - Kernel boot entry: `kernel/src/main.rs`
 - Kernel orchestration: `kernel/executive/src/lib.rs`, `kernel/executive/src/boot.rs`

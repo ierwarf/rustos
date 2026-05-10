@@ -106,6 +106,13 @@ pub fn init(boot_info_ptr: *const BootInfo) {
 pub unsafe extern "C" fn register_driver_framebuffer(
     framebuffer: *const DisplayFramebufferRegistration,
 ) -> i32 {
+    if nucleus_core::util::fault_injection::should_fail("display.provider.register") {
+        crate::debug::warn!(
+            display,
+            "fault injection: display.provider.register rejected framebuffer"
+        );
+        return -5;
+    }
     let Some(framebuffer) = (unsafe { framebuffer.as_ref() }) else {
         return -22;
     };

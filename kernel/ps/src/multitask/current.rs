@@ -301,7 +301,20 @@ pub fn halt_current_retired_task() -> ! {
 
 pub(crate) fn exit_current_task() -> ! {
     interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().exit_current_task();
+        let task_id = scheduler_ref().current_task_id();
+        let callers_to_wake = task_id
+            .map(|task_id| {
+                kernel_ipc_runtime::api::fail_endpoints_owned_by_task(
+                    task_id,
+                    kernel_ipc_runtime::api::IpcError::PeerClosed,
+                )
+            })
+            .unwrap_or_default();
+        let scheduler = scheduler_mut();
+        for task_id in callers_to_wake {
+            let _ = scheduler.wake_task(task_id);
+        }
+        scheduler.exit_current_task();
     });
     halt_current_retired_task()
 }

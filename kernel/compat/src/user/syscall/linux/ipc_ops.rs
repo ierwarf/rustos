@@ -1,0 +1,806 @@
+use super::*;
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+use core::mem::size_of;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+use kernel_ipc_runtime::api::{KernelEndpointHandle, KernelReplyHandle, KernelTransferredHandle};
+use lazy_static::lazy_static;
+use spin::Mutex;
+
+const MAX_SERVICE_ENDPOINTS: usize = 8;
+const MAX_PENDING_TRANSFER_OBJECTS: usize = 1024;
+static LINUX_SYSCALL_ENDPOINT: AtomicU64 = AtomicU64::new(0);
+static SERVICE_ENDPOINTS: [AtomicU64; MAX_SERVICE_ENDPOINTS] =
+    [const { AtomicU64::new(0) }; MAX_SERVICE_ENDPOINTS];
+static NEXT_TRANSFER_ID: AtomicU64 = AtomicU64::new(1);
+
+lazy_static! {
+    static ref TRANSFER_OBJECTS: Mutex<BTreeMap<u64, multitask::TransferredHandleEntry>> =
+        Mutex::new(BTreeMap::new());
+}
+
+pub(super) fn is_linux_rustos_ipc_syscall(syscall_number: u64) -> bool {
+    matches!(
+        syscall_number,
+        linux_abi::SYS_RUSTOS_IPC_ENDPOINT_CREATE
+            | linux_abi::SYS_RUSTOS_IPC_CALL
+            | linux_abi::SYS_RUSTOS_IPC_RECV
+            | linux_abi::SYS_RUSTOS_IPC_REPLY
+            | linux_abi::SYS_RUSTOS_IPC_CALL_WITH_HANDLES
+            | linux_abi::SYS_RUSTOS_IPC_RECV_WITH_HANDLES
+            | linux_abi::SYS_RUSTOS_IPC_REPLY_WITH_HANDLES
+            | linux_abi::SYS_RUSTOS_FD_CLOSE_BROKER
+            | linux_abi::SYS_RUSTOS_FD_DUP_BROKER
+            | linux_abi::SYS_RUSTOS_FD_GETDENTS64_BROKER
+            | linux_abi::SYS_RUSTOS_FD_FCNTL_BROKER
+            | linux_abi::SYS_RUSTOS_VFS_MOUNT_BROKER
+            | linux_abi::SYS_RUSTOS_VFS_UMOUNT_BROKER
+            | linux_abi::SYS_RUSTOS_PROC_PREPARE_BROKER
+            | linux_abi::SYS_RUSTOS_PROC_MAP_FILE_BROKER
+            | linux_abi::SYS_RUSTOS_PROC_MAP_ZEROED_BROKER
+            | linux_abi::SYS_RUSTOS_PROC_COMMIT_BROKER
+            | linux_abi::SYS_RUSTOS_PROC_ABORT_BROKER
+            | linux_abi::SYS_RUSTOS_IPC_REGISTER_LINUX_SYSCALL_ENDPOINT
+            | linux_abi::SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT
+            | linux_abi::SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT
+            | linux_abi::SYS_RUSTOS_STATX_METADATA
+            | linux_abi::SYS_RUSTOS_STAT_METADATA
+            | linux_abi::SYS_RUSTOS_READLINK_METADATA
+            | linux_abi::SYS_RUSTOS_ACCESS_METADATA
+            | linux_abi::SYS_RUSTOS_GETCWD_METADATA
+            | linux_abi::SYS_RUSTOS_CHDIR_METADATA
+    )
+}
+
+pub(super) fn dispatch_linux_rustos_ipc_syscall(frame: &SyscallFrame) -> u64 {
+    match frame.rax {
+        linux_abi::SYS_RUSTOS_IPC_ENDPOINT_CREATE => syscall_linux_rustos_ipc_endpoint_create(),
+        linux_abi::SYS_RUSTOS_IPC_CALL => {
+            syscall_linux_rustos_ipc_call(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
+        }
+        linux_abi::SYS_RUSTOS_IPC_RECV => {
+            syscall_linux_rustos_ipc_recv(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+        }
+        linux_abi::SYS_RUSTOS_IPC_REPLY => {
+            syscall_linux_rustos_ipc_reply(frame.rdi, frame.rsi, frame.rdx)
+        }
+        linux_abi::SYS_RUSTOS_IPC_CALL_WITH_HANDLES => {
+            syscall_linux_rustos_ipc_call_with_handles(frame.rdi)
+        }
+        linux_abi::SYS_RUSTOS_IPC_RECV_WITH_HANDLES => {
+            syscall_linux_rustos_ipc_recv_with_handles(frame.rdi)
+        }
+        linux_abi::SYS_RUSTOS_IPC_REPLY_WITH_HANDLES => {
+            syscall_linux_rustos_ipc_reply_with_handles(frame.rdi)
+        }
+        linux_abi::SYS_RUSTOS_FD_CLOSE_BROKER => {
+            offload_ops::syscall_linux_rustos_fd_close_broker(frame.rdi, frame.rsi)
+        }
+        linux_abi::SYS_RUSTOS_FD_DUP_BROKER => offload_ops::syscall_linux_rustos_fd_dup_broker(
+            frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8,
+        ),
+        linux_abi::SYS_RUSTOS_FD_GETDENTS64_BROKER => {
+            offload_ops::syscall_linux_rustos_fd_getdents64_broker(
+                frame.rdi, frame.rsi, frame.rdx, frame.r10,
+            )
+        }
+        linux_abi::SYS_RUSTOS_FD_FCNTL_BROKER => offload_ops::syscall_linux_rustos_fd_fcntl_broker(
+            frame.rdi, frame.rsi, frame.rdx, frame.r10,
+        ),
+        linux_abi::SYS_RUSTOS_VFS_MOUNT_BROKER => {
+            offload_ops::syscall_linux_rustos_vfs_mount_broker(frame.rdi)
+        }
+        linux_abi::SYS_RUSTOS_VFS_UMOUNT_BROKER => {
+            offload_ops::syscall_linux_rustos_vfs_umount_broker(
+                frame.rdi, frame.rsi, frame.rdx, frame.r10,
+            )
+        }
+        linux_abi::SYS_RUSTOS_PROC_PREPARE_BROKER => {
+            offload_ops::syscall_linux_rustos_proc_prepare_broker(frame.rdi)
+        }
+        linux_abi::SYS_RUSTOS_PROC_MAP_FILE_BROKER => {
+            offload_ops::syscall_linux_rustos_proc_map_file_broker(frame.rdi)
+        }
+        linux_abi::SYS_RUSTOS_PROC_MAP_ZEROED_BROKER => {
+            offload_ops::syscall_linux_rustos_proc_map_zeroed_broker(frame.rdi)
+        }
+        linux_abi::SYS_RUSTOS_PROC_COMMIT_BROKER => {
+            offload_ops::syscall_linux_rustos_proc_commit_broker(frame.rdi)
+        }
+        linux_abi::SYS_RUSTOS_PROC_ABORT_BROKER => {
+            offload_ops::syscall_linux_rustos_proc_abort_broker(frame.rdi)
+        }
+        linux_abi::SYS_RUSTOS_IPC_REGISTER_LINUX_SYSCALL_ENDPOINT => {
+            syscall_linux_rustos_ipc_register_linux_syscall_endpoint(frame.rdi)
+        }
+        linux_abi::SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT => {
+            syscall_linux_rustos_ipc_register_service_endpoint(frame.rdi, frame.rsi)
+        }
+        linux_abi::SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT => {
+            syscall_linux_rustos_ipc_lookup_service_endpoint(frame.rdi)
+        }
+        linux_abi::SYS_RUSTOS_STATX_METADATA => offload_ops::syscall_linux_rustos_statx_metadata(
+            frame.rdi, frame.rsi, frame.rdx, frame.r10,
+        ),
+        linux_abi::SYS_RUSTOS_STAT_METADATA => {
+            offload_ops::syscall_linux_rustos_stat_metadata(frame.rdi, frame.rsi, frame.rdx)
+        }
+        linux_abi::SYS_RUSTOS_READLINK_METADATA => {
+            offload_ops::syscall_linux_rustos_readlink_metadata(
+                frame.rdi, frame.rsi, frame.rdx, frame.r10,
+            )
+        }
+        linux_abi::SYS_RUSTOS_ACCESS_METADATA => offload_ops::syscall_linux_rustos_access_metadata(
+            frame.rdi, frame.rsi, frame.rdx, frame.r10,
+        ),
+        linux_abi::SYS_RUSTOS_GETCWD_METADATA => {
+            offload_ops::syscall_linux_rustos_getcwd_metadata(frame.rdi, frame.rsi, frame.rdx)
+        }
+        linux_abi::SYS_RUSTOS_CHDIR_METADATA => {
+            offload_ops::syscall_linux_rustos_chdir_metadata(frame.rdi, frame.rsi, frame.rdx)
+        }
+        _ => linux_errno(LINUX_ENOSYS),
+    }
+}
+
+pub(super) fn linux_syscall_endpoint() -> Option<KernelEndpointHandle> {
+    let raw = service_endpoint_raw(linux_abi::IPC_SERVICE_LINUX_SYSCALLD)
+        .unwrap_or_else(|| LINUX_SYSCALL_ENDPOINT.load(Ordering::Acquire));
+    (raw != 0).then_some(KernelEndpointHandle::from_raw(raw))
+}
+
+pub(super) fn service_endpoint(service_id: u64) -> Option<KernelEndpointHandle> {
+    let raw = service_endpoint_raw(service_id)?;
+    (raw != 0).then_some(KernelEndpointHandle::from_raw(raw))
+}
+
+fn service_endpoint_raw(service_id: u64) -> Option<u64> {
+    service_index(service_id).map(|index| SERVICE_ENDPOINTS[index].load(Ordering::Acquire))
+}
+
+fn service_index(service_id: u64) -> Option<usize> {
+    let index = usize::try_from(service_id).ok()?;
+    (index < MAX_SERVICE_ENDPOINTS).then_some(index)
+}
+
+pub(super) fn syscall_linux_rustos_ipc_endpoint_create() -> u64 {
+    let Some(task_id) = multitask::current_task_id() else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    match kernel_ipc_runtime::api::create_endpoint_for_task(task_id) {
+        Ok(endpoint) => {
+            debug::println!(
+                "ipc endpoint created: task={} endpoint={}",
+                task_id,
+                endpoint.raw()
+            );
+            endpoint.raw()
+        }
+        Err(err) => linux_errno(ipc_error_to_linux_errno(err)),
+    }
+}
+
+pub(super) fn syscall_linux_rustos_ipc_register_linux_syscall_endpoint(endpoint: u64) -> u64 {
+    if endpoint == 0 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    LINUX_SYSCALL_ENDPOINT.store(endpoint, Ordering::Release);
+    SERVICE_ENDPOINTS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
+        .store(endpoint, Ordering::Release);
+    debug::println!(
+        "ipc service registered: service={} endpoint={}",
+        linux_abi::IPC_SERVICE_LINUX_SYSCALLD,
+        endpoint
+    );
+    0
+}
+
+pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
+    service_id: u64,
+    endpoint: u64,
+) -> u64 {
+    let Some(index) = service_index(service_id) else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    SERVICE_ENDPOINTS[index].store(endpoint, Ordering::Release);
+    if endpoint == 0 {
+        debug::println!("ipc service revoked: service={}", service_id);
+    } else {
+        debug::println!(
+            "ipc service registered: service={} endpoint={}",
+            service_id,
+            endpoint
+        );
+    }
+    0
+}
+
+pub(super) fn syscall_linux_rustos_ipc_lookup_service_endpoint(service_id: u64) -> u64 {
+    let Some(raw) = service_endpoint_raw(service_id) else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    if raw == 0 {
+        return linux_errno(LINUX_ENOSYS);
+    }
+    raw
+}
+
+pub(super) fn syscall_linux_rustos_ipc_call(
+    endpoint: u64,
+    request_ptr: u64,
+    request_len: u64,
+    reply_ptr: u64,
+    reply_capacity: u64,
+) -> u64 {
+    let endpoint = KernelEndpointHandle::from_raw(endpoint);
+    let request = match copy_request_from_user(request_ptr, request_len) {
+        Ok(request) => request,
+        Err(errno) => return linux_errno(errno),
+    };
+    let reply = match enqueue_call_and_wake(endpoint, request.as_slice()) {
+        Ok(reply) => reply,
+        Err(errno) => return linux_errno(errno),
+    };
+    let response = match wait_for_reply(reply) {
+        Ok(response) => response,
+        Err(errno) => return linux_errno(errno),
+    };
+    let Ok(reply_capacity) = usize::try_from(reply_capacity) else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    if response.len() > reply_capacity {
+        return linux_errno(LINUX_EOVERFLOW);
+    }
+    if !response.is_empty() {
+        if let Err(err) = usermem::write_current_user_bytes(reply_ptr, response.as_slice()) {
+            return linux_errno(address_space_error_to_linux_errno(err));
+        }
+    }
+    response.len() as u64
+}
+
+pub(super) fn syscall_linux_rustos_ipc_recv(
+    endpoint: u64,
+    request_ptr: u64,
+    request_capacity: u64,
+    reply_cap_ptr: u64,
+) -> u64 {
+    let endpoint = KernelEndpointHandle::from_raw(endpoint);
+    let Ok(request_capacity) = usize::try_from(request_capacity) else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    loop {
+        match kernel_ipc_runtime::api::recv_endpoint_with_limit(endpoint, request_capacity) {
+            Ok(Some((reply, request))) => {
+                if !request.is_empty() {
+                    if let Err(err) = usermem::write_current_user_bytes(request_ptr, &request) {
+                        return linux_errno(address_space_error_to_linux_errno(err));
+                    }
+                }
+                if let Err(err) =
+                    usermem::write_current_user_bytes(reply_cap_ptr, &reply.raw().to_ne_bytes())
+                {
+                    return linux_errno(address_space_error_to_linux_errno(err));
+                }
+                return request.len() as u64;
+            }
+            Ok(None) => {
+                let Some(task_id) = multitask::current_task_id() else {
+                    return linux_errno(LINUX_EINVAL);
+                };
+                if let Err(err) =
+                    kernel_ipc_runtime::api::add_endpoint_receiver_waiter(endpoint, task_id)
+                {
+                    return linux_errno(ipc_error_to_linux_errno(err));
+                }
+                if !multitask::block_current_task() {
+                    return linux_errno(LINUX_EINVAL);
+                }
+                multitask::yield_now();
+            }
+            Err(err) => return linux_errno(ipc_error_to_linux_errno(err)),
+        }
+    }
+}
+
+pub(super) fn syscall_linux_rustos_ipc_reply(
+    reply: u64,
+    response_ptr: u64,
+    response_len: u64,
+) -> u64 {
+    let response = match copy_request_from_user(response_ptr, response_len) {
+        Ok(response) => response,
+        Err(errno) => return linux_errno(errno),
+    };
+    let task_id = match kernel_ipc_runtime::api::complete_endpoint_reply(
+        KernelReplyHandle::from_raw(reply),
+        response.as_slice(),
+    ) {
+        Ok(task_id) => task_id,
+        Err(err) => return linux_errno(ipc_error_to_linux_errno(err)),
+    };
+    let _ = multitask::wake_task(task_id);
+    0
+}
+
+pub(super) fn syscall_linux_rustos_ipc_call_with_handles(args_ptr: u64) -> u64 {
+    let args = match usermem::read_current_user_struct::<
+        rustos_user_abi::syscall::IpcCallWithHandlesArgs,
+    >(args_ptr)
+    {
+        Ok(args) => args,
+        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+    };
+    if args.reserved0 != 0 {
+        return linux_errno(LINUX_EINVAL);
+    }
+
+    let request = match copy_request_from_user(args.request_ptr, args.request_len) {
+        Ok(request) => request,
+        Err(errno) => return linux_errno(errno),
+    };
+    let send_handles = match export_current_fds_for_ipc(args.send_fds_ptr, args.send_fd_count) {
+        Ok(handles) => handles,
+        Err(errno) => return linux_errno(errno),
+    };
+    let reply = match enqueue_call_and_wake_with_handles(
+        KernelEndpointHandle::from_raw(args.endpoint),
+        request.as_slice(),
+        send_handles.as_slice(),
+    ) {
+        Ok(reply) => reply,
+        Err(errno) => {
+            drop_transfer_descriptors(send_handles.as_slice());
+            return linux_errno(errno);
+        }
+    };
+
+    let (response, reply_handles) = match wait_for_reply_with_handle_limit(
+        reply,
+        rustos_user_abi::syscall::IPC_MAX_TRANSFER_HANDLES,
+    ) {
+        Ok(response) => response,
+        Err(errno) => return linux_errno(errno),
+    };
+    let Ok(reply_capacity) = usize::try_from(args.reply_capacity) else {
+        drop_transfer_descriptors(reply_handles.as_slice());
+        return linux_errno(LINUX_EINVAL);
+    };
+    if response.len() > reply_capacity {
+        drop_transfer_descriptors(reply_handles.as_slice());
+        return linux_errno(LINUX_EOVERFLOW);
+    }
+    if reply_capacity > 0 {
+        if let Err(err) =
+            usermem::validate_current_user_write_buffer(args.reply_ptr, reply_capacity)
+        {
+            drop_transfer_descriptors(reply_handles.as_slice());
+            return linux_errno(address_space_error_to_linux_errno(err));
+        }
+    }
+    if usize::from(args.recv_fd_capacity) < reply_handles.len() {
+        drop_transfer_descriptors(reply_handles.as_slice());
+        return linux_errno(LINUX_EOVERFLOW);
+    }
+    if let Err(errno) = validate_received_handle_outputs(
+        args.recv_fds_ptr,
+        args.recv_fd_count_ptr,
+        reply_handles.len(),
+    ) {
+        drop_transfer_descriptors(reply_handles.as_slice());
+        return linux_errno(errno);
+    }
+    if let Err(errno) = install_received_handles(
+        reply_handles.as_slice(),
+        args.recv_fds_ptr,
+        args.recv_fd_count_ptr,
+    ) {
+        return linux_errno(errno);
+    }
+    if !response.is_empty() {
+        if let Err(err) = usermem::write_current_user_bytes(args.reply_ptr, response.as_slice()) {
+            return linux_errno(address_space_error_to_linux_errno(err));
+        }
+    }
+    response.len() as u64
+}
+
+pub(super) fn syscall_linux_rustos_ipc_recv_with_handles(args_ptr: u64) -> u64 {
+    let args = match usermem::read_current_user_struct::<
+        rustos_user_abi::syscall::IpcRecvWithHandlesArgs,
+    >(args_ptr)
+    {
+        Ok(args) => args,
+        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+    };
+    if args.reserved0 != 0 || args.reserved1 != 0 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let endpoint = KernelEndpointHandle::from_raw(args.endpoint);
+    let Ok(request_capacity) = usize::try_from(args.request_capacity) else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    if request_capacity > rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES {
+        return linux_errno(LINUX_EINVAL);
+    }
+    if usize::from(args.recv_fd_capacity) > rustos_user_abi::syscall::IPC_MAX_TRANSFER_HANDLES {
+        return linux_errno(LINUX_EINVAL);
+    }
+    if request_capacity > 0 {
+        if let Err(err) =
+            usermem::validate_current_user_write_buffer(args.request_ptr, request_capacity)
+        {
+            return linux_errno(address_space_error_to_linux_errno(err));
+        }
+    }
+    if let Err(err) =
+        usermem::validate_current_user_write_buffer(args.reply_cap_ptr, size_of::<u64>())
+    {
+        return linux_errno(address_space_error_to_linux_errno(err));
+    }
+    if let Err(errno) =
+        validate_received_handle_outputs(args.recv_fds_ptr, args.recv_fd_count_ptr, 0)
+    {
+        return linux_errno(errno);
+    }
+
+    loop {
+        match kernel_ipc_runtime::api::recv_endpoint_with_limits_and_handles(
+            endpoint,
+            request_capacity,
+            usize::from(args.recv_fd_capacity),
+        ) {
+            Ok(Some((reply, request, handles))) => {
+                if let Err(errno) = validate_received_handle_outputs(
+                    args.recv_fds_ptr,
+                    args.recv_fd_count_ptr,
+                    handles.len(),
+                ) {
+                    return linux_errno(errno);
+                }
+                if let Err(errno) = install_received_handles(
+                    handles.as_slice(),
+                    args.recv_fds_ptr,
+                    args.recv_fd_count_ptr,
+                ) {
+                    return linux_errno(errno);
+                }
+                if !request.is_empty() {
+                    if let Err(err) = usermem::write_current_user_bytes(args.request_ptr, &request)
+                    {
+                        return linux_errno(address_space_error_to_linux_errno(err));
+                    }
+                }
+                if let Err(err) = usermem::write_current_user_bytes(
+                    args.reply_cap_ptr,
+                    &reply.raw().to_ne_bytes(),
+                ) {
+                    return linux_errno(address_space_error_to_linux_errno(err));
+                }
+                return request.len() as u64;
+            }
+            Ok(None) => {
+                let Some(task_id) = multitask::current_task_id() else {
+                    return linux_errno(LINUX_EINVAL);
+                };
+                if let Err(err) =
+                    kernel_ipc_runtime::api::add_endpoint_receiver_waiter(endpoint, task_id)
+                {
+                    return linux_errno(ipc_error_to_linux_errno(err));
+                }
+                if !multitask::block_current_task() {
+                    return linux_errno(LINUX_EINVAL);
+                }
+                multitask::yield_now();
+            }
+            Err(err) => return linux_errno(ipc_error_to_linux_errno(err)),
+        }
+    }
+}
+
+pub(super) fn syscall_linux_rustos_ipc_reply_with_handles(args_ptr: u64) -> u64 {
+    let args = match usermem::read_current_user_struct::<
+        rustos_user_abi::syscall::IpcReplyWithHandlesArgs,
+    >(args_ptr)
+    {
+        Ok(args) => args,
+        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+    };
+    if args.reserved0 != 0 || args.reserved1 != 0 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let response = match copy_request_from_user(args.response_ptr, args.response_len) {
+        Ok(response) => response,
+        Err(errno) => return linux_errno(errno),
+    };
+    let send_handles = match export_current_fds_for_ipc(args.send_fds_ptr, args.send_fd_count) {
+        Ok(handles) => handles,
+        Err(errno) => return linux_errno(errno),
+    };
+    let task_id = match kernel_ipc_runtime::api::complete_endpoint_reply_with_handles(
+        KernelReplyHandle::from_raw(args.reply_cap),
+        response.as_slice(),
+        send_handles.as_slice(),
+    ) {
+        Ok(task_id) => task_id,
+        Err(err) => {
+            drop_transfer_descriptors(send_handles.as_slice());
+            return linux_errno(ipc_error_to_linux_errno(err));
+        }
+    };
+    let _ = multitask::wake_task(task_id);
+    0
+}
+
+pub(super) fn call_linux_syscall_endpoint(request: &[u8]) -> Result<Vec<u8>, i64> {
+    let endpoint = linux_syscall_endpoint().ok_or(LINUX_ENOSYS)?;
+    let reply = enqueue_call_and_wake(endpoint, request)?;
+    wait_for_reply(reply)
+}
+
+pub(super) fn call_service_endpoint(service_id: u64, request: &[u8]) -> Result<Vec<u8>, i64> {
+    let endpoint = service_endpoint(service_id).ok_or(LINUX_ENOSYS)?;
+    let reply = enqueue_call_and_wake(endpoint, request)?;
+    wait_for_reply(reply)
+}
+
+pub(super) fn call_service_endpoint_with_received_entries(
+    service_id: u64,
+    request: &[u8],
+    handle_capacity: usize,
+) -> Result<(Vec<u8>, Vec<multitask::TransferredHandleEntry>), i64> {
+    let endpoint = service_endpoint(service_id).ok_or(LINUX_ENOSYS)?;
+    let reply = enqueue_call_and_wake(endpoint, request)?;
+    let (response, descriptors) = wait_for_reply_with_handle_limit(reply, handle_capacity)?;
+    let entries = take_transfer_entries(descriptors.as_slice())?;
+    Ok((response, entries))
+}
+
+fn enqueue_call_and_wake(
+    endpoint: KernelEndpointHandle,
+    request: &[u8],
+) -> Result<KernelReplyHandle, i64> {
+    enqueue_call_and_wake_with_handles(endpoint, request, &[])
+}
+
+fn enqueue_call_and_wake_with_handles(
+    endpoint: KernelEndpointHandle,
+    request: &[u8],
+    attached_handles: &[KernelTransferredHandle],
+) -> Result<KernelReplyHandle, i64> {
+    let task_id = multitask::current_task_id().ok_or(LINUX_EINVAL)?;
+    let (reply, receiver_to_wake) = kernel_ipc_runtime::api::enqueue_endpoint_call_with_handles(
+        endpoint,
+        task_id,
+        request,
+        attached_handles,
+    )
+    .map_err(ipc_error_to_linux_errno)?;
+    if let Some(task_id) = receiver_to_wake {
+        let _ = multitask::wake_task(task_id);
+    }
+    Ok(reply)
+}
+
+fn wait_for_reply(reply: KernelReplyHandle) -> Result<Vec<u8>, i64> {
+    Ok(wait_for_reply_with_handle_limit(reply, 0)?.0)
+}
+
+fn wait_for_reply_with_handle_limit(
+    reply: KernelReplyHandle,
+    handle_capacity: usize,
+) -> Result<(Vec<u8>, Vec<KernelTransferredHandle>), i64> {
+    loop {
+        match kernel_ipc_runtime::api::take_endpoint_response_with_handle_limit(
+            reply,
+            handle_capacity,
+        ) {
+            Ok(Some(response)) => return Ok(response),
+            Ok(None) => {
+                if !multitask::block_current_task() {
+                    return Err(LINUX_EINVAL);
+                }
+                multitask::yield_now();
+            }
+            Err(err) => return Err(ipc_error_to_linux_errno(err)),
+        }
+    }
+}
+
+fn export_current_fds_for_ipc(
+    fds_ptr: u64,
+    fd_count: u16,
+) -> Result<Vec<KernelTransferredHandle>, i64> {
+    let fd_count = usize::from(fd_count);
+    if fd_count == 0 {
+        return Ok(Vec::new());
+    }
+    if fd_count > rustos_user_abi::syscall::IPC_MAX_TRANSFER_HANDLES || fds_ptr == 0 {
+        return Err(LINUX_EINVAL);
+    }
+
+    let fds = read_user_fd_array(fds_ptr, fd_count)?;
+    let Some(entries) = multitask::with_current_user_process_state(|_, _, process_state| {
+        let mut entries = Vec::with_capacity(fds.len());
+        for fd in fds {
+            if fd < 0 {
+                return Err(LINUX_EBADF);
+            }
+            let fd = fd as u64;
+            let Some(entry) = process_state.handles().get_entry(fd) else {
+                return Err(LINUX_EBADF);
+            };
+            let Some(transferred) = multitask::TransferredHandleEntry::from_entry(entry.clone())
+            else {
+                return Err(LINUX_EACCES);
+            };
+            entries.push(transferred);
+        }
+        Ok(entries)
+    }) else {
+        return Err(LINUX_EINVAL);
+    };
+    let entries = entries?;
+
+    let mut objects = TRANSFER_OBJECTS.lock();
+    if objects.len().saturating_add(entries.len()) > MAX_PENDING_TRANSFER_OBJECTS {
+        return Err(LINUX_ENOMEM);
+    }
+
+    let mut inserted_ids = Vec::with_capacity(entries.len());
+    let mut descriptors = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(transfer_id) = allocate_transfer_id(&objects) else {
+            for transfer_id in inserted_ids {
+                objects.remove(&transfer_id);
+            }
+            return Err(LINUX_ENOMEM);
+        };
+        let Some(descriptor) = entry.ipc_descriptor(transfer_id) else {
+            for transfer_id in inserted_ids {
+                objects.remove(&transfer_id);
+            }
+            return Err(LINUX_EINVAL);
+        };
+        objects.insert(transfer_id, entry);
+        inserted_ids.push(transfer_id);
+        descriptors.push(descriptor);
+    }
+    Ok(descriptors)
+}
+
+fn allocate_transfer_id(objects: &BTreeMap<u64, multitask::TransferredHandleEntry>) -> Option<u64> {
+    for _ in 0..MAX_PENDING_TRANSFER_OBJECTS {
+        let id = NEXT_TRANSFER_ID.fetch_add(1, Ordering::Relaxed);
+        if id != 0 && !objects.contains_key(&id) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+fn read_user_fd_array(fds_ptr: u64, fd_count: usize) -> Result<Vec<i32>, i64> {
+    let byte_len = fd_count.checked_mul(size_of::<i32>()).ok_or(LINUX_EINVAL)?;
+    let mut bytes = alloc::vec![0_u8; byte_len];
+    usermem::copy_from_current_user_exact(fds_ptr, &mut bytes)
+        .map_err(address_space_error_to_linux_errno)?;
+    let mut fds = Vec::with_capacity(fd_count);
+    for chunk in bytes.chunks_exact(size_of::<i32>()) {
+        fds.push(i32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    Ok(fds)
+}
+
+fn validate_received_handle_outputs(
+    fds_ptr: u64,
+    fd_count_ptr: u64,
+    fd_count: usize,
+) -> Result<(), i64> {
+    if fd_count > rustos_user_abi::syscall::IPC_MAX_TRANSFER_HANDLES {
+        return Err(LINUX_EINVAL);
+    }
+    if fd_count_ptr == 0 {
+        return Err(LINUX_EINVAL);
+    }
+    usermem::validate_current_user_write_buffer(fd_count_ptr, size_of::<u16>())
+        .map_err(address_space_error_to_linux_errno)?;
+    if fd_count == 0 {
+        return Ok(());
+    }
+    if fds_ptr == 0 {
+        return Err(LINUX_EINVAL);
+    }
+    usermem::validate_current_user_write_buffer(fds_ptr, fd_count * size_of::<i32>())
+        .map_err(address_space_error_to_linux_errno)?;
+    Ok(())
+}
+
+fn install_received_handles(
+    descriptors: &[KernelTransferredHandle],
+    fds_ptr: u64,
+    fd_count_ptr: u64,
+) -> Result<(), i64> {
+    validate_received_handle_outputs(fds_ptr, fd_count_ptr, descriptors.len())?;
+    let entries = take_transfer_entries(descriptors)?;
+    let Some(fds) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
+        let mut fds = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let fd = process_state.handles_mut().install_transferred(entry);
+            let Ok(fd) = i32::try_from(fd) else {
+                return Err(LINUX_EOVERFLOW);
+            };
+            fds.push(fd);
+        }
+        Ok(fds)
+    }) else {
+        return Err(LINUX_EINVAL);
+    };
+    let fds = fds?;
+
+    if !fds.is_empty() {
+        let bytes = unsafe {
+            core::slice::from_raw_parts(fds.as_ptr().cast::<u8>(), fds.len() * size_of::<i32>())
+        };
+        usermem::write_current_user_bytes(fds_ptr, bytes)
+            .map_err(address_space_error_to_linux_errno)?;
+    }
+    let count = u16::try_from(fds.len()).map_err(|_| LINUX_EOVERFLOW)?;
+    usermem::write_current_user_bytes(fd_count_ptr, &count.to_ne_bytes())
+        .map_err(address_space_error_to_linux_errno)?;
+    Ok(())
+}
+
+fn take_transfer_entries(
+    descriptors: &[KernelTransferredHandle],
+) -> Result<Vec<multitask::TransferredHandleEntry>, i64> {
+    let mut objects = TRANSFER_OBJECTS.lock();
+    for descriptor in descriptors {
+        let Some(entry) = objects.get(&descriptor.transfer_id()) else {
+            return Err(LINUX_ESTALE);
+        };
+        if entry.ipc_descriptor(descriptor.transfer_id()) != Some(*descriptor) {
+            return Err(LINUX_EINVAL);
+        }
+    }
+
+    let mut entries = Vec::with_capacity(descriptors.len());
+    for descriptor in descriptors {
+        let Some(entry) = objects.remove(&descriptor.transfer_id()) else {
+            return Err(LINUX_ESTALE);
+        };
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
+fn drop_transfer_descriptors(descriptors: &[KernelTransferredHandle]) {
+    if descriptors.is_empty() {
+        return;
+    }
+    let mut objects = TRANSFER_OBJECTS.lock();
+    for descriptor in descriptors {
+        objects.remove(&descriptor.transfer_id());
+    }
+}
+
+fn copy_request_from_user(user_ptr: u64, user_len: u64) -> Result<Vec<u8>, i64> {
+    let len = usize::try_from(user_len).map_err(|_| LINUX_EINVAL)?;
+    if len == 0 || len > rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES {
+        return Err(LINUX_EINVAL);
+    }
+    let mut bytes = alloc::vec![0_u8; len];
+    usermem::copy_from_current_user_exact(user_ptr, &mut bytes)
+        .map_err(address_space_error_to_linux_errno)?;
+    Ok(bytes)
+}
+
+fn ipc_error_to_linux_errno(err: kernel_ipc_runtime::api::IpcError) -> i64 {
+    match err {
+        kernel_ipc_runtime::api::IpcError::InvalidHandle
+        | kernel_ipc_runtime::api::IpcError::InvalidArgument => LINUX_EINVAL,
+        kernel_ipc_runtime::api::IpcError::PeerClosed => LINUX_EPIPE,
+        kernel_ipc_runtime::api::IpcError::BufferTooSmall => LINUX_EOVERFLOW,
+        kernel_ipc_runtime::api::IpcError::NoMemory => LINUX_ENOMEM,
+    }
+}

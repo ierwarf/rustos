@@ -1,20 +1,21 @@
 mod fs_ops;
+mod ipc_ops;
 mod memory_ops;
 mod network_ops;
+mod offload_ops;
 mod process_ops;
 
 use alloc::string::String;
 use core::convert::TryFrom;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use super::SyscallFrame;
 use crate::debug;
 use crate::memory::paging;
 use crate::multitask;
 use crate::user::linux as linux_abi;
 use crate::user::sysops::linux as linux_ops;
 use crate::user::sysops::usermem;
-
-use super::SyscallFrame;
 
 const LINUX_E2BIG: i64 = 7;
 const LINUX_ENOEXEC: i64 = 8;
@@ -45,6 +46,7 @@ const LINUX_EROFS: i64 = 30;
 const LINUX_ESPIPE: i64 = 29;
 const LINUX_ESTALE: i64 = 116;
 const LINUX_ENOSYS: i64 = 38;
+const LINUX_EOVERFLOW: i64 = 75;
 const SECONDARY_LINUX_SYSCALL_DEBUG_LIMIT: usize = 0;
 const MAX_RUSTOS_DEBUG_PRINT_BYTES: usize = 2048;
 
@@ -112,6 +114,9 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         linux_abi::SYS_RUSTOS_SPAWN_EXEC => process_ops::syscall_linux_rustos_spawn_exec(
             frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
         ),
+        _ if ipc_ops::is_linux_rustos_ipc_syscall(frame.rax) => {
+            ipc_ops::dispatch_linux_rustos_ipc_syscall(frame)
+        }
         linux_abi::SYS_CLOSE => fs_ops::syscall_linux_close(frame.rdi),
         linux_abi::SYS_SOCKET => network_ops::syscall_linux_socket(frame.rdi, frame.rsi, frame.rdx),
         linux_abi::SYS_SENDTO => network_ops::syscall_linux_sendto(
@@ -147,14 +152,14 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         linux_abi::SYS_DUP2 => fs_ops::syscall_linux_dup2(frame.rdi, frame.rsi),
         linux_abi::SYS_LSEEK => fs_ops::syscall_linux_lseek(frame.rdi, frame.rsi as i64, frame.rdx),
         linux_abi::SYS_WRITEV => fs_ops::syscall_linux_writev(frame.rdi, frame.rsi, frame.rdx),
-        linux_abi::SYS_ACCESS => fs_ops::syscall_linux_access(frame.rdi, frame.rsi),
+        linux_abi::SYS_ACCESS => offload_ops::syscall_linux_access(frame.rdi, frame.rsi),
         linux_abi::SYS_SCHED_YIELD => process_ops::syscall_linux_sched_yield(),
         linux_abi::SYS_MOUNT => {
             fs_ops::syscall_linux_mount(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
         }
-        linux_abi::SYS_GETCWD => fs_ops::syscall_linux_getcwd(frame.rdi, frame.rsi),
-        linux_abi::SYS_MKDIR => fs_ops::syscall_linux_mkdir(frame.rdi, frame.rsi),
-        linux_abi::SYS_CHDIR => fs_ops::syscall_linux_chdir(frame.rdi),
+        linux_abi::SYS_GETCWD => offload_ops::syscall_linux_getcwd(frame.rdi, frame.rsi),
+        linux_abi::SYS_MKDIR => offload_ops::syscall_linux_mkdir(frame.rdi, frame.rsi),
+        linux_abi::SYS_CHDIR => offload_ops::syscall_linux_chdir(frame.rdi),
         linux_abi::SYS_MMAP => memory_ops::syscall_linux_mmap(
             frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
         ),
@@ -184,19 +189,24 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
             process_ops::syscall_linux_wait4(frame.rdi as i64, frame.rsi, frame.rdx, frame.r10)
         }
         linux_abi::SYS_CLONE => process_ops::syscall_linux_clone(frame),
-        linux_abi::SYS_UNAME => process_ops::syscall_linux_uname(frame.rdi),
+        linux_abi::SYS_UNAME => offload_ops::syscall_linux_uname(frame.rdi),
         linux_abi::SYS_GETTID => process_ops::syscall_linux_gettid(),
         linux_abi::SYS_SCHED_GETAFFINITY => {
-            process_ops::syscall_linux_sched_getaffinity(frame.rdi, frame.rsi, frame.rdx)
+            offload_ops::syscall_linux_sched_getaffinity(frame.rdi, frame.rsi, frame.rdx)
         }
-        linux_abi::SYS_GETUID => process_ops::syscall_linux_getuid(),
-        linux_abi::SYS_GETGID => process_ops::syscall_linux_getgid(),
-        linux_abi::SYS_GETEUID => process_ops::syscall_linux_geteuid(),
-        linux_abi::SYS_GETEGID => process_ops::syscall_linux_getegid(),
-        linux_abi::SYS_SETUID => process_ops::syscall_linux_setuid(frame.rdi),
-        linux_abi::SYS_SETGID => process_ops::syscall_linux_setgid(frame.rdi),
+        linux_abi::SYS_GETUID => offload_ops::syscall_linux_getuid(),
+        linux_abi::SYS_GETGID => offload_ops::syscall_linux_getgid(),
+        linux_abi::SYS_GETEUID => offload_ops::syscall_linux_geteuid(),
+        linux_abi::SYS_GETEGID => offload_ops::syscall_linux_getegid(),
+        linux_abi::SYS_SETUID => offload_ops::syscall_linux_setuid(frame.rdi),
+        linux_abi::SYS_SETGID => offload_ops::syscall_linux_setgid(frame.rdi),
         linux_abi::SYS_FCNTL => fs_ops::syscall_linux_fcntl(frame.rdi, frame.rsi, frame.rdx),
-        linux_abi::SYS_READLINK => fs_ops::syscall_linux_readlink(frame.rdi, frame.rsi, frame.rdx),
+        linux_abi::SYS_READLINK => offload_ops::syscall_linux_readlinkat(
+            linux_abi::AT_FDCWD as u64,
+            frame.rdi,
+            frame.rsi,
+            frame.rdx,
+        ),
         linux_abi::SYS_FUTEX => process_ops::syscall_linux_futex(
             frame, frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
         ),
@@ -252,14 +262,14 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         }
         linux_abi::SYS_EXECVEAT => process_ops::syscall_linux_execveat(frame),
         linux_abi::SYS_NEWFSTATAT => {
-            fs_ops::syscall_linux_newfstatat(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+            offload_ops::syscall_linux_newfstatat(frame.rdi, frame.rsi, frame.rdx, frame.r10)
         }
         linux_abi::SYS_UMOUNT2 => fs_ops::syscall_linux_umount2(frame.rdi, frame.rsi),
         linux_abi::SYS_READLINKAT => {
-            fs_ops::syscall_linux_readlinkat(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+            offload_ops::syscall_linux_readlinkat(frame.rdi, frame.rsi, frame.rdx, frame.r10)
         }
         linux_abi::SYS_FACCESSAT => {
-            fs_ops::syscall_linux_faccessat(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+            offload_ops::syscall_linux_faccessat(frame.rdi, frame.rsi, frame.rdx, frame.r10)
         }
         linux_abi::SYS_SET_ROBUST_LIST => {
             process_ops::syscall_linux_set_robust_list(frame.rdi, frame.rsi)
@@ -270,13 +280,13 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         linux_abi::SYS_DUP3 => fs_ops::syscall_linux_dup3(frame.rdi, frame.rsi, frame.rdx),
         linux_abi::SYS_EPOLL_CREATE1 => fs_ops::syscall_linux_epoll_create1(frame.rdi),
         linux_abi::SYS_PRLIMIT64 => {
-            process_ops::syscall_linux_prlimit64(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+            offload_ops::syscall_linux_prlimit64(frame.rdi, frame.rsi, frame.rdx, frame.r10)
         }
         linux_abi::SYS_GETRANDOM => {
             process_ops::syscall_linux_getrandom(frame.rdi, frame.rsi, frame.rdx)
         }
         linux_abi::SYS_STATX => {
-            process_ops::syscall_linux_statx(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
+            offload_ops::syscall_linux_statx(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
         }
         linux_abi::SYS_RSEQ => {
             process_ops::syscall_linux_rseq(frame.rdi, frame.rsi, frame.rdx, frame.r10)
@@ -349,102 +359,105 @@ fn linux_syscall_support_level(syscall_number: u64) -> Option<LinuxSyscallSuppor
 }
 
 fn linux_syscall_number_supported(syscall_number: u64) -> bool {
-    matches!(
-        syscall_number,
-        linux_abi::SYS_READ
-            | linux_abi::SYS_WRITE
-            | linux_abi::SYS_CLOSE
-            | linux_abi::SYS_UNLINK
-            | linux_abi::SYS_SOCKET
-            | linux_abi::SYS_SENDTO
-            | linux_abi::SYS_ACCEPT
-            | linux_abi::SYS_FTRUNCATE
-            | linux_abi::SYS_FSTAT
-            | linux_abi::SYS_POLL
-            | linux_abi::SYS_PPOLL
-            | linux_abi::SYS_EPOLL_WAIT
-            | linux_abi::SYS_EPOLL_PWAIT
-            | linux_abi::SYS_EPOLL_CTL
-            | linux_abi::SYS_DUP
-            | linux_abi::SYS_DUP2
-            | linux_abi::SYS_LSEEK
-            | linux_abi::SYS_WRITEV
-            | linux_abi::SYS_ACCESS
-            | linux_abi::SYS_SCHED_YIELD
-            | linux_abi::SYS_MOUNT
-            | linux_abi::SYS_GETCWD
-            | linux_abi::SYS_MKDIR
-            | linux_abi::SYS_CHDIR
-            | linux_abi::SYS_MMAP
-            | linux_abi::SYS_MPROTECT
-            | linux_abi::SYS_MUNMAP
-            | linux_abi::SYS_MADVISE
-            | linux_abi::SYS_SIGALTSTACK
-            | linux_abi::SYS_BRK
-            | linux_abi::SYS_RT_SIGACTION
-            | linux_abi::SYS_RT_SIGPROCMASK
-            | linux_abi::SYS_RT_SIGRETURN
-            | linux_abi::SYS_IOCTL
-            | linux_abi::SYS_PREAD64
-            | linux_abi::SYS_NANOSLEEP
-            | linux_abi::SYS_GETPID
-            | linux_abi::SYS_FORK
-            | linux_abi::SYS_WAIT4
-            | linux_abi::SYS_CLONE
-            | linux_abi::SYS_UNAME
-            | linux_abi::SYS_GETTID
-            | linux_abi::SYS_SCHED_GETAFFINITY
-            | linux_abi::SYS_GETUID
-            | linux_abi::SYS_GETGID
-            | linux_abi::SYS_GETEUID
-            | linux_abi::SYS_GETEGID
-            | linux_abi::SYS_SETUID
-            | linux_abi::SYS_SETGID
-            | linux_abi::SYS_FCNTL
-            | linux_abi::SYS_READLINK
-            | linux_abi::SYS_FUTEX
-            | linux_abi::SYS_ARCH_PRCTL
-            | linux_abi::SYS_EXECVE
-            | linux_abi::SYS_SET_TID_ADDRESS
-            | linux_abi::SYS_CLOCK_GETTIME
-            | linux_abi::SYS_CLOCK_NANOSLEEP
-            | linux_abi::SYS_TGKILL
-            | linux_abi::SYS_OPENAT
-            | linux_abi::SYS_UNLINKAT
-            | linux_abi::SYS_SOCKETPAIR
-            | linux_abi::SYS_BIND
-            | linux_abi::SYS_CONNECT
-            | linux_abi::SYS_LISTEN
-            | linux_abi::SYS_ACCEPT4
-            | linux_abi::SYS_GETSOCKNAME
-            | linux_abi::SYS_GETPEERNAME
-            | linux_abi::SYS_SETSOCKOPT
-            | linux_abi::SYS_GETSOCKOPT
-            | linux_abi::SYS_SHUTDOWN
-            | linux_abi::SYS_SENDMSG
-            | linux_abi::SYS_RECVFROM
-            | linux_abi::SYS_RECVMSG
-            | linux_abi::SYS_GETDENTS64
-            | linux_abi::SYS_EXECVEAT
-            | linux_abi::SYS_NEWFSTATAT
-            | linux_abi::SYS_UMOUNT2
-            | linux_abi::SYS_READLINKAT
-            | linux_abi::SYS_FACCESSAT
-            | linux_abi::SYS_SET_ROBUST_LIST
-            | linux_abi::SYS_GET_ROBUST_LIST
-            | linux_abi::SYS_DUP3
-            | linux_abi::SYS_EPOLL_CREATE1
-            | linux_abi::SYS_PRLIMIT64
-            | linux_abi::SYS_GETRANDOM
-            | linux_abi::SYS_STATX
-            | linux_abi::SYS_RSEQ
-            | linux_abi::SYS_CLONE3
-            | linux_abi::SYS_MEMFD_CREATE
-            | linux_abi::SYS_RUSTOS_DEBUG_PRINT
-            | linux_abi::SYS_RUSTOS_SPAWN_EXEC
-            | linux_abi::SYS_EXIT
-            | linux_abi::SYS_EXIT_GROUP
-    )
+    ipc_ops::is_linux_rustos_ipc_syscall(syscall_number)
+        || matches!(
+            syscall_number,
+            linux_abi::SYS_RUSTOS_DEBUG_PRINT | linux_abi::SYS_RUSTOS_SPAWN_EXEC
+        )
+        || matches!(
+            syscall_number,
+            linux_abi::SYS_READ
+                | linux_abi::SYS_WRITE
+                | linux_abi::SYS_CLOSE
+                | linux_abi::SYS_UNLINK
+                | linux_abi::SYS_SOCKET
+                | linux_abi::SYS_SENDTO
+                | linux_abi::SYS_ACCEPT
+                | linux_abi::SYS_FTRUNCATE
+                | linux_abi::SYS_FSTAT
+                | linux_abi::SYS_POLL
+                | linux_abi::SYS_PPOLL
+                | linux_abi::SYS_EPOLL_WAIT
+                | linux_abi::SYS_EPOLL_PWAIT
+                | linux_abi::SYS_EPOLL_CTL
+                | linux_abi::SYS_DUP
+                | linux_abi::SYS_DUP2
+                | linux_abi::SYS_LSEEK
+                | linux_abi::SYS_WRITEV
+                | linux_abi::SYS_ACCESS
+                | linux_abi::SYS_SCHED_YIELD
+                | linux_abi::SYS_MOUNT
+                | linux_abi::SYS_GETCWD
+                | linux_abi::SYS_MKDIR
+                | linux_abi::SYS_CHDIR
+                | linux_abi::SYS_MMAP
+                | linux_abi::SYS_MPROTECT
+                | linux_abi::SYS_MUNMAP
+                | linux_abi::SYS_MADVISE
+                | linux_abi::SYS_SIGALTSTACK
+                | linux_abi::SYS_BRK
+                | linux_abi::SYS_RT_SIGACTION
+                | linux_abi::SYS_RT_SIGPROCMASK
+                | linux_abi::SYS_RT_SIGRETURN
+                | linux_abi::SYS_IOCTL
+                | linux_abi::SYS_PREAD64
+                | linux_abi::SYS_NANOSLEEP
+                | linux_abi::SYS_GETPID
+                | linux_abi::SYS_FORK
+                | linux_abi::SYS_WAIT4
+                | linux_abi::SYS_CLONE
+                | linux_abi::SYS_UNAME
+                | linux_abi::SYS_GETTID
+                | linux_abi::SYS_SCHED_GETAFFINITY
+                | linux_abi::SYS_GETUID
+                | linux_abi::SYS_GETGID
+                | linux_abi::SYS_GETEUID
+                | linux_abi::SYS_GETEGID
+                | linux_abi::SYS_SETUID
+                | linux_abi::SYS_SETGID
+                | linux_abi::SYS_FCNTL
+                | linux_abi::SYS_READLINK
+                | linux_abi::SYS_FUTEX
+                | linux_abi::SYS_ARCH_PRCTL
+                | linux_abi::SYS_EXECVE
+                | linux_abi::SYS_SET_TID_ADDRESS
+                | linux_abi::SYS_CLOCK_GETTIME
+                | linux_abi::SYS_CLOCK_NANOSLEEP
+                | linux_abi::SYS_TGKILL
+                | linux_abi::SYS_OPENAT
+                | linux_abi::SYS_UNLINKAT
+                | linux_abi::SYS_SOCKETPAIR
+                | linux_abi::SYS_BIND
+                | linux_abi::SYS_CONNECT
+                | linux_abi::SYS_LISTEN
+                | linux_abi::SYS_ACCEPT4
+                | linux_abi::SYS_GETSOCKNAME
+                | linux_abi::SYS_GETPEERNAME
+                | linux_abi::SYS_SETSOCKOPT
+                | linux_abi::SYS_GETSOCKOPT
+                | linux_abi::SYS_SHUTDOWN
+                | linux_abi::SYS_SENDMSG
+                | linux_abi::SYS_RECVFROM
+                | linux_abi::SYS_RECVMSG
+                | linux_abi::SYS_GETDENTS64
+                | linux_abi::SYS_EXECVEAT
+                | linux_abi::SYS_NEWFSTATAT
+                | linux_abi::SYS_UMOUNT2
+                | linux_abi::SYS_READLINKAT
+                | linux_abi::SYS_FACCESSAT
+                | linux_abi::SYS_SET_ROBUST_LIST
+                | linux_abi::SYS_GET_ROBUST_LIST
+                | linux_abi::SYS_DUP3
+                | linux_abi::SYS_EPOLL_CREATE1
+                | linux_abi::SYS_PRLIMIT64
+                | linux_abi::SYS_GETRANDOM
+                | linux_abi::SYS_STATX
+                | linux_abi::SYS_RSEQ
+                | linux_abi::SYS_CLONE3
+                | linux_abi::SYS_MEMFD_CREATE
+                | linux_abi::SYS_EXIT
+                | linux_abi::SYS_EXIT_GROUP
+        )
 }
 
 fn syscall_process_exit(status: u64) -> u64 {

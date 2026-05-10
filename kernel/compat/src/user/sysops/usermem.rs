@@ -53,6 +53,15 @@ pub fn write_current_user_bytes(
     })
 }
 
+pub fn validate_current_user_write_buffer(
+    user_ptr: u64,
+    len: usize,
+) -> Result<(), paging::AddressSpaceError> {
+    with_current_address_space(|address_space| {
+        address_space.validate_user_write_buffer(VirtAddr::new(user_ptr), len)
+    })
+}
+
 pub fn write_current_user_struct<T: Copy>(
     user_ptr: u64,
     value: &T,

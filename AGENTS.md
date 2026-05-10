@@ -40,6 +40,11 @@ reported command output as the primary context instead of scanning logs.
 
 ## Hardening Direction
 
+- Product goal: RustOS must preserve native compatibility for both Linux ELF
+  and Windows PE executables. Microkernel migration should move policy and
+  namespace ownership to user services without casually breaking observable app
+  ABI behavior; when ring0 code is removed, keep compatibility through narrow,
+  explicit brokers or service-owned implementations.
 - Prefer long-term hardening over symptom patches: make ownership, provider
   choice, timeouts, queue bounds, and ABI contracts explicit in source,
   manifests, registries, probes, or AI contracts.

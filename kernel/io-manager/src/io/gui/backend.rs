@@ -124,6 +124,9 @@ pub(crate) fn present_bgra8888_from_user(
     if !present_context_allows_blocking() {
         return Ok(false);
     }
+    if display_present_faulted() {
+        return Ok(false);
+    }
     let presented = copy_user_bgra8888_rect_in_stripes(
         address_space,
         user_ptr,
@@ -137,10 +140,7 @@ pub(crate) fn present_bgra8888_from_user(
             height,
         },
     )?;
-    if presented {
-        crate::driver::virtio_gpu::flush_primary();
-    }
-    Ok(presented)
+    Ok(presented && crate::driver::virtio_gpu::flush_primary())
 }
 
 #[cfg(rustos_debug_print_enabled)]
@@ -181,6 +181,9 @@ pub(crate) fn present_bgra8888_rect_from_user(
     if !present_context_allows_blocking() {
         return Ok(false);
     }
+    if display_present_faulted() {
+        return Ok(false);
+    }
     let presented = copy_user_bgra8888_rect_in_stripes(
         address_space,
         user_ptr,
@@ -189,15 +192,13 @@ pub(crate) fn present_bgra8888_rect_from_user(
         stride_bytes,
         rect,
     )?;
-    if presented {
-        crate::driver::virtio_gpu::flush_primary_rect(
+    Ok(presented
+        && crate::driver::virtio_gpu::flush_primary_rect(
             rect.x as u32,
             rect.y as u32,
             rect.width as u32,
             rect.height as u32,
-        );
-    }
-    Ok(presented)
+        ))
 }
 
 fn copy_user_bgra8888_rect_in_stripes(
@@ -348,22 +349,21 @@ pub(crate) fn present_bgra8888_from_kernel(
     if !present_context_allows_blocking() {
         return false;
     }
-    let presented = copy_kernel_bgra8888_rect_in_stripes(
-        src_ptr,
-        width,
-        height,
-        stride_bytes,
-        FramebufferRect {
-            x: 0,
-            y: 0,
-            width,
-            height,
-        },
-    );
-    if presented {
-        crate::driver::virtio_gpu::flush_primary();
+    if display_present_faulted() {
+        return false;
     }
-    presented
+    let presented = DISPLAY_BACKEND
+        .lock()
+        .with_framebuffer(|framebuffer| {
+            let drawn =
+                framebuffer.draw_bgra8888_frame_from_kernel(src_ptr, width, height, stride_bytes);
+            if drawn {
+                return framebuffer.present_scene();
+            }
+            false
+        })
+        .unwrap_or(false);
+    presented && crate::driver::virtio_gpu::flush_primary()
 }
 
 pub(crate) fn present_bgra8888_rect_from_kernel(
@@ -376,86 +376,32 @@ pub(crate) fn present_bgra8888_rect_from_kernel(
     if !present_context_allows_blocking() {
         return false;
     }
-    let presented =
-        copy_kernel_bgra8888_rect_in_stripes(src_ptr, width, height, stride_bytes, rect);
-    if presented {
-        crate::driver::virtio_gpu::flush_primary_rect(
-            rect.x as u32,
-            rect.y as u32,
-            rect.width as u32,
-            rect.height as u32,
-        );
-    }
-    presented
-}
-
-fn copy_kernel_bgra8888_rect_in_stripes(
-    src_ptr: *const u8,
-    width: usize,
-    height: usize,
-    stride_bytes: usize,
-    rect: FramebufferRect,
-) -> bool {
-    if rect.width == 0 || rect.height == 0 {
-        return true;
-    }
-    let Some(info) = display_info() else {
-        return false;
-    };
-    if width != info.width as usize || height != info.height as usize {
+    if display_present_faulted() {
         return false;
     }
-    let Some(min_stride) = width.checked_mul(4) else {
-        return false;
-    };
-    if stride_bytes < min_stride {
-        return false;
-    }
-    let Some(rect) = rect.intersection(FramebufferRect {
-        x: 0,
-        y: 0,
-        width: info.width as usize,
-        height: info.height as usize,
-    }) else {
-        return true;
-    };
-
-    let stripe_rows = user_present_stripe_rows(rect.width);
-    let Some(end_y) = rect.y.checked_add(rect.height) else {
-        return false;
-    };
-    let mut y = rect.y;
-    let mut copied = false;
-    while y < end_y {
-        let stripe_height = stripe_rows.min(end_y - y);
-        let stripe = FramebufferRect {
-            x: rect.x,
-            y,
-            width: rect.width,
-            height: stripe_height,
-        };
-        let Some(presented) = DISPLAY_BACKEND.lock().with_framebuffer(|framebuffer| {
+    let presented = DISPLAY_BACKEND
+        .lock()
+        .with_framebuffer(|framebuffer| {
             let drawn = framebuffer.draw_bgra8888_frame_rect_from_kernel(
                 src_ptr,
                 width,
                 height,
                 stride_bytes,
-                stripe,
+                rect,
             );
             if drawn {
                 return framebuffer.present_scene();
             }
             false
-        }) else {
-            return false;
-        };
-        if !presented {
-            return false;
-        }
-        copied = true;
-        y += stripe_height;
-    }
-    copied
+        })
+        .unwrap_or(false);
+    presented
+        && crate::driver::virtio_gpu::flush_primary_rect(
+            rect.x as u32,
+            rect.y as u32,
+            rect.width as u32,
+            rect.height as u32,
+        )
 }
 
 fn present_context_allows_blocking() -> bool {
@@ -466,6 +412,14 @@ fn present_context_allows_blocking() -> bool {
         return false;
     }
     true
+}
+
+fn display_present_faulted() -> bool {
+    if nucleus_core::util::fault_injection::should_fail("display.present") {
+        crate::debug::warn!(display, "fault injection: display.present dropped present");
+        return true;
+    }
+    false
 }
 
 fn mark_framebuffer_write_combine(info: FramebufferInfo) {

@@ -4,10 +4,9 @@ use std::time::Instant;
 use runtime_control::RuntimeClient;
 
 use crate::app::{
-    AppState, InputProcessingResult, INPUT_EVENT_BATCH, INPUT_PROCESS_BUDGET,
+    AppState, InputProcessingResult, VisualUpdate, INPUT_EVENT_BATCH, INPUT_PROCESS_BUDGET,
     MAX_INPUT_READ_BATCHES_PER_TICK,
 };
-use crate::canvas;
 use crate::profile;
 use crate::sys::{read_input, InputEvent, INPUT_ACTION_NONE, INPUT_KIND_POINTER_POSITION};
 use crate::wayland::WaylandCompositor;
@@ -61,9 +60,7 @@ pub(crate) fn process_pending_input(
 ) -> Result<InputProcessingResult, i32> {
     let previous_cursor_x = state.cursor_x;
     let previous_cursor_y = state.cursor_y;
-    let mut needs_full_redraw = false;
-    let mut partial_redraw_rect = canvas::Rect::empty();
-    let mut secondary_partial_redraw_rect = canvas::Rect::empty();
+    let mut visual_update = VisualUpdate::default();
     let mut backlog_remaining = false;
     let started_at = Instant::now();
     let mut input_events = 0_u64;
@@ -104,18 +101,11 @@ pub(crate) fn process_pending_input(
                 runtime,
                 wayland.as_deref_mut(),
                 &mut pending_pointer,
-                &mut needs_full_redraw,
-                &mut partial_redraw_rect,
-                &mut secondary_partial_redraw_rect,
+                &mut visual_update,
             )?;
 
             let redraw = state.handle_input_event(runtime, event, wayland.as_deref_mut())?;
-            absorb_visual_update(
-                &mut needs_full_redraw,
-                &mut partial_redraw_rect,
-                &mut secondary_partial_redraw_rect,
-                redraw,
-            );
+            visual_update.absorb(redraw);
         }
 
         let hit_batch_limit = batch_index + 1 == MAX_INPUT_READ_BATCHES_PER_TICK;
@@ -131,9 +121,7 @@ pub(crate) fn process_pending_input(
         runtime,
         wayland.as_deref_mut(),
         &mut pending_pointer,
-        &mut needs_full_redraw,
-        &mut partial_redraw_rect,
-        &mut secondary_partial_redraw_rect,
+        &mut visual_update,
     )?;
 
     let cursor_moved = state.cursor_x != previous_cursor_x || state.cursor_y != previous_cursor_y;
@@ -148,9 +136,7 @@ pub(crate) fn process_pending_input(
     );
 
     Ok(InputProcessingResult {
-        needs_full_redraw,
-        partial_redraw_rect,
-        secondary_partial_redraw_rect,
+        visual_update,
         backlog_remaining,
     })
 }
@@ -160,34 +146,15 @@ fn flush_pending_pointer(
     runtime: &RuntimeClient,
     wayland: Option<&mut WaylandCompositor>,
     pending_pointer: &mut PendingPointerPosition,
-    needs_full_redraw: &mut bool,
-    partial_redraw_rect: &mut canvas::Rect,
-    secondary_partial_redraw_rect: &mut canvas::Rect,
+    visual_update: &mut VisualUpdate,
 ) -> Result<(), i32> {
     let Some(event) = pending_pointer.take_event() else {
         return Ok(());
     };
 
     let redraw = state.handle_input_event(runtime, &event, wayland)?;
-    absorb_visual_update(
-        needs_full_redraw,
-        partial_redraw_rect,
-        secondary_partial_redraw_rect,
-        redraw,
-    );
+    visual_update.absorb(redraw);
     Ok(())
-}
-
-fn absorb_visual_update(
-    needs_full_redraw: &mut bool,
-    partial_redraw_rect: &mut canvas::Rect,
-    secondary_partial_redraw_rect: &mut canvas::Rect,
-    redraw: crate::app::VisualUpdate,
-) {
-    *needs_full_redraw |= redraw.needs_full_redraw;
-    *partial_redraw_rect = partial_redraw_rect.union(redraw.partial_redraw_rect);
-    *secondary_partial_redraw_rect =
-        secondary_partial_redraw_rect.union(redraw.secondary_partial_redraw_rect);
 }
 
 fn clamp_pointer_coordinate(value: i64, max: u32) -> u32 {

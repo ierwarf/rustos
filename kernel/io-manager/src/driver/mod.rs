@@ -465,6 +465,21 @@ fn load_candidate_with_dependencies(
         bus::name(bus),
         image_path
     );
+    if nucleus_core::util::fault_injection::should_fail("driver.module.load") {
+        crate::debug::warn!(
+            driver,
+            "fault injection: driver.module.load failed name={} path={}",
+            name,
+            image_path
+        );
+        registry::update_loadable_module_status(
+            name,
+            image_path,
+            DriverModuleState::LoadFailed,
+            Some("fault injected module load failure"),
+        );
+        return LoadAttempt::Failed;
+    }
     match load_module_image(name, class, bus, image_path, candidate.linux_driver_names) {
         Ok(_module) => {
             registry::update_loadable_module_status(
