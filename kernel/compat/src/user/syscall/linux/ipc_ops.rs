@@ -8,7 +8,7 @@ use kernel_ipc_runtime::api::{KernelEndpointHandle, KernelReplyHandle, KernelTra
 use lazy_static::lazy_static;
 use spin::Mutex;
 
-const MAX_SERVICE_ENDPOINTS: usize = 8;
+const MAX_SERVICE_ENDPOINTS: usize = 16;
 const MAX_PENDING_TRANSFER_OBJECTS: usize = 1024;
 static LINUX_SYSCALL_ENDPOINT: AtomicU64 = AtomicU64::new(0);
 static SERVICE_ENDPOINTS: [AtomicU64; MAX_SERVICE_ENDPOINTS] =
@@ -51,6 +51,9 @@ pub(super) fn is_linux_rustos_ipc_syscall(syscall_number: u64) -> bool {
             | linux_abi::SYS_RUSTOS_DRIVER_PROVIDER_ACTIVE_BROKER
             | linux_abi::SYS_RUSTOS_NET_BROKER
             | linux_abi::SYS_RUSTOS_BLOCK_BROKER
+            | linux_abi::SYS_RUSTOS_STORAGE_LIST_BROKER
+            | linux_abi::SYS_RUSTOS_INPUT_STATS_BROKER
+            | linux_abi::SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER
             | linux_abi::SYS_RUSTOS_IPC_REGISTER_LINUX_SYSCALL_ENDPOINT
             | linux_abi::SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT
             | linux_abi::SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT
@@ -136,6 +139,15 @@ pub(super) fn dispatch_linux_rustos_ipc_syscall(frame: &SyscallFrame) -> u64 {
         linux_abi::SYS_RUSTOS_NET_BROKER => offload_ops::syscall_linux_rustos_net_broker(frame.rdi),
         linux_abi::SYS_RUSTOS_BLOCK_BROKER => {
             offload_ops::syscall_linux_rustos_block_broker(frame.rdi)
+        }
+        linux_abi::SYS_RUSTOS_STORAGE_LIST_BROKER => {
+            offload_ops::syscall_linux_rustos_storage_list_broker(frame.rdi)
+        }
+        linux_abi::SYS_RUSTOS_INPUT_STATS_BROKER => {
+            offload_ops::syscall_linux_rustos_input_stats_broker(frame.rdi)
+        }
+        linux_abi::SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER => {
+            offload_ops::syscall_linux_rustos_lifecycle_drain_broker(frame.rdi)
         }
         linux_abi::SYS_RUSTOS_IPC_REGISTER_LINUX_SYSCALL_ENDPOINT => {
             syscall_linux_rustos_ipc_register_linux_syscall_endpoint(frame.rdi)
@@ -309,6 +321,10 @@ fn service_capability(service_id: u64) -> u64 {
         linux_abi::IPC_SERVICE_DEVMGRD => rustos_user_abi::syscall::IPC_SERVICE_CAP_DEVICE_POLICY,
         linux_abi::IPC_SERVICE_DRIVERD => rustos_user_abi::syscall::IPC_SERVICE_CAP_DRIVER_POLICY,
         linux_abi::IPC_SERVICE_LOADERD => rustos_user_abi::syscall::IPC_SERVICE_CAP_PROCESS_LOADER,
+        linux_abi::IPC_SERVICE_STORAGED => {
+            rustos_user_abi::syscall::IPC_SERVICE_CAP_STORAGE_POLICY
+        }
+        linux_abi::IPC_SERVICE_INPUTD => rustos_user_abi::syscall::IPC_SERVICE_CAP_INPUT_POLICY,
         _ => 0,
     }
 }

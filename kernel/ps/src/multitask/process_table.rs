@@ -305,6 +305,19 @@ pub fn process_id(handle: ProcessHandle) -> Option<u64> {
     Some(table.lookup_object(handle)?.process_id)
 }
 
+pub fn parent_process_id_of(process_id: u64) -> Option<u64> {
+    let table = PROCESS_TABLE.lock();
+    for slot in table.slots.iter() {
+        let Some(object) = slot.object.as_deref() else {
+            continue;
+        };
+        if object.process_id == process_id {
+            return object.parent_process_id;
+        }
+    }
+    None
+}
+
 pub enum WaitResult {
     Exited { pid: u64, status: i32 },
     Pending,

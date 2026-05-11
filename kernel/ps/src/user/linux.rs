@@ -131,6 +131,11 @@ raw_u64! {
     SYS_CLONE3 = linux::__NR_clone3;
     SYS_MEMFD_CREATE = linux::__NR_memfd_create;
     SYS_UMASK = linux::__NR_umask;
+    SYS_GETPPID = linux::__NR_getppid;
+    SYS_GETPGID = linux::__NR_getpgid;
+    SYS_SETPGID = linux::__NR_setpgid;
+    SYS_GETSID = linux::__NR_getsid;
+    SYS_SETSID = linux::__NR_setsid;
     TCGETS = linux_ioctl::TCGETS;
     TCSETS = linux_ioctl::TCSETS;
     TCSETSW = linux_ioctl::TCSETSW;
@@ -1389,6 +1394,12 @@ pub const SYS_RUSTOS_DRIVER_PROVIDER_ACTIVE_BROKER: u64 =
     rustos_user_abi::syscall::SYS_RUSTOS_DRIVER_PROVIDER_ACTIVE_BROKER;
 pub const SYS_RUSTOS_NET_BROKER: u64 = rustos_user_abi::syscall::SYS_RUSTOS_NET_BROKER;
 pub const SYS_RUSTOS_BLOCK_BROKER: u64 = rustos_user_abi::syscall::SYS_RUSTOS_BLOCK_BROKER;
+pub const SYS_RUSTOS_STORAGE_LIST_BROKER: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_STORAGE_LIST_BROKER;
+pub const SYS_RUSTOS_INPUT_STATS_BROKER: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_INPUT_STATS_BROKER;
+pub const SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER;
 pub const SYS_RUSTOS_STATX_METADATA: u64 = rustos_user_abi::syscall::SYS_RUSTOS_STATX_METADATA;
 pub const SYS_RUSTOS_STAT_METADATA: u64 = rustos_user_abi::syscall::SYS_RUSTOS_STAT_METADATA;
 pub const SYS_RUSTOS_READLINK_METADATA: u64 =
@@ -1402,6 +1413,8 @@ pub const IPC_SERVICE_NETD: u64 = rustos_user_abi::syscall::IPC_SERVICE_NETD;
 pub const IPC_SERVICE_DEVMGRD: u64 = rustos_user_abi::syscall::IPC_SERVICE_DEVMGRD;
 pub const IPC_SERVICE_DRIVERD: u64 = rustos_user_abi::syscall::IPC_SERVICE_DRIVERD;
 pub const IPC_SERVICE_LOADERD: u64 = rustos_user_abi::syscall::IPC_SERVICE_LOADERD;
+pub const IPC_SERVICE_STORAGED: u64 = rustos_user_abi::syscall::IPC_SERVICE_STORAGED;
+pub const IPC_SERVICE_INPUTD: u64 = rustos_user_abi::syscall::IPC_SERVICE_INPUTD;
 
 #[cfg(test)]
 mod tests {

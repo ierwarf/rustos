@@ -1,8 +1,8 @@
 id = "inputd"
 kind = "service"
 execution_domain = "user"
-profiles = ["legacy-services"]
-startup = "session"
+profiles = ["default"]
+startup = "init"
 
 [build]
 builder = "cargo-kernel-binary"

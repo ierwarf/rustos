@@ -16,6 +16,9 @@ struct LinuxPolicyState {
     credentials: Credentials,
     stack_rlimit: LinuxRlimit,
     umask: u32,
+    parent_pid: u64,
+    pgid: u64,
+    sid: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -190,7 +193,141 @@ fn initial_state(request: &LinuxSyscallOffloadRequest) -> LinuxPolicyState {
             rlim_max: LINUX_DEFAULT_STACK_RLIMIT_BYTES,
         },
         umask: DEFAULT_UMASK,
+        parent_pid: request.parent_pid,
+        pgid: request.pid,
+        sid: request.pid,
     }
+}
+
+/// Look up a child's initial state, inheriting umask/pgid/sid from the parent if
+/// the parent already has a tracked state. Called with the policy lock held.
+fn ensure_state_with_inheritance<'a>(
+    db: &'a mut BTreeMap<u64, LinuxPolicyState>,
+    request: &LinuxSyscallOffloadRequest,
+) -> &'a mut LinuxPolicyState {
+    if !db.contains_key(&request.pid) {
+        let parent = request
+            .parent_pid
+            .checked_add(0)
+            .filter(|&pid| pid != 0)
+            .and_then(|pid| db.get(&pid).copied());
+        let mut state = initial_state(request);
+        if let Some(parent) = parent {
+            state.umask = parent.umask;
+            state.pgid = parent.pgid;
+            state.sid = parent.sid;
+        }
+        db.insert(request.pid, state);
+    }
+    db.get_mut(&request.pid)
+        .expect("syscalld policy state must be present after insert")
+}
+
+pub(crate) fn handle_getppid(
+    request: &LinuxSyscallOffloadRequest,
+    response: &mut LinuxSyscallOffloadResponse,
+) {
+    let mut policy = policy_db().lock().expect("syscalld policy mutex poisoned");
+    let state = ensure_state_with_inheritance(&mut policy, request);
+    if state.parent_pid == 0 {
+        state.parent_pid = request.parent_pid;
+    }
+    let value = state.parent_pid;
+    response.status = 0;
+    response.payload_len = size_of::<u64>() as u32;
+    response.payload[..size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
+}
+
+pub(crate) fn handle_getpgid(
+    request: &LinuxSyscallOffloadRequest,
+    response: &mut LinuxSyscallOffloadResponse,
+) {
+    let target_pid = if request.dirfd == 0 {
+        request.pid
+    } else {
+        request.dirfd
+    };
+    let mut policy = policy_db().lock().expect("syscalld policy mutex poisoned");
+    let _ = ensure_state_with_inheritance(&mut policy, request);
+    let pgid = if let Some(state) = policy.get(&target_pid) {
+        state.pgid
+    } else {
+        target_pid
+    };
+    response.status = 0;
+    response.payload_len = size_of::<u64>() as u32;
+    response.payload[..size_of::<u64>()].copy_from_slice(&pgid.to_le_bytes());
+}
+
+pub(crate) fn handle_setpgid(
+    request: &LinuxSyscallOffloadRequest,
+    response: &mut LinuxSyscallOffloadResponse,
+) {
+    let target_pid = if request.dirfd == 0 {
+        request.pid
+    } else {
+        request.dirfd
+    };
+    let new_pgid = if request.arg0 == 0 {
+        target_pid
+    } else {
+        request.arg0
+    };
+    let mut policy = policy_db().lock().expect("syscalld policy mutex poisoned");
+    let _ = ensure_state_with_inheritance(&mut policy, request);
+    if target_pid != request.pid && !policy.contains_key(&target_pid) {
+        response.status = libc::ESRCH;
+        return;
+    }
+    let state = policy
+        .entry(target_pid)
+        .or_insert_with(|| initial_state(request));
+    state.pgid = new_pgid;
+    response.status = 0;
+    response.payload_len = 0;
+}
+
+pub(crate) fn handle_getsid(
+    request: &LinuxSyscallOffloadRequest,
+    response: &mut LinuxSyscallOffloadResponse,
+) {
+    let target_pid = if request.dirfd == 0 {
+        request.pid
+    } else {
+        request.dirfd
+    };
+    let mut policy = policy_db().lock().expect("syscalld policy mutex poisoned");
+    let _ = ensure_state_with_inheritance(&mut policy, request);
+    let sid = if let Some(state) = policy.get(&target_pid) {
+        state.sid
+    } else {
+        response.status = libc::ESRCH;
+        return;
+    };
+    response.status = 0;
+    response.payload_len = size_of::<u64>() as u32;
+    response.payload[..size_of::<u64>()].copy_from_slice(&sid.to_le_bytes());
+}
+
+pub(crate) fn handle_setsid(
+    request: &LinuxSyscallOffloadRequest,
+    response: &mut LinuxSyscallOffloadResponse,
+) {
+    let pid = request.pid;
+    let mut policy = policy_db().lock().expect("syscalld policy mutex poisoned");
+    let already_leader = policy
+        .values()
+        .any(|s| s.pgid == pid && s.sid == pid && s.parent_pid != 0);
+    let state = ensure_state_with_inheritance(&mut policy, request);
+    if already_leader && state.sid == pid && state.pgid == pid {
+        response.status = libc::EPERM;
+        return;
+    }
+    state.sid = pid;
+    state.pgid = pid;
+    response.status = 0;
+    response.payload_len = size_of::<u64>() as u32;
+    response.payload[..size_of::<u64>()].copy_from_slice(&pid.to_le_bytes());
 }
 
 pub(crate) fn handle_umask(
@@ -199,9 +336,7 @@ pub(crate) fn handle_umask(
 ) {
     let requested = request.mask & 0o777;
     let mut policy = policy_db().lock().expect("syscalld policy mutex poisoned");
-    let state = policy
-        .entry(request.pid)
-        .or_insert_with(|| initial_state(request));
+    let state = ensure_state_with_inheritance(&mut policy, request);
     let old = state.umask;
     state.umask = requested;
     response.status = 0;

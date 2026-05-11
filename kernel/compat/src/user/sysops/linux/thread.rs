@@ -460,6 +460,12 @@ pub(crate) fn exit_current_process(status: u64) -> ! {
     if let Some(process_id) = multitask::current_user_process_id() {
         let wait_status = ((status as i32) & 0xff) << 8;
         let _ = multitask::note_process_exit_status(process_id, wait_status);
+        let parent_pid = multitask::parent_process_id_of(process_id).unwrap_or(0);
+        crate::user::syscall::linux::offload_ops::record_process_exit(
+            process_id,
+            parent_pid,
+            wait_status,
+        );
     }
     let clear_child_tid = multitask::with_current_user_linux_state_mut(
         |_, _, abi, address_space, _, linux_thread_state| {

@@ -11,7 +11,12 @@ use rustos_user_abi::syscall::{
     LINUX_STATX_SIZE, LINUX_UTSNAME_SIZE, LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse,
     PROC_BROKER_ABI_VERSION, PROC_BROKER_FORMAT_ELF64, PROC_BROKER_FORMAT_PE64,
     PROC_BROKER_MAP_EXEC, PROC_BROKER_MAP_PRIVATE, PROC_BROKER_MAP_READ, PROC_BROKER_MAP_WRITE,
-    RustosBlockBrokerArgs, RustosDeviceIoctlBrokerArgs, RustosDriverLoadModuleBrokerArgs,
+    InputStatsBrokerArgs, InputStatsWire, LIFECYCLE_DRAIN_MAX_EVENTS, LifecycleDrainBrokerArgs,
+    LifecycleEventWire, RustosBlockBrokerArgs, RustosDeviceIoctlBrokerArgs,
+    RustosDriverLoadModuleBrokerArgs, STORAGE_LIST_MAX_DESCRIPTORS, STORAGE_LIST_PATH_CAPACITY,
+    STORAGE_FLAG_READONLY, StorageBlockDescriptorWire, StorageListBrokerArgs,
+    INPUT_STATS_FLAG_PENDING_COALESCED, INPUT_STATS_FLAG_PENDING_POINTER_POSITION,
+    LIFECYCLE_EVENT_EXIT,
     RustosDriverProbeAliasBrokerArgs, RustosDriverProviderActiveBrokerArgs, RustosNetBrokerArgs,
     RustosProcAbortBrokerArgs, RustosProcCommitBrokerArgs, RustosProcMapFileBrokerArgs,
     RustosProcMapZeroedBrokerArgs, RustosProcPrepareBrokerArgs, RustosVfsMountBrokerArgs,
@@ -28,8 +33,11 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_OP_LINUX_SCHED_GETAFFINITY, SYSCALL_OFFLOAD_OP_LINUX_SETGID,
     SYSCALL_OFFLOAD_OP_LINUX_SETUID, SYSCALL_OFFLOAD_OP_LINUX_SOCKET,
     SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR, SYSCALL_OFFLOAD_OP_LINUX_STATX,
-    SYSCALL_OFFLOAD_OP_LINUX_GETRANDOM, SYSCALL_OFFLOAD_OP_LINUX_UMASK,
-    SYSCALL_OFFLOAD_OP_LINUX_UMOUNT2, SYSCALL_OFFLOAD_OP_LINUX_UNAME,
+    SYSCALL_OFFLOAD_OP_LINUX_GETPGID, SYSCALL_OFFLOAD_OP_LINUX_GETPPID,
+    SYSCALL_OFFLOAD_OP_LINUX_GETRANDOM, SYSCALL_OFFLOAD_OP_LINUX_GETSID,
+    SYSCALL_OFFLOAD_OP_LINUX_SETPGID, SYSCALL_OFFLOAD_OP_LINUX_SETSID,
+    SYSCALL_OFFLOAD_OP_LINUX_UMASK, SYSCALL_OFFLOAD_OP_LINUX_UMOUNT2,
+    SYSCALL_OFFLOAD_OP_LINUX_UNAME,
     SYSCALL_OFFLOAD_PATH_CAPACITY, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, VFS_IPC_ABI_VERSION,
     VFS_IPC_HANDLE_KIND_DEVICE, VFS_IPC_HANDLE_KIND_DIR, VFS_IPC_HANDLE_KIND_FILE,
     VFS_IPC_OP_CLOSE, VFS_IPC_OP_DUP, VFS_IPC_OP_FCNTL, VFS_IPC_OP_FSTAT, VFS_IPC_OP_FTRUNCATE,
@@ -44,6 +52,27 @@ pub(super) const VFSD_DUP_MODE_DUP2: u32 = 1;
 pub(super) const VFSD_DUP_MODE_DUP3: u32 = 2;
 const MAX_PROC_PREPARES: usize = 64;
 const MAX_PROC_PREPARE_MAPPINGS: usize = 128;
+const LIFECYCLE_QUEUE_CAPACITY: usize = 256;
+
+static LIFECYCLE_QUEUE: Mutex<alloc::collections::VecDeque<LifecycleEventWire>> =
+    Mutex::new(alloc::collections::VecDeque::new());
+
+pub(crate) fn record_process_exit(pid: u64, parent_pid: u64, exit_status: i32) {
+    let event = LifecycleEventWire {
+        event: LIFECYCLE_EVENT_EXIT,
+        reserved0: 0,
+        reserved1: 0,
+        pid,
+        parent_pid,
+        exit_status,
+        reserved2: 0,
+    };
+    let mut queue = LIFECYCLE_QUEUE.lock();
+    if queue.len() >= LIFECYCLE_QUEUE_CAPACITY {
+        queue.pop_front();
+    }
+    queue.push_back(event);
+}
 const PROC_MAP_FLAGS_MASK: u64 =
     PROC_BROKER_MAP_READ | PROC_BROKER_MAP_WRITE | PROC_BROKER_MAP_EXEC | PROC_BROKER_MAP_PRIVATE;
 
@@ -764,6 +793,93 @@ pub(super) fn syscall_linux_umask(new_mask: u64) -> u64 {
         response.payload[2],
         response.payload[3],
     ]) as u64
+}
+
+pub(super) fn syscall_linux_getppid() -> u64 {
+    let request = new_offload_request(SYSCALL_OFFLOAD_OP_LINUX_GETPPID);
+    let response = match call_offload_request(&request) {
+        Ok(response) => response,
+        Err(errno) => return linux_errno(errno),
+    };
+    if response.status != 0 {
+        return linux_errno(response.status.unsigned_abs() as i64);
+    }
+    if response.payload_len as usize != size_of::<u64>() {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let mut bytes = [0_u8; size_of::<u64>()];
+    bytes.copy_from_slice(&response.payload[..size_of::<u64>()]);
+    u64::from_le_bytes(bytes)
+}
+
+pub(super) fn syscall_linux_getpgid(target_pid: u64) -> u64 {
+    let mut request = new_offload_request(SYSCALL_OFFLOAD_OP_LINUX_GETPGID);
+    request.dirfd = target_pid;
+    let response = match call_offload_request(&request) {
+        Ok(response) => response,
+        Err(errno) => return linux_errno(errno),
+    };
+    if response.status != 0 {
+        return linux_errno(response.status.unsigned_abs() as i64);
+    }
+    if response.payload_len as usize != size_of::<u64>() {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let mut bytes = [0_u8; size_of::<u64>()];
+    bytes.copy_from_slice(&response.payload[..size_of::<u64>()]);
+    u64::from_le_bytes(bytes)
+}
+
+pub(super) fn syscall_linux_setpgid(target_pid: u64, pgid: u64) -> u64 {
+    let mut request = new_offload_request(SYSCALL_OFFLOAD_OP_LINUX_SETPGID);
+    request.dirfd = target_pid;
+    request.arg0 = pgid;
+    let response = match call_offload_request(&request) {
+        Ok(response) => response,
+        Err(errno) => return linux_errno(errno),
+    };
+    if response.status != 0 {
+        return linux_errno(response.status.unsigned_abs() as i64);
+    }
+    if response.payload_len != 0 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    0
+}
+
+pub(super) fn syscall_linux_getsid(target_pid: u64) -> u64 {
+    let mut request = new_offload_request(SYSCALL_OFFLOAD_OP_LINUX_GETSID);
+    request.dirfd = target_pid;
+    let response = match call_offload_request(&request) {
+        Ok(response) => response,
+        Err(errno) => return linux_errno(errno),
+    };
+    if response.status != 0 {
+        return linux_errno(response.status.unsigned_abs() as i64);
+    }
+    if response.payload_len as usize != size_of::<u64>() {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let mut bytes = [0_u8; size_of::<u64>()];
+    bytes.copy_from_slice(&response.payload[..size_of::<u64>()]);
+    u64::from_le_bytes(bytes)
+}
+
+pub(super) fn syscall_linux_setsid() -> u64 {
+    let request = new_offload_request(SYSCALL_OFFLOAD_OP_LINUX_SETSID);
+    let response = match call_offload_request(&request) {
+        Ok(response) => response,
+        Err(errno) => return linux_errno(errno),
+    };
+    if response.status != 0 {
+        return linux_errno(response.status.unsigned_abs() as i64);
+    }
+    if response.payload_len as usize != size_of::<u64>() {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let mut bytes = [0_u8; size_of::<u64>()];
+    bytes.copy_from_slice(&response.payload[..size_of::<u64>()]);
+    u64::from_le_bytes(bytes)
 }
 
 pub(super) fn syscall_linux_getrandom(user_ptr: u64, user_len: u64, flags: u64) -> u64 {
@@ -2055,6 +2171,200 @@ pub(super) fn syscall_linux_rustos_block_broker(args_ptr: u64) -> u64 {
     }
 }
 
+pub(super) fn syscall_linux_rustos_storage_list_broker(args_ptr: u64) -> u64 {
+    if !current_process_has_storage_broker_capability() {
+        return linux_errno(LINUX_EACCES);
+    }
+    let args = match usermem::read_current_user_struct::<StorageListBrokerArgs>(args_ptr) {
+        Ok(args) => args,
+        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+    };
+    if args.abi_version != 1
+        || args.reserved0 != 0
+        || args.reserved1 != 0
+        || args.reserved2 != 0
+        || args.out_descriptors_ptr == 0
+        || args.out_count_ptr == 0
+    {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let capacity = args.out_capacity as usize;
+    if capacity == 0 || capacity > STORAGE_LIST_MAX_DESCRIPTORS {
+        return linux_errno(LINUX_EINVAL);
+    }
+    if let Err(err) = usermem::validate_current_user_write_buffer(
+        args.out_descriptors_ptr,
+        capacity * size_of::<StorageBlockDescriptorWire>(),
+    ) {
+        return linux_errno(address_space_error_to_linux_errno(err));
+    }
+    if let Err(err) =
+        usermem::validate_current_user_write_buffer(args.out_count_ptr, size_of::<u32>())
+    {
+        return linux_errno(address_space_error_to_linux_errno(err));
+    }
+    let descriptors = kernel_io_manager::api::block::descriptors();
+    let total = descriptors.len().min(capacity);
+    for (index, descriptor) in descriptors.into_iter().take(total).enumerate() {
+        let mut wire = StorageBlockDescriptorWire {
+            id: descriptor.id,
+            transport: descriptor.transport as u32,
+            flags: if descriptor.readonly {
+                STORAGE_FLAG_READONLY
+            } else {
+                0
+            },
+            logical_block_size: descriptor.logical_block_size as u32,
+            start_block: descriptor.start_block,
+            block_count: descriptor.block_count,
+            path_len: 0,
+            reserved0: 0,
+            path: [0; STORAGE_LIST_PATH_CAPACITY],
+        };
+        let path_bytes = descriptor.path.as_bytes();
+        let copy_len = path_bytes.len().min(STORAGE_LIST_PATH_CAPACITY);
+        wire.path[..copy_len].copy_from_slice(&path_bytes[..copy_len]);
+        wire.path_len = copy_len as u32;
+        let dest_ptr = args
+            .out_descriptors_ptr
+            .saturating_add((index * size_of::<StorageBlockDescriptorWire>()) as u64);
+        let bytes = as_bytes(&wire);
+        if let Err(err) = usermem::write_current_user_bytes(dest_ptr, bytes) {
+            return linux_errno(address_space_error_to_linux_errno(err));
+        }
+    }
+    let count_bytes = (total as u32).to_le_bytes();
+    if let Err(err) = usermem::write_current_user_bytes(args.out_count_ptr, &count_bytes) {
+        return linux_errno(address_space_error_to_linux_errno(err));
+    }
+    0
+}
+
+pub(super) fn syscall_linux_rustos_input_stats_broker(args_ptr: u64) -> u64 {
+    if !current_process_has_input_broker_capability() {
+        return linux_errno(LINUX_EACCES);
+    }
+    let args = match usermem::read_current_user_struct::<InputStatsBrokerArgs>(args_ptr) {
+        Ok(args) => args,
+        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+    };
+    if args.abi_version != 1
+        || args.reserved0 != 0
+        || args.reserved1 != 0
+        || args.out_stats_ptr == 0
+    {
+        return linux_errno(LINUX_EINVAL);
+    }
+    if let Err(err) =
+        usermem::validate_current_user_write_buffer(args.out_stats_ptr, size_of::<InputStatsWire>())
+    {
+        return linux_errno(address_space_error_to_linux_errno(err));
+    }
+    let snapshot = kernel_io_manager::api::input::event_queue::debug_snapshot();
+    let mut flags = 0u32;
+    if snapshot.pending_coalesced {
+        flags |= INPUT_STATS_FLAG_PENDING_COALESCED;
+    }
+    if snapshot.pending_pointer_position {
+        flags |= INPUT_STATS_FLAG_PENDING_POINTER_POSITION;
+    }
+    let wire = InputStatsWire {
+        pointer_packet_submits: snapshot.pointer_packet_submits,
+        pointer_absolute_submits: snapshot.pointer_absolute_submits,
+        read_calls: snapshot.read_calls,
+        read_events: snapshot.read_events,
+        lock_active: snapshot.lock_active,
+        lock_last_seq: snapshot.lock_last_seq,
+        queued: snapshot.queued as u64,
+        dropped_discrete: snapshot.dropped_discrete,
+        dropped_lossy: snapshot.dropped_lossy,
+        flags,
+        reserved0: 0,
+    };
+    let bytes = as_bytes(&wire);
+    match usermem::write_current_user_bytes(args.out_stats_ptr, bytes) {
+        Ok(()) => 0,
+        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
+    }
+}
+
+pub(super) fn syscall_linux_rustos_lifecycle_drain_broker(args_ptr: u64) -> u64 {
+    if !current_process_has_linux_syscall_broker_capability() {
+        return linux_errno(LINUX_EACCES);
+    }
+    let args = match usermem::read_current_user_struct::<LifecycleDrainBrokerArgs>(args_ptr) {
+        Ok(args) => args,
+        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+    };
+    if args.abi_version != 1
+        || args.reserved0 != 0
+        || args.reserved1 != 0
+        || args.reserved2 != 0
+        || args.out_events_ptr == 0
+        || args.out_count_ptr == 0
+    {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let capacity = args.out_capacity as usize;
+    if capacity == 0 || capacity > LIFECYCLE_DRAIN_MAX_EVENTS {
+        return linux_errno(LINUX_EINVAL);
+    }
+    if let Err(err) = usermem::validate_current_user_write_buffer(
+        args.out_events_ptr,
+        capacity * size_of::<LifecycleEventWire>(),
+    ) {
+        return linux_errno(address_space_error_to_linux_errno(err));
+    }
+    if let Err(err) =
+        usermem::validate_current_user_write_buffer(args.out_count_ptr, size_of::<u32>())
+    {
+        return linux_errno(address_space_error_to_linux_errno(err));
+    }
+    let mut drained: alloc::vec::Vec<LifecycleEventWire> = alloc::vec::Vec::new();
+    {
+        let mut queue = LIFECYCLE_QUEUE.lock();
+        while drained.len() < capacity {
+            if let Some(event) = queue.pop_front() {
+                drained.push(event);
+            } else {
+                break;
+            }
+        }
+    }
+    for (index, event) in drained.iter().enumerate() {
+        let dest_ptr = args
+            .out_events_ptr
+            .saturating_add((index * size_of::<LifecycleEventWire>()) as u64);
+        let bytes = as_bytes(event);
+        if let Err(err) = usermem::write_current_user_bytes(dest_ptr, bytes) {
+            return linux_errno(address_space_error_to_linux_errno(err));
+        }
+    }
+    let count_bytes = (drained.len() as u32).to_le_bytes();
+    if let Err(err) = usermem::write_current_user_bytes(args.out_count_ptr, &count_bytes) {
+        return linux_errno(address_space_error_to_linux_errno(err));
+    }
+    0
+}
+
+fn current_process_has_storage_broker_capability() -> bool {
+    ipc_ops::current_process_has_service_capability(
+        rustos_user_abi::syscall::IPC_SERVICE_CAP_STORAGE_POLICY,
+    )
+}
+
+fn current_process_has_input_broker_capability() -> bool {
+    ipc_ops::current_process_has_service_capability(
+        rustos_user_abi::syscall::IPC_SERVICE_CAP_INPUT_POLICY,
+    )
+}
+
+fn current_process_has_linux_syscall_broker_capability() -> bool {
+    ipc_ops::current_process_has_service_capability(
+        rustos_user_abi::syscall::IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY,
+    )
+}
+
 fn push_current_process_prepare_mapping(
     handle: u64,
     mapping: ProcPrepareMapping,
@@ -2299,6 +2609,7 @@ fn populate_offload_identity(request: &mut LinuxSyscallOffloadRequest) {
         request.pid = snapshot.process_id();
         request.tid = snapshot.thread_id();
         request.session_handle = snapshot.console_session().raw();
+        request.parent_pid = multitask::parent_process_id_of(snapshot.process_id()).unwrap_or(0);
     }
     if let Some(security) = multitask::with_current_process_credentials(|security| security) {
         request.uid = security.uid();

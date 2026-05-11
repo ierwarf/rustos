@@ -1,7 +1,7 @@
 id = "storaged"
 kind = "service"
 execution_domain = "user"
-profiles = ["legacy-services"]
+profiles = ["default"]
 startup = "init"
 
 [build]

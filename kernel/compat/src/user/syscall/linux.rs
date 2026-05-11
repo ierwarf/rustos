@@ -297,6 +297,11 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
             process_ops::syscall_linux_memfd_create(frame.rdi, frame.rsi)
         }
         linux_abi::SYS_UMASK => offload_ops::syscall_linux_umask(frame.rdi),
+        linux_abi::SYS_GETPPID => offload_ops::syscall_linux_getppid(),
+        linux_abi::SYS_GETPGID => offload_ops::syscall_linux_getpgid(frame.rdi),
+        linux_abi::SYS_SETPGID => offload_ops::syscall_linux_setpgid(frame.rdi, frame.rsi),
+        linux_abi::SYS_GETSID => offload_ops::syscall_linux_getsid(frame.rdi),
+        linux_abi::SYS_SETSID => offload_ops::syscall_linux_setsid(),
         linux_abi::SYS_EXIT | linux_abi::SYS_EXIT_GROUP => syscall_process_exit(frame.rdi),
         _ => unreachable!("linux syscall_check allowed an unknown syscall"),
     };
@@ -458,6 +463,11 @@ fn linux_syscall_number_supported(syscall_number: u64) -> bool {
                 | linux_abi::SYS_CLONE3
                 | linux_abi::SYS_MEMFD_CREATE
                 | linux_abi::SYS_UMASK
+                | linux_abi::SYS_GETPPID
+                | linux_abi::SYS_GETPGID
+                | linux_abi::SYS_SETPGID
+                | linux_abi::SYS_GETSID
+                | linux_abi::SYS_SETSID
                 | linux_abi::SYS_EXIT
                 | linux_abi::SYS_EXIT_GROUP
         )

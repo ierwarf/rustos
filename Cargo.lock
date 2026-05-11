@@ -484,7 +484,9 @@ dependencies = [
 name = "inputd"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "observability-client",
+ "rustos-user-abi",
 ]
 
 [[package]]
@@ -1164,7 +1166,9 @@ dependencies = [
 name = "storaged"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "observability-client",
+ "rustos-user-abi",
 ]
 
 [[package]]

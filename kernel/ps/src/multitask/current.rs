@@ -160,6 +160,10 @@ pub fn note_process_exit_status(process_id: u64, status: i32) -> Option<()> {
     process_table::note_process_exit_status(process_id, status)
 }
 
+pub fn parent_process_id_of(process_id: u64) -> Option<u64> {
+    process_table::parent_process_id_of(process_id)
+}
+
 pub fn wait_for_child(parent_process_id: u64, target_pid: i64) -> WaitChildResult {
     match process_table::wait_for_child(parent_process_id, target_pid) {
         process_table::WaitResult::Exited { pid, status } => {

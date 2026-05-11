@@ -163,6 +163,10 @@ pub mod snapshot {
         crate::multitask::current_user_process_id()
     }
 
+    pub fn parent_process_id_of(process_id: u64) -> Option<u64> {
+        crate::multitask::parent_process_id_of(process_id)
+    }
+
     pub fn retain_current_user_process_state() -> Option<RetainedCurrentUserProcessState> {
         crate::multitask::retain_current_user_process_state()
     }
@@ -277,8 +281,8 @@ pub use fault::{halt_current_retired_task, retire_current_user_task_due_to_fault
 pub use process::{spawn_kernel_process, spawn_user_process};
 pub use snapshot::{
     any_user_process_state, current_task_id, current_user_id, current_user_process_id,
-    current_user_snapshot, retain_current_user_process_state, with_current_process_credentials,
-    with_current_user_process_state_mut,
+    current_user_snapshot, parent_process_id_of, retain_current_user_process_state,
+    with_current_process_credentials, with_current_user_process_state_mut,
 };
 pub use task::{
     register_input_consumer_hooks, register_tick_jiffies_hook, rtc_interrupt_handler_addr,

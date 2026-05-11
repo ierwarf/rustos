@@ -36,6 +36,9 @@ pub mod syscall {
     pub const SYS_RUSTOS_DRIVER_PROVIDER_ACTIVE_BROKER: u64 = 0x5255_0021;
     pub const SYS_RUSTOS_NET_BROKER: u64 = 0x5255_0022;
     pub const SYS_RUSTOS_BLOCK_BROKER: u64 = 0x5255_0023;
+    pub const SYS_RUSTOS_STORAGE_LIST_BROKER: u64 = 0x5255_0024;
+    pub const SYS_RUSTOS_INPUT_STATS_BROKER: u64 = 0x5255_0025;
+    pub const SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER: u64 = 0x5255_0026;
 
     pub const IPC_ABI_VERSION: u16 = 1;
     pub const IPC_MAX_INLINE_BYTES: usize = 64 * 1024;
@@ -46,12 +49,16 @@ pub mod syscall {
     pub const IPC_SERVICE_DEVMGRD: u64 = 4;
     pub const IPC_SERVICE_DRIVERD: u64 = 5;
     pub const IPC_SERVICE_LOADERD: u64 = 6;
+    pub const IPC_SERVICE_STORAGED: u64 = 7;
+    pub const IPC_SERVICE_INPUTD: u64 = 8;
     pub const IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY: u64 = 1 << 0;
     pub const IPC_SERVICE_CAP_VFS_POLICY: u64 = 1 << 1;
     pub const IPC_SERVICE_CAP_NET_POLICY: u64 = 1 << 2;
     pub const IPC_SERVICE_CAP_DEVICE_POLICY: u64 = 1 << 3;
     pub const IPC_SERVICE_CAP_DRIVER_POLICY: u64 = 1 << 4;
     pub const IPC_SERVICE_CAP_PROCESS_LOADER: u64 = 1 << 5;
+    pub const IPC_SERVICE_CAP_STORAGE_POLICY: u64 = 1 << 6;
+    pub const IPC_SERVICE_CAP_INPUT_POLICY: u64 = 1 << 7;
     pub const IPC_SERVICE_CAP_BOOTSTRAP_POLICY: u64 = IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY
         | IPC_SERVICE_CAP_VFS_POLICY
         | IPC_SERVICE_CAP_NET_POLICY
@@ -85,6 +92,11 @@ pub mod syscall {
     pub const SYSCALL_OFFLOAD_OP_LINUX_UNLINKAT: u16 = 24;
     pub const SYSCALL_OFFLOAD_OP_LINUX_UMASK: u16 = 25;
     pub const SYSCALL_OFFLOAD_OP_LINUX_GETRANDOM: u16 = 26;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_GETPPID: u16 = 27;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_GETPGID: u16 = 28;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_SETPGID: u16 = 29;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_GETSID: u16 = 30;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_SETSID: u16 = 31;
     pub const SYSCALL_OFFLOAD_OP_LINUX_SOCKET: u16 = 32;
     pub const SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR: u16 = 33;
     pub const SYSCALL_OFFLOAD_OP_LINUX_BIND: u16 = 34;
@@ -167,6 +179,107 @@ pub mod syscall {
     pub const DRIVER_BUS_USB: u32 = 3;
     pub const DRIVER_BUS_PCI: u32 = 4;
     pub const DRIVER_BUS_VIRTIO: u32 = 5;
+    pub const STORAGE_LIST_PATH_CAPACITY: usize = 64;
+    pub const STORAGE_LIST_MAX_DESCRIPTORS: usize = 16;
+    pub const STORAGE_FLAG_READONLY: u32 = 1 << 0;
+    pub const LIFECYCLE_DRAIN_MAX_EVENTS: usize = 32;
+    pub const LIFECYCLE_EVENT_EXIT: u16 = 1;
+    pub const LIFECYCLE_EVENT_FORK: u16 = 2;
+    pub const LIFECYCLE_EVENT_EXEC: u16 = 3;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct StorageBlockDescriptorWire {
+        pub id: u32,
+        pub transport: u32,
+        pub flags: u32,
+        pub logical_block_size: u32,
+        pub start_block: u64,
+        pub block_count: u64,
+        pub path_len: u32,
+        pub reserved0: u32,
+        pub path: [u8; STORAGE_LIST_PATH_CAPACITY],
+    }
+
+    impl Default for StorageBlockDescriptorWire {
+        fn default() -> Self {
+            Self {
+                id: 0,
+                transport: 0,
+                flags: 0,
+                logical_block_size: 0,
+                start_block: 0,
+                block_count: 0,
+                path_len: 0,
+                reserved0: 0,
+                path: [0; STORAGE_LIST_PATH_CAPACITY],
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct StorageListBrokerArgs {
+        pub abi_version: u16,
+        pub reserved0: u16,
+        pub reserved1: u32,
+        pub out_descriptors_ptr: u64,
+        pub out_capacity: u32,
+        pub reserved2: u32,
+        pub out_count_ptr: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct InputStatsWire {
+        pub pointer_packet_submits: u64,
+        pub pointer_absolute_submits: u64,
+        pub read_calls: u64,
+        pub read_events: u64,
+        pub lock_active: u64,
+        pub lock_last_seq: u64,
+        pub queued: u64,
+        pub dropped_discrete: u64,
+        pub dropped_lossy: u64,
+        pub flags: u32,
+        pub reserved0: u32,
+    }
+
+    pub const INPUT_STATS_FLAG_PENDING_COALESCED: u32 = 1 << 0;
+    pub const INPUT_STATS_FLAG_PENDING_POINTER_POSITION: u32 = 1 << 1;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct InputStatsBrokerArgs {
+        pub abi_version: u16,
+        pub reserved0: u16,
+        pub reserved1: u32,
+        pub out_stats_ptr: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct LifecycleEventWire {
+        pub event: u16,
+        pub reserved0: u16,
+        pub reserved1: u32,
+        pub pid: u64,
+        pub parent_pid: u64,
+        pub exit_status: i32,
+        pub reserved2: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct LifecycleDrainBrokerArgs {
+        pub abi_version: u16,
+        pub reserved0: u16,
+        pub reserved1: u32,
+        pub out_events_ptr: u64,
+        pub out_capacity: u32,
+        pub reserved2: u32,
+        pub out_count_ptr: u64,
+    }
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -501,6 +614,7 @@ pub mod syscall {
         pub reserved0: u32,
         pub pid: u64,
         pub tid: u64,
+        pub parent_pid: u64,
         pub session_handle: u64,
         pub uid: u32,
         pub gid: u32,
@@ -523,6 +637,7 @@ pub mod syscall {
                 reserved0: 0,
                 pid: 0,
                 tid: 0,
+                parent_pid: 0,
                 session_handle: 0,
                 uid: 0,
                 gid: 0,
