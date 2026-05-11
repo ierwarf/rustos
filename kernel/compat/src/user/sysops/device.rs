@@ -114,6 +114,31 @@ pub(crate) fn ioctl_current_process_device_handle(
     result
 }
 
+pub(crate) fn ioctl_process_device_handle(
+    process_id: u64,
+    fd: u64,
+    request: u64,
+    arg: u64,
+) -> Result<u64, DeviceSysopError> {
+    let Some(result) = multitask::with_process_state_by_pid_mut(process_id, |process_state| {
+        let Some(entry) = process_state.handles().get_entry(fd) else {
+            return Err(DeviceSysopError::BadFileDescriptor);
+        };
+        if !entry.rights().allows_device_ioctl() {
+            return Err(DeviceSysopError::Unsupported);
+        }
+        let Some(device_handle) = entry.handle().device_handle() else {
+            return Err(DeviceSysopError::Unsupported);
+        };
+        device_ns::ioctl_from_user(device_handle, process_state, request, arg)
+            .map_err(map_device_error)
+    }) else {
+        return Err(DeviceSysopError::Unsupported);
+    };
+
+    result
+}
+
 pub(crate) fn mmap_current_process_handle(
     fd: u64,
     user_len: u64,

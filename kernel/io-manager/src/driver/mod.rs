@@ -24,7 +24,7 @@ pub mod virtio_gpu;
 use driver_abi::{DriverBus, DriverClass, DriverKernelApiV1};
 
 use crate::sync::KernelWaitLock;
-use loader::load_module_image;
+use loader::{load_module_image, load_module_image_explicit};
 pub(crate) use registry::{DriverModuleState, DriverRecord};
 
 const LOADABLE_DRIVER_REGISTRY_PATH: &str = "system/registry/kernel/loadable-drivers.tsv";
@@ -159,6 +159,58 @@ pub fn initialize_loadable_modules_for_class(class: DriverClass) -> bool {
     activate_builtin_providers_for_class(class);
     initialize_loadable_modules_matching(|record| record.class == class);
     class_has_active_loadable_provider(class)
+}
+
+pub fn load_module_image_from_policy(
+    name: &'static str,
+    class: u32,
+    bus: u32,
+    image_path: &'static str,
+    linux_driver_names: &'static str,
+) -> Result<(), &'static str> {
+    if registry::module_dependency_available(name) {
+        return Ok(());
+    }
+    let class = driver_class_from_raw(class).ok_or("driver class is invalid")?;
+    let bus = driver_bus_from_raw(bus).ok_or("driver bus is invalid")?;
+    load_module_image_explicit(name, class, bus, image_path, linux_driver_names).map(|_| ())
+}
+
+pub fn device_alias_present_from_policy(alias: &str, class: u32, bus: u32) -> bool {
+    let Some(class) = driver_class_from_raw(class) else {
+        return false;
+    };
+    let Some(bus) = driver_bus_from_raw(bus) else {
+        return false;
+    };
+    device_alias_present(alias, class, bus)
+}
+
+pub fn provider_group_active_from_policy(group: &str) -> bool {
+    if group == DISPLAY_PRIMARY_PROVIDER_GROUP {
+        return crate::io::gui::primary_display_provider_active();
+    }
+    registry::provider_group_active(group)
+}
+
+fn driver_class_from_raw(class: u32) -> Option<DriverClass> {
+    match class {
+        1 => Some(DriverClass::Display),
+        2 => Some(DriverClass::Input),
+        3 => Some(DriverClass::Network),
+        _ => None,
+    }
+}
+
+fn driver_bus_from_raw(bus: u32) -> Option<DriverBus> {
+    match bus {
+        1 => Some(DriverBus::Platform),
+        2 => Some(DriverBus::Serio),
+        3 => Some(DriverBus::Usb),
+        4 => Some(DriverBus::Pci),
+        5 => Some(DriverBus::Virtio),
+        _ => None,
+    }
 }
 
 fn activate_builtin_providers_for_class(class: DriverClass) {

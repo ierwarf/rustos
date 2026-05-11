@@ -133,24 +133,22 @@ fn current_process_mmap_handle_kind(fd: u64) -> Result<LinuxMmapHandleKind, Linu
         }
 
         match process_state.handles().get_entry(fd) {
-            Some(entry) if matches!(entry.handle(), KernelHandle::Memfd(_)) => {
-                Ok(LinuxMmapHandleKind::Memfd)
-            }
-            Some(entry) if matches!(entry.handle(), KernelHandle::VfsFile(_)) => {
-                Ok(LinuxMmapHandleKind::File)
-            }
-            Some(entry)
-                if matches!(
-                    entry.handle(),
-                    KernelHandle::Device(_) | KernelHandle::DisplaySurface(_)
-                ) =>
-            {
-                if !entry.rights().allows_shared_map() {
-                    return Err(LinuxSysopError::PermissionDenied);
+            Some(entry) => match entry.handle() {
+                KernelHandle::Memfd(_) => Ok(LinuxMmapHandleKind::Memfd),
+                KernelHandle::VfsFile(_) => Ok(LinuxMmapHandleKind::File),
+                KernelHandle::RemoteVfs(remote)
+                    if remote.kind() == crate::user::handles::RemoteVfsHandleKind::File =>
+                {
+                    Ok(LinuxMmapHandleKind::File)
                 }
-                Ok(LinuxMmapHandleKind::Device)
-            }
-            Some(_) => Err(LinuxSysopError::BadFileDescriptor),
+                KernelHandle::Device(_) | KernelHandle::DisplaySurface(_) => {
+                    if !entry.rights().allows_shared_map() {
+                        return Err(LinuxSysopError::PermissionDenied);
+                    }
+                    Ok(LinuxMmapHandleKind::Device)
+                }
+                _ => Err(LinuxSysopError::BadFileDescriptor),
+            },
             None => Err(LinuxSysopError::BadFileDescriptor),
         }
     }) else {
@@ -798,9 +796,14 @@ fn mmap_current_process_file(
         .map_err(|_| LinuxSysopError::InvalidArgument)?;
     let fixed_mapping = flags & linux_abi::MAP_FIXED != 0;
 
+    enum PreparedFileSource {
+        Vfs(crate::user::handles::VfsFileHandle),
+        Remote { id: u64, path: String, len: usize },
+    }
+
     struct PreparedFileMapping {
         region: crate::memory::paging::UserRegion,
-        file: crate::user::handles::VfsFileHandle,
+        source: PreparedFileSource,
     }
 
     let Some(result) = multitask::with_current_user_process_state_mut(|_, abi, process_state| {
@@ -808,8 +811,17 @@ fn mmap_current_process_file(
             return Err(LinuxSysopError::Unsupported);
         }
 
-        let file = match process_state.handles().get(fd) {
-            Some(KernelHandle::VfsFile(file)) => file.clone(),
+        let source = match process_state.handles().get(fd) {
+            Some(KernelHandle::VfsFile(file)) => PreparedFileSource::Vfs(file.clone()),
+            Some(KernelHandle::RemoteVfs(remote))
+                if remote.kind() == crate::user::handles::RemoteVfsHandleKind::File =>
+            {
+                PreparedFileSource::Remote {
+                    id: remote.remote_id(),
+                    path: remote.path(),
+                    len: usize::try_from(remote.len()).unwrap_or(usize::MAX),
+                }
+            }
             Some(_) => return Ok(None),
             None => return Err(LinuxSysopError::BadFileDescriptor),
         };
@@ -842,7 +854,7 @@ fn mmap_current_process_file(
         };
         process_state.set_mapping_cursor(region.end().as_u64());
 
-        Ok(Some(PreparedFileMapping { region, file }))
+        Ok(Some(PreparedFileMapping { region, source }))
     }) else {
         return Err(LinuxSysopError::Unsupported);
     };
@@ -851,8 +863,14 @@ fn mmap_current_process_file(
         return Ok(None);
     };
 
-    let file_len = prepared.file.len();
-    let file_path = prepared.file.path();
+    let file_len = match &prepared.source {
+        PreparedFileSource::Vfs(file) => file.len(),
+        PreparedFileSource::Remote { len, .. } => *len,
+    };
+    let file_path = match &prepared.source {
+        PreparedFileSource::Vfs(file) => file.path(),
+        PreparedFileSource::Remote { path, .. } => path.clone(),
+    };
     let file_offset = usize::try_from(offset).map_err(|_| LinuxSysopError::InvalidArgument)?;
     let Some(copy_result) = multitask::with_current_mm(|address_space| {
         if file_offset < file_len {
@@ -862,9 +880,23 @@ fn mmap_current_process_file(
             chunk.resize(copy_len.min(FILE_MMAP_COPY_CHUNK_LEN), 0);
             while copied < copy_len {
                 let chunk_len = (copy_len - copied).min(chunk.len());
-                let read = prepared
-                    .file
-                    .read_at(file_offset + copied, &mut chunk[..chunk_len]);
+                let read = match &prepared.source {
+                    PreparedFileSource::Vfs(file) => {
+                        file.read_at(file_offset + copied, &mut chunk[..chunk_len])
+                    }
+                    PreparedFileSource::Remote { id, .. } => {
+                        let bytes =
+                            crate::user::syscall::linux::offload_ops::call_remote_vfs_read_bytes(
+                                *id,
+                                (file_offset + copied) as u64,
+                                chunk_len,
+                            )
+                            .map_err(errno_to_linux_sysop)?;
+                        let read = bytes.len();
+                        chunk[..read].copy_from_slice(bytes.as_slice());
+                        read
+                    }
+                };
                 if read == 0 {
                     break;
                 }
@@ -945,6 +977,21 @@ fn rollback_failed_file_mapping(region: crate::memory::paging::UserRegion) {
             .address_space_mut()
             .unmap_user_pages_at(region.start, region.page_count);
     });
+}
+
+fn errno_to_linux_sysop(errno: i64) -> LinuxSysopError {
+    match errno {
+        2 => LinuxSysopError::NotFound,
+        9 => LinuxSysopError::BadFileDescriptor,
+        13 => LinuxSysopError::PermissionDenied,
+        14 => LinuxSysopError::AddressSpace(paging::AddressSpaceError::NotMapped),
+        20 => LinuxSysopError::NotDirectory,
+        21 => LinuxSysopError::InvalidArgument,
+        22 => LinuxSysopError::InvalidArgument,
+        30 => LinuxSysopError::ReadOnlyFilesystem,
+        75 => LinuxSysopError::InvalidArgument,
+        _ => LinuxSysopError::Unsupported,
+    }
 }
 
 fn mmap_current_process_memfd(

@@ -105,6 +105,15 @@ pub(crate) fn ioctl(fd: u64, _request: u64, _arg: u64) -> Result<u64, LinuxSysop
     Err(LinuxSysopError::Unsupported)
 }
 
+pub(crate) fn ioctl_for_process(
+    process_id: u64,
+    fd: u64,
+    request: u64,
+    arg: u64,
+) -> Result<u64, LinuxSysopError> {
+    device::ioctl_process_device_handle(process_id, fd, request, arg).map_err(Into::into)
+}
+
 pub(crate) fn getpid() -> u64 {
     multitask::current_user_process_id().unwrap_or(0)
 }
@@ -153,32 +162,6 @@ pub(crate) fn wait4(
 
 pub(crate) fn gettid() -> u64 {
     multitask::current_user_id().unwrap_or(0)
-}
-
-pub(crate) fn setuid_authorized(uid: u32) -> Result<u64, LinuxSysopError> {
-    let Some(result) = multitask::with_current_user_process_state_mut(|_, abi, process_state| {
-        if abi != UserAbi::Linux {
-            return Err(LinuxSysopError::Unsupported);
-        }
-        process_state.set_uid(uid);
-        Ok(0_u64)
-    }) else {
-        return Err(LinuxSysopError::Unsupported);
-    };
-    result
-}
-
-pub(crate) fn setgid_authorized(gid: u32) -> Result<u64, LinuxSysopError> {
-    let Some(result) = multitask::with_current_user_process_state_mut(|_, abi, process_state| {
-        if abi != UserAbi::Linux {
-            return Err(LinuxSysopError::Unsupported);
-        }
-        process_state.set_gid(gid);
-        Ok(0_u64)
-    }) else {
-        return Err(LinuxSysopError::Unsupported);
-    };
-    result
 }
 
 pub(crate) fn sched_yield() -> u64 {

@@ -1,10 +1,36 @@
+use std::collections::BTreeMap;
 use std::mem::size_of;
+use std::sync::{Mutex, OnceLock};
 
 use rustos_user_abi::syscall::{
     LinuxRlimit, LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, LinuxUtsName,
-    LINUX_CPUSET_BYTES, LINUX_DEFAULT_STACK_RLIMIT_BYTES, LINUX_RLIMIT_SIZE, LINUX_UTSNAME_SIZE,
+    LINUX_CPUSET_BYTES, LINUX_DEFAULT_STACK_RLIMIT_BYTES, LINUX_RLIMIT_SIZE,
     SYSCALL_OFFLOAD_PAYLOAD_CAPACITY,
 };
+
+#[derive(Clone, Copy, Debug)]
+struct LinuxPolicyState {
+    credentials: Credentials,
+    stack_rlimit: LinuxRlimit,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Credentials {
+    uid: u32,
+    gid: u32,
+    euid: u32,
+    egid: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum IdKind {
+    Uid,
+    Gid,
+    Euid,
+    Egid,
+}
+
+static PROCESS_POLICY: OnceLock<Mutex<BTreeMap<u64, LinuxPolicyState>>> = OnceLock::new();
 
 pub(crate) fn handle_uname(response: &mut LinuxSyscallOffloadResponse) {
     let mut uts = LinuxUtsName::default();
@@ -37,12 +63,19 @@ pub(crate) fn handle_prlimit64(
         response.status = libc::EINVAL;
         return;
     }
-    if wants_old_limit {
-        let current = LinuxRlimit {
-            rlim_cur: LINUX_DEFAULT_STACK_RLIMIT_BYTES,
-            rlim_max: LINUX_DEFAULT_STACK_RLIMIT_BYTES,
+    let mut policy = policy_db().lock().expect("syscalld policy mutex poisoned");
+    let state = policy
+        .entry(request.pid)
+        .or_insert_with(|| initial_state(request));
+    let old_limit = state.stack_rlimit;
+    if has_new_limit {
+        state.stack_rlimit = LinuxRlimit {
+            rlim_cur: read_u64(&request.path[..LINUX_RLIMIT_SIZE], 0),
+            rlim_max: read_u64(&request.path[..LINUX_RLIMIT_SIZE], 8),
         };
-        copy_payload(response, &current);
+    }
+    if wants_old_limit {
+        copy_payload(response, &old_limit);
     } else {
         response.status = 0;
         response.payload_len = 0;
@@ -70,7 +103,21 @@ pub(crate) fn handle_sched_getaffinity(
     response.payload_len = payload_len as u32;
 }
 
-pub(crate) fn handle_id(value: u32, response: &mut LinuxSyscallOffloadResponse) {
+pub(crate) fn handle_id(
+    request: &LinuxSyscallOffloadRequest,
+    kind: IdKind,
+    response: &mut LinuxSyscallOffloadResponse,
+) {
+    let mut policy = policy_db().lock().expect("syscalld policy mutex poisoned");
+    let state = policy
+        .entry(request.pid)
+        .or_insert_with(|| initial_state(request));
+    let value = match kind {
+        IdKind::Uid => state.credentials.uid,
+        IdKind::Gid => state.credentials.gid,
+        IdKind::Euid => state.credentials.euid,
+        IdKind::Egid => state.credentials.egid,
+    };
     response.status = 0;
     response.payload_len = size_of::<u32>() as u32;
     response.payload[..size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
@@ -81,14 +128,20 @@ pub(crate) fn handle_setuid(
     response: &mut LinuxSyscallOffloadResponse,
 ) {
     let requested = request.mask;
-    if request.euid != 0
-        && request.uid != 0
-        && requested != request.uid
-        && requested != request.euid
+    let mut policy = policy_db().lock().expect("syscalld policy mutex poisoned");
+    let state = policy
+        .entry(request.pid)
+        .or_insert_with(|| initial_state(request));
+    if state.credentials.euid != 0
+        && state.credentials.uid != 0
+        && requested != state.credentials.uid
+        && requested != state.credentials.euid
     {
         response.status = libc::EACCES;
         return;
     }
+    state.credentials.uid = requested;
+    state.credentials.euid = requested;
     response.status = 0;
     response.payload_len = 0;
 }
@@ -98,16 +151,54 @@ pub(crate) fn handle_setgid(
     response: &mut LinuxSyscallOffloadResponse,
 ) {
     let requested = request.mask;
-    if request.euid != 0
-        && request.uid != 0
-        && requested != request.gid
-        && requested != request.egid
+    let mut policy = policy_db().lock().expect("syscalld policy mutex poisoned");
+    let state = policy
+        .entry(request.pid)
+        .or_insert_with(|| initial_state(request));
+    if state.credentials.euid != 0
+        && state.credentials.uid != 0
+        && requested != state.credentials.gid
+        && requested != state.credentials.egid
     {
         response.status = libc::EACCES;
         return;
     }
+    state.credentials.gid = requested;
+    state.credentials.egid = requested;
     response.status = 0;
     response.payload_len = 0;
+}
+
+fn policy_db() -> &'static Mutex<BTreeMap<u64, LinuxPolicyState>> {
+    PROCESS_POLICY.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn initial_state(request: &LinuxSyscallOffloadRequest) -> LinuxPolicyState {
+    LinuxPolicyState {
+        credentials: Credentials {
+            uid: request.uid,
+            gid: request.gid,
+            euid: request.euid,
+            egid: request.egid,
+        },
+        stack_rlimit: LinuxRlimit {
+            rlim_cur: LINUX_DEFAULT_STACK_RLIMIT_BYTES,
+            rlim_max: LINUX_DEFAULT_STACK_RLIMIT_BYTES,
+        },
+    }
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+        bytes[offset + 4],
+        bytes[offset + 5],
+        bytes[offset + 6],
+        bytes[offset + 7],
+    ])
 }
 
 fn write_uts_field(dest: &mut [u8; 65], value: &[u8]) {
@@ -128,6 +219,7 @@ fn copy_payload<T>(response: &mut LinuxSyscallOffloadResponse, value: &T) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustos_user_abi::syscall::LINUX_UTSNAME_SIZE;
 
     #[test]
     fn uname_payload_fits_inline_response() {
@@ -141,6 +233,7 @@ mod tests {
     fn setuid_policy_matches_linux_subset() {
         let mut response = LinuxSyscallOffloadResponse::default();
         let request = LinuxSyscallOffloadRequest {
+            pid: 100,
             uid: 1000,
             euid: 1000,
             mask: 2000,
@@ -150,6 +243,7 @@ mod tests {
         assert_eq!(response.status, libc::EACCES);
 
         let request = LinuxSyscallOffloadRequest {
+            pid: 101,
             uid: 0,
             euid: 1000,
             mask: 2000,

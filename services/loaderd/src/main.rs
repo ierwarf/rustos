@@ -5,12 +5,17 @@ use std::thread;
 use std::time::Duration;
 
 use rustos_user_abi::syscall::{
-    LoaderSpawnRequest, LoaderSpawnResponse, RustosProcCommitBrokerArgs, IPC_SERVICE_LOADERD,
-    LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
+    LoaderSpawnRequest, LoaderSpawnResponse, RustosProcAbortBrokerArgs, RustosProcCommitBrokerArgs,
+    RustosProcMapFileBrokerArgs, RustosProcMapZeroedBrokerArgs, RustosProcPrepareBrokerArgs,
+    IPC_SERVICE_LOADERD, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
     LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_MAX_ARG_COUNT,
-    LOADER_SPAWN_MAX_ENV_COUNT, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
-    SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
-    SYS_RUSTOS_PROC_COMMIT_BROKER,
+    LOADER_SPAWN_MAX_ENV_COUNT, PROC_BROKER_ABI_VERSION, PROC_BROKER_FORMAT_ELF64,
+    PROC_BROKER_FORMAT_PE64, PROC_BROKER_MAP_EXEC, PROC_BROKER_MAP_PRIVATE, PROC_BROKER_MAP_READ,
+    PROC_BROKER_MAP_WRITE, PROC_BROKER_USER_SPACE_BASE, PROC_BROKER_USER_SPACE_END_EXCLUSIVE,
+    SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV,
+    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_PROC_ABORT_BROKER,
+    SYS_RUSTOS_PROC_COMMIT_BROKER, SYS_RUSTOS_PROC_MAP_FILE_BROKER,
+    SYS_RUSTOS_PROC_MAP_ZEROED_BROKER, SYS_RUSTOS_PROC_PREPARE_BROKER,
 };
 
 const RECV_BACKOFF: Duration = Duration::from_millis(10);
@@ -30,11 +35,18 @@ const ELF_EM_X86_64: u16 = 62;
 const ELF_PF_X: u32 = 1;
 const ELF_PF_W: u32 = 2;
 const ELF_PF_R: u32 = 4;
+const ELF_MAIN_DYN_LOAD_OFFSET: u64 = 0x0040_0000;
+const ELF_INTERP_LOAD_OFFSET: u64 = 0x0200_0000;
 const PE_DOS_HEADER_SIZE: usize = 64;
 const PE_SIGNATURE_SIZE: usize = 4;
 const PE_FILE_HEADER_SIZE: usize = 20;
+const PE_SECTION_HEADER_SIZE: usize = 40;
 const PE_OPTIONAL_MAGIC_PE32_PLUS: u16 = 0x20b;
 const PE_MACHINE_AMD64: u16 = 0x8664;
+const PE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+const PE_SCN_MEM_READ: u32 = 0x4000_0000;
+const PE_SCN_MEM_WRITE: u32 = 0x8000_0000;
+const PE_LOAD_OFFSET: u64 = 0x0040_0000;
 
 fn main() {
     let endpoint = syscall0(SYS_RUSTOS_IPC_ENDPOINT_CREATE);
@@ -114,10 +126,13 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> LoaderSpawnR
             return response;
         }
     };
-    if let Err(errno) = validate_executable_format(exec_path.as_str()) {
-        response.status = errno;
-        return response;
-    }
+    let executable_format = match validate_executable_format(exec_path.as_str()) {
+        Ok(format) => format,
+        Err(errno) => {
+            response.status = errno;
+            return response;
+        }
+    };
 
     let argv = match parse_blob(
         &request.argv_bytes,
@@ -153,8 +168,30 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> LoaderSpawnR
     let mut envp = env.iter().map(|value| value.as_ptr()).collect::<Vec<_>>();
     envp.push(std::ptr::null());
 
+    let prepare_args = RustosProcPrepareBrokerArgs {
+        abi_version: PROC_BROKER_ABI_VERSION,
+        format: executable_format,
+        flags: 0,
+        reserved0: 0,
+    };
+    let prepare_handle = syscall1(
+        SYS_RUSTOS_PROC_PREPARE_BROKER,
+        (&prepare_args as *const RustosProcPrepareBrokerArgs) as u64,
+    );
+    if prepare_handle < 0 {
+        response.status = (-prepare_handle) as i32;
+        return response;
+    }
+    if let Err(errno) =
+        map_executable_segments(exec_path.as_str(), prepare_handle as u64, executable_format)
+    {
+        abort_prepare(prepare_handle as u64, errno as u64);
+        response.status = errno;
+        return response;
+    }
+
     let args = RustosProcCommitBrokerArgs {
-        prepare_handle: 0,
+        prepare_handle: prepare_handle as u64,
         exec_path_ptr: path.as_ptr() as u64,
         exec_path_len: exec_path.len() as u64,
         argv_ptr: argvp.as_ptr() as u64,
@@ -174,6 +211,46 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> LoaderSpawnR
     }
     response.pid = pid;
     response
+}
+
+fn abort_prepare(prepare_handle: u64, reason: u64) {
+    let args = RustosProcAbortBrokerArgs {
+        prepare_handle,
+        reason,
+        reserved0: 0,
+    };
+    let _ = syscall1(
+        SYS_RUSTOS_PROC_ABORT_BROKER,
+        (&args as *const RustosProcAbortBrokerArgs) as u64,
+    );
+}
+
+fn map_executable_segments(exec_path: &str, prepare_handle: u64, format: u16) -> Result<(), i32> {
+    let path = CString::new(exec_path).map_err(|_| libc::EINVAL)?;
+    let fd = unsafe {
+        libc::syscall(
+            SYS_OPENAT,
+            AT_FDCWD,
+            path.as_ptr(),
+            O_RDONLY,
+            0 as libc::c_int,
+        ) as i32
+    };
+    if fd < 0 {
+        return Err(-fd);
+    }
+    let result = match format {
+        PROC_BROKER_FORMAT_ELF64 => {
+            map_elf_segments_fd(fd, prepare_handle, ELF_MAIN_DYN_LOAD_OFFSET, true)
+        }
+        PROC_BROKER_FORMAT_PE64 => map_pe_segments_fd(fd, prepare_handle),
+        _ => Err(libc::EINVAL),
+    };
+    let close_status = unsafe { libc::syscall(SYS_CLOSE, fd) as i64 };
+    if close_status < 0 {
+        return Err((-close_status) as i32);
+    }
+    result
 }
 
 fn validate_request(received: usize, request: &LoaderSpawnRequest) -> Result<(), i32> {
@@ -227,7 +304,7 @@ fn parse_blob(bytes: &[u8], len: usize, count: usize) -> Result<Vec<CString>, i3
     Ok(values)
 }
 
-fn validate_executable_format(exec_path: &str) -> Result<(), i32> {
+fn validate_executable_format(exec_path: &str) -> Result<u16, i32> {
     let path = CString::new(exec_path).map_err(|_| libc::EINVAL)?;
     let fd = unsafe {
         libc::syscall(
@@ -249,16 +326,18 @@ fn validate_executable_format(exec_path: &str) -> Result<(), i32> {
     result
 }
 
-fn validate_executable_fd(fd: i32) -> Result<(), i32> {
+fn validate_executable_fd(fd: i32) -> Result<u16, i32> {
     let mut header = [0_u8; ELF_HEADER_SIZE];
     read_exact_at(fd, 0, &mut header[..4])?;
     if header[..4] == *b"\x7fELF" {
         read_exact_at(fd, 0, &mut header)?;
-        return validate_elf_fd(fd, &header);
+        validate_elf_fd(fd, &header)?;
+        return Ok(PROC_BROKER_FORMAT_ELF64);
     }
     if &header[..2] == b"MZ" {
         read_exact_at(fd, 0, &mut header)?;
-        return validate_pe_fd(fd, &header[..PE_DOS_HEADER_SIZE]);
+        validate_pe_fd(fd, &header[..PE_DOS_HEADER_SIZE])?;
+        return Ok(PROC_BROKER_FORMAT_PE64);
     }
     Err(libc::ENOEXEC)
 }
@@ -320,6 +399,160 @@ fn validate_elf_fd(fd: i32, header: &[u8; ELF_HEADER_SIZE]) -> Result<(), i32> {
     Ok(())
 }
 
+fn map_elf_segments_fd(
+    fd: i32,
+    prepare_handle: u64,
+    dyn_load_offset: u64,
+    map_interpreter: bool,
+) -> Result<(), i32> {
+    let mut header = [0_u8; ELF_HEADER_SIZE];
+    read_exact_at(fd, 0, &mut header)?;
+    validate_elf_fd(fd, &header)?;
+
+    let load_bias = elf_load_bias_from_fd(fd, &header, dyn_load_offset)?;
+    let phoff = read_u64(&header, 32);
+    let phentsize = read_u16(&header, 54);
+    let phnum = read_u16(&header, 56);
+    let mut interpreter_path = None::<String>;
+    for index in 0..phnum {
+        let mut ph = [0_u8; ELF_PROGRAM_HEADER_SIZE];
+        let offset = phoff + u64::from(index) * u64::from(phentsize);
+        read_exact_at(fd, offset, &mut ph)?;
+        match read_u32(&ph, 0) {
+            ELF_PT_LOAD => map_elf_load_segment(fd, prepare_handle, &ph, load_bias)?,
+            ELF_PT_INTERP if map_interpreter => {
+                interpreter_path = Some(read_elf_interp_path(fd, &ph)?);
+            }
+            _ => {}
+        }
+    }
+    if let Some(path) = interpreter_path {
+        map_elf_interpreter(path.as_str(), prepare_handle)?;
+    }
+    Ok(())
+}
+
+fn map_elf_interpreter(path: &str, prepare_handle: u64) -> Result<(), i32> {
+    let path = CString::new(path).map_err(|_| libc::EINVAL)?;
+    let fd = unsafe {
+        libc::syscall(
+            SYS_OPENAT,
+            AT_FDCWD,
+            path.as_ptr(),
+            O_RDONLY,
+            0 as libc::c_int,
+        ) as i32
+    };
+    if fd < 0 {
+        return Err(-fd);
+    }
+    let result = map_elf_segments_fd(fd, prepare_handle, ELF_INTERP_LOAD_OFFSET, false);
+    let close_status = unsafe { libc::syscall(SYS_CLOSE, fd) as i64 };
+    if close_status < 0 {
+        return Err((-close_status) as i32);
+    }
+    result
+}
+
+fn elf_load_bias_from_fd(
+    fd: i32,
+    header: &[u8; ELF_HEADER_SIZE],
+    dyn_load_offset: u64,
+) -> Result<u64, i32> {
+    if read_u16(header, 16) == ELF_ET_EXEC {
+        return Ok(0);
+    }
+    let phoff = read_u64(header, 32);
+    let phentsize = read_u16(header, 54);
+    let phnum = read_u16(header, 56);
+    let mut min_load_addr = u64::MAX;
+    for index in 0..phnum {
+        let mut ph = [0_u8; ELF_PROGRAM_HEADER_SIZE];
+        let offset = phoff + u64::from(index) * u64::from(phentsize);
+        read_exact_at(fd, offset, &mut ph)?;
+        if read_u32(&ph, 0) == ELF_PT_LOAD && read_u64(&ph, 40) != 0 {
+            min_load_addr = min_load_addr.min(read_u64(&ph, 16) & !0xfff);
+        }
+    }
+    if min_load_addr == u64::MAX {
+        return Err(libc::ENOEXEC);
+    }
+    PROC_BROKER_USER_SPACE_BASE
+        .checked_add(dyn_load_offset)
+        .and_then(|base| base.checked_sub(min_load_addr))
+        .ok_or(libc::EOVERFLOW)
+}
+
+fn map_elf_load_segment(
+    fd: i32,
+    prepare_handle: u64,
+    ph: &[u8; ELF_PROGRAM_HEADER_SIZE],
+    load_bias: u64,
+) -> Result<(), i32> {
+    let segment_offset = read_u64(ph, 8);
+    let segment_vaddr = read_u64(ph, 16);
+    let file_size = read_u64(ph, 32);
+    let mem_size = read_u64(ph, 40);
+    let page_delta = segment_vaddr & 0xfff;
+    let target_addr = (segment_vaddr & !0xfff)
+        .checked_add(load_bias)
+        .ok_or(libc::EOVERFLOW)?;
+    let file_offset = segment_offset
+        .checked_sub(page_delta)
+        .ok_or(libc::ENOEXEC)?;
+    let file_len = page_delta.checked_add(file_size).ok_or(libc::EOVERFLOW)?;
+    let mem_len = align_up(
+        page_delta.checked_add(mem_size).ok_or(libc::EOVERFLOW)?,
+        4096,
+    )?;
+    let flags = proc_map_flags(read_u32(ph, 4));
+
+    if file_size == 0 {
+        let args = RustosProcMapZeroedBrokerArgs {
+            prepare_handle,
+            target_addr,
+            mem_len,
+            flags,
+            reserved0: 0,
+        };
+        let status = syscall1(
+            SYS_RUSTOS_PROC_MAP_ZEROED_BROKER,
+            (&args as *const RustosProcMapZeroedBrokerArgs) as u64,
+        );
+        return (status >= 0).then_some(()).ok_or((-status) as i32);
+    }
+
+    let args = RustosProcMapFileBrokerArgs {
+        prepare_handle,
+        fd: fd as u64,
+        file_offset,
+        target_addr,
+        file_len,
+        mem_len,
+        flags,
+        reserved0: 0,
+    };
+    let status = syscall1(
+        SYS_RUSTOS_PROC_MAP_FILE_BROKER,
+        (&args as *const RustosProcMapFileBrokerArgs) as u64,
+    );
+    (status >= 0).then_some(()).ok_or((-status) as i32)
+}
+
+fn proc_map_flags(elf_flags: u32) -> u64 {
+    let mut flags = PROC_BROKER_MAP_PRIVATE;
+    if elf_flags & ELF_PF_R != 0 {
+        flags |= PROC_BROKER_MAP_READ;
+    }
+    if elf_flags & ELF_PF_W != 0 {
+        flags |= PROC_BROKER_MAP_WRITE;
+    }
+    if elf_flags & ELF_PF_X != 0 {
+        flags |= PROC_BROKER_MAP_EXEC;
+    }
+    flags
+}
+
 fn validate_elf_load_segment(
     ph: &[u8; ELF_PROGRAM_HEADER_SIZE],
     load_ranges: &mut Vec<(u64, u64)>,
@@ -353,6 +586,10 @@ fn validate_elf_load_segment(
 }
 
 fn validate_elf_interp(fd: i32, ph: &[u8; ELF_PROGRAM_HEADER_SIZE]) -> Result<(), i32> {
+    read_elf_interp_path(fd, ph).map(|_| ())
+}
+
+fn read_elf_interp_path(fd: i32, ph: &[u8; ELF_PROGRAM_HEADER_SIZE]) -> Result<String, i32> {
     let offset = read_u64(ph, 8);
     let file_size = read_u64(ph, 32);
     if file_size < 2 || file_size as usize > LOADER_SPAWN_EXEC_PATH_CAPACITY {
@@ -367,7 +604,182 @@ fn validate_elf_interp(fd: i32, ph: &[u8; ELF_PROGRAM_HEADER_SIZE]) -> Result<()
     if !path.starts_with('/') {
         return Err(libc::ENOEXEC);
     }
+    Ok(path.to_string())
+}
+
+fn map_pe_segments_fd(fd: i32, prepare_handle: u64) -> Result<(), i32> {
+    let mut dos_header = [0_u8; PE_DOS_HEADER_SIZE];
+    read_exact_at(fd, 0, &mut dos_header)?;
+    let pe_offset = read_u32(&dos_header, 0x3c) as u64;
+    if pe_offset < PE_DOS_HEADER_SIZE as u64 || pe_offset > i32::MAX as u64 {
+        return Err(libc::ENOEXEC);
+    }
+
+    let mut file_header = [0_u8; PE_SIGNATURE_SIZE + PE_FILE_HEADER_SIZE];
+    read_exact_at(fd, pe_offset, &mut file_header)?;
+    if file_header[..PE_SIGNATURE_SIZE] != *b"PE\0\0" {
+        return Err(libc::ENOEXEC);
+    }
+    if read_u16(&file_header, 4) != PE_MACHINE_AMD64 {
+        return Err(libc::ENOEXEC);
+    }
+    let section_count = read_u16(&file_header, 6);
+    let optional_header_size = read_u16(&file_header, 20);
+    if section_count == 0 || optional_header_size < 112 {
+        return Err(libc::ENOEXEC);
+    }
+
+    let mut optional_header = vec![0_u8; optional_header_size as usize];
+    let optional_header_offset = pe_offset
+        .checked_add((PE_SIGNATURE_SIZE + PE_FILE_HEADER_SIZE) as u64)
+        .ok_or(libc::EOVERFLOW)?;
+    read_exact_at(fd, optional_header_offset, &mut optional_header)?;
+    if read_u16(&optional_header, 0) != PE_OPTIONAL_MAGIC_PE32_PLUS {
+        return Err(libc::ENOEXEC);
+    }
+    let section_alignment = read_u32(&optional_header, 32) as u64;
+    let file_alignment = read_u32(&optional_header, 36) as u64;
+    let size_of_image = read_u32(&optional_header, 56) as u64;
+    let size_of_headers = read_u32(&optional_header, 60) as u64;
+    if section_alignment < 4096
+        || !section_alignment.is_power_of_two()
+        || file_alignment == 0
+        || !file_alignment.is_power_of_two()
+        || size_of_image == 0
+        || size_of_headers == 0
+    {
+        return Err(libc::ENOEXEC);
+    }
+    let load_base = PROC_BROKER_USER_SPACE_BASE
+        .checked_add(PE_LOAD_OFFSET)
+        .ok_or(libc::EOVERFLOW)?;
+    let image_end = load_base
+        .checked_add(align_up(size_of_image, 4096)?)
+        .ok_or(libc::EOVERFLOW)?;
+    if image_end > PROC_BROKER_USER_SPACE_END_EXCLUSIVE {
+        return Err(libc::ENOEXEC);
+    }
+    map_pe_headers(fd, prepare_handle, load_base, size_of_headers)?;
+
+    let section_table = optional_header_offset
+        .checked_add(u64::from(optional_header_size))
+        .ok_or(libc::EOVERFLOW)?;
+    for index in 0..section_count {
+        let mut section = [0_u8; PE_SECTION_HEADER_SIZE];
+        let offset = section_table
+            .checked_add(u64::from(index) * PE_SECTION_HEADER_SIZE as u64)
+            .ok_or(libc::EOVERFLOW)?;
+        read_exact_at(fd, offset, &mut section)?;
+        map_pe_section(fd, prepare_handle, load_base, &section)?;
+    }
     Ok(())
+}
+
+fn map_pe_headers(
+    fd: i32,
+    prepare_handle: u64,
+    load_base: u64,
+    size_of_headers: u64,
+) -> Result<(), i32> {
+    let mem_len = align_up(size_of_headers, 4096)?;
+    let args = RustosProcMapFileBrokerArgs {
+        prepare_handle,
+        fd: fd as u64,
+        file_offset: 0,
+        target_addr: load_base,
+        file_len: size_of_headers,
+        mem_len,
+        flags: PROC_BROKER_MAP_PRIVATE | PROC_BROKER_MAP_READ,
+        reserved0: 0,
+    };
+    let status = syscall1(
+        SYS_RUSTOS_PROC_MAP_FILE_BROKER,
+        (&args as *const RustosProcMapFileBrokerArgs) as u64,
+    );
+    (status >= 0).then_some(()).ok_or((-status) as i32)
+}
+
+fn map_pe_section(
+    fd: i32,
+    prepare_handle: u64,
+    load_base: u64,
+    section: &[u8; PE_SECTION_HEADER_SIZE],
+) -> Result<(), i32> {
+    let virtual_size = read_u32(section, 8) as u64;
+    let virtual_address = read_u32(section, 12) as u64;
+    let raw_size = read_u32(section, 16) as u64;
+    let raw_offset = read_u32(section, 20) as u64;
+    let characteristics = read_u32(section, 36);
+    let section_size = virtual_size.max(raw_size);
+    if section_size == 0 {
+        return Ok(());
+    }
+    let target_addr = load_base
+        .checked_add(virtual_address)
+        .ok_or(libc::EOVERFLOW)?;
+    let page_base = align_down(target_addr, 4096);
+    let page_delta = target_addr.checked_sub(page_base).ok_or(libc::EOVERFLOW)?;
+    let mem_len = align_up(
+        page_delta
+            .checked_add(section_size)
+            .ok_or(libc::EOVERFLOW)?,
+        4096,
+    )?;
+    let flags = pe_map_flags(characteristics)?;
+    if raw_size == 0 {
+        let args = RustosProcMapZeroedBrokerArgs {
+            prepare_handle,
+            target_addr: page_base,
+            mem_len,
+            flags,
+            reserved0: 0,
+        };
+        let status = syscall1(
+            SYS_RUSTOS_PROC_MAP_ZEROED_BROKER,
+            (&args as *const RustosProcMapZeroedBrokerArgs) as u64,
+        );
+        return (status >= 0).then_some(()).ok_or((-status) as i32);
+    }
+    let file_offset = raw_offset.checked_sub(page_delta).ok_or(libc::ENOEXEC)?;
+    let file_len = page_delta.checked_add(raw_size).ok_or(libc::EOVERFLOW)?;
+    let args = RustosProcMapFileBrokerArgs {
+        prepare_handle,
+        fd: fd as u64,
+        file_offset,
+        target_addr: page_base,
+        file_len,
+        mem_len,
+        flags,
+        reserved0: 0,
+    };
+    let status = syscall1(
+        SYS_RUSTOS_PROC_MAP_FILE_BROKER,
+        (&args as *const RustosProcMapFileBrokerArgs) as u64,
+    );
+    (status >= 0).then_some(()).ok_or((-status) as i32)
+}
+
+fn pe_map_flags(characteristics: u32) -> Result<u64, i32> {
+    let executable = characteristics & PE_SCN_MEM_EXECUTE != 0;
+    let writable = characteristics & PE_SCN_MEM_WRITE != 0;
+    let readable = characteristics & PE_SCN_MEM_READ != 0;
+    if executable && writable {
+        return Err(libc::ENOEXEC);
+    }
+    if !executable && !writable && !readable {
+        return Err(libc::ENOEXEC);
+    }
+    let mut flags = PROC_BROKER_MAP_PRIVATE;
+    if readable || executable {
+        flags |= PROC_BROKER_MAP_READ;
+    }
+    if writable {
+        flags |= PROC_BROKER_MAP_WRITE;
+    }
+    if executable {
+        flags |= PROC_BROKER_MAP_EXEC;
+    }
+    Ok(flags)
 }
 
 fn validate_pe_fd(fd: i32, dos_header_prefix: &[u8]) -> Result<(), i32> {
@@ -441,6 +853,20 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
         bytes[offset + 6],
         bytes[offset + 7],
     ])
+}
+
+fn align_up(value: u64, align: u64) -> Result<u64, i32> {
+    if align == 0 || !align.is_power_of_two() {
+        return Err(libc::EINVAL);
+    }
+    value
+        .checked_add(align - 1)
+        .map(|value| value & !(align - 1))
+        .ok_or(libc::EOVERFLOW)
+}
+
+fn align_down(value: u64, align: u64) -> u64 {
+    value & !(align - 1)
 }
 
 fn syscall0(number: u64) -> i64 {

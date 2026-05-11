@@ -295,7 +295,19 @@ pub fn prepare_process_file_with_launch(
     prepare_loaded_process_with_launch(load_image_file(file)?, launch)
 }
 
-fn spawn_prepared_process(
+pub fn prepare_process_file_with_address_space(
+    file: VfsFileHandle,
+    address_space: ProcessAddressSpace,
+    launch: ProcessLaunchOptions<'_>,
+) -> Result<PreparedProcessImage, ProcessLoadError> {
+    let mut loaded = load_image_file(file)?;
+    if loaded.abi == UserAbi::Linux {
+        loaded.address_space = address_space;
+    }
+    prepare_loaded_process_with_launch(loaded, launch)
+}
+
+pub fn spawn_prepared_process(
     prepared: PreparedProcessImage,
     weight_micros: u64,
 ) -> Result<SpawnedProcess, ProcessLoadError> {

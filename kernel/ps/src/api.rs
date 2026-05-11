@@ -19,8 +19,8 @@ pub use crate::user::epoll::{EpollError, EpollHandle, EpollInterestSnapshot};
 pub use crate::user::handles::{
     ConsoleStreamKind, DisplaySurfaceHandle, FD_CLOEXEC, FIRST_DYNAMIC_FD, FileHandleSeekError,
     FileHandleSeekWhence, HandleEntry, HandleTable, InetSocketHandle, KernelHandle,
-    TransferredHandleEntry, VfsDirectoryEntry, VfsDirectoryEntryKind, VfsDirectoryHandle,
-    VfsFileHandle, VfsFileObject,
+    RemoteVfsHandle, RemoteVfsHandleKind, TransferredHandleEntry, VfsDirectoryEntry,
+    VfsDirectoryEntryKind, VfsDirectoryHandle, VfsFileHandle, VfsFileObject,
 };
 pub use crate::user::linux::{
     LinuxMemoryMapState, LinuxProcessImageInfo, LinuxProcessLaunch, LinuxProcessState,

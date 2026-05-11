@@ -2,7 +2,7 @@ mod fs_ops;
 mod ipc_ops;
 mod memory_ops;
 mod network_ops;
-mod offload_ops;
+pub(crate) mod offload_ops;
 mod process_ops;
 
 use alloc::string::String;
@@ -20,6 +20,7 @@ use crate::user::sysops::usermem;
 const LINUX_E2BIG: i64 = 7;
 const LINUX_ENOEXEC: i64 = 8;
 const LINUX_EINTR: i64 = 4;
+const LINUX_EIO: i64 = 5;
 const LINUX_EACCES: i64 = 13;
 const LINUX_ENOMEM: i64 = 12;
 const LINUX_ECHILD: i64 = 10;
@@ -47,6 +48,7 @@ const LINUX_ESPIPE: i64 = 29;
 const LINUX_ESTALE: i64 = 116;
 const LINUX_ENOSYS: i64 = 38;
 const LINUX_EOVERFLOW: i64 = 75;
+const LINUX_ETIMEDOUT: i64 = 110;
 const SECONDARY_LINUX_SYSCALL_DEBUG_LIMIT: usize = 0;
 const MAX_RUSTOS_DEBUG_PRINT_BYTES: usize = 2048;
 
@@ -105,7 +107,6 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
             )
         });
     }
-
     let result = match frame.rax {
         linux_abi::SYS_READ => fs_ops::syscall_linux_read(frame.rdi, frame.rsi, frame.rdx),
         linux_abi::SYS_WRITE => fs_ops::syscall_linux_write(frame.rdi, frame.rsi, frame.rdx),

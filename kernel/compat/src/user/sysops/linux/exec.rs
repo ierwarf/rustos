@@ -165,6 +165,58 @@ pub(crate) fn spawn_exec(
     Ok(pid)
 }
 
+pub(crate) fn spawn_prepared_exec(
+    address_space: crate::memory::paging::ProcessAddressSpace,
+    path_ptr: u64,
+    argv_ptr: u64,
+    envp_ptr: u64,
+    flags: u64,
+    console_session_raw: u64,
+    weight_micros: u64,
+) -> Result<u64, LinuxSysopError> {
+    let path = usermem::read_current_user_c_string(path_ptr, MAX_EXEC_PATH_LEN)?;
+    if path.is_empty() {
+        return Err(LinuxSysopError::InvalidArgument);
+    }
+    let absolute_path =
+        file::resolve_path_for_current_process(linux_abi::AT_FDCWD as i64 as u64, &path)?;
+    let argv = read_exec_string_array(argv_ptr, MAX_EXEC_ARG_COUNT, MAX_EXEC_TOTAL_STRING_BYTES)?;
+    let env = read_exec_string_array(
+        envp_ptr,
+        MAX_EXEC_ENV_COUNT,
+        MAX_EXEC_TOTAL_STRING_BYTES.saturating_sub(argv.used_bytes),
+    )?;
+    let image = file::open_path_for_current_process_file(absolute_path.as_str())?;
+    let logical_admin = flags & 0x1 != 0;
+
+    let mut argv_refs = argv.values.iter().map(String::as_str).collect::<Vec<_>>();
+    if argv_refs.is_empty() {
+        argv_refs.push(absolute_path.as_str());
+    }
+    let env_refs = env.values.iter().map(String::as_str).collect::<Vec<_>>();
+    let launch = ProcessLaunchOptions {
+        linux: crate::user::linux::LinuxProcessLaunch {
+            exec_path: absolute_path.as_str(),
+            argv: &argv_refs,
+            env: &env_refs,
+        },
+        windows: WindowsProcessLaunch {
+            exec_path: absolute_path.as_str(),
+            argv: &argv_refs,
+            env: &env_refs,
+        },
+        console_session: ConsoleSessionHandle::from_raw(console_session_raw),
+        logical_admin,
+        ..ProcessLaunchOptions::default()
+    };
+
+    let prepared = process::prepare_process_file_with_address_space(image, address_space, launch)
+        .map_err(map_process_load_error_to_linux)?;
+    process::spawn_prepared_process(prepared, weight_micros)
+        .map(|spawned| spawned.pid)
+        .map_err(map_process_load_error_to_linux)
+}
+
 fn trace_exec_stage(stage: &str, path: &str, started_ticks: u64) {
     let elapsed_ticks = crate::arch::rtc::ticks().saturating_sub(started_ticks);
     let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);

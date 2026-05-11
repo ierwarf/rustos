@@ -394,7 +394,13 @@ fn resolve_base_path_for_dirfd(dirfd: u64) -> Result<String, FileSysopError> {
     };
 
     match handle {
+        KernelHandle::RemoteVfs(remote)
+            if remote.kind() == crate::user::handles::RemoteVfsHandleKind::Directory =>
+        {
+            Ok(remote.path())
+        }
         KernelHandle::VfsDirectory(directory) => Ok(String::from(directory.path())),
+        KernelHandle::RemoteVfs(_) => Err(FileSysopError::NotDirectory),
         KernelHandle::VfsFile(_) => Err(FileSysopError::NotDirectory),
         KernelHandle::Memfd(_) => Err(FileSysopError::NotDirectory),
         _ => Err(FileSysopError::InvalidArgument),
@@ -410,6 +416,7 @@ fn clone_current_process_file_handle(fd: u64) -> Result<Option<CurrentFileHandle
     };
 
     match handle {
+        KernelHandle::RemoteVfs(_) => Ok(None),
         KernelHandle::VfsFile(file) => Ok(Some(CurrentFileHandle::Vfs(file.clone()))),
         KernelHandle::Memfd(file) => Ok(Some(CurrentFileHandle::Memfd(file.clone()))),
         _ => Ok(None),

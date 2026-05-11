@@ -93,10 +93,18 @@ fn handle_request(
         SYSCALL_OFFLOAD_OP_LINUX_SCHED_GETAFFINITY => {
             linux_policy::handle_sched_getaffinity(request, response)
         }
-        SYSCALL_OFFLOAD_OP_LINUX_GETUID => linux_policy::handle_id(request.uid, response),
-        SYSCALL_OFFLOAD_OP_LINUX_GETGID => linux_policy::handle_id(request.gid, response),
-        SYSCALL_OFFLOAD_OP_LINUX_GETEUID => linux_policy::handle_id(request.euid, response),
-        SYSCALL_OFFLOAD_OP_LINUX_GETEGID => linux_policy::handle_id(request.egid, response),
+        SYSCALL_OFFLOAD_OP_LINUX_GETUID => {
+            linux_policy::handle_id(request, linux_policy::IdKind::Uid, response)
+        }
+        SYSCALL_OFFLOAD_OP_LINUX_GETGID => {
+            linux_policy::handle_id(request, linux_policy::IdKind::Gid, response)
+        }
+        SYSCALL_OFFLOAD_OP_LINUX_GETEUID => {
+            linux_policy::handle_id(request, linux_policy::IdKind::Euid, response)
+        }
+        SYSCALL_OFFLOAD_OP_LINUX_GETEGID => {
+            linux_policy::handle_id(request, linux_policy::IdKind::Egid, response)
+        }
         SYSCALL_OFFLOAD_OP_LINUX_SETUID => linux_policy::handle_setuid(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_SETGID => linux_policy::handle_setgid(request, response),
         _ => response.status = libc::EINVAL,

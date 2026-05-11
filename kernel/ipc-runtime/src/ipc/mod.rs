@@ -30,7 +30,7 @@ const MAX_CHANNEL_QUEUE_DEPTH: usize = 256;
 const MAX_IPC_PAYLOAD_BYTES: usize = 64 * 1024;
 #[cfg(test)]
 const MAX_IPC_ATTACHED_HANDLES: usize = 16;
-const MAX_ENDPOINT_INLINE_MESSAGE_BYTES: usize = 4096;
+const MAX_ENDPOINT_INLINE_MESSAGE_BYTES: usize = rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES;
 const MAX_ENDPOINT_PENDING_MESSAGES: usize = 64;
 const MAX_ENDPOINT_TRANSFER_HANDLES: usize = 16;
 const MAX_ENDPOINT_WAITERS: usize = 64;

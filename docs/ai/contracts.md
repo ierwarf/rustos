@@ -81,6 +81,13 @@ Kernel/userspace ABI:
   policy belongs in `loaderd`. Kernel FD/socket/module/process data paths may
   remain as brokered mechanisms until handle/cap transfer and driver-domain
   isolation are in place.
+- Registered service endpoints also carry kernel-tracked broker capability
+  bits derived from their `IPC_SERVICE_*` id. Broker authorization must check
+  the current process' registered service capability, not its executable path.
+  Current capability constants are `IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY`,
+  `IPC_SERVICE_CAP_VFS_POLICY`, `IPC_SERVICE_CAP_NET_POLICY`,
+  `IPC_SERVICE_CAP_DEVICE_POLICY`, `IPC_SERVICE_CAP_DRIVER_POLICY`, and
+  `IPC_SERVICE_CAP_PROCESS_LOADER`.
 - Kernel IPC endpoint calls support bounded cap-transfer slots through
   `kernel_ipc_runtime::api::KernelTransferredHandle` and the
   `*_with_handles` endpoint APIs. Byte-only recv/take wrappers must keep failing
@@ -101,14 +108,25 @@ Kernel/userspace ABI:
   handle-aware ABI, even when no handles are returned. Counts are bounded by
   `IPC_MAX_TRANSFER_HANDLES`, and byte-only IPC syscalls must not silently carry
   or discard transferred handles.
-- Linux `openat` is the first VFS fd-producing syscall that uses this
-  handle-aware path: non-policy-service callers send the normalized path request
-  to `vfsd`, `vfsd` opens through the temporary kernel VFS broker, replies with
-  one transferred fd, and the kernel installs that transferred entry in the
-  caller fd table. Policy services may still use the broker directly to avoid
-  recursive self-IPC during bootstrap. Before `vfsd` registers its endpoint,
-  the temporary broker remains available for service dynamic-loader bootstrap;
-  after registration, generic pid-based bypass is not allowed.
+- VFS ownership uses `VfsIpcRequest` / `VfsIpcResponse`, separate from
+  `LinuxSyscallOffloadRequest`, for service-owned file handles and chunked I/O.
+  `vfsd` owns the Linux-visible namespace, cwd, directory cursors, regular file
+  cursors, remote file ids, and root FAT parsing. Kernel fd tables mirror these
+  service-owned objects as `KernelHandle::RemoteVfs`; kernel code may still own
+  bootstrapping, process/MM, user-memory copying at syscall entry, and explicit
+  broker primitives.
+- `SYS_RUSTOS_BLOCK_BROKER` is the narrow boot-volume read broker for `vfsd`.
+  It is gated by `IPC_SERVICE_CAP_VFS_POLICY`, accepts `RustosBlockBrokerArgs`,
+  and exposes only boot-volume info plus bounded read-only block reads. This
+  migration does not depend on `storaged`.
+- Linux `openat` installs `KernelHandle::RemoteVfs` for regular files and
+  directories after `vfsd` registration. Device paths remain kernel device
+  handles through the device broker path until `devmgrd` device-open transfer is
+  complete. Policy services may still use the bootstrap VFS path to avoid
+  recursive self-IPC during service startup. Before `vfsd` registers its
+  endpoint, the temporary broker remains available for service dynamic-loader
+  bootstrap; after registration, generic Linux app VFS syscalls must route to
+  `vfsd` or fail closed if `vfsd` is unavailable.
 - Linux `close`, `dup`/`dup2`/`dup3`, and `fcntl` route through `vfsd` before
   mutating the app fd table. `vfsd` is the only intended caller of the
   temporary `SYS_RUSTOS_FD_*_BROKER` syscalls; generic apps must not use them
@@ -118,7 +136,8 @@ Kernel/userspace ABI:
 - Linux `getdents64` also routes through `vfsd`; the temporary
   `SYS_RUSTOS_FD_GETDENTS64_BROKER` writes directory records into the target
   process address space selected by pid. FD broker syscalls must remain gated to
-  the `services/vfsd/vfsd.elf` process, not broad policy-service callers.
+  the registered `IPC_SERVICE_CAP_VFS_POLICY` owner, not broad policy-service
+  callers.
 - Linux `mount` and `umount2` must preserve Linux ELF compatibility while
   keeping namespace policy in `vfsd`: generic app syscalls route to `vfsd`,
   then `vfsd` calls the temporary gated `SYS_RUSTOS_VFS_*_BROKER` primitives for
@@ -128,10 +147,53 @@ Kernel/userspace ABI:
   `SYS_RUSTOS_SPAWN_EXEC` calls. `loaderd` registers `IPC_SERVICE_LOADERD`,
   validates executable format policy, and uses the temporary gated
   `SYS_RUSTOS_PROC_*_BROKER` primitives for kernel-owned process commit work.
-  `SYS_RUSTOS_PROC_*_BROKER` calls must fail with `EACCES` for non-loaderd
-  callers. `SYS_RUSTOS_SPAWN_EXEC` remains available for init/bootstrap
-  compatibility, but once `loaderd` is registered generic apps should not use it
-  directly.
+  `SYS_RUSTOS_PROC_*_BROKER` calls must fail with `EACCES` unless the caller
+  owns `IPC_SERVICE_CAP_PROCESS_LOADER`. `SYS_RUSTOS_SPAWN_EXEC` remains
+  available for init/bootstrap compatibility, but once `loaderd` is registered
+  generic apps should not use it directly.
+- Process broker sessions start with `SYS_RUSTOS_PROC_PREPARE_BROKER` using
+  `PROC_BROKER_ABI_VERSION` and an explicit executable format
+  (`PROC_BROKER_FORMAT_ELF64` or `PROC_BROKER_FORMAT_PE64`). The returned
+  `prepare_handle` is owned by the loader service process and must be supplied
+  to `SYS_RUSTOS_PROC_COMMIT_BROKER` or `SYS_RUSTOS_PROC_ABORT_BROKER`.
+  `SYS_RUSTOS_PROC_MAP_FILE_BROKER` and `SYS_RUSTOS_PROC_MAP_ZEROED_BROKER`
+  use `PROC_BROKER_MAP_{READ,WRITE,EXEC,PRIVATE}` flags and record non-
+  overlapping page-aligned mappings in the prepare session. `loaderd` must
+  emit ELF `PT_LOAD` mappings for both the main image and its `PT_INTERP`
+  interpreter, using the same static-PIE load biases as the kernel loader
+  (`PROC_BROKER_USER_SPACE_BASE + 0x0040_0000` for the main image and
+  `PROC_BROKER_USER_SPACE_BASE + 0x0200_0000` for the interpreter). The kernel
+  prepare session stores cloned VFS file capabilities for file-backed mappings,
+  not just fd numbers. Commit builds the child address space from those recorded
+  mappings, while still using kernel image parsing for remaining launch metadata
+  until loader-owned metadata transfer is complete. Linux ELF commit uses the
+  loader-provided address space. Windows PE commit currently preserves
+  compatibility by falling back to the kernel-built PE address space for
+  relocations/import/runtime setup, while `loaderd` already records PE
+  header/section mappings for the future metadata handoff.
+- Linux `ioctl` policy routes through `devmgrd` after bootstrap. `devmgrd` owns
+  request authorization and calls `SYS_RUSTOS_DEVICE_IOCTL_BROKER`, which is
+  gated by `IPC_SERVICE_CAP_DEVICE_POLICY` and performs the kernel-owned user
+  memory/device operation against the target process id and fd.
+- Linux socket namespace operations route through `netd` after bootstrap.
+  `socket`, `socketpair`, `bind`, `listen`, `accept/accept4`, and `connect`
+  call `netd`, and `netd` invokes the gated `SYS_RUSTOS_NET_BROKER` primitive
+  with the target process id. Kernel code still performs handle installation,
+  target user-memory validation/copy, and the current in-kernel socket/inet
+  substrate; policy routing and namespace sequencing belong to `netd`.
+- `driverd` owns registry parsing and provider/autoload ordering after it
+  registers `IPC_SERVICE_DRIVERD`. The gated driver broker surface is
+  `SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER`,
+  `SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER`, and
+  `SYS_RUSTOS_DRIVER_PROVIDER_ACTIVE_BROKER`; the kernel side only loads an
+  explicit module image, probes hardware aliases, or reports active provider
+  groups for final safety checks. Early boot may still use the legacy kernel
+  registry path until driver service bootstrap owns display/input/network
+  bring-up.
+- `syscalld` keeps the service-side Linux policy DB for per-process credentials
+  and `RLIMIT_STACK`. Linux-visible `get*id`, `set*id`, and `prlimit64` policy
+  must be sourced from `syscalld`; kernel process credentials are a temporary
+  bootstrap/security primitive and must not be mutated by Linux `set*id`.
 - `device::DisplayInfo.flags` distinguishes boot firmware framebuffers from a
   real primary display provider. Userspace display surfaces must require
   `DISPLAY_INFO_FLAG_PRIMARY_PROVIDER`; GRUB/firmware boot framebuffers are for

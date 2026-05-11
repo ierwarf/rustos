@@ -7,7 +7,9 @@ use core::slice;
 
 use crate::multitask;
 use crate::user::handles::{FD_CLOEXEC, HandleEntry, InetSocketHandle, KernelHandle};
+use crate::user::process_state::UserProcessState;
 use crate::user::socket::{PassedHandle, SocketCredentials, SocketHandle};
+use x86_64::VirtAddr;
 
 use super::*;
 
@@ -15,6 +17,16 @@ const MAX_SOCKET_IOV_PAYLOAD_BYTES: usize = 1024 * 1024;
 const MAX_SOCKET_CONTROL_BYTES: usize = 64 * 1024;
 
 pub(crate) fn socket(domain: u64, type_: u64, protocol: u64) -> Result<u64, LinuxSysopError> {
+    let process_id = multitask::current_user_process_id().ok_or(LinuxSysopError::Unsupported)?;
+    socket_for_process(process_id, domain, type_, protocol)
+}
+
+pub(crate) fn socket_for_process(
+    process_id: u64,
+    domain: u64,
+    type_: u64,
+    protocol: u64,
+) -> Result<u64, LinuxSysopError> {
     if domain == linux_abi::AF_INET {
         let (status_flags, fd_flags, base_type) = parse_inet_socket_type(type_)?;
         if !matches!(base_type, value if value == linux_abi::SOCK_STREAM || value == linux_abi::SOCK_DGRAM)
@@ -25,7 +37,8 @@ pub(crate) fn socket(domain: u64, type_: u64, protocol: u64) -> Result<u64, Linu
             return Err(LinuxSysopError::OperationNotSupported);
         }
         let token = kernel_io_manager::api::network::create_inet_socket(base_type, protocol);
-        return install_inet_socket(
+        return install_inet_socket_for_process(
+            process_id,
             InetSocketHandle::from_token(token, domain, base_type, protocol),
             status_flags,
             fd_flags,
@@ -40,8 +53,9 @@ pub(crate) fn socket(domain: u64, type_: u64, protocol: u64) -> Result<u64, Linu
     }
 
     let (status_flags, fd_flags) = parse_stream_socket_type(type_)?;
-    install_socket(
-        SocketHandle::new_unix_stream_with_owner(current_socket_credentials()),
+    install_socket_for_process(
+        process_id,
+        SocketHandle::new_unix_stream_with_owner(socket_credentials_for_process(process_id)),
         status_flags,
         fd_flags,
     )
@@ -52,7 +66,17 @@ fn install_inet_socket(
     status_flags: u64,
     fd_flags: u32,
 ) -> Result<u64, LinuxSysopError> {
-    let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
+    let process_id = multitask::current_user_process_id().ok_or(LinuxSysopError::Unsupported)?;
+    install_inet_socket_for_process(process_id, socket, status_flags, fd_flags)
+}
+
+fn install_inet_socket_for_process(
+    process_id: u64,
+    socket: InetSocketHandle,
+    status_flags: u64,
+    fd_flags: u32,
+) -> Result<u64, LinuxSysopError> {
+    let Some(result) = multitask::with_process_state_by_pid_mut(process_id, |process_state| {
         Ok(process_state.handles_mut().install_entry(HandleEntry::new(
             KernelHandle::InetSocket(socket),
             fd_flags,
@@ -71,6 +95,17 @@ pub(crate) fn socketpair(
     protocol: u64,
     sv_ptr: u64,
 ) -> Result<(), LinuxSysopError> {
+    let process_id = multitask::current_user_process_id().ok_or(LinuxSysopError::Unsupported)?;
+    socketpair_for_process(process_id, domain, type_, protocol, sv_ptr)
+}
+
+pub(crate) fn socketpair_for_process(
+    process_id: u64,
+    domain: u64,
+    type_: u64,
+    protocol: u64,
+    sv_ptr: u64,
+) -> Result<(), LinuxSysopError> {
     if domain != linux_abi::AF_UNIX {
         return Err(LinuxSysopError::AddressFamilyNotSupported);
     }
@@ -79,8 +114,8 @@ pub(crate) fn socketpair(
     }
 
     let (status_flags, fd_flags) = parse_stream_socket_type(type_)?;
-    let (left, right) = SocketHandle::socketpair(current_socket_credentials());
-    let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
+    let (left, right) = SocketHandle::socketpair(socket_credentials_for_process(process_id));
+    let Some(result) = multitask::with_process_state_by_pid_mut(process_id, |process_state| {
         let left_fd = process_state.handles_mut().install_entry(HandleEntry::new(
             KernelHandle::Socket(left),
             fd_flags,
@@ -103,7 +138,7 @@ pub(crate) fn socketpair(
             right_fd.to_le_bytes()[2],
             right_fd.to_le_bytes()[3],
         ];
-        usermem::write_current_user_bytes(sv_ptr, &bytes)?;
+        write_user_bytes_for_process_state(process_state, sv_ptr, &bytes)?;
         Ok(())
     }) else {
         return Err(LinuxSysopError::Unsupported);
@@ -113,13 +148,32 @@ pub(crate) fn socketpair(
 }
 
 pub(crate) fn bind(fd: u64, addr_ptr: u64, addr_len: u64) -> Result<(), LinuxSysopError> {
-    let path = read_sockaddr_un_path(addr_ptr, addr_len)?;
-    let (socket, _) = socket_handle_for_fd(fd)?;
+    let process_id = multitask::current_user_process_id().ok_or(LinuxSysopError::Unsupported)?;
+    bind_for_process(process_id, fd, addr_ptr, addr_len)
+}
+
+pub(crate) fn bind_for_process(
+    process_id: u64,
+    fd: u64,
+    addr_ptr: u64,
+    addr_len: u64,
+) -> Result<(), LinuxSysopError> {
+    let path = read_sockaddr_un_path_for_process(process_id, addr_ptr, addr_len)?;
+    let (socket, _) = socket_handle_for_process_fd(process_id, fd)?;
     socket.bind(path.as_str()).map_err(Into::into)
 }
 
 pub(crate) fn listen(fd: u64, backlog: u64) -> Result<(), LinuxSysopError> {
-    let (socket, _) = socket_handle_for_fd(fd)?;
+    let process_id = multitask::current_user_process_id().ok_or(LinuxSysopError::Unsupported)?;
+    listen_for_process(process_id, fd, backlog)
+}
+
+pub(crate) fn listen_for_process(
+    process_id: u64,
+    fd: u64,
+    backlog: u64,
+) -> Result<(), LinuxSysopError> {
+    let (socket, _) = socket_handle_for_process_fd(process_id, fd)?;
     let backlog = ((backlog as u32) as i32).max(0) as usize;
     socket.listen(backlog).map_err(Into::into)
 }
@@ -134,23 +188,49 @@ pub(crate) fn accept4(
     addr_len_ptr: u64,
     flags: u64,
 ) -> Result<u64, LinuxSysopError> {
-    let (socket, status_flags) = socket_handle_for_fd(fd)?;
+    let process_id = multitask::current_user_process_id().ok_or(LinuxSysopError::Unsupported)?;
+    accept4_for_process(process_id, fd, addr_ptr, addr_len_ptr, flags)
+}
+
+pub(crate) fn accept4_for_process(
+    process_id: u64,
+    fd: u64,
+    addr_ptr: u64,
+    addr_len_ptr: u64,
+    flags: u64,
+) -> Result<u64, LinuxSysopError> {
+    let (socket, status_flags) = socket_handle_for_process_fd(process_id, fd)?;
     let (new_status_flags, fd_flags) = parse_accept4_flags(flags)?;
     let accepted = socket.accept(status_flags & linux_abi::O_NONBLOCK != 0)?;
 
-    let accepted_fd = install_socket(accepted, linux_abi::O_RDWR | new_status_flags, fd_flags)?;
-    write_accept_address(addr_ptr, addr_len_ptr)?;
+    let accepted_fd = install_socket_for_process(
+        process_id,
+        accepted,
+        linux_abi::O_RDWR | new_status_flags,
+        fd_flags,
+    )?;
+    write_accept_address_for_process(process_id, addr_ptr, addr_len_ptr)?;
     Ok(accepted_fd)
 }
 
 pub(crate) fn connect(fd: u64, addr_ptr: u64, addr_len: u64) -> Result<(), LinuxSysopError> {
-    if let Some(socket) = inet_socket_handle_for_fd(fd)? {
-        let (addr, port) = read_sockaddr_in(addr_ptr, addr_len)?;
+    let process_id = multitask::current_user_process_id().ok_or(LinuxSysopError::Unsupported)?;
+    connect_for_process(process_id, fd, addr_ptr, addr_len)
+}
+
+pub(crate) fn connect_for_process(
+    process_id: u64,
+    fd: u64,
+    addr_ptr: u64,
+    addr_len: u64,
+) -> Result<(), LinuxSysopError> {
+    if let Some(socket) = inet_socket_handle_for_process_fd(process_id, fd)? {
+        let (addr, port) = read_sockaddr_in_for_process(process_id, addr_ptr, addr_len)?;
         return kernel_io_manager::api::network::connect_inet_socket(socket.token_id(), addr, port)
             .map_err(map_inet_error);
     }
-    let path = read_sockaddr_un_path(addr_ptr, addr_len)?;
-    let (socket, _) = socket_handle_for_fd(fd)?;
+    let path = read_sockaddr_un_path_for_process(process_id, addr_ptr, addr_len)?;
+    let (socket, _) = socket_handle_for_process_fd(process_id, fd)?;
     socket.connect(path.as_str()).map_err(Into::into)
 }
 
@@ -541,7 +621,17 @@ fn install_socket(
     status_flags: u64,
     fd_flags: u32,
 ) -> Result<u64, LinuxSysopError> {
-    let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
+    let process_id = multitask::current_user_process_id().ok_or(LinuxSysopError::Unsupported)?;
+    install_socket_for_process(process_id, socket, status_flags, fd_flags)
+}
+
+fn install_socket_for_process(
+    process_id: u64,
+    socket: SocketHandle,
+    status_flags: u64,
+    fd_flags: u32,
+) -> Result<u64, LinuxSysopError> {
+    let Some(result) = multitask::with_process_state_by_pid_mut(process_id, |process_state| {
         Ok(process_state.handles_mut().install_entry(HandleEntry::new(
             KernelHandle::Socket(socket),
             fd_flags,
@@ -567,6 +657,20 @@ fn current_socket_credentials() -> SocketCredentials {
     )
 }
 
+fn socket_credentials_for_process(process_id: u64) -> SocketCredentials {
+    let Some(credentials) = multitask::with_process_state_by_pid_mut(process_id, |process_state| {
+        let security = process_state.security();
+        SocketCredentials::new(
+            i32::try_from(process_id).unwrap_or(0),
+            security.euid(),
+            security.egid(),
+        )
+    }) else {
+        return SocketCredentials::new(0, 0, 0);
+    };
+    credentials
+}
+
 fn current_socket_for_fd(fd: u64) -> Result<Option<(SocketHandle, u64)>, LinuxSysopError> {
     if fd < 3 {
         return Ok(None);
@@ -580,6 +684,30 @@ fn current_socket_for_fd(fd: u64) -> Result<Option<(SocketHandle, u64)>, LinuxSy
             KernelHandle::Socket(socket) => Ok(Some((socket.clone(), entry.status_flags()))),
             KernelHandle::InetSocket(_) => Err(LinuxSysopError::OperationNotSupported),
             _ => Ok(None),
+        }
+    }) else {
+        return Err(LinuxSysopError::Unsupported);
+    };
+
+    result
+}
+
+fn socket_handle_for_process_fd(
+    process_id: u64,
+    fd: u64,
+) -> Result<(SocketHandle, u64), LinuxSysopError> {
+    if fd < 3 {
+        return Err(LinuxSysopError::NotSocket);
+    }
+
+    let Some(result) = multitask::with_process_state_by_pid_mut(process_id, |process_state| {
+        let Some(entry) = process_state.handles().get_entry(fd) else {
+            return Err(LinuxSysopError::BadFileDescriptor);
+        };
+        match entry.handle() {
+            KernelHandle::Socket(socket) => Ok((socket.clone(), entry.status_flags())),
+            KernelHandle::InetSocket(_) => Err(LinuxSysopError::OperationNotSupported),
+            _ => Err(LinuxSysopError::NotSocket),
         }
     }) else {
         return Err(LinuxSysopError::Unsupported);
@@ -610,6 +738,29 @@ fn current_inet_socket_for_fd(fd: u64) -> Result<Option<(InetSocketHandle, u64)>
 
 fn inet_socket_handle_for_fd(fd: u64) -> Result<Option<InetSocketHandle>, LinuxSysopError> {
     current_inet_socket_for_fd(fd).map(|entry| entry.map(|(socket, _)| socket))
+}
+
+fn inet_socket_handle_for_process_fd(
+    process_id: u64,
+    fd: u64,
+) -> Result<Option<InetSocketHandle>, LinuxSysopError> {
+    if fd < 3 {
+        return Ok(None);
+    }
+
+    let Some(result) = multitask::with_process_state_by_pid_mut(process_id, |process_state| {
+        let Some(entry) = process_state.handles().get_entry(fd) else {
+            return Err(LinuxSysopError::BadFileDescriptor);
+        };
+        match entry.handle() {
+            KernelHandle::InetSocket(socket) => Ok(Some(*socket)),
+            _ => Ok(None),
+        }
+    }) else {
+        return Err(LinuxSysopError::Unsupported);
+    };
+
+    result
 }
 
 fn inet_status_flags_for_fd(fd: u64) -> Result<u64, LinuxSysopError> {
@@ -695,13 +846,24 @@ fn parse_accept4_flags(flags: u64) -> Result<(u64, u32), LinuxSysopError> {
 }
 
 fn read_sockaddr_un_path(addr_ptr: u64, addr_len: u64) -> Result<String, LinuxSysopError> {
-    let len = usize::try_from(addr_len).map_err(|_| LinuxSysopError::InvalidArgument)?;
+    let mut bytes = read_user_bytes_current(addr_ptr, addr_len)?;
+    parse_sockaddr_un_path(bytes.as_mut_slice())
+}
+
+fn read_sockaddr_un_path_for_process(
+    process_id: u64,
+    addr_ptr: u64,
+    addr_len: u64,
+) -> Result<String, LinuxSysopError> {
+    let mut bytes = read_user_bytes_for_process(process_id, addr_ptr, addr_len)?;
+    parse_sockaddr_un_path(bytes.as_mut_slice())
+}
+
+fn parse_sockaddr_un_path(bytes: &mut [u8]) -> Result<String, LinuxSysopError> {
+    let len = bytes.len();
     if len < size_of::<u16>() || len > size_of::<linux_abi::LinuxSockaddrUn>() {
         return Err(LinuxSysopError::InvalidArgument);
     }
-
-    let mut bytes = vec![0_u8; len];
-    usermem::copy_from_current_user_exact(addr_ptr, &mut bytes)?;
     let family = u16::from_le_bytes([bytes[0], bytes[1]]) as u64;
     if family != linux_abi::AF_UNIX {
         return Err(LinuxSysopError::AddressFamilyNotSupported);
@@ -726,6 +888,36 @@ fn read_sockaddr_un_path(addr_ptr: u64, addr_len: u64) -> Result<String, LinuxSy
     Ok(String::from_utf8_lossy(&path_bytes[..path_len]).into_owned())
 }
 
+fn read_user_bytes_current(addr_ptr: u64, addr_len: u64) -> Result<Vec<u8>, LinuxSysopError> {
+    let len = usize::try_from(addr_len).map_err(|_| LinuxSysopError::InvalidArgument)?;
+    let mut bytes = vec![0_u8; len];
+    usermem::copy_from_current_user_exact(addr_ptr, &mut bytes)?;
+    Ok(bytes)
+}
+
+fn read_user_bytes_for_process(
+    process_id: u64,
+    addr_ptr: u64,
+    addr_len: u64,
+) -> Result<Vec<u8>, LinuxSysopError> {
+    let len = usize::try_from(addr_len).map_err(|_| LinuxSysopError::InvalidArgument)?;
+    let Some(result) = multitask::with_process_state_by_pid_mut(process_id, |process_state| {
+        let mut bytes = vec![0_u8; len];
+        process_state
+            .address_space()
+            .validate_user_read_buffer(VirtAddr::new(addr_ptr), len)
+            .map_err(LinuxSysopError::AddressSpace)?;
+        process_state
+            .address_space()
+            .copy_from_user(VirtAddr::new(addr_ptr), &mut bytes)
+            .map_err(LinuxSysopError::AddressSpace)?;
+        Ok(bytes)
+    }) else {
+        return Err(LinuxSysopError::Unsupported);
+    };
+    result
+}
+
 fn read_sockaddr_in(addr_ptr: u64, addr_len: u64) -> Result<([u8; 4], u16), LinuxSysopError> {
     let len = usize::try_from(addr_len).map_err(|_| LinuxSysopError::InvalidArgument)?;
     if addr_ptr == 0 || len < size_of::<linux_abi::LinuxSockaddrIn>() {
@@ -743,6 +935,102 @@ fn read_sockaddr_in(addr_ptr: u64, addr_len: u64) -> Result<([u8; 4], u16), Linu
         [bytes[4], bytes[5], bytes[6], bytes[7]],
         u16::from_be_bytes([bytes[2], bytes[3]]),
     ))
+}
+
+fn read_sockaddr_in_for_process(
+    process_id: u64,
+    addr_ptr: u64,
+    addr_len: u64,
+) -> Result<([u8; 4], u16), LinuxSysopError> {
+    let len = usize::try_from(addr_len).map_err(|_| LinuxSysopError::InvalidArgument)?;
+    if addr_ptr == 0 || len < size_of::<linux_abi::LinuxSockaddrIn>() {
+        return Err(LinuxSysopError::InvalidArgument);
+    }
+
+    let bytes = read_user_bytes_for_process(
+        process_id,
+        addr_ptr,
+        size_of::<linux_abi::LinuxSockaddrIn>() as u64,
+    )?;
+    let family = u16::from_le_bytes([bytes[0], bytes[1]]) as u64;
+    if family != linux_abi::AF_INET {
+        return Err(LinuxSysopError::AddressFamilyNotSupported);
+    }
+
+    Ok((
+        [bytes[4], bytes[5], bytes[6], bytes[7]],
+        u16::from_be_bytes([bytes[2], bytes[3]]),
+    ))
+}
+
+fn write_accept_address_for_process(
+    process_id: u64,
+    addr_ptr: u64,
+    addr_len_ptr: u64,
+) -> Result<(), LinuxSysopError> {
+    if addr_ptr == 0 {
+        return Ok(());
+    }
+    if addr_len_ptr == 0 {
+        return Err(LinuxSysopError::InvalidArgument);
+    }
+
+    let Some(result) = multitask::with_process_state_by_pid_mut(process_id, |process_state| {
+        let available = read_user_u32_for_process_state(process_state, addr_len_ptr)? as usize;
+        let sockaddr = linux_abi::LinuxSockaddrUn {
+            sun_family: linux_abi::AF_UNIX as u16,
+            ..Default::default()
+        };
+        let sockaddr_bytes = unsafe {
+            slice::from_raw_parts(
+                core::ptr::addr_of!(sockaddr).cast::<u8>(),
+                size_of::<linux_abi::LinuxSockaddrUn>(),
+            )
+        };
+        let write_len = available.min(size_of::<u16>());
+        write_user_bytes_for_process_state(process_state, addr_ptr, &sockaddr_bytes[..write_len])?;
+        write_user_bytes_for_process_state(
+            process_state,
+            addr_len_ptr,
+            &(size_of::<u16>() as u32).to_le_bytes(),
+        )?;
+        Ok(())
+    }) else {
+        return Err(LinuxSysopError::Unsupported);
+    };
+    result
+}
+
+fn read_user_u32_for_process_state(
+    process_state: &mut UserProcessState,
+    user_ptr: u64,
+) -> Result<u32, LinuxSysopError> {
+    let mut bytes = [0_u8; 4];
+    process_state
+        .address_space()
+        .validate_user_read_buffer(VirtAddr::new(user_ptr), bytes.len())
+        .map_err(LinuxSysopError::AddressSpace)?;
+    process_state
+        .address_space()
+        .copy_from_user(VirtAddr::new(user_ptr), &mut bytes)
+        .map_err(LinuxSysopError::AddressSpace)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn write_user_bytes_for_process_state(
+    process_state: &mut UserProcessState,
+    user_ptr: u64,
+    bytes: &[u8],
+) -> Result<(), LinuxSysopError> {
+    process_state
+        .address_space()
+        .validate_user_write_buffer(VirtAddr::new(user_ptr), bytes.len())
+        .map_err(LinuxSysopError::AddressSpace)?;
+    process_state
+        .address_space()
+        .copy_into_user(VirtAddr::new(user_ptr), bytes)
+        .map_err(LinuxSysopError::AddressSpace)?;
+    Ok(())
 }
 
 fn map_inet_error(error: kernel_io_manager::api::network::InetSocketError) -> LinuxSysopError {

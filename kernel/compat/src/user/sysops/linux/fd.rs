@@ -847,13 +847,14 @@ fn poll_revents_for_handle(
                 ..HandleReadiness::default()
             }
         }
-        KernelHandle::Memfd(_) | KernelHandle::VfsFile(_) | KernelHandle::VfsDirectory(_) => {
-            HandleReadiness {
-                readable: true,
-                writable: true,
-                ..HandleReadiness::default()
-            }
-        }
+        KernelHandle::Memfd(_)
+        | KernelHandle::RemoteVfs(_)
+        | KernelHandle::VfsFile(_)
+        | KernelHandle::VfsDirectory(_) => HandleReadiness {
+            readable: true,
+            writable: true,
+            ..HandleReadiness::default()
+        },
         KernelHandle::SharedRegion(_) => HandleReadiness::default(),
         KernelHandle::Epoll(epoll) => {
             if collect_epoll_ready_events(&epoll, 1, console_session).is_empty() {

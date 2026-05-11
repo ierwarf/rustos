@@ -30,9 +30,15 @@ pub mod syscall {
     pub const SYS_RUSTOS_PROC_MAP_ZEROED_BROKER: u64 = 0x5255_001b;
     pub const SYS_RUSTOS_PROC_COMMIT_BROKER: u64 = 0x5255_001c;
     pub const SYS_RUSTOS_PROC_ABORT_BROKER: u64 = 0x5255_001d;
+    pub const SYS_RUSTOS_DEVICE_IOCTL_BROKER: u64 = 0x5255_001e;
+    pub const SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER: u64 = 0x5255_001f;
+    pub const SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER: u64 = 0x5255_0020;
+    pub const SYS_RUSTOS_DRIVER_PROVIDER_ACTIVE_BROKER: u64 = 0x5255_0021;
+    pub const SYS_RUSTOS_NET_BROKER: u64 = 0x5255_0022;
+    pub const SYS_RUSTOS_BLOCK_BROKER: u64 = 0x5255_0023;
 
     pub const IPC_ABI_VERSION: u16 = 1;
-    pub const IPC_MAX_INLINE_BYTES: usize = 4096;
+    pub const IPC_MAX_INLINE_BYTES: usize = 64 * 1024;
     pub const IPC_MAX_TRANSFER_HANDLES: usize = 16;
     pub const IPC_SERVICE_LINUX_SYSCALLD: u64 = 1;
     pub const IPC_SERVICE_VFSD: u64 = 2;
@@ -40,6 +46,18 @@ pub mod syscall {
     pub const IPC_SERVICE_DEVMGRD: u64 = 4;
     pub const IPC_SERVICE_DRIVERD: u64 = 5;
     pub const IPC_SERVICE_LOADERD: u64 = 6;
+    pub const IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY: u64 = 1 << 0;
+    pub const IPC_SERVICE_CAP_VFS_POLICY: u64 = 1 << 1;
+    pub const IPC_SERVICE_CAP_NET_POLICY: u64 = 1 << 2;
+    pub const IPC_SERVICE_CAP_DEVICE_POLICY: u64 = 1 << 3;
+    pub const IPC_SERVICE_CAP_DRIVER_POLICY: u64 = 1 << 4;
+    pub const IPC_SERVICE_CAP_PROCESS_LOADER: u64 = 1 << 5;
+    pub const IPC_SERVICE_CAP_BOOTSTRAP_POLICY: u64 = IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY
+        | IPC_SERVICE_CAP_VFS_POLICY
+        | IPC_SERVICE_CAP_NET_POLICY
+        | IPC_SERVICE_CAP_DEVICE_POLICY
+        | IPC_SERVICE_CAP_DRIVER_POLICY
+        | IPC_SERVICE_CAP_PROCESS_LOADER;
     pub const SYSCALL_OFFLOAD_ABI_VERSION: u16 = 1;
     pub const SYSCALL_OFFLOAD_OP_LINUX_STATX: u16 = 1;
     pub const SYSCALL_OFFLOAD_OP_LINUX_NEWFSTATAT: u16 = 2;
@@ -75,6 +93,45 @@ pub mod syscall {
     pub const SYSCALL_OFFLOAD_OP_DRIVER_LOAD_POLICY: u16 = 64;
     pub const SYSCALL_OFFLOAD_PATH_CAPACITY: usize = 256;
     pub const SYSCALL_OFFLOAD_PAYLOAD_CAPACITY: usize = 0x200;
+    pub const VFS_IPC_ABI_VERSION: u16 = 1;
+    pub const VFS_IPC_OP_OPENAT: u16 = 1;
+    pub const VFS_IPC_OP_CLOSE: u16 = 2;
+    pub const VFS_IPC_OP_DUP: u16 = 3;
+    pub const VFS_IPC_OP_READ: u16 = 4;
+    pub const VFS_IPC_OP_WRITE: u16 = 5;
+    pub const VFS_IPC_OP_PREAD64: u16 = 6;
+    pub const VFS_IPC_OP_LSEEK: u16 = 7;
+    pub const VFS_IPC_OP_FSTAT: u16 = 8;
+    pub const VFS_IPC_OP_FTRUNCATE: u16 = 9;
+    pub const VFS_IPC_OP_GETDENTS64: u16 = 10;
+    pub const VFS_IPC_OP_FCNTL: u16 = 11;
+    pub const VFS_IPC_OP_STATX: u16 = 12;
+    pub const VFS_IPC_OP_NEWFSTATAT: u16 = 13;
+    pub const VFS_IPC_OP_READLINKAT: u16 = 14;
+    pub const VFS_IPC_OP_ACCESS: u16 = 15;
+    pub const VFS_IPC_OP_GETCWD: u16 = 16;
+    pub const VFS_IPC_OP_CHDIR: u16 = 17;
+    pub const VFS_IPC_OP_MKDIR: u16 = 18;
+    pub const VFS_IPC_OP_MOUNT: u16 = 19;
+    pub const VFS_IPC_OP_UMOUNT2: u16 = 20;
+    pub const VFS_IPC_OP_UNLINKAT: u16 = 21;
+    pub const VFS_IPC_OP_POLL_QUERY: u16 = 22;
+    pub const VFS_IPC_OP_LIFECYCLE: u16 = 23;
+    pub const VFS_IPC_PATH_CAPACITY: usize = 512;
+    pub const VFS_IPC_REQUEST_PAYLOAD_CAPACITY: usize = 512;
+    pub const VFS_IPC_PAYLOAD_CAPACITY: usize = 32 * 1024;
+    pub const VFS_IPC_HANDLE_KIND_FILE: u16 = 1;
+    pub const VFS_IPC_HANDLE_KIND_DIR: u16 = 2;
+    pub const VFS_IPC_HANDLE_KIND_DEVICE: u16 = 3;
+    pub const VFS_LIFECYCLE_FORK: u16 = 1;
+    pub const VFS_LIFECYCLE_EXEC_CLOEXEC: u16 = 2;
+    pub const VFS_LIFECYCLE_EXIT: u16 = 3;
+    pub const VFS_LIFECYCLE_DUP: u16 = 4;
+    pub const VFS_LIFECYCLE_CLOSE: u16 = 5;
+    pub const BLOCK_BROKER_ABI_VERSION: u16 = 1;
+    pub const BLOCK_BROKER_OP_BOOT_INFO: u16 = 1;
+    pub const BLOCK_BROKER_OP_BOOT_READ: u16 = 2;
+    pub const BLOCK_BROKER_MAX_IO_BYTES: usize = 64 * 1024;
     pub const LINUX_STAT_SIZE: usize = 0x90;
     pub const LINUX_STATX_SIZE: usize = 0x100;
     pub const LINUX_RLIMIT_SIZE: usize = 0x10;
@@ -88,6 +145,181 @@ pub mod syscall {
     pub const LOADER_SPAWN_ENV_BYTES: usize = 2048;
     pub const LOADER_SPAWN_MAX_ARG_COUNT: usize = 32;
     pub const LOADER_SPAWN_MAX_ENV_COUNT: usize = 64;
+    pub const PROC_BROKER_ABI_VERSION: u16 = 1;
+    pub const PROC_BROKER_FORMAT_ELF64: u16 = 1;
+    pub const PROC_BROKER_FORMAT_PE64: u16 = 2;
+    pub const PROC_BROKER_MAP_READ: u64 = 1 << 0;
+    pub const PROC_BROKER_MAP_WRITE: u64 = 1 << 1;
+    pub const PROC_BROKER_MAP_EXEC: u64 = 1 << 2;
+    pub const PROC_BROKER_MAP_PRIVATE: u64 = 1 << 3;
+    pub const PROC_BROKER_USER_SPACE_BASE: u64 = 1 << 39;
+    pub const PROC_BROKER_USER_SPACE_END_EXCLUSIVE: u64 = 2 << 39;
+    pub const DRIVER_BROKER_NAME_CAPACITY: usize = 64;
+    pub const DRIVER_BROKER_PATH_CAPACITY: usize = 256;
+    pub const DRIVER_BROKER_ALIAS_CAPACITY: usize = 256;
+    pub const DRIVER_CLASS_DISPLAY: u32 = 1;
+    pub const DRIVER_CLASS_INPUT: u32 = 2;
+    pub const DRIVER_CLASS_NETWORK: u32 = 3;
+    pub const DRIVER_BUS_PLATFORM: u32 = 1;
+    pub const DRIVER_BUS_SERIO: u32 = 2;
+    pub const DRIVER_BUS_USB: u32 = 3;
+    pub const DRIVER_BUS_PCI: u32 = 4;
+    pub const DRIVER_BUS_VIRTIO: u32 = 5;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct RustosBlockBrokerArgs {
+        pub abi_version: u16,
+        pub op: u16,
+        pub reserved0: u32,
+        pub lba: u64,
+        pub block_count: u64,
+        pub buffer_ptr: u64,
+        pub buffer_len: u64,
+        pub out_logical_block_size_ptr: u64,
+        pub out_block_count_ptr: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct VfsIpcRequest {
+        pub version: u16,
+        pub op: u16,
+        pub flags: u32,
+        pub pid: u64,
+        pub tid: u64,
+        pub session_handle: u64,
+        pub uid: u32,
+        pub gid: u32,
+        pub euid: u32,
+        pub egid: u32,
+        pub fd: u64,
+        pub dirfd: u64,
+        pub remote_id: u64,
+        pub arg0: u64,
+        pub arg1: u64,
+        pub arg2: u64,
+        pub arg3: u64,
+        pub path_len: u32,
+        pub payload_len: u32,
+        pub path: [u8; VFS_IPC_PATH_CAPACITY],
+        pub payload: [u8; VFS_IPC_REQUEST_PAYLOAD_CAPACITY],
+    }
+
+    impl Default for VfsIpcRequest {
+        fn default() -> Self {
+            Self {
+                version: VFS_IPC_ABI_VERSION,
+                op: VFS_IPC_OP_OPENAT,
+                flags: 0,
+                pid: 0,
+                tid: 0,
+                session_handle: 0,
+                uid: 0,
+                gid: 0,
+                euid: 0,
+                egid: 0,
+                fd: 0,
+                dirfd: 0,
+                remote_id: 0,
+                arg0: 0,
+                arg1: 0,
+                arg2: 0,
+                arg3: 0,
+                path_len: 0,
+                payload_len: 0,
+                path: [0; VFS_IPC_PATH_CAPACITY],
+                payload: [0; VFS_IPC_REQUEST_PAYLOAD_CAPACITY],
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct VfsIpcResponse {
+        pub version: u16,
+        pub op: u16,
+        pub status: i32,
+        pub handle_kind: u16,
+        pub reserved0: u16,
+        pub payload_len: u32,
+        pub remote_id: u64,
+        pub value: u64,
+        pub aux: u64,
+        pub payload: [u8; VFS_IPC_PAYLOAD_CAPACITY],
+    }
+
+    impl Default for VfsIpcResponse {
+        fn default() -> Self {
+            Self {
+                version: VFS_IPC_ABI_VERSION,
+                op: VFS_IPC_OP_OPENAT,
+                status: 0,
+                handle_kind: 0,
+                reserved0: 0,
+                payload_len: 0,
+                remote_id: 0,
+                value: 0,
+                aux: 0,
+                payload: [0; VFS_IPC_PAYLOAD_CAPACITY],
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct RustosDriverLoadModuleBrokerArgs {
+        pub name_ptr: u64,
+        pub name_len: u64,
+        pub class: u32,
+        pub bus: u32,
+        pub path_ptr: u64,
+        pub path_len: u64,
+        pub linux_driver_names_ptr: u64,
+        pub linux_driver_names_len: u64,
+        pub reserved0: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct RustosDriverProbeAliasBrokerArgs {
+        pub alias_ptr: u64,
+        pub alias_len: u64,
+        pub class: u32,
+        pub bus: u32,
+        pub reserved0: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct RustosDriverProviderActiveBrokerArgs {
+        pub provider_group_ptr: u64,
+        pub provider_group_len: u64,
+        pub reserved0: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct RustosDeviceIoctlBrokerArgs {
+        pub process_id: u64,
+        pub fd: u64,
+        pub request: u64,
+        pub arg: u64,
+        pub reserved0: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct RustosNetBrokerArgs {
+        pub process_id: u64,
+        pub op: u16,
+        pub reserved0: u16,
+        pub reserved1: u32,
+        pub arg0: u64,
+        pub arg1: u64,
+        pub arg2: u64,
+        pub arg3: u64,
+    }
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -460,13 +692,16 @@ mod syscall_tests {
         IPC_MAX_INLINE_BYTES, LINUX_RLIMIT_SIZE, LINUX_STATX_SIZE, LINUX_UTSNAME_SIZE, LinuxRlimit,
         LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, LinuxUtsName,
         SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_STATX, SYSCALL_OFFLOAD_PATH_CAPACITY,
-        SYSCALL_OFFLOAD_PAYLOAD_CAPACITY,
+        SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, VFS_IPC_ABI_VERSION, VFS_IPC_OP_OPENAT, VfsIpcRequest,
+        VfsIpcResponse,
     };
 
     #[test]
     fn statx_offload_messages_fit_inline_ipc_v1() {
         assert!(size_of::<LinuxSyscallOffloadRequest>() <= IPC_MAX_INLINE_BYTES);
         assert!(size_of::<LinuxSyscallOffloadResponse>() <= IPC_MAX_INLINE_BYTES);
+        assert!(size_of::<VfsIpcRequest>() <= IPC_MAX_INLINE_BYTES);
+        assert!(size_of::<VfsIpcResponse>() <= IPC_MAX_INLINE_BYTES);
         assert_eq!(LINUX_STATX_SIZE, 0x100);
         assert_eq!(SYSCALL_OFFLOAD_PATH_CAPACITY, 256);
         assert_eq!(SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, 0x200);
@@ -486,6 +721,15 @@ mod syscall_tests {
         assert_eq!(response.op, SYSCALL_OFFLOAD_OP_LINUX_STATX);
         assert_eq!(response.reserved0, 0);
         assert_eq!(response.payload_len, 0);
+
+        let vfs_request = VfsIpcRequest::default();
+        assert_eq!(vfs_request.version, VFS_IPC_ABI_VERSION);
+        assert_eq!(vfs_request.op, VFS_IPC_OP_OPENAT);
+
+        let vfs_response = VfsIpcResponse::default();
+        assert_eq!(vfs_response.version, VFS_IPC_ABI_VERSION);
+        assert_eq!(vfs_response.op, VFS_IPC_OP_OPENAT);
+        assert_eq!(vfs_response.reserved0, 0);
     }
 }
 

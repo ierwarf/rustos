@@ -12,6 +12,7 @@ kernel-ipc-runtime = { path = "../ipc-runtime" }
 kernel-ps = { path = "../ps" }
 nucleus-core = { path = "../nucleus-core" }
 rustos-user-abi = { path = "../../libs/rustos-user-abi" }
+storage-core = { path = "../../libs/storage-core" }
 trace-loc-macro = { path = "../../libs/trace-loc-macro" }
 lazy_static = { version = "1.4", features = ["spin_no_std"] }
 linux-raw-sys = { version = "0.12.1", default-features = false, features = ["no_std", "general", "ioctl", "auxvec", "net"] }

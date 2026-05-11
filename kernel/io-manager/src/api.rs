@@ -164,6 +164,7 @@ fn map_bootstrap_phase(phase: crate::storage::boot_volume::BootstrapPhase) -> Bo
 
 pub mod block {
     use super::{BlockDescriptor, BlockHandle, map_block_descriptor};
+    use storage_core::BlockDevice;
 
     pub fn register_boot_volume_opener() {
         crate::storage::block::register_boot_volume_opener();
@@ -182,6 +183,19 @@ pub mod block {
 
     pub fn lookup(path: &str) -> Option<BlockHandle> {
         crate::storage::block::lookup(path).map(|handle| BlockHandle { id: handle.id() })
+    }
+
+    pub fn boot_volume_descriptor() -> Option<BlockDescriptor> {
+        crate::storage::block::current_boot_volume_handle()
+            .and_then(crate::storage::block::descriptor)
+            .map(map_block_descriptor)
+    }
+
+    pub fn read_boot_volume_blocks(lba: u64, out: &mut [u8]) -> storage_core::IoResult<()> {
+        let handle = crate::storage::block::current_boot_volume_handle()
+            .ok_or(storage_core::StorageError::NotPresent)?;
+        let mut device = crate::storage::block::FatRegistryDevice::new(handle);
+        device.read_blocks(lba, out)
     }
 }
 
@@ -288,6 +302,30 @@ pub mod driver {
 
     pub fn initialize_loadable_modules_for_class(class: DriverClass) -> bool {
         crate::driver::initialize_loadable_modules_for_class(class)
+    }
+
+    pub fn load_module_image_from_policy(
+        name: &'static str,
+        class: u32,
+        bus: u32,
+        image_path: &'static str,
+        linux_driver_names: &'static str,
+    ) -> Result<(), &'static str> {
+        crate::driver::load_module_image_from_policy(
+            name,
+            class,
+            bus,
+            image_path,
+            linux_driver_names,
+        )
+    }
+
+    pub fn device_alias_present_from_policy(alias: &str, class: u32, bus: u32) -> bool {
+        crate::driver::device_alias_present_from_policy(alias, class, bus)
+    }
+
+    pub fn provider_group_active_from_policy(group: &str) -> bool {
+        crate::driver::provider_group_active_from_policy(group)
     }
 
     pub fn init_linux_cpu_local_symbols() {
@@ -574,8 +612,8 @@ pub mod network {
 }
 
 pub use block::{
-    descriptors as block_descriptors, init_block_devices, lookup as lookup_block,
-    register_boot_volume_opener,
+    boot_volume_descriptor, descriptors as block_descriptors, init_block_devices,
+    lookup as lookup_block, read_boot_volume_blocks, register_boot_volume_opener,
 };
 pub use boot::{
     boot_volume_identity, boot_volume_transport_hint, bootstrap_phase, enter_kernel_vfs_runtime,

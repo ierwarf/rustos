@@ -1,9 +1,14 @@
 use super::*;
-use rustos_user_abi::syscall::{SYSCALL_OFFLOAD_OP_LINUX_IOCTL, SYSCALL_OFFLOAD_OP_LINUX_UNLINKAT};
+use rustos_user_abi::syscall::SYSCALL_OFFLOAD_OP_LINUX_UNLINKAT;
 pub(super) fn syscall_linux_write(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
     debug_log_secondary_linux_syscall(|| {
         alloc::format!("write fd={} ptr={:#x} len={}", fd, user_ptr, user_len)
     });
+    match offload_ops::call_remote_vfs_write(fd, user_ptr, user_len) {
+        Ok(Some(written)) => return written,
+        Ok(None) => {}
+        Err(errno) => return linux_errno(errno),
+    }
     match linux_ops::write(fd, user_ptr, user_len) {
         Ok(written) => written as u64,
         Err(err) => {
@@ -49,6 +54,11 @@ pub(super) fn syscall_linux_read(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
     debug_log_secondary_linux_syscall(|| {
         alloc::format!("read fd={} ptr={:#x} len={}", fd, user_ptr, user_len)
     });
+    match offload_ops::call_remote_vfs_read(fd, user_ptr, user_len) {
+        Ok(Some(read)) => return read,
+        Ok(None) => {}
+        Err(errno) => return linux_errno(errno),
+    }
     match linux_ops::read(fd, user_ptr, user_len) {
         Ok(read) => read as u64,
         Err(err) => {
@@ -78,6 +88,11 @@ pub(super) fn syscall_linux_close(fd: u64) -> u64 {
 }
 
 pub(super) fn syscall_linux_ftruncate(fd: u64, len: u64) -> u64 {
+    match offload_ops::call_remote_vfs_ftruncate(fd, len) {
+        Ok(Some(())) => return 0,
+        Ok(None) => {}
+        Err(errno) => return linux_errno(errno),
+    }
     match linux_ops::ftruncate(fd, len) {
         Ok(()) => 0,
         Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
@@ -85,6 +100,11 @@ pub(super) fn syscall_linux_ftruncate(fd: u64, len: u64) -> u64 {
 }
 
 pub(super) fn syscall_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
+    match offload_ops::call_remote_vfs_fstat(fd, stat_ptr) {
+        Ok(Some(())) => return 0,
+        Ok(None) => {}
+        Err(errno) => return linux_errno(errno),
+    }
     match linux_ops::fstat(fd, stat_ptr) {
         Ok(()) => 0,
         Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
@@ -193,6 +213,11 @@ pub(super) fn syscall_linux_dup2(oldfd: u64, newfd: u64) -> u64 {
 }
 
 pub(super) fn syscall_linux_lseek(fd: u64, offset: i64, whence: u64) -> u64 {
+    match offload_ops::call_remote_vfs_lseek(fd, offset, whence) {
+        Ok(Some(position)) => return position,
+        Ok(None) => {}
+        Err(errno) => return linux_errno(errno),
+    }
     match linux_ops::lseek(fd, offset, whence) {
         Ok(position) => position,
         Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
@@ -264,6 +289,12 @@ pub(super) fn syscall_linux_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: 
             Ok(path) => path,
             Err(err) => return linux_errno(linux_sysop_error_to_errno(err)),
         };
+    if absolute_path.starts_with("/dev/") {
+        return match linux_ops::openat(dirfd, path_ptr, flags, mode) {
+            Ok(fd) => fd,
+            Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
+        };
+    }
     let mode = u32::try_from(mode).unwrap_or(u32::MAX);
     match offload_ops::call_vfs_openat_with_fd(dirfd, flags, mode, absolute_path.as_str()) {
         Ok(fd) => fd,
@@ -336,6 +367,11 @@ pub(super) fn syscall_linux_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
 }
 
 pub(super) fn syscall_linux_pread64(fd: u64, user_ptr: u64, user_len: u64, offset: u64) -> u64 {
+    match offload_ops::call_remote_vfs_pread64(fd, user_ptr, user_len, offset) {
+        Ok(Some(read)) => return read,
+        Ok(None) => {}
+        Err(errno) => return linux_errno(errno),
+    }
     match linux_ops::pread64(fd, user_ptr, user_len, offset) {
         Ok(read) => read as u64,
         Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
@@ -343,26 +379,17 @@ pub(super) fn syscall_linux_pread64(fd: u64, user_ptr: u64, user_len: u64, offse
 }
 
 pub(super) fn syscall_linux_ioctl(fd: u64, request: u64, arg: u64) -> u64 {
-    if let Err(errno) = offload_ops::call_service_policy(
-        linux_abi::IPC_SERVICE_DEVMGRD,
-        SYSCALL_OFFLOAD_OP_LINUX_IOCTL,
-        fd,
-        request,
-        u32::try_from(arg).unwrap_or(u32::MAX),
-    ) {
-        return linux_errno(errno);
-    }
-    match linux_ops::ioctl(fd, request, arg) {
+    match offload_ops::call_device_ioctl(fd, request, arg) {
         Ok(value) => value,
-        Err(err) => {
+        Err(errno) => {
             debug::println!(
-                "linux ioctl rejected: fd={} request={:#x} arg={:#x} err={:?}",
+                "linux ioctl rejected: fd={} request={:#x} arg={:#x} errno={}",
                 fd,
                 request,
                 arg,
-                err,
+                errno,
             );
-            linux_errno(linux_sysop_error_to_errno(err))
+            linux_errno(errno)
         }
     }
 }

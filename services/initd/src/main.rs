@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::io::Write;
+use std::mem::size_of;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -9,8 +11,11 @@ use runtime_control::{
     DEFAULT_APPLICATIONS_DIR, DEFAULT_RUNTIME_ENV_REGISTRY_PATH,
 };
 use rustos_user_abi::syscall::{
-    IPC_SERVICE_DEVMGRD, IPC_SERVICE_DRIVERD, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD,
-    IPC_SERVICE_NETD, IPC_SERVICE_VFSD, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
+    LoaderSpawnRequest, LoaderSpawnResponse, IPC_SERVICE_DEVMGRD, IPC_SERVICE_DRIVERD,
+    IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD, IPC_SERVICE_NETD, IPC_SERVICE_VFSD,
+    LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
+    LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, SYS_RUSTOS_IPC_CALL,
+    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
 };
 
 const INITD_EXEC_PATH: &str = "services/initd/initd.elf";
@@ -25,6 +30,7 @@ const STORAGED_EXEC_PATH: &str = "services/storaged/storaged.elf";
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const RETRY_BACKOFF: Duration = Duration::from_secs(1);
 const SYS_RUSTOS_SPAWN_EXEC: libc::c_long = 0x5255_0002;
+static LOADER_ENDPOINT_CACHE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StartupLaunchEntry {
@@ -286,6 +292,10 @@ fn reap_children(
 
 fn spawn_exec(exec_path: &str) -> Result<i32, i32> {
     boot_line(&format!("initd: spawn begin exec={exec_path}"));
+    if exec_path != LOADERD_EXEC_PATH && service_ready(IPC_SERVICE_LOADERD) {
+        return spawn_exec_via_loaderd(exec_path);
+    }
+
     let path = CString::new(exec_path).unwrap_or_else(|_| CString::new("/").unwrap());
     let argv = [path.as_ptr(), std::ptr::null()];
     let env = load_runtime_default_env(DEFAULT_RUNTIME_ENV_REGISTRY_PATH, RuntimeEnvScope::Init)
@@ -311,6 +321,115 @@ fn spawn_exec(exec_path: &str) -> Result<i32, i32> {
     }
     boot_line(&format!("initd: spawn returned exec={exec_path} pid={pid}"));
     Ok(pid)
+}
+
+fn spawn_exec_via_loaderd(exec_path: &str) -> Result<i32, i32> {
+    let argv = [CString::new(exec_path).map_err(|_| libc::EINVAL)?];
+    let env = load_runtime_default_env(DEFAULT_RUNTIME_ENV_REGISTRY_PATH, RuntimeEnvScope::Init)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|value| CString::new(value).ok())
+        .collect::<Vec<_>>();
+    let request = build_loader_spawn_request(exec_path, &argv, &env)?;
+    let endpoint = lookup_loader_endpoint()?;
+    let mut response = LoaderSpawnResponse::default();
+    let call = unsafe {
+        libc::syscall(
+            SYS_RUSTOS_IPC_CALL as libc::c_long,
+            endpoint,
+            (&request as *const LoaderSpawnRequest) as u64,
+            size_of::<LoaderSpawnRequest>() as u64,
+            (&mut response as *mut LoaderSpawnResponse) as u64,
+            size_of::<LoaderSpawnResponse>() as u64,
+        ) as i64
+    };
+    if call < 0 {
+        LOADER_ENDPOINT_CACHE.store(0, Ordering::Relaxed);
+        return Err((-call) as i32);
+    }
+    if call as usize != size_of::<LoaderSpawnResponse>()
+        || response.version != LOADER_REQUEST_ABI_VERSION
+        || response.op != LOADER_OP_SPAWN_EXEC
+    {
+        return Err(libc::EINVAL);
+    }
+    if response.status != 0 {
+        return Err(response.status);
+    }
+    let pid = i32::try_from(response.pid).map_err(|_| libc::EOVERFLOW)?;
+    boot_line(&format!(
+        "initd: loader spawn returned exec={exec_path} pid={pid}"
+    ));
+    Ok(pid)
+}
+
+fn build_loader_spawn_request(
+    exec_path: &str,
+    argv: &[CString],
+    env: &[CString],
+) -> Result<LoaderSpawnRequest, i32> {
+    let exec_bytes = exec_path.as_bytes();
+    if exec_bytes.is_empty()
+        || exec_bytes.len() > LOADER_SPAWN_EXEC_PATH_CAPACITY
+        || exec_bytes.contains(&0)
+    {
+        return Err(libc::EINVAL);
+    }
+    let mut request = LoaderSpawnRequest {
+        version: LOADER_REQUEST_ABI_VERSION,
+        op: LOADER_OP_SPAWN_EXEC,
+        flags: 1,
+        console_session: 0,
+        weight_micros: exec_weight_micros(exec_path),
+        exec_path_len: exec_bytes.len() as u32,
+        argv_count: u16::try_from(argv.len()).map_err(|_| libc::E2BIG)?,
+        env_count: u16::try_from(env.len()).map_err(|_| libc::E2BIG)?,
+        ..LoaderSpawnRequest::default()
+    };
+    request.exec_path[..exec_bytes.len()].copy_from_slice(exec_bytes);
+    request.argv_bytes_len =
+        copy_cstring_blob(argv, &mut request.argv_bytes, LOADER_SPAWN_ARG_BYTES)?;
+    request.env_bytes_len = copy_cstring_blob(env, &mut request.env_bytes, LOADER_SPAWN_ENV_BYTES)?;
+    Ok(request)
+}
+
+fn copy_cstring_blob(values: &[CString], dest: &mut [u8], capacity: usize) -> Result<u32, i32> {
+    let mut offset = 0usize;
+    for value in values {
+        let bytes = value.as_bytes();
+        let next = offset
+            .checked_add(bytes.len())
+            .and_then(|value| value.checked_add(1))
+            .ok_or(libc::E2BIG)?;
+        if next > capacity || next > dest.len() {
+            return Err(libc::E2BIG);
+        }
+        dest[offset..offset + bytes.len()].copy_from_slice(bytes);
+        dest[offset + bytes.len()] = 0;
+        offset = next;
+    }
+    u32::try_from(offset).map_err(|_| libc::E2BIG)
+}
+
+fn lookup_loader_endpoint() -> Result<u64, i32> {
+    let cached = LOADER_ENDPOINT_CACHE.load(Ordering::Relaxed);
+    if cached != 0 {
+        return Ok(cached);
+    }
+    let endpoint = unsafe {
+        libc::syscall(
+            SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT as libc::c_long,
+            IPC_SERVICE_LOADERD,
+        ) as i64
+    };
+    if endpoint < 0 {
+        return Err((-endpoint) as i32);
+    }
+    let endpoint = endpoint as u64;
+    if endpoint != 0 {
+        LOADER_ENDPOINT_CACHE.store(endpoint, Ordering::Relaxed);
+    }
+    Ok(endpoint)
 }
 
 fn exec_weight_micros(exec_path: &str) -> u64 {

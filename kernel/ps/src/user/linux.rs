@@ -1378,6 +1378,16 @@ pub const SYS_RUSTOS_PROC_COMMIT_BROKER: u64 =
     rustos_user_abi::syscall::SYS_RUSTOS_PROC_COMMIT_BROKER;
 pub const SYS_RUSTOS_PROC_ABORT_BROKER: u64 =
     rustos_user_abi::syscall::SYS_RUSTOS_PROC_ABORT_BROKER;
+pub const SYS_RUSTOS_DEVICE_IOCTL_BROKER: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_DEVICE_IOCTL_BROKER;
+pub const SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER;
+pub const SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER;
+pub const SYS_RUSTOS_DRIVER_PROVIDER_ACTIVE_BROKER: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_DRIVER_PROVIDER_ACTIVE_BROKER;
+pub const SYS_RUSTOS_NET_BROKER: u64 = rustos_user_abi::syscall::SYS_RUSTOS_NET_BROKER;
+pub const SYS_RUSTOS_BLOCK_BROKER: u64 = rustos_user_abi::syscall::SYS_RUSTOS_BLOCK_BROKER;
 pub const SYS_RUSTOS_STATX_METADATA: u64 = rustos_user_abi::syscall::SYS_RUSTOS_STATX_METADATA;
 pub const SYS_RUSTOS_STAT_METADATA: u64 = rustos_user_abi::syscall::SYS_RUSTOS_STAT_METADATA;
 pub const SYS_RUSTOS_READLINK_METADATA: u64 =

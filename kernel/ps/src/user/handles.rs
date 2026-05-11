@@ -4,6 +4,7 @@ use crate::user::epoll::EpollHandle;
 use crate::user::linux as linux_abi;
 use crate::user::memfd::MemfdHandle;
 use crate::user::socket::SocketHandle;
+use alloc::string::String;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use kernel_object::api::handle::{
@@ -44,6 +45,7 @@ pub enum KernelHandle {
     Epoll(EpollHandle),
     InetSocket(InetSocketHandle),
     Memfd(MemfdHandle),
+    RemoteVfs(RemoteVfsHandle),
     SharedRegion(KernelSharedRegionHandle),
     Socket(SocketHandle),
     VfsFile(VfsFileHandle),
@@ -57,6 +59,55 @@ pub struct InetSocketHandle {
     domain: u64,
     type_: u64,
     protocol: u64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RemoteVfsHandle {
+    token: u64,
+    remote_id: u64,
+    kind: RemoteVfsHandleKind,
+    path: String,
+    len: u64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum RemoteVfsHandleKind {
+    File,
+    Directory,
+    Device,
+}
+
+impl RemoteVfsHandle {
+    pub fn new(remote_id: u64, kind: RemoteVfsHandleKind, path: String, len: u64) -> Self {
+        static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+        Self {
+            token: NEXT_TOKEN.fetch_add(1, Ordering::Relaxed),
+            remote_id,
+            kind,
+            path,
+            len,
+        }
+    }
+
+    pub const fn token_id(&self) -> u64 {
+        self.token
+    }
+
+    pub const fn remote_id(&self) -> u64 {
+        self.remote_id
+    }
+
+    pub const fn kind(&self) -> RemoteVfsHandleKind {
+        self.kind
+    }
+
+    pub fn path(&self) -> String {
+        self.path.clone()
+    }
+
+    pub const fn len(&self) -> u64 {
+        self.len
+    }
 }
 
 impl InetSocketHandle {
@@ -122,6 +173,7 @@ impl KernelHandle {
             Self::Epoll(epoll) => HandleToken::new(HandleOwner::Compat, epoll.token_id()),
             Self::InetSocket(socket) => HandleToken::new(HandleOwner::Compat, socket.token_id()),
             Self::Memfd(memfd) => HandleToken::new(HandleOwner::Compat, memfd.token_id()),
+            Self::RemoteVfs(remote) => HandleToken::new(HandleOwner::Io, remote.token_id()),
             Self::SharedRegion(region) => HandleToken::new(HandleOwner::Ipc, region.raw()),
             Self::Socket(socket) => HandleToken::new(HandleOwner::Compat, socket.token_id()),
             Self::VfsFile(file) => HandleToken::new(HandleOwner::Io, file.token_id()),
@@ -141,6 +193,7 @@ impl KernelHandle {
             Self::Epoll(_) => "epoll",
             Self::InetSocket(_) => "inet-socket",
             Self::Memfd(_) => "memfd",
+            Self::RemoteVfs(_) => "remote-vfs",
             Self::SharedRegion(_) => "ipc-region",
             Self::Socket(_) => "socket",
             Self::VfsFile(_) => "vfs-file",
@@ -188,6 +241,19 @@ impl KernelHandle {
                     .union(SocketHandleRights::TRANSFER),
             ),
             Self::Memfd(_) => HandleRights::Memfd(file_rights_from_status_flags(status_flags)),
+            Self::RemoteVfs(remote) => match remote.kind() {
+                RemoteVfsHandleKind::File => {
+                    HandleRights::File(file_rights_from_status_flags(status_flags))
+                }
+                RemoteVfsHandleKind::Directory => {
+                    HandleRights::File(FileHandleRights::READ.union(FileHandleRights::TRANSFER))
+                }
+                RemoteVfsHandleKind::Device => HandleRights::File(
+                    FileHandleRights::READ
+                        .union(FileHandleRights::WRITE)
+                        .union(FileHandleRights::TRANSFER),
+                ),
+            },
             Self::SharedRegion(_) => HandleRights::SharedRegion(
                 SharedRegionRights::READ
                     .union(SharedRegionRights::WRITE)
@@ -219,6 +285,7 @@ impl KernelHandle {
                 | Self::VfsFile(_)
                 | Self::VfsDirectory(_)
                 | Self::Device(_)
+                | Self::RemoteVfs(_)
         ) && rights.allows_transfer()
     }
 
@@ -238,6 +305,7 @@ impl KernelHandle {
                 alloc::format!("socket:[rustos-inet:{}]", socket.token_id())
             }
             Self::Memfd(memfd) => memfd.path(),
+            Self::RemoteVfs(remote) => remote.path(),
             Self::Socket(socket) => socket.bound_path().unwrap_or_else(|| {
                 alloc::format!("socket:[rustos-unix-stream:{}]", token.object_id())
             }),

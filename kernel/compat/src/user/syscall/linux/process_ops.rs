@@ -84,7 +84,7 @@ pub(super) fn syscall_linux_rustos_spawn_exec(
     weight_micros: u64,
 ) -> u64 {
     if ipc_ops::service_endpoint(linux_abi::IPC_SERVICE_LOADERD).is_some()
-        && !current_process_may_use_legacy_spawn_exec()
+        && !current_process_has_loader_broker_capability()
     {
         return linux_errno(LINUX_EACCES);
     }
@@ -114,17 +114,10 @@ pub(super) fn syscall_linux_rustos_spawn_exec(
     }
 }
 
-fn current_process_may_use_legacy_spawn_exec() -> bool {
-    multitask::with_current_user_process_state(|_, _, process_state| {
-        let exec_path = process_state.exec_path();
-        process_path_is(exec_path, "services/initd/initd.elf")
-            || process_path_is(exec_path, "services/loaderd/loaderd.elf")
-    })
-    .unwrap_or(false)
-}
-
-fn process_path_is(actual: &str, expected: &str) -> bool {
-    actual == expected || actual.strip_prefix('/') == Some(expected)
+fn current_process_has_loader_broker_capability() -> bool {
+    ipc_ops::current_process_has_service_capability(
+        rustos_user_abi::syscall::IPC_SERVICE_CAP_PROCESS_LOADER,
+    )
 }
 
 fn apply_exec_transition_to_frame(

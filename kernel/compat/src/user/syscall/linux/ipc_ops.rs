@@ -13,6 +13,10 @@ const MAX_PENDING_TRANSFER_OBJECTS: usize = 1024;
 static LINUX_SYSCALL_ENDPOINT: AtomicU64 = AtomicU64::new(0);
 static SERVICE_ENDPOINTS: [AtomicU64; MAX_SERVICE_ENDPOINTS] =
     [const { AtomicU64::new(0) }; MAX_SERVICE_ENDPOINTS];
+static SERVICE_ENDPOINT_OWNERS: [AtomicU64; MAX_SERVICE_ENDPOINTS] =
+    [const { AtomicU64::new(0) }; MAX_SERVICE_ENDPOINTS];
+static SERVICE_ENDPOINT_CAPS: [AtomicU64; MAX_SERVICE_ENDPOINTS] =
+    [const { AtomicU64::new(0) }; MAX_SERVICE_ENDPOINTS];
 static NEXT_TRANSFER_ID: AtomicU64 = AtomicU64::new(1);
 
 lazy_static! {
@@ -41,6 +45,12 @@ pub(super) fn is_linux_rustos_ipc_syscall(syscall_number: u64) -> bool {
             | linux_abi::SYS_RUSTOS_PROC_MAP_ZEROED_BROKER
             | linux_abi::SYS_RUSTOS_PROC_COMMIT_BROKER
             | linux_abi::SYS_RUSTOS_PROC_ABORT_BROKER
+            | linux_abi::SYS_RUSTOS_DEVICE_IOCTL_BROKER
+            | linux_abi::SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER
+            | linux_abi::SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER
+            | linux_abi::SYS_RUSTOS_DRIVER_PROVIDER_ACTIVE_BROKER
+            | linux_abi::SYS_RUSTOS_NET_BROKER
+            | linux_abi::SYS_RUSTOS_BLOCK_BROKER
             | linux_abi::SYS_RUSTOS_IPC_REGISTER_LINUX_SYSCALL_ENDPOINT
             | linux_abi::SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT
             | linux_abi::SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT
@@ -111,6 +121,22 @@ pub(super) fn dispatch_linux_rustos_ipc_syscall(frame: &SyscallFrame) -> u64 {
         linux_abi::SYS_RUSTOS_PROC_ABORT_BROKER => {
             offload_ops::syscall_linux_rustos_proc_abort_broker(frame.rdi)
         }
+        linux_abi::SYS_RUSTOS_DEVICE_IOCTL_BROKER => {
+            offload_ops::syscall_linux_rustos_device_ioctl_broker(frame.rdi)
+        }
+        linux_abi::SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER => {
+            offload_ops::syscall_linux_rustos_driver_load_module_broker(frame.rdi)
+        }
+        linux_abi::SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER => {
+            offload_ops::syscall_linux_rustos_driver_probe_alias_broker(frame.rdi)
+        }
+        linux_abi::SYS_RUSTOS_DRIVER_PROVIDER_ACTIVE_BROKER => {
+            offload_ops::syscall_linux_rustos_driver_provider_active_broker(frame.rdi)
+        }
+        linux_abi::SYS_RUSTOS_NET_BROKER => offload_ops::syscall_linux_rustos_net_broker(frame.rdi),
+        linux_abi::SYS_RUSTOS_BLOCK_BROKER => {
+            offload_ops::syscall_linux_rustos_block_broker(frame.rdi)
+        }
         linux_abi::SYS_RUSTOS_IPC_REGISTER_LINUX_SYSCALL_ENDPOINT => {
             syscall_linux_rustos_ipc_register_linux_syscall_endpoint(frame.rdi)
         }
@@ -155,6 +181,42 @@ pub(super) fn service_endpoint(service_id: u64) -> Option<KernelEndpointHandle> 
     (raw != 0).then_some(KernelEndpointHandle::from_raw(raw))
 }
 
+pub(super) fn service_registered(service_id: u64) -> bool {
+    service_endpoint_raw(service_id).is_some_and(|raw| raw != 0)
+}
+
+pub(super) fn current_process_has_service_capability(capability: u64) -> bool {
+    if capability == 0 {
+        return false;
+    }
+    let Some(process_id) = multitask::current_user_process_id() else {
+        return false;
+    };
+    SERVICE_ENDPOINT_OWNERS
+        .iter()
+        .zip(SERVICE_ENDPOINT_CAPS.iter())
+        .any(|(owner, caps)| {
+            owner.load(Ordering::Acquire) == process_id
+                && caps.load(Ordering::Acquire) & capability == capability
+        })
+}
+
+pub(super) fn current_process_has_any_service_capability(capability_mask: u64) -> bool {
+    if capability_mask == 0 {
+        return false;
+    }
+    let Some(process_id) = multitask::current_user_process_id() else {
+        return false;
+    };
+    SERVICE_ENDPOINT_OWNERS
+        .iter()
+        .zip(SERVICE_ENDPOINT_CAPS.iter())
+        .any(|(owner, caps)| {
+            owner.load(Ordering::Acquire) == process_id
+                && caps.load(Ordering::Acquire) & capability_mask != 0
+        })
+}
+
 fn service_endpoint_raw(service_id: u64) -> Option<u64> {
     service_index(service_id).map(|index| SERVICE_ENDPOINTS[index].load(Ordering::Acquire))
 }
@@ -185,13 +247,24 @@ pub(super) fn syscall_linux_rustos_ipc_register_linux_syscall_endpoint(endpoint:
     if endpoint == 0 {
         return linux_errno(LINUX_EINVAL);
     }
+    let Some(process_id) = multitask::current_user_process_id() else {
+        return linux_errno(LINUX_EINVAL);
+    };
     LINUX_SYSCALL_ENDPOINT.store(endpoint, Ordering::Release);
     SERVICE_ENDPOINTS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
         .store(endpoint, Ordering::Release);
+    SERVICE_ENDPOINT_OWNERS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
+        .store(process_id, Ordering::Release);
+    SERVICE_ENDPOINT_CAPS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize].store(
+        rustos_user_abi::syscall::IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY,
+        Ordering::Release,
+    );
     debug::println!(
-        "ipc service registered: service={} endpoint={}",
+        "ipc service registered: service={} endpoint={} owner={} caps={:#x}",
         linux_abi::IPC_SERVICE_LINUX_SYSCALLD,
-        endpoint
+        endpoint,
+        process_id,
+        rustos_user_abi::syscall::IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY
     );
     0
 }
@@ -203,17 +276,41 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
     let Some(index) = service_index(service_id) else {
         return linux_errno(LINUX_EINVAL);
     };
+    let Some(process_id) = multitask::current_user_process_id() else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    let capability = service_capability(service_id);
     SERVICE_ENDPOINTS[index].store(endpoint, Ordering::Release);
     if endpoint == 0 {
+        SERVICE_ENDPOINT_OWNERS[index].store(0, Ordering::Release);
+        SERVICE_ENDPOINT_CAPS[index].store(0, Ordering::Release);
         debug::println!("ipc service revoked: service={}", service_id);
     } else {
+        SERVICE_ENDPOINT_OWNERS[index].store(process_id, Ordering::Release);
+        SERVICE_ENDPOINT_CAPS[index].store(capability, Ordering::Release);
         debug::println!(
-            "ipc service registered: service={} endpoint={}",
+            "ipc service registered: service={} endpoint={} owner={} caps={:#x}",
             service_id,
-            endpoint
+            endpoint,
+            process_id,
+            capability
         );
     }
     0
+}
+
+fn service_capability(service_id: u64) -> u64 {
+    match service_id {
+        linux_abi::IPC_SERVICE_LINUX_SYSCALLD => {
+            rustos_user_abi::syscall::IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY
+        }
+        linux_abi::IPC_SERVICE_VFSD => rustos_user_abi::syscall::IPC_SERVICE_CAP_VFS_POLICY,
+        linux_abi::IPC_SERVICE_NETD => rustos_user_abi::syscall::IPC_SERVICE_CAP_NET_POLICY,
+        linux_abi::IPC_SERVICE_DEVMGRD => rustos_user_abi::syscall::IPC_SERVICE_CAP_DEVICE_POLICY,
+        linux_abi::IPC_SERVICE_DRIVERD => rustos_user_abi::syscall::IPC_SERVICE_CAP_DRIVER_POLICY,
+        linux_abi::IPC_SERVICE_LOADERD => rustos_user_abi::syscall::IPC_SERVICE_CAP_PROCESS_LOADER,
+        _ => 0,
+    }
 }
 
 pub(super) fn syscall_linux_rustos_ipc_lookup_service_endpoint(service_id: u64) -> u64 {

@@ -4,12 +4,13 @@ use std::thread;
 use std::time::Duration;
 
 use rustos_user_abi::syscall::{
-    LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, IPC_SERVICE_NETD,
+    LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, RustosNetBrokerArgs, IPC_SERVICE_NETD,
     SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_ACCEPT, SYSCALL_OFFLOAD_OP_LINUX_BIND,
     SYSCALL_OFFLOAD_OP_LINUX_CONNECT, SYSCALL_OFFLOAD_OP_LINUX_LISTEN,
     SYSCALL_OFFLOAD_OP_LINUX_SOCKET, SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR,
     SYSCALL_OFFLOAD_PATH_CAPACITY, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
     SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
+    SYS_RUSTOS_NET_BROKER,
 };
 
 const RECV_BACKOFF: Duration = Duration::from_millis(10);
@@ -63,9 +64,10 @@ fn serve(endpoint: u64) {
             op: request.op,
             ..LinuxSyscallOffloadResponse::default()
         };
-        response.status = validate_request(received as usize, &request)
-            .err()
-            .unwrap_or(0);
+        response.status = match validate_request(received as usize, &request) {
+            Ok(()) => dispatch_request(&request, &mut response),
+            Err(errno) => errno,
+        };
         let reply = syscall3(
             SYS_RUSTOS_IPC_REPLY,
             reply_cap,
@@ -76,6 +78,33 @@ fn serve(endpoint: u64) {
             let _ = writeln!(std::io::stderr(), "netd: reply failed errno={}", -reply);
         }
     }
+}
+
+fn dispatch_request(
+    request: &LinuxSyscallOffloadRequest,
+    response: &mut LinuxSyscallOffloadResponse,
+) -> i32 {
+    let args = RustosNetBrokerArgs {
+        process_id: request.pid,
+        op: request.op,
+        reserved0: 0,
+        reserved1: 0,
+        arg0: request.dirfd,
+        arg1: request.flags,
+        arg2: request.arg0,
+        arg3: request.arg1,
+    };
+    let result = syscall1(
+        SYS_RUSTOS_NET_BROKER,
+        (&args as *const RustosNetBrokerArgs) as u64,
+    );
+    if result < 0 {
+        return (-result) as i32;
+    }
+    let bytes = (result as u64).to_le_bytes();
+    response.payload[..bytes.len()].copy_from_slice(&bytes);
+    response.payload_len = bytes.len() as u32;
+    0
 }
 
 fn validate_request(received: usize, request: &LinuxSyscallOffloadRequest) -> Result<(), i32> {
@@ -99,6 +128,10 @@ fn validate_request(received: usize, request: &LinuxSyscallOffloadRequest) -> Re
 
 fn syscall0(number: u64) -> i64 {
     unsafe { libc::syscall(number as libc::c_long) as i64 }
+}
+
+fn syscall1(number: u64, arg0: u64) -> i64 {
+    unsafe { libc::syscall(number as libc::c_long, arg0) as i64 }
 }
 
 fn syscall2(number: u64, arg0: u64, arg1: u64) -> i64 {

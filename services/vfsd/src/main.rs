@@ -1,12 +1,13 @@
-use std::ffi::CString;
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::mem::size_of;
 use std::thread;
 use std::time::Duration;
 
 use rustos_user_abi::syscall::{
-    IpcReplyWithHandlesArgs, LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse,
-    RustosVfsMountBrokerArgs, IPC_SERVICE_VFSD, LINUX_STATX_SIZE, LINUX_STAT_SIZE,
+    RustosBlockBrokerArgs, VfsIpcRequest, VfsIpcResponse, BLOCK_BROKER_ABI_VERSION,
+    BLOCK_BROKER_MAX_IO_BYTES, BLOCK_BROKER_OP_BOOT_INFO, BLOCK_BROKER_OP_BOOT_READ,
+    IPC_MAX_INLINE_BYTES, IPC_SERVICE_VFSD, LINUX_STATX_SIZE, LINUX_STAT_SIZE,
     SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_ACCESS, SYSCALL_OFFLOAD_OP_LINUX_CHDIR,
     SYSCALL_OFFLOAD_OP_LINUX_CLOSE, SYSCALL_OFFLOAD_OP_LINUX_DUP, SYSCALL_OFFLOAD_OP_LINUX_FCNTL,
     SYSCALL_OFFLOAD_OP_LINUX_GETCWD, SYSCALL_OFFLOAD_OP_LINUX_GETDENTS64,
@@ -14,19 +15,31 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_OP_LINUX_NEWFSTATAT, SYSCALL_OFFLOAD_OP_LINUX_OPENAT,
     SYSCALL_OFFLOAD_OP_LINUX_READLINKAT, SYSCALL_OFFLOAD_OP_LINUX_STATX,
     SYSCALL_OFFLOAD_OP_LINUX_UMOUNT2, SYSCALL_OFFLOAD_OP_LINUX_UNLINKAT,
-    SYSCALL_OFFLOAD_PATH_CAPACITY, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, SYS_RUSTOS_ACCESS_METADATA,
-    SYS_RUSTOS_CHDIR_METADATA, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_FD_CLOSE_BROKER,
-    SYS_RUSTOS_FD_DUP_BROKER, SYS_RUSTOS_FD_FCNTL_BROKER, SYS_RUSTOS_FD_GETDENTS64_BROKER,
-    SYS_RUSTOS_GETCWD_METADATA, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV,
-    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
-    SYS_RUSTOS_IPC_REPLY_WITH_HANDLES, SYS_RUSTOS_READLINK_METADATA, SYS_RUSTOS_STATX_METADATA,
-    SYS_RUSTOS_STAT_METADATA, SYS_RUSTOS_VFS_MOUNT_BROKER, SYS_RUSTOS_VFS_UMOUNT_BROKER,
+    SYSCALL_OFFLOAD_PATH_CAPACITY, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, SYS_RUSTOS_BLOCK_BROKER,
+    SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV,
+    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY, VFS_IPC_ABI_VERSION,
+    VFS_IPC_HANDLE_KIND_DEVICE, VFS_IPC_HANDLE_KIND_DIR, VFS_IPC_HANDLE_KIND_FILE,
+    VFS_IPC_OP_ACCESS, VFS_IPC_OP_CHDIR, VFS_IPC_OP_CLOSE, VFS_IPC_OP_DUP, VFS_IPC_OP_FCNTL,
+    VFS_IPC_OP_FSTAT, VFS_IPC_OP_FTRUNCATE, VFS_IPC_OP_GETCWD, VFS_IPC_OP_GETDENTS64,
+    VFS_IPC_OP_LSEEK, VFS_IPC_OP_MKDIR, VFS_IPC_OP_MOUNT, VFS_IPC_OP_NEWFSTATAT, VFS_IPC_OP_OPENAT,
+    VFS_IPC_OP_PREAD64, VFS_IPC_OP_READ, VFS_IPC_OP_READLINKAT, VFS_IPC_OP_STATX,
+    VFS_IPC_OP_UMOUNT2, VFS_IPC_OP_UNLINKAT, VFS_IPC_OP_WRITE, VFS_IPC_PATH_CAPACITY,
+    VFS_IPC_PAYLOAD_CAPACITY, VFS_IPC_REQUEST_PAYLOAD_CAPACITY,
 };
+use storage_core::{BlockDevice, IoResult, StorageError};
+use storage_fat::{FatDirEntry, FatNodeKind, FatVolume};
 
 const RECV_BACKOFF: Duration = Duration::from_millis(10);
-const DUP_MODE_DUP: u64 = 0;
-const DUP_MODE_DUP2: u64 = 1;
-const DUP_MODE_DUP3: u64 = 2;
+const DEFAULT_BLOCK_SIZE: u64 = 4096;
+const DT_REG: u8 = 8;
+const DT_DIR: u8 = 4;
+const DT_CHR: u8 = 2;
+const S_IFREG: u32 = 0o100000;
+const S_IFDIR: u32 = 0o040000;
+const S_IFCHR: u32 = 0o020000;
+const BOOT_FILE_MODE_BITS: u32 = S_IFREG | 0o444;
+const BOOT_DIRECTORY_MODE_BITS: u32 = S_IFDIR | 0o555;
+const DEVICE_FILE_MODE_BITS: u32 = S_IFCHR | 0o600;
 
 fn main() {
     let endpoint = syscall0(SYS_RUSTOS_IPC_ENDPOINT_CREATE);
@@ -57,14 +70,15 @@ fn main() {
 }
 
 fn serve(endpoint: u64) {
+    let mut state = VfsState::new();
     loop {
-        let mut request = LinuxSyscallOffloadRequest::default();
+        let mut request = [0_u8; IPC_MAX_INLINE_BYTES];
         let mut reply_cap = 0_u64;
         let received = syscall4(
             SYS_RUSTOS_IPC_RECV,
             endpoint,
-            (&mut request as *mut LinuxSyscallOffloadRequest) as u64,
-            size_of::<LinuxSyscallOffloadRequest>() as u64,
+            request.as_mut_ptr() as u64,
+            request.len() as u64,
             (&mut reply_cap as *mut u64) as u64,
         );
         if received < 0 {
@@ -72,449 +86,1203 @@ fn serve(endpoint: u64) {
             continue;
         }
 
-        let mut response = LinuxSyscallOffloadResponse::default();
-        let reply_fd = handle_request(received as usize, &request, &mut response);
-        let reply = reply_response(reply_cap, &response, reply_fd);
-        if let Some(fd) = reply_fd {
-            let _ = unsafe { libc::close(fd) };
-        }
+        let reply = if received as usize == size_of::<VfsIpcRequest>() {
+            let request = read_unaligned::<VfsIpcRequest>(&request);
+            let response = state.handle_vfs_request(&request);
+            reply_bytes(reply_cap, as_bytes(&response))
+        } else if received as usize == size_of::<LinuxSyscallOffloadRequest>() {
+            let request = read_unaligned::<LinuxSyscallOffloadRequest>(&request);
+            let response = state.handle_linux_request(&request);
+            reply_bytes(reply_cap, as_bytes(&response))
+        } else {
+            let response = LinuxSyscallOffloadResponse {
+                status: libc::EINVAL,
+                ..LinuxSyscallOffloadResponse::default()
+            };
+            reply_bytes(reply_cap, as_bytes(&response))
+        };
         if reply < 0 {
             let _ = writeln!(std::io::stderr(), "vfsd: reply failed errno={}", -reply);
         }
     }
 }
 
-fn handle_request(
-    received: usize,
-    request: &LinuxSyscallOffloadRequest,
-    response: &mut LinuxSyscallOffloadResponse,
-) -> Option<i32> {
-    response.op = request.op;
-    if let Err(errno) = validate_request(received, request) {
-        response.status = errno;
-        return None;
+struct VfsState {
+    volume: Option<FatVolume<BootBlockDevice>>,
+    cwd: BTreeMap<u64, String>,
+    handles: BTreeMap<u64, RemoteHandle>,
+    file_cache: BTreeMap<String, Vec<u8>>,
+    next_handle: u64,
+    mount_generation: u64,
+}
+
+#[derive(Clone)]
+struct RemoteHandle {
+    kind: RemoteKind,
+    path: String,
+    cursor: u64,
+    len: u64,
+    refs: u64,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RemoteKind {
+    File,
+    Directory,
+    Device,
+}
+
+#[derive(Clone, Copy)]
+struct Metadata {
+    kind: RemoteKind,
+    len: u64,
+    inode: u64,
+}
+
+impl VfsState {
+    fn new() -> Self {
+        Self {
+            volume: None,
+            cwd: BTreeMap::new(),
+            handles: BTreeMap::new(),
+            file_cache: BTreeMap::new(),
+            next_handle: 1,
+            mount_generation: 1,
+        }
     }
 
-    let reply_fd = match request.op {
-        SYSCALL_OFFLOAD_OP_LINUX_STATX => {
-            handle_statx(request, response);
-            None
+    fn handle_linux_request(
+        &mut self,
+        request: &LinuxSyscallOffloadRequest,
+    ) -> LinuxSyscallOffloadResponse {
+        let mut response = LinuxSyscallOffloadResponse {
+            op: request.op,
+            ..LinuxSyscallOffloadResponse::default()
+        };
+        if let Err(errno) = validate_linux_request(request) {
+            response.status = errno;
+            return response;
         }
-        SYSCALL_OFFLOAD_OP_LINUX_NEWFSTATAT => {
-            handle_newfstatat(request, response);
-            None
+        match request.op {
+            SYSCALL_OFFLOAD_OP_LINUX_STATX => self.linux_statx(request, &mut response),
+            SYSCALL_OFFLOAD_OP_LINUX_NEWFSTATAT => self.linux_newfstatat(request, &mut response),
+            SYSCALL_OFFLOAD_OP_LINUX_READLINKAT => self.linux_readlinkat(request, &mut response),
+            SYSCALL_OFFLOAD_OP_LINUX_ACCESS => self.linux_access(request, &mut response),
+            SYSCALL_OFFLOAD_OP_LINUX_GETCWD => self.linux_getcwd(request, &mut response),
+            SYSCALL_OFFLOAD_OP_LINUX_CHDIR => self.linux_chdir(request, &mut response),
+            SYSCALL_OFFLOAD_OP_LINUX_MKDIR => self.linux_mkdir(request, &mut response),
+            SYSCALL_OFFLOAD_OP_LINUX_OPENAT => self.linux_openat(request, &mut response),
+            SYSCALL_OFFLOAD_OP_LINUX_GETDENTS64 => self.linux_getdents64(request, &mut response),
+            SYSCALL_OFFLOAD_OP_LINUX_CLOSE => self.linux_close(request, &mut response),
+            SYSCALL_OFFLOAD_OP_LINUX_DUP => self.linux_dup(request, &mut response),
+            SYSCALL_OFFLOAD_OP_LINUX_FCNTL => self.linux_fcntl(request, &mut response),
+            SYSCALL_OFFLOAD_OP_LINUX_MOUNT => self.linux_mount(&mut response),
+            SYSCALL_OFFLOAD_OP_LINUX_UMOUNT2 => self.linux_umount2(&mut response),
+            SYSCALL_OFFLOAD_OP_LINUX_UNLINKAT => self.linux_unlinkat(request, &mut response),
+            _ => response.status = libc::EINVAL,
         }
-        SYSCALL_OFFLOAD_OP_LINUX_READLINKAT => {
-            handle_readlinkat(request, response);
-            None
+        response
+    }
+
+    fn handle_vfs_request(&mut self, request: &VfsIpcRequest) -> VfsIpcResponse {
+        let mut response = VfsIpcResponse {
+            op: request.op,
+            ..VfsIpcResponse::default()
+        };
+        if let Err(errno) = validate_vfs_request(request) {
+            response.status = errno;
+            return response;
         }
-        SYSCALL_OFFLOAD_OP_LINUX_ACCESS => {
-            handle_access(request, response);
-            None
+        match request.op {
+            VFS_IPC_OP_OPENAT => self.vfs_openat(request, &mut response),
+            VFS_IPC_OP_CLOSE => self.vfs_close(request, &mut response),
+            VFS_IPC_OP_DUP => self.vfs_dup(request, &mut response),
+            VFS_IPC_OP_READ => self.vfs_read(request, &mut response, None),
+            VFS_IPC_OP_PREAD64 => self.vfs_read(request, &mut response, Some(request.arg0)),
+            VFS_IPC_OP_WRITE => response.status = libc::EROFS,
+            VFS_IPC_OP_LSEEK => self.vfs_lseek(request, &mut response),
+            VFS_IPC_OP_FSTAT => self.vfs_fstat(request, &mut response),
+            VFS_IPC_OP_FTRUNCATE => response.status = libc::EROFS,
+            VFS_IPC_OP_GETDENTS64 => self.vfs_getdents64(request, &mut response),
+            VFS_IPC_OP_FCNTL => self.vfs_fcntl(request, &mut response),
+            VFS_IPC_OP_STATX => self.vfs_path_statx(request, &mut response),
+            VFS_IPC_OP_NEWFSTATAT => self.vfs_path_stat(request, &mut response),
+            VFS_IPC_OP_READLINKAT => response.status = libc::ENOENT,
+            VFS_IPC_OP_ACCESS => self.vfs_access(request, &mut response),
+            VFS_IPC_OP_GETCWD => self.vfs_getcwd(request, &mut response),
+            VFS_IPC_OP_CHDIR => self.vfs_chdir(request, &mut response),
+            VFS_IPC_OP_MKDIR => self.vfs_mkdir(request, &mut response),
+            VFS_IPC_OP_MOUNT => self.linux_mount_vfs(&mut response),
+            VFS_IPC_OP_UMOUNT2 => self.linux_umount_vfs(&mut response),
+            VFS_IPC_OP_UNLINKAT => self.vfs_unlinkat(request, &mut response),
+            _ => response.status = libc::EINVAL,
         }
-        SYSCALL_OFFLOAD_OP_LINUX_GETCWD => {
-            handle_getcwd(request, response);
-            None
-        }
-        SYSCALL_OFFLOAD_OP_LINUX_CHDIR => {
-            handle_chdir(request, response);
-            None
-        }
-        SYSCALL_OFFLOAD_OP_LINUX_MKDIR => {
-            handle_mkdir(request, response);
-            None
-        }
-        SYSCALL_OFFLOAD_OP_LINUX_OPENAT => handle_openat(request, response),
-        SYSCALL_OFFLOAD_OP_LINUX_CLOSE => {
-            handle_close(request, response);
-            None
-        }
-        SYSCALL_OFFLOAD_OP_LINUX_DUP => {
-            handle_dup(request, response);
-            None
-        }
-        SYSCALL_OFFLOAD_OP_LINUX_GETDENTS64 => {
-            handle_getdents64(request, response);
-            None
-        }
-        SYSCALL_OFFLOAD_OP_LINUX_FCNTL => {
-            handle_fcntl(request, response);
-            None
-        }
-        SYSCALL_OFFLOAD_OP_LINUX_MOUNT => {
-            handle_mount(request, response);
-            None
-        }
-        SYSCALL_OFFLOAD_OP_LINUX_UMOUNT2 => {
-            handle_umount2(request, response);
-            None
-        }
-        SYSCALL_OFFLOAD_OP_LINUX_UNLINKAT => {
-            handle_policy_allow(response);
-            None
-        }
-        _ => {
+        response
+    }
+
+    fn linux_statx(
+        &mut self,
+        request: &LinuxSyscallOffloadRequest,
+        response: &mut LinuxSyscallOffloadResponse,
+    ) {
+        let Some(path) = linux_request_path(request) else {
             response.status = libc::EINVAL;
-            None
+            return;
+        };
+        match self.metadata(path) {
+            Ok(metadata) => {
+                let statx = build_linux_statx(metadata);
+                response.payload_len = LINUX_STATX_SIZE as u32;
+                response.payload[..LINUX_STATX_SIZE].copy_from_slice(&statx);
+            }
+            Err(errno) => response.status = errno,
         }
-    };
-    reply_fd
-}
-
-fn handle_statx(request: &LinuxSyscallOffloadRequest, response: &mut LinuxSyscallOffloadResponse) {
-    let mut statx = [0_u8; LINUX_STATX_SIZE];
-    let status = syscall4(
-        SYS_RUSTOS_STATX_METADATA,
-        request.path.as_ptr() as u64,
-        request.path_len as u64,
-        request.mask as u64,
-        statx.as_mut_ptr() as u64,
-    );
-    if status < 0 {
-        response.status = (-status) as i32;
-        return;
     }
 
-    response.status = 0;
-    response.payload_len = LINUX_STATX_SIZE as u32;
-    response.payload[..LINUX_STATX_SIZE].copy_from_slice(&statx);
-}
-
-fn handle_newfstatat(
-    request: &LinuxSyscallOffloadRequest,
-    response: &mut LinuxSyscallOffloadResponse,
-) {
-    let mut stat = [0_u8; LINUX_STAT_SIZE];
-    let status = syscall3(
-        SYS_RUSTOS_STAT_METADATA,
-        request.path.as_ptr() as u64,
-        request.path_len as u64,
-        stat.as_mut_ptr() as u64,
-    );
-    if status < 0 {
-        response.status = (-status) as i32;
-        return;
+    fn linux_newfstatat(
+        &mut self,
+        request: &LinuxSyscallOffloadRequest,
+        response: &mut LinuxSyscallOffloadResponse,
+    ) {
+        let Some(path) = linux_request_path(request) else {
+            response.status = libc::EINVAL;
+            return;
+        };
+        match self.metadata(path) {
+            Ok(metadata) => {
+                let stat = build_linux_stat(metadata);
+                response.payload_len = LINUX_STAT_SIZE as u32;
+                response.payload[..LINUX_STAT_SIZE].copy_from_slice(&stat);
+            }
+            Err(errno) => response.status = errno,
+        }
     }
 
-    response.status = 0;
-    response.payload_len = LINUX_STAT_SIZE as u32;
-    response.payload[..LINUX_STAT_SIZE].copy_from_slice(&stat);
-}
-
-fn handle_readlinkat(
-    request: &LinuxSyscallOffloadRequest,
-    response: &mut LinuxSyscallOffloadResponse,
-) {
-    let out_len = (request.mask as usize).min(SYSCALL_OFFLOAD_PAYLOAD_CAPACITY);
-    let status = syscall4(
-        SYS_RUSTOS_READLINK_METADATA,
-        request.path.as_ptr() as u64,
-        request.path_len as u64,
-        response.payload.as_mut_ptr() as u64,
-        out_len as u64,
-    );
-    if status < 0 {
-        response.status = (-status) as i32;
-        return;
+    fn linux_readlinkat(
+        &mut self,
+        _request: &LinuxSyscallOffloadRequest,
+        response: &mut LinuxSyscallOffloadResponse,
+    ) {
+        response.status = libc::ENOENT;
     }
 
-    response.status = 0;
-    response.payload_len = status as u32;
-}
-
-fn handle_access(request: &LinuxSyscallOffloadRequest, response: &mut LinuxSyscallOffloadResponse) {
-    let status = syscall4(
-        SYS_RUSTOS_ACCESS_METADATA,
-        request.path.as_ptr() as u64,
-        request.path_len as u64,
-        request.mask as u64,
-        request.pid,
-    );
-    if status < 0 {
-        response.status = (-status) as i32;
-        return;
+    fn linux_access(
+        &mut self,
+        request: &LinuxSyscallOffloadRequest,
+        response: &mut LinuxSyscallOffloadResponse,
+    ) {
+        let Some(path) = linux_request_path(request) else {
+            response.status = libc::EINVAL;
+            return;
+        };
+        response.status = match self.metadata(path) {
+            Ok(_) => 0,
+            Err(errno) => errno,
+        };
     }
 
-    response.status = 0;
-    response.payload_len = 0;
-}
-
-fn handle_getcwd(request: &LinuxSyscallOffloadRequest, response: &mut LinuxSyscallOffloadResponse) {
-    let status = syscall3(
-        SYS_RUSTOS_GETCWD_METADATA,
-        request.pid,
-        response.payload.as_mut_ptr() as u64,
-        SYSCALL_OFFLOAD_PAYLOAD_CAPACITY as u64,
-    );
-    if status < 0 {
-        response.status = (-status) as i32;
-        return;
+    fn linux_getcwd(
+        &mut self,
+        request: &LinuxSyscallOffloadRequest,
+        response: &mut LinuxSyscallOffloadResponse,
+    ) {
+        let cwd = self.cwd_for_pid(request.pid);
+        write_payload_bytes(response, cwd.as_bytes());
     }
 
-    response.status = 0;
-    response.payload_len = status as u32;
-}
-
-fn handle_chdir(request: &LinuxSyscallOffloadRequest, response: &mut LinuxSyscallOffloadResponse) {
-    let status = syscall3(
-        SYS_RUSTOS_CHDIR_METADATA,
-        request.path.as_ptr() as u64,
-        request.path_len as u64,
-        request.pid,
-    );
-    if status < 0 {
-        response.status = (-status) as i32;
-        return;
+    fn linux_chdir(
+        &mut self,
+        request: &LinuxSyscallOffloadRequest,
+        response: &mut LinuxSyscallOffloadResponse,
+    ) {
+        let Some(path) = linux_request_path(request) else {
+            response.status = libc::EINVAL;
+            return;
+        };
+        response.status = self.chdir(request.pid, path);
     }
 
-    response.status = 0;
-    response.payload_len = 0;
-}
-
-fn handle_mkdir(request: &LinuxSyscallOffloadRequest, response: &mut LinuxSyscallOffloadResponse) {
-    let Some(path) = request_path(request) else {
-        response.status = libc::EINVAL;
-        return;
-    };
-    if path == "/run" || path == "/run/user" || path == format!("/run/user/{}", request.euid) {
-        response.status = 0;
-        response.payload_len = 0;
-    } else {
-        response.status = libc::EROFS;
+    fn linux_mkdir(
+        &mut self,
+        request: &LinuxSyscallOffloadRequest,
+        response: &mut LinuxSyscallOffloadResponse,
+    ) {
+        let Some(path) = linux_request_path(request) else {
+            response.status = libc::EINVAL;
+            return;
+        };
+        response.status = mkdir_policy(path, request.euid);
     }
-}
 
-fn handle_openat(
-    request: &LinuxSyscallOffloadRequest,
-    response: &mut LinuxSyscallOffloadResponse,
-) -> Option<i32> {
-    let Some(path) = request_path(request) else {
-        response.status = libc::EINVAL;
-        return None;
-    };
-    let Ok(path) = CString::new(path) else {
-        response.status = libc::EINVAL;
-        return None;
-    };
-
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_openat as libc::c_long,
-            libc::AT_FDCWD,
-            path.as_ptr(),
-            request.flags as libc::c_long,
-            request.mask as libc::c_long,
-        ) as i64
-    };
-    if fd < 0 {
-        response.status = (-fd) as i32;
-        return None;
+    fn linux_openat(
+        &mut self,
+        request: &LinuxSyscallOffloadRequest,
+        response: &mut LinuxSyscallOffloadResponse,
+    ) {
+        let Some(path) = linux_request_path(request) else {
+            response.status = libc::EINVAL;
+            return;
+        };
+        match self.open_remote(path, request.flags) {
+            Ok((id, handle)) => {
+                let mut payload = [0_u8; 32];
+                payload[0..8].copy_from_slice(&id.to_le_bytes());
+                payload[8..10].copy_from_slice(&handle_kind_u16(handle.kind).to_le_bytes());
+                payload[16..24].copy_from_slice(&handle.len.to_le_bytes());
+                response.payload_len = payload.len() as u32;
+                response.payload[..payload.len()].copy_from_slice(&payload);
+            }
+            Err(errno) => response.status = errno,
+        }
     }
-    let Ok(fd) = i32::try_from(fd) else {
-        response.status = libc::EOVERFLOW;
-        return None;
-    };
-    response.status = 0;
-    response.payload_len = 0;
-    Some(fd)
-}
 
-fn handle_close(request: &LinuxSyscallOffloadRequest, response: &mut LinuxSyscallOffloadResponse) {
-    let status = syscall2(SYS_RUSTOS_FD_CLOSE_BROKER, request.pid, request.dirfd);
-    if status < 0 {
-        response.status = (-status) as i32;
-        return;
-    }
-    response.status = 0;
-    response.payload_len = 0;
-}
-
-fn handle_dup(request: &LinuxSyscallOffloadRequest, response: &mut LinuxSyscallOffloadResponse) {
-    let mode = u64::from(request.mask);
-    let flags = request.arg1;
-    if !matches!(mode, DUP_MODE_DUP | DUP_MODE_DUP2 | DUP_MODE_DUP3) {
-        response.status = libc::EINVAL;
-        return;
-    }
-    let fd = syscall5(
-        SYS_RUSTOS_FD_DUP_BROKER,
-        request.pid,
-        request.dirfd,
-        request.arg0,
-        flags,
-        mode,
-    );
-    if fd < 0 {
-        response.status = (-fd) as i32;
-        return;
-    }
-    response.status = 0;
-    response.payload_len = size_of::<u64>() as u32;
-    response.payload[..size_of::<u64>()].copy_from_slice(&(fd as u64).to_ne_bytes());
-}
-
-fn handle_getdents64(
-    request: &LinuxSyscallOffloadRequest,
-    response: &mut LinuxSyscallOffloadResponse,
-) {
-    let read = syscall4(
-        SYS_RUSTOS_FD_GETDENTS64_BROKER,
-        request.pid,
-        request.dirfd,
-        request.arg0,
-        request.arg1,
-    );
-    if read < 0 {
-        response.status = (-read) as i32;
-        return;
-    }
-    response.status = 0;
-    response.payload_len = size_of::<u64>() as u32;
-    response.payload[..size_of::<u64>()].copy_from_slice(&(read as u64).to_ne_bytes());
-}
-
-fn handle_fcntl(request: &LinuxSyscallOffloadRequest, response: &mut LinuxSyscallOffloadResponse) {
-    let result = syscall4(
-        SYS_RUSTOS_FD_FCNTL_BROKER,
-        request.pid,
-        request.dirfd,
-        request.arg0,
-        request.arg1,
-    );
-    if result < 0 {
-        response.status = (-result) as i32;
-        return;
-    }
-    response.status = 0;
-    response.payload_len = size_of::<u64>() as u32;
-    response.payload[..size_of::<u64>()].copy_from_slice(&(result as u64).to_ne_bytes());
-}
-
-fn handle_mount(request: &LinuxSyscallOffloadRequest, response: &mut LinuxSyscallOffloadResponse) {
-    let args = RustosVfsMountBrokerArgs {
-        process_id: request.pid,
-        source_ptr: request.arg0,
-        target_path_ptr: request.path.as_ptr() as u64,
-        target_path_len: request.path_len as u64,
-        fstype_ptr: request.arg1,
-        flags: request.flags,
-        data_ptr: request.dirfd,
-        reserved0: 0,
-    };
-    let status = syscall1(
-        SYS_RUSTOS_VFS_MOUNT_BROKER,
-        (&args as *const RustosVfsMountBrokerArgs) as u64,
-    );
-    if status < 0 {
-        response.status = (-status) as i32;
-        return;
-    }
-    response.status = 0;
-    response.payload_len = 0;
-}
-
-fn handle_umount2(
-    request: &LinuxSyscallOffloadRequest,
-    response: &mut LinuxSyscallOffloadResponse,
-) {
-    let status = syscall4(
-        SYS_RUSTOS_VFS_UMOUNT_BROKER,
-        request.pid,
-        request.path.as_ptr() as u64,
-        request.path_len as u64,
-        request.flags,
-    );
-    if status < 0 {
-        response.status = (-status) as i32;
-        return;
-    }
-    response.status = 0;
-    response.payload_len = 0;
-}
-
-fn reply_response(
-    reply_cap: u64,
-    response: &LinuxSyscallOffloadResponse,
-    reply_fd: Option<i32>,
-) -> i64 {
-    let Some(fd) = reply_fd else {
-        return syscall3(
-            SYS_RUSTOS_IPC_REPLY,
-            reply_cap,
-            (response as *const LinuxSyscallOffloadResponse) as u64,
-            size_of::<LinuxSyscallOffloadResponse>() as u64,
+    fn linux_getdents64(
+        &mut self,
+        request: &LinuxSyscallOffloadRequest,
+        response: &mut LinuxSyscallOffloadResponse,
+    ) {
+        response.status = self.getdents_payload(
+            request.dirfd,
+            request.arg1 as usize,
+            &mut response.payload,
+            &mut response.payload_len,
         );
-    };
+    }
 
-    let args = IpcReplyWithHandlesArgs {
-        reply_cap,
-        response_ptr: (response as *const LinuxSyscallOffloadResponse) as u64,
-        response_len: size_of::<LinuxSyscallOffloadResponse>() as u64,
-        send_fds_ptr: (&fd as *const i32) as u64,
-        send_fd_count: 1,
-        ..IpcReplyWithHandlesArgs::default()
-    };
-    syscall1(
-        SYS_RUSTOS_IPC_REPLY_WITH_HANDLES,
-        (&args as *const IpcReplyWithHandlesArgs) as u64,
-    )
+    fn linux_close(
+        &mut self,
+        request: &LinuxSyscallOffloadRequest,
+        response: &mut LinuxSyscallOffloadResponse,
+    ) {
+        response.status = self.close_remote(request.dirfd);
+    }
+
+    fn linux_dup(
+        &mut self,
+        request: &LinuxSyscallOffloadRequest,
+        response: &mut LinuxSyscallOffloadResponse,
+    ) {
+        response.status = self.dup_remote(request.dirfd);
+    }
+
+    fn linux_fcntl(
+        &mut self,
+        _request: &LinuxSyscallOffloadRequest,
+        response: &mut LinuxSyscallOffloadResponse,
+    ) {
+        response.payload_len = size_of::<u64>() as u32;
+        response.payload[..size_of::<u64>()].copy_from_slice(&0_u64.to_le_bytes());
+    }
+
+    fn linux_mount(&mut self, response: &mut LinuxSyscallOffloadResponse) {
+        self.mount_generation = self.mount_generation.saturating_add(1);
+        response.status = 0;
+    }
+
+    fn linux_umount2(&mut self, response: &mut LinuxSyscallOffloadResponse) {
+        self.mount_generation = self.mount_generation.saturating_add(1);
+        response.status = 0;
+    }
+
+    fn linux_unlinkat(
+        &mut self,
+        request: &LinuxSyscallOffloadRequest,
+        response: &mut LinuxSyscallOffloadResponse,
+    ) {
+        let Some(path) = linux_request_path(request) else {
+            response.status = libc::EINVAL;
+            return;
+        };
+        response.status = unlink_policy(path);
+    }
+
+    fn vfs_openat(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let Some(path) = vfs_request_path(request) else {
+            response.status = libc::EINVAL;
+            return;
+        };
+        let path = match self.resolve_path(request.pid, request.dirfd, path) {
+            Ok(path) => path,
+            Err(errno) => {
+                response.status = errno;
+                return;
+            }
+        };
+        match self.open_remote(path.as_str(), request.arg0) {
+            Ok((id, handle)) => {
+                response.remote_id = id;
+                response.handle_kind = handle_kind_u16(handle.kind);
+                response.value = handle.len;
+            }
+            Err(errno) => response.status = errno,
+        }
+    }
+
+    fn vfs_close(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        response.status = self.close_remote(request.remote_id);
+    }
+
+    fn vfs_dup(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        response.status = self.dup_remote(request.remote_id);
+        response.remote_id = request.remote_id;
+    }
+
+    fn vfs_read(
+        &mut self,
+        request: &VfsIpcRequest,
+        response: &mut VfsIpcResponse,
+        offset: Option<u64>,
+    ) {
+        let len = (request.arg1 as usize).min(VFS_IPC_PAYLOAD_CAPACITY);
+        match self.read_remote(request.remote_id, offset, len) {
+            Ok(bytes) => {
+                response.payload_len = bytes.len() as u32;
+                response.value = bytes.len() as u64;
+                response.payload[..bytes.len()].copy_from_slice(bytes.as_slice());
+            }
+            Err(errno) => response.status = errno,
+        }
+    }
+
+    fn vfs_lseek(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let Some(handle) = self.handles.get_mut(&request.remote_id) else {
+            response.status = libc::EBADF;
+            return;
+        };
+        let next = match request.arg1 {
+            x if x == libc::SEEK_SET as u64 => request.arg0 as i64,
+            x if x == libc::SEEK_CUR as u64 => handle.cursor as i64 + request.arg0 as i64,
+            x if x == libc::SEEK_END as u64 => handle.len as i64 + request.arg0 as i64,
+            _ => {
+                response.status = libc::EINVAL;
+                return;
+            }
+        };
+        if next < 0 {
+            response.status = libc::EINVAL;
+            return;
+        }
+        handle.cursor = next as u64;
+        response.value = handle.cursor;
+    }
+
+    fn vfs_fstat(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let Some(handle) = self.handles.get(&request.remote_id) else {
+            response.status = libc::EBADF;
+            return;
+        };
+        let stat = build_linux_stat(Metadata {
+            kind: handle.kind,
+            len: handle.len,
+            inode: path_inode(handle.path.as_bytes()),
+        });
+        response.payload_len = LINUX_STAT_SIZE as u32;
+        response.payload[..LINUX_STAT_SIZE].copy_from_slice(&stat);
+    }
+
+    fn vfs_getdents64(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        response.status = self.getdents_payload(
+            request.remote_id,
+            request.arg1 as usize,
+            &mut response.payload,
+            &mut response.payload_len,
+        );
+        response.value = response.payload_len as u64;
+    }
+
+    fn vfs_fcntl(&mut self, _request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        response.value = 0;
+    }
+
+    fn vfs_path_statx(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let Some(path) = vfs_request_path(request) else {
+            response.status = libc::EINVAL;
+            return;
+        };
+        let path = match self.resolve_path(request.pid, request.dirfd, path) {
+            Ok(path) => path,
+            Err(errno) => {
+                response.status = errno;
+                return;
+            }
+        };
+        match self.metadata(path.as_str()) {
+            Ok(metadata) => {
+                let statx = build_linux_statx(metadata);
+                response.payload_len = LINUX_STATX_SIZE as u32;
+                response.payload[..LINUX_STATX_SIZE].copy_from_slice(&statx);
+            }
+            Err(errno) => response.status = errno,
+        }
+    }
+
+    fn vfs_path_stat(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let Some(path) = vfs_request_path(request) else {
+            response.status = libc::EINVAL;
+            return;
+        };
+        let path = match self.resolve_path(request.pid, request.dirfd, path) {
+            Ok(path) => path,
+            Err(errno) => {
+                response.status = errno;
+                return;
+            }
+        };
+        match self.metadata(path.as_str()) {
+            Ok(metadata) => {
+                let stat = build_linux_stat(metadata);
+                response.payload_len = LINUX_STAT_SIZE as u32;
+                response.payload[..LINUX_STAT_SIZE].copy_from_slice(&stat);
+            }
+            Err(errno) => response.status = errno,
+        }
+    }
+
+    fn vfs_access(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let Some(path) = vfs_request_path(request) else {
+            response.status = libc::EINVAL;
+            return;
+        };
+        response.status = match self.resolve_path(request.pid, request.dirfd, path) {
+            Ok(path) => self.metadata(path.as_str()).err().unwrap_or(0),
+            Err(errno) => errno,
+        };
+    }
+
+    fn vfs_getcwd(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let cwd = self.cwd_for_pid(request.pid);
+        write_vfs_payload_bytes(response, cwd.as_bytes());
+    }
+
+    fn vfs_chdir(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let Some(path) = vfs_request_path(request) else {
+            response.status = libc::EINVAL;
+            return;
+        };
+        let path = match self.resolve_path(request.pid, request.dirfd, path) {
+            Ok(path) => path,
+            Err(errno) => {
+                response.status = errno;
+                return;
+            }
+        };
+        response.status = self.chdir(request.pid, path.as_str());
+    }
+
+    fn vfs_mkdir(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let Some(path) = vfs_request_path(request) else {
+            response.status = libc::EINVAL;
+            return;
+        };
+        let path = match self.resolve_path(request.pid, request.dirfd, path) {
+            Ok(path) => path,
+            Err(errno) => {
+                response.status = errno;
+                return;
+            }
+        };
+        response.status = mkdir_policy(path.as_str(), request.euid);
+    }
+
+    fn linux_mount_vfs(&mut self, response: &mut VfsIpcResponse) {
+        self.mount_generation = self.mount_generation.saturating_add(1);
+        response.status = 0;
+    }
+
+    fn linux_umount_vfs(&mut self, response: &mut VfsIpcResponse) {
+        self.mount_generation = self.mount_generation.saturating_add(1);
+        response.status = 0;
+    }
+
+    fn vfs_unlinkat(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let Some(path) = vfs_request_path(request) else {
+            response.status = libc::EINVAL;
+            return;
+        };
+        let path = match self.resolve_path(request.pid, request.dirfd, path) {
+            Ok(path) => path,
+            Err(errno) => {
+                response.status = errno;
+                return;
+            }
+        };
+        response.status = unlink_policy(path.as_str());
+    }
+
+    fn cwd_for_pid(&mut self, pid: u64) -> String {
+        self.cwd
+            .entry(pid)
+            .or_insert_with(|| String::from("/"))
+            .clone()
+    }
+
+    fn chdir(&mut self, pid: u64, path: &str) -> i32 {
+        match self.metadata(path) {
+            Ok(metadata) if metadata.kind == RemoteKind::Directory => {
+                self.cwd.insert(pid, path.to_string());
+                0
+            }
+            Ok(_) => libc::ENOTDIR,
+            Err(errno) => errno,
+        }
+    }
+
+    fn resolve_path(&mut self, pid: u64, dirfd: u64, path: &str) -> Result<String, i32> {
+        if path.is_empty() || path.len() > VFS_IPC_PATH_CAPACITY {
+            return Err(libc::EINVAL);
+        }
+        let base = if path.starts_with('/') {
+            "/".to_string()
+        } else if is_at_fdcwd(dirfd) {
+            self.cwd_for_pid(pid)
+        } else {
+            let handle = self.handles.get(&dirfd).ok_or(libc::EBADF)?;
+            if handle.kind != RemoteKind::Directory {
+                return Err(libc::ENOTDIR);
+            }
+            handle.path.clone()
+        };
+        normalize_absolute_path(base.as_str(), path)
+    }
+
+    fn open_remote(&mut self, path: &str, flags: u64) -> Result<(u64, RemoteHandle), i32> {
+        let metadata = self.metadata(path)?;
+        if flags & libc::O_DIRECTORY as u64 != 0 && metadata.kind != RemoteKind::Directory {
+            return Err(libc::ENOTDIR);
+        }
+        if flags & (libc::O_CREAT | libc::O_TRUNC) as u64 != 0 {
+            return Err(libc::EROFS);
+        }
+        let id = self.next_handle;
+        self.next_handle = self.next_handle.checked_add(1).unwrap_or(1);
+        let handle = RemoteHandle {
+            kind: metadata.kind,
+            path: path.to_string(),
+            cursor: 0,
+            len: metadata.len,
+            refs: 1,
+        };
+        self.handles.insert(id, handle.clone());
+        Ok((id, handle))
+    }
+
+    fn close_remote(&mut self, id: u64) -> i32 {
+        let Some(handle) = self.handles.get_mut(&id) else {
+            return libc::EBADF;
+        };
+        if handle.refs > 1 {
+            handle.refs -= 1;
+        } else {
+            self.handles.remove(&id);
+        }
+        0
+    }
+
+    fn dup_remote(&mut self, id: u64) -> i32 {
+        let Some(handle) = self.handles.get_mut(&id) else {
+            return libc::EBADF;
+        };
+        handle.refs = handle.refs.saturating_add(1);
+        0
+    }
+
+    fn read_remote(&mut self, id: u64, offset: Option<u64>, len: usize) -> Result<Vec<u8>, i32> {
+        let (path, start, file_len) = {
+            let handle = self.handles.get(&id).ok_or(libc::EBADF)?;
+            if handle.kind != RemoteKind::File {
+                return Err(libc::EISDIR);
+            }
+            (
+                handle.path.clone(),
+                offset.unwrap_or(handle.cursor),
+                handle.len,
+            )
+        };
+        let available = file_len.saturating_sub(start);
+        let len = len.min(available as usize);
+        let bytes = if len == 0 {
+            Vec::new()
+        } else {
+            self.cached_file_slice(path.as_str(), start, len)?
+        };
+        if offset.is_none() {
+            if let Some(handle) = self.handles.get_mut(&id) {
+                handle.cursor = handle.cursor.saturating_add(bytes.len() as u64);
+            }
+        }
+        Ok(bytes)
+    }
+
+    fn cached_file_slice(&mut self, path: &str, start: u64, len: usize) -> Result<Vec<u8>, i32> {
+        if !self.file_cache.contains_key(path) {
+            let bytes = self
+                .volume()?
+                .read_file_to_vec(path)
+                .map_err(map_fat_error)?;
+            self.file_cache.insert(path.to_string(), bytes);
+        }
+        let Some(bytes) = self.file_cache.get(path) else {
+            return Err(libc::ENOENT);
+        };
+        let start = usize::try_from(start).map_err(|_| libc::EINVAL)?;
+        let end = start.saturating_add(len).min(bytes.len());
+        Ok(bytes[start..end].to_vec())
+    }
+
+    fn getdents_payload(
+        &mut self,
+        id: u64,
+        user_len: usize,
+        payload: &mut [u8],
+        payload_len: &mut u32,
+    ) -> i32 {
+        if user_len < 24 {
+            return libc::EINVAL;
+        }
+        let (path, cursor) = {
+            let Some(handle) = self.handles.get(&id) else {
+                return libc::EBADF;
+            };
+            if handle.kind != RemoteKind::Directory {
+                return libc::ENOTDIR;
+            }
+            (handle.path.clone(), handle.cursor as usize)
+        };
+        let entries = match self.dir_entries(path.as_str()) {
+            Ok(entries) => entries,
+            Err(errno) => return errno,
+        };
+        let mut written = 0usize;
+        let mut consumed = 0usize;
+        for (index, entry) in entries.iter().enumerate().skip(cursor) {
+            let record = encode_dirent(entry, index + 1);
+            if written + record.len() > user_len.min(payload.len()) {
+                if written == 0 {
+                    return libc::EINVAL;
+                }
+                break;
+            }
+            payload[written..written + record.len()].copy_from_slice(record.as_slice());
+            written += record.len();
+            consumed += 1;
+        }
+        if let Some(handle) = self.handles.get_mut(&id) {
+            handle.cursor = handle.cursor.saturating_add(consumed as u64);
+        }
+        *payload_len = written as u32;
+        0
+    }
+
+    fn metadata(&mut self, path: &str) -> Result<Metadata, i32> {
+        if path == "/" || path == "/dev" || path == "/proc" || path == "/run" {
+            return Ok(Metadata {
+                kind: RemoteKind::Directory,
+                len: 0,
+                inode: path_inode(path.as_bytes()),
+            });
+        }
+        if path.starts_with("/dev/") {
+            return Ok(Metadata {
+                kind: RemoteKind::Device,
+                len: 0,
+                inode: path_inode(path.as_bytes()),
+            });
+        }
+        let volume = self.volume()?;
+        let meta = volume.metadata(path).map_err(map_fat_error)?;
+        Ok(Metadata {
+            kind: match meta.kind {
+                FatNodeKind::File => RemoteKind::File,
+                FatNodeKind::Directory => RemoteKind::Directory,
+            },
+            len: meta.len,
+            inode: path_inode(path.as_bytes()),
+        })
+    }
+
+    fn dir_entries(&mut self, path: &str) -> Result<Vec<DirEntry>, i32> {
+        let mut entries = Vec::new();
+        if path == "/" {
+            entries.push(DirEntry::new("dev", RemoteKind::Directory));
+            entries.push(DirEntry::new("proc", RemoteKind::Directory));
+            entries.push(DirEntry::new("run", RemoteKind::Directory));
+        }
+        if path == "/dev" {
+            entries.push(DirEntry::new("console0", RemoteKind::Device));
+            entries.push(DirEntry::new("input", RemoteKind::Directory));
+            entries.push(DirEntry::new("dri", RemoteKind::Directory));
+            return Ok(entries);
+        }
+        if path == "/proc" || path == "/run" {
+            return Ok(entries);
+        }
+        let fat_entries = self.volume()?.read_dir(path).map_err(map_fat_error)?;
+        entries.extend(fat_entries.into_iter().map(DirEntry::from_fat));
+        Ok(entries)
+    }
+
+    fn volume(&mut self) -> Result<&FatVolume<BootBlockDevice>, i32> {
+        if self.volume.is_none() {
+            self.volume = Some(FatVolume::new(BootBlockDevice::open()?).map_err(map_fat_error)?);
+        }
+        Ok(self.volume.as_ref().expect("volume initialized"))
+    }
 }
 
-fn validate_request(received: usize, request: &LinuxSyscallOffloadRequest) -> Result<(), i32> {
-    if received != size_of::<LinuxSyscallOffloadRequest>()
-        || request.version != SYSCALL_OFFLOAD_ABI_VERSION
+#[derive(Clone)]
+struct DirEntry {
+    name: String,
+    kind: RemoteKind,
+}
+
+impl DirEntry {
+    fn new(name: &str, kind: RemoteKind) -> Self {
+        Self {
+            name: name.to_string(),
+            kind,
+        }
+    }
+
+    fn from_fat(entry: FatDirEntry) -> Self {
+        Self {
+            name: entry.name,
+            kind: match entry.kind {
+                FatNodeKind::File => RemoteKind::File,
+                FatNodeKind::Directory => RemoteKind::Directory,
+            },
+        }
+    }
+}
+
+struct BootBlockDevice {
+    block_size: usize,
+    block_count: u64,
+}
+
+impl BootBlockDevice {
+    fn open() -> Result<Self, i32> {
+        let mut block_size = 0_u64;
+        let mut block_count = 0_u64;
+        let args = RustosBlockBrokerArgs {
+            abi_version: BLOCK_BROKER_ABI_VERSION,
+            op: BLOCK_BROKER_OP_BOOT_INFO,
+            out_logical_block_size_ptr: (&mut block_size as *mut u64) as u64,
+            out_block_count_ptr: (&mut block_count as *mut u64) as u64,
+            ..RustosBlockBrokerArgs::default()
+        };
+        let status = syscall1(
+            SYS_RUSTOS_BLOCK_BROKER,
+            (&args as *const RustosBlockBrokerArgs) as u64,
+        );
+        if status < 0 {
+            return Err((-status) as i32);
+        }
+        let block_size = usize::try_from(block_size).map_err(|_| libc::EINVAL)?;
+        if block_size < 512 || block_count == 0 {
+            return Err(libc::EINVAL);
+        }
+        Ok(Self {
+            block_size,
+            block_count,
+        })
+    }
+}
+
+impl BlockDevice for BootBlockDevice {
+    fn logical_block_size(&self) -> usize {
+        self.block_size
+    }
+
+    fn block_count(&self) -> u64 {
+        self.block_count
+    }
+
+    fn read_blocks(&mut self, lba: u64, out: &mut [u8]) -> IoResult<()> {
+        if self.block_size == 0
+            || out.len() % self.block_size != 0
+            || BLOCK_BROKER_MAX_IO_BYTES < self.block_size
+        {
+            return Err(StorageError::InvalidInput);
+        }
+        let max_blocks = (BLOCK_BROKER_MAX_IO_BYTES / self.block_size) as u64;
+        let mut done = 0usize;
+        while done < out.len() {
+            let remaining_blocks = ((out.len() - done) / self.block_size) as u64;
+            let block_count = remaining_blocks.min(max_blocks);
+            let byte_len = block_count as usize * self.block_size;
+            let args = RustosBlockBrokerArgs {
+                abi_version: BLOCK_BROKER_ABI_VERSION,
+                op: BLOCK_BROKER_OP_BOOT_READ,
+                lba: lba + (done / self.block_size) as u64,
+                block_count,
+                buffer_ptr: out[done..done + byte_len].as_mut_ptr() as u64,
+                buffer_len: byte_len as u64,
+                ..RustosBlockBrokerArgs::default()
+            };
+            let status = syscall1(
+                SYS_RUSTOS_BLOCK_BROKER,
+                (&args as *const RustosBlockBrokerArgs) as u64,
+            );
+            if status < 0 {
+                return Err(StorageError::DeviceFault);
+            }
+            done += byte_len;
+        }
+        Ok(())
+    }
+
+    fn write_blocks(&mut self, _lba: u64, _input: &[u8]) -> IoResult<()> {
+        Err(StorageError::Unsupported)
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LinuxTimespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LinuxStat {
+    st_dev: u64,
+    st_ino: u64,
+    st_nlink: u64,
+    st_mode: u32,
+    st_uid: u32,
+    st_gid: u32,
+    __pad0: u32,
+    st_rdev: u64,
+    st_size: i64,
+    st_blksize: i64,
+    st_blocks: i64,
+    st_atim: LinuxTimespec,
+    st_mtim: LinuxTimespec,
+    st_ctim: LinuxTimespec,
+    __glibc_reserved: [i64; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LinuxStatxTimestamp {
+    tv_sec: i64,
+    tv_nsec: u32,
+    __reserved: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LinuxStatx {
+    stx_mask: u32,
+    stx_blksize: u32,
+    stx_attributes: u64,
+    stx_nlink: u32,
+    stx_uid: u32,
+    stx_gid: u32,
+    stx_mode: u16,
+    __spare0: [u16; 1],
+    stx_ino: u64,
+    stx_size: u64,
+    stx_blocks: u64,
+    stx_attributes_mask: u64,
+    stx_atime: LinuxStatxTimestamp,
+    stx_btime: LinuxStatxTimestamp,
+    stx_ctime: LinuxStatxTimestamp,
+    stx_mtime: LinuxStatxTimestamp,
+    stx_rdev_major: u32,
+    stx_rdev_minor: u32,
+    stx_dev_major: u32,
+    stx_dev_minor: u32,
+    stx_mnt_id: u64,
+    stx_dio_mem_align: u32,
+    stx_dio_offset_align: u32,
+    __spare3: [u64; 12],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxSyscallOffloadRequest {
+    version: u16,
+    op: u16,
+    reserved0: u32,
+    pid: u64,
+    tid: u64,
+    session_handle: u64,
+    uid: u32,
+    gid: u32,
+    euid: u32,
+    egid: u32,
+    dirfd: u64,
+    flags: u64,
+    arg0: u64,
+    arg1: u64,
+    mask: u32,
+    path_len: u32,
+    path: [u8; SYSCALL_OFFLOAD_PATH_CAPACITY],
+}
+
+impl Default for LinuxSyscallOffloadRequest {
+    fn default() -> Self {
+        Self {
+            version: SYSCALL_OFFLOAD_ABI_VERSION,
+            op: SYSCALL_OFFLOAD_OP_LINUX_STATX,
+            reserved0: 0,
+            pid: 0,
+            tid: 0,
+            session_handle: 0,
+            uid: 0,
+            gid: 0,
+            euid: 0,
+            egid: 0,
+            dirfd: 0,
+            flags: 0,
+            arg0: 0,
+            arg1: 0,
+            mask: 0,
+            path_len: 0,
+            path: [0; SYSCALL_OFFLOAD_PATH_CAPACITY],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxSyscallOffloadResponse {
+    version: u16,
+    op: u16,
+    status: i32,
+    payload_len: u32,
+    reserved0: u32,
+    payload: [u8; SYSCALL_OFFLOAD_PAYLOAD_CAPACITY],
+}
+
+impl Default for LinuxSyscallOffloadResponse {
+    fn default() -> Self {
+        Self {
+            version: SYSCALL_OFFLOAD_ABI_VERSION,
+            op: SYSCALL_OFFLOAD_OP_LINUX_STATX,
+            status: 0,
+            payload_len: 0,
+            reserved0: 0,
+            payload: [0; SYSCALL_OFFLOAD_PAYLOAD_CAPACITY],
+        }
+    }
+}
+
+fn validate_linux_request(request: &LinuxSyscallOffloadRequest) -> Result<(), i32> {
+    if request.version != SYSCALL_OFFLOAD_ABI_VERSION
         || request.reserved0 != 0
         || request.path_len as usize > SYSCALL_OFFLOAD_PATH_CAPACITY
     {
         return Err(libc::EINVAL);
     }
-    if request.op != SYSCALL_OFFLOAD_OP_LINUX_GETCWD
-        && !is_handle_policy_op(request.op)
-        && request.path_len == 0
+    Ok(())
+}
+
+fn validate_vfs_request(request: &VfsIpcRequest) -> Result<(), i32> {
+    if request.version != VFS_IPC_ABI_VERSION
+        || request.path_len as usize > VFS_IPC_PATH_CAPACITY
+        || request.payload_len as usize > VFS_IPC_REQUEST_PAYLOAD_CAPACITY
     {
         return Err(libc::EINVAL);
     }
-    match request.op {
-        SYSCALL_OFFLOAD_OP_LINUX_STATX
-        | SYSCALL_OFFLOAD_OP_LINUX_NEWFSTATAT
-        | SYSCALL_OFFLOAD_OP_LINUX_READLINKAT
-        | SYSCALL_OFFLOAD_OP_LINUX_ACCESS
-        | SYSCALL_OFFLOAD_OP_LINUX_GETCWD
-        | SYSCALL_OFFLOAD_OP_LINUX_CHDIR
-        | SYSCALL_OFFLOAD_OP_LINUX_MKDIR
-        | SYSCALL_OFFLOAD_OP_LINUX_OPENAT
-        | SYSCALL_OFFLOAD_OP_LINUX_GETDENTS64
-        | SYSCALL_OFFLOAD_OP_LINUX_CLOSE
-        | SYSCALL_OFFLOAD_OP_LINUX_DUP
-        | SYSCALL_OFFLOAD_OP_LINUX_FCNTL
-        | SYSCALL_OFFLOAD_OP_LINUX_MOUNT
-        | SYSCALL_OFFLOAD_OP_LINUX_UMOUNT2
-        | SYSCALL_OFFLOAD_OP_LINUX_UNLINKAT => Ok(()),
-        _ => Err(libc::EINVAL),
-    }
+    Ok(())
 }
 
-fn handle_policy_allow(response: &mut LinuxSyscallOffloadResponse) {
-    response.status = 0;
-    response.payload_len = 0;
-}
-
-fn is_handle_policy_op(op: u16) -> bool {
-    matches!(
-        op,
-        SYSCALL_OFFLOAD_OP_LINUX_GETDENTS64
-            | SYSCALL_OFFLOAD_OP_LINUX_CLOSE
-            | SYSCALL_OFFLOAD_OP_LINUX_DUP
-            | SYSCALL_OFFLOAD_OP_LINUX_FCNTL
-    )
-}
-
-fn request_path(request: &LinuxSyscallOffloadRequest) -> Option<&str> {
+fn linux_request_path(request: &LinuxSyscallOffloadRequest) -> Option<&str> {
     let len = request.path_len as usize;
-    if len == 0 || len > request.path.len() {
+    if len > request.path.len() {
         return None;
     }
     std::str::from_utf8(&request.path[..len]).ok()
+}
+
+fn vfs_request_path(request: &VfsIpcRequest) -> Option<&str> {
+    let len = request.path_len as usize;
+    if len > request.path.len() {
+        return None;
+    }
+    std::str::from_utf8(&request.path[..len]).ok()
+}
+
+fn mkdir_policy(path: &str, euid: u32) -> i32 {
+    if path == "/run" || path == "/run/user" || path == format!("/run/user/{euid}") {
+        0
+    } else {
+        libc::EROFS
+    }
+}
+
+fn unlink_policy(path: &str) -> i32 {
+    if path.starts_with("/run/") {
+        libc::ENOENT
+    } else {
+        libc::EROFS
+    }
+}
+
+fn normalize_absolute_path(base_path: &str, path: &str) -> Result<String, i32> {
+    let mut components: Vec<&str> = Vec::new();
+    if !path.starts_with('/') {
+        for component in base_path.split('/') {
+            if !component.is_empty() {
+                components.push(component);
+            }
+        }
+    }
+    for component in path.split('/') {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if component == ".." {
+            components.pop();
+            continue;
+        }
+        components.push(component);
+    }
+    let mut normalized = String::from("/");
+    for component in components {
+        if normalized.len() > 1 {
+            normalized.push('/');
+        }
+        normalized.push_str(component);
+    }
+    if normalized.len() > VFS_IPC_PATH_CAPACITY {
+        return Err(libc::EINVAL);
+    }
+    Ok(normalized)
+}
+
+fn is_at_fdcwd(dirfd: u64) -> bool {
+    dirfd == libc::AT_FDCWD as u32 as u64 || dirfd == (libc::AT_FDCWD as i64) as u64
+}
+
+fn map_fat_error(err: storage_fat::FatError) -> i32 {
+    match err {
+        fatfs::Error::NotFound => libc::ENOENT,
+        fatfs::Error::InvalidInput => libc::EINVAL,
+        fatfs::Error::Io(StorageError::NotPresent) => libc::ENODEV,
+        fatfs::Error::Io(StorageError::InvalidInput) => libc::EINVAL,
+        fatfs::Error::Io(_) => libc::EIO,
+        _ => libc::EIO,
+    }
+}
+
+fn handle_kind_u16(kind: RemoteKind) -> u16 {
+    match kind {
+        RemoteKind::File => VFS_IPC_HANDLE_KIND_FILE,
+        RemoteKind::Directory => VFS_IPC_HANDLE_KIND_DIR,
+        RemoteKind::Device => VFS_IPC_HANDLE_KIND_DEVICE,
+    }
+}
+
+fn build_linux_stat(metadata: Metadata) -> [u8; LINUX_STAT_SIZE] {
+    let stat = LinuxStat {
+        st_ino: metadata.inode.max(1),
+        st_nlink: if metadata.kind == RemoteKind::Directory {
+            2
+        } else {
+            1
+        },
+        st_mode: mode_bits(metadata.kind),
+        st_size: metadata.len.min(i64::MAX as u64) as i64,
+        st_blksize: DEFAULT_BLOCK_SIZE as i64,
+        st_blocks: metadata.len.div_ceil(512).min(i64::MAX as u64) as i64,
+        ..LinuxStat::default()
+    };
+    let mut bytes = [0_u8; LINUX_STAT_SIZE];
+    bytes.copy_from_slice(as_bytes(&stat));
+    bytes
+}
+
+fn build_linux_statx(metadata: Metadata) -> [u8; LINUX_STATX_SIZE] {
+    let statx = LinuxStatx {
+        stx_mask: 0x7ff,
+        stx_blksize: DEFAULT_BLOCK_SIZE as u32,
+        stx_nlink: if metadata.kind == RemoteKind::Directory {
+            2
+        } else {
+            1
+        },
+        stx_mode: mode_bits(metadata.kind) as u16,
+        stx_ino: metadata.inode.max(1),
+        stx_size: metadata.len,
+        stx_blocks: metadata.len.div_ceil(512),
+        ..LinuxStatx::default()
+    };
+    let mut bytes = [0_u8; LINUX_STATX_SIZE];
+    bytes.copy_from_slice(as_bytes(&statx));
+    bytes
+}
+
+fn mode_bits(kind: RemoteKind) -> u32 {
+    match kind {
+        RemoteKind::File => BOOT_FILE_MODE_BITS,
+        RemoteKind::Directory => BOOT_DIRECTORY_MODE_BITS,
+        RemoteKind::Device => DEVICE_FILE_MODE_BITS,
+    }
+}
+
+fn write_payload_bytes(response: &mut LinuxSyscallOffloadResponse, bytes: &[u8]) {
+    let len = bytes.len().min(response.payload.len());
+    response.payload[..len].copy_from_slice(&bytes[..len]);
+    response.payload_len = len as u32;
+}
+
+fn write_vfs_payload_bytes(response: &mut VfsIpcResponse, bytes: &[u8]) {
+    let len = bytes.len().min(response.payload.len());
+    response.payload[..len].copy_from_slice(&bytes[..len]);
+    response.payload_len = len as u32;
+    response.value = len as u64;
+}
+
+fn encode_dirent(entry: &DirEntry, next_offset: usize) -> Vec<u8> {
+    let base_len = 19 + entry.name.len() + 1;
+    let record_len = (base_len + 7) & !7;
+    let mut bytes = vec![0_u8; record_len];
+    bytes[..8].copy_from_slice(&path_inode(entry.name.as_bytes()).to_le_bytes());
+    bytes[8..16].copy_from_slice(&(next_offset as i64).to_le_bytes());
+    bytes[16..18].copy_from_slice(&(record_len as u16).to_le_bytes());
+    bytes[18] = match entry.kind {
+        RemoteKind::File => DT_REG,
+        RemoteKind::Directory => DT_DIR,
+        RemoteKind::Device => DT_CHR,
+    };
+    bytes[19..19 + entry.name.len()].copy_from_slice(entry.name.as_bytes());
+    bytes[19 + entry.name.len()] = 0;
+    bytes
+}
+
+fn path_inode(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    hash.max(1)
+}
+
+fn read_unaligned<T: Copy + Default>(bytes: &[u8]) -> T {
+    let mut value = T::default();
+    let dest = unsafe {
+        std::slice::from_raw_parts_mut((&mut value as *mut T).cast::<u8>(), size_of::<T>())
+    };
+    dest.copy_from_slice(&bytes[..size_of::<T>()]);
+    value
+}
+
+fn as_bytes<T>(value: &T) -> &[u8] {
+    unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
+}
+
+fn reply_bytes(reply_cap: u64, bytes: &[u8]) -> i64 {
+    syscall3(
+        SYS_RUSTOS_IPC_REPLY,
+        reply_cap,
+        bytes.as_ptr() as u64,
+        bytes.len() as u64,
+    )
 }
 
 fn syscall0(number: u64) -> i64 {
@@ -537,10 +1305,6 @@ fn syscall4(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
     unsafe { libc::syscall(number as libc::c_long, arg0, arg1, arg2, arg3) as i64 }
 }
 
-fn syscall5(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
-    unsafe { libc::syscall(number as libc::c_long, arg0, arg1, arg2, arg3, arg4) as i64 }
-}
-
 fn debug_line(message: &str) {
     let _ = syscall2(
         SYS_RUSTOS_DEBUG_PRINT,
@@ -555,33 +1319,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn malformed_vfs_requests_are_rejected() {
-        let mut request = LinuxSyscallOffloadRequest {
-            path_len: 1,
-            ..LinuxSyscallOffloadRequest::default()
-        };
-        assert_eq!(
-            validate_request(size_of::<LinuxSyscallOffloadRequest>(), &request),
-            Ok(())
-        );
-        request.op = SYSCALL_OFFLOAD_OP_LINUX_GETUID;
-        assert_eq!(
-            validate_request(size_of::<LinuxSyscallOffloadRequest>(), &request),
-            Err(libc::EINVAL)
-        );
+    fn vfs_requests_validate_inline_shape() {
+        let request = VfsIpcRequest::default();
+        assert_eq!(validate_vfs_request(&request), Ok(()));
+        assert!(size_of::<VfsIpcRequest>() <= IPC_MAX_INLINE_BYTES);
+        assert!(size_of::<VfsIpcResponse>() <= IPC_MAX_INLINE_BYTES);
+    }
 
-        request.op = SYSCALL_OFFLOAD_OP_LINUX_GETCWD;
-        request.path_len = 0;
+    #[test]
+    fn normalizes_cwd_relative_paths() {
         assert_eq!(
-            validate_request(size_of::<LinuxSyscallOffloadRequest>(), &request),
-            Ok(())
-        );
-
-        request.op = SYSCALL_OFFLOAD_OP_LINUX_STATX;
-        request.path_len = 0;
-        assert_eq!(
-            validate_request(size_of::<LinuxSyscallOffloadRequest>(), &request),
-            Err(libc::EINVAL)
+            normalize_absolute_path("/usr/lib", "../bin/app").unwrap(),
+            "/usr/bin/app"
         );
     }
 }

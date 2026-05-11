@@ -586,6 +586,7 @@ pub fn umount_for_current_process(target_path: &str) -> Result<(), MountError> {
             let path = match handle {
                 KernelHandle::VfsFile(file) => file.path(),
                 KernelHandle::VfsDirectory(directory) => String::from(directory.path()),
+                KernelHandle::RemoteVfs(remote) => remote.path(),
                 _ => continue,
             };
             if path_is_within_mount(path.as_str(), target_path) {

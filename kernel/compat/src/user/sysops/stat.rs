@@ -86,6 +86,17 @@ pub(crate) fn for_fd(fd: u64) -> Result<KernelStat, StatLookupError> {
                 file.len() as u64,
             ))
         }
+        KernelHandle::RemoteVfs(remote) => match remote.kind() {
+            crate::user::handles::RemoteVfsHandleKind::Directory => Ok(build_directory_stat(
+                path_inode(remote.path().as_bytes()),
+                remote.len(),
+            )),
+            crate::user::handles::RemoteVfsHandleKind::File
+            | crate::user::handles::RemoteVfsHandleKind::Device => Ok(build_regular_file_stat(
+                path_inode(remote.path().as_bytes()),
+                remote.len(),
+            )),
+        },
         KernelHandle::VfsDirectory(directory) => {
             let path = String::from(directory.path());
             let metadata = file::metadata_for_current_process_path(path.as_str())?;

@@ -5,5 +5,8 @@ edition = "2021"
 publish = false
 
 [dependencies]
+fatfs = { git = "https://github.com/rafalh/rust-fatfs", default-features = false, features = ["alloc", "lfn"] }
 libc = "0.2"
 rustos-user-abi = { path = "../../libs/rustos-user-abi" }
+storage-core = { path = "../../libs/storage-core" }
+storage-fat = { path = "../../libs/storage-fat" }
