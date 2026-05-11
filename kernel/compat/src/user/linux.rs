@@ -130,6 +130,7 @@ raw_u64! {
     SYS_RSEQ = linux::__NR_rseq;
     SYS_CLONE3 = linux::__NR_clone3;
     SYS_MEMFD_CREATE = linux::__NR_memfd_create;
+    SYS_UMASK = linux::__NR_umask;
     TCGETS = linux_ioctl::TCGETS;
     TCSETS = linux_ioctl::TCSETS;
     TCSETSW = linux_ioctl::TCSETSW;

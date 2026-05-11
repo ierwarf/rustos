@@ -28,6 +28,7 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_OP_LINUX_SCHED_GETAFFINITY, SYSCALL_OFFLOAD_OP_LINUX_SETGID,
     SYSCALL_OFFLOAD_OP_LINUX_SETUID, SYSCALL_OFFLOAD_OP_LINUX_SOCKET,
     SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR, SYSCALL_OFFLOAD_OP_LINUX_STATX,
+    SYSCALL_OFFLOAD_OP_LINUX_GETRANDOM, SYSCALL_OFFLOAD_OP_LINUX_UMASK,
     SYSCALL_OFFLOAD_OP_LINUX_UMOUNT2, SYSCALL_OFFLOAD_OP_LINUX_UNAME,
     SYSCALL_OFFLOAD_PATH_CAPACITY, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, VFS_IPC_ABI_VERSION,
     VFS_IPC_HANDLE_KIND_DEVICE, VFS_IPC_HANDLE_KIND_DIR, VFS_IPC_HANDLE_KIND_FILE,
@@ -742,6 +743,78 @@ pub(super) fn syscall_linux_setgid(gid: u64) -> u64 {
         return linux_errno(LINUX_EINVAL);
     }
     0
+}
+
+pub(super) fn syscall_linux_umask(new_mask: u64) -> u64 {
+    let mut request = new_offload_request(SYSCALL_OFFLOAD_OP_LINUX_UMASK);
+    request.mask = (new_mask & 0o777) as u32;
+    let response = match call_offload_request(&request) {
+        Ok(response) => response,
+        Err(errno) => return linux_errno(errno),
+    };
+    if response.status != 0 {
+        return linux_errno(response.status.unsigned_abs() as i64);
+    }
+    if response.payload_len as usize != size_of::<u32>() {
+        return linux_errno(LINUX_EINVAL);
+    }
+    u32::from_le_bytes([
+        response.payload[0],
+        response.payload[1],
+        response.payload[2],
+        response.payload[3],
+    ]) as u64
+}
+
+pub(super) fn syscall_linux_getrandom(user_ptr: u64, user_len: u64, flags: u64) -> u64 {
+    const GETRANDOM_FLAG_NONBLOCK: u64 = 0x0001;
+    const GETRANDOM_FLAG_RANDOM: u64 = 0x0002;
+    if flags & !(GETRANDOM_FLAG_NONBLOCK | GETRANDOM_FLAG_RANDOM) != 0 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let Ok(len) = usize::try_from(user_len) else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    if len == 0 {
+        return 0;
+    }
+    if !ipc_ops::service_registered(linux_abi::IPC_SERVICE_LINUX_SYSCALLD)
+        || current_process_may_bootstrap_policy_service()
+    {
+        return match linux_ops::getrandom(user_ptr, user_len, flags) {
+            Ok(read) => read as u64,
+            Err(err) => linux_errno(linux_sysop_error_to_errno(err)),
+        };
+    }
+    let max_chunk = SYSCALL_OFFLOAD_PAYLOAD_CAPACITY;
+    let mut copied = 0usize;
+    while copied < len {
+        let chunk_len = (len - copied).min(max_chunk);
+        let mut request = new_offload_request(SYSCALL_OFFLOAD_OP_LINUX_GETRANDOM);
+        request.flags = chunk_len as u64;
+        let response = match call_offload_request(&request) {
+            Ok(response) => response,
+            Err(errno) => return linux_errno(errno),
+        };
+        if response.status != 0 {
+            return linux_errno(response.status.unsigned_abs() as i64);
+        }
+        let payload_len = response.payload_len as usize;
+        if payload_len == 0 || payload_len > chunk_len {
+            return linux_errno(LINUX_EINVAL);
+        }
+        let dest_ptr = match user_ptr.checked_add(copied as u64) {
+            Some(value) => value,
+            None => return linux_errno(LINUX_EINVAL),
+        };
+        if let Err(err) =
+            usermem::write_current_user_bytes(dest_ptr, &response.payload[..payload_len])
+        {
+            return linux_errno(address_space_error_to_linux_errno(err));
+        }
+        copied += payload_len;
+    }
+    copied as u64
 }
 
 fn syscall_linux_id_getter(op: u16) -> u64 {

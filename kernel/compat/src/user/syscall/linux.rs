@@ -284,7 +284,7 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
             offload_ops::syscall_linux_prlimit64(frame.rdi, frame.rsi, frame.rdx, frame.r10)
         }
         linux_abi::SYS_GETRANDOM => {
-            process_ops::syscall_linux_getrandom(frame.rdi, frame.rsi, frame.rdx)
+            offload_ops::syscall_linux_getrandom(frame.rdi, frame.rsi, frame.rdx)
         }
         linux_abi::SYS_STATX => {
             offload_ops::syscall_linux_statx(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
@@ -296,6 +296,7 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         linux_abi::SYS_MEMFD_CREATE => {
             process_ops::syscall_linux_memfd_create(frame.rdi, frame.rsi)
         }
+        linux_abi::SYS_UMASK => offload_ops::syscall_linux_umask(frame.rdi),
         linux_abi::SYS_EXIT | linux_abi::SYS_EXIT_GROUP => syscall_process_exit(frame.rdi),
         _ => unreachable!("linux syscall_check allowed an unknown syscall"),
     };
@@ -456,6 +457,7 @@ fn linux_syscall_number_supported(syscall_number: u64) -> bool {
                 | linux_abi::SYS_RSEQ
                 | linux_abi::SYS_CLONE3
                 | linux_abi::SYS_MEMFD_CREATE
+                | linux_abi::SYS_UMASK
                 | linux_abi::SYS_EXIT
                 | linux_abi::SYS_EXIT_GROUP
         )

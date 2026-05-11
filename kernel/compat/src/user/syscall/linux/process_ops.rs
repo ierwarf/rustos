@@ -428,21 +428,9 @@ pub(super) fn syscall_linux_get_robust_list(pid: u64, head_ptr_ptr: u64, len_ptr
     }
 }
 
-pub(super) fn syscall_linux_getrandom(user_ptr: u64, user_len: u64, flags: u64) -> u64 {
-    match linux_ops::getrandom(user_ptr, user_len, flags) {
-        Ok(read) => read as u64,
-        Err(err) => {
-            debug::println!(
-                "linux getrandom rejected: user_ptr={:#x} len={} flags={:#x} err={:?}",
-                user_ptr,
-                user_len,
-                flags,
-                err,
-            );
-            linux_errno(linux_sysop_error_to_errno(err))
-        }
-    }
-}
+// Linux getrandom moved to offload_ops::syscall_linux_getrandom; syscalld owns
+// the userspace RNG policy. The kernel CSPRNG path stays in linux_ops::getrandom
+// as a bootstrap fallback before syscalld registers.
 
 pub(super) fn syscall_linux_rseq(area_ptr: u64, len: u64, flags: u64, signature: u64) -> u64 {
     match linux_ops::rseq(area_ptr, len, flags, signature) {

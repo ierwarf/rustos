@@ -8,10 +8,14 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_PAYLOAD_CAPACITY,
 };
 
+const DEFAULT_UMASK: u32 = 0o022;
+const GETRANDOM_MAX_BYTES: u32 = (SYSCALL_OFFLOAD_PAYLOAD_CAPACITY as u32) & !3;
+
 #[derive(Clone, Copy, Debug)]
 struct LinuxPolicyState {
     credentials: Credentials,
     stack_rlimit: LinuxRlimit,
+    umask: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -185,7 +189,71 @@ fn initial_state(request: &LinuxSyscallOffloadRequest) -> LinuxPolicyState {
             rlim_cur: LINUX_DEFAULT_STACK_RLIMIT_BYTES,
             rlim_max: LINUX_DEFAULT_STACK_RLIMIT_BYTES,
         },
+        umask: DEFAULT_UMASK,
     }
+}
+
+pub(crate) fn handle_umask(
+    request: &LinuxSyscallOffloadRequest,
+    response: &mut LinuxSyscallOffloadResponse,
+) {
+    let requested = request.mask & 0o777;
+    let mut policy = policy_db().lock().expect("syscalld policy mutex poisoned");
+    let state = policy
+        .entry(request.pid)
+        .or_insert_with(|| initial_state(request));
+    let old = state.umask;
+    state.umask = requested;
+    response.status = 0;
+    response.payload_len = size_of::<u32>() as u32;
+    response.payload[..size_of::<u32>()].copy_from_slice(&old.to_le_bytes());
+}
+
+pub(crate) fn handle_getrandom(
+    request: &LinuxSyscallOffloadRequest,
+    response: &mut LinuxSyscallOffloadResponse,
+) {
+    let requested_len = request.flags as u32;
+    if requested_len == 0 {
+        response.status = 0;
+        response.payload_len = 0;
+        return;
+    }
+    let len = requested_len.min(GETRANDOM_MAX_BYTES) as usize;
+    fill_random_bytes(&mut response.payload[..len], request.pid, request.tid);
+    response.status = 0;
+    response.payload_len = len as u32;
+}
+
+fn fill_random_bytes(dest: &mut [u8], pid: u64, tid: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
+    let mut state = COUNTER.fetch_add(0xA076_1D64_78BD_642F, Ordering::Relaxed)
+        ^ pid.wrapping_mul(0xBF58_476D_1CE4_E5B9)
+        ^ tid.wrapping_mul(0x94D0_49BB_1331_11EB);
+    state ^= now_nanos_seed();
+    for chunk in dest.chunks_mut(8) {
+        state = splitmix64(state);
+        let bytes = state.to_le_bytes();
+        for (dst, src) in chunk.iter_mut().zip(bytes.iter()) {
+            *dst = *src;
+        }
+    }
+}
+
+fn splitmix64(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+fn now_nanos_seed() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 fn read_u64(bytes: &[u8], offset: usize) -> u64 {
