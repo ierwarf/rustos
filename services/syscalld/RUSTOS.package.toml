@@ -2,11 +2,12 @@ id = "syscalld"
 kind = "service"
 execution_domain = "user"
 profiles = ["default"]
-startup = "init"
+startup = "none"
 
 [build]
 builder = "cargo-kernel-binary"
 package = "syscalld"
+linkage = "static-pie"
 
 [install]
 path = "services/syscalld/syscalld.elf"

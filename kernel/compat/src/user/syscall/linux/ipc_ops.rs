@@ -34,35 +34,9 @@ pub(super) fn is_linux_rustos_ipc_syscall(syscall_number: u64) -> bool {
             | linux_abi::SYS_RUSTOS_IPC_CALL_WITH_HANDLES
             | linux_abi::SYS_RUSTOS_IPC_RECV_WITH_HANDLES
             | linux_abi::SYS_RUSTOS_IPC_REPLY_WITH_HANDLES
-            | linux_abi::SYS_RUSTOS_FD_CLOSE_BROKER
-            | linux_abi::SYS_RUSTOS_FD_DUP_BROKER
-            | linux_abi::SYS_RUSTOS_FD_GETDENTS64_BROKER
-            | linux_abi::SYS_RUSTOS_FD_FCNTL_BROKER
-            | linux_abi::SYS_RUSTOS_VFS_MOUNT_BROKER
-            | linux_abi::SYS_RUSTOS_VFS_UMOUNT_BROKER
-            | linux_abi::SYS_RUSTOS_PROC_PREPARE_BROKER
-            | linux_abi::SYS_RUSTOS_PROC_MAP_FILE_BROKER
-            | linux_abi::SYS_RUSTOS_PROC_MAP_ZEROED_BROKER
-            | linux_abi::SYS_RUSTOS_PROC_COMMIT_BROKER
-            | linux_abi::SYS_RUSTOS_PROC_ABORT_BROKER
-            | linux_abi::SYS_RUSTOS_DEVICE_IOCTL_BROKER
-            | linux_abi::SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER
-            | linux_abi::SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER
-            | linux_abi::SYS_RUSTOS_DRIVER_PROVIDER_ACTIVE_BROKER
-            | linux_abi::SYS_RUSTOS_NET_BROKER
-            | linux_abi::SYS_RUSTOS_BLOCK_BROKER
-            | linux_abi::SYS_RUSTOS_STORAGE_LIST_BROKER
-            | linux_abi::SYS_RUSTOS_INPUT_STATS_BROKER
-            | linux_abi::SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER
             | linux_abi::SYS_RUSTOS_IPC_REGISTER_LINUX_SYSCALL_ENDPOINT
             | linux_abi::SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT
             | linux_abi::SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT
-            | linux_abi::SYS_RUSTOS_STATX_METADATA
-            | linux_abi::SYS_RUSTOS_STAT_METADATA
-            | linux_abi::SYS_RUSTOS_READLINK_METADATA
-            | linux_abi::SYS_RUSTOS_ACCESS_METADATA
-            | linux_abi::SYS_RUSTOS_GETCWD_METADATA
-            | linux_abi::SYS_RUSTOS_CHDIR_METADATA
     )
 }
 
@@ -87,68 +61,6 @@ pub(super) fn dispatch_linux_rustos_ipc_syscall(frame: &SyscallFrame) -> u64 {
         linux_abi::SYS_RUSTOS_IPC_REPLY_WITH_HANDLES => {
             syscall_linux_rustos_ipc_reply_with_handles(frame.rdi)
         }
-        linux_abi::SYS_RUSTOS_FD_CLOSE_BROKER => {
-            offload_ops::syscall_linux_rustos_fd_close_broker(frame.rdi, frame.rsi)
-        }
-        linux_abi::SYS_RUSTOS_FD_DUP_BROKER => offload_ops::syscall_linux_rustos_fd_dup_broker(
-            frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8,
-        ),
-        linux_abi::SYS_RUSTOS_FD_GETDENTS64_BROKER => {
-            offload_ops::syscall_linux_rustos_fd_getdents64_broker(
-                frame.rdi, frame.rsi, frame.rdx, frame.r10,
-            )
-        }
-        linux_abi::SYS_RUSTOS_FD_FCNTL_BROKER => offload_ops::syscall_linux_rustos_fd_fcntl_broker(
-            frame.rdi, frame.rsi, frame.rdx, frame.r10,
-        ),
-        linux_abi::SYS_RUSTOS_VFS_MOUNT_BROKER => {
-            offload_ops::syscall_linux_rustos_vfs_mount_broker(frame.rdi)
-        }
-        linux_abi::SYS_RUSTOS_VFS_UMOUNT_BROKER => {
-            offload_ops::syscall_linux_rustos_vfs_umount_broker(
-                frame.rdi, frame.rsi, frame.rdx, frame.r10,
-            )
-        }
-        linux_abi::SYS_RUSTOS_PROC_PREPARE_BROKER => {
-            offload_ops::syscall_linux_rustos_proc_prepare_broker(frame.rdi)
-        }
-        linux_abi::SYS_RUSTOS_PROC_MAP_FILE_BROKER => {
-            offload_ops::syscall_linux_rustos_proc_map_file_broker(frame.rdi)
-        }
-        linux_abi::SYS_RUSTOS_PROC_MAP_ZEROED_BROKER => {
-            offload_ops::syscall_linux_rustos_proc_map_zeroed_broker(frame.rdi)
-        }
-        linux_abi::SYS_RUSTOS_PROC_COMMIT_BROKER => {
-            offload_ops::syscall_linux_rustos_proc_commit_broker(frame.rdi)
-        }
-        linux_abi::SYS_RUSTOS_PROC_ABORT_BROKER => {
-            offload_ops::syscall_linux_rustos_proc_abort_broker(frame.rdi)
-        }
-        linux_abi::SYS_RUSTOS_DEVICE_IOCTL_BROKER => {
-            offload_ops::syscall_linux_rustos_device_ioctl_broker(frame.rdi)
-        }
-        linux_abi::SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER => {
-            offload_ops::syscall_linux_rustos_driver_load_module_broker(frame.rdi)
-        }
-        linux_abi::SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER => {
-            offload_ops::syscall_linux_rustos_driver_probe_alias_broker(frame.rdi)
-        }
-        linux_abi::SYS_RUSTOS_DRIVER_PROVIDER_ACTIVE_BROKER => {
-            offload_ops::syscall_linux_rustos_driver_provider_active_broker(frame.rdi)
-        }
-        linux_abi::SYS_RUSTOS_NET_BROKER => offload_ops::syscall_linux_rustos_net_broker(frame.rdi),
-        linux_abi::SYS_RUSTOS_BLOCK_BROKER => {
-            offload_ops::syscall_linux_rustos_block_broker(frame.rdi)
-        }
-        linux_abi::SYS_RUSTOS_STORAGE_LIST_BROKER => {
-            offload_ops::syscall_linux_rustos_storage_list_broker(frame.rdi)
-        }
-        linux_abi::SYS_RUSTOS_INPUT_STATS_BROKER => {
-            offload_ops::syscall_linux_rustos_input_stats_broker(frame.rdi)
-        }
-        linux_abi::SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER => {
-            offload_ops::syscall_linux_rustos_lifecycle_drain_broker(frame.rdi)
-        }
         linux_abi::SYS_RUSTOS_IPC_REGISTER_LINUX_SYSCALL_ENDPOINT => {
             syscall_linux_rustos_ipc_register_linux_syscall_endpoint(frame.rdi)
         }
@@ -157,26 +69,6 @@ pub(super) fn dispatch_linux_rustos_ipc_syscall(frame: &SyscallFrame) -> u64 {
         }
         linux_abi::SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT => {
             syscall_linux_rustos_ipc_lookup_service_endpoint(frame.rdi)
-        }
-        linux_abi::SYS_RUSTOS_STATX_METADATA => offload_ops::syscall_linux_rustos_statx_metadata(
-            frame.rdi, frame.rsi, frame.rdx, frame.r10,
-        ),
-        linux_abi::SYS_RUSTOS_STAT_METADATA => {
-            offload_ops::syscall_linux_rustos_stat_metadata(frame.rdi, frame.rsi, frame.rdx)
-        }
-        linux_abi::SYS_RUSTOS_READLINK_METADATA => {
-            offload_ops::syscall_linux_rustos_readlink_metadata(
-                frame.rdi, frame.rsi, frame.rdx, frame.r10,
-            )
-        }
-        linux_abi::SYS_RUSTOS_ACCESS_METADATA => offload_ops::syscall_linux_rustos_access_metadata(
-            frame.rdi, frame.rsi, frame.rdx, frame.r10,
-        ),
-        linux_abi::SYS_RUSTOS_GETCWD_METADATA => {
-            offload_ops::syscall_linux_rustos_getcwd_metadata(frame.rdi, frame.rsi, frame.rdx)
-        }
-        linux_abi::SYS_RUSTOS_CHDIR_METADATA => {
-            offload_ops::syscall_linux_rustos_chdir_metadata(frame.rdi, frame.rsi, frame.rdx)
         }
         _ => linux_errno(LINUX_ENOSYS),
     }
@@ -321,9 +213,7 @@ fn service_capability(service_id: u64) -> u64 {
         linux_abi::IPC_SERVICE_DEVMGRD => rustos_user_abi::syscall::IPC_SERVICE_CAP_DEVICE_POLICY,
         linux_abi::IPC_SERVICE_DRIVERD => rustos_user_abi::syscall::IPC_SERVICE_CAP_DRIVER_POLICY,
         linux_abi::IPC_SERVICE_LOADERD => rustos_user_abi::syscall::IPC_SERVICE_CAP_PROCESS_LOADER,
-        linux_abi::IPC_SERVICE_STORAGED => {
-            rustos_user_abi::syscall::IPC_SERVICE_CAP_STORAGE_POLICY
-        }
+        linux_abi::IPC_SERVICE_STORAGED => rustos_user_abi::syscall::IPC_SERVICE_CAP_STORAGE_POLICY,
         linux_abi::IPC_SERVICE_INPUTD => rustos_user_abi::syscall::IPC_SERVICE_CAP_INPUT_POLICY,
         _ => 0,
     }

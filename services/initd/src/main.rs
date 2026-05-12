@@ -11,9 +11,8 @@ use runtime_control::{
     DEFAULT_APPLICATIONS_DIR, DEFAULT_RUNTIME_ENV_REGISTRY_PATH,
 };
 use rustos_user_abi::syscall::{
-    LoaderSpawnRequest, LoaderSpawnResponse, IPC_SERVICE_DEVMGRD, IPC_SERVICE_DRIVERD,
-    IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD, IPC_SERVICE_NETD, IPC_SERVICE_VFSD,
-    LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
+    LoaderSpawnRequest, LoaderSpawnResponse, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD,
+    IPC_SERVICE_VFSD, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
     LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, SYS_RUSTOS_IPC_CALL,
     SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
 };
@@ -27,6 +26,7 @@ const DRIVERD_EXEC_PATH: &str = "services/driverd/driverd.elf";
 const LOADERD_EXEC_PATH: &str = "services/loaderd/loaderd.elf";
 const RUNTIMED_EXEC_PATH: &str = "services/runtimed/runtimed.elf";
 const STORAGED_EXEC_PATH: &str = "services/storaged/storaged.elf";
+const INPUTD_EXEC_PATH: &str = "services/inputd/inputd.elf";
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const RETRY_BACKOFF: Duration = Duration::from_secs(1);
 const SYS_RUSTOS_SPAWN_EXEC: libc::c_long = 0x5255_0002;
@@ -186,46 +186,33 @@ fn init_exec_priority(exec: &str) -> u8 {
     match exec {
         SYSCALLD_EXEC_PATH => 0,
         VFSD_EXEC_PATH => 1,
-        NETD_EXEC_PATH => 2,
-        DEVMGRD_EXEC_PATH => 3,
-        DRIVERD_EXEC_PATH => 4,
-        LOADERD_EXEC_PATH => 5,
-        RUNTIMED_EXEC_PATH => 6,
-        STORAGED_EXEC_PATH => 7,
-        _ => 8,
+        LOADERD_EXEC_PATH => 2,
+        NETD_EXEC_PATH => 3,
+        DEVMGRD_EXEC_PATH => 4,
+        DRIVERD_EXEC_PATH => 5,
+        STORAGED_EXEC_PATH => 6,
+        INPUTD_EXEC_PATH => 7,
+        RUNTIMED_EXEC_PATH => 8,
+        _ => 9,
     }
 }
 
 fn launch_gate_satisfied(exec: &str) -> bool {
     match exec {
         SYSCALLD_EXEC_PATH | VFSD_EXEC_PATH => true,
-        NETD_EXEC_PATH | DEVMGRD_EXEC_PATH | DRIVERD_EXEC_PATH => {
+        LOADERD_EXEC_PATH => {
             service_ready(IPC_SERVICE_LINUX_SYSCALLD) && service_ready(IPC_SERVICE_VFSD)
         }
-        LOADERD_EXEC_PATH => core_policy_without_loader_ready(),
-        _ => core_policy_services_ready(),
+        NETD_EXEC_PATH | DEVMGRD_EXEC_PATH | DRIVERD_EXEC_PATH | STORAGED_EXEC_PATH
+        | INPUTD_EXEC_PATH => foundation_policy_services_ready(),
+        _ => foundation_policy_services_ready(),
     }
 }
 
-fn core_policy_without_loader_ready() -> bool {
+fn foundation_policy_services_ready() -> bool {
     [
         IPC_SERVICE_LINUX_SYSCALLD,
         IPC_SERVICE_VFSD,
-        IPC_SERVICE_NETD,
-        IPC_SERVICE_DEVMGRD,
-        IPC_SERVICE_DRIVERD,
-    ]
-    .into_iter()
-    .all(service_ready)
-}
-
-fn core_policy_services_ready() -> bool {
-    [
-        IPC_SERVICE_LINUX_SYSCALLD,
-        IPC_SERVICE_VFSD,
-        IPC_SERVICE_NETD,
-        IPC_SERVICE_DEVMGRD,
-        IPC_SERVICE_DRIVERD,
         IPC_SERVICE_LOADERD,
     ]
     .into_iter()

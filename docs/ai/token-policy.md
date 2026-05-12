@@ -58,7 +58,55 @@ Do not:
 - paste large source excerpts
 - explain background architecture unless it changes routing decisions
 
-## 5. Update AI Contracts When Behavior Changes
+## 5. Prefer Fast Implementation Over Extended Reasoning
+
+Default to a short reasoning pass, then make the smallest source change that
+can satisfy the task. Do not spend time producing broad theory, long option
+lists, or exhaustive subsystem analysis when the requested scope is already
+clear.
+
+Do:
+
+- identify the narrow owner file or contract
+- state the concrete edit target if needed
+- implement promptly
+- validate with the smallest relevant command
+
+Spend extended reasoning time only when the user asks for debugging, failure
+analysis, structural review, security review, or a design decision. For
+debugging, reason from symptoms, command output, logs, or probes before editing.
+
+## 6. OS Debugging Stop Rule
+
+RustOS debugging must not drift into speculative patches. If execution is
+blocked by a structural inconsistency, missing ownership boundary, missing
+probe, unavailable runtime evidence, or a fix that would only guess at the
+cause, stop changing code and report:
+
+- observed symptom
+- last trustworthy evidence
+- structural blocker
+- exact next evidence or owner needed
+
+Do not fabricate a success path, add broad fallbacks, or keep hardening nearby
+code just because the original path is unclear.
+
+## 7. Risk-Weighted Hardening
+
+Harden the highest-risk OS surfaces first:
+
+- app-visible ABI and Linux ELF / Windows PE compatibility
+- privilege, capability, broker, and namespace boundaries
+- memory mapping, user-copy, handle-transfer, and lifetime checks
+- scheduler, lock ordering, IRQ-off, wait, and timeout behavior
+- boot, launch, service ownership, provider ordering, and driver loading
+- filesystem, network, input, display, and block-device mutation paths
+
+Avoid hardening low-risk helpers, cosmetic paths, or unrelated code unless the
+user explicitly asks. Every hardening change should name the risk it reduces
+and use the narrowest source boundary that can enforce it.
+
+## 8. Update AI Contracts When Behavior Changes
 
 If a change modifies any of these, update `docs/ai/contracts.md` or the focused
 AI map in the same change:
@@ -71,7 +119,7 @@ AI map in the same change:
 - runtime socket/protocol behavior
 - docs navigation or AI routing
 
-## 6. Avoid Ad Hoc And Hardcoded Policy
+## 9. Avoid Ad Hoc And Hardcoded Policy
 
 Prefer manifest fields, registries, protocol state, and existing subsystem APIs
 over ad hoc branches or hardcoded names, paths, priorities, and ordering. If a
@@ -79,7 +127,7 @@ temporary hardcoded fallback is unavoidable, keep it narrow, document the source
 of truth it is standing in for, and route future behavior through the stable
 contract instead of expanding the special case.
 
-## 7. Avoid Generated And Vendor Paths By Default
+## 10. Avoid Generated And Vendor Paths By Default
 
 Do not inspect these paths unless the task explicitly involves generated output
 or external binary inputs:
@@ -100,7 +148,7 @@ Allowed exceptions:
 
 When using an exception, inspect the narrowest file/path possible.
 
-## 8. Logs And Large Files
+## 11. Logs And Large Files
 
 Never read whole log files by default.
 
@@ -121,7 +169,7 @@ For files over roughly 500 lines:
 Avoid opening `Cargo.lock` unless dependency resolution changed. Use
 `rg -n "crate-name" Cargo.lock` before reading a range.
 
-## 9. Prompt Cache Hygiene
+## 12. Prompt Cache Hygiene
 
 Keep stable context stable across requests:
 

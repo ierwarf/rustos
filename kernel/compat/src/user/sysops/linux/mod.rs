@@ -25,27 +25,8 @@ use super::file;
 use super::stat;
 use super::usermem;
 
-mod exec;
-mod fd;
-mod fs;
-mod memfd;
-mod mm;
-mod process;
-mod signal;
-mod socket;
-mod thread;
-mod time;
-
-pub(crate) use exec::*;
-pub(crate) use fd::*;
-pub(crate) use fs::*;
-pub(crate) use memfd::*;
-pub(crate) use mm::*;
-pub(crate) use process::*;
-pub(crate) use signal::*;
-pub(crate) use socket::*;
-pub(crate) use thread::*;
-pub(crate) use time::*;
+// Linux mm/thread primitives still live here while mapping and scheduler state
+// remain privileged. Signal and clock policy is now owned by syscalld.
 
 const PAGE_SIZE: u64 = 4096;
 const LINUX_SIGSET_SIZE: u64 = 8;
@@ -140,37 +121,6 @@ impl From<device::DeviceSysopError> for LinuxSysopError {
     }
 }
 
-impl From<file::FileSysopError> for LinuxSysopError {
-    fn from(value: file::FileSysopError) -> Self {
-        match value {
-            file::FileSysopError::AddressSpace(err) => Self::AddressSpace(err),
-            file::FileSysopError::BadFileDescriptor => Self::BadFileDescriptor,
-            file::FileSysopError::InvalidArgument => Self::InvalidArgument,
-            file::FileSysopError::NotFound => Self::NotFound,
-            file::FileSysopError::NotDirectory => Self::NotDirectory,
-            file::FileSysopError::PermissionDenied => Self::PermissionDenied,
-            file::FileSysopError::ReadOnlyFilesystem => Self::ReadOnlyFilesystem,
-            file::FileSysopError::Unsupported => Self::Unsupported,
-        }
-    }
-}
-
-impl From<crate::user::socket::SocketError> for LinuxSysopError {
-    fn from(value: crate::user::socket::SocketError) -> Self {
-        match value {
-            crate::user::socket::SocketError::AddressInUse => Self::AddressInUse,
-            crate::user::socket::SocketError::BrokenPipe => Self::BrokenPipe,
-            crate::user::socket::SocketError::ConnectionRefused => Self::ConnectionRefused,
-            crate::user::socket::SocketError::InvalidArgument => Self::InvalidArgument,
-            crate::user::socket::SocketError::IsConnected => Self::AlreadyConnected,
-            crate::user::socket::SocketError::NotConnected => Self::NotConnected,
-            crate::user::socket::SocketError::NotFound => Self::NotFound,
-            crate::user::socket::SocketError::PermissionDenied => Self::PermissionDenied,
-            crate::user::socket::SocketError::TryAgain => Self::TryAgain,
-        }
-    }
-}
-
 impl From<crate::user::memfd::MemfdError> for LinuxSysopError {
     fn from(value: crate::user::memfd::MemfdError) -> Self {
         match value {
@@ -178,32 +128,6 @@ impl From<crate::user::memfd::MemfdError> for LinuxSysopError {
             crate::user::memfd::MemfdError::InvalidArgument => Self::InvalidArgument,
             crate::user::memfd::MemfdError::NoMemory => Self::NoMemory,
             crate::user::memfd::MemfdError::PermissionDenied => Self::PermissionDenied,
-        }
-    }
-}
-
-impl From<crate::user::epoll::EpollError> for LinuxSysopError {
-    fn from(value: crate::user::epoll::EpollError) -> Self {
-        match value {
-            crate::user::epoll::EpollError::Busy => Self::Busy,
-            crate::user::epoll::EpollError::InvalidArgument => Self::InvalidArgument,
-            crate::user::epoll::EpollError::NotFound => Self::NotFound,
-        }
-    }
-}
-
-impl From<crate::vfs::MountError> for LinuxSysopError {
-    fn from(value: crate::vfs::MountError) -> Self {
-        match value {
-            crate::vfs::MountError::Busy => Self::Busy,
-            crate::vfs::MountError::InvalidArgument
-            | crate::vfs::MountError::InvalidSource
-            | crate::vfs::MountError::UnsupportedMountFlags
-            | crate::vfs::MountError::UnsupportedFilesystem => Self::InvalidArgument,
-            crate::vfs::MountError::NotDirectory => Self::NotDirectory,
-            crate::vfs::MountError::NotFound => Self::NotFound,
-            crate::vfs::MountError::PermissionDenied => Self::PermissionDenied,
-            crate::vfs::MountError::ReadOnlyFilesystem => Self::ReadOnlyFilesystem,
         }
     }
 }

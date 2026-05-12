@@ -40,6 +40,26 @@ reported command output as the primary context instead of scanning logs.
 
 ## Hardening Direction
 
+- Active refactor state: RustOS is in a service-first ring0 evacuation phase.
+  The direct kernel-launched first user process is `rootd`, not the Linux
+  `initd` runtime. `rootd` is the bootstrap authority modeled after an seL4
+  initial task: it must stay independent of the Linux dynamic runtime and
+  starts the foundational services (`syscalld`, `vfsd`, `loaderd`) before
+  handing off to normal `initd`. Do not add generic Linux syscall fallbacks to
+  make `initd` boot earlier; move that pressure into `rootd`, service
+  manifests, or narrow bootstrap brokers.
+  The old line-commented Linux compatibility reference files have been consumed
+  into service-oriented syscall routing and removed from the kernel tree. A
+  wider evacuation wave now keeps only unfinished Linux thread policy and
+  Windows PE/Win32 policy as migration reference comments. Linux MM ABI policy
+  now belongs to `syscalld`; PTE mutation and backing lifetime enforcement go
+  through the gated `SYS_RUSTOS_MM_BROKER`. VFS, network, USB, input, provider,
+  signal, and clock policy should be extended in `syscalld`, `vfsd`, `netd`,
+  `loaderd`, `devmgrd`, `driverd`, `storaged`, or `inputd`.
+  Do not restore deleted or commented ring0 policy modules for quick
+  compatibility fixes; leave kernel code to narrow privileged primitives.
+  During this phase, compile/QEMU validation may be intentionally deferred when
+  the task is structural code removal.
 - Product goal: RustOS must preserve native compatibility for both Linux ELF
   and Windows PE executables. Microkernel migration should move policy and
   namespace ownership to user services without casually breaking observable app

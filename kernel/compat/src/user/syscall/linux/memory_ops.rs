@@ -1,4 +1,132 @@
+use core::mem::size_of;
+
+use x86_64::VirtAddr;
+
+use crate::memory::PageTableFlags;
+
 use super::*;
+
+const PAGE_SIZE: u64 = 4096;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SigaltstackPayload {
+    has_old: u8,
+    _pad: [u8; 7],
+    old_ss_sp: u64,
+    old_ss_size: u64,
+    old_ss_flags: u32,
+    _pad2: [u8; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SigaltstackRequestExtra {
+    has_new: u8,
+    _pad: [u8; 7],
+    new_ss_sp: u64,
+    new_ss_size: u64,
+    new_ss_flags: u32,
+    _pad2: [u8; 4],
+}
+
+pub(super) fn syscall_linux_madvise(start: u64, user_len: u64, advice: u64) -> u64 {
+    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_MADVISE);
+    request.arg0 = start;
+    request.arg1 = user_len;
+    request.flags = advice;
+    match call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response)) {
+        Ok(()) => 0,
+        Err(errno) => linux_errno(errno),
+    }
+}
+
+pub(super) fn syscall_linux_sigaltstack(stack_ptr: u64, old_stack_ptr: u64) -> u64 {
+    const SIGALTSTACK_WIRE_SIZE: usize = 24; // ss_sp + ss_flags + (pad) + ss_size
+    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_SIGALTSTACK);
+    let mut extra = SigaltstackRequestExtra::default();
+    if stack_ptr != 0 {
+        let mut buf = [0_u8; SIGALTSTACK_WIRE_SIZE];
+        if let Err(err) = usermem::copy_from_current_user_exact(stack_ptr, &mut buf) {
+            return linux_errno(address_space_error_to_linux_errno(err));
+        }
+        let ss_sp = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let ss_flags = i32::from_le_bytes(buf[8..12].try_into().unwrap());
+        let ss_size = u64::from_le_bytes(buf[16..24].try_into().unwrap());
+        extra.has_new = 1;
+        extra.new_ss_sp = ss_sp;
+        extra.new_ss_flags = ss_flags as u32;
+        extra.new_ss_size = ss_size;
+    }
+    if old_stack_ptr != 0 {
+        if let Err(err) =
+            usermem::validate_current_user_write_buffer(old_stack_ptr, SIGALTSTACK_WIRE_SIZE)
+        {
+            return linux_errno(address_space_error_to_linux_errno(err));
+        }
+        request.mask |= 0x1;
+    }
+    let extra_bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&extra as *const SigaltstackRequestExtra).cast::<u8>(),
+            size_of::<SigaltstackRequestExtra>(),
+        )
+    };
+    if extra_bytes.len() > SYSCALL_OFFLOAD_PATH_CAPACITY {
+        return linux_errno(LINUX_EINVAL);
+    }
+    request.path_len = extra_bytes.len() as u32;
+    request.path[..extra_bytes.len()].copy_from_slice(extra_bytes);
+
+    let response = match call_syscalld(request) {
+        Ok(response) => response,
+        Err(errno) => return linux_errno(errno),
+    };
+    if let Err(errno) = ensure_syscalld_status(&response) {
+        return linux_errno(errno);
+    }
+    if old_stack_ptr != 0 {
+        if (response.payload_len as usize) != size_of::<SigaltstackPayload>() {
+            return linux_errno(LINUX_EINVAL);
+        }
+        let mut payload = SigaltstackPayload::default();
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                response.payload.as_ptr(),
+                (&mut payload as *mut SigaltstackPayload).cast::<u8>(),
+                size_of::<SigaltstackPayload>(),
+            );
+        }
+        let mut out = [0_u8; SIGALTSTACK_WIRE_SIZE];
+        out[0..8].copy_from_slice(&payload.old_ss_sp.to_le_bytes());
+        out[8..12].copy_from_slice(&payload.old_ss_flags.to_le_bytes());
+        out[16..24].copy_from_slice(&payload.old_ss_size.to_le_bytes());
+        if let Err(err) = usermem::write_current_user_bytes(old_stack_ptr, &out) {
+            return linux_errno(address_space_error_to_linux_errno(err));
+        }
+    } else if response.payload_len != 0 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    0
+}
+
+pub(super) fn syscall_linux_brk(addr: u64) -> u64 {
+    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_BRK);
+    request.arg0 = addr;
+    let response = match call_syscalld(request) {
+        Ok(response) => response,
+        Err(_) if !ipc_ops::service_registered(linux_abi::IPC_SERVICE_LINUX_SYSCALLD) => {
+            return bootstrap_brk(addr);
+        }
+        Err(_) => return 0,
+    };
+    if response.payload_len as usize != size_of::<u64>() {
+        return 0;
+    }
+    let mut bytes = [0_u8; size_of::<u64>()];
+    bytes.copy_from_slice(&response.payload[..size_of::<u64>()]);
+    u64::from_le_bytes(bytes)
+}
 
 pub(super) fn syscall_linux_mmap(
     requested_addr: u64,
@@ -8,86 +136,296 @@ pub(super) fn syscall_linux_mmap(
     fd: u64,
     offset: u64,
 ) -> u64 {
-    match linux_ops::mmap(requested_addr, user_len, prot, flags, fd, offset) {
-        Ok(addr) => addr,
-        Err(err) => {
-            debug::println!(
-                "linux mmap rejected: addr={:#x} len={} prot={:#x} flags={:#x} fd={} offset={:#x} err={:?}",
-                requested_addr,
-                user_len,
-                prot,
-                flags,
-                fd,
-                offset,
-                err,
-            );
-            linux_errno(linux_sysop_error_to_errno(err))
+    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_MMAP);
+    request.arg0 = requested_addr;
+    request.arg1 = user_len;
+    request.flags = flags;
+    request.mask = prot as u32;
+    request.dirfd = fd;
+    // Pack offset into path bytes 0..8.
+    request.path[0..8].copy_from_slice(&offset.to_le_bytes());
+    request.path_len = 8;
+    let response = match call_syscalld(request) {
+        Ok(response) => response,
+        Err(_) if !ipc_ops::service_registered(linux_abi::IPC_SERVICE_LINUX_SYSCALLD) => {
+            return match bootstrap_mmap(requested_addr, user_len, prot, flags, fd, offset) {
+                Ok(addr) => addr,
+                Err(errno) => linux_errno(errno),
+            };
         }
+        Err(errno) => return linux_errno(errno),
+    };
+    if response.status != 0 {
+        return linux_errno(response.status.unsigned_abs() as i64);
     }
+    if response.payload_len as usize != size_of::<u64>() {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let mut bytes = [0_u8; size_of::<u64>()];
+    bytes.copy_from_slice(&response.payload[..size_of::<u64>()]);
+    u64::from_le_bytes(bytes)
 }
 
 pub(super) fn syscall_linux_mprotect(start: u64, user_len: u64, prot: u64) -> u64 {
-    match linux_ops::mprotect(start, user_len, prot) {
+    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_MPROTECT);
+    request.arg0 = start;
+    request.arg1 = user_len;
+    request.mask = prot as u32;
+    match call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response)) {
         Ok(()) => 0,
-        Err(err) => {
-            debug::println!(
-                "linux mprotect rejected: start={:#x} len={} prot={:#x} err={:?}",
-                start,
-                user_len,
-                prot,
-                err,
-            );
-            linux_errno(linux_sysop_error_to_errno(err))
+        Err(_) if !ipc_ops::service_registered(linux_abi::IPC_SERVICE_LINUX_SYSCALLD) => {
+            match bootstrap_mprotect(start, user_len, prot) {
+                Ok(()) => 0,
+                Err(errno) => linux_errno(errno),
+            }
         }
+        Err(errno) => linux_errno(errno),
     }
 }
 
 pub(super) fn syscall_linux_munmap(start: u64, user_len: u64) -> u64 {
-    match linux_ops::munmap(start, user_len) {
+    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_MUNMAP);
+    request.arg0 = start;
+    request.arg1 = user_len;
+    match call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response)) {
         Ok(()) => 0,
-        Err(err) => {
-            debug::println!(
-                "linux munmap rejected: start={:#x} len={} err={:?}",
-                start,
-                user_len,
-                err,
-            );
-            linux_errno(linux_sysop_error_to_errno(err))
+        Err(_) if !ipc_ops::service_registered(linux_abi::IPC_SERVICE_LINUX_SYSCALLD) => {
+            match bootstrap_munmap(start, user_len) {
+                Ok(()) => 0,
+                Err(errno) => linux_errno(errno),
+            }
         }
+        Err(errno) => linux_errno(errno),
     }
 }
 
-pub(super) fn syscall_linux_madvise(start: u64, user_len: u64, advice: u64) -> u64 {
-    match linux_ops::madvise(start, user_len, advice) {
-        Ok(()) => 0,
-        Err(err) => {
-            debug::println!(
-                "linux madvise rejected: start={:#x} len={} advice={} err={:?}",
-                start,
-                user_len,
-                advice,
-                err,
-            );
-            linux_errno(linux_sysop_error_to_errno(err))
+fn bootstrap_brk(addr: u64) -> u64 {
+    let Some(result) = multitask::with_current_user_process_state_mut(|_, abi, process_state| {
+        if abi != crate::user::abi::UserAbi::Linux {
+            return 0;
         }
+        let (brk_start, brk_mapped_end) = {
+            let (address_space, linux_process_state) =
+                process_state.address_space_and_linux_process_state_mut();
+            let Some(state) = linux_process_state.as_mut() else {
+                return 0;
+            };
+            if addr == 0 || addr < state.brk_start {
+                return state.brk_current;
+            }
+            let Some(requested_mapped_end) = checked_align_up(addr, PAGE_SIZE) else {
+                return state.brk_current;
+            };
+            if !state.can_grow_brk_to(requested_mapped_end) {
+                return state.brk_current;
+            }
+            if requested_mapped_end > state.brk_mapped_end {
+                let delta = requested_mapped_end - state.brk_mapped_end;
+                let page_count = (delta / PAGE_SIZE) as usize;
+                let flags = PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+                if address_space
+                    .map_zeroed_user_pages_at(
+                        VirtAddr::new(state.brk_mapped_end),
+                        page_count,
+                        flags,
+                    )
+                    .is_err()
+                {
+                    return state.brk_current;
+                }
+                state.brk_mapped_end = requested_mapped_end;
+            }
+            state.brk_current = addr;
+            (state.brk_start, state.brk_mapped_end)
+        };
+        if let Some(memory_map) = process_state.linux_memory_map_mut() {
+            memory_map.set_heap_range(brk_start, brk_mapped_end);
+        }
+        addr
+    }) else {
+        return 0;
+    };
+    result
+}
+
+fn bootstrap_mmap(
+    requested_addr: u64,
+    user_len: u64,
+    prot: u64,
+    flags: u64,
+    fd: u64,
+    offset: u64,
+) -> Result<u64, i64> {
+    let flags = linux_mmap_effective_flags(flags);
+    if offset != 0 || !linux_mmap_fd_is_anonymous(fd) {
+        return Err(LINUX_EINVAL);
+    }
+    if flags & linux_abi::MAP_ANONYMOUS == 0
+        || linux_mmap_mapping_type(flags) != linux_abi::MAP_PRIVATE
+    {
+        return Err(LINUX_EINVAL);
+    }
+    if prot & !(linux_abi::PROT_READ | linux_abi::PROT_WRITE | linux_abi::PROT_EXEC) != 0 {
+        return Err(LINUX_EINVAL);
+    }
+    if prot & linux_abi::PROT_WRITE != 0 && prot & linux_abi::PROT_EXEC != 0 {
+        return Err(LINUX_EACCES);
+    }
+    let fixed = flags & linux_abi::MAP_FIXED != 0;
+    if fixed && (requested_addr == 0 || requested_addr & (PAGE_SIZE - 1) != 0) {
+        return Err(LINUX_EINVAL);
+    }
+    let len = checked_align_up(user_len, PAGE_SIZE).ok_or(LINUX_ENOMEM)?;
+    if len == 0 {
+        return Err(LINUX_EINVAL);
+    }
+    let page_count = usize::try_from(len / PAGE_SIZE).map_err(|_| LINUX_EINVAL)?;
+    let page_flags = linux_mmap_page_flags(prot);
+
+    let Some(result) = multitask::with_current_user_process_state_mut(|_, abi, process_state| {
+        if abi != crate::user::abi::UserAbi::Linux {
+            return Err(LINUX_ENOSYS);
+        }
+        let mapped = {
+            let (address_space, linux_process_state) =
+                process_state.address_space_and_linux_process_state_mut();
+            let Some(state) = linux_process_state.as_mut() else {
+                return Err(LINUX_ENOSYS);
+            };
+            let start = if fixed {
+                requested_addr
+            } else {
+                find_bootstrap_mmap_start(address_space, state, requested_addr, len)?
+            };
+            let end = start.checked_add(len).ok_or(LINUX_ENOMEM)?;
+            if end > state.brk_limit() || end <= state.brk_mapped_end {
+                return Err(LINUX_ENOMEM);
+            }
+            if fixed {
+                let _ = address_space.unmap_user_bytes(VirtAddr::new(start), len as usize);
+                let _ = state.release_reserved_range(start, end);
+            } else if state.has_reserved_overlap(start, end)
+                || address_space
+                    .regions()
+                    .iter()
+                    .any(|region| region.start.as_u64() < end && start < region.end().as_u64())
+            {
+                return Err(LINUX_ENOMEM);
+            }
+            let region = address_space
+                .map_zeroed_user_pages_at(VirtAddr::new(start), page_count, page_flags)
+                .map_err(address_space_error_to_linux_errno)?;
+            state.mmap_next = state.mmap_next.max(region.end().as_u64());
+            region.start.as_u64()
+        };
+        process_state.set_mapping_cursor(mapped.checked_add(len).ok_or(LINUX_ENOMEM)?);
+        Ok(mapped)
+    }) else {
+        return Err(LINUX_ENOSYS);
+    };
+    result
+}
+
+fn bootstrap_mprotect(start: u64, user_len: u64, prot: u64) -> Result<(), i64> {
+    if start & (PAGE_SIZE - 1) != 0 {
+        return Err(LINUX_EINVAL);
+    }
+    let len = checked_align_up(user_len, PAGE_SIZE).ok_or(LINUX_EINVAL)?;
+    if len == 0 {
+        return Err(LINUX_EINVAL);
+    }
+    let flags = linux_mmap_page_flags(prot);
+    let Some(result) = multitask::with_current_user_process_state_mut(|_, abi, process_state| {
+        if abi != crate::user::abi::UserAbi::Linux {
+            return Err(LINUX_ENOSYS);
+        }
+        process_state
+            .address_space_mut()
+            .protect_user_bytes(VirtAddr::new(start), len as usize, flags)
+            .map_err(address_space_error_to_linux_errno)
+    }) else {
+        return Err(LINUX_ENOSYS);
+    };
+    result
+}
+
+fn bootstrap_munmap(start: u64, user_len: u64) -> Result<(), i64> {
+    if start & (PAGE_SIZE - 1) != 0 {
+        return Err(LINUX_EINVAL);
+    }
+    let len = checked_align_up(user_len, PAGE_SIZE).ok_or(LINUX_EINVAL)?;
+    if len == 0 {
+        return Err(LINUX_EINVAL);
+    }
+    let Some(result) = multitask::with_current_user_process_state_mut(|_, abi, process_state| {
+        if abi != crate::user::abi::UserAbi::Linux {
+            return Err(LINUX_ENOSYS);
+        }
+        match process_state
+            .address_space_mut()
+            .unmap_user_bytes(VirtAddr::new(start), len as usize)
+        {
+            Ok(_) | Err(paging::AddressSpaceError::NotMapped) => Ok(()),
+            Err(err) => Err(address_space_error_to_linux_errno(err)),
+        }
+    }) else {
+        return Err(LINUX_ENOSYS);
+    };
+    result
+}
+
+fn find_bootstrap_mmap_start(
+    address_space: &paging::ProcessAddressSpace,
+    state: &linux_abi::LinuxProcessState,
+    requested_addr: u64,
+    len: u64,
+) -> Result<u64, i64> {
+    let mut start = if requested_addr == 0 {
+        checked_align_up(state.mmap_next, PAGE_SIZE).ok_or(LINUX_ENOMEM)?
+    } else {
+        checked_align_up(requested_addr, PAGE_SIZE).ok_or(LINUX_ENOMEM)?
+    };
+    loop {
+        let end = start.checked_add(len).ok_or(LINUX_ENOMEM)?;
+        if end > state.brk_limit() {
+            return Err(LINUX_ENOMEM);
+        }
+        let overlaps_mapped = address_space
+            .regions()
+            .iter()
+            .any(|region| region.start.as_u64() < end && start < region.end().as_u64());
+        if !overlaps_mapped && !state.has_reserved_overlap(start, end) {
+            return Ok(start);
+        }
+        start = checked_align_up(end, PAGE_SIZE).ok_or(LINUX_ENOMEM)?;
     }
 }
 
-pub(super) fn syscall_linux_sigaltstack(stack_ptr: u64, old_stack_ptr: u64) -> u64 {
-    match linux_ops::sigaltstack(stack_ptr, old_stack_ptr) {
-        Ok(()) => 0,
-        Err(err) => {
-            debug::println!(
-                "linux sigaltstack rejected: stack_ptr={:#x} old_stack_ptr={:#x} err={:?}",
-                stack_ptr,
-                old_stack_ptr,
-                err,
-            );
-            linux_errno(linux_sysop_error_to_errno(err))
-        }
-    }
+fn linux_mmap_fd_is_anonymous(fd: u64) -> bool {
+    fd == u64::MAX || fd == u32::MAX as u64
 }
 
-pub(super) fn syscall_linux_brk(addr: u64) -> u64 {
-    linux_ops::brk(addr)
+fn linux_mmap_effective_flags(flags: u64) -> u64 {
+    flags & !(linux_abi::MAP_DENYWRITE | linux_abi::MAP_EXECUTABLE)
+}
+
+fn linux_mmap_mapping_type(flags: u64) -> u64 {
+    flags & linux_abi::MAP_TYPE
+}
+
+fn linux_mmap_page_flags(prot: u64) -> PageTableFlags {
+    let mut flags = PageTableFlags::empty();
+    if prot & linux_abi::PROT_WRITE != 0 {
+        flags |= PageTableFlags::WRITABLE;
+    }
+    if prot & linux_abi::PROT_EXEC == 0 {
+        flags |= PageTableFlags::NO_EXECUTE;
+    }
+    flags
+}
+
+fn checked_align_up(value: u64, align: u64) -> Option<u64> {
+    debug_assert!(align.is_power_of_two());
+    let mask = align.checked_sub(1)?;
+    Some(value.checked_add(mask)? & !mask)
 }

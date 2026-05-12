@@ -24,7 +24,7 @@ defined in `tools/xtask/src/cli.rs`.
 | `cargo xtask fuzz-host` | Run deterministic host parser fuzz smoke tests. | `logs/fuzz-crash-*.bin` on crash. |
 | `cargo xtask clean` | Remove cargo/build outputs. | Cleaned target/build dirs. |
 | `cargo xtask targets` | Install required Rust targets. | Rust target availability. |
-| `cargo xtask build-efi` | Build GRUB EFI boot manager only. Requires `RUSTOS_GRUB_PUBKEY` and `RUSTOS_GRUB_SIGNING_KEY`. | `build/artifacts/EFI/BOOT/BOOTX64.EFI`, `build/artifacts/nucleus.elf.sig`. |
+| `cargo xtask build-efi` | Build GRUB EFI boot manager only. Uses `RUSTOS_GRUB_*` when set, otherwise creates a local development key under `build/dev-grub-gpg`. | `build/artifacts/EFI/BOOT/BOOTX64.EFI`, `build/artifacts/nucleus.elf.sig`. |
 | `cargo xtask build-kernel` | Build Multiboot2 nucleus/kernel only. | `build/artifacts/nucleus.elf`. |
 | `cargo xtask build-user` | Build userspace packages. | service/app artifacts. |
 | `cargo xtask build-console-demo` | Build C demo/smoke programs. | app artifacts. |
@@ -107,7 +107,7 @@ Use `cargo xtask qemu-scenarios --list` to see the built-in scenario names.
 | `cargo xtask fuzz-host` | deterministic host parser fuzz smoke test를 실행합니다. | crash 시 `logs/fuzz-crash-*.bin` |
 | `cargo xtask clean` | cargo/build output을 지웁니다. | 정리된 target/build dirs |
 | `cargo xtask targets` | 필요한 Rust target을 설치합니다. | Rust target availability |
-| `cargo xtask build-efi` | GRUB EFI boot manager만 빌드합니다. `RUSTOS_GRUB_PUBKEY`, `RUSTOS_GRUB_SIGNING_KEY`가 필요합니다. | `build/artifacts/EFI/BOOT/BOOTX64.EFI`, `build/artifacts/nucleus.elf.sig` |
+| `cargo xtask build-efi` | GRUB EFI boot manager만 빌드합니다. `RUSTOS_GRUB_*` 값이 없으면 `build/dev-grub-gpg` 아래에 로컬 개발 키를 생성합니다. | `build/artifacts/EFI/BOOT/BOOTX64.EFI`, `build/artifacts/nucleus.elf.sig` |
 | `cargo xtask build-kernel` | Multiboot2 nucleus/kernel만 빌드합니다. | `build/artifacts/nucleus.elf` |
 | `cargo xtask build-user` | userspace package를 빌드합니다. | service/app artifacts |
 | `cargo xtask build-console-demo` | C demo/smoke program을 빌드합니다. | app artifacts |

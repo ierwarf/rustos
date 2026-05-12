@@ -11,11 +11,11 @@ use crate::user::abi::UserAbi;
 use crate::user::handles::VfsFileHandle;
 use crate::user::linux::{LinuxProcessImageInfo, LinuxProcessLaunch};
 use crate::user::process_state::ProcessSecurityContext;
-use crate::user::windows::WindowsProcessLaunch;
 use crate::vfs;
 
 mod linux;
-mod windows;
+// RING3-MIGRATION-REFERENCE: Windows process loader/runtime is preserved in
+// `process/windows/*.rs` as commented source for a future loaderd-owned PE path.
 
 const PAGE_SIZE: u64 = 4096;
 const MAX_LOAD_SEGMENTS: usize = 32;
@@ -216,14 +216,12 @@ impl ProcessStartRegisters {
 #[derive(Clone)]
 enum LoadedProcessRuntime {
     Linux(LinuxProcessImageInfo),
-    Windows(windows::WindowsProcessImageInfo),
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct ProcessLaunchOptions<'a> {
     pub registers: ProcessStartRegisters,
     pub linux: LinuxProcessLaunch<'a>,
-    pub windows: WindowsProcessLaunch<'a>,
     pub(crate) console_session: ConsoleSessionHandle,
     pub logical_admin: bool,
 }
@@ -233,7 +231,6 @@ impl<'a> Default for ProcessLaunchOptions<'a> {
         Self {
             registers: ProcessStartRegisters::new(),
             linux: LinuxProcessLaunch::new(""),
-            windows: WindowsProcessLaunch::new(""),
             console_session: ConsoleSessionHandle::SYSTEM,
             logical_admin: false,
         }
@@ -246,7 +243,9 @@ pub fn load_image(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadError> 
         return linux::load_elf(image);
     }
     if image.starts_with(b"MZ") {
-        return windows::load_pe(image);
+        return Err(ProcessLoadError::InvalidPe(
+            "Windows PE loading is ring3-migration reference material",
+        ));
     }
 
     Err(ProcessLoadError::InvalidPe(
@@ -255,12 +254,14 @@ pub fn load_image(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadError> 
 }
 
 pub fn initialize_windows_thread_identifiers(
-    address_space: &mut ProcessAddressSpace,
-    teb_address: u64,
-    process_id: u64,
-    thread_id: u64,
+    _address_space: &mut ProcessAddressSpace,
+    _teb_address: u64,
+    _process_id: u64,
+    _thread_id: u64,
 ) -> Result<(), ProcessLoadError> {
-    windows::initialize_thread_identifiers(address_space, teb_address, process_id, thread_id)
+    Err(ProcessLoadError::InvalidPe(
+        "Windows TEB initialization is ring3-migration reference material",
+    ))
 }
 
 pub fn spawn_process_with_launch(
@@ -382,23 +383,9 @@ pub fn load_image_file(file: VfsFileHandle) -> Result<LoadedProcessImage, Proces
         return linux::load_elf_file(file);
     }
     if &header[..2] == b"MZ" {
-        let image = file
-            .shared_bytes()
-            .map(|bytes| bytes.as_ref().to_vec())
-            .unwrap_or_else(|| {
-                let mut bytes = vec![0_u8; file.len()];
-                let mut copied = 0usize;
-                while copied < bytes.len() {
-                    let read = file.read_at(copied, &mut bytes[copied..]);
-                    if read == 0 {
-                        bytes.truncate(copied);
-                        break;
-                    }
-                    copied += read;
-                }
-                bytes
-            });
-        return windows::load_pe(image.as_slice());
+        return Err(ProcessLoadError::InvalidPe(
+            "Windows PE loading is ring3-migration reference material",
+        ));
     }
 
     Err(ProcessLoadError::InvalidPe(
@@ -442,25 +429,6 @@ fn build_process_bootstrap(
                 Some(linux::build_runtime_profile(&image, launch.linux)),
                 Some(image.initial_thread_state()),
             )
-        }
-        (UserAbi::Windows, LoadedProcessRuntime::Windows(image)) => {
-            let stack_pointer = initial_user_stack_top(stack_end)?;
-            let windows_runtime = windows::initialize_windows_runtime(
-                address_space,
-                &image,
-                launch.windows,
-                user_stack,
-                stack_end.as_u64(),
-            )?;
-            let mut bootstrap = multitask::UserTaskBootstrap::new(abi, entry, stack_pointer);
-            bootstrap.windows_runtime = Some(windows_runtime.runtime);
-            bootstrap.windows_thread_state = Some(windows_runtime.thread_state);
-            bootstrap.registers = launch.registers.into_task_registers();
-            bootstrap.user_stack = user_stack;
-            bootstrap.console_session = launch.console_session;
-            bootstrap.logical_admin = launch.logical_admin;
-            bootstrap.set_exec_path(launch.windows.exec_path);
-            return Ok(bootstrap);
         }
         _ => {
             return Err(ProcessLoadError::InvalidElf(

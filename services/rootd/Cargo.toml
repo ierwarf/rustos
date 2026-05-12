@@ -1,0 +1,10 @@
+[package]
+name = "rootd"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+build = "build.rs"
+
+[dependencies]
+rustos-user-abi = { path = "../../libs/rustos-user-abi" }

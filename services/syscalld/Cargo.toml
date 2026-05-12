@@ -5,5 +5,11 @@ edition = "2021"
 publish = false
 
 [dependencies]
-libc = "0.2"
+rustos-svc-runtime = { path = "../../libs/rustos-svc-runtime" }
 rustos-user-abi = { path = "../../libs/rustos-user-abi" }
+spin = { version = "0.10", default-features = false, features = ["spin_mutex", "once"] }
+
+[[bin]]
+name = "syscalld"
+path = "src/main.rs"
+test = false

@@ -13,7 +13,7 @@ use x86_64::VirtAddr;
 
 use crate::{announce_ready, debug, fatal, flow_debug, flow_info, hal_hooks, io_services, tasks};
 
-const INITD_EXEC_PATH: &str = "services/initd/initd.elf";
+const ROOTD_EXEC_PATH: &str = "services/rootd/rootd.elf";
 const MAX_BACKTRACE_FRAME_STEP: u64 = 1024 * 1024;
 
 macro_rules! boot_log {
@@ -316,24 +316,24 @@ pub fn bootstrap_init_process() {
         return;
     }
     debug::record_milestone(debug::LogCategory::Boot, "init-bootstrap-allowed", 0, 0);
-    flow_info(31, "init bootstrap begin");
-    boot_log!(debug::LogLevel::Info, 141, 0, "init bootstrap begin");
-    io_services::console_write(b"Bootstrapping init process...\r\n");
+    flow_info(31, "root bootstrap begin");
+    boot_log!(debug::LogLevel::Info, 141, 0, "root bootstrap begin");
+    io_services::console_write(b"Bootstrapping root process...\r\n");
     boot_log!(
         debug::LogLevel::Debug,
         142,
         0,
         "init bootstrap console line written",
     );
-    flow_debug(32, "init bootstrap loading initd");
+    flow_debug(32, "init bootstrap loading rootd");
     debug::record_milestone(debug::LogCategory::Boot, "init-bootstrap-load-begin", 0, 0);
     boot_log!(
         debug::LogLevel::Info,
         143,
         0,
-        "init bootstrap loading path={INITD_EXEC_PATH}",
+        "init bootstrap loading path={ROOTD_EXEC_PATH}",
     );
-    let loaded = match console_host::load_executable_image_by_path(INITD_EXEC_PATH, None) {
+    let loaded = match console_host::load_executable_image_by_path(ROOTD_EXEC_PATH, None) {
         Ok(loaded) => loaded,
         Err(err) => fatal::fatal_init_bootstrap_load(err),
     };
@@ -353,20 +353,20 @@ pub fn bootstrap_init_process() {
     );
     flow_debug(33, "init bootstrap image loaded");
     let program =
-        ConsoleProgramSpec::new(&loaded.bytes, INITD_EXEC_PATH, 50).with_logical_admin(true);
+        ConsoleProgramSpec::new(&loaded.bytes, ROOTD_EXEC_PATH, 50).with_logical_admin(true);
     match console_host::spawn_program_in_session(io_services::system_console_session_raw(), program)
     {
         Ok(_spawned) => {}
         Err(err) => fatal::fatal_init_bootstrap_spawn(err),
     }
-    flow_info(34, "init bootstrap spawn complete");
+    flow_info(34, "root bootstrap spawn complete");
     boot_log!(
         debug::LogLevel::Info,
         145,
         0,
-        "init bootstrap spawn complete",
+        "root bootstrap spawn complete",
     );
-    io_services::console_write(b"Init process ready.\r\n");
+    io_services::console_write(b"Root process ready.\r\n");
 }
 
 pub fn run_nucleus_loop() -> ! {

@@ -23,6 +23,5 @@ pub mod socket {
 }
 pub mod syscall;
 pub mod sysops;
-pub mod windows {
-    pub use crate::windows::*;
-}
+// RING3-MIGRATION-REFERENCE: Windows user-compat launch policy is commented in
+// `user/windows.rs` and `user/process/windows/*.rs` for migration to services.

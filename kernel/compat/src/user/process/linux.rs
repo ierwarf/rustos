@@ -181,7 +181,7 @@ pub(super) fn load_elf(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadEr
             (main_image.entry, 0, main_image.max_loaded_end)
         };
 
-    let linux_image = build_linux_process_image(
+    let mut linux_image = build_linux_process_image(
         &elf,
         &header,
         image,
@@ -193,6 +193,10 @@ pub(super) fn load_elf(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadEr
         image_mappings,
         runtime_search_paths,
     )?;
+
+    if linux_image.interpreter_path.is_none() {
+        reserve_bootstrap_heap(&mut address_space, &mut linux_image)?;
+    }
 
     Ok(LoadedProcessImage {
         abi: UserAbi::Linux,
@@ -272,7 +276,7 @@ pub(super) fn load_elf_file(file: VfsFileHandle) -> Result<LoadedProcessImage, P
             (main_image.entry, 0, main_image.max_loaded_end)
         };
 
-    let linux_image = build_linux_process_image_from_headers(
+    let mut linux_image = build_linux_process_image_from_headers(
         &header,
         &program_headers,
         main_image.load_bias,
@@ -283,6 +287,10 @@ pub(super) fn load_elf_file(file: VfsFileHandle) -> Result<LoadedProcessImage, P
         image_mappings,
         runtime_search_paths,
     )?;
+
+    if linux_image.interpreter_path.is_none() {
+        reserve_bootstrap_heap(&mut address_space, &mut linux_image)?;
+    }
 
     Ok(LoadedProcessImage {
         abi: UserAbi::Linux,
@@ -1112,6 +1120,8 @@ fn build_linux_process_image(
         program_header_entry_size: header.program_header_entry_size,
         program_header_count: header.program_header_count,
         brk_start,
+        bootstrap_heap_base: 0,
+        bootstrap_heap_len: 0,
         initial_tls,
         image_mappings,
         runtime_search_paths,
@@ -1156,10 +1166,44 @@ fn build_linux_process_image_from_headers(
         program_header_entry_size: header.program_header_entry_size,
         program_header_count: header.program_header_count,
         brk_start,
+        bootstrap_heap_base: 0,
+        bootstrap_heap_len: 0,
         initial_tls,
         image_mappings,
         runtime_search_paths,
     })
+}
+
+/// Pre-map a fixed bootstrap heap region for static-PIE policy services so
+/// `rustos-svc-runtime` can hand the address out to its bump allocator before
+/// any of the dynamic Linux runtime (and thus syscalld/vfsd) is available.
+/// Modeled on the seL4 BootInfo pattern where the kernel hands the root task
+/// pre-existing memory caps. Idempotent on failure: errors propagate as
+/// `ProcessLoadError` and leave the address space unchanged.
+fn reserve_bootstrap_heap(
+    address_space: &mut ProcessAddressSpace,
+    image: &mut LinuxProcessImageInfo,
+) -> Result<(), ProcessLoadError> {
+    use rustos_user_abi::syscall::RUSTOS_BOOTSTRAP_HEAP_DEFAULT_LEN;
+    const HEAP_GAP: u64 = 16 * 1024 * 1024;
+    const PAGE_SIZE_U64: u64 = 4096;
+
+    let heap_len = RUSTOS_BOOTSTRAP_HEAP_DEFAULT_LEN;
+    let heap_base = align_up(image.brk_start.saturating_add(HEAP_GAP), PAGE_SIZE_U64).ok_or(
+        ProcessLoadError::InvalidElf("bootstrap heap base overflow"),
+    )?;
+    if heap_base.checked_add(heap_len).is_none() {
+        return Err(ProcessLoadError::InvalidElf("bootstrap heap range overflow"));
+    }
+    let page_count = (heap_len / PAGE_SIZE_U64) as usize;
+    let flags = PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+    address_space
+        .map_zeroed_user_pages_at(VirtAddr::new(heap_base), page_count, flags)
+        .map_err(|_| ProcessLoadError::InvalidElf("bootstrap heap mapping failed"))?;
+
+    image.bootstrap_heap_base = heap_base;
+    image.bootstrap_heap_len = heap_len;
+    Ok(())
 }
 
 pub(super) fn build_runtime_profile(
@@ -2345,6 +2389,10 @@ fn build_linux_initial_stack_words(
         LINUX_AUX_HWCAP2,
         linux_abi::AT_EXECFN,
         execfn_addr,
+        rustos_user_abi::syscall::AT_RUSTOS_BOOTSTRAP_HEAP_BASE,
+        image.bootstrap_heap_base,
+        rustos_user_abi::syscall::AT_RUSTOS_BOOTSTRAP_HEAP_LEN,
+        image.bootstrap_heap_len,
         linux_abi::AT_NULL,
         0,
     ];
@@ -2469,6 +2517,8 @@ mod tests {
             program_header_entry_size: 56,
             program_header_count: 9,
             brk_start: 0x500000,
+            bootstrap_heap_base: 0,
+            bootstrap_heap_len: 0,
             initial_tls: None,
             image_mappings: Vec::new(),
             runtime_search_paths: Vec::new(),
@@ -2558,6 +2608,8 @@ mod tests {
             program_header_entry_size: 0,
             program_header_count: 0,
             brk_start: 0,
+            bootstrap_heap_base: 0,
+            bootstrap_heap_len: 0,
             initial_tls: None,
             image_mappings: Vec::new(),
             runtime_search_paths: vec![String::from("$ORIGIN/../lib")],
@@ -2593,6 +2645,8 @@ mod tests {
             program_header_entry_size: 0,
             program_header_count: 0,
             brk_start: 0,
+            bootstrap_heap_base: 0,
+            bootstrap_heap_len: 0,
             initial_tls: None,
             image_mappings: Vec::new(),
             runtime_search_paths: vec![

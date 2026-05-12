@@ -2,7 +2,7 @@ use anyhow::{Context, anyhow, bail};
 use fs_err as fs;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::Result;
 use crate::config::Config;
@@ -19,6 +19,14 @@ use crate::util::{
 mod cargo;
 
 use cargo::{apply_kernel_cargo_env, run_cargo_kernel_check, run_cargo_kernel_rustc};
+
+const DEFAULT_GRUB_DEV_KEY: &str = "RustOS Dev GRUB <rustos-dev-grub@example.invalid>";
+
+struct GrubSigningMaterial {
+    gpg_home: PathBuf,
+    pubkey: PathBuf,
+    signing_key: String,
+}
 
 pub(crate) fn build(config: &Config) -> Result<()> {
     validate_workspace_layering(&config.root_dir)?;
@@ -147,15 +155,9 @@ pub(crate) fn ensure_targets(config: &Config) -> Result<()> {
 }
 
 pub(crate) fn build_efi(config: &Config) -> Result<()> {
-    let pubkey = config
-        .rustos_grub_pubkey
-        .as_ref()
-        .context("RUSTOS_GRUB_PUBKEY is required to build the GRUB EFI boot manager")?;
-    if !pubkey.is_file() {
-        bail!("RUSTOS_GRUB_PUBKEY is not a file: {}", pubkey.display());
-    }
+    let signing = ensure_grub_signing_material(config)?;
 
-    sign_nucleus(config)?;
+    sign_nucleus_with(config, &signing)?;
 
     let artifact = config.artifact_boot_efi_path();
     remove_file_if_exists(&artifact)?;
@@ -171,7 +173,7 @@ pub(crate) fn build_efi(config: &Config) -> Result<()> {
         "set check_signatures=enforce\nload_video\nset gfxmode=auto\nset gfxpayload=keep\nterminal_output gfxterm\nsearch --file --set=root /nucleus.elf\nmultiboot2 ($root)/nucleus.elf\nboot\n",
     )?;
     let grub_cfg_signature = temp_dir.join("grub.cfg.sig");
-    sign_detached(config, &grub_cfg, &grub_cfg_signature)?;
+    sign_detached(config, &signing, &grub_cfg, &grub_cfg_signature)?;
 
     let mut command = Command::new(&config.grub_mkstandalone);
     command
@@ -180,7 +182,7 @@ pub(crate) fn build_efi(config: &Config) -> Result<()> {
         .arg("-o")
         .arg(&artifact)
         .arg("--pubkey")
-        .arg(pubkey)
+        .arg(&signing.pubkey)
         .arg("--modules")
         .arg("memdisk tar normal pgp gcry_rsa gcry_sha256 gcry_sha512 fat part_msdos part_gpt search search_fs_file ls multiboot2 all_video video video_fb efi_gop efi_uga gfxterm")
         .arg("--install-modules")
@@ -233,11 +235,21 @@ fn check_nucleus_multiboot2(config: &Config) -> Result<()> {
 }
 
 pub(crate) fn sign_nucleus(config: &Config) -> Result<()> {
+    let signing = ensure_grub_signing_material(config)?;
+    sign_nucleus_with(config, &signing)
+}
+
+fn sign_nucleus_with(config: &Config, signing: &GrubSigningMaterial) -> Result<()> {
     let nucleus = config.artifact_nucleus_elf_path();
     if !nucleus.is_file() {
         bail!("missing nucleus artifact: {}", nucleus.display());
     }
-    sign_detached(config, &nucleus, &config.artifact_nucleus_signature_path())
+    sign_detached(
+        config,
+        signing,
+        &nucleus,
+        &config.artifact_nucleus_signature_path(),
+    )
 }
 
 fn refresh_nucleus_signature_after_build(config: &Config) -> Result<()> {
@@ -256,29 +268,132 @@ fn refresh_nucleus_signature_after_build(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn sign_detached(config: &Config, input: &Path, signature: &Path) -> Result<()> {
-    let signing_key = config
-        .rustos_grub_signing_key
-        .as_deref()
-        .context("RUSTOS_GRUB_SIGNING_KEY is required to sign GRUB boot inputs")?;
+fn sign_detached(
+    config: &Config,
+    signing: &GrubSigningMaterial,
+    input: &Path,
+    signature: &Path,
+) -> Result<()> {
     remove_file_if_exists(signature)?;
 
     let mut command = Command::new(&config.gpg);
-    if let Some(home) = config.rustos_gpg_home.as_ref() {
-        command.arg("--homedir").arg(home);
-    }
     command
+        .arg("--homedir")
+        .arg(&signing.gpg_home)
         .arg("--batch")
         .arg("--yes")
         .arg("--pinentry-mode")
         .arg("loopback")
         .arg("--local-user")
-        .arg(signing_key)
+        .arg(&signing.signing_key)
         .arg("--detach-sign")
         .arg("--output")
         .arg(signature)
         .arg(input);
     run_command(&mut command)
+}
+
+fn ensure_grub_signing_material(config: &Config) -> Result<GrubSigningMaterial> {
+    let gpg_home = config
+        .rustos_gpg_home
+        .clone()
+        .unwrap_or_else(|| config.build_dir.join("dev-grub-gpg"));
+    let pubkey = config
+        .rustos_grub_pubkey
+        .clone()
+        .unwrap_or_else(|| config.build_dir.join("dev-grub.pub"));
+    let signing_key = config
+        .rustos_grub_signing_key
+        .clone()
+        .unwrap_or_else(|| String::from(DEFAULT_GRUB_DEV_KEY));
+
+    fs::create_dir_all(&gpg_home)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gpg_home, std::fs::Permissions::from_mode(0o700))?;
+    }
+
+    if !gpg_secret_key_exists(config, &gpg_home, &signing_key)? {
+        generate_grub_dev_key(config, &gpg_home, &signing_key)?;
+    }
+
+    export_grub_pubkey(config, &gpg_home, &signing_key, &pubkey)?;
+    Ok(GrubSigningMaterial {
+        gpg_home,
+        pubkey,
+        signing_key,
+    })
+}
+
+fn gpg_secret_key_exists(config: &Config, gpg_home: &Path, signing_key: &str) -> Result<bool> {
+    let status = Command::new(&config.gpg)
+        .arg("--homedir")
+        .arg(gpg_home)
+        .arg("--batch")
+        .arg("--list-secret-keys")
+        .arg(signing_key)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    Ok(status.success())
+}
+
+fn generate_grub_dev_key(config: &Config, gpg_home: &Path, signing_key: &str) -> Result<()> {
+    let mut command = Command::new(&config.gpg);
+    command
+        .arg("--homedir")
+        .arg(gpg_home)
+        .arg("--batch")
+        .arg("--passphrase")
+        .arg("")
+        .arg("--pinentry-mode")
+        .arg("loopback")
+        .arg("--quick-gen-key")
+        .arg(signing_key)
+        .arg("rsa2048")
+        .arg("sign")
+        .arg("0");
+    run_command(&mut command).with_context(|| {
+        format!(
+            "failed to generate GRUB development signing key in {}",
+            gpg_home.display()
+        )
+    })
+}
+
+fn export_grub_pubkey(
+    config: &Config,
+    gpg_home: &Path,
+    signing_key: &str,
+    pubkey: &Path,
+) -> Result<()> {
+    if let Some(parent) = pubkey.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let output = Command::new(&config.gpg)
+        .arg("--homedir")
+        .arg(gpg_home)
+        .arg("--batch")
+        .arg("--export")
+        .arg(signing_key)
+        .output()?;
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stdout.is_empty() {
+            eprint!("{stdout}");
+        }
+        if !stderr.is_empty() {
+            eprint!("{stderr}");
+        }
+        bail!(
+            "failed to export GRUB public key with status {}",
+            output.status
+        );
+    }
+    fs::write(pubkey, output.stdout)?;
+    Ok(())
 }
 
 pub(crate) fn build_user(config: &Config) -> Result<()> {
@@ -432,6 +547,24 @@ fn build_manifest(config: &Config, manifest: &PackageManifest) -> Result<()> {
 }
 
 fn build_cargo_kernel_binary(config: &Config, manifest: &PackageManifest) -> Result<()> {
+    let linkage = manifest
+        .build
+        .linkage
+        .as_deref()
+        .unwrap_or(config.user_elf_linkage.as_str());
+
+    match linkage {
+        "dynamic" => build_cargo_kernel_binary_dynamic(config, manifest),
+        "static-pie" => build_cargo_kernel_binary_static_pie(config, manifest),
+        other => bail!(
+            "package {} has unsupported build.linkage={:?}",
+            manifest.id,
+            other
+        ),
+    }
+}
+
+fn build_cargo_kernel_binary_dynamic(config: &Config, manifest: &PackageManifest) -> Result<()> {
     if config.user_elf_linkage != "dynamic" {
         bail!(
             "Rust std userspace currently supports only USER_ELF_LINKAGE=dynamic, got {}",
@@ -453,6 +586,54 @@ fn build_cargo_kernel_binary(config: &Config, manifest: &PackageManifest) -> Res
         .arg(&config.kernel_target)
         .arg("--release")
         .env("CARGO_TARGET_DIR", &config.cargo_target_dir);
+    run_command(&mut command)?;
+
+    let binary = config
+        .cargo_target_dir
+        .join(format!("{}/release/{package}", config.kernel_target));
+    let artifact = manifest.artifact_path(config);
+    if output_is_fresh(&artifact, &[binary.clone()])? {
+        return Ok(());
+    }
+    copy_with_parent(&binary, &artifact)
+}
+
+/// Build a `no_std` static-PIE service binary that has no `PT_INTERP` and no
+/// libc dependency. Used by foundation policy services (syscalld, vfsd) so
+/// that bringing them up does not require the dynamic Linux runtime they are
+/// supposed to provide — the seL4 root-task pattern. See
+/// [`libs/rustos-svc-runtime`](../../../../libs/rustos-svc-runtime/src/lib.rs).
+fn build_cargo_kernel_binary_static_pie(
+    config: &Config,
+    manifest: &PackageManifest,
+) -> Result<()> {
+    let package = manifest
+        .build
+        .package
+        .as_deref()
+        .with_context(|| format!("package {} missing build.package", manifest.id))?;
+
+    // Link our own _start (provided by rustos-svc-runtime via the `entry!`
+    // macro) and produce a static PIE with no interpreter. `-no-pie` is NOT
+    // used — we want PIE so the kernel can choose a load bias.
+    let rustflags = concat!(
+        "-C target-feature=+crt-static ",
+        "-C relocation-model=pic ",
+        "-C link-arg=-nostartfiles ",
+        "-C link-arg=-static-pie ",
+        "-C link-arg=-Wl,--no-dynamic-linker"
+    );
+
+    let mut command = Command::new(&config.cargo);
+    command
+        .arg("build")
+        .arg("-p")
+        .arg(package)
+        .arg("--target")
+        .arg(&config.kernel_target)
+        .arg("--release")
+        .env("CARGO_TARGET_DIR", &config.cargo_target_dir)
+        .env("RUSTFLAGS", rustflags);
     run_command(&mut command)?;
 
     let binary = config

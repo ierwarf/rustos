@@ -632,12 +632,8 @@ fn validate_kernel_source_boundaries(root_dir: &Path) -> Result<()> {
     )?;
 
     for shared_util_file in [
-        "kernel/io-manager/src/input/i8042.rs",
-        "kernel/io-manager/src/input/dispatcher.rs",
         "kernel/io-manager/src/io/console.rs",
-        "kernel/io-manager/src/io/tty.rs",
         "kernel/compat/src/user/process/linux.rs",
-        "kernel/compat/src/user/sysops/linux/process.rs",
     ] {
         let source = fs::read_to_string(root_dir.join(shared_util_file))?;
         assert_source_not_contains_any(

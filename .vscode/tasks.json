@@ -2,20 +2,6 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "Prepare GRUB dev key",
-      "type": "shell",
-      "command": "${workspaceFolder}/tools/ensure-grub-dev-key.sh",
-      "options": {
-        "cwd": "${workspaceFolder}",
-        "env": {
-          "RUSTOS_GPG_HOME": "${workspaceFolder}/build/dev-grub-gpg",
-          "RUSTOS_GRUB_PUBKEY": "${workspaceFolder}/build/dev-grub.pub",
-          "RUSTOS_GRUB_SIGNING_KEY": "RustOS VSCode Dev <rustos-vscode-dev@example.invalid>"
-        }
-      },
-      "problemMatcher": []
-    },
-    {
       "label": "Build OS",
       "type": "process",
       "command": "cargo",
@@ -23,17 +9,8 @@
         "xtask",
         "build"
       ],
-      "dependsOn": [
-        "Prepare GRUB dev key"
-      ],
-      "dependsOrder": "sequence",
       "options": {
-        "cwd": "${workspaceFolder}",
-        "env": {
-          "RUSTOS_GPG_HOME": "${workspaceFolder}/build/dev-grub-gpg",
-          "RUSTOS_GRUB_PUBKEY": "${workspaceFolder}/build/dev-grub.pub",
-          "RUSTOS_GRUB_SIGNING_KEY": "RustOS VSCode Dev <rustos-vscode-dev@example.invalid>"
-        }
+        "cwd": "${workspaceFolder}"
       },
       "problemMatcher": []
     }

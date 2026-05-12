@@ -152,6 +152,28 @@ impl HandleRights {
         }
     }
 
+    pub const fn allows_read(self) -> bool {
+        match self {
+            Self::File(rights) | Self::Memfd(rights) => rights.contains(FileHandleRights::READ),
+            Self::Device(rights) => rights.contains(DeviceHandleRights::READ),
+            Self::SharedRegion(rights) | Self::DisplaySurface(rights) => {
+                rights.contains(SharedRegionRights::READ)
+            }
+            _ => false,
+        }
+    }
+
+    pub const fn allows_write(self) -> bool {
+        match self {
+            Self::File(rights) | Self::Memfd(rights) => rights.contains(FileHandleRights::WRITE),
+            Self::Device(rights) => rights.contains(DeviceHandleRights::WRITE),
+            Self::SharedRegion(rights) | Self::DisplaySurface(rights) => {
+                rights.contains(SharedRegionRights::WRITE)
+            }
+            _ => false,
+        }
+    }
+
     pub const fn allows_device_ioctl(self) -> bool {
         match self {
             Self::Device(rights) => rights.contains(DeviceHandleRights::IOCTL),

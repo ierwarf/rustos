@@ -1,0 +1,8 @@
+[package]
+name = "rustos-svc-runtime"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rustos-user-abi = { path = "../rustos-user-abi" }

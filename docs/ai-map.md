@@ -44,19 +44,10 @@ can reuse the prefix.
 - `compat/`: Windows/Linux compatibility support.
 - `assets/image/`: static boot-image overlay.
 
-## Avoid
+## Path Policy
 
-Do not inspect these unless the task explicitly requires them:
-
-- `logs/`
-- `target/`
-- `build/`
-- `vendor/`
-- `perf.data`
-- `Cargo.lock`
-
-For logs, prefer `tail -n 100` to `tail -n 200`. For large source files, use
-`rg -n` first and then open only the matching line range.
+Generated paths, logs, vendor inputs, `Cargo.lock`, and large-file rules live in
+`docs/ai/token-policy.md`. Use this map for entrypoints, not path exceptions.
 
 ## Fast Commands
 
@@ -80,5 +71,4 @@ For explicit context caching systems, cache this minimal repo context:
 4. `docs/ai/task-router.md`
 
 Then append exactly one focused AI doc from `docs/ai/` after classifying the
-task. Do not include `logs/`, `build/`, `target/`, `vendor/`, or command output
-in the cached unit.
+task. Keep generated output, logs, and command output outside the cached unit.

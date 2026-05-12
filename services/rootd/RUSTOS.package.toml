@@ -1,0 +1,23 @@
+id = "rootd"
+kind = "service"
+execution_domain = "user"
+profiles = ["default"]
+startup = "none"
+
+[build]
+builder = "cargo-kernel-binary"
+package = "rootd"
+
+[install]
+path = "services/rootd/rootd.elf"
+
+[boot]
+preload = true
+required = true
+priority = -700
+
+[[desktop.entries]]
+display_name = "rootd"
+weight_micros = 50
+logical_admin = true
+console_hosted = false

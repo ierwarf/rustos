@@ -937,6 +937,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c8d0fd677905edcbeedbf2edb6494d676f0e98d54d5cf9bda0b061cb8fb8aba"
 
 [[package]]
+name = "rootd"
+version = "0.1.0"
+dependencies = [
+ "rustos-user-abi",
+]
+
+[[package]]
 name = "runtime-control"
 version = "0.1.0"
 dependencies = [
@@ -998,6 +1005,13 @@ dependencies = [
 [[package]]
 name = "rustos-observability"
 version = "0.1.0"
+
+[[package]]
+name = "rustos-svc-runtime"
+version = "0.1.0"
+dependencies = [
+ "rustos-user-abi",
+]
 
 [[package]]
 name = "rustos-user-abi"
@@ -1203,8 +1217,9 @@ dependencies = [
 name = "syscalld"
 version = "0.1.0"
 dependencies = [
- "libc",
+ "rustos-svc-runtime",
  "rustos-user-abi",
+ "spin 0.10.0",
 ]
 
 [[package]]
@@ -1340,7 +1355,7 @@ name = "vfsd"
 version = "0.1.0"
 dependencies = [
  "fatfs",
- "libc",
+ "rustos-svc-runtime",
  "rustos-user-abi",
  "storage-core",
  "storage-fat",

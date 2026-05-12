@@ -10,10 +10,6 @@ pub mod linux {
     }
 }
 
-pub mod windows {
-    pub use crate::windows::*;
-}
-
 pub mod shared {
     pub mod console_host {
         pub use crate::user::console_host::*;
@@ -31,9 +27,7 @@ pub mod syscall {
         set_linux_compat_stack_guard, with_kernel_gs_base,
     };
 
-    pub fn service_pending() {
-        kernel_io_manager::api::driver::linux::runtime::service_compat_pending();
-    }
+    pub fn service_pending() {}
 }
 
 pub use syscall::{init as init_syscalls, service_pending};

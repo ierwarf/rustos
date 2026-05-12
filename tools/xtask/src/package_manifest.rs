@@ -115,6 +115,14 @@ pub(crate) struct BuildSpec {
     pub(crate) extra_args: Vec<String>,
     #[serde(default)]
     pub(crate) optional: bool,
+    /// Per-package linkage override. Currently understood values:
+    /// - `None` / `Some("dynamic")`: link as a dynamic Linux ELF (default).
+    /// - `Some("static-pie")`: link as a static PIE with no `PT_INTERP`. Used
+    ///   by [seL4-style root tasks](https://docs.sel4.systems) such as
+    ///   syscalld and vfsd that must run before the dynamic Linux runtime
+    ///   (and the policies it depends on) are available.
+    #[serde(default)]
+    pub(crate) linkage: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

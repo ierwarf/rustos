@@ -1,4 +1,4 @@
-use alloc::string::String;
+use alloc::string::{String, ToString};
 
 pub type ConsoleSessionHandle = crate::io::session::ConsoleSessionHandle;
 
@@ -76,67 +76,12 @@ pub struct BlockDescriptor {
     pub block_count: u64,
 }
 
-fn map_vfs_error(error: crate::vfs::VfsError) -> VfsError {
-    match error {
-        crate::vfs::VfsError::BadFileDescriptor => VfsError::BadFileDescriptor,
-        crate::vfs::VfsError::InvalidArgument => VfsError::InvalidArgument,
-        crate::vfs::VfsError::NotFound => VfsError::NotFound,
-        crate::vfs::VfsError::NotDirectory => VfsError::NotDirectory,
-        crate::vfs::VfsError::PermissionDenied => VfsError::PermissionDenied,
-        crate::vfs::VfsError::ReadOnlyFilesystem => VfsError::ReadOnlyFilesystem,
-        crate::vfs::VfsError::Unsupported => VfsError::Unsupported,
-    }
-}
-
-fn map_mount_error(error: crate::vfs::MountError) -> MountError {
-    match error {
-        crate::vfs::MountError::Busy => MountError::Busy,
-        crate::vfs::MountError::InvalidArgument => MountError::InvalidArgument,
-        crate::vfs::MountError::InvalidSource => MountError::InvalidSource,
-        crate::vfs::MountError::NotDirectory => MountError::NotDirectory,
-        crate::vfs::MountError::NotFound => MountError::NotFound,
-        crate::vfs::MountError::PermissionDenied => MountError::PermissionDenied,
-        crate::vfs::MountError::ReadOnlyFilesystem => MountError::ReadOnlyFilesystem,
-        crate::vfs::MountError::UnsupportedFilesystem => MountError::UnsupportedFilesystem,
-        crate::vfs::MountError::UnsupportedMountFlags => MountError::UnsupportedMountFlags,
-    }
-}
-
-fn map_node_kind(kind: crate::vfs::VfsNodeKind) -> VfsNodeKind {
-    match kind {
-        crate::vfs::VfsNodeKind::File => VfsNodeKind::File,
-        crate::vfs::VfsNodeKind::Directory => VfsNodeKind::Directory,
-        crate::vfs::VfsNodeKind::Device => VfsNodeKind::Device,
-    }
-}
-
-fn map_timestamp(ts: crate::vfs::VfsTimestamp) -> VfsTimestamp {
-    VfsTimestamp {
-        sec: ts.sec,
-        nsec: ts.nsec,
-    }
-}
-
-fn map_metadata(metadata: crate::vfs::VfsMetadata) -> VfsMetadata {
-    VfsMetadata {
-        inode: metadata.inode,
-        kind: map_node_kind(metadata.kind),
-        len: metadata.len,
-        block_size: metadata.block_size,
-        blocks: metadata.blocks,
-        link_count: metadata.link_count,
-        atime: map_timestamp(metadata.atime),
-        mtime: map_timestamp(metadata.mtime),
-        ctime: map_timestamp(metadata.ctime),
-    }
-}
-
 fn map_block_descriptor(
     descriptor: crate::storage::block::BlockDeviceDescriptor,
 ) -> BlockDescriptor {
     BlockDescriptor {
         id: descriptor.id,
-        path: descriptor.path,
+        path: descriptor.path.to_string(),
         transport: descriptor.transport,
         readonly: descriptor.readonly,
         logical_block_size: descriptor.logical_block_size,
@@ -241,16 +186,11 @@ pub mod boot {
 }
 
 pub mod console {
-    #[allow(unused_imports)]
-    pub use crate::io::console::*;
-
     pub fn init() {
         crate::io::console::init();
     }
 
-    pub fn init_tty() {
-        crate::io::tty::init();
-    }
+    pub fn init_tty() {}
 
     pub fn write(bytes: &[u8]) {
         crate::io::console::write(bytes);
@@ -270,30 +210,22 @@ pub mod driver {
 
     pub mod linux {
         pub mod input {
+            pub fn consumer_acquire() {}
+
+            pub fn consumer_release() {}
+
             pub fn debug_lock_snapshot() -> (usize, u64) {
-                crate::driver::linux::input::debug_lock_snapshot()
-            }
-
-            pub fn consumer_acquire() {
-                crate::driver::linux::input::consumer_acquire();
-            }
-
-            pub fn consumer_release() {
-                crate::driver::linux::input::consumer_release();
+                (0, 0)
             }
         }
 
         pub mod runtime {
             pub fn debug_irq_lock_snapshot() -> (usize, usize) {
-                crate::driver::linux::runtime::debug_irq_lock_snapshot()
-            }
-
-            pub fn service_compat_pending() {
-                crate::driver::linux::runtime::service_compat_pending();
+                (0, 0)
             }
 
             pub fn tick_jiffies(delta: u64) -> u64 {
-                crate::driver::linux::runtime::tick_jiffies(delta)
+                delta
             }
         }
     }
@@ -304,107 +236,84 @@ pub mod driver {
         crate::driver::initialize_loadable_modules_for_class(class)
     }
 
-    pub fn load_module_image_from_policy(
-        name: &'static str,
-        class: u32,
-        bus: u32,
-        image_path: &'static str,
-        linux_driver_names: &'static str,
-    ) -> Result<(), &'static str> {
-        crate::driver::load_module_image_from_policy(
-            name,
-            class,
-            bus,
-            image_path,
-            linux_driver_names,
-        )
-    }
-
-    pub fn device_alias_present_from_policy(alias: &str, class: u32, bus: u32) -> bool {
-        crate::driver::device_alias_present_from_policy(alias, class, bus)
-    }
-
-    pub fn provider_group_active_from_policy(group: &str) -> bool {
-        crate::driver::provider_group_active_from_policy(group)
-    }
-
-    pub fn init_linux_cpu_local_symbols() {
-        crate::driver::linux::init_cpu_local_symbols();
-    }
-
-    pub fn service_compat_pending() {
-        crate::driver::linux::runtime::service_compat_pending();
-    }
+    pub fn init_linux_cpu_local_symbols() {}
 }
 
 pub mod input {
     pub mod event_queue {
-        pub use crate::input::event_queue::InputEventQueueDebugSnapshot;
+        #[derive(Clone, Copy, Debug, Default)]
+        pub struct InputEventQueueDebugSnapshot {
+            pub pointer_packet_submits: u64,
+            pub pointer_absolute_submits: u64,
+            pub read_calls: u64,
+            pub read_events: u64,
+            pub lock_active: u64,
+            pub lock_last_seq: u64,
+            pub queued: usize,
+            pub pending_coalesced: bool,
+            pub pending_pointer_position: bool,
+            pub dropped_discrete: u64,
+            pub dropped_lossy: u64,
+        }
 
         pub fn debug_snapshot() -> InputEventQueueDebugSnapshot {
-            crate::input::event_queue::debug_snapshot()
+            InputEventQueueDebugSnapshot::default()
         }
     }
 
-    pub fn init() {
-        crate::input::init();
-    }
+    pub fn init() {}
 
-    pub fn on_keyboard_interrupt() {
-        crate::input::on_keyboard_interrupt();
-    }
+    pub fn on_keyboard_interrupt() {}
 
-    pub fn on_mouse_interrupt() {
-        crate::input::on_mouse_interrupt();
-    }
-
-    pub fn serio_lower_half_service_pending() -> usize {
-        crate::input::serio_lower_half_service_pending()
-    }
+    pub fn on_mouse_interrupt() {}
 
     pub fn service_pending() -> usize {
-        crate::input::service_pending()
+        0
     }
 }
 
 pub mod device {
-    pub use crate::io::device::{
-        DeviceAccessKind, DeviceError, DeviceHandle, DeviceId, DeviceLookupError,
-    };
+    pub type DeviceHandle = kernel_object::api::device::DeviceHandle;
 
-    pub fn open(path: &str) -> Result<DeviceHandle, DeviceLookupError> {
-        crate::io::device::open(path)
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum DeviceError {
+        AddressSpace(crate::memory::paging::AddressSpaceError),
+        DisplayUnavailable,
+        InvalidArgument,
+        NotFound,
+        StaleSurface,
+        Unsupported,
     }
 
     pub fn read_to_current_user(
-        handle: DeviceHandle,
-        user_ptr: u64,
-        user_len: usize,
+        _handle: DeviceHandle,
+        _user_ptr: u64,
+        _user_len: usize,
     ) -> Result<usize, DeviceError> {
-        crate::io::device::read_to_current_user(handle, user_ptr, user_len)
+        Err(DeviceError::Unsupported)
     }
 
     pub fn read_to_user(
-        handle: DeviceHandle,
-        process_state: &mut crate::user::process_state::UserProcessState,
-        user_ptr: u64,
-        user_len: usize,
+        _handle: DeviceHandle,
+        _process_state: &mut crate::user::process_state::UserProcessState,
+        _user_ptr: u64,
+        _user_len: usize,
     ) -> Result<usize, DeviceError> {
-        crate::io::device::read_to_user(handle, process_state, user_ptr, user_len)
+        Err(DeviceError::Unsupported)
     }
 
     pub fn ioctl_from_user(
-        handle: DeviceHandle,
-        process_state: &mut crate::user::process_state::UserProcessState,
-        request: u64,
-        arg: u64,
+        _handle: DeviceHandle,
+        _process_state: &mut crate::user::process_state::UserProcessState,
+        _request: u64,
+        _arg: u64,
     ) -> Result<u64, DeviceError> {
-        crate::io::device::ioctl_from_user(handle, process_state, request, arg)
+        Err(DeviceError::Unsupported)
     }
 
     pub mod input {
         pub fn has_pending_events() -> bool {
-            crate::io::device::input::has_pending_events()
+            false
         }
     }
 }
@@ -413,48 +322,44 @@ pub mod tty {
     pub type LinuxTermios = crate::user::linux::LinuxTermios;
     pub use crate::io::session::ConsoleSessionHandle;
 
-    pub fn has_pending_input_for_session(session: ConsoleSessionHandle) -> bool {
-        crate::io::tty::has_pending_input_for_session(session)
+    pub fn has_pending_input_for_session(_session: ConsoleSessionHandle) -> bool {
+        false
     }
 
-    pub fn pending_input_len_for_session(session: ConsoleSessionHandle) -> usize {
-        crate::io::tty::pending_input_len_for_session(session)
+    pub fn pending_input_len_for_session(_session: ConsoleSessionHandle) -> usize {
+        0
     }
 
-    pub fn termios_for_session(session: ConsoleSessionHandle) -> LinuxTermios {
-        crate::io::tty::termios_for_session(session)
+    pub fn termios_for_session(_session: ConsoleSessionHandle) -> LinuxTermios {
+        LinuxTermios::default_console()
     }
 
     pub fn set_termios_for_session(
-        session: ConsoleSessionHandle,
-        termios: LinuxTermios,
-        flush_input: bool,
+        _session: ConsoleSessionHandle,
+        _termios: LinuxTermios,
+        _flush_input: bool,
     ) {
-        crate::io::tty::set_termios_for_session(session, termios, flush_input);
     }
 
-    pub fn write_to_session(session: ConsoleSessionHandle, bytes: &[u8]) -> usize {
-        crate::io::tty::write_to_session(session, bytes)
+    pub fn write_to_session(_session: ConsoleSessionHandle, bytes: &[u8]) -> usize {
+        crate::io::console::write(bytes);
+        bytes.len()
     }
 
-    pub fn read_input_for_session(session: ConsoleSessionHandle, dest: &mut [u8]) -> usize {
-        crate::io::tty::read_input_for_session(session, dest)
+    pub fn read_input_for_session(_session: ConsoleSessionHandle, _dest: &mut [u8]) -> usize {
+        0
     }
 
     pub fn read_input_blocking_for_session(
-        session: ConsoleSessionHandle,
-        dest: &mut [u8],
+        _session: ConsoleSessionHandle,
+        _dest: &mut [u8],
     ) -> usize {
-        crate::io::tty::read_input_blocking_for_session(session, dest)
+        0
     }
 }
 
 pub mod session {
     pub use crate::io::session::ConsoleSessionHandle;
-
-    pub const fn system_console_session() -> ConsoleSessionHandle {
-        crate::io::session::ConsoleSessionHandle::SYSTEM
-    }
 }
 
 pub mod io {
@@ -479,154 +384,115 @@ pub mod io {
 
 pub mod usb {
     pub fn debug_pointer_report_count() -> u64 {
-        crate::usb::debug_pointer_report_count()
+        0
     }
 
     pub fn debug_transfer_event_count() -> u64 {
-        crate::usb::debug_transfer_event_count()
+        0
     }
 
-    pub fn init() {
-        crate::usb::init();
-    }
+    pub fn init() {}
 }
 
 pub mod vfs {
-    use super::{MountError, VfsError, VfsMetadata, map_metadata, map_mount_error, map_vfs_error};
+    use super::{MountError, VfsError, VfsMetadata};
+    use alloc::string::ToString;
+    use fatfs::Error as FatError;
+    use storage_core::StorageError;
 
-    pub fn init() {
-        crate::vfs::init();
-    }
+    pub fn init() {}
 
     pub fn path_inode(path: &[u8]) -> u64 {
-        crate::vfs_core::path_inode(path)
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in path {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash.max(1)
     }
 
     pub fn normalize_kernel_path(path: &str) -> Result<alloc::string::String, VfsError> {
-        crate::vfs::normalize_kernel_path(path).map_err(map_vfs_error)
+        if path.starts_with('/') {
+            Ok(path.to_string())
+        } else {
+            Err(VfsError::InvalidArgument)
+        }
     }
 
     pub fn mount_for_current_process(
-        source_path: &str,
-        target_path: &str,
-        filesystem_type: &str,
-        flags: u64,
-        options: Option<&str>,
+        _source_path: &str,
+        _target_path: &str,
+        _filesystem_type: &str,
+        _flags: u64,
+        _options: Option<&str>,
     ) -> Result<(), MountError> {
-        crate::vfs::mount_for_current_process(
-            source_path,
-            target_path,
-            filesystem_type,
-            flags,
-            options,
-        )
-        .map_err(map_mount_error)
+        Err(MountError::UnsupportedFilesystem)
     }
 
-    pub fn umount_for_current_process(target_path: &str) -> Result<(), MountError> {
-        crate::vfs::umount_for_current_process(target_path).map_err(map_mount_error)
+    pub fn umount_for_current_process(_target_path: &str) -> Result<(), MountError> {
+        Err(MountError::InvalidArgument)
     }
 
     pub fn open_path_for_current_process(
-        absolute_path: &str,
-        flags: u64,
-        mode: u64,
+        _absolute_path: &str,
+        _flags: u64,
+        _mode: u64,
     ) -> Result<u64, VfsError> {
-        crate::vfs::open_path_for_current_process(absolute_path, flags, mode).map_err(map_vfs_error)
+        Err(VfsError::Unsupported)
     }
 
-    pub fn metadata_for_current_process_path(absolute_path: &str) -> Result<VfsMetadata, VfsError> {
-        crate::vfs::metadata_for_current_process_path(absolute_path)
-            .map(map_metadata)
-            .map_err(map_vfs_error)
-    }
-
-    pub fn check_access_for_current_process(
-        absolute_path: &str,
-        mode: u64,
-    ) -> Result<(), VfsError> {
-        crate::vfs::check_access_for_current_process(absolute_path, mode).map_err(map_vfs_error)
+    pub fn metadata_for_current_process_path(
+        _absolute_path: &str,
+    ) -> Result<VfsMetadata, VfsError> {
+        Err(VfsError::Unsupported)
     }
 
     pub fn check_access_for_user_process(
-        absolute_path: &str,
-        mode: u64,
-        abi: crate::user::UserAbi,
-        process_state: &mut crate::user::UserProcessState,
+        _absolute_path: &str,
+        _mode: u64,
+        _abi: crate::user::UserAbi,
+        _process_state: &mut crate::user::UserProcessState,
     ) -> Result<(), VfsError> {
-        crate::vfs::check_access_for_user_process(absolute_path, mode, abi, process_state)
-            .map_err(map_vfs_error)
+        Err(VfsError::Unsupported)
     }
 
-    pub fn read_path_to_vec_for_kernel(
-        absolute_path: &str,
-    ) -> Result<alloc::vec::Vec<u8>, VfsError> {
-        crate::vfs::read_path_to_vec_for_kernel(absolute_path).map_err(map_vfs_error)
+    fn boot_image_path(path: &str) -> Result<&str, VfsError> {
+        let path = path.strip_prefix('/').unwrap_or(path);
+        if path.is_empty() {
+            return Err(VfsError::InvalidArgument);
+        }
+        if path.starts_with("services/")
+            || path.starts_with("applications/")
+            || path.starts_with("lib/")
+            || path.starts_with("lib64/")
+        {
+            Ok(path)
+        } else {
+            Err(VfsError::Unsupported)
+        }
+    }
+
+    fn map_boot_volume_error(error: FatError<StorageError>) -> VfsError {
+        match error {
+            FatError::Io(StorageError::NotPresent) | FatError::NotFound => VfsError::NotFound,
+            FatError::Io(StorageError::Unsupported) => VfsError::Unsupported,
+            FatError::InvalidInput
+            | FatError::InvalidFileNameLength
+            | FatError::UnsupportedFileNameCharacter => VfsError::InvalidArgument,
+            FatError::CorruptedFileSystem => VfsError::InvalidArgument,
+            FatError::Io(_) | FatError::UnexpectedEof => VfsError::Unsupported,
+            _ => VfsError::Unsupported,
+        }
+    }
+
+    pub fn read_path_to_vec_for_kernel(path: &str) -> Result<alloc::vec::Vec<u8>, VfsError> {
+        let path = boot_image_path(path)?;
+        crate::storage::boot_volume::read_file_to_vec(path).map_err(map_boot_volume_error)
     }
 
     pub fn readlink_for_current_process(
-        absolute_path: &str,
+        _absolute_path: &str,
     ) -> Result<alloc::string::String, VfsError> {
-        crate::vfs::readlink_for_current_process(absolute_path).map_err(map_vfs_error)
+        Err(VfsError::Unsupported)
     }
 }
-
-pub mod network {
-    pub use crate::network::InetSocketError;
-
-    pub fn create_inet_socket(type_: u64, protocol: u64) -> u64 {
-        crate::network::create_inet_socket(type_, protocol)
-    }
-
-    pub fn close_inet_socket(token: u64) {
-        crate::network::close_inet_socket(token)
-    }
-
-    pub fn connect_inet_socket(
-        token: u64,
-        addr: [u8; 4],
-        port: u16,
-    ) -> Result<(), InetSocketError> {
-        crate::network::connect_inet_socket(token, addr, port)
-    }
-
-    pub fn send_inet_socket(token: u64, bytes: &[u8]) -> Result<usize, InetSocketError> {
-        crate::network::send_inet_socket(token, bytes)
-    }
-
-    pub fn recv_inet_socket(
-        token: u64,
-        out: &mut [u8],
-        nonblocking: bool,
-    ) -> Result<usize, InetSocketError> {
-        crate::network::recv_inet_socket(token, out, nonblocking)
-    }
-
-    pub fn inet_readable_bytes(token: u64) -> Result<usize, InetSocketError> {
-        crate::network::inet_readable_bytes(token)
-    }
-
-    pub fn inet_socket_writable(token: u64) -> bool {
-        crate::network::inet_socket_writable(token)
-    }
-}
-
-pub use block::{
-    boot_volume_descriptor, descriptors as block_descriptors, init_block_devices,
-    lookup as lookup_block, read_boot_volume_blocks, register_boot_volume_opener,
-};
-pub use boot::{
-    boot_volume_identity, boot_volume_transport_hint, bootstrap_phase, enter_kernel_vfs_runtime,
-    enter_userspace_runtime, init_boot_info, init_gui, system_console_session, userspace_ready,
-};
-pub use console::{
-    init as init_console, init_tty, service as service_console, write as write_console,
-};
-pub use driver::initialize_loadable_modules_for_class;
-pub use input::{init as init_input, service_pending as service_input_pending};
-pub use usb::init as init_usb;
-pub use vfs::{
-    check_access_for_current_process, init as init_vfs, metadata_for_current_process_path,
-    mount_for_current_process, open_path_for_current_process, path_inode,
-    umount_for_current_process,
-};

@@ -65,6 +65,29 @@ Kernel/userspace ABI:
 - Shared ABI crate: `libs/rustos-user-abi`.
 - Kernel re-export surfaces: `kernel/ps/src/user/abi.rs` and
   `kernel/compat/src/user/abi.rs`.
+- The kernel launches `services/rootd/rootd.elf` as the first user process.
+  `rootd` is the bootstrap initial task: it must avoid Linux libc/std dynamic
+  runtime dependencies, start `syscalld`, `vfsd`, and `loaderd`, then hand off
+  normal service orchestration to `services/initd/initd.elf`. Kernel boot code
+  should not grow generic POSIX compatibility exceptions for `initd`; any
+  unavoidable early service bootstrap surface must stay narrow, explicit, and
+  tied to `rootd` bringing up foundational policy services.
+- Current refactor phase is service-first ring0 evacuation. The old
+  line-commented Linux compat reference files have been consumed and removed
+  from the kernel tree. Linux MM ABI policy for `brk`, `mmap`, `mprotect`, and
+  `munmap` belongs to `syscalld`; kernel MM keeps only the gated
+  `SYS_RUSTOS_MM_BROKER` primitive for target address-space PTE mutation, fd
+  backing revalidation, shared-frame lifetime holds, and display-surface
+  mapping. The remaining migration references are unfinished Linux thread
+  policy and Windows PE/Win32 policy; signal and clock policy now belongs to
+  `syscalld`, and io-manager VFS/network/USB/input/provider policy belongs to
+  the user services. Do not restore deleted or commented ring0 policy modules
+  for quick compatibility fixes. Extend service implementations and keep
+  kernel code to deliberate privileged primitives such as syscall entry,
+  address-space mutation, scheduler state, user-memory copy, interrupt/MMIO
+  access, DMA, or module-load substrate. Compile and QEMU verification can be
+  deferred for tasks whose explicit goal is structural evacuation rather than
+  bootability.
 - Device, console, and UI `repr(C)` structs and ioctl numbers must be defined
   in `rustos-user-abi`; services such as `uiserver` and `runtimed` should use
   that crate rather than duplicating request structs or ioctl encoding logic.
@@ -78,16 +101,19 @@ Kernel/userspace ABI:
   should route to `vfsd`; AF_UNIX and socket control policy should route to
   `netd`; device open/ioctl policy should route to `devmgrd`; module
   autoload/provider policy belongs in `driverd`; executable format and launch
-  policy belongs in `loaderd`. Kernel FD/socket/module/process data paths may
-  remain as brokered mechanisms until handle/cap transfer and driver-domain
-  isolation are in place.
+  policy belongs in `loaderd`; storage inventory policy belongs in `storaged`;
+  input observability/control policy belongs in `inputd`. Kernel
+  FD/socket/module/process/storage/input data paths may remain as brokered
+  mechanisms until handle/cap transfer and driver-domain isolation are in
+  place.
 - Registered service endpoints also carry kernel-tracked broker capability
   bits derived from their `IPC_SERVICE_*` id. Broker authorization must check
   the current process' registered service capability, not its executable path.
   Current capability constants are `IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY`,
   `IPC_SERVICE_CAP_VFS_POLICY`, `IPC_SERVICE_CAP_NET_POLICY`,
-  `IPC_SERVICE_CAP_DEVICE_POLICY`, `IPC_SERVICE_CAP_DRIVER_POLICY`, and
-  `IPC_SERVICE_CAP_PROCESS_LOADER`.
+  `IPC_SERVICE_CAP_DEVICE_POLICY`, `IPC_SERVICE_CAP_DRIVER_POLICY`,
+  `IPC_SERVICE_CAP_PROCESS_LOADER`, `IPC_SERVICE_CAP_STORAGE_POLICY`, and
+  `IPC_SERVICE_CAP_INPUT_POLICY`.
 - Kernel IPC endpoint calls support bounded cap-transfer slots through
   `kernel_ipc_runtime::api::KernelTransferredHandle` and the
   `*_with_handles` endpoint APIs. Byte-only recv/take wrappers must keep failing
@@ -119,6 +145,16 @@ Kernel/userspace ABI:
   It is gated by `IPC_SERVICE_CAP_VFS_POLICY`, accepts `RustosBlockBrokerArgs`,
   and exposes only boot-volume info plus bounded read-only block reads. This
   migration does not depend on `storaged`.
+- `storaged` owns block-device inventory policy after it registers
+  `IPC_SERVICE_STORAGED`. It calls the gated `SYS_RUSTOS_STORAGE_LIST_BROKER`
+  primitive, which is authorized only by `IPC_SERVICE_CAP_STORAGE_POLICY`, to
+  enumerate kernel-discovered storage descriptors without exposing direct
+  generic-app storage probing.
+- `inputd` owns input queue observability policy after it registers
+  `IPC_SERVICE_INPUTD`. It calls the gated `SYS_RUSTOS_INPUT_STATS_BROKER`
+  primitive, which is authorized only by `IPC_SERVICE_CAP_INPUT_POLICY`, to
+  inspect kernel input queue counters while input event delivery remains a
+  brokered kernel/device data path.
 - Linux `openat` installs `KernelHandle::RemoteVfs` for regular files and
   directories after `vfsd` registration. Device paths remain kernel device
   handles through the device broker path until `devmgrd` device-open transfer is
@@ -130,7 +166,7 @@ Kernel/userspace ABI:
 - Linux `close`, `dup`/`dup2`/`dup3`, and `fcntl` route through `vfsd` before
   mutating the app fd table. `vfsd` is the only intended caller of the
   temporary `SYS_RUSTOS_FD_*_BROKER` syscalls; generic apps must not use them
-  directly. `LinuxSyscallOffloadRequest.arg0/arg1` are the 64-bit extension
+  directly. `LinuxSyscallOffloadRequest.arg0..arg3` are the 64-bit extension
   slots for fd control arguments such as target fd, command, argument, and
   flags. Do not pack pointer or flag values into the 32-bit `mask` field.
 - Linux `getdents64` also routes through `vfsd`; the temporary
@@ -143,6 +179,11 @@ Kernel/userspace ABI:
   then `vfsd` calls the temporary gated `SYS_RUSTOS_VFS_*_BROKER` primitives for
   the narrow kernel mount-table mutation. Do not reintroduce direct generic-app
   `linux_ops::mount` or `linux_ops::umount2` paths.
+- Legacy RustOS metadata syscall numbers
+  `SYS_RUSTOS_{STATX,STAT,READLINK,ACCESS,GETCWD,CHDIR}_METADATA` must not
+  perform direct generic-app VFS policy in ring0 after `vfsd` registers. They
+  route through `vfsd` for generic callers and retain direct kernel metadata
+  access only for pre-`vfsd` bootstrap and registered policy-service callers.
 - Runtime launches should route through `loaderd`, not direct generic
   `SYS_RUSTOS_SPAWN_EXEC` calls. `loaderd` registers `IPC_SERVICE_LOADERD`,
   validates executable format policy, and uses the temporary gated
@@ -175,12 +216,16 @@ Kernel/userspace ABI:
   request authorization and calls `SYS_RUSTOS_DEVICE_IOCTL_BROKER`, which is
   gated by `IPC_SERVICE_CAP_DEVICE_POLICY` and performs the kernel-owned user
   memory/device operation against the target process id and fd.
-- Linux socket namespace operations route through `netd` after bootstrap.
-  `socket`, `socketpair`, `bind`, `listen`, `accept/accept4`, and `connect`
-  call `netd`, and `netd` invokes the gated `SYS_RUSTOS_NET_BROKER` primitive
-  with the target process id. Kernel code still performs handle installation,
-  target user-memory validation/copy, and the current in-kernel socket/inet
-  substrate; policy routing and namespace sequencing belong to `netd`.
+- Linux socket namespace and socket I/O operations route through `netd` after
+  bootstrap. `socket`, `socketpair`, `bind`, `listen`, `accept/accept4`,
+  `connect`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `getsockname`,
+  `getpeername`, `setsockopt`, `getsockopt`, and `shutdown` call `netd`, and
+  `netd` invokes the gated `SYS_RUSTOS_NET_BROKER` primitive with the target
+  process id. Kernel code still performs handle installation, target
+  user-memory validation/copy, and the current in-kernel socket/inet substrate;
+  policy routing and namespace sequencing belong to `netd`. The net broker
+  argument struct carries six 64-bit syscall argument slots for this migration
+  surface.
 - `driverd` owns registry parsing and provider/autoload ordering after it
   registers `IPC_SERVICE_DRIVERD`. The gated driver broker surface is
   `SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER`,
@@ -281,15 +326,15 @@ Fault injection:
 - Keep `config/rustos.toml` `fault_injection.rules` on one physical line until
   the logging cfg scanner is separated from full-file config parsing.
 
-Linux network driver compat:
+Linux network and driver compat:
 
-- Linux `.ko` relocated calls into RustOS must go through the compat export ABI
-  metadata in `kernel/io-manager/src/driver/linux/mod.rs`. Keep RustOS internal
-  Rust/SysV call alignment intact; classify exported Linux compat symbols as
-  either aligned Rust calls or stack-preserving tail calls instead of changing
-  global Rust ABI rules.
-- Common netdev lifecycle is routed through `kernel/io-manager/src/network/mod.rs`
-  and `kernel/io-manager/src/driver/linux/netdev.rs`.
+- During the service-first evacuation, network namespace and socket policy live
+  in `netd`, module/provider policy lives in `driverd`, and the kernel
+  `kernel/io-manager/src/driver/mod.rs` surface is limited to privileged DMA,
+  IRQ, IOMMU, and MMIO primitives plus explicit module-load substrate hooks.
+- Deleted io-manager VFS/network/USB/input/provider policy files are not source
+  of truth. Do not restore them to make `.ko` loading or Linux socket behavior
+  appear to work; add service-owned policy and narrow privileged brokers.
 - Linux compat symbols must be explicitly implemented. Do not add broad
   prefix-based `0`, `NULL`, or no-op fallbacks to make a module load; unresolved
   required externals should fail module load.
@@ -298,23 +343,6 @@ Linux network driver compat:
   per-symbol disabled/no-op shims only when RustOS does not advertise that
   capability. These shims must fail closed or return disabled state; they must
   not fabricate packets, carrier, queue progress, or successful offload.
-- Static-call, tracepoint, and netdev data anchors may resolve to inert compat
-  storage only for symbols whose absence should disable instrumentation. Do not
-  use data-anchor catch-alls for operational queues, DMA ownership, or packet
-  memory.
-- `register_netdev`/`register_netdevice` must not imply carrier/link-up.
-  Link state follows `netif_carrier_on` and `netif_carrier_off`.
-- PCI network modules, including future `e1000e.ko` packages, use the same
-  netdev/skbuff/DMA compat surface as virtio network modules plus PCI probe
-  binding in `kernel/io-manager/src/driver/pci.rs`.
-- Virtio network data path is backed by the native modern PCI virtio-net backend
-  in `kernel/io-manager/src/network/virtio_net.rs`; Linux compat module load
-  should initialize or defer to that backend instead of fabricating link or TCP
-  success.
-- For native-backed virtio-net, the Linux module is an ownership/registration
-  signal. Its compat shims should keep module init/exit and relocation safe,
-  while packet IO remains in the native backend unless a real Linux netdev data
-  path is implemented end to end.
 
 Logging:
 

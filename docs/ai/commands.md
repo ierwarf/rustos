@@ -57,9 +57,8 @@ Fast context commands:
 
 GRUB Secure Boot debug environment:
 
-- `export RUSTOS_GPG_HOME=$PWD/build/dev-grub-gpg`
-- `export RUSTOS_GRUB_PUBKEY=$PWD/build/dev-grub.pub`
-- `export RUSTOS_GRUB_SIGNING_KEY=20E25476F6977B91B007E98F0A12944CD8F6DA70`
+- `cargo xtask build` creates a local development GRUB signing key under
+  `build/dev-grub-gpg` when `RUSTOS_GRUB_*` is unset.
 - `grub-file --is-x86-multiboot2 build/image/nucleus.elf`
 - `gpg --homedir build/dev-grub-gpg --verify build/image/nucleus.elf.sig build/image/nucleus.elf`
 

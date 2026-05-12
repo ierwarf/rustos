@@ -2,11 +2,12 @@ id = "vfsd"
 kind = "service"
 execution_domain = "user"
 profiles = ["default"]
-startup = "init"
+startup = "none"
 
 [build]
 builder = "cargo-kernel-binary"
 package = "vfsd"
+linkage = "static-pie"
 
 [install]
 path = "services/vfsd/vfsd.elf"

@@ -19,6 +19,7 @@ Second step: classify the user task into one row below. Read only the
 | Fault injection change | `contracts.md`, `commands.md` | `config/rustos.toml`; exact `libs/rustos-fault-injection`, `tools/xtask/src/qemu.rs`, or `kernel/nucleus-core/src/util/fault_injection.rs` range found by `rg` |
 | Runtime launch/session issue | `contracts.md` | `libs/runtime-control/src/lib.rs`, then exact `services/runtimed/src/main.rs` range |
 | UI/rendering issue | `repo-map.md` | search `services/uiserver/src`; open only the matching `render.rs` or `app/*` range |
+| Hardening request | `contracts.md`, `kernel-api-map.md` | highest-risk boundary first; exact API, broker, service, lock, memory, or device path found by `rg` |
 | Add service/app/driver | `workflows.md` | one closest existing manifest, one closest source file, target manifest/source only |
 | Docs update | `docs/SUMMARY.md` | target doc only; AI docs only if agent context changes |
 
@@ -26,28 +27,32 @@ Stop rules:
 
 - If task can be answered from one AI doc and one source file, stop searching.
 - If `rg` returns an exact symbol/function, open only a narrow range around it.
+- If the user asks for implementation and the target owner is clear, stop
+  reasoning and patch the smallest viable slice.
+- Reserve extended reasoning for debugging, failure analysis, structural review,
+  security review, or explicit design-choice requests.
+- For hardening, rank the OS risk first; do not spend time hardening unrelated
+  low-risk helpers after the high-risk boundary is identified.
+- If debugging hits a structural blocker or lacks runtime evidence, stop and
+  report the blocker instead of making speculative patches.
 - Do not open a backing module until the relevant `api.rs` or manifest contract
   shows the needed boundary.
 - Do not inspect `logs/` for build/check failures; use the failing command
   output first.
 - Do not inspect `logs/` for run/debug failures until the QEMU command line and
   failing symptom are known.
-- Do not open `Cargo.lock` unless the task is dependency resolution.
-- Do not open `build/`, `target/`, or `vendor/` unless `token-policy.md`
-  explicitly allows the exception.
+- Follow `token-policy.md` for generated paths, logs, and `Cargo.lock`.
 - If a human doc duplicates an AI contract, use the AI contract unless writing prose.
 - If source contradicts AI docs, source wins; update AI docs if task includes docs.
 - If a contract change is discovered, update the focused AI doc before finishing.
 
 Context budget defaults:
 
-- Simple answer: `token-policy.md` + 1 focused AI doc + 0-1 source file.
-- Small code change: 1 focused AI doc + 1-3 source ranges.
-- Cross-subsystem change: task-router + contracts + relevant API map + exact source ranges.
-- Debug from logs: 1 command doc + failing command output or `tail -n 120` from
-  one log file.
-- Avoid opening files over ~500 lines unless using `rg`/line ranges first.
-- Avoid generated/vendor paths by default; see `token-policy.md`.
+- Simple answer: this file plus one focused AI doc.
+- Small code change: one focused AI doc plus 1-3 source ranges.
+- Debugging: one command doc plus failing output or one focused log snippet.
+- Cross-subsystem work: add `contracts.md` and the relevant API map only when
+  the boundary crosses crates or services.
 
 Escalation rule:
 

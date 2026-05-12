@@ -7,7 +7,6 @@ use crate::debug;
 use crate::io::session::ConsoleSessionHandle;
 use crate::user::linux::LinuxProcessLaunch;
 use crate::user::process::{self, ProcessLaunchOptions, ProcessLoadError, SpawnedProcess};
-use crate::user::windows::WindowsProcessLaunch;
 use crate::vfs;
 
 fn emit_console(level: debug::LogLevel, event_id: u16, object_id: u64, message: String) {
@@ -188,11 +187,6 @@ pub fn spawn_program_in_session(
 
     let launch = ProcessLaunchOptions {
         linux: LinuxProcessLaunch {
-            exec_path: program.exec_path,
-            argv,
-            env: program.env,
-        },
-        windows: WindowsProcessLaunch {
             exec_path: program.exec_path,
             argv,
             env: program.env,

@@ -45,14 +45,9 @@ pub mod api;
 
 #[path = "driver/mod.rs"]
 pub mod driver;
-#[path = "input/mod.rs"]
-pub mod input;
-#[path = "input_core.rs"]
-pub mod input_core;
+
 #[path = "io/mod.rs"]
 pub mod io;
-#[path = "network/mod.rs"]
-pub mod network;
 #[path = "storage/mod.rs"]
 pub mod storage;
 pub(crate) mod sync;
@@ -66,9 +61,3 @@ pub(crate) mod test_support {
         TEST_LOCK.lock().expect("test lock poisoned")
     }
 }
-#[path = "usb/mod.rs"]
-pub mod usb;
-#[path = "vfs/mod.rs"]
-pub mod vfs;
-#[path = "vfs_core.rs"]
-pub mod vfs_core;

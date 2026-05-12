@@ -5,24 +5,22 @@ This directory is optimized for AI agents, not human onboarding.
 Rules:
 
 - Follow `token-policy.md`.
-- Use root `AGENTS.md` and `docs/ai-map.md` as the shortest entrypoints.
-- Read only the smallest file needed.
-- Prefer these files before scanning the whole repo.
-- Treat human docs as explanatory; treat AI docs as compact contracts.
-- Do not mirror bilingual content here.
+- Use root `AGENTS.md`, `docs/ai-map.md`, and `task-router.md` as entrypoints.
+- Read the smallest file/range needed before scanning the repo.
+- Treat human docs as explanatory and AI docs as compact contracts.
 - Verify code truth before editing when a contract references a source path.
+- For OS hardening, prioritize high-risk boundaries over broad cleanup.
+- For blocked debugging, stop and report the structural blocker instead of
+  making speculative patches.
 
-Suggested load order:
+Stable cache prefix:
 
 1. Root `AGENTS.md`.
 2. `docs/ai-map.md`.
-3. `token-policy.md` for mandatory context rules.
-4. `task-router.md` to choose the smallest context set.
-5. One focused AI doc selected by the router.
-6. `commands.md` only when running checks/builds.
-7. `workflows.md` only when implementing a known task type.
+3. `token-policy.md`.
+4. `task-router.md`.
 
-Keep items 1-4 stable and first in prompts or explicit context caches.
+Then append one focused AI doc selected by `task-router.md`.
 
 Primary human docs:
 
@@ -35,6 +33,4 @@ Primary human docs:
 
 Token policy:
 
-- Canonical policy lives in `token-policy.md`.
-- Start with `task-router.md`, then load only the focused docs/source files it names.
-- Never inspect `build/`, `target/`, `logs/`, or `vendor/` unless the task exception requires it.
+- Canonical policy lives in `token-policy.md`; do not duplicate it here.

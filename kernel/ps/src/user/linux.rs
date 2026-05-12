@@ -1019,6 +1019,12 @@ pub struct LinuxProcessImageInfo {
     pub program_header_entry_size: u64,
     pub program_header_count: u64,
     pub brk_start: u64,
+    /// Base of the seL4-style bootstrap heap pre-mapped by the kernel for
+    /// static-PIE policy services. Zero when no such heap was reserved
+    /// (i.e. the process is a normal dynamic Linux ELF).
+    pub bootstrap_heap_base: u64,
+    /// Length of the bootstrap heap in bytes. Zero when unused.
+    pub bootstrap_heap_len: u64,
     pub initial_tls: Option<LinuxInitialTlsInfo>,
     pub image_mappings: Vec<LinuxImageMapping>,
     pub runtime_search_paths: Vec<String>,
@@ -1026,11 +1032,20 @@ pub struct LinuxProcessImageInfo {
 
 impl LinuxProcessImageInfo {
     pub fn initial_process_state(&self) -> LinuxProcessState {
+        let bootstrap_end = self
+            .bootstrap_heap_base
+            .saturating_add(self.bootstrap_heap_len);
+        let default_mmap_next = align_up(self.brk_start.saturating_add(DEFAULT_MMAP_GAP), 4096);
+        let mmap_next = if bootstrap_end > default_mmap_next {
+            align_up(bootstrap_end, 4096)
+        } else {
+            default_mmap_next
+        };
         LinuxProcessState {
             brk_start: self.brk_start,
             brk_current: self.brk_start,
             brk_mapped_end: self.brk_start,
-            mmap_next: align_up(self.brk_start.saturating_add(DEFAULT_MMAP_GAP), 4096),
+            mmap_next,
             reserved_mappings: [LinuxReservedMapping::EMPTY; MAX_RESERVED_MAPPINGS],
         }
     }
@@ -1384,6 +1399,7 @@ pub const SYS_RUSTOS_PROC_COMMIT_BROKER: u64 =
     rustos_user_abi::syscall::SYS_RUSTOS_PROC_COMMIT_BROKER;
 pub const SYS_RUSTOS_PROC_ABORT_BROKER: u64 =
     rustos_user_abi::syscall::SYS_RUSTOS_PROC_ABORT_BROKER;
+pub const SYS_RUSTOS_MM_BROKER: u64 = rustos_user_abi::syscall::SYS_RUSTOS_MM_BROKER;
 pub const SYS_RUSTOS_DEVICE_IOCTL_BROKER: u64 =
     rustos_user_abi::syscall::SYS_RUSTOS_DEVICE_IOCTL_BROKER;
 pub const SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER: u64 =

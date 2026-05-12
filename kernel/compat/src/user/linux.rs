@@ -1380,6 +1380,7 @@ pub const SYS_RUSTOS_PROC_COMMIT_BROKER: u64 =
     rustos_user_abi::syscall::SYS_RUSTOS_PROC_COMMIT_BROKER;
 pub const SYS_RUSTOS_PROC_ABORT_BROKER: u64 =
     rustos_user_abi::syscall::SYS_RUSTOS_PROC_ABORT_BROKER;
+pub const SYS_RUSTOS_MM_BROKER: u64 = rustos_user_abi::syscall::SYS_RUSTOS_MM_BROKER;
 pub const SYS_RUSTOS_DEVICE_IOCTL_BROKER: u64 =
     rustos_user_abi::syscall::SYS_RUSTOS_DEVICE_IOCTL_BROKER;
 pub const SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER: u64 =

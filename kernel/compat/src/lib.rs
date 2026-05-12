@@ -130,6 +130,12 @@ pub(crate) mod io {
 
 pub(crate) mod storage {
     pub(crate) mod boot_volume {
+        pub fn read_file_to_vec(
+            path: &str,
+        ) -> Result<alloc::vec::Vec<u8>, kernel_io_manager::api::VfsError> {
+            kernel_io_manager::api::vfs::read_path_to_vec_for_kernel(path)
+        }
+
         pub fn userspace_runtime_active() -> bool {
             kernel_io_manager::api::boot::userspace_ready()
         }
@@ -209,7 +215,5 @@ pub(crate) mod vfs_core {
 }
 
 pub mod user;
-#[path = "user/windows.rs"]
-pub mod windows;
 
 pub mod api;

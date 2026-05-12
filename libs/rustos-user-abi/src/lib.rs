@@ -30,15 +30,28 @@ pub mod syscall {
     pub const SYS_RUSTOS_PROC_MAP_ZEROED_BROKER: u64 = 0x5255_001b;
     pub const SYS_RUSTOS_PROC_COMMIT_BROKER: u64 = 0x5255_001c;
     pub const SYS_RUSTOS_PROC_ABORT_BROKER: u64 = 0x5255_001d;
-    pub const SYS_RUSTOS_DEVICE_IOCTL_BROKER: u64 = 0x5255_001e;
-    pub const SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER: u64 = 0x5255_001f;
-    pub const SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER: u64 = 0x5255_0020;
-    pub const SYS_RUSTOS_DRIVER_PROVIDER_ACTIVE_BROKER: u64 = 0x5255_0021;
-    pub const SYS_RUSTOS_NET_BROKER: u64 = 0x5255_0022;
-    pub const SYS_RUSTOS_BLOCK_BROKER: u64 = 0x5255_0023;
-    pub const SYS_RUSTOS_STORAGE_LIST_BROKER: u64 = 0x5255_0024;
-    pub const SYS_RUSTOS_INPUT_STATS_BROKER: u64 = 0x5255_0025;
-    pub const SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER: u64 = 0x5255_0026;
+    pub const SYS_RUSTOS_MM_BROKER: u64 = 0x5255_001e;
+    pub const SYS_RUSTOS_DEVICE_IOCTL_BROKER: u64 = 0x5255_001f;
+    pub const SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER: u64 = 0x5255_0020;
+    pub const SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER: u64 = 0x5255_0021;
+    pub const SYS_RUSTOS_DRIVER_PROVIDER_ACTIVE_BROKER: u64 = 0x5255_0022;
+    pub const SYS_RUSTOS_NET_BROKER: u64 = 0x5255_0023;
+    pub const SYS_RUSTOS_BLOCK_BROKER: u64 = 0x5255_0024;
+    pub const SYS_RUSTOS_STORAGE_LIST_BROKER: u64 = 0x5255_0025;
+    pub const SYS_RUSTOS_INPUT_STATS_BROKER: u64 = 0x5255_0026;
+    pub const SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER: u64 = 0x5255_0027;
+
+    /// RustOS-private auxv entry: virtual address of the bootstrap heap region
+    /// that the kernel pre-maps for static-PIE policy services so they can run
+    /// `_start` without depending on syscalld/vfsd. Vendor space (>= 32) to avoid
+    /// colliding with future Linux auxv codes.
+    pub const AT_RUSTOS_BOOTSTRAP_HEAP_BASE: u64 = 0x5255_1000;
+    /// RustOS-private auxv entry: length in bytes of the bootstrap heap region.
+    pub const AT_RUSTOS_BOOTSTRAP_HEAP_LEN: u64 = 0x5255_1001;
+    /// Default size of the bootstrap heap pre-mapped for static-PIE policy
+    /// services. 16 MiB is enough for syscalld's BTreeMap<pid, state> and
+    /// vfsd's FAT volume metadata without falling back to mmap.
+    pub const RUSTOS_BOOTSTRAP_HEAP_DEFAULT_LEN: u64 = 16 * 1024 * 1024;
 
     pub const IPC_ABI_VERSION: u16 = 1;
     pub const IPC_MAX_INLINE_BYTES: usize = 64 * 1024;
@@ -103,10 +116,58 @@ pub mod syscall {
     pub const SYSCALL_OFFLOAD_OP_LINUX_LISTEN: u16 = 35;
     pub const SYSCALL_OFFLOAD_OP_LINUX_ACCEPT: u16 = 36;
     pub const SYSCALL_OFFLOAD_OP_LINUX_CONNECT: u16 = 37;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_SENDTO: u16 = 38;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_GETSOCKNAME: u16 = 39;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_GETPEERNAME: u16 = 40;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_SETSOCKOPT: u16 = 41;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_GETSOCKOPT: u16 = 42;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_SHUTDOWN: u16 = 43;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_SENDMSG: u16 = 44;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_RECVMSG: u16 = 45;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_RECVFROM: u16 = 46;
     pub const SYSCALL_OFFLOAD_OP_LINUX_IOCTL: u16 = 48;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_RT_SIGACTION: u16 = 49;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_RT_SIGPROCMASK: u16 = 50;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_NANOSLEEP: u16 = 51;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_CLOCK_GETTIME: u16 = 52;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_CLOCK_NANOSLEEP: u16 = 53;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_SET_ROBUST_LIST: u16 = 54;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_GET_ROBUST_LIST: u16 = 55;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_RSEQ: u16 = 56;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_MADVISE: u16 = 57;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_SIGALTSTACK: u16 = 58;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_BRK: u16 = 59;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_MMAP: u16 = 60;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_MPROTECT: u16 = 61;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_MUNMAP: u16 = 62;
     pub const SYSCALL_OFFLOAD_OP_DRIVER_LOAD_POLICY: u16 = 64;
     pub const SYSCALL_OFFLOAD_PATH_CAPACITY: usize = 256;
     pub const SYSCALL_OFFLOAD_PAYLOAD_CAPACITY: usize = 0x200;
+    pub const MM_BROKER_ABI_VERSION: u16 = 1;
+    pub const MM_BROKER_OP_QUERY_LAYOUT: u16 = 1;
+    pub const MM_BROKER_OP_DESCRIBE_FD: u16 = 2;
+    pub const MM_BROKER_OP_MAP_ANON: u16 = 3;
+    pub const MM_BROKER_OP_MAP_FILE_PRIVATE: u16 = 4;
+    pub const MM_BROKER_OP_MAP_MEMFD_SHARED: u16 = 5;
+    pub const MM_BROKER_OP_MAP_DEVICE_SHARED: u16 = 6;
+    pub const MM_BROKER_OP_PROTECT: u16 = 7;
+    pub const MM_BROKER_OP_UNMAP: u16 = 8;
+    pub const MM_BROKER_FLAG_NONE: u32 = 0;
+    pub const MM_BROKER_MAP_READ: u64 = 1 << 0;
+    pub const MM_BROKER_MAP_WRITE: u64 = 1 << 1;
+    pub const MM_BROKER_MAP_EXEC: u64 = 1 << 2;
+    pub const MM_BROKER_MAP_PRIVATE: u64 = 1 << 3;
+    pub const MM_BROKER_MAP_RESERVE: u64 = 1 << 4;
+    pub const MM_BROKER_MAP_SHARED: u64 = 1 << 5;
+    pub const MM_BROKER_FD_KIND_NONE: u16 = 0;
+    pub const MM_BROKER_FD_KIND_FILE: u16 = 1;
+    pub const MM_BROKER_FD_KIND_MEMFD: u16 = 2;
+    pub const MM_BROKER_FD_KIND_DEVICE: u16 = 3;
+    pub const MM_BROKER_FD_KIND_DISPLAY_SURFACE: u16 = 4;
+    pub const MM_BROKER_FD_RIGHT_READ: u64 = 1 << 0;
+    pub const MM_BROKER_FD_RIGHT_WRITE: u64 = 1 << 1;
+    pub const MM_BROKER_FD_RIGHT_MAP: u64 = 1 << 2;
+    pub const MM_BROKER_PATH_CAPACITY: usize = 128;
     pub const VFS_IPC_ABI_VERSION: u16 = 1;
     pub const VFS_IPC_OP_OPENAT: u16 = 1;
     pub const VFS_IPC_OP_CLOSE: u16 = 2;
@@ -152,6 +213,8 @@ pub mod syscall {
     pub const LINUX_UTSNAME_SIZE: usize = 65 * 6;
     pub const LINUX_CPUSET_BYTES: usize = 8;
     pub const LINUX_DEFAULT_STACK_RLIMIT_BYTES: u64 = 8 * 1024 * 1024;
+    pub const LINUX_TIMESPEC_SIZE: usize = 16;
+    pub const LINUX_SIGACTION_SIZE: usize = 32;
     pub const LOADER_REQUEST_ABI_VERSION: u16 = 1;
     pub const LOADER_OP_SPAWN_EXEC: u16 = 1;
     pub const LOADER_SPAWN_EXEC_PATH_CAPACITY: usize = 256;
@@ -434,6 +497,8 @@ pub mod syscall {
         pub arg1: u64,
         pub arg2: u64,
         pub arg3: u64,
+        pub arg4: u64,
+        pub arg5: u64,
     }
 
     #[repr(C)]
@@ -557,6 +622,65 @@ pub mod syscall {
     }
 
     #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct RustosMmBrokerArgs {
+        pub abi_version: u16,
+        pub op: u16,
+        pub flags: u32,
+        pub target_pid: u64,
+        pub addr: u64,
+        pub len: u64,
+        pub prot: u64,
+        pub mmap_flags: u64,
+        pub fd: u64,
+        pub offset: u64,
+        pub out_ptr: u64,
+        pub out_len: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct RustosMmLayoutBrokerResult {
+        pub brk_start: u64,
+        pub brk_current: u64,
+        pub brk_mapped_end: u64,
+        pub mmap_next: u64,
+        pub user_range_start: u64,
+        pub user_range_end: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct RustosMmFdBrokerResult {
+        pub kind: u16,
+        pub reserved0: u16,
+        pub path_len: u32,
+        pub rights: u64,
+        pub len: u64,
+        pub path: [u8; MM_BROKER_PATH_CAPACITY],
+    }
+
+    impl Default for RustosMmFdBrokerResult {
+        fn default() -> Self {
+            Self {
+                kind: MM_BROKER_FD_KIND_NONE,
+                reserved0: 0,
+                path_len: 0,
+                rights: 0,
+                len: 0,
+                path: [0; MM_BROKER_PATH_CAPACITY],
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct RustosMmMapBrokerResult {
+        pub addr: u64,
+        pub len: u64,
+    }
+
+    #[repr(C)]
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub struct LoaderSpawnRequest {
         pub version: u16,
@@ -624,6 +748,8 @@ pub mod syscall {
         pub flags: u64,
         pub arg0: u64,
         pub arg1: u64,
+        pub arg2: u64,
+        pub arg3: u64,
         pub mask: u32,
         pub path_len: u32,
         pub path: [u8; SYSCALL_OFFLOAD_PATH_CAPACITY],
@@ -647,6 +773,8 @@ pub mod syscall {
                 flags: 0,
                 arg0: 0,
                 arg1: 0,
+                arg2: 0,
+                arg3: 0,
                 mask: 0,
                 path_len: 0,
                 path: [0; SYSCALL_OFFLOAD_PATH_CAPACITY],
@@ -683,6 +811,22 @@ pub mod syscall {
     pub struct LinuxRlimit {
         pub rlim_cur: u64,
         pub rlim_max: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct LinuxTimespecWire {
+        pub tv_sec: i64,
+        pub tv_nsec: i64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct LinuxSigActionWire {
+        pub handler: u64,
+        pub flags: u64,
+        pub restorer: u64,
+        pub mask: u64,
     }
 
     #[repr(C)]
@@ -806,8 +950,9 @@ mod syscall_tests {
     use core::mem::size_of;
 
     use super::syscall::{
-        IPC_MAX_INLINE_BYTES, LINUX_RLIMIT_SIZE, LINUX_STATX_SIZE, LINUX_UTSNAME_SIZE, LinuxRlimit,
-        LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, LinuxUtsName,
+        IPC_MAX_INLINE_BYTES, LINUX_RLIMIT_SIZE, LINUX_SIGACTION_SIZE, LINUX_STATX_SIZE,
+        LINUX_TIMESPEC_SIZE, LINUX_UTSNAME_SIZE, LinuxRlimit, LinuxSigActionWire,
+        LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, LinuxTimespecWire, LinuxUtsName,
         SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_STATX, SYSCALL_OFFLOAD_PATH_CAPACITY,
         SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, VFS_IPC_ABI_VERSION, VFS_IPC_OP_OPENAT, VfsIpcRequest,
         VfsIpcResponse,
@@ -823,6 +968,8 @@ mod syscall_tests {
         assert_eq!(SYSCALL_OFFLOAD_PATH_CAPACITY, 256);
         assert_eq!(SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, 0x200);
         assert_eq!(LINUX_RLIMIT_SIZE, size_of::<LinuxRlimit>());
+        assert_eq!(LINUX_TIMESPEC_SIZE, size_of::<LinuxTimespecWire>());
+        assert_eq!(LINUX_SIGACTION_SIZE, size_of::<LinuxSigActionWire>());
         assert_eq!(LINUX_UTSNAME_SIZE, size_of::<LinuxUtsName>());
     }
 
@@ -1232,5 +1379,18 @@ mod tests {
         assert!(size_of::<syscall::LoaderSpawnRequest>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert!(size_of::<syscall::LoaderSpawnResponse>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert!(size_of::<syscall::RustosProcCommitBrokerArgs>() <= syscall::IPC_MAX_INLINE_BYTES);
+    }
+
+    #[test]
+    fn mm_broker_abi_layout_is_stable() {
+        assert_eq!(syscall::SYS_RUSTOS_MM_BROKER, 0x5255_001e);
+        assert_eq!(size_of::<syscall::RustosMmBrokerArgs>(), 80);
+        assert_eq!(size_of::<syscall::RustosMmLayoutBrokerResult>(), 48);
+        assert_eq!(
+            size_of::<syscall::RustosMmFdBrokerResult>(),
+            24 + syscall::MM_BROKER_PATH_CAPACITY
+        );
+        assert_eq!(size_of::<syscall::RustosMmMapBrokerResult>(), 16);
+        assert!(size_of::<syscall::RustosMmFdBrokerResult>() <= syscall::IPC_MAX_INLINE_BYTES);
     }
 }

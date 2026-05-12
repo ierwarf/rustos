@@ -140,7 +140,7 @@ pub(crate) fn present_bgra8888_from_user(
             height,
         },
     )?;
-    Ok(presented && crate::driver::virtio_gpu::flush_primary())
+    Ok(presented)
 }
 
 #[cfg(rustos_debug_print_enabled)]
@@ -192,13 +192,7 @@ pub(crate) fn present_bgra8888_rect_from_user(
         stride_bytes,
         rect,
     )?;
-    Ok(presented
-        && crate::driver::virtio_gpu::flush_primary_rect(
-            rect.x as u32,
-            rect.y as u32,
-            rect.width as u32,
-            rect.height as u32,
-        ))
+    Ok(presented)
 }
 
 fn copy_user_bgra8888_rect_in_stripes(
@@ -363,7 +357,7 @@ pub(crate) fn present_bgra8888_from_kernel(
             false
         })
         .unwrap_or(false);
-    presented && crate::driver::virtio_gpu::flush_primary()
+    presented
 }
 
 pub(crate) fn present_bgra8888_rect_from_kernel(
@@ -396,22 +390,10 @@ pub(crate) fn present_bgra8888_rect_from_kernel(
         })
         .unwrap_or(false);
     presented
-        && crate::driver::virtio_gpu::flush_primary_rect(
-            rect.x as u32,
-            rect.y as u32,
-            rect.width as u32,
-            rect.height as u32,
-        )
 }
 
 fn present_context_allows_blocking() -> bool {
-    if !interrupts::are_enabled() {
-        return false;
-    }
-    if crate::driver::linux::runtime::irq_spinlock_held_by_current() {
-        return false;
-    }
-    true
+    interrupts::are_enabled()
 }
 
 fn display_present_faulted() -> bool {

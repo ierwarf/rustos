@@ -30,17 +30,16 @@ Use `OVMF_PATH=/path/to/OVMF.fd` to override it.
 ### Build
 
 ```bash
-export RUSTOS_GRUB_PUBKEY=/path/to/grub-public-key.gpg # from: gpg --export <key>
-export RUSTOS_GRUB_SIGNING_KEY=<gpg-key-id-or-fingerprint>
 cargo xtask check
 cargo xtask build
 ```
 
 `cargo xtask build` validates layering, builds boot/user/kernel artifacts,
 builds modules and compatibility assets, stages the boot image, and writes
-runtime registries. The default boot manager build signs `nucleus.elf` with GPG
-and embeds `RUSTOS_GRUB_PUBKEY` into the generated GRUB EFI binary; the private
-signing key must stay outside the repository.
+runtime registries. If `RUSTOS_GRUB_*` is unset, xtask creates a local
+development GRUB signing key under `build/dev-grub-gpg` and exports
+`build/dev-grub.pub`. Release signing keys should still stay outside the
+repository and be supplied through the environment.
 
 ### Run
 
@@ -107,17 +106,15 @@ vendor/firmware/ovmf/OVMF.fd
 ### 빌드
 
 ```bash
-export RUSTOS_GRUB_PUBKEY=/path/to/grub-public-key.gpg # gpg --export <key> 산출물
-export RUSTOS_GRUB_SIGNING_KEY=<gpg-key-id-or-fingerprint>
 cargo xtask check
 cargo xtask build
 ```
 
 `cargo xtask build`는 layering 검사, boot/user/kernel artifact 빌드, module과
 compatibility asset 빌드, boot image staging, runtime registry 생성을 수행합니다.
-기본 boot manager build는 GPG로 `nucleus.elf`를 서명하고
-`RUSTOS_GRUB_PUBKEY`를 generated GRUB EFI binary에 embed합니다. private signing
-key는 repository 밖에 둡니다.
+`RUSTOS_GRUB_*` 값이 없으면 xtask가 `build/dev-grub-gpg` 아래에 로컬 개발용
+GRUB signing key를 만들고 `build/dev-grub.pub`를 export합니다. release signing
+key는 여전히 repository 밖에 두고 환경 변수로 주입해야 합니다.
 
 ### 실행
 
