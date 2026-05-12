@@ -89,6 +89,30 @@ pub(super) fn service_registered(service_id: u64) -> bool {
     service_endpoint_raw(service_id).is_some_and(|raw| raw != 0)
 }
 
+/// 프로세스 종료 시 해당 프로세스가 등록한 모든 IPC 서비스 엔드포인트를 해제한다.
+/// stale endpoint가 남아 있으면 이후 호출자가 wait_for_reply에서 무한 대기하게 되므로
+/// 반드시 프로세스 종료 경로에서 호출해야 한다.
+pub(crate) fn cleanup_service_endpoints_for_process(process_id: u64) {
+    if SERVICE_ENDPOINT_OWNERS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
+        .load(Ordering::Acquire)
+        == process_id
+    {
+        LINUX_SYSCALL_ENDPOINT.store(0, Ordering::Release);
+    }
+    for i in 0..MAX_SERVICE_ENDPOINTS {
+        if SERVICE_ENDPOINT_OWNERS[i].load(Ordering::Acquire) == process_id {
+            SERVICE_ENDPOINTS[i].store(0, Ordering::Release);
+            SERVICE_ENDPOINT_OWNERS[i].store(0, Ordering::Release);
+            SERVICE_ENDPOINT_CAPS[i].store(0, Ordering::Release);
+            debug::println!(
+                "ipc service endpoint revoked on process exit: index={} process={}",
+                i,
+                process_id
+            );
+        }
+    }
+}
+
 pub(super) fn current_process_has_service_capability(capability: u64) -> bool {
     if capability == 0 {
         return false;
@@ -215,6 +239,7 @@ fn service_capability(service_id: u64) -> u64 {
         linux_abi::IPC_SERVICE_LOADERD => rustos_user_abi::syscall::IPC_SERVICE_CAP_PROCESS_LOADER,
         linux_abi::IPC_SERVICE_STORAGED => rustos_user_abi::syscall::IPC_SERVICE_CAP_STORAGE_POLICY,
         linux_abi::IPC_SERVICE_INPUTD => rustos_user_abi::syscall::IPC_SERVICE_CAP_INPUT_POLICY,
+        linux_abi::IPC_SERVICE_PROCD => rustos_user_abi::syscall::IPC_SERVICE_CAP_PROCESS_POLICY,
         _ => 0,
     }
 }

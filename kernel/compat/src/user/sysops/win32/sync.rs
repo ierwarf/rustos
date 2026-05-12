@@ -1,8 +1,9 @@
-// RING3-MIGRATION-REFERENCE: disabled during service-first ring0 evacuation.
-// Preserve this old ring0 implementation as source material for userspace services; do not restore it without an explicit privileged-boundary decision.
+use crate::multitask;
 
-// use crate::multitask;
-// 
-// pub(crate) fn exit_process(_exit_code: u64) -> u64 {
-//     multitask::exit_current_user_task()
-// }
+pub(crate) fn exit_process(status: u64) -> u64 {
+    if let Some(process_id) = multitask::current_user_process_id() {
+        let wait_status = ((status as i32) & 0xff) << 8;
+        let _ = multitask::note_process_exit_status(process_id, wait_status);
+    }
+    multitask::exit_current_user_task()
+}

@@ -5,5 +5,5 @@ edition = "2021"
 publish = false
 
 [dependencies]
-libc = "0.2"
+rustos-svc-runtime = { path = "../../libs/rustos-svc-runtime" }
 rustos-user-abi = { path = "../../libs/rustos-user-abi" }

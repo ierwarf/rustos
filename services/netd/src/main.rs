@@ -105,7 +105,7 @@ fn dispatch_request(
         (&args as *const RustosNetBrokerArgs) as u64,
     );
     if result < 0 {
-        return (-result) as i32;
+        return last_errno();
     }
     let bytes = (result as u64).to_le_bytes();
     response.payload[..bytes.len()].copy_from_slice(&bytes);
@@ -159,6 +159,12 @@ fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
 
 fn syscall4(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
     unsafe { libc::syscall(number as libc::c_long, arg0, arg1, arg2, arg3) as i64 }
+}
+
+fn last_errno() -> i32 {
+    std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EIO)
 }
 
 fn debug_line(message: &str) {

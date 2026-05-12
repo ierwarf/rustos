@@ -603,10 +603,7 @@ fn build_cargo_kernel_binary_dynamic(config: &Config, manifest: &PackageManifest
 /// that bringing them up does not require the dynamic Linux runtime they are
 /// supposed to provide — the seL4 root-task pattern. See
 /// [`libs/rustos-svc-runtime`](../../../../libs/rustos-svc-runtime/src/lib.rs).
-fn build_cargo_kernel_binary_static_pie(
-    config: &Config,
-    manifest: &PackageManifest,
-) -> Result<()> {
+fn build_cargo_kernel_binary_static_pie(config: &Config, manifest: &PackageManifest) -> Result<()> {
     let package = manifest
         .build
         .package
@@ -618,6 +615,7 @@ fn build_cargo_kernel_binary_static_pie(
     // used — we want PIE so the kernel can choose a load bias.
     let rustflags = concat!(
         "-C target-feature=+crt-static ",
+        "-C panic=abort ",
         "-C relocation-model=pic ",
         "-C link-arg=-nostartfiles ",
         "-C link-arg=-static-pie ",
@@ -627,6 +625,7 @@ fn build_cargo_kernel_binary_static_pie(
     let mut command = Command::new(&config.cargo);
     command
         .arg("build")
+        .args(&config.kernel_cargo_zflags)
         .arg("-p")
         .arg(package)
         .arg("--target")

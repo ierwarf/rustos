@@ -40,6 +40,7 @@ pub mod syscall {
     pub const SYS_RUSTOS_STORAGE_LIST_BROKER: u64 = 0x5255_0025;
     pub const SYS_RUSTOS_INPUT_STATS_BROKER: u64 = 0x5255_0026;
     pub const SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER: u64 = 0x5255_0027;
+    pub const SYS_RUSTOS_PROC_MAP_DATA_BROKER: u64 = 0x5255_0028;
 
     /// RustOS-private auxv entry: virtual address of the bootstrap heap region
     /// that the kernel pre-maps for static-PIE policy services so they can run
@@ -64,6 +65,7 @@ pub mod syscall {
     pub const IPC_SERVICE_LOADERD: u64 = 6;
     pub const IPC_SERVICE_STORAGED: u64 = 7;
     pub const IPC_SERVICE_INPUTD: u64 = 8;
+    pub const IPC_SERVICE_PROCD: u64 = 9;
     pub const IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY: u64 = 1 << 0;
     pub const IPC_SERVICE_CAP_VFS_POLICY: u64 = 1 << 1;
     pub const IPC_SERVICE_CAP_NET_POLICY: u64 = 1 << 2;
@@ -72,6 +74,7 @@ pub mod syscall {
     pub const IPC_SERVICE_CAP_PROCESS_LOADER: u64 = 1 << 5;
     pub const IPC_SERVICE_CAP_STORAGE_POLICY: u64 = 1 << 6;
     pub const IPC_SERVICE_CAP_INPUT_POLICY: u64 = 1 << 7;
+    pub const IPC_SERVICE_CAP_PROCESS_POLICY: u64 = 1 << 8;
     pub const IPC_SERVICE_CAP_BOOTSTRAP_POLICY: u64 = IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY
         | IPC_SERVICE_CAP_VFS_POLICY
         | IPC_SERVICE_CAP_NET_POLICY
@@ -231,6 +234,7 @@ pub mod syscall {
     pub const PROC_BROKER_MAP_PRIVATE: u64 = 1 << 3;
     pub const PROC_BROKER_USER_SPACE_BASE: u64 = 1 << 39;
     pub const PROC_BROKER_USER_SPACE_END_EXCLUSIVE: u64 = 2 << 39;
+    pub const PROC_BROKER_DATA_PAYLOAD_CAPACITY: usize = 4096;
     pub const DRIVER_BROKER_NAME_CAPACITY: usize = 64;
     pub const DRIVER_BROKER_PATH_CAPACITY: usize = 256;
     pub const DRIVER_BROKER_ALIAS_CAPACITY: usize = 256;
@@ -597,6 +601,34 @@ pub mod syscall {
         pub mem_len: u64,
         pub flags: u64,
         pub reserved0: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct RustosProcMapDataBrokerArgs {
+        pub prepare_handle: u64,
+        pub target_addr: u64,
+        pub mem_len: u64,
+        pub flags: u64,
+        pub data_offset: u64,
+        pub data_len: u32,
+        pub reserved0: u32,
+        pub data: [u8; PROC_BROKER_DATA_PAYLOAD_CAPACITY],
+    }
+
+    impl Default for RustosProcMapDataBrokerArgs {
+        fn default() -> Self {
+            Self {
+                prepare_handle: 0,
+                target_addr: 0,
+                mem_len: 0,
+                flags: 0,
+                data_offset: 0,
+                data_len: 0,
+                reserved0: 0,
+                data: [0; PROC_BROKER_DATA_PAYLOAD_CAPACITY],
+            }
+        }
     }
 
     #[repr(C)]

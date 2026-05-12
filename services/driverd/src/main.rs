@@ -190,7 +190,9 @@ fn load_record(
         skipped.insert(record.name.clone());
         debug_line(&format!(
             "driverd: load failed name={} path={} errno={}",
-            record.name, record.image_path, -result
+            record.name,
+            record.image_path,
+            last_errno()
         ));
     }
     LoadResult::Progress
@@ -391,6 +393,12 @@ fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
 
 fn syscall4(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
     unsafe { libc::syscall(number as libc::c_long, arg0, arg1, arg2, arg3) as i64 }
+}
+
+fn last_errno() -> i32 {
+    std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EIO)
 }
 
 fn debug_line(message: &str) {

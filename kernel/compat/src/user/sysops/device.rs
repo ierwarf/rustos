@@ -1,4 +1,6 @@
 use core::convert::TryFrom;
+use core::mem::size_of;
+use core::slice;
 
 use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
@@ -6,9 +8,11 @@ use x86_64::structures::paging::PageTableFlags;
 use crate::io::device::{self as device_ns};
 use crate::memory::paging;
 use crate::multitask;
-use crate::user::handles::{DisplaySurfaceHandle, KernelHandle};
+use crate::user::handles::{DisplaySurfaceHandle, KernelHandle, RemoteVfsHandleKind};
 use crate::user::linux as linux_abi;
 use crate::user::process_state::UserProcessState;
+use rustos_user_abi::device as device_abi;
+
 const PAGE_SIZE: u64 = 4096;
 
 #[derive(Debug, Clone, Copy)]
@@ -124,19 +128,217 @@ pub(crate) fn ioctl_process_device_handle(
         let Some(entry) = process_state.handles().get_entry(fd) else {
             return Err(DeviceSysopError::BadFileDescriptor);
         };
-        if !entry.rights().allows_device_ioctl() {
-            return Err(DeviceSysopError::Unsupported);
+        match entry.handle() {
+            KernelHandle::Device(device_handle) => {
+                if !entry.rights().allows_device_ioctl() {
+                    return Err(DeviceSysopError::Unsupported);
+                }
+                device_ns::ioctl_from_user(*device_handle, process_state, request, arg)
+                    .map_err(map_device_error)
+            }
+            KernelHandle::RemoteVfs(remote) if remote.kind() == RemoteVfsHandleKind::Device => {
+                let path = remote.path();
+                ioctl_remote_device(process_state, path.as_str(), request, arg)
+            }
+            _ => Err(DeviceSysopError::Unsupported),
         }
-        let Some(device_handle) = entry.handle().device_handle() else {
-            return Err(DeviceSysopError::Unsupported);
-        };
-        device_ns::ioctl_from_user(device_handle, process_state, request, arg)
-            .map_err(map_device_error)
     }) else {
         return Err(DeviceSysopError::Unsupported);
     };
 
     result
+}
+
+fn ioctl_remote_device(
+    process_state: &mut UserProcessState,
+    path: &str,
+    request: u64,
+    arg: u64,
+) -> Result<u64, DeviceSysopError> {
+    if is_display_device_path(path) {
+        return ioctl_display_device(process_state, request, arg);
+    }
+    Err(DeviceSysopError::Unsupported)
+}
+
+fn is_display_device_path(path: &str) -> bool {
+    matches!(path, "/dev/display0" | "/dev/dri/card0")
+}
+
+fn ioctl_display_device(
+    process_state: &mut UserProcessState,
+    request: u64,
+    arg: u64,
+) -> Result<u64, DeviceSysopError> {
+    match request {
+        device_abi::DISPLAY_IOCTL_GET_INFO => ioctl_display_get_info(process_state, arg),
+        device_abi::DISPLAY_IOCTL_CREATE_SURFACE => {
+            ioctl_display_create_surface(process_state, arg)
+        }
+        device_abi::DISPLAY_IOCTL_PRESENT => ioctl_display_present(process_state, arg),
+        device_abi::DISPLAY_IOCTL_PRESENT_RECT => ioctl_display_present_rect(process_state, arg),
+        _ => Err(DeviceSysopError::Unsupported),
+    }
+}
+
+fn ioctl_display_get_info(
+    process_state: &mut UserProcessState,
+    arg: u64,
+) -> Result<u64, DeviceSysopError> {
+    let info = kernel_io_manager::api::io::gui::display_info()
+        .ok_or(DeviceSysopError::DisplayUnavailable)?;
+    let wire = device_abi::DisplayInfo::bgra8888(
+        info.width,
+        info.height,
+        info.stride_bytes,
+        info.bytes_per_pixel,
+        info.generation,
+        info.flags,
+    );
+    write_process_struct(process_state, arg, &wire)?;
+    Ok(0)
+}
+
+fn ioctl_display_create_surface(
+    process_state: &mut UserProcessState,
+    arg: u64,
+) -> Result<u64, DeviceSysopError> {
+    let mut request = read_process_struct::<device_abi::DisplaySurfaceCreate>(process_state, arg)?;
+    if request.flags != 0 || request.reserved != 0 {
+        return Err(DeviceSysopError::InvalidArgument);
+    }
+    let info = kernel_io_manager::api::io::gui::display_info()
+        .ok_or(DeviceSysopError::DisplayUnavailable)?;
+    if request.width != info.width
+        || request.height != info.height
+        || request.pixel_format != device_abi::PIXEL_FORMAT_BGRA8888
+    {
+        return Err(DeviceSysopError::InvalidArgument);
+    }
+
+    // RING3-MIGRATION-CANDIDATE: once a display service owns framebuffer
+    // presentation, this broker should only mint a service-provided surface
+    // capability instead of allocating the shared backing in kernel policy.
+    let mut surface = DisplaySurfaceHandle::new(
+        request.width,
+        request.height,
+        request.pixel_format,
+        info.generation,
+    )
+    .ok_or(DeviceSysopError::InvalidArgument)?;
+    let mapping_len =
+        usize::try_from(surface.mapping_len()).map_err(|_| DeviceSysopError::InvalidArgument)?;
+    let shared_region = crate::ipc::create_shared_region(mapping_len)
+        .map_err(|_| DeviceSysopError::InvalidArgument)?;
+    surface.set_shared_region(shared_region);
+
+    let surface_fd = process_state
+        .handles_mut()
+        .install(KernelHandle::DisplaySurface(surface));
+    let surface_fd_u32 =
+        u32::try_from(surface_fd).map_err(|_| DeviceSysopError::InvalidArgument)?;
+    request.handle = surface_fd_u32;
+    request.bytes_per_pixel = surface.bytes_per_pixel();
+    request.stride_bytes = surface.stride_bytes();
+    request.mapping_len = surface.mapping_len();
+    request.generation = surface.generation();
+    write_process_struct(process_state, arg, &request)?;
+    Ok(0)
+}
+
+fn ioctl_display_present(
+    process_state: &mut UserProcessState,
+    arg: u64,
+) -> Result<u64, DeviceSysopError> {
+    let request = read_process_struct::<device_abi::DisplayPresentRequest>(process_state, arg)?;
+    if request.reserved != 0 {
+        return Err(DeviceSysopError::InvalidArgument);
+    }
+    let surface = process_surface(process_state, request.surface_handle)?;
+    present_surface(surface, None)?;
+    Ok(0)
+}
+
+fn ioctl_display_present_rect(
+    process_state: &mut UserProcessState,
+    arg: u64,
+) -> Result<u64, DeviceSysopError> {
+    let request = read_process_struct::<device_abi::DisplayPresentRectRequest>(process_state, arg)?;
+    if request.reserved != 0 || request.width == 0 || request.height == 0 {
+        return Err(DeviceSysopError::InvalidArgument);
+    }
+    let surface = process_surface(process_state, request.surface_handle)?;
+    let x_end = request
+        .x
+        .checked_add(request.width)
+        .ok_or(DeviceSysopError::InvalidArgument)?;
+    let y_end = request
+        .y
+        .checked_add(request.height)
+        .ok_or(DeviceSysopError::InvalidArgument)?;
+    if x_end > surface.width() || y_end > surface.height() {
+        return Err(DeviceSysopError::InvalidArgument);
+    }
+    present_surface(
+        surface,
+        Some((request.x, request.y, request.width, request.height)),
+    )?;
+    Ok(0)
+}
+
+fn process_surface(
+    process_state: &UserProcessState,
+    surface_fd: u32,
+) -> Result<DisplaySurfaceHandle, DeviceSysopError> {
+    match process_state.handles().get(u64::from(surface_fd)) {
+        Some(KernelHandle::DisplaySurface(surface)) => Ok(*surface),
+        Some(_) => Err(DeviceSysopError::Unsupported),
+        None => Err(DeviceSysopError::BadFileDescriptor),
+    }
+}
+
+fn present_surface(
+    surface: DisplaySurfaceHandle,
+    rect: Option<(u32, u32, u32, u32)>,
+) -> Result<(), DeviceSysopError> {
+    let region = surface
+        .shared_region()
+        .ok_or(DeviceSysopError::InvalidArgument)?;
+    let (ptr, len) =
+        crate::ipc::map_shared_region(region).ok_or(DeviceSysopError::InvalidArgument)?;
+    let frame_len =
+        usize::try_from(surface.frame_len()).map_err(|_| DeviceSysopError::InvalidArgument)?;
+    if len < frame_len {
+        return Err(DeviceSysopError::InvalidArgument);
+    }
+    let width = surface.width() as usize;
+    let height = surface.height() as usize;
+    let stride = surface.stride_bytes() as usize;
+    let presented = match rect {
+        Some((x, y, rect_width, rect_height)) => {
+            kernel_io_manager::api::io::gui::present_userspace_frame_rect_from_kernel_bgra8888(
+                ptr.cast_const(),
+                width,
+                height,
+                stride,
+                x as usize,
+                y as usize,
+                rect_width as usize,
+                rect_height as usize,
+            )
+        }
+        None => kernel_io_manager::api::io::gui::present_userspace_frame_from_kernel_bgra8888(
+            ptr.cast_const(),
+            width,
+            height,
+            stride,
+        ),
+    };
+    if presented {
+        Ok(())
+    } else {
+        Err(DeviceSysopError::DisplayUnavailable)
+    }
 }
 
 pub(crate) fn mmap_current_process_handle(
@@ -257,6 +459,43 @@ fn surface_page_flags(prot: u64) -> PageTableFlags {
         flags |= PageTableFlags::WRITABLE;
     }
     flags
+}
+
+fn read_process_struct<T: Copy + Default>(
+    process_state: &UserProcessState,
+    ptr: u64,
+) -> Result<T, DeviceSysopError> {
+    if ptr == 0 {
+        return Err(DeviceSysopError::InvalidArgument);
+    }
+    let mut value = T::default();
+    let bytes =
+        unsafe { slice::from_raw_parts_mut((&mut value as *mut T).cast::<u8>(), size_of::<T>()) };
+    process_state
+        .address_space()
+        .validate_user_read_buffer(VirtAddr::new(ptr), bytes.len())?;
+    process_state
+        .address_space()
+        .copy_from_user(VirtAddr::new(ptr), bytes)?;
+    Ok(value)
+}
+
+fn write_process_struct<T: Copy>(
+    process_state: &UserProcessState,
+    ptr: u64,
+    value: &T,
+) -> Result<(), DeviceSysopError> {
+    if ptr == 0 {
+        return Err(DeviceSysopError::InvalidArgument);
+    }
+    let bytes = unsafe { slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
+    process_state
+        .address_space()
+        .validate_user_write_buffer(VirtAddr::new(ptr), bytes.len())?;
+    process_state
+        .address_space()
+        .copy_into_user(VirtAddr::new(ptr), bytes)?;
+    Ok(())
 }
 
 fn map_device_error(err: device_ns::DeviceError) -> DeviceSysopError {

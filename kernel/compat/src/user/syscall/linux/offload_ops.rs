@@ -1,6 +1,11 @@
 use alloc::vec::Vec;
 
-use rustos_user_abi::syscall::{VFS_IPC_OP_PREAD64, VFS_IPC_PAYLOAD_CAPACITY};
+use lazy_static::lazy_static;
+use rustos_user_abi::syscall::{
+    LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT, LifecycleDrainBrokerArgs, LifecycleEventWire,
+    VFS_IPC_OP_PREAD64, VFS_IPC_PAYLOAD_CAPACITY,
+};
+use spin::Mutex;
 
 use super::*;
 
@@ -33,4 +38,52 @@ pub(crate) fn call_remote_vfs_read_bytes(
     Ok(bytes)
 }
 
-pub(crate) fn record_process_exit(_pid: u64, _parent_pid: u64, _exit_status: i32) {}
+lazy_static! {
+    static ref LIFECYCLE_EVENTS: Mutex<Vec<LifecycleEventWire>> = Mutex::new(Vec::new());
+}
+
+pub(crate) fn record_process_exit(pid: u64, parent_pid: u64, exit_status: i32) {
+    let mut events = LIFECYCLE_EVENTS.lock();
+    if events.len() >= LIFECYCLE_DRAIN_MAX_EVENTS {
+        events.remove(0);
+    }
+    events.push(LifecycleEventWire {
+        event: LIFECYCLE_EVENT_EXIT,
+        pid,
+        parent_pid,
+        exit_status,
+        ..LifecycleEventWire::default()
+    });
+}
+
+pub(super) fn drain_lifecycle_events(args: &LifecycleDrainBrokerArgs) -> Result<u64, i64> {
+    if args.out_capacity as usize > LIFECYCLE_DRAIN_MAX_EVENTS || args.out_count_ptr == 0 {
+        return Err(LINUX_EINVAL);
+    }
+    let capacity = args.out_capacity as usize;
+    if capacity != 0 && args.out_events_ptr == 0 {
+        return Err(LINUX_EINVAL);
+    }
+    let mut drained = Vec::new();
+    {
+        let mut events = LIFECYCLE_EVENTS.lock();
+        let count = capacity.min(events.len());
+        for _ in 0..count {
+            drained.push(events.remove(0));
+        }
+    }
+    let out_count = drained.len() as u32;
+    if out_count != 0 {
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                drained.as_ptr().cast::<u8>(),
+                drained.len() * core::mem::size_of::<LifecycleEventWire>(),
+            )
+        };
+        usermem::write_current_user_bytes(args.out_events_ptr, bytes)
+            .map_err(address_space_error_to_linux_errno)?;
+    }
+    usermem::write_current_user_bytes(args.out_count_ptr, &out_count.to_le_bytes())
+        .map_err(address_space_error_to_linux_errno)?;
+    Ok(out_count as u64)
+}

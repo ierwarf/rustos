@@ -364,8 +364,50 @@ pub mod session {
 
 pub mod io {
     pub mod gui {
+        pub type GuiDisplayInfo = crate::io::gui::GuiDisplayInfo;
+
+        pub fn display_info() -> Option<GuiDisplayInfo> {
+            crate::io::gui::display_info()
+        }
+
         pub fn is_userspace_display_active() -> bool {
             crate::io::gui::is_userspace_display_active()
+        }
+
+        pub fn present_userspace_frame_from_kernel_bgra8888(
+            src_ptr: *const u8,
+            width: usize,
+            height: usize,
+            stride_bytes: usize,
+        ) -> bool {
+            crate::io::gui::present_userspace_frame_from_kernel_bgra8888(
+                src_ptr,
+                width,
+                height,
+                stride_bytes,
+            )
+        }
+
+        pub fn present_userspace_frame_rect_from_kernel_bgra8888(
+            src_ptr: *const u8,
+            width: usize,
+            height: usize,
+            stride_bytes: usize,
+            x: usize,
+            y: usize,
+            rect_width: usize,
+            rect_height: usize,
+        ) -> bool {
+            crate::io::gui::present_userspace_frame_rect_from_kernel_bgra8888(
+                src_ptr,
+                width,
+                height,
+                stride_bytes,
+                x,
+                y,
+                rect_width,
+                rect_height,
+            )
         }
 
         pub fn try_present_panic_blackout() -> bool {
@@ -462,6 +504,7 @@ pub mod vfs {
             return Err(VfsError::InvalidArgument);
         }
         if path.starts_with("services/")
+            || path.starts_with("apps/")
             || path.starts_with("applications/")
             || path.starts_with("lib/")
             || path.starts_with("lib64/")

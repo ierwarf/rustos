@@ -1395,6 +1395,8 @@ pub const SYS_RUSTOS_PROC_MAP_FILE_BROKER: u64 =
     rustos_user_abi::syscall::SYS_RUSTOS_PROC_MAP_FILE_BROKER;
 pub const SYS_RUSTOS_PROC_MAP_ZEROED_BROKER: u64 =
     rustos_user_abi::syscall::SYS_RUSTOS_PROC_MAP_ZEROED_BROKER;
+pub const SYS_RUSTOS_PROC_MAP_DATA_BROKER: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_PROC_MAP_DATA_BROKER;
 pub const SYS_RUSTOS_PROC_COMMIT_BROKER: u64 =
     rustos_user_abi::syscall::SYS_RUSTOS_PROC_COMMIT_BROKER;
 pub const SYS_RUSTOS_PROC_ABORT_BROKER: u64 =
@@ -1431,6 +1433,7 @@ pub const IPC_SERVICE_DRIVERD: u64 = rustos_user_abi::syscall::IPC_SERVICE_DRIVE
 pub const IPC_SERVICE_LOADERD: u64 = rustos_user_abi::syscall::IPC_SERVICE_LOADERD;
 pub const IPC_SERVICE_STORAGED: u64 = rustos_user_abi::syscall::IPC_SERVICE_STORAGED;
 pub const IPC_SERVICE_INPUTD: u64 = rustos_user_abi::syscall::IPC_SERVICE_INPUTD;
+pub const IPC_SERVICE_PROCD: u64 = rustos_user_abi::syscall::IPC_SERVICE_PROCD;
 
 #[cfg(test)]
 mod tests {

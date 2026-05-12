@@ -37,7 +37,7 @@ const SS_DISABLE: u32 = 2;
 const SS_ONSTACK: u32 = 1;
 const MINSIGSTKSZ: u64 = 2048;
 
-// Linux madvise constants (subset matching the migration reference).
+// Linux madvise constants used by the service-side policy subset.
 const MADV_NORMAL: u64 = 0;
 const MADV_RANDOM: u64 = 1;
 const MADV_SEQUENTIAL: u64 = 2;
@@ -645,19 +645,8 @@ pub(crate) fn handle_rseq(
     request: &LinuxSyscallOffloadRequest,
     response: &mut LinuxSyscallOffloadResponse,
 ) {
-    const RSEQ_FLAG_UNREGISTER: u64 = 0x1;
-    let mut policy = policy_db().lock();
-    let state = ensure_state_with_inheritance(&mut policy, request);
-    if request.arg2 & RSEQ_FLAG_UNREGISTER != 0 {
-        state.rseq_area = 0;
-        state.rseq_len = 0;
-        state.rseq_signature = 0;
-    } else {
-        state.rseq_area = request.arg0;
-        state.rseq_len = request.arg1;
-        state.rseq_signature = request.arg3;
-    }
-    response.status = 0;
+    let _ = request;
+    response.status = errno::ENOSYS;
     response.payload_len = 0;
 }
 
@@ -1103,7 +1092,22 @@ pub(crate) fn handle_mprotect(
         }
     };
     if !range_is_covered(&state, start, end) {
-        response.status = errno::ENOMEM;
+        // The range may have been mapped directly by the kernel (e.g. the main
+        // ELF binary's PT_LOAD segments).  Fall through to MM_BROKER_OP_PROTECT
+        // which works on the live page tables; if the range isn't mapped the
+        // kernel will return an error and we propagate it.
+        if let Err(errno) = broker_simple(
+            request.pid,
+            MM_BROKER_OP_PROTECT,
+            start,
+            map_len,
+            prot,
+            0,
+            u64::MAX,
+            0,
+        ) {
+            response.status = errno;
+        }
         return;
     }
 
@@ -1209,12 +1213,7 @@ pub(crate) fn handle_munmap(
 }
 
 fn mm_state_for(pid: u64) -> Result<MmPolicyState, i32> {
-    if let Some(state) = mm_db()
-        .lock()
-        
-        .get(&pid)
-        .cloned()
-    {
+    if let Some(state) = mm_db().lock().get(&pid).cloned() {
         return Ok(state);
     }
     let mut layout = RustosMmLayoutBrokerResult::default();
@@ -1250,10 +1249,7 @@ fn mm_state_for(pid: u64) -> Result<MmPolicyState, i32> {
 }
 
 fn save_mm_state(pid: u64, state: MmPolicyState) {
-    mm_db()
-        .lock()
-        
-        .insert(pid, state);
+    mm_db().lock().insert(pid, state);
 }
 
 fn describe_fd(pid: u64, fd: u64) -> Result<RustosMmFdBrokerResult, i32> {

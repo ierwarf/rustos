@@ -48,6 +48,11 @@ mod hal_hooks {
         rip: u64,
         rsp: u64,
     ) -> hal_api::UserFaultDisposition {
+        // fault로 종료되는 프로세스의 IPC 엔드포인트를 즉시 해제한다.
+        // 정상 종료는 syscall_process_exit에서 처리하므로 여기서는 fault 경우만 커버한다.
+        if let Some(process_id) = ps_api::current_user_process_id() {
+            compat_api::syscall::cleanup_service_endpoints_for_process(process_id);
+        }
         match ps_api::retire_current_user_task_due_to_fault(vector, error_code, cr2, rip, rsp) {
             ps_api::UserFaultDisposition::Resumed => hal_api::UserFaultDisposition::Resumed,
             ps_api::UserFaultDisposition::Retired => hal_api::UserFaultDisposition::Retired,

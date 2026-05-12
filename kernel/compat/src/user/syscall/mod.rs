@@ -12,8 +12,7 @@ use crate::user::abi::UserAbi;
 use kernel_ps::api::syscall as syscall_core;
 
 pub(crate) mod linux;
-// RING3-MIGRATION-REFERENCE: Windows syscall dispatch source is commented in
-// `user/syscall/windows/*` while the service-owned NT/Win32 path is designed.
+pub(crate) mod windows;
 
 const SYSCALL_ERR_INVALID: u64 = u64::MAX;
 const USER_RFLAGS_RESERVED_BIT_1: u64 = 1 << 1;
@@ -167,7 +166,7 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
 fn dispatch_syscall(frame: &mut SyscallFrame, abi: UserAbi) -> u64 {
     match abi {
         UserAbi::Linux => linux::dispatch_linux_syscall(frame),
-        UserAbi::Windows => SYSCALL_ERR_INVALID,
+        UserAbi::Windows => windows::dispatch_syscall(frame),
     }
 }
 

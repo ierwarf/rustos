@@ -7,6 +7,7 @@ pub const ESRCH: i32 = 3;
 pub const ENOMEM: i32 = 12;
 pub const EACCES: i32 = 13;
 pub const EINVAL: i32 = 22;
+pub const ENOSYS: i32 = 38;
 
 /// Linux `RLIMIT_*` resource codes we care about.
 pub const RLIMIT_STACK: u64 = 3;
@@ -48,11 +49,7 @@ pub fn sleep_millis(millis: u64) {
 /// payload themselves).
 pub fn nanosleep(req: &KTimespec) -> i64 {
     unsafe {
-        rustos_svc_runtime::syscall::syscall2(
-            SYS_NANOSLEEP,
-            (req as *const KTimespec) as u64,
-            0,
-        )
+        rustos_svc_runtime::syscall::syscall2(SYS_NANOSLEEP, (req as *const KTimespec) as u64, 0)
     }
 }
 

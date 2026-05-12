@@ -1,42 +1,49 @@
+mod block_broker_ops;
+mod broker_ops;
 mod debug_ops;
 mod error_ops;
 mod ipc_ops;
 mod memory_ops;
 mod mm_broker_ops;
 pub(crate) mod offload_ops;
+mod proc_broker_ops;
 mod service_ops;
 mod syscalld_ops;
+
+pub(crate) use ipc_ops::cleanup_service_endpoints_for_process;
 
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::convert::TryFrom;
 use core::mem::size_of;
 use core::slice;
-use core::sync::atomic::{AtomicUsize, Ordering};
 
+use block_broker_ops::*;
 use debug_ops::*;
 use error_ops::*;
 use memory_ops::*;
 use mm_broker_ops::*;
+use proc_broker_ops::*;
 use service_ops::*;
 use syscalld_ops::*;
 
 use rustos_user_abi::syscall::{
-    IPC_SERVICE_LOADERD, IPC_SERVICE_NETD, IPC_SERVICE_VFSD, LINUX_CPUSET_BYTES, LINUX_RLIMIT_SIZE,
-    LINUX_SIGACTION_SIZE, LINUX_STAT_SIZE, LINUX_STATX_SIZE, LINUX_TIMESPEC_SIZE,
-    LINUX_UTSNAME_SIZE, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
-    LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_MAX_ARG_COUNT,
-    LOADER_SPAWN_MAX_ENV_COUNT, LinuxSigActionWire, LinuxSyscallOffloadRequest,
-    LinuxSyscallOffloadResponse, LinuxTimespecWire, LoaderSpawnRequest, LoaderSpawnResponse,
-    SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_ACCEPT, SYSCALL_OFFLOAD_OP_LINUX_BIND,
-    SYSCALL_OFFLOAD_OP_LINUX_BRK, SYSCALL_OFFLOAD_OP_LINUX_CLOCK_GETTIME,
-    SYSCALL_OFFLOAD_OP_LINUX_CLOCK_NANOSLEEP, SYSCALL_OFFLOAD_OP_LINUX_CONNECT,
-    SYSCALL_OFFLOAD_OP_LINUX_GET_ROBUST_LIST, SYSCALL_OFFLOAD_OP_LINUX_GETEGID,
-    SYSCALL_OFFLOAD_OP_LINUX_GETEUID, SYSCALL_OFFLOAD_OP_LINUX_GETGID,
-    SYSCALL_OFFLOAD_OP_LINUX_GETPEERNAME, SYSCALL_OFFLOAD_OP_LINUX_GETPGID,
-    SYSCALL_OFFLOAD_OP_LINUX_GETPPID, SYSCALL_OFFLOAD_OP_LINUX_GETRANDOM,
-    SYSCALL_OFFLOAD_OP_LINUX_GETSID, SYSCALL_OFFLOAD_OP_LINUX_GETSOCKNAME,
-    SYSCALL_OFFLOAD_OP_LINUX_GETSOCKOPT, SYSCALL_OFFLOAD_OP_LINUX_GETUID,
+    IPC_SERVICE_DEVMGRD, IPC_SERVICE_LOADERD, IPC_SERVICE_NETD, IPC_SERVICE_VFSD,
+    LINUX_CPUSET_BYTES, LINUX_RLIMIT_SIZE, LINUX_SIGACTION_SIZE, LINUX_STAT_SIZE, LINUX_STATX_SIZE,
+    LINUX_TIMESPEC_SIZE, LINUX_UTSNAME_SIZE, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION,
+    LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY,
+    LOADER_SPAWN_MAX_ARG_COUNT, LOADER_SPAWN_MAX_ENV_COUNT, LinuxSigActionWire,
+    LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, LinuxTimespecWire, LoaderSpawnRequest,
+    LoaderSpawnResponse, SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_ACCEPT,
+    SYSCALL_OFFLOAD_OP_LINUX_BIND, SYSCALL_OFFLOAD_OP_LINUX_BRK,
+    SYSCALL_OFFLOAD_OP_LINUX_CLOCK_GETTIME, SYSCALL_OFFLOAD_OP_LINUX_CLOCK_NANOSLEEP,
+    SYSCALL_OFFLOAD_OP_LINUX_CONNECT, SYSCALL_OFFLOAD_OP_LINUX_GET_ROBUST_LIST,
+    SYSCALL_OFFLOAD_OP_LINUX_GETEGID, SYSCALL_OFFLOAD_OP_LINUX_GETEUID,
+    SYSCALL_OFFLOAD_OP_LINUX_GETGID, SYSCALL_OFFLOAD_OP_LINUX_GETPEERNAME,
+    SYSCALL_OFFLOAD_OP_LINUX_GETPGID, SYSCALL_OFFLOAD_OP_LINUX_GETPPID,
+    SYSCALL_OFFLOAD_OP_LINUX_GETRANDOM, SYSCALL_OFFLOAD_OP_LINUX_GETSID,
+    SYSCALL_OFFLOAD_OP_LINUX_GETSOCKNAME, SYSCALL_OFFLOAD_OP_LINUX_GETSOCKOPT,
+    SYSCALL_OFFLOAD_OP_LINUX_GETUID, SYSCALL_OFFLOAD_OP_LINUX_IOCTL,
     SYSCALL_OFFLOAD_OP_LINUX_LISTEN, SYSCALL_OFFLOAD_OP_LINUX_MADVISE,
     SYSCALL_OFFLOAD_OP_LINUX_MMAP, SYSCALL_OFFLOAD_OP_LINUX_MPROTECT,
     SYSCALL_OFFLOAD_OP_LINUX_MUNMAP, SYSCALL_OFFLOAD_OP_LINUX_NANOSLEEP,
@@ -104,10 +111,7 @@ const LINUX_EOVERFLOW: i64 = 75;
 const LINUX_ETIMEDOUT: i64 = 110;
 const GETRANDOM_FLAG_NONBLOCK: u64 = 0x0001;
 const GETRANDOM_FLAG_RANDOM: u64 = 0x0002;
-const SECONDARY_LINUX_SYSCALL_DEBUG_LIMIT: usize = 0;
 const MAX_RUSTOS_DEBUG_PRINT_BYTES: usize = 2048;
-
-static SECONDARY_LINUX_SYSCALL_DEBUG_LOGS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
@@ -117,31 +121,11 @@ enum LinuxSyscallSupport {
     Stub,
 }
 
-#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
-fn debug_log_secondary_linux_syscall(message: impl FnOnce() -> alloc::string::String) {
-    if SECONDARY_LINUX_SYSCALL_DEBUG_LOGS.fetch_add(1, Ordering::Relaxed)
-        >= SECONDARY_LINUX_SYSCALL_DEBUG_LIMIT
-    {
-        return;
-    }
-
-    let snapshot = multitask::current_user_snapshot();
-    let pid = snapshot.map(|user| user.thread_id()).unwrap_or(0);
-    let session = snapshot
-        .map(|user| user.console_session())
-        .unwrap_or_else(multitask::current_console_session);
-    debug::println!(
-        "secondary linux syscall: pid={} session={} {}",
-        pid,
-        session.raw(),
-        message(),
-    );
-}
-
 pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
     if let Err(error) = syscall_check(frame) {
         return error;
     }
+    debug_log_secondary_linux_syscall(frame);
 
     deliver_pending_signals_if_needed();
 
@@ -155,7 +139,29 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         linux_abi::SYS_RUSTOS_SPAWN_EXEC => syscall_linux_loader_spawn_exec(
             frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
         ),
+        linux_abi::SYS_RUSTOS_PROC_PREPARE_BROKER => {
+            syscall_linux_rustos_proc_prepare_broker(frame.rdi)
+        }
+        linux_abi::SYS_RUSTOS_PROC_MAP_FILE_BROKER => {
+            syscall_linux_rustos_proc_map_file_broker(frame.rdi)
+        }
+        linux_abi::SYS_RUSTOS_PROC_MAP_ZEROED_BROKER => {
+            syscall_linux_rustos_proc_map_zeroed_broker(frame.rdi)
+        }
+        linux_abi::SYS_RUSTOS_PROC_MAP_DATA_BROKER => {
+            syscall_linux_rustos_proc_map_data_broker(frame.rdi)
+        }
+        linux_abi::SYS_RUSTOS_PROC_COMMIT_BROKER => {
+            syscall_linux_rustos_proc_commit_broker(frame.rdi)
+        }
+        linux_abi::SYS_RUSTOS_PROC_ABORT_BROKER => {
+            syscall_linux_rustos_proc_abort_broker(frame.rdi)
+        }
         linux_abi::SYS_RUSTOS_MM_BROKER => syscall_linux_rustos_mm_broker(frame.rdi),
+        linux_abi::SYS_RUSTOS_BLOCK_BROKER => syscall_linux_rustos_block_broker(frame.rdi),
+        _ if broker_ops::is_linux_rustos_broker_syscall(frame.rax) => {
+            broker_ops::dispatch_linux_rustos_broker_syscall(frame)
+        }
         _ if ipc_ops::is_linux_rustos_ipc_syscall(frame.rax) => {
             ipc_ops::dispatch_linux_rustos_ipc_syscall(frame)
         }
@@ -185,7 +191,7 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         ),
         linux_abi::SYS_FTRUNCATE => syscall_linux_vfs_ftruncate(frame.rdi, frame.rsi),
         linux_abi::SYS_FSTAT => syscall_linux_vfs_fstat(frame.rdi, frame.rsi),
-        linux_abi::SYS_POLL => linux_errno(LINUX_ENOSYS),
+        linux_abi::SYS_POLL => syscall_linux_poll(frame.rdi, frame.rsi, frame.rdx as i64),
         linux_abi::SYS_PPOLL => linux_errno(LINUX_ENOSYS),
         linux_abi::SYS_EPOLL_WAIT => linux_errno(LINUX_ENOSYS),
         linux_abi::SYS_EPOLL_PWAIT => linux_errno(LINUX_ENOSYS),
@@ -193,7 +199,7 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         linux_abi::SYS_DUP => syscall_linux_vfs_dup(frame.rdi, 0, 0, VfsDupMode::Dup),
         linux_abi::SYS_DUP2 => syscall_linux_vfs_dup(frame.rdi, frame.rsi, 0, VfsDupMode::Dup2),
         linux_abi::SYS_LSEEK => syscall_linux_vfs_lseek(frame.rdi, frame.rsi as i64, frame.rdx),
-        linux_abi::SYS_WRITEV => linux_errno(LINUX_ENOSYS),
+        linux_abi::SYS_WRITEV => syscall_linux_vfs_writev(frame.rdi, frame.rsi, frame.rdx),
         linux_abi::SYS_ACCESS => {
             syscall_linux_vfs_access(linux_abi::AT_FDCWD as u64, frame.rdi, frame.rsi, 0)
         }
@@ -452,6 +458,7 @@ fn linux_syscall_support_level(syscall_number: u64) -> Option<LinuxSyscallSuppor
 
 fn linux_syscall_number_supported(syscall_number: u64) -> bool {
     ipc_ops::is_linux_rustos_ipc_syscall(syscall_number)
+        || broker_ops::is_linux_rustos_broker_syscall(syscall_number)
         || matches!(
             syscall_number,
             linux_abi::SYS_READ
@@ -459,7 +466,14 @@ fn linux_syscall_number_supported(syscall_number: u64) -> bool {
                 | linux_abi::SYS_UNLINK
                 | linux_abi::SYS_RUSTOS_DEBUG_PRINT
                 | linux_abi::SYS_RUSTOS_SPAWN_EXEC
+                | linux_abi::SYS_RUSTOS_PROC_PREPARE_BROKER
+                | linux_abi::SYS_RUSTOS_PROC_MAP_FILE_BROKER
+                | linux_abi::SYS_RUSTOS_PROC_MAP_ZEROED_BROKER
+                | linux_abi::SYS_RUSTOS_PROC_MAP_DATA_BROKER
+                | linux_abi::SYS_RUSTOS_PROC_COMMIT_BROKER
+                | linux_abi::SYS_RUSTOS_PROC_ABORT_BROKER
                 | linux_abi::SYS_RUSTOS_MM_BROKER
+                | linux_abi::SYS_RUSTOS_BLOCK_BROKER
                 | linux_abi::SYS_CLOSE
                 | linux_abi::SYS_SOCKET
                 | linux_abi::SYS_SENDTO
@@ -557,8 +571,10 @@ fn linux_syscall_number_supported(syscall_number: u64) -> bool {
 }
 
 fn syscall_process_exit(status: u64) -> u64 {
+    cleanup_linux_thread_exit();
     if let Some(process_id) = multitask::current_user_process_id() {
         let wait_status = ((status as i32) & 0xff) << 8;
+        ipc_ops::cleanup_service_endpoints_for_process(process_id);
         let _ = multitask::note_process_exit_status(process_id, wait_status);
         let parent = multitask::parent_process_id_of(process_id).unwrap_or(0);
         offload_ops::record_process_exit(process_id, parent, wait_status);

@@ -28,6 +28,10 @@ Package manifest:
 - In the `display-primary` provider group, real hardware/virtio display
   providers must be ordered ahead of firmware framebuffer fallbacks. `bootfb`
   is a last-resort fallback, not the default primary for QEMU or hardware GPUs.
+- `driverd` owns driver autoload policy. Kernel driver brokers may expose
+  narrow hardware-presence primitives for staged aliases such as
+  `platform:bootfb`, `pci:*`, and `virtio:*`, but they must not pick provider
+  order or bypass registry `provider_group` policy.
 
 Stage outputs:
 
@@ -78,9 +82,10 @@ Kernel/userspace ABI:
   `munmap` belongs to `syscalld`; kernel MM keeps only the gated
   `SYS_RUSTOS_MM_BROKER` primitive for target address-space PTE mutation, fd
   backing revalidation, shared-frame lifetime holds, and display-surface
-  mapping. The remaining migration references are unfinished Linux thread
-  policy and Windows PE/Win32 policy; signal and clock policy now belongs to
-  `syscalld`, and io-manager VFS/network/USB/input/provider policy belongs to
+  mapping. Linux thread policy and Windows PE/Win32 policy now have live
+  service-first implementations through `loaderd`, `syscalld`, and narrow
+  kernel brokers; signal and clock policy belongs to `syscalld`, and
+  io-manager VFS/network/USB/input/provider policy belongs to
   the user services. Do not restore deleted or commented ring0 policy modules
   for quick compatibility fixes. Extend service implementations and keep
   kernel code to deliberate privileged primitives such as syscall entry,
@@ -97,8 +102,9 @@ Kernel/userspace ABI:
   `IPC_SERVICE_*` ids. Registering endpoint `0` revokes the service endpoint
   and later lookups fail closed. `syscalld` is service id 1, `vfsd` is service
   id 2, `netd` is service id 3, `devmgrd` is service id 4, `driverd` is
-  service id 5, and `loaderd` is service id 6. File/path Linux syscall policy
-  should route to `vfsd`; AF_UNIX and socket control policy should route to
+  service id 5, `loaderd` is service id 6, `storaged` is service id 7,
+  `inputd` is service id 8, and reserved `procd` is service id 9. File/path
+  Linux syscall policy should route to `vfsd`; AF_UNIX and socket control policy should route to
   `netd`; device open/ioctl policy should route to `devmgrd`; module
   autoload/provider policy belongs in `driverd`; executable format and launch
   policy belongs in `loaderd`; storage inventory policy belongs in `storaged`;
@@ -112,8 +118,12 @@ Kernel/userspace ABI:
   Current capability constants are `IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY`,
   `IPC_SERVICE_CAP_VFS_POLICY`, `IPC_SERVICE_CAP_NET_POLICY`,
   `IPC_SERVICE_CAP_DEVICE_POLICY`, `IPC_SERVICE_CAP_DRIVER_POLICY`,
-  `IPC_SERVICE_CAP_PROCESS_LOADER`, `IPC_SERVICE_CAP_STORAGE_POLICY`, and
-  `IPC_SERVICE_CAP_INPUT_POLICY`.
+  `IPC_SERVICE_CAP_PROCESS_LOADER`, `IPC_SERVICE_CAP_STORAGE_POLICY`,
+  `IPC_SERVICE_CAP_INPUT_POLICY`, and reserved
+  `IPC_SERVICE_CAP_PROCESS_POLICY`. `procd` is the long-term process/thread
+  policy extraction point; until that service is introduced, Linux thread and
+  Windows process policy remains implemented through `syscalld`, `loaderd`, and
+  narrow kernel brokers.
 - Kernel IPC endpoint calls support bounded cap-transfer slots through
   `kernel_ipc_runtime::api::KernelTransferredHandle` and the
   `*_with_handles` endpoint APIs. Byte-only recv/take wrappers must keep failing
@@ -197,21 +207,23 @@ Kernel/userspace ABI:
   (`PROC_BROKER_FORMAT_ELF64` or `PROC_BROKER_FORMAT_PE64`). The returned
   `prepare_handle` is owned by the loader service process and must be supplied
   to `SYS_RUSTOS_PROC_COMMIT_BROKER` or `SYS_RUSTOS_PROC_ABORT_BROKER`.
-  `SYS_RUSTOS_PROC_MAP_FILE_BROKER` and `SYS_RUSTOS_PROC_MAP_ZEROED_BROKER`
-  use `PROC_BROKER_MAP_{READ,WRITE,EXEC,PRIVATE}` flags and record non-
-  overlapping page-aligned mappings in the prepare session. `loaderd` must
+  `SYS_RUSTOS_PROC_MAP_FILE_BROKER`, `SYS_RUSTOS_PROC_MAP_ZEROED_BROKER`, and
+  `SYS_RUSTOS_PROC_MAP_DATA_BROKER` use
+  `PROC_BROKER_MAP_{READ,WRITE,EXEC,PRIVATE}` flags and record non-overlapping
+  page-aligned mappings in the prepare session. `loaderd` must
   emit ELF `PT_LOAD` mappings for both the main image and its `PT_INTERP`
   interpreter, using the same static-PIE load biases as the kernel loader
   (`PROC_BROKER_USER_SPACE_BASE + 0x0040_0000` for the main image and
   `PROC_BROKER_USER_SPACE_BASE + 0x0200_0000` for the interpreter). The kernel
-  prepare session stores cloned VFS file capabilities for file-backed mappings,
-  not just fd numbers. Commit builds the child address space from those recorded
-  mappings, while still using kernel image parsing for remaining launch metadata
-  until loader-owned metadata transfer is complete. Linux ELF commit uses the
-  loader-provided address space. Windows PE commit currently preserves
-  compatibility by falling back to the kernel-built PE address space for
-  relocations/import/runtime setup, while `loaderd` already records PE
-  header/section mappings for the future metadata handoff.
+  prepare session stores loader-materialized data pages for mappings that need
+  service-side fixups. Commit builds the child address space from those
+  recorded mappings, while still using kernel image parsing for remaining
+  launch metadata until loader-owned metadata transfer is complete. Linux ELF
+  commit uses the loader-provided address space. Windows PE commit uses
+  loader-materialized PE header/section mappings, with PE64 base relocations
+  applied in `loaderd` before `SYS_RUSTOS_PROC_MAP_DATA_BROKER`; full
+  import/runtime expansion remains behind the reserved process-policy service
+  boundary.
 - Linux `ioctl` policy routes through `devmgrd` after bootstrap. `devmgrd` owns
   request authorization and calls `SYS_RUSTOS_DEVICE_IOCTL_BROKER`, which is
   gated by `IPC_SERVICE_CAP_DEVICE_POLICY` and performs the kernel-owned user

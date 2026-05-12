@@ -1376,6 +1376,8 @@ pub const SYS_RUSTOS_PROC_MAP_FILE_BROKER: u64 =
     rustos_user_abi::syscall::SYS_RUSTOS_PROC_MAP_FILE_BROKER;
 pub const SYS_RUSTOS_PROC_MAP_ZEROED_BROKER: u64 =
     rustos_user_abi::syscall::SYS_RUSTOS_PROC_MAP_ZEROED_BROKER;
+pub const SYS_RUSTOS_PROC_MAP_DATA_BROKER: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_PROC_MAP_DATA_BROKER;
 pub const SYS_RUSTOS_PROC_COMMIT_BROKER: u64 =
     rustos_user_abi::syscall::SYS_RUSTOS_PROC_COMMIT_BROKER;
 pub const SYS_RUSTOS_PROC_ABORT_BROKER: u64 =
@@ -1390,6 +1392,13 @@ pub const SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER: u64 =
 pub const SYS_RUSTOS_DRIVER_PROVIDER_ACTIVE_BROKER: u64 =
     rustos_user_abi::syscall::SYS_RUSTOS_DRIVER_PROVIDER_ACTIVE_BROKER;
 pub const SYS_RUSTOS_NET_BROKER: u64 = rustos_user_abi::syscall::SYS_RUSTOS_NET_BROKER;
+pub const SYS_RUSTOS_BLOCK_BROKER: u64 = rustos_user_abi::syscall::SYS_RUSTOS_BLOCK_BROKER;
+pub const SYS_RUSTOS_STORAGE_LIST_BROKER: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_STORAGE_LIST_BROKER;
+pub const SYS_RUSTOS_INPUT_STATS_BROKER: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_INPUT_STATS_BROKER;
+pub const SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER;
 pub const SYS_RUSTOS_STATX_METADATA: u64 = rustos_user_abi::syscall::SYS_RUSTOS_STATX_METADATA;
 pub const SYS_RUSTOS_STAT_METADATA: u64 = rustos_user_abi::syscall::SYS_RUSTOS_STAT_METADATA;
 pub const SYS_RUSTOS_READLINK_METADATA: u64 =
@@ -1403,6 +1412,9 @@ pub const IPC_SERVICE_NETD: u64 = rustos_user_abi::syscall::IPC_SERVICE_NETD;
 pub const IPC_SERVICE_DEVMGRD: u64 = rustos_user_abi::syscall::IPC_SERVICE_DEVMGRD;
 pub const IPC_SERVICE_DRIVERD: u64 = rustos_user_abi::syscall::IPC_SERVICE_DRIVERD;
 pub const IPC_SERVICE_LOADERD: u64 = rustos_user_abi::syscall::IPC_SERVICE_LOADERD;
+pub const IPC_SERVICE_STORAGED: u64 = rustos_user_abi::syscall::IPC_SERVICE_STORAGED;
+pub const IPC_SERVICE_INPUTD: u64 = rustos_user_abi::syscall::IPC_SERVICE_INPUTD;
+pub const IPC_SERVICE_PROCD: u64 = rustos_user_abi::syscall::IPC_SERVICE_PROCD;
 
 #[cfg(test)]
 mod tests {

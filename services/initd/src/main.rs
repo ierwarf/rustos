@@ -277,9 +277,19 @@ fn reap_children(
     }
 }
 
+fn is_foundation_service(exec_path: &str) -> bool {
+    matches!(
+        exec_path,
+        SYSCALLD_EXEC_PATH | VFSD_EXEC_PATH | LOADERD_EXEC_PATH
+    )
+}
+
 fn spawn_exec(exec_path: &str) -> Result<i32, i32> {
     boot_line(&format!("initd: spawn begin exec={exec_path}"));
-    if exec_path != LOADERD_EXEC_PATH && service_ready(IPC_SERVICE_LOADERD) {
+    // foundation 서비스(syscalld/vfsd/loaderd)는 loaderd IPC를 경유하지 않는다.
+    // loaderd는 파일을 열 때 VFS(vfsd)에 의존하므로, vfsd가 내려간 상태에서 loaderd로
+    // vfsd를 respawn하면 무한 대기에 빠진다. kernel bootstrap path를 사용해야 한다.
+    if !is_foundation_service(exec_path) && service_ready(IPC_SERVICE_LOADERD) {
         return spawn_exec_via_loaderd(exec_path);
     }
 
@@ -431,9 +441,13 @@ fn last_errno() -> i32 {
 }
 
 fn boot_line(message: &str) {
-    if option_env!("RUSTOS_LOGGING_BOOT_TRACE_ENABLED") != Some("true") {
+    if option_env!("RUSTOS_LOGGING_BOOT_TRACE_ENABLED") == Some("true") {
+        let _ = std::io::stderr().write_all(message.as_bytes());
+        let _ = std::io::stderr().write_all(b"\n");
         return;
     }
-    let _ = std::io::stderr().write_all(message.as_bytes());
-    let _ = std::io::stderr().write_all(b"\n");
+    unsafe {
+        let _ = libc::syscall(0x5255_0001 as libc::c_long, message.as_ptr(), message.len());
+        let _ = libc::syscall(0x5255_0001 as libc::c_long, b"\n".as_ptr(), 1_usize);
+    }
 }

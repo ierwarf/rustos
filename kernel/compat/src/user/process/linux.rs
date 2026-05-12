@@ -1189,11 +1189,12 @@ fn reserve_bootstrap_heap(
     const PAGE_SIZE_U64: u64 = 4096;
 
     let heap_len = RUSTOS_BOOTSTRAP_HEAP_DEFAULT_LEN;
-    let heap_base = align_up(image.brk_start.saturating_add(HEAP_GAP), PAGE_SIZE_U64).ok_or(
-        ProcessLoadError::InvalidElf("bootstrap heap base overflow"),
-    )?;
+    let heap_base = align_up(image.brk_start.saturating_add(HEAP_GAP), PAGE_SIZE_U64)
+        .ok_or(ProcessLoadError::InvalidElf("bootstrap heap base overflow"))?;
     if heap_base.checked_add(heap_len).is_none() {
-        return Err(ProcessLoadError::InvalidElf("bootstrap heap range overflow"));
+        return Err(ProcessLoadError::InvalidElf(
+            "bootstrap heap range overflow",
+        ));
     }
     let page_count = (heap_len / PAGE_SIZE_U64) as usize;
     let flags = PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;

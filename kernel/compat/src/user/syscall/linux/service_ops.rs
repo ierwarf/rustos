@@ -1,8 +1,88 @@
 use super::*;
+use lazy_static::lazy_static;
+use spin::Mutex;
+use x86_64::VirtAddr;
+
+const FUTEX_WAITERS_CAPACITY: usize = 256;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FutexKey {
+    address_space_root: u64,
+    uaddr: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FutexWaiter {
+    key: FutexKey,
+    task_id: u64,
+    bitset: u32,
+}
+
+lazy_static! {
+    static ref FUTEX_WAITERS: Mutex<[Option<FutexWaiter>; FUTEX_WAITERS_CAPACITY]> =
+        Mutex::new([None; FUTEX_WAITERS_CAPACITY]);
+}
+
+pub(super) fn syscall_linux_poll(fds_ptr: u64, nfds: u64, _timeout_ms: i64) -> u64 {
+    const POLLFD_SIZE: u64 = 8;
+    let Ok(nfds_usize) = usize::try_from(nfds) else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    if nfds_usize > 1024 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let mut ready = 0_u64;
+    for i in 0..nfds {
+        let Some(entry_ptr) = fds_ptr.checked_add(i.saturating_mul(POLLFD_SIZE)) else {
+            return linux_errno(LINUX_EFAULT);
+        };
+        let mut entry = [0_u8; 8];
+        if let Err(err) = usermem::copy_from_current_user_exact(entry_ptr, &mut entry) {
+            return linux_errno(address_space_error_to_linux_errno(err));
+        }
+        let fd = i32::from_le_bytes(entry[0..4].try_into().unwrap());
+        let events = u16::from_le_bytes(entry[4..6].try_into().unwrap());
+        let revents: u16 = if fd < 0 {
+            0
+        } else if fd <= 2 {
+            let ready_bits = events & (linux_abi::POLLIN | linux_abi::POLLOUT) as u16;
+            if ready_bits != 0 {
+                ready += 1;
+            }
+            ready_bits
+        } else {
+            let has_handle = multitask::with_current_user_process_state(|_, _, ps| {
+                ps.handles().get(fd as u64).is_some()
+            })
+            .unwrap_or(false);
+            if has_handle {
+                let ready_bits = events & (linux_abi::POLLIN | linux_abi::POLLOUT) as u16;
+                if ready_bits != 0 {
+                    ready += 1;
+                }
+                ready_bits
+            } else {
+                ready += 1;
+                linux_abi::POLLNVAL as u16
+            }
+        };
+        entry[6..8].copy_from_slice(&revents.to_le_bytes());
+        if let Err(err) = usermem::write_current_user_bytes(entry_ptr, &entry) {
+            return linux_errno(address_space_error_to_linux_errno(err));
+        }
+    }
+    ready
+}
 
 pub(super) fn syscall_linux_sched_yield() -> u64 {
     multitask::yield_now();
     0
+}
+
+fn current_process_is_linux_syscall_policy_owner() -> bool {
+    super::ipc_ops::current_process_has_service_capability(
+        rustos_user_abi::syscall::IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY,
+    )
 }
 
 pub(super) fn syscall_linux_getpid() -> u64 {
@@ -105,6 +185,10 @@ pub(super) fn syscall_linux_rt_sigprocmask(
 }
 
 pub(super) fn syscall_linux_nanosleep(request_ptr: u64, _remaining_ptr: u64) -> u64 {
+    if current_process_is_linux_syscall_policy_owner() {
+        return syscall_linux_policy_owner_nanosleep(request_ptr);
+    }
+
     let ts = match usermem::read_current_user_struct::<LinuxTimespecWire>(request_ptr) {
         Ok(ts) => ts,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
@@ -119,6 +203,10 @@ pub(super) fn syscall_linux_nanosleep(request_ptr: u64, _remaining_ptr: u64) -> 
 }
 
 pub(super) fn syscall_linux_clock_gettime(clock_id: u64, timespec_ptr: u64) -> u64 {
+    if current_process_is_linux_syscall_policy_owner() {
+        return syscall_linux_policy_owner_clock_gettime(clock_id, timespec_ptr);
+    }
+
     if let Err(err) = usermem::validate_current_user_write_buffer(timespec_ptr, LINUX_TIMESPEC_SIZE)
     {
         return linux_errno(address_space_error_to_linux_errno(err));
@@ -137,6 +225,115 @@ pub(super) fn syscall_linux_clock_gettime(clock_id: u64, timespec_ptr: u64) -> u
         Ok(()) => 0,
         Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
     }
+}
+
+fn syscall_linux_policy_owner_nanosleep(request_ptr: u64) -> u64 {
+    let ts = match usermem::read_current_user_struct::<LinuxTimespecWire>(request_ptr) {
+        Ok(ts) => ts,
+        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+    };
+    if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let nanos = (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64);
+    if nanos != 0 {
+        let millis = nanos.saturating_add(999_999) / 1_000_000;
+        crate::arch::rtc::sleep(millis.max(1));
+    }
+    0
+}
+
+fn syscall_linux_policy_owner_clock_gettime(clock_id: u64, timespec_ptr: u64) -> u64 {
+    if let Err(err) = usermem::validate_current_user_write_buffer(timespec_ptr, LINUX_TIMESPEC_SIZE)
+    {
+        return linux_errno(address_space_error_to_linux_errno(err));
+    }
+
+    let ts = match clock_id {
+        id if id == linux_abi::CLOCK_MONOTONIC as u64 => monotonic_timespec(),
+        id if id == linux_abi::CLOCK_REALTIME as u64 => realtime_timespec(),
+        _ => return linux_errno(LINUX_EINVAL),
+    };
+    match usermem::write_current_user_bytes(timespec_ptr, as_bytes(&ts)) {
+        Ok(()) => 0,
+        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
+    }
+}
+
+fn monotonic_timespec() -> LinuxTimespecWire {
+    let ticks = crate::arch::rtc::ticks();
+    let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
+    LinuxTimespecWire {
+        tv_sec: (ticks / ticks_per_second) as i64,
+        tv_nsec: ((ticks % ticks_per_second).saturating_mul(1_000_000_000) / ticks_per_second)
+            as i64,
+    }
+}
+
+fn realtime_timespec() -> LinuxTimespecWire {
+    let now = crate::arch::rtc::now();
+    let seconds = rtc_datetime_to_unix_seconds(
+        now.year, now.month, now.day, now.hour, now.minute, now.second,
+    )
+    .unwrap_or(0);
+    LinuxTimespecWire {
+        tv_sec: seconds as i64,
+        tv_nsec: 0,
+    }
+}
+
+fn rtc_datetime_to_unix_seconds(
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+) -> Option<u64> {
+    if year < 1970 || month == 0 || month > 12 || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let month_days = days_in_month(year, month)?;
+    if day == 0 || day > month_days {
+        return None;
+    }
+
+    let mut days = 0_u64;
+    let mut y = 1970_u16;
+    while y < year {
+        days += if is_leap_year(y) { 366 } else { 365 };
+        y += 1;
+    }
+    let mut m = 1_u8;
+    while m < month {
+        days += u64::from(days_in_month(year, m)?);
+        m += 1;
+    }
+    days += u64::from(day - 1);
+
+    Some(
+        days.saturating_mul(86_400)
+            .saturating_add(u64::from(hour) * 3_600)
+            .saturating_add(u64::from(minute) * 60)
+            .saturating_add(u64::from(second)),
+    )
+}
+
+fn days_in_month(year: u16, month: u8) -> Option<u8> {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => Some(31),
+        4 | 6 | 9 | 11 => Some(30),
+        2 if is_leap_year(year) => Some(29),
+        2 => Some(28),
+        _ => None,
+    }
+}
+
+fn is_leap_year(year: u16) -> bool {
+    let year = u64::from(year);
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
 
 pub(super) fn syscall_linux_clock_nanosleep(
@@ -160,24 +357,492 @@ pub(super) fn syscall_linux_clock_nanosleep(
     }
 }
 
-pub(super) fn syscall_linux_clone(_frame: &SyscallFrame) -> u64 {
-    linux_errno(LINUX_ENOSYS)
+pub(super) fn syscall_linux_futex_minimal(
+    uaddr: u64,
+    op: u64,
+    val: u64,
+    timeout_ptr: u64,
+    uaddr2: u64,
+    val3: u64,
+) -> u64 {
+    futex_impl(uaddr, op, val, timeout_ptr, uaddr2, val3)
 }
 
-pub(super) fn syscall_linux_clone3(_frame: &SyscallFrame) -> u64 {
-    linux_errno(LINUX_ENOSYS)
+pub(super) fn syscall_linux_clone(frame: &SyscallFrame) -> u64 {
+    clone_linux_thread(frame, frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
 }
 
 pub(super) fn syscall_linux_futex(
     _frame: &SyscallFrame,
-    _uaddr: u64,
-    _op: u64,
-    _val: u64,
-    _timeout_ptr: u64,
-    _uaddr2: u64,
-    _val3: u64,
+    uaddr: u64,
+    op: u64,
+    val: u64,
+    timeout_ptr: u64,
+    uaddr2: u64,
+    val3: u64,
 ) -> u64 {
-    linux_errno(LINUX_ENOSYS)
+    futex_impl(uaddr, op, val, timeout_ptr, uaddr2, val3)
+}
+
+pub(super) fn syscall_linux_clone3(frame: &SyscallFrame) -> u64 {
+    let expected_size = size_of::<linux_abi::LinuxCloneArgs>();
+    let provided_size = match usize::try_from(frame.rsi) {
+        Ok(size) if size != 0 && size <= expected_size => size,
+        _ => return linux_errno(LINUX_EINVAL),
+    };
+    let mut args = linux_abi::LinuxCloneArgs::default();
+    let args_bytes = unsafe {
+        slice::from_raw_parts_mut(core::ptr::addr_of_mut!(args).cast::<u8>(), provided_size)
+    };
+    if let Err(err) = usermem::copy_from_current_user_exact(frame.rdi, args_bytes) {
+        return linux_errno(address_space_error_to_linux_errno(err));
+    }
+    if args.flags & linux_abi::CLONE_PIDFD != 0
+        || args.set_tid != 0
+        || args.set_tid_size != 0
+        || args.flags & linux_abi::CLONE_INTO_CGROUP != 0
+        || args.exit_signal & !linux_abi::CSIGNAL != 0
+    {
+        return linux_errno(LINUX_ENOSYS);
+    }
+    let child_stack = if args.stack == 0 && args.stack_size == 0 {
+        0
+    } else {
+        match args.stack.checked_add(args.stack_size) {
+            Some(value) => value,
+            None => return linux_errno(LINUX_EINVAL),
+        }
+    };
+    clone_linux_thread(
+        frame,
+        args.flags | (args.exit_signal & linux_abi::CSIGNAL),
+        child_stack,
+        args.parent_tid,
+        args.child_tid,
+        args.tls,
+    )
+}
+
+fn futex_impl(uaddr: u64, op: u64, val: u64, timeout_ptr: u64, uaddr2: u64, val3: u64) -> u64 {
+    if (uaddr & 0x3) != 0 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let cmd = op & linux_abi::FUTEX_CMD_MASK;
+    let supported_flags = linux_abi::FUTEX_PRIVATE_FLAG | linux_abi::FUTEX_CLOCK_REALTIME;
+    if (op & !linux_abi::FUTEX_CMD_MASK) & !supported_flags != 0 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let result = match cmd {
+        c if c == linux_abi::FUTEX_WAIT => futex_wait(
+            uaddr,
+            val as u32,
+            timeout_ptr,
+            linux_abi::FUTEX_BITSET_MATCH_ANY,
+        ),
+        c if c == linux_abi::FUTEX_WAIT_BITSET => {
+            let Ok(bitset) = u32::try_from(val3) else {
+                return linux_errno(LINUX_EINVAL);
+            };
+            if bitset == 0 {
+                return linux_errno(LINUX_EINVAL);
+            }
+            futex_wait(uaddr, val as u32, timeout_ptr, bitset)
+        }
+        c if c == linux_abi::FUTEX_WAKE => {
+            futex_wake(uaddr, val, linux_abi::FUTEX_BITSET_MATCH_ANY)
+        }
+        c if c == linux_abi::FUTEX_WAKE_BITSET => {
+            let Ok(bitset) = u32::try_from(val3) else {
+                return linux_errno(LINUX_EINVAL);
+            };
+            if bitset == 0 {
+                return linux_errno(LINUX_EINVAL);
+            }
+            futex_wake(uaddr, val, bitset)
+        }
+        c if c == linux_abi::FUTEX_REQUEUE => futex_requeue(uaddr, val, timeout_ptr, uaddr2),
+        c if c == linux_abi::FUTEX_CMP_REQUEUE => {
+            futex_cmp_requeue(uaddr, val, timeout_ptr, uaddr2, val3)
+        }
+        _ => Err(LINUX_ENOSYS),
+    };
+    match result {
+        Ok(value) => value,
+        Err(errno) => linux_errno(errno),
+    }
+}
+
+fn clone_linux_thread(
+    frame: &SyscallFrame,
+    flags: u64,
+    child_stack: u64,
+    parent_tid_ptr: u64,
+    child_tid_ptr: u64,
+    tls: u64,
+) -> u64 {
+    const REQUIRED_THREAD_FLAGS: u64 = linux_abi::CLONE_VM
+        | linux_abi::CLONE_FS
+        | linux_abi::CLONE_FILES
+        | linux_abi::CLONE_SIGHAND
+        | linux_abi::CLONE_THREAD;
+    const OPTIONAL_THREAD_FLAGS: u64 = linux_abi::CLONE_SYSVSEM
+        | linux_abi::CLONE_SETTLS
+        | linux_abi::CLONE_PARENT_SETTID
+        | linux_abi::CLONE_CHILD_CLEARTID
+        | linux_abi::CLONE_CHILD_SETTID;
+
+    let exit_signal = flags & linux_abi::CSIGNAL;
+    let supported_flags = REQUIRED_THREAD_FLAGS | OPTIONAL_THREAD_FLAGS | linux_abi::CSIGNAL;
+    if exit_signal != 0 || flags & !supported_flags != 0 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    if flags & REQUIRED_THREAD_FLAGS != REQUIRED_THREAD_FLAGS {
+        return linux_errno(LINUX_ENOSYS);
+    }
+    if child_stack == 0
+        || !(paging::USER_SPACE_BASE..paging::USER_SPACE_END_EXCLUSIVE).contains(&child_stack)
+    {
+        return linux_errno(LINUX_EINVAL);
+    }
+    if flags & linux_abi::CLONE_SETTLS != 0
+        && tls != 0
+        && !(paging::USER_SPACE_BASE..paging::USER_SPACE_END_EXCLUSIVE).contains(&tls)
+    {
+        return linux_errno(LINUX_EINVAL);
+    }
+
+    let console_session = multitask::current_console_session();
+    let child_thread_state = match multitask::with_current_user_linux_state_mut(
+        |_, _, abi, address_space, _, linux_thread_state| {
+            if abi != crate::user::abi::UserAbi::Linux {
+                return Err(LINUX_ENOSYS);
+            }
+            let Some(parent_thread_state) = linux_thread_state.as_ref() else {
+                return Err(LINUX_ENOSYS);
+            };
+            if flags & linux_abi::CLONE_PARENT_SETTID != 0 {
+                address_space
+                    .validate_user_write_buffer(VirtAddr::new(parent_tid_ptr), size_of::<u32>())
+                    .map_err(address_space_error_to_linux_errno)?;
+            }
+            if flags & (linux_abi::CLONE_CHILD_SETTID | linux_abi::CLONE_CHILD_CLEARTID) != 0 {
+                address_space
+                    .validate_user_write_buffer(VirtAddr::new(child_tid_ptr), size_of::<u32>())
+                    .map_err(address_space_error_to_linux_errno)?;
+            }
+
+            let mut child_thread_state = *parent_thread_state;
+            if flags & linux_abi::CLONE_SETTLS != 0 {
+                child_thread_state.fs_base = tls;
+            }
+            child_thread_state.clear_child_tid = if flags & linux_abi::CLONE_CHILD_CLEARTID != 0 {
+                child_tid_ptr
+            } else {
+                0
+            };
+            child_thread_state.robust_list_head = 0;
+            child_thread_state.robust_list_len = 0;
+            child_thread_state.rseq_area = 0;
+            child_thread_state.rseq_len = 0;
+            child_thread_state.rseq_signature = 0;
+            child_thread_state.pending_signals = 0;
+            child_thread_state.signal_stack = linux_abi::LinuxSignalStack {
+                sp: 0,
+                flags: linux_abi::SS_DISABLE,
+                _pad: 0,
+                size: 0,
+            };
+            Ok(child_thread_state)
+        },
+    ) {
+        Some(Ok(state)) => state,
+        Some(Err(errno)) => return linux_errno(errno),
+        None => return linux_errno(LINUX_ENOSYS),
+    };
+
+    let mut bootstrap = multitask::UserTaskBootstrap::new(
+        crate::user::abi::UserAbi::Linux,
+        VirtAddr::new(frame.user_rip),
+        VirtAddr::new(child_stack),
+    );
+    bootstrap.console_session = console_session;
+    bootstrap.linux_thread_state = Some(child_thread_state);
+    bootstrap.registers = multitask::UserTaskRegisters {
+        rax: 0,
+        rbx: frame.rbx,
+        rcx: frame.user_rip,
+        rdx: frame.rdx,
+        rsi: frame.rsi,
+        rdi: frame.rdi,
+        rbp: frame.rbp,
+        r8: frame.r8,
+        r9: frame.r9,
+        r10: frame.r10,
+        r11: frame.user_rflags,
+        r12: frame.r12,
+        r13: frame.r13,
+        r14: frame.r14,
+        r15: frame.r15,
+    };
+
+    let child_tid =
+        match multitask::spawn_user_thread(bootstrap, multitask::DEFAULT_USER_TASK_WEIGHT_MICROS) {
+            Ok(tid) => tid,
+            Err(multitask::SpawnTaskError::InvalidWeightMicros) => {
+                return linux_errno(LINUX_EINVAL);
+            }
+            Err(multitask::SpawnTaskError::NoFreeTaskSlot) => return linux_errno(LINUX_EAGAIN),
+        };
+    let child_tid_bytes = (child_tid as u32).to_le_bytes();
+    if flags & (linux_abi::CLONE_PARENT_SETTID | linux_abi::CLONE_CHILD_SETTID) != 0 {
+        let result = multitask::with_current_user_process_state_mut(|_, abi, process_state| {
+            if abi != crate::user::abi::UserAbi::Linux {
+                return Err(LINUX_ENOSYS);
+            }
+            let address_space = process_state.address_space();
+            if flags & linux_abi::CLONE_PARENT_SETTID != 0 {
+                address_space
+                    .copy_into_user(VirtAddr::new(parent_tid_ptr), &child_tid_bytes)
+                    .map_err(address_space_error_to_linux_errno)?;
+            }
+            if flags & linux_abi::CLONE_CHILD_SETTID != 0 {
+                address_space
+                    .copy_into_user(VirtAddr::new(child_tid_ptr), &child_tid_bytes)
+                    .map_err(address_space_error_to_linux_errno)?;
+            }
+            Ok(())
+        });
+        match result {
+            Some(Ok(())) => {}
+            Some(Err(errno)) => return linux_errno(errno),
+            None => return linux_errno(LINUX_ENOSYS),
+        }
+    }
+    child_tid
+}
+
+fn futex_wait(uaddr: u64, expected: u32, timeout_ptr: u64, bitset: u32) -> Result<u64, i64> {
+    if timeout_ptr != 0 {
+        return Err(LINUX_ENOSYS);
+    }
+    let actual =
+        usermem::read_current_user_u32(uaddr).map_err(address_space_error_to_linux_errno)?;
+    if actual != expected {
+        return Err(LINUX_EAGAIN);
+    }
+    let (task_id, mut key) = current_futex_waiter_context()?;
+    key.uaddr = uaddr;
+    register_futex_waiter(FutexWaiter {
+        key,
+        task_id,
+        bitset,
+    })?;
+    if !multitask::block_current_user_task() {
+        clear_futex_waiter(task_id, key);
+        return Err(LINUX_ENOSYS);
+    }
+    multitask::yield_now();
+    clear_futex_waiter(task_id, key);
+    Ok(0)
+}
+
+fn futex_wake(uaddr: u64, max_wake: u64, bitset: u32) -> Result<u64, i64> {
+    let max_wake = usize::try_from(max_wake).map_err(|_| LINUX_EINVAL)?;
+    if max_wake == 0 {
+        return Ok(0);
+    }
+    let (_, mut key) = current_futex_waiter_context()?;
+    key.uaddr = uaddr;
+    Ok(wake_futex_waiters(key, max_wake, bitset) as u64)
+}
+
+fn futex_requeue(uaddr: u64, max_wake: u64, max_requeue: u64, uaddr2: u64) -> Result<u64, i64> {
+    futex_requeue_inner(uaddr, max_wake, max_requeue, uaddr2)
+}
+
+fn futex_cmp_requeue(
+    uaddr: u64,
+    max_wake: u64,
+    max_requeue: u64,
+    uaddr2: u64,
+    expected: u64,
+) -> Result<u64, i64> {
+    let actual =
+        usermem::read_current_user_u32(uaddr).map_err(address_space_error_to_linux_errno)?;
+    if actual as u64 != expected {
+        return Err(LINUX_EAGAIN);
+    }
+    futex_requeue_inner(uaddr, max_wake, max_requeue, uaddr2)
+}
+
+fn futex_requeue_inner(
+    uaddr: u64,
+    max_wake: u64,
+    max_requeue: u64,
+    uaddr2: u64,
+) -> Result<u64, i64> {
+    if (uaddr2 & 0x3) != 0 {
+        return Err(LINUX_EINVAL);
+    }
+    let max_wake = usize::try_from(max_wake).map_err(|_| LINUX_EINVAL)?;
+    let max_requeue = usize::try_from(max_requeue).map_err(|_| LINUX_EINVAL)?;
+    let (_, mut from_key) = current_futex_waiter_context()?;
+    from_key.uaddr = uaddr;
+    let mut to_key = from_key;
+    to_key.uaddr = uaddr2;
+    let (woke, requeued) = requeue_futex_waiters(
+        from_key,
+        to_key,
+        max_wake,
+        max_requeue,
+        linux_abi::FUTEX_BITSET_MATCH_ANY,
+    );
+    Ok((woke + requeued) as u64)
+}
+
+fn current_futex_waiter_context() -> Result<(u64, FutexKey), i64> {
+    multitask::with_current_user_process_state_mut(|pid, abi, process_state| {
+        if abi != crate::user::abi::UserAbi::Linux {
+            return Err(LINUX_ENOSYS);
+        }
+        Ok((
+            pid,
+            FutexKey {
+                address_space_root: process_state.address_space_root(),
+                uaddr: 0,
+            },
+        ))
+    })
+    .unwrap_or(Err(LINUX_ENOSYS))
+}
+
+fn register_futex_waiter(waiter: FutexWaiter) -> Result<(), i64> {
+    let mut waiters = FUTEX_WAITERS.lock();
+    let mut free_slot = None;
+    for slot in 0..waiters.len() {
+        match waiters[slot] {
+            Some(existing) if !multitask::is_user_task_alive(existing.task_id) => {
+                waiters[slot] = None;
+                if free_slot.is_none() {
+                    free_slot = Some(slot);
+                }
+            }
+            None if free_slot.is_none() => free_slot = Some(slot),
+            _ => {}
+        }
+    }
+    let Some(slot) = free_slot else {
+        return Err(LINUX_EBUSY);
+    };
+    waiters[slot] = Some(waiter);
+    Ok(())
+}
+
+fn clear_futex_waiter(task_id: u64, key: FutexKey) {
+    let mut waiters = FUTEX_WAITERS.lock();
+    for slot in 0..waiters.len() {
+        if waiters[slot]
+            .map(|waiter| waiter.task_id == task_id && waiter.key == key)
+            .unwrap_or(false)
+        {
+            waiters[slot] = None;
+        }
+    }
+}
+
+fn wake_futex_waiters(key: FutexKey, max_wake: usize, bitset: u32) -> usize {
+    let mut task_ids = [0_u64; FUTEX_WAITERS_CAPACITY];
+    let mut wake_count = 0usize;
+    {
+        let mut waiters = FUTEX_WAITERS.lock();
+        for slot in 0..waiters.len() {
+            if wake_count == max_wake {
+                break;
+            }
+            let Some(waiter) = waiters[slot] else {
+                continue;
+            };
+            if waiter.key != key || (waiter.bitset & bitset) == 0 {
+                continue;
+            }
+            task_ids[wake_count] = waiter.task_id;
+            waiters[slot] = None;
+            wake_count += 1;
+        }
+    }
+    let mut woken = 0usize;
+    for task_id in task_ids.into_iter().take(wake_count) {
+        if multitask::wake_user_task(task_id) {
+            woken += 1;
+        }
+    }
+    woken
+}
+
+fn requeue_futex_waiters(
+    from_key: FutexKey,
+    to_key: FutexKey,
+    max_wake: usize,
+    max_requeue: usize,
+    bitset: u32,
+) -> (usize, usize) {
+    let mut task_ids = [0_u64; FUTEX_WAITERS_CAPACITY];
+    let mut wake_count = 0usize;
+    let mut requeue_count = 0usize;
+    {
+        let mut waiters = FUTEX_WAITERS.lock();
+        for slot in 0..waiters.len() {
+            let Some(mut waiter) = waiters[slot] else {
+                continue;
+            };
+            if waiter.key != from_key || (waiter.bitset & bitset) == 0 {
+                continue;
+            }
+            if wake_count < max_wake {
+                task_ids[wake_count] = waiter.task_id;
+                waiters[slot] = None;
+                wake_count += 1;
+                continue;
+            }
+            if requeue_count < max_requeue {
+                waiter.key = to_key;
+                waiters[slot] = Some(waiter);
+                requeue_count += 1;
+                continue;
+            }
+            break;
+        }
+    }
+    let mut woken = 0usize;
+    for task_id in task_ids.into_iter().take(wake_count) {
+        if multitask::wake_user_task(task_id) {
+            woken += 1;
+        }
+    }
+    (woken, requeue_count)
+}
+
+pub(super) fn cleanup_linux_thread_exit() {
+    let clear_child_tid = multitask::with_current_user_linux_state_mut(
+        |_, _, abi, address_space, _, linux_thread_state| {
+            if abi != crate::user::abi::UserAbi::Linux {
+                return None;
+            }
+            let state = linux_thread_state.as_mut()?;
+            if state.clear_child_tid == 0 {
+                return None;
+            }
+            let clear_child_tid = state.clear_child_tid;
+            let _ =
+                address_space.copy_into_user(VirtAddr::new(clear_child_tid), &0_u32.to_le_bytes());
+            state.clear_child_tid = 0;
+            Some(clear_child_tid)
+        },
+    )
+    .flatten();
+    if let Some(clear_child_tid) = clear_child_tid {
+        let _ = futex_wake(clear_child_tid, 1, linux_abi::FUTEX_BITSET_MATCH_ANY);
+    }
 }
 
 pub(super) fn syscall_linux_arch_prctl(_code: u64, _arg: u64) -> u64 {
@@ -377,6 +1042,18 @@ pub(super) fn syscall_linux_vfs_dup(oldfd: u64, newfd: u64, flags: u64, mode: Vf
 }
 
 pub(super) fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
+    if fd == 0 {
+        let Ok(user_len) = usize::try_from(user_len) else {
+            return linux_errno(LINUX_EINVAL);
+        };
+        if user_len == 0 {
+            return 0;
+        }
+        return match crate::user::sysops::console::read_into_current_process(user_ptr, user_len) {
+            Ok(read) => read as u64,
+            Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
+        };
+    }
     if let Some(mut file) = current_vfs_file_handle(fd) {
         let Ok(user_len) = usize::try_from(user_len) else {
             return linux_errno(LINUX_EINVAL);
@@ -505,6 +1182,18 @@ pub(super) fn syscall_linux_vfs_pread64(fd: u64, user_ptr: u64, user_len: u64, o
 }
 
 pub(super) fn syscall_linux_vfs_write(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
+    if fd <= 2 {
+        let Ok(user_len) = usize::try_from(user_len) else {
+            return linux_errno(LINUX_EINVAL);
+        };
+        if user_len == 0 {
+            return 0;
+        }
+        return match crate::user::sysops::console::write_from_current_process(user_ptr, user_len) {
+            Ok(written) => written as u64,
+            Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
+        };
+    }
     let Some(remote) = current_remote_vfs_handle(fd) else {
         return linux_errno(LINUX_EBADF);
     };
@@ -531,6 +1220,68 @@ pub(super) fn syscall_linux_vfs_write(fd: u64, user_ptr: u64, user_len: u64) -> 
         Ok(written) => written,
         Err(errno) => linux_errno(errno),
     }
+}
+
+pub(super) fn syscall_linux_vfs_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
+    const LINUX_UIO_MAXIOV: u64 = 1024;
+    if iovcnt > LINUX_UIO_MAXIOV {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let mut total = 0_u64;
+    for index in 0..iovcnt {
+        let Some(entry_ptr) = iov_ptr.checked_add(index.saturating_mul(16)) else {
+            return if total == 0 {
+                linux_errno(LINUX_EFAULT)
+            } else {
+                total
+            };
+        };
+        let mut entry = [0_u8; 16];
+        if let Err(err) = usermem::copy_from_current_user_exact(entry_ptr, &mut entry) {
+            return if total == 0 {
+                linux_errno(address_space_error_to_linux_errno(err))
+            } else {
+                total
+            };
+        }
+        let base = u64::from_le_bytes(entry[..8].try_into().unwrap_or([0; 8]));
+        let len = u64::from_le_bytes(entry[8..16].try_into().unwrap_or([0; 8]));
+        let mut written_for_iov = 0_u64;
+        while written_for_iov < len {
+            let Some(chunk_ptr) = base.checked_add(written_for_iov) else {
+                return if total == 0 {
+                    linux_errno(LINUX_EFAULT)
+                } else {
+                    total
+                };
+            };
+            let chunk_len = (len - written_for_iov).min(VFS_IPC_REQUEST_PAYLOAD_CAPACITY as u64);
+            let result = syscall_linux_vfs_write(fd, chunk_ptr, chunk_len);
+            if is_linux_error(result) {
+                return if total == 0 { result } else { total };
+            }
+            if result == 0 {
+                return total;
+            }
+            total = match total.checked_add(result) {
+                Some(value) => value,
+                None => return linux_errno(LINUX_EINVAL),
+            };
+            written_for_iov = match written_for_iov.checked_add(result) {
+                Some(value) => value,
+                None => return linux_errno(LINUX_EINVAL),
+            };
+            if result < chunk_len {
+                return total;
+            }
+        }
+    }
+    total
+}
+
+fn is_linux_error(result: u64) -> bool {
+    let signed = result as i64;
+    (-4095..0).contains(&signed)
 }
 
 pub(super) fn syscall_linux_vfs_lseek(fd: u64, offset: i64, whence: u64) -> u64 {
@@ -564,6 +1315,9 @@ pub(super) fn syscall_linux_vfs_lseek(fd: u64, offset: i64, whence: u64) -> u64 
 }
 
 pub(super) fn syscall_linux_vfs_fstat(fd: u64, stat_ptr: u64) -> u64 {
+    if fd <= 2 {
+        return write_bootstrap_stat(stat_ptr, fd + 1, 0);
+    }
     if let Some(file) = current_vfs_file_handle(fd) {
         return write_bootstrap_stat(
             stat_ptr,
@@ -642,6 +1396,15 @@ pub(super) fn syscall_linux_vfs_getdents64(fd: u64, user_ptr: u64, user_len: u64
 }
 
 pub(super) fn syscall_linux_vfs_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
+    if fd <= 2 {
+        return match cmd {
+            linux_abi::F_GETFD => 0,
+            linux_abi::F_SETFD => 0,
+            linux_abi::F_GETFL => (linux_abi::O_RDWR as u64),
+            linux_abi::F_SETFL => 0,
+            _ => linux_errno(LINUX_EINVAL),
+        };
+    }
     let Some(remote) = current_remote_vfs_handle(fd) else {
         return linux_errno(LINUX_EBADF);
     };
@@ -1014,8 +1777,21 @@ pub(super) fn syscall_linux_vfs_umount2(target_ptr: u64, flags: u64) -> u64 {
     }
 }
 
-pub(super) fn syscall_linux_ioctl(_fd: u64, _request: u64, _arg: u64) -> u64 {
-    linux_errno(LINUX_ENOSYS)
+pub(super) fn syscall_linux_ioctl(fd: u64, request_number: u64, arg: u64) -> u64 {
+    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_IOCTL);
+    request.dirfd = fd;
+    request.flags = request_number;
+    request.arg1 = arg;
+    match call_service_offload_request(IPC_SERVICE_DEVMGRD, &request).and_then(|response| {
+        ensure_service_response(&response, SYSCALL_OFFLOAD_OP_LINUX_IOCTL)?;
+        ensure_syscalld_payload(&response, size_of::<u64>())?;
+        let mut bytes = [0_u8; size_of::<u64>()];
+        bytes.copy_from_slice(&response.payload[..size_of::<u64>()]);
+        Ok(u64::from_le_bytes(bytes))
+    }) {
+        Ok(value) => value,
+        Err(errno) => linux_errno(errno),
+    }
 }
 
 pub(super) fn syscall_linux_net4(op: u16, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
@@ -1091,23 +1867,23 @@ pub(super) fn syscall_linux_loader_spawn_exec(
     ) {
         return linux_errno(errno);
     }
+    // foundation 서비스(syscalld/vfsd/loaderd)는 loaderd를 경유하지 않고 항상 kernel
+    // bootstrap path를 사용한다. loaderd가 VFS(vfsd)에 의존하므로, 이 서비스들을 loaderd로
+    // respawn 하면 vfsd 크래시 시 의존 사이클이 발생해 복구 불가 상태가 된다.
+    if can_bootstrap_spawn_direct(exec_path.as_str()) {
+        return match spawn_bootstrap_exec_direct(
+            exec_path.as_str(),
+            flags,
+            console_session,
+            weight_micros,
+        ) {
+            Ok(pid) => pid,
+            Err(errno) => linux_errno(errno),
+        };
+    }
+
     let response = match call_loaderd(&request) {
         Ok(response) => response,
-        Err(errno) if can_bootstrap_spawn_direct(exec_path.as_str()) => {
-            return match spawn_bootstrap_exec_direct(
-                exec_path.as_str(),
-                flags,
-                console_session,
-                weight_micros,
-            ) {
-                Ok(pid) => pid,
-                Err(fallback_errno) => linux_errno(if fallback_errno == LINUX_ENOENT {
-                    errno
-                } else {
-                    fallback_errno
-                }),
-            };
-        }
         Err(errno) => return linux_errno(errno),
     };
     if response.version != LOADER_REQUEST_ABI_VERSION

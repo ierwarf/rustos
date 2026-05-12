@@ -2,10 +2,9 @@
 //! can call these directly without going through libc.
 
 use rustos_user_abi::syscall::{
-    SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
-    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_RECV,
-    SYS_RUSTOS_IPC_REGISTER_LINUX_SYSCALL_ENDPOINT, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
-    SYS_RUSTOS_IPC_REPLY,
+    SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_LINUX_SYSCALL_ENDPOINT,
+    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
 };
 
 use crate::syscall::{syscall0, syscall1, syscall2, syscall3, syscall4};
@@ -22,7 +21,13 @@ pub fn register_linux_syscall_endpoint(endpoint: u64) -> i64 {
 
 #[inline]
 pub fn register_service_endpoint(service_id: u64, endpoint: u64) -> i64 {
-    unsafe { syscall2(SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, service_id, endpoint) }
+    unsafe {
+        syscall2(
+            SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
+            service_id,
+            endpoint,
+        )
+    }
 }
 
 #[inline]

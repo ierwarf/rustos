@@ -17,8 +17,8 @@ use core::cell::UnsafeCell;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::BootstrapHeap;
 use crate::syscall;
+use crate::BootstrapHeap;
 
 const GROW_CHUNK_BYTES: usize = 1 * 1024 * 1024;
 

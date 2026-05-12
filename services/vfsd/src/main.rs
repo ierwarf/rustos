@@ -10,6 +10,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
 
+use rustos_svc_runtime::ipc;
 use rustos_user_abi::syscall::{
     RustosBlockBrokerArgs, VfsIpcRequest, VfsIpcResponse, BLOCK_BROKER_ABI_VERSION,
     BLOCK_BROKER_MAX_IO_BYTES, BLOCK_BROKER_OP_BOOT_INFO, BLOCK_BROKER_OP_BOOT_READ,
@@ -24,14 +25,13 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_PATH_CAPACITY, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, SYS_RUSTOS_BLOCK_BROKER,
     VFS_IPC_ABI_VERSION, VFS_IPC_HANDLE_KIND_DEVICE, VFS_IPC_HANDLE_KIND_DIR,
     VFS_IPC_HANDLE_KIND_FILE, VFS_IPC_OP_ACCESS, VFS_IPC_OP_CHDIR, VFS_IPC_OP_CLOSE,
-    VFS_IPC_OP_DUP, VFS_IPC_OP_FCNTL, VFS_IPC_OP_FSTAT, VFS_IPC_OP_FTRUNCATE,
-    VFS_IPC_OP_GETCWD, VFS_IPC_OP_GETDENTS64, VFS_IPC_OP_LSEEK, VFS_IPC_OP_MKDIR,
-    VFS_IPC_OP_MOUNT, VFS_IPC_OP_NEWFSTATAT, VFS_IPC_OP_OPENAT, VFS_IPC_OP_PREAD64,
-    VFS_IPC_OP_READ, VFS_IPC_OP_READLINKAT, VFS_IPC_OP_STATX, VFS_IPC_OP_UMOUNT2,
-    VFS_IPC_OP_UNLINKAT, VFS_IPC_OP_WRITE, VFS_IPC_PATH_CAPACITY, VFS_IPC_PAYLOAD_CAPACITY,
+    VFS_IPC_OP_DUP, VFS_IPC_OP_FCNTL, VFS_IPC_OP_FSTAT, VFS_IPC_OP_FTRUNCATE, VFS_IPC_OP_GETCWD,
+    VFS_IPC_OP_GETDENTS64, VFS_IPC_OP_LSEEK, VFS_IPC_OP_MKDIR, VFS_IPC_OP_MOUNT,
+    VFS_IPC_OP_NEWFSTATAT, VFS_IPC_OP_OPENAT, VFS_IPC_OP_PREAD64, VFS_IPC_OP_READ,
+    VFS_IPC_OP_READLINKAT, VFS_IPC_OP_STATX, VFS_IPC_OP_UMOUNT2, VFS_IPC_OP_UNLINKAT,
+    VFS_IPC_OP_WRITE, VFS_IPC_PATH_CAPACITY, VFS_IPC_PAYLOAD_CAPACITY,
     VFS_IPC_REQUEST_PAYLOAD_CAPACITY,
 };
-use rustos_svc_runtime::ipc;
 use storage_core::{BlockDevice, IoResult, StorageError};
 use storage_fat::{FatDirEntry, FatNodeKind, FatVolume};
 
@@ -465,11 +465,10 @@ impl VfsState {
         offset: Option<u64>,
     ) {
         let len = (request.arg1 as usize).min(VFS_IPC_PAYLOAD_CAPACITY);
-        match self.read_remote(request.remote_id, offset, len) {
-            Ok(bytes) => {
-                response.payload_len = bytes.len() as u32;
-                response.value = bytes.len() as u64;
-                response.payload[..bytes.len()].copy_from_slice(bytes.as_slice());
+        match self.read_remote_into(request.remote_id, offset, len, &mut response.payload) {
+            Ok(read) => {
+                response.payload_len = read as u32;
+                response.value = read as u64;
             }
             Err(errno) => response.status = errno,
         }
@@ -717,7 +716,13 @@ impl VfsState {
         0
     }
 
-    fn read_remote(&mut self, id: u64, offset: Option<u64>, len: usize) -> Result<Vec<u8>, i32> {
+    fn read_remote_into(
+        &mut self,
+        id: u64,
+        offset: Option<u64>,
+        len: usize,
+        dest: &mut [u8],
+    ) -> Result<usize, i32> {
         let (path, start, file_len) = {
             let handle = self.handles.get(&id).ok_or(EBADF)?;
             if handle.kind != RemoteKind::File {
@@ -730,21 +735,26 @@ impl VfsState {
             )
         };
         let available = file_len.saturating_sub(start);
-        let len = len.min(available as usize);
-        let bytes = if len == 0 {
-            Vec::new()
+        let len = len.min(available as usize).min(dest.len());
+        let read = if len == 0 {
+            0
         } else {
-            self.cached_file_slice(path.as_str(), start, len)?
+            self.cached_file_slice_into(path.as_str(), start, &mut dest[..len])?
         };
         if offset.is_none() {
             if let Some(handle) = self.handles.get_mut(&id) {
-                handle.cursor = handle.cursor.saturating_add(bytes.len() as u64);
+                handle.cursor = handle.cursor.saturating_add(read as u64);
             }
         }
-        Ok(bytes)
+        Ok(read)
     }
 
-    fn cached_file_slice(&mut self, path: &str, start: u64, len: usize) -> Result<Vec<u8>, i32> {
+    fn cached_file_slice_into(
+        &mut self,
+        path: &str,
+        start: u64,
+        dest: &mut [u8],
+    ) -> Result<usize, i32> {
         if !self.file_cache.contains_key(path) {
             let bytes = self
                 .volume()?
@@ -756,8 +766,13 @@ impl VfsState {
             return Err(ENOENT);
         };
         let start = usize::try_from(start).map_err(|_| EINVAL)?;
-        let end = start.saturating_add(len).min(bytes.len());
-        Ok(bytes[start..end].to_vec())
+        if start >= bytes.len() {
+            return Ok(0);
+        }
+        let end = start.saturating_add(dest.len()).min(bytes.len());
+        let read = end - start;
+        dest[..read].copy_from_slice(&bytes[start..end]);
+        Ok(read)
     }
 
     fn getdents_payload(
@@ -813,6 +828,8 @@ impl VfsState {
             });
         }
         if path.starts_with("/dev/") {
+            // RING3-MIGRATION-CANDIDATE: replace this wildcard device namespace
+            // with devmgrd-provided device records before adding more device nodes.
             return Ok(Metadata {
                 kind: RemoteKind::Device,
                 len: 0,

@@ -10,12 +10,10 @@ use crate::multitask;
 use crate::user::abi::UserAbi;
 use crate::user::handles::VfsFileHandle;
 use crate::user::linux::{LinuxProcessImageInfo, LinuxProcessLaunch};
-use crate::user::process_state::ProcessSecurityContext;
+use crate::user::process_state::{ProcessSecurityContext, WindowsProcessRuntimeState};
 use crate::vfs;
 
 mod linux;
-// RING3-MIGRATION-REFERENCE: Windows process loader/runtime is preserved in
-// `process/windows/*.rs` as commented source for a future loaderd-owned PE path.
 
 const PAGE_SIZE: u64 = 4096;
 const MAX_LOAD_SEGMENTS: usize = 32;
@@ -216,6 +214,13 @@ impl ProcessStartRegisters {
 #[derive(Clone)]
 enum LoadedProcessRuntime {
     Linux(LinuxProcessImageInfo),
+    Windows(WindowsProcessImageInfo),
+}
+
+#[derive(Clone)]
+struct WindowsProcessImageInfo {
+    image_base: u64,
+    image_size: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -243,24 +248,11 @@ pub fn load_image(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadError> 
         return linux::load_elf(image);
     }
     if image.starts_with(b"MZ") {
-        return Err(ProcessLoadError::InvalidPe(
-            "Windows PE loading is ring3-migration reference material",
-        ));
+        return load_pe_metadata(image);
     }
 
     Err(ProcessLoadError::InvalidPe(
         "unknown executable image format",
-    ))
-}
-
-pub fn initialize_windows_thread_identifiers(
-    _address_space: &mut ProcessAddressSpace,
-    _teb_address: u64,
-    _process_id: u64,
-    _thread_id: u64,
-) -> Result<(), ProcessLoadError> {
-    Err(ProcessLoadError::InvalidPe(
-        "Windows TEB initialization is ring3-migration reference material",
     ))
 }
 
@@ -287,6 +279,18 @@ pub fn prepare_process_with_launch(
     launch: ProcessLaunchOptions<'_>,
 ) -> Result<PreparedProcessImage, ProcessLoadError> {
     prepare_loaded_process_with_launch(load_image(image)?, launch)
+}
+
+pub fn prepare_process_with_address_space(
+    image: &[u8],
+    address_space: ProcessAddressSpace,
+    launch: ProcessLaunchOptions<'_>,
+) -> Result<PreparedProcessImage, ProcessLoadError> {
+    let mut loaded = load_image(image)?;
+    if matches!(loaded.abi, UserAbi::Linux | UserAbi::Windows) {
+        loaded.address_space = address_space;
+    }
+    prepare_loaded_process_with_launch(loaded, launch)
 }
 
 pub fn prepare_process_file_with_launch(
@@ -383,9 +387,12 @@ pub fn load_image_file(file: VfsFileHandle) -> Result<LoadedProcessImage, Proces
         return linux::load_elf_file(file);
     }
     if &header[..2] == b"MZ" {
-        return Err(ProcessLoadError::InvalidPe(
-            "Windows PE loading is ring3-migration reference material",
-        ));
+        let mut image = vec![0_u8; file.len()];
+        let read = file.read_at(0, &mut image);
+        if read != image.len() {
+            return Err(ProcessLoadError::InvalidPe("short PE image read"));
+        }
+        return load_pe_metadata(&image);
     }
 
     Err(ProcessLoadError::InvalidPe(
@@ -408,6 +415,7 @@ fn build_process_bootstrap(
         linux_memory_map,
         linux_runtime_profile,
         linux_thread_state,
+        windows_runtime,
     ) = match (abi, runtime) {
         (UserAbi::Linux, LoadedProcessRuntime::Linux(image)) => {
             linux::initialize_linux_initial_tls(address_space, &image)?;
@@ -428,7 +436,58 @@ fn build_process_bootstrap(
                 )),
                 Some(linux::build_runtime_profile(&image, launch.linux)),
                 Some(image.initial_thread_state()),
+                None,
             )
+        }
+        (UserAbi::Windows, LoadedProcessRuntime::Windows(image)) => {
+            let stack_pointer = initial_user_stack_top(stack_end)?;
+            let runtime = WindowsProcessRuntimeState {
+                image_base: image.image_base,
+                image_size: image.image_size,
+                allocation_base_hint: image.image_base.saturating_add(image.image_size),
+                public_runtime_address: 0,
+                peb_address: 0,
+                teb_address: 0,
+                process_parameters_address: 0,
+                loader_data_address: 0,
+                loader_module_array_address: 0,
+                loader_module_count: 1,
+                loader_reserved: 0,
+                main_module_entry_address: entry.as_u64(),
+                command_line_w_ptr: 0,
+                command_line_a_ptr: 0,
+                environment_w_ptr: 0,
+                environment_a_ptr: 0,
+                module_path_w_ptr: 0,
+                module_path_a_ptr: 0,
+                module_directory_w_ptr: 0,
+                module_directory_a_ptr: 0,
+                main_module_base_name_w_ptr: 0,
+                main_module_base_name_a_ptr: 0,
+                argc: 0,
+                argc_ptr: 0,
+                argv_ptr_ptr: 0,
+                environ_ptr_ptr: 0,
+                argv_ptr: 0,
+                environ_ptr: 0,
+                initial_narrow_environment_ptr: 0,
+                initenv_ptr: 0,
+                errno_ptr: 0,
+                last_error_ptr: 0,
+                commode_ptr: 0,
+                fmode_ptr: 0,
+                iob_array_ptr: 0,
+                stdin_file_ptr: 0,
+                stdout_file_ptr: 0,
+                stderr_file_ptr: 0,
+                localeconv_ptr: 0,
+                strerror_einval_ptr: 0,
+                strerror_enomem_ptr: 0,
+                strerror_eio_ptr: 0,
+                strerror_erange_ptr: 0,
+                strerror_unknown_ptr: 0,
+            };
+            (stack_pointer, None, None, None, None, Some(runtime))
         }
         _ => {
             return Err(ProcessLoadError::InvalidElf(
@@ -451,10 +510,86 @@ fn build_process_bootstrap(
     bootstrap.linux_memory_map = linux_memory_map;
     bootstrap.linux_runtime_profile = linux_runtime_profile;
     bootstrap.linux_thread_state = linux_thread_state;
+    bootstrap.windows_runtime = windows_runtime;
     bootstrap.console_session = launch.console_session;
     bootstrap.logical_admin = launch.logical_admin;
     bootstrap.set_exec_path(launch.linux.exec_path);
     Ok(bootstrap)
+}
+
+fn load_pe_metadata(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadError> {
+    const PE_LOAD_OFFSET: u64 = 0x0040_0000;
+    if image.len() < 0x100 {
+        return Err(ProcessLoadError::InvalidPe("PE image is too small"));
+    }
+    let pe_offset = read_u32(image, 0x3c)? as usize;
+    if pe_offset
+        .checked_add(0x88)
+        .is_none_or(|end| end > image.len())
+    {
+        return Err(ProcessLoadError::InvalidPe("PE header outside image"));
+    }
+    if &image[pe_offset..pe_offset + 4] != b"PE\0\0" {
+        return Err(ProcessLoadError::InvalidPe("missing PE signature"));
+    }
+    if read_u16(image, pe_offset + 4)? != 0x8664 {
+        return Err(ProcessLoadError::InvalidPe("unsupported PE machine"));
+    }
+    let optional = pe_offset + 24;
+    if read_u16(image, optional)? != 0x20b {
+        return Err(ProcessLoadError::InvalidPe(
+            "unsupported PE optional header",
+        ));
+    }
+    let entry_rva = read_u32(image, optional + 16)? as u64;
+    let size_of_image = read_u32(image, optional + 56)? as u64;
+    if entry_rva == 0 || size_of_image == 0 {
+        return Err(ProcessLoadError::InvalidPe(
+            "invalid PE entry or image size",
+        ));
+    }
+    let image_base = rustos_user_abi::syscall::PROC_BROKER_USER_SPACE_BASE
+        .checked_add(PE_LOAD_OFFSET)
+        .ok_or(ProcessLoadError::InvalidPe("PE load base overflow"))?;
+    Ok(LoadedProcessImage {
+        abi: UserAbi::Windows,
+        address_space: ProcessAddressSpace::new()?,
+        entry: VirtAddr::new(
+            image_base
+                .checked_add(entry_rva)
+                .ok_or(ProcessLoadError::InvalidPe("PE entry overflow"))?,
+        ),
+        runtime: LoadedProcessRuntime::Windows(WindowsProcessImageInfo {
+            image_base,
+            image_size: align_up(size_of_image, PAGE_SIZE)
+                .ok_or(ProcessLoadError::InvalidPe("PE image size overflow"))?,
+        }),
+    })
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, ProcessLoadError> {
+    let end = offset
+        .checked_add(2)
+        .ok_or(ProcessLoadError::InvalidPe("PE read overflow"))?;
+    if end > bytes.len() {
+        return Err(ProcessLoadError::InvalidPe("PE read outside image"));
+    }
+    Ok(u16::from_le_bytes([bytes[offset], bytes[offset + 1]]))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, ProcessLoadError> {
+    let end = offset
+        .checked_add(4)
+        .ok_or(ProcessLoadError::InvalidPe("PE read overflow"))?;
+    if end > bytes.len() {
+        return Err(ProcessLoadError::InvalidPe("PE read outside image"));
+    }
+    Ok(u32::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ]))
 }
 
 fn page_ranges_overlap(page_base: u64, page_end: u64, existing_ranges: &[(u64, u64)]) -> bool {
