@@ -14,19 +14,23 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_OP_LINUX_GETPGID, SYSCALL_OFFLOAD_OP_LINUX_GETPPID,
     SYSCALL_OFFLOAD_OP_LINUX_GETRANDOM, SYSCALL_OFFLOAD_OP_LINUX_GETSID,
     SYSCALL_OFFLOAD_OP_LINUX_GETUID, SYSCALL_OFFLOAD_OP_LINUX_GET_ROBUST_LIST,
-    SYSCALL_OFFLOAD_OP_LINUX_MADVISE, SYSCALL_OFFLOAD_OP_LINUX_MMAP,
-    SYSCALL_OFFLOAD_OP_LINUX_MPROTECT, SYSCALL_OFFLOAD_OP_LINUX_MUNMAP,
-    SYSCALL_OFFLOAD_OP_LINUX_NANOSLEEP, SYSCALL_OFFLOAD_OP_LINUX_PRLIMIT64,
+    SYSCALL_OFFLOAD_OP_LINUX_MADVISE, SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE,
+    SYSCALL_OFFLOAD_OP_LINUX_MMAP, SYSCALL_OFFLOAD_OP_LINUX_MPROTECT,
+    SYSCALL_OFFLOAD_OP_LINUX_MUNMAP, SYSCALL_OFFLOAD_OP_LINUX_NANOSLEEP,
+    SYSCALL_OFFLOAD_OP_LINUX_PRLIMIT64,
     SYSCALL_OFFLOAD_OP_LINUX_RSEQ, SYSCALL_OFFLOAD_OP_LINUX_RT_SIGACTION,
     SYSCALL_OFFLOAD_OP_LINUX_RT_SIGPROCMASK, SYSCALL_OFFLOAD_OP_LINUX_SCHED_GETAFFINITY,
     SYSCALL_OFFLOAD_OP_LINUX_SETGID, SYSCALL_OFFLOAD_OP_LINUX_SETPGID,
     SYSCALL_OFFLOAD_OP_LINUX_SETSID, SYSCALL_OFFLOAD_OP_LINUX_SETUID,
     SYSCALL_OFFLOAD_OP_LINUX_SET_ROBUST_LIST, SYSCALL_OFFLOAD_OP_LINUX_SIGALTSTACK,
-    SYSCALL_OFFLOAD_OP_LINUX_UMASK, SYSCALL_OFFLOAD_OP_LINUX_UNAME, SYSCALL_OFFLOAD_PATH_CAPACITY,
+    SYSCALL_OFFLOAD_OP_LINUX_UMASK, SYSCALL_OFFLOAD_OP_LINUX_UNAME,
+    SYSCALL_OFFLOAD_OP_LINUX_WAIT4, SYSCALL_OFFLOAD_PATH_CAPACITY,
+    WIN32_SYSCALL_OFFLOAD_ABI_VERSION, Win32SyscallOffloadRequest, Win32SyscallOffloadResponse,
 };
 
 mod errno;
 mod linux_policy;
+mod win32_policy;
 
 rustos_svc_runtime::entry!(service_main);
 
@@ -49,13 +53,13 @@ fn service_main() {
 
 fn serve(endpoint: u64) {
     loop {
-        let mut request = LinuxSyscallOffloadRequest::default();
+        let mut request = [0_u8; size_of::<LinuxSyscallOffloadRequest>()];
         let mut reply_cap = 0_u64;
         let received = unsafe {
             ipc::recv(
                 endpoint,
-                (&mut request as *mut LinuxSyscallOffloadRequest).cast::<u8>(),
-                size_of::<LinuxSyscallOffloadRequest>(),
+                request.as_mut_ptr(),
+                request.len(),
                 &mut reply_cap as *mut u64,
             )
         };
@@ -65,13 +69,12 @@ fn serve(endpoint: u64) {
             continue;
         }
 
-        let mut response = LinuxSyscallOffloadResponse::default();
-        handle_request(received as usize, &request, &mut response);
+        let response = handle_request(received as usize, &request);
         let reply = unsafe {
             ipc::reply(
                 reply_cap,
-                (&response as *const LinuxSyscallOffloadResponse).cast::<u8>(),
-                size_of::<LinuxSyscallOffloadResponse>(),
+                response.as_ptr(),
+                response.len(),
             )
         };
         if reply < 0 {
@@ -80,7 +83,56 @@ fn serve(endpoint: u64) {
     }
 }
 
-fn handle_request(
+enum SyscallOffloadReply {
+    Linux(LinuxSyscallOffloadResponse),
+    Win32(Win32SyscallOffloadResponse),
+}
+
+impl SyscallOffloadReply {
+    fn as_ptr(&self) -> *const u8 {
+        match self {
+            Self::Linux(response) => {
+                (response as *const LinuxSyscallOffloadResponse).cast::<u8>()
+            }
+            Self::Win32(response) => {
+                (response as *const Win32SyscallOffloadResponse).cast::<u8>()
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Linux(_) => size_of::<LinuxSyscallOffloadResponse>(),
+            Self::Win32(_) => size_of::<Win32SyscallOffloadResponse>(),
+        }
+    }
+}
+
+fn handle_request(received: usize, bytes: &[u8]) -> SyscallOffloadReply {
+    if received == size_of::<LinuxSyscallOffloadRequest>() {
+        let request = read_unaligned::<LinuxSyscallOffloadRequest>(bytes);
+        let mut response = LinuxSyscallOffloadResponse::default();
+        handle_linux_request(received, &request, &mut response);
+        return SyscallOffloadReply::Linux(response);
+    }
+    if received == size_of::<Win32SyscallOffloadRequest>() {
+        let request = read_unaligned::<Win32SyscallOffloadRequest>(bytes);
+        let mut response = Win32SyscallOffloadResponse {
+            version: WIN32_SYSCALL_OFFLOAD_ABI_VERSION,
+            op: request.op,
+            ..Win32SyscallOffloadResponse::default()
+        };
+        handle_win32_request(received, &request, &mut response);
+        return SyscallOffloadReply::Win32(response);
+    }
+    let response = LinuxSyscallOffloadResponse {
+        status: errno::EINVAL,
+        ..LinuxSyscallOffloadResponse::default()
+    };
+    SyscallOffloadReply::Linux(response)
+}
+
+fn handle_linux_request(
     received: usize,
     request: &LinuxSyscallOffloadRequest,
     response: &mut LinuxSyscallOffloadResponse,
@@ -144,8 +196,29 @@ fn handle_request(
         SYSCALL_OFFLOAD_OP_LINUX_MMAP => linux_policy::handle_mmap(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_MPROTECT => linux_policy::handle_mprotect(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_MUNMAP => linux_policy::handle_munmap(request, response),
+        SYSCALL_OFFLOAD_OP_LINUX_WAIT4 => linux_policy::handle_wait4(request, response),
+        SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE => {
+            linux_policy::handle_memfd_create(request, response)
+        }
         _ => response.status = errno::EINVAL,
     }
+}
+
+fn handle_win32_request(
+    received: usize,
+    request: &Win32SyscallOffloadRequest,
+    response: &mut Win32SyscallOffloadResponse,
+) {
+    response.op = request.op;
+    if received != size_of::<Win32SyscallOffloadRequest>()
+        || request.version != WIN32_SYSCALL_OFFLOAD_ABI_VERSION
+        || request.reserved0 != 0
+        || request.pid == 0
+    {
+        response.status = win32_policy::ERROR_INVALID_PARAMETER;
+        return;
+    }
+    win32_policy::handle_request(request, response);
 }
 
 fn validate_request(received: usize, request: &LinuxSyscallOffloadRequest) -> Result<(), i32> {
@@ -186,9 +259,16 @@ fn validate_request(received: usize, request: &LinuxSyscallOffloadRequest) -> Re
         | SYSCALL_OFFLOAD_OP_LINUX_BRK
         | SYSCALL_OFFLOAD_OP_LINUX_MMAP
         | SYSCALL_OFFLOAD_OP_LINUX_MPROTECT
-        | SYSCALL_OFFLOAD_OP_LINUX_MUNMAP => Ok(()),
+        | SYSCALL_OFFLOAD_OP_LINUX_MUNMAP
+        | SYSCALL_OFFLOAD_OP_LINUX_WAIT4
+        | SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE => Ok(()),
         _ => Err(errno::EINVAL),
     }
+}
+
+fn read_unaligned<T: Copy>(bytes: &[u8]) -> T {
+    debug_assert!(bytes.len() >= size_of::<T>());
+    unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) }
 }
 
 #[cfg(test)]

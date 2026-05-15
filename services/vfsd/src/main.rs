@@ -820,16 +820,20 @@ impl VfsState {
     }
 
     fn metadata(&mut self, path: &str) -> Result<Metadata, i32> {
-        if path == "/" || path == "/dev" || path == "/proc" || path == "/run" {
+        if path == "/"
+            || path == "/dev"
+            || path == "/proc"
+            || path == "/run"
+            || path == "/dev/input"
+            || path == "/dev/dri"
+        {
             return Ok(Metadata {
                 kind: RemoteKind::Directory,
                 len: 0,
                 inode: path_inode(path.as_bytes()),
             });
         }
-        if path.starts_with("/dev/") {
-            // RING3-MIGRATION-CANDIDATE: replace this wildcard device namespace
-            // with devmgrd-provided device records before adding more device nodes.
+        if known_device_node(path) {
             return Ok(Metadata {
                 kind: RemoteKind::Device,
                 len: 0,
@@ -857,8 +861,18 @@ impl VfsState {
         }
         if path == "/dev" {
             entries.push(DirEntry::new("console0", RemoteKind::Device));
+            entries.push(DirEntry::new("display0", RemoteKind::Device));
+            entries.push(DirEntry::new("input0", RemoteKind::Device));
             entries.push(DirEntry::new("input", RemoteKind::Directory));
             entries.push(DirEntry::new("dri", RemoteKind::Directory));
+            return Ok(entries);
+        }
+        if path == "/dev/input" {
+            entries.push(DirEntry::new("event0", RemoteKind::Device));
+            return Ok(entries);
+        }
+        if path == "/dev/dri" {
+            entries.push(DirEntry::new("card0", RemoteKind::Device));
             return Ok(entries);
         }
         if path == "/proc" || path == "/run" {
@@ -900,6 +914,13 @@ impl DirEntry {
             },
         }
     }
+}
+
+fn known_device_node(path: &str) -> bool {
+    matches!(
+        path,
+        "/dev/console0" | "/dev/display0" | "/dev/input0" | "/dev/input/event0" | "/dev/dri/card0"
+    )
 }
 
 struct BootBlockDevice {

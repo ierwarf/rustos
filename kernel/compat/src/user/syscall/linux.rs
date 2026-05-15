@@ -45,8 +45,9 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_OP_LINUX_GETSOCKNAME, SYSCALL_OFFLOAD_OP_LINUX_GETSOCKOPT,
     SYSCALL_OFFLOAD_OP_LINUX_GETUID, SYSCALL_OFFLOAD_OP_LINUX_IOCTL,
     SYSCALL_OFFLOAD_OP_LINUX_LISTEN, SYSCALL_OFFLOAD_OP_LINUX_MADVISE,
-    SYSCALL_OFFLOAD_OP_LINUX_MMAP, SYSCALL_OFFLOAD_OP_LINUX_MPROTECT,
-    SYSCALL_OFFLOAD_OP_LINUX_MUNMAP, SYSCALL_OFFLOAD_OP_LINUX_NANOSLEEP,
+    SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE, SYSCALL_OFFLOAD_OP_LINUX_MMAP,
+    SYSCALL_OFFLOAD_OP_LINUX_MPROTECT, SYSCALL_OFFLOAD_OP_LINUX_MUNMAP,
+    SYSCALL_OFFLOAD_OP_LINUX_NANOSLEEP,
     SYSCALL_OFFLOAD_OP_LINUX_PRLIMIT64, SYSCALL_OFFLOAD_OP_LINUX_RECVFROM,
     SYSCALL_OFFLOAD_OP_LINUX_RECVMSG, SYSCALL_OFFLOAD_OP_LINUX_RSEQ,
     SYSCALL_OFFLOAD_OP_LINUX_RT_SIGACTION, SYSCALL_OFFLOAD_OP_LINUX_RT_SIGPROCMASK,
@@ -57,7 +58,8 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_OP_LINUX_SETUID, SYSCALL_OFFLOAD_OP_LINUX_SHUTDOWN,
     SYSCALL_OFFLOAD_OP_LINUX_SIGALTSTACK, SYSCALL_OFFLOAD_OP_LINUX_SOCKET,
     SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR, SYSCALL_OFFLOAD_OP_LINUX_UMASK,
-    SYSCALL_OFFLOAD_OP_LINUX_UNAME, SYSCALL_OFFLOAD_PATH_CAPACITY,
+    SYSCALL_OFFLOAD_OP_LINUX_UNAME, SYSCALL_OFFLOAD_OP_LINUX_WAIT4,
+    SYSCALL_OFFLOAD_PATH_CAPACITY,
     SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, VFS_IPC_ABI_VERSION, VFS_IPC_HANDLE_KIND_DEVICE,
     VFS_IPC_HANDLE_KIND_DIR, VFS_IPC_HANDLE_KIND_FILE, VFS_IPC_OP_ACCESS, VFS_IPC_OP_CHDIR,
     VFS_IPC_OP_CLOSE, VFS_IPC_OP_DUP, VFS_IPC_OP_FCNTL, VFS_IPC_OP_FSTAT, VFS_IPC_OP_FTRUNCATE,
@@ -88,6 +90,7 @@ const LINUX_EBADF: i64 = 9;
 const LINUX_ENOENT: i64 = 2;
 const LINUX_ESRCH: i64 = 3;
 const LINUX_EBUSY: i64 = 16;
+const LINUX_EEXIST: i64 = 17;
 const LINUX_EFAULT: i64 = 14;
 const LINUX_EINVAL: i64 = 22;
 const LINUX_ENODEV: i64 = 19;
@@ -112,6 +115,10 @@ const LINUX_ETIMEDOUT: i64 = 110;
 const GETRANDOM_FLAG_NONBLOCK: u64 = 0x0001;
 const GETRANDOM_FLAG_RANDOM: u64 = 0x0002;
 const MAX_RUSTOS_DEBUG_PRINT_BYTES: usize = 2048;
+
+pub(crate) fn call_syscalld_raw(request: &[u8]) -> Result<Vec<u8>, i64> {
+    ipc_ops::call_linux_syscall_endpoint(request)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
@@ -192,10 +199,16 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         linux_abi::SYS_FTRUNCATE => syscall_linux_vfs_ftruncate(frame.rdi, frame.rsi),
         linux_abi::SYS_FSTAT => syscall_linux_vfs_fstat(frame.rdi, frame.rsi),
         linux_abi::SYS_POLL => syscall_linux_poll(frame.rdi, frame.rsi, frame.rdx as i64),
-        linux_abi::SYS_PPOLL => linux_errno(LINUX_ENOSYS),
-        linux_abi::SYS_EPOLL_WAIT => linux_errno(LINUX_ENOSYS),
-        linux_abi::SYS_EPOLL_PWAIT => linux_errno(LINUX_ENOSYS),
-        linux_abi::SYS_EPOLL_CTL => linux_errno(LINUX_ENOSYS),
+        linux_abi::SYS_PPOLL => syscall_linux_ppoll(frame.rdi, frame.rsi, frame.rdx, frame.r10),
+        linux_abi::SYS_EPOLL_WAIT => {
+            syscall_linux_epoll_wait(frame.rdi, frame.rsi, frame.rdx, frame.r10 as i64)
+        }
+        linux_abi::SYS_EPOLL_PWAIT => {
+            syscall_linux_epoll_wait(frame.rdi, frame.rsi, frame.rdx, frame.r10 as i64)
+        }
+        linux_abi::SYS_EPOLL_CTL => {
+            syscall_linux_epoll_ctl(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+        }
         linux_abi::SYS_DUP => syscall_linux_vfs_dup(frame.rdi, 0, 0, VfsDupMode::Dup),
         linux_abi::SYS_DUP2 => syscall_linux_vfs_dup(frame.rdi, frame.rsi, 0, VfsDupMode::Dup2),
         linux_abi::SYS_LSEEK => syscall_linux_vfs_lseek(frame.rdi, frame.rsi as i64, frame.rdx),
@@ -231,7 +244,9 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         linux_abi::SYS_NANOSLEEP => syscall_linux_nanosleep(frame.rdi, frame.rsi),
         linux_abi::SYS_GETPID => syscall_linux_getpid(),
         linux_abi::SYS_FORK => linux_errno(LINUX_ENOSYS),
-        linux_abi::SYS_WAIT4 => linux_errno(LINUX_ECHILD),
+        linux_abi::SYS_WAIT4 => {
+            syscall_linux_wait4(frame.rdi as i64, frame.rsi, frame.rdx, frame.r10)
+        }
         linux_abi::SYS_CLONE => syscall_linux_clone(frame),
         linux_abi::SYS_UNAME => syscall_linux_syscalld_uname(frame.rdi),
         linux_abi::SYS_GETTID => syscall_linux_gettid(),
@@ -389,7 +404,7 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         linux_abi::SYS_DUP3 => {
             syscall_linux_vfs_dup(frame.rdi, frame.rsi, frame.rdx, VfsDupMode::Dup3)
         }
-        linux_abi::SYS_EPOLL_CREATE1 => linux_errno(LINUX_ENOSYS),
+        linux_abi::SYS_EPOLL_CREATE1 => syscall_linux_epoll_create1(frame.rdi),
         linux_abi::SYS_UMASK => syscall_linux_syscalld_umask(frame.rdi),
         linux_abi::SYS_GETRANDOM => {
             syscall_linux_syscalld_getrandom(frame.rdi, frame.rsi, frame.rdx)
@@ -399,7 +414,7 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         }
         linux_abi::SYS_RSEQ => syscall_linux_rseq(frame.rdi, frame.rsi, frame.rdx, frame.r10),
         linux_abi::SYS_CLONE3 => syscall_linux_clone3(frame),
-        linux_abi::SYS_MEMFD_CREATE => linux_errno(LINUX_ENOSYS),
+        linux_abi::SYS_MEMFD_CREATE => syscall_linux_memfd_create(frame.rdi, frame.rsi),
         linux_abi::SYS_GETPPID => {
             syscall_linux_syscalld_u64_getter(SYSCALL_OFFLOAD_OP_LINUX_GETPPID, 0)
         }

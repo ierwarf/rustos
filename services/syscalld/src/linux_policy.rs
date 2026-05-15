@@ -60,6 +60,10 @@ const MADV_PAGEOUT: u64 = 21;
 const MADV_POPULATE_READ: u64 = 22;
 const MADV_POPULATE_WRITE: u64 = 23;
 const MADV_DONTNEED_LOCKED: u64 = 24;
+const WNOHANG: u64 = 1;
+const MFD_CLOEXEC: u64 = 0x0001;
+const MFD_ALLOW_SEALING: u64 = 0x0002;
+const MEMFD_NAME_MAX: usize = 249;
 
 #[derive(Clone, Copy, Debug)]
 struct LinuxPolicyState {
@@ -266,6 +270,44 @@ pub(crate) fn handle_setgid(
     }
     state.credentials.gid = requested;
     state.credentials.egid = requested;
+    response.status = 0;
+    response.payload_len = 0;
+}
+
+pub(crate) fn handle_wait4(
+    request: &LinuxSyscallOffloadRequest,
+    response: &mut LinuxSyscallOffloadResponse,
+) {
+    let pid = request.dirfd as i64;
+    if request.flags & !WNOHANG != 0 {
+        response.status = errno::EINVAL;
+        return;
+    }
+    if pid < -1 || pid == 0 {
+        response.status = errno::ENOSYS;
+        return;
+    }
+    response.status = 0;
+    response.payload_len = 0;
+}
+
+pub(crate) fn handle_memfd_create(
+    request: &LinuxSyscallOffloadRequest,
+    response: &mut LinuxSyscallOffloadResponse,
+) {
+    if request.flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING) != 0 {
+        response.status = errno::EINVAL;
+        return;
+    }
+    let name_len = request.path_len as usize;
+    if name_len == 0 || name_len > MEMFD_NAME_MAX || name_len > request.path.len() {
+        response.status = errno::EINVAL;
+        return;
+    }
+    if request.path[..name_len].contains(&0) {
+        response.status = errno::EINVAL;
+        return;
+    }
     response.status = 0;
     response.payload_len = 0;
 }

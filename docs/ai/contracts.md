@@ -228,6 +228,18 @@ Kernel/userspace ABI:
   request authorization and calls `SYS_RUSTOS_DEVICE_IOCTL_BROKER`, which is
   gated by `IPC_SERVICE_CAP_DEVICE_POLICY` and performs the kernel-owned user
   memory/device operation against the target process id and fd.
+- Windows syscall policy routes through `syscalld` using
+  `Win32SyscallOffloadRequest`/`Win32SyscallOffloadResponse` and the
+  `SYSCALL_OFFLOAD_OP_WIN32_*` operation range. The kernel Windows dispatcher
+  calls this service policy first, then performs only the narrow privileged
+  action that still requires current-process user memory, handle, scheduler, or
+  address-space access.
+- Linux `wait4` and `memfd_create` route policy validation through `syscalld`
+  (`SYSCALL_OFFLOAD_OP_LINUX_WAIT4` and
+  `SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE`). The kernel still performs the
+  narrow process-table wait, status/rusage copyout, memfd handle installation,
+  and memfd read/write/truncate/seal actions because those operate on current
+  process handles and user memory.
 - Linux socket namespace and socket I/O operations route through `netd` after
   bootstrap. `socket`, `socketpair`, `bind`, `listen`, `accept/accept4`,
   `connect`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `getsockname`,
@@ -247,6 +259,10 @@ Kernel/userspace ABI:
   groups for final safety checks. Early boot may still use the legacy kernel
   registry path until driver service bootstrap owns display/input/network
   bring-up.
+- `vfsd` owns the visible `/dev` namespace it exposes over VFS IPC. Device
+  metadata must come from explicit service-side nodes (`console0`, `display0`,
+  `input0`, `input/event0`, `dri/card0`) until a devmgrd-backed device registry
+  is wired into VFS; do not reintroduce a wildcard `/dev/*` success path.
 - `syscalld` keeps the service-side Linux policy DB for per-process credentials
   and `RLIMIT_STACK`. Linux-visible `get*id`, `set*id`, and `prlimit64` policy
   must be sourced from `syscalld`; kernel process credentials are a temporary

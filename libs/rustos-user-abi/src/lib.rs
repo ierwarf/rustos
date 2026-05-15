@@ -128,6 +128,7 @@ pub mod syscall {
     pub const SYSCALL_OFFLOAD_OP_LINUX_SENDMSG: u16 = 44;
     pub const SYSCALL_OFFLOAD_OP_LINUX_RECVMSG: u16 = 45;
     pub const SYSCALL_OFFLOAD_OP_LINUX_RECVFROM: u16 = 46;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_WAIT4: u16 = 47;
     pub const SYSCALL_OFFLOAD_OP_LINUX_IOCTL: u16 = 48;
     pub const SYSCALL_OFFLOAD_OP_LINUX_RT_SIGACTION: u16 = 49;
     pub const SYSCALL_OFFLOAD_OP_LINUX_RT_SIGPROCMASK: u16 = 50;
@@ -143,7 +144,20 @@ pub mod syscall {
     pub const SYSCALL_OFFLOAD_OP_LINUX_MMAP: u16 = 60;
     pub const SYSCALL_OFFLOAD_OP_LINUX_MPROTECT: u16 = 61;
     pub const SYSCALL_OFFLOAD_OP_LINUX_MUNMAP: u16 = 62;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE: u16 = 63;
     pub const SYSCALL_OFFLOAD_OP_DRIVER_LOAD_POLICY: u16 = 64;
+    pub const WIN32_SYSCALL_OFFLOAD_ABI_VERSION: u16 = 1;
+    pub const SYSCALL_OFFLOAD_OP_WIN32_WRITE_FILE: u16 = 80;
+    pub const SYSCALL_OFFLOAD_OP_WIN32_READ_FILE: u16 = 81;
+    pub const SYSCALL_OFFLOAD_OP_WIN32_DELAY_EXECUTION: u16 = 82;
+    pub const SYSCALL_OFFLOAD_OP_WIN32_CLOSE: u16 = 83;
+    pub const SYSCALL_OFFLOAD_OP_WIN32_GET_CONSOLE_MODE: u16 = 84;
+    pub const SYSCALL_OFFLOAD_OP_WIN32_SET_CONSOLE_MODE: u16 = 85;
+    pub const SYSCALL_OFFLOAD_OP_WIN32_EXIT_PROCESS: u16 = 86;
+    pub const SYSCALL_OFFLOAD_OP_WIN32_ALLOC_VIRTUAL_MEMORY: u16 = 87;
+    pub const SYSCALL_OFFLOAD_OP_WIN32_FREE_VIRTUAL_MEMORY: u16 = 88;
+    pub const SYSCALL_OFFLOAD_OP_WIN32_PROTECT_VIRTUAL_MEMORY: u16 = 89;
+    pub const SYSCALL_OFFLOAD_OP_WIN32_QUERY_VIRTUAL_MEMORY: u16 = 90;
     pub const SYSCALL_OFFLOAD_PATH_CAPACITY: usize = 256;
     pub const SYSCALL_OFFLOAD_PAYLOAD_CAPACITY: usize = 0x200;
     pub const MM_BROKER_ABI_VERSION: u16 = 1;
@@ -836,6 +850,33 @@ pub mod syscall {
                 payload: [0; SYSCALL_OFFLOAD_PAYLOAD_CAPACITY],
             }
         }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct Win32SyscallOffloadRequest {
+        pub version: u16,
+        pub op: u16,
+        pub reserved0: u32,
+        pub pid: u64,
+        pub tid: u64,
+        pub session_handle: u64,
+        pub arg0: u64,
+        pub arg1: u64,
+        pub arg2: u64,
+        pub arg3: u64,
+        pub arg4: u64,
+        pub arg5: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct Win32SyscallOffloadResponse {
+        pub version: u16,
+        pub op: u16,
+        pub status: u32,
+        pub result: u64,
+        pub reserved0: u64,
     }
 
     #[repr(C)]

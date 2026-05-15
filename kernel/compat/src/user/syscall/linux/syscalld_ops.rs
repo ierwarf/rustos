@@ -210,6 +210,111 @@ pub(super) fn syscall_linux_syscalld_getrandom(user_ptr: u64, user_len: u64, fla
     copied as u64
 }
 
+pub(super) fn syscall_linux_wait4(
+    pid: i64,
+    status_ptr: u64,
+    options: u64,
+    rusage_ptr: u64,
+) -> u64 {
+    if status_ptr != 0 {
+        if let Err(err) =
+            usermem::validate_current_user_write_buffer(status_ptr, size_of::<i32>())
+        {
+            return linux_errno(address_space_error_to_linux_errno(err));
+        }
+    }
+    if rusage_ptr != 0 {
+        if let Err(err) = usermem::validate_current_user_write_buffer(
+            rusage_ptr,
+            size_of::<linux_abi::LinuxRusage>(),
+        )
+        {
+            return linux_errno(address_space_error_to_linux_errno(err));
+        }
+    }
+
+    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_WAIT4);
+    request.dirfd = pid as u64;
+    request.flags = options;
+    request.arg0 = status_ptr;
+    request.arg1 = rusage_ptr;
+    if let Err(errno) =
+        call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response))
+    {
+        return linux_errno(errno);
+    }
+
+    let parent_pid = match multitask::current_user_process_id() {
+        Some(pid) => pid,
+        None => return linux_errno(LINUX_ENOSYS),
+    };
+    let nohang = options & linux_abi::WNOHANG as u64 != 0;
+    loop {
+        match multitask::wait_for_child(parent_pid, pid) {
+            multitask::WaitChildResult::Exited {
+                pid: child_pid,
+                status,
+            } => {
+                if status_ptr != 0 {
+                    if let Err(err) = usermem::write_current_user_struct(status_ptr, &status) {
+                        return linux_errno(address_space_error_to_linux_errno(err));
+                    }
+                }
+                if rusage_ptr != 0 {
+                    if let Err(err) = usermem::write_current_user_struct(
+                        rusage_ptr,
+                        &linux_abi::LinuxRusage::default(),
+                    ) {
+                        return linux_errno(address_space_error_to_linux_errno(err));
+                    }
+                }
+                return child_pid;
+            }
+            multitask::WaitChildResult::Pending if nohang => return 0,
+            multitask::WaitChildResult::Pending => multitask::yield_now(),
+            multitask::WaitChildResult::NoMatchingChild if nohang => return 0,
+            multitask::WaitChildResult::NoMatchingChild => return linux_errno(LINUX_ECHILD),
+        }
+    }
+}
+
+pub(super) fn syscall_linux_memfd_create(name_ptr: u64, flags: u64) -> u64 {
+    let name = match usermem::read_current_user_c_string(name_ptr, 249) {
+        Ok(name) if !name.is_empty() => name,
+        Ok(_) => return linux_errno(LINUX_EINVAL),
+        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+    };
+    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE);
+    request.flags = flags;
+    request.path_len = name.len() as u32;
+    request.path[..name.len()].copy_from_slice(name.as_bytes());
+    if let Err(errno) =
+        call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response))
+    {
+        return linux_errno(errno);
+    }
+
+    let fd_flags = if flags & linux_abi::MFD_CLOEXEC != 0 {
+        multitask::FD_CLOEXEC
+    } else {
+        0
+    };
+    let handle = multitask::KernelHandle::Memfd(multitask::MemfdHandle::new(
+        name,
+        flags & linux_abi::MFD_ALLOW_SEALING != 0,
+    ));
+    match multitask::with_current_user_process_state_mut(|_, _, process_state| {
+        process_state.handles_mut().install_entry(multitask::HandleEntry::new(
+            handle,
+            fd_flags,
+            linux_abi::O_RDWR,
+        ))
+    }) {
+        Some(fd) => fd,
+        None => linux_errno(LINUX_ENOSYS),
+    }
+}
+
 pub(super) fn new_syscalld_request(op: u16) -> LinuxSyscallOffloadRequest {
     let mut request = LinuxSyscallOffloadRequest {
         op,

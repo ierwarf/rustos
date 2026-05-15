@@ -74,6 +74,136 @@ pub(super) fn syscall_linux_poll(fds_ptr: u64, nfds: u64, _timeout_ms: i64) -> u
     ready
 }
 
+pub(super) fn syscall_linux_ppoll(
+    fds_ptr: u64,
+    nfds: u64,
+    timeout_ptr: u64,
+    _sigmask_ptr: u64,
+) -> u64 {
+    let timeout_ms = if timeout_ptr == 0 {
+        -1
+    } else {
+        let ts = match usermem::read_current_user_struct::<LinuxTimespecWire>(timeout_ptr) {
+            Ok(ts) => ts,
+            Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        };
+        if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
+            return linux_errno(LINUX_EINVAL);
+        }
+        ts.tv_sec
+            .saturating_mul(1000)
+            .saturating_add((ts.tv_nsec + 999_999) / 1_000_000)
+    };
+    syscall_linux_poll(fds_ptr, nfds, timeout_ms)
+}
+
+pub(super) fn syscall_linux_epoll_create1(flags: u64) -> u64 {
+    if flags & !linux_abi::EPOLL_CLOEXEC != 0 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let fd_flags = if flags & linux_abi::EPOLL_CLOEXEC != 0 {
+        multitask::FD_CLOEXEC
+    } else {
+        0
+    };
+    let handle = multitask::KernelHandle::Epoll(multitask::EpollHandle::new());
+    match multitask::with_current_user_process_state_mut(|_, _, process_state| {
+        process_state.handles_mut().install_entry(multitask::HandleEntry::new(
+            handle,
+            fd_flags,
+            linux_abi::O_RDONLY,
+        ))
+    }) {
+        Some(fd) => fd,
+        None => linux_errno(LINUX_ENOSYS),
+    }
+}
+
+pub(super) fn syscall_linux_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u64 {
+    if epfd == fd {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let Some(epoll) = current_epoll_handle(epfd) else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    match op {
+        linux_abi::EPOLL_CTL_ADD | linux_abi::EPOLL_CTL_MOD => {
+            if event_ptr == 0 {
+                return linux_errno(LINUX_EINVAL);
+            }
+            let Some(handle) = current_kernel_handle(fd) else {
+                return linux_errno(LINUX_EBADF);
+            };
+            if matches!(handle, multitask::KernelHandle::Epoll(_)) {
+                return linux_errno(LINUX_EOPNOTSUPP);
+            }
+            let (events, data) = match read_linux_epoll_event(event_ptr) {
+                Ok(event) => event,
+                Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+            };
+            let result = if op == linux_abi::EPOLL_CTL_ADD {
+                epoll.add(fd, handle, events, data)
+            } else {
+                epoll.modify(fd, handle, events, data)
+            };
+            match result {
+                Ok(()) => 0,
+                Err(err) => linux_errno(epoll_error_to_linux_errno(err)),
+            }
+        }
+        linux_abi::EPOLL_CTL_DEL => match epoll.delete(fd) {
+            Ok(()) => 0,
+            Err(err) => linux_errno(epoll_error_to_linux_errno(err)),
+        },
+        _ => linux_errno(LINUX_EINVAL),
+    }
+}
+
+pub(super) fn syscall_linux_epoll_wait(
+    epfd: u64,
+    events_ptr: u64,
+    maxevents: u64,
+    _timeout_ms: i64,
+) -> u64 {
+    let Ok(maxevents) = usize::try_from(maxevents) else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    if maxevents == 0 || maxevents > 1024 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    if let Err(err) = usermem::validate_current_user_write_buffer(
+        events_ptr,
+        maxevents.saturating_mul(size_of::<linux_abi::LinuxEpollEvent>()),
+    ) {
+        return linux_errno(address_space_error_to_linux_errno(err));
+    }
+    let Some(epoll) = current_epoll_handle(epfd) else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    let mut written = 0usize;
+    for interest in epoll.snapshot().into_iter().take(maxevents) {
+        let events = interest.events
+            & (linux_abi::EPOLLIN
+                | linux_abi::EPOLLPRI
+                | linux_abi::EPOLLOUT
+                | linux_abi::EPOLLERR
+                | linux_abi::EPOLLHUP);
+        if events == 0 {
+            continue;
+        }
+        let Some(entry_ptr) =
+            events_ptr.checked_add((written * size_of::<linux_abi::LinuxEpollEvent>()) as u64)
+        else {
+            return linux_errno(LINUX_EINVAL);
+        };
+        if let Err(err) = write_linux_epoll_event(entry_ptr, events, interest.data) {
+            return linux_errno(address_space_error_to_linux_errno(err));
+        }
+        written += 1;
+    }
+    written as u64
+}
+
 pub(super) fn syscall_linux_sched_yield() -> u64 {
     multitask::yield_now();
     0
@@ -897,8 +1027,15 @@ pub(super) fn syscall_linux_set_tid_address(user_ptr: u64) -> u64 {
     result.unwrap_or_else(|| linux_errno(LINUX_ENOSYS))
 }
 
-pub(super) fn syscall_linux_tgkill(_tgid: u64, _tid: u64, _signal: u64) -> u64 {
-    linux_errno(LINUX_ENOSYS)
+pub(super) fn syscall_linux_tgkill(tgid: u64, tid: u64, signal: u64) -> u64 {
+    if signal > linux_abi::MAX_SIGNAL_NUMBER as u64 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    if multitask::queue_linux_signal(tgid, tid, signal) {
+        0
+    } else {
+        linux_errno(LINUX_ESRCH)
+    }
 }
 
 pub(super) fn syscall_linux_set_robust_list(head_ptr: u64, len: u64) -> u64 {
@@ -1085,6 +1222,37 @@ pub(super) fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u
         }
         return copied as u64;
     }
+    if let Some(mut memfd) = current_memfd_handle(fd) {
+        let Ok(user_len) = usize::try_from(user_len) else {
+            return linux_errno(LINUX_EINVAL);
+        };
+        if user_len == 0 {
+            return 0;
+        }
+        if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, user_len) {
+            return linux_errno(address_space_error_to_linux_errno(err));
+        }
+        let mut copied = 0usize;
+        let mut chunk = [0_u8; 256];
+        while copied < user_len {
+            let chunk_len = (user_len - copied).min(chunk.len());
+            let read = memfd.read_into(&mut chunk[..chunk_len]);
+            if read == 0 {
+                break;
+            }
+            let Some(dest) = user_ptr.checked_add(copied as u64) else {
+                return linux_errno(LINUX_EINVAL);
+            };
+            if let Err(err) = usermem::write_current_user_bytes(dest, &chunk[..read]) {
+                return linux_errno(address_space_error_to_linux_errno(err));
+            }
+            copied += read;
+            if read < chunk_len {
+                break;
+            }
+        }
+        return copied as u64;
+    }
     let Some(remote) = current_remote_vfs_handle(fd) else {
         return linux_errno(LINUX_EBADF);
     };
@@ -1133,6 +1301,40 @@ pub(super) fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u
 }
 
 pub(super) fn syscall_linux_vfs_pread64(fd: u64, user_ptr: u64, user_len: u64, offset: u64) -> u64 {
+    if let Some(memfd) = current_memfd_handle(fd) {
+        let Ok(user_len) = usize::try_from(user_len) else {
+            return linux_errno(LINUX_EINVAL);
+        };
+        let Ok(offset) = usize::try_from(offset) else {
+            return linux_errno(LINUX_EINVAL);
+        };
+        if user_len == 0 {
+            return 0;
+        }
+        if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, user_len) {
+            return linux_errno(address_space_error_to_linux_errno(err));
+        }
+        let mut copied = 0usize;
+        let mut chunk = [0_u8; 256];
+        while copied < user_len {
+            let chunk_len = (user_len - copied).min(chunk.len());
+            let read = memfd.read_at(offset.saturating_add(copied), &mut chunk[..chunk_len]);
+            if read == 0 {
+                break;
+            }
+            let Some(dest) = user_ptr.checked_add(copied as u64) else {
+                return linux_errno(LINUX_EINVAL);
+            };
+            if let Err(err) = usermem::write_current_user_bytes(dest, &chunk[..read]) {
+                return linux_errno(address_space_error_to_linux_errno(err));
+            }
+            copied += read;
+            if read < chunk_len {
+                break;
+            }
+        }
+        return copied as u64;
+    }
     let Some(remote) = current_remote_vfs_handle(fd) else {
         return linux_errno(LINUX_EBADF);
     };
@@ -1193,6 +1395,34 @@ pub(super) fn syscall_linux_vfs_write(fd: u64, user_ptr: u64, user_len: u64) -> 
             Ok(written) => written as u64,
             Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
         };
+    }
+    if let Some(mut memfd) = current_memfd_handle(fd) {
+        let Ok(user_len) = usize::try_from(user_len) else {
+            return linux_errno(LINUX_EINVAL);
+        };
+        if user_len == 0 {
+            return 0;
+        }
+        let mut copied = 0usize;
+        let mut chunk = [0_u8; 256];
+        while copied < user_len {
+            let chunk_len = (user_len - copied).min(chunk.len());
+            let Some(src) = user_ptr.checked_add(copied as u64) else {
+                return linux_errno(LINUX_EINVAL);
+            };
+            if let Err(err) = usermem::copy_from_current_user_exact(src, &mut chunk[..chunk_len]) {
+                return linux_errno(address_space_error_to_linux_errno(err));
+            }
+            let written = match memfd.write_from(&chunk[..chunk_len]) {
+                Ok(written) => written,
+                Err(err) => return linux_errno(memfd_error_to_linux_errno(err)),
+            };
+            copied += written;
+            if written < chunk_len {
+                break;
+            }
+        }
+        return copied as u64;
     }
     let Some(remote) = current_remote_vfs_handle(fd) else {
         return linux_errno(LINUX_EBADF);
@@ -1297,6 +1527,18 @@ pub(super) fn syscall_linux_vfs_lseek(fd: u64, offset: i64, whence: u64) -> u64 
             Err(_) => linux_errno(LINUX_EINVAL),
         };
     }
+    if let Some(mut memfd) = current_memfd_handle(fd) {
+        let whence = match whence {
+            value if value == linux_abi::SEEK_SET => multitask::FileHandleSeekWhence::Start,
+            value if value == linux_abi::SEEK_CUR => multitask::FileHandleSeekWhence::Current,
+            value if value == linux_abi::SEEK_END => multitask::FileHandleSeekWhence::End,
+            _ => return linux_errno(LINUX_EINVAL),
+        };
+        return match memfd.seek(offset, whence) {
+            Ok(pos) => pos,
+            Err(_) => linux_errno(LINUX_EINVAL),
+        };
+    }
     let Some(remote) = current_remote_vfs_handle(fd) else {
         return linux_errno(LINUX_EBADF);
     };
@@ -1325,6 +1567,13 @@ pub(super) fn syscall_linux_vfs_fstat(fd: u64, stat_ptr: u64) -> u64 {
             file.len() as u64,
         );
     }
+    if let Some(memfd) = current_memfd_handle(fd) {
+        return write_bootstrap_stat(
+            stat_ptr,
+            crate::vfs_core::path_inode(memfd.path().as_bytes()),
+            memfd.len() as u64,
+        );
+    }
     let Some(remote) = current_remote_vfs_handle(fd) else {
         return linux_errno(LINUX_EBADF);
     };
@@ -1351,6 +1600,15 @@ pub(super) fn syscall_linux_vfs_fstat(fd: u64, stat_ptr: u64) -> u64 {
 }
 
 pub(super) fn syscall_linux_vfs_ftruncate(fd: u64, len: u64) -> u64 {
+    if let Some(memfd) = current_memfd_handle(fd) {
+        let Ok(len) = usize::try_from(len) else {
+            return linux_errno(LINUX_EINVAL);
+        };
+        return match memfd.truncate(len) {
+            Ok(()) => 0,
+            Err(err) => linux_errno(memfd_error_to_linux_errno(err)),
+        };
+    }
     let Some(remote) = current_remote_vfs_handle(fd) else {
         return linux_errno(LINUX_EBADF);
     };
@@ -1402,6 +1660,16 @@ pub(super) fn syscall_linux_vfs_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
             linux_abi::F_SETFD => 0,
             linux_abi::F_GETFL => (linux_abi::O_RDWR as u64),
             linux_abi::F_SETFL => 0,
+            _ => linux_errno(LINUX_EINVAL),
+        };
+    }
+    if let Some(memfd) = current_memfd_handle(fd) {
+        return match cmd {
+            linux_abi::F_GET_SEALS => memfd.seals() as u64,
+            linux_abi::F_ADD_SEALS => match memfd.add_seals(arg as u32) {
+                Ok(()) => 0,
+                Err(err) => linux_errno(memfd_error_to_linux_errno(err)),
+            },
             _ => linux_errno(LINUX_EINVAL),
         };
     }
@@ -1571,6 +1839,85 @@ fn current_vfs_file_handle(fd: u64) -> Option<multitask::VfsFileHandle> {
         }
     })
     .flatten()
+}
+
+fn current_memfd_handle(fd: u64) -> Option<multitask::MemfdHandle> {
+    multitask::with_current_user_process_state(|_, _, process_state| {
+        match process_state.handles().get(fd) {
+            Some(multitask::KernelHandle::Memfd(memfd)) => Some(memfd.clone()),
+            _ => None,
+        }
+    })
+    .flatten()
+}
+
+fn current_epoll_handle(fd: u64) -> Option<multitask::EpollHandle> {
+    multitask::with_current_user_process_state(|_, _, process_state| {
+        match process_state.handles().get(fd) {
+            Some(multitask::KernelHandle::Epoll(epoll)) => Some(epoll.clone()),
+            _ => None,
+        }
+    })
+    .flatten()
+}
+
+fn read_linux_epoll_event(user_ptr: u64) -> Result<(u32, u64), paging::AddressSpaceError> {
+    let mut bytes = [0_u8; size_of::<linux_abi::LinuxEpollEvent>()];
+    usermem::copy_from_current_user_exact(user_ptr, &mut bytes)?;
+    Ok((
+        u32::from_le_bytes(bytes[0..4].try_into().unwrap_or([0; 4])),
+        u64::from_le_bytes(bytes[4..12].try_into().unwrap_or([0; 8])),
+    ))
+}
+
+fn write_linux_epoll_event(
+    user_ptr: u64,
+    events: u32,
+    data: u64,
+) -> Result<(), paging::AddressSpaceError> {
+    let mut bytes = [0_u8; size_of::<linux_abi::LinuxEpollEvent>()];
+    bytes[0..4].copy_from_slice(&events.to_le_bytes());
+    bytes[4..12].copy_from_slice(&data.to_le_bytes());
+    usermem::write_current_user_bytes(user_ptr, &bytes)
+}
+
+fn current_kernel_handle(fd: u64) -> Option<multitask::KernelHandle> {
+    if fd == 0 {
+        return Some(multitask::KernelHandle::Console(
+            multitask::ConsoleStreamKind::Input,
+        ));
+    }
+    if fd == 1 {
+        return Some(multitask::KernelHandle::Console(
+            multitask::ConsoleStreamKind::Output,
+        ));
+    }
+    if fd == 2 {
+        return Some(multitask::KernelHandle::Console(
+            multitask::ConsoleStreamKind::Error,
+        ));
+    }
+    multitask::with_current_user_process_state(|_, _, process_state| {
+        process_state.handles().get(fd).cloned()
+    })
+    .flatten()
+}
+
+fn epoll_error_to_linux_errno(err: multitask::EpollError) -> i64 {
+    match err {
+        multitask::EpollError::Busy => LINUX_EEXIST,
+        multitask::EpollError::InvalidArgument => LINUX_EINVAL,
+        multitask::EpollError::NotFound => LINUX_ENOENT,
+    }
+}
+
+fn memfd_error_to_linux_errno(err: multitask::MemfdError) -> i64 {
+    match err {
+        multitask::MemfdError::Busy => LINUX_EBUSY,
+        multitask::MemfdError::InvalidArgument => LINUX_EINVAL,
+        multitask::MemfdError::NoMemory => LINUX_ENOMEM,
+        multitask::MemfdError::PermissionDenied => LINUX_EACCES,
+    }
 }
 
 fn bootstrap_openat(path: &str, flags: u64) -> u64 {
