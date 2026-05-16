@@ -112,9 +112,10 @@ Kernel/userspace ABI:
   policy belongs in `loaderd`; storage inventory policy belongs in `storaged`;
   input observability/control policy belongs in `inputd`; process/fork/wait and
   signal policy belongs in `procd`. Kernel
-  FD/socket/module/process/storage/input data paths may remain as brokered
-  mechanisms until handle/cap transfer and driver-domain isolation are in
-  place.
+  FD/socket/module/process/storage/input data paths remain as gated narrow
+  broker primitives for privileged DMA/MMIO/IRQ/module-load/socket/user-copy/
+  address-space mutation compatibility; moving drivers to isolated ring-3 domains
+  is intentionally excluded for Linux/Windows commercial compatibility.
 - Registered service endpoints also carry kernel-tracked broker capability
   bits derived from their `IPC_SERVICE_*` id. Broker authorization must check
   the current process' registered service capability, not its executable path.
@@ -174,23 +175,23 @@ Kernel/userspace ABI:
   handles through the device broker path until `devmgrd` device-open transfer is
   complete. Policy services may still use the bootstrap VFS path to avoid
   recursive self-IPC during service startup. Before `vfsd` registers its
-  endpoint, the temporary broker remains available for service dynamic-loader
-  bootstrap; after registration, generic Linux app VFS syscalls must route to
-  `vfsd` or fail closed if `vfsd` is unavailable.
+  endpoint, the gated bootstrap VFS broker remains available for service
+  dynamic-loader bootstrap; after registration, generic Linux app VFS syscalls
+  must route to `vfsd` or fail closed if `vfsd` is unavailable.
 - Linux `close`, `dup`/`dup2`/`dup3`, and `fcntl` route through `vfsd` before
   mutating the app fd table. `vfsd` is the only intended caller of the
-  temporary `SYS_RUSTOS_FD_*_BROKER` syscalls; generic apps must not use them
-  directly. `LinuxSyscallOffloadRequest.arg0..arg3` are the 64-bit extension
+  gated narrow `SYS_RUSTOS_FD_*_BROKER` broker primitives; generic apps must
+  not use them directly. `LinuxSyscallOffloadRequest.arg0..arg3` are the 64-bit extension
   slots for fd control arguments such as target fd, command, argument, and
   flags. Do not pack pointer or flag values into the 32-bit `mask` field.
-- Linux `getdents64` also routes through `vfsd`; the temporary
-  `SYS_RUSTOS_FD_GETDENTS64_BROKER` writes directory records into the target
+- Linux `getdents64` also routes through `vfsd`; the gated narrow
+  `SYS_RUSTOS_FD_GETDENTS64_BROKER` broker primitive writes directory records into the target
   process address space selected by pid. FD broker syscalls must remain gated to
   the registered `IPC_SERVICE_CAP_VFS_POLICY` owner, not broad policy-service
   callers.
 - Linux `mount` and `umount2` must preserve Linux ELF compatibility while
   keeping namespace policy in `vfsd`: generic app syscalls route to `vfsd`,
-  then `vfsd` calls the temporary gated `SYS_RUSTOS_VFS_*_BROKER` primitives for
+  then `vfsd` calls the gated narrow `SYS_RUSTOS_VFS_*_BROKER` broker primitives for
   the narrow kernel mount-table mutation. Do not reintroduce direct generic-app
   `linux_ops::mount` or `linux_ops::umount2` paths.
 - Legacy RustOS metadata syscall numbers
@@ -200,8 +201,8 @@ Kernel/userspace ABI:
   access only for pre-`vfsd` bootstrap and registered policy-service callers.
 - Runtime launches must route through `loaderd`, not direct generic
   `SYS_RUSTOS_SPAWN_EXEC` calls. `loaderd` registers `IPC_SERVICE_LOADERD`,
-  validates executable format policy, and uses the temporary gated
-  `SYS_RUSTOS_PROC_*_BROKER` primitives for kernel-owned process commit work.
+  validates executable format policy, and uses the gated narrow
+  `SYS_RUSTOS_PROC_*_BROKER` broker primitives for kernel-owned process commit work.
   `SYS_RUSTOS_PROC_*_BROKER` calls must fail with `EACCES` unless the caller
   owns `IPC_SERVICE_CAP_PROCESS_LOADER`. `SYS_RUSTOS_SPAWN_EXEC` is restricted
   to `rootd` spawning the fixed bootstrap service allowlist
@@ -289,7 +290,7 @@ Kernel/userspace ABI:
   is wired into VFS; do not reintroduce a wildcard `/dev/*` success path.
 - `syscalld` keeps the service-side Linux policy DB for per-process credentials
   and `RLIMIT_STACK`. Linux-visible `get*id`, `set*id`, and `prlimit64` policy
-  must be sourced from `syscalld`; kernel process credentials are a temporary
+  must be sourced from `syscalld`; kernel process credentials are a gated
   bootstrap/security primitive and must not be mutated by Linux `set*id`.
 - `device::DisplayInfo.flags` distinguishes boot firmware framebuffers from a
   real primary display provider. Userspace display surfaces must require

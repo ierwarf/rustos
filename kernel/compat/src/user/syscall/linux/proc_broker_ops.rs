@@ -75,6 +75,7 @@ enum MappingEntry {
 }
 
 struct ProcPrepareState {
+    owner_pid: u64,
     format: u16,
     mappings: Vec<MappingEntry>,
     windows_runtime: Option<crate::user::process::WindowsProcessLoaderRuntime>,
@@ -112,6 +113,9 @@ pub(super) fn syscall_linux_rustos_proc_prepare_broker(args_ptr: u64) -> u64 {
         return linux_errno(LINUX_EINVAL);
     }
 
+    let Some(owner_pid) = multitask::current_user_process_id() else {
+        return linux_errno(LINUX_EPERM);
+    };
     let mut prepares = PROC_PREPARES.lock();
     if prepares.len() >= MAX_PROC_PREPARES {
         return linux_errno(LINUX_EAGAIN);
@@ -122,6 +126,7 @@ pub(super) fn syscall_linux_rustos_proc_prepare_broker(args_ptr: u64) -> u64 {
     prepares.insert(
         handle,
         ProcPrepareState {
+            owner_pid,
             format: args.format,
             mappings: Vec::new(),
             windows_runtime: None,
@@ -151,6 +156,9 @@ pub(super) fn syscall_linux_rustos_proc_map_file_broker(args_ptr: u64) -> u64 {
     let Some(state) = prepares.get_mut(&args.prepare_handle) else {
         return linux_errno(LINUX_EINVAL);
     };
+    if !prepare_owned_by_current(state) {
+        return linux_errno(LINUX_EPERM);
+    }
     if let Err(errno) = validate_mapping_region(args.target_addr, args.mem_len, args.flags) {
         return linux_errno(errno);
     }
@@ -193,6 +201,9 @@ pub(super) fn syscall_linux_rustos_proc_map_file_batch_broker(args_ptr: u64) -> 
     let Some(state) = prepares.get_mut(&args.prepare_handle) else {
         return linux_errno(LINUX_EINVAL);
     };
+    if !prepare_owned_by_current(state) {
+        return linux_errno(LINUX_EPERM);
+    }
     for entry in &args.entries[..count] {
         if entry.reserved0 != 0 {
             return linux_errno(LINUX_EINVAL);
@@ -237,6 +248,9 @@ pub(super) fn syscall_linux_rustos_proc_set_linux_runtime_broker(args_ptr: u64) 
     let Some(state) = prepares.get_mut(&args.prepare_handle) else {
         return linux_errno(LINUX_EINVAL);
     };
+    if !prepare_owned_by_current(state) {
+        return linux_errno(LINUX_EPERM);
+    }
     if state.format != PROC_BROKER_FORMAT_ELF64 || state.linux_runtime.is_some() {
         return linux_errno(LINUX_EINVAL);
     }
@@ -297,6 +311,9 @@ pub(super) fn syscall_linux_rustos_proc_map_zeroed_broker(args_ptr: u64) -> u64 
     let Some(state) = prepares.get_mut(&args.prepare_handle) else {
         return linux_errno(LINUX_EINVAL);
     };
+    if !prepare_owned_by_current(state) {
+        return linux_errno(LINUX_EPERM);
+    }
     if let Err(errno) = validate_mapping_region(args.target_addr, args.mem_len, args.flags) {
         return linux_errno(errno);
     }
@@ -331,6 +348,9 @@ pub(super) fn syscall_linux_rustos_proc_map_data_broker(args_ptr: u64) -> u64 {
     let Some(state) = prepares.get_mut(&args.prepare_handle) else {
         return linux_errno(LINUX_EINVAL);
     };
+    if !prepare_owned_by_current(state) {
+        return linux_errno(LINUX_EPERM);
+    }
     if let Err(errno) = validate_mapping_region(args.target_addr, args.mem_len, args.flags) {
         return linux_errno(errno);
     }
@@ -379,6 +399,9 @@ pub(super) fn syscall_linux_rustos_proc_set_image_blob_broker(args_ptr: u64) -> 
     let Some(state) = prepares.get_mut(&args.prepare_handle) else {
         return linux_errno(LINUX_EINVAL);
     };
+    if !prepare_owned_by_current(state) {
+        return linux_errno(LINUX_EPERM);
+    }
     if state.format != PROC_BROKER_FORMAT_ELF64 {
         return linux_errno(LINUX_EINVAL);
     }
@@ -444,6 +467,9 @@ pub(super) fn syscall_linux_rustos_proc_set_windows_runtime_broker(args_ptr: u64
     let Some(state) = prepares.get_mut(&args.prepare_handle) else {
         return linux_errno(LINUX_EINVAL);
     };
+    if !prepare_owned_by_current(state) {
+        return linux_errno(LINUX_EPERM);
+    }
     if state.format != PROC_BROKER_FORMAT_PE64 || state.windows_runtime.is_some() {
         return linux_errno(LINUX_EINVAL);
     }
@@ -511,8 +537,14 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
     if args.reserved0 != 0 || args.prepare_handle == 0 {
         return linux_errno(LINUX_EINVAL);
     }
-    let Some(state) = PROC_PREPARES.lock().remove(&args.prepare_handle) else {
-        return linux_errno(LINUX_EINVAL);
+    let state = {
+        let mut prepares = PROC_PREPARES.lock();
+        match prepares.get(&args.prepare_handle) {
+            None => return linux_errno(LINUX_EINVAL),
+            Some(s) if !prepare_owned_by_current(s) => return linux_errno(LINUX_EPERM),
+            _ => {}
+        }
+        prepares.remove(&args.prepare_handle).unwrap()
     };
     if !matches!(
         state.format,
@@ -679,8 +711,14 @@ pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64
     if ticket.target_pid != args.target_pid || ticket.target_tid != args.target_tid {
         return linux_errno(LINUX_EPERM);
     }
-    let Some(state) = PROC_PREPARES.lock().remove(&args.prepare_handle) else {
-        return linux_errno(LINUX_EINVAL);
+    let state = {
+        let mut prepares = PROC_PREPARES.lock();
+        match prepares.get(&args.prepare_handle) {
+            None => return linux_errno(LINUX_EINVAL),
+            Some(s) if !prepare_owned_by_current(s) => return linux_errno(LINUX_EPERM),
+            _ => {}
+        }
+        prepares.remove(&args.prepare_handle).unwrap()
     };
     if state.format != PROC_BROKER_FORMAT_ELF64 || state.windows_runtime.is_some() {
         return linux_errno(LINUX_EINVAL);
@@ -739,14 +777,14 @@ pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64
             Err(err) => return linux_errno(process_load_error_to_linux_errno(err)),
         }
     };
-    let transition = exec_transition_from_prepared(args.target_pid, args.target_pid, &prepared);
+    let transition = exec_transition_from_prepared(args.target_pid, args.target_tid, &prepared);
     if multitask::exec_user_process_by_pid(
         args.target_pid,
         args.target_tid,
         prepared.address_space,
         prepared.bootstrap,
     ) {
-        EXEC_TRANSITIONS.lock().insert(args.target_pid, transition);
+        EXEC_TRANSITIONS.lock().insert(args.target_tid, transition);
         args.target_pid
     } else {
         linux_errno(LINUX_ESRCH)
@@ -890,7 +928,13 @@ pub(super) fn syscall_linux_rustos_proc_abort_broker(args_ptr: u64) -> u64 {
     if args.reserved0 != 0 {
         return linux_errno(LINUX_EINVAL);
     }
-    PROC_PREPARES.lock().remove(&args.prepare_handle);
+    let mut prepares = PROC_PREPARES.lock();
+    if let Some(state) = prepares.get(&args.prepare_handle) {
+        if !prepare_owned_by_current(state) {
+            return linux_errno(LINUX_EPERM);
+        }
+    }
+    prepares.remove(&args.prepare_handle);
     0
 }
 
@@ -900,6 +944,10 @@ fn current_process_can_load() -> bool {
 
 fn current_process_can_policy() -> bool {
     ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_PROCESS_POLICY)
+}
+
+fn prepare_owned_by_current(state: &ProcPrepareState) -> bool {
+    multitask::current_user_process_id() == Some(state.owner_pid)
 }
 
 fn user_registers_to_task_registers(

@@ -1,9 +1,9 @@
 mod bus;
 mod class;
 
-// Future boundary: driver/provider policy belongs in driverd/devmgrd.
-// Keep this module limited to privileged hardware presence checks, DMA/MMIO/IRQ
-// substrate, and narrow broker hooks until driver domains are isolated.
+// Kernel driver role: privileged DMA/MMIO/IRQ substrate and narrow broker hooks.
+// Driver/provider policy belongs in driverd/devmgrd. Driver-domain isolation is
+// out of scope; Linux/Windows compatibility requires some kernel data paths.
 pub mod dma;
 pub mod iommu;
 pub mod irq;
