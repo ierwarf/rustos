@@ -199,12 +199,14 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> LoaderSpawnR
     };
     let fd = syscall4(SYS_OPENAT, AT_FDCWD, path.as_ptr() as u64, O_RDONLY, 0) as i32;
     if fd < 0 {
+        debug_line("loaderd: open executable failed");
         response.status = -fd;
         return response;
     }
     let executable_format = match validate_executable_fd(fd) {
         Ok(format) => format,
         Err(errno) => {
+            debug_line("loaderd: validate executable failed");
             let _ = syscall1(SYS_CLOSE, fd as u64);
             response.status = errno;
             return response;
@@ -223,6 +225,7 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> LoaderSpawnR
     ) {
         Ok(values) => values,
         Err(errno) => {
+            let _ = syscall1(SYS_CLOSE, fd as u64);
             response.status = errno;
             return response;
         }
@@ -234,6 +237,7 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> LoaderSpawnR
     ) {
         Ok(values) => values,
         Err(errno) => {
+            let _ = syscall1(SYS_CLOSE, fd as u64);
             response.status = errno;
             return response;
         }
@@ -254,6 +258,7 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> LoaderSpawnR
         (&prepare_args as *const RustosProcPrepareBrokerArgs) as u64,
     );
     if prepare_handle < 0 {
+        debug_line("loaderd: prepare broker failed");
         let _ = syscall1(SYS_CLOSE, fd as u64);
         response.status = (-prepare_handle) as i32;
         return response;
@@ -268,20 +273,17 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> LoaderSpawnR
     ) {
         Ok(prepared) => prepared,
         Err(errno) => {
+            debug_line("loaderd: map executable failed");
             let _ = syscall1(SYS_CLOSE, fd as u64);
             abort_prepare(prepare_handle as u64, errno as u64);
             response.status = errno;
             return response;
         }
     };
-    let close_status = syscall1(SYS_CLOSE, fd as u64);
-    if close_status < 0 {
-        abort_prepare(prepare_handle as u64, (-close_status) as u64);
-        response.status = (-close_status) as i32;
-        return response;
-    }
     if let Some(ref result) = prepared.linux_runtime {
         if let Err(errno) = set_linux_runtime_broker(prepare_handle as u64, result) {
+            debug_line("loaderd: linux runtime broker failed");
+            close_fds(&prepared.cleanup_fds);
             abort_prepare(prepare_handle as u64, errno as u64);
             response.status = errno;
             return response;
@@ -293,7 +295,9 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> LoaderSpawnR
             (&runtime as *const RustosProcSetWindowsRuntimeBrokerArgs) as u64,
         );
         if status < 0 {
+            debug_line("loaderd: windows runtime broker failed");
             let errno = (-status) as i32;
+            close_fds(&prepared.cleanup_fds);
             abort_prepare(prepare_handle as u64, errno as u64);
             response.status = errno;
             return response;
@@ -310,11 +314,22 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> LoaderSpawnR
         envp.as_ptr() as u64,
     );
     if pid < 0 {
+        debug_line("loaderd: commit broker failed");
+        close_fds(&prepared.cleanup_fds);
         response.status = (-pid) as i32;
         return response;
     }
+    close_fds(&prepared.cleanup_fds);
     response.pid = pid;
     response
+}
+
+fn close_fds(fds: &[i32]) {
+    for fd in fds {
+        if *fd >= 0 {
+            let _ = syscall1(SYS_CLOSE, *fd as u64);
+        }
+    }
 }
 
 fn abort_prepare(prepare_handle: u64, reason: u64) {
@@ -424,11 +439,13 @@ struct ElfMapResult {
     max_loaded_end: u64,
     interpreter_path: Option<String>,
     interpreter_base: u64,
+    backing_fds: Vec<i32>,
 }
 
 struct PreparedExecutable {
     windows_runtime: Option<RustosProcSetWindowsRuntimeBrokerArgs>,
     linux_runtime: Option<ElfMapResult>,
+    cleanup_fds: Vec<i32>,
 }
 
 fn map_executable_segments(
@@ -442,9 +459,12 @@ fn map_executable_segments(
     match format {
         PROC_BROKER_FORMAT_ELF64 => {
             map_elf_segments_fd(fd, prepare_handle, ELF_MAIN_DYN_LOAD_OFFSET, true).map(|result| {
+                let mut cleanup_fds = result.backing_fds.clone();
+                cleanup_fds.push(fd);
                 PreparedExecutable {
                     windows_runtime: None,
                     linux_runtime: Some(result),
+                    cleanup_fds,
                 }
             })
         }
@@ -452,6 +472,7 @@ fn map_executable_segments(
             .map(|runtime| PreparedExecutable {
                 windows_runtime: Some(runtime),
                 linux_runtime: None,
+                cleanup_fds: vec![fd],
             }),
         _ => Err(EINVAL),
     }
@@ -636,13 +657,19 @@ fn map_elf_segments_fd(
 
     max_loaded_end = align_up(max_loaded_end, 4096)?;
 
-    let (interpreter_base, actual_entry, interp_path_out, interp_max_end) =
+    let (interpreter_base, actual_entry, interp_path_out, interp_max_end, backing_fds) =
         if let Some(path) = interpreter_path.as_deref() {
             let interp = map_elf_interpreter(path, prepare_handle)?;
             let end = interp.max_loaded_end.max(max_loaded_end);
-            (interp.load_bias, interp.entry, interpreter_path, end)
+            (
+                interp.load_bias,
+                interp.entry,
+                interpreter_path,
+                end,
+                interp.backing_fds,
+            )
         } else {
-            (0, entry, None, max_loaded_end)
+            (0, entry, None, max_loaded_end, Vec::new())
         };
 
     Ok(ElfMapResult {
@@ -655,6 +682,7 @@ fn map_elf_segments_fd(
         max_loaded_end: interp_max_end,
         interpreter_path: interp_path_out,
         interpreter_base,
+        backing_fds,
     })
 }
 
@@ -664,12 +692,15 @@ fn map_elf_interpreter(path: &str, prepare_handle: u64) -> Result<ElfMapResult, 
     if fd < 0 {
         return Err(-fd);
     }
-    let result = map_elf_segments_fd(fd, prepare_handle, ELF_INTERP_LOAD_OFFSET, false);
-    let close_status = syscall1(SYS_CLOSE, fd as u64);
-    if close_status < 0 {
-        return Err((-close_status) as i32);
-    }
-    result
+    let mut result = match map_elf_segments_fd(fd, prepare_handle, ELF_INTERP_LOAD_OFFSET, false) {
+        Ok(result) => result,
+        Err(errno) => {
+            let _ = syscall1(SYS_CLOSE, fd as u64);
+            return Err(errno);
+        }
+    };
+    result.backing_fds.push(fd);
+    Ok(result)
 }
 
 fn elf_load_bias_from_fd(

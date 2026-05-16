@@ -2,7 +2,7 @@ id = "netprobe"
 kind = "app"
 execution_domain = "user"
 profiles = ["default"]
-startup = "init"
+startup = "none"
 
 [build]
 builder = "c-demo"

@@ -110,6 +110,7 @@ const LINUX_ENOTCONN: i64 = 107;
 const LINUX_ECONNREFUSED: i64 = 111;
 const LINUX_EPIPE: i64 = 32;
 const LINUX_ERANGE: i64 = 34;
+const LINUX_EMFILE: i64 = 24;
 const LINUX_EROFS: i64 = 30;
 const LINUX_ESPIPE: i64 = 29;
 const LINUX_ESTALE: i64 = 116;
@@ -203,15 +204,20 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
             frame.rdx,
             0,
         ),
-        linux_abi::SYS_SENDTO => syscall_linux_net6(
-            SYSCALL_OFFLOAD_OP_LINUX_SENDTO,
-            frame.rdi,
-            frame.rsi,
-            frame.rdx,
-            frame.r10,
-            frame.r8,
-            frame.r9,
-        ),
+        linux_abi::SYS_SENDTO => syscall_linux_socket_sendto_direct(
+            frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
+        )
+        .unwrap_or_else(|| {
+            syscall_linux_net6(
+                SYSCALL_OFFLOAD_OP_LINUX_SENDTO,
+                frame.rdi,
+                frame.rsi,
+                frame.rdx,
+                frame.r10,
+                frame.r8,
+                frame.r9,
+            )
+        }),
         linux_abi::SYS_ACCEPT => syscall_linux_net4(
             SYSCALL_OFFLOAD_OP_LINUX_ACCEPT,
             frame.rdi,
@@ -388,29 +394,44 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
             0,
             0,
         ),
-        linux_abi::SYS_SENDMSG => syscall_linux_net4(
-            SYSCALL_OFFLOAD_OP_LINUX_SENDMSG,
-            frame.rdi,
-            frame.rsi,
-            frame.rdx,
-            0,
-        ),
-        linux_abi::SYS_RECVFROM => syscall_linux_net6(
-            SYSCALL_OFFLOAD_OP_LINUX_RECVFROM,
-            frame.rdi,
-            frame.rsi,
-            frame.rdx,
-            frame.r10,
-            frame.r8,
-            frame.r9,
-        ),
-        linux_abi::SYS_RECVMSG => syscall_linux_net4(
-            SYSCALL_OFFLOAD_OP_LINUX_RECVMSG,
-            frame.rdi,
-            frame.rsi,
-            frame.rdx,
-            0,
-        ),
+        linux_abi::SYS_SENDMSG => syscall_linux_socket_sendmsg_direct(
+            frame.rdi, frame.rsi, frame.rdx,
+        )
+        .unwrap_or_else(|| {
+            syscall_linux_net4(
+                SYSCALL_OFFLOAD_OP_LINUX_SENDMSG,
+                frame.rdi,
+                frame.rsi,
+                frame.rdx,
+                0,
+            )
+        }),
+        linux_abi::SYS_RECVFROM => syscall_linux_socket_recvfrom_direct(
+            frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
+        )
+        .unwrap_or_else(|| {
+            syscall_linux_net6(
+                SYSCALL_OFFLOAD_OP_LINUX_RECVFROM,
+                frame.rdi,
+                frame.rsi,
+                frame.rdx,
+                frame.r10,
+                frame.r8,
+                frame.r9,
+            )
+        }),
+        linux_abi::SYS_RECVMSG => syscall_linux_socket_recvmsg_direct(
+            frame.rdi, frame.rsi, frame.rdx,
+        )
+        .unwrap_or_else(|| {
+            syscall_linux_net4(
+                SYSCALL_OFFLOAD_OP_LINUX_RECVMSG,
+                frame.rdi,
+                frame.rsi,
+                frame.rdx,
+                0,
+            )
+        }),
         linux_abi::SYS_GETDENTS64 => syscall_linux_vfs_getdents64(frame.rdi, frame.rsi, frame.rdx),
         linux_abi::SYS_EXECVEAT => {
             syscall_linux_execveat(frame, frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)

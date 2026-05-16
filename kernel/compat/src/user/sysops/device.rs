@@ -11,6 +11,8 @@ use crate::multitask;
 use crate::user::handles::{DisplaySurfaceHandle, KernelHandle, RemoteVfsHandleKind};
 use crate::user::linux as linux_abi;
 use crate::user::process_state::UserProcessState;
+use alloc::vec;
+use rustos_user_abi::console as console_abi;
 use rustos_user_abi::device as device_abi;
 
 const PAGE_SIZE: u64 = 4096;
@@ -158,11 +160,142 @@ fn ioctl_remote_device(
     if is_display_device_path(path) {
         return ioctl_display_device(process_state, request, arg);
     }
+    if is_console_device_path(path) {
+        return ioctl_console_device(process_state, request, arg);
+    }
     Err(DeviceSysopError::Unsupported)
 }
 
 fn is_display_device_path(path: &str) -> bool {
     matches!(path, "/dev/display0" | "/dev/dri/card0")
+}
+
+fn is_console_device_path(path: &str) -> bool {
+    path == console_abi::CONSOLE_PATH
+}
+
+fn ioctl_console_device(
+    process_state: &mut UserProcessState,
+    request: u64,
+    arg: u64,
+) -> Result<u64, DeviceSysopError> {
+    match request {
+        console_abi::CONSOLE_IOCTL_CREATE_SESSION => ioctl_console_create_session(process_state, arg),
+        console_abi::CONSOLE_IOCTL_CLOSE_SESSION => ioctl_console_close_session(process_state, arg),
+        console_abi::CONSOLE_IOCTL_SET_SESSION_STATE => {
+            ioctl_console_set_session_state(process_state, arg)
+        }
+        console_abi::CONSOLE_IOCTL_SET_FOCUS => ioctl_console_set_focus(process_state, arg),
+        _ => Err(DeviceSysopError::Unsupported),
+    }
+}
+
+fn ioctl_console_create_session(
+    process_state: &mut UserProcessState,
+    arg: u64,
+) -> Result<u64, DeviceSysopError> {
+    let mut request =
+        read_process_struct::<console_abi::ConsoleCreateSessionRequest>(process_state, arg)?;
+    if request.reserved != 0 {
+        return Err(DeviceSysopError::InvalidArgument);
+    }
+    let title = read_process_text(
+        process_state,
+        request.title_ptr,
+        request.title_len,
+        kernel_io_manager::api::session::TITLE_CAPACITY,
+    )?;
+    let exec_path = read_process_text(
+        process_state,
+        request.exec_path_ptr,
+        request.exec_path_len,
+        kernel_io_manager::api::session::PATH_CAPACITY,
+    )?;
+    let title_str = core::str::from_utf8(&title).map_err(|_| DeviceSysopError::InvalidArgument)?;
+    let exec_str =
+        core::str::from_utf8(&exec_path).map_err(|_| DeviceSysopError::InvalidArgument)?;
+    let handle = kernel_io_manager::api::session::create(request.program_id, title_str, exec_str)
+        .map_err(|err| match err {
+            kernel_io_manager::api::session::CreateConsoleSessionError::NoCapacity => {
+                DeviceSysopError::Unsupported
+            }
+        })?;
+    request.session_handle = handle.raw();
+    write_process_struct(process_state, arg, &request)?;
+    Ok(0)
+}
+
+fn ioctl_console_close_session(
+    process_state: &mut UserProcessState,
+    arg: u64,
+) -> Result<u64, DeviceSysopError> {
+    let request =
+        read_process_struct::<console_abi::ConsoleCloseSessionRequest>(process_state, arg)?;
+    let handle = kernel_io_manager::api::session::ConsoleSessionHandle::from_raw(
+        request.session_handle,
+    );
+    if kernel_io_manager::api::session::remove(handle) {
+        Ok(0)
+    } else {
+        Err(DeviceSysopError::NotFound)
+    }
+}
+
+fn ioctl_console_set_session_state(
+    process_state: &mut UserProcessState,
+    arg: u64,
+) -> Result<u64, DeviceSysopError> {
+    let request =
+        read_process_struct::<console_abi::ConsoleSetSessionStateRequest>(process_state, arg)?;
+    if request.reserved != 0 {
+        return Err(DeviceSysopError::InvalidArgument);
+    }
+    let handle = kernel_io_manager::api::session::ConsoleSessionHandle::from_raw(
+        request.session_handle,
+    );
+    match kernel_io_manager::api::session::transition_state(handle, request.state) {
+        Some(true) => Ok(0),
+        Some(false) => Err(DeviceSysopError::NotFound),
+        None => Err(DeviceSysopError::InvalidArgument),
+    }
+}
+
+fn ioctl_console_set_focus(
+    process_state: &mut UserProcessState,
+    arg: u64,
+) -> Result<u64, DeviceSysopError> {
+    let request = read_process_struct::<console_abi::ConsoleSetFocusRequest>(process_state, arg)?;
+    let handle = kernel_io_manager::api::session::ConsoleSessionHandle::from_raw(
+        request.session_handle,
+    );
+    if kernel_io_manager::api::session::set_focus(handle) {
+        Ok(0)
+    } else {
+        Err(DeviceSysopError::NotFound)
+    }
+}
+
+fn read_process_text(
+    process_state: &UserProcessState,
+    ptr: u64,
+    len: u64,
+    max_len: usize,
+) -> Result<alloc::vec::Vec<u8>, DeviceSysopError> {
+    let len = usize::try_from(len).map_err(|_| DeviceSysopError::InvalidArgument)?;
+    if ptr == 0 || len == 0 || len > max_len {
+        return Err(DeviceSysopError::InvalidArgument);
+    }
+    let mut bytes = vec![0_u8; len];
+    process_state
+        .address_space()
+        .validate_user_read_buffer(VirtAddr::new(ptr), bytes.len())?;
+    process_state
+        .address_space()
+        .copy_from_user(VirtAddr::new(ptr), &mut bytes)?;
+    if bytes.contains(&0) {
+        return Err(DeviceSysopError::InvalidArgument);
+    }
+    Ok(bytes)
 }
 
 fn ioctl_display_device(

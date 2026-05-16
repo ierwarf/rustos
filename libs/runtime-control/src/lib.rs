@@ -1,9 +1,13 @@
+use std::ffi::CString;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::mem::size_of;
+use std::os::fd::FromRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::OnceLock;
+use std::thread;
+use std::time::{Duration, Instant};
 
 const PROTOCOL_VERSION: u16 = 1;
 const OP_SNAPSHOT_RUNNING_PROGRAMS: u16 = 1;
@@ -21,6 +25,7 @@ const RUNNING_PROGRAM_NAME_CAPACITY: usize = 48;
 const PROGRAM_PATH_CAPACITY: usize = 64;
 const MAX_RUNTIME_PROGRAMS: usize = 64;
 const DEFAULT_WEIGHT_MICROS: u64 = 50;
+const RPC_IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub const DEFAULT_RUNTIME_SOCKET_PATH: &str = "/run/runtimed.sock";
 pub const DEFAULT_APPLICATIONS_DIR: &str = "/usr/share/applications";
@@ -244,18 +249,21 @@ impl RuntimeClient {
             target_kind: READY_COMPONENT_UI_SERVER,
             ..RuntimeRequest::default()
         };
-        let _ = self.exchange(&request)?;
+        self.send_oneway(&request)?;
         Ok(())
     }
 
+    fn send_oneway(&self, request: &RuntimeRequest) -> Result<(), i32> {
+        let mut stream = connect_nonblocking_unix(&self.socket_path)?;
+        write_all_retry(&mut stream, as_bytes(request))
+    }
+
     fn exchange(&self, request: &RuntimeRequest) -> Result<(RuntimeResponse, Vec<u8>), i32> {
-        let mut stream = UnixStream::connect(&self.socket_path).map_err(io_errno)?;
-        stream.write_all(as_bytes(request)).map_err(io_errno)?;
+        let mut stream = connect_nonblocking_unix(&self.socket_path)?;
+        write_all_retry(&mut stream, as_bytes(request))?;
 
         let mut response = RuntimeResponse::default();
-        stream
-            .read_exact(as_bytes_mut(&mut response))
-            .map_err(io_errno)?;
+        read_exact_retry(&mut stream, as_bytes_mut(&mut response))?;
         if response.version != PROTOCOL_VERSION {
             return Err(libc::EPROTO);
         }
@@ -278,10 +286,89 @@ impl RuntimeClient {
         };
         let mut payload = vec![0_u8; payload_len];
         if payload_len != 0 {
-            stream.read_exact(&mut payload).map_err(io_errno)?;
+            read_exact_retry(&mut stream, &mut payload)?;
         }
         Ok((response, payload))
     }
+}
+
+fn connect_nonblocking_unix(path: &str) -> Result<UnixStream, i32> {
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(last_errno());
+    }
+
+    let path = CString::new(path).map_err(|_| libc::EINVAL)?;
+    let mut addr = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let path_bytes = path.as_bytes_with_nul();
+    if path_bytes.len() > addr.sun_path.len() {
+        let _ = unsafe { libc::close(fd) };
+        return Err(libc::ENAMETOOLONG);
+    }
+    for (index, byte) in path_bytes.iter().enumerate() {
+        addr.sun_path[index] = *byte as libc::c_char;
+    }
+
+    let rc = unsafe {
+        libc::connect(
+            fd,
+            (&addr as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+            size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        let err = last_errno();
+        let _ = unsafe { libc::close(fd) };
+        return Err(err);
+    }
+
+    Ok(unsafe { UnixStream::from_raw_fd(fd) })
+}
+
+fn write_all_retry(stream: &mut UnixStream, mut bytes: &[u8]) -> Result<(), i32> {
+    let deadline = Instant::now() + RPC_IO_TIMEOUT;
+    while !bytes.is_empty() {
+        match stream.write(bytes) {
+            Ok(0) => return Err(libc::EPIPE),
+            Ok(written) => bytes = &bytes[written..],
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(libc::ETIMEDOUT);
+                }
+                thread::yield_now();
+            }
+            Err(err) => return Err(io_errno(err)),
+        }
+    }
+    Ok(())
+}
+
+fn read_exact_retry(stream: &mut UnixStream, mut bytes: &mut [u8]) -> Result<(), i32> {
+    let deadline = Instant::now() + RPC_IO_TIMEOUT;
+    while !bytes.is_empty() {
+        match stream.read(bytes) {
+            Ok(0) => return Err(libc::EPIPE),
+            Ok(read) => {
+                let remaining = bytes;
+                bytes = &mut remaining[read..];
+            }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(libc::ETIMEDOUT);
+                }
+                thread::yield_now();
+            }
+            Err(err) => return Err(io_errno(err)),
+        }
+    }
+    Ok(())
 }
 
 pub fn decode_c_string(bytes: &[u8]) -> String {
@@ -896,6 +983,12 @@ fn request_with_path(
 
 fn io_errno(err: std::io::Error) -> i32 {
     err.raw_os_error().unwrap_or(libc::EIO)
+}
+
+fn last_errno() -> i32 {
+    std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EIO)
 }
 
 fn as_bytes<T>(value: &T) -> &[u8] {

@@ -11,6 +11,20 @@ pub mod mmio;
 
 use driver_abi::{DriverBus, DriverClass};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DriverLoadError {
+    /// Caller-supplied class/bus is unknown to the kernel.
+    UnsupportedTopology,
+    /// The kernel broker has no in-kernel loader for this driver; the module is
+    /// expected to be hosted by a user-space driver service that does not yet exist.
+    LoaderUnimplemented,
+    /// A supported loader was invoked but it failed for an operational reason
+    /// (e.g. boot framebuffer registration rejected by the GUI subsystem).
+    LoaderFailed,
+    /// Fault injection rejected the load.
+    FaultInjected,
+}
+
 const BOOTFB_DRIVER_NAME: &str = "bootfb";
 const BOOTFB_DRIVER_MODULE_PATH: &str = "system/drivers/display/bootfb.ko";
 const BOOTFB_ALIAS: &str = "platform:bootfb";
@@ -31,15 +45,15 @@ pub fn load_module_image_from_policy(
     bus: u32,
     image_path: &str,
     linux_driver_names: &str,
-) -> Result<(), &'static str> {
+) -> Result<(), DriverLoadError> {
     if nucleus_core::util::fault_injection::should_fail("driver.module.load") {
-        return Err("fault injection rejected driver module load");
+        return Err(DriverLoadError::FaultInjected);
     }
 
-    let class = decode_class(class).ok_or("driver class is unsupported")?;
-    let bus = decode_bus(bus).ok_or("driver bus is unsupported")?;
+    let class = decode_class(class).ok_or(DriverLoadError::UnsupportedTopology)?;
+    let bus = decode_bus(bus).ok_or(DriverLoadError::UnsupportedTopology)?;
     if !class::is_supported(class) || !bus::is_supported(bus) {
-        return Err("driver core is unsupported");
+        return Err(DriverLoadError::UnsupportedTopology);
     }
 
     if name == BOOTFB_DRIVER_NAME
@@ -51,7 +65,9 @@ pub fn load_module_image_from_policy(
         return load_boot_framebuffer_provider();
     }
 
-    Err("driver module loader is not available through this broker")
+    // No kernel-side loader exists for this module in the current architecture;
+    // a user-space driver host is expected to provide it in the future.
+    Err(DriverLoadError::LoaderUnimplemented)
 }
 
 pub fn device_alias_present_from_policy(alias: &str, class: u32, bus: u32) -> bool {
@@ -80,13 +96,13 @@ pub fn provider_group_active_from_policy(group: &str) -> bool {
     }
 }
 
-fn load_boot_framebuffer_provider() -> Result<(), &'static str> {
+fn load_boot_framebuffer_provider() -> Result<(), DriverLoadError> {
     let framebuffer = crate::storage::boot_volume::boot_framebuffer_info()
-        .ok_or("boot framebuffer unavailable")?;
+        .ok_or(DriverLoadError::LoaderFailed)?;
     if crate::io::gui::install_native_driver_framebuffer(framebuffer) {
         Ok(())
     } else {
-        Err("boot framebuffer registration failed")
+        Err(DriverLoadError::LoaderFailed)
     }
 }
 

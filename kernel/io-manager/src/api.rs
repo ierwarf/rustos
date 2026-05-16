@@ -360,6 +360,57 @@ pub mod tty {
 
 pub mod session {
     pub use crate::io::session::ConsoleSessionHandle;
+
+    pub const STATE_QUEUED: u16 = 1;
+    pub const STATE_LOADING_IMAGE: u16 = 2;
+    pub const STATE_SPAWNING: u16 = 3;
+    pub const STATE_RUNNING: u16 = 4;
+    pub const STATE_CLOSING: u16 = 5;
+
+    pub const TITLE_CAPACITY: usize = crate::io::session::CONSOLE_SESSION_TITLE_CAPACITY;
+    pub const PATH_CAPACITY: usize = crate::io::session::CONSOLE_SESSION_PATH_CAPACITY;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum CreateConsoleSessionError {
+        NoCapacity,
+    }
+
+    pub fn create(
+        program_id: u32,
+        title: &str,
+        exec_path: &str,
+    ) -> Result<ConsoleSessionHandle, CreateConsoleSessionError> {
+        crate::io::session::create_console_session(program_id, title, exec_path).map_err(|err| {
+            match err {
+                crate::io::session::CreateConsoleSessionError::NoCapacity => {
+                    CreateConsoleSessionError::NoCapacity
+                }
+            }
+        })
+    }
+
+    pub fn remove(handle: ConsoleSessionHandle) -> bool {
+        crate::io::session::remove_console_session(handle)
+    }
+
+    pub fn transition_state(handle: ConsoleSessionHandle, state: u16) -> Option<bool> {
+        let kernel_state = match state {
+            STATE_QUEUED => crate::io::session::ConsoleSessionState::Queued,
+            STATE_LOADING_IMAGE => crate::io::session::ConsoleSessionState::LoadingImage,
+            STATE_SPAWNING => crate::io::session::ConsoleSessionState::Spawning,
+            STATE_RUNNING => crate::io::session::ConsoleSessionState::Running,
+            STATE_CLOSING => crate::io::session::ConsoleSessionState::Closing,
+            _ => return None,
+        };
+        Some(crate::io::session::transition_console_session_state(
+            handle,
+            kernel_state,
+        ))
+    }
+
+    pub fn set_focus(handle: ConsoleSessionHandle) -> bool {
+        crate::io::session::set_focused_console_session(handle)
+    }
 }
 
 pub mod io {

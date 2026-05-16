@@ -2,6 +2,7 @@ use std::arch::asm;
 use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::net::UnixStream;
 use std::ptr;
 use std::thread;
 use std::time::Duration;
@@ -22,6 +23,8 @@ const TARGET_GOAL: u32 = 20;
 const BTN_LEFT: u32 = 0x110;
 const SHM_BUFFER_COUNT: usize = 2;
 const SYS_RUSTOS_DEBUG_PRINT: usize = 0x5255_0001;
+const DEFAULT_XDG_RUNTIME_DIR: &str = "/run/user/1000";
+const DEFAULT_WAYLAND_DISPLAY: &str = "wayland-0";
 
 fn auto_exit_after_first_frame() -> bool {
     match std::env::var("RUSTOS_WAYCLICK_AUTO_EXIT") {
@@ -81,12 +84,17 @@ fn connect_wayland_with_retry() -> Result<Connection, ConnectError> {
     const MAX_CONNECT_ATTEMPTS: usize = 20;
     const CONNECT_RETRY_DELAY_MILLIS: u64 = 100;
 
+    ensure_wayland_env_defaults();
     let mut last_error = None;
     for attempt in 0..MAX_CONNECT_ATTEMPTS {
         match Connection::connect_to_env() {
             Ok(connection) => return Ok(connection),
             Err(err) => {
+                if let Ok(connection) = connect_default_wayland_socket() {
+                    return Ok(connection);
+                }
                 if attempt + 1 == MAX_CONNECT_ATTEMPTS {
+                    log_default_wayland_socket_error();
                     return Err(err);
                 }
                 last_error = Some(err);
@@ -96,6 +104,34 @@ fn connect_wayland_with_retry() -> Result<Connection, ConnectError> {
     }
 
     Err(last_error.unwrap_or(ConnectError::NoCompositor))
+}
+
+fn ensure_wayland_env_defaults() {
+    if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+        std::env::set_var("XDG_RUNTIME_DIR", DEFAULT_XDG_RUNTIME_DIR);
+    }
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        std::env::set_var("WAYLAND_DISPLAY", DEFAULT_WAYLAND_DISPLAY);
+    }
+}
+
+fn connect_default_wayland_socket() -> Result<Connection, ConnectError> {
+    let stream = UnixStream::connect(default_wayland_socket_path())
+        .map_err(|_| ConnectError::NoCompositor)?;
+    Connection::from_socket(stream)
+}
+
+fn log_default_wayland_socket_error() {
+    if let Err(err) = UnixStream::connect(default_wayland_socket_path()) {
+        raw_stderr_line(&format!(
+            "wayclick: default wayland socket connect errno={:?}",
+            err.raw_os_error()
+        ));
+    }
+}
+
+fn default_wayland_socket_path() -> String {
+    format!("{DEFAULT_XDG_RUNTIME_DIR}/{DEFAULT_WAYLAND_DISPLAY}")
 }
 
 fn main() {

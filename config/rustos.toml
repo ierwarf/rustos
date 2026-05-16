@@ -29,7 +29,20 @@ heartbeat = "off"
 # non-failing; replace "off" with fail, drop-every:N, fail-after:N, rate:N, or
 # delay-ms:N to exercise a fault path.
 enabled = true
-rules = ["alloc.frame=off", "block.read=off", "block.write=off", "display.present=off", "display.provider.register=off", "driver.module.load=off", "input.event.enqueue=off", "pci.config.read=off", "process.spawn=off", "socket.recv=off", "socket.send=off", "virtio-gpu.control.submit=off"]
+rules = [
+    "alloc.frame=off",
+    "block.read=off",
+    "block.write=off",
+    "display.present=off",
+    "display.provider.register=off",
+    "driver.module.load=off",
+    "input.event.enqueue=off",
+    "pci.config.read=off",
+    "process.spawn=off",
+    "socket.recv=off",
+    "socket.send=off",
+    "virtio-gpu.control.submit=off",
+]
 
 [kernel.build]
 # Hardened/release-oriented kernel build knobs. Copy this block, or this whole

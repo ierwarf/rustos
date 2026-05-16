@@ -224,6 +224,12 @@ pub fn try_parse_logging_toml(source: &str) -> Result<LoggingConfig, String> {
             continue;
         }
 
+        let logging_section = matches!(section, "" | "logging" | "categories" | "logging.categories")
+            || section.starts_with("logging.");
+        if !logging_section {
+            continue;
+        }
+
         let Some((raw_key, raw_value)) = line.split_once('=') else {
             return Err(format!("invalid logging config line: {line}"));
         };
@@ -464,5 +470,23 @@ storage = "debug"
         assert_eq!(config.level_for_category("panic"), LOG_LEVEL_FATAL);
         assert_eq!(config.level_for_category("syscall"), LOG_LEVEL_OFF);
         assert_eq!(config.level_for_category("storage"), LOG_LEVEL_DEBUG);
+    }
+
+    #[test]
+    fn ignores_multiline_non_logging_sections() {
+        let source = r#"
+[logging]
+min_level = "warn"
+
+[fault_injection]
+rules = [
+    "alloc.frame=off",
+    "block.read=off",
+]
+"#;
+
+        let config = parse_logging_toml(source);
+        assert_eq!(config.min_level, super::LOG_LEVEL_WARN);
+        assert_eq!(config.level_for_category("boot"), super::LOG_LEVEL_WARN);
     }
 }

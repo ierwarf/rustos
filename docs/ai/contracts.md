@@ -376,8 +376,9 @@ Fault injection:
   IO, device registration, queue submit, process spawn, IPC/socket send/recv,
   and driver probe/load. Do not scatter fault checks through arbitrary helper
   functions.
-- Keep `config/rustos.toml` `fault_injection.rules` on one physical line until
-  the logging cfg scanner is separated from full-file config parsing.
+- `config/rustos.toml` may use normal TOML formatting for fault rules,
+  including multiline arrays; logging extraction must ignore non-logging
+  sections.
 
 Linux network and driver compat:
 

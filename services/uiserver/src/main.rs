@@ -245,9 +245,9 @@ fn log_slow_present(
 }
 
 fn run() -> Result<(), i32> {
-    boot_line("uiserver: run initialize begin");
+    diag_line("uiserver: run initialize begin");
     let mut state = AppState::initialize()?;
-    boot_line("uiserver: run initialize done");
+    diag_line("uiserver: run initialize done");
     if DEBUG_FREEZE_ON_WHITE_BOX {
         boot_line("uiserver: debug white box begin");
         render_debug_white_box(&mut state);
@@ -258,30 +258,30 @@ fn run() -> Result<(), i32> {
         boot_line("uiserver: debug white box halt");
         halt_after_debug_present();
     }
-    boot_line("uiserver: boot frame begin");
+    diag_line("uiserver: boot frame begin");
     render_boot_frame(&mut state);
     if DEBUG_DIRECT_SURFACE_PROBE {
         stamp_raw_surface_probe("boot", &mut state);
     }
     log_frame_sample("boot", &mut state);
-    boot_line("uiserver: boot frame done");
-    boot_line("uiserver: first present begin");
+    diag_line("uiserver: boot frame done");
+    diag_line("uiserver: first present begin");
     state.present()?;
-    boot_line("uiserver: first present done");
-    boot_line("uiserver: post-present init begin");
+    diag_line("uiserver: first present done");
+    diag_line("uiserver: post-present init begin");
     let mut pending_update = VisualUpdate::default();
     let mut presented_cursor_x = state.cursor_x;
     let mut presented_cursor_y = state.cursor_y;
-    boot_line("uiserver: runtime client open begin");
+    diag_line("uiserver: runtime client open begin");
     let mut runtime_state = RuntimeState::default();
     let runtime = RuntimeClient::open_default().map_err(|_| {
         diag_line("uiserver: open runtimed socket failed");
         19
     })?;
-    boot_line("uiserver: runtime client open done");
+    diag_line("uiserver: runtime client open done");
     match runtime.notify_ui_ready() {
-        Ok(()) => boot_line("uiserver: ui ready notified"),
-        Err(err) => boot_line(format!("uiserver: ui ready notify failed errno={err}").as_str()),
+        Ok(()) => diag_line("uiserver: ui ready notified"),
+        Err(err) => diag_line(format!("uiserver: ui ready notify failed errno={err}").as_str()),
     }
     let runtime_sync = RuntimeClient::open_default()
         .map(start_runtime_sync)
@@ -289,10 +289,10 @@ fn run() -> Result<(), i32> {
             diag_line("uiserver: open runtimed sync socket failed");
             19
         })?;
-    boot_line("uiserver: wayland initialize begin");
+    diag_line("uiserver: wayland initialize begin");
     let mut wayland = WaylandCompositor::initialize(state.display.width, state.display.height);
-    boot_line("uiserver: wayland initialize done");
-    boot_line("uiserver: post-present init done");
+    diag_line("uiserver: wayland initialize done");
+    diag_line("uiserver: post-present init done");
     let launcher_programs = start_launcher_program_loader();
     let console_refreshes = start_console_refresh_worker();
     let mut events = [InputEvent::default(); INPUT_EVENT_BATCH];
@@ -523,7 +523,7 @@ fn main() {
         Err(code) => code,
     };
     if exit_code != 0 {
-        diag_line("uiserver: exiting with nonzero status");
+        diag_line(format!("uiserver: exiting with nonzero status errno={exit_code}").as_str());
     }
     std::process::exit(exit_code);
 }

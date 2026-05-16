@@ -1333,6 +1333,7 @@ dependencies = [
  "embedded-graphics",
  "fontdue",
  "keyboard-core",
+ "libc",
  "observability-client",
  "runtime-control",
  "rustos-user-abi",

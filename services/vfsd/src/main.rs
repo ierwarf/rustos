@@ -38,6 +38,7 @@ use storage_fat::{FatDirEntry, FatNodeKind, FatVolume};
 // Linux errno constants (x86_64)
 const ENOENT: i32 = 2;
 const EIO: i32 = 5;
+const EAGAIN: i32 = 11;
 const EBADF: i32 = 9;
 const ENODEV: i32 = 19;
 const ENOTDIR: i32 = 20;
@@ -725,6 +726,9 @@ impl VfsState {
     ) -> Result<usize, i32> {
         let (path, start, file_len) = {
             let handle = self.handles.get(&id).ok_or(EBADF)?;
+            if handle.kind == RemoteKind::Device && is_input_device_node(handle.path.as_str()) {
+                return Err(EAGAIN);
+            }
             if handle.kind != RemoteKind::File {
                 return Err(EISDIR);
             }
@@ -921,6 +925,10 @@ fn known_device_node(path: &str) -> bool {
         path,
         "/dev/console0" | "/dev/display0" | "/dev/input0" | "/dev/input/event0" | "/dev/dri/card0"
     )
+}
+
+fn is_input_device_node(path: &str) -> bool {
+    matches!(path, "/dev/input0" | "/dev/input/event0")
 }
 
 struct BootBlockDevice {

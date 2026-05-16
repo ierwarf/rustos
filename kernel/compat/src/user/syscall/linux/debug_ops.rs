@@ -1,7 +1,7 @@
 use super::*;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-const SECONDARY_LINUX_SYSCALL_DEBUG_LIMIT: usize = 2048;
+const SECONDARY_LINUX_SYSCALL_DEBUG_LIMIT: usize = 64;
 static SECONDARY_LINUX_SYSCALL_DEBUG_LOGS: AtomicUsize = AtomicUsize::new(0);
 
 pub(super) fn syscall_linux_rustos_debug_print(user_ptr: u64, user_len: u64) -> u64 {

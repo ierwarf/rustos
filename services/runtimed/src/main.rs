@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -28,6 +28,9 @@ use rustos_user_abi::syscall::{
 const DEFAULT_USER_TASK_WEIGHT_MICROS: u64 = 50;
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const RETRY_BACKOFF: Duration = Duration::from_secs(1);
+const SERVICE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_RUNTIME_CLIENTS_PER_TICK: usize = 8;
+const MAX_POLICY_LAUNCH_ATTEMPTS_PER_TICK: usize = 1;
 const PROTOCOL_VERSION: u16 = 1;
 const OP_SNAPSHOT_RUNNING_PROGRAMS: u16 = 1;
 const OP_REQUEST_LAUNCH_PATH: u16 = 2;
@@ -136,6 +139,7 @@ struct BrokerState {
     running: BTreeMap<i32, RunningProcess>,
     launched_once: BTreeSet<String>,
     retry_after: BTreeMap<String, Instant>,
+    permanent_launch_failures: BTreeMap<String, i32>,
     launch_entries: Vec<LaunchEntry>,
     programs: BTreeMap<String, ProgramMetadata>,
     ui_ready: bool,
@@ -173,6 +177,7 @@ fn main() {
         running: BTreeMap::new(),
         launched_once: BTreeSet::new(),
         retry_after: BTreeMap::new(),
+        permanent_launch_failures: BTreeMap::new(),
         launch_entries: Vec::new(),
         programs: BTreeMap::new(),
         ui_ready: false,
@@ -236,7 +241,6 @@ fn maybe_load_launch_catalog(state: &mut BrokerState) -> bool {
     state.launch_entries = launch_entries;
     state.launch_catalog_loaded = true;
     boot_line("runtimed: launch catalog load done");
-    ensure_policy_launches(state);
     true
 }
 
@@ -347,8 +351,8 @@ fn bind_listener(path: &str) -> Result<UnixListener, i32> {
 
 fn service_listener(listener: &UnixListener, state: &mut BrokerState) -> bool {
     let mut did_work = false;
-    loop {
-        match listener.accept() {
+    for _ in 0..MAX_RUNTIME_CLIENTS_PER_TICK {
+        match accept_runtime_client(listener) {
             Ok((mut stream, _)) => {
                 did_work = true;
                 if let Err(err) = service_stream(&mut stream, state) {
@@ -378,11 +382,24 @@ fn service_listener(listener: &UnixListener, state: &mut BrokerState) -> bool {
     did_work
 }
 
+fn accept_runtime_client(listener: &UnixListener) -> std::io::Result<(UnixStream, ())> {
+    let fd = unsafe {
+        libc::accept4(
+            listener.as_raw_fd(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((unsafe { UnixStream::from_raw_fd(fd) }, ()))
+}
+
 fn service_stream(stream: &mut UnixStream, state: &mut BrokerState) -> Result<(), i32> {
     let mut request = RuntimeRequest::default();
-    stream
-        .read_exact(as_bytes_mut(&mut request))
-        .map_err(io_errno)?;
+    read_exact_retry(stream, as_bytes_mut(&mut request))?;
     if request.version != PROTOCOL_VERSION {
         return Err(libc::EPROTO);
     }
@@ -395,6 +412,27 @@ fn service_stream(stream: &mut UnixStream, state: &mut BrokerState) -> Result<()
         OP_NOTIFY_READY => handle_ready(stream, state, request),
         _ => Err(libc::EINVAL),
     }
+}
+
+fn read_exact_retry(stream: &mut UnixStream, mut bytes: &mut [u8]) -> Result<(), i32> {
+    let deadline = Instant::now() + SERVICE_REQUEST_TIMEOUT;
+    while !bytes.is_empty() {
+        match stream.read(bytes) {
+            Ok(0) => return Err(libc::EPIPE),
+            Ok(read) => {
+                let remaining = bytes;
+                bytes = &mut remaining[read..];
+            }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(libc::ETIMEDOUT);
+                }
+                thread::yield_now();
+            }
+            Err(err) => return Err(io_errno(err)),
+        }
+    }
+    Ok(())
 }
 
 fn handle_snapshot(stream: &mut UnixStream, state: &BrokerState) -> Result<(), i32> {
@@ -569,6 +607,12 @@ fn ensure_policy_launches(state: &mut BrokerState) -> bool {
     let mut launched_any = false;
     for entry in &state.launch_entries {
         if state
+            .permanent_launch_failures
+            .contains_key(entry.desktop_file_id.as_str())
+        {
+            continue;
+        }
+        if state
             .retry_after
             .get(entry.desktop_file_id.as_str())
             .is_some_and(|deadline| now < *deadline)
@@ -594,7 +638,17 @@ fn ensure_policy_launches(state: &mut BrokerState) -> bool {
         }
     }
 
+    let mut attempts = 0usize;
     for entry in state.launch_entries.clone() {
+        if attempts >= MAX_POLICY_LAUNCH_ATTEMPTS_PER_TICK {
+            break;
+        }
+        if state
+            .permanent_launch_failures
+            .contains_key(entry.desktop_file_id.as_str())
+        {
+            continue;
+        }
         if state
             .retry_after
             .get(entry.desktop_file_id.as_str())
@@ -632,6 +686,7 @@ fn ensure_policy_launches(state: &mut BrokerState) -> bool {
             continue;
         }
 
+        attempts += 1;
         match spawn_tracked_process(state, entry.clone()) {
             Ok(()) => {
                 observability_client::info!(
@@ -647,20 +702,45 @@ fn ensure_policy_launches(state: &mut BrokerState) -> bool {
                 }
             }
             Err(err) => {
-                observability_client::error!(
-                    "runtimed",
-                    service,
-                    "launch {} ({}) failed: errno={err}",
-                    entry.desktop_file_id,
-                    entry.exec
-                );
-                state
-                    .retry_after
-                    .insert(entry.desktop_file_id, Instant::now() + RETRY_BACKOFF);
+                if is_permanent_launch_failure(err) {
+                    observability_client::warn!(
+                        "runtimed",
+                        service,
+                        "launch {} ({}) disabled after permanent failure: errno={err}",
+                        entry.desktop_file_id,
+                        entry.exec
+                    );
+                    state
+                        .permanent_launch_failures
+                        .insert(entry.desktop_file_id, err);
+                } else {
+                    observability_client::error!(
+                        "runtimed",
+                        service,
+                        "launch {} ({}) failed: errno={err}",
+                        entry.desktop_file_id,
+                        entry.exec
+                    );
+                    state
+                        .retry_after
+                        .insert(entry.desktop_file_id, Instant::now() + RETRY_BACKOFF);
+                }
             }
         }
     }
     launched_any
+}
+
+fn is_permanent_launch_failure(errno: i32) -> bool {
+    matches!(
+        errno,
+        libc::ENOSYS
+            | libc::EOPNOTSUPP
+            | libc::ENOEXEC
+            | libc::EINVAL
+            | libc::ENOENT
+            | libc::EACCES
+    )
 }
 
 fn spawn_tracked_process(state: &mut BrokerState, entry: LaunchEntry) -> Result<(), i32> {
@@ -696,13 +776,23 @@ fn spawn_tracked_process(state: &mut BrokerState, entry: LaunchEntry) -> Result<
             if let Some(session) = session_handle {
                 let _ = close_console_session(ensure_console_fd(state)?, session);
             }
-            observability_client::error!(
-                "runtimed",
-                service,
-                "spawn exec failed desktop_id={} exec={} errno={err}",
-                entry.desktop_file_id,
-                entry.exec
-            );
+            if is_permanent_launch_failure(err) {
+                observability_client::warn!(
+                    "runtimed",
+                    service,
+                    "spawn exec permanent failure desktop_id={} exec={} errno={err}",
+                    entry.desktop_file_id,
+                    entry.exec
+                );
+            } else {
+                observability_client::error!(
+                    "runtimed",
+                    service,
+                    "spawn exec failed desktop_id={} exec={} errno={err}",
+                    entry.desktop_file_id,
+                    entry.exec
+                );
+            }
             return Err(err);
         }
     };

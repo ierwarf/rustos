@@ -140,6 +140,7 @@ fn main() {
 
         if launched_this_round {
             thread::yield_now();
+            continue;
         }
         thread::sleep(POLL_INTERVAL);
     }
@@ -189,9 +190,9 @@ fn init_exec_priority(exec: &str) -> u8 {
         NETD_EXEC_PATH => 3,
         DEVMGRD_EXEC_PATH => 4,
         DRIVERD_EXEC_PATH => 5,
-        STORAGED_EXEC_PATH => 6,
-        INPUTD_EXEC_PATH => 7,
-        RUNTIMED_EXEC_PATH => 8,
+        RUNTIMED_EXEC_PATH => 6,
+        STORAGED_EXEC_PATH => 7,
+        INPUTD_EXEC_PATH => 8,
         _ => 9,
     }
 }

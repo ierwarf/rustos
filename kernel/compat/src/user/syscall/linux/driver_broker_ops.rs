@@ -46,6 +46,12 @@ pub(super) fn syscall_linux_rustos_driver_load_module_broker(args_ptr: u64) -> u
         linux_driver_names.as_str(),
     ) {
         Ok(()) => 0,
+        Err(kernel_io_manager::driver::DriverLoadError::LoaderUnimplemented) => {
+            linux_errno(LINUX_ENOSYS)
+        }
+        Err(kernel_io_manager::driver::DriverLoadError::UnsupportedTopology) => {
+            linux_errno(LINUX_EOPNOTSUPP)
+        }
         Err(_) => linux_errno(LINUX_EIO),
     }
 }

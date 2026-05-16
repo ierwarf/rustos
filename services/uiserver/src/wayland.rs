@@ -1,5 +1,6 @@
+use std::ffi::CString;
 use std::io::ErrorKind;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex};
@@ -104,13 +105,6 @@ impl WaylandCompositor {
                 return None;
             }
         };
-        if let Err(err) = listener.set_nonblocking(true) {
-            diag_line(&format!(
-                "uiserver: wayland listener nonblocking failed: {err}"
-            ));
-            return None;
-        }
-
         let state = WaylandState::new(display_width, display_height);
         {
             let handle = display.handle();
@@ -142,7 +136,7 @@ impl WaylandCompositor {
             match self.listener.accept() {
                 Ok((stream, _)) => {
                     accepted = accepted.saturating_add(1);
-                    if let Err(err) = stream.set_nonblocking(true) {
+                    if let Err(err) = set_fd_nonblocking(stream.as_raw_fd()) {
                         diag_line(&format!(
                             "uiserver: accepted wayland client nonblocking failed: {err}"
                         ));
@@ -166,8 +160,11 @@ impl WaylandCompositor {
             }
         }
 
-        if let Err(err) = self.display.dispatch_clients(&mut self.state) {
-            diag_line(&format!("uiserver: wayland dispatch failed: {err}"));
+        match self.display.dispatch_clients(&mut self.state) {
+            Ok(_) => {}
+            Err(err) => {
+                diag_line(&format!("uiserver: wayland dispatch failed: {err}"));
+            }
         }
         self.flush_clients();
 
@@ -226,6 +223,17 @@ impl WaylandCompositor {
     }
 }
 
+fn set_fd_nonblocking(fd: i32) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn current_runtime_dir() -> String {
     const FALLBACK_RUNTIME_DIR: &str = "/run/user/1000";
     std::env::var("XDG_RUNTIME_DIR")
@@ -236,18 +244,66 @@ fn current_runtime_dir() -> String {
 
 fn bind_wayland_listener(runtime_dir: &str, socket_path: &str) -> std::io::Result<UnixListener> {
     fs::create_dir_all(runtime_dir)?;
-    match UnixListener::bind(socket_path) {
+    match bind_nonblocking_unix_listener(socket_path) {
         Ok(listener) => Ok(listener),
         Err(err) if err.kind() == ErrorKind::AddrInUse => {
             if stale_wayland_socket(runtime_dir, socket_path)? {
                 fs::remove_file(socket_path)?;
-                UnixListener::bind(socket_path)
+                bind_nonblocking_unix_listener(socket_path)
             } else {
                 Err(err)
             }
         }
         Err(err) => Err(err),
     }
+}
+
+fn bind_nonblocking_unix_listener(socket_path: &str) -> std::io::Result<UnixListener> {
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let result = (|| {
+        let path = CString::new(socket_path)
+            .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+        let path_bytes = path.as_bytes_with_nul();
+        let mut addr = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        if path_bytes.len() > addr.sun_path.len() {
+            return Err(std::io::Error::from_raw_os_error(libc::ENAMETOOLONG));
+        }
+        for (index, byte) in path_bytes.iter().enumerate() {
+            addr.sun_path[index] = *byte as libc::c_char;
+        }
+
+        let bind_rc = unsafe {
+            libc::bind(
+                fd,
+                (&addr as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+            )
+        };
+        if bind_rc < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if unsafe { libc::listen(fd, 16) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    })();
+
+    if let Err(err) = result {
+        let _ = unsafe { libc::close(fd) };
+        return Err(err);
+    }
+    Ok(unsafe { UnixListener::from_raw_fd(fd) })
 }
 
 fn stale_wayland_socket(runtime_dir: &str, socket_path: &str) -> std::io::Result<bool> {

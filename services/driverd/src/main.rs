@@ -188,12 +188,31 @@ fn load_record(
         ));
     } else {
         skipped.insert(record.name.clone());
-        debug_line(&format!(
-            "driverd: load failed name={} path={} errno={}",
-            record.name,
-            record.image_path,
+        // libc::syscall returns -1 and sets errno on failure, but RustOS bypass
+        // paths can also return the raw negative errno. Prefer libc's errno when
+        // result is -1 (the canonical libc signal), otherwise treat the raw
+        // negative as the errno directly.
+        let errno = if result == -1 {
             last_errno()
-        ));
+        } else if result < 0 {
+            (-result) as i32
+        } else {
+            last_errno()
+        };
+        match errno {
+            libc::ENOSYS => debug_line(&format!(
+                "driverd: skipped name={} reason=loader unimplemented (pending user-space driver host) path={}",
+                record.name, record.image_path
+            )),
+            libc::EOPNOTSUPP => debug_line(&format!(
+                "driverd: skipped name={} reason=unsupported class/bus topology path={}",
+                record.name, record.image_path
+            )),
+            _ => debug_line(&format!(
+                "driverd: load failed name={} path={} errno={errno}",
+                record.name, record.image_path
+            )),
+        }
     }
     LoadResult::Progress
 }

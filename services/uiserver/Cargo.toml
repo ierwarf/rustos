@@ -12,6 +12,7 @@ observability-client = { path = "../../libs/observability-client" }
 rustos-user-abi = { path = "../../libs/rustos-user-abi" }
 embedded-graphics = "0.8"
 keyboard-core = { path = "../../drivers/libs/keyboard-core" }
+libc = "0.2"
 runtime-control = { path = "../../libs/runtime-control" }
 vte = { version = "0.15.0", default-features = false }
 wayland-protocols = { version = "0.32.12", features = ["server", "unstable"] }
