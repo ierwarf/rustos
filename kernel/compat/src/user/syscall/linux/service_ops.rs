@@ -1252,6 +1252,16 @@ pub(super) fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mo
         Ok(path) => path,
         Err(errno) => return linux_errno(errno),
     };
+    // Fast path: bootstrap-owned binary/library paths are served from the in-kernel
+    // boot volume cache. Going through vfsd would require multi-call IPC chunking
+    // bounded by VFS_IPC_PAYLOAD_CAPACITY which dominates loaderd spawn latency.
+    if dirfd as i64 == linux_abi::AT_FDCWD as i64
+        && flags & linux_abi::O_ACCMODE == linux_abi::O_RDONLY
+        && flags & linux_abi::O_DIRECTORY == 0
+        && is_bootstrap_image_path(path.as_str())
+    {
+        return bootstrap_openat(path.as_str(), flags);
+    }
     let mut request = new_vfs_request(VFS_IPC_OP_OPENAT);
     request.dirfd = dirfd;
     request.arg0 = flags;
@@ -1390,7 +1400,7 @@ pub(super) fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u
             return linux_errno(address_space_error_to_linux_errno(err));
         }
         let mut copied = 0usize;
-        let mut chunk = [0_u8; 256];
+        let mut chunk = alloc::vec![0_u8; user_len.min(64 * 1024)];
         while copied < user_len {
             let chunk_len = (user_len - copied).min(chunk.len());
             let read = file.read_into(&mut chunk[..chunk_len]);
@@ -1421,7 +1431,7 @@ pub(super) fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u
             return linux_errno(address_space_error_to_linux_errno(err));
         }
         let mut copied = 0usize;
-        let mut chunk = [0_u8; 256];
+        let mut chunk = alloc::vec![0_u8; user_len.min(64 * 1024)];
         while copied < user_len {
             let chunk_len = (user_len - copied).min(chunk.len());
             let read = memfd.read_into(&mut chunk[..chunk_len]);
@@ -1444,6 +1454,31 @@ pub(super) fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u
     let Some(remote) = current_remote_vfs_handle(fd) else {
         return linux_errno(LINUX_EBADF);
     };
+    if remote.kind() == multitask::RemoteVfsHandleKind::Device
+        && matches!(remote.path().as_str(), "/dev/input0" | "/dev/input/event0")
+    {
+        let Ok(user_len) = usize::try_from(user_len) else {
+            return linux_errno(LINUX_EINVAL);
+        };
+        if user_len == 0 {
+            return 0;
+        }
+        let access = if remote.path().as_str() == "/dev/input/event0" {
+            kernel_object::api::device::DeviceAccessKind::Evdev
+        } else {
+            kernel_object::api::device::DeviceAccessKind::Native
+        };
+        let handle = kernel_object::api::device::DeviceHandle::with_access(
+            kernel_object::api::device::DeviceId::Input,
+            access,
+        );
+        return match kernel_io_manager::api::device::read_to_current_user(
+            handle, user_ptr, user_len,
+        ) {
+            Ok(read) => read as u64,
+            Err(err) => linux_errno(device_error_to_linux_errno(err)),
+        };
+    }
     let Ok(user_len) = usize::try_from(user_len) else {
         return linux_errno(LINUX_EINVAL);
     };
@@ -1489,6 +1524,40 @@ pub(super) fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u
 }
 
 pub(super) fn syscall_linux_vfs_pread64(fd: u64, user_ptr: u64, user_len: u64, offset: u64) -> u64 {
+    if let Some(file) = current_vfs_file_handle(fd) {
+        let Ok(user_len) = usize::try_from(user_len) else {
+            return linux_errno(LINUX_EINVAL);
+        };
+        let Ok(offset) = usize::try_from(offset) else {
+            return linux_errno(LINUX_EINVAL);
+        };
+        if user_len == 0 {
+            return 0;
+        }
+        if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, user_len) {
+            return linux_errno(address_space_error_to_linux_errno(err));
+        }
+        let mut copied = 0usize;
+        let mut chunk = alloc::vec![0_u8; user_len.min(64 * 1024)];
+        while copied < user_len {
+            let chunk_len = (user_len - copied).min(chunk.len());
+            let read = file.read_at(offset.saturating_add(copied), &mut chunk[..chunk_len]);
+            if read == 0 {
+                break;
+            }
+            let Some(dest) = user_ptr.checked_add(copied as u64) else {
+                return linux_errno(LINUX_EINVAL);
+            };
+            if let Err(err) = usermem::write_current_user_bytes(dest, &chunk[..read]) {
+                return linux_errno(address_space_error_to_linux_errno(err));
+            }
+            copied += read;
+            if read < chunk_len {
+                break;
+            }
+        }
+        return copied as u64;
+    }
     if let Some(memfd) = current_memfd_handle(fd) {
         let Ok(user_len) = usize::try_from(user_len) else {
             return linux_errno(LINUX_EINVAL);
@@ -1503,7 +1572,7 @@ pub(super) fn syscall_linux_vfs_pread64(fd: u64, user_ptr: u64, user_len: u64, o
             return linux_errno(address_space_error_to_linux_errno(err));
         }
         let mut copied = 0usize;
-        let mut chunk = [0_u8; 256];
+        let mut chunk = alloc::vec![0_u8; user_len.min(64 * 1024)];
         while copied < user_len {
             let chunk_len = (user_len - copied).min(chunk.len());
             let read = memfd.read_at(offset.saturating_add(copied), &mut chunk[..chunk_len]);
@@ -2657,9 +2726,17 @@ fn bootstrap_path(path: &str) -> Option<&str> {
     }
     (path.starts_with("services/")
         || path.starts_with("applications/")
+        || path.starts_with("apps/")
         || path.starts_with("lib/")
-        || path.starts_with("lib64/"))
+        || path.starts_with("lib64/")
+        || path.starts_with("usr/lib/")
+        || path.starts_with("usr/lib64/")
+        || path.starts_with("system/"))
     .then_some(path)
+}
+
+pub(super) fn is_bootstrap_image_path(path: &str) -> bool {
+    bootstrap_path(path).is_some()
 }
 
 fn write_bootstrap_stat(user_ptr: u64, inode: u64, len: u64) -> u64 {
@@ -2816,19 +2893,20 @@ pub(super) fn syscall_linux_vfs_umount2(target_ptr: u64, flags: u64) -> u64 {
 }
 
 pub(super) fn syscall_linux_ioctl(fd: u64, request_number: u64, arg: u64) -> u64 {
-    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_IOCTL);
-    request.dirfd = fd;
-    request.flags = request_number;
-    request.arg1 = arg;
-    match call_service_offload_request(IPC_SERVICE_DEVMGRD, &request).and_then(|response| {
-        ensure_service_response(&response, SYSCALL_OFFLOAD_OP_LINUX_IOCTL)?;
-        ensure_syscalld_payload(&response, size_of::<u64>())?;
-        let mut bytes = [0_u8; size_of::<u64>()];
-        bytes.copy_from_slice(&response.payload[..size_of::<u64>()]);
-        Ok(u64::from_le_bytes(bytes))
-    }) {
+    // Fast path inspired by seL4's "direct handling" pattern: short-circuit the
+    // devmgrd IPC bounce for device ioctls performed against the caller's own
+    // file descriptors. devmgrd's `dispatch_ioctl` currently forwards every
+    // request through `SYS_RUSTOS_DEVICE_IOCTL_BROKER`, which lands back in the
+    // same kernel handler we invoke here — so the IPC round-trip is pure
+    // overhead (≥4 context switches per call) for data-path ioctls like display
+    // present and input reads. Routing through devmgrd is only required for
+    // policy decisions, of which there are none today; if a policy hook is
+    // added later we can re-introduce IPC for the specific opcodes that need it.
+    match crate::user::sysops::device::ioctl_current_process_fd(fd, request_number, arg) {
         Ok(value) => value,
-        Err(errno) => linux_errno(errno),
+        Err(err) => linux_errno(
+            super::broker_ops::device_sysop_error_to_linux_errno(err),
+        ),
     }
 }
 
@@ -3075,6 +3153,19 @@ fn file_sysop_error_to_linux_errno(error: crate::user::sysops::file::FileSysopEr
         crate::user::sysops::file::FileSysopError::PermissionDenied => LINUX_EACCES,
         crate::user::sysops::file::FileSysopError::ReadOnlyFilesystem => LINUX_EROFS,
         crate::user::sysops::file::FileSysopError::Unsupported => LINUX_ENOSYS,
+    }
+}
+
+fn device_error_to_linux_errno(error: kernel_io_manager::api::device::DeviceError) -> i64 {
+    match error {
+        kernel_io_manager::api::device::DeviceError::AddressSpace(err) => {
+            address_space_error_to_linux_errno(err)
+        }
+        kernel_io_manager::api::device::DeviceError::DisplayUnavailable => LINUX_ENODEV,
+        kernel_io_manager::api::device::DeviceError::InvalidArgument => LINUX_EINVAL,
+        kernel_io_manager::api::device::DeviceError::NotFound => LINUX_ENOENT,
+        kernel_io_manager::api::device::DeviceError::StaleSurface => LINUX_EAGAIN,
+        kernel_io_manager::api::device::DeviceError::Unsupported => LINUX_ENOSYS,
     }
 }
 

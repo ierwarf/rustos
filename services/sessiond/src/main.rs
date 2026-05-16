@@ -6,10 +6,10 @@ use runtime_control::{
     decode_c_string, load_autostart_program_entries, load_startup_entries, DesktopProgramEntry,
     RuntimeClient, StartupMode, DEFAULT_APPLICATIONS_DIR, DEFAULT_AUTOSTART_DIR,
 };
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
-const LAUNCH_SETTLE_DELAY: Duration = Duration::from_millis(250);
-const LAUNCH_START_TIMEOUT: Duration = Duration::from_secs(60);
-const RETRY_BACKOFF: Duration = Duration::from_secs(1);
+const POLL_INTERVAL: Duration = Duration::from_millis(8);
+const LAUNCH_SETTLE_DELAY: Duration = Duration::from_millis(40);
+const LAUNCH_START_TIMEOUT: Duration = Duration::from_secs(20);
+const RETRY_BACKOFF: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct LaunchEntry {

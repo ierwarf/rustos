@@ -190,7 +190,9 @@ pub mod console {
         crate::io::console::init();
     }
 
-    pub fn init_tty() {}
+    pub fn init_tty() {
+        crate::io::tty::init();
+    }
 
     pub fn write(bytes: &[u8]) {
         crate::io::console::write(bytes);
@@ -210,12 +212,16 @@ pub mod driver {
 
     pub mod linux {
         pub mod input {
-            pub fn consumer_acquire() {}
+            pub fn consumer_acquire() {
+                crate::driver::linux::input::consumer_acquire();
+            }
 
-            pub fn consumer_release() {}
+            pub fn consumer_release() {
+                crate::driver::linux::input::consumer_release();
+            }
 
             pub fn debug_lock_snapshot() -> (usize, u64) {
-                (0, 0)
+                crate::driver::linux::input::debug_lock_snapshot()
             }
         }
 
@@ -236,84 +242,69 @@ pub mod driver {
         crate::driver::initialize_loadable_modules_for_class(class)
     }
 
-    pub fn init_linux_cpu_local_symbols() {}
+    pub fn init_linux_cpu_local_symbols() {
+        crate::driver::linux::init_cpu_local_symbols();
+    }
 }
 
 pub mod input {
     pub mod event_queue {
-        #[derive(Clone, Copy, Debug, Default)]
-        pub struct InputEventQueueDebugSnapshot {
-            pub pointer_packet_submits: u64,
-            pub pointer_absolute_submits: u64,
-            pub read_calls: u64,
-            pub read_events: u64,
-            pub lock_active: u64,
-            pub lock_last_seq: u64,
-            pub queued: usize,
-            pub pending_coalesced: bool,
-            pub pending_pointer_position: bool,
-            pub dropped_discrete: u64,
-            pub dropped_lossy: u64,
-        }
+        pub use crate::input::event_queue::InputEventQueueDebugSnapshot;
 
         pub fn debug_snapshot() -> InputEventQueueDebugSnapshot {
-            InputEventQueueDebugSnapshot::default()
+            crate::input::event_queue::debug_snapshot()
         }
     }
 
-    pub fn init() {}
+    pub fn init() {
+        crate::input::init();
+    }
 
-    pub fn on_keyboard_interrupt() {}
+    pub fn on_keyboard_interrupt() {
+        crate::input::on_keyboard_interrupt();
+    }
 
-    pub fn on_mouse_interrupt() {}
+    pub fn on_mouse_interrupt() {
+        crate::input::on_mouse_interrupt();
+    }
 
     pub fn service_pending() -> usize {
-        0
+        crate::input::service_pending()
     }
 }
 
 pub mod device {
-    pub type DeviceHandle = kernel_object::api::device::DeviceHandle;
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub enum DeviceError {
-        AddressSpace(crate::memory::paging::AddressSpaceError),
-        DisplayUnavailable,
-        InvalidArgument,
-        NotFound,
-        StaleSurface,
-        Unsupported,
-    }
+    pub use crate::io::device::{DeviceAccessKind, DeviceError, DeviceHandle, DeviceId};
 
     pub fn read_to_current_user(
-        _handle: DeviceHandle,
-        _user_ptr: u64,
-        _user_len: usize,
+        handle: kernel_object::api::device::DeviceHandle,
+        user_ptr: u64,
+        user_len: usize,
     ) -> Result<usize, DeviceError> {
-        Err(DeviceError::Unsupported)
+        crate::io::device::read_to_current_user(handle.into(), user_ptr, user_len)
     }
 
     pub fn read_to_user(
-        _handle: DeviceHandle,
-        _process_state: &mut crate::user::process_state::UserProcessState,
-        _user_ptr: u64,
-        _user_len: usize,
+        handle: kernel_object::api::device::DeviceHandle,
+        process_state: &mut crate::user::process_state::UserProcessState,
+        user_ptr: u64,
+        user_len: usize,
     ) -> Result<usize, DeviceError> {
-        Err(DeviceError::Unsupported)
+        crate::io::device::read_to_user(handle.into(), process_state, user_ptr, user_len)
     }
 
     pub fn ioctl_from_user(
-        _handle: DeviceHandle,
-        _process_state: &mut crate::user::process_state::UserProcessState,
-        _request: u64,
-        _arg: u64,
+        handle: kernel_object::api::device::DeviceHandle,
+        process_state: &mut crate::user::process_state::UserProcessState,
+        request: u64,
+        arg: u64,
     ) -> Result<u64, DeviceError> {
-        Err(DeviceError::Unsupported)
+        crate::io::device::ioctl_from_user(handle.into(), process_state, request, arg)
     }
 
     pub mod input {
         pub fn has_pending_events() -> bool {
-            false
+            crate::io::device::input::has_pending_events()
         }
     }
 }
@@ -322,39 +313,39 @@ pub mod tty {
     pub type LinuxTermios = crate::user::linux::LinuxTermios;
     pub use crate::io::session::ConsoleSessionHandle;
 
-    pub fn has_pending_input_for_session(_session: ConsoleSessionHandle) -> bool {
-        false
+    pub fn has_pending_input_for_session(session: ConsoleSessionHandle) -> bool {
+        crate::io::tty::has_pending_input_for_session(session)
     }
 
-    pub fn pending_input_len_for_session(_session: ConsoleSessionHandle) -> usize {
-        0
+    pub fn pending_input_len_for_session(session: ConsoleSessionHandle) -> usize {
+        crate::io::tty::pending_input_len_for_session(session)
     }
 
-    pub fn termios_for_session(_session: ConsoleSessionHandle) -> LinuxTermios {
-        LinuxTermios::default_console()
+    pub fn termios_for_session(session: ConsoleSessionHandle) -> LinuxTermios {
+        crate::io::tty::termios_for_session(session)
     }
 
     pub fn set_termios_for_session(
-        _session: ConsoleSessionHandle,
-        _termios: LinuxTermios,
-        _flush_input: bool,
+        session: ConsoleSessionHandle,
+        termios: LinuxTermios,
+        flush_input: bool,
     ) {
+        crate::io::tty::set_termios_for_session(session, termios, flush_input);
     }
 
-    pub fn write_to_session(_session: ConsoleSessionHandle, bytes: &[u8]) -> usize {
-        crate::io::console::write(bytes);
-        bytes.len()
+    pub fn write_to_session(session: ConsoleSessionHandle, bytes: &[u8]) -> usize {
+        crate::io::tty::write_to_session(session, bytes)
     }
 
-    pub fn read_input_for_session(_session: ConsoleSessionHandle, _dest: &mut [u8]) -> usize {
-        0
+    pub fn read_input_for_session(session: ConsoleSessionHandle, dest: &mut [u8]) -> usize {
+        crate::io::tty::read_input_for_session(session, dest)
     }
 
     pub fn read_input_blocking_for_session(
-        _session: ConsoleSessionHandle,
-        _dest: &mut [u8],
+        session: ConsoleSessionHandle,
+        dest: &mut [u8],
     ) -> usize {
-        0
+        crate::io::tty::read_input_blocking_for_session(session, dest)
     }
 }
 
@@ -472,19 +463,29 @@ pub mod io {
         pub fn flush_debug_console() {
             crate::io::gui::flush_debug_console();
         }
+
+        pub fn service_pending() -> usize {
+            crate::driver::virtio_gpu::service_pending()
+        }
     }
 }
 
 pub mod usb {
     pub fn debug_pointer_report_count() -> u64 {
-        0
+        crate::usb::debug_pointer_report_count()
     }
 
     pub fn debug_transfer_event_count() -> u64 {
-        0
+        crate::usb::debug_transfer_event_count()
     }
 
-    pub fn init() {}
+    pub fn init() {
+        crate::usb::init();
+    }
+
+    pub fn service_pending() -> usize {
+        crate::usb::service_pending()
+    }
 }
 
 pub mod vfs {

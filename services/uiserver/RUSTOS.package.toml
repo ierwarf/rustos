@@ -18,6 +18,6 @@ priority = -500
 
 [[desktop.entries]]
 display_name = "UI Server"
-weight_micros = 50
+weight_micros = 1000
 logical_admin = false
 console_hosted = false

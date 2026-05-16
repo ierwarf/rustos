@@ -5,11 +5,10 @@ use std::sync::OnceLock;
 
 const COPY_U32_AVX2_THRESHOLD: usize = 32;
 const BLEND_U32_AVX2_THRESHOLD: usize = 32;
-// Stability matters more than peak throughput here. Under heavy input on no-opt
-// builds, the custom AVX2 UI paths have been the most plausible source of
-// rendering corruption, so keep the scalar path until SIMD context handling is
-// proven end-to-end.
-const ENABLE_UI_SIMD_FAST_PATHS: bool = false;
+// The scheduler saves/restores XSAVE state and the boot probe exercises the
+// rendered framebuffer, so keep the wide UI row operations enabled for the
+// display hot path.
+const ENABLE_UI_SIMD_FAST_PATHS: bool = true;
 
 #[inline]
 pub(crate) fn copy_u32s(src: &[u32], dst: &mut [u32]) {

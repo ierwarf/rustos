@@ -31,7 +31,7 @@ const MAX_PROC_PREPARES: usize = 128;
 const MAX_MAPPINGS_PER_PREPARE: usize = 4096;
 const MAX_EXEC_TICKETS: usize = 128;
 const MAX_PROC_IMAGE_BLOB_BYTES: usize = 64 * 1024 * 1024;
-const FILE_COPY_CHUNK: usize = 4096;
+const FILE_COPY_CHUNK: usize = 64 * 1024;
 
 static NEXT_PREPARE_HANDLE: AtomicU64 = AtomicU64::new(1);
 static NEXT_EXEC_TICKET: AtomicU64 = AtomicU64::new(1);

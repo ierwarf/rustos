@@ -27,7 +27,7 @@ path = "services/example/example.elf"
 
 [[desktop.entries]]
 display_name = "example"
-weight_micros = 50
+weight_micros = 100
 console_hosted = false
 ```
 
@@ -121,7 +121,7 @@ path = "services/example/example.elf"
 
 [[desktop.entries]]
 display_name = "example"
-weight_micros = 50
+weight_micros = 100
 console_hosted = false
 ```
 

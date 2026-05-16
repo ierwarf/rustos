@@ -19,5 +19,5 @@ startup = "none"
 
 [[desktop.entries]]
 display_name = "WayClick"
-weight_micros = 50
+weight_micros = 100
 console_hosted = false

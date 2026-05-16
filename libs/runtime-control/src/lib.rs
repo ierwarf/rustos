@@ -24,7 +24,7 @@ const DESKTOP_FILE_ID_CAPACITY: usize = 48;
 const RUNNING_PROGRAM_NAME_CAPACITY: usize = 48;
 const PROGRAM_PATH_CAPACITY: usize = 64;
 const MAX_RUNTIME_PROGRAMS: usize = 64;
-const DEFAULT_WEIGHT_MICROS: u64 = 50;
+const DEFAULT_WEIGHT_MICROS: u64 = 100;
 const RPC_IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub const DEFAULT_RUNTIME_SOCKET_PATH: &str = "/run/runtimed.sock";
@@ -1016,7 +1016,7 @@ mod tests {
     #[test]
     fn parse_desktop_program_entry_reads_generated_metadata() {
         let entry = parse_desktop_program_entry(
-            "[Desktop Entry]\nType=Application\nName=WayClick\nExec=apps/wayclick/wayclick.elf\nTerminal=false\nOnlyShowIn=RustOS;\nX-RustOS-PackageId=wayclick\nX-RustOS-Startup=none\nX-RustOS-Deps=runtimed,sessiond\nX-RustOS-WeightMicros=50\nX-RustOS-LogicalAdmin=false\nX-RustOS-ConsoleHosted=false\nX-RustOS-Argv=apps/wayclick/wayclick.elf|--test\nX-RustOS-Env=A=1|B=2\n",
+            "[Desktop Entry]\nType=Application\nName=WayClick\nExec=apps/wayclick/wayclick.elf\nTerminal=false\nOnlyShowIn=RustOS;\nX-RustOS-PackageId=wayclick\nX-RustOS-Startup=none\nX-RustOS-Deps=runtimed,sessiond\nX-RustOS-WeightMicros=100\nX-RustOS-LogicalAdmin=false\nX-RustOS-ConsoleHosted=false\nX-RustOS-Argv=apps/wayclick/wayclick.elf|--test\nX-RustOS-Env=A=1|B=2\n",
             Path::new("/usr/share/applications/wayclick.desktop"),
             DesktopLoadMode::Applications,
         )

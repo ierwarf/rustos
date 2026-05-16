@@ -19,6 +19,6 @@ priority = -590
 
 [[desktop.entries]]
 display_name = "syscalld"
-weight_micros = 50
+weight_micros = 100
 logical_admin = true
 console_hosted = false

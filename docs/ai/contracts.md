@@ -95,6 +95,14 @@ Kernel/userspace ABI:
   access, DMA, or module-load substrate. Compile and QEMU verification can be
   deferred for tasks whose explicit goal is structural evacuation rather than
   bootability.
+- The target architecture is a hybrid kernel. Services own routing and policy,
+  but ring0 intentionally retains compatibility-critical mechanisms:
+  syscall/trap entry, gated syscall brokers, address-space mutation,
+  scheduler/task mutation, user-copy, IRQ/MMIO/DMA/IOMMU access, and
+  kernel-address-space `.ko` module execution. Do not describe the system as a
+  pure microkernel, and do not move `.ko` execution or syscall broker
+  primitives out of the kernel without a replacement that preserves native
+  Linux ELF and Windows PE behavior.
 - Device, console, and UI `repr(C)` structs and ioctl numbers must be defined
   in `rustos-user-abi`; services such as `uiserver` and `runtimed` should use
   that crate rather than duplicating request structs or ioctl encoding logic.
@@ -303,6 +311,38 @@ Kernel/userspace ABI:
   `drivers/libs/driver-abi::DisplayFramebufferRegistration`; do not infer
   primary display ownership from framebuffer geometry or from `display_info()`
   being present.
+- Display surface present is a kernel fast path: it copies validated shared
+  surface contents into the active framebuffer and queues virtio-gpu flush work
+  for the bounded housekeeping lower half. Do not reintroduce synchronous
+  virtio-gpu command waits into app syscall context for normal uiserver
+  presents.
+- Native virtio-gpu scanout backing is DMA memory and must be mapped
+  write-combining on the CPU side. Present latency regressions often show up as
+  slow `present_ms` in `uiserver`, so check the cache mode before changing UI
+  drawing code. The direct-map cache flag is level-specific: 2 MiB PDEs use PAT
+  bit 12, but split 4 KiB PTEs must use the PTE PAT selector bit instead of
+  carrying bit 12 into the physical address field.
+- `uiserver` partial dirty rects should stay split unless the merged union is
+  nearly as small as the separate areas. Over-coalescing disjoint topbar,
+  taskbar, and window updates turns small changes into large framebuffer copies
+  and delays input feedback.
+- User task weights are scheduler budgets in microseconds, not priorities.
+  The default runtime budget is 100 us; do not stage services/apps with 50 us
+  defaults unless a benchmark proves the interrupt/context-switch cost is
+  acceptable. Input/display responsiveness should come from bounded lower-half
+  work and explicit service readiness, not from 20 kHz user-task quanta.
+- CPU-bound display owners may have explicit larger budgets: `uiserver` gets a
+  longer render/present slice so large framebuffer copies are not preempted
+  every 100 us, and `runtimed` must pass manifest `weight_micros` through
+  `loaderd` instead of replacing it with the default. Do not raise early
+  broker/driver service budgets without a boot-time probe, because startup
+  concurrency can regress perceived boot time.
+- Init-time user services are ordered for perceived boot readiness: driver and
+  input policy services should start before runtime UI launchers. `runtimed`
+  depends on `netd` for its runtime control socket and waits for the `devmgrd`
+  endpoint before UI bootstrap because display ioctl policy routes there.
+  After `runtimed` is launched, defer secondary storage policy briefly so it
+  does not contend with display bring-up.
 
 Kernel API:
 
@@ -386,6 +426,11 @@ Linux network and driver compat:
   in `netd`, module/provider policy lives in `driverd`, and the kernel
   `kernel/io-manager/src/driver/mod.rs` surface is limited to privileged DMA,
   IRQ, IOMMU, and MMIO primitives plus explicit module-load substrate hooks.
+- `driverd` selects autoload/provider policy from staged registries and calls
+  the gated driver broker. The kernel broker owns only the privileged module
+  loader and driver ABI substrate: validating `.ko` images, relocating them,
+  exposing `DriverKernelApiV1`, mapping MMIO, and executing module init in the
+  kernel address space when the module ABI requires it.
 - Deleted io-manager VFS/network/USB/input/provider policy files are not source
   of truth. Do not restore them to make `.ko` loading or Linux socket behavior
   appear to work; add service-owned policy and narrow privileged brokers.

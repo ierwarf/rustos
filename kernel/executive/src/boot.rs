@@ -393,6 +393,12 @@ pub fn housekeeping_once() -> usize {
     trace_service_phase("tty");
     work += io_services::input_service_pending();
 
+    trace_service_phase("usb");
+    work += io_services::usb_service_pending();
+
+    trace_service_phase("display");
+    work += io_services::display_service_pending();
+
     trace_service_phase("reap");
     work += ps_api::service_deferred_work();
 

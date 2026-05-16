@@ -13,8 +13,8 @@ use crate::Result;
 use crate::config::Config;
 use crate::util::{create_temp_dir, env_string, read_trimmed, resolve_command_path};
 
-const DEFAULT_QEMU_DISPLAY_WIDTH: u32 = 3840;
-const DEFAULT_QEMU_DISPLAY_HEIGHT: u32 = 2160;
+const DEFAULT_QEMU_DISPLAY_WIDTH: u32 = 1600;
+const DEFAULT_QEMU_DISPLAY_HEIGHT: u32 = 900;
 
 struct RunOptions {
     profile: String,
@@ -1500,6 +1500,18 @@ fn run_display_probe(config: &Config, options: RunOptions) -> Result<()> {
                 Some("usbtablet")
             },
         )?;
+        if !prepared.usb_args.is_empty() {
+            wait_for_boot_marker(
+                &debugcon_log,
+                &["input: pointer event delivered"],
+                PROBE_QMP_TIMEOUT,
+            )?;
+            wait_for_boot_marker(
+                &debugcon_log,
+                &["uiserver: pointer moved"],
+                PROBE_QMP_TIMEOUT,
+            )?;
+        }
 
         let stressed_dump = prepared.session.temp_dir.join("probe-stressed.ppm");
         qmp_screendump(&mut qmp, &stressed_dump)?;

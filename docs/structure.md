@@ -55,6 +55,12 @@ are enforced by `cargo xtask check`.
   `kernel/nucleus-core`, `kernel/lowlevel`, `kernel/hal`, `kernel/mm`,
   `kernel/object`, `kernel/ipc-runtime`, `kernel/ps`, `kernel/io-manager`,
   `kernel/compat`, and `kernel/executive`.
+- RustOS is a hybrid kernel, not a pure microkernel. Policy and namespace
+  decisions should move to services such as `driverd`, `syscalld`, `vfsd`, and
+  `loaderd`, but privileged mechanisms stay in ring0 when native compatibility
+  requires them. This includes syscall entry/trap handling, gated syscall
+  brokers, address-space mutation, scheduler state, user-copy operations,
+  IRQ/MMIO/DMA/IOMMU access, and kernel-address-space `.ko` module execution.
 - Kernel-internal crate dependencies must not flow from lower layers back into
   higher layers. `cargo xtask check` validates these relationships.
 - `libs/` may depend only on boot protocol crates and other `libs/` crates.
@@ -159,6 +165,12 @@ source directories.
   `kernel/nucleus-core`, `kernel/lowlevel`, `kernel/hal`, `kernel/mm`,
   `kernel/object`, `kernel/ipc-runtime`, `kernel/ps`, `kernel/io-manager`,
   `kernel/compat`, `kernel/executive`로 나눕니다.
+- RustOS는 순수 microkernel이 아니라 hybrid kernel입니다. 정책과 namespace
+  결정은 `driverd`, `syscalld`, `vfsd`, `loaderd` 같은 service로 옮기되,
+  native compatibility에 필요한 privileged mechanism은 ring0에 남깁니다.
+  여기에는 syscall entry/trap 처리, gated syscall broker, address-space
+  mutation, scheduler state, user-copy, IRQ/MMIO/DMA/IOMMU 접근,
+  kernel-address-space `.ko` module 실행이 포함됩니다.
 - kernel 내부 crate dependency는 낮은 계층에서 높은 계층으로 역류하면
   안 됩니다. `cargo xtask check`가 이 관계를 검사합니다.
 - `libs/`는 boot protocol crate와 다른 `libs/` crate에만 의존할 수

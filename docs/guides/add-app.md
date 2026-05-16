@@ -39,7 +39,7 @@ path = "apps/example-app/example-app.elf"
 
 [[desktop.entries]]
 display_name = "Example App"
-weight_micros = 50
+weight_micros = 100
 console_hosted = false
 ```
 
@@ -86,7 +86,7 @@ path = "apps/example-app/example-app.elf"
 
 [[desktop.entries]]
 display_name = "Example App"
-weight_micros = 50
+weight_micros = 100
 console_hosted = false
 ```
 

@@ -37,6 +37,9 @@ pub(super) fn linux_errno(errno: i64) -> u64 {
 
 #[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code, unused_variables))]
 pub(super) fn debug_log_secondary_linux_syscall(frame: &SyscallFrame) {
+    if !debug::enabled!(compat, debug) {
+        return;
+    }
     let snapshot = multitask::current_user_snapshot();
     let pid = snapshot.map(|user| user.thread_id()).unwrap_or(0);
     if pid < 7 {

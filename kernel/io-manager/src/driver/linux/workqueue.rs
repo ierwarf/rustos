@@ -86,7 +86,7 @@ pub(crate) unsafe extern "C" fn alloc_workqueue(
     flags: u32,
     max_active: i32,
 ) -> *mut c_void {
-    crate::debug::write_debugcon_only_line(
+    super::compat_log::debugcon_line(
         alloc::format!(
             "linux alloc_workqueue: begin fmt={:#x} flags={:#x} max_active={}",
             _fmt as usize,
@@ -101,14 +101,14 @@ pub(crate) unsafe extern "C" fn alloc_workqueue(
         max_active,
     });
     let ptr = Box::into_raw(wq);
-    crate::debug::write_debugcon_only_line(
+    super::compat_log::debugcon_line(
         alloc::format!("linux alloc_workqueue: boxed ptr={:#x}", ptr as usize).as_bytes(),
     );
-    crate::debug::write_debugcon_only_line(b"linux alloc_workqueue: workqueues lock begin");
+    super::compat_log::debugcon_line(b"linux alloc_workqueue: workqueues lock begin");
     let mut workqueues = WORKQUEUES.lock();
-    crate::debug::write_debugcon_only_line(b"linux alloc_workqueue: workqueues lock acquired");
+    super::compat_log::debugcon_line(b"linux alloc_workqueue: workqueues lock acquired");
     workqueues.push(WorkqueueRecord { ptr: ptr as usize });
-    crate::debug::write_debugcon_only_line(
+    super::compat_log::debugcon_line(
         alloc::format!(
             "linux alloc_workqueue: workqueues push done len={}",
             workqueues.len()
@@ -116,8 +116,8 @@ pub(crate) unsafe extern "C" fn alloc_workqueue(
         .as_bytes(),
     );
     drop(workqueues);
-    crate::debug::write_debugcon_only_line(b"linux alloc_workqueue: workqueues lock released");
-    crate::debug::write_debugcon_only_line(
+    super::compat_log::debugcon_line(b"linux alloc_workqueue: workqueues lock released");
+    super::compat_log::debugcon_line(
         alloc::format!(
             "linux alloc_workqueue: ptr={:#x} flags={:#x} max_active={}",
             ptr as usize,

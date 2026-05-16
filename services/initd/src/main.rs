@@ -12,9 +12,9 @@ use runtime_control::{
 };
 use rustos_user_abi::syscall::{
     LoaderSpawnRequest, LoaderSpawnResponse, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD,
-    IPC_SERVICE_VFSD, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
-    LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, SYS_RUSTOS_IPC_CALL,
-    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
+    IPC_SERVICE_NETD, IPC_SERVICE_VFSD, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION,
+    LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY,
+    SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
 };
 
 const INITD_EXEC_PATH: &str = "services/initd/initd.elf";
@@ -27,8 +27,9 @@ const LOADERD_EXEC_PATH: &str = "services/loaderd/loaderd.elf";
 const RUNTIMED_EXEC_PATH: &str = "services/runtimed/runtimed.elf";
 const STORAGED_EXEC_PATH: &str = "services/storaged/storaged.elf";
 const INPUTD_EXEC_PATH: &str = "services/inputd/inputd.elf";
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
-const RETRY_BACKOFF: Duration = Duration::from_secs(1);
+const POLL_INTERVAL: Duration = Duration::from_millis(2);
+const RETRY_BACKOFF: Duration = Duration::from_millis(50);
+const SECONDARY_SERVICE_DEFER_AFTER_RUNTIMED: Duration = Duration::from_millis(0);
 static LOADER_ENDPOINT_CACHE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,17 +65,18 @@ fn main() {
     let mut running = BTreeMap::<i32, RunningService>::new();
     let mut launched_once_packages = BTreeSet::new();
     let mut retry_after = BTreeMap::<String, Instant>::new();
+    let mut defer_secondary_services_until = None::<Instant>;
 
     loop {
         reap_children(&mut running, &mut retry_after);
 
-        let running_packages = running
+        let mut running_packages = running
             .values()
             .map(|service| service.package_id.clone())
             .collect::<BTreeSet<_>>();
         let now = Instant::now();
         let mut launched_this_round = false;
-        for entry in startup_entries.clone() {
+        for entry in startup_entries.iter() {
             if !runtime_deps_satisfied(
                 &entry.runtime_deps,
                 &running_packages,
@@ -83,6 +85,10 @@ fn main() {
                 continue;
             }
             if !launch_gate_satisfied(entry.exec.as_str()) {
+                continue;
+            }
+            if secondary_service_deferred(entry.exec.as_str(), now, defer_secondary_services_until)
+            {
                 continue;
             }
 
@@ -119,12 +125,18 @@ fn main() {
                             restart: entry.restart,
                         },
                     );
+                    running_packages.insert(entry.package_id.clone());
                     retry_after.remove(entry.exec.as_str());
                     if !entry.restart {
-                        launched_once_packages.insert(entry.package_id);
+                        launched_once_packages.insert(entry.package_id.clone());
+                    }
+                    if entry.exec == RUNTIMED_EXEC_PATH
+                        && !SECONDARY_SERVICE_DEFER_AFTER_RUNTIMED.is_zero()
+                    {
+                        defer_secondary_services_until =
+                            Some(Instant::now() + SECONDARY_SERVICE_DEFER_AFTER_RUNTIMED);
                     }
                     launched_this_round = true;
-                    break;
                 }
                 Err(err) => {
                     observability_client::error!(
@@ -133,7 +145,8 @@ fn main() {
                         "launch {} failed: errno={err}",
                         entry.exec
                     );
-                    retry_after.insert(entry.exec, Instant::now() + RETRY_BACKOFF);
+                    retry_after
+                        .insert(entry.exec.clone(), Instant::now() + RETRY_BACKOFF);
                 }
             }
         }
@@ -144,6 +157,10 @@ fn main() {
         }
         thread::sleep(POLL_INTERVAL);
     }
+}
+
+fn secondary_service_deferred(exec: &str, now: Instant, deadline: Option<Instant>) -> bool {
+    exec == STORAGED_EXEC_PATH && deadline.is_some_and(|defer_until| now < defer_until)
 }
 
 fn load_init_entries() -> Vec<StartupLaunchEntry> {
@@ -187,12 +204,12 @@ fn init_exec_priority(exec: &str) -> u8 {
         SYSCALLD_EXEC_PATH => 0,
         VFSD_EXEC_PATH => 1,
         LOADERD_EXEC_PATH => 2,
-        NETD_EXEC_PATH => 3,
-        DEVMGRD_EXEC_PATH => 4,
-        DRIVERD_EXEC_PATH => 5,
+        DRIVERD_EXEC_PATH => 3,
+        NETD_EXEC_PATH => 4,
+        INPUTD_EXEC_PATH => 5,
         RUNTIMED_EXEC_PATH => 6,
-        STORAGED_EXEC_PATH => 7,
-        INPUTD_EXEC_PATH => 8,
+        DEVMGRD_EXEC_PATH => 7,
+        STORAGED_EXEC_PATH => 8,
         _ => 9,
     }
 }
@@ -203,8 +220,6 @@ fn launch_gate_satisfied(exec: &str) -> bool {
         LOADERD_EXEC_PATH => {
             service_ready(IPC_SERVICE_LINUX_SYSCALLD) && service_ready(IPC_SERVICE_VFSD)
         }
-        NETD_EXEC_PATH | DEVMGRD_EXEC_PATH | DRIVERD_EXEC_PATH | STORAGED_EXEC_PATH
-        | INPUTD_EXEC_PATH => foundation_policy_services_ready(),
         _ => foundation_policy_services_ready(),
     }
 }
@@ -397,7 +412,7 @@ fn lookup_loader_endpoint() -> Result<u64, i32> {
 
 fn exec_weight_micros(exec_path: &str) -> u64 {
     let _ = exec_path;
-    50
+    100
 }
 
 fn last_errno() -> i32 {

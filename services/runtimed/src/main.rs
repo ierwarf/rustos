@@ -20,17 +20,21 @@ use rustos_user_abi::console::{
     ConsoleSetFocusRequest, ConsoleSetSessionStateRequest,
 };
 use rustos_user_abi::syscall::{
-    LoaderSpawnRequest, LoaderSpawnResponse, IPC_SERVICE_LOADERD, LOADER_OP_SPAWN_EXEC,
-    LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES,
-    LOADER_SPAWN_EXEC_PATH_CAPACITY, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
+    LoaderSpawnRequest, LoaderSpawnResponse, IPC_SERVICE_DEVMGRD, IPC_SERVICE_LOADERD,
+    LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
+    LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, SYS_RUSTOS_IPC_CALL,
+    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
 };
 
-const DEFAULT_USER_TASK_WEIGHT_MICROS: u64 = 50;
-const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(5);
-const RETRY_BACKOFF: Duration = Duration::from_secs(1);
+const DEFAULT_USER_TASK_WEIGHT_MICROS: u64 = 100;
+const UI_SERVER_TASK_WEIGHT_MICROS: u64 = 1000;
+const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(2);
+const RETRY_BACKOFF: Duration = Duration::from_millis(100);
 const SERVICE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const DEVICE_POLICY_READY_TIMEOUT: Duration = Duration::from_secs(5);
+const DEVICE_POLICY_READY_POLL: Duration = Duration::from_millis(1);
 const MAX_RUNTIME_CLIENTS_PER_TICK: usize = 8;
-const MAX_POLICY_LAUNCH_ATTEMPTS_PER_TICK: usize = 1;
+const MAX_POLICY_LAUNCH_ATTEMPTS_PER_TICK: usize = 4;
 const PROTOCOL_VERSION: u16 = 1;
 const OP_SNAPSHOT_RUNNING_PROGRAMS: u16 = 1;
 const OP_REQUEST_LAUNCH_PATH: u16 = 2;
@@ -183,6 +187,12 @@ fn main() {
         ui_ready: false,
         launch_catalog_loaded: false,
     };
+    // Don't gate uiserver bootstrap on devmgrd being fully online. The uiserver
+    // opens device handles itself and will retry/wait inside its own init loop.
+    // Blocking here serialises devmgrd's glibc bring-up with uiserver's, adding
+    // 2-3 seconds to boot for no functional benefit.
+    let _device_policy_ready =
+        wait_for_service_endpoint(IPC_SERVICE_DEVMGRD, DEVICE_POLICY_READY_TIMEOUT);
     stderr_line("runtimed: bootstrap ui begin");
     boot_line("runtimed: bootstrap ui begin");
     if let Err(err) = bootstrap_ui_server(&mut state) {
@@ -254,7 +264,7 @@ fn bootstrap_ui_server(state: &mut BrokerState) -> Result<(), i32> {
             exec: String::from(UI_SERVER_EXEC_PATH),
             runtime_deps: Vec::new(),
             restart: true,
-            weight_micros: DEFAULT_USER_TASK_WEIGHT_MICROS,
+            weight_micros: UI_SERVER_TASK_WEIGHT_MICROS,
             logical_admin: false,
             console_hosted: false,
             args: Vec::new(),
@@ -769,6 +779,7 @@ fn spawn_tracked_process(state: &mut BrokerState, entry: LaunchEntry) -> Result<
         entry.args.as_slice(),
         entry.env.as_slice(),
         entry.logical_admin,
+        entry.weight_micros,
         session_handle.unwrap_or(0),
     ) {
         Ok(pid) => pid,
@@ -878,6 +889,7 @@ fn spawn_exec(
     argv: &[String],
     env: &[String],
     logical_admin: bool,
+    weight_micros: u64,
     session_handle: u64,
 ) -> Result<i32, i32> {
     boot_line(format!("runtimed: loader request begin exec={}", exec_path).as_str());
@@ -888,6 +900,7 @@ fn spawn_exec(
         &argv_storage,
         &env_storage,
         logical_admin,
+        weight_micros,
         session_handle,
     )?;
     let endpoint = lookup_loader_endpoint()?;
@@ -933,6 +946,7 @@ fn build_loader_spawn_request(
     argv: &[CString],
     env: &[CString],
     logical_admin: bool,
+    weight_micros: u64,
     session_handle: u64,
 ) -> Result<LoaderSpawnRequest, i32> {
     let exec_bytes = exec_path.as_bytes();
@@ -947,7 +961,7 @@ fn build_loader_spawn_request(
         op: LOADER_OP_SPAWN_EXEC,
         flags: u32::from(logical_admin),
         console_session: session_handle,
-        weight_micros: DEFAULT_USER_TASK_WEIGHT_MICROS,
+        weight_micros: effective_task_weight_micros(weight_micros),
         exec_path_len: exec_bytes.len() as u32,
         argv_count: u16::try_from(argv.len()).map_err(|_| libc::E2BIG)?,
         env_count: u16::try_from(env.len()).map_err(|_| libc::E2BIG)?,
@@ -978,17 +992,42 @@ fn copy_cstring_blob(values: &[CString], dest: &mut [u8], capacity: usize) -> Re
     u32::try_from(offset).map_err(|_| libc::E2BIG)
 }
 
+fn effective_task_weight_micros(weight_micros: u64) -> u64 {
+    if weight_micros == 0 {
+        DEFAULT_USER_TASK_WEIGHT_MICROS
+    } else {
+        weight_micros
+    }
+}
+
+fn wait_for_service_endpoint(service_id: u64, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if lookup_service_endpoint(service_id) > 0 {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(DEVICE_POLICY_READY_POLL);
+    }
+}
+
+fn lookup_service_endpoint(service_id: u64) -> i64 {
+    unsafe {
+        libc::syscall(
+            SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT as libc::c_long,
+            service_id,
+        ) as i64
+    }
+}
+
 fn lookup_loader_endpoint() -> Result<u64, i32> {
     let cached = LOADER_ENDPOINT_CACHE.load(Ordering::Relaxed);
     if cached != 0 {
         return Ok(cached);
     }
-    let endpoint = unsafe {
-        libc::syscall(
-            SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT as libc::c_long,
-            IPC_SERVICE_LOADERD,
-        ) as i64
-    };
+    let endpoint = lookup_service_endpoint(IPC_SERVICE_LOADERD);
     if endpoint < 0 {
         return Err((-endpoint) as i32);
     }

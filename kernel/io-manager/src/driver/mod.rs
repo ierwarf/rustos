@@ -1,5 +1,15 @@
 mod bus;
 mod class;
+mod devres;
+mod export;
+pub mod input;
+mod kernel_api;
+pub mod linux;
+mod loader;
+mod module_registry;
+pub mod pci;
+pub mod serio;
+pub mod virtio_gpu;
 
 // Kernel driver role: privileged DMA/MMIO/IRQ substrate and narrow broker hooks.
 // Driver/provider policy belongs in driverd/devmgrd. Driver-domain isolation is
@@ -9,6 +19,7 @@ pub mod iommu;
 pub mod irq;
 pub mod mmio;
 
+use alloc::string::ToString;
 use driver_abi::{DriverBus, DriverClass};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,8 +46,22 @@ const PCI_DEVICE_VIRTIO_GPU_TRANSITIONAL: u16 = 0x1010;
 const PCI_DEVICE_VIRTIO_MODERN_BASE: u16 = 0x1040;
 const PCI_DEVICE_VIRTIO_MODERN_END: u16 = 0x107f;
 
+pub(crate) fn exported_kernel_api() -> *const driver_abi::DriverKernelApiV1 {
+    kernel_api::exported_kernel_api()
+}
+
+pub(crate) fn runtime_executable_addr_is_known(addr: usize) -> bool {
+    loader::runtime_executable_addr_is_known(addr)
+}
+
 pub fn initialize_loadable_modules_for_class(class: DriverClass) -> bool {
     class::is_supported(class)
+}
+
+pub(crate) fn register_kernel_builtin(name: &'static str, class: DriverClass, bus: DriverBus) {
+    debug_assert!(class::is_supported(class));
+    debug_assert!(bus::is_supported(bus));
+    let _ = name;
 }
 
 pub fn load_module_image_from_policy(
@@ -56,18 +81,27 @@ pub fn load_module_image_from_policy(
         return Err(DriverLoadError::UnsupportedTopology);
     }
 
-    if name == BOOTFB_DRIVER_NAME
-        && class == DriverClass::Display
-        && bus == DriverBus::Platform
-        && image_path == BOOTFB_DRIVER_MODULE_PATH
-        && (linux_driver_names.is_empty() || linux_driver_names == BOOTFB_DRIVER_NAME)
-    {
-        return load_boot_framebuffer_provider();
+    let name = leak_policy_text(name)?;
+    let image_path = leak_policy_text(image_path)?;
+    let linux_driver_names = leak_policy_text(linux_driver_names)?;
+    match loader::load_module_image_explicit(name, class, bus, image_path, linux_driver_names) {
+        Ok(_) => {
+            if class == DriverClass::Display && bus == DriverBus::Virtio {
+                let _ = virtio_gpu::try_enable_primary_display();
+            }
+            Ok(())
+        }
+        Err(_)
+            if name == BOOTFB_DRIVER_NAME
+                && class == DriverClass::Display
+                && bus == DriverBus::Platform
+                && image_path == BOOTFB_DRIVER_MODULE_PATH
+                && (linux_driver_names.is_empty() || linux_driver_names == BOOTFB_DRIVER_NAME) =>
+        {
+            load_boot_framebuffer_provider()
+        }
+        Err(_) => Err(DriverLoadError::LoaderFailed),
     }
-
-    // No kernel-side loader exists for this module in the current architecture;
-    // a user-space driver host is expected to provide it in the future.
-    Err(DriverLoadError::LoaderUnimplemented)
 }
 
 pub fn device_alias_present_from_policy(alias: &str, class: u32, bus: u32) -> bool {
@@ -85,6 +119,8 @@ pub fn device_alias_present_from_policy(alias: &str, class: u32, bus: u32) -> bo
         }
         DriverBus::Pci => pci_alias_present(alias),
         DriverBus::Virtio => virtio_alias_present(alias),
+        DriverBus::Usb => usb_alias_present(alias, class),
+        DriverBus::Serio => serio_alias_present(alias),
         _ => false,
     }
 }
@@ -104,6 +140,16 @@ fn load_boot_framebuffer_provider() -> Result<(), DriverLoadError> {
     } else {
         Err(DriverLoadError::LoaderFailed)
     }
+}
+
+fn leak_policy_text(value: &str) -> Result<&'static str, DriverLoadError> {
+    if value
+        .bytes()
+        .any(|byte| byte == b'\0' || byte == b'\n' || byte == b'\r')
+    {
+        return Err(DriverLoadError::UnsupportedTopology);
+    }
+    Ok(alloc::boxed::Box::leak(value.to_string().into_boxed_str()))
 }
 
 fn decode_class(value: u32) -> Option<DriverClass> {
@@ -160,6 +206,22 @@ fn virtio_alias_present(alias: &str) -> bool {
         present
     });
     present
+}
+
+fn usb_alias_present(alias: &str, class: DriverClass) -> bool {
+    if alias.starts_with("usb:") {
+        return class == DriverClass::Input
+            && (crate::usb::hid_interfaces_available()
+                || crate::usb::host_controllers_available());
+    }
+    if alias.starts_with("hid:") {
+        return class == DriverClass::Input && crate::usb::hid_interfaces_available();
+    }
+    false
+}
+
+fn serio_alias_present(alias: &str) -> bool {
+    alias.starts_with("serio:") && serio::ports_available()
 }
 
 fn pci_alias_matches(alias: &str, pci: crate::arch::pci::PciDevice) -> bool {

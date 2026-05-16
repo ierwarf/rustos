@@ -45,8 +45,11 @@ const DT_RELASZ: i64 = 8;
 const DT_RELAENT: i64 = 9;
 const R_X86_64_RELATIVE: u32 = 8;
 
-// 2 MiB huge-page PDE uses bit 12 as the PAT selector bit.
+// 2 MiB huge-page PDE uses bit 12 as the PAT selector bit. For 4 KiB PTEs the
+// PAT selector lives at bit 7, so direct-map code must translate this abstract
+// write-combine flag when it splits a huge mapping into leaf pages.
 pub const WRITE_COMBINE_BIT: PageTableFlags = PageTableFlags::from_bits_retain(1 << 12);
+const WRITE_COMBINE_PAGE_BIT: PageTableFlags = PageTableFlags::HUGE_PAGE;
 const MMIO_UNCACHED_FLAGS: PageTableFlags = PageTableFlags::NO_CACHE;
 const MMIO_WRITE_COMBINE_FLAGS: PageTableFlags = WRITE_COMBINE_BIT;
 
@@ -350,7 +353,7 @@ impl<const SIZE_GB: usize> PML4<SIZE_GB> {
             }
             (
                 entry.addr().as_u64(),
-                entry.flags() & !PageTableFlags::HUGE_PAGE,
+                Self::direct_map_page_flags(entry.flags() & !PageTableFlags::HUGE_PAGE),
             )
         };
 
@@ -404,8 +407,8 @@ impl<const SIZE_GB: usize> PML4<SIZE_GB> {
                 let entry = self.pd_entry_mut(block_index);
                 if !entry.is_unused() && entry.flags().contains(PageTableFlags::HUGE_PAGE) {
                     let mut flags = entry.flags();
-                    flags.remove(remove_flags);
-                    flags |= add_flags | PageTableFlags::HUGE_PAGE;
+                    flags.remove(Self::direct_map_huge_flags(remove_flags));
+                    flags |= Self::direct_map_huge_flags(add_flags) | PageTableFlags::HUGE_PAGE;
                     entry.set_addr(entry.addr(), flags);
                     Self::flush_block(block_index);
                     page_phys = block_end;
@@ -419,8 +422,8 @@ impl<const SIZE_GB: usize> PML4<SIZE_GB> {
                 .ok_or("direct-map split table budget exhausted")?;
             let entry = &mut table[page_index];
             let mut flags = entry.flags();
-            flags.remove(remove_flags | PageTableFlags::HUGE_PAGE);
-            flags |= add_flags;
+            flags.remove(Self::direct_map_page_flags(remove_flags));
+            flags |= Self::direct_map_page_flags(add_flags);
             entry.set_addr(entry.addr(), flags);
             Self::flush_direct_map_page(page_phys);
             page_phys += PAGE_4KIB;
@@ -450,6 +453,18 @@ impl<const SIZE_GB: usize> PML4<SIZE_GB> {
             return None;
         }
         Some(page.flags())
+    }
+
+    fn direct_map_huge_flags(flags: PageTableFlags) -> PageTableFlags {
+        flags
+    }
+
+    fn direct_map_page_flags(mut flags: PageTableFlags) -> PageTableFlags {
+        if flags.contains(WRITE_COMBINE_BIT) {
+            flags.remove(WRITE_COMBINE_BIT);
+            flags |= WRITE_COMBINE_PAGE_BIT;
+        }
+        flags
     }
 
     fn protect_loaded_kernel_image(

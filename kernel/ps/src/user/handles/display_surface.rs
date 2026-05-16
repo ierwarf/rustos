@@ -1,4 +1,4 @@
-use crate::ipc::KernelSharedRegionHandle;
+use crate::ipc::{self, KernelSharedRegionHandle};
 use crate::memory::paging::UserRegion;
 use crate::user::abi::device::PIXEL_FORMAT_BGRA8888;
 
@@ -19,6 +19,11 @@ pub struct DisplaySurfaceHandle {
     frame_len: u64,
     mapping_len: u64,
     shared_region: Option<KernelSharedRegionHandle>,
+    /// Cached higher-half kernel virtual address of `shared_region`'s backing
+    /// memory, populated by [`Self::set_shared_region`]. Avoids re-acquiring
+    /// the global IPC objects lock (with interrupts disabled) on every present.
+    shared_region_kernel_addr: u64,
+    shared_region_kernel_len: u64,
     mapped_region: Option<UserRegion>,
 }
 
@@ -52,6 +57,8 @@ impl DisplaySurfaceHandle {
             frame_len,
             mapping_len,
             shared_region: None,
+            shared_region_kernel_addr: 0,
+            shared_region_kernel_len: 0,
             mapped_region: None,
         })
     }
@@ -96,8 +103,32 @@ impl DisplaySurfaceHandle {
         self.shared_region
     }
 
+    /// Returns the cached `(pointer, len)` for the surface's shared backing
+    /// memory. Populated by [`Self::set_shared_region`]. The pointer is valid
+    /// for the lifetime of the surface — shared regions are pinned to fixed
+    /// physical frames at creation time.
+    pub fn shared_region_kernel_mapping(self) -> Option<(*mut u8, usize)> {
+        if self.shared_region.is_none() || self.shared_region_kernel_addr == 0 {
+            return None;
+        }
+        Some((
+            self.shared_region_kernel_addr as *mut u8,
+            self.shared_region_kernel_len as usize,
+        ))
+    }
+
     pub fn set_shared_region(&mut self, region: KernelSharedRegionHandle) {
         self.shared_region = Some(region);
+        // Cache the kernel-side virtual mapping once so per-present code paths
+        // never need to touch the global IPC objects lock. Falling back to
+        // a zero address forces callers down the slow lookup path.
+        if let Some((ptr, len)) = ipc::map_shared_region(region) {
+            self.shared_region_kernel_addr = ptr as u64;
+            self.shared_region_kernel_len = len as u64;
+        } else {
+            self.shared_region_kernel_addr = 0;
+            self.shared_region_kernel_len = 0;
+        }
     }
 
     pub fn set_mapped_region(&mut self, region: UserRegion) {

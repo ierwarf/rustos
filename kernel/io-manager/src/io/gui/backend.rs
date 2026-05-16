@@ -140,6 +140,9 @@ pub(crate) fn present_bgra8888_from_user(
             height,
         },
     )?;
+    if presented {
+        crate::driver::virtio_gpu::queue_primary_flush();
+    }
     Ok(presented)
 }
 
@@ -192,6 +195,14 @@ pub(crate) fn present_bgra8888_rect_from_user(
         stride_bytes,
         rect,
     )?;
+    if presented {
+        crate::driver::virtio_gpu::queue_primary_flush_rect(
+            rect.x as u32,
+            rect.y as u32,
+            rect.width as u32,
+            rect.height as u32,
+        );
+    }
     Ok(presented)
 }
 
@@ -357,6 +368,9 @@ pub(crate) fn present_bgra8888_from_kernel(
             false
         })
         .unwrap_or(false);
+    if presented {
+        crate::driver::virtio_gpu::queue_primary_flush();
+    }
     presented
 }
 
@@ -389,6 +403,14 @@ pub(crate) fn present_bgra8888_rect_from_kernel(
             false
         })
         .unwrap_or(false);
+    if presented {
+        crate::driver::virtio_gpu::queue_primary_flush_rect(
+            rect.x as u32,
+            rect.y as u32,
+            rect.width as u32,
+            rect.height as u32,
+        );
+    }
     presented
 }
 

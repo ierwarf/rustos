@@ -20,6 +20,8 @@ use lifecycle_broker_ops::*;
 use net_broker_ops::*;
 use storage_broker_ops::*;
 
+pub(super) use device_broker_ops::device_sysop_error_to_linux_errno;
+
 pub(super) fn is_linux_rustos_broker_syscall(syscall_number: u64) -> bool {
     matches!(
         syscall_number,

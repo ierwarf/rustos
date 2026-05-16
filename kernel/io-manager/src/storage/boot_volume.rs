@@ -27,7 +27,9 @@ pub type PhysicalBootBlockDeviceOpener =
 
 type BootVolumeFs = fat::MountedFatVolume<Box<dyn BlockDevice>>;
 type BootVolumeFileInner<'a> = storage_fat::FatFile<'a, Box<dyn BlockDevice>>;
-const BOOT_VOLUME_READ_CHUNK_CAP: usize = 4 * 1024;
+const BOOT_VOLUME_READ_CHUNK_CAP: usize = 64 * 1024;
+
+static CACHED_BOOT_VOLUME_FS: Mutex<Option<BootVolumeFs>> = Mutex::new(None);
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,11 +52,12 @@ impl BootstrapPhase {
 }
 
 fn should_trace_boot_path(path: &str) -> bool {
-    path.contains("services/")
-        || path.starts_with("lib/")
-        || path.starts_with("/lib/")
-        || path.starts_with("lib64/")
-        || path.starts_with("/lib64/")
+    crate::debug::enabled!(storage, debug)
+        && (path.contains("services/")
+            || path.starts_with("lib/")
+            || path.starts_with("/lib/")
+            || path.starts_with("lib64/")
+            || path.starts_with("/lib64/"))
 }
 
 #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
@@ -450,7 +453,7 @@ pub fn read_bootstrap_file_to_vec(
         crate::debug::println!("boot volume helper: read_file_to_vec begin path={}", path);
     }
     ensure_bootstrap_fs_access(path)?;
-    with_open_boot_volume(|volume| volume.read_file_to_vec(path))
+    with_open_boot_volume(|fs| fs.read_file_to_vec(path))
 }
 
 pub fn read_file_to_vec(path: &str) -> core::result::Result<Vec<u8>, fatfs::Error<DiskIoError>> {
@@ -460,7 +463,7 @@ pub fn read_file_to_vec(path: &str) -> core::result::Result<Vec<u8>, fatfs::Erro
             path
         );
     }
-    with_open_boot_volume(|volume| volume.read_file_to_vec(path))
+    with_open_boot_volume(|fs| fs.read_file_to_vec(path))
 }
 
 pub fn read_file_into(
@@ -474,14 +477,14 @@ pub fn read_file_into(
             dest.len()
         );
     }
-    with_open_boot_volume(|volume| volume.read_file_into(path, dest))
+    with_open_boot_volume(|fs| fs.read_file_into(path, dest))
 }
 
 pub fn metadata(path: &str) -> core::result::Result<BootVolumeMetadata, fatfs::Error<DiskIoError>> {
     if should_trace_boot_path(path) {
         crate::debug::println!("boot volume helper: metadata begin path={}", path);
     }
-    with_open_boot_volume(|volume| volume.metadata(path))
+    with_open_boot_volume(|fs| fs.metadata(path))
 }
 
 pub fn read_dir(
@@ -490,24 +493,41 @@ pub fn read_dir(
     if should_trace_boot_path(path) {
         crate::debug::println!("boot volume helper: read_dir begin path={}", path);
     }
-    with_open_boot_volume(|volume| volume.read_dir(path))
+    with_open_boot_volume(|fs| fs.read_dir(path))
 }
 
 fn with_open_boot_volume<T>(
-    f: impl FnOnce(&BootVolume) -> core::result::Result<T, fatfs::Error<DiskIoError>>,
+    f: impl FnOnce(&BootVolumeFs) -> core::result::Result<T, fatfs::Error<DiskIoError>>,
 ) -> core::result::Result<T, fatfs::Error<DiskIoError>> {
-    crate::debug::println!("boot volume helper: open begin");
-    let volume = BootVolume::open()?;
-    crate::debug::println!("boot volume helper: open done");
-    let result = f(&volume);
-    crate::debug::println!("boot volume helper: callback done ok={}", result.is_ok());
-    let close_result = volume.close();
-    crate::debug::println!("boot volume helper: close done ok={}", close_result.is_ok());
-    match (result, close_result) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(err)) => Err(err),
-        (Err(err), _) => Err(err),
+    let trace = crate::debug::enabled!(storage, debug);
+    let mut cache = CACHED_BOOT_VOLUME_FS.lock();
+    if cache.is_none() {
+        if trace {
+            crate::debug::debug!(storage, "boot volume helper: open begin");
+        }
+        let opener =
+            (*BOOT_BLOCK_DEVICE_OPENER.lock()).ok_or(fatfs::Error::Io(DiskIoError::NotPresent))?;
+        let device = opener()?;
+        let fs = fat::open_volume(device)?;
+        *cache = Some(fs);
+        if trace {
+            crate::debug::debug!(storage, "boot volume helper: open done");
+        }
     }
+    let volume_fs = cache.as_ref().expect("cache populated above");
+    let result = f(volume_fs);
+    if trace {
+        crate::debug::debug!(
+            storage,
+            "boot volume helper: callback done ok={}",
+            result.is_ok()
+        );
+    }
+    if result.is_err() {
+        // Drop the cache on error so the next call retries with a freshly mounted volume.
+        *cache = None;
+    }
+    result
 }
 
 fn boot_info() -> Option<&'static BootInfo> {

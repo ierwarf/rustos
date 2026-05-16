@@ -19,10 +19,10 @@ use crate::wayland::WaylandWindowSnapshot;
 pub(crate) const INPUT_EVENT_BATCH: usize = 256;
 pub(crate) const MAX_INPUT_READ_BATCHES_PER_TICK: usize = 4;
 pub(crate) const MAX_RUNNING_PROGRAMS: usize = 8;
-pub(crate) const IDLE_SLEEP: Duration = Duration::from_millis(4);
+pub(crate) const IDLE_SLEEP: Duration = Duration::from_millis(2);
 pub(crate) const INPUT_PROCESS_BUDGET: Duration = Duration::from_millis(2);
-pub(crate) const RUNTIME_POLL_SLEEP: Duration = Duration::from_millis(32);
-pub(crate) const CONSOLE_POLL_SLEEP: Duration = Duration::from_millis(64);
+pub(crate) const RUNTIME_POLL_SLEEP: Duration = Duration::from_millis(16);
+pub(crate) const CONSOLE_POLL_SLEEP: Duration = Duration::from_millis(16);
 pub(crate) const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 pub(crate) const CURSOR_MOTION_SETTLE_INTERVAL: Duration = Duration::from_micros(8_333);
 pub(crate) const HIDDEN_RUNTIME_PROGRAM_TITLES: &[&str] = &["UI Server"];
@@ -56,6 +56,8 @@ pub(crate) struct InputProcessingResult {
 }
 
 const MAX_PARTIAL_RECTS: usize = 32;
+const PARTIAL_RECT_MERGE_NUMERATOR: u64 = 5;
+const PARTIAL_RECT_MERGE_DENOMINATOR: u64 = 4;
 const FULL_REDRAW_PROMOTION_NUMERATOR: u64 = 9;
 const FULL_REDRAW_PROMOTION_DENOMINATOR: u64 = 10;
 
@@ -143,7 +145,7 @@ impl VisualUpdate {
                 let separate_area = rect_area(a)
                     .saturating_add(rect_area(b))
                     .saturating_sub(rect_area(a.intersect(b)));
-                if rect_area(union) <= separate_area.saturating_mul(2) {
+                if should_merge_partial_rects(union, separate_area) {
                     self.partial_rects[index] = union;
                     self.partial_rects.swap_remove(other);
                     merged = true;
@@ -186,7 +188,7 @@ impl VisualUpdate {
             let separate_area = rect_area(*existing)
                 .saturating_add(rect_area(rect))
                 .saturating_sub(rect_area(existing.intersect(rect)));
-            rect_area(union) <= separate_area.saturating_mul(2)
+            should_merge_partial_rects(union, separate_area)
         })
     }
 
@@ -203,6 +205,11 @@ impl VisualUpdate {
 
 fn rect_area(rect: canvas::Rect) -> u64 {
     (rect.width as u64).saturating_mul(rect.height as u64)
+}
+
+fn should_merge_partial_rects(union: canvas::Rect, separate_area: u64) -> bool {
+    rect_area(union).saturating_mul(PARTIAL_RECT_MERGE_DENOMINATOR)
+        <= separate_area.saturating_mul(PARTIAL_RECT_MERGE_NUMERATOR)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

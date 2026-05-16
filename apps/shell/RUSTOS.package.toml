@@ -19,4 +19,4 @@ startup = "none"
 
 [[desktop.entries]]
 display_name = "shell"
-weight_micros = 50
+weight_micros = 100

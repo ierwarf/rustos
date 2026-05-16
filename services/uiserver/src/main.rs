@@ -40,6 +40,7 @@ static FRAME_SAMPLE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SLOW_CONSOLE_REFRESH_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SLOW_PRESENT_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SLOW_RUNTIME_REFRESH_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static POINTER_MOVED_LOGGED: AtomicUsize = AtomicUsize::new(0);
 
 fn cursor_move_update(
     state: &AppState,
@@ -210,6 +211,8 @@ fn log_slow_runtime_refresh(
 fn log_slow_present(
     state: &AppState,
     elapsed: Duration,
+    render_elapsed: Duration,
+    present_elapsed: Duration,
     full_redraw: bool,
     rect: Option<crate::canvas::Rect>,
 ) {
@@ -219,8 +222,10 @@ fn log_slow_present(
     }
     let message = if full_redraw {
         format!(
-            "uiserver: slow full present elapsed_ms={} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
+            "uiserver: slow full present elapsed_ms={} render_ms={} present_ms={} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
             elapsed.as_millis(),
+            render_elapsed.as_millis(),
+            present_elapsed.as_millis(),
             state.console_windows.len(),
             state.wayland_windows.len(),
             state.focused_session_handle,
@@ -229,8 +234,10 @@ fn log_slow_present(
     } else {
         let rect = rect.unwrap_or_default();
         format!(
-            "uiserver: slow partial present elapsed_ms={} rect={}x{}@{},{} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
+            "uiserver: slow partial present elapsed_ms={} render_ms={} present_ms={} rect={}x{}@{},{} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
             elapsed.as_millis(),
+            render_elapsed.as_millis(),
+            present_elapsed.as_millis(),
             rect.width,
             rect.height,
             rect.x,
@@ -242,6 +249,21 @@ fn log_slow_present(
         )
     };
     diag_line(message.as_str());
+}
+
+fn log_pointer_moved_once(state: &AppState) {
+    if POINTER_MOVED_LOGGED
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        diag_line(
+            format!(
+                "uiserver: pointer moved x={} y={}",
+                state.cursor_x, state.cursor_y
+            )
+            .as_str(),
+        );
+    }
 }
 
 fn run() -> Result<(), i32> {
@@ -439,7 +461,14 @@ fn run() -> Result<(), i32> {
             );
             let total_elapsed = render_elapsed + present_elapsed;
             if total_elapsed >= SLOW_PRESENT_THRESHOLD {
-                log_slow_present(&state, total_elapsed, true, None);
+                log_slow_present(
+                    &state,
+                    total_elapsed,
+                    render_elapsed,
+                    present_elapsed,
+                    true,
+                    None,
+                );
             }
             true
         } else if !drawable_update.partial_rects().is_empty() {
@@ -484,7 +513,14 @@ fn run() -> Result<(), i32> {
             );
             let total_elapsed = render_elapsed + present_elapsed;
             if total_elapsed >= SLOW_PRESENT_THRESHOLD {
-                log_slow_present(&state, total_elapsed, false, Some(present_union));
+                log_slow_present(
+                    &state,
+                    total_elapsed,
+                    render_elapsed,
+                    present_elapsed,
+                    false,
+                    Some(present_union),
+                );
             }
             true
         } else {
@@ -495,9 +531,14 @@ fn run() -> Result<(), i32> {
             if let Some(compositor) = wayland.as_mut() {
                 compositor.frame_presented();
             }
+            let cursor_moved =
+                presented_cursor_x != state.cursor_x || presented_cursor_y != state.cursor_y;
             pending_update.clear();
             presented_cursor_x = state.cursor_x;
             presented_cursor_y = state.cursor_y;
+            if cursor_moved {
+                log_pointer_moved_once(&state);
+            }
         }
 
         let now = Instant::now();

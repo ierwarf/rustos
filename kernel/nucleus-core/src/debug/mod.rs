@@ -588,7 +588,34 @@ fn emit_milestone_debugcon_line(record: MilestoneRecord) {
 
 #[cfg(rustos_debug_print_enabled)]
 fn milestone_debugcon_visible(name: &str) -> bool {
-    !matches!(name, "boot" | "driver-loader")
+    !matches!(
+        name,
+        "boot"
+            | "driver-loader"
+            | "module-probe-entry"
+            | "module-probe-virtio-net"
+            | "module-reloc-target"
+            | "module-reloc-resolved"
+            | "module-reloc-head"
+            | "module-init-linux-call"
+            | "module-init-return"
+            | "module-init-disallowed-external"
+            | "module-init-unresolved-external"
+            | "linux-virtio-register"
+            | "linux-virtio-register-return"
+            | "usb-register-entry"
+            | "usb-register-bus-begin"
+            | "usb-register-driver-begin"
+            | "usb-register-linux-begin"
+            | "usb-register-done"
+            | "hid-quirks-enter"
+            | "hid-quirks-return"
+            | "xhci-core-register"
+            | "xhci-runtime-register-begin"
+            | "xhci-runtime-register-done"
+            | "xhci-poll-submit-begin"
+            | "xhci-poll-submit-done"
+    )
 }
 
 #[cfg(rustos_debug_print_enabled)]

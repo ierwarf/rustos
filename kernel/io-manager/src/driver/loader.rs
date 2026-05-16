@@ -22,7 +22,7 @@ use x86_64::PhysAddr;
 
 use crate::sync::KernelWaitLock;
 
-use super::{bus, class, export, module_registry, registry};
+use super::{bus, class, export, module_registry};
 
 macro_rules! driver_diag {
     ($level:expr, $event_id:expr, $object_id:expr, $($arg:tt)*) => {{
@@ -269,7 +269,7 @@ pub(super) fn validate_module_image(
         bus::name(expected_bus),
         image_path
     );
-    let image = crate::vfs::read_path_to_vec_for_kernel(image_path)
+    let image = crate::storage::boot_volume::read_file_to_vec(image_path)
         .map_err(|_| "module image not found")?;
     driver_diag!(
         crate::debug::LogLevel::Debug,
@@ -338,9 +338,6 @@ pub(super) fn load_module_image(
     image_path: &'static str,
     linux_driver_names: &'static str,
 ) -> Result<LoadedModuleInfo, &'static str> {
-    if !registry::contains_loadable_elf(name, class, bus, image_path) {
-        return Err("driver module path is not registered");
-    }
     load_module_image_explicit(name, class, bus, image_path, linux_driver_names)
 }
 
@@ -361,7 +358,7 @@ pub(super) fn load_module_image_explicit(
         bus::name(bus),
         image_path,
     );
-    let image = crate::vfs::read_path_to_vec_for_kernel(image_path)
+    let image = crate::storage::boot_volume::read_file_to_vec(image_path)
         .map_err(|_| "module image not found")?;
     driver_diag!(
         crate::debug::LogLevel::Debug,
@@ -479,24 +476,6 @@ pub(super) fn load_module_image_explicit(
                 image_path,
                 memory.runtime_base(),
                 memory.host_base() as usize,
-                init_addr
-            );
-            driver_diag!(
-                crate::debug::LogLevel::Info,
-                26,
-                memory.runtime_base() as u64,
-                "driver module init call: name={} abi=linux path={} entry={:#x}",
-                name,
-                image_path,
-                init_addr
-            );
-            driver_diag!(
-                crate::debug::LogLevel::Debug,
-                27,
-                memory.runtime_base() as u64,
-                "driver module init raw-call: name={} abi=linux path={} entry={:#x}",
-                name,
-                image_path,
                 init_addr
             );
             crate::debug::record_milestone(

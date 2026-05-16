@@ -179,7 +179,9 @@ fn load_record(
     let result = load_module(record);
     if result == 0 {
         loaded.insert(record.name.clone());
-        if !record.provider_group.is_empty() {
+        if !record.provider_group.is_empty()
+            && provider_group_active(record.provider_group.as_str())
+        {
             provider_groups.insert(record.provider_group.clone());
         }
         debug_line(&format!(

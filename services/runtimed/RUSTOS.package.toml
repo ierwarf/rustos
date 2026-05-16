@@ -14,10 +14,10 @@ path = "services/runtimed/runtimed.elf"
 [boot]
 preload = true
 required = false
-priority = -560
+priority = -577
 
 [[desktop.entries]]
 display_name = "runtimed"
-weight_micros = 50
+weight_micros = 100
 logical_admin = true
 console_hosted = false

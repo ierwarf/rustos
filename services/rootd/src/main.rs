@@ -11,7 +11,7 @@ use rustos_user_abi::syscall::{
 
 const SYS_SCHED_YIELD: u64 = 24;
 const SPAWN_FLAG_LOGICAL_ADMIN: u64 = 1;
-const DEFAULT_WEIGHT_MICROS: u64 = 50;
+const DEFAULT_WEIGHT_MICROS: u64 = 100;
 const SERVICE_WAIT_SPINS: usize = 200_000;
 
 const SYSCALLD_EXEC: &[u8] = b"services/syscalld/syscalld.elf\0";

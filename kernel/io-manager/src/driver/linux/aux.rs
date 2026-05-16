@@ -256,7 +256,7 @@ pub(crate) unsafe extern "C" fn alloc_chrdev_region(
     count: u32,
     _name: *const c_char,
 ) -> i32 {
-    crate::debug::write_debugcon_only_line(
+    super::compat_log::debugcon_line(
         alloc::format!(
             "linux compat: alloc_chrdev_region begin devt_ptr={:#x} count={}",
             devt as usize,
@@ -265,13 +265,13 @@ pub(crate) unsafe extern "C" fn alloc_chrdev_region(
         .as_bytes(),
     );
     if devt.is_null() || count == 0 {
-        crate::debug::write_debugcon_only_line(b"linux compat: alloc_chrdev_region invalid");
+        super::compat_log::debugcon_line(b"linux compat: alloc_chrdev_region invalid");
         return -22;
     }
     unsafe {
         *devt = NEXT_CHRDEV.fetch_add(count.max(1), Ordering::Relaxed);
     }
-    crate::debug::write_debugcon_only_line(
+    super::compat_log::debugcon_line(
         alloc::format!("linux compat: alloc_chrdev_region end devt={:#x}", unsafe {
             *devt
         })
@@ -283,13 +283,13 @@ pub(crate) unsafe extern "C" fn alloc_chrdev_region(
 pub(crate) unsafe extern "C" fn unregister_chrdev_region(_devt: u32, _count: u32) {}
 
 pub(crate) unsafe extern "C" fn cdev_init(_cdev: *mut c_void, _fops: *const c_void) {
-    crate::debug::write_debugcon_only_line(
+    super::compat_log::debugcon_line(
         alloc::format!("linux compat: cdev_init ptr={:#x}", _cdev as usize).as_bytes(),
     );
 }
 
 pub(crate) unsafe extern "C" fn cdev_add(_cdev: *mut c_void, _devt: u32, _count: u32) -> i32 {
-    crate::debug::write_debugcon_only_line(
+    super::compat_log::debugcon_line(
         alloc::format!(
             "linux compat: cdev_add ptr={:#x} devt={:#x} count={}",
             _cdev as usize,
@@ -307,9 +307,9 @@ pub(crate) unsafe extern "C" fn debugfs_create_dir(
     _name: *const c_char,
     _parent: *mut c_void,
 ) -> *mut c_void {
-    crate::debug::write_debugcon_only_line(b"linux compat: debugfs_create_dir begin");
+    super::compat_log::debugcon_line(b"linux compat: debugfs_create_dir begin");
     let handle = new_handle();
-    crate::debug::write_debugcon_only_line(
+    super::compat_log::debugcon_line(
         alloc::format!(
             "linux compat: debugfs_create_dir end handle={:#x}",
             handle as usize

@@ -41,7 +41,7 @@ path = "services/exampled/exampled.elf"
 
 [[desktop.entries]]
 display_name = "exampled"
-weight_micros = 50
+weight_micros = 100
 logical_admin = true
 console_hosted = false
 ```
@@ -93,7 +93,7 @@ path = "services/exampled/exampled.elf"
 
 [[desktop.entries]]
 display_name = "exampled"
-weight_micros = 50
+weight_micros = 100
 logical_admin = true
 console_hosted = false
 ```

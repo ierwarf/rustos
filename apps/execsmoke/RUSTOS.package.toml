@@ -20,20 +20,20 @@ startup = "none"
 
 [[desktop.entries]]
 display_name = "execve smoke"
-weight_micros = 50
+weight_micros = 100
 args = ["apps/execsmoke/execsmoke.elf", "execve"]
 
 [[desktop.entries]]
 display_name = "execveat smoke"
-weight_micros = 50
+weight_micros = 100
 args = ["apps/execsmoke/execsmoke.elf", "execveat"]
 
 [[desktop.entries]]
 display_name = "exec thread smoke"
-weight_micros = 50
+weight_micros = 100
 args = ["apps/execsmoke/execsmoke.elf", "thread-execve"]
 
 [[desktop.entries]]
 display_name = "exec empty argv smoke"
-weight_micros = 50
+weight_micros = 100
 args = ["apps/execsmoke/execsmoke.elf", "empty-argv"]

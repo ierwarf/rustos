@@ -127,29 +127,57 @@ pub(crate) fn ioctl_process_device_handle(
     arg: u64,
 ) -> Result<u64, DeviceSysopError> {
     let Some(result) = multitask::with_process_state_by_pid_mut(process_id, |process_state| {
-        let Some(entry) = process_state.handles().get_entry(fd) else {
-            return Err(DeviceSysopError::BadFileDescriptor);
-        };
-        match entry.handle() {
-            KernelHandle::Device(device_handle) => {
-                if !entry.rights().allows_device_ioctl() {
-                    return Err(DeviceSysopError::Unsupported);
-                }
-                device_ns::ioctl_from_user(*device_handle, process_state, request, arg)
-                    .map_err(map_device_error)
-            }
-            KernelHandle::RemoteVfs(remote) if remote.kind() == RemoteVfsHandleKind::Device => {
-                let path = remote.path();
-                ioctl_remote_device(process_state, path.as_str(), request, arg)
-            }
-            _ => Err(DeviceSysopError::Unsupported),
-        }
+        ioctl_via_process_state(process_state, fd, request, arg)
     }) else {
         return Err(DeviceSysopError::Unsupported);
     };
 
     result
 }
+
+/// Direct, no-IPC ioctl entry for the currently running user process. Used by the
+/// kernel-side fast path so userspace `ioctl(2)` does not have to round-trip through
+/// the devmgrd policy service for data-path operations (e.g. display present, input
+/// reads) where no policy decision is actually performed today.
+pub(crate) fn ioctl_current_process_fd(
+    fd: u64,
+    request: u64,
+    arg: u64,
+) -> Result<u64, DeviceSysopError> {
+    let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
+        ioctl_via_process_state(process_state, fd, request, arg)
+    }) else {
+        return Err(DeviceSysopError::Unsupported);
+    };
+
+    result
+}
+
+fn ioctl_via_process_state(
+    process_state: &mut UserProcessState,
+    fd: u64,
+    request: u64,
+    arg: u64,
+) -> Result<u64, DeviceSysopError> {
+    let Some(entry) = process_state.handles().get_entry(fd) else {
+        return Err(DeviceSysopError::BadFileDescriptor);
+    };
+    match entry.handle() {
+        KernelHandle::Device(device_handle) => {
+            if !entry.rights().allows_device_ioctl() {
+                return Err(DeviceSysopError::Unsupported);
+            }
+            device_ns::ioctl_from_user(*device_handle, process_state, request, arg)
+                .map_err(map_device_error)
+        }
+        KernelHandle::RemoteVfs(remote) if remote.kind() == RemoteVfsHandleKind::Device => {
+            let path = remote.path();
+            ioctl_remote_device(process_state, path.as_str(), request, arg)
+        }
+        _ => Err(DeviceSysopError::Unsupported),
+    }
+}
+
 
 fn ioctl_remote_device(
     process_state: &mut UserProcessState,
@@ -180,7 +208,9 @@ fn ioctl_console_device(
     arg: u64,
 ) -> Result<u64, DeviceSysopError> {
     match request {
-        console_abi::CONSOLE_IOCTL_CREATE_SESSION => ioctl_console_create_session(process_state, arg),
+        console_abi::CONSOLE_IOCTL_CREATE_SESSION => {
+            ioctl_console_create_session(process_state, arg)
+        }
         console_abi::CONSOLE_IOCTL_CLOSE_SESSION => ioctl_console_close_session(process_state, arg),
         console_abi::CONSOLE_IOCTL_SET_SESSION_STATE => {
             ioctl_console_set_session_state(process_state, arg)
@@ -216,10 +246,10 @@ fn ioctl_console_create_session(
         core::str::from_utf8(&exec_path).map_err(|_| DeviceSysopError::InvalidArgument)?;
     let handle = kernel_io_manager::api::session::create(request.program_id, title_str, exec_str)
         .map_err(|err| match err {
-            kernel_io_manager::api::session::CreateConsoleSessionError::NoCapacity => {
-                DeviceSysopError::Unsupported
-            }
-        })?;
+        kernel_io_manager::api::session::CreateConsoleSessionError::NoCapacity => {
+            DeviceSysopError::Unsupported
+        }
+    })?;
     request.session_handle = handle.raw();
     write_process_struct(process_state, arg, &request)?;
     Ok(0)
@@ -231,9 +261,8 @@ fn ioctl_console_close_session(
 ) -> Result<u64, DeviceSysopError> {
     let request =
         read_process_struct::<console_abi::ConsoleCloseSessionRequest>(process_state, arg)?;
-    let handle = kernel_io_manager::api::session::ConsoleSessionHandle::from_raw(
-        request.session_handle,
-    );
+    let handle =
+        kernel_io_manager::api::session::ConsoleSessionHandle::from_raw(request.session_handle);
     if kernel_io_manager::api::session::remove(handle) {
         Ok(0)
     } else {
@@ -250,9 +279,8 @@ fn ioctl_console_set_session_state(
     if request.reserved != 0 {
         return Err(DeviceSysopError::InvalidArgument);
     }
-    let handle = kernel_io_manager::api::session::ConsoleSessionHandle::from_raw(
-        request.session_handle,
-    );
+    let handle =
+        kernel_io_manager::api::session::ConsoleSessionHandle::from_raw(request.session_handle);
     match kernel_io_manager::api::session::transition_state(handle, request.state) {
         Some(true) => Ok(0),
         Some(false) => Err(DeviceSysopError::NotFound),
@@ -265,9 +293,8 @@ fn ioctl_console_set_focus(
     arg: u64,
 ) -> Result<u64, DeviceSysopError> {
     let request = read_process_struct::<console_abi::ConsoleSetFocusRequest>(process_state, arg)?;
-    let handle = kernel_io_manager::api::session::ConsoleSessionHandle::from_raw(
-        request.session_handle,
-    );
+    let handle =
+        kernel_io_manager::api::session::ConsoleSessionHandle::from_raw(request.session_handle);
     if kernel_io_manager::api::session::set_focus(handle) {
         Ok(0)
     } else {
@@ -434,11 +461,17 @@ fn present_surface(
     surface: DisplaySurfaceHandle,
     rect: Option<(u32, u32, u32, u32)>,
 ) -> Result<(), DeviceSysopError> {
-    let region = surface
-        .shared_region()
+    // Fast path: use the cached kernel pointer stashed when the shared region
+    // was first installed. This avoids contending for the global IPC objects
+    // mutex (which also disables interrupts) on every frame.
+    let (ptr, len) = surface
+        .shared_region_kernel_mapping()
+        .or_else(|| {
+            surface
+                .shared_region()
+                .and_then(crate::ipc::map_shared_region)
+        })
         .ok_or(DeviceSysopError::InvalidArgument)?;
-    let (ptr, len) =
-        crate::ipc::map_shared_region(region).ok_or(DeviceSysopError::InvalidArgument)?;
     let frame_len =
         usize::try_from(surface.frame_len()).map_err(|_| DeviceSysopError::InvalidArgument)?;
     if len < frame_len {

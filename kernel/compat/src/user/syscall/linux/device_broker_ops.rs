@@ -22,7 +22,9 @@ pub(super) fn syscall_linux_rustos_device_ioctl_broker(args_ptr: u64) -> u64 {
     }
 }
 
-fn device_sysop_error_to_linux_errno(err: DeviceSysopError) -> i64 {
+pub(in crate::user::syscall::linux) fn device_sysop_error_to_linux_errno(
+    err: DeviceSysopError,
+) -> i64 {
     match err {
         DeviceSysopError::AddressSpace(err) => address_space_error_to_linux_errno(err),
         DeviceSysopError::BadFileDescriptor => LINUX_EBADF,
