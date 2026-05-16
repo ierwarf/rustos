@@ -58,6 +58,47 @@ pub fn spawn_user_process_with_parent(
     Ok(id)
 }
 
+pub fn spawn_user_process_state_with_parent(
+    process_state: UserProcessState,
+    bootstrap: UserTaskBootstrap,
+    parent_process_id: Option<u64>,
+    weight_micros: u64,
+) -> Result<u64, SpawnTaskError> {
+    if nucleus_core::util::fault_injection::should_fail("process.spawn") {
+        crate::debug::warn!(process, "fault injection: process.spawn failed");
+        return Err(SpawnTaskError::NoFreeTaskSlot);
+    }
+    let id = NEXT_TASK_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let pit_divisor = checked_thread_pit_divisor(weight_micros)?;
+    let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
+    let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
+    let rflags = initial_task_rflags().bits();
+    let spawned_from_user = interrupts::without_interrupts(|| unsafe {
+        let scheduler = scheduler_mut();
+        let current_is_user = scheduler.current_task_is_user_task();
+        scheduler
+            .allocate_user_process_state_slot(
+                id,
+                process_state,
+                bootstrap,
+                parent_process_id,
+                pit_divisor,
+                user_cs,
+                user_ss,
+                rflags,
+                noop_task_entry,
+            )
+            .map(|_| current_is_user)
+            .ok_or(SpawnTaskError::NoFreeTaskSlot)
+    })?;
+
+    if spawned_from_user {
+        super::request_deferred_reschedule();
+    }
+
+    Ok(id)
+}
+
 pub fn spawn_kernel_process(
     process_state: UserProcessState,
     entry: VirtAddr,

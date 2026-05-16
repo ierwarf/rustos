@@ -897,6 +897,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "procd"
+version = "0.1.0"
+dependencies = [
+ "rustos-svc-runtime",
+ "rustos-user-abi",
+ "spin 0.10.0",
+]
+
+[[package]]
 name = "quick-xml"
 version = "0.39.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

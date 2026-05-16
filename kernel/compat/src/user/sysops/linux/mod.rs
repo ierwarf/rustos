@@ -26,7 +26,8 @@ use super::stat;
 use super::usermem;
 
 // Linux mm/thread primitives still live here while mapping and scheduler state
-// remain privileged. Signal and clock policy is now owned by syscalld.
+// remain privileged. Process and signal policy is owned by procd; clock policy
+// is owned by syscalld.
 
 const PAGE_SIZE: u64 = 4096;
 const LINUX_SIGSET_SIZE: u64 = 8;

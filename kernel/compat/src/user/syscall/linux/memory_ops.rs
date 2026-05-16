@@ -10,17 +10,6 @@ const PAGE_SIZE: u64 = 4096;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct SigaltstackPayload {
-    has_old: u8,
-    _pad: [u8; 7],
-    old_ss_sp: u64,
-    old_ss_size: u64,
-    old_ss_flags: u32,
-    _pad2: [u8; 4],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
 struct SigaltstackRequestExtra {
     has_new: u8,
     _pad: [u8; 7],
@@ -43,9 +32,20 @@ pub(super) fn syscall_linux_madvise(start: u64, user_len: u64, advice: u64) -> u
 
 pub(super) fn syscall_linux_sigaltstack(stack_ptr: u64, old_stack_ptr: u64) -> u64 {
     const SIGALTSTACK_WIRE_SIZE: usize = 24; // ss_sp + ss_flags + (pad) + ss_size
-    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_SIGALTSTACK);
+    let mut request = new_procd_request(rustos_user_abi::syscall::PROCD_OP_SIGALTSTACK);
     let mut extra = SigaltstackRequestExtra::default();
+    let old_stack = multitask::current_linux_thread_state()
+        .map(|state| state.signal_stack)
+        .unwrap_or(linux_abi::LinuxSignalStack {
+            sp: 0,
+            flags: linux_abi::SS_DISABLE,
+            _pad: 0,
+            size: 0,
+        });
     if stack_ptr != 0 {
+        if old_stack.flags & linux_abi::SS_ONSTACK != 0 {
+            return linux_errno(LINUX_EPERM);
+        }
         let mut buf = [0_u8; SIGALTSTACK_WIRE_SIZE];
         if let Err(err) = usermem::copy_from_current_user_exact(stack_ptr, &mut buf) {
             return linux_errno(address_space_error_to_linux_errno(err));
@@ -64,7 +64,7 @@ pub(super) fn syscall_linux_sigaltstack(stack_ptr: u64, old_stack_ptr: u64) -> u
         {
             return linux_errno(address_space_error_to_linux_errno(err));
         }
-        request.mask |= 0x1;
+        request.flags |= 0x1;
     }
     let extra_bytes = unsafe {
         core::slice::from_raw_parts(
@@ -72,35 +72,53 @@ pub(super) fn syscall_linux_sigaltstack(stack_ptr: u64, old_stack_ptr: u64) -> u
             size_of::<SigaltstackRequestExtra>(),
         )
     };
-    if extra_bytes.len() > SYSCALL_OFFLOAD_PATH_CAPACITY {
+    if extra_bytes.len() > request.payload.len() {
         return linux_errno(LINUX_EINVAL);
     }
-    request.path_len = extra_bytes.len() as u32;
-    request.path[..extra_bytes.len()].copy_from_slice(extra_bytes);
+    request.payload_len = extra_bytes.len() as u32;
+    request.payload[..extra_bytes.len()].copy_from_slice(extra_bytes);
 
-    let response = match call_syscalld(request) {
+    let response = match call_procd(&request) {
         Ok(response) => response,
         Err(errno) => return linux_errno(errno),
     };
-    if let Err(errno) = ensure_syscalld_status(&response) {
-        return linux_errno(errno);
+    if response.status != 0 {
+        return linux_errno(response.status.unsigned_abs() as i64);
+    }
+    if extra.has_new != 0 {
+        let _ = multitask::with_current_user_process_and_linux_thread_state_mut(
+            |_, _, _, _, linux_thread_state| {
+                let Some(state) = linux_thread_state.as_mut() else {
+                    return;
+                };
+                state.signal_stack = if extra.new_ss_flags & linux_abi::SS_DISABLE != 0 {
+                    linux_abi::LinuxSignalStack {
+                        sp: 0,
+                        flags: linux_abi::SS_DISABLE,
+                        _pad: 0,
+                        size: 0,
+                    }
+                } else {
+                    linux_abi::LinuxSignalStack {
+                        sp: extra.new_ss_sp,
+                        flags: extra.new_ss_flags,
+                        _pad: 0,
+                        size: extra.new_ss_size,
+                    }
+                };
+            },
+        );
     }
     if old_stack_ptr != 0 {
-        if (response.payload_len as usize) != size_of::<SigaltstackPayload>() {
-            return linux_errno(LINUX_EINVAL);
-        }
-        let mut payload = SigaltstackPayload::default();
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                response.payload.as_ptr(),
-                (&mut payload as *mut SigaltstackPayload).cast::<u8>(),
-                size_of::<SigaltstackPayload>(),
-            );
-        }
         let mut out = [0_u8; SIGALTSTACK_WIRE_SIZE];
-        out[0..8].copy_from_slice(&payload.old_ss_sp.to_le_bytes());
-        out[8..12].copy_from_slice(&payload.old_ss_flags.to_le_bytes());
-        out[16..24].copy_from_slice(&payload.old_ss_size.to_le_bytes());
+        let old_flags = if old_stack.size == 0 {
+            linux_abi::SS_DISABLE
+        } else {
+            old_stack.flags
+        };
+        out[0..8].copy_from_slice(&old_stack.sp.to_le_bytes());
+        out[8..12].copy_from_slice(&old_flags.to_le_bytes());
+        out[16..24].copy_from_slice(&old_stack.size.to_le_bytes());
         if let Err(err) = usermem::write_current_user_bytes(old_stack_ptr, &out) {
             return linux_errno(address_space_error_to_linux_errno(err));
         }

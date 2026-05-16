@@ -210,15 +210,9 @@ pub(super) fn syscall_linux_syscalld_getrandom(user_ptr: u64, user_len: u64, fla
     copied as u64
 }
 
-pub(super) fn syscall_linux_wait4(
-    pid: i64,
-    status_ptr: u64,
-    options: u64,
-    rusage_ptr: u64,
-) -> u64 {
+pub(super) fn syscall_linux_wait4(pid: i64, status_ptr: u64, options: u64, rusage_ptr: u64) -> u64 {
     if status_ptr != 0 {
-        if let Err(err) =
-            usermem::validate_current_user_write_buffer(status_ptr, size_of::<i32>())
+        if let Err(err) = usermem::validate_current_user_write_buffer(status_ptr, size_of::<i32>())
         {
             return linux_errno(address_space_error_to_linux_errno(err));
         }
@@ -227,19 +221,18 @@ pub(super) fn syscall_linux_wait4(
         if let Err(err) = usermem::validate_current_user_write_buffer(
             rusage_ptr,
             size_of::<linux_abi::LinuxRusage>(),
-        )
-        {
+        ) {
             return linux_errno(address_space_error_to_linux_errno(err));
         }
     }
 
-    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_WAIT4);
-    request.dirfd = pid as u64;
-    request.flags = options;
-    request.arg0 = status_ptr;
-    request.arg1 = rusage_ptr;
+    let mut request = new_procd_request(PROCD_OP_WAIT4);
+    request.arg0 = pid as u64;
+    request.arg1 = options;
+    request.arg2 = status_ptr;
+    request.arg3 = rusage_ptr;
     if let Err(errno) =
-        call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response))
+        call_procd(&request).and_then(|response| ensure_empty_procd_response(&response))
     {
         return linux_errno(errno);
     }
@@ -271,7 +264,14 @@ pub(super) fn syscall_linux_wait4(
                 return child_pid;
             }
             multitask::WaitChildResult::Pending if nohang => return 0,
-            multitask::WaitChildResult::Pending => multitask::yield_now(),
+            multitask::WaitChildResult::Pending => {
+                multitask::yield_now();
+                if let Some(state) = multitask::current_linux_thread_state() {
+                    if state.pending_signals & !state.signal_mask != 0 {
+                        return linux_errno(LINUX_EINTR);
+                    }
+                }
+            }
             multitask::WaitChildResult::NoMatchingChild if nohang => return 0,
             multitask::WaitChildResult::NoMatchingChild => return linux_errno(LINUX_ECHILD),
         }
@@ -304,11 +304,13 @@ pub(super) fn syscall_linux_memfd_create(name_ptr: u64, flags: u64) -> u64 {
         flags & linux_abi::MFD_ALLOW_SEALING != 0,
     ));
     match multitask::with_current_user_process_state_mut(|_, _, process_state| {
-        process_state.handles_mut().install_entry(multitask::HandleEntry::new(
-            handle,
-            fd_flags,
-            linux_abi::O_RDWR,
-        ))
+        process_state
+            .handles_mut()
+            .install_entry(multitask::HandleEntry::new(
+                handle,
+                fd_flags,
+                linux_abi::O_RDWR,
+            ))
     }) {
         Some(fd) => fd,
         None => linux_errno(LINUX_ENOSYS),

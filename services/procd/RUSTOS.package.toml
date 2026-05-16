@@ -1,0 +1,24 @@
+id = "procd"
+kind = "service"
+execution_domain = "user"
+profiles = ["default"]
+startup = "none"
+
+[build]
+builder = "cargo-kernel-binary"
+package = "procd"
+linkage = "static-pie"
+
+[install]
+path = "services/procd/procd.elf"
+
+[boot]
+preload = true
+required = false
+priority = -560
+
+[[desktop.entries]]
+display_name = "procd"
+weight_micros = 50
+logical_admin = true
+console_hosted = false

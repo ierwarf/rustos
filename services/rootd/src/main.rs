@@ -5,8 +5,8 @@ use core::arch::asm;
 use core::panic::PanicInfo;
 
 use rustos_user_abi::syscall::{
-    IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD, IPC_SERVICE_VFSD, SYS_RUSTOS_DEBUG_PRINT,
-    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_SPAWN_EXEC,
+    IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD, IPC_SERVICE_PROCD, IPC_SERVICE_VFSD,
+    SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_SPAWN_EXEC,
 };
 
 const SYS_SCHED_YIELD: u64 = 24;
@@ -17,6 +17,7 @@ const SERVICE_WAIT_SPINS: usize = 200_000;
 const SYSCALLD_EXEC: &[u8] = b"services/syscalld/syscalld.elf\0";
 const VFSD_EXEC: &[u8] = b"services/vfsd/vfsd.elf\0";
 const LOADERD_EXEC: &[u8] = b"services/loaderd/loaderd.elf\0";
+const PROCD_EXEC: &[u8] = b"services/procd/procd.elf\0";
 const INITD_EXEC: &[u8] = b"services/initd/initd.elf\0";
 
 #[no_mangle]
@@ -26,6 +27,7 @@ pub extern "C" fn _start() -> ! {
     spawn_core_service(SYSCALLD_EXEC, IPC_SERVICE_LINUX_SYSCALLD);
     spawn_core_service(VFSD_EXEC, IPC_SERVICE_VFSD);
     spawn_core_service(LOADERD_EXEC, IPC_SERVICE_LOADERD);
+    spawn_core_service(PROCD_EXEC, IPC_SERVICE_PROCD);
 
     debug_line(b"rootd: core services ready, spawning initd\n");
     loop {

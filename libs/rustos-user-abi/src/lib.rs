@@ -41,6 +41,15 @@ pub mod syscall {
     pub const SYS_RUSTOS_INPUT_STATS_BROKER: u64 = 0x5255_0026;
     pub const SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER: u64 = 0x5255_0027;
     pub const SYS_RUSTOS_PROC_MAP_DATA_BROKER: u64 = 0x5255_0028;
+    pub const SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER: u64 = 0x5255_0029;
+    pub const SYS_RUSTOS_PROC_AUTHORIZE_EXEC_BROKER: u64 = 0x5255_002a;
+    pub const SYS_RUSTOS_PROC_EXEC_TARGET_BROKER: u64 = 0x5255_002b;
+    pub const SYS_RUSTOS_PROC_FORK_BROKER: u64 = 0x5255_002c;
+    pub const SYS_RUSTOS_PROC_SIGNAL_QUEUE_BROKER: u64 = 0x5255_002d;
+    pub const SYS_RUSTOS_PROC_SET_IMAGE_BLOB_BROKER: u64 = 0x5255_002e;
+    pub const SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER: u64 = 0x5255_002f;
+    pub const SYS_RUSTOS_PROC_MAP_FILE_BATCH_BROKER: u64 = 0x5255_0030;
+    pub const SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER: u64 = 0x5255_0031;
 
     /// RustOS-private auxv entry: virtual address of the bootstrap heap region
     /// that the kernel pre-maps for static-PIE policy services so they can run
@@ -146,6 +155,7 @@ pub mod syscall {
     pub const SYSCALL_OFFLOAD_OP_LINUX_MUNMAP: u16 = 62;
     pub const SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE: u16 = 63;
     pub const SYSCALL_OFFLOAD_OP_DRIVER_LOAD_POLICY: u16 = 64;
+    pub const SYSCALL_OFFLOAD_OP_LINUX_PROCESS_EXIT: u16 = 65;
     pub const WIN32_SYSCALL_OFFLOAD_ABI_VERSION: u16 = 1;
     pub const SYSCALL_OFFLOAD_OP_WIN32_WRITE_FILE: u16 = 80;
     pub const SYSCALL_OFFLOAD_OP_WIN32_READ_FILE: u16 = 81;
@@ -234,11 +244,30 @@ pub mod syscall {
     pub const LINUX_SIGACTION_SIZE: usize = 32;
     pub const LOADER_REQUEST_ABI_VERSION: u16 = 1;
     pub const LOADER_OP_SPAWN_EXEC: u16 = 1;
+    pub const LOADER_OP_EXEC_TARGET: u16 = 2;
     pub const LOADER_SPAWN_EXEC_PATH_CAPACITY: usize = 256;
     pub const LOADER_SPAWN_ARG_BYTES: usize = 1024;
     pub const LOADER_SPAWN_ENV_BYTES: usize = 2048;
     pub const LOADER_SPAWN_MAX_ARG_COUNT: usize = 32;
     pub const LOADER_SPAWN_MAX_ENV_COUNT: usize = 64;
+    pub const PROCD_IPC_ABI_VERSION: u16 = 1;
+    pub const PROCD_OP_EXECVE: u16 = 1;
+    pub const PROCD_OP_EXECVEAT: u16 = 2;
+    pub const PROCD_OP_FORK: u16 = 3;
+    pub const PROCD_OP_WAIT4: u16 = 4;
+    pub const PROCD_OP_RT_SIGACTION: u16 = 5;
+    pub const PROCD_OP_RT_SIGPROCMASK: u16 = 6;
+    pub const PROCD_OP_SIGALTSTACK: u16 = 7;
+    pub const PROCD_OP_TGKILL: u16 = 8;
+    pub const PROCD_OP_SELECT_SIGNAL: u16 = 9;
+    pub const PROCD_PATH_CAPACITY: usize = LOADER_SPAWN_EXEC_PATH_CAPACITY;
+    pub const PROCD_ARG_BYTES: usize = LOADER_SPAWN_ARG_BYTES;
+    pub const PROCD_ENV_BYTES: usize = LOADER_SPAWN_ENV_BYTES;
+    pub const PROCD_PAYLOAD_CAPACITY: usize = SYSCALL_OFFLOAD_PAYLOAD_CAPACITY;
+    pub const PROCD_SELECT_SIGNAL_NONE: u16 = 0;
+    pub const PROCD_SELECT_SIGNAL_IGNORE: u16 = 1;
+    pub const PROCD_SELECT_SIGNAL_TERMINATE: u16 = 2;
+    pub const PROCD_SELECT_SIGNAL_HANDLER: u16 = 3;
     pub const PROC_BROKER_ABI_VERSION: u16 = 1;
     pub const PROC_BROKER_FORMAT_ELF64: u16 = 1;
     pub const PROC_BROKER_FORMAT_PE64: u16 = 2;
@@ -249,6 +278,8 @@ pub mod syscall {
     pub const PROC_BROKER_USER_SPACE_BASE: u64 = 1 << 39;
     pub const PROC_BROKER_USER_SPACE_END_EXCLUSIVE: u64 = 2 << 39;
     pub const PROC_BROKER_DATA_PAYLOAD_CAPACITY: usize = 4096;
+    pub const PROC_BROKER_BATCH_CAPACITY: usize = 8;
+    pub const PROC_BROKER_LINUX_INTERP_PATH_CAPACITY: usize = 256;
     pub const DRIVER_BROKER_NAME_CAPACITY: usize = 64;
     pub const DRIVER_BROKER_PATH_CAPACITY: usize = 256;
     pub const DRIVER_BROKER_ALIAS_CAPACITY: usize = 256;
@@ -646,6 +677,286 @@ pub mod syscall {
     }
 
     #[repr(C)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct RustosProcSetImageBlobBrokerArgs {
+        pub abi_version: u16,
+        pub reserved0: u16,
+        pub data_len: u32,
+        pub prepare_handle: u64,
+        pub total_len: u64,
+        pub data_offset: u64,
+        pub data: [u8; PROC_BROKER_DATA_PAYLOAD_CAPACITY],
+    }
+
+    impl Default for RustosProcSetImageBlobBrokerArgs {
+        fn default() -> Self {
+            Self {
+                abi_version: 0,
+                reserved0: 0,
+                data_len: 0,
+                prepare_handle: 0,
+                total_len: 0,
+                data_offset: 0,
+                data: [0; PROC_BROKER_DATA_PAYLOAD_CAPACITY],
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct RustosProcSetWindowsRuntimeBrokerArgs {
+        pub abi_version: u16,
+        pub reserved0: u16,
+        pub loader_module_count: u32,
+        pub prepare_handle: u64,
+        pub entry_point: u64,
+        pub image_base: u64,
+        pub image_size: u64,
+        pub runtime_base: u64,
+        pub runtime_size: u64,
+        pub public_runtime_address: u64,
+        pub peb_address: u64,
+        pub teb_address: u64,
+        pub process_parameters_address: u64,
+        pub loader_data_address: u64,
+        pub loader_module_array_address: u64,
+        pub main_module_entry_address: u64,
+        pub command_line_w_ptr: u64,
+        pub command_line_a_ptr: u64,
+        pub environment_w_ptr: u64,
+        pub environment_a_ptr: u64,
+        pub module_path_w_ptr: u64,
+        pub module_path_a_ptr: u64,
+        pub module_directory_w_ptr: u64,
+        pub module_directory_a_ptr: u64,
+        pub main_module_base_name_w_ptr: u64,
+        pub main_module_base_name_a_ptr: u64,
+        pub argc: i32,
+        pub reserved1: u32,
+        pub argc_ptr: u64,
+        pub argv_ptr_ptr: u64,
+        pub environ_ptr_ptr: u64,
+        pub argv_ptr: u64,
+        pub environ_ptr: u64,
+        pub initial_narrow_environment_ptr: u64,
+        pub initenv_ptr: u64,
+        pub errno_ptr: u64,
+        pub last_error_ptr: u64,
+        pub commode_ptr: u64,
+        pub fmode_ptr: u64,
+        pub iob_array_ptr: u64,
+        pub stdin_file_ptr: u64,
+        pub stdout_file_ptr: u64,
+        pub stderr_file_ptr: u64,
+        pub localeconv_ptr: u64,
+        pub strerror_einval_ptr: u64,
+        pub strerror_enomem_ptr: u64,
+        pub strerror_eio_ptr: u64,
+        pub strerror_erange_ptr: u64,
+        pub strerror_unknown_ptr: u64,
+        pub teb_process_id_ptr: u64,
+        pub teb_thread_id_ptr: u64,
+        pub reserved2: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct RustosProcAuthorizeExecBrokerArgs {
+        pub abi_version: u16,
+        pub reserved0: u16,
+        pub reserved1: u32,
+        pub target_pid: u64,
+        pub target_tid: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct RustosProcExecTargetBrokerArgs {
+        pub abi_version: u16,
+        pub reserved0: u16,
+        pub flags: u32,
+        pub prepare_handle: u64,
+        pub exec_ticket: u64,
+        pub target_pid: u64,
+        pub target_tid: u64,
+        pub exec_path_ptr: u64,
+        pub exec_path_len: u64,
+        pub argv_ptr: u64,
+        pub envp_ptr: u64,
+        pub console_session: u64,
+        pub weight_micros: u64,
+        pub reserved1: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct RustosProcCancelExecBrokerArgs {
+        pub abi_version: u16,
+        pub reserved0: u16,
+        pub reserved1: u32,
+        pub exec_ticket: u64,
+        pub target_pid: u64,
+        pub target_tid: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct RustosProcMapFileBatchEntry {
+        pub fd: u64,
+        pub file_offset: u64,
+        pub target_addr: u64,
+        pub file_len: u64,
+        pub mem_len: u64,
+        pub flags: u64,
+        pub reserved0: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct RustosProcMapFileBatchBrokerArgs {
+        pub prepare_handle: u64,
+        pub count: u32,
+        pub reserved0: u32,
+        pub entries: [RustosProcMapFileBatchEntry; PROC_BROKER_BATCH_CAPACITY],
+    }
+
+    impl Default for RustosProcMapFileBatchBrokerArgs {
+        fn default() -> Self {
+            Self {
+                prepare_handle: 0,
+                count: 0,
+                reserved0: 0,
+                entries: [RustosProcMapFileBatchEntry::default(); PROC_BROKER_BATCH_CAPACITY],
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    pub struct RustosProcSetLinuxRuntimeBrokerArgs {
+        pub abi_version: u16,
+        pub has_tls: u16,
+        pub interp_path_len: u16,
+        pub reserved0: u16,
+        pub prepare_handle: u64,
+        pub entry: u64,
+        pub phdr_addr: u64,
+        pub phnum: u64,
+        pub phent: u64,
+        pub brk_start: u64,
+        pub interpreter_base: u64,
+        pub tls_template_addr: u64,
+        pub tls_template_size: u64,
+        pub tls_mem_size: u64,
+        pub tls_align: u64,
+        pub tls_mapping_base: u64,
+        pub tls_mapping_size: u64,
+        pub tls_block_base: u64,
+        pub tls_thread_pointer: u64,
+        pub tls_tcb_base: u64,
+        pub tls_dtv_base: u64,
+        /// Actual CPU start address: interpreter entry if dynamic ELF, same as
+        /// `entry` if static. The `entry` field carries AT_ENTRY (main program
+        /// entry); this field is what the kernel sets as the initial RIP.
+        pub actual_entry: u64,
+        pub interp_path: [u8; PROC_BROKER_LINUX_INTERP_PATH_CAPACITY],
+    }
+
+    impl Default for RustosProcSetLinuxRuntimeBrokerArgs {
+        fn default() -> Self {
+            Self {
+                abi_version: 0,
+                has_tls: 0,
+                interp_path_len: 0,
+                reserved0: 0,
+                prepare_handle: 0,
+                entry: 0,
+                phdr_addr: 0,
+                phnum: 0,
+                phent: 0,
+                brk_start: 0,
+                interpreter_base: 0,
+                tls_template_addr: 0,
+                tls_template_size: 0,
+                tls_mem_size: 0,
+                tls_align: 0,
+                tls_mapping_base: 0,
+                tls_mapping_size: 0,
+                tls_block_base: 0,
+                tls_thread_pointer: 0,
+                tls_tcb_base: 0,
+                tls_dtv_base: 0,
+                actual_entry: 0,
+                interp_path: [0; PROC_BROKER_LINUX_INTERP_PATH_CAPACITY],
+            }
+        }
+    }
+
+    impl core::fmt::Debug for RustosProcSetLinuxRuntimeBrokerArgs {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("RustosProcSetLinuxRuntimeBrokerArgs")
+                .field("abi_version", &self.abi_version)
+                .field("has_tls", &self.has_tls)
+                .field("prepare_handle", &self.prepare_handle)
+                .field("entry", &self.entry)
+                .field("phdr_addr", &self.phdr_addr)
+                .field("interpreter_base", &self.interpreter_base)
+                .finish()
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct RustosUserRegisters {
+        pub rax: u64,
+        pub rbx: u64,
+        pub rcx: u64,
+        pub rdx: u64,
+        pub rsi: u64,
+        pub rdi: u64,
+        pub rbp: u64,
+        pub rsp: u64,
+        pub rip: u64,
+        pub r8: u64,
+        pub r9: u64,
+        pub r10: u64,
+        pub r11: u64,
+        pub r12: u64,
+        pub r13: u64,
+        pub r14: u64,
+        pub r15: u64,
+        pub rflags: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct RustosProcForkBrokerArgs {
+        pub abi_version: u16,
+        pub reserved0: u16,
+        pub flags: u32,
+        pub source_pid: u64,
+        pub source_tid: u64,
+        pub clone_flags: u64,
+        pub stack_ptr: u64,
+        pub ptid_ptr: u64,
+        pub ctid_ptr: u64,
+        pub tls: u64,
+        pub registers: RustosUserRegisters,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct RustosProcSignalQueueBrokerArgs {
+        pub abi_version: u16,
+        pub reserved0: u16,
+        pub signal: u32,
+        pub target_pid: u64,
+        pub target_tid: u64,
+        pub sender_pid: u64,
+        pub sender_tid: u64,
+    }
+
+    #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     pub struct RustosProcCommitBrokerArgs {
         pub prepare_handle: u64,
@@ -734,6 +1045,9 @@ pub mod syscall {
         pub flags: u32,
         pub console_session: u64,
         pub weight_micros: u64,
+        pub target_pid: u64,
+        pub target_tid: u64,
+        pub exec_ticket: u64,
         pub exec_path_len: u32,
         pub argv_count: u16,
         pub env_count: u16,
@@ -753,6 +1067,9 @@ pub mod syscall {
                 flags: 0,
                 console_session: 0,
                 weight_micros: 0,
+                target_pid: 0,
+                target_tid: 0,
+                exec_ticket: 0,
                 exec_path_len: 0,
                 argv_count: 0,
                 env_count: 0,
@@ -774,6 +1091,100 @@ pub mod syscall {
         pub status: i32,
         pub pid: i64,
         pub reserved0: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct ProcdIpcRequest {
+        pub version: u16,
+        pub op: u16,
+        pub flags: u32,
+        pub pid: u64,
+        pub tid: u64,
+        pub parent_pid: u64,
+        pub dirfd: u64,
+        pub arg0: u64,
+        pub arg1: u64,
+        pub arg2: u64,
+        pub arg3: u64,
+        pub arg4: u64,
+        pub arg5: u64,
+        pub path_len: u32,
+        pub argv_bytes_len: u32,
+        pub env_bytes_len: u32,
+        pub payload_len: u32,
+        pub argv_count: u16,
+        pub env_count: u16,
+        pub reserved0: u32,
+        pub registers: RustosUserRegisters,
+        pub path: [u8; PROCD_PATH_CAPACITY],
+        pub argv_bytes: [u8; PROCD_ARG_BYTES],
+        pub env_bytes: [u8; PROCD_ENV_BYTES],
+        pub payload: [u8; PROCD_PAYLOAD_CAPACITY],
+    }
+
+    impl Default for ProcdIpcRequest {
+        fn default() -> Self {
+            Self {
+                version: PROCD_IPC_ABI_VERSION,
+                op: PROCD_OP_EXECVE,
+                flags: 0,
+                pid: 0,
+                tid: 0,
+                parent_pid: 0,
+                dirfd: 0,
+                arg0: 0,
+                arg1: 0,
+                arg2: 0,
+                arg3: 0,
+                arg4: 0,
+                arg5: 0,
+                path_len: 0,
+                argv_bytes_len: 0,
+                env_bytes_len: 0,
+                payload_len: 0,
+                argv_count: 0,
+                env_count: 0,
+                reserved0: 0,
+                registers: RustosUserRegisters::default(),
+                path: [0; PROCD_PATH_CAPACITY],
+                argv_bytes: [0; PROCD_ARG_BYTES],
+                env_bytes: [0; PROCD_ENV_BYTES],
+                payload: [0; PROCD_PAYLOAD_CAPACITY],
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct ProcdIpcResponse {
+        pub version: u16,
+        pub op: u16,
+        pub status: i32,
+        pub result: i64,
+        pub action: u16,
+        pub signal: u16,
+        pub reserved0: u32,
+        pub payload_len: u32,
+        pub reserved1: u32,
+        pub payload: [u8; PROCD_PAYLOAD_CAPACITY],
+    }
+
+    impl Default for ProcdIpcResponse {
+        fn default() -> Self {
+            Self {
+                version: PROCD_IPC_ABI_VERSION,
+                op: PROCD_OP_EXECVE,
+                status: 0,
+                result: 0,
+                action: PROCD_SELECT_SIGNAL_NONE,
+                signal: 0,
+                reserved0: 0,
+                payload_len: 0,
+                reserved1: 0,
+                payload: [0; PROCD_PAYLOAD_CAPACITY],
+            }
+        }
     }
 
     #[repr(C)]
@@ -1452,6 +1863,43 @@ mod tests {
         assert!(size_of::<syscall::LoaderSpawnRequest>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert!(size_of::<syscall::LoaderSpawnResponse>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert!(size_of::<syscall::RustosProcCommitBrokerArgs>() <= syscall::IPC_MAX_INLINE_BYTES);
+        assert!(
+            size_of::<syscall::RustosProcSetWindowsRuntimeBrokerArgs>()
+                <= syscall::IPC_MAX_INLINE_BYTES
+        );
+        assert!(
+            size_of::<syscall::RustosProcSetImageBlobBrokerArgs>() <= syscall::IPC_MAX_INLINE_BYTES
+        );
+        assert!(
+            size_of::<syscall::RustosProcMapFileBatchBrokerArgs>() <= syscall::IPC_MAX_INLINE_BYTES
+        );
+        assert!(
+            size_of::<syscall::RustosProcSetLinuxRuntimeBrokerArgs>()
+                <= syscall::IPC_MAX_INLINE_BYTES
+        );
+        assert_eq!(syscall::SYS_RUSTOS_PROC_MAP_FILE_BATCH_BROKER, 0x5255_0030);
+        assert_eq!(
+            syscall::SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER,
+            0x5255_0031
+        );
+    }
+
+    #[test]
+    fn procd_abi_layout_fits_inline_ipc() {
+        assert_eq!(syscall::IPC_SERVICE_PROCD, 9);
+        assert_eq!(syscall::SYS_RUSTOS_PROC_AUTHORIZE_EXEC_BROKER, 0x5255_002a);
+        assert!(size_of::<syscall::ProcdIpcRequest>() <= syscall::IPC_MAX_INLINE_BYTES);
+        assert!(size_of::<syscall::ProcdIpcResponse>() <= syscall::IPC_MAX_INLINE_BYTES);
+        assert!(
+            size_of::<syscall::RustosProcExecTargetBrokerArgs>() <= syscall::IPC_MAX_INLINE_BYTES
+        );
+        assert!(
+            size_of::<syscall::RustosProcCancelExecBrokerArgs>() <= syscall::IPC_MAX_INLINE_BYTES
+        );
+        assert!(size_of::<syscall::RustosProcForkBrokerArgs>() <= syscall::IPC_MAX_INLINE_BYTES);
+        assert!(
+            size_of::<syscall::RustosProcSignalQueueBrokerArgs>() <= syscall::IPC_MAX_INLINE_BYTES
+        );
     }
 
     #[test]

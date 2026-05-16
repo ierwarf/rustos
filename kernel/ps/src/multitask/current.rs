@@ -109,6 +109,26 @@ pub fn exec_current_user_process(
     })
 }
 
+pub fn exec_user_process_by_pid(
+    process_id: u64,
+    thread_id: u64,
+    address_space: ProcessAddressSpace,
+    bootstrap: super::UserTaskBootstrap,
+) -> bool {
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().exec_user_process_by_pid(process_id, thread_id, address_space, bootstrap)
+    })
+}
+
+pub fn linux_thread_snapshot_by_ids(
+    process_id: u64,
+    thread_id: u64,
+) -> Option<super::LinuxThreadSnapshot> {
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_ref().linux_thread_snapshot_by_ids(process_id, thread_id)
+    })
+}
+
 pub fn with_current_user_linux_state_mut<R>(
     f: impl FnOnce(
         u64,
@@ -204,6 +224,13 @@ pub fn with_current_process_state_mut<R>(
 pub fn with_current_process_state<R>(f: impl FnOnce(u64, &UserProcessState) -> R) -> Option<R> {
     let process = retain_current_process_ref()?;
     Some(process.with_state(f))
+}
+
+pub fn with_process_state_by_pid<R>(
+    process_id: u64,
+    f: impl FnOnce(&UserProcessState) -> R,
+) -> Option<R> {
+    process_table::with_process_state_by_pid(process_id, f)
 }
 
 pub fn with_current_user_process_and_linux_thread_state_mut<R>(

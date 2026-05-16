@@ -19,7 +19,10 @@ use crate::user::process_state::{UserProcessState, WindowsThreadRuntimeState};
 
 use super::context::{SAVED_CONTEXT_BYTES, SavedContext};
 use super::process_table::{self, ProcessHandle};
-use super::{CurrentUserSnapshot, UserFaultDisposition, UserStackState, UserTaskBootstrap};
+use super::{
+    CurrentUserSnapshot, UserFaultDisposition, UserStackState, UserTaskBootstrap,
+    initial_task_rflags,
+};
 
 pub(super) const MAX_TASK: usize = 32;
 const ROOT_TASK_SLOT: usize = 0;
@@ -605,6 +608,63 @@ impl Scheduler {
                     exec_path
                 );
 
+                self.contexts[slot] = Some(TaskContext {
+                    saved_rsp,
+                    ready: true,
+                    blocked: false,
+                    pit_divisor,
+                    address_space_root: root_phys,
+                    kernel_stack_base: kernel_stack_base as u64,
+                    kernel_stack_top: kernel_stack_top as u64,
+                    alternate_kernel_stack_base: 0,
+                    alternate_kernel_stack_top: 0,
+                    user_mode: true,
+                    user_abi: Some(bootstrap.abi),
+                    console_session: bootstrap.console_session,
+                    process_handle: Some(process_handle),
+                    user_stack: bootstrap.user_stack,
+                    linux_thread_state: bootstrap.linux_thread_state,
+                    windows_thread_state: bootstrap.windows_thread_state.map(|mut state| {
+                        state.thread_id = id;
+                        state
+                    }),
+                });
+                self.simd_states[slot] = SimdState::new();
+                self.starts[slot] = Some(TaskStart {
+                    entry: idle_entry,
+                    id,
+                });
+                return Some(slot);
+            }
+        }
+
+        None
+    }
+
+    pub(super) fn allocate_user_process_state_slot(
+        &mut self,
+        id: u64,
+        process_state: UserProcessState,
+        bootstrap: UserTaskBootstrap,
+        parent_process_id: Option<u64>,
+        pit_divisor: u16,
+        user_cs: u64,
+        user_ss: u64,
+        rflags: u64,
+        idle_entry: fn(u64),
+    ) -> Option<usize> {
+        for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
+            if self.contexts[slot].is_none() {
+                self.reset_stack_storage(slot)?;
+                let saved_rsp =
+                    self.init_user_task_context(slot, &bootstrap, user_cs, user_ss, rflags);
+                let root_phys = process_state.address_space_root();
+                let process_handle = process_table::create_process_with_parent(
+                    id,
+                    parent_process_id,
+                    process_state,
+                )?;
+                let (kernel_stack_base, kernel_stack_top) = self.stack_bounds(slot);
                 self.contexts[slot] = Some(TaskContext {
                     saved_rsp,
                     ready: true,
@@ -1398,6 +1458,110 @@ impl Scheduler {
         true
     }
 
+    pub(super) fn exec_user_process_by_pid(
+        &mut self,
+        process_id: u64,
+        thread_id: u64,
+        address_space: ProcessAddressSpace,
+        mut bootstrap: UserTaskBootstrap,
+    ) -> bool {
+        let Some(slot) = self.find_linux_thread_slot(process_id, thread_id) else {
+            return false;
+        };
+        let Some(current_context) = self.contexts[slot] else {
+            return false;
+        };
+        let Some(process_handle) = current_context.process_handle else {
+            return false;
+        };
+        let Some(linux_process_state) = bootstrap.linux_process_state.take() else {
+            return false;
+        };
+        let Some(linux_memory_map) = bootstrap.linux_memory_map.take() else {
+            return false;
+        };
+        let Some(linux_runtime_profile) = bootstrap.linux_runtime_profile.take() else {
+            return false;
+        };
+        let exec_path = String::from(bootstrap.exec_path());
+        let (sibling_slots, sibling_count) =
+            self.collect_process_sibling_slots(slot, process_handle);
+        let new_root = address_space.root_phys().as_u64();
+        let preserved_signal_mask = current_context
+            .linux_thread_state
+            .map(|state| state.signal_mask)
+            .unwrap_or(0);
+        if let Some(thread_state) = bootstrap.linux_thread_state.as_mut() {
+            thread_state.signal_mask = preserved_signal_mask;
+            thread_state.pending_signals = 0;
+        }
+        let new_fs_base = bootstrap
+            .linux_thread_state
+            .map(|state| state.fs_base)
+            .unwrap_or(0);
+        let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
+        let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
+        let rflags = initial_task_rflags().bits();
+        let saved_rsp = self.init_user_task_context(slot, &bootstrap, user_cs, user_ss, rflags);
+
+        {
+            let Some(context) = self.contexts[slot].as_mut() else {
+                return false;
+            };
+            context.saved_rsp = saved_rsp;
+            context.address_space_root = new_root;
+            context.user_abi = Some(bootstrap.abi);
+            context.console_session = bootstrap.console_session;
+            context.user_stack = bootstrap.user_stack;
+            context.linux_thread_state = bootstrap.linux_thread_state;
+            context.blocked = false;
+            context.ready = true;
+        }
+        self.retired[slot] = false;
+        self.retire_reasons[slot] = None;
+        self.last_errors[slot] = 0;
+        self.simd_states[slot] = SimdState::new();
+        self.starts[slot] = Some(TaskStart {
+            entry: super::noop_task_entry,
+            id: process_id,
+        });
+
+        if slot == self.current_task {
+            crate::memory::paging::load_address_space_phys(PhysAddr::new(new_root));
+            FsBase::write(VirtAddr::new(new_fs_base));
+        }
+        process_table::replace_for_exec(
+            process_handle,
+            address_space,
+            linux_process_state,
+            linux_memory_map,
+            linux_runtime_profile,
+            exec_path.as_str(),
+        )
+        .expect("target process handle disappeared during exec");
+
+        for index in 0..sibling_count {
+            self.clear_slot(sibling_slots[index]);
+        }
+        true
+    }
+
+    pub(super) fn linux_thread_snapshot_by_ids(
+        &self,
+        process_id: u64,
+        thread_id: u64,
+    ) -> Option<super::LinuxThreadSnapshot> {
+        let slot = self.find_linux_thread_slot(process_id, thread_id)?;
+        let context = self.contexts[slot]?;
+        Some(super::LinuxThreadSnapshot {
+            process_id,
+            thread_id,
+            console_session: context.console_session,
+            user_stack: context.user_stack,
+            thread_state: context.linux_thread_state?,
+        })
+    }
+
     pub(super) fn queue_linux_signal(
         &mut self,
         process_id: u64,
@@ -1447,6 +1611,30 @@ impl Scheduler {
         }
 
         false
+    }
+
+    fn find_linux_thread_slot(&self, process_id: u64, thread_id: u64) -> Option<usize> {
+        for slot in 0..MAX_TASK {
+            if self.retired[slot] {
+                continue;
+            }
+            let Some(context) = self.contexts[slot] else {
+                continue;
+            };
+            if !context.user_mode || context.user_abi != Some(UserAbi::Linux) {
+                continue;
+            }
+            if self.starts[slot].map(|start| start.id) != Some(thread_id) {
+                continue;
+            }
+            let Some(process_handle) = context.process_handle else {
+                continue;
+            };
+            if process_table::process_id(process_handle) == Some(process_id) {
+                return Some(slot);
+            }
+        }
+        None
     }
 
     fn collect_process_sibling_slots(

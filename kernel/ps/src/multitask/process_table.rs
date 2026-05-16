@@ -350,6 +350,14 @@ pub fn with_process_state_by_pid_mut<R>(
     Some(f(process.state_mut()))
 }
 
+pub fn with_process_state_by_pid<R>(
+    process_id: u64,
+    f: impl FnOnce(&UserProcessState) -> R,
+) -> Option<R> {
+    let process = retain_process_by_pid(process_id)?;
+    Some(f(process.state()))
+}
+
 pub fn replace_for_exec(
     handle: ProcessHandle,
     address_space: ProcessAddressSpace,

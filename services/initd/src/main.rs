@@ -29,7 +29,6 @@ const STORAGED_EXEC_PATH: &str = "services/storaged/storaged.elf";
 const INPUTD_EXEC_PATH: &str = "services/inputd/inputd.elf";
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const RETRY_BACKOFF: Duration = Duration::from_secs(1);
-const SYS_RUSTOS_SPAWN_EXEC: libc::c_long = 0x5255_0002;
 static LOADER_ENDPOINT_CACHE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -277,47 +276,13 @@ fn reap_children(
     }
 }
 
-fn is_foundation_service(exec_path: &str) -> bool {
-    matches!(
-        exec_path,
-        SYSCALLD_EXEC_PATH | VFSD_EXEC_PATH | LOADERD_EXEC_PATH
-    )
-}
-
 fn spawn_exec(exec_path: &str) -> Result<i32, i32> {
     boot_line(&format!("initd: spawn begin exec={exec_path}"));
-    // foundation 서비스(syscalld/vfsd/loaderd)는 loaderd IPC를 경유하지 않는다.
-    // loaderd는 파일을 열 때 VFS(vfsd)에 의존하므로, vfsd가 내려간 상태에서 loaderd로
-    // vfsd를 respawn하면 무한 대기에 빠진다. kernel bootstrap path를 사용해야 한다.
-    if !is_foundation_service(exec_path) && service_ready(IPC_SERVICE_LOADERD) {
+    if service_ready(IPC_SERVICE_LOADERD) {
         return spawn_exec_via_loaderd(exec_path);
     }
 
-    let path = CString::new(exec_path).unwrap_or_else(|_| CString::new("/").unwrap());
-    let argv = [path.as_ptr(), std::ptr::null()];
-    let env = load_runtime_default_env(DEFAULT_RUNTIME_ENV_REGISTRY_PATH, RuntimeEnvScope::Init)
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|value| CString::new(value).ok())
-        .collect::<Vec<_>>();
-    let mut envp = env.iter().map(|value| value.as_ptr()).collect::<Vec<_>>();
-    envp.push(std::ptr::null());
-    let pid = unsafe {
-        libc::syscall(
-            SYS_RUSTOS_SPAWN_EXEC,
-            path.as_ptr(),
-            argv.as_ptr(),
-            envp.as_ptr(),
-            1_u64,
-            0_u64,
-            exec_weight_micros(exec_path),
-        ) as i32
-    };
-    if pid < 0 {
-        return Err(last_errno());
-    }
-    boot_line(&format!("initd: spawn returned exec={exec_path} pid={pid}"));
-    Ok(pid)
+    Err(libc::EAGAIN)
 }
 
 fn spawn_exec_via_loaderd(exec_path: &str) -> Result<i32, i32> {

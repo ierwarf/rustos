@@ -108,11 +108,13 @@ pub(super) fn syscall_linux_epoll_create1(flags: u64) -> u64 {
     };
     let handle = multitask::KernelHandle::Epoll(multitask::EpollHandle::new());
     match multitask::with_current_user_process_state_mut(|_, _, process_state| {
-        process_state.handles_mut().install_entry(multitask::HandleEntry::new(
-            handle,
-            fd_flags,
-            linux_abi::O_RDONLY,
-        ))
+        process_state
+            .handles_mut()
+            .install_entry(multitask::HandleEntry::new(
+                handle,
+                fd_flags,
+                linux_abi::O_RDONLY,
+            ))
     }) {
         Some(fd) => fd,
         None => linux_errno(LINUX_ENOSYS),
@@ -223,22 +225,65 @@ pub(super) fn syscall_linux_gettid() -> u64 {
     multitask::current_user_thread_id().unwrap_or(0)
 }
 
+pub(super) fn syscall_linux_execve(
+    frame: &mut SyscallFrame,
+    path_ptr: u64,
+    argv_ptr: u64,
+    envp_ptr: u64,
+) -> u64 {
+    procd_exec(
+        frame,
+        PROCD_OP_EXECVE,
+        linux_abi::AT_FDCWD as u64,
+        path_ptr,
+        argv_ptr,
+        envp_ptr,
+        0,
+    )
+}
+
+pub(super) fn syscall_linux_execveat(
+    frame: &mut SyscallFrame,
+    dirfd: u64,
+    path_ptr: u64,
+    argv_ptr: u64,
+    envp_ptr: u64,
+    flags: u64,
+) -> u64 {
+    procd_exec(
+        frame,
+        PROCD_OP_EXECVEAT,
+        dirfd,
+        path_ptr,
+        argv_ptr,
+        envp_ptr,
+        flags,
+    )
+}
+
+pub(super) fn syscall_linux_fork(frame: &SyscallFrame) -> u64 {
+    procd_fork(frame, 0, 0, 0, 0, 0)
+}
+
 pub(super) fn syscall_linux_rt_sigaction(
     signal: u64,
     action_ptr: u64,
     old_action_ptr: u64,
-    _sigset_size: u64,
+    sigset_size: u64,
 ) -> u64 {
-    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_RT_SIGACTION);
+    if sigset_size != size_of::<u64>() as u64 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let mut request = new_procd_request(PROCD_OP_RT_SIGACTION);
     request.arg0 = signal;
     if action_ptr != 0 {
         let action = match usermem::read_current_user_struct::<LinuxSigActionWire>(action_ptr) {
             Ok(action) => action,
             Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
         };
-        request.mask |= 0x1;
-        request.path_len = LINUX_SIGACTION_SIZE as u32;
-        request.path[..LINUX_SIGACTION_SIZE].copy_from_slice(as_bytes(&action));
+        request.flags |= 0x1;
+        request.payload_len = LINUX_SIGACTION_SIZE as u32;
+        request.payload[..LINUX_SIGACTION_SIZE].copy_from_slice(as_bytes(&action));
     }
     if old_action_ptr != 0 {
         if let Err(err) =
@@ -246,15 +291,18 @@ pub(super) fn syscall_linux_rt_sigaction(
         {
             return linux_errno(address_space_error_to_linux_errno(err));
         }
-        request.mask |= 0x2;
+        request.flags |= 0x2;
     }
-    let response = match call_syscalld(request) {
+    let response = match call_procd(&request) {
         Ok(response) => response,
         Err(errno) => return linux_errno(errno),
     };
     if old_action_ptr != 0 {
-        if let Err(errno) = ensure_syscalld_payload(&response, LINUX_SIGACTION_SIZE) {
-            return linux_errno(errno);
+        if response.status != 0 {
+            return linux_errno(response.status.unsigned_abs() as i64);
+        }
+        if response.payload_len as usize != LINUX_SIGACTION_SIZE {
+            return linux_errno(LINUX_EINVAL);
         }
         match usermem::write_current_user_bytes(
             old_action_ptr,
@@ -264,7 +312,7 @@ pub(super) fn syscall_linux_rt_sigaction(
             Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
         }
     } else {
-        match ensure_empty_syscalld_response(&response) {
+        match ensure_empty_procd_response(&response) {
             Ok(()) => 0,
             Err(errno) => linux_errno(errno),
         }
@@ -275,43 +323,74 @@ pub(super) fn syscall_linux_rt_sigprocmask(
     how: u64,
     set_ptr: u64,
     oldset_ptr: u64,
-    _sigset_size: u64,
+    sigset_size: u64,
 ) -> u64 {
-    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_RT_SIGPROCMASK);
+    if sigset_size != size_of::<u64>() as u64 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let mut request = new_procd_request(PROCD_OP_RT_SIGPROCMASK);
     request.arg0 = how;
+    let mut requested_mask = 0_u64;
     if set_ptr != 0 {
         let mut set = [0_u8; 8];
         if let Err(err) = usermem::copy_from_current_user_exact(set_ptr, &mut set) {
             return linux_errno(address_space_error_to_linux_errno(err));
         }
-        request.mask |= 0x1;
-        request.path_len = 8;
-        request.path[..8].copy_from_slice(&set);
+        requested_mask = u64::from_ne_bytes(set);
+        request.flags |= 0x1;
+        request.payload_len = 8;
+        request.payload[..8].copy_from_slice(&set);
     }
     if oldset_ptr != 0 {
         if let Err(err) = usermem::validate_current_user_write_buffer(oldset_ptr, 8) {
             return linux_errno(address_space_error_to_linux_errno(err));
         }
-        request.mask |= 0x2;
+        request.flags |= 0x2;
     }
-    let response = match call_syscalld(request) {
+    let response = match call_procd(&request) {
         Ok(response) => response,
         Err(errno) => return linux_errno(errno),
     };
+    if response.status != 0 {
+        return linux_errno(response.status.unsigned_abs() as i64);
+    }
+    if set_ptr != 0 {
+        sync_current_linux_signal_mask(how, requested_mask);
+    }
     if oldset_ptr != 0 {
-        if let Err(errno) = ensure_syscalld_payload(&response, 8) {
-            return linux_errno(errno);
+        if response.payload_len as usize != 8 {
+            return linux_errno(LINUX_EINVAL);
         }
         match usermem::write_current_user_bytes(oldset_ptr, &response.payload[..8]) {
             Ok(()) => 0,
             Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
         }
     } else {
-        match ensure_empty_syscalld_response(&response) {
+        match ensure_empty_procd_response(&response) {
             Ok(()) => 0,
             Err(errno) => linux_errno(errno),
         }
     }
+}
+
+fn sync_current_linux_signal_mask(how: u64, requested_mask: u64) {
+    const SIG_BLOCK: u64 = 0;
+    const SIG_UNBLOCK: u64 = 1;
+    const SIG_SETMASK: u64 = 2;
+    let unblockable = (1_u64 << (9 - 1)) | (1_u64 << (19 - 1));
+    let _ = multitask::with_current_user_process_and_linux_thread_state_mut(
+        |_, _, _, _, linux_thread_state| {
+            let Some(state) = linux_thread_state.as_mut() else {
+                return;
+            };
+            match how {
+                SIG_BLOCK => state.signal_mask |= requested_mask & !unblockable,
+                SIG_UNBLOCK => state.signal_mask &= !requested_mask,
+                SIG_SETMASK => state.signal_mask = requested_mask & !unblockable,
+                _ => {}
+            }
+        },
+    );
 }
 
 pub(super) fn syscall_linux_nanosleep(request_ptr: u64, _remaining_ptr: u64) -> u64 {
@@ -623,11 +702,18 @@ fn clone_linux_thread(
 
     let exit_signal = flags & linux_abi::CSIGNAL;
     let supported_flags = REQUIRED_THREAD_FLAGS | OPTIONAL_THREAD_FLAGS | linux_abi::CSIGNAL;
+    if flags & REQUIRED_THREAD_FLAGS != REQUIRED_THREAD_FLAGS {
+        return procd_fork(
+            frame,
+            flags,
+            child_stack,
+            parent_tid_ptr,
+            child_tid_ptr,
+            tls,
+        );
+    }
     if exit_signal != 0 || flags & !supported_flags != 0 {
         return linux_errno(LINUX_EINVAL);
-    }
-    if flags & REQUIRED_THREAD_FLAGS != REQUIRED_THREAD_FLAGS {
-        return linux_errno(LINUX_ENOSYS);
     }
     if child_stack == 0
         || !(paging::USER_SPACE_BASE..paging::USER_SPACE_END_EXCLUSIVE).contains(&child_stack)
@@ -1027,14 +1113,58 @@ pub(super) fn syscall_linux_set_tid_address(user_ptr: u64) -> u64 {
     result.unwrap_or_else(|| linux_errno(LINUX_ENOSYS))
 }
 
-pub(super) fn syscall_linux_tgkill(tgid: u64, tid: u64, signal: u64) -> u64 {
-    if signal > linux_abi::MAX_SIGNAL_NUMBER as u64 {
+pub(super) fn syscall_linux_kill(pid: u64, signal: u64) -> u64 {
+    let pid_i64 = pid as i64;
+    if pid_i64 == 0 || pid_i64 < -1 {
+        return linux_errno(LINUX_ENOSYS);
+    }
+    if signal > 64 {
         return linux_errno(LINUX_EINVAL);
     }
-    if multitask::queue_linux_signal(tgid, tid, signal) {
-        0
+    let target_pid = if pid_i64 == -1 {
+        match multitask::current_user_process_id() {
+            Some(id) => id,
+            None => return linux_errno(LINUX_ENOSYS),
+        }
     } else {
-        linux_errno(LINUX_ESRCH)
+        pid
+    };
+    let mut request = new_procd_request(rustos_user_abi::syscall::PROCD_OP_TGKILL);
+    request.arg0 = target_pid;
+    request.arg1 = target_pid;
+    request.arg2 = signal;
+    match call_procd(&request).and_then(|response| ensure_empty_procd_response(&response)) {
+        Ok(()) => 0,
+        Err(errno) => linux_errno(errno),
+    }
+}
+
+pub(super) fn syscall_linux_tkill(tid: u64, signal: u64) -> u64 {
+    if signal > 64 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let pid = match multitask::current_user_process_id() {
+        Some(id) => id,
+        None => return linux_errno(LINUX_ENOSYS),
+    };
+    let mut request = new_procd_request(rustos_user_abi::syscall::PROCD_OP_TGKILL);
+    request.arg0 = pid;
+    request.arg1 = tid;
+    request.arg2 = signal;
+    match call_procd(&request).and_then(|response| ensure_empty_procd_response(&response)) {
+        Ok(()) => 0,
+        Err(errno) => linux_errno(errno),
+    }
+}
+
+pub(super) fn syscall_linux_tgkill(tgid: u64, tid: u64, signal: u64) -> u64 {
+    let mut request = new_procd_request(rustos_user_abi::syscall::PROCD_OP_TGKILL);
+    request.arg0 = tgid;
+    request.arg1 = tid;
+    request.arg2 = signal;
+    match call_procd(&request).and_then(|response| ensure_empty_procd_response(&response)) {
+        Ok(()) => 0,
+        Err(errno) => linux_errno(errno),
     }
 }
 
@@ -2175,74 +2305,42 @@ pub(super) fn syscall_linux_net6(
 
 pub(super) fn syscall_linux_loader_spawn_exec(
     path_ptr: u64,
-    argv_ptr: u64,
-    envp_ptr: u64,
+    _argv_ptr: u64,
+    _envp_ptr: u64,
     flags: u64,
     console_session: u64,
     weight_micros: u64,
 ) -> u64 {
+    const BOOTSTRAP_SPAWN_ALLOWED_FLAGS: u64 = 0x1;
+
     let exec_path = match copy_current_user_path(path_ptr, LOADER_SPAWN_EXEC_PATH_CAPACITY) {
         Ok(path) => path,
         Err(errno) => return linux_errno(errno),
     };
-    let mut request = LoaderSpawnRequest {
-        flags: flags as u32,
-        console_session,
-        weight_micros,
-        ..LoaderSpawnRequest::default()
-    };
-    if exec_path.len() > request.exec_path.len() {
+    if flags & !BOOTSTRAP_SPAWN_ALLOWED_FLAGS != 0 {
         return linux_errno(LINUX_EINVAL);
     }
-    request.exec_path_len = exec_path.len() as u32;
-    request.exec_path[..exec_path.len()].copy_from_slice(exec_path.as_bytes());
-    if let Err(errno) = copy_string_vector(
-        argv_ptr,
-        LOADER_SPAWN_MAX_ARG_COUNT,
-        &mut request.argv_bytes,
-        &mut request.argv_bytes_len,
-        &mut request.argv_count,
-    ) {
-        return linux_errno(errno);
+    if !current_process_can_bootstrap_spawn() {
+        return linux_errno(LINUX_EACCES);
     }
-    if let Err(errno) = copy_string_vector(
-        envp_ptr,
-        LOADER_SPAWN_MAX_ENV_COUNT,
-        &mut request.env_bytes,
-        &mut request.env_bytes_len,
-        &mut request.env_count,
-    ) {
-        return linux_errno(errno);
-    }
-    // foundation 서비스(syscalld/vfsd/loaderd)는 loaderd를 경유하지 않고 항상 kernel
-    // bootstrap path를 사용한다. loaderd가 VFS(vfsd)에 의존하므로, 이 서비스들을 loaderd로
-    // respawn 하면 vfsd 크래시 시 의존 사이클이 발생해 복구 불가 상태가 된다.
-    if can_bootstrap_spawn_direct(exec_path.as_str()) {
-        return match spawn_bootstrap_exec_direct(
-            exec_path.as_str(),
-            flags,
-            console_session,
-            weight_micros,
-        ) {
-            Ok(pid) => pid,
-            Err(errno) => linux_errno(errno),
-        };
+    if !can_bootstrap_spawn_direct(exec_path.as_str()) {
+        return linux_errno(LINUX_EACCES);
     }
 
-    let response = match call_loaderd(&request) {
-        Ok(response) => response,
-        Err(errno) => return linux_errno(errno),
-    };
-    if response.version != LOADER_REQUEST_ABI_VERSION
-        || response.op != LOADER_OP_SPAWN_EXEC
-        || response.reserved0 != 0
-    {
-        return linux_errno(LINUX_EINVAL);
+    match spawn_bootstrap_exec_direct(exec_path.as_str(), flags, console_session, weight_micros) {
+        Ok(pid) => pid,
+        Err(errno) => linux_errno(errno),
     }
-    if response.status != 0 {
-        return linux_errno(response.status.unsigned_abs() as i64);
-    }
-    response.pid as u64
+}
+
+fn current_process_can_bootstrap_spawn() -> bool {
+    const ROOTD_EXEC_PATH: &str = "services/rootd/rootd.elf";
+
+    multitask::with_current_process_state(|_, process_state| {
+        process_state.security().is_logical_admin()
+            && process_state.exec_path().trim_start_matches('/') == ROOTD_EXEC_PATH
+    })
+    .unwrap_or(false)
 }
 
 fn can_bootstrap_spawn_direct(exec_path: &str) -> bool {
@@ -2252,6 +2350,8 @@ fn can_bootstrap_spawn_direct(exec_path: &str) -> bool {
         "services/syscalld/syscalld.elf"
             | "services/vfsd/vfsd.elf"
             | "services/loaderd/loaderd.elf"
+            | "services/procd/procd.elf"
+            | "services/initd/initd.elf"
     )
 }
 
@@ -2261,13 +2361,6 @@ fn spawn_bootstrap_exec_direct(
     console_session: u64,
     weight_micros: u64,
 ) -> Result<u64, i64> {
-    let current_is_admin =
-        multitask::with_current_process_credentials(|security| security.is_logical_admin())
-            .unwrap_or(false);
-    if !current_is_admin {
-        return Err(LINUX_EPERM);
-    }
-
     let loaded = crate::user::console_host::load_executable_image_by_path(exec_path, None)
         .map_err(console_host_error_to_linux_errno)?;
     let session = if console_session == 0 {
@@ -2346,6 +2439,167 @@ pub(super) fn copy_string_vector(
     Err(LINUX_E2BIG)
 }
 
+fn procd_exec(
+    frame: &mut SyscallFrame,
+    op: u16,
+    dirfd: u64,
+    path_ptr: u64,
+    argv_ptr: u64,
+    envp_ptr: u64,
+    flags: u64,
+) -> u64 {
+    if op == PROCD_OP_EXECVEAT && (flags != 0 || !is_linux_at_fdcwd(dirfd)) {
+        return linux_errno(LINUX_ENOSYS);
+    }
+    let raw_exec_path = match copy_current_user_path(path_ptr, PROCD_PATH_CAPACITY) {
+        Ok(path) => path,
+        Err(errno) => return linux_errno(errno),
+    };
+    let Some(process_id) = multitask::current_user_process_id() else {
+        return linux_errno(LINUX_ESRCH);
+    };
+    let exec_path = match crate::user::sysops::file::resolve_path_for_process(
+        process_id,
+        raw_exec_path.as_str(),
+    ) {
+        Ok(path) => path,
+        Err(errno) => return linux_errno(file_sysop_error_to_linux_errno(errno)),
+    };
+    let mut request = new_procd_request(op);
+    request.dirfd = (linux_abi::AT_FDCWD as i64) as u64;
+    request.flags = flags as u32;
+    if exec_path.len() > request.path.len() {
+        return linux_errno(LINUX_EINVAL);
+    }
+    request.path_len = exec_path.len() as u32;
+    request.path[..exec_path.len()].copy_from_slice(exec_path.as_bytes());
+    if let Err(errno) = copy_string_vector(
+        argv_ptr,
+        LOADER_SPAWN_MAX_ARG_COUNT,
+        &mut request.argv_bytes,
+        &mut request.argv_bytes_len,
+        &mut request.argv_count,
+    ) {
+        return linux_errno(errno);
+    }
+    if let Err(errno) = copy_string_vector(
+        envp_ptr,
+        LOADER_SPAWN_MAX_ENV_COUNT,
+        &mut request.env_bytes,
+        &mut request.env_bytes_len,
+        &mut request.env_count,
+    ) {
+        return linux_errno(errno);
+    }
+    match call_procd(&request).and_then(|response| ensure_empty_procd_response(&response)) {
+        Ok(()) if apply_pending_exec_transition(frame) => frame.rax,
+        Ok(()) => linux_errno(LINUX_EINVAL),
+        Err(errno) => linux_errno(errno),
+    }
+}
+
+fn is_linux_at_fdcwd(dirfd: u64) -> bool {
+    dirfd == linux_abi::AT_FDCWD as u64 || dirfd == (linux_abi::AT_FDCWD as i64) as u64
+}
+
+fn file_sysop_error_to_linux_errno(error: crate::user::sysops::file::FileSysopError) -> i64 {
+    match error {
+        crate::user::sysops::file::FileSysopError::AddressSpace(err) => {
+            address_space_error_to_linux_errno(err)
+        }
+        crate::user::sysops::file::FileSysopError::BadFileDescriptor => LINUX_EBADF,
+        crate::user::sysops::file::FileSysopError::InvalidArgument => LINUX_EINVAL,
+        crate::user::sysops::file::FileSysopError::NotFound => LINUX_ENOENT,
+        crate::user::sysops::file::FileSysopError::NotDirectory => LINUX_ENOTDIR,
+        crate::user::sysops::file::FileSysopError::PermissionDenied => LINUX_EACCES,
+        crate::user::sysops::file::FileSysopError::ReadOnlyFilesystem => LINUX_EROFS,
+        crate::user::sysops::file::FileSysopError::Unsupported => LINUX_ENOSYS,
+    }
+}
+
+fn procd_fork(
+    frame: &SyscallFrame,
+    clone_flags: u64,
+    stack_ptr: u64,
+    ptid_ptr: u64,
+    ctid_ptr: u64,
+    tls: u64,
+) -> u64 {
+    let mut request = new_procd_request(PROCD_OP_FORK);
+    request.arg0 = clone_flags;
+    request.arg1 = stack_ptr;
+    request.arg2 = ptid_ptr;
+    request.arg3 = ctid_ptr;
+    request.arg4 = tls;
+    request.registers = frame_to_user_registers(frame);
+    match call_procd(&request) {
+        Ok(response) if response.status == 0 => response.result as u64,
+        Ok(response) => linux_errno(response.status.unsigned_abs() as i64),
+        Err(errno) => linux_errno(errno),
+    }
+}
+
+fn frame_to_user_registers(frame: &SyscallFrame) -> RustosUserRegisters {
+    RustosUserRegisters {
+        rax: frame.rax,
+        rbx: frame.rbx,
+        rcx: frame.user_rip,
+        rdx: frame.rdx,
+        rsi: frame.rsi,
+        rdi: frame.rdi,
+        rbp: frame.rbp,
+        rsp: frame.user_rsp,
+        rip: frame.user_rip,
+        r8: frame.r8,
+        r9: frame.r9,
+        r10: frame.r10,
+        r11: frame.user_rflags,
+        r12: frame.r12,
+        r13: frame.r13,
+        r14: frame.r14,
+        r15: frame.r15,
+        rflags: frame.user_rflags,
+    }
+}
+
+pub(super) fn new_procd_request(op: u16) -> ProcdIpcRequest {
+    let mut request = ProcdIpcRequest {
+        op,
+        ..ProcdIpcRequest::default()
+    };
+    if let Some(snapshot) = multitask::current_user_snapshot() {
+        request.pid = snapshot.process_id();
+        request.tid = snapshot.thread_id();
+        request.parent_pid = multitask::parent_process_id_of(snapshot.process_id()).unwrap_or(0);
+    }
+    if let Some(thread_state) = multitask::current_linux_thread_state() {
+        request.arg5 = thread_state.signal_mask;
+    }
+    request
+}
+
+pub(super) fn call_procd(request: &ProcdIpcRequest) -> Result<ProcdIpcResponse, i64> {
+    let response = ipc_ops::call_service_endpoint(IPC_SERVICE_PROCD, as_bytes(request))?;
+    if response.len() != size_of::<ProcdIpcResponse>() {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(read_unaligned::<ProcdIpcResponse>(response.as_slice()))
+}
+
+pub(super) fn ensure_empty_procd_response(response: &ProcdIpcResponse) -> Result<(), i64> {
+    if response.version != rustos_user_abi::syscall::PROCD_IPC_ABI_VERSION
+        || response.payload_len != 0
+        || response.reserved0 != 0
+        || response.reserved1 != 0
+    {
+        return Err(LINUX_EINVAL);
+    }
+    if response.status != 0 {
+        return Err(response.status.unsigned_abs() as i64);
+    }
+    Ok(())
+}
+
 pub(super) fn new_vfs_request(op: u16) -> VfsIpcRequest {
     let mut request = VfsIpcRequest {
         op,
@@ -2405,14 +2659,6 @@ pub(super) fn call_service_offload_request(
     Ok(read_unaligned::<LinuxSyscallOffloadResponse>(
         response.as_slice(),
     ))
-}
-
-pub(super) fn call_loaderd(request: &LoaderSpawnRequest) -> Result<LoaderSpawnResponse, i64> {
-    let response = ipc_ops::call_service_endpoint(IPC_SERVICE_LOADERD, as_bytes(request))?;
-    if response.len() != size_of::<LoaderSpawnResponse>() {
-        return Err(LINUX_EINVAL);
-    }
-    Ok(read_unaligned::<LoaderSpawnResponse>(response.as_slice()))
 }
 
 pub(super) fn ensure_vfs_status(response: &VfsIpcResponse) -> Result<(), i64> {

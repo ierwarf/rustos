@@ -4,15 +4,15 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use rustos_user_abi::syscall::{
-    LinuxRlimit, LinuxSigActionWire, LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse,
-    LinuxTimespecWire, LinuxUtsName, RustosMmBrokerArgs, RustosMmFdBrokerResult,
-    RustosMmLayoutBrokerResult, RustosMmMapBrokerResult, LINUX_CPUSET_BYTES,
-    LINUX_DEFAULT_STACK_RLIMIT_BYTES, LINUX_RLIMIT_SIZE, LINUX_SIGACTION_SIZE, LINUX_TIMESPEC_SIZE,
-    MM_BROKER_ABI_VERSION, MM_BROKER_FD_KIND_DEVICE, MM_BROKER_FD_KIND_DISPLAY_SURFACE,
-    MM_BROKER_FD_KIND_FILE, MM_BROKER_FD_KIND_MEMFD, MM_BROKER_OP_DESCRIBE_FD,
-    MM_BROKER_OP_MAP_ANON, MM_BROKER_OP_MAP_DEVICE_SHARED, MM_BROKER_OP_MAP_FILE_PRIVATE,
-    MM_BROKER_OP_MAP_MEMFD_SHARED, MM_BROKER_OP_PROTECT, MM_BROKER_OP_QUERY_LAYOUT,
-    MM_BROKER_OP_UNMAP, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, SYS_RUSTOS_MM_BROKER,
+    LinuxRlimit, LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, LinuxTimespecWire,
+    LinuxUtsName, RustosMmBrokerArgs, RustosMmFdBrokerResult, RustosMmLayoutBrokerResult,
+    RustosMmMapBrokerResult, LINUX_CPUSET_BYTES, LINUX_DEFAULT_STACK_RLIMIT_BYTES,
+    LINUX_RLIMIT_SIZE, LINUX_TIMESPEC_SIZE, MM_BROKER_ABI_VERSION, MM_BROKER_FD_KIND_DEVICE,
+    MM_BROKER_FD_KIND_DISPLAY_SURFACE, MM_BROKER_FD_KIND_FILE, MM_BROKER_FD_KIND_MEMFD,
+    MM_BROKER_OP_DESCRIBE_FD, MM_BROKER_OP_MAP_ANON, MM_BROKER_OP_MAP_DEVICE_SHARED,
+    MM_BROKER_OP_MAP_FILE_PRIVATE, MM_BROKER_OP_MAP_MEMFD_SHARED, MM_BROKER_OP_PROTECT,
+    MM_BROKER_OP_QUERY_LAYOUT, MM_BROKER_OP_UNMAP, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY,
+    SYS_RUSTOS_MM_BROKER,
 };
 use spin::Mutex;
 
@@ -33,10 +33,6 @@ const PROT_READ: u64 = 0x1;
 const PROT_WRITE: u64 = 0x2;
 const PROT_EXEC: u64 = 0x4;
 const LINUX_USER_SPACE_END: u64 = 0x0000_8000_0000;
-const SS_DISABLE: u32 = 2;
-const SS_ONSTACK: u32 = 1;
-const MINSIGSTKSZ: u64 = 2048;
-
 // Linux madvise constants used by the service-side policy subset.
 const MADV_NORMAL: u64 = 0;
 const MADV_RANDOM: u64 = 1;
@@ -60,7 +56,6 @@ const MADV_PAGEOUT: u64 = 21;
 const MADV_POPULATE_READ: u64 = 22;
 const MADV_POPULATE_WRITE: u64 = 23;
 const MADV_DONTNEED_LOCKED: u64 = 24;
-const WNOHANG: u64 = 1;
 const MFD_CLOEXEC: u64 = 0x0001;
 const MFD_ALLOW_SEALING: u64 = 0x0002;
 const MEMFD_NAME_MAX: usize = 249;
@@ -73,16 +68,11 @@ struct LinuxPolicyState {
     parent_pid: u64,
     pgid: u64,
     sid: u64,
-    signal_mask: u64,
-    sigactions: [LinuxSigActionWire; 65],
     robust_head: u64,
     robust_len: u64,
     rseq_area: u64,
     rseq_len: u64,
     rseq_signature: u64,
-    sigaltstack_sp: u64,
-    sigaltstack_size: u64,
-    sigaltstack_flags: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -274,23 +264,6 @@ pub(crate) fn handle_setgid(
     response.payload_len = 0;
 }
 
-pub(crate) fn handle_wait4(
-    request: &LinuxSyscallOffloadRequest,
-    response: &mut LinuxSyscallOffloadResponse,
-) {
-    let pid = request.dirfd as i64;
-    if request.flags & !WNOHANG != 0 {
-        response.status = errno::EINVAL;
-        return;
-    }
-    if pid < -1 || pid == 0 {
-        response.status = errno::ENOSYS;
-        return;
-    }
-    response.status = 0;
-    response.payload_len = 0;
-}
-
 pub(crate) fn handle_memfd_create(
     request: &LinuxSyscallOffloadRequest,
     response: &mut LinuxSyscallOffloadResponse,
@@ -336,16 +309,11 @@ fn initial_state(request: &LinuxSyscallOffloadRequest) -> LinuxPolicyState {
         parent_pid: request.parent_pid,
         pgid: request.pid,
         sid: request.pid,
-        signal_mask: 0,
-        sigactions: [LinuxSigActionWire::default(); 65],
         robust_head: 0,
         robust_len: 0,
         rseq_area: 0,
         rseq_len: 0,
         rseq_signature: 0,
-        sigaltstack_sp: 0,
-        sigaltstack_size: 0,
-        sigaltstack_flags: SS_DISABLE,
     }
 }
 
@@ -508,77 +476,6 @@ pub(crate) fn handle_getrandom(
     fill_random_bytes(&mut response.payload[..len], request.pid, request.tid);
     response.status = 0;
     response.payload_len = len as u32;
-}
-
-pub(crate) fn handle_rt_sigaction(
-    request: &LinuxSyscallOffloadRequest,
-    response: &mut LinuxSyscallOffloadResponse,
-) {
-    let signal = request.arg0 as usize;
-    let has_action = request.mask & 0x1 != 0;
-    let wants_old = request.mask & 0x2 != 0;
-    if signal == 0 || signal >= 65 {
-        response.status = errno::EINVAL;
-        return;
-    }
-    if has_action && request.path_len as usize != LINUX_SIGACTION_SIZE {
-        response.status = errno::EINVAL;
-        return;
-    }
-    let mut policy = policy_db().lock();
-    let state = ensure_state_with_inheritance(&mut policy, request);
-    let old = state.sigactions[signal];
-    if has_action {
-        state.sigactions[signal] = read_sigaction(&request.path[..LINUX_SIGACTION_SIZE]);
-    }
-    if wants_old {
-        copy_payload(response, &old);
-    } else {
-        response.status = 0;
-        response.payload_len = 0;
-    }
-}
-
-pub(crate) fn handle_rt_sigprocmask(
-    request: &LinuxSyscallOffloadRequest,
-    response: &mut LinuxSyscallOffloadResponse,
-) {
-    const SIG_BLOCK: u64 = 0;
-    const SIG_UNBLOCK: u64 = 1;
-    const SIG_SETMASK: u64 = 2;
-    let how = request.arg0;
-    let has_set = request.mask & 0x1 != 0;
-    let wants_old = request.mask & 0x2 != 0;
-    if has_set && request.path_len as usize != 8 {
-        response.status = errno::EINVAL;
-        return;
-    }
-    let requested_mask = if has_set {
-        read_u64(&request.path[..8], 0)
-    } else {
-        0
-    };
-    let unblockable = (1_u64 << 9) | (1_u64 << 19);
-    let mut policy = policy_db().lock();
-    let state = ensure_state_with_inheritance(&mut policy, request);
-    let old = state.signal_mask;
-    if has_set {
-        match how {
-            SIG_BLOCK => state.signal_mask |= requested_mask & !unblockable,
-            SIG_UNBLOCK => state.signal_mask &= !requested_mask,
-            SIG_SETMASK => state.signal_mask = requested_mask & !unblockable,
-            _ => {
-                response.status = errno::EINVAL;
-                return;
-            }
-        }
-    }
-    if wants_old {
-        copy_payload(response, &old);
-    } else {
-        response.status = 0;
-        response.payload_len = 0;
-    }
 }
 
 pub(crate) fn handle_nanosleep(
@@ -744,15 +641,6 @@ fn read_timespec(bytes: &[u8]) -> LinuxTimespecWire {
     }
 }
 
-fn read_sigaction(bytes: &[u8]) -> LinuxSigActionWire {
-    LinuxSigActionWire {
-        handler: read_u64(bytes, 0),
-        flags: read_u64(bytes, 8),
-        restorer: read_u64(bytes, 16),
-        mask: read_u64(bytes, 24),
-    }
-}
-
 fn write_uts_field(dest: &mut [u8; 65], value: &[u8]) {
     let len = value.len().min(dest.len().saturating_sub(1));
     dest[..len].copy_from_slice(&value[..len]);
@@ -819,88 +707,6 @@ pub(crate) fn handle_madvise(
     }
     response.status = 0;
     response.payload_len = 0;
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct SigaltstackPayload {
-    has_old: u8,
-    _pad: [u8; 7],
-    old_ss_sp: u64,
-    old_ss_size: u64,
-    old_ss_flags: u32,
-    _pad2: [u8; 4],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct SigaltstackRequestExtra {
-    has_new: u8,
-    _pad: [u8; 7],
-    new_ss_sp: u64,
-    new_ss_size: u64,
-    new_ss_flags: u32,
-    _pad2: [u8; 4],
-}
-
-pub(crate) fn handle_sigaltstack(
-    request: &LinuxSyscallOffloadRequest,
-    response: &mut LinuxSyscallOffloadResponse,
-) {
-    let wants_old = request.mask & 0x1 != 0;
-    let extra_size = size_of::<SigaltstackRequestExtra>();
-    if (request.path_len as usize) != extra_size {
-        response.status = errno::EINVAL;
-        return;
-    }
-    let mut extra = SigaltstackRequestExtra::default();
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            request.path.as_ptr(),
-            (&mut extra as *mut SigaltstackRequestExtra).cast::<u8>(),
-            extra_size,
-        );
-    }
-    let mut policy = policy_db().lock();
-    let state = ensure_state_with_inheritance(&mut policy, request);
-    let old_payload = SigaltstackPayload {
-        has_old: 1,
-        old_ss_sp: state.sigaltstack_sp,
-        old_ss_size: state.sigaltstack_size,
-        old_ss_flags: if state.sigaltstack_size == 0 {
-            SS_DISABLE
-        } else {
-            state.sigaltstack_flags
-        },
-        ..SigaltstackPayload::default()
-    };
-    if extra.has_new != 0 {
-        let new_flags = extra.new_ss_flags;
-        let recognized = new_flags & !(SS_DISABLE | SS_ONSTACK);
-        if recognized != 0 {
-            response.status = errno::EINVAL;
-            return;
-        }
-        if new_flags & SS_DISABLE != 0 {
-            state.sigaltstack_sp = 0;
-            state.sigaltstack_size = 0;
-            state.sigaltstack_flags = SS_DISABLE;
-        } else {
-            if extra.new_ss_size < MINSIGSTKSZ {
-                response.status = errno::ENOMEM;
-                return;
-            }
-            state.sigaltstack_sp = extra.new_ss_sp;
-            state.sigaltstack_size = extra.new_ss_size;
-            state.sigaltstack_flags = new_flags;
-        }
-    }
-    if wants_old {
-        copy_payload(response, &old_payload);
-    } else {
-        response.status = 0;
-        response.payload_len = 0;
-    }
 }
 
 pub(crate) fn handle_brk(
@@ -1391,6 +1197,12 @@ fn mm_broker_call(args: &RustosMmBrokerArgs) -> Result<(), i32> {
     } else {
         Ok(())
     }
+}
+
+pub(crate) fn handle_process_exit(request: &LinuxSyscallOffloadRequest) {
+    let dead_pid = request.pid;
+    PROCESS_POLICY.lock().remove(&dead_pid);
+    MM_POLICY.lock().remove(&dead_pid);
 }
 
 fn mmap_offset(request: &LinuxSyscallOffloadRequest) -> u64 {

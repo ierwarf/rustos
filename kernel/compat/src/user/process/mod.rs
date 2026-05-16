@@ -10,7 +10,9 @@ use crate::multitask;
 use crate::user::abi::UserAbi;
 use crate::user::handles::VfsFileHandle;
 use crate::user::linux::{LinuxProcessImageInfo, LinuxProcessLaunch};
-use crate::user::process_state::{ProcessSecurityContext, WindowsProcessRuntimeState};
+use crate::user::process_state::{
+    ProcessSecurityContext, WindowsProcessRuntimeState, WindowsThreadRuntimeState,
+};
 use crate::vfs;
 
 mod linux;
@@ -221,6 +223,15 @@ enum LoadedProcessRuntime {
 struct WindowsProcessImageInfo {
     image_base: u64,
     image_size: u64,
+    runtime: Option<WindowsProcessRuntimeState>,
+    teb_address: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct WindowsProcessLoaderRuntime {
+    pub entry_point: u64,
+    pub runtime: WindowsProcessRuntimeState,
+    pub teb_address: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -290,6 +301,40 @@ pub fn prepare_process_with_address_space(
     if matches!(loaded.abi, UserAbi::Linux | UserAbi::Windows) {
         loaded.address_space = address_space;
     }
+    prepare_loaded_process_with_launch(loaded, launch)
+}
+
+pub fn prepare_windows_process_with_address_space(
+    metadata: WindowsProcessLoaderRuntime,
+    address_space: ProcessAddressSpace,
+    launch: ProcessLaunchOptions<'_>,
+) -> Result<PreparedProcessImage, ProcessLoadError> {
+    let loaded = LoadedProcessImage {
+        abi: UserAbi::Windows,
+        address_space,
+        entry: VirtAddr::new(metadata.entry_point),
+        runtime: LoadedProcessRuntime::Windows(WindowsProcessImageInfo {
+            image_base: metadata.runtime.image_base,
+            image_size: metadata.runtime.image_size,
+            runtime: Some(metadata.runtime),
+            teb_address: metadata.teb_address,
+        }),
+    };
+    prepare_loaded_process_with_launch(loaded, launch)
+}
+
+pub fn prepare_linux_process_with_metadata(
+    info: LinuxProcessImageInfo,
+    actual_entry: u64,
+    address_space: ProcessAddressSpace,
+    launch: ProcessLaunchOptions<'_>,
+) -> Result<PreparedProcessImage, ProcessLoadError> {
+    let loaded = LoadedProcessImage {
+        abi: UserAbi::Linux,
+        address_space,
+        entry: VirtAddr::new(actual_entry),
+        runtime: LoadedProcessRuntime::Linux(info),
+    };
     prepare_loaded_process_with_launch(loaded, launch)
 }
 
@@ -440,53 +485,12 @@ fn build_process_bootstrap(
             )
         }
         (UserAbi::Windows, LoadedProcessRuntime::Windows(image)) => {
-            let stack_pointer = initial_user_stack_top(stack_end)?;
-            let runtime = WindowsProcessRuntimeState {
-                image_base: image.image_base,
-                image_size: image.image_size,
-                allocation_base_hint: image.image_base.saturating_add(image.image_size),
-                public_runtime_address: 0,
-                peb_address: 0,
-                teb_address: 0,
-                process_parameters_address: 0,
-                loader_data_address: 0,
-                loader_module_array_address: 0,
-                loader_module_count: 1,
-                loader_reserved: 0,
-                main_module_entry_address: entry.as_u64(),
-                command_line_w_ptr: 0,
-                command_line_a_ptr: 0,
-                environment_w_ptr: 0,
-                environment_a_ptr: 0,
-                module_path_w_ptr: 0,
-                module_path_a_ptr: 0,
-                module_directory_w_ptr: 0,
-                module_directory_a_ptr: 0,
-                main_module_base_name_w_ptr: 0,
-                main_module_base_name_a_ptr: 0,
-                argc: 0,
-                argc_ptr: 0,
-                argv_ptr_ptr: 0,
-                environ_ptr_ptr: 0,
-                argv_ptr: 0,
-                environ_ptr: 0,
-                initial_narrow_environment_ptr: 0,
-                initenv_ptr: 0,
-                errno_ptr: 0,
-                last_error_ptr: 0,
-                commode_ptr: 0,
-                fmode_ptr: 0,
-                iob_array_ptr: 0,
-                stdin_file_ptr: 0,
-                stdout_file_ptr: 0,
-                stderr_file_ptr: 0,
-                localeconv_ptr: 0,
-                strerror_einval_ptr: 0,
-                strerror_enomem_ptr: 0,
-                strerror_eio_ptr: 0,
-                strerror_erange_ptr: 0,
-                strerror_unknown_ptr: 0,
+            let Some(runtime) = image.runtime else {
+                return Err(ProcessLoadError::InvalidPe(
+                    "Windows runtime metadata was not provided by loaderd",
+                ));
             };
+            let stack_pointer = initial_user_stack_top(stack_end)?;
             (stack_pointer, None, None, None, None, Some(runtime))
         }
         _ => {
@@ -511,6 +515,10 @@ fn build_process_bootstrap(
     bootstrap.linux_runtime_profile = linux_runtime_profile;
     bootstrap.linux_thread_state = linux_thread_state;
     bootstrap.windows_runtime = windows_runtime;
+    if let Some(runtime) = bootstrap.windows_runtime {
+        bootstrap.windows_thread_state =
+            Some(WindowsThreadRuntimeState::new(0, runtime.teb_address));
+    }
     bootstrap.console_session = launch.console_session;
     bootstrap.logical_admin = launch.logical_admin;
     bootstrap.set_exec_path(launch.linux.exec_path);
@@ -563,6 +571,8 @@ fn load_pe_metadata(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadError
             image_base,
             image_size: align_up(size_of_image, PAGE_SIZE)
                 .ok_or(ProcessLoadError::InvalidPe("PE image size overflow"))?,
+            runtime: None,
+            teb_address: 0,
         }),
     })
 }

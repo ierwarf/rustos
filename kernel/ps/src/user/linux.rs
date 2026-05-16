@@ -131,6 +131,8 @@ raw_u64! {
     SYS_CLONE3 = linux::__NR_clone3;
     SYS_MEMFD_CREATE = linux::__NR_memfd_create;
     SYS_UMASK = linux::__NR_umask;
+    SYS_KILL = linux::__NR_kill;
+    SYS_TKILL = linux::__NR_tkill;
     SYS_GETPPID = linux::__NR_getppid;
     SYS_GETPGID = linux::__NR_getpgid;
     SYS_SETPGID = linux::__NR_setpgid;
@@ -1397,6 +1399,21 @@ pub const SYS_RUSTOS_PROC_MAP_ZEROED_BROKER: u64 =
     rustos_user_abi::syscall::SYS_RUSTOS_PROC_MAP_ZEROED_BROKER;
 pub const SYS_RUSTOS_PROC_MAP_DATA_BROKER: u64 =
     rustos_user_abi::syscall::SYS_RUSTOS_PROC_MAP_DATA_BROKER;
+pub const SYS_RUSTOS_PROC_SET_IMAGE_BLOB_BROKER: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_PROC_SET_IMAGE_BLOB_BROKER;
+pub const SYS_RUSTOS_PROC_AUTHORIZE_EXEC_BROKER: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_PROC_AUTHORIZE_EXEC_BROKER;
+pub const SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER;
+pub const SYS_RUSTOS_PROC_MAP_FILE_BATCH_BROKER: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_PROC_MAP_FILE_BATCH_BROKER;
+pub const SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER;
+pub const SYS_RUSTOS_PROC_EXEC_TARGET_BROKER: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_PROC_EXEC_TARGET_BROKER;
+pub const SYS_RUSTOS_PROC_FORK_BROKER: u64 = rustos_user_abi::syscall::SYS_RUSTOS_PROC_FORK_BROKER;
+pub const SYS_RUSTOS_PROC_SIGNAL_QUEUE_BROKER: u64 =
+    rustos_user_abi::syscall::SYS_RUSTOS_PROC_SIGNAL_QUEUE_BROKER;
 pub const SYS_RUSTOS_PROC_COMMIT_BROKER: u64 =
     rustos_user_abi::syscall::SYS_RUSTOS_PROC_COMMIT_BROKER;
 pub const SYS_RUSTOS_PROC_ABORT_BROKER: u64 =

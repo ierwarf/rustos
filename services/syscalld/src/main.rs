@@ -7,25 +7,23 @@ use core::mem::size_of;
 
 use rustos_svc_runtime::ipc;
 use rustos_user_abi::syscall::{
-    LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, SYSCALL_OFFLOAD_ABI_VERSION,
-    SYSCALL_OFFLOAD_OP_LINUX_BRK, SYSCALL_OFFLOAD_OP_LINUX_CLOCK_GETTIME,
-    SYSCALL_OFFLOAD_OP_LINUX_CLOCK_NANOSLEEP, SYSCALL_OFFLOAD_OP_LINUX_GETEGID,
-    SYSCALL_OFFLOAD_OP_LINUX_GETEUID, SYSCALL_OFFLOAD_OP_LINUX_GETGID,
-    SYSCALL_OFFLOAD_OP_LINUX_GETPGID, SYSCALL_OFFLOAD_OP_LINUX_GETPPID,
-    SYSCALL_OFFLOAD_OP_LINUX_GETRANDOM, SYSCALL_OFFLOAD_OP_LINUX_GETSID,
-    SYSCALL_OFFLOAD_OP_LINUX_GETUID, SYSCALL_OFFLOAD_OP_LINUX_GET_ROBUST_LIST,
-    SYSCALL_OFFLOAD_OP_LINUX_MADVISE, SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE,
-    SYSCALL_OFFLOAD_OP_LINUX_MMAP, SYSCALL_OFFLOAD_OP_LINUX_MPROTECT,
-    SYSCALL_OFFLOAD_OP_LINUX_MUNMAP, SYSCALL_OFFLOAD_OP_LINUX_NANOSLEEP,
-    SYSCALL_OFFLOAD_OP_LINUX_PRLIMIT64,
-    SYSCALL_OFFLOAD_OP_LINUX_RSEQ, SYSCALL_OFFLOAD_OP_LINUX_RT_SIGACTION,
-    SYSCALL_OFFLOAD_OP_LINUX_RT_SIGPROCMASK, SYSCALL_OFFLOAD_OP_LINUX_SCHED_GETAFFINITY,
-    SYSCALL_OFFLOAD_OP_LINUX_SETGID, SYSCALL_OFFLOAD_OP_LINUX_SETPGID,
-    SYSCALL_OFFLOAD_OP_LINUX_SETSID, SYSCALL_OFFLOAD_OP_LINUX_SETUID,
-    SYSCALL_OFFLOAD_OP_LINUX_SET_ROBUST_LIST, SYSCALL_OFFLOAD_OP_LINUX_SIGALTSTACK,
+    LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, Win32SyscallOffloadRequest,
+    Win32SyscallOffloadResponse, SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_BRK,
+    SYSCALL_OFFLOAD_OP_LINUX_CLOCK_GETTIME, SYSCALL_OFFLOAD_OP_LINUX_CLOCK_NANOSLEEP,
+    SYSCALL_OFFLOAD_OP_LINUX_GETEGID, SYSCALL_OFFLOAD_OP_LINUX_GETEUID,
+    SYSCALL_OFFLOAD_OP_LINUX_GETGID, SYSCALL_OFFLOAD_OP_LINUX_GETPGID,
+    SYSCALL_OFFLOAD_OP_LINUX_GETPPID, SYSCALL_OFFLOAD_OP_LINUX_GETRANDOM,
+    SYSCALL_OFFLOAD_OP_LINUX_GETSID, SYSCALL_OFFLOAD_OP_LINUX_GETUID,
+    SYSCALL_OFFLOAD_OP_LINUX_GET_ROBUST_LIST, SYSCALL_OFFLOAD_OP_LINUX_MADVISE,
+    SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE, SYSCALL_OFFLOAD_OP_LINUX_MMAP,
+    SYSCALL_OFFLOAD_OP_LINUX_MPROTECT, SYSCALL_OFFLOAD_OP_LINUX_MUNMAP,
+    SYSCALL_OFFLOAD_OP_LINUX_NANOSLEEP, SYSCALL_OFFLOAD_OP_LINUX_PRLIMIT64,
+    SYSCALL_OFFLOAD_OP_LINUX_PROCESS_EXIT, SYSCALL_OFFLOAD_OP_LINUX_RSEQ,
+    SYSCALL_OFFLOAD_OP_LINUX_SCHED_GETAFFINITY, SYSCALL_OFFLOAD_OP_LINUX_SETGID,
+    SYSCALL_OFFLOAD_OP_LINUX_SETPGID, SYSCALL_OFFLOAD_OP_LINUX_SETSID,
+    SYSCALL_OFFLOAD_OP_LINUX_SETUID, SYSCALL_OFFLOAD_OP_LINUX_SET_ROBUST_LIST,
     SYSCALL_OFFLOAD_OP_LINUX_UMASK, SYSCALL_OFFLOAD_OP_LINUX_UNAME,
-    SYSCALL_OFFLOAD_OP_LINUX_WAIT4, SYSCALL_OFFLOAD_PATH_CAPACITY,
-    WIN32_SYSCALL_OFFLOAD_ABI_VERSION, Win32SyscallOffloadRequest, Win32SyscallOffloadResponse,
+    SYSCALL_OFFLOAD_PATH_CAPACITY, WIN32_SYSCALL_OFFLOAD_ABI_VERSION,
 };
 
 mod errno;
@@ -70,13 +68,7 @@ fn serve(endpoint: u64) {
         }
 
         let response = handle_request(received as usize, &request);
-        let reply = unsafe {
-            ipc::reply(
-                reply_cap,
-                response.as_ptr(),
-                response.len(),
-            )
-        };
+        let reply = unsafe { ipc::reply(reply_cap, response.as_ptr(), response.len()) };
         if reply < 0 {
             ipc::debug_line("syscalld: reply failed");
         }
@@ -91,12 +83,8 @@ enum SyscallOffloadReply {
 impl SyscallOffloadReply {
     fn as_ptr(&self) -> *const u8 {
         match self {
-            Self::Linux(response) => {
-                (response as *const LinuxSyscallOffloadResponse).cast::<u8>()
-            }
-            Self::Win32(response) => {
-                (response as *const Win32SyscallOffloadResponse).cast::<u8>()
-            }
+            Self::Linux(response) => (response as *const LinuxSyscallOffloadResponse).cast::<u8>(),
+            Self::Win32(response) => (response as *const Win32SyscallOffloadResponse).cast::<u8>(),
         }
     }
 
@@ -170,12 +158,6 @@ fn handle_linux_request(
         SYSCALL_OFFLOAD_OP_LINUX_SETPGID => linux_policy::handle_setpgid(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_GETSID => linux_policy::handle_getsid(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_SETSID => linux_policy::handle_setsid(request, response),
-        SYSCALL_OFFLOAD_OP_LINUX_RT_SIGACTION => {
-            linux_policy::handle_rt_sigaction(request, response)
-        }
-        SYSCALL_OFFLOAD_OP_LINUX_RT_SIGPROCMASK => {
-            linux_policy::handle_rt_sigprocmask(request, response)
-        }
         SYSCALL_OFFLOAD_OP_LINUX_NANOSLEEP => linux_policy::handle_nanosleep(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_CLOCK_GETTIME => {
             linux_policy::handle_clock_gettime(request, response)
@@ -191,15 +173,14 @@ fn handle_linux_request(
         }
         SYSCALL_OFFLOAD_OP_LINUX_RSEQ => linux_policy::handle_rseq(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_MADVISE => linux_policy::handle_madvise(request, response),
-        SYSCALL_OFFLOAD_OP_LINUX_SIGALTSTACK => linux_policy::handle_sigaltstack(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_BRK => linux_policy::handle_brk(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_MMAP => linux_policy::handle_mmap(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_MPROTECT => linux_policy::handle_mprotect(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_MUNMAP => linux_policy::handle_munmap(request, response),
-        SYSCALL_OFFLOAD_OP_LINUX_WAIT4 => linux_policy::handle_wait4(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE => {
             linux_policy::handle_memfd_create(request, response)
         }
+        SYSCALL_OFFLOAD_OP_LINUX_PROCESS_EXIT => linux_policy::handle_process_exit(request),
         _ => response.status = errno::EINVAL,
     }
 }
@@ -246,8 +227,6 @@ fn validate_request(received: usize, request: &LinuxSyscallOffloadRequest) -> Re
         | SYSCALL_OFFLOAD_OP_LINUX_SETPGID
         | SYSCALL_OFFLOAD_OP_LINUX_GETSID
         | SYSCALL_OFFLOAD_OP_LINUX_SETSID
-        | SYSCALL_OFFLOAD_OP_LINUX_RT_SIGACTION
-        | SYSCALL_OFFLOAD_OP_LINUX_RT_SIGPROCMASK
         | SYSCALL_OFFLOAD_OP_LINUX_NANOSLEEP
         | SYSCALL_OFFLOAD_OP_LINUX_CLOCK_GETTIME
         | SYSCALL_OFFLOAD_OP_LINUX_CLOCK_NANOSLEEP
@@ -255,13 +234,12 @@ fn validate_request(received: usize, request: &LinuxSyscallOffloadRequest) -> Re
         | SYSCALL_OFFLOAD_OP_LINUX_GET_ROBUST_LIST
         | SYSCALL_OFFLOAD_OP_LINUX_RSEQ
         | SYSCALL_OFFLOAD_OP_LINUX_MADVISE
-        | SYSCALL_OFFLOAD_OP_LINUX_SIGALTSTACK
         | SYSCALL_OFFLOAD_OP_LINUX_BRK
         | SYSCALL_OFFLOAD_OP_LINUX_MMAP
         | SYSCALL_OFFLOAD_OP_LINUX_MPROTECT
         | SYSCALL_OFFLOAD_OP_LINUX_MUNMAP
-        | SYSCALL_OFFLOAD_OP_LINUX_WAIT4
-        | SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE => Ok(()),
+        | SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE
+        | SYSCALL_OFFLOAD_OP_LINUX_PROCESS_EXIT => Ok(()),
         _ => Err(errno::EINVAL),
     }
 }

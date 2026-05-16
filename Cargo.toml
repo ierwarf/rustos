@@ -33,6 +33,7 @@ members = [
     "services/devmgrd",
     "services/driverd",
     "services/loaderd",
+    "services/procd",
     "services/runtimed",
     "services/sessiond",
     "services/uiserver",

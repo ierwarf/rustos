@@ -1,6 +1,9 @@
 mod bus;
 mod class;
 
+// Future boundary: driver/provider policy belongs in driverd/devmgrd.
+// Keep this module limited to privileged hardware presence checks, DMA/MMIO/IRQ
+// substrate, and narrow broker hooks until driver domains are isolated.
 pub mod dma;
 pub mod iommu;
 pub mod irq;

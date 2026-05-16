@@ -1,0 +1,15 @@
+[package]
+name = "procd"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rustos-svc-runtime = { path = "../../libs/rustos-svc-runtime" }
+rustos-user-abi = { path = "../../libs/rustos-user-abi" }
+spin = { version = "0.10", default-features = false, features = ["spin_mutex"] }
+
+[[bin]]
+name = "procd"
+path = "src/main.rs"
+test = false

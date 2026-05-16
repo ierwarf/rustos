@@ -71,8 +71,8 @@ Kernel/userspace ABI:
   `kernel/compat/src/user/abi.rs`.
 - The kernel launches `services/rootd/rootd.elf` as the first user process.
   `rootd` is the bootstrap initial task: it must avoid Linux libc/std dynamic
-  runtime dependencies, start `syscalld`, `vfsd`, and `loaderd`, then hand off
-  normal service orchestration to `services/initd/initd.elf`. Kernel boot code
+  runtime dependencies, start `syscalld`, `vfsd`, `loaderd`, and `procd`, then
+  hand off normal service orchestration to `services/initd/initd.elf`. Kernel boot code
   should not grow generic POSIX compatibility exceptions for `initd`; any
   unavoidable early service bootstrap surface must stay narrow, explicit, and
   tied to `rootd` bringing up foundational policy services.
@@ -82,9 +82,11 @@ Kernel/userspace ABI:
   `munmap` belongs to `syscalld`; kernel MM keeps only the gated
   `SYS_RUSTOS_MM_BROKER` primitive for target address-space PTE mutation, fd
   backing revalidation, shared-frame lifetime holds, and display-surface
-  mapping. Linux thread policy and Windows PE/Win32 policy now have live
-  service-first implementations through `loaderd`, `syscalld`, and narrow
-  kernel brokers; signal and clock policy belongs to `syscalld`, and
+  mapping. Linux thread/fork/exec/signal policy and Windows PE/Win32 policy now
+  have live service-first implementations through `loaderd`, `procd`,
+  `syscalld`, and narrow kernel brokers; process and signal policy belongs to
+  `procd`, executable image policy belongs to `loaderd`, clock policy belongs
+  to `syscalld`, and
   io-manager VFS/network/USB/input/provider policy belongs to
   the user services. Do not restore deleted or commented ring0 policy modules
   for quick compatibility fixes. Extend service implementations and keep
@@ -103,12 +105,13 @@ Kernel/userspace ABI:
   and later lookups fail closed. `syscalld` is service id 1, `vfsd` is service
   id 2, `netd` is service id 3, `devmgrd` is service id 4, `driverd` is
   service id 5, `loaderd` is service id 6, `storaged` is service id 7,
-  `inputd` is service id 8, and reserved `procd` is service id 9. File/path
+  `inputd` is service id 8, and `procd` is service id 9. File/path
   Linux syscall policy should route to `vfsd`; AF_UNIX and socket control policy should route to
   `netd`; device open/ioctl policy should route to `devmgrd`; module
   autoload/provider policy belongs in `driverd`; executable format and launch
   policy belongs in `loaderd`; storage inventory policy belongs in `storaged`;
-  input observability/control policy belongs in `inputd`. Kernel
+  input observability/control policy belongs in `inputd`; process/fork/wait and
+  signal policy belongs in `procd`. Kernel
   FD/socket/module/process/storage/input data paths may remain as brokered
   mechanisms until handle/cap transfer and driver-domain isolation are in
   place.
@@ -119,11 +122,12 @@ Kernel/userspace ABI:
   `IPC_SERVICE_CAP_VFS_POLICY`, `IPC_SERVICE_CAP_NET_POLICY`,
   `IPC_SERVICE_CAP_DEVICE_POLICY`, `IPC_SERVICE_CAP_DRIVER_POLICY`,
   `IPC_SERVICE_CAP_PROCESS_LOADER`, `IPC_SERVICE_CAP_STORAGE_POLICY`,
-  `IPC_SERVICE_CAP_INPUT_POLICY`, and reserved
-  `IPC_SERVICE_CAP_PROCESS_POLICY`. `procd` is the long-term process/thread
-  policy extraction point; until that service is introduced, Linux thread and
-  Windows process policy remains implemented through `syscalld`, `loaderd`, and
-  narrow kernel brokers.
+  `IPC_SERVICE_CAP_INPUT_POLICY`, and `IPC_SERVICE_CAP_PROCESS_POLICY`.
+  `procd` owns process/thread namespace policy for Linux `execve`,
+  process-copy `fork`/`clone`, `wait4`, `rt_sigaction`, `rt_sigprocmask`,
+  `sigaltstack`, `tgkill`, and signal selection. Kernel code must keep only
+  user-copy, address-space replacement, scheduler mutation, pending-signal
+  wakeup, and Linux x86_64 `rt_sigframe`/`rt_sigreturn` primitives.
 - Kernel IPC endpoint calls support bounded cap-transfer slots through
   `kernel_ipc_runtime::api::KernelTransferredHandle` and the
   `*_with_handles` endpoint APIs. Byte-only recv/take wrappers must keep failing
@@ -194,36 +198,57 @@ Kernel/userspace ABI:
   perform direct generic-app VFS policy in ring0 after `vfsd` registers. They
   route through `vfsd` for generic callers and retain direct kernel metadata
   access only for pre-`vfsd` bootstrap and registered policy-service callers.
-- Runtime launches should route through `loaderd`, not direct generic
+- Runtime launches must route through `loaderd`, not direct generic
   `SYS_RUSTOS_SPAWN_EXEC` calls. `loaderd` registers `IPC_SERVICE_LOADERD`,
   validates executable format policy, and uses the temporary gated
   `SYS_RUSTOS_PROC_*_BROKER` primitives for kernel-owned process commit work.
   `SYS_RUSTOS_PROC_*_BROKER` calls must fail with `EACCES` unless the caller
-  owns `IPC_SERVICE_CAP_PROCESS_LOADER`. `SYS_RUSTOS_SPAWN_EXEC` remains
-  available for init/bootstrap compatibility, but once `loaderd` is registered
-  generic apps should not use it directly.
+  owns `IPC_SERVICE_CAP_PROCESS_LOADER`. `SYS_RUSTOS_SPAWN_EXEC` is restricted
+  to `rootd` spawning the fixed bootstrap service allowlist
+  (`syscalld`, `vfsd`, `loaderd`, `procd`, `initd`) and must fail closed for
+  `initd`, generic apps, and service restarts. Core-service supervision after
+  bootstrap needs an explicit `rootd`/supervisor contract, not a broader kernel
+  spawn fallback.
 - Process broker sessions start with `SYS_RUSTOS_PROC_PREPARE_BROKER` using
   `PROC_BROKER_ABI_VERSION` and an explicit executable format
   (`PROC_BROKER_FORMAT_ELF64` or `PROC_BROKER_FORMAT_PE64`). The returned
   `prepare_handle` is owned by the loader service process and must be supplied
   to `SYS_RUSTOS_PROC_COMMIT_BROKER` or `SYS_RUSTOS_PROC_ABORT_BROKER`.
-  `SYS_RUSTOS_PROC_MAP_FILE_BROKER`, `SYS_RUSTOS_PROC_MAP_ZEROED_BROKER`, and
-  `SYS_RUSTOS_PROC_MAP_DATA_BROKER` use
+  `SYS_RUSTOS_PROC_MAP_ZEROED_BROKER`, `SYS_RUSTOS_PROC_MAP_DATA_BROKER`, and
+  `SYS_RUSTOS_PROC_MAP_FILE_BROKER` use
   `PROC_BROKER_MAP_{READ,WRITE,EXEC,PRIVATE}` flags and record non-overlapping
-  page-aligned mappings in the prepare session. `loaderd` must
-  emit ELF `PT_LOAD` mappings for both the main image and its `PT_INTERP`
-  interpreter, using the same static-PIE load biases as the kernel loader
+  page-aligned mappings in the prepare session.
+  `SYS_RUSTOS_PROC_MAP_FILE_BROKER` and its batch variant
+  `SYS_RUSTOS_PROC_MAP_FILE_BATCH_BROKER` are **fd/cap-backed only**: the
+  kernel resolves the caller's fd to a pinned `KernelHandle` at registration
+  time; no path re-open occurs at commit. Backing must be a file-kind handle
+  (`VfsFile`, `RemoteVfs(File)`, or `Memfd`); directory, device, and socket
+  descriptors are rejected with `EINVAL`/`EACCES`. `loaderd` must emit ELF
+  `PT_LOAD` mappings for both the main image and its `PT_INTERP` interpreter
+  via `SYS_RUSTOS_PROC_MAP_FILE_BROKER`, using the static-PIE load biases
   (`PROC_BROKER_USER_SPACE_BASE + 0x0040_0000` for the main image and
   `PROC_BROKER_USER_SPACE_BASE + 0x0200_0000` for the interpreter). The kernel
   prepare session stores loader-materialized data pages for mappings that need
-  service-side fixups. Commit builds the child address space from those
-  recorded mappings, while still using kernel image parsing for remaining
-  launch metadata until loader-owned metadata transfer is complete. Linux ELF
-  commit uses the loader-provided address space. Windows PE commit uses
-  loader-materialized PE header/section mappings, with PE64 base relocations
-  applied in `loaderd` before `SYS_RUSTOS_PROC_MAP_DATA_BROKER`; full
-  import/runtime expansion remains behind the reserved process-policy service
-  boundary.
+  service-side fixups. Linux ELF sessions must use
+  `SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER` to supply minimal launch metadata
+  (entry, phdr, phnum, phent, brk_start, interpreter_base) instead of
+  streaming the raw binary with `SYS_RUSTOS_PROC_SET_IMAGE_BLOB_BROKER`; the
+  kernel derives process launch state from this metadata and the pre-built
+  address space. Commit builds the child address space from the recorded
+  mappings. Windows
+  PE64 policy belongs to `loaderd`: PE validation, section materialization,
+  base relocation, import/export resolution, staged system-DLL registry lookup,
+  and PEB/TEB/runtime blob construction happen before commit. PE64 commit must
+  include `SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER` metadata after all
+  `SYS_RUSTOS_PROC_MAP_DATA_BROKER` mappings and before
+  `SYS_RUSTOS_PROC_COMMIT_BROKER`; the kernel validates the metadata and
+  spawns the already-materialized address space, but must not reintroduce PE
+  import/export/system-DLL policy. Linux app `execve` goes through `procd` for
+  target authorization and then `loaderd` for executable image materialization;
+  if loader materialization fails, `procd` must cancel the exec ticket with
+  `SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER` before replying. Do not move
+  executable-format, import/export, or DLL namespace policy back into the
+  kernel.
 - Linux `ioctl` policy routes through `devmgrd` after bootstrap. `devmgrd` owns
   request authorization and calls `SYS_RUSTOS_DEVICE_IOCTL_BROKER`, which is
   gated by `IPC_SERVICE_CAP_DEVICE_POLICY` and performs the kernel-owned user
@@ -234,12 +259,11 @@ Kernel/userspace ABI:
   calls this service policy first, then performs only the narrow privileged
   action that still requires current-process user memory, handle, scheduler, or
   address-space access.
-- Linux `wait4` and `memfd_create` route policy validation through `syscalld`
-  (`SYSCALL_OFFLOAD_OP_LINUX_WAIT4` and
-  `SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE`). The kernel still performs the
-  narrow process-table wait, status/rusage copyout, memfd handle installation,
-  and memfd read/write/truncate/seal actions because those operate on current
-  process handles and user memory.
+- Linux `wait4` routes process ownership validation through `procd`; the kernel
+  still performs the narrow process-table wait and status/rusage copyout.
+  Linux `memfd_create` route policy validation remains in `syscalld`, while the
+  kernel performs handle installation and memfd read/write/truncate/seal
+  actions because those operate on current process handles and user memory.
 - Linux socket namespace and socket I/O operations route through `netd` after
   bootstrap. `socket`, `socketpair`, `bind`, `listen`, `accept/accept4`,
   `connect`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `getsockname`,

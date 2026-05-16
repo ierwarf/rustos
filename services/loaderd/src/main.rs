@@ -10,19 +10,26 @@ use alloc::vec::Vec;
 use core::mem::size_of;
 
 use rustos_user_abi::syscall::{
-    LoaderSpawnRequest, LoaderSpawnResponse, RustosProcAbortBrokerArgs, RustosProcCommitBrokerArgs,
+    LoaderSpawnRequest, LoaderSpawnResponse, RustosProcAbortBrokerArgs,
     RustosProcMapDataBrokerArgs, RustosProcMapFileBrokerArgs, RustosProcMapZeroedBrokerArgs,
-    RustosProcPrepareBrokerArgs, IPC_SERVICE_LOADERD, LOADER_OP_SPAWN_EXEC,
-    LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES,
-    LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_MAX_ARG_COUNT, LOADER_SPAWN_MAX_ENV_COUNT,
-    PROC_BROKER_ABI_VERSION, PROC_BROKER_DATA_PAYLOAD_CAPACITY, PROC_BROKER_FORMAT_ELF64,
-    PROC_BROKER_FORMAT_PE64, PROC_BROKER_MAP_EXEC, PROC_BROKER_MAP_PRIVATE, PROC_BROKER_MAP_READ,
-    PROC_BROKER_MAP_WRITE, PROC_BROKER_USER_SPACE_BASE, PROC_BROKER_USER_SPACE_END_EXCLUSIVE,
-    SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REPLY,
-    SYS_RUSTOS_PROC_ABORT_BROKER, SYS_RUSTOS_PROC_COMMIT_BROKER, SYS_RUSTOS_PROC_MAP_DATA_BROKER,
+    RustosProcPrepareBrokerArgs, RustosProcSetImageBlobBrokerArgs,
+    RustosProcSetLinuxRuntimeBrokerArgs, RustosProcSetWindowsRuntimeBrokerArgs,
+    IPC_SERVICE_LOADERD, LOADER_OP_EXEC_TARGET, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION,
+    LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY,
+    LOADER_SPAWN_MAX_ARG_COUNT, LOADER_SPAWN_MAX_ENV_COUNT, PROC_BROKER_ABI_VERSION,
+    PROC_BROKER_DATA_PAYLOAD_CAPACITY, PROC_BROKER_FORMAT_ELF64, PROC_BROKER_FORMAT_PE64,
+    PROC_BROKER_LINUX_INTERP_PATH_CAPACITY, PROC_BROKER_MAP_EXEC, PROC_BROKER_MAP_PRIVATE,
+    PROC_BROKER_MAP_READ, PROC_BROKER_MAP_WRITE, PROC_BROKER_USER_SPACE_BASE,
+    PROC_BROKER_USER_SPACE_END_EXCLUSIVE, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_RECV,
+    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_PROC_ABORT_BROKER, SYS_RUSTOS_PROC_MAP_DATA_BROKER,
     SYS_RUSTOS_PROC_MAP_FILE_BROKER, SYS_RUSTOS_PROC_MAP_ZEROED_BROKER,
-    SYS_RUSTOS_PROC_PREPARE_BROKER,
+    SYS_RUSTOS_PROC_PREPARE_BROKER, SYS_RUSTOS_PROC_SET_IMAGE_BLOB_BROKER,
+    SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER, SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER,
 };
+
+mod commit;
+
+use commit::{commit_prepared_executable, LoaderOperation};
 
 const O_RDONLY: u64 = 0;
 const SYS_OPENAT: u64 = 257;
@@ -52,6 +59,9 @@ const PE_SECTION_HEADER_SIZE: usize = 40;
 const PE_OPTIONAL_MAGIC_PE32_PLUS: u16 = 0x20b;
 const PE_MACHINE_AMD64: u16 = 0x8664;
 const PE_FILE_RELOCS_STRIPPED: u16 = 0x0001;
+const PE_FILE_DLL: u16 = 0x2000;
+const PE_DIRECTORY_EXPORT: usize = 0;
+const PE_DIRECTORY_IMPORT: usize = 1;
 const PE_DIRECTORY_BASERELOC: usize = 5;
 const PE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const PE_SCN_MEM_READ: u32 = 0x4000_0000;
@@ -61,6 +71,48 @@ const PE_REL_BASED_DIR64: u16 = 10;
 const PE_LOAD_OFFSET: u64 = 0x0040_0000;
 const PE_MAX_SECTIONS: u16 = 128;
 const PE_MAX_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
+const PE_MAX_IMPORT_MODULES: usize = 64;
+const PE_MAX_FORWARDER_DEPTH: usize = 8;
+const WINDOWS_DLL_REGISTRY_PATH: &str = "system/registry/compat/windows-system-dlls.txt";
+const WINDOWS_RUNTIME_STRING_LIMIT: usize = 64 * 1024;
+const WINDOWS_FILE_STRUCT_SIZE: usize = 0x30;
+const WINDOWS_LOCALE_UNSPECIFIED_CHAR: i8 = 127;
+const HANDLE_PROCESS_HEAP: u64 = 0xffff_ffff_ffff_fff0;
+
+const BUILTIN_SYSTEM_DLL_ALIASES: &[(&str, &str)] = &[
+    ("ntdll", "ntdll.dll"),
+    ("kernelbase", "kernelbase.dll"),
+    ("kernel32", "kernel32.dll"),
+    ("msvcrt", "msvcrt.dll"),
+    ("ucrtbase", "ucrtbase.dll"),
+    ("vcruntime140", "vcruntime140.dll"),
+    ("vcruntime140_1", "vcruntime140_1.dll"),
+    ("api-ms-win-core-console-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-errorhandling-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-file-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-handle-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-heap-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-libraryloader-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-libraryloader-l1-2-0", "kernelbase.dll"),
+    ("api-ms-win-core-memory-l1-1-0", "kernelbase.dll"),
+    (
+        "api-ms-win-core-processenvironment-l1-1-0",
+        "kernelbase.dll",
+    ),
+    ("api-ms-win-core-processthreads-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-string-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-synch-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-synch-l1-2-0", "kernelbase.dll"),
+    ("api-ms-win-crt-convert-l1-1-0", "ucrtbase.dll"),
+    ("api-ms-win-crt-environment-l1-1-0", "ucrtbase.dll"),
+    ("api-ms-win-crt-heap-l1-1-0", "ucrtbase.dll"),
+    ("api-ms-win-crt-locale-l1-1-0", "ucrtbase.dll"),
+    ("api-ms-win-crt-math-l1-1-0", "ucrtbase.dll"),
+    ("api-ms-win-crt-runtime-l1-1-0", "ucrtbase.dll"),
+    ("api-ms-win-crt-stdio-l1-1-0", "ucrtbase.dll"),
+    ("api-ms-win-crt-string-l1-1-0", "ucrtbase.dll"),
+    ("api-ms-win-crt-utility-l1-1-0", "ucrtbase.dll"),
+];
 
 rustos_svc_runtime::entry!(service_main);
 
@@ -123,6 +175,13 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> LoaderSpawnR
         response.status = errno;
         return response;
     }
+    let operation = match LoaderOperation::from_op(request.op) {
+        Ok(operation) => operation,
+        Err(errno) => {
+            response.status = errno;
+            return response;
+        }
+    };
 
     let exec_path = match request_text(&request.exec_path, request.exec_path_len as usize) {
         Ok(path) => path,
@@ -131,13 +190,31 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> LoaderSpawnR
             return response;
         }
     };
-    let executable_format = match validate_executable_format(exec_path.as_str()) {
+    let path = match CString::new(exec_path.as_str()) {
+        Ok(path) => path,
+        Err(_) => {
+            response.status = EINVAL;
+            return response;
+        }
+    };
+    let fd = syscall4(SYS_OPENAT, AT_FDCWD, path.as_ptr() as u64, O_RDONLY, 0) as i32;
+    if fd < 0 {
+        response.status = -fd;
+        return response;
+    }
+    let executable_format = match validate_executable_fd(fd) {
         Ok(format) => format,
         Err(errno) => {
+            let _ = syscall1(SYS_CLOSE, fd as u64);
             response.status = errno;
             return response;
         }
     };
+    if !operation.allows_format(executable_format) {
+        let _ = syscall1(SYS_CLOSE, fd as u64);
+        response.status = ENOEXEC;
+        return response;
+    }
 
     let argv = match parse_blob(
         &request.argv_bytes,
@@ -161,13 +238,6 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> LoaderSpawnR
             return response;
         }
     };
-    let path = match CString::new(exec_path.as_str()) {
-        Ok(path) => path,
-        Err(_) => {
-            response.status = EINVAL;
-            return response;
-        }
-    };
     let mut argvp = argv.iter().map(|value| value.as_ptr()).collect::<Vec<_>>();
     argvp.push(core::ptr::null());
     let mut envp = env.iter().map(|value| value.as_ptr()).collect::<Vec<_>>();
@@ -184,31 +254,60 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> LoaderSpawnR
         (&prepare_args as *const RustosProcPrepareBrokerArgs) as u64,
     );
     if prepare_handle < 0 {
+        let _ = syscall1(SYS_CLOSE, fd as u64);
         response.status = (-prepare_handle) as i32;
         return response;
     }
-    if let Err(errno) =
-        map_executable_segments(exec_path.as_str(), prepare_handle as u64, executable_format)
-    {
-        abort_prepare(prepare_handle as u64, errno as u64);
-        response.status = errno;
+    let prepared = match map_executable_segments(
+        fd,
+        exec_path.as_str(),
+        prepare_handle as u64,
+        executable_format,
+        &argv,
+        &env,
+    ) {
+        Ok(prepared) => prepared,
+        Err(errno) => {
+            let _ = syscall1(SYS_CLOSE, fd as u64);
+            abort_prepare(prepare_handle as u64, errno as u64);
+            response.status = errno;
+            return response;
+        }
+    };
+    let close_status = syscall1(SYS_CLOSE, fd as u64);
+    if close_status < 0 {
+        abort_prepare(prepare_handle as u64, (-close_status) as u64);
+        response.status = (-close_status) as i32;
         return response;
     }
+    if let Some(ref result) = prepared.linux_runtime {
+        if let Err(errno) = set_linux_runtime_broker(prepare_handle as u64, result) {
+            abort_prepare(prepare_handle as u64, errno as u64);
+            response.status = errno;
+            return response;
+        }
+    }
+    if let Some(runtime) = prepared.windows_runtime {
+        let status = syscall1(
+            SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER,
+            (&runtime as *const RustosProcSetWindowsRuntimeBrokerArgs) as u64,
+        );
+        if status < 0 {
+            let errno = (-status) as i32;
+            abort_prepare(prepare_handle as u64, errno as u64);
+            response.status = errno;
+            return response;
+        }
+    }
 
-    let args = RustosProcCommitBrokerArgs {
-        prepare_handle: prepare_handle as u64,
-        exec_path_ptr: path.as_ptr() as u64,
-        exec_path_len: exec_path.len() as u64,
-        argv_ptr: argvp.as_ptr() as u64,
-        envp_ptr: envp.as_ptr() as u64,
-        flags: request.flags as u64,
-        console_session: request.console_session,
-        weight_micros: request.weight_micros,
-        reserved0: 0,
-    };
-    let pid = syscall1(
-        SYS_RUSTOS_PROC_COMMIT_BROKER,
-        (&args as *const RustosProcCommitBrokerArgs) as u64,
+    let pid = commit_prepared_executable(
+        operation,
+        request,
+        prepare_handle as u64,
+        path.as_ptr() as u64,
+        exec_path.len() as u64,
+        argvp.as_ptr() as u64,
+        envp.as_ptr() as u64,
     );
     if pid < 0 {
         response.status = (-pid) as i32;
@@ -230,30 +329,138 @@ fn abort_prepare(prepare_handle: u64, reason: u64) {
     );
 }
 
-fn map_executable_segments(exec_path: &str, prepare_handle: u64, format: u16) -> Result<(), i32> {
-    let path = CString::new(exec_path).map_err(|_| EINVAL)?;
-    let fd = syscall4(SYS_OPENAT, AT_FDCWD, path.as_ptr() as u64, O_RDONLY, 0) as i32;
-    if fd < 0 {
-        return Err(-fd);
-    }
-    let result = match format {
-        PROC_BROKER_FORMAT_ELF64 => {
-            map_elf_segments_fd(fd, prepare_handle, ELF_MAIN_DYN_LOAD_OFFSET, true)
+fn set_image_blob_from_fd(fd: i32, prepare_handle: u64) -> Result<(), i32> {
+    let image = read_fd_to_vec(fd)?;
+    let total_len = image.len() as u64;
+    let mut offset = 0usize;
+    while offset < image.len() {
+        let chunk_len = (image.len() - offset).min(PROC_BROKER_DATA_PAYLOAD_CAPACITY);
+        let mut args = RustosProcSetImageBlobBrokerArgs {
+            abi_version: PROC_BROKER_ABI_VERSION,
+            prepare_handle,
+            total_len,
+            data_offset: offset as u64,
+            data_len: chunk_len as u32,
+            ..RustosProcSetImageBlobBrokerArgs::default()
+        };
+        args.data[..chunk_len].copy_from_slice(&image[offset..offset + chunk_len]);
+        let status = syscall1(
+            SYS_RUSTOS_PROC_SET_IMAGE_BLOB_BROKER,
+            (&args as *const RustosProcSetImageBlobBrokerArgs) as u64,
+        );
+        if status < 0 {
+            return Err((-status) as i32);
         }
-        PROC_BROKER_FORMAT_PE64 => map_pe_segments_fd(fd, prepare_handle),
-        _ => Err(EINVAL),
-    };
-    let close_status = syscall1(SYS_CLOSE, fd as u64);
-    if close_status < 0 {
-        return Err((-close_status) as i32);
+        offset = offset.checked_add(chunk_len).ok_or(EOVERFLOW)?;
     }
-    result
+    Ok(())
+}
+
+fn set_linux_runtime_broker(prepare_handle: u64, result: &ElfMapResult) -> Result<(), i32> {
+    let brk_start = align_up(result.max_loaded_end, 4096)?;
+    let mut args = RustosProcSetLinuxRuntimeBrokerArgs {
+        abi_version: PROC_BROKER_ABI_VERSION,
+        has_tls: 0,
+        interp_path_len: 0,
+        reserved0: 0,
+        prepare_handle,
+        entry: result.entry,
+        actual_entry: result.actual_entry,
+        phdr_addr: result.phdr_addr,
+        phnum: result.phnum,
+        phent: result.phent,
+        brk_start,
+        interpreter_base: result.interpreter_base,
+        ..RustosProcSetLinuxRuntimeBrokerArgs::default()
+    };
+    if let Some(path) = result.interpreter_path.as_deref() {
+        let bytes = path.as_bytes();
+        let len = bytes.len().min(PROC_BROKER_LINUX_INTERP_PATH_CAPACITY);
+        args.interp_path[..len].copy_from_slice(&bytes[..len]);
+        args.interp_path_len = len as u16;
+    }
+    let status = syscall1(
+        SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER,
+        (&args as *const RustosProcSetLinuxRuntimeBrokerArgs) as u64,
+    );
+    (status >= 0).then_some(()).ok_or((-status) as i32)
+}
+
+fn read_fd_to_vec(fd: i32) -> Result<Vec<u8>, i32> {
+    let mut out = Vec::new();
+    let mut offset = 0_u64;
+    loop {
+        let mut chunk = [0_u8; 4096];
+        let read = syscall4(
+            SYS_PREAD64,
+            fd as u64,
+            chunk.as_mut_ptr() as u64,
+            chunk.len() as u64,
+            offset,
+        );
+        if read < 0 {
+            return Err((-read) as i32);
+        }
+        if read == 0 {
+            break;
+        }
+        let read = read as usize;
+        out.extend_from_slice(&chunk[..read]);
+        offset = offset.checked_add(read as u64).ok_or(EOVERFLOW)?;
+        if read < chunk.len() {
+            break;
+        }
+    }
+    (!out.is_empty()).then_some(out).ok_or(ENOEXEC)
+}
+
+struct ElfMapResult {
+    load_bias: u64,
+    entry: u64,
+    actual_entry: u64,
+    phdr_addr: u64,
+    phnum: u64,
+    phent: u64,
+    max_loaded_end: u64,
+    interpreter_path: Option<String>,
+    interpreter_base: u64,
+}
+
+struct PreparedExecutable {
+    windows_runtime: Option<RustosProcSetWindowsRuntimeBrokerArgs>,
+    linux_runtime: Option<ElfMapResult>,
+}
+
+fn map_executable_segments(
+    fd: i32,
+    exec_path: &str,
+    prepare_handle: u64,
+    format: u16,
+    argv: &[CString],
+    env: &[CString],
+) -> Result<PreparedExecutable, i32> {
+    match format {
+        PROC_BROKER_FORMAT_ELF64 => {
+            map_elf_segments_fd(fd, prepare_handle, ELF_MAIN_DYN_LOAD_OFFSET, true).map(|result| {
+                PreparedExecutable {
+                    windows_runtime: None,
+                    linux_runtime: Some(result),
+                }
+            })
+        }
+        PROC_BROKER_FORMAT_PE64 => map_pe_segments_fd(fd, prepare_handle, exec_path, argv, env)
+            .map(|runtime| PreparedExecutable {
+                windows_runtime: Some(runtime),
+                linux_runtime: None,
+            }),
+        _ => Err(EINVAL),
+    }
 }
 
 fn validate_request(received: usize, request: &LoaderSpawnRequest) -> Result<(), i32> {
     if received != size_of::<LoaderSpawnRequest>()
         || request.version != LOADER_REQUEST_ABI_VERSION
-        || request.op != LOADER_OP_SPAWN_EXEC
+        || !matches!(request.op, LOADER_OP_SPAWN_EXEC | LOADER_OP_EXEC_TARGET)
         || request.reserved0 != 0
         || request.exec_path_len == 0
         || request.exec_path_len as usize > LOADER_SPAWN_EXEC_PATH_CAPACITY
@@ -261,6 +468,16 @@ fn validate_request(received: usize, request: &LoaderSpawnRequest) -> Result<(),
         || request.env_count as usize > LOADER_SPAWN_MAX_ENV_COUNT
         || request.argv_bytes_len as usize > LOADER_SPAWN_ARG_BYTES
         || request.env_bytes_len as usize > LOADER_SPAWN_ENV_BYTES
+    {
+        return Err(EINVAL);
+    }
+    if request.op == LOADER_OP_SPAWN_EXEC
+        && (request.target_pid != 0 || request.target_tid != 0 || request.exec_ticket != 0)
+    {
+        return Err(EINVAL);
+    }
+    if request.op == LOADER_OP_EXEC_TARGET
+        && (request.target_pid == 0 || request.target_tid == 0 || request.exec_ticket == 0)
     {
         return Err(EINVAL);
     }
@@ -299,20 +516,6 @@ fn parse_blob(bytes: &[u8], len: usize, count: usize) -> Result<Vec<CString>, i3
         return Err(EINVAL);
     }
     Ok(values)
-}
-
-fn validate_executable_format(exec_path: &str) -> Result<u16, i32> {
-    let path = CString::new(exec_path).map_err(|_| EINVAL)?;
-    let fd = syscall4(SYS_OPENAT, AT_FDCWD, path.as_ptr() as u64, O_RDONLY, 0) as i32;
-    if fd < 0 {
-        return Err(-fd);
-    }
-    let result = validate_executable_fd(fd);
-    let close_status = syscall1(SYS_CLOSE, fd as u64);
-    if close_status < 0 {
-        return Err((-close_status) as i32);
-    }
-    result
 }
 
 fn validate_executable_fd(fd: i32) -> Result<u16, i32> {
@@ -393,37 +596,71 @@ fn map_elf_segments_fd(
     prepare_handle: u64,
     dyn_load_offset: u64,
     map_interpreter: bool,
-) -> Result<(), i32> {
+) -> Result<ElfMapResult, i32> {
     let mut header = [0_u8; ELF_HEADER_SIZE];
     read_exact_at(fd, 0, &mut header)?;
     validate_elf_fd(fd, &header)?;
 
     let load_bias = elf_load_bias_from_fd(fd, &header, dyn_load_offset)?;
     let phoff = read_u64(&header, 32);
-    let phentsize = read_u16(&header, 54);
-    let phnum = read_u16(&header, 56);
+    let e_entry = read_u64(&header, 24);
+    let phentsize = read_u16(&header, 54) as u64;
+    let phnum = read_u16(&header, 56) as u64;
+    let entry = e_entry.wrapping_add(load_bias);
+    let phdr_addr = phoff.wrapping_add(load_bias);
+
+    let mut max_loaded_end: u64 = load_bias;
     let mut interpreter_path = None::<String>;
+
     for index in 0..phnum {
         let mut ph = [0_u8; ELF_PROGRAM_HEADER_SIZE];
-        let offset = phoff + u64::from(index) * u64::from(phentsize);
+        let offset = phoff + index * phentsize;
         read_exact_at(fd, offset, &mut ph)?;
         match read_u32(&ph, 0) {
-            ELF_PT_LOAD => map_elf_load_segment(fd, prepare_handle, &ph, load_bias)?,
+            ELF_PT_LOAD => {
+                map_elf_load_segment(fd, prepare_handle, &ph, load_bias)?;
+                let vaddr = read_u64(&ph, 16);
+                let memsz = read_u64(&ph, 40);
+                let end = vaddr
+                    .checked_add(memsz)
+                    .and_then(|e| e.checked_add(load_bias))
+                    .ok_or(EOVERFLOW)?;
+                max_loaded_end = max_loaded_end.max(end);
+            }
             ELF_PT_INTERP if map_interpreter => {
                 interpreter_path = Some(read_elf_interp_path(fd, &ph)?);
             }
             _ => {}
         }
     }
-    if let Some(path) = interpreter_path {
-        map_elf_interpreter(path.as_str(), prepare_handle)?;
-    }
-    Ok(())
+
+    max_loaded_end = align_up(max_loaded_end, 4096)?;
+
+    let (interpreter_base, actual_entry, interp_path_out, interp_max_end) =
+        if let Some(path) = interpreter_path.as_deref() {
+            let interp = map_elf_interpreter(path, prepare_handle)?;
+            let end = interp.max_loaded_end.max(max_loaded_end);
+            (interp.load_bias, interp.entry, interpreter_path, end)
+        } else {
+            (0, entry, None, max_loaded_end)
+        };
+
+    Ok(ElfMapResult {
+        load_bias,
+        entry,
+        actual_entry,
+        phdr_addr,
+        phnum,
+        phent: phentsize,
+        max_loaded_end: interp_max_end,
+        interpreter_path: interp_path_out,
+        interpreter_base,
+    })
 }
 
-fn map_elf_interpreter(path: &str, prepare_handle: u64) -> Result<(), i32> {
-    let path = CString::new(path).map_err(|_| EINVAL)?;
-    let fd = syscall4(SYS_OPENAT, AT_FDCWD, path.as_ptr() as u64, O_RDONLY, 0) as i32;
+fn map_elf_interpreter(path: &str, prepare_handle: u64) -> Result<ElfMapResult, i32> {
+    let cpath = CString::new(path).map_err(|_| EINVAL)?;
+    let fd = syscall4(SYS_OPENAT, AT_FDCWD, cpath.as_ptr() as u64, O_RDONLY, 0) as i32;
     if fd < 0 {
         return Err(-fd);
     }
@@ -512,18 +749,7 @@ fn map_elf_load_segment(
         SYS_RUSTOS_PROC_MAP_FILE_BROKER,
         (&args as *const RustosProcMapFileBrokerArgs) as u64,
     );
-    if status < 0 {
-        return Err((-status) as i32);
-    }
-    map_data_pages_from_file(
-        fd,
-        prepare_handle,
-        file_offset,
-        file_len,
-        target_addr,
-        mem_len,
-        flags,
-    )
+    (status >= 0).then_some(()).ok_or((-status) as i32)
 }
 
 fn proc_map_flags(elf_flags: u32) -> u64 {
@@ -594,7 +820,54 @@ fn read_elf_interp_path(fd: i32, ph: &[u8; ELF_PROGRAM_HEADER_SIZE]) -> Result<S
     Ok(path.to_string())
 }
 
-fn map_pe_segments_fd(fd: i32, prepare_handle: u64) -> Result<(), i32> {
+fn map_pe_segments_fd(
+    fd: i32,
+    prepare_handle: u64,
+    exec_path: &str,
+    argv: &[CString],
+    env: &[CString],
+) -> Result<RustosProcSetWindowsRuntimeBrokerArgs, i32> {
+    let mut main = load_pe_image_fd(fd, exec_path, pe_default_load_base()?, false)?;
+    let mut modules = Vec::<LoadedPeModule>::new();
+    let registry = load_system_dll_registry()?;
+    let mut next_base = align_up(
+        main.load_base
+            .checked_add(main.image_size)
+            .ok_or(EOVERFLOW)?,
+        4096,
+    )?;
+    preload_system_dlls(&registry, &mut modules, &mut next_base)?;
+    resolve_import_closure(&mut main, &mut modules, &registry, &mut next_base)?;
+    let runtime = build_windows_runtime_blob(
+        prepare_handle,
+        &main,
+        &modules,
+        exec_path,
+        argv,
+        env,
+        next_base,
+    )?;
+    patch_crt_runtime_exports(&mut modules, &runtime)?;
+    patch_crt_runtime_exports_for_main(&mut main, &modules, &runtime)?;
+    map_loaded_pe_module(prepare_handle, &main)?;
+    for module in &modules {
+        map_loaded_pe_module(prepare_handle, module)?;
+    }
+    Ok(runtime)
+}
+
+fn pe_default_load_base() -> Result<u64, i32> {
+    PROC_BROKER_USER_SPACE_BASE
+        .checked_add(PE_LOAD_OFFSET)
+        .ok_or(EOVERFLOW)
+}
+
+fn load_pe_image_fd(
+    fd: i32,
+    path: &str,
+    load_base: u64,
+    require_dll: bool,
+) -> Result<LoadedPeModule, i32> {
     let mut dos_header = [0_u8; PE_DOS_HEADER_SIZE];
     read_exact_at(fd, 0, &mut dos_header)?;
     let pe_offset = read_u32(&dos_header, 0x3c) as u64;
@@ -616,6 +889,10 @@ fn map_pe_segments_fd(fd: i32, prepare_handle: u64) -> Result<(), i32> {
     if section_count == 0 || section_count > PE_MAX_SECTIONS || optional_header_size < 112 {
         return Err(ENOEXEC);
     }
+    let is_dll = characteristics & PE_FILE_DLL != 0;
+    if require_dll != is_dll {
+        return Err(ENOEXEC);
+    }
 
     let mut optional_header = vec![0_u8; optional_header_size as usize];
     let optional_header_offset = pe_offset
@@ -625,6 +902,7 @@ fn map_pe_segments_fd(fd: i32, prepare_handle: u64) -> Result<(), i32> {
     if read_u16(&optional_header, 0) != PE_OPTIONAL_MAGIC_PE32_PLUS {
         return Err(ENOEXEC);
     }
+    let entry_rva = read_u32(&optional_header, 16);
     let preferred_base = read_u64(&optional_header, 24);
     let section_alignment = read_u32(&optional_header, 32) as u64;
     let file_alignment = read_u32(&optional_header, 36) as u64;
@@ -641,9 +919,6 @@ fn map_pe_segments_fd(fd: i32, prepare_handle: u64) -> Result<(), i32> {
     {
         return Err(ENOEXEC);
     }
-    let load_base = PROC_BROKER_USER_SPACE_BASE
-        .checked_add(PE_LOAD_OFFSET)
-        .ok_or(EOVERFLOW)?;
     let image_end = load_base
         .checked_add(align_up(size_of_image, 4096)?)
         .ok_or(EOVERFLOW)?;
@@ -689,25 +964,36 @@ fn map_pe_segments_fd(fd: i32, prepare_handle: u64) -> Result<(), i32> {
         characteristics,
     )?;
 
-    map_data_pages_from_image(
-        prepare_handle,
-        &image,
-        0,
+    let directories = pe_directories(&optional_header)?;
+    let exports = build_export_cache(&image, directories[PE_DIRECTORY_EXPORT])?;
+    Ok(LoadedPeModule {
+        path: path.to_string(),
+        base_name: file_name_from_path(path).to_string(),
         load_base,
-        align_up(size_of_headers, 4096)?,
-        PROC_BROKER_MAP_PRIVATE | PROC_BROKER_MAP_READ,
-    )?;
-    for section in sections {
-        map_data_pages_from_image(
-            prepare_handle,
-            &image,
-            section.image_offset,
-            section.target_addr,
-            section.mem_len,
-            section.flags,
-        )?;
-    }
-    Ok(())
+        image_size: align_up(size_of_image, 4096)?,
+        entry_point: load_base.checked_add(entry_rva as u64).ok_or(EOVERFLOW)?,
+        image,
+        headers_len: align_up(size_of_headers, 4096)?,
+        sections,
+        directories,
+        exports,
+        imports_patched: false,
+    })
+}
+
+#[derive(Clone)]
+struct LoadedPeModule {
+    path: String,
+    base_name: String,
+    load_base: u64,
+    image_size: u64,
+    entry_point: u64,
+    image: Vec<u8>,
+    headers_len: u64,
+    sections: Vec<PeMappedSection>,
+    directories: [PeDataDirectory; 16],
+    exports: Option<ExportCache>,
+    imports_patched: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -716,6 +1002,34 @@ struct PeMappedSection {
     target_addr: u64,
     mem_len: u64,
     flags: u64,
+}
+
+#[derive(Clone, Copy)]
+struct PeDataDirectory {
+    rva: u32,
+    size: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ExportTarget {
+    Address(u32),
+    Forwarder {
+        dll_name: Vec<u8>,
+        symbol: ExportLookup,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ExportLookup {
+    Name(Vec<u8>),
+    Ordinal(u32),
+}
+
+#[derive(Clone, Debug)]
+struct ExportCache {
+    ordinal_base: u32,
+    functions: Vec<ExportTarget>,
+    names: Vec<(Vec<u8>, u32)>,
 }
 
 fn materialize_pe_section(
@@ -830,6 +1144,1249 @@ fn apply_pe_relocations(
         cursor = block_end;
     }
     Ok(())
+}
+
+fn pe_directories(optional_header: &[u8]) -> Result<[PeDataDirectory; 16], i32> {
+    let number = read_u32(optional_header, 108) as usize;
+    let mut directories = [PeDataDirectory { rva: 0, size: 0 }; 16];
+    for (index, entry) in directories.iter_mut().enumerate().take(number.min(16)) {
+        let offset = 112 + index * 8;
+        if offset + 8 > optional_header.len() {
+            return Err(ENOEXEC);
+        }
+        *entry = PeDataDirectory {
+            rva: read_u32(optional_header, offset),
+            size: read_u32(optional_header, offset + 4),
+        };
+    }
+    Ok(directories)
+}
+
+fn map_loaded_pe_module(prepare_handle: u64, module: &LoadedPeModule) -> Result<(), i32> {
+    map_data_pages_from_image(
+        prepare_handle,
+        &module.image,
+        0,
+        module.load_base,
+        module.headers_len,
+        PROC_BROKER_MAP_PRIVATE | PROC_BROKER_MAP_READ,
+    )?;
+    for section in &module.sections {
+        map_data_pages_from_image(
+            prepare_handle,
+            &module.image,
+            section.image_offset,
+            section.target_addr,
+            section.mem_len,
+            section.flags,
+        )?;
+    }
+    Ok(())
+}
+
+fn resolve_import_closure(
+    main: &mut LoadedPeModule,
+    modules: &mut Vec<LoadedPeModule>,
+    registry: &[SystemDllEntry],
+    next_base: &mut u64,
+) -> Result<(), i32> {
+    let mut cursor = 0;
+    while cursor <= modules.len() {
+        if modules.len() > PE_MAX_IMPORT_MODULES {
+            return Err(ENOEXEC);
+        }
+        if cursor == modules.len() {
+            patch_module_imports(main, modules, registry, next_base)?;
+            break;
+        }
+        let mut module = modules.remove(cursor);
+        patch_module_imports(&mut module, modules, registry, next_base)?;
+        module.imports_patched = true;
+        modules.insert(cursor, module);
+        cursor += 1;
+    }
+    Ok(())
+}
+
+fn patch_module_imports(
+    module: &mut LoadedPeModule,
+    modules: &mut Vec<LoadedPeModule>,
+    registry: &[SystemDllEntry],
+    next_base: &mut u64,
+) -> Result<(), i32> {
+    if module.imports_patched {
+        return Ok(());
+    }
+    let imports = collect_imports(module)?;
+    for import in imports {
+        let dll_index =
+            ensure_system_dll_loaded(import.dll_name.as_slice(), modules, registry, next_base)?;
+        let target =
+            resolve_export_by_index(modules, dll_index, &import.lookup, 0)?.ok_or(ENOEXEC)?;
+        write_u64_at_rva(&mut module.image, import.first_thunk_rva, target)?;
+    }
+    module.imports_patched = true;
+    Ok(())
+}
+
+struct ImportPatch {
+    dll_name: Vec<u8>,
+    lookup: ExportLookup,
+    first_thunk_rva: u32,
+}
+
+fn collect_imports(module: &LoadedPeModule) -> Result<Vec<ImportPatch>, i32> {
+    let import_dir = module.directories[PE_DIRECTORY_IMPORT];
+    if import_dir.rva == 0 || import_dir.size == 0 {
+        return Ok(Vec::new());
+    }
+    let mut imports = Vec::new();
+    let mut descriptor = import_dir.rva as usize;
+    let limit = descriptor
+        .checked_add(import_dir.size as usize)
+        .ok_or(EOVERFLOW)?;
+    if limit > module.image.len() {
+        return Err(ENOEXEC);
+    }
+    while descriptor + 20 <= limit {
+        let original_first_thunk = read_u32(&module.image, descriptor);
+        let name_rva = read_u32(&module.image, descriptor + 12);
+        let first_thunk = read_u32(&module.image, descriptor + 16);
+        if original_first_thunk == 0 && name_rva == 0 && first_thunk == 0 {
+            break;
+        }
+        let dll_name = read_c_string_at_rva(&module.image, name_rva)?.to_vec();
+        let mut lookup_rva = if original_first_thunk != 0 {
+            original_first_thunk
+        } else {
+            first_thunk
+        };
+        let mut write_rva = first_thunk;
+        loop {
+            let lookup_offset = lookup_rva as usize;
+            if lookup_offset + 8 > module.image.len() {
+                return Err(ENOEXEC);
+            }
+            let entry = read_u64(&module.image, lookup_offset);
+            if entry == 0 {
+                break;
+            }
+            let lookup = if entry >> 63 != 0 {
+                ExportLookup::Ordinal((entry & 0xffff) as u32)
+            } else {
+                let name_rva = (entry & 0x7fff_ffff) as u32;
+                ExportLookup::Name(read_import_name_at_rva(&module.image, name_rva)?.to_vec())
+            };
+            imports.push(ImportPatch {
+                dll_name: dll_name.clone(),
+                lookup,
+                first_thunk_rva: write_rva,
+            });
+            lookup_rva = lookup_rva.checked_add(8).ok_or(EOVERFLOW)?;
+            write_rva = write_rva.checked_add(8).ok_or(EOVERFLOW)?;
+        }
+        descriptor += 20;
+    }
+    Ok(imports)
+}
+
+fn ensure_system_dll_loaded(
+    requested: &[u8],
+    modules: &mut Vec<LoadedPeModule>,
+    registry: &[SystemDllEntry],
+    next_base: &mut u64,
+) -> Result<usize, i32> {
+    let canonical = canonical_system_dll_name_bytes(requested).ok_or(ENOEXEC)?;
+    if let Some(index) = modules
+        .iter()
+        .position(|module| dll_name_eq(module.base_name.as_bytes(), canonical.as_bytes()))
+    {
+        return Ok(index);
+    }
+    let entry = registry
+        .iter()
+        .find(|entry| dll_name_eq(entry.base_name.as_bytes(), canonical.as_bytes()))
+        .ok_or(ENOEXEC)?;
+    let fd = open_readonly(entry.path.as_str())?;
+    let load_base = *next_base;
+    let loaded = load_pe_image_fd(fd, entry.path.as_str(), load_base, true);
+    let close_status = syscall1(SYS_CLOSE, fd as u64);
+    if close_status < 0 {
+        return Err((-close_status) as i32);
+    }
+    let module = loaded?;
+    *next_base = align_up(
+        module
+            .load_base
+            .checked_add(module.image_size)
+            .ok_or(EOVERFLOW)?,
+        4096,
+    )?;
+    modules.push(module);
+    Ok(modules.len() - 1)
+}
+
+fn preload_system_dlls(
+    registry: &[SystemDllEntry],
+    modules: &mut Vec<LoadedPeModule>,
+    next_base: &mut u64,
+) -> Result<(), i32> {
+    for entry in registry.iter().take(PE_MAX_IMPORT_MODULES) {
+        if modules
+            .iter()
+            .any(|module| dll_name_eq(module.base_name.as_bytes(), entry.base_name.as_bytes()))
+        {
+            continue;
+        }
+        let fd = open_readonly(entry.path.as_str())?;
+        let loaded = load_pe_image_fd(fd, entry.path.as_str(), *next_base, true);
+        let close_status = syscall1(SYS_CLOSE, fd as u64);
+        if close_status < 0 {
+            return Err((-close_status) as i32);
+        }
+        let module = loaded?;
+        *next_base = align_up(
+            module
+                .load_base
+                .checked_add(module.image_size)
+                .ok_or(EOVERFLOW)?,
+            4096,
+        )?;
+        modules.push(module);
+    }
+    Ok(())
+}
+
+fn resolve_export_by_index(
+    modules: &[LoadedPeModule],
+    module_index: usize,
+    lookup: &ExportLookup,
+    depth: usize,
+) -> Result<Option<u64>, i32> {
+    if depth >= PE_MAX_FORWARDER_DEPTH {
+        return Err(ENOEXEC);
+    }
+    let module = modules.get(module_index).ok_or(ENOEXEC)?;
+    let Some(cache) = module.exports.as_ref() else {
+        return Ok(None);
+    };
+    let target = match lookup {
+        ExportLookup::Name(name) => lookup_export_by_name(cache, name),
+        ExportLookup::Ordinal(ordinal) => lookup_export_by_ordinal(cache, *ordinal),
+    };
+    match target {
+        Some(ExportTarget::Address(0)) => Ok(None),
+        Some(ExportTarget::Address(rva)) => module
+            .load_base
+            .checked_add(*rva as u64)
+            .map(Some)
+            .ok_or(EOVERFLOW),
+        Some(ExportTarget::Forwarder { dll_name, symbol }) => {
+            let canonical = canonical_system_dll_name_bytes(dll_name).ok_or(ENOEXEC)?;
+            let Some(index) = modules
+                .iter()
+                .position(|module| dll_name_eq(module.base_name.as_bytes(), canonical.as_bytes()))
+            else {
+                return Err(ENOEXEC);
+            };
+            resolve_export_by_index(modules, index, symbol, depth + 1)
+        }
+        None => Ok(None),
+    }
+}
+
+fn build_export_cache(
+    image: &[u8],
+    directory: PeDataDirectory,
+) -> Result<Option<ExportCache>, i32> {
+    if directory.rva == 0 || directory.size == 0 {
+        return Ok(None);
+    }
+    let offset = directory.rva as usize;
+    if offset + 40 > image.len() {
+        return Err(ENOEXEC);
+    }
+    let name_rva = read_u32(image, offset + 12);
+    let ordinal_base = read_u32(image, offset + 16);
+    let function_count = read_u32(image, offset + 20);
+    let name_count = read_u32(image, offset + 24);
+    let address_of_functions = read_u32(image, offset + 28);
+    let address_of_names = read_u32(image, offset + 32);
+    let address_of_name_ordinals = read_u32(image, offset + 36);
+    if function_count == 0
+        || name_count > function_count
+        || name_rva == 0
+        || address_of_functions == 0
+        || name_count != 0 && (address_of_names == 0 || address_of_name_ordinals == 0)
+    {
+        return Err(ENOEXEC);
+    }
+    let _ = read_c_string_at_rva(image, name_rva)?;
+    let mut functions = Vec::with_capacity(function_count as usize);
+    for index in 0..function_count {
+        let table = (address_of_functions as usize)
+            .checked_add(index as usize * 4)
+            .ok_or(EOVERFLOW)?;
+        if table + 4 > image.len() {
+            return Err(ENOEXEC);
+        }
+        let rva = read_u32(image, table);
+        functions.push(classify_export_target(image, directory, rva)?);
+    }
+    let mut names = Vec::with_capacity(name_count as usize);
+    for index in 0..name_count {
+        let name_table = (address_of_names as usize)
+            .checked_add(index as usize * 4)
+            .ok_or(EOVERFLOW)?;
+        let ordinal_table = (address_of_name_ordinals as usize)
+            .checked_add(index as usize * 2)
+            .ok_or(EOVERFLOW)?;
+        if name_table + 4 > image.len() || ordinal_table + 2 > image.len() {
+            return Err(ENOEXEC);
+        }
+        let export_name = read_c_string_at_rva(image, read_u32(image, name_table))?.to_vec();
+        let function_index = read_u16(image, ordinal_table) as u32;
+        if function_index >= function_count {
+            return Err(ENOEXEC);
+        }
+        names.push((export_name, function_index));
+    }
+    Ok(Some(ExportCache {
+        ordinal_base,
+        functions,
+        names,
+    }))
+}
+
+fn classify_export_target(
+    image: &[u8],
+    directory: PeDataDirectory,
+    rva: u32,
+) -> Result<ExportTarget, i32> {
+    if rva == 0 {
+        return Ok(ExportTarget::Address(0));
+    }
+    let export_end = directory.rva.checked_add(directory.size).ok_or(EOVERFLOW)?;
+    if rva >= directory.rva && rva < export_end {
+        let forwarder = read_c_string_at_rva(image, rva)?;
+        let Some(separator) = forwarder.iter().rposition(|byte| *byte == b'.') else {
+            return Err(ENOEXEC);
+        };
+        let dll_name = forwarder[..separator].to_vec();
+        let symbol_bytes = &forwarder[separator + 1..];
+        if dll_name.is_empty() || symbol_bytes.is_empty() {
+            return Err(ENOEXEC);
+        }
+        let symbol = if let Some(ordinal) = symbol_bytes.strip_prefix(b"#") {
+            ExportLookup::Ordinal(parse_ascii_u32(ordinal).ok_or(ENOEXEC)?)
+        } else {
+            ExportLookup::Name(symbol_bytes.to_vec())
+        };
+        return Ok(ExportTarget::Forwarder { dll_name, symbol });
+    }
+    Ok(ExportTarget::Address(rva))
+}
+
+fn lookup_export_by_name<'a>(cache: &'a ExportCache, name: &[u8]) -> Option<&'a ExportTarget> {
+    let (_, index) = cache
+        .names
+        .iter()
+        .find(|(candidate, _)| candidate == name)?;
+    cache.functions.get(*index as usize)
+}
+
+fn lookup_export_by_ordinal(cache: &ExportCache, ordinal: u32) -> Option<&ExportTarget> {
+    if ordinal < cache.ordinal_base {
+        return None;
+    }
+    cache.functions.get((ordinal - cache.ordinal_base) as usize)
+}
+
+fn patch_crt_runtime_exports(
+    modules: &mut [LoadedPeModule],
+    runtime: &RustosProcSetWindowsRuntimeBrokerArgs,
+) -> Result<(), i32> {
+    for module in modules {
+        patch_export_u64(module, b"__argc", runtime.argc_ptr)?;
+        patch_export_u64(module, b"__argv", runtime.argv_ptr_ptr)?;
+        patch_export_u64(module, b"__wargv", runtime.argv_ptr_ptr)?;
+        patch_export_u64(module, b"_environ", runtime.environ_ptr_ptr)?;
+        patch_export_u64(module, b"__initenv", runtime.environ_ptr_ptr)?;
+        patch_export_u64(module, b"_errno", runtime.errno_ptr)?;
+        patch_export_u64(module, b"__doserrno", runtime.last_error_ptr)?;
+        patch_export_i32(module, b"_commode", 0)?;
+        patch_export_i32(module, b"_fmode", 0)?;
+        patch_export_u64(module, b"__iob_func", runtime.iob_array_ptr)?;
+    }
+    Ok(())
+}
+
+fn patch_crt_runtime_exports_for_main(
+    main: &mut LoadedPeModule,
+    modules: &[LoadedPeModule],
+    runtime: &RustosProcSetWindowsRuntimeBrokerArgs,
+) -> Result<(), i32> {
+    let mut scratch = modules.to_vec();
+    scratch.push(main.clone());
+    patch_crt_runtime_exports(&mut scratch, runtime)?;
+    if let Some(updated) = scratch.pop() {
+        main.image = updated.image;
+    }
+    Ok(())
+}
+
+fn patch_export_u64(module: &mut LoadedPeModule, symbol: &[u8], value: u64) -> Result<(), i32> {
+    let Some(cache) = module.exports.as_ref() else {
+        return Ok(());
+    };
+    let Some(ExportTarget::Address(rva)) = lookup_export_by_name(cache, symbol) else {
+        return Ok(());
+    };
+    write_u64_at_rva(&mut module.image, *rva, value)
+}
+
+fn patch_export_i32(module: &mut LoadedPeModule, symbol: &[u8], value: i32) -> Result<(), i32> {
+    let Some(cache) = module.exports.as_ref() else {
+        return Ok(());
+    };
+    let Some(ExportTarget::Address(rva)) = lookup_export_by_name(cache, symbol) else {
+        return Ok(());
+    };
+    let offset = *rva as usize;
+    if offset + 4 > module.image.len() {
+        return Err(ENOEXEC);
+    }
+    module.image[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct PebLite {
+    reserved0: [u8; 0x10],
+    image_base_address: u64,
+    loader_data: u64,
+    process_parameters: u64,
+    subsystem_data: u64,
+    process_heap: u64,
+    reserved1: [u64; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TebLite {
+    exception_list: u64,
+    stack_base: u64,
+    stack_limit: u64,
+    subsystem_tib: u64,
+    fiber_data: u64,
+    arbitrary_user_pointer: u64,
+    self_pointer: u64,
+    environment_pointer: u64,
+    client_id_unique_process: u64,
+    client_id_unique_thread: u64,
+    active_rpc_handle: u64,
+    thread_local_storage_pointer: u64,
+    process_environment_block: u64,
+    reserved: [u64; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ProcessParametersLite {
+    image_path_name: u64,
+    command_line: u64,
+    environment: u64,
+    reserved: [u64; 5],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct PebLdrDataLite {
+    module_count: u32,
+    reserved: u32,
+    module_array: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LdrDataTableEntryLite {
+    dll_base: u64,
+    entry_point: u64,
+    size_of_image: u32,
+    reserved: u32,
+    full_dll_name_w: u64,
+    base_dll_name_w: u64,
+    full_dll_name_a: u64,
+    base_dll_name_a: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct RustosRuntimePublic {
+    size: u32,
+    version: u32,
+    peb_address: u64,
+    teb_address: u64,
+    loader_data_address: u64,
+    argc_ptr: u64,
+    argv_ptr_ptr: u64,
+    environ_ptr_ptr: u64,
+    argv_ptr: u64,
+    environ_ptr: u64,
+    initial_narrow_environment_ptr: u64,
+    command_line_a_ptr: u64,
+    command_line_w_ptr: u64,
+    environment_a_ptr: u64,
+    environment_w_ptr: u64,
+    module_path_a_ptr: u64,
+    module_path_w_ptr: u64,
+    module_directory_a_ptr: u64,
+    module_directory_w_ptr: u64,
+    main_module_base_name_a_ptr: u64,
+    main_module_base_name_w_ptr: u64,
+    errno_ptr: u64,
+    last_error_ptr: u64,
+    commode_ptr: u64,
+    fmode_ptr: u64,
+    iob_array_ptr: u64,
+    stdin_file_ptr: u64,
+    stdout_file_ptr: u64,
+    stderr_file_ptr: u64,
+    localeconv_ptr: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FileLiteLayout {
+    ptr: u64,
+    cnt: i32,
+    _cnt_padding: u32,
+    base: u64,
+    flag: i32,
+    file: i32,
+    charbuf: i32,
+    bufsiz: i32,
+    tmpfname: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LconvLite {
+    decimal_point: u64,
+    thousands_sep: u64,
+    grouping: u64,
+    int_curr_symbol: u64,
+    currency_symbol: u64,
+    mon_decimal_point: u64,
+    mon_thousands_sep: u64,
+    mon_grouping: u64,
+    positive_sign: u64,
+    negative_sign: u64,
+    int_frac_digits: i8,
+    frac_digits: i8,
+    p_cs_precedes: i8,
+    p_sep_by_space: i8,
+    n_cs_precedes: i8,
+    n_sep_by_space: i8,
+    p_sign_posn: i8,
+    n_sign_posn: i8,
+    w_decimal_point: u64,
+    w_thousands_sep: u64,
+    w_int_curr_symbol: u64,
+    w_currency_symbol: u64,
+    w_mon_decimal_point: u64,
+    w_mon_thousands_sep: u64,
+    w_positive_sign: u64,
+    w_negative_sign: u64,
+}
+
+struct RuntimeBlobBuilder {
+    bytes: Vec<u8>,
+}
+
+impl RuntimeBlobBuilder {
+    fn new() -> Self {
+        Self { bytes: Vec::new() }
+    }
+
+    fn align(&mut self, align: usize) {
+        debug_assert!(align.is_power_of_two());
+        let aligned = (self.bytes.len() + align - 1) & !(align - 1);
+        self.bytes.resize(aligned, 0);
+    }
+
+    fn reserve_struct<T>(&mut self) -> usize {
+        self.align(core::mem::align_of::<T>());
+        let offset = self.bytes.len();
+        self.bytes.resize(offset + size_of::<T>(), 0);
+        offset
+    }
+
+    fn overwrite(&mut self, offset: usize, bytes: &[u8]) {
+        self.bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
+    }
+
+    fn push_u64(&mut self, value: u64) -> usize {
+        self.align(8);
+        let offset = self.bytes.len();
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+        offset
+    }
+
+    fn push_i32(&mut self, value: i32) -> usize {
+        self.align(4);
+        let offset = self.bytes.len();
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+        offset
+    }
+
+    fn push_bytes(&mut self, bytes: &[u8], align: usize) -> usize {
+        self.align(align.max(1));
+        let offset = self.bytes.len();
+        self.bytes.extend_from_slice(bytes);
+        offset
+    }
+
+    fn push_utf16_z(&mut self, value: &str) -> usize {
+        self.align(2);
+        let offset = self.bytes.len();
+        for code_unit in value.encode_utf16() {
+            self.bytes.extend_from_slice(&code_unit.to_le_bytes());
+        }
+        self.bytes.extend_from_slice(&0_u16.to_le_bytes());
+        offset
+    }
+
+    fn push_ascii_z(&mut self, value: &str) -> usize {
+        self.push_bytes(value.as_bytes(), 1);
+        self.bytes.push(0);
+        self.bytes.len() - value.len() - 1
+    }
+}
+
+fn build_windows_runtime_blob(
+    prepare_handle: u64,
+    main: &LoadedPeModule,
+    modules: &[LoadedPeModule],
+    exec_path: &str,
+    argv: &[CString],
+    env: &[CString],
+    runtime_base_hint: u64,
+) -> Result<RustosProcSetWindowsRuntimeBrokerArgs, i32> {
+    let argv_strings = cstrings_to_strs(argv)?;
+    let env_strings = cstrings_to_strs(env)?;
+    let default_argv = [exec_path];
+    let argv_view = if argv_strings.is_empty() {
+        &default_argv[..]
+    } else {
+        argv_strings.as_slice()
+    };
+    let command_line = build_windows_command_line(argv_view);
+    let environment_a = build_environment_block_ascii(env_strings.as_slice())?;
+    let environment_w = build_environment_block_utf16(env_strings.as_slice())?;
+    let base_module_name = file_name_from_path(exec_path);
+    let module_directory = directory_name_from_path(exec_path);
+
+    let mut builder = RuntimeBlobBuilder::new();
+    let peb_offset = builder.reserve_struct::<PebLite>();
+    let teb_offset = builder.reserve_struct::<TebLite>();
+    let params_offset = builder.reserve_struct::<ProcessParametersLite>();
+    let ldr_data_offset = builder.reserve_struct::<PebLdrDataLite>();
+    let loader_module_count = 1usize.checked_add(modules.len()).ok_or(EOVERFLOW)?;
+    let mut ldr_entry_offsets = Vec::with_capacity(loader_module_count);
+    for _ in 0..loader_module_count {
+        ldr_entry_offsets.push(builder.reserve_struct::<LdrDataTableEntryLite>());
+    }
+    let argc_offset = builder.push_i32(i32::try_from(argv_view.len()).unwrap_or(i32::MAX));
+    let argv_ptr_ptr_offset = builder.push_u64(0);
+    let environ_ptr_ptr_offset = builder.push_u64(0);
+    let errno_offset = builder.push_i32(0);
+    let last_error_offset = builder.push_i32(0);
+    let commode_offset = builder.push_i32(0);
+    let fmode_offset = builder.push_i32(0);
+    let module_path_a_offset = builder.push_ascii_z(exec_path);
+    let module_path_w_offset = builder.push_utf16_z(exec_path);
+    let module_directory_a_offset = builder.push_ascii_z(module_directory);
+    let module_directory_w_offset = builder.push_utf16_z(module_directory);
+    let base_name_a_offset = builder.push_ascii_z(base_module_name);
+    let base_name_w_offset = builder.push_utf16_z(base_module_name);
+    let command_line_a_offset = builder.push_ascii_z(command_line.as_str());
+    let command_line_w_offset = builder.push_utf16_z(command_line.as_str());
+    let environment_a_offset = builder.push_bytes(environment_a.as_slice(), 1);
+    let environment_w_offset = builder.push_bytes(environment_w.as_slice(), 2);
+    let decimal_point_a_offset = builder.push_ascii_z(".");
+    let empty_a_offset = builder.push_ascii_z("");
+    let decimal_point_w_offset = builder.push_utf16_z(".");
+    let empty_w_offset = builder.push_utf16_z("");
+    let strerror_einval_offset = builder.push_ascii_z("invalid argument");
+    let strerror_enomem_offset = builder.push_ascii_z("not enough memory");
+    let strerror_eio_offset = builder.push_ascii_z("i/o error");
+    let strerror_erange_offset = builder.push_ascii_z("result out of range");
+    let strerror_unknown_offset = builder.push_ascii_z("unknown error");
+    let mut module_name_offsets = Vec::with_capacity(modules.len());
+    for module in modules {
+        module_name_offsets.push((
+            builder.push_ascii_z(module.path.as_str()),
+            builder.push_utf16_z(module.path.as_str()),
+            builder.push_ascii_z(module.base_name.as_str()),
+            builder.push_utf16_z(module.base_name.as_str()),
+        ));
+    }
+    let localeconv_offset = builder.reserve_struct::<LconvLite>();
+    let runtime_public_offset = builder.reserve_struct::<RustosRuntimePublic>();
+    builder.align(8);
+    let iob_array_offset = builder.bytes.len();
+    builder
+        .bytes
+        .resize(iob_array_offset + WINDOWS_FILE_STRUCT_SIZE * 3, 0);
+
+    let mut argv_string_offsets = Vec::with_capacity(argv_view.len());
+    for arg in argv_view {
+        argv_string_offsets.push(builder.push_ascii_z(arg));
+    }
+    builder.align(8);
+    let argv_table_offset = builder.bytes.len();
+    for _ in argv_view {
+        builder.push_u64(0);
+    }
+    builder.push_u64(0);
+
+    let mut env_string_offsets = Vec::with_capacity(env_strings.len());
+    for item in &env_strings {
+        env_string_offsets.push(builder.push_ascii_z(item));
+    }
+    builder.align(8);
+    let environ_table_offset = builder.bytes.len();
+    for _ in &env_strings {
+        builder.push_u64(0);
+    }
+    builder.push_u64(0);
+
+    if builder.bytes.len() > WINDOWS_RUNTIME_STRING_LIMIT {
+        return Err(ENOEXEC);
+    }
+    let runtime_base = align_up(runtime_base_hint, 4096)?;
+    let runtime_size = align_up(builder.bytes.len() as u64, 4096)?;
+    let module_path_a_ptr = runtime_base + module_path_a_offset as u64;
+    let module_path_w_ptr = runtime_base + module_path_w_offset as u64;
+    let module_directory_a_ptr = runtime_base + module_directory_a_offset as u64;
+    let module_directory_w_ptr = runtime_base + module_directory_w_offset as u64;
+    let base_name_a_ptr = runtime_base + base_name_a_offset as u64;
+    let base_name_w_ptr = runtime_base + base_name_w_offset as u64;
+    let command_line_a_ptr = runtime_base + command_line_a_offset as u64;
+    let command_line_w_ptr = runtime_base + command_line_w_offset as u64;
+    let environment_a_ptr = runtime_base + environment_a_offset as u64;
+    let environment_w_ptr = runtime_base + environment_w_offset as u64;
+    let argc_ptr = runtime_base + argc_offset as u64;
+    let argv_ptr_ptr = runtime_base + argv_ptr_ptr_offset as u64;
+    let environ_ptr_ptr = runtime_base + environ_ptr_ptr_offset as u64;
+    let errno_ptr = runtime_base + errno_offset as u64;
+    let last_error_ptr = runtime_base + last_error_offset as u64;
+    let commode_ptr = runtime_base + commode_offset as u64;
+    let fmode_ptr = runtime_base + fmode_offset as u64;
+    let argv_ptr = runtime_base + argv_table_offset as u64;
+    let environ_ptr = runtime_base + environ_table_offset as u64;
+    let process_parameters_address = runtime_base + params_offset as u64;
+    let peb_address = runtime_base + peb_offset as u64;
+    let teb_address = runtime_base + teb_offset as u64;
+    let loader_data_address = runtime_base + ldr_data_offset as u64;
+    let loader_module_array_address = runtime_base + ldr_entry_offsets[0] as u64;
+    let public_runtime_address = runtime_base + runtime_public_offset as u64;
+    let localeconv_ptr = runtime_base + localeconv_offset as u64;
+    let iob_array_ptr = runtime_base + iob_array_offset as u64;
+    let stdin_file_ptr = iob_array_ptr;
+    let stdout_file_ptr = iob_array_ptr + WINDOWS_FILE_STRUCT_SIZE as u64;
+    let stderr_file_ptr = iob_array_ptr + (WINDOWS_FILE_STRUCT_SIZE * 2) as u64;
+    let decimal_point_a_ptr = runtime_base + decimal_point_a_offset as u64;
+    let empty_a_ptr = runtime_base + empty_a_offset as u64;
+    let decimal_point_w_ptr = runtime_base + decimal_point_w_offset as u64;
+    let empty_w_ptr = runtime_base + empty_w_offset as u64;
+    let strerror_einval_ptr = runtime_base + strerror_einval_offset as u64;
+    let strerror_enomem_ptr = runtime_base + strerror_enomem_offset as u64;
+    let strerror_eio_ptr = runtime_base + strerror_eio_offset as u64;
+    let strerror_erange_ptr = runtime_base + strerror_erange_offset as u64;
+    let strerror_unknown_ptr = runtime_base + strerror_unknown_offset as u64;
+
+    for (index, offset) in argv_string_offsets.iter().copied().enumerate() {
+        let ptr = runtime_base + offset as u64;
+        builder.overwrite(
+            argv_table_offset + index * size_of::<u64>(),
+            &ptr.to_le_bytes(),
+        );
+    }
+    for (index, offset) in env_string_offsets.iter().copied().enumerate() {
+        let ptr = runtime_base + offset as u64;
+        builder.overwrite(
+            environ_table_offset + index * size_of::<u64>(),
+            &ptr.to_le_bytes(),
+        );
+    }
+    builder.overwrite(argv_ptr_ptr_offset, &argv_ptr.to_le_bytes());
+    builder.overwrite(environ_ptr_ptr_offset, &environ_ptr.to_le_bytes());
+
+    let peb = PebLite {
+        image_base_address: main.load_base,
+        loader_data: loader_data_address,
+        process_parameters: process_parameters_address,
+        process_heap: HANDLE_PROCESS_HEAP,
+        ..PebLite::default()
+    };
+    builder.overwrite(peb_offset, as_bytes(&peb));
+    let teb = TebLite {
+        arbitrary_user_pointer: public_runtime_address,
+        self_pointer: teb_address,
+        process_environment_block: peb_address,
+        ..TebLite::default()
+    };
+    builder.overwrite(teb_offset, as_bytes(&teb));
+    let params = ProcessParametersLite {
+        image_path_name: module_path_w_ptr,
+        command_line: command_line_w_ptr,
+        environment: environment_w_ptr,
+        reserved: [0; 5],
+    };
+    builder.overwrite(params_offset, as_bytes(&params));
+    let ldr_data = PebLdrDataLite {
+        module_count: loader_module_count as u32,
+        reserved: 0,
+        module_array: loader_module_array_address,
+    };
+    builder.overwrite(ldr_data_offset, as_bytes(&ldr_data));
+    let runtime_public = RustosRuntimePublic {
+        size: size_of::<RustosRuntimePublic>() as u32,
+        version: 1,
+        peb_address,
+        teb_address,
+        loader_data_address,
+        argc_ptr,
+        argv_ptr_ptr,
+        environ_ptr_ptr,
+        argv_ptr,
+        environ_ptr,
+        initial_narrow_environment_ptr: environ_ptr,
+        command_line_a_ptr,
+        command_line_w_ptr,
+        environment_a_ptr,
+        environment_w_ptr,
+        module_path_a_ptr,
+        module_path_w_ptr,
+        module_directory_a_ptr,
+        module_directory_w_ptr,
+        main_module_base_name_a_ptr: base_name_a_ptr,
+        main_module_base_name_w_ptr: base_name_w_ptr,
+        errno_ptr,
+        last_error_ptr,
+        commode_ptr,
+        fmode_ptr,
+        iob_array_ptr,
+        stdin_file_ptr,
+        stdout_file_ptr,
+        stderr_file_ptr,
+        localeconv_ptr,
+    };
+    builder.overwrite(runtime_public_offset, as_bytes(&runtime_public));
+    let main_ldr = LdrDataTableEntryLite {
+        dll_base: main.load_base,
+        entry_point: main.entry_point,
+        size_of_image: main.image_size as u32,
+        full_dll_name_w: module_path_w_ptr,
+        base_dll_name_w: base_name_w_ptr,
+        full_dll_name_a: module_path_a_ptr,
+        base_dll_name_a: base_name_a_ptr,
+        ..LdrDataTableEntryLite::default()
+    };
+    builder.overwrite(ldr_entry_offsets[0], as_bytes(&main_ldr));
+    for (index, module) in modules.iter().enumerate() {
+        let (full_a, full_w, base_a, base_w) = module_name_offsets[index];
+        let entry = LdrDataTableEntryLite {
+            dll_base: module.load_base,
+            entry_point: module.entry_point,
+            size_of_image: module.image_size as u32,
+            full_dll_name_w: runtime_base + full_w as u64,
+            base_dll_name_w: runtime_base + base_w as u64,
+            full_dll_name_a: runtime_base + full_a as u64,
+            base_dll_name_a: runtime_base + base_a as u64,
+            ..LdrDataTableEntryLite::default()
+        };
+        builder.overwrite(ldr_entry_offsets[index + 1], as_bytes(&entry));
+    }
+    let localeconv = LconvLite {
+        decimal_point: decimal_point_a_ptr,
+        thousands_sep: empty_a_ptr,
+        grouping: empty_a_ptr,
+        int_curr_symbol: empty_a_ptr,
+        currency_symbol: empty_a_ptr,
+        mon_decimal_point: decimal_point_a_ptr,
+        mon_thousands_sep: empty_a_ptr,
+        mon_grouping: empty_a_ptr,
+        positive_sign: empty_a_ptr,
+        negative_sign: empty_a_ptr,
+        int_frac_digits: WINDOWS_LOCALE_UNSPECIFIED_CHAR,
+        frac_digits: WINDOWS_LOCALE_UNSPECIFIED_CHAR,
+        p_cs_precedes: WINDOWS_LOCALE_UNSPECIFIED_CHAR,
+        p_sep_by_space: WINDOWS_LOCALE_UNSPECIFIED_CHAR,
+        n_cs_precedes: WINDOWS_LOCALE_UNSPECIFIED_CHAR,
+        n_sep_by_space: WINDOWS_LOCALE_UNSPECIFIED_CHAR,
+        p_sign_posn: WINDOWS_LOCALE_UNSPECIFIED_CHAR,
+        n_sign_posn: WINDOWS_LOCALE_UNSPECIFIED_CHAR,
+        w_decimal_point: decimal_point_w_ptr,
+        w_thousands_sep: empty_w_ptr,
+        w_int_curr_symbol: empty_w_ptr,
+        w_currency_symbol: empty_w_ptr,
+        w_mon_decimal_point: decimal_point_w_ptr,
+        w_mon_thousands_sep: empty_w_ptr,
+        w_positive_sign: empty_w_ptr,
+        w_negative_sign: empty_w_ptr,
+    };
+    builder.overwrite(localeconv_offset, as_bytes(&localeconv));
+    builder.overwrite(
+        iob_array_offset,
+        as_bytes(&FileLiteLayout {
+            flag: 0x0001,
+            file: 0,
+            ..FileLiteLayout::default()
+        }),
+    );
+    builder.overwrite(
+        iob_array_offset + WINDOWS_FILE_STRUCT_SIZE,
+        as_bytes(&FileLiteLayout {
+            flag: 0x0002,
+            file: 1,
+            ..FileLiteLayout::default()
+        }),
+    );
+    builder.overwrite(
+        iob_array_offset + WINDOWS_FILE_STRUCT_SIZE * 2,
+        as_bytes(&FileLiteLayout {
+            flag: 0x0002,
+            file: 2,
+            ..FileLiteLayout::default()
+        }),
+    );
+    map_data_pages_from_image(
+        prepare_handle,
+        &builder.bytes,
+        0,
+        runtime_base,
+        runtime_size,
+        PROC_BROKER_MAP_PRIVATE | PROC_BROKER_MAP_READ | PROC_BROKER_MAP_WRITE,
+    )?;
+
+    Ok(RustosProcSetWindowsRuntimeBrokerArgs {
+        abi_version: PROC_BROKER_ABI_VERSION,
+        loader_module_count: loader_module_count as u32,
+        prepare_handle,
+        entry_point: main.entry_point,
+        image_base: main.load_base,
+        image_size: main.image_size,
+        runtime_base,
+        runtime_size,
+        public_runtime_address,
+        peb_address,
+        teb_address,
+        process_parameters_address,
+        loader_data_address,
+        loader_module_array_address,
+        main_module_entry_address: main.entry_point,
+        command_line_w_ptr,
+        command_line_a_ptr,
+        environment_w_ptr,
+        environment_a_ptr,
+        module_path_w_ptr,
+        module_path_a_ptr,
+        module_directory_w_ptr,
+        module_directory_a_ptr,
+        main_module_base_name_w_ptr: base_name_w_ptr,
+        main_module_base_name_a_ptr: base_name_a_ptr,
+        argc: i32::try_from(argv_view.len()).unwrap_or(i32::MAX),
+        argc_ptr,
+        argv_ptr_ptr,
+        environ_ptr_ptr,
+        argv_ptr,
+        environ_ptr,
+        initial_narrow_environment_ptr: environ_ptr,
+        initenv_ptr: environ_ptr_ptr,
+        errno_ptr,
+        last_error_ptr,
+        commode_ptr,
+        fmode_ptr,
+        iob_array_ptr,
+        stdin_file_ptr,
+        stdout_file_ptr,
+        stderr_file_ptr,
+        localeconv_ptr,
+        strerror_einval_ptr,
+        strerror_enomem_ptr,
+        strerror_eio_ptr,
+        strerror_erange_ptr,
+        strerror_unknown_ptr,
+        teb_process_id_ptr: teb_address
+            + core::mem::offset_of!(TebLite, client_id_unique_process) as u64,
+        teb_thread_id_ptr: teb_address
+            + core::mem::offset_of!(TebLite, client_id_unique_thread) as u64,
+        ..RustosProcSetWindowsRuntimeBrokerArgs::default()
+    })
+}
+
+#[derive(Clone)]
+struct SystemDllEntry {
+    path: String,
+    base_name: String,
+}
+
+fn load_system_dll_registry() -> Result<Vec<SystemDllEntry>, i32> {
+    let bytes = read_file_to_vec(WINDOWS_DLL_REGISTRY_PATH)?;
+    let text = core::str::from_utf8(bytes.as_slice()).map_err(|_| ENOEXEC)?;
+    let mut entries = Vec::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        entries.push(SystemDllEntry {
+            path: line.to_string(),
+            base_name: file_name_from_path(line).to_string(),
+        });
+    }
+    if entries.is_empty() {
+        return Err(ENOEXEC);
+    }
+    Ok(entries)
+}
+
+fn read_file_to_vec(path: &str) -> Result<Vec<u8>, i32> {
+    let fd = open_readonly(path)?;
+    let mut out = Vec::new();
+    let mut offset = 0_u64;
+    loop {
+        let mut chunk = [0_u8; 4096];
+        let read = syscall4(
+            SYS_PREAD64,
+            fd as u64,
+            chunk.as_mut_ptr() as u64,
+            chunk.len() as u64,
+            offset,
+        );
+        if read < 0 {
+            let _ = syscall1(SYS_CLOSE, fd as u64);
+            return Err((-read) as i32);
+        }
+        if read == 0 {
+            break;
+        }
+        let read = read as usize;
+        out.extend_from_slice(&chunk[..read]);
+        offset = offset.checked_add(read as u64).ok_or(EOVERFLOW)?;
+        if read < chunk.len() {
+            break;
+        }
+    }
+    let close_status = syscall1(SYS_CLOSE, fd as u64);
+    if close_status < 0 {
+        return Err((-close_status) as i32);
+    }
+    Ok(out)
+}
+
+fn open_readonly(path: &str) -> Result<i32, i32> {
+    let c_path = CString::new(path).map_err(|_| EINVAL)?;
+    let fd = syscall4(SYS_OPENAT, AT_FDCWD, c_path.as_ptr() as u64, O_RDONLY, 0) as i32;
+    if fd < 0 {
+        return Err(-fd);
+    }
+    Ok(fd)
+}
+
+fn cstrings_to_strs(values: &[CString]) -> Result<Vec<&str>, i32> {
+    values
+        .iter()
+        .map(|value| core::str::from_utf8(value.as_bytes()).map_err(|_| EINVAL))
+        .collect()
+}
+
+fn build_windows_command_line(argv: &[&str]) -> String {
+    let mut command_line = String::new();
+    for (index, arg) in argv.iter().enumerate() {
+        if index != 0 {
+            command_line.push(' ');
+        }
+        command_line.push_str(quote_command_line_arg(arg).as_str());
+    }
+    command_line
+}
+
+fn quote_command_line_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return String::from("\"\"");
+    }
+    if !arg.bytes().any(|byte| matches!(byte, b' ' | b'\t' | b'"')) {
+        return String::from(arg);
+    }
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0usize;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                for _ in 0..=backslashes {
+                    quoted.push('\\');
+                }
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                for _ in 0..backslashes {
+                    quoted.push('\\');
+                }
+                backslashes = 0;
+                quoted.push(ch);
+            }
+        }
+    }
+    for _ in 0..(backslashes * 2) {
+        quoted.push('\\');
+    }
+    quoted.push('"');
+    quoted
+}
+
+fn build_environment_block_ascii(env: &[&str]) -> Result<Vec<u8>, i32> {
+    let mut bytes = Vec::new();
+    for item in env {
+        bytes.extend_from_slice(item.as_bytes());
+        bytes.push(0);
+    }
+    bytes.push(0);
+    if bytes.len() > WINDOWS_RUNTIME_STRING_LIMIT {
+        return Err(ENOEXEC);
+    }
+    Ok(bytes)
+}
+
+fn build_environment_block_utf16(env: &[&str]) -> Result<Vec<u8>, i32> {
+    let mut bytes = Vec::new();
+    for item in env {
+        for code_unit in item.encode_utf16() {
+            bytes.extend_from_slice(&code_unit.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+    }
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    if bytes.len() > WINDOWS_RUNTIME_STRING_LIMIT {
+        return Err(ENOEXEC);
+    }
+    Ok(bytes)
+}
+
+fn as_bytes<T>(value: &T) -> &[u8] {
+    unsafe { core::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
+}
+
+fn read_c_string_at_rva(image: &[u8], rva: u32) -> Result<&[u8], i32> {
+    let start = rva as usize;
+    if start >= image.len() {
+        return Err(ENOEXEC);
+    }
+    let mut end = start;
+    while end < image.len() {
+        if image[end] == 0 {
+            return Ok(&image[start..end]);
+        }
+        end += 1;
+    }
+    Err(ENOEXEC)
+}
+
+fn read_import_name_at_rva(image: &[u8], rva: u32) -> Result<&[u8], i32> {
+    let offset = rva as usize;
+    if offset + 2 > image.len() {
+        return Err(ENOEXEC);
+    }
+    read_c_string_at_rva(image, rva.checked_add(2).ok_or(EOVERFLOW)?)
+}
+
+fn write_u64_at_rva(image: &mut [u8], rva: u32, value: u64) -> Result<(), i32> {
+    let offset = rva as usize;
+    if offset + 8 > image.len() {
+        return Err(ENOEXEC);
+    }
+    image[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+fn parse_ascii_u32(bytes: &[u8]) -> Option<u32> {
+    let mut value = 0_u32;
+    for byte in bytes {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?;
+        value = value.checked_add((byte - b'0') as u32)?;
+    }
+    Some(value)
+}
+
+fn canonical_system_dll_name_bytes(name: &[u8]) -> Option<&'static str> {
+    let trimmed = trim_dll_suffix(name);
+    for (_, target) in BUILTIN_SYSTEM_DLL_ALIASES {
+        if dll_name_eq(trimmed, trim_dll_suffix(target.as_bytes())) {
+            return Some(*target);
+        }
+    }
+    None
+}
+
+fn dll_name_eq(actual: &[u8], expected_ascii_lower: &[u8]) -> bool {
+    let actual = trim_dll_suffix(actual);
+    let expected = trim_dll_suffix(expected_ascii_lower);
+    actual.len() == expected.len()
+        && actual
+            .iter()
+            .zip(expected.iter())
+            .all(|(&lhs, &rhs)| lhs.to_ascii_lowercase() == rhs)
+}
+
+fn trim_dll_suffix(name: &[u8]) -> &[u8] {
+    let suffix = name.get(name.len().saturating_sub(4)..).unwrap_or_default();
+    if suffix.len() == 4
+        && suffix[0] == b'.'
+        && suffix[1].eq_ignore_ascii_case(&b'd')
+        && suffix[2].eq_ignore_ascii_case(&b'l')
+        && suffix[3].eq_ignore_ascii_case(&b'l')
+    {
+        &name[..name.len() - 4]
+    } else {
+        name
+    }
+}
+
+fn file_name_from_path(path: &str) -> &str {
+    let mut last = path;
+    for (index, byte) in path.bytes().enumerate() {
+        if matches!(byte, b'/' | b'\\') {
+            last = &path[index + 1..];
+        }
+    }
+    if last.is_empty() {
+        path
+    } else {
+        last
+    }
+}
+
+fn directory_name_from_path(path: &str) -> &str {
+    let mut last_separator = None;
+    for (index, byte) in path.bytes().enumerate() {
+        if matches!(byte, b'/' | b'\\') {
+            last_separator = Some(index);
+        }
+    }
+    match last_separator {
+        Some(0) => &path[..1],
+        Some(index) => &path[..index],
+        None => ".",
+    }
 }
 
 fn map_data_pages_from_file(
