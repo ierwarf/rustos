@@ -49,7 +49,7 @@ rules = [
 # file, into config/rustos.toml when testing a release-shaped image.
 
 codegen_units = 1
-opt_level = "2"
+opt_level = "0"
 overflow_checks = true
 debug_assertions = false
 lto = "thin"

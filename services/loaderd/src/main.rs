@@ -558,15 +558,13 @@ fn parse_blob(bytes: &[u8], len: usize, count: usize) -> Result<Vec<CString>, i3
 
 fn validate_executable_fd(fd: i32) -> Result<u16, i32> {
     let mut header = [0_u8; ELF_HEADER_SIZE];
-    read_exact_at(fd, 0, &mut header[..4])?;
+    read_exact_at(fd, 0, &mut header)?;
     if header[..4] == *b"\x7fELF" {
-        read_exact_at(fd, 0, &mut header)?;
         let phdrs = read_program_headers(fd, &header)?;
         validate_elf_fd(fd, &header, &phdrs)?;
         return Ok(PROC_BROKER_FORMAT_ELF64);
     }
     if &header[..2] == b"MZ" {
-        read_exact_at(fd, 0, &mut header)?;
         validate_pe_fd(fd, &header[..PE_DOS_HEADER_SIZE])?;
         return Ok(PROC_BROKER_FORMAT_PE64);
     }
@@ -608,15 +606,13 @@ fn program_header_at(phdrs: &[u8], index: u64) -> Result<&[u8], i32> {
         .map_err(|_| EOVERFLOW)?
         .checked_mul(ELF_PROGRAM_HEADER_SIZE)
         .ok_or(EOVERFLOW)?;
-    let end = start.checked_add(ELF_PROGRAM_HEADER_SIZE).ok_or(EOVERFLOW)?;
+    let end = start
+        .checked_add(ELF_PROGRAM_HEADER_SIZE)
+        .ok_or(EOVERFLOW)?;
     phdrs.get(start..end).ok_or(ENOEXEC)
 }
 
-fn validate_elf_fd(
-    fd: i32,
-    header: &[u8; ELF_HEADER_SIZE],
-    phdrs: &[u8],
-) -> Result<(), i32> {
+fn validate_elf_fd(fd: i32, header: &[u8; ELF_HEADER_SIZE], phdrs: &[u8]) -> Result<(), i32> {
     if header[4] != 2 || header[5] != 1 || header[6] != 1 {
         return Err(ENOEXEC);
     }

@@ -717,7 +717,7 @@ fn prepare_port_command(
         (*table).cfis[13] = ((sector_count >> 8) & 0xff) as u8;
         // Zero the unused upper FIS DWORDs and the ACMD/reserved area used by
         // ATAPI so spurious bytes from the previous command never leak in.
-        for slot in (*table).cfis[14..].iter_mut() {
+        for slot in (&mut (*table).cfis)[14..].iter_mut() {
             *slot = 0;
         }
 

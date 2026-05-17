@@ -1937,6 +1937,7 @@ fn apply_module_relocations(
     policy: SymbolResolvePolicy,
 ) -> Result<(), &'static str> {
     let symbols = symbol_table_entries(elf)?;
+    let symbol_names = symbol_string_table(elf)?;
     let section_headers = section_header_entries(elf)?;
     let section_names = section_header_string_table(elf)?;
     let mut resolved_symbols = vec![[None; SymbolResolveFlavor::COUNT]; symbols.len()];
@@ -1988,6 +1989,7 @@ fn apply_module_relocations(
                 runtime_base,
                 &layout.sections,
                 &symbols,
+                symbol_names,
                 symbol_index,
                 relocation.relocation_type(),
                 policy,
@@ -2041,6 +2043,7 @@ fn resolve_symbol_addr_cached(
     runtime_base: usize,
     layouts: &[Option<ModuleSectionLayout>],
     symbols: &[ModuleSymbol],
+    symbol_names: &[u8],
     symbol_index: usize,
     relocation_type: u32,
     policy: SymbolResolvePolicy,
@@ -2057,7 +2060,15 @@ fn resolve_symbol_addr_cached(
         return cached;
     }
 
-    let resolved = resolve_symbol_addr(elf, runtime_base, layouts, symbol, relocation_type, policy);
+    let resolved = resolve_symbol_addr_with_names(
+        elf,
+        runtime_base,
+        layouts,
+        symbol,
+        symbol_names,
+        relocation_type,
+        policy,
+    );
     slot[flavor.index()] = Some(resolved);
     resolved
 }
@@ -2175,10 +2186,35 @@ fn resolve_symbol_addr(
     relocation_type: u32,
     policy: SymbolResolvePolicy,
 ) -> Result<usize, &'static str> {
+    let symbol_names = symbol_string_table(elf)?;
+    resolve_symbol_addr_with_names(
+        elf,
+        runtime_base,
+        layouts,
+        symbol,
+        symbol_names,
+        relocation_type,
+        policy,
+    )
+}
+
+fn resolve_symbol_addr_with_names(
+    elf: &ModuleElf<'_>,
+    runtime_base: usize,
+    layouts: &[Option<ModuleSectionLayout>],
+    symbol: &ModuleSymbol,
+    symbol_names: &[u8],
+    relocation_type: u32,
+    policy: SymbolResolvePolicy,
+) -> Result<usize, &'static str> {
     match symbol.shndx {
-        objelf::SHN_UNDEF => {
-            resolve_external_symbol_for_relocation(elf, symbol, relocation_type, policy)
-        }
+        objelf::SHN_UNDEF => resolve_external_symbol_for_relocation_with_names(
+            elf,
+            symbol,
+            symbol_names,
+            relocation_type,
+            policy,
+        ),
         objelf::SHN_ABS => {
             usize::try_from(symbol.value).map_err(|_| "absolute module symbol value overflow")
         }
@@ -2240,40 +2276,45 @@ fn resolve_external_symbol(
     symbol: &ModuleSymbol,
     policy: SymbolResolvePolicy,
 ) -> Result<usize, &'static str> {
-    if symbol.binding()? == ModuleSymbolBinding::Weak {
-        if symbol.name == 0 {
+    if symbol.name == 0 {
+        if symbol.binding()? == ModuleSymbolBinding::Weak {
             return Ok(0);
         }
-        if let Ok(name) = symbol_name(elf, symbol) {
-            if let Some(address) = resolve_allowed_external_symbol(name, policy) {
-                return Ok(address);
-            }
-            if is_optional_weak_symbol(name) {
-                driver_diag!(
-                    crate::debug::LogLevel::Warn,
-                    25,
-                    0,
-                    "driver module unresolved optional weak external: symbol={}",
-                    name
-                );
-                return Ok(0);
-            }
+        return Err("module references unnamed external symbol");
+    }
+    let name = symbol_name(elf, symbol).map_err(|_| "module external symbol name is invalid")?;
+    resolve_external_symbol_by_name(symbol, name, policy)
+}
+
+fn resolve_external_symbol_by_name(
+    symbol: &ModuleSymbol,
+    name: &str,
+    policy: SymbolResolvePolicy,
+) -> Result<usize, &'static str> {
+    if symbol.binding()? == ModuleSymbolBinding::Weak {
+        if let Some(address) = resolve_allowed_external_symbol(name, policy) {
+            return Ok(address);
+        }
+        if is_optional_weak_symbol(name) {
             driver_diag!(
                 crate::debug::LogLevel::Warn,
-                26,
+                25,
                 0,
-                "driver module unresolved weak external: symbol={}",
+                "driver module unresolved optional weak external: symbol={}",
                 name
             );
+            return Ok(0);
         }
+        driver_diag!(
+            crate::debug::LogLevel::Warn,
+            26,
+            0,
+            "driver module unresolved weak external: symbol={}",
+            name
+        );
         return Err("module references unsupported weak external symbol");
     }
 
-    if symbol.name == 0 {
-        return Err("module references unnamed external symbol");
-    }
-
-    let name = symbol_name(elf, symbol).map_err(|_| "module external symbol name is invalid")?;
     let address = resolve_allowed_external_symbol(name, policy);
     let Some(address) = address else {
         if policy.is_linux_compat() && !is_allowed_linux_external_symbol(name, policy) {
@@ -2342,6 +2383,36 @@ fn resolve_external_symbol_for_relocation(
     Ok(resolved)
 }
 
+fn resolve_external_symbol_for_relocation_with_names(
+    _elf: &ModuleElf<'_>,
+    symbol: &ModuleSymbol,
+    symbol_names: &[u8],
+    relocation_type: u32,
+    policy: SymbolResolvePolicy,
+) -> Result<usize, &'static str> {
+    if symbol.name == 0 {
+        if symbol.binding()? == ModuleSymbolBinding::Weak {
+            return Ok(0);
+        }
+        return Err("module references unnamed external symbol");
+    }
+    let name = symbol_name_from_table(symbol_names, symbol)
+        .map_err(|_| "module external symbol name is invalid")?;
+    let resolved = resolve_external_symbol_by_name(symbol, name, policy)?;
+    if relocation_type == R_X86_64_PLT32 {
+        return compat_trampoline_addr(resolved, compat_trampoline_mode_for_symbol(name));
+    }
+
+    if matches!(
+        relocation_type,
+        R_X86_64_PC32 | R_X86_64_32 | R_X86_64_32S | R_X86_64_PC64
+    ) {
+        return Ok(crate::memory::paging::lower_half_addr(resolved as u64) as usize);
+    }
+
+    Ok(resolved)
+}
+
 fn compat_trampoline_mode_for_symbol(name: &str) -> CompatTrampolineMode {
     match super::linux::export_abi(name) {
         super::linux::LinuxCompatExportAbi::AlignRustCall => CompatTrampolineMode::AlignRustCall,
@@ -2354,10 +2425,6 @@ fn compat_trampoline_mode_for_symbol(name: &str) -> CompatTrampolineMode {
 fn resolve_allowed_external_symbol(name: &str, policy: SymbolResolvePolicy) -> Option<usize> {
     if !policy.is_linux_compat() {
         return export::resolve_symbol(name);
-    }
-
-    if !is_allowed_linux_external_symbol(name, policy) {
-        return None;
     }
 
     resolve_linux_allowed_symbol(name, policy)

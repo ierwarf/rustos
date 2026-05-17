@@ -16,6 +16,8 @@ struct ProfileWindow {
     cursor_moves: u64,
     wayland_motion_calls: u64,
     wayland_motion_micros: u64,
+    runtime_refresh_calls: u64,
+    runtime_refresh_micros: u64,
     console_refresh_calls: u64,
     console_refresh_changed: u64,
     console_refresh_micros: u64,
@@ -24,6 +26,10 @@ struct ProfileWindow {
     present_rects: u64,
     render_micros: u64,
     present_micros: u64,
+    full_render_micros: u64,
+    full_present_micros: u64,
+    partial_render_micros: u64,
+    partial_present_micros: u64,
     present_pixels: u64,
     throttle_spins: u64,
 }
@@ -85,6 +91,17 @@ pub(crate) fn record_wayland_motion(elapsed: Duration) {
         .saturating_add(duration_micros(elapsed));
 }
 
+pub(crate) fn record_runtime_refresh(elapsed: Duration) {
+    if !enabled() {
+        return;
+    }
+    let mut window = window().lock().unwrap();
+    window.runtime_refresh_calls = window.runtime_refresh_calls.saturating_add(1);
+    window.runtime_refresh_micros = window
+        .runtime_refresh_micros
+        .saturating_add(duration_micros(elapsed));
+}
+
 pub(crate) fn record_console_refresh(elapsed: Duration, changed: bool) {
     if !enabled() {
         return;
@@ -112,8 +129,20 @@ pub(crate) fn record_present(
     let mut window = window().lock().unwrap();
     if full {
         window.full_presents = window.full_presents.saturating_add(1);
+        window.full_render_micros = window
+            .full_render_micros
+            .saturating_add(duration_micros(render_elapsed));
+        window.full_present_micros = window
+            .full_present_micros
+            .saturating_add(duration_micros(present_elapsed));
     } else {
         window.partial_presents = window.partial_presents.saturating_add(1);
+        window.partial_render_micros = window
+            .partial_render_micros
+            .saturating_add(duration_micros(render_elapsed));
+        window.partial_present_micros = window
+            .partial_present_micros
+            .saturating_add(duration_micros(present_elapsed));
     }
     window.present_rects = window.present_rects.saturating_add(rect_count);
     window.present_pixels = window.present_pixels.saturating_add(pixel_count);
@@ -146,17 +175,29 @@ pub(crate) fn maybe_emit() {
     }
 
     let line = format!(
-        "uiserver profile: loops={} input_ms={} con_calls={} con_chg={} con_ms={} full={} part={} rects={} ren_ms={} prs_ms={} mpix={} spins={}",
+        "uiserver profile: loops={} input_events={} input_ms={} motion={} position={} other={} backlog={} cursor_moves={} wayland_calls={} wayland_ms={} runtime_calls={} runtime_ms={} con_calls={} con_chg={} con_ms={} full={} part={} rects={} full_ren_ms={} full_prs_ms={} part_ren_ms={} part_prs_ms={} mpix={} spins={}",
         window.input_loops,
+        window.input_events,
         window.input_loop_micros / 1000,
+        window.pointer_motion_events,
+        window.pointer_position_events,
+        window.other_events,
+        window.backlog_loops,
+        window.cursor_moves,
+        window.wayland_motion_calls,
+        window.wayland_motion_micros / 1000,
+        window.runtime_refresh_calls,
+        window.runtime_refresh_micros / 1000,
         window.console_refresh_calls,
         window.console_refresh_changed,
         window.console_refresh_micros / 1000,
         window.full_presents,
         window.partial_presents,
         window.present_rects,
-        window.render_micros / 1000,
-        window.present_micros / 1000,
+        window.full_render_micros / 1000,
+        window.full_present_micros / 1000,
+        window.partial_render_micros / 1000,
+        window.partial_present_micros / 1000,
         window.present_pixels / 1_000_000,
         window.throttle_spins,
     );

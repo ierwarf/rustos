@@ -14,6 +14,7 @@ use x86_64::VirtAddr;
 use crate::{announce_ready, debug, fatal, flow_debug, flow_info, hal_hooks, io_services, tasks};
 
 const ROOTD_EXEC_PATH: &str = "services/rootd/rootd.elf";
+const ROOTD_BOOTSTRAP_WEIGHT_MICROS: u64 = 1_000;
 const MAX_BACKTRACE_FRAME_STEP: u64 = 1024 * 1024;
 
 macro_rules! boot_log {
@@ -352,8 +353,12 @@ pub fn bootstrap_init_process() {
         loaded.bytes.len(),
     );
     flow_debug(33, "init bootstrap image loaded");
-    let program =
-        ConsoleProgramSpec::new(&loaded.bytes, ROOTD_EXEC_PATH, 50).with_logical_admin(true);
+    let program = ConsoleProgramSpec::new(
+        &loaded.bytes,
+        ROOTD_EXEC_PATH,
+        ROOTD_BOOTSTRAP_WEIGHT_MICROS,
+    )
+    .with_logical_admin(true);
     match console_host::spawn_program_in_session(io_services::system_console_session_raw(), program)
     {
         Ok(_spawned) => {}
@@ -379,6 +384,7 @@ pub fn run_nucleus_loop() -> ! {
         kernel_initialization_complete(),
         io_services::bootstrap_phase(),
     );
+    ps_api::mark_root_idle();
     loop {
         x86_64::instructions::interrupts::enable_and_hlt();
     }
@@ -390,11 +396,11 @@ pub fn housekeeping_once() -> usize {
     trace_service_phase("compat");
     compat_api::service_pending();
 
-    trace_service_phase("tty");
-    work += io_services::input_service_pending();
-
     trace_service_phase("usb");
     work += io_services::usb_service_pending();
+
+    trace_service_phase("tty");
+    work += io_services::input_service_pending();
 
     trace_service_phase("display");
     work += io_services::display_service_pending();

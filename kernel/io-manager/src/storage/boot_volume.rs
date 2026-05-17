@@ -1,12 +1,14 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use alloc::boxed::Box;
+use alloc::string::{String, ToString};
+use alloc::vec;
 use alloc::vec::Vec;
 use boot_protocol::{BootInfo, BootVolumeIdentity, BootVolumeTransport, FramebufferInfo};
 use core::ptr;
-use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 
-use crate::sync::KernelSpinLock as Mutex;
+use crate::sync::{KernelSpinLock as Mutex, KernelWaitLock};
 use fatfs::{IoBase, Read, Seek, SeekFrom, Write};
 use storage_core::BlockDevice;
 
@@ -28,8 +30,38 @@ pub type PhysicalBootBlockDeviceOpener =
 type BootVolumeFs = fat::MountedFatVolume<Box<dyn BlockDevice>>;
 type BootVolumeFileInner<'a> = storage_fat::FatFile<'a, Box<dyn BlockDevice>>;
 const BOOT_VOLUME_READ_CHUNK_CAP: usize = 64 * 1024;
+const ROOT_FILE_EXTENTS_REGISTRY_PATH: &str = "system/registry/kernel/root-file-extents.tsv";
+const ROOT_EXTENT_READ_CHUNK_CAP: usize = 256 * 1024;
 
-static CACHED_BOOT_VOLUME_FS: Mutex<Option<BootVolumeFs>> = Mutex::new(None);
+static CACHED_BOOT_VOLUME_FS: KernelWaitLock<Option<BootVolumeFs>> = KernelWaitLock::new(None);
+static ROOT_FILE_EXTENTS: KernelWaitLock<RootFileExtentState> =
+    KernelWaitLock::new(RootFileExtentState::Uninitialized);
+static ROOT_EXTENT_LOGS_REMAINING: AtomicUsize = AtomicUsize::new(32);
+
+#[derive(Clone, Debug)]
+struct RootFileExtent {
+    offset: u64,
+    len: u64,
+}
+
+#[derive(Clone, Debug)]
+struct RootFileExtentEntry {
+    path: String,
+    len: u64,
+    extents: Vec<RootFileExtent>,
+}
+
+#[derive(Debug)]
+struct RootFileExtentTable {
+    entries: Vec<RootFileExtentEntry>,
+}
+
+#[derive(Debug)]
+enum RootFileExtentState {
+    Uninitialized,
+    Ready(RootFileExtentTable),
+    Disabled,
+}
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -186,6 +218,254 @@ impl PhysicalBootVolumeFile<'_> {
     }
 }
 
+fn read_file_to_vec_from_fs(
+    fs: &BootVolumeFs,
+    path: &str,
+) -> core::result::Result<Vec<u8>, fatfs::Error<DiskIoError>> {
+    let len = usize::try_from(fs.metadata(path)?.len).map_err(|_| fatfs::Error::InvalidInput)?;
+    let mut bytes = vec![0_u8; len];
+    let read = read_file_into_from_fs(fs, path, &mut bytes, |_, _| {})?;
+    bytes.truncate(read);
+    Ok(bytes)
+}
+
+fn normalized_extent_path(path: &str) -> Option<&str> {
+    let path = path.strip_prefix('/').unwrap_or(path);
+    (!path.is_empty() && !path.contains("..")).then_some(path)
+}
+
+fn read_file_to_vec_from_extents(
+    path: &str,
+) -> core::result::Result<Option<Vec<u8>>, fatfs::Error<DiskIoError>> {
+    let Some(path) = normalized_extent_path(path) else {
+        return Ok(None);
+    };
+    let mut cache = ROOT_FILE_EXTENTS.lock();
+    if matches!(*cache, RootFileExtentState::Uninitialized) {
+        *cache = match load_root_file_extent_table() {
+            Ok(table) => {
+                crate::debug::info!(
+                    storage,
+                    "boot volume extents: loaded entries={}",
+                    table.entries.len()
+                );
+                RootFileExtentState::Ready(table)
+            }
+            Err(err) => {
+                crate::debug::warn!(storage, "boot volume extents: disabled error={:?}", err);
+                RootFileExtentState::Disabled
+            }
+        };
+    }
+    let entry = match &*cache {
+        RootFileExtentState::Ready(table) => table.find(path).cloned(),
+        _ => None,
+    };
+    drop(cache);
+    let Some(entry) = entry else {
+        if path.starts_with("system/registry/") {
+            crate::debug::warn!(storage, "boot volume extents: miss path={}", path);
+        }
+        return Ok(None);
+    };
+    trace_extent_read(entry.path.as_str(), entry.len);
+    read_extent_entry(&entry).map(Some)
+}
+
+fn metadata_from_extents(
+    path: &str,
+) -> core::result::Result<Option<BootVolumeMetadata>, fatfs::Error<DiskIoError>> {
+    let Some(path) = normalized_extent_path(path) else {
+        return Ok(None);
+    };
+    let mut cache = ROOT_FILE_EXTENTS.lock();
+    if matches!(*cache, RootFileExtentState::Uninitialized) {
+        *cache = match load_root_file_extent_table() {
+            Ok(table) => {
+                crate::debug::info!(
+                    storage,
+                    "boot volume extents: loaded entries={}",
+                    table.entries.len()
+                );
+                RootFileExtentState::Ready(table)
+            }
+            Err(err) => {
+                crate::debug::warn!(storage, "boot volume extents: disabled error={:?}", err);
+                RootFileExtentState::Disabled
+            }
+        };
+    }
+    let RootFileExtentState::Ready(table) = &*cache else {
+        return Ok(None);
+    };
+    Ok(table.find(path).map(|entry| BootVolumeMetadata {
+        kind: storage_fat::FatNodeKind::File,
+        len: entry.len,
+    }))
+}
+
+fn trace_extent_read(path: &str, len: u64) {
+    if ROOT_EXTENT_LOGS_REMAINING
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+            remaining.checked_sub(1)
+        })
+        .is_ok()
+    {
+        crate::debug::info!(
+            storage,
+            "boot volume extents: read path={} len={}",
+            path,
+            len
+        );
+    }
+}
+
+impl RootFileExtentTable {
+    fn find(&self, path: &str) -> Option<&RootFileExtentEntry> {
+        self.entries.iter().find(|entry| entry.path == path)
+    }
+}
+
+fn load_root_file_extent_table()
+-> core::result::Result<RootFileExtentTable, fatfs::Error<DiskIoError>> {
+    let bytes =
+        with_open_boot_volume(|fs| read_file_to_vec_from_fs(fs, ROOT_FILE_EXTENTS_REGISTRY_PATH))?;
+    parse_root_file_extent_table(&bytes).map_err(|_| fatfs::Error::InvalidInput)
+}
+
+fn parse_root_file_extent_table(bytes: &[u8]) -> Result<RootFileExtentTable, ()> {
+    let text = core::str::from_utf8(bytes).map_err(|_| ())?;
+    let mut entries = Vec::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let path = registry_field(line, "path").ok_or(())?;
+        let len = registry_field(line, "len")
+            .ok_or(())?
+            .parse::<u64>()
+            .map_err(|_| ())?;
+        let extents = parse_extent_list(registry_field(line, "extents").ok_or(())?)?;
+        let path = normalized_extent_path(path).ok_or(())?.to_string();
+        entries.push(RootFileExtentEntry { path, len, extents });
+    }
+    Ok(RootFileExtentTable { entries })
+}
+
+fn registry_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    line.split('\t').find_map(|field| {
+        let (field_key, value) = field.split_once('=')?;
+        (field_key == key).then_some(value)
+    })
+}
+
+fn parse_extent_list(text: &str) -> Result<Vec<RootFileExtent>, ()> {
+    let mut extents = Vec::new();
+    if text.is_empty() {
+        return Ok(extents);
+    }
+    for item in text.split(',') {
+        let (offset, len) = item.split_once(':').ok_or(())?;
+        let offset = offset.parse::<u64>().map_err(|_| ())?;
+        let len = len.parse::<u64>().map_err(|_| ())?;
+        if len == 0 {
+            continue;
+        }
+        extents.push(RootFileExtent { offset, len });
+    }
+    Ok(extents)
+}
+
+fn read_extent_entry(
+    entry: &RootFileExtentEntry,
+) -> core::result::Result<Vec<u8>, fatfs::Error<DiskIoError>> {
+    let len = usize::try_from(entry.len).map_err(|_| fatfs::Error::InvalidInput)?;
+    let mut bytes = vec![0_u8; len];
+    let mut written = 0usize;
+    let handle = crate::storage::block::current_boot_volume_handle()
+        .ok_or(fatfs::Error::Io(DiskIoError::NotPresent))?;
+    let block_size = crate::storage::block::descriptor(handle)
+        .map(|descriptor| descriptor.logical_block_size)
+        .filter(|block_size| *block_size != 0)
+        .ok_or(fatfs::Error::Io(DiskIoError::NotPresent))?;
+    let mut device = crate::storage::block::FatRegistryDevice::new(handle);
+
+    for extent in &entry.extents {
+        if written == bytes.len() {
+            break;
+        }
+        let extent_offset =
+            usize::try_from(extent.offset).map_err(|_| fatfs::Error::InvalidInput)?;
+        let extent_len = usize::try_from(extent.len).map_err(|_| fatfs::Error::InvalidInput)?;
+        let readable = extent_len.min(bytes.len() - written);
+        if readable == 0 {
+            continue;
+        }
+        read_extent_bytes(
+            &mut device,
+            block_size,
+            extent_offset,
+            readable,
+            &mut bytes[written..written + readable],
+        )?;
+        written += readable;
+    }
+    if written != bytes.len() {
+        return Err(fatfs::Error::UnexpectedEof);
+    }
+    Ok(bytes)
+}
+
+fn read_extent_bytes(
+    device: &mut crate::storage::block::FatRegistryDevice,
+    block_size: usize,
+    mut offset: usize,
+    mut len: usize,
+    dest: &mut [u8],
+) -> core::result::Result<(), fatfs::Error<DiskIoError>> {
+    let mut done = 0usize;
+    while len != 0 {
+        let block_offset = offset % block_size;
+        let aligned_offset = offset - block_offset;
+        let chunk_payload = len.min(ROOT_EXTENT_READ_CHUNK_CAP);
+        let read_len = (block_offset + chunk_payload).div_ceil(block_size) * block_size;
+        let lba = (aligned_offset / block_size) as u64;
+        let mut scratch = vec![0_u8; read_len];
+        device
+            .read_blocks(lba, scratch.as_mut_slice())
+            .map_err(fatfs::Error::Io)?;
+        dest[done..done + chunk_payload]
+            .copy_from_slice(&scratch[block_offset..block_offset + chunk_payload]);
+        done += chunk_payload;
+        offset += chunk_payload;
+        len -= chunk_payload;
+    }
+    Ok(())
+}
+
+fn read_file_into_from_fs(
+    fs: &BootVolumeFs,
+    path: &str,
+    dest: &mut [u8],
+    mut after_chunk: impl FnMut(usize, usize),
+) -> core::result::Result<usize, fatfs::Error<DiskIoError>> {
+    let mut file = fs.open_file(path)?;
+    let mut done = 0usize;
+    while done < dest.len() {
+        let remaining = dest.len() - done;
+        let chunk_len = remaining.min(BOOT_VOLUME_READ_CHUNK_CAP);
+        let count = file.read(&mut dest[done..done + chunk_len])?;
+        after_chunk(done, count);
+        if count == 0 {
+            break;
+        }
+        done += count;
+        crate::multitask::cond_resched();
+    }
+    Ok(done)
+}
+
 impl BootVolume {
     pub fn open() -> core::result::Result<Self, fatfs::Error<DiskIoError>> {
         let opener =
@@ -223,7 +503,7 @@ impl BootVolume {
         if should_trace_boot_path(path) {
             crate::debug::println!("boot volume: read_file_to_vec enter path={}", path);
         }
-        self.fs.read_file_to_vec(path)
+        read_file_to_vec_from_fs(&self.fs, path)
     }
 
     pub fn read_file_into(
@@ -239,39 +519,7 @@ impl BootVolume {
             );
         }
         let trace = should_trace_boot_path(path);
-        if trace {
-            crate::debug::println!("boot volume: read_file_into open_file begin path={}", path);
-        }
-        let mut file = self.fs.open_file(path)?;
-        if trace {
-            crate::debug::println!("boot volume: read_file_into open_file done path={}", path);
-        }
-        let mut done = 0usize;
-        while done < dest.len() {
-            if trace && done == 0 {
-                crate::debug::println!(
-                    "boot volume: read_file_into first read begin path={} remaining={}",
-                    path,
-                    dest.len() - done
-                );
-            }
-            let remaining = dest.len() - done;
-            let chunk_len = remaining.min(BOOT_VOLUME_READ_CHUNK_CAP);
-            let count = match file.read(&mut dest[done..done + chunk_len]) {
-                Ok(count) => count,
-                Err(err) => {
-                    if trace {
-                        crate::debug::println!(
-                            "boot volume: read_file_into read error path={} offset={} chunk_len={} err={:?}",
-                            path,
-                            done,
-                            chunk_len,
-                            err
-                        );
-                    }
-                    return Err(err);
-                }
-            };
+        let done = read_file_into_from_fs(&self.fs, path, dest, |done, count| {
             if trace && done == 0 {
                 crate::debug::println!(
                     "boot volume: read_file_into first read done path={} count={}",
@@ -286,11 +534,7 @@ impl BootVolume {
                     count
                 );
             }
-            if count == 0 {
-                break;
-            }
-            done += count;
-        }
+        })?;
         if trace {
             crate::debug::println!(
                 "boot volume: read_file_into exit path={} ok={} read={}",
@@ -398,7 +642,7 @@ impl PhysicalBootVolume {
         &self,
         path: &str,
     ) -> core::result::Result<Vec<u8>, fatfs::Error<DiskIoError>> {
-        self.fs.read_file_to_vec(path)
+        read_file_to_vec_from_fs(&self.fs, path)
     }
 
     pub fn read_file_into(
@@ -406,7 +650,7 @@ impl PhysicalBootVolume {
         path: &str,
         dest: &mut [u8],
     ) -> core::result::Result<usize, fatfs::Error<DiskIoError>> {
-        self.fs.read_file_into(path, dest)
+        read_file_into_from_fs(&self.fs, path, dest, |_, _| {})
     }
 
     pub fn append_bytes(
@@ -453,7 +697,10 @@ pub fn read_bootstrap_file_to_vec(
         crate::debug::println!("boot volume helper: read_file_to_vec begin path={}", path);
     }
     ensure_bootstrap_fs_access(path)?;
-    with_open_boot_volume(|fs| fs.read_file_to_vec(path))
+    if let Some(bytes) = read_file_to_vec_from_extents(path)? {
+        return Ok(bytes);
+    }
+    with_open_boot_volume(|fs| read_file_to_vec_from_fs(fs, path))
 }
 
 pub fn read_file_to_vec(path: &str) -> core::result::Result<Vec<u8>, fatfs::Error<DiskIoError>> {
@@ -463,7 +710,14 @@ pub fn read_file_to_vec(path: &str) -> core::result::Result<Vec<u8>, fatfs::Erro
             path
         );
     }
-    with_open_boot_volume(|fs| fs.read_file_to_vec(path))
+    if let Some(bytes) = read_file_to_vec_from_extents(path)? {
+        return Ok(bytes);
+    }
+    let result = with_open_boot_volume(|fs| read_file_to_vec_from_fs(fs, path));
+    if result.is_err() && path.starts_with("system/registry/") {
+        crate::debug::warn!(storage, "boot volume helper: fallback failed path={}", path);
+    }
+    result
 }
 
 pub fn read_file_into(
@@ -477,12 +731,20 @@ pub fn read_file_into(
             dest.len()
         );
     }
-    with_open_boot_volume(|fs| fs.read_file_into(path, dest))
+    if let Some(bytes) = read_file_to_vec_from_extents(path)? {
+        let len = bytes.len().min(dest.len());
+        dest[..len].copy_from_slice(&bytes[..len]);
+        return Ok(len);
+    }
+    with_open_boot_volume(|fs| read_file_into_from_fs(fs, path, dest, |_, _| {}))
 }
 
 pub fn metadata(path: &str) -> core::result::Result<BootVolumeMetadata, fatfs::Error<DiskIoError>> {
     if should_trace_boot_path(path) {
         crate::debug::println!("boot volume helper: metadata begin path={}", path);
+    }
+    if let Some(metadata) = metadata_from_extents(path)? {
+        return Ok(metadata);
     }
     with_open_boot_volume(|fs| fs.metadata(path))
 }

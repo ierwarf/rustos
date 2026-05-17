@@ -11,6 +11,8 @@ use crate::sync::KernelWaitLock;
 pub(super) fn register_root_device(device: Box<dyn BlockDeviceOps>) {
     let transport = device.transport_kind();
     let readonly = device.readonly();
+    let logical_block_size = device.logical_block_size();
+    let block_count = device.block_count();
     let root_id = {
         let mut devices = BLOCK_DEVICES.lock();
         let id = devices.len() as u32;
@@ -19,6 +21,10 @@ pub(super) fn register_root_device(device: Box<dyn BlockDeviceOps>) {
             path: alloc::format!("/dev/block{id}"),
             transport,
             readonly,
+            logical_block_size,
+            start_block: 0,
+            block_count,
+            root_id: id,
             kind: BlockDeviceKind::Root(Arc::new(KernelWaitLock::new(device))),
         });
         id
@@ -47,11 +53,20 @@ fn register_partitions(root_id: u32) {
     for (index, partition) in partitions.into_iter().enumerate() {
         let id = devices.len() as u32;
         let partition_number = index + 1;
+        let start_block = device_start_block_locked(&devices, root_id)
+            .unwrap_or(0)
+            .saturating_add(partition.start_lba);
+        let logical_block_size = device_logical_block_size_locked(&devices, root_id).unwrap_or(0);
+        let root_device_id = device_root_id_locked(&devices, root_id).unwrap_or(root_id);
         devices.push(BlockDeviceRecord {
             id,
             path: alloc::format!("/dev/block{root_id}p{partition_number}"),
             transport,
             readonly,
+            logical_block_size,
+            start_block,
+            block_count: partition.block_count,
+            root_id: root_device_id,
             kind: BlockDeviceKind::Slice {
                 parent_id: root_id,
                 start_block: partition.start_lba,
@@ -66,12 +81,7 @@ pub(super) fn device_logical_block_size_locked(
     device_id: u32,
 ) -> Option<usize> {
     let record = devices.iter().find(|device| device.id == device_id)?;
-    match &record.kind {
-        BlockDeviceKind::Root(device) => Some(device.lock().logical_block_size()),
-        BlockDeviceKind::Slice { parent_id, .. } => {
-            device_logical_block_size_locked(devices, *parent_id)
-        }
-    }
+    Some(record.logical_block_size)
 }
 
 pub(super) fn device_block_count_locked(
@@ -79,10 +89,7 @@ pub(super) fn device_block_count_locked(
     device_id: u32,
 ) -> Option<u64> {
     let record = devices.iter().find(|device| device.id == device_id)?;
-    match &record.kind {
-        BlockDeviceKind::Root(device) => Some(device.lock().block_count()),
-        BlockDeviceKind::Slice { block_count, .. } => Some(*block_count),
-    }
+    Some(record.block_count)
 }
 
 pub(super) fn device_start_block_locked(
@@ -90,22 +97,12 @@ pub(super) fn device_start_block_locked(
     device_id: u32,
 ) -> Option<u64> {
     let record = devices.iter().find(|device| device.id == device_id)?;
-    match &record.kind {
-        BlockDeviceKind::Root(_) => Some(0),
-        BlockDeviceKind::Slice {
-            parent_id,
-            start_block,
-            ..
-        } => Some(device_start_block_locked(devices, *parent_id)?.saturating_add(*start_block)),
-    }
+    Some(record.start_block)
 }
 
 pub(super) fn device_root_id_locked(devices: &[BlockDeviceRecord], device_id: u32) -> Option<u32> {
     let record = devices.iter().find(|device| device.id == device_id)?;
-    match &record.kind {
-        BlockDeviceKind::Root(_) => Some(record.id),
-        BlockDeviceKind::Slice { parent_id, .. } => device_root_id_locked(devices, *parent_id),
-    }
+    Some(record.root_id)
 }
 
 pub(super) fn root_device_ids_locked(devices: &[BlockDeviceRecord]) -> Vec<u32> {

@@ -14,6 +14,30 @@ use crate::sys::{
     DisplaySurfaceCreate, SurfaceMapping, ESTALE, PIXEL_FORMAT_BGRA8888,
 };
 const SURFACE_CREATE_RETRIES: usize = 4;
+// Retry budget for waiting on the primary display provider (e.g. virtio-gpu).
+// The earliest snapshot uiserver sees may still be the platform bootfb fallback
+// while `driverd` is still bringing virtio-gpu online. Polling for up to ~5s
+// at 50ms intervals covers boot-time ordering races without hanging forever.
+const PRIMARY_DISPLAY_WAIT_ATTEMPTS: usize = 100;
+const PRIMARY_DISPLAY_WAIT_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Display validation outcome split between "wait and retry" failures (the
+/// primary provider has not yet registered) and hard configuration errors
+/// that should propagate to the runtime.
+enum DisplayValidationError {
+    NotPrimaryYet,
+    Fatal(i32),
+}
+
+fn validate_display_info_with_retry(
+    display: &DisplayInfo,
+) -> Result<usize, DisplayValidationError> {
+    if !display.is_primary_provider() {
+        // Don't log on every retry: that floods debugcon during the wait.
+        return Err(DisplayValidationError::NotPrimaryYet);
+    }
+    validate_display_info(display).map_err(DisplayValidationError::Fatal)
+}
 
 struct DisplaySurfaceState {
     display: DisplayInfo,
@@ -118,11 +142,57 @@ fn validate_surface_metadata(
 }
 
 fn fetch_surface_state(display_fd: i32) -> Result<DisplaySurfaceState, i32> {
+    // Wait for the primary display provider to register before we attempt
+    // surface creation. This guards against the boot-time race where
+    // `runtimed` spawns uiserver before `driverd` finishes loading the
+    // virtio-gpu module, leaving us with only the bootfb fallback for which
+    // surface creation is unsupported.
+    let mut wait_attempts = 0usize;
     for attempt in 0..SURFACE_CREATE_RETRIES {
-        let display = display_get_info(display_fd).map_err(|_| {
+        // Re-fetch display info each surface attempt: after a generation
+        // mismatch (or the primary-provider wait below) the geometry may have
+        // changed and we need fresh dimensions for create_surface.
+        let mut display: DisplayInfo = display_get_info(display_fd).map_err(|_| {
             diag_line("uiserver: display_get_info failed");
-            13
+            13_i32
         })?;
+        let display_stride_bytes = loop {
+            match validate_display_info_with_retry(&display) {
+                Ok(stride) => break stride,
+                Err(DisplayValidationError::Fatal(err)) => return Err(err),
+                Err(DisplayValidationError::NotPrimaryYet) => {
+                    if wait_attempts == 0 {
+                        diag_line(
+                            format!(
+                                "uiserver: waiting for primary display provider (initial flags={:#x} gen={})",
+                                display.flags, display.generation,
+                            )
+                            .as_str(),
+                        );
+                    }
+                    wait_attempts += 1;
+                    if wait_attempts >= PRIMARY_DISPLAY_WAIT_ATTEMPTS {
+                        diag_line("uiserver: primary display provider never registered");
+                        return Err(14);
+                    }
+                    thread::sleep(PRIMARY_DISPLAY_WAIT_DELAY);
+                    display = display_get_info(display_fd).map_err(|_| {
+                        diag_line("uiserver: display_get_info failed during primary wait");
+                        13_i32
+                    })?;
+                }
+            }
+        };
+        if wait_attempts > 0 && attempt == 0 {
+            diag_line(
+                format!(
+                    "uiserver: primary display ready after {} retries width={} height={} flags={:#x} gen={}",
+                    wait_attempts, display.width, display.height, display.flags, display.generation,
+                )
+                .as_str(),
+            );
+        }
+
         diag_line(
             format!(
                 "uiserver: display_get_info attempt={} width={} height={} stride={} bpp={} fmt={} flags={:#x} gen={}",
@@ -137,7 +207,6 @@ fn fetch_surface_state(display_fd: i32) -> Result<DisplaySurfaceState, i32> {
             )
             .as_str(),
         );
-        let display_stride_bytes = validate_display_info(&display)?;
 
         let surface =
             display_create_surface(display_fd, display.width, display.height).map_err(|_| {

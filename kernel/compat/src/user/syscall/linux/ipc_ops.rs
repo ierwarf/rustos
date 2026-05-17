@@ -2,7 +2,7 @@ use super::*;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use kernel_ipc_runtime::api::{KernelEndpointHandle, KernelReplyHandle, KernelTransferredHandle};
 use lazy_static::lazy_static;
@@ -10,6 +10,9 @@ use spin::Mutex;
 
 const MAX_SERVICE_ENDPOINTS: usize = 16;
 const MAX_PENDING_TRANSFER_OBJECTS: usize = 1024;
+const SLOW_IPC_THRESHOLD_MS: u64 = 10;
+const MAX_SLOW_IPC_LOGS: usize = 20;
+const EARLY_IPC_SAMPLE_COUNT: usize = 6;
 static LINUX_SYSCALL_ENDPOINT: AtomicU64 = AtomicU64::new(0);
 static SERVICE_ENDPOINTS: [AtomicU64; MAX_SERVICE_ENDPOINTS] =
     [const { AtomicU64::new(0) }; MAX_SERVICE_ENDPOINTS];
@@ -18,6 +21,7 @@ static SERVICE_ENDPOINT_OWNERS: [AtomicU64; MAX_SERVICE_ENDPOINTS] =
 static SERVICE_ENDPOINT_CAPS: [AtomicU64; MAX_SERVICE_ENDPOINTS] =
     [const { AtomicU64::new(0) }; MAX_SERVICE_ENDPOINTS];
 static NEXT_TRANSFER_ID: AtomicU64 = AtomicU64::new(1);
+static SLOW_IPC_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 lazy_static! {
     static ref TRANSFER_OBJECTS: Mutex<BTreeMap<u64, multitask::TransferredHandleEntry>> =
@@ -262,18 +266,22 @@ pub(super) fn syscall_linux_rustos_ipc_call(
     reply_capacity: u64,
 ) -> u64 {
     let endpoint = KernelEndpointHandle::from_raw(endpoint);
+    let start_ticks = crate::arch::rtc::ticks();
     let request = match copy_request_from_user(request_ptr, request_len) {
         Ok(request) => request,
         Err(errno) => return linux_errno(errno),
     };
+    let copy_ticks = crate::arch::rtc::ticks();
     let reply = match enqueue_call_and_wake(endpoint, request.as_slice()) {
         Ok(reply) => reply,
         Err(errno) => return linux_errno(errno),
     };
+    let send_ticks = crate::arch::rtc::ticks();
     let response = match wait_for_reply(reply) {
         Ok(response) => response,
         Err(errno) => return linux_errno(errno),
     };
+    let wait_ticks = crate::arch::rtc::ticks();
     let Ok(reply_capacity) = usize::try_from(reply_capacity) else {
         return linux_errno(LINUX_EINVAL);
     };
@@ -285,6 +293,19 @@ pub(super) fn syscall_linux_rustos_ipc_call(
             return linux_errno(address_space_error_to_linux_errno(err));
         }
     }
+    let write_ticks = crate::arch::rtc::ticks();
+    log_slow_ipc_call(
+        "call",
+        endpoint.raw(),
+        start_ticks,
+        copy_ticks,
+        copy_ticks,
+        send_ticks,
+        wait_ticks,
+        write_ticks,
+        request.len(),
+        response.len(),
+    );
     response.len() as u64
 }
 
@@ -349,10 +370,12 @@ pub(super) fn syscall_linux_rustos_ipc_reply(
     response_ptr: u64,
     response_len: u64,
 ) -> u64 {
+    let start_ticks = crate::arch::rtc::ticks();
     let response = match copy_request_from_user(response_ptr, response_len) {
         Ok(response) => response,
         Err(errno) => return linux_errno(errno),
     };
+    let copy_ticks = crate::arch::rtc::ticks();
     let task_id = match kernel_ipc_runtime::api::complete_endpoint_reply(
         KernelReplyHandle::from_raw(reply),
         response.as_slice(),
@@ -360,11 +383,20 @@ pub(super) fn syscall_linux_rustos_ipc_reply(
         Ok(task_id) => task_id,
         Err(err) => return linux_errno(ipc_error_to_linux_errno(err)),
     };
+    let reply_ticks = crate::arch::rtc::ticks();
     let _ = multitask::wake_task(task_id);
     // Direct hand-back to the caller: the service is about to wait on its
     // endpoint again, so donate the remaining quantum to the original caller
     // instead of round-robining away from a freshly-completed reply.
     multitask::set_next_pick_hint(task_id);
+    log_slow_ipc_reply(
+        "reply",
+        reply,
+        start_ticks,
+        copy_ticks,
+        reply_ticks,
+        response.len(),
+    );
     0
 }
 
@@ -380,14 +412,17 @@ pub(super) fn syscall_linux_rustos_ipc_call_with_handles(args_ptr: u64) -> u64 {
         return linux_errno(LINUX_EINVAL);
     }
 
+    let start_ticks = crate::arch::rtc::ticks();
     let request = match copy_request_from_user(args.request_ptr, args.request_len) {
         Ok(request) => request,
         Err(errno) => return linux_errno(errno),
     };
+    let copy_ticks = crate::arch::rtc::ticks();
     let send_handles = match export_current_fds_for_ipc(args.send_fds_ptr, args.send_fd_count) {
         Ok(handles) => handles,
         Err(errno) => return linux_errno(errno),
     };
+    let export_ticks = crate::arch::rtc::ticks();
     let reply = match enqueue_call_and_wake_with_handles(
         KernelEndpointHandle::from_raw(args.endpoint),
         request.as_slice(),
@@ -399,6 +434,7 @@ pub(super) fn syscall_linux_rustos_ipc_call_with_handles(args_ptr: u64) -> u64 {
             return linux_errno(errno);
         }
     };
+    let send_ticks = crate::arch::rtc::ticks();
 
     let (response, reply_handles) = match wait_for_reply_with_handle_limit(
         reply,
@@ -407,6 +443,7 @@ pub(super) fn syscall_linux_rustos_ipc_call_with_handles(args_ptr: u64) -> u64 {
         Ok(response) => response,
         Err(errno) => return linux_errno(errno),
     };
+    let wait_ticks = crate::arch::rtc::ticks();
     let Ok(reply_capacity) = usize::try_from(args.reply_capacity) else {
         drop_transfer_descriptors(reply_handles.as_slice());
         return linux_errno(LINUX_EINVAL);
@@ -447,6 +484,19 @@ pub(super) fn syscall_linux_rustos_ipc_call_with_handles(args_ptr: u64) -> u64 {
             return linux_errno(address_space_error_to_linux_errno(err));
         }
     }
+    let write_ticks = crate::arch::rtc::ticks();
+    log_slow_ipc_call(
+        "call-with-handles",
+        args.endpoint,
+        start_ticks,
+        copy_ticks,
+        export_ticks,
+        send_ticks,
+        wait_ticks,
+        write_ticks,
+        request.len(),
+        response.len(),
+    );
     response.len() as u64
 }
 
@@ -592,14 +642,46 @@ pub(super) fn syscall_linux_rustos_ipc_reply_with_handles(args_ptr: u64) -> u64 
 
 pub(super) fn call_linux_syscall_endpoint(request: &[u8]) -> Result<Vec<u8>, i64> {
     let endpoint = linux_syscall_endpoint().ok_or(LINUX_ENOSYS)?;
+    let start_ticks = crate::arch::rtc::ticks();
     let reply = enqueue_call_and_wake(endpoint, request)?;
-    wait_for_reply(reply)
+    let send_ticks = crate::arch::rtc::ticks();
+    let response = wait_for_reply(reply)?;
+    let reply_ticks = crate::arch::rtc::ticks();
+    log_slow_ipc_call(
+        "linux-syscall",
+        endpoint.raw(),
+        start_ticks,
+        start_ticks,
+        start_ticks,
+        send_ticks,
+        reply_ticks,
+        reply_ticks,
+        request.len(),
+        response.len(),
+    );
+    Ok(response)
 }
 
 pub(super) fn call_service_endpoint(service_id: u64, request: &[u8]) -> Result<Vec<u8>, i64> {
     let endpoint = service_endpoint(service_id).ok_or(LINUX_ENOSYS)?;
+    let start_ticks = crate::arch::rtc::ticks();
     let reply = enqueue_call_and_wake(endpoint, request)?;
-    wait_for_reply(reply)
+    let send_ticks = crate::arch::rtc::ticks();
+    let response = wait_for_reply(reply)?;
+    let reply_ticks = crate::arch::rtc::ticks();
+    log_slow_ipc_call(
+        "service",
+        endpoint.raw(),
+        start_ticks,
+        start_ticks,
+        start_ticks,
+        send_ticks,
+        reply_ticks,
+        reply_ticks,
+        request.len(),
+        response.len(),
+    );
+    Ok(response)
 }
 
 pub(super) fn call_service_endpoint_with_received_entries(
@@ -608,9 +690,23 @@ pub(super) fn call_service_endpoint_with_received_entries(
     handle_capacity: usize,
 ) -> Result<(Vec<u8>, Vec<multitask::TransferredHandleEntry>), i64> {
     let endpoint = service_endpoint(service_id).ok_or(LINUX_ENOSYS)?;
+    let start_ticks = crate::arch::rtc::ticks();
     let reply = enqueue_call_and_wake(endpoint, request)?;
     let (response, descriptors) = wait_for_reply_with_handle_limit(reply, handle_capacity)?;
+    let reply_ticks = crate::arch::rtc::ticks();
     let entries = take_transfer_entries(descriptors.as_slice())?;
+    log_slow_ipc_call(
+        "service-handles",
+        endpoint.raw(),
+        start_ticks,
+        start_ticks,
+        start_ticks,
+        reply_ticks,
+        reply_ticks,
+        reply_ticks,
+        request.len(),
+        response.len(),
+    );
     Ok((response, entries))
 }
 
@@ -888,4 +984,104 @@ fn ipc_error_to_linux_errno(err: kernel_ipc_runtime::api::IpcError) -> i64 {
         kernel_ipc_runtime::api::IpcError::BufferTooSmall => LINUX_EOVERFLOW,
         kernel_ipc_runtime::api::IpcError::NoMemory => LINUX_ENOMEM,
     }
+}
+
+fn ticks_elapsed_ms(start_ticks: u64, end_ticks: u64) -> u64 {
+    let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
+    end_ticks
+        .saturating_sub(start_ticks)
+        .saturating_mul(1000)
+        .saturating_div(ticks_per_second)
+}
+
+fn maybe_log_slow_ipc<F>(elapsed_ms: u64, log: F)
+where
+    F: FnOnce(),
+{
+    let sample_index = SLOW_IPC_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if sample_index >= MAX_SLOW_IPC_LOGS {
+        return;
+    }
+    if sample_index >= EARLY_IPC_SAMPLE_COUNT && elapsed_ms < SLOW_IPC_THRESHOLD_MS {
+        return;
+    }
+    log();
+}
+
+fn log_slow_ipc_call(
+    kind: &str,
+    endpoint: u64,
+    start_ticks: u64,
+    copy_ticks: u64,
+    export_ticks: u64,
+    send_ticks: u64,
+    wait_ticks: u64,
+    write_ticks: u64,
+    request_len: usize,
+    response_len: usize,
+) {
+    let total_ms = ticks_elapsed_ms(start_ticks, write_ticks);
+    maybe_log_slow_ipc(total_ms, || {
+        let copy_ms = ticks_elapsed_ms(start_ticks, copy_ticks);
+        let export_ms = ticks_elapsed_ms(copy_ticks, export_ticks);
+        let send_ms = ticks_elapsed_ms(export_ticks, send_ticks);
+        let wait_ms = ticks_elapsed_ms(send_ticks, wait_ticks);
+        let write_ms = ticks_elapsed_ms(wait_ticks, write_ticks);
+        debug::println!(
+            "ipc slow {}: endpoint={} total_ms={} copy_ms={} export_ms={} send_ms={} wait_ms={} write_ms={} request_len={} response_len={}",
+            kind,
+            endpoint,
+            total_ms,
+            copy_ms,
+            export_ms,
+            send_ms,
+            wait_ms,
+            write_ms,
+            request_len,
+            response_len,
+        );
+    });
+}
+
+fn log_slow_ipc_recv(
+    kind: &str,
+    endpoint: u64,
+    start_ticks: u64,
+    recv_ticks: u64,
+    request_len: usize,
+) {
+    let total_ms = ticks_elapsed_ms(start_ticks, recv_ticks);
+    maybe_log_slow_ipc(total_ms, || {
+        debug::println!(
+            "ipc slow {}: endpoint={} total_ms={} request_len={}",
+            kind,
+            endpoint,
+            total_ms,
+            request_len,
+        );
+    });
+}
+
+fn log_slow_ipc_reply(
+    kind: &str,
+    reply: u64,
+    start_ticks: u64,
+    copy_ticks: u64,
+    reply_ticks: u64,
+    response_len: usize,
+) {
+    let total_ms = ticks_elapsed_ms(start_ticks, reply_ticks);
+    maybe_log_slow_ipc(total_ms, || {
+        let copy_ms = ticks_elapsed_ms(start_ticks, copy_ticks);
+        let reply_ms = ticks_elapsed_ms(copy_ticks, reply_ticks);
+        debug::println!(
+            "ipc slow {}: reply={} total_ms={} copy_ms={} reply_ms={} response_len={}",
+            kind,
+            reply,
+            total_ms,
+            copy_ms,
+            reply_ms,
+            response_len,
+        );
+    });
 }

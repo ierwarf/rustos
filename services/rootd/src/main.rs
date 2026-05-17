@@ -10,9 +10,12 @@ use rustos_user_abi::syscall::{
 };
 
 const SYS_SCHED_YIELD: u64 = 24;
+const SYS_EXIT_GROUP: u64 = 231;
 const SPAWN_FLAG_LOGICAL_ADMIN: u64 = 1;
-const DEFAULT_WEIGHT_MICROS: u64 = 100;
-const SERVICE_WAIT_SPINS: usize = 200_000;
+// Bootstrap services need to make forward progress quickly while the rest of
+// the userspace stack is still cold. Keep them at a Linux CFS-like default
+// weight instead of the bare minimum weight used for best-effort tasks.
+const DEFAULT_WEIGHT_MICROS: u64 = 1_000;
 
 const SYSCALLD_EXEC: &[u8] = b"services/syscalld/syscalld.elf\0";
 const VFSD_EXEC: &[u8] = b"services/vfsd/vfsd.elf\0";
@@ -24,12 +27,16 @@ const INITD_EXEC: &[u8] = b"services/initd/initd.elf\0";
 pub extern "C" fn _start() -> ! {
     debug_line(b"rootd: bootstrap enter\n");
 
-    spawn_core_service(SYSCALLD_EXEC, IPC_SERVICE_LINUX_SYSCALLD);
-    spawn_core_service(VFSD_EXEC, IPC_SERVICE_VFSD);
-    spawn_core_service(LOADERD_EXEC, IPC_SERVICE_LOADERD);
-    spawn_core_service(PROCD_EXEC, IPC_SERVICE_PROCD);
+    // Start the core hosts first, then hand off to initd immediately so the
+    // remaining bootstrap work can overlap with their own initialization.
+    // Initd already gates the services it needs before it launches them, so
+    // rootd does not need to serialize the entire bootstrap on readiness.
+    spawn_core_service_without_wait(SYSCALLD_EXEC, IPC_SERVICE_LINUX_SYSCALLD);
+    spawn_core_service_without_wait(VFSD_EXEC, IPC_SERVICE_VFSD);
+    spawn_core_service_without_wait(LOADERD_EXEC, IPC_SERVICE_LOADERD);
+    spawn_core_service_without_wait(PROCD_EXEC, IPC_SERVICE_PROCD);
 
-    debug_line(b"rootd: core services ready, spawning initd\n");
+    debug_line(b"rootd: core services spawned, spawning initd\n");
     loop {
         match spawn_exec(INITD_EXEC) {
             Ok(_) => break,
@@ -38,12 +45,13 @@ pub extern "C" fn _start() -> ! {
     }
 
     debug_line(b"rootd: initd spawned\n");
+    exit_group(0);
     loop {
         yield_now();
     }
 }
 
-fn spawn_core_service(path: &'static [u8], service_id: u64) {
+fn spawn_core_service_without_wait(path: &'static [u8], service_id: u64) {
     if service_ready(service_id) {
         return;
     }
@@ -53,18 +61,6 @@ fn spawn_core_service(path: &'static [u8], service_id: u64) {
             Ok(_) => break,
             Err(_) => yield_now(),
         }
-    }
-
-    for _ in 0..SERVICE_WAIT_SPINS {
-        if service_ready(service_id) {
-            return;
-        }
-        yield_now();
-    }
-
-    debug_line(b"rootd: service wait timed out\n");
-    loop {
-        yield_now();
     }
 }
 
@@ -100,6 +96,10 @@ fn debug_line(bytes: &[u8]) {
 
 fn yield_now() {
     let _ = syscall0(SYS_SCHED_YIELD);
+}
+
+fn exit_group(status: i32) {
+    let _ = syscall1(SYS_EXIT_GROUP, status as u64);
 }
 
 fn syscall0(number: u64) -> i64 {

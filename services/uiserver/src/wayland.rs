@@ -57,6 +57,7 @@ pub(crate) struct WaylandWindowSnapshot {
     pub(crate) frame: Rect,
     pub(crate) minimized: bool,
     pub(crate) content_version: u64,
+    pub(crate) damage: Rect,
     pub(crate) pixels: Arc<Vec<u32>>,
     pub(crate) width: usize,
     pub(crate) height: usize,
@@ -188,6 +189,10 @@ impl WaylandCompositor {
 
     pub(crate) fn window_snapshots(&self) -> Vec<WaylandWindowSnapshot> {
         self.state.window_snapshots()
+    }
+
+    pub(crate) fn clear_window_damage(&mut self) {
+        self.state.clear_window_damage();
     }
 
     pub(crate) fn pointer_motion(&mut self, x: u32, y: u32) {
@@ -468,6 +473,7 @@ mod tests {
             },
             minimized: false,
             content_version: 7,
+            damage: Rect::empty(),
             pixels: Arc::new(vec![1, 2, 3]),
             width: 3,
             height: 1,
@@ -607,6 +613,7 @@ impl WaylandState {
                 frame: surface.frame,
                 minimized: surface.minimized,
                 content_version: surface.content_version,
+                damage: surface.last_damage,
                 pixels: surface.pixels.clone(),
                 width: surface.width,
                 height: surface.height,
@@ -614,6 +621,14 @@ impl WaylandState {
             });
         }
         snapshots
+    }
+
+    fn clear_window_damage(&mut self) {
+        for surface in &self.surfaces {
+            if let Ok(mut state) = surface.shared.lock() {
+                state.last_damage = Rect::empty();
+            }
+        }
     }
 
     fn event_time_ms(&self) -> u32 {
@@ -1337,6 +1352,7 @@ struct WaylandSurfaceState {
     pending_buffer: Option<Option<BufferAttachment>>,
     current_buffer: Option<BufferData>,
     pending_damage: Rect,
+    last_damage: Rect,
     pending_callbacks: Vec<wl_callback::WlCallback>,
     pixels: Arc<Vec<u32>>,
     width: usize,
@@ -1996,16 +2012,17 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
                 }
             }
             wl_surface::Request::Commit => {
-                let (pending_buffer, committed_damage) = {
+                let (pending_buffer, committed_damage_rect) = {
                     let Ok(mut surface) = data.shared.lock() else {
                         return;
                     };
-                    let committed_damage = !surface.pending_damage.is_empty();
+                    let committed_damage = surface.pending_damage;
                     surface.pending_damage = Rect::empty();
                     (surface.pending_buffer.take(), committed_damage)
                 };
+                let has_damage = !committed_damage_rect.is_empty();
 
-                let commits_buffer = matches!(pending_buffer, Some(Some(_))) || committed_damage;
+                let commits_buffer = matches!(pending_buffer, Some(Some(_))) || has_damage;
                 if commits_buffer {
                     let commit_ready = {
                         match data.shared.lock() {
@@ -2050,6 +2067,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
                                 surface.width = 0;
                                 surface.height = 0;
                                 surface.stride_pixels = 0;
+                                surface.last_damage = Rect::empty();
                                 surface.content_version =
                                     next_content_version(surface.content_version);
                                 surface.configured_serial = 0;
@@ -2061,7 +2079,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
                             }
                         }
                     }
-                } else if committed_damage {
+                } else if has_damage {
                     copy_source = data
                         .shared
                         .lock()
@@ -2086,6 +2104,16 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
                             surface.content_version = next_content_version(surface.content_version);
                             surface.frame.width = width.max(surface.frame.width.min(width));
                             surface.frame.height = height.max(surface.frame.height.min(height));
+                            surface.last_damage = if has_damage {
+                                committed_damage_rect
+                            } else {
+                                Rect {
+                                    x: 0,
+                                    y: 0,
+                                    width,
+                                    height,
+                                }
+                            };
                             mapped = true;
                             dirty = true;
                         } else {
@@ -2106,7 +2134,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
                     buffer.release();
                 }
 
-                if committed_damage && !dirty {
+                if has_damage && !dirty {
                     if let Ok(surface) = data.shared.lock() {
                         if !surface.pixels.is_empty() && surface.width != 0 && surface.height != 0 {
                             mapped = true;
@@ -2114,6 +2142,11 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
                     }
                 }
 
+                if !dirty {
+                    if let Ok(mut surface) = data.shared.lock() {
+                        surface.last_damage = Rect::empty();
+                    }
+                }
                 if dirty {
                     state.mark_dirty();
                 }

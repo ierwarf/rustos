@@ -1,5 +1,6 @@
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use core::{mem, ptr, ptr::NonNull};
 
 use x86_64::PhysAddr;
@@ -38,6 +39,41 @@ const STACK_CANARY_WORD: u64 = 0x5343_4844_554c_4552;
 const TASK_ENTRY_STACK_RESERVE_QWORDS: usize = 3;
 const PAGE_FAULT_VECTOR: u8 = 14;
 const RFLAGS_RESERVED_BIT_1: u64 = 1 << 1;
+const LONG_WAIT_THRESHOLD_MS: u64 = 16;
+const MAX_LONG_WAIT_LOGS: usize = 64;
+static LONG_WAIT_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+// CFS-like fairness constants (mirrors Linux kernel/sched/fair.c).
+// NICE_0_LOAD is the nominal weight; vruntime delta = elapsed * NICE_0_LOAD / weight.
+// Smaller weight -> larger vruntime per real-time unit -> less CPU share.
+const NICE_0_LOAD: u32 = 1024;
+const MIN_LOAD_WEIGHT: u32 = 32;
+const MAX_LOAD_WEIGHT: u32 = 1_000_000;
+// Latency credit applied when a sleeper wakes: their vruntime is bounded by
+// (min_vruntime - SLEEPER_LATENCY_BONUS_NS), so I/O-bound tasks get
+// preferential dispatch but cannot stockpile unbounded credit while idle.
+// 12ms is generous enough to win wake-preempt against CPU-bound peers even
+// after a relatively short render burst.
+const SLEEPER_LATENCY_BONUS_NS: u64 = 12_000_000;
+// Bounded L4/seL4-style IPC handoff credit. This is deliberately much smaller
+// than the sleeper bonus: it nudges a just-woken server/replier ahead of the
+// caller's fair position without turning every IPC service into permanent RT.
+const IPC_DONATION_BONUS_NS: u64 = 2_000_000;
+// Minimum preemption granularity: do not preempt the current task in favour of
+// a marginally-smaller vruntime peer if it has run less than this. Set small
+// (200us) so wake-up latency stays low; advantage_ns check still uses this as
+// the "must be at least this much ahead" threshold for peer-driven preemption.
+const SCHED_MIN_GRANULARITY_NS: u64 = 200_000;
+// Maximum runtime budget before we *forcibly* prefer any other ready task,
+// even ones that would normally lose the vruntime comparison. Acts as a
+// last-resort anti-starvation rail for long-running kernel paths that finally
+// call cond_resched.
+const SCHED_MAX_BURST_NS: u64 = 20_000_000;
+// Initial vruntime offset for newly-spawned tasks relative to current
+// min_vruntime. Linux uses sched_vslice ~ sched_latency * weight / total_weight
+// ~ a few ms. Using 6ms keeps a flood of spawns (initd starting 8 services)
+// from preempting steady-state workers like uiserver for too long.
+const SCHED_NEW_TASK_VRUNTIME_PENALTY_NS: u64 = 6_000_000;
 
 pub(super) struct CurrentLinuxThreadBinding {
     pub(super) process_handle: ProcessHandle,
@@ -68,7 +104,9 @@ enum TaskRetireReason {
 struct TaskContext {
     saved_rsp: usize,
     ready: bool,
+    ready_since_ticks: u64,
     blocked: bool,
+    blocked_since_ticks: u64,
     /// Block-arm flag for race-free sleep/wake. Set by `arm_block_current_task`;
     /// cleared by `wake_task` and `commit_block_current_task`. A wake delivered
     /// while the task is still running clears the flag, so the subsequent
@@ -76,6 +114,16 @@ struct TaskContext {
     /// block. Mirrors Linux's `prepare_to_wait` / `set_current_state` pattern.
     wake_armed: bool,
     pit_divisor: u16,
+    /// CFS-like load weight. Bigger weight -> larger CPU share. Derived from
+    /// the task's `weight_micros` / pit_divisor at allocation time.
+    weight: u32,
+    /// Virtual runtime in nanoseconds, scaled by NICE_0_LOAD/weight. The task
+    /// with the smallest vruntime among the ready set is picked next.
+    vruntime_ns: u64,
+    /// RTC tick when the task last started running (was switched to). Zero
+    /// while the task is not running. Used to accumulate vruntime on
+    /// preemption / context switch.
+    exec_start_ticks: u64,
     address_space_root: u64,
     kernel_stack_base: u64,
     kernel_stack_top: u64,
@@ -113,6 +161,18 @@ pub(super) struct Scheduler {
     /// and stalling for an entire PIT slice. Consumed (cleared) on the next
     /// scheduler pick whether or not the hint was used.
     next_pick_hint: Option<usize>,
+    /// Cached minimum vruntime across the ready set, refreshed each pick.
+    /// New tasks initialise their vruntime from this value (plus a small
+    /// penalty) so they cannot preempt long-lived ready tasks just by virtue
+    /// of being freshly created.
+    last_min_vruntime_ns: u64,
+    /// True after the bootstrap root task has entered the permanent hlt loop.
+    /// Before that, slot 0 still runs finalize work and remains schedulable.
+    root_idle: bool,
+    /// Fixed scheduler tick divisor. CFS-style scheduling accounts CPU share
+    /// through vruntime weights; it must not also shorten/lengthen the hardware
+    /// tick per task or low-weight services pay excessive interrupt overhead.
+    scheduler_tick_divisor: u16,
 }
 
 impl Scheduler {
@@ -128,6 +188,9 @@ impl Scheduler {
             current_task: 0,
             pending_reap: false,
             next_pick_hint: None,
+            last_min_vruntime_ns: 0,
+            root_idle: false,
+            scheduler_tick_divisor: 0,
         }
     }
 
@@ -137,7 +200,36 @@ impl Scheduler {
     /// round-robining through unrelated ready tasks. The hint is consumed on
     /// the next pick regardless of whether it was usable.
     pub(super) fn set_next_pick_hint(&mut self, task_id: u64) {
-        self.next_pick_hint = self.find_task_slot(task_id);
+        let Some(slot) = self.find_task_slot(task_id) else {
+            self.next_pick_hint = None;
+            return;
+        };
+        self.apply_ipc_donation(slot);
+        self.next_pick_hint = Some(slot);
+    }
+
+    fn apply_ipc_donation(&mut self, target_slot: usize) {
+        if target_slot == self.current_task || target_slot >= MAX_TASK {
+            return;
+        }
+        let Some(target) = self.contexts[target_slot] else {
+            return;
+        };
+        if !target.ready || !self.context_is_schedulable(target_slot, target) {
+            return;
+        }
+        let Some(current) = self.contexts[self.current_task] else {
+            return;
+        };
+        if !self.is_fair_candidate_slot(target_slot)
+            || !self.is_fair_candidate_slot(self.current_task)
+        {
+            return;
+        }
+        let donated_floor = current.vruntime_ns.saturating_sub(IPC_DONATION_BONUS_NS);
+        if let Some(target) = self.contexts[target_slot].as_mut() {
+            target.vruntime_ns = target.vruntime_ns.min(donated_floor);
+        }
     }
 
     fn take_next_pick_hint_ready_slot(&mut self) -> Option<usize> {
@@ -172,6 +264,8 @@ impl Scheduler {
         self.last_errors = [0; MAX_TASK];
         self.current_task = ROOT_TASK_SLOT;
         self.pending_reap = false;
+        self.root_idle = false;
+        self.scheduler_tick_divisor = main_thread_pit_divisor;
         self.reset_stack_storage(ROOT_TASK_SLOT)
             .expect("scheduler root stack allocation failed");
         let (kernel_stack_base, kernel_stack_top) = self.stack_bounds(ROOT_TASK_SLOT);
@@ -185,9 +279,14 @@ impl Scheduler {
                 0,
             ),
             ready: true,
+            ready_since_ticks: crate::arch::rtc::ticks(),
             blocked: false,
+            blocked_since_ticks: 0,
             wake_armed: false,
             pit_divisor: main_thread_pit_divisor,
+            weight: Self::weight_from_pit_divisor(main_thread_pit_divisor),
+            vruntime_ns: 0,
+            exec_start_ticks: crate::arch::rtc::ticks(),
             address_space_root: crate::memory::paging::kernel_root_phys().as_u64(),
             kernel_stack_base: kernel_stack_base as u64,
             kernel_stack_top: kernel_stack_top as u64,
@@ -235,7 +334,174 @@ impl Scheduler {
         };
 
         context.saved_rsp = saved_rsp;
+        if ready && !context.ready {
+            context.ready_since_ticks = crate::arch::rtc::ticks();
+        } else if !ready {
+            context.ready_since_ticks = 0;
+        }
         context.ready = ready;
+    }
+
+    fn ticks_elapsed_ms(start_ticks: u64, end_ticks: u64) -> u64 {
+        let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
+        end_ticks
+            .saturating_sub(start_ticks)
+            .saturating_mul(1000)
+            .saturating_div(ticks_per_second)
+    }
+
+    /// Converts an RTC-tick span into nanoseconds. Used for CFS-like vruntime
+    /// accounting; saturates on overflow so a runaway tick counter cannot
+    /// poison the scheduler.
+    fn ticks_elapsed_ns(start_ticks: u64, end_ticks: u64) -> u64 {
+        let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
+        end_ticks
+            .saturating_sub(start_ticks)
+            .saturating_mul(1_000_000_000)
+            .saturating_div(ticks_per_second)
+    }
+
+    /// Linux-style weighted vruntime delta:
+    /// `delta_vruntime = delta_exec * NICE_0_LOAD / weight`.
+    /// Heavier-weight tasks accrue vruntime more slowly and therefore receive
+    /// a proportionally larger share of CPU time.
+    fn weighted_vruntime_delta(elapsed_ns: u64, weight: u32) -> u64 {
+        let w = weight.clamp(MIN_LOAD_WEIGHT, MAX_LOAD_WEIGHT) as u64;
+        elapsed_ns
+            .saturating_mul(NICE_0_LOAD as u64)
+            .saturating_div(w)
+    }
+
+    /// Maps the per-task PIT divisor (proportional to its `weight_micros`)
+    /// onto a CFS load weight. The default user task weight_micros=100 yields
+    /// divisor ~119, which we scale to ~952 (close to NICE_0_LOAD=1024).
+    /// Heavier services such as `uiserver` (weight_micros=2000) end up around
+    /// ~19000 and naturally receive ~20x more CPU when contending.
+    fn weight_from_pit_divisor(divisor: u16) -> u32 {
+        // pit_divisor is BASE_FREQUENCY_HZ * weight_micros / 1_000_000, so it
+        // is monotonically increasing in weight_micros. Using `divisor * 8`
+        // keeps default-weight tasks near NICE_0_LOAD without arithmetic that
+        // requires knowing the PIT base frequency at this layer.
+        let scaled = (divisor.max(1) as u32).saturating_mul(8);
+        scaled.clamp(MIN_LOAD_WEIGHT, MAX_LOAD_WEIGHT)
+    }
+
+    /// Returns the smallest vruntime across all ready (or current-running)
+    /// tasks, plus the chosen task's vruntime. Used both for wake-bonus
+    /// floors and for choosing the next task to dispatch.
+    fn min_ready_vruntime(&self) -> u64 {
+        let mut min: Option<u64> = None;
+        for slot in 0..MAX_TASK {
+            if !self.is_fair_candidate_slot(slot) {
+                continue;
+            }
+            let Some(ctx) = self.contexts[slot] else {
+                continue;
+            };
+            if !ctx.ready {
+                continue;
+            }
+            if !self.context_is_schedulable(slot, ctx) {
+                continue;
+            }
+            let v = ctx.vruntime_ns;
+            min = Some(min.map(|m| m.min(v)).unwrap_or(v));
+        }
+        min.unwrap_or(0)
+    }
+
+    fn is_fair_candidate_slot(&self, slot: usize) -> bool {
+        // Linux keeps the idle task out of CFS and only falls back to it when
+        // no fair-class task is runnable. RustOS slot 0 is the same concept:
+        // after finalize; before then the root task still does real boot work.
+        slot != ROOT_TASK_SLOT || !self.root_idle
+    }
+
+    pub(super) fn mark_root_idle(&mut self) {
+        self.root_idle = true;
+    }
+
+    /// Accumulates vruntime for the currently-running slot up to `now_ticks`
+    /// and clears its execution-start mark. Safe to call repeatedly.
+    fn account_current_runtime(&mut self, slot: usize, now_ticks: u64) {
+        let Some(context) = self.contexts[slot].as_mut() else {
+            return;
+        };
+        let start = context.exec_start_ticks;
+        if start == 0 || now_ticks <= start {
+            context.exec_start_ticks = 0;
+            return;
+        }
+        let elapsed_ns = Self::ticks_elapsed_ns(start, now_ticks);
+        let delta = Self::weighted_vruntime_delta(elapsed_ns, context.weight);
+        context.vruntime_ns = context.vruntime_ns.saturating_add(delta);
+        context.exec_start_ticks = 0;
+    }
+
+    /// Picks the schedulable task with the smallest vruntime. Ties prefer
+    /// rotation away from the current task to keep RR-equivalent behaviour
+    /// when all weights are equal. Returns `None` only if literally nothing
+    /// is ready and schedulable, including the current task and root.
+    fn pick_min_vruntime(&self, current: usize) -> Option<usize> {
+        let mut best: Option<(usize, u64)> = None;
+        for slot in 0..MAX_TASK {
+            if !self.is_fair_candidate_slot(slot) {
+                continue;
+            }
+            let Some(ctx) = self.contexts[slot] else {
+                continue;
+            };
+            if !ctx.ready {
+                continue;
+            }
+            if !self.context_is_schedulable(slot, ctx) {
+                continue;
+            }
+            // Tiny additive bias for the current slot encourages rotation on
+            // exact vruntime ties (the common case under equal weights), so
+            // we avoid sticking on one task when several are equally idle.
+            let key = if slot == current {
+                ctx.vruntime_ns.saturating_add(1)
+            } else {
+                ctx.vruntime_ns
+            };
+            match best {
+                None => best = Some((slot, key)),
+                Some((_, bk)) if key < bk => best = Some((slot, key)),
+                _ => {}
+            }
+        }
+        best.map(|(slot, _)| slot)
+    }
+
+    fn maybe_log_long_wait(
+        &self,
+        kind: &str,
+        slot: usize,
+        task_id: Option<u64>,
+        process_id: Option<u64>,
+        start_ticks: u64,
+        end_ticks: u64,
+    ) {
+        let Some(process_id) = process_id.filter(|process_id| *process_id != 0) else {
+            return;
+        };
+        let elapsed_ms = Self::ticks_elapsed_ms(start_ticks, end_ticks);
+        if elapsed_ms < LONG_WAIT_THRESHOLD_MS {
+            return;
+        }
+        let sample = LONG_WAIT_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+        if sample >= MAX_LONG_WAIT_LOGS {
+            return;
+        }
+        crate::debug::println!(
+            "scheduler long wait: kind={} slot={} task={} pid={} elapsed_ms={}",
+            kind,
+            slot,
+            task_id.unwrap_or(0),
+            process_id,
+            elapsed_ms
+        );
     }
 
     fn retire_slot(&mut self, slot: usize, reason: TaskRetireReason) {
@@ -533,18 +799,6 @@ impl Scheduler {
             .is_none()
     }
 
-    fn next_ready_task_index(&self, current: usize) -> Option<usize> {
-        for offset in 1..=MAX_TASK {
-            let idx = (current + offset) % MAX_TASK;
-            if let Some(ctx) = self.contexts[idx] {
-                if ctx.ready && self.context_is_schedulable(idx, ctx) {
-                    return Some(idx);
-                }
-            }
-        }
-        None
-    }
-
     pub(super) fn allocate_kernel_slot(
         &mut self,
         entry: fn(u64),
@@ -569,9 +823,16 @@ impl Scheduler {
                         0,
                     ),
                     ready: true,
+                    ready_since_ticks: crate::arch::rtc::ticks(),
                     blocked: false,
+                    blocked_since_ticks: 0,
                     wake_armed: false,
                     pit_divisor,
+                    weight: Self::weight_from_pit_divisor(pit_divisor),
+                    vruntime_ns: self
+                        .last_min_vruntime_ns
+                        .saturating_add(SCHED_NEW_TASK_VRUNTIME_PENALTY_NS),
+                    exec_start_ticks: 0,
                     address_space_root: crate::memory::paging::kernel_root_phys().as_u64(),
                     kernel_stack_base: kernel_stack_base as u64,
                     kernel_stack_top: kernel_stack_top as u64,
@@ -648,9 +909,16 @@ impl Scheduler {
                 self.contexts[slot] = Some(TaskContext {
                     saved_rsp,
                     ready: true,
+                    ready_since_ticks: crate::arch::rtc::ticks(),
                     blocked: false,
+                    blocked_since_ticks: 0,
                     wake_armed: false,
                     pit_divisor,
+                    weight: Self::weight_from_pit_divisor(pit_divisor),
+                    vruntime_ns: self
+                        .last_min_vruntime_ns
+                        .saturating_add(SCHED_NEW_TASK_VRUNTIME_PENALTY_NS),
+                    exec_start_ticks: 0,
                     address_space_root: root_phys,
                     kernel_stack_base: kernel_stack_base as u64,
                     kernel_stack_top: kernel_stack_top as u64,
@@ -706,9 +974,16 @@ impl Scheduler {
                 self.contexts[slot] = Some(TaskContext {
                     saved_rsp,
                     ready: true,
+                    ready_since_ticks: crate::arch::rtc::ticks(),
                     blocked: false,
+                    blocked_since_ticks: 0,
                     wake_armed: false,
                     pit_divisor,
+                    weight: Self::weight_from_pit_divisor(pit_divisor),
+                    vruntime_ns: self
+                        .last_min_vruntime_ns
+                        .saturating_add(SCHED_NEW_TASK_VRUNTIME_PENALTY_NS),
+                    exec_start_ticks: 0,
                     address_space_root: root_phys,
                     kernel_stack_base: kernel_stack_base as u64,
                     kernel_stack_top: kernel_stack_top as u64,
@@ -765,9 +1040,16 @@ impl Scheduler {
                         arg0,
                     ),
                     ready: true,
+                    ready_since_ticks: crate::arch::rtc::ticks(),
                     blocked: false,
+                    blocked_since_ticks: 0,
                     wake_armed: false,
                     pit_divisor,
+                    weight: Self::weight_from_pit_divisor(pit_divisor),
+                    vruntime_ns: self
+                        .last_min_vruntime_ns
+                        .saturating_add(SCHED_NEW_TASK_VRUNTIME_PENALTY_NS),
+                    exec_start_ticks: 0,
                     address_space_root: root_phys,
                     kernel_stack_base: kernel_stack_base as u64,
                     kernel_stack_top: kernel_stack_top as u64,
@@ -850,9 +1132,16 @@ impl Scheduler {
                     saved_rsp: self
                         .init_user_task_context(slot, &bootstrap, user_cs, user_ss, rflags),
                     ready: true,
+                    ready_since_ticks: crate::arch::rtc::ticks(),
                     blocked: false,
+                    blocked_since_ticks: 0,
                     wake_armed: false,
                     pit_divisor,
+                    weight: Self::weight_from_pit_divisor(pit_divisor),
+                    vruntime_ns: self
+                        .last_min_vruntime_ns
+                        .saturating_add(SCHED_NEW_TASK_VRUNTIME_PENALTY_NS),
+                    exec_start_ticks: 0,
                     address_space_root: root_phys,
                     kernel_stack_base: kernel_stack_base as u64,
                     kernel_stack_top: kernel_stack_top as u64,
@@ -1037,6 +1326,18 @@ impl Scheduler {
 
     pub(super) fn on_timer_interrupt(&mut self, current_rsp: usize) -> (usize, u16) {
         let current_slot = self.current_task;
+        let now_ticks = crate::arch::rtc::ticks();
+        let current_runtime_ns = self.contexts[current_slot]
+            .map(|context| context.exec_start_ticks)
+            .filter(|start| *start != 0 && now_ticks > *start)
+            .map(|start| Self::ticks_elapsed_ns(start, now_ticks))
+            .unwrap_or(0);
+
+        // Account vruntime for the outgoing slot first, regardless of what we
+        // do with it next. This makes the CFS-like fairness accounting see
+        // every CPU cycle a task actually consumed.
+        self.account_current_runtime(current_slot, now_ticks);
+
         if self.retired[current_slot] {
             self.mark_slot_ready(current_slot, current_rsp, false);
         } else if self.contexts[current_slot]
@@ -1062,17 +1363,54 @@ impl Scheduler {
 
         self.retire_invalid_ready_tasks();
 
-        let next_idx = self
-            .take_next_pick_hint_ready_slot()
-            .or_else(|| self.next_ready_task_index(self.current_task))
-            .unwrap_or(ROOT_TASK_SLOT);
+        // Refresh cached min_vruntime: this is fed to newly-spawned tasks so
+        // they do not preempt the rest of the system on creation alone.
+        self.last_min_vruntime_ns = self.min_ready_vruntime();
+
+        // Pick order:
+        //  1. IPC donation hint (if still ready/schedulable).
+        //  2. CFS-like smallest vruntime among ready tasks.
+        //  3. Root task as the unconditional fallback.
+        // The hint short-circuits CFS only when the donor is hot-handing off a
+        // reply to a specific receiver; otherwise vruntime decides fairness.
+        let hint = self.take_next_pick_hint_ready_slot();
+        let cfs_pick = self.pick_min_vruntime(current_slot);
+        let next_idx = match (hint, cfs_pick) {
+            (Some(hint_slot), _) => hint_slot,
+            (None, Some(slot)) => slot,
+            (None, None) => ROOT_TASK_SLOT,
+        };
+
+        // Apply min-granularity guard: if the CFS pick differs from current
+        // only by a few ns of vruntime advantage and current has not consumed
+        // a slice of at least SCHED_MIN_GRANULARITY_NS, keep current to avoid
+        // context-switch ping-pong. This is the same heuristic Linux uses to
+        // damp wake-preempt thrash.
+        let next_idx = self.maybe_keep_current(current_slot, next_idx, current_runtime_ns);
 
         if let Some(next) = self.contexts[next_idx] {
             match self.context_validation_error(next_idx, next, next.saved_rsp) {
                 None => {
                     self.trace_switch(current_slot, next_idx);
+                    if next_idx != current_slot && next.ready_since_ticks != 0 {
+                        let task_id = self.starts[next_idx].map(|start| start.id);
+                        let process_id = next.process_handle.and_then(process_table::process_id);
+                        self.maybe_log_long_wait(
+                            "ready",
+                            next_idx,
+                            task_id,
+                            process_id,
+                            next.ready_since_ticks,
+                            now_ticks,
+                        );
+                    }
+                    if let Some(context) = self.contexts[next_idx].as_mut() {
+                        context.ready = false;
+                        context.ready_since_ticks = 0;
+                        context.exec_start_ticks = now_ticks;
+                    }
                     self.current_task = next_idx;
-                    return (next.saved_rsp, next.pit_divisor);
+                    return (next.saved_rsp, self.scheduler_tick_divisor);
                 }
                 Some(reason) if next_idx == ROOT_TASK_SLOT => {
                     self.log_invalid_context(next_idx, next.saved_rsp, reason, "next");
@@ -1086,7 +1424,58 @@ impl Scheduler {
         }
 
         let current = self.contexts[current_slot].expect("scheduler lost the current task context");
-        (current.saved_rsp, current.pit_divisor)
+        // Keep running current: refresh its exec_start_ticks so subsequent
+        // vruntime accounting sees a non-zero baseline.
+        if let Some(ctx) = self.contexts[current_slot].as_mut() {
+            ctx.exec_start_ticks = now_ticks;
+            ctx.ready = false;
+        }
+        (current.saved_rsp, self.scheduler_tick_divisor)
+    }
+
+    /// Min-granularity guard. Returns either `cfs_pick` (preempt) or
+    /// `current_slot` (keep running) based on whether preemption is worth
+    /// the context-switch cost. Mirrors `wakeup_preempt_entity` /
+    /// `check_preempt_tick` from Linux CFS at a much smaller scale.
+    fn maybe_keep_current(
+        &self,
+        current_slot: usize,
+        cfs_pick: usize,
+        current_runtime_ns: u64,
+    ) -> usize {
+        if cfs_pick == current_slot {
+            return cfs_pick;
+        }
+        if !self.is_fair_candidate_slot(current_slot) {
+            return cfs_pick;
+        }
+        let Some(current_ctx) = self.contexts[current_slot] else {
+            return cfs_pick;
+        };
+        if !current_ctx.ready || !self.context_is_schedulable(current_slot, current_ctx) {
+            return cfs_pick;
+        }
+        let Some(pick_ctx) = self.contexts[cfs_pick] else {
+            return cfs_pick;
+        };
+        // If the pick's vruntime advantage is large, preempt unconditionally:
+        // current has burned through too much CPU relative to peers.
+        let current_v = current_ctx.vruntime_ns;
+        let pick_v = pick_ctx.vruntime_ns;
+        let advantage_ns = current_v.saturating_sub(pick_v);
+
+        // Linux rule (simplified): only preempt if either
+        //   - current has run at least SCHED_MIN_GRANULARITY_NS, or
+        //   - the peer's vruntime advantage exceeds SCHED_MIN_GRANULARITY_NS
+        //     (peer was starved long enough to deserve immediate dispatch).
+        if current_runtime_ns >= SCHED_MIN_GRANULARITY_NS
+            || advantage_ns >= SCHED_MIN_GRANULARITY_NS
+            || current_runtime_ns >= SCHED_MAX_BURST_NS
+        {
+            cfs_pick
+        } else {
+            current_slot
+        }
     }
 
     fn trace_switch(&self, from_slot: usize, to_slot: usize) {
@@ -1469,7 +1858,9 @@ impl Scheduler {
             context.user_stack = bootstrap.user_stack;
             context.linux_thread_state = bootstrap.linux_thread_state;
             context.blocked = false;
+            context.blocked_since_ticks = 0;
             context.ready = true;
+            context.ready_since_ticks = crate::arch::rtc::ticks();
         }
 
         self.retired[slot] = false;
@@ -1557,7 +1948,9 @@ impl Scheduler {
             context.user_stack = bootstrap.user_stack;
             context.linux_thread_state = bootstrap.linux_thread_state;
             context.blocked = false;
+            context.blocked_since_ticks = 0;
             context.ready = true;
+            context.ready_since_ticks = crate::arch::rtc::ticks();
         }
         self.retired[slot] = false;
         self.retire_reasons[slot] = None;
@@ -1647,7 +2040,9 @@ impl Scheduler {
             thread_state.pending_signals |= signal_bit;
             if thread_state.signal_mask & signal_bit == 0 {
                 context.blocked = false;
+                context.blocked_since_ticks = 0;
                 context.ready = true;
+                context.ready_since_ticks = crate::arch::rtc::ticks();
             }
             return true;
         }
@@ -1858,6 +2253,8 @@ impl Scheduler {
 
         context.blocked = true;
         context.ready = false;
+        context.ready_since_ticks = 0;
+        context.blocked_since_ticks = crate::arch::rtc::ticks();
         context.wake_armed = false;
         true
     }
@@ -1873,6 +2270,8 @@ impl Scheduler {
 
         context.blocked = true;
         context.ready = false;
+        context.ready_since_ticks = 0;
+        context.blocked_since_ticks = crate::arch::rtc::ticks();
         context.wake_armed = false;
         true
     }
@@ -1910,6 +2309,8 @@ impl Scheduler {
         context.wake_armed = false;
         context.blocked = true;
         context.ready = false;
+        context.ready_since_ticks = 0;
+        context.blocked_since_ticks = crate::arch::rtc::ticks();
         Some(true)
     }
 
@@ -1932,6 +2333,16 @@ impl Scheduler {
             return false;
         }
 
+        let blocked_since_ticks = self
+            .contexts
+            .get(slot)
+            .and_then(|context| *context)
+            .map(|context| context.blocked_since_ticks)
+            .unwrap_or(0);
+        let task_id = self.starts[slot].map(|start| start.id);
+        let process_id = self.contexts[slot]
+            .and_then(|context| context.process_handle)
+            .and_then(process_table::process_id);
         let (saved_rsp, user_mode) = match self.contexts[slot] {
             Some(context) => (context.saved_rsp, context.user_mode),
             None => return false,
@@ -1939,6 +2350,15 @@ impl Scheduler {
         let invalid_reason = self
             .validate_saved_context(slot, user_mode, saved_rsp)
             .err();
+
+        // Compute the sleeper bonus floor *before* mutably borrowing the
+        // context. This is the CFS rule: a task that just woke from a long
+        // sleep gets vruntime = max(self_vruntime, min_vruntime - bonus) so
+        // that I/O-bound tasks (Wayland clients, IPC repliers) preempt
+        // CPU-bound peers but cannot accumulate unbounded credit while idle.
+        let now_ticks = crate::arch::rtc::ticks();
+        let min_vruntime = self.min_ready_vruntime();
+        let wake_floor = min_vruntime.saturating_sub(SLEEPER_LATENCY_BONUS_NS);
 
         {
             let Some(context) = self.contexts[slot].as_mut() else {
@@ -1949,6 +2369,31 @@ impl Scheduler {
             context.wake_armed = false;
             context.blocked = false;
             context.ready = invalid_reason.is_none();
+            context.blocked_since_ticks = 0;
+            context.ready_since_ticks = if invalid_reason.is_none() {
+                now_ticks
+            } else {
+                0
+            };
+            if invalid_reason.is_none() {
+                // Bound vruntime to the runqueue floor: prevents
+                // long-blocked tasks from running unimpeded after wake
+                // (which would just shift starvation onto the rest of the
+                // system), while still granting them latency-sensitive
+                // priority via SLEEPER_LATENCY_BONUS_NS.
+                context.vruntime_ns = context.vruntime_ns.max(wake_floor);
+            }
+        }
+
+        if invalid_reason.is_none() && blocked_since_ticks != 0 {
+            self.maybe_log_long_wait(
+                "wake",
+                slot,
+                task_id,
+                process_id,
+                blocked_since_ticks,
+                now_ticks,
+            );
         }
 
         if let Some(reason) = invalid_reason {
@@ -2124,9 +2569,14 @@ mod tests {
         TaskContext {
             saved_rsp: 0,
             ready: true,
+            ready_since_ticks: 0,
             blocked: false,
+            blocked_since_ticks: 0,
             wake_armed: false,
             pit_divisor: 0,
+            weight: NICE_0_LOAD,
+            vruntime_ns: 0,
+            exec_start_ticks: 0,
             address_space_root: 0,
             kernel_stack_base: 0,
             kernel_stack_top: 0,

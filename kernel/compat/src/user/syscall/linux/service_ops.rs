@@ -1,6 +1,7 @@
 use super::*;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 use x86_64::VirtAddr;
@@ -8,6 +9,9 @@ use x86_64::VirtAddr;
 const FUTEX_WAITERS_CAPACITY: usize = 256;
 const MAX_SOCKET_IO_BYTES: usize = 64 * 1024;
 const MAX_IOVEC_COUNT: usize = 16;
+const EARLY_SERVICE_CALL_SAMPLES: usize = 6;
+const SLOW_SERVICE_CALL_THRESHOLD_MS: u64 = 10;
+const MAX_SLOW_SERVICE_CALL_LOGS: usize = 20;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FutexKey {
@@ -26,6 +30,8 @@ lazy_static! {
     static ref FUTEX_WAITERS: Mutex<[Option<FutexWaiter>; FUTEX_WAITERS_CAPACITY]> =
         Mutex::new([None; FUTEX_WAITERS_CAPACITY]);
 }
+
+static SLOW_SERVICE_CALL_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub(super) fn syscall_linux_poll(fds_ptr: u64, nfds: u64, timeout_ms: i64) -> u64 {
     let start_tick = crate::arch::rtc::ticks();
@@ -1211,10 +1217,19 @@ pub(super) fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mo
         Ok(path) => path,
         Err(errno) => return linux_errno(errno),
     };
+    if path.contains("startup-programs") || path.contains("runtime-env") {
+        crate::debug::info!(
+            compat,
+            "bootstrap path probe: op=openat dirfd={:#x} flags={:#x} path={}",
+            dirfd,
+            flags,
+            path
+        );
+    }
     // Fast path: bootstrap-owned binary/library paths are served from the in-kernel
     // boot volume cache. Going through vfsd would require multi-call IPC chunking
     // bounded by VFS_IPC_PAYLOAD_CAPACITY which dominates loaderd spawn latency.
-    if dirfd as i64 == linux_abi::AT_FDCWD as i64
+    if can_lookup_bootstrap_path(dirfd, path.as_str())
         && flags & linux_abi::O_ACCMODE == linux_abi::O_RDONLY
         && flags & linux_abi::O_DIRECTORY == 0
         && is_bootstrap_image_path(path.as_str())
@@ -2420,8 +2435,23 @@ pub(super) fn syscall_linux_vfs_statx(
         Ok(path) => path,
         Err(errno) => return linux_errno(errno),
     };
+    if path.contains("startup-programs") || path.contains("runtime-env") {
+        crate::debug::info!(
+            compat,
+            "bootstrap path probe: op=statx dirfd={:#x} flags={:#x} path={}",
+            dirfd,
+            flags,
+            path
+        );
+    }
     if let Err(err) = usermem::validate_current_user_write_buffer(statx_ptr, LINUX_STATX_SIZE) {
         return linux_errno(address_space_error_to_linux_errno(err));
+    }
+    if can_lookup_bootstrap_path(dirfd, path.as_str()) && is_bootstrap_image_path(path.as_str()) {
+        match bootstrap_read_file(path.as_str()) {
+            Ok(_) => return bootstrap_stat_path(path.as_str(), statx_ptr, true),
+            Err(errno) => return linux_errno(errno),
+        }
     }
     let mut request = new_vfs_request(VFS_IPC_OP_STATX);
     request.dirfd = dirfd;
@@ -2459,8 +2489,23 @@ pub(super) fn syscall_linux_vfs_newfstatat(
         Ok(path) => path,
         Err(errno) => return linux_errno(errno),
     };
+    if path.contains("startup-programs") || path.contains("runtime-env") {
+        crate::debug::info!(
+            compat,
+            "bootstrap path probe: op=newfstatat dirfd={:#x} flags={:#x} path={}",
+            dirfd,
+            flags,
+            path
+        );
+    }
     if let Err(err) = usermem::validate_current_user_write_buffer(stat_ptr, LINUX_STAT_SIZE) {
         return linux_errno(address_space_error_to_linux_errno(err));
+    }
+    if can_lookup_bootstrap_path(dirfd, path.as_str()) && is_bootstrap_image_path(path.as_str()) {
+        match bootstrap_read_file(path.as_str()) {
+            Ok(_) => return bootstrap_stat_path(path.as_str(), stat_ptr, false),
+            Err(errno) => return linux_errno(errno),
+        }
     }
     let mut request = new_vfs_request(VFS_IPC_OP_NEWFSTATAT);
     request.dirfd = dirfd;
@@ -2497,6 +2542,15 @@ pub(super) fn syscall_linux_vfs_readlinkat(
         Ok(path) => path,
         Err(errno) => return linux_errno(errno),
     };
+    if path.contains("startup-programs") || path.contains("runtime-env") {
+        crate::debug::info!(
+            compat,
+            "bootstrap path probe: op=access dirfd={:#x} flags={:#x} path={}",
+            dirfd,
+            flags,
+            path
+        );
+    }
     let Ok(user_len) = usize::try_from(user_len) else {
         return linux_errno(LINUX_EINVAL);
     };
@@ -2531,6 +2585,12 @@ pub(super) fn syscall_linux_vfs_access(dirfd: u64, path_ptr: u64, mode: u64, fla
         Ok(path) => path,
         Err(errno) => return linux_errno(errno),
     };
+    if can_lookup_bootstrap_path(dirfd, path.as_str()) && is_bootstrap_image_path(path.as_str()) {
+        match bootstrap_read_file(path.as_str()) {
+            Ok(_) => return 0,
+            Err(errno) => return linux_errno(errno),
+        }
+    }
     let mut request = new_vfs_request(VFS_IPC_OP_ACCESS);
     request.dirfd = dirfd;
     request.flags = flags as u32;
@@ -2686,8 +2746,11 @@ fn bootstrap_path(path: &str) -> Option<&str> {
     (path.starts_with("services/")
         || path.starts_with("applications/")
         || path.starts_with("apps/")
+        || path.starts_with("etc/")
         || path.starts_with("lib/")
         || path.starts_with("lib64/")
+        || path.starts_with("lib/x86_64-linux-gnu/")
+        || path.starts_with("usr/lib/x86_64-linux-gnu/")
         || path.starts_with("usr/lib/")
         || path.starts_with("usr/lib64/")
         || path.starts_with("system/"))
@@ -3095,7 +3158,13 @@ fn procd_exec(
 }
 
 fn is_linux_at_fdcwd(dirfd: u64) -> bool {
-    dirfd == linux_abi::AT_FDCWD as u64 || dirfd == (linux_abi::AT_FDCWD as i64) as u64
+    const AT_FDCWD_I64: u64 = (-100_i64) as u64;
+    const AT_FDCWD_I32: u64 = 0xffff_ff9c;
+    dirfd == AT_FDCWD_I64 || dirfd == AT_FDCWD_I32 || dirfd == linux_abi::AT_FDCWD as u64
+}
+
+fn can_lookup_bootstrap_path(dirfd: u64, path: &str) -> bool {
+    path.starts_with('/') || is_linux_at_fdcwd(dirfd)
 }
 
 fn file_sysop_error_to_linux_errno(error: crate::user::sysops::file::FileSysopError) -> i64 {
@@ -3188,11 +3257,22 @@ pub(super) fn new_procd_request(op: u16) -> ProcdIpcRequest {
 }
 
 pub(super) fn call_procd(request: &ProcdIpcRequest) -> Result<ProcdIpcResponse, i64> {
+    let start_ticks = crate::arch::rtc::ticks();
     let response = ipc_ops::call_service_endpoint(IPC_SERVICE_PROCD, as_bytes(request))?;
     if response.len() != size_of::<ProcdIpcResponse>() {
         return Err(LINUX_EINVAL);
     }
-    Ok(read_unaligned::<ProcdIpcResponse>(response.as_slice()))
+    let response = read_unaligned::<ProcdIpcResponse>(response.as_slice());
+    log_slow_service_call(
+        "procd",
+        request.op,
+        ticks_elapsed_ms(start_ticks, crate::arch::rtc::ticks()),
+        request.pid,
+        request.tid,
+        response.status as i64,
+        None,
+    );
+    Ok(response)
 }
 
 pub(super) fn ensure_empty_procd_response(response: &ProcdIpcResponse) -> Result<(), i64> {
@@ -3243,7 +3323,18 @@ pub(super) fn populate_vfs_path(request: &mut VfsIpcRequest, path: &str) -> Resu
 }
 
 pub(super) fn call_vfs_ipc_request(request: &VfsIpcRequest) -> Result<VfsIpcResponse, i64> {
+    let start_ticks = crate::arch::rtc::ticks();
     let response = ipc_ops::call_service_endpoint(IPC_SERVICE_VFSD, as_bytes(request))?;
+    let detail = vfs_request_log_detail(request);
+    log_slow_service_call(
+        "vfsd",
+        request.op,
+        ticks_elapsed_ms(start_ticks, crate::arch::rtc::ticks()),
+        request.pid,
+        request.tid,
+        response.len() as i64,
+        detail.as_deref(),
+    );
     if response.len() != size_of::<VfsIpcResponse>() {
         return Err(LINUX_EINVAL);
     }
@@ -3261,7 +3352,17 @@ pub(super) fn call_service_offload_request(
     service_id: u64,
     request: &LinuxSyscallOffloadRequest,
 ) -> Result<LinuxSyscallOffloadResponse, i64> {
+    let start_ticks = crate::arch::rtc::ticks();
     let response = ipc_ops::call_service_endpoint(service_id, as_bytes(request))?;
+    log_slow_service_call(
+        "offload",
+        request.op,
+        ticks_elapsed_ms(start_ticks, crate::arch::rtc::ticks()),
+        request.pid,
+        request.tid,
+        response.len() as i64,
+        None,
+    );
     if response.len() != size_of::<LinuxSyscallOffloadResponse>() {
         return Err(LINUX_EINVAL);
     }
@@ -3288,6 +3389,72 @@ pub(super) fn ensure_service_response(
         return Err(LINUX_EINVAL);
     }
     ensure_syscalld_status(response)
+}
+
+fn ticks_elapsed_ms(start_ticks: u64, end_ticks: u64) -> u64 {
+    let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
+    end_ticks
+        .saturating_sub(start_ticks)
+        .saturating_mul(1000)
+        .saturating_div(ticks_per_second)
+}
+
+fn log_slow_service_call(
+    service: &str,
+    op: u16,
+    elapsed_ms: u64,
+    pid: u64,
+    tid: u64,
+    status_or_len: i64,
+    detail: Option<&str>,
+) {
+    let sample_index = SLOW_SERVICE_CALL_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if sample_index >= MAX_SLOW_SERVICE_CALL_LOGS {
+        return;
+    }
+    if sample_index >= EARLY_SERVICE_CALL_SAMPLES && elapsed_ms < SLOW_SERVICE_CALL_THRESHOLD_MS {
+        return;
+    }
+    if let Some(detail) = detail {
+        debug::println!(
+            "service ipc slow: service={} op={} elapsed_ms={} pid={} tid={} status_or_len={} detail={}",
+            service,
+            op,
+            elapsed_ms,
+            pid,
+            tid,
+            status_or_len,
+            detail,
+        );
+    } else {
+        debug::println!(
+            "service ipc slow: service={} op={} elapsed_ms={} pid={} tid={} status_or_len={}",
+            service,
+            op,
+            elapsed_ms,
+            pid,
+            tid,
+            status_or_len,
+        );
+    }
+}
+
+fn vfs_request_log_detail(request: &VfsIpcRequest) -> Option<String> {
+    if request.path_len != 0 {
+        let path_len = usize::try_from(request.path_len).ok()?;
+        if path_len > request.path.len() {
+            return None;
+        }
+        let path = core::str::from_utf8(&request.path[..path_len]).ok()?;
+        return Some(alloc::format!("path={}", path));
+    }
+    if let Some(remote) = current_remote_vfs_handle(request.fd) {
+        return Some(alloc::format!("fd={} path={}", request.fd, remote.path()));
+    }
+    if let Some(file) = current_vfs_file_handle(request.fd) {
+        return Some(alloc::format!("fd={} path={}", request.fd, file.path()));
+    }
+    None
 }
 
 pub(super) fn current_remote_vfs_handle(fd: u64) -> Option<multitask::RemoteVfsHandle> {

@@ -37,6 +37,14 @@ High-risk APIs:
 - scheduler wait primitives: use `current_task_id`, `block_current_task`, and
   `wake_task` for kernel-capable wait queues; use `*_user_*` wrappers only for
   userspace-task waits.
+- scheduler preemption: use `cond_resched`/`reschedule_if_requested` only at
+  Linux-style safe points outside spinlocked or IRQ-off regions; timer IRQs
+  should request reschedule for user-task kernel frames, not blindly switch
+  away from arbitrary kernel code.
+- scheduler fairness: keep the hardware timer tick fixed and route service
+  weights into scheduler vruntime/load accounting only. Root slot 0 is a fair
+  task during bootstrap finalize, then becomes the idle fallback after
+  `mark_root_idle()`.
 - VFS mount/unmount/open path helpers: require current process context.
 
 Docs:

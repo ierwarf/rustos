@@ -19,6 +19,7 @@ use app::{
     CONSOLE_POLL_SLEEP, CURSOR_BLINK_INTERVAL, CURSOR_MOTION_SETTLE_INTERVAL, IDLE_SLEEP,
     INPUT_EVENT_BATCH, RUNTIME_POLL_SLEEP,
 };
+use render::start_desktop_background_loader;
 use render::{render_boot_frame, render_debug_white_box, render_frame, render_rect};
 use runtime_control::RuntimeClient;
 use runtime_sync::{refresh_runtime_state, start_runtime_sync, RuntimeState};
@@ -34,12 +35,14 @@ const MAX_SLOW_CONSOLE_REFRESH_LOGS: usize = 4;
 const MAX_SLOW_PRESENT_LOGS: usize = 8;
 const SLOW_RUNTIME_REFRESH_THRESHOLD: Duration = Duration::from_millis(100);
 const MAX_SLOW_RUNTIME_REFRESH_LOGS: usize = 8;
+const MAX_WAYLAND_CALLBACK_ONLY_LOGS: usize = 8;
 const WAYLAND_BACKLOG_SERVICE_INTERVAL: Duration = Duration::from_millis(4);
 
 static FRAME_SAMPLE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SLOW_CONSOLE_REFRESH_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SLOW_PRESENT_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SLOW_RUNTIME_REFRESH_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static WAYLAND_CALLBACK_ONLY_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static POINTER_MOVED_LOGGED: AtomicUsize = AtomicUsize::new(0);
 
 fn cursor_move_update(
@@ -251,6 +254,17 @@ fn log_slow_present(
     diag_line(message.as_str());
 }
 
+fn log_boot_stage(started_at: Instant, stage: &str) {
+    diag_line(
+        format!(
+            "uiserver: boot stage={} elapsed_us={}",
+            stage,
+            started_at.elapsed().as_micros(),
+        )
+        .as_str(),
+    );
+}
+
 fn log_pointer_moved_once(state: &AppState) {
     if POINTER_MOVED_LOGGED
         .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
@@ -266,10 +280,40 @@ fn log_pointer_moved_once(state: &AppState) {
     }
 }
 
+fn log_wayland_callback_only(state: &AppState, rect: canvas::Rect) {
+    if !profile::enabled() {
+        return;
+    }
+    let log_index = WAYLAND_CALLBACK_ONLY_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if log_index >= MAX_WAYLAND_CALLBACK_ONLY_LOGS {
+        return;
+    }
+    diag_line(
+        format!(
+            "uiserver: wayland callback-only dispatch rect={}x{}@{},{} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
+            rect.width,
+            rect.height,
+            rect.x,
+            rect.y,
+            state.console_windows.len(),
+            state.wayland_windows.len(),
+            state.focused_session_handle,
+            state.focused_wayland_surface_id,
+        )
+        .as_str(),
+    );
+}
+
 fn run() -> Result<(), i32> {
+    let boot_started = Instant::now();
     diag_line("uiserver: run initialize begin");
     let mut state = AppState::initialize()?;
     diag_line("uiserver: run initialize done");
+    log_boot_stage(boot_started, "initialize");
+    let desktop_background = start_desktop_background_loader(
+        state.surface.width as usize,
+        state.surface.height as usize,
+    );
     if DEBUG_FREEZE_ON_WHITE_BOX {
         boot_line("uiserver: debug white box begin");
         render_debug_white_box(&mut state);
@@ -287,20 +331,25 @@ fn run() -> Result<(), i32> {
     }
     log_frame_sample("boot", &mut state);
     diag_line("uiserver: boot frame done");
+    log_boot_stage(boot_started, "boot_frame");
     diag_line("uiserver: first present begin");
+    let first_present_started = Instant::now();
     state.present()?;
     diag_line("uiserver: first present done");
+    log_boot_stage(first_present_started, "first_present");
     diag_line("uiserver: post-present init begin");
     let mut pending_update = VisualUpdate::default();
     let mut presented_cursor_x = state.cursor_x;
     let mut presented_cursor_y = state.cursor_y;
     diag_line("uiserver: runtime client open begin");
+    let runtime_open_started = Instant::now();
     let mut runtime_state = RuntimeState::default();
     let runtime = RuntimeClient::open_default().map_err(|_| {
         diag_line("uiserver: open runtimed socket failed");
         19
     })?;
     diag_line("uiserver: runtime client open done");
+    log_boot_stage(runtime_open_started, "runtime_client_open");
     match runtime.notify_ui_ready() {
         Ok(()) => diag_line("uiserver: ui ready notified"),
         Err(err) => diag_line(format!("uiserver: ui ready notify failed errno={err}").as_str()),
@@ -312,9 +361,12 @@ fn run() -> Result<(), i32> {
             19
         })?;
     diag_line("uiserver: wayland initialize begin");
+    let wayland_init_started = Instant::now();
     let mut wayland = WaylandCompositor::initialize(state.display.width, state.display.height);
     diag_line("uiserver: wayland initialize done");
+    log_boot_stage(wayland_init_started, "wayland_initialize");
     diag_line("uiserver: post-present init done");
+    log_boot_stage(boot_started, "post_present_init");
     let launcher_programs = start_launcher_program_loader();
     let console_refreshes = start_console_refresh_worker();
     let mut events = [InputEvent::default(); INPUT_EVENT_BATCH];
@@ -328,6 +380,24 @@ fn run() -> Result<(), i32> {
 
     loop {
         loop_count = loop_count.saturating_add(1);
+
+        let mut background_ready = false;
+        while let Ok(background) = desktop_background.try_recv() {
+            if background.width == state.surface.width as usize
+                && background.height == state.surface.height as usize
+            {
+                state.desktop_cache.width = background.width;
+                state.desktop_cache.height = background.height;
+                state.desktop_cache.background_pixels = background.pixels;
+                state.desktop_cache.background_valid = true;
+                state.desktop_cache.chrome_valid = false;
+                background_ready = true;
+            }
+        }
+        if background_ready {
+            diag_line("uiserver: desktop background ready");
+            pending_update.request_full();
+        }
 
         while let Ok(programs) = launcher_programs.try_recv() {
             if state.apply_launcher_programs(programs) {
@@ -343,19 +413,24 @@ fn run() -> Result<(), i32> {
         pending_update.absorb(input.visual_update);
 
         let now = Instant::now();
+        let mut wayland_callback_only = false;
         let service_wayland = !input.backlog_remaining || now >= next_wayland_backlog_service;
         if let Some(compositor) = wayland.as_mut() {
             if service_wayland {
                 if compositor.tick() {
                     let wayland_dirty = state.sync_wayland_windows(compositor.window_snapshots());
+                    compositor.clear_window_damage();
                     let focus_dirty = state.recover_focus_after_wayland_change(Some(compositor))?;
                     let mut update = VisualUpdate::partial(wayland_dirty);
                     update.add_partial_rect(focus_dirty);
                     pending_update.absorb(update);
                 }
-                pending_update.absorb(VisualUpdate::partial(
-                    compositor.pending_frame_callback_rect(),
-                ));
+                let frame_callback_rect = compositor.pending_frame_callback_rect();
+                wayland_callback_only =
+                    pending_update.is_empty() && !frame_callback_rect.is_empty();
+                if wayland_callback_only {
+                    log_wayland_callback_only(&state, frame_callback_rect);
+                }
                 next_wayland_backlog_service = now + WAYLAND_BACKLOG_SERVICE_INTERVAL;
             } else if input.backlog_remaining {
                 compositor.flush_clients();
@@ -369,6 +444,7 @@ fn run() -> Result<(), i32> {
             let apply_update = state.apply_runtime_state(&mut runtime_state);
             let apply_changed = !apply_update.is_empty();
             let refresh_elapsed = refresh_started.elapsed();
+            profile::record_runtime_refresh(refresh_elapsed);
             if refresh_elapsed >= SLOW_RUNTIME_REFRESH_THRESHOLD {
                 log_slow_runtime_refresh(&state, refresh_elapsed, runtime_changed, apply_changed);
             }
@@ -521,6 +597,12 @@ fn run() -> Result<(), i32> {
         } else {
             false
         };
+
+        if !rendered && wayland_callback_only {
+            if let Some(compositor) = wayland.as_mut() {
+                compositor.frame_presented();
+            }
+        }
 
         if rendered {
             if let Some(compositor) = wayland.as_mut() {

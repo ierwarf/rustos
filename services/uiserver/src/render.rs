@@ -1,6 +1,12 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+use std::time::{Duration, Instant};
+
 use crate::app::{AppState, ConsoleWindow, CursorMotion, DesktopSurfaceCache};
 use crate::canvas::{Rect, SurfaceCanvas};
 use crate::font::{self, TextStyle};
+use crate::sys::diag_line;
 use crate::sys::ConsoleSessionHandle;
 use crate::wayland::WaylandWindowSnapshot;
 
@@ -65,6 +71,34 @@ const LAUNCHER_BUTTON_GAP: usize = 8;
 const TASKBAR_SLOT_WIDTH: usize = 172;
 const TASKBAR_SLOT_HEIGHT: usize = 30;
 const TASKBAR_SLOT_GAP: usize = 8;
+const SLOW_DESKTOP_REFRESH_THRESHOLD: Duration = Duration::from_millis(8);
+const MAX_DESKTOP_REFRESH_LOGS: usize = 6;
+const MAX_DESKTOP_PENDING_LOGS: usize = 3;
+
+static DESKTOP_REFRESH_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static DESKTOP_PENDING_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) struct DesktopBackground {
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) pixels: Vec<u32>,
+}
+
+pub(crate) fn start_desktop_background_loader(
+    width: usize,
+    height: usize,
+) -> Receiver<DesktopBackground> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let pixels = build_desktop_background(width, height);
+        let _ = sender.send(DesktopBackground {
+            width,
+            height,
+            pixels,
+        });
+    });
+    receiver
+}
 
 pub(crate) fn launcher_dirty_rect(width: u32, _height: u32) -> Rect {
     shadow_bounds(topbar_rail_rect(width as usize), 2)
@@ -151,6 +185,21 @@ pub(crate) fn wayland_window_outer_rect(window: &WaylandWindowSnapshot) -> Rect 
             .height
             .saturating_add(WINDOW_TITLE_HEIGHT + WINDOW_BORDER * 2),
     }
+}
+
+pub(crate) fn wayland_window_damage_rect(window: &WaylandWindowSnapshot, damage: Rect) -> Rect {
+    if damage.is_empty() {
+        return Rect::empty();
+    }
+
+    let client = wayland_window_client_rect(wayland_window_outer_rect(window));
+    Rect {
+        x: client.x.saturating_add(damage.x),
+        y: client.y.saturating_add(damage.y),
+        width: damage.width,
+        height: damage.height,
+    }
+    .intersect(client)
 }
 
 pub(crate) fn window_close_button_rect(outer: Rect) -> Rect {
@@ -319,14 +368,18 @@ fn render_scene(
     wayland_windows: &[WaylandWindowSnapshot],
 ) {
     let clip_rect = canvas.clip_rect();
-    canvas.draw_surface(
-        &desktop_cache.pixels,
-        desktop_cache.width,
-        desktop_cache.height,
-        desktop_cache.width,
-        0,
-        0,
-    );
+    if desktop_cache.background_valid {
+        canvas.draw_surface(
+            &desktop_cache.pixels,
+            desktop_cache.width,
+            desktop_cache.height,
+            desktop_cache.width,
+            0,
+            0,
+        );
+    } else if DESKTOP_PENDING_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < MAX_DESKTOP_PENDING_LOGS {
+        diag_line("uiserver: desktop background not ready; skipping desktop blit");
+    }
 
     for window in wayland_windows {
         if window.minimized || Some(window.surface_id) == focused_wayland_surface_id {
@@ -437,7 +490,7 @@ fn shadow_bounds(rect: Rect, steps: usize) -> Rect {
 }
 
 fn draw_console_window(canvas: &mut SurfaceCanvas<'_>, window: &mut ConsoleWindow, focused: bool) {
-    refresh_window_surface(window, focused);
+    rebuild_console_window_surface(window, focused);
     draw_shadow(canvas, window.frame, WINDOW_SHADOW_STEPS, 28);
     canvas.draw_surface(
         &window.surface_cache.pixels,
@@ -657,6 +710,7 @@ fn draw_launcher_badge(canvas: &mut SurfaceCanvas<'_>, rect: Rect, title: &str) 
 }
 
 fn refresh_desktop_surface(state: &mut AppState) {
+    let refresh_started = Instant::now();
     let width = state.surface.width as usize;
     let height = state.surface.height as usize;
     let resized = state.desktop_cache.width != width || state.desktop_cache.height != height;
@@ -672,47 +726,21 @@ fn refresh_desktop_surface(state: &mut AppState) {
         return;
     }
 
-    let screen = Rect {
-        x: 0,
-        y: 0,
-        width,
-        height,
-    };
-
     if !state.desktop_cache.background_valid {
-        let mut canvas = SurfaceCanvas::new(
-            state.desktop_cache.background_pixels.as_mut_slice(),
-            width as u32,
-            height as u32,
-            width,
-        );
-        canvas.fill_rect(screen, COLOR_DESKTOP_BG_BASE);
-        canvas.fill_rect_alpha(
-            Rect {
-                x: 0,
-                y: 0,
-                width,
-                height: (height / 3).max(1),
-            },
-            COLOR_DESKTOP_BAND,
-            94,
-        );
-        canvas.fill_rect_alpha(
-            Rect {
-                x: 0,
-                y: height.saturating_sub(height / 5),
-                width,
-                height: height / 5,
-            },
-            COLOR_CLIENT_BACKDROP,
-            86,
-        );
-        canvas.fill_pattern_grid(screen, 28, COLOR_GRID, 22);
-        canvas.fill_pattern_grid(screen, 112, COLOR_GRID_MAJOR, 34);
-        state.desktop_cache.background_valid = true;
-        // Background changed → composite pixels are now stale, even if
-        // chrome_valid was true (e.g. on first render).
-        state.desktop_cache.chrome_valid = false;
+        if DESKTOP_REFRESH_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < MAX_DESKTOP_REFRESH_LOGS {
+            diag_line(
+                format!(
+                    "uiserver: desktop background pending width={} height={} resized={} chrome_valid={} pixels_len={}",
+                    width,
+                    height,
+                    resized,
+                    state.desktop_cache.chrome_valid,
+                    state.desktop_cache.pixels.len(),
+                )
+                .as_str(),
+            );
+        }
+        return;
     }
 
     if !state.desktop_cache.chrome_valid {
@@ -721,14 +749,17 @@ fn refresh_desktop_surface(state: &mut AppState) {
             state.desktop_cache.pixels.resize(total, 0);
         }
 
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
         // Restore the chrome strips from clean background pixels so the new
         // chrome paints over a fresh substrate instead of accumulating alpha.
         let topbar = topbar_rail_rect(width);
         let taskbar = taskbar_rail_rect(width, height);
-        let chrome_strips: [Rect; 2] = [
-            shadow_bounds(topbar, 2),
-            shadow_bounds(taskbar, 2),
-        ];
+        let chrome_strips: [Rect; 2] = [shadow_bounds(topbar, 2), shadow_bounds(taskbar, 2)];
         for strip in chrome_strips {
             let strip = strip.intersect(screen);
             if strip.is_empty() {
@@ -767,6 +798,63 @@ fn refresh_desktop_surface(state: &mut AppState) {
         }
         state.desktop_cache.chrome_valid = true;
     }
+
+    let refresh_elapsed = refresh_started.elapsed();
+    if refresh_elapsed >= SLOW_DESKTOP_REFRESH_THRESHOLD
+        && DESKTOP_REFRESH_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < MAX_DESKTOP_REFRESH_LOGS
+    {
+        diag_line(
+            format!(
+                "uiserver: desktop refresh elapsed_ms={} resized={} background_valid={} chrome_valid={} background_pixels={} composite_pixels={}",
+                refresh_elapsed.as_millis(),
+                resized,
+                state.desktop_cache.background_valid,
+                state.desktop_cache.chrome_valid,
+                state.desktop_cache.background_pixels.len(),
+                state.desktop_cache.pixels.len(),
+            )
+            .as_str(),
+        );
+    }
+}
+
+pub(crate) fn build_desktop_background(width: usize, height: usize) -> Vec<u32> {
+    let mut pixels = vec![0; width.saturating_mul(height)];
+    if pixels.is_empty() {
+        return pixels;
+    }
+
+    let screen = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let mut canvas = SurfaceCanvas::new(pixels.as_mut_slice(), width as u32, height as u32, width);
+    canvas.fill_rect(screen, COLOR_DESKTOP_BG_BASE);
+    canvas.fill_rect_alpha(
+        Rect {
+            x: 0,
+            y: 0,
+            width,
+            height: (height / 3).max(1),
+        },
+        COLOR_DESKTOP_BAND,
+        94,
+    );
+    canvas.fill_rect_alpha(
+        Rect {
+            x: 0,
+            y: height.saturating_sub(height / 5),
+            width,
+            height: height / 5,
+        },
+        COLOR_CLIENT_BACKDROP,
+        86,
+    );
+    canvas.fill_pattern_grid(screen, 28, COLOR_GRID, 22);
+    canvas.fill_pattern_grid(screen, 112, COLOR_GRID_MAJOR, 34);
+    pixels
 }
 
 fn draw_brand_block(canvas: &mut SurfaceCanvas<'_>, topbar: Rect) {
@@ -845,7 +933,7 @@ fn draw_status_block(canvas: &mut SurfaceCanvas<'_>, topbar: Rect, launcher_coun
     );
 }
 
-fn refresh_window_surface(window: &mut ConsoleWindow, focused: bool) {
+pub(crate) fn rebuild_console_window_surface(window: &mut ConsoleWindow, focused: bool) {
     let width = window.frame.width;
     let height = window.frame.height;
     if width == 0 || height == 0 {
@@ -1103,7 +1191,7 @@ fn window_client_rect(outer: Rect) -> Rect {
     }
 }
 
-fn wayland_window_client_rect(outer: Rect) -> Rect {
+pub(crate) fn wayland_window_client_rect(outer: Rect) -> Rect {
     Rect {
         x: outer.x + WINDOW_BORDER,
         y: outer.y + WINDOW_BORDER + WINDOW_TITLE_HEIGHT,

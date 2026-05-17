@@ -100,6 +100,10 @@ pub fn reschedule_if_requested() {
     }
 }
 
+pub fn cond_resched() {
+    reschedule_if_requested();
+}
+
 pub fn clear_deferred_reschedule_request() {
     DEFERRED_RESCHEDULE_REQUESTED.store(0, core::sync::atomic::Ordering::Release);
 }

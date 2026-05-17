@@ -1,5 +1,6 @@
 use std::io::Write;
 use std::mem::size_of;
+use std::time::Instant;
 use std::{collections::BTreeSet, fs, thread, time::Duration};
 
 use rustos_user_abi::syscall::{
@@ -17,6 +18,7 @@ const RECV_BACKOFF: Duration = Duration::from_millis(10);
 const LOADABLE_DRIVER_REGISTRY_PATH: &str = "system/registry/kernel/loadable-drivers.tsv";
 
 fn main() {
+    debug_line("driverd: service start");
     let endpoint = syscall0(SYS_RUSTOS_IPC_ENDPOINT_CREATE);
     if endpoint < 0 {
         let _ = writeln!(
@@ -41,7 +43,9 @@ fn main() {
     }
 
     debug_line("driverd: driver policy endpoint registered");
+    debug_line("driverd: autoload begin");
     autoload_from_registry();
+    debug_line("driverd: autoload done");
     serve(endpoint as u64);
 }
 
@@ -61,6 +65,8 @@ struct DriverRecord {
 }
 
 fn autoload_from_registry() {
+    let started_at = Instant::now();
+    debug_line("driverd: registry read begin");
     let text = match fs::read_to_string(LOADABLE_DRIVER_REGISTRY_PATH) {
         Ok(text) => text,
         Err(err) => {
@@ -75,6 +81,11 @@ fn autoload_from_registry() {
             return;
         }
     };
+    debug_line(&format!(
+        "driverd: registry parsed count={} elapsed_ms={}",
+        records.len(),
+        started_at.elapsed().as_millis()
+    ));
     records.sort_by_key(|record| {
         (
             !record.softdeps.trim().is_empty(),
@@ -118,6 +129,12 @@ fn autoload_from_registry() {
         }
         pending = deferred;
     }
+    debug_line(&format!(
+        "driverd: autoload registry complete loaded={} skipped={} elapsed_ms={}",
+        loaded.len(),
+        skipped.len(),
+        started_at.elapsed().as_millis()
+    ));
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -133,7 +150,17 @@ fn load_record(
     skipped: &mut BTreeSet<String>,
     provider_groups: &mut BTreeSet<String>,
 ) -> LoadResult {
+    let started_at = Instant::now();
+    debug_line(&format!(
+        "driverd: record begin name={} path={} class={} bus={}",
+        record.name, record.image_path, record.class, record.bus
+    ));
     if loaded.contains(record.name.as_str()) || skipped.contains(record.name.as_str()) {
+        debug_line(&format!(
+            "driverd: record already handled name={} elapsed_ms={}",
+            record.name,
+            started_at.elapsed().as_millis()
+        ));
         return LoadResult::Progress;
     }
     for dep in comma_fields(record.deps.as_str()) {
@@ -142,6 +169,11 @@ fn load_record(
             debug_line(&format!(
                 "driverd: skipped name={} reason=dependency skipped dep={}",
                 record.name, dep
+            ));
+            debug_line(&format!(
+                "driverd: record skipped name={} reason=dependency skipped elapsed_ms={}",
+                record.name,
+                started_at.elapsed().as_millis()
             ));
             return LoadResult::Progress;
         }
@@ -166,6 +198,11 @@ fn load_record(
             "driverd: skipped name={} reason=provider active group={}",
             record.name, record.provider_group
         ));
+        debug_line(&format!(
+            "driverd: record skipped name={} reason=provider active elapsed_ms={}",
+            record.name,
+            started_at.elapsed().as_millis()
+        ));
         return LoadResult::Progress;
     }
     if !aliases_match(record) {
@@ -174,9 +211,21 @@ fn load_record(
             "driverd: skipped name={} reason=no matching alias aliases={}",
             record.name, record.aliases
         ));
+        debug_line(&format!(
+            "driverd: record skipped name={} reason=no matching alias elapsed_ms={}",
+            record.name,
+            started_at.elapsed().as_millis()
+        ));
         return LoadResult::Progress;
     }
+    let load_started = Instant::now();
     let result = load_module(record);
+    debug_line(&format!(
+        "driverd: load module returned name={} elapsed_ms={} status={}",
+        record.name,
+        load_started.elapsed().as_millis(),
+        result
+    ));
     if result == 0 {
         loaded.insert(record.name.clone());
         if !record.provider_group.is_empty()
@@ -216,6 +265,11 @@ fn load_record(
             )),
         }
     }
+    debug_line(&format!(
+        "driverd: record done name={} elapsed_ms={}",
+        record.name,
+        started_at.elapsed().as_millis()
+    ));
     LoadResult::Progress
 }
 

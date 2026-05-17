@@ -338,6 +338,28 @@ Kernel/userspace ABI:
   `loaderd` instead of replacing it with the default. Do not raise early
   broker/driver service budgets without a boot-time probe, because startup
   concurrency can regress perceived boot time.
+- Scheduler changes must follow Linux scheduler invariants rather than ad hoc
+  interactivity heuristics. Timer interrupts that hit a user task while it is
+  executing a kernel frame should set a deferred reschedule request, and long
+  lock-free kernel paths must call the RustOS `cond_resched` equivalent at
+  safe points. Do not preempt arbitrary kernel frames from the interrupt
+  handler unless the path has explicit preemption-count/lock-state safety.
+- The default RustOS fair scheduler should stay Linux CFS-like: fixed periodic
+  scheduler tick, per-task nanosecond vruntime accounting, weighted CPU share,
+  smallest-vruntime pick, bounded sleeper credit, and an idle/root class that
+  is excluded from fair competition once bootstrap finalize has ended.
+  Per-task weights must not reprogram the hardware timer; weights affect
+  vruntime only.
+- Borrow seL4/Windows scheduler rules only for the roles they prove well:
+  seL4-style IPC handoff may donate a bounded next-pick vruntime credit to the
+  receiver/replier, and Windows-style
+  time-critical priority must be brief and mostly blocked. Do not turn these
+  into broad permanent real-time boosts for normal services or apps.
+- Kernel code must not hold `KernelSpinLock` across disk, filesystem, IPC, or
+  framebuffer-sized copy loops. Use `KernelWaitLock` or split the critical
+  section, then add safe `cond_resched` points in long loops. This mirrors the
+  Linux rule that spinlocked/atomic regions are not sleeping preemption
+  points.
 - Init-time user services are ordered for perceived boot readiness: driver and
   input policy services should start before runtime UI launchers. `runtimed`
   depends on `netd` for its runtime control socket and waits for the `devmgrd`

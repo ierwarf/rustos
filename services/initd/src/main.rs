@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use runtime_control::{
     load_runtime_default_env, load_startup_entries, RuntimeEnvScope, StartupEntry, StartupMode,
-    DEFAULT_APPLICATIONS_DIR, DEFAULT_RUNTIME_ENV_REGISTRY_PATH,
+    DEFAULT_RUNTIME_ENV_REGISTRY_PATH, DEFAULT_STARTUP_REGISTRY_PATH,
 };
 use rustos_user_abi::syscall::{
     LoaderSpawnRequest, LoaderSpawnResponse, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD,
@@ -36,7 +36,7 @@ const DISPLAY_CRITICAL_TASK_WEIGHT_MICROS: u64 = 2_000;
 // no longer starves on round-robin scheduling, so the defer dominates total
 // boot time (~6s of dead air post-runtimed). 750ms keeps a small ordering gap
 // after the UI is reachable without spending the entire boot budget on it.
-const SECONDARY_SERVICE_DEFER_AFTER_RUNTIMED: Duration = Duration::from_millis(750);
+const SECONDARY_SERVICE_DEFER_AFTER_RUNTIMED: Duration = Duration::ZERO;
 static LOADER_ENDPOINT_CACHE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,10 +59,12 @@ fn main() {
     let load_started = Instant::now();
     boot_line("initd: load entries begin");
     let startup_entries = load_init_entries();
+    let init_env = load_init_env();
     boot_line(
         format!(
-            "initd: load entries done count={} elapsed_ms={}",
+            "initd: load entries done count={} env={} elapsed_ms={}",
             startup_entries.len(),
+            init_env.len(),
             load_started.elapsed().as_millis()
         )
         .as_str(),
@@ -116,7 +118,7 @@ fn main() {
                 continue;
             }
 
-            match spawn_exec(entry.exec.as_str()) {
+            match spawn_exec(entry.exec.as_str(), &init_env) {
                 Ok(pid) => {
                     observability_client::info!(
                         "initd",
@@ -176,11 +178,11 @@ fn secondary_service_deferred(exec: &str, now: Instant, deadline: Option<Instant
 }
 
 fn load_init_entries() -> Vec<StartupLaunchEntry> {
-    let Ok(entries) = load_startup_entries(DEFAULT_APPLICATIONS_DIR) else {
+    let Ok(entries) = load_startup_entries(DEFAULT_STARTUP_REGISTRY_PATH) else {
         observability_client::warn!(
             "initd",
             service,
-            "application desktop dir unavailable: {DEFAULT_APPLICATIONS_DIR}"
+            "startup registry unavailable: {DEFAULT_STARTUP_REGISTRY_PATH}"
         );
         return Vec::new();
     };
@@ -199,6 +201,17 @@ fn load_init_entries() -> Vec<StartupLaunchEntry> {
             })
             .then_with(|| lhs.exec.cmp(&rhs.exec))
     });
+    boot_line(
+        format!(
+            "initd: launch order={}",
+            launch_entries
+                .iter()
+                .map(|entry| entry.exec.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+        .as_str(),
+    );
     launch_entries
 }
 
@@ -211,14 +224,22 @@ fn startup_launch_entry(entry: StartupEntry) -> StartupLaunchEntry {
     }
 }
 
+fn load_init_env() -> Vec<CString> {
+    load_runtime_default_env(DEFAULT_RUNTIME_ENV_REGISTRY_PATH, RuntimeEnvScope::Init)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|value| CString::new(value).ok())
+        .collect()
+}
+
 fn init_exec_priority(exec: &str) -> u8 {
     match exec {
         SYSCALLD_EXEC_PATH => 0,
         VFSD_EXEC_PATH => 1,
         LOADERD_EXEC_PATH => 2,
-        NETD_EXEC_PATH => 3,
-        RUNTIMED_EXEC_PATH => 4,
-        DRIVERD_EXEC_PATH => 5,
+        DRIVERD_EXEC_PATH => 3,
+        NETD_EXEC_PATH => 4,
+        RUNTIMED_EXEC_PATH => 5,
         INPUTD_EXEC_PATH => 6,
         DEVMGRD_EXEC_PATH => 7,
         STORAGED_EXEC_PATH => 8,
@@ -232,7 +253,7 @@ fn launch_gate_satisfied(exec: &str) -> bool {
         LOADERD_EXEC_PATH => {
             service_ready(IPC_SERVICE_LINUX_SYSCALLD) && service_ready(IPC_SERVICE_VFSD)
         }
-        DRIVERD_EXEC_PATH => foundation_policy_services_ready() && service_ready(IPC_SERVICE_NETD),
+        DRIVERD_EXEC_PATH => foundation_policy_services_ready(),
         RUNTIMED_EXEC_PATH => foundation_policy_services_ready() && service_ready(IPC_SERVICE_NETD),
         _ => foundation_policy_services_ready(),
     }
@@ -306,23 +327,18 @@ fn reap_children(
     }
 }
 
-fn spawn_exec(exec_path: &str) -> Result<i32, i32> {
+fn spawn_exec(exec_path: &str, env: &[CString]) -> Result<i32, i32> {
     boot_line(&format!("initd: spawn begin exec={exec_path}"));
     if service_ready(IPC_SERVICE_LOADERD) {
-        return spawn_exec_via_loaderd(exec_path);
+        return spawn_exec_via_loaderd(exec_path, env);
     }
 
     Err(libc::EAGAIN)
 }
 
-fn spawn_exec_via_loaderd(exec_path: &str) -> Result<i32, i32> {
+fn spawn_exec_via_loaderd(exec_path: &str, env: &[CString]) -> Result<i32, i32> {
     let argv = [CString::new(exec_path).map_err(|_| libc::EINVAL)?];
-    let env = load_runtime_default_env(DEFAULT_RUNTIME_ENV_REGISTRY_PATH, RuntimeEnvScope::Init)
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|value| CString::new(value).ok())
-        .collect::<Vec<_>>();
-    let request = build_loader_spawn_request(exec_path, &argv, &env)?;
+    let request = build_loader_spawn_request(exec_path, &argv, env)?;
     let endpoint = lookup_loader_endpoint()?;
     let mut response = LoaderSpawnResponse::default();
     let call = unsafe {

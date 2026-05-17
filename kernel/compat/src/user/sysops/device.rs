@@ -178,7 +178,6 @@ fn ioctl_via_process_state(
     }
 }
 
-
 fn ioctl_remote_device(
     process_state: &mut UserProcessState,
     path: &str,

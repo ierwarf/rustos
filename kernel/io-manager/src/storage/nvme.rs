@@ -50,7 +50,11 @@ const NVME_FEATURE_NUM_QUEUES: u32 = 0x07;
 const NVME_ADMIN_QUEUE_DEPTH: u16 = 16;
 const NVME_IO_QUEUE_DEPTH: u16 = 16;
 const NVME_IDENTIFY_BYTES: usize = 4096;
-const NVME_DATA_BUFFER_BYTES: usize = 4096;
+const NVME_PAGE_BYTES: usize = 4096;
+const NVME_PRP_LIST_BYTES: usize = NVME_PAGE_BYTES;
+const NVME_PRP_LIST_ENTRY_BYTES: usize = core::mem::size_of::<u64>();
+const NVME_MAX_PRP_LIST_ENTRIES: usize = NVME_PRP_LIST_BYTES / NVME_PRP_LIST_ENTRY_BYTES;
+const NVME_DATA_BUFFER_BYTES: usize = 64 * 1024;
 const NVME_WAIT_SPINS: usize = 5_000_000;
 
 fn emit_nvme(level: crate::debug::LogLevel, event_id: u16, object_id: u64, message: String) {
@@ -131,6 +135,8 @@ struct NvmeRuntime {
     identify_dma: u64,
     data_cpu: *mut u8,
     data_dma: u64,
+    prp_list_cpu: *mut u64,
+    prp_list_dma: u64,
 }
 
 unsafe impl Send for NvmeRuntime {}
@@ -267,6 +273,8 @@ impl SharedBlockDevice for NvmeBlockDevice {
                 return Err(DiskIoError::InvalidInput);
             }
             let data_dma = runtime.data_dma;
+            let prp_list_cpu = runtime.prp_list_cpu;
+            let prp_list_dma = runtime.prp_list_dma;
             issue_nvm_command(
                 self.controller.as_ref(),
                 &mut runtime.io,
@@ -274,7 +282,10 @@ impl SharedBlockDevice for NvmeBlockDevice {
                 NVME_NVM_OP_READ,
                 block_lba,
                 data_dma,
+                prp_list_cpu,
+                prp_list_dma,
                 transfer_blocks as u16,
+                transfer_bytes,
             )?;
             unsafe {
                 crate::arch::simd::copy_fast(
@@ -331,6 +342,8 @@ impl SharedBlockDevice for NvmeBlockDevice {
                 );
             }
             let data_dma = runtime.data_dma;
+            let prp_list_cpu = runtime.prp_list_cpu;
+            let prp_list_dma = runtime.prp_list_dma;
             issue_nvm_command(
                 self.controller.as_ref(),
                 &mut runtime.io,
@@ -338,7 +351,10 @@ impl SharedBlockDevice for NvmeBlockDevice {
                 NVME_NVM_OP_WRITE,
                 block_lba,
                 data_dma,
+                prp_list_cpu,
+                prp_list_dma,
                 transfer_blocks as u16,
+                transfer_bytes,
             )?;
             offset += transfer_bytes;
         }
@@ -480,6 +496,8 @@ fn probe_controller(pci: PciDevice) -> Result<Option<NvmeBlockDevice>, DiskIoErr
     let identify_dma = crate::memory::paging::kernel_virtual_to_physical_addr(identify_cpu as u64);
     let data_cpu = alloc_dma_buffer(controller.dma_key, NVME_DATA_BUFFER_BYTES)?;
     let data_dma = crate::memory::paging::kernel_virtual_to_physical_addr(data_cpu as u64);
+    let prp_list_cpu = alloc_dma_buffer(controller.dma_key, NVME_PRP_LIST_BYTES)?.cast::<u64>();
+    let prp_list_dma = crate::memory::paging::kernel_virtual_to_physical_addr(prp_list_cpu as u64);
 
     let model =
         identify_controller_model(controller.as_ref(), &mut admin, identify_dma, identify_cpu)?;
@@ -528,6 +546,8 @@ fn probe_controller(pci: PciDevice) -> Result<Option<NvmeBlockDevice>, DiskIoErr
             identify_dma,
             data_cpu,
             data_dma,
+            prp_list_cpu,
+            prp_list_dma,
         }),
     }))
 }
@@ -695,18 +715,22 @@ fn issue_nvm_command(
     opcode: u8,
     lba: u64,
     data_dma: u64,
+    prp_list_cpu: *mut u64,
+    prp_list_dma: u64,
     block_count: u16,
+    byte_count: usize,
 ) -> IoResult<()> {
     if block_count == 0 {
         return Err(DiskIoError::InvalidInput);
     }
+    let (prp1, prp2) = data_prps(data_dma, prp_list_cpu, prp_list_dma, byte_count)?;
     let cmd = NvmeSubmission {
         cdw0: build_cdw0(opcode, io.alloc_cid()),
         nsid: namespace_id,
         rsvd2: 0,
         mptr: 0,
-        prp1: data_dma,
-        prp2: 0,
+        prp1,
+        prp2,
         cdw10: lba as u32,
         cdw11: (lba >> 32) as u32,
         cdw12: (block_count - 1) as u32,
@@ -715,6 +739,38 @@ fn issue_nvm_command(
         cdw15: 0,
     };
     submit_and_wait(controller, io, cmd).map(|_| ())
+}
+
+fn data_prps(
+    data_dma: u64,
+    prp_list_cpu: *mut u64,
+    prp_list_dma: u64,
+    byte_count: usize,
+) -> IoResult<(u64, u64)> {
+    if byte_count == 0 || byte_count > NVME_DATA_BUFFER_BYTES {
+        return Err(DiskIoError::InvalidInput);
+    }
+    let page_count = byte_count.div_ceil(NVME_PAGE_BYTES);
+    if page_count <= 1 {
+        return Ok((data_dma, 0));
+    }
+    let second_page = data_dma + NVME_PAGE_BYTES as u64;
+    if page_count == 2 {
+        return Ok((data_dma, second_page));
+    }
+    if prp_list_cpu.is_null() || page_count - 1 > NVME_MAX_PRP_LIST_ENTRIES {
+        return Err(DiskIoError::InvalidInput);
+    }
+    unsafe {
+        ptr::write_bytes(prp_list_cpu, 0, NVME_MAX_PRP_LIST_ENTRIES);
+        for index in 1..page_count {
+            ptr::write_volatile(
+                prp_list_cpu.add(index - 1),
+                data_dma + (index * NVME_PAGE_BYTES) as u64,
+            );
+        }
+    }
+    Ok((data_dma, prp_list_dma))
 }
 
 fn submit_and_wait(

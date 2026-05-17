@@ -21,3 +21,4 @@ display_name = "UI Server"
 weight_micros = 1000
 logical_admin = false
 console_hosted = false
+env = ["RUSTOS_UI_PROFILE=1"]

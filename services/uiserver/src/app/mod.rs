@@ -7,12 +7,16 @@ pub(crate) use runtime::start_console_refresh_worker;
 
 use std::os::fd::OwnedFd;
 use std::string::String;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use std::vec::Vec;
 
 use crate::canvas;
 use crate::cursor_sprites::CURSOR_SPRITE_MAX_DISTANCE;
-use crate::sys::{ConsoleSessionHandle, DisplayInfo, DisplaySurfaceCreate, SurfaceMapping};
+use crate::profile;
+use crate::sys::{
+    diag_line, ConsoleSessionHandle, DisplayInfo, DisplaySurfaceCreate, SurfaceMapping,
+};
 use crate::terminal::TerminalState;
 use crate::wayland::WaylandWindowSnapshot;
 
@@ -60,6 +64,9 @@ const PARTIAL_RECT_MERGE_NUMERATOR: u64 = 5;
 const PARTIAL_RECT_MERGE_DENOMINATOR: u64 = 4;
 const FULL_REDRAW_PROMOTION_NUMERATOR: u64 = 9;
 const FULL_REDRAW_PROMOTION_DENOMINATOR: u64 = 10;
+const MAX_WAYLAND_SYNC_LOGS: usize = 8;
+
+static WAYLAND_SYNC_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct VisualUpdate {
@@ -413,8 +420,15 @@ impl AppState {
         let before_dirty = self
             .wayland_stack_dirty_rect()
             .union(self.wayland_taskbar_dirty_rect());
+        let previous_windows = std::mem::take(&mut self.wayland_windows);
         let previous_dragging = self.dragging_window;
         let previous_focus = self.focused_wayland_surface_id;
+        let has_damage = windows.iter().any(|window| !window.damage.is_empty());
+        let order_unchanged = previous_windows.len() == windows.len()
+            && previous_windows
+                .iter()
+                .zip(windows.iter())
+                .all(|(previous, next)| previous.surface_id == next.surface_id);
         if let Some(DragTarget::Wayland(surface_id)) = self.dragging_window {
             if windows
                 .iter()
@@ -431,14 +445,69 @@ impl AppState {
                 self.focused_wayland_surface_id = None;
             }
         }
-        if self.wayland_windows == windows
+
+        if order_unchanged
+            && previous_windows == windows
             && previous_dragging == self.dragging_window
             && previous_focus == self.focused_wayland_surface_id
+            && !has_damage
         {
             return canvas::Rect::empty();
         }
+
+        if !order_unchanged {
+            self.wayland_windows = windows;
+            return before_dirty
+                .union(self.wayland_stack_dirty_rect())
+                .union(self.wayland_taskbar_dirty_rect());
+        }
+
+        let mut dirty = canvas::Rect::empty();
+        for (previous, window) in previous_windows.iter().zip(windows.iter()) {
+            if previous.minimized != window.minimized || previous.frame != window.frame {
+                dirty = dirty.union(crate::render::wayland_window_dirty_rect(previous));
+                dirty = dirty.union(crate::render::wayland_window_dirty_rect(window));
+                continue;
+            }
+
+            if previous.title != window.title {
+                let outer = crate::render::wayland_window_outer_rect(window);
+                dirty = dirty.union(outer);
+                dirty = dirty.union(self.wayland_taskbar_dirty_rect());
+                continue;
+            }
+
+            if previous.content_version != window.content_version || !window.damage.is_empty() {
+                let outer = crate::render::wayland_window_outer_rect(window);
+                let rect = if window.damage.is_empty() {
+                    crate::render::wayland_window_client_rect(outer)
+                } else {
+                    crate::render::wayland_window_damage_rect(window, window.damage)
+                };
+                dirty = dirty.union(rect);
+            }
+        }
+
         self.wayland_windows = windows;
+        if profile::enabled() && has_damage {
+            let log_index = WAYLAND_SYNC_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+            if log_index < MAX_WAYLAND_SYNC_LOGS {
+                diag_line(
+                    format!(
+                        "uiserver: wayland sync damage dirty={}x{}@{},{} windows={} focused_wayland={:?}",
+                        dirty.width,
+                        dirty.height,
+                        dirty.x,
+                        dirty.y,
+                        self.wayland_windows.len(),
+                        self.focused_wayland_surface_id,
+                    )
+                    .as_str(),
+                );
+            }
+        }
         before_dirty
+            .union(dirty)
             .union(self.wayland_stack_dirty_rect())
             .union(self.wayland_taskbar_dirty_rect())
     }

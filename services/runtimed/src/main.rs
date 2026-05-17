@@ -192,7 +192,7 @@ fn main() {
         ui_ready: false,
         launch_catalog_loaded: false,
     };
-    let mut launch_catalog = None::<Receiver<LaunchCatalog>>;
+    let mut launch_catalog = Some(start_launch_catalog_loader());
     stderr_line("runtimed: bootstrap ui begin");
     boot_line("runtimed: bootstrap ui begin");
     if let Err(err) = bootstrap_ui_server(&mut state) {

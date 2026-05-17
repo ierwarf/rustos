@@ -161,28 +161,19 @@ fn resolve_root_device_locked(
 ) -> Option<ResolvedRootDevice> {
     let record = devices.iter().find(|device| device.id == device_id)?;
     match &record.kind {
-        BlockDeviceKind::Root(device) => {
-            let (logical_block_size, block_count) = {
-                let device = device.lock();
-                (device.logical_block_size(), device.block_count())
-            };
-            Some(ResolvedRootDevice {
-                device: Arc::clone(device),
-                readonly: record.readonly,
-                logical_block_size,
-                block_count,
-                start_block: 0,
-            })
-        }
-        BlockDeviceKind::Slice {
-            parent_id,
-            start_block,
-            block_count,
-        } => {
+        BlockDeviceKind::Root(device) => Some(ResolvedRootDevice {
+            device: Arc::clone(device),
+            readonly: record.readonly,
+            logical_block_size: record.logical_block_size,
+            block_count: record.block_count,
+            start_block: record.start_block,
+        }),
+        BlockDeviceKind::Slice { parent_id, .. } => {
             let mut resolved = resolve_root_device_locked(devices, *parent_id)?;
             resolved.readonly |= record.readonly;
-            resolved.start_block = resolved.start_block.saturating_add(*start_block);
-            resolved.block_count = (*block_count).min(resolved.block_count);
+            resolved.start_block = record.start_block;
+            resolved.block_count = record.block_count.min(resolved.block_count);
+            resolved.logical_block_size = record.logical_block_size;
             Some(resolved)
         }
     }

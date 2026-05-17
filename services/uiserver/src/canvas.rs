@@ -286,8 +286,9 @@ impl<'a> SurfaceCanvas<'a> {
             else {
                 return;
             };
-            let Some(row_pixels) =
-                self.pixels.get_mut(row_start..row_start.saturating_add(rect.width))
+            let Some(row_pixels) = self
+                .pixels
+                .get_mut(row_start..row_start.saturating_add(rect.width))
             else {
                 return;
             };
@@ -306,8 +307,9 @@ impl<'a> SurfaceCanvas<'a> {
             else {
                 return;
             };
-            let Some(row_pixels) =
-                self.pixels.get_mut(row_start..row_start.saturating_add(rect.width))
+            let Some(row_pixels) = self
+                .pixels
+                .get_mut(row_start..row_start.saturating_add(rect.width))
             else {
                 return;
             };

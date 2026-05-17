@@ -71,6 +71,10 @@ struct BlockDeviceRecord {
     path: String,
     transport: BlockTransportKind,
     readonly: bool,
+    logical_block_size: usize,
+    start_block: u64,
+    block_count: u64,
+    root_id: u32,
     kind: BlockDeviceKind,
 }
 
@@ -181,10 +185,9 @@ pub fn descriptors() -> Vec<BlockDeviceDescriptor> {
             path: device.path.clone(),
             transport: device.transport,
             readonly: device.readonly,
-            logical_block_size: registry::device_logical_block_size_locked(&devices, device.id)
-                .unwrap_or(0),
-            start_block: registry::device_start_block_locked(&devices, device.id).unwrap_or(0),
-            block_count: registry::device_block_count_locked(&devices, device.id).unwrap_or(0),
+            logical_block_size: device.logical_block_size,
+            start_block: device.start_block,
+            block_count: device.block_count,
         })
         .collect()
 }
@@ -219,10 +222,9 @@ fn descriptor_without_init(handle: BlockDeviceHandle) -> Option<BlockDeviceDescr
         path: record.path.clone(),
         transport: record.transport,
         readonly: record.readonly,
-        logical_block_size: registry::device_logical_block_size_locked(&devices, handle.id())
-            .unwrap_or(0),
-        start_block: registry::device_start_block_locked(&devices, handle.id()).unwrap_or(0),
-        block_count: registry::device_block_count_locked(&devices, handle.id()).unwrap_or(0),
+        logical_block_size: record.logical_block_size,
+        start_block: record.start_block,
+        block_count: record.block_count,
     })
 }
 
