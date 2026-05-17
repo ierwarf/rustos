@@ -86,7 +86,8 @@ Kernel/userspace ABI:
   have live service-first implementations through `loaderd`, `procd`,
   `syscalld`, and narrow kernel brokers; process and signal policy belongs to
   `procd`, executable image policy belongs to `loaderd`, clock policy belongs
-  to `syscalld`, and
+  to `syscalld` except hot read-only `clock_gettime`/`nanosleep` fast paths
+  that may stay in the kernel to avoid per-call IPC latency, and
   io-manager VFS/network/USB/input/provider policy belongs to
   the user services. Do not restore deleted or commented ring0 policy modules
   for quick compatibility fixes. Extend service implementations and keep

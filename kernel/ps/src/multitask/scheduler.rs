@@ -69,6 +69,12 @@ struct TaskContext {
     saved_rsp: usize,
     ready: bool,
     blocked: bool,
+    /// Block-arm flag for race-free sleep/wake. Set by `arm_block_current_task`;
+    /// cleared by `wake_task` and `commit_block_current_task`. A wake delivered
+    /// while the task is still running clears the flag, so the subsequent
+    /// `commit_block_current_task` observes that a wake raced and refuses to
+    /// block. Mirrors Linux's `prepare_to_wait` / `set_current_state` pattern.
+    wake_armed: bool,
     pit_divisor: u16,
     address_space_root: u64,
     kernel_stack_base: u64,
@@ -100,6 +106,13 @@ pub(super) struct Scheduler {
     stacks: [Option<Vec<u8>>; MAX_TASK],
     current_task: usize,
     pending_reap: bool,
+    /// L4/seL4-style "donate" hint: on the next scheduler tick, prefer this
+    /// slot if it is ready. Set by IPC paths immediately before
+    /// `yield_now()` so the caller hands its remaining timeslice to the
+    /// receiver/replier instead of letting round-robin pick an unrelated task
+    /// and stalling for an entire PIT slice. Consumed (cleared) on the next
+    /// scheduler pick whether or not the hint was used.
+    next_pick_hint: Option<usize>,
 }
 
 impl Scheduler {
@@ -114,7 +127,29 @@ impl Scheduler {
             stacks: [const { None }; MAX_TASK],
             current_task: 0,
             pending_reap: false,
+            next_pick_hint: None,
         }
+    }
+
+    /// Sets a "donate" hint that biases the next scheduler pick toward the
+    /// given task id. IPC paths use this so that after `wake_task(target)` and
+    /// `yield_now()`, the scheduler immediately runs `target` instead of
+    /// round-robining through unrelated ready tasks. The hint is consumed on
+    /// the next pick regardless of whether it was usable.
+    pub(super) fn set_next_pick_hint(&mut self, task_id: u64) {
+        self.next_pick_hint = self.find_task_slot(task_id);
+    }
+
+    fn take_next_pick_hint_ready_slot(&mut self) -> Option<usize> {
+        let slot = self.next_pick_hint.take()?;
+        if slot >= MAX_TASK {
+            return None;
+        }
+        let context = self.contexts[slot]?;
+        if !context.ready || !self.context_is_schedulable(slot, context) {
+            return None;
+        }
+        Some(slot)
     }
 
     pub(super) fn reset(
@@ -151,6 +186,7 @@ impl Scheduler {
             ),
             ready: true,
             blocked: false,
+            wake_armed: false,
             pit_divisor: main_thread_pit_divisor,
             address_space_root: crate::memory::paging::kernel_root_phys().as_u64(),
             kernel_stack_base: kernel_stack_base as u64,
@@ -534,6 +570,7 @@ impl Scheduler {
                     ),
                     ready: true,
                     blocked: false,
+                    wake_armed: false,
                     pit_divisor,
                     address_space_root: crate::memory::paging::kernel_root_phys().as_u64(),
                     kernel_stack_base: kernel_stack_base as u64,
@@ -612,6 +649,7 @@ impl Scheduler {
                     saved_rsp,
                     ready: true,
                     blocked: false,
+                    wake_armed: false,
                     pit_divisor,
                     address_space_root: root_phys,
                     kernel_stack_base: kernel_stack_base as u64,
@@ -669,6 +707,7 @@ impl Scheduler {
                     saved_rsp,
                     ready: true,
                     blocked: false,
+                    wake_armed: false,
                     pit_divisor,
                     address_space_root: root_phys,
                     kernel_stack_base: kernel_stack_base as u64,
@@ -727,6 +766,7 @@ impl Scheduler {
                     ),
                     ready: true,
                     blocked: false,
+                    wake_armed: false,
                     pit_divisor,
                     address_space_root: root_phys,
                     kernel_stack_base: kernel_stack_base as u64,
@@ -811,6 +851,7 @@ impl Scheduler {
                         .init_user_task_context(slot, &bootstrap, user_cs, user_ss, rflags),
                     ready: true,
                     blocked: false,
+                    wake_armed: false,
                     pit_divisor,
                     address_space_root: root_phys,
                     kernel_stack_base: kernel_stack_base as u64,
@@ -1022,7 +1063,8 @@ impl Scheduler {
         self.retire_invalid_ready_tasks();
 
         let next_idx = self
-            .next_ready_task_index(self.current_task)
+            .take_next_pick_hint_ready_slot()
+            .or_else(|| self.next_ready_task_index(self.current_task))
             .unwrap_or(ROOT_TASK_SLOT);
 
         if let Some(next) = self.contexts[next_idx] {
@@ -1816,6 +1858,7 @@ impl Scheduler {
 
         context.blocked = true;
         context.ready = false;
+        context.wake_armed = false;
         true
     }
 
@@ -1830,7 +1873,44 @@ impl Scheduler {
 
         context.blocked = true;
         context.ready = false;
+        context.wake_armed = false;
         true
+    }
+
+    /// Arms a race-free block on the current task. Pair with
+    /// `commit_block_current_task`. Between the two calls the caller must
+    /// re-check the wakeup condition; if a wake fires in that window the
+    /// commit returns `false` and the caller stays runnable instead of
+    /// sleeping with a lost wakeup.
+    pub(super) fn arm_block_current_task(&mut self) -> bool {
+        let slot = self.current_task;
+        let Some(context) = self.contexts[slot].as_mut() else {
+            return false;
+        };
+        if slot == ROOT_TASK_SLOT {
+            return false;
+        }
+        context.wake_armed = true;
+        true
+    }
+
+    /// Commits a previously armed block. Returns `Some(true)` if the task was
+    /// blocked, `Some(false)` if a wake raced us (wake_armed cleared by
+    /// `wake_task`) and we should re-check the condition without sleeping,
+    /// `None` on invalid context.
+    pub(super) fn commit_block_current_task(&mut self) -> Option<bool> {
+        let slot = self.current_task;
+        let context = self.contexts[slot].as_mut()?;
+        if slot == ROOT_TASK_SLOT {
+            return None;
+        }
+        if !context.wake_armed {
+            return Some(false);
+        }
+        context.wake_armed = false;
+        context.blocked = true;
+        context.ready = false;
+        Some(true)
     }
 
     pub(super) fn wake_user_task(&mut self, task_id: u64) -> bool {
@@ -1864,6 +1944,9 @@ impl Scheduler {
             let Some(context) = self.contexts[slot].as_mut() else {
                 return false;
             };
+            // Always clear the arm flag so a paired commit_block_current_task
+            // observes that a wake raced before the caller actually slept.
+            context.wake_armed = false;
             context.blocked = false;
             context.ready = invalid_reason.is_none();
         }
@@ -2042,6 +2125,7 @@ mod tests {
             saved_rsp: 0,
             ready: true,
             blocked: false,
+            wake_armed: false,
             pit_divisor: 0,
             address_space_root: 0,
             kernel_stack_base: 0,

@@ -73,7 +73,7 @@ pub mod endpoint {
     pub fn add_receiver_waiter(
         endpoint: KernelEndpointHandle,
         task_id: u64,
-    ) -> Result<(), IpcError> {
+    ) -> Result<bool, IpcError> {
         crate::ipc::add_endpoint_receiver_waiter(endpoint, task_id)
     }
 

@@ -29,7 +29,14 @@ const STORAGED_EXEC_PATH: &str = "services/storaged/storaged.elf";
 const INPUTD_EXEC_PATH: &str = "services/inputd/inputd.elf";
 const POLL_INTERVAL: Duration = Duration::from_millis(2);
 const RETRY_BACKOFF: Duration = Duration::from_millis(50);
-const SECONDARY_SERVICE_DEFER_AFTER_RUNTIMED: Duration = Duration::from_millis(0);
+const DEFAULT_INIT_TASK_WEIGHT_MICROS: u64 = 1_000;
+const DISPLAY_CRITICAL_TASK_WEIGHT_MICROS: u64 = 2_000;
+// Previously 6_000ms — designed to keep inputd/devmgrd/storaged off the spawn
+// path while display/UI came up. With directed-yield IPC the display bring-up
+// no longer starves on round-robin scheduling, so the defer dominates total
+// boot time (~6s of dead air post-runtimed). 750ms keeps a small ordering gap
+// after the UI is reachable without spending the entire boot budget on it.
+const SECONDARY_SERVICE_DEFER_AFTER_RUNTIMED: Duration = Duration::from_millis(750);
 static LOADER_ENDPOINT_CACHE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -137,6 +144,7 @@ fn main() {
                             Some(Instant::now() + SECONDARY_SERVICE_DEFER_AFTER_RUNTIMED);
                     }
                     launched_this_round = true;
+                    break;
                 }
                 Err(err) => {
                     observability_client::error!(
@@ -145,8 +153,7 @@ fn main() {
                         "launch {} failed: errno={err}",
                         entry.exec
                     );
-                    retry_after
-                        .insert(entry.exec.clone(), Instant::now() + RETRY_BACKOFF);
+                    retry_after.insert(entry.exec.clone(), Instant::now() + RETRY_BACKOFF);
                 }
             }
         }
@@ -160,7 +167,12 @@ fn main() {
 }
 
 fn secondary_service_deferred(exec: &str, now: Instant, deadline: Option<Instant>) -> bool {
-    exec == STORAGED_EXEC_PATH && deadline.is_some_and(|defer_until| now < defer_until)
+    match exec {
+        INPUTD_EXEC_PATH | DEVMGRD_EXEC_PATH | STORAGED_EXEC_PATH => {
+            deadline.is_none_or(|defer_until| now < defer_until)
+        }
+        _ => false,
+    }
 }
 
 fn load_init_entries() -> Vec<StartupLaunchEntry> {
@@ -204,10 +216,10 @@ fn init_exec_priority(exec: &str) -> u8 {
         SYSCALLD_EXEC_PATH => 0,
         VFSD_EXEC_PATH => 1,
         LOADERD_EXEC_PATH => 2,
-        DRIVERD_EXEC_PATH => 3,
-        NETD_EXEC_PATH => 4,
-        INPUTD_EXEC_PATH => 5,
-        RUNTIMED_EXEC_PATH => 6,
+        NETD_EXEC_PATH => 3,
+        RUNTIMED_EXEC_PATH => 4,
+        DRIVERD_EXEC_PATH => 5,
+        INPUTD_EXEC_PATH => 6,
         DEVMGRD_EXEC_PATH => 7,
         STORAGED_EXEC_PATH => 8,
         _ => 9,
@@ -220,6 +232,8 @@ fn launch_gate_satisfied(exec: &str) -> bool {
         LOADERD_EXEC_PATH => {
             service_ready(IPC_SERVICE_LINUX_SYSCALLD) && service_ready(IPC_SERVICE_VFSD)
         }
+        DRIVERD_EXEC_PATH => foundation_policy_services_ready() && service_ready(IPC_SERVICE_NETD),
+        RUNTIMED_EXEC_PATH => foundation_policy_services_ready() && service_ready(IPC_SERVICE_NETD),
         _ => foundation_policy_services_ready(),
     }
 }
@@ -411,8 +425,10 @@ fn lookup_loader_endpoint() -> Result<u64, i32> {
 }
 
 fn exec_weight_micros(exec_path: &str) -> u64 {
-    let _ = exec_path;
-    100
+    match exec_path {
+        RUNTIMED_EXEC_PATH | DRIVERD_EXEC_PATH => DISPLAY_CRITICAL_TASK_WEIGHT_MICROS,
+        _ => DEFAULT_INIT_TASK_WEIGHT_MICROS,
+    }
 }
 
 fn last_errno() -> i32 {

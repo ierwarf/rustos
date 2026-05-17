@@ -366,25 +366,25 @@ fn run() -> Result<(), i32> {
         if now >= next_runtime_poll {
             let refresh_started = Instant::now();
             let runtime_changed = refresh_runtime_state(&runtime_sync, &mut runtime_state)?;
-            let apply_dirty = state.apply_runtime_state(&mut runtime_state);
-            let apply_changed = !apply_dirty.is_empty();
+            let apply_update = state.apply_runtime_state(&mut runtime_state);
+            let apply_changed = !apply_update.is_empty();
             let refresh_elapsed = refresh_started.elapsed();
             if refresh_elapsed >= SLOW_RUNTIME_REFRESH_THRESHOLD {
                 log_slow_runtime_refresh(&state, refresh_elapsed, runtime_changed, apply_changed);
             }
             next_runtime_poll = now + RUNTIME_POLL_SLEEP;
-            pending_update.absorb(VisualUpdate::partial(apply_dirty));
+            pending_update.absorb(apply_update);
         }
 
         let now = Instant::now();
         if now >= next_console_poll {
             let refresh_started = Instant::now();
-            let mut dirty_rect = canvas::Rect::empty();
+            let mut console_update = VisualUpdate::default();
             while let Ok(refresh) = console_refreshes.try_recv() {
-                dirty_rect = dirty_rect.union(state.apply_console_refresh(refresh)?);
+                console_update.absorb(state.apply_console_refresh(refresh)?);
             }
-            let changed = !dirty_rect.is_empty();
-            pending_update.absorb(VisualUpdate::partial(dirty_rect));
+            let changed = !console_update.is_empty();
+            pending_update.absorb(console_update);
             let refresh_elapsed = refresh_started.elapsed();
             profile::record_console_refresh(refresh_elapsed, changed);
             if refresh_elapsed >= SLOW_CONSOLE_REFRESH_THRESHOLD {
@@ -477,7 +477,6 @@ fn run() -> Result<(), i32> {
             let mut present_elapsed = Duration::ZERO;
             let mut present_union = canvas::Rect::empty();
             let mut pixel_count = 0_u64;
-            let mut recovered_stale_surface = false;
 
             for rect in &render_rects {
                 present_union = present_union.union(*rect);
@@ -487,22 +486,18 @@ fn run() -> Result<(), i32> {
                 let render_started = Instant::now();
                 render_rect(&mut state, *rect);
                 render_elapsed += render_started.elapsed();
+            }
 
-                let present_started = Instant::now();
-                match state.present_rect(*rect) {
-                    Ok(()) => {}
-                    Err(err) if state.recover_if_stale_surface_error(err)? => {
-                        pending_update.request_full();
-                        recovered_stale_surface = true;
-                        break;
-                    }
-                    Err(err) => return Err(err),
+            let present_started = Instant::now();
+            match state.present_rect(present_union) {
+                Ok(()) => {}
+                Err(err) if state.recover_if_stale_surface_error(err)? => {
+                    pending_update.request_full();
+                    continue;
                 }
-                present_elapsed += present_started.elapsed();
+                Err(err) => return Err(err),
             }
-            if recovered_stale_surface {
-                continue;
-            }
+            present_elapsed += present_started.elapsed();
             let rect_count = render_rects.len() as u64;
             profile::record_present(
                 false,

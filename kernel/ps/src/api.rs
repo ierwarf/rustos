@@ -4,13 +4,14 @@ pub use crate::multitask::{
     UserFaultDisposition, UserStackState, UserTaskBootstrap, UserTaskRegisters, WaitChildResult,
 };
 pub use crate::multitask::{
-    block_current_task, block_current_user_task, current_last_error, current_linux_thread_state,
+    arm_block_current_task, block_current_task, block_current_user_task,
+    commit_block_current_task, current_last_error, current_linux_thread_state,
     current_user_address_space, current_user_stack_state, current_user_thread_id,
     exec_current_user_process, exec_user_process_by_pid, exit_current_user_task,
     is_user_task_alive, linux_thread_snapshot_by_ids, note_process_exit_status, queue_linux_signal,
     restore_current_simd_state, save_current_simd_state, set_current_last_error,
-    spawn_user_process_state_with_parent, spawn_user_process_with_parent, spawn_user_thread,
-    wake_task, wake_user_task, with_current_mm, with_current_process_state,
+    set_next_pick_hint, spawn_user_process_state_with_parent, spawn_user_process_with_parent,
+    spawn_user_thread, wake_task, wake_user_task, with_current_mm, with_current_process_state,
     with_current_process_state_mut, with_current_user_linux_state_mut,
     with_current_user_process_and_linux_thread_state_mut, with_current_user_process_state,
     with_process_state_by_pid, with_process_state_by_pid_mut,
@@ -250,6 +251,14 @@ pub mod task {
 
     pub fn block_current_task() -> bool {
         crate::multitask::block_current_task()
+    }
+
+    pub fn arm_block_current_task() -> bool {
+        crate::multitask::arm_block_current_task()
+    }
+
+    pub fn commit_block_current_task() -> Option<bool> {
+        crate::multitask::commit_block_current_task()
     }
 
     pub fn wake_task(task_id: u64) -> bool {

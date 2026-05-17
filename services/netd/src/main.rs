@@ -17,7 +17,7 @@ use rustos_user_abi::syscall::{
     SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_NET_BROKER,
 };
 
-const RECV_BACKOFF: Duration = Duration::from_millis(10);
+const RECV_BACKOFF: Duration = Duration::from_millis(1);
 
 fn main() {
     let endpoint = syscall0(SYS_RUSTOS_IPC_ENDPOINT_CREATE);

@@ -104,7 +104,7 @@ fn serve(endpoint: u64) {
             )
         };
         if received < 0 {
-            rustos_svc_runtime::syscall::sleep_millis(10);
+            rustos_svc_runtime::syscall::sleep_millis(1);
             continue;
         }
 
@@ -152,8 +152,18 @@ struct VfsState {
     cwd: BTreeMap<u64, String>,
     handles: BTreeMap<u64, RemoteHandle>,
     file_cache: BTreeMap<String, Vec<u8>>,
+    /// Positive + negative metadata cache. `Ok(_)` is a resolved entry;
+    /// `Err(errno)` is a negative cache (e.g. ENOENT) so back-to-back stat()s
+    /// of common missing libc paths return without touching FAT. The whole map
+    /// is dropped whenever `mount_generation` changes.
+    metadata_cache: BTreeMap<String, Result<Metadata, i32>>,
+    /// Cached directory listings, keyed by absolute path. Linux startup
+    /// re-reads `/`, `/dev`, library directories, etc.; FAT traversal per call
+    /// is expensive enough to dominate boot time when libc walks PATH.
+    dir_entries_cache: BTreeMap<String, Vec<DirEntry>>,
     next_handle: u64,
     mount_generation: u64,
+    cache_generation: u64,
 }
 
 #[derive(Clone)]
@@ -186,8 +196,20 @@ impl VfsState {
             cwd: BTreeMap::new(),
             handles: BTreeMap::new(),
             file_cache: BTreeMap::new(),
+            metadata_cache: BTreeMap::new(),
+            dir_entries_cache: BTreeMap::new(),
             next_handle: 1,
             mount_generation: 1,
+            cache_generation: 1,
+        }
+    }
+
+    fn invalidate_caches_if_remounted(&mut self) {
+        if self.cache_generation != self.mount_generation {
+            self.metadata_cache.clear();
+            self.dir_entries_cache.clear();
+            self.file_cache.clear();
+            self.cache_generation = self.mount_generation;
         }
     }
 
@@ -844,16 +866,23 @@ impl VfsState {
                 inode: path_inode(path.as_bytes()),
             });
         }
-        let volume = self.volume()?;
-        let meta = volume.metadata(path).map_err(map_fat_error)?;
-        Ok(Metadata {
-            kind: match meta.kind {
-                FatNodeKind::File => RemoteKind::File,
-                FatNodeKind::Directory => RemoteKind::Directory,
-            },
-            len: meta.len,
-            inode: path_inode(path.as_bytes()),
-        })
+        self.invalidate_caches_if_remounted();
+        if let Some(entry) = self.metadata_cache.get(path) {
+            return *entry;
+        }
+        let result = match self.volume()?.metadata(path) {
+            Ok(meta) => Ok(Metadata {
+                kind: match meta.kind {
+                    FatNodeKind::File => RemoteKind::File,
+                    FatNodeKind::Directory => RemoteKind::Directory,
+                },
+                len: meta.len,
+                inode: path_inode(path.as_bytes()),
+            }),
+            Err(err) => Err(map_fat_error(err)),
+        };
+        self.metadata_cache.insert(path.to_string(), result);
+        result
     }
 
     fn dir_entries(&mut self, path: &str) -> Result<Vec<DirEntry>, i32> {
@@ -882,8 +911,16 @@ impl VfsState {
         if path == "/proc" || path == "/run" {
             return Ok(entries);
         }
+        self.invalidate_caches_if_remounted();
+        if let Some(cached) = self.dir_entries_cache.get(path) {
+            entries.extend_from_slice(cached);
+            return Ok(entries);
+        }
         let fat_entries = self.volume()?.read_dir(path).map_err(map_fat_error)?;
-        entries.extend(fat_entries.into_iter().map(DirEntry::from_fat));
+        let resolved: Vec<DirEntry> = fat_entries.into_iter().map(DirEntry::from_fat).collect();
+        self.dir_entries_cache
+            .insert(path.to_string(), resolved.clone());
+        entries.extend(resolved);
         Ok(entries)
     }
 

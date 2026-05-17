@@ -85,8 +85,30 @@ pub fn block_current_task() -> bool {
     interrupts::without_interrupts(|| unsafe { scheduler_mut().block_current_task() })
 }
 
+/// Arms a race-free block on the current task; must be paired with
+/// `commit_block_current_task`. Returns false if the slot is invalid or this is
+/// the root task.
+pub fn arm_block_current_task() -> bool {
+    interrupts::without_interrupts(|| unsafe { scheduler_mut().arm_block_current_task() })
+}
+
+/// Commits a previously armed block. Returns `Some(true)` if blocked,
+/// `Some(false)` if a wake raced us and we stayed runnable, `None` on invalid
+/// context. Callers must re-check their wakeup condition when `Some(false)` is
+/// returned instead of yielding.
+pub fn commit_block_current_task() -> Option<bool> {
+    interrupts::without_interrupts(|| unsafe { scheduler_mut().commit_block_current_task() })
+}
+
 pub fn wake_task(task_id: u64) -> bool {
     interrupts::without_interrupts(|| unsafe { scheduler_mut().wake_task(task_id) })
+}
+
+/// Biases the next scheduler pick toward `task_id`. Combine with `wake_task` +
+/// `yield_now` to implement direct hand-off (caller donates remaining quantum
+/// to the receiver), eliminating round-robin latency on IPC roundtrips.
+pub fn set_next_pick_hint(task_id: u64) {
+    interrupts::without_interrupts(|| unsafe { scheduler_mut().set_next_pick_hint(task_id) })
 }
 
 pub fn current_console_session() -> ConsoleSessionHandle {

@@ -51,7 +51,9 @@ pub(crate) fn refresh_runtime_state(
     sync: &RuntimeSyncHandle,
     runtime_state: &mut RuntimeState,
 ) -> Result<bool, i32> {
-    let snapshot = sync.shared.lock().unwrap().clone();
+    let Ok(snapshot) = sync.shared.try_lock().map(|state| state.clone()) else {
+        return Ok(false);
+    };
     if snapshot.generation == runtime_state.generation {
         return Ok(false);
     }

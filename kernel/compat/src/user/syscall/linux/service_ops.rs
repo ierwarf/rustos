@@ -253,12 +253,6 @@ pub(super) fn syscall_linux_sched_yield() -> u64 {
     0
 }
 
-fn current_process_is_linux_syscall_policy_owner() -> bool {
-    super::ipc_ops::current_process_has_service_capability(
-        rustos_user_abi::syscall::IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY,
-    )
-}
-
 pub(super) fn syscall_linux_getpid() -> u64 {
     multitask::current_user_process_id().unwrap_or(0)
 }
@@ -436,46 +430,11 @@ fn sync_current_linux_signal_mask(how: u64, requested_mask: u64) {
 }
 
 pub(super) fn syscall_linux_nanosleep(request_ptr: u64, _remaining_ptr: u64) -> u64 {
-    if current_process_is_linux_syscall_policy_owner() {
-        return syscall_linux_policy_owner_nanosleep(request_ptr);
-    }
-
-    let ts = match usermem::read_current_user_struct::<LinuxTimespecWire>(request_ptr) {
-        Ok(ts) => ts,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
-    };
-    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_NANOSLEEP);
-    request.path_len = LINUX_TIMESPEC_SIZE as u32;
-    request.path[..LINUX_TIMESPEC_SIZE].copy_from_slice(as_bytes(&ts));
-    match call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response)) {
-        Ok(()) => 0,
-        Err(errno) => linux_errno(errno),
-    }
+    syscall_linux_policy_owner_nanosleep(request_ptr)
 }
 
 pub(super) fn syscall_linux_clock_gettime(clock_id: u64, timespec_ptr: u64) -> u64 {
-    if current_process_is_linux_syscall_policy_owner() {
-        return syscall_linux_policy_owner_clock_gettime(clock_id, timespec_ptr);
-    }
-
-    if let Err(err) = usermem::validate_current_user_write_buffer(timespec_ptr, LINUX_TIMESPEC_SIZE)
-    {
-        return linux_errno(address_space_error_to_linux_errno(err));
-    }
-    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_CLOCK_GETTIME);
-    request.arg0 = clock_id;
-    let response = match call_syscalld(request) {
-        Ok(response) => response,
-        Err(errno) => return linux_errno(errno),
-    };
-    if let Err(errno) = ensure_syscalld_payload(&response, LINUX_TIMESPEC_SIZE) {
-        return linux_errno(errno);
-    }
-    match usermem::write_current_user_bytes(timespec_ptr, &response.payload[..LINUX_TIMESPEC_SIZE])
-    {
-        Ok(()) => 0,
-        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
-    }
+    syscall_linux_policy_owner_clock_gettime(clock_id, timespec_ptr)
 }
 
 fn syscall_linux_policy_owner_nanosleep(request_ptr: u64) -> u64 {
@@ -2904,9 +2863,7 @@ pub(super) fn syscall_linux_ioctl(fd: u64, request_number: u64, arg: u64) -> u64
     // added later we can re-introduce IPC for the specific opcodes that need it.
     match crate::user::sysops::device::ioctl_current_process_fd(fd, request_number, arg) {
         Ok(value) => value,
-        Err(err) => linux_errno(
-            super::broker_ops::device_sysop_error_to_linux_errno(err),
-        ),
+        Err(err) => linux_errno(super::broker_ops::device_sysop_error_to_linux_errno(err)),
     }
 }
 

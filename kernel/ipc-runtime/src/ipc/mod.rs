@@ -753,30 +753,45 @@ pub fn recv_endpoint_with_limits_and_handles(
             .expect("ipc endpoint disappeared while dequeuing call")
             .pending_messages
             .pop_front();
+        // Move the request bytes and handles out of the message rather than cloning;
+        // the server has consumed them and the message struct only needs to track
+        // the reply-write path from here on.
+        let message = objects
+            .endpoint_messages
+            .get_mut(&message_id)
+            .expect("ipc endpoint_message disappeared while dequeuing call");
+        let request = core::mem::take(&mut message.request);
+        let attached_handles = core::mem::take(&mut message.attached_handles);
         Ok(Some((
             KernelReplyHandle::from_raw(reply_id),
-            message.request.clone(),
-            message.attached_handles.clone(),
+            request,
+            attached_handles,
         )))
     })
 }
 
+/// Registers `task_id` as a receiver waiter on `endpoint`. Returns
+/// `Ok(has_pending)` where `has_pending == true` means a message is already
+/// queued on the endpoint at the moment of registration. Callers must use the
+/// returned flag to skip blocking (and re-poll the queue) when `true`, closing
+/// the recv→add-waiter→block race window where the producer queued a message
+/// before our slot was visible and so issued no wake.
 pub fn add_endpoint_receiver_waiter(
     endpoint: KernelEndpointHandle,
     task_id: u64,
-) -> Result<(), IpcError> {
+) -> Result<bool, IpcError> {
     with_ipc_objects(|objects| {
         let Some(endpoint_object) = objects.endpoints.get_mut(&endpoint.raw()) else {
             return Err(IpcError::InvalidHandle);
         };
-        if endpoint_object.waiting_receivers.contains(&task_id) {
-            return Ok(());
+        let already_waiting = endpoint_object.waiting_receivers.contains(&task_id);
+        if !already_waiting {
+            if endpoint_object.waiting_receivers.len() >= MAX_ENDPOINT_WAITERS {
+                return Err(IpcError::NoMemory);
+            }
+            endpoint_object.waiting_receivers.push_back(task_id);
         }
-        if endpoint_object.waiting_receivers.len() >= MAX_ENDPOINT_WAITERS {
-            return Err(IpcError::NoMemory);
-        }
-        endpoint_object.waiting_receivers.push_back(task_id);
-        Ok(())
+        Ok(!endpoint_object.pending_messages.is_empty())
     })
 }
 

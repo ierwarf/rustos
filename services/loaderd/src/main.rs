@@ -11,20 +11,21 @@ use core::mem::size_of;
 
 use rustos_user_abi::syscall::{
     LoaderSpawnRequest, LoaderSpawnResponse, RustosProcAbortBrokerArgs,
-    RustosProcMapDataBrokerArgs, RustosProcMapFileBrokerArgs, RustosProcMapZeroedBrokerArgs,
-    RustosProcPrepareBrokerArgs, RustosProcSetImageBlobBrokerArgs,
+    RustosProcMapDataBrokerArgs, RustosProcMapFileBatchBrokerArgs, RustosProcMapFileBatchEntry,
+    RustosProcMapZeroedBrokerArgs, RustosProcPrepareBrokerArgs, RustosProcSetImageBlobBrokerArgs,
     RustosProcSetLinuxRuntimeBrokerArgs, RustosProcSetWindowsRuntimeBrokerArgs,
     IPC_SERVICE_LOADERD, LOADER_OP_EXEC_TARGET, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION,
     LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY,
     LOADER_SPAWN_MAX_ARG_COUNT, LOADER_SPAWN_MAX_ENV_COUNT, PROC_BROKER_ABI_VERSION,
-    PROC_BROKER_DATA_PAYLOAD_CAPACITY, PROC_BROKER_FORMAT_ELF64, PROC_BROKER_FORMAT_PE64,
-    PROC_BROKER_LINUX_INTERP_PATH_CAPACITY, PROC_BROKER_MAP_EXEC, PROC_BROKER_MAP_PRIVATE,
-    PROC_BROKER_MAP_READ, PROC_BROKER_MAP_WRITE, PROC_BROKER_USER_SPACE_BASE,
-    PROC_BROKER_USER_SPACE_END_EXCLUSIVE, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_RECV,
-    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_PROC_ABORT_BROKER, SYS_RUSTOS_PROC_MAP_DATA_BROKER,
-    SYS_RUSTOS_PROC_MAP_FILE_BROKER, SYS_RUSTOS_PROC_MAP_ZEROED_BROKER,
-    SYS_RUSTOS_PROC_PREPARE_BROKER, SYS_RUSTOS_PROC_SET_IMAGE_BLOB_BROKER,
-    SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER, SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER,
+    PROC_BROKER_BATCH_CAPACITY, PROC_BROKER_DATA_PAYLOAD_CAPACITY, PROC_BROKER_FORMAT_ELF64,
+    PROC_BROKER_FORMAT_PE64, PROC_BROKER_LINUX_INTERP_PATH_CAPACITY, PROC_BROKER_MAP_EXEC,
+    PROC_BROKER_MAP_PRIVATE, PROC_BROKER_MAP_READ, PROC_BROKER_MAP_WRITE,
+    PROC_BROKER_USER_SPACE_BASE, PROC_BROKER_USER_SPACE_END_EXCLUSIVE, SYS_RUSTOS_DEBUG_PRINT,
+    SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_PROC_ABORT_BROKER,
+    SYS_RUSTOS_PROC_MAP_DATA_BROKER, SYS_RUSTOS_PROC_MAP_FILE_BATCH_BROKER,
+    SYS_RUSTOS_PROC_MAP_ZEROED_BROKER, SYS_RUSTOS_PROC_PREPARE_BROKER,
+    SYS_RUSTOS_PROC_SET_IMAGE_BLOB_BROKER, SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER,
+    SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER,
 };
 
 mod commit;
@@ -146,7 +147,7 @@ fn serve(endpoint: u64) {
             (&mut reply_cap as *mut u64) as u64,
         );
         if received < 0 {
-            rustos_svc_runtime::syscall::sleep_millis(10);
+            rustos_svc_runtime::syscall::sleep_millis(1);
             continue;
         }
 
@@ -544,7 +545,8 @@ fn validate_executable_fd(fd: i32) -> Result<u16, i32> {
     read_exact_at(fd, 0, &mut header[..4])?;
     if header[..4] == *b"\x7fELF" {
         read_exact_at(fd, 0, &mut header)?;
-        validate_elf_fd(fd, &header)?;
+        let phdrs = read_program_headers(fd, &header)?;
+        validate_elf_fd(fd, &header, &phdrs)?;
         return Ok(PROC_BROKER_FORMAT_ELF64);
     }
     if &header[..2] == b"MZ" {
@@ -555,7 +557,50 @@ fn validate_executable_fd(fd: i32) -> Result<u16, i32> {
     Err(ENOEXEC)
 }
 
-fn validate_elf_fd(fd: i32, header: &[u8; ELF_HEADER_SIZE]) -> Result<(), i32> {
+/// Reads the full program-header table in a single pread64. Loaderd used to
+/// issue one IPC roundtrip per program header (×3, since validation, load-bias
+/// computation, and segment mapping each re-walked the table). With a typical
+/// dynamic ELF carrying ~10 program headers, that was ~30 wasted IPC bounces
+/// per spawn. Reading the table once keeps the producer/consumer wakeup count
+/// down and dominates spawn latency on TCG.
+fn read_program_headers(fd: i32, header: &[u8; ELF_HEADER_SIZE]) -> Result<Vec<u8>, i32> {
+    let phoff = read_u64(header, 32);
+    let phentsize = read_u16(header, 54);
+    let phnum = read_u16(header, 56);
+    if phnum == 0 || phnum > ELF_MAX_PROGRAM_HEADERS {
+        return Err(ENOEXEC);
+    }
+    if phentsize as usize != ELF_PROGRAM_HEADER_SIZE {
+        return Err(ENOEXEC);
+    }
+    let table_len = u64::from(phentsize)
+        .checked_mul(u64::from(phnum))
+        .ok_or(EOVERFLOW)?;
+    let table_end = phoff.checked_add(table_len).ok_or(EOVERFLOW)?;
+    if table_end > i64::MAX as u64 {
+        return Err(EOVERFLOW);
+    }
+    let mut buf = alloc::vec![0_u8; table_len as usize];
+    if !buf.is_empty() {
+        read_exact_at(fd, phoff, &mut buf)?;
+    }
+    Ok(buf)
+}
+
+fn program_header_at(phdrs: &[u8], index: u64) -> Result<&[u8], i32> {
+    let start = usize::try_from(index)
+        .map_err(|_| EOVERFLOW)?
+        .checked_mul(ELF_PROGRAM_HEADER_SIZE)
+        .ok_or(EOVERFLOW)?;
+    let end = start.checked_add(ELF_PROGRAM_HEADER_SIZE).ok_or(EOVERFLOW)?;
+    phdrs.get(start..end).ok_or(ENOEXEC)
+}
+
+fn validate_elf_fd(
+    fd: i32,
+    header: &[u8; ELF_HEADER_SIZE],
+    phdrs: &[u8],
+) -> Result<(), i32> {
     if header[4] != 2 || header[5] != 1 || header[6] != 1 {
         return Err(ENOEXEC);
     }
@@ -571,27 +616,14 @@ fn validate_elf_fd(fd: i32, header: &[u8; ELF_HEADER_SIZE]) -> Result<(), i32> {
         return Err(ENOEXEC);
     }
 
-    let phoff = read_u64(header, 32);
-    let phentsize = read_u16(header, 54);
-    let phnum = read_u16(header, 56);
-    if phnum == 0 || phnum > ELF_MAX_PROGRAM_HEADERS {
-        return Err(ENOEXEC);
-    }
-
-    let table_len = u64::from(phentsize)
-        .checked_mul(u64::from(phnum))
-        .ok_or(EOVERFLOW)?;
-    let table_end = phoff.checked_add(table_len).ok_or(EOVERFLOW)?;
-    if table_end > i64::MAX as u64 {
-        return Err(EOVERFLOW);
-    }
+    let phnum = read_u16(header, 56) as u64;
 
     let mut load_ranges = Vec::<(u64, u64)>::new();
     let mut saw_load = false;
     for index in 0..phnum {
+        let ph_slice = program_header_at(phdrs, index)?;
         let mut ph = [0_u8; ELF_PROGRAM_HEADER_SIZE];
-        let offset = phoff + u64::from(index) * u64::from(phentsize);
-        read_exact_at(fd, offset, &mut ph)?;
+        ph.copy_from_slice(ph_slice);
         let kind = read_u32(&ph, 0);
         let flags = read_u32(&ph, 4);
         if flags & !(ELF_PF_X | ELF_PF_W | ELF_PF_R) != 0 {
@@ -620,9 +652,10 @@ fn map_elf_segments_fd(
 ) -> Result<ElfMapResult, i32> {
     let mut header = [0_u8; ELF_HEADER_SIZE];
     read_exact_at(fd, 0, &mut header)?;
-    validate_elf_fd(fd, &header)?;
+    let phdrs = read_program_headers(fd, &header)?;
+    validate_elf_fd(fd, &header, &phdrs)?;
 
-    let load_bias = elf_load_bias_from_fd(fd, &header, dyn_load_offset)?;
+    let load_bias = elf_load_bias_from_phdrs(&header, &phdrs, dyn_load_offset)?;
     let phoff = read_u64(&header, 32);
     let e_entry = read_u64(&header, 24);
     let phentsize = read_u16(&header, 54) as u64;
@@ -632,14 +665,25 @@ fn map_elf_segments_fd(
 
     let mut max_loaded_end: u64 = load_bias;
     let mut interpreter_path = None::<String>;
+    let mut file_maps = Vec::<RustosProcMapFileBatchEntry>::new();
 
     for index in 0..phnum {
+        let ph_slice = program_header_at(&phdrs, index)?;
         let mut ph = [0_u8; ELF_PROGRAM_HEADER_SIZE];
-        let offset = phoff + index * phentsize;
-        read_exact_at(fd, offset, &mut ph)?;
+        ph.copy_from_slice(ph_slice);
         match read_u32(&ph, 0) {
             ELF_PT_LOAD => {
-                map_elf_load_segment(fd, prepare_handle, &ph, load_bias)?;
+                match elf_load_segment_mapping(fd, &ph, load_bias)? {
+                    ElfLoadMapping::File(entry) => file_maps.push(entry),
+                    ElfLoadMapping::Zeroed {
+                        target_addr,
+                        mem_len,
+                        flags,
+                    } => {
+                        flush_elf_file_map_batch(prepare_handle, &mut file_maps)?;
+                        map_elf_zeroed_segment(prepare_handle, target_addr, mem_len, flags)?;
+                    }
+                }
                 let vaddr = read_u64(&ph, 16);
                 let memsz = read_u64(&ph, 40);
                 let end = vaddr
@@ -654,6 +698,7 @@ fn map_elf_segments_fd(
             _ => {}
         }
     }
+    flush_elf_file_map_batch(prepare_handle, &mut file_maps)?;
 
     max_loaded_end = align_up(max_loaded_end, 4096)?;
 
@@ -703,22 +748,20 @@ fn map_elf_interpreter(path: &str, prepare_handle: u64) -> Result<ElfMapResult, 
     Ok(result)
 }
 
-fn elf_load_bias_from_fd(
-    fd: i32,
+fn elf_load_bias_from_phdrs(
     header: &[u8; ELF_HEADER_SIZE],
+    phdrs: &[u8],
     dyn_load_offset: u64,
 ) -> Result<u64, i32> {
     if read_u16(header, 16) == ELF_ET_EXEC {
         return Ok(0);
     }
-    let phoff = read_u64(header, 32);
-    let phentsize = read_u16(header, 54);
-    let phnum = read_u16(header, 56);
+    let phnum = read_u16(header, 56) as u64;
     let mut min_load_addr = u64::MAX;
     for index in 0..phnum {
+        let ph_slice = program_header_at(phdrs, index)?;
         let mut ph = [0_u8; ELF_PROGRAM_HEADER_SIZE];
-        let offset = phoff + u64::from(index) * u64::from(phentsize);
-        read_exact_at(fd, offset, &mut ph)?;
+        ph.copy_from_slice(ph_slice);
         if read_u32(&ph, 0) == ELF_PT_LOAD && read_u64(&ph, 40) != 0 {
             min_load_addr = min_load_addr.min(read_u64(&ph, 16) & !0xfff);
         }
@@ -732,12 +775,20 @@ fn elf_load_bias_from_fd(
         .ok_or(EOVERFLOW)
 }
 
-fn map_elf_load_segment(
+enum ElfLoadMapping {
+    File(RustosProcMapFileBatchEntry),
+    Zeroed {
+        target_addr: u64,
+        mem_len: u64,
+        flags: u64,
+    },
+}
+
+fn elf_load_segment_mapping(
     fd: i32,
-    prepare_handle: u64,
     ph: &[u8; ELF_PROGRAM_HEADER_SIZE],
     load_bias: u64,
-) -> Result<(), i32> {
+) -> Result<ElfLoadMapping, i32> {
     let segment_offset = read_u64(ph, 8);
     let segment_vaddr = read_u64(ph, 16);
     let file_size = read_u64(ph, 32);
@@ -752,22 +803,14 @@ fn map_elf_load_segment(
     let flags = proc_map_flags(read_u32(ph, 4));
 
     if file_size == 0 {
-        let args = RustosProcMapZeroedBrokerArgs {
-            prepare_handle,
+        return Ok(ElfLoadMapping::Zeroed {
             target_addr,
             mem_len,
             flags,
-            reserved0: 0,
-        };
-        let status = syscall1(
-            SYS_RUSTOS_PROC_MAP_ZEROED_BROKER,
-            (&args as *const RustosProcMapZeroedBrokerArgs) as u64,
-        );
-        return (status >= 0).then_some(()).ok_or((-status) as i32);
+        });
     }
 
-    let args = RustosProcMapFileBrokerArgs {
-        prepare_handle,
+    Ok(ElfLoadMapping::File(RustosProcMapFileBatchEntry {
         fd: fd as u64,
         file_offset,
         target_addr,
@@ -775,10 +818,49 @@ fn map_elf_load_segment(
         mem_len,
         flags,
         reserved0: 0,
+    }))
+}
+
+fn flush_elf_file_map_batch(
+    prepare_handle: u64,
+    file_maps: &mut Vec<RustosProcMapFileBatchEntry>,
+) -> Result<(), i32> {
+    for chunk in file_maps.chunks(PROC_BROKER_BATCH_CAPACITY) {
+        let mut args = RustosProcMapFileBatchBrokerArgs {
+            prepare_handle,
+            count: chunk.len() as u32,
+            ..RustosProcMapFileBatchBrokerArgs::default()
+        };
+        args.entries[..chunk.len()].copy_from_slice(chunk);
+        let status = syscall1(
+            SYS_RUSTOS_PROC_MAP_FILE_BATCH_BROKER,
+            (&args as *const RustosProcMapFileBatchBrokerArgs) as u64,
+        );
+        if status < 0 {
+            file_maps.clear();
+            return Err((-status) as i32);
+        }
+    }
+    file_maps.clear();
+    Ok(())
+}
+
+fn map_elf_zeroed_segment(
+    prepare_handle: u64,
+    target_addr: u64,
+    mem_len: u64,
+    flags: u64,
+) -> Result<(), i32> {
+    let args = RustosProcMapZeroedBrokerArgs {
+        prepare_handle,
+        target_addr,
+        mem_len,
+        flags,
+        reserved0: 0,
     };
     let status = syscall1(
-        SYS_RUSTOS_PROC_MAP_FILE_BROKER,
-        (&args as *const RustosProcMapFileBrokerArgs) as u64,
+        SYS_RUSTOS_PROC_MAP_ZEROED_BROKER,
+        (&args as *const RustosProcMapZeroedBrokerArgs) as u64,
     );
     (status >= 0).then_some(()).ok_or((-status) as i32)
 }

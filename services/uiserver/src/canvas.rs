@@ -255,33 +255,65 @@ impl<'a> SurfaceCanvas<'a> {
 
         let x_end = rect.x.saturating_add(rect.width);
         let y_end = rect.y.saturating_add(rect.height);
-        let mut x = rect.x;
-        while x < x_end {
-            self.fill_rect_alpha(
-                Rect {
-                    x,
-                    y: rect.y,
-                    width: 1,
-                    height: rect.height,
-                },
-                color,
-                alpha,
-            );
-            x = x.saturating_add(spacing);
+
+        // Vertical grid lines. The previous implementation called
+        // `fill_rect_alpha` per vertical strip, each of which produced a fresh
+        // 1-pixel slice per row that always fell below the SIMD threshold and
+        // re-entered the scalar blender. That was the dominant cost in the
+        // first-frame desktop refresh (~400 ms on TCG). Inline the blend here
+        // so each cell is a single pixel of per-pixel arithmetic with no slice
+        // bookkeeping or function-call cost in the inner loop.
+        let alpha32 = alpha as u32;
+        let inv_alpha32 = 255_u32.saturating_sub(alpha32);
+        let src_b = color & 0xff;
+        let src_g = (color >> 8) & 0xff;
+        let src_r = (color >> 16) & 0xff;
+        let blend_pixel = |dst: &mut u32| {
+            let cur = *dst;
+            let cur_b = cur & 0xff;
+            let cur_g = (cur >> 8) & 0xff;
+            let cur_r = (cur >> 16) & 0xff;
+            let out_b = (src_b * alpha32 + cur_b * inv_alpha32) / 255;
+            let out_g = (src_g * alpha32 + cur_g * inv_alpha32) / 255;
+            let out_r = (src_r * alpha32 + cur_r * inv_alpha32) / 255;
+            *dst = (out_r << 16) | (out_g << 8) | out_b;
+        };
+
+        for row in rect.y..y_end {
+            let Some(row_start) = row
+                .checked_mul(self.stride_pixels)
+                .and_then(|offset| offset.checked_add(rect.x))
+            else {
+                return;
+            };
+            let Some(row_pixels) =
+                self.pixels.get_mut(row_start..row_start.saturating_add(rect.width))
+            else {
+                return;
+            };
+            let mut x_offset = 0usize;
+            while x_offset < rect.width {
+                blend_pixel(&mut row_pixels[x_offset]);
+                x_offset = x_offset.saturating_add(spacing);
+            }
         }
 
         let mut y = rect.y;
         while y < y_end {
-            self.fill_rect_alpha(
-                Rect {
-                    x: rect.x,
-                    y,
-                    width: rect.width,
-                    height: 1,
-                },
-                color,
-                alpha,
-            );
+            let Some(row_start) = y
+                .checked_mul(self.stride_pixels)
+                .and_then(|offset| offset.checked_add(rect.x))
+            else {
+                return;
+            };
+            let Some(row_pixels) =
+                self.pixels.get_mut(row_start..row_start.saturating_add(rect.width))
+            else {
+                return;
+            };
+            for pixel in row_pixels.iter_mut() {
+                blend_pixel(pixel);
+            }
             y = y.saturating_add(spacing);
         }
     }

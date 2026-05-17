@@ -63,7 +63,7 @@ fn serve(endpoint: u64) {
         };
         if received < 0 {
             // Brief back-off (raw nanosleep, ~10 ms) before retrying.
-            errno::sleep_millis(10);
+            errno::sleep_millis(1);
             continue;
         }
 

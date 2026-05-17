@@ -77,7 +77,7 @@ fn serve(endpoint: u64) {
             )
         };
         if received < 0 {
-            rustos_svc_runtime::syscall::sleep_millis(10);
+            rustos_svc_runtime::syscall::sleep_millis(1);
             continue;
         }
 

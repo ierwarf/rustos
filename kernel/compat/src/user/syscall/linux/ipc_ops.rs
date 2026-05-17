@@ -317,15 +317,27 @@ pub(super) fn syscall_linux_rustos_ipc_recv(
                 let Some(task_id) = multitask::current_task_id() else {
                     return linux_errno(LINUX_EINVAL);
                 };
-                if let Err(err) =
-                    kernel_ipc_runtime::api::add_endpoint_receiver_waiter(endpoint, task_id)
-                {
-                    return linux_errno(ipc_error_to_linux_errno(err));
-                }
-                if !multitask::block_current_task() {
+                if !multitask::arm_block_current_task() {
                     return linux_errno(LINUX_EINVAL);
                 }
-                multitask::yield_now();
+                let pending = match kernel_ipc_runtime::api::add_endpoint_receiver_waiter(
+                    endpoint, task_id,
+                ) {
+                    Ok(pending) => pending,
+                    Err(err) => {
+                        let _ = multitask::commit_block_current_task();
+                        return linux_errno(ipc_error_to_linux_errno(err));
+                    }
+                };
+                if pending {
+                    let _ = multitask::commit_block_current_task();
+                    continue;
+                }
+                match multitask::commit_block_current_task() {
+                    Some(true) => multitask::yield_now(),
+                    Some(false) => {}
+                    None => return linux_errno(LINUX_EINVAL),
+                }
             }
             Err(err) => return linux_errno(ipc_error_to_linux_errno(err)),
         }
@@ -349,6 +361,10 @@ pub(super) fn syscall_linux_rustos_ipc_reply(
         Err(err) => return linux_errno(ipc_error_to_linux_errno(err)),
     };
     let _ = multitask::wake_task(task_id);
+    // Direct hand-back to the caller: the service is about to wait on its
+    // endpoint again, so donate the remaining quantum to the original caller
+    // instead of round-robining away from a freshly-completed reply.
+    multitask::set_next_pick_hint(task_id);
     0
 }
 
@@ -512,15 +528,27 @@ pub(super) fn syscall_linux_rustos_ipc_recv_with_handles(args_ptr: u64) -> u64 {
                 let Some(task_id) = multitask::current_task_id() else {
                     return linux_errno(LINUX_EINVAL);
                 };
-                if let Err(err) =
-                    kernel_ipc_runtime::api::add_endpoint_receiver_waiter(endpoint, task_id)
-                {
-                    return linux_errno(ipc_error_to_linux_errno(err));
-                }
-                if !multitask::block_current_task() {
+                if !multitask::arm_block_current_task() {
                     return linux_errno(LINUX_EINVAL);
                 }
-                multitask::yield_now();
+                let pending = match kernel_ipc_runtime::api::add_endpoint_receiver_waiter(
+                    endpoint, task_id,
+                ) {
+                    Ok(pending) => pending,
+                    Err(err) => {
+                        let _ = multitask::commit_block_current_task();
+                        return linux_errno(ipc_error_to_linux_errno(err));
+                    }
+                };
+                if pending {
+                    let _ = multitask::commit_block_current_task();
+                    continue;
+                }
+                match multitask::commit_block_current_task() {
+                    Some(true) => multitask::yield_now(),
+                    Some(false) => {}
+                    None => return linux_errno(LINUX_EINVAL),
+                }
             }
             Err(err) => return linux_errno(ipc_error_to_linux_errno(err)),
         }
@@ -558,6 +586,7 @@ pub(super) fn syscall_linux_rustos_ipc_reply_with_handles(args_ptr: u64) -> u64 
         }
     };
     let _ = multitask::wake_task(task_id);
+    multitask::set_next_pick_hint(task_id);
     0
 }
 
@@ -605,8 +634,14 @@ fn enqueue_call_and_wake_with_handles(
         attached_handles,
     )
     .map_err(ipc_error_to_linux_errno)?;
-    if let Some(task_id) = receiver_to_wake {
-        let _ = multitask::wake_task(task_id);
+    if let Some(receiver_task_id) = receiver_to_wake {
+        let _ = multitask::wake_task(receiver_task_id);
+        // L4-style direct switch: hint the scheduler to run the receiver next,
+        // so the caller's subsequent `yield_now` in `wait_for_reply` immediately
+        // hands the CPU to the service task. Without this, the receiver waits
+        // for a full round-robin trip — which on TCG dominates per-IPC latency
+        // and balloons service-spawn into multiple seconds.
+        multitask::set_next_pick_hint(receiver_task_id);
     }
     Ok(reply)
 }
@@ -626,10 +661,32 @@ fn wait_for_reply_with_handle_limit(
         ) {
             Ok(Some(response)) => return Ok(response),
             Ok(None) => {
-                if !multitask::block_current_task() {
+                if !multitask::arm_block_current_task() {
                     return Err(LINUX_EINVAL);
                 }
-                multitask::yield_now();
+                // Re-poll after arming. If the replier completed the response between our
+                // first take and arming, the wake_task call landed before arm_block, so
+                // wake_armed would be set but no further wake arrives; re-checking the
+                // queue here picks up that response without sleeping.
+                match kernel_ipc_runtime::api::take_endpoint_response_with_handle_limit(
+                    reply,
+                    handle_capacity,
+                ) {
+                    Ok(Some(response)) => {
+                        let _ = multitask::commit_block_current_task();
+                        return Ok(response);
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        let _ = multitask::commit_block_current_task();
+                        return Err(ipc_error_to_linux_errno(err));
+                    }
+                }
+                match multitask::commit_block_current_task() {
+                    Some(true) => multitask::yield_now(),
+                    Some(false) => {}
+                    None => return Err(LINUX_EINVAL),
+                }
             }
             Err(err) => return Err(ipc_error_to_linux_errno(err)),
         }

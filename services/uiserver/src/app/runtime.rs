@@ -4,7 +4,9 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::vec::Vec;
 
-use super::{AppState, ConsoleWindow, DragTarget, CONSOLE_POLL_SLEEP, MAX_RUNNING_PROGRAMS};
+use super::{
+    AppState, ConsoleWindow, DragTarget, VisualUpdate, CONSOLE_POLL_SLEEP, MAX_RUNNING_PROGRAMS,
+};
 use crate::canvas;
 use crate::render::{self, default_console_window_rect, taskbar_slot_rect};
 use crate::runtime_sync::{runtime_program_is_hidden, runtime_program_title, RuntimeState};
@@ -100,44 +102,47 @@ fn collect_console_refresh(
 }
 
 impl AppState {
-    pub(crate) fn apply_runtime_state(&mut self, runtime_state: &mut RuntimeState) -> canvas::Rect {
+    pub(crate) fn apply_runtime_state(&mut self, runtime_state: &mut RuntimeState) -> VisualUpdate {
         if !runtime_state.dirty {
-            return canvas::Rect::empty();
+            return VisualUpdate::default();
         }
 
-        let dirty_rect = self.sync_windows_from_runtime(
+        let mut update = self.sync_windows_from_runtime(
             &runtime_state.running_programs[..runtime_state
                 .running_program_count
                 .min(MAX_RUNNING_PROGRAMS)],
         );
         runtime_state.dirty = false;
-        dirty_rect.union(self.focused_window_reorder_dirty_rect())
+        update.add_partial_rect(self.focused_window_reorder_dirty_rect());
+        update
     }
 
     pub(crate) fn apply_console_refresh(
         &mut self,
         refresh: ConsoleRefresh,
-    ) -> Result<canvas::Rect, i32> {
+    ) -> Result<VisualUpdate, i32> {
         let sessions = refresh.sessions.as_slice();
         let before_dirty = self
             .console_stack_dirty_rect()
             .union(self.taskbar_dirty_rect());
-        let mut dirty_rect = canvas::Rect::empty();
+        let mut update = VisualUpdate::default();
         let pruned = self.prune_windows(|session_handle| {
             sessions
                 .iter()
                 .any(|session| session.session_handle == session_handle)
         });
-        let added = self.add_missing_console_windows(sessions);
-        if pruned || added {
-            dirty_rect = dirty_rect
-                .union(before_dirty)
-                .union(self.console_stack_dirty_rect())
-                .union(self.taskbar_dirty_rect());
+        let added_update = self.add_missing_console_windows(sessions);
+        if pruned {
+            update.add_partial_rect(before_dirty);
+            update.add_partial_rect(self.console_stack_dirty_rect());
+            update.add_partial_rect(self.taskbar_dirty_rect());
+        } else if !added_update.is_empty() {
+            update.absorb(added_update);
+            update.add_partial_rect(self.taskbar_dirty_rect());
         }
         self.clamp_console_snapshot_index();
-        dirty_rect =
-            dirty_rect.union(self.reconcile_console_focus(refresh.state.focused_session_handle)?);
+        update
+            .add_partial_rect(self.reconcile_console_focus(refresh.state.focused_session_handle)?);
 
         let taskbar_dirty_rect = self.taskbar_dirty_rect();
         for window in self.console_windows.iter_mut() {
@@ -151,9 +156,8 @@ impl AppState {
             if !session_title.is_empty() && window.title != session_title {
                 window.title = session_title;
                 window.invalidate_surface();
-                dirty_rect = dirty_rect
-                    .union(crate::render::console_window_dirty_rect(window.frame))
-                    .union(taskbar_dirty_rect);
+                update.add_partial_rect(crate::render::console_window_dirty_rect(window.frame));
+                update.add_partial_rect(taskbar_dirty_rect);
             }
             if session.output_generation == window.output_generation {
                 continue;
@@ -172,22 +176,21 @@ impl AppState {
                     .extend_from_slice(output.bytes.as_slice());
                 window.terminal_dirty = true;
                 window.invalidate_surface();
-                dirty_rect =
-                    dirty_rect.union(crate::render::console_window_dirty_rect(window.frame));
+                update.add_partial_rect(crate::render::console_window_dirty_rect(window.frame));
             }
             window.output_generation = output.output_generation;
         }
 
-        Ok(dirty_rect)
+        Ok(update)
     }
 
-    fn add_missing_console_windows(&mut self, sessions: &[ConsoleSessionInfo]) -> bool {
+    fn add_missing_console_windows(&mut self, sessions: &[ConsoleSessionInfo]) -> VisualUpdate {
         let mut known_sessions = self
             .console_windows
             .iter()
             .map(|window| window.session_handle)
             .collect::<Vec<_>>();
-        let mut added = false;
+        let mut update = VisualUpdate::default();
 
         for session in sessions {
             let session_handle = session.session_handle;
@@ -198,27 +201,29 @@ impl AppState {
                 continue;
             }
 
+            let frame = default_console_window_rect(
+                self.display.width,
+                self.display.height,
+                self.console_windows.len(),
+            );
             self.console_windows.push(ConsoleWindow::new(
                 session_handle,
                 console_session_title(session),
-                default_console_window_rect(
-                    self.display.width,
-                    self.display.height,
-                    self.console_windows.len(),
-                ),
+                frame,
                 0,
             ));
             known_sessions.push(session_handle);
-            added = true;
+            update.add_partial_rect(crate::render::console_window_dirty_rect(frame));
         }
 
-        added
+        update
     }
 
-    fn sync_windows_from_runtime(&mut self, programs: &[RuntimeRunningProgram]) -> canvas::Rect {
+    fn sync_windows_from_runtime(&mut self, programs: &[RuntimeRunningProgram]) -> VisualUpdate {
         let before_dirty = self
             .console_stack_dirty_rect()
             .union(self.taskbar_dirty_rect());
+        let taskbar_dirty_rect = self.taskbar_dirty_rect();
         self.closing_console_sessions.retain(|session_handle| {
             programs
                 .iter()
@@ -226,23 +231,24 @@ impl AppState {
         });
         let existing = std::mem::take(&mut self.console_windows);
         let mut next = Vec::with_capacity(programs.len());
-        let mut changed = false;
+        let mut update = VisualUpdate::default();
+        let mut topology_changed = false;
         let mut kept_sessions = Vec::with_capacity(programs.len());
 
         for mut window in existing {
             if self.is_console_session_closing(window.session_handle) {
-                changed = true;
+                topology_changed = true;
                 continue;
             }
             let Some(program) = programs
                 .iter()
                 .find(|program| program.session_handle == window.session_handle)
             else {
-                changed = true;
+                topology_changed = true;
                 continue;
             };
             if runtime_program_is_hidden(program) || program.session_handle == 0 {
-                changed = true;
+                topology_changed = true;
                 continue;
             }
 
@@ -250,7 +256,8 @@ impl AppState {
             if window.title != new_title {
                 window.title = new_title;
                 window.invalidate_surface();
-                changed = true;
+                update.add_partial_rect(crate::render::console_window_dirty_rect(window.frame));
+                update.add_partial_rect(taskbar_dirty_rect);
             }
             kept_sessions.push(window.session_handle);
             next.push(window);
@@ -265,13 +272,16 @@ impl AppState {
                 continue;
             }
 
+            let frame =
+                default_console_window_rect(self.display.width, self.display.height, next.len());
             next.push(ConsoleWindow::new(
                 program.session_handle,
                 runtime_program_title(program),
-                default_console_window_rect(self.display.width, self.display.height, next.len()),
+                frame,
                 0,
             ));
-            changed = true;
+            update.add_partial_rect(crate::render::console_window_dirty_rect(frame));
+            update.add_partial_rect(taskbar_dirty_rect);
         }
 
         if let Some(DragTarget::Console(session_handle)) = self.dragging_window {
@@ -280,7 +290,7 @@ impl AppState {
                 .all(|window| window.session_handle != session_handle)
             {
                 self.dragging_window = None;
-                changed = true;
+                topology_changed = true;
             }
         }
 
@@ -290,17 +300,18 @@ impl AppState {
         {
             if self.focused_session_handle != 0 {
                 self.focused_session_handle = 0;
-                changed = true;
+                topology_changed = true;
             }
         }
 
         self.console_windows = next;
-        if changed {
-            before_dirty
-                .union(self.console_stack_dirty_rect())
-                .union(self.taskbar_dirty_rect())
+        if topology_changed {
+            let mut update = VisualUpdate::partial(before_dirty);
+            update.add_partial_rect(self.console_stack_dirty_rect());
+            update.add_partial_rect(self.taskbar_dirty_rect());
+            update
         } else {
-            canvas::Rect::empty()
+            update
         }
     }
 
@@ -337,11 +348,14 @@ impl AppState {
             0
         };
 
-        let mut dirty_rect = self
-            .window_rect_for_session(previous_focused)
-            .union(self.taskbar_slot_rect_for_session(previous_focused))
-            .union(self.taskbar_slot_rect_for_session(self.focused_session_handle))
-            .union(self.window_rect_for_session(self.focused_session_handle));
+        let mut dirty_rect = if previous_focused == 0 {
+            self.window_rect_for_session(self.focused_session_handle)
+        } else {
+            self.window_rect_for_session(previous_focused)
+                .union(self.taskbar_slot_rect_for_session(previous_focused))
+                .union(self.taskbar_slot_rect_for_session(self.focused_session_handle))
+                .union(self.window_rect_for_session(self.focused_session_handle))
+        };
         while self.focused_session_handle == 0 && !self.console_windows.is_empty() {
             let Some(fallback_session) = self
                 .console_windows
@@ -355,9 +369,11 @@ impl AppState {
             match console_set_focus(self.console_fd.as_raw_fd(), fallback_session) {
                 Ok(()) => {
                     self.focused_session_handle = fallback_session;
-                    dirty_rect = dirty_rect
-                        .union(self.window_rect_for_session(fallback_session))
-                        .union(self.taskbar_slot_rect_for_session(fallback_session));
+                    dirty_rect = dirty_rect.union(self.window_rect_for_session(fallback_session));
+                    if previous_focused != 0 {
+                        dirty_rect =
+                            dirty_rect.union(self.taskbar_slot_rect_for_session(fallback_session));
+                    }
                 }
                 Err(err)
                     if matches!(
@@ -615,7 +631,6 @@ impl AppState {
                 .union(self.taskbar_dirty_rect())
         } else {
             self.window_rect_for_session(session_handle)
-                .union(self.taskbar_slot_rect_for_session(session_handle))
         }
     }
 }

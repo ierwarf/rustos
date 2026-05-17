@@ -6,6 +6,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,21 +21,19 @@ use rustos_user_abi::console::{
     ConsoleSetFocusRequest, ConsoleSetSessionStateRequest,
 };
 use rustos_user_abi::syscall::{
-    LoaderSpawnRequest, LoaderSpawnResponse, IPC_SERVICE_DEVMGRD, IPC_SERVICE_LOADERD,
-    LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
-    LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, SYS_RUSTOS_IPC_CALL,
-    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
+    LoaderSpawnRequest, LoaderSpawnResponse, IPC_SERVICE_LOADERD, LOADER_OP_SPAWN_EXEC,
+    LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES,
+    LOADER_SPAWN_EXEC_PATH_CAPACITY, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
 };
 
 const DEFAULT_USER_TASK_WEIGHT_MICROS: u64 = 100;
-const UI_SERVER_TASK_WEIGHT_MICROS: u64 = 1000;
+const MIN_EFFECTIVE_TASK_WEIGHT_MICROS: u64 = 1_000;
+const UI_SERVER_TASK_WEIGHT_MICROS: u64 = 2_000;
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const RETRY_BACKOFF: Duration = Duration::from_millis(100);
 const SERVICE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-const DEVICE_POLICY_READY_TIMEOUT: Duration = Duration::from_secs(5);
-const DEVICE_POLICY_READY_POLL: Duration = Duration::from_millis(1);
 const MAX_RUNTIME_CLIENTS_PER_TICK: usize = 8;
-const MAX_POLICY_LAUNCH_ATTEMPTS_PER_TICK: usize = 4;
+const MAX_POLICY_LAUNCH_ATTEMPTS_PER_TICK: usize = 1;
 const PROTOCOL_VERSION: u16 = 1;
 const OP_SNAPSHOT_RUNNING_PROGRAMS: u16 = 1;
 const OP_REQUEST_LAUNCH_PATH: u16 = 2;
@@ -150,6 +149,12 @@ struct BrokerState {
     launch_catalog_loaded: bool,
 }
 
+struct LaunchCatalog {
+    programs: BTreeMap<String, ProgramMetadata>,
+    launch_entries: Vec<LaunchEntry>,
+    elapsed_ms: u128,
+}
+
 fn boot_line(message: &str) {
     if option_env!("RUSTOS_LOGGING_BOOT_TRACE_ENABLED") != Some("true") {
         return;
@@ -187,12 +192,7 @@ fn main() {
         ui_ready: false,
         launch_catalog_loaded: false,
     };
-    // Don't gate uiserver bootstrap on devmgrd being fully online. The uiserver
-    // opens device handles itself and will retry/wait inside its own init loop.
-    // Blocking here serialises devmgrd's glibc bring-up with uiserver's, adding
-    // 2-3 seconds to boot for no functional benefit.
-    let _device_policy_ready =
-        wait_for_service_endpoint(IPC_SERVICE_DEVMGRD, DEVICE_POLICY_READY_TIMEOUT);
+    let mut launch_catalog = None::<Receiver<LaunchCatalog>>;
     stderr_line("runtimed: bootstrap ui begin");
     boot_line("runtimed: bootstrap ui begin");
     if let Err(err) = bootstrap_ui_server(&mut state) {
@@ -210,7 +210,13 @@ fn main() {
         let mut did_work = false;
         did_work |= reap_children(&mut state);
         did_work |= service_listener(&listener, &mut state);
-        did_work |= maybe_load_launch_catalog(&mut state);
+        if state.ui_ready && !state.launch_catalog_loaded && launch_catalog.is_none() {
+            launch_catalog = Some(start_launch_catalog_loader());
+            did_work = true;
+        }
+        if let Some(receiver) = launch_catalog.as_ref() {
+            did_work |= receive_launch_catalog(&mut state, receiver);
+        }
         did_work |= ensure_policy_launches(&mut state);
         if did_work {
             continue;
@@ -219,38 +225,50 @@ fn main() {
     }
 }
 
-fn maybe_load_launch_catalog(state: &mut BrokerState) -> bool {
+fn start_launch_catalog_loader() -> Receiver<LaunchCatalog> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        boot_line("runtimed: launch catalog load begin");
+        let started_at = Instant::now();
+        let (programs, launch_entries) = load_launch_catalog();
+        let elapsed_ms = started_at.elapsed().as_millis();
+        let _ = sender.send(LaunchCatalog {
+            programs,
+            launch_entries,
+            elapsed_ms,
+        });
+        boot_line("runtimed: launch catalog load done");
+    });
+    receiver
+}
+
+fn receive_launch_catalog(state: &mut BrokerState, receiver: &Receiver<LaunchCatalog>) -> bool {
     if state.launch_catalog_loaded {
         return false;
     }
-    if !state.ui_ready {
+    let Ok(catalog) = receiver.try_recv() else {
         return false;
-    }
-
-    boot_line("runtimed: launch catalog load begin");
-    let started_at = Instant::now();
-    let (programs, launch_entries) = load_launch_catalog();
+    };
     observability_client::info!(
         "runtimed",
         service,
         "launch catalog summary programs={} policies={} elapsed_ms={}",
-        programs.len(),
-        launch_entries.len(),
-        started_at.elapsed().as_millis()
+        catalog.programs.len(),
+        catalog.launch_entries.len(),
+        catalog.elapsed_ms
     );
     boot_line(
         format!(
             "runtimed: launch catalog summary programs={} policies={} elapsed_ms={}",
-            programs.len(),
-            launch_entries.len(),
-            started_at.elapsed().as_millis()
+            catalog.programs.len(),
+            catalog.launch_entries.len(),
+            catalog.elapsed_ms
         )
         .as_str(),
     );
-    state.programs = programs;
-    state.launch_entries = launch_entries;
+    state.programs = catalog.programs;
+    state.launch_entries = catalog.launch_entries;
     state.launch_catalog_loaded = true;
-    boot_line("runtimed: launch catalog load done");
     true
 }
 
@@ -993,24 +1011,12 @@ fn copy_cstring_blob(values: &[CString], dest: &mut [u8], capacity: usize) -> Re
 }
 
 fn effective_task_weight_micros(weight_micros: u64) -> u64 {
-    if weight_micros == 0 {
+    let requested = if weight_micros == 0 {
         DEFAULT_USER_TASK_WEIGHT_MICROS
     } else {
         weight_micros
-    }
-}
-
-fn wait_for_service_endpoint(service_id: u64, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if lookup_service_endpoint(service_id) > 0 {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        thread::sleep(DEVICE_POLICY_READY_POLL);
-    }
+    };
+    requested.max(MIN_EFFECTIVE_TASK_WEIGHT_MICROS)
 }
 
 fn lookup_service_endpoint(service_id: u64) -> i64 {
