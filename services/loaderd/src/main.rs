@@ -402,28 +402,44 @@ fn set_linux_runtime_broker(prepare_handle: u64, result: &ElfMapResult) -> Resul
     (status >= 0).then_some(()).ok_or((-status) as i32)
 }
 
+// 256 KiB per read amortizes the per-syscall IPC round-trip to vfsd and the
+// underlying ahci read. The previous 4 KiB chunks turned a single libc load
+// into ~500 individual storage commands, each of which paid the kernel/vfsd
+// crossing and AHCI completion latency.
+const ELF_READ_CHUNK_BYTES: usize = 256 * 1024;
+
 fn read_fd_to_vec(fd: i32) -> Result<Vec<u8>, i32> {
-    let mut out = Vec::new();
+    let mut out: Vec<u8> = Vec::with_capacity(ELF_READ_CHUNK_BYTES);
     let mut offset = 0_u64;
     loop {
-        let mut chunk = [0_u8; 4096];
+        let want = ELF_READ_CHUNK_BYTES;
+        out.reserve(want);
+        let cur_len = out.len();
+        unsafe {
+            out.set_len(cur_len + want);
+        }
         let read = syscall4(
             SYS_PREAD64,
             fd as u64,
-            chunk.as_mut_ptr() as u64,
-            chunk.len() as u64,
+            out.as_mut_ptr().wrapping_add(cur_len) as u64,
+            want as u64,
             offset,
         );
         if read < 0 {
+            unsafe {
+                out.set_len(cur_len);
+            }
             return Err((-read) as i32);
+        }
+        let read = read as usize;
+        unsafe {
+            out.set_len(cur_len + read);
         }
         if read == 0 {
             break;
         }
-        let read = read as usize;
-        out.extend_from_slice(&chunk[..read]);
         offset = offset.checked_add(read as u64).ok_or(EOVERFLOW)?;
-        if read < chunk.len() {
+        if read < want {
             break;
         }
     }
@@ -2270,32 +2286,52 @@ fn load_system_dll_registry() -> Result<Vec<SystemDllEntry>, i32> {
 
 fn read_file_to_vec(path: &str) -> Result<Vec<u8>, i32> {
     let fd = open_readonly(path)?;
-    let mut out = Vec::new();
+    let mut out: Vec<u8> = Vec::with_capacity(ELF_READ_CHUNK_BYTES);
     let mut offset = 0_u64;
+    let mut error: Option<i32> = None;
     loop {
-        let mut chunk = [0_u8; 4096];
+        let want = ELF_READ_CHUNK_BYTES;
+        out.reserve(want);
+        let cur_len = out.len();
+        unsafe {
+            out.set_len(cur_len + want);
+        }
         let read = syscall4(
             SYS_PREAD64,
             fd as u64,
-            chunk.as_mut_ptr() as u64,
-            chunk.len() as u64,
+            out.as_mut_ptr().wrapping_add(cur_len) as u64,
+            want as u64,
             offset,
         );
         if read < 0 {
-            let _ = syscall1(SYS_CLOSE, fd as u64);
-            return Err((-read) as i32);
+            unsafe {
+                out.set_len(cur_len);
+            }
+            error = Some((-read) as i32);
+            break;
+        }
+        let read = read as usize;
+        unsafe {
+            out.set_len(cur_len + read);
         }
         if read == 0 {
             break;
         }
-        let read = read as usize;
-        out.extend_from_slice(&chunk[..read]);
-        offset = offset.checked_add(read as u64).ok_or(EOVERFLOW)?;
-        if read < chunk.len() {
+        match offset.checked_add(read as u64) {
+            Some(new_offset) => offset = new_offset,
+            None => {
+                error = Some(EOVERFLOW);
+                break;
+            }
+        }
+        if read < want {
             break;
         }
     }
     let close_status = syscall1(SYS_CLOSE, fd as u64);
+    if let Some(err) = error {
+        return Err(err);
+    }
     if close_status < 0 {
         return Err((-close_status) as i32);
     }

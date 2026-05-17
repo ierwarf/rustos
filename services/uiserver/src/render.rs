@@ -663,29 +663,29 @@ fn refresh_desktop_surface(state: &mut AppState) {
     if resized {
         state.desktop_cache.width = width;
         state.desktop_cache.height = height;
-        state
-            .desktop_cache
-            .pixels
-            .resize(width.saturating_mul(height), 0);
-        state.desktop_cache.valid = false;
+        let total = width.saturating_mul(height);
+        state.desktop_cache.pixels.resize(total, 0);
+        state.desktop_cache.background_pixels.resize(total, 0);
+        state.desktop_cache.invalidate_all();
     }
-    if state.desktop_cache.valid {
+    if state.desktop_cache.fully_valid() {
         return;
     }
 
-    {
+    let screen = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+
+    if !state.desktop_cache.background_valid {
         let mut canvas = SurfaceCanvas::new(
-            state.desktop_cache.pixels.as_mut_slice(),
+            state.desktop_cache.background_pixels.as_mut_slice(),
             width as u32,
             height as u32,
             width,
         );
-        let screen = Rect {
-            x: 0,
-            y: 0,
-            width,
-            height,
-        };
         canvas.fill_rect(screen, COLOR_DESKTOP_BG_BASE);
         canvas.fill_rect_alpha(
             Rect {
@@ -709,9 +709,49 @@ fn refresh_desktop_surface(state: &mut AppState) {
         );
         canvas.fill_pattern_grid(screen, 28, COLOR_GRID, 22);
         canvas.fill_pattern_grid(screen, 112, COLOR_GRID_MAJOR, 34);
+        state.desktop_cache.background_valid = true;
+        // Background changed → composite pixels are now stale, even if
+        // chrome_valid was true (e.g. on first render).
+        state.desktop_cache.chrome_valid = false;
+    }
 
+    if !state.desktop_cache.chrome_valid {
+        let total = state.desktop_cache.background_pixels.len();
+        if state.desktop_cache.pixels.len() != total {
+            state.desktop_cache.pixels.resize(total, 0);
+        }
+
+        // Restore the chrome strips from clean background pixels so the new
+        // chrome paints over a fresh substrate instead of accumulating alpha.
         let topbar = topbar_rail_rect(width);
         let taskbar = taskbar_rail_rect(width, height);
+        let chrome_strips: [Rect; 2] = [
+            shadow_bounds(topbar, 2),
+            shadow_bounds(taskbar, 2),
+        ];
+        for strip in chrome_strips {
+            let strip = strip.intersect(screen);
+            if strip.is_empty() {
+                continue;
+            }
+            for row in strip.y..strip.y.saturating_add(strip.height) {
+                let row_start = row.saturating_mul(width).saturating_add(strip.x);
+                let row_end = row_start.saturating_add(strip.width);
+                if row_end > total {
+                    continue;
+                }
+                state.desktop_cache.pixels[row_start..row_end]
+                    .copy_from_slice(&state.desktop_cache.background_pixels[row_start..row_end]);
+            }
+        }
+
+        let mut canvas = SurfaceCanvas::new(
+            state.desktop_cache.pixels.as_mut_slice(),
+            width as u32,
+            height as u32,
+            width,
+        );
+
         draw_rail_panel(&mut canvas, topbar);
         draw_rail_panel(&mut canvas, taskbar);
 
@@ -725,8 +765,8 @@ fn refresh_desktop_surface(state: &mut AppState) {
                 program.title.as_str(),
             );
         }
+        state.desktop_cache.chrome_valid = true;
     }
-    state.desktop_cache.valid = true;
 }
 
 fn draw_brand_block(canvas: &mut SurfaceCanvas<'_>, topbar: Rect) {

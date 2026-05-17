@@ -70,8 +70,14 @@ const ATA_CMD_FLUSH_CACHE_EXT: u8 = 0xea;
 const COMMAND_FIS_DWORDS: u16 = 5;
 const COMMAND_LIST_BYTES: usize = 1024;
 const RECEIVED_FIS_BYTES: usize = 256;
+// Each PRDT entry can describe up to 4 MiB. We pack 16 of them so a single
+// AHCI command can move 1 MiB (=2048 sectors) per round trip, fits comfortably
+// inside the 16-bit LBA48 sector count, and stays page-aligned. Boot reads
+// previously split every 16 MiB volume into 256 tiny 64 KiB commands.
+const PRDT_ENTRIES: usize = 16;
+const DMA_BUFFER_BYTES: usize = 1024 * 1024;
 const COMMAND_TABLE_BYTES: usize = 4096;
-const DMA_BUFFER_BYTES: usize = 64 * 1024;
+const PRDT_ENTRY_MAX_BYTES: usize = 4 * 1024 * 1024;
 const COMMAND_SLOT: u32 = 0;
 const AHCI_WAIT_SPINS: usize = 1_000_000;
 const LOGICAL_BLOCK_SIZE: usize = 512;
@@ -102,7 +108,7 @@ struct AhciCommandTable {
     cfis: [u8; 64],
     acmd: [u8; 16],
     reserved: [u8; 48],
-    prdt: [AhciPrdtEntry; 1],
+    prdt: [AhciPrdtEntry; PRDT_ENTRIES],
 }
 
 struct AhciController {
@@ -651,27 +657,43 @@ fn prepare_port_command(
         return Err(DiskIoError::Timeout);
     }
 
-    unsafe {
-        ptr::write_bytes(runtime.command_list_cpu, 0, COMMAND_LIST_BYTES);
-        ptr::write_bytes(
-            runtime.command_table_cpu.cast::<u8>(),
-            0,
-            COMMAND_TABLE_BYTES,
-        );
-    }
-
+    // Only the single command-list slot and FIS fields we touch matter to the
+    // controller. Avoid the per-command 5 KiB+ memzero that used to dwarf the
+    // useful work for small transfers.
     let header = runtime.command_list_cpu.cast::<AhciCommandHeader>();
     let fis_len_flags = COMMAND_FIS_DWORDS | if is_write { 1 << 6 } else { 0 };
+    let table = runtime.command_table_cpu;
+    let sector_count = if byte_count == 0 {
+        0
+    } else {
+        if byte_count % LOGICAL_BLOCK_SIZE != 0 || byte_count > DMA_BUFFER_BYTES {
+            return Err(DiskIoError::InvalidInput);
+        }
+        byte_count / LOGICAL_BLOCK_SIZE
+    };
+    if sector_count > u16::MAX as usize {
+        return Err(DiskIoError::InvalidInput);
+    }
+    let prdt_used = if byte_count == 0 {
+        0
+    } else {
+        byte_count.div_ceil(PRDT_ENTRY_MAX_BYTES)
+    };
+    if prdt_used > PRDT_ENTRIES {
+        return Err(DiskIoError::InvalidInput);
+    }
+
     unsafe {
         (*header).flags = fis_len_flags;
-        (*header).prdtl = if byte_count == 0 { 0 } else { 1 };
+        (*header).prdtl = prdt_used as u16;
         (*header).prdbc = 0;
         (*header).ctba = runtime.command_table_dma as u32;
         (*header).ctbau = (runtime.command_table_dma >> 32) as u32;
-    }
+        // Zero reserved tail of the header so a stale value can't be misread.
+        for slot in (*header).reserved.iter_mut() {
+            *slot = 0;
+        }
 
-    let table = runtime.command_table_cpu;
-    unsafe {
         (*table).cfis[0] = FIS_TYPE_REG_H2D;
         (*table).cfis[1] = 1 << 7;
         (*table).cfis[2] = command;
@@ -691,27 +713,33 @@ fn prepare_port_command(
             (*table).cfis[10] = ((lba >> 40) & 0xff) as u8;
         }
         (*table).cfis[11] = 0;
-        let sector_count = if byte_count == 0 {
-            0
-        } else {
-            if byte_count % LOGICAL_BLOCK_SIZE != 0 || byte_count > DMA_BUFFER_BYTES {
-                return Err(DiskIoError::InvalidInput);
-            }
-            byte_count / LOGICAL_BLOCK_SIZE
-        };
-        if sector_count > u16::MAX as usize {
-            return Err(DiskIoError::InvalidInput);
-        }
         (*table).cfis[12] = (sector_count & 0xff) as u8;
         (*table).cfis[13] = ((sector_count >> 8) & 0xff) as u8;
+        // Zero the unused upper FIS DWORDs and the ACMD/reserved area used by
+        // ATAPI so spurious bytes from the previous command never leak in.
+        for slot in (*table).cfis[14..].iter_mut() {
+            *slot = 0;
+        }
 
         if byte_count != 0 {
-            (*table).prdt[0].dba = runtime.dma_buffer_dma as u32;
-            (*table).prdt[0].dbau = (runtime.dma_buffer_dma >> 32) as u32;
-            (*table).prdt[0].reserved = 0;
-            (*table).prdt[0].dbc = ((byte_count - 1) as u32) | (1 << 31);
+            let mut remaining = byte_count;
+            let mut offset = 0usize;
+            for index in 0..prdt_used {
+                let chunk = remaining.min(PRDT_ENTRY_MAX_BYTES);
+                let dma = runtime.dma_buffer_dma + offset as u64;
+                (*table).prdt[index].dba = dma as u32;
+                (*table).prdt[index].dbau = (dma >> 32) as u32;
+                (*table).prdt[index].reserved = 0;
+                // Set IOC only on the final descriptor — keep wait cost flat
+                // regardless of how many PRDT entries we populated.
+                let ioc_bit = if index + 1 == prdt_used { 1 << 31 } else { 0 };
+                (*table).prdt[index].dbc = ((chunk - 1) as u32) | ioc_bit;
+                offset += chunk;
+                remaining -= chunk;
+            }
         }
     }
+    let _ = COMMAND_LIST_BYTES;
     Ok(())
 }
 

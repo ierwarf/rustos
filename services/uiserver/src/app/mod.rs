@@ -229,10 +229,31 @@ pub(crate) struct WindowSurfaceCache {
 
 #[derive(Default)]
 pub(crate) struct DesktopSurfaceCache {
+    // Composite output, ready to blit into the framebuffer surface.
     pub(crate) pixels: Vec<u32>,
+    // Background-only render (gradient bands + grid). Kept separately so a
+    // launcher list change only repaints the topbar strip on top of a clean
+    // background copy instead of regenerating ~5 MiB of alpha blends.
+    pub(crate) background_pixels: Vec<u32>,
     pub(crate) width: usize,
     pub(crate) height: usize,
-    pub(crate) valid: bool,
+    pub(crate) background_valid: bool,
+    pub(crate) chrome_valid: bool,
+}
+
+impl DesktopSurfaceCache {
+    pub(crate) fn invalidate_all(&mut self) {
+        self.background_valid = false;
+        self.chrome_valid = false;
+    }
+
+    pub(crate) fn invalidate_chrome(&mut self) {
+        self.chrome_valid = false;
+    }
+
+    pub(crate) fn fully_valid(&self) -> bool {
+        self.background_valid && self.chrome_valid
+    }
 }
 
 pub(crate) struct ConsoleWindow {

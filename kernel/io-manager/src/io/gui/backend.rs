@@ -12,10 +12,15 @@ use super::framebuffer::{Framebuffer, FramebufferRect, build_framebuffer};
 use crate::memory::paging::{self, ProcessAddressSpace};
 use crate::sync::KernelWaitLock;
 
-const ENABLE_FRAMEBUFFER_WRITE_COMBINE: bool = false;
+const ENABLE_FRAMEBUFFER_WRITE_COMBINE: bool = true;
 #[cfg(rustos_debug_print_enabled)]
 const MAX_BACKEND_PRESENT_SAMPLE_LOGS: usize = 8;
-const USER_PRESENT_STRIPE_BYTES: usize = 1024 * 1024;
+// Sized to swallow a 1920x1200x4 = ~9 MiB frame in a single stripe so the
+// present path holds the backend lock once, allocates scratch once, and emits
+// exactly one virtio transfer/flush command pair per user present. The 1 MiB
+// stripe before this caused 6 mutex acquires + 6 virtio commands for a single
+// 1600x900 frame and turned full presents into a serialization storm.
+const USER_PRESENT_STRIPE_BYTES: usize = 16 * 1024 * 1024;
 
 enum BackendInstance {
     Unavailable,
@@ -244,7 +249,7 @@ fn copy_user_bgra8888_rect_in_stripes(
         .checked_add(rect.height)
         .ok_or(paging::AddressSpaceError::AddressOverflow)?;
     let mut y = rect.y;
-    let mut scratch = Vec::new();
+    let mut scratch = present_scratch_take();
     let mut copied = false;
 
     while y < end_y {
@@ -278,16 +283,19 @@ fn copy_user_bgra8888_rect_in_stripes(
             }
             Ok(drawn)
         }) else {
+            present_scratch_return(scratch);
             return Ok(false);
         };
 
         if !result? {
+            present_scratch_return(scratch);
             return Ok(false);
         }
         copied = true;
         y += stripe_height;
     }
 
+    present_scratch_return(scratch);
     Ok(copied)
 }
 
@@ -306,11 +314,34 @@ fn copy_user_bgra8888_rect_to_scratch(
         .checked_mul(rect.height)
         .ok_or(paging::AddressSpaceError::AddressOverflow)?;
     if scratch.capacity() < total_bytes {
+        let need = total_bytes - scratch.capacity();
         scratch
-            .try_reserve_exact(total_bytes - scratch.capacity())
+            .try_reserve_exact(need)
             .map_err(|_| paging::AddressSpaceError::OutOfFrames)?;
     }
-    scratch.resize(total_bytes, 0);
+    // Skip the resize-with-zero step: every byte in [0, total_bytes) is
+    // immediately overwritten by copy_from_user below. Zeroing 5+ MiB on a
+    // 60 Hz present loop directly limited throughput on TCG.
+    unsafe {
+        scratch.set_len(total_bytes);
+    }
+
+    // When the user buffer is dense for this rect (stride == row width) and
+    // the rectangle hugs the left edge, the entire stripe is contiguous in the
+    // user address space, so one copy_from_user can pull the whole block
+    // through the page walker instead of paying per-row overhead.
+    if stride_bytes == row_bytes && rect.x == 0 {
+        let source_offset = rect
+            .y
+            .checked_mul(stride_bytes)
+            .ok_or(paging::AddressSpaceError::AddressOverflow)?;
+        let source = user_ptr
+            .checked_add(source_offset as u64)
+            .ok_or(paging::AddressSpaceError::AddressOverflow)?;
+        address_space.copy_from_user(VirtAddr::new(source), &mut scratch[..total_bytes])?;
+        return Ok(total_bytes);
+    }
+
     for row in 0..rect.height {
         let source_row = rect
             .y
@@ -338,6 +369,22 @@ fn copy_user_bgra8888_rect_to_scratch(
         )?;
     }
     Ok(total_bytes)
+}
+
+// Cache the per-present scratch buffer so we don't pay a frame allocator pass
+// on every present. The buffer is reused across presents and grows to the
+// largest stripe ever seen, then stays put.
+static PRESENT_SCRATCH: KernelWaitLock<Vec<u8>> = KernelWaitLock::new(Vec::new());
+
+fn present_scratch_take() -> Vec<u8> {
+    core::mem::take(&mut *PRESENT_SCRATCH.lock())
+}
+
+fn present_scratch_return(scratch: Vec<u8>) {
+    let mut slot = PRESENT_SCRATCH.lock();
+    if slot.capacity() < scratch.capacity() {
+        *slot = scratch;
+    }
 }
 
 fn user_present_stripe_rows(width: usize) -> usize {

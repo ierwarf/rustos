@@ -276,7 +276,7 @@ impl AppState {
         self.cursor_x = self.cursor_x.min(self.display.width.saturating_sub(1));
         self.cursor_y = self.cursor_y.min(self.display.height.saturating_sub(1));
         self.dragging_window = None;
-        self.desktop_cache.valid = false;
+        self.desktop_cache.invalidate_all();
         for window in &mut self.console_windows {
             window.invalidate_surface();
         }
@@ -329,7 +329,10 @@ impl AppState {
             return false;
         }
         self.launcher_programs = launcher_programs;
-        self.desktop_cache.valid = false;
+        // Background bands are unaffected by launcher changes — only the
+        // topbar chrome holds launcher buttons, so keep the precomputed
+        // gradient/grid pixels and just repaint the chrome strip on top.
+        self.desktop_cache.invalidate_chrome();
         true
     }
 }
