@@ -558,8 +558,12 @@ pub mod vfs {
         if path.starts_with("services/")
             || path.starts_with("apps/")
             || path.starts_with("applications/")
+            || path.starts_with("etc/")
             || path.starts_with("lib/")
             || path.starts_with("lib64/")
+            || path.starts_with("usr/lib/")
+            || path.starts_with("usr/lib64/")
+            || path.starts_with("system/")
         {
             Ok(path)
         } else {

@@ -440,6 +440,7 @@ fn read_extent_bytes(
         done += chunk_payload;
         offset += chunk_payload;
         len -= chunk_payload;
+        crate::multitask::cond_resched();
     }
     Ok(())
 }

@@ -41,6 +41,10 @@ High-risk APIs:
   Linux-style safe points outside spinlocked or IRQ-off regions; timer IRQs
   should request reschedule for user-task kernel frames, not blindly switch
   away from arbitrary kernel code.
+- Linux `.ko` init preemption: module init executes as a user-service syscall
+  kernel frame, so long lock-free Linux compat callbacks must call
+  `cond_resched` at safe points. Do not hold RustOS spinlocks or IRQ-off
+  sections across those calls.
 - scheduler fairness: keep the hardware timer tick fixed and route service
   weights into scheduler vruntime/load accounting only. Root slot 0 is a fair
   task during bootstrap finalize, then becomes the idle fallback after

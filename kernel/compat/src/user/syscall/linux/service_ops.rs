@@ -1388,6 +1388,7 @@ pub(super) fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u
                 return linux_errno(address_space_error_to_linux_errno(err));
             }
             copied += read;
+            multitask::cond_resched();
             if read < chunk_len {
                 break;
             }
@@ -1419,6 +1420,7 @@ pub(super) fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u
                 return linux_errno(address_space_error_to_linux_errno(err));
             }
             copied += read;
+            multitask::cond_resched();
             if read < chunk_len {
                 break;
             }
@@ -1490,6 +1492,7 @@ pub(super) fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u
             return linux_errno(address_space_error_to_linux_errno(err));
         }
         copied += read;
+        multitask::cond_resched();
         if read < chunk_len {
             break;
         }
@@ -1526,6 +1529,7 @@ pub(super) fn syscall_linux_vfs_pread64(fd: u64, user_ptr: u64, user_len: u64, o
                 return linux_errno(address_space_error_to_linux_errno(err));
             }
             copied += read;
+            multitask::cond_resched();
             if read < chunk_len {
                 break;
             }
@@ -1560,6 +1564,7 @@ pub(super) fn syscall_linux_vfs_pread64(fd: u64, user_ptr: u64, user_len: u64, o
                 return linux_errno(address_space_error_to_linux_errno(err));
             }
             copied += read;
+            multitask::cond_resched();
             if read < chunk_len {
                 break;
             }
@@ -1607,6 +1612,7 @@ pub(super) fn syscall_linux_vfs_pread64(fd: u64, user_ptr: u64, user_len: u64, o
             return linux_errno(address_space_error_to_linux_errno(err));
         }
         copied += read;
+        multitask::cond_resched();
         if read < chunk_len {
             break;
         }
@@ -1666,6 +1672,7 @@ pub(super) fn syscall_linux_vfs_write(fd: u64, user_ptr: u64, user_len: u64) -> 
                 Err(err) => return linux_errno(memfd_error_to_linux_errno(err)),
             };
             copied += written;
+            multitask::cond_resched();
             if written < chunk_len {
                 break;
             }
@@ -2542,15 +2549,6 @@ pub(super) fn syscall_linux_vfs_readlinkat(
         Ok(path) => path,
         Err(errno) => return linux_errno(errno),
     };
-    if path.contains("startup-programs") || path.contains("runtime-env") {
-        crate::debug::info!(
-            compat,
-            "bootstrap path probe: op=access dirfd={:#x} flags={:#x} path={}",
-            dirfd,
-            flags,
-            path
-        );
-    }
     let Ok(user_len) = usize::try_from(user_len) else {
         return linux_errno(LINUX_EINVAL);
     };

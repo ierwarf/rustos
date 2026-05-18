@@ -124,7 +124,9 @@ pub(crate) unsafe extern "C" fn usb_register_driver(
         driver as usize as u64,
         0,
     );
+    crate::multitask::cond_resched();
     let status = crate::usb::register_linux_driver(driver);
+    crate::multitask::cond_resched();
     unsafe {
         asm!("cld", options(nomem, nostack));
     }
@@ -177,7 +179,10 @@ pub(crate) unsafe extern "C" fn usb_submit_urb(urb: *mut LinuxCompatUrb, _mem_fl
     if unsafe { (*urb).dev.is_null() } {
         return -19;
     }
-    crate::usb::submit_urb(urb)
+    crate::multitask::cond_resched();
+    let status = crate::usb::submit_urb(urb);
+    crate::multitask::cond_resched();
+    status
 }
 
 pub(crate) unsafe extern "C" fn usb_unlink_urb(urb: *mut LinuxCompatUrb) -> i32 {
@@ -231,7 +236,9 @@ pub(crate) unsafe extern "C" fn usb_control_msg(
         )
         .as_bytes(),
     );
+    crate::multitask::cond_resched();
     let status = crate::usb::control_msg(dev, request, request_type, value, index, data, size);
+    crate::multitask::cond_resched();
     super::compat_log::debugcon_line(
         alloc::format!(
             "usb_control_msg: end dev={:#x} status={}",
@@ -254,7 +261,10 @@ pub(crate) unsafe extern "C" fn usb_interrupt_msg(
     if dev.is_null() || data.is_null() || len < 0 {
         return -22;
     }
-    crate::usb::interrupt_msg(dev, data, len, actual_length)
+    crate::multitask::cond_resched();
+    let status = crate::usb::interrupt_msg(dev, data, len, actual_length);
+    crate::multitask::cond_resched();
+    status
 }
 
 pub(crate) unsafe extern "C" fn usb_clear_halt(_dev: *mut LinuxCompatUsbDevice, _pipe: i32) -> i32 {
@@ -400,6 +410,9 @@ pub(crate) unsafe extern "C" fn __usb_get_extra_descriptor(
     let bytes = unsafe { core::slice::from_raw_parts(buffer.cast::<u8>(), size as usize) };
     let mut offset = 0usize;
     while offset + 2 <= bytes.len() {
+        if (offset & 0x3f) == 0 {
+            crate::multitask::cond_resched();
+        }
         let descriptor_len = bytes[offset] as usize;
         if descriptor_len < 2 || offset + descriptor_len > bytes.len() {
             break;

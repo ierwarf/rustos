@@ -39,7 +39,8 @@ const STACK_CANARY_WORD: u64 = 0x5343_4844_554c_4552;
 const TASK_ENTRY_STACK_RESERVE_QWORDS: usize = 3;
 const PAGE_FAULT_VECTOR: u8 = 14;
 const RFLAGS_RESERVED_BIT_1: u64 = 1 << 1;
-const LONG_WAIT_THRESHOLD_MS: u64 = 16;
+const LONG_READY_WAIT_THRESHOLD_MS: u64 = 50;
+const LONG_BLOCKED_WAIT_THRESHOLD_MS: u64 = 250;
 const MAX_LONG_WAIT_LOGS: usize = 64;
 static LONG_WAIT_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -474,9 +475,8 @@ impl Scheduler {
         best.map(|(slot, _)| slot)
     }
 
-    fn maybe_log_long_wait(
+    fn maybe_log_ready_wait(
         &self,
-        kind: &str,
         slot: usize,
         task_id: Option<u64>,
         process_id: Option<u64>,
@@ -487,7 +487,7 @@ impl Scheduler {
             return;
         };
         let elapsed_ms = Self::ticks_elapsed_ms(start_ticks, end_ticks);
-        if elapsed_ms < LONG_WAIT_THRESHOLD_MS {
+        if elapsed_ms < LONG_READY_WAIT_THRESHOLD_MS {
             return;
         }
         let sample = LONG_WAIT_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -495,8 +495,35 @@ impl Scheduler {
             return;
         }
         crate::debug::println!(
-            "scheduler long wait: kind={} slot={} task={} pid={} elapsed_ms={}",
-            kind,
+            "scheduler ready wait: slot={} task={} pid={} elapsed_ms={}",
+            slot,
+            task_id.unwrap_or(0),
+            process_id,
+            elapsed_ms
+        );
+    }
+
+    fn maybe_log_blocked_wait(
+        &self,
+        slot: usize,
+        task_id: Option<u64>,
+        process_id: Option<u64>,
+        start_ticks: u64,
+        end_ticks: u64,
+    ) {
+        let Some(process_id) = process_id.filter(|process_id| *process_id != 0) else {
+            return;
+        };
+        let elapsed_ms = Self::ticks_elapsed_ms(start_ticks, end_ticks);
+        if elapsed_ms < LONG_BLOCKED_WAIT_THRESHOLD_MS {
+            return;
+        }
+        let sample = LONG_WAIT_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+        if sample >= MAX_LONG_WAIT_LOGS {
+            return;
+        }
+        crate::debug::println!(
+            "scheduler blocked wait: slot={} task={} pid={} elapsed_ms={}",
             slot,
             task_id.unwrap_or(0),
             process_id,
@@ -1375,10 +1402,10 @@ impl Scheduler {
         // reply to a specific receiver; otherwise vruntime decides fairness.
         let hint = self.take_next_pick_hint_ready_slot();
         let cfs_pick = self.pick_min_vruntime(current_slot);
-        let next_idx = match (hint, cfs_pick) {
-            (Some(hint_slot), _) => hint_slot,
-            (None, Some(slot)) => slot,
-            (None, None) => ROOT_TASK_SLOT,
+        let (next_idx, ipc_handoff) = match (hint, cfs_pick) {
+            (Some(hint_slot), _) => (hint_slot, true),
+            (None, Some(slot)) => (slot, false),
+            (None, None) => (ROOT_TASK_SLOT, false),
         };
 
         // Apply min-granularity guard: if the CFS pick differs from current
@@ -1386,7 +1413,11 @@ impl Scheduler {
         // a slice of at least SCHED_MIN_GRANULARITY_NS, keep current to avoid
         // context-switch ping-pong. This is the same heuristic Linux uses to
         // damp wake-preempt thrash.
-        let next_idx = self.maybe_keep_current(current_slot, next_idx, current_runtime_ns);
+        let next_idx = if ipc_handoff {
+            next_idx
+        } else {
+            self.maybe_keep_current(current_slot, next_idx, current_runtime_ns)
+        };
 
         if let Some(next) = self.contexts[next_idx] {
             match self.context_validation_error(next_idx, next, next.saved_rsp) {
@@ -1395,8 +1426,7 @@ impl Scheduler {
                     if next_idx != current_slot && next.ready_since_ticks != 0 {
                         let task_id = self.starts[next_idx].map(|start| start.id);
                         let process_id = next.process_handle.and_then(process_table::process_id);
-                        self.maybe_log_long_wait(
-                            "ready",
+                        self.maybe_log_ready_wait(
                             next_idx,
                             task_id,
                             process_id,
@@ -2386,14 +2416,7 @@ impl Scheduler {
         }
 
         if invalid_reason.is_none() && blocked_since_ticks != 0 {
-            self.maybe_log_long_wait(
-                "wake",
-                slot,
-                task_id,
-                process_id,
-                blocked_since_ticks,
-                now_ticks,
-            );
+            self.maybe_log_blocked_wait(slot, task_id, process_id, blocked_since_ticks, now_ticks);
         }
 
         if let Some(reason) = invalid_reason {

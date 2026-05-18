@@ -350,10 +350,6 @@ fn run() -> Result<(), i32> {
     })?;
     diag_line("uiserver: runtime client open done");
     log_boot_stage(runtime_open_started, "runtime_client_open");
-    match runtime.notify_ui_ready() {
-        Ok(()) => diag_line("uiserver: ui ready notified"),
-        Err(err) => diag_line(format!("uiserver: ui ready notify failed errno={err}").as_str()),
-    }
     let runtime_sync = RuntimeClient::open_default()
         .map(start_runtime_sync)
         .map_err(|_| {
@@ -365,6 +361,10 @@ fn run() -> Result<(), i32> {
     let mut wayland = WaylandCompositor::initialize(state.display.width, state.display.height);
     diag_line("uiserver: wayland initialize done");
     log_boot_stage(wayland_init_started, "wayland_initialize");
+    match runtime.notify_ui_ready() {
+        Ok(()) => diag_line("uiserver: ui ready notified"),
+        Err(err) => diag_line(format!("uiserver: ui ready notify failed errno={err}").as_str()),
+    }
     diag_line("uiserver: post-present init done");
     log_boot_stage(boot_started, "post_present_init");
     let launcher_programs = start_launcher_program_loader();

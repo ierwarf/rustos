@@ -12,10 +12,11 @@ use rustos_user_abi::syscall::{
 const SYS_SCHED_YIELD: u64 = 24;
 const SYS_EXIT_GROUP: u64 = 231;
 const SPAWN_FLAG_LOGICAL_ADMIN: u64 = 1;
-// Bootstrap services need to make forward progress quickly while the rest of
-// the userspace stack is still cold. Keep them at a Linux CFS-like default
-// weight instead of the bare minimum weight used for best-effort tasks.
-const DEFAULT_WEIGHT_MICROS: u64 = 1_000;
+// Bootstrap IPC hosts sit on hot syscall/loader/VFS paths. Give them a modest
+// Linux nice-like service boost so dynamic-linker and driver bursts do not
+// leave runnable servers behind for hundreds of milliseconds.
+const CORE_SERVICE_WEIGHT_MICROS: u64 = 4_000;
+const INITD_WEIGHT_MICROS: u64 = 2_000;
 
 const SYSCALLD_EXEC: &[u8] = b"services/syscalld/syscalld.elf\0";
 const VFSD_EXEC: &[u8] = b"services/vfsd/vfsd.elf\0";
@@ -38,7 +39,7 @@ pub extern "C" fn _start() -> ! {
 
     debug_line(b"rootd: core services spawned, spawning initd\n");
     loop {
-        match spawn_exec(INITD_EXEC) {
+        match spawn_exec(INITD_EXEC, INITD_WEIGHT_MICROS) {
             Ok(_) => break,
             Err(_) => yield_now(),
         }
@@ -57,14 +58,14 @@ fn spawn_core_service_without_wait(path: &'static [u8], service_id: u64) {
     }
 
     loop {
-        match spawn_exec(path) {
+        match spawn_exec(path, CORE_SERVICE_WEIGHT_MICROS) {
             Ok(_) => break,
             Err(_) => yield_now(),
         }
     }
 }
 
-fn spawn_exec(path: &'static [u8]) -> Result<u64, i64> {
+fn spawn_exec(path: &'static [u8], weight_micros: u64) -> Result<u64, i64> {
     let argv = [path.as_ptr(), core::ptr::null()];
     let result = syscall6(
         SYS_RUSTOS_SPAWN_EXEC,
@@ -73,7 +74,7 @@ fn spawn_exec(path: &'static [u8]) -> Result<u64, i64> {
         0,
         SPAWN_FLAG_LOGICAL_ADMIN,
         0,
-        DEFAULT_WEIGHT_MICROS,
+        weight_micros,
     );
     if result < 0 {
         Err(-result)

@@ -114,7 +114,9 @@ pub(crate) unsafe extern "C" fn __hid_register_driver(
     super::compat_log::debugcon_line(
         alloc::format!("hid register driver: begin bind ptr={:#x}", driver as usize).as_bytes(),
     );
+    crate::multitask::cond_resched();
     bind_driver(driver);
+    crate::multitask::cond_resched();
     super::compat_log::debugcon_line(
         alloc::format!("hid register driver: end bind ptr={:#x}", driver as usize).as_bytes(),
     );
@@ -295,7 +297,9 @@ pub(crate) unsafe extern "C" fn hid_hw_start(
         )
         .as_bytes(),
     );
+    crate::multitask::cond_resched();
     let status = unsafe { start(dev) };
+    crate::multitask::cond_resched();
     if status == 0 {
         unsafe {
             (*dev).io_started = true;
@@ -350,7 +354,9 @@ pub(crate) unsafe extern "C" fn hid_hw_open(dev: *mut LinuxCompatHidDevice) -> i
         )
         .as_bytes(),
     );
+    crate::multitask::cond_resched();
     let status = unsafe { open(dev) };
+    crate::multitask::cond_resched();
     if status != 0 {
         unsafe {
             (*dev).ll_open_count = (*dev).ll_open_count.saturating_sub(1);
@@ -489,6 +495,7 @@ pub(crate) unsafe extern "C" fn hid_open_report(_dev: *mut LinuxCompatHidDevice)
                 .as_bytes(),
             );
             let status = unsafe { parse(_dev) };
+            crate::multitask::cond_resched();
             super::compat_log::debugcon_line(
                 alloc::format!(
                     "hid_open_report: ll.parse end dev={:#x} status={}",
@@ -745,6 +752,7 @@ pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
 fn bind_driver(driver: *mut LinuxCompatHidDriver) {
     let devices = HID_DEVICES.lock().clone();
     for device in devices {
+        crate::multitask::cond_resched();
         let _ = bind_device_to_driver(device as *mut LinuxCompatHidDevice, driver);
     }
 }
@@ -752,6 +760,7 @@ fn bind_driver(driver: *mut LinuxCompatHidDriver) {
 fn bind_device(dev: *mut LinuxCompatHidDevice) -> i32 {
     let drivers = HID_DRIVERS.lock().clone();
     for driver in drivers {
+        crate::multitask::cond_resched();
         let status = bind_device_to_driver(dev, driver as *mut LinuxCompatHidDriver);
         if status == 0 {
             return 0;
@@ -790,7 +799,10 @@ fn bind_device_to_driver(dev: *mut LinuxCompatHidDevice, driver: *mut LinuxCompa
             )
             .as_bytes(),
         );
-        unsafe { probe(dev, id) }
+        crate::multitask::cond_resched();
+        let status = unsafe { probe(dev, id) };
+        crate::multitask::cond_resched();
+        status
     } else {
         0
     };
@@ -1030,6 +1042,9 @@ fn rebuild_hid_reports(dev: *mut LinuxCompatHidDevice) -> i32 {
     let mut offset = 0usize;
 
     while offset < descriptor.len() {
+        if (offset & 0x3f) == 0 {
+            crate::multitask::cond_resched();
+        }
         let prefix = descriptor[offset];
         offset += 1;
         if prefix == 0xfe {

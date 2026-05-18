@@ -21,7 +21,9 @@ pub fn tick_jiffies(delta: u64) -> u64 {
     JIFFIES.fetch_add(delta, Ordering::Relaxed) + delta
 }
 
-pub(crate) fn service_compat_pending() {}
+pub(crate) fn service_compat_pending() {
+    crate::multitask::cond_resched();
+}
 
 pub(crate) unsafe extern "C" fn get_random_bytes(buf: *mut c_void, len: usize) {
     if buf.is_null() || len == 0 {
@@ -116,6 +118,11 @@ pub(crate) unsafe extern "C" fn schedule_timeout(timeout: i64) -> i64 {
     if timeout > 0 {
         tick_jiffies(timeout as u64);
     }
+    service_compat_pending();
+    0
+}
+
+pub(crate) unsafe extern "C" fn cond_resched() -> i32 {
     service_compat_pending();
     0
 }
@@ -264,6 +271,9 @@ pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
         "usleep_range_state" => Some(usleep_range_state as *const () as usize),
         "schedule" => Some(schedule as *const () as usize),
         "schedule_timeout" => Some(schedule_timeout as *const () as usize),
+        "cond_resched" => Some(cond_resched as *const () as usize),
+        "_cond_resched" => Some(cond_resched as *const () as usize),
+        "__cond_resched" => Some(cond_resched as *const () as usize),
         "__msecs_to_jiffies" => Some(__msecs_to_jiffies as *const () as usize),
         "jiffies_to_usecs" => Some(jiffies_to_usecs as *const () as usize),
         "ktime_get_coarse_ts64" => Some(ktime_get_coarse_ts64 as *const () as usize),

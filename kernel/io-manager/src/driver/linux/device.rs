@@ -127,8 +127,9 @@ pub(crate) unsafe extern "C" fn bus_for_each_dev(
     let Some(callback) = (unsafe { callback_fn::<DeviceIterFn>(callback) }) else {
         return -22;
     };
-    let devices = REGISTERED_DEVICES.lock();
-    for device in devices.iter().copied().filter(|entry| entry.bus == bus_ptr) {
+    let devices = REGISTERED_DEVICES.lock().clone();
+    for device in devices.into_iter().filter(|entry| entry.bus == bus_ptr) {
+        crate::multitask::cond_resched();
         let status = unsafe { callback(device.ptr as *mut LinuxCompatDevice, data) };
         if status != 0 {
             return status;
@@ -149,8 +150,9 @@ pub(crate) unsafe extern "C" fn bus_for_each_drv(
     let Some(callback) = (unsafe { callback_fn::<DriverIterFn>(callback) }) else {
         return -22;
     };
-    let drivers = REGISTERED_DRIVERS.lock();
-    for driver in drivers.iter().copied().filter(|entry| entry.bus == bus_ptr) {
+    let drivers = REGISTERED_DRIVERS.lock().clone();
+    for driver in drivers.into_iter().filter(|entry| entry.bus == bus_ptr) {
+        crate::multitask::cond_resched();
         let status = unsafe { callback(driver.ptr as *mut LinuxCompatDeviceDriver, data) };
         if status != 0 {
             return status;
@@ -165,6 +167,7 @@ pub(crate) unsafe extern "C" fn bus_rescan_devices(bus: *mut c_void) -> i32 {
     };
     let drivers = REGISTERED_DRIVERS.lock().clone();
     for driver in drivers.into_iter().filter(|driver| driver.bus == bus_ptr) {
+        crate::multitask::cond_resched();
         let status = unsafe { driver_attach(driver.ptr as *mut LinuxCompatDeviceDriver) };
         if status != 0 {
             return status;

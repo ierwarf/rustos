@@ -344,6 +344,14 @@ Kernel/userspace ABI:
   lock-free kernel paths must call the RustOS `cond_resched` equivalent at
   safe points. Do not preempt arbitrary kernel frames from the interrupt
   handler unless the path has explicit preemption-count/lock-state safety.
+- Ring0 Linux `.ko` module init runs inside the calling user service's kernel
+  frame. Linux compat exports such as `schedule`, `schedule_timeout`,
+  `cond_resched`/`_cond_resched`/`__cond_resched`, and long callback bridges
+  (`driver_register`/HID bind/probe/open/report parse, USB register/URB/control
+  callbacks, virtio probe loops, and similar lock-free callback chains) must
+  provide explicit RustOS
+  `cond_resched` safe points so `driverd` module init cannot starve `uiserver`,
+  `wayclick`, or other ready user tasks until module init returns.
 - The default RustOS fair scheduler should stay Linux CFS-like: fixed periodic
   scheduler tick, per-task nanosecond vruntime accounting, weighted CPU share,
   smallest-vruntime pick, bounded sleeper credit, and an idle/root class that

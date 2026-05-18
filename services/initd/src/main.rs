@@ -178,13 +178,19 @@ fn secondary_service_deferred(exec: &str, now: Instant, deadline: Option<Instant
 }
 
 fn load_init_entries() -> Vec<StartupLaunchEntry> {
-    let Ok(entries) = load_startup_entries(DEFAULT_STARTUP_REGISTRY_PATH) else {
-        observability_client::warn!(
-            "initd",
-            service,
-            "startup registry unavailable: {DEFAULT_STARTUP_REGISTRY_PATH}"
-        );
-        return Vec::new();
+    let entries = match load_startup_entries(DEFAULT_STARTUP_REGISTRY_PATH) {
+        Ok(entries) => entries,
+        Err(err) => {
+            observability_client::warn!(
+                "initd",
+                service,
+                "startup registry unavailable path={} kind={:?} errno={:?}",
+                DEFAULT_STARTUP_REGISTRY_PATH,
+                err.kind(),
+                err.raw_os_error()
+            );
+            return Vec::new();
+        }
     };
 
     let mut launch_entries = entries
@@ -225,11 +231,23 @@ fn startup_launch_entry(entry: StartupEntry) -> StartupLaunchEntry {
 }
 
 fn load_init_env() -> Vec<CString> {
-    load_runtime_default_env(DEFAULT_RUNTIME_ENV_REGISTRY_PATH, RuntimeEnvScope::Init)
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|value| CString::new(value).ok())
-        .collect()
+    match load_runtime_default_env(DEFAULT_RUNTIME_ENV_REGISTRY_PATH, RuntimeEnvScope::Init) {
+        Ok(values) => values,
+        Err(err) => {
+            observability_client::warn!(
+                "initd",
+                service,
+                "runtime env unavailable path={} kind={:?} errno={:?}",
+                DEFAULT_RUNTIME_ENV_REGISTRY_PATH,
+                err.kind(),
+                err.raw_os_error()
+            );
+            Vec::new()
+        }
+    }
+    .into_iter()
+    .filter_map(|value| CString::new(value).ok())
+    .collect()
 }
 
 fn init_exec_priority(exec: &str) -> u8 {
