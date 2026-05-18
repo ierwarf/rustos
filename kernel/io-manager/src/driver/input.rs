@@ -10,6 +10,9 @@ static TEST_POINTER_EVENTS_READY: AtomicU8 = AtomicU8::new(0);
 #[cfg(test)]
 static TEST_POINTER_CAPTURE_RESULT: AtomicU8 = AtomicU8::new(0);
 
+// RING3-MIGRATION-REFERENCE START: inputd should own pointer readiness,
+// coalescing/capture policy, and button-state tracking. Ring0 driver callbacks
+// should forward validated packets to the service-owned queue.
 pub(crate) fn reset_pointer_state() {
     POINTER_BUTTON_STATE.store(0, Ordering::Release);
 }
@@ -87,6 +90,7 @@ fn log_pointer_delivery_once(kind: &'static str) {
         crate::debug::info!(input, "input: pointer event delivered kind={}", kind);
     }
 }
+// RING3-MIGRATION-REFERENCE END: inputd-owned pointer delivery policy.
 
 #[cfg(test)]
 mod tests {

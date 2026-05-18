@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: commercial-max displayd/uiserver should own display
+// backend selection, native-present policy, probe/readiness state, and provider fallback
+// ordering. Ring0 keeps only privileged present/grant primitives and boot/panic output.
 use alloc::vec::Vec;
 #[cfg(rustos_debug_print_enabled)]
 use core::sync::atomic::AtomicUsize;
@@ -534,3 +537,4 @@ fn framebuffer_info_is_valid(info: FramebufferInfo) -> bool {
 
     min_size <= size
 }
+// RING3-MIGRATION-REFERENCE END: commercial-max displayd/uiserver-owned display backend policy.

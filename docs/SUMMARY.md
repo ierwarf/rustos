@@ -9,6 +9,10 @@
 
 # Architecture
 
+- [Microkernel Overview](architecture/microkernel-overview.md)
+- [Userspace Services](architecture/services.md)
+- [Userspace Compatibility](architecture/userspace-compat.md)
+- [UI Server & Wayland](architecture/ui-server.md)
 - [Structure Guide](structure.md)
 - [Logging Guide](logging.md)
 - [Fault Injection](fault-injection.md)

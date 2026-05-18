@@ -4,6 +4,7 @@
 extern crate alloc;
 
 use alloc::ffi::CString;
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -490,6 +491,12 @@ fn map_executable_segments(
                 windows_runtime: Some(runtime),
                 linux_runtime: None,
                 cleanup_fds: vec![fd],
+            })
+            .map_err(|errno| {
+                debug_line(&format!(
+                    "loaderd: map pe segments failed exec={exec_path} errno={errno}",
+                ));
+                errno
             }),
         _ => Err(EINVAL),
     }
@@ -952,17 +959,22 @@ fn map_pe_segments_fd(
     argv: &[CString],
     env: &[CString],
 ) -> Result<RustosProcSetWindowsRuntimeBrokerArgs, i32> {
-    let mut main = load_pe_image_fd(fd, exec_path, pe_default_load_base()?, false)?;
+    let mut main = load_pe_image_fd(fd, exec_path, pe_default_load_base()?, false)
+        .map_err(|err| pe_step_err(exec_path, "load-pe-image-main", err))?;
     let mut modules = Vec::<LoadedPeModule>::new();
-    let registry = load_system_dll_registry()?;
+    let registry = load_system_dll_registry()
+        .map_err(|err| pe_step_err(exec_path, "load-dll-registry", err))?;
     let mut next_base = align_up(
         main.load_base
             .checked_add(main.image_size)
             .ok_or(EOVERFLOW)?,
         4096,
-    )?;
-    preload_system_dlls(&registry, &mut modules, &mut next_base)?;
-    resolve_import_closure(&mut main, &mut modules, &registry, &mut next_base)?;
+    )
+    .map_err(|err| pe_step_err(exec_path, "align-next-base", err))?;
+    preload_system_dlls(&registry, &mut modules, &mut next_base)
+        .map_err(|err| pe_step_err(exec_path, "preload-dlls", err))?;
+    resolve_import_closure(&mut main, &mut modules, &registry, &mut next_base)
+        .map_err(|err| pe_step_err(exec_path, "resolve-imports", err))?;
     let runtime = build_windows_runtime_blob(
         prepare_handle,
         &main,
@@ -971,14 +983,31 @@ fn map_pe_segments_fd(
         argv,
         env,
         next_base,
-    )?;
-    patch_crt_runtime_exports(&mut modules, &runtime)?;
-    patch_crt_runtime_exports_for_main(&mut main, &modules, &runtime)?;
-    map_loaded_pe_module(prepare_handle, &main)?;
+    )
+    .map_err(|err| pe_step_err(exec_path, "build-runtime-blob", err))?;
+    patch_crt_runtime_exports(&mut modules, &runtime)
+        .map_err(|err| pe_step_err(exec_path, "patch-crt-modules", err))?;
+    patch_crt_runtime_exports_for_main(&mut main, &modules, &runtime)
+        .map_err(|err| pe_step_err(exec_path, "patch-crt-main", err))?;
+    map_loaded_pe_module(prepare_handle, &main)
+        .map_err(|err| pe_step_err(exec_path, "map-main-pages", err))?;
     for module in &modules {
-        map_loaded_pe_module(prepare_handle, module)?;
+        map_loaded_pe_module(prepare_handle, module).map_err(|err| {
+            pe_step_err(
+                exec_path,
+                &format!("map-dll-pages:{}", module.base_name),
+                err,
+            )
+        })?;
     }
     Ok(runtime)
+}
+
+fn pe_step_err(exec_path: &str, step: &str, errno: i32) -> i32 {
+    debug_line(&format!(
+        "loaderd: pe step failed exec={exec_path} step={step} errno={errno}",
+    ));
+    errno
 }
 
 fn pe_default_load_base() -> Result<u64, i32> {

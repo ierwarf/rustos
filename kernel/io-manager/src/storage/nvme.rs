@@ -1,3 +1,7 @@
+// RING3-MIGRATION-REFERENCE START: commercial-max storaged should own NVMe queue
+// policy, identify parsing, namespace inventory, and block IO state only for a non-.ko
+// service driver rewrite. RustOS-authored `.ko` NVMe drivers stay ring0; ring0 also
+// keeps MMIO/DMA/IRQ grant primitives and early bootstrap block access.
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
@@ -848,3 +852,4 @@ fn wait_until(mut predicate: impl FnMut() -> bool) -> bool {
     }
     false
 }
+// RING3-MIGRATION-REFERENCE END: commercial-max storaged-owned non-.ko NVMe service driver.

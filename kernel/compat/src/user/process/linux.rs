@@ -47,6 +47,12 @@ const ELF_ENDIAN: LittleEndian = LittleEndian;
 const LINUX_AUX_PLATFORM: &str = "x86_64";
 const LINUX_AUX_HWCAP: u64 = 0;
 const LINUX_AUX_HWCAP2: u64 = 0;
+
+// RING3-MIGRATION-REFERENCE START: loaderd/procd/syscalld should own Linux ELF
+// image policy, interpreter/runtime search, segment validation, mapping
+// manifests, dynamic relocation policy, runtime profile construction, and
+// initial memory-map metadata. Ring0 should keep only address-space commit,
+// page mutation, TLS install, and bootstrap register/stack materialization.
 #[derive(Clone, Copy)]
 enum ElfImageType {
     Executable,
@@ -2225,6 +2231,7 @@ fn read_raw_elf_header(image: &[u8]) -> Result<RawElfHeader<LittleEndian>, Proce
         .map_err(|_| ProcessLoadError::InvalidElf("ELF header is truncated"))?;
     Ok(unsafe { ptr::read_unaligned(bytes.as_ptr() as *const RawElfHeader<LittleEndian>) })
 }
+// RING3-MIGRATION-REFERENCE END: loaderd/procd/syscalld-owned Linux ELF load policy.
 
 pub(super) fn initialize_linux_initial_tls(
     address_space: &mut ProcessAddressSpace,
@@ -2268,6 +2275,11 @@ pub(super) fn initialize_linux_user_stack(
     launch: LinuxProcessLaunch<'_>,
     security: ProcessSecurityContext,
 ) -> Result<VirtAddr, ProcessLoadError> {
+    // RING3-MIGRATION-REFERENCE START: procd/syscalld should own Linux initial
+    // stack and auxv policy, including argv/env layout, credential aux entries,
+    // hwcap/defaults, and RustOS-private aux values. Ring0 keeps the final
+    // current-address-space byte writes needed to materialize the prepared
+    // bootstrap image.
     let aligned_top = align_down(stack_end.as_u64(), 16);
     let mut cursor = aligned_top;
     let mut random_bytes = [0_u8; LINUX_STACK_RANDOM_BYTES];
@@ -2454,6 +2466,7 @@ fn push_stack_bytes(
     *cursor = aligned;
     Ok(aligned)
 }
+// RING3-MIGRATION-REFERENCE END: procd/syscalld-owned Linux initial stack policy.
 
 fn make_interpreter_load_error(path: &str, error: vfs::VfsError) -> ProcessLoadError {
     let mut stored_path = [0_u8; 128];

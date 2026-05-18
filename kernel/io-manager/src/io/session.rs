@@ -11,6 +11,10 @@ static SESSION_MANAGER: KernelWaitLock<ConsoleSessionManager> =
     KernelWaitLock::new(ConsoleSessionManager::new());
 static NEXT_SESSION_CREATED_GENERATION: AtomicU64 = AtomicU64::new(1);
 
+// RING3-MIGRATION-REFERENCE START: runtime/session service should own normal
+// console-session lifecycle, focus, title/path metadata, state transitions, and
+// pid binding. Ring0 keeps only opaque handles needed by scheduler/device
+// broker primitives.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub struct ConsoleSessionHandle(u64);
 
@@ -381,6 +385,7 @@ pub fn reset_for_tests() {
     *SESSION_MANAGER.lock() = ConsoleSessionManager::new();
     NEXT_SESSION_CREATED_GENERATION.store(1, Ordering::Relaxed);
 }
+// RING3-MIGRATION-REFERENCE END: runtime/session-service-owned session policy.
 
 #[cfg(test)]
 mod tests {

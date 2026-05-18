@@ -1,3 +1,7 @@
+// RING3-MIGRATION-REFERENCE START: commercial-max usbdrv/inputd should own USB
+// enumeration policy, transfer-ring policy, and HID delivery only for a non-.ko service
+// driver rewrite. RustOS-authored `.ko` xHCI drivers stay ring0 with Linux `.ko`
+// compatibility; ring0 also keeps MMIO/DMA/IRQ grant primitives.
 use alloc::vec;
 use alloc::vec::Vec;
 use core::convert::TryFrom;
@@ -2283,3 +2287,4 @@ mod tests {
         assert_eq!(decoded.slot_id(), 7);
     }
 }
+// RING3-MIGRATION-REFERENCE END: commercial-max usbdrv/inputd-owned non-.ko USB service driver.

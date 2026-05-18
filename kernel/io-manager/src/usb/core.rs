@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: commercial-max usbdrv/devmgrd should own USB device
+// descriptors, enumeration state, class routing, and device metadata once user-mode USB
+// driver services exist. Ring0 keeps controller grants and compatibility callback substrate.
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ffi::c_void;
@@ -623,3 +626,4 @@ fn c_string_bytes(value: &str) -> Box<[u8]> {
     bytes.push(0);
     bytes.into_boxed_slice()
 }
+// RING3-MIGRATION-REFERENCE END: commercial-max usbdrv/devmgrd-owned USB core policy.

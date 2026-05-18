@@ -11,6 +11,10 @@ Compact repo map for AI agents. For detailed routing, read
 - `docs/ai/repo-map.md`: source ownership and canonical entrypoints.
 - `docs/ai/commands.md`: quiet build/check commands and focused debug commands.
 - `docs/ai/contracts.md`: stable schemas, generated paths, API boundaries.
+- `docs/ai/ring3-evacuation.md`: service-first ring0 evacuation boundaries and
+  ring3 migration candidates.
+- `docs/ai/commercial-microkernel-closure.md`: final hybrid closure criteria,
+  migration marker rules, and ring0/services LOC accounting.
 
 Use these first files as the stable prefix for AI sessions. Keep changing task
 details, logs, and command output after them so provider prompt/context caches

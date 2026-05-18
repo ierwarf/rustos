@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: commercial-max netd should own socket state machines,
+// socket namespace policy, peer/bind/listen state, and option defaults. Ring0 keeps only
+// raw wake/copy primitives and kernel socket handles required for current-process commits.
 use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -1075,3 +1078,4 @@ mod tests {
         assert!(listener.bound_path().is_none());
     }
 }
+// RING3-MIGRATION-REFERENCE END: commercial-max netd-owned socket state.

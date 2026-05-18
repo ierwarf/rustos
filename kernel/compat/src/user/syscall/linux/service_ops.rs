@@ -1229,6 +1229,9 @@ pub(super) fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mo
     // Fast path: bootstrap-owned binary/library paths are served from the in-kernel
     // boot volume cache. Going through vfsd would require multi-call IPC chunking
     // bounded by VFS_IPC_PAYLOAD_CAPACITY which dominates loaderd spawn latency.
+    // RING3-MIGRATION-REFERENCE START: rootd/loaderd/vfsd should own
+    // post-bootstrap binary/library loading. Keep only the fixed early
+    // foundational-service escape hatch in ring0.
     if can_lookup_bootstrap_path(dirfd, path.as_str())
         && flags & linux_abi::O_ACCMODE == linux_abi::O_RDONLY
         && flags & linux_abi::O_DIRECTORY == 0
@@ -1236,6 +1239,7 @@ pub(super) fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mo
     {
         return bootstrap_openat(path.as_str(), flags);
     }
+    // RING3-MIGRATION-REFERENCE END: rootd/loaderd/vfsd bootstrap file fast path.
     let mut request = new_vfs_request(VFS_IPC_OP_OPENAT);
     request.dirfd = dirfd;
     request.arg0 = flags;
@@ -1246,6 +1250,9 @@ pub(super) fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mo
     let response = match call_vfs_ipc_request(&request) {
         Ok(response) => response,
         Err(_) if !ipc_ops::service_registered(linux_abi::IPC_SERVICE_VFSD) => {
+            // RING3-MIGRATION-REFERENCE START: shrink pre-vfsd fallback to rootd
+            // bootstrap only; generic post-bootstrap VFS belongs to vfsd.
+            // RING3-MIGRATION-REFERENCE END: pre-vfsd bootstrap fallback.
             return bootstrap_openat(path.as_str(), flags);
         }
         Err(errno) => return linux_errno(errno),
@@ -1430,6 +1437,9 @@ pub(super) fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u
     let Some(remote) = current_remote_vfs_handle(fd) else {
         return linux_errno(LINUX_EBADF);
     };
+    // RING3-MIGRATION-REFERENCE START: inputd/devmgrd should own input-device
+    // read routing and reader policy. Ring0 should only perform the authorized
+    // current-process copy from a service-owned queue.
     if remote.kind() == multitask::RemoteVfsHandleKind::Device
         && matches!(remote.path().as_str(), "/dev/input0" | "/dev/input/event0")
     {
@@ -1455,6 +1465,7 @@ pub(super) fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u
             Err(err) => linux_errno(device_error_to_linux_errno(err)),
         };
     }
+    // RING3-MIGRATION-REFERENCE END: inputd/devmgrd-owned input read route.
     let Ok(user_len) = usize::try_from(user_len) else {
         return linux_errno(LINUX_EINVAL);
     };
@@ -2454,12 +2465,15 @@ pub(super) fn syscall_linux_vfs_statx(
     if let Err(err) = usermem::validate_current_user_write_buffer(statx_ptr, LINUX_STATX_SIZE) {
         return linux_errno(address_space_error_to_linux_errno(err));
     }
+    // RING3-MIGRATION-REFERENCE START: rootd/loaderd/vfsd should own
+    // post-bootstrap metadata for binary/library paths.
     if can_lookup_bootstrap_path(dirfd, path.as_str()) && is_bootstrap_image_path(path.as_str()) {
         match bootstrap_read_file(path.as_str()) {
             Ok(_) => return bootstrap_stat_path(path.as_str(), statx_ptr, true),
             Err(errno) => return linux_errno(errno),
         }
     }
+    // RING3-MIGRATION-REFERENCE END: rootd/loaderd/vfsd statx bootstrap path.
     let mut request = new_vfs_request(VFS_IPC_OP_STATX);
     request.dirfd = dirfd;
     request.flags = flags as u32;
@@ -2508,12 +2522,15 @@ pub(super) fn syscall_linux_vfs_newfstatat(
     if let Err(err) = usermem::validate_current_user_write_buffer(stat_ptr, LINUX_STAT_SIZE) {
         return linux_errno(address_space_error_to_linux_errno(err));
     }
+    // RING3-MIGRATION-REFERENCE START: rootd/loaderd/vfsd should own
+    // post-bootstrap fstatat metadata for binary/library paths.
     if can_lookup_bootstrap_path(dirfd, path.as_str()) && is_bootstrap_image_path(path.as_str()) {
         match bootstrap_read_file(path.as_str()) {
             Ok(_) => return bootstrap_stat_path(path.as_str(), stat_ptr, false),
             Err(errno) => return linux_errno(errno),
         }
     }
+    // RING3-MIGRATION-REFERENCE END: rootd/loaderd/vfsd fstatat bootstrap path.
     let mut request = new_vfs_request(VFS_IPC_OP_NEWFSTATAT);
     request.dirfd = dirfd;
     request.flags = flags as u32;
@@ -2583,12 +2600,15 @@ pub(super) fn syscall_linux_vfs_access(dirfd: u64, path_ptr: u64, mode: u64, fla
         Ok(path) => path,
         Err(errno) => return linux_errno(errno),
     };
+    // RING3-MIGRATION-REFERENCE START: rootd/loaderd/vfsd should own
+    // post-bootstrap access checks for binary/library paths.
     if can_lookup_bootstrap_path(dirfd, path.as_str()) && is_bootstrap_image_path(path.as_str()) {
         match bootstrap_read_file(path.as_str()) {
             Ok(_) => return 0,
             Err(errno) => return linux_errno(errno),
         }
     }
+    // RING3-MIGRATION-REFERENCE END: rootd/loaderd/vfsd access bootstrap path.
     let mut request = new_vfs_request(VFS_IPC_OP_ACCESS);
     request.dirfd = dirfd;
     request.flags = flags as u32;
@@ -2697,6 +2717,9 @@ fn memfd_error_to_linux_errno(err: multitask::MemfdError) -> i64 {
     }
 }
 
+// RING3-MIGRATION-REFERENCE START: rootd/loaderd/vfsd should own bootstrap
+// file materialization and path allowlists after the fixed early-service boot
+// window. Ring0 keeps only a narrow pre-service escape hatch.
 fn bootstrap_openat(path: &str, flags: u64) -> u64 {
     if flags & linux_abi::O_DIRECTORY != 0 || flags & linux_abi::O_ACCMODE != linux_abi::O_RDONLY {
         return linux_errno(LINUX_ENOSYS);
@@ -2758,6 +2781,7 @@ fn bootstrap_path(path: &str) -> Option<&str> {
 pub(super) fn is_bootstrap_image_path(path: &str) -> bool {
     bootstrap_path(path).is_some()
 }
+// RING3-MIGRATION-REFERENCE END: rootd/loaderd/vfsd bootstrap file helpers.
 
 fn write_bootstrap_stat(user_ptr: u64, inode: u64, len: u64) -> u64 {
     if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, LINUX_STAT_SIZE) {
@@ -2912,6 +2936,9 @@ pub(super) fn syscall_linux_vfs_umount2(target_ptr: u64, flags: u64) -> u64 {
     }
 }
 
+// RING3-MIGRATION-REFERENCE START: devmgrd should own ioctl authorization and
+// per-device policy. Ring0 keeps the current-process user-copy/device broker
+// after devmgrd authorizes the operation.
 pub(super) fn syscall_linux_ioctl(fd: u64, request_number: u64, arg: u64) -> u64 {
     // Fast path inspired by seL4's "direct handling" pattern: short-circuit the
     // devmgrd IPC bounce for device ioctls performed against the caller's own
@@ -2927,6 +2954,7 @@ pub(super) fn syscall_linux_ioctl(fd: u64, request_number: u64, arg: u64) -> u64
         Err(err) => linux_errno(super::broker_ops::device_sysop_error_to_linux_errno(err)),
     }
 }
+// RING3-MIGRATION-REFERENCE END: devmgrd-owned ioctl policy bypass.
 
 pub(super) fn syscall_linux_net4(op: u16, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
     syscall_linux_net6(op, arg0, arg1, arg2, arg3, 0, 0)
@@ -2960,6 +2988,9 @@ pub(super) fn syscall_linux_net6(
     }
 }
 
+// RING3-MIGRATION-REFERENCE START: rootd/supervisor should own bootstrap
+// service supervision, restart policy, dependency waits, and retry budgets.
+// Ring0 keeps fixed early spawn primitives only.
 pub(super) fn syscall_linux_loader_spawn_exec(
     path_ptr: u64,
     _argv_ptr: u64,
@@ -3054,6 +3085,7 @@ fn console_host_error_to_linux_errno(error: crate::user::console_host::ConsoleHo
         crate::user::console_host::ConsoleHostError::Spawn { .. } => LINUX_ENOEXEC,
     }
 }
+// RING3-MIGRATION-REFERENCE END: rootd/supervisor-owned bootstrap spawn policy.
 
 pub(super) fn copy_string_vector(
     vector_ptr: u64,

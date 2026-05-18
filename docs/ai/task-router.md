@@ -20,6 +20,7 @@ Second step: classify the user task into one row below. Read only the
 | Runtime launch/session issue | `contracts.md` | `libs/runtime-control/src/lib.rs`, then exact `services/runtimed/src/main.rs` range |
 | UI/rendering issue | `repo-map.md` | search `services/uiserver/src`; open only the matching `render.rs` or `app/*` range |
 | Hardening request | `contracts.md`, `kernel-api-map.md` | highest-risk boundary first; exact API, broker, service, lock, memory, or device path found by `rg` |
+| Ring0/ring3 ownership or microkernel boundary | `contracts.md`, `ring3-evacuation.md` | `commercial-microkernel-closure.md` for final-shape/LOC questions; `kernel-api-map.md`, then exact broker, service, driver, input, storage, or compat path found by `rg` |
 | Add service/app/driver | `workflows.md` | one closest existing manifest, one closest source file, target manifest/source only |
 | Docs update | `docs/SUMMARY.md` | target doc only; AI docs only if agent context changes |
 

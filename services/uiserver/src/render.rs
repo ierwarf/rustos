@@ -10,24 +10,28 @@ use crate::sys::diag_line;
 use crate::sys::ConsoleSessionHandle;
 use crate::wayland::WaylandWindowSnapshot;
 
-const COLOR_BOOT_BG_BASE: u32 = 0x0008_1f38;
-const COLOR_DESKTOP_BG_BASE: u32 = 0x000b_2746;
-const COLOR_DESKTOP_BAND: u32 = 0x0015_4a7d;
-const COLOR_GRID: u32 = 0x0036_6f9e;
-const COLOR_GRID_MAJOR: u32 = 0x0051_96ca;
-const COLOR_PANEL_GLASS: u32 = 0x001e_5f8b;
-const COLOR_PANEL_INNER: u32 = 0x0011_3f68;
-const COLOR_PANEL_ELEVATED: u32 = 0x0028_77aa;
-const COLOR_ACCENT_FOCUS: u32 = 0x0075_d9ff;
-const COLOR_ACCENT_SOFT: u32 = 0x00b8_ecff;
-const COLOR_ACCENT_WARM: u32 = 0x008f_ddff;
-const COLOR_BORDER_IDLE: u32 = 0x004f_86ad;
-const COLOR_BORDER_FOCUS: u32 = 0x009a_e5ff;
-const COLOR_TEXT_PRIMARY: u32 = 0x00f4_fbff;
-const COLOR_TEXT_DIM: u32 = 0x00b7_d8ec;
+// Translucent monochrome "aero" palette — a single cool steel-blue hue
+// tinted lighter for glass surfaces and darker for backdrops. Alpha values
+// stay in the existing fill_rect_alpha calls; only the underlying tone
+// changes so chrome reads as frosted glass rather than the prior teal.
+const COLOR_BOOT_BG_BASE: u32 = 0x000c_1623;
+const COLOR_DESKTOP_BG_BASE: u32 = 0x0010_1c2c;
+const COLOR_DESKTOP_BAND: u32 = 0x002a_3c5a;
+const COLOR_GRID: u32 = 0x0038_4d6e;
+const COLOR_GRID_MAJOR: u32 = 0x0054_6e93;
+const COLOR_PANEL_GLASS: u32 = 0x00cf_dceb;
+const COLOR_PANEL_INNER: u32 = 0x008e_a3bd;
+const COLOR_PANEL_ELEVATED: u32 = 0x00b6_c7dd;
+const COLOR_ACCENT_FOCUS: u32 = 0x00ea_f3fb;
+const COLOR_ACCENT_SOFT: u32 = 0x00ff_ffff;
+const COLOR_ACCENT_WARM: u32 = 0x00c6_d6e7;
+const COLOR_BORDER_IDLE: u32 = 0x004d_637f;
+const COLOR_BORDER_FOCUS: u32 = 0x00d8_e3f1;
+const COLOR_TEXT_PRIMARY: u32 = 0x00f6_f9fc;
+const COLOR_TEXT_DIM: u32 = 0x00b8_c6da;
 const COLOR_SHADOW: u32 = 0x0000_0000;
-const COLOR_CLIENT_BACKDROP: u32 = 0x0009_1d34;
-const COLOR_CLIENT_DIVIDER: u32 = 0x0044_789d;
+const COLOR_CLIENT_BACKDROP: u32 = 0x0012_1c2e;
+const COLOR_CLIENT_DIVIDER: u32 = 0x004c_637e;
 
 const TOPBAR_MARGIN_TOP: usize = 16;
 const TOPBAR_RAIL_HEIGHT: usize = 40;
@@ -52,9 +56,9 @@ const WINDOW_SHADOW_STEPS: usize = 6;
 const WINDOW_BUTTON_SIZE: usize = 18;
 const WINDOW_BUTTON_GAP: usize = 8;
 const WINDOW_BUTTON_MARGIN_RIGHT: usize = 12;
-const COLOR_BUTTON_IDLE: u32 = 0x0018_4d77;
-const COLOR_BUTTON_MINIMIZE: u32 = 0x008f_ddff;
-const COLOR_BUTTON_CLOSE: u32 = 0x0057_b3ef;
+const COLOR_BUTTON_IDLE: u32 = 0x0058_6f8a;
+const COLOR_BUTTON_MINIMIZE: u32 = 0x00d0_dde9;
+const COLOR_BUTTON_CLOSE: u32 = 0x00f0_b6b6;
 
 const DEFAULT_WINDOW_WIDTH: usize = 640;
 const DEFAULT_WINDOW_HEIGHT: usize = 400;
@@ -832,28 +836,32 @@ pub(crate) fn build_desktop_background(width: usize, height: usize) -> Vec<u32> 
     };
     let mut canvas = SurfaceCanvas::new(pixels.as_mut_slice(), width as u32, height as u32, width);
     canvas.fill_rect(screen, COLOR_DESKTOP_BG_BASE);
+    // Upper sky band — slightly brighter to suggest a frosted sheen across
+    // the top half of the desktop.
     canvas.fill_rect_alpha(
         Rect {
             x: 0,
             y: 0,
             width,
-            height: (height / 3).max(1),
+            height: (height / 2).max(1),
         },
         COLOR_DESKTOP_BAND,
-        94,
+        72,
     );
+    // Lower drift — deepens the bottom third so the taskbar reads as glass
+    // against a darker fall-off.
     canvas.fill_rect_alpha(
         Rect {
             x: 0,
-            y: height.saturating_sub(height / 5),
+            y: height.saturating_sub(height / 4),
             width,
-            height: height / 5,
+            height: height / 4,
         },
         COLOR_CLIENT_BACKDROP,
-        86,
+        96,
     );
-    canvas.fill_pattern_grid(screen, 28, COLOR_GRID, 22);
-    canvas.fill_pattern_grid(screen, 112, COLOR_GRID_MAJOR, 34);
+    canvas.fill_pattern_grid(screen, 32, COLOR_GRID, 18);
+    canvas.fill_pattern_grid(screen, 128, COLOR_GRID_MAJOR, 28);
     pixels
 }
 
@@ -1027,7 +1035,7 @@ fn paint_window_chrome_with_client_rect(
         height: WINDOW_TITLE_HEIGHT,
     };
 
-    draw_shadow(canvas, outer, WINDOW_SHADOW_STEPS, 28);
+    draw_shadow(canvas, outer, WINDOW_SHADOW_STEPS, 36);
     canvas.fill_rect(
         outer,
         if focused {
@@ -1037,9 +1045,23 @@ fn paint_window_chrome_with_client_rect(
         },
     );
     canvas.fill_rect(inner, COLOR_PANEL_INNER);
-    canvas.fill_rect_alpha(title_rect, COLOR_PANEL_GLASS, 230);
+    // Title bar — two-layer frosted glass with a brighter sheen on focus.
+    let title_top_half = Rect {
+        x: title_rect.x,
+        y: title_rect.y,
+        width: title_rect.width,
+        height: title_rect.height / 2,
+    };
+    let title_bottom_half = Rect {
+        x: title_rect.x,
+        y: title_top_half.y.saturating_add(title_top_half.height),
+        width: title_rect.width,
+        height: title_rect.height.saturating_sub(title_top_half.height),
+    };
+    canvas.fill_rect_alpha(title_top_half, COLOR_PANEL_GLASS, 210);
+    canvas.fill_rect_alpha(title_bottom_half, COLOR_PANEL_ELEVATED, 200);
     if focused {
-        canvas.fill_rect_alpha(title_rect, COLOR_PANEL_ELEVATED, 118);
+        canvas.fill_rect_alpha(title_rect, COLOR_ACCENT_FOCUS, 64);
     }
     canvas.fill_rect_alpha(
         Rect {
@@ -1049,7 +1071,7 @@ fn paint_window_chrome_with_client_rect(
             height: 1,
         },
         COLOR_ACCENT_SOFT,
-        165,
+        220,
     );
     canvas.fill_rect(
         Rect {
@@ -1135,8 +1157,26 @@ fn draw_window_button(canvas: &mut SurfaceCanvas<'_>, rect: Rect, accent: u32, l
 }
 
 fn draw_rail_panel(canvas: &mut SurfaceCanvas<'_>, rect: Rect) {
-    draw_shadow(canvas, rect, 4, 18);
-    canvas.fill_rect_alpha(rect, COLOR_PANEL_GLASS, 186);
+    draw_shadow(canvas, rect, 5, 26);
+    // Translucent glass body. We split the panel into an upper "sheen" half
+    // and a lower "settled" half so the rail reads as a frosted plate with a
+    // brighter top, in the same spirit as Aero glass.
+    let upper = Rect {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height / 2,
+    };
+    let lower = Rect {
+        x: rect.x,
+        y: upper.y.saturating_add(upper.height),
+        width: rect.width,
+        height: rect.height.saturating_sub(upper.height),
+    };
+    canvas.fill_rect_alpha(upper, COLOR_PANEL_GLASS, 168);
+    canvas.fill_rect_alpha(lower, COLOR_PANEL_INNER, 168);
+    // Soft inner border keeps the chrome reading as a single object even at
+    // low overall alpha.
     canvas.fill_rect_alpha(
         Rect {
             x: rect.x + 1,
@@ -1144,10 +1184,11 @@ fn draw_rail_panel(canvas: &mut SurfaceCanvas<'_>, rect: Rect) {
             width: rect.width.saturating_sub(2),
             height: rect.height.saturating_sub(2),
         },
-        COLOR_PANEL_INNER,
-        214,
+        COLOR_PANEL_ELEVATED,
+        56,
     );
     canvas.stroke_rect(rect, COLOR_BORDER_IDLE);
+    // Specular highlight along the very top edge.
     canvas.fill_rect_alpha(
         Rect {
             x: rect.x + 1,
@@ -1156,7 +1197,18 @@ fn draw_rail_panel(canvas: &mut SurfaceCanvas<'_>, rect: Rect) {
             height: 1,
         },
         COLOR_ACCENT_SOFT,
-        130,
+        180,
+    );
+    // Subtle baseline shadow at the bottom edge to plant the rail.
+    canvas.fill_rect_alpha(
+        Rect {
+            x: rect.x + 1,
+            y: rect.y + rect.height.saturating_sub(2),
+            width: rect.width.saturating_sub(2),
+            height: 1,
+        },
+        COLOR_SHADOW,
+        110,
     );
 }
 

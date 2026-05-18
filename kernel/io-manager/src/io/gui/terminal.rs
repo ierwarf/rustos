@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: commercial-max sessiond/uiserver should own terminal
+// drawing, cursor style, text layout, and normal console presentation. Ring0 keeps only
+// emergency boot/panic text output.
 use core::str;
 
 use embedded_graphics::geometry::Point;
@@ -544,3 +547,4 @@ fn terminal_foreground() -> Rgb888 {
 fn terminal_cursor_color() -> Rgb888 {
     Rgb888::new(124, 220, 255)
 }
+// RING3-MIGRATION-REFERENCE END: commercial-max sessiond/uiserver-owned terminal presentation.

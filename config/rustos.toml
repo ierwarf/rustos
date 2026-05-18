@@ -22,7 +22,7 @@ console = "info"
 service = "info"
 compat = "info"
 debug = "info"
-heartbeat = "off"
+heartbeat = "info"
 
 [fault_injection]
 # Runtime fault profiles are enabled for hardening runs. The default rule is

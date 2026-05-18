@@ -253,6 +253,10 @@ impl<'a> Default for ProcessLaunchOptions<'a> {
     }
 }
 
+// RING3-MIGRATION-REFERENCE START: loaderd/procd should own generic executable
+// image detection, launch defaults, file-backed image loading, and cold
+// Linux/Windows loader metadata policy. Ring0 should keep task commit,
+// address-space mutation, and prepared bootstrap materialization.
 #[inline(never)]
 pub fn load_image(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadError> {
     if image.starts_with(b"\x7FELF") {
@@ -356,6 +360,7 @@ pub fn prepare_process_file_with_address_space(
     }
     prepare_loaded_process_with_launch(loaded, launch)
 }
+// RING3-MIGRATION-REFERENCE END: loaderd/procd-owned generic image loading policy.
 
 pub fn spawn_prepared_process(
     prepared: PreparedProcessImage,
@@ -375,6 +380,10 @@ fn prepare_loaded_process_with_launch(
     mut loaded: LoadedProcessImage,
     launch: ProcessLaunchOptions<'_>,
 ) -> Result<PreparedProcessImage, ProcessLoadError> {
+    // RING3-MIGRATION-REFERENCE START: procd/syscalld should own process
+    // bootstrap policy defaults and runtime metadata selection. Ring0 keeps the
+    // guarded user-stack mapping, UserTaskBootstrap assembly, and scheduler
+    // commit boundary.
     debug_assert!(USER_STACK_RESERVE_PAGES > USER_STACK_INITIAL_COMMIT_PAGES);
     debug_assert!(
         USER_STACK_RESERVE_PAGES - USER_STACK_INITIAL_COMMIT_PAGES >= USER_STACK_GUARD_PAGES
@@ -418,8 +427,13 @@ fn prepare_loaded_process_with_launch(
         bootstrap,
     })
 }
+// RING3-MIGRATION-REFERENCE END: procd/syscalld-owned process bootstrap policy.
 
 pub fn load_image_file(file: VfsFileHandle) -> Result<LoadedProcessImage, ProcessLoadError> {
+    // RING3-MIGRATION-REFERENCE START: loaderd should own file-backed image
+    // format detection and normal app image reads. Ring0 keeps only fixed
+    // bootstrap escape hatches until rootd/loaderd can provide the prepared
+    // mapping metadata.
     let mut header = [0_u8; 4];
     let read = file.read_at(0, &mut header);
     if read < header.len() {
@@ -444,6 +458,7 @@ pub fn load_image_file(file: VfsFileHandle) -> Result<LoadedProcessImage, Proces
         "unknown executable image format",
     ))
 }
+// RING3-MIGRATION-REFERENCE END: loaderd-owned file-backed image loading policy.
 
 fn build_process_bootstrap(
     runtime: LoadedProcessRuntime,
@@ -526,6 +541,10 @@ fn build_process_bootstrap(
 }
 
 fn load_pe_metadata(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadError> {
+    // RING3-MIGRATION-REFERENCE START: loaderd should own cold PE header
+    // validation, image-base selection, size policy, and Windows runtime
+    // metadata derivation. Ring0 keeps only validated mapping commit and
+    // prepared-process bootstrap primitives.
     const PE_LOAD_OFFSET: u64 = 0x0040_0000;
     if image.len() < 0x100 {
         return Err(ProcessLoadError::InvalidPe("PE image is too small"));
@@ -601,6 +620,7 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, ProcessLoadError> {
         bytes[offset + 3],
     ]))
 }
+// RING3-MIGRATION-REFERENCE END: loaderd-owned cold PE metadata policy.
 
 fn page_ranges_overlap(page_base: u64, page_end: u64, existing_ranges: &[(u64, u64)]) -> bool {
     for &(other_start, other_end) in existing_ranges {

@@ -253,7 +253,6 @@ impl<'a> SurfaceCanvas<'a> {
             return;
         }
 
-        let x_end = rect.x.saturating_add(rect.width);
         let y_end = rect.y.saturating_add(rect.height);
 
         // Vertical grid lines. The previous implementation called

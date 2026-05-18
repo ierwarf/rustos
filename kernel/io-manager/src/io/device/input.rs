@@ -13,6 +13,9 @@ const MAX_INPUT_EVENTS_PER_READ: usize = 1024;
 const MAX_EVDEV_EVENTS_PER_READ: usize =
     MAX_INPUT_EVENTS_PER_READ * crate::input_core::MAX_EVDEV_EVENTS_PER_INPUT_EVENT;
 
+// RING3-MIGRATION-REFERENCE START: inputd should own input device read policy,
+// reader state, native/evdev translation, and buffer sizing. Ring0 keeps the
+// current-process user-copy broker used to deliver already-authorized bytes.
 pub fn read_events(dest: &mut [device::InputEvent]) -> usize {
     event_queue::read_input_events(dest)
 }
@@ -196,3 +199,4 @@ fn abi_events_as_input_core(
 ) -> &mut [crate::input_core::InputEvent] {
     unsafe { slice::from_raw_parts_mut(dest.as_mut_ptr().cast(), dest.len()) }
 }
+// RING3-MIGRATION-REFERENCE END: inputd-owned input device read policy.

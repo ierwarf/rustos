@@ -104,6 +104,9 @@ pub fn load_module_image_from_policy(
     }
 }
 
+// RING3-MIGRATION-REFERENCE START: driverd should own alias matching,
+// provider-group decisions, fallback priority, and retry/order policy. Ring0
+// keeps only narrow hardware-presence facts and the `.ko` load substrate.
 pub fn device_alias_present_from_policy(alias: &str, class: u32, bus: u32) -> bool {
     let Some(class) = decode_class(class) else {
         return false;
@@ -305,3 +308,4 @@ fn parse_fixed_hex(field: &str) -> Option<u32> {
     }
     Some(value)
 }
+// RING3-MIGRATION-REFERENCE END: driverd-owned provider/alias policy.

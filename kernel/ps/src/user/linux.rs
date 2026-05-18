@@ -1,5 +1,9 @@
 #![allow(dead_code)]
 
+// RING3-MIGRATION-REFERENCE START: commercial-max procd/syscalld should own Linux
+// process/thread ABI defaults, signal defaults, runtime metadata policy, and namespace
+// state. Ring0 keeps scheduler-facing task state and the minimum cached fields needed by
+// trap return and privileged broker commits.
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use linux_raw_sys::{
@@ -1483,3 +1487,4 @@ mod tests {
         );
     }
 }
+// RING3-MIGRATION-REFERENCE END: commercial-max procd/syscalld-owned Linux process ABI state.

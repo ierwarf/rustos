@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: commercial-max devmgrd/displayd should own display
+// device open/read/write policy, display metadata, and user-visible readiness state.
+// Ring0 keeps privileged framebuffer/user-copy/present broker primitives.
 use core::convert::TryFrom;
 #[cfg(rustos_debug_print_enabled)]
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -376,3 +379,4 @@ fn validate_surface_mapping(
         .ok_or(DeviceError::InvalidArgument)?;
     Ok(())
 }
+// RING3-MIGRATION-REFERENCE END: commercial-max devmgrd/displayd-owned display device policy.

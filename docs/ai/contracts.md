@@ -100,10 +100,15 @@ Kernel/userspace ABI:
   but ring0 intentionally retains compatibility-critical mechanisms:
   syscall/trap entry, gated syscall brokers, address-space mutation,
   scheduler/task mutation, user-copy, IRQ/MMIO/DMA/IOMMU access, and
-  kernel-address-space `.ko` module execution. Do not describe the system as a
-  pure microkernel, and do not move `.ko` execution or syscall broker
-  primitives out of the kernel without a replacement that preserves native
-  Linux ELF and Windows PE behavior.
+  kernel-address-space `.ko` module execution. Linux `.ko` modules must remain
+  ring0 for commercial driver compatibility: the kernel module ABI assumes
+  direct access to kernel symbols, IRQ state, DMA/MMIO mappings, Linux-style
+  callback context, and shared in-kernel driver data structures. Do not
+  describe the system as a pure microkernel, and do not move `.ko` execution or
+  syscall broker primitives out of the kernel without a replacement that
+  preserves native Linux ELF, Windows PE, and commercial driver behavior.
+  Move the policy around those mechanisms to services instead; see
+  `docs/ai/ring3-evacuation.md`.
 - Device, console, and UI `repr(C)` structs and ioctl numbers must be defined
   in `rustos-user-abi`; services such as `uiserver` and `runtimed` should use
   that crate rather than duplicating request structs or ioctl encoding logic.
@@ -461,7 +466,10 @@ Linux network and driver compat:
   the gated driver broker. The kernel broker owns only the privileged module
   loader and driver ABI substrate: validating `.ko` images, relocating them,
   exposing `DriverKernelApiV1`, mapping MMIO, and executing module init in the
-  kernel address space when the module ABI requires it.
+  kernel address space when the module ABI requires it. Do not move Linux `.ko`
+  execution to ring3 as a generic goal; ring3 work should remove surrounding
+  policy, namespace, queue, and provider decisions from the kernel while
+  leaving commercial-driver ABI execution in ring0.
 - Deleted io-manager VFS/network/USB/input/provider policy files are not source
   of truth. Do not restore them to make `.ko` loading or Linux socket behavior
   appear to work; add service-owned policy and narrow privileged brokers.

@@ -1,3 +1,7 @@
+// RING3-MIGRATION-REFERENCE START: commercial-max netd should own socket namespace,
+// socket option policy, bind/connect/listen routing, fd transfer, and network syscall
+// validation. Ring0 keeps current-process user-copy and raw socket/device handoff
+// primitives.
 use super::*;
 
 use alloc::string::String;
@@ -669,3 +673,4 @@ fn socket_error_to_linux_errno(error: multitask::SocketError) -> i64 {
         multitask::SocketError::TryAgain => LINUX_EAGAIN,
     }
 }
+// RING3-MIGRATION-REFERENCE END: commercial-max netd-owned socket broker policy.

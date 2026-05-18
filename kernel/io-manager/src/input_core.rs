@@ -94,6 +94,10 @@ pub struct InputEventQueueSnapshot {
     pub overwritten_pointer_positions: u64,
 }
 
+// RING3-MIGRATION-REFERENCE START: inputd should own queue coalescing,
+// overflow/drop policy, evdev translation, key-code mapping, and reader-visible
+// counters. Ring0 should keep only stable input ABI structs or a shared ABI
+// library split while hardware callbacks feed a bounded inputd-owned ring.
 #[derive(Clone, Copy)]
 struct PendingEvent {
     event: InputEvent,
@@ -783,6 +787,7 @@ fn pop_events_into(
     }
     count
 }
+// RING3-MIGRATION-REFERENCE END: inputd-owned input queue/translation core.
 
 #[cfg(test)]
 mod tests {

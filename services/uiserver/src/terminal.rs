@@ -168,7 +168,7 @@ impl TerminalState {
         if !self.initialized || self.layout.cols == 0 || self.layout.rows == 0 {
             return;
         }
-        self.render_cell(canvas, self.cursor_row, self.cursor_col);
+        self.render_cell(canvas, self.cursor_row, self.cursor_col, true);
     }
 
     pub(crate) fn render(&self, canvas: &mut SurfaceCanvas<'_>) {
@@ -180,7 +180,7 @@ impl TerminalState {
 
         for row in 0..self.layout.rows {
             for col in 0..self.layout.cols {
-                self.render_cell(canvas, row, col);
+                self.render_cell(canvas, row, col, false);
             }
         }
     }
@@ -309,9 +309,20 @@ impl TerminalState {
         self.cells[index] = byte;
     }
 
-    fn render_cell(&self, canvas: &mut SurfaceCanvas<'_>, row: usize, col: usize) {
+    fn render_cell(
+        &self,
+        canvas: &mut SurfaceCanvas<'_>,
+        row: usize,
+        col: usize,
+        paint_background: bool,
+    ) {
         let cell_rect = self.layout.cell_rect(row, col);
-        canvas.fill_rect(cell_rect, terminal_background_color());
+        // Bulk render fills the whole `layout.bounds` first, so per-cell
+        // background paints are only needed when the caller is repainting
+        // a single cell (e.g. cursor blink) on top of existing pixels.
+        if paint_background {
+            canvas.fill_rect(cell_rect, terminal_background_color());
+        }
 
         let byte = self.cell(row, col);
         if byte != b' ' {
@@ -387,13 +398,13 @@ fn first_csi_param(params: &Params) -> usize {
 }
 
 fn terminal_background_color() -> u32 {
-    0x00101724
+    0x000d_1726
 }
 
 fn terminal_foreground() -> u32 {
-    0x00e6_f0f8
+    0x00e8_ecf2
 }
 
 fn terminal_cursor_color() -> u32 {
-    0x0069_d5ff
+    0x00d8_e3f1
 }

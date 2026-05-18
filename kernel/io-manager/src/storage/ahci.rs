@@ -1,3 +1,7 @@
+// RING3-MIGRATION-REFERENCE START: commercial-max storaged should own AHCI port
+// discovery, command-slot policy, and block IO state only for a non-.ko service driver
+// rewrite. RustOS-authored `.ko` AHCI drivers stay ring0; ring0 also keeps MMIO/DMA/IRQ
+// grant primitives and early bootstrap block access.
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -814,3 +818,4 @@ fn wait_until(mut predicate: impl FnMut() -> bool) -> bool {
     }
     false
 }
+// RING3-MIGRATION-REFERENCE END: commercial-max storaged-owned non-.ko AHCI service driver.

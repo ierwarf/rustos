@@ -1,5 +1,8 @@
 #![allow(dead_code)]
 
+// RING3-MIGRATION-REFERENCE START: commercial-max syscalld/procd should own Linux
+// compatibility metadata, cold ABI structs, defaults, and namespace-facing state. Ring0
+// keeps only trap/user-copy representations and scheduler-visible cached state.
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use linux_raw_sys::{
@@ -1460,3 +1463,4 @@ mod tests {
         );
     }
 }
+// RING3-MIGRATION-REFERENCE END: commercial-max syscalld/procd-owned Linux compatibility state.

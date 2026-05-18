@@ -35,6 +35,9 @@ pub struct InputEventQueueDebugSnapshot {
     pub dropped_lossy: u64,
 }
 
+// RING3-MIGRATION-REFERENCE START: inputd should own input queue policy,
+// overflow/coalescing state, readers, and observability. Ring0 should keep only
+// bounded hardware-report ingress, wakeup, and user-copy/broker primitives.
 static INPUT_EVENTS: Mutex<InputEventQueueState> = Mutex::new(InputEventQueueState::new());
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -155,6 +158,7 @@ fn with_event_queue<R>(f: impl FnOnce(&mut InputEventQueueState) -> R) -> R {
         result
     }
 }
+// RING3-MIGRATION-REFERENCE END: inputd-owned input queue policy.
 
 #[cfg(test)]
 mod tests {

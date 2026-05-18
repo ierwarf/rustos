@@ -14,6 +14,9 @@ use super::constants::{
 use super::runtime::{set_last_error, with_windows_runtime_mut};
 use super::util::{address_space_error_to_win32, as_bytes};
 
+// RING3-MIGRATION-REFERENCE START: syscalld should own cold Win32 memory
+// policy validation and allocation DB decisions. Ring0 should keep only the
+// privileged address-space mutation and user-copy actions.
 pub(crate) fn virtual_query(address: u64, info_ptr: u64, len: u64) -> u64 {
     let result = with_windows_runtime_mut(|process_state, runtime| {
         let out_len = usize::try_from(len).map_err(|_| ERROR_INVALID_PARAMETER)?;
@@ -271,3 +274,4 @@ fn align_up_u64(value: u64, align: u64) -> Option<u64> {
     let mask = align.checked_sub(1)?;
     value.checked_add(mask).map(|value| value & !mask)
 }
+// RING3-MIGRATION-REFERENCE END: syscalld-owned Win32 memory policy.

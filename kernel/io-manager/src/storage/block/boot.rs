@@ -16,6 +16,9 @@ struct RegistryRootBlockDevice {
     block_count: u64,
 }
 
+// RING3-MIGRATION-REFERENCE START: storaged should own boot-volume candidate
+// ordering, partition policy, and root selection after bootstrap. Ring0 should
+// keep only early rootd/vfsd boot-block broker access and raw device IO.
 #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 pub(super) fn open_boot_handle() -> IoResult<BlockDeviceHandle> {
     super::ensure_initialized();
@@ -283,6 +286,7 @@ pub(super) fn detect_partitions(root_id: u32) -> IoResult<Vec<SharedPartitionInf
             .collect()
     })
 }
+// RING3-MIGRATION-REFERENCE END: storaged-owned boot-volume selection policy.
 
 impl storage_core::BlockDevice for RegistryRootBlockDevice {
     fn logical_block_size(&self) -> usize {

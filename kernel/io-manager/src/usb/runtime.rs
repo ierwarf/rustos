@@ -31,6 +31,9 @@ const PIPE_CONTROL: u32 = 2;
 const USB_DIR_IN: u32 = 0x80;
 const USB_URB_STATUS_IO_ERROR: i32 = -5;
 const USB_URB_STATUS_UNLINKED: i32 = -2;
+// RING3-MIGRATION-REFERENCE START: inputd should own USB HID report queue
+// policy, drop/coalescing limits, and HID parsing knobs. Linux .ko callback and
+// URB completion substrate stays ring0 for commercial driver compatibility.
 const REPORT_QUEUE_CAPACITY: usize = 256;
 const PENDING_COMPLETION_CAPACITY: usize = 64;
 const COMPLETIONS_PER_SERVICE: usize = 32;
@@ -154,6 +157,7 @@ static URB_SUBMIT_LOGS: AtomicUsize = AtomicUsize::new(0);
 static REPORT_ENQUEUE_LOGS: AtomicUsize = AtomicUsize::new(0);
 static REPORT_DESCRIPTOR_LOGS: AtomicUsize = AtomicUsize::new(0);
 static HID_REPORT_ENTRY_LOGS: AtomicUsize = AtomicUsize::new(0);
+// RING3-MIGRATION-REFERENCE END: inputd-owned USB HID queue state.
 
 pub(crate) fn service_pending() -> usize {
     let mut completed = 0usize;
@@ -324,6 +328,8 @@ pub(crate) fn unregister_interface(
 
 #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 pub(crate) fn enqueue_report(usb_device: *mut LinuxCompatUsbDevice, report: &[u8]) {
+    // RING3-MIGRATION-REFERENCE START: inputd should own runtime HID report
+    // buffering/coalescing and only receive bounded packets from ring0.
     if usb_device.is_null() || report.is_empty() {
         return;
     }
@@ -389,6 +395,7 @@ pub(crate) fn enqueue_report(usb_device: *mut LinuxCompatUsbDevice, report: &[u8
     }
 
     queue_urb_completion(completion);
+    // RING3-MIGRATION-REFERENCE END: inputd-owned runtime HID report buffering.
 }
 
 pub(crate) fn control_msg(
@@ -564,6 +571,9 @@ pub(crate) fn hid_input_report(
     data: *mut u8,
     size: u32,
 ) -> Option<i32> {
+    // RING3-MIGRATION-REFERENCE START: inputd should own HID report
+    // classification and event translation. Ring0 should only identify the HID
+    // source and forward the report bytes/capability.
     if dev.is_null() || data.is_null() || size == 0 || size as usize > MAX_REPORT_BYTES {
         return Some(-22);
     }
@@ -609,7 +619,9 @@ pub(crate) fn hid_input_report(
         }
         HidReportLayout::Pointer(layout) => handle_pointer_report(dev as usize, report, layout),
     };
-    Some(status)
+    let result = Some(status);
+    // RING3-MIGRATION-REFERENCE END: inputd-owned HID report classification.
+    result
 }
 
 pub(crate) fn hid_remove_device(dev: *mut LinuxCompatHidDevice) {
@@ -812,6 +824,9 @@ fn dispatch_urb_completion(completion: Option<UrbCompletion>) {
     }
 }
 
+// RING3-MIGRATION-REFERENCE START: inputd should own HID layout parsing,
+// keyboard/pointer state, coordinate scaling, bit extraction, and event
+// translation. Ring0 keeps only the USB/.ko callback boundary.
 fn runtime_reports_can_coalesce(
     existing: &RuntimeReport,
     incoming: &RuntimeReport,
@@ -1493,6 +1508,7 @@ fn sign_extend_u32(value: u32, bit_len: usize) -> i32 {
         (value | (!0u32 << bit_len)) as i32
     }
 }
+// RING3-MIGRATION-REFERENCE END: inputd-owned HID parse/translation policy.
 
 fn usb_pipeint(pipe: u32) -> bool {
     ((pipe >> 30) & 3) == PIPE_INTERRUPT

@@ -273,6 +273,7 @@ fn receive_launch_catalog(state: &mut BrokerState, receiver: &Receiver<LaunchCat
 }
 
 fn bootstrap_ui_server(state: &mut BrokerState) -> Result<(), i32> {
+    let (args, env) = ui_server_bootstrap_args_env();
     spawn_tracked_process(
         state,
         LaunchEntry {
@@ -285,10 +286,46 @@ fn bootstrap_ui_server(state: &mut BrokerState) -> Result<(), i32> {
             weight_micros: UI_SERVER_TASK_WEIGHT_MICROS,
             logical_admin: false,
             console_hosted: false,
-            args: Vec::new(),
-            env: Vec::new(),
+            args,
+            env,
         },
     )
+}
+
+fn ui_server_bootstrap_args_env() -> (Vec<String>, Vec<String>) {
+    // Bootstrap happens before the launch catalog loader has finished, so we
+    // pull the uiserver desktop entry (and the Init-scope env defaults) up
+    // front. Reading from the registry warms the OnceLock cache; the catalog
+    // loader thread reuses it without a second disk read.
+    let mut env = Vec::new();
+    if let Ok(values) =
+        load_runtime_default_env(DEFAULT_RUNTIME_ENV_REGISTRY_PATH, RuntimeEnvScope::Init)
+    {
+        env.extend(values);
+    }
+
+    let mut args = Vec::new();
+    if let Ok(entries) = load_desktop_program_entries(DEFAULT_APPLICATIONS_DIR) {
+        if let Some(entry) = entries
+            .into_iter()
+            .find(|entry| entry.desktop_file_id == UI_SERVER_DESKTOP_FILE_ID)
+        {
+            args = entry.args;
+            merge_manifest_env_into(&mut env, &entry.env);
+        }
+    }
+    (args, env)
+}
+
+fn merge_manifest_env_into(env: &mut Vec<String>, manifest_env: &[String]) {
+    for value in manifest_env {
+        let Some(eq) = value.find('=') else {
+            continue;
+        };
+        let key_prefix = &value[..=eq];
+        env.retain(|existing| !existing.starts_with(key_prefix));
+        env.push(value.clone());
+    }
 }
 
 fn bind_listener(path: &str) -> Result<UnixListener, i32> {

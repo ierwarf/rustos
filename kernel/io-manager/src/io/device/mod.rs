@@ -167,6 +167,10 @@ impl From<paging::AddressSpaceError> for DeviceError {
     }
 }
 
+// RING3-MIGRATION-REFERENCE START: devmgrd should own device namespace,
+// permission/access-kind selection, and device-open policy. Ring0 should keep
+// typed device handles plus user-copy/ioctl brokers after devmgrd authorizes
+// the operation.
 const DEVICE_DESCRIPTORS: [DeviceDescriptor; 3] = [
     DeviceDescriptor {
         id: DeviceId::Console,
@@ -305,6 +309,7 @@ fn normalize_device_path(path: &str) -> Result<NormalizedDevicePath, DeviceLooku
         _ => Err(DeviceLookupError::NotFound),
     }
 }
+// RING3-MIGRATION-REFERENCE END: devmgrd-owned device namespace/read policy.
 
 #[cfg(test)]
 mod tests {

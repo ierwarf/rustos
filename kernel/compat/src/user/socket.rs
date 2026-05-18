@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: commercial-max netd should own Linux socket ABI
+// compatibility, address conversion policy, option validation, and namespace routing.
+// Ring0 keeps only current-process copy helpers and raw socket broker commits.
 use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -1047,3 +1050,4 @@ mod tests {
         assert!(listener.bound_path().is_none());
     }
 }
+// RING3-MIGRATION-REFERENCE END: commercial-max netd-owned Linux socket compatibility policy.

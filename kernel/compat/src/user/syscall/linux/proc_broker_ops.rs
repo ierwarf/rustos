@@ -1,3 +1,7 @@
+// RING3-MIGRATION-REFERENCE START: commercial-max procd/loaderd/pager should own process
+// prepare state, exec tickets, file-backed mapping plans, and fork/signal policy. Ring0
+// keeps only pinned backing validation, address-space commit, final register transition,
+// and task mutation as narrow privileged broker commits.
 use super::*;
 
 use alloc::collections::BTreeMap;
@@ -1257,3 +1261,4 @@ fn console_host_error_to_linux_errno(error: crate::user::console_host::ConsoleHo
         }
     }
 }
+// RING3-MIGRATION-REFERENCE END: commercial-max procd/loaderd/pager-owned process broker policy.

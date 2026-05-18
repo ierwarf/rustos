@@ -1,3 +1,7 @@
+// RING3-MIGRATION-REFERENCE START: commercial-max rootd/capability service should own
+// service discovery, endpoint namespace, handle-transfer policy, slow-call policy, and
+// service capability grants. Ring0 keeps endpoint creation, user-copy, wake/reply, and
+// handle import/export primitives as the IPC substrate.
 use super::*;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -1085,3 +1089,4 @@ fn log_slow_ipc_reply(
         );
     });
 }
+// RING3-MIGRATION-REFERENCE END: commercial-max rootd/capability-owned IPC policy.

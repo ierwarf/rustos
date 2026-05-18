@@ -377,6 +377,8 @@ fn run() -> Result<(), i32> {
     let mut next_loop_summary = Instant::now() + Duration::from_secs(1);
     let mut next_wayland_backlog_service = Instant::now();
     let mut loop_count = 0_u64;
+    let mut frames_rendered_window = 0_u64;
+    let mut cursor_moves_window = 0_u64;
 
     loop {
         loop_count = loop_count.saturating_add(1);
@@ -495,23 +497,29 @@ fn run() -> Result<(), i32> {
 
         let now = Instant::now();
         if now >= next_loop_summary {
-            if profile::enabled() {
-                diag_line(
-                    format!(
-                        "uiserver: loop summary loops={} pending_update={} backlog={} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
-                        loop_count,
-                        !drawable_update.is_empty(),
-                        input.backlog_remaining,
-                        state.console_windows.len(),
-                        state.wayland_windows.len(),
-                        state.focused_session_handle,
-                        state.focused_wayland_surface_id,
-                    )
-                    .as_str(),
-                );
-            }
+            diag_line(
+                format!(
+                    "uiserver: heartbeat loops={} frames={} cursor_moves={} cursor={},{} presented_cursor={},{} pending_update={} backlog={} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
+                    loop_count,
+                    frames_rendered_window,
+                    cursor_moves_window,
+                    state.cursor_x,
+                    state.cursor_y,
+                    presented_cursor_x,
+                    presented_cursor_y,
+                    !drawable_update.is_empty(),
+                    input.backlog_remaining,
+                    state.console_windows.len(),
+                    state.wayland_windows.len(),
+                    state.focused_session_handle,
+                    state.focused_wayland_surface_id,
+                )
+                .as_str(),
+            );
             next_loop_summary = now + Duration::from_secs(1);
             loop_count = 0;
+            frames_rendered_window = 0;
+            cursor_moves_window = 0;
         }
         let rendered = if drawable_update.needs_full_redraw {
             let render_started = Instant::now();
@@ -605,6 +613,7 @@ fn run() -> Result<(), i32> {
         }
 
         if rendered {
+            frames_rendered_window = frames_rendered_window.saturating_add(1);
             if let Some(compositor) = wayland.as_mut() {
                 compositor.frame_presented();
             }
@@ -614,6 +623,7 @@ fn run() -> Result<(), i32> {
             presented_cursor_x = state.cursor_x;
             presented_cursor_y = state.cursor_y;
             if cursor_moved {
+                cursor_moves_window = cursor_moves_window.saturating_add(1);
                 log_pointer_moved_once(&state);
             }
         }

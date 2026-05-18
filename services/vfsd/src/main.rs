@@ -846,6 +846,9 @@ impl VfsState {
     }
 
     fn metadata(&mut self, path: &str) -> Result<Metadata, i32> {
+        // RING3-MIGRATION-REFERENCE START: devmgrd should own device namespace
+        // metadata. vfsd should consume explicit devmgrd-provided nodes instead
+        // of carrying static `/dev` policy.
         if path == "/"
             || path == "/dev"
             || path == "/proc"
@@ -866,6 +869,7 @@ impl VfsState {
                 inode: path_inode(path.as_bytes()),
             });
         }
+        // RING3-MIGRATION-REFERENCE END: devmgrd-owned device metadata.
         self.invalidate_caches_if_remounted();
         if let Some(entry) = self.metadata_cache.get(path) {
             return *entry;
@@ -887,6 +891,9 @@ impl VfsState {
 
     fn dir_entries(&mut self, path: &str) -> Result<Vec<DirEntry>, i32> {
         let mut entries = Vec::new();
+        // RING3-MIGRATION-REFERENCE START: devmgrd should own `/dev` directory
+        // contents and capability metadata; vfsd should mirror a devmgrd
+        // registry rather than listing static device nodes.
         if path == "/" {
             entries.push(DirEntry::new("dev", RemoteKind::Directory));
             entries.push(DirEntry::new("proc", RemoteKind::Directory));
@@ -911,6 +918,7 @@ impl VfsState {
         if path == "/proc" || path == "/run" {
             return Ok(entries);
         }
+        // RING3-MIGRATION-REFERENCE END: devmgrd-owned `/dev` directory policy.
         self.invalidate_caches_if_remounted();
         if let Some(cached) = self.dir_entries_cache.get(path) {
             entries.extend_from_slice(cached);
@@ -957,6 +965,8 @@ impl DirEntry {
     }
 }
 
+// RING3-MIGRATION-REFERENCE START: devmgrd should be the source of device-node
+// existence and type policy; vfsd should not grow this static list.
 fn known_device_node(path: &str) -> bool {
     matches!(
         path,
@@ -967,6 +977,7 @@ fn known_device_node(path: &str) -> bool {
 fn is_input_device_node(path: &str) -> bool {
     matches!(path, "/dev/input0" | "/dev/input/event0")
 }
+// RING3-MIGRATION-REFERENCE END: devmgrd-owned device-node policy.
 
 struct BootBlockDevice {
     block_size: usize,

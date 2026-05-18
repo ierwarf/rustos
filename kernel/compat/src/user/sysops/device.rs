@@ -1,3 +1,7 @@
+// RING3-MIGRATION-REFERENCE START: commercial-max devmgrd/displayd should own device
+// sysop policy, `/dev` handle dispatch, ioctl/read/write authorization, surface metadata,
+// and device ABI validation. Ring0 keeps current-process user-copy, display mapping
+// commits, and raw device broker primitives.
 use core::convert::TryFrom;
 use core::mem::size_of;
 use core::slice;
@@ -673,3 +677,4 @@ fn map_device_error(err: device_ns::DeviceError) -> DeviceSysopError {
         device_ns::DeviceError::Unsupported => DeviceSysopError::Unsupported,
     }
 }
+// RING3-MIGRATION-REFERENCE END: commercial-max devmgrd/displayd-owned device sysop policy.

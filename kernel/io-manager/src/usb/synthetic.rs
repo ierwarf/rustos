@@ -13,6 +13,9 @@ use super::hid_translation::{
 use crate::driver::linux::compat::{LinuxCompatHidDevice, LinuxCompatUrb, LinuxCompatUsbDevice};
 use crate::input::keyboard::{KeyAction, KeyboardEvent};
 
+// RING3-MIGRATION-REFERENCE START: inputd should own synthetic HID device
+// state, report generation, queue/drop policy, and event translation. Ring0
+// keeps only compatibility callbacks needed by Linux .ko USB/HID paths.
 const KEYBOARD_REPORT_LEN: usize = 8;
 const POINTER_REPORT_LEN: usize = 4;
 const MAX_REPORT_LEN: usize = KEYBOARD_REPORT_LEN;
@@ -972,3 +975,4 @@ fn with_injection(f: impl FnOnce()) {
     f();
     end_injection();
 }
+// RING3-MIGRATION-REFERENCE END: inputd-owned synthetic HID policy.

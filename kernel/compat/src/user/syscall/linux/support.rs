@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: commercial-max syscalld should own cold Linux ABI
+// compatibility tables, errno/default translations, and policy-facing helper logic.
+// Ring0 keeps only helpers required by trap entry and privileged broker commits.
 use super::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -524,3 +527,4 @@ fn linux_syscall_number_supported(syscall_number: u64) -> bool {
                 | linux_abi::SYS_EXIT_GROUP
         )
 }
+// RING3-MIGRATION-REFERENCE END: commercial-max syscalld-owned Linux syscall support policy.

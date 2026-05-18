@@ -89,6 +89,10 @@ pub fn register_boot_volume_opener() {
     );
 }
 
+// RING3-MIGRATION-REFERENCE START: storaged should own block inventory,
+// boot-root selection policy, transport preference, and `/dev/block*`
+// namespace lookup after bootstrap. Ring0 keeps hardware block drivers and
+// gated read/write broker primitives.
 pub fn current_boot_volume_handle() -> Option<BlockDeviceHandle> {
     ensure_initialized();
 
@@ -249,6 +253,7 @@ fn log_boot_volume_handle_once(handle: BlockDeviceHandle) {
         );
     }
 }
+// RING3-MIGRATION-REFERENCE END: storaged-owned block inventory/selection policy.
 
 pub(crate) fn flush(handle: BlockDeviceHandle) -> IoResult<()> {
     ensure_initialized();

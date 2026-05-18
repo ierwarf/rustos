@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: commercial-max inputd should own HID usage
+// translation, key/button mapping tables, and layout policy. Ring0 keeps only raw report
+// ingress from hardware or compatibility drivers.
 use driver_abi::{POINTER_BUTTON_LEFT, POINTER_BUTTON_MIDDLE, POINTER_BUTTON_RIGHT};
 
 use crate::input::keyboard::KeyCode;
@@ -266,3 +269,4 @@ pub(super) fn hid_usage_to_keycode(usage: u8) -> Option<KeyCode> {
         _ => return None,
     })
 }
+// RING3-MIGRATION-REFERENCE END: commercial-max inputd-owned HID translation policy.

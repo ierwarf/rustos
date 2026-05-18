@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: commercial-max storaged/pager should own block cache,
+// block IO scheduling policy, request coalescing, and backing-object handoff. Ring0 keeps
+// raw block-device primitives and early bootstrap reads.
 use crate::sync::KernelSpinLock as Mutex;
 use alloc::boxed::Box;
 use alloc::format;
@@ -259,3 +262,4 @@ pub(super) fn cache_lookup(device_id: u32, lba: u64) -> Option<Vec<u8>> {
 pub(super) fn clear_cache_for_tests() {
     BLOCK_CACHE.lock().clear();
 }
+// RING3-MIGRATION-REFERENCE END: commercial-max storaged/pager-owned block IO cache policy.

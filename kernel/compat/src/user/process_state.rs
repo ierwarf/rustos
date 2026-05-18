@@ -171,6 +171,10 @@ pub struct UserProcessState {
     exec_path_len: usize,
 }
 
+// RING3-MIGRATION-REFERENCE START: loaderd/syscalld should own cold Win32
+// runtime metadata, module/allocation policy DBs, and validation defaults.
+// Ring0 keeps only the metadata required for current address-space, scheduler,
+// handle, and user-copy operations.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WindowsLoadedModule {
     pub base_address: u64,
@@ -311,6 +315,7 @@ impl WindowsThreadRuntimeState {
         }
     }
 }
+// RING3-MIGRATION-REFERENCE END: loaderd/syscalld-owned Win32 metadata policy.
 
 impl UserProcessState {
     pub fn new(
@@ -653,6 +658,9 @@ impl UserProcessState {
         Ok(region)
     }
 
+    // RING3-MIGRATION-REFERENCE START: syscalld should own cold Win32
+    // allocation/protection policy tracking. Ring0 keeps only address-space
+    // mutation and minimal metadata needed for VirtualQuery copyout.
     pub fn record_windows_allocation(&mut self, allocation: WindowsAllocation) {
         if let Some(existing) = self
             .windows_allocations
@@ -696,6 +704,7 @@ impl UserProcessState {
             .position(|allocation| allocation.base == base)?;
         Some(self.windows_allocations.swap_remove(index))
     }
+    // RING3-MIGRATION-REFERENCE END: syscalld-owned Win32 allocation policy DB.
 
     fn sync_linux_mapping_cursor(&mut self) {
         if let Some(linux_process_state) = self.linux_process_state.as_mut() {

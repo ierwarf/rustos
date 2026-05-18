@@ -156,10 +156,11 @@ impl AppState {
             if !session_title.is_empty() && window.title != session_title {
                 window.title = session_title;
                 window.invalidate_surface();
-                prime_console_window_surface(
-                    window,
-                    window.session_handle == refresh.state.focused_session_handle,
-                );
+                // Defer rebuild to the render pass; draw_console_window will
+                // call rebuild_console_window_surface unconditionally before
+                // blitting the cached pixels. Priming here would just duplicate
+                // that work and stretch the runtime refresh (the only time we
+                // hold the main loop) into a visible stall.
                 update.add_partial_rect(crate::render::console_window_dirty_rect(window.frame));
                 update.add_partial_rect(taskbar_dirty_rect);
             }
@@ -180,10 +181,11 @@ impl AppState {
                     .extend_from_slice(output.bytes.as_slice());
                 window.terminal_dirty = true;
                 window.invalidate_surface();
-                prime_console_window_surface(
-                    window,
-                    window.session_handle == refresh.state.focused_session_handle,
-                );
+                // Defer rebuild to the render pass; draw_console_window will
+                // call rebuild_console_window_surface unconditionally before
+                // blitting the cached pixels. Priming here would just duplicate
+                // that work and stretch the runtime refresh (the only time we
+                // hold the main loop) into a visible stall.
                 update.add_partial_rect(crate::render::console_window_dirty_rect(window.frame));
             }
             window.output_generation = output.output_generation;
@@ -214,16 +216,12 @@ impl AppState {
                 self.display.height,
                 self.console_windows.len(),
             );
-            let focused = session_handle == self.focused_session_handle;
             self.console_windows.push(ConsoleWindow::new(
                 session_handle,
                 console_session_title(session),
                 frame,
                 0,
             ));
-            if let Some(window) = self.console_windows.last_mut() {
-                prime_console_window_surface(window, focused);
-            }
             known_sessions.push(session_handle);
             update.add_partial_rect(crate::render::console_window_dirty_rect(frame));
         }
@@ -286,16 +284,12 @@ impl AppState {
 
             let frame =
                 default_console_window_rect(self.display.width, self.display.height, next.len());
-            let focused = program.session_handle == self.focused_session_handle;
             next.push(ConsoleWindow::new(
                 program.session_handle,
                 runtime_program_title(program),
                 frame,
                 0,
             ));
-            if let Some(window) = next.last_mut() {
-                prime_console_window_surface(window, focused);
-            }
             update.add_partial_rect(crate::render::console_window_dirty_rect(frame));
             update.add_partial_rect(taskbar_dirty_rect);
         }
@@ -648,12 +642,6 @@ impl AppState {
         } else {
             self.window_rect_for_session(session_handle)
         }
-    }
-}
-
-fn prime_console_window_surface(window: &mut ConsoleWindow, focused: bool) {
-    if !window.surface_cache.valid {
-        crate::render::rebuild_console_window_surface(window, focused);
     }
 }
 

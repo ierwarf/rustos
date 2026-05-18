@@ -1,3 +1,7 @@
+// RING3-MIGRATION-REFERENCE START: commercial-max syscalld/pager should own Linux MM
+// policy, mapping defaults, backing-object leases, and pager-visible accounting. Ring0
+// keeps page-table mutation, current-address-space validation, and backing lifetime
+// enforcement as privileged broker commits.
 use super::*;
 
 use alloc::vec::Vec;
@@ -531,3 +535,4 @@ fn memfd_error_to_errno(err: MemfdError) -> i64 {
         MemfdError::PermissionDenied => LINUX_EACCES,
     }
 }
+// RING3-MIGRATION-REFERENCE END: commercial-max syscalld/pager-owned MM broker policy.
