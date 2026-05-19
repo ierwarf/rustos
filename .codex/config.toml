@@ -1,0 +1,73 @@
+# Project-scoped Codex configuration for RustOS.
+#
+# Loaded in addition to ~/.codex/config.toml when the agent is run with
+# CWD inside this repo. Only applies because this project is marked
+# trust_level = "trusted" in the user config.
+#
+# Keep this file project-specific: hooks, MCP servers, and any
+# overrides that only make sense for RustOS work belong here. Personal
+# style settings (model, reasoning effort, plugins, memories) stay in
+# the user config.
+
+[features]
+codex_hooks = true
+
+# --------------------------------------------------------------------------
+# Hooks
+#
+# Scripts live in .codex/hooks/ and read a JSON event from stdin, returning
+# a JSON decision on stdout. Each script computes the repo root from its
+# own location so this config is portable across clones.
+# --------------------------------------------------------------------------
+
+[[hooks.PreToolUse]]
+matcher = "^Read$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = '"$(git rev-parse --show-toplevel)/.codex/hooks/pre_read_large_file.sh"'
+timeout = 5
+statusMessage = "Checking file size / allow-list"
+
+[[hooks.PreToolUse]]
+matcher = "^Bash$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = '"$(git rev-parse --show-toplevel)/.codex/hooks/pre_bash_destructive.sh"'
+timeout = 5
+statusMessage = "Checking for destructive shell"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = '"$(git rev-parse --show-toplevel)/.codex/hooks/pre_commit.sh"'
+timeout = 180
+statusMessage = "Pre-commit fmt + clippy"
+
+[[hooks.PostToolUse]]
+matcher = "^(Edit|Write)$"
+
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = '"$(git rev-parse --show-toplevel)/.codex/hooks/post_edit_rust.sh"'
+timeout = 120
+statusMessage = "cargo xtask check"
+
+# --------------------------------------------------------------------------
+# MCP servers (project-scoped)
+#
+# Uncomment after installing the corresponding binary. Project-scoped MCP
+# is honored because this project is trusted in the user config.
+# --------------------------------------------------------------------------
+
+# [mcp_servers.ripgrep]
+# command = "mcp-ripgrep"
+# args = []
+
+# [mcp_servers.serena]
+# command = "uvx"
+# args = ["--from", "serena-mcp", "serena"]
+
+# [mcp_servers.github]
+# command = "gh-mcp"
+# args = []

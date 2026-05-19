@@ -25,7 +25,5 @@
 # Local scratch files
 /settings.rs
 
-# Local agent/tool state
-/.codex
-/.codex/
-/.agents/
+# Agent/tool config is tracked: .codex/ (hooks, subagents, project config),
+# .agents/ (skills), and .cargo/ (workspace cargo config) live in-repo.
