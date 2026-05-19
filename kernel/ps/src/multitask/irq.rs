@@ -128,7 +128,10 @@ extern "C" fn software_schedule_interrupt_dispatch(
     let next_rsp = unsafe {
         let scheduler = scheduler_mut();
         scheduler.save_current_simd_state();
-        let (next_rsp, _next_pit_divisor) = scheduler.on_timer_interrupt(current_rsp);
+        // Voluntary yield: floor the vruntime charge so a sub-tick yield can't
+        // accumulate 0 vruntime and re-win CFS. Timer-driven preemption still
+        // uses the unfloored path.
+        let (next_rsp, _next_pit_divisor) = scheduler.on_voluntary_yield(current_rsp);
         scheduler.prepare_current_task_execution();
         scheduler.restore_current_simd_state();
         next_rsp

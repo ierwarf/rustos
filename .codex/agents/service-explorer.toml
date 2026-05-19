@@ -1,7 +1,7 @@
 name = "service-explorer"
 description = "Read-only explorer for the services/ and compat/ subtrees. Use to locate service ownership, trace IPC paths, and find which daemon owns a given policy before proposing changes. Parallelizable with kernel-explorer for cross-cutting questions."
 model = "gpt-5.5"
-model_reasoning_effort = "medium"
+model_reasoning_effort = "low"
 sandbox_mode = "read-only"
 nickname_candidates = ["sex", "svcx"]
 developer_instructions = """

@@ -41,7 +41,10 @@ const PAGE_FAULT_VECTOR: u8 = 14;
 const RFLAGS_RESERVED_BIT_1: u64 = 1 << 1;
 const LONG_READY_WAIT_THRESHOLD_MS: u64 = 50;
 const LONG_BLOCKED_WAIT_THRESHOLD_MS: u64 = 250;
-const MAX_LONG_WAIT_LOGS: usize = 64;
+// Cap bumped from 64 -> 256 so the diagnostic survives past the initial boot
+// spike. Earlier runs exhausted the cap by the second of bring-up, hiding the
+// later steady-state stalls completely.
+const MAX_LONG_WAIT_LOGS: usize = 256;
 static LONG_WAIT_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 // CFS-like fairness constants (mirrors Linux kernel/sched/fair.c).
@@ -53,9 +56,15 @@ const MAX_LOAD_WEIGHT: u32 = 1_000_000;
 // Latency credit applied when a sleeper wakes: their vruntime is bounded by
 // (min_vruntime - SLEEPER_LATENCY_BONUS_NS), so I/O-bound tasks get
 // preferential dispatch but cannot stockpile unbounded credit while idle.
-// 12ms is generous enough to win wake-preempt against CPU-bound peers even
-// after a relatively short render burst.
-const SLEEPER_LATENCY_BONUS_NS: u64 = 12_000_000;
+// 1.5ms (matches Linux CFS `sysctl_sched_wakeup_granularity`'s default class)
+// — large enough to give a freshly-woken IPC replier preemption priority
+// against a peer's tail latency, but small enough that a high-weight task
+// like `uiserver` (weight_micros=1000, real weight ~8000) is not repeatedly
+// starved by I/O-bound peers (~weight 952) waking from short syscall blocks.
+// At 12ms, the per-wake real-time advantage to a light peer over a heavy
+// task was `12ms * heavy_weight / light_weight ≈ 100ms`, which let services
+// monopolize CPU on every wake and dropped uiserver render to ~5fps.
+const SLEEPER_LATENCY_BONUS_NS: u64 = 1_500_000;
 // Bounded L4/seL4-style IPC handoff credit. This is deliberately much smaller
 // than the sleeper bonus: it nudges a just-woken server/replier ahead of the
 // caller's fair position without turning every IPC service into permanent RT.
@@ -426,16 +435,47 @@ impl Scheduler {
 
     /// Accumulates vruntime for the currently-running slot up to `now_ticks`
     /// and clears its execution-start mark. Safe to call repeatedly.
-    fn account_current_runtime(&mut self, slot: usize, now_ticks: u64) {
+    ///
+    /// Floors the per-slice charge when explicitly requested by a voluntary
+    /// yield path so a sub-tick yield can never charge 0. The RTC tick is
+    /// ~976us at 1024Hz, and without a floor a task that yields rapidly
+    /// (e.g. the nucleus housekeeping loop, or a user task ping-ponging IPC
+    /// replies) accumulates 0 vruntime per pick and keeps winning CFS while
+    /// real services sit ready for hundreds of ms. The floor mirrors
+    /// `SCHED_MIN_GRANULARITY_NS` — the same threshold the keep-current guard
+    /// uses — so the two halves of the heuristic agree.
+    ///
+    /// Timer-driven accounting (`force_min_charge = false`) is unchanged: a
+    /// preempted task that genuinely ran less than a tick boundary keeps the
+    /// historical zero-charge behavior, since storage and other kernel paths
+    /// rely on it to make timely forward progress under TCG.
+    fn account_current_runtime(
+        &mut self,
+        slot: usize,
+        now_ticks: u64,
+        force_min_charge: bool,
+    ) {
         let Some(context) = self.contexts[slot].as_mut() else {
             return;
         };
         let start = context.exec_start_ticks;
-        if start == 0 || now_ticks <= start {
+        if start == 0 {
+            return;
+        }
+        let elapsed_ns = if now_ticks > start {
+            Self::ticks_elapsed_ns(start, now_ticks)
+        } else {
+            0
+        };
+        let elapsed_ns = if force_min_charge {
+            elapsed_ns.max(SCHED_MIN_GRANULARITY_NS)
+        } else {
+            elapsed_ns
+        };
+        if elapsed_ns == 0 {
             context.exec_start_ticks = 0;
             return;
         }
-        let elapsed_ns = Self::ticks_elapsed_ns(start, now_ticks);
         let delta = Self::weighted_vruntime_delta(elapsed_ns, context.weight);
         context.vruntime_ns = context.vruntime_ns.saturating_add(delta);
         context.exec_start_ticks = 0;
@@ -496,12 +536,19 @@ impl Scheduler {
         if sample >= MAX_LONG_WAIT_LOGS {
             return;
         }
+        // `self.current_task` is still the slot being preempted right now: it is
+        // the task that held CPU while the picked slot sat ready. Logging it
+        // names the suspected cond_resched offender directly.
+        let (from_slot, from_task, from_pid) = self.describe_current_task();
         crate::debug::println!(
-            "scheduler ready wait: slot={} task={} pid={} elapsed_ms={}",
+            "scheduler ready wait: slot={} task={} pid={} elapsed_ms={} from_slot={} from_task={} from_pid={}",
             slot,
             task_id.unwrap_or(0),
             process_id,
-            elapsed_ms
+            elapsed_ms,
+            from_slot,
+            from_task,
+            from_pid,
         );
     }
 
@@ -524,13 +571,38 @@ impl Scheduler {
         if sample >= MAX_LONG_WAIT_LOGS {
             return;
         }
+        // The waker (current task) and its identity isolate "service was idle"
+        // (waker is some peer reaching it for the first time in a while) from
+        // "scheduler dropped the wakeup" (waker is the IPC replier and the
+        // gap should have been ms, not s).
+        let (from_slot, from_task, from_pid) = self.describe_current_task();
         crate::debug::println!(
-            "scheduler blocked wait: slot={} task={} pid={} elapsed_ms={}",
+            "scheduler blocked wait: slot={} task={} pid={} elapsed_ms={} woken_by_slot={} woken_by_task={} woken_by_pid={}",
             slot,
             task_id.unwrap_or(0),
             process_id,
-            elapsed_ms
+            elapsed_ms,
+            from_slot,
+            from_task,
+            from_pid,
         );
+    }
+
+    fn describe_current_task(&self) -> (usize, u64, u64) {
+        let slot = self.current_task;
+        let task = self
+            .starts
+            .get(slot)
+            .and_then(|start| *start)
+            .map(|start| start.id)
+            .unwrap_or(0);
+        let pid = self
+            .contexts
+            .get(slot)
+            .and_then(|context| *context)
+            .and_then(|context| context.process_id)
+            .unwrap_or(0);
+        (slot, task, pid)
     }
 
     fn retire_slot(&mut self, slot: usize, reason: TaskRetireReason) {
@@ -1359,6 +1431,18 @@ impl Scheduler {
     }
 
     pub(super) fn on_timer_interrupt(&mut self, current_rsp: usize) -> (usize, u16) {
+        self.dispatch_schedule(current_rsp, false)
+    }
+
+    pub(super) fn on_voluntary_yield(&mut self, current_rsp: usize) -> (usize, u16) {
+        self.dispatch_schedule(current_rsp, true)
+    }
+
+    fn dispatch_schedule(
+        &mut self,
+        current_rsp: usize,
+        voluntary_yield: bool,
+    ) -> (usize, u16) {
         let current_slot = self.current_task;
         let now_ticks = crate::arch::rtc::ticks();
         let current_runtime_ns = self.contexts[current_slot]
@@ -1369,8 +1453,9 @@ impl Scheduler {
 
         // Account vruntime for the outgoing slot first, regardless of what we
         // do with it next. This makes the CFS-like fairness accounting see
-        // every CPU cycle a task actually consumed.
-        self.account_current_runtime(current_slot, now_ticks);
+        // every CPU cycle a task actually consumed. On voluntary yields we
+        // floor the charge — see `account_current_runtime` for the rationale.
+        self.account_current_runtime(current_slot, now_ticks, voluntary_yield);
 
         if self.retired[current_slot] {
             self.mark_slot_ready(current_slot, current_rsp, false);

@@ -1,7 +1,7 @@
 name = "kernel-explorer"
 description = "Read-only explorer for the kernel/ subtree. Use to locate symbols, trace call sites, and gather evidence in kernel code before any change is proposed. Cheap and parallelizable — spawn multiple instances for independent queries."
 model = "gpt-5.5"
-model_reasoning_effort = "medium"
+model_reasoning_effort = "low"
 sandbox_mode = "read-only"
 nickname_candidates = ["kex", "kexp"]
 developer_instructions = """

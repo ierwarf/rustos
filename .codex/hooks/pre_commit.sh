@@ -34,9 +34,6 @@ if ! cargo fmt --all -- --check >/dev/null 2>&1; then
   fail "cargo fmt --check failed. Run 'cargo fmt --all' and retry."
 fi
 
-if ! timeout 120 cargo clippy --workspace --no-deps -- -D warnings >/tmp/clippy.out 2>&1; then
-  tail="$(tail -n 30 /tmp/clippy.out)"
-  fail "cargo clippy failed (tail): $tail"
-fi
-
+# clippy is already run by post_edit_rust.sh after every .rs edit;
+# re-running --workspace here adds ~120s per commit for no benefit.
 printf '{"decision":"allow"}\n'

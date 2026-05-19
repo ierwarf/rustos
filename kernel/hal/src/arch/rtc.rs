@@ -275,21 +275,28 @@ pub fn init() {
 pub fn on_interrupt() {
     let ticks = RTC_TICKS.fetch_add(1, Ordering::AcqRel).saturating_add(1);
     wake_ready_sleepers(ticks);
-    let last_diag_tick = RTC_LAST_DIAG_PRINT_TICK.load(Ordering::Acquire);
-    if ticks.saturating_sub(last_diag_tick) >= 4
-        && RTC_LAST_DIAG_PRINT_TICK
-            .compare_exchange(last_diag_tick, ticks, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    {
-        let completed = RTC_TICKS_COMPLETED.load(Ordering::Acquire);
-        let task = crate::hooks::current_task_id().unwrap_or(u64::MAX);
-        crate::debug::println!(
-            "rtc diag: tick={} completed={} delta={} task={}",
-            ticks,
-            completed,
-            ticks.saturating_sub(completed),
-            task,
-        );
+    // Only emit the diagnostic when we observe more than one in-flight tick
+    // (re-entrance or a missed completion). In the steady state delta is
+    // always 1 — logging that every few ticks dominates the debugcon stream
+    // (≈90% of boot output) without adding signal.
+    let completed = RTC_TICKS_COMPLETED.load(Ordering::Acquire);
+    let inflight = ticks.saturating_sub(completed);
+    if inflight > 1 {
+        let last_diag_tick = RTC_LAST_DIAG_PRINT_TICK.load(Ordering::Acquire);
+        if ticks.saturating_sub(last_diag_tick) >= 4
+            && RTC_LAST_DIAG_PRINT_TICK
+                .compare_exchange(last_diag_tick, ticks, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            let task = crate::hooks::current_task_id().unwrap_or(u64::MAX);
+            crate::debug::println!(
+                "rtc diag: tick={} completed={} delta={} task={}",
+                ticks,
+                completed,
+                inflight,
+                task,
+            );
+        }
     }
     let current_second = ticks / RTC_TICKS_PER_SEC;
     let last_reported_second = RTC_LAST_ALIVE_SECOND.load(Ordering::Acquire);

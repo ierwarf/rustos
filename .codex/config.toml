@@ -55,19 +55,20 @@ statusMessage = "cargo xtask check"
 
 # --------------------------------------------------------------------------
 # MCP servers (project-scoped)
-#
-# Uncomment after installing the corresponding binary. Project-scoped MCP
-# is honored because this project is trusted in the user config.
+# All three servers are active. Binaries:
+#   ripgrep  — npx mcp-ripgrep (npm)
+#   serena   — uvx from serena-mcp (~/.local/bin/uvx via astral uv)
+#   github   — ~/.local/bin/github-mcp-server (github/github-mcp-server v1.0.5)
 # --------------------------------------------------------------------------
 
-# [mcp_servers.ripgrep]
-# command = "mcp-ripgrep"
-# args = []
+[mcp_servers.ripgrep]
+command = "npx"
+args = ["-y", "mcp-ripgrep"]
 
-# [mcp_servers.serena]
-# command = "uvx"
-# args = ["--from", "serena-mcp", "serena"]
+[mcp_servers.serena]
+command = "uvx"
+args = ["--from", "serena-mcp", "serena"]
 
-# [mcp_servers.github]
-# command = "gh-mcp"
-# args = []
+[mcp_servers.github]
+command = "github-mcp-server"
+args = ["stdio"]

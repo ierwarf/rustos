@@ -84,6 +84,13 @@ pub(crate) struct TerminalState {
     cursor_visible: bool,
     focused: bool,
     initialized: bool,
+    /// Number of bytes from the output stream already fed to the parser.
+    /// Used to make `rebuild_from_bytes` incremental: when the caller's
+    /// `bytes` slice has grown since the last call (the common case for an
+    /// append-only shell output stream), we replay only the suffix instead of
+    /// re-parsing the entire history. Cleared on layout change / explicit
+    /// reset / non-extending update.
+    parsed_byte_count: usize,
 }
 
 impl TerminalState {
@@ -97,15 +104,32 @@ impl TerminalState {
             cursor_visible: true,
             focused: false,
             initialized: false,
+            parsed_byte_count: 0,
         }
     }
 
     pub(crate) fn rebuild_from_bytes(&mut self, client_rect: Rect, focused: bool, bytes: &[u8]) {
         let layout = TerminalLayout::for_client_rect(client_rect);
+        let layout_unchanged = self.initialized && self.layout == layout;
+        // Incremental fast path: layout is unchanged and the new byte stream
+        // extends what we previously parsed. The shell's output cache is
+        // append-only in practice, so re-parsing the entire history on every
+        // refresh is gratuitous and was dominating render time (~436ms per
+        // partial present on a one-window desktop). Just advance the parser
+        // over the new suffix and update focus.
+        if layout_unchanged && bytes.len() >= self.parsed_byte_count {
+            self.focused = focused;
+            for &byte in &bytes[self.parsed_byte_count..] {
+                self.advance_parser(byte);
+            }
+            self.parsed_byte_count = bytes.len();
+            return;
+        }
         self.reset(layout, focused);
         for &byte in bytes {
             self.advance_parser(byte);
         }
+        self.parsed_byte_count = bytes.len();
     }
 
     pub(crate) fn needs_layout_rebuild(&self, client_rect: Rect) -> bool {
@@ -194,6 +218,7 @@ impl TerminalState {
         self.focused = focused;
         self.initialized = true;
         self.cells = [b' '; MAX_CONSOLE_CELLS];
+        self.parsed_byte_count = 0;
     }
 
     fn advance_parser(&mut self, byte: u8) {

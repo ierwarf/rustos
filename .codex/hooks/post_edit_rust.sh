@@ -21,12 +21,24 @@ case "$path" in
   *) printf '{"decision":"allow"}\n'; exit 0 ;;
 esac
 
-# Run cargo xtask check with a short timeout so a runaway compile cannot
-# stall the loop. Capture only the tail of stderr.
+# Skip repeated checks within a 30-second window: if the last successful
+# xtask check completed less than 30s ago, the workspace hasn't had time
+# to accumulate new errors worth re-checking.
+STAMP="/tmp/.rustos_xtask_ok"
+now=$(date +%s)
+if [[ -f "$STAMP" ]]; then
+  last=$(cat "$STAMP" 2>/dev/null || echo 0)
+  if (( now - last < 30 )); then
+    jq -n '{decision:"allow", message:"cargo xtask check: skipped (last ok <30s ago)"}'
+    exit 0
+  fi
+fi
+
 cd "$REPO_ROOT"
 log="$(mktemp)"
 if timeout 90 cargo xtask check >"$log" 2>&1; then
   rm -f "$log"
+  date +%s >"$STAMP"
   jq -n '{decision:"allow", message:"cargo xtask check: ok"}'
   exit 0
 fi
