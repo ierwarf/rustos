@@ -23,6 +23,11 @@ startup = "none"
 name = "usbhid"
 class = "input"
 bus = "usb"
+# Keep the .ko artifact staged for ring0 compatibility work, but do not
+# autoload it until Linux USB HID URB completion can survive sustained QEMU
+# tablet traffic without stalling the heartbeat. Native RustOS HID input remains
+# the active boot input provider in the meantime.
+enabled = false
 priority = 110
 when = "vfs-ready"
 aliases = ["usb:v*p*d*dc*dsc*dp*ic03isc*ip*in*"]

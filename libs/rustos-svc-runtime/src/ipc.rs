@@ -2,12 +2,13 @@
 //! can call these directly without going through libc.
 
 use rustos_user_abi::syscall::{
-    SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
-    SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_LINUX_SYSCALL_ENDPOINT,
-    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
+    SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
+    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_RECV,
+    SYS_RUSTOS_IPC_REGISTER_LINUX_SYSCALL_ENDPOINT, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_REPLY,
 };
 
-use crate::syscall::{syscall0, syscall1, syscall2, syscall3, syscall4};
+use crate::syscall::{syscall0, syscall1, syscall2, syscall3, syscall4, syscall5};
 
 #[inline]
 pub fn endpoint_create() -> i64 {
@@ -33,6 +34,24 @@ pub fn register_service_endpoint(service_id: u64, endpoint: u64) -> i64 {
 #[inline]
 pub fn lookup_service_endpoint(service_id: u64) -> i64 {
     unsafe { syscall1(SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, service_id) }
+}
+
+#[inline]
+pub unsafe fn call(
+    endpoint: u64,
+    request: *const u8,
+    request_len: usize,
+    reply: *mut u8,
+    reply_capacity: usize,
+) -> i64 {
+    syscall5(
+        SYS_RUSTOS_IPC_CALL,
+        endpoint,
+        request as u64,
+        request_len as u64,
+        reply as u64,
+        reply_capacity as u64,
+    )
 }
 
 /// Block until a request arrives on `endpoint`. On success, the request bytes

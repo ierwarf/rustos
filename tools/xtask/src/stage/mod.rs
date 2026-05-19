@@ -412,6 +412,9 @@ fn write_driver_registry(config: &Config, manifests: &[PackageManifest]) -> Resu
         let Some(autoload) = manifest.autoload.as_ref() else {
             continue;
         };
+        if !autoload.enabled {
+            continue;
+        }
         if !manifest.artifact_path(config).is_file() {
             continue;
         }

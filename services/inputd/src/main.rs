@@ -4,36 +4,16 @@ use std::thread;
 use std::time::Duration;
 
 use rustos_user_abi::syscall::{
-    InputStatsBrokerArgs, InputStatsWire, IPC_SERVICE_INPUTD, SYS_RUSTOS_DEBUG_PRINT,
+    InputStatsBrokerArgs, InputStatsWire, InputdIpcRequest, InputdIpcResponse, INPUTD_ACCESS_EVDEV,
+    INPUTD_ACCESS_NATIVE, INPUTD_IPC_ABI_VERSION, INPUTD_IPC_OP_AUTHORIZE_READ, INPUTD_IPC_OP_PING,
+    INPUTD_IPC_OP_STATS, INPUTD_READ_FLAG_NONBLOCK, IPC_SERVICE_INPUTD, SYS_RUSTOS_DEBUG_PRINT,
     SYS_RUSTOS_INPUT_STATS_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV,
     SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
 };
 
 const RECV_BACKOFF: Duration = Duration::from_millis(50);
-const INPUTD_ABI_VERSION: u16 = 1;
-const INPUTD_OP_PING: u16 = 1;
-const INPUTD_OP_STATS: u16 = 2;
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct InputdRequest {
-    version: u16,
-    op: u16,
-    flags: u32,
-    arg0: u64,
-    arg1: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct InputdResponse {
-    version: u16,
-    op: u16,
-    status: i32,
-    reserved0: u32,
-    value: u64,
-    payload: InputStatsWire,
-}
+const INPUTD_MAX_NATIVE_READ_BYTES: u64 = 1024 * 24;
+const INPUTD_MAX_EVDEV_READ_BYTES: u64 = 1024 * 24 * 3;
 
 fn main() {
     observability_client::info!("inputd", service, "service started");
@@ -65,23 +45,23 @@ fn main() {
 
 fn serve(endpoint: u64) {
     loop {
-        let mut request = InputdRequest::default();
+        let mut request = InputdIpcRequest::default();
         let mut reply_cap = 0_u64;
         let received = syscall4(
             SYS_RUSTOS_IPC_RECV,
             endpoint,
-            (&mut request as *mut InputdRequest) as u64,
-            size_of::<InputdRequest>() as u64,
+            (&mut request as *mut InputdIpcRequest) as u64,
+            size_of::<InputdIpcRequest>() as u64,
             (&mut reply_cap as *mut u64) as u64,
         );
         if received < 0 {
             thread::sleep(RECV_BACKOFF);
             continue;
         }
-        let mut response = InputdResponse {
-            version: INPUTD_ABI_VERSION,
+        let mut response = InputdIpcResponse {
+            version: INPUTD_IPC_ABI_VERSION,
             op: request.op,
-            ..InputdResponse::default()
+            ..InputdIpcResponse::default()
         };
         response.status = match validate(received as usize, &request) {
             Ok(()) => dispatch(&request, &mut response),
@@ -90,8 +70,8 @@ fn serve(endpoint: u64) {
         let reply = syscall3(
             SYS_RUSTOS_IPC_REPLY,
             reply_cap,
-            (&response as *const InputdResponse) as u64,
-            size_of::<InputdResponse>() as u64,
+            (&response as *const InputdIpcResponse) as u64,
+            size_of::<InputdIpcResponse>() as u64,
         );
         if reply < 0 {
             let _ = writeln!(std::io::stderr(), "inputd: reply failed errno={}", -reply);
@@ -99,21 +79,39 @@ fn serve(endpoint: u64) {
     }
 }
 
-fn dispatch(request: &InputdRequest, response: &mut InputdResponse) -> i32 {
+fn dispatch(request: &InputdIpcRequest, response: &mut InputdIpcResponse) -> i32 {
     match request.op {
-        INPUTD_OP_PING => {
-            response.value = request.arg0;
+        INPUTD_IPC_OP_PING => {
+            response.approved_len = request.requested_len;
             0
         }
-        INPUTD_OP_STATS => match fetch_stats() {
+        INPUTD_IPC_OP_STATS => match fetch_stats() {
             Ok(stats) => {
-                response.payload = stats;
+                response.stats = stats;
                 0
             }
             Err(errno) => errno,
         },
+        INPUTD_IPC_OP_AUTHORIZE_READ => authorize_read(request, response),
         _ => libc::EINVAL,
     }
+}
+
+fn authorize_read(request: &InputdIpcRequest, response: &mut InputdIpcResponse) -> i32 {
+    if request.pid == 0 || request.tid == 0 || request.fd > i32::MAX as u64 {
+        return libc::EINVAL;
+    }
+    let max_len = match request.access {
+        INPUTD_ACCESS_NATIVE => INPUTD_MAX_NATIVE_READ_BYTES,
+        INPUTD_ACCESS_EVDEV => INPUTD_MAX_EVDEV_READ_BYTES,
+        _ => return libc::EINVAL,
+    };
+    response.approved_len = request.requested_len.min(max_len);
+    match fetch_stats() {
+        Ok(stats) => response.stats = stats,
+        Err(errno) => return errno,
+    }
+    0
 }
 
 fn fetch_stats() -> Result<InputStatsWire, i32> {
@@ -134,13 +132,19 @@ fn fetch_stats() -> Result<InputStatsWire, i32> {
     Ok(stats)
 }
 
-fn validate(received: usize, request: &InputdRequest) -> Result<(), i32> {
-    if received != size_of::<InputdRequest>() || request.version != INPUTD_ABI_VERSION {
+fn validate(received: usize, request: &InputdIpcRequest) -> Result<(), i32> {
+    if received != size_of::<InputdIpcRequest>()
+        || request.version != INPUTD_IPC_ABI_VERSION
+        || request.flags & !INPUTD_READ_FLAG_NONBLOCK != 0
+        || request.reserved0 != 0
+        || request.reserved1 != 0
+    {
         return Err(libc::EINVAL);
     }
     match request.op {
-        INPUTD_OP_PING => Ok(()),
-        INPUTD_OP_STATS => Ok(()),
+        INPUTD_IPC_OP_PING => Ok(()),
+        INPUTD_IPC_OP_STATS => Ok(()),
+        INPUTD_IPC_OP_AUTHORIZE_READ => Ok(()),
         _ => Err(libc::EINVAL),
     }
 }

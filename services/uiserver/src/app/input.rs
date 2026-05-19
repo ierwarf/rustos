@@ -1,6 +1,6 @@
 use std::os::fd::AsRawFd;
 use std::string::String;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use runtime_control::RuntimeClient;
 
@@ -17,6 +17,9 @@ use crate::sys::{
     INPUT_KIND_POINTER_POSITION, POINTER_BUTTON_LEFT,
 };
 use crate::wayland::WaylandCompositor;
+
+const MAX_WINDOW_DRAG_STEP_PIXELS: usize = 96;
+const WINDOW_DRAG_FRAME_INTERVAL: Duration = Duration::from_millis(66);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TaskbarHit {
@@ -114,9 +117,11 @@ impl AppState {
                 if self.left_button_down {
                     return self.handle_left_press(runtime, wayland);
                 }
-                let was_dragging = self.dragging_window.take().is_some();
-                if was_dragging {
-                    return Ok(VisualUpdate::default());
+                if self.dragging_window.is_some() {
+                    let update = self.drag_window_to_cursor_forced(wayland.as_deref_mut());
+                    self.dragging_window = None;
+                    self.next_drag_update_at = None;
+                    return Ok(update);
                 }
                 if let Some(wayland) = wayland {
                     wayland.pointer_button(POINTER_BUTTON_LEFT, false);
@@ -375,6 +380,7 @@ impl AppState {
         self.dragging_window = Some(DragTarget::Console(session_handle));
         self.drag_offset_x = self.cursor_x.saturating_sub(window.frame.x as u32) as usize;
         self.drag_offset_y = self.cursor_y.saturating_sub(window.frame.y as u32) as usize;
+        self.next_drag_update_at = Some(Instant::now());
     }
 
     fn start_wayland_window_drag(&mut self, surface_id: u32) {
@@ -390,6 +396,7 @@ impl AppState {
         self.dragging_window = Some(DragTarget::Wayland(surface_id));
         self.drag_offset_x = self.cursor_x.saturating_sub(outer.x as u32) as usize;
         self.drag_offset_y = self.cursor_y.saturating_sub(outer.y as u32) as usize;
+        self.next_drag_update_at = Some(Instant::now());
     }
 
     fn restore_console_window(
@@ -486,6 +493,31 @@ impl AppState {
     }
 
     fn drag_window_to_cursor(&mut self, wayland: Option<&mut WaylandCompositor>) -> VisualUpdate {
+        self.drag_window_to_cursor_inner(wayland, false)
+    }
+
+    fn drag_window_to_cursor_forced(
+        &mut self,
+        wayland: Option<&mut WaylandCompositor>,
+    ) -> VisualUpdate {
+        self.drag_window_to_cursor_inner(wayland, true)
+    }
+
+    fn drag_window_to_cursor_inner(
+        &mut self,
+        wayland: Option<&mut WaylandCompositor>,
+        force: bool,
+    ) -> VisualUpdate {
+        let now = Instant::now();
+        if !force
+            && self
+                .next_drag_update_at
+                .is_some_and(|deadline| now < deadline)
+        {
+            return VisualUpdate::default();
+        }
+        self.next_drag_update_at = Some(now + WINDOW_DRAG_FRAME_INTERVAL);
+
         match self.dragging_window {
             Some(DragTarget::Console(session_handle)) => {
                 let Some(window) = self
@@ -494,12 +526,17 @@ impl AppState {
                     .find(|window| window.session_handle == session_handle)
                 else {
                     self.dragging_window = None;
+                    self.next_drag_update_at = None;
                     return VisualUpdate::default();
                 };
 
                 let previous_frame = window.frame;
-                let next_x = self.cursor_x.saturating_sub(self.drag_offset_x as u32) as usize;
-                let next_y = self.cursor_y.saturating_sub(self.drag_offset_y as u32) as usize;
+                let target_x = self.cursor_x.saturating_sub(self.drag_offset_x as u32) as usize;
+                let target_y = self.cursor_y.saturating_sub(self.drag_offset_y as u32) as usize;
+                let next_x =
+                    step_towards_usize(window.frame.x, target_x, MAX_WINDOW_DRAG_STEP_PIXELS);
+                let next_y =
+                    step_towards_usize(window.frame.y, target_y, MAX_WINDOW_DRAG_STEP_PIXELS);
                 let next_frame = clamp_console_window_rect(
                     self.display.width,
                     self.display.height,
@@ -525,15 +562,26 @@ impl AppState {
                     .position(|window| window.surface_id == surface_id)
                 else {
                     self.dragging_window = None;
+                    self.next_drag_update_at = None;
                     return VisualUpdate::default();
                 };
                 let previous_outer = wayland_window_outer_rect(&self.wayland_windows[index]);
+                let target_x = self.cursor_x.saturating_sub(self.drag_offset_x as u32) as usize;
+                let target_y = self.cursor_y.saturating_sub(self.drag_offset_y as u32) as usize;
                 let next_outer = clamp_console_window_rect(
                     self.display.width,
                     self.display.height,
                     canvas::Rect {
-                        x: self.cursor_x.saturating_sub(self.drag_offset_x as u32) as usize,
-                        y: self.cursor_y.saturating_sub(self.drag_offset_y as u32) as usize,
+                        x: step_towards_usize(
+                            previous_outer.x,
+                            target_x,
+                            MAX_WINDOW_DRAG_STEP_PIXELS,
+                        ),
+                        y: step_towards_usize(
+                            previous_outer.y,
+                            target_y,
+                            MAX_WINDOW_DRAG_STEP_PIXELS,
+                        ),
                         ..previous_outer
                     },
                 );
@@ -557,5 +605,13 @@ impl AppState {
             }
             None => VisualUpdate::default(),
         }
+    }
+}
+
+fn step_towards_usize(current: usize, target: usize, max_step: usize) -> usize {
+    if target > current {
+        current.saturating_add((target - current).min(max_step))
+    } else {
+        current.saturating_sub((current - target).min(max_step))
     }
 }

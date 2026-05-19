@@ -66,16 +66,18 @@ privilege substrate, not a policy owner.
 
 1. Device ioctl policy bypass:
    - Current source: `kernel/compat/src/user/syscall/linux/service_ops.rs`
-     has a direct `syscall_linux_ioctl` fast path to
-     `ioctl_current_process_fd`.
+     routes Linux `ioctl` to `devmgrd` after bootstrap, with a direct
+     `ioctl_current_process_fd` fallback only before `devmgrd` registers.
    - Target: route policy-sensitive ioctl classes through `devmgrd`; keep the
      brokered current-process memory/device operation in ring0.
 
 2. Input event queue ownership:
    - Current source: `kernel/io-manager/src/input/event_queue.rs` owns
      `INPUT_EVENTS` under an IRQ-off spinlock, and
-     `kernel/io-manager/src/io/device/input.rs` translates/read-copies events
-     directly to user buffers.
+     `kernel/io-manager/src/io/device/input.rs` still translates and
+     read-copies events to user buffers. Linux input reads now ask `inputd` for
+     `INPUTD_IPC_OP_AUTHORIZE_READ` before the ring0 user-copy/device broker
+     drains the remaining kernel queue.
    - Target: `inputd` owns event queue policy, overflow behavior, readers, and
      observability. Ring0 should enqueue validated hardware reports into a
      bounded shared ring, wake the target, and retain only user-copy/broker
@@ -91,11 +93,12 @@ privilege substrate, not a policy owner.
      Ring0 `.ko`/USB callbacks stay as the report source.
 
 4. Device namespace and metadata:
-   - Current source: `vfsd` exposes static `/dev` nodes and `devmgrd` only
-     forwards ioctl policy to `SYS_RUSTOS_DEVICE_IOCTL_BROKER`.
+   - Current source: `vfsd` queries `devmgrd` using the device registry IPC for
+     `/dev` lookup/readdir, with a static explicit-node fallback only before
+     `devmgrd` registers.
    - Target: `devmgrd` owns device registry, permissions, capability transfer,
-     and device-open policy; `vfsd` consumes explicit devmgrd nodes instead of
-     growing wildcard `/dev/*` behavior.
+     and device-open policy; keep shrinking `vfsd` fallback nodes and move
+     device-open capability transfer to `devmgrd`.
 
 5. Driver bootstrap policy leftovers:
    - Current source: `kernel/io-manager/src/driver/mod.rs` still has

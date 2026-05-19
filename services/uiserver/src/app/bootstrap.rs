@@ -333,6 +333,7 @@ impl AppState {
             dragging_window: None,
             drag_offset_x: 0,
             drag_offset_y: 0,
+            next_drag_update_at: None,
         })
     }
 

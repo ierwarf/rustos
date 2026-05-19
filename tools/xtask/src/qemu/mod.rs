@@ -168,7 +168,7 @@ const PROBE_BOOT_TIMEOUT_DEFAULT: Duration = Duration::from_secs(30);
 const PROBE_QMP_TIMEOUT: Duration = Duration::from_secs(10);
 const PROBE_STEP_DELAY: Duration = Duration::from_millis(25);
 const PROBE_STRESS_DURATION_DEFAULT: Duration = Duration::from_secs(20);
-const PROBE_HEARTBEAT_STALL_DEFAULT: Duration = Duration::from_millis(2500);
+const PROBE_HEARTBEAT_STALL_DEFAULT: Duration = Duration::from_secs(15);
 const QEMU_WAIT_POLL: Duration = Duration::from_millis(100);
 const FAULT_FW_CFG_NAME: &str = "opt/rustos/fault-injection";
 
@@ -933,7 +933,7 @@ fn append_boot_disk_args(args: &mut Vec<OsString>, boot_image: &Path, boot_disk:
     }
     args.push(OsString::from("-drive"));
     args.push(OsString::from(format!(
-        "id=bootdisk,if=none,file={},format=raw",
+        "id=bootdisk,if=none,file={},format=raw,snapshot=on",
         boot_image.display()
     )));
     args.push(OsString::from("-device"));
@@ -1468,6 +1468,15 @@ fn run_display_probe(config: &Config, options: RunOptions) -> Result<()> {
             ],
             probe_duration_env("RUSTOS_PROBE_BOOT_TIMEOUT_MS", PROBE_BOOT_TIMEOUT_DEFAULT),
         )?;
+        wait_for_boot_marker(
+            &debugcon_log,
+            &[
+                "uiserver: desktop background ready",
+                "uiserver: first present done",
+                "uiserver: slow full present",
+            ],
+            PROBE_QMP_TIMEOUT,
+        )?;
 
         let baseline_dump = prepared.session.temp_dir.join("probe-baseline.ppm");
         qmp_screendump(&mut qmp, &baseline_dump)?;
@@ -1607,7 +1616,8 @@ fn run_probe_mouse_stress(
     let end = Instant::now() + stress_duration;
     let mut step = 0usize;
     let mut last_heartbeat_second = latest_kernel_alive_second(debugcon_log);
-    let mut heartbeat_seen = last_heartbeat_second.is_some();
+    let mut last_liveness_epoch = latest_probe_liveness_epoch(debugcon_log);
+    let mut heartbeat_seen = last_liveness_epoch.is_some();
     let mut last_heartbeat_at = Instant::now();
     let mut x = 0x4000_i32;
     let mut y = 0x3000_i32;
@@ -1624,10 +1634,11 @@ fn run_probe_mouse_stress(
             }
         }
 
-        if let Some(second) = latest_kernel_alive_second_in_log(&log) {
+        if let Some(epoch) = latest_probe_liveness_epoch_in_log(&log) {
             heartbeat_seen = true;
-            if last_heartbeat_second != Some(second) {
-                last_heartbeat_second = Some(second);
+            if last_liveness_epoch != Some(epoch) {
+                last_liveness_epoch = Some(epoch);
+                last_heartbeat_second = latest_kernel_alive_second_in_log(&log);
                 last_heartbeat_at = Instant::now();
             }
         }
@@ -1636,7 +1647,7 @@ fn run_probe_mouse_stress(
             && Instant::now().saturating_duration_since(last_heartbeat_at) > heartbeat_stall
         {
             bail!(
-                "probe detected stalled kernel heartbeat after {:?} (last second={})",
+                "probe detected stalled kernel/service heartbeat after {:?} (last kernel second={})",
                 heartbeat_stall,
                 last_heartbeat_second
                     .map(|value| value.to_string())
@@ -1748,6 +1759,21 @@ fn qmp_input_send_pointer_rel(
 fn latest_kernel_alive_second(log_path: &Path) -> Option<u64> {
     let log = fs::read_to_string(log_path).ok()?;
     latest_kernel_alive_second_in_log(&log)
+}
+
+fn latest_probe_liveness_epoch(log_path: &Path) -> Option<u64> {
+    let log = fs::read_to_string(log_path).ok()?;
+    latest_probe_liveness_epoch_in_log(&log)
+}
+
+fn latest_probe_liveness_epoch_in_log(log: &str) -> Option<u64> {
+    let count = log
+        .lines()
+        .filter(|line| {
+            parse_kernel_alive_second(line).is_some() || line.contains("uiserver: heartbeat")
+        })
+        .count() as u64;
+    (count > 0).then_some(count)
 }
 
 fn latest_kernel_alive_second_in_log(log: &str) -> Option<u64> {

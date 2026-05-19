@@ -152,6 +152,8 @@ pub(crate) struct AutoloadSpec {
     pub(crate) name: String,
     pub(crate) class: String,
     pub(crate) bus: String,
+    #[serde(default = "default_autoload_enabled")]
+    pub(crate) enabled: bool,
     #[serde(default)]
     pub(crate) priority: i32,
     #[serde(default)]
@@ -168,6 +170,10 @@ pub(crate) struct AutoloadSpec {
     pub(crate) provider_group: Option<String>,
     #[serde(default)]
     pub(crate) fallback_only: bool,
+}
+
+fn default_autoload_enabled() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize)]

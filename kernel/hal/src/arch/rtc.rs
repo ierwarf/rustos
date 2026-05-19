@@ -25,8 +25,10 @@ const RTC_TICKS_PER_SEC: u64 = 1024;
 const RTC_SLEEP_WAITER_CAPACITY: usize = 256;
 
 static RTC_TICKS: AtomicU64 = AtomicU64::new(0);
+static RTC_TICKS_COMPLETED: AtomicU64 = AtomicU64::new(0);
 static RTC_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static RTC_LAST_ALIVE_SECOND: AtomicU64 = AtomicU64::new(u64::MAX);
+static RTC_LAST_DIAG_PRINT_TICK: AtomicU64 = AtomicU64::new(0);
 static RTC_LAST_XHCI_TRANSFER_COUNT: AtomicU64 = AtomicU64::new(0);
 static RTC_LAST_HID_POINTER_REPORT_COUNT: AtomicU64 = AtomicU64::new(0);
 static RTC_LAST_INPUT_PACKET_SUBMIT_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -273,6 +275,22 @@ pub fn init() {
 pub fn on_interrupt() {
     let ticks = RTC_TICKS.fetch_add(1, Ordering::AcqRel).saturating_add(1);
     wake_ready_sleepers(ticks);
+    let last_diag_tick = RTC_LAST_DIAG_PRINT_TICK.load(Ordering::Acquire);
+    if ticks.saturating_sub(last_diag_tick) >= 4
+        && RTC_LAST_DIAG_PRINT_TICK
+            .compare_exchange(last_diag_tick, ticks, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        let completed = RTC_TICKS_COMPLETED.load(Ordering::Acquire);
+        let task = crate::hooks::current_task_id().unwrap_or(u64::MAX);
+        crate::debug::println!(
+            "rtc diag: tick={} completed={} delta={} task={}",
+            ticks,
+            completed,
+            ticks.saturating_sub(completed),
+            task,
+        );
+    }
     let current_second = ticks / RTC_TICKS_PER_SEC;
     let last_reported_second = RTC_LAST_ALIVE_SECOND.load(Ordering::Acquire);
     if current_second != last_reported_second
@@ -350,6 +368,7 @@ pub fn on_interrupt() {
     }
     // Must read register C to acknowledge and re-arm RTC interrupts.
     let _ = cmos_read(RTC_REG_C);
+    RTC_TICKS_COMPLETED.fetch_add(1, Ordering::AcqRel);
 }
 
 pub fn sleep(milliseconds: u64) {

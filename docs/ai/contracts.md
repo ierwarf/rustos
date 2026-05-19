@@ -179,11 +179,15 @@ Kernel/userspace ABI:
   primitive, which is authorized only by `IPC_SERVICE_CAP_STORAGE_POLICY`, to
   enumerate kernel-discovered storage descriptors without exposing direct
   generic-app storage probing.
-- `inputd` owns input queue observability policy after it registers
-  `IPC_SERVICE_INPUTD`. It calls the gated `SYS_RUSTOS_INPUT_STATS_BROKER`
-  primitive, which is authorized only by `IPC_SERVICE_CAP_INPUT_POLICY`, to
-  inspect kernel input queue counters while input event delivery remains a
-  brokered kernel/device data path.
+- `inputd` owns input queue observability and input-read authorization policy
+  after it registers `IPC_SERVICE_INPUTD`. Kernel Linux input reads call
+  `InputdIpcRequest` / `InputdIpcResponse` with
+  `INPUTD_IPC_OP_AUTHORIZE_READ`; `inputd` approves the access class and
+  maximum read size, then ring0 performs only the current-process
+  user-copy/device data path. `inputd` also calls the gated
+  `SYS_RUSTOS_INPUT_STATS_BROKER` primitive, authorized only by
+  `IPC_SERVICE_CAP_INPUT_POLICY`, to inspect kernel input queue counters while
+  the remaining event queue is being evacuated.
 - Linux `openat` installs `KernelHandle::RemoteVfs` for regular files and
   directories after `vfsd` registration. Device paths remain kernel device
   handles through the device broker path until `devmgrd` device-open transfer is
@@ -264,10 +268,14 @@ Kernel/userspace ABI:
   `SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER` before replying. Do not move
   executable-format, import/export, or DLL namespace policy back into the
   kernel.
-- Linux `ioctl` policy routes through `devmgrd` after bootstrap. `devmgrd` owns
-  request authorization and calls `SYS_RUSTOS_DEVICE_IOCTL_BROKER`, which is
-  gated by `IPC_SERVICE_CAP_DEVICE_POLICY` and performs the kernel-owned user
-  memory/device operation against the target process id and fd.
+- Policy-sensitive Linux `ioctl` requests route through `devmgrd` after
+  bootstrap. `devmgrd` owns request authorization and calls
+  `SYS_RUSTOS_DEVICE_IOCTL_BROKER`, which is gated by
+  `IPC_SERVICE_CAP_DEVICE_POLICY` and performs the kernel-owned user
+  memory/device operation against the target process id and fd. The kernel may
+  use a direct ioctl fallback before `IPC_SERVICE_DEVMGRD` is registered, and
+  hot data-path ioctls such as display present may remain direct broker calls
+  to avoid per-frame policy IPC.
 - Windows syscall policy routes through `syscalld` using
   `Win32SyscallOffloadRequest`/`Win32SyscallOffloadResponse` and the
   `SYSCALL_OFFLOAD_OP_WIN32_*` operation range. The kernel Windows dispatcher
@@ -298,10 +306,11 @@ Kernel/userspace ABI:
   groups for final safety checks. Early boot may still use the legacy kernel
   registry path until driver service bootstrap owns display/input/network
   bring-up.
-- `vfsd` owns the visible `/dev` namespace it exposes over VFS IPC. Device
-  metadata must come from explicit service-side nodes (`console0`, `display0`,
-  `input0`, `input/event0`, `dri/card0`) until a devmgrd-backed device registry
-  is wired into VFS; do not reintroduce a wildcard `/dev/*` success path.
+- `devmgrd` owns the visible `/dev` registry protocol exposed to `vfsd` through
+  `DevmgrdIpcRequest`/`DevmgrdIpcResponse` with `DEVMGRD_IPC_OP_LOOKUP` and
+  `DEVMGRD_IPC_OP_READDIR`. `vfsd` may mirror explicit nodes (`console0`,
+  `display0`, `input0`, `input/event0`, `dri/card0`) only as a pre-devmgrd
+  bootstrap fallback; do not reintroduce a wildcard `/dev/*` success path.
 - `syscalld` keeps the service-side Linux policy DB for per-process credentials
   and `RLIMIT_STACK`. Linux-visible `get*id`, `set*id`, and `prlimit64` policy
   must be sourced from `syscalld`; kernel process credentials are a gated

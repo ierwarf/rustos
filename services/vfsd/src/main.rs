@@ -9,13 +9,17 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
+use core::str;
 
 use rustos_svc_runtime::ipc;
 use rustos_user_abi::syscall::{
-    RustosBlockBrokerArgs, VfsIpcRequest, VfsIpcResponse, BLOCK_BROKER_ABI_VERSION,
-    BLOCK_BROKER_MAX_IO_BYTES, BLOCK_BROKER_OP_BOOT_INFO, BLOCK_BROKER_OP_BOOT_READ,
-    IPC_MAX_INLINE_BYTES, IPC_SERVICE_VFSD, LINUX_STATX_SIZE, LINUX_STAT_SIZE,
-    SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_ACCESS, SYSCALL_OFFLOAD_OP_LINUX_CHDIR,
+    DevmgrdIpcRequest, DevmgrdIpcResponse, RustosBlockBrokerArgs, VfsIpcRequest, VfsIpcResponse,
+    BLOCK_BROKER_ABI_VERSION, BLOCK_BROKER_MAX_IO_BYTES, BLOCK_BROKER_OP_BOOT_INFO,
+    BLOCK_BROKER_OP_BOOT_READ, DEVMGRD_IPC_ABI_VERSION, DEVMGRD_IPC_OP_LOOKUP,
+    DEVMGRD_IPC_OP_READDIR, DEVMGRD_MAX_DIR_ENTRIES, DEVMGRD_NODE_KIND_DEVICE,
+    DEVMGRD_NODE_KIND_DIR, IPC_MAX_INLINE_BYTES, IPC_SERVICE_DEVMGRD, IPC_SERVICE_VFSD,
+    LINUX_STATX_SIZE, LINUX_STAT_SIZE, SYSCALL_OFFLOAD_ABI_VERSION,
+    SYSCALL_OFFLOAD_OP_LINUX_ACCESS, SYSCALL_OFFLOAD_OP_LINUX_CHDIR,
     SYSCALL_OFFLOAD_OP_LINUX_CLOSE, SYSCALL_OFFLOAD_OP_LINUX_DUP, SYSCALL_OFFLOAD_OP_LINUX_FCNTL,
     SYSCALL_OFFLOAD_OP_LINUX_GETCWD, SYSCALL_OFFLOAD_OP_LINUX_GETDENTS64,
     SYSCALL_OFFLOAD_OP_LINUX_MKDIR, SYSCALL_OFFLOAD_OP_LINUX_MOUNT,
@@ -849,18 +853,25 @@ impl VfsState {
         // RING3-MIGRATION-REFERENCE START: devmgrd should own device namespace
         // metadata. vfsd should consume explicit devmgrd-provided nodes instead
         // of carrying static `/dev` policy.
-        if path == "/"
-            || path == "/dev"
-            || path == "/proc"
-            || path == "/run"
-            || path == "/dev/input"
-            || path == "/dev/dri"
-        {
+        if path == "/" || path == "/proc" || path == "/run" {
             return Ok(Metadata {
                 kind: RemoteKind::Directory,
                 len: 0,
                 inode: path_inode(path.as_bytes()),
             });
+        }
+        if path == "/dev" || path.starts_with("/dev/") {
+            match devmgrd_lookup(path) {
+                Ok(kind) => {
+                    return Ok(Metadata {
+                        kind,
+                        len: 0,
+                        inode: path_inode(path.as_bytes()),
+                    });
+                }
+                Err(ENODEV) => {}
+                Err(errno) => return Err(errno),
+            }
         }
         if known_device_node(path) {
             return Ok(Metadata {
@@ -898,6 +909,13 @@ impl VfsState {
             entries.push(DirEntry::new("dev", RemoteKind::Directory));
             entries.push(DirEntry::new("proc", RemoteKind::Directory));
             entries.push(DirEntry::new("run", RemoteKind::Directory));
+        }
+        if path == "/dev" || path == "/dev/input" || path == "/dev/dri" {
+            match devmgrd_dir_entries(path) {
+                Ok(entries) => return Ok(entries),
+                Err(ENODEV) => {}
+                Err(errno) => return Err(errno),
+            }
         }
         if path == "/dev" {
             entries.push(DirEntry::new("console0", RemoteKind::Device));
@@ -967,6 +985,83 @@ impl DirEntry {
 
 // RING3-MIGRATION-REFERENCE START: devmgrd should be the source of device-node
 // existence and type policy; vfsd should not grow this static list.
+fn devmgrd_lookup(path: &str) -> Result<RemoteKind, i32> {
+    let mut request = devmgrd_request(DEVMGRD_IPC_OP_LOOKUP, path)?;
+    let response = call_devmgrd(&mut request)?;
+    devmgrd_kind_to_remote(response.kind)
+}
+
+fn devmgrd_dir_entries(path: &str) -> Result<Vec<DirEntry>, i32> {
+    let mut request = devmgrd_request(DEVMGRD_IPC_OP_READDIR, path)?;
+    let response = call_devmgrd(&mut request)?;
+    if response.entry_count as usize > DEVMGRD_MAX_DIR_ENTRIES {
+        return Err(EINVAL);
+    }
+    let mut entries = Vec::new();
+    for entry in response.entries.iter().take(response.entry_count as usize) {
+        let name_len = entry.name_len as usize;
+        if name_len == 0 || name_len > entry.name.len() {
+            return Err(EINVAL);
+        }
+        let name = str::from_utf8(&entry.name[..name_len]).map_err(|_| EINVAL)?;
+        entries.push(DirEntry::new(name, devmgrd_kind_to_remote(entry.kind)?));
+    }
+    Ok(entries)
+}
+
+fn devmgrd_request(op: u16, path: &str) -> Result<DevmgrdIpcRequest, i32> {
+    let bytes = path.as_bytes();
+    if bytes.is_empty() || bytes.len() > VFS_IPC_PATH_CAPACITY {
+        return Err(EINVAL);
+    }
+    let mut request = DevmgrdIpcRequest {
+        op,
+        path_len: bytes.len() as u32,
+        ..DevmgrdIpcRequest::default()
+    };
+    request.path[..bytes.len()].copy_from_slice(bytes);
+    Ok(request)
+}
+
+fn call_devmgrd(request: &mut DevmgrdIpcRequest) -> Result<DevmgrdIpcResponse, i32> {
+    let endpoint = ipc::lookup_service_endpoint(IPC_SERVICE_DEVMGRD);
+    if endpoint < 0 {
+        return Err(ENODEV);
+    }
+    let mut response = DevmgrdIpcResponse::default();
+    let received = unsafe {
+        ipc::call(
+            endpoint as u64,
+            (request as *const DevmgrdIpcRequest).cast::<u8>(),
+            size_of::<DevmgrdIpcRequest>(),
+            (&mut response as *mut DevmgrdIpcResponse).cast::<u8>(),
+            size_of::<DevmgrdIpcResponse>(),
+        )
+    };
+    if received < 0 {
+        return Err(ENODEV);
+    }
+    if received as usize != size_of::<DevmgrdIpcResponse>()
+        || response.version != DEVMGRD_IPC_ABI_VERSION
+        || response.op != request.op
+        || response.reserved0 != 0
+    {
+        return Err(EINVAL);
+    }
+    if response.status != 0 {
+        return Err(response.status.unsigned_abs() as i32);
+    }
+    Ok(response)
+}
+
+fn devmgrd_kind_to_remote(kind: u16) -> Result<RemoteKind, i32> {
+    match kind {
+        DEVMGRD_NODE_KIND_DIR => Ok(RemoteKind::Directory),
+        DEVMGRD_NODE_KIND_DEVICE => Ok(RemoteKind::Device),
+        _ => Err(EINVAL),
+    }
+}
+
 fn known_device_node(path: &str) -> bool {
     matches!(
         path,

@@ -169,6 +169,10 @@ pub mod snapshot {
         crate::multitask::current_task_id()
     }
 
+    pub fn current_user_log_ids() -> Option<(u64, u64)> {
+        crate::multitask::current_user_log_ids()
+    }
+
     pub fn current_user_process_id() -> Option<u64> {
         crate::multitask::current_user_process_id()
     }
@@ -298,9 +302,10 @@ pub use boot::{is_initialized, service_deferred_work, start};
 pub use fault::{halt_current_retired_task, retire_current_user_task_due_to_fault};
 pub use process::{spawn_kernel_process, spawn_user_process};
 pub use snapshot::{
-    any_user_process_state, current_task_id, current_user_id, current_user_process_id,
-    current_user_snapshot, parent_process_id_of, retain_current_user_process_state,
-    with_current_process_credentials, with_current_user_process_state_mut,
+    any_user_process_state, current_task_id, current_user_id, current_user_log_ids,
+    current_user_process_id, current_user_snapshot, parent_process_id_of,
+    retain_current_user_process_state, with_current_process_credentials,
+    with_current_user_process_state_mut,
 };
 pub use task::{
     register_input_consumer_hooks, register_tick_jiffies_hook, rtc_interrupt_handler_addr,

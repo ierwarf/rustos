@@ -23,6 +23,9 @@ startup = "none"
 name = "hid-generic"
 class = "input"
 bus = "usb"
+# Keep the .ko artifact staged for ring0 compatibility work, but do not
+# autoload it until the Linux HID attach path is non-blocking under QEMU USB.
+enabled = false
 priority = 120
 when = "vfs-ready"
 aliases = ["hid:b*g*v*p*"]

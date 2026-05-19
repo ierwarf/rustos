@@ -225,6 +225,14 @@ pub mod syscall {
     pub const VFS_IPC_HANDLE_KIND_FILE: u16 = 1;
     pub const VFS_IPC_HANDLE_KIND_DIR: u16 = 2;
     pub const VFS_IPC_HANDLE_KIND_DEVICE: u16 = 3;
+    pub const DEVMGRD_IPC_ABI_VERSION: u16 = 1;
+    pub const DEVMGRD_IPC_OP_LOOKUP: u16 = 1;
+    pub const DEVMGRD_IPC_OP_READDIR: u16 = 2;
+    pub const DEVMGRD_NODE_KIND_NONE: u16 = 0;
+    pub const DEVMGRD_NODE_KIND_DIR: u16 = 1;
+    pub const DEVMGRD_NODE_KIND_DEVICE: u16 = 2;
+    pub const DEVMGRD_MAX_DIR_ENTRIES: usize = 16;
+    pub const DEVMGRD_NAME_CAPACITY: usize = 32;
     pub const VFS_LIFECYCLE_FORK: u16 = 1;
     pub const VFS_LIFECYCLE_EXEC_CLOEXEC: u16 = 2;
     pub const VFS_LIFECYCLE_EXIT: u16 = 3;
@@ -359,6 +367,13 @@ pub mod syscall {
 
     pub const INPUT_STATS_FLAG_PENDING_COALESCED: u32 = 1 << 0;
     pub const INPUT_STATS_FLAG_PENDING_POINTER_POSITION: u32 = 1 << 1;
+    pub const INPUTD_IPC_ABI_VERSION: u16 = 1;
+    pub const INPUTD_IPC_OP_PING: u16 = 1;
+    pub const INPUTD_IPC_OP_STATS: u16 = 2;
+    pub const INPUTD_IPC_OP_AUTHORIZE_READ: u16 = 3;
+    pub const INPUTD_ACCESS_NATIVE: u16 = 1;
+    pub const INPUTD_ACCESS_EVDEV: u16 = 2;
+    pub const INPUTD_READ_FLAG_NONBLOCK: u32 = 1 << 0;
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -367,6 +382,32 @@ pub mod syscall {
         pub reserved0: u16,
         pub reserved1: u32,
         pub out_stats_ptr: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct InputdIpcRequest {
+        pub version: u16,
+        pub op: u16,
+        pub flags: u32,
+        pub pid: u64,
+        pub tid: u64,
+        pub fd: u64,
+        pub access: u16,
+        pub reserved0: u16,
+        pub reserved1: u32,
+        pub requested_len: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct InputdIpcResponse {
+        pub version: u16,
+        pub op: u16,
+        pub status: i32,
+        pub flags: u32,
+        pub approved_len: u64,
+        pub stats: InputStatsWire,
     }
 
     #[repr(C)]
@@ -533,6 +574,76 @@ pub mod syscall {
         pub request: u64,
         pub arg: u64,
         pub reserved0: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct DevmgrdNodeEntry {
+        pub name_len: u16,
+        pub kind: u16,
+        pub reserved0: u32,
+        pub name: [u8; DEVMGRD_NAME_CAPACITY],
+    }
+
+    impl Default for DevmgrdNodeEntry {
+        fn default() -> Self {
+            Self {
+                name_len: 0,
+                kind: DEVMGRD_NODE_KIND_NONE,
+                reserved0: 0,
+                name: [0; DEVMGRD_NAME_CAPACITY],
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct DevmgrdIpcRequest {
+        pub version: u16,
+        pub op: u16,
+        pub flags: u32,
+        pub path_len: u32,
+        pub reserved0: u32,
+        pub path: [u8; VFS_IPC_PATH_CAPACITY],
+    }
+
+    impl Default for DevmgrdIpcRequest {
+        fn default() -> Self {
+            Self {
+                version: DEVMGRD_IPC_ABI_VERSION,
+                op: DEVMGRD_IPC_OP_LOOKUP,
+                flags: 0,
+                path_len: 0,
+                reserved0: 0,
+                path: [0; VFS_IPC_PATH_CAPACITY],
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct DevmgrdIpcResponse {
+        pub version: u16,
+        pub op: u16,
+        pub status: i32,
+        pub kind: u16,
+        pub reserved0: u16,
+        pub entry_count: u32,
+        pub entries: [DevmgrdNodeEntry; DEVMGRD_MAX_DIR_ENTRIES],
+    }
+
+    impl Default for DevmgrdIpcResponse {
+        fn default() -> Self {
+            Self {
+                version: DEVMGRD_IPC_ABI_VERSION,
+                op: DEVMGRD_IPC_OP_LOOKUP,
+                status: 0,
+                kind: DEVMGRD_NODE_KIND_NONE,
+                reserved0: 0,
+                entry_count: 0,
+                entries: [DevmgrdNodeEntry::default(); DEVMGRD_MAX_DIR_ENTRIES],
+            }
+        }
     }
 
     #[repr(C)]

@@ -134,6 +134,7 @@ struct TaskContext {
     user_abi: Option<UserAbi>,
     console_session: ConsoleSessionHandle,
     process_handle: Option<ProcessHandle>,
+    process_id: Option<u64>,
     user_stack: Option<UserStackState>,
     linux_thread_state: Option<LinuxThreadState>,
     windows_thread_state: Option<WindowsThreadRuntimeState>,
@@ -297,6 +298,7 @@ impl Scheduler {
             user_abi: None,
             console_session: ConsoleSessionHandle::SYSTEM,
             process_handle: None,
+            process_id: None,
             user_stack: None,
             linux_thread_state: None,
             windows_thread_state: None,
@@ -869,6 +871,7 @@ impl Scheduler {
                     user_abi: None,
                     console_session: ConsoleSessionHandle::SYSTEM,
                     process_handle: None,
+                    process_id: None,
                     user_stack: None,
                     linux_thread_state: None,
                     windows_thread_state: None,
@@ -955,6 +958,7 @@ impl Scheduler {
                     user_abi: Some(bootstrap.abi),
                     console_session: bootstrap.console_session,
                     process_handle: Some(process_handle),
+                    process_id: Some(id),
                     user_stack: bootstrap.user_stack,
                     linux_thread_state: bootstrap.linux_thread_state,
                     windows_thread_state: bootstrap.windows_thread_state.map(|mut state| {
@@ -1020,6 +1024,7 @@ impl Scheduler {
                     user_abi: Some(bootstrap.abi),
                     console_session: bootstrap.console_session,
                     process_handle: Some(process_handle),
+                    process_id: Some(id),
                     user_stack: bootstrap.user_stack,
                     linux_thread_state: bootstrap.linux_thread_state,
                     windows_thread_state: bootstrap.windows_thread_state.map(|mut state| {
@@ -1086,6 +1091,7 @@ impl Scheduler {
                     user_abi: None,
                     console_session: ConsoleSessionHandle::SYSTEM,
                     process_handle: Some(process_handle),
+                    process_id: Some(id),
                     user_stack: None,
                     linux_thread_state: None,
                     windows_thread_state: None,
@@ -1131,7 +1137,7 @@ impl Scheduler {
         let Some(process_handle) = current.process_handle else {
             return None;
         };
-        let Some(process_id) = process_table::process_id(process_handle) else {
+        let Some(process_id) = current.process_id else {
             return None;
         };
         for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
@@ -1178,6 +1184,7 @@ impl Scheduler {
                     user_abi: Some(bootstrap.abi),
                     console_session: bootstrap.console_session,
                     process_handle: Some(process_handle),
+                    process_id: Some(process_id),
                     user_stack: bootstrap.user_stack,
                     linux_thread_state: bootstrap.linux_thread_state,
                     windows_thread_state: bootstrap.windows_thread_state.map(|mut state| {
@@ -1425,7 +1432,7 @@ impl Scheduler {
                     self.trace_switch(current_slot, next_idx);
                     if next_idx != current_slot && next.ready_since_ticks != 0 {
                         let task_id = self.starts[next_idx].map(|start| start.id);
-                        let process_id = next.process_handle.and_then(process_table::process_id);
+                        let process_id = next.process_id;
                         self.maybe_log_ready_wait(
                             next_idx,
                             task_id,
@@ -1742,6 +1749,17 @@ impl Scheduler {
         self.starts[self.current_task].map(|start| start.id)
     }
 
+    pub(super) fn current_user_log_ids(&self) -> Option<(u64, u64)> {
+        let slot = self.current_task;
+        let context = self.contexts[slot]?;
+        if !context.user_mode {
+            return None;
+        }
+        let process_id = context.process_id?;
+        let thread_id = self.starts[slot].map(|start| start.id)?;
+        Some((process_id, thread_id))
+    }
+
     pub(super) fn current_task_id(&self) -> Option<u64> {
         self.starts[self.current_task].map(|start| start.id)
     }
@@ -1858,7 +1876,7 @@ impl Scheduler {
             return false;
         };
 
-        let Some(process_id) = process_table::process_id(process_handle) else {
+        let Some(process_id) = current_context.process_id else {
             return false;
         };
         let exec_path = String::from(bootstrap.exec_path());
@@ -2051,10 +2069,7 @@ impl Scheduler {
             if start.id != task_id {
                 continue;
             }
-            let Some(process_handle) = context.process_handle else {
-                continue;
-            };
-            if process_table::process_id(process_handle) != Some(process_id) {
+            if context.process_id != Some(process_id) {
                 continue;
             }
             if signal == 0 {
@@ -2094,10 +2109,7 @@ impl Scheduler {
             if self.starts[slot].map(|start| start.id) != Some(thread_id) {
                 continue;
             }
-            let Some(process_handle) = context.process_handle else {
-                continue;
-            };
-            if process_table::process_id(process_handle) == Some(process_id) {
+            if context.process_id == Some(process_id) {
                 return Some(slot);
             }
         }
@@ -2165,12 +2177,6 @@ impl Scheduler {
         let Some(process_handle) = context.process_handle else {
             return false;
         };
-        let process_id = process_table::process_id(process_handle).unwrap_or_else(|| {
-            self.starts[slot]
-                .map(|start| start.id)
-                .unwrap_or(slot as u64)
-        });
-        let _ = process_id;
         let map_result =
             process_table::with_process_state_mut(process_handle, |_, process_state| {
                 let (address_space, linux_process_state) =
@@ -2370,9 +2376,7 @@ impl Scheduler {
             .map(|context| context.blocked_since_ticks)
             .unwrap_or(0);
         let task_id = self.starts[slot].map(|start| start.id);
-        let process_id = self.contexts[slot]
-            .and_then(|context| context.process_handle)
-            .and_then(process_table::process_id);
+        let process_id = self.contexts[slot].and_then(|context| context.process_id);
         let (saved_rsp, user_mode) = match self.contexts[slot] {
             Some(context) => (context.saved_rsp, context.user_mode),
             None => return false,
@@ -2609,6 +2613,7 @@ mod tests {
             user_abi: Some(UserAbi::Linux),
             console_session: ConsoleSessionHandle::SYSTEM,
             process_handle: Some(handle),
+            process_id: process_table::process_id(handle),
             user_stack: None,
             linux_thread_state: None,
             windows_thread_state: None,

@@ -1449,11 +1449,20 @@ pub(super) fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u
         if user_len == 0 {
             return 0;
         }
-        let access = if remote.path().as_str() == "/dev/input/event0" {
+        let is_evdev = remote.path().as_str() == "/dev/input/event0";
+        let access = if is_evdev {
             kernel_object::api::device::DeviceAccessKind::Evdev
         } else {
             kernel_object::api::device::DeviceAccessKind::Native
         };
+        let user_len = match inputd_authorize_read(fd, user_len, is_evdev) {
+            Ok(approved_len) => approved_len,
+            Err(LINUX_ENOSYS) => user_len,
+            Err(errno) => return linux_errno(errno),
+        };
+        if user_len == 0 {
+            return 0;
+        }
         let handle = kernel_object::api::device::DeviceHandle::with_access(
             kernel_object::api::device::DeviceId::Input,
             access,
@@ -1509,6 +1518,30 @@ pub(super) fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u
         }
     }
     copied as u64
+}
+
+fn inputd_authorize_read(fd: u64, requested_len: usize, is_evdev: bool) -> Result<usize, i64> {
+    let mut request = InputdIpcRequest {
+        version: INPUTD_IPC_ABI_VERSION,
+        op: INPUTD_IPC_OP_AUTHORIZE_READ,
+        fd,
+        access: if is_evdev {
+            INPUTD_ACCESS_EVDEV
+        } else {
+            INPUTD_ACCESS_NATIVE
+        },
+        requested_len: requested_len as u64,
+        ..InputdIpcRequest::default()
+    };
+    if let Some(snapshot) = multitask::current_user_snapshot() {
+        request.pid = snapshot.process_id();
+        request.tid = snapshot.thread_id();
+    }
+    let response = call_inputd_ipc_request(&request)?;
+    if response.approved_len > requested_len as u64 {
+        return Err(LINUX_EINVAL);
+    }
+    usize::try_from(response.approved_len).map_err(|_| LINUX_EOVERFLOW)
 }
 
 pub(super) fn syscall_linux_vfs_pread64(fd: u64, user_ptr: u64, user_len: u64, offset: u64) -> u64 {
@@ -2940,19 +2973,45 @@ pub(super) fn syscall_linux_vfs_umount2(target_ptr: u64, flags: u64) -> u64 {
 // per-device policy. Ring0 keeps the current-process user-copy/device broker
 // after devmgrd authorizes the operation.
 pub(super) fn syscall_linux_ioctl(fd: u64, request_number: u64, arg: u64) -> u64 {
-    // Fast path inspired by seL4's "direct handling" pattern: short-circuit the
-    // devmgrd IPC bounce for device ioctls performed against the caller's own
-    // file descriptors. devmgrd's `dispatch_ioctl` currently forwards every
-    // request through `SYS_RUSTOS_DEVICE_IOCTL_BROKER`, which lands back in the
-    // same kernel handler we invoke here — so the IPC round-trip is pure
-    // overhead (≥4 context switches per call) for data-path ioctls like display
-    // present and input reads. Routing through devmgrd is only required for
-    // policy decisions, of which there are none today; if a policy hook is
-    // added later we can re-introduce IPC for the specific opcodes that need it.
+    if ioctl_requires_devmgrd_policy(request_number) {
+        let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_IOCTL);
+        request.dirfd = fd;
+        request.flags = request_number;
+        request.arg1 = arg;
+        match call_service_offload_request(IPC_SERVICE_DEVMGRD, &request).and_then(|response| {
+            ensure_service_response(&response, SYSCALL_OFFLOAD_OP_LINUX_IOCTL)?;
+            ensure_syscalld_payload(&response, size_of::<u64>())?;
+            let mut bytes = [0_u8; size_of::<u64>()];
+            bytes.copy_from_slice(&response.payload[..size_of::<u64>()]);
+            Ok(u64::from_le_bytes(bytes))
+        }) {
+            Ok(value) => return value,
+            Err(LINUX_ENOSYS) => {}
+            Err(errno) => return linux_errno(errno),
+        }
+    }
+
+    // Bootstrap fallback only: early services can issue console/display ioctls
+    // before devmgrd has registered. Hot data-path ioctls also stay direct:
+    // display present/input delivery costs must be fixed with broker/data-path
+    // design, not by forcing per-frame policy IPC.
     match crate::user::sysops::device::ioctl_current_process_fd(fd, request_number, arg) {
         Ok(value) => value,
         Err(err) => linux_errno(super::broker_ops::device_sysop_error_to_linux_errno(err)),
     }
+}
+
+fn ioctl_requires_devmgrd_policy(request_number: u64) -> bool {
+    matches!(
+        request_number,
+        rustos_user_abi::device::DISPLAY_IOCTL_GET_INFO
+            | rustos_user_abi::device::DISPLAY_IOCTL_CREATE_SURFACE
+            | rustos_user_abi::console::CONSOLE_IOCTL_CREATE_SESSION
+            | rustos_user_abi::console::CONSOLE_IOCTL_CLOSE_SESSION
+            | rustos_user_abi::console::CONSOLE_IOCTL_BIND_CURRENT_SESSION
+            | rustos_user_abi::console::CONSOLE_IOCTL_SET_SESSION_STATE
+            | rustos_user_abi::console::CONSOLE_IOCTL_SET_FOCUS
+    )
 }
 // RING3-MIGRATION-REFERENCE END: devmgrd-owned ioctl policy bypass.
 
@@ -3374,6 +3433,36 @@ pub(super) fn call_vfs_ipc_request(request: &VfsIpcRequest) -> Result<VfsIpcResp
         || response.reserved0 != 0
     {
         return Err(LINUX_EINVAL);
+    }
+    Ok(response)
+}
+
+pub(super) fn call_inputd_ipc_request(
+    request: &InputdIpcRequest,
+) -> Result<InputdIpcResponse, i64> {
+    let start_ticks = crate::arch::rtc::ticks();
+    let response = ipc_ops::call_service_endpoint(IPC_SERVICE_INPUTD, as_bytes(request))?;
+    log_slow_service_call(
+        "inputd",
+        request.op,
+        ticks_elapsed_ms(start_ticks, crate::arch::rtc::ticks()),
+        request.pid,
+        request.tid,
+        response.len() as i64,
+        None,
+    );
+    if response.len() != size_of::<InputdIpcResponse>() {
+        return Err(LINUX_EINVAL);
+    }
+    let response = read_unaligned::<InputdIpcResponse>(response.as_slice());
+    if response.version != INPUTD_IPC_ABI_VERSION
+        || response.op != request.op
+        || response.flags != 0
+    {
+        return Err(LINUX_EINVAL);
+    }
+    if response.status != 0 {
+        return Err(response.status.unsigned_abs() as i64);
     }
     Ok(response)
 }

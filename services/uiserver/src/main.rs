@@ -37,6 +37,7 @@ const SLOW_RUNTIME_REFRESH_THRESHOLD: Duration = Duration::from_millis(100);
 const MAX_SLOW_RUNTIME_REFRESH_LOGS: usize = 8;
 const MAX_WAYLAND_CALLBACK_ONLY_LOGS: usize = 8;
 const WAYLAND_BACKLOG_SERVICE_INTERVAL: Duration = Duration::from_millis(4);
+const PARTIAL_RENDER_BUDGET: Duration = Duration::from_millis(80);
 
 static FRAME_SAMPLE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SLOW_CONSOLE_REFRESH_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -380,7 +381,7 @@ fn run() -> Result<(), i32> {
     let mut frames_rendered_window = 0_u64;
     let mut cursor_moves_window = 0_u64;
 
-    loop {
+    'main_loop: loop {
         loop_count = loop_count.saturating_add(1);
 
         let mut background_ready = false;
@@ -521,6 +522,7 @@ fn run() -> Result<(), i32> {
             frames_rendered_window = 0;
             cursor_moves_window = 0;
         }
+        let mut deferred_update = VisualUpdate::default();
         let rendered = if drawable_update.needs_full_redraw {
             let render_started = Instant::now();
             render_frame(&mut state);
@@ -531,7 +533,7 @@ fn run() -> Result<(), i32> {
                 Ok(()) => {}
                 Err(err) if state.recover_if_stale_surface_error(err)? => {
                     pending_update.request_full();
-                    continue;
+                    continue 'main_loop;
                 }
                 Err(err) => return Err(err),
             }
@@ -557,12 +559,13 @@ fn run() -> Result<(), i32> {
             true
         } else if !drawable_update.partial_rects().is_empty() {
             let render_rects = drawable_update.partial_rects().to_vec();
+            let mut rendered_rects = Vec::with_capacity(render_rects.len());
             let mut render_elapsed = Duration::ZERO;
             let mut present_elapsed = Duration::ZERO;
             let mut present_union = canvas::Rect::empty();
             let mut pixel_count = 0_u64;
 
-            for rect in &render_rects {
+            for (index, rect) in render_rects.iter().enumerate() {
                 present_union = present_union.union(*rect);
                 pixel_count =
                     pixel_count.saturating_add(rect.width.saturating_mul(rect.height) as u64);
@@ -570,19 +573,28 @@ fn run() -> Result<(), i32> {
                 let render_started = Instant::now();
                 render_rect(&mut state, *rect);
                 render_elapsed += render_started.elapsed();
+                rendered_rects.push(*rect);
+                if index + 1 < render_rects.len() && render_elapsed >= PARTIAL_RENDER_BUDGET {
+                    for deferred_rect in &render_rects[index + 1..] {
+                        deferred_update.add_partial_rect(*deferred_rect);
+                    }
+                    break;
+                }
             }
 
             let present_started = Instant::now();
-            match state.present_rect(present_union) {
-                Ok(()) => {}
-                Err(err) if state.recover_if_stale_surface_error(err)? => {
-                    pending_update.request_full();
-                    continue;
+            for rect in &rendered_rects {
+                match state.present_rect(*rect) {
+                    Ok(()) => {}
+                    Err(err) if state.recover_if_stale_surface_error(err)? => {
+                        pending_update.request_full();
+                        continue 'main_loop;
+                    }
+                    Err(err) => return Err(err),
                 }
-                Err(err) => return Err(err),
             }
             present_elapsed += present_started.elapsed();
-            let rect_count = render_rects.len() as u64;
+            let rect_count = rendered_rects.len() as u64;
             profile::record_present(
                 false,
                 rect_count,
@@ -620,6 +632,7 @@ fn run() -> Result<(), i32> {
             let cursor_moved =
                 presented_cursor_x != state.cursor_x || presented_cursor_y != state.cursor_y;
             pending_update.clear();
+            pending_update.absorb(deferred_update);
             presented_cursor_x = state.cursor_x;
             presented_cursor_y = state.cursor_y;
             if cursor_moved {

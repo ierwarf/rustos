@@ -50,6 +50,7 @@ pub struct TaskHooks {
     pub halt_current_retired_task: Option<fn() -> !>,
     pub current_user_snapshot: Option<fn() -> Option<CurrentUserSnapshot>>,
     pub is_scheduler_initialized: Option<fn() -> bool>,
+    pub current_task_id: Option<fn() -> Option<u64>>,
     pub current_user_thread_id: Option<fn() -> Option<u64>>,
     pub block_current_user_task: Option<fn() -> bool>,
     pub wake_user_task: Option<fn(u64) -> bool>,
@@ -81,6 +82,7 @@ static HOOKS: RwLock<HookRegistry> = RwLock::new(HookRegistry {
         halt_current_retired_task: None,
         current_user_snapshot: None,
         is_scheduler_initialized: None,
+        current_task_id: None,
         current_user_thread_id: None,
         block_current_user_task: None,
         wake_user_task: None,
@@ -152,6 +154,10 @@ pub fn current_user_thread_id() -> Option<u64> {
         .task
         .current_user_thread_id
         .and_then(|hook| hook())
+}
+
+pub fn current_task_id() -> Option<u64> {
+    HOOKS.read().task.current_task_id.and_then(|hook| hook())
 }
 
 pub fn block_current_user_task() -> bool {

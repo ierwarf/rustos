@@ -337,6 +337,7 @@ pub(crate) fn enqueue_report(usb_device: *mut LinuxCompatUsbDevice, report: &[u8
         return;
     };
     let report_len = report.len();
+    let native_report = report.clone();
     let report_preview = [
         report.as_slice().first().copied().unwrap_or(0),
         report.as_slice().get(1).copied().unwrap_or(0),
@@ -344,7 +345,7 @@ pub(crate) fn enqueue_report(usb_device: *mut LinuxCompatUsbDevice, report: &[u8
         report.as_slice().get(3).copied().unwrap_or(0),
     ];
 
-    let completion = {
+    let (completion, native_layout, native_state_key) = {
         let mut devices = USB_RUNTIME_DEVICES.lock();
         let Some(device) = devices
             .iter_mut()
@@ -352,17 +353,39 @@ pub(crate) fn enqueue_report(usb_device: *mut LinuxCompatUsbDevice, report: &[u8
         else {
             return;
         };
+        let native_layout = device.layout_hint.clone();
+        let native_state_key = device.usb_device_ptr;
 
         if let Some(urb_ptr) = device.pending_urbs.pop_front() {
-            completion_from_report(urb_ptr as *mut LinuxCompatUrb, report)
+            (
+                completion_from_report(urb_ptr as *mut LinuxCompatUrb, report),
+                native_layout,
+                native_state_key,
+            )
         } else {
             if let Some(last) = device.queued_reports.back_mut() {
                 if runtime_reports_can_coalesce(last, &report, device.layout_hint.as_deref()) {
                     *last = report;
-                    return;
+                    (None, native_layout, native_state_key)
+                } else if device.queued_reports.len() >= REPORT_QUEUE_CAPACITY {
+                    device.dropped_reports = device.dropped_reports.saturating_add(1);
+                    if device
+                        .dropped_reports
+                        .is_multiple_of(REPORT_DROP_LOG_INTERVAL)
+                    {
+                        crate::debug::println!(
+                            "usb runtime report overload: usb_dev={:#x} dropped={} queued={}",
+                            device.usb_device_ptr,
+                            device.dropped_reports,
+                            device.queued_reports.len()
+                        );
+                    }
+                    (None, native_layout, native_state_key)
+                } else {
+                    let _ = device.queued_reports.push_back(report);
+                    (None, native_layout, native_state_key)
                 }
-            }
-            if device.queued_reports.len() >= REPORT_QUEUE_CAPACITY {
+            } else if device.queued_reports.len() >= REPORT_QUEUE_CAPACITY {
                 device.dropped_reports = device.dropped_reports.saturating_add(1);
                 if device
                     .dropped_reports
@@ -375,12 +398,15 @@ pub(crate) fn enqueue_report(usb_device: *mut LinuxCompatUsbDevice, report: &[u8
                         device.queued_reports.len()
                     );
                 }
-                return;
+                (None, native_layout, native_state_key)
+            } else {
+                let _ = device.queued_reports.push_back(report);
+                (None, native_layout, native_state_key)
             }
-            let _ = device.queued_reports.push_back(report);
-            None
         }
     };
+
+    translate_runtime_report(native_state_key, &native_report, native_layout);
 
     if REPORT_ENQUEUE_LOGS.fetch_add(1, Ordering::Relaxed) < REPORT_ENQUEUE_LOG_LIMIT {
         crate::debug::println!(
@@ -791,6 +817,25 @@ fn copy_report_bytes(report: RuntimeReport, dest: *mut u8, max_len: usize) -> us
         core::ptr::copy_nonoverlapping(report.as_slice().as_ptr(), dest, copied);
     }
     copied
+}
+
+fn translate_runtime_report(
+    state_key: usize,
+    report: &RuntimeReport,
+    layout: Option<Arc<HidReportLayout>>,
+) {
+    let Some(layout) = layout else {
+        return;
+    };
+    let bytes = report.as_slice();
+    match layout.as_ref() {
+        HidReportLayout::BootKeyboard(layout) => {
+            let _ = handle_keyboard_report(state_key, bytes, layout);
+        }
+        HidReportLayout::Pointer(layout) => {
+            let _ = handle_pointer_report(state_key, bytes, layout);
+        }
+    }
 }
 
 fn queue_urb_completion(completion: Option<UrbCompletion>) {

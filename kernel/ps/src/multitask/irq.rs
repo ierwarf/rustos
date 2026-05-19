@@ -59,14 +59,19 @@ extern "C" fn rtc_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut Sav
     }
 
     let current_rsp = context_ptr as usize;
-    let next_rsp = unsafe {
+    let interrupted_kernel_frame = unsafe {
         let scheduler = scheduler_mut();
         let _ = crate::linux_runtime_hooks::tick_jiffies(1);
-        if timer_interrupted_kernel_frame(context_ptr, scheduler) {
-            crate::arch::rtc::on_interrupt();
-            crate::arch::pic::send_eoi(crate::arch::pic::PIC_2_OFFSET);
-            return context_ptr;
-        }
+        timer_interrupted_kernel_frame(context_ptr, scheduler)
+    };
+    if interrupted_kernel_frame {
+        crate::arch::rtc::on_interrupt();
+        crate::arch::pic::send_eoi(crate::arch::pic::PIC_2_OFFSET);
+        return context_ptr;
+    }
+
+    let next_rsp = unsafe {
+        let scheduler = scheduler_mut();
         scheduler.save_current_simd_state();
         let (next_rsp, _next_pit_divisor) = scheduler.on_timer_interrupt(current_rsp);
         scheduler.prepare_current_task_execution();

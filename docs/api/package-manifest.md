@@ -87,6 +87,7 @@ Bridge drivers can declare autoload metadata:
 name = "amdgpu"
 class = "display"
 bus = "pci"
+enabled = true
 priority = 10
 when = "vfs-ready"
 aliases = ["pci:vendor=0x1002,class=0x03"]
@@ -94,7 +95,7 @@ provider_group = "display-primary"
 fallback_only = false
 ```
 
-Stage writes this into `system/registry/kernel/loadable-drivers.tsv`.
+Stage writes enabled entries into `system/registry/kernel/loadable-drivers.tsv`.
 
 <a id="korean"></a>
 
@@ -181,6 +182,7 @@ Bridge driver는 autoload metadata를 선언할 수 있습니다.
 name = "amdgpu"
 class = "display"
 bus = "pci"
+enabled = true
 priority = 10
 when = "vfs-ready"
 aliases = ["pci:vendor=0x1002,class=0x03"]
@@ -188,4 +190,4 @@ provider_group = "display-primary"
 fallback_only = false
 ```
 
-stage는 이 정보를 `system/registry/kernel/loadable-drivers.tsv`에 기록합니다.
+stage는 enabled entry만 `system/registry/kernel/loadable-drivers.tsv`에 기록합니다.

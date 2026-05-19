@@ -82,6 +82,9 @@ const COMMAND_COMPLETION_IRQ_OFF_SPINS: usize = 50_000;
 const COMMAND_COMPLETION_BOOT_SPINS: usize = 1_000_000;
 const COMMAND_TIMEOUT_BACKOFF_BASE_MS: u64 = 100;
 const COMMAND_TIMEOUT_BACKOFF_MAX_MS: u64 = 1_000;
+const MAX_PENDING_FLUSH_RECTS: usize = 8;
+const FLUSH_RECT_MERGE_NUMERATOR: u64 = 5;
+const FLUSH_RECT_MERGE_DENOMINATOR: u64 = 4;
 
 static DISPLAY: Mutex<Option<VirtioGpuDisplay>> = Mutex::new(None);
 static DISPLAY_INITIALIZING: AtomicBool = AtomicBool::new(false);
@@ -97,6 +100,15 @@ struct FlushRect {
 }
 
 impl FlushRect {
+    const fn empty() -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        }
+    }
+
     fn union(self, other: Self) -> Self {
         let x0 = self.x.min(other.x);
         let y0 = self.y.min(other.y);
@@ -115,6 +127,37 @@ impl FlushRect {
             height: y1.saturating_sub(y0),
         }
     }
+
+    fn intersection(self, other: Self) -> Self {
+        let x0 = self.x.max(other.x);
+        let y0 = self.y.max(other.y);
+        let x1 = self
+            .x
+            .saturating_add(self.width)
+            .min(other.x.saturating_add(other.width));
+        let y1 = self
+            .y
+            .saturating_add(self.height)
+            .min(other.y.saturating_add(other.height));
+        if x1 <= x0 || y1 <= y0 {
+            return Self::empty();
+        }
+        Self {
+            x: x0,
+            y: y0,
+            width: x1 - x0,
+            height: y1 - y0,
+        }
+    }
+}
+
+fn flush_rect_area(rect: FlushRect) -> u64 {
+    u64::from(rect.width).saturating_mul(u64::from(rect.height))
+}
+
+fn should_merge_flush_rects(union: FlushRect, separate_area: u64) -> bool {
+    flush_rect_area(union).saturating_mul(FLUSH_RECT_MERGE_DENOMINATOR)
+        <= separate_area.saturating_mul(FLUSH_RECT_MERGE_NUMERATOR)
 }
 
 #[derive(Clone, Copy)]
@@ -125,39 +168,62 @@ enum FlushRequest {
 
 struct PendingFlush {
     full: bool,
-    rect: Option<FlushRect>,
+    rects: [FlushRect; MAX_PENDING_FLUSH_RECTS],
+    len: usize,
 }
 
 impl PendingFlush {
     const fn empty() -> Self {
         Self {
             full: false,
-            rect: None,
+            rects: [FlushRect::empty(); MAX_PENDING_FLUSH_RECTS],
+            len: 0,
         }
     }
 
     fn request_full(&mut self) {
         self.full = true;
-        self.rect = None;
+        self.len = 0;
     }
 
     fn add_rect(&mut self, rect: FlushRect) {
         if self.full || rect.width == 0 || rect.height == 0 {
             return;
         }
-        self.rect = Some(match self.rect {
-            Some(existing) => existing.union(rect),
-            None => rect,
-        });
+        if let Some(index) = self.tight_merge_target(rect) {
+            self.rects[index] = self.rects[index].union(rect);
+            return;
+        }
+        if self.len < self.rects.len() {
+            self.rects[self.len] = rect;
+            self.len += 1;
+            return;
+        }
+        if let Some(index) = self.lowest_growth_merge_target(rect) {
+            self.rects[index] = self.rects[index].union(rect);
+        } else {
+            self.request_full();
+        }
     }
 
     fn take_request(&mut self) -> Option<FlushRequest> {
         if self.full {
             self.full = false;
-            self.rect = None;
+            self.len = 0;
             return Some(FlushRequest::Full);
         }
-        self.rect.take().map(FlushRequest::Rect)
+        if self.len == 0 {
+            return None;
+        }
+        let rect = self.rects[0];
+        self.len -= 1;
+        let mut index = 0;
+        while index < self.len {
+            self.rects[index] = self.rects[index + 1];
+            index += 1;
+        }
+        self.rects[self.len] = FlushRect::empty();
+        Some(FlushRequest::Rect(rect))
     }
 
     fn requeue(&mut self, request: FlushRequest) {
@@ -165,6 +231,42 @@ impl PendingFlush {
             FlushRequest::Full => self.request_full(),
             FlushRequest::Rect(rect) => self.add_rect(rect),
         }
+    }
+
+    fn tight_merge_target(&self, rect: FlushRect) -> Option<usize> {
+        let mut index = 0;
+        while index < self.len {
+            let existing = self.rects[index];
+            let union = existing.union(rect);
+            let separate_area = flush_rect_area(existing)
+                .saturating_add(flush_rect_area(rect))
+                .saturating_sub(flush_rect_area(existing.intersection(rect)));
+            if should_merge_flush_rects(union, separate_area) {
+                return Some(index);
+            }
+            index += 1;
+        }
+        None
+    }
+
+    fn lowest_growth_merge_target(&self, rect: FlushRect) -> Option<usize> {
+        if self.len == 0 {
+            return None;
+        }
+        let mut best_index = 0;
+        let mut best_growth = u64::MAX;
+        let mut index = 0;
+        while index < self.len {
+            let existing = self.rects[index];
+            let growth =
+                flush_rect_area(existing.union(rect)).saturating_sub(flush_rect_area(existing));
+            if growth < best_growth {
+                best_growth = growth;
+                best_index = index;
+            }
+            index += 1;
+        }
+        Some(best_index)
     }
 }
 

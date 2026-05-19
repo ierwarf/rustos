@@ -70,9 +70,11 @@ mod hal_hooks {
     }
 
     fn current_debug_user_context() -> Option<nucleus_core::debug::CurrentUserLogContext> {
-        ps_api::current_user_snapshot().map(|snapshot| nucleus_core::debug::CurrentUserLogContext {
-            process_id: snapshot.process_id(),
-            thread_id: snapshot.thread_id(),
+        ps_api::current_user_log_ids().map(|(process_id, thread_id)| {
+            nucleus_core::debug::CurrentUserLogContext {
+                process_id,
+                thread_id,
+            }
         })
     }
 
@@ -140,6 +142,7 @@ mod hal_hooks {
             halt_current_retired_task: Some(ps_api::halt_current_retired_task),
             current_user_snapshot: Some(current_user_snapshot),
             is_scheduler_initialized: Some(ps_api::is_initialized),
+            current_task_id: Some(ps_api::current_task_id),
             current_user_thread_id: Some(ps_api::current_user_id),
             block_current_user_task: Some(ps_api::block_current_user_task),
             wake_user_task: Some(ps_api::wake_user_task),

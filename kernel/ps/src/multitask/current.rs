@@ -29,6 +29,10 @@ pub fn current_task_id() -> Option<u64> {
     interrupts::without_interrupts(|| unsafe { scheduler_ref().current_task_id() })
 }
 
+pub fn current_user_log_ids() -> Option<(u64, u64)> {
+    interrupts::without_interrupts(|| unsafe { scheduler_ref().current_user_log_ids() })
+}
+
 pub fn current_user_process_id() -> Option<u64> {
     current_user_snapshot().map(|snapshot| snapshot.process_id())
 }
