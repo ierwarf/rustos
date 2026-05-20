@@ -449,12 +449,7 @@ impl Scheduler {
     /// preempted task that genuinely ran less than a tick boundary keeps the
     /// historical zero-charge behavior, since storage and other kernel paths
     /// rely on it to make timely forward progress under TCG.
-    fn account_current_runtime(
-        &mut self,
-        slot: usize,
-        now_ticks: u64,
-        force_min_charge: bool,
-    ) {
+    fn account_current_runtime(&mut self, slot: usize, now_ticks: u64, force_min_charge: bool) {
         let Some(context) = self.contexts[slot].as_mut() else {
             return;
         };
@@ -1438,11 +1433,7 @@ impl Scheduler {
         self.dispatch_schedule(current_rsp, true)
     }
 
-    fn dispatch_schedule(
-        &mut self,
-        current_rsp: usize,
-        voluntary_yield: bool,
-    ) -> (usize, u16) {
+    fn dispatch_schedule(&mut self, current_rsp: usize, voluntary_yield: bool) -> (usize, u16) {
         let current_slot = self.current_task;
         let now_ticks = crate::arch::rtc::ticks();
         let current_runtime_ns = self.contexts[current_slot]

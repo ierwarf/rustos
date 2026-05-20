@@ -4,51 +4,16 @@ use std::thread;
 use std::time::Duration;
 
 use rustos_user_abi::syscall::{
-    StorageBlockDescriptorWire, StorageListBrokerArgs, IPC_SERVICE_STORAGED,
-    STORAGE_LIST_MAX_DESCRIPTORS, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
-    SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
-    SYS_RUSTOS_STORAGE_LIST_BROKER,
+    BootExtentLeaseWire, RustosBootExtentBrokerArgs, StorageBlockDescriptorWire,
+    StorageListBrokerArgs, StoragedRequest, StoragedResponse, BOOT_EXTENT_FLAG_READONLY,
+    BOOT_EXTENT_PATH_CAPACITY, IPC_SERVICE_STORAGED, STORAGED_IPC_ABI_VERSION,
+    STORAGED_OP_BOOT_EXTENT_LOOKUP, STORAGED_OP_LIST_COUNT, STORAGED_OP_LIST_GET, STORAGED_OP_PING,
+    STORAGED_OP_ROOT_STATUS, STORAGE_LIST_MAX_DESCRIPTORS, SYS_RUSTOS_BOOT_EXTENT_BROKER,
+    SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV,
+    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_STORAGE_LIST_BROKER,
 };
 
 const RECV_BACKOFF: Duration = Duration::from_millis(50);
-const STORAGED_ABI_VERSION: u16 = 1;
-const STORAGED_OP_PING: u16 = 1;
-const STORAGED_OP_LIST_COUNT: u16 = 2;
-const STORAGED_OP_LIST_GET: u16 = 3;
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct StoragedRequest {
-    version: u16,
-    op: u16,
-    flags: u32,
-    arg0: u64,
-    arg1: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct StoragedResponse {
-    version: u16,
-    op: u16,
-    status: i32,
-    reserved0: u32,
-    value: u64,
-    payload: StorageBlockDescriptorWire,
-}
-
-impl Default for StoragedResponse {
-    fn default() -> Self {
-        Self {
-            version: 0,
-            op: 0,
-            status: 0,
-            reserved0: 0,
-            value: 0,
-            payload: StorageBlockDescriptorWire::default(),
-        }
-    }
-}
 
 fn main() {
     observability_client::info!("storaged", service, "service started");
@@ -94,7 +59,7 @@ fn serve(endpoint: u64) {
             continue;
         }
         let mut response = StoragedResponse {
-            version: STORAGED_ABI_VERSION,
+            version: STORAGED_IPC_ABI_VERSION,
             op: request.op,
             ..StoragedResponse::default()
         };
@@ -140,8 +105,59 @@ fn dispatch(request: &StoragedRequest, response: &mut StoragedResponse) -> i32 {
             }
             Err(errno) => errno,
         },
+        STORAGED_OP_ROOT_STATUS => match selected_root_descriptor() {
+            Ok(descriptor) => {
+                response.payload = descriptor;
+                response.value = descriptor.id as u64;
+                0
+            }
+            Err(errno) => errno,
+        },
+        STORAGED_OP_BOOT_EXTENT_LOOKUP => match boot_extent_lookup(request) {
+            Ok(lease) => {
+                response.boot_extent = lease;
+                response.value = lease.file_len;
+                0
+            }
+            Err(errno) => errno,
+        },
         _ => libc::EINVAL,
     }
+}
+
+fn selected_root_descriptor() -> Result<StorageBlockDescriptorWire, i32> {
+    let descriptors = list_descriptors()?;
+    descriptors.first().copied().ok_or(libc::ENODEV)
+}
+
+fn boot_extent_lookup(request: &StoragedRequest) -> Result<BootExtentLeaseWire, i32> {
+    if request.path_len == 0 || request.path_len as usize > BOOT_EXTENT_PATH_CAPACITY {
+        return Err(libc::EINVAL);
+    }
+    let len = request.path_len as usize;
+    let path = std::str::from_utf8(&request.path[..len]).map_err(|_| libc::EINVAL)?;
+    let mut lease = BootExtentLeaseWire {
+        path_len: request.path_len,
+        flags: BOOT_EXTENT_FLAG_READONLY,
+        ..BootExtentLeaseWire::default()
+    };
+    lease.path[..len].copy_from_slice(&request.path[..len]);
+    let args = RustosBootExtentBrokerArgs {
+        abi_version: STORAGED_IPC_ABI_VERSION,
+        flags: 0,
+        reserved0: 0,
+        path_ptr: path.as_ptr() as u64,
+        path_len: len as u64,
+        out_lease_ptr: (&mut lease as *mut BootExtentLeaseWire) as u64,
+    };
+    let result = syscall1(
+        SYS_RUSTOS_BOOT_EXTENT_BROKER,
+        (&args as *const RustosBootExtentBrokerArgs) as u64,
+    );
+    if result < 0 {
+        return Err(last_errno());
+    }
+    Ok(lease)
 }
 
 fn list_descriptors() -> Result<Vec<StorageBlockDescriptorWire>, i32> {
@@ -168,13 +184,19 @@ fn list_descriptors() -> Result<Vec<StorageBlockDescriptorWire>, i32> {
 }
 
 fn validate(received: usize, request: &StoragedRequest) -> Result<(), i32> {
-    if received != size_of::<StoragedRequest>() || request.version != STORAGED_ABI_VERSION {
+    if received != size_of::<StoragedRequest>()
+        || request.version != STORAGED_IPC_ABI_VERSION
+        || request.flags != 0
+        || request.reserved0 != 0
+    {
         return Err(libc::EINVAL);
     }
     match request.op {
         STORAGED_OP_PING => Ok(()),
         STORAGED_OP_LIST_COUNT => Ok(()),
         STORAGED_OP_LIST_GET => Ok(()),
+        STORAGED_OP_ROOT_STATUS => Ok(()),
+        STORAGED_OP_BOOT_EXTENT_LOOKUP => Ok(()),
         _ => Err(libc::EINVAL),
     }
 }

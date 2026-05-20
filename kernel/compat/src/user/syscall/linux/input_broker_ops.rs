@@ -2,7 +2,8 @@ use super::*;
 
 use rustos_user_abi::syscall::{
     INPUT_STATS_FLAG_PENDING_COALESCED, INPUT_STATS_FLAG_PENDING_POINTER_POSITION,
-    IPC_SERVICE_CAP_INPUT_POLICY, InputStatsBrokerArgs, InputStatsWire,
+    INPUTD_ACCESS_NATIVE, INPUTD_INGEST_MAX_EVENTS, IPC_SERVICE_CAP_INPUT_POLICY,
+    InputIngestBrokerArgs, InputIngressWire, InputStatsBrokerArgs, InputStatsWire,
 };
 
 pub(super) fn syscall_linux_rustos_input_stats_broker(args_ptr: u64) -> u64 {
@@ -41,6 +42,54 @@ pub(super) fn syscall_linux_rustos_input_stats_broker(args_ptr: u64) -> u64 {
 
     match usermem::write_current_user_struct(args.out_stats_ptr, &stats) {
         Ok(()) => 0,
+        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
+    }
+}
+
+pub(super) fn syscall_linux_rustos_input_ingest_broker(args_ptr: u64) -> u64 {
+    if !ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_INPUT_POLICY) {
+        return linux_errno(LINUX_EPERM);
+    }
+
+    let args = match usermem::read_current_user_struct::<InputIngestBrokerArgs>(args_ptr) {
+        Ok(args) => args,
+        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+    };
+    if args.abi_version != 1
+        || args.reserved0 != 0
+        || args.reserved1 != 0
+        || args.reserved2 != 0
+        || args.out_events_ptr == 0
+        || args.out_count_ptr == 0
+    {
+        return linux_errno(LINUX_EINVAL);
+    }
+
+    let capacity = usize::try_from(args.out_capacity).unwrap_or(usize::MAX);
+    if capacity > INPUTD_INGEST_MAX_EVENTS {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let mut events = alloc::vec![rustos_user_abi::ui::UiInputEvent::default(); capacity];
+    let count = kernel_io_manager::api::input::event_queue::drain_events(&mut events);
+    for (index, event) in events.iter().take(count).enumerate() {
+        let wire = InputIngressWire {
+            kind: event.kind,
+            access: INPUTD_ACCESS_NATIVE,
+            flags: 0,
+            event: *event,
+        };
+        let offset = index
+            .checked_mul(core::mem::size_of::<InputIngressWire>())
+            .and_then(|offset| u64::try_from(offset).ok());
+        let Some(offset) = offset else {
+            return linux_errno(LINUX_EINVAL);
+        };
+        if let Err(err) = usermem::write_current_user_struct(args.out_events_ptr + offset, &wire) {
+            return linux_errno(address_space_error_to_linux_errno(err));
+        }
+    }
+    match usermem::write_current_user_u32(args.out_count_ptr, count as u32) {
+        Ok(()) => count as u64,
         Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
     }
 }

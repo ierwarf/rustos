@@ -139,18 +139,8 @@ impl From<kernel_object::api::device::DeviceHandle> for DeviceHandle {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct DeviceDescriptor {
-    pub(crate) id: DeviceId,
-    pub(crate) path: &'static str,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DeviceLookupError {
-    InvalidPath,
-    NotFound,
-}
-
+// `/dev` namespace lookup is owned by `devmgrd`; the kernel only keeps typed
+// device IO brokers (read/ioctl) below.
 #[derive(Debug, Clone, Copy)]
 pub enum DeviceError {
     AddressSpace(paging::AddressSpaceError),
@@ -167,41 +157,12 @@ impl From<paging::AddressSpaceError> for DeviceError {
     }
 }
 
-// RING3-MIGRATION-REFERENCE START: devmgrd should own device namespace,
-// permission/access-kind selection, and device-open policy. Ring0 should keep
-// typed device handles plus user-copy/ioctl brokers after devmgrd authorizes
-// the operation.
-const DEVICE_DESCRIPTORS: [DeviceDescriptor; 3] = [
-    DeviceDescriptor {
-        id: DeviceId::Console,
-        path: DeviceId::Console.path(),
-    },
-    DeviceDescriptor {
-        id: DeviceId::Display,
-        path: DeviceId::Display.path(),
-    },
-    DeviceDescriptor {
-        id: DeviceId::Input,
-        path: DeviceId::Input.path(),
-    },
-];
-
-pub(crate) fn descriptors() -> &'static [DeviceDescriptor] {
-    &DEVICE_DESCRIPTORS
-}
-
-pub(crate) fn lookup(path: &str) -> Result<DeviceDescriptor, DeviceLookupError> {
-    Ok(normalize_device_path(path)?.descriptor)
-}
-
-pub fn open(path: &str) -> Result<DeviceHandle, DeviceLookupError> {
-    let normalized = normalize_device_path(path)?;
-    Ok(DeviceHandle::with_access(
-        normalized.descriptor.id,
-        normalized.access_kind,
-    ))
-}
-
+// RING3-MIGRATION-REFERENCE START: devmgrd owns the `/dev` namespace and
+// device-open policy; ring0 keeps only the typed user-copy/ioctl brokers that
+// devmgrd dispatches against. The namespace lookup helpers (descriptors,
+// open, normalize_device_path) and the hard-coded DEVICE_DESCRIPTORS table
+// have been removed from ring0 — `vfsd` already routes `/dev` opens through
+// `devmgrd`'s registry IPC.
 pub fn read_to_user(
     handle: DeviceHandle,
     process_state: &mut UserProcessState,
@@ -267,84 +228,18 @@ pub(super) fn write_user_struct<T: Copy>(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct NormalizedDevicePath {
-    descriptor: DeviceDescriptor,
-    access_kind: DeviceAccessKind,
-}
-
-fn normalize_device_path(path: &str) -> Result<NormalizedDevicePath, DeviceLookupError> {
-    if !path.starts_with('/') {
-        return Err(DeviceLookupError::InvalidPath);
-    }
-
-    let components = path
-        .split('/')
-        .filter(|component| !component.is_empty() && *component != ".");
-    let parts = components.collect::<alloc::vec::Vec<_>>();
-    let Some(root) = parts.first().copied() else {
-        return Err(DeviceLookupError::InvalidPath);
-    };
-    if root != "dev" {
-        return Err(DeviceLookupError::NotFound);
-    }
-
-    match parts.as_slice() {
-        ["dev", "console0"] => Ok(NormalizedDevicePath {
-            descriptor: DEVICE_DESCRIPTORS[0],
-            access_kind: DeviceAccessKind::Native,
-        }),
-        ["dev", "display0"] | ["dev", "dri", "card0"] => Ok(NormalizedDevicePath {
-            descriptor: DEVICE_DESCRIPTORS[1],
-            access_kind: DeviceAccessKind::Native,
-        }),
-        ["dev", "input0"] => Ok(NormalizedDevicePath {
-            descriptor: DEVICE_DESCRIPTORS[2],
-            access_kind: DeviceAccessKind::Native,
-        }),
-        ["dev", "input", "event0"] => Ok(NormalizedDevicePath {
-            descriptor: DEVICE_DESCRIPTORS[2],
-            access_kind: DeviceAccessKind::Evdev,
-        }),
-        _ => Err(DeviceLookupError::NotFound),
-    }
-}
 // RING3-MIGRATION-REFERENCE END: devmgrd-owned device namespace/read policy.
 
 #[cfg(test)]
 mod tests {
-    use super::{DeviceAccessKind, DeviceId, DeviceLookupError, lookup, open};
+    use super::{DeviceAccessKind, DeviceHandle, DeviceId};
 
     #[test]
-    fn lookup_accepts_registered_device_paths() {
-        assert_eq!(lookup("/dev/console0").unwrap().id, DeviceId::Console);
-        assert_eq!(lookup("/dev/display0").unwrap().id, DeviceId::Display);
-        assert_eq!(lookup("/dev/input0").unwrap().id, DeviceId::Input);
-        assert_eq!(lookup("/dev/dri/card0").unwrap().id, DeviceId::Display);
-        assert_eq!(lookup("/dev/input/event0").unwrap().id, DeviceId::Input);
-    }
-
-    #[test]
-    fn lookup_normalizes_redundant_separators() {
-        assert_eq!(lookup("//dev///display0").unwrap().id, DeviceId::Display);
-    }
-
-    #[test]
-    fn lookup_rejects_invalid_namespaces() {
-        assert_eq!(lookup("/tmp/display0"), Err(DeviceLookupError::NotFound));
-        assert_eq!(lookup("display0"), Err(DeviceLookupError::InvalidPath));
-        assert_eq!(
-            lookup("/dev/display0/child"),
-            Err(DeviceLookupError::NotFound)
-        );
-    }
-
-    #[test]
-    fn open_returns_device_handle() {
-        assert_eq!(open("/dev/input0").unwrap().device_id(), DeviceId::Input);
-        assert_eq!(
-            open("/dev/input/event0").unwrap().access_kind(),
-            DeviceAccessKind::Evdev
-        );
+    fn device_handle_round_trip_keeps_id_and_access() {
+        let handle = DeviceHandle::with_access(DeviceId::Input, DeviceAccessKind::Evdev);
+        let object = handle.into_object_handle();
+        let restored = DeviceHandle::from_object_handle(object);
+        assert_eq!(restored.device_id(), DeviceId::Input);
+        assert_eq!(restored.access_kind(), DeviceAccessKind::Evdev);
     }
 }

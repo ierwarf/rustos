@@ -13,7 +13,7 @@ use core::mem::size_of;
 use rustos_user_abi::syscall::{
     LoaderSpawnRequest, LoaderSpawnResponse, RustosProcAbortBrokerArgs,
     RustosProcMapDataBrokerArgs, RustosProcMapFileBatchBrokerArgs, RustosProcMapFileBatchEntry,
-    RustosProcMapZeroedBrokerArgs, RustosProcPrepareBrokerArgs, RustosProcSetImageBlobBrokerArgs,
+    RustosProcMapZeroedBrokerArgs, RustosProcPrepareBrokerArgs,
     RustosProcSetLinuxRuntimeBrokerArgs, RustosProcSetWindowsRuntimeBrokerArgs,
     IPC_SERVICE_LOADERD, LOADER_OP_EXEC_TARGET, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION,
     LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY,
@@ -25,8 +25,7 @@ use rustos_user_abi::syscall::{
     SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_PROC_ABORT_BROKER,
     SYS_RUSTOS_PROC_MAP_DATA_BROKER, SYS_RUSTOS_PROC_MAP_FILE_BATCH_BROKER,
     SYS_RUSTOS_PROC_MAP_ZEROED_BROKER, SYS_RUSTOS_PROC_PREPARE_BROKER,
-    SYS_RUSTOS_PROC_SET_IMAGE_BLOB_BROKER, SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER,
-    SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER,
+    SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER, SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER,
 };
 
 mod commit;
@@ -41,6 +40,7 @@ const AT_FDCWD: u64 = (-100_i64) as u64;
 const EINVAL: i32 = 22;
 const ENOEXEC: i32 = 8;
 const EOVERFLOW: i32 = 75;
+const ELF_READ_CHUNK_BYTES: usize = 256 * 1024;
 const ELF_HEADER_SIZE: usize = 64;
 const ELF_PROGRAM_HEADER_SIZE: usize = 56;
 const ELF_MAX_PROGRAM_HEADERS: u16 = 128;
@@ -346,33 +346,6 @@ fn abort_prepare(prepare_handle: u64, reason: u64) {
     );
 }
 
-fn set_image_blob_from_fd(fd: i32, prepare_handle: u64) -> Result<(), i32> {
-    let image = read_fd_to_vec(fd)?;
-    let total_len = image.len() as u64;
-    let mut offset = 0usize;
-    while offset < image.len() {
-        let chunk_len = (image.len() - offset).min(PROC_BROKER_DATA_PAYLOAD_CAPACITY);
-        let mut args = RustosProcSetImageBlobBrokerArgs {
-            abi_version: PROC_BROKER_ABI_VERSION,
-            prepare_handle,
-            total_len,
-            data_offset: offset as u64,
-            data_len: chunk_len as u32,
-            ..RustosProcSetImageBlobBrokerArgs::default()
-        };
-        args.data[..chunk_len].copy_from_slice(&image[offset..offset + chunk_len]);
-        let status = syscall1(
-            SYS_RUSTOS_PROC_SET_IMAGE_BLOB_BROKER,
-            (&args as *const RustosProcSetImageBlobBrokerArgs) as u64,
-        );
-        if status < 0 {
-            return Err((-status) as i32);
-        }
-        offset = offset.checked_add(chunk_len).ok_or(EOVERFLOW)?;
-    }
-    Ok(())
-}
-
 fn set_linux_runtime_broker(prepare_handle: u64, result: &ElfMapResult) -> Result<(), i32> {
     let brk_start = align_up(result.max_loaded_end, 4096)?;
     let mut args = RustosProcSetLinuxRuntimeBrokerArgs {
@@ -407,45 +380,6 @@ fn set_linux_runtime_broker(prepare_handle: u64, result: &ElfMapResult) -> Resul
 // underlying ahci read. The previous 4 KiB chunks turned a single libc load
 // into ~500 individual storage commands, each of which paid the kernel/vfsd
 // crossing and AHCI completion latency.
-const ELF_READ_CHUNK_BYTES: usize = 256 * 1024;
-
-fn read_fd_to_vec(fd: i32) -> Result<Vec<u8>, i32> {
-    let mut out: Vec<u8> = Vec::with_capacity(ELF_READ_CHUNK_BYTES);
-    let mut offset = 0_u64;
-    loop {
-        let want = ELF_READ_CHUNK_BYTES;
-        out.reserve(want);
-        let cur_len = out.len();
-        unsafe {
-            out.set_len(cur_len + want);
-        }
-        let read = syscall4(
-            SYS_PREAD64,
-            fd as u64,
-            out.as_mut_ptr().wrapping_add(cur_len) as u64,
-            want as u64,
-            offset,
-        );
-        if read < 0 {
-            unsafe {
-                out.set_len(cur_len);
-            }
-            return Err((-read) as i32);
-        }
-        let read = read as usize;
-        unsafe {
-            out.set_len(cur_len + read);
-        }
-        if read == 0 {
-            break;
-        }
-        offset = offset.checked_add(read as u64).ok_or(EOVERFLOW)?;
-        if read < want {
-            break;
-        }
-    }
-    (!out.is_empty()).then_some(out).ok_or(ENOEXEC)
-}
 
 struct ElfMapResult {
     load_bias: u64,

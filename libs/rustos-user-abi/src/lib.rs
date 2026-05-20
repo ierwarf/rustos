@@ -46,10 +46,15 @@ pub mod syscall {
     pub const SYS_RUSTOS_PROC_EXEC_TARGET_BROKER: u64 = 0x5255_002b;
     pub const SYS_RUSTOS_PROC_FORK_BROKER: u64 = 0x5255_002c;
     pub const SYS_RUSTOS_PROC_SIGNAL_QUEUE_BROKER: u64 = 0x5255_002d;
-    pub const SYS_RUSTOS_PROC_SET_IMAGE_BLOB_BROKER: u64 = 0x5255_002e;
+    // 0x5255_002e was SYS_RUSTOS_PROC_SET_IMAGE_BLOB_BROKER (image-blob upload),
+    // retired 2026-05-20 — loaderd now only ships parsed runtime metadata.
     pub const SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER: u64 = 0x5255_002f;
     pub const SYS_RUSTOS_PROC_MAP_FILE_BATCH_BROKER: u64 = 0x5255_0030;
     pub const SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER: u64 = 0x5255_0031;
+    pub const SYS_RUSTOS_DEVICE_OPEN_BROKER: u64 = 0x5255_0032;
+    pub const SYS_RUSTOS_INPUT_INGEST_BROKER: u64 = 0x5255_0033;
+    pub const SYS_RUSTOS_BOOT_EXTENT_BROKER: u64 = 0x5255_0034;
+    pub const SYS_RUSTOS_IPC_TRY_RECV: u64 = 0x5255_0035;
 
     /// RustOS-private auxv entry: virtual address of the bootstrap heap region
     /// that the kernel pre-maps for static-PIE policy services so they can run
@@ -75,6 +80,10 @@ pub mod syscall {
     pub const IPC_SERVICE_STORAGED: u64 = 7;
     pub const IPC_SERVICE_INPUTD: u64 = 8;
     pub const IPC_SERVICE_PROCD: u64 = 9;
+    pub const IPC_SERVICE_ROOTD: u64 = 10;
+    pub const IPC_SERVICE_SESSIOND: u64 = 11;
+    pub const IPC_SERVICE_PAGERD: u64 = 12;
+    pub const IPC_SERVICE_SERVICE_DRIVERD: u64 = 13;
     pub const IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY: u64 = 1 << 0;
     pub const IPC_SERVICE_CAP_VFS_POLICY: u64 = 1 << 1;
     pub const IPC_SERVICE_CAP_NET_POLICY: u64 = 1 << 2;
@@ -84,6 +93,10 @@ pub mod syscall {
     pub const IPC_SERVICE_CAP_STORAGE_POLICY: u64 = 1 << 6;
     pub const IPC_SERVICE_CAP_INPUT_POLICY: u64 = 1 << 7;
     pub const IPC_SERVICE_CAP_PROCESS_POLICY: u64 = 1 << 8;
+    pub const IPC_SERVICE_CAP_ROOT_SUPERVISOR: u64 = 1 << 9;
+    pub const IPC_SERVICE_CAP_SESSION_POLICY: u64 = 1 << 10;
+    pub const IPC_SERVICE_CAP_PAGER_POLICY: u64 = 1 << 11;
+    pub const IPC_SERVICE_CAP_SERVICE_DRIVER_POLICY: u64 = 1 << 12;
     pub const IPC_SERVICE_CAP_BOOTSTRAP_POLICY: u64 = IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY
         | IPC_SERVICE_CAP_VFS_POLICY
         | IPC_SERVICE_CAP_NET_POLICY
@@ -228,11 +241,34 @@ pub mod syscall {
     pub const DEVMGRD_IPC_ABI_VERSION: u16 = 1;
     pub const DEVMGRD_IPC_OP_LOOKUP: u16 = 1;
     pub const DEVMGRD_IPC_OP_READDIR: u16 = 2;
+    pub const DEVMGRD_IPC_OP_OPEN: u16 = 3;
+    pub const DEVMGRD_IPC_OP_IOCTL_AUTHORIZE: u16 = 4;
     pub const DEVMGRD_NODE_KIND_NONE: u16 = 0;
     pub const DEVMGRD_NODE_KIND_DIR: u16 = 1;
     pub const DEVMGRD_NODE_KIND_DEVICE: u16 = 2;
+    pub const DEVMGRD_DEVICE_ID_CONSOLE: u16 = 1;
+    pub const DEVMGRD_DEVICE_ID_DISPLAY: u16 = 2;
+    pub const DEVMGRD_DEVICE_ID_INPUT: u16 = 3;
+    pub const DEVMGRD_DEVICE_ACCESS_NATIVE: u16 = 1;
+    pub const DEVMGRD_DEVICE_ACCESS_EVDEV: u16 = 2;
+    pub const DEVMGRD_DEVICE_RIGHT_READ: u64 = 1 << 0;
+    pub const DEVMGRD_DEVICE_RIGHT_WRITE: u64 = 1 << 1;
+    pub const DEVMGRD_DEVICE_RIGHT_IOCTL: u64 = 1 << 2;
+    pub const DEVMGRD_DEVICE_RIGHT_ADMIN: u64 = 1 << 3;
+    pub const DEVMGRD_DEVICE_RIGHT_MAP: u64 = 1 << 4;
+    pub const DEVMGRD_DEVICE_RIGHT_TRANSFER: u64 = 1 << 5;
     pub const DEVMGRD_MAX_DIR_ENTRIES: usize = 16;
     pub const DEVMGRD_NAME_CAPACITY: usize = 32;
+    pub const ROOTD_IPC_ABI_VERSION: u16 = 1;
+    pub const ROOTD_IPC_OP_STATUS: u16 = 1;
+    pub const ROOTD_IPC_OP_LEASE_LIST: u16 = 2;
+    pub const ROOTD_MAX_LEASES: usize = 8;
+    pub const ROOTD_EXEC_PATH_CAPACITY: usize = 256;
+    pub const ROOTD_LEASE_STATE_EMPTY: u16 = 0;
+    pub const ROOTD_LEASE_STATE_RUNNING: u16 = 1;
+    pub const ROOTD_LEASE_STATE_EXITED: u16 = 2;
+    pub const ROOTD_LEASE_STATE_RESTART_PENDING: u16 = 3;
+    pub const ROOTD_LEASE_STATE_FAILED: u16 = 4;
     pub const VFS_LIFECYCLE_FORK: u16 = 1;
     pub const VFS_LIFECYCLE_EXEC_CLOEXEC: u16 = 2;
     pub const VFS_LIFECYCLE_EXIT: u16 = 3;
@@ -302,10 +338,251 @@ pub mod syscall {
     pub const STORAGE_LIST_PATH_CAPACITY: usize = 64;
     pub const STORAGE_LIST_MAX_DESCRIPTORS: usize = 16;
     pub const STORAGE_FLAG_READONLY: u32 = 1 << 0;
+    pub const STORAGED_IPC_ABI_VERSION: u16 = 1;
+    pub const STORAGED_OP_PING: u16 = 1;
+    pub const STORAGED_OP_LIST_COUNT: u16 = 2;
+    pub const STORAGED_OP_LIST_GET: u16 = 3;
+    pub const STORAGED_OP_ROOT_STATUS: u16 = 4;
+    pub const STORAGED_OP_BOOT_EXTENT_LOOKUP: u16 = 5;
+    pub const BOOT_EXTENT_PATH_CAPACITY: usize = 256;
+    pub const BOOT_EXTENT_MAX_EXTENTS: usize = 16;
+    pub const BOOT_EXTENT_FLAG_READONLY: u32 = 1 << 0;
     pub const LIFECYCLE_DRAIN_MAX_EVENTS: usize = 32;
     pub const LIFECYCLE_EVENT_EXIT: u16 = 1;
     pub const LIFECYCLE_EVENT_FORK: u16 = 2;
     pub const LIFECYCLE_EVENT_EXEC: u16 = 3;
+    pub const COMMERCIAL_MAX_PROTOCOL_ABI_VERSION: u16 = 1;
+    pub const COMMERCIAL_MAX_PROTOCOL_NAME_CAPACITY: usize = 32;
+    pub const COMMERCIAL_MAX_PROTOCOL_PATH_CAPACITY: usize = 256;
+    pub const COMMERCIAL_MAX_PROTOCOL_PAYLOAD_CAPACITY: usize = 512;
+    pub const COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS: usize = 16;
+    pub const COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR: u16 = 1;
+    pub const COMMERCIAL_MAX_PROTOCOL_PROCD: u16 = 2;
+    pub const COMMERCIAL_MAX_PROTOCOL_LOADERD: u16 = 3;
+    pub const COMMERCIAL_MAX_PROTOCOL_SYSCALLD: u16 = 4;
+    pub const COMMERCIAL_MAX_PROTOCOL_VFSD: u16 = 5;
+    pub const COMMERCIAL_MAX_PROTOCOL_DEVMGRD: u16 = 6;
+    pub const COMMERCIAL_MAX_PROTOCOL_INPUTD: u16 = 7;
+    pub const COMMERCIAL_MAX_PROTOCOL_STORAGED: u16 = 8;
+    pub const COMMERCIAL_MAX_PROTOCOL_NETD: u16 = 9;
+    pub const COMMERCIAL_MAX_PROTOCOL_DRIVERD: u16 = 10;
+    pub const COMMERCIAL_MAX_PROTOCOL_SESSIOND: u16 = 11;
+    pub const COMMERCIAL_MAX_PROTOCOL_PAGERD: u16 = 12;
+    pub const COMMERCIAL_MAX_PROTOCOL_SERVICE_DRIVERD: u16 = 13;
+    pub const COMMERCIAL_MAX_PROTOCOL_CAPABILITY: u16 = 14;
+    pub const COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST: u16 = 1;
+    pub const COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE: u16 = 2;
+    pub const COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH: u16 = 3;
+    pub const COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY: u16 = 4;
+    pub const COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL: u16 = 5;
+    pub const COMMERCIAL_MAX_PROCD_OP_PROCESS_PREPARE: u16 = 1;
+    pub const COMMERCIAL_MAX_PROCD_OP_EXEC_TICKET: u16 = 2;
+    pub const COMMERCIAL_MAX_PROCD_OP_FORK_PLAN: u16 = 3;
+    pub const COMMERCIAL_MAX_PROCD_OP_THREAD_PLAN: u16 = 4;
+    pub const COMMERCIAL_MAX_PROCD_OP_SIGNAL_POLICY: u16 = 5;
+    pub const COMMERCIAL_MAX_PROCD_OP_WAIT_NAMESPACE: u16 = 6;
+    pub const COMMERCIAL_MAX_PROCD_OP_SESSION_MEMBERSHIP: u16 = 7;
+    pub const COMMERCIAL_MAX_LOADERD_OP_IMAGE_PROBE: u16 = 1;
+    pub const COMMERCIAL_MAX_LOADERD_OP_ELF_RUNTIME_PLAN: u16 = 2;
+    pub const COMMERCIAL_MAX_LOADERD_OP_PE_RUNTIME_PLAN: u16 = 3;
+    pub const COMMERCIAL_MAX_LOADERD_OP_INTERPRETER_PLAN: u16 = 4;
+    pub const COMMERCIAL_MAX_LOADERD_OP_IMPORT_POLICY: u16 = 5;
+    pub const COMMERCIAL_MAX_LOADERD_OP_MAP_PLAN: u16 = 6;
+    pub const COMMERCIAL_MAX_LOADERD_OP_AUXV_PLAN: u16 = 7;
+    pub const COMMERCIAL_MAX_SYSCALLD_OP_LINUX_POLICY: u16 = 1;
+    pub const COMMERCIAL_MAX_SYSCALLD_OP_WIN32_POLICY: u16 = 2;
+    pub const COMMERCIAL_MAX_SYSCALLD_OP_MM_POLICY: u16 = 3;
+    pub const COMMERCIAL_MAX_SYSCALLD_OP_CREDS_LIMITS: u16 = 4;
+    pub const COMMERCIAL_MAX_SYSCALLD_OP_CLOCK_POLICY: u16 = 5;
+    pub const COMMERCIAL_MAX_SYSCALLD_OP_RANDOM_POLICY: u16 = 6;
+    pub const COMMERCIAL_MAX_SYSCALLD_OP_COLD_SYSCALL_OFFLOAD: u16 = 7;
+    pub const COMMERCIAL_MAX_VFSD_OP_MOUNT_GRAPH: u16 = 1;
+    pub const COMMERCIAL_MAX_VFSD_OP_PATH_RESOLVE: u16 = 2;
+    pub const COMMERCIAL_MAX_VFSD_OP_FD_TABLE_PLAN: u16 = 3;
+    pub const COMMERCIAL_MAX_VFSD_OP_DIRECTORY_CURSOR: u16 = 4;
+    pub const COMMERCIAL_MAX_VFSD_OP_FILE_CURSOR: u16 = 5;
+    pub const COMMERCIAL_MAX_VFSD_OP_METADATA_POLICY: u16 = 6;
+    pub const COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_REGISTRY: u16 = 1;
+    pub const COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_OPEN: u16 = 2;
+    pub const COMMERCIAL_MAX_DEVMGRD_OP_IOCTL_AUTHORIZE: u16 = 3;
+    pub const COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_MAP: u16 = 4;
+    pub const COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_EVENT_SUBSCRIBE: u16 = 5;
+    pub const COMMERCIAL_MAX_INPUTD_OP_INPUT_INGEST: u16 = 1;
+    pub const COMMERCIAL_MAX_INPUTD_OP_INPUT_READER: u16 = 2;
+    pub const COMMERCIAL_MAX_INPUTD_OP_EVDEV_TRANSLATE: u16 = 3;
+    pub const COMMERCIAL_MAX_INPUTD_OP_LAYOUT_POLICY: u16 = 4;
+    pub const COMMERCIAL_MAX_INPUTD_OP_DROP_POLICY: u16 = 5;
+    pub const COMMERCIAL_MAX_INPUTD_OP_INPUT_STATS: u16 = 6;
+    pub const COMMERCIAL_MAX_STORAGED_OP_BLOCK_INVENTORY: u16 = 1;
+    pub const COMMERCIAL_MAX_STORAGED_OP_PARTITION_SCAN: u16 = 2;
+    pub const COMMERCIAL_MAX_STORAGED_OP_ROOT_VOLUME_SELECT: u16 = 3;
+    pub const COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE: u16 = 4;
+    pub const COMMERCIAL_MAX_STORAGED_OP_VOLUME_METADATA: u16 = 5;
+    pub const COMMERCIAL_MAX_NETD_OP_SOCKET_NAMESPACE: u16 = 1;
+    pub const COMMERCIAL_MAX_NETD_OP_SOCKET_OPTIONS: u16 = 2;
+    pub const COMMERCIAL_MAX_NETD_OP_ADDRESS_BIND: u16 = 3;
+    pub const COMMERCIAL_MAX_NETD_OP_ROUTE_POLICY: u16 = 4;
+    pub const COMMERCIAL_MAX_NETD_OP_PACKET_LEASE: u16 = 5;
+    pub const COMMERCIAL_MAX_NETD_OP_FD_TRANSFER: u16 = 6;
+    pub const COMMERCIAL_MAX_DRIVERD_OP_DRIVER_PLAN: u16 = 1;
+    pub const COMMERCIAL_MAX_DRIVERD_OP_MODULE_LOAD_AUTHORIZE: u16 = 2;
+    pub const COMMERCIAL_MAX_DRIVERD_OP_SYMBOL_POLICY: u16 = 3;
+    pub const COMMERCIAL_MAX_DRIVERD_OP_PROVIDER_SELECT: u16 = 4;
+    pub const COMMERCIAL_MAX_DRIVERD_OP_RETRY_BUDGET: u16 = 5;
+    pub const COMMERCIAL_MAX_DRIVERD_OP_FALLBACK_POLICY: u16 = 6;
+    pub const COMMERCIAL_MAX_SESSIOND_OP_SESSION_GRAPH: u16 = 1;
+    pub const COMMERCIAL_MAX_SESSIOND_OP_TTY_LINE_DISCIPLINE: u16 = 2;
+    pub const COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE: u16 = 3;
+    pub const COMMERCIAL_MAX_SESSIOND_OP_FOREGROUND_FOCUS: u16 = 4;
+    pub const COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP: u16 = 5;
+    pub const COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT: u16 = 1;
+    pub const COMMERCIAL_MAX_PAGERD_OP_PAGE_CACHE_POLICY: u16 = 2;
+    pub const COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE: u16 = 3;
+    pub const COMMERCIAL_MAX_PAGERD_OP_WRITEBACK_POLICY: u16 = 4;
+    pub const COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DRIVER_INSTANCE: u16 = 1;
+    pub const COMMERCIAL_MAX_SERVICE_DRIVERD_OP_MMIO_LEASE: u16 = 2;
+    pub const COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IRQ_ROUTE: u16 = 3;
+    pub const COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DMA_BUFFER: u16 = 4;
+    pub const COMMERCIAL_MAX_CAPABILITY_OP_LEASE_GRANT: u16 = 1;
+    pub const COMMERCIAL_MAX_CAPABILITY_OP_LEASE_REVOKE: u16 = 2;
+    pub const COMMERCIAL_MAX_CAPABILITY_OP_LEASE_RENEW: u16 = 3;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct CommercialMaxProtocolHeader {
+        pub version: u16,
+        pub protocol: u16,
+        pub op: u16,
+        pub flags: u16,
+        pub service_id: u64,
+        pub subject_pid: u64,
+        pub subject_tid: u64,
+        pub ticket: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct CommercialMaxProtocolDescriptorWire {
+        pub protocol: u16,
+        pub op: u16,
+        pub flags: u32,
+        pub service_id: u64,
+        pub capability_mask: u64,
+        pub value0: u64,
+        pub value1: u64,
+        pub name_len: u16,
+        pub reserved0: u16,
+        pub reserved1: u32,
+        pub name: [u8; COMMERCIAL_MAX_PROTOCOL_NAME_CAPACITY],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct CommercialMaxCapabilityLeaseWire {
+        pub lease_id: u64,
+        pub service_id: u64,
+        pub subject_pid: u64,
+        pub subject_tid: u64,
+        pub capability_mask: u64,
+        pub rights_mask: u64,
+        pub expires_at_mono_ns: u64,
+        pub generation: u64,
+        pub label_len: u16,
+        pub reserved0: u16,
+        pub reserved1: u32,
+        pub label: [u8; COMMERCIAL_MAX_PROTOCOL_NAME_CAPACITY],
+    }
+
+    impl Default for CommercialMaxCapabilityLeaseWire {
+        fn default() -> Self {
+            Self {
+                lease_id: 0,
+                service_id: 0,
+                subject_pid: 0,
+                subject_tid: 0,
+                capability_mask: 0,
+                rights_mask: 0,
+                expires_at_mono_ns: 0,
+                generation: 0,
+                label_len: 0,
+                reserved0: 0,
+                reserved1: 0,
+                label: [0; COMMERCIAL_MAX_PROTOCOL_NAME_CAPACITY],
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct CommercialMaxProtocolRequest {
+        pub header: CommercialMaxProtocolHeader,
+        pub arg0: u64,
+        pub arg1: u64,
+        pub arg2: u64,
+        pub arg3: u64,
+        pub path_len: u32,
+        pub payload_len: u32,
+        pub path: [u8; COMMERCIAL_MAX_PROTOCOL_PATH_CAPACITY],
+        pub payload: [u8; COMMERCIAL_MAX_PROTOCOL_PAYLOAD_CAPACITY],
+    }
+
+    impl Default for CommercialMaxProtocolRequest {
+        fn default() -> Self {
+            Self {
+                header: CommercialMaxProtocolHeader {
+                    version: COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+                    ..CommercialMaxProtocolHeader::default()
+                },
+                arg0: 0,
+                arg1: 0,
+                arg2: 0,
+                arg3: 0,
+                path_len: 0,
+                payload_len: 0,
+                path: [0; COMMERCIAL_MAX_PROTOCOL_PATH_CAPACITY],
+                payload: [0; COMMERCIAL_MAX_PROTOCOL_PAYLOAD_CAPACITY],
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct CommercialMaxProtocolResponse {
+        pub header: CommercialMaxProtocolHeader,
+        pub status: i32,
+        pub descriptor_count: u16,
+        pub reserved0: u16,
+        pub value0: u64,
+        pub value1: u64,
+        pub capability: CommercialMaxCapabilityLeaseWire,
+        pub descriptors:
+            [CommercialMaxProtocolDescriptorWire; COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS],
+        pub payload_len: u32,
+        pub reserved1: u32,
+        pub payload: [u8; COMMERCIAL_MAX_PROTOCOL_PAYLOAD_CAPACITY],
+    }
+
+    impl Default for CommercialMaxProtocolResponse {
+        fn default() -> Self {
+            Self {
+                header: CommercialMaxProtocolHeader {
+                    version: COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+                    ..CommercialMaxProtocolHeader::default()
+                },
+                status: 0,
+                descriptor_count: 0,
+                reserved0: 0,
+                value0: 0,
+                value1: 0,
+                capability: CommercialMaxCapabilityLeaseWire::default(),
+                descriptors: [CommercialMaxProtocolDescriptorWire::default();
+                    COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS],
+                payload_len: 0,
+                reserved1: 0,
+                payload: [0; COMMERCIAL_MAX_PROTOCOL_PAYLOAD_CAPACITY],
+            }
+        }
+    }
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -351,6 +628,92 @@ pub mod syscall {
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct BootExtentWire {
+        pub disk_offset: u64,
+        pub len: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct BootExtentLeaseWire {
+        pub path_len: u32,
+        pub flags: u32,
+        pub file_len: u64,
+        pub hash_or_generation: u64,
+        pub extent_count: u32,
+        pub reserved0: u32,
+        pub extents: [BootExtentWire; BOOT_EXTENT_MAX_EXTENTS],
+        pub path: [u8; BOOT_EXTENT_PATH_CAPACITY],
+    }
+
+    impl Default for BootExtentLeaseWire {
+        fn default() -> Self {
+            Self {
+                path_len: 0,
+                flags: 0,
+                file_len: 0,
+                hash_or_generation: 0,
+                extent_count: 0,
+                reserved0: 0,
+                extents: [BootExtentWire::default(); BOOT_EXTENT_MAX_EXTENTS],
+                path: [0; BOOT_EXTENT_PATH_CAPACITY],
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct StoragedRequest {
+        pub version: u16,
+        pub op: u16,
+        pub flags: u32,
+        pub arg0: u64,
+        pub arg1: u64,
+        pub path_len: u32,
+        pub reserved0: u32,
+        pub path: [u8; BOOT_EXTENT_PATH_CAPACITY],
+    }
+
+    impl Default for StoragedRequest {
+        fn default() -> Self {
+            Self {
+                version: STORAGED_IPC_ABI_VERSION,
+                op: STORAGED_OP_PING,
+                flags: 0,
+                arg0: 0,
+                arg1: 0,
+                path_len: 0,
+                reserved0: 0,
+                path: [0; BOOT_EXTENT_PATH_CAPACITY],
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct StoragedResponse {
+        pub version: u16,
+        pub op: u16,
+        pub status: i32,
+        pub reserved0: u32,
+        pub value: u64,
+        pub payload: StorageBlockDescriptorWire,
+        pub boot_extent: BootExtentLeaseWire,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct RustosBootExtentBrokerArgs {
+        pub abi_version: u16,
+        pub flags: u16,
+        pub reserved0: u32,
+        pub path_ptr: u64,
+        pub path_len: u64,
+        pub out_lease_ptr: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     pub struct InputStatsWire {
         pub pointer_packet_submits: u64,
         pub pointer_absolute_submits: u64,
@@ -371,8 +734,12 @@ pub mod syscall {
     pub const INPUTD_IPC_OP_PING: u16 = 1;
     pub const INPUTD_IPC_OP_STATS: u16 = 2;
     pub const INPUTD_IPC_OP_AUTHORIZE_READ: u16 = 3;
+    pub const INPUTD_IPC_OP_DRAIN_INGEST: u16 = 4;
+    pub const INPUTD_IPC_OP_READ: u16 = 5;
     pub const INPUTD_ACCESS_NATIVE: u16 = 1;
     pub const INPUTD_ACCESS_EVDEV: u16 = 2;
+    pub const INPUTD_READ_PAYLOAD_CAPACITY: usize = 32 * 1024;
+    pub const INPUTD_INGEST_MAX_EVENTS: usize = 256;
     pub const INPUTD_READ_FLAG_NONBLOCK: u32 = 1 << 0;
 
     #[repr(C)]
@@ -382,6 +749,27 @@ pub mod syscall {
         pub reserved0: u16,
         pub reserved1: u32,
         pub out_stats_ptr: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct InputIngressWire {
+        pub kind: u16,
+        pub access: u16,
+        pub flags: u32,
+        pub event: super::ui::UiInputEvent,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct InputIngestBrokerArgs {
+        pub abi_version: u16,
+        pub reserved0: u16,
+        pub reserved1: u32,
+        pub out_events_ptr: u64,
+        pub out_capacity: u32,
+        pub reserved2: u32,
+        pub out_count_ptr: u64,
     }
 
     #[repr(C)]
@@ -408,6 +796,34 @@ pub mod syscall {
         pub flags: u32,
         pub approved_len: u64,
         pub stats: InputStatsWire,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct InputdReadResponse {
+        pub version: u16,
+        pub op: u16,
+        pub status: i32,
+        pub flags: u32,
+        pub payload_len: u32,
+        pub reserved0: u32,
+        pub stats: InputStatsWire,
+        pub payload: [u8; INPUTD_READ_PAYLOAD_CAPACITY],
+    }
+
+    impl Default for InputdReadResponse {
+        fn default() -> Self {
+            Self {
+                version: INPUTD_IPC_ABI_VERSION,
+                op: INPUTD_IPC_OP_READ,
+                status: 0,
+                flags: 0,
+                payload_len: 0,
+                reserved0: 0,
+                stats: InputStatsWire::default(),
+                payload: [0; INPUTD_READ_PAYLOAD_CAPACITY],
+            }
+        }
     }
 
     #[repr(C)]
@@ -577,6 +993,18 @@ pub mod syscall {
     }
 
     #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct RustosDeviceOpenBrokerArgs {
+        pub abi_version: u16,
+        pub device_id: u16,
+        pub access: u16,
+        pub reserved0: u16,
+        pub rights: u64,
+        pub open_flags: u64,
+        pub reserved1: u64,
+    }
+
+    #[repr(C)]
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub struct DevmgrdNodeEntry {
         pub name_len: u16,
@@ -644,6 +1072,110 @@ pub mod syscall {
                 entries: [DevmgrdNodeEntry::default(); DEVMGRD_MAX_DIR_ENTRIES],
             }
         }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct DevmgrdDeviceOpenRequest {
+        pub version: u16,
+        pub op: u16,
+        pub flags: u32,
+        pub pid: u64,
+        pub tid: u64,
+        pub session_handle: u64,
+        pub uid: u32,
+        pub gid: u32,
+        pub open_flags: u64,
+        pub access: u16,
+        pub reserved0: u16,
+        pub path_len: u32,
+        pub path: [u8; VFS_IPC_PATH_CAPACITY],
+    }
+
+    impl Default for DevmgrdDeviceOpenRequest {
+        fn default() -> Self {
+            Self {
+                version: DEVMGRD_IPC_ABI_VERSION,
+                op: DEVMGRD_IPC_OP_OPEN,
+                flags: 0,
+                pid: 0,
+                tid: 0,
+                session_handle: 0,
+                uid: 0,
+                gid: 0,
+                open_flags: 0,
+                access: 0,
+                reserved0: 0,
+                path_len: 0,
+                path: [0; VFS_IPC_PATH_CAPACITY],
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct DevmgrdDeviceOpenResponse {
+        pub version: u16,
+        pub op: u16,
+        pub status: i32,
+        pub device_id: u16,
+        pub access: u16,
+        pub reserved0: u32,
+        pub rights: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct CoreServiceLeaseWire {
+        pub service_id: u64,
+        pub pid: u64,
+        pub restart_budget: u32,
+        pub backoff_ms: u32,
+        pub state: u16,
+        pub reserved0: u16,
+        pub exit_status: i32,
+        pub exec_path_len: u32,
+        pub reserved1: u32,
+        pub exec_path: [u8; ROOTD_EXEC_PATH_CAPACITY],
+    }
+
+    impl Default for CoreServiceLeaseWire {
+        fn default() -> Self {
+            Self {
+                service_id: 0,
+                pid: 0,
+                restart_budget: 0,
+                backoff_ms: 0,
+                state: ROOTD_LEASE_STATE_EMPTY,
+                reserved0: 0,
+                exit_status: 0,
+                exec_path_len: 0,
+                reserved1: 0,
+                exec_path: [0; ROOTD_EXEC_PATH_CAPACITY],
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct RootdIpcRequest {
+        pub version: u16,
+        pub op: u16,
+        pub flags: u32,
+        pub index: u32,
+        pub reserved0: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct RootdIpcResponse {
+        pub version: u16,
+        pub op: u16,
+        pub status: i32,
+        pub lease_count: u32,
+        pub reserved0: u32,
+        pub value: u64,
+        pub lease: CoreServiceLeaseWire,
     }
 
     #[repr(C)]
@@ -782,32 +1314,6 @@ pub mod syscall {
                 data_offset: 0,
                 data_len: 0,
                 reserved0: 0,
-                data: [0; PROC_BROKER_DATA_PAYLOAD_CAPACITY],
-            }
-        }
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub struct RustosProcSetImageBlobBrokerArgs {
-        pub abi_version: u16,
-        pub reserved0: u16,
-        pub data_len: u32,
-        pub prepare_handle: u64,
-        pub total_len: u64,
-        pub data_offset: u64,
-        pub data: [u8; PROC_BROKER_DATA_PAYLOAD_CAPACITY],
-    }
-
-    impl Default for RustosProcSetImageBlobBrokerArgs {
-        fn default() -> Self {
-            Self {
-                abi_version: 0,
-                reserved0: 0,
-                data_len: 0,
-                prepare_handle: 0,
-                total_len: 0,
-                data_offset: 0,
                 data: [0; PROC_BROKER_DATA_PAYLOAD_CAPACITY],
             }
         }
@@ -1979,9 +2485,6 @@ mod tests {
                 <= syscall::IPC_MAX_INLINE_BYTES
         );
         assert!(
-            size_of::<syscall::RustosProcSetImageBlobBrokerArgs>() <= syscall::IPC_MAX_INLINE_BYTES
-        );
-        assert!(
             size_of::<syscall::RustosProcMapFileBatchBrokerArgs>() <= syscall::IPC_MAX_INLINE_BYTES
         );
         assert!(
@@ -1993,6 +2496,10 @@ mod tests {
             syscall::SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER,
             0x5255_0031
         );
+        assert_eq!(syscall::SYS_RUSTOS_DEVICE_OPEN_BROKER, 0x5255_0032);
+        assert_eq!(syscall::SYS_RUSTOS_INPUT_INGEST_BROKER, 0x5255_0033);
+        assert_eq!(syscall::SYS_RUSTOS_BOOT_EXTENT_BROKER, 0x5255_0034);
+        assert_eq!(syscall::SYS_RUSTOS_IPC_TRY_RECV, 0x5255_0035);
     }
 
     #[test]
@@ -2010,6 +2517,48 @@ mod tests {
         assert!(size_of::<syscall::RustosProcForkBrokerArgs>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert!(
             size_of::<syscall::RustosProcSignalQueueBrokerArgs>() <= syscall::IPC_MAX_INLINE_BYTES
+        );
+    }
+
+    #[test]
+    fn service_protocol_abi_layout_fits_inline_ipc() {
+        assert_eq!(syscall::IPC_SERVICE_ROOTD, 10);
+        assert_eq!(syscall::IPC_SERVICE_SESSIOND, 11);
+        assert_eq!(syscall::IPC_SERVICE_PAGERD, 12);
+        assert_eq!(syscall::IPC_SERVICE_SERVICE_DRIVERD, 13);
+        assert_eq!(syscall::DEVMGRD_IPC_OP_OPEN, 3);
+        assert_eq!(syscall::DEVMGRD_IPC_OP_IOCTL_AUTHORIZE, 4);
+        assert_eq!(syscall::INPUTD_IPC_OP_DRAIN_INGEST, 4);
+        assert_eq!(syscall::INPUTD_IPC_OP_READ, 5);
+        assert_eq!(syscall::STORAGED_OP_ROOT_STATUS, 4);
+        assert_eq!(syscall::STORAGED_OP_BOOT_EXTENT_LOOKUP, 5);
+
+        assert!(size_of::<syscall::DevmgrdDeviceOpenRequest>() <= syscall::IPC_MAX_INLINE_BYTES);
+        assert!(size_of::<syscall::DevmgrdDeviceOpenResponse>() <= syscall::IPC_MAX_INLINE_BYTES);
+        assert!(size_of::<syscall::InputIngestBrokerArgs>() <= syscall::IPC_MAX_INLINE_BYTES);
+        assert!(size_of::<syscall::InputdReadResponse>() <= syscall::IPC_MAX_INLINE_BYTES);
+        assert!(size_of::<syscall::RootdIpcRequest>() <= syscall::IPC_MAX_INLINE_BYTES);
+        assert!(size_of::<syscall::RootdIpcResponse>() <= syscall::IPC_MAX_INLINE_BYTES);
+        assert!(size_of::<syscall::StoragedRequest>() <= syscall::IPC_MAX_INLINE_BYTES);
+        assert!(size_of::<syscall::StoragedResponse>() <= syscall::IPC_MAX_INLINE_BYTES);
+        assert!(size_of::<syscall::RustosBootExtentBrokerArgs>() <= syscall::IPC_MAX_INLINE_BYTES);
+    }
+
+    #[test]
+    fn commercial_max_protocol_abi_layout_fits_inline_ipc() {
+        assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, 1);
+        assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR, 1);
+        assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_CAPABILITY, 14);
+        assert_eq!(syscall::COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE, 4);
+        assert_eq!(syscall::COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE, 3);
+        assert!(
+            size_of::<syscall::CommercialMaxProtocolRequest>() <= syscall::IPC_MAX_INLINE_BYTES
+        );
+        assert!(
+            size_of::<syscall::CommercialMaxProtocolResponse>() <= syscall::IPC_MAX_INLINE_BYTES
+        );
+        assert!(
+            size_of::<syscall::CommercialMaxCapabilityLeaseWire>() <= syscall::IPC_MAX_INLINE_BYTES
         );
     }
 

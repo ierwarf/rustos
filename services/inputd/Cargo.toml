@@ -5,6 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
+input-evdev = { path = "../../drivers/libs/input-evdev" }
 libc = "0.2"
 observability-client = { path = "../../libs/observability-client" }
 rustos-user-abi = { path = "../../libs/rustos-user-abi" }

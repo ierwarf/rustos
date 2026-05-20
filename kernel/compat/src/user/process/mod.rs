@@ -221,17 +221,13 @@ enum LoadedProcessRuntime {
 
 #[derive(Clone)]
 struct WindowsProcessImageInfo {
-    image_base: u64,
-    image_size: u64,
-    runtime: Option<WindowsProcessRuntimeState>,
-    teb_address: u64,
+    runtime: WindowsProcessRuntimeState,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct WindowsProcessLoaderRuntime {
     pub entry_point: u64,
     pub runtime: WindowsProcessRuntimeState,
-    pub teb_address: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -255,15 +251,20 @@ impl<'a> Default for ProcessLaunchOptions<'a> {
 
 // RING3-MIGRATION-REFERENCE START: loaderd/procd should own generic executable
 // image detection, launch defaults, file-backed image loading, and cold
-// Linux/Windows loader metadata policy. Ring0 should keep task commit,
-// address-space mutation, and prepared bootstrap materialization.
+// Linux loader metadata policy. Ring0 should keep task commit, address-space
+// mutation, and prepared bootstrap materialization. PE detection no longer
+// lives here — procd routes Windows binaries through loaderd, which returns a
+// prepared `windows_runtime` blob via the PROC_BROKER set-windows-runtime
+// path (see `prepare_windows_process_with_address_space`).
 #[inline(never)]
 pub fn load_image(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadError> {
     if image.starts_with(b"\x7FELF") {
         return linux::load_elf(image);
     }
     if image.starts_with(b"MZ") {
-        return load_pe_metadata(image);
+        return Err(ProcessLoadError::InvalidPe(
+            "PE bytes-image path retired; route Windows binaries through loaderd",
+        ));
     }
 
     Err(ProcessLoadError::InvalidPe(
@@ -280,32 +281,11 @@ pub fn spawn_process_with_launch(
     spawn_prepared_process(prepared, weight_micros)
 }
 
-pub fn spawn_process_file_with_launch(
-    file: VfsFileHandle,
-    weight_micros: u64,
-    launch: ProcessLaunchOptions<'_>,
-) -> Result<SpawnedProcess, ProcessLoadError> {
-    let prepared = prepare_process_file_with_launch(file, launch)?;
-    spawn_prepared_process(prepared, weight_micros)
-}
-
 pub fn prepare_process_with_launch(
     image: &[u8],
     launch: ProcessLaunchOptions<'_>,
 ) -> Result<PreparedProcessImage, ProcessLoadError> {
     prepare_loaded_process_with_launch(load_image(image)?, launch)
-}
-
-pub fn prepare_process_with_address_space(
-    image: &[u8],
-    address_space: ProcessAddressSpace,
-    launch: ProcessLaunchOptions<'_>,
-) -> Result<PreparedProcessImage, ProcessLoadError> {
-    let mut loaded = load_image(image)?;
-    if matches!(loaded.abi, UserAbi::Linux | UserAbi::Windows) {
-        loaded.address_space = address_space;
-    }
-    prepare_loaded_process_with_launch(loaded, launch)
 }
 
 pub fn prepare_windows_process_with_address_space(
@@ -318,10 +298,7 @@ pub fn prepare_windows_process_with_address_space(
         address_space,
         entry: VirtAddr::new(metadata.entry_point),
         runtime: LoadedProcessRuntime::Windows(WindowsProcessImageInfo {
-            image_base: metadata.runtime.image_base,
-            image_size: metadata.runtime.image_size,
-            runtime: Some(metadata.runtime),
-            teb_address: metadata.teb_address,
+            runtime: metadata.runtime,
         }),
     };
     prepare_loaded_process_with_launch(loaded, launch)
@@ -342,24 +319,6 @@ pub fn prepare_linux_process_with_metadata(
     prepare_loaded_process_with_launch(loaded, launch)
 }
 
-pub fn prepare_process_file_with_launch(
-    file: VfsFileHandle,
-    launch: ProcessLaunchOptions<'_>,
-) -> Result<PreparedProcessImage, ProcessLoadError> {
-    prepare_loaded_process_with_launch(load_image_file(file)?, launch)
-}
-
-pub fn prepare_process_file_with_address_space(
-    file: VfsFileHandle,
-    address_space: ProcessAddressSpace,
-    launch: ProcessLaunchOptions<'_>,
-) -> Result<PreparedProcessImage, ProcessLoadError> {
-    let mut loaded = load_image_file(file)?;
-    if loaded.abi == UserAbi::Linux {
-        loaded.address_space = address_space;
-    }
-    prepare_loaded_process_with_launch(loaded, launch)
-}
 // RING3-MIGRATION-REFERENCE END: loaderd/procd-owned generic image loading policy.
 
 pub fn spawn_prepared_process(
@@ -429,36 +388,9 @@ fn prepare_loaded_process_with_launch(
 }
 // RING3-MIGRATION-REFERENCE END: procd/syscalld-owned process bootstrap policy.
 
-pub fn load_image_file(file: VfsFileHandle) -> Result<LoadedProcessImage, ProcessLoadError> {
-    // RING3-MIGRATION-REFERENCE START: loaderd should own file-backed image
-    // format detection and normal app image reads. Ring0 keeps only fixed
-    // bootstrap escape hatches until rootd/loaderd can provide the prepared
-    // mapping metadata.
-    let mut header = [0_u8; 4];
-    let read = file.read_at(0, &mut header);
-    if read < header.len() {
-        return Err(ProcessLoadError::InvalidPe(
-            "unknown executable image format",
-        ));
-    }
-
-    if header == *b"\x7FELF" {
-        return linux::load_elf_file(file);
-    }
-    if &header[..2] == b"MZ" {
-        let mut image = vec![0_u8; file.len()];
-        let read = file.read_at(0, &mut image);
-        if read != image.len() {
-            return Err(ProcessLoadError::InvalidPe("short PE image read"));
-        }
-        return load_pe_metadata(&image);
-    }
-
-    Err(ProcessLoadError::InvalidPe(
-        "unknown executable image format",
-    ))
-}
-// RING3-MIGRATION-REFERENCE END: loaderd-owned file-backed image loading policy.
+// Note: file-backed image loading (`load_image_file`/`load_elf_file`) has been
+// retired from ring0. loaderd reads images via VFS fd and prepares the runtime
+// metadata in user space; ring0 only consumes prepared metadata for commit.
 
 fn build_process_bootstrap(
     runtime: LoadedProcessRuntime,
@@ -500,13 +432,8 @@ fn build_process_bootstrap(
             )
         }
         (UserAbi::Windows, LoadedProcessRuntime::Windows(image)) => {
-            let Some(runtime) = image.runtime else {
-                return Err(ProcessLoadError::InvalidPe(
-                    "Windows runtime metadata was not provided by loaderd",
-                ));
-            };
             let stack_pointer = initial_user_stack_top(stack_end)?;
-            (stack_pointer, None, None, None, None, Some(runtime))
+            (stack_pointer, None, None, None, None, Some(image.runtime))
         }
         _ => {
             return Err(ProcessLoadError::InvalidElf(
@@ -540,87 +467,10 @@ fn build_process_bootstrap(
     Ok(bootstrap)
 }
 
-fn load_pe_metadata(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadError> {
-    // RING3-MIGRATION-REFERENCE START: loaderd should own cold PE header
-    // validation, image-base selection, size policy, and Windows runtime
-    // metadata derivation. Ring0 keeps only validated mapping commit and
-    // prepared-process bootstrap primitives.
-    const PE_LOAD_OFFSET: u64 = 0x0040_0000;
-    if image.len() < 0x100 {
-        return Err(ProcessLoadError::InvalidPe("PE image is too small"));
-    }
-    let pe_offset = read_u32(image, 0x3c)? as usize;
-    if pe_offset
-        .checked_add(0x88)
-        .is_none_or(|end| end > image.len())
-    {
-        return Err(ProcessLoadError::InvalidPe("PE header outside image"));
-    }
-    if &image[pe_offset..pe_offset + 4] != b"PE\0\0" {
-        return Err(ProcessLoadError::InvalidPe("missing PE signature"));
-    }
-    if read_u16(image, pe_offset + 4)? != 0x8664 {
-        return Err(ProcessLoadError::InvalidPe("unsupported PE machine"));
-    }
-    let optional = pe_offset + 24;
-    if read_u16(image, optional)? != 0x20b {
-        return Err(ProcessLoadError::InvalidPe(
-            "unsupported PE optional header",
-        ));
-    }
-    let entry_rva = read_u32(image, optional + 16)? as u64;
-    let size_of_image = read_u32(image, optional + 56)? as u64;
-    if entry_rva == 0 || size_of_image == 0 {
-        return Err(ProcessLoadError::InvalidPe(
-            "invalid PE entry or image size",
-        ));
-    }
-    let image_base = rustos_user_abi::syscall::PROC_BROKER_USER_SPACE_BASE
-        .checked_add(PE_LOAD_OFFSET)
-        .ok_or(ProcessLoadError::InvalidPe("PE load base overflow"))?;
-    Ok(LoadedProcessImage {
-        abi: UserAbi::Windows,
-        address_space: ProcessAddressSpace::new()?,
-        entry: VirtAddr::new(
-            image_base
-                .checked_add(entry_rva)
-                .ok_or(ProcessLoadError::InvalidPe("PE entry overflow"))?,
-        ),
-        runtime: LoadedProcessRuntime::Windows(WindowsProcessImageInfo {
-            image_base,
-            image_size: align_up(size_of_image, PAGE_SIZE)
-                .ok_or(ProcessLoadError::InvalidPe("PE image size overflow"))?,
-            runtime: None,
-            teb_address: 0,
-        }),
-    })
-}
-
-fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, ProcessLoadError> {
-    let end = offset
-        .checked_add(2)
-        .ok_or(ProcessLoadError::InvalidPe("PE read overflow"))?;
-    if end > bytes.len() {
-        return Err(ProcessLoadError::InvalidPe("PE read outside image"));
-    }
-    Ok(u16::from_le_bytes([bytes[offset], bytes[offset + 1]]))
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, ProcessLoadError> {
-    let end = offset
-        .checked_add(4)
-        .ok_or(ProcessLoadError::InvalidPe("PE read overflow"))?;
-    if end > bytes.len() {
-        return Err(ProcessLoadError::InvalidPe("PE read outside image"));
-    }
-    Ok(u32::from_le_bytes([
-        bytes[offset],
-        bytes[offset + 1],
-        bytes[offset + 2],
-        bytes[offset + 3],
-    ]))
-}
-// RING3-MIGRATION-REFERENCE END: loaderd-owned cold PE metadata policy.
+// PE header validation, image-base selection, and Windows runtime metadata
+// derivation now live in `loaderd` (see `load_pe_image_fd`). Procd populates
+// `windows_runtime` via PROC_BROKER_OP_SET_WINDOWS_RUNTIME, and ring0 only
+// consumes the prepared metadata in `prepare_windows_process_with_address_space`.
 
 fn page_ranges_overlap(page_base: u64, page_end: u64, existing_ranges: &[(u64, u64)]) -> bool {
     for &(other_start, other_end) in existing_ranges {

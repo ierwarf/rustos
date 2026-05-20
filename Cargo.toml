@@ -40,6 +40,7 @@ members = [
     "apps/wayclick",
     "drivers/libs/driver-abi",
     "drivers/libs/driver-module-runtime",
+    "drivers/libs/input-evdev",
     "drivers/libs/keyboard-core",
     "drivers/bridges/display/bootfb",
     "drivers/bridges/display/amdgpu",

@@ -38,6 +38,7 @@ pub(super) fn is_linux_rustos_ipc_syscall(syscall_number: u64) -> bool {
         linux_abi::SYS_RUSTOS_IPC_ENDPOINT_CREATE
             | linux_abi::SYS_RUSTOS_IPC_CALL
             | linux_abi::SYS_RUSTOS_IPC_RECV
+            | linux_abi::SYS_RUSTOS_IPC_TRY_RECV
             | linux_abi::SYS_RUSTOS_IPC_REPLY
             | linux_abi::SYS_RUSTOS_IPC_CALL_WITH_HANDLES
             | linux_abi::SYS_RUSTOS_IPC_RECV_WITH_HANDLES
@@ -56,6 +57,9 @@ pub(super) fn dispatch_linux_rustos_ipc_syscall(frame: &SyscallFrame) -> u64 {
         }
         linux_abi::SYS_RUSTOS_IPC_RECV => {
             syscall_linux_rustos_ipc_recv(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+        }
+        linux_abi::SYS_RUSTOS_IPC_TRY_RECV => {
+            syscall_linux_rustos_ipc_try_recv(frame.rdi, frame.rsi, frame.rdx, frame.r10)
         }
         linux_abi::SYS_RUSTOS_IPC_REPLY => {
             syscall_linux_rustos_ipc_reply(frame.rdi, frame.rsi, frame.rdx)
@@ -248,6 +252,15 @@ fn service_capability(service_id: u64) -> u64 {
         linux_abi::IPC_SERVICE_STORAGED => rustos_user_abi::syscall::IPC_SERVICE_CAP_STORAGE_POLICY,
         linux_abi::IPC_SERVICE_INPUTD => rustos_user_abi::syscall::IPC_SERVICE_CAP_INPUT_POLICY,
         linux_abi::IPC_SERVICE_PROCD => rustos_user_abi::syscall::IPC_SERVICE_CAP_PROCESS_POLICY,
+        linux_abi::IPC_SERVICE_ROOTD => {
+            rustos_user_abi::syscall::IPC_SERVICE_CAP_ROOT_SUPERVISOR
+                | rustos_user_abi::syscall::IPC_SERVICE_CAP_PROCESS_POLICY
+        }
+        linux_abi::IPC_SERVICE_SESSIOND => rustos_user_abi::syscall::IPC_SERVICE_CAP_SESSION_POLICY,
+        linux_abi::IPC_SERVICE_PAGERD => rustos_user_abi::syscall::IPC_SERVICE_CAP_PAGER_POLICY,
+        linux_abi::IPC_SERVICE_SERVICE_DRIVERD => {
+            rustos_user_abi::syscall::IPC_SERVICE_CAP_SERVICE_DRIVER_POLICY
+        }
         _ => 0,
     }
 }
@@ -366,6 +379,39 @@ pub(super) fn syscall_linux_rustos_ipc_recv(
             }
             Err(err) => return linux_errno(ipc_error_to_linux_errno(err)),
         }
+    }
+}
+
+pub(super) fn syscall_linux_rustos_ipc_try_recv(
+    endpoint: u64,
+    request_ptr: u64,
+    request_capacity: u64,
+    reply_cap_ptr: u64,
+) -> u64 {
+    recv_endpoint_once(endpoint, request_ptr, request_capacity, reply_cap_ptr)
+        .map_or_else(linux_errno, |received| received as u64)
+}
+
+fn recv_endpoint_once(
+    endpoint: u64,
+    request_ptr: u64,
+    request_capacity: u64,
+    reply_cap_ptr: u64,
+) -> Result<usize, i64> {
+    let endpoint = KernelEndpointHandle::from_raw(endpoint);
+    let request_capacity = usize::try_from(request_capacity).map_err(|_| LINUX_EINVAL)?;
+    match kernel_ipc_runtime::api::recv_endpoint_with_limit(endpoint, request_capacity) {
+        Ok(Some((reply, request))) => {
+            if !request.is_empty() {
+                usermem::write_current_user_bytes(request_ptr, &request)
+                    .map_err(address_space_error_to_linux_errno)?;
+            }
+            usermem::write_current_user_bytes(reply_cap_ptr, &reply.raw().to_ne_bytes())
+                .map_err(address_space_error_to_linux_errno)?;
+            Ok(request.len())
+        }
+        Ok(None) => Err(LINUX_EAGAIN),
+        Err(err) => Err(ipc_error_to_linux_errno(err)),
     }
 }
 

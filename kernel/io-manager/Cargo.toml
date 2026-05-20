@@ -16,6 +16,7 @@ kernel-ipc-runtime = { path = "../ipc-runtime" }
 kernel-ps = { path = "../ps" }
 boot-protocol = { path = "../../boot/boot-protocol" }
 driver-abi = { path = "../../drivers/libs/driver-abi" }
+input-evdev = { path = "../../drivers/libs/input-evdev" }
 keyboard-core = { path = "../../drivers/libs/keyboard-core" }
 storage-core = { path = "../../libs/storage-core" }
 storage-fat = { path = "../../libs/storage-fat" }

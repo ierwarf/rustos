@@ -9,13 +9,13 @@ use crate::user::sysops::usermem;
 
 use super::DeviceError;
 
-const MAX_INPUT_EVENTS_PER_READ: usize = 1024;
-const MAX_EVDEV_EVENTS_PER_READ: usize =
-    MAX_INPUT_EVENTS_PER_READ * crate::input_core::MAX_EVDEV_EVENTS_PER_INPUT_EVENT;
+const MAX_INPUT_EVENTS_PER_READ: usize = crate::input_core::MAX_INPUT_EVENTS_PER_READ;
+const MAX_EVDEV_EVENTS_PER_READ: usize = crate::input_core::MAX_EVDEV_EVENTS_PER_READ;
 
 // RING3-MIGRATION-REFERENCE START: inputd should own input device read policy,
-// reader state, native/evdev translation, and buffer sizing. Ring0 keeps the
-// current-process user-copy broker used to deliver already-authorized bytes.
+// reader state, and buffer sizing. Ring0 keeps the current-process user-copy
+// broker used to deliver already-authorized bytes; evdev translation now lives
+// in the shared `input-evdev` crate (see `crate::input_core` re-exports).
 pub fn read_events(dest: &mut [device::InputEvent]) -> usize {
     event_queue::read_input_events(dest)
 }
@@ -157,11 +157,9 @@ fn read_evdev_events_to_user(
     }
 
     let mut output = evdev_event_scratch(output_capacity)?;
-    let written = crate::input_core::translate_input_events_to_evdev(
-        abi_events_as_input_core(&mut input_events[..read]),
-        &mut output,
-    )
-    .map_err(|_| DeviceError::InvalidArgument)?;
+    let written =
+        crate::input_core::translate_input_events_to_evdev(&input_events[..read], &mut output)
+            .map_err(|_| DeviceError::InvalidArgument)?;
     let bytes_len = written
         .checked_mul(event_size)
         .ok_or(DeviceError::InvalidArgument)?;
@@ -193,10 +191,4 @@ fn allocation_error() -> DeviceError {
 }
 
 type LinuxInputEvent = crate::input_core::LinuxInputEvent;
-
-fn abi_events_as_input_core(
-    dest: &mut [device::InputEvent],
-) -> &mut [crate::input_core::InputEvent] {
-    unsafe { slice::from_raw_parts_mut(dest.as_mut_ptr().cast(), dest.len()) }
-}
 // RING3-MIGRATION-REFERENCE END: inputd-owned input device read policy.

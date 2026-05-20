@@ -1176,9 +1176,7 @@ impl WaylandState {
         state.needs_initial_configure = false;
         drop(state);
         self.mark_dirty();
-        diag_line(format!(
-            "uiserver: retire_surface end surface={surface_id}"
-        ));
+        diag_line(format!("uiserver: retire_surface end surface={surface_id}"));
         true
     }
 

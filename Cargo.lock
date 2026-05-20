@@ -481,9 +481,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "input-evdev"
+version = "0.1.0"
+dependencies = [
+ "driver-abi",
+ "keyboard-core",
+ "rustos-user-abi",
+]
+
+[[package]]
 name = "inputd"
 version = "0.1.0"
 dependencies = [
+ "input-evdev",
  "libc",
  "observability-client",
  "rustos-user-abi",
@@ -564,6 +574,7 @@ dependencies = [
  "fatfs",
  "heapless",
  "hidreport",
+ "input-evdev",
  "kernel-hal",
  "kernel-ipc-runtime",
  "kernel-mm",

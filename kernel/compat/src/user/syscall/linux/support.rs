@@ -416,7 +416,6 @@ fn linux_syscall_number_supported(syscall_number: u64) -> bool {
                 | linux_abi::SYS_RUSTOS_PROC_MAP_FILE_BROKER
                 | linux_abi::SYS_RUSTOS_PROC_MAP_ZEROED_BROKER
                 | linux_abi::SYS_RUSTOS_PROC_MAP_DATA_BROKER
-                | SYS_RUSTOS_PROC_SET_IMAGE_BLOB_BROKER
                 | SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER
                 | linux_abi::SYS_RUSTOS_PROC_COMMIT_BROKER
                 | linux_abi::SYS_RUSTOS_PROC_ABORT_BROKER

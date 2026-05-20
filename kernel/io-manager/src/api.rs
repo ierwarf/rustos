@@ -1,4 +1,5 @@
 use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
 pub type ConsoleSessionHandle = crate::io::session::ConsoleSessionHandle;
 
@@ -74,6 +75,19 @@ pub struct BlockDescriptor {
     pub logical_block_size: usize,
     pub start_block: u64,
     pub block_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BootPathExtent {
+    pub disk_offset: u64,
+    pub len: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BootPathExtentLease {
+    pub file_len: u64,
+    pub generation: u64,
+    pub extents: Vec<BootPathExtent>,
 }
 
 fn map_block_descriptor(
@@ -253,6 +267,10 @@ pub mod input {
 
         pub fn debug_snapshot() -> InputEventQueueDebugSnapshot {
             crate::input::event_queue::debug_snapshot()
+        }
+
+        pub fn drain_events(dest: &mut [crate::user::abi::device::InputEvent]) -> usize {
+            crate::input::event_queue::read_input_events(dest)
         }
     }
 
@@ -489,7 +507,7 @@ pub mod usb {
 }
 
 pub mod vfs {
-    use super::{MountError, VfsError, VfsMetadata};
+    use super::{BootPathExtent, BootPathExtentLease, MountError, VfsError, VfsMetadata};
     use alloc::string::ToString;
     use fatfs::Error as FatError;
     use storage_core::StorageError;
@@ -587,6 +605,35 @@ pub mod vfs {
     pub fn read_path_to_vec_for_kernel(path: &str) -> Result<alloc::vec::Vec<u8>, VfsError> {
         let path = boot_image_path(path)?;
         crate::storage::boot_volume::read_file_to_vec(path).map_err(map_boot_volume_error)
+    }
+
+    pub fn boot_path_file_len_for_kernel(path: &str) -> Result<u64, VfsError> {
+        let path = boot_image_path(path)?;
+        crate::storage::boot_volume::metadata(path)
+            .map(|metadata| metadata.len)
+            .map_err(map_boot_volume_error)
+    }
+
+    pub fn boot_path_extent_lease_for_kernel(
+        path: &str,
+    ) -> Result<Option<BootPathExtentLease>, VfsError> {
+        let path = boot_image_path(path)?;
+        crate::storage::boot_volume::boot_file_extent_lease(path)
+            .map(|lease| {
+                lease.map(|lease| BootPathExtentLease {
+                    file_len: lease.len,
+                    generation: lease.generation,
+                    extents: lease
+                        .extents
+                        .into_iter()
+                        .map(|extent| BootPathExtent {
+                            disk_offset: extent.offset,
+                            len: extent.len,
+                        })
+                        .collect(),
+                })
+            })
+            .map_err(map_boot_volume_error)
     }
 
     pub fn readlink_for_current_process(

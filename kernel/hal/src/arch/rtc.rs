@@ -350,9 +350,8 @@ fn emit_heartbeat_log(current_second: u64) {
     let linux_irq_total_depth = snapshot.linux_irq_total_depth as usize;
     let linux_input_lock_active = snapshot.linux_input_lock_active;
     let linux_input_lock_last_seq = snapshot.linux_input_lock_last_seq;
-    let xhci_delta = xhci_transfer_count.saturating_sub(
-        RTC_LAST_XHCI_TRANSFER_COUNT.swap(xhci_transfer_count, Ordering::AcqRel),
-    );
+    let xhci_delta = xhci_transfer_count
+        .saturating_sub(RTC_LAST_XHCI_TRANSFER_COUNT.swap(xhci_transfer_count, Ordering::AcqRel));
     let hid_pointer_delta = hid_pointer_report_count.saturating_sub(
         RTC_LAST_HID_POINTER_REPORT_COUNT.swap(hid_pointer_report_count, Ordering::AcqRel),
     );

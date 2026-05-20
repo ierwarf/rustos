@@ -1278,6 +1278,13 @@ pub(super) fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mo
     {
         return bootstrap_openat(path.as_str(), flags);
     }
+    if is_devmgrd_open_path(path.as_str()) {
+        match open_device_via_devmgrd(path.as_str(), flags) {
+            Ok(fd) => return fd,
+            Err(LINUX_ENOSYS) | Err(LINUX_ENODEV) if can_use_bootstrap_vfs_escape() => {}
+            Err(errno) => return linux_errno(errno),
+        }
+    }
     let mut request = new_vfs_request(VFS_IPC_OP_OPENAT);
     request.dirfd = dirfd;
     request.arg0 = flags;
@@ -1469,6 +1476,9 @@ pub(super) fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u
         }
         return copied as u64;
     }
+    if let Some(inputd_access) = current_input_device_access(fd) {
+        return read_input_device_via_inputd(fd, user_ptr, user_len, inputd_access);
+    }
     let Some(remote) = current_remote_vfs_handle(fd) else {
         return linux_errno(LINUX_EBADF);
     };
@@ -1478,40 +1488,13 @@ pub(super) fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u
     if remote.kind() == multitask::RemoteVfsHandleKind::Device
         && matches!(remote.path().as_str(), "/dev/input0" | "/dev/input/event0")
     {
-        let Ok(user_len) = usize::try_from(user_len) else {
-            return linux_errno(LINUX_EINVAL);
-        };
-        if user_len == 0 {
-            return 0;
-        }
         let is_evdev = remote.path().as_str() == "/dev/input/event0";
-        let access = if is_evdev {
-            kernel_object::api::device::DeviceAccessKind::Evdev
+        let inputd_access = if is_evdev {
+            INPUTD_ACCESS_EVDEV
         } else {
-            kernel_object::api::device::DeviceAccessKind::Native
+            INPUTD_ACCESS_NATIVE
         };
-        // Clamp to the same limits inputd enforces. These are compile-time
-        // constants; no IPC round-trip is needed.
-        const MAX_NATIVE: usize = 1024 * 24;
-        const MAX_EVDEV: usize = 1024 * 24 * 3;
-        let user_len = if is_evdev {
-            user_len.min(MAX_EVDEV)
-        } else {
-            user_len.min(MAX_NATIVE)
-        };
-        if user_len == 0 {
-            return 0;
-        }
-        let handle = kernel_object::api::device::DeviceHandle::with_access(
-            kernel_object::api::device::DeviceId::Input,
-            access,
-        );
-        return match kernel_io_manager::api::device::read_to_current_user(
-            handle, user_ptr, user_len,
-        ) {
-            Ok(read) => read as u64,
-            Err(err) => linux_errno(device_error_to_linux_errno(err)),
-        };
+        return read_input_device_via_inputd(fd, user_ptr, user_len, inputd_access);
     }
     // RING3-MIGRATION-REFERENCE END: inputd/devmgrd-owned input read route.
     let Ok(user_len) = usize::try_from(user_len) else {
@@ -1558,7 +1541,6 @@ pub(super) fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u
     }
     copied as u64
 }
-
 
 pub(super) fn syscall_linux_vfs_pread64(fd: u64, user_ptr: u64, user_len: u64, offset: u64) -> u64 {
     if let Some(file) = current_vfs_file_handle(fd) {
@@ -3021,13 +3003,17 @@ fn ioctl_requires_devmgrd_policy(request_number: u64) -> bool {
         // Boot-time surface setup — devmgrd validates surface parameters.
         rustos_user_abi::device::DISPLAY_IOCTL_GET_INFO
             | rustos_user_abi::device::DISPLAY_IOCTL_CREATE_SURFACE
+            // Console/session observation and input injection policy.
+            | rustos_user_abi::console::CONSOLE_IOCTL_GET_STATE
+            | rustos_user_abi::console::CONSOLE_IOCTL_SNAPSHOT_SESSION_OUTPUT
+            | rustos_user_abi::console::CONSOLE_IOCTL_SEND_INPUT_EVENT
+            | rustos_user_abi::console::CONSOLE_IOCTL_SNAPSHOT_SESSIONS
             // Session lifecycle — devmgrd owns session-table bookkeeping.
             | rustos_user_abi::console::CONSOLE_IOCTL_CREATE_SESSION
             | rustos_user_abi::console::CONSOLE_IOCTL_CLOSE_SESSION
             | rustos_user_abi::console::CONSOLE_IOCTL_BIND_CURRENT_SESSION
-            | rustos_user_abi::console::CONSOLE_IOCTL_SET_SESSION_STATE
-        // CONSOLE_IOCTL_SET_FOCUS intentionally omitted: devmgrd is a
-        // no-op forwarder for this ioctl; go direct to avoid IPC cost.
+            | rustos_user_abi::console::CONSOLE_IOCTL_SET_SESSION_STATE // CONSOLE_IOCTL_SET_FOCUS intentionally omitted: devmgrd is a
+                                                                        // no-op forwarder for this ioctl; go direct to avoid IPC cost.
     )
 }
 // RING3-MIGRATION-REFERENCE END: devmgrd-owned ioctl policy bypass.
@@ -3479,6 +3465,149 @@ pub(super) fn call_inputd_ipc_request(
     if response.version != INPUTD_IPC_ABI_VERSION
         || response.op != request.op
         || response.flags != 0
+    {
+        return Err(LINUX_EINVAL);
+    }
+    if response.status != 0 {
+        return Err(response.status.unsigned_abs() as i64);
+    }
+    Ok(response)
+}
+
+fn is_devmgrd_open_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/dev/input0" | "/dev/input/event0" | "/dev/display0" | "/dev/dri/card0" | "/dev/console0"
+    )
+}
+
+fn current_input_device_access(fd: u64) -> Option<u16> {
+    multitask::with_current_user_process_state(|_, _, process_state| {
+        let handle = process_state.handles().get(fd)?;
+        let device = handle.device_handle()?;
+        if device.device_id() != kernel_object::api::device::DeviceId::Input {
+            return None;
+        }
+        match device.access_kind() {
+            kernel_object::api::device::DeviceAccessKind::Native => Some(INPUTD_ACCESS_NATIVE),
+            kernel_object::api::device::DeviceAccessKind::Evdev => Some(INPUTD_ACCESS_EVDEV),
+        }
+    })
+    .flatten()
+}
+
+fn read_input_device_via_inputd(fd: u64, user_ptr: u64, user_len: u64, inputd_access: u16) -> u64 {
+    let Ok(user_len) = usize::try_from(user_len) else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    if user_len == 0 {
+        return 0;
+    }
+    let mut request = InputdIpcRequest {
+        version: INPUTD_IPC_ABI_VERSION,
+        op: INPUTD_IPC_OP_READ,
+        fd,
+        access: inputd_access,
+        requested_len: user_len.min(INPUTD_READ_PAYLOAD_CAPACITY) as u64,
+        ..InputdIpcRequest::default()
+    };
+    if let Some(snapshot) = multitask::current_user_snapshot() {
+        request.pid = snapshot.process_id();
+        request.tid = snapshot.thread_id();
+    }
+    let response = match call_inputd_read_request(&request) {
+        Ok(response) => response,
+        Err(errno) => return linux_errno(errno),
+    };
+    if response.payload_len as u64 > request.requested_len {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let read = response.payload_len as usize;
+    if read == 0 {
+        return 0;
+    }
+    if user_ptr.checked_add(read as u64).is_none() {
+        return linux_errno(LINUX_EINVAL);
+    }
+    if let Err(err) = usermem::write_current_user_bytes(user_ptr, &response.payload[..read]) {
+        return linux_errno(address_space_error_to_linux_errno(err));
+    }
+    read as u64
+}
+
+fn open_device_via_devmgrd(path: &str, flags: u64) -> Result<u64, i64> {
+    let bytes = path.as_bytes();
+    if bytes.is_empty() || bytes.len() > VFS_IPC_PATH_CAPACITY {
+        return Err(LINUX_EINVAL);
+    }
+    let mut request = DevmgrdDeviceOpenRequest {
+        version: rustos_user_abi::syscall::DEVMGRD_IPC_ABI_VERSION,
+        op: rustos_user_abi::syscall::DEVMGRD_IPC_OP_OPEN,
+        open_flags: flags,
+        path_len: bytes.len() as u32,
+        ..DevmgrdDeviceOpenRequest::default()
+    };
+    request.path[..bytes.len()].copy_from_slice(bytes);
+    if let Some(snapshot) = multitask::current_user_snapshot() {
+        request.pid = snapshot.process_id();
+        request.tid = snapshot.thread_id();
+    }
+    let (response, entries) = ipc_ops::call_service_endpoint_with_received_entries(
+        IPC_SERVICE_DEVMGRD,
+        as_bytes(&request),
+        1,
+    )?;
+    if response.len() != size_of::<DevmgrdDeviceOpenResponse>() {
+        return Err(LINUX_EINVAL);
+    }
+    let response = read_unaligned::<DevmgrdDeviceOpenResponse>(response.as_slice());
+    if response.version != rustos_user_abi::syscall::DEVMGRD_IPC_ABI_VERSION
+        || response.op != rustos_user_abi::syscall::DEVMGRD_IPC_OP_OPEN
+        || response.reserved0 != 0
+    {
+        return Err(LINUX_EINVAL);
+    }
+    if response.status != 0 {
+        return Err(response.status.unsigned_abs() as i64);
+    }
+    if entries.len() != 1 {
+        return Err(LINUX_EINVAL);
+    }
+    let mut entries = entries.into_iter();
+    let Some(entry) = entries.next() else {
+        return Err(LINUX_EINVAL);
+    };
+    let Some(fd) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
+        process_state.handles_mut().install_transferred(entry)
+    }) else {
+        return Err(LINUX_EINVAL);
+    };
+    Ok(fd)
+}
+
+pub(super) fn call_inputd_read_request(
+    request: &InputdIpcRequest,
+) -> Result<InputdReadResponse, i64> {
+    let start_ticks = crate::arch::rtc::ticks();
+    let response = ipc_ops::call_service_endpoint(IPC_SERVICE_INPUTD, as_bytes(request))?;
+    log_slow_service_call(
+        "inputd",
+        request.op,
+        ticks_elapsed_ms(start_ticks, crate::arch::rtc::ticks()),
+        request.pid,
+        request.tid,
+        response.len() as i64,
+        None,
+    );
+    if response.len() != size_of::<InputdReadResponse>() {
+        return Err(LINUX_EINVAL);
+    }
+    let response = read_unaligned::<InputdReadResponse>(response.as_slice());
+    if response.version != INPUTD_IPC_ABI_VERSION
+        || response.op != request.op
+        || response.flags != 0
+        || response.reserved0 != 0
+        || response.payload_len as usize > INPUTD_READ_PAYLOAD_CAPACITY
     {
         return Err(LINUX_EINVAL);
     }

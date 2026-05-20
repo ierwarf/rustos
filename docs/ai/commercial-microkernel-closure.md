@@ -131,14 +131,27 @@ awk 'BEGIN{inmark=0; total=0}
 
 As of the strict Tier 0 + Tier 1 closure pass:
 
-- Current source LOC: `kernel` 73459, `services` 19026.
+- Current source LOC: `kernel` 72255, `services` 19266 (re-measured 2026-05-20
+  after this session's reductions; `drivers/libs/input-evdev` carries the
+  shared input/HID translation code outside both buckets).
 - Strict Tier 0 + Tier 1 marked migration LOC: 7890 total.
-- Strict marked-only projection: `kernel` 65569, `services` 26916 before new
+- Strict marked-only projection: `kernel` 64672, `services` 27219 before new
   broker overhead.
-- Commercial-max live migration markers: 28360 total. This includes the strict
-  markers plus protocol-first and long-horizon commercial-max references.
-- Commercial-max marked-only projection: `kernel` 45099 before residual broker
+- Commercial-max live migration markers: 26609 total (was 28199; -1590 LOC this
+  wave via input/HID shared crate moves, inputd/devmgrd policy routing,
+  kernel `/dev` namespace lookup removal, PE bytes-image path retirement,
+  dead file-backed ELF loader removal, and the procd image-blob fallback
+  collapse).
+- Commercial-max marked-only projection: `kernel` 45646 before residual broker
   shells and new service/shared-ABI overhead.
+
+Migration cadence reality (added 2026-05-20): the commercial-max wave is gated
+on protocols listed in **Service Protocol Target** that do not yet exist in
+shared ABI crates. Removing markers without those protocols would falsify
+closure state. The next actionable wave is to land one protocol pair at a
+time (e.g. `inputd::InputIngest` + `EvdevTranslate`), migrate the policy that
+sits behind it, then retire the corresponding marker. Expect ~500-1500
+validated LOC of net migration per protocol pair, not per session.
 
 This marked projection includes Tier 0 plus the Tier 1 live-code references
 listed below. It is still a migration budget, not a claim that all code can be
@@ -171,10 +184,19 @@ Tier 0 is already marked and high-confidence:
 
 Tier 1 is now marked as strict-closure live-code references:
 
-- `kernel/io-manager/src/input_core.rs`: 622 marked LOC. Queue coalescing, drop
-  policy, evdev translation, key-code mapping, and reader-visible counters
-  belong in `inputd`. Stable input ABI structs may remain in ring0 or move to a
-  shared ABI crate.
+- `kernel/io-manager/src/input_core.rs`: ~400 marked LOC (was 622). Queue
+  coalescing, drop policy, and reader-visible counters still belong in
+  `inputd`. **Completed 2026-05-20**: evdev translation, key-code mapping,
+  pointer-button mapping, and stable input ABI structs were lifted into the new
+  `drivers/libs/input-evdev` crate. Both the kernel `/dev/input/event0` read
+  broker and `inputd` now share that crate. Later in the same 2026-05-20 wave,
+  HID usage/modifier/button helper maps also moved into `input-evdev`, and
+  Linux input reads started using `inputd` authorization for read sizing before
+  the ring0 user-copy broker. Validated by `cargo xtask check` and
+  `cargo xtask build`; the earlier `display-probe` QEMU scenario covered the
+  first shared-crate split, while the `usb-input-display` scenario was already
+  failing on the pre-change baseline (kernel `input: pointer event delivered`
+  log never fires with the QEMU PS/2 tablet).
 - `kernel/compat/src/user/process/linux.rs`: 2136 marked LOC. ELF interpreter
   search, runtime search paths, segment validation, mapping manifests, dynamic
   relocation policy, runtime profile construction, initial memory-map metadata,
@@ -199,6 +221,15 @@ Tier 1 added 3398 marked LOC on top of the 4492 LOC Tier 0 surface.
 The final service-first target needs explicit protocols before more code can
 leave ring0. Design these as versioned request/reply ABIs in shared crates, with
 capability handles instead of stringly-typed authority:
+
+Prework landed: `rustos-user-abi::syscall` now reserves the compact
+`CommercialMaxProtocolHeader`, `CommercialMaxProtocolRequest`,
+`CommercialMaxProtocolResponse`, descriptor, and capability-lease wire ABIs.
+The protocol ids cover every owner below, plus `sessiond`, `pagerd`, a
+non-`.ko` service-driver coordinator, and generic capability leases. Treat this
+as the compatibility-safe control-plane envelope; each protocol still needs a
+service implementation and, where privilege is required, a separate
+capability-gated ring0 broker.
 
 - `rootd/supervisor`: `BootstrapManifest`, `CoreServiceLease`,
   `DependencyGraph`, `RestartPolicy`, `ReadinessSignal`.

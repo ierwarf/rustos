@@ -1,44 +1,26 @@
+//! In-kernel input event queue.
+//!
+//! Owns the bounded ring used by hardware callbacks plus the coalescing/drop
+//! policy that decides what reaches readers. evdev translation and the key/
+//! pointer code maps now live in the shared `input-evdev` crate so the kernel
+//! and `inputd` share the same bit-stable tables.
+
 pub use driver_abi::PointerPacket;
 use heapless::Deque as HeaplessDeque;
+pub use input_evdev::{
+    EvdevTranslateError, INPUT_ACTION_NONE, INPUT_ACTION_PRESSED, INPUT_ACTION_RELEASED,
+    INPUT_ACTION_REPEATED, INPUT_KIND_KEYBOARD, INPUT_KIND_POINTER_BUTTON,
+    INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION, INPUT_KIND_POINTER_SCROLL, InputEvent,
+    LinuxInputEvent, LinuxInputTimeval, MAX_EVDEV_EVENTS_PER_INPUT_EVENT,
+    MAX_EVDEV_EVENTS_PER_READ, MAX_EVDEV_READ_BYTES, MAX_INPUT_EVENTS_PER_READ,
+    MAX_NATIVE_READ_BYTES, POINTER_BUTTON_LEFT, POINTER_BUTTON_MIDDLE, POINTER_BUTTON_RIGHT,
+    POINTER_BUTTON_X1, POINTER_BUTTON_X2, linux_key_code_to_rustos, pointer_button_to_linux,
+    rustos_key_code_to_linux, translate_input_events_to_evdev, translate_input_to_evdev,
+};
 pub use keyboard_core::{KeyAction, KeyCode, KeyboardEvent, Modifiers};
 
 const INPUT_EVENT_QUEUE_CAPACITY: usize = 2048;
 const INPUT_EVENT_LOSSY_RESERVE: usize = 64;
-
-pub const INPUT_KIND_KEYBOARD: u16 = 1;
-pub const INPUT_KIND_POINTER_MOTION: u16 = 2;
-pub const INPUT_KIND_POINTER_BUTTON: u16 = 3;
-pub const INPUT_KIND_POINTER_SCROLL: u16 = 4;
-pub const INPUT_KIND_POINTER_POSITION: u16 = 5;
-
-pub const INPUT_ACTION_NONE: u16 = 0;
-pub const INPUT_ACTION_PRESSED: u16 = 1;
-pub const INPUT_ACTION_RELEASED: u16 = 2;
-pub const INPUT_ACTION_REPEATED: u16 = 3;
-
-pub const POINTER_BUTTON_LEFT: u32 = 1;
-pub const POINTER_BUTTON_RIGHT: u32 = 2;
-pub const POINTER_BUTTON_MIDDLE: u32 = 4;
-pub const POINTER_BUTTON_X1: u32 = 8;
-pub const POINTER_BUTTON_X2: u32 = 16;
-pub const MAX_EVDEV_EVENTS_PER_INPUT_EVENT: usize = 3;
-
-const EV_KEY: u16 = 0x01;
-const EV_REL: u16 = 0x02;
-const EV_ABS: u16 = 0x03;
-const EV_SYN: u16 = 0x00;
-const SYN_REPORT: u16 = 0;
-const REL_X: u16 = 0x00;
-const REL_Y: u16 = 0x01;
-const REL_HWHEEL: u16 = 0x06;
-const REL_WHEEL: u16 = 0x08;
-const ABS_X: u16 = 0x00;
-const ABS_Y: u16 = 0x01;
-const BTN_LEFT: u16 = 0x110;
-const BTN_RIGHT: u16 = 0x111;
-const BTN_MIDDLE: u16 = 0x112;
-const BTN_SIDE: u16 = 0x113;
-const BTN_EXTRA: u16 = 0x114;
 
 const POINTER_BUTTON_MASK_LEFT: u8 = driver_abi::POINTER_BUTTON_LEFT;
 const POINTER_BUTTON_MASK_RIGHT: u8 = driver_abi::POINTER_BUTTON_RIGHT;
@@ -46,42 +28,9 @@ const POINTER_BUTTON_MASK_MIDDLE: u8 = driver_abi::POINTER_BUTTON_MIDDLE;
 const POINTER_BUTTON_MASK_X1: u8 = driver_abi::POINTER_BUTTON_X1;
 const POINTER_BUTTON_MASK_X2: u8 = driver_abi::POINTER_BUTTON_X2;
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct InputEvent {
-    pub kind: u16,
-    pub action: u16,
-    pub code: u32,
-    pub value0: i32,
-    pub value1: i32,
-    pub modifiers: u32,
-    pub text: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct LinuxInputTimeval {
-    pub tv_sec: i64,
-    pub tv_usec: i64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct LinuxInputEvent {
-    pub time: LinuxInputTimeval,
-    pub kind: u16,
-    pub code: u16,
-    pub value: i32,
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PointerIngressState {
     buttons: u8,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EvdevTranslateError {
-    InvalidArgument,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -94,10 +43,11 @@ pub struct InputEventQueueSnapshot {
     pub overwritten_pointer_positions: u64,
 }
 
-// RING3-MIGRATION-REFERENCE START: inputd should own queue coalescing,
-// overflow/drop policy, evdev translation, key-code mapping, and reader-visible
-// counters. Ring0 should keep only stable input ABI structs or a shared ABI
-// library split while hardware callbacks feed a bounded inputd-owned ring.
+// RING3-MIGRATION-REFERENCE START: inputd should own the bounded input queue,
+// coalescing logic, overflow/drop policy, and reader-visible counters. Ring0
+// should keep only the IRQ-side ingress primitive (a bounded shared ring) plus
+// the user-copy/broker primitives consumers need. evdev translation and key/
+// button code maps already moved to the shared `input-evdev` crate.
 #[derive(Clone, Copy)]
 struct PendingEvent {
     event: InputEvent,
@@ -510,193 +460,6 @@ impl PointerIngressState {
     }
 }
 
-pub fn translate_input_to_evdev(
-    event: InputEvent,
-    dest: &mut [LinuxInputEvent],
-) -> Result<usize, EvdevTranslateError> {
-    let mut count = 0usize;
-    match event.kind {
-        INPUT_KIND_KEYBOARD => {
-            let code =
-                rustos_key_code_to_linux(event.code).ok_or(EvdevTranslateError::InvalidArgument)?;
-            push_evdev(
-                dest,
-                &mut count,
-                EV_KEY,
-                code,
-                input_action_value(event.action),
-            )?;
-            push_syn(dest, &mut count)?;
-        }
-        INPUT_KIND_POINTER_MOTION => {
-            if event.value0 != 0 {
-                push_evdev(dest, &mut count, EV_REL, REL_X, event.value0)?;
-            }
-            if event.value1 != 0 {
-                push_evdev(dest, &mut count, EV_REL, REL_Y, event.value1)?;
-            }
-            push_syn(dest, &mut count)?;
-        }
-        INPUT_KIND_POINTER_POSITION => {
-            push_evdev(dest, &mut count, EV_ABS, ABS_X, event.value0)?;
-            push_evdev(dest, &mut count, EV_ABS, ABS_Y, event.value1)?;
-            push_syn(dest, &mut count)?;
-        }
-        INPUT_KIND_POINTER_BUTTON => {
-            let code =
-                pointer_button_to_linux(event.code).ok_or(EvdevTranslateError::InvalidArgument)?;
-            push_evdev(
-                dest,
-                &mut count,
-                EV_KEY,
-                code,
-                input_action_value(event.action),
-            )?;
-            push_syn(dest, &mut count)?;
-        }
-        INPUT_KIND_POINTER_SCROLL => {
-            if event.value0 != 0 {
-                push_evdev(dest, &mut count, EV_REL, REL_WHEEL, event.value0)?;
-            }
-            if event.value1 != 0 {
-                push_evdev(dest, &mut count, EV_REL, REL_HWHEEL, event.value1)?;
-            }
-            push_syn(dest, &mut count)?;
-        }
-        _ => {}
-    }
-    Ok(count)
-}
-
-pub fn translate_input_events_to_evdev(
-    input: &[InputEvent],
-    dest: &mut [LinuxInputEvent],
-) -> Result<usize, EvdevTranslateError> {
-    let mut written = 0usize;
-    for event in input {
-        written += translate_input_to_evdev(*event, &mut dest[written..])?;
-    }
-    Ok(written)
-}
-
-pub fn linux_key_code_to_rustos(code: u32) -> Option<KeyCode> {
-    Some(match code {
-        1 => KeyCode::Escape,
-        2 => KeyCode::Digit1,
-        3 => KeyCode::Digit2,
-        4 => KeyCode::Digit3,
-        5 => KeyCode::Digit4,
-        6 => KeyCode::Digit5,
-        7 => KeyCode::Digit6,
-        8 => KeyCode::Digit7,
-        9 => KeyCode::Digit8,
-        10 => KeyCode::Digit9,
-        11 => KeyCode::Digit0,
-        12 => KeyCode::Minus,
-        13 => KeyCode::Equal,
-        14 => KeyCode::Backspace,
-        15 => KeyCode::Tab,
-        16 => KeyCode::Q,
-        17 => KeyCode::W,
-        18 => KeyCode::E,
-        19 => KeyCode::R,
-        20 => KeyCode::T,
-        21 => KeyCode::Y,
-        22 => KeyCode::U,
-        23 => KeyCode::I,
-        24 => KeyCode::O,
-        25 => KeyCode::P,
-        26 => KeyCode::LeftBracket,
-        27 => KeyCode::RightBracket,
-        28 => KeyCode::Enter,
-        29 => KeyCode::LeftCtrl,
-        30 => KeyCode::A,
-        31 => KeyCode::S,
-        32 => KeyCode::D,
-        33 => KeyCode::F,
-        34 => KeyCode::G,
-        35 => KeyCode::H,
-        36 => KeyCode::J,
-        37 => KeyCode::K,
-        38 => KeyCode::L,
-        39 => KeyCode::Semicolon,
-        40 => KeyCode::Apostrophe,
-        41 => KeyCode::Grave,
-        42 => KeyCode::LeftShift,
-        43 => KeyCode::Backslash,
-        44 => KeyCode::Z,
-        45 => KeyCode::X,
-        46 => KeyCode::C,
-        47 => KeyCode::V,
-        48 => KeyCode::B,
-        49 => KeyCode::N,
-        50 => KeyCode::M,
-        51 => KeyCode::Comma,
-        52 => KeyCode::Dot,
-        53 => KeyCode::Slash,
-        54 => KeyCode::RightShift,
-        55 => KeyCode::NumpadStar,
-        56 => KeyCode::LeftAlt,
-        57 => KeyCode::Space,
-        58 => KeyCode::CapsLock,
-        59 => KeyCode::F1,
-        60 => KeyCode::F2,
-        61 => KeyCode::F3,
-        62 => KeyCode::F4,
-        63 => KeyCode::F5,
-        64 => KeyCode::F6,
-        65 => KeyCode::F7,
-        66 => KeyCode::F8,
-        67 => KeyCode::F9,
-        68 => KeyCode::F10,
-        69 => KeyCode::NumLock,
-        70 => KeyCode::ScrollLock,
-        71 => KeyCode::Numpad7,
-        72 => KeyCode::Numpad8,
-        73 => KeyCode::Numpad9,
-        74 => KeyCode::NumpadMinus,
-        75 => KeyCode::Numpad4,
-        76 => KeyCode::Numpad5,
-        77 => KeyCode::Numpad6,
-        78 => KeyCode::NumpadPlus,
-        79 => KeyCode::Numpad1,
-        80 => KeyCode::Numpad2,
-        81 => KeyCode::Numpad3,
-        82 => KeyCode::Numpad0,
-        83 => KeyCode::NumpadDot,
-        87 => KeyCode::F11,
-        88 => KeyCode::F12,
-        96 => KeyCode::NumpadEnter,
-        97 => KeyCode::RightCtrl,
-        98 => KeyCode::NumpadSlash,
-        100 => KeyCode::RightAlt,
-        102 => KeyCode::Home,
-        103 => KeyCode::ArrowUp,
-        104 => KeyCode::PageUp,
-        105 => KeyCode::ArrowLeft,
-        106 => KeyCode::ArrowRight,
-        107 => KeyCode::End,
-        108 => KeyCode::ArrowDown,
-        109 => KeyCode::PageDown,
-        110 => KeyCode::Insert,
-        111 => KeyCode::Delete,
-        125 => KeyCode::LeftMeta,
-        126 => KeyCode::RightMeta,
-        127 => KeyCode::Menu,
-        _ => return None,
-    })
-}
-
-pub fn rustos_key_code_to_linux(code: u32) -> Option<u16> {
-    let key_code = KeyCode::from_u32(code)?;
-    for linux_code in 1..=127_u32 {
-        if linux_key_code_to_rustos(linux_code) == Some(key_code) {
-            return u16::try_from(linux_code).ok();
-        }
-    }
-    None
-}
-
 fn map_key_action(action: KeyAction) -> u16 {
     match action {
         KeyAction::Pressed => INPUT_ACTION_PRESSED,
@@ -726,49 +489,6 @@ fn merge_coalesced_event(existing: &mut InputEvent, next: InputEvent) {
     existing.value1 = existing.value1.saturating_add(next.value1);
 }
 
-fn input_action_value(action: u16) -> i32 {
-    match action {
-        INPUT_ACTION_RELEASED => 0,
-        INPUT_ACTION_REPEATED => 2,
-        _ => 1,
-    }
-}
-
-fn pointer_button_to_linux(button: u32) -> Option<u16> {
-    Some(match button {
-        POINTER_BUTTON_LEFT => BTN_LEFT,
-        POINTER_BUTTON_RIGHT => BTN_RIGHT,
-        POINTER_BUTTON_MIDDLE => BTN_MIDDLE,
-        POINTER_BUTTON_X1 => BTN_SIDE,
-        POINTER_BUTTON_X2 => BTN_EXTRA,
-        _ => return None,
-    })
-}
-
-fn push_syn(dest: &mut [LinuxInputEvent], count: &mut usize) -> Result<(), EvdevTranslateError> {
-    push_evdev(dest, count, EV_SYN, SYN_REPORT, 0)
-}
-
-fn push_evdev(
-    dest: &mut [LinuxInputEvent],
-    count: &mut usize,
-    kind: u16,
-    code: u16,
-    value: i32,
-) -> Result<(), EvdevTranslateError> {
-    let slot = dest
-        .get_mut(*count)
-        .ok_or(EvdevTranslateError::InvalidArgument)?;
-    *slot = LinuxInputEvent {
-        time: LinuxInputTimeval::default(),
-        kind,
-        code,
-        value,
-    };
-    *count += 1;
-    Ok(())
-}
-
 fn queue_remaining_capacity<T, const CAPACITY: usize>(queue: &HeaplessDeque<T, CAPACITY>) -> usize {
     CAPACITY - queue.len()
 }
@@ -787,7 +507,7 @@ fn pop_events_into(
     }
     count
 }
-// RING3-MIGRATION-REFERENCE END: inputd-owned input queue/translation core.
+// RING3-MIGRATION-REFERENCE END: inputd-owned input queue policy.
 
 #[cfg(test)]
 mod tests {

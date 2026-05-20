@@ -16,7 +16,6 @@ pub use rustos_observability::{LogCategory, LogLevel};
 #[cfg(rustos_debug_print_enabled)]
 use spin::{Mutex, RwLock};
 #[cfg(all(rustos_debug_print_enabled, not(test)))]
-
 #[cfg(rustos_debug_print_enabled)]
 include!(concat!(env!("OUT_DIR"), "/logging_build.rs"));
 

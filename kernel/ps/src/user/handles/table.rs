@@ -142,6 +142,26 @@ impl HandleTable {
         self.install_entry(HandleEntry::new(handle, fd_flags, status_flags))
     }
 
+    pub fn install_with_open_flags_and_rights(
+        &mut self,
+        handle: KernelHandle,
+        open_flags: u64,
+        rights: HandleRights,
+    ) -> u64 {
+        let fd_flags = if open_flags & linux_abi::O_CLOEXEC != 0 {
+            FD_CLOEXEC
+        } else {
+            0
+        };
+        let status_flags = open_flags & STATUS_FLAG_MASK;
+        self.install_entry(HandleEntry::new_with_rights(
+            handle,
+            rights,
+            fd_flags,
+            status_flags,
+        ))
+    }
+
     pub fn install_entry(&mut self, entry: HandleEntry) -> u64 {
         self.install_entry_min(entry, FIRST_DYNAMIC_FD as u64)
     }

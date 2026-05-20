@@ -93,6 +93,14 @@ privilege substrate, not a policy owner.
      read-copies events to user buffers. Linux input reads now ask `inputd` for
      `INPUTD_IPC_OP_AUTHORIZE_READ` before the ring0 user-copy/device broker
      drains the remaining kernel queue.
+   - Completed (2026-05-20): evdev translation, key-code mapping, pointer
+     button mapping, and stable input ABI structs moved to the
+     `drivers/libs/input-evdev` shared crate so the kernel broker and `inputd`
+     share one set of tables.
+   - Completed (2026-05-20): Linux input reads now round-trip through
+     `inputd` for `INPUTD_IPC_OP_AUTHORIZE_READ`; `inputd` owns native/evdev
+     read byte limits via the shared `input-evdev` constants before the ring0
+     current-process user-copy broker drains the remaining kernel queue.
    - Target: `inputd` owns event queue policy, overflow behavior, readers, and
      observability. Ring0 should enqueue validated hardware reports into a
      bounded shared ring, wake the target, and retain only user-copy/broker
@@ -103,6 +111,10 @@ privilege substrate, not a policy owner.
      `kernel/io-manager/src/usb/synthetic.rs`, and
      `kernel/io-manager/src/driver/input.rs` parse HID reports, keep keyboard
      and pointer state, and inject input events.
+   - Completed (2026-05-20): HID usage/key translation, modifier masks, pointer
+     button report conversion, and synthetic HID helper maps moved to
+     `drivers/libs/input-evdev`; the kernel keeps only a thin re-export while
+     `runtime.rs`/`synthetic.rs` still own report parsing and state.
    - Target: move HID layout parsing, synthetic keyboard/pointer state,
      pointer coalescing policy, drop policy, and event translation to `inputd`.
      Ring0 `.ko`/USB callbacks stay as the report source.
@@ -114,7 +126,13 @@ privilege substrate, not a policy owner.
    - Completed: static device-node metadata and readdir fallback entries were
      removed from `vfsd`; `/dev` node existence and type now come from
      `devmgrd`.
-   - Remaining target: move device-open capability transfer to `devmgrd`.
+   - Completed (2026-05-20): kernel `io::device::{DEVICE_DESCRIPTORS, lookup,
+     open, descriptors, normalize_device_path}` deleted along with the unused
+     namespace tests. Ring0 now only exposes the typed read/ioctl brokers,
+     and the `/dev` namespace lives entirely behind `vfsd`+`devmgrd`.
+   - Completed: device-open capability transfer is live through `devmgrd`
+     `DEVMGRD_IPC_OP_OPEN` plus `SYS_RUSTOS_DEVICE_OPEN_BROKER`; the broker
+     installs the fd with the exact reduced rights selected by `devmgrd`.
 
 5. Driver bootstrap policy leftovers:
    - Current source: `kernel/io-manager/src/driver/mod.rs` still has
@@ -133,6 +151,9 @@ privilege substrate, not a policy owner.
    - Completed: boot-volume selection is cached at the kernel broker boundary,
      so post-bootstrap boot-volume reads reuse the selected handle instead of
      rerunning transport/partition ordering policy.
+   - Completed: `STORAGED_OP_BOOT_EXTENT_LOOKUP` now returns registry-backed
+     boot extent leases with extents and generation when staged extents exist;
+     metadata-only fallback remains for unstaged paths.
    - Remaining target: `storaged` owns inventory, partition policy, root
      selection, and mount candidate ordering after bootstrap. Kernel keeps block
      hardware drivers and the gated boot/block read broker for `vfsd` and early
@@ -152,13 +173,18 @@ privilege substrate, not a policy owner.
 8. Service supervision and restart policy:
    - Current source: kernel spawn brokers can still directly spawn the fixed
      bootstrap service allowlist.
-   - Target: kernel keeps process commit/spawn primitives; `rootd` or a narrow
-     supervisor owns restart policy, dependency waits, retry budgets, and
-     post-bootstrap core-service recovery.
+   - Completed: resident `rootd` owns core-service leases and restart budgets;
+     post-bootstrap restarts call `loaderd` when it is alive, with direct spawn
+     retained only for fixed bootstrap and loaderd recovery.
+   - Target: keep reducing restart dependency policy into rootd lease protocol
+     state and readiness/dependency manifests.
 
 9. Console/TTY/session policy:
    - Current source: console, TTY, and GUI device paths still live mainly under
      `kernel/io-manager/src/io`.
+   - Completed (2026-05-20): policy-sensitive console/session observation and
+     input-injection ioctls now route through `devmgrd` before the gated
+     ring0 device ioctl broker. Display present and focus hot paths stay direct.
    - Target: keep boot console and panic output in ring0, but move normal
      session routing, device visibility, and user-facing console policy to
      `runtimed`, `uiserver`, `devmgrd`, or a dedicated session service.
@@ -167,6 +193,22 @@ privilege substrate, not a policy owner.
     - Current source: service-owned policy exists, but kernel process state
       still stores some Linux and Windows runtime metadata used by syscall
       handlers.
+    - Completed (2026-05-20):
+      - Kernel `load_pe_metadata` and the bytes-PE path in
+        `process/mod.rs::load_image` and `load_image_file` were retired.
+        PE parsing lives entirely in `loaderd::load_pe_image_fd`; procd
+        populates `windows_runtime` via `PROC_BROKER_OP_SET_WINDOWS_RUNTIME`
+        and ring0 consumes the prepared metadata in
+        `prepare_windows_process_with_address_space`.
+      - Kernel ELF file-backed loader (`load_elf_file`,
+        `prepare_process_file_with_*`, `spawn_process_file_with_*`,
+        `load_image_file`, and the `*_from_headers` / `*_from_file` ELF
+        helper chain — ~880 LOC) was deleted. loaderd reads images via VFS
+        fd and pushes the parsed `linux_runtime` plan to procd; the
+        `proc_broker_ops` `image_blob` fallback to in-kernel ELF parsing was
+        also dropped from both `prepare_image` and `exec_image` so the only
+        live ELF parser in ring0 is the bytes-based `load_elf` used by the
+        bootstrap `console_host` spawn path.
     - Target: keep metadata required for scheduler/address-space/user-copy in
       ring0; move cold validation, namespace lookup, defaults, limits, and
       policy DBs to `syscalld`, `procd`, or `loaderd`.

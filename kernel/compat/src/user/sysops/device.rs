@@ -78,25 +78,27 @@ pub(crate) fn read_current_process_handle(
         WrongHandle(&'static str),
     }
 
-    let Some((result, diag)) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
-        match process_state.handles().get(fd) {
-            Some(handle) if handle.device_handle().is_some() => {
-                let device_handle = handle.device_handle().expect("checked above");
-                let device_id = device_handle.device_id();
-                let result =
-                    device_ns::read_to_user(device_handle, process_state, user_ptr, user_len)
-                        .map_err(map_device_error);
-                let diag = matches!(result, Err(DeviceSysopError::Unsupported))
-                    .then_some(ReadDiag::UnsupportedDevice(device_id));
-                (result, diag)
+    let Some((result, diag)) =
+        multitask::with_current_user_process_state_mut(|_, _, process_state| {
+            match process_state.handles().get(fd) {
+                Some(handle) if handle.device_handle().is_some() => {
+                    let device_handle = handle.device_handle().expect("checked above");
+                    let device_id = device_handle.device_id();
+                    let result =
+                        device_ns::read_to_user(device_handle, process_state, user_ptr, user_len)
+                            .map_err(map_device_error);
+                    let diag = matches!(result, Err(DeviceSysopError::Unsupported))
+                        .then_some(ReadDiag::UnsupportedDevice(device_id));
+                    (result, diag)
+                }
+                Some(handle) => (
+                    Err(DeviceSysopError::Unsupported),
+                    Some(ReadDiag::WrongHandle(handle.kind_name())),
+                ),
+                None => (Err(DeviceSysopError::BadFileDescriptor), None),
             }
-            Some(handle) => (
-                Err(DeviceSysopError::Unsupported),
-                Some(ReadDiag::WrongHandle(handle.kind_name())),
-            ),
-            None => (Err(DeviceSysopError::BadFileDescriptor), None),
-        }
-    }) else {
+        })
+    else {
         return Err(DeviceSysopError::Unsupported);
     };
 
@@ -104,11 +106,17 @@ pub(crate) fn read_current_process_handle(
         match diag {
             ReadDiag::UnsupportedDevice(device_id) => crate::debug::println!(
                 "device read unsupported: fd={} device={:?} user_ptr={:#x} len={}",
-                fd, device_id, user_ptr, user_len,
+                fd,
+                device_id,
+                user_ptr,
+                user_len,
             ),
             ReadDiag::WrongHandle(kind_name) => crate::debug::println!(
                 "device read wrong-handle: fd={} handle={} user_ptr={:#x} len={}",
-                fd, kind_name, user_ptr, user_len,
+                fd,
+                kind_name,
+                user_ptr,
+                user_len,
             ),
         }
     }

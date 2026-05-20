@@ -48,6 +48,19 @@ struct RootFileExtent {
     len: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BootFileExtent {
+    pub offset: u64,
+    pub len: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BootFileExtentLease {
+    pub len: u64,
+    pub generation: u64,
+    pub extents: Vec<BootFileExtent>,
+}
+
 #[derive(Clone, Debug)]
 struct RootFileExtentEntry {
     path: String,
@@ -322,6 +335,69 @@ fn trace_extent_read(path: &str, len: u64) {
             len
         );
     }
+}
+
+pub fn boot_file_extent_lease(
+    path: &str,
+) -> core::result::Result<Option<BootFileExtentLease>, fatfs::Error<DiskIoError>> {
+    let Some(path) = normalized_extent_path(path) else {
+        return Ok(None);
+    };
+    let mut cache = ROOT_FILE_EXTENTS.lock();
+    if matches!(*cache, RootFileExtentState::Uninitialized) {
+        *cache = match load_root_file_extent_table() {
+            Ok(table) => {
+                crate::debug::info!(
+                    storage,
+                    "boot volume extents: loaded entries={}",
+                    table.entries.len()
+                );
+                RootFileExtentState::Ready(table)
+            }
+            Err(err) => {
+                crate::debug::warn!(storage, "boot volume extents: disabled error={:?}", err);
+                RootFileExtentState::Disabled
+            }
+        };
+    }
+    let RootFileExtentState::Ready(table) = &*cache else {
+        return Ok(None);
+    };
+    Ok(table.find(path).map(|entry| BootFileExtentLease {
+        len: entry.len,
+        generation: root_file_extent_generation(entry),
+        extents: entry
+            .extents
+            .iter()
+            .map(|extent| BootFileExtent {
+                offset: extent.offset,
+                len: extent.len,
+            })
+            .collect(),
+    }))
+}
+
+fn root_file_extent_generation(entry: &RootFileExtentEntry) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in entry.path.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    for value in [entry.len] {
+        for byte in value.to_le_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    for extent in &entry.extents {
+        for value in [extent.offset, extent.len] {
+            for byte in value.to_le_bytes() {
+                hash ^= byte as u64;
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+    }
+    hash.max(1)
 }
 
 impl RootFileExtentTable {

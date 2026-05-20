@@ -1,4 +1,3 @@
-use core::mem::{align_of, size_of};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) use crate::input_core::InputEventQueueState;
@@ -7,10 +6,11 @@ use driver_abi::PointerPacket;
 #[cfg(not(test))]
 use x86_64::instructions::interrupts;
 
+// `crate::user::abi::device::InputEvent` and `crate::input_core::InputEvent`
+// are both aliases of `rustos_user_abi::ui::UiInputEvent` via the shared
+// `input-evdev` crate, so callers can pass either name through the queue
+// without a layout cast.
 use crate::user::abi::device::InputEvent;
-
-const _: [(); size_of::<crate::input_core::InputEvent>()] = [(); size_of::<InputEvent>()];
-const _: [(); align_of::<crate::input_core::InputEvent>()] = [(); align_of::<InputEvent>()];
 
 static POINTER_PACKET_SUBMIT_COUNT: AtomicU64 = AtomicU64::new(0);
 static POINTER_ABSOLUTE_SUBMIT_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -84,10 +84,7 @@ pub(crate) fn submit_pointer_absolute(
 }
 
 pub(crate) fn read_input_events(dest: &mut [InputEvent]) -> usize {
-    let count = with_event_queue(|events| {
-        let host_dest = abi_events_as_input_core(dest);
-        events.read_input_events(host_dest)
-    });
+    let count = with_event_queue(|events| events.read_input_events(dest));
     INPUT_READ_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
     INPUT_READ_EVENT_COUNT.fetch_add(count as u64, Ordering::Relaxed);
     count
@@ -131,10 +128,6 @@ pub(crate) fn reset_for_tests() {
     EVENT_QUEUE_LOCK_ACTIVE.store(0, Ordering::Relaxed);
     EVENT_QUEUE_LOCK_LAST_SEQ.store(0, Ordering::Relaxed);
     EVENT_QUEUE_LOCK_NEXT_SEQ.store(1, Ordering::Relaxed);
-}
-
-fn abi_events_as_input_core(dest: &mut [InputEvent]) -> &mut [crate::input_core::InputEvent] {
-    unsafe { core::slice::from_raw_parts_mut(dest.as_mut_ptr().cast(), dest.len()) }
 }
 
 fn with_event_queue<R>(f: impl FnOnce(&mut InputEventQueueState) -> R) -> R {

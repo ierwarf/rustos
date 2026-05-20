@@ -824,7 +824,9 @@ fn main() {
         Err(code) => code,
     };
     if exit_code != 0 {
-        diag_line(format!("uiserver: exiting with nonzero status errno={exit_code}"));
+        diag_line(format!(
+            "uiserver: exiting with nonzero status errno={exit_code}"
+        ));
     }
     std::process::exit(exit_code);
 }

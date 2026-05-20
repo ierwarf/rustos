@@ -92,23 +92,6 @@ struct SegmentLoadInfo {
     page_file_end: usize,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct ParsedProgramHeader {
-    kind: u32,
-    flags: u32,
-    offset: u64,
-    virtual_addr: u64,
-    file_size: u64,
-    mem_size: u64,
-    align: u64,
-}
-
-#[derive(Clone, Copy)]
-struct ParsedDynamicEntry {
-    tag: i64,
-    value: u64,
-}
-
 #[derive(Clone, Copy)]
 struct MappedElfImage {
     entry: VirtAddr,
@@ -212,292 +195,6 @@ pub(super) fn load_elf(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadEr
     })
 }
 
-#[inline(never)]
-pub(super) fn load_elf_file(file: VfsFileHandle) -> Result<LoadedProcessImage, ProcessLoadError> {
-    if let Some(bytes) = file.shared_bytes() {
-        return load_elf(bytes.as_ref());
-    }
-
-    validate_elf_kind_file(&file)?;
-    let header = validate_elf_header_file(&file)?;
-    let program_headers = read_program_headers_from_file(&file, &header)?;
-    let interpreter_path = elf_interpreter_path_file(&file, &program_headers)?;
-    let runtime_search_paths = elf_runtime_search_paths_file(&file, &program_headers)?;
-    let load_bias =
-        choose_elf_load_bias_from_headers(&program_headers, header.image_type, ELF_DYN_LOAD_BASE)?;
-    let mut address_space = ProcessAddressSpace::new()?;
-    let mut image_mappings = Vec::new();
-
-    let mut loaded_segments = 0usize;
-    let mut mapped_page_ranges = [(0_u64, 0_u64); MAX_LOAD_SEGMENTS];
-    let main_image = map_elf_file_image(
-        &file,
-        &header,
-        &program_headers,
-        header.image_type,
-        load_bias,
-        LinuxImageMappingPathKind::Executable,
-        &mut address_space,
-        &mut mapped_page_ranges,
-        &mut loaded_segments,
-        &mut image_mappings,
-        interpreter_path.is_none(),
-    )?;
-
-    let interpreter_path_owned = interpreter_path.clone();
-    let (entry, interpreter_base, max_loaded_end) =
-        if let Some(interpreter_path) = interpreter_path.as_deref() {
-            let interpreter_file = VfsFileHandle::read_only_memory(
-                interpreter_path.to_string(),
-                load_interpreter_image(interpreter_path)?,
-            );
-            let interpreter_header = validate_elf_header_file(&interpreter_file)?;
-            let interpreter_program_headers =
-                read_program_headers_from_file(&interpreter_file, &interpreter_header)?;
-            ensure_no_elf_interpreter_from_headers(&interpreter_program_headers)?;
-            let interpreter_load_bias = choose_elf_load_bias_from_headers(
-                &interpreter_program_headers,
-                interpreter_header.image_type,
-                ELF_INTERP_LOAD_BASE,
-            )?;
-            let interpreter = map_elf_file_image(
-                &interpreter_file,
-                &interpreter_header,
-                &interpreter_program_headers,
-                interpreter_header.image_type,
-                interpreter_load_bias,
-                LinuxImageMappingPathKind::Interpreter,
-                &mut address_space,
-                &mut mapped_page_ranges,
-                &mut loaded_segments,
-                &mut image_mappings,
-                false,
-            )?;
-            (
-                interpreter.entry,
-                interpreter.load_bias,
-                main_image.max_loaded_end.max(interpreter.max_loaded_end),
-            )
-        } else {
-            (main_image.entry, 0, main_image.max_loaded_end)
-        };
-
-    let mut linux_image = build_linux_process_image_from_headers(
-        &header,
-        &program_headers,
-        main_image.load_bias,
-        max_loaded_end,
-        main_image.entry.as_u64(),
-        interpreter_base,
-        interpreter_path_owned,
-        image_mappings,
-        runtime_search_paths,
-    )?;
-
-    if linux_image.interpreter_path.is_none() {
-        reserve_bootstrap_heap(&mut address_space, &mut linux_image)?;
-    }
-
-    Ok(LoadedProcessImage {
-        abi: UserAbi::Linux,
-        address_space,
-        entry,
-        runtime: LoadedProcessRuntime::Linux(linux_image),
-    })
-}
-
-fn validate_elf_kind_file(file: &VfsFileHandle) -> Result<(), ProcessLoadError> {
-    let mut magic = [0_u8; 4];
-    read_exact_file(file, 0, &mut magic)?;
-    match FileKind::parse(&magic[..])
-        .map_err(|_| ProcessLoadError::InvalidElf("invalid ELF image"))?
-    {
-        FileKind::Elf64 => Ok(()),
-        _ => Err(ProcessLoadError::InvalidElf("ELF image is not 64-bit")),
-    }
-}
-
-fn validate_elf_header_file(file: &VfsFileHandle) -> Result<ElfHeaderInfo, ProcessLoadError> {
-    let mut bytes = [0_u8; ELF64_HEADER_SIZE];
-    read_exact_file(file, 0, &mut bytes)?;
-    validate_elf_header(bytes.as_slice())
-}
-
-fn read_program_headers_from_file(
-    file: &VfsFileHandle,
-    header: &ElfHeaderInfo,
-) -> Result<Vec<ParsedProgramHeader>, ProcessLoadError> {
-    let table_size = header
-        .program_header_entry_size
-        .checked_mul(header.program_header_count)
-        .ok_or(ProcessLoadError::InvalidElf(
-            "program header table size overflow",
-        ))?;
-    let table_size = usize::try_from(table_size)
-        .map_err(|_| ProcessLoadError::InvalidElf("program header table is too large"))?;
-    let mut bytes = vec![0_u8; table_size];
-    read_exact_file(file, header.program_header_offset, &mut bytes)?;
-
-    let entry_size = usize::try_from(header.program_header_entry_size)
-        .map_err(|_| ProcessLoadError::InvalidElf("program header size is invalid"))?;
-    let mut program_headers =
-        Vec::with_capacity(usize::try_from(header.program_header_count).unwrap_or(0));
-    for entry in bytes.chunks_exact(entry_size) {
-        program_headers.push(parse_program_header(entry)?);
-    }
-    Ok(program_headers)
-}
-
-fn parse_program_header(bytes: &[u8]) -> Result<ParsedProgramHeader, ProcessLoadError> {
-    if bytes.len() < ELF64_PROGRAM_HEADER_SIZE as usize {
-        return Err(ProcessLoadError::InvalidElf("program header is truncated"));
-    }
-
-    Ok(ParsedProgramHeader {
-        kind: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
-        flags: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
-        offset: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
-        virtual_addr: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
-        file_size: u64::from_le_bytes(bytes[32..40].try_into().unwrap()),
-        mem_size: u64::from_le_bytes(bytes[40..48].try_into().unwrap()),
-        align: u64::from_le_bytes(bytes[48..56].try_into().unwrap()),
-    })
-}
-
-fn read_exact_file(
-    file: &VfsFileHandle,
-    offset: u64,
-    dest: &mut [u8],
-) -> Result<(), ProcessLoadError> {
-    let mut done = 0usize;
-    while done < dest.len() {
-        let chunk_offset = offset
-            .checked_add(done as u64)
-            .ok_or(ProcessLoadError::InvalidElf("ELF file offset overflow"))?;
-        let chunk_offset = usize::try_from(chunk_offset)
-            .map_err(|_| ProcessLoadError::InvalidElf("ELF file offset is out of range"))?;
-        let read = file.read_at(chunk_offset, &mut dest[done..]);
-        if read == 0 {
-            return Err(ProcessLoadError::InvalidElf("ELF image is truncated"));
-        }
-        done += read;
-    }
-    Ok(())
-}
-
-fn elf_interpreter_path_file(
-    file: &VfsFileHandle,
-    program_headers: &[ParsedProgramHeader],
-) -> Result<Option<String>, ProcessLoadError> {
-    for ph in program_headers {
-        if ph.kind != objelf::PT_INTERP {
-            continue;
-        }
-
-        let size = usize::try_from(ph.file_size)
-            .map_err(|_| ProcessLoadError::InvalidElf("PT_INTERP size is out of range"))?;
-        let mut bytes = vec![0_u8; size];
-        read_exact_file(file, ph.offset, &mut bytes)?;
-        let nul = bytes
-            .iter()
-            .position(|&byte| byte == 0)
-            .ok_or(ProcessLoadError::InvalidElf(
-                "PT_INTERP path is not terminated",
-            ))?;
-        let raw_path = core::str::from_utf8(&bytes[..nul])
-            .map_err(|_| ProcessLoadError::InvalidElf("PT_INTERP path is not valid UTF-8"))?;
-        let normalized = vfs::normalize_kernel_path(raw_path)
-            .map_err(|_| ProcessLoadError::InvalidElf("PT_INTERP path is invalid"))?;
-        return Ok(Some(normalized));
-    }
-
-    Ok(None)
-}
-
-fn elf_runtime_search_paths_file(
-    file: &VfsFileHandle,
-    program_headers: &[ParsedProgramHeader],
-) -> Result<Vec<String>, ProcessLoadError> {
-    let Some(dynamic_segment) = program_headers
-        .iter()
-        .find(|ph| ph.kind == objelf::PT_DYNAMIC)
-    else {
-        return Ok(Vec::new());
-    };
-    let entries = read_dynamic_entries(file, dynamic_segment)?;
-
-    let mut strtab_addr = 0_u64;
-    let mut strtab_size = 0_u64;
-    let mut rpath_offset = None;
-    let mut runpath_offset = None;
-    for entry in &entries {
-        match entry.tag {
-            value if value == objelf::DT_STRTAB as i64 => strtab_addr = entry.value,
-            value if value == objelf::DT_STRSZ as i64 => strtab_size = entry.value,
-            value if value == objelf::DT_RPATH as i64 => rpath_offset = Some(entry.value),
-            value if value == objelf::DT_RUNPATH as i64 => runpath_offset = Some(entry.value),
-            value if value == objelf::DT_NULL as i64 => break,
-            _ => {}
-        }
-    }
-
-    let Some(search_offset) = runpath_offset.or(rpath_offset) else {
-        return Ok(Vec::new());
-    };
-    if strtab_addr == 0 || strtab_size == 0 {
-        return Err(ProcessLoadError::InvalidElf(
-            "dynamic string table metadata is incomplete",
-        ));
-    }
-
-    let strtab = read_virtual_bytes_from_file(
-        file,
-        program_headers,
-        strtab_addr,
-        usize::try_from(strtab_size)
-            .map_err(|_| ProcessLoadError::InvalidElf("dynamic string table is too large"))?,
-    )?;
-    let encoded = elf_dynamic_string(
-        strtab.as_slice(),
-        usize::try_from(search_offset)
-            .map_err(|_| ProcessLoadError::InvalidElf("runtime search path offset is invalid"))?,
-    )?;
-
-    let mut paths = Vec::new();
-    for entry in encoded.split(':') {
-        let entry = entry.trim();
-        if entry.is_empty() || paths.iter().any(|current| current == entry) {
-            continue;
-        }
-        paths.push(entry.to_string());
-    }
-    Ok(paths)
-}
-
-fn read_dynamic_entries(
-    file: &VfsFileHandle,
-    dynamic_segment: &ParsedProgramHeader,
-) -> Result<Vec<ParsedDynamicEntry>, ProcessLoadError> {
-    let size = usize::try_from(dynamic_segment.file_size)
-        .map_err(|_| ProcessLoadError::InvalidElf("dynamic segment size is out of range"))?;
-    if size % ELF64_DYNAMIC_ENTRY_SIZE != 0 {
-        return Err(ProcessLoadError::InvalidElf(
-            "dynamic segment size is not aligned",
-        ));
-    }
-
-    let mut bytes = vec![0_u8; size];
-    read_exact_file(file, dynamic_segment.offset, &mut bytes)?;
-    let mut entries = Vec::with_capacity(size / ELF64_DYNAMIC_ENTRY_SIZE);
-    for chunk in bytes.chunks_exact(ELF64_DYNAMIC_ENTRY_SIZE) {
-        entries.push(ParsedDynamicEntry {
-            tag: i64::from_le_bytes(chunk[0..8].try_into().unwrap()),
-            value: u64::from_le_bytes(chunk[8..16].try_into().unwrap()),
-        });
-    }
-    Ok(entries)
-}
-
 fn validate_elf_kind(image: &[u8]) -> Result<(), ProcessLoadError> {
     match FileKind::parse(image).map_err(|_| ProcessLoadError::InvalidElf("invalid ELF image"))? {
         FileKind::Elf64 => Ok(()),
@@ -566,20 +263,6 @@ fn ensure_no_elf_interpreter(elf: &ElfFile<'_>) -> Result<(), ProcessLoadError> 
     Ok(())
 }
 
-fn ensure_no_elf_interpreter_from_headers(
-    program_headers: &[ParsedProgramHeader],
-) -> Result<(), ProcessLoadError> {
-    if program_headers
-        .iter()
-        .any(|ph| ph.kind == objelf::PT_INTERP)
-    {
-        return Err(ProcessLoadError::InvalidElf(
-            "nested ELF interpreters are not supported",
-        ));
-    }
-    Ok(())
-}
-
 fn choose_elf_load_bias(
     elf: &ElfFile<'_>,
     image_type: ElfImageType,
@@ -610,37 +293,6 @@ fn choose_elf_load_bias(
                         "static PIE load bias underflow",
                     ))?;
             Ok(load_bias)
-        }
-    }
-}
-
-fn choose_elf_load_bias_from_headers(
-    program_headers: &[ParsedProgramHeader],
-    image_type: ElfImageType,
-    preferred_base: u64,
-) -> Result<u64, ProcessLoadError> {
-    match image_type {
-        ElfImageType::Executable => Ok(0),
-        ElfImageType::StaticPie => {
-            let mut min_load_addr = u64::MAX;
-            for ph in program_headers {
-                if ph.kind != objelf::PT_LOAD || ph.mem_size == 0 {
-                    continue;
-                }
-                min_load_addr = min_load_addr.min(align_down(ph.virtual_addr, PAGE_SIZE));
-            }
-
-            if min_load_addr == u64::MAX {
-                return Err(ProcessLoadError::InvalidElf(
-                    "ELF does not contain PT_LOAD segments",
-                ));
-            }
-
-            preferred_base
-                .checked_sub(min_load_addr)
-                .ok_or(ProcessLoadError::InvalidElf(
-                    "static PIE load bias underflow",
-                ))
         }
     }
 }
@@ -798,110 +450,6 @@ fn map_elf_image(
     })
 }
 
-fn map_elf_file_image(
-    file: &VfsFileHandle,
-    header: &ElfHeaderInfo,
-    program_headers: &[ParsedProgramHeader],
-    image_type: ElfImageType,
-    load_bias: u64,
-    path_kind: LinuxImageMappingPathKind,
-    address_space: &mut ProcessAddressSpace,
-    mapped_page_ranges: &mut [(u64, u64); MAX_LOAD_SEGMENTS],
-    loaded_segments: &mut usize,
-    image_mappings: &mut Vec<LinuxImageMapping>,
-    apply_kernel_relocations: bool,
-) -> Result<MappedElfImage, ProcessLoadError> {
-    let entry = validate_entry_point(header, load_bias)?;
-    let mut executable_entry_covered = false;
-    let mut max_loaded_end = 0_u64;
-    let mut image_loaded_segments = 0usize;
-
-    for ph in program_headers {
-        if ph.kind != objelf::PT_LOAD {
-            continue;
-        }
-        if ph.mem_size == 0 && ph.file_size == 0 {
-            continue;
-        }
-
-        if *loaded_segments >= MAX_LOAD_SEGMENTS {
-            return Err(ProcessLoadError::InvalidElf("too many PT_LOAD segments"));
-        }
-
-        validate_segment_policy_from_header(ph)?;
-        let segment = validated_segment_bounds_from_header(file.len(), ph, load_bias)?;
-        if page_ranges_overlap(
-            segment.page_base,
-            segment.page_end,
-            &mapped_page_ranges[..*loaded_segments],
-        ) {
-            return Err(ProcessLoadError::InvalidElf("PT_LOAD page ranges overlap"));
-        }
-        mapped_page_ranges[*loaded_segments] = (segment.page_base, segment.page_end);
-        max_loaded_end = max_loaded_end.max(segment.end);
-
-        if header.entry_point >= ph.virtual_addr
-            && header.entry_point < ph.virtual_addr.saturating_add(ph.mem_size)
-            && program_header_is_execute(ph)
-        {
-            executable_entry_covered = true;
-        }
-
-        let page_count = ((segment.page_end - segment.page_base) / PAGE_SIZE) as usize;
-        let page_flags = segment_page_flags_from_header(ph);
-        address_space.map_zeroed_user_pages_at(
-            VirtAddr::new(segment.page_base),
-            page_count,
-            page_flags,
-        )?;
-        if segment.page_file_offset != segment.page_file_end {
-            initialize_user_bytes_from_file(
-                address_space,
-                file,
-                segment.page_base,
-                segment.page_file_offset,
-                segment.page_file_end,
-            )?;
-        }
-        address_space.ensure_user_region_mapped(VirtAddr::new(segment.page_base), page_count)?;
-        image_mappings.push(LinuxImageMapping {
-            start: segment.page_base,
-            end: segment.page_end,
-            offset: align_down(ph.offset, PAGE_SIZE),
-            flags: LinuxVmaFlags::new(
-                program_header_is_read(ph),
-                program_header_is_write(ph),
-                program_header_is_execute(ph),
-                true,
-            ),
-            path_kind,
-        });
-        *loaded_segments += 1;
-        image_loaded_segments += 1;
-    }
-
-    if image_loaded_segments == 0 {
-        return Err(ProcessLoadError::InvalidElf(
-            "ELF does not contain PT_LOAD segments",
-        ));
-    }
-    if !executable_entry_covered {
-        return Err(ProcessLoadError::InvalidElf(
-            "entry point is not inside an executable PT_LOAD segment",
-        ));
-    }
-
-    if apply_kernel_relocations && matches!(image_type, ElfImageType::StaticPie) {
-        apply_elf_dynamic_relocations_file(file, program_headers, address_space, load_bias)?;
-    }
-
-    Ok(MappedElfImage {
-        entry,
-        load_bias,
-        max_loaded_end,
-    })
-}
-
 fn validated_segment_bounds(
     image: &[u8],
     ph: &ProgramHeader<'_>,
@@ -971,102 +519,6 @@ fn validated_segment_bounds(
     })
 }
 
-fn validated_segment_bounds_from_header(
-    file_len: usize,
-    ph: &ParsedProgramHeader,
-    load_bias: u64,
-) -> Result<SegmentLoadInfo, ProcessLoadError> {
-    validate_segment_alignment_from_header(ph)?;
-
-    let file_size = usize::try_from(ph.file_size)
-        .map_err(|_| ProcessLoadError::InvalidElf("segment file size out of range"))?;
-    let mem_size = usize::try_from(ph.mem_size)
-        .map_err(|_| ProcessLoadError::InvalidElf("segment memory size out of range"))?;
-    let file_offset = usize::try_from(ph.offset)
-        .map_err(|_| ProcessLoadError::InvalidElf("segment file offset out of range"))?;
-
-    if mem_size == 0 {
-        return Err(ProcessLoadError::InvalidElf(
-            "PT_LOAD segment has zero memory size",
-        ));
-    }
-    if file_size > mem_size {
-        return Err(ProcessLoadError::InvalidElf(
-            "segment file size exceeds memory size",
-        ));
-    }
-
-    let file_end = file_offset
-        .checked_add(file_size)
-        .ok_or(ProcessLoadError::InvalidElf("segment file bounds overflow"))?;
-    if file_end > file_len {
-        return Err(ProcessLoadError::InvalidElf(
-            "segment file range is outside ELF image",
-        ));
-    }
-
-    let addr = ph
-        .virtual_addr
-        .checked_add(load_bias)
-        .ok_or(ProcessLoadError::InvalidElf("segment address overflow"))?;
-    if !(paging::USER_SPACE_BASE..paging::USER_SPACE_END_EXCLUSIVE).contains(&addr) {
-        return Err(ProcessLoadError::InvalidElf(
-            "segment address is outside the supported user range",
-        ));
-    }
-
-    let end = addr
-        .checked_add(mem_size as u64)
-        .ok_or(ProcessLoadError::InvalidElf("segment address overflow"))?;
-    if end > paging::USER_SPACE_END_EXCLUSIVE {
-        return Err(ProcessLoadError::InvalidElf(
-            "segment address exceeds the supported user range",
-        ));
-    }
-
-    let page_base = align_down(addr, PAGE_SIZE);
-    let page_end = align_up(end, PAGE_SIZE).ok_or(ProcessLoadError::InvalidElf(
-        "segment page alignment overflow",
-    ))?;
-    let (page_file_offset, page_file_end) = segment_page_file_copy_range(file_offset, file_size)?;
-
-    Ok(SegmentLoadInfo {
-        addr,
-        end,
-        page_base,
-        page_end,
-        page_file_offset,
-        page_file_end,
-    })
-}
-
-fn initialize_user_bytes_from_file(
-    address_space: &ProcessAddressSpace,
-    file: &VfsFileHandle,
-    user_addr: u64,
-    file_offset: usize,
-    file_end: usize,
-) -> Result<(), ProcessLoadError> {
-    let mut current_file_offset = file_offset;
-    let mut current_user_addr = user_addr;
-    let mut chunk = vec![0_u8; 64 * 1024];
-    while current_file_offset < file_end {
-        let remaining = file_end - current_file_offset;
-        let chunk_len = remaining.min(chunk.len());
-        read_exact_file(file, current_file_offset as u64, &mut chunk[..chunk_len])?;
-        address_space
-            .initialize_user_bytes(VirtAddr::new(current_user_addr), &chunk[..chunk_len])?;
-        current_file_offset += chunk_len;
-        current_user_addr =
-            current_user_addr
-                .checked_add(chunk_len as u64)
-                .ok_or(ProcessLoadError::InvalidElf(
-                    "segment initialization address overflow",
-                ))?;
-    }
-    Ok(())
-}
-
 fn segment_page_file_copy_range(
     file_offset: usize,
     file_size: usize,
@@ -1123,52 +575,6 @@ fn build_linux_process_image(
         interpreter_base,
         interpreter_path,
         program_headers,
-        program_header_entry_size: header.program_header_entry_size,
-        program_header_count: header.program_header_count,
-        brk_start,
-        bootstrap_heap_base: 0,
-        bootstrap_heap_len: 0,
-        initial_tls,
-        image_mappings,
-        runtime_search_paths,
-    })
-}
-
-fn build_linux_process_image_from_headers(
-    header: &ElfHeaderInfo,
-    program_headers: &[ParsedProgramHeader],
-    load_bias: u64,
-    max_loaded_end: u64,
-    entry: u64,
-    interpreter_base: u64,
-    interpreter_path: Option<String>,
-    image_mappings: Vec<LinuxImageMapping>,
-    runtime_search_paths: Vec<String>,
-) -> Result<LinuxProcessImageInfo, ProcessLoadError> {
-    let program_headers_addr =
-        program_header_table_addr_from_headers(program_headers, header, load_bias)?;
-    let initial_tls = if interpreter_base == 0 {
-        elf_initial_tls_info_from_headers(program_headers, load_bias, max_loaded_end)?
-    } else {
-        None
-    };
-    let brk_start = if let Some(tls) = initial_tls {
-        tls.mapping_base
-            .checked_add(tls.mapping_size)
-            .ok_or(ProcessLoadError::InvalidElf(
-                "initial brk calculation overflow",
-            ))?
-    } else {
-        align_up(max_loaded_end, PAGE_SIZE).ok_or(ProcessLoadError::InvalidElf(
-            "initial brk calculation overflow",
-        ))?
-    };
-
-    Ok(LinuxProcessImageInfo {
-        entry,
-        interpreter_base,
-        interpreter_path,
-        program_headers: program_headers_addr,
         program_header_entry_size: header.program_header_entry_size,
         program_header_count: header.program_header_count,
         brk_start,
@@ -1316,22 +722,6 @@ fn elf_initial_tls_info(
         ))
 }
 
-fn elf_initial_tls_info_from_headers(
-    program_headers: &[ParsedProgramHeader],
-    load_bias: u64,
-    max_loaded_end: u64,
-) -> Result<Option<LinuxInitialTlsInfo>, ProcessLoadError> {
-    let Some(template) = elf_tls_template_info_from_headers(program_headers, load_bias)? else {
-        return Ok(None);
-    };
-
-    elf_initial_tls_info_from_template(template, max_loaded_end)
-        .map(Some)
-        .ok_or(ProcessLoadError::InvalidElf(
-            "PT_TLS layout calculation overflow",
-        ))
-}
-
 fn elf_initial_tls_info_from_template(
     template: ElfTlsTemplateInfo,
     max_loaded_end: u64,
@@ -1440,69 +830,6 @@ fn elf_tls_template_info(
     Ok(tls_template)
 }
 
-fn elf_tls_template_info_from_headers(
-    program_headers: &[ParsedProgramHeader],
-    load_bias: u64,
-) -> Result<Option<ElfTlsTemplateInfo>, ProcessLoadError> {
-    let mut tls_template = None;
-
-    for ph in program_headers {
-        if ph.kind != objelf::PT_TLS {
-            continue;
-        }
-        if tls_template.is_some() {
-            return Err(ProcessLoadError::InvalidElf(
-                "multiple PT_TLS segments are not supported",
-            ));
-        }
-
-        let template_size = ph.file_size;
-        let mem_size = ph.mem_size;
-        if mem_size == 0 {
-            continue;
-        }
-        if template_size > mem_size {
-            return Err(ProcessLoadError::InvalidElf(
-                "PT_TLS file size exceeds memory size",
-            ));
-        }
-
-        let align = ph.align.max(1);
-        if !align.is_power_of_two() {
-            return Err(ProcessLoadError::InvalidElf(
-                "PT_TLS alignment must be zero, one, or a power of two",
-            ));
-        }
-
-        let template_addr =
-            ph.virtual_addr
-                .checked_add(load_bias)
-                .ok_or(ProcessLoadError::InvalidElf(
-                    "PT_TLS template address overflow",
-                ))?;
-        let template_end =
-            template_addr
-                .checked_add(template_size)
-                .ok_or(ProcessLoadError::InvalidElf(
-                    "PT_TLS template bounds overflow",
-                ))?;
-        if template_end > paging::USER_SPACE_END_EXCLUSIVE {
-            return Err(ProcessLoadError::InvalidElf(
-                "PT_TLS template is outside the supported user range",
-            ));
-        }
-
-        tls_template = Some(ElfTlsTemplateInfo {
-            template_addr,
-            template_size,
-            mem_size,
-            align,
-        });
-    }
-
-    Ok(tls_template)
-}
-
 fn program_header_table_addr(
     elf: &ElfFile<'_>,
     header: &ElfHeaderInfo,
@@ -1550,63 +877,6 @@ fn program_header_table_addr(
         let table_delta = ph_offset - file_start;
         return ph
             .virtual_addr()
-            .checked_add(table_delta)
-            .and_then(|value| value.checked_add(load_bias))
-            .ok_or(ProcessLoadError::InvalidElf(
-                "program header table address overflow",
-            ));
-    }
-
-    Err(ProcessLoadError::InvalidElf(
-        "program header table is not mapped by PT_LOAD",
-    ))
-}
-
-fn program_header_table_addr_from_headers(
-    program_headers: &[ParsedProgramHeader],
-    header: &ElfHeaderInfo,
-    load_bias: u64,
-) -> Result<u64, ProcessLoadError> {
-    for ph in program_headers {
-        if ph.kind == objelf::PT_PHDR {
-            return ph
-                .virtual_addr
-                .checked_add(load_bias)
-                .ok_or(ProcessLoadError::InvalidElf(
-                    "program header address overflow",
-                ));
-        }
-    }
-
-    let ph_offset = header.program_header_offset;
-    let ph_size = header
-        .program_header_entry_size
-        .checked_mul(header.program_header_count)
-        .ok_or(ProcessLoadError::InvalidElf(
-            "program header table size overflow",
-        ))?;
-    let ph_end = ph_offset
-        .checked_add(ph_size)
-        .ok_or(ProcessLoadError::InvalidElf(
-            "program header table bounds overflow",
-        ))?;
-
-    for ph in program_headers {
-        if ph.kind != objelf::PT_LOAD || ph.file_size == 0 {
-            continue;
-        }
-
-        let file_start = ph.offset;
-        let file_end = file_start
-            .checked_add(ph.file_size)
-            .ok_or(ProcessLoadError::InvalidElf("PT_LOAD file bounds overflow"))?;
-        if ph_offset < file_start || ph_end > file_end {
-            continue;
-        }
-
-        let table_delta = ph_offset - file_start;
-        return ph
-            .virtual_addr
             .checked_add(table_delta)
             .and_then(|value| value.checked_add(load_bias))
             .ok_or(ProcessLoadError::InvalidElf(
@@ -1707,67 +977,6 @@ fn apply_elf_dynamic_relocations(
     Ok(())
 }
 
-fn apply_elf_dynamic_relocations_file(
-    file: &VfsFileHandle,
-    program_headers: &[ParsedProgramHeader],
-    address_space: &ProcessAddressSpace,
-    load_bias: u64,
-) -> Result<(), ProcessLoadError> {
-    let Some(relocations) = parse_elf_dynamic_relocations_file(file, program_headers)? else {
-        return Ok(());
-    };
-
-    if relocations.rela_entry_size != core::mem::size_of::<Rela64>() as u64 {
-        return Err(ProcessLoadError::InvalidElf(
-            "ELF RELA entry size is not supported",
-        ));
-    }
-
-    let rela_size = usize::try_from(relocations.rela_size)
-        .map_err(|_| ProcessLoadError::InvalidElf("ELF RELA size is out of range"))?;
-    let rela_bytes =
-        read_virtual_bytes_from_file(file, program_headers, relocations.rela_address, rela_size)?;
-    if rela_bytes.len() % core::mem::size_of::<Rela64>() != 0 {
-        return Err(ProcessLoadError::InvalidElf(
-            "ELF RELA table size is not aligned",
-        ));
-    }
-
-    for chunk in rela_bytes.chunks_exact(core::mem::size_of::<Rela64>()) {
-        let relocation = read_rela64(chunk);
-        let relocation_type = relocation.info as u32;
-        if relocation_type == ELF_RELOC_X86_64_IRELATIVE {
-            return Err(ProcessLoadError::InvalidElf(
-                "IFUNC relocations are not supported for static PIE",
-            ));
-        }
-        if relocation_type != ELF_RELOC_X86_64_RELATIVE {
-            return Err(ProcessLoadError::InvalidElf(
-                "unsupported static PIE relocation type",
-            ));
-        }
-        if (relocation.info >> 32) != 0 {
-            return Err(ProcessLoadError::InvalidElf(
-                "static PIE relocation unexpectedly references a symbol",
-            ));
-        }
-
-        let target_addr =
-            relocation
-                .offset
-                .checked_add(load_bias)
-                .ok_or(ProcessLoadError::InvalidElf(
-                    "relocation target address overflow",
-                ))?;
-        let relocated = add_signed_u64(load_bias, relocation.addend)
-            .ok_or(ProcessLoadError::InvalidElf("relocation value overflow"))?;
-        address_space
-            .initialize_user_bytes(VirtAddr::new(target_addr), &relocated.to_le_bytes())?;
-    }
-
-    Ok(())
-}
-
 fn parse_elf_dynamic_relocations(
     elf: &ElfFile<'_>,
 ) -> Result<Option<ElfDynamicRelocationInfo>, ProcessLoadError> {
@@ -1809,45 +1018,6 @@ fn parse_elf_dynamic_relocations(
                 info.rela_entry_size = entry.get_val().map_err(ProcessLoadError::InvalidElf)?;
             }
             DynamicTag::Null => break,
-            _ => {}
-        }
-    }
-
-    if info.rela_size == 0 {
-        return Ok(None);
-    }
-    if info.rela_address == 0 || info.rela_entry_size == 0 {
-        return Err(ProcessLoadError::InvalidElf(
-            "dynamic relocation metadata is incomplete",
-        ));
-    }
-
-    Ok(Some(info))
-}
-
-fn parse_elf_dynamic_relocations_file(
-    file: &VfsFileHandle,
-    program_headers: &[ParsedProgramHeader],
-) -> Result<Option<ElfDynamicRelocationInfo>, ProcessLoadError> {
-    let Some(dynamic_segment) = program_headers
-        .iter()
-        .find(|ph| ph.kind == objelf::PT_DYNAMIC)
-    else {
-        return Ok(None);
-    };
-
-    let mut info = ElfDynamicRelocationInfo {
-        rela_address: 0,
-        rela_size: 0,
-        rela_entry_size: 0,
-    };
-
-    for entry in read_dynamic_entries(file, dynamic_segment)? {
-        match entry.tag {
-            value if value == objelf::DT_RELA as i64 => info.rela_address = entry.value,
-            value if value == objelf::DT_RELASZ as i64 => info.rela_size = entry.value,
-            value if value == objelf::DT_RELAENT as i64 => info.rela_entry_size = entry.value,
-            value if value == objelf::DT_NULL as i64 => break,
             _ => {}
         }
     }
@@ -2069,53 +1239,6 @@ fn elf_file_slice_from_virtual_address<'a>(
     ))
 }
 
-fn read_virtual_bytes_from_file(
-    file: &VfsFileHandle,
-    program_headers: &[ParsedProgramHeader],
-    virtual_address: u64,
-    len: usize,
-) -> Result<Vec<u8>, ProcessLoadError> {
-    let end = virtual_address
-        .checked_add(len as u64)
-        .ok_or(ProcessLoadError::InvalidElf(
-            "ELF virtual slice bounds overflow",
-        ))?;
-
-    for ph in program_headers {
-        if ph.kind != objelf::PT_LOAD || ph.file_size == 0 {
-            continue;
-        }
-
-        let segment_start = ph.virtual_addr;
-        let segment_end =
-            segment_start
-                .checked_add(ph.file_size)
-                .ok_or(ProcessLoadError::InvalidElf(
-                    "ELF PT_LOAD file-backed range overflow",
-                ))?;
-        if virtual_address < segment_start || end > segment_end {
-            continue;
-        }
-
-        let delta = usize::try_from(virtual_address - segment_start)
-            .map_err(|_| ProcessLoadError::InvalidElf("ELF virtual slice is out of range"))?;
-        let file_offset = usize::try_from(ph.offset)
-            .map_err(|_| ProcessLoadError::InvalidElf("ELF file offset is out of range"))?;
-        let start = file_offset
-            .checked_add(delta)
-            .ok_or(ProcessLoadError::InvalidElf(
-                "ELF file slice offset overflow",
-            ))?;
-        let mut bytes = vec![0_u8; len];
-        read_exact_file(file, start as u64, &mut bytes)?;
-        return Ok(bytes);
-    }
-
-    Err(ProcessLoadError::InvalidElf(
-        "ELF virtual slice is not covered by a PT_LOAD segment",
-    ))
-}
-
 fn read_rela64(bytes: &[u8]) -> Rela64 {
     debug_assert_eq!(bytes.len(), core::mem::size_of::<Rela64>());
     Rela64 {
@@ -2143,16 +1266,6 @@ fn validate_segment_policy(ph: &ProgramHeader<'_>) -> Result<(), ProcessLoadErro
     Ok(())
 }
 
-fn validate_segment_policy_from_header(ph: &ParsedProgramHeader) -> Result<(), ProcessLoadError> {
-    if program_header_is_write(ph) && program_header_is_execute(ph) {
-        return Err(ProcessLoadError::InvalidElf(
-            "writable executable PT_LOAD segment is not allowed",
-        ));
-    }
-
-    Ok(())
-}
-
 fn validate_segment_alignment(ph: &ProgramHeader<'_>) -> Result<(), ProcessLoadError> {
     let align = ph.align();
     if align > 1 && !align.is_power_of_two() {
@@ -2170,25 +1283,6 @@ fn validate_segment_alignment(ph: &ProgramHeader<'_>) -> Result<(), ProcessLoadE
     Ok(())
 }
 
-fn validate_segment_alignment_from_header(
-    ph: &ParsedProgramHeader,
-) -> Result<(), ProcessLoadError> {
-    let align = ph.align;
-    if align > 1 && !align.is_power_of_two() {
-        return Err(ProcessLoadError::InvalidElf(
-            "PT_LOAD alignment must be zero, one, or a power of two",
-        ));
-    }
-
-    if align > 1 && ((ph.virtual_addr ^ ph.offset) & (align - 1)) != 0 {
-        return Err(ProcessLoadError::InvalidElf(
-            "PT_LOAD virtual address and file offset are misaligned",
-        ));
-    }
-
-    Ok(())
-}
-
 fn segment_page_flags(ph: &ProgramHeader<'_>) -> PageTableFlags {
     let mut flags = PageTableFlags::empty();
     if ph.flags().is_write() {
@@ -2198,29 +1292,6 @@ fn segment_page_flags(ph: &ProgramHeader<'_>) -> PageTableFlags {
         flags |= PageTableFlags::NO_EXECUTE;
     }
     flags
-}
-
-fn segment_page_flags_from_header(ph: &ParsedProgramHeader) -> PageTableFlags {
-    let mut flags = PageTableFlags::empty();
-    if program_header_is_write(ph) {
-        flags |= PageTableFlags::WRITABLE;
-    }
-    if !program_header_is_execute(ph) {
-        flags |= PageTableFlags::NO_EXECUTE;
-    }
-    flags
-}
-
-fn program_header_is_read(ph: &ParsedProgramHeader) -> bool {
-    ph.flags & objelf::PF_R != 0
-}
-
-fn program_header_is_write(ph: &ParsedProgramHeader) -> bool {
-    ph.flags & objelf::PF_W != 0
-}
-
-fn program_header_is_execute(ph: &ParsedProgramHeader) -> bool {
-    ph.flags & objelf::PF_X != 0
 }
 
 fn read_raw_elf_header(image: &[u8]) -> Result<RawElfHeader<LittleEndian>, ProcessLoadError> {

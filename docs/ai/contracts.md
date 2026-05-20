@@ -120,7 +120,9 @@ Kernel/userspace ABI:
   and later lookups fail closed. `syscalld` is service id 1, `vfsd` is service
   id 2, `netd` is service id 3, `devmgrd` is service id 4, `driverd` is
   service id 5, `loaderd` is service id 6, `storaged` is service id 7,
-  `inputd` is service id 8, and `procd` is service id 9. File/path
+  `inputd` is service id 8, `procd` is service id 9, `rootd` supervisor is
+  service id 10, `sessiond` is reserved as service id 11, `pagerd` as service
+  id 12, and non-`.ko` service-driver coordination as service id 13. File/path
   Linux syscall policy should route to `vfsd`; AF_UNIX and socket control policy should route to
   `netd`; device open/ioctl policy should route to `devmgrd`; module
   autoload/provider policy belongs in `driverd`; executable format and launch
@@ -138,7 +140,10 @@ Kernel/userspace ABI:
   `IPC_SERVICE_CAP_VFS_POLICY`, `IPC_SERVICE_CAP_NET_POLICY`,
   `IPC_SERVICE_CAP_DEVICE_POLICY`, `IPC_SERVICE_CAP_DRIVER_POLICY`,
   `IPC_SERVICE_CAP_PROCESS_LOADER`, `IPC_SERVICE_CAP_STORAGE_POLICY`,
-  `IPC_SERVICE_CAP_INPUT_POLICY`, and `IPC_SERVICE_CAP_PROCESS_POLICY`.
+  `IPC_SERVICE_CAP_INPUT_POLICY`, `IPC_SERVICE_CAP_PROCESS_POLICY`,
+  `IPC_SERVICE_CAP_ROOT_SUPERVISOR`, `IPC_SERVICE_CAP_SESSION_POLICY`,
+  `IPC_SERVICE_CAP_PAGER_POLICY`, and
+  `IPC_SERVICE_CAP_SERVICE_DRIVER_POLICY`.
   `procd` owns process/thread namespace policy for Linux `execve`,
   process-copy `fork`/`clone`, `wait4`, `rt_sigaction`, `rt_sigprocmask`,
   `sigaltstack`, `tgkill`, and signal selection. Kernel code must keep only
@@ -150,7 +155,9 @@ Kernel/userspace ABI:
   with `BufferTooSmall` when a queued message or reply contains transferred
   handles, so older paths do not silently drop capabilities. Transferred handles
   require an explicit nonzero transfer ticket and rights whose
-  `HandleRights::allows_transfer()` is true.
+  `HandleRights::allows_transfer()` is true. Supervisor-style services that
+  must keep polling independent brokers must use `SYS_RUSTOS_IPC_TRY_RECV`
+  rather than blocking `SYS_RUSTOS_IPC_RECV` in their main ownership loop.
 - Process FD tables expose transfer only through
   `kernel_ps::api::TransferredHandleEntry` and `HandleTable::{duplicate_for_transfer,
   install_transferred}`. Export requires the source handle class and rights to
@@ -179,21 +186,28 @@ Kernel/userspace ABI:
   `IPC_SERVICE_STORAGED`. It calls the gated `SYS_RUSTOS_STORAGE_LIST_BROKER`
   primitive, which is authorized only by `IPC_SERVICE_CAP_STORAGE_POLICY`, to
   enumerate kernel-discovered storage descriptors without exposing direct
-  generic-app storage probing.
-- `inputd` owns input queue observability and input-read authorization policy
-  after it registers `IPC_SERVICE_INPUTD`. Kernel Linux input reads call
-  `InputdIpcRequest` / `InputdIpcResponse` with
-  `INPUTD_IPC_OP_AUTHORIZE_READ`; `inputd` approves the access class and
-  maximum read size, then ring0 performs only the current-process
-  user-copy/device data path. `inputd` also calls the gated
-  `SYS_RUSTOS_INPUT_STATS_BROKER` primitive, authorized only by
-  `IPC_SERVICE_CAP_INPUT_POLICY`, to inspect kernel input queue counters while
-  the remaining event queue is being evacuated.
+  generic-app storage probing. `StoragedRequest`/`StoragedResponse` also expose
+  `STORAGED_OP_ROOT_STATUS` and `STORAGED_OP_BOOT_EXTENT_LOOKUP`; the matching
+  `SYS_RUSTOS_BOOT_EXTENT_BROKER` stays a gated early/bootstrap read lease
+  primitive. When a path is present in the staged root-file extent registry,
+  the broker must return `BootExtentLeaseWire.extents[]`, `extent_count`, and a
+  nonzero `hash_or_generation`; metadata-only fallback is only for paths whose
+  extents have not yet been staged.
+- `inputd` owns input ingest draining and input-read payload policy after it
+  registers `IPC_SERVICE_INPUTD`. Kernel Linux input reads call
+  `InputdIpcRequest` with `INPUTD_IPC_OP_READ`; `inputd` drains raw reports via
+  the gated `SYS_RUSTOS_INPUT_INGEST_BROKER`, chooses native or evdev bytes,
+  and returns a bounded `InputdReadResponse` payload capped at 32 KiB. Ring0
+  performs only current-process user-copy of the service-returned bytes.
+  `INPUTD_IPC_OP_AUTHORIZE_READ` and `SYS_RUSTOS_INPUT_STATS_BROKER` remain
+  compatibility/observability surfaces while the remaining event queue is being
+  evacuated.
 - Linux `openat` installs `KernelHandle::RemoteVfs` for regular files and
-  directories after `vfsd` registration. Device paths remain kernel device
-  handles through the device broker path until `devmgrd` device-open transfer is
-  complete. Policy services may still use the bootstrap VFS path to avoid
-  recursive self-IPC during service startup. Before `vfsd` registers its
+  directories after `vfsd` registration. Explicit device paths route to
+  `devmgrd` `DEVMGRD_IPC_OP_OPEN`; `devmgrd` calls
+  `SYS_RUSTOS_DEVICE_OPEN_BROKER` and replies with the transferred device fd.
+  Policy services may still use the bootstrap VFS path to avoid recursive
+  self-IPC during service startup. Before `vfsd` registers its
   endpoint, the gated bootstrap VFS broker remains available for service
   dynamic-loader bootstrap; after registration, generic Linux app VFS syscalls
   must route to `vfsd` or fail closed if `vfsd` is unavailable.
@@ -226,9 +240,12 @@ Kernel/userspace ABI:
   owns `IPC_SERVICE_CAP_PROCESS_LOADER`. `SYS_RUSTOS_SPAWN_EXEC` is restricted
   to `rootd` spawning the fixed bootstrap service allowlist
   (`syscalld`, `vfsd`, `loaderd`, `procd`, `initd`) and must fail closed for
-  `initd`, generic apps, and service restarts. Core-service supervision after
-  bootstrap needs an explicit `rootd`/supervisor contract, not a broader kernel
-  spawn fallback.
+  `initd`, generic apps, and broad service restarts. `rootd` may use this
+  direct spawn primitive only during fixed bootstrap and for `loaderd` recovery;
+  post-bootstrap restarts of other leases must call `loaderd`. `rootd` stays
+  resident as `IPC_SERVICE_ROOTD`, serves `ROOTD_IPC_OP_STATUS` and
+  `ROOTD_IPC_OP_LEASE_LIST`, and tracks `CoreServiceLeaseWire` state from the
+  gated `SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER`.
 - Process broker sessions start with `SYS_RUSTOS_PROC_PREPARE_BROKER` using
   `PROC_BROKER_ABI_VERSION` and an explicit executable format
   (`PROC_BROKER_FORMAT_ELF64` or `PROC_BROKER_FORMAT_PE64`). The returned
@@ -312,6 +329,19 @@ Kernel/userspace ABI:
   `DEVMGRD_IPC_OP_READDIR`. `vfsd` may mirror explicit nodes (`console0`,
   `display0`, `input0`, `input/event0`, `dri/card0`) only as a pre-devmgrd
   bootstrap fallback; do not reintroduce a wildcard `/dev/*` success path.
+  Device-open policy uses `DevmgrdDeviceOpenRequest` /
+  `DevmgrdDeviceOpenResponse`; the kernel broker accepts only typed
+  `DeviceId + access + rights` and must not infer policy from paths. The
+  broker must install the returned device fd with the exact reduced
+  `DeviceHandleRights` chosen by `devmgrd`, not the default native-device
+  rights.
+- Commercial-max protocol prework lives in
+  `rustos-user-abi::syscall::CommercialMaxProtocol*`. It reserves versioned
+  protocol ids and op ids for rootd supervisor, procd, loaderd, syscalld, vfsd,
+  devmgrd, inputd, storaged, netd, driverd, sessiond, pagerd, service-driver,
+  and capability-lease work. These structs are shared ABI scaffolding only;
+  ring0 still exposes new privileged actions only when a narrow broker is
+  implemented and capability-gated.
 - `syscalld` keeps the service-side Linux policy DB for per-process credentials
   and `RLIMIT_STACK`. Linux-visible `get*id`, `set*id`, and `prlimit64` policy
   must be sourced from `syscalld`; kernel process credentials are a gated

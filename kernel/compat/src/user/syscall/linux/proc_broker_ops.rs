@@ -24,9 +24,8 @@ use rustos_user_abi::syscall::{
     RustosProcAuthorizeExecBrokerArgs, RustosProcCancelExecBrokerArgs, RustosProcCommitBrokerArgs,
     RustosProcExecTargetBrokerArgs, RustosProcForkBrokerArgs, RustosProcMapDataBrokerArgs,
     RustosProcMapFileBatchBrokerArgs, RustosProcMapFileBrokerArgs, RustosProcMapZeroedBrokerArgs,
-    RustosProcPrepareBrokerArgs, RustosProcSetImageBlobBrokerArgs,
-    RustosProcSetLinuxRuntimeBrokerArgs, RustosProcSetWindowsRuntimeBrokerArgs,
-    RustosProcSignalQueueBrokerArgs, RustosUserRegisters,
+    RustosProcPrepareBrokerArgs, RustosProcSetLinuxRuntimeBrokerArgs,
+    RustosProcSetWindowsRuntimeBrokerArgs, RustosProcSignalQueueBrokerArgs, RustosUserRegisters,
 };
 use spin::Mutex;
 
@@ -35,7 +34,6 @@ const SPAWN_FLAG_LOGICAL_ADMIN: u64 = 1;
 const MAX_PROC_PREPARES: usize = 128;
 const MAX_MAPPINGS_PER_PREPARE: usize = 4096;
 const MAX_EXEC_TICKETS: usize = 128;
-const MAX_PROC_IMAGE_BLOB_BYTES: usize = 64 * 1024 * 1024;
 const FILE_COPY_CHUNK: usize = 64 * 1024;
 
 static NEXT_PREPARE_HANDLE: AtomicU64 = AtomicU64::new(1);
@@ -84,7 +82,6 @@ struct ProcPrepareState {
     format: u16,
     mappings: Vec<MappingEntry>,
     windows_runtime: Option<crate::user::process::WindowsProcessLoaderRuntime>,
-    image_blob: Option<Vec<u8>>,
     linux_runtime: Option<(crate::user::linux::LinuxProcessImageInfo, u64)>,
 }
 
@@ -135,7 +132,6 @@ pub(super) fn syscall_linux_rustos_proc_prepare_broker(args_ptr: u64) -> u64 {
             format: args.format,
             mappings: Vec::new(),
             windows_runtime: None,
-            image_blob: None,
             linux_runtime: None,
         },
     );
@@ -372,54 +368,6 @@ pub(super) fn syscall_linux_rustos_proc_map_data_broker(args_ptr: u64) -> u64 {
     0
 }
 
-pub(super) fn syscall_linux_rustos_proc_set_image_blob_broker(args_ptr: u64) -> u64 {
-    if !current_process_can_load() {
-        return linux_errno(LINUX_EPERM);
-    }
-    let args = match usermem::read_current_user_struct::<RustosProcSetImageBlobBrokerArgs>(args_ptr)
-    {
-        Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
-    };
-    let total_len = match usize::try_from(args.total_len) {
-        Ok(len) if len != 0 && len <= MAX_PROC_IMAGE_BLOB_BYTES => len,
-        _ => return linux_errno(LINUX_EINVAL),
-    };
-    let data_offset = match usize::try_from(args.data_offset) {
-        Ok(offset) => offset,
-        Err(_) => return linux_errno(LINUX_EINVAL),
-    };
-    let data_len = args.data_len as usize;
-    if args.abi_version != PROC_BROKER_ABI_VERSION
-        || args.reserved0 != 0
-        || data_len > args.data.len()
-        || data_offset
-            .checked_add(data_len)
-            .is_none_or(|end| end > total_len)
-    {
-        return linux_errno(LINUX_EINVAL);
-    }
-
-    let mut prepares = PROC_PREPARES.lock();
-    let Some(state) = prepares.get_mut(&args.prepare_handle) else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    if !prepare_owned_by_current(state) {
-        return linux_errno(LINUX_EPERM);
-    }
-    if state.format != PROC_BROKER_FORMAT_ELF64 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let blob = state
-        .image_blob
-        .get_or_insert_with(|| alloc::vec![0_u8; total_len]);
-    if blob.len() != total_len {
-        return linux_errno(LINUX_EINVAL);
-    }
-    blob[data_offset..data_offset + data_len].copy_from_slice(&args.data[..data_len]);
-    0
-}
-
 pub(super) fn syscall_linux_rustos_proc_set_windows_runtime_broker(args_ptr: u64) -> u64 {
     if !current_process_can_load() {
         return linux_errno(LINUX_EPERM);
@@ -480,7 +428,6 @@ pub(super) fn syscall_linux_rustos_proc_set_windows_runtime_broker(args_ptr: u64
     }
     state.windows_runtime = Some(crate::user::process::WindowsProcessLoaderRuntime {
         entry_point: args.entry_point,
-        teb_address: args.teb_address,
         runtime: crate::user::process_state::WindowsProcessRuntimeState {
             image_base: args.image_base,
             image_size: args.image_size,
@@ -604,34 +551,23 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
     };
     let prepared = match state.format {
         PROC_BROKER_FORMAT_ELF64 => {
-            if let Some((info, actual_entry)) = state.linux_runtime {
-                match crate::user::process::prepare_linux_process_with_metadata(
-                    info,
-                    actual_entry,
-                    address_space,
-                    crate::user::process::ProcessLaunchOptions {
-                        linux: linux_launch,
-                        ..launch
-                    },
-                ) {
-                    Ok(prepared) => prepared,
-                    Err(err) => return linux_errno(process_load_error_to_linux_errno(err)),
-                }
-            } else {
-                let Some(image_blob) = state.image_blob.as_deref() else {
-                    return linux_errno(LINUX_EINVAL);
-                };
-                match crate::user::process::prepare_process_with_address_space(
-                    image_blob,
-                    address_space,
-                    crate::user::process::ProcessLaunchOptions {
-                        linux: linux_launch,
-                        ..launch
-                    },
-                ) {
-                    Ok(prepared) => prepared,
-                    Err(err) => return linux_errno(process_load_error_to_linux_errno(err)),
-                }
+            // loaderd always populates `linux_runtime` before issuing commit;
+            // the bytes-image fallback that used to call into ring0 ELF parsing
+            // was retired with the PE bytes path on 2026-05-20.
+            let Some((info, actual_entry)) = state.linux_runtime else {
+                return linux_errno(LINUX_EINVAL);
+            };
+            match crate::user::process::prepare_linux_process_with_metadata(
+                info,
+                actual_entry,
+                address_space,
+                crate::user::process::ProcessLaunchOptions {
+                    linux: linux_launch,
+                    ..launch
+                },
+            ) {
+                Ok(prepared) => prepared,
+                Err(err) => return linux_errno(process_load_error_to_linux_errno(err)),
             }
         }
         PROC_BROKER_FORMAT_PE64 => {
@@ -799,34 +735,22 @@ pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64
         logical_admin,
         ..crate::user::process::ProcessLaunchOptions::default()
     };
-    let prepared = if let Some((info, actual_entry)) = state.linux_runtime {
-        match crate::user::process::prepare_linux_process_with_metadata(
-            info,
-            actual_entry,
-            address_space,
-            crate::user::process::ProcessLaunchOptions {
-                linux: linux_launch,
-                ..launch
-            },
-        ) {
-            Ok(prepared) => prepared,
-            Err(err) => return linux_errno(process_load_error_to_linux_errno(err)),
-        }
-    } else {
-        let Some(image_blob) = state.image_blob.as_deref() else {
-            return linux_errno(LINUX_EINVAL);
-        };
-        match crate::user::process::prepare_process_with_address_space(
-            image_blob,
-            address_space,
-            crate::user::process::ProcessLaunchOptions {
-                linux: linux_launch,
-                ..launch
-            },
-        ) {
-            Ok(prepared) => prepared,
-            Err(err) => return linux_errno(process_load_error_to_linux_errno(err)),
-        }
+    // Same loaderd contract as prepare: linux_runtime must be populated; the
+    // bytes-image fallback into ring0 ELF parsing was retired.
+    let Some((info, actual_entry)) = state.linux_runtime else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    let prepared = match crate::user::process::prepare_linux_process_with_metadata(
+        info,
+        actual_entry,
+        address_space,
+        crate::user::process::ProcessLaunchOptions {
+            linux: linux_launch,
+            ..launch
+        },
+    ) {
+        Ok(prepared) => prepared,
+        Err(err) => return linux_errno(process_load_error_to_linux_errno(err)),
     };
     let transition = exec_transition_from_prepared(args.target_pid, args.target_tid, &prepared);
     if multitask::exec_user_process_by_pid(

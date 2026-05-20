@@ -36,7 +36,7 @@ const DISPLAY_CRITICAL_TASK_WEIGHT_MICROS: u64 = 2_000;
 // no longer starves on round-robin scheduling, so the defer dominates total
 // boot time (~6s of dead air post-runtimed). 750ms keeps a small ordering gap
 // after the UI is reachable without spending the entire boot budget on it.
-const SECONDARY_SERVICE_DEFER_AFTER_RUNTIMED: Duration = Duration::ZERO;
+const SECONDARY_SERVICE_DEFER_AFTER_RUNTIMED: Duration = Duration::from_millis(750);
 static LOADER_ENDPOINT_CACHE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -173,9 +173,7 @@ fn secondary_service_deferred(exec: &str, now: Instant, deadline: Option<Instant
         return false;
     }
     match exec {
-        INPUTD_EXEC_PATH | STORAGED_EXEC_PATH => {
-            deadline.is_none_or(|defer_until| now < defer_until)
-        }
+        STORAGED_EXEC_PATH => deadline.is_none_or(|defer_until| now < defer_until),
         _ => false,
     }
 }
@@ -279,6 +277,7 @@ fn launch_gate_satisfied(exec: &str) -> bool {
             foundation_policy_services_ready()
                 && service_ready(IPC_SERVICE_NETD)
                 && service_ready(rustos_user_abi::syscall::IPC_SERVICE_DEVMGRD)
+                && service_ready(rustos_user_abi::syscall::IPC_SERVICE_INPUTD)
         }
         _ => foundation_policy_services_ready(),
     }

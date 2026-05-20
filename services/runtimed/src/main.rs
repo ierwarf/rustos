@@ -21,9 +21,10 @@ use rustos_user_abi::console::{
     ConsoleSetFocusRequest, ConsoleSetSessionStateRequest,
 };
 use rustos_user_abi::syscall::{
-    LoaderSpawnRequest, LoaderSpawnResponse, IPC_SERVICE_LOADERD, LOADER_OP_SPAWN_EXEC,
-    LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES,
-    LOADER_SPAWN_EXEC_PATH_CAPACITY, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
+    LoaderSpawnRequest, LoaderSpawnResponse, IPC_SERVICE_DEVMGRD, IPC_SERVICE_LOADERD,
+    LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
+    LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, SYS_RUSTOS_IPC_CALL,
+    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
 };
 
 const DEFAULT_USER_TASK_WEIGHT_MICROS: u64 = 100;
@@ -52,6 +53,8 @@ const SYS_IOCTL: usize = 16;
 const SYS_OPENAT: usize = 257;
 const AT_FDCWD: isize = -100;
 const O_RDWR: usize = 2;
+const DEVMGRD_BOOTSTRAP_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const SERVICE_ENDPOINT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CONSOLE_SESSION_STATE_LOADING_IMAGE: u16 = console_abi::CONSOLE_SESSION_STATE_LOADING_IMAGE;
 const CONSOLE_SESSION_STATE_SPAWNING: u16 = console_abi::CONSOLE_SESSION_STATE_SPAWNING;
 const CONSOLE_SESSION_STATE_RUNNING: u16 = console_abi::CONSOLE_SESSION_STATE_RUNNING;
@@ -273,6 +276,8 @@ fn receive_launch_catalog(state: &mut BrokerState, receiver: &Receiver<LaunchCat
 }
 
 fn bootstrap_ui_server(state: &mut BrokerState) -> Result<(), i32> {
+    boot_line("runtimed: waiting for devmgrd before ui bootstrap");
+    wait_for_service_endpoint(IPC_SERVICE_DEVMGRD, DEVMGRD_BOOTSTRAP_WAIT_TIMEOUT)?;
     let (args, env) = ui_server_bootstrap_args_env();
     spawn_tracked_process(
         state,
@@ -290,6 +295,19 @@ fn bootstrap_ui_server(state: &mut BrokerState) -> Result<(), i32> {
             env,
         },
     )
+}
+
+fn wait_for_service_endpoint(service_id: u64, timeout: Duration) -> Result<(), i32> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if lookup_service_endpoint(service_id) > 0 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(libc::ETIMEDOUT);
+        }
+        thread::sleep(SERVICE_ENDPOINT_POLL_INTERVAL);
+    }
 }
 
 fn ui_server_bootstrap_args_env() -> (Vec<String>, Vec<String>) {
