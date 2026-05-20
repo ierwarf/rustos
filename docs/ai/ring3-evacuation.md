@@ -88,11 +88,9 @@ privilege substrate, not a policy owner.
 
 2. Input event queue ownership:
    - Current source: `kernel/io-manager/src/input/event_queue.rs` owns
-     `INPUT_EVENTS` under an IRQ-off spinlock, and
-     `kernel/io-manager/src/io/device/input.rs` still translates and
-     read-copies events to user buffers. Linux input reads now ask `inputd` for
-     `INPUTD_IPC_OP_AUTHORIZE_READ` before the ring0 user-copy/device broker
-     drains the remaining kernel queue.
+     `INPUT_EVENTS` under an IRQ-off spinlock. Linux input reads now call
+     `inputd` for `INPUTD_IPC_OP_READ`; ring0 only copies the service-returned
+     payload into the current process.
    - Completed (2026-05-20): evdev translation, key-code mapping, pointer
      button mapping, and stable input ABI structs moved to the
      `drivers/libs/input-evdev` shared crate so the kernel broker and `inputd`
@@ -101,6 +99,12 @@ privilege substrate, not a policy owner.
      `inputd` for `INPUTD_IPC_OP_AUTHORIZE_READ`; `inputd` owns native/evdev
      read byte limits via the shared `input-evdev` constants before the ring0
      current-process user-copy broker drains the remaining kernel queue.
+   - Completed: the stale direct `kernel/io-manager/src/io/device/input.rs`
+     read-copy broker and `service_ops` input-read migration marker were
+     removed; input device reads are service-owned through `inputd`.
+   - Completed: `inputd` now owns a bounded reader queue and lossy overflow
+     accounting after draining the ring0 ingress broker; exported stats combine
+     the remaining kernel ingress counters with service queue depth/drop state.
    - Target: `inputd` owns event queue policy, overflow behavior, readers, and
      observability. Ring0 should enqueue validated hardware reports into a
      bounded shared ring, wake the target, and retain only user-copy/broker
@@ -133,6 +137,10 @@ privilege substrate, not a policy owner.
    - Completed: device-open capability transfer is live through `devmgrd`
      `DEVMGRD_IPC_OP_OPEN` plus `SYS_RUSTOS_DEVICE_OPEN_BROKER`; the broker
      installs the fd with the exact reduced rights selected by `devmgrd`.
+   - Completed: policy-owned display/console ioctl routing now uses the
+     explicit `DEVMGRD_IPC_OP_IOCTL_AUTHORIZE` protocol; `devmgrd` validates
+     the ioctl allowlist before invoking the gated ring0 ioctl broker, and the
+     old generic syscall-offload ioctl path was removed from `devmgrd`.
 
 5. Driver bootstrap policy leftovers:
    - Current source: `kernel/io-manager/src/driver/mod.rs` still has
@@ -154,6 +162,10 @@ privilege substrate, not a policy owner.
    - Completed: `STORAGED_OP_BOOT_EXTENT_LOOKUP` now returns registry-backed
      boot extent leases with extents and generation when staged extents exist;
      metadata-only fallback remains for unstaged paths.
+   - Completed: `storaged` now reads and parses
+     `system/registry/kernel/root-file-extents.tsv` itself for
+     `STORAGED_OP_BOOT_EXTENT_LOOKUP` before falling back to the gated kernel
+     broker, so post-bootstrap extent lookup policy starts in the service.
    - Remaining target: `storaged` owns inventory, partition policy, root
      selection, and mount candidate ordering after bootstrap. Kernel keeps block
      hardware drivers and the gated boot/block read broker for `vfsd` and early

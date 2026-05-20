@@ -38,92 +38,6 @@ impl From<paging::AddressSpaceError> for DeviceSysopError {
     }
 }
 
-#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
-pub(crate) fn read_current_process_handle(
-    fd: u64,
-    user_ptr: u64,
-    user_len: u64,
-) -> Result<usize, DeviceSysopError> {
-    let user_len = usize::try_from(user_len).map_err(|_| DeviceSysopError::InvalidArgument)?;
-    if user_len == 0 {
-        return Ok(0);
-    }
-
-    let Some(handle) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
-        process_state.handles().get(fd).cloned()
-    }) else {
-        return Err(DeviceSysopError::Unsupported);
-    };
-
-    if let Some(device_handle) = handle.as_ref().and_then(KernelHandle::device_handle) {
-        let device_id = device_handle.device_id();
-        let result = device_ns::read_to_current_user(device_handle, user_ptr, user_len)
-            .map_err(map_device_error);
-        if matches!(result, Err(DeviceSysopError::Unsupported)) {
-            crate::debug::println!(
-                "device read unsupported: fd={} device={:?} user_ptr={:#x} len={}",
-                fd,
-                device_id,
-                user_ptr,
-                user_len,
-            );
-        }
-        return result;
-    }
-
-    // Carry debug context out of the closure so we never call debug::println!
-    // while holding the process-state lock (port I/O causes VMExits).
-    enum ReadDiag {
-        UnsupportedDevice(device_ns::DeviceId),
-        WrongHandle(&'static str),
-    }
-
-    let Some((result, diag)) =
-        multitask::with_current_user_process_state_mut(|_, _, process_state| {
-            match process_state.handles().get(fd) {
-                Some(handle) if handle.device_handle().is_some() => {
-                    let device_handle = handle.device_handle().expect("checked above");
-                    let device_id = device_handle.device_id();
-                    let result =
-                        device_ns::read_to_user(device_handle, process_state, user_ptr, user_len)
-                            .map_err(map_device_error);
-                    let diag = matches!(result, Err(DeviceSysopError::Unsupported))
-                        .then_some(ReadDiag::UnsupportedDevice(device_id));
-                    (result, diag)
-                }
-                Some(handle) => (
-                    Err(DeviceSysopError::Unsupported),
-                    Some(ReadDiag::WrongHandle(handle.kind_name())),
-                ),
-                None => (Err(DeviceSysopError::BadFileDescriptor), None),
-            }
-        })
-    else {
-        return Err(DeviceSysopError::Unsupported);
-    };
-
-    if let Some(diag) = diag {
-        match diag {
-            ReadDiag::UnsupportedDevice(device_id) => crate::debug::println!(
-                "device read unsupported: fd={} device={:?} user_ptr={:#x} len={}",
-                fd,
-                device_id,
-                user_ptr,
-                user_len,
-            ),
-            ReadDiag::WrongHandle(kind_name) => crate::debug::println!(
-                "device read wrong-handle: fd={} handle={} user_ptr={:#x} len={}",
-                fd,
-                kind_name,
-                user_ptr,
-                user_len,
-            ),
-        }
-    }
-
-    result
-}
-
 pub(crate) fn ioctl_current_process_device_handle(
     device_handle: device_ns::DeviceHandle,
     request: u64,
@@ -156,8 +70,8 @@ pub(crate) fn ioctl_process_device_handle(
 
 /// Direct, no-IPC ioctl entry for the currently running user process. Used by the
 /// kernel-side fast path so userspace `ioctl(2)` does not have to round-trip through
-/// the devmgrd policy service for data-path operations (e.g. display present, input
-/// reads) where no policy decision is actually performed today.
+/// the devmgrd policy service for data-path operations (e.g. display present) where
+/// no policy decision is actually performed today.
 pub(crate) fn ioctl_current_process_fd(
     fd: u64,
     request: u64,

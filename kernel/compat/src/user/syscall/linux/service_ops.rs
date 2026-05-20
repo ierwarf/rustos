@@ -1482,9 +1482,6 @@ pub(super) fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u
     let Some(remote) = current_remote_vfs_handle(fd) else {
         return linux_errno(LINUX_EBADF);
     };
-    // RING3-MIGRATION-REFERENCE START: inputd/devmgrd should own input-device
-    // read routing and reader policy. Ring0 should only perform the authorized
-    // current-process copy from a service-owned queue.
     if remote.kind() == multitask::RemoteVfsHandleKind::Device
         && matches!(remote.path().as_str(), "/dev/input0" | "/dev/input/event0")
     {
@@ -1496,7 +1493,6 @@ pub(super) fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u
         };
         return read_input_device_via_inputd(fd, user_ptr, user_len, inputd_access);
     }
-    // RING3-MIGRATION-REFERENCE END: inputd/devmgrd-owned input read route.
     let Ok(user_len) = usize::try_from(user_len) else {
         return linux_errno(LINUX_EINVAL);
     };
@@ -2965,22 +2961,9 @@ pub(super) fn syscall_linux_vfs_umount2(target_ptr: u64, flags: u64) -> u64 {
     }
 }
 
-// RING3-MIGRATION-REFERENCE START: devmgrd should own ioctl authorization and
-// per-device policy. Ring0 keeps the current-process user-copy/device broker
-// after devmgrd authorizes the operation.
 pub(super) fn syscall_linux_ioctl(fd: u64, request_number: u64, arg: u64) -> u64 {
     if ioctl_requires_devmgrd_policy(request_number) {
-        let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_IOCTL);
-        request.dirfd = fd;
-        request.flags = request_number;
-        request.arg1 = arg;
-        match call_service_offload_request(IPC_SERVICE_DEVMGRD, &request).and_then(|response| {
-            ensure_service_response(&response, SYSCALL_OFFLOAD_OP_LINUX_IOCTL)?;
-            ensure_syscalld_payload(&response, size_of::<u64>())?;
-            let mut bytes = [0_u8; size_of::<u64>()];
-            bytes.copy_from_slice(&response.payload[..size_of::<u64>()]);
-            Ok(u64::from_le_bytes(bytes))
-        }) {
+        match ioctl_device_via_devmgrd(fd, request_number, arg) {
             Ok(value) => return value,
             Err(_) if !ipc_ops::service_registered(linux_abi::IPC_SERVICE_DEVMGRD) => {}
             Err(errno) => return linux_errno(errno),
@@ -3016,7 +2999,6 @@ fn ioctl_requires_devmgrd_policy(request_number: u64) -> bool {
                                                                         // no-op forwarder for this ioctl; go direct to avoid IPC cost.
     )
 }
-// RING3-MIGRATION-REFERENCE END: devmgrd-owned ioctl policy bypass.
 
 pub(super) fn syscall_linux_net4(op: u16, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
     syscall_linux_net6(op, arg0, arg1, arg2, arg3, 0, 0)
@@ -3050,9 +3032,6 @@ pub(super) fn syscall_linux_net6(
     }
 }
 
-// RING3-MIGRATION-REFERENCE START: rootd/supervisor should own bootstrap
-// service supervision, restart policy, dependency waits, and retry budgets.
-// Ring0 keeps fixed early spawn primitives only.
 pub(super) fn syscall_linux_loader_spawn_exec(
     path_ptr: u64,
     _argv_ptr: u64,
@@ -3147,7 +3126,6 @@ fn console_host_error_to_linux_errno(error: crate::user::console_host::ConsoleHo
         crate::user::console_host::ConsoleHostError::Spawn { .. } => LINUX_ENOEXEC,
     }
 }
-// RING3-MIGRATION-REFERENCE END: rootd/supervisor-owned bootstrap spawn policy.
 
 pub(super) fn copy_string_vector(
     vector_ptr: u64,
@@ -3583,6 +3561,53 @@ fn open_device_via_devmgrd(path: &str, flags: u64) -> Result<u64, i64> {
         return Err(LINUX_EINVAL);
     };
     Ok(fd)
+}
+
+fn ioctl_device_via_devmgrd(fd: u64, request_number: u64, arg: u64) -> Result<u64, i64> {
+    let mut request = DevmgrdDeviceIoctlRequest {
+        version: rustos_user_abi::syscall::DEVMGRD_IPC_ABI_VERSION,
+        op: rustos_user_abi::syscall::DEVMGRD_IPC_OP_IOCTL_AUTHORIZE,
+        fd,
+        request: request_number,
+        arg,
+        ..DevmgrdDeviceIoctlRequest::default()
+    };
+    if let Some(snapshot) = multitask::current_user_snapshot() {
+        request.pid = snapshot.process_id();
+        request.tid = snapshot.thread_id();
+        request.session_handle = snapshot.console_session().raw();
+    }
+    if let Some(security) = multitask::with_current_process_credentials(|security| security) {
+        request.uid = security.uid();
+        request.gid = security.gid();
+        request.euid = security.euid();
+        request.egid = security.egid();
+    }
+    let start_ticks = crate::arch::rtc::ticks();
+    let response = ipc_ops::call_service_endpoint(IPC_SERVICE_DEVMGRD, as_bytes(&request))?;
+    log_slow_service_call(
+        "devmgrd",
+        request.op,
+        ticks_elapsed_ms(start_ticks, crate::arch::rtc::ticks()),
+        request.pid,
+        request.tid,
+        response.len() as i64,
+        None,
+    );
+    if response.len() != size_of::<DevmgrdDeviceIoctlResponse>() {
+        return Err(LINUX_EINVAL);
+    }
+    let response = read_unaligned::<DevmgrdDeviceIoctlResponse>(response.as_slice());
+    if response.version != rustos_user_abi::syscall::DEVMGRD_IPC_ABI_VERSION
+        || response.op != rustos_user_abi::syscall::DEVMGRD_IPC_OP_IOCTL_AUTHORIZE
+        || response.reserved0 != 0
+    {
+        return Err(LINUX_EINVAL);
+    }
+    if response.status != 0 {
+        return Err(response.status.unsigned_abs() as i64);
+    }
+    Ok(response.value)
 }
 
 pub(super) fn call_inputd_read_request(

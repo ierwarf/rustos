@@ -1126,6 +1126,56 @@ pub mod syscall {
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct DevmgrdDeviceIoctlRequest {
+        pub version: u16,
+        pub op: u16,
+        pub flags: u32,
+        pub pid: u64,
+        pub tid: u64,
+        pub session_handle: u64,
+        pub uid: u32,
+        pub gid: u32,
+        pub euid: u32,
+        pub egid: u32,
+        pub fd: u64,
+        pub request: u64,
+        pub arg: u64,
+        pub reserved0: u64,
+    }
+
+    impl Default for DevmgrdDeviceIoctlRequest {
+        fn default() -> Self {
+            Self {
+                version: DEVMGRD_IPC_ABI_VERSION,
+                op: DEVMGRD_IPC_OP_IOCTL_AUTHORIZE,
+                flags: 0,
+                pid: 0,
+                tid: 0,
+                session_handle: 0,
+                uid: 0,
+                gid: 0,
+                euid: 0,
+                egid: 0,
+                fd: 0,
+                request: 0,
+                arg: 0,
+                reserved0: 0,
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct DevmgrdDeviceIoctlResponse {
+        pub version: u16,
+        pub op: u16,
+        pub status: i32,
+        pub value: u64,
+        pub reserved0: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub struct CoreServiceLeaseWire {
         pub service_id: u64,
         pub pid: u64,
@@ -2535,6 +2585,8 @@ mod tests {
 
         assert!(size_of::<syscall::DevmgrdDeviceOpenRequest>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert!(size_of::<syscall::DevmgrdDeviceOpenResponse>() <= syscall::IPC_MAX_INLINE_BYTES);
+        assert!(size_of::<syscall::DevmgrdDeviceIoctlRequest>() <= syscall::IPC_MAX_INLINE_BYTES);
+        assert!(size_of::<syscall::DevmgrdDeviceIoctlResponse>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert!(size_of::<syscall::InputIngestBrokerArgs>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert!(size_of::<syscall::InputdReadResponse>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert!(size_of::<syscall::RootdIpcRequest>() <= syscall::IPC_MAX_INLINE_BYTES);

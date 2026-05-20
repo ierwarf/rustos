@@ -157,41 +157,6 @@ impl From<paging::AddressSpaceError> for DeviceError {
     }
 }
 
-// RING3-MIGRATION-REFERENCE START: devmgrd owns the `/dev` namespace and
-// device-open policy; ring0 keeps only the typed user-copy/ioctl brokers that
-// devmgrd dispatches against. The namespace lookup helpers (descriptors,
-// open, normalize_device_path) and the hard-coded DEVICE_DESCRIPTORS table
-// have been removed from ring0 — `vfsd` already routes `/dev` opens through
-// `devmgrd`'s registry IPC.
-pub fn read_to_user(
-    handle: DeviceHandle,
-    process_state: &mut UserProcessState,
-    user_ptr: u64,
-    user_len: usize,
-) -> Result<usize, DeviceError> {
-    match handle.device_id() {
-        DeviceId::Input => match handle.access_kind() {
-            DeviceAccessKind::Native => input::read_to_user(process_state, user_ptr, user_len),
-            DeviceAccessKind::Evdev => input::read_evdev_to_user(process_state, user_ptr, user_len),
-        },
-        DeviceId::Console | DeviceId::Display => Err(DeviceError::Unsupported),
-    }
-}
-
-pub fn read_to_current_user(
-    handle: DeviceHandle,
-    user_ptr: u64,
-    user_len: usize,
-) -> Result<usize, DeviceError> {
-    match handle.device_id() {
-        DeviceId::Input => match handle.access_kind() {
-            DeviceAccessKind::Native => input::read_to_current_user(user_ptr, user_len),
-            DeviceAccessKind::Evdev => input::read_evdev_to_current_user(user_ptr, user_len),
-        },
-        DeviceId::Console | DeviceId::Display => Err(DeviceError::Unsupported),
-    }
-}
-
 pub fn ioctl_from_user(
     handle: DeviceHandle,
     process_state: &mut UserProcessState,
@@ -227,8 +192,6 @@ pub(super) fn write_user_struct<T: Copy>(
     address_space.copy_into_user(VirtAddr::new(user_ptr), bytes)?;
     Ok(())
 }
-
-// RING3-MIGRATION-REFERENCE END: devmgrd-owned device namespace/read policy.
 
 #[cfg(test)]
 mod tests {

@@ -36,28 +36,6 @@ pub(crate) mod io {
         pub(crate) use kernel_io_manager::api::device::DeviceError;
         pub(crate) use kernel_object::api::device::{DeviceHandle, DeviceId};
 
-        pub fn read_to_current_user(
-            handle: DeviceHandle,
-            user_ptr: u64,
-            user_len: usize,
-        ) -> Result<usize, DeviceError> {
-            kernel_io_manager::api::device::read_to_current_user(handle.into(), user_ptr, user_len)
-        }
-
-        pub fn read_to_user(
-            handle: DeviceHandle,
-            process_state: &mut kernel_ps::api::process_state::UserProcessState,
-            user_ptr: u64,
-            user_len: usize,
-        ) -> Result<usize, DeviceError> {
-            kernel_io_manager::api::device::read_to_user(
-                handle.into(),
-                process_state,
-                user_ptr,
-                user_len,
-            )
-        }
-
         pub fn ioctl_from_user(
             handle: DeviceHandle,
             process_state: &mut kernel_ps::api::process_state::UserProcessState,

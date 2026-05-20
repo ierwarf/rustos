@@ -4,16 +4,18 @@ use std::thread;
 use std::time::Duration;
 
 use rustos_user_abi::syscall::{
-    BootExtentLeaseWire, RustosBootExtentBrokerArgs, StorageBlockDescriptorWire,
+    BootExtentLeaseWire, BootExtentWire, RustosBootExtentBrokerArgs, StorageBlockDescriptorWire,
     StorageListBrokerArgs, StoragedRequest, StoragedResponse, BOOT_EXTENT_FLAG_READONLY,
-    BOOT_EXTENT_PATH_CAPACITY, IPC_SERVICE_STORAGED, STORAGED_IPC_ABI_VERSION,
-    STORAGED_OP_BOOT_EXTENT_LOOKUP, STORAGED_OP_LIST_COUNT, STORAGED_OP_LIST_GET, STORAGED_OP_PING,
-    STORAGED_OP_ROOT_STATUS, STORAGE_LIST_MAX_DESCRIPTORS, SYS_RUSTOS_BOOT_EXTENT_BROKER,
-    SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV,
-    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_STORAGE_LIST_BROKER,
+    BOOT_EXTENT_MAX_EXTENTS, BOOT_EXTENT_PATH_CAPACITY, IPC_SERVICE_STORAGED,
+    STORAGED_IPC_ABI_VERSION, STORAGED_OP_BOOT_EXTENT_LOOKUP, STORAGED_OP_LIST_COUNT,
+    STORAGED_OP_LIST_GET, STORAGED_OP_PING, STORAGED_OP_ROOT_STATUS, STORAGE_LIST_MAX_DESCRIPTORS,
+    SYS_RUSTOS_BOOT_EXTENT_BROKER, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
+    SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
+    SYS_RUSTOS_STORAGE_LIST_BROKER,
 };
 
 const RECV_BACKOFF: Duration = Duration::from_millis(50);
+const ROOT_FILE_EXTENTS_REGISTRY_PATH: &str = "system/registry/kernel/root-file-extents.tsv";
 
 fn main() {
     observability_client::info!("storaged", service, "service started");
@@ -142,6 +144,9 @@ fn boot_extent_lookup(request: &StoragedRequest) -> Result<BootExtentLeaseWire, 
         ..BootExtentLeaseWire::default()
     };
     lease.path[..len].copy_from_slice(&request.path[..len]);
+    if let Some(registry_lease) = boot_extent_lookup_registry(path, &request.path[..len])? {
+        return Ok(registry_lease);
+    }
     let args = RustosBootExtentBrokerArgs {
         abi_version: STORAGED_IPC_ABI_VERSION,
         flags: 0,
@@ -158,6 +163,104 @@ fn boot_extent_lookup(request: &StoragedRequest) -> Result<BootExtentLeaseWire, 
         return Err(last_errno());
     }
     Ok(lease)
+}
+
+fn boot_extent_lookup_registry(
+    request_path: &str,
+    request_path_bytes: &[u8],
+) -> Result<Option<BootExtentLeaseWire>, i32> {
+    let Some(normalized) = normalize_extent_path(request_path) else {
+        return Err(libc::EINVAL);
+    };
+    let text = match std::fs::read_to_string(ROOT_FILE_EXTENTS_REGISTRY_PATH) {
+        Ok(text) => text,
+        Err(_) => return Ok(None),
+    };
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some(path) = registry_field(line, "path") else {
+            continue;
+        };
+        if normalize_extent_path(path) != Some(normalized) {
+            continue;
+        }
+        let len = registry_field(line, "len")
+            .ok_or(libc::EINVAL)?
+            .parse::<u64>()
+            .map_err(|_| libc::EINVAL)?;
+        let extents = parse_extent_list(registry_field(line, "extents").ok_or(libc::EINVAL)?)?;
+        if extents.len() > BOOT_EXTENT_MAX_EXTENTS {
+            return Err(libc::EOVERFLOW);
+        }
+        let mut lease = BootExtentLeaseWire {
+            path_len: request_path_bytes.len() as u32,
+            flags: BOOT_EXTENT_FLAG_READONLY,
+            file_len: len,
+            hash_or_generation: boot_extent_generation(normalized, len, &extents),
+            extent_count: extents.len() as u32,
+            ..BootExtentLeaseWire::default()
+        };
+        lease.path[..request_path_bytes.len()].copy_from_slice(request_path_bytes);
+        for (dest, src) in lease.extents.iter_mut().zip(extents.iter()) {
+            *dest = *src;
+        }
+        return Ok(Some(lease));
+    }
+    Ok(None)
+}
+
+fn normalize_extent_path(path: &str) -> Option<&str> {
+    let path = path.strip_prefix('/').unwrap_or(path);
+    (!path.is_empty() && !path.contains("..")).then_some(path)
+}
+
+fn registry_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    line.split('\t').find_map(|field| {
+        let (field_key, value) = field.split_once('=')?;
+        (field_key == key).then_some(value)
+    })
+}
+
+fn parse_extent_list(text: &str) -> Result<Vec<BootExtentWire>, i32> {
+    let mut extents = Vec::new();
+    if text.is_empty() {
+        return Ok(extents);
+    }
+    for item in text.split(',') {
+        let (offset, len) = item.split_once(':').ok_or(libc::EINVAL)?;
+        let disk_offset = offset.parse::<u64>().map_err(|_| libc::EINVAL)?;
+        let len = len.parse::<u64>().map_err(|_| libc::EINVAL)?;
+        if len != 0 {
+            extents.push(BootExtentWire { disk_offset, len });
+        }
+    }
+    Ok(extents)
+}
+
+fn boot_extent_generation(path: &str, file_len: u64, extents: &[BootExtentWire]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in path.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    for value in [file_len] {
+        for byte in value.to_le_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    for extent in extents {
+        for value in [extent.disk_offset, extent.len] {
+            for byte in value.to_le_bytes() {
+                hash ^= byte as u64;
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+    }
+    hash.max(1)
 }
 
 fn list_descriptors() -> Result<Vec<StorageBlockDescriptorWire>, i32> {

@@ -18,9 +18,38 @@ use rustos_user_abi::syscall::{
 };
 
 const RECV_BACKOFF: Duration = Duration::from_millis(50);
+const INPUTD_QUEUE_MAX_EVENTS: usize = 4096;
 const INPUTD_MAX_NATIVE_READ_BYTES: u64 = input_evdev::MAX_NATIVE_READ_BYTES as u64;
 const INPUTD_MAX_EVDEV_READ_BYTES: u64 = input_evdev::MAX_EVDEV_READ_BYTES as u64;
 static INPUT_DELIVERY_LOGGED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Default)]
+struct InputQueue {
+    events: VecDeque<input_evdev::InputEvent>,
+    dropped_lossy: u64,
+}
+
+impl InputQueue {
+    fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    fn push(&mut self, event: input_evdev::InputEvent) {
+        if self.events.len() >= INPUTD_QUEUE_MAX_EVENTS {
+            let _ = self.events.pop_front();
+            self.dropped_lossy = self.dropped_lossy.saturating_add(1);
+        }
+        self.events.push_back(event);
+    }
+
+    fn pop_front(&mut self) -> Option<input_evdev::InputEvent> {
+        self.events.pop_front()
+    }
+}
 
 fn main() {
     observability_client::info!("inputd", service, "service started");
@@ -51,7 +80,7 @@ fn main() {
 }
 
 fn serve(endpoint: u64) {
-    let mut queue = VecDeque::new();
+    let mut queue = InputQueue::default();
     loop {
         let mut request = InputdIpcRequest::default();
         let mut reply_cap = 0_u64;
@@ -108,25 +137,25 @@ fn serve(endpoint: u64) {
 fn dispatch(
     request: &InputdIpcRequest,
     response: &mut InputdIpcResponse,
-    queue: &mut VecDeque<input_evdev::InputEvent>,
+    queue: &mut InputQueue,
 ) -> i32 {
     match request.op {
         INPUTD_IPC_OP_PING => {
             response.approved_len = request.requested_len;
             0
         }
-        INPUTD_IPC_OP_STATS => match fetch_stats() {
+        INPUTD_IPC_OP_STATS => match fetch_stats(queue) {
             Ok(stats) => {
                 response.stats = stats;
                 0
             }
             Err(errno) => errno,
         },
-        INPUTD_IPC_OP_AUTHORIZE_READ => authorize_read(request, response),
+        INPUTD_IPC_OP_AUTHORIZE_READ => authorize_read(request, response, queue),
         INPUTD_IPC_OP_DRAIN_INGEST => match drain_ingest(queue) {
             Ok(count) => {
                 response.approved_len = count as u64;
-                match fetch_stats() {
+                match fetch_stats(queue) {
                     Ok(stats) => response.stats = stats,
                     Err(errno) => return errno,
                 }
@@ -141,7 +170,7 @@ fn dispatch(
 fn dispatch_read(
     request: &InputdIpcRequest,
     response: &mut InputdReadResponse,
-    queue: &mut VecDeque<input_evdev::InputEvent>,
+    queue: &mut InputQueue,
 ) -> i32 {
     if request.pid == 0 || request.tid == 0 || request.fd > i32::MAX as u64 {
         return libc::EINVAL;
@@ -161,14 +190,14 @@ fn dispatch_read(
         return status.err().unwrap_or(libc::EINVAL);
     };
     response.payload_len = len as u32;
-    match fetch_stats() {
+    match fetch_stats(queue) {
         Ok(stats) => response.stats = stats,
         Err(errno) => return errno,
     }
     0
 }
 
-fn drain_ingest(queue: &mut VecDeque<input_evdev::InputEvent>) -> Result<usize, i32> {
+fn drain_ingest(queue: &mut InputQueue) -> Result<usize, i32> {
     let mut events = vec![InputIngressWire::default(); INPUTD_INGEST_MAX_EVENTS];
     let mut count = 0_u32;
     let args = InputIngestBrokerArgs {
@@ -190,7 +219,7 @@ fn drain_ingest(queue: &mut VecDeque<input_evdev::InputEvent>) -> Result<usize, 
     let count = (count as usize).min(events.len());
     for wire in events.iter().take(count) {
         if wire.access == INPUTD_ACCESS_NATIVE {
-            queue.push_back(wire.event);
+            queue.push(wire.event);
         }
     }
     if count > 0 && !INPUT_DELIVERY_LOGGED.swap(true, Ordering::AcqRel) {
@@ -202,7 +231,7 @@ fn drain_ingest(queue: &mut VecDeque<input_evdev::InputEvent>) -> Result<usize, 
 }
 
 fn fill_native_payload(
-    queue: &mut VecDeque<input_evdev::InputEvent>,
+    queue: &mut InputQueue,
     payload: &mut [u8; INPUTD_READ_PAYLOAD_CAPACITY],
     requested: usize,
 ) -> Result<usize, i32> {
@@ -229,7 +258,7 @@ fn fill_native_payload(
 }
 
 fn fill_evdev_payload(
-    queue: &mut VecDeque<input_evdev::InputEvent>,
+    queue: &mut InputQueue,
     payload: &mut [u8; INPUTD_READ_PAYLOAD_CAPACITY],
     requested: usize,
 ) -> Result<usize, i32> {
@@ -256,7 +285,11 @@ fn fill_evdev_payload(
     Ok(bytes_len)
 }
 
-fn authorize_read(request: &InputdIpcRequest, response: &mut InputdIpcResponse) -> i32 {
+fn authorize_read(
+    request: &InputdIpcRequest,
+    response: &mut InputdIpcResponse,
+    queue: &InputQueue,
+) -> i32 {
     if request.pid == 0 || request.tid == 0 || request.fd > i32::MAX as u64 {
         return libc::EINVAL;
     }
@@ -266,14 +299,14 @@ fn authorize_read(request: &InputdIpcRequest, response: &mut InputdIpcResponse) 
         _ => return libc::EINVAL,
     };
     response.approved_len = request.requested_len.min(max_len);
-    match fetch_stats() {
+    match fetch_stats(queue) {
         Ok(stats) => response.stats = stats,
         Err(errno) => return errno,
     }
     0
 }
 
-fn fetch_stats() -> Result<InputStatsWire, i32> {
+fn fetch_stats(queue: &InputQueue) -> Result<InputStatsWire, i32> {
     let mut stats = InputStatsWire::default();
     let args = InputStatsBrokerArgs {
         abi_version: 1,
@@ -288,6 +321,8 @@ fn fetch_stats() -> Result<InputStatsWire, i32> {
     if result < 0 {
         return Err(last_errno());
     }
+    stats.queued = stats.queued.saturating_add(queue.len() as u64);
+    stats.dropped_lossy = stats.dropped_lossy.saturating_add(queue.dropped_lossy);
     Ok(stats)
 }
 

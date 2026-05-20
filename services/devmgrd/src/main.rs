@@ -4,20 +4,19 @@ use std::thread;
 use std::time::Duration;
 
 use rustos_user_abi::syscall::{
-    DevmgrdDeviceOpenRequest, DevmgrdDeviceOpenResponse, DevmgrdIpcRequest, DevmgrdIpcResponse,
-    DevmgrdNodeEntry, IpcReplyWithHandlesArgs, LinuxSyscallOffloadRequest,
-    LinuxSyscallOffloadResponse, RustosDeviceIoctlBrokerArgs, RustosDeviceOpenBrokerArgs,
+    DevmgrdDeviceIoctlRequest, DevmgrdDeviceIoctlResponse, DevmgrdDeviceOpenRequest,
+    DevmgrdDeviceOpenResponse, DevmgrdIpcRequest, DevmgrdIpcResponse, DevmgrdNodeEntry,
+    IpcReplyWithHandlesArgs, RustosDeviceIoctlBrokerArgs, RustosDeviceOpenBrokerArgs,
     DEVMGRD_DEVICE_ACCESS_EVDEV, DEVMGRD_DEVICE_ACCESS_NATIVE, DEVMGRD_DEVICE_ID_CONSOLE,
     DEVMGRD_DEVICE_ID_DISPLAY, DEVMGRD_DEVICE_ID_INPUT, DEVMGRD_DEVICE_RIGHT_ADMIN,
     DEVMGRD_DEVICE_RIGHT_IOCTL, DEVMGRD_DEVICE_RIGHT_MAP, DEVMGRD_DEVICE_RIGHT_READ,
     DEVMGRD_DEVICE_RIGHT_TRANSFER, DEVMGRD_DEVICE_RIGHT_WRITE, DEVMGRD_IPC_ABI_VERSION,
-    DEVMGRD_IPC_OP_LOOKUP, DEVMGRD_IPC_OP_OPEN, DEVMGRD_IPC_OP_READDIR, DEVMGRD_MAX_DIR_ENTRIES,
-    DEVMGRD_NAME_CAPACITY, DEVMGRD_NODE_KIND_DEVICE, DEVMGRD_NODE_KIND_DIR, IPC_MAX_INLINE_BYTES,
-    IPC_SERVICE_DEVMGRD, SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_IOCTL,
-    SYSCALL_OFFLOAD_PATH_CAPACITY, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_DEVICE_IOCTL_BROKER,
-    SYS_RUSTOS_DEVICE_OPEN_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV,
-    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
-    SYS_RUSTOS_IPC_REPLY_WITH_HANDLES,
+    DEVMGRD_IPC_OP_IOCTL_AUTHORIZE, DEVMGRD_IPC_OP_LOOKUP, DEVMGRD_IPC_OP_OPEN,
+    DEVMGRD_IPC_OP_READDIR, DEVMGRD_MAX_DIR_ENTRIES, DEVMGRD_NAME_CAPACITY,
+    DEVMGRD_NODE_KIND_DEVICE, DEVMGRD_NODE_KIND_DIR, IPC_MAX_INLINE_BYTES, IPC_SERVICE_DEVMGRD,
+    SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_DEVICE_IOCTL_BROKER, SYS_RUSTOS_DEVICE_OPEN_BROKER,
+    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_REPLY_WITH_HANDLES,
 };
 
 const RECV_BACKOFF: Duration = Duration::from_millis(10);
@@ -67,23 +66,6 @@ fn serve(endpoint: u64) {
         }
 
         let reply = match received as usize {
-            size if size == size_of::<LinuxSyscallOffloadRequest>() => {
-                let request = read_unaligned::<LinuxSyscallOffloadRequest>(&request);
-                let mut response = LinuxSyscallOffloadResponse {
-                    op: request.op,
-                    ..LinuxSyscallOffloadResponse::default()
-                };
-                response.status = match validate_request(received as usize, &request) {
-                    Ok(()) => dispatch_request(&request, &mut response),
-                    Err(errno) => errno,
-                };
-                syscall3(
-                    SYS_RUSTOS_IPC_REPLY,
-                    reply_cap,
-                    (&response as *const LinuxSyscallOffloadResponse) as u64,
-                    size_of::<LinuxSyscallOffloadResponse>() as u64,
-                )
-            }
             size if size == size_of::<DevmgrdIpcRequest>() => {
                 let request = read_unaligned::<DevmgrdIpcRequest>(&request);
                 let response = dispatch_registry_request(&request);
@@ -98,16 +80,20 @@ fn serve(endpoint: u64) {
                 let request = read_unaligned::<DevmgrdDeviceOpenRequest>(&request);
                 reply_device_open(reply_cap, &request)
             }
+            size if size == size_of::<DevmgrdDeviceIoctlRequest>() => {
+                let request = read_unaligned::<DevmgrdDeviceIoctlRequest>(&request);
+                reply_device_ioctl(reply_cap, &request)
+            }
             _ => {
-                let response = LinuxSyscallOffloadResponse {
+                let response = DevmgrdIpcResponse {
                     status: libc::EINVAL,
-                    ..LinuxSyscallOffloadResponse::default()
+                    ..DevmgrdIpcResponse::default()
                 };
                 syscall3(
                     SYS_RUSTOS_IPC_REPLY,
                     reply_cap,
-                    (&response as *const LinuxSyscallOffloadResponse) as u64,
-                    size_of::<LinuxSyscallOffloadResponse>() as u64,
+                    (&response as *const DevmgrdIpcResponse) as u64,
+                    size_of::<DevmgrdIpcResponse>() as u64,
                 )
             }
         };
@@ -115,6 +101,42 @@ fn serve(endpoint: u64) {
             let _ = writeln!(std::io::stderr(), "devmgrd: reply failed errno={}", -reply);
         }
     }
+}
+
+fn reply_device_ioctl(reply_cap: u64, request: &DevmgrdDeviceIoctlRequest) -> i64 {
+    let mut response = DevmgrdDeviceIoctlResponse {
+        version: DEVMGRD_IPC_ABI_VERSION,
+        op: DEVMGRD_IPC_OP_IOCTL_AUTHORIZE,
+        ..DevmgrdDeviceIoctlResponse::default()
+    };
+    response.status = match authorize_ioctl_request(request) {
+        Ok(()) => {
+            let args = RustosDeviceIoctlBrokerArgs {
+                process_id: request.pid,
+                fd: request.fd,
+                request: request.request,
+                arg: request.arg,
+                reserved0: 0,
+            };
+            let result = syscall1(
+                SYS_RUSTOS_DEVICE_IOCTL_BROKER,
+                (&args as *const RustosDeviceIoctlBrokerArgs) as u64,
+            );
+            if result < 0 {
+                last_errno()
+            } else {
+                response.value = result as u64;
+                0
+            }
+        }
+        Err(errno) => errno,
+    };
+    syscall3(
+        SYS_RUSTOS_IPC_REPLY,
+        reply_cap,
+        (&response as *const DevmgrdDeviceIoctlResponse) as u64,
+        size_of::<DevmgrdDeviceIoctlResponse>() as u64,
+    )
 }
 
 fn dispatch_registry_request(request: &DevmgrdIpcRequest) -> DevmgrdIpcResponse {
@@ -266,6 +288,39 @@ fn input_read_rights() -> u64 {
     DEVMGRD_DEVICE_RIGHT_READ | DEVMGRD_DEVICE_RIGHT_TRANSFER
 }
 
+fn authorize_ioctl_request(request: &DevmgrdDeviceIoctlRequest) -> Result<(), i32> {
+    if request.version != DEVMGRD_IPC_ABI_VERSION
+        || request.op != DEVMGRD_IPC_OP_IOCTL_AUTHORIZE
+        || request.flags != 0
+        || request.reserved0 != 0
+        || request.pid == 0
+        || request.tid == 0
+    {
+        return Err(libc::EINVAL);
+    }
+    if is_policy_owned_ioctl(request.request) {
+        Ok(())
+    } else {
+        Err(libc::ENOTTY)
+    }
+}
+
+fn is_policy_owned_ioctl(request_number: u64) -> bool {
+    matches!(
+        request_number,
+        rustos_user_abi::device::DISPLAY_IOCTL_GET_INFO
+            | rustos_user_abi::device::DISPLAY_IOCTL_CREATE_SURFACE
+            | rustos_user_abi::console::CONSOLE_IOCTL_GET_STATE
+            | rustos_user_abi::console::CONSOLE_IOCTL_SNAPSHOT_SESSION_OUTPUT
+            | rustos_user_abi::console::CONSOLE_IOCTL_SEND_INPUT_EVENT
+            | rustos_user_abi::console::CONSOLE_IOCTL_SNAPSHOT_SESSIONS
+            | rustos_user_abi::console::CONSOLE_IOCTL_CREATE_SESSION
+            | rustos_user_abi::console::CONSOLE_IOCTL_CLOSE_SESSION
+            | rustos_user_abi::console::CONSOLE_IOCTL_BIND_CURRENT_SESSION
+            | rustos_user_abi::console::CONSOLE_IOCTL_SET_SESSION_STATE
+    )
+}
+
 fn validate_registry_request(request: &DevmgrdIpcRequest) -> Result<&str, i32> {
     if request.version != DEVMGRD_IPC_ABI_VERSION || request.flags != 0 || request.reserved0 != 0 {
         return Err(libc::EINVAL);
@@ -326,54 +381,6 @@ fn encode_node_entry(name: &str, kind: u16) -> Option<DevmgrdNodeEntry> {
     };
     entry.name[..bytes.len()].copy_from_slice(bytes);
     Some(entry)
-}
-
-fn dispatch_request(
-    request: &LinuxSyscallOffloadRequest,
-    response: &mut LinuxSyscallOffloadResponse,
-) -> i32 {
-    match request.op {
-        SYSCALL_OFFLOAD_OP_LINUX_IOCTL => dispatch_ioctl(request, response),
-        _ => libc::EINVAL,
-    }
-}
-
-fn dispatch_ioctl(
-    request: &LinuxSyscallOffloadRequest,
-    response: &mut LinuxSyscallOffloadResponse,
-) -> i32 {
-    let args = RustosDeviceIoctlBrokerArgs {
-        process_id: request.pid,
-        fd: request.dirfd,
-        request: request.flags,
-        arg: request.arg1,
-        reserved0: 0,
-    };
-    let result = syscall1(
-        SYS_RUSTOS_DEVICE_IOCTL_BROKER,
-        (&args as *const RustosDeviceIoctlBrokerArgs) as u64,
-    );
-    if result < 0 {
-        return last_errno();
-    }
-    let bytes = (result as u64).to_le_bytes();
-    response.payload[..bytes.len()].copy_from_slice(&bytes);
-    response.payload_len = bytes.len() as u32;
-    0
-}
-
-fn validate_request(received: usize, request: &LinuxSyscallOffloadRequest) -> Result<(), i32> {
-    if received != size_of::<LinuxSyscallOffloadRequest>()
-        || request.version != SYSCALL_OFFLOAD_ABI_VERSION
-        || request.reserved0 != 0
-        || request.path_len as usize > SYSCALL_OFFLOAD_PATH_CAPACITY
-    {
-        return Err(libc::EINVAL);
-    }
-    match request.op {
-        SYSCALL_OFFLOAD_OP_LINUX_IOCTL => Ok(()),
-        _ => Err(libc::EINVAL),
-    }
 }
 
 fn syscall0(number: u64) -> i64 {

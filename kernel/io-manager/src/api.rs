@@ -294,23 +294,6 @@ pub mod input {
 pub mod device {
     pub use crate::io::device::{DeviceAccessKind, DeviceError, DeviceHandle, DeviceId};
 
-    pub fn read_to_current_user(
-        handle: kernel_object::api::device::DeviceHandle,
-        user_ptr: u64,
-        user_len: usize,
-    ) -> Result<usize, DeviceError> {
-        crate::io::device::read_to_current_user(handle.into(), user_ptr, user_len)
-    }
-
-    pub fn read_to_user(
-        handle: kernel_object::api::device::DeviceHandle,
-        process_state: &mut crate::user::process_state::UserProcessState,
-        user_ptr: u64,
-        user_len: usize,
-    ) -> Result<usize, DeviceError> {
-        crate::io::device::read_to_user(handle.into(), process_state, user_ptr, user_len)
-    }
-
     pub fn ioctl_from_user(
         handle: kernel_object::api::device::DeviceHandle,
         process_state: &mut crate::user::process_state::UserProcessState,
