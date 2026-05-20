@@ -13,12 +13,12 @@ use core::str;
 
 use rustos_svc_runtime::ipc;
 use rustos_user_abi::syscall::{
-    DevmgrdIpcRequest, DevmgrdIpcResponse, RustosBlockBrokerArgs, VfsIpcRequest, VfsIpcResponse,
     BLOCK_BROKER_ABI_VERSION, BLOCK_BROKER_MAX_IO_BYTES, BLOCK_BROKER_OP_BOOT_INFO,
     BLOCK_BROKER_OP_BOOT_READ, DEVMGRD_IPC_ABI_VERSION, DEVMGRD_IPC_OP_LOOKUP,
     DEVMGRD_IPC_OP_READDIR, DEVMGRD_MAX_DIR_ENTRIES, DEVMGRD_NODE_KIND_DEVICE,
-    DEVMGRD_NODE_KIND_DIR, IPC_MAX_INLINE_BYTES, IPC_SERVICE_DEVMGRD, IPC_SERVICE_VFSD,
-    LINUX_STATX_SIZE, LINUX_STAT_SIZE, SYSCALL_OFFLOAD_ABI_VERSION,
+    DEVMGRD_NODE_KIND_DIR, DevmgrdIpcRequest, DevmgrdIpcResponse, IPC_MAX_INLINE_BYTES,
+    IPC_SERVICE_DEVMGRD, IPC_SERVICE_VFSD, LINUX_STAT_SIZE, LINUX_STATX_SIZE,
+    RustosBlockBrokerArgs, SYS_RUSTOS_BLOCK_BROKER, SYSCALL_OFFLOAD_ABI_VERSION,
     SYSCALL_OFFLOAD_OP_LINUX_ACCESS, SYSCALL_OFFLOAD_OP_LINUX_CHDIR,
     SYSCALL_OFFLOAD_OP_LINUX_CLOSE, SYSCALL_OFFLOAD_OP_LINUX_DUP, SYSCALL_OFFLOAD_OP_LINUX_FCNTL,
     SYSCALL_OFFLOAD_OP_LINUX_GETCWD, SYSCALL_OFFLOAD_OP_LINUX_GETDENTS64,
@@ -26,15 +26,14 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_OP_LINUX_NEWFSTATAT, SYSCALL_OFFLOAD_OP_LINUX_OPENAT,
     SYSCALL_OFFLOAD_OP_LINUX_READLINKAT, SYSCALL_OFFLOAD_OP_LINUX_STATX,
     SYSCALL_OFFLOAD_OP_LINUX_UMOUNT2, SYSCALL_OFFLOAD_OP_LINUX_UNLINKAT,
-    SYSCALL_OFFLOAD_PATH_CAPACITY, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, SYS_RUSTOS_BLOCK_BROKER,
-    VFS_IPC_ABI_VERSION, VFS_IPC_HANDLE_KIND_DEVICE, VFS_IPC_HANDLE_KIND_DIR,
-    VFS_IPC_HANDLE_KIND_FILE, VFS_IPC_OP_ACCESS, VFS_IPC_OP_CHDIR, VFS_IPC_OP_CLOSE,
-    VFS_IPC_OP_DUP, VFS_IPC_OP_FCNTL, VFS_IPC_OP_FSTAT, VFS_IPC_OP_FTRUNCATE, VFS_IPC_OP_GETCWD,
-    VFS_IPC_OP_GETDENTS64, VFS_IPC_OP_LSEEK, VFS_IPC_OP_MKDIR, VFS_IPC_OP_MOUNT,
-    VFS_IPC_OP_NEWFSTATAT, VFS_IPC_OP_OPENAT, VFS_IPC_OP_PREAD64, VFS_IPC_OP_READ,
-    VFS_IPC_OP_READLINKAT, VFS_IPC_OP_STATX, VFS_IPC_OP_UMOUNT2, VFS_IPC_OP_UNLINKAT,
-    VFS_IPC_OP_WRITE, VFS_IPC_PATH_CAPACITY, VFS_IPC_PAYLOAD_CAPACITY,
-    VFS_IPC_REQUEST_PAYLOAD_CAPACITY,
+    SYSCALL_OFFLOAD_PATH_CAPACITY, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, VFS_IPC_ABI_VERSION,
+    VFS_IPC_HANDLE_KIND_DEVICE, VFS_IPC_HANDLE_KIND_DIR, VFS_IPC_HANDLE_KIND_FILE,
+    VFS_IPC_OP_ACCESS, VFS_IPC_OP_CHDIR, VFS_IPC_OP_CLOSE, VFS_IPC_OP_DUP, VFS_IPC_OP_FCNTL,
+    VFS_IPC_OP_FSTAT, VFS_IPC_OP_FTRUNCATE, VFS_IPC_OP_GETCWD, VFS_IPC_OP_GETDENTS64,
+    VFS_IPC_OP_LSEEK, VFS_IPC_OP_MKDIR, VFS_IPC_OP_MOUNT, VFS_IPC_OP_NEWFSTATAT, VFS_IPC_OP_OPENAT,
+    VFS_IPC_OP_PREAD64, VFS_IPC_OP_READ, VFS_IPC_OP_READLINKAT, VFS_IPC_OP_STATX,
+    VFS_IPC_OP_UMOUNT2, VFS_IPC_OP_UNLINKAT, VFS_IPC_OP_WRITE, VFS_IPC_PATH_CAPACITY,
+    VFS_IPC_PAYLOAD_CAPACITY, VFS_IPC_REQUEST_PAYLOAD_CAPACITY, VfsIpcRequest, VfsIpcResponse,
 };
 use storage_core::{BlockDevice, IoResult, StorageError};
 use storage_fat::{FatDirEntry, FatNodeKind, FatVolume};
@@ -850,9 +849,6 @@ impl VfsState {
     }
 
     fn metadata(&mut self, path: &str) -> Result<Metadata, i32> {
-        // RING3-MIGRATION-REFERENCE START: devmgrd should own device namespace
-        // metadata. vfsd should consume explicit devmgrd-provided nodes instead
-        // of carrying static `/dev` policy.
         if path == "/" || path == "/proc" || path == "/run" {
             return Ok(Metadata {
                 kind: RemoteKind::Directory,
@@ -869,18 +865,9 @@ impl VfsState {
                         inode: path_inode(path.as_bytes()),
                     });
                 }
-                Err(ENODEV) => {}
                 Err(errno) => return Err(errno),
             }
         }
-        if known_device_node(path) {
-            return Ok(Metadata {
-                kind: RemoteKind::Device,
-                len: 0,
-                inode: path_inode(path.as_bytes()),
-            });
-        }
-        // RING3-MIGRATION-REFERENCE END: devmgrd-owned device metadata.
         self.invalidate_caches_if_remounted();
         if let Some(entry) = self.metadata_cache.get(path) {
             return *entry;
@@ -902,9 +889,6 @@ impl VfsState {
 
     fn dir_entries(&mut self, path: &str) -> Result<Vec<DirEntry>, i32> {
         let mut entries = Vec::new();
-        // RING3-MIGRATION-REFERENCE START: devmgrd should own `/dev` directory
-        // contents and capability metadata; vfsd should mirror a devmgrd
-        // registry rather than listing static device nodes.
         if path == "/" {
             entries.push(DirEntry::new("dev", RemoteKind::Directory));
             entries.push(DirEntry::new("proc", RemoteKind::Directory));
@@ -913,30 +897,12 @@ impl VfsState {
         if path == "/dev" || path == "/dev/input" || path == "/dev/dri" {
             match devmgrd_dir_entries(path) {
                 Ok(entries) => return Ok(entries),
-                Err(ENODEV) => {}
                 Err(errno) => return Err(errno),
             }
-        }
-        if path == "/dev" {
-            entries.push(DirEntry::new("console0", RemoteKind::Device));
-            entries.push(DirEntry::new("display0", RemoteKind::Device));
-            entries.push(DirEntry::new("input0", RemoteKind::Device));
-            entries.push(DirEntry::new("input", RemoteKind::Directory));
-            entries.push(DirEntry::new("dri", RemoteKind::Directory));
-            return Ok(entries);
-        }
-        if path == "/dev/input" {
-            entries.push(DirEntry::new("event0", RemoteKind::Device));
-            return Ok(entries);
-        }
-        if path == "/dev/dri" {
-            entries.push(DirEntry::new("card0", RemoteKind::Device));
-            return Ok(entries);
         }
         if path == "/proc" || path == "/run" {
             return Ok(entries);
         }
-        // RING3-MIGRATION-REFERENCE END: devmgrd-owned `/dev` directory policy.
         self.invalidate_caches_if_remounted();
         if let Some(cached) = self.dir_entries_cache.get(path) {
             entries.extend_from_slice(cached);
@@ -983,8 +949,6 @@ impl DirEntry {
     }
 }
 
-// RING3-MIGRATION-REFERENCE START: devmgrd should be the source of device-node
-// existence and type policy; vfsd should not grow this static list.
 fn devmgrd_lookup(path: &str) -> Result<RemoteKind, i32> {
     let mut request = devmgrd_request(DEVMGRD_IPC_OP_LOOKUP, path)?;
     let response = call_devmgrd(&mut request)?;
@@ -1062,17 +1026,9 @@ fn devmgrd_kind_to_remote(kind: u16) -> Result<RemoteKind, i32> {
     }
 }
 
-fn known_device_node(path: &str) -> bool {
-    matches!(
-        path,
-        "/dev/console0" | "/dev/display0" | "/dev/input0" | "/dev/input/event0" | "/dev/dri/card0"
-    )
-}
-
 fn is_input_device_node(path: &str) -> bool {
     matches!(path, "/dev/input0" | "/dev/input/event0")
 }
-// RING3-MIGRATION-REFERENCE END: devmgrd-owned device-node policy.
 
 struct BootBlockDevice {
     block_size: usize,

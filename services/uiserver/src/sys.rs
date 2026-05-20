@@ -170,7 +170,7 @@ pub(crate) fn open_input() -> Result<Vec<OwnedFd>, i32> {
     )
 }
 
-pub(crate) fn diag_line(message: &str) {
+pub(crate) fn diag_line(message: impl Into<String>) {
     static SENDER: OnceLock<mpsc::SyncSender<String>> = OnceLock::new();
     let sender = SENDER.get_or_init(|| {
         let (sender, receiver) = mpsc::sync_channel::<String>(128);
@@ -181,7 +181,7 @@ pub(crate) fn diag_line(message: &str) {
         });
         sender
     });
-    let _ = sender.try_send(message.to_owned());
+    let _ = sender.try_send(message.into());
 }
 
 pub(crate) fn boot_trace_enabled() -> bool {

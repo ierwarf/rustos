@@ -15,11 +15,12 @@ use crate::user::handles::{KernelHandle, RemoteVfsHandleKind, VfsFileHandle};
 use crate::user::memfd::MemfdHandle;
 use lazy_static::lazy_static;
 use rustos_user_abi::syscall::{
-    IPC_SERVICE_CAP_PROCESS_LOADER, IPC_SERVICE_CAP_PROCESS_POLICY, PROC_BROKER_ABI_VERSION,
-    PROC_BROKER_BATCH_CAPACITY, PROC_BROKER_FORMAT_ELF64, PROC_BROKER_FORMAT_PE64,
-    PROC_BROKER_LINUX_INTERP_PATH_CAPACITY, PROC_BROKER_MAP_EXEC, PROC_BROKER_MAP_PRIVATE,
-    PROC_BROKER_MAP_READ, PROC_BROKER_MAP_WRITE, PROC_BROKER_USER_SPACE_BASE,
-    PROC_BROKER_USER_SPACE_END_EXCLUSIVE, RustosProcAbortBrokerArgs,
+    IPC_SERVICE_CAP_PROCESS_LOADER, IPC_SERVICE_CAP_PROCESS_POLICY, LOADER_SPAWN_ARG_BYTES,
+    LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_MAX_ARG_COUNT, LOADER_SPAWN_MAX_ENV_COUNT,
+    PROC_BROKER_ABI_VERSION, PROC_BROKER_BATCH_CAPACITY, PROC_BROKER_FORMAT_ELF64,
+    PROC_BROKER_FORMAT_PE64, PROC_BROKER_LINUX_INTERP_PATH_CAPACITY, PROC_BROKER_MAP_EXEC,
+    PROC_BROKER_MAP_PRIVATE, PROC_BROKER_MAP_READ, PROC_BROKER_MAP_WRITE,
+    PROC_BROKER_USER_SPACE_BASE, PROC_BROKER_USER_SPACE_END_EXCLUSIVE, RustosProcAbortBrokerArgs,
     RustosProcAuthorizeExecBrokerArgs, RustosProcCancelExecBrokerArgs, RustosProcCommitBrokerArgs,
     RustosProcExecTargetBrokerArgs, RustosProcForkBrokerArgs, RustosProcMapDataBrokerArgs,
     RustosProcMapFileBatchBrokerArgs, RustosProcMapFileBrokerArgs, RustosProcMapZeroedBrokerArgs,
@@ -560,6 +561,29 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
         Ok(path) => path,
         Err(errno) => return linux_errno(errno),
     };
+    let argv_storage = match read_user_string_vector(
+        args.argv_ptr,
+        LOADER_SPAWN_MAX_ARG_COUNT,
+        LOADER_SPAWN_ARG_BYTES,
+    ) {
+        Ok(values) => values,
+        Err(errno) => return linux_errno(errno),
+    };
+    let env_storage = match read_user_string_vector(
+        args.envp_ptr,
+        LOADER_SPAWN_MAX_ENV_COUNT,
+        LOADER_SPAWN_ENV_BYTES,
+    ) {
+        Ok(values) => values,
+        Err(errno) => return linux_errno(errno),
+    };
+    let argv_refs = argv_storage.iter().map(String::as_str).collect::<Vec<_>>();
+    let env_refs = env_storage.iter().map(String::as_str).collect::<Vec<_>>();
+    let linux_launch = crate::user::linux::LinuxProcessLaunch {
+        exec_path: &exec_path,
+        argv: argv_refs.as_slice(),
+        env: env_refs.as_slice(),
+    };
     let address_space = match address_space_from_mappings(&state.mappings) {
         Ok(address_space) => address_space,
         Err(errno) => return linux_errno(errno),
@@ -573,7 +597,7 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
     };
     let logical_admin = args.flags & SPAWN_FLAG_LOGICAL_ADMIN != 0;
     let launch = crate::user::process::ProcessLaunchOptions {
-        linux: crate::user::linux::LinuxProcessLaunch::new(&exec_path),
+        linux: linux_launch,
         console_session: session,
         logical_admin,
         ..crate::user::process::ProcessLaunchOptions::default()
@@ -586,7 +610,7 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
                     actual_entry,
                     address_space,
                     crate::user::process::ProcessLaunchOptions {
-                        linux: crate::user::linux::LinuxProcessLaunch::new(&exec_path),
+                        linux: linux_launch,
                         ..launch
                     },
                 ) {
@@ -601,7 +625,7 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
                     image_blob,
                     address_space,
                     crate::user::process::ProcessLaunchOptions {
-                        linux: crate::user::linux::LinuxProcessLaunch::new(&exec_path),
+                        linux: linux_launch,
                         ..launch
                     },
                 ) {
@@ -731,6 +755,29 @@ pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64
         Ok(path) => path,
         Err(errno) => return linux_errno(errno),
     };
+    let argv_storage = match read_user_string_vector(
+        args.argv_ptr,
+        LOADER_SPAWN_MAX_ARG_COUNT,
+        LOADER_SPAWN_ARG_BYTES,
+    ) {
+        Ok(values) => values,
+        Err(errno) => return linux_errno(errno),
+    };
+    let env_storage = match read_user_string_vector(
+        args.envp_ptr,
+        LOADER_SPAWN_MAX_ENV_COUNT,
+        LOADER_SPAWN_ENV_BYTES,
+    ) {
+        Ok(values) => values,
+        Err(errno) => return linux_errno(errno),
+    };
+    let argv_refs = argv_storage.iter().map(String::as_str).collect::<Vec<_>>();
+    let env_refs = env_storage.iter().map(String::as_str).collect::<Vec<_>>();
+    let linux_launch = crate::user::linux::LinuxProcessLaunch {
+        exec_path: &exec_path,
+        argv: argv_refs.as_slice(),
+        env: env_refs.as_slice(),
+    };
     let address_space = match address_space_from_mappings(&state.mappings) {
         Ok(address_space) => address_space,
         Err(errno) => return linux_errno(errno),
@@ -747,7 +794,7 @@ pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64
     })
     .unwrap_or(false);
     let launch = crate::user::process::ProcessLaunchOptions {
-        linux: crate::user::linux::LinuxProcessLaunch::new(&exec_path),
+        linux: linux_launch,
         console_session: session,
         logical_admin,
         ..crate::user::process::ProcessLaunchOptions::default()
@@ -758,7 +805,7 @@ pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64
             actual_entry,
             address_space,
             crate::user::process::ProcessLaunchOptions {
-                linux: crate::user::linux::LinuxProcessLaunch::new(&exec_path),
+                linux: linux_launch,
                 ..launch
             },
         ) {
@@ -773,7 +820,7 @@ pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64
             image_blob,
             address_space,
             crate::user::process::ProcessLaunchOptions {
-                linux: crate::user::linux::LinuxProcessLaunch::new(&exec_path),
+                linux: linux_launch,
                 ..launch
             },
         ) {
@@ -1242,6 +1289,40 @@ fn read_user_text(ptr: u64, len: u64) -> Result<String, i64> {
         return Err(LINUX_EINVAL);
     }
     String::from_utf8(bytes).map_err(|_| LINUX_EINVAL)
+}
+
+fn read_user_string_vector(
+    vector_ptr: u64,
+    max_count: usize,
+    max_bytes: usize,
+) -> Result<Vec<String>, i64> {
+    let mut bytes = alloc::vec![0_u8; max_bytes];
+    let mut bytes_len = 0_u32;
+    let mut count = 0_u16;
+    copy_string_vector(
+        vector_ptr,
+        max_count,
+        &mut bytes,
+        &mut bytes_len,
+        &mut count,
+    )?;
+
+    let bytes_len = bytes_len as usize;
+    let mut offset = 0usize;
+    let mut values = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let Some(relative_end) = bytes[offset..bytes_len].iter().position(|byte| *byte == 0) else {
+            return Err(LINUX_EINVAL);
+        };
+        let end = offset + relative_end;
+        let value = core::str::from_utf8(&bytes[offset..end]).map_err(|_| LINUX_EINVAL)?;
+        values.push(String::from(value));
+        offset = end.checked_add(1).ok_or(LINUX_EINVAL)?;
+    }
+    if offset != bytes_len {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(values)
 }
 
 fn console_host_error_to_linux_errno(error: crate::user::console_host::ConsoleHostError) -> i64 {

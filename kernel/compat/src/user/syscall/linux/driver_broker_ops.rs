@@ -75,11 +75,7 @@ pub(super) fn syscall_linux_rustos_driver_probe_alias_broker(args_ptr: u64) -> u
         Err(errno) => return linux_errno(errno),
     };
 
-    if kernel_io_manager::driver::device_alias_present_from_policy(
-        alias.as_str(),
-        args.class,
-        args.bus,
-    ) {
+    if kernel_io_manager::driver::hardware_alias_present(alias.as_str(), args.class, args.bus) {
         1
     } else {
         0
@@ -108,7 +104,7 @@ pub(super) fn syscall_linux_rustos_driver_provider_active_broker(args_ptr: u64) 
         Err(errno) => return linux_errno(errno),
     };
 
-    if kernel_io_manager::driver::provider_group_active_from_policy(group.as_str()) {
+    if kernel_io_manager::driver::provider_group_hardware_active(group.as_str()) {
         1
     } else {
         0

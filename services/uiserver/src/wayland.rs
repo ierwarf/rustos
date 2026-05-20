@@ -46,7 +46,7 @@ const MAX_WAYLAND_KEYBOARD_RESOURCES: usize = 64;
 const MAX_WAYLAND_FRAME_CALLBACKS_PER_SURFACE: usize = 8;
 
 fn post_protocol_error<I: Resource>(resource: &I, message: String) {
-    diag_line(&format!("uiserver: wayland protocol error: {message}"));
+    diag_line(format!("uiserver: wayland protocol error: {message}"));
     resource.post_error(0_u32, message);
 }
 
@@ -92,14 +92,14 @@ impl WaylandCompositor {
         let display = match Display::new() {
             Ok(display) => display,
             Err(err) => {
-                diag_line(&format!("uiserver: wayland display init failed: {err}"));
+                diag_line(format!("uiserver: wayland display init failed: {err}"));
                 return None;
             }
         };
         let listener = match bind_wayland_listener(runtime_dir.as_str(), socket_path.as_str()) {
             Ok(listener) => listener,
             Err(err) => {
-                diag_line(&format!(
+                diag_line(format!(
                     "uiserver: wayland socket bind failed path={} err={err}",
                     socket_path
                 ));
@@ -119,7 +119,7 @@ impl WaylandCompositor {
                 (),
             );
         }
-        diag_line(&format!(
+        diag_line(format!(
             "uiserver: wayland compositor ready on {}/{}",
             runtime_dir, WAYLAND_SOCKET_NAME
         ));
@@ -138,7 +138,7 @@ impl WaylandCompositor {
                 Ok((stream, _)) => {
                     accepted = accepted.saturating_add(1);
                     if let Err(err) = set_fd_nonblocking(stream.as_raw_fd()) {
-                        diag_line(&format!(
+                        diag_line(format!(
                             "uiserver: accepted wayland client nonblocking failed: {err}"
                         ));
                         continue;
@@ -148,14 +148,14 @@ impl WaylandCompositor {
                         .handle()
                         .insert_client(stream, Arc::new(WaylandClientState))
                     {
-                        diag_line(&format!("uiserver: wayland insert_client failed: {err}"));
+                        diag_line(format!("uiserver: wayland insert_client failed: {err}"));
                     } else {
                         self.state.dirty = true;
                     }
                 }
                 Err(err) if err.kind() == ErrorKind::WouldBlock => break,
                 Err(err) => {
-                    diag_line(&format!("uiserver: wayland accept failed: {err}"));
+                    diag_line(format!("uiserver: wayland accept failed: {err}"));
                     break;
                 }
             }
@@ -164,7 +164,7 @@ impl WaylandCompositor {
         match self.display.dispatch_clients(&mut self.state) {
             Ok(_) => {}
             Err(err) => {
-                diag_line(&format!("uiserver: wayland dispatch failed: {err}"));
+                diag_line(format!("uiserver: wayland dispatch failed: {err}"));
             }
         }
         self.flush_clients();
@@ -179,7 +179,7 @@ impl WaylandCompositor {
 
     pub(crate) fn flush_clients(&mut self) {
         if let Err(err) = self.display.flush_clients() {
-            diag_line(&format!("uiserver: wayland flush failed: {err}"));
+            diag_line(format!("uiserver: wayland flush failed: {err}"));
         }
     }
 
@@ -1140,19 +1140,19 @@ impl WaylandState {
         shared: &Arc<Mutex<WaylandSurfaceState>>,
         surface_id: u32,
     ) -> bool {
-        diag_line(&format!(
+        diag_line(format!(
             "uiserver: retire_surface begin surface={surface_id}"
         ));
         self.clear_focus_for_surface(surface_id);
         self.pointer_button_down = false;
         self.sync_surface_output(shared, false);
         let Ok(mut state) = shared.lock() else {
-            diag_line(&format!(
+            diag_line(format!(
                 "uiserver: retire_surface lock failed surface={surface_id}"
             ));
             return false;
         };
-        diag_line(&format!(
+        diag_line(format!(
             "uiserver: retire_surface state surface={} title={} alive={} minimized={} size={}x{} callbacks={}",
             surface_id,
             state.title,
@@ -1176,7 +1176,7 @@ impl WaylandState {
         state.needs_initial_configure = false;
         drop(state);
         self.mark_dirty();
-        diag_line(&format!(
+        diag_line(format!(
             "uiserver: retire_surface end surface={surface_id}"
         ));
         true
@@ -1250,18 +1250,18 @@ impl WaylandState {
     }
 
     fn close_surface(&mut self, surface_id: u32) -> bool {
-        diag_line(&format!(
+        diag_line(format!(
             "uiserver: close_surface begin surface={surface_id}"
         ));
         let Some(shared) = self.find_surface_by_protocol_id(surface_id) else {
-            diag_line(&format!(
+            diag_line(format!(
                 "uiserver: close_surface missing surface={surface_id}"
             ));
             return false;
         };
         let toplevel = shared.lock().ok().and_then(|state| state.toplevel.clone());
         let retired = self.retire_surface(&shared, surface_id);
-        diag_line(&format!(
+        diag_line(format!(
             "uiserver: close_surface retired surface={} retired={} has_toplevel={}",
             surface_id,
             retired,
@@ -1271,7 +1271,7 @@ impl WaylandState {
             return retired;
         };
         toplevel.close();
-        diag_line(&format!(
+        diag_line(format!(
             "uiserver: close_surface close_sent surface={surface_id}"
         ));
         retired
@@ -1567,7 +1567,7 @@ impl GlobalDispatch<wl_output::WlOutput, ()> for WaylandState {
         }
         if let Some(client_id) = output.client().map(|client| client.id()) {
             if !can_track {
-                diag_line(&format!(
+                diag_line(format!(
                     "uiserver: wayland output resource tracking limit {} reached",
                     MAX_WAYLAND_OUTPUT_RESOURCES
                 ));
@@ -2165,7 +2165,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
         resource: &wl_surface::WlSurface,
         data: &SurfaceData,
     ) {
-        diag_line(&format!(
+        diag_line(format!(
             "uiserver: wl_surface destroyed surface={}",
             resource.id().protocol_id()
         ));
@@ -2331,7 +2331,7 @@ impl Dispatch<xdg_toplevel::XdgToplevel, SurfaceData> for WaylandState {
                         .as_ref()
                         .map(|resource| resource.id().protocol_id())
                 });
-                diag_line(&format!(
+                diag_line(format!(
                     "uiserver: xdg_toplevel destroy surface={:?}",
                     surface_id
                 ));

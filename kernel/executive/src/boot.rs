@@ -411,6 +411,13 @@ pub fn housekeeping_once() -> usize {
     trace_service_phase("console");
     work += io_services::console_service();
 
+    trace_service_phase("heartbeat");
+    // Emit the once-per-second wall-clock heartbeat outside IRQ context. The
+    // RTC interrupt only marks the second as pending; the actual snapshot +
+    // format + debugcon write happens here so a 700-byte log line full of
+    // single-byte outb VMExits doesn't drop frames inside the IRQ handler.
+    work += hal_api::arch::rtc::drain_pending_heartbeat();
+
     work
 }
 

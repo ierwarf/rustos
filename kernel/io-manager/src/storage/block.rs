@@ -11,7 +11,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use boot_protocol::BootVolumeIdentity;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use storage_core::BlockDevice as SharedBlockDevice;
 
 use crate::storage::fat::{DiskIoError, IoResult};
@@ -25,6 +25,7 @@ static BLOCK_DEVICES: Mutex<Vec<BlockDeviceRecord>> = Mutex::new(Vec::new());
 static BLOCK_INIT_DONE: AtomicBool = AtomicBool::new(false);
 static BLOCK_INIT_LOCK: KernelWaitLock<()> = KernelWaitLock::new(());
 static BOOT_VOLUME_HANDLE_LOGGED: AtomicBool = AtomicBool::new(false);
+static BOOT_VOLUME_HANDLE_ID: AtomicU32 = AtomicU32::new(u32::MAX);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlockDeviceHandle {
@@ -89,25 +90,23 @@ pub fn register_boot_volume_opener() {
     );
 }
 
-// RING3-MIGRATION-REFERENCE START: storaged should own block inventory,
-// boot-root selection policy, transport preference, and `/dev/block*`
-// namespace lookup after bootstrap. Ring0 keeps hardware block drivers and
-// gated read/write broker primitives.
 pub fn current_boot_volume_handle() -> Option<BlockDeviceHandle> {
     ensure_initialized();
+    if let Some(handle) = cached_boot_volume_handle() {
+        return Some(handle);
+    }
 
     if let Some(identity) = crate::storage::boot_volume::boot_volume_identity() {
         if let Ok(handle) = boot::open_physical_boot_handle(identity) {
-            log_boot_volume_handle_once(handle);
-            return Some(handle);
+            return Some(cache_boot_volume_handle(handle));
         }
     }
 
     let handle = boot::open_boot_handle().ok();
     if let Some(handle) = handle {
-        log_boot_volume_handle_once(handle);
+        return Some(cache_boot_volume_handle(handle));
     }
-    handle
+    None
 }
 
 fn ensure_initialized() {
@@ -253,7 +252,25 @@ fn log_boot_volume_handle_once(handle: BlockDeviceHandle) {
         );
     }
 }
-// RING3-MIGRATION-REFERENCE END: storaged-owned block inventory/selection policy.
+
+fn cached_boot_volume_handle() -> Option<BlockDeviceHandle> {
+    match BOOT_VOLUME_HANDLE_ID.load(Ordering::Acquire) {
+        u32::MAX => None,
+        id => Some(BlockDeviceHandle::new(id)),
+    }
+}
+
+fn cache_boot_volume_handle(handle: BlockDeviceHandle) -> BlockDeviceHandle {
+    let _ = BOOT_VOLUME_HANDLE_ID.compare_exchange(
+        u32::MAX,
+        handle.id(),
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+    let selected = cached_boot_volume_handle().unwrap_or(handle);
+    log_boot_volume_handle_once(selected);
+    selected
+}
 
 pub(crate) fn flush(handle: BlockDeviceHandle) -> IoResult<()> {
     ensure_initialized();

@@ -104,10 +104,7 @@ pub fn load_module_image_from_policy(
     }
 }
 
-// RING3-MIGRATION-REFERENCE START: driverd should own alias matching,
-// provider-group decisions, fallback priority, and retry/order policy. Ring0
-// keeps only narrow hardware-presence facts and the `.ko` load substrate.
-pub fn device_alias_present_from_policy(alias: &str, class: u32, bus: u32) -> bool {
+pub fn hardware_alias_present(alias: &str, class: u32, bus: u32) -> bool {
     let Some(class) = decode_class(class) else {
         return false;
     };
@@ -128,7 +125,7 @@ pub fn device_alias_present_from_policy(alias: &str, class: u32, bus: u32) -> bo
     }
 }
 
-pub fn provider_group_active_from_policy(group: &str) -> bool {
+pub fn provider_group_hardware_active(group: &str) -> bool {
     match group {
         DISPLAY_PRIMARY_PROVIDER_GROUP => crate::io::gui::primary_display_provider_active(),
         _ => false,
@@ -308,4 +305,3 @@ fn parse_fixed_hex(field: &str) -> Option<u32> {
     }
     Some(value)
 }
-// RING3-MIGRATION-REFERENCE END: driverd-owned provider/alias policy.

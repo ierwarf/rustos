@@ -4,10 +4,10 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use rustos_user_abi::syscall::{
-    LinuxRlimit, LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, LinuxTimespecWire,
-    LinuxUtsName, RustosMmBrokerArgs, RustosMmFdBrokerResult, RustosMmLayoutBrokerResult,
+    LinuxRlimit, LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, LinuxUtsName,
+    RustosMmBrokerArgs, RustosMmFdBrokerResult, RustosMmLayoutBrokerResult,
     RustosMmMapBrokerResult, LINUX_CPUSET_BYTES, LINUX_DEFAULT_STACK_RLIMIT_BYTES,
-    LINUX_RLIMIT_SIZE, LINUX_TIMESPEC_SIZE, MM_BROKER_ABI_VERSION, MM_BROKER_FD_KIND_DEVICE,
+    LINUX_RLIMIT_SIZE, MM_BROKER_ABI_VERSION, MM_BROKER_FD_KIND_DEVICE,
     MM_BROKER_FD_KIND_DISPLAY_SURFACE, MM_BROKER_FD_KIND_FILE, MM_BROKER_FD_KIND_MEMFD,
     MM_BROKER_OP_DESCRIBE_FD, MM_BROKER_OP_MAP_ANON, MM_BROKER_OP_MAP_DEVICE_SHARED,
     MM_BROKER_OP_MAP_FILE_PRIVATE, MM_BROKER_OP_MAP_MEMFD_SHARED, MM_BROKER_OP_PROTECT,
@@ -93,9 +93,6 @@ pub(crate) enum IdKind {
 
 static PROCESS_POLICY: Mutex<BTreeMap<u64, LinuxPolicyState>> = Mutex::new(BTreeMap::new());
 static MM_POLICY: Mutex<BTreeMap<u64, MmPolicyState>> = Mutex::new(BTreeMap::new());
-/// Monotonic clock origin in nanoseconds (captured on first `handle_clock_gettime`).
-/// Zero = not yet captured. Stored as `AtomicU64` so we do not need `OnceLock`.
-static MONOTONIC_START_NANOS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
 struct MmPolicyState {
@@ -478,84 +475,6 @@ pub(crate) fn handle_getrandom(
     response.payload_len = len as u32;
 }
 
-pub(crate) fn handle_nanosleep(
-    request: &LinuxSyscallOffloadRequest,
-    response: &mut LinuxSyscallOffloadResponse,
-) {
-    if request.path_len as usize != LINUX_TIMESPEC_SIZE {
-        response.status = errno::EINVAL;
-        return;
-    }
-    let ts = read_timespec(&request.path[..LINUX_TIMESPEC_SIZE]);
-    if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
-        response.status = errno::EINVAL;
-        return;
-    }
-    let req = errno::KTimespec {
-        tv_sec: ts.tv_sec,
-        tv_nsec: ts.tv_nsec,
-    };
-    let _ = errno::nanosleep(&req);
-    response.status = 0;
-    response.payload_len = 0;
-}
-
-pub(crate) fn handle_clock_gettime(
-    request: &LinuxSyscallOffloadRequest,
-    response: &mut LinuxSyscallOffloadResponse,
-) {
-    const CLOCK_REALTIME_OP: u64 = 0;
-    const CLOCK_MONOTONIC_OP: u64 = 1;
-    let ts = match request.arg0 {
-        CLOCK_REALTIME_OP => {
-            let mut out = errno::KTimespec::default();
-            if errno::clock_gettime(errno::CLOCK_REALTIME, &mut out) < 0 {
-                response.status = errno::EINVAL;
-                return;
-            }
-            LinuxTimespecWire {
-                tv_sec: out.tv_sec,
-                tv_nsec: out.tv_nsec,
-            }
-        }
-        CLOCK_MONOTONIC_OP => {
-            let mut out = errno::KTimespec::default();
-            if errno::clock_gettime(errno::CLOCK_MONOTONIC, &mut out) < 0 {
-                response.status = errno::EINVAL;
-                return;
-            }
-            let now_ns = (out.tv_sec as u64)
-                .wrapping_mul(1_000_000_000)
-                .wrapping_add(out.tv_nsec as u64);
-            // Capture the origin lazily; CAS-once so we keep the first observed value.
-            let _ = MONOTONIC_START_NANOS.compare_exchange(
-                0,
-                now_ns,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
-            let start = MONOTONIC_START_NANOS.load(Ordering::Acquire);
-            let elapsed = now_ns.saturating_sub(start);
-            LinuxTimespecWire {
-                tv_sec: (elapsed / 1_000_000_000) as i64,
-                tv_nsec: (elapsed % 1_000_000_000) as i64,
-            }
-        }
-        _ => {
-            response.status = errno::EINVAL;
-            return;
-        }
-    };
-    copy_payload(response, &ts);
-}
-
-pub(crate) fn handle_clock_nanosleep(
-    request: &LinuxSyscallOffloadRequest,
-    response: &mut LinuxSyscallOffloadResponse,
-) {
-    handle_nanosleep(request, response);
-}
-
 pub(crate) fn handle_set_robust_list(
     request: &LinuxSyscallOffloadRequest,
     response: &mut LinuxSyscallOffloadResponse,
@@ -594,7 +513,6 @@ fn fill_random_bytes(dest: &mut [u8], pid: u64, tid: u64) {
     let mut state = COUNTER.fetch_add(0xA076_1D64_78BD_642F, Ordering::Relaxed)
         ^ pid.wrapping_mul(0xBF58_476D_1CE4_E5B9)
         ^ tid.wrapping_mul(0x94D0_49BB_1331_11EB);
-    state ^= now_nanos_seed();
     for chunk in dest.chunks_mut(8) {
         state = splitmix64(state);
         let bytes = state.to_le_bytes();
@@ -611,16 +529,6 @@ fn splitmix64(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-fn now_nanos_seed() -> u64 {
-    let mut ts = errno::KTimespec::default();
-    if errno::clock_gettime(errno::CLOCK_REALTIME, &mut ts) < 0 {
-        return 0;
-    }
-    (ts.tv_sec as u64)
-        .wrapping_mul(1_000_000_000)
-        .wrapping_add(ts.tv_nsec as u64)
-}
-
 fn read_u64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes([
         bytes[offset],
@@ -632,13 +540,6 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
         bytes[offset + 6],
         bytes[offset + 7],
     ])
-}
-
-fn read_timespec(bytes: &[u8]) -> LinuxTimespecWire {
-    LinuxTimespecWire {
-        tv_sec: read_u64(bytes, 0) as i64,
-        tv_nsec: read_u64(bytes, 8) as i64,
-    }
 }
 
 fn write_uts_field(dest: &mut [u8; 65], value: &[u8]) {

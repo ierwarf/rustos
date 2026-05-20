@@ -1,7 +1,7 @@
 [logging]
 enabled = true
 boot_trace_enabled = false
-serial_mirror = true
+serial_mirror = false
 ring_buffer_bytes = 16384
 min_level = "info"
 
@@ -49,7 +49,7 @@ rules = [
 # file, into config/rustos.toml when testing a release-shaped image.
 
 codegen_units = 1
-opt_level = "0"
+opt_level = "2"
 overflow_checks = true
 debug_assertions = false
 lto = "thin"

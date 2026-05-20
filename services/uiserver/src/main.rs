@@ -38,6 +38,8 @@ const MAX_SLOW_RUNTIME_REFRESH_LOGS: usize = 8;
 const MAX_WAYLAND_CALLBACK_ONLY_LOGS: usize = 8;
 const WAYLAND_BACKLOG_SERVICE_INTERVAL: Duration = Duration::from_millis(4);
 const PARTIAL_RENDER_BUDGET: Duration = Duration::from_millis(80);
+const SLOW_LOOP_THRESHOLD: Duration = Duration::from_millis(50);
+const MAX_SLOW_LOOP_LOGS: usize = 16;
 
 static FRAME_SAMPLE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SLOW_CONSOLE_REFRESH_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -45,6 +47,37 @@ static SLOW_PRESENT_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SLOW_RUNTIME_REFRESH_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WAYLAND_CALLBACK_ONLY_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static POINTER_MOVED_LOGGED: AtomicUsize = AtomicUsize::new(0);
+static SLOW_LOOP_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Default)]
+struct LoopPhaseTimings {
+    input: Duration,
+    input_present: Duration,
+    wayland: Duration,
+    runtime: Duration,
+    console: Duration,
+    cursor: Duration,
+    main_present: Duration,
+    sleep: Duration,
+}
+
+impl LoopPhaseTimings {
+    fn total_excluding_sleep(&self) -> Duration {
+        self.input
+            + self.input_present
+            + self.wayland
+            + self.runtime
+            + self.console
+            + self.cursor
+            + self.main_present
+    }
+}
+
+enum PresentUpdateResult {
+    Idle,
+    Rendered { deferred_update: VisualUpdate },
+    StaleSurface,
+}
 
 fn cursor_move_update(
     state: &AppState,
@@ -67,9 +100,154 @@ fn cursor_move_update(
     update
 }
 
+fn prepare_drawable_update(
+    state: &AppState,
+    pending_update: &VisualUpdate,
+    presented_cursor_x: u32,
+    presented_cursor_y: u32,
+) -> VisualUpdate {
+    let mut drawable_update = pending_update.clone();
+    drawable_update.absorb(cursor_move_update(
+        state,
+        presented_cursor_x,
+        presented_cursor_y,
+    ));
+    drawable_update.coalesce_tight_partials();
+    drawable_update.promote_large_partial(state.surface.width, state.surface.height);
+    drawable_update
+}
+
+fn present_drawable_update(
+    state: &mut AppState,
+    drawable_update: &VisualUpdate,
+) -> Result<PresentUpdateResult, i32> {
+    if drawable_update.needs_full_redraw {
+        let render_started = Instant::now();
+        render_frame(state);
+        let render_elapsed = render_started.elapsed();
+        log_frame_sample("full", state);
+        let present_started = Instant::now();
+        match state.present() {
+            Ok(()) => {}
+            Err(err) if state.recover_if_stale_surface_error(err)? => {
+                return Ok(PresentUpdateResult::StaleSurface);
+            }
+            Err(err) => return Err(err),
+        }
+        let present_elapsed = present_started.elapsed();
+        profile::record_present(
+            true,
+            1,
+            u64::from(state.surface.width) * u64::from(state.surface.height),
+            render_elapsed,
+            present_elapsed,
+        );
+        let total_elapsed = render_elapsed + present_elapsed;
+        if total_elapsed >= SLOW_PRESENT_THRESHOLD {
+            log_slow_present(
+                state,
+                total_elapsed,
+                render_elapsed,
+                present_elapsed,
+                true,
+                None,
+            );
+        }
+        return Ok(PresentUpdateResult::Rendered {
+            deferred_update: VisualUpdate::default(),
+        });
+    }
+
+    if drawable_update.partial_rects().is_empty() {
+        return Ok(PresentUpdateResult::Idle);
+    }
+
+    let render_rects = drawable_update.partial_rects().to_vec();
+    let mut rendered_rects = Vec::with_capacity(render_rects.len());
+    let mut render_elapsed = Duration::ZERO;
+    let mut present_elapsed = Duration::ZERO;
+    let mut present_union = canvas::Rect::empty();
+    let mut pixel_count = 0_u64;
+    let mut deferred_update = VisualUpdate::default();
+
+    for (index, rect) in render_rects.iter().enumerate() {
+        present_union = present_union.union(*rect);
+        pixel_count = pixel_count.saturating_add(rect.width.saturating_mul(rect.height) as u64);
+
+        let render_started = Instant::now();
+        render_rect(state, *rect);
+        render_elapsed += render_started.elapsed();
+        rendered_rects.push(*rect);
+        if index + 1 < render_rects.len() && render_elapsed >= PARTIAL_RENDER_BUDGET {
+            for deferred_rect in &render_rects[index + 1..] {
+                deferred_update.add_partial_rect(*deferred_rect);
+            }
+            break;
+        }
+    }
+
+    let present_started = Instant::now();
+    for rect in &rendered_rects {
+        match state.present_rect(*rect) {
+            Ok(()) => {}
+            Err(err) if state.recover_if_stale_surface_error(err)? => {
+                return Ok(PresentUpdateResult::StaleSurface);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    present_elapsed += present_started.elapsed();
+    let rect_count = rendered_rects.len() as u64;
+    profile::record_present(
+        false,
+        rect_count,
+        pixel_count,
+        render_elapsed,
+        present_elapsed,
+    );
+    let total_elapsed = render_elapsed + present_elapsed;
+    if total_elapsed >= SLOW_PRESENT_THRESHOLD {
+        log_slow_present(
+            state,
+            total_elapsed,
+            render_elapsed,
+            present_elapsed,
+            false,
+            Some(present_union),
+        );
+    }
+    Ok(PresentUpdateResult::Rendered { deferred_update })
+}
+
+fn commit_rendered_update(
+    state: &AppState,
+    wayland: &mut Option<WaylandCompositor>,
+    pending_update: &mut VisualUpdate,
+    deferred_update: VisualUpdate,
+    presented_cursor_x: &mut u32,
+    presented_cursor_y: &mut u32,
+    frames_rendered_window: &mut u64,
+    cursor_moves_window: &mut u64,
+) {
+    *frames_rendered_window = frames_rendered_window.saturating_add(1);
+    if let Some(compositor) = wayland.as_mut() {
+        compositor.frame_presented();
+    }
+    let cursor_moved =
+        *presented_cursor_x != state.cursor_x || *presented_cursor_y != state.cursor_y;
+    pending_update.clear();
+    pending_update.absorb(deferred_update);
+    *presented_cursor_x = state.cursor_x;
+    *presented_cursor_y = state.cursor_y;
+    if cursor_moved {
+        *cursor_moves_window = cursor_moves_window.saturating_add(1);
+        log_pointer_moved_once(state);
+    }
+}
+
 fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
-        diag_line(&format!("uiserver panic: {info}"));
+        diag_line(format!("uiserver panic: {info}"));
     }));
 }
 
@@ -175,16 +353,13 @@ fn log_slow_console_refresh(state: &AppState, elapsed: Duration) {
     if sample_index >= MAX_SLOW_CONSOLE_REFRESH_LOGS {
         return;
     }
-    diag_line(
-        format!(
-            "uiserver: slow console refresh elapsed_ms={} console_windows={} focused_session={} wayland_windows={}",
-            elapsed.as_millis(),
-            state.console_windows.len(),
-            state.focused_session_handle,
-            state.wayland_windows.len(),
-        )
-        .as_str(),
-    );
+    diag_line(format!(
+        "uiserver: slow console refresh elapsed_ms={} console_windows={} focused_session={} wayland_windows={}",
+        elapsed.as_millis(),
+        state.console_windows.len(),
+        state.focused_session_handle,
+        state.wayland_windows.len(),
+    ));
 }
 
 fn log_slow_runtime_refresh(
@@ -197,19 +372,16 @@ fn log_slow_runtime_refresh(
     if sample_index >= MAX_SLOW_RUNTIME_REFRESH_LOGS {
         return;
     }
-    diag_line(
-        format!(
-            "uiserver: slow runtime refresh elapsed_ms={} runtime_changed={} apply_changed={} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
-            elapsed.as_millis(),
-            runtime_changed,
-            apply_changed,
-            state.console_windows.len(),
-            state.wayland_windows.len(),
-            state.focused_session_handle,
-            state.focused_wayland_surface_id,
-        )
-        .as_str(),
-    );
+    diag_line(format!(
+        "uiserver: slow runtime refresh elapsed_ms={} runtime_changed={} apply_changed={} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
+        elapsed.as_millis(),
+        runtime_changed,
+        apply_changed,
+        state.console_windows.len(),
+        state.wayland_windows.len(),
+        state.focused_session_handle,
+        state.focused_wayland_surface_id,
+    ));
 }
 
 fn log_slow_present(
@@ -252,18 +424,15 @@ fn log_slow_present(
             state.focused_wayland_surface_id,
         )
     };
-    diag_line(message.as_str());
+    diag_line(message);
 }
 
 fn log_boot_stage(started_at: Instant, stage: &str) {
-    diag_line(
-        format!(
-            "uiserver: boot stage={} elapsed_us={}",
-            stage,
-            started_at.elapsed().as_micros(),
-        )
-        .as_str(),
-    );
+    diag_line(format!(
+        "uiserver: boot stage={} elapsed_us={}",
+        stage,
+        started_at.elapsed().as_micros(),
+    ));
 }
 
 fn log_pointer_moved_once(state: &AppState) {
@@ -271,14 +440,38 @@ fn log_pointer_moved_once(state: &AppState) {
         .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
-        diag_line(
-            format!(
-                "uiserver: pointer moved x={} y={}",
-                state.cursor_x, state.cursor_y
-            )
-            .as_str(),
-        );
+        diag_line(format!(
+            "uiserver: pointer moved x={} y={}",
+            state.cursor_x, state.cursor_y
+        ));
     }
+}
+
+fn log_slow_loop_iteration(
+    state: &AppState,
+    iteration_elapsed: Duration,
+    timings: &LoopPhaseTimings,
+    backlog_remaining: bool,
+) {
+    let index = SLOW_LOOP_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if index >= MAX_SLOW_LOOP_LOGS {
+        return;
+    }
+    diag_line(format!(
+        "uiserver: slow loop iter_ms={} input_ms={} input_present_ms={} wayland_ms={} runtime_ms={} console_ms={} cursor_ms={} present_ms={} sleep_ms={} backlog={} console_windows={} wayland_windows={}",
+        iteration_elapsed.as_millis(),
+        timings.input.as_millis(),
+        timings.input_present.as_millis(),
+        timings.wayland.as_millis(),
+        timings.runtime.as_millis(),
+        timings.console.as_millis(),
+        timings.cursor.as_millis(),
+        timings.main_present.as_millis(),
+        timings.sleep.as_millis(),
+        backlog_remaining,
+        state.console_windows.len(),
+        state.wayland_windows.len(),
+    ));
 }
 
 fn log_wayland_callback_only(state: &AppState, rect: canvas::Rect) {
@@ -289,20 +482,17 @@ fn log_wayland_callback_only(state: &AppState, rect: canvas::Rect) {
     if log_index >= MAX_WAYLAND_CALLBACK_ONLY_LOGS {
         return;
     }
-    diag_line(
-        format!(
-            "uiserver: wayland callback-only dispatch rect={}x{}@{},{} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
-            rect.width,
-            rect.height,
-            rect.x,
-            rect.y,
-            state.console_windows.len(),
-            state.wayland_windows.len(),
-            state.focused_session_handle,
-            state.focused_wayland_surface_id,
-        )
-        .as_str(),
-    );
+    diag_line(format!(
+        "uiserver: wayland callback-only dispatch rect={}x{}@{},{} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
+        rect.width,
+        rect.height,
+        rect.x,
+        rect.y,
+        state.console_windows.len(),
+        state.wayland_windows.len(),
+        state.focused_session_handle,
+        state.focused_wayland_surface_id,
+    ));
 }
 
 fn run() -> Result<(), i32> {
@@ -364,7 +554,7 @@ fn run() -> Result<(), i32> {
     log_boot_stage(wayland_init_started, "wayland_initialize");
     match runtime.notify_ui_ready() {
         Ok(()) => diag_line("uiserver: ui ready notified"),
-        Err(err) => diag_line(format!("uiserver: ui ready notify failed errno={err}").as_str()),
+        Err(err) => diag_line(format!("uiserver: ui ready notify failed errno={err}")),
     }
     diag_line("uiserver: post-present init done");
     log_boot_stage(boot_started, "post_present_init");
@@ -383,6 +573,8 @@ fn run() -> Result<(), i32> {
 
     'main_loop: loop {
         loop_count = loop_count.saturating_add(1);
+        let iteration_started = Instant::now();
+        let mut phase_timings = LoopPhaseTimings::default();
 
         let mut background_ready = false;
         while let Ok(background) = desktop_background.try_recv() {
@@ -411,11 +603,56 @@ fn run() -> Result<(), i32> {
             }
         }
 
+        let input_started = Instant::now();
         let input =
             input_loop::process_pending_input(&mut state, wayland.as_mut(), &runtime, &mut events)?;
         pending_update.absorb(input.visual_update);
+        phase_timings.input = input_started.elapsed();
 
-        let now = Instant::now();
+        let input_present_started = Instant::now();
+        let drawable_update = prepare_drawable_update(
+            &state,
+            &pending_update,
+            presented_cursor_x,
+            presented_cursor_y,
+        );
+        let rendered_input_update = match present_drawable_update(&mut state, &drawable_update)? {
+            PresentUpdateResult::Rendered { deferred_update } => {
+                commit_rendered_update(
+                    &state,
+                    &mut wayland,
+                    &mut pending_update,
+                    deferred_update,
+                    &mut presented_cursor_x,
+                    &mut presented_cursor_y,
+                    &mut frames_rendered_window,
+                    &mut cursor_moves_window,
+                );
+                true
+            }
+            PresentUpdateResult::StaleSurface => {
+                pending_update.request_full();
+                continue 'main_loop;
+            }
+            PresentUpdateResult::Idle => false,
+        };
+        phase_timings.input_present = input_present_started.elapsed();
+        if rendered_input_update && input.backlog_remaining {
+            let iteration_elapsed = iteration_started.elapsed();
+            if iteration_elapsed >= SLOW_LOOP_THRESHOLD {
+                log_slow_loop_iteration(
+                    &state,
+                    iteration_elapsed,
+                    &phase_timings,
+                    input.backlog_remaining,
+                );
+            }
+            profile::maybe_emit();
+            continue 'main_loop;
+        }
+
+        let wayland_started = Instant::now();
+        let now = wayland_started;
         let mut wayland_callback_only = false;
         let service_wayland = !input.backlog_remaining || now >= next_wayland_backlog_service;
         if let Some(compositor) = wayland.as_mut() {
@@ -439,8 +676,10 @@ fn run() -> Result<(), i32> {
                 compositor.flush_clients();
             }
         }
+        phase_timings.wayland = wayland_started.elapsed();
 
-        let now = Instant::now();
+        let runtime_phase_started = Instant::now();
+        let now = runtime_phase_started;
         if now >= next_runtime_poll {
             let refresh_started = Instant::now();
             let runtime_changed = refresh_runtime_state(&runtime_sync, &mut runtime_state)?;
@@ -454,8 +693,10 @@ fn run() -> Result<(), i32> {
             next_runtime_poll = now + RUNTIME_POLL_SLEEP;
             pending_update.absorb(apply_update);
         }
+        phase_timings.runtime = runtime_phase_started.elapsed();
 
-        let now = Instant::now();
+        let console_phase_started = Instant::now();
+        let now = console_phase_started;
         if now >= next_console_poll {
             let refresh_started = Instant::now();
             let mut console_update = VisualUpdate::default();
@@ -471,8 +712,10 @@ fn run() -> Result<(), i32> {
             }
             next_console_poll = now + CONSOLE_POLL_SLEEP;
         }
+        phase_timings.console = console_phase_started.elapsed();
 
-        let now = Instant::now();
+        let cursor_phase_started = Instant::now();
+        let now = cursor_phase_started;
         if now >= next_cursor_blink {
             if let Some(rect) = state.toggle_focused_terminal_cursor() {
                 pending_update.absorb(VisualUpdate::partial(rect));
@@ -485,137 +728,57 @@ fn run() -> Result<(), i32> {
             pending_update.absorb(VisualUpdate::partial(cursor_dirty_rect));
             next_cursor_motion_settle = now + CURSOR_MOTION_SETTLE_INTERVAL;
         }
-        let mut drawable_update = pending_update.clone();
-        if !input.backlog_remaining || !pending_update.is_empty() {
-            drawable_update.absorb(cursor_move_update(
-                &state,
-                presented_cursor_x,
-                presented_cursor_y,
-            ));
-        }
-        drawable_update.coalesce_tight_partials();
-        drawable_update.promote_large_partial(state.surface.width, state.surface.height);
+        let drawable_update = prepare_drawable_update(
+            &state,
+            &pending_update,
+            presented_cursor_x,
+            presented_cursor_y,
+        );
+        phase_timings.cursor = cursor_phase_started.elapsed();
 
         let now = Instant::now();
         if now >= next_loop_summary {
-            diag_line(
-                format!(
-                    "uiserver: heartbeat loops={} frames={} cursor_moves={} cursor={},{} presented_cursor={},{} pending_update={} backlog={} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
-                    loop_count,
-                    frames_rendered_window,
-                    cursor_moves_window,
-                    state.cursor_x,
-                    state.cursor_y,
-                    presented_cursor_x,
-                    presented_cursor_y,
-                    !drawable_update.is_empty(),
-                    input.backlog_remaining,
-                    state.console_windows.len(),
-                    state.wayland_windows.len(),
-                    state.focused_session_handle,
-                    state.focused_wayland_surface_id,
-                )
-                .as_str(),
-            );
+            diag_line(format!(
+                "uiserver: heartbeat loops={} frames={} cursor_moves={} cursor={},{} presented_cursor={},{} pending_update={} backlog={} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
+                loop_count,
+                frames_rendered_window,
+                cursor_moves_window,
+                state.cursor_x,
+                state.cursor_y,
+                presented_cursor_x,
+                presented_cursor_y,
+                !drawable_update.is_empty(),
+                input.backlog_remaining,
+                state.console_windows.len(),
+                state.wayland_windows.len(),
+                state.focused_session_handle,
+                state.focused_wayland_surface_id,
+            ));
             next_loop_summary = now + Duration::from_secs(1);
             loop_count = 0;
             frames_rendered_window = 0;
             cursor_moves_window = 0;
         }
-        let mut deferred_update = VisualUpdate::default();
-        let rendered = if drawable_update.needs_full_redraw {
-            let render_started = Instant::now();
-            render_frame(&mut state);
-            let render_elapsed = render_started.elapsed();
-            log_frame_sample("full", &mut state);
-            let present_started = Instant::now();
-            match state.present() {
-                Ok(()) => {}
-                Err(err) if state.recover_if_stale_surface_error(err)? => {
-                    pending_update.request_full();
-                    continue 'main_loop;
-                }
-                Err(err) => return Err(err),
-            }
-            let present_elapsed = present_started.elapsed();
-            profile::record_present(
-                true,
-                1,
-                u64::from(state.surface.width) * u64::from(state.surface.height),
-                render_elapsed,
-                present_elapsed,
-            );
-            let total_elapsed = render_elapsed + present_elapsed;
-            if total_elapsed >= SLOW_PRESENT_THRESHOLD {
-                log_slow_present(
+        let main_present_started = Instant::now();
+        let rendered = match present_drawable_update(&mut state, &drawable_update)? {
+            PresentUpdateResult::Rendered { deferred_update } => {
+                commit_rendered_update(
                     &state,
-                    total_elapsed,
-                    render_elapsed,
-                    present_elapsed,
-                    true,
-                    None,
+                    &mut wayland,
+                    &mut pending_update,
+                    deferred_update,
+                    &mut presented_cursor_x,
+                    &mut presented_cursor_y,
+                    &mut frames_rendered_window,
+                    &mut cursor_moves_window,
                 );
+                true
             }
-            true
-        } else if !drawable_update.partial_rects().is_empty() {
-            let render_rects = drawable_update.partial_rects().to_vec();
-            let mut rendered_rects = Vec::with_capacity(render_rects.len());
-            let mut render_elapsed = Duration::ZERO;
-            let mut present_elapsed = Duration::ZERO;
-            let mut present_union = canvas::Rect::empty();
-            let mut pixel_count = 0_u64;
-
-            for (index, rect) in render_rects.iter().enumerate() {
-                present_union = present_union.union(*rect);
-                pixel_count =
-                    pixel_count.saturating_add(rect.width.saturating_mul(rect.height) as u64);
-
-                let render_started = Instant::now();
-                render_rect(&mut state, *rect);
-                render_elapsed += render_started.elapsed();
-                rendered_rects.push(*rect);
-                if index + 1 < render_rects.len() && render_elapsed >= PARTIAL_RENDER_BUDGET {
-                    for deferred_rect in &render_rects[index + 1..] {
-                        deferred_update.add_partial_rect(*deferred_rect);
-                    }
-                    break;
-                }
+            PresentUpdateResult::StaleSurface => {
+                pending_update.request_full();
+                continue 'main_loop;
             }
-
-            let present_started = Instant::now();
-            for rect in &rendered_rects {
-                match state.present_rect(*rect) {
-                    Ok(()) => {}
-                    Err(err) if state.recover_if_stale_surface_error(err)? => {
-                        pending_update.request_full();
-                        continue 'main_loop;
-                    }
-                    Err(err) => return Err(err),
-                }
-            }
-            present_elapsed += present_started.elapsed();
-            let rect_count = rendered_rects.len() as u64;
-            profile::record_present(
-                false,
-                rect_count,
-                pixel_count,
-                render_elapsed,
-                present_elapsed,
-            );
-            let total_elapsed = render_elapsed + present_elapsed;
-            if total_elapsed >= SLOW_PRESENT_THRESHOLD {
-                log_slow_present(
-                    &state,
-                    total_elapsed,
-                    render_elapsed,
-                    present_elapsed,
-                    false,
-                    Some(present_union),
-                );
-            }
-            true
-        } else {
-            false
+            PresentUpdateResult::Idle => false,
         };
 
         if !rendered && wayland_callback_only {
@@ -623,25 +786,10 @@ fn run() -> Result<(), i32> {
                 compositor.frame_presented();
             }
         }
+        phase_timings.main_present = main_present_started.elapsed();
 
-        if rendered {
-            frames_rendered_window = frames_rendered_window.saturating_add(1);
-            if let Some(compositor) = wayland.as_mut() {
-                compositor.frame_presented();
-            }
-            let cursor_moved =
-                presented_cursor_x != state.cursor_x || presented_cursor_y != state.cursor_y;
-            pending_update.clear();
-            pending_update.absorb(deferred_update);
-            presented_cursor_x = state.cursor_x;
-            presented_cursor_y = state.cursor_y;
-            if cursor_moved {
-                cursor_moves_window = cursor_moves_window.saturating_add(1);
-                log_pointer_moved_once(&state);
-            }
-        }
-
-        let now = Instant::now();
+        let sleep_started = Instant::now();
+        let now = sleep_started;
         if !rendered && pending_update.is_empty() && !input.backlog_remaining {
             let sleep_deadline = next_runtime_poll
                 .min(next_console_poll)
@@ -649,6 +797,18 @@ fn run() -> Result<(), i32> {
                 .min(next_cursor_motion_settle)
                 .min(now + IDLE_SLEEP);
             input_loop::sleep_until(sleep_deadline);
+        }
+        phase_timings.sleep = sleep_started.elapsed();
+
+        let iteration_elapsed = iteration_started.elapsed();
+        let active_elapsed = phase_timings.total_excluding_sleep();
+        if active_elapsed >= SLOW_LOOP_THRESHOLD {
+            log_slow_loop_iteration(
+                &state,
+                iteration_elapsed,
+                &phase_timings,
+                input.backlog_remaining,
+            );
         }
         profile::maybe_emit();
     }
@@ -664,7 +824,7 @@ fn main() {
         Err(code) => code,
     };
     if exit_code != 0 {
-        diag_line(format!("uiserver: exiting with nonzero status errno={exit_code}").as_str());
+        diag_line(format!("uiserver: exiting with nonzero status errno={exit_code}"));
     }
     std::process::exit(exit_code);
 }

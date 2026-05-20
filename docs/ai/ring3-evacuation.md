@@ -40,6 +40,13 @@ privilege substrate, not a policy owner.
   decision must remain near a hot path, keep the policy owner in a service and
   expose a small ring0 fact/action primitive instead of reintroducing broad
   kernel fallback behavior.
+- Do not move a syscall to ring3 by building a syscall proxy that immediately
+  reissues the same Linux syscall from the service. Valid evacuation shape is
+  `app syscall -> policy service -> narrow RustOS broker/primitive`; invalid
+  shape is `app syscall -> policy service -> same app-visible Linux syscall`.
+  Per-task sleep and hot read-only time queries should stay kernel-direct or
+  use a dedicated non-recursive broker, because the caller task must be the
+  object that blocks/wakes.
 - Source regions that still violate this shape should carry paired
   `RING3-MIGRATION-REFERENCE START` / `RING3-MIGRATION-REFERENCE END` markers
   around the live code. Do not comment the code out; the marker is a migration
@@ -52,8 +59,11 @@ privilege substrate, not a policy owner.
 - `loaderd`: Linux ELF and Windows PE image policy, mapping materialization,
   import/export/system-DLL policy, runtime launch requests.
 - `procd`: Linux exec/fork/wait/signal policy and process namespace decisions.
-- `syscalld`: Linux credential, rlimit, random/time/MM policy and Win32 syscall
-  validation before narrow kernel actions.
+- `syscalld`: Linux credential, rlimit, random/MM policy and Win32 syscall
+  validation before narrow kernel actions. Time syscalls are not proxied
+  through `syscalld` when they would reissue the same Linux syscall; hot
+  `clock_gettime`, `nanosleep`, and `clock_nanosleep` handling stays
+  kernel-direct unless a non-recursive broker is introduced.
 - `netd`: Linux socket namespace and socket syscall routing before the gated
   kernel socket broker.
 - `driverd`: staged driver registry parsing, autoload order, dependencies,
@@ -66,10 +76,15 @@ privilege substrate, not a policy owner.
 
 1. Device ioctl policy bypass:
    - Current source: `kernel/compat/src/user/syscall/linux/service_ops.rs`
-     routes Linux `ioctl` to `devmgrd` after bootstrap, with a direct
-     `ioctl_current_process_fd` fallback only before `devmgrd` registers.
-   - Target: route policy-sensitive ioctl classes through `devmgrd`; keep the
-     brokered current-process memory/device operation in ring0.
+     routes policy-sensitive Linux `ioctl` classes to `devmgrd`. The direct
+     `ioctl_current_process_fd` fallback is now limited to pre-`devmgrd`
+     bootstrap or ioctl classes that are intentionally hot data-path broker
+     operations.
+   - Completed: post-`devmgrd` policy-sensitive ioctl fallback to direct ring0
+     dispatch was removed.
+   - Remaining target: route more device-specific ioctl classes through
+     `devmgrd` as their service-side validation exists; keep the brokered
+     current-process memory/device operation in ring0.
 
 2. Input event queue ownership:
    - Current source: `kernel/io-manager/src/input/event_queue.rs` owns
@@ -94,35 +109,45 @@ privilege substrate, not a policy owner.
 
 4. Device namespace and metadata:
    - Current source: `vfsd` queries `devmgrd` using the device registry IPC for
-     `/dev` lookup/readdir, with a static explicit-node fallback only before
-     `devmgrd` registers.
-   - Target: `devmgrd` owns device registry, permissions, capability transfer,
-     and device-open policy; keep shrinking `vfsd` fallback nodes and move
-     device-open capability transfer to `devmgrd`.
+     `/dev` lookup/readdir. `initd` gates `runtimed` on `devmgrd` readiness so
+     the UI/session path does not depend on static `/dev` fallback nodes.
+   - Completed: static device-node metadata and readdir fallback entries were
+     removed from `vfsd`; `/dev` node existence and type now come from
+     `devmgrd`.
+   - Remaining target: move device-open capability transfer to `devmgrd`.
 
 5. Driver bootstrap policy leftovers:
    - Current source: `kernel/io-manager/src/driver/mod.rs` still has
-     `device_alias_present_from_policy`, `provider_group_active_from_policy`,
-     and a boot-framebuffer fallback path.
-   - Target: keep these as narrow hardware facts or fallback primitives only.
-     Provider ordering, fallback priority, alias matching, and retry policy stay
-     in `driverd` registries/manifests.
+     `hardware_alias_present`, `provider_group_hardware_active`, and a
+     boot-framebuffer fallback primitive.
+   - Completed: the kernel-facing driver broker names now expose hardware facts
+     instead of policy ownership; provider ordering, fallback priority, alias
+     matching, dependency handling, and retry policy stay in `driverd`
+     registries/manifests.
+   - Remaining target: keep boot-framebuffer as a last-resort primitive only.
 
 6. Storage selection and partition policy:
    - Current source: `kernel/io-manager/src/storage/block.rs` and
      `kernel/io-manager/src/storage/block/boot.rs` register roots, detect
-     partitions, sort by boot-volume hints, and select boot handles.
-   - Target: `storaged` owns inventory, partition policy, root selection, and
-     mount candidate ordering after bootstrap. Kernel keeps block hardware
-     drivers and the gated boot/block read broker for `vfsd` and early `rootd`.
+     partitions, and select the early boot-volume handle.
+   - Completed: boot-volume selection is cached at the kernel broker boundary,
+     so post-bootstrap boot-volume reads reuse the selected handle instead of
+     rerunning transport/partition ordering policy.
+   - Remaining target: `storaged` owns inventory, partition policy, root
+     selection, and mount candidate ordering after bootstrap. Kernel keeps block
+     hardware drivers and the gated boot/block read broker for `vfsd` and early
+     `rootd`.
 
 7. Bootstrap VFS escape hatches:
    - Current source: `kernel/compat/src/user/syscall/linux/service_ops.rs`
-     still has bootstrap `openat`, `statx`, `newfstatat`, `access`, and fixed
-     service-spawn exceptions for early service loading.
-   - Target: shrink direct paths to `rootd` and the fixed foundational service
-     allowlist only. Post-bootstrap binary/library loading belongs to
-     `loaderd` plus `vfsd`, not generic kernel file reads.
+     keeps bootstrap `openat`, `statx`, `newfstatat`, and `access` only while
+     `vfsd` is not registered, plus fixed service-spawn exceptions for early
+     service loading.
+   - Completed: post-`vfsd` direct ring0 file/metadata checks for bootstrap
+     image paths were removed; once `vfsd` registers, binary/library loading
+     and metadata route through `loaderd` plus `vfsd`.
+   - Remaining target: shrink fixed service-spawn exceptions to `rootd` and
+     the foundational service allowlist only.
 
 8. Service supervision and restart policy:
    - Current source: kernel spawn brokers can still directly spawn the fixed

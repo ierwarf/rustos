@@ -31,7 +31,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(2);
 const RETRY_BACKOFF: Duration = Duration::from_millis(50);
 const DEFAULT_INIT_TASK_WEIGHT_MICROS: u64 = 1_000;
 const DISPLAY_CRITICAL_TASK_WEIGHT_MICROS: u64 = 2_000;
-// Previously 6_000ms — designed to keep inputd/devmgrd/storaged off the spawn
+// Previously 6_000ms — designed to keep inputd/storaged off the spawn
 // path while display/UI came up. With directed-yield IPC the display bring-up
 // no longer starves on round-robin scheduling, so the defer dominates total
 // boot time (~6s of dead air post-runtimed). 750ms keeps a small ordering gap
@@ -169,8 +169,11 @@ fn main() {
 }
 
 fn secondary_service_deferred(exec: &str, now: Instant, deadline: Option<Instant>) -> bool {
+    if SECONDARY_SERVICE_DEFER_AFTER_RUNTIMED.is_zero() {
+        return false;
+    }
     match exec {
-        INPUTD_EXEC_PATH | DEVMGRD_EXEC_PATH | STORAGED_EXEC_PATH => {
+        INPUTD_EXEC_PATH | STORAGED_EXEC_PATH => {
             deadline.is_none_or(|defer_until| now < defer_until)
         }
         _ => false,
@@ -257,9 +260,9 @@ fn init_exec_priority(exec: &str) -> u8 {
         LOADERD_EXEC_PATH => 2,
         DRIVERD_EXEC_PATH => 3,
         NETD_EXEC_PATH => 4,
-        RUNTIMED_EXEC_PATH => 5,
+        DEVMGRD_EXEC_PATH => 5,
         INPUTD_EXEC_PATH => 6,
-        DEVMGRD_EXEC_PATH => 7,
+        RUNTIMED_EXEC_PATH => 7,
         STORAGED_EXEC_PATH => 8,
         _ => 9,
     }
@@ -272,7 +275,11 @@ fn launch_gate_satisfied(exec: &str) -> bool {
             service_ready(IPC_SERVICE_LINUX_SYSCALLD) && service_ready(IPC_SERVICE_VFSD)
         }
         DRIVERD_EXEC_PATH => foundation_policy_services_ready(),
-        RUNTIMED_EXEC_PATH => foundation_policy_services_ready() && service_ready(IPC_SERVICE_NETD),
+        RUNTIMED_EXEC_PATH => {
+            foundation_policy_services_ready()
+                && service_ready(IPC_SERVICE_NETD)
+                && service_ready(rustos_user_abi::syscall::IPC_SERVICE_DEVMGRD)
+        }
         _ => foundation_policy_services_ready(),
     }
 }

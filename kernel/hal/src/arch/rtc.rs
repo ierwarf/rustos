@@ -29,6 +29,10 @@ static RTC_TICKS_COMPLETED: AtomicU64 = AtomicU64::new(0);
 static RTC_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static RTC_LAST_ALIVE_SECOND: AtomicU64 = AtomicU64::new(u64::MAX);
 static RTC_LAST_DIAG_PRINT_TICK: AtomicU64 = AtomicU64::new(0);
+// Marked by RTC IRQ each time the integer-second wall clock advances; drained
+// outside IRQ context by `drain_pending_heartbeat`. `u64::MAX` is the sentinel
+// for "no second has ever been observed" (matches RTC_LAST_ALIVE_SECOND).
+static HEARTBEAT_PENDING_SECOND: AtomicU64 = AtomicU64::new(u64::MAX);
 static RTC_LAST_XHCI_TRANSFER_COUNT: AtomicU64 = AtomicU64::new(0);
 static RTC_LAST_HID_POINTER_REPORT_COUNT: AtomicU64 = AtomicU64::new(0);
 static RTC_LAST_INPUT_PACKET_SUBMIT_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -298,84 +302,104 @@ pub fn on_interrupt() {
             );
         }
     }
+    // Heartbeat snapshot + format + log used to run here. With KVM each outb to
+    // debugcon is a VMExit, so emitting ~700 bytes from IRQ context drops the
+    // current second's frame — visible as a periodic stutter. Just mark the
+    // second as pending; housekeeping picks it up outside IRQ context.
     let current_second = ticks / RTC_TICKS_PER_SEC;
     let last_reported_second = RTC_LAST_ALIVE_SECOND.load(Ordering::Acquire);
-    if current_second != last_reported_second
-        && RTC_LAST_ALIVE_SECOND
-            .compare_exchange(
-                last_reported_second,
-                current_second,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    {
-        if !crate::debug::enabled!(heartbeat, info) {
-            let _ = cmos_read(RTC_REG_C);
-            return;
-        }
-        let snapshot = crate::hooks::heartbeat_snapshot();
-        let xhci_transfer_count = snapshot.xhci_transfer_count;
-        let hid_pointer_report_count = snapshot.hid_pointer_report_count;
-        let input_snapshot = snapshot.input;
-        let linux_irq_owner_count = snapshot.linux_irq_owner_count;
-        let linux_irq_total_depth = snapshot.linux_irq_total_depth as usize;
-        let linux_input_lock_active = snapshot.linux_input_lock_active;
-        let linux_input_lock_last_seq = snapshot.linux_input_lock_last_seq;
-        let xhci_delta = xhci_transfer_count.saturating_sub(
-            RTC_LAST_XHCI_TRANSFER_COUNT.swap(xhci_transfer_count, Ordering::AcqRel),
-        );
-        let hid_pointer_delta = hid_pointer_report_count.saturating_sub(
-            RTC_LAST_HID_POINTER_REPORT_COUNT.swap(hid_pointer_report_count, Ordering::AcqRel),
-        );
-        let input_packet_delta = input_snapshot.pointer_packet_submits.saturating_sub(
-            RTC_LAST_INPUT_PACKET_SUBMIT_COUNT
-                .swap(input_snapshot.pointer_packet_submits, Ordering::AcqRel),
-        );
-        let input_absolute_delta = input_snapshot.pointer_absolute_submits.saturating_sub(
-            RTC_LAST_INPUT_ABSOLUTE_SUBMIT_COUNT
-                .swap(input_snapshot.pointer_absolute_submits, Ordering::AcqRel),
-        );
-        let input_read_call_delta = input_snapshot.read_calls.saturating_sub(
-            RTC_LAST_INPUT_READ_CALL_COUNT.swap(input_snapshot.read_calls, Ordering::AcqRel),
-        );
-        let input_read_event_delta = input_snapshot.read_events.saturating_sub(
-            RTC_LAST_INPUT_READ_EVENT_COUNT.swap(input_snapshot.read_events, Ordering::AcqRel),
-        );
-        let linux_irq_depth_delta = (linux_irq_total_depth as u64).saturating_sub(
-            RTC_LAST_LINUX_IRQ_LOCK_DEPTH.swap(linux_irq_total_depth as u64, Ordering::AcqRel),
-        );
-        crate::debug::info!(
-            heartbeat,
-            alloc::format!(
-                "second={} userspace_display={} xhci_delta={} hid_ptr_delta={} input_packet_delta={} input_abs_delta={} input_read_calls_delta={} input_read_events_delta={} linux_irq_owners={} linux_irq_depth={} linux_irq_depth_delta={} input_lock_active={} input_lock_last_seq={} eventq_lock_active={} eventq_lock_last_seq={} queued={} pending_coalesced={} pending_pointer_position={} dropped_discrete={} dropped_lossy={}",
-                current_second,
-                snapshot.userspace_display_active,
-                xhci_delta,
-                hid_pointer_delta,
-                input_packet_delta,
-                input_absolute_delta,
-                input_read_call_delta,
-                input_read_event_delta,
-                linux_irq_owner_count,
-                linux_irq_total_depth,
-                linux_irq_depth_delta,
-                linux_input_lock_active,
-                linux_input_lock_last_seq,
-                input_snapshot.lock_active,
-                input_snapshot.lock_last_seq,
-                input_snapshot.queued,
-                input_snapshot.pending_coalesced,
-                input_snapshot.pending_pointer_position,
-                input_snapshot.dropped_discrete,
-                input_snapshot.dropped_lossy
-            )
-            .as_str()
-        );
+    if current_second != last_reported_second {
+        HEARTBEAT_PENDING_SECOND.store(current_second, Ordering::Release);
     }
     // Must read register C to acknowledge and re-arm RTC interrupts.
     let _ = cmos_read(RTC_REG_C);
     RTC_TICKS_COMPLETED.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Drain a pending heartbeat second (if any) and emit its diagnostic log. Must
+/// be called outside IRQ context — the housekeeping task is the intended
+/// caller. Returns the number of seconds drained.
+pub fn drain_pending_heartbeat() -> usize {
+    let pending = HEARTBEAT_PENDING_SECOND.load(Ordering::Acquire);
+    if pending == u64::MAX {
+        return 0;
+    }
+    let last_reported = RTC_LAST_ALIVE_SECOND.load(Ordering::Acquire);
+    if pending == last_reported {
+        return 0;
+    }
+    if RTC_LAST_ALIVE_SECOND
+        .compare_exchange(last_reported, pending, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return 0;
+    }
+    if !crate::debug::enabled!(heartbeat, info) {
+        return 1;
+    }
+    emit_heartbeat_log(pending);
+    1
+}
+
+fn emit_heartbeat_log(current_second: u64) {
+    let snapshot = crate::hooks::heartbeat_snapshot();
+    let xhci_transfer_count = snapshot.xhci_transfer_count;
+    let hid_pointer_report_count = snapshot.hid_pointer_report_count;
+    let input_snapshot = snapshot.input;
+    let linux_irq_owner_count = snapshot.linux_irq_owner_count;
+    let linux_irq_total_depth = snapshot.linux_irq_total_depth as usize;
+    let linux_input_lock_active = snapshot.linux_input_lock_active;
+    let linux_input_lock_last_seq = snapshot.linux_input_lock_last_seq;
+    let xhci_delta = xhci_transfer_count.saturating_sub(
+        RTC_LAST_XHCI_TRANSFER_COUNT.swap(xhci_transfer_count, Ordering::AcqRel),
+    );
+    let hid_pointer_delta = hid_pointer_report_count.saturating_sub(
+        RTC_LAST_HID_POINTER_REPORT_COUNT.swap(hid_pointer_report_count, Ordering::AcqRel),
+    );
+    let input_packet_delta = input_snapshot.pointer_packet_submits.saturating_sub(
+        RTC_LAST_INPUT_PACKET_SUBMIT_COUNT
+            .swap(input_snapshot.pointer_packet_submits, Ordering::AcqRel),
+    );
+    let input_absolute_delta = input_snapshot.pointer_absolute_submits.saturating_sub(
+        RTC_LAST_INPUT_ABSOLUTE_SUBMIT_COUNT
+            .swap(input_snapshot.pointer_absolute_submits, Ordering::AcqRel),
+    );
+    let input_read_call_delta = input_snapshot.read_calls.saturating_sub(
+        RTC_LAST_INPUT_READ_CALL_COUNT.swap(input_snapshot.read_calls, Ordering::AcqRel),
+    );
+    let input_read_event_delta = input_snapshot.read_events.saturating_sub(
+        RTC_LAST_INPUT_READ_EVENT_COUNT.swap(input_snapshot.read_events, Ordering::AcqRel),
+    );
+    let linux_irq_depth_delta = (linux_irq_total_depth as u64).saturating_sub(
+        RTC_LAST_LINUX_IRQ_LOCK_DEPTH.swap(linux_irq_total_depth as u64, Ordering::AcqRel),
+    );
+    crate::debug::info!(
+        heartbeat,
+        alloc::format!(
+            "second={} userspace_display={} xhci_delta={} hid_ptr_delta={} input_packet_delta={} input_abs_delta={} input_read_calls_delta={} input_read_events_delta={} linux_irq_owners={} linux_irq_depth={} linux_irq_depth_delta={} input_lock_active={} input_lock_last_seq={} eventq_lock_active={} eventq_lock_last_seq={} queued={} pending_coalesced={} pending_pointer_position={} dropped_discrete={} dropped_lossy={}",
+            current_second,
+            snapshot.userspace_display_active,
+            xhci_delta,
+            hid_pointer_delta,
+            input_packet_delta,
+            input_absolute_delta,
+            input_read_call_delta,
+            input_read_event_delta,
+            linux_irq_owner_count,
+            linux_irq_total_depth,
+            linux_irq_depth_delta,
+            linux_input_lock_active,
+            linux_input_lock_last_seq,
+            input_snapshot.lock_active,
+            input_snapshot.lock_last_seq,
+            input_snapshot.queued,
+            input_snapshot.pending_coalesced,
+            input_snapshot.pending_pointer_position,
+            input_snapshot.dropped_discrete,
+            input_snapshot.dropped_lossy
+        )
+        .as_str()
+    );
 }
 
 pub fn sleep(milliseconds: u64) {

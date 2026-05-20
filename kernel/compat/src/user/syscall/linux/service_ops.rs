@@ -448,9 +448,21 @@ fn syscall_linux_policy_owner_nanosleep(request_ptr: u64) -> u64 {
         Ok(ts) => ts,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
     };
-    if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
-        return linux_errno(LINUX_EINVAL);
+    match sleep_relative_timespec(ts) {
+        Ok(()) => 0,
+        Err(errno) => linux_errno(errno),
     }
+}
+
+fn validate_timespec(ts: LinuxTimespecWire) -> Result<(), i64> {
+    if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(())
+}
+
+fn sleep_relative_timespec(ts: LinuxTimespecWire) -> Result<(), i64> {
+    validate_timespec(ts)?;
     let nanos = (ts.tv_sec as u64)
         .saturating_mul(1_000_000_000)
         .saturating_add(ts.tv_nsec as u64);
@@ -458,7 +470,34 @@ fn syscall_linux_policy_owner_nanosleep(request_ptr: u64) -> u64 {
         let millis = nanos.saturating_add(999_999) / 1_000_000;
         crate::arch::rtc::sleep(millis.max(1));
     }
-    0
+    Ok(())
+}
+
+fn current_clock_timespec(clock_id: u64) -> Result<LinuxTimespecWire, i64> {
+    match clock_id {
+        id if id == linux_abi::CLOCK_MONOTONIC as u64 => Ok(monotonic_timespec()),
+        id if id == linux_abi::CLOCK_REALTIME as u64 => Ok(realtime_timespec()),
+        _ => Err(LINUX_EINVAL),
+    }
+}
+
+fn timespec_lte(lhs: LinuxTimespecWire, rhs: LinuxTimespecWire) -> bool {
+    lhs.tv_sec < rhs.tv_sec || lhs.tv_sec == rhs.tv_sec && lhs.tv_nsec <= rhs.tv_nsec
+}
+
+fn sleep_until_timespec(clock_id: u64, deadline: LinuxTimespecWire) -> Result<(), i64> {
+    validate_timespec(deadline)?;
+    let now = current_clock_timespec(clock_id)?;
+    if timespec_lte(deadline, now) {
+        return Ok(());
+    }
+    let mut tv_sec = deadline.tv_sec.saturating_sub(now.tv_sec);
+    let mut tv_nsec = deadline.tv_nsec - now.tv_nsec;
+    if tv_nsec < 0 {
+        tv_sec = tv_sec.saturating_sub(1);
+        tv_nsec += 1_000_000_000;
+    }
+    sleep_relative_timespec(LinuxTimespecWire { tv_sec, tv_nsec })
 }
 
 fn syscall_linux_policy_owner_clock_gettime(clock_id: u64, timespec_ptr: u64) -> u64 {
@@ -467,10 +506,9 @@ fn syscall_linux_policy_owner_clock_gettime(clock_id: u64, timespec_ptr: u64) ->
         return linux_errno(address_space_error_to_linux_errno(err));
     }
 
-    let ts = match clock_id {
-        id if id == linux_abi::CLOCK_MONOTONIC as u64 => monotonic_timespec(),
-        id if id == linux_abi::CLOCK_REALTIME as u64 => realtime_timespec(),
-        _ => return linux_errno(LINUX_EINVAL),
+    let ts = match current_clock_timespec(clock_id) {
+        Ok(ts) => ts,
+        Err(errno) => return linux_errno(errno),
     };
     match usermem::write_current_user_bytes(timespec_ptr, as_bytes(&ts)) {
         Ok(()) => 0,
@@ -562,12 +600,18 @@ pub(super) fn syscall_linux_clock_nanosleep(
         Ok(ts) => ts,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
     };
-    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_CLOCK_NANOSLEEP);
-    request.arg0 = clock_id;
-    request.arg1 = flags;
-    request.path_len = LINUX_TIMESPEC_SIZE as u32;
-    request.path[..LINUX_TIMESPEC_SIZE].copy_from_slice(as_bytes(&ts));
-    match call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response)) {
+    if flags & !(linux_abi::TIMER_ABSTIME as u64) != 0 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let result = if flags & linux_abi::TIMER_ABSTIME as u64 != 0 {
+        sleep_until_timespec(clock_id, ts)
+    } else {
+        match current_clock_timespec(clock_id) {
+            Ok(_) => sleep_relative_timespec(ts),
+            Err(errno) => Err(errno),
+        }
+    };
+    match result {
         Ok(()) => 0,
         Err(errno) => linux_errno(errno),
     }
@@ -1226,20 +1270,14 @@ pub(super) fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mo
             path
         );
     }
-    // Fast path: bootstrap-owned binary/library paths are served from the in-kernel
-    // boot volume cache. Going through vfsd would require multi-call IPC chunking
-    // bounded by VFS_IPC_PAYLOAD_CAPACITY which dominates loaderd spawn latency.
-    // RING3-MIGRATION-REFERENCE START: rootd/loaderd/vfsd should own
-    // post-bootstrap binary/library loading. Keep only the fixed early
-    // foundational-service escape hatch in ring0.
-    if can_lookup_bootstrap_path(dirfd, path.as_str())
+    if can_use_bootstrap_vfs_escape()
+        && can_lookup_bootstrap_path(dirfd, path.as_str())
         && flags & linux_abi::O_ACCMODE == linux_abi::O_RDONLY
         && flags & linux_abi::O_DIRECTORY == 0
         && is_bootstrap_image_path(path.as_str())
     {
         return bootstrap_openat(path.as_str(), flags);
     }
-    // RING3-MIGRATION-REFERENCE END: rootd/loaderd/vfsd bootstrap file fast path.
     let mut request = new_vfs_request(VFS_IPC_OP_OPENAT);
     request.dirfd = dirfd;
     request.arg0 = flags;
@@ -1249,10 +1287,7 @@ pub(super) fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mo
     }
     let response = match call_vfs_ipc_request(&request) {
         Ok(response) => response,
-        Err(_) if !ipc_ops::service_registered(linux_abi::IPC_SERVICE_VFSD) => {
-            // RING3-MIGRATION-REFERENCE START: shrink pre-vfsd fallback to rootd
-            // bootstrap only; generic post-bootstrap VFS belongs to vfsd.
-            // RING3-MIGRATION-REFERENCE END: pre-vfsd bootstrap fallback.
+        Err(_) if can_use_bootstrap_vfs_escape() => {
             return bootstrap_openat(path.as_str(), flags);
         }
         Err(errno) => return linux_errno(errno),
@@ -1455,10 +1490,14 @@ pub(super) fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u
         } else {
             kernel_object::api::device::DeviceAccessKind::Native
         };
-        let user_len = match inputd_authorize_read(fd, user_len, is_evdev) {
-            Ok(approved_len) => approved_len,
-            Err(LINUX_ENOSYS) => user_len,
-            Err(errno) => return linux_errno(errno),
+        // Clamp to the same limits inputd enforces. These are compile-time
+        // constants; no IPC round-trip is needed.
+        const MAX_NATIVE: usize = 1024 * 24;
+        const MAX_EVDEV: usize = 1024 * 24 * 3;
+        let user_len = if is_evdev {
+            user_len.min(MAX_EVDEV)
+        } else {
+            user_len.min(MAX_NATIVE)
         };
         if user_len == 0 {
             return 0;
@@ -1520,29 +1559,6 @@ pub(super) fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u
     copied as u64
 }
 
-fn inputd_authorize_read(fd: u64, requested_len: usize, is_evdev: bool) -> Result<usize, i64> {
-    let mut request = InputdIpcRequest {
-        version: INPUTD_IPC_ABI_VERSION,
-        op: INPUTD_IPC_OP_AUTHORIZE_READ,
-        fd,
-        access: if is_evdev {
-            INPUTD_ACCESS_EVDEV
-        } else {
-            INPUTD_ACCESS_NATIVE
-        },
-        requested_len: requested_len as u64,
-        ..InputdIpcRequest::default()
-    };
-    if let Some(snapshot) = multitask::current_user_snapshot() {
-        request.pid = snapshot.process_id();
-        request.tid = snapshot.thread_id();
-    }
-    let response = call_inputd_ipc_request(&request)?;
-    if response.approved_len > requested_len as u64 {
-        return Err(LINUX_EINVAL);
-    }
-    usize::try_from(response.approved_len).map_err(|_| LINUX_EOVERFLOW)
-}
 
 pub(super) fn syscall_linux_vfs_pread64(fd: u64, user_ptr: u64, user_len: u64, offset: u64) -> u64 {
     if let Some(file) = current_vfs_file_handle(fd) {
@@ -2498,15 +2514,15 @@ pub(super) fn syscall_linux_vfs_statx(
     if let Err(err) = usermem::validate_current_user_write_buffer(statx_ptr, LINUX_STATX_SIZE) {
         return linux_errno(address_space_error_to_linux_errno(err));
     }
-    // RING3-MIGRATION-REFERENCE START: rootd/loaderd/vfsd should own
-    // post-bootstrap metadata for binary/library paths.
-    if can_lookup_bootstrap_path(dirfd, path.as_str()) && is_bootstrap_image_path(path.as_str()) {
+    if can_use_bootstrap_vfs_escape()
+        && can_lookup_bootstrap_path(dirfd, path.as_str())
+        && is_bootstrap_image_path(path.as_str())
+    {
         match bootstrap_read_file(path.as_str()) {
             Ok(_) => return bootstrap_stat_path(path.as_str(), statx_ptr, true),
             Err(errno) => return linux_errno(errno),
         }
     }
-    // RING3-MIGRATION-REFERENCE END: rootd/loaderd/vfsd statx bootstrap path.
     let mut request = new_vfs_request(VFS_IPC_OP_STATX);
     request.dirfd = dirfd;
     request.flags = flags as u32;
@@ -2516,7 +2532,7 @@ pub(super) fn syscall_linux_vfs_statx(
     }
     let response = match call_vfs_ipc_request(&request) {
         Ok(response) => response,
-        Err(_) if !ipc_ops::service_registered(linux_abi::IPC_SERVICE_VFSD) => {
+        Err(_) if can_use_bootstrap_vfs_escape() => {
             return bootstrap_stat_path(path.as_str(), statx_ptr, true);
         }
         Err(errno) => return linux_errno(errno),
@@ -2555,15 +2571,15 @@ pub(super) fn syscall_linux_vfs_newfstatat(
     if let Err(err) = usermem::validate_current_user_write_buffer(stat_ptr, LINUX_STAT_SIZE) {
         return linux_errno(address_space_error_to_linux_errno(err));
     }
-    // RING3-MIGRATION-REFERENCE START: rootd/loaderd/vfsd should own
-    // post-bootstrap fstatat metadata for binary/library paths.
-    if can_lookup_bootstrap_path(dirfd, path.as_str()) && is_bootstrap_image_path(path.as_str()) {
+    if can_use_bootstrap_vfs_escape()
+        && can_lookup_bootstrap_path(dirfd, path.as_str())
+        && is_bootstrap_image_path(path.as_str())
+    {
         match bootstrap_read_file(path.as_str()) {
             Ok(_) => return bootstrap_stat_path(path.as_str(), stat_ptr, false),
             Err(errno) => return linux_errno(errno),
         }
     }
-    // RING3-MIGRATION-REFERENCE END: rootd/loaderd/vfsd fstatat bootstrap path.
     let mut request = new_vfs_request(VFS_IPC_OP_NEWFSTATAT);
     request.dirfd = dirfd;
     request.flags = flags as u32;
@@ -2572,7 +2588,7 @@ pub(super) fn syscall_linux_vfs_newfstatat(
     }
     let response = match call_vfs_ipc_request(&request) {
         Ok(response) => response,
-        Err(_) if !ipc_ops::service_registered(linux_abi::IPC_SERVICE_VFSD) => {
+        Err(_) if can_use_bootstrap_vfs_escape() => {
             return bootstrap_stat_path(path.as_str(), stat_ptr, false);
         }
         Err(errno) => return linux_errno(errno),
@@ -2633,15 +2649,15 @@ pub(super) fn syscall_linux_vfs_access(dirfd: u64, path_ptr: u64, mode: u64, fla
         Ok(path) => path,
         Err(errno) => return linux_errno(errno),
     };
-    // RING3-MIGRATION-REFERENCE START: rootd/loaderd/vfsd should own
-    // post-bootstrap access checks for binary/library paths.
-    if can_lookup_bootstrap_path(dirfd, path.as_str()) && is_bootstrap_image_path(path.as_str()) {
+    if can_use_bootstrap_vfs_escape()
+        && can_lookup_bootstrap_path(dirfd, path.as_str())
+        && is_bootstrap_image_path(path.as_str())
+    {
         match bootstrap_read_file(path.as_str()) {
             Ok(_) => return 0,
             Err(errno) => return linux_errno(errno),
         }
     }
-    // RING3-MIGRATION-REFERENCE END: rootd/loaderd/vfsd access bootstrap path.
     let mut request = new_vfs_request(VFS_IPC_OP_ACCESS);
     request.dirfd = dirfd;
     request.flags = flags as u32;
@@ -2651,12 +2667,10 @@ pub(super) fn syscall_linux_vfs_access(dirfd: u64, path_ptr: u64, mode: u64, fla
     }
     match call_vfs_ipc_request(&request).and_then(|response| ensure_vfs_status(&response)) {
         Ok(()) => 0,
-        Err(_) if !ipc_ops::service_registered(linux_abi::IPC_SERVICE_VFSD) => {
-            match bootstrap_read_file(path.as_str()) {
-                Ok(_) => 0,
-                Err(errno) => linux_errno(errno),
-            }
-        }
+        Err(_) if can_use_bootstrap_vfs_escape() => match bootstrap_read_file(path.as_str()) {
+            Ok(_) => 0,
+            Err(errno) => linux_errno(errno),
+        },
         Err(errno) => linux_errno(errno),
     }
 }
@@ -2986,7 +3000,7 @@ pub(super) fn syscall_linux_ioctl(fd: u64, request_number: u64, arg: u64) -> u64
             Ok(u64::from_le_bytes(bytes))
         }) {
             Ok(value) => return value,
-            Err(LINUX_ENOSYS) => {}
+            Err(_) if !ipc_ops::service_registered(linux_abi::IPC_SERVICE_DEVMGRD) => {}
             Err(errno) => return linux_errno(errno),
         }
     }
@@ -3004,13 +3018,16 @@ pub(super) fn syscall_linux_ioctl(fd: u64, request_number: u64, arg: u64) -> u64
 fn ioctl_requires_devmgrd_policy(request_number: u64) -> bool {
     matches!(
         request_number,
+        // Boot-time surface setup — devmgrd validates surface parameters.
         rustos_user_abi::device::DISPLAY_IOCTL_GET_INFO
             | rustos_user_abi::device::DISPLAY_IOCTL_CREATE_SURFACE
+            // Session lifecycle — devmgrd owns session-table bookkeeping.
             | rustos_user_abi::console::CONSOLE_IOCTL_CREATE_SESSION
             | rustos_user_abi::console::CONSOLE_IOCTL_CLOSE_SESSION
             | rustos_user_abi::console::CONSOLE_IOCTL_BIND_CURRENT_SESSION
             | rustos_user_abi::console::CONSOLE_IOCTL_SET_SESSION_STATE
-            | rustos_user_abi::console::CONSOLE_IOCTL_SET_FOCUS
+        // CONSOLE_IOCTL_SET_FOCUS intentionally omitted: devmgrd is a
+        // no-op forwarder for this ioctl; go direct to avoid IPC cost.
     )
 }
 // RING3-MIGRATION-REFERENCE END: devmgrd-owned ioctl policy bypass.
@@ -3254,6 +3271,10 @@ fn is_linux_at_fdcwd(dirfd: u64) -> bool {
 
 fn can_lookup_bootstrap_path(dirfd: u64, path: &str) -> bool {
     path.starts_with('/') || is_linux_at_fdcwd(dirfd)
+}
+
+fn can_use_bootstrap_vfs_escape() -> bool {
+    !ipc_ops::service_registered(linux_abi::IPC_SERVICE_VFSD)
 }
 
 fn file_sysop_error_to_linux_errno(error: crate::user::sysops::file::FileSysopError) -> i64 {

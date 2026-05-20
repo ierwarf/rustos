@@ -201,7 +201,7 @@ pub(crate) fn maybe_emit() {
         window.present_pixels / 1_000_000,
         window.throttle_spins,
     );
-    diag_line(line.as_str());
+    diag_line(line);
     *window = ProfileWindow {
         started_at: Some(now),
         ..ProfileWindow::default()
