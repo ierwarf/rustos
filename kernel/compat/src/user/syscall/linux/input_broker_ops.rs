@@ -69,22 +69,16 @@ pub(super) fn syscall_linux_rustos_input_ingest_broker(args_ptr: u64) -> u64 {
     if capacity > INPUTD_INGEST_MAX_EVENTS {
         return linux_errno(LINUX_EINVAL);
     }
-    let mut events = alloc::vec![rustos_user_abi::ui::UiInputEvent::default(); capacity];
-    let count = kernel_io_manager::api::input::event_queue::drain_events(&mut events);
-    for (index, event) in events.iter().take(count).enumerate() {
-        let wire = InputIngressWire {
-            kind: event.kind,
-            access: INPUTD_ACCESS_NATIVE,
-            flags: 0,
-            event: *event,
-        };
+    let mut ingress = alloc::vec![InputIngressWire::default(); capacity];
+    let count = kernel_io_manager::api::input::event_queue::drain_ingress(&mut ingress);
+    for (index, wire) in ingress.iter().take(count).enumerate() {
         let offset = index
             .checked_mul(core::mem::size_of::<InputIngressWire>())
             .and_then(|offset| u64::try_from(offset).ok());
         let Some(offset) = offset else {
             return linux_errno(LINUX_EINVAL);
         };
-        if let Err(err) = usermem::write_current_user_struct(args.out_events_ptr + offset, &wire) {
+        if let Err(err) = usermem::write_current_user_struct(args.out_events_ptr + offset, wire) {
             return linux_errno(address_space_error_to_linux_errno(err));
         }
     }

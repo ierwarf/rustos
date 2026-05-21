@@ -1,8 +1,14 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) use crate::input_core::InputEventQueueState;
-use crate::sync::{KernelSpinGuard as MutexGuard, KernelSpinLock as Mutex};
+use crate::sync::KernelSpinLock as Mutex;
 use driver_abi::PointerPacket;
+use heapless::Deque as HeaplessDeque;
+use rustos_user_abi::syscall::{
+    INPUTD_ACCESS_NATIVE, INPUTD_INGRESS_KIND_EVENT, INPUTD_INGRESS_KIND_KEYBOARD,
+    INPUTD_INGRESS_KIND_POINTER_ABSOLUTE, INPUTD_INGRESS_KIND_POINTER_PACKET, InputIngressWire,
+    InputKeyboardEventWire, InputPointerAbsoluteWire, InputPointerPacketWire,
+};
 #[cfg(not(test))]
 use x86_64::instructions::interrupts;
 
@@ -16,9 +22,11 @@ static POINTER_PACKET_SUBMIT_COUNT: AtomicU64 = AtomicU64::new(0);
 static POINTER_ABSOLUTE_SUBMIT_COUNT: AtomicU64 = AtomicU64::new(0);
 static INPUT_READ_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
 static INPUT_READ_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
+static INPUT_INGRESS_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
 static EVENT_QUEUE_LOCK_ACTIVE: AtomicU64 = AtomicU64::new(0);
 static EVENT_QUEUE_LOCK_LAST_SEQ: AtomicU64 = AtomicU64::new(0);
 static EVENT_QUEUE_LOCK_NEXT_SEQ: AtomicU64 = AtomicU64::new(1);
+const INPUT_INGRESS_QUEUE_CAPACITY: usize = 2048;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct InputEventQueueDebugSnapshot {
@@ -35,10 +43,9 @@ pub struct InputEventQueueDebugSnapshot {
     pub dropped_lossy: u64,
 }
 
-// RING3-MIGRATION-REFERENCE START: inputd should own input queue policy,
-// overflow/coalescing state, readers, and observability. Ring0 should keep only
-// bounded hardware-report ingress, wakeup, and user-copy/broker primitives.
 static INPUT_EVENTS: Mutex<InputEventQueueState> = Mutex::new(InputEventQueueState::new());
+static INPUT_INGRESS: Mutex<HeaplessDeque<InputIngressWire, INPUT_INGRESS_QUEUE_CAPACITY>> =
+    Mutex::new(HeaplessDeque::new());
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn push_pointer_motion(dx: i16, dy: i16) {
@@ -65,21 +72,61 @@ pub(crate) fn push_pointer_button_left(pressed: bool) {
     push_pointer_button(crate::input_core::POINTER_BUTTON_LEFT, pressed);
 }
 
-pub(crate) fn submit_pointer_packet(packet: PointerPacket, previous_buttons: u8) -> bool {
-    POINTER_PACKET_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
-    with_event_queue(|events| events.submit_pointer_packet(packet, previous_buttons))
+pub(crate) fn submit_keyboard_event(event: crate::input::keyboard::KeyboardEvent) -> bool {
+    push_ingress(InputIngressWire {
+        kind: INPUTD_INGRESS_KIND_KEYBOARD,
+        access: INPUTD_ACCESS_NATIVE,
+        flags: 0,
+        event: InputEvent::default(),
+        keyboard: InputKeyboardEventWire {
+            action: keyboard_action_to_inputd(event.action),
+            reserved0: 0,
+            code: event.code as u32,
+            modifiers: event.modifiers.bits() as u32,
+            text: event.text.unwrap_or(0) as u32,
+        },
+        pointer_packet: InputPointerPacketWire::default(),
+        pointer_absolute: InputPointerAbsoluteWire::default(),
+    })
 }
 
-pub(crate) fn submit_pointer_absolute(
-    x: u32,
-    y: u32,
-    buttons: u8,
-    wheel_vertical: i16,
-    previous_buttons: u8,
-) -> bool {
+pub(crate) fn submit_pointer_packet(packet: PointerPacket) -> bool {
+    POINTER_PACKET_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
+    push_ingress(InputIngressWire {
+        kind: INPUTD_INGRESS_KIND_POINTER_PACKET,
+        access: INPUTD_ACCESS_NATIVE,
+        flags: 0,
+        event: InputEvent::default(),
+        keyboard: InputKeyboardEventWire::default(),
+        pointer_packet: InputPointerPacketWire {
+            buttons: packet.buttons,
+            reserved0: [0; 3],
+            dx: packet.dx,
+            dy: packet.dy,
+            wheel_vertical: packet.wheel_vertical,
+            wheel_horizontal: packet.wheel_horizontal,
+        },
+        pointer_absolute: InputPointerAbsoluteWire::default(),
+    })
+}
+
+pub(crate) fn submit_pointer_absolute(x: u32, y: u32, buttons: u8, wheel_vertical: i16) -> bool {
     POINTER_ABSOLUTE_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
-    with_event_queue(|events| {
-        events.submit_pointer_absolute(x, y, buttons, wheel_vertical, previous_buttons)
+    push_ingress(InputIngressWire {
+        kind: INPUTD_INGRESS_KIND_POINTER_ABSOLUTE,
+        access: INPUTD_ACCESS_NATIVE,
+        flags: 0,
+        event: InputEvent::default(),
+        keyboard: InputKeyboardEventWire::default(),
+        pointer_packet: InputPointerPacketWire::default(),
+        pointer_absolute: InputPointerAbsoluteWire {
+            buttons,
+            reserved0: [0; 3],
+            x,
+            y,
+            wheel_vertical,
+            reserved1: 0,
+        },
     })
 }
 
@@ -91,17 +138,17 @@ pub(crate) fn read_input_events(dest: &mut [InputEvent]) -> usize {
 }
 
 pub(crate) fn has_pending_input_events() -> bool {
-    with_event_queue(|events| events.has_pending_events())
-}
-
-pub(crate) fn lock_event_queue() -> MutexGuard<'static, InputEventQueueState> {
-    INPUT_EVENTS.lock()
+    has_pending_ingress() || with_event_queue(|events| events.has_pending_events())
 }
 
 pub fn debug_snapshot() -> InputEventQueueDebugSnapshot {
     let snapshot = INPUT_EVENTS
         .try_lock()
         .map(|events| events.snapshot())
+        .unwrap_or_default();
+    let ingress_queued = INPUT_INGRESS
+        .try_lock()
+        .map(|ingress| ingress.len())
         .unwrap_or_default();
     InputEventQueueDebugSnapshot {
         pointer_packet_submits: POINTER_PACKET_SUBMIT_COUNT.load(Ordering::Relaxed),
@@ -110,24 +157,98 @@ pub fn debug_snapshot() -> InputEventQueueDebugSnapshot {
         read_events: INPUT_READ_EVENT_COUNT.load(Ordering::Relaxed),
         lock_active: EVENT_QUEUE_LOCK_ACTIVE.load(Ordering::Acquire),
         lock_last_seq: EVENT_QUEUE_LOCK_LAST_SEQ.load(Ordering::Acquire),
-        queued: snapshot.queued,
+        queued: snapshot.queued.saturating_add(ingress_queued),
         pending_coalesced: snapshot.pending_coalesced,
         pending_pointer_position: snapshot.pending_pointer_position,
         dropped_discrete: snapshot.dropped_discrete,
-        dropped_lossy: snapshot.dropped_lossy,
+        dropped_lossy: snapshot
+            .dropped_lossy
+            .saturating_add(INPUT_INGRESS_DROP_COUNT.load(Ordering::Relaxed)),
     }
+}
+
+pub(crate) fn drain_ingress(dest: &mut [InputIngressWire]) -> usize {
+    let mut count = with_ingress_queue(|ingress| {
+        let mut count = 0;
+        for slot in dest.iter_mut() {
+            let Some(wire) = ingress.pop_front() else {
+                break;
+            };
+            *slot = wire;
+            count += 1;
+        }
+        count
+    });
+    if count == dest.len() {
+        return count;
+    }
+
+    let mut events = alloc::vec![InputEvent::default(); dest.len() - count];
+    let event_count = read_input_events(&mut events);
+    for event in events.into_iter().take(event_count) {
+        dest[count] = InputIngressWire {
+            kind: INPUTD_INGRESS_KIND_EVENT,
+            access: INPUTD_ACCESS_NATIVE,
+            flags: 0,
+            event,
+            keyboard: InputKeyboardEventWire::default(),
+            pointer_packet: InputPointerPacketWire::default(),
+            pointer_absolute: InputPointerAbsoluteWire::default(),
+        };
+        count += 1;
+    }
+    count
 }
 
 #[cfg(test)]
 pub(crate) fn reset_for_tests() {
     *INPUT_EVENTS.lock() = InputEventQueueState::new();
+    *INPUT_INGRESS.lock() = HeaplessDeque::new();
     POINTER_PACKET_SUBMIT_COUNT.store(0, Ordering::Relaxed);
     POINTER_ABSOLUTE_SUBMIT_COUNT.store(0, Ordering::Relaxed);
     INPUT_READ_CALL_COUNT.store(0, Ordering::Relaxed);
     INPUT_READ_EVENT_COUNT.store(0, Ordering::Relaxed);
+    INPUT_INGRESS_DROP_COUNT.store(0, Ordering::Relaxed);
     EVENT_QUEUE_LOCK_ACTIVE.store(0, Ordering::Relaxed);
     EVENT_QUEUE_LOCK_LAST_SEQ.store(0, Ordering::Relaxed);
     EVENT_QUEUE_LOCK_NEXT_SEQ.store(1, Ordering::Relaxed);
+}
+
+fn push_ingress(wire: InputIngressWire) -> bool {
+    with_ingress_queue(|ingress| {
+        if ingress.push_back(wire).is_ok() {
+            true
+        } else {
+            INPUT_INGRESS_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+    })
+}
+
+fn has_pending_ingress() -> bool {
+    with_ingress_queue(|ingress| !ingress.is_empty())
+}
+
+fn keyboard_action_to_inputd(action: crate::input::keyboard::KeyAction) -> u16 {
+    match action {
+        crate::input::keyboard::KeyAction::Pressed => crate::input_core::INPUT_ACTION_PRESSED,
+        crate::input::keyboard::KeyAction::Released => crate::input_core::INPUT_ACTION_RELEASED,
+        crate::input::keyboard::KeyAction::Repeated => crate::input_core::INPUT_ACTION_REPEATED,
+    }
+}
+
+fn with_ingress_queue<R>(
+    f: impl FnOnce(&mut HeaplessDeque<InputIngressWire, INPUT_INGRESS_QUEUE_CAPACITY>) -> R,
+) -> R {
+    #[cfg(test)]
+    {
+        f(&mut INPUT_INGRESS.lock())
+    }
+
+    #[cfg(not(test))]
+    {
+        interrupts::without_interrupts(|| f(&mut INPUT_INGRESS.lock()))
+    }
 }
 
 fn with_event_queue<R>(f: impl FnOnce(&mut InputEventQueueState) -> R) -> R {
@@ -151,8 +272,6 @@ fn with_event_queue<R>(f: impl FnOnce(&mut InputEventQueueState) -> R) -> R {
         result
     }
 }
-// RING3-MIGRATION-REFERENCE END: inputd-owned input queue policy.
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -191,7 +310,7 @@ mod tests {
         push_pointer_motion(1, 1);
 
         let snapshot = debug_snapshot();
-        assert!(snapshot.pending_coalesced);
-        assert_eq!(snapshot.queued, 0);
+        assert!(!snapshot.pending_coalesced);
+        assert_eq!(snapshot.queued, 1);
     }
 }

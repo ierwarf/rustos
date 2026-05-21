@@ -117,33 +117,24 @@ fn with_pending_tty_keyboard_events<R>(
 }
 
 fn dispatch_keyboard_event_locked(event: KeyboardEvent) {
+    let submitted = crate::input::event_queue::submit_keyboard_event(event);
     let session = if crate::io::gui::is_userspace_display_active() {
         None
     } else {
         crate::io::session::focused_console_session()
     };
     let Some(session) = session else {
-        let mut input_events = crate::input::event_queue::lock_event_queue();
-        if input_events.can_accept_keyboard_event(event) {
-            let pushed = input_events.push_keyboard_event(event);
-            debug_assert!(pushed);
-        } else {
-            input_events.note_keyboard_drop(event);
-        }
+        let _ = submitted;
         return;
     };
 
     let mut pending = PENDING_TTY_KEYBOARD_EVENTS.lock();
-    let mut input_events = crate::input::event_queue::lock_event_queue();
     let tty_ok = pending.can_push_event();
-    if input_events.can_accept_keyboard_event(event) && tty_ok {
-        let pushed = input_events.push_keyboard_event(event);
-        debug_assert!(pushed);
+    if submitted && tty_ok {
         pending.push_event(PendingTtyKeyboardEvent { session, event });
         return;
     }
 
-    input_events.note_keyboard_drop(event);
     pending.record_drop();
 }
 
@@ -196,8 +187,8 @@ mod tests {
 
         dispatch_keyboard_event_locked(key_event());
 
-        let mut events = [crate::user::abi::device::InputEvent::default(); 1];
-        assert_eq!(crate::input::event_queue::read_input_events(&mut events), 0);
+        let mut ingress = [rustos_user_abi::syscall::InputIngressWire::default(); 1];
+        assert_eq!(crate::input::event_queue::drain_ingress(&mut ingress), 1);
         assert_eq!(
             PENDING_TTY_KEYBOARD_EVENTS.lock().queued.len(),
             PENDING_TTY_KEYBOARD_EVENTS_CAPACITY
@@ -205,7 +196,7 @@ mod tests {
     }
 
     #[test]
-    fn input_overflow_drops_keyboard_event_for_both_sinks() {
+    fn keyboard_ingress_no_longer_depends_on_legacy_input_queue_capacity() {
         let _guard = isolated();
         reset_for_tests();
         for code in 0..4096_u32 {
@@ -215,6 +206,12 @@ mod tests {
         dispatch_keyboard_event(key_event());
 
         assert_eq!(PENDING_TTY_KEYBOARD_EVENTS.lock().queued.len(), 0);
+        let mut ingress = [rustos_user_abi::syscall::InputIngressWire::default(); 1];
+        assert_eq!(crate::input::event_queue::drain_ingress(&mut ingress), 1);
+        assert_eq!(
+            ingress[0].kind,
+            rustos_user_abi::syscall::INPUTD_INGRESS_KIND_KEYBOARD
+        );
     }
 
     #[test]
@@ -225,12 +222,12 @@ mod tests {
 
         dispatch_keyboard_event(key_event());
 
-        let mut events = [crate::user::abi::device::InputEvent::default(); 1];
-        assert_eq!(crate::input::event_queue::read_input_events(&mut events), 1);
+        let mut ingress = [rustos_user_abi::syscall::InputIngressWire::default(); 1];
+        assert_eq!(crate::input::event_queue::drain_ingress(&mut ingress), 1);
         assert_eq!(
-            events[0].kind,
-            crate::user::abi::device::INPUT_KIND_KEYBOARD
+            ingress[0].kind,
+            rustos_user_abi::syscall::INPUTD_INGRESS_KIND_KEYBOARD
         );
-        assert_eq!(events[0].code, KeyCode::A as u32);
+        assert_eq!(ingress[0].keyboard.code, KeyCode::A as u32);
     }
 }

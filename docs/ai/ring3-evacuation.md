@@ -105,6 +105,23 @@ privilege substrate, not a policy owner.
    - Completed: `inputd` now owns a bounded reader queue and lossy overflow
      accounting after draining the ring0 ingress broker; exported stats combine
      the remaining kernel ingress counters with service queue depth/drop state.
+   - Completed: pointer motion/position coalescing moved out of the kernel
+     ingress queue and into `inputd`; `kernel/io-manager/src/input_core.rs`
+     now keeps raw bounded ingress reports only.
+   - Completed: the input queue migration markers in `input_core.rs` and
+     `input/event_queue.rs` were retired after the remaining code was reduced
+     to bounded ring0 ingress, wakeup/debug counters, and broker drain.
+   - Completed: kernel pointer delivery no longer gates reports on display
+     readiness; inputd owns reader/drop policy for early reports while ring0
+     forwards validated packets into the bounded ingress queue.
+   - Completed: pointer packets now cross `SYS_RUSTOS_INPUT_INGEST_BROKER`
+     as raw pointer ingress records; `inputd` owns pointer button-edge state
+     and translates raw relative/absolute reports into native/evdev reader
+     events.
+   - Completed: keyboard reader events now cross the same ingress broker as
+     typed keyboard ingress records; `inputd` owns the reader queue insertion
+     and native/evdev read exposure while ring0 keeps only USB capture and
+     legacy TTY forwarding.
    - Target: `inputd` owns event queue policy, overflow behavior, readers, and
      observability. Ring0 should enqueue validated hardware reports into a
      bounded shared ring, wake the target, and retain only user-copy/broker
@@ -191,7 +208,13 @@ privilege substrate, not a policy owner.
    - Target: keep reducing restart dependency policy into rootd lease protocol
      state and readiness/dependency manifests.
 
-9. Console/TTY/session policy:
+9. Network socket policy:
+   - Completed: Linux socket calls now use the explicit versioned
+     `NetdIpcRequest/NetdIpcResponse` protocol between the syscall path and
+     `netd`; `netd` still invokes the gated ring0 net broker for current-process
+     fd/user-copy commits.
+
+10. Console/TTY/session policy:
    - Current source: console, TTY, and GUI device paths still live mainly under
      `kernel/io-manager/src/io`.
    - Completed (2026-05-20): policy-sensitive console/session observation and

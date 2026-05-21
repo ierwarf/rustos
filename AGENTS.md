@@ -8,7 +8,13 @@ Read this first, then keep context small.
 - Use `docs/ai/task-router.md` to choose the smallest context set.
 - Use `docs/ai-map.md` or `docs/ai/repo-map.md` before broad source search.
 - Do not preload all docs, all manifests, or whole subsystems.
-- Prefer `rg` and exact `sed -n 'START,ENDp'` ranges over opening large files.
+- Prefer Serena MCP symbol tools, then `rg`, and exact `sed -n 'START,ENDp'` ranges over opening large files.
+
+## Tool usage
+
+When analyzing code structure, use Serena MCP symbol tools before broad text search.
+Use ripgrep only for raw text matches or when Serena lacks the needed index.
+If an MCP server is unavailable, say so explicitly.
 
 ## Do Not Inspect By Default
 

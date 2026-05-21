@@ -1,9 +1,8 @@
 //! In-kernel input event queue.
 //!
-//! Owns the bounded ring used by hardware callbacks plus the coalescing/drop
-//! policy that decides what reaches readers. evdev translation and the key/
-//! pointer code maps now live in the shared `input-evdev` crate so the kernel
-//! and `inputd` share the same bit-stable tables.
+//! Owns the bounded ingress ring used by hardware callbacks. Reader queue
+//! coalescing, evdev translation, and drop policy live in `inputd` and the
+//! shared `input-evdev` crate so ring0 stays a thin report source.
 
 pub use driver_abi::PointerPacket;
 use heapless::Deque as HeaplessDeque;
@@ -17,10 +16,8 @@ pub use input_evdev::{
     POINTER_BUTTON_X1, POINTER_BUTTON_X2, linux_key_code_to_rustos, pointer_button_to_linux,
     rustos_key_code_to_linux, translate_input_events_to_evdev, translate_input_to_evdev,
 };
-pub use keyboard_core::{KeyAction, KeyCode, KeyboardEvent, Modifiers};
 
 const INPUT_EVENT_QUEUE_CAPACITY: usize = 2048;
-const INPUT_EVENT_LOSSY_RESERVE: usize = 64;
 
 const POINTER_BUTTON_MASK_LEFT: u8 = driver_abi::POINTER_BUTTON_LEFT;
 const POINTER_BUTTON_MASK_RIGHT: u8 = driver_abi::POINTER_BUTTON_RIGHT;
@@ -43,82 +40,19 @@ pub struct InputEventQueueSnapshot {
     pub overwritten_pointer_positions: u64,
 }
 
-// RING3-MIGRATION-REFERENCE START: inputd should own the bounded input queue,
-// coalescing logic, overflow/drop policy, and reader-visible counters. Ring0
-// should keep only the IRQ-side ingress primitive (a bounded shared ring) plus
-// the user-copy/broker primitives consumers need. evdev translation and key/
-// button code maps already moved to the shared `input-evdev` crate.
-#[derive(Clone, Copy)]
-struct PendingEvent {
-    event: InputEvent,
-    sequence: u64,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PendingKind {
-    Coalesced,
-    PointerPosition,
-}
-
 pub struct InputEventQueueState {
     queued: HeaplessDeque<InputEvent, INPUT_EVENT_QUEUE_CAPACITY>,
-    pending_coalesced: Option<PendingEvent>,
-    pending_pointer_position: Option<PendingEvent>,
-    next_pending_sequence: u64,
     dropped_discrete_events: u64,
     dropped_lossy_events: u64,
-    overwritten_pointer_positions: u64,
 }
 
 impl InputEventQueueState {
     pub const fn new() -> Self {
         Self {
             queued: HeaplessDeque::new(),
-            pending_coalesced: None,
-            pending_pointer_position: None,
-            next_pending_sequence: 0,
             dropped_discrete_events: 0,
             dropped_lossy_events: 0,
-            overwritten_pointer_positions: 0,
         }
-    }
-
-    pub fn can_accept_keyboard_event(&self, event: KeyboardEvent) -> bool {
-        match event.action {
-            KeyAction::Repeated => {
-                queue_remaining_capacity(&self.queued) > INPUT_EVENT_LOSSY_RESERVE
-            }
-            KeyAction::Pressed | KeyAction::Released => queue_remaining_capacity(&self.queued) != 0,
-        }
-    }
-
-    pub fn push_keyboard_event(&mut self, event: KeyboardEvent) -> bool {
-        let accepted = self.can_accept_keyboard_event(event);
-        let action = event.action;
-        let input_event = InputEvent {
-            kind: INPUT_KIND_KEYBOARD,
-            action: map_key_action(event.action),
-            code: event.code as u32,
-            value0: 0,
-            value1: 0,
-            modifiers: event.modifiers.bits() as u32,
-            text: event.text.unwrap_or(0) as u32,
-        };
-
-        if !accepted {
-            self.record_keyboard_drop(action);
-            return false;
-        }
-
-        if matches!(action, KeyAction::Repeated) {
-            return self.push_noncritical_discrete_event(input_event);
-        }
-
-        self.push_critical_discrete_event(input_event)
-    }
-
-    pub fn note_keyboard_drop(&mut self, event: KeyboardEvent) {
-        self.record_keyboard_drop(event.action);
     }
 
     pub fn push_pointer_motion(&mut self, dx: i16, dy: i16) {
@@ -126,7 +60,7 @@ impl InputEventQueueState {
             return;
         }
 
-        self.push_coalescible_event(InputEvent {
+        self.push_lossy_event(InputEvent {
             kind: INPUT_KIND_POINTER_MOTION,
             action: INPUT_ACTION_NONE,
             code: 0,
@@ -138,7 +72,7 @@ impl InputEventQueueState {
     }
 
     pub fn push_pointer_position(&mut self, x: u32, y: u32) {
-        let event = InputEvent {
+        self.push_lossy_event(InputEvent {
             kind: INPUT_KIND_POINTER_POSITION,
             action: INPUT_ACTION_NONE,
             code: 0,
@@ -146,22 +80,10 @@ impl InputEventQueueState {
             value1: y as i32,
             modifiers: 0,
             text: 0,
-        };
-
-        if let Some(pending) = &mut self.pending_pointer_position {
-            if pending.event.value0 != event.value0 || pending.event.value1 != event.value1 {
-                pending.event = event;
-                self.overwritten_pointer_positions =
-                    self.overwritten_pointer_positions.saturating_add(1);
-            }
-            return;
-        }
-
-        self.pending_pointer_position = Some(self.new_pending_event(event));
+        });
     }
 
     pub fn push_pointer_button(&mut self, code: u32, pressed: bool) {
-        self.drain_pending_before_critical_discrete();
         self.push_critical_discrete_event(InputEvent {
             kind: INPUT_KIND_POINTER_BUTTON,
             action: if pressed {
@@ -182,7 +104,7 @@ impl InputEventQueueState {
             return;
         }
 
-        self.push_coalescible_event(InputEvent {
+        self.push_lossy_event(InputEvent {
             kind: INPUT_KIND_POINTER_SCROLL,
             action: INPUT_ACTION_NONE,
             code: 0,
@@ -229,56 +151,31 @@ impl InputEventQueueState {
     }
 
     pub fn read_input_events(&mut self, dest: &mut [InputEvent]) -> usize {
-        let mut count = pop_events_into(&mut self.queued, dest);
-        while count < dest.len() {
-            let Some(event) = self.take_oldest_pending_event() else {
-                break;
-            };
-            dest[count] = event;
-            count += 1;
-        }
-        count
+        pop_events_into(&mut self.queued, dest)
     }
 
     pub fn has_pending_events(&self) -> bool {
         !self.queued.is_empty()
-            || self.pending_coalesced.is_some()
-            || self.pending_pointer_position.is_some()
     }
 
     pub fn snapshot(&self) -> InputEventQueueSnapshot {
         InputEventQueueSnapshot {
             queued: self.queued.len(),
-            pending_coalesced: self.pending_coalesced.is_some(),
-            pending_pointer_position: self.pending_pointer_position.is_some(),
+            pending_coalesced: false,
+            pending_pointer_position: false,
             dropped_discrete: self.dropped_discrete_events,
             dropped_lossy: self.dropped_lossy_events,
-            overwritten_pointer_positions: self.overwritten_pointer_positions,
+            overwritten_pointer_positions: 0,
         }
     }
 
-    fn push_coalescible_event(&mut self, event: InputEvent) {
-        if let Some(pending) = &mut self.pending_coalesced {
-            if can_coalesce(pending.event, event) {
-                merge_coalesced_event(&mut pending.event, event);
-                return;
-            }
-        }
-
-        self.make_room_for_pending_coalesced_slot();
-        if self.pending_coalesced.is_none() {
-            self.pending_coalesced = Some(self.new_pending_event(event));
+    fn push_lossy_event(&mut self, event: InputEvent) -> bool {
+        if self.queued.push_back(event).is_ok() {
+            true
         } else {
             self.record_lossy_drop();
+            false
         }
-    }
-
-    fn push_noncritical_discrete_event(&mut self, event: InputEvent) -> bool {
-        if queue_remaining_capacity(&self.queued) <= INPUT_EVENT_LOSSY_RESERVE {
-            self.record_discrete_drop();
-            return false;
-        }
-        self.queued.push_back(event).is_ok()
     }
 
     fn push_critical_discrete_event(&mut self, event: InputEvent) -> bool {
@@ -308,104 +205,6 @@ impl InputEventQueueState {
 
         self.push_pointer_button(button_mask as u32, is_pressed);
         true
-    }
-
-    fn make_room_for_pending_coalesced_slot(&mut self) {
-        while self.pending_coalesced.is_some() {
-            let Some(kind) = self.oldest_pending_kind() else {
-                break;
-            };
-            if self.try_queue_pending_kind(kind, INPUT_EVENT_LOSSY_RESERVE) {
-                continue;
-            }
-            self.drop_pending_kind(kind);
-        }
-    }
-
-    fn drain_pending_before_critical_discrete(&mut self) {
-        while let Some(kind) = self.oldest_pending_kind() {
-            if self.try_queue_pending_kind(kind, 1) {
-                continue;
-            }
-            self.drop_pending_kind(kind);
-        }
-    }
-
-    fn try_queue_pending_kind(
-        &mut self,
-        kind: PendingKind,
-        minimum_remaining_capacity: usize,
-    ) -> bool {
-        let event = match self.pending_event(kind) {
-            Some(event) => event.event,
-            None => return true,
-        };
-
-        if queue_remaining_capacity(&self.queued) <= minimum_remaining_capacity {
-            return false;
-        }
-        if self.queued.push_back(event).is_err() {
-            return false;
-        }
-
-        self.clear_pending_kind(kind);
-        true
-    }
-
-    fn oldest_pending_kind(&self) -> Option<PendingKind> {
-        match (self.pending_coalesced, self.pending_pointer_position) {
-            (Some(coalesced), Some(position)) => Some(if coalesced.sequence <= position.sequence {
-                PendingKind::Coalesced
-            } else {
-                PendingKind::PointerPosition
-            }),
-            (Some(_), None) => Some(PendingKind::Coalesced),
-            (None, Some(_)) => Some(PendingKind::PointerPosition),
-            (None, None) => None,
-        }
-    }
-
-    fn take_oldest_pending_event(&mut self) -> Option<InputEvent> {
-        let kind = self.oldest_pending_kind()?;
-        let event = self.pending_event(kind)?.event;
-        self.clear_pending_kind(kind);
-        Some(event)
-    }
-
-    fn pending_event(&self, kind: PendingKind) -> Option<PendingEvent> {
-        match kind {
-            PendingKind::Coalesced => self.pending_coalesced,
-            PendingKind::PointerPosition => self.pending_pointer_position,
-        }
-    }
-
-    fn clear_pending_kind(&mut self, kind: PendingKind) {
-        match kind {
-            PendingKind::Coalesced => self.pending_coalesced = None,
-            PendingKind::PointerPosition => self.pending_pointer_position = None,
-        }
-    }
-
-    fn drop_pending_kind(&mut self, kind: PendingKind) {
-        self.clear_pending_kind(kind);
-        self.record_lossy_drop();
-    }
-
-    fn new_pending_event(&mut self, event: InputEvent) -> PendingEvent {
-        let pending = PendingEvent {
-            event,
-            sequence: self.next_pending_sequence,
-        };
-        self.next_pending_sequence = self.next_pending_sequence.wrapping_add(1);
-        pending
-    }
-
-    fn record_keyboard_drop(&mut self, action: KeyAction) {
-        if matches!(action, KeyAction::Repeated) {
-            self.record_lossy_drop();
-        } else {
-            self.record_discrete_drop();
-        }
     }
 
     fn record_discrete_drop(&mut self) {
@@ -460,39 +259,6 @@ impl PointerIngressState {
     }
 }
 
-fn map_key_action(action: KeyAction) -> u16 {
-    match action {
-        KeyAction::Pressed => INPUT_ACTION_PRESSED,
-        KeyAction::Released => INPUT_ACTION_RELEASED,
-        KeyAction::Repeated => INPUT_ACTION_REPEATED,
-    }
-}
-
-fn can_coalesce(existing: InputEvent, next: InputEvent) -> bool {
-    existing.kind == next.kind
-        && existing.kind != INPUT_KIND_KEYBOARD
-        && existing.kind != INPUT_KIND_POINTER_BUTTON
-        && existing.action == next.action
-        && existing.code == next.code
-        && existing.modifiers == next.modifiers
-        && existing.text == next.text
-}
-
-fn merge_coalesced_event(existing: &mut InputEvent, next: InputEvent) {
-    if existing.kind == INPUT_KIND_POINTER_POSITION {
-        existing.value0 = next.value0;
-        existing.value1 = next.value1;
-        return;
-    }
-
-    existing.value0 = existing.value0.saturating_add(next.value0);
-    existing.value1 = existing.value1.saturating_add(next.value1);
-}
-
-fn queue_remaining_capacity<T, const CAPACITY: usize>(queue: &HeaplessDeque<T, CAPACITY>) -> usize {
-    CAPACITY - queue.len()
-}
-
 fn pop_events_into(
     queue: &mut HeaplessDeque<InputEvent, INPUT_EVENT_QUEUE_CAPACITY>,
     dest: &mut [InputEvent],
@@ -507,28 +273,15 @@ fn pop_events_into(
     }
     count
 }
-// RING3-MIGRATION-REFERENCE END: inputd-owned input queue policy.
-
 #[cfg(test)]
 mod tests {
     use super::{
-        INPUT_ACTION_PRESSED, INPUT_EVENT_LOSSY_RESERVE, INPUT_EVENT_QUEUE_CAPACITY,
-        INPUT_KIND_POINTER_BUTTON, INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION,
-        InputEventQueueState, KeyboardEvent, Modifiers, POINTER_BUTTON_LEFT, PointerPacket,
+        INPUT_ACTION_PRESSED, INPUT_KIND_POINTER_BUTTON, INPUT_KIND_POINTER_MOTION,
+        INPUT_KIND_POINTER_POSITION, InputEventQueueState, POINTER_BUTTON_LEFT, PointerPacket,
     };
-    use keyboard_core::{KeyAction, KeyCode};
-
-    fn key_event() -> KeyboardEvent {
-        KeyboardEvent {
-            code: KeyCode::A,
-            action: KeyAction::Pressed,
-            modifiers: Modifiers::empty(),
-            text: Some(b'a'),
-        }
-    }
 
     #[test]
-    fn coalesces_consecutive_pointer_motion() {
+    fn queues_consecutive_pointer_motion_as_ingress_reports() {
         let mut queue = InputEventQueueState::new();
         queue.push_pointer_motion(3, -2);
         queue.push_pointer_motion(4, 6);
@@ -536,25 +289,31 @@ mod tests {
         let mut events = [super::InputEvent::default(); 2];
         let read = queue.read_input_events(&mut events);
 
-        assert_eq!(read, 1);
+        assert_eq!(read, 2);
         assert_eq!(events[0].kind, INPUT_KIND_POINTER_MOTION);
-        assert_eq!(events[0].value0, 7);
-        assert_eq!(events[0].value1, 4);
+        assert_eq!(events[0].value0, 3);
+        assert_eq!(events[0].value1, -2);
+        assert_eq!(events[1].kind, INPUT_KIND_POINTER_MOTION);
+        assert_eq!(events[1].value0, 4);
+        assert_eq!(events[1].value1, 6);
     }
 
     #[test]
-    fn latest_pointer_position_wins() {
+    fn pointer_positions_remain_raw_ingress_reports() {
         let mut queue = InputEventQueueState::new();
         queue.push_pointer_position(10, 20);
         queue.push_pointer_position(30, 40);
 
-        let mut events = [super::InputEvent::default(); 1];
+        let mut events = [super::InputEvent::default(); 2];
         let read = queue.read_input_events(&mut events);
 
-        assert_eq!(read, 1);
+        assert_eq!(read, 2);
         assert_eq!(events[0].kind, INPUT_KIND_POINTER_POSITION);
-        assert_eq!(events[0].value0, 30);
-        assert_eq!(events[0].value1, 40);
+        assert_eq!(events[0].value0, 10);
+        assert_eq!(events[0].value1, 20);
+        assert_eq!(events[1].kind, INPUT_KIND_POINTER_POSITION);
+        assert_eq!(events[1].value0, 30);
+        assert_eq!(events[1].value1, 40);
     }
 
     #[test]
@@ -596,16 +355,5 @@ mod tests {
         assert_eq!(events[0].kind, INPUT_KIND_POINTER_MOTION);
         assert_eq!(events[1].kind, INPUT_KIND_POINTER_BUTTON);
         assert_eq!(events[1].code, POINTER_BUTTON_LEFT);
-    }
-
-    #[test]
-    fn keyboard_repeat_is_lossy_near_capacity() {
-        let mut queue = InputEventQueueState::new();
-        for code in 0..(INPUT_EVENT_QUEUE_CAPACITY as u32 - INPUT_EVENT_LOSSY_RESERVE as u32) {
-            queue.push_pointer_button(code, true);
-        }
-        let mut repeated = key_event();
-        repeated.action = KeyAction::Repeated;
-        assert!(!queue.push_keyboard_event(repeated));
     }
 }

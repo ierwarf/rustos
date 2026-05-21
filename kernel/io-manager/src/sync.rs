@@ -480,13 +480,29 @@ impl<T: ?Sized> Drop for KernelWaitGuard<'_, T> {
 }
 
 fn can_block_current_task() -> bool {
-    interrupts::are_enabled()
-        && crate::multitask::is_initialized()
-        && crate::multitask::current_task_id().is_some()
+    #[cfg(test)]
+    {
+        false
+    }
+
+    #[cfg(not(test))]
+    {
+        interrupts::are_enabled()
+            && crate::multitask::is_initialized()
+            && crate::multitask::current_task_id().is_some()
+    }
 }
 
 fn current_lock_owner_token() -> usize {
-    crate::multitask::current_task_id()
-        .map(|task_id| task_id.saturating_add(1) as usize)
-        .unwrap_or(1)
+    #[cfg(test)]
+    {
+        1
+    }
+
+    #[cfg(not(test))]
+    {
+        crate::multitask::current_task_id()
+            .map(|task_id| task_id.saturating_add(1) as usize)
+            .unwrap_or(1)
+    }
 }

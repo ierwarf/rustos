@@ -3013,20 +3013,28 @@ pub(super) fn syscall_linux_net6(
     arg4: u64,
     arg5: u64,
 ) -> u64 {
-    let mut request = new_syscalld_request(op);
-    request.dirfd = arg0;
-    request.flags = arg1;
-    request.arg0 = arg2;
-    request.arg1 = arg3;
-    request.arg2 = arg4;
-    request.arg3 = arg5;
-    match call_service_offload_request(IPC_SERVICE_NETD, &request).and_then(|response| {
-        ensure_service_response(&response, op)?;
-        ensure_syscalld_payload(&response, size_of::<u64>())?;
-        let mut bytes = [0_u8; size_of::<u64>()];
-        bytes.copy_from_slice(&response.payload[..size_of::<u64>()]);
-        Ok(u64::from_le_bytes(bytes))
-    }) {
+    let mut request = NetdIpcRequest {
+        version: NETD_IPC_ABI_VERSION,
+        op,
+        arg0,
+        arg1,
+        arg2,
+        arg3,
+        arg4,
+        arg5,
+        ..NetdIpcRequest::default()
+    };
+    if let Some(snapshot) = multitask::current_user_snapshot() {
+        request.pid = snapshot.process_id();
+        request.tid = snapshot.thread_id();
+    }
+    if let Some(security) = multitask::with_current_process_credentials(|security| security) {
+        request.uid = security.uid();
+        request.gid = security.gid();
+        request.euid = security.euid();
+        request.egid = security.egid();
+    }
+    match call_netd_ipc_request(&request).map(|response| response.value) {
         Ok(value) => value,
         Err(errno) => linux_errno(errno),
     }
@@ -3633,6 +3641,34 @@ pub(super) fn call_inputd_read_request(
         || response.flags != 0
         || response.reserved0 != 0
         || response.payload_len as usize > INPUTD_READ_PAYLOAD_CAPACITY
+    {
+        return Err(LINUX_EINVAL);
+    }
+    if response.status != 0 {
+        return Err(response.status.unsigned_abs() as i64);
+    }
+    Ok(response)
+}
+
+fn call_netd_ipc_request(request: &NetdIpcRequest) -> Result<NetdIpcResponse, i64> {
+    let start_ticks = crate::arch::rtc::ticks();
+    let response = ipc_ops::call_service_endpoint(IPC_SERVICE_NETD, as_bytes(request))?;
+    log_slow_service_call(
+        "netd",
+        request.op,
+        ticks_elapsed_ms(start_ticks, crate::arch::rtc::ticks()),
+        request.pid,
+        request.tid,
+        response.len() as i64,
+        None,
+    );
+    if response.len() != size_of::<NetdIpcResponse>() {
+        return Err(LINUX_EINVAL);
+    }
+    let response = read_unaligned::<NetdIpcResponse>(response.as_slice());
+    if response.version != NETD_IPC_ABI_VERSION
+        || response.op != request.op
+        || response.reserved0 != 0
     {
         return Err(LINUX_EINVAL);
     }

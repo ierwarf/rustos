@@ -269,6 +269,7 @@ pub mod syscall {
     pub const ROOTD_LEASE_STATE_EXITED: u16 = 2;
     pub const ROOTD_LEASE_STATE_RESTART_PENDING: u16 = 3;
     pub const ROOTD_LEASE_STATE_FAILED: u16 = 4;
+    pub const NETD_IPC_ABI_VERSION: u16 = 1;
     pub const VFS_LIFECYCLE_FORK: u16 = 1;
     pub const VFS_LIFECYCLE_EXEC_CLOEXEC: u16 = 2;
     pub const VFS_LIFECYCLE_EXIT: u16 = 3;
@@ -741,6 +742,10 @@ pub mod syscall {
     pub const INPUTD_READ_PAYLOAD_CAPACITY: usize = 32 * 1024;
     pub const INPUTD_INGEST_MAX_EVENTS: usize = 256;
     pub const INPUTD_READ_FLAG_NONBLOCK: u32 = 1 << 0;
+    pub const INPUTD_INGRESS_KIND_EVENT: u16 = 1;
+    pub const INPUTD_INGRESS_KIND_POINTER_PACKET: u16 = 2;
+    pub const INPUTD_INGRESS_KIND_POINTER_ABSOLUTE: u16 = 3;
+    pub const INPUTD_INGRESS_KIND_KEYBOARD: u16 = 4;
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -753,11 +758,46 @@ pub mod syscall {
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default)]
+    pub struct InputKeyboardEventWire {
+        pub action: u16,
+        pub reserved0: u16,
+        pub code: u32,
+        pub modifiers: u32,
+        pub text: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct InputPointerPacketWire {
+        pub buttons: u8,
+        pub reserved0: [u8; 3],
+        pub dx: i16,
+        pub dy: i16,
+        pub wheel_vertical: i16,
+        pub wheel_horizontal: i16,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct InputPointerAbsoluteWire {
+        pub buttons: u8,
+        pub reserved0: [u8; 3],
+        pub x: u32,
+        pub y: u32,
+        pub wheel_vertical: i16,
+        pub reserved1: i16,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default)]
     pub struct InputIngressWire {
         pub kind: u16,
         pub access: u16,
         pub flags: u32,
         pub event: super::ui::UiInputEvent,
+        pub keyboard: InputKeyboardEventWire,
+        pub pointer_packet: InputPointerPacketWire,
+        pub pointer_absolute: InputPointerAbsoluteWire,
     }
 
     #[repr(C)]
@@ -1241,6 +1281,37 @@ pub mod syscall {
         pub arg3: u64,
         pub arg4: u64,
         pub arg5: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct NetdIpcRequest {
+        pub version: u16,
+        pub op: u16,
+        pub flags: u32,
+        pub pid: u64,
+        pub tid: u64,
+        pub uid: u32,
+        pub gid: u32,
+        pub euid: u32,
+        pub egid: u32,
+        pub arg0: u64,
+        pub arg1: u64,
+        pub arg2: u64,
+        pub arg3: u64,
+        pub arg4: u64,
+        pub arg5: u64,
+        pub reserved0: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct NetdIpcResponse {
+        pub version: u16,
+        pub op: u16,
+        pub status: i32,
+        pub reserved0: u32,
+        pub value: u64,
     }
 
     #[repr(C)]
@@ -2580,6 +2651,10 @@ mod tests {
         assert_eq!(syscall::DEVMGRD_IPC_OP_IOCTL_AUTHORIZE, 4);
         assert_eq!(syscall::INPUTD_IPC_OP_DRAIN_INGEST, 4);
         assert_eq!(syscall::INPUTD_IPC_OP_READ, 5);
+        assert_eq!(syscall::INPUTD_INGRESS_KIND_EVENT, 1);
+        assert_eq!(syscall::INPUTD_INGRESS_KIND_POINTER_PACKET, 2);
+        assert_eq!(syscall::INPUTD_INGRESS_KIND_POINTER_ABSOLUTE, 3);
+        assert_eq!(syscall::INPUTD_INGRESS_KIND_KEYBOARD, 4);
         assert_eq!(syscall::STORAGED_OP_ROOT_STATUS, 4);
         assert_eq!(syscall::STORAGED_OP_BOOT_EXTENT_LOOKUP, 5);
 
@@ -2588,12 +2663,18 @@ mod tests {
         assert!(size_of::<syscall::DevmgrdDeviceIoctlRequest>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert!(size_of::<syscall::DevmgrdDeviceIoctlResponse>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert!(size_of::<syscall::InputIngestBrokerArgs>() <= syscall::IPC_MAX_INLINE_BYTES);
+        assert_eq!(size_of::<syscall::InputKeyboardEventWire>(), 16);
+        assert_eq!(size_of::<syscall::InputPointerPacketWire>(), 12);
+        assert_eq!(size_of::<syscall::InputPointerAbsoluteWire>(), 16);
+        assert_eq!(size_of::<syscall::InputIngressWire>(), 76);
         assert!(size_of::<syscall::InputdReadResponse>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert!(size_of::<syscall::RootdIpcRequest>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert!(size_of::<syscall::RootdIpcResponse>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert!(size_of::<syscall::StoragedRequest>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert!(size_of::<syscall::StoragedResponse>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert!(size_of::<syscall::RustosBootExtentBrokerArgs>() <= syscall::IPC_MAX_INLINE_BYTES);
+        assert!(size_of::<syscall::NetdIpcRequest>() <= syscall::IPC_MAX_INLINE_BYTES);
+        assert!(size_of::<syscall::NetdIpcResponse>() <= syscall::IPC_MAX_INLINE_BYTES);
     }
 
     #[test]

@@ -7,11 +7,13 @@ use std::thread;
 use std::time::Duration;
 
 use rustos_user_abi::syscall::{
-    InputIngestBrokerArgs, InputIngressWire, InputStatsBrokerArgs, InputStatsWire,
-    InputdIpcRequest, InputdIpcResponse, InputdReadResponse, INPUTD_ACCESS_EVDEV,
-    INPUTD_ACCESS_NATIVE, INPUTD_INGEST_MAX_EVENTS, INPUTD_IPC_ABI_VERSION,
-    INPUTD_IPC_OP_AUTHORIZE_READ, INPUTD_IPC_OP_DRAIN_INGEST, INPUTD_IPC_OP_PING,
-    INPUTD_IPC_OP_READ, INPUTD_IPC_OP_STATS, INPUTD_READ_FLAG_NONBLOCK,
+    InputIngestBrokerArgs, InputIngressWire, InputKeyboardEventWire, InputPointerAbsoluteWire,
+    InputPointerPacketWire, InputStatsBrokerArgs, InputStatsWire, InputdIpcRequest,
+    InputdIpcResponse, InputdReadResponse, INPUTD_ACCESS_EVDEV, INPUTD_ACCESS_NATIVE,
+    INPUTD_INGEST_MAX_EVENTS, INPUTD_INGRESS_KIND_EVENT, INPUTD_INGRESS_KIND_KEYBOARD,
+    INPUTD_INGRESS_KIND_POINTER_ABSOLUTE, INPUTD_INGRESS_KIND_POINTER_PACKET,
+    INPUTD_IPC_ABI_VERSION, INPUTD_IPC_OP_AUTHORIZE_READ, INPUTD_IPC_OP_DRAIN_INGEST,
+    INPUTD_IPC_OP_PING, INPUTD_IPC_OP_READ, INPUTD_IPC_OP_STATS, INPUTD_READ_FLAG_NONBLOCK,
     INPUTD_READ_PAYLOAD_CAPACITY, IPC_SERVICE_INPUTD, SYS_RUSTOS_DEBUG_PRINT,
     SYS_RUSTOS_INPUT_INGEST_BROKER, SYS_RUSTOS_INPUT_STATS_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
     SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
@@ -27,6 +29,7 @@ static INPUT_DELIVERY_LOGGED: AtomicBool = AtomicBool::new(false);
 struct InputQueue {
     events: VecDeque<input_evdev::InputEvent>,
     dropped_lossy: u64,
+    pointer_buttons: u8,
 }
 
 impl InputQueue {
@@ -39,6 +42,12 @@ impl InputQueue {
     }
 
     fn push(&mut self, event: input_evdev::InputEvent) {
+        if let Some(back) = self.events.back_mut() {
+            if can_coalesce(*back, event) {
+                merge_coalesced_event(back, event);
+                return;
+            }
+        }
         if self.events.len() >= INPUTD_QUEUE_MAX_EVENTS {
             let _ = self.events.pop_front();
             self.dropped_lossy = self.dropped_lossy.saturating_add(1);
@@ -48,6 +57,228 @@ impl InputQueue {
 
     fn pop_front(&mut self) -> Option<input_evdev::InputEvent> {
         self.events.pop_front()
+    }
+
+    fn push_keyboard_event(&mut self, event: InputKeyboardEventWire) {
+        self.push(input_evdev::InputEvent {
+            kind: input_evdev::INPUT_KIND_KEYBOARD,
+            action: event.action,
+            code: event.code,
+            value0: 0,
+            value1: 0,
+            modifiers: event.modifiers,
+            text: event.text,
+        });
+    }
+
+    fn push_pointer_packet(&mut self, packet: InputPointerPacketWire) {
+        if packet.dx != 0 || packet.dy != 0 {
+            self.push(input_evdev::InputEvent {
+                kind: input_evdev::INPUT_KIND_POINTER_MOTION,
+                action: input_evdev::INPUT_ACTION_NONE,
+                code: 0,
+                value0: packet.dx as i32,
+                value1: packet.dy as i32,
+                modifiers: 0,
+                text: 0,
+            });
+        }
+        if packet.wheel_vertical != 0 || packet.wheel_horizontal != 0 {
+            self.push(input_evdev::InputEvent {
+                kind: input_evdev::INPUT_KIND_POINTER_SCROLL,
+                action: input_evdev::INPUT_ACTION_NONE,
+                code: 0,
+                value0: packet.wheel_vertical as i32,
+                value1: packet.wheel_horizontal as i32,
+                modifiers: 0,
+                text: 0,
+            });
+        }
+        self.push_pointer_button_edges(packet.buttons);
+    }
+
+    fn push_pointer_absolute(&mut self, absolute: InputPointerAbsoluteWire) {
+        self.push(input_evdev::InputEvent {
+            kind: input_evdev::INPUT_KIND_POINTER_POSITION,
+            action: input_evdev::INPUT_ACTION_NONE,
+            code: 0,
+            value0: absolute.x as i32,
+            value1: absolute.y as i32,
+            modifiers: 0,
+            text: 0,
+        });
+        if absolute.wheel_vertical != 0 {
+            self.push(input_evdev::InputEvent {
+                kind: input_evdev::INPUT_KIND_POINTER_SCROLL,
+                action: input_evdev::INPUT_ACTION_NONE,
+                code: 0,
+                value0: absolute.wheel_vertical as i32,
+                value1: 0,
+                modifiers: 0,
+                text: 0,
+            });
+        }
+        self.push_pointer_button_edges(absolute.buttons);
+    }
+
+    fn push_pointer_button_edges(&mut self, current: u8) {
+        let previous = self.pointer_buttons;
+        self.pointer_buttons = current;
+        self.push_pointer_button_edge(previous, current, input_evdev::POINTER_BUTTON_LEFT as u8);
+        self.push_pointer_button_edge(previous, current, input_evdev::POINTER_BUTTON_RIGHT as u8);
+        self.push_pointer_button_edge(previous, current, input_evdev::POINTER_BUTTON_MIDDLE as u8);
+        self.push_pointer_button_edge(previous, current, input_evdev::POINTER_BUTTON_X1 as u8);
+        self.push_pointer_button_edge(previous, current, input_evdev::POINTER_BUTTON_X2 as u8);
+    }
+
+    fn push_pointer_button_edge(&mut self, previous: u8, current: u8, button_mask: u8) {
+        let was_pressed = previous & button_mask != 0;
+        let is_pressed = current & button_mask != 0;
+        if was_pressed == is_pressed {
+            return;
+        }
+        self.push(input_evdev::InputEvent {
+            kind: input_evdev::INPUT_KIND_POINTER_BUTTON,
+            action: if is_pressed {
+                input_evdev::INPUT_ACTION_PRESSED
+            } else {
+                input_evdev::INPUT_ACTION_RELEASED
+            },
+            code: button_mask as u32,
+            value0: 0,
+            value1: 0,
+            modifiers: 0,
+            text: 0,
+        });
+    }
+}
+
+fn can_coalesce(existing: input_evdev::InputEvent, next: input_evdev::InputEvent) -> bool {
+    existing.kind == next.kind
+        && existing.kind != input_evdev::INPUT_KIND_KEYBOARD
+        && existing.kind != input_evdev::INPUT_KIND_POINTER_BUTTON
+        && existing.action == next.action
+        && existing.code == next.code
+        && existing.modifiers == next.modifiers
+        && existing.text == next.text
+}
+
+fn merge_coalesced_event(existing: &mut input_evdev::InputEvent, next: input_evdev::InputEvent) {
+    if existing.kind == input_evdev::INPUT_KIND_POINTER_POSITION {
+        existing.value0 = next.value0;
+        existing.value1 = next.value1;
+        return;
+    }
+    existing.value0 = existing.value0.saturating_add(next.value0);
+    existing.value1 = existing.value1.saturating_add(next.value1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InputQueue;
+    use rustos_user_abi::syscall::{InputKeyboardEventWire, InputPointerPacketWire};
+
+    fn pointer_motion(dx: i32, dy: i32) -> input_evdev::InputEvent {
+        input_evdev::InputEvent {
+            kind: input_evdev::INPUT_KIND_POINTER_MOTION,
+            action: input_evdev::INPUT_ACTION_NONE,
+            code: 0,
+            value0: dx,
+            value1: dy,
+            modifiers: 0,
+            text: 0,
+        }
+    }
+
+    fn pointer_position(x: i32, y: i32) -> input_evdev::InputEvent {
+        input_evdev::InputEvent {
+            kind: input_evdev::INPUT_KIND_POINTER_POSITION,
+            action: input_evdev::INPUT_ACTION_NONE,
+            code: 0,
+            value0: x,
+            value1: y,
+            modifiers: 0,
+            text: 0,
+        }
+    }
+
+    fn pointer_packet(buttons: u8, dx: i16, dy: i16) -> InputPointerPacketWire {
+        InputPointerPacketWire {
+            buttons,
+            reserved0: [0; 3],
+            dx,
+            dy,
+            wheel_vertical: 0,
+            wheel_horizontal: 0,
+        }
+    }
+
+    fn key_event() -> InputKeyboardEventWire {
+        InputKeyboardEventWire {
+            action: input_evdev::INPUT_ACTION_PRESSED,
+            reserved0: 0,
+            code: 30,
+            modifiers: 0,
+            text: b'a' as u32,
+        }
+    }
+
+    #[test]
+    fn inputd_queue_coalesces_pointer_motion() {
+        let mut queue = InputQueue::default();
+        queue.push(pointer_motion(3, -2));
+        queue.push(pointer_motion(4, 6));
+
+        assert_eq!(queue.len(), 1);
+        let event = queue.pop_front().unwrap();
+        assert_eq!(event.value0, 7);
+        assert_eq!(event.value1, 4);
+    }
+
+    #[test]
+    fn inputd_queue_keeps_latest_pointer_position() {
+        let mut queue = InputQueue::default();
+        queue.push(pointer_position(10, 20));
+        queue.push(pointer_position(30, 40));
+
+        assert_eq!(queue.len(), 1);
+        let event = queue.pop_front().unwrap();
+        assert_eq!(event.value0, 30);
+        assert_eq!(event.value1, 40);
+    }
+
+    #[test]
+    fn inputd_queue_owns_pointer_button_edges_from_raw_reports() {
+        let mut queue = InputQueue::default();
+        queue.push_pointer_packet(pointer_packet(1, 7, -3));
+
+        assert_eq!(queue.len(), 2);
+        let motion = queue.pop_front().unwrap();
+        assert_eq!(motion.kind, input_evdev::INPUT_KIND_POINTER_MOTION);
+        assert_eq!(motion.value0, 7);
+        assert_eq!(motion.value1, -3);
+        let button = queue.pop_front().unwrap();
+        assert_eq!(button.kind, input_evdev::INPUT_KIND_POINTER_BUTTON);
+        assert_eq!(button.action, input_evdev::INPUT_ACTION_PRESSED);
+        assert_eq!(button.code, input_evdev::POINTER_BUTTON_LEFT);
+
+        queue.push_pointer_packet(pointer_packet(0, 0, 0));
+        let release = queue.pop_front().unwrap();
+        assert_eq!(release.kind, input_evdev::INPUT_KIND_POINTER_BUTTON);
+        assert_eq!(release.action, input_evdev::INPUT_ACTION_RELEASED);
+        assert_eq!(release.code, input_evdev::POINTER_BUTTON_LEFT);
+    }
+
+    #[test]
+    fn inputd_queue_owns_keyboard_reader_events_from_ingress() {
+        let mut queue = InputQueue::default();
+        queue.push_keyboard_event(key_event());
+
+        let event = queue.pop_front().unwrap();
+        assert_eq!(event.kind, input_evdev::INPUT_KIND_KEYBOARD);
+        assert_eq!(event.action, input_evdev::INPUT_ACTION_PRESSED);
+        assert_eq!(event.code, 30);
+        assert_eq!(event.text, b'a' as u32);
     }
 }
 
@@ -218,8 +449,20 @@ fn drain_ingest(queue: &mut InputQueue) -> Result<usize, i32> {
     }
     let count = (count as usize).min(events.len());
     for wire in events.iter().take(count) {
-        if wire.access == INPUTD_ACCESS_NATIVE {
-            queue.push(wire.event);
+        match wire.kind {
+            INPUTD_INGRESS_KIND_EVENT if wire.access == INPUTD_ACCESS_NATIVE => {
+                queue.push(wire.event);
+            }
+            INPUTD_INGRESS_KIND_KEYBOARD if wire.access == INPUTD_ACCESS_NATIVE => {
+                queue.push_keyboard_event(wire.keyboard);
+            }
+            INPUTD_INGRESS_KIND_POINTER_PACKET if wire.access == INPUTD_ACCESS_NATIVE => {
+                queue.push_pointer_packet(wire.pointer_packet);
+            }
+            INPUTD_INGRESS_KIND_POINTER_ABSOLUTE if wire.access == INPUTD_ACCESS_NATIVE => {
+                queue.push_pointer_absolute(wire.pointer_absolute);
+            }
+            _ => {}
         }
     }
     if count > 0 && !INPUT_DELIVERY_LOGGED.swap(true, Ordering::AcqRel) {
