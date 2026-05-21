@@ -58,6 +58,15 @@ extern "C" fn rtc_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut Sav
         return context_ptr;
     }
 
+    // Drain sleeper wakeups BEFORE the scheduler pick so newly-ready tasks
+    // are visible to `dispatch_schedule`. The previous ordering ran the pick
+    // first, then woke sleepers — so a sleeper whose target tick had just
+    // arrived waited a full extra IRQ (and longer, since a heavier User-class
+    // task could keep being picked over and over while the wake was stale).
+    // Matches Linux's `tick_sched_timer` -> `update_process_times` -> wake
+    // ordering, and the Fuchsia Zircon "wake then reschedule" pattern.
+    crate::arch::rtc::on_interrupt();
+
     let current_rsp = context_ptr as usize;
     let interrupted_kernel_frame = unsafe {
         let scheduler = scheduler_mut();
@@ -65,7 +74,6 @@ extern "C" fn rtc_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut Sav
         timer_interrupted_kernel_frame(context_ptr, scheduler)
     };
     if interrupted_kernel_frame {
-        crate::arch::rtc::on_interrupt();
         crate::arch::pic::send_eoi(crate::arch::pic::PIC_2_OFFSET);
         return context_ptr;
     }
@@ -79,7 +87,6 @@ extern "C" fn rtc_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut Sav
         next_rsp
     };
 
-    crate::arch::rtc::on_interrupt();
     crate::arch::pic::send_eoi(crate::arch::pic::PIC_2_OFFSET);
     next_rsp as *mut SavedContext
 }

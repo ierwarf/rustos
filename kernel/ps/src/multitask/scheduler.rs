@@ -85,6 +85,53 @@ const SCHED_MAX_BURST_NS: u64 = 20_000_000;
 // from preempting steady-state workers like uiserver for too long.
 const SCHED_NEW_TASK_VRUNTIME_PENALTY_NS: u64 = 6_000_000;
 
+/// Load-weight threshold that promotes a user-mode task to the `System`
+/// scheduling class. The default `weight_micros = 100` (most services and
+/// apps) yields a load weight near `NICE_0_LOAD` (~952). uiserver's
+/// `weight_micros = 1000-2000` yields ~9000-19000. The threshold splits at
+/// 4000 so a service that wants to be latency-isolated from User-class apps
+/// only needs to bump `weight_micros` in its `RUSTOS.package.toml` past
+/// ~420us. Kernel-mode tasks are unconditionally System regardless of weight.
+const SYSTEM_CLASS_WEIGHT_THRESHOLD: u32 = 4_000;
+
+/// Strict priority bands. Higher class (smaller discriminant) is always
+/// scheduled before lower classes while it has any ready task. Within a class
+/// the existing CFS-style vruntime accounting decides fairness.
+///
+/// This mirrors the way commercial microkernels structure mixed workloads:
+///
+/// - Mach (XNU) groups threads into QoS bands (USER_INTERACTIVE > DEFAULT >
+///   BACKGROUND); cross-band preemption is unconditional, intra-band uses
+///   the timeshare policy.
+/// - Fuchsia Zircon stacks a deadline scheduler above the fair scheduler,
+///   with deadline threads always preempting fair threads.
+/// - QNX Neutrino uses 256 priority levels with strict priority between
+///   them and round-robin within a level.
+/// - Linux stacks SCHED_DEADLINE > SCHED_FIFO/RR > SCHED_OTHER (CFS) so RT
+///   threads always run ahead of CFS when ready.
+///
+/// We use just three bands because that is the smallest set that names the
+/// three distinct latency contracts in this kernel: System services that
+/// must stay responsive to IPC, User apps that should share the rest fairly,
+/// and the Idle halt loop. More bands can be added by extending the enum
+/// without touching call sites — `pick_min_vruntime` walks `SchedClass` in
+/// `Ord` order.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum SchedClass {
+    /// Kernel-mode tasks (root during boot, housekeeping, kernel workers)
+    /// and user-mode services whose `weight_micros` is at or above
+    /// `SYSTEM_CLASS_WEIGHT_THRESHOLD`. Examples: `uiserver`, future
+    /// `inputd`/`syscalld` once their manifests bump weight.
+    System = 0,
+    /// Default class for user-spawned applications (`apps/*`) and services
+    /// that have not opted into System latency. Runs only when no System
+    /// task is ready.
+    User = 1,
+    /// The root halt loop after `mark_root_idle()`. Picked only as the last
+    /// resort fallback when literally nothing else is ready.
+    Idle = 2,
+}
+
 pub(super) struct CurrentLinuxThreadBinding {
     pub(super) process_handle: ProcessHandle,
     pub(super) tid: u64,
@@ -252,6 +299,18 @@ impl Scheduler {
         if !context.ready || !self.context_is_schedulable(slot, context) {
             return None;
         }
+        // IPC donation must not violate strict class priority. If a class
+        // higher than the hint has any ready work, fall through to the
+        // regular pick so the hint cannot let a User-class IPC callee bypass
+        // a ready System task.
+        let hint_class = self.slot_class(slot)?;
+        if hint_class > SchedClass::System
+            && self
+                .pick_min_vruntime_in_class(self.current_task, SchedClass::System)
+                .is_some()
+        {
+            return None;
+        }
         Some(slot)
     }
 
@@ -399,8 +458,10 @@ impl Scheduler {
     }
 
     /// Returns the smallest vruntime across all ready (or current-running)
-    /// tasks, plus the chosen task's vruntime. Used both for wake-bonus
-    /// floors and for choosing the next task to dispatch.
+    /// tasks, plus the chosen task's vruntime. Used as the initialisation
+    /// floor for newly-spawned tasks (whose class is not yet known) and
+    /// nowhere else; class-aware floors go through
+    /// `min_ready_vruntime_in_class`.
     fn min_ready_vruntime(&self) -> u64 {
         let mut min: Option<u64> = None;
         for slot in 0..MAX_TASK {
@@ -420,6 +481,59 @@ impl Scheduler {
             min = Some(min.map(|m| m.min(v)).unwrap_or(v));
         }
         min.unwrap_or(0)
+    }
+
+    /// Returns the smallest vruntime among ready tasks in a specific
+    /// scheduling class. Used by the sleeper-bonus floor in `wake_task_slot`
+    /// so the bonus is normalised against the woken task's actual peers, not
+    /// against an unrelated higher-priority band whose vruntime may track a
+    /// different real-time pace because of weight differences.
+    fn min_ready_vruntime_in_class(&self, class: SchedClass) -> u64 {
+        let mut min: Option<u64> = None;
+        for slot in 0..MAX_TASK {
+            if !self.is_fair_candidate_slot(slot) {
+                continue;
+            }
+            let Some(ctx) = self.contexts[slot] else {
+                continue;
+            };
+            if !ctx.ready {
+                continue;
+            }
+            if !self.context_is_schedulable(slot, ctx) {
+                continue;
+            }
+            if self.slot_class(slot) != Some(class) {
+                continue;
+            }
+            let v = ctx.vruntime_ns;
+            min = Some(min.map(|m| m.min(v)).unwrap_or(v));
+        }
+        min.unwrap_or(0)
+    }
+
+    /// Classifies a slot into one of the strict priority bands. Result is
+    /// derived (not stored) so changing `weight_micros` of a service via its
+    /// manifest is the single source of truth; no separate sched_class field
+    /// has to be kept in sync.
+    ///
+    /// Class is determined purely by load weight, not by user/kernel mode.
+    /// Kernel-mode workers (housekeeping, future kernel daemons) intentionally
+    /// run at default weight and stay in User — they are polling loops that
+    /// yield often, and putting them in System above User-class services
+    /// would deadlock IPC because housekeeping never blocks long enough to
+    /// release the band. Promotion to System is an explicit per-service
+    /// opt-in via `RUSTOS.package.toml::weight_micros`.
+    fn slot_class(&self, slot: usize) -> Option<SchedClass> {
+        let ctx = self.contexts[slot]?;
+        if slot == ROOT_TASK_SLOT && self.root_idle {
+            return Some(SchedClass::Idle);
+        }
+        if ctx.weight >= SYSTEM_CLASS_WEIGHT_THRESHOLD {
+            Some(SchedClass::System)
+        } else {
+            Some(SchedClass::User)
+        }
     }
 
     fn is_fair_candidate_slot(&self, slot: usize) -> bool {
@@ -476,11 +590,32 @@ impl Scheduler {
         context.exec_start_ticks = 0;
     }
 
-    /// Picks the schedulable task with the smallest vruntime. Ties prefer
-    /// rotation away from the current task to keep RR-equivalent behaviour
-    /// when all weights are equal. Returns `None` only if literally nothing
-    /// is ready and schedulable, including the current task and root.
+    /// Walks scheduling classes in strict priority order (System > User >
+    /// Idle) and within each picks the smallest-vruntime ready task. A class
+    /// is fully drained before the next is consulted: once any System task
+    /// is ready, no User or Idle task is ever returned by this function.
+    ///
+    /// Returns `None` only if literally nothing is ready and schedulable in
+    /// any class (including the current task and root) — in which case
+    /// `dispatch_schedule` falls back to ROOT_TASK_SLOT.
     fn pick_min_vruntime(&self, current: usize) -> Option<usize> {
+        // Order matters: must walk in `SchedClass::Ord` (System=0 first).
+        for class in [SchedClass::System, SchedClass::User, SchedClass::Idle] {
+            if let Some(slot) = self.pick_min_vruntime_in_class(current, class) {
+                return Some(slot);
+            }
+        }
+        None
+    }
+
+    /// Picks the schedulable task with the smallest vruntime within a single
+    /// class. Ties prefer rotation away from the current task to keep
+    /// RR-equivalent behaviour when all weights are equal.
+    fn pick_min_vruntime_in_class(
+        &self,
+        current: usize,
+        class: SchedClass,
+    ) -> Option<usize> {
         let mut best: Option<(usize, u64)> = None;
         for slot in 0..MAX_TASK {
             if !self.is_fair_candidate_slot(slot) {
@@ -493,6 +628,9 @@ impl Scheduler {
                 continue;
             }
             if !self.context_is_schedulable(slot, ctx) {
+                continue;
+            }
+            if self.slot_class(slot) != Some(class) {
                 continue;
             }
             // Tiny additive bias for the current slot encourages rotation on
@@ -1571,6 +1709,22 @@ impl Scheduler {
         let Some(pick_ctx) = self.contexts[cfs_pick] else {
             return cfs_pick;
         };
+
+        // Cross-class preemption is unconditional. The min-granularity guard
+        // below is a CFS fairness damper that only makes sense between peers
+        // in the same class — applying it across bands would let, say, a
+        // sub-tick User-class task block a freshly-woken System task and
+        // recreate exactly the latency bug this scheduler is meant to fix.
+        // Mirrors Mach's QoS preemption rule and Linux's "RT > CFS, no
+        // sched_min_granularity check between policies" stacking.
+        if let (Some(current_class), Some(pick_class)) =
+            (self.slot_class(current_slot), self.slot_class(cfs_pick))
+        {
+            if pick_class < current_class {
+                return cfs_pick;
+            }
+        }
+
         // If the pick's vruntime advantage is large, preempt unconditionally:
         // current has burned through too much CPU relative to peers.
         let current_v = current_ctx.vruntime_ns;
@@ -2462,15 +2616,22 @@ impl Scheduler {
             .err();
 
         // Compute the sleeper bonus floor *before* mutably borrowing the
-        // context. This is the CFS rule: a task that just woke from a long
-        // sleep gets vruntime = max(self_vruntime, min_vruntime - bonus) so
-        // that I/O-bound tasks (Wayland clients, IPC repliers) preempt
-        // CPU-bound peers but cannot accumulate unbounded credit while idle.
+        // context. Scope the floor to the woken task's class so the bonus is
+        // measured against its actual peers — pooling System and User into a
+        // single min would let a long-sleeping User task come back with a
+        // vruntime well below the System min and starve System peers via the
+        // bonus mechanism alone. Mirrors per-cfs_rq min_vruntime tracking in
+        // Linux when SCHED_DEADLINE / cgroups create logically separate
+        // runqueues.
         let now_ticks = crate::arch::rtc::ticks();
-        let min_vruntime = self.min_ready_vruntime();
-        let wake_floor = min_vruntime.saturating_sub(SLEEPER_LATENCY_BONUS_NS);
+        let woken_class = self.slot_class(slot);
+        let class_min_vruntime = match woken_class {
+            Some(class) => self.min_ready_vruntime_in_class(class),
+            None => self.min_ready_vruntime(),
+        };
+        let wake_floor = class_min_vruntime.saturating_sub(SLEEPER_LATENCY_BONUS_NS);
 
-        {
+        let (waker_vruntime, waker_ready) = {
             let Some(context) = self.contexts[slot].as_mut() else {
                 return false;
             };
@@ -2493,7 +2654,8 @@ impl Scheduler {
                 // priority via SLEEPER_LATENCY_BONUS_NS.
                 context.vruntime_ns = context.vruntime_ns.max(wake_floor);
             }
-        }
+            (context.vruntime_ns, context.ready)
+        };
 
         if invalid_reason.is_none() && blocked_since_ticks != 0 {
             self.maybe_log_blocked_wait(slot, task_id, process_id, blocked_since_ticks, now_ticks);
@@ -2504,7 +2666,40 @@ impl Scheduler {
                 panic!("scheduler root kernel context is corrupted: {}", reason);
             }
             self.retire_slot_due_to_invalid_context(slot, saved_rsp, reason);
+            return true;
         }
+
+        // Wake-preempt. Without this signal the wake just makes the task
+        // ready; the next scheduling decision then waits for either the next
+        // timer tick (~1ms — recoverable) or the current task to voluntarily
+        // yield (could be tens to hundreds of ms in a user-task syscall that
+        // doesn't cond_resched). Linux's `check_preempt_wakeup` uses a
+        // wakeup_granularity threshold; Mach signals
+        // `AST_PREEMPT | AST_URGENT` on cross-band wake. We use the
+        // existing DEFERRED_RESCHEDULE flag — it is checked at syscall exit
+        // and on every IRQ tail, so once raised it is consumed at the
+        // earliest safe point regardless of whether the wake originated from
+        // an IRQ or a kernel-mode syscall (futex/IPC reply paths).
+        if waker_ready && slot != self.current_task {
+            let current_class = self.slot_class(self.current_task);
+            let should_preempt = match (woken_class, current_class) {
+                // Cross-class: a higher-priority band has work, preempt.
+                (Some(wc), Some(cc)) if wc < cc => true,
+                // Same class: only preempt if the wake brings the waker
+                // distinctly ahead in vruntime — the CFS wake-preempt rule.
+                (Some(wc), Some(cc)) if wc == cc => {
+                    let current_v = self.contexts[self.current_task]
+                        .map(|ctx| ctx.vruntime_ns)
+                        .unwrap_or(0);
+                    current_v.saturating_sub(waker_vruntime) >= SCHED_MIN_GRANULARITY_NS
+                }
+                _ => false,
+            };
+            if should_preempt {
+                super::request_deferred_reschedule();
+            }
+        }
+
         true
     }
 
