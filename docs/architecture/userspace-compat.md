@@ -122,7 +122,8 @@ runtimed (또는 initd autostart)
 
 - canonical Linux ABI surface는 `rustos-user-abi::linux`에 있고
   `kernel/ps::api`와 `kernel/compat::user`를 통해 re-export 됩니다.
-  `kernel/compat/src/user` 아래 shadow ABI 파일은 다시 만들지 않습니다.
+  `kernel/compat/src/user` 아래 shadow ABI/handle/user-copy 파일은 다시
+  만들지 않습니다.
 - 새 Linux syscall routing은 `syscalld`, `vfsd`, 또는 적절한 userspace
   service에 추가하고 `kernel/compat`에 넣지 않습니다.
 

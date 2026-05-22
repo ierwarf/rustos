@@ -67,8 +67,9 @@ Runtime control:
 Kernel/userspace ABI:
 
 - Shared ABI crate: `libs/rustos-user-abi`.
-- Kernel re-export surface: `kernel/ps/src/user/abi.rs`; `kernel/compat`
-  re-exports through `kernel_ps::api` instead of carrying shadow ABI files.
+- Kernel re-export surface: `kernel/ps/src/user/{abi,handles,sysops}.rs`;
+  `kernel/compat` re-exports through `kernel_ps::api` instead of carrying
+  shadow ABI, handle, or user-memory sysop files.
 - The kernel launches `services/rootd/rootd.elf` as the first user process.
   `rootd` is the bootstrap initial task: it must avoid Linux libc/std dynamic
   runtime dependencies, start `syscalld`, `vfsd`, `loaderd`, and `procd`, then

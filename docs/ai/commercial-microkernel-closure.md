@@ -197,9 +197,9 @@ Tier 0 is already marked and high-confidence:
 - `kernel/compat/src/user/syscall/linux/service_ops.rs`: rootd/loaderd/vfsd,
   inputd/devmgrd, and supervisor-owned bootstrap/syscall policy leftovers
 - `kernel/compat/src/user/sysops/win32/memory.rs`: syscalld/loaderd-owned cold
-  Win32 memory policy. The old shadow process-state file under
-  `kernel/compat/src/user` has been retired; compat re-exports
-  `kernel_ps::api` process state.
+  Win32 memory policy. The old shadow process-state, handle-table, and
+  user-memory sysop files under `kernel/compat/src/user` have been retired;
+  compat re-exports the canonical `kernel_ps::api` surfaces.
 
 Tier 1 is now marked as strict-closure live-code references:
 

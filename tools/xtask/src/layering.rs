@@ -608,10 +608,14 @@ fn validate_kernel_source_boundaries(root_dir: &Path) -> Result<()> {
         "kernel/compat/src/user/abi.rs",
         "kernel/compat/src/user/epoll.rs",
         "kernel/compat/src/user/handles.rs",
+        "kernel/compat/src/user/handles/display_surface.rs",
+        "kernel/compat/src/user/handles/table.rs",
+        "kernel/compat/src/user/handles/vfs.rs",
         "kernel/compat/src/user/linux.rs",
         "kernel/compat/src/user/memfd.rs",
         "kernel/compat/src/user/process_state.rs",
         "kernel/compat/src/user/socket.rs",
+        "kernel/compat/src/user/sysops/usermem.rs",
     ] {
         if root_dir.join(retired_shadow_file).exists() {
             bail!("{retired_shadow_file} should stay retired; use kernel_ps::api re-exports");

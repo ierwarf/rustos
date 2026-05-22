@@ -32,30 +32,6 @@ pub struct LoadedExecutableImage {
 }
 
 #[derive(Clone, Copy)]
-pub struct ExecutableImage {
-    pub primary_path: &'static str,
-    pub fallback_path: Option<&'static str>,
-}
-
-impl ExecutableImage {
-    pub const fn new(primary_path: &'static str) -> Self {
-        Self {
-            primary_path,
-            fallback_path: None,
-        }
-    }
-
-    // Preferred/fallback pairs remain part of the launch contract for staged images.
-    #[allow(dead_code)]
-    pub const fn preferred(primary_path: &'static str, fallback_path: &'static str) -> Self {
-        Self {
-            primary_path,
-            fallback_path: Some(fallback_path),
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
 pub struct ConsoleProgramSpec<'a> {
     pub image: &'a [u8],
     pub exec_path: &'a str,
@@ -219,42 +195,6 @@ pub fn spawn_program_in_session(
         })
 }
 
-pub fn load_executable_image(
-    image: ExecutableImage,
-) -> Result<LoadedExecutableImage, ConsoleHostError> {
-    let trace = reserve_console_host_trace();
-    if trace {
-        emit_console(
-            debug::LogLevel::Debug,
-            3,
-            0,
-            alloc::format!(
-                "console host: load image begin primary={} fallback={}",
-                image.primary_path,
-                image.fallback_path.unwrap_or("-"),
-            ),
-        );
-    }
-    match load_executable_image_uncached(image) {
-        Ok(loaded) => {
-            if trace {
-                emit_console(
-                    debug::LogLevel::Debug,
-                    4,
-                    0,
-                    alloc::format!(
-                        "console host: load image done path={} bytes={}",
-                        loaded.path,
-                        loaded.bytes.len(),
-                    ),
-                );
-            }
-            Ok(loaded)
-        }
-        Err(err) => Err(err),
-    }
-}
-
 pub fn load_executable_image_by_path(
     primary_path: &str,
     fallback_path: Option<&str>,
@@ -286,10 +226,10 @@ pub fn load_executable_image_by_path(
                     6,
                     0,
                     alloc::format!(
-                        "console host: load image done path={} bytes={}",
-                        loaded.path,
-                        loaded.bytes.len(),
-                    ),
+                "console host: load image done path={} bytes={}",
+                loaded.path,
+                loaded.bytes.len(),
+            ),
                 );
             }
             Ok(loaded)
@@ -298,35 +238,8 @@ pub fn load_executable_image_by_path(
     }
 }
 
-pub fn prime_executable_image(image: ExecutableImage) -> Result<(), ConsoleHostError> {
-    let loaded = load_executable_image_uncached(image)?;
-    if reserve_console_host_trace() {
-        emit_console(
-            debug::LogLevel::Debug,
-            7,
-            0,
-            alloc::format!(
-                "console host: verified image path={} bytes={} magic={:02x} {:02x} {:02x} {:02x}",
-                loaded.path,
-                loaded.bytes.len(),
-                loaded.bytes.first().copied().unwrap_or(0),
-                loaded.bytes.get(1).copied().unwrap_or(0),
-                loaded.bytes.get(2).copied().unwrap_or(0),
-                loaded.bytes.get(3).copied().unwrap_or(0),
-            ),
-        );
-    }
-    Ok(())
-}
-
 fn reserve_console_host_trace() -> bool {
     debug::enabled!(console, debug)
-}
-
-fn load_executable_image_uncached(
-    image: ExecutableImage,
-) -> Result<LoadedExecutableImage, ConsoleHostError> {
-    load_executable_image_path_uncached(image.primary_path, image.fallback_path)
 }
 
 fn load_executable_image_path_uncached(
