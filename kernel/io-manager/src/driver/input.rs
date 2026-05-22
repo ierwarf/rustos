@@ -1,7 +1,5 @@
 #[cfg(not(test))]
 use core::sync::atomic::AtomicBool;
-#[cfg(test)]
-use core::sync::atomic::AtomicU8;
 use core::sync::atomic::Ordering;
 
 use driver_abi::PointerPacket;
@@ -9,14 +7,9 @@ use driver_abi::PointerPacket;
 #[cfg(not(test))]
 static POINTER_DELIVERY_LOGGED: AtomicBool = AtomicBool::new(false);
 
-#[cfg(test)]
-static TEST_POINTER_CAPTURE_RESULT: AtomicU8 = AtomicU8::new(0);
-
 pub(crate) fn reset_pointer_state() {}
 
 pub(crate) fn submit_pointer_packet(packet: PointerPacket) -> bool {
-    let _ = capture_pointer_packet(packet);
-
     let submitted = crate::input::event_queue::submit_pointer_packet(packet);
     if submitted {
         log_pointer_delivery_once("relative");
@@ -43,25 +36,6 @@ pub(crate) unsafe extern "C" fn report_pointer_packet(packet: *const PointerPack
     0
 }
 
-// RING3-MIGRATION-REFERENCE START: inputd should own pointer capture policy.
-// Ring0 driver callbacks should forward validated packets to the
-// service-owned ingress queue.
-fn capture_pointer_packet(packet: PointerPacket) -> bool {
-    #[cfg(test)]
-    match TEST_POINTER_CAPTURE_RESULT.load(Ordering::Relaxed) {
-        1 => return false,
-        2 => return true,
-        _ => {}
-    }
-
-    if crate::usb::has_runtime_pointer_device() {
-        return false;
-    }
-
-    crate::usb::capture_pointer_packet(packet)
-}
-// RING3-MIGRATION-REFERENCE END: inputd-owned pointer capture policy.
-
 fn log_pointer_delivery_once(kind: &'static str) {
     #[cfg(test)]
     {
@@ -77,8 +51,7 @@ fn log_pointer_delivery_once(kind: &'static str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{TEST_POINTER_CAPTURE_RESULT, reset_pointer_state, submit_pointer_packet};
-    use core::sync::atomic::Ordering;
+    use super::{reset_pointer_state, submit_pointer_packet};
     use driver_abi::{POINTER_BUTTON_LEFT as POINTER_PACKET_LEFT, PointerPacket};
     use rustos_user_abi::syscall::{INPUTD_INGRESS_KIND_POINTER_PACKET, InputIngressWire};
 
@@ -88,15 +61,13 @@ mod tests {
 
     fn reset_for_tests() {
         reset_pointer_state();
-        TEST_POINTER_CAPTURE_RESULT.store(0, Ordering::Relaxed);
         crate::input::event_queue::reset_for_tests();
     }
 
     #[test]
-    fn pointer_packet_still_reaches_event_queue_when_usb_capture_reports_true() {
+    fn pointer_packet_reaches_inputd_ingress_queue() {
         let _guard = isolated();
         reset_for_tests();
-        TEST_POINTER_CAPTURE_RESULT.store(2, Ordering::Relaxed);
 
         let changed = submit_pointer_packet(PointerPacket {
             buttons: POINTER_PACKET_LEFT,

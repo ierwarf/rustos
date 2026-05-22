@@ -147,14 +147,14 @@ As of the strict Tier 0 + Tier 1 closure pass:
 
 2026-05-22 commercial-max protocol snapshot:
 
-- Current source LOC: `kernel` 69605, `services` 22618, total 92223
-  (`rustos-user-abi` carries 3997 source LOC after the shared Linux ABI move).
-- Commercial-max live migration markers remaining: 22509 LOC. The largest
+- Current source LOC: `kernel` 69539, `services` 22618, total 92157
+  (`rustos-user-abi` carries 3875 source LOC after the shared Linux ABI move).
+- Commercial-max live migration markers remaining: 22497 LOC. The largest
   remaining marked surfaces are `usb/xhci.rs` 2126,
   `process/linux.rs` 1297, `proc_broker_ops.rs` 1210,
   `virtio_gpu.rs` 1195, `ipc_ops.rs` 1063, `serio.rs` 999,
   `ps/user/socket.rs` 956, and `compat/user/socket.rs` 931.
-- Current marked-only projection: `kernel` 47096 before residual broker shells
+- Current marked-only projection: `kernel` 47042 before residual broker shells
   and any additional service/shared-ABI overhead.
 - The shared commercial-max protocol envelope is now implemented by the current
   service owners for `rootd`, `procd`, `loaderd`, `syscalld`, `vfsd`,

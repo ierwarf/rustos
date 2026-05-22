@@ -1,13 +1,5 @@
 use super::*;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
-enum LinuxSyscallSupport {
-    Native,
-    Partial,
-    Stub,
-}
-
 const LINUX_SI_MAX_SIZE: usize = 128;
 const LINUX_SA_ONSTACK: u64 = 0x0800_0000;
 const LINUX_SIGNAL_RED_ZONE_SIZE: u64 = 128;
@@ -367,40 +359,9 @@ fn clear_current_pending_signal(signal: u64) {
 }
 
 pub(super) fn syscall_check(frame: &SyscallFrame) -> Result<(), u64> {
-    let Some(support) = linux_syscall_support_level(frame.rax) else {
-        debug::println!(
-            "unsupported linux syscall: nr={} rip={:#x} rdi={:#x} rsi={:#x} rdx={:#x} r10={:#x}",
-            frame.rax,
-            frame.user_rip,
-            frame.rdi,
-            frame.rsi,
-            frame.rdx,
-            frame.r10,
-        );
-        return Err(linux_errno(LINUX_ENOSYS));
-    };
-
     if !super::super::syscall_frame_security_check(frame) {
         super::super::validate_syscall_entry_or_terminate(frame);
     }
 
-    if support == LinuxSyscallSupport::Stub {
-        return Err(linux_errno(LINUX_ENOSYS));
-    }
-
     Ok(())
-}
-
-fn linux_syscall_support_level(syscall_number: u64) -> Option<LinuxSyscallSupport> {
-    if !linux_syscall_number_supported(syscall_number) {
-        return None;
-    }
-
-    Some(LinuxSyscallSupport::Native)
-}
-
-fn linux_syscall_number_supported(syscall_number: u64) -> bool {
-    ipc_ops::is_linux_rustos_ipc_syscall(syscall_number)
-        || broker_ops::is_linux_rustos_broker_syscall(syscall_number)
-        || linux_abi::is_supported_syscall_number(syscall_number)
 }

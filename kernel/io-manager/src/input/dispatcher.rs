@@ -13,10 +13,6 @@ const TTY_KEYBOARD_DROP_LOG_INTERVAL: u64 = 128;
 static PENDING_TTY_KEYBOARD_EVENTS: Mutex<PendingTtyKeyboardEventState> =
     Mutex::new(PendingTtyKeyboardEventState::new());
 
-#[cfg(test)]
-static TEST_KEYBOARD_CAPTURE_RESULT: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(0);
-
 #[derive(Clone, Copy)]
 struct PendingTtyKeyboardEvent {
     session: ConsoleSessionHandle,
@@ -57,8 +53,6 @@ impl PendingTtyKeyboardEventState {
 }
 
 pub(crate) fn dispatch_keyboard_event(event: KeyboardEvent) {
-    let _ = capture_keyboard_event(event);
-
     #[cfg(test)]
     {
         dispatch_keyboard_event_locked(event);
@@ -68,17 +62,6 @@ pub(crate) fn dispatch_keyboard_event(event: KeyboardEvent) {
     interrupts::without_interrupts(|| {
         dispatch_keyboard_event_locked(event);
     });
-}
-
-fn capture_keyboard_event(event: KeyboardEvent) -> bool {
-    #[cfg(test)]
-    match TEST_KEYBOARD_CAPTURE_RESULT.load(std::sync::atomic::Ordering::Relaxed) {
-        1 => return false,
-        2 => return true,
-        _ => {}
-    }
-
-    crate::usb::capture_keyboard_event(event)
 }
 
 pub(crate) fn service_pending() -> usize {

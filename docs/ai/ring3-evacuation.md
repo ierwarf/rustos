@@ -122,8 +122,12 @@ privilege substrate, not a policy owner.
      events.
   - Completed: keyboard reader events now cross the same ingress broker as
     typed keyboard ingress records; `inputd` owns the reader queue insertion
-    and native/evdev read exposure while ring0 keeps only USB capture and
+    and native/evdev read exposure while ring0 keeps only hardware capture and
     legacy TTY forwarding.
+  - Completed: PS/2/driver keyboard and pointer submissions no longer mirror
+    into synthetic USB HID from ring0. They enter the bounded `inputd` ingress
+    queue directly; synthetic USB HID state remains only for the unfinished
+    USB-service-driver migration surface.
   - Completed: `inputd` now accepts the shared commercial-max
     `CommercialMaxProtocolRequest` envelope for input ingest, reader sizing,
     evdev translation, layout policy, drop policy, and stats. Legacy
@@ -144,6 +148,10 @@ privilege substrate, not a policy owner.
      button report conversion, and synthetic HID helper maps moved to
      `drivers/libs/input-evdev`; the kernel keeps only a thin re-export while
      `runtime.rs`/`synthetic.rs` still own report parsing and state.
+   - Completed: the old ring0 capture bridge from PS/2/driver input into
+     synthetic USB keyboard/pointer reports was removed. Normal app-visible
+     input now flows through `inputd` ingress/read policy instead of a
+     synthetic USB fallback path.
    - Target: move HID layout parsing, synthetic keyboard/pointer state,
      pointer coalescing policy, drop policy, and event translation to `inputd`.
      Ring0 `.ko`/USB callbacks stay as the report source.
@@ -345,6 +353,11 @@ privilege substrate, not a policy owner.
         `compat/user/linux.rs` now re-export the shared ABI module, while
         `support.rs` keeps only trap/security checks and signal-frame
         construction/restore around the shared table.
+      - The separate ring0 supported-syscall allowlist was removed after the
+        dispatch table and service/broker validators became the real boundary.
+        `syscalld` owns cold offload validation; unsupported numbers now fall
+        through the dispatcher to `ENOSYS` instead of being pre-filtered by a
+        second kernel policy table.
     - Target: keep metadata required for scheduler/address-space/user-copy in
       ring0; move cold validation, namespace lookup, defaults, limits, and
       policy DBs to `syscalld`, `procd`, or `loaderd`.
