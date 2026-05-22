@@ -11,10 +11,16 @@ use alloc::vec::Vec;
 use core::mem::size_of;
 
 use rustos_user_abi::syscall::{
-    LoaderSpawnRequest, LoaderSpawnResponse, RustosProcAbortBrokerArgs,
-    RustosProcMapDataBrokerArgs, RustosProcMapFileBatchBrokerArgs, RustosProcMapFileBatchEntry,
-    RustosProcMapZeroedBrokerArgs, RustosProcPrepareBrokerArgs,
-    RustosProcSetLinuxRuntimeBrokerArgs, RustosProcSetWindowsRuntimeBrokerArgs,
+    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, LoaderSpawnRequest,
+    LoaderSpawnResponse, RustosProcAbortBrokerArgs, RustosProcMapDataBrokerArgs,
+    RustosProcMapFileBatchBrokerArgs, RustosProcMapFileBatchEntry, RustosProcMapZeroedBrokerArgs,
+    RustosProcPrepareBrokerArgs, RustosProcSetLinuxRuntimeBrokerArgs,
+    RustosProcSetWindowsRuntimeBrokerArgs, COMMERCIAL_MAX_LOADERD_OP_AUXV_PLAN,
+    COMMERCIAL_MAX_LOADERD_OP_ELF_RUNTIME_PLAN, COMMERCIAL_MAX_LOADERD_OP_IMAGE_PROBE,
+    COMMERCIAL_MAX_LOADERD_OP_IMPORT_POLICY, COMMERCIAL_MAX_LOADERD_OP_INTERPRETER_PLAN,
+    COMMERCIAL_MAX_LOADERD_OP_MAP_PLAN, COMMERCIAL_MAX_LOADERD_OP_PE_RUNTIME_PLAN,
+    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_LOADERD, IPC_MAX_INLINE_BYTES,
     IPC_SERVICE_LOADERD, LOADER_OP_EXEC_TARGET, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION,
     LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY,
     LOADER_SPAWN_MAX_ARG_COUNT, LOADER_SPAWN_MAX_ENV_COUNT, PROC_BROKER_ABI_VERSION,
@@ -138,13 +144,13 @@ fn service_main() {
 
 fn serve(endpoint: u64) {
     loop {
-        let mut request = LoaderSpawnRequest::default();
+        let mut request = [0_u8; IPC_MAX_INLINE_BYTES];
         let mut reply_cap = 0_u64;
         let received = syscall4(
             SYS_RUSTOS_IPC_RECV,
             endpoint,
-            (&mut request as *mut LoaderSpawnRequest) as u64,
-            size_of::<LoaderSpawnRequest>() as u64,
+            request.as_mut_ptr() as u64,
+            request.len() as u64,
             (&mut reply_cap as *mut u64) as u64,
         );
         if received < 0 {
@@ -152,17 +158,55 @@ fn serve(endpoint: u64) {
             continue;
         }
 
-        let response = handle_request(received as usize, &request);
+        let response = handle_wire_request(received as usize, &request);
         let reply = syscall3(
             SYS_RUSTOS_IPC_REPLY,
             reply_cap,
-            (&response as *const LoaderSpawnResponse) as u64,
-            size_of::<LoaderSpawnResponse>() as u64,
+            response.as_ptr() as u64,
+            response.len() as u64,
         );
         if reply < 0 {
             rustos_svc_runtime::ipc::debug_line("loaderd: reply failed");
         }
     }
+}
+
+enum LoaderReply {
+    Spawn(LoaderSpawnResponse),
+    Commercial(CommercialMaxProtocolResponse),
+}
+
+impl LoaderReply {
+    fn as_ptr(&self) -> *const u8 {
+        match self {
+            Self::Spawn(response) => (response as *const LoaderSpawnResponse).cast::<u8>(),
+            Self::Commercial(response) => {
+                (response as *const CommercialMaxProtocolResponse).cast::<u8>()
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Spawn(_) => size_of::<LoaderSpawnResponse>(),
+            Self::Commercial(_) => size_of::<CommercialMaxProtocolResponse>(),
+        }
+    }
+}
+
+fn handle_wire_request(received: usize, bytes: &[u8]) -> LoaderReply {
+    if received == size_of::<CommercialMaxProtocolRequest>() {
+        let request = read_unaligned::<CommercialMaxProtocolRequest>(bytes);
+        return LoaderReply::Commercial(handle_commercial_request(&request));
+    }
+    if received == size_of::<LoaderSpawnRequest>() {
+        let request = read_unaligned::<LoaderSpawnRequest>(bytes);
+        return LoaderReply::Spawn(handle_request(received, &request));
+    }
+    LoaderReply::Spawn(LoaderSpawnResponse {
+        status: EINVAL,
+        ..LoaderSpawnResponse::default()
+    })
 }
 
 fn handle_request(received: usize, request: &LoaderSpawnRequest) -> LoaderSpawnResponse {
@@ -326,6 +370,103 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> LoaderSpawnR
     response
 }
 
+fn handle_commercial_request(
+    request: &CommercialMaxProtocolRequest,
+) -> CommercialMaxProtocolResponse {
+    let mut response = CommercialMaxProtocolResponse {
+        header: request.header,
+        ..CommercialMaxProtocolResponse::default()
+    };
+    response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    if let Err(errno) = validate_commercial_request(request) {
+        response.status = errno;
+        return response;
+    }
+    match request.header.op {
+        COMMERCIAL_MAX_LOADERD_OP_IMAGE_PROBE => {
+            let path = match commercial_request_path(request) {
+                Ok(path) => path,
+                Err(errno) => {
+                    response.status = errno;
+                    return response;
+                }
+            };
+            match probe_image(path) {
+                Ok(format) => {
+                    response.value0 = format as u64;
+                    response.descriptor_count = 1;
+                    response.descriptors[0] =
+                        loader_descriptor("image-probe", request.header.op, format as u64);
+                    response.capability = loader_capability("image-probe", request.header.op);
+                }
+                Err(errno) => response.status = errno,
+            }
+        }
+        COMMERCIAL_MAX_LOADERD_OP_ELF_RUNTIME_PLAN => {
+            response.descriptor_count = 1;
+            response.value0 = ELF_MAIN_DYN_LOAD_OFFSET;
+            response.value1 = ELF_INTERP_LOAD_OFFSET;
+            response.descriptors[0] = loader_descriptor(
+                "elf-runtime",
+                request.header.op,
+                PROC_BROKER_FORMAT_ELF64 as u64,
+            );
+        }
+        COMMERCIAL_MAX_LOADERD_OP_PE_RUNTIME_PLAN => {
+            response.descriptor_count = 1;
+            response.value0 = PE_LOAD_OFFSET;
+            response.value1 = PE_MAX_IMAGE_BYTES;
+            response.descriptors[0] = loader_descriptor(
+                "pe-runtime",
+                request.header.op,
+                PROC_BROKER_FORMAT_PE64 as u64,
+            );
+        }
+        COMMERCIAL_MAX_LOADERD_OP_INTERPRETER_PLAN => {
+            response.descriptor_count = 1;
+            response.value0 = PROC_BROKER_LINUX_INTERP_PATH_CAPACITY as u64;
+            response.descriptors[0] =
+                loader_descriptor("interpreter", request.header.op, response.value0);
+        }
+        COMMERCIAL_MAX_LOADERD_OP_IMPORT_POLICY => {
+            response.descriptor_count = 1;
+            response.value0 = PE_MAX_IMPORT_MODULES as u64;
+            response.value1 = PE_MAX_FORWARDER_DEPTH as u64;
+            response.descriptors[0] =
+                loader_descriptor("import-policy", request.header.op, response.value0);
+            response.capability = loader_capability("import-policy", request.header.op);
+        }
+        COMMERCIAL_MAX_LOADERD_OP_MAP_PLAN => {
+            response.descriptor_count = 1;
+            response.value0 = PROC_BROKER_USER_SPACE_BASE;
+            response.value1 = PROC_BROKER_USER_SPACE_END_EXCLUSIVE;
+            response.descriptors[0] =
+                loader_descriptor("map-plan", request.header.op, response.value0);
+            response.capability = loader_capability("map-plan", request.header.op);
+        }
+        COMMERCIAL_MAX_LOADERD_OP_AUXV_PLAN => {
+            response.descriptor_count = 1;
+            response.value0 = LOADER_SPAWN_MAX_ARG_COUNT as u64;
+            response.value1 = LOADER_SPAWN_MAX_ENV_COUNT as u64;
+            response.descriptors[0] =
+                loader_descriptor("auxv-plan", request.header.op, response.value0);
+        }
+        _ => response.status = EINVAL,
+    }
+    response
+}
+
+fn probe_image(path: &str) -> Result<u16, i32> {
+    let path = CString::new(path).map_err(|_| EINVAL)?;
+    let fd = syscall4(SYS_OPENAT, AT_FDCWD, path.as_ptr() as u64, O_RDONLY, 0) as i32;
+    if fd < 0 {
+        return Err(-fd);
+    }
+    let result = validate_executable_fd(fd);
+    let _ = syscall1(SYS_CLOSE, fd as u64);
+    result
+}
+
 fn close_fds(fds: &[i32]) {
     for fd in fds {
         if *fd >= 0 {
@@ -461,6 +602,86 @@ fn validate_request(received: usize, request: &LoaderSpawnRequest) -> Result<(),
         return Err(EINVAL);
     }
     Ok(())
+}
+
+fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result<(), i32> {
+    if request.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
+        || request.header.protocol != COMMERCIAL_MAX_PROTOCOL_LOADERD
+        || request.path_len as usize > request.path.len()
+        || request.payload_len as usize > request.payload.len()
+    {
+        return Err(EINVAL);
+    }
+    match request.header.op {
+        COMMERCIAL_MAX_LOADERD_OP_IMAGE_PROBE
+        | COMMERCIAL_MAX_LOADERD_OP_ELF_RUNTIME_PLAN
+        | COMMERCIAL_MAX_LOADERD_OP_PE_RUNTIME_PLAN
+        | COMMERCIAL_MAX_LOADERD_OP_INTERPRETER_PLAN
+        | COMMERCIAL_MAX_LOADERD_OP_IMPORT_POLICY
+        | COMMERCIAL_MAX_LOADERD_OP_MAP_PLAN
+        | COMMERCIAL_MAX_LOADERD_OP_AUXV_PLAN => Ok(()),
+        _ => Err(EINVAL),
+    }
+}
+
+fn commercial_request_path(request: &CommercialMaxProtocolRequest) -> Result<&str, i32> {
+    let len = request.path_len as usize;
+    if len == 0 {
+        return Err(EINVAL);
+    }
+    core::str::from_utf8(&request.path[..len]).map_err(|_| EINVAL)
+}
+
+fn loader_descriptor(label: &str, op: u16, value0: u64) -> CommercialMaxProtocolDescriptorWire {
+    let mut descriptor = CommercialMaxProtocolDescriptorWire {
+        protocol: COMMERCIAL_MAX_PROTOCOL_LOADERD,
+        op,
+        flags: 0,
+        service_id: IPC_SERVICE_LOADERD,
+        capability_mask: loader_capability_mask(op),
+        value0,
+        value1: 0,
+        ..CommercialMaxProtocolDescriptorWire::default()
+    };
+    copy_label(label, &mut descriptor.name, &mut descriptor.name_len);
+    descriptor
+}
+
+fn loader_capability(label: &str, op: u16) -> CommercialMaxCapabilityLeaseWire {
+    let mut capability = CommercialMaxCapabilityLeaseWire {
+        lease_id: ((COMMERCIAL_MAX_PROTOCOL_LOADERD as u64) << 32) | u64::from(op),
+        service_id: IPC_SERVICE_LOADERD,
+        capability_mask: loader_capability_mask(op),
+        rights_mask: loader_capability_mask(op),
+        ..CommercialMaxCapabilityLeaseWire::default()
+    };
+    copy_label(label, &mut capability.label, &mut capability.label_len);
+    capability
+}
+
+fn loader_capability_mask(op: u16) -> u64 {
+    match op {
+        COMMERCIAL_MAX_LOADERD_OP_IMAGE_PROBE => 1 << 0,
+        COMMERCIAL_MAX_LOADERD_OP_ELF_RUNTIME_PLAN => 1 << 1,
+        COMMERCIAL_MAX_LOADERD_OP_PE_RUNTIME_PLAN => 1 << 2,
+        COMMERCIAL_MAX_LOADERD_OP_INTERPRETER_PLAN => 1 << 3,
+        COMMERCIAL_MAX_LOADERD_OP_IMPORT_POLICY => 1 << 4,
+        COMMERCIAL_MAX_LOADERD_OP_MAP_PLAN => 1 << 5,
+        COMMERCIAL_MAX_LOADERD_OP_AUXV_PLAN => 1 << 6,
+        _ => 0,
+    }
+}
+
+fn copy_label(label: &str, target: &mut [u8], len: &mut u16) {
+    let bytes = label.as_bytes();
+    let count = bytes.len().min(target.len());
+    target[..count].copy_from_slice(&bytes[..count]);
+    *len = count as u16;
+}
+
+fn read_unaligned<T: Copy>(bytes: &[u8]) -> T {
+    debug_assert!(bytes.len() >= size_of::<T>());
+    unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) }
 }
 
 fn request_text(bytes: &[u8], len: usize) -> Result<String, i32> {
@@ -1176,7 +1397,13 @@ fn apply_pe_relocations(
     if preferred_base == load_base {
         return Ok(());
     }
-    if reloc_rva == 0 || reloc_size == 0 || characteristics & PE_FILE_RELOCS_STRIPPED != 0 {
+    if characteristics & PE_FILE_RELOCS_STRIPPED != 0 {
+        return Err(ENOEXEC);
+    }
+    if reloc_rva == 0 && reloc_size == 0 {
+        return Ok(());
+    }
+    if reloc_rva == 0 || reloc_size == 0 {
         return Err(ENOEXEC);
     }
     let reloc_start = reloc_rva as usize;

@@ -1,5 +1,11 @@
 #![no_std]
 
+#[cfg(feature = "linux-compat-state")]
+extern crate alloc;
+
+#[cfg(feature = "linux-compat-state")]
+pub mod linux;
+
 pub mod syscall {
     pub const SYS_RUSTOS_DEBUG_PRINT: u64 = 0x5255_0001;
     pub const SYS_RUSTOS_SPAWN_EXEC: u64 = 0x5255_0002;
@@ -2681,8 +2687,31 @@ mod tests {
     fn commercial_max_protocol_abi_layout_fits_inline_ipc() {
         assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, 1);
         assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR, 1);
+        assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_PROCD, 2);
+        assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_LOADERD, 3);
+        assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_SYSCALLD, 4);
+        assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_VFSD, 5);
+        assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_DEVMGRD, 6);
+        assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_INPUTD, 7);
+        assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_STORAGED, 8);
+        assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_NETD, 9);
+        assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_DRIVERD, 10);
+        assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_SESSIOND, 11);
+        assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_PAGERD, 12);
+        assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_SERVICE_DRIVERD, 13);
         assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_CAPABILITY, 14);
+        assert_eq!(syscall::COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL, 5);
+        assert_eq!(syscall::COMMERCIAL_MAX_PROCD_OP_SESSION_MEMBERSHIP, 7);
+        assert_eq!(syscall::COMMERCIAL_MAX_LOADERD_OP_AUXV_PLAN, 7);
+        assert_eq!(syscall::COMMERCIAL_MAX_SYSCALLD_OP_COLD_SYSCALL_OFFLOAD, 7);
+        assert_eq!(syscall::COMMERCIAL_MAX_VFSD_OP_METADATA_POLICY, 6);
+        assert_eq!(syscall::COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_OPEN, 2);
+        assert_eq!(syscall::COMMERCIAL_MAX_INPUTD_OP_INPUT_READER, 2);
         assert_eq!(syscall::COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE, 4);
+        assert_eq!(syscall::COMMERCIAL_MAX_NETD_OP_PACKET_LEASE, 5);
+        assert_eq!(syscall::COMMERCIAL_MAX_DRIVERD_OP_PROVIDER_SELECT, 4);
+        assert_eq!(syscall::COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP, 5);
+        assert_eq!(syscall::COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DMA_BUFFER, 4);
         assert_eq!(syscall::COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE, 3);
         assert!(
             size_of::<syscall::CommercialMaxProtocolRequest>() <= syscall::IPC_MAX_INLINE_BYTES

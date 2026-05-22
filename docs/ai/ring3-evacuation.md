@@ -76,12 +76,14 @@ privilege substrate, not a policy owner.
 
 1. Device ioctl policy bypass:
    - Current source: `kernel/compat/src/user/syscall/linux/service_ops.rs`
-     routes policy-sensitive Linux `ioctl` classes to `devmgrd`. The direct
-     `ioctl_current_process_fd` fallback is now limited to pre-`devmgrd`
-     bootstrap or ioctl classes that are intentionally hot data-path broker
-     operations.
+     routes policy-sensitive Linux `ioctl` classes to `devmgrd`; the direct
+     `ioctl_current_process_fd` path is limited to ioctl classes intentionally
+     left as hot data-path broker operations.
    - Completed: post-`devmgrd` policy-sensitive ioctl fallback to direct ring0
      dispatch was removed.
+   - Completed: pre-`devmgrd` policy-sensitive ioctl fallback was removed as
+     well. If `devmgrd` is absent, policy ioctl classes now fail closed instead
+     of mutating display/console/session state directly in ring0.
    - Remaining target: route more device-specific ioctl classes through
      `devmgrd` as their service-side validation exists; keep the brokered
      current-process memory/device operation in ring0.
@@ -118,14 +120,20 @@ privilege substrate, not a policy owner.
      as raw pointer ingress records; `inputd` owns pointer button-edge state
      and translates raw relative/absolute reports into native/evdev reader
      events.
-   - Completed: keyboard reader events now cross the same ingress broker as
-     typed keyboard ingress records; `inputd` owns the reader queue insertion
-     and native/evdev read exposure while ring0 keeps only USB capture and
-     legacy TTY forwarding.
-   - Target: `inputd` owns event queue policy, overflow behavior, readers, and
-     observability. Ring0 should enqueue validated hardware reports into a
-     bounded shared ring, wake the target, and retain only user-copy/broker
-     primitives needed for compatibility.
+  - Completed: keyboard reader events now cross the same ingress broker as
+    typed keyboard ingress records; `inputd` owns the reader queue insertion
+    and native/evdev read exposure while ring0 keeps only USB capture and
+    legacy TTY forwarding.
+  - Completed: `inputd` now accepts the shared commercial-max
+    `CommercialMaxProtocolRequest` envelope for input ingest, reader sizing,
+    evdev translation, layout policy, drop policy, and stats. Legacy
+    `InputdIpcRequest`/`InputdReadResponse` remains live for current read
+    paths while the commercial-max control plane exposes descriptor/capability
+    responses.
+  - Target: `inputd` owns event queue policy, overflow behavior, readers, and
+    observability. Ring0 should enqueue validated hardware reports into a
+    bounded shared ring, wake the target, and retain only user-copy/broker
+    primitives needed for compatibility.
 
 3. HID report parsing and synthetic HID policy:
    - Current source: `kernel/io-manager/src/usb/runtime.rs`,
@@ -158,16 +166,36 @@ privilege substrate, not a policy owner.
      explicit `DEVMGRD_IPC_OP_IOCTL_AUTHORIZE` protocol; `devmgrd` validates
      the ioctl allowlist before invoking the gated ring0 ioctl broker, and the
      old generic syscall-offload ioctl path was removed from `devmgrd`.
+   - Completed: console focus mutation (`CONSOLE_IOCTL_SET_FOCUS`) now goes
+     through the same `devmgrd` authorization path as other console/session
+     ioctls. Ring0 still performs the current-process user-copy and final
+     session focus commit.
+   - Completed: `devmgrd` now accepts the shared commercial-max
+     `CommercialMaxProtocolRequest` envelope for device registry, device-open
+     policy, ioctl authorization, device-map discovery, and device event
+     subscription descriptors. The existing handle-transfer `DEVMGRD_IPC_OP_OPEN`
+     ABI remains the path that installs real fds.
 
 5. Driver bootstrap policy leftovers:
    - Current source: `kernel/io-manager/src/driver/mod.rs` still has
      `hardware_alias_present`, `provider_group_hardware_active`, and a
      boot-framebuffer fallback primitive.
-   - Completed: the kernel-facing driver broker names now expose hardware facts
-     instead of policy ownership; provider ordering, fallback priority, alias
-     matching, dependency handling, and retry policy stay in `driverd`
-     registries/manifests.
-   - Remaining target: keep boot-framebuffer as a last-resort primitive only.
+  - Completed: the kernel-facing driver broker names now expose hardware facts
+    instead of policy ownership; provider ordering, fallback priority, alias
+    matching, dependency handling, and retry policy stay in `driverd`
+    registries/manifests.
+  - Completed: `driverd` now accepts the shared commercial-max
+    `CommercialMaxProtocolRequest` envelope for driver plans, module-load
+    authorization, symbol policy, provider selection, retry budget, and
+    fallback policy. `.ko` relocation/init remains ring0-only behind the
+    existing gated load-module broker.
+  - Completed: `driverd` now also registers the
+    `IPC_SERVICE_SERVICE_DRIVERD` endpoint on the same IPC queue and accepts
+    the commercial-max service-driver protocol for driver instances, MMIO
+    leases, IRQ routes, and DMA buffer descriptors. This is only the
+    non-`.ko` service-driver control plane; Linux/RustOS `.ko` execution still
+    stays ring0.
+  - Remaining target: keep boot-framebuffer as a last-resort primitive only.
 
 6. Storage selection and partition policy:
    - Current source: `kernel/io-manager/src/storage/block.rs` and
@@ -176,13 +204,19 @@ privilege substrate, not a policy owner.
    - Completed: boot-volume selection is cached at the kernel broker boundary,
      so post-bootstrap boot-volume reads reuse the selected handle instead of
      rerunning transport/partition ordering policy.
-   - Completed: `STORAGED_OP_BOOT_EXTENT_LOOKUP` now returns registry-backed
+  - Completed: `STORAGED_OP_BOOT_EXTENT_LOOKUP` now returns registry-backed
      boot extent leases with extents and generation when staged extents exist;
-     metadata-only fallback remains for unstaged paths.
-   - Completed: `storaged` now reads and parses
+     the metadata-only fallback for unstaged paths has been removed.
+  - Completed: `storaged` now reads and parses
      `system/registry/kernel/root-file-extents.tsv` itself for
-     `STORAGED_OP_BOOT_EXTENT_LOOKUP` before falling back to the gated kernel
-     broker, so post-bootstrap extent lookup policy starts in the service.
+     `STORAGED_OP_BOOT_EXTENT_LOOKUP`, and missing registry entries fail
+     closed instead of asking ring0 to synthesize a length-only lease.
+   - Completed: `storaged` now also accepts the shared commercial-max
+     `CommercialMaxProtocolRequest` envelope for block inventory, partition
+     scan, root-volume selection, boot extent leases, and volume metadata. The
+     legacy compact `StoragedRequest/StoragedResponse` ABI remains live for
+     current clients while commercial-max clients can use descriptor/capability
+     responses.
    - Remaining target: `storaged` owns inventory, partition policy, root
      selection, and mount candidate ordering after bootstrap. Kernel keeps block
      hardware drivers and the gated boot/block read broker for `vfsd` and early
@@ -190,12 +224,20 @@ privilege substrate, not a policy owner.
 
 7. Bootstrap VFS escape hatches:
    - Current source: `kernel/compat/src/user/syscall/linux/service_ops.rs`
-     keeps bootstrap `openat`, `statx`, `newfstatat`, and `access` only while
-     `vfsd` is not registered, plus fixed service-spawn exceptions for early
-     service loading.
+     keeps fixed service-spawn exceptions for early service loading, but no
+     longer keeps bootstrap file-materialization fallbacks for Linux
+     `openat`/`statx`/`newfstatat`/`access`.
    - Completed: post-`vfsd` direct ring0 file/metadata checks for bootstrap
      image paths were removed; once `vfsd` registers, binary/library loading
      and metadata route through `loaderd` plus `vfsd`.
+   - Completed: the remaining pre-`vfsd` bootstrap file fallback helpers were
+     deleted from `service_ops`; Linux VFS requests now require the service
+     path instead of reading the boot volume directly from ring0.
+   - Completed: `vfsd` now accepts the shared commercial-max
+     `CommercialMaxProtocolRequest` envelope for mount graph, path resolve,
+     fd-table planning, directory/file cursors, and metadata policy. The
+     existing compact VFS IPC and Linux syscall-offload replies remain the live
+     file-operation paths.
    - Remaining target: shrink fixed service-spawn exceptions to `rootd` and
      the foundational service allowlist only.
 
@@ -205,6 +247,19 @@ privilege substrate, not a policy owner.
    - Completed: resident `rootd` owns core-service leases and restart budgets;
      post-bootstrap restarts call `loaderd` when it is alive, with direct spawn
      retained only for fixed bootstrap and loaderd recovery.
+   - Completed: `rootd` now accepts the shared commercial-max
+     `CommercialMaxProtocolRequest` envelope on its supervisor endpoint for
+     bootstrap manifest, core-service lease, dependency graph, restart policy,
+     and readiness-signal queries while keeping the legacy compact rootd IPC
+     ABI for current clients.
+   - Attempted (2026-05-22, reverted): tried routing the initial `initd`
+     spawn through `LOADER_OP_SPAWN_EXEC` and shrinking
+     `can_bootstrap_spawn_direct` to {syscalld, vfsd, loaderd, procd}. Boot
+     hung after `rootd` issued `IPC_CALL` to loaderd for initd; reverted to
+     the direct kernel spawn for initd until the loaderd-served path is
+     instrumented enough to diagnose the stall (likely loaderd-side
+     PROC_COMMIT_BROKER capability gap or VFS readiness ordering — restart
+     path already works through loaderd, but cold first-spawn does not).
    - Target: keep reducing restart dependency policy into rootd lease protocol
      state and readiness/dependency manifests.
 
@@ -213,6 +268,11 @@ privilege substrate, not a policy owner.
      `NetdIpcRequest/NetdIpcResponse` protocol between the syscall path and
      `netd`; `netd` still invokes the gated ring0 net broker for current-process
      fd/user-copy commits.
+   - Completed: `netd` now accepts the shared commercial-max
+     `CommercialMaxProtocolRequest` envelope for socket namespace, socket
+     options, address bind, route policy, packet lease, and fd-transfer
+     descriptors/capability leases. The compact netd IPC remains the hot path
+     that calls the gated ring0 socket broker.
 
 10. Console/TTY/session policy:
    - Current source: console, TTY, and GUI device paths still live mainly under
@@ -220,6 +280,12 @@ privilege substrate, not a policy owner.
    - Completed (2026-05-20): policy-sensitive console/session observation and
      input-injection ioctls now route through `devmgrd` before the gated
      ring0 device ioctl broker. Display present and focus hot paths stay direct.
+   - Completed: `runtimed` now also registers the `IPC_SERVICE_SESSIOND`
+     endpoint and accepts the shared commercial-max `CommercialMaxProtocolRequest`
+     envelope for session graph, TTY line discipline, console route, foreground
+     focus, and UI bootstrap status. Existing runtime socket clients remain
+     unchanged while session-policy dependencies can resolve through the service
+     endpoint registry.
    - Target: keep boot console and panic output in ring0, but move normal
      session routing, device visibility, and user-facing console policy to
      `runtimed`, `uiserver`, `devmgrd`, or a dedicated session service.
@@ -228,6 +294,25 @@ privilege substrate, not a policy owner.
     - Current source: service-owned policy exists, but kernel process state
       still stores some Linux and Windows runtime metadata used by syscall
       handlers.
+    - Completed: `syscalld` now accepts the shared commercial-max
+      `CommercialMaxProtocolRequest` envelope for Linux policy, Win32 policy,
+      MM policy, creds/limits, clock/random policy, and cold syscall-offload
+      descriptors. Existing Linux and Win32 syscall offload messages remain the
+      execution/validation hot paths.
+    - Completed: `syscalld` now also registers `IPC_SERVICE_PAGERD` on its
+      policy IPC queue and accepts the commercial-max pager protocol for
+      backing objects, page-cache policy, fault resolution, and writeback
+      policy descriptors. Ring0 still owns the final page-table mutation and
+      current-address-space commit brokers.
+    - Completed: `loaderd` now accepts the shared commercial-max
+      `CommercialMaxProtocolRequest` envelope for image probing, ELF/PE runtime
+      plans, interpreter/import policy, map plans, and auxv plans. Existing
+      `LoaderSpawnRequest` remains the path that commits prepared executable
+      mappings through narrow ring0 brokers.
+    - Completed: `procd` now accepts the shared commercial-max
+      `CommercialMaxProtocolRequest` envelope for process prepare, exec ticket,
+      fork/thread plans, signal policy, wait namespace, and session membership.
+      Existing `ProcdIpcRequest` remains the live process operation ABI.
     - Completed (2026-05-20):
       - Kernel `load_pe_metadata` and the bytes-PE path in
         `process/mod.rs::load_image` and `load_image_file` were retired.
@@ -244,6 +329,22 @@ privilege substrate, not a policy owner.
         also dropped from both `prepare_image` and `exec_image` so the only
         live ELF parser in ring0 is the bytes-based `load_elf` used by the
         bootstrap `console_host` spawn path.
+      - `loaderd` PE relocation policy now accepts relocated PE images with an
+        empty base-relocation directory when the PE header does not mark
+        relocations stripped. This keeps Windows system-DLL loading in
+        service-owned PE policy and avoids falling back to ring0 image parsing.
+    - `winsys`/`ntdll` owns CRT `scanf` token policy for Windows PE programs:
+        field widths such as `%9s` are parsed in ring3, and successive `scanf`
+        calls consume a persistent console input buffer before refilling from
+        `NtReadFile`. Ring0 remains limited to the Win32 console read/write
+        user-copy primitive and session TTY substrate.
+      - Linux ABI constants, process/thread defaults, signal defaults,
+        runtime profile normalization, VMA metadata helpers, and the supported
+        syscall-number table moved from duplicated kernel `ps`/`compat` copies
+        into `rustos-user-abi::linux`. Kernel `ps/user/linux.rs` and
+        `compat/user/linux.rs` now re-export the shared ABI module, while
+        `support.rs` keeps only trap/security checks and signal-frame
+        construction/restore around the shared table.
     - Target: keep metadata required for scheduler/address-space/user-copy in
       ring0; move cold validation, namespace lookup, defaults, limits, and
       policy DBs to `syscalld`, `procd`, or `loaderd`.

@@ -13,13 +13,19 @@ use core::str;
 
 use rustos_svc_runtime::ipc;
 use rustos_user_abi::syscall::{
-    DevmgrdIpcRequest, DevmgrdIpcResponse, RustosBlockBrokerArgs, VfsIpcRequest, VfsIpcResponse,
+    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, DevmgrdIpcRequest,
+    DevmgrdIpcResponse, RustosBlockBrokerArgs, VfsIpcRequest, VfsIpcResponse,
     BLOCK_BROKER_ABI_VERSION, BLOCK_BROKER_MAX_IO_BYTES, BLOCK_BROKER_OP_BOOT_INFO,
-    BLOCK_BROKER_OP_BOOT_READ, DEVMGRD_IPC_ABI_VERSION, DEVMGRD_IPC_OP_LOOKUP,
-    DEVMGRD_IPC_OP_READDIR, DEVMGRD_MAX_DIR_ENTRIES, DEVMGRD_NODE_KIND_DEVICE,
-    DEVMGRD_NODE_KIND_DIR, IPC_MAX_INLINE_BYTES, IPC_SERVICE_DEVMGRD, IPC_SERVICE_VFSD,
-    LINUX_STATX_SIZE, LINUX_STAT_SIZE, SYSCALL_OFFLOAD_ABI_VERSION,
-    SYSCALL_OFFLOAD_OP_LINUX_ACCESS, SYSCALL_OFFLOAD_OP_LINUX_CHDIR,
+    BLOCK_BROKER_OP_BOOT_READ, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_VFSD,
+    COMMERCIAL_MAX_VFSD_OP_DIRECTORY_CURSOR, COMMERCIAL_MAX_VFSD_OP_FD_TABLE_PLAN,
+    COMMERCIAL_MAX_VFSD_OP_FILE_CURSOR, COMMERCIAL_MAX_VFSD_OP_METADATA_POLICY,
+    COMMERCIAL_MAX_VFSD_OP_MOUNT_GRAPH, COMMERCIAL_MAX_VFSD_OP_PATH_RESOLVE,
+    DEVMGRD_IPC_ABI_VERSION, DEVMGRD_IPC_OP_LOOKUP, DEVMGRD_IPC_OP_READDIR,
+    DEVMGRD_MAX_DIR_ENTRIES, DEVMGRD_NODE_KIND_DEVICE, DEVMGRD_NODE_KIND_DIR, IPC_MAX_INLINE_BYTES,
+    IPC_SERVICE_DEVMGRD, IPC_SERVICE_VFSD, LINUX_STATX_SIZE, LINUX_STAT_SIZE,
+    SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_ACCESS, SYSCALL_OFFLOAD_OP_LINUX_CHDIR,
     SYSCALL_OFFLOAD_OP_LINUX_CLOSE, SYSCALL_OFFLOAD_OP_LINUX_DUP, SYSCALL_OFFLOAD_OP_LINUX_FCNTL,
     SYSCALL_OFFLOAD_OP_LINUX_GETCWD, SYSCALL_OFFLOAD_OP_LINUX_GETDENTS64,
     SYSCALL_OFFLOAD_OP_LINUX_MKDIR, SYSCALL_OFFLOAD_OP_LINUX_MOUNT,
@@ -120,6 +126,16 @@ fn serve(endpoint: u64) {
                     reply_cap,
                     (&response as *const VfsIpcResponse).cast::<u8>(),
                     size_of::<VfsIpcResponse>(),
+                )
+            }
+        } else if received as usize == size_of::<CommercialMaxProtocolRequest>() {
+            let request = read_unaligned::<CommercialMaxProtocolRequest>(&request);
+            let response = state.handle_commercial_request(&request);
+            unsafe {
+                ipc::reply(
+                    reply_cap,
+                    (&response as *const CommercialMaxProtocolResponse).cast::<u8>(),
+                    size_of::<CommercialMaxProtocolResponse>(),
                 )
             }
         } else if received as usize == size_of::<LinuxSyscallOffloadRequest>() {
@@ -245,6 +261,79 @@ impl VfsState {
             SYSCALL_OFFLOAD_OP_LINUX_MOUNT => self.linux_mount(&mut response),
             SYSCALL_OFFLOAD_OP_LINUX_UMOUNT2 => self.linux_umount2(&mut response),
             SYSCALL_OFFLOAD_OP_LINUX_UNLINKAT => self.linux_unlinkat(request, &mut response),
+            _ => response.status = EINVAL,
+        }
+        response
+    }
+
+    fn handle_commercial_request(
+        &mut self,
+        request: &CommercialMaxProtocolRequest,
+    ) -> CommercialMaxProtocolResponse {
+        let mut response = CommercialMaxProtocolResponse {
+            header: request.header,
+            ..CommercialMaxProtocolResponse::default()
+        };
+        response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+        if let Err(errno) = validate_commercial_request(request) {
+            response.status = errno;
+            return response;
+        }
+        match request.header.op {
+            COMMERCIAL_MAX_VFSD_OP_MOUNT_GRAPH => {
+                response.value0 = self.mount_generation;
+                response.value1 = u64::from(self.volume.is_some());
+                response.descriptor_count = 1;
+                response.descriptors[0] =
+                    vfs_descriptor("mount-graph", request.header.op, self.mount_generation, 0);
+            }
+            COMMERCIAL_MAX_VFSD_OP_PATH_RESOLVE => {
+                let path = commercial_request_path(request);
+                if let Some(path) = path {
+                    match self.metadata(path) {
+                        Ok(metadata) => {
+                            response.value0 = metadata.inode;
+                            response.value1 = metadata.len;
+                            response.capability = vfs_capability("path-resolve", request.header.op);
+                            response.descriptor_count = 1;
+                            response.descriptors[0] = vfs_descriptor(
+                                "path-resolve",
+                                request.header.op,
+                                metadata.inode,
+                                metadata.len,
+                            );
+                        }
+                        Err(errno) => response.status = errno,
+                    }
+                } else {
+                    response.status = EINVAL;
+                }
+            }
+            COMMERCIAL_MAX_VFSD_OP_FD_TABLE_PLAN => {
+                response.value0 = self.handles.len() as u64;
+                response.value1 = self.next_handle;
+                response.descriptor_count = 1;
+                response.descriptors[0] =
+                    vfs_descriptor("fd-table", request.header.op, self.handles.len() as u64, 0);
+            }
+            COMMERCIAL_MAX_VFSD_OP_DIRECTORY_CURSOR => {
+                fill_handle_descriptors(self, &mut response, RemoteKind::Directory);
+            }
+            COMMERCIAL_MAX_VFSD_OP_FILE_CURSOR => {
+                fill_handle_descriptors(self, &mut response, RemoteKind::File);
+            }
+            COMMERCIAL_MAX_VFSD_OP_METADATA_POLICY => {
+                response.value0 = self.metadata_cache.len() as u64;
+                response.value1 = self.dir_entries_cache.len() as u64;
+                response.capability = vfs_capability("metadata-policy", request.header.op);
+                response.descriptor_count = 1;
+                response.descriptors[0] = vfs_descriptor(
+                    "metadata-policy",
+                    request.header.op,
+                    self.metadata_cache.len() as u64,
+                    self.dir_entries_cache.len() as u64,
+                );
+            }
             _ => response.status = EINVAL,
         }
         response
@@ -923,6 +1012,103 @@ impl VfsState {
         }
         Ok(self.volume.as_ref().expect("volume initialized"))
     }
+}
+
+fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result<(), i32> {
+    if request.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
+        || request.header.protocol != COMMERCIAL_MAX_PROTOCOL_VFSD
+        || request.path_len as usize > request.path.len()
+        || request.payload_len as usize > request.payload.len()
+    {
+        return Err(EINVAL);
+    }
+    match request.header.op {
+        COMMERCIAL_MAX_VFSD_OP_MOUNT_GRAPH
+        | COMMERCIAL_MAX_VFSD_OP_PATH_RESOLVE
+        | COMMERCIAL_MAX_VFSD_OP_FD_TABLE_PLAN
+        | COMMERCIAL_MAX_VFSD_OP_DIRECTORY_CURSOR
+        | COMMERCIAL_MAX_VFSD_OP_FILE_CURSOR
+        | COMMERCIAL_MAX_VFSD_OP_METADATA_POLICY => Ok(()),
+        _ => Err(EINVAL),
+    }
+}
+
+fn commercial_request_path(request: &CommercialMaxProtocolRequest) -> Option<&str> {
+    let len = request.path_len as usize;
+    str::from_utf8(&request.path[..len]).ok()
+}
+
+fn fill_handle_descriptors(
+    state: &VfsState,
+    response: &mut CommercialMaxProtocolResponse,
+    kind: RemoteKind,
+) {
+    let mut total = 0_u64;
+    for (index, (id, handle)) in state
+        .handles
+        .iter()
+        .filter(|(_, handle)| handle.kind == kind)
+        .enumerate()
+    {
+        total += 1;
+        if index < COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS {
+            response.descriptors[index] =
+                vfs_descriptor(handle.path.as_str(), response.header.op, *id, handle.cursor);
+            response.descriptor_count = (index + 1) as u16;
+        }
+    }
+    response.value0 = total;
+}
+
+fn vfs_descriptor(
+    label: &str,
+    op: u16,
+    value0: u64,
+    value1: u64,
+) -> CommercialMaxProtocolDescriptorWire {
+    let mut descriptor = CommercialMaxProtocolDescriptorWire {
+        protocol: COMMERCIAL_MAX_PROTOCOL_VFSD,
+        op,
+        flags: 0,
+        service_id: IPC_SERVICE_VFSD,
+        capability_mask: vfs_capability_mask(op),
+        value0,
+        value1,
+        ..CommercialMaxProtocolDescriptorWire::default()
+    };
+    copy_label(label, &mut descriptor.name, &mut descriptor.name_len);
+    descriptor
+}
+
+fn vfs_capability(label: &str, op: u16) -> CommercialMaxCapabilityLeaseWire {
+    let mut capability = CommercialMaxCapabilityLeaseWire {
+        lease_id: ((COMMERCIAL_MAX_PROTOCOL_VFSD as u64) << 32) | u64::from(op),
+        service_id: IPC_SERVICE_VFSD,
+        capability_mask: vfs_capability_mask(op),
+        rights_mask: vfs_capability_mask(op),
+        ..CommercialMaxCapabilityLeaseWire::default()
+    };
+    copy_label(label, &mut capability.label, &mut capability.label_len);
+    capability
+}
+
+fn vfs_capability_mask(op: u16) -> u64 {
+    match op {
+        COMMERCIAL_MAX_VFSD_OP_MOUNT_GRAPH => 1 << 0,
+        COMMERCIAL_MAX_VFSD_OP_PATH_RESOLVE => 1 << 1,
+        COMMERCIAL_MAX_VFSD_OP_FD_TABLE_PLAN => 1 << 2,
+        COMMERCIAL_MAX_VFSD_OP_DIRECTORY_CURSOR => 1 << 3,
+        COMMERCIAL_MAX_VFSD_OP_FILE_CURSOR => 1 << 4,
+        COMMERCIAL_MAX_VFSD_OP_METADATA_POLICY => 1 << 5,
+        _ => 0,
+    }
+}
+
+fn copy_label(label: &str, target: &mut [u8], len: &mut u16) {
+    let bytes = label.as_bytes();
+    let count = bytes.len().min(target.len());
+    target[..count].copy_from_slice(&bytes[..count]);
+    *len = count as u16;
 }
 
 #[derive(Clone)]

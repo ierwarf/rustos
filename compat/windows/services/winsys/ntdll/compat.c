@@ -42,6 +42,9 @@ static ULONGLONG rustos_tls_bitmap = 0;
 static void *rustos_tls_values[RUSTOS_NTDLL_TLS_SLOT_COUNT];
 static void *rustos_unhandled_exception_filter = NULL;
 static int rustos_ungetc_byte = RUSTOS_NTDLL_EOF;
+static char rustos_scanf_input[RUSTOS_NTDLL_SCANF_BUFFER_CAPACITY];
+static size_t rustos_scanf_input_len = 0;
+static size_t rustos_scanf_input_index = 0;
 static RustosOnExitCallback rustos_onexit_callbacks[RUSTOS_NTDLL_ONEXIT_CAPACITY];
 static UINT rustos_onexit_count = 0;
 static RustosHeapBlock rustos_heap_blocks[RUSTOS_NTDLL_HEAP_BLOCK_CAPACITY];
@@ -236,6 +239,64 @@ static size_t rustos_read_console_line(char *buffer, size_t capacity)
     return len;
 }
 
+static int rustos_scanf_refill_input(void)
+{
+    rustos_scanf_input_len =
+        rustos_read_console_line(rustos_scanf_input, sizeof(rustos_scanf_input));
+    rustos_scanf_input_index = 0;
+    return rustos_scanf_input_len != 0;
+}
+
+static int rustos_scanf_peek_input(void)
+{
+    while (rustos_scanf_input_index >= rustos_scanf_input_len) {
+        if (!rustos_scanf_refill_input()) {
+            return RUSTOS_NTDLL_EOF;
+        }
+    }
+    return (unsigned char)rustos_scanf_input[rustos_scanf_input_index];
+}
+
+static int rustos_scanf_take_input(void)
+{
+    int ch = rustos_scanf_peek_input();
+    if (ch != RUSTOS_NTDLL_EOF) {
+        rustos_scanf_input_index++;
+    }
+    return ch;
+}
+
+static void rustos_scanf_skip_input_whitespace(void)
+{
+    for (;;) {
+        int ch = rustos_scanf_peek_input();
+        if (ch == RUSTOS_NTDLL_EOF || !rustos_ascii_isspace(ch)) {
+            return;
+        }
+        (void)rustos_scanf_take_input();
+    }
+}
+
+static size_t rustos_scanf_read_token(char *dst, size_t capacity, size_t width)
+{
+    size_t len = 0;
+    if (dst == NULL || capacity == 0) {
+        return 0;
+    }
+    while (len + 1 < capacity) {
+        int ch = rustos_scanf_peek_input();
+        if (ch == RUSTOS_NTDLL_EOF || rustos_ascii_isspace(ch)) {
+            break;
+        }
+        if (width != 0 && len >= width) {
+            break;
+        }
+        dst[len++] = (char)rustos_scanf_take_input();
+    }
+    dst[len] = '\0';
+    return len;
+}
+
 static int rustos_write_char(void *stream, char ch)
 {
     return rustos_write_all(stream, &ch, 1);
@@ -291,6 +352,17 @@ static const char *rustos_skip_digits(const char *text)
         text++;
     }
     return text;
+}
+
+static const char *rustos_parse_scanf_width(const char *cursor, size_t *width)
+{
+    size_t value = 0;
+    while (*cursor >= '0' && *cursor <= '9') {
+        value = value * 10u + (size_t)(*cursor - '0');
+        cursor++;
+    }
+    *width = value;
+    return cursor;
 }
 
 static const char *rustos_parse_length(const char *cursor, RustosFormatLength *length)
@@ -476,13 +548,6 @@ static int rustos_vfprintf_internal(void *stream, const char *format, RUSTOS_VA_
     return written_total;
 }
 
-static void rustos_skip_input_whitespace(const char *input, size_t *index)
-{
-    while (input[*index] != '\0' && rustos_ascii_isspace((unsigned char)input[*index])) {
-        (*index)++;
-    }
-}
-
 static int rustos_parse_unsigned_token(
     const char *token,
     int base,
@@ -547,34 +612,19 @@ static int rustos_parse_signed_token(const char *token, long long *value, int au
     return TRUE;
 }
 
-static int rustos_copy_token(char *dst, const char *src, size_t len)
-{
-    size_t index;
-    if (dst == NULL) {
-        return FALSE;
-    }
-    for (index = 0; index < len; index++) {
-        dst[index] = src[index];
-    }
-    dst[len] = '\0';
-    return TRUE;
-}
-
 static int rustos_vscanf_internal(const char *format, RUSTOS_VA_LIST ap)
 {
-    char input[RUSTOS_NTDLL_SCANF_BUFFER_CAPACITY];
-    size_t input_index = 0;
     const char *fmt = format;
     int assigned = 0;
     if (format == NULL) {
         rustos_set_last_error(RUSTOS_ERROR_INVALID_PARAMETER);
         return RUSTOS_NTDLL_EOF;
     }
-    rustos_read_console_line(input, sizeof(input));
 
     while (*fmt != '\0') {
         RustosFormatLength length = RUSTOS_FORMAT_LENGTH_DEFAULT;
         const char *spec_cursor;
+        size_t field_width = 0;
         char spec;
         if (*fmt == '%') {
             fmt++;
@@ -582,24 +632,33 @@ static int rustos_vscanf_internal(const char *format, RUSTOS_VA_LIST ap)
                 rustos_set_last_error(RUSTOS_ERROR_INVALID_PARAMETER);
                 return RUSTOS_NTDLL_EOF;
             }
+            if (*fmt == '%') {
+                if (rustos_scanf_take_input() != '%') {
+                    return assigned;
+                }
+                fmt++;
+                continue;
+            }
+            if (*fmt == '*') {
+                rustos_set_last_error(RUSTOS_ERROR_INVALID_PARAMETER);
+                return RUSTOS_NTDLL_EOF;
+            }
+            fmt = rustos_parse_scanf_width(fmt, &field_width);
             spec_cursor = rustos_parse_length(fmt, &length);
             spec = *spec_cursor;
             if (spec != 'c') {
-                rustos_skip_input_whitespace(input, &input_index);
+                rustos_scanf_skip_input_whitespace();
             }
             switch (spec) {
             case 'd':
             case 'i': {
                 char token[128];
-                size_t start = input_index;
+                size_t width = field_width;
                 long long value = 0;
-                while (input[input_index] != '\0'
-                    && !rustos_ascii_isspace((unsigned char)input[input_index])) {
-                    input_index++;
+                if (width == 0 || width >= sizeof(token)) {
+                    width = sizeof(token) - 1;
                 }
-                if (input_index == start
-                    || input_index - start >= sizeof(token)
-                    || !rustos_copy_token(token, input + start, input_index - start)
+                if (rustos_scanf_read_token(token, sizeof(token), width) == 0
                     || !rustos_parse_signed_token(token, &value, spec == 'i')) {
                     return assigned;
                 }
@@ -616,16 +675,13 @@ static int rustos_vscanf_internal(const char *format, RUSTOS_VA_LIST ap)
             case 'u':
             case 'x': {
                 char token[128];
-                size_t start = input_index;
+                size_t width = field_width;
                 unsigned long long value = 0;
                 int base = spec == 'x' ? 16 : 10;
-                while (input[input_index] != '\0'
-                    && !rustos_ascii_isspace((unsigned char)input[input_index])) {
-                    input_index++;
+                if (width == 0 || width >= sizeof(token)) {
+                    width = sizeof(token) - 1;
                 }
-                if (input_index == start
-                    || input_index - start >= sizeof(token)
-                    || !rustos_copy_token(token, input + start, input_index - start)
+                if (rustos_scanf_read_token(token, sizeof(token), width) == 0
                     || !rustos_parse_unsigned_token(token, base, &value)) {
                     return assigned;
                 }
@@ -640,32 +696,49 @@ static int rustos_vscanf_internal(const char *format, RUSTOS_VA_LIST ap)
                 break;
             }
             case 'c': {
-                int ch = rustos_read_console_byte();
+                size_t count = field_width == 0 ? 1 : field_width;
+                size_t index;
                 char *out;
-                if (ch == RUSTOS_NTDLL_EOF) {
-                    return assigned == 0 ? RUSTOS_NTDLL_EOF : assigned;
-                }
                 out = __builtin_va_arg(ap, char *);
-                *out = (char)ch;
+                if (out == NULL) {
+                    rustos_set_last_error(RUSTOS_ERROR_INVALID_PARAMETER);
+                    return RUSTOS_NTDLL_EOF;
+                }
+                for (index = 0; index < count; index++) {
+                    int ch = rustos_scanf_take_input();
+                    if (ch == RUSTOS_NTDLL_EOF) {
+                        return assigned == 0 && index == 0 ? RUSTOS_NTDLL_EOF : assigned;
+                    }
+                    out[index] = (char)ch;
+                }
                 assigned++;
                 break;
             }
             case 's': {
                 char *out;
-                size_t start;
-                if (input[input_index] == '\0') {
+                size_t copied = 0;
+                if (rustos_scanf_peek_input() == RUSTOS_NTDLL_EOF) {
                     return assigned;
                 }
-                start = input_index;
-                while (input[input_index] != '\0'
-                    && !rustos_ascii_isspace((unsigned char)input[input_index])) {
-                    input_index++;
-                }
                 out = __builtin_va_arg(ap, char *);
-                if (!rustos_copy_token(out, input + start, input_index - start)) {
+                if (out == NULL) {
                     rustos_set_last_error(RUSTOS_ERROR_INVALID_PARAMETER);
                     return RUSTOS_NTDLL_EOF;
                 }
+                for (;;) {
+                    int ch = rustos_scanf_peek_input();
+                    if (ch == RUSTOS_NTDLL_EOF || rustos_ascii_isspace(ch)) {
+                        break;
+                    }
+                    if (field_width != 0 && copied >= field_width) {
+                        break;
+                    }
+                    out[copied++] = (char)rustos_scanf_take_input();
+                }
+                if (copied == 0) {
+                    return assigned;
+                }
+                out[copied] = '\0';
                 assigned++;
                 break;
             }
@@ -680,13 +753,12 @@ static int rustos_vscanf_internal(const char *format, RUSTOS_VA_LIST ap)
             while (rustos_ascii_isspace((unsigned char)*fmt)) {
                 fmt++;
             }
-            rustos_skip_input_whitespace(input, &input_index);
+            rustos_scanf_skip_input_whitespace();
             continue;
         }
-        if (input[input_index] != *fmt) {
+        if (rustos_scanf_take_input() != (unsigned char)*fmt) {
             return assigned;
         }
-        input_index++;
         fmt++;
     }
 

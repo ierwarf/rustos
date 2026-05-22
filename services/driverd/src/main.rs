@@ -4,14 +4,25 @@ use std::time::Instant;
 use std::{collections::BTreeSet, fs, thread, time::Duration};
 
 use rustos_user_abi::syscall::{
-    LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, RustosDriverLoadModuleBrokerArgs,
-    RustosDriverProbeAliasBrokerArgs, RustosDriverProviderActiveBrokerArgs, DRIVER_BUS_PCI,
-    DRIVER_BUS_PLATFORM, DRIVER_BUS_SERIO, DRIVER_BUS_USB, DRIVER_BUS_VIRTIO, DRIVER_CLASS_DISPLAY,
-    DRIVER_CLASS_INPUT, DRIVER_CLASS_NETWORK, IPC_SERVICE_DRIVERD, SYSCALL_OFFLOAD_ABI_VERSION,
-    SYSCALL_OFFLOAD_OP_DRIVER_LOAD_POLICY, SYSCALL_OFFLOAD_PATH_CAPACITY, SYS_RUSTOS_DEBUG_PRINT,
-    SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER, SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER,
-    SYS_RUSTOS_DRIVER_PROVIDER_ACTIVE_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV,
-    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
+    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, LinuxSyscallOffloadRequest,
+    LinuxSyscallOffloadResponse, RustosDriverLoadModuleBrokerArgs,
+    RustosDriverProbeAliasBrokerArgs, RustosDriverProviderActiveBrokerArgs,
+    COMMERCIAL_MAX_DRIVERD_OP_DRIVER_PLAN, COMMERCIAL_MAX_DRIVERD_OP_FALLBACK_POLICY,
+    COMMERCIAL_MAX_DRIVERD_OP_MODULE_LOAD_AUTHORIZE, COMMERCIAL_MAX_DRIVERD_OP_PROVIDER_SELECT,
+    COMMERCIAL_MAX_DRIVERD_OP_RETRY_BUDGET, COMMERCIAL_MAX_DRIVERD_OP_SYMBOL_POLICY,
+    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_DRIVERD,
+    COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_SERVICE_DRIVERD,
+    COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DMA_BUFFER,
+    COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DRIVER_INSTANCE, COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IRQ_ROUTE,
+    COMMERCIAL_MAX_SERVICE_DRIVERD_OP_MMIO_LEASE, DRIVER_BUS_PCI, DRIVER_BUS_PLATFORM,
+    DRIVER_BUS_SERIO, DRIVER_BUS_USB, DRIVER_BUS_VIRTIO, DRIVER_CLASS_DISPLAY, DRIVER_CLASS_INPUT,
+    DRIVER_CLASS_NETWORK, IPC_SERVICE_DRIVERD, IPC_SERVICE_SERVICE_DRIVERD,
+    SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_DRIVER_LOAD_POLICY,
+    SYSCALL_OFFLOAD_PATH_CAPACITY, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER,
+    SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER, SYS_RUSTOS_DRIVER_PROVIDER_ACTIVE_BROKER,
+    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_REPLY,
 };
 
 const RECV_BACKOFF: Duration = Duration::from_millis(10);
@@ -41,8 +52,22 @@ fn main() {
         );
         return;
     }
+    let service_driver_register = syscall2(
+        SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
+        IPC_SERVICE_SERVICE_DRIVERD,
+        endpoint as u64,
+    );
+    if service_driver_register < 0 {
+        let _ = writeln!(
+            std::io::stderr(),
+            "driverd: service-driver endpoint register failed errno={}",
+            -service_driver_register
+        );
+        return;
+    }
 
     debug_line("driverd: driver policy endpoint registered");
+    debug_line("driverd: service-driver policy endpoint registered");
     debug_line("driverd: autoload begin");
     autoload_from_registry();
     debug_line("driverd: autoload done");
@@ -67,17 +92,10 @@ struct DriverRecord {
 fn autoload_from_registry() {
     let started_at = Instant::now();
     debug_line("driverd: registry read begin");
-    let text = match fs::read_to_string(LOADABLE_DRIVER_REGISTRY_PATH) {
-        Ok(text) => text,
-        Err(err) => {
-            debug_line(&format!("driverd: registry read failed error={err:?}"));
-            return;
-        }
-    };
-    let mut records = match parse_registry(text.as_str()) {
+    let mut records = match registry_records() {
         Ok(records) => records,
         Err(err) => {
-            debug_line(&format!("driverd: registry parse failed error={err}"));
+            debug_line(&format!("driverd: registry load failed error={err}"));
             return;
         }
     };
@@ -371,6 +389,12 @@ fn parse_registry(text: &str) -> Result<Vec<DriverRecord>, &'static str> {
     Ok(records)
 }
 
+fn registry_records() -> Result<Vec<DriverRecord>, String> {
+    let text = fs::read_to_string(LOADABLE_DRIVER_REGISTRY_PATH)
+        .map_err(|err| format!("read failed: {err:?}"))?;
+    parse_registry(text.as_str()).map_err(str::to_string)
+}
+
 fn registry_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     for token in line.split('\t') {
         let (candidate, value) = token.split_once('=')?;
@@ -403,13 +427,13 @@ fn parse_driver_bus(name: &str) -> Option<u32> {
 
 fn serve(endpoint: u64) {
     loop {
-        let mut request = LinuxSyscallOffloadRequest::default();
+        let mut request = CommercialMaxProtocolRequest::default();
         let mut reply_cap = 0_u64;
         let received = syscall4(
             SYS_RUSTOS_IPC_RECV,
             endpoint,
-            (&mut request as *mut LinuxSyscallOffloadRequest) as u64,
-            size_of::<LinuxSyscallOffloadRequest>() as u64,
+            (&mut request as *mut CommercialMaxProtocolRequest) as u64,
+            size_of::<CommercialMaxProtocolRequest>() as u64,
             (&mut reply_cap as *mut u64) as u64,
         );
         if received < 0 {
@@ -417,6 +441,18 @@ fn serve(endpoint: u64) {
             continue;
         }
 
+        if received as usize == size_of::<CommercialMaxProtocolRequest>() {
+            let reply = reply_commercial_request(reply_cap, &request);
+            if reply < 0 {
+                let _ = writeln!(std::io::stderr(), "driverd: reply failed errno={}", -reply);
+            }
+            continue;
+        }
+
+        let request = unsafe {
+            &*((&request as *const CommercialMaxProtocolRequest)
+                .cast::<LinuxSyscallOffloadRequest>())
+        };
         let mut response = LinuxSyscallOffloadResponse {
             op: request.op,
             ..LinuxSyscallOffloadResponse::default()
@@ -436,6 +472,24 @@ fn serve(endpoint: u64) {
     }
 }
 
+fn reply_commercial_request(reply_cap: u64, request: &CommercialMaxProtocolRequest) -> i64 {
+    let mut response = CommercialMaxProtocolResponse {
+        header: request.header,
+        ..CommercialMaxProtocolResponse::default()
+    };
+    response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    response.status = match validate_commercial_request(request) {
+        Ok(()) => dispatch_commercial_request(request, &mut response),
+        Err(errno) => errno,
+    };
+    syscall3(
+        SYS_RUSTOS_IPC_REPLY,
+        reply_cap,
+        (&response as *const CommercialMaxProtocolResponse) as u64,
+        size_of::<CommercialMaxProtocolResponse>() as u64,
+    )
+}
+
 fn validate_request(received: usize, request: &LinuxSyscallOffloadRequest) -> Result<(), i32> {
     if received != size_of::<LinuxSyscallOffloadRequest>()
         || request.version != SYSCALL_OFFLOAD_ABI_VERSION
@@ -448,6 +502,256 @@ fn validate_request(received: usize, request: &LinuxSyscallOffloadRequest) -> Re
         SYSCALL_OFFLOAD_OP_DRIVER_LOAD_POLICY => Ok(()),
         _ => Err(libc::EINVAL),
     }
+}
+
+fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result<(), i32> {
+    if request.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
+        || request.path_len as usize > request.path.len()
+        || request.payload_len as usize > request.payload.len()
+    {
+        return Err(libc::EINVAL);
+    }
+    match request.header.protocol {
+        COMMERCIAL_MAX_PROTOCOL_DRIVERD => match request.header.op {
+            COMMERCIAL_MAX_DRIVERD_OP_DRIVER_PLAN
+            | COMMERCIAL_MAX_DRIVERD_OP_MODULE_LOAD_AUTHORIZE
+            | COMMERCIAL_MAX_DRIVERD_OP_SYMBOL_POLICY
+            | COMMERCIAL_MAX_DRIVERD_OP_PROVIDER_SELECT
+            | COMMERCIAL_MAX_DRIVERD_OP_RETRY_BUDGET
+            | COMMERCIAL_MAX_DRIVERD_OP_FALLBACK_POLICY => Ok(()),
+            _ => Err(libc::EINVAL),
+        },
+        COMMERCIAL_MAX_PROTOCOL_SERVICE_DRIVERD => match request.header.op {
+            COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DRIVER_INSTANCE
+            | COMMERCIAL_MAX_SERVICE_DRIVERD_OP_MMIO_LEASE
+            | COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IRQ_ROUTE
+            | COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DMA_BUFFER => Ok(()),
+            _ => Err(libc::EINVAL),
+        },
+        _ => Err(libc::EINVAL),
+    }
+}
+
+fn dispatch_commercial_request(
+    request: &CommercialMaxProtocolRequest,
+    response: &mut CommercialMaxProtocolResponse,
+) -> i32 {
+    if request.header.protocol == COMMERCIAL_MAX_PROTOCOL_SERVICE_DRIVERD {
+        return dispatch_service_driver_request(request, response);
+    }
+    let records = match registry_records() {
+        Ok(records) => records,
+        Err(_) => return libc::ENOENT,
+    };
+    match request.header.op {
+        COMMERCIAL_MAX_DRIVERD_OP_DRIVER_PLAN => {
+            fill_driver_descriptors(response, records.iter());
+            0
+        }
+        COMMERCIAL_MAX_DRIVERD_OP_MODULE_LOAD_AUTHORIZE => {
+            let path = match commercial_request_path(request) {
+                Ok(path) => path,
+                Err(errno) => return errno,
+            };
+            if let Some(record) = records.iter().find(|record| record.image_path == path) {
+                response.descriptor_count = 1;
+                response.value0 = record.class as u64;
+                response.value1 = record.bus as u64;
+                response.descriptors[0] = driver_descriptor(record);
+                response.capability = driver_capability(record.name.as_str(), request.header.op);
+                0
+            } else {
+                libc::EACCES
+            }
+        }
+        COMMERCIAL_MAX_DRIVERD_OP_SYMBOL_POLICY => {
+            fill_driver_descriptors(response, records.iter());
+            response.capability = driver_capability("symbol-policy", request.header.op);
+            0
+        }
+        COMMERCIAL_MAX_DRIVERD_OP_PROVIDER_SELECT => {
+            let provider_records = records
+                .iter()
+                .filter(|record| !record.provider_group.is_empty());
+            fill_driver_descriptors(response, provider_records);
+            response.capability = driver_capability("provider-select", request.header.op);
+            0
+        }
+        COMMERCIAL_MAX_DRIVERD_OP_RETRY_BUDGET => {
+            fill_driver_descriptors(response, records.iter());
+            response.value1 = 1;
+            0
+        }
+        COMMERCIAL_MAX_DRIVERD_OP_FALLBACK_POLICY => {
+            let fallback_records = records.iter().filter(|record| record.fallback_only);
+            fill_driver_descriptors(response, fallback_records);
+            response.capability = driver_capability("fallback-policy", request.header.op);
+            0
+        }
+        _ => libc::EINVAL,
+    }
+}
+
+fn dispatch_service_driver_request(
+    request: &CommercialMaxProtocolRequest,
+    response: &mut CommercialMaxProtocolResponse,
+) -> i32 {
+    match request.header.op {
+        COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DRIVER_INSTANCE => {
+            match registry_records() {
+                Ok(records) => fill_driver_descriptors(response, records.iter()),
+                Err(_) => return libc::ENOENT,
+            }
+            response.capability = service_driver_capability("driver-instance", request.header.op);
+            0
+        }
+        COMMERCIAL_MAX_SERVICE_DRIVERD_OP_MMIO_LEASE => {
+            response.descriptor_count = 1;
+            response.descriptors[0] = service_driver_descriptor(
+                "mmio-lease",
+                request.header.op,
+                request.arg0,
+                request.arg1,
+            );
+            response.capability = service_driver_capability("mmio-lease", request.header.op);
+            0
+        }
+        COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IRQ_ROUTE => {
+            response.descriptor_count = 1;
+            response.descriptors[0] = service_driver_descriptor(
+                "irq-route",
+                request.header.op,
+                request.arg0,
+                request.arg1,
+            );
+            response.capability = service_driver_capability("irq-route", request.header.op);
+            0
+        }
+        COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DMA_BUFFER => {
+            response.descriptor_count = 1;
+            response.descriptors[0] = service_driver_descriptor(
+                "dma-buffer",
+                request.header.op,
+                request.arg0,
+                request.arg1,
+            );
+            response.capability = service_driver_capability("dma-buffer", request.header.op);
+            0
+        }
+        _ => libc::EINVAL,
+    }
+}
+
+fn fill_driver_descriptors<'a, I>(response: &mut CommercialMaxProtocolResponse, records: I)
+where
+    I: Iterator<Item = &'a DriverRecord>,
+{
+    let mut total = 0_u64;
+    for (index, record) in records.enumerate() {
+        total += 1;
+        if index < COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS {
+            response.descriptors[index] = driver_descriptor(record);
+            response.descriptor_count = (index + 1) as u16;
+        }
+    }
+    response.value0 = total;
+}
+
+fn driver_descriptor(record: &DriverRecord) -> CommercialMaxProtocolDescriptorWire {
+    let mut descriptor = CommercialMaxProtocolDescriptorWire {
+        protocol: COMMERCIAL_MAX_PROTOCOL_DRIVERD,
+        op: COMMERCIAL_MAX_DRIVERD_OP_DRIVER_PLAN,
+        flags: u32::from(record.fallback_only),
+        service_id: IPC_SERVICE_DRIVERD,
+        capability_mask: driver_capability_mask(COMMERCIAL_MAX_DRIVERD_OP_DRIVER_PLAN),
+        value0: record.class as u64,
+        value1: record.bus as u64,
+        ..CommercialMaxProtocolDescriptorWire::default()
+    };
+    copy_label(
+        record.name.as_str(),
+        &mut descriptor.name,
+        &mut descriptor.name_len,
+    );
+    descriptor
+}
+
+fn driver_capability(label: &str, op: u16) -> CommercialMaxCapabilityLeaseWire {
+    let mut capability = CommercialMaxCapabilityLeaseWire {
+        lease_id: ((COMMERCIAL_MAX_PROTOCOL_DRIVERD as u64) << 32) | u64::from(op),
+        service_id: IPC_SERVICE_DRIVERD,
+        capability_mask: driver_capability_mask(op),
+        rights_mask: driver_capability_mask(op),
+        ..CommercialMaxCapabilityLeaseWire::default()
+    };
+    copy_label(label, &mut capability.label, &mut capability.label_len);
+    capability
+}
+
+fn driver_capability_mask(op: u16) -> u64 {
+    match op {
+        COMMERCIAL_MAX_DRIVERD_OP_DRIVER_PLAN => 1 << 0,
+        COMMERCIAL_MAX_DRIVERD_OP_MODULE_LOAD_AUTHORIZE => 1 << 1,
+        COMMERCIAL_MAX_DRIVERD_OP_SYMBOL_POLICY => 1 << 2,
+        COMMERCIAL_MAX_DRIVERD_OP_PROVIDER_SELECT => 1 << 3,
+        COMMERCIAL_MAX_DRIVERD_OP_RETRY_BUDGET => 1 << 4,
+        COMMERCIAL_MAX_DRIVERD_OP_FALLBACK_POLICY => 1 << 5,
+        _ => 0,
+    }
+}
+
+fn service_driver_descriptor(
+    label: &str,
+    op: u16,
+    value0: u64,
+    value1: u64,
+) -> CommercialMaxProtocolDescriptorWire {
+    let mut descriptor = CommercialMaxProtocolDescriptorWire {
+        protocol: COMMERCIAL_MAX_PROTOCOL_SERVICE_DRIVERD,
+        op,
+        flags: 0,
+        service_id: IPC_SERVICE_SERVICE_DRIVERD,
+        capability_mask: service_driver_capability_mask(op),
+        value0,
+        value1,
+        ..CommercialMaxProtocolDescriptorWire::default()
+    };
+    copy_label(label, &mut descriptor.name, &mut descriptor.name_len);
+    descriptor
+}
+
+fn service_driver_capability(label: &str, op: u16) -> CommercialMaxCapabilityLeaseWire {
+    let mut capability = CommercialMaxCapabilityLeaseWire {
+        lease_id: ((COMMERCIAL_MAX_PROTOCOL_SERVICE_DRIVERD as u64) << 32) | u64::from(op),
+        service_id: IPC_SERVICE_SERVICE_DRIVERD,
+        capability_mask: service_driver_capability_mask(op),
+        rights_mask: service_driver_capability_mask(op),
+        ..CommercialMaxCapabilityLeaseWire::default()
+    };
+    copy_label(label, &mut capability.label, &mut capability.label_len);
+    capability
+}
+
+fn service_driver_capability_mask(op: u16) -> u64 {
+    match op {
+        COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DRIVER_INSTANCE => 1 << 0,
+        COMMERCIAL_MAX_SERVICE_DRIVERD_OP_MMIO_LEASE => 1 << 1,
+        COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IRQ_ROUTE => 1 << 2,
+        COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DMA_BUFFER => 1 << 3,
+        _ => 0,
+    }
+}
+
+fn commercial_request_path(request: &CommercialMaxProtocolRequest) -> Result<&str, i32> {
+    let len = request.path_len as usize;
+    std::str::from_utf8(&request.path[..len]).map_err(|_| libc::EINVAL)
+}
+
+fn copy_label(label: &str, target: &mut [u8], len: &mut u16) {
+    let bytes = label.as_bytes();
+    let count = bytes.len().min(target.len());
+    target[..count].copy_from_slice(&bytes[..count]);
+    *len = count as u16;
 }
 
 fn syscall0(number: u64) -> i64 {

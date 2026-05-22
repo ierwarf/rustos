@@ -109,13 +109,7 @@ pub(super) fn syscall_linux_rustos_boot_extent_broker(args_ptr: u64) -> u64 {
                 dest.len = src.len;
             }
         }
-        Ok(None) => {
-            lease.file_len =
-                match kernel_io_manager::api::vfs::boot_path_file_len_for_kernel(normalized) {
-                    Ok(file_len) => file_len,
-                    Err(_) => return linux_errno(LINUX_ENOENT),
-                };
-        }
+        Ok(None) => return linux_errno(LINUX_ENOENT),
         Err(_) => return linux_errno(LINUX_ENOENT),
     }
     lease.path[..path_len].copy_from_slice(&path_bytes);

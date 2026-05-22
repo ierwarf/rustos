@@ -21,10 +21,16 @@ use rustos_user_abi::console::{
     ConsoleSetFocusRequest, ConsoleSetSessionStateRequest,
 };
 use rustos_user_abi::syscall::{
-    LoaderSpawnRequest, LoaderSpawnResponse, IPC_SERVICE_DEVMGRD, IPC_SERVICE_LOADERD,
-    LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
+    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, LoaderSpawnRequest,
+    LoaderSpawnResponse, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_SESSIOND,
+    COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE, COMMERCIAL_MAX_SESSIOND_OP_FOREGROUND_FOCUS,
+    COMMERCIAL_MAX_SESSIOND_OP_SESSION_GRAPH, COMMERCIAL_MAX_SESSIOND_OP_TTY_LINE_DISCIPLINE,
+    COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP, IPC_SERVICE_DEVMGRD, IPC_SERVICE_LOADERD,
+    IPC_SERVICE_SESSIOND, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
     LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, SYS_RUSTOS_IPC_CALL,
-    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_TRY_RECV,
 };
 
 const DEFAULT_USER_TASK_WEIGHT_MICROS: u64 = 100;
@@ -183,6 +189,7 @@ fn main() {
     };
     stderr_line("runtimed: runtime socket ready");
     boot_line("runtimed: runtime socket ready");
+    let session_endpoint = create_session_endpoint();
 
     let mut state = BrokerState {
         console_fd: None,
@@ -211,6 +218,7 @@ fn main() {
     }
     loop {
         let mut did_work = false;
+        did_work |= service_session_endpoint(session_endpoint, &mut state);
         did_work |= reap_children(&mut state);
         did_work |= service_listener(&listener, &mut state);
         if state.ui_ready && !state.launch_catalog_loaded && launch_catalog.is_none() {
@@ -307,6 +315,214 @@ fn wait_for_service_endpoint(service_id: u64, timeout: Duration) -> Result<(), i
             return Err(libc::ETIMEDOUT);
         }
         thread::sleep(SERVICE_ENDPOINT_POLL_INTERVAL);
+    }
+}
+
+fn create_session_endpoint() -> Option<u64> {
+    let endpoint = unsafe { libc::syscall(SYS_RUSTOS_IPC_ENDPOINT_CREATE as libc::c_long) as i64 };
+    if endpoint < 0 {
+        stderr_line("runtimed: session endpoint create failed");
+        return None;
+    }
+    let register = unsafe {
+        libc::syscall(
+            SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT as libc::c_long,
+            IPC_SERVICE_SESSIOND,
+            endpoint as u64,
+        ) as i64
+    };
+    if register < 0 {
+        stderr_line("runtimed: session endpoint register failed");
+        return None;
+    }
+    stderr_line("runtimed: session policy endpoint registered");
+    Some(endpoint as u64)
+}
+
+fn service_session_endpoint(endpoint: Option<u64>, state: &mut BrokerState) -> bool {
+    let Some(endpoint) = endpoint else {
+        return false;
+    };
+    let mut request = CommercialMaxProtocolRequest::default();
+    let mut reply_cap = 0_u64;
+    let received = unsafe {
+        libc::syscall(
+            SYS_RUSTOS_IPC_TRY_RECV as libc::c_long,
+            endpoint,
+            (&mut request as *mut CommercialMaxProtocolRequest) as u64,
+            size_of::<CommercialMaxProtocolRequest>() as u64,
+            (&mut reply_cap as *mut u64) as u64,
+        ) as i64
+    };
+    if received < 0 {
+        return false;
+    }
+    let mut response = CommercialMaxProtocolResponse {
+        header: request.header,
+        ..CommercialMaxProtocolResponse::default()
+    };
+    response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    response.status = if received as usize != size_of::<CommercialMaxProtocolRequest>() {
+        libc::EINVAL
+    } else {
+        handle_session_request(&request, state, &mut response)
+    };
+    let reply = unsafe {
+        libc::syscall(
+            SYS_RUSTOS_IPC_REPLY as libc::c_long,
+            reply_cap,
+            (&response as *const CommercialMaxProtocolResponse) as u64,
+            size_of::<CommercialMaxProtocolResponse>() as u64,
+        ) as i64
+    };
+    if reply < 0 {
+        stderr_line("runtimed: session reply failed");
+    }
+    true
+}
+
+fn handle_session_request(
+    request: &CommercialMaxProtocolRequest,
+    state: &BrokerState,
+    response: &mut CommercialMaxProtocolResponse,
+) -> i32 {
+    if request.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
+        || request.header.protocol != COMMERCIAL_MAX_PROTOCOL_SESSIOND
+        || request.path_len as usize > request.path.len()
+        || request.payload_len as usize > request.payload.len()
+    {
+        return libc::EINVAL;
+    }
+    match request.header.op {
+        COMMERCIAL_MAX_SESSIOND_OP_SESSION_GRAPH => {
+            let session_count = state
+                .running
+                .values()
+                .filter(|program| program.session_handle != 0)
+                .count();
+            response.value0 = state.running.len() as u64;
+            response.value1 = session_count as u64;
+            fill_session_program_descriptors(state, response);
+            0
+        }
+        COMMERCIAL_MAX_SESSIOND_OP_TTY_LINE_DISCIPLINE => {
+            response.descriptor_count = 1;
+            response.value0 = u64::from(state.console_fd.is_some());
+            response.descriptors[0] = session_descriptor(
+                "tty-line",
+                request.header.op,
+                state
+                    .console_fd
+                    .as_ref()
+                    .map_or(0, |fd| fd.as_raw_fd() as u64),
+                0,
+            );
+            response.capability = session_capability("tty-line", request.header.op);
+            0
+        }
+        COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE => {
+            response.value0 = state
+                .running
+                .values()
+                .filter(|program| program.session_handle != 0)
+                .count() as u64;
+            response.descriptor_count = 1;
+            response.descriptors[0] =
+                session_descriptor("console-route", request.header.op, response.value0, 0);
+            response.capability = session_capability("console-route", request.header.op);
+            0
+        }
+        COMMERCIAL_MAX_SESSIOND_OP_FOREGROUND_FOCUS => {
+            let focused_session = state
+                .running
+                .values()
+                .filter(|program| program.session_handle != 0)
+                .map(|program| program.session_handle)
+                .max()
+                .unwrap_or(0);
+            response.value0 = focused_session;
+            response.descriptor_count = 1;
+            response.descriptors[0] =
+                session_descriptor("foreground-focus", request.header.op, focused_session, 0);
+            response.capability = session_capability("foreground-focus", request.header.op);
+            0
+        }
+        COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP => {
+            response.value0 = u64::from(state.ui_ready);
+            response.value1 = u64::from(state.launch_catalog_loaded);
+            response.descriptor_count = 1;
+            response.descriptors[0] = session_descriptor(
+                "ui-bootstrap",
+                request.header.op,
+                response.value0,
+                response.value1,
+            );
+            0
+        }
+        _ => libc::EINVAL,
+    }
+}
+
+fn fill_session_program_descriptors(
+    state: &BrokerState,
+    response: &mut CommercialMaxProtocolResponse,
+) {
+    let mut count = 0usize;
+    for program in state.running.values() {
+        if count >= response.descriptors.len() {
+            break;
+        }
+        response.descriptors[count] = session_descriptor(
+            program.desktop_file_id.as_str(),
+            COMMERCIAL_MAX_SESSIOND_OP_SESSION_GRAPH,
+            program.pid as u64,
+            program.session_handle,
+        );
+        count += 1;
+    }
+    response.descriptor_count = count as u16;
+}
+
+fn session_descriptor(
+    label: &str,
+    op: u16,
+    value0: u64,
+    value1: u64,
+) -> CommercialMaxProtocolDescriptorWire {
+    let mut descriptor = CommercialMaxProtocolDescriptorWire {
+        protocol: COMMERCIAL_MAX_PROTOCOL_SESSIOND,
+        op,
+        flags: 0,
+        service_id: IPC_SERVICE_SESSIOND,
+        capability_mask: session_capability_mask(op),
+        value0,
+        value1,
+        ..CommercialMaxProtocolDescriptorWire::default()
+    };
+    copy_label(label, &mut descriptor.name, &mut descriptor.name_len);
+    descriptor
+}
+
+fn session_capability(label: &str, op: u16) -> CommercialMaxCapabilityLeaseWire {
+    let mut capability = CommercialMaxCapabilityLeaseWire {
+        lease_id: ((COMMERCIAL_MAX_PROTOCOL_SESSIOND as u64) << 32) | u64::from(op),
+        service_id: IPC_SERVICE_SESSIOND,
+        capability_mask: session_capability_mask(op),
+        rights_mask: session_capability_mask(op),
+        ..CommercialMaxCapabilityLeaseWire::default()
+    };
+    copy_label(label, &mut capability.label, &mut capability.label_len);
+    capability
+}
+
+fn session_capability_mask(op: u16) -> u64 {
+    match op {
+        COMMERCIAL_MAX_SESSIOND_OP_SESSION_GRAPH => 1 << 0,
+        COMMERCIAL_MAX_SESSIOND_OP_TTY_LINE_DISCIPLINE => 1 << 1,
+        COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE => 1 << 2,
+        COMMERCIAL_MAX_SESSIOND_OP_FOREGROUND_FOCUS => 1 << 3,
+        COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP => 1 << 4,
+        _ => 0,
     }
 }
 
@@ -1450,6 +1666,13 @@ fn copy_ascii_into(dest: &mut [u8], value: &str) {
             _ => b'?',
         };
     }
+}
+
+fn copy_label(label: &str, target: &mut [u8], len: &mut u16) {
+    let bytes = label.as_bytes();
+    let count = bytes.len().min(target.len());
+    target[..count].copy_from_slice(&bytes[..count]);
+    *len = count as u16;
 }
 
 fn io_errno(err: std::io::Error) -> i32 {

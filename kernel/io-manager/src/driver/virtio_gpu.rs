@@ -698,7 +698,11 @@ pub(crate) fn flush_primary_rect(x: u32, y: u32, width: u32, height: u32) -> boo
 }
 
 pub(crate) fn queue_primary_flush() -> bool {
-    PENDING_FLUSH.lock().request_full();
+    let Some(mut pending) = PENDING_FLUSH.try_lock() else {
+        DISPLAY_NEEDS_FULL_FLUSH.store(true, Ordering::Release);
+        return false;
+    };
+    pending.request_full();
     true
 }
 
@@ -706,7 +710,11 @@ pub(crate) fn queue_primary_flush_rect(x: u32, y: u32, width: u32, height: u32) 
     if width == 0 || height == 0 {
         return true;
     }
-    PENDING_FLUSH.lock().add_rect(FlushRect {
+    let Some(mut pending) = PENDING_FLUSH.try_lock() else {
+        DISPLAY_NEEDS_FULL_FLUSH.store(true, Ordering::Release);
+        return false;
+    };
+    pending.add_rect(FlushRect {
         x,
         y,
         width,
@@ -734,7 +742,11 @@ pub(crate) fn service_pending() -> usize {
         FlushRequest::Rect(rect) => flush_primary_rect(rect.x, rect.y, rect.width, rect.height),
     };
     if !flushed {
-        PENDING_FLUSH.lock().requeue(request);
+        if let Some(mut pending) = PENDING_FLUSH.try_lock() {
+            pending.requeue(request);
+        } else {
+            DISPLAY_NEEDS_FULL_FLUSH.store(true, Ordering::Release);
+        }
     }
     1
 }

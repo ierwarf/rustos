@@ -1270,18 +1270,9 @@ pub(super) fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mo
             path
         );
     }
-    if can_use_bootstrap_vfs_escape()
-        && can_lookup_bootstrap_path(dirfd, path.as_str())
-        && flags & linux_abi::O_ACCMODE == linux_abi::O_RDONLY
-        && flags & linux_abi::O_DIRECTORY == 0
-        && is_bootstrap_image_path(path.as_str())
-    {
-        return bootstrap_openat(path.as_str(), flags);
-    }
     if is_devmgrd_open_path(path.as_str()) {
         match open_device_via_devmgrd(path.as_str(), flags) {
             Ok(fd) => return fd,
-            Err(LINUX_ENOSYS) | Err(LINUX_ENODEV) if can_use_bootstrap_vfs_escape() => {}
             Err(errno) => return linux_errno(errno),
         }
     }
@@ -1294,9 +1285,6 @@ pub(super) fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mo
     }
     let response = match call_vfs_ipc_request(&request) {
         Ok(response) => response,
-        Err(_) if can_use_bootstrap_vfs_escape() => {
-            return bootstrap_openat(path.as_str(), flags);
-        }
         Err(errno) => return linux_errno(errno),
     };
     if let Err(errno) = ensure_vfs_status(&response) {
@@ -2492,15 +2480,6 @@ pub(super) fn syscall_linux_vfs_statx(
     if let Err(err) = usermem::validate_current_user_write_buffer(statx_ptr, LINUX_STATX_SIZE) {
         return linux_errno(address_space_error_to_linux_errno(err));
     }
-    if can_use_bootstrap_vfs_escape()
-        && can_lookup_bootstrap_path(dirfd, path.as_str())
-        && is_bootstrap_image_path(path.as_str())
-    {
-        match bootstrap_read_file(path.as_str()) {
-            Ok(_) => return bootstrap_stat_path(path.as_str(), statx_ptr, true),
-            Err(errno) => return linux_errno(errno),
-        }
-    }
     let mut request = new_vfs_request(VFS_IPC_OP_STATX);
     request.dirfd = dirfd;
     request.flags = flags as u32;
@@ -2510,9 +2489,6 @@ pub(super) fn syscall_linux_vfs_statx(
     }
     let response = match call_vfs_ipc_request(&request) {
         Ok(response) => response,
-        Err(_) if can_use_bootstrap_vfs_escape() => {
-            return bootstrap_stat_path(path.as_str(), statx_ptr, true);
-        }
         Err(errno) => return linux_errno(errno),
     };
     if let Err(errno) = ensure_vfs_status(&response) {
@@ -2549,15 +2525,6 @@ pub(super) fn syscall_linux_vfs_newfstatat(
     if let Err(err) = usermem::validate_current_user_write_buffer(stat_ptr, LINUX_STAT_SIZE) {
         return linux_errno(address_space_error_to_linux_errno(err));
     }
-    if can_use_bootstrap_vfs_escape()
-        && can_lookup_bootstrap_path(dirfd, path.as_str())
-        && is_bootstrap_image_path(path.as_str())
-    {
-        match bootstrap_read_file(path.as_str()) {
-            Ok(_) => return bootstrap_stat_path(path.as_str(), stat_ptr, false),
-            Err(errno) => return linux_errno(errno),
-        }
-    }
     let mut request = new_vfs_request(VFS_IPC_OP_NEWFSTATAT);
     request.dirfd = dirfd;
     request.flags = flags as u32;
@@ -2566,9 +2533,6 @@ pub(super) fn syscall_linux_vfs_newfstatat(
     }
     let response = match call_vfs_ipc_request(&request) {
         Ok(response) => response,
-        Err(_) if can_use_bootstrap_vfs_escape() => {
-            return bootstrap_stat_path(path.as_str(), stat_ptr, false);
-        }
         Err(errno) => return linux_errno(errno),
     };
     if let Err(errno) = ensure_vfs_status(&response) {
@@ -2627,15 +2591,6 @@ pub(super) fn syscall_linux_vfs_access(dirfd: u64, path_ptr: u64, mode: u64, fla
         Ok(path) => path,
         Err(errno) => return linux_errno(errno),
     };
-    if can_use_bootstrap_vfs_escape()
-        && can_lookup_bootstrap_path(dirfd, path.as_str())
-        && is_bootstrap_image_path(path.as_str())
-    {
-        match bootstrap_read_file(path.as_str()) {
-            Ok(_) => return 0,
-            Err(errno) => return linux_errno(errno),
-        }
-    }
     let mut request = new_vfs_request(VFS_IPC_OP_ACCESS);
     request.dirfd = dirfd;
     request.flags = flags as u32;
@@ -2645,10 +2600,6 @@ pub(super) fn syscall_linux_vfs_access(dirfd: u64, path_ptr: u64, mode: u64, fla
     }
     match call_vfs_ipc_request(&request).and_then(|response| ensure_vfs_status(&response)) {
         Ok(()) => 0,
-        Err(_) if can_use_bootstrap_vfs_escape() => match bootstrap_read_file(path.as_str()) {
-            Ok(_) => 0,
-            Err(errno) => linux_errno(errno),
-        },
         Err(errno) => linux_errno(errno),
     }
 }
@@ -2742,72 +2693,6 @@ fn memfd_error_to_linux_errno(err: multitask::MemfdError) -> i64 {
     }
 }
 
-// RING3-MIGRATION-REFERENCE START: rootd/loaderd/vfsd should own bootstrap
-// file materialization and path allowlists after the fixed early-service boot
-// window. Ring0 keeps only a narrow pre-service escape hatch.
-fn bootstrap_openat(path: &str, flags: u64) -> u64 {
-    if flags & linux_abi::O_DIRECTORY != 0 || flags & linux_abi::O_ACCMODE != linux_abi::O_RDONLY {
-        return linux_errno(LINUX_ENOSYS);
-    }
-    let bytes = match bootstrap_read_file(path) {
-        Ok(bytes) => bytes,
-        Err(errno) => return linux_errno(errno),
-    };
-    let boot_path = bootstrap_path(path).unwrap_or(path);
-    let handle = multitask::KernelHandle::VfsFile(multitask::VfsFileHandle::read_only_memory(
-        String::from(boot_path),
-        bytes,
-    ));
-    multitask::with_current_user_process_state_mut(|_, _, process_state| {
-        process_state
-            .handles_mut()
-            .install_with_open_flags(handle, flags)
-    })
-    .unwrap_or_else(|| linux_errno(LINUX_EINVAL))
-}
-
-fn bootstrap_stat_path(path: &str, user_ptr: u64, statx: bool) -> u64 {
-    let bytes = match bootstrap_read_file(path) {
-        Ok(bytes) => bytes,
-        Err(errno) => return linux_errno(errno),
-    };
-    let inode = crate::vfs_core::path_inode(path.as_bytes());
-    if statx {
-        write_bootstrap_statx(user_ptr, inode, bytes.len() as u64)
-    } else {
-        write_bootstrap_stat(user_ptr, inode, bytes.len() as u64)
-    }
-}
-
-fn bootstrap_read_file(path: &str) -> Result<alloc::vec::Vec<u8>, i64> {
-    let path = bootstrap_path(path).ok_or(LINUX_ENOSYS)?;
-    crate::storage::boot_volume::read_file_to_vec(path).map_err(|_| LINUX_ENOENT)
-}
-
-fn bootstrap_path(path: &str) -> Option<&str> {
-    let path = path.strip_prefix('/').unwrap_or(path);
-    if path.is_empty() || path.contains("..") {
-        return None;
-    }
-    (path.starts_with("services/")
-        || path.starts_with("applications/")
-        || path.starts_with("apps/")
-        || path.starts_with("etc/")
-        || path.starts_with("lib/")
-        || path.starts_with("lib64/")
-        || path.starts_with("lib/x86_64-linux-gnu/")
-        || path.starts_with("usr/lib/x86_64-linux-gnu/")
-        || path.starts_with("usr/lib/")
-        || path.starts_with("usr/lib64/")
-        || path.starts_with("system/"))
-    .then_some(path)
-}
-
-pub(super) fn is_bootstrap_image_path(path: &str) -> bool {
-    bootstrap_path(path).is_some()
-}
-// RING3-MIGRATION-REFERENCE END: rootd/loaderd/vfsd bootstrap file helpers.
-
 fn write_bootstrap_stat(user_ptr: u64, inode: u64, len: u64) -> u64 {
     if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, LINUX_STAT_SIZE) {
         return linux_errno(address_space_error_to_linux_errno(err));
@@ -2819,24 +2704,6 @@ fn write_bootstrap_stat(user_ptr: u64, inode: u64, len: u64) -> u64 {
     out[48..56].copy_from_slice(&(len as i64).to_ne_bytes());
     out[56..64].copy_from_slice(&4096_i64.to_ne_bytes());
     out[64..72].copy_from_slice(&(len.div_ceil(512) as i64).to_ne_bytes());
-    match usermem::write_current_user_bytes(user_ptr, &out) {
-        Ok(()) => 0,
-        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
-    }
-}
-
-fn write_bootstrap_statx(user_ptr: u64, inode: u64, len: u64) -> u64 {
-    if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, LINUX_STATX_SIZE) {
-        return linux_errno(address_space_error_to_linux_errno(err));
-    }
-    let mut out = [0_u8; LINUX_STATX_SIZE];
-    out[0..4].copy_from_slice(&0x17ff_u32.to_ne_bytes());
-    out[4..8].copy_from_slice(&4096_u32.to_ne_bytes());
-    out[16..20].copy_from_slice(&1_u32.to_ne_bytes());
-    out[28..30].copy_from_slice(&(0o100000_u16 | 0o555).to_ne_bytes());
-    out[40..48].copy_from_slice(&inode.max(1).to_ne_bytes());
-    out[48..56].copy_from_slice(&len.to_ne_bytes());
-    out[56..64].copy_from_slice(&len.div_ceil(512).to_ne_bytes());
     match usermem::write_current_user_bytes(user_ptr, &out) {
         Ok(()) => 0,
         Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
@@ -2965,15 +2832,13 @@ pub(super) fn syscall_linux_ioctl(fd: u64, request_number: u64, arg: u64) -> u64
     if ioctl_requires_devmgrd_policy(request_number) {
         match ioctl_device_via_devmgrd(fd, request_number, arg) {
             Ok(value) => return value,
-            Err(_) if !ipc_ops::service_registered(linux_abi::IPC_SERVICE_DEVMGRD) => {}
             Err(errno) => return linux_errno(errno),
         }
     }
 
-    // Bootstrap fallback only: early services can issue console/display ioctls
-    // before devmgrd has registered. Hot data-path ioctls also stay direct:
-    // display present/input delivery costs must be fixed with broker/data-path
-    // design, not by forcing per-frame policy IPC.
+    // Hot data-path ioctls stay direct: display present/input delivery costs
+    // must be fixed with broker/data-path design, not by forcing per-frame
+    // policy IPC.
     match crate::user::sysops::device::ioctl_current_process_fd(fd, request_number, arg) {
         Ok(value) => value,
         Err(err) => linux_errno(super::broker_ops::device_sysop_error_to_linux_errno(err)),
@@ -2995,8 +2860,8 @@ fn ioctl_requires_devmgrd_policy(request_number: u64) -> bool {
             | rustos_user_abi::console::CONSOLE_IOCTL_CREATE_SESSION
             | rustos_user_abi::console::CONSOLE_IOCTL_CLOSE_SESSION
             | rustos_user_abi::console::CONSOLE_IOCTL_BIND_CURRENT_SESSION
-            | rustos_user_abi::console::CONSOLE_IOCTL_SET_SESSION_STATE // CONSOLE_IOCTL_SET_FOCUS intentionally omitted: devmgrd is a
-                                                                        // no-op forwarder for this ioctl; go direct to avoid IPC cost.
+            | rustos_user_abi::console::CONSOLE_IOCTL_SET_SESSION_STATE
+            | rustos_user_abi::console::CONSOLE_IOCTL_SET_FOCUS
     )
 }
 
@@ -3239,14 +3104,6 @@ fn is_linux_at_fdcwd(dirfd: u64) -> bool {
     const AT_FDCWD_I64: u64 = (-100_i64) as u64;
     const AT_FDCWD_I32: u64 = 0xffff_ff9c;
     dirfd == AT_FDCWD_I64 || dirfd == AT_FDCWD_I32 || dirfd == linux_abi::AT_FDCWD as u64
-}
-
-fn can_lookup_bootstrap_path(dirfd: u64, path: &str) -> bool {
-    path.starts_with('/') || is_linux_at_fdcwd(dirfd)
-}
-
-fn can_use_bootstrap_vfs_escape() -> bool {
-    !ipc_ops::service_registered(linux_abi::IPC_SERVICE_VFSD)
 }
 
 fn file_sysop_error_to_linux_errno(error: crate::user::sysops::file::FileSysopError) -> i64 {

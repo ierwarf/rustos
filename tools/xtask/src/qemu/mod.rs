@@ -818,7 +818,8 @@ options:
   -h, --help                         show this help
 
 probe-display always forces headless mode and validates screendump geometry after
-injecting mouse movement/click stress through QMP.
+injecting mouse movement/click stress through QMP. Set RUSTOS_PROBE_KEY_TEXT to
+inject focused keyboard text before the mouse stress phase.
 "
     );
 }
@@ -1421,6 +1422,8 @@ fn append_qemu_args(
 }
 
 fn run_display_probe(config: &Config, options: RunOptions) -> Result<()> {
+    let probe_expect_markers = options.expect_markers.clone();
+    let probe_key_text = env_string("RUSTOS_PROBE_KEY_TEXT");
     let prepared = prepare_run(config, options)?;
     fs::create_dir_all(&config.logs_dir)?;
 
@@ -1477,6 +1480,13 @@ fn run_display_probe(config: &Config, options: RunOptions) -> Result<()> {
             ],
             PROBE_QMP_TIMEOUT,
         )?;
+        for marker in &probe_expect_markers {
+            wait_for_boot_marker(&debugcon_log, &[marker.as_str()], PROBE_QMP_TIMEOUT)?;
+        }
+        if let Some(text) = probe_key_text.as_deref() {
+            qmp_hmp_type_text(&mut qmp, text)?;
+        }
+        thread::sleep(Duration::from_millis(500));
 
         let baseline_dump = prepared.session.temp_dir.join("probe-baseline.ppm");
         qmp_screendump(&mut qmp, &baseline_dump)?;
@@ -1839,6 +1849,104 @@ fn qmp_hmp_capture(qmp: &mut UnixStream, command_line: &str, deadline: Instant) 
     qmp.write_all(command.as_bytes())?;
     qmp.write_all(b"\n")?;
     wait_for_qmp_return_message(qmp, deadline)
+}
+
+fn qmp_hmp_send_key(qmp: &mut UnixStream, key: &str) -> Result<()> {
+    let command_line = format!("sendkey {key}");
+    let _ = qmp_hmp_capture(qmp, &command_line, Instant::now() + PROBE_QMP_TIMEOUT)?;
+    thread::sleep(Duration::from_millis(25));
+    Ok(())
+}
+
+fn qmp_hmp_type_text(qmp: &mut UnixStream, text: &str) -> Result<()> {
+    for ch in text.chars() {
+        let Some(key) = hmp_key_for_char(ch) else {
+            bail!("RUSTOS_PROBE_KEY_TEXT contains unsupported character: {ch:?}");
+        };
+        qmp_hmp_send_key(qmp, key)?;
+    }
+    thread::sleep(Duration::from_millis(500));
+    Ok(())
+}
+
+fn hmp_key_for_char(ch: char) -> Option<&'static str> {
+    match ch {
+        'a'..='z' | '0'..='9' => Some(match ch {
+            'a' => "a",
+            'b' => "b",
+            'c' => "c",
+            'd' => "d",
+            'e' => "e",
+            'f' => "f",
+            'g' => "g",
+            'h' => "h",
+            'i' => "i",
+            'j' => "j",
+            'k' => "k",
+            'l' => "l",
+            'm' => "m",
+            'n' => "n",
+            'o' => "o",
+            'p' => "p",
+            'q' => "q",
+            'r' => "r",
+            's' => "s",
+            't' => "t",
+            'u' => "u",
+            'v' => "v",
+            'w' => "w",
+            'x' => "x",
+            'y' => "y",
+            'z' => "z",
+            '0' => "0",
+            '1' => "1",
+            '2' => "2",
+            '3' => "3",
+            '4' => "4",
+            '5' => "5",
+            '6' => "6",
+            '7' => "7",
+            '8' => "8",
+            '9' => "9",
+            _ => return None,
+        }),
+        'A' => Some("shift-a"),
+        'B' => Some("shift-b"),
+        'C' => Some("shift-c"),
+        'D' => Some("shift-d"),
+        'E' => Some("shift-e"),
+        'F' => Some("shift-f"),
+        'G' => Some("shift-g"),
+        'H' => Some("shift-h"),
+        'I' => Some("shift-i"),
+        'J' => Some("shift-j"),
+        'K' => Some("shift-k"),
+        'L' => Some("shift-l"),
+        'M' => Some("shift-m"),
+        'N' => Some("shift-n"),
+        'O' => Some("shift-o"),
+        'P' => Some("shift-p"),
+        'Q' => Some("shift-q"),
+        'R' => Some("shift-r"),
+        'S' => Some("shift-s"),
+        'T' => Some("shift-t"),
+        'U' => Some("shift-u"),
+        'V' => Some("shift-v"),
+        'W' => Some("shift-w"),
+        'X' => Some("shift-x"),
+        'Y' => Some("shift-y"),
+        'Z' => Some("shift-z"),
+        ' ' => Some("spc"),
+        '\n' | '\r' => Some("ret"),
+        '\t' => Some("tab"),
+        '-' => Some("minus"),
+        '_' => Some("shift-minus"),
+        '.' => Some("dot"),
+        ',' => Some("comma"),
+        '/' => Some("slash"),
+        '\\' => Some("backslash"),
+        _ => None,
+    }
 }
 
 fn qmp_execute(qmp: &mut UnixStream, command: &str, deadline: Instant) -> Result<()> {

@@ -7,8 +7,18 @@ use core::mem::size_of;
 
 use rustos_svc_runtime::ipc;
 use rustos_user_abi::syscall::{
-    LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, Win32SyscallOffloadRequest,
-    Win32SyscallOffloadResponse, SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_BRK,
+    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, LinuxSyscallOffloadRequest,
+    LinuxSyscallOffloadResponse, Win32SyscallOffloadRequest, Win32SyscallOffloadResponse,
+    COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT, COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE,
+    COMMERCIAL_MAX_PAGERD_OP_PAGE_CACHE_POLICY, COMMERCIAL_MAX_PAGERD_OP_WRITEBACK_POLICY,
+    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
+    COMMERCIAL_MAX_PROTOCOL_PAGERD, COMMERCIAL_MAX_PROTOCOL_SYSCALLD,
+    COMMERCIAL_MAX_SYSCALLD_OP_CLOCK_POLICY, COMMERCIAL_MAX_SYSCALLD_OP_COLD_SYSCALL_OFFLOAD,
+    COMMERCIAL_MAX_SYSCALLD_OP_CREDS_LIMITS, COMMERCIAL_MAX_SYSCALLD_OP_LINUX_POLICY,
+    COMMERCIAL_MAX_SYSCALLD_OP_MM_POLICY, COMMERCIAL_MAX_SYSCALLD_OP_RANDOM_POLICY,
+    COMMERCIAL_MAX_SYSCALLD_OP_WIN32_POLICY, IPC_MAX_INLINE_BYTES, IPC_SERVICE_LINUX_SYSCALLD,
+    IPC_SERVICE_PAGERD, SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_BRK,
     SYSCALL_OFFLOAD_OP_LINUX_GETEGID, SYSCALL_OFFLOAD_OP_LINUX_GETEUID,
     SYSCALL_OFFLOAD_OP_LINUX_GETGID, SYSCALL_OFFLOAD_OP_LINUX_GETPGID,
     SYSCALL_OFFLOAD_OP_LINUX_GETPPID, SYSCALL_OFFLOAD_OP_LINUX_GETRANDOM,
@@ -21,8 +31,13 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_OP_LINUX_SETGID, SYSCALL_OFFLOAD_OP_LINUX_SETPGID,
     SYSCALL_OFFLOAD_OP_LINUX_SETSID, SYSCALL_OFFLOAD_OP_LINUX_SETUID,
     SYSCALL_OFFLOAD_OP_LINUX_SET_ROBUST_LIST, SYSCALL_OFFLOAD_OP_LINUX_UMASK,
-    SYSCALL_OFFLOAD_OP_LINUX_UNAME, SYSCALL_OFFLOAD_PATH_CAPACITY,
-    WIN32_SYSCALL_OFFLOAD_ABI_VERSION,
+    SYSCALL_OFFLOAD_OP_LINUX_UNAME, SYSCALL_OFFLOAD_OP_WIN32_ALLOC_VIRTUAL_MEMORY,
+    SYSCALL_OFFLOAD_OP_WIN32_CLOSE, SYSCALL_OFFLOAD_OP_WIN32_DELAY_EXECUTION,
+    SYSCALL_OFFLOAD_OP_WIN32_EXIT_PROCESS, SYSCALL_OFFLOAD_OP_WIN32_FREE_VIRTUAL_MEMORY,
+    SYSCALL_OFFLOAD_OP_WIN32_GET_CONSOLE_MODE, SYSCALL_OFFLOAD_OP_WIN32_PROTECT_VIRTUAL_MEMORY,
+    SYSCALL_OFFLOAD_OP_WIN32_QUERY_VIRTUAL_MEMORY, SYSCALL_OFFLOAD_OP_WIN32_READ_FILE,
+    SYSCALL_OFFLOAD_OP_WIN32_SET_CONSOLE_MODE, SYSCALL_OFFLOAD_OP_WIN32_WRITE_FILE,
+    SYSCALL_OFFLOAD_PATH_CAPACITY, WIN32_SYSCALL_OFFLOAD_ABI_VERSION,
 };
 
 mod errno;
@@ -43,14 +58,20 @@ fn service_main() {
         ipc::debug_line("syscalld: endpoint register failed");
         return;
     }
+    let pager_register = ipc::register_service_endpoint(IPC_SERVICE_PAGERD, endpoint as u64);
+    if pager_register < 0 {
+        ipc::debug_line("syscalld: pager endpoint register failed");
+        return;
+    }
 
     ipc::debug_line("syscalld: linux syscall endpoint registered");
+    ipc::debug_line("syscalld: pager policy endpoint registered");
     serve(endpoint as u64);
 }
 
 fn serve(endpoint: u64) {
     loop {
-        let mut request = [0_u8; size_of::<LinuxSyscallOffloadRequest>()];
+        let mut request = [0_u8; IPC_MAX_INLINE_BYTES];
         let mut reply_cap = 0_u64;
         let received = unsafe {
             ipc::recv(
@@ -77,6 +98,7 @@ fn serve(endpoint: u64) {
 enum SyscallOffloadReply {
     Linux(LinuxSyscallOffloadResponse),
     Win32(Win32SyscallOffloadResponse),
+    Commercial(CommercialMaxProtocolResponse),
 }
 
 impl SyscallOffloadReply {
@@ -84,6 +106,9 @@ impl SyscallOffloadReply {
         match self {
             Self::Linux(response) => (response as *const LinuxSyscallOffloadResponse).cast::<u8>(),
             Self::Win32(response) => (response as *const Win32SyscallOffloadResponse).cast::<u8>(),
+            Self::Commercial(response) => {
+                (response as *const CommercialMaxProtocolResponse).cast::<u8>()
+            }
         }
     }
 
@@ -91,11 +116,17 @@ impl SyscallOffloadReply {
         match self {
             Self::Linux(_) => size_of::<LinuxSyscallOffloadResponse>(),
             Self::Win32(_) => size_of::<Win32SyscallOffloadResponse>(),
+            Self::Commercial(_) => size_of::<CommercialMaxProtocolResponse>(),
         }
     }
 }
 
 fn handle_request(received: usize, bytes: &[u8]) -> SyscallOffloadReply {
+    if received == size_of::<CommercialMaxProtocolRequest>() {
+        let request = read_unaligned::<CommercialMaxProtocolRequest>(bytes);
+        let response = handle_commercial_request(&request);
+        return SyscallOffloadReply::Commercial(response);
+    }
     if received == size_of::<LinuxSyscallOffloadRequest>() {
         let request = read_unaligned::<LinuxSyscallOffloadRequest>(bytes);
         let mut response = LinuxSyscallOffloadResponse::default();
@@ -117,6 +148,153 @@ fn handle_request(received: usize, bytes: &[u8]) -> SyscallOffloadReply {
         ..LinuxSyscallOffloadResponse::default()
     };
     SyscallOffloadReply::Linux(response)
+}
+
+fn handle_commercial_request(
+    request: &CommercialMaxProtocolRequest,
+) -> CommercialMaxProtocolResponse {
+    let mut response = CommercialMaxProtocolResponse {
+        header: request.header,
+        ..CommercialMaxProtocolResponse::default()
+    };
+    response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    if let Err(errno) = validate_commercial_request(request) {
+        response.status = errno;
+        return response;
+    }
+    if request.header.protocol == COMMERCIAL_MAX_PROTOCOL_PAGERD {
+        handle_pager_request(request, &mut response);
+        return response;
+    }
+    match request.header.op {
+        COMMERCIAL_MAX_SYSCALLD_OP_LINUX_POLICY => {
+            fill_syscall_descriptors(
+                &mut response,
+                &[
+                    ("uname", SYSCALL_OFFLOAD_OP_LINUX_UNAME),
+                    ("ids", SYSCALL_OFFLOAD_OP_LINUX_GETUID),
+                    ("process-group", SYSCALL_OFFLOAD_OP_LINUX_GETPGID),
+                    ("robust-list", SYSCALL_OFFLOAD_OP_LINUX_SET_ROBUST_LIST),
+                    ("rseq", SYSCALL_OFFLOAD_OP_LINUX_RSEQ),
+                ],
+            );
+        }
+        COMMERCIAL_MAX_SYSCALLD_OP_WIN32_POLICY => {
+            fill_syscall_descriptors(
+                &mut response,
+                &[
+                    ("write-file", SYSCALL_OFFLOAD_OP_WIN32_WRITE_FILE),
+                    ("read-file", SYSCALL_OFFLOAD_OP_WIN32_READ_FILE),
+                    ("console-mode", SYSCALL_OFFLOAD_OP_WIN32_GET_CONSOLE_MODE),
+                    (
+                        "virtual-memory",
+                        SYSCALL_OFFLOAD_OP_WIN32_ALLOC_VIRTUAL_MEMORY,
+                    ),
+                    ("exit-process", SYSCALL_OFFLOAD_OP_WIN32_EXIT_PROCESS),
+                ],
+            );
+        }
+        COMMERCIAL_MAX_SYSCALLD_OP_MM_POLICY => {
+            fill_syscall_descriptors(
+                &mut response,
+                &[
+                    ("brk", SYSCALL_OFFLOAD_OP_LINUX_BRK),
+                    ("mmap", SYSCALL_OFFLOAD_OP_LINUX_MMAP),
+                    ("mprotect", SYSCALL_OFFLOAD_OP_LINUX_MPROTECT),
+                    ("munmap", SYSCALL_OFFLOAD_OP_LINUX_MUNMAP),
+                    ("madvise", SYSCALL_OFFLOAD_OP_LINUX_MADVISE),
+                    ("memfd-create", SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE),
+                ],
+            );
+            response.capability = syscalld_capability("mm-policy", request.header.op);
+        }
+        COMMERCIAL_MAX_SYSCALLD_OP_CREDS_LIMITS => {
+            fill_syscall_descriptors(
+                &mut response,
+                &[
+                    ("getuid", SYSCALL_OFFLOAD_OP_LINUX_GETUID),
+                    ("setuid", SYSCALL_OFFLOAD_OP_LINUX_SETUID),
+                    ("getgid", SYSCALL_OFFLOAD_OP_LINUX_GETGID),
+                    ("setgid", SYSCALL_OFFLOAD_OP_LINUX_SETGID),
+                    ("prlimit64", SYSCALL_OFFLOAD_OP_LINUX_PRLIMIT64),
+                    ("umask", SYSCALL_OFFLOAD_OP_LINUX_UMASK),
+                ],
+            );
+        }
+        COMMERCIAL_MAX_SYSCALLD_OP_CLOCK_POLICY => {
+            fill_syscall_descriptors(
+                &mut response,
+                &[
+                    ("delay-execution", SYSCALL_OFFLOAD_OP_WIN32_DELAY_EXECUTION),
+                    ("close", SYSCALL_OFFLOAD_OP_WIN32_CLOSE),
+                ],
+            );
+        }
+        COMMERCIAL_MAX_SYSCALLD_OP_RANDOM_POLICY => {
+            fill_syscall_descriptors(
+                &mut response,
+                &[("getrandom", SYSCALL_OFFLOAD_OP_LINUX_GETRANDOM)],
+            );
+            response.capability = syscalld_capability("random-policy", request.header.op);
+        }
+        COMMERCIAL_MAX_SYSCALLD_OP_COLD_SYSCALL_OFFLOAD => {
+            response.value0 = 2;
+            response.descriptor_count = 2;
+            response.descriptors[0] = syscalld_descriptor(
+                "linux-offload",
+                request.header.op,
+                SYSCALL_OFFLOAD_ABI_VERSION as u64,
+            );
+            response.descriptors[1] = syscalld_descriptor(
+                "win32-offload",
+                request.header.op,
+                WIN32_SYSCALL_OFFLOAD_ABI_VERSION as u64,
+            );
+        }
+        _ => response.status = errno::EINVAL,
+    }
+    response
+}
+
+fn handle_pager_request(
+    request: &CommercialMaxProtocolRequest,
+    response: &mut CommercialMaxProtocolResponse,
+) {
+    match request.header.op {
+        COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT => {
+            response.descriptor_count = 1;
+            response.descriptors[0] = pager_descriptor(
+                "backing-object",
+                request.header.op,
+                request.arg0,
+                request.arg1,
+            );
+            response.capability = pager_capability("backing-object", request.header.op);
+        }
+        COMMERCIAL_MAX_PAGERD_OP_PAGE_CACHE_POLICY => {
+            response.descriptor_count = 1;
+            response.descriptors[0] =
+                pager_descriptor("page-cache", request.header.op, request.arg0, request.arg1);
+            response.capability = pager_capability("page-cache", request.header.op);
+        }
+        COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE => {
+            response.descriptor_count = 1;
+            response.descriptors[0] = pager_descriptor(
+                "fault-resolve",
+                request.header.op,
+                request.arg0,
+                request.arg1,
+            );
+            response.capability = pager_capability("fault-resolve", request.header.op);
+        }
+        COMMERCIAL_MAX_PAGERD_OP_WRITEBACK_POLICY => {
+            response.descriptor_count = 1;
+            response.descriptors[0] =
+                pager_descriptor("writeback", request.header.op, request.arg0, request.arg1);
+            response.capability = pager_capability("writeback", request.header.op);
+        }
+        _ => response.status = errno::EINVAL,
+    }
 }
 
 fn handle_linux_request(
@@ -231,6 +409,145 @@ fn validate_request(received: usize, request: &LinuxSyscallOffloadRequest) -> Re
         | SYSCALL_OFFLOAD_OP_LINUX_PROCESS_EXIT => Ok(()),
         _ => Err(errno::EINVAL),
     }
+}
+
+fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result<(), i32> {
+    if request.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
+        || request.path_len as usize > request.path.len()
+        || request.payload_len as usize > request.payload.len()
+    {
+        return Err(errno::EINVAL);
+    }
+    match request.header.protocol {
+        COMMERCIAL_MAX_PROTOCOL_SYSCALLD => match request.header.op {
+            COMMERCIAL_MAX_SYSCALLD_OP_LINUX_POLICY
+            | COMMERCIAL_MAX_SYSCALLD_OP_WIN32_POLICY
+            | COMMERCIAL_MAX_SYSCALLD_OP_MM_POLICY
+            | COMMERCIAL_MAX_SYSCALLD_OP_CREDS_LIMITS
+            | COMMERCIAL_MAX_SYSCALLD_OP_CLOCK_POLICY
+            | COMMERCIAL_MAX_SYSCALLD_OP_RANDOM_POLICY
+            | COMMERCIAL_MAX_SYSCALLD_OP_COLD_SYSCALL_OFFLOAD => Ok(()),
+            _ => Err(errno::EINVAL),
+        },
+        COMMERCIAL_MAX_PROTOCOL_PAGERD => match request.header.op {
+            COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT
+            | COMMERCIAL_MAX_PAGERD_OP_PAGE_CACHE_POLICY
+            | COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE
+            | COMMERCIAL_MAX_PAGERD_OP_WRITEBACK_POLICY => Ok(()),
+            _ => Err(errno::EINVAL),
+        },
+        _ => Err(errno::EINVAL),
+    }
+}
+
+fn fill_syscall_descriptors(response: &mut CommercialMaxProtocolResponse, entries: &[(&str, u16)]) {
+    let count = entries.len().min(COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS);
+    response.descriptor_count = count as u16;
+    response.value0 = entries.len() as u64;
+    for (index, (name, op)) in entries.iter().take(count).enumerate() {
+        response.descriptors[index] = syscalld_descriptor(name, *op, *op as u64);
+    }
+}
+
+fn syscalld_descriptor(name: &str, op: u16, value0: u64) -> CommercialMaxProtocolDescriptorWire {
+    let mut descriptor = CommercialMaxProtocolDescriptorWire {
+        protocol: COMMERCIAL_MAX_PROTOCOL_SYSCALLD,
+        op,
+        flags: 0,
+        service_id: IPC_SERVICE_LINUX_SYSCALLD,
+        capability_mask: syscalld_capability_mask(op),
+        value0,
+        value1: 0,
+        ..CommercialMaxProtocolDescriptorWire::default()
+    };
+    copy_label(name, &mut descriptor.name, &mut descriptor.name_len);
+    descriptor
+}
+
+fn syscalld_capability(label: &str, op: u16) -> CommercialMaxCapabilityLeaseWire {
+    let mut capability = CommercialMaxCapabilityLeaseWire {
+        lease_id: ((COMMERCIAL_MAX_PROTOCOL_SYSCALLD as u64) << 32) | u64::from(op),
+        service_id: IPC_SERVICE_LINUX_SYSCALLD,
+        capability_mask: syscalld_capability_mask(op),
+        rights_mask: syscalld_capability_mask(op),
+        ..CommercialMaxCapabilityLeaseWire::default()
+    };
+    copy_label(label, &mut capability.label, &mut capability.label_len);
+    capability
+}
+
+fn syscalld_capability_mask(op: u16) -> u64 {
+    match op {
+        COMMERCIAL_MAX_SYSCALLD_OP_LINUX_POLICY | SYSCALL_OFFLOAD_OP_LINUX_UNAME => 1 << 0,
+        COMMERCIAL_MAX_SYSCALLD_OP_WIN32_POLICY | SYSCALL_OFFLOAD_OP_WIN32_WRITE_FILE => 1 << 1,
+        COMMERCIAL_MAX_SYSCALLD_OP_MM_POLICY
+        | SYSCALL_OFFLOAD_OP_LINUX_BRK
+        | SYSCALL_OFFLOAD_OP_LINUX_MMAP
+        | SYSCALL_OFFLOAD_OP_LINUX_MPROTECT
+        | SYSCALL_OFFLOAD_OP_LINUX_MUNMAP => 1 << 2,
+        COMMERCIAL_MAX_SYSCALLD_OP_CREDS_LIMITS
+        | SYSCALL_OFFLOAD_OP_LINUX_GETUID
+        | SYSCALL_OFFLOAD_OP_LINUX_SETUID => 1 << 3,
+        COMMERCIAL_MAX_SYSCALLD_OP_CLOCK_POLICY | SYSCALL_OFFLOAD_OP_WIN32_DELAY_EXECUTION => {
+            1 << 4
+        }
+        COMMERCIAL_MAX_SYSCALLD_OP_RANDOM_POLICY | SYSCALL_OFFLOAD_OP_LINUX_GETRANDOM => 1 << 5,
+        COMMERCIAL_MAX_SYSCALLD_OP_COLD_SYSCALL_OFFLOAD => 1 << 6,
+        _ => 0,
+    }
+}
+
+fn pager_descriptor(
+    name: &str,
+    op: u16,
+    value0: u64,
+    value1: u64,
+) -> CommercialMaxProtocolDescriptorWire {
+    let mut descriptor = CommercialMaxProtocolDescriptorWire {
+        protocol: COMMERCIAL_MAX_PROTOCOL_PAGERD,
+        op,
+        flags: 0,
+        service_id: IPC_SERVICE_PAGERD,
+        capability_mask: pager_capability_mask(op),
+        value0,
+        value1,
+        ..CommercialMaxProtocolDescriptorWire::default()
+    };
+    copy_label(name, &mut descriptor.name, &mut descriptor.name_len);
+    descriptor
+}
+
+fn pager_capability(label: &str, op: u16) -> CommercialMaxCapabilityLeaseWire {
+    let mut capability = CommercialMaxCapabilityLeaseWire {
+        lease_id: ((COMMERCIAL_MAX_PROTOCOL_PAGERD as u64) << 32) | u64::from(op),
+        service_id: IPC_SERVICE_PAGERD,
+        capability_mask: pager_capability_mask(op),
+        rights_mask: pager_capability_mask(op),
+        ..CommercialMaxCapabilityLeaseWire::default()
+    };
+    copy_label(label, &mut capability.label, &mut capability.label_len);
+    capability
+}
+
+fn pager_capability_mask(op: u16) -> u64 {
+    match op {
+        COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT => 1 << 0,
+        COMMERCIAL_MAX_PAGERD_OP_PAGE_CACHE_POLICY => 1 << 1,
+        COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE => 1 << 2,
+        COMMERCIAL_MAX_PAGERD_OP_WRITEBACK_POLICY => 1 << 3,
+        _ => 0,
+    }
+}
+
+fn copy_label(label: &str, target: &mut [u8], len: &mut u16) {
+    let bytes = label.as_bytes();
+    let count = if bytes.len() < target.len() {
+        bytes.len()
+    } else {
+        target.len()
+    };
+    target[..count].copy_from_slice(&bytes[..count]);
+    *len = count as u16;
 }
 
 fn read_unaligned<T: Copy>(bytes: &[u8]) -> T {

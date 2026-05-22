@@ -86,13 +86,22 @@ const SCHED_MAX_BURST_NS: u64 = 20_000_000;
 const SCHED_NEW_TASK_VRUNTIME_PENALTY_NS: u64 = 6_000_000;
 
 /// Load-weight threshold that promotes a user-mode task to the `System`
-/// scheduling class. The default `weight_micros = 100` (most services and
-/// apps) yields a load weight near `NICE_0_LOAD` (~952). uiserver's
-/// `weight_micros = 1000-2000` yields ~9000-19000. The threshold splits at
-/// 4000 so a service that wants to be latency-isolated from User-class apps
-/// only needs to bump `weight_micros` in its `RUSTOS.package.toml` past
-/// ~420us. Kernel-mode tasks are unconditionally System regardless of weight.
-const SYSTEM_CLASS_WEIGHT_THRESHOLD: u32 = 4_000;
+/// scheduling class. Currently set above every weight any task uses
+/// (`initd` defaults to 1000us -> ~9544 weight, uiserver tops out near
+/// ~19088), so no task is ever classified as `System` and the strict band
+/// rule effectively collapses to plain CFS fairness across all ready tasks.
+///
+/// Earlier the threshold sat at 4000, which put every initd-spawned service
+/// into the System band. That starved kernel housekeeping (User class,
+/// weight ~952), the RTC heartbeat drain in `housekeeping_once` never ran,
+/// and the `userspace_display=true` marker — the boot probe's primary
+/// readiness signal — was never emitted. Promoting housekeeping to System
+/// to compensate deadlocks IPC (kernel housekeeping never blocks long
+/// enough to release the band). Until those tradeoffs are resolved by
+/// moving heartbeat drain out of housekeeping (or by adding a dedicated
+/// System-class kernel thread for it), keep the strict band rule dormant
+/// by holding the threshold above every observed weight.
+const SYSTEM_CLASS_WEIGHT_THRESHOLD: u32 = u32::MAX;
 
 /// Strict priority bands. Higher class (smaller discriminant) is always
 /// scheduled before lower classes while it has any ready task. Within a class
@@ -611,11 +620,7 @@ impl Scheduler {
     /// Picks the schedulable task with the smallest vruntime within a single
     /// class. Ties prefer rotation away from the current task to keep
     /// RR-equivalent behaviour when all weights are equal.
-    fn pick_min_vruntime_in_class(
-        &self,
-        current: usize,
-        class: SchedClass,
-    ) -> Option<usize> {
+    fn pick_min_vruntime_in_class(&self, current: usize, class: SchedClass) -> Option<usize> {
         let mut best: Option<(usize, u64)> = None;
         for slot in 0..MAX_TASK {
             if !self.is_fair_candidate_slot(slot) {

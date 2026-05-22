@@ -522,7 +522,6 @@ dependencies = [
  "kernel-object",
  "kernel-ps",
  "lazy_static",
- "linux-raw-sys",
  "nucleus-core",
  "object",
  "rustos-user-abi",
@@ -644,7 +643,6 @@ dependencies = [
  "kernel-mm",
  "kernel-object",
  "lazy_static",
- "linux-raw-sys",
  "nucleus-core",
  "rustos-user-abi",
  "spin 0.10.0",
@@ -1037,6 +1035,9 @@ dependencies = [
 [[package]]
 name = "rustos-user-abi"
 version = "0.1.0"
+dependencies = [
+ "linux-raw-sys",
+]
 
 [[package]]
 name = "rustversion"

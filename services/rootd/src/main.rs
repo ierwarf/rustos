@@ -4,19 +4,25 @@
 use core::arch::asm;
 use core::mem::size_of;
 use core::panic::PanicInfo;
+use core::slice;
 
 use rustos_user_abi::syscall::{
-    CoreServiceLeaseWire, LifecycleDrainBrokerArgs, LifecycleEventWire, LoaderSpawnRequest,
-    LoaderSpawnResponse, RootdIpcRequest, RootdIpcResponse, IPC_SERVICE_LINUX_SYSCALLD,
-    IPC_SERVICE_LOADERD, IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD, IPC_SERVICE_VFSD,
-    LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT, LOADER_OP_SPAWN_EXEC,
-    LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY,
-    ROOTD_IPC_ABI_VERSION, ROOTD_IPC_OP_LEASE_LIST, ROOTD_IPC_OP_STATUS, ROOTD_LEASE_STATE_EXITED,
-    ROOTD_LEASE_STATE_FAILED, ROOTD_LEASE_STATE_RESTART_PENDING, ROOTD_LEASE_STATE_RUNNING,
-    SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
-    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
-    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_TRY_RECV, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
-    SYS_RUSTOS_SPAWN_EXEC,
+    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, CoreServiceLeaseWire,
+    LifecycleDrainBrokerArgs, LifecycleEventWire, LoaderSpawnRequest, LoaderSpawnResponse,
+    RootdIpcRequest, RootdIpcResponse, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR,
+    COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST, COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE,
+    COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH, COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL,
+    COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD,
+    IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD, IPC_SERVICE_VFSD, LIFECYCLE_DRAIN_MAX_EVENTS,
+    LIFECYCLE_EVENT_EXIT, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
+    LOADER_SPAWN_EXEC_PATH_CAPACITY, ROOTD_IPC_ABI_VERSION, ROOTD_IPC_OP_LEASE_LIST,
+    ROOTD_IPC_OP_STATUS, ROOTD_LEASE_STATE_EXITED, ROOTD_LEASE_STATE_FAILED,
+    ROOTD_LEASE_STATE_RESTART_PENDING, ROOTD_LEASE_STATE_RUNNING, SYS_RUSTOS_DEBUG_PRINT,
+    SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_TRY_RECV,
+    SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER, SYS_RUSTOS_SPAWN_EXEC,
 };
 
 const SYS_SCHED_YIELD: u64 = 24;
@@ -202,33 +208,80 @@ fn serve_rootd_once(endpoint: u64, leases: &[Lease]) {
     if endpoint == 0 {
         return;
     }
-    let mut request = RootdIpcRequest::default();
+    let mut request = CommercialMaxProtocolRequest::default();
     let mut reply_cap = 0_u64;
     let received = syscall4(
         SYS_RUSTOS_IPC_TRY_RECV,
         endpoint,
-        (&mut request as *mut RootdIpcRequest) as u64,
-        size_of::<RootdIpcRequest>() as u64,
+        (&mut request as *mut CommercialMaxProtocolRequest) as u64,
+        size_of::<CommercialMaxProtocolRequest>() as u64,
         (&mut reply_cap as *mut u64) as u64,
     );
     if received < 0 {
         return;
     }
+    if received as usize == size_of::<CommercialMaxProtocolRequest>() {
+        reply_commercial_max_request(reply_cap, &request, leases);
+        return;
+    }
+    if received as usize != size_of::<RootdIpcRequest>() {
+        return;
+    }
+    let legacy =
+        unsafe { &*((&request as *const CommercialMaxProtocolRequest).cast::<RootdIpcRequest>()) };
+    reply_legacy_rootd_request(reply_cap, legacy, leases, received as usize);
+}
+
+fn reply_legacy_rootd_request(
+    reply_cap: u64,
+    request: &RootdIpcRequest,
+    leases: &[Lease],
+    received: usize,
+) {
     let mut response = RootdIpcResponse {
         version: ROOTD_IPC_ABI_VERSION,
         op: request.op,
         lease_count: leases.len() as u32,
         ..RootdIpcResponse::default()
     };
-    response.status = validate_rootd_request(received as usize, &request)
-        .and_then(|_| fill_rootd_response(&request, leases, &mut response))
-        .err()
-        .unwrap_or(0);
+    response.status = match validate_rootd_request(received, request) {
+        Ok(()) => match fill_rootd_response(request, leases, &mut response) {
+            Ok(()) => 0,
+            Err(errno) => errno,
+        },
+        Err(errno) => errno,
+    };
     let _ = syscall3(
         SYS_RUSTOS_IPC_REPLY,
         reply_cap,
         (&response as *const RootdIpcResponse) as u64,
         size_of::<RootdIpcResponse>() as u64,
+    );
+}
+
+fn reply_commercial_max_request(
+    reply_cap: u64,
+    request: &CommercialMaxProtocolRequest,
+    leases: &[Lease],
+) {
+    let mut response = CommercialMaxProtocolResponse {
+        header: request.header,
+        value0: leases.len() as u64,
+        ..CommercialMaxProtocolResponse::default()
+    };
+    response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    response.status = match validate_commercial_max_request(request) {
+        Ok(()) => match fill_commercial_max_response(request, leases, &mut response) {
+            Ok(()) => 0,
+            Err(errno) => errno,
+        },
+        Err(errno) => errno,
+    };
+    let _ = syscall3(
+        SYS_RUSTOS_IPC_REPLY,
+        reply_cap,
+        (&response as *const CommercialMaxProtocolResponse) as u64,
+        size_of::<CommercialMaxProtocolResponse>() as u64,
     );
 }
 
@@ -253,10 +306,13 @@ fn fill_rootd_response(
 ) -> Result<(), i32> {
     match request.op {
         ROOTD_IPC_OP_STATUS => {
-            response.value = leases
-                .iter()
-                .filter(|lease| lease.state == ROOTD_LEASE_STATE_RUNNING)
-                .count() as u64;
+            let mut running = 0_u64;
+            for lease in leases {
+                if lease.state == ROOTD_LEASE_STATE_RUNNING {
+                    running += 1;
+                }
+            }
+            response.value = running;
             Ok(())
         }
         ROOTD_IPC_OP_LEASE_LIST => {
@@ -265,6 +321,84 @@ fn fill_rootd_response(
                 return Err(34);
             }
             response.lease = lease_wire(&leases[index]);
+            Ok(())
+        }
+        _ => Err(22),
+    }
+}
+
+fn validate_commercial_max_request(request: &CommercialMaxProtocolRequest) -> Result<(), i32> {
+    if request.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
+        || request.header.protocol != COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR
+        || request.header.flags != 0
+        || request.path_len as usize > request.path.len()
+        || request.payload_len as usize > request.payload.len()
+    {
+        return Err(22);
+    }
+    match request.header.op {
+        COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST
+        | COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE
+        | COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH
+        | COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY
+        | COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL => Ok(()),
+        _ => Err(22),
+    }
+}
+
+fn fill_commercial_max_response(
+    request: &CommercialMaxProtocolRequest,
+    leases: &[Lease],
+    response: &mut CommercialMaxProtocolResponse,
+) -> Result<(), i32> {
+    match request.header.op {
+        COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST => {
+            fill_manifest_descriptors(leases, response);
+            response.payload_len = write_manifest_payload(leases, &mut response.payload) as u32;
+            Ok(())
+        }
+        COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE => {
+            let lease = match lease_by_index(leases, request.arg0 as usize) {
+                Ok(lease) => lease,
+                Err(errno) => return Err(errno),
+            };
+            response.descriptor_count = 1;
+            response.descriptors[0] = lease_descriptor(lease, request.header.op, 0);
+            response.capability = lease_capability(lease, request.header.op);
+            response.payload_len = write_payload_struct(&lease_wire(lease), &mut response.payload);
+            response.value1 = lease.pid;
+            Ok(())
+        }
+        COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH => {
+            fill_dependency_graph(leases, response);
+            Ok(())
+        }
+        COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY => {
+            let lease = match lease_by_index(leases, request.arg0 as usize) {
+                Ok(lease) => lease,
+                Err(errno) => return Err(errno),
+            };
+            response.descriptor_count = 1;
+            response.descriptors[0] = lease_descriptor(lease, request.header.op, 0);
+            response.value0 = lease.restart_budget as u64;
+            response.value1 = lease.backoff_ms as u64;
+            Ok(())
+        }
+        COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL => {
+            let lease = match lease_by_service_or_index(leases, request.arg0, request.arg1 as usize)
+            {
+                Ok(lease) => lease,
+                Err(errno) => return Err(errno),
+            };
+            response.descriptor_count = 1;
+            response.descriptors[0] = lease_descriptor(lease, request.header.op, 0);
+            response.value0 =
+                if lease.service_id != INITD_LEASE_ID && service_ready(lease.service_id) {
+                    1
+                } else {
+                    0
+                };
+            response.value1 = lease.state as u64;
             Ok(())
         }
         _ => Err(22),
@@ -286,6 +420,155 @@ fn lease_wire(lease: &Lease) -> CoreServiceLeaseWire {
     wire.exec_path_len = len as u32;
     wire.exec_path[..len].copy_from_slice(&path[..len]);
     wire
+}
+
+fn lease_by_index(leases: &[Lease], index: usize) -> Result<&Lease, i32> {
+    if index < leases.len() {
+        Ok(&leases[index])
+    } else {
+        Err(34)
+    }
+}
+
+fn lease_by_service_or_index(
+    leases: &[Lease],
+    service_id: u64,
+    fallback_index: usize,
+) -> Result<&Lease, i32> {
+    if service_id != 0 {
+        for lease in leases {
+            if lease.service_id == service_id {
+                return Ok(lease);
+            }
+        }
+        return Err(34);
+    }
+    lease_by_index(leases, fallback_index)
+}
+
+fn fill_manifest_descriptors(leases: &[Lease], response: &mut CommercialMaxProtocolResponse) {
+    let count = leases.len().min(COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS);
+    response.descriptor_count = count as u16;
+    let mut index = 0usize;
+    while index < count {
+        let lease = &leases[index];
+        response.descriptors[index] = lease_descriptor(
+            lease,
+            COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE,
+            index as u64,
+        );
+        index += 1;
+    }
+}
+
+fn fill_dependency_graph(leases: &[Lease], response: &mut CommercialMaxProtocolResponse) {
+    let count = leases.len().min(COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS);
+    response.descriptor_count = count as u16;
+    let mut index = 0usize;
+    while index < count {
+        let lease = &leases[index];
+        let mut descriptor = lease_descriptor(
+            lease,
+            COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH,
+            index as u64,
+        );
+        descriptor.value1 = if index == 0 {
+            0
+        } else {
+            leases[index - 1].service_id
+        };
+        response.descriptors[index] = descriptor;
+        index += 1;
+    }
+}
+
+fn lease_descriptor(lease: &Lease, op: u16, index: u64) -> CommercialMaxProtocolDescriptorWire {
+    let mut descriptor = CommercialMaxProtocolDescriptorWire {
+        protocol: COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR,
+        op,
+        service_id: lease.service_id,
+        capability_mask: rootd_capability_mask(op),
+        value0: index,
+        value1: lease.pid,
+        ..CommercialMaxProtocolDescriptorWire::default()
+    };
+    let name = service_name(lease.exec_path);
+    copy_label(name, &mut descriptor.name, &mut descriptor.name_len);
+    descriptor
+}
+
+fn lease_capability(lease: &Lease, op: u16) -> CommercialMaxCapabilityLeaseWire {
+    let mut capability = CommercialMaxCapabilityLeaseWire {
+        lease_id: lease.pid,
+        service_id: lease.service_id,
+        subject_pid: lease.pid,
+        capability_mask: rootd_capability_mask(op),
+        rights_mask: rootd_capability_mask(op),
+        generation: lease.pid,
+        ..CommercialMaxCapabilityLeaseWire::default()
+    };
+    let name = service_name(lease.exec_path);
+    copy_label(name, &mut capability.label, &mut capability.label_len);
+    capability
+}
+
+fn rootd_capability_mask(op: u16) -> u64 {
+    match op {
+        COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST => 1 << 0,
+        COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE => 1 << 1,
+        COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH => 1 << 2,
+        COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY => 1 << 3,
+        COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL => 1 << 4,
+        _ => 0,
+    }
+}
+
+fn service_name(path: &'static [u8]) -> &'static [u8] {
+    let path = trim_nul(path);
+    let mut start = 0;
+    let mut index = 0;
+    while index < path.len() {
+        if path[index] == b'/' {
+            start = index + 1;
+        }
+        index += 1;
+    }
+    &path[start..]
+}
+
+fn copy_label(src: &[u8], dest: &mut [u8], len: &mut u16) {
+    let count = src.len().min(dest.len());
+    dest[..count].copy_from_slice(&src[..count]);
+    *len = count as u16;
+}
+
+fn write_manifest_payload(leases: &[Lease], dest: &mut [u8]) -> usize {
+    let mut written = 0;
+    for lease in leases {
+        let path = trim_nul(lease.exec_path);
+        if written != 0 {
+            if written >= dest.len() {
+                break;
+            }
+            dest[written] = b'\n';
+            written += 1;
+        }
+        let remaining = dest.len().saturating_sub(written);
+        let count = path.len().min(remaining);
+        dest[written..written + count].copy_from_slice(&path[..count]);
+        written += count;
+        if count < path.len() {
+            break;
+        }
+    }
+    written
+}
+
+fn write_payload_struct<T>(value: &T, dest: &mut [u8]) -> u32 {
+    let bytes = unsafe { slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
+    let count = bytes.len().min(dest.len());
+    dest[..count].copy_from_slice(&bytes[..count]);
+    count as u32
 }
 
 fn trim_nul(bytes: &'static [u8]) -> &'static [u8] {
@@ -541,6 +824,9 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
         yield_now();
     }
 }
+
+#[no_mangle]
+pub extern "C" fn rust_eh_personality() {}
 
 #[no_mangle]
 pub unsafe extern "C" fn memset(dest: *mut u8, value: i32, len: usize) -> *mut u8 {

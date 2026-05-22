@@ -4,4 +4,9 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[features]
+default = []
+linux-compat-state = ["dep:linux-raw-sys"]
+
 [dependencies]
+linux-raw-sys = { version = "0.12.1", default-features = false, features = ["no_std", "general", "ioctl", "auxvec", "net"], optional = true }

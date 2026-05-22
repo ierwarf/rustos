@@ -7,16 +7,22 @@ use std::thread;
 use std::time::Duration;
 
 use rustos_user_abi::syscall::{
-    InputIngestBrokerArgs, InputIngressWire, InputKeyboardEventWire, InputPointerAbsoluteWire,
-    InputPointerPacketWire, InputStatsBrokerArgs, InputStatsWire, InputdIpcRequest,
-    InputdIpcResponse, InputdReadResponse, INPUTD_ACCESS_EVDEV, INPUTD_ACCESS_NATIVE,
-    INPUTD_INGEST_MAX_EVENTS, INPUTD_INGRESS_KIND_EVENT, INPUTD_INGRESS_KIND_KEYBOARD,
-    INPUTD_INGRESS_KIND_POINTER_ABSOLUTE, INPUTD_INGRESS_KIND_POINTER_PACKET,
-    INPUTD_IPC_ABI_VERSION, INPUTD_IPC_OP_AUTHORIZE_READ, INPUTD_IPC_OP_DRAIN_INGEST,
-    INPUTD_IPC_OP_PING, INPUTD_IPC_OP_READ, INPUTD_IPC_OP_STATS, INPUTD_READ_FLAG_NONBLOCK,
-    INPUTD_READ_PAYLOAD_CAPACITY, IPC_SERVICE_INPUTD, SYS_RUSTOS_DEBUG_PRINT,
-    SYS_RUSTOS_INPUT_INGEST_BROKER, SYS_RUSTOS_INPUT_STATS_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
-    SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
+    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, InputIngestBrokerArgs,
+    InputIngressWire, InputKeyboardEventWire, InputPointerAbsoluteWire, InputPointerPacketWire,
+    InputStatsBrokerArgs, InputStatsWire, InputdIpcRequest, InputdIpcResponse, InputdReadResponse,
+    COMMERCIAL_MAX_INPUTD_OP_DROP_POLICY, COMMERCIAL_MAX_INPUTD_OP_EVDEV_TRANSLATE,
+    COMMERCIAL_MAX_INPUTD_OP_INPUT_INGEST, COMMERCIAL_MAX_INPUTD_OP_INPUT_READER,
+    COMMERCIAL_MAX_INPUTD_OP_INPUT_STATS, COMMERCIAL_MAX_INPUTD_OP_LAYOUT_POLICY,
+    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_INPUTD, INPUTD_ACCESS_EVDEV,
+    INPUTD_ACCESS_NATIVE, INPUTD_INGEST_MAX_EVENTS, INPUTD_INGRESS_KIND_EVENT,
+    INPUTD_INGRESS_KIND_KEYBOARD, INPUTD_INGRESS_KIND_POINTER_ABSOLUTE,
+    INPUTD_INGRESS_KIND_POINTER_PACKET, INPUTD_IPC_ABI_VERSION, INPUTD_IPC_OP_AUTHORIZE_READ,
+    INPUTD_IPC_OP_DRAIN_INGEST, INPUTD_IPC_OP_PING, INPUTD_IPC_OP_READ, INPUTD_IPC_OP_STATS,
+    INPUTD_READ_FLAG_NONBLOCK, INPUTD_READ_PAYLOAD_CAPACITY, IPC_MAX_INLINE_BYTES,
+    IPC_SERVICE_INPUTD, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_INPUT_INGEST_BROKER,
+    SYS_RUSTOS_INPUT_STATS_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV,
+    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
 };
 
 const RECV_BACKOFF: Duration = Duration::from_millis(50);
@@ -313,19 +319,32 @@ fn main() {
 fn serve(endpoint: u64) {
     let mut queue = InputQueue::default();
     loop {
-        let mut request = InputdIpcRequest::default();
+        let mut request = [0_u8; IPC_MAX_INLINE_BYTES];
         let mut reply_cap = 0_u64;
         let received = syscall4(
             SYS_RUSTOS_IPC_RECV,
             endpoint,
-            (&mut request as *mut InputdIpcRequest) as u64,
-            size_of::<InputdIpcRequest>() as u64,
+            request.as_mut_ptr() as u64,
+            request.len() as u64,
             (&mut reply_cap as *mut u64) as u64,
         );
         if received < 0 {
             thread::sleep(RECV_BACKOFF);
             continue;
         }
+        let request_size = received as usize;
+        if request_size == size_of::<CommercialMaxProtocolRequest>() {
+            let request = read_unaligned::<CommercialMaxProtocolRequest>(&request);
+            let reply = reply_commercial_request(reply_cap, &request, &mut queue);
+            if reply < 0 {
+                let _ = writeln!(std::io::stderr(), "inputd: reply failed errno={}", -reply);
+            }
+            continue;
+        }
+        if request_size != size_of::<InputdIpcRequest>() {
+            continue;
+        }
+        let request = read_unaligned::<InputdIpcRequest>(&request);
         let reply = if request.op == INPUTD_IPC_OP_READ {
             let mut response = InputdReadResponse {
                 version: INPUTD_IPC_ABI_VERSION,
@@ -363,6 +382,28 @@ fn serve(endpoint: u64) {
             let _ = writeln!(std::io::stderr(), "inputd: reply failed errno={}", -reply);
         }
     }
+}
+
+fn reply_commercial_request(
+    reply_cap: u64,
+    request: &CommercialMaxProtocolRequest,
+    queue: &mut InputQueue,
+) -> i64 {
+    let mut response = CommercialMaxProtocolResponse {
+        header: request.header,
+        ..CommercialMaxProtocolResponse::default()
+    };
+    response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    response.status = validate_commercial_request(request)
+        .and_then(|_| dispatch_commercial_request(request, &mut response, queue))
+        .err()
+        .unwrap_or(0);
+    syscall3(
+        SYS_RUSTOS_IPC_REPLY,
+        reply_cap,
+        (&response as *const CommercialMaxProtocolResponse) as u64,
+        size_of::<CommercialMaxProtocolResponse>() as u64,
+    )
 }
 
 fn dispatch(
@@ -569,6 +610,82 @@ fn fetch_stats(queue: &InputQueue) -> Result<InputStatsWire, i32> {
     Ok(stats)
 }
 
+fn dispatch_commercial_request(
+    request: &CommercialMaxProtocolRequest,
+    response: &mut CommercialMaxProtocolResponse,
+    queue: &mut InputQueue,
+) -> Result<(), i32> {
+    match request.header.op {
+        COMMERCIAL_MAX_INPUTD_OP_INPUT_INGEST => {
+            response.value0 = drain_ingest(queue)? as u64;
+            write_stats_payload(queue, response)
+        }
+        COMMERCIAL_MAX_INPUTD_OP_INPUT_READER => {
+            let access = request.arg0 as u16;
+            response.value0 = match access {
+                INPUTD_ACCESS_NATIVE => request.arg1.min(INPUTD_MAX_NATIVE_READ_BYTES),
+                INPUTD_ACCESS_EVDEV => request.arg1.min(INPUTD_MAX_EVDEV_READ_BYTES),
+                _ => return Err(libc::EINVAL),
+            };
+            response.capability = input_capability("reader", request.header.op);
+            write_stats_payload(queue, response)
+        }
+        COMMERCIAL_MAX_INPUTD_OP_EVDEV_TRANSLATE => {
+            response.value0 = input_evdev::MAX_EVDEV_EVENTS_PER_INPUT_EVENT as u64;
+            response.value1 = input_evdev::MAX_INPUT_EVENTS_PER_READ as u64;
+            response.capability = input_capability("evdev", request.header.op);
+            Ok(())
+        }
+        COMMERCIAL_MAX_INPUTD_OP_LAYOUT_POLICY => {
+            response.descriptor_count = 1;
+            response.descriptors[0] = input_descriptor("keyboard-layout", request.header.op);
+            Ok(())
+        }
+        COMMERCIAL_MAX_INPUTD_OP_DROP_POLICY => {
+            response.value0 = INPUTD_QUEUE_MAX_EVENTS as u64;
+            response.value1 = queue.dropped_lossy;
+            response.descriptor_count = 1;
+            response.descriptors[0] = input_descriptor("lossy-drop-oldest", request.header.op);
+            Ok(())
+        }
+        COMMERCIAL_MAX_INPUTD_OP_INPUT_STATS => write_stats_payload(queue, response),
+        _ => Err(libc::EINVAL),
+    }
+}
+
+fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result<(), i32> {
+    if request.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
+        || request.header.protocol != COMMERCIAL_MAX_PROTOCOL_INPUTD
+        || request.header.flags != 0
+        || request.path_len as usize > request.path.len()
+        || request.payload_len as usize > request.payload.len()
+    {
+        return Err(libc::EINVAL);
+    }
+    match request.header.op {
+        COMMERCIAL_MAX_INPUTD_OP_INPUT_INGEST
+        | COMMERCIAL_MAX_INPUTD_OP_INPUT_READER
+        | COMMERCIAL_MAX_INPUTD_OP_EVDEV_TRANSLATE
+        | COMMERCIAL_MAX_INPUTD_OP_LAYOUT_POLICY
+        | COMMERCIAL_MAX_INPUTD_OP_DROP_POLICY
+        | COMMERCIAL_MAX_INPUTD_OP_INPUT_STATS => Ok(()),
+        _ => Err(libc::EINVAL),
+    }
+}
+
+fn write_stats_payload(
+    queue: &InputQueue,
+    response: &mut CommercialMaxProtocolResponse,
+) -> Result<(), i32> {
+    let stats = fetch_stats(queue)?;
+    response.value0 = response.value0.max(stats.queued);
+    response.value1 = stats.dropped_lossy;
+    response.payload_len = write_payload_struct(&stats, &mut response.payload);
+    response.descriptor_count = 1;
+    response.descriptors[0] = input_descriptor("stats", COMMERCIAL_MAX_INPUTD_OP_INPUT_STATS);
+    Ok(())
+}
+
 fn validate(received: usize, request: &InputdIpcRequest) -> Result<(), i32> {
     if received != size_of::<InputdIpcRequest>()
         || request.version != INPUTD_IPC_ABI_VERSION
@@ -586,6 +703,70 @@ fn validate(received: usize, request: &InputdIpcRequest) -> Result<(), i32> {
         INPUTD_IPC_OP_READ => Ok(()),
         _ => Err(libc::EINVAL),
     }
+}
+
+fn input_descriptor(label: &str, op: u16) -> CommercialMaxProtocolDescriptorWire {
+    let mut descriptor = CommercialMaxProtocolDescriptorWire {
+        protocol: COMMERCIAL_MAX_PROTOCOL_INPUTD,
+        op,
+        service_id: IPC_SERVICE_INPUTD,
+        capability_mask: input_capability_mask(op),
+        value0: INPUTD_QUEUE_MAX_EVENTS as u64,
+        ..CommercialMaxProtocolDescriptorWire::default()
+    };
+    copy_label(
+        label.as_bytes(),
+        &mut descriptor.name,
+        &mut descriptor.name_len,
+    );
+    descriptor
+}
+
+fn input_capability(label: &str, op: u16) -> CommercialMaxCapabilityLeaseWire {
+    let mut capability = CommercialMaxCapabilityLeaseWire {
+        lease_id: op as u64,
+        service_id: IPC_SERVICE_INPUTD,
+        capability_mask: input_capability_mask(op),
+        rights_mask: input_capability_mask(op),
+        generation: INPUTD_QUEUE_MAX_EVENTS as u64,
+        ..CommercialMaxCapabilityLeaseWire::default()
+    };
+    copy_label(
+        label.as_bytes(),
+        &mut capability.label,
+        &mut capability.label_len,
+    );
+    capability
+}
+
+fn input_capability_mask(op: u16) -> u64 {
+    match op {
+        COMMERCIAL_MAX_INPUTD_OP_INPUT_INGEST => 1 << 0,
+        COMMERCIAL_MAX_INPUTD_OP_INPUT_READER => 1 << 1,
+        COMMERCIAL_MAX_INPUTD_OP_EVDEV_TRANSLATE => 1 << 2,
+        COMMERCIAL_MAX_INPUTD_OP_LAYOUT_POLICY => 1 << 3,
+        COMMERCIAL_MAX_INPUTD_OP_DROP_POLICY => 1 << 4,
+        COMMERCIAL_MAX_INPUTD_OP_INPUT_STATS => 1 << 5,
+        _ => 0,
+    }
+}
+
+fn copy_label(src: &[u8], dest: &mut [u8], len: &mut u16) {
+    let count = src.len().min(dest.len());
+    dest[..count].copy_from_slice(&src[..count]);
+    *len = count as u16;
+}
+
+fn write_payload_struct<T>(value: &T, dest: &mut [u8]) -> u32 {
+    let bytes = unsafe { slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
+    let count = bytes.len().min(dest.len());
+    dest[..count].copy_from_slice(&bytes[..count]);
+    count as u32
+}
+
+fn read_unaligned<T: Copy>(buffer: &[u8]) -> T {
+    assert!(buffer.len() >= size_of::<T>());
+    unsafe { core::ptr::read_unaligned(buffer.as_ptr().cast::<T>()) }
 }
 
 fn syscall0(number: u64) -> i64 {

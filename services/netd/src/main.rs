@@ -4,7 +4,13 @@ use std::thread;
 use std::time::Duration;
 
 use rustos_user_abi::syscall::{
-    NetdIpcRequest, NetdIpcResponse, RustosNetBrokerArgs, IPC_SERVICE_NETD, NETD_IPC_ABI_VERSION,
+    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, NetdIpcRequest, NetdIpcResponse,
+    RustosNetBrokerArgs, COMMERCIAL_MAX_NETD_OP_ADDRESS_BIND, COMMERCIAL_MAX_NETD_OP_FD_TRANSFER,
+    COMMERCIAL_MAX_NETD_OP_PACKET_LEASE, COMMERCIAL_MAX_NETD_OP_ROUTE_POLICY,
+    COMMERCIAL_MAX_NETD_OP_SOCKET_NAMESPACE, COMMERCIAL_MAX_NETD_OP_SOCKET_OPTIONS,
+    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
+    COMMERCIAL_MAX_PROTOCOL_NETD, IPC_SERVICE_NETD, NETD_IPC_ABI_VERSION,
     SYSCALL_OFFLOAD_OP_LINUX_ACCEPT, SYSCALL_OFFLOAD_OP_LINUX_BIND,
     SYSCALL_OFFLOAD_OP_LINUX_CONNECT, SYSCALL_OFFLOAD_OP_LINUX_GETPEERNAME,
     SYSCALL_OFFLOAD_OP_LINUX_GETSOCKNAME, SYSCALL_OFFLOAD_OP_LINUX_GETSOCKOPT,
@@ -50,13 +56,13 @@ fn main() {
 
 fn serve(endpoint: u64) {
     loop {
-        let mut request = NetdIpcRequest::default();
+        let mut request = CommercialMaxProtocolRequest::default();
         let mut reply_cap = 0_u64;
         let received = syscall4(
             SYS_RUSTOS_IPC_RECV,
             endpoint,
-            (&mut request as *mut NetdIpcRequest) as u64,
-            size_of::<NetdIpcRequest>() as u64,
+            (&mut request as *mut CommercialMaxProtocolRequest) as u64,
+            size_of::<CommercialMaxProtocolRequest>() as u64,
             (&mut reply_cap as *mut u64) as u64,
         );
         if received < 0 {
@@ -64,6 +70,17 @@ fn serve(endpoint: u64) {
             continue;
         }
 
+        if received as usize == size_of::<CommercialMaxProtocolRequest>() {
+            let reply = reply_commercial_request(reply_cap, &request);
+            if reply < 0 {
+                let _ = writeln!(std::io::stderr(), "netd: reply failed errno={}", -reply);
+            }
+            continue;
+        }
+
+        let request = unsafe {
+            &*((&request as *const CommercialMaxProtocolRequest).cast::<NetdIpcRequest>())
+        };
         let mut response = NetdIpcResponse {
             version: NETD_IPC_ABI_VERSION,
             op: request.op,
@@ -83,6 +100,24 @@ fn serve(endpoint: u64) {
             let _ = writeln!(std::io::stderr(), "netd: reply failed errno={}", -reply);
         }
     }
+}
+
+fn reply_commercial_request(reply_cap: u64, request: &CommercialMaxProtocolRequest) -> i64 {
+    let mut response = CommercialMaxProtocolResponse {
+        header: request.header,
+        ..CommercialMaxProtocolResponse::default()
+    };
+    response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    response.status = match validate_commercial_request(request) {
+        Ok(()) => dispatch_commercial_request(request, &mut response),
+        Err(errno) => errno,
+    };
+    syscall3(
+        SYS_RUSTOS_IPC_REPLY,
+        reply_cap,
+        (&response as *const CommercialMaxProtocolResponse) as u64,
+        size_of::<CommercialMaxProtocolResponse>() as u64,
+    )
 }
 
 fn dispatch_request(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
@@ -137,6 +172,152 @@ fn validate_request(received: usize, request: &NetdIpcRequest) -> Result<(), i32
         | SYSCALL_OFFLOAD_OP_LINUX_RECVFROM => Ok(()),
         _ => Err(libc::EINVAL),
     }
+}
+
+fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result<(), i32> {
+    if request.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
+        || request.header.protocol != COMMERCIAL_MAX_PROTOCOL_NETD
+        || request.path_len as usize > request.path.len()
+        || request.payload_len as usize > request.payload.len()
+    {
+        return Err(libc::EINVAL);
+    }
+    match request.header.op {
+        COMMERCIAL_MAX_NETD_OP_SOCKET_NAMESPACE
+        | COMMERCIAL_MAX_NETD_OP_SOCKET_OPTIONS
+        | COMMERCIAL_MAX_NETD_OP_ADDRESS_BIND
+        | COMMERCIAL_MAX_NETD_OP_ROUTE_POLICY
+        | COMMERCIAL_MAX_NETD_OP_PACKET_LEASE
+        | COMMERCIAL_MAX_NETD_OP_FD_TRANSFER => Ok(()),
+        _ => Err(libc::EINVAL),
+    }
+}
+
+fn dispatch_commercial_request(
+    request: &CommercialMaxProtocolRequest,
+    response: &mut CommercialMaxProtocolResponse,
+) -> i32 {
+    match request.header.op {
+        COMMERCIAL_MAX_NETD_OP_SOCKET_NAMESPACE => {
+            fill_net_descriptors(
+                response,
+                &[
+                    ("socket", SYSCALL_OFFLOAD_OP_LINUX_SOCKET),
+                    ("socketpair", SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR),
+                    ("shutdown", SYSCALL_OFFLOAD_OP_LINUX_SHUTDOWN),
+                ],
+            );
+            0
+        }
+        COMMERCIAL_MAX_NETD_OP_SOCKET_OPTIONS => {
+            fill_net_descriptors(
+                response,
+                &[
+                    ("setsockopt", SYSCALL_OFFLOAD_OP_LINUX_SETSOCKOPT),
+                    ("getsockopt", SYSCALL_OFFLOAD_OP_LINUX_GETSOCKOPT),
+                ],
+            );
+            0
+        }
+        COMMERCIAL_MAX_NETD_OP_ADDRESS_BIND => {
+            fill_net_descriptors(
+                response,
+                &[
+                    ("bind", SYSCALL_OFFLOAD_OP_LINUX_BIND),
+                    ("listen", SYSCALL_OFFLOAD_OP_LINUX_LISTEN),
+                    ("getsockname", SYSCALL_OFFLOAD_OP_LINUX_GETSOCKNAME),
+                    ("getpeername", SYSCALL_OFFLOAD_OP_LINUX_GETPEERNAME),
+                ],
+            );
+            0
+        }
+        COMMERCIAL_MAX_NETD_OP_ROUTE_POLICY => {
+            fill_net_descriptors(response, &[("connect", SYSCALL_OFFLOAD_OP_LINUX_CONNECT)]);
+            0
+        }
+        COMMERCIAL_MAX_NETD_OP_PACKET_LEASE => {
+            fill_net_descriptors(
+                response,
+                &[
+                    ("sendto", SYSCALL_OFFLOAD_OP_LINUX_SENDTO),
+                    ("sendmsg", SYSCALL_OFFLOAD_OP_LINUX_SENDMSG),
+                    ("recvfrom", SYSCALL_OFFLOAD_OP_LINUX_RECVFROM),
+                    ("recvmsg", SYSCALL_OFFLOAD_OP_LINUX_RECVMSG),
+                ],
+            );
+            response.capability = net_capability("packet", request.header.op);
+            0
+        }
+        COMMERCIAL_MAX_NETD_OP_FD_TRANSFER => {
+            fill_net_descriptors(response, &[("accept", SYSCALL_OFFLOAD_OP_LINUX_ACCEPT)]);
+            response.capability = net_capability("fd-transfer", request.header.op);
+            0
+        }
+        _ => libc::EINVAL,
+    }
+}
+
+fn fill_net_descriptors(response: &mut CommercialMaxProtocolResponse, entries: &[(&str, u16)]) {
+    let count = entries.len().min(COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS);
+    response.descriptor_count = count as u16;
+    response.value0 = entries.len() as u64;
+    for (index, (name, op)) in entries.iter().take(count).enumerate() {
+        response.descriptors[index] = net_descriptor(name, *op);
+    }
+}
+
+fn net_descriptor(name: &str, offload_op: u16) -> CommercialMaxProtocolDescriptorWire {
+    let mut descriptor = CommercialMaxProtocolDescriptorWire {
+        protocol: COMMERCIAL_MAX_PROTOCOL_NETD,
+        op: offload_op,
+        flags: 0,
+        service_id: IPC_SERVICE_NETD,
+        capability_mask: net_capability_mask(offload_op),
+        value0: offload_op as u64,
+        value1: 0,
+        ..CommercialMaxProtocolDescriptorWire::default()
+    };
+    copy_label(name, &mut descriptor.name, &mut descriptor.name_len);
+    descriptor
+}
+
+fn net_capability(label: &str, op: u16) -> CommercialMaxCapabilityLeaseWire {
+    let mut capability = CommercialMaxCapabilityLeaseWire {
+        lease_id: ((COMMERCIAL_MAX_PROTOCOL_NETD as u64) << 32) | u64::from(op),
+        service_id: IPC_SERVICE_NETD,
+        capability_mask: net_capability_mask(op),
+        rights_mask: net_capability_mask(op),
+        ..CommercialMaxCapabilityLeaseWire::default()
+    };
+    copy_label(label, &mut capability.label, &mut capability.label_len);
+    capability
+}
+
+fn net_capability_mask(op: u16) -> u64 {
+    match op {
+        COMMERCIAL_MAX_NETD_OP_SOCKET_NAMESPACE | SYSCALL_OFFLOAD_OP_LINUX_SOCKET => 1 << 0,
+        COMMERCIAL_MAX_NETD_OP_SOCKET_OPTIONS
+        | SYSCALL_OFFLOAD_OP_LINUX_SETSOCKOPT
+        | SYSCALL_OFFLOAD_OP_LINUX_GETSOCKOPT => 1 << 1,
+        COMMERCIAL_MAX_NETD_OP_ADDRESS_BIND
+        | SYSCALL_OFFLOAD_OP_LINUX_BIND
+        | SYSCALL_OFFLOAD_OP_LINUX_LISTEN => 1 << 2,
+        COMMERCIAL_MAX_NETD_OP_ROUTE_POLICY | SYSCALL_OFFLOAD_OP_LINUX_CONNECT => 1 << 3,
+        COMMERCIAL_MAX_NETD_OP_PACKET_LEASE
+        | SYSCALL_OFFLOAD_OP_LINUX_SENDTO
+        | SYSCALL_OFFLOAD_OP_LINUX_SENDMSG
+        | SYSCALL_OFFLOAD_OP_LINUX_RECVFROM
+        | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG => 1 << 4,
+        COMMERCIAL_MAX_NETD_OP_FD_TRANSFER | SYSCALL_OFFLOAD_OP_LINUX_ACCEPT => 1 << 5,
+        _ => 0,
+    }
+}
+
+fn copy_label(label: &str, target: &mut [u8], len: &mut u16) {
+    let bytes = label.as_bytes();
+    let count = bytes.len().min(target.len());
+    target[..count].copy_from_slice(&bytes[..count]);
+    *len = count as u16;
 }
 
 fn syscall0(number: u64) -> i64 {

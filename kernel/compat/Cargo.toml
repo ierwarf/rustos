@@ -11,11 +11,10 @@ kernel-object = { path = "../object" }
 kernel-ipc-runtime = { path = "../ipc-runtime" }
 kernel-ps = { path = "../ps" }
 nucleus-core = { path = "../nucleus-core" }
-rustos-user-abi = { path = "../../libs/rustos-user-abi" }
+rustos-user-abi = { path = "../../libs/rustos-user-abi", features = ["linux-compat-state"] }
 storage-core = { path = "../../libs/storage-core" }
 trace-loc-macro = { path = "../../libs/trace-loc-macro" }
 lazy_static = { version = "1.4", features = ["spin_no_std"] }
-linux-raw-sys = { version = "0.12.1", default-features = false, features = ["no_std", "general", "ioctl", "auxvec", "net"] }
 object = { version = "0.38.1", default-features = false, features = ["read_core", "elf"] }
 spin = "0.10.0"
 x86_64 = { version = "0.15.4", default-features = false, features = ["instructions", "abi_x86_interrupt"] }

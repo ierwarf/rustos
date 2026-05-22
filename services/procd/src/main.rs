@@ -9,12 +9,18 @@ use core::mem::size_of;
 use rustos_svc_runtime::ipc;
 use rustos_svc_runtime::syscall::{syscall1, syscall5};
 use rustos_user_abi::syscall::{
-    LifecycleDrainBrokerArgs, LifecycleEventWire, LinuxSyscallOffloadRequest,
-    LinuxSyscallOffloadResponse, LoaderSpawnRequest, LoaderSpawnResponse, ProcdIpcRequest,
-    ProcdIpcResponse, RustosProcAuthorizeExecBrokerArgs, RustosProcCancelExecBrokerArgs,
-    RustosProcForkBrokerArgs, RustosProcSignalQueueBrokerArgs, IPC_SERVICE_LINUX_SYSCALLD,
-    IPC_SERVICE_LOADERD, IPC_SERVICE_PROCD, LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT,
-    LINUX_SIGACTION_SIZE, LOADER_OP_EXEC_TARGET, LOADER_REQUEST_ABI_VERSION,
+    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, LifecycleDrainBrokerArgs,
+    LifecycleEventWire, LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse,
+    LoaderSpawnRequest, LoaderSpawnResponse, ProcdIpcRequest, ProcdIpcResponse,
+    RustosProcAuthorizeExecBrokerArgs, RustosProcCancelExecBrokerArgs, RustosProcForkBrokerArgs,
+    RustosProcSignalQueueBrokerArgs, COMMERCIAL_MAX_PROCD_OP_EXEC_TICKET,
+    COMMERCIAL_MAX_PROCD_OP_FORK_PLAN, COMMERCIAL_MAX_PROCD_OP_PROCESS_PREPARE,
+    COMMERCIAL_MAX_PROCD_OP_SESSION_MEMBERSHIP, COMMERCIAL_MAX_PROCD_OP_SIGNAL_POLICY,
+    COMMERCIAL_MAX_PROCD_OP_THREAD_PLAN, COMMERCIAL_MAX_PROCD_OP_WAIT_NAMESPACE,
+    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_PROCD, IPC_MAX_INLINE_BYTES,
+    IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD, IPC_SERVICE_PROCD, LIFECYCLE_DRAIN_MAX_EVENTS,
+    LIFECYCLE_EVENT_EXIT, LINUX_SIGACTION_SIZE, LOADER_OP_EXEC_TARGET, LOADER_REQUEST_ABI_VERSION,
     LOADER_SPAWN_MAX_ARG_COUNT, LOADER_SPAWN_MAX_ENV_COUNT, PROCD_ARG_BYTES, PROCD_ENV_BYTES,
     PROCD_IPC_ABI_VERSION, PROCD_OP_EXECVE, PROCD_OP_EXECVEAT, PROCD_OP_FORK,
     PROCD_OP_RT_SIGACTION, PROCD_OP_RT_SIGPROCMASK, PROCD_OP_SELECT_SIGNAL, PROCD_OP_SIGALTSTACK,
@@ -66,13 +72,13 @@ fn service_main() {
 fn serve(endpoint: u64) {
     let mut drain_counter = 0u32;
     loop {
-        let mut request = ProcdIpcRequest::default();
+        let mut request = [0_u8; IPC_MAX_INLINE_BYTES];
         let mut reply_cap = 0_u64;
         let received = unsafe {
             ipc::recv(
                 endpoint,
-                (&mut request as *mut ProcdIpcRequest).cast::<u8>(),
-                size_of::<ProcdIpcRequest>(),
+                request.as_mut_ptr(),
+                request.len(),
                 &mut reply_cap as *mut u64,
             )
         };
@@ -81,14 +87,8 @@ fn serve(endpoint: u64) {
             continue;
         }
 
-        let response = handle_request(received as usize, &request);
-        let reply = unsafe {
-            ipc::reply(
-                reply_cap,
-                (&response as *const ProcdIpcResponse).cast::<u8>(),
-                size_of::<ProcdIpcResponse>(),
-            )
-        };
+        let response = handle_wire_request(received as usize, &request);
+        let reply = unsafe { ipc::reply(reply_cap, response.as_ptr(), response.len()) };
         if reply < 0 {
             ipc::debug_line("procd: reply failed");
         }
@@ -98,6 +98,44 @@ fn serve(endpoint: u64) {
             drain_lifecycle_events();
         }
     }
+}
+
+enum ProcdReply {
+    Ipc(ProcdIpcResponse),
+    Commercial(CommercialMaxProtocolResponse),
+}
+
+impl ProcdReply {
+    fn as_ptr(&self) -> *const u8 {
+        match self {
+            Self::Ipc(response) => (response as *const ProcdIpcResponse).cast::<u8>(),
+            Self::Commercial(response) => {
+                (response as *const CommercialMaxProtocolResponse).cast::<u8>()
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Ipc(_) => size_of::<ProcdIpcResponse>(),
+            Self::Commercial(_) => size_of::<CommercialMaxProtocolResponse>(),
+        }
+    }
+}
+
+fn handle_wire_request(received: usize, bytes: &[u8]) -> ProcdReply {
+    if received == size_of::<CommercialMaxProtocolRequest>() {
+        let request = read_unaligned::<CommercialMaxProtocolRequest>(bytes);
+        return ProcdReply::Commercial(handle_commercial_request(&request));
+    }
+    if received == size_of::<ProcdIpcRequest>() {
+        let request = read_unaligned::<ProcdIpcRequest>(bytes);
+        return ProcdReply::Ipc(handle_request(received, &request));
+    }
+    ProcdReply::Ipc(ProcdIpcResponse {
+        status: EINVAL,
+        ..ProcdIpcResponse::default()
+    })
 }
 
 fn drain_lifecycle_events() {
@@ -180,6 +218,76 @@ fn handle_request(received: usize, request: &ProcdIpcRequest) -> ProcdIpcRespons
     response
 }
 
+fn handle_commercial_request(
+    request: &CommercialMaxProtocolRequest,
+) -> CommercialMaxProtocolResponse {
+    let mut response = CommercialMaxProtocolResponse {
+        header: request.header,
+        ..CommercialMaxProtocolResponse::default()
+    };
+    response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    if let Err(errno) = validate_commercial_request(request) {
+        response.status = errno;
+        return response;
+    }
+    match request.header.op {
+        COMMERCIAL_MAX_PROCD_OP_PROCESS_PREPARE => {
+            response.descriptor_count = 1;
+            response.descriptors[0] = procd_descriptor(
+                "process-prepare",
+                request.header.op,
+                request.header.subject_pid,
+            );
+            response.capability = procd_capability("process-prepare", request.header.op);
+        }
+        COMMERCIAL_MAX_PROCD_OP_EXEC_TICKET => {
+            response.descriptor_count = 1;
+            response.descriptors[0] =
+                procd_descriptor("exec-ticket", request.header.op, request.header.subject_pid);
+            response.capability = procd_capability("exec-ticket", request.header.op);
+        }
+        COMMERCIAL_MAX_PROCD_OP_FORK_PLAN => {
+            response.descriptor_count = 1;
+            response.descriptors[0] =
+                procd_descriptor("fork-plan", request.header.op, request.header.subject_pid);
+            response.capability = procd_capability("fork-plan", request.header.op);
+        }
+        COMMERCIAL_MAX_PROCD_OP_THREAD_PLAN => {
+            let count = THREAD_SIGNAL_POLICY.lock().len() as u64;
+            response.value0 = count;
+            response.descriptor_count = 1;
+            response.descriptors[0] = procd_descriptor("thread-plan", request.header.op, count);
+        }
+        COMMERCIAL_MAX_PROCD_OP_SIGNAL_POLICY => {
+            let process_count = PROCESS_SIGNAL_POLICY.lock().len() as u64;
+            let thread_count = THREAD_SIGNAL_POLICY.lock().len() as u64;
+            response.value0 = process_count;
+            response.value1 = thread_count;
+            response.descriptor_count = 1;
+            response.descriptors[0] =
+                procd_descriptor("signal-policy", request.header.op, process_count);
+        }
+        COMMERCIAL_MAX_PROCD_OP_WAIT_NAMESPACE => {
+            response.descriptor_count = 1;
+            response.descriptors[0] = procd_descriptor(
+                "wait-namespace",
+                request.header.op,
+                request.header.subject_pid,
+            );
+        }
+        COMMERCIAL_MAX_PROCD_OP_SESSION_MEMBERSHIP => {
+            response.descriptor_count = 1;
+            response.descriptors[0] = procd_descriptor(
+                "session-membership",
+                request.header.op,
+                request.header.subject_pid,
+            );
+        }
+        _ => response.status = EINVAL,
+    }
+    response
+}
+
 fn validate_request(received: usize, request: &ProcdIpcRequest) -> Result<(), i32> {
     if received != size_of::<ProcdIpcRequest>()
         || request.version != PROCD_IPC_ABI_VERSION
@@ -196,6 +304,73 @@ fn validate_request(received: usize, request: &ProcdIpcRequest) -> Result<(), i3
         return Err(EINVAL);
     }
     Ok(())
+}
+
+fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result<(), i32> {
+    if request.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
+        || request.header.protocol != COMMERCIAL_MAX_PROTOCOL_PROCD
+        || request.path_len as usize > request.path.len()
+        || request.payload_len as usize > request.payload.len()
+    {
+        return Err(EINVAL);
+    }
+    match request.header.op {
+        COMMERCIAL_MAX_PROCD_OP_PROCESS_PREPARE
+        | COMMERCIAL_MAX_PROCD_OP_EXEC_TICKET
+        | COMMERCIAL_MAX_PROCD_OP_FORK_PLAN
+        | COMMERCIAL_MAX_PROCD_OP_THREAD_PLAN
+        | COMMERCIAL_MAX_PROCD_OP_SIGNAL_POLICY
+        | COMMERCIAL_MAX_PROCD_OP_WAIT_NAMESPACE
+        | COMMERCIAL_MAX_PROCD_OP_SESSION_MEMBERSHIP => Ok(()),
+        _ => Err(EINVAL),
+    }
+}
+
+fn procd_descriptor(label: &str, op: u16, value0: u64) -> CommercialMaxProtocolDescriptorWire {
+    let mut descriptor = CommercialMaxProtocolDescriptorWire {
+        protocol: COMMERCIAL_MAX_PROTOCOL_PROCD,
+        op,
+        flags: 0,
+        service_id: IPC_SERVICE_PROCD,
+        capability_mask: procd_capability_mask(op),
+        value0,
+        value1: 0,
+        ..CommercialMaxProtocolDescriptorWire::default()
+    };
+    copy_label(label, &mut descriptor.name, &mut descriptor.name_len);
+    descriptor
+}
+
+fn procd_capability(label: &str, op: u16) -> CommercialMaxCapabilityLeaseWire {
+    let mut capability = CommercialMaxCapabilityLeaseWire {
+        lease_id: ((COMMERCIAL_MAX_PROTOCOL_PROCD as u64) << 32) | u64::from(op),
+        service_id: IPC_SERVICE_PROCD,
+        capability_mask: procd_capability_mask(op),
+        rights_mask: procd_capability_mask(op),
+        ..CommercialMaxCapabilityLeaseWire::default()
+    };
+    copy_label(label, &mut capability.label, &mut capability.label_len);
+    capability
+}
+
+fn procd_capability_mask(op: u16) -> u64 {
+    match op {
+        COMMERCIAL_MAX_PROCD_OP_PROCESS_PREPARE => 1 << 0,
+        COMMERCIAL_MAX_PROCD_OP_EXEC_TICKET => 1 << 1,
+        COMMERCIAL_MAX_PROCD_OP_FORK_PLAN => 1 << 2,
+        COMMERCIAL_MAX_PROCD_OP_THREAD_PLAN => 1 << 3,
+        COMMERCIAL_MAX_PROCD_OP_SIGNAL_POLICY => 1 << 4,
+        COMMERCIAL_MAX_PROCD_OP_WAIT_NAMESPACE => 1 << 5,
+        COMMERCIAL_MAX_PROCD_OP_SESSION_MEMBERSHIP => 1 << 6,
+        _ => 0,
+    }
+}
+
+fn copy_label(label: &str, target: &mut [u8], len: &mut u16) {
+    let bytes = label.as_bytes();
+    let count = bytes.len().min(target.len());
+    target[..count].copy_from_slice(&bytes[..count]);
+    *len = count as u16;
 }
 
 fn handle_exec(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse) {

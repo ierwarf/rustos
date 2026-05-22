@@ -4,9 +4,15 @@ use std::thread;
 use std::time::Duration;
 
 use rustos_user_abi::syscall::{
-    DevmgrdDeviceIoctlRequest, DevmgrdDeviceIoctlResponse, DevmgrdDeviceOpenRequest,
-    DevmgrdDeviceOpenResponse, DevmgrdIpcRequest, DevmgrdIpcResponse, DevmgrdNodeEntry,
-    IpcReplyWithHandlesArgs, RustosDeviceIoctlBrokerArgs, RustosDeviceOpenBrokerArgs,
+    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, DevmgrdDeviceIoctlRequest,
+    DevmgrdDeviceIoctlResponse, DevmgrdDeviceOpenRequest, DevmgrdDeviceOpenResponse,
+    DevmgrdIpcRequest, DevmgrdIpcResponse, DevmgrdNodeEntry, IpcReplyWithHandlesArgs,
+    RustosDeviceIoctlBrokerArgs, RustosDeviceOpenBrokerArgs,
+    COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_EVENT_SUBSCRIBE, COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_MAP,
+    COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_OPEN, COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_REGISTRY,
+    COMMERCIAL_MAX_DEVMGRD_OP_IOCTL_AUTHORIZE, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_DEVMGRD, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
     DEVMGRD_DEVICE_ACCESS_EVDEV, DEVMGRD_DEVICE_ACCESS_NATIVE, DEVMGRD_DEVICE_ID_CONSOLE,
     DEVMGRD_DEVICE_ID_DISPLAY, DEVMGRD_DEVICE_ID_INPUT, DEVMGRD_DEVICE_RIGHT_ADMIN,
     DEVMGRD_DEVICE_RIGHT_IOCTL, DEVMGRD_DEVICE_RIGHT_MAP, DEVMGRD_DEVICE_RIGHT_READ,
@@ -84,6 +90,10 @@ fn serve(endpoint: u64) {
                 let request = read_unaligned::<DevmgrdDeviceIoctlRequest>(&request);
                 reply_device_ioctl(reply_cap, &request)
             }
+            size if size == size_of::<CommercialMaxProtocolRequest>() => {
+                let request = read_unaligned::<CommercialMaxProtocolRequest>(&request);
+                reply_commercial_request(reply_cap, &request)
+            }
             _ => {
                 let response = DevmgrdIpcResponse {
                     status: libc::EINVAL,
@@ -101,6 +111,24 @@ fn serve(endpoint: u64) {
             let _ = writeln!(std::io::stderr(), "devmgrd: reply failed errno={}", -reply);
         }
     }
+}
+
+fn reply_commercial_request(reply_cap: u64, request: &CommercialMaxProtocolRequest) -> i64 {
+    let mut response = CommercialMaxProtocolResponse {
+        header: request.header,
+        ..CommercialMaxProtocolResponse::default()
+    };
+    response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    response.status = validate_commercial_request(request)
+        .and_then(|_| dispatch_commercial_request(request, &mut response))
+        .err()
+        .unwrap_or(0);
+    syscall3(
+        SYS_RUSTOS_IPC_REPLY,
+        reply_cap,
+        (&response as *const CommercialMaxProtocolResponse) as u64,
+        size_of::<CommercialMaxProtocolResponse>() as u64,
+    )
 }
 
 fn reply_device_ioctl(reply_cap: u64, request: &DevmgrdDeviceIoctlRequest) -> i64 {
@@ -240,7 +268,11 @@ fn validate_device_open_request(
         return Err(libc::EINVAL);
     }
     let path = validate_open_path(request)?;
-    let writable = request.open_flags & libc::O_ACCMODE as u64 != libc::O_RDONLY as u64;
+    device_open_policy(path, request.open_flags)
+}
+
+fn device_open_policy(path: &str, open_flags: u64) -> Result<DeviceOpenPolicy, i32> {
+    let writable = open_flags & libc::O_ACCMODE as u64 != libc::O_RDONLY as u64;
     match path {
         "/dev/console0" => Ok(DeviceOpenPolicy {
             device_id: DEVMGRD_DEVICE_ID_CONSOLE,
@@ -318,7 +350,74 @@ fn is_policy_owned_ioctl(request_number: u64) -> bool {
             | rustos_user_abi::console::CONSOLE_IOCTL_CLOSE_SESSION
             | rustos_user_abi::console::CONSOLE_IOCTL_BIND_CURRENT_SESSION
             | rustos_user_abi::console::CONSOLE_IOCTL_SET_SESSION_STATE
+            | rustos_user_abi::console::CONSOLE_IOCTL_SET_FOCUS
     )
+}
+
+fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result<(), i32> {
+    if request.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
+        || request.header.protocol != COMMERCIAL_MAX_PROTOCOL_DEVMGRD
+        || request.header.flags != 0
+        || request.path_len as usize > request.path.len()
+        || request.payload_len as usize > request.payload.len()
+    {
+        return Err(libc::EINVAL);
+    }
+    match request.header.op {
+        COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_REGISTRY
+        | COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_OPEN
+        | COMMERCIAL_MAX_DEVMGRD_OP_IOCTL_AUTHORIZE
+        | COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_MAP
+        | COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_EVENT_SUBSCRIBE => Ok(()),
+        _ => Err(libc::EINVAL),
+    }
+}
+
+fn dispatch_commercial_request(
+    request: &CommercialMaxProtocolRequest,
+    response: &mut CommercialMaxProtocolResponse,
+) -> Result<(), i32> {
+    match request.header.op {
+        COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_REGISTRY => {
+            fill_device_descriptors(response, DEVICE_DESCRIPTORS);
+            Ok(())
+        }
+        COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_OPEN => {
+            let path = commercial_request_path(request)?;
+            let policy = device_open_policy(path, request.arg0)?;
+            response.descriptor_count = 1;
+            response.descriptors[0] = device_descriptor(path, policy);
+            response.capability = device_capability(path, policy);
+            response.value0 = policy.device_id as u64;
+            response.value1 = policy.rights;
+            Ok(())
+        }
+        COMMERCIAL_MAX_DEVMGRD_OP_IOCTL_AUTHORIZE => {
+            if is_policy_owned_ioctl(request.arg0) {
+                response.value0 = request.arg0;
+                Ok(())
+            } else {
+                Err(libc::ENOTTY)
+            }
+        }
+        COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_MAP => {
+            fill_device_descriptors(response, DISPLAY_DEVICE_DESCRIPTORS);
+            Ok(())
+        }
+        COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_EVENT_SUBSCRIBE => {
+            fill_device_descriptors(response, INPUT_DEVICE_DESCRIPTORS);
+            Ok(())
+        }
+        _ => Err(libc::EINVAL),
+    }
+}
+
+fn commercial_request_path(request: &CommercialMaxProtocolRequest) -> Result<&str, i32> {
+    let len = request.path_len as usize;
+    if len == 0 || len > request.path.len() {
+        return Err(libc::EINVAL);
+    }
+    std::str::from_utf8(&request.path[..len]).map_err(|_| libc::EINVAL)
 }
 
 fn validate_registry_request(request: &DevmgrdIpcRequest) -> Result<&str, i32> {
@@ -330,6 +429,124 @@ fn validate_registry_request(request: &DevmgrdIpcRequest) -> Result<&str, i32> {
         return Err(libc::EINVAL);
     }
     std::str::from_utf8(&request.path[..len]).map_err(|_| libc::EINVAL)
+}
+
+const DEVICE_DESCRIPTORS: &[(&str, DeviceOpenPolicy)] = &[
+    (
+        "/dev/console0",
+        DeviceOpenPolicy {
+            device_id: DEVMGRD_DEVICE_ID_CONSOLE,
+            access: DEVMGRD_DEVICE_ACCESS_NATIVE,
+            rights: DEVMGRD_DEVICE_RIGHT_READ
+                | DEVMGRD_DEVICE_RIGHT_WRITE
+                | DEVMGRD_DEVICE_RIGHT_IOCTL
+                | DEVMGRD_DEVICE_RIGHT_ADMIN
+                | DEVMGRD_DEVICE_RIGHT_MAP
+                | DEVMGRD_DEVICE_RIGHT_TRANSFER,
+        },
+    ),
+    (
+        "/dev/display0",
+        DeviceOpenPolicy {
+            device_id: DEVMGRD_DEVICE_ID_DISPLAY,
+            access: DEVMGRD_DEVICE_ACCESS_NATIVE,
+            rights: DEVMGRD_DEVICE_RIGHT_READ
+                | DEVMGRD_DEVICE_RIGHT_WRITE
+                | DEVMGRD_DEVICE_RIGHT_IOCTL
+                | DEVMGRD_DEVICE_RIGHT_ADMIN
+                | DEVMGRD_DEVICE_RIGHT_MAP
+                | DEVMGRD_DEVICE_RIGHT_TRANSFER,
+        },
+    ),
+    (
+        "/dev/dri/card0",
+        DeviceOpenPolicy {
+            device_id: DEVMGRD_DEVICE_ID_DISPLAY,
+            access: DEVMGRD_DEVICE_ACCESS_NATIVE,
+            rights: DEVMGRD_DEVICE_RIGHT_READ
+                | DEVMGRD_DEVICE_RIGHT_WRITE
+                | DEVMGRD_DEVICE_RIGHT_IOCTL
+                | DEVMGRD_DEVICE_RIGHT_ADMIN
+                | DEVMGRD_DEVICE_RIGHT_MAP
+                | DEVMGRD_DEVICE_RIGHT_TRANSFER,
+        },
+    ),
+    (
+        "/dev/input0",
+        DeviceOpenPolicy {
+            device_id: DEVMGRD_DEVICE_ID_INPUT,
+            access: DEVMGRD_DEVICE_ACCESS_NATIVE,
+            rights: DEVMGRD_DEVICE_RIGHT_READ | DEVMGRD_DEVICE_RIGHT_TRANSFER,
+        },
+    ),
+    (
+        "/dev/input/event0",
+        DeviceOpenPolicy {
+            device_id: DEVMGRD_DEVICE_ID_INPUT,
+            access: DEVMGRD_DEVICE_ACCESS_EVDEV,
+            rights: DEVMGRD_DEVICE_RIGHT_READ | DEVMGRD_DEVICE_RIGHT_TRANSFER,
+        },
+    ),
+];
+
+const DISPLAY_DEVICE_DESCRIPTORS: &[(&str, DeviceOpenPolicy)] =
+    &[DEVICE_DESCRIPTORS[1], DEVICE_DESCRIPTORS[2]];
+const INPUT_DEVICE_DESCRIPTORS: &[(&str, DeviceOpenPolicy)] =
+    &[DEVICE_DESCRIPTORS[3], DEVICE_DESCRIPTORS[4]];
+
+fn fill_device_descriptors(
+    response: &mut CommercialMaxProtocolResponse,
+    descriptors: &[(&str, DeviceOpenPolicy)],
+) {
+    let count = descriptors
+        .len()
+        .min(COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS);
+    response.descriptor_count = count as u16;
+    response.value0 = descriptors.len() as u64;
+    for (index, (path, policy)) in descriptors.iter().take(count).enumerate() {
+        response.descriptors[index] = device_descriptor(path, *policy);
+    }
+}
+
+fn device_descriptor(path: &str, policy: DeviceOpenPolicy) -> CommercialMaxProtocolDescriptorWire {
+    let mut descriptor = CommercialMaxProtocolDescriptorWire {
+        protocol: COMMERCIAL_MAX_PROTOCOL_DEVMGRD,
+        op: COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_OPEN,
+        service_id: policy.device_id as u64,
+        capability_mask: policy.rights,
+        value0: policy.access as u64,
+        value1: policy.rights,
+        ..CommercialMaxProtocolDescriptorWire::default()
+    };
+    copy_label(
+        path.as_bytes(),
+        &mut descriptor.name,
+        &mut descriptor.name_len,
+    );
+    descriptor
+}
+
+fn device_capability(path: &str, policy: DeviceOpenPolicy) -> CommercialMaxCapabilityLeaseWire {
+    let mut capability = CommercialMaxCapabilityLeaseWire {
+        lease_id: policy.device_id as u64,
+        service_id: IPC_SERVICE_DEVMGRD,
+        capability_mask: policy.rights,
+        rights_mask: policy.rights,
+        generation: policy.access as u64,
+        ..CommercialMaxCapabilityLeaseWire::default()
+    };
+    copy_label(
+        path.as_bytes(),
+        &mut capability.label,
+        &mut capability.label_len,
+    );
+    capability
+}
+
+fn copy_label(src: &[u8], dest: &mut [u8], len: &mut u16) {
+    let count = src.len().min(dest.len());
+    dest[..count].copy_from_slice(&src[..count]);
+    *len = count as u16;
 }
 
 fn lookup_device_node(path: &str, response: &mut DevmgrdIpcResponse) -> i32 {

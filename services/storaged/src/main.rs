@@ -1,17 +1,23 @@
 use std::io::Write;
 use std::mem::size_of;
+use std::slice;
 use std::thread;
 use std::time::Duration;
 
 use rustos_user_abi::syscall::{
-    BootExtentLeaseWire, BootExtentWire, RustosBootExtentBrokerArgs, StorageBlockDescriptorWire,
-    StorageListBrokerArgs, StoragedRequest, StoragedResponse, BOOT_EXTENT_FLAG_READONLY,
-    BOOT_EXTENT_MAX_EXTENTS, BOOT_EXTENT_PATH_CAPACITY, IPC_SERVICE_STORAGED,
-    STORAGED_IPC_ABI_VERSION, STORAGED_OP_BOOT_EXTENT_LOOKUP, STORAGED_OP_LIST_COUNT,
-    STORAGED_OP_LIST_GET, STORAGED_OP_PING, STORAGED_OP_ROOT_STATUS, STORAGE_LIST_MAX_DESCRIPTORS,
-    SYS_RUSTOS_BOOT_EXTENT_BROKER, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
-    SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
-    SYS_RUSTOS_STORAGE_LIST_BROKER,
+    BootExtentLeaseWire, BootExtentWire, CommercialMaxCapabilityLeaseWire,
+    CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
+    CommercialMaxProtocolResponse, StorageBlockDescriptorWire, StorageListBrokerArgs,
+    StoragedRequest, StoragedResponse, BOOT_EXTENT_FLAG_READONLY, BOOT_EXTENT_MAX_EXTENTS,
+    BOOT_EXTENT_PATH_CAPACITY, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_STORAGED,
+    COMMERCIAL_MAX_STORAGED_OP_BLOCK_INVENTORY, COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE,
+    COMMERCIAL_MAX_STORAGED_OP_PARTITION_SCAN, COMMERCIAL_MAX_STORAGED_OP_ROOT_VOLUME_SELECT,
+    COMMERCIAL_MAX_STORAGED_OP_VOLUME_METADATA, IPC_SERVICE_STORAGED, STORAGED_IPC_ABI_VERSION,
+    STORAGED_OP_BOOT_EXTENT_LOOKUP, STORAGED_OP_LIST_COUNT, STORAGED_OP_LIST_GET, STORAGED_OP_PING,
+    STORAGED_OP_ROOT_STATUS, STORAGE_LIST_MAX_DESCRIPTORS, SYS_RUSTOS_DEBUG_PRINT,
+    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_STORAGE_LIST_BROKER,
 };
 
 const RECV_BACKOFF: Duration = Duration::from_millis(50);
@@ -47,37 +53,72 @@ fn main() {
 
 fn serve(endpoint: u64) {
     loop {
-        let mut request = StoragedRequest::default();
+        let mut request = CommercialMaxProtocolRequest::default();
         let mut reply_cap = 0_u64;
         let received = syscall4(
             SYS_RUSTOS_IPC_RECV,
             endpoint,
-            (&mut request as *mut StoragedRequest) as u64,
-            size_of::<StoragedRequest>() as u64,
+            (&mut request as *mut CommercialMaxProtocolRequest) as u64,
+            size_of::<CommercialMaxProtocolRequest>() as u64,
             (&mut reply_cap as *mut u64) as u64,
         );
         if received < 0 {
             thread::sleep(RECV_BACKOFF);
             continue;
         }
-        let mut response = StoragedResponse {
-            version: STORAGED_IPC_ABI_VERSION,
-            op: request.op,
-            ..StoragedResponse::default()
-        };
-        response.status = match validate(received as usize, &request) {
-            Ok(()) => dispatch(&request, &mut response),
-            Err(errno) => errno,
-        };
-        let reply = syscall3(
-            SYS_RUSTOS_IPC_REPLY,
-            reply_cap,
-            (&response as *const StoragedResponse) as u64,
-            size_of::<StoragedResponse>() as u64,
-        );
-        if reply < 0 {
-            let _ = writeln!(std::io::stderr(), "storaged: reply failed errno={}", -reply);
+        if received as usize == size_of::<CommercialMaxProtocolRequest>() {
+            reply_commercial_request(reply_cap, &request);
+            continue;
         }
+        if received as usize != size_of::<StoragedRequest>() {
+            continue;
+        }
+        let legacy = unsafe {
+            &*((&request as *const CommercialMaxProtocolRequest).cast::<StoragedRequest>())
+        };
+        reply_legacy_request(reply_cap, legacy, received as usize);
+    }
+}
+
+fn reply_legacy_request(reply_cap: u64, request: &StoragedRequest, received: usize) {
+    let mut response = StoragedResponse {
+        version: STORAGED_IPC_ABI_VERSION,
+        op: request.op,
+        ..StoragedResponse::default()
+    };
+    response.status = match validate(received as usize, &request) {
+        Ok(()) => dispatch(&request, &mut response),
+        Err(errno) => errno,
+    };
+    let reply = syscall3(
+        SYS_RUSTOS_IPC_REPLY,
+        reply_cap,
+        (&response as *const StoragedResponse) as u64,
+        size_of::<StoragedResponse>() as u64,
+    );
+    if reply < 0 {
+        let _ = writeln!(std::io::stderr(), "storaged: reply failed errno={}", -reply);
+    }
+}
+
+fn reply_commercial_request(reply_cap: u64, request: &CommercialMaxProtocolRequest) {
+    let mut response = CommercialMaxProtocolResponse {
+        header: request.header,
+        ..CommercialMaxProtocolResponse::default()
+    };
+    response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    response.status = validate_commercial_request(request)
+        .and_then(|_| dispatch_commercial(request, &mut response))
+        .err()
+        .unwrap_or(0);
+    let reply = syscall3(
+        SYS_RUSTOS_IPC_REPLY,
+        reply_cap,
+        (&response as *const CommercialMaxProtocolResponse) as u64,
+        size_of::<CommercialMaxProtocolResponse>() as u64,
+    );
+    if reply < 0 {
+        let _ = writeln!(std::io::stderr(), "storaged: reply failed errno={}", -reply);
     }
 }
 
@@ -127,6 +168,40 @@ fn dispatch(request: &StoragedRequest, response: &mut StoragedResponse) -> i32 {
     }
 }
 
+fn dispatch_commercial(
+    request: &CommercialMaxProtocolRequest,
+    response: &mut CommercialMaxProtocolResponse,
+) -> Result<(), i32> {
+    match request.header.op {
+        COMMERCIAL_MAX_STORAGED_OP_BLOCK_INVENTORY | COMMERCIAL_MAX_STORAGED_OP_PARTITION_SCAN => {
+            let descriptors = list_descriptors()?;
+            response.value0 = descriptors.len() as u64;
+            fill_storage_descriptors(&descriptors, request.header.op, response);
+            Ok(())
+        }
+        COMMERCIAL_MAX_STORAGED_OP_ROOT_VOLUME_SELECT
+        | COMMERCIAL_MAX_STORAGED_OP_VOLUME_METADATA => {
+            let descriptor = selected_root_descriptor()?;
+            response.value0 = descriptor.id as u64;
+            response.descriptor_count = 1;
+            response.descriptors[0] = storage_descriptor(&descriptor, request.header.op);
+            response.capability = storage_capability(&descriptor, request.header.op);
+            response.payload_len = write_payload_struct(&descriptor, &mut response.payload);
+            Ok(())
+        }
+        COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE => {
+            let storaged_request = storaged_request_from_commercial(request)?;
+            let lease = boot_extent_lookup(&storaged_request)?;
+            response.value0 = lease.file_len;
+            response.value1 = lease.hash_or_generation;
+            response.capability = boot_extent_capability(&lease);
+            response.payload_len = write_payload_struct(&lease, &mut response.payload);
+            Ok(())
+        }
+        _ => Err(libc::EINVAL),
+    }
+}
+
 fn selected_root_descriptor() -> Result<StorageBlockDescriptorWire, i32> {
     let descriptors = list_descriptors()?;
     descriptors.first().copied().ok_or(libc::ENODEV)
@@ -144,37 +219,24 @@ fn boot_extent_lookup(request: &StoragedRequest) -> Result<BootExtentLeaseWire, 
         ..BootExtentLeaseWire::default()
     };
     lease.path[..len].copy_from_slice(&request.path[..len]);
-    if let Some(registry_lease) = boot_extent_lookup_registry(path, &request.path[..len])? {
-        return Ok(registry_lease);
-    }
-    let args = RustosBootExtentBrokerArgs {
-        abi_version: STORAGED_IPC_ABI_VERSION,
-        flags: 0,
-        reserved0: 0,
-        path_ptr: path.as_ptr() as u64,
-        path_len: len as u64,
-        out_lease_ptr: (&mut lease as *mut BootExtentLeaseWire) as u64,
-    };
-    let result = syscall1(
-        SYS_RUSTOS_BOOT_EXTENT_BROKER,
-        (&args as *const RustosBootExtentBrokerArgs) as u64,
-    );
-    if result < 0 {
-        return Err(last_errno());
-    }
+    let registry_lease = boot_extent_lookup_registry(path, &request.path[..len])?;
+    lease.file_len = registry_lease.file_len;
+    lease.hash_or_generation = registry_lease.hash_or_generation;
+    lease.extent_count = registry_lease.extent_count;
+    lease.extents = registry_lease.extents;
     Ok(lease)
 }
 
 fn boot_extent_lookup_registry(
     request_path: &str,
     request_path_bytes: &[u8],
-) -> Result<Option<BootExtentLeaseWire>, i32> {
+) -> Result<BootExtentLeaseWire, i32> {
     let Some(normalized) = normalize_extent_path(request_path) else {
         return Err(libc::EINVAL);
     };
     let text = match std::fs::read_to_string(ROOT_FILE_EXTENTS_REGISTRY_PATH) {
         Ok(text) => text,
-        Err(_) => return Ok(None),
+        Err(_) => return Err(libc::ENOENT),
     };
     for raw_line in text.lines() {
         let line = raw_line.trim();
@@ -207,9 +269,9 @@ fn boot_extent_lookup_registry(
         for (dest, src) in lease.extents.iter_mut().zip(extents.iter()) {
             *dest = *src;
         }
-        return Ok(Some(lease));
+        return Ok(lease);
     }
-    Ok(None)
+    Err(libc::ENOENT)
 }
 
 fn normalize_extent_path(path: &str) -> Option<&str> {
@@ -302,6 +364,133 @@ fn validate(received: usize, request: &StoragedRequest) -> Result<(), i32> {
         STORAGED_OP_BOOT_EXTENT_LOOKUP => Ok(()),
         _ => Err(libc::EINVAL),
     }
+}
+
+fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result<(), i32> {
+    if request.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
+        || request.header.protocol != COMMERCIAL_MAX_PROTOCOL_STORAGED
+        || request.header.flags != 0
+        || request.path_len as usize > request.path.len()
+        || request.payload_len as usize > request.payload.len()
+    {
+        return Err(libc::EINVAL);
+    }
+    match request.header.op {
+        COMMERCIAL_MAX_STORAGED_OP_BLOCK_INVENTORY
+        | COMMERCIAL_MAX_STORAGED_OP_PARTITION_SCAN
+        | COMMERCIAL_MAX_STORAGED_OP_ROOT_VOLUME_SELECT
+        | COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE
+        | COMMERCIAL_MAX_STORAGED_OP_VOLUME_METADATA => Ok(()),
+        _ => Err(libc::EINVAL),
+    }
+}
+
+fn storaged_request_from_commercial(
+    request: &CommercialMaxProtocolRequest,
+) -> Result<StoragedRequest, i32> {
+    let len = request.path_len as usize;
+    if len == 0 || len > BOOT_EXTENT_PATH_CAPACITY {
+        return Err(libc::EINVAL);
+    }
+    let mut storaged_request = StoragedRequest {
+        version: STORAGED_IPC_ABI_VERSION,
+        op: STORAGED_OP_BOOT_EXTENT_LOOKUP,
+        path_len: len as u32,
+        ..StoragedRequest::default()
+    };
+    storaged_request.path[..len].copy_from_slice(&request.path[..len]);
+    Ok(storaged_request)
+}
+
+fn fill_storage_descriptors(
+    descriptors: &[StorageBlockDescriptorWire],
+    op: u16,
+    response: &mut CommercialMaxProtocolResponse,
+) {
+    let count = descriptors
+        .len()
+        .min(COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS);
+    response.descriptor_count = count as u16;
+    for (index, descriptor) in descriptors.iter().take(count).enumerate() {
+        response.descriptors[index] = storage_descriptor(descriptor, op);
+    }
+}
+
+fn storage_descriptor(
+    descriptor: &StorageBlockDescriptorWire,
+    op: u16,
+) -> CommercialMaxProtocolDescriptorWire {
+    let mut wire = CommercialMaxProtocolDescriptorWire {
+        protocol: COMMERCIAL_MAX_PROTOCOL_STORAGED,
+        op,
+        flags: descriptor.flags,
+        service_id: descriptor.id as u64,
+        capability_mask: storaged_capability_mask(op),
+        value0: descriptor.block_count,
+        value1: descriptor.start_block,
+        ..CommercialMaxProtocolDescriptorWire::default()
+    };
+    let name_len = (descriptor.path_len as usize)
+        .min(descriptor.path.len())
+        .min(wire.name.len());
+    wire.name_len = name_len as u16;
+    wire.name[..name_len].copy_from_slice(&descriptor.path[..name_len]);
+    wire
+}
+
+fn storage_capability(
+    descriptor: &StorageBlockDescriptorWire,
+    op: u16,
+) -> CommercialMaxCapabilityLeaseWire {
+    let mut wire = CommercialMaxCapabilityLeaseWire {
+        lease_id: descriptor.id as u64,
+        service_id: IPC_SERVICE_STORAGED,
+        capability_mask: storaged_capability_mask(op),
+        rights_mask: storaged_capability_mask(op),
+        generation: descriptor.id as u64,
+        ..CommercialMaxCapabilityLeaseWire::default()
+    };
+    let label_len = (descriptor.path_len as usize)
+        .min(descriptor.path.len())
+        .min(wire.label.len());
+    wire.label_len = label_len as u16;
+    wire.label[..label_len].copy_from_slice(&descriptor.path[..label_len]);
+    wire
+}
+
+fn boot_extent_capability(lease: &BootExtentLeaseWire) -> CommercialMaxCapabilityLeaseWire {
+    let mut wire = CommercialMaxCapabilityLeaseWire {
+        lease_id: lease.hash_or_generation,
+        service_id: IPC_SERVICE_STORAGED,
+        capability_mask: storaged_capability_mask(COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE),
+        rights_mask: storaged_capability_mask(COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE),
+        generation: lease.hash_or_generation,
+        ..CommercialMaxCapabilityLeaseWire::default()
+    };
+    let label_len = (lease.path_len as usize)
+        .min(lease.path.len())
+        .min(wire.label.len());
+    wire.label_len = label_len as u16;
+    wire.label[..label_len].copy_from_slice(&lease.path[..label_len]);
+    wire
+}
+
+fn storaged_capability_mask(op: u16) -> u64 {
+    match op {
+        COMMERCIAL_MAX_STORAGED_OP_BLOCK_INVENTORY => 1 << 0,
+        COMMERCIAL_MAX_STORAGED_OP_PARTITION_SCAN => 1 << 1,
+        COMMERCIAL_MAX_STORAGED_OP_ROOT_VOLUME_SELECT => 1 << 2,
+        COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE => 1 << 3,
+        COMMERCIAL_MAX_STORAGED_OP_VOLUME_METADATA => 1 << 4,
+        _ => 0,
+    }
+}
+
+fn write_payload_struct<T>(value: &T, dest: &mut [u8]) -> u32 {
+    let bytes = unsafe { slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
+    let count = bytes.len().min(dest.len());
+    dest[..count].copy_from_slice(&bytes[..count]);
+    count as u32
 }
 
 fn syscall0(number: u64) -> i64 {

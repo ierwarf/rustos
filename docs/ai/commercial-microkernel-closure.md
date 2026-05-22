@@ -145,13 +145,31 @@ As of the strict Tier 0 + Tier 1 closure pass:
 - Commercial-max marked-only projection: `kernel` 45646 before residual broker
   shells and new service/shared-ABI overhead.
 
-Migration cadence reality (added 2026-05-20): the commercial-max wave is gated
-on protocols listed in **Service Protocol Target** that do not yet exist in
-shared ABI crates. Removing markers without those protocols would falsify
-closure state. The next actionable wave is to land one protocol pair at a
-time (e.g. `inputd::InputIngest` + `EvdevTranslate`), migrate the policy that
-sits behind it, then retire the corresponding marker. Expect ~500-1500
-validated LOC of net migration per protocol pair, not per session.
+2026-05-22 commercial-max protocol snapshot:
+
+- Current source LOC: `kernel` 69605, `services` 22618, total 92223
+  (`rustos-user-abi` carries 3997 source LOC after the shared Linux ABI move).
+- Commercial-max live migration markers remaining: 22509 LOC. The largest
+  remaining marked surfaces are `usb/xhci.rs` 2126,
+  `process/linux.rs` 1297, `proc_broker_ops.rs` 1210,
+  `virtio_gpu.rs` 1195, `ipc_ops.rs` 1063, `serio.rs` 999,
+  `ps/user/socket.rs` 956, and `compat/user/socket.rs` 931.
+- Current marked-only projection: `kernel` 47096 before residual broker shells
+  and any additional service/shared-ABI overhead.
+- The shared commercial-max protocol envelope is now implemented by the current
+  service owners for `rootd`, `procd`, `loaderd`, `syscalld`, `vfsd`,
+  `devmgrd`, `inputd`, `storaged`, `netd`, `driverd`, `sessiond` via
+  `runtimed`, `pagerd` via `syscalld`, and non-`.ko` `service-driverd` via
+  `driverd`. This does not mean all marked ring0 policy has moved; it means
+  the ABI/control-plane precondition is no longer the primary blocker.
+
+Migration cadence reality: the commercial-max protocol envelope exists, but
+removing markers without moving the policy behind each protocol would falsify
+closure state. The next actionable wave is to move one live policy area at a
+time behind its service protocol (for example USB HID policy into `inputd`,
+or endpoint/capability policy into `rootd`/capability service), then retire the
+corresponding marker after validation. Expect ~500-1500 validated LOC of net
+migration per policy slice, not per session.
 
 This marked projection includes Tier 0 plus the Tier 1 live-code references
 listed below. It is still a migration budget, not a claim that all code can be
@@ -270,10 +288,11 @@ Move these policy blocks after their protocols are in place:
   exec tickets, fork/thread plans, wait/signal/session policy. Target:
   `procd`/`loaderd`. Ring0 keeps pinned backing, address-space commit, register
   transition, and task mutation.
-- `kernel/ps/src/user/linux.rs` and `kernel/compat/src/user/linux.rs`: Linux ABI
-  process/thread defaults, aux state ownership, signal defaults, and cold ABI
-  policy. Stable ABI structs may move to a shared crate; scheduler-facing task
-  state remains ring0.
+- `libs/rustos-user-abi/src/linux.rs`: Linux ABI process/thread defaults,
+  aux state, signal defaults, runtime profile normalization, and the supported
+  syscall-number table now live in the shared ABI crate. Kernel
+  `ps/user/linux.rs` and `compat/user/linux.rs` re-export it; scheduler-facing
+  task state still remains ring0.
 - `kernel/compat/src/user/syscall/linux/service_ops.rs`: cold syscall routing,
   bootstrap fallback policy, service discovery fallback, Linux compatibility
   defaults, and fd/device dispatch policy. Target: `syscalld`, `rootd`,

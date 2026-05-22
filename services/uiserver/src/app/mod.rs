@@ -8,7 +8,7 @@ pub(crate) use runtime::start_console_refresh_worker;
 use std::os::fd::OwnedFd;
 use std::string::String;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::vec::Vec;
 
 use crate::canvas;
@@ -384,7 +384,6 @@ pub(crate) struct AppState {
     dragging_window: Option<DragTarget>,
     drag_offset_x: usize,
     drag_offset_y: usize,
-    pub(crate) next_drag_update_at: Option<Instant>,
 }
 
 fn align_up(value: usize, align: usize) -> Option<usize> {
