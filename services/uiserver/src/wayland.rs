@@ -24,6 +24,10 @@ use wayland_server::{
 };
 
 use crate::canvas::Rect;
+use crate::layout::{
+    self, clamp_wayland_frame, wayland_client_size_for_buffer, wayland_max_client_size,
+    WINDOW_BORDER, WINDOW_TITLE_HEIGHT,
+};
 use crate::sys::{
     diag_line, map_shared_fd_readable, InputEvent, SharedFdMapping, INPUT_ACTION_PRESSED,
     INPUT_ACTION_RELEASED, INPUT_ACTION_REPEATED, INPUT_KIND_KEYBOARD,
@@ -33,7 +37,6 @@ const WAYLAND_SOCKET_NAME: &str = "wayland-0";
 const WINDOW_CASCADE_X: usize = 42;
 const WINDOW_CASCADE_Y: usize = 30;
 const WINDOW_CASCADE_SLOTS: usize = 6;
-const WINDOW_TITLEBAR_HEIGHT: usize = 36;
 const LINUX_BTN_LEFT: u32 = 0x110;
 const MAX_WAYLAND_SHM_POOL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_WAYLAND_BUFFER_DIMENSION: usize = 8192;
@@ -217,6 +220,13 @@ impl WaylandCompositor {
 
     pub(crate) fn set_surface_minimized(&mut self, surface_id: u32, minimized: bool) -> bool {
         self.state.set_surface_minimized(surface_id, minimized)
+    }
+
+    /// Toggle the surface's maximized state. The first call snapshots the
+    /// current frame and resizes it to fill the desktop region; the second
+    /// call restores the snapshot.
+    pub(crate) fn toggle_surface_maximized(&mut self, surface_id: u32) -> bool {
+        self.state.toggle_surface_maximized(surface_id)
     }
 
     pub(crate) fn close_surface(&mut self, surface_id: u32) -> bool {
@@ -538,17 +548,31 @@ impl WaylandState {
     }
 
     fn allocate_window_frame(&mut self) -> Rect {
-        let width = (self.display_width as usize).saturating_mul(11) / 20;
-        let height = (self.display_height as usize).saturating_mul(3) / 5;
+        let (max_w, max_h) = wayland_max_client_size(self.display_width, self.display_height);
+        // The hint we send to clients is "use 11/20 by 3/5 of the screen",
+        // but a misbehaving client may keep its own size — so the hint here
+        // also doubles as the upper bound we render at.
+        let suggested_w = ((self.display_width as usize).saturating_mul(11) / 20).min(max_w);
+        let suggested_h = ((self.display_height as usize).saturating_mul(3) / 5).min(max_h);
+
         let index = self.next_surface_index;
         self.next_surface_index = self.next_surface_index.saturating_add(1);
         let step = index % WINDOW_CASCADE_SLOTS;
-        Rect {
-            x: 72 + step * WINDOW_CASCADE_X,
-            y: 84 + step * WINDOW_CASCADE_Y,
-            width,
-            height,
-        }
+
+        let desktop = layout::desktop_bounds(self.display_width, self.display_height);
+        let x = desktop.x + step * WINDOW_CASCADE_X;
+        let y = desktop.y + step * WINDOW_CASCADE_Y;
+
+        clamp_wayland_frame(
+            Rect {
+                x,
+                y,
+                width: suggested_w,
+                height: suggested_h,
+            },
+            self.display_width,
+            self.display_height,
+        )
     }
 
     fn create_surface_data(&mut self) -> Option<SurfaceData> {
@@ -872,11 +896,18 @@ impl WaylandState {
             let Some(client_id) = surface.client_id.clone() else {
                 continue;
             };
+            // The compositor clamps `surface.frame` to the available desktop
+            // region; the client buffer might be larger but only the clamped
+            // area is actually rendered. Hit-test against that visible area so
+            // clicks outside the painted chrome can't fake-hit invisible
+            // pixels.
+            let visible_w = surface.width.min(surface.frame.width);
+            let visible_h = surface.height.min(surface.frame.height);
             let client_rect = Rect {
-                x: surface.frame.x + 1,
-                y: surface.frame.y + WINDOW_TITLEBAR_HEIGHT + 1,
-                width: surface.width,
-                height: surface.height,
+                x: surface.frame.x + WINDOW_BORDER,
+                y: surface.frame.y + WINDOW_TITLE_HEIGHT + WINDOW_BORDER,
+                width: visible_w,
+                height: visible_h,
             };
             if !client_rect.contains(x, y) {
                 continue;
@@ -1209,14 +1240,26 @@ impl WaylandState {
         let Some(shared) = self.find_surface_by_protocol_id(surface_id) else {
             return false;
         };
+        let display_width = self.display_width;
+        let display_height = self.display_height;
         let Ok(mut state) = shared.lock() else {
             return false;
         };
-        if state.frame.x == x && state.frame.y == y {
+        let clamped = clamp_wayland_frame(
+            Rect {
+                x,
+                y,
+                width: state.frame.width,
+                height: state.frame.height,
+            },
+            display_width,
+            display_height,
+        );
+        if state.frame.x == clamped.x && state.frame.y == clamped.y {
             return false;
         }
-        state.frame.x = x;
-        state.frame.y = y;
+        state.frame.x = clamped.x;
+        state.frame.y = clamped.y;
         drop(state);
         self.mark_dirty();
         true
@@ -1243,6 +1286,45 @@ impl WaylandState {
         } else if let Some(object_id) = object_id {
             self.bring_surface_to_front(object_id);
         }
+        self.mark_dirty();
+        true
+    }
+
+    fn toggle_surface_maximized(&mut self, surface_id: u32) -> bool {
+        let Some(shared) = self.find_surface_by_protocol_id(surface_id) else {
+            return false;
+        };
+        let display_width = self.display_width;
+        let display_height = self.display_height;
+        let Ok(mut state) = shared.lock() else {
+            return false;
+        };
+        let next_frame = if let Some(saved) = state.pre_maximize_frame.take() {
+            // Restore: send the saved client size back to the client so it
+            // re-renders at the original dimensions if it respects configure.
+            clamp_wayland_frame(saved, display_width, display_height)
+        } else {
+            state.pre_maximize_frame = Some(state.frame);
+            let bounds = layout::desktop_bounds(display_width, display_height);
+            clamp_wayland_frame(
+                Rect {
+                    x: bounds.x,
+                    y: bounds.y,
+                    width: bounds.width.saturating_sub(WINDOW_BORDER * 2),
+                    height: bounds
+                        .height
+                        .saturating_sub(WINDOW_BORDER * 2 + WINDOW_TITLE_HEIGHT),
+                },
+                display_width,
+                display_height,
+            )
+        };
+        if state.frame == next_frame {
+            return false;
+        }
+        state.frame = next_frame;
+        drop(state);
+        self.send_toplevel_configure(&shared);
         self.mark_dirty();
         true
     }
@@ -1343,6 +1425,9 @@ struct WaylandSurfaceState {
     title: String,
     frame: Rect,
     minimized: bool,
+    /// `Some(frame)` while the surface is currently maximized; storing the
+    /// pre-maximize frame lets the next maximize click restore it.
+    pre_maximize_frame: Option<Rect>,
     resource: Option<wl_surface::WlSurface>,
     client_id: Option<ClientId>,
     xdg_surface: Option<xdg_surface::XdgSurface>,
@@ -2092,6 +2177,8 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
 
                 if let Some(copy_source) = copy_source {
                     let copied = copy_source.copy_pixels();
+                    let display_width = state.display_width;
+                    let display_height = state.display_height;
                     if let Ok(mut surface) = data.shared.lock() {
                         if let Some((pixels, width, height, stride_pixels)) = copied {
                             surface.current_buffer = Some(copy_source);
@@ -2100,8 +2187,28 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
                             surface.height = height;
                             surface.stride_pixels = stride_pixels;
                             surface.content_version = next_content_version(surface.content_version);
-                            surface.frame.width = width.max(surface.frame.width.min(width));
-                            surface.frame.height = height.max(surface.frame.height.min(height));
+                            // Clamp the rendered chrome to the desktop region.
+                            // The client buffer may be bigger than this (e.g.
+                            // wayclick hardcodes 800×520 and ignores our
+                            // configure); in that case the buffer is cropped
+                            // to what the chrome can show.
+                            let (visible_w, visible_h) = wayland_client_size_for_buffer(
+                                width,
+                                height,
+                                display_width,
+                                display_height,
+                            );
+                            let clamped = clamp_wayland_frame(
+                                Rect {
+                                    x: surface.frame.x,
+                                    y: surface.frame.y,
+                                    width: visible_w,
+                                    height: visible_h,
+                                },
+                                display_width,
+                                display_height,
+                            );
+                            surface.frame = clamped;
                             surface.last_damage = if has_damage {
                                 committed_damage_rect
                             } else {

@@ -147,14 +147,14 @@ As of the strict Tier 0 + Tier 1 closure pass:
 
 2026-05-22 commercial-max protocol snapshot:
 
-- Current source LOC: `kernel` 69539, `services` 22618, total 92157
+- Current source LOC: `kernel` 67299, `services` 23143, total 90442
   (`rustos-user-abi` carries 3875 source LOC after the shared Linux ABI move).
-- Commercial-max live migration markers remaining: 22497 LOC. The largest
+- Commercial-max live migration markers remaining: 21397 LOC. The largest
   remaining marked surfaces are `usb/xhci.rs` 2126,
   `process/linux.rs` 1297, `proc_broker_ops.rs` 1210,
   `virtio_gpu.rs` 1195, `ipc_ops.rs` 1063, `serio.rs` 999,
-  `ps/user/socket.rs` 956, and `compat/user/socket.rs` 931.
-- Current marked-only projection: `kernel` 47042 before residual broker shells
+  and `ps/user/socket.rs` 956.
+- Current marked-only projection: `kernel` 45902 before residual broker shells
   and any additional service/shared-ABI overhead.
 - The shared commercial-max protocol envelope is now implemented by the current
   service owners for `rootd`, `procd`, `loaderd`, `syscalld`, `vfsd`,
@@ -196,9 +196,10 @@ Tier 0 is already marked and high-confidence:
   boot-volume selection policy
 - `kernel/compat/src/user/syscall/linux/service_ops.rs`: rootd/loaderd/vfsd,
   inputd/devmgrd, and supervisor-owned bootstrap/syscall policy leftovers
-- `kernel/compat/src/user/process_state.rs` and
-  `kernel/compat/src/user/sysops/win32/memory.rs`: syscalld/loaderd-owned cold
-  Win32 metadata and memory policy
+- `kernel/compat/src/user/sysops/win32/memory.rs`: syscalld/loaderd-owned cold
+  Win32 memory policy. The old shadow process-state file under
+  `kernel/compat/src/user` has been retired; compat re-exports
+  `kernel_ps::api` process state.
 
 Tier 1 is now marked as strict-closure live-code references:
 
@@ -303,9 +304,10 @@ Move these policy blocks after their protocols are in place:
   `net_broker_ops.rs`: move policy validation, namespace lookup, timeout/default
   selection, and routing into `syscalld`, `procd`, `vfsd`, and `netd`. Ring0
   keeps privileged MM commits and raw wake/copy primitives.
-- `kernel/compat/src/user/socket.rs` and `kernel/ps/src/user/socket.rs`: socket
-  namespace, option policy, bind/connect/listen routing, and fd transfer belong
-  in `netd`. Ring0 keeps kernel socket primitives and packet/device handoff.
+- `kernel/ps/src/user/socket.rs`: socket namespace, option policy,
+  bind/connect/listen routing, and fd transfer belong in `netd`. Ring0 keeps
+  kernel socket primitives and packet/device handoff. The old
+  `kernel/compat/src/user/socket.rs` shadow implementation has been retired.
 - `kernel/compat/src/user/sysops/device.rs` and device-facing
   `kernel/io-manager/src/io/device/*.rs`: `/dev` open policy, ioctl authority,
   and device metadata belong in `devmgrd`. Ring0 keeps current-process IO and

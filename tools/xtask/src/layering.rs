@@ -604,32 +604,19 @@ fn validate_kernel_source_boundaries(root_dir: &Path) -> Result<()> {
     let hal_rtc = fs::read_to_string(root_dir.join("kernel/hal/src/arch/rtc.rs"))?;
     assert_source_not_contains_any(&hal_rtc, "kernel/hal/src/arch/rtc.rs", &["kernel_ps::"])?;
 
-    let handles_rs = fs::read_to_string(root_dir.join("kernel/compat/src/user/handles.rs"))?;
-    assert_source_not_contains_any(
-        &handles_rs,
-        "kernel/compat/src/user/handles.rs",
-        &[
-            "#[cfg(rustos_building_kernel_compat)]",
-            "#[cfg(not(rustos_building_kernel_compat))]",
-            "crate::object_tokens::",
-            "kernel_object::api::{",
-        ],
-    )?;
-    if handles_rs.lines().count() > 250 {
-        bail!("kernel compat handles.rs remains too large after object split");
-    }
-
-    let compat_abi = fs::read_to_string(root_dir.join("kernel/compat/src/user/abi.rs"))?;
-    assert_source_not_contains_any(
-        &compat_abi,
+    for retired_shadow_file in [
         "kernel/compat/src/user/abi.rs",
-        &[
-            "#[cfg(rustos_building_kernel_compat)]",
-            "#[cfg(not(rustos_building_kernel_compat))]",
-            concat!("kernel_base", "::user_abi::UserAbi"),
-            "crate::user_abi::UserAbi",
-        ],
-    )?;
+        "kernel/compat/src/user/epoll.rs",
+        "kernel/compat/src/user/handles.rs",
+        "kernel/compat/src/user/linux.rs",
+        "kernel/compat/src/user/memfd.rs",
+        "kernel/compat/src/user/process_state.rs",
+        "kernel/compat/src/user/socket.rs",
+    ] {
+        if root_dir.join(retired_shadow_file).exists() {
+            bail!("{retired_shadow_file} should stay retired; use kernel_ps::api re-exports");
+        }
+    }
 
     for shared_util_file in [
         "kernel/io-manager/src/io/console.rs",

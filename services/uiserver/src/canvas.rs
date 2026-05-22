@@ -1,4 +1,5 @@
 use core::convert::Infallible;
+use std::sync::OnceLock;
 
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::geometry::{OriginDimensions, Size};
@@ -202,84 +203,120 @@ impl<'a> SurfaceCanvas<'a> {
         }
     }
 
-    pub(crate) fn stroke_rect(&mut self, rect: Rect, color: u32) {
-        if rect.is_empty() {
+    pub(crate) fn fill_rounded_rect_alpha(
+        &mut self,
+        rect: Rect,
+        color: u32,
+        alpha: u8,
+        radius: usize,
+    ) {
+        if alpha == 0 || rect.is_empty() {
             return;
         }
-        self.fill_rect(
-            Rect {
-                x: rect.x,
-                y: rect.y,
-                width: rect.width,
-                height: 1,
-            },
-            color,
-        );
-        self.fill_rect(
-            Rect {
-                x: rect.x,
-                y: rect.y.saturating_add(rect.height.saturating_sub(1)),
-                width: rect.width,
-                height: 1,
-            },
-            color,
-        );
-        self.fill_rect(
-            Rect {
-                x: rect.x,
-                y: rect.y,
-                width: 1,
-                height: rect.height,
-            },
-            color,
-        );
-        self.fill_rect(
-            Rect {
-                x: rect.x.saturating_add(rect.width.saturating_sub(1)),
-                y: rect.y,
-                width: 1,
-                height: rect.height,
-            },
-            color,
-        );
+        let r = radius
+            .min(rect.width / 2)
+            .min(rect.height / 2);
+        if r == 0 {
+            self.fill_rect_alpha(rect, color, alpha);
+            return;
+        }
+
+        let middle = Rect {
+            x: rect.x,
+            y: rect.y.saturating_add(r),
+            width: rect.width,
+            height: rect.height.saturating_sub(r.saturating_mul(2)),
+        };
+        if !middle.is_empty() {
+            self.fill_rect_alpha(middle, color, alpha);
+        }
+
+        // For commonly-used radii we precompute the per-row (inset, AA alpha)
+        // table once at startup so dragging windows or repainting large
+        // rounded shadows doesn't pay a sqrt + float-floor per row per
+        // layer per frame.
+        let profile = corner_profile(r);
+
+        for dy in 0..r {
+            let row = profile[dy];
+            let inset = row.inset as usize;
+            if inset >= rect.width {
+                continue;
+            }
+            let row_width = rect.width.saturating_sub(inset.saturating_mul(2));
+            let row_x = rect.x.saturating_add(inset);
+            let top_y = rect.y.saturating_add(dy);
+            let bot_y = rect
+                .y
+                .saturating_add(rect.height)
+                .saturating_sub(1)
+                .saturating_sub(dy);
+            if row_width > 0 {
+                self.fill_rect_alpha(
+                    Rect {
+                        x: row_x,
+                        y: top_y,
+                        width: row_width,
+                        height: 1,
+                    },
+                    color,
+                    alpha,
+                );
+                if bot_y != top_y {
+                    self.fill_rect_alpha(
+                        Rect {
+                            x: row_x,
+                            y: bot_y,
+                            width: row_width,
+                            height: 1,
+                        },
+                        color,
+                        alpha,
+                    );
+                }
+            }
+
+            let aa_q8 = row.aa_alpha_q8 as u32;
+            if aa_q8 != 0 && inset > 0 {
+                let aa_alpha = (((alpha as u32) * aa_q8 + 128) >> 8).min(255) as u8;
+                if aa_alpha > 0 {
+                    let left_x = row_x.saturating_sub(1);
+                    let right_x = rect.x.saturating_add(rect.width).saturating_sub(inset);
+                    self.put_pixel_alpha(left_x as i32, top_y as i32, color, aa_alpha);
+                    if right_x < rect.x.saturating_add(rect.width) {
+                        self.put_pixel_alpha(right_x as i32, top_y as i32, color, aa_alpha);
+                    }
+                    if bot_y != top_y {
+                        self.put_pixel_alpha(left_x as i32, bot_y as i32, color, aa_alpha);
+                        if right_x < rect.x.saturating_add(rect.width) {
+                            self.put_pixel_alpha(right_x as i32, bot_y as i32, color, aa_alpha);
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    pub(crate) fn fill_pattern_grid(&mut self, rect: Rect, spacing: usize, color: u32, alpha: u8) {
-        if spacing == 0 || alpha == 0 {
-            return;
-        }
+    pub(crate) fn fill_v_gradient(&mut self, rect: Rect, top_color: u32, bottom_color: u32) {
         let rect = rect.intersect(self.clip_rect);
         if rect.is_empty() {
             return;
         }
-
-        let y_end = rect.y.saturating_add(rect.height);
-
-        // Vertical grid lines. The previous implementation called
-        // `fill_rect_alpha` per vertical strip, each of which produced a fresh
-        // 1-pixel slice per row that always fell below the SIMD threshold and
-        // re-entered the scalar blender. That was the dominant cost in the
-        // first-frame desktop refresh (~400 ms on TCG). Inline the blend here
-        // so each cell is a single pixel of per-pixel arithmetic with no slice
-        // bookkeeping or function-call cost in the inner loop.
-        let alpha32 = alpha as u32;
-        let inv_alpha32 = 255_u32.saturating_sub(alpha32);
-        let src_b = color & 0xff;
-        let src_g = (color >> 8) & 0xff;
-        let src_r = (color >> 16) & 0xff;
-        let blend_pixel = |dst: &mut u32| {
-            let cur = *dst;
-            let cur_b = cur & 0xff;
-            let cur_g = (cur >> 8) & 0xff;
-            let cur_r = (cur >> 16) & 0xff;
-            let out_b = (src_b * alpha32 + cur_b * inv_alpha32) / 255;
-            let out_g = (src_g * alpha32 + cur_g * inv_alpha32) / 255;
-            let out_r = (src_r * alpha32 + cur_r * inv_alpha32) / 255;
-            *dst = (out_r << 16) | (out_g << 8) | out_b;
-        };
-
-        for row in rect.y..y_end {
-            let Some(row_start) = row
+        let top_r = ((top_color >> 16) & 0xff) as i32;
+        let top_g = ((top_color >> 8) & 0xff) as i32;
+        let top_b = (top_color & 0xff) as i32;
+        let bot_r = ((bottom_color >> 16) & 0xff) as i32;
+        let bot_g = ((bottom_color >> 8) & 0xff) as i32;
+        let bot_b = (bottom_color & 0xff) as i32;
+        let span = rect.height.max(1) as i32;
+        for dy in 0..rect.height {
+            let t = dy as i32;
+            let inv = span - t;
+            let r = ((top_r * inv + bot_r * t) / span) as u32 & 0xff;
+            let g = ((top_g * inv + bot_g * t) / span) as u32 & 0xff;
+            let b = ((top_b * inv + bot_b * t) / span) as u32 & 0xff;
+            let row_color = (r << 16) | (g << 8) | b;
+            let Some(row_start) = (rect.y + dy)
                 .checked_mul(self.stride_pixels)
                 .and_then(|offset| offset.checked_add(rect.x))
             else {
@@ -291,31 +328,70 @@ impl<'a> SurfaceCanvas<'a> {
             else {
                 return;
             };
-            let mut x_offset = 0usize;
-            while x_offset < rect.width {
-                blend_pixel(&mut row_pixels[x_offset]);
-                x_offset = x_offset.saturating_add(spacing);
-            }
+            row_pixels.fill(row_color);
+        }
+    }
+
+    pub(crate) fn fill_radial_glow(
+        &mut self,
+        center_x: i32,
+        center_y: i32,
+        radius: u32,
+        color: u32,
+        max_alpha: u8,
+    ) {
+        if radius == 0 || max_alpha == 0 {
+            return;
+        }
+        let radius_i = radius as i32;
+        let bounding = Rect {
+            x: (center_x - radius_i).max(0) as usize,
+            y: (center_y - radius_i).max(0) as usize,
+            width: (radius_i * 2 + 1) as usize,
+            height: (radius_i * 2 + 1) as usize,
+        }
+        .intersect(self.clip_rect);
+        if bounding.is_empty() {
+            return;
         }
 
-        let mut y = rect.y;
-        while y < y_end {
+        let r2 = (radius_i as i64).saturating_mul(radius_i as i64);
+        const COVERAGE_SCALE: i64 = 1 << 16;
+        for y in bounding.y..bounding.y.saturating_add(bounding.height) {
+            let dy = y as i64 - center_y as i64;
+            let dy2 = dy * dy;
+            if dy2 > r2 {
+                continue;
+            }
             let Some(row_start) = y
                 .checked_mul(self.stride_pixels)
-                .and_then(|offset| offset.checked_add(rect.x))
+                .and_then(|offset| offset.checked_add(bounding.x))
             else {
-                return;
+                continue;
             };
             let Some(row_pixels) = self
                 .pixels
-                .get_mut(row_start..row_start.saturating_add(rect.width))
+                .get_mut(row_start..row_start.saturating_add(bounding.width))
             else {
-                return;
+                continue;
             };
-            for pixel in row_pixels.iter_mut() {
-                blend_pixel(pixel);
+            for (offset, pixel) in row_pixels.iter_mut().enumerate() {
+                let x = bounding.x + offset;
+                let dx = x as i64 - center_x as i64;
+                let d2 = dx * dx + dy2;
+                if d2 > r2 {
+                    continue;
+                }
+                // Smooth fall-off: coverage = (1 - d²/R²)² in fixed-point Q16.
+                let coverage_linear = ((r2 - d2) * COVERAGE_SCALE) / r2;
+                let coverage = (coverage_linear * coverage_linear) / COVERAGE_SCALE;
+                let alpha = ((max_alpha as i64) * coverage) / COVERAGE_SCALE;
+                let alpha = alpha.clamp(0, 255) as u8;
+                if alpha == 0 {
+                    continue;
+                }
+                blend_pixel(pixel, color, alpha);
             }
-            y = y.saturating_add(spacing);
         }
     }
 
@@ -584,6 +660,63 @@ fn div_round(value: i32, divisor: i32) -> i32 {
     } else {
         value.saturating_sub(divisor / 2) / divisor
     }
+}
+
+// Maximum radius we keep in the precomputed corner-profile cache. Anything
+// larger falls back to the float path; in practice the UI uses radii ≤ 24.
+const MAX_CACHED_RADIUS: usize = 32;
+
+#[derive(Clone, Copy)]
+struct CornerRow {
+    /// How many columns from the corner this row sits inside the body
+    /// (i.e. the corner triangle eats `inset` pixels at each side).
+    inset: u16,
+    /// Sub-pixel coverage of the boundary pixel, scaled to Q8 (0..=256).
+    /// Multiplied into the caller's alpha to produce an antialiased edge.
+    aa_alpha_q8: u16,
+}
+
+static CORNER_CACHE: OnceLock<Vec<Vec<CornerRow>>> = OnceLock::new();
+
+fn corner_profile(radius: usize) -> &'static [CornerRow] {
+    let cache = CORNER_CACHE.get_or_init(|| {
+        (0..=MAX_CACHED_RADIUS)
+            .map(build_corner_rows)
+            .collect()
+    });
+    if let Some(profile) = cache.get(radius) {
+        profile.as_slice()
+    } else {
+        // Cold path for unusually large radii — rebuild on every call.
+        // No callers in the current renderer hit this branch.
+        Box::leak(build_corner_rows(radius).into_boxed_slice())
+    }
+}
+
+fn build_corner_rows(radius: usize) -> Vec<CornerRow> {
+    if radius == 0 {
+        return Vec::new();
+    }
+    let r = radius;
+    let r2 = (r as f32) * (r as f32);
+    (0..r)
+        .map(|dy| {
+            let dy_from_center = (r - dy) as f32;
+            let max_extent_sq = r2 - dy_from_center * dy_from_center;
+            if max_extent_sq <= 0.0 {
+                return CornerRow {
+                    inset: r as u16,
+                    aa_alpha_q8: 0,
+                };
+            }
+            let max_extent_f = max_extent_sq.sqrt();
+            let max_extent = (max_extent_f.floor() as usize).min(r);
+            let inset = (r - max_extent) as u16;
+            let frac = max_extent_f - max_extent as f32;
+            let aa_alpha_q8 = (frac * 256.0).round().clamp(0.0, 255.0) as u16;
+            CornerRow { inset, aa_alpha_q8 }
+        })
+        .collect()
 }
 
 fn blend_pixel(dst: &mut u32, src: u32, alpha: u8) {

@@ -411,7 +411,7 @@ impl AppState {
 
     pub(crate) fn recover_focus_after_wayland_change(
         &mut self,
-        _wayland: Option<&mut WaylandCompositor>,
+        wayland: Option<&mut WaylandCompositor>,
     ) -> Result<canvas::Rect, i32> {
         let previous_wayland_focus = self.focused_wayland_surface_id;
         let wayland_focused = self.focused_wayland_surface_id.is_some()
@@ -423,6 +423,27 @@ impl AppState {
         }
 
         self.focused_wayland_surface_id = None;
+
+        // Prefer the most-recently-stacked visible Wayland window before
+        // falling back to a console — closing one Wayland app on top of
+        // another should hand focus to the next Wayland window, not jump
+        // back to a terminal in the background.
+        if let Some(fallback_surface) = self
+            .wayland_windows
+            .iter()
+            .rev()
+            .find(|window| !window.minimized)
+            .map(|window| window.surface_id)
+        {
+            if let Some(wayland) = wayland {
+                wayland.focus_surface(fallback_surface);
+            }
+            self.focused_wayland_surface_id = Some(fallback_surface);
+            self.focused_session_handle = 0;
+            return Ok(self
+                .wayland_stack_dirty_rect()
+                .union(self.wayland_taskbar_dirty_rect()));
+        }
 
         let console_focused = self.focused_session_handle != 0
             && self.console_windows.iter().any(|window| {

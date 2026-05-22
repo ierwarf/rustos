@@ -268,6 +268,10 @@ pub(crate) struct ConsoleWindow {
     pub(crate) title: String,
     pub(crate) frame: canvas::Rect,
     pub(crate) minimized: bool,
+    /// Saved frame from before the most recent maximize; `Some` while the
+    /// window is currently maximized so the second click on the maximize
+    /// button can restore it.
+    pub(crate) pre_maximize_frame: Option<canvas::Rect>,
     pub(crate) terminal: TerminalState,
     pub(crate) output_cache: Vec<u8>,
     pub(crate) output_generation: u64,
@@ -287,6 +291,7 @@ impl ConsoleWindow {
             title,
             frame,
             minimized: false,
+            pre_maximize_frame: None,
             terminal: TerminalState::new(),
             output_cache: Vec::new(),
             output_generation,

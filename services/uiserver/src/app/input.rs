@@ -7,9 +7,11 @@ use runtime_control::RuntimeClient;
 use super::{AppState, DragTarget, VisualUpdate};
 use crate::canvas;
 use crate::profile;
+use crate::layout::maximized_window_rect;
 use crate::render::{
     clamp_console_window_rect, launcher_button_rect, taskbar_slot_rect, wayland_window_outer_rect,
-    window_close_button_rect, window_minimize_button_rect, window_title_bar_rect,
+    window_close_button_rect, window_maximize_button_rect, window_minimize_button_rect,
+    window_title_bar_rect,
 };
 use crate::sys::{
     self, console_send_input_event, console_set_focus, ConsoleSessionHandle, InputEvent,
@@ -29,6 +31,7 @@ enum WindowChromeHit {
     Client,
     TitleBar,
     Minimize,
+    Maximize,
     Close,
 }
 
@@ -261,6 +264,9 @@ impl AppState {
         if window_close_button_rect(outer).contains(self.cursor_x, self.cursor_y) {
             return WindowChromeHit::Close;
         }
+        if window_maximize_button_rect(outer).contains(self.cursor_x, self.cursor_y) {
+            return WindowChromeHit::Maximize;
+        }
         if window_minimize_button_rect(outer).contains(self.cursor_x, self.cursor_y) {
             return WindowChromeHit::Minimize;
         }
@@ -285,6 +291,7 @@ impl AppState {
                 match chrome_hit {
                     WindowChromeHit::Close => self.close_console_window(runtime, session_handle),
                     WindowChromeHit::Minimize => self.minimize_console_window(session_handle),
+                    WindowChromeHit::Maximize => self.toggle_console_window_maximize(session_handle),
                     WindowChromeHit::TitleBar => {
                         let dirty_rect = self.focus_window(session_handle)?;
                         self.start_console_window_drag(session_handle);
@@ -338,6 +345,18 @@ impl AppState {
                         Ok(VisualUpdate::partial(
                             before_dirty.union(wayland_dirty).union(focus_dirty),
                         ))
+                    }
+                    WindowChromeHit::Maximize => {
+                        let before_dirty = self.wayland_visual_dirty_rect();
+                        wayland.toggle_surface_maximized(surface_id);
+                        wayland.focus_surface(surface_id);
+                        let wayland_dirty = self.sync_wayland_windows(wayland.window_snapshots());
+                        self.focused_wayland_surface_id = Some(surface_id);
+                        self.focused_session_handle = 0;
+                        if self.dragging_window == Some(DragTarget::Wayland(surface_id)) {
+                            self.dragging_window = None;
+                        }
+                        Ok(VisualUpdate::partial(before_dirty.union(wayland_dirty)))
                     }
                     WindowChromeHit::TitleBar => {
                         let before_dirty = self.wayland_visual_dirty_rect();
@@ -457,9 +476,20 @@ impl AppState {
             self.next_console_snapshot_index %= self.console_windows.len();
         }
         if closed_was_focused {
+            // Hand focus to the most-recently-stacked visible console
+            // window, if any. Previously this loop force-minimized every
+            // other console window, which made closing one terminal
+            // mysteriously hide the rest.
             self.focused_session_handle = 0;
-            for window in &mut self.console_windows {
-                window.minimized = true;
+            let fallback = self
+                .console_windows
+                .iter()
+                .rev()
+                .find(|window| !window.minimized)
+                .map(|window| window.session_handle);
+            if let Some(fallback_session) = fallback {
+                let _ = console_set_focus(self.console_fd.as_raw_fd(), fallback_session);
+                self.focused_session_handle = fallback_session;
             }
         }
         let _ = runtime.request_terminate_session(session_handle);
@@ -467,6 +497,37 @@ impl AppState {
             self.dragging_window = None;
         }
         Ok(VisualUpdate::full())
+    }
+
+    fn toggle_console_window_maximize(
+        &mut self,
+        session_handle: ConsoleSessionHandle,
+    ) -> Result<VisualUpdate, i32> {
+        let display_width = self.display.width;
+        let display_height = self.display.height;
+        if let Some(window) = self
+            .console_windows
+            .iter_mut()
+            .find(|window| window.session_handle == session_handle)
+        {
+            let next_frame = if let Some(saved) = window.pre_maximize_frame.take() {
+                clamp_console_window_rect(display_width, display_height, saved)
+            } else {
+                window.pre_maximize_frame = Some(window.frame);
+                maximized_window_rect(display_width, display_height)
+            };
+            if window.frame != next_frame {
+                window.frame = next_frame;
+                window.invalidate_surface();
+                window.terminal_dirty = true;
+            }
+        }
+        let dirty_rect = self.focus_window(session_handle)?;
+        Ok(if dirty_rect.is_empty() {
+            VisualUpdate::full()
+        } else {
+            VisualUpdate::partial(dirty_rect.union(canvas::Rect::empty()))
+        })
     }
 
     fn restore_wayland_window(

@@ -281,6 +281,9 @@ privilege substrate, not a policy owner.
      options, address bind, route policy, packet lease, and fd-transfer
      descriptors/capability leases. The compact netd IPC remains the hot path
      that calls the gated ring0 socket broker.
+   - Completed: the old `kernel/compat/src/user/socket.rs` shadow
+     implementation was deleted. `kernel/compat` now uses the `kernel_ps::api`
+     socket primitive re-export while `netd` remains the policy owner.
 
 10. Console/TTY/session policy:
    - Current source: console, TTY, and GUI device paths still live mainly under

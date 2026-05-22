@@ -3,6 +3,7 @@ mod canvas;
 mod cursor_sprites;
 mod font;
 mod input_loop;
+mod layout;
 mod profile;
 mod render;
 mod runtime_sync;

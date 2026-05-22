@@ -31,8 +31,9 @@ runtimed (or initd autostart)
 
 Notes:
 
-- The canonical Linux ABI surface lives in `kernel/ps/src/user/linux.rs`.
-  `kernel/compat/src/user/linux.rs` is a re-export shim — never edit it.
+- The canonical Linux ABI surface lives in `rustos-user-abi::linux`, re-exported
+  through `kernel/ps::api` and then `kernel/compat::user`. Do not reintroduce
+  shadow ABI files under `kernel/compat/src/user`.
 - Adding new Linux syscall routing should happen in `syscalld`, `vfsd`, or
   the appropriate userspace service, not in `kernel/compat`.
 
@@ -119,9 +120,9 @@ runtimed (또는 initd autostart)
 
 참고:
 
-- canonical Linux ABI surface는 `kernel/ps/src/user/linux.rs`에 있습니다.
-  `kernel/compat/src/user/linux.rs`는 re-export shim 이므로 절대 편집하지
-  않습니다.
+- canonical Linux ABI surface는 `rustos-user-abi::linux`에 있고
+  `kernel/ps::api`와 `kernel/compat::user`를 통해 re-export 됩니다.
+  `kernel/compat/src/user` 아래 shadow ABI 파일은 다시 만들지 않습니다.
 - 새 Linux syscall routing은 `syscalld`, `vfsd`, 또는 적절한 userspace
   service에 추가하고 `kernel/compat`에 넣지 않습니다.
 

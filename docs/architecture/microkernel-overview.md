@@ -103,10 +103,10 @@ adding a manifest field over carving a new syscall.
 ### Compatibility Direction
 
 - Linux ELF: dynamic ELF main + interpreter loader lives in `loaderd`.
-  Linux ABI surface lives in `kernel/ps/src/user/linux.rs` (canonical) and is
-  re-exported from `kernel/compat/src/user/linux.rs` (do not edit the
-  re-export). `syscalld` owns Linux MM policy and forwards through the gated
-  MM broker.
+  Linux ABI surface lives in `rustos-user-abi::linux` and is re-exported
+  through `kernel/ps::api` and `kernel/compat::user`; do not reintroduce
+  shadow ABI files under `kernel/compat/src/user`. `syscalld` owns Linux MM
+  policy and forwards through the gated MM broker.
 - Windows PE: `loaderd` maps PE32+ images, resolves imports from the System32
   DLL inventory (`build/image/compat/windows/System32/*`), and registers a
   Windows runtime broker with the kernel. The PE/Win32 ABI bridge currently
@@ -214,9 +214,10 @@ broker는 보수적으로 추가합니다. 새 syscall을 만들기보다 기존
 ### 호환성 방향
 
 - Linux ELF: dynamic ELF main + interpreter loader는 `loaderd`. Linux ABI
-  surface는 `kernel/ps/src/user/linux.rs`(canonical), `kernel/compat/src/user/linux.rs`는
-  re-export (편집 금지). Linux MM policy는 `syscalld`가 소유하고 gated MM
-  broker로 forward.
+  surface는 `rustos-user-abi::linux`에 있고 `kernel/ps::api` 및
+  `kernel/compat::user`를 통해 re-export 됩니다. `kernel/compat/src/user`
+  아래 shadow ABI 파일은 다시 만들지 않습니다. Linux MM policy는
+  `syscalld`가 소유하고 gated MM broker로 forward.
 - Windows PE: `loaderd`가 PE32+ image를 mapping하고
   `build/image/compat/windows/System32/*`의 DLL inventory에서 import를
   해석한 뒤 Windows runtime broker를 커널에 등록합니다. PE/Win32 ABI
