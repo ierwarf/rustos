@@ -172,11 +172,7 @@ pub fn spawn_program_in_session(
         ..ProcessLaunchOptions::default()
     };
 
-    process::spawn_bootstrap_linux_process_with_launch(
-        program.image,
-        program.weight_micros,
-        launch,
-    )
+    process::spawn_bootstrap_linux_process_with_launch(program.image, program.weight_micros, launch)
         .map(|spawned| {
             if trace {
                 emit_console(

@@ -30,9 +30,9 @@ use rustos_user_abi::syscall::{
     CommercialMaxProtocolResponse, IPC_SERVICE_DEVMGRD, IPC_SERVICE_LOADERD, IPC_SERVICE_SESSIOND,
     LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
     LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, LoaderSpawnRequest,
-    LoaderSpawnResponse, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
-    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
-    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_TRY_RECV,
+    LoaderSpawnResponse, RustosDeviceIoctlBrokerArgs, SYS_RUSTOS_DEVICE_IOCTL_BROKER,
+    SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_TRY_RECV,
 };
 
 const DEFAULT_USER_TASK_WEIGHT_MICROS: u64 = 100;
@@ -1086,6 +1086,13 @@ fn ensure_policy_launches(state: &mut BrokerState) -> bool {
         {
             continue;
         }
+        if !entry.exec.starts_with("services/") && !loader_endpoint_ready() {
+            state.retry_after.insert(
+                entry.desktop_file_id.clone(),
+                Instant::now() + RETRY_BACKOFF,
+            );
+            continue;
+        }
 
         if entry.restart {
             if running_packages.contains(&entry.package_id) {
@@ -1148,12 +1155,7 @@ fn ensure_policy_launches(state: &mut BrokerState) -> bool {
 fn is_permanent_launch_failure(errno: i32) -> bool {
     matches!(
         errno,
-        libc::ENOSYS
-            | libc::EOPNOTSUPP
-            | libc::ENOEXEC
-            | libc::EINVAL
-            | libc::ENOENT
-            | libc::EACCES
+        libc::EOPNOTSUPP | libc::ENOEXEC | libc::EINVAL | libc::ENOENT | libc::EACCES
     )
 }
 
@@ -1428,6 +1430,10 @@ fn lookup_loader_endpoint() -> Result<u64, i32> {
         LOADER_ENDPOINT_CACHE.store(endpoint, Ordering::Relaxed);
     }
     Ok(endpoint)
+}
+
+fn loader_endpoint_ready() -> bool {
+    lookup_loader_endpoint().is_ok()
 }
 
 fn stderr_line(message: &str) {
@@ -1963,13 +1969,13 @@ fn create_console_session(
         exec_path.as_ptr() as u64,
         exec_path.len() as u64,
     );
-    ioctl_with_mut(console_fd, CONSOLE_IOCTL_CREATE_SESSION, &mut request)?;
+    sessiond_console_ioctl(console_fd, CONSOLE_IOCTL_CREATE_SESSION, &mut request)?;
     Ok(request.session_handle)
 }
 
 fn close_console_session(console_fd: RawFd, session_handle: u64) -> Result<bool, i32> {
     let mut request = ConsoleCloseSessionRequest::new(session_handle);
-    match ioctl_with_mut(console_fd, CONSOLE_IOCTL_CLOSE_SESSION, &mut request) {
+    match sessiond_console_ioctl(console_fd, CONSOLE_IOCTL_CLOSE_SESSION, &mut request) {
         Ok(()) => Ok(true),
         Err(err) if err == libc::ENOENT || err == libc::EINVAL => Ok(false),
         Err(err) => Err(err),
@@ -1982,12 +1988,36 @@ fn set_console_session_state(
     state: u16,
 ) -> Result<(), i32> {
     let mut request = ConsoleSetSessionStateRequest::new(session_handle, state);
-    ioctl_with_mut(console_fd, CONSOLE_IOCTL_SET_SESSION_STATE, &mut request)
+    sessiond_console_ioctl(console_fd, CONSOLE_IOCTL_SET_SESSION_STATE, &mut request)
 }
 
 fn console_set_focus(console_fd: RawFd, session_handle: u64) -> Result<(), i32> {
     let mut request = ConsoleSetFocusRequest::new(session_handle);
-    ioctl_with_mut(console_fd, CONSOLE_IOCTL_SET_FOCUS, &mut request)
+    sessiond_console_ioctl(console_fd, CONSOLE_IOCTL_SET_FOCUS, &mut request)
+}
+
+fn sessiond_console_ioctl<T>(console_fd: RawFd, request: usize, arg: &mut T) -> Result<(), i32> {
+    let args = RustosDeviceIoctlBrokerArgs {
+        process_id: 0,
+        fd: console_fd as u64,
+        request: request as u64,
+        arg: arg as *mut T as u64,
+        reserved0: 0,
+    };
+    let rc = unsafe {
+        libc::syscall(
+            SYS_RUSTOS_DEVICE_IOCTL_BROKER as libc::c_long,
+            (&args as *const RustosDeviceIoctlBrokerArgs) as u64,
+        ) as i64
+    };
+    if rc < 0 {
+        let errno = (-rc) as i32;
+        if errno == libc::EPERM {
+            return ioctl_with_mut(console_fd, request, arg);
+        }
+        return Err(errno);
+    }
+    Ok(())
 }
 
 fn open_device(path: &str, flags: usize) -> Result<OwnedFd, i32> {

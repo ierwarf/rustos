@@ -5,11 +5,10 @@ use crate::sync::KernelSpinLock as Mutex;
 use driver_abi::PointerPacket;
 use heapless::Deque as HeaplessDeque;
 use rustos_user_abi::syscall::{
-    InputHidKeyboardReportWire, InputHidPointerReportWire, InputIngressWire,
-    InputKeyboardEventWire, InputPointerAbsoluteWire, InputPointerPacketWire, INPUTD_ACCESS_NATIVE,
-    INPUTD_INGRESS_KIND_EVENT, INPUTD_INGRESS_KIND_HID_KEYBOARD_REPORT,
+    INPUTD_ACCESS_NATIVE, INPUTD_INGRESS_KIND_EVENT, INPUTD_INGRESS_KIND_HID_KEYBOARD_REPORT,
     INPUTD_INGRESS_KIND_HID_POINTER_REPORT, INPUTD_INGRESS_KIND_KEYBOARD,
-    INPUTD_INGRESS_KIND_POINTER_PACKET,
+    INPUTD_INGRESS_KIND_POINTER_PACKET, InputHidKeyboardReportWire, InputHidPointerReportWire,
+    InputIngressWire, InputKeyboardEventWire, InputPointerAbsoluteWire, InputPointerPacketWire,
 };
 #[cfg(not(test))]
 use x86_64::instructions::interrupts;
@@ -295,7 +294,7 @@ mod tests {
         reset_for_tests,
     };
     use crate::user::abi::device::{
-        InputEvent, INPUT_ACTION_PRESSED, INPUT_KIND_POINTER_BUTTON, INPUT_KIND_POINTER_MOTION,
+        INPUT_ACTION_PRESSED, INPUT_KIND_POINTER_BUTTON, INPUT_KIND_POINTER_MOTION, InputEvent,
     };
 
     fn isolated() -> std::sync::MutexGuard<'static, ()> {

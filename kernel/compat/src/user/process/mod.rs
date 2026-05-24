@@ -1,7 +1,7 @@
 use alloc::vec;
 
-use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
+use x86_64::structures::paging::PageTableFlags;
 
 use crate::debug;
 use crate::io::session::ConsoleSessionHandle;

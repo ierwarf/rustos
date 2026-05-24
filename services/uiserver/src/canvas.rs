@@ -213,9 +213,7 @@ impl<'a> SurfaceCanvas<'a> {
         if alpha == 0 || rect.is_empty() {
             return;
         }
-        let r = radius
-            .min(rect.width / 2)
-            .min(rect.height / 2);
+        let r = radius.min(rect.width / 2).min(rect.height / 2);
         if r == 0 {
             self.fill_rect_alpha(rect, color, alpha);
             return;
@@ -686,11 +684,8 @@ struct CornerRow {
 static CORNER_CACHE: OnceLock<Vec<Vec<CornerRow>>> = OnceLock::new();
 
 fn corner_profile(radius: usize) -> &'static [CornerRow] {
-    let cache = CORNER_CACHE.get_or_init(|| {
-        (0..=MAX_CACHED_RADIUS)
-            .map(build_corner_rows)
-            .collect()
-    });
+    let cache =
+        CORNER_CACHE.get_or_init(|| (0..=MAX_CACHED_RADIUS).map(build_corner_rows).collect());
     if let Some(profile) = cache.get(radius) {
         profile.as_slice()
     } else {

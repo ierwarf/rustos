@@ -10,14 +10,14 @@ use driver_abi::{
     DriverBus, DriverClass, DriverModuleHeader, RUSTOS_DRIVER_ABI_VERSION_SYMBOL,
     RUSTOS_DRIVER_HEADER_SYMBOL, RUSTOS_DRIVER_INIT_SYMBOL,
 };
+use elf::ElfBytes;
 use elf::endian::LittleEndian as ElfLittleEndian;
 use elf::file::Class as ElfClass;
-use elf::ElfBytes;
+use object::LittleEndian;
 use object::elf::{
     self as objelf, FileHeader64 as RawElfHeader, Rela64 as RawRela,
     SectionHeader64 as RawSectionHeader, Sym64 as RawSym,
 };
-use object::LittleEndian;
 use x86_64::PhysAddr;
 
 use crate::sync::KernelWaitLock;
@@ -3167,8 +3167,8 @@ pub(super) fn section_header_entries(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_module_section, reset_for_tests, runtime_executable_addr_is_known,
-        validate_module_path, ModuleMemoryClass, ModuleSectionHeader, PendingModuleExecGuard,
+        ModuleMemoryClass, ModuleSectionHeader, PendingModuleExecGuard, classify_module_section,
+        reset_for_tests, runtime_executable_addr_is_known, validate_module_path,
     };
     use object::elf as objelf;
 

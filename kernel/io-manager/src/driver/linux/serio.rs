@@ -4,8 +4,8 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use driver_abi::SerioPortInfo;
 
 use super::compat::{
-    compat_cstr, serio_any_matches, LinuxCompatSerio, LinuxCompatSerioDeviceId,
-    LinuxCompatSerioDriver,
+    LinuxCompatSerio, LinuxCompatSerioDeviceId, LinuxCompatSerioDriver, compat_cstr,
+    serio_any_matches,
 };
 
 static NEXT_DYNAMIC_PORT_ID: AtomicU32 = AtomicU32::new(0x100);

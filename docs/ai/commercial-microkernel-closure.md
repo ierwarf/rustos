@@ -344,6 +344,20 @@ For every step the shape is:
 - Validation: `cargo xtask build` + commercial-max QEMU signature.
   Console/TTY regressions surface through `wayclick.desktop` readiness and
   the boot debugcon markers; both are part of the signature.
+- 2026-05-25 completed slice:
+  - `SessionGraph` reads (`GET_STATE`, `SNAPSHOT_SESSIONS`) now execute on the
+    `sessiond`/`runtimed` commercial-max endpoint and return payloads through
+    `devmgrd`'s ioctl response path.
+  - Console lifecycle commits (`CREATE_SESSION`, `CLOSE_SESSION`,
+    `BIND_CURRENT_SESSION`, `SET_SESSION_STATE`, `SET_FOCUS`) no longer bounce
+    through reentrant sessiond authorization before the gated device-ioctl
+    broker performs the final ring0 commit.
+  - `runtimed` gates non-service policy launches on loaderd endpoint readiness
+    and no longer treats loader readiness `ENOSYS` as a permanent desktop
+    launch failure; the observed `shell.desktop errno=38` regression is fixed.
+  - Validation passed: `cargo xtask check`, `cargo xtask build`, and
+    `cargo xtask run --profile nvme --accel-profile kvm --usb-input
+    --debugcon file --commercial-max-ready -- --no-reboot`.
 
 ### Step 4 — Syscalld + pagerd MM cluster (1288 LOC)
 

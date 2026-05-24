@@ -4,11 +4,11 @@ use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use boot_protocol::FramebufferInfo;
-use x86_64::instructions::interrupts;
 use x86_64::VirtAddr;
+use x86_64::instructions::interrupts;
 
-use super::framebuffer::{build_framebuffer, Framebuffer, FramebufferRect};
 use super::GuiDisplayInfo;
+use super::framebuffer::{Framebuffer, FramebufferRect, build_framebuffer};
 use crate::memory::paging::{self, ProcessAddressSpace};
 use crate::sync::KernelWaitLock;
 
@@ -93,11 +93,7 @@ impl DisplayBackend {
 
 fn next_display_generation(current: u64) -> u64 {
     let next = current.wrapping_add(1);
-    if next == 0 {
-        1
-    } else {
-        next
-    }
+    if next == 0 { 1 } else { next }
 }
 
 pub(crate) fn install_boot_framebuffer(info: FramebufferInfo, flags: u32) -> bool {

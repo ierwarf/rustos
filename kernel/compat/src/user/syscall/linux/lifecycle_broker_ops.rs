@@ -1,6 +1,6 @@
 use super::*;
 
-use rustos_user_abi::syscall::{LifecycleDrainBrokerArgs, IPC_SERVICE_CAP_PROCESS_POLICY};
+use rustos_user_abi::syscall::{IPC_SERVICE_CAP_PROCESS_POLICY, LifecycleDrainBrokerArgs};
 
 pub(super) fn syscall_linux_rustos_lifecycle_drain_broker(args_ptr: u64) -> u64 {
     if !ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_PROCESS_POLICY) {

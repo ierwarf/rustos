@@ -346,9 +346,12 @@ fn shadow_bounds(rect: Rect, steps: usize) -> Rect {
         width: rect
             .width
             .saturating_add(steps.saturating_mul(2).saturating_add(2)),
-        height: rect
-            .height
-            .saturating_add(steps.saturating_mul(2).saturating_add(steps).saturating_add(2)),
+        height: rect.height.saturating_add(
+            steps
+                .saturating_mul(2)
+                .saturating_add(steps)
+                .saturating_add(2),
+        ),
     }
 }
 
@@ -407,10 +410,7 @@ fn refresh_desktop_surface(state: &mut AppState) {
         // accumulating alpha across rebuilds.
         let topbar = topbar_rail_rect(width);
         let taskbar = taskbar_rail_rect(width, height);
-        let chrome_strips: [Rect; 2] = [
-            shadow_bounds(topbar, 3),
-            shadow_bounds(taskbar, 3),
-        ];
+        let chrome_strips: [Rect; 2] = [shadow_bounds(topbar, 3), shadow_bounds(taskbar, 3)];
         for strip in chrome_strips {
             let strip = strip.intersect(screen);
             if strip.is_empty() {

@@ -1,4 +1,4 @@
-use alloc::alloc::{alloc, alloc_zeroed, dealloc, realloc, Layout};
+use alloc::alloc::{Layout, alloc, alloc_zeroed, dealloc, realloc};
 use alloc::vec::Vec;
 use core::ffi::{c_char, c_void};
 use core::{ptr, slice};

@@ -369,6 +369,9 @@ fn authorize_ioctl_request(request: &DevmgrdDeviceIoctlRequest) -> Result<(), i3
     }
     match ioctl_policy_owner(request.request) {
         Some(IoctlPolicyOwner::Devmgrd) => Ok(()),
+        Some(IoctlPolicyOwner::Sessiond(_)) if sessiond_broker_commits_ioctl(request.request) => {
+            Ok(())
+        }
         Some(IoctlPolicyOwner::Sessiond(op)) => authorize_session_ioctl(op, request.request),
         Some(IoctlPolicyOwner::Uiserver(op)) => authorize_uiserver_ioctl(op, request.request),
         None => Err(libc::ENOTTY),
@@ -380,6 +383,17 @@ fn sessiond_executes_ioctl(request_number: u64) -> bool {
         request_number,
         rustos_user_abi::console::CONSOLE_IOCTL_GET_STATE
             | rustos_user_abi::console::CONSOLE_IOCTL_SNAPSHOT_SESSIONS
+    )
+}
+
+fn sessiond_broker_commits_ioctl(request_number: u64) -> bool {
+    matches!(
+        request_number,
+        rustos_user_abi::console::CONSOLE_IOCTL_CREATE_SESSION
+            | rustos_user_abi::console::CONSOLE_IOCTL_CLOSE_SESSION
+            | rustos_user_abi::console::CONSOLE_IOCTL_BIND_CURRENT_SESSION
+            | rustos_user_abi::console::CONSOLE_IOCTL_SET_SESSION_STATE
+            | rustos_user_abi::console::CONSOLE_IOCTL_SET_FOCUS
     )
 }
 

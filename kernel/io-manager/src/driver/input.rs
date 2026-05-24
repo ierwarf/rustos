@@ -33,8 +33,8 @@ fn log_pointer_delivery_once(kind: &'static str) {
 #[cfg(test)]
 mod tests {
     use super::{reset_pointer_state, submit_pointer_packet};
-    use driver_abi::{PointerPacket, POINTER_BUTTON_LEFT as POINTER_PACKET_LEFT};
-    use rustos_user_abi::syscall::{InputIngressWire, INPUTD_INGRESS_KIND_POINTER_PACKET};
+    use driver_abi::{POINTER_BUTTON_LEFT as POINTER_PACKET_LEFT, PointerPacket};
+    use rustos_user_abi::syscall::{INPUTD_INGRESS_KIND_POINTER_PACKET, InputIngressWire};
 
     fn isolated() -> std::sync::MutexGuard<'static, ()> {
         crate::test_support::exclusive_test()

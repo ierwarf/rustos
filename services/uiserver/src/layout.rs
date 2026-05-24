@@ -270,11 +270,7 @@ pub(crate) const WAYLAND_TITLE_VISIBLE_PX: usize = 120;
 /// deliberately allow windows to be dragged partly off-screen so the
 /// user has free range of motion even when the chrome size matches the
 /// available area.
-pub(crate) fn clamp_wayland_frame(
-    frame: Rect,
-    display_width: u32,
-    display_height: u32,
-) -> Rect {
+pub(crate) fn clamp_wayland_frame(frame: Rect, display_width: u32, display_height: u32) -> Rect {
     let (max_w, max_h) = wayland_max_client_size(display_width, display_height);
     let width = frame.width.min(max_w).max(1);
     let height = frame.height.min(max_h).max(1);
@@ -286,10 +282,7 @@ pub(crate) fn clamp_wayland_frame(
     // the desktop on either side. Allows dragging off the left or right
     // edge until the title bar would disappear.
     let min_visible = WAYLAND_TITLE_VISIBLE_PX.min(outer_w);
-    let min_x = bounds
-        .x
-        .saturating_add(min_visible)
-        .saturating_sub(outer_w);
+    let min_x = bounds.x.saturating_add(min_visible).saturating_sub(outer_w);
     let max_x = bounds
         .x
         .saturating_add(bounds.width)

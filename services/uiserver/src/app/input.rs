@@ -6,8 +6,8 @@ use runtime_control::RuntimeClient;
 
 use super::{AppState, DragTarget, VisualUpdate};
 use crate::canvas;
-use crate::profile;
 use crate::layout::{clamp_wayland_frame, maximized_window_rect};
+use crate::profile;
 use crate::render::{
     clamp_console_window_rect, console_window_dirty_rect, launcher_button_rect, taskbar_slot_rect,
     wayland_window_dirty_rect, wayland_window_outer_rect, window_close_button_rect,
@@ -291,7 +291,9 @@ impl AppState {
                 match chrome_hit {
                     WindowChromeHit::Close => self.close_console_window(runtime, session_handle),
                     WindowChromeHit::Minimize => self.minimize_console_window(session_handle),
-                    WindowChromeHit::Maximize => self.toggle_console_window_maximize(session_handle),
+                    WindowChromeHit::Maximize => {
+                        self.toggle_console_window_maximize(session_handle)
+                    }
                     WindowChromeHit::TitleBar => {
                         let dirty_rect = self.focus_window(session_handle)?;
                         self.start_console_window_drag(session_handle);

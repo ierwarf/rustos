@@ -18,9 +18,9 @@ use crate::layout::{
 use crate::wayland::WaylandWindowSnapshot;
 
 use super::colors::{
-    COLOR_ACCENT_GOLD, COLOR_ACCENT_MINT, COLOR_ACCENT_PEACH, COLOR_AURORA_VIOLET,
-    COLOR_BG_DEEP, COLOR_BORDER_SUBTLE, COLOR_GLASS_DARK, COLOR_GLASS_DEEP, COLOR_PANEL_HIGHLIGHT,
-    COLOR_SHADOW, COLOR_TEXT_DIM, COLOR_TEXT_PRIMARY,
+    COLOR_ACCENT_GOLD, COLOR_ACCENT_MINT, COLOR_ACCENT_PEACH, COLOR_AURORA_VIOLET, COLOR_BG_DEEP,
+    COLOR_BORDER_SUBTLE, COLOR_GLASS_DARK, COLOR_GLASS_DEEP, COLOR_PANEL_HIGHLIGHT, COLOR_SHADOW,
+    COLOR_TEXT_DIM, COLOR_TEXT_PRIMARY,
 };
 use super::icons::draw_app_icon;
 use super::{wayland_window_client_rect, wayland_window_outer_rect};
@@ -347,7 +347,13 @@ pub(crate) fn rebuild_console_window_surface(window: &mut ConsoleWindow, focused
     // in the corner triangles.
     canvas.fill_rect(outer, COLOR_BG_DEEP);
 
-    paint_window_chrome(&mut canvas, outer, client_rect, window.title.as_str(), focused);
+    paint_window_chrome(
+        &mut canvas,
+        outer,
+        client_rect,
+        window.title.as_str(),
+        focused,
+    );
 
     if terminal_needs_rebuild {
         window
