@@ -85,8 +85,8 @@ Before a large ring0 policy deletion batch, run and preserve these five gates:
 
 1. Inventory: `cargo xtask ring3-inventory` is the source-of-truth snapshot for
    remaining `RING3-MIGRATION-REFERENCE` marked LOC. Current snapshot:
-   `total_marked_loc=20449`, `excluded_xhci_nvme_loc=2910`,
-   `active_batch_marked_loc=17539`.
+   `total_marked_loc=16583`, `excluded_xhci_nvme_loc=2910`,
+   `active_batch_marked_loc=13673`.
 2. Protocol mapping: every active lane must name the current service owner
    (`inputd`, `sessiond`, `uiserver`, `storaged`, `netd`,
    `loaderd`/`procd`, `syscalld`/`pagerd`, `rootd`/capability, `devmgrd`,
@@ -102,18 +102,16 @@ Before a large ring0 policy deletion batch, run and preserve these five gates:
    `initd` spawn, `devmgrd`, `inputd`, `sessiond`, Wayland, UI-ready,
    `wayclick.desktop`, and `storaged` readiness markers.
 
-Large-batch order for the active 17539 marked LOC is:
+Large-batch order for the active 13673 marked LOC is:
 
 1. `inputd` service-shrink: `serio`, `i8042`, USB runtime/core HID policy
    (`usb/synthetic.rs` was retired entirely after confirming it was dead code
    post the capture-bridge removal).
-2. `uiserver`/display service-shrink: GUI/framebuffer/backend/terminal and
-   non-`.ko` virtio-gpu policy.
-3. `loaderd`/`procd` ABI-first: Linux image/process policy and proc broker
+2. `loaderd`/`procd` ABI-first: Linux image/process policy and proc broker
    marker retirement.
-4. `rootd`/capability and IPC policy: service namespace/capability policy
+3. `rootd`/capability and IPC policy: service namespace/capability policy
    behind rootd-visible descriptors, leaving kernel endpoint primitives.
-5. `storaged`, `netd`, `sessiond`, `syscalld` residual bridge cleanup after the
+4. `storaged`, `netd`, `sessiond`, `syscalld` residual bridge cleanup after the
    larger service-shrink paths stop depending on ring0 policy fallbacks.
 
 1. Device ioctl policy bypass:
@@ -243,6 +241,12 @@ Large-batch order for the active 17539 marked LOC is:
      (`runtimed` today). `devmgrd` still owns device-open policy and the final
      gated ioctl broker call, while session graph, console route, and
      foreground-focus policy are validated by the session owner.
+   - Completed: display setup authorization now delegates from
+     `devmgrd` to the `IPC_SERVICE_UISERVER` commercial-max protocol before the
+     gated ring0 device ioctl broker. Ring0 keeps the final current-process
+     user-copy and framebuffer copy/present primitive; `uiserver` exposes the
+     commercial-max present-policy descriptor without putting per-frame present
+     on policy IPC.
 
 5. Driver bootstrap policy leftovers:
    - Current source: `kernel/io-manager/src/driver/mod.rs` still has
@@ -263,6 +267,13 @@ Large-batch order for the active 17539 marked LOC is:
     leases, IRQ routes, and DMA buffer descriptors. This is only the
     non-`.ko` service-driver control plane; Linux/RustOS `.ko` execution still
     stays ring0.
+  - Completed: the display full chunk retired the stale
+    `virtio_gpu.rs`/`io/gui*`/`io/device/display.rs` markers. `uiserver` owns
+    normal display readiness, metadata, surface, present, and terminal-present
+    policy descriptors; hot present stays on the narrow ring0 broker path.
+    `driverd` keeps non-`.ko` virtio display provider
+    policy in its service-driver control plane; ring0 keeps `.ko` execution,
+    MMIO/DMA commands, boot/panic output, and the copy/present primitive.
   - Completed: boot-framebuffer fallback stays a last-resort primitive. The
     in-kernel fallback path preserves `DISPLAY_INFO_FLAG_BOOT_FRAMEBUFFER`,
     refuses to replace an already-active non-boot primary provider, and remains
@@ -364,7 +375,8 @@ Large-batch order for the active 17539 marked LOC is:
      `kernel/io-manager/src/io`.
    - Completed (2026-05-20): policy-sensitive console/session observation and
      input-injection ioctls now route through `devmgrd` before the gated
-     ring0 device ioctl broker. Display present and focus hot paths stay direct.
+     ring0 device ioctl broker. The later display chunk moved display setup
+     authorization to `uiserver`; ring0 still owns the hot present path.
    - Completed: `runtimed` now also registers the `IPC_SERVICE_SESSIOND`
      endpoint and accepts the shared commercial-max `CommercialMaxProtocolRequest`
      envelope for session graph, TTY line discipline, console route, foreground

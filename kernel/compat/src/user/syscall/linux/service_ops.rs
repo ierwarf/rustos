@@ -2837,7 +2837,7 @@ pub(super) fn syscall_linux_ioctl(fd: u64, request_number: u64, arg: u64) -> u64
     }
 
     // Hot data-path ioctls stay direct: display present/input delivery costs
-    // must be fixed with broker/data-path design, not by forcing per-frame
+    // must stay on the narrow broker/data path instead of taking per-frame
     // policy IPC.
     match crate::user::sysops::device::ioctl_current_process_fd(fd, request_number, arg) {
         Ok(value) => value,
@@ -2848,7 +2848,7 @@ pub(super) fn syscall_linux_ioctl(fd: u64, request_number: u64, arg: u64) -> u64
 fn ioctl_requires_devmgrd_policy(request_number: u64) -> bool {
     matches!(
         request_number,
-        // Boot-time surface setup — devmgrd validates surface parameters.
+        // Display setup policy — devmgrd delegates UI policy to uiserver.
         rustos_user_abi::device::DISPLAY_IOCTL_GET_INFO
             | rustos_user_abi::device::DISPLAY_IOCTL_CREATE_SURFACE
             // Console/session observation and input injection policy.

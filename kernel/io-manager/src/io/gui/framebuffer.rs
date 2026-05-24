@@ -1,6 +1,3 @@
-// RING3-MIGRATION-REFERENCE START: commercial-max displayd/uiserver should own normal
-// framebuffer allocation, format conversion, damage tracking, and presentation policy.
-// Ring0 keeps boot framebuffer discovery plus boot/panic emergency output.
 use core::convert::Infallible;
 use core::ptr;
 
@@ -881,4 +878,3 @@ mod tests {
         assert!(storage[framebuffer_size..].iter().all(|&byte| byte == 0xa5));
     }
 }
-// RING3-MIGRATION-REFERENCE END: commercial-max displayd/uiserver-owned framebuffer policy.

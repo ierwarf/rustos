@@ -90,6 +90,7 @@ pub mod syscall {
     pub const IPC_SERVICE_SESSIOND: u64 = 11;
     pub const IPC_SERVICE_PAGERD: u64 = 12;
     pub const IPC_SERVICE_SERVICE_DRIVERD: u64 = 13;
+    pub const IPC_SERVICE_UISERVER: u64 = 14;
     pub const IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY: u64 = 1 << 0;
     pub const IPC_SERVICE_CAP_VFS_POLICY: u64 = 1 << 1;
     pub const IPC_SERVICE_CAP_NET_POLICY: u64 = 1 << 2;
@@ -103,6 +104,7 @@ pub mod syscall {
     pub const IPC_SERVICE_CAP_SESSION_POLICY: u64 = 1 << 10;
     pub const IPC_SERVICE_CAP_PAGER_POLICY: u64 = 1 << 11;
     pub const IPC_SERVICE_CAP_SERVICE_DRIVER_POLICY: u64 = 1 << 12;
+    pub const IPC_SERVICE_CAP_UI_POLICY: u64 = 1 << 13;
     pub const IPC_SERVICE_CAP_BOOTSTRAP_POLICY: u64 = IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY
         | IPC_SERVICE_CAP_VFS_POLICY
         | IPC_SERVICE_CAP_NET_POLICY
@@ -377,6 +379,7 @@ pub mod syscall {
     pub const COMMERCIAL_MAX_PROTOCOL_PAGERD: u16 = 12;
     pub const COMMERCIAL_MAX_PROTOCOL_SERVICE_DRIVERD: u16 = 13;
     pub const COMMERCIAL_MAX_PROTOCOL_CAPABILITY: u16 = 14;
+    pub const COMMERCIAL_MAX_PROTOCOL_UISERVER: u16 = 15;
     pub const COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST: u16 = 1;
     pub const COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE: u16 = 2;
     pub const COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH: u16 = 3;
@@ -450,6 +453,11 @@ pub mod syscall {
     pub const COMMERCIAL_MAX_SERVICE_DRIVERD_OP_MMIO_LEASE: u16 = 2;
     pub const COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IRQ_ROUTE: u16 = 3;
     pub const COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DMA_BUFFER: u16 = 4;
+    pub const COMMERCIAL_MAX_UISERVER_OP_DISPLAY_READINESS: u16 = 1;
+    pub const COMMERCIAL_MAX_UISERVER_OP_DISPLAY_METADATA: u16 = 2;
+    pub const COMMERCIAL_MAX_UISERVER_OP_SURFACE_POLICY: u16 = 3;
+    pub const COMMERCIAL_MAX_UISERVER_OP_PRESENT_POLICY: u16 = 4;
+    pub const COMMERCIAL_MAX_UISERVER_OP_TERMINAL_PRESENT_POLICY: u16 = 5;
     pub const COMMERCIAL_MAX_CAPABILITY_OP_LEASE_GRANT: u16 = 1;
     pub const COMMERCIAL_MAX_CAPABILITY_OP_LEASE_REVOKE: u16 = 2;
     pub const COMMERCIAL_MAX_CAPABILITY_OP_LEASE_RENEW: u16 = 3;
@@ -2680,6 +2688,7 @@ mod tests {
         assert_eq!(syscall::IPC_SERVICE_SESSIOND, 11);
         assert_eq!(syscall::IPC_SERVICE_PAGERD, 12);
         assert_eq!(syscall::IPC_SERVICE_SERVICE_DRIVERD, 13);
+        assert_eq!(syscall::IPC_SERVICE_UISERVER, 14);
         assert_eq!(syscall::DEVMGRD_IPC_OP_OPEN, 3);
         assert_eq!(syscall::DEVMGRD_IPC_OP_IOCTL_AUTHORIZE, 4);
         assert_eq!(syscall::INPUTD_IPC_OP_DRAIN_INGEST, 4);
@@ -2731,6 +2740,7 @@ mod tests {
         assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_PAGERD, 12);
         assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_SERVICE_DRIVERD, 13);
         assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_CAPABILITY, 14);
+        assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_UISERVER, 15);
         assert_eq!(syscall::COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL, 5);
         assert_eq!(syscall::COMMERCIAL_MAX_PROCD_OP_SESSION_MEMBERSHIP, 7);
         assert_eq!(syscall::COMMERCIAL_MAX_LOADERD_OP_AUXV_PLAN, 7);
@@ -2743,6 +2753,10 @@ mod tests {
         assert_eq!(syscall::COMMERCIAL_MAX_DRIVERD_OP_PROVIDER_SELECT, 4);
         assert_eq!(syscall::COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP, 5);
         assert_eq!(syscall::COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DMA_BUFFER, 4);
+        assert_eq!(
+            syscall::COMMERCIAL_MAX_UISERVER_OP_TERMINAL_PRESENT_POLICY,
+            5
+        );
         assert_eq!(syscall::COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE, 3);
         assert!(
             size_of::<syscall::CommercialMaxProtocolRequest>() <= syscall::IPC_MAX_INLINE_BYTES

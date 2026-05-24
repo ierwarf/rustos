@@ -1,6 +1,3 @@
-// RING3-MIGRATION-REFERENCE START: commercial-max displayd/uiserver should own normal
-// GUI state, draw routing, terminal presentation, and display readiness policy. Ring0
-// keeps only boot console, panic output, and narrow display present primitives.
 mod backend;
 mod framebuffer;
 
@@ -660,4 +657,3 @@ impl EmergencyConsole {
         EMERGENCY_PADDING_Y + row as i32 * self.line_height() as i32
     }
 }
-// RING3-MIGRATION-REFERENCE END: commercial-max displayd/uiserver-owned GUI policy.

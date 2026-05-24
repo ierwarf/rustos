@@ -149,24 +149,25 @@ As of the strict Tier 0 + Tier 1 closure pass:
 
 - Current source LOC: `kernel` 67299, `services` 23143, total 90442
   (`rustos-user-abi` carries 3875 source LOC after the shared Linux ABI move).
-- Commercial-max live migration markers remaining: 21397 LOC. The largest
-  remaining marked surfaces are `usb/xhci.rs` 2126,
+- Commercial-max live migration markers remaining: 16583 LOC. The largest
+  remaining marked surfaces are `usb/xhci.rs` 2125,
   `process/linux.rs` 1297, `proc_broker_ops.rs` 1210,
-  `virtio_gpu.rs` 1195, `ipc_ops.rs` 1063, `serio.rs` 999,
-  and `ps/user/socket.rs` 956.
+  `ipc_ops.rs` 1064, `serio.rs` 999, and `ps/user/socket.rs` 956.
 - Current marked-only projection: `kernel` 45902 before residual broker shells
   and any additional service/shared-ABI overhead.
 - The shared commercial-max protocol envelope is now implemented by the current
   service owners for `rootd`, `procd`, `loaderd`, `syscalld`, `vfsd`,
-  `devmgrd`, `inputd`, `storaged`, `netd`, `driverd`, `sessiond` via
-  `runtimed`, `pagerd` via `syscalld`, and non-`.ko` `service-driverd` via
-  `driverd`. This does not mean all marked ring0 policy has moved; it means
-  the ABI/control-plane precondition is no longer the primary blocker.
-- Current session-policy bridge: `devmgrd` delegates console/session ioctl
-  authorization to `IPC_SERVICE_SESSIOND` for session graph, console route, and
-  foreground focus before invoking the gated ring0 device ioctl broker. This
-  leaves display setup authorization in `devmgrd` and keeps display present as
-  a hot direct path.
+  `devmgrd`, `inputd`, `storaged`, `netd`, `driverd`, `uiserver`,
+  `sessiond` via `runtimed`, `pagerd` via `syscalld`, and non-`.ko`
+  `service-driverd` via `driverd`. This does not mean all marked ring0 policy
+  has moved; it means the ABI/control-plane precondition is no longer the
+  primary blocker.
+- Current display/session policy bridge: `devmgrd` delegates display setup
+  authorization to `IPC_SERVICE_UISERVER` and console/session
+  ioctl authorization to `IPC_SERVICE_SESSIOND` before invoking the gated ring0
+  device ioctl broker. Ring0 still owns the final framebuffer copy/present
+  primitive and hot present path, boot/panic output, and `.ko`/MMIO/DMA
+  execution island.
 - Current capability-policy bridge: `rootd` accepts the generic
   commercial-max capability protocol for service lease grant/revoke/renew
   descriptors. Ring0 still installs and enforces broker capability bits at
@@ -178,8 +179,8 @@ As of the strict Tier 0 + Tier 1 closure pass:
   candidates before falling back to stable descriptor id ordering.
 - Current preparation gate: `cargo xtask ring3-inventory` now classifies the
   remaining migration markers by LOC, owner, lane, and deletion action. Current
-  snapshot is `total_marked_loc=20449`, `excluded_xhci_nvme_loc=2910`, and
-  `active_batch_marked_loc=17539`; the xHCI/NVMe LOC is held outside this
+  snapshot is `total_marked_loc=16583`, `excluded_xhci_nvme_loc=2910`, and
+  `active_batch_marked_loc=13673`; the xHCI/NVMe LOC is held outside this
   batch pending `.ko` replacement strategy.
 - Current runtime gate: `cargo xtask run --profile nvme --accel-profile kvm
   --usb-input --debugcon file --commercial-max-ready -- --no-reboot` is the

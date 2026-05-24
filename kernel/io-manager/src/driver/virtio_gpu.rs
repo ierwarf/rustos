@@ -1,7 +1,3 @@
-// RING3-MIGRATION-REFERENCE START: commercial-max displayd/uiserver should own
-// virtio-gpu resource policy, scanout setup, and normal display present only for a
-// non-.ko service driver rewrite. RustOS-authored `.ko` GPU drivers stay ring0 with
-// Linux `.ko` compatibility; ring0 also keeps boot/panic output and MMIO/DMA grants.
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering, compiler_fence};
 
@@ -1328,4 +1324,3 @@ unsafe fn write_common_u64(base: *mut u8, offset: usize, value: u64) {
 fn align_up(value: usize, align: usize) -> usize {
     (value + align - 1) & !(align - 1)
 }
-// RING3-MIGRATION-REFERENCE END: commercial-max displayd/uiserver-owned non-.ko virtio-gpu service driver.

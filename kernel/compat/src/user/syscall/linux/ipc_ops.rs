@@ -261,6 +261,7 @@ fn service_capability(service_id: u64) -> u64 {
         linux_abi::IPC_SERVICE_SERVICE_DRIVERD => {
             rustos_user_abi::syscall::IPC_SERVICE_CAP_SERVICE_DRIVER_POLICY
         }
+        linux_abi::IPC_SERVICE_UISERVER => rustos_user_abi::syscall::IPC_SERVICE_CAP_UI_POLICY,
         _ => 0,
     }
 }

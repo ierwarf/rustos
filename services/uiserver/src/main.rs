@@ -500,6 +500,7 @@ fn run() -> Result<(), i32> {
     let boot_started = Instant::now();
     diag_line("uiserver: run initialize begin");
     let mut state = AppState::initialize()?;
+    sys::publish_display_policy_metadata(state.display);
     diag_line("uiserver: run initialize done");
     log_boot_stage(boot_started, "initialize");
     let desktop_background = start_desktop_background_loader(
@@ -553,6 +554,7 @@ fn run() -> Result<(), i32> {
     let mut wayland = WaylandCompositor::initialize(state.display.width, state.display.height);
     diag_line("uiserver: wayland initialize done");
     log_boot_stage(wayland_init_started, "wayland_initialize");
+    sys::mark_display_policy_ready();
     match runtime.notify_ui_ready() {
         Ok(()) => diag_line("uiserver: ui ready notified"),
         Err(err) => diag_line(format!("uiserver: ui ready notify failed errno={err}")),
@@ -820,6 +822,12 @@ fn main() {
     profile_line("uiserver profile: startup");
     install_panic_hook();
     boot_line("uiserver: panic hook installed");
+    if let Err(err) = sys::start_display_policy_endpoint() {
+        diag_line(format!(
+            "uiserver: display policy endpoint failed errno={err}"
+        ));
+        std::process::exit(err);
+    }
     let exit_code = match run() {
         Ok(()) => 0,
         Err(code) => code,

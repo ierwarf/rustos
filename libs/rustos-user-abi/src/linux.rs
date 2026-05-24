@@ -1441,6 +1441,7 @@ pub const IPC_SERVICE_ROOTD: u64 = crate::syscall::IPC_SERVICE_ROOTD;
 pub const IPC_SERVICE_SESSIOND: u64 = crate::syscall::IPC_SERVICE_SESSIOND;
 pub const IPC_SERVICE_PAGERD: u64 = crate::syscall::IPC_SERVICE_PAGERD;
 pub const IPC_SERVICE_SERVICE_DRIVERD: u64 = crate::syscall::IPC_SERVICE_SERVICE_DRIVERD;
+pub const IPC_SERVICE_UISERVER: u64 = crate::syscall::IPC_SERVICE_UISERVER;
 
 #[cfg(test)]
 mod tests {

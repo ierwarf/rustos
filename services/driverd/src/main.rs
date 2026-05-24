@@ -4,10 +4,6 @@ use std::time::Instant;
 use std::{collections::BTreeSet, fs, thread, time::Duration};
 
 use rustos_user_abi::syscall::{
-    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, LinuxSyscallOffloadRequest,
-    LinuxSyscallOffloadResponse, RustosDriverLoadModuleBrokerArgs,
-    RustosDriverProbeAliasBrokerArgs, RustosDriverProviderActiveBrokerArgs,
     COMMERCIAL_MAX_DRIVERD_OP_DRIVER_PLAN, COMMERCIAL_MAX_DRIVERD_OP_FALLBACK_POLICY,
     COMMERCIAL_MAX_DRIVERD_OP_MODULE_LOAD_AUTHORIZE, COMMERCIAL_MAX_DRIVERD_OP_PROVIDER_SELECT,
     COMMERCIAL_MAX_DRIVERD_OP_RETRY_BUDGET, COMMERCIAL_MAX_DRIVERD_OP_SYMBOL_POLICY,
@@ -15,14 +11,17 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_SERVICE_DRIVERD,
     COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DMA_BUFFER,
     COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DRIVER_INSTANCE, COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IRQ_ROUTE,
-    COMMERCIAL_MAX_SERVICE_DRIVERD_OP_MMIO_LEASE, DRIVER_BUS_PCI, DRIVER_BUS_PLATFORM,
-    DRIVER_BUS_SERIO, DRIVER_BUS_USB, DRIVER_BUS_VIRTIO, DRIVER_CLASS_DISPLAY, DRIVER_CLASS_INPUT,
+    COMMERCIAL_MAX_SERVICE_DRIVERD_OP_MMIO_LEASE, CommercialMaxCapabilityLeaseWire,
+    CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
+    CommercialMaxProtocolResponse, DRIVER_BUS_PCI, DRIVER_BUS_PLATFORM, DRIVER_BUS_SERIO,
+    DRIVER_BUS_USB, DRIVER_BUS_VIRTIO, DRIVER_CLASS_DISPLAY, DRIVER_CLASS_INPUT,
     DRIVER_CLASS_NETWORK, IPC_SERVICE_DRIVERD, IPC_SERVICE_SERVICE_DRIVERD,
-    SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_DRIVER_LOAD_POLICY,
-    SYSCALL_OFFLOAD_PATH_CAPACITY, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER,
-    SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER, SYS_RUSTOS_DRIVER_PROVIDER_ACTIVE_BROKER,
-    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
-    SYS_RUSTOS_IPC_REPLY,
+    LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, RustosDriverLoadModuleBrokerArgs,
+    RustosDriverProbeAliasBrokerArgs, RustosDriverProviderActiveBrokerArgs, SYS_RUSTOS_DEBUG_PRINT,
+    SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER, SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER,
+    SYS_RUSTOS_DRIVER_PROVIDER_ACTIVE_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV,
+    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY, SYSCALL_OFFLOAD_ABI_VERSION,
+    SYSCALL_OFFLOAD_OP_DRIVER_LOAD_POLICY, SYSCALL_OFFLOAD_PATH_CAPACITY,
 };
 
 const RECV_BACKOFF: Duration = Duration::from_millis(10);
@@ -236,6 +235,14 @@ fn load_record(
         ));
         return LoadResult::Progress;
     }
+    if is_non_ko_virtio_display(record) && !authorize_display_service_driver(record) {
+        skipped.insert(record.name.clone());
+        debug_line(&format!(
+            "driverd: skipped name={} reason=service-driver display lease denied",
+            record.name
+        ));
+        return LoadResult::Progress;
+    }
     let load_started = Instant::now();
     let result = load_module(record);
     debug_line(&format!(
@@ -300,6 +307,23 @@ fn aliases_match(record: &DriverRecord) -> bool {
         }
     }
     !saw_alias
+}
+
+fn is_non_ko_virtio_display(record: &DriverRecord) -> bool {
+    record.class == DRIVER_CLASS_DISPLAY
+        && record.bus == DRIVER_BUS_VIRTIO
+        && !record.image_path.ends_with(".ko")
+}
+
+fn authorize_display_service_driver(record: &DriverRecord) -> bool {
+    if record.provider_group.trim().is_empty() || record.fallback_only {
+        return false;
+    }
+    debug_line(&format!(
+        "driverd: service-driver display lease granted name={} group={} bus={}",
+        record.name, record.provider_group, record.bus
+    ));
+    true
 }
 
 fn load_module(record: &DriverRecord) -> i64 {

@@ -7,11 +7,12 @@ use std::ffi::CString;
 use std::fs;
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
 
 use keyboard_core::{KeyAction, KeyCode, KeyboardDriver};
-use rustos_user_abi::{console as console_abi, device as device_abi};
+use rustos_user_abi::{console as console_abi, device as device_abi, syscall as syscall_abi};
 
 use console_abi::{
     ConsoleSendInputEventRequest, ConsoleSetFocusRequest, ConsoleSnapshotSessionOutputRequest,
@@ -32,6 +33,11 @@ const SYS_MMAP: usize = 9;
 const SYS_MUNMAP: usize = 11;
 const SYS_IOCTL: usize = 16;
 const SYS_OPENAT: usize = 257;
+const SYS_RUSTOS_IPC_ENDPOINT_CREATE: usize = syscall_abi::SYS_RUSTOS_IPC_ENDPOINT_CREATE as usize;
+const SYS_RUSTOS_IPC_RECV: usize = syscall_abi::SYS_RUSTOS_IPC_RECV as usize;
+const SYS_RUSTOS_IPC_REPLY: usize = syscall_abi::SYS_RUSTOS_IPC_REPLY as usize;
+const SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT: usize =
+    syscall_abi::SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT as usize;
 
 const AT_FDCWD: isize = -100;
 const O_RDONLY: usize = 0;
@@ -45,6 +51,8 @@ const MAP_SHARED: usize = 0x01;
 const PAGE_SIZE: usize = 4096;
 const MAX_SURFACE_MAPPING_BYTES: usize = 128 * 1024 * 1024;
 const MAX_SHARED_FD_MAPPING_BYTES: usize = 64 * 1024 * 1024;
+const DISPLAY_POLICY_MAX_WIDTH: u64 = 7680;
+const DISPLAY_POLICY_MAX_HEIGHT: u64 = 4320;
 const MAX_EVDEV_EVENTS_PER_READ: usize = 512;
 const EV_SYN: u16 = 0x00;
 const EV_KEY: u16 = 0x01;
@@ -69,6 +77,16 @@ pub(crate) const ENOENT: i32 = 2;
 pub(crate) const EINVAL: i32 = 22;
 pub(crate) const ESTALE: i32 = 116;
 pub(crate) type ConsoleSessionHandle = u64;
+
+static DISPLAY_POLICY_READY: AtomicBool = AtomicBool::new(false);
+static DISPLAY_POLICY_WIDTH: AtomicU32 = AtomicU32::new(0);
+static DISPLAY_POLICY_HEIGHT: AtomicU32 = AtomicU32::new(0);
+static DISPLAY_POLICY_STRIDE: AtomicU32 = AtomicU32::new(0);
+static DISPLAY_POLICY_BPP: AtomicU32 = AtomicU32::new(0);
+static DISPLAY_POLICY_FORMAT: AtomicU32 = AtomicU32::new(0);
+static DISPLAY_POLICY_FLAGS: AtomicU32 = AtomicU32::new(0);
+static DISPLAY_POLICY_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 struct LinuxInputTimeval {
@@ -95,6 +113,217 @@ struct InputTranslationState {
 fn input_translation_state() -> &'static Mutex<InputTranslationState> {
     static STATE: OnceLock<Mutex<InputTranslationState>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(InputTranslationState::default()))
+}
+
+pub(crate) fn start_display_policy_endpoint() -> Result<(), i32> {
+    let endpoint = unsafe { syscall0(SYS_RUSTOS_IPC_ENDPOINT_CREATE) };
+    if is_syscall_error(endpoint) {
+        return Err(errno_from_result(endpoint));
+    }
+    let register = unsafe {
+        syscall2(
+            SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
+            syscall_abi::IPC_SERVICE_UISERVER as usize,
+            endpoint as usize,
+        )
+    };
+    if is_syscall_error(register) {
+        return Err(errno_from_result(register));
+    }
+    thread::Builder::new()
+        .name(String::from("uiserver-display-policy"))
+        .spawn(move || serve_display_policy(endpoint as u64))
+        .map_err(|_| EINVAL)?;
+    diag_line("uiserver: display policy endpoint registered");
+    Ok(())
+}
+
+pub(crate) fn publish_display_policy_metadata(display: DisplayInfo) {
+    DISPLAY_POLICY_WIDTH.store(display.width, Ordering::Release);
+    DISPLAY_POLICY_HEIGHT.store(display.height, Ordering::Release);
+    DISPLAY_POLICY_STRIDE.store(display.stride_bytes, Ordering::Release);
+    DISPLAY_POLICY_BPP.store(display.bytes_per_pixel, Ordering::Release);
+    DISPLAY_POLICY_FORMAT.store(display.pixel_format, Ordering::Release);
+    DISPLAY_POLICY_FLAGS.store(display.flags, Ordering::Release);
+    DISPLAY_POLICY_GENERATION.store(display.generation, Ordering::Release);
+}
+
+pub(crate) fn mark_display_policy_ready() {
+    DISPLAY_POLICY_READY.store(true, Ordering::Release);
+}
+
+fn serve_display_policy(endpoint: u64) {
+    loop {
+        let mut request = syscall_abi::CommercialMaxProtocolRequest::default();
+        let mut reply_cap = 0_u64;
+        let received = unsafe {
+            syscall4(
+                SYS_RUSTOS_IPC_RECV,
+                endpoint as usize,
+                (&mut request as *mut syscall_abi::CommercialMaxProtocolRequest) as usize,
+                size_of::<syscall_abi::CommercialMaxProtocolRequest>(),
+                (&mut reply_cap as *mut u64) as usize,
+            )
+        };
+        if is_syscall_error(received) {
+            thread::sleep(std::time::Duration::from_millis(10));
+            continue;
+        }
+        let response = dispatch_display_policy_request(received as usize, &request);
+        let reply = unsafe {
+            syscall3(
+                SYS_RUSTOS_IPC_REPLY,
+                reply_cap as usize,
+                (&response as *const syscall_abi::CommercialMaxProtocolResponse) as usize,
+                size_of::<syscall_abi::CommercialMaxProtocolResponse>(),
+            )
+        };
+        if is_syscall_error(reply) {
+            diag_line(format!(
+                "uiserver: display policy reply failed errno={}",
+                errno_from_result(reply)
+            ));
+        }
+    }
+}
+
+fn dispatch_display_policy_request(
+    received: usize,
+    request: &syscall_abi::CommercialMaxProtocolRequest,
+) -> syscall_abi::CommercialMaxProtocolResponse {
+    let mut response = syscall_abi::CommercialMaxProtocolResponse {
+        header: request.header,
+        ..syscall_abi::CommercialMaxProtocolResponse::default()
+    };
+    response.header.version = syscall_abi::COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    response.status = match validate_display_policy_request(received, request) {
+        Ok(()) => fill_display_policy_response(request, &mut response),
+        Err(errno) => errno,
+    };
+    response
+}
+
+fn validate_display_policy_request(
+    received: usize,
+    request: &syscall_abi::CommercialMaxProtocolRequest,
+) -> Result<(), i32> {
+    if received != size_of::<syscall_abi::CommercialMaxProtocolRequest>()
+        || request.header.version != syscall_abi::COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
+        || request.header.protocol != syscall_abi::COMMERCIAL_MAX_PROTOCOL_UISERVER
+        || request.header.flags != 0
+        || request.path_len as usize > request.path.len()
+        || request.payload_len as usize > request.payload.len()
+    {
+        return Err(libc::EINVAL);
+    }
+    match request.header.op {
+        syscall_abi::COMMERCIAL_MAX_UISERVER_OP_DISPLAY_READINESS
+        | syscall_abi::COMMERCIAL_MAX_UISERVER_OP_DISPLAY_METADATA
+        | syscall_abi::COMMERCIAL_MAX_UISERVER_OP_SURFACE_POLICY
+        | syscall_abi::COMMERCIAL_MAX_UISERVER_OP_PRESENT_POLICY
+        | syscall_abi::COMMERCIAL_MAX_UISERVER_OP_TERMINAL_PRESENT_POLICY => Ok(()),
+        _ => Err(libc::EINVAL),
+    }
+}
+
+fn fill_display_policy_response(
+    request: &syscall_abi::CommercialMaxProtocolRequest,
+    response: &mut syscall_abi::CommercialMaxProtocolResponse,
+) -> i32 {
+    match request.header.op {
+        syscall_abi::COMMERCIAL_MAX_UISERVER_OP_DISPLAY_READINESS => {
+            response.value0 = if DISPLAY_POLICY_READY.load(Ordering::Acquire) {
+                1
+            } else {
+                0
+            };
+            response.value1 = DISPLAY_POLICY_GENERATION.load(Ordering::Acquire);
+            response.capability = display_policy_capability("display-readiness", request.header.op);
+            0
+        }
+        syscall_abi::COMMERCIAL_MAX_UISERVER_OP_DISPLAY_METADATA => {
+            response.value0 = (u64::from(DISPLAY_POLICY_WIDTH.load(Ordering::Acquire)) << 32)
+                | u64::from(DISPLAY_POLICY_HEIGHT.load(Ordering::Acquire));
+            response.value1 = (u64::from(DISPLAY_POLICY_STRIDE.load(Ordering::Acquire)) << 32)
+                | u64::from(DISPLAY_POLICY_BPP.load(Ordering::Acquire));
+            response.capability = display_policy_capability("display-metadata", request.header.op);
+            response.descriptor_count = 1;
+            response.descriptors[0] =
+                display_policy_descriptor("display-metadata", request.header.op);
+            0
+        }
+        syscall_abi::COMMERCIAL_MAX_UISERVER_OP_SURFACE_POLICY => {
+            if request.arg1 > DISPLAY_POLICY_MAX_WIDTH || request.arg2 > DISPLAY_POLICY_MAX_HEIGHT {
+                return libc::EINVAL;
+            }
+            if request.arg3 != 0 && request.arg3 != u64::from(device_abi::PIXEL_FORMAT_BGRA8888) {
+                return libc::EINVAL;
+            }
+            response.capability = display_policy_capability("surface-policy", request.header.op);
+            0
+        }
+        syscall_abi::COMMERCIAL_MAX_UISERVER_OP_PRESENT_POLICY => {
+            response.capability = display_policy_capability("present-policy", request.header.op);
+            0
+        }
+        syscall_abi::COMMERCIAL_MAX_UISERVER_OP_TERMINAL_PRESENT_POLICY => {
+            response.capability =
+                display_policy_capability("terminal-present-policy", request.header.op);
+            0
+        }
+        _ => libc::EINVAL,
+    }
+}
+
+fn display_policy_descriptor(
+    label: &str,
+    op: u16,
+) -> syscall_abi::CommercialMaxProtocolDescriptorWire {
+    let mut descriptor = syscall_abi::CommercialMaxProtocolDescriptorWire {
+        protocol: syscall_abi::COMMERCIAL_MAX_PROTOCOL_UISERVER,
+        op,
+        service_id: syscall_abi::IPC_SERVICE_UISERVER,
+        capability_mask: display_policy_capability_mask(op),
+        value0: (u64::from(DISPLAY_POLICY_WIDTH.load(Ordering::Acquire)) << 32)
+            | u64::from(DISPLAY_POLICY_HEIGHT.load(Ordering::Acquire)),
+        value1: DISPLAY_POLICY_GENERATION.load(Ordering::Acquire),
+        ..syscall_abi::CommercialMaxProtocolDescriptorWire::default()
+    };
+    copy_policy_label(label, &mut descriptor.name, &mut descriptor.name_len);
+    descriptor
+}
+
+fn display_policy_capability(
+    label: &str,
+    op: u16,
+) -> syscall_abi::CommercialMaxCapabilityLeaseWire {
+    let mut capability = syscall_abi::CommercialMaxCapabilityLeaseWire {
+        lease_id: ((syscall_abi::COMMERCIAL_MAX_PROTOCOL_UISERVER as u64) << 32) | u64::from(op),
+        service_id: syscall_abi::IPC_SERVICE_UISERVER,
+        capability_mask: display_policy_capability_mask(op),
+        rights_mask: display_policy_capability_mask(op),
+        ..syscall_abi::CommercialMaxCapabilityLeaseWire::default()
+    };
+    copy_policy_label(label, &mut capability.label, &mut capability.label_len);
+    capability
+}
+
+fn display_policy_capability_mask(op: u16) -> u64 {
+    match op {
+        syscall_abi::COMMERCIAL_MAX_UISERVER_OP_DISPLAY_READINESS => 1 << 0,
+        syscall_abi::COMMERCIAL_MAX_UISERVER_OP_DISPLAY_METADATA => 1 << 1,
+        syscall_abi::COMMERCIAL_MAX_UISERVER_OP_SURFACE_POLICY => 1 << 2,
+        syscall_abi::COMMERCIAL_MAX_UISERVER_OP_PRESENT_POLICY => 1 << 3,
+        syscall_abi::COMMERCIAL_MAX_UISERVER_OP_TERMINAL_PRESENT_POLICY => 1 << 4,
+        _ => 0,
+    }
+}
+
+fn copy_policy_label(label: &str, target: &mut [u8], len: &mut u16) {
+    let bytes = label.as_bytes();
+    let count = bytes.len().min(target.len());
+    target[..count].copy_from_slice(&bytes[..count]);
+    *len = count as u16;
 }
 
 const DISPLAY_IOCTL_GET_INFO: usize = device_abi::DISPLAY_IOCTL_GET_INFO as usize;
@@ -814,6 +1043,20 @@ unsafe fn syscall2(number: usize, arg0: usize, arg1: usize) -> isize {
             inlateout("rax") number as isize => result,
             in("rdi") arg0 as isize,
             in("rsi") arg1 as isize,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    result
+}
+
+unsafe fn syscall0(number: usize) -> isize {
+    let result: isize;
+    unsafe {
+        asm!(
+            "syscall",
+            inlateout("rax") number as isize => result,
             lateout("rcx") _,
             lateout("r11") _,
             options(nostack),
