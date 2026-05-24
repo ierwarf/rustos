@@ -13,9 +13,6 @@ const EDIT_BUFFER_CAPACITY: usize = 256;
 const CURSOR_MOVE_SEQUENCE_MAX_LEN: usize = 16;
 const TTY_DEBUG_LOG_LIMIT: usize = 32;
 
-// RING3-MIGRATION-REFERENCE START: TTY line discipline, edit buffers,
-// termios/session input policy, and wake/read behavior should move to a
-// session or console service. Ring0 keeps only boot/panic console substrate.
 static TTY: KernelWaitLock<TtyCollection> = KernelWaitLock::new(TtyCollection::new());
 static TTY_COMMIT_DEBUG_LOGS: AtomicUsize = AtomicUsize::new(0);
 static TTY_WAKE_DEBUG_LOGS: AtomicUsize = AtomicUsize::new(0);
@@ -633,7 +630,6 @@ fn copy_bytes(dest: &mut [u8], source: &[u8]) -> usize {
     dest[..len].copy_from_slice(&source[..len]);
     len
 }
-// RING3-MIGRATION-REFERENCE END: session-service-owned TTY policy.
 
 #[cfg(test)]
 mod tests {

@@ -9,9 +9,6 @@ const OUTPUT_BUFFER_CAPACITY: usize = 4096;
 const PENDING_BUFFER_CAPACITY: usize = 4096;
 const FLUSH_CHUNK_CAPACITY: usize = 256;
 
-// RING3-MIGRATION-REFERENCE START: normal console buffering, per-session
-// snapshots, and flush policy should move to a session/console service.
-// Ring0 keeps early boot console and panic/debug sinks.
 static CONSOLE: KernelWaitLock<ConsoleState> = KernelWaitLock::new(ConsoleState::new());
 
 pub fn init() {
@@ -276,7 +273,6 @@ impl ConsoleSessionState {
         };
     }
 }
-// RING3-MIGRATION-REFERENCE END: session-service-owned console policy.
 
 #[cfg(test)]
 mod tests {
