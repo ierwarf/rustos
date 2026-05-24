@@ -368,7 +368,7 @@ pub mod syscall {
     pub const COMMERCIAL_MAX_PROTOCOL_ABI_VERSION: u16 = 1;
     pub const COMMERCIAL_MAX_PROTOCOL_NAME_CAPACITY: usize = 32;
     pub const COMMERCIAL_MAX_PROTOCOL_PATH_CAPACITY: usize = 256;
-    pub const COMMERCIAL_MAX_PROTOCOL_PAYLOAD_CAPACITY: usize = 512;
+    pub const COMMERCIAL_MAX_PROTOCOL_PAYLOAD_CAPACITY: usize = 4096;
     pub const COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS: usize = 16;
     pub const COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR: u16 = 1;
     pub const COMMERCIAL_MAX_PROTOCOL_PROCD: u16 = 2;
@@ -1224,7 +1224,10 @@ pub mod syscall {
         pub fd: u64,
         pub request: u64,
         pub arg: u64,
+        pub payload_len: u32,
+        pub reserved1: u32,
         pub reserved0: u64,
+        pub payload: [u8; COMMERCIAL_MAX_PROTOCOL_PAYLOAD_CAPACITY],
     }
 
     impl Default for DevmgrdDeviceIoctlRequest {
@@ -1243,19 +1246,40 @@ pub mod syscall {
                 fd: 0,
                 request: 0,
                 arg: 0,
+                payload_len: 0,
+                reserved1: 0,
                 reserved0: 0,
+                payload: [0; COMMERCIAL_MAX_PROTOCOL_PAYLOAD_CAPACITY],
             }
         }
     }
 
     #[repr(C)]
-    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub struct DevmgrdDeviceIoctlResponse {
         pub version: u16,
         pub op: u16,
         pub status: i32,
         pub value: u64,
+        pub payload_len: u32,
+        pub reserved1: u32,
         pub reserved0: u64,
+        pub payload: [u8; COMMERCIAL_MAX_PROTOCOL_PAYLOAD_CAPACITY],
+    }
+
+    impl Default for DevmgrdDeviceIoctlResponse {
+        fn default() -> Self {
+            Self {
+                version: 0,
+                op: 0,
+                status: 0,
+                value: 0,
+                payload_len: 0,
+                reserved1: 0,
+                reserved0: 0,
+                payload: [0; COMMERCIAL_MAX_PROTOCOL_PAYLOAD_CAPACITY],
+            }
+        }
     }
 
     #[repr(C)]
@@ -2216,12 +2240,12 @@ mod syscall_tests {
     use core::mem::size_of;
 
     use super::syscall::{
-        LinuxRlimit, LinuxSigActionWire, LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse,
-        LinuxTimespecWire, LinuxUtsName, VfsIpcRequest, VfsIpcResponse, IPC_MAX_INLINE_BYTES,
-        LINUX_RLIMIT_SIZE, LINUX_SIGACTION_SIZE, LINUX_STATX_SIZE, LINUX_TIMESPEC_SIZE,
-        LINUX_UTSNAME_SIZE, SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_STATX,
-        SYSCALL_OFFLOAD_PATH_CAPACITY, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, VFS_IPC_ABI_VERSION,
-        VFS_IPC_OP_OPENAT,
+        IPC_MAX_INLINE_BYTES, LINUX_RLIMIT_SIZE, LINUX_SIGACTION_SIZE, LINUX_STATX_SIZE,
+        LINUX_TIMESPEC_SIZE, LINUX_UTSNAME_SIZE, LinuxRlimit, LinuxSigActionWire,
+        LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, LinuxTimespecWire, LinuxUtsName,
+        SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_STATX, SYSCALL_OFFLOAD_PATH_CAPACITY,
+        SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, VFS_IPC_ABI_VERSION, VFS_IPC_OP_OPENAT, VfsIpcRequest,
+        VfsIpcResponse,
     };
 
     #[test]

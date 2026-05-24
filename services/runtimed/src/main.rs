@@ -18,7 +18,8 @@ use runtime_control::{
 };
 use rustos_user_abi::console::{
     self as console_abi, ConsoleCloseSessionRequest, ConsoleCreateSessionRequest,
-    ConsoleSetFocusRequest, ConsoleSetSessionStateRequest,
+    ConsoleSessionInfo, ConsoleSetFocusRequest, ConsoleSetSessionStateRequest,
+    ConsoleSnapshotSessionsRequest, ConsoleStateInfo,
 };
 use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_SESSIOND,
@@ -70,6 +71,7 @@ const UI_SERVER_DESKTOP_FILE_ID: &str = "uiserver.desktop";
 const UI_SERVER_DISPLAY_NAME: &str = "UI Server";
 const UI_SERVER_EXEC_PATH: &str = "services/uiserver/uiserver.elf";
 static LOADER_ENDPOINT_CACHE: AtomicU64 = AtomicU64::new(0);
+static SESSION_GRAPH_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -400,15 +402,7 @@ fn handle_session_request(
     }
     match request.header.op {
         COMMERCIAL_MAX_SESSIOND_OP_SESSION_GRAPH => {
-            let session_count = state
-                .running
-                .values()
-                .filter(|program| program.session_handle != 0)
-                .count();
-            response.value0 = state.running.len() as u64;
-            response.value1 = session_count as u64;
-            fill_session_program_descriptors(state, response);
-            0
+            handle_session_graph_request(request, state, response)
         }
         COMMERCIAL_MAX_SESSIOND_OP_TTY_LINE_DISCIPLINE => {
             response.descriptor_count = 1;
@@ -493,6 +487,95 @@ fn session_op_accepts_ioctl(op: u16, request_number: u64) -> bool {
         | COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP => false,
         _ => false,
     }
+}
+
+fn handle_session_graph_request(
+    request: &CommercialMaxProtocolRequest,
+    state: &BrokerState,
+    response: &mut CommercialMaxProtocolResponse,
+) -> i32 {
+    let session_count = state
+        .running
+        .values()
+        .filter(|program| program.session_handle != 0)
+        .count();
+    response.value0 = focused_session_handle(state);
+    response.value1 = session_count as u64;
+    fill_session_program_descriptors(state, response);
+
+    match request.arg0 {
+        0 => 0,
+        console_abi::CONSOLE_IOCTL_GET_STATE => {
+            let info = ConsoleStateInfo {
+                focused_session_handle: response.value0,
+                session_count: session_count as u32,
+                reserved: 0,
+            };
+            copy_payload(response, as_bytes(&info))
+        }
+        console_abi::CONSOLE_IOCTL_SNAPSHOT_SESSIONS => {
+            if request.payload_len as usize != size_of::<ConsoleSnapshotSessionsRequest>() {
+                return libc::EINVAL;
+            }
+            let mut snapshot = read_unaligned::<ConsoleSnapshotSessionsRequest>(&request.payload);
+            let capacity = snapshot
+                .capacity
+                .min(console_abi::MAX_CONSOLE_SESSIONS as u64) as usize;
+            let mut payload_len = size_of::<ConsoleSnapshotSessionsRequest>();
+            let max_payload_len = payload_len
+                .saturating_add(capacity.saturating_mul(size_of::<ConsoleSessionInfo>()));
+            if max_payload_len > response.payload.len() {
+                return libc::EINVAL;
+            }
+
+            let focused = focused_session_handle(state);
+            let generation = SESSION_GRAPH_GENERATION.fetch_add(1, Ordering::Relaxed);
+            let mut written = 0usize;
+            for program in state.running.values() {
+                if program.session_handle == 0 || written >= capacity {
+                    continue;
+                }
+                let mut info = ConsoleSessionInfo {
+                    session_handle: program.session_handle,
+                    state: CONSOLE_SESSION_STATE_RUNNING,
+                    focused: u16::from(program.session_handle == focused),
+                    reserved: 0,
+                    output_generation: generation,
+                    ..ConsoleSessionInfo::default()
+                };
+                copy_ascii_into(&mut info.title, &program.display_name);
+                let bytes = as_bytes(&info);
+                response.payload[payload_len..payload_len + bytes.len()].copy_from_slice(bytes);
+                payload_len += bytes.len();
+                written += 1;
+            }
+            snapshot.count = written as u64;
+            response.payload[..size_of::<ConsoleSnapshotSessionsRequest>()]
+                .copy_from_slice(as_bytes(&snapshot));
+            response.payload_len = payload_len as u32;
+            0
+        }
+        _ => 0,
+    }
+}
+
+fn focused_session_handle(state: &BrokerState) -> u64 {
+    state
+        .running
+        .values()
+        .filter(|program| program.session_handle != 0)
+        .map(|program| program.session_handle)
+        .max()
+        .unwrap_or(0)
+}
+
+fn copy_payload(response: &mut CommercialMaxProtocolResponse, bytes: &[u8]) -> i32 {
+    if bytes.len() > response.payload.len() {
+        return libc::EINVAL;
+    }
+    response.payload[..bytes.len()].copy_from_slice(bytes);
+    response.payload_len = bytes.len() as u32;
+    0
 }
 
 fn fill_session_program_descriptors(
@@ -1954,4 +2037,9 @@ fn as_bytes<T>(value: &T) -> &[u8] {
 
 fn as_bytes_mut<T>(value: &mut T) -> &mut [u8] {
     unsafe { std::slice::from_raw_parts_mut((value as *mut T).cast::<u8>(), size_of::<T>()) }
+}
+
+fn read_unaligned<T: Copy>(bytes: &[u8]) -> T {
+    assert!(bytes.len() >= size_of::<T>());
+    unsafe { bytes.as_ptr().cast::<T>().read_unaligned() }
 }

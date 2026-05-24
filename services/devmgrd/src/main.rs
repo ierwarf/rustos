@@ -4,11 +4,6 @@ use std::thread;
 use std::time::Duration;
 
 use rustos_user_abi::syscall::{
-    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, DevmgrdDeviceIoctlRequest,
-    DevmgrdDeviceIoctlResponse, DevmgrdDeviceOpenRequest, DevmgrdDeviceOpenResponse,
-    DevmgrdIpcRequest, DevmgrdIpcResponse, DevmgrdNodeEntry, IpcReplyWithHandlesArgs,
-    RustosDeviceIoctlBrokerArgs, RustosDeviceOpenBrokerArgs,
     COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_EVENT_SUBSCRIBE, COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_MAP,
     COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_OPEN, COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_REGISTRY,
     COMMERCIAL_MAX_DEVMGRD_OP_IOCTL_AUTHORIZE, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
@@ -16,14 +11,19 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_PROTOCOL_SESSIOND, COMMERCIAL_MAX_PROTOCOL_UISERVER,
     COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE, COMMERCIAL_MAX_SESSIOND_OP_FOREGROUND_FOCUS,
     COMMERCIAL_MAX_SESSIOND_OP_SESSION_GRAPH, COMMERCIAL_MAX_UISERVER_OP_DISPLAY_METADATA,
-    COMMERCIAL_MAX_UISERVER_OP_SURFACE_POLICY, DEVMGRD_DEVICE_ACCESS_EVDEV,
-    DEVMGRD_DEVICE_ACCESS_NATIVE, DEVMGRD_DEVICE_ID_CONSOLE, DEVMGRD_DEVICE_ID_DISPLAY,
-    DEVMGRD_DEVICE_ID_INPUT, DEVMGRD_DEVICE_RIGHT_ADMIN, DEVMGRD_DEVICE_RIGHT_IOCTL,
-    DEVMGRD_DEVICE_RIGHT_MAP, DEVMGRD_DEVICE_RIGHT_READ, DEVMGRD_DEVICE_RIGHT_TRANSFER,
-    DEVMGRD_DEVICE_RIGHT_WRITE, DEVMGRD_IPC_ABI_VERSION, DEVMGRD_IPC_OP_IOCTL_AUTHORIZE,
-    DEVMGRD_IPC_OP_LOOKUP, DEVMGRD_IPC_OP_OPEN, DEVMGRD_IPC_OP_READDIR, DEVMGRD_MAX_DIR_ENTRIES,
-    DEVMGRD_NAME_CAPACITY, DEVMGRD_NODE_KIND_DEVICE, DEVMGRD_NODE_KIND_DIR, IPC_MAX_INLINE_BYTES,
-    IPC_SERVICE_DEVMGRD, IPC_SERVICE_SESSIOND, IPC_SERVICE_UISERVER, SYS_RUSTOS_DEBUG_PRINT,
+    COMMERCIAL_MAX_UISERVER_OP_SURFACE_POLICY, CommercialMaxCapabilityLeaseWire,
+    CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
+    CommercialMaxProtocolResponse, DEVMGRD_DEVICE_ACCESS_EVDEV, DEVMGRD_DEVICE_ACCESS_NATIVE,
+    DEVMGRD_DEVICE_ID_CONSOLE, DEVMGRD_DEVICE_ID_DISPLAY, DEVMGRD_DEVICE_ID_INPUT,
+    DEVMGRD_DEVICE_RIGHT_ADMIN, DEVMGRD_DEVICE_RIGHT_IOCTL, DEVMGRD_DEVICE_RIGHT_MAP,
+    DEVMGRD_DEVICE_RIGHT_READ, DEVMGRD_DEVICE_RIGHT_TRANSFER, DEVMGRD_DEVICE_RIGHT_WRITE,
+    DEVMGRD_IPC_ABI_VERSION, DEVMGRD_IPC_OP_IOCTL_AUTHORIZE, DEVMGRD_IPC_OP_LOOKUP,
+    DEVMGRD_IPC_OP_OPEN, DEVMGRD_IPC_OP_READDIR, DEVMGRD_MAX_DIR_ENTRIES, DEVMGRD_NAME_CAPACITY,
+    DEVMGRD_NODE_KIND_DEVICE, DEVMGRD_NODE_KIND_DIR, DevmgrdDeviceIoctlRequest,
+    DevmgrdDeviceIoctlResponse, DevmgrdDeviceOpenRequest, DevmgrdDeviceOpenResponse,
+    DevmgrdIpcRequest, DevmgrdIpcResponse, DevmgrdNodeEntry, IPC_MAX_INLINE_BYTES,
+    IPC_SERVICE_DEVMGRD, IPC_SERVICE_SESSIOND, IPC_SERVICE_UISERVER, IpcReplyWithHandlesArgs,
+    RustosDeviceIoctlBrokerArgs, RustosDeviceOpenBrokerArgs, SYS_RUSTOS_DEBUG_PRINT,
     SYS_RUSTOS_DEVICE_IOCTL_BROKER, SYS_RUSTOS_DEVICE_OPEN_BROKER, SYS_RUSTOS_IPC_CALL,
     SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_RECV,
     SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
@@ -142,7 +142,43 @@ fn reply_device_ioctl(reply_cap: u64, request: &DevmgrdDeviceIoctlRequest) -> i6
         op: DEVMGRD_IPC_OP_IOCTL_AUTHORIZE,
         ..DevmgrdDeviceIoctlResponse::default()
     };
-    response.status = match authorize_ioctl_request(request) {
+    response.status =
+        if let Some(IoctlPolicyOwner::Sessiond(op)) = ioctl_policy_owner(request.request) {
+            if sessiond_executes_ioctl(request.request) {
+                match call_sessiond_ioctl(op, request) {
+                    Ok(session_response) => {
+                        response.value = session_response.value0;
+                        response.payload_len = session_response.payload_len;
+                        let payload_len = session_response.payload_len as usize;
+                        if payload_len <= response.payload.len() {
+                            response.payload[..payload_len]
+                                .copy_from_slice(&session_response.payload[..payload_len]);
+                            0
+                        } else {
+                            libc::EINVAL
+                        }
+                    }
+                    Err(errno) => errno,
+                }
+            } else {
+                authorize_and_broker_ioctl(request, &mut response)
+            }
+        } else {
+            authorize_and_broker_ioctl(request, &mut response)
+        };
+    syscall3(
+        SYS_RUSTOS_IPC_REPLY,
+        reply_cap,
+        (&response as *const DevmgrdDeviceIoctlResponse) as u64,
+        size_of::<DevmgrdDeviceIoctlResponse>() as u64,
+    )
+}
+
+fn authorize_and_broker_ioctl(
+    request: &DevmgrdDeviceIoctlRequest,
+    response: &mut DevmgrdDeviceIoctlResponse,
+) -> i32 {
+    match authorize_ioctl_request(request) {
         Ok(()) => {
             let args = RustosDeviceIoctlBrokerArgs {
                 process_id: request.pid,
@@ -163,13 +199,7 @@ fn reply_device_ioctl(reply_cap: u64, request: &DevmgrdDeviceIoctlRequest) -> i6
             }
         }
         Err(errno) => errno,
-    };
-    syscall3(
-        SYS_RUSTOS_IPC_REPLY,
-        reply_cap,
-        (&response as *const DevmgrdDeviceIoctlResponse) as u64,
-        size_of::<DevmgrdDeviceIoctlResponse>() as u64,
-    )
+    }
 }
 
 fn dispatch_registry_request(request: &DevmgrdIpcRequest) -> DevmgrdIpcResponse {
@@ -329,6 +359,8 @@ fn authorize_ioctl_request(request: &DevmgrdDeviceIoctlRequest) -> Result<(), i3
     if request.version != DEVMGRD_IPC_ABI_VERSION
         || request.op != DEVMGRD_IPC_OP_IOCTL_AUTHORIZE
         || request.flags != 0
+        || request.payload_len as usize > request.payload.len()
+        || request.reserved1 != 0
         || request.reserved0 != 0
         || request.pid == 0
         || request.tid == 0
@@ -340,6 +372,73 @@ fn authorize_ioctl_request(request: &DevmgrdDeviceIoctlRequest) -> Result<(), i3
         Some(IoctlPolicyOwner::Sessiond(op)) => authorize_session_ioctl(op, request.request),
         Some(IoctlPolicyOwner::Uiserver(op)) => authorize_uiserver_ioctl(op, request.request),
         None => Err(libc::ENOTTY),
+    }
+}
+
+fn sessiond_executes_ioctl(request_number: u64) -> bool {
+    matches!(
+        request_number,
+        rustos_user_abi::console::CONSOLE_IOCTL_GET_STATE
+            | rustos_user_abi::console::CONSOLE_IOCTL_SNAPSHOT_SESSIONS
+    )
+}
+
+fn call_sessiond_ioctl(
+    op: u16,
+    ioctl_request: &DevmgrdDeviceIoctlRequest,
+) -> Result<CommercialMaxProtocolResponse, i32> {
+    if ioctl_request.version != DEVMGRD_IPC_ABI_VERSION
+        || ioctl_request.op != DEVMGRD_IPC_OP_IOCTL_AUTHORIZE
+        || ioctl_request.flags != 0
+        || ioctl_request.payload_len as usize > ioctl_request.payload.len()
+        || ioctl_request.reserved1 != 0
+        || ioctl_request.reserved0 != 0
+        || ioctl_request.pid == 0
+        || ioctl_request.tid == 0
+    {
+        return Err(libc::EINVAL);
+    }
+    let endpoint = syscall1(SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, IPC_SERVICE_SESSIOND);
+    if endpoint <= 0 {
+        return Err(libc::ENOSYS);
+    }
+    let mut request = CommercialMaxProtocolRequest::default();
+    request.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    request.header.protocol = COMMERCIAL_MAX_PROTOCOL_SESSIOND;
+    request.header.op = op;
+    request.header.subject_pid = ioctl_request.pid;
+    request.header.subject_tid = ioctl_request.tid;
+    request.arg0 = ioctl_request.request;
+    request.arg1 = ioctl_request.fd;
+    request.arg2 = ioctl_request.session_handle;
+    request.payload_len = ioctl_request.payload_len;
+    let payload_len = ioctl_request.payload_len as usize;
+    request.payload[..payload_len].copy_from_slice(&ioctl_request.payload[..payload_len]);
+
+    let mut response = CommercialMaxProtocolResponse::default();
+    let result = syscall5(
+        SYS_RUSTOS_IPC_CALL,
+        endpoint as u64,
+        (&request as *const CommercialMaxProtocolRequest) as u64,
+        size_of::<CommercialMaxProtocolRequest>() as u64,
+        (&mut response as *mut CommercialMaxProtocolResponse) as u64,
+        size_of::<CommercialMaxProtocolResponse>() as u64,
+    );
+    if result < 0 {
+        return Err(last_errno());
+    }
+    if result as usize != size_of::<CommercialMaxProtocolResponse>()
+        || response.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
+        || response.header.protocol != COMMERCIAL_MAX_PROTOCOL_SESSIOND
+        || response.header.op != op
+        || response.payload_len as usize > response.payload.len()
+    {
+        return Err(libc::EINVAL);
+    }
+    if response.status == 0 {
+        Ok(response)
+    } else {
+        Err(response.status)
     }
 }
 

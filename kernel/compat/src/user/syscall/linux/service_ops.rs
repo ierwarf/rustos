@@ -3447,6 +3447,7 @@ fn ioctl_device_via_devmgrd(fd: u64, request_number: u64, arg: u64) -> Result<u6
         request.euid = security.euid();
         request.egid = security.egid();
     }
+    populate_devmgrd_ioctl_payload(&mut request, arg)?;
     let start_ticks = crate::arch::rtc::ticks();
     let response = ipc_ops::call_service_endpoint(IPC_SERVICE_DEVMGRD, as_bytes(&request))?;
     log_slow_service_call(
@@ -3464,6 +3465,8 @@ fn ioctl_device_via_devmgrd(fd: u64, request_number: u64, arg: u64) -> Result<u6
     let response = read_unaligned::<DevmgrdDeviceIoctlResponse>(response.as_slice());
     if response.version != rustos_user_abi::syscall::DEVMGRD_IPC_ABI_VERSION
         || response.op != rustos_user_abi::syscall::DEVMGRD_IPC_OP_IOCTL_AUTHORIZE
+        || response.payload_len as usize > response.payload.len()
+        || response.reserved1 != 0
         || response.reserved0 != 0
     {
         return Err(LINUX_EINVAL);
@@ -3471,7 +3474,90 @@ fn ioctl_device_via_devmgrd(fd: u64, request_number: u64, arg: u64) -> Result<u6
     if response.status != 0 {
         return Err(response.status.unsigned_abs() as i64);
     }
+    apply_devmgrd_ioctl_payload(request_number, arg, &response)?;
     Ok(response.value)
+}
+
+fn populate_devmgrd_ioctl_payload(
+    request: &mut DevmgrdDeviceIoctlRequest,
+    arg: u64,
+) -> Result<(), i64> {
+    match request.request {
+        rustos_user_abi::console::CONSOLE_IOCTL_SNAPSHOT_SESSIONS => {
+            let snapshot = usermem::read_current_user_struct::<
+                rustos_user_abi::console::ConsoleSnapshotSessionsRequest,
+            >(arg)
+            .map_err(address_space_error_to_linux_errno)?;
+            copy_devmgrd_ioctl_request_payload(request, as_bytes(&snapshot))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn copy_devmgrd_ioctl_request_payload(
+    request: &mut DevmgrdDeviceIoctlRequest,
+    bytes: &[u8],
+) -> Result<(), i64> {
+    if bytes.len() > request.payload.len() {
+        return Err(LINUX_EINVAL);
+    }
+    request.payload[..bytes.len()].copy_from_slice(bytes);
+    request.payload_len = bytes.len() as u32;
+    Ok(())
+}
+
+fn apply_devmgrd_ioctl_payload(
+    request_number: u64,
+    arg: u64,
+    response: &DevmgrdDeviceIoctlResponse,
+) -> Result<(), i64> {
+    let payload_len = response.payload_len as usize;
+    if payload_len == 0 {
+        return Ok(());
+    }
+    match request_number {
+        rustos_user_abi::console::CONSOLE_IOCTL_GET_STATE => {
+            if payload_len != size_of::<rustos_user_abi::console::ConsoleStateInfo>() {
+                return Err(LINUX_EINVAL);
+            }
+            let info =
+                read_unaligned::<rustos_user_abi::console::ConsoleStateInfo>(&response.payload);
+            usermem::write_current_user_struct(arg, &info)
+                .map_err(address_space_error_to_linux_errno)
+        }
+        rustos_user_abi::console::CONSOLE_IOCTL_SNAPSHOT_SESSIONS => {
+            let header_len = size_of::<rustos_user_abi::console::ConsoleSnapshotSessionsRequest>();
+            if payload_len < header_len {
+                return Err(LINUX_EINVAL);
+            }
+            let snapshot = read_unaligned::<rustos_user_abi::console::ConsoleSnapshotSessionsRequest>(
+                &response.payload,
+            );
+            if snapshot.count > snapshot.capacity
+                || snapshot.count > rustos_user_abi::console::MAX_CONSOLE_SESSIONS as u64
+            {
+                return Err(LINUX_EINVAL);
+            }
+            let count = usize::try_from(snapshot.count).map_err(|_| LINUX_EINVAL)?;
+            let sessions_len = count
+                .checked_mul(size_of::<rustos_user_abi::console::ConsoleSessionInfo>())
+                .ok_or(LINUX_EINVAL)?;
+            if payload_len != header_len + sessions_len {
+                return Err(LINUX_EINVAL);
+            }
+            usermem::write_current_user_struct(arg, &snapshot)
+                .map_err(address_space_error_to_linux_errno)?;
+            if sessions_len == 0 {
+                return Ok(());
+            }
+            usermem::write_current_user_bytes(
+                snapshot.sessions_ptr,
+                &response.payload[header_len..payload_len],
+            )
+            .map_err(address_space_error_to_linux_errno)
+        }
+        _ => Err(LINUX_EINVAL),
+    }
 }
 
 pub(super) fn call_inputd_read_request(
