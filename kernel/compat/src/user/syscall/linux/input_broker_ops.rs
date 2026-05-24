@@ -1,9 +1,9 @@
 use super::*;
 
 use rustos_user_abi::syscall::{
-    INPUT_STATS_FLAG_PENDING_COALESCED, INPUT_STATS_FLAG_PENDING_POINTER_POSITION,
-    INPUTD_ACCESS_NATIVE, INPUTD_INGEST_MAX_EVENTS, IPC_SERVICE_CAP_INPUT_POLICY,
     InputIngestBrokerArgs, InputIngressWire, InputStatsBrokerArgs, InputStatsWire,
+    INPUTD_ACCESS_NATIVE, INPUTD_INGEST_MAX_EVENTS, INPUT_STATS_FLAG_PENDING_COALESCED,
+    INPUT_STATS_FLAG_PENDING_POINTER_POSITION, IPC_SERVICE_CAP_INPUT_POLICY,
 };
 
 pub(super) fn syscall_linux_rustos_input_stats_broker(args_ptr: u64) -> u64 {

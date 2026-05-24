@@ -40,7 +40,6 @@ pub mod syscall {
     pub const SYS_RUSTOS_DEVICE_IOCTL_BROKER: u64 = 0x5255_001f;
     pub const SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER: u64 = 0x5255_0020;
     pub const SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER: u64 = 0x5255_0021;
-    pub const SYS_RUSTOS_DRIVER_PROVIDER_ACTIVE_BROKER: u64 = 0x5255_0022;
     pub const SYS_RUSTOS_NET_BROKER: u64 = 0x5255_0023;
     pub const SYS_RUSTOS_BLOCK_BROKER: u64 = 0x5255_0024;
     pub const SYS_RUSTOS_STORAGE_LIST_BROKER: u64 = 0x5255_0025;
@@ -344,6 +343,12 @@ pub mod syscall {
     pub const DRIVER_BUS_USB: u32 = 3;
     pub const DRIVER_BUS_PCI: u32 = 4;
     pub const DRIVER_BUS_VIRTIO: u32 = 5;
+    pub const DRIVER_LOAD_POLICY_DISPLAY_PRIMARY: u64 = 1 << 0;
+    pub const DRIVER_LOAD_POLICY_DISPLAY_FALLBACK: u64 = 1 << 1;
+    pub const DRIVER_LOAD_POLICY_DISPLAY_PREFERRED_SCANOUT: u64 = 1 << 2;
+    pub const DRIVER_LOAD_POLICY_KNOWN_FLAGS: u64 = DRIVER_LOAD_POLICY_DISPLAY_PRIMARY
+        | DRIVER_LOAD_POLICY_DISPLAY_FALLBACK
+        | DRIVER_LOAD_POLICY_DISPLAY_PREFERRED_SCANOUT;
     pub const STORAGE_LIST_PATH_CAPACITY: usize = 64;
     pub const STORAGE_LIST_MAX_DESCRIPTORS: usize = 16;
     pub const STORAGE_FLAG_READONLY: u32 = 1 << 0;
@@ -423,6 +428,9 @@ pub mod syscall {
     pub const COMMERCIAL_MAX_INPUTD_OP_LAYOUT_POLICY: u16 = 4;
     pub const COMMERCIAL_MAX_INPUTD_OP_DROP_POLICY: u16 = 5;
     pub const COMMERCIAL_MAX_INPUTD_OP_INPUT_STATS: u16 = 6;
+    pub const COMMERCIAL_MAX_INPUTD_OP_SERIO_BUS_POLICY: u16 = 7;
+    pub const COMMERCIAL_MAX_INPUTD_OP_I8042_COMMAND_POLICY: u16 = 8;
+    pub const COMMERCIAL_MAX_INPUTD_OP_PS2_PACKET_POLICY: u16 = 9;
     pub const COMMERCIAL_MAX_STORAGED_OP_BLOCK_INVENTORY: u16 = 1;
     pub const COMMERCIAL_MAX_STORAGED_OP_PARTITION_SCAN: u16 = 2;
     pub const COMMERCIAL_MAX_STORAGED_OP_ROOT_VOLUME_SELECT: u16 = 3;
@@ -1042,6 +1050,9 @@ pub mod syscall {
         pub path_len: u64,
         pub linux_driver_names_ptr: u64,
         pub linux_driver_names_len: u64,
+        pub policy_flags: u64,
+        pub preferred_width: u32,
+        pub preferred_height: u32,
         pub reserved0: u64,
     }
 
@@ -1052,14 +1063,6 @@ pub mod syscall {
         pub alias_len: u64,
         pub class: u32,
         pub bus: u32,
-        pub reserved0: u64,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-    pub struct RustosDriverProviderActiveBrokerArgs {
-        pub provider_group_ptr: u64,
-        pub provider_group_len: u64,
         pub reserved0: u64,
     }
 
@@ -2213,12 +2216,12 @@ mod syscall_tests {
     use core::mem::size_of;
 
     use super::syscall::{
-        IPC_MAX_INLINE_BYTES, LINUX_RLIMIT_SIZE, LINUX_SIGACTION_SIZE, LINUX_STATX_SIZE,
-        LINUX_TIMESPEC_SIZE, LINUX_UTSNAME_SIZE, LinuxRlimit, LinuxSigActionWire,
-        LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, LinuxTimespecWire, LinuxUtsName,
-        SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_STATX, SYSCALL_OFFLOAD_PATH_CAPACITY,
-        SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, VFS_IPC_ABI_VERSION, VFS_IPC_OP_OPENAT, VfsIpcRequest,
-        VfsIpcResponse,
+        LinuxRlimit, LinuxSigActionWire, LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse,
+        LinuxTimespecWire, LinuxUtsName, VfsIpcRequest, VfsIpcResponse, IPC_MAX_INLINE_BYTES,
+        LINUX_RLIMIT_SIZE, LINUX_SIGACTION_SIZE, LINUX_STATX_SIZE, LINUX_TIMESPEC_SIZE,
+        LINUX_UTSNAME_SIZE, SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_STATX,
+        SYSCALL_OFFLOAD_PATH_CAPACITY, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, VFS_IPC_ABI_VERSION,
+        VFS_IPC_OP_OPENAT,
     };
 
     #[test]
@@ -2748,6 +2751,7 @@ mod tests {
         assert_eq!(syscall::COMMERCIAL_MAX_VFSD_OP_METADATA_POLICY, 6);
         assert_eq!(syscall::COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_OPEN, 2);
         assert_eq!(syscall::COMMERCIAL_MAX_INPUTD_OP_INPUT_READER, 2);
+        assert_eq!(syscall::COMMERCIAL_MAX_INPUTD_OP_PS2_PACKET_POLICY, 9);
         assert_eq!(syscall::COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE, 4);
         assert_eq!(syscall::COMMERCIAL_MAX_NETD_OP_PACKET_LEASE, 5);
         assert_eq!(syscall::COMMERCIAL_MAX_DRIVERD_OP_PROVIDER_SELECT, 4);

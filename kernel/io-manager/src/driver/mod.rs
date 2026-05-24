@@ -39,7 +39,6 @@ pub enum DriverLoadError {
 const BOOTFB_DRIVER_NAME: &str = "bootfb";
 const BOOTFB_DRIVER_MODULE_PATH: &str = "system/drivers/display/bootfb.ko";
 const BOOTFB_ALIAS: &str = "platform:bootfb";
-const DISPLAY_PRIMARY_PROVIDER_GROUP: &str = "display-primary";
 const PCI_VENDOR_VIRTIO: u16 = 0x1af4;
 const PCI_DEVICE_VIRTIO_NET_TRANSITIONAL: u16 = 0x1000;
 const PCI_DEVICE_VIRTIO_GPU_TRANSITIONAL: u16 = 0x1010;
@@ -70,6 +69,9 @@ pub fn load_module_image_from_policy(
     bus: u32,
     image_path: &str,
     linux_driver_names: &str,
+    policy_flags: u64,
+    preferred_width: u32,
+    preferred_height: u32,
 ) -> Result<(), DriverLoadError> {
     if nucleus_core::util::fault_injection::should_fail("driver.module.load") {
         return Err(DriverLoadError::FaultInjected);
@@ -84,6 +86,9 @@ pub fn load_module_image_from_policy(
     let name = leak_policy_text(name)?;
     let image_path = leak_policy_text(image_path)?;
     let linux_driver_names = leak_policy_text(linux_driver_names)?;
+    if class == DriverClass::Display && bus == DriverBus::Virtio {
+        virtio_gpu::apply_load_policy(policy_flags, preferred_width, preferred_height);
+    }
     match loader::load_module_image_explicit(name, class, bus, image_path, linux_driver_names) {
         Ok(_) => {
             if class == DriverClass::Display && bus == DriverBus::Virtio {
@@ -121,13 +126,6 @@ pub fn hardware_alias_present(alias: &str, class: u32, bus: u32) -> bool {
         DriverBus::Virtio => virtio_alias_present(alias),
         DriverBus::Usb => usb_alias_present(alias, class),
         DriverBus::Serio => serio_alias_present(alias),
-        _ => false,
-    }
-}
-
-pub fn provider_group_hardware_active(group: &str) -> bool {
-    match group {
-        DISPLAY_PRIMARY_PROVIDER_GROUP => crate::io::gui::primary_display_provider_active(),
         _ => false,
     }
 }

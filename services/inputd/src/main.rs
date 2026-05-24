@@ -7,22 +7,23 @@ use std::thread;
 use std::time::Duration;
 
 use rustos_user_abi::syscall::{
-    COMMERCIAL_MAX_INPUTD_OP_DROP_POLICY, COMMERCIAL_MAX_INPUTD_OP_EVDEV_TRANSLATE,
+    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, InputHidKeyboardReportWire,
+    InputHidPointerReportWire, InputIngestBrokerArgs, InputIngressWire, InputKeyboardEventWire,
+    InputPointerAbsoluteWire, InputPointerPacketWire, InputStatsBrokerArgs, InputStatsWire,
+    InputdIpcRequest, InputdIpcResponse, InputdReadResponse, COMMERCIAL_MAX_INPUTD_OP_DROP_POLICY,
+    COMMERCIAL_MAX_INPUTD_OP_EVDEV_TRANSLATE, COMMERCIAL_MAX_INPUTD_OP_I8042_COMMAND_POLICY,
     COMMERCIAL_MAX_INPUTD_OP_INPUT_INGEST, COMMERCIAL_MAX_INPUTD_OP_INPUT_READER,
     COMMERCIAL_MAX_INPUTD_OP_INPUT_STATS, COMMERCIAL_MAX_INPUTD_OP_LAYOUT_POLICY,
-    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_INPUTD,
-    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, INPUTD_ACCESS_EVDEV,
+    COMMERCIAL_MAX_INPUTD_OP_PS2_PACKET_POLICY, COMMERCIAL_MAX_INPUTD_OP_SERIO_BUS_POLICY,
+    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_INPUTD, INPUTD_ACCESS_EVDEV,
     INPUTD_ACCESS_NATIVE, INPUTD_INGEST_MAX_EVENTS, INPUTD_INGRESS_KIND_EVENT,
     INPUTD_INGRESS_KIND_HID_KEYBOARD_REPORT, INPUTD_INGRESS_KIND_HID_POINTER_REPORT,
     INPUTD_INGRESS_KIND_KEYBOARD, INPUTD_INGRESS_KIND_POINTER_ABSOLUTE,
     INPUTD_INGRESS_KIND_POINTER_PACKET, INPUTD_IPC_ABI_VERSION, INPUTD_IPC_OP_AUTHORIZE_READ,
     INPUTD_IPC_OP_DRAIN_INGEST, INPUTD_IPC_OP_PING, INPUTD_IPC_OP_READ, INPUTD_IPC_OP_STATS,
     INPUTD_READ_FLAG_NONBLOCK, INPUTD_READ_PAYLOAD_CAPACITY, IPC_MAX_INLINE_BYTES,
-    IPC_SERVICE_INPUTD, InputHidKeyboardReportWire, InputHidPointerReportWire,
-    InputIngestBrokerArgs, InputIngressWire, InputKeyboardEventWire, InputPointerAbsoluteWire,
-    InputPointerPacketWire, InputStatsBrokerArgs, InputStatsWire, InputdIpcRequest,
-    InputdIpcResponse, InputdReadResponse, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_INPUT_INGEST_BROKER,
+    IPC_SERVICE_INPUTD, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_INPUT_INGEST_BROKER,
     SYS_RUSTOS_INPUT_STATS_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV,
     SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
 };
@@ -761,6 +762,26 @@ fn dispatch_commercial_request(
             Ok(())
         }
         COMMERCIAL_MAX_INPUTD_OP_INPUT_STATS => write_stats_payload(queue, response),
+        COMMERCIAL_MAX_INPUTD_OP_SERIO_BUS_POLICY => {
+            response.descriptor_count = 1;
+            response.descriptors[0] =
+                input_descriptor("serio-bus-service-driver", request.header.op);
+            response.capability = input_capability("serio-bus", request.header.op);
+            Ok(())
+        }
+        COMMERCIAL_MAX_INPUTD_OP_I8042_COMMAND_POLICY => {
+            response.descriptor_count = 1;
+            response.descriptors[0] =
+                input_descriptor("i8042-command-service-driver", request.header.op);
+            response.capability = input_capability("i8042-command", request.header.op);
+            Ok(())
+        }
+        COMMERCIAL_MAX_INPUTD_OP_PS2_PACKET_POLICY => {
+            response.descriptor_count = 1;
+            response.descriptors[0] = input_descriptor("ps2-packet-policy", request.header.op);
+            response.capability = input_capability("ps2-packet", request.header.op);
+            Ok(())
+        }
         _ => Err(libc::EINVAL),
     }
 }
@@ -780,7 +801,10 @@ fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result
         | COMMERCIAL_MAX_INPUTD_OP_EVDEV_TRANSLATE
         | COMMERCIAL_MAX_INPUTD_OP_LAYOUT_POLICY
         | COMMERCIAL_MAX_INPUTD_OP_DROP_POLICY
-        | COMMERCIAL_MAX_INPUTD_OP_INPUT_STATS => Ok(()),
+        | COMMERCIAL_MAX_INPUTD_OP_INPUT_STATS
+        | COMMERCIAL_MAX_INPUTD_OP_SERIO_BUS_POLICY
+        | COMMERCIAL_MAX_INPUTD_OP_I8042_COMMAND_POLICY
+        | COMMERCIAL_MAX_INPUTD_OP_PS2_PACKET_POLICY => Ok(()),
         _ => Err(libc::EINVAL),
     }
 }
@@ -859,6 +883,9 @@ fn input_capability_mask(op: u16) -> u64 {
         COMMERCIAL_MAX_INPUTD_OP_LAYOUT_POLICY => 1 << 3,
         COMMERCIAL_MAX_INPUTD_OP_DROP_POLICY => 1 << 4,
         COMMERCIAL_MAX_INPUTD_OP_INPUT_STATS => 1 << 5,
+        COMMERCIAL_MAX_INPUTD_OP_SERIO_BUS_POLICY => 1 << 6,
+        COMMERCIAL_MAX_INPUTD_OP_I8042_COMMAND_POLICY => 1 << 7,
+        COMMERCIAL_MAX_INPUTD_OP_PS2_PACKET_POLICY => 1 << 8,
         _ => 0,
     }
 }

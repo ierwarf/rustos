@@ -6,9 +6,9 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::sync::{KernelSpinGuard as MutexGuard, KernelSpinLock as Mutex};
 use driver_abi::{
-    BTN_EXTRA, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE, EV_KEY, EV_REL, EV_SYN,
+    PointerPacket, BTN_EXTRA, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE, EV_KEY, EV_REL, EV_SYN,
     POINTER_BUTTON_LEFT, POINTER_BUTTON_MIDDLE, POINTER_BUTTON_RIGHT, POINTER_BUTTON_X1,
-    POINTER_BUTTON_X2, PointerPacket, REL_HWHEEL, REL_WHEEL, REL_X, REL_Y, SYN_REPORT,
+    POINTER_BUTTON_X2, REL_HWHEEL, REL_WHEEL, REL_X, REL_Y, SYN_REPORT,
 };
 #[cfg(not(test))]
 use x86_64::instructions::interrupts;

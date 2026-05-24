@@ -4,24 +4,25 @@ use std::time::Instant;
 use std::{collections::BTreeSet, fs, thread, time::Duration};
 
 use rustos_user_abi::syscall::{
-    COMMERCIAL_MAX_DRIVERD_OP_DRIVER_PLAN, COMMERCIAL_MAX_DRIVERD_OP_FALLBACK_POLICY,
-    COMMERCIAL_MAX_DRIVERD_OP_MODULE_LOAD_AUTHORIZE, COMMERCIAL_MAX_DRIVERD_OP_PROVIDER_SELECT,
-    COMMERCIAL_MAX_DRIVERD_OP_RETRY_BUDGET, COMMERCIAL_MAX_DRIVERD_OP_SYMBOL_POLICY,
-    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_DRIVERD,
-    COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_SERVICE_DRIVERD,
-    COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DMA_BUFFER,
+    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, LinuxSyscallOffloadRequest,
+    LinuxSyscallOffloadResponse, RustosDriverLoadModuleBrokerArgs,
+    RustosDriverProbeAliasBrokerArgs, COMMERCIAL_MAX_DRIVERD_OP_DRIVER_PLAN,
+    COMMERCIAL_MAX_DRIVERD_OP_FALLBACK_POLICY, COMMERCIAL_MAX_DRIVERD_OP_MODULE_LOAD_AUTHORIZE,
+    COMMERCIAL_MAX_DRIVERD_OP_PROVIDER_SELECT, COMMERCIAL_MAX_DRIVERD_OP_RETRY_BUDGET,
+    COMMERCIAL_MAX_DRIVERD_OP_SYMBOL_POLICY, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_DRIVERD, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
+    COMMERCIAL_MAX_PROTOCOL_SERVICE_DRIVERD, COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DMA_BUFFER,
     COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DRIVER_INSTANCE, COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IRQ_ROUTE,
-    COMMERCIAL_MAX_SERVICE_DRIVERD_OP_MMIO_LEASE, CommercialMaxCapabilityLeaseWire,
-    CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
-    CommercialMaxProtocolResponse, DRIVER_BUS_PCI, DRIVER_BUS_PLATFORM, DRIVER_BUS_SERIO,
-    DRIVER_BUS_USB, DRIVER_BUS_VIRTIO, DRIVER_CLASS_DISPLAY, DRIVER_CLASS_INPUT,
-    DRIVER_CLASS_NETWORK, IPC_SERVICE_DRIVERD, IPC_SERVICE_SERVICE_DRIVERD,
-    LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, RustosDriverLoadModuleBrokerArgs,
-    RustosDriverProbeAliasBrokerArgs, RustosDriverProviderActiveBrokerArgs, SYS_RUSTOS_DEBUG_PRINT,
+    COMMERCIAL_MAX_SERVICE_DRIVERD_OP_MMIO_LEASE, DRIVER_BUS_PCI, DRIVER_BUS_PLATFORM,
+    DRIVER_BUS_SERIO, DRIVER_BUS_USB, DRIVER_BUS_VIRTIO, DRIVER_CLASS_DISPLAY, DRIVER_CLASS_INPUT,
+    DRIVER_CLASS_NETWORK, DRIVER_LOAD_POLICY_DISPLAY_FALLBACK,
+    DRIVER_LOAD_POLICY_DISPLAY_PREFERRED_SCANOUT, DRIVER_LOAD_POLICY_DISPLAY_PRIMARY,
+    IPC_SERVICE_DRIVERD, IPC_SERVICE_SERVICE_DRIVERD, SYSCALL_OFFLOAD_ABI_VERSION,
+    SYSCALL_OFFLOAD_OP_DRIVER_LOAD_POLICY, SYSCALL_OFFLOAD_PATH_CAPACITY, SYS_RUSTOS_DEBUG_PRINT,
     SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER, SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER,
-    SYS_RUSTOS_DRIVER_PROVIDER_ACTIVE_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV,
-    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY, SYSCALL_OFFLOAD_ABI_VERSION,
-    SYSCALL_OFFLOAD_OP_DRIVER_LOAD_POLICY, SYSCALL_OFFLOAD_PATH_CAPACITY,
+    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_REPLY,
 };
 
 const RECV_BACKOFF: Duration = Duration::from_millis(10);
@@ -206,9 +207,7 @@ fn load_record(
             ));
         }
     }
-    if !record.provider_group.is_empty()
-        && (provider_groups.contains(record.provider_group.as_str())
-            || provider_group_active(record.provider_group.as_str()))
+    if !record.provider_group.is_empty() && provider_groups.contains(record.provider_group.as_str())
     {
         skipped.insert(record.name.clone());
         debug_line(&format!(
@@ -253,9 +252,7 @@ fn load_record(
     ));
     if result == 0 {
         loaded.insert(record.name.clone());
-        if !record.provider_group.is_empty()
-            && provider_group_active(record.provider_group.as_str())
-        {
+        if !record.provider_group.is_empty() {
             provider_groups.insert(record.provider_group.clone());
         }
         debug_line(&format!(
@@ -327,6 +324,7 @@ fn authorize_display_service_driver(record: &DriverRecord) -> bool {
 }
 
 fn load_module(record: &DriverRecord) -> i64 {
+    let (policy_flags, preferred_width, preferred_height) = driver_load_policy(record);
     let args = RustosDriverLoadModuleBrokerArgs {
         name_ptr: record.name.as_ptr() as u64,
         name_len: record.name.len() as u64,
@@ -336,12 +334,33 @@ fn load_module(record: &DriverRecord) -> i64 {
         path_len: record.image_path.len() as u64,
         linux_driver_names_ptr: record.linux_driver_names.as_ptr() as u64,
         linux_driver_names_len: record.linux_driver_names.len() as u64,
+        policy_flags,
+        preferred_width,
+        preferred_height,
         reserved0: 0,
     };
     syscall1(
         SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER,
         (&args as *const RustosDriverLoadModuleBrokerArgs) as u64,
     )
+}
+
+fn driver_load_policy(record: &DriverRecord) -> (u64, u32, u32) {
+    let mut flags = 0;
+    let mut preferred_width = 0;
+    let mut preferred_height = 0;
+    if record.class == DRIVER_CLASS_DISPLAY && !record.provider_group.is_empty() {
+        flags |= DRIVER_LOAD_POLICY_DISPLAY_PRIMARY;
+        if record.fallback_only {
+            flags |= DRIVER_LOAD_POLICY_DISPLAY_FALLBACK;
+        }
+        if record.bus == DRIVER_BUS_VIRTIO && !record.fallback_only {
+            flags |= DRIVER_LOAD_POLICY_DISPLAY_PREFERRED_SCANOUT;
+            preferred_width = 1600;
+            preferred_height = 900;
+        }
+    }
+    (flags, preferred_width, preferred_height)
 }
 
 fn probe_alias(alias: &str, class: u32, bus: u32) -> bool {
@@ -355,18 +374,6 @@ fn probe_alias(alias: &str, class: u32, bus: u32) -> bool {
     syscall1(
         SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER,
         (&args as *const RustosDriverProbeAliasBrokerArgs) as u64,
-    ) == 1
-}
-
-fn provider_group_active(provider_group: &str) -> bool {
-    let args = RustosDriverProviderActiveBrokerArgs {
-        provider_group_ptr: provider_group.as_ptr() as u64,
-        provider_group_len: provider_group.len() as u64,
-        reserved0: 0,
-    };
-    syscall1(
-        SYS_RUSTOS_DRIVER_PROVIDER_ACTIVE_BROKER,
-        (&args as *const RustosDriverProviderActiveBrokerArgs) as u64,
     ) == 1
 }
 

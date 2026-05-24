@@ -1,7 +1,3 @@
-// RING3-MIGRATION-REFERENCE START: commercial-max inputd should own serio bus policy
-// and legacy input routing only for a non-.ko service driver rewrite. RustOS-authored
-// `.ko` serio/input drivers stay ring0; ring0 also keeps IRQ/port grant primitives and
-// compatibility driver substrate.
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ffi::c_void;
@@ -9,12 +5,12 @@ use core::slice;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::sync::KernelSpinLock as Mutex;
-use driver_abi::{SERIO_ANY, SerioDeviceId, SerioDriverRegistration, SerioPortInfo};
+use driver_abi::{SerioDeviceId, SerioDriverRegistration, SerioPortInfo, SERIO_ANY};
 use x86_64::instructions::interrupts;
 
 use super::linux::compat::{
-    LinuxCompatSerio, LinuxCompatSerioCloseFn, LinuxCompatSerioDeviceId, LinuxCompatSerioDriver,
-    LinuxCompatSerioOpenFn, LinuxCompatSerioWriteFn, compat_cstr,
+    compat_cstr, LinuxCompatSerio, LinuxCompatSerioCloseFn, LinuxCompatSerioDeviceId,
+    LinuxCompatSerioDriver, LinuxCompatSerioOpenFn, LinuxCompatSerioWriteFn,
 };
 
 #[derive(Clone, Copy, Default)]
@@ -1094,4 +1090,3 @@ fn device_id_matches(id: SerioDeviceId, port: SerioPortInfo) -> bool {
 fn field_matches(expected: u32, actual: u32) -> bool {
     expected == SERIO_ANY || expected == actual
 }
-// RING3-MIGRATION-REFERENCE END: commercial-max inputd-owned non-.ko serio service driver.

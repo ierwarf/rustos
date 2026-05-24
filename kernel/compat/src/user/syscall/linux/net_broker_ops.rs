@@ -8,7 +8,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::mem::size_of;
 
-use rustos_user_abi::syscall::{IPC_SERVICE_CAP_NET_POLICY, RustosNetBrokerArgs};
+use rustos_user_abi::syscall::{RustosNetBrokerArgs, IPC_SERVICE_CAP_NET_POLICY};
 use x86_64::VirtAddr;
 
 const MAX_SOCKET_IO_BYTES: usize = 64 * 1024;

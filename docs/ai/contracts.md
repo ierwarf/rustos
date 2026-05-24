@@ -319,12 +319,12 @@ Kernel/userspace ABI:
 - `driverd` owns registry parsing and provider/autoload ordering after it
   registers `IPC_SERVICE_DRIVERD`. The gated driver broker surface is
   `SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER`,
-  `SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER`, and
-  `SYS_RUSTOS_DRIVER_PROVIDER_ACTIVE_BROKER`; the kernel side only loads an
-  explicit module image, probes hardware aliases, or reports active provider
-  groups for final safety checks. Early boot may still use the legacy kernel
-  registry path until driver service bootstrap owns display/input/network
-  bring-up.
+  `SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER`; the kernel side only loads an
+  explicit module image or probes hardware aliases. Provider-group active state,
+  fallback ordering, and virtio display preferred scanout policy are `driverd`
+  state, not a ring0 provider-policy broker. Early boot may still use the
+  legacy kernel registry path until driver service bootstrap owns
+  display/input/network bring-up.
 - `devmgrd` owns the visible `/dev` registry protocol exposed to `vfsd` through
   `DevmgrdIpcRequest`/`DevmgrdIpcResponse` with `DEVMGRD_IPC_OP_LOOKUP` and
   `DEVMGRD_IPC_OP_READDIR`. `vfsd` may mirror explicit nodes (`console0`,

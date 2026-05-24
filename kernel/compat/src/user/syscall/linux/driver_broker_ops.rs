@@ -2,9 +2,9 @@ use super::*;
 
 use alloc::string::String;
 use rustos_user_abi::syscall::{
+    RustosDriverLoadModuleBrokerArgs, RustosDriverProbeAliasBrokerArgs,
     DRIVER_BROKER_ALIAS_CAPACITY, DRIVER_BROKER_NAME_CAPACITY, DRIVER_BROKER_PATH_CAPACITY,
-    IPC_SERVICE_CAP_DRIVER_POLICY, RustosDriverLoadModuleBrokerArgs,
-    RustosDriverProbeAliasBrokerArgs, RustosDriverProviderActiveBrokerArgs,
+    DRIVER_LOAD_POLICY_KNOWN_FLAGS, IPC_SERVICE_CAP_DRIVER_POLICY,
 };
 
 pub(super) fn syscall_linux_rustos_driver_load_module_broker(args_ptr: u64) -> u64 {
@@ -17,7 +17,7 @@ pub(super) fn syscall_linux_rustos_driver_load_module_broker(args_ptr: u64) -> u
         Ok(args) => args,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
     };
-    if args.reserved0 != 0 {
+    if args.reserved0 != 0 || args.policy_flags & !DRIVER_LOAD_POLICY_KNOWN_FLAGS != 0 {
         return linux_errno(LINUX_EINVAL);
     }
 
@@ -44,6 +44,9 @@ pub(super) fn syscall_linux_rustos_driver_load_module_broker(args_ptr: u64) -> u
         args.bus,
         path.as_str(),
         linux_driver_names.as_str(),
+        args.policy_flags,
+        args.preferred_width,
+        args.preferred_height,
     ) {
         Ok(()) => 0,
         Err(kernel_io_manager::driver::DriverLoadError::LoaderUnimplemented) => {
@@ -76,35 +79,6 @@ pub(super) fn syscall_linux_rustos_driver_probe_alias_broker(args_ptr: u64) -> u
     };
 
     if kernel_io_manager::driver::hardware_alias_present(alias.as_str(), args.class, args.bus) {
-        1
-    } else {
-        0
-    }
-}
-
-pub(super) fn syscall_linux_rustos_driver_provider_active_broker(args_ptr: u64) -> u64 {
-    if !ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_DRIVER_POLICY) {
-        return linux_errno(LINUX_EPERM);
-    }
-
-    let args =
-        match usermem::read_current_user_struct::<RustosDriverProviderActiveBrokerArgs>(args_ptr) {
-            Ok(args) => args,
-            Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
-        };
-    if args.reserved0 != 0 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let group = match read_driver_text(
-        args.provider_group_ptr,
-        args.provider_group_len,
-        DRIVER_BROKER_NAME_CAPACITY,
-    ) {
-        Ok(value) => value,
-        Err(errno) => return linux_errno(errno),
-    };
-
-    if kernel_io_manager::driver::provider_group_hardware_active(group.as_str()) {
         1
     } else {
         0

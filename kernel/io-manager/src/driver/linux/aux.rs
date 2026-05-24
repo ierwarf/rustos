@@ -1,4 +1,4 @@
-use alloc::alloc::{Layout, alloc};
+use alloc::alloc::{alloc, Layout};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ffi::{c_char, c_void};
@@ -204,7 +204,11 @@ pub(crate) unsafe extern "C" fn down_interruptible(sem: *mut c_void) -> i32 {
 }
 
 pub(crate) unsafe extern "C" fn down_trylock(sem: *mut c_void) -> i32 {
-    if try_take_semaphore(sem) { 0 } else { 1 }
+    if try_take_semaphore(sem) {
+        0
+    } else {
+        1
+    }
 }
 
 pub(crate) unsafe extern "C" fn up(sem: *mut c_void) {

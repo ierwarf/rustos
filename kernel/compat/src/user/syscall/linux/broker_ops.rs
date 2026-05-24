@@ -29,7 +29,6 @@ pub(super) fn is_linux_rustos_broker_syscall(syscall_number: u64) -> bool {
             | linux_abi::SYS_RUSTOS_DEVICE_OPEN_BROKER
             | linux_abi::SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER
             | linux_abi::SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER
-            | linux_abi::SYS_RUSTOS_DRIVER_PROVIDER_ACTIVE_BROKER
             | linux_abi::SYS_RUSTOS_NET_BROKER
             | linux_abi::SYS_RUSTOS_STORAGE_LIST_BROKER
             | linux_abi::SYS_RUSTOS_BOOT_EXTENT_BROKER
@@ -52,9 +51,6 @@ pub(super) fn dispatch_linux_rustos_broker_syscall(frame: &SyscallFrame) -> u64 
         }
         linux_abi::SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER => {
             syscall_linux_rustos_driver_probe_alias_broker(frame.rdi)
-        }
-        linux_abi::SYS_RUSTOS_DRIVER_PROVIDER_ACTIVE_BROKER => {
-            syscall_linux_rustos_driver_provider_active_broker(frame.rdi)
         }
         linux_abi::SYS_RUSTOS_NET_BROKER => syscall_linux_rustos_net_broker(frame.rdi),
         linux_abi::SYS_RUSTOS_STORAGE_LIST_BROKER => {

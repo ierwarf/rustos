@@ -144,7 +144,11 @@ pub(crate) fn request_any_context_irq(
     dev_id: *mut c_void,
 ) -> i32 {
     let status = request_threaded_irq(irq, handler, None, flags, dev_id);
-    if status == 0 { 0 } else { status }
+    if status == 0 {
+        0
+    } else {
+        status
+    }
 }
 
 pub(crate) fn free_irq(irq: u32, dev_id: *mut c_void) -> *const c_void {

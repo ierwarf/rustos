@@ -7,14 +7,14 @@
 pub use driver_abi::PointerPacket;
 use heapless::Deque as HeaplessDeque;
 pub use input_evdev::{
-    EvdevTranslateError, INPUT_ACTION_NONE, INPUT_ACTION_PRESSED, INPUT_ACTION_RELEASED,
-    INPUT_ACTION_REPEATED, INPUT_KIND_KEYBOARD, INPUT_KIND_POINTER_BUTTON,
-    INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION, INPUT_KIND_POINTER_SCROLL, InputEvent,
-    LinuxInputEvent, LinuxInputTimeval, MAX_EVDEV_EVENTS_PER_INPUT_EVENT,
-    MAX_EVDEV_EVENTS_PER_READ, MAX_EVDEV_READ_BYTES, MAX_INPUT_EVENTS_PER_READ,
-    MAX_NATIVE_READ_BYTES, POINTER_BUTTON_LEFT, POINTER_BUTTON_MIDDLE, POINTER_BUTTON_RIGHT,
-    POINTER_BUTTON_X1, POINTER_BUTTON_X2, linux_key_code_to_rustos, pointer_button_to_linux,
-    rustos_key_code_to_linux, translate_input_events_to_evdev, translate_input_to_evdev,
+    linux_key_code_to_rustos, pointer_button_to_linux, rustos_key_code_to_linux,
+    translate_input_events_to_evdev, translate_input_to_evdev, EvdevTranslateError, InputEvent,
+    LinuxInputEvent, LinuxInputTimeval, INPUT_ACTION_NONE, INPUT_ACTION_PRESSED,
+    INPUT_ACTION_RELEASED, INPUT_ACTION_REPEATED, INPUT_KIND_KEYBOARD, INPUT_KIND_POINTER_BUTTON,
+    INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION, INPUT_KIND_POINTER_SCROLL,
+    MAX_EVDEV_EVENTS_PER_INPUT_EVENT, MAX_EVDEV_EVENTS_PER_READ, MAX_EVDEV_READ_BYTES,
+    MAX_INPUT_EVENTS_PER_READ, MAX_NATIVE_READ_BYTES, POINTER_BUTTON_LEFT, POINTER_BUTTON_MIDDLE,
+    POINTER_BUTTON_RIGHT, POINTER_BUTTON_X1, POINTER_BUTTON_X2,
 };
 
 const INPUT_EVENT_QUEUE_CAPACITY: usize = 2048;
@@ -131,25 +131,6 @@ impl InputEventQueueState {
         changed
     }
 
-    pub fn submit_pointer_absolute(
-        &mut self,
-        x: u32,
-        y: u32,
-        buttons: u8,
-        wheel_vertical: i16,
-        previous_buttons: u8,
-    ) -> bool {
-        self.push_pointer_position(x, y);
-        let mut changed = true;
-
-        if wheel_vertical != 0 {
-            self.push_pointer_scroll(wheel_vertical, 0);
-        }
-
-        changed |= self.push_pointer_button_edges(previous_buttons, buttons);
-        changed
-    }
-
     pub fn read_input_events(&mut self, dest: &mut [InputEvent]) -> usize {
         pop_events_into(&mut self.queued, dest)
     }
@@ -244,19 +225,6 @@ impl PointerIngressState {
         self.buttons = packet.buttons;
         queue.submit_pointer_packet(packet, previous)
     }
-
-    pub fn submit_pointer_absolute(
-        &mut self,
-        queue: &mut InputEventQueueState,
-        x: u32,
-        y: u32,
-        buttons: u8,
-        wheel_vertical: i16,
-    ) -> bool {
-        let previous = self.buttons;
-        self.buttons = buttons;
-        queue.submit_pointer_absolute(x, y, buttons, wheel_vertical, previous)
-    }
 }
 
 fn pop_events_into(
@@ -276,8 +244,8 @@ fn pop_events_into(
 #[cfg(test)]
 mod tests {
     use super::{
-        INPUT_ACTION_PRESSED, INPUT_KIND_POINTER_BUTTON, INPUT_KIND_POINTER_MOTION,
-        INPUT_KIND_POINTER_POSITION, InputEventQueueState, POINTER_BUTTON_LEFT, PointerPacket,
+        InputEventQueueState, PointerPacket, INPUT_ACTION_PRESSED, INPUT_KIND_POINTER_BUTTON,
+        INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION, POINTER_BUTTON_LEFT,
     };
 
     #[test]

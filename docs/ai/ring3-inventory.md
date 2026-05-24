@@ -11,9 +11,9 @@ cargo xtask ring3-inventory
 
 Current snapshot:
 
-- `total_marked_loc=16583`
+- `total_marked_loc=14814`
 - `excluded_xhci_nvme_loc=2910`
-- `active_batch_marked_loc=13673`
+- `active_batch_marked_loc=11904`
 
 `kernel/io-manager/src/usb/xhci.rs` and
 `kernel/io-manager/src/storage/nvme.rs` are explicitly excluded from the active
@@ -34,6 +34,21 @@ endpoint, routed display setup/present authorization through `devmgrd` to
 `uiserver`, and left ring0 with the framebuffer copy/present primitive,
 boot/panic console, and `.ko`/MMIO/DMA execution island. The stale display
 markers in `virtio_gpu.rs`, `io/gui*`, and `io/device/display.rs` are retired.
+The "3866 LOC" display figure was an inventory-marker retirement delta, not a
+physical source deletion claim; the commit that retired those markers changed
+17 files with 419 insertions and 82 deletions because the display primitive and
+compatibility island intentionally remained ring0.
+Follow-up display cleanup removed the unused ring0 normal terminal renderer and
+retired the provider-active kernel broker. `driverd` now owns provider-group
+active state, fallback ordering, and the preferred virtio scanout descriptor it
+passes to the load-module broker; ring0 consumes that descriptor as
+MMIO/DMA/display primitive configuration.
+
+The latest inputd service-driver chunk added commercial-max policy ops for
+serio bus routing, i8042 command policy, and PS/2 packet policy. The
+`serio.rs`/`i8042.rs` markers are retired because the non-`.ko` service-driver
+policy surface is now explicit in `inputd`; ring0 still keeps the IRQ/port
+grant and `.ko` compatibility substrate.
 
 ## Active Batch Lanes
 
@@ -41,10 +56,8 @@ markers in `virtio_gpu.rs`, `io/gui*`, and `io/device/display.rs` are retired.
 | ---: | --- | --- | --- | --- |
 | 1297 | abi-first-large | loaderd-procd | move cold image/process policy into loaderd/procd before deleting ring0 parser branches | `kernel/compat/src/user/process/linux.rs` |
 | 1210 | abi-first-large | loaderd-procd | move cold image/process policy into loaderd/procd before deleting ring0 parser branches | `kernel/compat/src/user/syscall/linux/proc_broker_ops.rs` |
-| 1063 | abi-first-large | rootd-capability | move namespace/capability policy behind rootd capability protocol | `kernel/compat/src/user/syscall/linux/ipc_ops.rs` |
-| 999 | service-shrink | inputd | move legacy input routing into inputd service-driver path | `kernel/io-manager/src/driver/serio.rs` |
+| 1064 | abi-first-large | rootd-capability | move namespace/capability policy behind rootd capability protocol | `kernel/compat/src/user/syscall/linux/ipc_ops.rs` |
 | 956 | service-shrink | netd | replace marked policy with service-owned protocol and then remove marker | `kernel/ps/src/user/socket.rs` |
-| 770 | service-shrink | inputd | move legacy input routing into inputd service-driver path | `kernel/io-manager/src/input/i8042.rs` |
 | 768 | service-shrink | inputd | move HID parse/state policy into inputd, keep USB callback source | `kernel/io-manager/src/usb/runtime.rs` |
 | 728 | service-shrink | storaged | move post-bootstrap storage policy into storaged, keep raw block broker | `kernel/io-manager/src/storage/ahci.rs` |
 | 622 | service-shrink | netd | replace marked policy with service-owned protocol and then remove marker | `kernel/compat/src/user/syscall/linux/net_broker_ops.rs` |

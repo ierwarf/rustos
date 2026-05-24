@@ -17,25 +17,6 @@ pub(crate) fn submit_pointer_packet(packet: PointerPacket) -> bool {
     submitted
 }
 
-pub(crate) fn submit_pointer_absolute(x: u32, y: u32, buttons: u8, wheel_vertical: i16) -> bool {
-    let submitted =
-        crate::input::event_queue::submit_pointer_absolute(x, y, buttons, wheel_vertical);
-    if submitted {
-        log_pointer_delivery_once("absolute");
-    }
-    submitted
-}
-
-pub(crate) unsafe extern "C" fn report_pointer_packet(packet: *const PointerPacket) -> i32 {
-    if packet.is_null() {
-        return -22;
-    }
-
-    let packet = unsafe { *packet };
-    submit_pointer_packet(packet);
-    0
-}
-
 fn log_pointer_delivery_once(kind: &'static str) {
     #[cfg(test)]
     {
@@ -52,8 +33,8 @@ fn log_pointer_delivery_once(kind: &'static str) {
 #[cfg(test)]
 mod tests {
     use super::{reset_pointer_state, submit_pointer_packet};
-    use driver_abi::{POINTER_BUTTON_LEFT as POINTER_PACKET_LEFT, PointerPacket};
-    use rustos_user_abi::syscall::{INPUTD_INGRESS_KIND_POINTER_PACKET, InputIngressWire};
+    use driver_abi::{PointerPacket, POINTER_BUTTON_LEFT as POINTER_PACKET_LEFT};
+    use rustos_user_abi::syscall::{InputIngressWire, INPUTD_INGRESS_KIND_POINTER_PACKET};
 
     fn isolated() -> std::sync::MutexGuard<'static, ()> {
         crate::test_support::exclusive_test()

@@ -149,10 +149,10 @@ As of the strict Tier 0 + Tier 1 closure pass:
 
 - Current source LOC: `kernel` 67299, `services` 23143, total 90442
   (`rustos-user-abi` carries 3875 source LOC after the shared Linux ABI move).
-- Commercial-max live migration markers remaining: 16583 LOC. The largest
+- Commercial-max live migration markers remaining: 14814 LOC. The largest
   remaining marked surfaces are `usb/xhci.rs` 2125,
   `process/linux.rs` 1297, `proc_broker_ops.rs` 1210,
-  `ipc_ops.rs` 1064, `serio.rs` 999, and `ps/user/socket.rs` 956.
+  `ipc_ops.rs` 1064, `ps/user/socket.rs` 956, and `usb/runtime.rs` 768.
 - Current marked-only projection: `kernel` 45902 before residual broker shells
   and any additional service/shared-ABI overhead.
 - The shared commercial-max protocol envelope is now implemented by the current
@@ -168,6 +168,16 @@ As of the strict Tier 0 + Tier 1 closure pass:
   device ioctl broker. Ring0 still owns the final framebuffer copy/present
   primitive and hot present path, boot/panic output, and `.ko`/MMIO/DMA
   execution island.
+- Current display driver-policy bridge: the provider-active kernel broker is
+  retired. `driverd` owns display provider-group active state, fallback
+  ordering, and the preferred virtio scanout policy passed through
+  `SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER`; ring0 virtio-gpu consumes that
+  descriptor only as privileged MMIO/DMA configuration.
+- Current input service-driver bridge: `inputd` exposes commercial-max
+  descriptors for input ingest/readers/stats plus serio bus routing, i8042
+  command policy, and PS/2 packet policy. Ring0 keeps hardware IRQ/port grants,
+  PS/2 byte sources, and `.ko` callback compatibility while non-`.ko`
+  service-driver policy is represented in `inputd`.
 - Current capability-policy bridge: `rootd` accepts the generic
   commercial-max capability protocol for service lease grant/revoke/renew
   descriptors. Ring0 still installs and enforces broker capability bits at
@@ -179,8 +189,8 @@ As of the strict Tier 0 + Tier 1 closure pass:
   candidates before falling back to stable descriptor id ordering.
 - Current preparation gate: `cargo xtask ring3-inventory` now classifies the
   remaining migration markers by LOC, owner, lane, and deletion action. Current
-  snapshot is `total_marked_loc=16583`, `excluded_xhci_nvme_loc=2910`, and
-  `active_batch_marked_loc=13673`; the xHCI/NVMe LOC is held outside this
+  snapshot is `total_marked_loc=14814`, `excluded_xhci_nvme_loc=2910`, and
+  `active_batch_marked_loc=11904`; the xHCI/NVMe LOC is held outside this
   batch pending `.ko` replacement strategy.
 - Current runtime gate: `cargo xtask run --profile nvme --accel-profile kvm
   --usb-input --debugcon file --commercial-max-ready -- --no-reboot` is the

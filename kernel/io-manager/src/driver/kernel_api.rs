@@ -1,8 +1,8 @@
 use core::{ptr, slice, str};
 
 use driver_abi::{
-    DISPLAY_FRAMEBUFFER_FLAG_BOOT_FRAMEBUFFER, DisplayFramebufferRegistration, DriverKernelApiV1,
-    DriverLogLevel, DriverMmioCachePolicy, DriverPciBarInfo, DriverPciDeviceInfo,
+    DisplayFramebufferRegistration, DriverKernelApiV1, DriverLogLevel, DriverMmioCachePolicy,
+    DriverPciBarInfo, DriverPciDeviceInfo, DISPLAY_FRAMEBUFFER_FLAG_BOOT_FRAMEBUFFER,
     PCI_BAR_FLAG_64BIT, PCI_BAR_FLAG_IO_SPACE, PCI_BAR_FLAG_PREFETCHABLE,
 };
 

@@ -7,15 +7,15 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use crate::sync::KernelSpinLock as Mutex;
 use boot_protocol::{BootInfo, FramebufferInfo};
 use driver_abi::{
-    DISPLAY_FRAMEBUFFER_FLAG_BOOT_FRAMEBUFFER, DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER,
-    DISPLAY_FRAMEBUFFER_KNOWN_FLAGS, DisplayFramebufferRegistration, DisplayPixelFormat,
+    DisplayFramebufferRegistration, DisplayPixelFormat, DISPLAY_FRAMEBUFFER_FLAG_BOOT_FRAMEBUFFER,
+    DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER, DISPLAY_FRAMEBUFFER_KNOWN_FLAGS,
 };
-use embedded_graphics::Drawable;
 use embedded_graphics::geometry::Point;
-use embedded_graphics::mono_font::{MonoTextStyle, ascii::FONT_9X18_BOLD};
+use embedded_graphics::mono_font::{ascii::FONT_9X18_BOLD, MonoTextStyle};
 use embedded_graphics::pixelcolor::Rgb888;
 use embedded_graphics::prelude::RgbColor;
 use embedded_graphics::text::{Baseline, Text};
+use embedded_graphics::Drawable;
 
 use self::framebuffer::{Framebuffer, FramebufferRect};
 use crate::io::session::ConsoleSessionHandle;
@@ -43,16 +43,6 @@ pub struct GuiDisplayInfo {
     pub bytes_per_pixel: u32,
     pub flags: u32,
     pub generation: u64,
-}
-
-impl GuiDisplayInfo {
-    pub const fn is_primary_provider(self) -> bool {
-        self.flags & DISPLAY_INFO_FLAG_PRIMARY_PROVIDER != 0
-    }
-
-    pub const fn is_boot_framebuffer(self) -> bool {
-        self.flags & DISPLAY_INFO_FLAG_BOOT_FRAMEBUFFER != 0
-    }
 }
 
 pub fn init_console() {
@@ -157,9 +147,6 @@ pub unsafe extern "C" fn register_driver_framebuffer(
     }
 
     let display_flags = display_flags_from_driver_registration(framebuffer.flags);
-    if boot_framebuffer_would_replace_primary(display_flags) {
-        return -16;
-    }
 
     if !backend::install_driver_framebuffer(driver_framebuffer, display_flags) {
         return -22;
@@ -184,9 +171,6 @@ pub(crate) fn install_boot_framebuffer_fallback(framebuffer: FramebufferInfo) ->
         return false;
     }
     let flags = DISPLAY_INFO_FLAG_BOOT_FRAMEBUFFER | DISPLAY_INFO_FLAG_PRIMARY_PROVIDER;
-    if boot_framebuffer_would_replace_primary(flags) {
-        return false;
-    }
     if !backend::install_driver_framebuffer(framebuffer, flags) {
         return false;
     }
@@ -202,10 +186,6 @@ pub fn display_dimensions() -> Option<(u32, u32)> {
     backend::display_dimensions()
 }
 
-pub fn primary_display_provider_active() -> bool {
-    display_info().is_some_and(GuiDisplayInfo::is_primary_provider)
-}
-
 fn display_flags_from_driver_registration(registration_flags: u8) -> u32 {
     let mut flags = 0;
     if registration_flags & DISPLAY_FRAMEBUFFER_FLAG_BOOT_FRAMEBUFFER != 0 {
@@ -215,15 +195,6 @@ fn display_flags_from_driver_registration(registration_flags: u8) -> u32 {
         flags |= DISPLAY_INFO_FLAG_PRIMARY_PROVIDER;
     }
     flags
-}
-
-fn boot_framebuffer_would_replace_primary(flags: u32) -> bool {
-    let boot_primary = flags
-        & (DISPLAY_INFO_FLAG_BOOT_FRAMEBUFFER | DISPLAY_INFO_FLAG_PRIMARY_PROVIDER)
-        == (DISPLAY_INFO_FLAG_BOOT_FRAMEBUFFER | DISPLAY_INFO_FLAG_PRIMARY_PROVIDER);
-    boot_primary
-        && display_info()
-            .is_some_and(|info| info.is_primary_provider() && !info.is_boot_framebuffer())
 }
 
 pub fn present_userspace_frame_from_user_bgra8888(

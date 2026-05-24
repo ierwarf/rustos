@@ -85,8 +85,8 @@ Before a large ring0 policy deletion batch, run and preserve these five gates:
 
 1. Inventory: `cargo xtask ring3-inventory` is the source-of-truth snapshot for
    remaining `RING3-MIGRATION-REFERENCE` marked LOC. Current snapshot:
-   `total_marked_loc=16583`, `excluded_xhci_nvme_loc=2910`,
-   `active_batch_marked_loc=13673`.
+   `total_marked_loc=14814`, `excluded_xhci_nvme_loc=2910`,
+   `active_batch_marked_loc=11904`.
 2. Protocol mapping: every active lane must name the current service owner
    (`inputd`, `sessiond`, `uiserver`, `storaged`, `netd`,
    `loaderd`/`procd`, `syscalld`/`pagerd`, `rootd`/capability, `devmgrd`,
@@ -102,11 +102,12 @@ Before a large ring0 policy deletion batch, run and preserve these five gates:
    `initd` spawn, `devmgrd`, `inputd`, `sessiond`, Wayland, UI-ready,
    `wayclick.desktop`, and `storaged` readiness markers.
 
-Large-batch order for the active 13673 marked LOC is:
+Large-batch order for the active 11904 marked LOC is:
 
-1. `inputd` service-shrink: `serio`, `i8042`, USB runtime/core HID policy
+1. `inputd` service-shrink: remaining USB runtime/core HID policy
    (`usb/synthetic.rs` was retired entirely after confirming it was dead code
-   post the capture-bridge removal).
+   post the capture-bridge removal; `serio`/`i8042` service-driver policy
+   markers are retired behind explicit `inputd` descriptors).
 2. `loaderd`/`procd` ABI-first: Linux image/process policy and proc broker
    marker retirement.
 3. `rootd`/capability and IPC policy: service namespace/capability policy
@@ -205,6 +206,11 @@ Large-batch order for the active 13673 marked LOC is:
      through the bounded input ingress broker; `inputd` owns key/button state
      and native/evdev event production. HID descriptor/layout parsing still
      remains in ring0 for the active `.ko` callback path.
+   - Completed: `inputd` commercial-max control now exposes explicit
+     service-driver policy descriptors for serio bus routing, i8042 command
+     policy, and PS/2 packet policy. The broad `serio.rs` and `i8042.rs`
+     migration markers are retired; ring0 retains IRQ/port grants and the
+     `.ko` compatibility callback substrate.
    - Target: move HID layout parsing, keyboard/pointer state, pointer
      coalescing policy, drop policy, and event translation to `inputd`.
      Ring0 `.ko`/USB callbacks stay as the report source.
@@ -250,12 +256,15 @@ Large-batch order for the active 13673 marked LOC is:
 
 5. Driver bootstrap policy leftovers:
    - Current source: `kernel/io-manager/src/driver/mod.rs` still has
-     `hardware_alias_present`, `provider_group_hardware_active`, and a
-     boot-framebuffer fallback primitive.
-  - Completed: the kernel-facing driver broker names now expose hardware facts
-    instead of policy ownership; provider ordering, fallback priority, alias
-    matching, dependency handling, and retry policy stay in `driverd`
+     `hardware_alias_present` and a boot-framebuffer fallback primitive.
+  - Completed: the provider-active kernel broker was removed. `driverd` now
+    owns provider-group active state after successful loads, fallback priority,
+    alias matching, dependency handling, and retry policy in its
     registries/manifests.
+  - Completed: `driverd` passes explicit display load-policy flags and the
+    preferred virtio scanout geometry through the gated load-module broker.
+    Ring0 virtio-gpu consumes that descriptor as a primitive input instead of
+    deriving normal scanout policy from the boot framebuffer.
   - Completed: `driverd` now accepts the shared commercial-max
     `CommercialMaxProtocolRequest` envelope for driver plans, module-load
     authorization, symbol policy, provider selection, retry budget, and

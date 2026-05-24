@@ -1,14 +1,10 @@
-// RING3-MIGRATION-REFERENCE START: commercial-max inputd should own i8042 command
-// policy, PS/2 byte parsing, and legacy input routing only for a non-.ko service driver
-// rewrite. RustOS-authored `.ko` i8042/input drivers stay ring0; ring0 also keeps
-// IRQ/port grant primitives.
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::sync::KernelSpinLock as Mutex;
 use driver_abi::{
-    POINTER_BUTTON_LEFT, POINTER_BUTTON_MIDDLE, POINTER_BUTTON_RIGHT, PointerPacket, SerioDeviceId,
-    SerioDriverRegistration, SerioPortInfo,
+    PointerPacket, SerioDeviceId, SerioDriverRegistration, SerioPortInfo, POINTER_BUTTON_LEFT,
+    POINTER_BUTTON_MIDDLE, POINTER_BUTTON_RIGHT,
 };
 use nucleus_core::util::ring::RingBuffer;
 use x86_64::instructions::{interrupts, port::Port};
@@ -870,4 +866,3 @@ fn read_status() -> u8 {
 const fn is_ignorable_command_response(byte: u8) -> bool {
     byte == DEVICE_RESPONSE_SELF_TEST_PASSED
 }
-// RING3-MIGRATION-REFERENCE END: commercial-max inputd-owned non-.ko i8042 service driver.

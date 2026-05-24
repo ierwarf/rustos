@@ -1,10 +1,11 @@
 use core::ptr;
-use core::sync::atomic::{AtomicBool, Ordering, compiler_fence};
+use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU32, Ordering};
 
 use crate::sync::KernelSpinLock as Mutex;
 use boot_protocol::{
     BootPixelFormat, FramebufferInfo, MAX_BOOT_FRAMEBUFFER_HEIGHT, MAX_BOOT_FRAMEBUFFER_WIDTH,
 };
+use rustos_user_abi::syscall::DRIVER_LOAD_POLICY_DISPLAY_PREFERRED_SCANOUT;
 use x86_64::instructions::interrupts;
 
 const PCI_VENDOR_VIRTIO: u16 = 0x1af4;
@@ -50,8 +51,6 @@ const COMMAND_RESPONSE_SIZE: usize = 1024;
 
 const FRAMEBUFFER_WIDTH_DEFAULT: u32 = 1600;
 const FRAMEBUFFER_HEIGHT_DEFAULT: u32 = 900;
-const MIN_USABLE_SCANOUT_WIDTH: u32 = 1024;
-const MIN_USABLE_SCANOUT_HEIGHT: u32 = 600;
 const MAX_SCANOUT_WIDTH: u32 = MAX_BOOT_FRAMEBUFFER_WIDTH;
 const MAX_SCANOUT_HEIGHT: u32 = MAX_BOOT_FRAMEBUFFER_HEIGHT;
 const BYTES_PER_PIXEL: u32 = 4;
@@ -86,6 +85,8 @@ static DISPLAY: Mutex<Option<VirtioGpuDisplay>> = Mutex::new(None);
 static DISPLAY_INITIALIZING: AtomicBool = AtomicBool::new(false);
 static DISPLAY_NEEDS_FULL_FLUSH: AtomicBool = AtomicBool::new(false);
 static PENDING_FLUSH: Mutex<PendingFlush> = Mutex::new(PendingFlush::empty());
+static POLICY_SCANOUT_WIDTH: AtomicU32 = AtomicU32::new(0);
+static POLICY_SCANOUT_HEIGHT: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy)]
 struct FlushRect {
@@ -585,6 +586,18 @@ fn milliseconds_to_ticks(milliseconds: u64) -> u64 {
 
 unsafe impl Send for VirtQueue {}
 
+pub(crate) fn apply_load_policy(policy_flags: u64, preferred_width: u32, preferred_height: u32) {
+    if policy_flags & DRIVER_LOAD_POLICY_DISPLAY_PREFERRED_SCANOUT != 0
+        && scanout_size_is_supported(preferred_width, preferred_height)
+    {
+        POLICY_SCANOUT_WIDTH.store(preferred_width, Ordering::Release);
+        POLICY_SCANOUT_HEIGHT.store(preferred_height, Ordering::Release);
+    } else {
+        POLICY_SCANOUT_WIDTH.store(0, Ordering::Release);
+        POLICY_SCANOUT_HEIGHT.store(0, Ordering::Release);
+    }
+}
+
 pub(crate) fn try_enable_primary_display() -> bool {
     if DISPLAY.lock().is_some() {
         return true;
@@ -867,9 +880,12 @@ fn probe_and_init() -> Option<VirtioGpuDisplay> {
     }
     trace_native("virtio-gpu-native-driver-ok", pci_bdf_key(pci), 0);
 
-    let (width, height) = query_display_info(&mut controller)
-        .and_then(usable_scanout_size)
-        .unwrap_or_else(default_scanout_size);
+    let (width, height) = policy_scanout_size()
+        .or_else(|| {
+            query_display_info(&mut controller)
+                .filter(|&(width, height)| scanout_size_is_supported(width, height))
+        })
+        .unwrap_or((FRAMEBUFFER_WIDTH_DEFAULT, FRAMEBUFFER_HEIGHT_DEFAULT));
     let stride_pixels = width;
     let Some(framebuffer_size) = framebuffer_size_bytes(width, height) else {
         trace_native(
@@ -1032,56 +1048,10 @@ fn query_display_info(controller: &mut VirtioGpuDisplay) -> Option<(u32, u32)> {
     None
 }
 
-fn usable_scanout_size((width, height): (u32, u32)) -> Option<(u32, u32)> {
-    if !scanout_size_is_supported(width, height) {
-        crate::debug::println!(
-            "virtio-gpu native: rejecting unsupported host scanout {}x{}",
-            width,
-            height
-        );
-        return None;
-    }
-
-    if scanout_size_matches_boot_framebuffer(width, height) {
-        let fallback = default_scanout_size();
-        if fallback != (width, height) {
-            crate::debug::println!(
-                "virtio-gpu native: overriding inherited boot scanout {}x{} with {}x{}",
-                width,
-                height,
-                fallback.0,
-                fallback.1
-            );
-            return Some(fallback);
-        }
-    }
-
-    if width < MIN_USABLE_SCANOUT_WIDTH || height < MIN_USABLE_SCANOUT_HEIGHT {
-        let fallback = default_scanout_size();
-        crate::debug::println!(
-            "virtio-gpu native: overriding small host scanout {}x{} with {}x{}",
-            width,
-            height,
-            fallback.0,
-            fallback.1
-        );
-        return Some(fallback);
-    }
-
-    Some((width, height))
-}
-
-fn default_scanout_size() -> (u32, u32) {
-    (FRAMEBUFFER_WIDTH_DEFAULT, FRAMEBUFFER_HEIGHT_DEFAULT)
-}
-
-fn scanout_size_matches_boot_framebuffer(width: u32, height: u32) -> bool {
-    if let Some(framebuffer) = crate::storage::boot_volume::boot_framebuffer_info() {
-        return framebuffer.validate().is_ok()
-            && framebuffer.width as u32 == width
-            && framebuffer.height as u32 == height;
-    }
-    false
+fn policy_scanout_size() -> Option<(u32, u32)> {
+    let width = POLICY_SCANOUT_WIDTH.load(Ordering::Acquire);
+    let height = POLICY_SCANOUT_HEIGHT.load(Ordering::Acquire);
+    scanout_size_is_supported(width, height).then_some((width, height))
 }
 
 fn scanout_size_is_supported(width: u32, height: u32) -> bool {

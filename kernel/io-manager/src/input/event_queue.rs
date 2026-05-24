@@ -5,11 +5,11 @@ use crate::sync::KernelSpinLock as Mutex;
 use driver_abi::PointerPacket;
 use heapless::Deque as HeaplessDeque;
 use rustos_user_abi::syscall::{
-    INPUTD_ACCESS_NATIVE, INPUTD_INGRESS_KIND_EVENT, INPUTD_INGRESS_KIND_HID_KEYBOARD_REPORT,
-    INPUTD_INGRESS_KIND_HID_POINTER_REPORT, INPUTD_INGRESS_KIND_KEYBOARD,
-    INPUTD_INGRESS_KIND_POINTER_ABSOLUTE, INPUTD_INGRESS_KIND_POINTER_PACKET,
     InputHidKeyboardReportWire, InputHidPointerReportWire, InputIngressWire,
-    InputKeyboardEventWire, InputPointerAbsoluteWire, InputPointerPacketWire,
+    InputKeyboardEventWire, InputPointerAbsoluteWire, InputPointerPacketWire, INPUTD_ACCESS_NATIVE,
+    INPUTD_INGRESS_KIND_EVENT, INPUTD_INGRESS_KIND_HID_KEYBOARD_REPORT,
+    INPUTD_INGRESS_KIND_HID_POINTER_REPORT, INPUTD_INGRESS_KIND_KEYBOARD,
+    INPUTD_INGRESS_KIND_POINTER_PACKET,
 };
 #[cfg(not(test))]
 use x86_64::instructions::interrupts;
@@ -111,28 +111,6 @@ pub(crate) fn submit_pointer_packet(packet: PointerPacket) -> bool {
             wheel_horizontal: packet.wheel_horizontal,
         },
         pointer_absolute: InputPointerAbsoluteWire::default(),
-        hid_keyboard: InputHidKeyboardReportWire::default(),
-        hid_pointer: InputHidPointerReportWire::default(),
-    })
-}
-
-pub(crate) fn submit_pointer_absolute(x: u32, y: u32, buttons: u8, wheel_vertical: i16) -> bool {
-    POINTER_ABSOLUTE_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
-    push_ingress(InputIngressWire {
-        kind: INPUTD_INGRESS_KIND_POINTER_ABSOLUTE,
-        access: INPUTD_ACCESS_NATIVE,
-        flags: 0,
-        event: InputEvent::default(),
-        keyboard: InputKeyboardEventWire::default(),
-        pointer_packet: InputPointerPacketWire::default(),
-        pointer_absolute: InputPointerAbsoluteWire {
-            buttons,
-            reserved0: [0; 3],
-            x,
-            y,
-            wheel_vertical,
-            reserved1: 0,
-        },
         hid_keyboard: InputHidKeyboardReportWire::default(),
         hid_pointer: InputHidPointerReportWire::default(),
     })
@@ -317,7 +295,7 @@ mod tests {
         reset_for_tests,
     };
     use crate::user::abi::device::{
-        INPUT_ACTION_PRESSED, INPUT_KIND_POINTER_BUTTON, INPUT_KIND_POINTER_MOTION, InputEvent,
+        InputEvent, INPUT_ACTION_PRESSED, INPUT_KIND_POINTER_BUTTON, INPUT_KIND_POINTER_MOTION,
     };
 
     fn isolated() -> std::sync::MutexGuard<'static, ()> {

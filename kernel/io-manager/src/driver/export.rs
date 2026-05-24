@@ -1,4 +1,4 @@
-use alloc::alloc::{Layout, alloc, alloc_zeroed, dealloc, handle_alloc_error, realloc};
+use alloc::alloc::{alloc, alloc_zeroed, dealloc, handle_alloc_error, realloc, Layout};
 
 use super::module_registry;
 
