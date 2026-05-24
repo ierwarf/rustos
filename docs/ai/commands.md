@@ -47,19 +47,19 @@ Do not run:
 Docs verification:
 
 - `mdbook build` if `mdbook` exists.
-- Use ripgrep MCP to inspect markdown links with pattern
-  `\[[^]]+\]\(([^)#]+\.md)`.
+- Inspect markdown links with pattern `\[[^]]+\]\(([^)#]+\.md)`.
 - top-level human docs should include `[English](#english) | [한국어](#korean)`.
 
 Fast context commands:
 
-- Use Serena MCP for symbols and ripgrep MCP for raw `symbol_or_path` matches
+- Prefer symbol-aware search (Serena MCP when available) for symbols and
+  scoped text search (ripgrep MCP or `rg`) for raw `symbol_or_path` matches
   under `kernel`, `services`, `tools`, `libs`, `drivers`, and `apps`.
 - `find kernel -maxdepth 4 -name api.rs | sort`
 - `find . -name RUSTOS.package.toml | sort`
-- Use Serena or ripgrep MCP for
-  `enum XtaskCommand|struct Config|enum PackageKind` under `tools/xtask/src`.
-- Read `START..END` only after MCP finds the relevant line range.
+- Search for `enum XtaskCommand|struct Config|enum PackageKind` under
+  `tools/xtask/src`.
+- Read `START..END` only after search finds the relevant line range.
 
 GRUB Secure Boot debug environment:
 
@@ -72,12 +72,11 @@ KVM display boot loop:
 
 - `cargo xtask build`
 - `cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file`
-- Use ripgrep MCP on the relevant log file for
+- Search the relevant log file for
   `error: no suitable video mode|boot framebuffer|bootfb|virtio-gpu|virtio register|DisplayUnavailable|uiserver|panic|scheduler invalid`.
 
-Use ripgrep MCP file listing instead of recursive `ls` or broad `find` when
-searching many files. If ripgrep MCP is unavailable, stop and report the MCP
-failure instead of using shell `rg`.
+Prefer scoped file-listing search (ripgrep MCP or `rg --files`) over recursive
+`ls` or broad `find` when searching many files.
 
 Generated path exceptions:
 

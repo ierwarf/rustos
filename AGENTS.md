@@ -13,59 +13,30 @@ Read this first, then keep context small.
 
 ## Tool usage
 
-Use MCP servers proactively when they fit the task. For code structure, use
-Serena MCP symbol tools before broad text search. For raw text matches, use the
-ripgrep MCP server; keep matches scoped. Do not use shell `rg` as a fallback for
-normal repo exploration. For GitHub repo, PR, issue, or Actions work, use the
-GitHub MCP server/plugin first.
-If a required MCP server is unavailable, stop and report that MCP is unavailable
-instead of falling back to shell tools. Fix project MCP config only when the
-failure is clearly local to this repo and the user asked for MCP repair.
+Prefer symbol-aware search and scoped text search over opening large files.
+When project MCP servers (e.g. Serena, ripgrep, GitHub) are available, use them
+first; otherwise use the equivalent shell tooling. Keep matches scoped.
 
 Let project hooks run. Do not bypass hooks with `--no-verify`, `--no-gpg-sign`,
 or equivalent flags. If a hook blocks or reports a tool/config failure, treat
 that output as primary evidence and repair the hook or command path before
 continuing.
 
-## MCP Explorer Sub-Agent
+## Sub-Agent Use
 
-For repo exploration, the main agent may spawn a `gpt-5.4-mini` explorer
-sub-agent when it would avoid repeated search/read churn. Use
-`reasoning_effort = high` by default.
+A sub-agent is justified only when it reduces search/read churn that would
+otherwise pollute the main context: parallel independent exploration, log
+triage, or a disjoint write slice. Do not spawn one for a single focused read
+or edit.
 
-Rules:
+Constraints:
 
-- Use the mini agent only for read-only exploration.
-- Do not spawn the mini agent for trivial one-file lookups or when one direct
-  MCP call is enough.
-- Use multiple explorer sub-agents in parallel only when the questions are
-  independent and the results can reduce repeated search/read churn.
-- Do not use sub-agents for a single focused read or a single focused edit.
-- Use fan-out/fan-in: the main agent keeps the critical path local, sends only
-  independent sidecar work to sub-agents, then integrates evidence before
-  deciding or editing.
-- The mini agent must use MCP tools only:
-  - Serena MCP for symbols, declarations, references, and focused reads.
-  - ripgrep MCP for raw text search, file listing, and match counts.
-- The mini agent must not use shell `rg`, `grep`, broad `find`, or direct log
-  reads.
-- If required MCP is unavailable, the mini agent must stop and report MCP
-  failure.
-- The mini agent must not edit files, propose final fixes, or decide root
-  cause.
-- The mini agent must return a compact evidence packet only: relevant files and
-  line numbers, matching symbols/contracts, short summaries, and
-  confidence/uncertainty. Omit empty fields.
-- The main agent remains responsible for reasoning, edits, validation, and
-  final decisions.
-- Keep sub-agent use commercially bounded: pass only narrow task context, require
-  evidence paths, avoid secrets/signing material, stop on vague or MCP-failed
-  results, and review any worker changes before integration.
-- `reasoning_effort = medium` is allowed only for simple read-only location
-  tasks: file listing, exact symbol lookup, literal text search, and doc-policy
-  checks.
-- Do not use `gpt-5.4-mini` at `xhigh` or `low` for this repo's explorer
-  sub-agent.
+- Read-only by default. Workers may write only when given disjoint file scope.
+- Pass narrow context: task, relevant paths, stop condition. No secrets,
+  signing material, or unrelated repo state.
+- Return evidence (files, line numbers, symbols, short summary, uncertainty),
+  not final decisions. The main agent owns reasoning, integration, and
+  validation.
 
 ## Do Not Inspect By Default
 
@@ -135,9 +106,10 @@ reported command output as the primary context instead of scanning logs.
 
 - Workspace: `Cargo.toml`
 - xtask CLI: `tools/xtask/src/cli.rs`
-- Build orchestration: `tools/xtask/src/build.rs`
-- Staging and registries: `tools/xtask/src/stage.rs`
-- QEMU runner: `tools/xtask/src/qemu.rs`
+- Build orchestration: `tools/xtask/src/build/` (`mod.rs`, `cargo.rs`)
+- Staging and registries: `tools/xtask/src/stage/mod.rs`
+- QEMU runner: `tools/xtask/src/qemu/mod.rs`
+- Host config: `tools/xtask/src/config/` (`mod.rs`, `project.rs`)
 - Package schema: `tools/xtask/src/package_manifest.rs`
 - Kernel boot entry: `kernel/src/main.rs`
 - Kernel API boundaries: `kernel/*/src/api.rs`
@@ -154,7 +126,7 @@ reported command output as the primary context instead of scanning logs.
 - On completion, report a brief summary only: what changed, validation run, and
   any remaining blocker or risk.
 - Keep stable instructions near the top of future prompts and task-specific
-  details at the end. OpenAI prompt caching depends on exact reusable prefixes.
+  details at the end. Prompt caching depends on exact reusable prefixes.
 - Treat `AGENTS.md`, `docs/ai-map.md`, and the focused `docs/ai/*` files as the
   stable reusable prefix. Do not mix logs, generated output, or transient command
   output into that prefix.

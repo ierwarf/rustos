@@ -104,6 +104,13 @@ Before a large ring0 policy deletion batch, run and preserve these five gates:
 
 Large-batch order for the active 11904 marked LOC is:
 
+0. **Next wave (~5000 LOC, easiest-first)**: see
+   `docs/ai/commercial-microkernel-closure.md` § *Active Migration Plan*.
+   Steps 1–7 retire 4694 marked LOC across `process/mod.rs`, the storaged
+   inventory trio, the sessiond console/session/tty cluster, the
+   syscalld/pagerd MM cluster, `sysops/file.rs`, `sysops/device.rs`, and
+   `sysops/win32/memory.rs`. Do this wave before opening any of the larger
+   items below; the protocol envelopes it depends on are already live.
 1. `inputd` service-shrink: remaining USB runtime/core HID policy
    (`usb/synthetic.rs` was retired entirely after confirming it was dead code
    post the capture-bridge removal; `serio`/`i8042` service-driver policy

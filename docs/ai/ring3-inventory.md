@@ -63,7 +63,7 @@ grant and `.ko` compatibility substrate.
 | 622 | service-shrink | netd | replace marked policy with service-owned protocol and then remove marker | `kernel/compat/src/user/syscall/linux/net_broker_ops.rs` |
 | 565 | service-shrink | inputd | replace marked policy with service-owned protocol and then remove marker | `kernel/io-manager/src/usb/core.rs` |
 | 550 | policy-bridge | devmgrd | replace marked policy with service-owned protocol and then remove marker | `kernel/compat/src/user/sysops/device.rs` |
-| 529 | policy-bridge | sessiond | replace marked policy with service-owned protocol and then remove marker | `kernel/io-manager/src/io/tty.rs` |
+| 529 | service-shrink | sessiond | replace marked policy with service-owned protocol and then remove marker | `kernel/io-manager/src/io/tty.rs` |
 | 495 | policy-bridge | syscalld-pagerd | replace marked policy with service-owned protocol and then remove marker | `kernel/compat/src/user/syscall/linux/mm_broker_ops.rs` |
 | 483 | service-shrink | storaged | move post-bootstrap storage policy into storaged, keep raw block broker | `kernel/io-manager/src/storage/boot_volume.rs` |
 | 462 | policy-bridge | vfsd-pagerd | replace marked policy with service-owned protocol and then remove marker | `kernel/compat/src/user/sysops/file.rs` |

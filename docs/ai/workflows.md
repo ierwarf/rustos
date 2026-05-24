@@ -63,7 +63,7 @@ Debug QEMU boot:
 
 Debug GRUB display boot:
 
-1. Check `tools/xtask/src/build.rs` embedded GRUB config before changing QEMU flags.
+1. Check `tools/xtask/src/build/mod.rs` embedded GRUB config before changing QEMU flags.
 2. Keep GRUB video setup conservative: `load_video`, `gfxmode=auto`, `gfxpayload=keep`.
 3. Check `kernel/nucleus-core/src/multiboot2_entry.S` for the Multiboot2 framebuffer request tag.
 4. Confirm the kernel log prints a nonzero `boot framebuffer addr`.

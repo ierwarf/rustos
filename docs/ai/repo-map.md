@@ -10,10 +10,10 @@ Core entrypoints:
 
 - Workspace: `Cargo.toml`
 - Build/run CLI: `tools/xtask/src/cli.rs`
-- Build orchestration: `tools/xtask/src/build.rs`
-- Stage/registries: `tools/xtask/src/stage.rs`
-- QEMU runner: `tools/xtask/src/qemu.rs`
-- Host config/env: `tools/xtask/src/config.rs`
+- Build orchestration: `tools/xtask/src/build/` (`mod.rs`, `cargo.rs`)
+- Stage/registries: `tools/xtask/src/stage/mod.rs`
+- QEMU runner: `tools/xtask/src/qemu/mod.rs`
+- Host config/env: `tools/xtask/src/config/` (`mod.rs`, `project.rs`)
 - Package schema: `tools/xtask/src/package_manifest.rs`
 - Runtime client/protocol: `libs/runtime-control/src/lib.rs`
 - Logging config parser/cfg: `tools/build_log_cfg.rs`
@@ -51,8 +51,8 @@ Docs:
 
 Before editing:
 
-- For package/stage behavior, inspect `tools/xtask/src/package_manifest.rs` and `tools/xtask/src/stage.rs`.
-- For QEMU behavior, inspect `tools/xtask/src/qemu.rs`.
+- For package/stage behavior, inspect `tools/xtask/src/package_manifest.rs` and `tools/xtask/src/stage/mod.rs`.
+- For QEMU behavior, inspect `tools/xtask/src/qemu/mod.rs`.
 - For runtime launch behavior, inspect `services/runtimed/src/main.rs` and `libs/runtime-control/src/lib.rs`.
 - For UI behavior, inspect `services/uiserver/src/app/*` and `services/uiserver/src/render.rs`.
 - For kernel subsystem integration, inspect the relevant `kernel/*/src/api.rs` first, then the backing module.

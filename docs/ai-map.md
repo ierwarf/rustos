@@ -23,10 +23,10 @@ can reuse the prefix.
 ## Source Entrypoints
 
 - Build/run CLI: `tools/xtask/src/cli.rs`
-- Build orchestration: `tools/xtask/src/build.rs`
-- Stage/image/registries: `tools/xtask/src/stage.rs`
-- QEMU/debug runner: `tools/xtask/src/qemu.rs`
-- Host env/config: `tools/xtask/src/config.rs`
+- Build orchestration: `tools/xtask/src/build/` (`mod.rs`, `cargo.rs`)
+- Stage/image/registries: `tools/xtask/src/stage/mod.rs`
+- QEMU/debug runner: `tools/xtask/src/qemu/mod.rs`
+- Host env/config: `tools/xtask/src/config/` (`mod.rs`, `project.rs`)
 - Package manifest schema: `tools/xtask/src/package_manifest.rs`
 - Kernel boot order: `kernel/src/main.rs`
 - Kernel public surfaces: `kernel/*/src/api.rs`

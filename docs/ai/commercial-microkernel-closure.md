@@ -238,37 +238,182 @@ Tier 0 is already marked and high-confidence:
 
 Tier 1 is now marked as strict-closure live-code references:
 
-- `kernel/io-manager/src/input_core.rs`: ~400 marked LOC (was 622). Queue
-  coalescing, drop policy, and reader-visible counters still belong in
-  `inputd`. **Completed 2026-05-20**: evdev translation, key-code mapping,
-  pointer-button mapping, and stable input ABI structs were lifted into the new
-  `drivers/libs/input-evdev` crate. Both the kernel `/dev/input/event0` read
-  broker and `inputd` now share that crate. Later in the same 2026-05-20 wave,
-  HID usage/modifier/button helper maps also moved into `input-evdev`, and
-  Linux input reads started using `inputd` authorization for read sizing before
-  the ring0 user-copy broker. Validated by `cargo xtask check` and
-  `cargo xtask build`; the earlier `display-probe` QEMU scenario covered the
-  first shared-crate split, while the `usb-input-display` scenario was already
-  failing on the pre-change baseline (kernel `input: pointer event delivered`
-  log never fires with the QEMU PS/2 tablet).
-- `kernel/compat/src/user/process/linux.rs`: 2136 marked LOC. ELF interpreter
+- `kernel/io-manager/src/input_core.rs`: markers retired (0 marked LOC; was 622
+  then ~400). Queue coalescing, drop policy, and reader-visible counters now
+  live in `inputd`. **Completed 2026-05-20**: evdev translation, key-code
+  mapping, pointer-button mapping, and stable input ABI structs were lifted
+  into the new `drivers/libs/input-evdev` crate. Both the kernel
+  `/dev/input/event0` read broker and `inputd` now share that crate. Later in
+  the same 2026-05-20 wave, HID usage/modifier/button helper maps also moved
+  into `input-evdev`, and Linux input reads started using `inputd`
+  authorization for read sizing before the ring0 user-copy broker.
+- `kernel/compat/src/user/process/linux.rs`: 1297 marked LOC. ELF interpreter
   search, runtime search paths, segment validation, mapping manifests, dynamic
   relocation policy, runtime profile construction, initial memory-map metadata,
   and initial stack/auxv policy belong in `loaderd`, `procd`, and `syscalld`.
   Ring0 keeps address-space commit, page mutation, TLS install, and final stack
   materialization.
-- `kernel/compat/src/user/process/mod.rs`: 229 marked LOC. Generic image
+- `kernel/compat/src/user/process/mod.rs`: 97 marked LOC. Generic image
   detection, file-backed image loading, cold PE metadata, and bootstrap policy
   defaults belong in `loaderd`, `procd`, and `syscalld`. Ring0 keeps
   `spawn_prepared_process`, guarded user-stack mapping, `UserTaskBootstrap`
   assembly, and scheduler commit.
-- `kernel/io-manager/src/storage/boot_volume.rs`: 411 marked LOC. Root extent
+- `kernel/io-manager/src/storage/boot_volume.rs`: 483 marked LOC. Root extent
   registry parsing/cache/direct reads and post-bootstrap file/metadata/directory
   helpers belong in `rootd`, `vfsd`, and `storaged`. Early bootstrap reads and
   the physical boot-volume primitive remain ring0 until rootd can provide
   prepared file extents.
 
-Tier 1 added 3398 marked LOC on top of the 4492 LOC Tier 0 surface.
+Tier 1 currently carries 1877 marked LOC (1297 + 97 + 483) on top of the live
+Tier 0 surface (2343 marked LOC across `usb/runtime.rs`, `io/tty.rs`,
+`io/session.rs`, `io/console.rs`, `storage/block/boot.rs`, and
+`sysops/win32/memory.rs`; the other historical Tier 0 entries have been
+retired). Strict Tier 0 + Tier 1 currently totals 4220 marked LOC; the
+remaining 10594 marked LOC in `cargo xtask ring3-inventory` belongs to the
+larger commercial-max abi-first/service-shrink/policy-bridge lanes and the
+excluded xHCI/NVMe `.ko`-evaluation lane.
+
+## Active Migration Plan (~5000 LOC)
+
+This is the next concrete migration wave. The commercial-max protocol envelope
+already exists on every owner below, so each step is **policy/code move plus
+marker retirement**, not protocol design.
+
+Take steps in order. Each step is independent enough to land as one PR but
+should be completed end-to-end (move policy → switch caller → delete ring0
+block → retire marker → re-run `cargo xtask ring3-inventory`) before starting
+the next. Do not skip ahead — earlier steps remove edges that later steps
+depend on, and the order is also smallest/safest first.
+
+For every step the shape is:
+
+1. Implement the service-owned policy under the named owner (extend the
+   existing commercial-max protocol op or add the smallest new op).
+2. Switch the ring0 broker/syscall caller to invoke the service.
+3. Delete or shrink the marked ring0 block. Do not leave a `// removed`
+   placeholder or wrapper stub.
+4. Retire the `RING3-MIGRATION-REFERENCE START`/`END` pair.
+5. Re-run `cargo xtask ring3-inventory`; the affected file must drop off the
+   table.
+
+### Step 1 — `process/mod.rs` cold image dispatch (97 LOC)
+
+- File: `kernel/compat/src/user/process/mod.rs`.
+- Owner: `loaderd` + `procd`.
+- Move: residual generic executable detection and cold-PE/file-backed image
+  dispatch helpers. `loaderd` already owns the live PE/ELF runtime plan; this
+  step deletes the kernel-side dispatch leftovers.
+- Ring0 keeps: `spawn_prepared_process`, guarded user-stack mapping,
+  `UserTaskBootstrap` assembly, scheduler commit.
+- Validation: `cargo xtask check` + commercial-max QEMU signature.
+
+### Step 2 — Storaged inventory finalization (969 LOC)
+
+- Files: `kernel/io-manager/src/storage/boot_volume.rs` (483),
+  `kernel/io-manager/src/storage/block/boot.rs` (247),
+  `kernel/io-manager/src/storage/block/io.rs` (239).
+- Owner: `storaged` (already owns root-volume selection rank and root-extent
+  registry parsing).
+- Move: post-bootstrap boot-volume candidate selection, root-extent registry
+  parse/cache and direct-read helpers, block-cache and runtime block IO
+  policy. Route remaining callers through `STORAGED_OP_BOOT_EXTENT_LOOKUP`
+  and the commercial-max `BlockInventory`/`BootExtentLease`/`VolumeMetadata`
+  ops.
+- Ring0 keeps: physical boot-volume primitive read, raw block IO controller
+  paths (AHCI/NVMe drivers stay separate), the gated boot/block read broker
+  for early `rootd` and `vfsd`.
+- Validation: `cargo xtask build` + commercial-max QEMU signature with the
+  NVMe profile (exercises the boot path that previously ran the kernel
+  fallbacks).
+
+### Step 3 — Sessiond console/session/tty cluster (1080 LOC)
+
+- Files: `kernel/io-manager/src/io/console.rs` (227),
+  `kernel/io-manager/src/io/session.rs` (324),
+  `kernel/io-manager/src/io/tty.rs` (529).
+- Owner: `sessiond` via `runtimed` on `IPC_SERVICE_SESSIOND` (already
+  accepting the commercial-max envelope; `devmgrd` → `sessiond` console/session
+  ioctl authorization is live).
+- Move: normal console buffering and per-session route, session graph state,
+  TTY line discipline and edit buffers. Use the commercial-max
+  `SessionGraph`/`TtyLineDiscipline`/`ConsoleRoute`/`ForegroundFocus`/
+  `UiBootstrap` ops on the existing endpoint.
+- Ring0 keeps: boot console + panic output primitive, current-process
+  user-copy, final console-focus/session-commit behind the gated device-ioctl
+  broker.
+- Validation: `cargo xtask build` + commercial-max QEMU signature.
+  Console/TTY regressions surface through `wayclick.desktop` readiness and
+  the boot debugcon markers; both are part of the signature.
+
+### Step 4 — Syscalld + pagerd MM cluster (1288 LOC)
+
+- Files: `kernel/compat/src/user/syscall/linux/mm_broker_ops.rs` (495),
+  `kernel/compat/src/user/syscall/linux/memory_ops.rs` (422),
+  `kernel/compat/src/user/syscall/linux/syscalld_ops.rs` (371).
+- Owner: `syscalld` plus `pagerd` (registered on the `syscalld` IPC queue;
+  commercial-max envelope is already live).
+- Move: Linux MM argument/limit policy validation, `mmap`/`brk`/`mremap`/
+  `mprotect`/`madvise` defaults and ordering, generic Linux syscall-offload
+  routing/timeout/default selection. Use the commercial-max `MmPolicy`,
+  `LinuxPolicy`, and pager `BackingObject`/`PageCachePolicy`/`FaultResolve`
+  ops.
+- Ring0 keeps: `SYS_RUSTOS_MM_BROKER` PTE mutation + backing-lifetime
+  enforcement, current-address-space commit, user-copy primitives. Do **not**
+  build a generic Linux syscall proxy in `syscalld` — invalid evacuation
+  shape per `ring3-evacuation.md`.
+- Validation: `cargo xtask check` + `cargo xtask build` + commercial-max
+  QEMU signature with `apps/execsmoke` (or any workload that exercises
+  `mmap`/`munmap`/`mprotect`).
+
+### Step 5 — vfsd cold file metadata sysop (462 LOC)
+
+- File: `kernel/compat/src/user/sysops/file.rs`.
+- Owner: `vfsd` plus `pagerd` for backing/page-cache policy.
+- Move: cold-path file sysop defaults, `statx`/path-resolve fallback policy,
+  metadata normalization, directory-cursor defaults. Use the commercial-max
+  `PathResolve`/`MetadataPolicy`/`DirectoryCursor`/`FileCursor` ops on the
+  live `vfsd` endpoint.
+- Ring0 keeps: current-process user-copy and the gated VFS broker commits.
+- Validation: `cargo xtask build` + commercial-max QEMU signature.
+
+### Step 6 — devmgrd cold device sysop (550 LOC)
+
+- File: `kernel/compat/src/user/sysops/device.rs`.
+- Owner: `devmgrd` (display setup already delegates to
+  `IPC_SERVICE_UISERVER`; console/session ioctl already delegates to
+  `IPC_SERVICE_SESSIOND`).
+- Move: residual device-class dispatch defaults, policy-side fallback
+  metadata generation, ioctl-class default normalization. Use the
+  commercial-max `DeviceRegistry`/`DeviceOpen`/`IoctlAuthorize`/
+  `DeviceEventSubscribe` ops; never expand the ring0 fallback path.
+- Ring0 keeps: `SYS_RUSTOS_DEVICE_OPEN_BROKER` fd install with reduced
+  rights, current-process ioctl user-copy.
+- Validation: `cargo xtask build` + commercial-max QEMU signature. Run
+  `cargo xtask probe-display` to confirm no display/ioctl regression.
+
+### Step 7 — Win32 cold memory sysop (248 LOC)
+
+- File: `kernel/compat/src/user/sysops/win32/memory.rs`.
+- Owner: `syscalld` (Win32 policy lane on the commercial-max envelope).
+- Move: `VirtualAlloc`/`VirtualFree`/`NtAllocateVirtualMemory`/
+  `NtFreeVirtualMemory` cold validation and protection-flag normalization.
+  Use the commercial-max `Win32Policy` ops.
+- Ring0 keeps: page mutation, address-space commit, user-copy.
+- Validation: `cargo xtask build` + commercial-max QEMU signature with a
+  Windows PE smoke (`apps/windows/userdemo2`).
+
+### Plan totals and what comes after
+
+Cumulative LOC retired by completing all seven steps: **4694 marked LOC**
+(97 + 969 + 1080 + 1288 + 462 + 550 + 248).
+
+After this wave, the remaining ~7210 LOC of active-batch markers is the harder
+set: abi-first-large (`process/linux.rs` 1297, `proc_broker_ops.rs` 1210,
+`ipc_ops.rs` 1064, `process/mod.rs` already in Step 1), large service-shrink
+(`ps/user/socket.rs` 956, `usb/runtime.rs` 768, `storage/ahci.rs` 728,
+`net_broker_ops.rs` 622, `usb/core.rs` 565), and `policy-bridge` USB/HID +
+network. Those need additional service/driver work and are intentionally
+deferred; do not pull them forward into this wave.
 
 ## Service Protocol Target
 
@@ -359,7 +504,7 @@ Move these policy blocks after their protocols are in place:
   `sessiond`/`runtimed`; framebuffer present, boot console, and panic output
   remain ring0.
 
-Estimated additional Tier 2 policy beyond the currently marked 7890 LOC:
+Estimated additional Tier 2 policy beyond the currently marked 14814 LOC:
 7000-12000 source LOC. This is intentionally a range because ABI structs and
 broker shells may move to shared crates instead of services, while ring0 keeps
 the privileged commit functions.
@@ -388,23 +533,26 @@ more policy while preserving compatibility.
 
 Current measured baseline:
 
-- `kernel`: 73459 source LOC
-- `services`: 19026 source LOC
-- marked Tier 0 + Tier 1 migration references: 7890 source LOC
-- commercial-max migration references: 28360 source LOC
+- `kernel`: 64819 source LOC
+- `services`: 24182 source LOC
+- marked Tier 0 + Tier 1 migration references: 4220 source LOC
+- commercial-max migration references (full `RING3-MIGRATION-REFERENCE`
+  marked set): 14814 source LOC, of which 2910 LOC (`usb/xhci.rs`,
+  `storage/nvme.rs`) sits in the `.ko`-evaluation lane and 11904 LOC is in the
+  active migration batch.
 
 If only the currently marked Tier 0 + Tier 1 references are moved:
 
-- `kernel`: about 65569 LOC
-- `services`: about 26916 LOC before broker/service overhead
+- `kernel`: about 60599 LOC
+- `services`: about 28402 LOC before broker/service overhead
 
 Protocol-first maximum compatible target:
 
 - raw kernel policy moved to ring3/shared ABI: about 15000-20000 source LOC
-  total, including the already marked 7890 LOC
+  total, including the already marked 14814 LOC
 - additional protocol/test/service overhead: about 3000-6000 source LOC
-- realistic final `kernel`: about 56000-61000 source LOC
-- realistic final `services`: about 37000-45000 source LOC
+- realistic final `kernel`: about 48000-53000 source LOC
+- realistic final `services`: about 42000-50000 source LOC
 
 The kernel number does not drop by the full moved amount because residual
 broker shells, capability checks, and privileged commit stubs stay in ring0. The
@@ -446,7 +594,7 @@ Additional commercial-max migration beyond the protocol-first target:
 Commercial-max total:
 
 - raw kernel code moved to ring3/shared ABI: about 28000-35000 source LOC
-- realistic final `kernel`: about 42000-50000 source LOC
+- realistic final `kernel`: about 33000-42000 source LOC
 - realistic final `services` plus shared user ABI libraries: about 55000-70000
   source LOC
 
