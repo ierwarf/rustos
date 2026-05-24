@@ -1,7 +1,7 @@
 use alloc::vec;
 
-use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
+use x86_64::VirtAddr;
 
 use crate::debug;
 use crate::io::session::ConsoleSessionHandle;
@@ -249,43 +249,21 @@ impl<'a> Default for ProcessLaunchOptions<'a> {
     }
 }
 
-// RING3-MIGRATION-REFERENCE START: loaderd/procd should own generic executable
-// image detection, launch defaults, file-backed image loading, and cold
-// Linux loader metadata policy. Ring0 should keep task commit, address-space
-// mutation, and prepared bootstrap materialization. PE detection no longer
-// lives here — procd routes Windows binaries through loaderd, which returns a
-// prepared `windows_runtime` blob via the PROC_BROKER set-windows-runtime
-// path (see `prepare_windows_process_with_address_space`).
 #[inline(never)]
-pub fn load_image(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadError> {
-    if image.starts_with(b"\x7FELF") {
-        return linux::load_elf(image);
-    }
-    if image.starts_with(b"MZ") {
-        return Err(ProcessLoadError::InvalidPe(
-            "PE bytes-image path retired; route Windows binaries through loaderd",
-        ));
-    }
-
-    Err(ProcessLoadError::InvalidPe(
-        "unknown executable image format",
-    ))
-}
-
-pub fn spawn_process_with_launch(
+pub fn spawn_bootstrap_linux_process_with_launch(
     image: &[u8],
     weight_micros: u64,
     launch: ProcessLaunchOptions<'_>,
 ) -> Result<SpawnedProcess, ProcessLoadError> {
-    let prepared = prepare_process_with_launch(image, launch)?;
+    let prepared = prepare_bootstrap_linux_process_with_launch(image, launch)?;
     spawn_prepared_process(prepared, weight_micros)
 }
 
-pub fn prepare_process_with_launch(
+fn prepare_bootstrap_linux_process_with_launch(
     image: &[u8],
     launch: ProcessLaunchOptions<'_>,
 ) -> Result<PreparedProcessImage, ProcessLoadError> {
-    prepare_loaded_process_with_launch(load_image(image)?, launch)
+    prepare_loaded_process_with_launch(linux::load_elf(image)?, launch)
 }
 
 pub fn prepare_windows_process_with_address_space(
@@ -319,8 +297,6 @@ pub fn prepare_linux_process_with_metadata(
     prepare_loaded_process_with_launch(loaded, launch)
 }
 
-// RING3-MIGRATION-REFERENCE END: loaderd/procd-owned generic image loading policy.
-
 pub fn spawn_prepared_process(
     prepared: PreparedProcessImage,
     weight_micros: u64,
@@ -339,10 +315,6 @@ fn prepare_loaded_process_with_launch(
     mut loaded: LoadedProcessImage,
     launch: ProcessLaunchOptions<'_>,
 ) -> Result<PreparedProcessImage, ProcessLoadError> {
-    // RING3-MIGRATION-REFERENCE START: procd/syscalld should own process
-    // bootstrap policy defaults and runtime metadata selection. Ring0 keeps the
-    // guarded user-stack mapping, UserTaskBootstrap assembly, and scheduler
-    // commit boundary.
     debug_assert!(USER_STACK_RESERVE_PAGES > USER_STACK_INITIAL_COMMIT_PAGES);
     debug_assert!(
         USER_STACK_RESERVE_PAGES - USER_STACK_INITIAL_COMMIT_PAGES >= USER_STACK_GUARD_PAGES
@@ -386,7 +358,6 @@ fn prepare_loaded_process_with_launch(
         bootstrap,
     })
 }
-// RING3-MIGRATION-REFERENCE END: procd/syscalld-owned process bootstrap policy.
 
 // Note: file-backed image loading (`load_image_file`/`load_elf_file`) has been
 // retired from ring0. loaderd reads images via VFS fd and prepares the runtime

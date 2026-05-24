@@ -5,14 +5,14 @@ use core::cmp;
 use core::convert::TryFrom;
 use core::ptr;
 
-use object::LittleEndian;
 use object::elf::{self as objelf, FileHeader64 as RawElfHeader};
 use object::read::FileKind;
-use x86_64::VirtAddr;
+use object::LittleEndian;
 use x86_64::structures::paging::PageTableFlags;
-use xmas_elf::ElfFile;
+use x86_64::VirtAddr;
 use xmas_elf::dynamic::Tag as DynamicTag;
 use xmas_elf::program::{ProgramHeader, SegmentData, Type as ProgramType};
+use xmas_elf::ElfFile;
 
 use crate::memory::paging::{self, ProcessAddressSpace};
 use crate::multitask::UserStackState;
@@ -27,8 +27,8 @@ use crate::user::process_state::ProcessSecurityContext;
 use crate::vfs;
 
 use super::{
-    LoadedProcessImage, LoadedProcessRuntime, MAX_LOAD_SEGMENTS, PAGE_SIZE, ProcessLoadError,
-    align_down, align_up, page_ranges_overlap,
+    align_down, align_up, page_ranges_overlap, LoadedProcessImage, LoadedProcessRuntime,
+    ProcessLoadError, MAX_LOAD_SEGMENTS, PAGE_SIZE,
 };
 
 const ELF_DYN_LOAD_BASE: u64 = paging::USER_SPACE_BASE + 0x0040_0000;
@@ -1130,7 +1130,11 @@ fn elf_dynamic_string<'a>(strtab: &'a [u8], offset: usize) -> Result<&'a str, Pr
 fn linux_env_value<'a>(env: &'a [&'a str], key: &str) -> Option<&'a str> {
     env.iter().find_map(|entry| {
         let (name, value) = entry.split_once('=')?;
-        if name == key { Some(value) } else { None }
+        if name == key {
+            Some(value)
+        } else {
+            None
+        }
     })
 }
 
@@ -1563,10 +1567,10 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::{
-        ELF_DYN_LOAD_BASE, ElfTlsTemplateInfo, INITIAL_TLS_TCB_ALIGN, INITIAL_TLS_TCB_SIZE,
-        LINUX_AUX_HWCAP, LINUX_AUX_HWCAP2, build_linux_initial_stack_words, build_runtime_profile,
-        elf_initial_tls_info_from_template, expand_runtime_search_entry,
-        segment_page_file_copy_range,
+        build_linux_initial_stack_words, build_runtime_profile, elf_initial_tls_info_from_template,
+        expand_runtime_search_entry, segment_page_file_copy_range, ElfTlsTemplateInfo,
+        ELF_DYN_LOAD_BASE, INITIAL_TLS_TCB_ALIGN, INITIAL_TLS_TCB_SIZE, LINUX_AUX_HWCAP,
+        LINUX_AUX_HWCAP2,
     };
     use crate::memory::paging::USER_SPACE_BASE;
     use crate::user::linux as linux_abi;

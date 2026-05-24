@@ -10,24 +10,33 @@
 # the user config.
 
 [features]
-codex_hooks = true
+hooks = true
 
 # --------------------------------------------------------------------------
 # Hooks
 #
 # Scripts live in .codex/hooks/ and read a JSON event from stdin, returning
-# a JSON decision on stdout. Each script computes the repo root from its
+# a Codex hook decision on stdout. Each script computes the repo root from its
 # own location so this config is portable across clones.
 # --------------------------------------------------------------------------
 
 [[hooks.PreToolUse]]
-matcher = "^Read$"
+matcher = "^(Read|mcp__.*read.*file|mcp__serena__read_file)$"
 
 [[hooks.PreToolUse.hooks]]
 type = "command"
 command = '"$(git rev-parse --show-toplevel)/.codex/hooks/pre_read_large_file.sh"'
 timeout = 5
 statusMessage = "Checking file size / allow-list"
+
+[[hooks.PreToolUse]]
+matcher = "^(apply_patch|Edit|Write)$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = '"$(git rev-parse --show-toplevel)/.codex/hooks/pre_edit_policy.sh"'
+timeout = 5
+statusMessage = "Checking edit path policy"
 
 [[hooks.PreToolUse]]
 matcher = "^Bash$"
@@ -45,13 +54,30 @@ timeout = 180
 statusMessage = "Pre-commit fmt + clippy"
 
 [[hooks.PostToolUse]]
-matcher = "^(Edit|Write)$"
+matcher = "^(apply_patch|Edit|Write)$"
 
 [[hooks.PostToolUse.hooks]]
 type = "command"
 command = '"$(git rev-parse --show-toplevel)/.codex/hooks/post_edit_rust.sh"'
 timeout = 120
 statusMessage = "cargo xtask check"
+
+[[hooks.UserPromptSubmit]]
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = '"$(git rev-parse --show-toplevel)/.codex/hooks/user_prompt_policy.sh"'
+timeout = 5
+statusMessage = "Checking prompt safety"
+
+[[hooks.SessionStart]]
+matcher = "^(startup|resume)$"
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = '"$(git rev-parse --show-toplevel)/.codex/hooks/session_context.sh"'
+timeout = 5
+statusMessage = "Loading RustOS hook context"
 
 # --------------------------------------------------------------------------
 # MCP servers (project-scoped)
@@ -69,7 +95,3 @@ args = ["-y", "mcp-ripgrep"]
 [mcp_servers.serena]
 command = "uvx"
 args = ["--from", "serena-agent", "serena", "start-mcp-server"]
-
-[mcp_servers.github]
-command = "bash"
-args = ["-lc", "token=\"${GITHUB_PERSONAL_ACCESS_TOKEN:-}\"; if [ -z \"$token\" ] && command -v gh >/dev/null 2>&1; then token=\"$(gh auth token 2>/dev/null || true)\"; fi; export GITHUB_PERSONAL_ACCESS_TOKEN=\"$token\"; exec github-mcp-server stdio"]

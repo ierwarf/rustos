@@ -2,7 +2,10 @@
 
 Use this before `docs/api/kernel.md`.
 
-Rule: cross-crate kernel calls should go through `kernel_*::api`.
+**Rule:** cross-crate kernel calls go through `kernel_*::api`. Do not reach
+into another crate's private modules when `api.rs` exposes a wrapper.
+
+## API surfaces
 
 | Need | Import | Read |
 | --- | --- | --- |
@@ -16,7 +19,9 @@ Rule: cross-crate kernel calls should go through `kernel_*::api`.
 | Boot orchestration/hooks | `kernel_executive::boot` | `kernel/executive/src/boot.rs`, `kernel/executive/src/lib.rs` |
 | Logging/panic/boot trace | `nucleus_core::debug` | `kernel/nucleus-core/src/debug/mod.rs` |
 
-Boot order from `kernel/src/main.rs`:
+## Boot order
+
+From `kernel/src/main.rs`:
 
 1. `hal_api::disable_interrupts`
 2. `debug::boot_trace::init`
@@ -27,31 +32,34 @@ Boot order from `kernel/src/main.rs`:
 7. `hal_api::call_with_stack`
 8. `boot::kernel_main_bootstrap`
 
-Do not reorder without reading `kernel/src/main.rs` and `kernel/executive/src/boot.rs`.
+Do not reorder without reading `kernel/src/main.rs` and
+`kernel/executive/src/boot.rs`.
 
-High-risk APIs:
+## High-risk APIs
 
-- `unsafe` boot transfer helpers: `enter_higher_half`, `call_with_stack`.
-- user-memory IO: `read_to_current_user`, `read_to_user`, `ioctl_from_user`.
-- process state mutation: `with_current_user_process_state_mut`, `with_process_state_by_pid_mut`.
-- scheduler wait primitives: use `current_task_id`, `block_current_task`, and
-  `wake_task` for kernel-capable wait queues; use `*_user_*` wrappers only for
-  userspace-task waits.
-- scheduler preemption: use `cond_resched`/`reschedule_if_requested` only at
-  Linux-style safe points outside spinlocked or IRQ-off regions; timer IRQs
+- **`unsafe` boot transfer:** `enter_higher_half`, `call_with_stack`.
+- **User-memory IO:** `read_to_current_user`, `read_to_user`,
+  `ioctl_from_user`.
+- **Process state mutation:** `with_current_user_process_state_mut`,
+  `with_process_state_by_pid_mut`.
+- **Scheduler wait primitives:** use `current_task_id`, `block_current_task`,
+  `wake_task` for kernel-capable wait queues; use `*_user_*` wrappers only
+  for userspace-task waits.
+- **Scheduler preemption:** `cond_resched`/`reschedule_if_requested` only at
+  Linux-style safe points outside spinlocked or IRQ-off regions. Timer IRQs
   should request reschedule for user-task kernel frames, not blindly switch
   away from arbitrary kernel code.
-- Linux `.ko` init preemption: module init executes as a user-service syscall
+- **Linux `.ko` init preemption:** module init runs as a user-service syscall
   kernel frame, so long lock-free Linux compat callbacks must call
   `cond_resched` at safe points. Do not hold RustOS spinlocks or IRQ-off
   sections across those calls.
-- scheduler fairness: keep the hardware timer tick fixed and route service
-  weights into scheduler vruntime/load accounting only. Root slot 0 is a fair
+- **Scheduler fairness:** keep the hardware timer tick fixed and route
+  service weights into vruntime/load accounting only. Root slot 0 is a fair
   task during bootstrap finalize, then becomes the idle fallback after
   `mark_root_idle()`.
-- VFS mount/unmount/open path helpers: require current process context.
+- **VFS mount/unmount/open path helpers:** require current process context.
 
-Docs:
+## Docs
 
 - Human reference: `docs/api/kernel.md`.
 - AI contract: `docs/ai/contracts.md`.

@@ -1,36 +1,42 @@
 # AI Agent Reference
 
-This directory is optimized for AI agents, not human onboarding.
+Optimized for AI agents, not human onboarding. English-only, dense, contract-shaped.
 
-Rules:
+## What lives here
+
+| File | Role |
+| --- | --- |
+| `token-policy.md` | Mandatory operating policy: context budget, forbidden paths, when to stop. |
+| `task-router.md` | Task → smallest context set. Read after `token-policy.md`. |
+| `repo-map.md` | Source ownership and canonical entrypoints. Deeper than `docs/ai-map.md`. |
+| `commands.md` | Quiet build/check/debug commands and their failure meanings. |
+| `contracts.md` | Stable schemas, generated paths, ABI boundaries. Update when behavior changes. |
+| `kernel-api-map.md` | Cross-crate kernel API surfaces (`kernel_*::api`) and boot order. |
+| `workflows.md` | Step recipes: add service/app/driver, modify kernel API, debug QEMU boot. |
+| `ring3-evacuation.md` | Service-first ring0 evacuation boundaries and migration candidates. |
+| `ring3-inventory.md` | Live LOC/owner/action snapshot for the active migration batch. |
+| `commercial-microkernel-closure.md` | Final hybrid-kernel closure criteria, marker rules, LOC accounting. |
+
+## Operating rules
 
 - Follow `token-policy.md`.
-- Use root `AGENTS.md`, `docs/ai-map.md`, and `task-router.md` as entrypoints.
 - Read the smallest file/range needed before scanning the repo.
-- Treat human docs as explanatory and AI docs as compact contracts.
+- Treat human docs (`docs/*.md` outside `docs/ai/`) as explanatory; AI docs as compact contracts.
 - Verify code truth before editing when a contract references a source path.
 - For OS hardening, prioritize high-risk boundaries over broad cleanup.
-- For blocked debugging, stop and report the structural blocker instead of
-  making speculative patches.
+- For blocked debugging, stop and report the structural blocker — no speculative patches.
 
-Stable cache prefix:
+## Stable cache prefix
 
-1. Root `AGENTS.md`.
-2. `docs/ai-map.md`.
-3. `token-policy.md`.
-4. `task-router.md`.
+Cache exactly these, in order, then append **one** focused AI doc selected by `task-router.md`:
 
-Then append one focused AI doc selected by `task-router.md`.
+1. Root `AGENTS.md`
+2. `docs/ai-map.md`
+3. `token-policy.md`
+4. `task-router.md`
 
-Primary human docs:
+Keep task text, logs, command output, and source snippets *after* this prefix. Never cache logs or generated output.
 
-- `docs/index.md`
-- `docs/ai-map.md`
-- `docs/getting-started.md`
-- `docs/execution-flow.md`
-- `docs/structure.md`
-- `docs/logging.md`
+## Human docs (use only when AI contracts are missing the needed behavior)
 
-Token policy:
-
-- Canonical policy lives in `token-policy.md`; do not duplicate it here.
+`docs/index.md`, `docs/ai-map.md`, `docs/getting-started.md`, `docs/execution-flow.md`, `docs/structure.md`, `docs/logging.md`.

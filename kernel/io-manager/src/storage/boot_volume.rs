@@ -38,10 +38,6 @@ static ROOT_FILE_EXTENTS: KernelWaitLock<RootFileExtentState> =
     KernelWaitLock::new(RootFileExtentState::Uninitialized);
 static ROOT_EXTENT_LOGS_REMAINING: AtomicUsize = AtomicUsize::new(32);
 
-// RING3-MIGRATION-REFERENCE START: rootd/vfsd/storaged should own post-bootstrap
-// root-file extent registry parsing, cache state, direct extent reads, and
-// metadata policy. Ring0 keeps only early bootstrap reads and raw block access
-// primitives until rootd can provide prepared file extents.
 #[derive(Clone, Debug)]
 struct RootFileExtent {
     offset: u64,
@@ -524,8 +520,6 @@ fn read_extent_bytes(
     }
     Ok(())
 }
-// RING3-MIGRATION-REFERENCE END: rootd/vfsd/storaged-owned root extent policy.
-
 fn read_file_into_from_fs(
     fs: &BootVolumeFs,
     path: &str,
@@ -786,10 +780,6 @@ pub fn read_bootstrap_file_to_vec(
 }
 
 pub fn read_file_to_vec(path: &str) -> core::result::Result<Vec<u8>, fatfs::Error<DiskIoError>> {
-    // RING3-MIGRATION-REFERENCE START: vfsd/rootd should own normal runtime
-    // boot-volume file reads, metadata, and directory lookup after the
-    // foundational services are online. Ring0 keeps only pre-vfsd bootstrap
-    // file access and raw block read primitives.
     if should_trace_boot_path(path) {
         crate::debug::println!(
             "boot volume helper: runtime read_file_to_vec begin path={}",
@@ -843,7 +833,6 @@ pub fn read_dir(
     }
     with_open_boot_volume(|fs| fs.read_dir(path))
 }
-// RING3-MIGRATION-REFERENCE END: vfsd/rootd-owned runtime boot-volume file policy.
 
 fn with_open_boot_volume<T>(
     f: impl FnOnce(&BootVolumeFs) -> core::result::Result<T, fatfs::Error<DiskIoError>>,

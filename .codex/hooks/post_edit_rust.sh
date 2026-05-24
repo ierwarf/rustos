@@ -12,6 +12,9 @@ INPUT="$(cat)"
 path="$(printf '%s' "$INPUT" | jq -r '
   .tool_input.file_path // .arguments.file_path // .params.file_path // empty
 ' 2>/dev/null || true)"
+cmd="$(printf '%s' "$INPUT" | jq -r '
+  .tool_input.command // .arguments.command // .params.command // empty
+' 2>/dev/null || true)"
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 case "$path" in
@@ -20,10 +23,15 @@ case "$path" in
   *) abs_path="$REPO_ROOT/$path" ;;
 esac
 
-# Only react to *.rs edits inside this workspace.
+# Only react to *.rs edits inside this workspace. apply_patch reports the patch
+# as tool_input.command, so parse file headers when no direct file path exists.
 case "$abs_path" in
   "$REPO_ROOT"/*.rs|"$REPO_ROOT"/**/*.rs) ;;
-  *) printf '{"decision":"allow"}\n'; exit 0 ;;
+  *)
+    if ! printf '%s\n' "$cmd" | grep -Eq '^\*\*\* (Add|Update|Delete) File: .+\.rs$'; then
+      exit 0
+    fi
+    ;;
 esac
 
 # Skip repeated checks within a 30-second window: if the last successful
@@ -34,7 +42,6 @@ now=$(date +%s)
 if [[ -f "$STAMP" ]]; then
   last=$(cat "$STAMP" 2>/dev/null || echo 0)
   if (( now - last < 30 )); then
-    jq -n '{decision:"allow", message:"cargo xtask check: skipped (last ok <30s ago)"}'
     exit 0
   fi
 fi
@@ -44,11 +51,10 @@ log="$(mktemp)"
 if timeout 90 cargo xtask check >"$log" 2>&1; then
   rm -f "$log"
   date +%s >"$STAMP"
-  jq -n '{decision:"allow", message:"cargo xtask check: ok"}'
   exit 0
 fi
 
 tail="$(tail -n 40 "$log")"
 rm -f "$log"
 jq -n --arg m "cargo xtask check failed (tail):
-$tail" '{decision:"allow", message:$m}'
+$tail" '{systemMessage:$m}'

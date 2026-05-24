@@ -17,40 +17,69 @@ INPUT="$(cat)"
 # versions, so probe the common shapes and fall back to allow.
 path="$(printf '%s' "$INPUT" | jq -r '
   .tool_input.file_path // .tool_input.path //
+  .tool_input.relative_path //
   .arguments.file_path // .arguments.path //
+  .arguments.relative_path //
   .params.file_path  // .params.path  //
+  .params.relative_path //
   empty
 ' 2>/dev/null || true)"
 
 if [[ -z "$path" ]]; then
-  printf '{"decision":"allow"}\n'
   exit 0
 fi
 
-# Hard-block extensions / directories regardless of size.
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 case "$path" in
+  "$REPO_ROOT"/*) rel_path="${path#"$REPO_ROOT"/}" ;;
+  ./*) rel_path="${path#./}" ;;
+  *) rel_path="$path" ;;
+esac
+
+# Hard-block extensions / directories regardless of size.
+case "$rel_path" in
   logs/*.log|logs/*.txt|*/logs/*.log|*/logs/*.txt|*.pcap|*.bin|*.iso|*.img|perf.data|*/perf.data|target/*|*/target/*|build/*|*/build/*|vendor/*|*/vendor/*|Cargo.lock|*/Cargo.lock)
-    msg="Blocked: $path is in the do-not-inspect set (logs/target/build/vendor/Cargo.lock/binary). \
+    msg="Blocked: $rel_path is in the do-not-inspect set (logs/target/build/vendor/Cargo.lock/binary). \
 Use rg, tail -n, or sed -n line ranges instead. \
 See AGENTS.md > Do Not Inspect By Default."
-    jq -n --arg m "$msg" '{decision:"block", message:$m}'
+    jq -n --arg m "$msg" '{
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: $m
+      },
+      decision: "block",
+      reason: $m
+    }'
     exit 0
     ;;
 esac
 
-if [[ ! -e "$path" ]]; then
-  printf '{"decision":"allow"}\n'
+case "$path" in
+  /*) fs_path="$path" ;;
+  *) fs_path="$REPO_ROOT/$path" ;;
+esac
+
+if [[ ! -e "$fs_path" ]]; then
   exit 0
 fi
 
 # Size gate for everything else: 256KB soft limit.
-size=$(stat -c%s -- "$path" 2>/dev/null || echo 0)
+size=$(stat -c%s -- "$fs_path" 2>/dev/null || echo 0)
 if (( size > 262144 )); then
-  msg="Blocked: $path is ${size} bytes (>256KB). \
+  msg="Blocked: $rel_path is ${size} bytes (>256KB). \
 Use rg/tail/sed line ranges, or summarize via the log-summarizer subagent. \
 If you genuinely need a full read, ask the user first."
-  jq -n --arg m "$msg" '{decision:"block", message:$m}'
+  jq -n --arg m "$msg" '{
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: $m
+    },
+    decision: "block",
+    reason: $m
+  }'
   exit 0
 fi
 
-printf '{"decision":"allow"}\n'
+exit 0
