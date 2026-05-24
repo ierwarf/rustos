@@ -7,20 +7,22 @@ use std::thread;
 use std::time::Duration;
 
 use rustos_user_abi::syscall::{
-    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, InputIngestBrokerArgs,
-    InputIngressWire, InputKeyboardEventWire, InputPointerAbsoluteWire, InputPointerPacketWire,
-    InputStatsBrokerArgs, InputStatsWire, InputdIpcRequest, InputdIpcResponse, InputdReadResponse,
     COMMERCIAL_MAX_INPUTD_OP_DROP_POLICY, COMMERCIAL_MAX_INPUTD_OP_EVDEV_TRANSLATE,
     COMMERCIAL_MAX_INPUTD_OP_INPUT_INGEST, COMMERCIAL_MAX_INPUTD_OP_INPUT_READER,
     COMMERCIAL_MAX_INPUTD_OP_INPUT_STATS, COMMERCIAL_MAX_INPUTD_OP_LAYOUT_POLICY,
-    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_INPUTD, INPUTD_ACCESS_EVDEV,
+    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_INPUTD,
+    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, INPUTD_ACCESS_EVDEV,
     INPUTD_ACCESS_NATIVE, INPUTD_INGEST_MAX_EVENTS, INPUTD_INGRESS_KIND_EVENT,
+    INPUTD_INGRESS_KIND_HID_KEYBOARD_REPORT, INPUTD_INGRESS_KIND_HID_POINTER_REPORT,
     INPUTD_INGRESS_KIND_KEYBOARD, INPUTD_INGRESS_KIND_POINTER_ABSOLUTE,
     INPUTD_INGRESS_KIND_POINTER_PACKET, INPUTD_IPC_ABI_VERSION, INPUTD_IPC_OP_AUTHORIZE_READ,
     INPUTD_IPC_OP_DRAIN_INGEST, INPUTD_IPC_OP_PING, INPUTD_IPC_OP_READ, INPUTD_IPC_OP_STATS,
     INPUTD_READ_FLAG_NONBLOCK, INPUTD_READ_PAYLOAD_CAPACITY, IPC_MAX_INLINE_BYTES,
-    IPC_SERVICE_INPUTD, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_INPUT_INGEST_BROKER,
+    IPC_SERVICE_INPUTD, InputHidKeyboardReportWire, InputHidPointerReportWire,
+    InputIngestBrokerArgs, InputIngressWire, InputKeyboardEventWire, InputPointerAbsoluteWire,
+    InputPointerPacketWire, InputStatsBrokerArgs, InputStatsWire, InputdIpcRequest,
+    InputdIpcResponse, InputdReadResponse, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_INPUT_INGEST_BROKER,
     SYS_RUSTOS_INPUT_STATS_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV,
     SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
 };
@@ -32,8 +34,17 @@ const INPUTD_MAX_EVDEV_READ_BYTES: u64 = input_evdev::MAX_EVDEV_READ_BYTES as u6
 static INPUT_DELIVERY_LOGGED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Default)]
+struct HidKeyboardState {
+    source_id: u64,
+    modifiers: u8,
+    keys: [u8; 16],
+    key_count: usize,
+}
+
+#[derive(Default)]
 struct InputQueue {
     events: VecDeque<input_evdev::InputEvent>,
+    hid_keyboards: Vec<HidKeyboardState>,
     dropped_lossy: u64,
     pointer_buttons: u8,
 }
@@ -125,6 +136,101 @@ impl InputQueue {
             });
         }
         self.push_pointer_button_edges(absolute.buttons);
+    }
+
+    fn push_hid_keyboard_report(&mut self, report: InputHidKeyboardReportWire) {
+        let mut keys = [0u8; 16];
+        let key_count = (report.key_count as usize).min(keys.len());
+        keys[..key_count].copy_from_slice(&report.keys[..key_count]);
+        let state_index = if let Some(index) = self
+            .hid_keyboards
+            .iter()
+            .position(|state| state.source_id == report.source_id)
+        {
+            index
+        } else {
+            self.hid_keyboards.push(HidKeyboardState {
+                source_id: report.source_id,
+                ..HidKeyboardState::default()
+            });
+            self.hid_keyboards.len() - 1
+        };
+        let previous_modifiers = self.hid_keyboards[state_index].modifiers;
+        let previous_keys = self.hid_keyboards[state_index].keys;
+        let previous_key_count = self.hid_keyboards[state_index].key_count;
+        self.hid_keyboards[state_index].modifiers = report.modifiers;
+        self.hid_keyboards[state_index].keys = keys;
+        self.hid_keyboards[state_index].key_count = key_count;
+
+        for usage in 0xE0u8..=0xE7 {
+            let mask = 1u8 << (usage - 0xE0);
+            if (previous_modifiers & mask) == (report.modifiers & mask) {
+                continue;
+            }
+            if let Some(code) = input_evdev::hid_usage_to_keycode(usage) {
+                self.push_keycode_event(code as u32, (report.modifiers & mask) != 0);
+            }
+        }
+
+        let mut previous_index = 0usize;
+        while previous_index < previous_key_count {
+            let usage = previous_keys[previous_index];
+            if !keys[..key_count].contains(&usage) {
+                if let Some(code) = input_evdev::hid_usage_to_keycode(usage) {
+                    self.push_keycode_event(code as u32, false);
+                }
+            }
+            previous_index += 1;
+        }
+
+        let mut current_index = 0usize;
+        while current_index < key_count {
+            let usage = keys[current_index];
+            if !previous_keys[..previous_key_count].contains(&usage) {
+                if let Some(code) = input_evdev::hid_usage_to_keycode(usage) {
+                    self.push_keycode_event(code as u32, true);
+                }
+            }
+            current_index += 1;
+        }
+    }
+
+    fn push_hid_pointer_report(&mut self, report: InputHidPointerReportWire) {
+        if report.relative != 0 {
+            self.push_pointer_packet(InputPointerPacketWire {
+                buttons: report.buttons,
+                reserved0: [0; 3],
+                dx: report.x as i16,
+                dy: report.y as i16,
+                wheel_vertical: report.wheel_vertical,
+                wheel_horizontal: 0,
+            });
+        } else {
+            self.push_pointer_absolute(InputPointerAbsoluteWire {
+                buttons: report.buttons,
+                reserved0: [0; 3],
+                x: report.x.max(0) as u32,
+                y: report.y.max(0) as u32,
+                wheel_vertical: report.wheel_vertical,
+                reserved1: 0,
+            });
+        }
+    }
+
+    fn push_keycode_event(&mut self, code: u32, pressed: bool) {
+        self.push(input_evdev::InputEvent {
+            kind: input_evdev::INPUT_KIND_KEYBOARD,
+            action: if pressed {
+                input_evdev::INPUT_ACTION_PRESSED
+            } else {
+                input_evdev::INPUT_ACTION_RELEASED
+            },
+            code,
+            value0: 0,
+            value1: 0,
+            modifiers: 0,
+            text: 0,
+        });
     }
 
     fn push_pointer_button_edges(&mut self, current: u8) {
@@ -502,6 +608,12 @@ fn drain_ingest(queue: &mut InputQueue) -> Result<usize, i32> {
             }
             INPUTD_INGRESS_KIND_POINTER_ABSOLUTE if wire.access == INPUTD_ACCESS_NATIVE => {
                 queue.push_pointer_absolute(wire.pointer_absolute);
+            }
+            INPUTD_INGRESS_KIND_HID_KEYBOARD_REPORT if wire.access == INPUTD_ACCESS_NATIVE => {
+                queue.push_hid_keyboard_report(wire.hid_keyboard);
+            }
+            INPUTD_INGRESS_KIND_HID_POINTER_REPORT if wire.access == INPUTD_ACCESS_NATIVE => {
+                queue.push_hid_pointer_report(wire.hid_pointer);
             }
             _ => {}
         }

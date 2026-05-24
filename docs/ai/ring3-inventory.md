@@ -11,9 +11,9 @@ cargo xtask ring3-inventory
 
 Current snapshot:
 
-- `total_marked_loc=20542`
+- `total_marked_loc=20449`
 - `excluded_xhci_nvme_loc=2910`
-- `active_batch_marked_loc=17632`
+- `active_batch_marked_loc=17539`
 
 `kernel/io-manager/src/usb/xhci.rs` and
 `kernel/io-manager/src/storage/nvme.rs` are explicitly excluded from the active
@@ -23,6 +23,11 @@ The previous snapshot (active=18512) was reduced by retiring the
 `usb/synthetic.rs` marker entirely: the file was deleted along with its dead
 `emulation`/`core`/`runtime` plumbing after confirming `synthetic_hid_kind` was
 never `Some(..)` post the 2026-05-20 capture-bridge removal.
+
+The latest inputd shrink moved USB HID keyboard key-state diffing, pointer
+button-edge state, and reader-visible event injection into `inputd`; ring0 now
+forwards normalized HID keyboard/pointer reports through the input ingress
+broker while HID descriptor/layout parsing remains in `usb/runtime.rs`.
 
 ## Active Batch Lanes
 
@@ -34,9 +39,9 @@ never `Some(..)` post the 2026-05-20 capture-bridge removal.
 | 1063 | abi-first-large | rootd-capability | move namespace/capability policy behind rootd capability protocol | `kernel/compat/src/user/syscall/linux/ipc_ops.rs` |
 | 999 | service-shrink | inputd | move legacy input routing into inputd service-driver path | `kernel/io-manager/src/driver/serio.rs` |
 | 956 | service-shrink | netd | replace marked policy with service-owned protocol and then remove marker | `kernel/ps/src/user/socket.rs` |
-| 861 | service-shrink | inputd | move HID parse/state policy into inputd, keep USB callback source | `kernel/io-manager/src/usb/runtime.rs` |
 | 785 | service-shrink | uiserver | move provider/display policy into uiserver or service-driver path | `kernel/io-manager/src/io/gui/framebuffer.rs` |
 | 770 | service-shrink | inputd | move legacy input routing into inputd service-driver path | `kernel/io-manager/src/input/i8042.rs` |
+| 768 | service-shrink | inputd | move HID parse/state policy into inputd, keep USB callback source | `kernel/io-manager/src/usb/runtime.rs` |
 | 728 | service-shrink | storaged | move post-bootstrap storage policy into storaged, keep raw block broker | `kernel/io-manager/src/storage/ahci.rs` |
 | 622 | service-shrink | netd | replace marked policy with service-owned protocol and then remove marker | `kernel/compat/src/user/syscall/linux/net_broker_ops.rs` |
 | 589 | service-shrink | uiserver | move provider/display policy into uiserver or service-driver path | `kernel/io-manager/src/io/gui.rs` |

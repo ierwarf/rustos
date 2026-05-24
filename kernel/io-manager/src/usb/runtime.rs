@@ -6,11 +6,11 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::sync::KernelSpinLock as Mutex;
-use driver_abi::PointerPacket;
 use heapless::Deque as HeaplessDeque;
 use hidreport::{ArrayField, Field, FieldAttributes, Report, ReportDescriptor};
+use rustos_user_abi::syscall::{InputHidKeyboardReportWire, InputHidPointerReportWire};
 
-use super::hid_translation::{hid_usage_to_keycode, pointer_buttons_from_report};
+use super::hid_translation::pointer_buttons_from_report;
 use crate::driver::linux::compat::{LinuxCompatHidDevice, LinuxCompatUrb, LinuxCompatUsbDevice};
 
 const USB_REQ_GET_DESCRIPTOR: u8 = 0x06;
@@ -122,13 +122,6 @@ struct PointerLayout {
 struct HidReportState {
     hid_device_ptr: usize,
     layout: Option<Arc<HidReportLayout>>,
-    last_modifiers: u8,
-    last_keys: [u8; 16],
-    last_key_count: usize,
-    last_pointer_buttons: u8,
-    last_pointer_x: i32,
-    last_pointer_y: i32,
-    have_pointer_origin: bool,
 }
 
 impl Default for HidReportState {
@@ -136,13 +129,6 @@ impl Default for HidReportState {
         Self {
             hid_device_ptr: 0,
             layout: None,
-            last_modifiers: 0,
-            last_keys: [0; 16],
-            last_key_count: 0,
-            last_pointer_buttons: 0,
-            last_pointer_x: 0,
-            last_pointer_y: 0,
-            have_pointer_origin: false,
         }
     }
 }
@@ -555,11 +541,7 @@ pub(crate) fn cancel_urb(urb: *mut LinuxCompatUrb) -> bool {
 }
 
 #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
-pub(crate) fn hid_input_report(
-    dev: *mut LinuxCompatHidDevice,
-    data: *mut u8,
-    size: u32,
-) -> i32 {
+pub(crate) fn hid_input_report(dev: *mut LinuxCompatHidDevice, data: *mut u8, size: u32) -> i32 {
     // RING3-MIGRATION-REFERENCE START: inputd should own HID report
     // classification and event translation. Ring0 should only identify the HID
     // source and forward the report bytes/capability.
@@ -1190,67 +1172,13 @@ fn handle_keyboard_report(
         }
     }
 
-    let (previous_modifiers, previous_keys, previous_key_count) = {
-        let mut states = HID_REPORT_STATES.lock();
-        let state = ensure_hid_state(&mut states, hid_device_ptr);
-        let previous_modifiers = state.last_modifiers;
-        let previous_keys = state.last_keys;
-        let previous_key_count = state.last_key_count;
-        state.last_modifiers = modifiers;
-        state.last_keys = keys;
-        state.last_key_count = key_count;
-        (previous_modifiers, previous_keys, previous_key_count)
-    };
-
-    for usage in 0xE0u8..=0xE7 {
-        let mask = 1u8 << (usage - 0xE0);
-        if (previous_modifiers & mask) == (modifiers & mask) {
-            continue;
-        }
-        if let Some(code) = hid_usage_to_keycode(usage) {
-            crate::input::keyboard::inject_key_transition(code, (modifiers & mask) == 0);
-        }
-    }
-
-    let mut previous_index = 0usize;
-    while previous_index < previous_key_count {
-        let usage = previous_keys[previous_index];
-        let mut still_present = false;
-        let mut current_index = 0usize;
-        while current_index < key_count {
-            if keys[current_index] == usage {
-                still_present = true;
-                break;
-            }
-            current_index += 1;
-        }
-        if !still_present {
-            if let Some(code) = hid_usage_to_keycode(usage) {
-                crate::input::keyboard::inject_key_transition(code, true);
-            }
-        }
-        previous_index += 1;
-    }
-
-    let mut current_index = 0usize;
-    while current_index < key_count {
-        let usage = keys[current_index];
-        let mut was_present = false;
-        let mut previous_index = 0usize;
-        while previous_index < previous_key_count {
-            if previous_keys[previous_index] == usage {
-                was_present = true;
-                break;
-            }
-            previous_index += 1;
-        }
-        if !was_present {
-            if let Some(code) = hid_usage_to_keycode(usage) {
-                crate::input::keyboard::inject_key_transition(code, false);
-            }
-        }
-        current_index += 1;
-    }
+    let _ = crate::input::event_queue::submit_hid_keyboard_report(InputHidKeyboardReportWire {
+        source_id: hid_device_ptr as u64,
+        modifiers,
+        key_count: key_count as u8,
+        reserved0: [0; 6],
+        keys,
+    });
 
     if KEYBOARD_TRANSLATION_LOG_LIMIT != 0
         && KEYBOARD_TRANSLATION_LOGS.fetch_add(1, Ordering::Relaxed)
@@ -1280,6 +1208,7 @@ fn handle_pointer_report(hid_device_ptr: usize, report: &[u8], layout: &PointerL
         return 0;
     }
     let button_bits = extract_pointer_buttons(&layout, report);
+    let buttons = pointer_buttons_from_report(button_bits);
     let x = extract_value_field_i32(&layout.x_field, report).unwrap_or(0);
     let y = extract_value_field_i32(&layout.y_field, report).unwrap_or(0);
     let wheel = layout
@@ -1291,39 +1220,29 @@ fn handle_pointer_report(hid_device_ptr: usize, report: &[u8], layout: &PointerL
     if layout.relative {
         HID_POINTER_REPORT_COUNT.fetch_add(1, Ordering::Relaxed);
 
-        let packet = {
-            let mut states = HID_REPORT_STATES.lock();
-            let state = ensure_hid_state(&mut states, hid_device_ptr);
-            state.last_pointer_buttons = button_bits;
-            PointerPacket {
-                buttons: pointer_buttons_from_report(button_bits),
-                dx: x as i16,
-                dy: y as i16,
-                wheel_vertical: wheel as i16,
-                wheel_horizontal: 0,
-                reserved0: 0,
-                reserved1: 0,
-                reserved2: 0,
-            }
-        };
-
-        crate::driver::input::submit_pointer_packet(packet);
+        let _ = crate::input::event_queue::submit_hid_pointer_report(InputHidPointerReportWire {
+            source_id: hid_device_ptr as u64,
+            buttons,
+            relative: 1,
+            reserved0: [0; 2],
+            x,
+            y,
+            wheel_vertical: wheel as i16,
+            reserved1: 0,
+        });
 
         if POINTER_TRANSLATION_LOG_LIMIT != 0
-            && (packet.dx != 0
-                || packet.dy != 0
-                || packet.wheel_vertical != 0
-                || packet.buttons != 0)
+            && (x != 0 || y != 0 || wheel != 0 || buttons != 0)
             && POINTER_TRANSLATION_LOGS.fetch_add(1, Ordering::Relaxed)
                 < POINTER_TRANSLATION_LOG_LIMIT
         {
             crate::debug::println!(
                 "usb hid pointer report: dev={:#x} dx={} dy={} wheel={} buttons={:#x} relative={}",
                 hid_device_ptr,
-                packet.dx,
-                packet.dy,
-                packet.wheel_vertical,
-                packet.buttons,
+                x,
+                y,
+                wheel,
+                buttons,
                 layout.relative
             );
         }
@@ -1343,23 +1262,18 @@ fn handle_pointer_report(hid_device_ptr: usize, report: &[u8], layout: &PointerL
         scale_absolute_coordinate(x, layout.logical_min_x, layout.logical_max_x, display_max_x);
     let target_y =
         scale_absolute_coordinate(y, layout.logical_min_y, layout.logical_max_y, display_max_y);
-    let buttons = {
-        let mut states = HID_REPORT_STATES.lock();
-        let state = ensure_hid_state(&mut states, hid_device_ptr);
-        state.have_pointer_origin = true;
-        state.last_pointer_x = target_x;
-        state.last_pointer_y = target_y;
-        state.last_pointer_buttons = button_bits;
-        pointer_buttons_from_report(button_bits)
-    };
 
     HID_POINTER_REPORT_COUNT.fetch_add(1, Ordering::Relaxed);
-    crate::driver::input::submit_pointer_absolute(
-        target_x.max(0) as u32,
-        target_y.max(0) as u32,
+    let _ = crate::input::event_queue::submit_hid_pointer_report(InputHidPointerReportWire {
+        source_id: hid_device_ptr as u64,
         buttons,
-        wheel as i16,
-    );
+        relative: 0,
+        reserved0: [0; 2],
+        x: target_x,
+        y: target_y,
+        wheel_vertical: wheel as i16,
+        reserved1: 0,
+    });
 
     if POINTER_TRANSLATION_LOG_LIMIT != 0
         && POINTER_TRANSLATION_LOGS.fetch_add(1, Ordering::Relaxed) < POINTER_TRANSLATION_LOG_LIMIT
@@ -1380,23 +1294,6 @@ fn handle_pointer_report(hid_device_ptr: usize, report: &[u8], layout: &PointerL
 
 pub(crate) fn debug_pointer_report_count() -> u64 {
     HID_POINTER_REPORT_COUNT.load(Ordering::Relaxed)
-}
-
-fn ensure_hid_state(
-    states: &mut Vec<HidReportState>,
-    hid_device_ptr: usize,
-) -> &mut HidReportState {
-    for index in 0..states.len() {
-        if states[index].hid_device_ptr == hid_device_ptr {
-            return &mut states[index];
-        }
-    }
-
-    states.push(HidReportState {
-        hid_device_ptr,
-        ..HidReportState::default()
-    });
-    states.last_mut().expect("hid report state just inserted")
 }
 
 fn hid_layout_summary(layout: &HidReportLayout) -> (&'static str, u8, usize) {

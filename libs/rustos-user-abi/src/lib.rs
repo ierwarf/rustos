@@ -752,6 +752,8 @@ pub mod syscall {
     pub const INPUTD_INGRESS_KIND_POINTER_PACKET: u16 = 2;
     pub const INPUTD_INGRESS_KIND_POINTER_ABSOLUTE: u16 = 3;
     pub const INPUTD_INGRESS_KIND_KEYBOARD: u16 = 4;
+    pub const INPUTD_INGRESS_KIND_HID_KEYBOARD_REPORT: u16 = 5;
+    pub const INPUTD_INGRESS_KIND_HID_POINTER_REPORT: u16 = 6;
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -796,6 +798,29 @@ pub mod syscall {
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default)]
+    pub struct InputHidKeyboardReportWire {
+        pub source_id: u64,
+        pub modifiers: u8,
+        pub key_count: u8,
+        pub reserved0: [u8; 6],
+        pub keys: [u8; 16],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct InputHidPointerReportWire {
+        pub source_id: u64,
+        pub buttons: u8,
+        pub relative: u8,
+        pub reserved0: [u8; 2],
+        pub x: i32,
+        pub y: i32,
+        pub wheel_vertical: i16,
+        pub reserved1: i16,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default)]
     pub struct InputIngressWire {
         pub kind: u16,
         pub access: u16,
@@ -804,6 +829,8 @@ pub mod syscall {
         pub keyboard: InputKeyboardEventWire,
         pub pointer_packet: InputPointerPacketWire,
         pub pointer_absolute: InputPointerAbsoluteWire,
+        pub hid_keyboard: InputHidKeyboardReportWire,
+        pub hid_pointer: InputHidPointerReportWire,
     }
 
     #[repr(C)]
@@ -2661,6 +2688,8 @@ mod tests {
         assert_eq!(syscall::INPUTD_INGRESS_KIND_POINTER_PACKET, 2);
         assert_eq!(syscall::INPUTD_INGRESS_KIND_POINTER_ABSOLUTE, 3);
         assert_eq!(syscall::INPUTD_INGRESS_KIND_KEYBOARD, 4);
+        assert_eq!(syscall::INPUTD_INGRESS_KIND_HID_KEYBOARD_REPORT, 5);
+        assert_eq!(syscall::INPUTD_INGRESS_KIND_HID_POINTER_REPORT, 6);
         assert_eq!(syscall::STORAGED_OP_ROOT_STATUS, 4);
         assert_eq!(syscall::STORAGED_OP_BOOT_EXTENT_LOOKUP, 5);
 
@@ -2672,7 +2701,9 @@ mod tests {
         assert_eq!(size_of::<syscall::InputKeyboardEventWire>(), 16);
         assert_eq!(size_of::<syscall::InputPointerPacketWire>(), 12);
         assert_eq!(size_of::<syscall::InputPointerAbsoluteWire>(), 16);
-        assert_eq!(size_of::<syscall::InputIngressWire>(), 76);
+        assert_eq!(size_of::<syscall::InputHidKeyboardReportWire>(), 32);
+        assert_eq!(size_of::<syscall::InputHidPointerReportWire>(), 32);
+        assert_eq!(size_of::<syscall::InputIngressWire>(), 140);
         assert!(size_of::<syscall::InputdReadResponse>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert!(size_of::<syscall::RootdIpcRequest>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert!(size_of::<syscall::RootdIpcResponse>() <= syscall::IPC_MAX_INLINE_BYTES);

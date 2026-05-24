@@ -178,8 +178,8 @@ As of the strict Tier 0 + Tier 1 closure pass:
   candidates before falling back to stable descriptor id ordering.
 - Current preparation gate: `cargo xtask ring3-inventory` now classifies the
   remaining migration markers by LOC, owner, lane, and deletion action. Current
-  snapshot is `total_marked_loc=21423`, `excluded_xhci_nvme_loc=2911`, and
-  `active_batch_marked_loc=18512`; the xHCI/NVMe LOC is held outside this
+  snapshot is `total_marked_loc=20449`, `excluded_xhci_nvme_loc=2910`, and
+  `active_batch_marked_loc=17539`; the xHCI/NVMe LOC is held outside this
   batch pending `.ko` replacement strategy.
 - Current runtime gate: `cargo xtask run --profile nvme --accel-profile kvm
   --usb-input --debugcon file --commercial-max-ready -- --no-reboot` is the

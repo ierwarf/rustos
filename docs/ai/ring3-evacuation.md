@@ -85,8 +85,8 @@ Before a large ring0 policy deletion batch, run and preserve these five gates:
 
 1. Inventory: `cargo xtask ring3-inventory` is the source-of-truth snapshot for
    remaining `RING3-MIGRATION-REFERENCE` marked LOC. Current snapshot:
-   `total_marked_loc=20542`, `excluded_xhci_nvme_loc=2910`,
-   `active_batch_marked_loc=17632`.
+   `total_marked_loc=20449`, `excluded_xhci_nvme_loc=2910`,
+   `active_batch_marked_loc=17539`.
 2. Protocol mapping: every active lane must name the current service owner
    (`inputd`, `sessiond`, `uiserver`, `storaged`, `netd`,
    `loaderd`/`procd`, `syscalld`/`pagerd`, `rootd`/capability, `devmgrd`,
@@ -102,7 +102,7 @@ Before a large ring0 policy deletion batch, run and preserve these five gates:
    `initd` spawn, `devmgrd`, `inputd`, `sessiond`, Wayland, UI-ready,
    `wayclick.desktop`, and `storaged` readiness markers.
 
-Large-batch order for the active 17632 marked LOC is:
+Large-batch order for the active 17539 marked LOC is:
 
 1. `inputd` service-shrink: `serio`, `i8042`, USB runtime/core HID policy
    (`usb/synthetic.rs` was retired entirely after confirming it was dead code
@@ -201,6 +201,12 @@ Large-batch order for the active 17632 marked LOC is:
      had no live device producers — xhci was the only registrar and always set
      `synthetic_hid_kind: None`. The inputd-owned "synthetic HID device"
      migration marker is retired.
+   - Completed: USB HID keyboard key-state diffing, pointer button-edge state,
+     and reader-visible event injection moved from `usb/runtime.rs` into
+     `inputd`. Ring0 now forwards normalized HID keyboard/pointer reports
+     through the bounded input ingress broker; `inputd` owns key/button state
+     and native/evdev event production. HID descriptor/layout parsing still
+     remains in ring0 for the active `.ko` callback path.
    - Target: move HID layout parsing, keyboard/pointer state, pointer
      coalescing policy, drop policy, and event translation to `inputd`.
      Ring0 `.ko`/USB callbacks stay as the report source.
