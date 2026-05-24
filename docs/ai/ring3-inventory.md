@@ -19,37 +19,6 @@ Current snapshot:
 `kernel/io-manager/src/storage/nvme.rs` are explicitly excluded from the active
 batch while `.ko` replacement is being evaluated.
 
-The previous snapshot (active=18512) was reduced by retiring the
-`usb/synthetic.rs` marker entirely: the file was deleted along with its dead
-`emulation`/`core`/`runtime` plumbing after confirming `synthetic_hid_kind` was
-never `Some(..)` post the 2026-05-20 capture-bridge removal.
-
-The latest inputd shrink moved USB HID keyboard key-state diffing, pointer
-button-edge state, and reader-visible event injection into `inputd`; ring0 now
-forwards normalized HID keyboard/pointer reports through the input ingress
-broker while HID descriptor/layout parsing remains in `usb/runtime.rs`.
-
-The latest display chunk added the `uiserver` commercial-max display policy
-endpoint, routed display setup/present authorization through `devmgrd` to
-`uiserver`, and left ring0 with the framebuffer copy/present primitive,
-boot/panic console, and `.ko`/MMIO/DMA execution island. The stale display
-markers in `virtio_gpu.rs`, `io/gui*`, and `io/device/display.rs` are retired.
-The "3866 LOC" display figure was an inventory-marker retirement delta, not a
-physical source deletion claim; the commit that retired those markers changed
-17 files with 419 insertions and 82 deletions because the display primitive and
-compatibility island intentionally remained ring0.
-Follow-up display cleanup removed the unused ring0 normal terminal renderer and
-retired the provider-active kernel broker. `driverd` now owns provider-group
-active state, fallback ordering, and the preferred virtio scanout descriptor it
-passes to the load-module broker; ring0 consumes that descriptor as
-MMIO/DMA/display primitive configuration.
-
-The latest inputd service-driver chunk added commercial-max policy ops for
-serio bus routing, i8042 command policy, and PS/2 packet policy. The
-`serio.rs`/`i8042.rs` markers are retired because the non-`.ko` service-driver
-policy surface is now explicit in `inputd`; ring0 still keeps the IRQ/port
-grant and `.ko` compatibility substrate.
-
 ## Active Batch Lanes
 
 | LOC | Lane | Owner | Action | Path |

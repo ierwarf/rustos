@@ -2829,6 +2829,13 @@ pub(super) fn syscall_linux_vfs_umount2(target_ptr: u64, flags: u64) -> u64 {
 }
 
 pub(super) fn syscall_linux_ioctl(fd: u64, request_number: u64, arg: u64) -> u64 {
+    if ioctl_requires_sessiond_tty_policy(request_number) {
+        match ioctl_tty_via_sessiond(fd, request_number, arg) {
+            Ok(value) => return value,
+            Err(errno) => return linux_errno(errno),
+        }
+    }
+
     if ioctl_requires_devmgrd_policy(request_number) {
         match ioctl_device_via_devmgrd(fd, request_number, arg) {
             Ok(value) => return value,
@@ -2862,6 +2869,17 @@ fn ioctl_requires_devmgrd_policy(request_number: u64) -> bool {
             | rustos_user_abi::console::CONSOLE_IOCTL_BIND_CURRENT_SESSION
             | rustos_user_abi::console::CONSOLE_IOCTL_SET_SESSION_STATE
             | rustos_user_abi::console::CONSOLE_IOCTL_SET_FOCUS
+    )
+}
+
+fn ioctl_requires_sessiond_tty_policy(request_number: u64) -> bool {
+    matches!(
+        request_number,
+        linux_abi::TCGETS
+            | linux_abi::TCSETS
+            | linux_abi::TCSETSW
+            | linux_abi::TCSETSF
+            | linux_abi::FIONREAD
     )
 }
 
@@ -3425,6 +3443,60 @@ fn open_device_via_devmgrd(path: &str, flags: u64) -> Result<u64, i64> {
         return Err(LINUX_EINVAL);
     };
     Ok(fd)
+}
+
+fn ioctl_tty_via_sessiond(fd: u64, request_number: u64, arg: u64) -> Result<u64, i64> {
+    let snapshot = multitask::current_user_snapshot().ok_or(LINUX_EINVAL)?;
+    let mut request = CommercialMaxProtocolRequest::default();
+    request.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    request.header.protocol = COMMERCIAL_MAX_PROTOCOL_SESSIOND;
+    request.header.op = COMMERCIAL_MAX_SESSIOND_OP_TTY_LINE_DISCIPLINE;
+    request.header.service_id = IPC_SERVICE_SESSIOND;
+    request.header.subject_pid = snapshot.process_id();
+    request.header.subject_tid = snapshot.thread_id();
+    request.arg0 = request_number;
+    request.arg1 = fd;
+    request.arg2 = snapshot.console_session().raw();
+    if matches!(
+        request_number,
+        linux_abi::TCSETS | linux_abi::TCSETSW | linux_abi::TCSETSF
+    ) {
+        let termios = usermem::read_current_user_struct::<linux_abi::LinuxTermios>(arg)
+            .map_err(address_space_error_to_linux_errno)?;
+        request.payload[..size_of::<linux_abi::LinuxTermios>()].copy_from_slice(as_bytes(&termios));
+        request.payload_len = size_of::<linux_abi::LinuxTermios>() as u32;
+    }
+
+    let start_ticks = crate::arch::rtc::ticks();
+    let response = ipc_ops::call_service_endpoint(IPC_SERVICE_SESSIOND, as_bytes(&request))?;
+    log_slow_service_call(
+        "sessiond",
+        request.header.op,
+        ticks_elapsed_ms(start_ticks, crate::arch::rtc::ticks()),
+        request.header.subject_pid,
+        request.header.subject_tid,
+        response.len() as i64,
+        None,
+    );
+    if response.len() != size_of::<CommercialMaxProtocolResponse>() {
+        return Err(LINUX_EINVAL);
+    }
+    let response = read_unaligned::<CommercialMaxProtocolResponse>(response.as_slice());
+    if response.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
+        || response.header.protocol != COMMERCIAL_MAX_PROTOCOL_SESSIOND
+        || response.header.op != COMMERCIAL_MAX_SESSIOND_OP_TTY_LINE_DISCIPLINE
+        || response.payload_len as usize > response.payload.len()
+        || response.reserved0 != 0
+        || response.reserved1 != 0
+    {
+        return Err(LINUX_EINVAL);
+    }
+    if response.status != 0 {
+        return Err(response.status.unsigned_abs() as i64);
+    }
+
+    crate::user::sysops::device::ioctl_current_process_fd(fd, request_number, arg)
+        .map_err(super::broker_ops::device_sysop_error_to_linux_errno)
 }
 
 fn ioctl_device_via_devmgrd(fd: u64, request_number: u64, arg: u64) -> Result<u64, i64> {

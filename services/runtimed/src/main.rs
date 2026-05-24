@@ -61,6 +61,11 @@ const SYS_IOCTL: usize = 16;
 const SYS_OPENAT: usize = 257;
 const AT_FDCWD: isize = -100;
 const O_RDWR: usize = 2;
+const LINUX_TCGETS: u64 = libc::TCGETS as u64;
+const LINUX_TCSETS: u64 = libc::TCSETS as u64;
+const LINUX_TCSETSW: u64 = libc::TCSETSW as u64;
+const LINUX_TCSETSF: u64 = libc::TCSETSF as u64;
+const LINUX_FIONREAD: u64 = libc::FIONREAD as u64;
 const DEVMGRD_BOOTSTRAP_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVICE_ENDPOINT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CONSOLE_SESSION_STATE_LOADING_IMAGE: u16 = console_abi::CONSOLE_SESSION_STATE_LOADING_IMAGE;
@@ -483,8 +488,11 @@ fn session_op_accepts_ioctl(op: u16, request_number: u64) -> bool {
         COMMERCIAL_MAX_SESSIOND_OP_FOREGROUND_FOCUS => {
             request_number == console_abi::CONSOLE_IOCTL_SET_FOCUS
         }
-        COMMERCIAL_MAX_SESSIOND_OP_TTY_LINE_DISCIPLINE
-        | COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP => false,
+        COMMERCIAL_MAX_SESSIOND_OP_TTY_LINE_DISCIPLINE => matches!(
+            request_number,
+            LINUX_TCGETS | LINUX_TCSETS | LINUX_TCSETSW | LINUX_TCSETSF | LINUX_FIONREAD
+        ),
+        COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP => false,
         _ => false,
     }
 }

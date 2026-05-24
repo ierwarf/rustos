@@ -145,70 +145,16 @@ As of the strict Tier 0 + Tier 1 closure pass:
 - Commercial-max marked-only projection: `kernel` 45646 before residual broker
   shells and new service/shared-ABI overhead.
 
-2026-05-22 commercial-max protocol snapshot:
+2026-05-22 snapshot: `kernel` 67299, `services` 23143 LOC. Commercial-max
+protocol envelope implemented by all service owners; ABI/control-plane
+precondition is no longer the primary blocker. Active markers: 14814 LOC
+(`total`), 2910 excluded (xHCI/NVMe), 11904 active batch. See
+`docs/ai/ring3-inventory.md` for the per-file table.
 
-- Current source LOC: `kernel` 67299, `services` 23143, total 90442
-  (`rustos-user-abi` carries 3875 source LOC after the shared Linux ABI move).
-- Commercial-max live migration markers remaining: 14814 LOC. The largest
-  remaining marked surfaces are `usb/xhci.rs` 2125,
-  `process/linux.rs` 1297, `proc_broker_ops.rs` 1210,
-  `ipc_ops.rs` 1064, `ps/user/socket.rs` 956, and `usb/runtime.rs` 768.
-- Current marked-only projection: `kernel` 45902 before residual broker shells
-  and any additional service/shared-ABI overhead.
-- The shared commercial-max protocol envelope is now implemented by the current
-  service owners for `rootd`, `procd`, `loaderd`, `syscalld`, `vfsd`,
-  `devmgrd`, `inputd`, `storaged`, `netd`, `driverd`, `uiserver`,
-  `sessiond` via `runtimed`, `pagerd` via `syscalld`, and non-`.ko`
-  `service-driverd` via `driverd`. This does not mean all marked ring0 policy
-  has moved; it means the ABI/control-plane precondition is no longer the
-  primary blocker.
-- Current display/session policy bridge: `devmgrd` delegates display setup
-  authorization to `IPC_SERVICE_UISERVER` and console/session
-  ioctl authorization to `IPC_SERVICE_SESSIOND` before invoking the gated ring0
-  device ioctl broker. Ring0 still owns the final framebuffer copy/present
-  primitive and hot present path, boot/panic output, and `.ko`/MMIO/DMA
-  execution island.
-- Current display driver-policy bridge: the provider-active kernel broker is
-  retired. `driverd` owns display provider-group active state, fallback
-  ordering, and the preferred virtio scanout policy passed through
-  `SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER`; ring0 virtio-gpu consumes that
-  descriptor only as privileged MMIO/DMA configuration.
-- Current input service-driver bridge: `inputd` exposes commercial-max
-  descriptors for input ingest/readers/stats plus serio bus routing, i8042
-  command policy, and PS/2 packet policy. Ring0 keeps hardware IRQ/port grants,
-  PS/2 byte sources, and `.ko` callback compatibility while non-`.ko`
-  service-driver policy is represented in `inputd`.
-- Current capability-policy bridge: `rootd` accepts the generic
-  commercial-max capability protocol for service lease grant/revoke/renew
-  descriptors. Ring0 still installs and enforces broker capability bits at
-  endpoint registration, but the supervisor-visible lease policy is no longer
-  only implicit kernel state.
-- Current storage-policy bridge: `storaged` owns post-bootstrap root-volume
-  selection rank for its legacy and commercial-max root-volume responses,
-  preferring partitions over whole disks and writable candidates over read-only
-  candidates before falling back to stable descriptor id ordering.
-- Current preparation gate: `cargo xtask ring3-inventory` now classifies the
-  remaining migration markers by LOC, owner, lane, and deletion action. Current
-  snapshot is `total_marked_loc=14814`, `excluded_xhci_nvme_loc=2910`, and
-  `active_batch_marked_loc=11904`; the xHCI/NVMe LOC is held outside this
-  batch pending `.ko` replacement strategy.
-- Current runtime gate: `cargo xtask run --profile nvme --accel-profile kvm
-  --usb-input --debugcon file --commercial-max-ready -- --no-reboot` is the
-  commercial-max QEMU signature check. It expands to rootd core readiness,
-  loaderd-spawned `initd`, device/input/session policy endpoints, Wayland/UI
-  readiness, `wayclick.desktop`, and `storaged` readiness.
-
-Migration cadence reality: the commercial-max protocol envelope exists, but
-removing markers without moving the policy behind each protocol would falsify
-closure state. The next actionable wave is to move one live policy area at a
-time behind its service protocol (for example USB HID policy into `inputd`,
-or endpoint/capability policy into `rootd`/capability service), then retire the
-corresponding marker after validation. Expect ~500-1500 validated LOC of net
-migration per policy slice, not per session.
-
-This marked projection includes Tier 0 plus the Tier 1 live-code references
-listed below. It is still a migration budget, not a claim that all code can be
-deleted from ring0 without residual broker primitives.
+Migration cadence: move one live policy area at a time behind its service
+protocol, then retire the marker after validation. Expect ~500–1500 validated
+LOC per policy slice, not per session. This projection is a migration budget,
+not a claim that all code can be deleted without residual broker primitives.
 
 ## Closure Tiers
 
@@ -355,9 +301,15 @@ For every step the shape is:
   - `runtimed` gates non-service policy launches on loaderd endpoint readiness
     and no longer treats loader readiness `ENOSYS` as a permanent desktop
     launch failure; the observed `shell.desktop errno=38` regression is fixed.
+  - `TTY_LINE_DISCIPLINE` now gates `TCGETS`, `TCSETS`, `TCSETSW`, `TCSETSF`,
+    and `FIONREAD` through the `sessiond`/`runtimed` commercial-max endpoint
+    before ring0 performs the current-process console-fd user-copy/commit.
   - Validation passed: `cargo xtask check`, `cargo xtask build`, and
     `cargo xtask run --profile nvme --accel-profile kvm --usb-input
     --debugcon file --commercial-max-ready -- --no-reboot`.
+- Remaining before Step 3 can be deleted: move the actual normal console
+  output/input buffers and TTY edit buffers out of `kernel/io-manager/src/io/*`
+  instead of only service-gating their ring0 commits.
 
 ### Step 4 — Syscalld + pagerd MM cluster (1288 LOC)
 
@@ -431,197 +383,58 @@ deferred; do not pull them forward into this wave.
 
 ## Service Protocol Target
 
-The final service-first target needs explicit protocols before more code can
-leave ring0. Design these as versioned request/reply ABIs in shared crates, with
-capability handles instead of stringly-typed authority:
-
-Prework landed: `rustos-user-abi::syscall` now reserves the compact
-`CommercialMaxProtocolHeader`, `CommercialMaxProtocolRequest`,
-`CommercialMaxProtocolResponse`, descriptor, and capability-lease wire ABIs.
-The protocol ids cover every owner below, plus `sessiond`, `pagerd`, a
-non-`.ko` service-driver coordinator, and generic capability leases. Treat this
-as the compatibility-safe control-plane envelope; each protocol still needs a
-service implementation and, where privilege is required, a separate
-capability-gated ring0 broker.
-
-- `rootd/supervisor`: `BootstrapManifest`, `CoreServiceLease`,
-  `DependencyGraph`, `RestartPolicy`, `ReadinessSignal`.
-- `procd`: `ProcessPrepare`, `ExecTicket`, `ForkPlan`, `ThreadPlan`,
-  `SignalPolicy`, `WaitNamespace`, `SessionMembership`.
-- `loaderd`: `ImageProbe`, `ElfRuntimePlan`, `PeRuntimePlan`, `InterpreterPlan`,
-  `ImportPolicy`, `MapPlan`, `AuxvPlan`.
-- `syscalld`: `LinuxPolicy`, `Win32Policy`, `MmPolicy`, `CredsLimits`,
-  `ClockPolicy`, `RandomPolicy`, `ColdSyscallOffload`.
-- `vfsd`: `MountGraph`, `PathResolve`, `FdTablePlan`, `DirectoryCursor`,
-  `FileCursor`, `MetadataPolicy`.
-- `devmgrd`: `DeviceRegistry`, `DeviceOpen`, `IoctlAuthorize`, `DeviceMap`,
-  `DeviceEventSubscribe`.
-- `inputd`: `InputIngest`, `InputReader`, `EvdevTranslate`, `LayoutPolicy`,
-  `DropPolicy`, `InputStats`.
-- `storaged`: `BlockInventory`, `PartitionScan`, `RootVolumeSelect`,
-  `BootExtentLease`, `VolumeMetadata`.
-- `netd`: `SocketNamespace`, `SocketOptions`, `AddressBind`, `RoutePolicy`,
-  `PacketLease`, `FdTransfer`.
-- `driverd`: `DriverPlan`, `ModuleLoadAuthorize`, `SymbolPolicy`,
-  `ProviderSelect`, `RetryBudget`, `FallbackPolicy`.
-- `sessiond` or `runtimed`: `SessionGraph`, `TtyLineDiscipline`,
-  `ConsoleRoute`, `ForegroundFocus`, `UiBootstrap`.
-
-Ring0 still performs only the privileged commits behind these protocols:
-address-space mutation, final task/register transition, user-copy, wakeups,
+`rustos-user-abi::syscall` reserves `CommercialMaxProtocol*` wire ABIs for all
+service owners. Protocol op names per service are in `docs/ai/contracts-abi.md`
+(IPC service IDs) and the shared ABI crate. Ring0 performs only privileged
+commits: address-space mutation, task/register transition, user-copy, wakeups,
 hardware IO, driver relocation/init, `.ko` callback entry, raw block/socket
 primitive execution, display present, boot console, and panic output.
 
 ## Protocol-First Tier 2
 
-Tier 2 becomes real only when the service protocol above exists. It is the
-largest compatibility-preserving evacuation wave, not a marker-only cleanup.
+Tier 2 is the largest compatibility-preserving wave. Key files to move after
+active-batch protocols are stable:
 
-Move these policy blocks after their protocols are in place:
+- `proc_broker_ops.rs` → `procd`/`loaderd`
+- `service_ops.rs` → `syscalld`, `rootd`, `loaderd`, `vfsd`, `devmgrd`, `inputd`
+- `ipc_ops.rs`, `mm_broker_ops.rs`, `memory_ops.rs`, `syscalld_ops.rs`,
+  `net_broker_ops.rs` → `syscalld`, `procd`, `vfsd`, `netd`
+- `kernel/ps/src/user/socket.rs` → `netd`
+- `kernel/io-manager/src/driver/loader.rs` symbol/module policy → `driverd`
+- `kernel/io-manager/src/storage/*` post-bootstrap → `storaged`
+- `kernel/io-manager/src/io/gui*`, console/session → `sessiond`/`runtimed`
 
-- `kernel/compat/src/user/syscall/linux/proc_broker_ops.rs`: process prepare,
-  exec tickets, fork/thread plans, wait/signal/session policy. Target:
-  `procd`/`loaderd`. Ring0 keeps pinned backing, address-space commit, register
-  transition, and task mutation.
-- `libs/rustos-user-abi/src/linux.rs`: Linux ABI process/thread defaults,
-  aux state, signal defaults, runtime profile normalization, and the supported
-  syscall-number table now live in the shared ABI crate. Kernel
-  `ps/user/linux.rs` and `compat/user/linux.rs` re-export it; scheduler-facing
-  task state still remains ring0.
-- `kernel/compat/src/user/syscall/linux/service_ops.rs`: cold syscall routing,
-  bootstrap fallback policy, service discovery fallback, Linux compatibility
-  defaults, and fd/device dispatch policy. Target: `syscalld`, `rootd`,
-  `loaderd`, `vfsd`, `devmgrd`, and `inputd`. Ring0 keeps trap entry,
-  user-copy, current-task access, and broker commits.
-- `kernel/compat/src/user/syscall/linux/ipc_ops.rs`,
-  `mm_broker_ops.rs`, `memory_ops.rs`, `syscalld_ops.rs`, and
-  `net_broker_ops.rs`: move policy validation, namespace lookup, timeout/default
-  selection, and routing into `syscalld`, `procd`, `vfsd`, and `netd`. Ring0
-  keeps privileged MM commits and raw wake/copy primitives.
-- `kernel/ps/src/user/socket.rs`: socket namespace, option policy,
-  bind/connect/listen routing, and fd transfer belong in `netd`. Ring0 keeps
-  kernel socket primitives and packet/device handoff. The old
-  `kernel/compat/src/user/socket.rs` shadow implementation has been retired.
-- `kernel/compat/src/user/sysops/device.rs` and device-facing
-  `kernel/io-manager/src/io/device/*.rs`: `/dev` open policy, ioctl authority,
-  and device metadata belong in `devmgrd`. Ring0 keeps current-process IO and
-  raw device execution.
-- `kernel/io-manager/src/driver/loader.rs`: symbol allowlist and module policy
-  move to `driverd` manifests/protocols. `.ko` validation, relocation, init,
-  execution, and callback substrate remain ring0 by contract for both Linux and
-  RustOS-authored modules.
-- `kernel/io-manager/src/storage/*`: post-bootstrap inventory, root selection,
-  partition policy, and volume metadata belong in `storaged`; raw controller
-  drivers and early bootstrap reads remain ring0.
-- `kernel/io-manager/src/io/gui*` and console/session paths: session routing,
-  tty discipline, foreground focus, and UI bootstrap belong in
-  `sessiond`/`runtimed`; framebuffer present, boot console, and panic output
-  remain ring0.
-
-Estimated additional Tier 2 policy beyond the currently marked 14814 LOC:
-7000-12000 source LOC. This is intentionally a range because ABI structs and
-broker shells may move to shared crates instead of services, while ring0 keeps
-the privileged commit functions.
+Estimated additional Tier 2 policy: 7000–12000 source LOC beyond currently
+marked 14814. Ring0 keeps privileged commit functions throughout.
 
 ## Protocol-First Tier 3
 
-Tier 3 is the long tail after Tier 2 lands:
-
-- replace in-kernel service discovery fallbacks with rootd-issued capability
-  leases
-- replace kernel-owned default provider order with manifest/provider registries
-- move cold compatibility tables into `syscalld`/`loaderd` shared data
-- move retry, timeout, and fallback policy into service manifests
-- reduce ring0 broker code to argument validation, capability checks, and
-  privileged commits
-
-Tier 3 should not try to move scheduler mechanics, MM mutation, IRQ/hardware,
-driver execution, user-copy, or panic/boot output. It is a policy shrink pass,
-not a purity pass.
+After Tier 2: replace in-kernel service discovery fallbacks with rootd
+capability leases; replace kernel-owned provider order with manifest registries;
+move cold compat tables to `syscalld`/`loaderd` shared data; reduce ring0
+broker code to argument validation, capability checks, and privileged commits.
+Do not move scheduler mechanics, MM mutation, IRQ/hardware, user-copy, or
+panic/boot output.
 
 ## Final LOC Projection
 
-Do not answer that the final evacuation is only about 4000 LOC. That was below
-the currently marked code, and the protocol-first target moves substantially
-more policy while preserving compatibility.
+Current baseline: `kernel` 64819, `services` 24182. Marked: 14814 LOC (2910
+excluded xHCI/NVMe, 11904 active batch).
 
-Current measured baseline:
+Protocol-first maximum compatible target (not near-term):
+- kernel policy moved to ring3/shared ABI: ~15000–20000 LOC total
+- realistic final `kernel`: ~48000–53000 LOC
+- realistic final `services`: ~42000–50000 LOC
 
-- `kernel`: 64819 source LOC
-- `services`: 24182 source LOC
-- marked Tier 0 + Tier 1 migration references: 4220 source LOC
-- commercial-max migration references (full `RING3-MIGRATION-REFERENCE`
-  marked set): 14814 source LOC, of which 2910 LOC (`usb/xhci.rs`,
-  `storage/nvme.rs`) sits in the `.ko`-evaluation lane and 11904 LOC is in the
-  active migration batch.
+Commercial-max target (requires non-`.ko` service-driver framework, pager,
+capability/supervision contracts):
+- raw kernel moved: ~28000–35000 LOC
+- realistic final `kernel`: ~33000–42000 LOC
+- realistic final `services` + shared ABI: ~55000–70000 LOC
 
-If only the currently marked Tier 0 + Tier 1 references are moved:
-
-- `kernel`: about 60599 LOC
-- `services`: about 28402 LOC before broker/service overhead
-
-Protocol-first maximum compatible target:
-
-- raw kernel policy moved to ring3/shared ABI: about 15000-20000 source LOC
-  total, including the already marked 14814 LOC
-- additional protocol/test/service overhead: about 3000-6000 source LOC
-- realistic final `kernel`: about 48000-53000 source LOC
-- realistic final `services`: about 42000-50000 source LOC
-
-The kernel number does not drop by the full moved amount because residual
-broker shells, capability checks, and privileged commit stubs stay in ring0. The
-service number can grow more than the raw moved code because the final design
-adds explicit protocols, state machines, validation, and tests.
-
-This is the maximum compatible target under the commercial hybrid rule. Moving
-more than this starts attacking `.ko` execution, hardware drivers, scheduler/MM
-mechanics, user-copy, or panic/boot paths, which would break the product goal
-instead of improving the microkernel boundary.
-
-## Commercial-Max Projection
-
-If RustOS is treated as a commercial launch product and the project is allowed
-to invest in new service protocols, non-`.ko` service-driver implementations,
-and pager-style memory services, the maximum microkernel push is larger than
-the protocol-first policy target above.
-
-This is not a near-term marker cleanup plan. It assumes these new systems exist:
-
-- a stable capability/handle ABI shared by kernel, rootd, and all core services
-- a rootd-owned service supervisor with restart, dependency, and readiness
-  contracts
-- non-`.ko` service-driver framework for RustOS-owned drivers and virtual
-  hardware paths
-- service-owned pager/page-cache/backing-object manager
-- service-owned provider registries, retry budgets, timeout policy, and ABI
-  compatibility tables
-- a retained ring0 `.ko` island for Linux drivers and RustOS-authored `.ko`
-  modules, including unsupported, proprietary, and GPU-class drivers
-
-Additional commercial-max migration beyond the protocol-first target:
-
-- non-`.ko` service-driver/device-class services: about 8000-12000 LOC
-- pager/page-cache/backing-object ownership: about 3000-5000 LOC
-- rootd/capability/supervision/provider-policy shrink: about 2000-4000 LOC
-- remaining cold Linux/Win32 ABI tables and fallback policy: about 2000-4000 LOC
-
-Commercial-max total:
-
-- raw kernel code moved to ring3/shared ABI: about 28000-35000 source LOC
-- realistic final `kernel`: about 33000-42000 source LOC
-- realistic final `services` plus shared user ABI libraries: about 55000-70000
-  source LOC
-
-The lower end keeps more compatibility substrate in ring0. The upper end
-requires real non-`.ko` service drivers, pager protocols, and
-service-supervision contracts, not just moving functions between files.
-
-Do not plan below about 40000 kernel LOC while preserving commercial
-compatibility unless RustOS is also willing to replace the ring0 `.ko` island
-with a full Linux driver-domain environment or drop important driver classes.
-That is a different product decision, not the default commercial hybrid target.
-RustOS-authored `.ko` modules should stay in this ring0 island; if a driver is
-intended to be ring3, implement it as a service driver rather than as `.ko`.
+Do not plan below ~40000 kernel LOC under commercial compatibility without
+replacing the `.ko` island. RustOS-authored `.ko` modules stay ring0; ring3
+drivers are service drivers, not `.ko`.
 
 ## Stop Conditions
 

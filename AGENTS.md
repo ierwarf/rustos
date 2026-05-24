@@ -18,16 +18,8 @@ prefix every agent should load. Everything else is opened on demand.
 
 ## Context Budget
 
-- Start at `docs/ai/token-policy.md`.
-- Pick the smallest context set with `docs/ai/task-router.md`.
-- Consult `docs/ai-map.md` or `docs/ai/repo-map.md` before any broad source
-  search.
-- Do not preload all docs, all manifests, or whole subsystems.
-- Prefer Serena MCP symbols, then ripgrep MCP, then focused reads — open large
-  files only when a symbol/pattern hit demands it.
-- Keep stable instructions near the top of prompts, task-specific details at
-  the end. Prompt caching depends on exact reusable prefixes — do not mix logs
-  or generated output into that prefix.
+See `docs/ai-map.md` (cache order) and `docs/ai/token-policy.md` (full rules).
+Search before opening. Stable prefix first, task text last. No logs in prefix.
 
 ## Tool Usage
 
@@ -73,81 +65,37 @@ This repo runs on GPT Plus. The mini-first rule is binding.
 ## Do Not Inspect By Default
 
 `logs/`, `target/`, `build/`, `vendor/`, `perf.data`, `Cargo.lock`.
-
-Allowed exceptions:
-
-- Run/debug failures: only the relevant `logs/` file, prefer the last 100–200
-  lines.
-- Stage/registry bugs: only specific files under
-  `build/image/system/registry/`.
-- Firmware/module packaging: only the specific `vendor/` path involved.
-- Dependency resolution changes: focused `Cargo.lock` snippets via `rg` first.
+Narrow exceptions defined in `docs/ai/token-policy.md` §10.
 
 ## Common Commands
 
-- Fast validation: `cargo xtask check`
-- Full image build: `cargo xtask build`
-- Kernel only: `cargo xtask build-kernel`
-- Userspace only: `cargo xtask build-user`
-- Driver modules only: `cargo xtask build-driver-modules`
-- Stage existing artifacts: `cargo xtask stage`
-
-These are expected to be quiet on success. On failure, use the reported
-command output as primary context instead of scanning logs.
+See `docs/ai/commands.md`. Quiet on success; treat failure output as primary
+context. Do not scan logs for build failures.
 
 ## Hardening Direction
 
-**Active refactor — ring0 evacuation.** The first user process launched
-directly by the kernel is `rootd`, not the Linux `initd` runtime. `rootd` is
-the bootstrap authority modeled after an seL4 initial task: it must stay
-independent of the Linux dynamic runtime and starts the foundational services
-(`syscalld`, `vfsd`, `loaderd`) before handing off to normal `initd`. Do not
-add generic Linux syscall fallbacks to make `initd` boot earlier — push that
-pressure into `rootd`, service manifests, or narrow bootstrap brokers.
+**Active refactor — ring0 evacuation.** `rootd` is the first user process;
+starts `syscalld`, `vfsd`, `loaderd`, then hands off to `initd`. Push policy
+into services, not back into the kernel. For evacuation shape, boundaries, and
+migration steps: `docs/ai/ring3-evacuation.md` and
+`docs/ai/commercial-microkernel-closure.md`.
 
-The old line-commented Linux compatibility reference files have been consumed
-into service-oriented syscall routing and removed from the kernel tree. Only
-unfinished Linux thread policy and Windows PE/Win32 policy remain as migration
-reference comments. Linux MM ABI policy now belongs to `syscalld`; PTE
-mutation and backing lifetime enforcement go through the gated
-`SYS_RUSTOS_MM_BROKER`. Extend VFS, network, USB, input, provider, signal, and
-clock policy in `syscalld`, `vfsd`, `netd`, `loaderd`, `devmgrd`, `driverd`,
-`storaged`, or `inputd` — not in the kernel.
-
-Do not restore deleted or commented ring0 policy modules for quick
-compatibility fixes; the kernel keeps only narrow privileged primitives.
-During this phase, compile/QEMU validation may be intentionally deferred for
-structural code removal tasks.
-
-**Product goal.** Preserve native compatibility for both Linux ELF and Windows
-PE executables. Microkernel migration moves policy and namespace ownership to
-user services without casually breaking observable app ABI behavior; when
-ring0 code is removed, keep compatibility through narrow, explicit brokers or
-service-owned implementations.
+**Product goal.** Preserve native Linux ELF and Windows PE compatibility.
+Migration moves policy to user services without breaking observable app ABI;
+ring0 code removal must go through narrow explicit brokers.
 
 **General principles.**
 
-- Long-term hardening over symptom patches: make ownership, provider choice,
-  timeouts, queue bounds, and ABI contracts explicit in source, manifests,
-  registries, probes, or AI contracts.
-- Avoid broad catch-alls and fabricated success paths. Fail closed with
-  bounded waits and direct diagnostics when an implementation is incomplete.
-- For display, input, driver loading, and compat work, keep fallback providers
-  behind real hardware/virtio providers and add validation that catches black
-  frames, stalls, stale surfaces, and provider-order regressions.
+- Hardening over symptom patches: make ownership, timeouts, queue bounds, and
+  ABI contracts explicit in source, manifests, registries, or AI contracts.
+- Fail closed with bounded waits and direct diagnostics; no fabricated success.
+- Display/input/driver/compat: keep fallback providers behind real hardware/virtio
+  providers; validate against black frames, stalls, and provider-order regressions.
 
 ## Repo Entrypoints
 
-- Workspace: `Cargo.toml`
-- xtask CLI: `tools/xtask/src/cli.rs`
-- Build orchestration: `tools/xtask/src/build/` (`mod.rs`, `cargo.rs`)
-- Staging and registries: `tools/xtask/src/stage/mod.rs`
-- QEMU runner: `tools/xtask/src/qemu/mod.rs`
-- Host config: `tools/xtask/src/config/` (`mod.rs`, `project.rs`)
-- Package schema: `tools/xtask/src/package_manifest.rs`
-- Kernel boot entry: `kernel/src/main.rs`
-- Kernel API boundaries: `kernel/*/src/api.rs`
-- Runtime protocol: `libs/runtime-control/src/lib.rs`
+See `docs/ai-map.md`. Key: `Cargo.toml`, `tools/xtask/src/cli.rs`,
+`kernel/src/main.rs`, `kernel/*/src/api.rs`, `libs/runtime-control/src/lib.rs`.
 
 ## Reporting Discipline
 

@@ -62,4 +62,4 @@ Do not reorder without reading `kernel/src/main.rs` and
 ## Docs
 
 - Human reference: `docs/api/kernel.md`.
-- AI contract: `docs/ai/contracts.md`.
+- AI contract: `docs/ai/contracts-infra.md` (Kernel API section).

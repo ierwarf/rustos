@@ -10,7 +10,8 @@ Optimized for AI agents, not human onboarding. English-only, dense, contract-sha
 | `task-router.md` | Task → smallest context set. Read after `token-policy.md`. |
 | `repo-map.md` | Source ownership and canonical entrypoints. Deeper than `docs/ai-map.md`. |
 | `commands.md` | Quiet build/check/debug commands and their failure meanings. |
-| `contracts.md` | Stable schemas, generated paths, ABI boundaries. Update when behavior changes. |
+| `contracts-infra.md` | Manifest/stage/build/logging/fault contracts. |
+| `contracts-abi.md` | IPC service IDs, broker syscalls, service routing contracts. |
 | `kernel-api-map.md` | Cross-crate kernel API surfaces (`kernel_*::api`) and boot order. |
 | `workflows.md` | Step recipes: add service/app/driver, modify kernel API, debug QEMU boot. |
 | `ring3-evacuation.md` | Service-first ring0 evacuation boundaries and migration candidates. |

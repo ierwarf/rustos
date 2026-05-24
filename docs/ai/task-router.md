@@ -12,15 +12,15 @@ opening anything under `Then read only if needed`.
 | --- | --- | --- |
 | Build/check issue | `commands.md` | exact failing command output, then `tools/xtask/src/build/` range found by search |
 | Run/QEMU/debug issue | `commands.md`, `repo-map.md` | exact `tools/xtask/src/qemu/mod.rs` range found by search; logs only via `tail -n 120` or focused scoped search |
-| Package/stage/registry issue | `contracts.md` | affected `RUSTOS.package.toml`, then exact `package_manifest.rs` or `stage/mod.rs` range |
+| Package/stage/registry issue | `contracts-infra.md` | affected `RUSTOS.package.toml`, then exact `package_manifest.rs` or `stage/mod.rs` range |
 | Kernel API/change | `kernel-api-map.md` | relevant `kernel/*/src/api.rs`, then backing module range found by symbol search |
-| Kernel boot-order change | `kernel-api-map.md`, `contracts.md` | `kernel/src/main.rs`, then exact `kernel/executive/src/boot.rs` range |
-| Logging change | `contracts.md` | `config/rustos.toml`; open `tools/build_log_cfg.rs` only after searching category/level name |
-| Fault injection change | `contracts.md`, `commands.md` | `config/rustos.toml`; exact `libs/rustos-fault-injection`, `tools/xtask/src/qemu/mod.rs`, or `kernel/nucleus-core/src/util/fault_injection.rs` range found by search |
-| Runtime launch/session issue | `contracts.md` | `libs/runtime-control/src/lib.rs`, then exact `services/runtimed/src/main.rs` range |
+| Kernel boot-order change | `kernel-api-map.md`, `contracts-infra.md` | `kernel/src/main.rs`, then exact `kernel/executive/src/boot.rs` range |
+| Logging change | `contracts-infra.md` | `config/rustos.toml`; open `tools/build_log_cfg.rs` only after searching category/level name |
+| Fault injection change | `contracts-infra.md`, `commands.md` | `config/rustos.toml`; exact `libs/rustos-fault-injection`, `tools/xtask/src/qemu/mod.rs`, or `kernel/nucleus-core/src/util/fault_injection.rs` range found by search |
+| Runtime launch/session issue | `contracts-infra.md` | `libs/runtime-control/src/lib.rs`, then exact `services/runtimed/src/main.rs` range; add `contracts-abi.md` only if IPC-level routing is involved |
 | UI/rendering issue | `repo-map.md` | search `services/uiserver/src`; open only the matching `render.rs` or `app/*` range |
-| Hardening request | `contracts.md`, `kernel-api-map.md` | highest-risk boundary first; exact API, broker, service, lock, memory, or device path found by MCP search |
-| Ring0/ring3 ownership or microkernel boundary | `contracts.md`, `ring3-evacuation.md` | `ring3-inventory.md` for current marker LOC/owner/action snapshots; `commercial-microkernel-closure.md` § *Active Migration Plan* for the next-wave step list, § *Final LOC Projection* for shape/LOC questions; `kernel-api-map.md`, then exact broker, service, driver, input, storage, or compat path found by MCP search |
+| Hardening request | `contracts-abi.md`, `kernel-api-map.md` | highest-risk boundary first; exact API, broker, service, lock, memory, or device path found by MCP search |
+| Ring0/ring3 ownership or microkernel boundary | `contracts-abi.md`, `ring3-evacuation.md` | `ring3-inventory.md` for current marker LOC/owner/action snapshots; `commercial-microkernel-closure.md` § *Active Migration Plan* for the next-wave step list, § *Final LOC Projection* for shape/LOC questions; `kernel-api-map.md`, then exact broker, service, driver, input, storage, or compat path found by MCP search |
 | Add service/app/driver | `workflows.md` | one closest existing manifest, one closest source file, target manifest/source only |
 | Docs update | `docs/SUMMARY.md` | target doc only; AI docs only if agent context changes |
 
@@ -55,8 +55,8 @@ opening anything under `Then read only if needed`.
 - Simple answer: this file plus one focused AI doc.
 - Small code change: one focused AI doc plus 1–3 source ranges.
 - Debugging: one command doc plus failing output or one focused log snippet.
-- Cross-subsystem work: add `contracts.md` and the relevant API map only when
-  the boundary crosses crates or services.
+- Cross-subsystem work: add `contracts-abi.md` and the relevant API map only
+  when the boundary crosses crates or services.
 
 ## Escalation rule
 

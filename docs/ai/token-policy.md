@@ -95,8 +95,8 @@ narrowest source boundary that can enforce it.
 
 ## 8. Update AI Contracts When Behavior Changes
 
-If a change modifies any of the following, update `contracts.md` or the
-focused AI map in the same change:
+If a change modifies any of the following, update `contracts-infra.md`,
+`contracts-abi.md`, or the focused AI map in the same change:
 
 - package manifest schema
 - xtask command behavior

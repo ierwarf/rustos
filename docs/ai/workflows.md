@@ -33,17 +33,17 @@ Before any workflow: read `token-policy.md`, then `task-router.md`.
 
 ## Modify kernel API
 
-1. Read `task-router.md`, `contracts.md`, and the relevant `kernel/*/src/api.rs`.
+1. Read `task-router.md`, `contracts-infra.md`, and the relevant `kernel/*/src/api.rs`.
 2. Preserve `api.rs` as the cross-crate boundary.
 3. Update `docs/api/kernel.md` only for public API surface or boot/order changes.
 4. Run focused `cargo check` where possible; otherwise `cargo xtask check`.
 
 ## Modify logging
 
-1. Read `docs/logging.md` and `contracts.md`.
+1. Read `contracts.md` (Logging section). Human `docs/logging.md` only for prose updates.
 2. Update `config/rustos.toml` `[logging]`.
-3. If adding a category, also update `libs/rustos-observability/src/lib.rs`,
-   `tools/build_log_cfg.rs`, human logging docs, and AI contracts.
+3. If adding a category, update `libs/rustos-observability/src/lib.rs`,
+   `tools/build_log_cfg.rs`, and AI contracts.
 4. Rebuild affected crates; prefer `cargo xtask build` for kernel logging.
 
 ## Update docs
@@ -51,7 +51,7 @@ Before any workflow: read `token-policy.md`, then `task-router.md`.
 1. Human docs: bilingual, English first, language anchors.
 2. AI docs: English only, dense, no repeated bilingual prose.
 3. Update `docs/SUMMARY.md` for new human or AI pages.
-4. If behavior contracts changed, update `contracts.md` or the focused AI map.
+4. If behavior contracts changed, update `contracts-infra.md` or `contracts-abi.md`.
 5. Run mdBook / link sanity checks.
 
 ## Debug QEMU boot
