@@ -135,7 +135,7 @@ pub fn provider_group_hardware_active(group: &str) -> bool {
 fn load_boot_framebuffer_provider() -> Result<(), DriverLoadError> {
     let framebuffer = crate::storage::boot_volume::boot_framebuffer_info()
         .ok_or(DriverLoadError::LoaderFailed)?;
-    if crate::io::gui::install_native_driver_framebuffer(framebuffer) {
+    if crate::io::gui::install_boot_framebuffer_fallback(framebuffer) {
         Ok(())
     } else {
         Err(DriverLoadError::LoaderFailed)

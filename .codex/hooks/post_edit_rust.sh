@@ -14,9 +14,14 @@ path="$(printf '%s' "$INPUT" | jq -r '
 ' 2>/dev/null || true)"
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+case "$path" in
+  /*) abs_path="$path" ;;
+  "") abs_path="" ;;
+  *) abs_path="$REPO_ROOT/$path" ;;
+esac
 
 # Only react to *.rs edits inside this workspace.
-case "$path" in
+case "$abs_path" in
   "$REPO_ROOT"/*.rs|"$REPO_ROOT"/**/*.rs) ;;
   *) printf '{"decision":"allow"}\n'; exit 0 ;;
 esac
@@ -43,6 +48,7 @@ if timeout 90 cargo xtask check >"$log" 2>&1; then
   exit 0
 fi
 
-tail="$(tail -n 40 "$log" | jq -Rs .)"
+tail="$(tail -n 40 "$log")"
 rm -f "$log"
-printf '{"decision":"allow","message":"cargo xtask check failed (tail):\\n%s"}\n' "${tail//\"/}"
+jq -n --arg m "cargo xtask check failed (tail):
+$tail" '{decision:"allow", message:$m}'

@@ -3,6 +3,9 @@
 //! `fill_rounded_rect_alpha` / `fill_rect_alpha` against a SurfaceCanvas;
 //! no shape larger than a rounded rectangle is needed.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use crate::app::ConsoleWindow;
 use crate::canvas::{Rect, SurfaceCanvas};
 use crate::font::{self, TextStyle};
@@ -468,22 +471,107 @@ fn draw_traffic_light(canvas: &mut SurfaceCanvas<'_>, rect: Rect, accent: u32) {
     );
 }
 
-pub(super) fn draw_window_shadow(canvas: &mut SurfaceCanvas<'_>, rect: Rect) {
-    // Fewer, larger steps with a steeper falloff: visually similar to a
-    // 10-step shadow but ~40 % cheaper per repaint — which directly helps
-    // dragging windows at 60 fps.
-    for step in 0..WINDOW_SHADOW_STEPS {
-        let alpha = 52u32.saturating_sub((step as u32).saturating_mul(7)) as u8;
-        if alpha == 0 {
-            break;
+// ---- shadow mask cache ----
+//
+// The drop shadow under a window used to be six stacked
+// `fill_rounded_rect_alpha` passes — about 2.8 M SIMD-blended pixels per
+// frame for an 800-wide wayclick window. Since every layer paints the
+// same color (black) at different alphas, we precompute the *combined*
+// alpha mask once per outer-rect size and blit it as a single alpha-only
+// stamp. The on-screen result is identical; the cost drops to a single
+// per-pixel scalar blend pass.
+
+const SHADOW_PAD_LEFT: usize = 6;
+const SHADOW_PAD_RIGHT: usize = 12;
+const SHADOW_PAD_TOP: usize = 0;
+const SHADOW_PAD_BOTTOM: usize = 8;
+
+struct ShadowMask {
+    alpha: Vec<u8>,
+    width: usize,
+    height: usize,
+}
+
+fn shadow_mask_cache() -> &'static Mutex<HashMap<(usize, usize), &'static ShadowMask>> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Mutex<HashMap<(usize, usize), &'static ShadowMask>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn ensure_shadow_mask(outer_w: usize, outer_h: usize) -> &'static ShadowMask {
+    let key = (outer_w, outer_h);
+    {
+        if let Ok(cache) = shadow_mask_cache().lock() {
+            if let Some(mask) = cache.get(&key) {
+                return *mask;
+            }
         }
-        let inset = step + 1;
-        let shadow = Rect {
-            x: rect.x.saturating_sub(inset),
-            y: rect.y.saturating_sub(inset / 2).saturating_add(3),
-            width: rect.width.saturating_add(inset * 2),
-            height: rect.height.saturating_add(inset + 2),
-        };
-        canvas.fill_rounded_rect_alpha(shadow, COLOR_SHADOW, alpha, WINDOW_RADIUS + step);
     }
+    // Build outside the lock so a slow build can't stall other paints,
+    // then race-insert under the lock. Box::leak gives us a stable
+    // `'static` reference without reference counting on the hot path.
+    let mask: &'static ShadowMask = Box::leak(Box::new(build_shadow_mask(outer_w, outer_h)));
+    if let Ok(mut cache) = shadow_mask_cache().lock() {
+        cache.entry(key).or_insert(mask);
+        return cache[&key];
+    }
+    mask
+}
+
+fn build_shadow_mask(outer_w: usize, outer_h: usize) -> ShadowMask {
+    let mask_w = outer_w + SHADOW_PAD_LEFT + SHADOW_PAD_RIGHT;
+    let mask_h = outer_h + SHADOW_PAD_TOP + SHADOW_PAD_BOTTOM;
+    // Paint shadow layers onto a white scratch surface; after blending,
+    // each pixel's red channel records (255 − combined_shadow_alpha).
+    let mut scratch = vec![0x00ff_ffff_u32; mask_w * mask_h];
+    {
+        let mut canvas =
+            SurfaceCanvas::new(scratch.as_mut_slice(), mask_w as u32, mask_h as u32, mask_w);
+        let local_rect = Rect {
+            x: SHADOW_PAD_LEFT,
+            y: SHADOW_PAD_TOP,
+            width: outer_w,
+            height: outer_h,
+        };
+        for step in 0..WINDOW_SHADOW_STEPS {
+            let alpha = 52u32.saturating_sub((step as u32).saturating_mul(7)) as u8;
+            if alpha == 0 {
+                break;
+            }
+            let inset = step + 1;
+            let layer = Rect {
+                x: local_rect.x.saturating_sub(inset),
+                y: local_rect.y.saturating_sub(inset / 2).saturating_add(3),
+                width: local_rect.width.saturating_add(inset * 2),
+                height: local_rect.height.saturating_add(inset + 2),
+            };
+            canvas.fill_rounded_rect_alpha(layer, COLOR_SHADOW, alpha, WINDOW_RADIUS + step);
+        }
+    }
+    let alpha: Vec<u8> = scratch
+        .iter()
+        .map(|p| 255u8.saturating_sub(((p >> 16) & 0xff) as u8))
+        .collect();
+    ShadowMask {
+        alpha,
+        width: mask_w,
+        height: mask_h,
+    }
+}
+
+pub(super) fn draw_window_shadow(canvas: &mut SurfaceCanvas<'_>, rect: Rect) {
+    if rect.is_empty() {
+        return;
+    }
+    let mask = ensure_shadow_mask(rect.width, rect.height);
+    let dst_x = rect.x.saturating_sub(SHADOW_PAD_LEFT);
+    let dst_y = rect.y.saturating_add(SHADOW_PAD_TOP);
+    canvas.blit_alpha_mask(
+        &mask.alpha,
+        mask.width,
+        mask.height,
+        dst_x,
+        dst_y,
+        COLOR_SHADOW,
+    );
 }

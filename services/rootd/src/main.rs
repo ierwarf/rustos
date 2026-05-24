@@ -2,27 +2,31 @@
 #![no_main]
 
 use core::arch::asm;
+use core::cell::UnsafeCell;
 use core::mem::size_of;
 use core::panic::PanicInfo;
 use core::slice;
 
 use rustos_user_abi::syscall::{
+    COMMERCIAL_MAX_CAPABILITY_OP_LEASE_GRANT, COMMERCIAL_MAX_CAPABILITY_OP_LEASE_RENEW,
+    COMMERCIAL_MAX_CAPABILITY_OP_LEASE_REVOKE, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_CAPABILITY, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
+    COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR, COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST,
+    COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE, COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH,
+    COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL, COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY,
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, CoreServiceLeaseWire,
-    LifecycleDrainBrokerArgs, LifecycleEventWire, LoaderSpawnRequest, LoaderSpawnResponse,
-    RootdIpcRequest, RootdIpcResponse, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
-    COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR,
-    COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST, COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE,
-    COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH, COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL,
-    COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD,
-    IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD, IPC_SERVICE_VFSD, LIFECYCLE_DRAIN_MAX_EVENTS,
-    LIFECYCLE_EVENT_EXIT, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
-    LOADER_SPAWN_EXEC_PATH_CAPACITY, ROOTD_IPC_ABI_VERSION, ROOTD_IPC_OP_LEASE_LIST,
+    IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD, IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD,
+    IPC_SERVICE_VFSD, LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT, LOADER_OP_SPAWN_EXEC,
+    LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES,
+    LOADER_SPAWN_EXEC_PATH_CAPACITY, LifecycleDrainBrokerArgs, LifecycleEventWire,
+    LoaderSpawnRequest, LoaderSpawnResponse, ROOTD_IPC_ABI_VERSION, ROOTD_IPC_OP_LEASE_LIST,
     ROOTD_IPC_OP_STATUS, ROOTD_LEASE_STATE_EXITED, ROOTD_LEASE_STATE_FAILED,
-    ROOTD_LEASE_STATE_RESTART_PENDING, ROOTD_LEASE_STATE_RUNNING, SYS_RUSTOS_DEBUG_PRINT,
-    SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
-    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_TRY_RECV,
-    SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER, SYS_RUSTOS_SPAWN_EXEC,
+    ROOTD_LEASE_STATE_RESTART_PENDING, ROOTD_LEASE_STATE_RUNNING, RootdIpcRequest,
+    RootdIpcResponse, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
+    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_TRY_RECV, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
+    SYS_RUSTOS_SPAWN_EXEC,
 };
 
 const SYS_SCHED_YIELD: u64 = 24;
@@ -39,6 +43,73 @@ const LOADERD_EXEC: &[u8] = b"services/loaderd/loaderd.elf\0";
 const PROCD_EXEC: &[u8] = b"services/procd/procd.elf\0";
 const INITD_EXEC: &[u8] = b"services/initd/initd.elf\0";
 const INITD_LEASE_ID: u64 = 0;
+const INITD_LEASE_INDEX: usize = 4;
+const DEP_SYSCALLD: u16 = 1 << 0;
+const DEP_VFSD: u16 = 1 << 1;
+const DEP_LOADERD: u16 = 1 << 2;
+const DEP_PROCD: u16 = 1 << 3;
+
+#[derive(Clone, Copy)]
+struct BootstrapServiceSpec {
+    service_id: u64,
+    exec_path: &'static [u8],
+    weight_micros: u64,
+    dependency_mask: u16,
+    bootstrap_direct: bool,
+    restart_direct: bool,
+}
+
+const BOOTSTRAP_MANIFEST: [BootstrapServiceSpec; 5] = [
+    BootstrapServiceSpec {
+        service_id: IPC_SERVICE_LINUX_SYSCALLD,
+        exec_path: SYSCALLD_EXEC,
+        weight_micros: CORE_SERVICE_WEIGHT_MICROS,
+        dependency_mask: 0,
+        bootstrap_direct: true,
+        restart_direct: false,
+    },
+    BootstrapServiceSpec {
+        service_id: IPC_SERVICE_VFSD,
+        exec_path: VFSD_EXEC,
+        weight_micros: CORE_SERVICE_WEIGHT_MICROS,
+        dependency_mask: 0,
+        bootstrap_direct: true,
+        restart_direct: false,
+    },
+    BootstrapServiceSpec {
+        service_id: IPC_SERVICE_LOADERD,
+        exec_path: LOADERD_EXEC,
+        weight_micros: CORE_SERVICE_WEIGHT_MICROS,
+        dependency_mask: 0,
+        bootstrap_direct: true,
+        restart_direct: true,
+    },
+    BootstrapServiceSpec {
+        service_id: IPC_SERVICE_PROCD,
+        exec_path: PROCD_EXEC,
+        weight_micros: CORE_SERVICE_WEIGHT_MICROS,
+        dependency_mask: 0,
+        bootstrap_direct: true,
+        restart_direct: false,
+    },
+    BootstrapServiceSpec {
+        service_id: INITD_LEASE_ID,
+        exec_path: INITD_EXEC,
+        weight_micros: INITD_WEIGHT_MICROS,
+        dependency_mask: DEP_SYSCALLD | DEP_VFSD | DEP_LOADERD | DEP_PROCD,
+        bootstrap_direct: false,
+        restart_direct: false,
+    },
+];
+
+struct RootdIpcCell<T>(UnsafeCell<T>);
+
+unsafe impl<T> Sync for RootdIpcCell<T> {}
+
+static INITD_LOADER_REQUEST: RootdIpcCell<LoaderSpawnRequest> =
+    RootdIpcCell(UnsafeCell::new(empty_loader_spawn_request()));
+static INITD_LOADER_RESPONSE: RootdIpcCell<LoaderSpawnResponse> =
+    RootdIpcCell(UnsafeCell::new(empty_loader_spawn_response()));
 
 #[derive(Clone, Copy)]
 struct Lease {
@@ -57,31 +128,32 @@ pub extern "C" fn _start() -> ! {
     debug_line(b"rootd: bootstrap enter\n");
     let endpoint = create_rootd_endpoint();
     let mut leases = [
-        lease(
-            IPC_SERVICE_LINUX_SYSCALLD,
-            SYSCALLD_EXEC,
-            CORE_SERVICE_WEIGHT_MICROS,
-        ),
-        lease(IPC_SERVICE_VFSD, VFSD_EXEC, CORE_SERVICE_WEIGHT_MICROS),
-        lease(
-            IPC_SERVICE_LOADERD,
-            LOADERD_EXEC,
-            CORE_SERVICE_WEIGHT_MICROS,
-        ),
-        lease(IPC_SERVICE_PROCD, PROCD_EXEC, CORE_SERVICE_WEIGHT_MICROS),
-        lease(INITD_LEASE_ID, INITD_EXEC, INITD_WEIGHT_MICROS),
+        lease(BOOTSTRAP_MANIFEST[0]),
+        lease(BOOTSTRAP_MANIFEST[1]),
+        lease(BOOTSTRAP_MANIFEST[2]),
+        lease(BOOTSTRAP_MANIFEST[3]),
+        lease(BOOTSTRAP_MANIFEST[4]),
     ];
 
-    // Start the core hosts first, then hand off to initd immediately so the
-    // remaining bootstrap work can overlap with their own initialization.
-    // Initd already gates the services it needs before it launches them, so
-    // rootd does not need to serialize the entire bootstrap on readiness.
-    for index in 0..4 {
-        spawn_core_service_without_wait(&mut leases[index]);
+    // The bootstrap manifest is the rootd-owned policy boundary for direct
+    // early spawn, dependency readiness, restart fallback, and advertised
+    // supervisor descriptors.
+    for index in 0..leases.len() {
+        if BOOTSTRAP_MANIFEST[index].bootstrap_direct {
+            spawn_core_service_without_wait(&mut leases[index]);
+        }
     }
 
-    debug_line(b"rootd: core services spawned, spawning initd\n");
-    spawn_tracked_without_wait(&mut leases[4]);
+    debug_line(b"rootd: core services spawned, waiting for readiness\n");
+    while !service_dependencies_ready(INITD_LEASE_INDEX) {
+        drain_lifecycle_events(&mut leases);
+        serve_rootd_once(endpoint, &leases);
+        restart_failed_leases(&mut leases);
+        yield_now();
+    }
+
+    debug_line(b"rootd: core services ready, spawning initd via loaderd\n");
+    spawn_initd_via_loaderd(endpoint, &mut leases);
 
     debug_line(b"rootd: initd spawned\n");
     loop {
@@ -92,16 +164,16 @@ pub extern "C" fn _start() -> ! {
     }
 }
 
-fn lease(service_id: u64, exec_path: &'static [u8], weight_micros: u64) -> Lease {
+fn lease(spec: BootstrapServiceSpec) -> Lease {
     Lease {
-        service_id,
-        exec_path,
+        service_id: spec.service_id,
+        exec_path: spec.exec_path,
         pid: 0,
         restart_budget: 3,
         backoff_ms: 250,
         state: rustos_user_abi::syscall::ROOTD_LEASE_STATE_EMPTY,
         exit_status: 0,
-        weight_micros,
+        weight_micros: spec.weight_micros,
     }
 }
 
@@ -164,11 +236,46 @@ fn spawn_exec(path: &'static [u8], weight_micros: u64) -> Result<u64, i64> {
     }
 }
 
+fn spawn_initd_via_loaderd(endpoint: u64, leases: &mut [Lease]) {
+    let mut attempts = 0_u64;
+    loop {
+        match spawn_exec_via_loaderd(
+            leases[INITD_LEASE_INDEX].exec_path,
+            leases[INITD_LEASE_INDEX].weight_micros,
+        ) {
+            Ok(pid) => {
+                leases[INITD_LEASE_INDEX].pid = pid;
+                leases[INITD_LEASE_INDEX].state = ROOTD_LEASE_STATE_RUNNING;
+                leases[INITD_LEASE_INDEX].exit_status = 0;
+                break;
+            }
+            Err(_) => {
+                attempts = attempts.saturating_add(1);
+                if attempts <= 8 || attempts.is_power_of_two() {
+                    debug_line(b"rootd: initd loader spawn retry\n");
+                }
+                drain_lifecycle_events(leases);
+                serve_rootd_once(endpoint, leases);
+                restart_failed_leases(leases);
+                yield_now();
+            }
+        }
+    }
+}
+
 fn service_ready(service_id: u64) -> bool {
     if service_id == INITD_LEASE_ID {
         return false;
     }
     syscall1(SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, service_id) > 0
+}
+
+fn service_dependencies_ready(index: usize) -> bool {
+    let mask = BOOTSTRAP_MANIFEST[index].dependency_mask;
+    (mask & DEP_SYSCALLD == 0 || service_ready(IPC_SERVICE_LINUX_SYSCALLD))
+        && (mask & DEP_VFSD == 0 || service_ready(IPC_SERVICE_VFSD))
+        && (mask & DEP_LOADERD == 0 || service_ready(IPC_SERVICE_LOADERD))
+        && (mask & DEP_PROCD == 0 || service_ready(IPC_SERVICE_PROCD))
 }
 
 fn drain_lifecycle_events(leases: &mut [Lease]) {
@@ -329,19 +436,27 @@ fn fill_rootd_response(
 
 fn validate_commercial_max_request(request: &CommercialMaxProtocolRequest) -> Result<(), i32> {
     if request.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
-        || request.header.protocol != COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR
         || request.header.flags != 0
         || request.path_len as usize > request.path.len()
         || request.payload_len as usize > request.payload.len()
     {
         return Err(22);
     }
-    match request.header.op {
-        COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST
-        | COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE
-        | COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH
-        | COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY
-        | COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL => Ok(()),
+    match request.header.protocol {
+        COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR => match request.header.op {
+            COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST
+            | COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE
+            | COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH
+            | COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY
+            | COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL => Ok(()),
+            _ => Err(22),
+        },
+        COMMERCIAL_MAX_PROTOCOL_CAPABILITY => match request.header.op {
+            COMMERCIAL_MAX_CAPABILITY_OP_LEASE_GRANT
+            | COMMERCIAL_MAX_CAPABILITY_OP_LEASE_REVOKE
+            | COMMERCIAL_MAX_CAPABILITY_OP_LEASE_RENEW => Ok(()),
+            _ => Err(22),
+        },
         _ => Err(22),
     }
 }
@@ -351,6 +466,9 @@ fn fill_commercial_max_response(
     leases: &[Lease],
     response: &mut CommercialMaxProtocolResponse,
 ) -> Result<(), i32> {
+    if request.header.protocol == COMMERCIAL_MAX_PROTOCOL_CAPABILITY {
+        return fill_capability_response(request, leases, response);
+    }
     match request.header.op {
         COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST => {
             fill_manifest_descriptors(leases, response);
@@ -399,6 +517,58 @@ fn fill_commercial_max_response(
                     0
                 };
             response.value1 = lease.state as u64;
+            Ok(())
+        }
+        _ => Err(22),
+    }
+}
+
+fn fill_capability_response(
+    request: &CommercialMaxProtocolRequest,
+    leases: &[Lease],
+    response: &mut CommercialMaxProtocolResponse,
+) -> Result<(), i32> {
+    match request.header.op {
+        COMMERCIAL_MAX_CAPABILITY_OP_LEASE_GRANT => {
+            if request.arg0 == 0 {
+                fill_capability_descriptors(leases, response);
+                return Ok(());
+            }
+            let lease = match lease_by_service_or_index(leases, request.arg0, request.arg1 as usize)
+            {
+                Ok(lease) => lease,
+                Err(errno) => return Err(errno),
+            };
+            response.descriptor_count = 1;
+            response.descriptors[0] = capability_descriptor(lease, request.header.op, 0);
+            response.capability = service_capability_lease(lease, request.header.op);
+            response.value0 = service_policy_capability(lease.service_id);
+            response.value1 = lease.pid;
+            Ok(())
+        }
+        COMMERCIAL_MAX_CAPABILITY_OP_LEASE_REVOKE => {
+            let lease = match lease_by_service_or_index(leases, request.arg0, request.arg1 as usize)
+            {
+                Ok(lease) => lease,
+                Err(errno) => return Err(errno),
+            };
+            response.descriptor_count = 1;
+            response.descriptors[0] = capability_descriptor(lease, request.header.op, 0);
+            response.value0 = u64::from(lease.state == ROOTD_LEASE_STATE_FAILED);
+            response.value1 = lease.pid;
+            Ok(())
+        }
+        COMMERCIAL_MAX_CAPABILITY_OP_LEASE_RENEW => {
+            let lease = match lease_by_service_or_index(leases, request.arg0, request.arg1 as usize)
+            {
+                Ok(lease) => lease,
+                Err(errno) => return Err(errno),
+            };
+            response.descriptor_count = 1;
+            response.descriptors[0] = capability_descriptor(lease, request.header.op, 0);
+            response.capability = service_capability_lease(lease, request.header.op);
+            response.value0 = service_policy_capability(lease.service_id);
+            response.value1 = u64::from(lease.state == ROOTD_LEASE_STATE_RUNNING);
             Ok(())
         }
         _ => Err(22),
@@ -472,12 +642,22 @@ fn fill_dependency_graph(leases: &[Lease], response: &mut CommercialMaxProtocolR
             COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH,
             index as u64,
         );
-        descriptor.value1 = if index == 0 {
-            0
-        } else {
-            leases[index - 1].service_id
-        };
+        descriptor.value1 = BOOTSTRAP_MANIFEST[index].dependency_mask as u64;
         response.descriptors[index] = descriptor;
+        index += 1;
+    }
+}
+
+fn fill_capability_descriptors(leases: &[Lease], response: &mut CommercialMaxProtocolResponse) {
+    let count = leases.len().min(COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS);
+    response.descriptor_count = count as u16;
+    let mut index = 0usize;
+    while index < count {
+        response.descriptors[index] = capability_descriptor(
+            &leases[index],
+            COMMERCIAL_MAX_CAPABILITY_OP_LEASE_GRANT,
+            index as u64,
+        );
         index += 1;
     }
 }
@@ -512,6 +692,40 @@ fn lease_capability(lease: &Lease, op: u16) -> CommercialMaxCapabilityLeaseWire 
     capability
 }
 
+fn capability_descriptor(
+    lease: &Lease,
+    op: u16,
+    index: u64,
+) -> CommercialMaxProtocolDescriptorWire {
+    let mut descriptor = CommercialMaxProtocolDescriptorWire {
+        protocol: COMMERCIAL_MAX_PROTOCOL_CAPABILITY,
+        op,
+        service_id: lease.service_id,
+        capability_mask: service_policy_capability(lease.service_id),
+        value0: index,
+        value1: lease.pid,
+        ..CommercialMaxProtocolDescriptorWire::default()
+    };
+    let name = service_name(lease.exec_path);
+    copy_label(name, &mut descriptor.name, &mut descriptor.name_len);
+    descriptor
+}
+
+fn service_capability_lease(lease: &Lease, op: u16) -> CommercialMaxCapabilityLeaseWire {
+    let mut capability = CommercialMaxCapabilityLeaseWire {
+        lease_id: ((COMMERCIAL_MAX_PROTOCOL_CAPABILITY as u64) << 32) | lease.service_id,
+        service_id: lease.service_id,
+        subject_pid: lease.pid,
+        capability_mask: service_policy_capability(lease.service_id),
+        rights_mask: capability_protocol_mask(op),
+        generation: lease.pid,
+        ..CommercialMaxCapabilityLeaseWire::default()
+    };
+    let name = service_name(lease.exec_path);
+    copy_label(name, &mut capability.label, &mut capability.label_len);
+    capability
+}
+
 fn rootd_capability_mask(op: u16) -> u64 {
     match op {
         COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST => 1 << 0,
@@ -519,6 +733,28 @@ fn rootd_capability_mask(op: u16) -> u64 {
         COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH => 1 << 2,
         COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY => 1 << 3,
         COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL => 1 << 4,
+        _ => 0,
+    }
+}
+
+fn capability_protocol_mask(op: u16) -> u64 {
+    match op {
+        COMMERCIAL_MAX_CAPABILITY_OP_LEASE_GRANT => 1 << 0,
+        COMMERCIAL_MAX_CAPABILITY_OP_LEASE_REVOKE => 1 << 1,
+        COMMERCIAL_MAX_CAPABILITY_OP_LEASE_RENEW => 1 << 2,
+        _ => 0,
+    }
+}
+
+fn service_policy_capability(service_id: u64) -> u64 {
+    match service_id {
+        IPC_SERVICE_LINUX_SYSCALLD => {
+            rustos_user_abi::syscall::IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY
+        }
+        IPC_SERVICE_VFSD => rustos_user_abi::syscall::IPC_SERVICE_CAP_VFS_POLICY,
+        IPC_SERVICE_LOADERD => rustos_user_abi::syscall::IPC_SERVICE_CAP_PROCESS_LOADER,
+        IPC_SERVICE_PROCD => rustos_user_abi::syscall::IPC_SERVICE_CAP_PROCESS_POLICY,
+        INITD_LEASE_ID => rustos_user_abi::syscall::IPC_SERVICE_CAP_ROOT_SUPERVISOR,
         _ => 0,
     }
 }
@@ -580,7 +816,8 @@ fn trim_nul(bytes: &'static [u8]) -> &'static [u8] {
 }
 
 fn restart_failed_leases(leases: &mut [Lease]) {
-    for lease in leases.iter_mut() {
+    for index in 0..leases.len() {
+        let lease = &mut leases[index];
         if !matches!(
             lease.state,
             ROOTD_LEASE_STATE_EXITED | ROOTD_LEASE_STATE_RESTART_PENDING
@@ -591,7 +828,7 @@ fn restart_failed_leases(leases: &mut [Lease]) {
             lease.state = ROOTD_LEASE_STATE_FAILED;
             continue;
         }
-        match restart_lease(lease) {
+        match restart_lease(index, lease) {
             Ok(pid) => {
                 lease.pid = pid;
                 lease.restart_budget -= 1;
@@ -605,11 +842,11 @@ fn restart_failed_leases(leases: &mut [Lease]) {
     }
 }
 
-fn restart_lease(lease: &Lease) -> Result<u64, i64> {
-    if lease.service_id == IPC_SERVICE_LOADERD {
+fn restart_lease(index: usize, lease: &Lease) -> Result<u64, i64> {
+    if BOOTSTRAP_MANIFEST[index].restart_direct {
         return spawn_exec(lease.exec_path, lease.weight_micros);
     }
-    if !service_ready(IPC_SERVICE_LOADERD) {
+    if !service_dependencies_ready(index) || !service_ready(IPC_SERVICE_LOADERD) {
         return Err(11);
     }
     spawn_exec_via_loaderd(lease.exec_path, lease.weight_micros)
@@ -628,7 +865,8 @@ fn spawn_exec_via_loaderd(path: &'static [u8], weight_micros: u64) -> Result<u64
     {
         return Err(22);
     }
-    let mut request = LoaderSpawnRequest::default();
+    let request = unsafe { &mut *INITD_LOADER_REQUEST.0.get() };
+    *request = empty_loader_spawn_request();
     request.version = LOADER_REQUEST_ABI_VERSION;
     request.op = LOADER_OP_SPAWN_EXEC;
     request.flags = SPAWN_FLAG_LOGICAL_ADMIN as u32;
@@ -640,13 +878,14 @@ fn spawn_exec_via_loaderd(path: &'static [u8], weight_micros: u64) -> Result<u64
     copy_bytes(path, &mut request.argv_bytes);
     request.argv_bytes[path.len()] = 0;
 
-    let mut response = LoaderSpawnResponse::default();
+    let response = unsafe { &mut *INITD_LOADER_RESPONSE.0.get() };
+    *response = empty_loader_spawn_response();
     let result = syscall5(
         SYS_RUSTOS_IPC_CALL,
         endpoint as u64,
-        (&request as *const LoaderSpawnRequest) as u64,
+        (request as *const LoaderSpawnRequest) as u64,
         size_of::<LoaderSpawnRequest>() as u64,
-        (&mut response as *mut LoaderSpawnResponse) as u64,
+        (response as *mut LoaderSpawnResponse) as u64,
         size_of::<LoaderSpawnResponse>() as u64,
     );
     if result < 0 {
@@ -665,6 +904,38 @@ fn spawn_exec_via_loaderd(path: &'static [u8], weight_micros: u64) -> Result<u64
         return Err(22);
     }
     Ok(response.pid as u64)
+}
+
+const fn empty_loader_spawn_request() -> LoaderSpawnRequest {
+    LoaderSpawnRequest {
+        version: 0,
+        op: 0,
+        flags: 0,
+        console_session: 0,
+        weight_micros: 0,
+        target_pid: 0,
+        target_tid: 0,
+        exec_ticket: 0,
+        exec_path_len: 0,
+        argv_count: 0,
+        env_count: 0,
+        argv_bytes_len: 0,
+        env_bytes_len: 0,
+        reserved0: 0,
+        exec_path: [0; LOADER_SPAWN_EXEC_PATH_CAPACITY],
+        argv_bytes: [0; LOADER_SPAWN_ARG_BYTES],
+        env_bytes: [0; LOADER_SPAWN_ENV_BYTES],
+    }
+}
+
+const fn empty_loader_spawn_response() -> LoaderSpawnResponse {
+    LoaderSpawnResponse {
+        version: 0,
+        op: 0,
+        status: 0,
+        pid: 0,
+        reserved0: 0,
+    }
 }
 
 fn contains_nul(bytes: &[u8]) -> bool {

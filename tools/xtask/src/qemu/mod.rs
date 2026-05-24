@@ -221,6 +221,18 @@ const RUN_SUMMARY_MARKERS: &[&str] = &[
     "wayland",
 ];
 
+const COMMERCIAL_MAX_READY_MARKERS: &[&str] = &[
+    "rootd: core services ready, spawning initd via loaderd",
+    "rootd: initd spawned",
+    "devmgrd: device policy endpoint registered",
+    "inputd: input policy endpoint registered",
+    "runtimed: session policy endpoint registered",
+    "uiserver: wayland compositor ready on /run/user/1000/wayland-0",
+    "uiserver: ui ready notified",
+    "launched wayclick.desktop",
+    "storaged: storage policy endpoint registered",
+];
+
 #[derive(Clone, Copy)]
 enum ScenarioCommand {
     Run,
@@ -423,6 +435,15 @@ where
             "--expect" => {
                 let marker = next_required_arg(args, "--expect")?;
                 append_unique_string(&mut options.expect_markers, marker);
+            }
+            "--commercial-max-ready" => {
+                for marker in COMMERCIAL_MAX_READY_MARKERS {
+                    append_unique_string(&mut options.expect_markers, (*marker).to_owned());
+                }
+                options.summarize_log = true;
+                if options.timeout.is_none() {
+                    options.timeout = Some(Duration::from_secs(35));
+                }
             }
             "--fault" => {
                 let rule = next_required_arg(args, "--fault")?;
@@ -785,6 +806,7 @@ options:
   --qemu-log <int|null>              write QEMU trace log to logs/qemu_interrupt.log or disable it
   --timeout <seconds>                stop QEMU after this many seconds; no default timeout
   --expect <marker>                  stop successfully once all repeated expected markers appear
+  --commercial-max-ready             expect rootd/initd/services/Wayland/wayclick/storaged readiness
   --fault <location=action>          pass a validated fault-injection rule through QEMU fw_cfg
   --summarize-log                    print high-signal debugcon lines after QEMU stops
   --vfio-pci <0000:bb:dd.f>          attach a vfio-pci host device to qemu (repeatable)

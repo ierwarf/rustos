@@ -31,10 +31,7 @@ mod chrome;
 mod colors;
 mod icons;
 
-pub(crate) use background::{
-    build_desktop_background, start_desktop_background_loader, DesktopBackground,
-};
-pub(crate) use chrome::rebuild_console_window_surface;
+pub(crate) use background::start_desktop_background_loader;
 
 const SLOW_DESKTOP_REFRESH_THRESHOLD: Duration = Duration::from_millis(8);
 const MAX_DESKTOP_REFRESH_LOGS: usize = 6;

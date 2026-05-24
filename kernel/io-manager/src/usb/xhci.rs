@@ -761,7 +761,6 @@ fn enumerate_boot_port(
         manufacturer: None,
         product: None,
         serial: None,
-        synthetic_hid_kind: None,
     });
     crate::debug::record_milestone(
         crate::debug::LogCategory::Usb,

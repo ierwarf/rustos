@@ -11,26 +11,27 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use runtime_control::{
-    load_desktop_program_entries, load_runtime_default_env, load_runtime_launch_program_entries,
-    DesktopProgramEntry, RuntimeEnvScope, RuntimeRunningProgram, StartupMode,
     DEFAULT_APPLICATIONS_DIR, DEFAULT_RUNTIME_ENV_REGISTRY_PATH,
-    DEFAULT_RUNTIME_LAUNCH_REGISTRY_PATH, DEFAULT_RUNTIME_SOCKET_PATH,
+    DEFAULT_RUNTIME_LAUNCH_REGISTRY_PATH, DEFAULT_RUNTIME_SOCKET_PATH, DesktopProgramEntry,
+    RuntimeEnvScope, RuntimeRunningProgram, StartupMode, load_desktop_program_entries,
+    load_runtime_default_env, load_runtime_launch_program_entries,
 };
 use rustos_user_abi::console::{
     self as console_abi, ConsoleCloseSessionRequest, ConsoleCreateSessionRequest,
     ConsoleSetFocusRequest, ConsoleSetSessionStateRequest,
 };
 use rustos_user_abi::syscall::{
-    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, LoaderSpawnRequest,
-    LoaderSpawnResponse, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_SESSIOND,
+    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_SESSIOND,
     COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE, COMMERCIAL_MAX_SESSIOND_OP_FOREGROUND_FOCUS,
     COMMERCIAL_MAX_SESSIOND_OP_SESSION_GRAPH, COMMERCIAL_MAX_SESSIOND_OP_TTY_LINE_DISCIPLINE,
-    COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP, IPC_SERVICE_DEVMGRD, IPC_SERVICE_LOADERD,
-    IPC_SERVICE_SESSIOND, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
-    LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, SYS_RUSTOS_IPC_CALL,
-    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
-    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_TRY_RECV,
+    COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP, CommercialMaxCapabilityLeaseWire,
+    CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
+    CommercialMaxProtocolResponse, IPC_SERVICE_DEVMGRD, IPC_SERVICE_LOADERD, IPC_SERVICE_SESSIOND,
+    LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
+    LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, LoaderSpawnRequest,
+    LoaderSpawnResponse, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
+    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_TRY_RECV,
 };
 
 const DEFAULT_USER_TASK_WEIGHT_MICROS: u64 = 100;
@@ -388,10 +389,14 @@ fn handle_session_request(
 ) -> i32 {
     if request.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
         || request.header.protocol != COMMERCIAL_MAX_PROTOCOL_SESSIOND
+        || request.header.flags != 0
         || request.path_len as usize > request.path.len()
         || request.payload_len as usize > request.payload.len()
     {
         return libc::EINVAL;
+    }
+    if !session_op_accepts_ioctl(request.header.op, request.arg0) {
+        return libc::ENOTTY;
     }
     match request.header.op {
         COMMERCIAL_MAX_SESSIOND_OP_SESSION_GRAPH => {
@@ -460,6 +465,33 @@ fn handle_session_request(
             0
         }
         _ => libc::EINVAL,
+    }
+}
+
+fn session_op_accepts_ioctl(op: u16, request_number: u64) -> bool {
+    if request_number == 0 {
+        return true;
+    }
+    match op {
+        COMMERCIAL_MAX_SESSIOND_OP_SESSION_GRAPH => matches!(
+            request_number,
+            console_abi::CONSOLE_IOCTL_GET_STATE | console_abi::CONSOLE_IOCTL_SNAPSHOT_SESSIONS
+        ),
+        COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE => matches!(
+            request_number,
+            console_abi::CONSOLE_IOCTL_SNAPSHOT_SESSION_OUTPUT
+                | console_abi::CONSOLE_IOCTL_SEND_INPUT_EVENT
+                | console_abi::CONSOLE_IOCTL_CREATE_SESSION
+                | console_abi::CONSOLE_IOCTL_CLOSE_SESSION
+                | console_abi::CONSOLE_IOCTL_BIND_CURRENT_SESSION
+                | console_abi::CONSOLE_IOCTL_SET_SESSION_STATE
+        ),
+        COMMERCIAL_MAX_SESSIOND_OP_FOREGROUND_FOCUS => {
+            request_number == console_abi::CONSOLE_IOCTL_SET_FOCUS
+        }
+        COMMERCIAL_MAX_SESSIOND_OP_TTY_LINE_DISCIPLINE
+        | COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP => false,
+        _ => false,
     }
 }
 
@@ -1799,23 +1831,33 @@ mod tests {
             .map(|item| item.to_str().unwrap().to_string())
             .collect::<Vec<_>>();
         assert!(values.iter().any(|item| item == "PATH=/custom/bin"));
-        assert!(values
-            .iter()
-            .any(|item| item == "XDG_RUNTIME_DIR=/run/custom"));
+        assert!(
+            values
+                .iter()
+                .any(|item| item == "XDG_RUNTIME_DIR=/run/custom")
+        );
         assert!(values.iter().any(|item| item == "HOME=/home/user"));
-        assert!(values
-            .iter()
-            .any(|item| item == "WAYLAND_DISPLAY=wayland-0"));
+        assert!(
+            values
+                .iter()
+                .any(|item| item == "WAYLAND_DISPLAY=wayland-0")
+        );
         assert!(values.iter().any(|item| item == "XDG_SESSION_TYPE=wayland"));
-        assert!(values
-            .iter()
-            .any(|item| item == "XDG_CURRENT_DESKTOP=RustOS"));
-        assert!(!values
-            .iter()
-            .any(|item| item == "PATH=/bin:/usr/bin:/usr/local/bin"));
-        assert!(!values
-            .iter()
-            .any(|item| item == "XDG_RUNTIME_DIR=/run/user/1000"));
+        assert!(
+            values
+                .iter()
+                .any(|item| item == "XDG_CURRENT_DESKTOP=RustOS")
+        );
+        assert!(
+            !values
+                .iter()
+                .any(|item| item == "PATH=/bin:/usr/bin:/usr/local/bin")
+        );
+        assert!(
+            !values
+                .iter()
+                .any(|item| item == "XDG_RUNTIME_DIR=/run/user/1000")
+        );
     }
 }
 

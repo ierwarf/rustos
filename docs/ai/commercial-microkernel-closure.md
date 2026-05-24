@@ -162,6 +162,30 @@ As of the strict Tier 0 + Tier 1 closure pass:
   `runtimed`, `pagerd` via `syscalld`, and non-`.ko` `service-driverd` via
   `driverd`. This does not mean all marked ring0 policy has moved; it means
   the ABI/control-plane precondition is no longer the primary blocker.
+- Current session-policy bridge: `devmgrd` delegates console/session ioctl
+  authorization to `IPC_SERVICE_SESSIOND` for session graph, console route, and
+  foreground focus before invoking the gated ring0 device ioctl broker. This
+  leaves display setup authorization in `devmgrd` and keeps display present as
+  a hot direct path.
+- Current capability-policy bridge: `rootd` accepts the generic
+  commercial-max capability protocol for service lease grant/revoke/renew
+  descriptors. Ring0 still installs and enforces broker capability bits at
+  endpoint registration, but the supervisor-visible lease policy is no longer
+  only implicit kernel state.
+- Current storage-policy bridge: `storaged` owns post-bootstrap root-volume
+  selection rank for its legacy and commercial-max root-volume responses,
+  preferring partitions over whole disks and writable candidates over read-only
+  candidates before falling back to stable descriptor id ordering.
+- Current preparation gate: `cargo xtask ring3-inventory` now classifies the
+  remaining migration markers by LOC, owner, lane, and deletion action. Current
+  snapshot is `total_marked_loc=21423`, `excluded_xhci_nvme_loc=2911`, and
+  `active_batch_marked_loc=18512`; the xHCI/NVMe LOC is held outside this
+  batch pending `.ko` replacement strategy.
+- Current runtime gate: `cargo xtask run --profile nvme --accel-profile kvm
+  --usb-input --debugcon file --commercial-max-ready -- --no-reboot` is the
+  commercial-max QEMU signature check. It expands to rootd core readiness,
+  loaderd-spawned `initd`, device/input/session policy endpoints, Wayland/UI
+  readiness, `wayclick.desktop`, and `storaged` readiness.
 
 Migration cadence reality: the commercial-max protocol envelope exists, but
 removing markers without moving the policy behind each protocol would falsify

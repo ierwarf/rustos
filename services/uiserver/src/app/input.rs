@@ -7,11 +7,11 @@ use runtime_control::RuntimeClient;
 use super::{AppState, DragTarget, VisualUpdate};
 use crate::canvas;
 use crate::profile;
-use crate::layout::maximized_window_rect;
+use crate::layout::{clamp_wayland_frame, maximized_window_rect};
 use crate::render::{
-    clamp_console_window_rect, launcher_button_rect, taskbar_slot_rect, wayland_window_outer_rect,
-    window_close_button_rect, window_maximize_button_rect, window_minimize_button_rect,
-    window_title_bar_rect,
+    clamp_console_window_rect, console_window_dirty_rect, launcher_button_rect, taskbar_slot_rect,
+    wayland_window_dirty_rect, wayland_window_outer_rect, window_close_button_rect,
+    window_maximize_button_rect, window_minimize_button_rect, window_title_bar_rect,
 };
 use crate::sys::{
     self, console_send_input_event, console_set_focus, ConsoleSessionHandle, InputEvent,
@@ -581,8 +581,11 @@ impl AppState {
                 }
 
                 window.frame = next_frame;
-                let mut update = VisualUpdate::partial(previous_frame);
-                update.add_partial_rect(next_frame);
+                // Use shadow-inclusive dirty rects so the previous shadow
+                // halo gets repainted instead of leaving a dark ghost
+                // behind the dragged window.
+                let mut update = VisualUpdate::partial(console_window_dirty_rect(previous_frame));
+                update.add_partial_rect(console_window_dirty_rect(next_frame));
                 update
             }
             Some(DragTarget::Wayland(surface_id)) => {
@@ -595,32 +598,38 @@ impl AppState {
                     return VisualUpdate::default();
                 };
                 let previous_outer = wayland_window_outer_rect(&self.wayland_windows[index]);
+                let previous_dirty = wayland_window_dirty_rect(&self.wayland_windows[index]);
+                // Wayland windows store the *content* size in `frame.width/height`
+                // — use `clamp_wayland_frame` (not the console clamp) so the
+                // title bar stays grabbable but the window can drag past the
+                // desktop edge.
                 let target_x = self.cursor_x.saturating_sub(self.drag_offset_x as u32) as usize;
                 let target_y = self.cursor_y.saturating_sub(self.drag_offset_y as u32) as usize;
-                let next_outer = clamp_console_window_rect(
-                    self.display.width,
-                    self.display.height,
+                let frame = self.wayland_windows[index].frame;
+                let clamped = clamp_wayland_frame(
                     canvas::Rect {
                         x: target_x,
                         y: target_y,
-                        ..previous_outer
+                        width: frame.width,
+                        height: frame.height,
                     },
+                    self.display.width,
+                    self.display.height,
                 );
-                if previous_outer.x == next_outer.x && previous_outer.y == next_outer.y {
+                if previous_outer.x == clamped.x && previous_outer.y == clamped.y {
                     return VisualUpdate::default();
                 }
 
                 if let Some(window) = self.wayland_windows.get_mut(index) {
-                    window.frame.x = next_outer.x;
-                    window.frame.y = next_outer.y;
+                    window.frame.x = clamped.x;
+                    window.frame.y = clamped.y;
                 }
                 let next_dirty = self.wayland_window_rect_for_surface(surface_id);
                 if let Some(wayland) = wayland {
-                    wayland.move_surface(surface_id, next_outer.x, next_outer.y);
+                    wayland.move_surface(surface_id, clamped.x, clamped.y);
                     self.sync_wayland_windows(wayland.window_snapshots());
                 }
-                let mut update = VisualUpdate::partial(previous_outer);
-                update.add_partial_rect(next_outer);
+                let mut update = VisualUpdate::partial(previous_dirty);
                 update.add_partial_rect(next_dirty);
                 update
             }

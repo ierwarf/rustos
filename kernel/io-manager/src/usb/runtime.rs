@@ -175,43 +175,6 @@ pub(crate) fn service_pending() -> usize {
     completed
 }
 
-pub(crate) fn handles_device(dev: *mut LinuxCompatUsbDevice) -> bool {
-    if dev.is_null() {
-        return false;
-    }
-    let devices = USB_RUNTIME_DEVICES.lock();
-    let target = dev as usize;
-    for index in 0..devices.len() {
-        if devices[index].usb_device_ptr == target {
-            return true;
-        }
-    }
-    false
-}
-
-pub(crate) fn owns_hid_device(dev: *mut LinuxCompatHidDevice) -> bool {
-    if dev.is_null() {
-        return false;
-    }
-    let (vendor, product, bus) =
-        unsafe { ((*dev).vendor as u16, (*dev).product as u16, (*dev).bus) };
-    if bus != 0x03 {
-        return false;
-    }
-    let devices = USB_RUNTIME_DEVICES.lock();
-    for index in 0..devices.len() {
-        let entry = &devices[index];
-        let entry_vendor =
-            u16::from_le_bytes([entry.device_descriptor[8], entry.device_descriptor[9]]);
-        let entry_product =
-            u16::from_le_bytes([entry.device_descriptor[10], entry.device_descriptor[11]]);
-        if entry_vendor == vendor && entry_product == product {
-            return true;
-        }
-    }
-    false
-}
-
 pub(crate) fn has_pointer_device() -> bool {
     let devices = USB_RUNTIME_DEVICES.lock();
     for index in 0..devices.len() {
@@ -596,12 +559,12 @@ pub(crate) fn hid_input_report(
     dev: *mut LinuxCompatHidDevice,
     data: *mut u8,
     size: u32,
-) -> Option<i32> {
+) -> i32 {
     // RING3-MIGRATION-REFERENCE START: inputd should own HID report
     // classification and event translation. Ring0 should only identify the HID
     // source and forward the report bytes/capability.
     if dev.is_null() || data.is_null() || size == 0 || size as usize > MAX_REPORT_BYTES {
-        return Some(-22);
+        return -22;
     }
 
     let report = unsafe { core::slice::from_raw_parts(data, size as usize) };
@@ -619,7 +582,7 @@ pub(crate) fn hid_input_report(
                     report.get(3).copied().unwrap_or(0),
                 );
             }
-            return None;
+            return 0;
         }
     };
 
@@ -645,9 +608,8 @@ pub(crate) fn hid_input_report(
         }
         HidReportLayout::Pointer(layout) => handle_pointer_report(dev as usize, report, layout),
     };
-    let result = Some(status);
     // RING3-MIGRATION-REFERENCE END: inputd-owned HID report classification.
-    result
+    status
 }
 
 pub(crate) fn hid_remove_device(dev: *mut LinuxCompatHidDevice) {
@@ -1240,57 +1202,55 @@ fn handle_keyboard_report(
         (previous_modifiers, previous_keys, previous_key_count)
     };
 
-    with_injection(|| {
-        for usage in 0xE0u8..=0xE7 {
-            let mask = 1u8 << (usage - 0xE0);
-            if (previous_modifiers & mask) == (modifiers & mask) {
-                continue;
-            }
-            if let Some(code) = hid_usage_to_keycode(usage) {
-                crate::input::keyboard::inject_key_transition(code, (modifiers & mask) == 0);
-            }
+    for usage in 0xE0u8..=0xE7 {
+        let mask = 1u8 << (usage - 0xE0);
+        if (previous_modifiers & mask) == (modifiers & mask) {
+            continue;
         }
-
-        let mut previous_index = 0usize;
-        while previous_index < previous_key_count {
-            let usage = previous_keys[previous_index];
-            let mut still_present = false;
-            let mut current_index = 0usize;
-            while current_index < key_count {
-                if keys[current_index] == usage {
-                    still_present = true;
-                    break;
-                }
-                current_index += 1;
-            }
-            if !still_present {
-                if let Some(code) = hid_usage_to_keycode(usage) {
-                    crate::input::keyboard::inject_key_transition(code, true);
-                }
-            }
-            previous_index += 1;
+        if let Some(code) = hid_usage_to_keycode(usage) {
+            crate::input::keyboard::inject_key_transition(code, (modifiers & mask) == 0);
         }
+    }
 
+    let mut previous_index = 0usize;
+    while previous_index < previous_key_count {
+        let usage = previous_keys[previous_index];
+        let mut still_present = false;
         let mut current_index = 0usize;
         while current_index < key_count {
-            let usage = keys[current_index];
-            let mut was_present = false;
-            let mut previous_index = 0usize;
-            while previous_index < previous_key_count {
-                if previous_keys[previous_index] == usage {
-                    was_present = true;
-                    break;
-                }
-                previous_index += 1;
-            }
-            if !was_present {
-                if let Some(code) = hid_usage_to_keycode(usage) {
-                    crate::input::keyboard::inject_key_transition(code, false);
-                }
+            if keys[current_index] == usage {
+                still_present = true;
+                break;
             }
             current_index += 1;
         }
-    });
+        if !still_present {
+            if let Some(code) = hid_usage_to_keycode(usage) {
+                crate::input::keyboard::inject_key_transition(code, true);
+            }
+        }
+        previous_index += 1;
+    }
+
+    let mut current_index = 0usize;
+    while current_index < key_count {
+        let usage = keys[current_index];
+        let mut was_present = false;
+        let mut previous_index = 0usize;
+        while previous_index < previous_key_count {
+            if previous_keys[previous_index] == usage {
+                was_present = true;
+                break;
+            }
+            previous_index += 1;
+        }
+        if !was_present {
+            if let Some(code) = hid_usage_to_keycode(usage) {
+                crate::input::keyboard::inject_key_transition(code, false);
+            }
+        }
+        current_index += 1;
+    }
 
     if KEYBOARD_TRANSLATION_LOG_LIMIT != 0
         && KEYBOARD_TRANSLATION_LOGS.fetch_add(1, Ordering::Relaxed)
@@ -1347,9 +1307,7 @@ fn handle_pointer_report(hid_device_ptr: usize, report: &[u8], layout: &PointerL
             }
         };
 
-        with_injection(|| {
-            crate::driver::input::submit_pointer_packet(packet);
-        });
+        crate::driver::input::submit_pointer_packet(packet);
 
         if POINTER_TRANSLATION_LOG_LIMIT != 0
             && (packet.dx != 0
@@ -1396,14 +1354,12 @@ fn handle_pointer_report(hid_device_ptr: usize, report: &[u8], layout: &PointerL
     };
 
     HID_POINTER_REPORT_COUNT.fetch_add(1, Ordering::Relaxed);
-    with_injection(|| {
-        crate::driver::input::submit_pointer_absolute(
-            target_x.max(0) as u32,
-            target_y.max(0) as u32,
-            buttons,
-            wheel as i16,
-        );
-    });
+    crate::driver::input::submit_pointer_absolute(
+        target_x.max(0) as u32,
+        target_y.max(0) as u32,
+        buttons,
+        wheel as i16,
+    );
 
     if POINTER_TRANSLATION_LOG_LIMIT != 0
         && POINTER_TRANSLATION_LOGS.fetch_add(1, Ordering::Relaxed) < POINTER_TRANSLATION_LOG_LIMIT
@@ -1583,12 +1539,6 @@ fn usb_pipe_endpoint(dev: *mut LinuxCompatUsbDevice, pipe: u32) -> *mut c_void {
                 .unwrap_or(core::ptr::null_mut()) as *mut c_void
         }
     }
-}
-
-fn with_injection(f: impl FnOnce()) {
-    super::synthetic::begin_injection();
-    f();
-    super::synthetic::end_injection();
 }
 
 #[cfg(test)]

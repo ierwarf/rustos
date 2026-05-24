@@ -2953,7 +2953,6 @@ fn can_bootstrap_spawn_direct(exec_path: &str) -> bool {
             | "services/vfsd/vfsd.elf"
             | "services/loaderd/loaderd.elf"
             | "services/procd/procd.elf"
-            | "services/initd/initd.elf"
     )
 }
 

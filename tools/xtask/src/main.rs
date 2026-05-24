@@ -4,6 +4,7 @@ mod config;
 mod layering;
 mod package_manifest;
 mod qemu;
+mod ring3_inventory;
 mod stage;
 mod testinfra;
 mod util;

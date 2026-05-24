@@ -253,9 +253,23 @@ pub(crate) fn wayland_client_size_for_buffer(
     (buffer_width.min(max_w), buffer_height.min(max_h))
 }
 
-/// Clamp a Wayland surface frame so the rendered chrome stays inside the
-/// desktop region. `frame.width` / `frame.height` are interpreted as the
-/// *client content* size — the title bar and border are added on top.
+/// How much of the title bar must remain inside the desktop region after
+/// a clamp. We require enough horizontal overlap to keep the close button
+/// reachable and full vertical visibility so the title stays clickable
+/// for re-grab.
+pub(crate) const WAYLAND_TITLE_VISIBLE_PX: usize = 120;
+
+/// Clamp a Wayland surface frame so the title bar stays grabbable.
+///
+/// `frame.width` / `frame.height` are interpreted as the *client content*
+/// size — the title bar and border are added on top. The content size is
+/// capped to what the desktop can show so a misbehaving client (e.g.
+/// wayclick ignoring our configure) cannot push the buffer over the
+/// topbar or dock. The *position*, however, only needs to keep
+/// `WAYLAND_TITLE_VISIBLE_PX` of the title bar inside the desktop — we
+/// deliberately allow windows to be dragged partly off-screen so the
+/// user has free range of motion even when the chrome size matches the
+/// available area.
 pub(crate) fn clamp_wayland_frame(
     frame: Rect,
     display_width: u32,
@@ -267,11 +281,33 @@ pub(crate) fn clamp_wayland_frame(
     let bounds = desktop_bounds(display_width, display_height);
     let outer_w = width.saturating_add(WINDOW_BORDER * 2);
     let outer_h = height.saturating_add(WINDOW_TITLE_HEIGHT + WINDOW_BORDER * 2);
-    let max_x = bounds.x + bounds.width.saturating_sub(outer_w);
-    let max_y = bounds.y + bounds.height.saturating_sub(outer_h);
+
+    // Horizontal: keep at least `WAYLAND_TITLE_VISIBLE_PX` of chrome inside
+    // the desktop on either side. Allows dragging off the left or right
+    // edge until the title bar would disappear.
+    let min_visible = WAYLAND_TITLE_VISIBLE_PX.min(outer_w);
+    let min_x = bounds
+        .x
+        .saturating_add(min_visible)
+        .saturating_sub(outer_w);
+    let max_x = bounds
+        .x
+        .saturating_add(bounds.width)
+        .saturating_sub(min_visible);
+
+    // Vertical: title bar must stay below the topbar and above the dock
+    // (otherwise the window can't be grabbed back). The body may extend
+    // past the bottom margin.
+    let min_y = bounds.y;
+    let title_strip = WINDOW_TITLE_HEIGHT.saturating_add(WINDOW_BORDER);
+    let max_y = bounds
+        .y
+        .saturating_add(bounds.height)
+        .saturating_sub(title_strip.min(outer_h));
+
     Rect {
-        x: frame.x.clamp(bounds.x, max_x),
-        y: frame.y.clamp(bounds.y, max_y),
+        x: frame.x.clamp(min_x, max_x),
+        y: frame.y.clamp(min_y, max_y),
         width,
         height,
     }

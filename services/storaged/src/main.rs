@@ -5,19 +5,19 @@ use std::thread;
 use std::time::Duration;
 
 use rustos_user_abi::syscall::{
-    BootExtentLeaseWire, BootExtentWire, CommercialMaxCapabilityLeaseWire,
-    CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
-    CommercialMaxProtocolResponse, StorageBlockDescriptorWire, StorageListBrokerArgs,
-    StoragedRequest, StoragedResponse, BOOT_EXTENT_FLAG_READONLY, BOOT_EXTENT_MAX_EXTENTS,
-    BOOT_EXTENT_PATH_CAPACITY, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    BOOT_EXTENT_FLAG_READONLY, BOOT_EXTENT_MAX_EXTENTS, BOOT_EXTENT_PATH_CAPACITY,
+    BootExtentLeaseWire, BootExtentWire, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
     COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_STORAGED,
     COMMERCIAL_MAX_STORAGED_OP_BLOCK_INVENTORY, COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE,
     COMMERCIAL_MAX_STORAGED_OP_PARTITION_SCAN, COMMERCIAL_MAX_STORAGED_OP_ROOT_VOLUME_SELECT,
-    COMMERCIAL_MAX_STORAGED_OP_VOLUME_METADATA, IPC_SERVICE_STORAGED, STORAGED_IPC_ABI_VERSION,
-    STORAGED_OP_BOOT_EXTENT_LOOKUP, STORAGED_OP_LIST_COUNT, STORAGED_OP_LIST_GET, STORAGED_OP_PING,
-    STORAGED_OP_ROOT_STATUS, STORAGE_LIST_MAX_DESCRIPTORS, SYS_RUSTOS_DEBUG_PRINT,
-    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
-    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_STORAGE_LIST_BROKER,
+    COMMERCIAL_MAX_STORAGED_OP_VOLUME_METADATA, CommercialMaxCapabilityLeaseWire,
+    CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
+    CommercialMaxProtocolResponse, IPC_SERVICE_STORAGED, STORAGE_FLAG_READONLY,
+    STORAGE_LIST_MAX_DESCRIPTORS, STORAGED_IPC_ABI_VERSION, STORAGED_OP_BOOT_EXTENT_LOOKUP,
+    STORAGED_OP_LIST_COUNT, STORAGED_OP_LIST_GET, STORAGED_OP_PING, STORAGED_OP_ROOT_STATUS,
+    SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV,
+    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_STORAGE_LIST_BROKER,
+    StorageBlockDescriptorWire, StorageListBrokerArgs, StoragedRequest, StoragedResponse,
 };
 
 const RECV_BACKOFF: Duration = Duration::from_millis(50);
@@ -204,7 +204,17 @@ fn dispatch_commercial(
 
 fn selected_root_descriptor() -> Result<StorageBlockDescriptorWire, i32> {
     let descriptors = list_descriptors()?;
-    descriptors.first().copied().ok_or(libc::ENODEV)
+    descriptors
+        .iter()
+        .copied()
+        .min_by_key(root_selection_rank)
+        .ok_or(libc::ENODEV)
+}
+
+fn root_selection_rank(descriptor: &StorageBlockDescriptorWire) -> (u8, u8, u32) {
+    let partition_rank = u8::from(descriptor.start_block == 0);
+    let readonly_rank = u8::from((descriptor.flags & STORAGE_FLAG_READONLY) != 0);
+    (partition_rank, readonly_rank, descriptor.id)
 }
 
 fn boot_extent_lookup(request: &StoragedRequest) -> Result<BootExtentLeaseWire, i32> {

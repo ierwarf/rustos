@@ -16,6 +16,7 @@ Use from repo root.
 | `cargo xtask fuzz-host --target all` | deterministic host fuzz smoke for fault rules, project config, and package manifest parsing | `logs/` on crash | parser panic or invariant bug |
 | `cargo xtask build-user` | userspace packages only | `target/`, `build/artifacts` | service/app compile error |
 | `cargo xtask build-driver-modules` | bridge modules only | `target/`, `build/artifacts` | driver/module build error |
+| `cargo xtask ring3-inventory` | classify remaining `RING3-MIGRATION-REFERENCE` marked LOC by owner/lane | none | stale marker classification or unexpected active LOC growth |
 | `cargo test -p module-tests` | module tests | `target/` | unit/module regression |
 | `git diff --check` | whitespace sanity | none | trailing whitespace/conflict marker |
 
@@ -26,6 +27,8 @@ QEMU args:
 - Example: `cargo xtask run --profile nvme -- --no-reboot`.
 - Short KVM no-opt debug runs should use the built-in timeout and summary:
   `cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file --timeout 35 --summarize-log -- --no-reboot`.
+- Commercial-max closure runs should use the readiness signature bundle:
+  `cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file --commercial-max-ready -- --no-reboot`.
 - Use repeated `--expect <marker>` when a run should stop as soon as specific
   debugcon markers appear. Without `--expect`, `--timeout` is a controlled stop.
 - Use repeated `--fault <location=action>` to pass a validated fault-injection
@@ -44,16 +47,19 @@ Do not run:
 Docs verification:
 
 - `mdbook build` if `mdbook` exists.
-- `rg -n "\[[^]]+\]\(([^)#]+\.md)" docs README.md` to inspect md links.
+- Use ripgrep MCP to inspect markdown links with pattern
+  `\[[^]]+\]\(([^)#]+\.md)`.
 - top-level human docs should include `[English](#english) | [한국어](#korean)`.
 
 Fast context commands:
 
-- `rg -n "symbol_or_path" kernel services tools libs drivers apps`
+- Use Serena MCP for symbols and ripgrep MCP for raw `symbol_or_path` matches
+  under `kernel`, `services`, `tools`, `libs`, `drivers`, and `apps`.
 - `find kernel -maxdepth 4 -name api.rs | sort`
 - `find . -name RUSTOS.package.toml | sort`
-- `rg -n "enum XtaskCommand|struct Config|enum PackageKind" tools/xtask/src`
-- `sed -n 'START,ENDp' path/to/file` after `rg` finds the relevant line range.
+- Use Serena or ripgrep MCP for
+  `enum XtaskCommand|struct Config|enum PackageKind` under `tools/xtask/src`.
+- Read `START..END` only after MCP finds the relevant line range.
 
 GRUB Secure Boot debug environment:
 
@@ -66,9 +72,12 @@ KVM display boot loop:
 
 - `cargo xtask build`
 - `cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file`
-- `rg -n "error: no suitable video mode|boot framebuffer|bootfb|virtio-gpu|virtio register|DisplayUnavailable|uiserver|panic|scheduler invalid" logs/debugcon.log logs/qemu*.log`
+- Use ripgrep MCP on the relevant log file for
+  `error: no suitable video mode|boot framebuffer|bootfb|virtio-gpu|virtio register|DisplayUnavailable|uiserver|panic|scheduler invalid`.
 
-Use `rg --files` instead of recursive `ls` or broad `find` when searching many files.
+Use ripgrep MCP file listing instead of recursive `ls` or broad `find` when
+searching many files. If ripgrep MCP is unavailable, stop and report the MCP
+failure instead of using shell `rg`.
 
 Generated path exceptions:
 

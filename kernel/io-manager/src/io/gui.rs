@@ -52,6 +52,10 @@ impl GuiDisplayInfo {
     pub const fn is_primary_provider(self) -> bool {
         self.flags & DISPLAY_INFO_FLAG_PRIMARY_PROVIDER != 0
     }
+
+    pub const fn is_boot_framebuffer(self) -> bool {
+        self.flags & DISPLAY_INFO_FLAG_BOOT_FRAMEBUFFER != 0
+    }
 }
 
 pub fn init_console() {
@@ -155,10 +159,12 @@ pub unsafe extern "C" fn register_driver_framebuffer(
         return -22;
     }
 
-    if !backend::install_driver_framebuffer(
-        driver_framebuffer,
-        display_flags_from_driver_registration(framebuffer.flags),
-    ) {
+    let display_flags = display_flags_from_driver_registration(framebuffer.flags);
+    if boot_framebuffer_would_replace_primary(display_flags) {
+        return -16;
+    }
+
+    if !backend::install_driver_framebuffer(driver_framebuffer, display_flags) {
         return -22;
     }
     emergency_console_framebuffer_changed();
@@ -170,6 +176,21 @@ pub(crate) fn install_native_driver_framebuffer(framebuffer: FramebufferInfo) ->
         return false;
     }
     if !backend::install_driver_framebuffer(framebuffer, DISPLAY_INFO_FLAG_PRIMARY_PROVIDER) {
+        return false;
+    }
+    emergency_console_framebuffer_changed();
+    true
+}
+
+pub(crate) fn install_boot_framebuffer_fallback(framebuffer: FramebufferInfo) -> bool {
+    if framebuffer.validate().is_err() {
+        return false;
+    }
+    let flags = DISPLAY_INFO_FLAG_BOOT_FRAMEBUFFER | DISPLAY_INFO_FLAG_PRIMARY_PROVIDER;
+    if boot_framebuffer_would_replace_primary(flags) {
+        return false;
+    }
+    if !backend::install_driver_framebuffer(framebuffer, flags) {
         return false;
     }
     emergency_console_framebuffer_changed();
@@ -197,6 +218,15 @@ fn display_flags_from_driver_registration(registration_flags: u8) -> u32 {
         flags |= DISPLAY_INFO_FLAG_PRIMARY_PROVIDER;
     }
     flags
+}
+
+fn boot_framebuffer_would_replace_primary(flags: u32) -> bool {
+    let boot_primary = flags
+        & (DISPLAY_INFO_FLAG_BOOT_FRAMEBUFFER | DISPLAY_INFO_FLAG_PRIMARY_PROVIDER)
+        == (DISPLAY_INFO_FLAG_BOOT_FRAMEBUFFER | DISPLAY_INFO_FLAG_PRIMARY_PROVIDER);
+    boot_primary
+        && display_info()
+            .is_some_and(|info| info.is_primary_provider() && !info.is_boot_framebuffer())
 }
 
 pub fn present_userspace_frame_from_user_bgra8888(

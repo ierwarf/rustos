@@ -62,7 +62,6 @@ pub(crate) struct UsbInterfaceRegistration<'a> {
     pub(crate) manufacturer: Option<&'a str>,
     pub(crate) product: Option<&'a str>,
     pub(crate) serial: Option<&'a str>,
-    pub(crate) synthetic_hid_kind: Option<super::synthetic::SyntheticHidKind>,
 }
 
 #[derive(Clone, Copy)]
@@ -356,10 +355,6 @@ pub(crate) fn register_owned_interface(
         registration.interface_protocol,
     );
 
-    if let Some(kind) = registration.synthetic_hid_kind {
-        super::synthetic::register_device(device_ptr, interface_ptr, kind);
-    }
-
     bind_all_drivers_to_interface(interface_index);
     interface_ptr
 }
@@ -403,8 +398,6 @@ pub(crate) fn unregister_owned_interface(interface: *mut LinuxCompatUsbInterface
             }
         }
     }
-
-    super::synthetic::unregister_interface(interface);
 
     unsafe {
         (*interface).dev.driver = ptr::null_mut();

@@ -830,7 +830,7 @@ fn wait_for_reply_with_handle_limit(
                 }
                 match multitask::commit_block_current_task() {
                     Some(true) => multitask::yield_now(),
-                    Some(false) => {}
+                    Some(false) => multitask::yield_now(),
                     None => return Err(LINUX_EINVAL),
                 }
             }

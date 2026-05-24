@@ -22,21 +22,26 @@ path="$(printf '%s' "$INPUT" | jq -r '
   empty
 ' 2>/dev/null || true)"
 
-if [[ -z "$path" || ! -e "$path" ]]; then
+if [[ -z "$path" ]]; then
   printf '{"decision":"allow"}\n'
   exit 0
 fi
 
 # Hard-block extensions / directories regardless of size.
 case "$path" in
-  */logs/*.log|*/logs/*.txt|*.pcap|*.bin|*.iso|*.img|*/perf.data|*/target/*|*/build/*|*/vendor/*)
-    msg="Blocked: $path is in the do-not-inspect set (logs/target/build/vendor/binary). \
+  logs/*.log|logs/*.txt|*/logs/*.log|*/logs/*.txt|*.pcap|*.bin|*.iso|*.img|perf.data|*/perf.data|target/*|*/target/*|build/*|*/build/*|vendor/*|*/vendor/*|Cargo.lock|*/Cargo.lock)
+    msg="Blocked: $path is in the do-not-inspect set (logs/target/build/vendor/Cargo.lock/binary). \
 Use rg, tail -n, or sed -n line ranges instead. \
 See AGENTS.md > Do Not Inspect By Default."
     jq -n --arg m "$msg" '{decision:"block", message:$m}'
     exit 0
     ;;
 esac
+
+if [[ ! -e "$path" ]]; then
+  printf '{"decision":"allow"}\n'
+  exit 0
+fi
 
 # Size gate for everything else: 256KB soft limit.
 size=$(stat -c%s -- "$path" 2>/dev/null || echo 0)

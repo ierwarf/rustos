@@ -4,6 +4,7 @@ use crate::Result;
 use crate::build;
 use crate::config::{self as config_mod, Config};
 use crate::qemu;
+use crate::ring3_inventory;
 use crate::stage;
 use crate::testinfra;
 use std::path::PathBuf;
@@ -67,6 +68,8 @@ enum XtaskCommand {
     BuildConsoleDemo,
     #[command(name = "build-driver-modules")]
     BuildDriverModules,
+    #[command(name = "ring3-inventory")]
+    Ring3Inventory,
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -118,6 +121,7 @@ pub(crate) fn run() -> Result<()> {
         Some(XtaskCommand::BuildUser) => build::build_user(&config),
         Some(XtaskCommand::BuildConsoleDemo) => build::build_console_demo(&config),
         Some(XtaskCommand::BuildDriverModules) => build::build_driver_modules(&config),
+        Some(XtaskCommand::Ring3Inventory) => ring3_inventory::print_inventory(&config),
         Some(XtaskCommand::Config { command }) => match command {
             ConfigCommand::Check => config_mod::check(&config),
             ConfigCommand::Show => config_mod::show(&config),

@@ -563,27 +563,34 @@ impl<'a> SurfaceCanvas<'a> {
         let src_x = dst_rect.x.saturating_sub(dst_x);
         let src_y = dst_rect.y.saturating_sub(dst_y);
 
+        // Row-based access: take one slice per row so the inner loop only
+        // sees plain index iteration without per-pixel bounds checks. With
+        // ~470 k iterations per shadow blit this used to dominate the drag
+        // hot path.
         for row in 0..dst_rect.height {
-            let src_row = match (src_y + row).checked_mul(src_width) {
+            let src_row_start = match (src_y + row).checked_mul(src_width) {
                 Some(offset) => offset.saturating_add(src_x),
                 None => return,
             };
-            let dst_row = match (dst_rect.y + row).checked_mul(self.stride_pixels) {
+            let dst_row_start = match (dst_rect.y + row).checked_mul(self.stride_pixels) {
                 Some(offset) => offset.saturating_add(dst_rect.x),
                 None => return,
             };
-            for col in 0..dst_rect.width {
-                let src_index = src_row.saturating_add(col);
-                let dst_index = dst_row.saturating_add(col);
-                let Some(alpha_value) = alpha.get(src_index).copied() else {
-                    return;
-                };
+            let Some(src_row) =
+                alpha.get(src_row_start..src_row_start.saturating_add(dst_rect.width))
+            else {
+                return;
+            };
+            let Some(dst_row) = self
+                .pixels
+                .get_mut(dst_row_start..dst_row_start.saturating_add(dst_rect.width))
+            else {
+                return;
+            };
+            for (dst_pixel, &alpha_value) in dst_row.iter_mut().zip(src_row.iter()) {
                 if alpha_value == 0 {
                     continue;
                 }
-                let Some(dst_pixel) = self.pixels.get_mut(dst_index) else {
-                    return;
-                };
                 blend_pixel(dst_pixel, color, alpha_value);
             }
         }

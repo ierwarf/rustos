@@ -4,7 +4,6 @@ mod hid_translation;
 mod host;
 mod manager;
 mod runtime;
-mod synthetic;
 mod xhci;
 
 pub fn init() {
@@ -69,14 +68,6 @@ pub(crate) fn find_interface(
     minor: i32,
 ) -> *mut crate::driver::linux::compat::LinuxCompatUsbInterface {
     core::find_interface(driver, minor)
-}
-
-pub(crate) fn capture_keyboard_event(event: crate::input::keyboard::KeyboardEvent) -> bool {
-    emulation::capture_keyboard_event(event)
-}
-
-pub(crate) fn capture_pointer_packet(packet: driver_abi::PointerPacket) -> bool {
-    emulation::capture_pointer_packet(packet)
 }
 
 pub(crate) fn has_runtime_pointer_device() -> bool {

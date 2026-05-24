@@ -8,13 +8,64 @@ Read this first, then keep context small.
 - Use `docs/ai/task-router.md` to choose the smallest context set.
 - Use `docs/ai-map.md` or `docs/ai/repo-map.md` before broad source search.
 - Do not preload all docs, all manifests, or whole subsystems.
-- Prefer Serena MCP symbol tools, then `rg`, and exact `sed -n 'START,ENDp'` ranges over opening large files.
+- Prefer Serena MCP symbol tools, then ripgrep MCP, and exact focused reads over
+  opening large files.
 
 ## Tool usage
 
-When analyzing code structure, use Serena MCP symbol tools before broad text search.
-Use ripgrep only for raw text matches or when Serena lacks the needed index.
-If an MCP server is unavailable, say so explicitly.
+Use MCP servers proactively when they fit the task. For code structure, use
+Serena MCP symbol tools before broad text search. For raw text matches, use the
+ripgrep MCP server; keep matches scoped. Do not use shell `rg` as a fallback for
+normal repo exploration. For GitHub repo, PR, issue, or Actions work, use the
+GitHub MCP server/plugin first.
+If a required MCP server is unavailable, stop and report that MCP is unavailable
+instead of falling back to shell tools. Fix project MCP config only when the
+failure is clearly local to this repo and the user asked for MCP repair.
+
+Let project hooks run. Do not bypass hooks with `--no-verify`, `--no-gpg-sign`,
+or equivalent flags. If a hook blocks or reports a tool/config failure, treat
+that output as primary evidence and repair the hook or command path before
+continuing.
+
+## MCP Explorer Sub-Agent
+
+For repo exploration, the main agent may spawn a `gpt-5.4-mini` explorer
+sub-agent when it would avoid repeated search/read churn. Use
+`reasoning_effort = high` by default.
+
+Rules:
+
+- Use the mini agent only for read-only exploration.
+- Do not spawn the mini agent for trivial one-file lookups or when one direct
+  MCP call is enough.
+- Use multiple explorer sub-agents in parallel only when the questions are
+  independent and the results can reduce repeated search/read churn.
+- Do not use sub-agents for a single focused read or a single focused edit.
+- Use fan-out/fan-in: the main agent keeps the critical path local, sends only
+  independent sidecar work to sub-agents, then integrates evidence before
+  deciding or editing.
+- The mini agent must use MCP tools only:
+  - Serena MCP for symbols, declarations, references, and focused reads.
+  - ripgrep MCP for raw text search, file listing, and match counts.
+- The mini agent must not use shell `rg`, `grep`, broad `find`, or direct log
+  reads.
+- If required MCP is unavailable, the mini agent must stop and report MCP
+  failure.
+- The mini agent must not edit files, propose final fixes, or decide root
+  cause.
+- The mini agent must return a compact evidence packet only: relevant files and
+  line numbers, matching symbols/contracts, short summaries, and
+  confidence/uncertainty. Omit empty fields.
+- The main agent remains responsible for reasoning, edits, validation, and
+  final decisions.
+- Keep sub-agent use commercially bounded: pass only narrow task context, require
+  evidence paths, avoid secrets/signing material, stop on vague or MCP-failed
+  results, and review any worker changes before integration.
+- `reasoning_effort = medium` is allowed only for simple read-only location
+  tasks: file listing, exact symbol lookup, literal text search, and doc-policy
+  checks.
+- Do not use `gpt-5.4-mini` at `xhigh` or `low` for this repo's explorer
+  sub-agent.
 
 ## Do Not Inspect By Default
 

@@ -74,6 +74,48 @@ privilege substrate, not a policy owner.
 
 ## Move Next
 
+Batch exclusion note: xHCI and NVMe controller evacuation is intentionally not
+part of the current migration batch. Both paths are under `.ko` replacement
+evaluation; keep their ring0 controller code stable until the module strategy is
+chosen.
+
+## Commercial-Max Batch Prep
+
+Before a large ring0 policy deletion batch, run and preserve these five gates:
+
+1. Inventory: `cargo xtask ring3-inventory` is the source-of-truth snapshot for
+   remaining `RING3-MIGRATION-REFERENCE` marked LOC. Current snapshot:
+   `total_marked_loc=20542`, `excluded_xhci_nvme_loc=2910`,
+   `active_batch_marked_loc=17632`.
+2. Protocol mapping: every active lane must name the current service owner
+   (`inputd`, `sessiond`, `uiserver`, `storaged`, `netd`,
+   `loaderd`/`procd`, `syscalld`/`pagerd`, `rootd`/capability, `devmgrd`,
+   `vfsd`/`pagerd`) before deleting a marker.
+3. Acceptance gate: large chunks must pass `cargo xtask check`,
+   `cargo xtask build`, and the commercial-max QEMU signature:
+   `cargo xtask run --profile nvme --accel-profile kvm --usb-input
+   --debugcon file --commercial-max-ready -- --no-reboot`.
+4. Removal order: implement service-owned protocol/validator first, switch the
+   caller path second, delete or shrink the ring0 policy branch third, and only
+   then remove or update the migration marker.
+5. Runtime signature: QEMU acceptance requires rootd core readiness, loaderd
+   `initd` spawn, `devmgrd`, `inputd`, `sessiond`, Wayland, UI-ready,
+   `wayclick.desktop`, and `storaged` readiness markers.
+
+Large-batch order for the active 17632 marked LOC is:
+
+1. `inputd` service-shrink: `serio`, `i8042`, USB runtime/core HID policy
+   (`usb/synthetic.rs` was retired entirely after confirming it was dead code
+   post the capture-bridge removal).
+2. `uiserver`/display service-shrink: GUI/framebuffer/backend/terminal and
+   non-`.ko` virtio-gpu policy.
+3. `loaderd`/`procd` ABI-first: Linux image/process policy and proc broker
+   marker retirement.
+4. `rootd`/capability and IPC policy: service namespace/capability policy
+   behind rootd-visible descriptors, leaving kernel endpoint primitives.
+5. `storaged`, `netd`, `sessiond`, `syscalld` residual bridge cleanup after the
+   larger service-shrink paths stop depending on ring0 policy fallbacks.
+
 1. Device ioctl policy bypass:
    - Current source: `kernel/compat/src/user/syscall/linux/service_ops.rs`
      routes policy-sensitive Linux `ioctl` classes to `devmgrd`; the direct
@@ -140,20 +182,27 @@ privilege substrate, not a policy owner.
     primitives needed for compatibility.
 
 3. HID report parsing and synthetic HID policy:
-   - Current source: `kernel/io-manager/src/usb/runtime.rs`,
-     `kernel/io-manager/src/usb/synthetic.rs`, and
+   - Current source: `kernel/io-manager/src/usb/runtime.rs` and
      `kernel/io-manager/src/driver/input.rs` parse HID reports, keep keyboard
      and pointer state, and inject input events.
    - Completed (2026-05-20): HID usage/key translation, modifier masks, pointer
      button report conversion, and synthetic HID helper maps moved to
      `drivers/libs/input-evdev`; the kernel keeps only a thin re-export while
-     `runtime.rs`/`synthetic.rs` still own report parsing and state.
+     `runtime.rs` still owns report parsing and state.
    - Completed: the old ring0 capture bridge from PS/2/driver input into
      synthetic USB keyboard/pointer reports was removed. Normal app-visible
      input now flows through `inputd` ingress/read policy instead of a
      synthetic USB fallback path.
-   - Target: move HID layout parsing, synthetic keyboard/pointer state,
-     pointer coalescing policy, drop policy, and event translation to `inputd`.
+   - Completed: `kernel/io-manager/src/usb/synthetic.rs` was deleted in full
+     along with `emulation`/`core`/`runtime` plumbing (`synthetic_hid_kind`
+     enum, `register_device`/`unregister_interface`, `with_injection` re-entry
+     guard, `capture_keyboard_event`/`capture_pointer_packet` wrappers, and
+     `handles_device`/`owns_hid_device` predicates) after confirming the file
+     had no live device producers — xhci was the only registrar and always set
+     `synthetic_hid_kind: None`. The inputd-owned "synthetic HID device"
+     migration marker is retired.
+   - Target: move HID layout parsing, keyboard/pointer state, pointer
+     coalescing policy, drop policy, and event translation to `inputd`.
      Ring0 `.ko`/USB callbacks stay as the report source.
 
 4. Device namespace and metadata:
@@ -183,6 +232,11 @@ privilege substrate, not a policy owner.
      policy, ioctl authorization, device-map discovery, and device event
      subscription descriptors. The existing handle-transfer `DEVMGRD_IPC_OP_OPEN`
      ABI remains the path that installs real fds.
+   - Completed: console/session ioctl authorization is delegated from
+     `devmgrd` to the `IPC_SERVICE_SESSIOND` commercial-max protocol
+     (`runtimed` today). `devmgrd` still owns device-open policy and the final
+     gated ioctl broker call, while session graph, console route, and
+     foreground-focus policy are validated by the session owner.
 
 5. Driver bootstrap policy leftovers:
    - Current source: `kernel/io-manager/src/driver/mod.rs` still has
@@ -203,7 +257,10 @@ privilege substrate, not a policy owner.
     leases, IRQ routes, and DMA buffer descriptors. This is only the
     non-`.ko` service-driver control plane; Linux/RustOS `.ko` execution still
     stays ring0.
-  - Remaining target: keep boot-framebuffer as a last-resort primitive only.
+  - Completed: boot-framebuffer fallback stays a last-resort primitive. The
+    in-kernel fallback path preserves `DISPLAY_INFO_FLAG_BOOT_FRAMEBUFFER`,
+    refuses to replace an already-active non-boot primary provider, and remains
+    behind `driverd` provider-group policy.
 
 6. Storage selection and partition policy:
    - Current source: `kernel/io-manager/src/storage/block.rs` and
@@ -225,6 +282,9 @@ privilege substrate, not a policy owner.
      legacy compact `StoragedRequest/StoragedResponse` ABI remains live for
      current clients while commercial-max clients can use descriptor/capability
      responses.
+   - Completed: root-volume selection rank now lives in `storaged`; partition
+     descriptors beat whole-disk descriptors, writable candidates beat read-only
+     candidates, and descriptor id is only the final stable tie-breaker.
    - Remaining target: `storaged` owns inventory, partition policy, root
      selection, and mount candidate ordering after bootstrap. Kernel keeps block
      hardware drivers and the gated boot/block read broker for `vfsd` and early
@@ -246,8 +306,10 @@ privilege substrate, not a policy owner.
      fd-table planning, directory/file cursors, and metadata policy. The
      existing compact VFS IPC and Linux syscall-offload replies remain the live
      file-operation paths.
-   - Remaining target: shrink fixed service-spawn exceptions to `rootd` and
-     the foundational service allowlist only.
+   - Completed: fixed service-spawn exceptions are limited to the rootd-started
+     foundational service allowlist (`syscalld`, `vfsd`, `loaderd`, `procd`).
+     The initial `initd` launch goes through `loaderd` after rootd observes the
+     foundational endpoints.
 
 8. Service supervision and restart policy:
    - Current source: kernel spawn brokers can still directly spawn the fixed
@@ -260,14 +322,20 @@ privilege substrate, not a policy owner.
      bootstrap manifest, core-service lease, dependency graph, restart policy,
      and readiness-signal queries while keeping the legacy compact rootd IPC
      ABI for current clients.
-   - Attempted (2026-05-22, reverted): tried routing the initial `initd`
-     spawn through `LOADER_OP_SPAWN_EXEC` and shrinking
-     `can_bootstrap_spawn_direct` to {syscalld, vfsd, loaderd, procd}. Boot
-     hung after `rootd` issued `IPC_CALL` to loaderd for initd; reverted to
-     the direct kernel spawn for initd until the loaderd-served path is
-     instrumented enough to diagnose the stall (likely loaderd-side
-     PROC_COMMIT_BROKER capability gap or VFS readiness ordering — restart
-     path already works through loaderd, but cold first-spawn does not).
+   - Completed: initial `initd` spawn now uses `LOADER_OP_SPAWN_EXEC` after
+     `rootd` waits for `syscalld`, `vfsd`, `loaderd`, and `procd` service
+     endpoints. This removes the reverted cold-spawn path's VFS/readiness race
+     without adding a generic kernel spawn exception for initd.
+   - Completed: rootd now carries the bootstrap service manifest, dependency
+     mask, direct-spawn allowance, and restart-direct allowance in one
+     supervisor-owned table. The commercial-max dependency graph response
+     reports those manifest dependencies instead of deriving a fake linear
+     chain from lease order.
+   - Completed: rootd now accepts the generic commercial-max capability
+     protocol for service lease grant/revoke/renew descriptors. Kernel endpoint
+     registration still installs the privileged capability bits, but rootd owns
+     the advertised service-capability lease policy and supervisor-visible
+     capability state.
    - Target: keep reducing restart dependency policy into rootd lease protocol
      state and readiness/dependency manifests.
 
@@ -297,6 +365,10 @@ privilege substrate, not a policy owner.
      focus, and UI bootstrap status. Existing runtime socket clients remain
      unchanged while session-policy dependencies can resolve through the service
      endpoint registry.
+   - Completed: `sessiond`/`runtimed` now validates console/session ioctl
+     authorization requests forwarded by `devmgrd`; the kernel device broker
+     remains limited to current-process user-copy and final console/session
+     commits.
    - Target: keep boot console and panic output in ring0, but move normal
      session routing, device visibility, and user-facing console policy to
      `runtimed`, `uiserver`, `devmgrd`, or a dedicated session service.

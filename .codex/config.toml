@@ -58,7 +58,8 @@ statusMessage = "cargo xtask check"
 # All three servers are active. Binaries:
 #   ripgrep  — npx mcp-ripgrep (npm)
 #   serena   — uvx from serena-mcp (~/.local/bin/uvx via astral uv)
-#   github   — ~/.local/bin/github-mcp-server (github/github-mcp-server v1.0.5)
+#   github   — ~/.local/bin/github-mcp-server (github/github-mcp-server v1.0.5),
+#              with GITHUB_PERSONAL_ACCESS_TOKEN fallback from `gh auth token`
 # --------------------------------------------------------------------------
 
 [mcp_servers.ripgrep]
@@ -67,8 +68,8 @@ args = ["-y", "mcp-ripgrep"]
 
 [mcp_servers.serena]
 command = "uvx"
-args = ["--from", "serena-mcp", "serena"]
+args = ["--from", "serena-agent", "serena", "start-mcp-server"]
 
 [mcp_servers.github]
-command = "github-mcp-server"
-args = ["stdio"]
+command = "bash"
+args = ["-lc", "token=\"${GITHUB_PERSONAL_ACCESS_TOKEN:-}\"; if [ -z \"$token\" ] && command -v gh >/dev/null 2>&1; then token=\"$(gh auth token 2>/dev/null || true)\"; fi; export GITHUB_PERSONAL_ACCESS_TOKEN=\"$token\"; exec github-mcp-server stdio"]
