@@ -4,9 +4,7 @@
 extern crate alloc;
 
 use alloc::collections::BTreeMap;
-use alloc::format;
 use alloc::string::{String, ToString};
-use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
 use core::str;
@@ -14,47 +12,55 @@ use core::str;
 use rustos_svc_runtime::ipc;
 use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, DevmgrdIpcRequest,
-    DevmgrdIpcResponse, RustosBlockBrokerArgs, VfsIpcRequest, VfsIpcResponse,
-    BLOCK_BROKER_ABI_VERSION, BLOCK_BROKER_MAX_IO_BYTES, BLOCK_BROKER_OP_BOOT_INFO,
-    BLOCK_BROKER_OP_BOOT_READ, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
-    COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_VFSD,
-    COMMERCIAL_MAX_VFSD_OP_DIRECTORY_CURSOR, COMMERCIAL_MAX_VFSD_OP_FD_TABLE_PLAN,
-    COMMERCIAL_MAX_VFSD_OP_FILE_CURSOR, COMMERCIAL_MAX_VFSD_OP_METADATA_POLICY,
-    COMMERCIAL_MAX_VFSD_OP_MOUNT_GRAPH, COMMERCIAL_MAX_VFSD_OP_PATH_RESOLVE,
-    DEVMGRD_IPC_ABI_VERSION, DEVMGRD_IPC_OP_LOOKUP, DEVMGRD_IPC_OP_READDIR,
-    DEVMGRD_MAX_DIR_ENTRIES, DEVMGRD_NODE_KIND_DEVICE, DEVMGRD_NODE_KIND_DIR, IPC_MAX_INLINE_BYTES,
-    IPC_SERVICE_DEVMGRD, IPC_SERVICE_VFSD, LINUX_STATX_SIZE, LINUX_STAT_SIZE,
-    SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_ACCESS, SYSCALL_OFFLOAD_OP_LINUX_CHDIR,
-    SYSCALL_OFFLOAD_OP_LINUX_CLOSE, SYSCALL_OFFLOAD_OP_LINUX_DUP, SYSCALL_OFFLOAD_OP_LINUX_FCNTL,
-    SYSCALL_OFFLOAD_OP_LINUX_GETCWD, SYSCALL_OFFLOAD_OP_LINUX_GETDENTS64,
-    SYSCALL_OFFLOAD_OP_LINUX_MKDIR, SYSCALL_OFFLOAD_OP_LINUX_MOUNT,
-    SYSCALL_OFFLOAD_OP_LINUX_NEWFSTATAT, SYSCALL_OFFLOAD_OP_LINUX_OPENAT,
-    SYSCALL_OFFLOAD_OP_LINUX_READLINKAT, SYSCALL_OFFLOAD_OP_LINUX_STATX,
-    SYSCALL_OFFLOAD_OP_LINUX_UMOUNT2, SYSCALL_OFFLOAD_OP_LINUX_UNLINKAT,
-    SYSCALL_OFFLOAD_PATH_CAPACITY, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, SYS_RUSTOS_BLOCK_BROKER,
-    VFS_IPC_ABI_VERSION, VFS_IPC_HANDLE_KIND_DEVICE, VFS_IPC_HANDLE_KIND_DIR,
-    VFS_IPC_HANDLE_KIND_FILE, VFS_IPC_OP_ACCESS, VFS_IPC_OP_CHDIR, VFS_IPC_OP_CLOSE,
-    VFS_IPC_OP_DUP, VFS_IPC_OP_FCNTL, VFS_IPC_OP_FSTAT, VFS_IPC_OP_FTRUNCATE, VFS_IPC_OP_GETCWD,
-    VFS_IPC_OP_GETDENTS64, VFS_IPC_OP_LSEEK, VFS_IPC_OP_MKDIR, VFS_IPC_OP_MOUNT,
-    VFS_IPC_OP_NEWFSTATAT, VFS_IPC_OP_OPENAT, VFS_IPC_OP_PREAD64, VFS_IPC_OP_READ,
-    VFS_IPC_OP_READLINKAT, VFS_IPC_OP_STATX, VFS_IPC_OP_UMOUNT2, VFS_IPC_OP_UNLINKAT,
-    VFS_IPC_OP_WRITE, VFS_IPC_PATH_CAPACITY, VFS_IPC_PAYLOAD_CAPACITY,
-    VFS_IPC_REQUEST_PAYLOAD_CAPACITY,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, VfsIpcRequest, VfsIpcResponse,
+    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
+    COMMERCIAL_MAX_PROTOCOL_VFSD, COMMERCIAL_MAX_VFSD_OP_DIRECTORY_CURSOR,
+    COMMERCIAL_MAX_VFSD_OP_FD_TABLE_PLAN, COMMERCIAL_MAX_VFSD_OP_FILE_CURSOR,
+    COMMERCIAL_MAX_VFSD_OP_METADATA_POLICY, COMMERCIAL_MAX_VFSD_OP_MOUNT_GRAPH,
+    COMMERCIAL_MAX_VFSD_OP_PATH_RESOLVE, IPC_MAX_INLINE_BYTES, IPC_SERVICE_VFSD,
+    LINUX_STAT_SIZE, LINUX_STATX_SIZE, SYSCALL_OFFLOAD_OP_LINUX_ACCESS,
+    SYSCALL_OFFLOAD_OP_LINUX_CHDIR, SYSCALL_OFFLOAD_OP_LINUX_CLOSE, SYSCALL_OFFLOAD_OP_LINUX_DUP,
+    SYSCALL_OFFLOAD_OP_LINUX_FCNTL, SYSCALL_OFFLOAD_OP_LINUX_GETCWD,
+    SYSCALL_OFFLOAD_OP_LINUX_GETDENTS64, SYSCALL_OFFLOAD_OP_LINUX_MKDIR,
+    SYSCALL_OFFLOAD_OP_LINUX_MOUNT, SYSCALL_OFFLOAD_OP_LINUX_NEWFSTATAT,
+    SYSCALL_OFFLOAD_OP_LINUX_OPENAT, SYSCALL_OFFLOAD_OP_LINUX_READLINKAT,
+    SYSCALL_OFFLOAD_OP_LINUX_STATX, SYSCALL_OFFLOAD_OP_LINUX_UMOUNT2,
+    SYSCALL_OFFLOAD_OP_LINUX_UNLINKAT, VFS_IPC_OP_ACCESS, VFS_IPC_OP_CHDIR, VFS_IPC_OP_CLOSE,
+    VFS_IPC_OP_DUP, VFS_IPC_OP_FCNTL, VFS_IPC_OP_FSTAT, VFS_IPC_OP_FTRUNCATE,
+    VFS_IPC_OP_GETCWD, VFS_IPC_OP_GETDENTS64, VFS_IPC_OP_LSEEK, VFS_IPC_OP_MKDIR,
+    VFS_IPC_OP_MOUNT, VFS_IPC_OP_NEWFSTATAT, VFS_IPC_OP_OPENAT, VFS_IPC_OP_PREAD64,
+    VFS_IPC_OP_READ, VFS_IPC_OP_READLINKAT, VFS_IPC_OP_STATX, VFS_IPC_OP_UMOUNT2,
+    VFS_IPC_OP_UNLINKAT, VFS_IPC_OP_WRITE, VFS_IPC_PATH_CAPACITY, VFS_IPC_PAYLOAD_CAPACITY,
 };
-use storage_core::{BlockDevice, IoResult, StorageError};
 use storage_fat::{FatDirEntry, FatNodeKind, FatVolume};
 
+mod block;
+mod devmgrd;
+mod linux_types;
+mod util;
+
+use block::BootBlockDevice;
+use devmgrd::{devmgrd_dir_entries, devmgrd_lookup};
+use linux_types::{
+    LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, validate_linux_request,
+    validate_vfs_request,
+};
+use util::{
+    build_linux_stat, build_linux_statx, encode_dirent, handle_kind_u16, is_at_fdcwd,
+    linux_request_path, map_fat_error, mkdir_policy, normalize_absolute_path, path_inode,
+    read_unaligned, unlink_policy, vfs_request_path, write_payload_bytes, write_vfs_payload_bytes,
+};
+
 // Linux errno constants (x86_64)
-const ENOENT: i32 = 2;
-const EIO: i32 = 5;
-const EAGAIN: i32 = 11;
-const EBADF: i32 = 9;
-const ENODEV: i32 = 19;
-const ENOTDIR: i32 = 20;
-const EISDIR: i32 = 21;
-const EINVAL: i32 = 22;
-const EROFS: i32 = 30;
+pub(crate) const ENOENT: i32 = 2;
+pub(crate) const EIO: i32 = 5;
+pub(crate) const EAGAIN: i32 = 11;
+pub(crate) const EBADF: i32 = 9;
+pub(crate) const ENODEV: i32 = 19;
+pub(crate) const ENOTDIR: i32 = 20;
+pub(crate) const EISDIR: i32 = 21;
+pub(crate) const EINVAL: i32 = 22;
+pub(crate) const EROFS: i32 = 30;
 
 // Linux lseek whence constants
 const SEEK_SET: u64 = 0;
@@ -67,20 +73,20 @@ const O_TRUNC: u64 = 0o1000;
 const O_DIRECTORY: u64 = 0o200000;
 
 // AT_FDCWD as u64 (represents -100 in twos complement, or 0xFFFF_FFFF_FFFF_FF9C)
-const AT_FDCWD_U64: u64 = (-100_i64) as u64;
+pub(crate) const AT_FDCWD_U64: u64 = (-100_i64) as u64;
 // Also allow the truncated u32 form
-const AT_FDCWD_U32: u64 = 0xFFFF_FF9C;
+pub(crate) const AT_FDCWD_U32: u64 = 0xFFFF_FF9C;
 
-const DEFAULT_BLOCK_SIZE: u64 = 4096;
-const DT_REG: u8 = 8;
-const DT_DIR: u8 = 4;
-const DT_CHR: u8 = 2;
+pub(crate) const DEFAULT_BLOCK_SIZE: u64 = 4096;
+pub(crate) const DT_REG: u8 = 8;
+pub(crate) const DT_DIR: u8 = 4;
+pub(crate) const DT_CHR: u8 = 2;
 const S_IFREG: u32 = 0o100000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFCHR: u32 = 0o020000;
-const BOOT_FILE_MODE_BITS: u32 = S_IFREG | 0o444;
-const BOOT_DIRECTORY_MODE_BITS: u32 = S_IFDIR | 0o555;
-const DEVICE_FILE_MODE_BITS: u32 = S_IFCHR | 0o600;
+pub(crate) const BOOT_FILE_MODE_BITS: u32 = S_IFREG | 0o444;
+pub(crate) const BOOT_DIRECTORY_MODE_BITS: u32 = S_IFDIR | 0o555;
+pub(crate) const DEVICE_FILE_MODE_BITS: u32 = S_IFCHR | 0o600;
 
 rustos_svc_runtime::entry!(service_main);
 
@@ -196,17 +202,17 @@ struct RemoteHandle {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum RemoteKind {
+pub(crate) enum RemoteKind {
     File,
     Directory,
     Device,
 }
 
 #[derive(Clone, Copy)]
-struct Metadata {
-    kind: RemoteKind,
-    len: u64,
-    inode: u64,
+pub(crate) struct Metadata {
+    pub(crate) kind: RemoteKind,
+    pub(crate) len: u64,
+    pub(crate) inode: u64,
 }
 
 impl VfsState {
@@ -1112,13 +1118,13 @@ fn copy_label(label: &str, target: &mut [u8], len: &mut u16) {
 }
 
 #[derive(Clone)]
-struct DirEntry {
-    name: String,
-    kind: RemoteKind,
+pub(crate) struct DirEntry {
+    pub(crate) name: String,
+    pub(crate) kind: RemoteKind,
 }
 
 impl DirEntry {
-    fn new(name: &str, kind: RemoteKind) -> Self {
+    pub(crate) fn new(name: &str, kind: RemoteKind) -> Self {
         Self {
             name: name.to_string(),
             kind,
@@ -1136,518 +1142,8 @@ impl DirEntry {
     }
 }
 
-fn devmgrd_lookup(path: &str) -> Result<RemoteKind, i32> {
-    let mut request = devmgrd_request(DEVMGRD_IPC_OP_LOOKUP, path)?;
-    let response = call_devmgrd(&mut request)?;
-    devmgrd_kind_to_remote(response.kind)
-}
-
-fn devmgrd_dir_entries(path: &str) -> Result<Vec<DirEntry>, i32> {
-    let mut request = devmgrd_request(DEVMGRD_IPC_OP_READDIR, path)?;
-    let response = call_devmgrd(&mut request)?;
-    if response.entry_count as usize > DEVMGRD_MAX_DIR_ENTRIES {
-        return Err(EINVAL);
-    }
-    let mut entries = Vec::new();
-    for entry in response.entries.iter().take(response.entry_count as usize) {
-        let name_len = entry.name_len as usize;
-        if name_len == 0 || name_len > entry.name.len() {
-            return Err(EINVAL);
-        }
-        let name = str::from_utf8(&entry.name[..name_len]).map_err(|_| EINVAL)?;
-        entries.push(DirEntry::new(name, devmgrd_kind_to_remote(entry.kind)?));
-    }
-    Ok(entries)
-}
-
-fn devmgrd_request(op: u16, path: &str) -> Result<DevmgrdIpcRequest, i32> {
-    let bytes = path.as_bytes();
-    if bytes.is_empty() || bytes.len() > VFS_IPC_PATH_CAPACITY {
-        return Err(EINVAL);
-    }
-    let mut request = DevmgrdIpcRequest {
-        op,
-        path_len: bytes.len() as u32,
-        ..DevmgrdIpcRequest::default()
-    };
-    request.path[..bytes.len()].copy_from_slice(bytes);
-    Ok(request)
-}
-
-fn call_devmgrd(request: &mut DevmgrdIpcRequest) -> Result<DevmgrdIpcResponse, i32> {
-    let endpoint = ipc::lookup_service_endpoint(IPC_SERVICE_DEVMGRD);
-    if endpoint < 0 {
-        return Err(ENODEV);
-    }
-    let mut response = DevmgrdIpcResponse::default();
-    let received = unsafe {
-        ipc::call(
-            endpoint as u64,
-            (request as *const DevmgrdIpcRequest).cast::<u8>(),
-            size_of::<DevmgrdIpcRequest>(),
-            (&mut response as *mut DevmgrdIpcResponse).cast::<u8>(),
-            size_of::<DevmgrdIpcResponse>(),
-        )
-    };
-    if received < 0 {
-        return Err(ENODEV);
-    }
-    if received as usize != size_of::<DevmgrdIpcResponse>()
-        || response.version != DEVMGRD_IPC_ABI_VERSION
-        || response.op != request.op
-        || response.reserved0 != 0
-    {
-        return Err(EINVAL);
-    }
-    if response.status != 0 {
-        return Err(response.status.unsigned_abs() as i32);
-    }
-    Ok(response)
-}
-
-fn devmgrd_kind_to_remote(kind: u16) -> Result<RemoteKind, i32> {
-    match kind {
-        DEVMGRD_NODE_KIND_DIR => Ok(RemoteKind::Directory),
-        DEVMGRD_NODE_KIND_DEVICE => Ok(RemoteKind::Device),
-        _ => Err(EINVAL),
-    }
-}
-
 fn is_input_device_node(path: &str) -> bool {
     matches!(path, "/dev/input0" | "/dev/input/event0")
-}
-
-struct BootBlockDevice {
-    block_size: usize,
-    block_count: u64,
-}
-
-impl BootBlockDevice {
-    fn open() -> Result<Self, i32> {
-        let mut block_size = 0_u64;
-        let mut block_count = 0_u64;
-        let args = RustosBlockBrokerArgs {
-            abi_version: BLOCK_BROKER_ABI_VERSION,
-            op: BLOCK_BROKER_OP_BOOT_INFO,
-            out_logical_block_size_ptr: (&mut block_size as *mut u64) as u64,
-            out_block_count_ptr: (&mut block_count as *mut u64) as u64,
-            ..RustosBlockBrokerArgs::default()
-        };
-        let status = unsafe {
-            rustos_svc_runtime::syscall::syscall1(
-                SYS_RUSTOS_BLOCK_BROKER,
-                (&args as *const RustosBlockBrokerArgs) as u64,
-            )
-        };
-        if status < 0 {
-            return Err((-status) as i32);
-        }
-        let block_size = usize::try_from(block_size).map_err(|_| EINVAL)?;
-        if block_size < 512 || block_count == 0 {
-            return Err(EINVAL);
-        }
-        Ok(Self {
-            block_size,
-            block_count,
-        })
-    }
-}
-
-impl BlockDevice for BootBlockDevice {
-    fn logical_block_size(&self) -> usize {
-        self.block_size
-    }
-
-    fn block_count(&self) -> u64 {
-        self.block_count
-    }
-
-    fn read_blocks(&mut self, lba: u64, out: &mut [u8]) -> IoResult<()> {
-        if self.block_size == 0
-            || out.len() % self.block_size != 0
-            || BLOCK_BROKER_MAX_IO_BYTES < self.block_size
-        {
-            return Err(StorageError::InvalidInput);
-        }
-        let max_blocks = (BLOCK_BROKER_MAX_IO_BYTES / self.block_size) as u64;
-        let mut done = 0usize;
-        while done < out.len() {
-            let remaining_blocks = ((out.len() - done) / self.block_size) as u64;
-            let block_count = remaining_blocks.min(max_blocks);
-            let byte_len = block_count as usize * self.block_size;
-            let args = RustosBlockBrokerArgs {
-                abi_version: BLOCK_BROKER_ABI_VERSION,
-                op: BLOCK_BROKER_OP_BOOT_READ,
-                lba: lba + (done / self.block_size) as u64,
-                block_count,
-                buffer_ptr: out[done..done + byte_len].as_mut_ptr() as u64,
-                buffer_len: byte_len as u64,
-                ..RustosBlockBrokerArgs::default()
-            };
-            let status = unsafe {
-                rustos_svc_runtime::syscall::syscall1(
-                    SYS_RUSTOS_BLOCK_BROKER,
-                    (&args as *const RustosBlockBrokerArgs) as u64,
-                )
-            };
-            if status < 0 {
-                return Err(StorageError::DeviceFault);
-            }
-            done += byte_len;
-        }
-        Ok(())
-    }
-
-    fn write_blocks(&mut self, _lba: u64, _input: &[u8]) -> IoResult<()> {
-        Err(StorageError::Unsupported)
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct LinuxTimespec {
-    tv_sec: i64,
-    tv_nsec: i64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct LinuxStat {
-    st_dev: u64,
-    st_ino: u64,
-    st_nlink: u64,
-    st_mode: u32,
-    st_uid: u32,
-    st_gid: u32,
-    __pad0: u32,
-    st_rdev: u64,
-    st_size: i64,
-    st_blksize: i64,
-    st_blocks: i64,
-    st_atim: LinuxTimespec,
-    st_mtim: LinuxTimespec,
-    st_ctim: LinuxTimespec,
-    __glibc_reserved: [i64; 3],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct LinuxStatxTimestamp {
-    tv_sec: i64,
-    tv_nsec: u32,
-    __reserved: i32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct LinuxStatx {
-    stx_mask: u32,
-    stx_blksize: u32,
-    stx_attributes: u64,
-    stx_nlink: u32,
-    stx_uid: u32,
-    stx_gid: u32,
-    stx_mode: u16,
-    __spare0: [u16; 1],
-    stx_ino: u64,
-    stx_size: u64,
-    stx_blocks: u64,
-    stx_attributes_mask: u64,
-    stx_atime: LinuxStatxTimestamp,
-    stx_btime: LinuxStatxTimestamp,
-    stx_ctime: LinuxStatxTimestamp,
-    stx_mtime: LinuxStatxTimestamp,
-    stx_rdev_major: u32,
-    stx_rdev_minor: u32,
-    stx_dev_major: u32,
-    stx_dev_minor: u32,
-    stx_mnt_id: u64,
-    stx_dio_mem_align: u32,
-    stx_dio_offset_align: u32,
-    __spare3: [u64; 12],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct LinuxSyscallOffloadRequest {
-    version: u16,
-    op: u16,
-    reserved0: u32,
-    pid: u64,
-    tid: u64,
-    parent_pid: u64,
-    session_handle: u64,
-    uid: u32,
-    gid: u32,
-    euid: u32,
-    egid: u32,
-    dirfd: u64,
-    flags: u64,
-    arg0: u64,
-    arg1: u64,
-    arg2: u64,
-    arg3: u64,
-    mask: u32,
-    path_len: u32,
-    path: [u8; SYSCALL_OFFLOAD_PATH_CAPACITY],
-}
-
-impl Default for LinuxSyscallOffloadRequest {
-    fn default() -> Self {
-        Self {
-            version: SYSCALL_OFFLOAD_ABI_VERSION,
-            op: SYSCALL_OFFLOAD_OP_LINUX_STATX,
-            reserved0: 0,
-            pid: 0,
-            tid: 0,
-            parent_pid: 0,
-            session_handle: 0,
-            uid: 0,
-            gid: 0,
-            euid: 0,
-            egid: 0,
-            dirfd: 0,
-            flags: 0,
-            arg0: 0,
-            arg1: 0,
-            arg2: 0,
-            arg3: 0,
-            mask: 0,
-            path_len: 0,
-            path: [0; SYSCALL_OFFLOAD_PATH_CAPACITY],
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct LinuxSyscallOffloadResponse {
-    version: u16,
-    op: u16,
-    status: i32,
-    payload_len: u32,
-    reserved0: u32,
-    payload: [u8; SYSCALL_OFFLOAD_PAYLOAD_CAPACITY],
-}
-
-impl Default for LinuxSyscallOffloadResponse {
-    fn default() -> Self {
-        Self {
-            version: SYSCALL_OFFLOAD_ABI_VERSION,
-            op: SYSCALL_OFFLOAD_OP_LINUX_STATX,
-            status: 0,
-            payload_len: 0,
-            reserved0: 0,
-            payload: [0; SYSCALL_OFFLOAD_PAYLOAD_CAPACITY],
-        }
-    }
-}
-
-fn validate_linux_request(request: &LinuxSyscallOffloadRequest) -> Result<(), i32> {
-    if request.version != SYSCALL_OFFLOAD_ABI_VERSION
-        || request.reserved0 != 0
-        || request.path_len as usize > SYSCALL_OFFLOAD_PATH_CAPACITY
-    {
-        return Err(EINVAL);
-    }
-    Ok(())
-}
-
-fn validate_vfs_request(request: &VfsIpcRequest) -> Result<(), i32> {
-    if request.version != VFS_IPC_ABI_VERSION
-        || request.path_len as usize > VFS_IPC_PATH_CAPACITY
-        || request.payload_len as usize > VFS_IPC_REQUEST_PAYLOAD_CAPACITY
-    {
-        return Err(EINVAL);
-    }
-    Ok(())
-}
-
-fn linux_request_path(request: &LinuxSyscallOffloadRequest) -> Option<&str> {
-    let len = request.path_len as usize;
-    if len > request.path.len() {
-        return None;
-    }
-    core::str::from_utf8(&request.path[..len]).ok()
-}
-
-fn vfs_request_path(request: &VfsIpcRequest) -> Option<&str> {
-    let len = request.path_len as usize;
-    if len > request.path.len() {
-        return None;
-    }
-    core::str::from_utf8(&request.path[..len]).ok()
-}
-
-fn mkdir_policy(path: &str, euid: u32) -> i32 {
-    let run_user_path = format!("/run/user/{euid}");
-    if path == "/run" || path == "/run/user" || path == run_user_path.as_str() {
-        0
-    } else {
-        EROFS
-    }
-}
-
-fn unlink_policy(path: &str) -> i32 {
-    if path.starts_with("/run/") {
-        ENOENT
-    } else {
-        EROFS
-    }
-}
-
-fn normalize_absolute_path(base_path: &str, path: &str) -> Result<String, i32> {
-    let mut components: Vec<&str> = Vec::new();
-    if !path.starts_with('/') {
-        for component in base_path.split('/') {
-            if !component.is_empty() {
-                components.push(component);
-            }
-        }
-    }
-    for component in path.split('/') {
-        if component.is_empty() || component == "." {
-            continue;
-        }
-        if component == ".." {
-            components.pop();
-            continue;
-        }
-        components.push(component);
-    }
-    let mut normalized = String::from("/");
-    for component in components {
-        if normalized.len() > 1 {
-            normalized.push('/');
-        }
-        normalized.push_str(component);
-    }
-    if normalized.len() > VFS_IPC_PATH_CAPACITY {
-        return Err(EINVAL);
-    }
-    Ok(normalized)
-}
-
-fn is_at_fdcwd(dirfd: u64) -> bool {
-    dirfd == AT_FDCWD_U64 || dirfd == AT_FDCWD_U32
-}
-
-fn map_fat_error(err: storage_fat::FatError) -> i32 {
-    match err {
-        fatfs::Error::NotFound => ENOENT,
-        fatfs::Error::InvalidInput => EINVAL,
-        fatfs::Error::Io(StorageError::NotPresent) => ENODEV,
-        fatfs::Error::Io(StorageError::InvalidInput) => EINVAL,
-        fatfs::Error::Io(_) => EIO,
-        _ => EIO,
-    }
-}
-
-fn handle_kind_u16(kind: RemoteKind) -> u16 {
-    match kind {
-        RemoteKind::File => VFS_IPC_HANDLE_KIND_FILE,
-        RemoteKind::Directory => VFS_IPC_HANDLE_KIND_DIR,
-        RemoteKind::Device => VFS_IPC_HANDLE_KIND_DEVICE,
-    }
-}
-
-fn build_linux_stat(metadata: Metadata) -> [u8; LINUX_STAT_SIZE] {
-    let stat = LinuxStat {
-        st_ino: metadata.inode.max(1),
-        st_nlink: if metadata.kind == RemoteKind::Directory {
-            2
-        } else {
-            1
-        },
-        st_mode: mode_bits(metadata.kind),
-        st_size: metadata.len.min(i64::MAX as u64) as i64,
-        st_blksize: DEFAULT_BLOCK_SIZE as i64,
-        st_blocks: metadata.len.div_ceil(512).min(i64::MAX as u64) as i64,
-        ..LinuxStat::default()
-    };
-    let mut bytes = [0_u8; LINUX_STAT_SIZE];
-    bytes.copy_from_slice(as_bytes(&stat));
-    bytes
-}
-
-fn build_linux_statx(metadata: Metadata) -> [u8; LINUX_STATX_SIZE] {
-    let statx = LinuxStatx {
-        stx_mask: 0x7ff,
-        stx_blksize: DEFAULT_BLOCK_SIZE as u32,
-        stx_nlink: if metadata.kind == RemoteKind::Directory {
-            2
-        } else {
-            1
-        },
-        stx_mode: mode_bits(metadata.kind) as u16,
-        stx_ino: metadata.inode.max(1),
-        stx_size: metadata.len,
-        stx_blocks: metadata.len.div_ceil(512),
-        ..LinuxStatx::default()
-    };
-    let mut bytes = [0_u8; LINUX_STATX_SIZE];
-    bytes.copy_from_slice(as_bytes(&statx));
-    bytes
-}
-
-fn mode_bits(kind: RemoteKind) -> u32 {
-    match kind {
-        RemoteKind::File => BOOT_FILE_MODE_BITS,
-        RemoteKind::Directory => BOOT_DIRECTORY_MODE_BITS,
-        RemoteKind::Device => DEVICE_FILE_MODE_BITS,
-    }
-}
-
-fn write_payload_bytes(response: &mut LinuxSyscallOffloadResponse, bytes: &[u8]) {
-    let len = bytes.len().min(response.payload.len());
-    response.payload[..len].copy_from_slice(&bytes[..len]);
-    response.payload_len = len as u32;
-}
-
-fn write_vfs_payload_bytes(response: &mut VfsIpcResponse, bytes: &[u8]) {
-    let len = bytes.len().min(response.payload.len());
-    response.payload[..len].copy_from_slice(&bytes[..len]);
-    response.payload_len = len as u32;
-    response.value = len as u64;
-}
-
-fn encode_dirent(entry: &DirEntry, next_offset: usize) -> Vec<u8> {
-    let base_len = 19 + entry.name.len() + 1;
-    let record_len = (base_len + 7) & !7;
-    let mut bytes = vec![0_u8; record_len];
-    bytes[..8].copy_from_slice(&path_inode(entry.name.as_bytes()).to_le_bytes());
-    bytes[8..16].copy_from_slice(&(next_offset as i64).to_le_bytes());
-    bytes[16..18].copy_from_slice(&(record_len as u16).to_le_bytes());
-    bytes[18] = match entry.kind {
-        RemoteKind::File => DT_REG,
-        RemoteKind::Directory => DT_DIR,
-        RemoteKind::Device => DT_CHR,
-    };
-    bytes[19..19 + entry.name.len()].copy_from_slice(entry.name.as_bytes());
-    bytes[19 + entry.name.len()] = 0;
-    bytes
-}
-
-fn path_inode(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x1000_0000_01b3);
-    }
-    hash.max(1)
-}
-
-fn read_unaligned<T: Copy + Default>(bytes: &[u8]) -> T {
-    let mut value = T::default();
-    let dest = unsafe {
-        core::slice::from_raw_parts_mut((&mut value as *mut T).cast::<u8>(), size_of::<T>())
-    };
-    dest.copy_from_slice(&bytes[..size_of::<T>()]);
-    value
-}
-
-fn as_bytes<T>(value: &T) -> &[u8] {
-    unsafe { core::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
 }
 
 #[cfg(test)]
