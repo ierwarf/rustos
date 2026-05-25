@@ -1,3 +1,6 @@
+// RING3-MIGRATION-COMMENTED-OUT START: Win32 ABI constants belong in the
+// Windows ABI user service.
+/*
 pub(super) const HANDLE_STDIN: u64 = 0x1000_0001;
 pub(super) const HANDLE_STDOUT: u64 = 0x1000_0002;
 pub(super) const HANDLE_STDERR: u64 = 0x1000_0003;
@@ -44,3 +47,6 @@ pub(super) struct MemoryBasicInformation {
     pub(super) protect: u32,
     pub(super) type_: u32,
 }
+
+*/
+// RING3-MIGRATION-COMMENTED-OUT END

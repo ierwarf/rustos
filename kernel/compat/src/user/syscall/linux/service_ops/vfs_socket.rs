@@ -1,5 +1,9 @@
 use super::*;
 
+// RING3-MIGRATION-COMMENTED-OUT START: vfsd/netd should own the Linux VFS +
+// socket service layer (open/close/read/write/pread/pwrite/iovec/socket I/O).
+// Ring0 keeps only the handle table and IPC substrate.
+/*
 const MAX_SOCKET_IO_BYTES: usize = 64 * 1024;
 const MAX_IOVEC_COUNT: usize = 16;
 
@@ -948,3 +952,6 @@ pub fn is_linux_error(result: u64) -> bool {
     let signed = result as i64;
     (-4095..0).contains(&signed)
 }
+
+*/
+// RING3-MIGRATION-COMMENTED-OUT END

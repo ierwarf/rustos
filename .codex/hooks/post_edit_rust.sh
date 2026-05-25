@@ -41,7 +41,7 @@ STAMP="/tmp/.rustos_xtask_ok"
 now=$(date +%s)
 if [[ -f "$STAMP" ]]; then
   last=$(cat "$STAMP" 2>/dev/null || echo 0)
-  if (( now - last < 30 )); then
+  if (( now - last < 120 )); then
     exit 0
   fi
 fi

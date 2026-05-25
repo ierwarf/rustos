@@ -1,6 +1,3 @@
-// RING3-MIGRATION-REFERENCE START: commercial-max usbdrv/devmgrd should own USB device
-// descriptors, enumeration state, class routing, and device metadata once user-mode USB
-// driver services exist. Ring0 keeps controller grants and compatibility callback substrate.
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ffi::c_void;
@@ -474,6 +471,10 @@ pub(crate) fn find_interface(
     ptr::null_mut()
 }
 
+// RING3-MIGRATION-COMMENTED-OUT START: devmgrd/inputd should own USB interface
+// class routing and driver-match policy. Ring0 keeps Linux .ko callback
+// invocation and compat object lifetime as substrate.
+/*
 fn bind_all_drivers_to_interface(interface_index: usize) {
     let drivers = USB_DRIVERS.lock().clone();
     for (driver_index, driver) in drivers.iter().enumerate() {
@@ -613,10 +614,11 @@ fn id_matches(interface: &RegisteredUsbInterface, id: &LinuxCompatUsbDeviceId) -
     }
     true
 }
+*/
+// RING3-MIGRATION-COMMENTED-OUT END
 
 fn c_string_bytes(value: &str) -> Box<[u8]> {
     let mut bytes = value.as_bytes().to_vec();
     bytes.push(0);
     bytes.into_boxed_slice()
 }
-// RING3-MIGRATION-REFERENCE END: commercial-max usbdrv/devmgrd-owned USB core policy.

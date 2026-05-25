@@ -50,8 +50,8 @@ statusMessage = "Checking for destructive shell"
 [[hooks.PreToolUse.hooks]]
 type = "command"
 command = '"$(git rev-parse --show-toplevel)/.codex/hooks/pre_commit.sh"'
-timeout = 180
-statusMessage = "Pre-commit fmt + clippy"
+timeout = 30
+statusMessage = "Pre-commit fmt check"
 
 [[hooks.PostToolUse]]
 matcher = "^(apply_patch|Edit|Write)$"

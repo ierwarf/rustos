@@ -9,15 +9,18 @@ use std::time::Duration;
 use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, InputHidKeyboardReportWire,
-    InputHidPointerReportWire, InputIngestBrokerArgs, InputIngressWire, InputKeyboardEventWire,
-    InputPointerAbsoluteWire, InputPointerPacketWire, InputStatsBrokerArgs, InputStatsWire,
-    InputdIpcRequest, InputdIpcResponse, InputdReadResponse, COMMERCIAL_MAX_INPUTD_OP_DROP_POLICY,
-    COMMERCIAL_MAX_INPUTD_OP_EVDEV_TRANSLATE, COMMERCIAL_MAX_INPUTD_OP_I8042_COMMAND_POLICY,
+    InputHidPointerReportWire, InputHidPolicyWire, InputIngestBrokerArgs, InputIngressWire,
+    InputKeyboardEventWire, InputPointerAbsoluteWire, InputPointerPacketWire, InputStatsBrokerArgs,
+    InputStatsWire, InputdIpcRequest, InputdIpcResponse, InputdReadResponse,
+    COMMERCIAL_MAX_INPUTD_OP_DROP_POLICY, COMMERCIAL_MAX_INPUTD_OP_EVDEV_TRANSLATE,
+    COMMERCIAL_MAX_INPUTD_OP_HID_REPORT_POLICY, COMMERCIAL_MAX_INPUTD_OP_I8042_COMMAND_POLICY,
     COMMERCIAL_MAX_INPUTD_OP_INPUT_INGEST, COMMERCIAL_MAX_INPUTD_OP_INPUT_READER,
     COMMERCIAL_MAX_INPUTD_OP_INPUT_STATS, COMMERCIAL_MAX_INPUTD_OP_LAYOUT_POLICY,
     COMMERCIAL_MAX_INPUTD_OP_PS2_PACKET_POLICY, COMMERCIAL_MAX_INPUTD_OP_SERIO_BUS_POLICY,
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_INPUTD, INPUTD_ACCESS_EVDEV,
-    INPUTD_ACCESS_NATIVE, INPUTD_INGEST_MAX_EVENTS, INPUTD_INGRESS_KIND_EVENT,
+    INPUTD_ACCESS_NATIVE, INPUTD_HID_POLICY_DESCRIPTOR_CAPACITY, INPUTD_HID_POLICY_KIND_KEYBOARD,
+    INPUTD_HID_POLICY_KIND_POINTER, INPUTD_HID_POLICY_KIND_UNKNOWN,
+    INPUTD_HID_POLICY_REPORT_CAPACITY, INPUTD_INGEST_MAX_EVENTS, INPUTD_INGRESS_KIND_EVENT,
     INPUTD_INGRESS_KIND_HID_KEYBOARD_REPORT, INPUTD_INGRESS_KIND_HID_POINTER_REPORT,
     INPUTD_INGRESS_KIND_KEYBOARD, INPUTD_INGRESS_KIND_POINTER_ABSOLUTE,
     INPUTD_INGRESS_KIND_POINTER_PACKET, INPUTD_IPC_ABI_VERSION, INPUTD_IPC_OP_AUTHORIZE_READ,
@@ -782,6 +785,10 @@ fn dispatch_commercial_request(
             response.capability = input_capability("ps2-packet", request.header.op);
             Ok(())
         }
+        COMMERCIAL_MAX_INPUTD_OP_HID_REPORT_POLICY => {
+            fill_hid_report_policy(request, response);
+            Ok(())
+        }
         _ => Err(libc::EINVAL),
     }
 }
@@ -804,9 +811,48 @@ fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result
         | COMMERCIAL_MAX_INPUTD_OP_INPUT_STATS
         | COMMERCIAL_MAX_INPUTD_OP_SERIO_BUS_POLICY
         | COMMERCIAL_MAX_INPUTD_OP_I8042_COMMAND_POLICY
-        | COMMERCIAL_MAX_INPUTD_OP_PS2_PACKET_POLICY => Ok(()),
+        | COMMERCIAL_MAX_INPUTD_OP_PS2_PACKET_POLICY
+        | COMMERCIAL_MAX_INPUTD_OP_HID_REPORT_POLICY => Ok(()),
         _ => Err(libc::EINVAL),
     }
+}
+
+fn fill_hid_report_policy(
+    request: &CommercialMaxProtocolRequest,
+    response: &mut CommercialMaxProtocolResponse,
+) {
+    let payload_len = (request.payload_len as usize).min(request.payload.len());
+    let requested_report_len = (request.arg2 as usize).min(INPUTD_HID_POLICY_REPORT_CAPACITY);
+    let report_len = requested_report_len.min(payload_len);
+    let descriptor_available = payload_len.saturating_sub(report_len);
+    let descriptor_len = (request.arg3 as usize)
+        .min(INPUTD_HID_POLICY_DESCRIPTOR_CAPACITY)
+        .min(descriptor_available);
+    let kind = match request.arg1 as u16 {
+        INPUTD_HID_POLICY_KIND_KEYBOARD => INPUTD_HID_POLICY_KIND_KEYBOARD,
+        INPUTD_HID_POLICY_KIND_POINTER => INPUTD_HID_POLICY_KIND_POINTER,
+        _ => INPUTD_HID_POLICY_KIND_UNKNOWN,
+    };
+    let mut policy = InputHidPolicyWire {
+        source_id: request.arg0,
+        kind,
+        report_len: report_len as u16,
+        descriptor_len: descriptor_len as u16,
+        required_bytes: report_len as u16,
+        ..InputHidPolicyWire::default()
+    };
+    policy.report[..report_len].copy_from_slice(&request.payload[..report_len]);
+    let descriptor_start = report_len;
+    let descriptor_end = descriptor_start + descriptor_len;
+    policy.descriptor_prefix[..descriptor_len]
+        .copy_from_slice(&request.payload[descriptor_start..descriptor_end]);
+
+    response.value0 = policy.report_len as u64;
+    response.value1 = policy.descriptor_len as u64;
+    response.descriptor_count = 1;
+    response.descriptors[0] = input_descriptor("hid-report-policy", request.header.op);
+    response.capability = input_capability("hid-report", request.header.op);
+    response.payload_len = write_payload_struct(&policy, &mut response.payload);
 }
 
 fn write_stats_payload(
@@ -886,6 +932,7 @@ fn input_capability_mask(op: u16) -> u64 {
         COMMERCIAL_MAX_INPUTD_OP_SERIO_BUS_POLICY => 1 << 6,
         COMMERCIAL_MAX_INPUTD_OP_I8042_COMMAND_POLICY => 1 << 7,
         COMMERCIAL_MAX_INPUTD_OP_PS2_PACKET_POLICY => 1 << 8,
+        COMMERCIAL_MAX_INPUTD_OP_HID_REPORT_POLICY => 1 << 9,
         _ => 0,
     }
 }

@@ -4,9 +4,6 @@ use x86_64::VirtAddr;
 
 use crate::memory::PageTableFlags;
 
-// RING3-MIGRATION-REFERENCE START: commercial-max syscalld/pager should own mmap/brk/mremap
-// compatibility policy, default flags, accounting, and cold Linux ABI validation. Ring0
-// keeps only address-space mutation and user-visible commit primitives.
 use super::*;
 
 const PAGE_SIZE: u64 = 4096;
@@ -450,4 +447,3 @@ fn checked_align_up(value: u64, align: u64) -> Option<u64> {
     let mask = align.checked_sub(1)?;
     Some(value.checked_add(mask)? & !mask)
 }
-// RING3-MIGRATION-REFERENCE END: commercial-max syscalld/pager-owned Linux memory policy.

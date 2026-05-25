@@ -1,5 +1,9 @@
 use super::*;
 
+// RING3-MIGRATION-COMMENTED-OUT START: vfsd should own VFS metadata syscalls
+// (lseek/fstat/ftruncate/getdents64/fcntl) and the current-handle accessors.
+// Ring0 keeps only the handle-table substrate.
+/*
 pub fn syscall_linux_vfs_lseek(fd: u64, offset: i64, whence: u64) -> u64 {
     if let Some(mut file) = current_vfs_file_handle(fd) {
         let whence = match whence {
@@ -721,3 +725,6 @@ pub fn syscall_linux_net6(
         Err(errno) => linux_errno(errno),
     }
 }
+
+*/
+// RING3-MIGRATION-COMMENTED-OUT END

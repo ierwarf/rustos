@@ -1,6 +1,3 @@
-// RING3-MIGRATION-REFERENCE START: commercial-max netd should own socket state machines,
-// socket namespace policy, peer/bind/listen state, and option defaults. Ring0 keeps only
-// raw wake/copy primitives and kernel socket handles required for current-process commits.
 use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -15,6 +12,10 @@ use crate::user::handles::KernelHandle;
 use crate::user::linux as linux_abi;
 use kernel_object::api::handle::HandleRights;
 
+// RING3-MIGRATION-COMMENTED-OUT START: netd should own the Linux Unix-domain
+// + Inet socket implementation (binding registry, listen/accept queues, byte
+// buffers, credentials). Ring0 keeps only the handle table substrate.
+/*
 const MAX_LISTEN_BACKLOG: usize = 128;
 const SOCKET_BUFFER_CAPACITY: usize = 1024 * 1024;
 const UNIX_PRIVATE_SOCKET_MODE: u32 = 0o600;
@@ -1078,4 +1079,6 @@ mod tests {
         assert!(listener.bound_path().is_none());
     }
 }
-// RING3-MIGRATION-REFERENCE END: commercial-max netd-owned socket state.
+
+*/
+// RING3-MIGRATION-COMMENTED-OUT END

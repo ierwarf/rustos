@@ -7,6 +7,9 @@ use crate::vfs;
 
 use super::file;
 
+// RING3-MIGRATION-COMMENTED-OUT START: vfsd should own Linux stat / KernelStat
+// construction from VFS metadata. Ring0 keeps only raw VFS metadata access.
+/*
 const DEFAULT_BLOCK_SIZE: u64 = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -208,3 +211,6 @@ fn map_vfs_error_to_stat(err: vfs::VfsError) -> StatLookupError {
         vfs::VfsError::Unsupported => StatLookupError::Unsupported,
     }
 }
+
+*/
+// RING3-MIGRATION-COMMENTED-OUT END

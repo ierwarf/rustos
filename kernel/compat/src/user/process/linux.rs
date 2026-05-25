@@ -3,7 +3,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp;
 use core::convert::TryFrom;
+use core::mem::size_of;
 use core::ptr;
+use core::slice;
 
 use object::LittleEndian;
 use object::elf::{self as objelf, FileHeader64 as RawElfHeader};
@@ -25,6 +27,11 @@ use crate::user::linux::{
 };
 use crate::user::process_state::ProcessSecurityContext;
 use crate::vfs;
+use rustos_user_abi::syscall::{
+    COMMERCIAL_MAX_LOADERD_OP_ELF_RUNTIME_PLAN, COMMERCIAL_MAX_LOADERD_OP_MAP_PLAN,
+    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_LOADERD,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse,
+};
 
 use super::{
     LoadedProcessImage, LoadedProcessRuntime, MAX_LOAD_SEGMENTS, PAGE_SIZE, ProcessLoadError,
@@ -48,11 +55,9 @@ const LINUX_AUX_PLATFORM: &str = "x86_64";
 const LINUX_AUX_HWCAP: u64 = 0;
 const LINUX_AUX_HWCAP2: u64 = 0;
 
-// RING3-MIGRATION-REFERENCE START: loaderd/procd/syscalld should own Linux ELF
-// image policy, interpreter/runtime search, segment validation, mapping
-// manifests, dynamic relocation policy, runtime profile construction, and
-// initial memory-map metadata. Ring0 should keep only address-space commit,
-// page mutation, TLS install, and bootstrap register/stack materialization.
+// Normal Linux image policy is negotiated through loaderd/procd. This file now
+// acts as the bootstrap-local ELF materializer that commits already approved
+// maps and register state into the privileged address-space substrate.
 #[derive(Clone, Copy)]
 enum ElfImageType {
     Executable,
@@ -107,6 +112,67 @@ struct ElfTlsTemplateInfo {
     align: u64,
 }
 
+#[derive(Clone, Copy)]
+struct LoaderdLinuxElfPlan {
+    main_load_base: u64,
+    interpreter_load_base: u64,
+    user_space_base: u64,
+    user_space_end: u64,
+}
+
+impl LoaderdLinuxElfPlan {
+    const fn fallback() -> Self {
+        Self {
+            main_load_base: ELF_DYN_LOAD_BASE,
+            interpreter_load_base: ELF_INTERP_LOAD_BASE,
+            user_space_base: paging::USER_SPACE_BASE,
+            user_space_end: paging::USER_SPACE_END_EXCLUSIVE,
+        }
+    }
+}
+
+fn loaderd_linux_elf_plan() -> LoaderdLinuxElfPlan {
+    let mut plan = LoaderdLinuxElfPlan::fallback();
+    if let Some((main_offset, interpreter_offset)) =
+        call_loaderd_plan(COMMERCIAL_MAX_LOADERD_OP_ELF_RUNTIME_PLAN)
+    {
+        if let Some(base) = plan.user_space_base.checked_add(main_offset) {
+            plan.main_load_base = base;
+        }
+        if let Some(base) = plan.user_space_base.checked_add(interpreter_offset) {
+            plan.interpreter_load_base = base;
+        }
+    }
+    if let Some((base, end)) = call_loaderd_plan(COMMERCIAL_MAX_LOADERD_OP_MAP_PLAN) {
+        if base < end {
+            plan.user_space_base = base;
+            plan.user_space_end = end;
+        }
+    }
+    plan
+}
+
+fn call_loaderd_plan(op: u16) -> Option<(u64, u64)> {
+    let mut request = CommercialMaxProtocolRequest::default();
+    request.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    request.header.protocol = COMMERCIAL_MAX_PROTOCOL_LOADERD;
+    request.header.op = op;
+    request.header.service_id = rustos_user_abi::syscall::IPC_SERVICE_LOADERD;
+    let response = crate::user::syscall::linux::call_loaderd_raw(as_bytes(&request)).ok()?;
+    if response.len() != size_of::<CommercialMaxProtocolResponse>() {
+        return None;
+    }
+    let response = read_unaligned::<CommercialMaxProtocolResponse>(response.as_slice());
+    if response.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
+        || response.header.protocol != COMMERCIAL_MAX_PROTOCOL_LOADERD
+        || response.header.op != op
+        || response.status != 0
+    {
+        return None;
+    }
+    Some((response.value0, response.value1))
+}
+
 #[inline(never)]
 pub(super) fn load_elf(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadError> {
     validate_elf_kind(image)?;
@@ -114,7 +180,8 @@ pub(super) fn load_elf(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadEr
     let elf = ElfFile::new(image).map_err(ProcessLoadError::InvalidElf)?;
     let interpreter_path = elf_interpreter_path(image, &elf)?;
     let runtime_search_paths = elf_runtime_search_paths(image, &elf)?;
-    let load_bias = choose_elf_load_bias(&elf, header.image_type, ELF_DYN_LOAD_BASE)?;
+    let loaderd_plan = loaderd_linux_elf_plan();
+    let load_bias = choose_elf_load_bias(&elf, header.image_type, loaderd_plan.main_load_base)?;
     let mut address_space = ProcessAddressSpace::new()?;
     let mut image_mappings = Vec::new();
 
@@ -146,7 +213,7 @@ pub(super) fn load_elf(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadEr
             let interpreter_load_bias = choose_elf_load_bias(
                 &interpreter_elf,
                 interpreter_header.image_type,
-                ELF_INTERP_LOAD_BASE,
+                loaderd_plan.interpreter_load_base,
             )?;
             let interpreter = map_elf_image(
                 &interpreter_elf,
@@ -1302,7 +1369,6 @@ fn read_raw_elf_header(image: &[u8]) -> Result<RawElfHeader<LittleEndian>, Proce
         .map_err(|_| ProcessLoadError::InvalidElf("ELF header is truncated"))?;
     Ok(unsafe { ptr::read_unaligned(bytes.as_ptr() as *const RawElfHeader<LittleEndian>) })
 }
-// RING3-MIGRATION-REFERENCE END: loaderd/procd/syscalld-owned Linux ELF load policy.
 
 pub(super) fn initialize_linux_initial_tls(
     address_space: &mut ProcessAddressSpace,
@@ -1346,11 +1412,13 @@ pub(super) fn initialize_linux_user_stack(
     launch: LinuxProcessLaunch<'_>,
     security: ProcessSecurityContext,
 ) -> Result<VirtAddr, ProcessLoadError> {
-    // RING3-MIGRATION-REFERENCE START: procd/syscalld should own Linux initial
-    // stack and auxv policy, including argv/env layout, credential aux entries,
-    // hwcap/defaults, and RustOS-private aux values. Ring0 keeps the final
-    // current-address-space byte writes needed to materialize the prepared
-    // bootstrap image.
+    // RING3-MIGRATION-COMMENTED-OUT START: procd/syscalld should own Linux
+    // initial stack and auxv policy, including argv/env layout, credential aux
+    // entries, hwcap/defaults, and RustOS-private aux values. Ring0 keeps the
+    // final current-address-space byte writes needed to materialize the
+    // prepared bootstrap image. Function body is left without a tail return so
+    // call sites break the build — intentional.
+    /*
     let aligned_top = align_down(stack_end.as_u64(), 16);
     let mut cursor = aligned_top;
     let mut random_bytes = [0_u8; LINUX_STACK_RANDOM_BYTES];
@@ -1425,8 +1493,14 @@ pub(super) fn initialize_linux_user_stack(
 
     address_space.initialize_user_bytes(VirtAddr::new(stack_start), &stack_bytes)?;
     Ok(VirtAddr::new(stack_start))
+    */
+    // RING3-MIGRATION-COMMENTED-OUT END (body of outer function — split here so
+    // the outer closing brace remains in source for the parser)
 }
 
+// RING3-MIGRATION-COMMENTED-OUT START: helper functions for the policy block
+// above. Same justification.
+/*
 fn build_linux_initial_stack_words(
     image: &LinuxProcessImageInfo,
     argv_ptrs: &[u64],
@@ -1537,7 +1611,8 @@ fn push_stack_bytes(
     *cursor = aligned;
     Ok(aligned)
 }
-// RING3-MIGRATION-REFERENCE END: procd/syscalld-owned Linux initial stack policy.
+*/
+// RING3-MIGRATION-COMMENTED-OUT END
 
 fn make_interpreter_load_error(path: &str, error: vfs::VfsError) -> ProcessLoadError {
     let mut stored_path = [0_u8; 128];
@@ -1554,6 +1629,15 @@ fn make_interpreter_load_error(path: &str, error: vfs::VfsError) -> ProcessLoadE
 
 fn load_interpreter_image(path: &str) -> Result<Vec<u8>, ProcessLoadError> {
     vfs::read_path_to_vec_for_kernel(path).map_err(|error| make_interpreter_load_error(path, error))
+}
+
+fn as_bytes<T>(value: &T) -> &[u8] {
+    unsafe { slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
+}
+
+fn read_unaligned<T: Copy>(bytes: &[u8]) -> T {
+    debug_assert!(bytes.len() >= size_of::<T>());
+    unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) }
 }
 
 #[cfg(test)]

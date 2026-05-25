@@ -22,6 +22,10 @@ use storage_broker_ops::*;
 
 pub(super) use device_broker_ops::device_sysop_error_to_linux_errno;
 
+// RING3-MIGRATION-COMMENTED-OUT START: broker syscall dispatch belongs in the
+// ring3 syscalld service. Ring0 keeps the raw syscall entry but routes broker
+// numbers directly to the syscalld endpoint instead of the in-kernel match.
+/*
 pub(super) fn is_linux_rustos_broker_syscall(syscall_number: u64) -> bool {
     matches!(
         syscall_number,
@@ -71,3 +75,6 @@ pub(super) fn dispatch_linux_rustos_broker_syscall(frame: &SyscallFrame) -> u64 
         _ => linux_errno(LINUX_ENOSYS),
     }
 }
+
+*/
+// RING3-MIGRATION-COMMENTED-OUT END

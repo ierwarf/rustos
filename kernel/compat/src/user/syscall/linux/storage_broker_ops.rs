@@ -90,6 +90,11 @@ pub(super) fn syscall_linux_rustos_boot_extent_broker(args_ptr: u64) -> u64 {
     let Ok(path) = core::str::from_utf8(&path_bytes) else {
         return linux_errno(LINUX_EINVAL);
     };
+    // RING3-MIGRATION-COMMENTED-OUT START: storaged should own boot extent lease
+    // policy. Ring0 keeps the privileged extent lookup/user-copy substrate.
+    // Function body intentionally left without a tail return — call site breakage
+    // is the migration signal.
+    /*
     let normalized = path.strip_prefix('/').unwrap_or(path);
     let mut lease = BootExtentLeaseWire {
         path_len: path_len as u32,
@@ -117,8 +122,13 @@ pub(super) fn syscall_linux_rustos_boot_extent_broker(args_ptr: u64) -> u64 {
         Ok(()) => 0,
         Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
     }
+    */
+    // RING3-MIGRATION-COMMENTED-OUT END
 }
 
+// RING3-MIGRATION-COMMENTED-OUT START: storaged should own block descriptor wire
+// policy and transport naming. Ring0 keeps descriptor snapshot copying.
+/*
 fn storage_descriptor_wire(
     descriptor: &kernel_io_manager::api::BlockDescriptor,
 ) -> StorageBlockDescriptorWire {
@@ -149,3 +159,5 @@ fn storage_transport_wire(transport: TransportKind) -> u32 {
         TransportKind::Usb => 3,
     }
 }
+*/
+// RING3-MIGRATION-COMMENTED-OUT END

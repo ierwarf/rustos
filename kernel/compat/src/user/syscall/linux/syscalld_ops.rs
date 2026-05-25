@@ -1,8 +1,11 @@
-// RING3-MIGRATION-REFERENCE START: commercial-max syscalld should own syscall offload
-// endpoint policy, cold ABI routing, timeout/default selection, and service authority.
-// Ring0 keeps trap entry, user-copy, endpoint wakeup, and narrow privileged commits.
 use super::*;
 
+// RING3-MIGRATION-COMMENTED-OUT START: every Linux syscall offload wrapper in
+// this file (uname/prlimit/sched_getaffinity/id_getter/setid/umask/...
+// /wait4/memfd_create) is a ring0-side proxy to syscalld. In the final ring3
+// architecture syscalld owns these directly; ring0 keeps only the offload IPC
+// transport (call_syscalld) and the message struct helpers.
+/*
 pub(super) fn syscall_linux_syscalld_uname(buf_ptr: u64) -> u64 {
     if let Err(err) = usermem::validate_current_user_write_buffer(buf_ptr, LINUX_UTSNAME_SIZE) {
         return linux_errno(address_space_error_to_linux_errno(err));
@@ -393,4 +396,6 @@ pub(super) fn read_unaligned<T: Copy>(bytes: &[u8]) -> T {
     assert!(bytes.len() >= size_of::<T>());
     unsafe { bytes.as_ptr().cast::<T>().read_unaligned() }
 }
-// RING3-MIGRATION-REFERENCE END: commercial-max syscalld-owned syscall offload policy.
+
+*/
+// RING3-MIGRATION-COMMENTED-OUT END

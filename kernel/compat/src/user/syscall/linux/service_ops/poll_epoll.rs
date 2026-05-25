@@ -1,5 +1,8 @@
 use super::*;
 
+// RING3-MIGRATION-COMMENTED-OUT START: vfsd should own poll/ppoll/epoll_*.
+// Ring0 keeps the handle-table and wait/wake substrate.
+/*
 pub fn syscall_linux_poll(fds_ptr: u64, nfds: u64, timeout_ms: i64) -> u64 {
     let start_tick = crate::arch::rtc::ticks();
     let ticks_per_second = crate::arch::rtc::ticks_per_second();
@@ -220,3 +223,6 @@ pub fn kernel_handle_poll_revents(handle: &multitask::KernelHandle, requested: u
         _ => requested & (linux_abi::EPOLLIN | linux_abi::EPOLLOUT),
     }
 }
+
+*/
+// RING3-MIGRATION-COMMENTED-OUT END

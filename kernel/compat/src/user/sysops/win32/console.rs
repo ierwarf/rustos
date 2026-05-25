@@ -13,6 +13,11 @@ use super::constants::{
 use super::runtime::set_last_error;
 use super::util::address_space_error_to_win32;
 
+// RING3-MIGRATION-COMMENTED-OUT START: Win32 console sysops (read_file /
+// write_file / get_console_mode / set_console_mode / sleep / close_handle)
+// belong in the Windows ABI user service. Ring0 keeps only the host console
+// substrate it ultimately delegates to.
+/*
 pub(crate) fn write_file(
     handle: u64,
     buffer: u64,
@@ -159,3 +164,6 @@ pub(crate) fn set_console_mode(handle: u64, _mode: u64) -> u64 {
     set_last_error(ERROR_INVALID_HANDLE);
     BOOL_FALSE
 }
+
+*/
+// RING3-MIGRATION-COMMENTED-OUT END

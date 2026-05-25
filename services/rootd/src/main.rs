@@ -17,8 +17,11 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR,
     COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST, COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE,
     COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH, COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL,
-    COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD,
-    IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD, IPC_SERVICE_VFSD, LIFECYCLE_DRAIN_MAX_EVENTS,
+    COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY, IPC_SERVICE_DEVMGRD, IPC_SERVICE_DRIVERD,
+    IPC_SERVICE_INPUTD, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD, IPC_SERVICE_NETD,
+    IPC_SERVICE_PAGERD, IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD, IPC_SERVICE_SERVICE_DRIVERD,
+    IPC_SERVICE_SESSIOND, IPC_SERVICE_STORAGED, IPC_SERVICE_UISERVER, IPC_SERVICE_VFSD,
+    LIFECYCLE_DRAIN_MAX_EVENTS,
     LIFECYCLE_EVENT_EXIT, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
     LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, ROOTD_IPC_ABI_VERSION,
     ROOTD_IPC_OP_LEASE_LIST, ROOTD_IPC_OP_STATUS, ROOTD_LEASE_STATE_EXITED,
@@ -717,7 +720,7 @@ fn service_capability_lease(lease: &Lease, op: u16) -> CommercialMaxCapabilityLe
         service_id: lease.service_id,
         subject_pid: lease.pid,
         capability_mask: service_policy_capability(lease.service_id),
-        rights_mask: capability_protocol_mask(op),
+        rights_mask: service_policy_capability(lease.service_id),
         generation: lease.pid,
         ..CommercialMaxCapabilityLeaseWire::default()
     };
@@ -752,8 +755,20 @@ fn service_policy_capability(service_id: u64) -> u64 {
             rustos_user_abi::syscall::IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY
         }
         IPC_SERVICE_VFSD => rustos_user_abi::syscall::IPC_SERVICE_CAP_VFS_POLICY,
+        IPC_SERVICE_NETD => rustos_user_abi::syscall::IPC_SERVICE_CAP_NET_POLICY,
+        IPC_SERVICE_DEVMGRD => rustos_user_abi::syscall::IPC_SERVICE_CAP_DEVICE_POLICY,
+        IPC_SERVICE_DRIVERD => rustos_user_abi::syscall::IPC_SERVICE_CAP_DRIVER_POLICY,
         IPC_SERVICE_LOADERD => rustos_user_abi::syscall::IPC_SERVICE_CAP_PROCESS_LOADER,
+        IPC_SERVICE_STORAGED => rustos_user_abi::syscall::IPC_SERVICE_CAP_STORAGE_POLICY,
+        IPC_SERVICE_INPUTD => rustos_user_abi::syscall::IPC_SERVICE_CAP_INPUT_POLICY,
         IPC_SERVICE_PROCD => rustos_user_abi::syscall::IPC_SERVICE_CAP_PROCESS_POLICY,
+        IPC_SERVICE_ROOTD => rustos_user_abi::syscall::IPC_SERVICE_CAP_ROOT_SUPERVISOR,
+        IPC_SERVICE_SESSIOND => rustos_user_abi::syscall::IPC_SERVICE_CAP_SESSION_POLICY,
+        IPC_SERVICE_PAGERD => rustos_user_abi::syscall::IPC_SERVICE_CAP_PAGER_POLICY,
+        IPC_SERVICE_SERVICE_DRIVERD => {
+            rustos_user_abi::syscall::IPC_SERVICE_CAP_SERVICE_DRIVER_POLICY
+        }
+        IPC_SERVICE_UISERVER => rustos_user_abi::syscall::IPC_SERVICE_CAP_UI_POLICY,
         INITD_LEASE_ID => rustos_user_abi::syscall::IPC_SERVICE_CAP_ROOT_SUPERVISOR,
         _ => 0,
     }

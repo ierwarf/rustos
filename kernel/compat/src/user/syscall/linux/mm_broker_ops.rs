@@ -1,7 +1,3 @@
-// RING3-MIGRATION-REFERENCE START: commercial-max syscalld/pager should own Linux MM
-// policy, mapping defaults, backing-object leases, and pager-visible accounting. Ring0
-// keeps page-table mutation, current-address-space validation, and backing lifetime
-// enforcement as privileged broker commits.
 use super::*;
 
 use alloc::vec::Vec;
@@ -22,6 +18,10 @@ use rustos_user_abi::syscall::{
 use crate::user::handles::{KernelHandle, RemoteVfsHandleKind, VfsFileHandle};
 use crate::user::memfd::{MemfdError, MemfdHandle};
 
+// RING3-MIGRATION-COMMENTED-OUT START: mm broker (anon/file/memfd/device map,
+// protect, unmap, layout/fd describe) belongs in syscalld/procd. Ring0 keeps
+// only the address-space substrate that procd calls into.
+/*
 const PAGE_SIZE: u64 = 4096;
 const FILE_COPY_CHUNK: usize = 4096;
 
@@ -535,4 +535,6 @@ fn memfd_error_to_errno(err: MemfdError) -> i64 {
         MemfdError::PermissionDenied => LINUX_EACCES,
     }
 }
-// RING3-MIGRATION-REFERENCE END: commercial-max syscalld/pager-owned MM broker policy.
+
+*/
+// RING3-MIGRATION-COMMENTED-OUT END

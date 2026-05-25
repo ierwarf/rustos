@@ -1,7 +1,3 @@
-// RING3-MIGRATION-REFERENCE START: commercial-max devmgrd/displayd should own device
-// sysop policy, `/dev` handle dispatch, ioctl/read/write authorization, surface metadata,
-// and device ABI validation. Ring0 keeps current-process user-copy, display mapping
-// commits, and raw device broker primitives.
 use core::convert::TryFrom;
 use core::mem::size_of;
 use core::slice;
@@ -19,6 +15,10 @@ use alloc::vec;
 use rustos_user_abi::console as console_abi;
 use rustos_user_abi::device as device_abi;
 
+// RING3-MIGRATION-COMMENTED-OUT START: devmgrd/sessiond should own all device
+// sysop helpers (ioctl/path classification/Linux device shim). Ring0 keeps
+// only the raw KernelHandle accessors.
+/*
 const PAGE_SIZE: u64 = 4096;
 
 #[derive(Debug, Clone, Copy)]
@@ -606,4 +606,6 @@ fn map_device_error(err: device_ns::DeviceError) -> DeviceSysopError {
         device_ns::DeviceError::Unsupported => DeviceSysopError::Unsupported,
     }
 }
-// RING3-MIGRATION-REFERENCE END: commercial-max devmgrd/displayd-owned device sysop policy.
+
+*/
+// RING3-MIGRATION-COMMENTED-OUT END

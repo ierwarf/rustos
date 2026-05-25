@@ -1,7 +1,3 @@
-// RING3-MIGRATION-REFERENCE START: commercial-max storaged should own AHCI port
-// discovery, command-slot policy, and block IO state only for a non-.ko service driver
-// rewrite. RustOS-authored `.ko` AHCI drivers stay ring0; ring0 also keeps MMIO/DMA/IRQ
-// grant primitives and early bootstrap block access.
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -74,10 +70,11 @@ const ATA_CMD_FLUSH_CACHE_EXT: u8 = 0xea;
 const COMMAND_FIS_DWORDS: u16 = 5;
 const COMMAND_LIST_BYTES: usize = 1024;
 const RECEIVED_FIS_BYTES: usize = 256;
-// Each PRDT entry can describe up to 4 MiB. We pack 16 of them so a single
-// AHCI command can move 1 MiB (=2048 sectors) per round trip, fits comfortably
-// inside the 16-bit LBA48 sector count, and stays page-aligned. Boot reads
-// previously split every 16 MiB volume into 256 tiny 64 KiB commands.
+// RING3-MIGRATION-COMMENTED-OUT START: storaged should own AHCI transfer and
+// queue policy parameters. Ring0 keeps MMIO/DMA command execution and bootstrap
+// reads. References from substrate code below are intentionally left to break
+// the build.
+/*
 const PRDT_ENTRIES: usize = 16;
 const DMA_BUFFER_BYTES: usize = 1024 * 1024;
 const COMMAND_TABLE_BYTES: usize = 4096;
@@ -86,6 +83,8 @@ const COMMAND_SLOT: u32 = 0;
 const AHCI_WAIT_SPINS: usize = 1_000_000;
 const LOGICAL_BLOCK_SIZE: usize = 512;
 const DEBUG_BOUNDARY_16M_LBA: u64 = (16 * 1024 * 1024) / LOGICAL_BLOCK_SIZE as u64;
+*/
+// RING3-MIGRATION-COMMENTED-OUT END
 
 static AHCI_16M_BOUNDARY_LOGGED: AtomicBool = AtomicBool::new(false);
 
@@ -175,6 +174,9 @@ pub(crate) fn probe_devices() -> Vec<Box<dyn BlockDeviceOps>> {
     devices
 }
 
+// RING3-MIGRATION-COMMENTED-OUT START: storaged should own block chunking and
+// transfer command policy. Ring0 keeps the physical AHCI DMA execution path.
+/*
 impl SharedBlockDevice for AhciBlockDevice {
     fn logical_block_size(&self) -> usize {
         LOGICAL_BLOCK_SIZE
@@ -292,6 +294,8 @@ impl SharedBlockDevice for AhciBlockDevice {
         self.execute_non_data_command(&mut runtime, ATA_CMD_FLUSH_CACHE_EXT)
     }
 }
+*/
+// RING3-MIGRATION-COMMENTED-OUT END
 
 fn note_ahci_16m_boundary_once(lba: u64, blocks: u64, is_write: bool) {
     let end = lba.saturating_add(blocks);
@@ -445,6 +449,10 @@ fn probe_controller(pci: PciDevice) -> Result<Vec<Box<dyn BlockDeviceOps>>, Disk
         ports
     );
 
+    // RING3-MIGRATION-COMMENTED-OUT START: storaged should own AHCI port
+    // selection and admission policy. Ring0 keeps MMIO probing and controller
+    // grants.
+    /*
     for port in 0..32 {
         if (ports & (1 << port)) == 0 {
             continue;
@@ -453,6 +461,8 @@ fn probe_controller(pci: PciDevice) -> Result<Vec<Box<dyn BlockDeviceOps>>, Disk
             devices.push(Box::new(device) as Box<dyn BlockDeviceOps>);
         }
     }
+    */
+    // RING3-MIGRATION-COMMENTED-OUT END
 
     Ok(devices)
 }
@@ -747,6 +757,9 @@ fn prepare_port_command(
     Ok(())
 }
 
+// RING3-MIGRATION-COMMENTED-OUT START: storaged should own AHCI command-form
+// selection. Ring0 keeps only the final command issue substrate.
+/*
 fn dma_command_for_range(dma28: u8, dma48: u8, lba: u64, sector_count: usize) -> IoResult<u8> {
     let end = lba
         .checked_add(sector_count as u64)
@@ -757,6 +770,8 @@ fn dma_command_for_range(dma28: u8, dma48: u8, lba: u64, sector_count: usize) ->
         Ok(dma48)
     }
 }
+*/
+// RING3-MIGRATION-COMMENTED-OUT END
 
 fn issue_port_command(controller: &AhciController, port: u8) -> IoResult<()> {
     let bit = 1_u32 << COMMAND_SLOT;
@@ -818,4 +833,3 @@ fn wait_until(mut predicate: impl FnMut() -> bool) -> bool {
     }
     false
 }
-// RING3-MIGRATION-REFERENCE END: commercial-max storaged-owned non-.ko AHCI service driver.

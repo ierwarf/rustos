@@ -119,6 +119,12 @@ pub(in crate::user::syscall::linux) fn device_sysop_error_to_linux_errno(
     }
 }
 
+// RING3-MIGRATION-COMMENTED-OUT START: devmgrd should own device right/access
+// translation policy. Ring0 keeps handle installation and object substrate.
+// Extended past the original marker to include map_device_access — same
+// access-translation bucket. Call sites in the broker syscalls above are
+// intentionally left to break the build.
+/*
 fn allowed_device_rights_mask() -> u64 {
     DEVMGRD_DEVICE_RIGHT_READ
         | DEVMGRD_DEVICE_RIGHT_WRITE
@@ -162,7 +168,6 @@ fn map_device_id(id: u16) -> Option<crate::io::device::DeviceId> {
         _ => None,
     }
 }
-
 fn map_device_access(access: u16) -> Option<DeviceAccessKind> {
     match access {
         DEVMGRD_DEVICE_ACCESS_NATIVE => Some(DeviceAccessKind::Native),
@@ -170,3 +175,5 @@ fn map_device_access(access: u16) -> Option<DeviceAccessKind> {
         _ => None,
     }
 }
+*/
+// RING3-MIGRATION-COMMENTED-OUT END

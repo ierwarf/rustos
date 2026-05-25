@@ -1,7 +1,3 @@
-// RING3-MIGRATION-REFERENCE START: commercial-max procd/loaderd/pager should own process
-// prepare state, exec tickets, file-backed mapping plans, and fork/signal policy. Ring0
-// keeps only pinned backing validation, address-space commit, final register transition,
-// and task mutation as narrow privileged broker commits.
 use super::*;
 
 use alloc::collections::BTreeMap;
@@ -15,6 +11,8 @@ use crate::user::handles::{KernelHandle, RemoteVfsHandleKind, VfsFileHandle};
 use crate::user::memfd::MemfdHandle;
 use lazy_static::lazy_static;
 use rustos_user_abi::syscall::{
+    COMMERCIAL_MAX_PROCD_OP_PROCESS_PREPARE, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_PROCD, CommercialMaxProtocolRequest, CommercialMaxProtocolResponse,
     IPC_SERVICE_CAP_PROCESS_LOADER, IPC_SERVICE_CAP_PROCESS_POLICY, LOADER_SPAWN_ARG_BYTES,
     LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_MAX_ARG_COUNT, LOADER_SPAWN_MAX_ENV_COUNT,
     PROC_BROKER_ABI_VERSION, PROC_BROKER_BATCH_CAPACITY, PROC_BROKER_FORMAT_ELF64,
@@ -29,6 +27,10 @@ use rustos_user_abi::syscall::{
 };
 use spin::Mutex;
 
+// RING3-MIGRATION-COMMENTED-OUT START: procd/loaderd should own the entire
+// Linux process prepare/map/runtime/exec broker. Ring0 keeps only the IPC
+// transport and address-space substrate referenced from procd.
+/*
 const PAGE_SIZE: u64 = 4096;
 const SPAWN_FLAG_LOGICAL_ADMIN: u64 = 1;
 const MAX_PROC_PREPARES: usize = 128;
@@ -105,14 +107,11 @@ pub(super) fn syscall_linux_rustos_proc_prepare_broker(args_ptr: u64) -> u64 {
         Ok(args) => args,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
     };
-    if args.abi_version != PROC_BROKER_ABI_VERSION
-        || args.reserved0 != 0
-        || !matches!(
-            args.format,
-            PROC_BROKER_FORMAT_ELF64 | PROC_BROKER_FORMAT_PE64
-        )
-    {
+    if args.abi_version != PROC_BROKER_ABI_VERSION || args.reserved0 != 0 {
         return linux_errno(LINUX_EINVAL);
+    }
+    if let Err(errno) = procd_process_prepare_policy(args.format) {
+        return linux_errno(errno);
     }
 
     let Some(owner_pid) = multitask::current_user_process_id() else {
@@ -1133,6 +1132,42 @@ fn allocate_prepare_handle(prepares: &BTreeMap<u64, ProcPrepareState>) -> Option
     None
 }
 
+fn procd_process_prepare_policy(format: u16) -> Result<(), i64> {
+    let Some(snapshot) = multitask::current_user_snapshot() else {
+        return Err(LINUX_EPERM);
+    };
+    let mut request = CommercialMaxProtocolRequest::default();
+    request.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    request.header.protocol = COMMERCIAL_MAX_PROTOCOL_PROCD;
+    request.header.op = COMMERCIAL_MAX_PROCD_OP_PROCESS_PREPARE;
+    request.header.service_id = rustos_user_abi::syscall::IPC_SERVICE_PROCD;
+    request.header.subject_pid = snapshot.process_id();
+    request.header.subject_tid = snapshot.thread_id();
+    request.arg0 = u64::from(format);
+    let response = match ipc_ops::call_service_endpoint(
+        rustos_user_abi::syscall::IPC_SERVICE_PROCD,
+        as_bytes(&request),
+    ) {
+        Ok(response) => response,
+        Err(errno) => return Err(errno),
+    };
+    if response.len() != core::mem::size_of::<CommercialMaxProtocolResponse>() {
+        return Err(LINUX_EINVAL);
+    }
+    let response = read_unaligned::<CommercialMaxProtocolResponse>(response.as_slice());
+    if response.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
+        || response.header.protocol != COMMERCIAL_MAX_PROTOCOL_PROCD
+        || response.header.op != COMMERCIAL_MAX_PROCD_OP_PROCESS_PREPARE
+    {
+        return Err(LINUX_EINVAL);
+    }
+    if response.status == 0 {
+        Ok(())
+    } else {
+        Err(i64::from(response.status))
+    }
+}
+
 fn validate_mapping_region(target_addr: u64, mem_len: u64, flags: u64) -> Result<(), i64> {
     if mem_len == 0
         || target_addr % PAGE_SIZE != 0
@@ -1266,4 +1301,6 @@ fn console_host_error_to_linux_errno(error: crate::user::console_host::ConsoleHo
         }
     }
 }
-// RING3-MIGRATION-REFERENCE END: commercial-max procd/loaderd/pager-owned process broker policy.
+
+*/
+// RING3-MIGRATION-COMMENTED-OUT END

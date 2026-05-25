@@ -5,6 +5,9 @@ use spin::Mutex;
 
 use crate::user::handles::KernelHandle;
 
+// RING3-MIGRATION-COMMENTED-OUT START: vfsd should own the Linux epoll
+// implementation. Ring0 keeps only handle table + wait/wake substrate.
+/*
 const MAX_EPOLL_INTERESTS: usize = 256;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -126,3 +129,6 @@ impl EpollHandle {
             .collect()
     }
 }
+
+*/
+// RING3-MIGRATION-COMMENTED-OUT END

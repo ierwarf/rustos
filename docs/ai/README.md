@@ -14,9 +14,6 @@ Optimized for AI agents, not human onboarding. English-only, dense, contract-sha
 | `contracts-abi.md` | IPC service IDs, broker syscalls, service routing contracts. |
 | `kernel-api-map.md` | Cross-crate kernel API surfaces (`kernel_*::api`) and boot order. |
 | `workflows.md` | Step recipes: add service/app/driver, modify kernel API, debug QEMU boot. |
-| `ring3-evacuation.md` | Service-first ring0 evacuation boundaries and migration candidates. |
-| `ring3-inventory.md` | Live LOC/owner/action snapshot for the active migration batch. |
-| `commercial-microkernel-closure.md` | Final hybrid-kernel closure criteria, marker rules, LOC accounting. |
 
 ## Operating rules
 

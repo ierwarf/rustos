@@ -343,6 +343,8 @@ pub const DRIVER_LOAD_POLICY_KNOWN_FLAGS: u64 = DRIVER_LOAD_POLICY_DISPLAY_PRIMA
 pub const STORAGE_LIST_PATH_CAPACITY: usize = 64;
 pub const STORAGE_LIST_MAX_DESCRIPTORS: usize = 16;
 pub const STORAGE_FLAG_READONLY: u32 = 1 << 0;
+pub const STORAGE_AHCI_POLICY_FLAG_DMA_64: u32 = 1 << 0;
+pub const STORAGE_AHCI_POLICY_FLAG_SINGLE_SLOT: u32 = 1 << 1;
 pub const STORAGED_IPC_ABI_VERSION: u16 = 1;
 pub const STORAGED_OP_PING: u16 = 1;
 pub const STORAGED_OP_LIST_COUNT: u16 = 2;
@@ -422,11 +424,13 @@ pub const COMMERCIAL_MAX_INPUTD_OP_INPUT_STATS: u16 = 6;
 pub const COMMERCIAL_MAX_INPUTD_OP_SERIO_BUS_POLICY: u16 = 7;
 pub const COMMERCIAL_MAX_INPUTD_OP_I8042_COMMAND_POLICY: u16 = 8;
 pub const COMMERCIAL_MAX_INPUTD_OP_PS2_PACKET_POLICY: u16 = 9;
+pub const COMMERCIAL_MAX_INPUTD_OP_HID_REPORT_POLICY: u16 = 10;
 pub const COMMERCIAL_MAX_STORAGED_OP_BLOCK_INVENTORY: u16 = 1;
 pub const COMMERCIAL_MAX_STORAGED_OP_PARTITION_SCAN: u16 = 2;
 pub const COMMERCIAL_MAX_STORAGED_OP_ROOT_VOLUME_SELECT: u16 = 3;
 pub const COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE: u16 = 4;
 pub const COMMERCIAL_MAX_STORAGED_OP_VOLUME_METADATA: u16 = 5;
+pub const COMMERCIAL_MAX_STORAGED_OP_AHCI_POLICY: u16 = 6;
 pub const COMMERCIAL_MAX_NETD_OP_SOCKET_NAMESPACE: u16 = 1;
 pub const COMMERCIAL_MAX_NETD_OP_SOCKET_OPTIONS: u16 = 2;
 pub const COMMERCIAL_MAX_NETD_OP_ADDRESS_BIND: u16 = 3;
@@ -631,6 +635,20 @@ impl Default for StorageBlockDescriptorWire {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StoragedAhciPolicyWire {
+    pub abi_version: u16,
+    pub reserved0: u16,
+    pub flags: u32,
+    pub command_slot: u32,
+    pub prdt_entries: u32,
+    pub max_transfer_bytes: u32,
+    pub logical_block_size: u32,
+    pub wait_spins: u32,
+    pub max_ports: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct StorageListBrokerArgs {
     pub abi_version: u16,
     pub reserved0: u16,
@@ -762,6 +780,11 @@ pub const INPUTD_INGRESS_KIND_POINTER_ABSOLUTE: u16 = 3;
 pub const INPUTD_INGRESS_KIND_KEYBOARD: u16 = 4;
 pub const INPUTD_INGRESS_KIND_HID_KEYBOARD_REPORT: u16 = 5;
 pub const INPUTD_INGRESS_KIND_HID_POINTER_REPORT: u16 = 6;
+pub const INPUTD_HID_POLICY_REPORT_CAPACITY: usize = 64;
+pub const INPUTD_HID_POLICY_DESCRIPTOR_CAPACITY: usize = 128;
+pub const INPUTD_HID_POLICY_KIND_UNKNOWN: u16 = 0;
+pub const INPUTD_HID_POLICY_KIND_KEYBOARD: u16 = 1;
+pub const INPUTD_HID_POLICY_KIND_POINTER: u16 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -825,6 +848,46 @@ pub struct InputHidPointerReportWire {
     pub y: i32,
     pub wheel_vertical: i16,
     pub reserved1: i16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InputHidPolicyWire {
+    pub source_id: u64,
+    pub kind: u16,
+    pub report_len: u16,
+    pub descriptor_len: u16,
+    pub report_id: u8,
+    pub flags: u8,
+    pub required_bytes: u16,
+    pub reserved0: u16,
+    pub logical_min_x: i32,
+    pub logical_max_x: i32,
+    pub logical_min_y: i32,
+    pub logical_max_y: i32,
+    pub report: [u8; INPUTD_HID_POLICY_REPORT_CAPACITY],
+    pub descriptor_prefix: [u8; INPUTD_HID_POLICY_DESCRIPTOR_CAPACITY],
+}
+
+impl Default for InputHidPolicyWire {
+    fn default() -> Self {
+        Self {
+            source_id: 0,
+            kind: INPUTD_HID_POLICY_KIND_UNKNOWN,
+            report_len: 0,
+            descriptor_len: 0,
+            report_id: 0,
+            flags: 0,
+            required_bytes: 0,
+            reserved0: 0,
+            logical_min_x: 0,
+            logical_max_x: 0,
+            logical_min_y: 0,
+            logical_max_y: 0,
+            report: [0; INPUTD_HID_POLICY_REPORT_CAPACITY],
+            descriptor_prefix: [0; INPUTD_HID_POLICY_DESCRIPTOR_CAPACITY],
+        }
+    }
 }
 
 #[repr(C)]

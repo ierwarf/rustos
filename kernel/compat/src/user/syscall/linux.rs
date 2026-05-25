@@ -131,6 +131,10 @@ pub(crate) fn call_syscalld_raw(request: &[u8]) -> Result<Vec<u8>, i64> {
     ipc_ops::call_linux_syscall_endpoint(request)
 }
 
+pub(crate) fn call_loaderd_raw(request: &[u8]) -> Result<Vec<u8>, i64> {
+    ipc_ops::call_service_endpoint(IPC_SERVICE_LOADERD, request)
+}
+
 pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
     if let Err(error) = syscall_check(frame) {
         return error;

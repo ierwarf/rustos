@@ -10,6 +10,10 @@ use crate::memory::{kernel_vm, phys};
 use crate::user::handles::{FileHandleSeekError, FileHandleSeekWhence};
 use crate::user::linux as linux_abi;
 
+// RING3-MIGRATION-COMMENTED-OUT START: mm service / procd should own the
+// Linux memfd implementation (anonymous file backing + page lifecycle). Ring0
+// keeps the physical-frame allocator substrate.
+/*
 const PAGE_SIZE: usize = 4096;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -357,3 +361,6 @@ fn write_at_locked(frames: &[u64], offset: usize, src: &[u8]) {
         copied += chunk_len;
     }
 }
+
+*/
+// RING3-MIGRATION-COMMENTED-OUT END

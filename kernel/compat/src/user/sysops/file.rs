@@ -1,7 +1,3 @@
-// RING3-MIGRATION-REFERENCE START: commercial-max vfsd/pager should own file sysop
-// policy, path normalization, file cursor behavior, memfd/page-cache routing, and Linux
-// file ABI defaults. Ring0 keeps only current-process user-copy and narrow file/memfd
-// commit primitives.
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -20,6 +16,10 @@ use crate::user::linux as linux_abi;
 use crate::user::memfd::{MemfdError, MemfdHandle};
 use crate::vfs;
 
+// RING3-MIGRATION-COMMENTED-OUT START: vfsd should own file sysop helpers
+// (resolve_path / open_path / read_path / write_path). Ring0 keeps only the
+// VFS handle and memfd substrate.
+/*
 const FILE_IO_CHUNK_LEN: usize = 16 * 1024;
 const MAX_OPEN_PATH_LEN: usize = 256;
 
@@ -526,4 +526,6 @@ mod tests {
         );
     }
 }
-// RING3-MIGRATION-REFERENCE END: commercial-max vfsd/pager-owned file sysop policy.
+
+*/
+// RING3-MIGRATION-COMMENTED-OUT END

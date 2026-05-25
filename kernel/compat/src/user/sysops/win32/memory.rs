@@ -7,16 +7,16 @@ use crate::user::process_state::{WindowsAllocation, WindowsAllocationKind};
 
 use super::constants::{
     BOOL_FALSE, BOOL_TRUE, ERROR_INVALID_ADDRESS, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER,
-    ERROR_SUCCESS, MEM_COMMIT, MEM_IMAGE, MEM_PRIVATE, MEM_RELEASE, MEM_RESERVE,
-    MemoryBasicInformation, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS,
-    PAGE_READONLY, PAGE_READWRITE, PAGE_SIZE,
+    ERROR_SUCCESS, MEM_COMMIT, MEM_IMAGE, MEM_PRIVATE, MemoryBasicInformation, PAGE_EXECUTE_READ,
+    PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_SIZE,
 };
 use super::runtime::{set_last_error, with_windows_runtime_mut};
 use super::util::{address_space_error_to_win32, as_bytes};
 
-// RING3-MIGRATION-REFERENCE START: syscalld should own cold Win32 memory
-// policy validation and allocation DB decisions. Ring0 should keep only the
-// privileged address-space mutation and user-copy actions.
+// RING3-MIGRATION-COMMENTED-OUT START: Win32 memory sysops (VirtualQuery /
+// VirtualAlloc / VirtualFree / VirtualProtect) belong in the Windows ABI user
+// service. Ring0 keeps only the address-space substrate.
+/*
 pub(crate) fn virtual_query(address: u64, info_ptr: u64, len: u64) -> u64 {
     let result = with_windows_runtime_mut(|process_state, runtime| {
         let out_len = usize::try_from(len).map_err(|_| ERROR_INVALID_PARAMETER)?;
@@ -88,12 +88,7 @@ pub(crate) fn virtual_query(address: u64, info_ptr: u64, len: u64) -> u64 {
 
 pub(crate) fn virtual_alloc(base: u64, len: u64, allocation_type: u64, protect: u64) -> u64 {
     let protect = protect as u32;
-    if allocation_type & !(MEM_COMMIT | MEM_RESERVE) != 0
-        || allocation_type & (MEM_COMMIT | MEM_RESERVE) == 0
-    {
-        set_last_error(ERROR_INVALID_PARAMETER);
-        return 0;
-    }
+    let _ = allocation_type;
     match allocate_windows_memory(
         len,
         protect,
@@ -112,10 +107,7 @@ pub(crate) fn virtual_alloc(base: u64, len: u64, allocation_type: u64, protect: 
 }
 
 pub(crate) fn virtual_free(base: u64, len: u64, free_type: u64) -> u64 {
-    if len != 0 || free_type != MEM_RELEASE {
-        set_last_error(ERROR_INVALID_PARAMETER);
-        return BOOL_FALSE;
-    }
+    let _ = (len, free_type);
     match free_windows_memory(base, Some(WindowsAllocationKind::Virtual)) {
         Ok(()) => {
             set_last_error(ERROR_SUCCESS);
@@ -129,10 +121,6 @@ pub(crate) fn virtual_free(base: u64, len: u64, free_type: u64) -> u64 {
 }
 
 pub(crate) fn virtual_protect(base: u64, len: u64, protect: u64, old_protect_ptr: u64) -> u64 {
-    if old_protect_ptr == 0 {
-        set_last_error(ERROR_INVALID_PARAMETER);
-        return BOOL_FALSE;
-    }
     match protect_windows_memory(base, len, protect as u32, old_protect_ptr) {
         Ok(()) => {
             set_last_error(ERROR_SUCCESS);
@@ -158,9 +146,6 @@ fn allocate_windows_memory(
             return Err(ERROR_INVALID_FUNCTION);
         }
         let region = if let Some(base) = exact_base {
-            if base & (PAGE_SIZE - 1) != 0 {
-                return Err(ERROR_INVALID_PARAMETER);
-            }
             process_state
                 .address_space_mut()
                 .map_zeroed_user_pages_at(VirtAddr::new(base), page_count, page_flags)
@@ -274,4 +259,6 @@ fn align_up_u64(value: u64, align: u64) -> Option<u64> {
     let mask = align.checked_sub(1)?;
     value.checked_add(mask).map(|value| value & !mask)
 }
-// RING3-MIGRATION-REFERENCE END: syscalld-owned Win32 memory policy.
+
+*/
+// RING3-MIGRATION-COMMENTED-OUT END

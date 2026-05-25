@@ -1,7 +1,3 @@
-// RING3-MIGRATION-REFERENCE START: commercial-max netd should own socket namespace,
-// socket option policy, bind/connect/listen routing, fd transfer, and network syscall
-// validation. Ring0 keeps current-process user-copy and raw socket/device handoff
-// primitives.
 use super::*;
 
 use alloc::string::String;
@@ -11,6 +7,10 @@ use core::mem::size_of;
 use rustos_user_abi::syscall::{IPC_SERVICE_CAP_NET_POLICY, RustosNetBrokerArgs};
 use x86_64::VirtAddr;
 
+// RING3-MIGRATION-COMMENTED-OUT START: netd should own the entire Linux net
+// broker (socket lifecycle, send/recv, sockopt, name lookups). Ring0 keeps the
+// handle table and IPC transport substrate.
+/*
 const MAX_SOCKET_IO_BYTES: usize = 64 * 1024;
 const MAX_IOVEC_COUNT: usize = 16;
 
@@ -673,4 +673,6 @@ fn socket_error_to_linux_errno(error: multitask::SocketError) -> i64 {
         multitask::SocketError::TryAgain => LINUX_EAGAIN,
     }
 }
-// RING3-MIGRATION-REFERENCE END: commercial-max netd-owned socket broker policy.
+
+*/
+// RING3-MIGRATION-COMMENTED-OUT END

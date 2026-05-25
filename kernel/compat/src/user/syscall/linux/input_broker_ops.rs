@@ -6,6 +6,9 @@ use rustos_user_abi::syscall::{
     InputIngestBrokerArgs, InputIngressWire, InputStatsBrokerArgs, InputStatsWire,
 };
 
+// RING3-MIGRATION-COMMENTED-OUT START: inputd should own input stats /
+// ingest broker. Ring0 keeps the raw input ring buffer substrate.
+/*
 pub(super) fn syscall_linux_rustos_input_stats_broker(args_ptr: u64) -> u64 {
     if !ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_INPUT_POLICY) {
         return linux_errno(LINUX_EPERM);
@@ -87,3 +90,6 @@ pub(super) fn syscall_linux_rustos_input_ingest_broker(args_ptr: u64) -> u64 {
         Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
     }
 }
+
+*/
+// RING3-MIGRATION-COMMENTED-OUT END

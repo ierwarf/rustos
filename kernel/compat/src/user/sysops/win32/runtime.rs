@@ -6,6 +6,9 @@ use crate::user::process_state::{UserProcessState, WindowsProcessRuntimeState};
 
 use super::constants::ERROR_INVALID_FUNCTION;
 
+// RING3-MIGRATION-COMMENTED-OUT START: Win32 last-error / runtime accessor
+// helpers belong in the Windows ABI user service.
+/*
 pub(crate) fn set_last_error(value: u32) -> u64 {
     multitask::set_current_last_error(value);
     let _ = multitask::with_current_user_process_state_mut(|_, abi, process_state| {
@@ -42,3 +45,6 @@ pub(super) fn with_windows_runtime_mut<R>(
     };
     result
 }
+
+*/
+// RING3-MIGRATION-COMMENTED-OUT END

@@ -9,6 +9,10 @@ const MAX_SLOW_SERVICE_CALL_LOGS: usize = 20;
 
 static SLOW_SERVICE_CALL_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+// RING3-MIGRATION-COMMENTED-OUT START: rootd/loaderd/procd should own direct
+// bootstrap spawn allowlists and launch policy. Ring0 keeps only the initial
+// rootd escape hatch until the first service graph is alive.
+/*
 pub fn syscall_linux_loader_spawn_exec(
     path_ptr: u64,
     _argv_ptr: u64,
@@ -86,6 +90,8 @@ fn spawn_bootstrap_exec_direct(
         .map(|spawned| spawned.pid)
         .map_err(console_host_error_to_linux_errno)
 }
+*/
+// RING3-MIGRATION-COMMENTED-OUT END
 
 fn console_host_error_to_linux_errno(error: crate::user::console_host::ConsoleHostError) -> i64 {
     match error {

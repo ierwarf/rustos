@@ -26,8 +26,9 @@ use rustos_user_abi::syscall::{
     PROCD_OP_RT_SIGACTION, PROCD_OP_RT_SIGPROCMASK, PROCD_OP_SELECT_SIGNAL, PROCD_OP_SIGALTSTACK,
     PROCD_OP_TGKILL, PROCD_OP_WAIT4, PROCD_PATH_CAPACITY, PROCD_PAYLOAD_CAPACITY,
     PROCD_SELECT_SIGNAL_HANDLER, PROCD_SELECT_SIGNAL_IGNORE, PROCD_SELECT_SIGNAL_NONE,
-    PROCD_SELECT_SIGNAL_TERMINATE, PROC_BROKER_ABI_VERSION, SYSCALL_OFFLOAD_ABI_VERSION,
-    SYSCALL_OFFLOAD_OP_LINUX_PROCESS_EXIT, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
+    PROCD_SELECT_SIGNAL_TERMINATE, PROC_BROKER_ABI_VERSION, PROC_BROKER_FORMAT_ELF64,
+    PROC_BROKER_FORMAT_PE64, SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_PROCESS_EXIT,
+    SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
     SYS_RUSTOS_PROC_AUTHORIZE_EXEC_BROKER, SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER,
     SYS_RUSTOS_PROC_FORK_BROKER, SYS_RUSTOS_PROC_SIGNAL_QUEUE_BROKER,
 };
@@ -232,11 +233,14 @@ fn handle_commercial_request(
     }
     match request.header.op {
         COMMERCIAL_MAX_PROCD_OP_PROCESS_PREPARE => {
+            let format = request.arg0 as u16;
+            response.value0 = u64::from(format);
+            response.value1 = PROC_BROKER_ABI_VERSION as u64;
             response.descriptor_count = 1;
             response.descriptors[0] = procd_descriptor(
                 "process-prepare",
                 request.header.op,
-                request.header.subject_pid,
+                response.value0,
             );
             response.capability = procd_capability("process-prepare", request.header.op);
         }
@@ -315,8 +319,16 @@ fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result
         return Err(EINVAL);
     }
     match request.header.op {
-        COMMERCIAL_MAX_PROCD_OP_PROCESS_PREPARE
-        | COMMERCIAL_MAX_PROCD_OP_EXEC_TICKET
+        COMMERCIAL_MAX_PROCD_OP_PROCESS_PREPARE => {
+            if !matches!(
+                request.arg0 as u16,
+                PROC_BROKER_FORMAT_ELF64 | PROC_BROKER_FORMAT_PE64
+            ) {
+                return Err(EINVAL);
+            }
+            Ok(())
+        }
+        COMMERCIAL_MAX_PROCD_OP_EXEC_TICKET
         | COMMERCIAL_MAX_PROCD_OP_FORK_PLAN
         | COMMERCIAL_MAX_PROCD_OP_THREAD_PLAN
         | COMMERCIAL_MAX_PROCD_OP_SIGNAL_POLICY

@@ -3,6 +3,10 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 use x86_64::VirtAddr;
 
+// RING3-MIGRATION-COMMENTED-OUT START: procd should own futex + Linux clone
+// thread spawn policy. Ring0 keeps the wait/wake primitives + thread creation
+// substrate.
+/*
 const FUTEX_WAITERS_CAPACITY: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -595,3 +599,6 @@ pub fn syscall_linux_rseq(area_ptr: u64, len: u64, flags: u64, signature: u64) -
         Err(errno) => linux_errno(errno),
     }
 }
+
+*/
+// RING3-MIGRATION-COMMENTED-OUT END

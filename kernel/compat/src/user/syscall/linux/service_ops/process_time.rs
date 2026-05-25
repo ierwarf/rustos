@@ -1,5 +1,9 @@
 use super::*;
 
+// RING3-MIGRATION-COMMENTED-OUT START: procd/syscalld should own
+// sched_yield/getpid/gettid/execve/execveat/fork/rt_sigaction/rt_sigprocmask
+// and friends. Ring0 keeps only the scheduler primitive substrate.
+/*
 pub fn syscall_linux_sched_yield() -> u64 {
     multitask::yield_now();
     0
@@ -428,3 +432,6 @@ pub fn syscall_linux_clone3(frame: &SyscallFrame) -> u64 {
         args.tls,
     )
 }
+
+*/
+// RING3-MIGRATION-COMMENTED-OUT END

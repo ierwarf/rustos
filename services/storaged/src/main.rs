@@ -8,20 +8,28 @@ use rustos_user_abi::syscall::{
     BootExtentLeaseWire, BootExtentWire, CommercialMaxCapabilityLeaseWire,
     CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
     CommercialMaxProtocolResponse, StorageBlockDescriptorWire, StorageListBrokerArgs,
-    StoragedRequest, StoragedResponse, BOOT_EXTENT_FLAG_READONLY, BOOT_EXTENT_MAX_EXTENTS,
-    BOOT_EXTENT_PATH_CAPACITY, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    StoragedAhciPolicyWire, StoragedRequest, StoragedResponse, BOOT_EXTENT_FLAG_READONLY,
+    BOOT_EXTENT_MAX_EXTENTS, BOOT_EXTENT_PATH_CAPACITY, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
     COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_STORAGED,
-    COMMERCIAL_MAX_STORAGED_OP_BLOCK_INVENTORY, COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE,
-    COMMERCIAL_MAX_STORAGED_OP_PARTITION_SCAN, COMMERCIAL_MAX_STORAGED_OP_ROOT_VOLUME_SELECT,
-    COMMERCIAL_MAX_STORAGED_OP_VOLUME_METADATA, IPC_SERVICE_STORAGED, STORAGED_IPC_ABI_VERSION,
-    STORAGED_OP_BOOT_EXTENT_LOOKUP, STORAGED_OP_LIST_COUNT, STORAGED_OP_LIST_GET, STORAGED_OP_PING,
-    STORAGED_OP_ROOT_STATUS, STORAGE_FLAG_READONLY, STORAGE_LIST_MAX_DESCRIPTORS,
+    COMMERCIAL_MAX_STORAGED_OP_AHCI_POLICY, COMMERCIAL_MAX_STORAGED_OP_BLOCK_INVENTORY,
+    COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE, COMMERCIAL_MAX_STORAGED_OP_PARTITION_SCAN,
+    COMMERCIAL_MAX_STORAGED_OP_ROOT_VOLUME_SELECT, COMMERCIAL_MAX_STORAGED_OP_VOLUME_METADATA,
+    IPC_SERVICE_STORAGED, STORAGED_IPC_ABI_VERSION, STORAGED_OP_BOOT_EXTENT_LOOKUP,
+    STORAGED_OP_LIST_COUNT, STORAGED_OP_LIST_GET, STORAGED_OP_PING, STORAGED_OP_ROOT_STATUS,
+    STORAGE_AHCI_POLICY_FLAG_DMA_64, STORAGE_AHCI_POLICY_FLAG_SINGLE_SLOT, STORAGE_FLAG_READONLY,
+    STORAGE_LIST_MAX_DESCRIPTORS,
     SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV,
     SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_STORAGE_LIST_BROKER,
 };
 
 const RECV_BACKOFF: Duration = Duration::from_millis(50);
 const ROOT_FILE_EXTENTS_REGISTRY_PATH: &str = "system/registry/kernel/root-file-extents.tsv";
+const AHCI_POLICY_COMMAND_SLOT: u32 = 0;
+const AHCI_POLICY_PRDT_ENTRIES: u32 = 16;
+const AHCI_POLICY_MAX_TRANSFER_BYTES: u32 = 1024 * 1024;
+const AHCI_POLICY_LOGICAL_BLOCK_SIZE: u32 = 512;
+const AHCI_POLICY_WAIT_SPINS: u32 = 1_000_000;
+const AHCI_POLICY_MAX_PORTS: u32 = 32;
 
 fn main() {
     observability_client::info!("storaged", service, "service started");
@@ -198,7 +206,31 @@ fn dispatch_commercial(
             response.payload_len = write_payload_struct(&lease, &mut response.payload);
             Ok(())
         }
+        COMMERCIAL_MAX_STORAGED_OP_AHCI_POLICY => {
+            let policy = ahci_policy_response();
+            response.value0 = policy.max_transfer_bytes as u64;
+            response.value1 = policy.prdt_entries as u64;
+            response.descriptor_count = 1;
+            response.descriptors[0] = ahci_policy_descriptor(request.header.op);
+            response.capability = ahci_policy_capability(request.header.op);
+            response.payload_len = write_payload_struct(&policy, &mut response.payload);
+            Ok(())
+        }
         _ => Err(libc::EINVAL),
+    }
+}
+
+fn ahci_policy_response() -> StoragedAhciPolicyWire {
+    StoragedAhciPolicyWire {
+        abi_version: STORAGED_IPC_ABI_VERSION,
+        flags: STORAGE_AHCI_POLICY_FLAG_DMA_64 | STORAGE_AHCI_POLICY_FLAG_SINGLE_SLOT,
+        command_slot: AHCI_POLICY_COMMAND_SLOT,
+        prdt_entries: AHCI_POLICY_PRDT_ENTRIES,
+        max_transfer_bytes: AHCI_POLICY_MAX_TRANSFER_BYTES,
+        logical_block_size: AHCI_POLICY_LOGICAL_BLOCK_SIZE,
+        wait_spins: AHCI_POLICY_WAIT_SPINS,
+        max_ports: AHCI_POLICY_MAX_PORTS,
+        ..StoragedAhciPolicyWire::default()
     }
 }
 
@@ -390,7 +422,8 @@ fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result
         | COMMERCIAL_MAX_STORAGED_OP_PARTITION_SCAN
         | COMMERCIAL_MAX_STORAGED_OP_ROOT_VOLUME_SELECT
         | COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE
-        | COMMERCIAL_MAX_STORAGED_OP_VOLUME_METADATA => Ok(()),
+        | COMMERCIAL_MAX_STORAGED_OP_VOLUME_METADATA
+        | COMMERCIAL_MAX_STORAGED_OP_AHCI_POLICY => Ok(()),
         _ => Err(libc::EINVAL),
     }
 }
@@ -485,6 +518,34 @@ fn boot_extent_capability(lease: &BootExtentLeaseWire) -> CommercialMaxCapabilit
     wire
 }
 
+fn ahci_policy_descriptor(op: u16) -> CommercialMaxProtocolDescriptorWire {
+    let mut wire = CommercialMaxProtocolDescriptorWire {
+        protocol: COMMERCIAL_MAX_PROTOCOL_STORAGED,
+        op,
+        flags: STORAGE_AHCI_POLICY_FLAG_DMA_64 | STORAGE_AHCI_POLICY_FLAG_SINGLE_SLOT,
+        service_id: IPC_SERVICE_STORAGED,
+        capability_mask: storaged_capability_mask(op),
+        value0: AHCI_POLICY_MAX_TRANSFER_BYTES as u64,
+        value1: AHCI_POLICY_PRDT_ENTRIES as u64,
+        ..CommercialMaxProtocolDescriptorWire::default()
+    };
+    copy_label(b"ahci-policy", &mut wire.name, &mut wire.name_len);
+    wire
+}
+
+fn ahci_policy_capability(op: u16) -> CommercialMaxCapabilityLeaseWire {
+    let mut wire = CommercialMaxCapabilityLeaseWire {
+        lease_id: op as u64,
+        service_id: IPC_SERVICE_STORAGED,
+        capability_mask: storaged_capability_mask(op),
+        rights_mask: storaged_capability_mask(op),
+        generation: AHCI_POLICY_MAX_TRANSFER_BYTES as u64,
+        ..CommercialMaxCapabilityLeaseWire::default()
+    };
+    copy_label(b"ahci-policy", &mut wire.label, &mut wire.label_len);
+    wire
+}
+
 fn storaged_capability_mask(op: u16) -> u64 {
     match op {
         COMMERCIAL_MAX_STORAGED_OP_BLOCK_INVENTORY => 1 << 0,
@@ -492,8 +553,15 @@ fn storaged_capability_mask(op: u16) -> u64 {
         COMMERCIAL_MAX_STORAGED_OP_ROOT_VOLUME_SELECT => 1 << 2,
         COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE => 1 << 3,
         COMMERCIAL_MAX_STORAGED_OP_VOLUME_METADATA => 1 << 4,
+        COMMERCIAL_MAX_STORAGED_OP_AHCI_POLICY => 1 << 5,
         _ => 0,
     }
+}
+
+fn copy_label(src: &[u8], dest: &mut [u8], len: &mut u16) {
+    let count = src.len().min(dest.len());
+    dest[..count].copy_from_slice(&src[..count]);
+    *len = count as u16;
 }
 
 fn write_payload_struct<T>(value: &T, dest: &mut [u8]) -> u32 {
