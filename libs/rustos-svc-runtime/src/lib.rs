@@ -5,6 +5,7 @@ extern crate alloc;
 
 pub mod allocator;
 pub mod ipc;
+#[cfg(not(test))]
 mod panic;
 pub mod syscall;
 
