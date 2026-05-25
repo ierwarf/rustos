@@ -6,19 +6,19 @@ use std::time::{Duration, Instant};
 
 use rustos_user_abi::console::{self as console_abi};
 use rustos_user_abi::syscall::{
-    IPC_SERVICE_LOADERD, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
-    LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, LoaderSpawnRequest,
-    LoaderSpawnResponse, RustosDeviceIoctlBrokerArgs, SYS_RUSTOS_DEVICE_IOCTL_BROKER,
+    LoaderSpawnRequest, LoaderSpawnResponse, RustosDeviceIoctlBrokerArgs, IPC_SERVICE_LOADERD,
+    LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
+    LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, SYS_RUSTOS_DEVICE_IOCTL_BROKER,
     SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
 };
 
-use super::{BrokerState, LaunchEntry, RunningProcess};
 use super::{
-    CONSOLE_PATH, CONSOLE_SESSION_STATE_LOADING_IMAGE, CONSOLE_SESSION_STATE_RUNNING,
-    CONSOLE_SESSION_STATE_SPAWNING, IDLE_POLL_INTERVAL, LOADER_ENDPOINT_CACHE,
-    MIN_EFFECTIVE_TASK_WEIGHT_MICROS, DEFAULT_USER_TASK_WEIGHT_MICROS, O_RDWR, RETRY_BACKOFF,
-    SYS_IOCTL, SYS_OPENAT, AT_FDCWD, boot_line,
+    boot_line, AT_FDCWD, CONSOLE_PATH, CONSOLE_SESSION_STATE_LOADING_IMAGE,
+    CONSOLE_SESSION_STATE_RUNNING, CONSOLE_SESSION_STATE_SPAWNING, DEFAULT_USER_TASK_WEIGHT_MICROS,
+    IDLE_POLL_INTERVAL, LOADER_ENDPOINT_CACHE, MIN_EFFECTIVE_TASK_WEIGHT_MICROS, O_RDWR,
+    RETRY_BACKOFF, SYS_IOCTL, SYS_OPENAT,
 };
+use super::{BrokerState, LaunchEntry, RunningProcess};
 
 use rustos_user_abi::console::{
     ConsoleCloseSessionRequest, ConsoleCreateSessionRequest, ConsoleSetFocusRequest,
@@ -50,6 +50,7 @@ pub(super) fn spawn_tracked_process(
             entry.display_name.as_str(),
             entry.exec.as_str(),
         )?;
+        state.session_runtime.create_session(session);
         set_console_session_state(console_fd, session, CONSOLE_SESSION_STATE_LOADING_IMAGE)?;
         Some(session)
     } else {
@@ -66,6 +67,7 @@ pub(super) fn spawn_tracked_process(
         Ok(pid) => pid,
         Err(err) => {
             if let Some(session) = session_handle {
+                state.session_runtime.remove_session(session);
                 let _ = close_console_session(ensure_console_fd(state)?, session);
             }
             if is_permanent_launch_failure(err) {
@@ -134,6 +136,7 @@ pub(super) fn reap_children(state: &mut BrokerState) -> bool {
             reaped_any = true;
             if let Some(process) = state.running.remove(&pid) {
                 if process.session_handle != 0 {
+                    state.session_runtime.remove_session(process.session_handle);
                     if let Ok(console_fd) = ensure_console_fd(state) {
                         let _ = close_console_session(console_fd, process.session_handle);
                     }
@@ -251,8 +254,7 @@ fn build_loader_spawn_request(
     request.exec_path[..exec_bytes.len()].copy_from_slice(exec_bytes);
     request.argv_bytes_len =
         copy_cstring_blob(argv, &mut request.argv_bytes, LOADER_SPAWN_ARG_BYTES)?;
-    request.env_bytes_len =
-        copy_cstring_blob(env, &mut request.env_bytes, LOADER_SPAWN_ENV_BYTES)?;
+    request.env_bytes_len = copy_cstring_blob(env, &mut request.env_bytes, LOADER_SPAWN_ENV_BYTES)?;
     Ok(request)
 }
 
@@ -325,9 +327,8 @@ pub(super) fn stderr_line(message: &str) {
 }
 
 pub(super) fn terminate_pid(pid: i32) -> Result<(), i32> {
-    let rc = unsafe {
-        libc::syscall(libc::SYS_tgkill as libc::c_long, pid, pid, libc::SIGKILL) as i32
-    };
+    let rc =
+        unsafe { libc::syscall(libc::SYS_tgkill as libc::c_long, pid, pid, libc::SIGKILL) as i32 };
     if rc < 0 {
         return Err(last_errno());
     }
@@ -353,10 +354,7 @@ pub(super) fn create_console_session(
     Ok(request.session_handle)
 }
 
-pub(super) fn close_console_session(
-    console_fd: RawFd,
-    session_handle: u64,
-) -> Result<bool, i32> {
+pub(super) fn close_console_session(console_fd: RawFd, session_handle: u64) -> Result<bool, i32> {
     let mut request = ConsoleCloseSessionRequest::new(session_handle);
     match sessiond_console_ioctl(console_fd, CONSOLE_IOCTL_CLOSE_SESSION, &mut request) {
         Ok(()) => Ok(true),
@@ -437,9 +435,7 @@ pub(super) fn ensure_console_fd(state: &mut BrokerState) -> Result<RawFd, i32> {
 }
 
 fn ioctl_with_mut<T>(fd: RawFd, request: usize, arg: &mut T) -> Result<(), i32> {
-    let rc = unsafe {
-        libc::syscall(SYS_IOCTL as libc::c_long, fd, request, arg as *mut T) as i32
-    };
+    let rc = unsafe { libc::syscall(SYS_IOCTL as libc::c_long, fd, request, arg as *mut T) as i32 };
     if rc < 0 {
         return Err(last_errno());
     }
@@ -447,7 +443,7 @@ fn ioctl_with_mut<T>(fd: RawFd, request: usize, arg: &mut T) -> Result<(), i32> 
 }
 
 fn build_exec_argv(exec_path: &str, argv: &[String]) -> Vec<CString> {
-    use super::{MAX_EXEC_ARG_COUNT};
+    use super::MAX_EXEC_ARG_COUNT;
     if argv.is_empty() {
         return vec![c_string_or_fallback(exec_path, "/")];
     }
@@ -464,7 +460,9 @@ fn build_exec_argv(exec_path: &str, argv: &[String]) -> Vec<CString> {
 }
 
 fn build_exec_env(extra_env: &[String]) -> Vec<CString> {
-    use runtime_control::{DEFAULT_RUNTIME_ENV_REGISTRY_PATH, RuntimeEnvScope, load_runtime_default_env};
+    use runtime_control::{
+        load_runtime_default_env, RuntimeEnvScope, DEFAULT_RUNTIME_ENV_REGISTRY_PATH,
+    };
     let default_env =
         load_runtime_default_env(DEFAULT_RUNTIME_ENV_REGISTRY_PATH, RuntimeEnvScope::Runtime)
             .unwrap_or_default();
@@ -472,7 +470,7 @@ fn build_exec_env(extra_env: &[String]) -> Vec<CString> {
 }
 
 fn build_exec_env_with_defaults(extra_env: &[String], default_env: &[String]) -> Vec<CString> {
-    use super::{MAX_EXEC_ENV_COUNT};
+    use super::MAX_EXEC_ENV_COUNT;
     let mut env = extra_env
         .iter()
         .filter(|item| valid_exec_text(item.as_str(), true))
@@ -577,12 +575,22 @@ mod tests {
             .map(|item| item.to_str().unwrap().to_string())
             .collect::<Vec<_>>();
         assert!(values.iter().any(|item| item == "PATH=/custom/bin"));
-        assert!(values.iter().any(|item| item == "XDG_RUNTIME_DIR=/run/custom"));
+        assert!(values
+            .iter()
+            .any(|item| item == "XDG_RUNTIME_DIR=/run/custom"));
         assert!(values.iter().any(|item| item == "HOME=/home/user"));
-        assert!(values.iter().any(|item| item == "WAYLAND_DISPLAY=wayland-0"));
+        assert!(values
+            .iter()
+            .any(|item| item == "WAYLAND_DISPLAY=wayland-0"));
         assert!(values.iter().any(|item| item == "XDG_SESSION_TYPE=wayland"));
-        assert!(values.iter().any(|item| item == "XDG_CURRENT_DESKTOP=RustOS"));
-        assert!(!values.iter().any(|item| item == "PATH=/bin:/usr/bin:/usr/local/bin"));
-        assert!(!values.iter().any(|item| item == "XDG_RUNTIME_DIR=/run/user/1000"));
+        assert!(values
+            .iter()
+            .any(|item| item == "XDG_CURRENT_DESKTOP=RustOS"));
+        assert!(!values
+            .iter()
+            .any(|item| item == "PATH=/bin:/usr/bin:/usr/local/bin"));
+        assert!(!values
+            .iter()
+            .any(|item| item == "XDG_RUNTIME_DIR=/run/user/1000"));
     }
 }

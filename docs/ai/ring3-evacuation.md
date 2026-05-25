@@ -132,10 +132,9 @@ For current active-batch file/LOC/owner table, see `docs/ai/ring3-inventory.md`.
    `driverd` policy. No active ring0 policy remaining; `.ko` execution stays
    ring0.
 
-6. **Storage selection** — `storaged` owns root-volume selection rank. Target:
-   full inventory/partition policy in `storaged` (Step 2 in *Active Migration
-   Plan*). Kernel keeps raw block hardware drivers and gated boot/block read
-   broker.
+6. **Storage selection** — `storaged` owns root-volume selection rank and
+   completed the active inventory/partition-policy wave. Kernel keeps raw
+   block hardware drivers and gated boot/block read broker.
 
 7. **Bootstrap VFS** — fixed spawn exceptions limited to rootd-started
    foundational service allowlist. Pre/post-vfsd file fallbacks retired. No
@@ -150,9 +149,10 @@ For current active-batch file/LOC/owner table, see `docs/ai/ring3-inventory.md`.
    retirement in active batch (`ring3-inventory.md`).
 
 10. **Console/TTY/session** — `runtimed` accepts `IPC_SERVICE_SESSIOND`;
-    `devmgrd` delegates console/session ioctl authorization to `sessiond`.
-    Target: move normal console buffers and TTY edit buffers out of ring0
-    (Step 3 in *Active Migration Plan*).
+    `devmgrd` delegates console/session ioctl execution/authorization to
+    `sessiond`, and normal console output/input plus TTY edit state are
+    service-owned. Ring0 keeps boot/panic console primitives and final gated
+    commit/user-copy paths.
 
 11. **Cold Linux/Win32 ABI** — `syscalld`, `procd`, `loaderd` all accept
     commercial-max envelopes. Shared ABI in `rustos-user-abi::linux`. Target:

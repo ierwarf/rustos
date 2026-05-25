@@ -7,14 +7,14 @@ use std::time::Instant;
 
 use runtime_control::RuntimeRunningProgram;
 
-use super::{BrokerState, LaunchEntry, RuntimeRequest, RuntimeResponse};
 use super::{
-    LAUNCH_TARGET_NEW_SESSION, MAX_POLICY_LAUNCH_ATTEMPTS_PER_TICK,
-    MAX_RUNTIME_CLIENTS_PER_TICK, MAX_RUNTIME_PROGRAMS, OP_NOTIFY_READY,
-    OP_REQUEST_LAUNCH_PATH, OP_REQUEST_TERMINATE, OP_SNAPSHOT_RUNNING_PROGRAMS, PROTOCOL_VERSION,
+    boot_line, LAUNCH_TARGET_NEW_SESSION, MAX_POLICY_LAUNCH_ATTEMPTS_PER_TICK,
+    MAX_RUNTIME_CLIENTS_PER_TICK, MAX_RUNTIME_PROGRAMS, OP_NOTIFY_READY, OP_REQUEST_LAUNCH_PATH,
+    OP_REQUEST_TERMINATE, OP_SNAPSHOT_RUNNING_PROGRAMS, PROTOCOL_VERSION,
     READY_COMPONENT_UI_SERVER, RETRY_BACKOFF, TERMINATE_TARGET_PID, TERMINATE_TARGET_SESSION,
-    UI_SERVER_EXEC_PATH, boot_line,
+    UI_SERVER_EXEC_PATH,
 };
+use super::{BrokerState, LaunchEntry, RuntimeRequest, RuntimeResponse};
 
 pub(super) fn bind_listener(path: &str) -> Result<UnixListener, i32> {
     let started_at = Instant::now();
@@ -308,6 +308,7 @@ fn handle_terminate(
                 super::spawn::ensure_console_fd(state)?,
                 request.target_value,
             )? {
+                state.session_runtime.remove_session(request.target_value);
                 terminated = true;
             }
         }

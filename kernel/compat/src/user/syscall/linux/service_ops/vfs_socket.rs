@@ -122,6 +122,12 @@ pub fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
         if user_len == 0 {
             return 0;
         }
+        if !current_console_session_is_system() {
+            return match console_read_via_sessiond(user_ptr, user_len) {
+                Ok(read) => read,
+                Err(errno) => linux_errno(errno),
+            };
+        }
         return match crate::user::sysops::console::read_into_current_process(user_ptr, user_len) {
             Ok(read) => read as u64,
             Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
@@ -401,6 +407,12 @@ pub fn syscall_linux_vfs_write(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
         if user_len == 0 {
             return 0;
         }
+        if !current_console_session_is_system() {
+            return match console_write_via_sessiond(user_ptr, user_len) {
+                Ok(written) => written,
+                Err(errno) => linux_errno(errno),
+            };
+        }
         return match crate::user::sysops::console::write_from_current_process(user_ptr, user_len) {
             Ok(written) => written as u64,
             Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
@@ -574,21 +586,13 @@ pub fn syscall_linux_socket_recvfrom_direct(
     Some(result.unwrap_or_else(linux_errno))
 }
 
-pub fn syscall_linux_socket_sendmsg_direct(
-    fd: u64,
-    msg_ptr: u64,
-    flags: u64,
-) -> Option<u64> {
+pub fn syscall_linux_socket_sendmsg_direct(fd: u64, msg_ptr: u64, flags: u64) -> Option<u64> {
     let (socket, status_flags) = current_socket_with_flags(fd)?;
     let result = socket_sendmsg_current(&socket, msg_ptr, status_flags, flags);
     Some(result.unwrap_or_else(linux_errno))
 }
 
-pub fn syscall_linux_socket_recvmsg_direct(
-    fd: u64,
-    msg_ptr: u64,
-    flags: u64,
-) -> Option<u64> {
+pub fn syscall_linux_socket_recvmsg_direct(fd: u64, msg_ptr: u64, flags: u64) -> Option<u64> {
     let (socket, status_flags) = current_socket_with_flags(fd)?;
     let result = socket_recvmsg_current(&socket, msg_ptr, status_flags, flags);
     Some(result.unwrap_or_else(linux_errno))

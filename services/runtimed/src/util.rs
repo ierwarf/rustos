@@ -114,4 +114,3 @@ fn valid_request_text(value: &str) -> bool {
             .bytes()
             .all(|byte| matches!(byte, b' '..=b'~') && byte != b'\\')
 }
-

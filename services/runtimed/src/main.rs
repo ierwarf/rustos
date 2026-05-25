@@ -5,7 +5,7 @@ use std::sync::atomic::AtomicU64;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use runtime_control::{DEFAULT_RUNTIME_SOCKET_PATH, StartupMode};
+use runtime_control::{StartupMode, DEFAULT_RUNTIME_SOCKET_PATH};
 use rustos_user_abi::console::{self as console_abi};
 
 mod catalog;
@@ -136,6 +136,7 @@ pub(crate) struct ProgramMetadata {
 
 pub(crate) struct BrokerState {
     pub(crate) console_fd: Option<OwnedFd>,
+    pub(crate) session_runtime: session::SessionRuntime,
     pub(crate) running: BTreeMap<i32, RunningProcess>,
     pub(crate) launched_once: BTreeSet<String>,
     pub(crate) retry_after: BTreeMap<String, Instant>,
@@ -181,6 +182,7 @@ fn main() {
 
     let mut state = BrokerState {
         console_fd: None,
+        session_runtime: session::SessionRuntime::default(),
         running: BTreeMap::new(),
         launched_once: BTreeSet::new(),
         retry_after: BTreeMap::new(),

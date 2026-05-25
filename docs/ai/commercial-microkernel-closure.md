@@ -219,11 +219,11 @@ remaining 10594 marked LOC in `cargo xtask ring3-inventory` belongs to the
 larger commercial-max abi-first/service-shrink/policy-bridge lanes and the
 excluded xHCI/NVMe `.ko`-evaluation lane.
 
-## Active Migration Plan (~5000 LOC)
+## Active Migration Plan (~2500 LOC)
 
 This is the next concrete migration wave. The commercial-max protocol envelope
-already exists on every owner below, so each step is **policy/code move plus
-marker retirement**, not protocol design.
+already exists on every owner below, so the active steps here are policy/code
+move plus marker retirement, not protocol design.
 
 Take steps in order. Each step is independent enough to land as one PR but
 should be completed end-to-end (move policy → switch caller → delete ring0
@@ -241,75 +241,6 @@ For every step the shape is:
 4. Retire the `RING3-MIGRATION-REFERENCE START`/`END` pair.
 5. Re-run `cargo xtask ring3-inventory`; the affected file must drop off the
    table.
-
-### Step 1 — `process/mod.rs` cold image dispatch (97 LOC)
-
-- File: `kernel/compat/src/user/process/mod.rs`.
-- Owner: `loaderd` + `procd`.
-- Move: residual generic executable detection and cold-PE/file-backed image
-  dispatch helpers. `loaderd` already owns the live PE/ELF runtime plan; this
-  step deletes the kernel-side dispatch leftovers.
-- Ring0 keeps: `spawn_prepared_process`, guarded user-stack mapping,
-  `UserTaskBootstrap` assembly, scheduler commit.
-- Validation: `cargo xtask check` + commercial-max QEMU signature.
-
-### Step 2 — Storaged inventory finalization (969 LOC)
-
-- Files: `kernel/io-manager/src/storage/boot_volume.rs` (483),
-  `kernel/io-manager/src/storage/block/boot.rs` (247),
-  `kernel/io-manager/src/storage/block/io.rs` (239).
-- Owner: `storaged` (already owns root-volume selection rank and root-extent
-  registry parsing).
-- Move: post-bootstrap boot-volume candidate selection, root-extent registry
-  parse/cache and direct-read helpers, block-cache and runtime block IO
-  policy. Route remaining callers through `STORAGED_OP_BOOT_EXTENT_LOOKUP`
-  and the commercial-max `BlockInventory`/`BootExtentLease`/`VolumeMetadata`
-  ops.
-- Ring0 keeps: physical boot-volume primitive read, raw block IO controller
-  paths (AHCI/NVMe drivers stay separate), the gated boot/block read broker
-  for early `rootd` and `vfsd`.
-- Validation: `cargo xtask build` + commercial-max QEMU signature with the
-  NVMe profile (exercises the boot path that previously ran the kernel
-  fallbacks).
-
-### Step 3 — Sessiond console/session/tty cluster (1080 LOC)
-
-- Files: `kernel/io-manager/src/io/console.rs` (227),
-  `kernel/io-manager/src/io/session.rs` (324),
-  `kernel/io-manager/src/io/tty.rs` (529).
-- Owner: `sessiond` via `runtimed` on `IPC_SERVICE_SESSIOND` (already
-  accepting the commercial-max envelope; `devmgrd` → `sessiond` console/session
-  ioctl authorization is live).
-- Move: normal console buffering and per-session route, session graph state,
-  TTY line discipline and edit buffers. Use the commercial-max
-  `SessionGraph`/`TtyLineDiscipline`/`ConsoleRoute`/`ForegroundFocus`/
-  `UiBootstrap` ops on the existing endpoint.
-- Ring0 keeps: boot console + panic output primitive, current-process
-  user-copy, final console-focus/session-commit behind the gated device-ioctl
-  broker.
-- Validation: `cargo xtask build` + commercial-max QEMU signature.
-  Console/TTY regressions surface through `wayclick.desktop` readiness and
-  the boot debugcon markers; both are part of the signature.
-- 2026-05-25 completed slice:
-  - `SessionGraph` reads (`GET_STATE`, `SNAPSHOT_SESSIONS`) now execute on the
-    `sessiond`/`runtimed` commercial-max endpoint and return payloads through
-    `devmgrd`'s ioctl response path.
-  - Console lifecycle commits (`CREATE_SESSION`, `CLOSE_SESSION`,
-    `BIND_CURRENT_SESSION`, `SET_SESSION_STATE`, `SET_FOCUS`) no longer bounce
-    through reentrant sessiond authorization before the gated device-ioctl
-    broker performs the final ring0 commit.
-  - `runtimed` gates non-service policy launches on loaderd endpoint readiness
-    and no longer treats loader readiness `ENOSYS` as a permanent desktop
-    launch failure; the observed `shell.desktop errno=38` regression is fixed.
-  - `TTY_LINE_DISCIPLINE` now gates `TCGETS`, `TCSETS`, `TCSETSW`, `TCSETSF`,
-    and `FIONREAD` through the `sessiond`/`runtimed` commercial-max endpoint
-    before ring0 performs the current-process console-fd user-copy/commit.
-  - Validation passed: `cargo xtask check`, `cargo xtask build`, and
-    `cargo xtask run --profile nvme --accel-profile kvm --usb-input
-    --debugcon file --commercial-max-ready -- --no-reboot`.
-- Remaining before Step 3 can be deleted: move the actual normal console
-  output/input buffers and TTY edit buffers out of `kernel/io-manager/src/io/*`
-  instead of only service-gating their ring0 commits.
 
 ### Step 4 — Syscalld + pagerd MM cluster (1288 LOC)
 
@@ -370,16 +301,16 @@ For every step the shape is:
 
 ### Plan totals and what comes after
 
-Cumulative LOC retired by completing all seven steps: **4694 marked LOC**
-(97 + 969 + 1080 + 1288 + 462 + 550 + 248).
+The remaining active wave in this plan is Steps 4-7, which retire **2548
+marked LOC** \(1288 + 462 + 550 + 248\).
 
-After this wave, the remaining ~7210 LOC of active-batch markers is the harder
-set: abi-first-large (`process/linux.rs` 1297, `proc_broker_ops.rs` 1210,
-`ipc_ops.rs` 1064, `process/mod.rs` already in Step 1), large service-shrink
-(`ps/user/socket.rs` 956, `usb/runtime.rs` 768, `storage/ahci.rs` 728,
-`net_broker_ops.rs` 622, `usb/core.rs` 565), and `policy-bridge` USB/HID +
-network. Those need additional service/driver work and are intentionally
-deferred; do not pull them forward into this wave.
+After this wave, the remaining backlog outside this plan is the harder set:
+abi-first-large \(`process/linux.rs` 1297, `proc_broker_ops.rs` 1210,
+`ipc_ops.rs` 1064\), large service-shrink \(`ps/user/socket.rs` 956,
+`usb/runtime.rs` 768, `storage/ahci.rs` 728, `net_broker_ops.rs` 622,
+`usb/core.rs` 565\), and `policy-bridge` USB/HID + network. Those need
+additional service/driver work and are intentionally deferred; do not pull
+them forward into this wave.
 
 ## Service Protocol Target
 

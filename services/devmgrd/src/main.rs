@@ -383,6 +383,8 @@ fn sessiond_executes_ioctl(request_number: u64) -> bool {
         request_number,
         rustos_user_abi::console::CONSOLE_IOCTL_GET_STATE
             | rustos_user_abi::console::CONSOLE_IOCTL_SNAPSHOT_SESSIONS
+            | rustos_user_abi::console::CONSOLE_IOCTL_SNAPSHOT_SESSION_OUTPUT
+            | rustos_user_abi::console::CONSOLE_IOCTL_SEND_INPUT_EVENT
     )
 }
 

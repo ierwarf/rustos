@@ -11,9 +11,9 @@ cargo xtask ring3-inventory
 
 Current snapshot:
 
-- `total_marked_loc=14814`
+- `total_marked_loc=12668`
 - `excluded_xhci_nvme_loc=2910`
-- `active_batch_marked_loc=11904`
+- `active_batch_marked_loc=9758`
 
 `kernel/io-manager/src/usb/xhci.rs` and
 `kernel/io-manager/src/storage/nvme.rs` are explicitly excluded from the active
@@ -32,18 +32,11 @@ batch while `.ko` replacement is being evaluated.
 | 622 | service-shrink | netd | replace marked policy with service-owned protocol and then remove marker | `kernel/compat/src/user/syscall/linux/net_broker_ops.rs` |
 | 565 | service-shrink | inputd | replace marked policy with service-owned protocol and then remove marker | `kernel/io-manager/src/usb/core.rs` |
 | 550 | policy-bridge | devmgrd | replace marked policy with service-owned protocol and then remove marker | `kernel/compat/src/user/sysops/device.rs` |
-| 529 | service-shrink | sessiond | replace marked policy with service-owned protocol and then remove marker | `kernel/io-manager/src/io/tty.rs` |
 | 495 | policy-bridge | syscalld-pagerd | replace marked policy with service-owned protocol and then remove marker | `kernel/compat/src/user/syscall/linux/mm_broker_ops.rs` |
-| 483 | service-shrink | storaged | move post-bootstrap storage policy into storaged, keep raw block broker | `kernel/io-manager/src/storage/boot_volume.rs` |
 | 462 | policy-bridge | vfsd-pagerd | replace marked policy with service-owned protocol and then remove marker | `kernel/compat/src/user/sysops/file.rs` |
 | 422 | policy-bridge | syscalld-pagerd | replace marked policy with service-owned protocol and then remove marker | `kernel/compat/src/user/syscall/linux/memory_ops.rs` |
 | 371 | policy-bridge | syscalld-pagerd | replace marked policy with service-owned protocol and then remove marker | `kernel/compat/src/user/syscall/linux/syscalld_ops.rs` |
-| 324 | service-shrink | sessiond | replace marked policy with service-owned protocol and then remove marker | `kernel/io-manager/src/io/session.rs` |
 | 248 | policy-bridge | syscalld-pagerd | replace marked policy with service-owned protocol and then remove marker | `kernel/compat/src/user/sysops/win32/memory.rs` |
-| 247 | service-shrink | storaged | move post-bootstrap storage policy into storaged, keep raw block broker | `kernel/io-manager/src/storage/block/boot.rs` |
-| 239 | service-shrink | storaged | move post-bootstrap storage policy into storaged, keep raw block broker | `kernel/io-manager/src/storage/block/io.rs` |
-| 227 | service-shrink | sessiond | replace marked policy with service-owned protocol and then remove marker | `kernel/io-manager/src/io/console.rs` |
-| 97 | abi-first-large | loaderd-procd | move cold image/process policy into loaderd/procd before deleting ring0 parser branches | `kernel/compat/src/user/process/mod.rs` |
 
 ## Excluded `.ko` Evaluation Lane
 

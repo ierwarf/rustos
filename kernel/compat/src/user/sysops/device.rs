@@ -10,7 +10,6 @@ use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
 
 use crate::io::device::{self as device_ns};
-use crate::io::tty;
 use crate::memory::paging;
 use crate::multitask;
 use crate::user::handles::{DisplaySurfaceHandle, KernelHandle, RemoteVfsHandleKind};
@@ -149,10 +148,6 @@ fn ioctl_console_device(
             ioctl_console_set_session_state(process_state, arg)
         }
         console_abi::CONSOLE_IOCTL_SET_FOCUS => ioctl_console_set_focus(process_state, arg),
-        linux_abi::TCGETS => ioctl_console_tcgets(process_state, arg),
-        linux_abi::TCSETS | linux_abi::TCSETSW => ioctl_console_tcsets(process_state, arg, false),
-        linux_abi::TCSETSF => ioctl_console_tcsets(process_state, arg, true),
-        linux_abi::FIONREAD => ioctl_console_fionread(process_state, arg),
         _ => Err(DeviceSysopError::Unsupported),
     }
 }
@@ -237,41 +232,6 @@ fn ioctl_console_set_focus(
     } else {
         Err(DeviceSysopError::NotFound)
     }
-}
-
-fn ioctl_console_tcgets(
-    process_state: &mut UserProcessState,
-    arg: u64,
-) -> Result<u64, DeviceSysopError> {
-    let termios = tty::termios_for_session(current_console_session());
-    write_process_struct(process_state, arg, &termios)?;
-    Ok(0)
-}
-
-fn ioctl_console_tcsets(
-    process_state: &mut UserProcessState,
-    arg: u64,
-    flush_input: bool,
-) -> Result<u64, DeviceSysopError> {
-    let termios = read_process_struct::<linux_abi::LinuxTermios>(process_state, arg)?;
-    tty::set_termios_for_session(current_console_session(), termios, flush_input);
-    Ok(0)
-}
-
-fn ioctl_console_fionread(
-    process_state: &mut UserProcessState,
-    arg: u64,
-) -> Result<u64, DeviceSysopError> {
-    let pending =
-        tty::pending_input_len_for_session(current_console_session()).min(i32::MAX as usize);
-    write_process_struct(process_state, arg, &(pending as i32))?;
-    Ok(0)
-}
-
-fn current_console_session() -> kernel_object::api::session::ConsoleSessionHandle {
-    multitask::current_user_snapshot()
-        .map(|snapshot| snapshot.console_session())
-        .unwrap_or_else(multitask::current_console_session)
 }
 
 fn read_process_text(

@@ -595,4 +595,3 @@ pub fn syscall_linux_rseq(area_ptr: u64, len: u64, flags: u64, signature: u64) -
         Err(errno) => linux_errno(errno),
     }
 }
-

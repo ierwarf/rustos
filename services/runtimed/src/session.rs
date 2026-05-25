@@ -1,34 +1,394 @@
+use std::collections::{BTreeMap, VecDeque};
 use std::mem::size_of;
-use std::os::fd::AsRawFd;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rustos_user_abi::console::{
-    self as console_abi, ConsoleSessionInfo, ConsoleSnapshotSessionsRequest, ConsoleStateInfo,
+use runtime_control::{
+    load_desktop_program_entries, load_runtime_default_env, RuntimeEnvScope,
+    DEFAULT_APPLICATIONS_DIR, DEFAULT_RUNTIME_ENV_REGISTRY_PATH,
 };
+use rustos_user_abi::console::{
+    self as console_abi, ConsoleSendInputEventRequest, ConsoleSessionInfo,
+    ConsoleSnapshotSessionOutputRequest, ConsoleSnapshotSessionsRequest, ConsoleStateInfo,
+};
+use rustos_user_abi::device::{InputEvent, INPUT_ACTION_RELEASED, INPUT_KIND_KEYBOARD};
+use rustos_user_abi::linux::LinuxTermios;
 use rustos_user_abi::syscall::{
+    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse,
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_SESSIOND,
+    COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READ, COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_WRITE,
     COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE, COMMERCIAL_MAX_SESSIOND_OP_FOREGROUND_FOCUS,
     COMMERCIAL_MAX_SESSIOND_OP_SESSION_GRAPH, COMMERCIAL_MAX_SESSIOND_OP_TTY_LINE_DISCIPLINE,
-    COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP, CommercialMaxCapabilityLeaseWire,
-    CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
-    CommercialMaxProtocolResponse, IPC_SERVICE_DEVMGRD, IPC_SERVICE_SESSIOND,
-    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
-    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_TRY_RECV,
-};
-use runtime_control::{
-    DEFAULT_APPLICATIONS_DIR, DEFAULT_RUNTIME_ENV_REGISTRY_PATH, RuntimeEnvScope,
-    load_desktop_program_entries, load_runtime_default_env,
+    COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP, IPC_SERVICE_DEVMGRD, IPC_SERVICE_SESSIOND,
+    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
+    SYS_RUSTOS_IPC_TRY_RECV,
 };
 
-use super::{BrokerState, LaunchEntry};
 use super::{
-    CONSOLE_SESSION_STATE_RUNNING, DEVMGRD_BOOTSTRAP_WAIT_TIMEOUT, LINUX_FIONREAD, LINUX_TCGETS,
-    LINUX_TCSETS, LINUX_TCSETSF, LINUX_TCSETSW, SERVICE_ENDPOINT_POLL_INTERVAL,
+    boot_line, CONSOLE_SESSION_STATE_RUNNING, DEVMGRD_BOOTSTRAP_WAIT_TIMEOUT, LINUX_FIONREAD,
+    LINUX_TCGETS, LINUX_TCSETS, LINUX_TCSETSF, LINUX_TCSETSW, SERVICE_ENDPOINT_POLL_INTERVAL,
     SESSION_GRAPH_GENERATION, UI_SERVER_DESKTOP_FILE_ID, UI_SERVER_DISPLAY_NAME,
-    UI_SERVER_EXEC_PATH, UI_SERVER_TASK_WEIGHT_MICROS, boot_line,
+    UI_SERVER_EXEC_PATH, UI_SERVER_TASK_WEIGHT_MICROS,
 };
+use super::{BrokerState, LaunchEntry};
+
+const INPUT_BUFFER_CAPACITY: usize = 1024;
+const EDIT_BUFFER_CAPACITY: usize = 256;
+const OUTPUT_BUFFER_CAPACITY: usize = 4096;
+const KEY_ESCAPE: u32 = 0;
+const KEY_BACKSPACE: u32 = 13;
+const KEY_ENTER: u32 = 27;
+const KEY_NUMPAD_ENTER: u32 = 88;
+const KEY_INSERT: u32 = 90;
+const KEY_DELETE: u32 = 91;
+const KEY_HOME: u32 = 92;
+const KEY_END: u32 = 93;
+const KEY_PAGE_UP: u32 = 94;
+const KEY_PAGE_DOWN: u32 = 95;
+const KEY_ARROW_UP: u32 = 96;
+const KEY_ARROW_DOWN: u32 = 97;
+const KEY_ARROW_LEFT: u32 = 98;
+const KEY_ARROW_RIGHT: u32 = 99;
+
+#[derive(Default)]
+pub(crate) struct SessionRuntime {
+    sessions: BTreeMap<u64, TtySessionState>,
+    output_generation: u64,
+}
+
+impl SessionRuntime {
+    pub(crate) fn create_session(&mut self, session: u64) {
+        self.sessions.entry(session).or_default();
+    }
+
+    pub(crate) fn remove_session(&mut self, session: u64) {
+        self.sessions.remove(&session);
+    }
+
+    fn session_mut(&mut self, session: u64) -> &mut TtySessionState {
+        self.sessions.entry(session).or_default()
+    }
+
+    fn write_to_session(&mut self, session: u64, bytes: &[u8]) -> usize {
+        let state = self.session_mut(session);
+        let written = state.write(bytes);
+        if written != 0 {
+            self.output_generation = self.output_generation.wrapping_add(1).max(1);
+        }
+        written
+    }
+
+    fn read_from_session(&mut self, session: u64, dest: &mut [u8]) -> usize {
+        self.session_mut(session).read_input(dest)
+    }
+
+    fn snapshot_output(&self, session: u64, dest: &mut [u8]) -> Option<usize> {
+        let state = self.sessions.get(&session)?;
+        Some(state.snapshot_output(dest))
+    }
+
+    fn handle_input_event(&mut self, session: u64, event: InputEvent) -> Result<(), i32> {
+        if event.kind != INPUT_KIND_KEYBOARD {
+            return Ok(());
+        }
+        if event.action == INPUT_ACTION_RELEASED {
+            return Ok(());
+        }
+        let state = self.session_mut(session);
+        let changed = state.on_key_event(event)?;
+        if changed {
+            self.output_generation = self.output_generation.wrapping_add(1).max(1);
+        }
+        Ok(())
+    }
+
+    fn termios(&mut self, session: u64) -> LinuxTermios {
+        self.session_mut(session).termios
+    }
+
+    fn set_termios(&mut self, session: u64, termios: LinuxTermios, flush_input: bool) {
+        self.session_mut(session).set_termios(termios, flush_input);
+    }
+
+    fn pending_input_len(&mut self, session: u64) -> usize {
+        self.session_mut(session).input.len()
+    }
+
+    fn output_generation(&self) -> u64 {
+        self.output_generation
+    }
+}
+
+struct TtySessionState {
+    input: VecDeque<u8>,
+    edit: Vec<u8>,
+    edit_cursor: usize,
+    output: VecDeque<u8>,
+    termios: LinuxTermios,
+}
+
+impl Default for TtySessionState {
+    fn default() -> Self {
+        Self {
+            input: VecDeque::new(),
+            edit: Vec::new(),
+            edit_cursor: 0,
+            output: VecDeque::new(),
+            termios: LinuxTermios::default_console(),
+        }
+    }
+}
+
+impl TtySessionState {
+    fn read_input(&mut self, dest: &mut [u8]) -> usize {
+        let mut read = 0usize;
+        while read < dest.len() {
+            let Some(byte) = self.input.pop_front() else {
+                break;
+            };
+            dest[read] = byte;
+            read += 1;
+        }
+        read
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> usize {
+        if self.termios.maps_output_newline_to_crlf() {
+            let mut previous = None;
+            for &byte in bytes {
+                if byte == b'\n' && previous != Some(b'\r') {
+                    self.push_output(b'\r');
+                }
+                self.push_output(byte);
+                previous = Some(byte);
+            }
+        } else {
+            self.push_output_bytes(bytes);
+        }
+        bytes.len()
+    }
+
+    fn snapshot_output(&self, dest: &mut [u8]) -> usize {
+        let count = dest.len().min(self.output.len());
+        let skip = self.output.len().saturating_sub(count);
+        for (idx, byte) in self.output.iter().skip(skip).take(count).enumerate() {
+            dest[idx] = *byte;
+        }
+        count
+    }
+
+    fn on_key_event(&mut self, event: InputEvent) -> Result<bool, i32> {
+        let before = self.output.len();
+        if self.termios.is_canonical() {
+            self.on_canonical_key_event(event)?;
+        } else {
+            self.on_noncanonical_key_event(event)?;
+        }
+        Ok(self.output.len() != before)
+    }
+
+    fn on_canonical_key_event(&mut self, event: InputEvent) -> Result<(), i32> {
+        match event.code {
+            KEY_ARROW_LEFT => self.move_cursor_left(),
+            KEY_ARROW_RIGHT => self.move_cursor_right(),
+            KEY_BACKSPACE => self.handle_backspace(),
+            KEY_ENTER | KEY_NUMPAD_ENTER => self.commit_line(),
+            _ => {
+                let byte = input_event_text_byte(event)?;
+                self.insert_edit_byte(byte);
+            }
+        }
+        Ok(())
+    }
+
+    fn on_noncanonical_key_event(&mut self, event: InputEvent) -> Result<(), i32> {
+        let bytes = noncanonical_input_bytes(self.termios, event)?;
+        self.push_input_bytes(&bytes);
+        if self.termios.echo_enabled() {
+            self.echo_noncanonical_input(&bytes);
+        }
+        Ok(())
+    }
+
+    fn insert_edit_byte(&mut self, byte: u8) {
+        if self.edit.len() == EDIT_BUFFER_CAPACITY {
+            return;
+        }
+        let cursor = self.edit_cursor.min(self.edit.len());
+        self.edit.insert(cursor, byte);
+        self.edit_cursor = cursor + 1;
+        if self.should_echo_canonical_input() {
+            if cursor + 1 == self.edit.len() {
+                self.push_output(byte);
+            } else {
+                let tail: Vec<u8> = self.edit[cursor..].to_vec();
+                self.push_output_bytes(&tail);
+                self.move_visual_cursor_left(self.edit.len() - self.edit_cursor);
+            }
+        }
+    }
+
+    fn handle_backspace(&mut self) {
+        if self.edit_cursor == 0 || self.edit.is_empty() {
+            return;
+        }
+        let delete_at = self.edit_cursor - 1;
+        self.edit.remove(delete_at);
+        self.edit_cursor -= 1;
+        if self.should_echo_canonical_input() {
+            if delete_at == self.edit.len() {
+                self.push_output_bytes(b"\x08 \x08");
+            } else {
+                self.move_visual_cursor_left(1);
+                let tail: Vec<u8> = self.edit[delete_at..].to_vec();
+                self.push_output_bytes(&tail);
+                self.push_output(b' ');
+                self.move_visual_cursor_left(self.edit.len() - delete_at + 1);
+            }
+        }
+    }
+
+    fn move_cursor_left(&mut self) {
+        if self.edit_cursor == 0 {
+            return;
+        }
+        self.edit_cursor -= 1;
+        if self.should_echo_canonical_input() {
+            self.move_visual_cursor_left(1);
+        }
+    }
+
+    fn move_cursor_right(&mut self) {
+        if self.edit_cursor >= self.edit.len() {
+            return;
+        }
+        self.edit_cursor += 1;
+        if self.should_echo_canonical_input() {
+            self.move_visual_cursor_right(1);
+        }
+    }
+
+    fn commit_line(&mut self) {
+        let required = self.edit.len().saturating_add(1);
+        if self.input.len().saturating_add(required) > INPUT_BUFFER_CAPACITY {
+            return;
+        }
+        if self.should_echo_canonical_input() {
+            self.push_output_bytes(b"\r\n");
+        }
+        let edit = core::mem::take(&mut self.edit);
+        self.push_input_bytes(&edit);
+        self.push_input_bytes(b"\n");
+        self.edit_cursor = 0;
+    }
+
+    fn set_termios(&mut self, termios: LinuxTermios, flush_input: bool) {
+        if flush_input {
+            self.input.clear();
+            self.edit.clear();
+            self.edit_cursor = 0;
+        } else if self.termios.is_canonical() && !termios.is_canonical() {
+            let edit = core::mem::take(&mut self.edit);
+            self.push_input_bytes(&edit);
+            self.edit_cursor = 0;
+        }
+        self.termios = termios;
+    }
+
+    fn should_echo_canonical_input(&self) -> bool {
+        self.termios.is_canonical() && self.termios.echo_enabled()
+    }
+
+    fn echo_noncanonical_input(&mut self, bytes: &[u8]) {
+        if bytes.len() != 1 {
+            return;
+        }
+        match bytes[0] {
+            b'\n' => self.push_output_bytes(b"\r\n"),
+            0x08 | 0x7f => self.push_output_bytes(b"\x08 \x08"),
+            b'\t' | 0x20..=0x7e => self.push_output(bytes[0]),
+            byte if self.termios.echoes_control_chars() => {
+                self.push_output(b'^');
+                self.push_output(if byte == 0x7f {
+                    b'?'
+                } else {
+                    byte.saturating_add(64)
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn move_visual_cursor_left(&mut self, count: usize) {
+        self.write_cursor_move_sequence(count, b'D');
+    }
+
+    fn move_visual_cursor_right(&mut self, count: usize) {
+        self.write_cursor_move_sequence(count, b'C');
+    }
+
+    fn write_cursor_move_sequence(&mut self, count: usize, direction: u8) {
+        if count == 0 {
+            return;
+        }
+        self.push_output_bytes(b"\x1b[");
+        if count != 1 {
+            for byte in count.to_string().bytes() {
+                self.push_output(byte);
+            }
+        }
+        self.push_output(direction);
+    }
+
+    fn push_input_bytes(&mut self, bytes: &[u8]) {
+        let room = INPUT_BUFFER_CAPACITY.saturating_sub(self.input.len());
+        for &byte in bytes.iter().take(room) {
+            self.input.push_back(byte);
+        }
+    }
+
+    fn push_output_bytes(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.push_output(byte);
+        }
+    }
+
+    fn push_output(&mut self, byte: u8) {
+        if self.output.len() == OUTPUT_BUFFER_CAPACITY {
+            let _ = self.output.pop_front();
+        }
+        self.output.push_back(byte);
+    }
+}
+
+fn input_event_text_byte(event: InputEvent) -> Result<u8, i32> {
+    if event.text == 0 || event.text > u8::MAX as u32 {
+        return Err(libc::EINVAL);
+    }
+    Ok(event.text as u8)
+}
+
+fn noncanonical_input_bytes(termios: LinuxTermios, event: InputEvent) -> Result<Vec<u8>, i32> {
+    let bytes: &[u8] = match event.code {
+        KEY_BACKSPACE => return Ok(vec![termios.erase_byte()]),
+        KEY_ENTER | KEY_NUMPAD_ENTER => b"\n",
+        KEY_ARROW_UP => b"\x1b[A",
+        KEY_ARROW_DOWN => b"\x1b[B",
+        KEY_ARROW_RIGHT => b"\x1b[C",
+        KEY_ARROW_LEFT => b"\x1b[D",
+        KEY_HOME => b"\x1b[H",
+        KEY_END => b"\x1b[F",
+        KEY_INSERT => b"\x1b[2~",
+        KEY_DELETE => b"\x1b[3~",
+        KEY_PAGE_UP => b"\x1b[5~",
+        KEY_PAGE_DOWN => b"\x1b[6~",
+        KEY_ESCAPE => b"\x1b",
+        _ => return Ok(vec![input_event_text_byte(event)?]),
+    };
+    Ok(bytes.to_vec())
+}
 
 pub(super) fn bootstrap_ui_server(state: &mut BrokerState) -> Result<(), i32> {
     boot_line("runtimed: waiting for devmgrd before ui bootstrap");
@@ -66,8 +426,7 @@ fn wait_for_service_endpoint(service_id: u64, timeout: Duration) -> Result<(), i
 }
 
 pub(super) fn create_session_endpoint() -> Option<u64> {
-    let endpoint =
-        unsafe { libc::syscall(SYS_RUSTOS_IPC_ENDPOINT_CREATE as libc::c_long) as i64 };
+    let endpoint = unsafe { libc::syscall(SYS_RUSTOS_IPC_ENDPOINT_CREATE as libc::c_long) as i64 };
     if endpoint < 0 {
         super::spawn::stderr_line("runtimed: session endpoint create failed");
         return None;
@@ -131,7 +490,7 @@ pub(super) fn service_session_endpoint(endpoint: Option<u64>, state: &mut Broker
 
 fn handle_session_request(
     request: &CommercialMaxProtocolRequest,
-    state: &BrokerState,
+    state: &mut BrokerState,
     response: &mut CommercialMaxProtocolResponse,
 ) -> i32 {
     if request.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
@@ -150,31 +509,10 @@ fn handle_session_request(
             handle_session_graph_request(request, state, response)
         }
         COMMERCIAL_MAX_SESSIOND_OP_TTY_LINE_DISCIPLINE => {
-            response.descriptor_count = 1;
-            response.value0 = u64::from(state.console_fd.is_some());
-            response.descriptors[0] = session_descriptor(
-                "tty-line",
-                request.header.op,
-                state
-                    .console_fd
-                    .as_ref()
-                    .map_or(0, |fd| fd.as_raw_fd() as u64),
-                0,
-            );
-            response.capability = session_capability("tty-line", request.header.op);
-            0
+            handle_tty_line_request(request, state, response)
         }
         COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE => {
-            response.value0 = state
-                .running
-                .values()
-                .filter(|program| program.session_handle != 0)
-                .count() as u64;
-            response.descriptor_count = 1;
-            response.descriptors[0] =
-                session_descriptor("console-route", request.header.op, response.value0, 0);
-            response.capability = session_capability("console-route", request.header.op);
-            0
+            handle_console_route_request(request, state, response)
         }
         COMMERCIAL_MAX_SESSIOND_OP_FOREGROUND_FOCUS => {
             let focused_session = state
@@ -224,6 +562,8 @@ fn session_op_accepts_ioctl(op: u16, request_number: u64) -> bool {
                 | console_abi::CONSOLE_IOCTL_CLOSE_SESSION
                 | console_abi::CONSOLE_IOCTL_BIND_CURRENT_SESSION
                 | console_abi::CONSOLE_IOCTL_SET_SESSION_STATE
+                | COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READ
+                | COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_WRITE
         ),
         COMMERCIAL_MAX_SESSIOND_OP_FOREGROUND_FOCUS => {
             request_number == console_abi::CONSOLE_IOCTL_SET_FOCUS
@@ -234,6 +574,132 @@ fn session_op_accepts_ioctl(op: u16, request_number: u64) -> bool {
         ),
         COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP => false,
         _ => false,
+    }
+}
+
+fn handle_tty_line_request(
+    request: &CommercialMaxProtocolRequest,
+    state: &mut BrokerState,
+    response: &mut CommercialMaxProtocolResponse,
+) -> i32 {
+    let session = request.arg2;
+    if session == 0 {
+        return libc::EINVAL;
+    }
+    response.descriptor_count = 1;
+    response.descriptors[0] = session_descriptor("tty-line", request.header.op, session, 0);
+    response.capability = session_capability("tty-line", request.header.op);
+    match request.arg0 {
+        LINUX_TCGETS => {
+            let termios = state.session_runtime.termios(session);
+            copy_payload(response, super::util::as_bytes(&termios))
+        }
+        LINUX_TCSETS | LINUX_TCSETSW | LINUX_TCSETSF => {
+            if request.payload_len as usize != size_of::<LinuxTermios>() {
+                return libc::EINVAL;
+            }
+            let termios = super::util::read_unaligned::<LinuxTermios>(&request.payload);
+            state
+                .session_runtime
+                .set_termios(session, termios, request.arg0 == LINUX_TCSETSF);
+            0
+        }
+        LINUX_FIONREAD => {
+            response.value0 = state.session_runtime.pending_input_len(session) as u64;
+            0
+        }
+        _ => libc::ENOTTY,
+    }
+}
+
+fn handle_console_route_request(
+    request: &CommercialMaxProtocolRequest,
+    state: &mut BrokerState,
+    response: &mut CommercialMaxProtocolResponse,
+) -> i32 {
+    response.descriptor_count = 1;
+    response.descriptors[0] = session_descriptor(
+        "console-route",
+        request.header.op,
+        request.arg2,
+        request.arg0,
+    );
+    response.capability = session_capability("console-route", request.header.op);
+    match request.arg0 {
+        COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_WRITE => {
+            let session = request.arg2;
+            if session == 0 || request.payload_len as usize > request.payload.len() {
+                return libc::EINVAL;
+            }
+            let payload_len = request.payload_len as usize;
+            response.value0 = state
+                .session_runtime
+                .write_to_session(session, &request.payload[..payload_len])
+                as u64;
+            0
+        }
+        COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READ => {
+            let session = request.arg2;
+            let capacity = request.arg3.min(response.payload.len() as u64) as usize;
+            if session == 0 || capacity == 0 {
+                return libc::EINVAL;
+            }
+            let read = state
+                .session_runtime
+                .read_from_session(session, &mut response.payload[..capacity]);
+            response.payload_len = read as u32;
+            response.value0 = read as u64;
+            0
+        }
+        console_abi::CONSOLE_IOCTL_SNAPSHOT_SESSION_OUTPUT => {
+            if request.payload_len as usize != size_of::<ConsoleSnapshotSessionOutputRequest>() {
+                return libc::EINVAL;
+            }
+            let mut snapshot = super::util::read_unaligned::<ConsoleSnapshotSessionOutputRequest>(
+                &request.payload,
+            );
+            let capacity = snapshot.capacity.min(response.payload.len() as u64) as usize;
+            let mut bytes = vec![0_u8; capacity];
+            let Some(count) = state
+                .session_runtime
+                .snapshot_output(snapshot.session_handle, &mut bytes)
+            else {
+                return libc::EINVAL;
+            };
+            snapshot.count = count as u64;
+            let header_len = size_of::<ConsoleSnapshotSessionOutputRequest>();
+            let payload_len = header_len.saturating_add(count);
+            if payload_len > response.payload.len() {
+                return libc::EINVAL;
+            }
+            response.payload[..header_len].copy_from_slice(super::util::as_bytes(&snapshot));
+            response.payload[header_len..payload_len].copy_from_slice(&bytes[..count]);
+            response.payload_len = payload_len as u32;
+            response.value0 = count as u64;
+            0
+        }
+        console_abi::CONSOLE_IOCTL_SEND_INPUT_EVENT => {
+            if request.payload_len as usize != size_of::<ConsoleSendInputEventRequest>() {
+                return libc::EINVAL;
+            }
+            let input =
+                super::util::read_unaligned::<ConsoleSendInputEventRequest>(&request.payload);
+            match state
+                .session_runtime
+                .handle_input_event(input.session_handle, input.event)
+            {
+                Ok(()) => 0,
+                Err(errno) => errno,
+            }
+        }
+        _ => {
+            response.value0 = state
+                .running
+                .values()
+                .filter(|program| program.session_handle != 0)
+                .count() as u64;
+            0
+        }
     }
 }
 
@@ -278,7 +744,10 @@ fn handle_session_graph_request(
             }
 
             let focused = focused_session_handle(state);
-            let generation = SESSION_GRAPH_GENERATION.fetch_add(1, Ordering::Relaxed);
+            let generation = state
+                .session_runtime
+                .output_generation()
+                .max(SESSION_GRAPH_GENERATION.fetch_add(1, Ordering::Relaxed));
             let mut written = 0usize;
             for program in state.running.values() {
                 if program.session_handle == 0 || written >= capacity {

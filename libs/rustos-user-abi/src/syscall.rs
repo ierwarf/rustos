@@ -444,6 +444,8 @@ pub const COMMERCIAL_MAX_SESSIOND_OP_TTY_LINE_DISCIPLINE: u16 = 2;
 pub const COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE: u16 = 3;
 pub const COMMERCIAL_MAX_SESSIOND_OP_FOREGROUND_FOCUS: u16 = 4;
 pub const COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP: u16 = 5;
+pub const COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READ: u64 = 0x100;
+pub const COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_WRITE: u64 = 0x101;
 pub const COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT: u16 = 1;
 pub const COMMERCIAL_MAX_PAGERD_OP_PAGE_CACHE_POLICY: u16 = 2;
 pub const COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE: u16 = 3;
@@ -569,8 +571,7 @@ pub struct CommercialMaxProtocolResponse {
     pub value0: u64,
     pub value1: u64,
     pub capability: CommercialMaxCapabilityLeaseWire,
-    pub descriptors:
-        [CommercialMaxProtocolDescriptorWire; COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS],
+    pub descriptors: [CommercialMaxProtocolDescriptorWire; COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS],
     pub payload_len: u32,
     pub reserved1: u32,
     pub payload: [u8; COMMERCIAL_MAX_PROTOCOL_PAYLOAD_CAPACITY],

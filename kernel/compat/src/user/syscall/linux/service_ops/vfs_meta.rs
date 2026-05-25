@@ -305,12 +305,7 @@ pub fn syscall_linux_vfs_statx(
     }
 }
 
-pub fn syscall_linux_vfs_newfstatat(
-    dirfd: u64,
-    path_ptr: u64,
-    stat_ptr: u64,
-    flags: u64,
-) -> u64 {
+pub fn syscall_linux_vfs_newfstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) -> u64 {
     let path = match copy_current_user_path(path_ptr, VFS_IPC_PATH_CAPACITY) {
         Ok(path) => path,
         Err(errno) => return linux_errno(errno),
@@ -650,7 +645,9 @@ pub fn syscall_linux_ioctl(fd: u64, request_number: u64, arg: u64) -> u64 {
     // policy IPC.
     match crate::user::sysops::device::ioctl_current_process_fd(fd, request_number, arg) {
         Ok(value) => value,
-        Err(err) => linux_errno(super::super::broker_ops::device_sysop_error_to_linux_errno(err)),
+        Err(err) => linux_errno(super::super::broker_ops::device_sysop_error_to_linux_errno(
+            err,
+        )),
     }
 }
 
