@@ -10,6 +10,7 @@ use core::mem::size_of;
 use core::str;
 
 use rustos_svc_runtime::ipc;
+use rustos_user_abi::linux as linux_abi;
 use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, VfsIpcRequest, VfsIpcResponse,
@@ -17,20 +18,21 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_PROTOCOL_VFSD, COMMERCIAL_MAX_VFSD_OP_DIRECTORY_CURSOR,
     COMMERCIAL_MAX_VFSD_OP_FD_TABLE_PLAN, COMMERCIAL_MAX_VFSD_OP_FILE_CURSOR,
     COMMERCIAL_MAX_VFSD_OP_METADATA_POLICY, COMMERCIAL_MAX_VFSD_OP_MOUNT_GRAPH,
-    COMMERCIAL_MAX_VFSD_OP_PATH_RESOLVE, IPC_MAX_INLINE_BYTES, IPC_SERVICE_VFSD,
-    LINUX_STAT_SIZE, LINUX_STATX_SIZE, SYSCALL_OFFLOAD_OP_LINUX_ACCESS,
-    SYSCALL_OFFLOAD_OP_LINUX_CHDIR, SYSCALL_OFFLOAD_OP_LINUX_CLOSE, SYSCALL_OFFLOAD_OP_LINUX_DUP,
-    SYSCALL_OFFLOAD_OP_LINUX_FCNTL, SYSCALL_OFFLOAD_OP_LINUX_GETCWD,
-    SYSCALL_OFFLOAD_OP_LINUX_GETDENTS64, SYSCALL_OFFLOAD_OP_LINUX_MKDIR,
-    SYSCALL_OFFLOAD_OP_LINUX_MOUNT, SYSCALL_OFFLOAD_OP_LINUX_NEWFSTATAT,
-    SYSCALL_OFFLOAD_OP_LINUX_OPENAT, SYSCALL_OFFLOAD_OP_LINUX_READLINKAT,
-    SYSCALL_OFFLOAD_OP_LINUX_STATX, SYSCALL_OFFLOAD_OP_LINUX_UMOUNT2,
-    SYSCALL_OFFLOAD_OP_LINUX_UNLINKAT, VFS_IPC_OP_ACCESS, VFS_IPC_OP_CHDIR, VFS_IPC_OP_CLOSE,
-    VFS_IPC_OP_DUP, VFS_IPC_OP_FCNTL, VFS_IPC_OP_FSTAT, VFS_IPC_OP_FTRUNCATE,
-    VFS_IPC_OP_GETCWD, VFS_IPC_OP_GETDENTS64, VFS_IPC_OP_LSEEK, VFS_IPC_OP_MKDIR,
-    VFS_IPC_OP_MOUNT, VFS_IPC_OP_NEWFSTATAT, VFS_IPC_OP_OPENAT, VFS_IPC_OP_PREAD64,
-    VFS_IPC_OP_READ, VFS_IPC_OP_READLINKAT, VFS_IPC_OP_STATX, VFS_IPC_OP_UMOUNT2,
-    VFS_IPC_OP_UNLINKAT, VFS_IPC_OP_WRITE, VFS_IPC_PATH_CAPACITY, VFS_IPC_PAYLOAD_CAPACITY,
+    COMMERCIAL_MAX_VFSD_OP_PATH_RESOLVE, IPC_MAX_INLINE_BYTES, IPC_SERVICE_VFSD, LINUX_STATX_SIZE,
+    LINUX_STAT_SIZE, SYSCALL_OFFLOAD_OP_LINUX_ACCESS, SYSCALL_OFFLOAD_OP_LINUX_CHDIR,
+    SYSCALL_OFFLOAD_OP_LINUX_CLOSE, SYSCALL_OFFLOAD_OP_LINUX_DUP, SYSCALL_OFFLOAD_OP_LINUX_FCNTL,
+    SYSCALL_OFFLOAD_OP_LINUX_GETCWD, SYSCALL_OFFLOAD_OP_LINUX_GETDENTS64,
+    SYSCALL_OFFLOAD_OP_LINUX_MKDIR, SYSCALL_OFFLOAD_OP_LINUX_MOUNT,
+    SYSCALL_OFFLOAD_OP_LINUX_NEWFSTATAT, SYSCALL_OFFLOAD_OP_LINUX_OPENAT,
+    SYSCALL_OFFLOAD_OP_LINUX_READLINKAT, SYSCALL_OFFLOAD_OP_LINUX_STATX,
+    SYSCALL_OFFLOAD_OP_LINUX_UMOUNT2, SYSCALL_OFFLOAD_OP_LINUX_UNLINKAT, VFS_IPC_OP_ACCESS,
+    VFS_IPC_OP_CHDIR, VFS_IPC_OP_CLOSE, VFS_IPC_OP_DUP, VFS_IPC_OP_FCNTL, VFS_IPC_OP_FSTAT,
+    VFS_IPC_OP_FTRUNCATE, VFS_IPC_OP_GETCWD, VFS_IPC_OP_GETDENTS64, VFS_IPC_OP_LSEEK,
+    VFS_IPC_OP_MKDIR, VFS_IPC_OP_MOUNT, VFS_IPC_OP_NEWFSTATAT, VFS_IPC_OP_OPENAT,
+    VFS_IPC_OP_POLL_QUERY, VFS_IPC_OP_PREAD64, VFS_IPC_OP_READ, VFS_IPC_OP_READLINKAT,
+    VFS_IPC_OP_STATX, VFS_IPC_OP_UMOUNT2, VFS_IPC_OP_UNLINKAT, VFS_IPC_OP_WRITE,
+    VFS_IPC_PATH_CAPACITY, VFS_IPC_PAYLOAD_CAPACITY, VFS_POLL_QUERY_EPOLL_CREATE,
+    VFS_POLL_QUERY_EPOLL_CTL, VFS_POLL_QUERY_EPOLL_WAIT, VFS_POLL_QUERY_POLL,
 };
 use storage_fat::{FatDirEntry, FatNodeKind, FatVolume};
 
@@ -42,8 +44,8 @@ mod util;
 use block::BootBlockDevice;
 use devmgrd::{devmgrd_dir_entries, devmgrd_lookup};
 use linux_types::{
-    LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, validate_linux_request,
-    validate_vfs_request,
+    validate_linux_request, validate_vfs_request, LinuxSyscallOffloadRequest,
+    LinuxSyscallOffloadResponse,
 };
 use util::{
     build_linux_stat, build_linux_statx, encode_dirent, handle_kind_u16, is_at_fdcwd,
@@ -56,6 +58,7 @@ pub(crate) const ENOENT: i32 = 2;
 pub(crate) const EIO: i32 = 5;
 pub(crate) const EAGAIN: i32 = 11;
 pub(crate) const EBADF: i32 = 9;
+pub(crate) const EEXIST: i32 = 17;
 pub(crate) const ENODEV: i32 = 19;
 pub(crate) const ENOTDIR: i32 = 20;
 pub(crate) const EISDIR: i32 = 21;
@@ -187,6 +190,7 @@ struct VfsState {
     /// re-reads `/`, `/dev`, library directories, etc.; FAT traversal per call
     /// is expensive enough to dominate boot time when libc walks PATH.
     dir_entries_cache: BTreeMap<String, Vec<DirEntry>>,
+    epolls: BTreeMap<u64, EpollState>,
     next_handle: u64,
     mount_generation: u64,
     cache_generation: u64,
@@ -199,6 +203,17 @@ struct RemoteHandle {
     cursor: u64,
     len: u64,
     refs: u64,
+}
+
+#[derive(Clone)]
+struct EpollInterest {
+    events: u32,
+    data: u64,
+}
+
+#[derive(Clone)]
+struct EpollState {
+    interests: BTreeMap<u64, EpollInterest>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -224,6 +239,7 @@ impl VfsState {
             file_cache: BTreeMap::new(),
             metadata_cache: BTreeMap::new(),
             dir_entries_cache: BTreeMap::new(),
+            epolls: BTreeMap::new(),
             next_handle: 1,
             mount_generation: 1,
             cache_generation: 1,
@@ -376,9 +392,116 @@ impl VfsState {
             VFS_IPC_OP_MOUNT => self.linux_mount_vfs(&mut response),
             VFS_IPC_OP_UMOUNT2 => self.linux_umount_vfs(&mut response),
             VFS_IPC_OP_UNLINKAT => self.vfs_unlinkat(request, &mut response),
+            VFS_IPC_OP_POLL_QUERY => self.vfs_poll_query(request, &mut response),
             _ => response.status = EINVAL,
         }
         response
+    }
+
+    fn vfs_poll_query(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        match request.arg0 {
+            VFS_POLL_QUERY_POLL => self.vfs_poll_once(request, response),
+            VFS_POLL_QUERY_EPOLL_CREATE => {
+                self.epolls.entry(request.remote_id).or_insert(EpollState {
+                    interests: BTreeMap::new(),
+                });
+            }
+            VFS_POLL_QUERY_EPOLL_CTL => self.vfs_epoll_ctl(request, response),
+            VFS_POLL_QUERY_EPOLL_WAIT => self.vfs_epoll_wait(request, response),
+            _ => response.status = EINVAL,
+        }
+    }
+
+    fn vfs_poll_once(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        const POLLFD_SIZE: usize = size_of::<linux_abi::LinuxPollFd>();
+        let len = request.payload_len as usize;
+        if len % POLLFD_SIZE != 0 || len > response.payload.len() {
+            response.status = EINVAL;
+            return;
+        }
+        let mut ready = 0_u64;
+        for offset in (0..len).step_by(POLLFD_SIZE) {
+            let fd = i32::from_le_bytes(request.payload[offset..offset + 4].try_into().unwrap());
+            let events =
+                i16::from_le_bytes(request.payload[offset + 4..offset + 6].try_into().unwrap());
+            let revents = if fd < 0 {
+                0
+            } else {
+                let ready_bits = poll_ready_bits(events as u32) as i16;
+                if ready_bits != 0 {
+                    ready += 1;
+                }
+                ready_bits
+            };
+            response.payload[offset..offset + 6]
+                .copy_from_slice(&request.payload[offset..offset + 6]);
+            response.payload[offset + 6..offset + 8].copy_from_slice(&revents.to_le_bytes());
+        }
+        response.value = ready;
+        response.payload_len = len as u32;
+    }
+
+    fn vfs_epoll_ctl(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let Some(epoll) = self.epolls.get_mut(&request.remote_id) else {
+            response.status = EINVAL;
+            return;
+        };
+        match request.arg1 {
+            linux_abi::EPOLL_CTL_ADD => {
+                if epoll.interests.contains_key(&request.fd) {
+                    response.status = EEXIST;
+                    return;
+                }
+                let Some(interest) = epoll_interest_from_request(request) else {
+                    response.status = EINVAL;
+                    return;
+                };
+                epoll.interests.insert(request.fd, interest);
+            }
+            linux_abi::EPOLL_CTL_MOD => {
+                if !epoll.interests.contains_key(&request.fd) {
+                    response.status = ENOENT;
+                    return;
+                }
+                let Some(interest) = epoll_interest_from_request(request) else {
+                    response.status = EINVAL;
+                    return;
+                };
+                epoll.interests.insert(request.fd, interest);
+            }
+            linux_abi::EPOLL_CTL_DEL => {
+                if epoll.interests.remove(&request.fd).is_none() {
+                    response.status = ENOENT;
+                }
+            }
+            _ => response.status = EINVAL,
+        }
+    }
+
+    fn vfs_epoll_wait(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        const EPOLL_EVENT_SIZE: usize = size_of::<linux_abi::LinuxEpollEvent>();
+        let Some(epoll) = self.epolls.get(&request.remote_id) else {
+            response.status = EINVAL;
+            return;
+        };
+        let maxevents = request.arg1 as usize;
+        let max_payload_events = response.payload.len() / EPOLL_EVENT_SIZE;
+        let mut written = 0usize;
+        for interest in epoll.interests.values() {
+            if written >= maxevents || written >= max_payload_events {
+                break;
+            }
+            let events = poll_ready_bits(interest.events);
+            if events == 0 {
+                continue;
+            }
+            let offset = written * EPOLL_EVENT_SIZE;
+            response.payload[offset..offset + 4].copy_from_slice(&events.to_le_bytes());
+            response.payload[offset + 4..offset + 12].copy_from_slice(&interest.data.to_le_bytes());
+            written += 1;
+        }
+        response.value = written as u64;
+        response.payload_len = (written * EPOLL_EVENT_SIZE) as u32;
     }
 
     fn linux_statx(
@@ -1018,6 +1141,26 @@ impl VfsState {
         }
         Ok(self.volume.as_ref().expect("volume initialized"))
     }
+}
+
+fn poll_ready_bits(requested: u32) -> u32 {
+    requested
+        & (linux_abi::EPOLLIN
+            | linux_abi::EPOLLPRI
+            | linux_abi::EPOLLOUT
+            | linux_abi::EPOLLERR
+            | linux_abi::EPOLLHUP)
+}
+
+fn epoll_interest_from_request(request: &VfsIpcRequest) -> Option<EpollInterest> {
+    const EPOLL_EVENT_SIZE: usize = size_of::<linux_abi::LinuxEpollEvent>();
+    if request.payload_len as usize != EPOLL_EVENT_SIZE {
+        return None;
+    }
+    Some(EpollInterest {
+        events: u32::from_le_bytes(request.payload[0..4].try_into().ok()?),
+        data: u64::from_le_bytes(request.payload[4..12].try_into().ok()?),
+    })
 }
 
 fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result<(), i32> {

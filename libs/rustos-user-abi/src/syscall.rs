@@ -230,6 +230,10 @@ pub const VFS_IPC_OP_UMOUNT2: u16 = 20;
 pub const VFS_IPC_OP_UNLINKAT: u16 = 21;
 pub const VFS_IPC_OP_POLL_QUERY: u16 = 22;
 pub const VFS_IPC_OP_LIFECYCLE: u16 = 23;
+pub const VFS_POLL_QUERY_POLL: u64 = 1;
+pub const VFS_POLL_QUERY_EPOLL_CREATE: u64 = 2;
+pub const VFS_POLL_QUERY_EPOLL_CTL: u64 = 3;
+pub const VFS_POLL_QUERY_EPOLL_WAIT: u64 = 4;
 pub const VFS_IPC_PATH_CAPACITY: usize = 512;
 pub const VFS_IPC_REQUEST_PAYLOAD_CAPACITY: usize = 512;
 pub const VFS_IPC_PAYLOAD_CAPACITY: usize = 32 * 1024;
@@ -268,6 +272,7 @@ pub const ROOTD_LEASE_STATE_EXITED: u16 = 2;
 pub const ROOTD_LEASE_STATE_RESTART_PENDING: u16 = 3;
 pub const ROOTD_LEASE_STATE_FAILED: u16 = 4;
 pub const NETD_IPC_ABI_VERSION: u16 = 1;
+pub const NETD_IPC_PAYLOAD_CAPACITY: usize = 32 * 1024;
 pub const VFS_LIFECYCLE_FORK: u16 = 1;
 pub const VFS_LIFECYCLE_EXEC_CLOEXEC: u16 = 2;
 pub const VFS_LIFECYCLE_EXIT: u16 = 3;
@@ -1412,6 +1417,8 @@ pub struct NetdIpcRequest {
     pub version: u16,
     pub op: u16,
     pub flags: u32,
+    pub payload_len: u32,
+    pub reserved1: u32,
     pub pid: u64,
     pub tid: u64,
     pub uid: u32,
@@ -1425,6 +1432,9 @@ pub struct NetdIpcRequest {
     pub arg4: u64,
     pub arg5: u64,
     pub reserved0: u64,
+    pub socket_token: u64,
+    pub status_flags: u64,
+    pub payload: [u8; NETD_IPC_PAYLOAD_CAPACITY],
 }
 
 #[repr(C)]
@@ -1435,6 +1445,9 @@ pub struct NetdIpcResponse {
     pub status: i32,
     pub reserved0: u32,
     pub value: u64,
+    pub payload_len: u32,
+    pub reserved1: u32,
+    pub payload: [u8; NETD_IPC_PAYLOAD_CAPACITY],
 }
 
 #[repr(C)]
@@ -2203,12 +2216,12 @@ mod syscall_tests {
     use core::mem::size_of;
 
     use super::{
-        IPC_MAX_INLINE_BYTES, LINUX_RLIMIT_SIZE, LINUX_SIGACTION_SIZE, LINUX_STATX_SIZE,
-        LINUX_TIMESPEC_SIZE, LINUX_UTSNAME_SIZE, LinuxRlimit, LinuxSigActionWire,
-        LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, LinuxTimespecWire, LinuxUtsName,
-        SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_STATX, SYSCALL_OFFLOAD_PATH_CAPACITY,
-        SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, VFS_IPC_ABI_VERSION, VFS_IPC_OP_OPENAT, VfsIpcRequest,
-        VfsIpcResponse,
+        LinuxRlimit, LinuxSigActionWire, LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse,
+        LinuxTimespecWire, LinuxUtsName, VfsIpcRequest, VfsIpcResponse, IPC_MAX_INLINE_BYTES,
+        LINUX_RLIMIT_SIZE, LINUX_SIGACTION_SIZE, LINUX_STATX_SIZE, LINUX_TIMESPEC_SIZE,
+        LINUX_UTSNAME_SIZE, SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_STATX,
+        SYSCALL_OFFLOAD_PATH_CAPACITY, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, VFS_IPC_ABI_VERSION,
+        VFS_IPC_OP_OPENAT,
     };
 
     #[test]

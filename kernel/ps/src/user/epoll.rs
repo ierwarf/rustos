@@ -1,14 +1,4 @@
-use alloc::sync::Arc;
-use alloc::vec::Vec;
-
-use spin::Mutex;
-
-use crate::user::handles::KernelHandle;
-
-// RING3-MIGRATION-COMMENTED-OUT START: vfsd should own the Linux epoll
-// implementation. Ring0 keeps only handle table + wait/wake substrate.
-/*
-const MAX_EPOLL_INTERESTS: usize = 256;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum EpollError {
@@ -17,38 +7,27 @@ pub enum EpollError {
     NotFound,
 }
 
-#[derive(Debug, Clone)]
-struct EpollInterest {
-    fd: u64,
-    handle: KernelHandle,
-    events: u32,
-    data: u64,
-}
-
-#[derive(Debug)]
-struct EpollState {
-    interests: Vec<EpollInterest>,
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct EpollHandle {
-    inner: Arc<Mutex<EpollState>>,
+    token: u64,
 }
 
 #[derive(Debug, Clone)]
 pub struct EpollInterestSnapshot {
-    pub handle: KernelHandle,
     pub events: u32,
     pub data: u64,
 }
 
 impl EpollHandle {
     pub fn new() -> Self {
+        static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
         Self {
-            inner: Arc::new(Mutex::new(EpollState {
-                interests: Vec::new(),
-            })),
+            token: NEXT_TOKEN.fetch_add(1, Ordering::Relaxed),
         }
+    }
+
+    pub fn from_token(token: u64) -> Self {
+        Self { token }
     }
 
     pub fn path(&self) -> &'static str {
@@ -56,79 +35,6 @@ impl EpollHandle {
     }
 
     pub fn token_id(&self) -> u64 {
-        Arc::as_ptr(&self.inner) as usize as u64
-    }
-
-    pub fn add(
-        &self,
-        fd: u64,
-        handle: KernelHandle,
-        events: u32,
-        data: u64,
-    ) -> Result<(), EpollError> {
-        let mut state = self.inner.lock();
-        if state.interests.iter().any(|interest| interest.fd == fd) {
-            return Err(EpollError::Busy);
-        }
-        if state.interests.len() >= MAX_EPOLL_INTERESTS {
-            return Err(EpollError::InvalidArgument);
-        }
-        state.interests.push(EpollInterest {
-            fd,
-            handle,
-            events,
-            data,
-        });
-        Ok(())
-    }
-
-    pub fn modify(
-        &self,
-        fd: u64,
-        handle: KernelHandle,
-        events: u32,
-        data: u64,
-    ) -> Result<(), EpollError> {
-        let mut state = self.inner.lock();
-        let Some(interest) = state
-            .interests
-            .iter_mut()
-            .find(|interest| interest.fd == fd)
-        else {
-            return Err(EpollError::NotFound);
-        };
-        interest.handle = handle;
-        interest.events = events;
-        interest.data = data;
-        Ok(())
-    }
-
-    pub fn delete(&self, fd: u64) -> Result<(), EpollError> {
-        let mut state = self.inner.lock();
-        let Some(index) = state
-            .interests
-            .iter()
-            .position(|interest| interest.fd == fd)
-        else {
-            return Err(EpollError::NotFound);
-        };
-        state.interests.remove(index);
-        Ok(())
-    }
-
-    pub fn snapshot(&self) -> Vec<EpollInterestSnapshot> {
-        self.inner
-            .lock()
-            .interests
-            .iter()
-            .map(|interest| EpollInterestSnapshot {
-                handle: interest.handle.clone(),
-                events: interest.events,
-                data: interest.data,
-            })
-            .collect()
+        self.token
     }
 }
-
-*/
-// RING3-MIGRATION-COMMENTED-OUT END

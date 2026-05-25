@@ -1,8 +1,7 @@
 use super::*;
 
 // RING3-MIGRATION-COMMENTED-OUT START: vfsd/netd should own the Linux VFS +
-// socket service layer (open/close/read/write/pread/pwrite/iovec/socket I/O).
-// Ring0 keeps only the handle table and IPC substrate.
+// socket service layer. Reference only; do not reactivate.
 /*
 const MAX_SOCKET_IO_BYTES: usize = 64 * 1024;
 const MAX_IOVEC_COUNT: usize = 16;
@@ -118,6 +117,46 @@ pub fn syscall_linux_vfs_dup(oldfd: u64, newfd: u64, flags: u64, mode: VfsDupMod
     }
 }
 
+pub fn syscall_linux_vfs_dup(oldfd: u64, newfd: u64, flags: u64, mode: VfsDupMode) -> u64 {
+    let Some(old_token) = current_socket_token(oldfd) else {
+        return linux_errno(LINUX_ENOSYS);
+    };
+    if matches!(mode, VfsDupMode::Dup2) && oldfd == newfd {
+        return oldfd;
+    }
+    if matches!(mode, VfsDupMode::Dup3) && (oldfd == newfd || flags & !linux_abi::O_CLOEXEC != 0) {
+        return linux_errno(LINUX_EINVAL);
+    }
+
+    let close_on_exec = flags & linux_abi::O_CLOEXEC != 0;
+    let replaced_socket = match mode {
+        VfsDupMode::Dup => None,
+        VfsDupMode::Dup2 | VfsDupMode::Dup3 => current_socket_token(newfd),
+    };
+    if let Err(errno) = call_netd_socket_token_op(SYSCALL_OFFLOAD_OP_LINUX_DUP, old_token) {
+        return linux_errno(errno);
+    }
+    let result = multitask::with_current_user_process_state_mut(|_, _, process_state| match mode {
+        VfsDupMode::Dup => process_state.handles_mut().duplicate_min(oldfd, 0, false),
+        VfsDupMode::Dup2 => process_state
+            .handles_mut()
+            .duplicate_exact(oldfd, newfd, false),
+        VfsDupMode::Dup3 => process_state
+            .handles_mut()
+            .duplicate_exact(oldfd, newfd, close_on_exec),
+    })
+    .flatten();
+    let Some(fd) = result else {
+        let _ = call_netd_socket_token_op(SYSCALL_OFFLOAD_OP_LINUX_CLOSE, old_token);
+        return linux_errno(LINUX_EBADF);
+    };
+
+    if let Some(token) = replaced_socket {
+        let _ = call_netd_socket_token_op(SYSCALL_OFFLOAD_OP_LINUX_CLOSE, token);
+    }
+    fd
+}
+
 pub fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
     if fd == 0 {
         let Ok(user_len) = usize::try_from(user_len) else {
@@ -137,25 +176,16 @@ pub fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
             Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
         };
     }
-    if let Some((socket, nonblocking)) = current_socket_handle(fd) {
-        let Ok(user_len) = usize::try_from(user_len) else {
-            return linux_errno(LINUX_EINVAL);
-        };
-        if user_len == 0 {
-            return 0;
-        }
-        if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, user_len) {
-            return linux_errno(address_space_error_to_linux_errno(err));
-        }
-        let mut bytes = alloc::vec![0_u8; user_len.min(VFS_IPC_PAYLOAD_CAPACITY)];
-        let read = match socket.recv(bytes.as_mut_slice(), nonblocking) {
-            Ok(read) => read,
-            Err(err) => return linux_errno(socket_error_to_linux_errno(err)),
-        };
-        return match usermem::write_current_user_bytes(user_ptr, &bytes[..read]) {
-            Ok(()) => read as u64,
-            Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
-        };
+    if current_socket_handle(fd).is_some() {
+        return syscall_linux_net6(
+            SYSCALL_OFFLOAD_OP_LINUX_RECVFROM,
+            fd,
+            user_ptr,
+            user_len,
+            0,
+            0,
+            0,
+        );
     }
     if let Some(mut file) = current_vfs_file_handle(fd) {
         let Ok(user_len) = usize::try_from(user_len) else {
@@ -422,22 +452,16 @@ pub fn syscall_linux_vfs_write(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
             Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
         };
     }
-    if let Some((socket, nonblocking)) = current_socket_handle(fd) {
-        let Ok(user_len) = usize::try_from(user_len) else {
-            return linux_errno(LINUX_EINVAL);
-        };
-        if user_len == 0 {
-            return 0;
-        }
-        let chunk_len = user_len.min(VFS_IPC_REQUEST_PAYLOAD_CAPACITY);
-        let mut bytes = alloc::vec![0_u8; chunk_len];
-        if let Err(err) = usermem::copy_from_current_user_exact(user_ptr, bytes.as_mut_slice()) {
-            return linux_errno(address_space_error_to_linux_errno(err));
-        }
-        return match socket.send(bytes.as_slice(), nonblocking) {
-            Ok(written) => written as u64,
-            Err(err) => linux_errno(socket_error_to_linux_errno(err)),
-        };
+    if current_socket_handle(fd).is_some() {
+        return syscall_linux_net6(
+            SYSCALL_OFFLOAD_OP_LINUX_SENDTO,
+            fd,
+            user_ptr,
+            user_len,
+            0,
+            0,
+            0,
+        );
     }
     if let Some(mut memfd) = current_memfd_handle(fd) {
         let Ok(user_len) = usize::try_from(user_len) else {
@@ -561,12 +585,8 @@ pub fn syscall_linux_socket_sendto_direct(
     name_ptr: u64,
     name_len: u64,
 ) -> Option<u64> {
-    let (socket, status_flags) = current_socket_with_flags(fd)?;
-    if name_ptr != 0 || name_len != 0 {
-        return Some(linux_errno(LINUX_EOPNOTSUPP));
-    }
-    let result = socket_send_current(&socket, user_ptr, user_len, status_flags, flags);
-    Some(result.unwrap_or_else(linux_errno))
+    let _ = (fd, user_ptr, user_len, flags, name_ptr, name_len);
+    None
 }
 
 pub fn syscall_linux_socket_recvfrom_direct(
@@ -577,124 +597,18 @@ pub fn syscall_linux_socket_recvfrom_direct(
     name_ptr: u64,
     name_len_ptr: u64,
 ) -> Option<u64> {
-    let (socket, status_flags) = current_socket_with_flags(fd)?;
-    let result = socket_recv_current(&socket, user_ptr, user_len, status_flags, flags);
-    if result.is_ok() && name_ptr != 0 && name_len_ptr != 0 {
-        if let Err(errno) = write_current_sockaddr_un(socket.peer_path().unwrap_or_default())(
-            name_ptr,
-            name_len_ptr,
-        ) {
-            return Some(linux_errno(errno));
-        }
-    }
-    Some(result.unwrap_or_else(linux_errno))
+    let _ = (fd, user_ptr, user_len, flags, name_ptr, name_len_ptr);
+    None
 }
 
 pub fn syscall_linux_socket_sendmsg_direct(fd: u64, msg_ptr: u64, flags: u64) -> Option<u64> {
-    let (socket, status_flags) = current_socket_with_flags(fd)?;
-    let result = socket_sendmsg_current(&socket, msg_ptr, status_flags, flags);
-    Some(result.unwrap_or_else(linux_errno))
+    let _ = (fd, msg_ptr, flags);
+    None
 }
 
 pub fn syscall_linux_socket_recvmsg_direct(fd: u64, msg_ptr: u64, flags: u64) -> Option<u64> {
-    let (socket, status_flags) = current_socket_with_flags(fd)?;
-    let result = socket_recvmsg_current(&socket, msg_ptr, status_flags, flags);
-    Some(result.unwrap_or_else(linux_errno))
-}
-
-fn socket_send_current(
-    socket: &multitask::SocketHandle,
-    user_ptr: u64,
-    user_len: u64,
-    status_flags: u64,
-    flags: u64,
-) -> Result<u64, i64> {
-    let len = checked_socket_io_len(user_len)?;
-    if len == 0 {
-        return Ok(0);
-    }
-    let mut bytes = alloc::vec![0_u8; len];
-    usermem::copy_from_current_user_exact(user_ptr, &mut bytes)
-        .map_err(address_space_error_to_linux_errno)?;
-    let nonblocking = socket_nonblocking(status_flags, flags);
-    let sent = socket
-        .send(bytes.as_slice(), nonblocking)
-        .map_err(socket_error_to_linux_errno)?;
-    Ok(sent as u64)
-}
-
-fn socket_recv_current(
-    socket: &multitask::SocketHandle,
-    user_ptr: u64,
-    user_len: u64,
-    status_flags: u64,
-    flags: u64,
-) -> Result<u64, i64> {
-    let len = checked_socket_io_len(user_len)?;
-    if len == 0 {
-        return Ok(0);
-    }
-    if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, len) {
-        return Err(address_space_error_to_linux_errno(err));
-    }
-    let mut bytes = alloc::vec![0_u8; len];
-    let nonblocking = socket_nonblocking(status_flags, flags);
-    let read = socket
-        .recv(bytes.as_mut_slice(), nonblocking)
-        .map_err(socket_error_to_linux_errno)?;
-    usermem::write_current_user_bytes(user_ptr, &bytes[..read])
-        .map_err(address_space_error_to_linux_errno)?;
-    Ok(read as u64)
-}
-
-fn socket_sendmsg_current(
-    socket: &multitask::SocketHandle,
-    msg_ptr: u64,
-    status_flags: u64,
-    flags: u64,
-) -> Result<u64, i64> {
-    let header = usermem::read_current_user_struct::<linux_abi::LinuxMsghdr>(msg_ptr)
-        .map_err(address_space_error_to_linux_errno)?;
-    let bytes = read_current_iovec_bytes(header.msg_iov, header.msg_iovlen)?;
-    let rights = read_current_scm_rights(header.msg_control, header.msg_controllen)?;
-    let nonblocking = socket_nonblocking(status_flags, flags);
-    let sent = socket
-        .send_message(bytes, rights, nonblocking)
-        .map_err(socket_error_to_linux_errno)?;
-    Ok(sent as u64)
-}
-
-fn socket_recvmsg_current(
-    socket: &multitask::SocketHandle,
-    msg_ptr: u64,
-    status_flags: u64,
-    flags: u64,
-) -> Result<u64, i64> {
-    let mut header = usermem::read_current_user_struct::<linux_abi::LinuxMsghdr>(msg_ptr)
-        .map_err(address_space_error_to_linux_errno)?;
-    let iovecs = read_current_iovecs(header.msg_iov, header.msg_iovlen)?;
-    let total_len = iovec_total_len(&iovecs)?;
-    let mut bytes = alloc::vec![0_u8; total_len.min(MAX_SOCKET_IO_BYTES)];
-    let nonblocking = socket_nonblocking(status_flags, flags);
-    let (read, rights) = socket
-        .recv_with_rights(bytes.as_mut_slice(), nonblocking)
-        .map_err(socket_error_to_linux_errno)?;
-    write_current_iovec_bytes(&iovecs, &bytes[..read])?;
-    let (rights_written, control_len) = write_current_scm_rights(
-        header.msg_control,
-        header.msg_controllen,
-        flags,
-        rights.as_slice(),
-    )?;
-    header.msg_namelen = 0;
-    header.msg_controllen = control_len as u64;
-    header.msg_flags = 0;
-    if rights_written < rights.len() {
-        header.msg_flags |= linux_abi::MSG_CTRUNC as u32;
-    }
-    usermem::write_current_user_struct(msg_ptr, &header)
-        .map_err(address_space_error_to_linux_errno)?;
-    Ok(read as u64)
+    let _ = (fd, msg_ptr, flags);
+    None
 }
 
 fn checked_socket_io_len(len: u64) -> Result<usize, i64> {
@@ -955,3 +869,266 @@ pub fn is_linux_error(result: u64) -> bool {
 
 */
 // RING3-MIGRATION-COMMENTED-OUT END
+
+pub fn syscall_linux_vfs_close(fd: u64) -> u64 {
+    if !current_socket_fd(fd) {
+        return linux_errno(LINUX_ENOSYS);
+    }
+    let result = syscall_linux_net4(SYSCALL_OFFLOAD_OP_LINUX_CLOSE, fd, 0, 0, 0);
+    if is_linux_error(result) {
+        return result;
+    }
+    match multitask::with_current_user_process_state_mut(|_, _, process_state| {
+        process_state.handles_mut().close(fd)
+    }) {
+        Some(Some(_)) => 0,
+        _ => linux_errno(LINUX_EBADF),
+    }
+}
+
+pub fn syscall_linux_vfs_dup(oldfd: u64, newfd: u64, flags: u64, mode: VfsDupMode) -> u64 {
+    let Some(old_token) = current_socket_token(oldfd) else {
+        return linux_errno(LINUX_ENOSYS);
+    };
+    if matches!(mode, VfsDupMode::Dup2) && oldfd == newfd {
+        return oldfd;
+    }
+    if matches!(mode, VfsDupMode::Dup3) && (oldfd == newfd || flags & !linux_abi::O_CLOEXEC != 0) {
+        return linux_errno(LINUX_EINVAL);
+    }
+
+    let close_on_exec = flags & linux_abi::O_CLOEXEC != 0;
+    let replaced_socket = match mode {
+        VfsDupMode::Dup => None,
+        VfsDupMode::Dup2 | VfsDupMode::Dup3 => current_socket_token(newfd),
+    };
+    if let Err(errno) = call_netd_socket_token_op(SYSCALL_OFFLOAD_OP_LINUX_DUP, old_token) {
+        return linux_errno(errno);
+    }
+    let result = multitask::with_current_user_process_state_mut(|_, _, process_state| match mode {
+        VfsDupMode::Dup => process_state.handles_mut().duplicate_min(oldfd, 0, false),
+        VfsDupMode::Dup2 => process_state
+            .handles_mut()
+            .duplicate_exact(oldfd, newfd, false),
+        VfsDupMode::Dup3 => {
+            process_state
+                .handles_mut()
+                .duplicate_exact(oldfd, newfd, close_on_exec)
+        }
+    })
+    .flatten();
+    let Some(fd) = result else {
+        let _ = call_netd_socket_token_op(SYSCALL_OFFLOAD_OP_LINUX_CLOSE, old_token);
+        return linux_errno(LINUX_EBADF);
+    };
+
+    if let Some(token) = replaced_socket {
+        let _ = call_netd_socket_token_op(SYSCALL_OFFLOAD_OP_LINUX_CLOSE, token);
+    }
+    fd
+}
+
+pub fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
+    if current_socket_fd(fd) {
+        return syscall_linux_net6(
+            SYSCALL_OFFLOAD_OP_LINUX_RECVFROM,
+            fd,
+            user_ptr,
+            user_len,
+            0,
+            0,
+            0,
+        );
+    }
+    linux_errno(LINUX_ENOSYS)
+}
+
+pub fn syscall_linux_vfs_write(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
+    if current_socket_fd(fd) {
+        return syscall_linux_net6(
+            SYSCALL_OFFLOAD_OP_LINUX_SENDTO,
+            fd,
+            user_ptr,
+            user_len,
+            0,
+            0,
+            0,
+        );
+    }
+    linux_errno(LINUX_ENOSYS)
+}
+
+pub fn syscall_linux_vfs_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
+    if !current_socket_fd(fd) {
+        return linux_errno(LINUX_ENOSYS);
+    }
+    let bytes = match read_socket_writev_payload(iov_ptr, iovcnt) {
+        Ok(bytes) => bytes,
+        Err(errno) => return linux_errno(errno),
+    };
+    if bytes.is_empty() {
+        return 0;
+    }
+    let mut written = 0usize;
+    while written < bytes.len() {
+        let chunk = &bytes[written..];
+        let count = match call_netd_socket_payload(fd, SYSCALL_OFFLOAD_OP_LINUX_SENDTO, chunk) {
+            Ok(count) => count as usize,
+            Err(errno) => {
+                return if written == 0 {
+                    linux_errno(errno)
+                } else {
+                    written as u64
+                }
+            }
+        };
+        if count == 0 {
+            break;
+        }
+        written = written.saturating_add(count);
+    }
+    written as u64
+}
+
+pub fn syscall_linux_socket_sendto_direct(
+    fd: u64,
+    user_ptr: u64,
+    user_len: u64,
+    flags: u64,
+    dest_ptr: u64,
+    dest_len: u64,
+) -> Option<u64> {
+    let _ = (fd, user_ptr, user_len, flags, dest_ptr, dest_len);
+    None
+}
+
+pub fn syscall_linux_socket_recvfrom_direct(
+    fd: u64,
+    user_ptr: u64,
+    user_len: u64,
+    flags: u64,
+    src_ptr: u64,
+    src_len_ptr: u64,
+) -> Option<u64> {
+    let _ = (fd, user_ptr, user_len, flags, src_ptr, src_len_ptr);
+    None
+}
+
+pub fn syscall_linux_socket_sendmsg_direct(fd: u64, msg_ptr: u64, flags: u64) -> Option<u64> {
+    let _ = (fd, msg_ptr, flags);
+    None
+}
+
+pub fn syscall_linux_socket_recvmsg_direct(fd: u64, msg_ptr: u64, flags: u64) -> Option<u64> {
+    let _ = (fd, msg_ptr, flags);
+    None
+}
+
+pub fn is_linux_error(result: u64) -> bool {
+    let signed = result as i64;
+    (-4095..0).contains(&signed)
+}
+
+fn current_socket_fd(fd: u64) -> bool {
+    multitask::with_current_user_process_state(|_, _, process_state| {
+        matches!(
+            process_state.handles().get(fd),
+            Some(multitask::KernelHandle::Socket(_))
+        )
+    })
+    .unwrap_or(false)
+}
+
+fn current_socket_token(fd: u64) -> Option<u64> {
+    multitask::with_current_user_process_state(|_, _, process_state| {
+        match process_state.handles().get(fd) {
+            Some(multitask::KernelHandle::Socket(socket)) => Some(socket.token_id()),
+            _ => None,
+        }
+    })
+    .flatten()
+}
+
+fn current_socket_token_and_flags(fd: u64) -> Option<(u64, u64)> {
+    multitask::with_current_user_process_state(|_, _, process_state| {
+        let entry = process_state.handles().get_entry(fd)?;
+        match entry.handle() {
+            multitask::KernelHandle::Socket(socket) => {
+                Some((socket.token_id(), entry.status_flags()))
+            }
+            _ => None,
+        }
+    })
+    .flatten()
+}
+
+fn new_netd_socket_request(op: u16, socket_token: u64) -> NetdIpcRequest {
+    let mut request = NetdIpcRequest {
+        version: NETD_IPC_ABI_VERSION,
+        op,
+        socket_token,
+        ..NetdIpcRequest::default()
+    };
+    if let Some(snapshot) = multitask::current_user_snapshot() {
+        request.pid = snapshot.process_id();
+        request.tid = snapshot.thread_id();
+    }
+    if let Some(security) = multitask::with_current_process_credentials(|security| security) {
+        request.uid = security.uid();
+        request.gid = security.gid();
+        request.euid = security.euid();
+        request.egid = security.egid();
+    }
+    request
+}
+
+fn call_netd_socket_token_op(op: u16, socket_token: u64) -> Result<u64, i64> {
+    let request = new_netd_socket_request(op, socket_token);
+    call_netd_ipc_request(&request).map(|response| response.value)
+}
+
+fn call_netd_socket_payload(fd: u64, op: u16, payload: &[u8]) -> Result<u64, i64> {
+    let Some((token, status_flags)) = current_socket_token_and_flags(fd) else {
+        return Err(LINUX_EBADF);
+    };
+    if payload.len() > NETD_IPC_PAYLOAD_CAPACITY {
+        return Err(LINUX_EINVAL);
+    }
+    let mut request = new_netd_socket_request(op, token);
+    request.arg0 = fd;
+    request.status_flags = status_flags;
+    request.payload_len = payload.len() as u32;
+    request.payload[..payload.len()].copy_from_slice(payload);
+    call_netd_ipc_request(&request).map(|response| response.value)
+}
+
+fn read_socket_writev_payload(iov_ptr: u64, iovcnt: u64) -> Result<Vec<u8>, i64> {
+    let Ok(iovcnt) = usize::try_from(iovcnt) else {
+        return Err(LINUX_EINVAL);
+    };
+    if iovcnt > 16 {
+        return Err(LINUX_EINVAL);
+    }
+    let mut payload = Vec::new();
+    for index in 0..iovcnt {
+        let Some(entry_ptr) =
+            iov_ptr.checked_add((index * size_of::<linux_abi::LinuxIovec>()) as u64)
+        else {
+            return Err(LINUX_EFAULT);
+        };
+        let iov = usermem::read_current_user_struct::<linux_abi::LinuxIovec>(entry_ptr)
+            .map_err(address_space_error_to_linux_errno)?;
+        let len = usize::try_from(iov.iov_len).map_err(|_| LINUX_EINVAL)?;
+        if len == 0 {
+            continue;
+        }
+        if payload.len().saturating_add(len) > NETD_IPC_PAYLOAD_CAPACITY {
+            return Err(LINUX_EINVAL);
+        }
+        let start = payload.len();
+        payload.resize(start + len, 0);
+        usermem::copy_from_current_user_exact(iov.iov_base, &mut payload[start..])
+            .map_err(address_space_error_to_linux_errno)?;
+    }
+    Ok(payload)
+}

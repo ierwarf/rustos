@@ -9,6 +9,8 @@ IPC service IDs, broker syscalls, handle transfer, and service routing. For pack
 - Device/console/UI `repr(C)` structs and ioctl numbers must live in `rustos-user-abi`. Services (`uiserver`, `runtimed`) consume that crate — never duplicate request structs or ioctl encoding.
 - Evacuation policy, ring0/ring3 boundary, service ownership: live source
   `RING3-MIGRATION-REFERENCE` markers plus `cargo xtask ring3-inventory`.
+- `RING3-MIGRATION-REFERENCE` / `RING3-MIGRATION-COMMENTED-OUT` blocks are references for migration, not dormant code to revive. Do not fix breakage by uncommenting them unless the exact lines are the remaining ring0 substrate.
+- For each slice, move policy/state/lifecycle behavior into the owning service, leave only narrow ring0 fd-table/user-copy/page-table/privileged-device substrate, then delete or bypass the reference block.
 
 ## Boot Initial Task
 
@@ -60,6 +62,7 @@ Kernel data paths (FD/socket/module/process/storage/input) remain narrow gated b
 - Linux `close`/`dup`/`dup2`/`dup3`/`fcntl`/`getdents64` route through vfsd before app fd-table mutation. vfsd is the only intended caller of `SYS_RUSTOS_FD_*_BROKER`; gated by `VFS_POLICY`. Generic apps must not call directly.
 - `LinuxSyscallOffloadRequest.arg0..arg3` carry 64-bit fd-control args (target fd, cmd, arg, flags). **Do not pack pointer/flag values into the 32-bit `mask` field.**
 - `mount`/`umount2` route to vfsd → gated `SYS_RUSTOS_VFS_*_BROKER` for kernel mount-table mutation. Do not reintroduce direct generic-app `linux_ops::mount`/`umount2` paths.
+- `poll`/`ppoll`/`epoll_*` route readiness policy and epoll interest state through `VFS_IPC_OP_POLL_QUERY`. Ring0 keeps fd-table validation, epoll token handles, user-copy, and bounded timeout sleeping.
 - Legacy `SYS_RUSTOS_{STATX,STAT,READLINK,ACCESS,GETCWD,CHDIR}_METADATA`: no generic-app VFS policy in ring0 after vfsd registers. Pre-vfsd bootstrap + registered policy-service callers retain direct kernel metadata access.
 - `SYS_RUSTOS_BLOCK_BROKER`: narrow boot-volume read broker, gated by `VFS_POLICY`, accepts `RustosBlockBrokerArgs`. Does not depend on `storaged`.
 
@@ -116,9 +119,9 @@ Commit (`COMMIT_BROKER`) builds the child address space from recorded mappings.
 
 ## Network Surface (`netd`)
 
-Routed Linux ops after bootstrap: `socket`, `socketpair`, `bind`, `listen`, `accept`/`accept4`, `connect`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `getsockname`, `getpeername`, `setsockopt`, `getsockopt`, `shutdown`.
+Routed Linux ops after bootstrap: `socket`, `socketpair`, socket `dup`/`dup2`/`dup3`, socket `close`, socket `read`/`write`/`writev`, `bind`, `listen`, `accept`/`accept4`, `connect`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `getsockname`, `getpeername`, `setsockopt`, `getsockopt`, `shutdown`.
 
-netd invokes gated `SYS_RUSTOS_NET_BROKER` with target pid. Net broker arg struct carries six 64-bit syscall arg slots. Kernel performs handle install, target user-memory validation/copy, and in-kernel socket/inet substrate; policy routing + namespace sequencing belong to netd.
+netd invokes gated `SYS_RUSTOS_NET_BROKER` with target pid. Net broker arg struct carries six 64-bit syscall arg slots. Kernel performs handle install and target user-memory validation/copy; AF_UNIX socket lifecycle, binding/listen queues, byte queues, and socket option policy belong to netd. `NetdIpcRequest`/`Response` carry `socket_token`, fd `status_flags`, and a bounded inline payload for this service-owned socket path.
 
 ## Process Policy Surface (`procd`)
 
