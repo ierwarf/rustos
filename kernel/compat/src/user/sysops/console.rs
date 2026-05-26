@@ -1,6 +1,5 @@
 use alloc::string::String;
 use core::cmp::min;
-use core::sync::atomic::{AtomicUsize, Ordering};
 
 use x86_64::VirtAddr;
 
@@ -9,12 +8,7 @@ use crate::memory::paging;
 use crate::multitask;
 
 const CONSOLE_IO_CHUNK_LEN: usize = 256;
-const CONSOLE_IO_DEBUG_LOG_LIMIT: usize = 0;
 
-static CONSOLE_READ_DEBUG_LOGS: AtomicUsize = AtomicUsize::new(0);
-static CONSOLE_WRITE_DEBUG_LOGS: AtomicUsize = AtomicUsize::new(0);
-
-#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 pub(crate) fn write_from_current_process(
     user_ptr: u64,
     len: usize,
@@ -26,7 +20,6 @@ pub(crate) fn write_from_current_process(
     let session = snapshot
         .map(|user| user.console_session())
         .unwrap_or_else(multitask::current_console_session);
-    let pid = snapshot.map(|user| user.thread_id()).unwrap_or(0);
 
     while copied < len {
         let chunk_len = min(len - copied, chunk.len());
@@ -50,18 +43,6 @@ pub(crate) fn write_from_current_process(
             crate::debug::write_bytes(&chunk[..chunk_len]);
         }
         copied += chunk_len;
-    }
-
-    if !session.is_system()
-        && CONSOLE_WRITE_DEBUG_LOGS.fetch_add(1, Ordering::Relaxed) < CONSOLE_IO_DEBUG_LOG_LIMIT
-    {
-        crate::debug::println!(
-            "console write: pid={} session={} len={} total_written={}",
-            pid,
-            session.raw(),
-            len,
-            total_written,
-        );
     }
 
     Ok(total_written)
@@ -136,7 +117,6 @@ fn log_console_user_buffer_failure(
     }
 }
 
-#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 pub(crate) fn read_into_current_process(
     user_ptr: u64,
     len: usize,
@@ -148,11 +128,9 @@ pub(crate) fn read_into_current_process(
 
     let mut total_read = 0usize;
     let mut chunk = [0_u8; CONSOLE_IO_CHUNK_LEN];
-    let snapshot = multitask::current_user_snapshot();
-    let session = snapshot
+    let session = multitask::current_user_snapshot()
         .map(|user| user.console_session())
         .unwrap_or_else(multitask::current_console_session);
-    let pid = snapshot.map(|user| user.thread_id()).unwrap_or(0);
 
     while total_read < len {
         let chunk_len = min(len - total_read, chunk.len());
@@ -173,18 +151,6 @@ pub(crate) fn read_into_current_process(
         })
         .ok_or(paging::AddressSpaceError::NotMapped)??;
         total_read += read;
-    }
-
-    if !session.is_system()
-        && CONSOLE_READ_DEBUG_LOGS.fetch_add(1, Ordering::Relaxed) < CONSOLE_IO_DEBUG_LOG_LIMIT
-    {
-        crate::debug::println!(
-            "console read: pid={} session={} len={} total_read={}",
-            pid,
-            session.raw(),
-            len,
-            total_read,
-        );
     }
 
     Ok(total_read)
