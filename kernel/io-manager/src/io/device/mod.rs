@@ -85,10 +85,6 @@ impl DeviceHandle {
         }
     }
 
-    pub(crate) const fn with_access(device_id: DeviceId, access_kind: DeviceAccessKind) -> Self {
-        Self::from_parts(device_id, access_kind)
-    }
-
     pub const fn device_id(self) -> DeviceId {
         self.device_id
     }

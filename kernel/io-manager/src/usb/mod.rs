@@ -1,6 +1,5 @@
 mod core;
 mod emulation;
-mod hid_translation;
 mod host;
 mod manager;
 mod runtime;

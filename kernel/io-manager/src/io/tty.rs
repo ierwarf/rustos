@@ -145,16 +145,6 @@ impl TtySessionState {
         }
     }
 
-    fn reset(&mut self) {
-        *self = Self::new();
-    }
-
-    fn wake_input_waiter(&mut self) {
-        let Some(task_id) = self.input_waiter.take() else {
-            return;
-        };
-        let _ = crate::multitask::wake_user_task(task_id);
-    }
 }
 
 #[cfg(test)]

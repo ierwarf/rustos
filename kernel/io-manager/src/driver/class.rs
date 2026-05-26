@@ -43,9 +43,3 @@ pub(crate) fn name(class: DriverClass) -> &'static str {
         .unwrap_or("unknown")
 }
 
-pub(crate) fn parse(name: &str) -> Option<DriverClass> {
-    SUPPORTED_CLASS_CORES
-        .iter()
-        .find(|descriptor| descriptor.name.eq_ignore_ascii_case(name))
-        .map(|descriptor| descriptor.class)
-}

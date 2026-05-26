@@ -17,19 +17,7 @@ const USB_DIR_IN: u8 = 0x80;
 const USB_DEVICE_STATE_CONFIGURED: u32 = 7;
 const USB_DEVICE_FLAG_CAN_SUBMIT: u32 = 1 << 0;
 const USB_DEVICE_FLAG_AUTHORIZED: u32 = 1 << 4;
-const USB_INTERFACE_FLAG_NEEDS_BINDING: u32 = 1 << 5;
 const USB_INTERFACE_FLAG_AUTHORIZED: u32 = 1 << 7;
-const USB_DEVICE_ID_MATCH_VENDOR: u16 = 0x0001;
-const USB_DEVICE_ID_MATCH_PRODUCT: u16 = 0x0002;
-const USB_DEVICE_ID_MATCH_DEV_LO: u16 = 0x0004;
-const USB_DEVICE_ID_MATCH_DEV_HI: u16 = 0x0008;
-const USB_DEVICE_ID_MATCH_DEV_CLASS: u16 = 0x0010;
-const USB_DEVICE_ID_MATCH_DEV_SUBCLASS: u16 = 0x0020;
-const USB_DEVICE_ID_MATCH_DEV_PROTOCOL: u16 = 0x0040;
-const USB_DEVICE_ID_MATCH_INT_CLASS: u16 = 0x0080;
-const USB_DEVICE_ID_MATCH_INT_SUBCLASS: u16 = 0x0100;
-const USB_DEVICE_ID_MATCH_INT_PROTOCOL: u16 = 0x0200;
-const USB_DEVICE_ID_MATCH_INT_NUMBER: u16 = 0x0400;
 
 static USB_SYNTHETIC_BUS_NAME: [u8; 4] = *b"usb\0";
 static USB_SYNTHETIC_BUS: LinuxCompatUsbBus = LinuxCompatUsbBus {
@@ -115,6 +103,7 @@ pub(crate) fn hid_interfaces_available() -> bool {
         .any(|interface| interface.interface_class == 0x03)
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 pub(crate) fn register_linux_driver(driver: *mut LinuxCompatUsbDriver) -> i32 {
     if driver.is_null() {
         return -22;
@@ -192,6 +181,7 @@ pub(crate) fn unregister_linux_driver(driver: *mut LinuxCompatUsbDriver) {
     }
 }
 
+#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 pub(crate) fn register_owned_interface(
     registration: UsbInterfaceRegistration<'_>,
 ) -> *mut LinuxCompatUsbInterface {

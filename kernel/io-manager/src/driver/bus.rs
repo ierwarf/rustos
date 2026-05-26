@@ -53,9 +53,3 @@ pub(crate) fn name(bus: DriverBus) -> &'static str {
         .unwrap_or("unknown")
 }
 
-pub(crate) fn parse(name: &str) -> Option<DriverBus> {
-    SUPPORTED_BUS_CORES
-        .iter()
-        .find(|descriptor| descriptor.name.eq_ignore_ascii_case(name))
-        .map(|descriptor| descriptor.bus)
-}

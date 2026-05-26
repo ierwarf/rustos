@@ -332,20 +332,6 @@ pub(crate) unsafe extern "C" fn timer_delete_sync(timer: *mut LinuxTimerList) ->
     delete_timer(timer)
 }
 
-pub(crate) fn service_pending() -> usize {
-    let mut serviced = 0;
-    loop {
-        let mut progress = 0;
-        progress += service_expired_timers();
-        progress += service_queued_work(None);
-        serviced += progress;
-        if progress == 0 {
-            break;
-        }
-    }
-    serviced
-}
-
 pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
     match name {
         "alloc_workqueue" => Some(alloc_workqueue as *const () as usize),
@@ -427,38 +413,6 @@ fn cancel_queue_timers(wq_ptr: usize) {
             set_work_pending(work_ptr, false);
         }
     }
-}
-
-fn service_expired_timers() -> usize {
-    let now = runtime::current_jiffies();
-    let expired = {
-        let mut timers = PENDING_TIMERS.lock();
-        let mut expired = Vec::new();
-        let mut index = 0;
-        while index < timers.len() {
-            if timers[index].expires > now {
-                index += 1;
-                continue;
-            }
-            expired.push(timers.swap_remove(index).timer);
-        }
-        expired
-    };
-
-    for timer_ptr in expired.iter().copied() {
-        mark_timer_pending(timer_ptr, false);
-    }
-
-    for timer_ptr in expired.iter().copied() {
-        let timer = unsafe { &mut *(timer_ptr as *mut LinuxTimerList) };
-        if let Some(func) = timer.function {
-            unsafe {
-                func(timer);
-            }
-        }
-    }
-
-    expired.len()
 }
 
 fn service_queued_work(filter_wq: Option<usize>) -> usize {

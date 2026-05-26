@@ -526,23 +526,6 @@ pub(crate) struct LinuxCompatUsbDeviceId {
     pub(crate) driver_info: usize,
 }
 
-impl LinuxCompatUsbDeviceId {
-    pub(crate) const fn is_terminator(self) -> bool {
-        self.match_flags == 0
-            && self.id_vendor == 0
-            && self.id_product == 0
-            && self.bcd_device_lo == 0
-            && self.bcd_device_hi == 0
-            && self.b_device_class == 0
-            && self.b_device_sub_class == 0
-            && self.b_device_protocol == 0
-            && self.b_interface_class == 0
-            && self.b_interface_sub_class == 0
-            && self.b_interface_protocol == 0
-            && self.b_interface_number == 0
-            && self.driver_info == 0
-    }
-}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]

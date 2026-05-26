@@ -225,17 +225,6 @@ pub fn dispatch_pic_irq(irq: u8) -> bool {
     handled
 }
 
-pub(crate) fn service_threaded_irqs() -> usize {
-    let mut work = 0usize;
-    while let Some(pending) = PENDING_THREADED_IRQS.lock().pop_front() {
-        let _status =
-            unsafe { (pending.thread_fn)(pending.irq as i32, pending.dev_id as *mut c_void) };
-        work += 1;
-    }
-    reenable_thread_queue_full_irqs();
-    work
-}
-
 fn enqueue_threaded_irq(irq: u32, thread_fn: LinuxIrqHandler, dev_id: usize) -> bool {
     if irq as usize >= PIC_IRQ_COUNT {
         return false;
@@ -264,17 +253,6 @@ fn enqueue_threaded_irq(irq: u32, thread_fn: LinuxIrqHandler, dev_id: usize) -> 
         dev_id
     );
     true
-}
-
-fn reenable_thread_queue_full_irqs() {
-    let mut disabled = THREAD_QUEUE_FULL_DISABLED_IRQS.lock();
-    for irq in 0..PIC_IRQ_COUNT {
-        if !disabled[irq] {
-            continue;
-        }
-        disabled[irq] = false;
-        crate::arch::pic::enable_irq(irq as u8);
-    }
 }
 
 fn remove_pending_threaded_irq(irq: u32, dev_id: usize) {

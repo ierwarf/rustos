@@ -331,16 +331,6 @@ pub(super) fn validate_module_image(
     Ok(header)
 }
 
-pub(super) fn load_module_image(
-    name: &'static str,
-    class: DriverClass,
-    bus: DriverBus,
-    image_path: &'static str,
-    linux_driver_names: &'static str,
-) -> Result<LoadedModuleInfo, &'static str> {
-    load_module_image_explicit(name, class, bus, image_path, linux_driver_names)
-}
-
 pub(super) fn load_module_image_explicit(
     name: &'static str,
     class: DriverClass,
@@ -2271,21 +2261,6 @@ fn symbol_resolve_flavor(symbol: &ModuleSymbol, relocation_type: u32) -> SymbolR
     SymbolResolveFlavor::Direct
 }
 
-fn resolve_external_symbol(
-    elf: &ModuleElf<'_>,
-    symbol: &ModuleSymbol,
-    policy: SymbolResolvePolicy,
-) -> Result<usize, &'static str> {
-    if symbol.name == 0 {
-        if symbol.binding()? == ModuleSymbolBinding::Weak {
-            return Ok(0);
-        }
-        return Err("module references unnamed external symbol");
-    }
-    let name = symbol_name(elf, symbol).map_err(|_| "module external symbol name is invalid")?;
-    resolve_external_symbol_by_name(symbol, name, policy)
-}
-
 fn resolve_external_symbol_by_name(
     symbol: &ModuleSymbol,
     name: &str,
@@ -2358,29 +2333,6 @@ fn resolve_external_symbol_by_name(
         return Err("module references unsupported external symbol");
     };
     Ok(address)
-}
-
-fn resolve_external_symbol_for_relocation(
-    elf: &ModuleElf<'_>,
-    symbol: &ModuleSymbol,
-    relocation_type: u32,
-    policy: SymbolResolvePolicy,
-) -> Result<usize, &'static str> {
-    let resolved = resolve_external_symbol(elf, symbol, policy)?;
-    if relocation_type == R_X86_64_PLT32 {
-        let name =
-            symbol_name(elf, symbol).map_err(|_| "module external symbol name is invalid")?;
-        return compat_trampoline_addr(resolved, compat_trampoline_mode_for_symbol(name));
-    }
-
-    if matches!(
-        relocation_type,
-        R_X86_64_PC32 | R_X86_64_32 | R_X86_64_32S | R_X86_64_PC64
-    ) {
-        return Ok(crate::memory::paging::lower_half_addr(resolved as u64) as usize);
-    }
-
-    Ok(resolved)
 }
 
 fn resolve_external_symbol_for_relocation_with_names(
@@ -2748,11 +2700,6 @@ fn symbol_name_from_table<'a>(
         "module symbol name offset is out of range",
         "module symbol name is not UTF-8",
     )
-}
-
-fn symbol_name<'a>(elf: &'a ModuleElf<'a>, symbol: &ModuleSymbol) -> Result<&'a str, &'static str> {
-    let string_table = symbol_string_table(elf)?;
-    symbol_name_from_table(string_table, symbol)
 }
 
 fn symbol_table_entries(elf: &ModuleElf<'_>) -> Result<Vec<ModuleSymbol>, &'static str> {

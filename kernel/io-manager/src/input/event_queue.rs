@@ -5,8 +5,7 @@ use crate::sync::KernelSpinLock as Mutex;
 use driver_abi::PointerPacket;
 use heapless::Deque as HeaplessDeque;
 use rustos_user_abi::syscall::{
-    INPUTD_ACCESS_NATIVE, INPUTD_INGRESS_KIND_EVENT, INPUTD_INGRESS_KIND_HID_KEYBOARD_REPORT,
-    INPUTD_INGRESS_KIND_HID_POINTER_REPORT, INPUTD_INGRESS_KIND_KEYBOARD,
+    INPUTD_ACCESS_NATIVE, INPUTD_INGRESS_KIND_EVENT, INPUTD_INGRESS_KIND_KEYBOARD,
     INPUTD_INGRESS_KIND_POINTER_PACKET, InputHidKeyboardReportWire, InputHidPointerReportWire,
     InputIngressWire, InputKeyboardEventWire, InputPointerAbsoluteWire, InputPointerPacketWire,
 };
@@ -112,34 +111,6 @@ pub(crate) fn submit_pointer_packet(packet: PointerPacket) -> bool {
         pointer_absolute: InputPointerAbsoluteWire::default(),
         hid_keyboard: InputHidKeyboardReportWire::default(),
         hid_pointer: InputHidPointerReportWire::default(),
-    })
-}
-
-pub(crate) fn submit_hid_keyboard_report(report: InputHidKeyboardReportWire) -> bool {
-    push_ingress(InputIngressWire {
-        kind: INPUTD_INGRESS_KIND_HID_KEYBOARD_REPORT,
-        access: INPUTD_ACCESS_NATIVE,
-        flags: 0,
-        event: InputEvent::default(),
-        keyboard: InputKeyboardEventWire::default(),
-        pointer_packet: InputPointerPacketWire::default(),
-        pointer_absolute: InputPointerAbsoluteWire::default(),
-        hid_keyboard: report,
-        hid_pointer: InputHidPointerReportWire::default(),
-    })
-}
-
-pub(crate) fn submit_hid_pointer_report(report: InputHidPointerReportWire) -> bool {
-    push_ingress(InputIngressWire {
-        kind: INPUTD_INGRESS_KIND_HID_POINTER_REPORT,
-        access: INPUTD_ACCESS_NATIVE,
-        flags: 0,
-        event: InputEvent::default(),
-        keyboard: InputKeyboardEventWire::default(),
-        pointer_packet: InputPointerPacketWire::default(),
-        pointer_absolute: InputPointerAbsoluteWire::default(),
-        hid_keyboard: InputHidKeyboardReportWire::default(),
-        hid_pointer: report,
     })
 }
 

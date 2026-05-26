@@ -1,7 +1,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::sync::KernelSpinLock as Mutex;
 use heapless::Deque as HeaplessDeque;
@@ -29,16 +29,8 @@ const USB_URB_STATUS_UNLINKED: i32 = -2;
 const REPORT_QUEUE_CAPACITY: usize = 256;
 const PENDING_COMPLETION_CAPACITY: usize = 64;
 const COMPLETIONS_PER_SERVICE: usize = 32;
-const REPORT_DROP_LOG_INTERVAL: u64 = 128;
-const MAX_REPORT_BYTES: usize = 4096;
-const KEYBOARD_TRANSLATION_LOG_LIMIT: usize = 0;
-const POINTER_TRANSLATION_LOG_LIMIT: usize = 0;
 const URB_SUBMIT_LOG_LIMIT: usize = 0;
-const REPORT_ENQUEUE_LOG_LIMIT: usize = 0;
 const REPORT_DESCRIPTOR_LOG_LIMIT: usize = 0;
-const HID_REPORT_ENTRY_LOG_LIMIT: usize = 0;
-
-static HID_POINTER_REPORT_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 struct RuntimeUsbDevice {
@@ -127,12 +119,8 @@ impl Default for HidReportState {
 static USB_RUNTIME_DEVICES: Mutex<Vec<RuntimeUsbDevice>> = Mutex::new(Vec::new());
 static PENDING_COMPLETIONS: Mutex<HeaplessDeque<UrbCompletion, PENDING_COMPLETION_CAPACITY>> =
     Mutex::new(HeaplessDeque::new());
-static KEYBOARD_TRANSLATION_LOGS: AtomicUsize = AtomicUsize::new(0);
-static POINTER_TRANSLATION_LOGS: AtomicUsize = AtomicUsize::new(0);
 static URB_SUBMIT_LOGS: AtomicUsize = AtomicUsize::new(0);
-static REPORT_ENQUEUE_LOGS: AtomicUsize = AtomicUsize::new(0);
 static REPORT_DESCRIPTOR_LOGS: AtomicUsize = AtomicUsize::new(0);
-static HID_REPORT_ENTRY_LOGS: AtomicUsize = AtomicUsize::new(0);
 
 pub(crate) fn service_pending() -> usize {
     let mut completed = 0usize;
@@ -581,15 +569,6 @@ pub(crate) fn hid_remove_device(dev: *mut LinuxCompatHidDevice) {
 }
 
 impl RuntimeReport {
-    fn from_slice(bytes: &[u8]) -> Option<Self> {
-        if bytes.is_empty() || bytes.len() > MAX_REPORT_BYTES {
-            return None;
-        }
-        Some(RuntimeReport {
-            bytes: bytes.to_vec().into_boxed_slice(),
-        })
-    }
-
     fn len(&self) -> usize {
         self.bytes.len()
     }
