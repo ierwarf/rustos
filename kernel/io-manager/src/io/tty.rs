@@ -1,31 +1,15 @@
 use alloc::vec::Vec;
 use nucleus_core::util::ring::RingBuffer;
 
-use crate::input::keyboard::KeyboardEvent;
 use crate::io::session::ConsoleSessionHandle;
 use crate::sync::KernelWaitLock;
 use crate::user::linux as linux_abi;
 
 const INPUT_BUFFER_CAPACITY: usize = 1024;
-const OUTPUT_BUFFER_CAPACITY: usize = 4096;
 
 static TTY: KernelWaitLock<TtyCollection> = KernelWaitLock::new(TtyCollection::new());
 
 pub fn init() {}
-
-pub fn on_key_event_for_session(session: ConsoleSessionHandle, event: KeyboardEvent) {
-    if !session_accepts_user_input(session) {
-        return;
-    }
-
-    let mut tty = TTY.lock();
-    let session_state = tty.session_mut(session);
-
-    if let Some(byte) = event.text {
-        let _ = session_state.input.push(byte);
-        session_state.wake_input_waiter();
-    }
-}
 
 pub fn read_input_for_session(session: ConsoleSessionHandle, dest: &mut [u8]) -> usize {
     TTY.lock().session_mut(session).input.pop_into(dest)
@@ -94,28 +78,8 @@ pub fn read_input_blocking_for_session(session: ConsoleSessionHandle, dest: &mut
     }
 }
 
-pub fn write_to_session(session: ConsoleSessionHandle, bytes: &[u8]) -> usize {
-    if bytes.is_empty() {
-        return 0;
-    }
-    TTY.lock().session_mut(session).output.extend_overwrite(bytes)
-}
-
-pub(crate) fn reset_session(session: ConsoleSessionHandle) {
-    TTY.lock().reset_session(session);
-}
-
-fn session_accepts_user_input(session: ConsoleSessionHandle) -> bool {
-    #[cfg(test)]
-    {
-        let _ = session;
-        true
-    }
-
-    #[cfg(not(test))]
-    {
-        !session.is_system() && crate::io::gui::is_userspace_display_active()
-    }
+pub fn write_to_session(_session: ConsoleSessionHandle, bytes: &[u8]) -> usize {
+    bytes.len()
 }
 
 struct TtyCollection {
@@ -159,24 +123,6 @@ impl TtyCollection {
             .state
     }
 
-    fn reset_session(&mut self, session: ConsoleSessionHandle) {
-        if session.is_system() {
-            self.system.reset();
-            return;
-        }
-        let Some(slot_index) = session.slot_index() else {
-            return;
-        };
-        let Some(entry) = self.sessions.get_mut(slot_index) else {
-            return;
-        };
-        let Some(bound) = entry.as_ref() else {
-            return;
-        };
-        if bound.handle == session {
-            *entry = None;
-        }
-    }
 }
 
 struct BoundTtySessionState {
@@ -186,7 +132,6 @@ struct BoundTtySessionState {
 
 struct TtySessionState {
     input: RingBuffer<u8, INPUT_BUFFER_CAPACITY>,
-    output: RingBuffer<u8, OUTPUT_BUFFER_CAPACITY>,
     termios: linux_abi::LinuxTermios,
     input_waiter: Option<u64>,
 }
@@ -195,7 +140,6 @@ impl TtySessionState {
     const fn new() -> Self {
         Self {
             input: RingBuffer::new(),
-            output: RingBuffer::new(),
             termios: linux_abi::LinuxTermios::default_console(),
             input_waiter: None,
         }
