@@ -1,26 +1,18 @@
-use alloc::vec::Vec;
 #[cfg(rustos_debug_print_enabled)]
 use core::sync::atomic::AtomicUsize;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::Ordering;
 
 use boot_protocol::FramebufferInfo;
-use x86_64::VirtAddr;
 use x86_64::instructions::interrupts;
 
 use super::GuiDisplayInfo;
 use super::framebuffer::{Framebuffer, FramebufferRect, build_framebuffer};
-use crate::memory::paging::{self, ProcessAddressSpace};
+use crate::memory::paging;
 use crate::sync::KernelWaitLock;
 
 const ENABLE_FRAMEBUFFER_WRITE_COMBINE: bool = true;
 #[cfg(rustos_debug_print_enabled)]
 const MAX_BACKEND_PRESENT_SAMPLE_LOGS: usize = 8;
-// Sized to swallow a 1920x1200x4 = ~9 MiB frame in a single stripe so the
-// present path holds the backend lock once, allocates scratch once, and emits
-// exactly one virtio transfer/flush command pair per user present. The 1 MiB
-// stripe before this caused 6 mutex acquires + 6 virtio commands for a single
-// 1600x900 frame and turned full presents into a serialization storm.
-const USER_PRESENT_STRIPE_BYTES: usize = 16 * 1024 * 1024;
 
 enum BackendInstance {
     Unavailable,
@@ -41,8 +33,6 @@ static DISPLAY_BACKEND: KernelWaitLock<DisplayBackend> =
     KernelWaitLock::new(DisplayBackend::empty());
 #[cfg(rustos_debug_print_enabled)]
 static BACKEND_PRESENT_SAMPLE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static DISPLAY_WIDTH: AtomicU32 = AtomicU32::new(0);
-static DISPLAY_HEIGHT: AtomicU32 = AtomicU32::new(0);
 
 impl DisplayBackend {
     const fn empty() -> Self {
@@ -64,8 +54,6 @@ impl DisplayBackend {
             framebuffer: build_framebuffer(info),
             flags,
         });
-        DISPLAY_WIDTH.store(info.width, Ordering::Release);
-        DISPLAY_HEIGHT.store(info.height, Ordering::Release);
         true
     }
 
@@ -113,44 +101,6 @@ pub(crate) fn display_info() -> Option<GuiDisplayInfo> {
     DISPLAY_BACKEND.lock().display_info()
 }
 
-pub(crate) fn display_dimensions() -> Option<(u32, u32)> {
-    let width = DISPLAY_WIDTH.load(Ordering::Acquire);
-    let height = DISPLAY_HEIGHT.load(Ordering::Acquire);
-    (width != 0 && height != 0).then_some((width, height))
-}
-
-pub(crate) fn present_bgra8888_from_user(
-    address_space: &ProcessAddressSpace,
-    user_ptr: u64,
-    width: usize,
-    height: usize,
-    stride_bytes: usize,
-) -> Result<bool, paging::AddressSpaceError> {
-    if !present_context_allows_blocking() {
-        return Ok(false);
-    }
-    if display_present_faulted() {
-        return Ok(false);
-    }
-    let presented = copy_user_bgra8888_rect_in_stripes(
-        address_space,
-        user_ptr,
-        width,
-        height,
-        stride_bytes,
-        FramebufferRect {
-            x: 0,
-            y: 0,
-            width,
-            height,
-        },
-    )?;
-    if presented {
-        crate::driver::virtio_gpu::queue_primary_flush();
-    }
-    Ok(presented)
-}
-
 #[cfg(rustos_debug_print_enabled)]
 fn log_backend_present_sample(framebuffer: &Framebuffer, drawn: bool) {
     let sample_index = BACKEND_PRESENT_SAMPLE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -178,220 +128,6 @@ fn log_backend_present_sample(framebuffer: &Framebuffer, drawn: bool) {
 #[cfg(not(rustos_debug_print_enabled))]
 fn log_backend_present_sample(_framebuffer: &Framebuffer, _drawn: bool) {}
 
-pub(crate) fn present_bgra8888_rect_from_user(
-    address_space: &ProcessAddressSpace,
-    user_ptr: u64,
-    width: usize,
-    height: usize,
-    stride_bytes: usize,
-    rect: FramebufferRect,
-) -> Result<bool, paging::AddressSpaceError> {
-    if !present_context_allows_blocking() {
-        return Ok(false);
-    }
-    if display_present_faulted() {
-        return Ok(false);
-    }
-    let presented = copy_user_bgra8888_rect_in_stripes(
-        address_space,
-        user_ptr,
-        width,
-        height,
-        stride_bytes,
-        rect,
-    )?;
-    if presented {
-        crate::driver::virtio_gpu::queue_primary_flush_rect(
-            rect.x as u32,
-            rect.y as u32,
-            rect.width as u32,
-            rect.height as u32,
-        );
-    }
-    Ok(presented)
-}
-
-fn copy_user_bgra8888_rect_in_stripes(
-    address_space: &ProcessAddressSpace,
-    user_ptr: u64,
-    width: usize,
-    height: usize,
-    stride_bytes: usize,
-    rect: FramebufferRect,
-) -> Result<bool, paging::AddressSpaceError> {
-    if rect.width == 0 || rect.height == 0 {
-        return Ok(true);
-    }
-    let Some(info) = display_info() else {
-        return Ok(false);
-    };
-    if width != info.width as usize || height != info.height as usize {
-        return Ok(false);
-    }
-    let Some(min_stride) = width.checked_mul(4) else {
-        return Ok(false);
-    };
-    if stride_bytes < min_stride {
-        return Ok(false);
-    }
-    let Some(rect) = rect.intersection(FramebufferRect {
-        x: 0,
-        y: 0,
-        width: info.width as usize,
-        height: info.height as usize,
-    }) else {
-        return Ok(true);
-    };
-
-    let stripe_rows = user_present_stripe_rows(rect.width);
-    let end_y = rect
-        .y
-        .checked_add(rect.height)
-        .ok_or(paging::AddressSpaceError::AddressOverflow)?;
-    let mut y = rect.y;
-    let mut scratch = present_scratch_take();
-    let mut copied = false;
-
-    while y < end_y {
-        let stripe_height = stripe_rows.min(end_y - y);
-        let stripe = FramebufferRect {
-            x: rect.x,
-            y,
-            width: rect.width,
-            height: stripe_height,
-        };
-        let row_bytes = stripe
-            .width
-            .checked_mul(4)
-            .ok_or(paging::AddressSpaceError::AddressOverflow)?;
-        let scratch_len = copy_user_bgra8888_rect_to_scratch(
-            address_space,
-            user_ptr,
-            stride_bytes,
-            stripe,
-            &mut scratch,
-        )?;
-        let Some(result) = DISPLAY_BACKEND.lock().with_framebuffer(|framebuffer| {
-            let drawn = framebuffer.draw_bgra8888_rect_from_kernel(
-                scratch[..scratch_len].as_ptr(),
-                row_bytes,
-                stripe,
-            );
-            log_backend_present_sample(framebuffer, drawn);
-            if drawn {
-                return Ok(framebuffer.present_scene());
-            }
-            Ok(drawn)
-        }) else {
-            present_scratch_return(scratch);
-            return Ok(false);
-        };
-
-        if !result? {
-            present_scratch_return(scratch);
-            return Ok(false);
-        }
-        copied = true;
-        y += stripe_height;
-    }
-
-    present_scratch_return(scratch);
-    Ok(copied)
-}
-
-fn copy_user_bgra8888_rect_to_scratch(
-    address_space: &ProcessAddressSpace,
-    user_ptr: u64,
-    stride_bytes: usize,
-    rect: FramebufferRect,
-    scratch: &mut Vec<u8>,
-) -> Result<usize, paging::AddressSpaceError> {
-    let row_bytes = rect
-        .width
-        .checked_mul(4)
-        .ok_or(paging::AddressSpaceError::AddressOverflow)?;
-    let total_bytes = row_bytes
-        .checked_mul(rect.height)
-        .ok_or(paging::AddressSpaceError::AddressOverflow)?;
-    if scratch.capacity() < total_bytes {
-        let need = total_bytes - scratch.capacity();
-        scratch
-            .try_reserve_exact(need)
-            .map_err(|_| paging::AddressSpaceError::OutOfFrames)?;
-    }
-    // Skip the resize-with-zero step: every byte in [0, total_bytes) is
-    // immediately overwritten by copy_from_user below. Zeroing 5+ MiB on a
-    // 60 Hz present loop directly limited throughput on TCG.
-    unsafe {
-        scratch.set_len(total_bytes);
-    }
-
-    // When the user buffer is dense for this rect (stride == row width) and
-    // the rectangle hugs the left edge, the entire stripe is contiguous in the
-    // user address space, so one copy_from_user can pull the whole block
-    // through the page walker instead of paying per-row overhead.
-    if stride_bytes == row_bytes && rect.x == 0 {
-        let source_offset = rect
-            .y
-            .checked_mul(stride_bytes)
-            .ok_or(paging::AddressSpaceError::AddressOverflow)?;
-        let source = user_ptr
-            .checked_add(source_offset as u64)
-            .ok_or(paging::AddressSpaceError::AddressOverflow)?;
-        address_space.copy_from_user(VirtAddr::new(source), &mut scratch[..total_bytes])?;
-        return Ok(total_bytes);
-    }
-
-    for row in 0..rect.height {
-        let source_row = rect
-            .y
-            .checked_add(row)
-            .ok_or(paging::AddressSpaceError::AddressOverflow)?;
-        let row_offset = source_row
-            .checked_mul(stride_bytes)
-            .ok_or(paging::AddressSpaceError::AddressOverflow)?;
-        let source_offset = row_offset
-            .checked_add(
-                rect.x
-                    .checked_mul(4)
-                    .ok_or(paging::AddressSpaceError::AddressOverflow)?,
-            )
-            .ok_or(paging::AddressSpaceError::AddressOverflow)?;
-        let source = user_ptr
-            .checked_add(source_offset as u64)
-            .ok_or(paging::AddressSpaceError::AddressOverflow)?;
-        let dest_offset = row
-            .checked_mul(row_bytes)
-            .ok_or(paging::AddressSpaceError::AddressOverflow)?;
-        address_space.copy_from_user(
-            VirtAddr::new(source),
-            &mut scratch[dest_offset..dest_offset + row_bytes],
-        )?;
-    }
-    Ok(total_bytes)
-}
-
-// Cache the per-present scratch buffer so we don't pay a frame allocator pass
-// on every present. The buffer is reused across presents and grows to the
-// largest stripe ever seen, then stays put.
-static PRESENT_SCRATCH: KernelWaitLock<Vec<u8>> = KernelWaitLock::new(Vec::new());
-
-fn present_scratch_take() -> Vec<u8> {
-    core::mem::take(&mut *PRESENT_SCRATCH.lock())
-}
-
-fn present_scratch_return(scratch: Vec<u8>) {
-    let mut slot = PRESENT_SCRATCH.lock();
-    if slot.capacity() < scratch.capacity() {
-        *slot = scratch;
-    }
-}
-
-fn user_present_stripe_rows(width: usize) -> usize {
-    let row_bytes = width.saturating_mul(4).max(1);
-    (USER_PRESENT_STRIPE_BYTES / row_bytes).max(1)
-}
-
 pub(crate) fn present_bgra8888_from_kernel(
     src_ptr: *const u8,
     width: usize,
@@ -409,6 +145,7 @@ pub(crate) fn present_bgra8888_from_kernel(
         .with_framebuffer(|framebuffer| {
             let drawn =
                 framebuffer.draw_bgra8888_frame_from_kernel(src_ptr, width, height, stride_bytes);
+            log_backend_present_sample(framebuffer, drawn);
             if drawn {
                 return framebuffer.present_scene();
             }
@@ -444,6 +181,7 @@ pub(crate) fn present_bgra8888_rect_from_kernel(
                 stride_bytes,
                 rect,
             );
+            log_backend_present_sample(framebuffer, drawn);
             if drawn {
                 return framebuffer.present_scene();
             }

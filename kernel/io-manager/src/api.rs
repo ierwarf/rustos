@@ -200,20 +200,12 @@ pub mod boot {
 }
 
 pub mod console {
-    pub fn init() {
-        crate::io::console::init();
-    }
-
     pub fn init_tty() {
         crate::io::tty::init();
     }
 
     pub fn write(bytes: &[u8]) {
         crate::io::console::write(bytes);
-    }
-
-    pub fn service() -> usize {
-        crate::io::console::service()
     }
 }
 
@@ -459,14 +451,6 @@ pub mod io {
 
         pub fn try_present_panic_blackout() -> bool {
             crate::io::gui::try_present_panic_blackout()
-        }
-
-        pub fn write_panic_console_line(bytes: &[u8]) -> bool {
-            crate::io::gui::write_panic_console_line(bytes)
-        }
-
-        pub fn flush_debug_console() {
-            crate::io::gui::flush_debug_console();
         }
 
         pub fn service_pending() -> usize {

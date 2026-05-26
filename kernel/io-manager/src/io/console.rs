@@ -6,14 +6,8 @@ use crate::io::session::ConsoleSessionHandle;
 use crate::sync::KernelWaitLock;
 
 const OUTPUT_BUFFER_CAPACITY: usize = 4096;
-const PENDING_BUFFER_CAPACITY: usize = 4096;
-const FLUSH_CHUNK_CAPACITY: usize = 256;
 
 static CONSOLE: KernelWaitLock<ConsoleState> = KernelWaitLock::new(ConsoleState::new());
-
-pub fn init() {
-    crate::io::gui::init_console();
-}
 
 #[allow(dead_code)]
 pub fn write(bytes: &[u8]) -> usize {
@@ -27,9 +21,7 @@ pub(crate) fn write_to_session(session: ConsoleSessionHandle, bytes: &[u8]) -> u
     if bytes.is_empty() {
         return 0;
     }
-    let written = with_console_state(|console| console.write_to_session(session, bytes));
-    while flush_pending_once() {}
-    written
+    with_console_state(|console| console.write_to_session(session, bytes))
 }
 
 pub(crate) fn write_from_tty(session: ConsoleSessionHandle, bytes: &[u8]) -> usize {
@@ -60,26 +52,6 @@ pub(crate) fn copy_recent_output_for_tests(dest: &mut [u8]) -> usize {
         .copy_recent_output(ConsoleSessionHandle::SYSTEM, dest)
 }
 
-fn flush_pending_once() -> bool {
-    let mut chunk = [0_u8; FLUSH_CHUNK_CAPACITY];
-    let Some((session, len)) = with_console_state(|console| console.drain_pending(&mut chunk))
-    else {
-        return false;
-    };
-
-    crate::io::gui::write_console_session(session, &chunk[..len]);
-    true
-}
-
-pub fn service() -> usize {
-    let mut work = 0;
-    while flush_pending_once() {
-        work += 1;
-    }
-    crate::io::gui::tick_console_cursor();
-    work
-}
-
 fn with_console_state<R>(f: impl FnOnce(&mut ConsoleState) -> R) -> R {
     f(&mut CONSOLE.lock())
 }
@@ -87,7 +59,6 @@ fn with_console_state<R>(f: impl FnOnce(&mut ConsoleState) -> R) -> R {
 struct ConsoleState {
     system: ConsoleSessionState,
     sessions: Vec<Option<BoundConsoleSessionState>>,
-    next_flush_slot: usize,
 }
 
 impl ConsoleState {
@@ -95,7 +66,6 @@ impl ConsoleState {
         Self {
             system: ConsoleSessionState::new(),
             sessions: Vec::new(),
-            next_flush_slot: 0,
         }
     }
 
@@ -104,43 +74,6 @@ impl ConsoleState {
             return self.system.write(bytes);
         }
         self.ensure_session(session).write(bytes)
-    }
-
-    fn drain_pending(&mut self, dest: &mut [u8]) -> Option<(ConsoleSessionHandle, usize)> {
-        if self.sessions.is_empty() {
-            return None;
-        }
-
-        let session_count = self.sessions.len();
-
-        for offset in 0..session_count {
-            let index = (self.next_flush_slot + offset) % session_count;
-            let Some(handle) = self
-                .sessions
-                .get(index)
-                .and_then(|entry| entry.as_ref())
-                .map(|bound| bound.handle)
-            else {
-                continue;
-            };
-            if !crate::io::session::is_console_session_active(handle) {
-                continue;
-            }
-
-            let Some(bound) = self.sessions[index].as_mut() else {
-                continue;
-            };
-
-            let len = bound.state.drain_pending(dest);
-            if len == 0 {
-                continue;
-            }
-
-            self.next_flush_slot = (index + 1) % session_count;
-            return Some((handle, len));
-        }
-
-        None
     }
 
     fn copy_recent_output(&self, session: ConsoleSessionHandle, dest: &mut [u8]) -> usize {
@@ -193,9 +126,6 @@ impl ConsoleState {
             return;
         }
         *entry = None;
-        if self.next_flush_slot >= self.sessions.len().saturating_sub(1) {
-            self.next_flush_slot = 0;
-        }
     }
 
     fn ensure_session(&mut self, session: ConsoleSessionHandle) -> &mut ConsoleSessionState {
@@ -230,7 +160,6 @@ struct BoundConsoleSessionState {
 
 struct ConsoleSessionState {
     output: RingBuffer<u8, OUTPUT_BUFFER_CAPACITY>,
-    pending: RingBuffer<u8, PENDING_BUFFER_CAPACITY>,
     output_generation: u64,
 }
 
@@ -238,7 +167,6 @@ impl ConsoleSessionState {
     const fn new() -> Self {
         Self {
             output: RingBuffer::new(),
-            pending: RingBuffer::new(),
             output_generation: 0,
         }
     }
@@ -249,13 +177,8 @@ impl ConsoleSessionState {
         }
 
         let written = self.output.extend_overwrite(bytes);
-        self.pending.extend_overwrite(bytes);
         self.output_generation = self.output_generation.wrapping_add(1);
         written
-    }
-
-    fn drain_pending(&mut self, dest: &mut [u8]) -> usize {
-        self.pending.pop_into(dest)
     }
 
     fn copy_recent_output(&self, dest: &mut [u8]) -> usize {

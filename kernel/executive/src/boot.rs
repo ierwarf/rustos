@@ -76,7 +76,6 @@ pub fn handle_kernel_panic(info: &PanicInfo<'_>) -> ! {
 
     debug::dump_recent_trace_locations("panic");
     print_backtrace();
-    io_services::gui_flush_debug_console();
 
     loop {
         core::hint::spin_loop();
@@ -224,9 +223,6 @@ pub fn initialize_kernel(boot_info_ptr: *const BootInfo) {
 
     io_services::init_input();
     announce_ready("Input", b"Input initialized.\r\n");
-
-    io_services::console_init();
-    announce_ready("Console", b"Console initialized.\r\n");
 
     io_services::tty_init();
     hal_api::init_rtc();
@@ -408,9 +404,6 @@ pub fn housekeeping_once() -> usize {
     trace_service_phase("reap");
     work += ps_api::service_deferred_work();
 
-    trace_service_phase("console");
-    work += io_services::console_service();
-
     trace_service_phase("heartbeat");
     // Emit the once-per-second wall-clock heartbeat outside IRQ context. The
     // RTC interrupt only marks the second as pending; the actual snapshot +
@@ -515,7 +508,6 @@ fn valid_next_frame_pointer(current: u64, next: u64) -> bool {
 fn gui_panic_line(args: fmt::Arguments<'_>) {
     let mut line = PanicLine::new();
     let _ = line.write_fmt(args);
-    let _ = io_services::gui_write_panic_console_line(line.as_bytes());
     io_services::console_write(line.as_bytes());
     io_services::console_write(b"\r\n");
 }
