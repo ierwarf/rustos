@@ -1,5 +1,4 @@
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
 use nucleus_core::util::ring::RingBuffer;
 
 use crate::input::keyboard::{KeyAction, KeyCode, KeyboardEvent};
@@ -11,18 +10,10 @@ use crate::user::linux as linux_abi;
 const INPUT_BUFFER_CAPACITY: usize = 1024;
 const EDIT_BUFFER_CAPACITY: usize = 256;
 const CURSOR_MOVE_SEQUENCE_MAX_LEN: usize = 16;
-const TTY_DEBUG_LOG_LIMIT: usize = 32;
 
 static TTY: KernelWaitLock<TtyCollection> = KernelWaitLock::new(TtyCollection::new());
-static TTY_COMMIT_DEBUG_LOGS: AtomicUsize = AtomicUsize::new(0);
-static TTY_WAKE_DEBUG_LOGS: AtomicUsize = AtomicUsize::new(0);
 
 pub fn init() {}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn on_key_event(event: KeyboardEvent) {
-    on_key_event_for_session(ConsoleSessionHandle::SYSTEM, event);
-}
 
 pub fn on_key_event_for_session(session: ConsoleSessionHandle, event: KeyboardEvent) {
     if !session_accepts_user_input(session) {
@@ -30,11 +21,6 @@ pub fn on_key_event_for_session(session: ConsoleSessionHandle, event: KeyboardEv
     }
 
     TTY.lock().session_mut(session).on_key_event(session, event);
-}
-
-#[allow(dead_code)]
-pub fn read_input(dest: &mut [u8]) -> usize {
-    read_input_for_session(ConsoleSessionHandle::SYSTEM, dest)
 }
 
 pub fn read_input_for_session(session: ConsoleSessionHandle, dest: &mut [u8]) -> usize {
@@ -61,11 +47,6 @@ pub fn set_termios_for_session(
     TTY.lock()
         .session_mut(session)
         .set_termios(termios, flush_input);
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn read_input_blocking(dest: &mut [u8]) -> usize {
-    read_input_blocking_for_session(ConsoleSessionHandle::SYSTEM, dest)
 }
 
 pub fn read_input_blocking_for_session(session: ConsoleSessionHandle, dest: &mut [u8]) -> usize {
@@ -104,11 +85,6 @@ pub fn read_input_blocking_for_session(session: ConsoleSessionHandle, dest: &mut
             ReadDisposition::Blocked => crate::multitask::yield_now(),
         }
     }
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn write(bytes: &[u8]) -> usize {
-    write_to_session(ConsoleSessionHandle::SYSTEM, bytes)
 }
 
 pub fn write_to_session(session: ConsoleSessionHandle, bytes: &[u8]) -> usize {
@@ -432,15 +408,6 @@ impl TtySessionState {
         let _ = self.input.push(b'\n');
         self.edit_len = 0;
         self.edit_cursor = 0;
-        if !session.is_system()
-            && TTY_COMMIT_DEBUG_LOGS.fetch_add(1, Ordering::Relaxed) < TTY_DEBUG_LOG_LIMIT
-        {
-            crate::debug::println!(
-                "tty commit: session={} queued_len={}",
-                session.raw(),
-                self.input.len(),
-            );
-        }
         self.wake_input_waiter();
     }
 
@@ -594,10 +561,7 @@ impl TtySessionState {
         let Some(task_id) = self.input_waiter.take() else {
             return;
         };
-        let _woke = crate::multitask::wake_user_task(task_id);
-        if TTY_WAKE_DEBUG_LOGS.fetch_add(1, Ordering::Relaxed) < TTY_DEBUG_LOG_LIMIT {
-            crate::debug::println!("tty wake: task_id={} woke={}", task_id, _woke);
-        }
+        let _ = crate::multitask::wake_user_task(task_id);
     }
 }
 
