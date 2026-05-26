@@ -6,4 +6,3 @@ pub(crate) mod stat;
 pub mod usermem {
     pub use kernel_ps::api::sysops::usermem::*;
 }
-pub(crate) mod win32;

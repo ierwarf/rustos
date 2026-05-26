@@ -395,9 +395,7 @@ fn on_handle_close(handle: &KernelHandle) {
 mod tests {
     use alloc::vec;
 
-    use super::{
-        FD_CLOEXEC, HandleEntry, HandleTable, KernelHandle, VfsDirectoryHandle, VfsFileHandle,
-    };
+    use super::{FD_CLOEXEC, HandleEntry, HandleTable, KernelHandle, VfsDirectoryHandle};
     use crate::memory::paging::UserRegion;
     use crate::user::linux as linux_abi;
     use kernel_object::api::handle::{FileHandleRights, HandleOwner, HandleRights};
@@ -407,17 +405,17 @@ mod tests {
     fn install_entry_min_keeps_existing_dynamic_fds() {
         let mut table = HandleTable::new();
 
-        let fd0 = table.install(KernelHandle::VfsFile(VfsFileHandle::read_only_memory(
+        let fd0 = table.install(KernelHandle::VfsDirectory(VfsDirectoryHandle::new(
             "/a".into(),
-            vec![1],
+            vec![],
         )));
-        let fd1 = table.install(KernelHandle::VfsFile(VfsFileHandle::read_only_memory(
+        let fd1 = table.install(KernelHandle::VfsDirectory(VfsDirectoryHandle::new(
             "/b".into(),
-            vec![2],
+            vec![],
         )));
-        let fd2 = table.install(KernelHandle::VfsFile(VfsFileHandle::read_only_memory(
+        let fd2 = table.install(KernelHandle::VfsDirectory(VfsDirectoryHandle::new(
             "/c".into(),
-            vec![3],
+            vec![],
         )));
 
         assert_eq!(fd0, 3);
@@ -430,12 +428,12 @@ mod tests {
         let mut table = HandleTable::new();
 
         let keep_fd = table.install_entry(HandleEntry::new(
-            KernelHandle::VfsFile(VfsFileHandle::read_only_memory("/keep".into(), vec![1])),
+            KernelHandle::VfsDirectory(VfsDirectoryHandle::new("/keep".into(), vec![])),
             0,
             0,
         ));
         let drop_fd = table.install_entry(HandleEntry::new(
-            KernelHandle::VfsFile(VfsFileHandle::read_only_memory("/drop".into(), vec![2])),
+            KernelHandle::VfsDirectory(VfsDirectoryHandle::new("/drop".into(), vec![])),
             FD_CLOEXEC,
             0,
         ));
@@ -449,7 +447,7 @@ mod tests {
     #[test]
     fn set_status_flags_preserves_access_mode_and_masks_unknown_bits() {
         let mut entry = HandleEntry::new(
-            KernelHandle::VfsFile(VfsFileHandle::read_only_memory("/flags".into(), vec![1])),
+            KernelHandle::VfsDirectory(VfsDirectoryHandle::new("/flags".into(), vec![])),
             0,
             linux_abi::O_RDWR | linux_abi::O_APPEND,
         );
@@ -468,12 +466,12 @@ mod tests {
     fn duplicate_exact_replaces_target_and_applies_cloexec_flag() {
         let mut table = HandleTable::new();
         let source_fd = table.install_entry(HandleEntry::new(
-            KernelHandle::VfsFile(VfsFileHandle::read_only_memory("/source".into(), vec![1])),
+            KernelHandle::VfsDirectory(VfsDirectoryHandle::new("/source".into(), vec![])),
             0,
             linux_abi::O_RDONLY,
         ));
         let target_fd = table.install_entry(HandleEntry::new(
-            KernelHandle::VfsFile(VfsFileHandle::read_only_memory("/target".into(), vec![2])),
+            KernelHandle::VfsDirectory(VfsDirectoryHandle::new("/target".into(), vec![])),
             0,
             linux_abi::O_RDONLY,
         ));
@@ -485,8 +483,8 @@ mod tests {
         let replaced = table.get_entry(target_fd).expect("duplicated entry");
         assert_eq!(replaced.fd_flags() & FD_CLOEXEC, FD_CLOEXEC);
         match replaced.handle() {
-            KernelHandle::VfsFile(file) => assert_eq!(file.path(), "/source"),
-            other => panic!("expected VfsFile after dup2-style replace, got {other:?}"),
+            KernelHandle::VfsDirectory(dir) => assert_eq!(dir.path(), "/source"),
+            other => panic!("expected VfsDirectory after dup2-style replace, got {other:?}"),
         }
     }
 
@@ -495,7 +493,7 @@ mod tests {
         let mut table = HandleTable::new();
         let rights = HandleRights::File(FileHandleRights::READ);
         let source_fd = table.install_entry(HandleEntry::new_with_rights(
-            KernelHandle::VfsFile(VfsFileHandle::read_only_memory("/source".into(), vec![1])),
+            KernelHandle::VfsDirectory(VfsDirectoryHandle::new("/source".into(), vec![])),
             rights,
             0,
             linux_abi::O_RDONLY,
@@ -510,7 +508,7 @@ mod tests {
     fn transfer_duplicate_requires_transfer_right() {
         let mut table = HandleTable::new();
         let source_fd = table.install_entry(HandleEntry::new_with_rights(
-            KernelHandle::VfsFile(VfsFileHandle::read_only_memory("/source".into(), vec![1])),
+            KernelHandle::VfsDirectory(VfsDirectoryHandle::new("/source".into(), vec![])),
             HandleRights::File(FileHandleRights::READ),
             0,
             linux_abi::O_RDONLY,
@@ -523,7 +521,7 @@ mod tests {
     fn transfer_install_preserves_rights_and_flags() {
         let mut source = HandleTable::new();
         let source_fd = source.install_entry(HandleEntry::new(
-            KernelHandle::VfsFile(VfsFileHandle::read_only_memory("/source".into(), vec![1])),
+            KernelHandle::VfsDirectory(VfsDirectoryHandle::new("/source".into(), vec![])),
             FD_CLOEXEC,
             linux_abi::O_RDONLY | linux_abi::O_NONBLOCK,
         ));
@@ -581,9 +579,9 @@ mod tests {
         let mut table = HandleTable::new();
         assert_eq!(table.display_surface_count(), 0);
 
-        table.install(KernelHandle::VfsFile(VfsFileHandle::read_only_memory(
+        table.install(KernelHandle::VfsDirectory(VfsDirectoryHandle::new(
             "/file".into(),
-            vec![1],
+            vec![],
         )));
         assert_eq!(table.display_surface_count(), 0);
 

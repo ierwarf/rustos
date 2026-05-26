@@ -22,8 +22,8 @@ mod vfs;
 pub use display_surface::DisplaySurfaceHandle;
 pub use table::{HandleEntry, HandleTable, TransferredHandleEntry};
 pub use vfs::{
-    FileHandleSeekError, FileHandleSeekWhence, FileHandleWriteError, VfsDirectoryEntry,
-    VfsDirectoryEntryKind, VfsDirectoryHandle, VfsFileHandle, VfsFileObject,
+    FileHandleSeekError, FileHandleSeekWhence, VfsDirectoryEntry, VfsDirectoryEntryKind,
+    VfsDirectoryHandle,
 };
 
 pub const FIRST_DYNAMIC_FD: u32 = 3;
@@ -48,7 +48,6 @@ pub enum KernelHandle {
     RemoteVfs(RemoteVfsHandle),
     SharedRegion(KernelSharedRegionHandle),
     Socket(SocketHandle),
-    VfsFile(VfsFileHandle),
     VfsDirectory(VfsDirectoryHandle),
     DisplaySurface(DisplaySurfaceHandle),
 }
@@ -176,7 +175,6 @@ impl KernelHandle {
             Self::RemoteVfs(remote) => HandleToken::new(HandleOwner::Io, remote.token_id()),
             Self::SharedRegion(region) => HandleToken::new(HandleOwner::Ipc, region.raw()),
             Self::Socket(socket) => HandleToken::new(HandleOwner::Compat, socket.token_id()),
-            Self::VfsFile(file) => HandleToken::new(HandleOwner::Io, file.token_id()),
             Self::VfsDirectory(directory) => {
                 HandleToken::new(HandleOwner::Io, directory.token_id())
             }
@@ -196,7 +194,6 @@ impl KernelHandle {
             Self::RemoteVfs(_) => "remote-vfs",
             Self::SharedRegion(_) => "ipc-region",
             Self::Socket(_) => "socket",
-            Self::VfsFile(_) => "vfs-file",
             Self::VfsDirectory(_) => "vfs-dir",
             Self::DisplaySurface(_) => "display-surface",
         }
@@ -265,7 +262,6 @@ impl KernelHandle {
                     .union(SocketHandleRights::PASS_FD)
                     .union(SocketHandleRights::TRANSFER),
             ),
-            Self::VfsFile(_) => HandleRights::File(file_rights_from_status_flags(status_flags)),
             Self::VfsDirectory(_) => {
                 HandleRights::File(FileHandleRights::READ.union(FileHandleRights::TRANSFER))
             }
@@ -282,7 +278,6 @@ impl KernelHandle {
             self,
             Self::Socket(_)
                 | Self::Memfd(_)
-                | Self::VfsFile(_)
                 | Self::VfsDirectory(_)
                 | Self::Device(_)
                 | Self::RemoteVfs(_)
@@ -309,7 +304,6 @@ impl KernelHandle {
             Self::Socket(socket) => socket.bound_path().unwrap_or_else(|| {
                 alloc::format!("socket:[rustos-unix-stream:{}]", token.object_id())
             }),
-            Self::VfsFile(file) => file.path(),
             Self::VfsDirectory(directory) => alloc::string::String::from(directory.path()),
             Self::DisplaySurface(_) => {
                 alloc::format!("anon_inode:[rustos-display-surface:{}]", token.object_id())

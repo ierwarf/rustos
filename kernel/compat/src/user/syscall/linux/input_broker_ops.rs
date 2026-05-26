@@ -1,14 +1,11 @@
 use super::*;
 
 use rustos_user_abi::syscall::{
-    INPUT_STATS_FLAG_PENDING_COALESCED, INPUT_STATS_FLAG_PENDING_POINTER_POSITION,
-    INPUTD_ACCESS_NATIVE, INPUTD_INGEST_MAX_EVENTS, IPC_SERVICE_CAP_INPUT_POLICY,
     InputIngestBrokerArgs, InputIngressWire, InputStatsBrokerArgs, InputStatsWire,
+    INPUTD_ACCESS_NATIVE, INPUTD_INGEST_MAX_EVENTS, INPUT_STATS_FLAG_PENDING_COALESCED,
+    INPUT_STATS_FLAG_PENDING_POINTER_POSITION, IPC_SERVICE_CAP_INPUT_POLICY,
 };
 
-// RING3-MIGRATION-COMMENTED-OUT START: inputd should own input stats /
-// ingest broker. Ring0 keeps the raw input ring buffer substrate.
-/*
 pub(super) fn syscall_linux_rustos_input_stats_broker(args_ptr: u64) -> u64 {
     if !ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_INPUT_POLICY) {
         return linux_errno(LINUX_EPERM);
@@ -90,6 +87,3 @@ pub(super) fn syscall_linux_rustos_input_ingest_broker(args_ptr: u64) -> u64 {
         Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
     }
 }
-
-*/
-// RING3-MIGRATION-COMMENTED-OUT END

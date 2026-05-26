@@ -19,7 +19,6 @@ use xmas_elf::program::{ProgramHeader, SegmentData, Type as ProgramType};
 use crate::memory::paging::{self, ProcessAddressSpace};
 use crate::multitask::UserStackState;
 use crate::user::abi::UserAbi;
-use crate::user::handles::VfsFileHandle;
 use crate::user::linux::{
     self as linux_abi, LinuxImageMapping, LinuxImageMappingPathKind, LinuxInitialTlsInfo,
     LinuxMemoryMapState, LinuxProcessImageInfo, LinuxProcessLaunch, LinuxRuntimeProfile, LinuxVma,
@@ -1412,13 +1411,6 @@ pub(super) fn initialize_linux_user_stack(
     launch: LinuxProcessLaunch<'_>,
     security: ProcessSecurityContext,
 ) -> Result<VirtAddr, ProcessLoadError> {
-    // RING3-MIGRATION-COMMENTED-OUT START: procd/syscalld should own Linux
-    // initial stack and auxv policy, including argv/env layout, credential aux
-    // entries, hwcap/defaults, and RustOS-private aux values. Ring0 keeps the
-    // final current-address-space byte writes needed to materialize the
-    // prepared bootstrap image. Function body is left without a tail return so
-    // call sites break the build — intentional.
-    /*
     let aligned_top = align_down(stack_end.as_u64(), 16);
     let mut cursor = aligned_top;
     let mut random_bytes = [0_u8; LINUX_STACK_RANDOM_BYTES];
@@ -1493,14 +1485,8 @@ pub(super) fn initialize_linux_user_stack(
 
     address_space.initialize_user_bytes(VirtAddr::new(stack_start), &stack_bytes)?;
     Ok(VirtAddr::new(stack_start))
-    */
-    // RING3-MIGRATION-COMMENTED-OUT END (body of outer function — split here so
-    // the outer closing brace remains in source for the parser)
 }
 
-// RING3-MIGRATION-COMMENTED-OUT START: helper functions for the policy block
-// above. Same justification.
-/*
 fn build_linux_initial_stack_words(
     image: &LinuxProcessImageInfo,
     argv_ptrs: &[u64],
@@ -1611,8 +1597,6 @@ fn push_stack_bytes(
     *cursor = aligned;
     Ok(aligned)
 }
-*/
-// RING3-MIGRATION-COMMENTED-OUT END
 
 fn make_interpreter_load_error(path: &str, error: vfs::VfsError) -> ProcessLoadError {
     let mut stored_path = [0_u8; 128];

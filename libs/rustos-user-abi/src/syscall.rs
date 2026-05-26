@@ -273,6 +273,8 @@ pub const ROOTD_LEASE_STATE_RESTART_PENDING: u16 = 3;
 pub const ROOTD_LEASE_STATE_FAILED: u16 = 4;
 pub const NETD_IPC_ABI_VERSION: u16 = 1;
 pub const NETD_IPC_PAYLOAD_CAPACITY: usize = 32 * 1024;
+pub const NETD_SENDMSG_PAYLOAD_HEADER_SIZE: usize = 16;
+pub const NETD_RECVMSG_PAYLOAD_HEADER_SIZE: usize = 16;
 pub const VFS_LIFECYCLE_FORK: u16 = 1;
 pub const VFS_LIFECYCLE_EXEC_CLOEXEC: u16 = 2;
 pub const VFS_LIFECYCLE_EXIT: u16 = 3;
@@ -1412,7 +1414,7 @@ pub struct RustosNetBrokerArgs {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NetdIpcRequest {
     pub version: u16,
     pub op: u16,
@@ -1437,8 +1439,36 @@ pub struct NetdIpcRequest {
     pub payload: [u8; NETD_IPC_PAYLOAD_CAPACITY],
 }
 
+impl Default for NetdIpcRequest {
+    fn default() -> Self {
+        Self {
+            version: 0,
+            op: 0,
+            flags: 0,
+            payload_len: 0,
+            reserved1: 0,
+            pid: 0,
+            tid: 0,
+            uid: 0,
+            gid: 0,
+            euid: 0,
+            egid: 0,
+            arg0: 0,
+            arg1: 0,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+            reserved0: 0,
+            socket_token: 0,
+            status_flags: 0,
+            payload: [0; NETD_IPC_PAYLOAD_CAPACITY],
+        }
+    }
+}
+
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NetdIpcResponse {
     pub version: u16,
     pub op: u16,
@@ -1448,6 +1478,21 @@ pub struct NetdIpcResponse {
     pub payload_len: u32,
     pub reserved1: u32,
     pub payload: [u8; NETD_IPC_PAYLOAD_CAPACITY],
+}
+
+impl Default for NetdIpcResponse {
+    fn default() -> Self {
+        Self {
+            version: 0,
+            op: 0,
+            status: 0,
+            reserved0: 0,
+            value: 0,
+            payload_len: 0,
+            reserved1: 0,
+            payload: [0; NETD_IPC_PAYLOAD_CAPACITY],
+        }
+    }
 }
 
 #[repr(C)]

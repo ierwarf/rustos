@@ -8,7 +8,6 @@ use crate::io::session::ConsoleSessionHandle;
 use crate::memory::paging::{self, AddressSpaceError, ProcessAddressSpace};
 use crate::multitask;
 use crate::user::abi::UserAbi;
-use crate::user::handles::VfsFileHandle;
 use crate::user::linux::{LinuxProcessImageInfo, LinuxProcessLaunch};
 use crate::user::process_state::{
     ProcessSecurityContext, WindowsProcessRuntimeState, WindowsThreadRuntimeState,

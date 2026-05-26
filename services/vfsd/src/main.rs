@@ -203,6 +203,7 @@ struct RemoteHandle {
     cursor: u64,
     len: u64,
     refs: u64,
+    status_flags: u64,
 }
 
 #[derive(Clone)]
@@ -381,7 +382,7 @@ impl VfsState {
             VFS_IPC_OP_FSTAT => self.vfs_fstat(request, &mut response),
             VFS_IPC_OP_FTRUNCATE => response.status = EROFS,
             VFS_IPC_OP_GETDENTS64 => self.vfs_getdents64(request, &mut response),
-            VFS_IPC_OP_FCNTL => self.vfs_fcntl(&mut response),
+            VFS_IPC_OP_FCNTL => self.vfs_fcntl(request, &mut response),
             VFS_IPC_OP_STATX => self.vfs_path_statx(request, &mut response),
             VFS_IPC_OP_NEWFSTATAT => self.vfs_path_stat(request, &mut response),
             VFS_IPC_OP_READLINKAT => response.status = ENOENT,
@@ -689,6 +690,7 @@ impl VfsState {
                 response.remote_id = id;
                 response.handle_kind = handle_kind_u16(handle.kind);
                 response.value = handle.len;
+                write_vfs_payload_bytes(response, handle.path.as_bytes());
             }
             Err(errno) => response.status = errno,
         }
@@ -765,8 +767,15 @@ impl VfsState {
         response.value = response.payload_len as u64;
     }
 
-    fn vfs_fcntl(&mut self, response: &mut VfsIpcResponse) {
-        response.value = 0;
+    fn vfs_fcntl(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        response.status = self.fcntl_remote(request.remote_id, request.arg0, request.arg1);
+        if response.status == 0 {
+            response.value = self
+                .handles
+                .get(&request.remote_id)
+                .map(|handle| handle.status_flags)
+                .unwrap_or(0);
+        }
     }
 
     fn vfs_path_statx(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
@@ -911,7 +920,12 @@ impl VfsState {
         } else if is_at_fdcwd(dirfd) {
             self.cwd_for_pid(pid)
         } else {
-            let handle = self.handles.get(&dirfd).ok_or(EBADF)?;
+            let base_handle_id = if request.remote_id != 0 {
+                request.remote_id
+            } else {
+                dirfd
+            };
+            let handle = self.handles.get(&base_handle_id).ok_or(EBADF)?;
             if handle.kind != RemoteKind::Directory {
                 return Err(ENOTDIR);
             }
@@ -936,6 +950,7 @@ impl VfsState {
             cursor: 0,
             len: metadata.len,
             refs: 1,
+            status_flags: flags & !linux_abi::O_CLOEXEC,
         };
         self.handles.insert(id, handle.clone());
         Ok((id, handle))
@@ -959,6 +974,23 @@ impl VfsState {
         };
         handle.refs = handle.refs.saturating_add(1);
         0
+    }
+
+    fn fcntl_remote(&mut self, id: u64, cmd: u64, arg: u64) -> i32 {
+        const F_SETFL_MUTABLE_MASK: u64 = linux_abi::O_APPEND | linux_abi::O_NONBLOCK;
+
+        let Some(handle) = self.handles.get_mut(&id) else {
+            return EBADF;
+        };
+        match cmd {
+            linux_abi::F_GETFL => 0,
+            linux_abi::F_SETFL => {
+                handle.status_flags =
+                    (handle.status_flags & !F_SETFL_MUTABLE_MASK) | (arg & F_SETFL_MUTABLE_MASK);
+                0
+            }
+            _ => EINVAL,
+        }
     }
 
     fn read_remote_into(

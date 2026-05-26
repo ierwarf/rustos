@@ -9,10 +9,6 @@ use crate::user::linux::LinuxProcessLaunch;
 use crate::user::process::{self, ProcessLaunchOptions, ProcessLoadError, SpawnedProcess};
 use crate::vfs;
 
-// RING3-MIGRATION-COMMENTED-OUT START: loaderd should own console-host
-// executable image fetch via VFS + program spec + session-attach spawn
-// policy. Ring0 keeps the raw process load substrate.
-/*
 fn emit_console(level: debug::LogLevel, event_id: u16, object_id: u64, message: String) {
     debug::record_milestone(
         debug::LogCategory::Console,
@@ -304,6 +300,3 @@ fn load_executable_image_path_uncached(
         }
     }
 }
-
-*/
-// RING3-MIGRATION-COMMENTED-OUT END

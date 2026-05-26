@@ -3,14 +3,10 @@ use super::*;
 use alloc::vec::Vec;
 use kernel_io_manager::api::block as block_api;
 use rustos_user_abi::syscall::{
-    BLOCK_BROKER_ABI_VERSION, BLOCK_BROKER_MAX_IO_BYTES, BLOCK_BROKER_OP_BOOT_INFO,
-    BLOCK_BROKER_OP_BOOT_READ, IPC_SERVICE_CAP_VFS_POLICY, RustosBlockBrokerArgs,
+    RustosBlockBrokerArgs, BLOCK_BROKER_ABI_VERSION, BLOCK_BROKER_MAX_IO_BYTES,
+    BLOCK_BROKER_OP_BOOT_INFO, BLOCK_BROKER_OP_BOOT_READ, IPC_SERVICE_CAP_VFS_POLICY,
 };
 
-// RING3-MIGRATION-COMMENTED-OUT START: vfsd/storaged should own boot-info /
-// boot-read block broker policy. Ring0 keeps the privileged block device
-// substrate.
-/*
 pub(super) fn syscall_linux_rustos_block_broker(args_ptr: u64) -> u64 {
     if !ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_VFS_POLICY) {
         return linux_errno(LINUX_EPERM);
@@ -114,6 +110,3 @@ fn storage_error_to_linux_errno(err: storage_core::StorageError) -> i64 {
         | storage_core::StorageError::DeviceFault => LINUX_EIO,
     }
 }
-
-*/
-// RING3-MIGRATION-COMMENTED-OUT END

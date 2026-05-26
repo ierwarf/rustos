@@ -2,15 +2,11 @@ use super::*;
 
 use alloc::string::String;
 use rustos_user_abi::syscall::{
+    RustosDriverLoadModuleBrokerArgs, RustosDriverProbeAliasBrokerArgs,
     DRIVER_BROKER_ALIAS_CAPACITY, DRIVER_BROKER_NAME_CAPACITY, DRIVER_BROKER_PATH_CAPACITY,
     DRIVER_LOAD_POLICY_KNOWN_FLAGS, IPC_SERVICE_CAP_DRIVER_POLICY,
-    RustosDriverLoadModuleBrokerArgs, RustosDriverProbeAliasBrokerArgs,
 };
 
-// RING3-MIGRATION-COMMENTED-OUT START: driverd should own module-load policy
-// flags, alias probing, and provider selection. Ring0 keeps the privileged
-// module install substrate for `.ko` compatibility.
-/*
 pub(super) fn syscall_linux_rustos_driver_load_module_broker(args_ptr: u64) -> u64 {
     if !ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_DRIVER_POLICY) {
         return linux_errno(LINUX_EPERM);
@@ -88,8 +84,6 @@ pub(super) fn syscall_linux_rustos_driver_probe_alias_broker(args_ptr: u64) -> u
         0
     }
 }
-*/
-// RING3-MIGRATION-COMMENTED-OUT END
 
 fn read_driver_text(ptr: u64, len: u64, max_len: usize) -> Result<String, i64> {
     let len = usize::try_from(len).map_err(|_| LINUX_EINVAL)?;

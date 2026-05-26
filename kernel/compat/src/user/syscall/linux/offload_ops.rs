@@ -2,17 +2,13 @@ use alloc::vec::Vec;
 
 use lazy_static::lazy_static;
 use rustos_user_abi::syscall::{
-    LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT, LifecycleDrainBrokerArgs, LifecycleEventWire,
+    LifecycleDrainBrokerArgs, LifecycleEventWire, LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT,
     VFS_IPC_OP_PREAD64, VFS_IPC_PAYLOAD_CAPACITY,
 };
 use spin::Mutex;
 
 use super::*;
 
-// RING3-MIGRATION-COMMENTED-OUT START: remote VFS read path, process-exit
-// recording, and lifecycle event drain are syscalld/procd policy. Ring0 keeps
-// only the IPC transport substrate.
-/*
 pub(crate) fn call_remote_vfs_read_bytes(
     remote_id: u64,
     offset: u64,
@@ -91,6 +87,3 @@ pub(super) fn drain_lifecycle_events(args: &LifecycleDrainBrokerArgs) -> Result<
         .map_err(address_space_error_to_linux_errno)?;
     Ok(out_count as u64)
 }
-
-*/
-// RING3-MIGRATION-COMMENTED-OUT END

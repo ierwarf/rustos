@@ -8,10 +8,6 @@ use crate::io::tty;
 use crate::memory::paging;
 use crate::multitask;
 
-// RING3-MIGRATION-COMMENTED-OUT START: sessiond/runtimed should own console
-// I/O sysops (Linux process tty read/write paths). Ring0 keeps the raw tty
-// substrate accessor only.
-/*
 const CONSOLE_IO_CHUNK_LEN: usize = 256;
 const CONSOLE_IO_DEBUG_LOG_LIMIT: usize = 0;
 
@@ -193,6 +189,3 @@ pub(crate) fn read_into_current_process(
 
     Ok(total_read)
 }
-
-*/
-// RING3-MIGRATION-COMMENTED-OUT END

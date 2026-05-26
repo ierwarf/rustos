@@ -1,33 +1,28 @@
 use super::*;
 
 use alloc::vec::Vec;
-use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
+use x86_64::VirtAddr;
 
 use rustos_user_abi::syscall::{
-    IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY, MM_BROKER_ABI_VERSION, MM_BROKER_FD_KIND_DEVICE,
-    MM_BROKER_FD_KIND_DISPLAY_SURFACE, MM_BROKER_FD_KIND_FILE, MM_BROKER_FD_KIND_MEMFD,
-    MM_BROKER_FD_KIND_NONE, MM_BROKER_FD_RIGHT_MAP, MM_BROKER_FD_RIGHT_READ,
-    MM_BROKER_FD_RIGHT_WRITE, MM_BROKER_OP_DESCRIBE_FD, MM_BROKER_OP_MAP_ANON,
-    MM_BROKER_OP_MAP_DEVICE_SHARED, MM_BROKER_OP_MAP_FILE_PRIVATE, MM_BROKER_OP_MAP_MEMFD_SHARED,
-    MM_BROKER_OP_PROTECT, MM_BROKER_OP_QUERY_LAYOUT, MM_BROKER_OP_UNMAP, MM_BROKER_PATH_CAPACITY,
     RustosMmBrokerArgs, RustosMmFdBrokerResult, RustosMmLayoutBrokerResult,
-    RustosMmMapBrokerResult,
+    RustosMmMapBrokerResult, IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY, MM_BROKER_ABI_VERSION,
+    MM_BROKER_FD_KIND_DEVICE, MM_BROKER_FD_KIND_DISPLAY_SURFACE, MM_BROKER_FD_KIND_FILE,
+    MM_BROKER_FD_KIND_MEMFD, MM_BROKER_FD_KIND_NONE, MM_BROKER_FD_RIGHT_MAP,
+    MM_BROKER_FD_RIGHT_READ, MM_BROKER_FD_RIGHT_WRITE, MM_BROKER_OP_DESCRIBE_FD,
+    MM_BROKER_OP_MAP_ANON, MM_BROKER_OP_MAP_DEVICE_SHARED, MM_BROKER_OP_MAP_FILE_PRIVATE,
+    MM_BROKER_OP_MAP_MEMFD_SHARED, MM_BROKER_OP_PROTECT, MM_BROKER_OP_QUERY_LAYOUT,
+    MM_BROKER_OP_UNMAP, MM_BROKER_PATH_CAPACITY,
 };
 
-use crate::user::handles::{KernelHandle, RemoteVfsHandleKind, VfsFileHandle};
+use crate::user::handles::{KernelHandle, RemoteVfsHandleKind};
 use crate::user::memfd::{MemfdError, MemfdHandle};
 
-// RING3-MIGRATION-COMMENTED-OUT START: mm broker (anon/file/memfd/device map,
-// protect, unmap, layout/fd describe) belongs in syscalld/procd. Ring0 keeps
-// only the address-space substrate that procd calls into.
-/*
 const PAGE_SIZE: u64 = 4096;
 const FILE_COPY_CHUNK: usize = 4096;
 
 #[derive(Clone)]
 enum FileMappingSource {
-    Vfs(VfsFileHandle),
     Remote { remote_id: u64 },
 }
 
@@ -91,11 +86,6 @@ fn broker_describe_fd(args: &RustosMmBrokerArgs) -> Result<(), i64> {
         result.rights = broker_rights(entry.rights());
 
         match entry.handle() {
-            KernelHandle::VfsFile(file) => {
-                result.kind = MM_BROKER_FD_KIND_FILE;
-                result.len = file.len() as u64;
-                copy_path(&mut result, &file.path());
-            }
             KernelHandle::RemoteVfs(remote) if remote.kind() == RemoteVfsHandleKind::File => {
                 result.kind = MM_BROKER_FD_KIND_FILE;
                 result.len = remote.len();
@@ -365,7 +355,6 @@ fn file_mapping_source(target_pid: u64, fd: u64) -> Result<FileMappingSource, i6
             return Err(LINUX_EACCES);
         }
         match entry.handle() {
-            KernelHandle::VfsFile(file) => Ok(FileMappingSource::Vfs(file.clone())),
             KernelHandle::RemoteVfs(remote) if remote.kind() == RemoteVfsHandleKind::File => {
                 Ok(FileMappingSource::Remote {
                     remote_id: remote.remote_id(),
@@ -406,12 +395,6 @@ fn copy_file_mapping(
     while copied < len {
         let count = (len - copied).min(chunk.len());
         let read = match source {
-            FileMappingSource::Vfs(file) => file.read_at(
-                usize::try_from(offset)
-                    .map_err(|_| LINUX_EINVAL)?
-                    .saturating_add(copied),
-                &mut chunk[..count],
-            ),
             FileMappingSource::Remote { remote_id } => {
                 match offload_ops::call_remote_vfs_read_bytes(
                     *remote_id,
@@ -535,6 +518,3 @@ fn memfd_error_to_errno(err: MemfdError) -> i64 {
         MemfdError::PermissionDenied => LINUX_EACCES,
     }
 }
-
-*/
-// RING3-MIGRATION-COMMENTED-OUT END

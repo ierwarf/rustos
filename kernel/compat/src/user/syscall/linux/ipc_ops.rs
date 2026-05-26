@@ -222,9 +222,13 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
         debug::println!("ipc service revoked: service={}", service_id);
         return 0;
     }
-    let Some(capability) = service_registration_capability(service_id) else {
-        return linux_errno(LINUX_EACCES);
-    };
+    if SERVICE_ENDPOINTS[index].load(Ordering::Acquire) != 0 {
+        return linux_errno(LINUX_EBUSY);
+    }
+    let capability = service_capability(service_id);
+    if capability == 0 {
+        return linux_errno(LINUX_EINVAL);
+    }
     SERVICE_ENDPOINTS[index].store(endpoint, Ordering::Release);
     SERVICE_ENDPOINT_OWNERS[index].store(process_id, Ordering::Release);
     SERVICE_ENDPOINT_CAPS[index].store(capability, Ordering::Release);
@@ -236,36 +240,6 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
         capability
     );
     0
-}
-
-// RING3-MIGRATION-COMMENTED-OUT START: capability policy (bootstrap map +
-// static service capability table + rootd lease lookup) belongs in rootd, not
-// in ring0. Ring0 keeps only endpoint-table writes and user-copy IPC
-// substrate. Call sites in syscall_linux_rustos_ipc_register_service_endpoint
-// and syscall_linux_rustos_ipc_register_linux_syscall_endpoint are intentionally
-// left referencing these to break the build until rootd protocol replaces them.
-/*
-fn service_registration_capability(service_id: u64) -> Option<u64> {
-    if service_id == linux_abi::IPC_SERVICE_ROOTD {
-        return Some(service_capability(service_id));
-    }
-    if let Some(capability) = rootd_service_capability(service_id) {
-        return Some(capability);
-    }
-    bootstrap_service_capability(service_id)
-}
-
-fn bootstrap_service_capability(service_id: u64) -> Option<u64> {
-    if service_endpoint_raw(linux_abi::IPC_SERVICE_ROOTD).unwrap_or(0) != 0 {
-        return None;
-    }
-    match service_id {
-        linux_abi::IPC_SERVICE_LINUX_SYSCALLD
-        | linux_abi::IPC_SERVICE_VFSD
-        | linux_abi::IPC_SERVICE_LOADERD
-        | linux_abi::IPC_SERVICE_PROCD => Some(service_capability(service_id)),
-        _ => None,
-    }
 }
 
 fn service_capability(service_id: u64) -> u64 {
@@ -294,41 +268,6 @@ fn service_capability(service_id: u64) -> u64 {
         _ => 0,
     }
 }
-
-fn rootd_service_capability(service_id: u64) -> Option<u64> {
-    if service_id == linux_abi::IPC_SERVICE_ROOTD {
-        return None;
-    }
-    let endpoint = service_endpoint(linux_abi::IPC_SERVICE_ROOTD)?;
-    let mut request = rustos_user_abi::syscall::CommercialMaxProtocolRequest::default();
-    request.header.version = rustos_user_abi::syscall::COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
-    request.header.protocol = rustos_user_abi::syscall::COMMERCIAL_MAX_PROTOCOL_CAPABILITY;
-    request.header.op = rustos_user_abi::syscall::COMMERCIAL_MAX_CAPABILITY_OP_LEASE_GRANT;
-    request.header.service_id = linux_abi::IPC_SERVICE_ROOTD;
-    request.arg0 = service_id;
-    let reply = enqueue_call_and_wake(endpoint, as_bytes(&request)).ok()?;
-    let response = wait_for_reply(reply).ok()?;
-    if response.len() != size_of::<rustos_user_abi::syscall::CommercialMaxProtocolResponse>() {
-        return None;
-    }
-    let response =
-        read_unaligned::<rustos_user_abi::syscall::CommercialMaxProtocolResponse>(response.as_slice());
-    if response.header.version != rustos_user_abi::syscall::COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
-        || response.header.protocol != rustos_user_abi::syscall::COMMERCIAL_MAX_PROTOCOL_CAPABILITY
-        || response.header.op != rustos_user_abi::syscall::COMMERCIAL_MAX_CAPABILITY_OP_LEASE_GRANT
-        || response.status != 0
-        || response.value0 == 0
-        || response.capability.service_id != service_id
-        || response.capability.lease_id == 0
-        || response.capability.capability_mask & response.value0 != response.value0
-        || response.capability.rights_mask & response.value0 != response.value0
-    {
-        return None;
-    }
-    Some(response.value0)
-}
-*/
-// RING3-MIGRATION-COMMENTED-OUT END
 
 pub(super) fn syscall_linux_rustos_ipc_lookup_service_endpoint(service_id: u64) -> u64 {
     let Some(raw) = service_endpoint_raw(service_id) else {

@@ -4,11 +4,11 @@ use crate::user::sysops::device::{self, DeviceSysopError};
 use kernel_object::api::device::DeviceAccessKind;
 use kernel_object::api::handle::{DeviceHandleRights, HandleRights};
 use rustos_user_abi::syscall::{
-    DEVMGRD_DEVICE_ACCESS_EVDEV, DEVMGRD_DEVICE_ACCESS_NATIVE, DEVMGRD_DEVICE_ID_CONSOLE,
-    DEVMGRD_DEVICE_ID_DISPLAY, DEVMGRD_DEVICE_ID_INPUT, DEVMGRD_DEVICE_RIGHT_ADMIN,
-    DEVMGRD_DEVICE_RIGHT_IOCTL, DEVMGRD_DEVICE_RIGHT_MAP, DEVMGRD_DEVICE_RIGHT_READ,
-    DEVMGRD_DEVICE_RIGHT_TRANSFER, DEVMGRD_DEVICE_RIGHT_WRITE, IPC_SERVICE_CAP_DEVICE_POLICY,
-    IPC_SERVICE_CAP_SESSION_POLICY, RustosDeviceIoctlBrokerArgs, RustosDeviceOpenBrokerArgs,
+    RustosDeviceIoctlBrokerArgs, RustosDeviceOpenBrokerArgs, DEVMGRD_DEVICE_ACCESS_EVDEV,
+    DEVMGRD_DEVICE_ACCESS_NATIVE, DEVMGRD_DEVICE_ID_CONSOLE, DEVMGRD_DEVICE_ID_DISPLAY,
+    DEVMGRD_DEVICE_ID_INPUT, DEVMGRD_DEVICE_RIGHT_ADMIN, DEVMGRD_DEVICE_RIGHT_IOCTL,
+    DEVMGRD_DEVICE_RIGHT_MAP, DEVMGRD_DEVICE_RIGHT_READ, DEVMGRD_DEVICE_RIGHT_TRANSFER,
+    DEVMGRD_DEVICE_RIGHT_WRITE, IPC_SERVICE_CAP_DEVICE_POLICY, IPC_SERVICE_CAP_SESSION_POLICY,
 };
 
 pub(super) fn syscall_linux_rustos_device_open_broker(args_ptr: u64) -> u64 {
@@ -119,12 +119,6 @@ pub(in crate::user::syscall::linux) fn device_sysop_error_to_linux_errno(
     }
 }
 
-// RING3-MIGRATION-COMMENTED-OUT START: devmgrd should own device right/access
-// translation policy. Ring0 keeps handle installation and object substrate.
-// Extended past the original marker to include map_device_access — same
-// access-translation bucket. Call sites in the broker syscalls above are
-// intentionally left to break the build.
-/*
 fn allowed_device_rights_mask() -> u64 {
     DEVMGRD_DEVICE_RIGHT_READ
         | DEVMGRD_DEVICE_RIGHT_WRITE
@@ -175,5 +169,3 @@ fn map_device_access(access: u16) -> Option<DeviceAccessKind> {
         _ => None,
     }
 }
-*/
-// RING3-MIGRATION-COMMENTED-OUT END

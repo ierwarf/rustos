@@ -9,10 +9,6 @@ const MAX_SLOW_SERVICE_CALL_LOGS: usize = 20;
 
 static SLOW_SERVICE_CALL_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-// RING3-MIGRATION-COMMENTED-OUT START: rootd/loaderd/procd should own direct
-// bootstrap spawn allowlists and launch policy. Ring0 keeps only the initial
-// rootd escape hatch until the first service graph is alive.
-/*
 pub fn syscall_linux_loader_spawn_exec(
     path_ptr: u64,
     _argv_ptr: u64,
@@ -90,9 +86,6 @@ fn spawn_bootstrap_exec_direct(
         .map(|spawned| spawned.pid)
         .map_err(console_host_error_to_linux_errno)
 }
-*/
-// RING3-MIGRATION-COMMENTED-OUT END
-
 fn console_host_error_to_linux_errno(error: crate::user::console_host::ConsoleHostError) -> i64 {
     match error {
         crate::user::console_host::ConsoleHostError::BootstrapBlocked => LINUX_EAGAIN,
@@ -217,16 +210,8 @@ fn is_linux_at_fdcwd(dirfd: u64) -> bool {
 
 fn file_sysop_error_to_linux_errno(error: crate::user::sysops::file::FileSysopError) -> i64 {
     match error {
-        crate::user::sysops::file::FileSysopError::AddressSpace(err) => {
-            address_space_error_to_linux_errno(err)
-        }
-        crate::user::sysops::file::FileSysopError::BadFileDescriptor => LINUX_EBADF,
         crate::user::sysops::file::FileSysopError::InvalidArgument => LINUX_EINVAL,
         crate::user::sysops::file::FileSysopError::NotFound => LINUX_ENOENT,
-        crate::user::sysops::file::FileSysopError::NotDirectory => LINUX_ENOTDIR,
-        crate::user::sysops::file::FileSysopError::PermissionDenied => LINUX_EACCES,
-        crate::user::sysops::file::FileSysopError::ReadOnlyFilesystem => LINUX_EROFS,
-        crate::user::sysops::file::FileSysopError::Unsupported => LINUX_ENOSYS,
     }
 }
 
@@ -368,6 +353,28 @@ pub fn populate_vfs_path(request: &mut VfsIpcRequest, path: &str) -> Result<(), 
     request.path_len = bytes.len() as u32;
     request.path[..bytes.len()].copy_from_slice(bytes);
     Ok(())
+}
+
+pub fn populate_vfs_path_base(
+    request: &mut VfsIpcRequest,
+    dirfd: u64,
+    path: &str,
+) -> Result<(), i64> {
+    request.dirfd = dirfd;
+    if !path.starts_with('/') && !is_linux_at_fdcwd_for_vfs(dirfd) {
+        let remote = current_remote_vfs_handle(dirfd).ok_or(LINUX_EBADF)?;
+        if remote.kind() != multitask::RemoteVfsHandleKind::Directory {
+            return Err(LINUX_ENOTDIR);
+        }
+        request.remote_id = remote.remote_id();
+    }
+    populate_vfs_path(request, path)
+}
+
+fn is_linux_at_fdcwd_for_vfs(dirfd: u64) -> bool {
+    const AT_FDCWD_I64: u64 = (-100_i64) as u64;
+    const AT_FDCWD_I32: u64 = 0xffff_ff9c;
+    dirfd == AT_FDCWD_I64 || dirfd == AT_FDCWD_I32 || dirfd == linux_abi::AT_FDCWD as u64
 }
 
 pub fn call_vfs_ipc_request(request: &VfsIpcRequest) -> Result<VfsIpcResponse, i64> {
@@ -1094,9 +1101,6 @@ fn vfs_request_log_detail(request: &VfsIpcRequest) -> Option<String> {
     }
     if let Some(remote) = current_remote_vfs_handle(request.fd) {
         return Some(alloc::format!("fd={} path={}", request.fd, remote.path()));
-    }
-    if let Some(file) = current_vfs_file_handle(request.fd) {
-        return Some(alloc::format!("fd={} path={}", request.fd, file.path()));
     }
     None
 }

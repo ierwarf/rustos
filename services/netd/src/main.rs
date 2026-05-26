@@ -14,6 +14,7 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_NETD_OP_SOCKET_NAMESPACE, COMMERCIAL_MAX_NETD_OP_SOCKET_OPTIONS,
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
     COMMERCIAL_MAX_PROTOCOL_NETD, IPC_SERVICE_NETD, NETD_IPC_ABI_VERSION,
+    NETD_RECVMSG_PAYLOAD_HEADER_SIZE, NETD_SENDMSG_PAYLOAD_HEADER_SIZE,
     SYSCALL_OFFLOAD_OP_LINUX_ACCEPT, SYSCALL_OFFLOAD_OP_LINUX_BIND, SYSCALL_OFFLOAD_OP_LINUX_CLOSE,
     SYSCALL_OFFLOAD_OP_LINUX_CONNECT, SYSCALL_OFFLOAD_OP_LINUX_DUP,
     SYSCALL_OFFLOAD_OP_LINUX_GETPEERNAME, SYSCALL_OFFLOAD_OP_LINUX_GETSOCKNAME,
@@ -531,6 +532,9 @@ fn handle_accept(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i3
 }
 
 fn handle_send(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
+    if request.op == SYSCALL_OFFLOAD_OP_LINUX_SENDMSG {
+        return handle_sendmsg(request, response);
+    }
     let len = request.payload_len as usize;
     let bytes = &request.payload[..len];
     match send_socket_bytes(request, bytes) {
@@ -542,7 +546,42 @@ fn handle_send(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 
     }
 }
 
+fn handle_sendmsg(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
+    let payload_len = request.payload_len as usize;
+    if payload_len < NETD_SENDMSG_PAYLOAD_HEADER_SIZE {
+        return libc::EINVAL;
+    }
+    let data_len = u32::from_ne_bytes(request.payload[0..4].try_into().unwrap_or([0; 4])) as usize;
+    let control_len =
+        u32::from_ne_bytes(request.payload[4..8].try_into().unwrap_or([0; 4])) as usize;
+    let data_start = NETD_SENDMSG_PAYLOAD_HEADER_SIZE;
+    let control_start = match data_start.checked_add(data_len) {
+        Some(value) => value,
+        None => return libc::EINVAL,
+    };
+    let end = match control_start.checked_add(control_len) {
+        Some(value) => value,
+        None => return libc::EINVAL,
+    };
+    if end > payload_len {
+        return libc::EINVAL;
+    }
+    if let Err(errno) = validate_sendmsg_control(&request.payload[control_start..end]) {
+        return errno;
+    }
+    match send_socket_bytes(request, &request.payload[data_start..control_start]) {
+        Ok(sent) => {
+            response.value = sent as u64;
+            0
+        }
+        Err(errno) => errno,
+    }
+}
+
 fn handle_recv(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
+    if request.op == SYSCALL_OFFLOAD_OP_LINUX_RECVMSG {
+        return handle_recvmsg(request, response);
+    }
     let requested = if request.op == SYSCALL_OFFLOAD_OP_LINUX_RECVMSG {
         request.payload_len as usize
     } else {
@@ -553,6 +592,37 @@ fn handle_recv(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 
         Ok(read) => {
             response.value = read as u64;
             response.payload_len = read as u32;
+            0
+        }
+        Err(errno) => errno,
+    }
+}
+
+fn handle_recvmsg(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
+    let control = match recvmsg_control_payload(request) {
+        Ok(control) => control,
+        Err(errno) => return errno,
+    };
+    let available = response
+        .payload
+        .len()
+        .saturating_sub(NETD_RECVMSG_PAYLOAD_HEADER_SIZE)
+        .saturating_sub(control.len());
+    let requested = request.payload_len as usize;
+    let data_len = requested.min(available);
+    let data_start = NETD_RECVMSG_PAYLOAD_HEADER_SIZE;
+    let data_end = data_start + data_len;
+    match recv_socket_bytes(request, &mut response.payload[data_start..data_end]) {
+        Ok(read) => {
+            let control_start = data_start + read;
+            let control_end = control_start + control.len();
+            response.payload[control_start..control_end].copy_from_slice(&control);
+            response.payload[0..4].copy_from_slice(&(read as u32).to_ne_bytes());
+            response.payload[4..8].copy_from_slice(&(control.len() as u32).to_ne_bytes());
+            response.payload[8..12].copy_from_slice(&0_u32.to_ne_bytes());
+            response.payload[12..16].copy_from_slice(&0_u32.to_ne_bytes());
+            response.payload_len = control_end as u32;
+            response.value = read as u64;
             0
         }
         Err(errno) => errno,
@@ -728,6 +798,102 @@ fn recv_socket_bytes(request: &NetdIpcRequest, dest: &mut [u8]) -> Result<usize,
         *slot = connected.incoming_bytes.pop_front().unwrap_or_default();
     }
     Ok(count)
+}
+
+fn recvmsg_control_payload(request: &NetdIpcRequest) -> Result<Vec<u8>, i32> {
+    let state = net_state().lock().unwrap();
+    let socket = state
+        .sockets
+        .get(&request.socket_token)
+        .ok_or(libc::EBADF)?;
+    if !socket.options.passcred {
+        return Ok(Vec::new());
+    }
+    let UnixSocketState::Connected(connected) = &socket.state else {
+        return Err(libc::ENOTCONN);
+    };
+    let cmsg_len = size_of::<linux_abi::LinuxCmsghdr>() + size_of::<linux_abi::LinuxUCred>();
+    let mut control = vec![0_u8; cmsg_align(cmsg_len)];
+    let header = linux_abi::LinuxCmsghdr {
+        cmsg_len: cmsg_len as u64,
+        cmsg_level: linux_abi::SOL_SOCKET as u32,
+        cmsg_type: linux_abi::SCM_CREDENTIALS as u32,
+    };
+    let credentials = linux_abi::LinuxUCred {
+        pid: connected.peer_credentials.pid,
+        uid: connected.peer_credentials.uid,
+        gid: connected.peer_credentials.gid,
+    };
+    write_plain_old_data(
+        &mut control[..size_of::<linux_abi::LinuxCmsghdr>()],
+        &header,
+    );
+    write_plain_old_data(
+        &mut control[size_of::<linux_abi::LinuxCmsghdr>()..cmsg_len],
+        &credentials,
+    );
+    control.truncate(cmsg_len);
+    Ok(control)
+}
+
+fn validate_sendmsg_control(control: &[u8]) -> Result<(), i32> {
+    let mut offset = 0usize;
+    while offset + size_of::<linux_abi::LinuxCmsghdr>() <= control.len() {
+        let header = read_cmsghdr(&control[offset..])?;
+        let cmsg_len = usize::try_from(header.cmsg_len).map_err(|_| libc::EINVAL)?;
+        if cmsg_len < size_of::<linux_abi::LinuxCmsghdr>() || offset + cmsg_len > control.len() {
+            return Err(libc::EINVAL);
+        }
+        if header.cmsg_level != linux_abi::SOL_SOCKET as u32 {
+            return Err(libc::EOPNOTSUPP);
+        }
+        match header.cmsg_type {
+            value if value == linux_abi::SCM_CREDENTIALS as u32 => {}
+            value if value == linux_abi::SCM_RIGHTS as u32 => return Err(libc::EOPNOTSUPP),
+            _ => return Err(libc::EOPNOTSUPP),
+        }
+        let aligned_next = offset
+            .checked_add(cmsg_align(cmsg_len))
+            .ok_or(libc::EINVAL)?;
+        let unaligned_next = offset.checked_add(cmsg_len).ok_or(libc::EINVAL)?;
+        let next = if aligned_next <= control.len() {
+            aligned_next
+        } else if unaligned_next == control.len() {
+            unaligned_next
+        } else {
+            return Err(libc::EINVAL);
+        };
+        if next <= offset {
+            return Err(libc::EINVAL);
+        }
+        offset = next;
+    }
+    if offset != control.len() {
+        return Err(libc::EINVAL);
+    }
+    Ok(())
+}
+
+fn read_cmsghdr(bytes: &[u8]) -> Result<linux_abi::LinuxCmsghdr, i32> {
+    if bytes.len() < size_of::<linux_abi::LinuxCmsghdr>() {
+        return Err(libc::EINVAL);
+    }
+    Ok(linux_abi::LinuxCmsghdr {
+        cmsg_len: u64::from_ne_bytes(bytes[0..8].try_into().map_err(|_| libc::EINVAL)?),
+        cmsg_level: u32::from_ne_bytes(bytes[8..12].try_into().map_err(|_| libc::EINVAL)?),
+        cmsg_type: u32::from_ne_bytes(bytes[12..16].try_into().map_err(|_| libc::EINVAL)?),
+    })
+}
+
+fn write_plain_old_data<T: Copy>(dest: &mut [u8], value: &T) {
+    let bytes =
+        unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
+    dest.copy_from_slice(bytes);
+}
+
+fn cmsg_align(len: usize) -> usize {
+    let align = size_of::<usize>();
+    (len + align - 1) & !(align - 1)
 }
 
 fn call_net_broker(

@@ -4,33 +4,29 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
-use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
+use x86_64::VirtAddr;
 
-use crate::user::handles::{KernelHandle, RemoteVfsHandleKind, VfsFileHandle};
+use crate::user::handles::{KernelHandle, RemoteVfsHandleKind};
 use crate::user::memfd::MemfdHandle;
 use lazy_static::lazy_static;
 use rustos_user_abi::syscall::{
-    COMMERCIAL_MAX_PROCD_OP_PROCESS_PREPARE, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
-    COMMERCIAL_MAX_PROTOCOL_PROCD, CommercialMaxProtocolRequest, CommercialMaxProtocolResponse,
-    IPC_SERVICE_CAP_PROCESS_LOADER, IPC_SERVICE_CAP_PROCESS_POLICY, LOADER_SPAWN_ARG_BYTES,
-    LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_MAX_ARG_COUNT, LOADER_SPAWN_MAX_ENV_COUNT,
-    PROC_BROKER_ABI_VERSION, PROC_BROKER_BATCH_CAPACITY, PROC_BROKER_FORMAT_ELF64,
-    PROC_BROKER_FORMAT_PE64, PROC_BROKER_LINUX_INTERP_PATH_CAPACITY, PROC_BROKER_MAP_EXEC,
-    PROC_BROKER_MAP_PRIVATE, PROC_BROKER_MAP_READ, PROC_BROKER_MAP_WRITE,
-    PROC_BROKER_USER_SPACE_BASE, PROC_BROKER_USER_SPACE_END_EXCLUSIVE, RustosProcAbortBrokerArgs,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, RustosProcAbortBrokerArgs,
     RustosProcAuthorizeExecBrokerArgs, RustosProcCancelExecBrokerArgs, RustosProcCommitBrokerArgs,
     RustosProcExecTargetBrokerArgs, RustosProcForkBrokerArgs, RustosProcMapDataBrokerArgs,
     RustosProcMapFileBatchBrokerArgs, RustosProcMapFileBrokerArgs, RustosProcMapZeroedBrokerArgs,
     RustosProcPrepareBrokerArgs, RustosProcSetLinuxRuntimeBrokerArgs,
     RustosProcSetWindowsRuntimeBrokerArgs, RustosProcSignalQueueBrokerArgs, RustosUserRegisters,
+    COMMERCIAL_MAX_PROCD_OP_PROCESS_PREPARE, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_PROCD, IPC_SERVICE_CAP_PROCESS_LOADER, IPC_SERVICE_CAP_PROCESS_POLICY,
+    LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_MAX_ARG_COUNT,
+    LOADER_SPAWN_MAX_ENV_COUNT, PROC_BROKER_ABI_VERSION, PROC_BROKER_BATCH_CAPACITY,
+    PROC_BROKER_FORMAT_ELF64, PROC_BROKER_FORMAT_PE64, PROC_BROKER_LINUX_INTERP_PATH_CAPACITY,
+    PROC_BROKER_MAP_EXEC, PROC_BROKER_MAP_PRIVATE, PROC_BROKER_MAP_READ, PROC_BROKER_MAP_WRITE,
+    PROC_BROKER_USER_SPACE_BASE, PROC_BROKER_USER_SPACE_END_EXCLUSIVE,
 };
 use spin::Mutex;
 
-// RING3-MIGRATION-COMMENTED-OUT START: procd/loaderd should own the entire
-// Linux process prepare/map/runtime/exec broker. Ring0 keeps only the IPC
-// transport and address-space substrate referenced from procd.
-/*
 const PAGE_SIZE: u64 = 4096;
 const SPAWN_FLAG_LOGICAL_ADMIN: u64 = 1;
 const MAX_PROC_PREPARES: usize = 128;
@@ -50,7 +46,6 @@ lazy_static! {
 
 #[derive(Clone)]
 enum PinnedFileBacking {
-    Vfs(VfsFileHandle),
     Remote { remote_id: u64 },
     Memfd(MemfdHandle),
 }
@@ -1042,10 +1037,6 @@ fn copy_file_into_address_space(
     while copied < total {
         let count = (total - copied).min(chunk.len());
         let read = match backing {
-            PinnedFileBacking::Vfs(file) => {
-                let off = usize::try_from(file_offset).map_err(|_| LINUX_EINVAL)? + copied;
-                file.read_at(off, &mut chunk[..count])
-            }
             PinnedFileBacking::Remote { remote_id } => {
                 match offload_ops::call_remote_vfs_read_bytes(
                     *remote_id,
@@ -1083,7 +1074,6 @@ fn pinned_file_backing_from_current(fd: u64) -> Result<PinnedFileBacking, i64> {
             return Err(LINUX_EACCES);
         }
         match entry.handle() {
-            KernelHandle::VfsFile(file) => Ok(PinnedFileBacking::Vfs(file.clone())),
             KernelHandle::RemoteVfs(r) if r.kind() == RemoteVfsHandleKind::File => {
                 Ok(PinnedFileBacking::Remote {
                     remote_id: r.remote_id(),
@@ -1301,6 +1291,3 @@ fn console_host_error_to_linux_errno(error: crate::user::console_host::ConsoleHo
         }
     }
 }
-
-*/
-// RING3-MIGRATION-COMMENTED-OUT END

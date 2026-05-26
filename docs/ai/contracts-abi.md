@@ -70,7 +70,7 @@ Kernel data paths (FD/socket/module/process/storage/input) remain narrow gated b
 
 - Gated `SYS_RUSTOS_STORAGE_LIST_BROKER` (gated by `STORAGE_POLICY`) enumerates kernel-discovered descriptors; no direct generic-app storage probing.
 - `StoragedRequest`/`Response` exposes `STORAGED_OP_ROOT_STATUS`, `STORAGED_OP_BOOT_EXTENT_LOOKUP`.
-- `SYS_RUSTOS_BOOT_EXTENT_BROKER`: gated early/bootstrap read lease primitive. If path is in staged root-file extent registry, must return `BootExtentLeaseWire.extents[]`, `extent_count`, nonzero `hash_or_generation`. Metadata-only fallback only for paths whose extents are not yet staged.
+- Boot extent leases are storaged policy, sourced from `system/registry/kernel/root-file-extents.tsv` and returned over `STORAGED_OP_BOOT_EXTENT_LOOKUP`. Do not reintroduce generic ring0 boot-extent policy; ring0 storage brokers remain descriptor/block substrate only.
 
 ## Input Surface (`inputd`)
 

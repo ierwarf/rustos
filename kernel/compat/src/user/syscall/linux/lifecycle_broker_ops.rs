@@ -1,12 +1,15 @@
 use super::*;
 
-use rustos_user_abi::syscall::{IPC_SERVICE_CAP_PROCESS_POLICY, LifecycleDrainBrokerArgs};
+use rustos_user_abi::syscall::{
+    LifecycleDrainBrokerArgs, IPC_SERVICE_CAP_PROCESS_POLICY, IPC_SERVICE_CAP_ROOT_SUPERVISOR,
+};
 
-// RING3-MIGRATION-COMMENTED-OUT START: procd should own lifecycle event
-// drain. Ring0 keeps the lifecycle event ring substrate.
-/*
 pub(super) fn syscall_linux_rustos_lifecycle_drain_broker(args_ptr: u64) -> u64 {
-    if !ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_PROCESS_POLICY) {
+    let is_process_policy =
+        ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_PROCESS_POLICY);
+    let is_root_supervisor =
+        ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_ROOT_SUPERVISOR);
+    if !is_process_policy && !is_root_supervisor {
         return linux_errno(LINUX_EPERM);
     }
     let args = match usermem::read_current_user_struct::<LifecycleDrainBrokerArgs>(args_ptr) {
@@ -18,6 +21,3 @@ pub(super) fn syscall_linux_rustos_lifecycle_drain_broker(args_ptr: u64) -> u64 
         Err(errno) => linux_errno(errno),
     }
 }
-
-*/
-// RING3-MIGRATION-COMMENTED-OUT END

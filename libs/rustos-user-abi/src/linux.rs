@@ -278,6 +278,7 @@ raw_u64! {
     MFD_ALLOW_SEALING = linux::MFD_ALLOW_SEALING;
 }
 
+pub const SCM_CREDENTIALS: u64 = 2;
 pub const MADV_NORMAL: u64 = 0;
 pub const MADV_RANDOM: u64 = 1;
 pub const MADV_SEQUENTIAL: u64 = 2;

@@ -22,7 +22,7 @@ pub use crate::user::handles::{
     ConsoleStreamKind, DisplaySurfaceHandle, FD_CLOEXEC, FIRST_DYNAMIC_FD, FileHandleSeekError,
     FileHandleSeekWhence, HandleEntry, HandleTable, InetSocketHandle, KernelHandle,
     RemoteVfsHandle, RemoteVfsHandleKind, TransferredHandleEntry, VfsDirectoryEntry,
-    VfsDirectoryEntryKind, VfsDirectoryHandle, VfsFileHandle, VfsFileObject,
+    VfsDirectoryEntryKind, VfsDirectoryHandle,
 };
 pub use crate::user::linux::{
     LinuxMemoryMapState, LinuxProcessImageInfo, LinuxProcessLaunch, LinuxProcessState,
