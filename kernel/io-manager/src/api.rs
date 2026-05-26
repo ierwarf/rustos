@@ -261,10 +261,6 @@ pub mod input {
             crate::input::event_queue::debug_snapshot()
         }
 
-        pub fn drain_events(dest: &mut [crate::user::abi::device::InputEvent]) -> usize {
-            crate::input::event_queue::read_input_events(dest)
-        }
-
         pub fn drain_ingress(dest: &mut [rustos_user_abi::syscall::InputIngressWire]) -> usize {
             crate::input::event_queue::drain_ingress(dest)
         }

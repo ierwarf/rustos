@@ -26,7 +26,7 @@ pub fn on_mouse_interrupt() {
 }
 
 pub fn service_pending() -> usize {
-    dispatcher::service_pending() + serio_lower_half_service_pending()
+    serio_lower_half_service_pending()
 }
 
 fn report_keyboard_transport(result: i8042::KeyboardTransportInitResult) {
