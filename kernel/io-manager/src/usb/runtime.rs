@@ -1,16 +1,11 @@
 use alloc::boxed::Box;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ffi::c_void;
-use core::ops::Range;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::sync::KernelSpinLock as Mutex;
 use heapless::Deque as HeaplessDeque;
-use hidreport::{ArrayField, Field, FieldAttributes, Report, ReportDescriptor};
-use rustos_user_abi::syscall::{InputHidKeyboardReportWire, InputHidPointerReportWire};
 
-use super::hid_translation::pointer_buttons_from_report;
 use crate::driver::linux::compat::{LinuxCompatHidDevice, LinuxCompatUrb, LinuxCompatUsbDevice};
 
 const USB_REQ_GET_DESCRIPTOR: u8 = 0x06;
@@ -53,7 +48,6 @@ struct RuntimeUsbDevice {
     device_descriptor: [u8; 18],
     hid_descriptor: Box<[u8]>,
     report_descriptor: Box<[u8]>,
-    layout_hint: Option<Arc<HidReportLayout>>,
     queued_reports: HeaplessDeque<RuntimeReport, REPORT_QUEUE_CAPACITY>,
     pending_urbs: HeaplessDeque<usize, REPORT_QUEUE_CAPACITY>,
     dropped_reports: u64,
@@ -68,12 +62,6 @@ struct RuntimeReport {
 struct UrbCompletion {
     urb_ptr: usize,
     callback: unsafe extern "C" fn(*mut LinuxCompatUrb),
-}
-
-#[derive(Clone, Debug)]
-enum HidReportLayout {
-    BootKeyboard(BootKeyboardLayout),
-    Pointer(PointerLayout),
 }
 
 // RING3-MIGRATION-COMMENTED-OUT START: inputd should own HID report layout
@@ -137,7 +125,6 @@ impl Default for HidReportState {
 // RING3-MIGRATION-COMMENTED-OUT END
 
 static USB_RUNTIME_DEVICES: Mutex<Vec<RuntimeUsbDevice>> = Mutex::new(Vec::new());
-static HID_REPORT_STATES: Mutex<Vec<HidReportState>> = Mutex::new(Vec::new());
 static PENDING_COMPLETIONS: Mutex<HeaplessDeque<UrbCompletion, PENDING_COMPLETION_CAPACITY>> =
     Mutex::new(HeaplessDeque::new());
 static KEYBOARD_TRANSLATION_LOGS: AtomicUsize = AtomicUsize::new(0);
@@ -164,15 +151,6 @@ pub(crate) fn service_pending() -> usize {
 }
 
 pub(crate) fn has_pointer_device() -> bool {
-    let devices = USB_RUNTIME_DEVICES.lock();
-    for index in 0..devices.len() {
-        if matches!(
-            devices[index].layout_hint.as_deref(),
-            Some(HidReportLayout::Pointer(_))
-        ) {
-            return true;
-        }
-    }
     false
 }
 
@@ -190,8 +168,6 @@ pub(crate) fn register_device(
     {
         return;
     }
-    let layout_hint = parse_hid_layout(report_descriptor).map(Arc::new);
-
     let mut device_descriptor = [0u8; 18];
     unsafe {
         let descriptor = &(*usb_device).descriptor;
@@ -213,7 +189,6 @@ pub(crate) fn register_device(
         device_descriptor,
         hid_descriptor: hid_descriptor.to_vec().into_boxed_slice(),
         report_descriptor: report_descriptor.to_vec().into_boxed_slice(),
-        layout_hint,
         queued_reports: HeaplessDeque::new(),
         pending_urbs: HeaplessDeque::new(),
         dropped_reports: 0,
@@ -598,20 +573,11 @@ pub(crate) fn hid_input_report(dev: *mut LinuxCompatHidDevice, data: *mut u8, si
     status
     */
     // RING3-MIGRATION-COMMENTED-OUT END
+    0
 }
 
 pub(crate) fn hid_remove_device(dev: *mut LinuxCompatHidDevice) {
-    if dev.is_null() {
-        return;
-    }
-    let dev_ptr = dev as usize;
-    let mut states = HID_REPORT_STATES.lock();
-    if let Some(index) = states
-        .iter()
-        .position(|state| state.hid_device_ptr == dev_ptr)
-    {
-        states.remove(index);
-    }
+    let _ = dev;
 }
 
 impl RuntimeReport {
@@ -767,25 +733,6 @@ fn copy_report_bytes(report: RuntimeReport, dest: *mut u8, max_len: usize) -> us
         core::ptr::copy_nonoverlapping(report.as_slice().as_ptr(), dest, copied);
     }
     copied
-}
-
-fn translate_runtime_report(
-    state_key: usize,
-    report: &RuntimeReport,
-    layout: Option<Arc<HidReportLayout>>,
-) {
-    let Some(layout) = layout else {
-        return;
-    };
-    let bytes = report.as_slice();
-    match layout.as_ref() {
-        HidReportLayout::BootKeyboard(layout) => {
-            let _ = handle_keyboard_report(state_key, bytes, layout);
-        }
-        HidReportLayout::Pointer(layout) => {
-            let _ = handle_pointer_report(state_key, bytes, layout);
-        }
-    }
 }
 
 fn queue_urb_completion(completion: Option<UrbCompletion>) {

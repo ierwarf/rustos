@@ -6,7 +6,7 @@ use core::ptr;
 use crate::sync::KernelSpinLock as Mutex;
 
 use crate::driver::linux::compat::{
-    LinuxCompatUsbBus, LinuxCompatUsbDevice, LinuxCompatUsbDeviceId, LinuxCompatUsbDriver,
+    LinuxCompatUsbBus, LinuxCompatUsbDevice, LinuxCompatUsbDriver,
     LinuxCompatUsbHostEndpoint, LinuxCompatUsbHostInterface, LinuxCompatUsbInterface,
 };
 
@@ -142,7 +142,6 @@ pub(crate) fn register_linux_driver(driver: *mut LinuxCompatUsbDriver) -> i32 {
         driver_index,
         USB_INTERFACES.lock().len(),
     );
-    bind_driver_to_interfaces(driver_index, driver);
     0
 }
 
@@ -352,7 +351,6 @@ pub(crate) fn register_owned_interface(
         registration.interface_protocol,
     );
 
-    bind_all_drivers_to_interface(interface_index);
     interface_ptr
 }
 

@@ -70,11 +70,6 @@ const ATA_CMD_FLUSH_CACHE_EXT: u8 = 0xea;
 const COMMAND_FIS_DWORDS: u16 = 5;
 const COMMAND_LIST_BYTES: usize = 1024;
 const RECEIVED_FIS_BYTES: usize = 256;
-// RING3-MIGRATION-COMMENTED-OUT START: storaged should own AHCI transfer and
-// queue policy parameters. Ring0 keeps MMIO/DMA command execution and bootstrap
-// reads. References from substrate code below are intentionally left to break
-// the build.
-/*
 const PRDT_ENTRIES: usize = 16;
 const DMA_BUFFER_BYTES: usize = 1024 * 1024;
 const COMMAND_TABLE_BYTES: usize = 4096;
@@ -83,8 +78,6 @@ const COMMAND_SLOT: u32 = 0;
 const AHCI_WAIT_SPINS: usize = 1_000_000;
 const LOGICAL_BLOCK_SIZE: usize = 512;
 const DEBUG_BOUNDARY_16M_LBA: u64 = (16 * 1024 * 1024) / LOGICAL_BLOCK_SIZE as u64;
-*/
-// RING3-MIGRATION-COMMENTED-OUT END
 
 static AHCI_16M_BOUNDARY_LOGGED: AtomicBool = AtomicBool::new(false);
 
@@ -174,9 +167,6 @@ pub(crate) fn probe_devices() -> Vec<Box<dyn BlockDeviceOps>> {
     devices
 }
 
-// RING3-MIGRATION-COMMENTED-OUT START: storaged should own block chunking and
-// transfer command policy. Ring0 keeps the physical AHCI DMA execution path.
-/*
 impl SharedBlockDevice for AhciBlockDevice {
     fn logical_block_size(&self) -> usize {
         LOGICAL_BLOCK_SIZE
@@ -186,116 +176,18 @@ impl SharedBlockDevice for AhciBlockDevice {
         self.sector_count
     }
 
-    fn read_blocks(&mut self, lba: u64, out: &mut [u8]) -> IoResult<()> {
-        if out.is_empty() || out.len() % LOGICAL_BLOCK_SIZE != 0 {
-            return Err(DiskIoError::InvalidInput);
-        }
-        let mut runtime = self.runtime.lock();
-        let mut offset = 0usize;
-        while offset < out.len() {
-            let block_offset = offset / LOGICAL_BLOCK_SIZE;
-            let block_lba = lba
-                .checked_add(block_offset as u64)
-                .ok_or(DiskIoError::InvalidInput)?;
-            let transfer_bytes = DMA_BUFFER_BYTES.min(out.len() - offset);
-            let transfer_blocks = transfer_bytes / LOGICAL_BLOCK_SIZE;
-            if transfer_blocks == 0 {
-                return Err(DiskIoError::InvalidInput);
-            }
-            if block_lba
-                .checked_add(transfer_blocks as u64)
-                .ok_or(DiskIoError::InvalidInput)?
-                > self.sector_count
-            {
-                return Err(DiskIoError::InvalidInput);
-            }
-            note_ahci_16m_boundary_once(block_lba, transfer_blocks as u64, false);
-            let command = dma_command_for_range(
-                ATA_CMD_READ_DMA,
-                ATA_CMD_READ_DMA_EXT,
-                block_lba,
-                transfer_blocks,
-            )?;
-            let result = self.execute_dma_command(
-                &mut runtime,
-                command,
-                block_lba,
-                false,
-                transfer_blocks * LOGICAL_BLOCK_SIZE,
-            );
-            if let Err(error) = result {
-                crate::debug::println!(
-                    "ahci: read failed model={} port={} lba={} error={:?}",
-                    self.model,
-                    self.port,
-                    block_lba,
-                    error
-                );
-                return Err(error);
-            }
-            unsafe {
-                crate::arch::simd::copy_fast(
-                    runtime.dma_buffer_cpu.cast_const(),
-                    out[offset..offset + transfer_blocks * LOGICAL_BLOCK_SIZE].as_mut_ptr(),
-                    transfer_blocks * LOGICAL_BLOCK_SIZE,
-                );
-            }
-            offset += transfer_blocks * LOGICAL_BLOCK_SIZE;
-        }
-        Ok(())
+    fn read_blocks(&mut self, _lba: u64, _out: &mut [u8]) -> IoResult<()> {
+        Err(DiskIoError::Unsupported)
     }
 
-    fn write_blocks(&mut self, lba: u64, input: &[u8]) -> IoResult<()> {
-        if input.is_empty() || input.len() % LOGICAL_BLOCK_SIZE != 0 {
-            return Err(DiskIoError::InvalidInput);
-        }
-        let mut runtime = self.runtime.lock();
-        let mut offset = 0usize;
-        while offset < input.len() {
-            let block_offset = offset / LOGICAL_BLOCK_SIZE;
-            let block_lba = lba
-                .checked_add(block_offset as u64)
-                .ok_or(DiskIoError::InvalidInput)?;
-            let transfer_bytes = DMA_BUFFER_BYTES.min(input.len() - offset);
-            let transfer_blocks = transfer_bytes / LOGICAL_BLOCK_SIZE;
-            if transfer_blocks == 0 {
-                return Err(DiskIoError::InvalidInput);
-            }
-            if block_lba
-                .checked_add(transfer_blocks as u64)
-                .ok_or(DiskIoError::InvalidInput)?
-                > self.sector_count
-            {
-                return Err(DiskIoError::InvalidInput);
-            }
-            note_ahci_16m_boundary_once(block_lba, transfer_blocks as u64, true);
-            let byte_count = transfer_blocks * LOGICAL_BLOCK_SIZE;
-            unsafe {
-                crate::arch::simd::copy_fast(
-                    input[offset..offset + byte_count].as_ptr(),
-                    runtime.dma_buffer_cpu,
-                    byte_count,
-                );
-            }
-            let command = dma_command_for_range(
-                ATA_CMD_WRITE_DMA,
-                ATA_CMD_WRITE_DMA_EXT,
-                block_lba,
-                transfer_blocks,
-            )?;
-            self.execute_dma_command(&mut runtime, command, block_lba, true, byte_count)?;
-            offset += byte_count;
-        }
-        Ok(())
+    fn write_blocks(&mut self, _lba: u64, _input: &[u8]) -> IoResult<()> {
+        Err(DiskIoError::Unsupported)
     }
 
     fn flush(&mut self) -> IoResult<()> {
-        let mut runtime = self.runtime.lock();
-        self.execute_non_data_command(&mut runtime, ATA_CMD_FLUSH_CACHE_EXT)
+        Err(DiskIoError::Unsupported)
     }
 }
-*/
-// RING3-MIGRATION-COMMENTED-OUT END
 
 fn note_ahci_16m_boundary_once(lba: u64, blocks: u64, is_write: bool) {
     let end = lba.saturating_add(blocks);

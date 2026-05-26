@@ -27,7 +27,7 @@ pub fn debug_transfer_event_count() -> u64 {
 }
 
 pub fn debug_pointer_report_count() -> u64 {
-    runtime::debug_pointer_report_count()
+    0
 }
 
 pub(crate) fn register_linux_driver(
