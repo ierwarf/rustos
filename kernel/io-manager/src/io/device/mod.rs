@@ -1,4 +1,3 @@
-pub(crate) mod console;
 pub(crate) mod display;
 pub(crate) mod input;
 
@@ -164,7 +163,7 @@ pub fn ioctl_from_user(
     arg: u64,
 ) -> Result<u64, DeviceError> {
     match handle.device_id() {
-        DeviceId::Console => console::ioctl(process_state, request, arg),
+        DeviceId::Console => Err(DeviceError::Unsupported),
         DeviceId::Display => display::ioctl(process_state, request, arg),
         DeviceId::Input => Err(DeviceError::Unsupported),
     }
