@@ -428,25 +428,42 @@ fn decode_hid_keyboard_report(
     descriptor: &[u8],
     report: &[u8],
 ) -> Option<InputHidKeyboardReportWire> {
-    if !report_descriptor_has_keyboard(descriptor) {
+    let (report_id, report) = report_payload_for_descriptor(descriptor, report)?;
+    let fields = parse_hid_input_fields(descriptor, report_id);
+    if !hid_fields_have_keyboard(&fields) {
         return None;
     }
-    let report = strip_report_id(descriptor, report)?;
-    if report.len() < 8 {
-        return None;
-    }
+    let mut modifiers = 0u8;
     let mut keys = [0_u8; 16];
     let mut key_count = 0usize;
-    for usage in report[2..].iter().copied().filter(|usage| *usage != 0) {
-        if key_count >= keys.len() {
-            break;
+
+    for field in fields {
+        if field.usage_page != HID_USAGE_PAGE_KEYBOARD {
+            continue;
         }
-        keys[key_count] = usage;
-        key_count += 1;
+        let value = read_hid_field(report, field)?;
+        if field.variable {
+            if field.usage >= HID_USAGE_KEYBOARD_LEFT_CONTROL
+                && field.usage <= HID_USAGE_KEYBOARD_RIGHT_GUI
+                && value != 0
+            {
+                modifiers |= 1u8 << (field.usage - HID_USAGE_KEYBOARD_LEFT_CONTROL);
+            } else if value != 0 && field.usage <= u8::MAX as u16 && key_count < keys.len() {
+                keys[key_count] = field.usage as u8;
+                key_count += 1;
+            }
+            continue;
+        }
+
+        if value > 0 && value <= u8::MAX as i32 && key_count < keys.len() {
+            keys[key_count] = value as u8;
+            key_count += 1;
+        }
     }
+
     Some(InputHidKeyboardReportWire {
         source_id,
-        modifiers: report[0],
+        modifiers,
         key_count: key_count as u8,
         reserved0: [0; 6],
         keys,
@@ -458,102 +475,307 @@ fn decode_hid_pointer_report(
     descriptor: &[u8],
     report: &[u8],
 ) -> Option<InputHidPointerReportWire> {
-    if !report_descriptor_has_pointer(descriptor) {
+    let (report_id, report) = report_payload_for_descriptor(descriptor, report)?;
+    let fields = parse_hid_input_fields(descriptor, report_id);
+    if !hid_fields_have_pointer(&fields) {
         return None;
     }
-    let report = strip_report_id(descriptor, report)?;
-    let buttons = report.first().copied().unwrap_or(0) & 0x1f;
 
-    if pointer_descriptor_is_relative(descriptor) {
-        if report.len() < 3 {
-            return None;
+    let mut buttons = 0u8;
+    let mut x = None::<(i32, HidInputField)>;
+    let mut y = None::<(i32, HidInputField)>;
+    let mut wheel_vertical = 0i16;
+
+    for field in fields {
+        let value = read_hid_field(report, field)?;
+        match (field.usage_page, field.usage) {
+            (HID_USAGE_PAGE_BUTTON, usage @ 1..=8) => {
+                if value != 0 {
+                    buttons |= 1u8 << (usage - 1);
+                }
+            }
+            (HID_USAGE_PAGE_GENERIC_DESKTOP, HID_USAGE_X) => x = Some((value, field)),
+            (HID_USAGE_PAGE_GENERIC_DESKTOP, HID_USAGE_Y) => y = Some((value, field)),
+            (HID_USAGE_PAGE_GENERIC_DESKTOP, HID_USAGE_WHEEL) => {
+                wheel_vertical = value.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            }
+            _ => {}
         }
-        return Some(InputHidPointerReportWire {
-            source_id,
-            buttons,
-            relative: 1,
-            reserved0: [0; 2],
-            x: i32::from(report[1] as i8),
-            y: i32::from(report[2] as i8),
-            wheel_vertical: report
-                .get(3)
-                .copied()
-                .map(|value| value as i8 as i16)
-                .unwrap_or(0),
-            reserved1: 0,
-        });
     }
 
-    if report.len() < 5 {
-        return None;
-    }
-    let raw_x = u16::from_le_bytes([report[1], report[2]]) as i32;
-    let raw_y = u16::from_le_bytes([report[3], report[4]]) as i32;
-    let logical_max = pointer_descriptor_logical_max(descriptor).max(1);
+    let (raw_x, x_field) = x?;
+    let (raw_y, y_field) = y?;
+    let relative = x_field.relative || y_field.relative;
+    let x_value = if relative {
+        raw_x
+    } else {
+        scale_pointer_coordinate(
+            raw_x,
+            x_field.logical_min,
+            x_field.logical_max,
+            DEFAULT_POINTER_WIDTH - 1,
+        )
+    };
+    let y_value = if relative {
+        raw_y
+    } else {
+        scale_pointer_coordinate(
+            raw_y,
+            y_field.logical_min,
+            y_field.logical_max,
+            DEFAULT_POINTER_HEIGHT - 1,
+        )
+    };
+
     Some(InputHidPointerReportWire {
         source_id,
         buttons,
-        relative: 0,
+        relative: relative as u8,
         reserved0: [0; 2],
-        x: scale_pointer_coordinate(raw_x, logical_max, DEFAULT_POINTER_WIDTH - 1),
-        y: scale_pointer_coordinate(raw_y, logical_max, DEFAULT_POINTER_HEIGHT - 1),
-        wheel_vertical: report
-            .get(5)
-            .copied()
-            .map(|value| value as i8 as i16)
-            .unwrap_or(0),
+        x: x_value,
+        y: y_value,
+        wheel_vertical,
         reserved1: 0,
     })
 }
 
-fn report_descriptor_has_keyboard(descriptor: &[u8]) -> bool {
-    let has_keyboard_usage = descriptor.windows(2).any(|item| item == [0x09, 0x06]);
-    let has_key_usage_page = descriptor.windows(2).any(|item| item == [0x05, 0x07]);
-    has_keyboard_usage && has_key_usage_page
+const HID_USAGE_PAGE_GENERIC_DESKTOP: u16 = 0x01;
+const HID_USAGE_PAGE_KEYBOARD: u16 = 0x07;
+const HID_USAGE_PAGE_BUTTON: u16 = 0x09;
+const HID_USAGE_X: u16 = 0x30;
+const HID_USAGE_Y: u16 = 0x31;
+const HID_USAGE_WHEEL: u16 = 0x38;
+const HID_USAGE_KEYBOARD_LEFT_CONTROL: u16 = 0xe0;
+const HID_USAGE_KEYBOARD_RIGHT_GUI: u16 = 0xe7;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct HidInputField {
+    usage_page: u16,
+    usage: u16,
+    bit_offset: usize,
+    bit_size: u8,
+    logical_min: i32,
+    logical_max: i32,
+    variable: bool,
+    relative: bool,
 }
 
-fn report_descriptor_has_pointer(descriptor: &[u8]) -> bool {
-    let has_mouse_usage = descriptor.windows(2).any(|item| item == [0x09, 0x02]);
-    let has_x_usage = descriptor.windows(2).any(|item| item == [0x09, 0x30]);
-    let has_y_usage = descriptor.windows(2).any(|item| item == [0x09, 0x31]);
-    has_mouse_usage && has_x_usage && has_y_usage
+fn report_payload_for_descriptor<'a>(
+    descriptor: &[u8],
+    report: &'a [u8],
+) -> Option<(u8, &'a [u8])> {
+    if report.is_empty() {
+        return None;
+    }
+    if !descriptor_has_report_id(descriptor) {
+        return Some((0, report));
+    }
+    Some((report[0], &report[1..]))
 }
 
-fn strip_report_id<'a>(descriptor: &[u8], report: &'a [u8]) -> Option<&'a [u8]> {
-    let Some(report_id) = descriptor
-        .windows(2)
-        .find_map(|item| (item[0] == 0x85).then_some(item[1]))
-    else {
-        return Some(report);
-    };
-    (report.first().copied() == Some(report_id)).then_some(&report[1..])
+fn descriptor_has_report_id(descriptor: &[u8]) -> bool {
+    descriptor.windows(2).any(|item| item[0] == 0x85)
 }
 
-fn pointer_descriptor_is_relative(descriptor: &[u8]) -> bool {
-    descriptor.windows(2).any(|item| item == [0x81, 0x06])
-        && !descriptor.windows(3).any(|item| item == [0x26, 0xff, 0x7f])
-}
+fn parse_hid_input_fields(descriptor: &[u8], wanted_report_id: u8) -> Vec<HidInputField> {
+    let mut fields = Vec::new();
+    let mut usage_page = 0u16;
+    let mut logical_min = 0i32;
+    let mut logical_max = 0i32;
+    let mut report_size = 0u8;
+    let mut report_count = 0u8;
+    let mut report_id = 0u8;
+    let mut usages = Vec::<u16>::new();
+    let mut usage_min = None::<u16>;
+    let mut usage_max = None::<u16>;
+    let mut offsets = Vec::<(u8, usize)>::new();
+    let mut index = 0usize;
 
-fn pointer_descriptor_logical_max(descriptor: &[u8]) -> i32 {
-    let mut max_value = 0_i32;
-    for item in descriptor.windows(3) {
-        if item[0] == 0x26 {
-            max_value = max_value.max(u16::from_le_bytes([item[1], item[2]]) as i32);
+    while index < descriptor.len() {
+        let prefix = descriptor[index];
+        index += 1;
+        if prefix == 0xfe {
+            if index + 1 >= descriptor.len() {
+                break;
+            }
+            let size = descriptor[index] as usize;
+            index = index
+                .saturating_add(2)
+                .saturating_add(size)
+                .min(descriptor.len());
+            continue;
+        }
+        let size = match prefix & 0x03 {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            _ => 4,
+        };
+        if index + size > descriptor.len() {
+            break;
+        }
+        let data = &descriptor[index..index + size];
+        index += size;
+        let item_type = (prefix >> 2) & 0x03;
+        let tag = (prefix >> 4) & 0x0f;
+        let unsigned = hid_item_unsigned(data);
+        let signed = hid_item_signed(data);
+
+        match (item_type, tag) {
+            (1, 0x0) => usage_page = unsigned as u16,
+            (1, 0x1) => logical_min = signed,
+            (1, 0x2) => logical_max = signed,
+            (1, 0x7) => report_size = unsigned.min(u8::MAX as u32) as u8,
+            (1, 0x8) => report_id = unsigned.min(u8::MAX as u32) as u8,
+            (1, 0x9) => report_count = unsigned.min(u8::MAX as u32) as u8,
+            (2, 0x0) => usages.push(unsigned as u16),
+            (2, 0x1) => usage_min = Some(unsigned as u16),
+            (2, 0x2) => usage_max = Some(unsigned as u16),
+            (0, 0x8) => {
+                let flags = unsigned as u8;
+                let is_constant = flags & 0x01 != 0;
+                let is_variable = flags & 0x02 != 0;
+                let is_relative = flags & 0x04 != 0;
+                let count = report_count.max(1);
+                let size_bits = report_size as usize;
+                let start_offset = report_offset_mut(&mut offsets, report_id);
+                for field_index in 0..count {
+                    let bit_offset = *start_offset + field_index as usize * size_bits;
+                    if !is_constant && report_id == wanted_report_id {
+                        let usage = usage_for_field(field_index, &usages, usage_min, usage_max);
+                        fields.push(HidInputField {
+                            usage_page,
+                            usage,
+                            bit_offset,
+                            bit_size: report_size,
+                            logical_min,
+                            logical_max,
+                            variable: is_variable,
+                            relative: is_relative,
+                        });
+                    }
+                }
+                *start_offset = start_offset.saturating_add(count as usize * size_bits);
+                usages.clear();
+                usage_min = None;
+                usage_max = None;
+            }
+            (0, _) => {
+                usages.clear();
+                usage_min = None;
+                usage_max = None;
+            }
+            _ => {}
         }
     }
-    if max_value > 1 {
-        max_value
+
+    fields
+}
+
+fn hid_fields_have_keyboard(fields: &[HidInputField]) -> bool {
+    fields
+        .iter()
+        .any(|field| field.usage_page == HID_USAGE_PAGE_KEYBOARD)
+}
+
+fn report_offset_mut(offsets: &mut Vec<(u8, usize)>, report_id: u8) -> &mut usize {
+    if let Some(index) = offsets.iter().position(|(id, _)| *id == report_id) {
+        return &mut offsets[index].1;
+    }
+    offsets.push((report_id, 0));
+    &mut offsets.last_mut().expect("offset inserted").1
+}
+
+fn usage_for_field(
+    field_index: u8,
+    usages: &[u16],
+    usage_min: Option<u16>,
+    usage_max: Option<u16>,
+) -> u16 {
+    usages
+        .get(field_index as usize)
+        .copied()
+        .or_else(|| {
+            let min = usage_min?;
+            let max = usage_max.unwrap_or(min);
+            Some(min.saturating_add(field_index as u16).min(max))
+        })
+        .or_else(|| usages.last().copied())
+        .unwrap_or(0)
+}
+
+fn hid_fields_have_pointer(fields: &[HidInputField]) -> bool {
+    fields.iter().any(|field| {
+        field.usage_page == HID_USAGE_PAGE_GENERIC_DESKTOP && field.usage == HID_USAGE_X
+    }) && fields.iter().any(|field| {
+        field.usage_page == HID_USAGE_PAGE_GENERIC_DESKTOP && field.usage == HID_USAGE_Y
+    })
+}
+
+fn read_hid_field(report: &[u8], field: HidInputField) -> Option<i32> {
+    if field.bit_size == 0 || field.bit_size > 32 {
+        return None;
+    }
+    let raw = read_bits_le(report, field.bit_offset, field.bit_size as usize)?;
+    if field.logical_min < 0 {
+        let shift = 32usize.saturating_sub(field.bit_size as usize);
+        Some(((raw << shift) as i32) >> shift)
     } else {
-        0x7fff
+        Some(raw as i32)
     }
 }
 
-fn scale_pointer_coordinate(value: i32, logical_max: i32, target_max: i32) -> i32 {
-    if target_max <= 0 || logical_max <= 0 {
+fn read_bits_le(report: &[u8], bit_offset: usize, bit_size: usize) -> Option<u32> {
+    if bit_size == 0 || bit_size > 32 {
+        return None;
+    }
+    let end_bit = bit_offset.checked_add(bit_size)?;
+    if end_bit > report.len().checked_mul(8)? {
+        return None;
+    }
+    let mut value = 0u32;
+    for bit in 0..bit_size {
+        let source_bit = bit_offset + bit;
+        let byte = *report.get(source_bit / 8)?;
+        let bit_value = (byte >> (source_bit % 8)) & 1;
+        value |= u32::from(bit_value) << bit;
+    }
+    Some(value)
+}
+
+fn hid_item_unsigned(data: &[u8]) -> u32 {
+    let mut bytes = [0u8; 4];
+    bytes[..data.len().min(4)].copy_from_slice(&data[..data.len().min(4)]);
+    u32::from_le_bytes(bytes)
+}
+
+fn hid_item_signed(data: &[u8]) -> i32 {
+    match data.len() {
+        0 => 0,
+        1 => i32::from(data[0] as i8),
+        2 => i32::from(i16::from_le_bytes([data[0], data[1]])),
+        _ => i32::from_le_bytes([
+            data.first().copied().unwrap_or(0),
+            data.get(1).copied().unwrap_or(0),
+            data.get(2).copied().unwrap_or(0),
+            data.get(3).copied().unwrap_or(0),
+        ]),
+    }
+}
+
+fn scale_pointer_coordinate(
+    value: i32,
+    logical_min: i32,
+    logical_max: i32,
+    target_max: i32,
+) -> i32 {
+    if target_max <= 0 || logical_max <= logical_min {
         return 0;
     }
-    let clamped = value.clamp(0, logical_max);
-    ((clamped as i64 * target_max as i64) / logical_max as i64) as i32
+    let clamped = value.clamp(logical_min, logical_max);
+    let numerator = i64::from(clamped.saturating_sub(logical_min)) * i64::from(target_max);
+    let denominator = i64::from(logical_max.saturating_sub(logical_min)).max(1);
+    (numerator / denominator) as i32
 }
 
 #[cfg(test)]
@@ -717,8 +939,13 @@ mod tests {
     #[test]
     fn inputd_decodes_raw_hid_keyboard_report() {
         let mut queue = InputQueue::default();
-        let descriptor = [0x05, 0x01, 0x09, 0x06, 0x05, 0x07];
-        let report = [0, 0, 0x04, 0, 0, 0, 0, 0];
+        let descriptor = [
+            0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x05, 0x07, 0x19, 0xe0, 0x29, 0xe7, 0x15, 0x00,
+            0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x95, 0x01, 0x75, 0x08, 0x81, 0x01,
+            0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x25, 0x65, 0x05, 0x07, 0x19, 0x00, 0x29, 0x65,
+            0x81, 0x00, 0xc0,
+        ];
+        let report = [0x02, 0, 0x04, 0, 0, 0, 0, 0];
         queue.push_hid_raw_report(hid_raw(
             INPUTD_HID_POLICY_KIND_KEYBOARD,
             &report,
@@ -728,13 +955,29 @@ mod tests {
         let event = queue.pop_front().unwrap();
         assert_eq!(event.kind, input_evdev::INPUT_KIND_KEYBOARD);
         assert_eq!(event.action, input_evdev::INPUT_ACTION_PRESSED);
+        assert_eq!(
+            event.code,
+            input_evdev::hid_usage_to_keycode(0xe1).unwrap() as u32
+        );
+        let event = queue.pop_front().unwrap();
+        assert_eq!(event.kind, input_evdev::INPUT_KIND_KEYBOARD);
+        assert_eq!(event.action, input_evdev::INPUT_ACTION_PRESSED);
+        assert_eq!(
+            event.code,
+            input_evdev::hid_usage_to_keycode(0x04).unwrap() as u32
+        );
     }
 
     #[test]
     fn inputd_decodes_raw_hid_pointer_report() {
         let mut queue = InputQueue::default();
-        let descriptor = [0x05, 0x01, 0x09, 0x02, 0x09, 0x30, 0x09, 0x31, 0x81, 0x06];
-        let report = [1, 7_u8, 0xfd_u8];
+        let descriptor = [
+            0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01, 0xa1, 0x00, 0x05, 0x09, 0x19, 0x01,
+            0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x03, 0x81, 0x02, 0x75, 0x05,
+            0x95, 0x01, 0x81, 0x01, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38, 0x15, 0x81,
+            0x25, 0x7f, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06, 0xc0, 0xc0,
+        ];
+        let report = [1, 7_u8, 0xfd_u8, 0];
         queue.push_hid_raw_report(hid_raw(
             INPUTD_HID_POLICY_KIND_POINTER,
             &report,
@@ -748,6 +991,29 @@ mod tests {
         let button = queue.pop_front().unwrap();
         assert_eq!(button.kind, input_evdev::INPUT_KIND_POINTER_BUTTON);
         assert_eq!(button.action, input_evdev::INPUT_ACTION_PRESSED);
+    }
+
+    #[test]
+    fn inputd_decodes_absolute_hid_tablet_report_from_descriptor_fields() {
+        let mut queue = InputQueue::default();
+        let descriptor = [
+            0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01, 0xa1, 0x00, 0x05, 0x09, 0x19, 0x01,
+            0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01, 0x81, 0x02, 0x95, 0x01,
+            0x75, 0x05, 0x81, 0x01, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x00, 0x26, 0xff,
+            0x7f, 0x75, 0x10, 0x95, 0x02, 0x81, 0x02, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7f, 0x75,
+            0x08, 0x95, 0x01, 0x81, 0x06, 0xc0, 0xc0,
+        ];
+        let report = [0, 0xff, 0x7f, 0xff, 0x7f, 0];
+        queue.push_hid_raw_report(hid_raw(
+            INPUTD_HID_POLICY_KIND_POINTER,
+            &report,
+            &descriptor,
+        ));
+
+        let position = queue.pop_front().unwrap();
+        assert_eq!(position.kind, input_evdev::INPUT_KIND_POINTER_POSITION);
+        assert_eq!(position.value0, 1599);
+        assert_eq!(position.value1, 899);
     }
 }
 

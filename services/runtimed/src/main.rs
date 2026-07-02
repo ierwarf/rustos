@@ -137,6 +137,7 @@ pub(crate) struct ProgramMetadata {
 pub(crate) struct BrokerState {
     pub(crate) console_fd: Option<OwnedFd>,
     pub(crate) next_session_handle: u64,
+    pub(crate) focused_session_handle: u64,
     pub(crate) session_runtime: session::SessionRuntime,
     pub(crate) running: BTreeMap<i32, RunningProcess>,
     pub(crate) launched_once: BTreeSet<String>,
@@ -184,6 +185,7 @@ fn main() {
     let mut state = BrokerState {
         console_fd: None,
         next_session_handle: 1,
+        focused_session_handle: 0,
         session_runtime: session::SessionRuntime::default(),
         running: BTreeMap::new(),
         launched_once: BTreeSet::new(),

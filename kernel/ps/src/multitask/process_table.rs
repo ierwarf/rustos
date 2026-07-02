@@ -395,6 +395,16 @@ pub fn note_process_exit_status(process_id: u64, status: i32) -> Option<()> {
     Some(())
 }
 
+pub fn thread_count_by_pid(process_id: u64) -> Option<usize> {
+    let table = PROCESS_TABLE.lock();
+    table
+        .slots
+        .iter()
+        .filter_map(|slot| slot.object.as_deref())
+        .find(|object| object.process_id == process_id)
+        .map(|object| object.thread_count)
+}
+
 pub fn wait_for_child(parent_process_id: u64, target_pid: i64) -> WaitResult {
     let mut table = PROCESS_TABLE.lock();
     let mut saw_child = false;

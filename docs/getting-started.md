@@ -54,7 +54,7 @@ or `cargo xtask stage` after changing image contents.
 
 | Command | Purpose |
 | --- | --- |
-| `cargo xtask run -- --no-reboot` | Pass raw QEMU args after `--`. |
+| `cargo xtask run -- -display none` | Pass raw QEMU args after `--`. |
 | `cargo xtask run --profile nvme` | Boot using the NVMe QEMU profile. |
 | `cargo xtask run --accel-profile kvm` | Use KVM acceleration and host CPU profile. |
 | `cargo xtask run --usb-input` | Attach USB keyboard/tablet devices for HID testing. |
@@ -129,7 +129,7 @@ cargo xtask run
 
 | Command | Purpose |
 | --- | --- |
-| `cargo xtask run -- --no-reboot` | `--` 뒤의 값을 raw QEMU arg로 전달합니다. |
+| `cargo xtask run -- -display none` | `--` 뒤의 값을 raw QEMU arg로 전달합니다. |
 | `cargo xtask run --profile nvme` | NVMe QEMU profile로 부팅합니다. |
 | `cargo xtask run --accel-profile kvm` | KVM acceleration과 host CPU profile을 사용합니다. |
 | `cargo xtask run --usb-input` | HID test용 USB keyboard/tablet device를 붙입니다. |

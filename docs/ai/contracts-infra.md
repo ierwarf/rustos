@@ -151,7 +151,7 @@ Add new points only at realistic failure boundaries: allocation, block IO, devic
   count it as a ring3 service-driver migration target.
 - Vendor virtio-net `.ko` stays out of the default profile until post-init worker/IRQ behavior is non-blocking under QEMU; `netd` remains the default network policy owner.
 - Vendor HID core `.ko` stays out of the default profile while USB HID leaf modules are disabled; native RustOS input remains the default boot input provider.
-- Native xHCI is enabled with `RUSTOS_NATIVE_XHCI`; HID interrupt polling additionally requires `RUSTOS_NATIVE_XHCI_HID_POLL`. Keep both gated until they cannot delay display/runtime boot.
+- Native xHCI and HID interrupt polling are always on for USB input/display probes.
 - Optional net features (XDP, BPF, AF_XDP, ethtool offloads, DIM) may use per-symbol disabled shims; must fail closed — **never** fabricate packets or carrier state.
 
 ## Logging

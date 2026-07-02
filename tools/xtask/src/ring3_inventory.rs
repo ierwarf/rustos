@@ -66,6 +66,7 @@ pub(crate) fn print_inventory(config: &Config) -> Result<()> {
                     | "display-present-substrate-exception"
                     | "bootstrap-device-route-exception"
                     | "vfs-bootstrap-hotpath-exception"
+                    | "vfs-socket-fd-substrate-exception"
                     | "abi-substrate-reference"
                     | "ring3-owner-reference"
                     | "already-migrated-reference"
@@ -200,6 +201,7 @@ fn owner_for_path(path: &Path) -> &'static str {
         || path.contains("/driver/kernel_api.rs")
         || path.contains("/driver/loader.rs")
         || path.contains("/driver/module_registry.rs")
+        || path.ends_with("/driver/pci.rs")
     {
         "linux-ko-compat"
     } else if path.contains("services/vfsd/") {
@@ -298,6 +300,7 @@ fn lane_for_path(path: &Path) -> &'static str {
         || path.contains("/driver/kernel_api.rs")
         || path.contains("/driver/loader.rs")
         || path.contains("/driver/module_registry.rs")
+        || path.ends_with("/driver/pci.rs")
         || path.contains("/usb/emulation.rs")
     {
         "compat-ring0-exception"
@@ -331,6 +334,8 @@ fn lane_for_path(path: &Path) -> &'static str {
         || path.ends_with("/broker_ops.rs")
     {
         "capability-broker-ring0-exception"
+    } else if path.contains("/service_ops/vfs_socket.rs") {
+        "vfs-socket-fd-substrate-exception"
     } else if path.contains("/service_ops/vfs_meta.rs") {
         "vfs-bootstrap-hotpath-exception"
     } else if path.contains("/service_ops/futex_thread.rs")
@@ -415,6 +420,7 @@ fn action_for_path(path: &Path) -> &'static str {
         || path.contains("/driver/kernel_api.rs")
         || path.contains("/driver/loader.rs")
         || path.contains("/driver/module_registry.rs")
+        || path.ends_with("/driver/pci.rs")
         || path.contains("/usb/emulation.rs")
     {
         "explicit Linux .ko ring0 compatibility substrate exception; do not migrate .ko execution to ring3"
@@ -459,6 +465,8 @@ fn action_for_path(path: &Path) -> &'static str {
         "capability-gated device/session ioctl substrate exception; policy is devmgrd/sessiond-owned"
     } else if path.contains("/ipc_ops.rs") {
         "service endpoint registry and capability-gate substrate exception; rootd owns capability lease policy"
+    } else if path.contains("/service_ops/vfs_socket.rs") {
+        "VFS/socket fd-table and user-copy substrate exception; file/socket policy is vfsd/netd-owned"
     } else if path.contains("/service_ops/vfs_meta.rs") {
         "bootstrap stat and hot ioctl route substrate exception; policy is vfsd/devmgrd/sessiond-owned"
     } else if path.contains("/service_ops/futex_thread.rs")

@@ -11,6 +11,12 @@ unsafe extern "C" fn compat_printk(_fmt: *const c_char) -> i32 {
 }
 
 unsafe extern "C" fn drm_dev_register(_dev: *mut c_void, _flags: u64) -> i32 {
+    if crate::io::gui::install_inherited_primary_scanout_from_boot() {
+        crate::debug::info!(
+            display,
+            "virtio-gpu: inherited virtio-vga scanout registered"
+        );
+    }
     0
 }
 

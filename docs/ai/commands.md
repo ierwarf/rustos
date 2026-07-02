@@ -36,16 +36,16 @@ failure output as the primary debugging context.
 ## QEMU args
 
 - xtask args go before `--`; raw QEMU args after `--`.
-- Example: `cargo xtask run --profile nvme -- --no-reboot`.
+- Example: `cargo xtask run --profile nvme`.
 - Short KVM no-opt debug runs use the built-in timeout and summary:
   ```
   cargo xtask run --profile nvme --accel-profile kvm --usb-input \
-    --debugcon file --timeout 35 --summarize-log -- --no-reboot
+    --debugcon file --timeout 35 --summarize-log
   ```
 - Commercial-max closure runs use the readiness signature bundle:
   ```
   cargo xtask run --profile nvme --accel-profile kvm --usb-input \
-    --debugcon file --commercial-max-ready -- --no-reboot
+    --debugcon file --commercial-max-ready
   ```
 - Use repeated `--expect <marker>` to stop as soon as specific debugcon
   markers appear. Without `--expect`, `--timeout` is a controlled stop.

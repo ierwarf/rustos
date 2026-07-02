@@ -100,8 +100,8 @@ Kernel data paths (FD/socket/module/process/storage/input) remain narrow gated b
 
 - Gated brokers: `SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER`, `SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER`. Kernel side only loads an explicit module image or probes hardware aliases.
 - Provider-group active state, fallback ordering, virtio display preferred scanout = **driverd state, not a ring0 broker**.
-- xHCI uses the native RustOS host-controller path, gated by `RUSTOS_NATIVE_XHCI` until descriptor enumeration cannot delay display/runtime boot. Linux USB host-controller `.ko` bridges stay out of the default profile; keep load/provider/device/input policy in driverd/devmgrd/inputd, not in the native transfer engine.
-- Native xHCI HID polling is separately gated by `RUSTOS_NATIVE_XHCI_HID_POLL` until the post-configuration polling path is non-blocking under QEMU and real hardware.
+- xHCI uses the native RustOS host-controller path by default. Linux USB host-controller `.ko` bridges stay out of the default profile; keep load/provider/device/input policy in driverd/devmgrd/inputd, not in the native transfer engine.
+- Native xHCI HID polling is always enabled for USB input.
 - The remaining `service-driver-host` lane is not `.ko` work. It is first-party
   non-`.ko` native driver debt such as xHCI/legacy input: either implement an
   explicit ring3 service-driver host with leased privileged resources, or
@@ -173,13 +173,18 @@ Kernel keeps only: user-copy, address-space replacement, scheduler mutation, pen
 - Virtio-gpu is a Linux `.ko` display path. Do not reintroduce a native
   `kernel/io-manager/src/driver/virtio_gpu.rs` fallback or count it as a ring3
   service-driver target.
+- Until full virtio-gpu 2D scanout command processing is implemented in the
+  Linux `.ko` compat substrate, `__register_virtio_driver`/`drm_dev_register`
+  may claim the virtio-vga inherited boot scanout as the primary provider. This
+  keeps the provider path on the `.ko` registration boundary without restoring
+  the deleted native fallback.
 - `uiserver` partial dirty rects should stay split unless merged union is nearly as small as separate areas. Over-coalescing disjoint topbar/taskbar/window updates → large framebuffer copies + delayed input feedback.
 
 ## Scheduler
 
 - Linux CFS-like: fixed tick, nanosecond vruntime, weighted share, bounded sleeper credit. Weights affect vruntime only — **never reprogram hardware timer**.
 - Timer IRQ hitting a user-task kernel frame: set deferred reschedule; **do not preempt arbitrary kernel frames**.
-- Task weights = microsecond vruntime budgets (default 100 µs). `uiserver` gets a longer render/present slice. `runtimed` must pass manifest `weight_micros` through `loaderd`; never replace with default.
+- Task weights = microsecond vruntime budgets (default 100 µs). `uiserver` gets a longer render/present slice, and latency-critical brokers it calls in-frame, especially `inputd`, must stay in the same order of weight so UI loops do not block behind input IPC. `runtimed` must pass manifest `weight_micros` through `loaderd`; never replace with default.
 - `.ko` module init runs as a user-service kernel frame. Long lock-free compat callbacks (`driver_register`, HID/USB/virtio probes) must call `cond_resched` at safe points so module init does not starve ready user tasks.
 - `KernelSpinLock` must not be held across disk/filesystem/IPC/framebuffer-copy loops. Use `KernelWaitLock` or split the section; add `cond_resched` in long loops.
 - Boot service order: driver/input policy services before UI launchers. `runtimed` waits on `devmgrd` endpoint before UI bootstrap.

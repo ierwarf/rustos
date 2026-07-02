@@ -186,22 +186,8 @@ pub fn syscall_linux_nanosleep(request_ptr: u64, _remaining_ptr: u64) -> u64 {
         Ok(ts) => ts,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
     };
-    if current_process_is_syscalld_policy_owner() {
-        if !is_valid_timespec(ts) {
-            return linux_errno(LINUX_EINVAL);
-        }
-        sleep_relative_timespec_substrate(ts);
-        return 0;
-    }
-    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_NANOSLEEP);
-    request.path_len = LINUX_TIMESPEC_SIZE as u32;
-    request.path[..LINUX_TIMESPEC_SIZE].copy_from_slice(as_bytes(&ts));
-    let response = match call_syscalld(request) {
-        Ok(response) => response,
-        Err(errno) => return linux_errno(errno),
-    };
-    if let Err(errno) = ensure_empty_syscalld_response(&response) {
-        return linux_errno(errno);
+    if !is_valid_timespec(ts) {
+        return linux_errno(LINUX_EINVAL);
     }
     sleep_relative_timespec_substrate(ts);
     0
@@ -212,20 +198,8 @@ pub fn syscall_linux_clock_gettime(clock_id: u64, timespec_ptr: u64) -> u64 {
     {
         return linux_errno(address_space_error_to_linux_errno(err));
     }
-    if current_process_is_syscalld_policy_owner() {
-        if !is_supported_clock_id(clock_id) {
-            return linux_errno(LINUX_EINVAL);
-        }
-        return write_clock_timespec(clock_id, timespec_ptr);
-    }
-    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_CLOCK_GETTIME);
-    request.arg0 = clock_id;
-    let response = match call_syscalld(request) {
-        Ok(response) => response,
-        Err(errno) => return linux_errno(errno),
-    };
-    if let Err(errno) = ensure_empty_syscalld_response(&response) {
-        return linux_errno(errno);
+    if !is_supported_clock_id(clock_id) {
+        return linux_errno(LINUX_EINVAL);
     }
     write_clock_timespec(clock_id, timespec_ptr)
 }
@@ -236,10 +210,6 @@ fn write_clock_timespec(clock_id: u64, timespec_ptr: u64) -> u64 {
         Ok(()) => 0,
         Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
     }
-}
-
-fn current_process_is_syscalld_policy_owner() -> bool {
-    ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY)
 }
 
 fn is_supported_clock_id(clock_id: u64) -> bool {
@@ -369,26 +339,11 @@ pub fn syscall_linux_clock_nanosleep(
         Ok(ts) => ts,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
     };
-    if current_process_is_syscalld_policy_owner() {
-        if !is_supported_clock_id(clock_id)
-            || flags & !(linux_abi::TIMER_ABSTIME as u64) != 0
-            || !is_valid_timespec(ts)
-        {
-            return linux_errno(LINUX_EINVAL);
-        }
-        return sleep_clock_nanosleep_substrate(clock_id, flags, ts);
-    }
-    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_CLOCK_NANOSLEEP);
-    request.arg0 = clock_id;
-    request.flags = flags;
-    request.path_len = LINUX_TIMESPEC_SIZE as u32;
-    request.path[..LINUX_TIMESPEC_SIZE].copy_from_slice(as_bytes(&ts));
-    let response = match call_syscalld(request) {
-        Ok(response) => response,
-        Err(errno) => return linux_errno(errno),
-    };
-    if let Err(errno) = ensure_empty_syscalld_response(&response) {
-        return linux_errno(errno);
+    if !is_supported_clock_id(clock_id)
+        || flags & !(linux_abi::TIMER_ABSTIME as u64) != 0
+        || !is_valid_timespec(ts)
+    {
+        return linux_errno(LINUX_EINVAL);
     }
     sleep_clock_nanosleep_substrate(clock_id, flags, ts)
 }

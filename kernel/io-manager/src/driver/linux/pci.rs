@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: Linux .ko PCI shim compatibility
+// substrate exception. driverd owns load/provider policy; ring0 keeps Linux
+// PCI symbol dispatch and privileged PCI/MMIO resource access for .ko modules.
 use core::ffi::{c_char, c_void};
 
 use super::compat::{LinuxCompatPciDev, LinuxCompatPciDriver};
@@ -163,6 +166,7 @@ pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
         _ => None,
     }
 }
+// RING3-MIGRATION-REFERENCE END: Linux .ko PCI shim compatibility substrate exception.
 
 fn map_bar(
     dev: *mut LinuxCompatPciDev,

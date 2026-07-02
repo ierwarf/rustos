@@ -6,7 +6,7 @@
       "type": "node-terminal",
       "request": "launch",
       "preLaunchTask": "Build OS",
-      "command": "exec env RUSTOS_NATIVE_XHCI=1 RUSTOS_NATIVE_XHCI_HID_POLL=1 cargo xtask run --profile nvme --usb-input --debugcon file --summarize-log -- --no-reboot",
+      "command": "exec cargo xtask run --profile nvme --usb-input --debugcon file --summarize-log",
       "cwd": "${workspaceFolder}"
     },
     {
@@ -14,7 +14,7 @@
       "type": "node-terminal",
       "request": "launch",
       "preLaunchTask": "Build OS",
-      "command": "exec env RUSTOS_NATIVE_XHCI=1 RUSTOS_NATIVE_XHCI_HID_POLL=1 cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file --summarize-log -- --no-reboot",
+      "command": "exec cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file --summarize-log",
       "cwd": "${workspaceFolder}"
     }
   ]

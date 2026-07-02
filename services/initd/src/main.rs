@@ -464,7 +464,9 @@ fn lookup_loader_endpoint() -> Result<u64, i32> {
 
 fn exec_weight_micros(exec_path: &str) -> u64 {
     match exec_path {
-        RUNTIMED_EXEC_PATH | DRIVERD_EXEC_PATH => DISPLAY_CRITICAL_TASK_WEIGHT_MICROS,
+        RUNTIMED_EXEC_PATH | DRIVERD_EXEC_PATH | INPUTD_EXEC_PATH => {
+            DISPLAY_CRITICAL_TASK_WEIGHT_MICROS
+        }
         _ => DEFAULT_INIT_TASK_WEIGHT_MICROS,
     }
 }

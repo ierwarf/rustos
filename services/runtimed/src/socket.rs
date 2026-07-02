@@ -309,6 +309,7 @@ fn handle_terminate(
                 request.target_value,
             )? {
                 state.session_runtime.remove_session(request.target_value);
+                super::session::clear_focused_session_if(state, request.target_value);
                 terminated = true;
             }
         }

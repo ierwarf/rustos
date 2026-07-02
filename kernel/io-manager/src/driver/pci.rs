@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: Linux .ko PCI compatibility bus substrate
+// exception. driverd owns provider/module policy; ring0 keeps PCI config,
+// BAR/resource, and Linux driver probe callback substrate for .ko execution.
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ffi::c_void;
@@ -632,3 +635,4 @@ fn write_u32(address: crate::arch::pci::PciDevice, offset: i32, value: u32) -> i
 fn irq_safe<T>(f: impl FnOnce() -> T) -> T {
     interrupts::without_interrupts(f)
 }
+// RING3-MIGRATION-REFERENCE END: Linux .ko PCI compatibility bus substrate exception.

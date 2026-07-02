@@ -250,7 +250,9 @@ fn load_record(
             ));
         }
     }
-    if !record.provider_group.is_empty() && provider_groups.contains(record.provider_group.as_str())
+    if !record.fallback_only
+        && !record.provider_group.is_empty()
+        && provider_groups.contains(record.provider_group.as_str())
     {
         skipped.insert(record.name.clone());
         debug_line(&format!(

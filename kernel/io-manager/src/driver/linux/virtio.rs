@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: Linux .ko virtio shim compatibility
+// substrate exception. driverd/devmgrd own provider policy; ring0 keeps Linux
+// virtio bus registration and callback substrate for .ko modules.
 use alloc::vec::Vec;
 use core::ffi::{c_char, c_void};
 use core::{ptr, slice};
@@ -141,6 +144,19 @@ unsafe extern "C" fn register_virtio_driver(driver: *mut c_void) -> i32 {
     register_driver_record(driver, policy.class, driver_name_hash);
     if policy.class == DriverClass::Network {
         crate::network::note_virtio_net_driver_registered();
+    } else if policy.class == DriverClass::Display
+        && crate::io::gui::install_inherited_primary_scanout_from_boot()
+    {
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Driver,
+            "virtio-gpu-inherited-scanout",
+            driver as usize as u64,
+            driver_name_hash,
+        );
+        crate::debug::info!(
+            display,
+            "virtio-gpu: inherited virtio-vga scanout registered"
+        );
     }
     let status = 0;
     crate::debug::record_milestone(
@@ -782,3 +798,4 @@ pub(crate) fn resolve_symbol_meta(name: &str) -> Option<super::LinuxCompatSymbol
 pub(crate) fn symbol_abi(name: &str) -> Option<super::LinuxCompatExportAbi> {
     resolve_symbol_meta(name).map(|symbol| symbol.abi)
 }
+// RING3-MIGRATION-REFERENCE END: Linux .ko virtio shim compatibility substrate exception.

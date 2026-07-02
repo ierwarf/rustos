@@ -254,16 +254,6 @@ pub(crate) fn register_owned_interface(
     if let Some(extra) = extra.as_ref() {
         altsetting.extra = extra.as_ptr() as *mut u8;
         altsetting.extralen = extra.len() as i32;
-        crate::debug::write_debugcon_only_line(
-            alloc::format!(
-                "usb core interface extra: intf={} ptr={:#x} len={} bytes={:02x?}",
-                registration.interface_number,
-                altsetting.extra as usize,
-                altsetting.extralen,
-                extra
-            )
-            .as_bytes(),
-        );
     }
 
     let device_ptr = device.as_mut() as *mut LinuxCompatUsbDevice;

@@ -800,7 +800,8 @@ options:
   -profile, --profile <name>         qemu profile (default, g14, nvme)
   -accel-profile, --accel-profile <name>
                                      accelerator profile; use \"kvm\" for host CPU
-  --usb-input                        attach qemu-xhci + usb-kbd + usb-tablet for USB HID testing
+  --usb-input                        attach qemu-xhci + usb-kbd + usb-tablet
+                                     for USB HID testing
   --no-network                       do not attach default usernet + virtio-net-pci
   --debugcon <file|stdio|null>       route debugcon to file, terminal, or disable it
   --qemu-log <int|null>              write QEMU trace log to logs/qemu_interrupt.log or disable it
@@ -826,7 +827,8 @@ options:
   -profile, --profile <name>         qemu profile (default, g14, nvme)
   -accel-profile, --accel-profile <name>
                                      accelerator profile; use \"kvm\" for host CPU
-  --usb-input                        attach qemu-xhci + usb-kbd + usb-tablet for USB HID testing
+  --usb-input                        attach qemu-xhci + usb-kbd + usb-tablet
+                                     for USB HID testing
   --no-network                       do not attach default usernet + virtio-net-pci
   --debugcon <file|stdio|null>       route debugcon to file, terminal, or disable it
   --qemu-log <int|null>              write QEMU trace log to logs/qemu_interrupt.log or disable it

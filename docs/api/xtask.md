@@ -38,7 +38,7 @@ defined in `tools/xtask/src/cli.rs`.
 | --- | --- |
 | `--profile <default|g14|nvme>` | Select QEMU machine/storage/memory profile. |
 | `--accel-profile kvm` | Use KVM acceleration and host CPU profile. |
-| `--usb-input` | Attach `qemu-xhci`, `usb-kbd`, and `usb-tablet`. |
+| `--usb-input` | Attach `qemu-xhci`, `usb-kbd`, and `usb-tablet` so interactive GTK runs receive pointer input without click-to-grab. |
 | `--no-network` | Disable default usernet and `virtio-net-pci`. |
 | `--debugcon <file|stdio|null>` | Route debugcon to file, terminal, or disable it. |
 | `--qemu-log <int|null>` | Write QEMU interrupt trace or disable QEMU trace logging. |
@@ -53,21 +53,21 @@ defined in `tools/xtask/src/cli.rs`.
 Raw QEMU args go after `--`:
 
 ```bash
-cargo xtask run -- --no-reboot
+cargo xtask run -- -display none
 ```
 
 Bounded KVM no-opt debugging uses NVMe storage by default while AHCI boundary
 issues are isolated separately:
 
 ```bash
-cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file --timeout 35 --summarize-log -- --no-reboot
+cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file --timeout 35 --summarize-log
 ```
 
 Fault injection rules can come from `config/rustos.toml` or repeated
 `--fault` arguments:
 
 ```bash
-cargo xtask run --fault display.present=drop-every:10 --timeout 35 --summarize-log -- --no-reboot
+cargo xtask run --fault display.present=drop-every:10 --timeout 35 --summarize-log
 ```
 
 Use `cargo xtask qemu-scenarios --list` to see the built-in scenario names.
@@ -121,7 +121,7 @@ Use `cargo xtask qemu-scenarios --list` to see the built-in scenario names.
 | --- | --- |
 | `--profile <default|g14|nvme>` | QEMU machine/storage/memory profile 선택 |
 | `--accel-profile kvm` | KVM acceleration과 host CPU profile 사용 |
-| `--usb-input` | `qemu-xhci`, `usb-kbd`, `usb-tablet` attach |
+| `--usb-input` | `qemu-xhci`, `usb-kbd`, `usb-tablet` attach. GTK interactive run에서 click-to-grab 없이 pointer input을 받습니다. |
 | `--no-network` | default usernet과 `virtio-net-pci` 비활성화 |
 | `--debugcon <file|stdio|null>` | debugcon을 file, terminal로 보내거나 끔 |
 | `--qemu-log <int|null>` | QEMU interrupt trace를 쓰거나 QEMU trace logging을 끔 |
@@ -136,21 +136,21 @@ Use `cargo xtask qemu-scenarios --list` to see the built-in scenario names.
 Raw QEMU arg는 `--` 뒤에 둡니다.
 
 ```bash
-cargo xtask run -- --no-reboot
+cargo xtask run -- -display none
 ```
 
 KVM no-opt bounded debugging은 AHCI boundary issue를 별도로 격리하기 위해
 우선 NVMe storage profile을 사용합니다.
 
 ```bash
-cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file --timeout 35 --summarize-log -- --no-reboot
+cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file --timeout 35 --summarize-log
 ```
 
 Fault injection rule은 `config/rustos.toml`에서 오거나 반복 지정한 `--fault`
 argument에서 옵니다.
 
 ```bash
-cargo xtask run --fault display.present=drop-every:10 --timeout 35 --summarize-log -- --no-reboot
+cargo xtask run --fault display.present=drop-every:10 --timeout 35 --summarize-log
 ```
 
 내장 scenario 이름은 `cargo xtask qemu-scenarios --list`로 확인합니다.

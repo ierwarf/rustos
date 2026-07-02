@@ -60,6 +60,7 @@ pub(crate) struct InputProcessingResult {
 }
 
 const MAX_PARTIAL_RECTS: usize = 32;
+const MAX_PARTIAL_RECT_PIXELS: u64 = 96 * 1024;
 const PARTIAL_RECT_MERGE_NUMERATOR: u64 = 5;
 const PARTIAL_RECT_MERGE_DENOMINATOR: u64 = 4;
 const FULL_REDRAW_PROMOTION_NUMERATOR: u64 = 9;
@@ -134,6 +135,38 @@ impl VisualUpdate {
         {
             self.request_full();
         }
+    }
+
+    pub(crate) fn split_large_partials(&mut self) {
+        if self.needs_full_redraw || self.partial_rects.is_empty() {
+            return;
+        }
+
+        let mut split = Vec::with_capacity(self.partial_rects.len());
+        for rect in self.partial_rects.drain(..) {
+            let area = rect_area(rect);
+            if area <= MAX_PARTIAL_RECT_PIXELS || rect.width == 0 {
+                split.push(rect);
+                continue;
+            }
+
+            let strip_height = ((MAX_PARTIAL_RECT_PIXELS / rect.width as u64) as usize)
+                .max(1)
+                .min(rect.height);
+            let mut y = rect.y;
+            let end_y = rect.y.saturating_add(rect.height);
+            while y < end_y {
+                let height = strip_height.min(end_y - y);
+                split.push(canvas::Rect {
+                    x: rect.x,
+                    y,
+                    width: rect.width,
+                    height,
+                });
+                y = y.saturating_add(height);
+            }
+        }
+        self.partial_rects = split;
     }
 
     pub(crate) fn coalesce_tight_partials(&mut self) {
@@ -495,16 +528,31 @@ impl AppState {
         }
 
         self.wayland_windows = windows;
+        let focus_or_drag_changed = previous_dragging != self.dragging_window
+            || previous_focus != self.focused_wayland_surface_id;
+        let returned_dirty = if focus_or_drag_changed {
+            before_dirty
+                .union(dirty)
+                .union(self.wayland_stack_dirty_rect())
+                .union(self.wayland_taskbar_dirty_rect())
+        } else {
+            dirty
+        };
         if profile::enabled() && has_damage {
             let log_index = WAYLAND_SYNC_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
             if log_index < MAX_WAYLAND_SYNC_LOGS {
                 diag_line(
                     format!(
-                        "uiserver: wayland sync damage dirty={}x{}@{},{} windows={} focused_wayland={:?}",
+                        "uiserver: wayland sync damage dirty={}x{}@{},{} returned={}x{}@{},{} stack_included={} windows={} focused_wayland={:?}",
                         dirty.width,
                         dirty.height,
                         dirty.x,
                         dirty.y,
+                        returned_dirty.width,
+                        returned_dirty.height,
+                        returned_dirty.x,
+                        returned_dirty.y,
+                        focus_or_drag_changed,
                         self.wayland_windows.len(),
                         self.focused_wayland_surface_id,
                     )
@@ -512,10 +560,7 @@ impl AppState {
                 );
             }
         }
-        before_dirty
-            .union(dirty)
-            .union(self.wayland_stack_dirty_rect())
-            .union(self.wayland_taskbar_dirty_rect())
+        returned_dirty
     }
 
     pub(crate) fn record_cursor_motion(&mut self, previous_x: u32, previous_y: u32) {

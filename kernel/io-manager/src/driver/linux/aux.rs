@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: Linux .ko auxiliary helper compatibility
+// substrate exception. Service policy stays in driverd/inputd/devmgrd; ring0
+// keeps helper ABI glue required by in-kernel .ko execution.
 use alloc::alloc::{Layout, alloc};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -709,3 +712,4 @@ fn release_semaphore(sem: *mut c_void) {
         existing.count = existing.count.saturating_add(1);
     }
 }
+// RING3-MIGRATION-REFERENCE END: Linux .ko auxiliary helper compatibility substrate exception.

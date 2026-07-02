@@ -143,30 +143,39 @@ fn reply_device_ioctl(reply_cap: u64, request: &DevmgrdDeviceIoctlRequest) -> i6
         op: DEVMGRD_IPC_OP_IOCTL_AUTHORIZE,
         ..DevmgrdDeviceIoctlResponse::default()
     };
-    response.status =
-        if let Some(IoctlPolicyOwner::Sessiond(op)) = ioctl_policy_owner(request.request) {
-            if sessiond_executes_ioctl(request.request) {
-                match call_sessiond_ioctl(op, request) {
-                    Ok(session_response) => {
-                        response.value = session_response.value0;
-                        response.payload_len = session_response.payload_len;
-                        let payload_len = session_response.payload_len as usize;
-                        if payload_len <= response.payload.len() {
-                            response.payload[..payload_len]
-                                .copy_from_slice(&session_response.payload[..payload_len]);
-                            0
-                        } else {
-                            libc::EINVAL
-                        }
+    response.status = if let Some(IoctlPolicyOwner::Sessiond(op)) =
+        ioctl_policy_owner(request.request)
+    {
+        if sessiond_executes_ioctl(request.request) {
+            match call_sessiond_ioctl(op, request) {
+                Ok(session_response) => {
+                    response.value = session_response.value0;
+                    response.payload_len = session_response.payload_len;
+                    let payload_len = session_response.payload_len as usize;
+                    if payload_len <= response.payload.len() {
+                        response.payload[..payload_len]
+                            .copy_from_slice(&session_response.payload[..payload_len]);
+                        0
+                    } else {
+                        libc::EINVAL
                     }
-                    Err(errno) => errno,
                 }
-            } else {
-                authorize_and_broker_ioctl(request, &mut response)
+                Err(errno) => {
+                    if request.request == rustos_user_abi::console::CONSOLE_IOCTL_SET_FOCUS {
+                        debug_line(
+                            format!("devmgrd: console set focus via sessiond failed errno={errno}")
+                                .as_str(),
+                        );
+                    }
+                    errno
+                }
             }
         } else {
             authorize_and_broker_ioctl(request, &mut response)
-        };
+        }
+    } else {
+        authorize_and_broker_ioctl(request, &mut response)
+    };
     syscall3(
         SYS_RUSTOS_IPC_REPLY,
         reply_cap,
@@ -385,6 +394,7 @@ fn sessiond_executes_ioctl(request_number: u64) -> bool {
             | rustos_user_abi::console::CONSOLE_IOCTL_SNAPSHOT_SESSIONS
             | rustos_user_abi::console::CONSOLE_IOCTL_SNAPSHOT_SESSION_OUTPUT
             | rustos_user_abi::console::CONSOLE_IOCTL_SEND_INPUT_EVENT
+            | rustos_user_abi::console::CONSOLE_IOCTL_SET_FOCUS
     )
 }
 
@@ -395,7 +405,6 @@ fn sessiond_broker_commits_ioctl(request_number: u64) -> bool {
             | rustos_user_abi::console::CONSOLE_IOCTL_CLOSE_SESSION
             | rustos_user_abi::console::CONSOLE_IOCTL_BIND_CURRENT_SESSION
             | rustos_user_abi::console::CONSOLE_IOCTL_SET_SESSION_STATE
-            | rustos_user_abi::console::CONSOLE_IOCTL_SET_FOCUS
     )
 }
 
@@ -416,7 +425,14 @@ fn call_sessiond_ioctl(
     }
     let endpoint = syscall1(SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, IPC_SERVICE_SESSIOND);
     if endpoint <= 0 {
-        return Err(libc::ENOSYS);
+        let errno = last_errno();
+        if ioctl_request.request == rustos_user_abi::console::CONSOLE_IOCTL_SET_FOCUS {
+            debug_line(
+                format!("devmgrd: sessiond lookup failed endpoint={endpoint} errno={errno}")
+                    .as_str(),
+            );
+        }
+        return Err(errno);
     }
     let mut request = CommercialMaxProtocolRequest::default();
     request.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
@@ -441,7 +457,11 @@ fn call_sessiond_ioctl(
         size_of::<CommercialMaxProtocolResponse>() as u64,
     );
     if result < 0 {
-        return Err(last_errno());
+        let errno = last_errno();
+        if ioctl_request.request == rustos_user_abi::console::CONSOLE_IOCTL_SET_FOCUS {
+            debug_line(format!("devmgrd: sessiond call failed errno={errno}").as_str());
+        }
+        return Err(errno);
     }
     if result as usize != size_of::<CommercialMaxProtocolResponse>()
         || response.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION

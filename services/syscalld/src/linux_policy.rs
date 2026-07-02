@@ -11,8 +11,8 @@ use rustos_user_abi::syscall::{
     MM_BROKER_FD_KIND_DISPLAY_SURFACE, MM_BROKER_FD_KIND_FILE, MM_BROKER_FD_KIND_MEMFD,
     MM_BROKER_OP_DESCRIBE_FD, MM_BROKER_OP_MAP_ANON, MM_BROKER_OP_MAP_DEVICE_SHARED,
     MM_BROKER_OP_MAP_FILE_PRIVATE, MM_BROKER_OP_MAP_MEMFD_SHARED, MM_BROKER_OP_PROTECT,
-    MM_BROKER_OP_QUERY_LAYOUT, MM_BROKER_OP_UNMAP, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY,
-    SYS_RUSTOS_MM_BROKER,
+    MM_BROKER_OP_QUERY_LAYOUT, MM_BROKER_OP_UNMAP, PROC_BROKER_USER_SPACE_BASE,
+    PROC_BROKER_USER_SPACE_END_EXCLUSIVE, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, SYS_RUSTOS_MM_BROKER,
 };
 use spin::Mutex;
 
@@ -43,8 +43,8 @@ const MAP_EXECUTABLE: u64 = 0x1000;
 const PROT_READ: u64 = 0x1;
 const PROT_WRITE: u64 = 0x2;
 const PROT_EXEC: u64 = 0x4;
-const LINUX_USER_SPACE_BASE: u64 = 0x0000_0000_0000_1000;
-const LINUX_USER_SPACE_END: u64 = 0x0000_8000_0000;
+const LINUX_USER_SPACE_BASE: u64 = PROC_BROKER_USER_SPACE_BASE;
+const LINUX_USER_SPACE_END: u64 = PROC_BROKER_USER_SPACE_END_EXCLUSIVE;
 // Linux madvise constants used by the service-side policy subset.
 const MADV_NORMAL: u64 = 0;
 const MADV_RANDOM: u64 = 1;
@@ -942,7 +942,9 @@ pub(crate) fn handle_mmap(
             save_mm_state(request.pid, state);
             copy_payload(response, &mapped_addr);
         }
-        Err(errno) => response.status = errno,
+        Err(errno) => {
+            response.status = errno;
+        }
     }
 }
 

@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: Linux .ko MMIO mapping shim compatibility
+// substrate exception. driverd owns driver policy; ring0 keeps privileged
+// MMIO map helpers required by in-kernel .ko execution.
 use core::ffi::c_void;
 
 use super::compat::LinuxCompatResource;
@@ -156,3 +159,4 @@ fn map_mmio(offset: u64, size: usize, write_combine: bool) -> *mut c_void {
     }
     crate::driver::mmio::map(offset, size, write_combine)
 }
+// RING3-MIGRATION-REFERENCE END: Linux .ko MMIO mapping shim compatibility substrate exception.

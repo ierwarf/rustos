@@ -14,7 +14,7 @@ sessions for Linux and Windows PE programs.
 
 ```text
 runtimed bootstrap_ui_server
-  -> spawn uiserver with manifest args + env (RUSTOS_UI_PROFILE=1)
+  -> spawn uiserver with manifest args/env
 uiserver run()
   -> AppState::initialize (display_get_info + display_create_surface)
   -> render_boot_frame (single solid fill — no chrome yet)
@@ -73,8 +73,8 @@ ring. Layout uses the terminal monospace atlas; chrome uses the UI atlas.
 
 ### Profile Trace
 
-Set `RUSTOS_UI_PROFILE=1` (now applied automatically on the bootstrap
-launch) to enable `profile::record_*` paths. The summary lines tagged
+Set `RUSTOS_UI_PROFILE=1` when profiling is needed to enable
+`profile::record_*` paths. The summary lines tagged
 `uiserver profile: ...` get flushed to debugcon and are the primary tool
 for diagnosing slow refresh / slow present regressions. Use them before
 adding new diag prints.
@@ -91,7 +91,7 @@ console-hosted session rendering을 담당합니다.
 
 ```text
 runtimed bootstrap_ui_server
-  -> manifest args + env (RUSTOS_UI_PROFILE=1)로 uiserver spawn
+  -> manifest args/env로 uiserver spawn
 uiserver run()
   -> AppState::initialize (display_get_info + display_create_surface)
   -> render_boot_frame (chrome 없이 단색 fill)
@@ -149,8 +149,7 @@ console-hosted program (shell, PE demo)은 `runtimed`에서 console session
 
 ### Profile Trace
 
-`RUSTOS_UI_PROFILE=1` (이제 bootstrap launch에서 자동 적용)을 설정하면
-`profile::record_*` 경로가 활성화됩니다. `uiserver profile: ...` summary
-line이 debugcon으로 flush 되며 slow refresh / slow present regression을
-진단할 때 주된 도구입니다. 새 diag print를 추가하기 전에 이 경로를 먼저
-사용하세요.
+profiling이 필요할 때 `RUSTOS_UI_PROFILE=1`을 설정하면 `profile::record_*`
+경로가 활성화됩니다. `uiserver profile: ...` summary line이 debugcon으로
+flush 되며 slow refresh / slow present regression을 진단할 때 주된
+도구입니다. 새 diag print를 추가하기 전에 이 경로를 먼저 사용하세요.

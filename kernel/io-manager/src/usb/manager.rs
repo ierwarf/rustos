@@ -12,7 +12,7 @@ use super::host::{UsbHostControllerInfo, controller_kind_name};
 use super::xhci;
 
 const USB_SERVICE_ROUNDS: usize = 2;
-const ENABLE_NATIVE_XHCI: bool = option_env!("RUSTOS_NATIVE_XHCI").is_some();
+const ENABLE_NATIVE_XHCI: bool = true;
 
 struct UsbRuntimeState {
     controllers: Vec<UsbHostControllerInfo>,

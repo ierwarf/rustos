@@ -172,7 +172,7 @@ pub fn clone_linux_thread(
                     .validate_user_write_buffer(VirtAddr::new(parent_tid_ptr), size_of::<u32>())
                     .map_err(address_space_error_to_linux_errno)?;
             }
-            if flags & (linux_abi::CLONE_CHILD_SETTID | linux_abi::CLONE_CHILD_CLEARTID) != 0 {
+            if flags & linux_abi::CLONE_CHILD_SETTID != 0 {
                 address_space
                     .validate_user_write_buffer(VirtAddr::new(child_tid_ptr), size_of::<u32>())
                     .map_err(address_space_error_to_linux_errno)?;

@@ -6,9 +6,9 @@ pub use crate::multitask::{
 pub use crate::multitask::{
     arm_block_current_task, block_current_task, block_current_user_task, commit_block_current_task,
     current_last_error, current_linux_thread_state, current_user_address_space,
-    current_user_stack_state, current_user_thread_id, exec_current_user_process,
-    exec_user_process_by_pid, exit_current_user_task, is_user_task_alive,
-    linux_thread_snapshot_by_ids, note_process_exit_status, queue_linux_signal,
+    current_user_process_thread_count, current_user_stack_state, current_user_thread_id,
+    exec_current_user_process, exec_user_process_by_pid, exit_current_user_task,
+    is_user_task_alive, linux_thread_snapshot_by_ids, note_process_exit_status, queue_linux_signal,
     restore_current_simd_state, save_current_simd_state, set_current_last_error,
     set_next_pick_hint, spawn_user_process_state_with_parent, spawn_user_process_with_parent,
     spawn_user_thread, wake_task, wake_user_task, with_current_mm, with_current_process_state,

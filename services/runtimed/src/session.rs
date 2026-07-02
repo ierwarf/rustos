@@ -9,7 +9,7 @@ use runtime_control::{
     DEFAULT_APPLICATIONS_DIR, DEFAULT_RUNTIME_ENV_REGISTRY_PATH,
 };
 use rustos_user_abi::console::{
-    self as console_abi, ConsoleSendInputEventRequest, ConsoleSessionInfo,
+    self as console_abi, ConsoleSendInputEventRequest, ConsoleSessionInfo, ConsoleSetFocusRequest,
     ConsoleSnapshotSessionOutputRequest, ConsoleSnapshotSessionsRequest, ConsoleStateInfo,
 };
 use rustos_user_abi::device::{InputEvent, INPUT_ACTION_RELEASED, INPUT_KIND_KEYBOARD};
@@ -442,7 +442,9 @@ pub(super) fn create_session_endpoint() -> Option<u64> {
         super::spawn::stderr_line("runtimed: session endpoint register failed");
         return None;
     }
-    super::spawn::stderr_line("runtimed: session policy endpoint registered");
+    super::spawn::stderr_line(
+        format!("runtimed: session policy endpoint registered endpoint={endpoint}").as_str(),
+    );
     Some(endpoint as u64)
 }
 
@@ -515,13 +517,11 @@ fn handle_session_request(
             handle_console_route_request(request, state, response)
         }
         COMMERCIAL_MAX_SESSIOND_OP_FOREGROUND_FOCUS => {
-            let focused_session = state
-                .running
-                .values()
-                .filter(|program| program.session_handle != 0)
-                .map(|program| program.session_handle)
-                .max()
-                .unwrap_or(0);
+            let status = handle_foreground_focus_request(request, state, response);
+            if status != 0 {
+                return status;
+            }
+            let focused_session = response.value0;
             response.value0 = focused_session;
             response.descriptor_count = 1;
             response.descriptors[0] =
@@ -542,6 +542,27 @@ fn handle_session_request(
             0
         }
         _ => libc::EINVAL,
+    }
+}
+
+fn handle_foreground_focus_request(
+    request: &CommercialMaxProtocolRequest,
+    state: &mut BrokerState,
+    response: &mut CommercialMaxProtocolResponse,
+) -> i32 {
+    match request.arg0 {
+        0 => {
+            response.value0 = focused_session_handle(state);
+            0
+        }
+        console_abi::CONSOLE_IOCTL_SET_FOCUS => {
+            if request.payload_len as usize != size_of::<ConsoleSetFocusRequest>() {
+                return libc::EINVAL;
+            }
+            let focus = super::util::read_unaligned::<ConsoleSetFocusRequest>(&request.payload);
+            set_focused_session_handle(state, focus.session_handle)
+        }
+        _ => libc::ENOTTY,
     }
 }
 
@@ -778,10 +799,45 @@ fn handle_session_graph_request(
 }
 
 fn focused_session_handle(state: &BrokerState) -> u64 {
+    if state.focused_session_handle != 0 && session_exists(state, state.focused_session_handle) {
+        return state.focused_session_handle;
+    }
+    fallback_focused_session_handle_excluding(state, 0)
+}
+
+fn set_focused_session_handle(state: &mut BrokerState, session_handle: u64) -> i32 {
+    if session_handle == 0 || !session_exists(state, session_handle) {
+        return libc::EINVAL;
+    }
+    state.focused_session_handle = session_handle;
+    0
+}
+
+pub(super) fn focus_session_after_spawn(state: &mut BrokerState, session_handle: u64) {
+    if session_handle != 0 {
+        state.focused_session_handle = session_handle;
+    }
+}
+
+pub(super) fn clear_focused_session_if(state: &mut BrokerState, session_handle: u64) {
+    if session_handle != 0 && state.focused_session_handle == session_handle {
+        state.focused_session_handle =
+            fallback_focused_session_handle_excluding(state, session_handle);
+    }
+}
+
+fn session_exists(state: &BrokerState, session_handle: u64) -> bool {
     state
         .running
         .values()
-        .filter(|program| program.session_handle != 0)
+        .any(|program| program.session_handle == session_handle)
+}
+
+fn fallback_focused_session_handle_excluding(state: &BrokerState, excluded_session: u64) -> u64 {
+    state
+        .running
+        .values()
+        .filter(|program| program.session_handle != 0 && program.session_handle != excluded_session)
         .map(|program| program.session_handle)
         .max()
         .unwrap_or(0)

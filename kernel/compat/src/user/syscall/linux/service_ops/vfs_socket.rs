@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: vfsd/netd fd-usercopy substrate exception.
+// vfsd/netd own file/socket policy. Ring0 keeps current-process user-copy,
+// fd-table mutation, and remote-handle/socket-token installation substrate.
 use super::*;
 
 pub fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64) -> u64 {
@@ -766,3 +769,4 @@ fn read_socket_writev_payload(iov_ptr: u64, iovcnt: u64) -> Result<Vec<u8>, i64>
     }
     Ok(payload)
 }
+// RING3-MIGRATION-REFERENCE END: vfsd/netd fd-usercopy substrate exception.

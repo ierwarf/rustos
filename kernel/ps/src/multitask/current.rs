@@ -37,6 +37,11 @@ pub fn current_user_process_id() -> Option<u64> {
     current_user_snapshot().map(|snapshot| snapshot.process_id())
 }
 
+pub fn current_user_process_thread_count() -> Option<usize> {
+    let process_id = current_user_process_id()?;
+    process_table::thread_count_by_pid(process_id)
+}
+
 pub fn current_linux_thread_state() -> Option<LinuxThreadState> {
     interrupts::without_interrupts(|| unsafe { scheduler_ref().current_linux_thread_state() })
 }

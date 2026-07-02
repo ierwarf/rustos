@@ -23,7 +23,7 @@ use crate::layout::{
     window_minimize_button_rect as layout_window_minimize_button_rect,
     window_title_bar_rect as layout_window_title_bar_rect, WINDOW_SHADOW_STEPS,
 };
-use crate::sys::{diag_line, ConsoleSessionHandle};
+use crate::sys::{diag_line, ui_profile_enabled, ConsoleSessionHandle};
 use crate::wayland::WaylandWindowSnapshot;
 
 mod background;
@@ -238,7 +238,9 @@ fn render_scene(
             0,
             0,
         );
-    } else if DESKTOP_PENDING_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < MAX_DESKTOP_PENDING_LOGS {
+    } else if ui_profile_enabled()
+        && DESKTOP_PENDING_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < MAX_DESKTOP_PENDING_LOGS
+    {
         diag_line("uiserver: desktop background not ready; skipping desktop blit");
     }
 
@@ -377,7 +379,9 @@ fn refresh_desktop_surface(state: &mut AppState) {
     }
 
     if !state.desktop_cache.background_valid {
-        if DESKTOP_REFRESH_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < MAX_DESKTOP_REFRESH_LOGS {
+        if ui_profile_enabled()
+            && DESKTOP_REFRESH_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < MAX_DESKTOP_REFRESH_LOGS
+        {
             diag_line(
                 format!(
                     "uiserver: desktop background pending width={} height={} resized={} chrome_valid={} pixels_len={}",

@@ -75,6 +75,7 @@ pub(crate) const MAX_CONSOLE_SNAPSHOT_BYTES: usize = 4096;
 const EAGAIN: i32 = 11;
 pub(crate) const ENOENT: i32 = 2;
 pub(crate) const EINVAL: i32 = 22;
+pub(crate) const ENOSYS: i32 = 38;
 pub(crate) const ESTALE: i32 = 116;
 pub(crate) type ConsoleSessionHandle = u64;
 

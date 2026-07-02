@@ -120,7 +120,7 @@ pub fn hardware_alias_present(alias: &str, class: u32, bus: u32) -> bool {
         }
         DriverBus::Pci => pci_alias_present(alias),
         DriverBus::Virtio => {
-            if class == DriverClass::Display && display_primary_provider_active() {
+            if class == DriverClass::Display && display_non_boot_primary_provider_active() {
                 return false;
             }
             virtio_alias_present(alias)
@@ -135,6 +135,18 @@ fn display_primary_provider_active() -> bool {
     crate::io::gui::display_info()
         .map(|display| {
             display.flags & crate::user::abi::device::DISPLAY_INFO_FLAG_PRIMARY_PROVIDER != 0
+        })
+        .unwrap_or(false)
+}
+
+fn display_non_boot_primary_provider_active() -> bool {
+    crate::io::gui::display_info()
+        .map(|display| {
+            let primary =
+                display.flags & crate::user::abi::device::DISPLAY_INFO_FLAG_PRIMARY_PROVIDER != 0;
+            let boot =
+                display.flags & crate::user::abi::device::DISPLAY_INFO_FLAG_BOOT_FRAMEBUFFER != 0;
+            primary && !boot
         })
         .unwrap_or(false)
 }

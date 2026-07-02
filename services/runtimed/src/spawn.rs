@@ -81,12 +81,7 @@ pub(super) fn spawn_tracked_process(
         .as_str(),
     );
     state.retry_after.remove(entry.desktop_file_id.as_str());
-    if let Some(session) = session_handle {
-        let console_fd = ensure_console_fd(state)?;
-        let _ = CONSOLE_SESSION_STATE_SPAWNING;
-        let _ = CONSOLE_SESSION_STATE_RUNNING;
-        let _ = console_set_focus(console_fd, session);
-    }
+    let inserted_session_handle = session_handle.unwrap_or(0);
     state.running.insert(
         pid,
         RunningProcess {
@@ -95,10 +90,16 @@ pub(super) fn spawn_tracked_process(
             desktop_file_id: entry.desktop_file_id,
             display_name: entry.display_name,
             exec: entry.exec,
-            session_handle: session_handle.unwrap_or(0),
+            session_handle: inserted_session_handle,
             restart: entry.restart,
         },
     );
+    if inserted_session_handle != 0 {
+        let _ = ensure_console_fd(state)?;
+        let _ = CONSOLE_SESSION_STATE_SPAWNING;
+        let _ = CONSOLE_SESSION_STATE_RUNNING;
+        super::session::focus_session_after_spawn(state, inserted_session_handle);
+    }
     Ok(())
 }
 
@@ -120,6 +121,7 @@ pub(super) fn reap_children(state: &mut BrokerState) -> bool {
             if let Some(process) = state.running.remove(&pid) {
                 if process.session_handle != 0 {
                     state.session_runtime.remove_session(process.session_handle);
+                    super::session::clear_focused_session_if(state, process.session_handle);
                     if let Ok(console_fd) = ensure_console_fd(state) {
                         let _ = close_console_session(console_fd, process.session_handle);
                     }
@@ -328,10 +330,6 @@ fn allocate_console_session(state: &mut BrokerState) -> u64 {
 
 pub(super) fn close_console_session(_console_fd: RawFd, session_handle: u64) -> Result<bool, i32> {
     Ok(session_handle != 0)
-}
-
-fn console_set_focus(_console_fd: RawFd, _session_handle: u64) -> Result<(), i32> {
-    Ok(())
 }
 
 fn open_device(path: &str, flags: usize) -> Result<OwnedFd, i32> {

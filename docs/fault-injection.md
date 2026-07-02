@@ -94,7 +94,7 @@ rules = ["socket.send=rate:5"]
 You can also pass a rule for one run without editing the config:
 
 ```bash
-cargo xtask run --fault display.present=drop-every:10 --timeout 35 --summarize-log -- --no-reboot
+cargo xtask run --fault display.present=drop-every:10 --timeout 35 --summarize-log
 ```
 
 ### Adding New Points
@@ -201,7 +201,7 @@ rules = ["socket.send=rate:5"]
 config를 수정하지 않고 한 번만 rule을 넘길 수도 있습니다.
 
 ```bash
-cargo xtask run --fault display.present=drop-every:10 --timeout 35 --summarize-log -- --no-reboot
+cargo xtask run --fault display.present=drop-every:10 --timeout 35 --summarize-log
 ```
 
 ### 새 지점 추가

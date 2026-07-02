@@ -116,6 +116,22 @@ pub(crate) fn install_boot_framebuffer_fallback(framebuffer: FramebufferInfo) ->
     backend::install_driver_framebuffer(framebuffer, flags)
 }
 
+pub(crate) fn install_inherited_primary_scanout_from_boot() -> bool {
+    if display_info().is_some_and(|display| {
+        display.flags & DISPLAY_INFO_FLAG_PRIMARY_PROVIDER != 0
+            && display.flags & DISPLAY_INFO_FLAG_BOOT_FRAMEBUFFER == 0
+    }) {
+        return true;
+    }
+    let Some(framebuffer) = crate::storage::boot_volume::boot_framebuffer_info() else {
+        return false;
+    };
+    if framebuffer.validate().is_err() {
+        return false;
+    }
+    backend::install_driver_framebuffer(framebuffer, DISPLAY_INFO_FLAG_PRIMARY_PROVIDER)
+}
+
 pub fn display_info() -> Option<GuiDisplayInfo> {
     backend::display_info()
 }

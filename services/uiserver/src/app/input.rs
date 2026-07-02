@@ -78,13 +78,23 @@ impl AppState {
             INPUT_KIND_POINTER_MOTION => {
                 let previous_x = self.cursor_x;
                 let previous_y = self.cursor_y;
+                let previous_dirty =
+                    self.cursor_visual_dirty_rect(self.surface.width, self.surface.height);
                 let next_x = (self.cursor_x as i32 + event.value0).max(0) as u32;
                 let next_y = (self.cursor_y as i32 + event.value1).max(0) as u32;
                 self.cursor_x = next_x.min(self.display.width.saturating_sub(1));
                 self.cursor_y = next_y.min(self.display.height.saturating_sub(1));
                 self.record_cursor_motion(previous_x, previous_y);
+                let mut cursor_update =
+                    VisualUpdate::partial(previous_dirty.union(
+                        self.cursor_visual_dirty_rect(self.surface.width, self.surface.height),
+                    ));
                 let drag_update = self.drag_window_to_cursor(wayland.as_deref_mut());
                 if !drag_update.is_empty() {
+                    cursor_update.absorb(drag_update);
+                    return Ok(cursor_update);
+                }
+                if previous_x == self.cursor_x && previous_y == self.cursor_y {
                     return Ok(drag_update);
                 }
                 if let Some(wayland) = wayland.as_deref_mut() {
@@ -92,18 +102,28 @@ impl AppState {
                     wayland.pointer_motion(self.cursor_x, self.cursor_y);
                     profile::record_wayland_motion(started.elapsed());
                 }
-                Ok(VisualUpdate::default())
+                Ok(cursor_update)
             }
             INPUT_KIND_POINTER_POSITION => {
                 let previous_x = self.cursor_x;
                 let previous_y = self.cursor_y;
+                let previous_dirty =
+                    self.cursor_visual_dirty_rect(self.surface.width, self.surface.height);
                 self.cursor_x =
                     (event.value0.max(0) as u32).min(self.display.width.saturating_sub(1));
                 self.cursor_y =
                     (event.value1.max(0) as u32).min(self.display.height.saturating_sub(1));
                 self.record_cursor_motion(previous_x, previous_y);
+                let mut cursor_update =
+                    VisualUpdate::partial(previous_dirty.union(
+                        self.cursor_visual_dirty_rect(self.surface.width, self.surface.height),
+                    ));
                 let drag_update = self.drag_window_to_cursor(wayland.as_deref_mut());
                 if !drag_update.is_empty() {
+                    cursor_update.absorb(drag_update);
+                    return Ok(cursor_update);
+                }
+                if previous_x == self.cursor_x && previous_y == self.cursor_y {
                     return Ok(drag_update);
                 }
                 if let Some(wayland) = wayland.as_deref_mut() {
@@ -111,7 +131,7 @@ impl AppState {
                     wayland.pointer_motion(self.cursor_x, self.cursor_y);
                     profile::record_wayland_motion(started.elapsed());
                 }
-                Ok(VisualUpdate::default())
+                Ok(cursor_update)
             }
             INPUT_KIND_POINTER_BUTTON if event.code == POINTER_BUTTON_LEFT => {
                 self.left_button_down = event.action == sys::INPUT_ACTION_PRESSED;

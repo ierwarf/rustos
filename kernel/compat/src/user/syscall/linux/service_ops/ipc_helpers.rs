@@ -4,7 +4,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 const EARLY_SERVICE_CALL_SAMPLES: usize = 6;
 const SLOW_SERVICE_CALL_THRESHOLD_MS: u64 = 10;
-const MAX_SLOW_SERVICE_CALL_LOGS: usize = 20;
+const MAX_SLOW_SERVICE_CALL_LOGS: usize = 128;
 
 static SLOW_SERVICE_CALL_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -820,6 +820,13 @@ fn populate_devmgrd_ioctl_payload(
             .map_err(address_space_error_to_linux_errno)?;
             copy_devmgrd_ioctl_request_payload(request, as_bytes(&input))
         }
+        rustos_user_abi::console::CONSOLE_IOCTL_SET_FOCUS => {
+            let focus = usermem::read_current_user_struct::<
+                rustos_user_abi::console::ConsoleSetFocusRequest,
+            >(arg)
+            .map_err(address_space_error_to_linux_errno)?;
+            copy_devmgrd_ioctl_request_payload(request, as_bytes(&focus))
+        }
         _ => Ok(()),
     }
 }
@@ -920,6 +927,11 @@ fn apply_devmgrd_ioctl_payload(
 pub fn call_inputd_read_request(request: &InputdIpcRequest) -> Result<InputdReadResponse, i64> {
     let start_ticks = crate::arch::rtc::ticks();
     let response = ipc_ops::call_service_endpoint(IPC_SERVICE_INPUTD, as_bytes(request))?;
+    let detail = if request.flags & INPUTD_READ_FLAG_NONBLOCK != 0 {
+        Some("nonblock")
+    } else {
+        Some("blocking")
+    };
     log_slow_service_call(
         "inputd",
         request.op,
@@ -927,7 +939,7 @@ pub fn call_inputd_read_request(request: &InputdIpcRequest) -> Result<InputdRead
         request.pid,
         request.tid,
         response.len() as i64,
-        None,
+        detail,
     );
     if response.len() != size_of::<InputdReadResponse>() {
         return Err(LINUX_EINVAL);

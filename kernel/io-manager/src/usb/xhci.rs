@@ -48,7 +48,7 @@ const XHCI_REGISTER_WAIT_SPINS: usize = 1_000_000;
 const XHCI_EVENT_WAIT_SPINS: usize = 20_000_000;
 const XHCI_TRANSFER_LOG_LIMIT: usize = 0;
 const XHCI_POLL_SUBMIT_LOG_LIMIT: usize = 0;
-const ENABLE_NATIVE_XHCI_HID_POLL: bool = option_env!("RUSTOS_NATIVE_XHCI_HID_POLL").is_some();
+const ENABLE_NATIVE_XHCI_HID_POLL: bool = true;
 
 const USB_DT_DEVICE: u8 = 0x01;
 const USB_DT_CONFIG: u8 = 0x02;
@@ -667,18 +667,9 @@ fn enumerate_boot_port(
         parsed.endpoint_interval,
         parsed.report_descriptor_len,
     );
-    crate::debug::write_debugcon_only_line(
-        alloc::format!(
-            "xhci hid descriptor: port={} slot={} bytes={:02x?}",
-            port + 1,
-            slot_id,
-            parsed.hid_descriptor.as_slice()
-        )
-        .as_bytes(),
-    );
     if !ENABLE_NATIVE_XHCI_HID_POLL {
         crate::debug::println!(
-            "xhci: native HID polling gated: port={} slot={} set RUSTOS_NATIVE_XHCI_HID_POLL=1 to enable",
+            "xhci: native HID polling disabled: port={} slot={}",
             port + 1,
             slot_id
         );

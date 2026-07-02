@@ -62,6 +62,7 @@ const ELF_PROGRAM_HEADER_SIZE: usize = 56;
 const ELF_MAX_PROGRAM_HEADERS: u16 = 128;
 const ELF_PT_LOAD: u32 = 1;
 const ELF_PT_INTERP: u32 = 3;
+const ELF_PT_PHDR: u32 = 6;
 const ELF_ET_EXEC: u16 = 2;
 const ELF_ET_DYN: u16 = 3;
 const ELF_EM_X86_64: u16 = 62;
@@ -863,7 +864,7 @@ fn map_elf_segments_fd(
     let phentsize = read_u16(&header, 54) as u64;
     let phnum = read_u16(&header, 56) as u64;
     let entry = e_entry.wrapping_add(load_bias);
-    let phdr_addr = phoff.wrapping_add(load_bias);
+    let phdr_addr = program_header_table_addr_from_phdrs(&header, &phdrs, load_bias)?;
 
     let mut max_loaded_end: u64 = load_bias;
     let mut interpreter_path = None::<String>;
@@ -975,6 +976,48 @@ fn elf_load_bias_from_phdrs(
         .checked_add(dyn_load_offset)
         .and_then(|base| base.checked_sub(min_load_addr))
         .ok_or(EOVERFLOW)
+}
+
+fn program_header_table_addr_from_phdrs(
+    header: &[u8; ELF_HEADER_SIZE],
+    phdrs: &[u8],
+    load_bias: u64,
+) -> Result<u64, i32> {
+    let phoff = read_u64(header, 32);
+    let phentsize = read_u16(header, 54) as u64;
+    let phnum = read_u16(header, 56) as u64;
+    let ph_size = phentsize.checked_mul(phnum).ok_or(EOVERFLOW)?;
+    let ph_end = phoff.checked_add(ph_size).ok_or(EOVERFLOW)?;
+
+    for index in 0..phnum {
+        let ph_slice = program_header_at(phdrs, index)?;
+        let mut ph = [0_u8; ELF_PROGRAM_HEADER_SIZE];
+        ph.copy_from_slice(ph_slice);
+        if read_u32(&ph, 0) == ELF_PT_PHDR {
+            return read_u64(&ph, 16).checked_add(load_bias).ok_or(EOVERFLOW);
+        }
+    }
+
+    for index in 0..phnum {
+        let ph_slice = program_header_at(phdrs, index)?;
+        let mut ph = [0_u8; ELF_PROGRAM_HEADER_SIZE];
+        ph.copy_from_slice(ph_slice);
+        if read_u32(&ph, 0) != ELF_PT_LOAD || read_u64(&ph, 32) == 0 {
+            continue;
+        }
+        let file_start = read_u64(&ph, 8);
+        let file_end = file_start.checked_add(read_u64(&ph, 32)).ok_or(EOVERFLOW)?;
+        if phoff < file_start || ph_end > file_end {
+            continue;
+        }
+        let table_delta = phoff - file_start;
+        return read_u64(&ph, 16)
+            .checked_add(table_delta)
+            .and_then(|value| value.checked_add(load_bias))
+            .ok_or(EOVERFLOW);
+    }
+
+    Err(ENOEXEC)
 }
 
 enum ElfLoadMapping {

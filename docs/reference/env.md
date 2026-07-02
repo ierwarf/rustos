@@ -37,7 +37,7 @@
 Most build variables are parsed by `tools/xtask/src/config.rs`. QEMU run
 variables are parsed by `tools/xtask/src/qemu.rs`. For repeated KVM no-opt
 debugging, use `cargo xtask run --profile nvme --accel-profile kvm --usb-input
---debugcon file --timeout 35 --summarize-log -- --no-reboot`.
+--debugcon file --timeout 35 --summarize-log`.
 
 <a id="korean"></a>
 
@@ -74,4 +74,4 @@ debugging, use `cargo xtask run --profile nvme --accel-profile kvm --usb-input
 대부분의 build variable은 `tools/xtask/src/config.rs`에서 읽습니다. QEMU run
 variable은 `tools/xtask/src/qemu.rs`에서 읽습니다. 반복 KVM no-opt 디버깅은
 `cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file
---timeout 35 --summarize-log -- --no-reboot`를 사용합니다.
+--timeout 35 --summarize-log`를 사용합니다.

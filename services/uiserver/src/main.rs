@@ -12,19 +12,21 @@ mod sys;
 mod terminal;
 mod wayland;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use app::{
     start_console_refresh_worker, start_launcher_program_loader, AppState, VisualUpdate,
     CONSOLE_POLL_SLEEP, CURSOR_BLINK_INTERVAL, CURSOR_MOTION_SETTLE_INTERVAL, IDLE_SLEEP,
-    INPUT_EVENT_BATCH, RUNTIME_POLL_SLEEP,
+    RUNTIME_POLL_SLEEP,
 };
 use render::start_desktop_background_loader;
 use render::{render_boot_frame, render_debug_white_box, render_frame, render_rect};
 use runtime_control::RuntimeClient;
 use runtime_sync::{refresh_runtime_state, start_runtime_sync, RuntimeState};
-use sys::{boot_line, boot_trace_enabled, diag_line, profile_line, InputEvent};
+use sys::{boot_line, boot_trace_enabled, diag_line, profile_line};
 use wayland::WaylandCompositor;
 
 const DEBUG_FREEZE_ON_WHITE_BOX: bool = false;
@@ -37,10 +39,22 @@ const MAX_SLOW_PRESENT_LOGS: usize = 8;
 const SLOW_RUNTIME_REFRESH_THRESHOLD: Duration = Duration::from_millis(100);
 const MAX_SLOW_RUNTIME_REFRESH_LOGS: usize = 8;
 const MAX_WAYLAND_CALLBACK_ONLY_LOGS: usize = 8;
+const MAX_CURSOR_PIPELINE_LOGS: usize = 32;
+const UI_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const UI_WATCHDOG_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+const UI_PHASE_PANIC_THRESHOLD_MS: u64 = 3_000;
 const WAYLAND_BACKLOG_SERVICE_INTERVAL: Duration = Duration::from_millis(4);
 const PARTIAL_RENDER_BUDGET: Duration = Duration::from_millis(80);
 const SLOW_LOOP_THRESHOLD: Duration = Duration::from_millis(50);
 const MAX_SLOW_LOOP_LOGS: usize = 16;
+
+const UI_PHASE_IDLE: usize = 0;
+const UI_PHASE_INPUT: usize = 1;
+const UI_PHASE_INPUT_PRESENT: usize = 2;
+const UI_PHASE_WAYLAND: usize = 3;
+const UI_PHASE_RUNTIME: usize = 4;
+const UI_PHASE_CONSOLE: usize = 5;
+const UI_PHASE_MAIN_PRESENT: usize = 6;
 
 static FRAME_SAMPLE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SLOW_CONSOLE_REFRESH_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -48,6 +62,7 @@ static SLOW_PRESENT_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SLOW_RUNTIME_REFRESH_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WAYLAND_CALLBACK_ONLY_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static POINTER_MOVED_LOGGED: AtomicUsize = AtomicUsize::new(0);
+static CURSOR_PIPELINE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SLOW_LOOP_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Default)]
@@ -78,6 +93,82 @@ enum PresentUpdateResult {
     Idle,
     Rendered { deferred_update: VisualUpdate },
     StaleSurface,
+}
+
+#[derive(Clone)]
+struct UiLoopWatchdog {
+    boot_started: Instant,
+    phase: Arc<AtomicUsize>,
+    phase_started_ms: Arc<AtomicU64>,
+    loop_seq: Arc<AtomicU64>,
+}
+
+impl UiLoopWatchdog {
+    fn start(boot_started: Instant) -> Self {
+        let watchdog = Self {
+            boot_started,
+            phase: Arc::new(AtomicUsize::new(UI_PHASE_IDLE)),
+            phase_started_ms: Arc::new(AtomicU64::new(0)),
+            loop_seq: Arc::new(AtomicU64::new(0)),
+        };
+        let phase = Arc::clone(&watchdog.phase);
+        let phase_started_ms = Arc::clone(&watchdog.phase_started_ms);
+        let loop_seq = Arc::clone(&watchdog.loop_seq);
+        let thread_started = boot_started;
+        let _ = thread::Builder::new()
+            .name(String::from("uiserver-watchdog"))
+            .spawn(move || loop {
+                thread::sleep(UI_WATCHDOG_CHECK_INTERVAL);
+                let phase_id = phase.load(Ordering::Acquire);
+                if phase_id == UI_PHASE_IDLE {
+                    continue;
+                }
+                let started_ms = phase_started_ms.load(Ordering::Acquire);
+                let now_ms = elapsed_ms_since(thread_started);
+                let elapsed_ms = now_ms.saturating_sub(started_ms);
+                if elapsed_ms < UI_PHASE_PANIC_THRESHOLD_MS {
+                    continue;
+                }
+                diag_line(format!(
+                    "uiserver watchdog panic: phase={} elapsed_ms={} loop_seq={}",
+                    ui_phase_name(phase_id),
+                    elapsed_ms,
+                    loop_seq.load(Ordering::Acquire),
+                ));
+                std::process::exit(134);
+            });
+        watchdog
+    }
+
+    fn begin_loop(&self, loop_id: u64) {
+        self.loop_seq.store(loop_id, Ordering::Release);
+    }
+
+    fn enter(&self, phase: usize) {
+        self.phase_started_ms
+            .store(elapsed_ms_since(self.boot_started), Ordering::Release);
+        self.phase.store(phase, Ordering::Release);
+    }
+
+    fn leave(&self) {
+        self.phase.store(UI_PHASE_IDLE, Ordering::Release);
+    }
+}
+
+fn elapsed_ms_since(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn ui_phase_name(phase: usize) -> &'static str {
+    match phase {
+        UI_PHASE_INPUT => "input",
+        UI_PHASE_INPUT_PRESENT => "input-present",
+        UI_PHASE_WAYLAND => "wayland",
+        UI_PHASE_RUNTIME => "runtime",
+        UI_PHASE_CONSOLE => "console",
+        UI_PHASE_MAIN_PRESENT => "main-present",
+        _ => "idle",
+    }
 }
 
 fn cursor_move_update(
@@ -115,6 +206,7 @@ fn prepare_drawable_update(
     ));
     drawable_update.coalesce_tight_partials();
     drawable_update.promote_large_partial(state.surface.width, state.surface.height);
+    drawable_update.split_large_partials();
     drawable_update
 }
 
@@ -152,6 +244,9 @@ fn present_drawable_update(
                 present_elapsed,
                 true,
                 None,
+                1,
+                u64::from(state.surface.width) * u64::from(state.surface.height),
+                0,
             );
         }
         return Ok(PresentUpdateResult::Rendered {
@@ -215,12 +310,16 @@ fn present_drawable_update(
             present_elapsed,
             false,
             Some(present_union),
+            rect_count,
+            pixel_count,
+            deferred_update.partial_rects().len(),
         );
     }
     Ok(PresentUpdateResult::Rendered { deferred_update })
 }
 
 fn commit_rendered_update(
+    phase: &str,
     state: &AppState,
     wayland: &mut Option<WaylandCompositor>,
     pending_update: &mut VisualUpdate,
@@ -234,8 +333,11 @@ fn commit_rendered_update(
     if let Some(compositor) = wayland.as_mut() {
         compositor.frame_presented();
     }
-    let cursor_moved =
-        *presented_cursor_x != state.cursor_x || *presented_cursor_y != state.cursor_y;
+    let previous_presented_cursor_x = *presented_cursor_x;
+    let previous_presented_cursor_y = *presented_cursor_y;
+    let cursor_moved = previous_presented_cursor_x != state.cursor_x
+        || previous_presented_cursor_y != state.cursor_y;
+    let deferred_rects = deferred_update.partial_rects().len();
     pending_update.clear();
     pending_update.absorb(deferred_update);
     *presented_cursor_x = state.cursor_x;
@@ -243,6 +345,16 @@ fn commit_rendered_update(
     if cursor_moved {
         *cursor_moves_window = cursor_moves_window.saturating_add(1);
         log_pointer_moved_once(state);
+        log_cursor_pipeline_sample(
+            phase,
+            state,
+            pending_update,
+            deferred_rects,
+            previous_presented_cursor_x,
+            previous_presented_cursor_y,
+            cursor_moved,
+            true,
+        );
     }
 }
 
@@ -392,6 +504,9 @@ fn log_slow_present(
     present_elapsed: Duration,
     full_redraw: bool,
     rect: Option<crate::canvas::Rect>,
+    rect_count: u64,
+    pixel_count: u64,
+    deferred_rects: usize,
 ) {
     let sample_index = SLOW_PRESENT_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if sample_index >= MAX_SLOW_PRESENT_LOGS {
@@ -399,10 +514,13 @@ fn log_slow_present(
     }
     let message = if full_redraw {
         format!(
-            "uiserver: slow full present elapsed_ms={} render_ms={} present_ms={} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
+            "uiserver: slow full present elapsed_ms={} render_ms={} present_ms={} rects={} pixels={} deferred_rects={} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
             elapsed.as_millis(),
             render_elapsed.as_millis(),
             present_elapsed.as_millis(),
+            rect_count,
+            pixel_count,
+            deferred_rects,
             state.console_windows.len(),
             state.wayland_windows.len(),
             state.focused_session_handle,
@@ -411,7 +529,7 @@ fn log_slow_present(
     } else {
         let rect = rect.unwrap_or_default();
         format!(
-            "uiserver: slow partial present elapsed_ms={} render_ms={} present_ms={} rect={}x{}@{},{} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
+            "uiserver: slow partial present elapsed_ms={} render_ms={} present_ms={} rect={}x{}@{},{} rects={} pixels={} deferred_rects={} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
             elapsed.as_millis(),
             render_elapsed.as_millis(),
             present_elapsed.as_millis(),
@@ -419,6 +537,9 @@ fn log_slow_present(
             rect.height,
             rect.x,
             rect.y,
+            rect_count,
+            pixel_count,
+            deferred_rects,
             state.console_windows.len(),
             state.wayland_windows.len(),
             state.focused_session_handle,
@@ -436,6 +557,16 @@ fn log_boot_stage(started_at: Instant, stage: &str) {
     ));
 }
 
+fn phase_result<T>(phase: &str, result: Result<T, i32>) -> Result<T, i32> {
+    if let Err(errno) = result {
+        diag_line(format!(
+            "uiserver: phase failed phase={phase} errno={errno}"
+        ));
+        return Err(errno);
+    }
+    result
+}
+
 fn log_pointer_moved_once(state: &AppState) {
     if POINTER_MOVED_LOGGED
         .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
@@ -446,6 +577,39 @@ fn log_pointer_moved_once(state: &AppState) {
             state.cursor_x, state.cursor_y
         ));
     }
+}
+
+fn log_cursor_pipeline_sample(
+    phase: &str,
+    state: &AppState,
+    update: &VisualUpdate,
+    deferred_rects: usize,
+    presented_cursor_x: u32,
+    presented_cursor_y: u32,
+    cursor_mismatch: bool,
+    rendered: bool,
+) {
+    if !cursor_mismatch && update.is_empty() {
+        return;
+    }
+    let index = CURSOR_PIPELINE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if index >= MAX_CURSOR_PIPELINE_LOGS {
+        return;
+    }
+    diag_line(format!(
+        "uiserver: cursor pipeline phase={} rendered={} cursor={},{} presented={},{} mismatch={} full={} rects={} deferred_rects={} update_empty={}",
+        phase,
+        rendered,
+        state.cursor_x,
+        state.cursor_y,
+        presented_cursor_x,
+        presented_cursor_y,
+        cursor_mismatch,
+        update.needs_full_redraw,
+        update.partial_rects().len(),
+        deferred_rects,
+        update.is_empty(),
+    ));
 }
 
 fn log_slow_loop_iteration(
@@ -563,20 +727,24 @@ fn run() -> Result<(), i32> {
     log_boot_stage(boot_started, "post_present_init");
     let launcher_programs = start_launcher_program_loader();
     let console_refreshes = start_console_refresh_worker();
-    let mut events = [InputEvent::default(); INPUT_EVENT_BATCH];
+    let input_events = input_loop::start_input_reader(std::mem::take(&mut state.input_fds));
     let mut next_runtime_poll = Instant::now();
     let mut next_console_poll = Instant::now() + CONSOLE_POLL_SLEEP;
     let mut next_cursor_blink = Instant::now() + CURSOR_BLINK_INTERVAL;
     let mut next_cursor_motion_settle = Instant::now() + CURSOR_MOTION_SETTLE_INTERVAL;
-    let mut next_loop_summary = Instant::now() + Duration::from_secs(1);
+    let mut next_loop_summary = Instant::now() + UI_HEARTBEAT_INTERVAL;
     let mut next_wayland_backlog_service = Instant::now();
     let mut loop_count = 0_u64;
+    let mut total_loop_count = 0_u64;
     let mut frames_rendered_window = 0_u64;
     let mut cursor_moves_window = 0_u64;
+    let watchdog = UiLoopWatchdog::start(boot_started);
 
     sys::debug_line("uiserver: main loop entered");
     'main_loop: loop {
         loop_count = loop_count.saturating_add(1);
+        total_loop_count = total_loop_count.saturating_add(1);
+        watchdog.begin_loop(total_loop_count);
         let iteration_started = Instant::now();
         let mut phase_timings = LoopPhaseTimings::default();
 
@@ -608,8 +776,17 @@ fn run() -> Result<(), i32> {
         }
 
         let input_started = Instant::now();
-        let input =
-            input_loop::process_pending_input(&mut state, wayland.as_mut(), &runtime, &mut events)?;
+        watchdog.enter(UI_PHASE_INPUT);
+        let input = phase_result(
+            "input",
+            input_loop::process_pending_input(
+                &mut state,
+                wayland.as_mut(),
+                &runtime,
+                &input_events,
+            ),
+        )?;
+        watchdog.leave();
         pending_update.absorb(input.visual_update);
         phase_timings.input = input_started.elapsed();
 
@@ -620,9 +797,24 @@ fn run() -> Result<(), i32> {
             presented_cursor_x,
             presented_cursor_y,
         );
-        let rendered_input_update = match present_drawable_update(&mut state, &drawable_update)? {
+        log_cursor_pipeline_sample(
+            "input-present-ready",
+            &state,
+            &drawable_update,
+            0,
+            presented_cursor_x,
+            presented_cursor_y,
+            state.cursor_x != presented_cursor_x || state.cursor_y != presented_cursor_y,
+            false,
+        );
+        watchdog.enter(UI_PHASE_INPUT_PRESENT);
+        let rendered_input_update = match phase_result(
+            "input-present",
+            present_drawable_update(&mut state, &drawable_update),
+        )? {
             PresentUpdateResult::Rendered { deferred_update } => {
                 commit_rendered_update(
+                    "input-present",
                     &state,
                     &mut wayland,
                     &mut pending_update,
@@ -635,11 +827,13 @@ fn run() -> Result<(), i32> {
                 true
             }
             PresentUpdateResult::StaleSurface => {
+                watchdog.leave();
                 pending_update.request_full();
                 continue 'main_loop;
             }
             PresentUpdateResult::Idle => false,
         };
+        watchdog.leave();
         phase_timings.input_present = input_present_started.elapsed();
         if rendered_input_update
             && input.backlog_remaining
@@ -662,12 +856,16 @@ fn run() -> Result<(), i32> {
         let now = wayland_started;
         let mut wayland_callback_only = false;
         let service_wayland = !input.backlog_remaining || now >= next_wayland_backlog_service;
+        watchdog.enter(UI_PHASE_WAYLAND);
         if let Some(compositor) = wayland.as_mut() {
             if service_wayland {
                 if compositor.tick() {
                     let wayland_dirty = state.sync_wayland_windows(compositor.window_snapshots());
                     compositor.clear_window_damage();
-                    let focus_dirty = state.recover_focus_after_wayland_change(Some(compositor))?;
+                    let focus_dirty = phase_result(
+                        "wayland-focus",
+                        state.recover_focus_after_wayland_change(Some(compositor)),
+                    )?;
                     let mut update = VisualUpdate::partial(wayland_dirty);
                     update.add_partial_rect(focus_dirty);
                     pending_update.absorb(update);
@@ -683,13 +881,18 @@ fn run() -> Result<(), i32> {
                 compositor.flush_clients();
             }
         }
+        watchdog.leave();
         phase_timings.wayland = wayland_started.elapsed();
 
         let runtime_phase_started = Instant::now();
         let now = runtime_phase_started;
+        watchdog.enter(UI_PHASE_RUNTIME);
         if now >= next_runtime_poll {
             let refresh_started = Instant::now();
-            let runtime_changed = refresh_runtime_state(&runtime_sync, &mut runtime_state)?;
+            let runtime_changed = phase_result(
+                "runtime-refresh",
+                refresh_runtime_state(&runtime_sync, &mut runtime_state),
+            )?;
             let apply_update = state.apply_runtime_state(&mut runtime_state);
             let apply_changed = !apply_update.is_empty();
             let refresh_elapsed = refresh_started.elapsed();
@@ -700,15 +903,20 @@ fn run() -> Result<(), i32> {
             next_runtime_poll = now + RUNTIME_POLL_SLEEP;
             pending_update.absorb(apply_update);
         }
+        watchdog.leave();
         phase_timings.runtime = runtime_phase_started.elapsed();
 
         let console_phase_started = Instant::now();
         let now = console_phase_started;
+        watchdog.enter(UI_PHASE_CONSOLE);
         if now >= next_console_poll {
             let refresh_started = Instant::now();
             let mut console_update = VisualUpdate::default();
             while let Ok(refresh) = console_refreshes.try_recv() {
-                console_update.absorb(state.apply_console_refresh(refresh)?);
+                console_update.absorb(phase_result(
+                    "console-refresh",
+                    state.apply_console_refresh(refresh),
+                )?);
             }
             let changed = !console_update.is_empty();
             pending_update.absorb(console_update);
@@ -719,6 +927,7 @@ fn run() -> Result<(), i32> {
             }
             next_console_poll = now + CONSOLE_POLL_SLEEP;
         }
+        watchdog.leave();
         phase_timings.console = console_phase_started.elapsed();
 
         let cursor_phase_started = Instant::now();
@@ -745,9 +954,11 @@ fn run() -> Result<(), i32> {
 
         let now = Instant::now();
         if now >= next_loop_summary {
+            let input_reader = input_events.snapshot();
             diag_line(format!(
-                "uiserver: heartbeat loops={} frames={} cursor_moves={} cursor={},{} presented_cursor={},{} pending_update={} backlog={} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
+                "uiserver: update tick loops={} total_loops={} frames={} cursor_moves={} cursor={},{} presented_cursor={},{} pending_update={} backlog={} input_read_active={} input_read_ms={} input_reads={}/{} input_events={} input_drops={} input_slow={} input_errors={} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
                 loop_count,
+                total_loop_count,
                 frames_rendered_window,
                 cursor_moves_window,
                 state.cursor_x,
@@ -756,20 +967,43 @@ fn run() -> Result<(), i32> {
                 presented_cursor_y,
                 !drawable_update.is_empty(),
                 input.backlog_remaining,
+                input_reader.read_active,
+                input_reader.read_elapsed_ms,
+                input_reader.completed_reads,
+                input_reader.read_attempts,
+                input_reader.delivered_events,
+                input_reader.queue_drops,
+                input_reader.slow_reads,
+                input_reader.errors,
                 state.console_windows.len(),
                 state.wayland_windows.len(),
                 state.focused_session_handle,
                 state.focused_wayland_surface_id,
             ));
-            next_loop_summary = now + Duration::from_secs(1);
+            next_loop_summary = now + UI_HEARTBEAT_INTERVAL;
             loop_count = 0;
             frames_rendered_window = 0;
             cursor_moves_window = 0;
         }
         let main_present_started = Instant::now();
-        let rendered = match present_drawable_update(&mut state, &drawable_update)? {
+        log_cursor_pipeline_sample(
+            "main-present-ready",
+            &state,
+            &drawable_update,
+            0,
+            presented_cursor_x,
+            presented_cursor_y,
+            state.cursor_x != presented_cursor_x || state.cursor_y != presented_cursor_y,
+            false,
+        );
+        watchdog.enter(UI_PHASE_MAIN_PRESENT);
+        let rendered = match phase_result(
+            "main-present",
+            present_drawable_update(&mut state, &drawable_update),
+        )? {
             PresentUpdateResult::Rendered { deferred_update } => {
                 commit_rendered_update(
+                    "main-present",
                     &state,
                     &mut wayland,
                     &mut pending_update,
@@ -782,11 +1016,13 @@ fn run() -> Result<(), i32> {
                 true
             }
             PresentUpdateResult::StaleSurface => {
+                watchdog.leave();
                 pending_update.request_full();
                 continue 'main_loop;
             }
             PresentUpdateResult::Idle => false,
         };
+        watchdog.leave();
 
         if !rendered && wayland_callback_only {
             if let Some(compositor) = wayland.as_mut() {

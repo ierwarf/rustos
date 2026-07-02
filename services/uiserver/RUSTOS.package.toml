@@ -18,7 +18,6 @@ priority = -500
 
 [[desktop.entries]]
 display_name = "UI Server"
-weight_micros = 1000
+weight_micros = 2000
 logical_admin = false
 console_hosted = false
-env = ["RUSTOS_UI_PROFILE=1"]

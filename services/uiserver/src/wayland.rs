@@ -30,8 +30,8 @@ use crate::layout::{
     WINDOW_BORDER, WINDOW_TITLE_HEIGHT,
 };
 use crate::sys::{
-    diag_line, map_shared_fd_readable, InputEvent, SharedFdMapping, INPUT_ACTION_PRESSED,
-    INPUT_ACTION_RELEASED, INPUT_ACTION_REPEATED, INPUT_KIND_KEYBOARD,
+    diag_line, map_shared_fd_readable, ui_profile_enabled, InputEvent, SharedFdMapping,
+    INPUT_ACTION_PRESSED, INPUT_ACTION_RELEASED, INPUT_ACTION_REPEATED, INPUT_KIND_KEYBOARD,
 };
 
 const WAYLAND_SOCKET_NAME: &str = "wayland-0";
@@ -186,7 +186,8 @@ impl WaylandCompositor {
             {
                 Ok(dispatched) => {
                     self.clients.push(client_id);
-                    if dispatched > 0
+                    if ui_profile_enabled()
+                        && dispatched > 0
                         && WAYLAND_DISPATCH_LOG_COUNT.fetch_add(1, Ordering::Relaxed)
                             < MAX_WAYLAND_DISPATCH_LOGS
                     {

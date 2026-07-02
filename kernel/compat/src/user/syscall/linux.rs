@@ -457,7 +457,8 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         linux_abi::SYS_SETSID => {
             syscall_linux_syscalld_u64_getter(SYSCALL_OFFLOAD_OP_LINUX_SETSID, 0)
         }
-        linux_abi::SYS_EXIT | linux_abi::SYS_EXIT_GROUP => syscall_process_exit(frame.rdi),
+        linux_abi::SYS_EXIT => syscall_process_exit(frame.rdi, false),
+        linux_abi::SYS_EXIT_GROUP => syscall_process_exit(frame.rdi, true),
         _ => linux_errno(LINUX_ENOSYS),
     };
 
@@ -467,17 +468,20 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
     result
 }
 
-fn syscall_process_exit(status: u64) -> u64 {
+fn syscall_process_exit(status: u64, exit_group: bool) -> u64 {
     cleanup_linux_thread_exit();
     if let Some(process_id) = multitask::current_user_process_id() {
-        let wait_status = ((status as i32) & 0xff) << 8;
-        ipc_ops::cleanup_service_endpoints_for_process(process_id);
-        let _ = multitask::note_process_exit_status(process_id, wait_status);
-        let parent = multitask::parent_process_id_of(process_id).unwrap_or(0);
-        if parent != 0 {
-            multitask::queue_linux_signal(parent, parent, linux_abi::SIGCHLD as u64);
+        let last_thread = multitask::current_user_process_thread_count().unwrap_or(1) <= 1;
+        if exit_group || last_thread {
+            let wait_status = ((status as i32) & 0xff) << 8;
+            ipc_ops::cleanup_service_endpoints_for_process(process_id);
+            let _ = multitask::note_process_exit_status(process_id, wait_status);
+            let parent = multitask::parent_process_id_of(process_id).unwrap_or(0);
+            if parent != 0 {
+                multitask::queue_linux_signal(parent, parent, linux_abi::SIGCHLD as u64);
+            }
+            offload_ops::record_process_exit(process_id, parent, wait_status);
         }
-        offload_ops::record_process_exit(process_id, parent, wait_status);
     }
     multitask::exit_current_user_task()
 }

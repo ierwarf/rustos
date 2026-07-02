@@ -18,6 +18,13 @@ use crate::sys::{
 use crate::wayland::WaylandCompositor;
 use runtime_control::RuntimeRunningProgram;
 
+fn is_stale_console_focus_error(errno: i32) -> bool {
+    matches!(
+        errno,
+        crate::sys::ENOENT | crate::sys::EINVAL | crate::sys::ESTALE
+    )
+}
+
 pub(crate) struct ConsoleRefresh {
     state: ConsoleStateInfo,
     sessions: Vec<ConsoleSessionInfo>,
@@ -385,12 +392,7 @@ impl AppState {
                             dirty_rect.union(self.taskbar_slot_rect_for_session(fallback_session));
                     }
                 }
-                Err(err)
-                    if matches!(
-                        err,
-                        crate::sys::ENOENT | crate::sys::EINVAL | crate::sys::ESTALE
-                    ) =>
-                {
+                Err(err) if is_stale_console_focus_error(err) => {
                     let pruned =
                         self.prune_windows(|session_handle| session_handle != fallback_session);
                     if pruned {
@@ -542,12 +544,7 @@ impl AppState {
                 Ok(()) => {
                     self.focused_session_handle = session_handle;
                 }
-                Err(err)
-                    if matches!(
-                        err,
-                        crate::sys::ENOENT | crate::sys::EINVAL | crate::sys::ESTALE
-                    ) =>
-                {
+                Err(err) if is_stale_console_focus_error(err) => {
                     self.prune_windows(|existing_session| existing_session != session_handle);
                     return Ok(dirty_rect
                         .union(self.window_stack_dirty_rect())
@@ -602,17 +599,30 @@ impl AppState {
                 .union(self.taskbar_slot_rect_for_session(previous_focused)));
         };
 
-        if self.focused_session_handle != session_handle {
-            console_set_focus(self.console_fd.as_raw_fd(), session_handle)?;
-            self.focused_session_handle = session_handle;
-        }
-
-        Ok(self
+        let mut dirty_rect = self
             .window_rect_for_session(previous_focused)
             .union(self.window_rect_for_session(session_handle))
             .union(self.taskbar_slot_rect_for_session(previous_focused))
             .union(self.taskbar_slot_rect_for_session(session_handle))
-            .union(self.focused_window_reorder_dirty_rect()))
+            .union(self.focused_window_reorder_dirty_rect());
+        if self.focused_session_handle != session_handle {
+            match console_set_focus(self.console_fd.as_raw_fd(), session_handle) {
+                Ok(()) => {
+                    self.focused_session_handle = session_handle;
+                }
+                Err(err) if is_stale_console_focus_error(err) => {
+                    self.prune_windows(|existing_session| existing_session != session_handle);
+                    self.focused_session_handle = 0;
+                    dirty_rect = dirty_rect
+                        .union(self.window_stack_dirty_rect())
+                        .union(self.taskbar_dirty_rect());
+                    return Ok(dirty_rect);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(dirty_rect)
     }
 
     fn window_rect_for_session(&self, session_handle: ConsoleSessionHandle) -> canvas::Rect {

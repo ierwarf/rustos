@@ -27,16 +27,15 @@ surfaces or sockets they expose.
 | `storaged` | Block device policy and partition mapping over AHCI/NVMe. | Block API + driverd. |
 | `netd` | Network stack policy (virtio-net today, more to follow). | netprobe socket. |
 | `procd` | Process accounting, signal delivery, kernel ↔ runtime bridges for `ps`-style listings. | Pairs with `runtimed`. |
-| `uiserver` | Display surface, compositor, Wayland server, console renderer. Bootstrap-launched with `RUSTOS_UI_PROFILE` applied from the manifest. | `/run/user/1000/wayland-0`, runtime client. |
+| `uiserver` | Display surface, compositor, Wayland server, console renderer. Profiling stays opt-in via `RUSTOS_UI_PROFILE`. | `/run/user/1000/wayland-0`, runtime client. |
 
 ### Bootstrap-launched vs Catalog-launched
 
 The first thing `runtimed` does is **bootstrap_ui_server**: it spawns
 `uiserver` immediately, before the desktop/runtime-launch registries are
-finished loading. That bootstrap path now reads the uiserver desktop entry
-synchronously so manifest env (e.g. `RUSTOS_UI_PROFILE=1`) is honored on the
-very first run, not just after the catalog loader finishes on a worker
-thread.
+finished loading. That bootstrap path reads the uiserver desktop entry
+synchronously so manifest args/env are honored on the very first run, not just
+after the catalog loader finishes on a worker thread.
 
 All other services and apps are launched from the catalog. The catalog is
 loaded asynchronously to keep boot wall-clock short; the OnceLock cache in
@@ -87,15 +86,15 @@ ELF, 그리고 staged registry에 한 줄을 함께 가집니다. 아래 표는 
 | `storaged` | AHCI/NVMe 위 block device policy와 partition mapping. | Block API + driverd. |
 | `netd` | network stack policy (현재 virtio-net). | netprobe socket. |
 | `procd` | process accounting, signal 전달, ps-style listing용 kernel ↔ runtime bridge. | `runtimed`와 쌍. |
-| `uiserver` | display surface, compositor, Wayland server, console renderer. manifest의 `RUSTOS_UI_PROFILE` 가 적용된 채 부트스트랩 launch. | `/run/user/1000/wayland-0`, runtime client. |
+| `uiserver` | display surface, compositor, Wayland server, console renderer. profiling은 `RUSTOS_UI_PROFILE`로 필요할 때만 켭니다. | `/run/user/1000/wayland-0`, runtime client. |
 
 ### 부트스트랩 launch vs catalog launch
 
 `runtimed`가 가장 먼저 하는 일은 **bootstrap_ui_server** 입니다. desktop /
 runtime-launch registry 로딩이 끝나기 전에 `uiserver`를 바로 spawn 합니다.
 이제 이 bootstrap 경로는 uiserver desktop entry를 동기적으로 읽어서
-manifest env (예: `RUSTOS_UI_PROFILE=1`)를 첫 실행부터 반영합니다. catalog
-loader worker 완료를 기다리던 이전 동작에서 회귀입니다.
+manifest args/env를 첫 실행부터 반영합니다. catalog loader worker 완료를
+기다리던 이전 동작에서 회귀입니다.
 
 다른 모든 service와 app은 catalog에서 launch 됩니다. catalog는 boot
 wall-clock을 줄이려고 비동기로 로드되며, `runtime-control`의 OnceLock

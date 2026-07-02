@@ -71,9 +71,8 @@ fn report_aux_transport(result: i8042::AuxTransportInitResult) {
 pub(crate) fn initialize_aux_transport() -> bool {
     if crate::usb::has_runtime_pointer_device() {
         crate::debug::println!(
-            "input: skipping PS/2 aux transport because a USB pointer is already present"
+            "input: USB pointer present; keeping PS/2 aux fallback probe enabled"
         );
-        return false;
     }
 
     match i8042::init_aux_mouse_port() {

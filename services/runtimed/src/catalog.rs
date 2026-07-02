@@ -67,13 +67,6 @@ pub(super) fn load_launch_catalog() -> (BTreeMap<String, ProgramMetadata>, Vec<L
         load_runtime_launch_program_entries(DEFAULT_RUNTIME_LAUNCH_REGISTRY_PATH)
             .unwrap_or_default();
     let registry_elapsed = load_started.elapsed().as_millis();
-    observability_client::info!(
-        "runtimed",
-        service,
-        "launch registry entries={} elapsed_ms={}",
-        registry_entries.len(),
-        registry_elapsed
-    );
     boot_line(
         format!(
             "runtimed: launch registry entries={} elapsed_ms={}",
@@ -96,13 +89,6 @@ pub(super) fn load_launch_catalog() -> (BTreeMap<String, ProgramMetadata>, Vec<L
     let launch_started = Instant::now();
     let launch_entries = load_launch_entries(&programs, autostart_entries);
     let launch_elapsed = launch_started.elapsed().as_millis();
-    observability_client::info!(
-        "runtimed",
-        service,
-        "launch policies={} elapsed_ms={}",
-        launch_entries.len(),
-        launch_elapsed
-    );
     boot_line(
         format!(
             "runtimed: launch policies={} elapsed_ms={}",

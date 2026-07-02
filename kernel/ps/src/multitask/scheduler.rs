@@ -85,23 +85,12 @@ const SCHED_MAX_BURST_NS: u64 = 20_000_000;
 // from preempting steady-state workers like uiserver for too long.
 const SCHED_NEW_TASK_VRUNTIME_PENALTY_NS: u64 = 6_000_000;
 
-/// Load-weight threshold that promotes a user-mode task to the `System`
-/// scheduling class. Currently set above every weight any task uses
-/// (`initd` defaults to 1000us -> ~9544 weight, uiserver tops out near
-/// ~19088), so no task is ever classified as `System` and the strict band
-/// rule effectively collapses to plain CFS fairness across all ready tasks.
-///
-/// Earlier the threshold sat at 4000, which put every initd-spawned service
-/// into the System band. That starved kernel housekeeping (User class,
-/// weight ~952), the RTC heartbeat drain in `housekeeping_once` never ran,
-/// and the `userspace_display=true` marker — the boot probe's primary
-/// readiness signal — was never emitted. Promoting housekeeping to System
-/// to compensate deadlocks IPC (kernel housekeeping never blocks long
-/// enough to release the band). Until those tradeoffs are resolved by
-/// moving heartbeat drain out of housekeeping (or by adding a dedicated
-/// System-class kernel thread for it), keep the strict band rule dormant
-/// by holding the threshold above every observed weight.
-const SYSTEM_CLASS_WEIGHT_THRESHOLD: u32 = u32::MAX;
+/// Load-weight threshold that promotes latency-critical services to the
+/// `System` scheduling class. Effective 1000us service weights map to ~9544
+/// and remain User; 2000us UI/input services map to ~19088 and opt into
+/// System. This keeps the strict band off for normal poll loops while giving
+/// the interactive path a real wakeup-latency contract.
+const SYSTEM_CLASS_WEIGHT_THRESHOLD: u32 = 16_000;
 
 /// Strict priority bands. Higher class (smaller discriminant) is always
 /// scheduled before lower classes while it has any ready task. Within a class
@@ -679,7 +668,7 @@ impl Scheduler {
         // names the suspected cond_resched offender directly.
         let (from_slot, from_task, from_pid) = self.describe_current_task();
         crate::debug::println!(
-            "scheduler ready wait: slot={} task={} pid={} elapsed_ms={} from_slot={} from_task={} from_pid={}",
+            "scheduler long ready wait: slot={} task={} pid={} elapsed_ms={} from_slot={} from_task={} from_pid={}",
             slot,
             task_id.unwrap_or(0),
             process_id,
@@ -715,7 +704,7 @@ impl Scheduler {
         // gap should have been ms, not s).
         let (from_slot, from_task, from_pid) = self.describe_current_task();
         crate::debug::println!(
-            "scheduler blocked wait: slot={} task={} pid={} elapsed_ms={} woken_by_slot={} woken_by_task={} woken_by_pid={}",
+            "scheduler long blocked wait: slot={} task={} pid={} elapsed_ms={} woken_by_slot={} woken_by_task={} woken_by_pid={}",
             slot,
             task_id.unwrap_or(0),
             process_id,
