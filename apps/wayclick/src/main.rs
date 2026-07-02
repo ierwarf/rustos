@@ -1,6 +1,7 @@
 use std::arch::asm;
 use std::ffi::CString;
 use std::io;
+use std::mem::size_of;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::ptr;
@@ -87,19 +88,29 @@ fn connect_wayland_with_retry() -> Result<Connection, ConnectError> {
     ensure_wayland_env_defaults();
     let mut last_error = None;
     for attempt in 0..MAX_CONNECT_ATTEMPTS {
-        match Connection::connect_to_env() {
-            Ok(connection) => return Ok(connection),
-            Err(err) => {
-                if let Ok(connection) = connect_default_wayland_socket() {
+        let socket_path = configured_wayland_socket_path();
+        match connect_wayland_socket(socket_path.as_str()) {
+            Ok(connection) => {
+                raw_stderr_line(&format!("wayclick: connected path={socket_path}"));
+                return Ok(connection);
+            }
+            Err(socket_errno) => match Connection::connect_to_env() {
+                Ok(connection) => {
+                    raw_stderr_line("wayclick: connected via env");
                     return Ok(connection);
                 }
-                if attempt + 1 == MAX_CONNECT_ATTEMPTS {
-                    log_default_wayland_socket_error();
-                    return Err(err);
+                Err(err) => {
+                    if attempt + 1 == MAX_CONNECT_ATTEMPTS {
+                        raw_stderr_line(&format!(
+                            "wayclick: default wayland socket connect path={} errno={socket_errno}",
+                            socket_path
+                        ));
+                        return Err(err);
+                    }
+                    last_error = Some(err);
+                    thread::sleep(Duration::from_millis(CONNECT_RETRY_DELAY_MILLIS));
                 }
-                last_error = Some(err);
-                thread::sleep(Duration::from_millis(CONNECT_RETRY_DELAY_MILLIS));
-            }
+            },
         }
     }
 
@@ -115,23 +126,71 @@ fn ensure_wayland_env_defaults() {
     }
 }
 
-fn connect_default_wayland_socket() -> Result<Connection, ConnectError> {
-    let stream = UnixStream::connect(default_wayland_socket_path())
-        .map_err(|_| ConnectError::NoCompositor)?;
-    Connection::from_socket(stream)
+fn connect_wayland_socket(path: &str) -> Result<Connection, i32> {
+    let stream = connect_unix_stream_nonblocking(path)?;
+    Connection::from_socket(stream).map_err(|_| libc::EPROTO)
 }
 
-fn log_default_wayland_socket_error() {
-    if let Err(err) = UnixStream::connect(default_wayland_socket_path()) {
-        raw_stderr_line(&format!(
-            "wayclick: default wayland socket connect errno={:?}",
-            err.raw_os_error()
-        ));
+fn connect_unix_stream_nonblocking(path: &str) -> Result<UnixStream, i32> {
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(last_errno());
     }
+
+    let path = CString::new(path).map_err(|_| libc::EINVAL)?;
+    let path_bytes = path.as_bytes_with_nul();
+    let mut addr = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    if path_bytes.len() > addr.sun_path.len() {
+        let _ = unsafe { libc::close(fd) };
+        return Err(libc::ENAMETOOLONG);
+    }
+    for (index, byte) in path_bytes.iter().enumerate() {
+        addr.sun_path[index] = *byte as libc::c_char;
+    }
+
+    let rc = unsafe {
+        libc::connect(
+            fd,
+            (&addr as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+            size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        let errno = last_errno();
+        let _ = unsafe { libc::close(fd) };
+        return Err(errno);
+    }
+
+    Ok(unsafe { UnixStream::from_raw_fd(fd) })
 }
 
-fn default_wayland_socket_path() -> String {
-    format!("{DEFAULT_XDG_RUNTIME_DIR}/{DEFAULT_WAYLAND_DISPLAY}")
+fn last_errno() -> i32 {
+    std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EIO)
+}
+
+fn configured_wayland_socket_path() -> String {
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_XDG_RUNTIME_DIR.to_string());
+    let display = std::env::var("WAYLAND_DISPLAY")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_WAYLAND_DISPLAY.to_string());
+    if display.starts_with('/') {
+        display
+    } else {
+        format!("{runtime_dir}/{display}")
+    }
 }
 
 fn main() {
@@ -153,10 +212,22 @@ fn main() {
 
     let mut state = GameState::new();
     while state.running {
-        if let Err(err) = event_queue.blocking_dispatch(&mut state) {
+        match event_queue.dispatch_pending(&mut state) {
+            Ok(dispatched) if dispatched > 0 => continue,
+            Ok(_) => {}
+            Err(err) => {
+                raw_stderr_line(&format!("wayclick: dispatch failed: {err:?}"));
+                break;
+            }
+        }
+        if let Err(err) = event_queue.flush() {
             raw_stderr_line(&format!("wayclick: dispatch failed: {err:?}"));
             break;
         }
+        if let Some(guard) = event_queue.prepare_read() {
+            let _ = guard.read();
+        }
+        thread::sleep(Duration::from_millis(1));
     }
     raw_stderr_line("wayclick: main exit");
 }

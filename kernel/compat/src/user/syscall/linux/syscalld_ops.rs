@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: syscalld should own cold Linux syscall
+// policy, uname/personality/time/random decisions, and service offload replies.
+// Ring0 keeps user-copy and fallback syscall substrate.
 use super::*;
 
 pub(super) fn syscall_linux_syscalld_uname(buf_ptr: u64) -> u64 {
@@ -390,3 +393,4 @@ pub(super) fn read_unaligned<T: Copy>(bytes: &[u8]) -> T {
     assert!(bytes.len() >= size_of::<T>());
     unsafe { bytes.as_ptr().cast::<T>().read_unaligned() }
 }
+// RING3-MIGRATION-REFERENCE END: syscalld-owned Linux syscall policy.

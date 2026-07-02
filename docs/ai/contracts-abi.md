@@ -8,7 +8,8 @@ IPC service IDs, broker syscalls, handle transfer, and service routing. For pack
 - Kernel re-export: `kernel/ps/src/user/{abi,handles,sysops}.rs`. `kernel/compat` re-exports through `kernel_ps::api`; no shadow ABI/handle/user-memory sysop files.
 - Device/console/UI `repr(C)` structs and ioctl numbers must live in `rustos-user-abi`. Services (`uiserver`, `runtimed`) consume that crate — never duplicate request structs or ioctl encoding.
 - Evacuation policy, ring0/ring3 boundary, service ownership: live source
-  `RING3-MIGRATION-REFERENCE` markers plus `cargo xtask ring3-inventory`.
+  `RING3-MIGRATION-REFERENCE` / `RING3-MIGRATION-COMMENTED-OUT` markers plus
+  `cargo xtask ring3-inventory`.
 - `RING3-MIGRATION-REFERENCE` / `RING3-MIGRATION-COMMENTED-OUT` blocks are references for migration, not dormant code to revive. Do not fix breakage by uncommenting them unless the exact lines are the remaining ring0 substrate.
 - For each slice, move policy/state/lifecycle behavior into the owning service, leave only narrow ring0 fd-table/user-copy/page-table/privileged-device substrate, then delete or bypass the reference block.
 
@@ -71,6 +72,7 @@ Kernel data paths (FD/socket/module/process/storage/input) remain narrow gated b
 - Gated `SYS_RUSTOS_STORAGE_LIST_BROKER` (gated by `STORAGE_POLICY`) enumerates kernel-discovered descriptors; no direct generic-app storage probing.
 - `StoragedRequest`/`Response` exposes `STORAGED_OP_ROOT_STATUS`, `STORAGED_OP_BOOT_EXTENT_LOOKUP`.
 - Boot extent leases are storaged policy, sourced from `system/registry/kernel/root-file-extents.tsv` and returned over `STORAGED_OP_BOOT_EXTENT_LOOKUP`. Do not reintroduce generic ring0 boot-extent policy; ring0 storage brokers remain descriptor/block substrate only.
+- AHCI/NVMe post-bootstrap selection, inventory, partition, and extent policy lives in `storaged`/`vfsd`, but physical boot-volume block reads still require kernel io-manager transport substrate. Do not delete AHCI MMIO/DMA command execution until an explicit ring3 service-driver protocol can perform real block I/O before `rootd` and `vfsd` need it.
 
 ## Input Surface (`inputd`)
 
@@ -91,6 +93,9 @@ Kernel data paths (FD/socket/module/process/storage/input) remain narrow gated b
 
 - Gated brokers: `SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER`, `SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER`. Kernel side only loads an explicit module image or probes hardware aliases.
 - Provider-group active state, fallback ordering, virtio display preferred scanout = **driverd state, not a ring0 broker**.
+- xHCI uses the native RustOS host-controller path, gated by `RUSTOS_NATIVE_XHCI` until descriptor enumeration cannot delay display/runtime boot. Linux USB host-controller `.ko` bridges stay out of the default profile; keep load/provider/device/input policy in driverd/devmgrd/inputd, not in the native transfer engine.
+- Native xHCI HID polling is separately gated by `RUSTOS_NATIVE_XHCI_HID_POLL` until the post-configuration polling path is non-blocking under QEMU and real hardware.
+- Post-bootstrap NVMe may use Linux `.ko` bridge manifests only in storage-dev profiles where the compat surface is explicit. Built-in NVMe remains the boot/storage substrate.
 - Early boot may use legacy kernel registry path until driver-service bootstrap owns display/input/network bring-up.
 
 ## Process Loader Surface (`loaderd` + `procd`)

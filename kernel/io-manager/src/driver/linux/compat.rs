@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: Linux .ko compatibility structs are explicit
+// ring0 ABI substrate. Policy belongs in services; layout/shim state stays here
+// for in-kernel Linux module execution.
 use core::ffi::{c_char, c_void};
 
 use driver_abi::{SERIO_ANY, SerioPortInfo};
@@ -525,7 +528,6 @@ pub(crate) struct LinuxCompatUsbDeviceId {
     pub(crate) b_interface_number: u8,
     pub(crate) driver_info: usize,
 }
-
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -1265,3 +1267,4 @@ pub(crate) fn compat_cstr(ptr: *const c_char) -> Option<&'static str> {
 pub(crate) fn serio_any_matches(expected: u8, actual: u8) -> bool {
     expected == SERIO_ANY as u8 || expected == actual
 }
+// RING3-MIGRATION-REFERENCE END: Linux .ko compatibility layout substrate exception.

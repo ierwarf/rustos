@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: vfsd/netd should own Linux VFS and socket
+// namespace policy. Ring0 keeps fd-table mutation, user-copy, handle install,
+// and bootstrap/device bridge substrate.
 use super::*;
 
 pub fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64) -> u64 {
@@ -237,13 +240,14 @@ pub fn syscall_linux_vfs_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
                         Err(errno) => return linux_errno(errno),
                     };
                     if cmd == linux_abi::F_SETFL {
-                        let _ =
-                            multitask::with_current_user_process_state_mut(|_, _, process_state| {
+                        let _ = multitask::with_current_user_process_state_mut(
+                            |_, _, process_state| {
                                 process_state
                                     .handles_mut()
                                     .get_entry_mut(fd)
                                     .map(|entry| entry.set_status_flags(value));
-                            });
+                            },
+                        );
                         return 0;
                     }
                     return value;
@@ -334,21 +338,20 @@ pub fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
     if let Some(mut memfd) = current_memfd_handle(fd) {
         return read_local_vfs_file(user_ptr, user_len, |_, chunk| memfd.read_into(chunk));
     }
-    if let Some(inputd_access) = current_input_device_access(fd) {
-        return read_input_device_via_inputd(fd, user_ptr, user_len, inputd_access);
+    if let Some((inputd_access, status_flags)) = current_input_device_access(fd) {
+        return read_input_device_via_inputd(fd, user_ptr, user_len, inputd_access, status_flags);
     }
     let Some(remote) = current_remote_vfs_handle(fd) else {
         return linux_errno(LINUX_EBADF);
     };
-    if remote.kind() == multitask::RemoteVfsHandleKind::Device
-        && matches!(remote.path().as_str(), "/dev/input0" | "/dev/input/event0")
-    {
+    if matches!(remote.path().as_str(), "/dev/input0" | "/dev/input/event0") {
         let access = if remote.path().as_str() == "/dev/input/event0" {
             INPUTD_ACCESS_EVDEV
         } else {
             INPUTD_ACCESS_NATIVE
         };
-        return read_input_device_via_inputd(fd, user_ptr, user_len, access);
+        let status_flags = current_fd_status_flags(fd).unwrap_or(0);
+        return read_input_device_via_inputd(fd, user_ptr, user_len, access, status_flags);
     }
     read_remote_vfs(fd, remote.remote_id(), user_ptr, user_len, None)
 }
@@ -452,7 +455,7 @@ pub fn syscall_linux_vfs_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
                         linux_errno(errno)
                     } else {
                         written as u64
-                    }
+                    };
                 }
             };
             if count == 0 {
@@ -626,7 +629,7 @@ fn writev_via_write(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
                     linux_errno(address_space_error_to_linux_errno(err))
                 } else {
                     total
-                }
+                };
             }
         };
         let mut written_for_iov = 0_u64;
@@ -766,3 +769,4 @@ fn read_socket_writev_payload(iov_ptr: u64, iovcnt: u64) -> Result<Vec<u8>, i64>
     }
     Ok(payload)
 }
+// RING3-MIGRATION-REFERENCE END: vfsd/netd-owned VFS and socket syscall policy.

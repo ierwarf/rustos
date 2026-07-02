@@ -1,3 +1,5 @@
+// RING3-MIGRATION-REFERENCE START: inputd should own pointer delivery policy.
+// Ring0 keeps driver callback ingress into the bounded input queue.
 #[cfg(not(test))]
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::Ordering;
@@ -71,3 +73,4 @@ mod tests {
         assert_eq!(ingress[0].pointer_packet.dy, -3);
     }
 }
+// RING3-MIGRATION-REFERENCE END: inputd-owned pointer delivery policy.

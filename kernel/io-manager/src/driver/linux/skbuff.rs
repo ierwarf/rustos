@@ -1,3 +1,5 @@
+// RING3-MIGRATION-REFERENCE START: Linux .ko skbuff shims are explicit ring0
+// compatibility substrate. Network policy belongs in netd.
 use core::ffi::c_void;
 use core::ptr;
 
@@ -60,3 +62,4 @@ pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
         _ => None,
     }
 }
+// RING3-MIGRATION-REFERENCE END: Linux .ko skbuff compatibility substrate exception.

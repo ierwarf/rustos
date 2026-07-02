@@ -1,7 +1,7 @@
 id = "hid"
 kind = "bridge-driver"
 execution_domain = "kernel"
-profiles = ["default"]
+profiles = ["input-dev"]
 
 [build]
 builder = "external-copy"

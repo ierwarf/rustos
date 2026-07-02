@@ -12,22 +12,29 @@
 //! [`kernel/compat/src/user/syscall/linux/memory_ops.rs`](../../../../../kernel/compat/src/user/syscall/linux/memory_ops.rs)
 //! handles this even before syscalld is registered.
 
+#[cfg(feature = "global-allocator")]
 use core::alloc::{GlobalAlloc, Layout};
+#[cfg(feature = "global-allocator")]
 use core::cell::UnsafeCell;
+#[cfg(feature = "global-allocator")]
 use core::ptr;
+#[cfg(feature = "global-allocator")]
 use core::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(feature = "global-allocator")]
 use crate::syscall;
 use crate::BootstrapHeap;
 
 const GROW_CHUNK_BYTES: usize = 1 * 1024 * 1024;
 
+#[cfg(feature = "global-allocator")]
 struct BumpRegion {
     base: usize,
     end: usize,
     cursor: usize,
 }
 
+#[cfg(feature = "global-allocator")]
 impl BumpRegion {
     const EMPTY: Self = Self {
         base: 0,
@@ -36,13 +43,16 @@ impl BumpRegion {
     };
 }
 
+#[cfg(feature = "global-allocator")]
 struct BumpAllocator {
     region: UnsafeCell<BumpRegion>,
     locked: AtomicBool,
 }
 
+#[cfg(feature = "global-allocator")]
 unsafe impl Sync for BumpAllocator {}
 
+#[cfg(feature = "global-allocator")]
 impl BumpAllocator {
     const fn new() -> Self {
         Self {
@@ -67,6 +77,7 @@ impl BumpAllocator {
     }
 }
 
+#[cfg(feature = "global-allocator")]
 unsafe impl GlobalAlloc for BumpAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let region_ptr = self.lock();
@@ -118,17 +129,20 @@ unsafe impl GlobalAlloc for BumpAllocator {
     }
 }
 
+#[cfg(feature = "global-allocator")]
 fn grow_chunk_bytes(min_required: usize) -> usize {
     let rounded = (min_required + 0xfff) & !0xfff;
     rounded.max(GROW_CHUNK_BYTES)
 }
 
+#[cfg(feature = "global-allocator")]
 #[global_allocator]
 static ALLOC: BumpAllocator = BumpAllocator::new();
 
 /// Install the kernel-supplied bootstrap heap as the initial bump region.
 ///
 /// Safe to call exactly once at process start before any allocation occurs.
+#[cfg(feature = "global-allocator")]
 pub(crate) unsafe fn init(heap: BootstrapHeap) {
     if heap.base == 0 || heap.len == 0 {
         return;
@@ -138,3 +152,6 @@ pub(crate) unsafe fn init(heap: BootstrapHeap) {
     region.end = heap.base + heap.len;
     region.cursor = heap.base;
 }
+
+#[cfg(not(feature = "global-allocator"))]
+pub(crate) unsafe fn init(_heap: BootstrapHeap) {}

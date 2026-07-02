@@ -1,10 +1,13 @@
+// RING3-MIGRATION-REFERENCE START: vfsd/storaged should own boot-info and
+// boot-block read policy. Ring0 keeps a gated physical block broker because
+// early boot-volume reads require privileged storage substrate.
 use super::*;
 
 use alloc::vec::Vec;
 use kernel_io_manager::api::block as block_api;
 use rustos_user_abi::syscall::{
-    RustosBlockBrokerArgs, BLOCK_BROKER_ABI_VERSION, BLOCK_BROKER_MAX_IO_BYTES,
-    BLOCK_BROKER_OP_BOOT_INFO, BLOCK_BROKER_OP_BOOT_READ, IPC_SERVICE_CAP_VFS_POLICY,
+    BLOCK_BROKER_ABI_VERSION, BLOCK_BROKER_MAX_IO_BYTES, BLOCK_BROKER_OP_BOOT_INFO,
+    BLOCK_BROKER_OP_BOOT_READ, IPC_SERVICE_CAP_VFS_POLICY, RustosBlockBrokerArgs,
 };
 
 pub(super) fn syscall_linux_rustos_block_broker(args_ptr: u64) -> u64 {
@@ -110,3 +113,4 @@ fn storage_error_to_linux_errno(err: storage_core::StorageError) -> i64 {
         | storage_core::StorageError::DeviceFault => LINUX_EIO,
     }
 }
+// RING3-MIGRATION-REFERENCE END: vfsd/storaged-owned boot block broker policy.

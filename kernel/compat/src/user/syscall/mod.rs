@@ -1,3 +1,5 @@
+// RING3-MIGRATION-REFERENCE START: syscalld should own syscall policy. Ring0
+// keeps architectural syscall entry/return validation substrate.
 use core::arch::global_asm;
 use x86_64::VirtAddr;
 use x86_64::registers::control::{Efer, EferFlags};
@@ -386,3 +388,4 @@ mod tests {
         assert!(syscall_return_contract(&frame).is_none());
     }
 }
+// RING3-MIGRATION-REFERENCE END: syscalld-owned syscall entry policy.

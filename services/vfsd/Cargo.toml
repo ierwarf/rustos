@@ -3,11 +3,12 @@ name = "vfsd"
 version = "0.1.0"
 edition = "2021"
 publish = false
+build = "build.rs"
 
 [dependencies]
 fatfs = { git = "https://github.com/rafalh/rust-fatfs", default-features = false, features = ["alloc", "lfn"] }
 rustos-svc-runtime = { path = "../../libs/rustos-svc-runtime" }
-rustos-user-abi = { path = "../../libs/rustos-user-abi" }
+rustos-user-abi = { path = "../../libs/rustos-user-abi", features = ["linux-compat-state"] }
 storage-core = { path = "../../libs/storage-core" }
 storage-fat = { path = "../../libs/storage-fat" }
 

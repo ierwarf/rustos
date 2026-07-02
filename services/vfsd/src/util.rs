@@ -5,48 +5,57 @@ use alloc::vec::Vec;
 use core::mem::size_of;
 
 use rustos_user_abi::syscall::{
-    LINUX_STAT_SIZE, LINUX_STATX_SIZE, VFS_IPC_PATH_CAPACITY, VfsIpcRequest, VfsIpcResponse,
+    VfsIpcRequest, VfsIpcResponse, LINUX_STATX_SIZE, LINUX_STAT_SIZE, VFS_IPC_PATH_CAPACITY,
 };
 
+use super::linux_types::{LinuxStat, LinuxStatx, LinuxSyscallOffloadResponse};
 use super::{DirEntry, Metadata, RemoteKind};
 use super::{
-    AT_FDCWD_U32, AT_FDCWD_U64, BOOT_DIRECTORY_MODE_BITS, BOOT_FILE_MODE_BITS,
-    DEFAULT_BLOCK_SIZE, DEVICE_FILE_MODE_BITS, DT_CHR, DT_DIR, DT_REG, EINVAL, EROFS,
+    AT_FDCWD_U32, AT_FDCWD_U64, BOOT_DIRECTORY_MODE_BITS, BOOT_FILE_MODE_BITS, DEFAULT_BLOCK_SIZE,
+    DEVICE_FILE_MODE_BITS, DT_CHR, DT_DIR, DT_REG, EINVAL, EROFS,
 };
-use super::linux_types::{LinuxStat, LinuxStatx, LinuxSyscallOffloadResponse};
-use storage_fat::FatError;
 use storage_core::StorageError;
+use storage_fat::FatError;
 
 pub(super) fn normalize_absolute_path(base_path: &str, path: &str) -> Result<String, i32> {
-    let mut components: Vec<&str> = Vec::new();
+    let capacity = base_path
+        .len()
+        .saturating_add(path.len())
+        .saturating_add(1)
+        .min(VFS_IPC_PATH_CAPACITY + 1);
+    let mut normalized = String::with_capacity(capacity);
+    normalized.push('/');
     if !path.starts_with('/') {
         for component in base_path.split('/') {
-            if !component.is_empty() {
-                components.push(component);
-            }
+            normalize_component(&mut normalized, component);
         }
     }
     for component in path.split('/') {
-        if component.is_empty() || component == "." {
-            continue;
-        }
-        if component == ".." {
-            components.pop();
-            continue;
-        }
-        components.push(component);
-    }
-    let mut normalized = String::from("/");
-    for component in components {
-        if normalized.len() > 1 {
-            normalized.push('/');
-        }
-        normalized.push_str(component);
+        normalize_component(&mut normalized, component);
     }
     if normalized.len() > VFS_IPC_PATH_CAPACITY {
         return Err(EINVAL);
     }
     Ok(normalized)
+}
+
+fn normalize_component(normalized: &mut String, component: &str) {
+    if component.is_empty() || component == "." {
+        return;
+    }
+    if component == ".." {
+        if normalized.len() <= 1 {
+            return;
+        }
+        if let Some(index) = normalized.rfind('/') {
+            normalized.truncate(index.max(1));
+        }
+        return;
+    }
+    if normalized.len() > 1 {
+        normalized.push('/');
+    }
+    normalized.push_str(component);
 }
 
 pub(super) fn is_at_fdcwd(dirfd: u64) -> bool {

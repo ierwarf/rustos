@@ -1,6 +1,8 @@
+// RING3-MIGRATION-REFERENCE START: rootd/loaderd/procd/vfsd should own direct
+// service-call routing policy. Ring0 keeps IPC call framing and user-copy
+// substrate.
 use super::*;
 use alloc::string::String;
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 const EARLY_SERVICE_CALL_SAMPLES: usize = 6;
@@ -215,19 +217,6 @@ fn file_sysop_error_to_linux_errno(error: crate::user::sysops::file::FileSysopEr
     }
 }
 
-fn device_error_to_linux_errno(error: kernel_io_manager::api::device::DeviceError) -> i64 {
-    match error {
-        kernel_io_manager::api::device::DeviceError::AddressSpace(err) => {
-            address_space_error_to_linux_errno(err)
-        }
-        kernel_io_manager::api::device::DeviceError::DisplayUnavailable => LINUX_ENODEV,
-        kernel_io_manager::api::device::DeviceError::InvalidArgument => LINUX_EINVAL,
-        kernel_io_manager::api::device::DeviceError::NotFound => LINUX_ENOENT,
-        kernel_io_manager::api::device::DeviceError::StaleSurface => LINUX_EAGAIN,
-        kernel_io_manager::api::device::DeviceError::Unsupported => LINUX_ENOSYS,
-    }
-}
-
 pub fn procd_fork(
     frame: &SyscallFrame,
     clone_flags: u64,
@@ -403,34 +392,6 @@ pub fn call_vfs_ipc_request(request: &VfsIpcRequest) -> Result<VfsIpcResponse, i
     Ok(response)
 }
 
-pub fn call_inputd_ipc_request(request: &InputdIpcRequest) -> Result<InputdIpcResponse, i64> {
-    let start_ticks = crate::arch::rtc::ticks();
-    let response = ipc_ops::call_service_endpoint(IPC_SERVICE_INPUTD, as_bytes(request))?;
-    log_slow_service_call(
-        "inputd",
-        request.op,
-        ticks_elapsed_ms(start_ticks, crate::arch::rtc::ticks()),
-        request.pid,
-        request.tid,
-        response.len() as i64,
-        None,
-    );
-    if response.len() != size_of::<InputdIpcResponse>() {
-        return Err(LINUX_EINVAL);
-    }
-    let response = read_unaligned::<InputdIpcResponse>(response.as_slice());
-    if response.version != INPUTD_IPC_ABI_VERSION
-        || response.op != request.op
-        || response.flags != 0
-    {
-        return Err(LINUX_EINVAL);
-    }
-    if response.status != 0 {
-        return Err(response.status.unsigned_abs() as i64);
-    }
-    Ok(response)
-}
-
 pub fn is_devmgrd_open_path(path: &str) -> bool {
     matches!(
         path,
@@ -438,17 +399,26 @@ pub fn is_devmgrd_open_path(path: &str) -> bool {
     )
 }
 
-pub fn current_input_device_access(fd: u64) -> Option<u16> {
+pub fn current_input_device_access(fd: u64) -> Option<(u16, u64)> {
     multitask::with_current_user_process_state(|_, _, process_state| {
-        let handle = process_state.handles().get(fd)?;
+        let entry = process_state.handles().get_entry(fd)?;
+        let handle = entry.handle();
         let device = handle.device_handle()?;
         if device.device_id() != kernel_object::api::device::DeviceId::Input {
             return None;
         }
-        match device.access_kind() {
-            kernel_object::api::device::DeviceAccessKind::Native => Some(INPUTD_ACCESS_NATIVE),
-            kernel_object::api::device::DeviceAccessKind::Evdev => Some(INPUTD_ACCESS_EVDEV),
-        }
+        let access = match device.access_kind() {
+            kernel_object::api::device::DeviceAccessKind::Native => INPUTD_ACCESS_NATIVE,
+            kernel_object::api::device::DeviceAccessKind::Evdev => INPUTD_ACCESS_EVDEV,
+        };
+        Some((access, entry.status_flags()))
+    })
+    .flatten()
+}
+
+pub fn current_fd_status_flags(fd: u64) -> Option<u64> {
+    multitask::with_current_user_process_state(|_, _, process_state| {
+        Some(process_state.handles().get_entry(fd)?.status_flags())
     })
     .flatten()
 }
@@ -458,6 +428,7 @@ pub fn read_input_device_via_inputd(
     user_ptr: u64,
     user_len: u64,
     inputd_access: u16,
+    status_flags: u64,
 ) -> u64 {
     let Ok(user_len) = usize::try_from(user_len) else {
         return linux_errno(LINUX_EINVAL);
@@ -468,6 +439,7 @@ pub fn read_input_device_via_inputd(
     let mut request = InputdIpcRequest {
         version: INPUTD_IPC_ABI_VERSION,
         op: INPUTD_IPC_OP_READ,
+        flags: ((status_flags & linux_abi::O_NONBLOCK != 0) as u32) * INPUTD_READ_FLAG_NONBLOCK,
         fd,
         access: inputd_access,
         requested_len: user_len.min(INPUTD_READ_PAYLOAD_CAPACITY) as u64,
@@ -486,6 +458,9 @@ pub fn read_input_device_via_inputd(
     }
     let read = response.payload_len as usize;
     if read == 0 {
+        if status_flags & linux_abi::O_NONBLOCK != 0 {
+            return linux_errno(LINUX_EAGAIN);
+        }
         return 0;
     }
     if user_ptr.checked_add(read as u64).is_none() {
@@ -1002,44 +977,11 @@ pub fn call_netd_ipc_request(request: &NetdIpcRequest) -> Result<NetdIpcResponse
     Ok(response)
 }
 
-pub fn call_service_offload_request(
-    service_id: u64,
-    request: &LinuxSyscallOffloadRequest,
-) -> Result<LinuxSyscallOffloadResponse, i64> {
-    let start_ticks = crate::arch::rtc::ticks();
-    let response = ipc_ops::call_service_endpoint(service_id, as_bytes(request))?;
-    log_slow_service_call(
-        "offload",
-        request.op,
-        ticks_elapsed_ms(start_ticks, crate::arch::rtc::ticks()),
-        request.pid,
-        request.tid,
-        response.len() as i64,
-        None,
-    );
-    if response.len() != size_of::<LinuxSyscallOffloadResponse>() {
-        return Err(LINUX_EINVAL);
-    }
-    Ok(read_unaligned::<LinuxSyscallOffloadResponse>(
-        response.as_slice(),
-    ))
-}
-
 pub fn ensure_vfs_status(response: &VfsIpcResponse) -> Result<(), i64> {
     if response.status != 0 {
         return Err(response.status.unsigned_abs() as i64);
     }
     Ok(())
-}
-
-pub fn ensure_service_response(response: &LinuxSyscallOffloadResponse, op: u16) -> Result<(), i64> {
-    if response.version != SYSCALL_OFFLOAD_ABI_VERSION
-        || response.op != op
-        || response.reserved0 != 0
-    {
-        return Err(LINUX_EINVAL);
-    }
-    ensure_syscalld_status(response)
 }
 
 fn ticks_elapsed_ms(start_ticks: u64, end_ticks: u64) -> u64 {
@@ -1126,3 +1068,4 @@ pub fn copy_current_user_path(ptr: u64, capacity: usize) -> Result<String, i64> 
     }
     Ok(path)
 }
+// RING3-MIGRATION-REFERENCE END: service-owned direct IPC helper policy.

@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: uiserver should own normal framebuffer damage
+// policy and presentation scheduling. Ring0 keeps the mapped framebuffer memory
+// substrate and boot/display transition backing store.
 use core::convert::Infallible;
 use core::ptr;
 
@@ -878,3 +881,4 @@ mod tests {
         assert!(storage[framebuffer_size..].iter().all(|&byte| byte == 0xa5));
     }
 }
+// RING3-MIGRATION-REFERENCE END: uiserver-owned framebuffer policy.

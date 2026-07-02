@@ -1,3 +1,5 @@
+// RING3-MIGRATION-REFERENCE START: Linux .ko netdev shims are explicit ring0
+// compatibility substrate. Network namespace/policy belongs in netd.
 use core::cell::UnsafeCell;
 use core::ffi::{c_char, c_void};
 use core::ptr;
@@ -279,3 +281,4 @@ fn is_netdev_data_symbol(name: &str) -> bool {
                 | "vmemmap_base"
         )
 }
+// RING3-MIGRATION-REFERENCE END: Linux .ko netdev compatibility substrate exception.

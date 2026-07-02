@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: vfsd should own VFS metadata syscall policy.
+// Ring0 keeps fd-table validation, memfd substrate, current-process user-copy,
+// and bootstrap-only stat materialization.
 use super::*;
 pub fn syscall_linux_vfs_lseek(fd: u64, offset: i64, whence: u64) -> u64 {
     if let Some(mut memfd) = current_memfd_handle(fd) {
@@ -317,14 +320,6 @@ pub fn current_kernel_handle(fd: u64) -> Option<multitask::KernelHandle> {
         process_state.handles().get(fd).cloned()
     })
     .flatten()
-}
-
-pub fn epoll_error_to_linux_errno(err: multitask::EpollError) -> i64 {
-    match err {
-        multitask::EpollError::Busy => LINUX_EEXIST,
-        multitask::EpollError::InvalidArgument => LINUX_EINVAL,
-        multitask::EpollError::NotFound => LINUX_ENOENT,
-    }
 }
 
 pub fn memfd_error_to_linux_errno(err: multitask::MemfdError) -> i64 {
@@ -812,6 +807,7 @@ fn write_current_control_payload(
     control_capacity: u64,
     control: &[u8],
 ) -> Result<(usize, u32), i64> {
+    let control = decode_transfer_control_payload(control)?;
     if control.is_empty() {
         return Ok((0, 0));
     }
@@ -822,7 +818,7 @@ fn write_current_control_payload(
     if capacity < control.len() {
         return Ok((0, linux_abi::MSG_CTRUNC as u32));
     }
-    usermem::write_current_user_bytes(control_ptr, control)
+    usermem::write_current_user_bytes(control_ptr, control.as_slice())
         .map_err(address_space_error_to_linux_errno)?;
     Ok((control.len(), 0))
 }
@@ -838,7 +834,157 @@ fn read_current_control_payload(control_ptr: u64, control_len: u64) -> Result<Ve
     let mut control = alloc::vec![0_u8; control_len];
     usermem::copy_from_current_user_exact(control_ptr, &mut control)
         .map_err(address_space_error_to_linux_errno)?;
-    Ok(control)
+    encode_transfer_control_payload(control.as_slice())
+}
+
+fn encode_transfer_control_payload(control: &[u8]) -> Result<Vec<u8>, i64> {
+    rewrite_scm_rights_control(control, |fd_bytes| {
+        if fd_bytes.len() % core::mem::size_of::<i32>() != 0 {
+            return Err(LINUX_EINVAL);
+        }
+        let mut fds = Vec::with_capacity(fd_bytes.len() / core::mem::size_of::<i32>());
+        for chunk in fd_bytes.chunks_exact(core::mem::size_of::<i32>()) {
+            fds.push(i32::from_ne_bytes(
+                chunk.try_into().map_err(|_| LINUX_EINVAL)?,
+            ));
+        }
+        let descriptors = super::super::ipc_ops::export_current_fds_for_transfer(fds.as_slice())
+            .map_err(|_| LINUX_EBADF)?;
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                descriptors.as_ptr().cast::<u8>(),
+                descriptors.len()
+                    * core::mem::size_of::<kernel_ipc_runtime::api::KernelTransferredHandle>(),
+            )
+        };
+        Ok(bytes.to_vec())
+    })
+}
+
+fn decode_transfer_control_payload(control: &[u8]) -> Result<Vec<u8>, i64> {
+    rewrite_scm_rights_control(control, |descriptor_bytes| {
+        let descriptor_size =
+            core::mem::size_of::<kernel_ipc_runtime::api::KernelTransferredHandle>();
+        if descriptor_size == 0 || descriptor_bytes.len() % descriptor_size != 0 {
+            return Err(LINUX_EINVAL);
+        }
+        let mut descriptors = Vec::with_capacity(descriptor_bytes.len() / descriptor_size);
+        for chunk in descriptor_bytes.chunks_exact(descriptor_size) {
+            descriptors.push(read_transfer_descriptor(chunk)?);
+        }
+        let fds = super::super::ipc_ops::install_transfer_descriptors_for_current_process(
+            descriptors.as_slice(),
+        )?;
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                fds.as_ptr().cast::<u8>(),
+                fds.len() * core::mem::size_of::<i32>(),
+            )
+        };
+        Ok(bytes.to_vec())
+    })
+}
+
+fn rewrite_scm_rights_control<F>(control: &[u8], mut rewrite: F) -> Result<Vec<u8>, i64>
+where
+    F: FnMut(&[u8]) -> Result<Vec<u8>, i64>,
+{
+    let mut out = Vec::with_capacity(control.len());
+    let mut offset = 0usize;
+    while offset + core::mem::size_of::<linux_abi::LinuxCmsghdr>() <= control.len() {
+        let header = read_control_header(&control[offset..])?;
+        let cmsg_len = usize::try_from(header.cmsg_len).map_err(|_| LINUX_EINVAL)?;
+        if cmsg_len < core::mem::size_of::<linux_abi::LinuxCmsghdr>()
+            || offset + cmsg_len > control.len()
+        {
+            return Err(LINUX_EINVAL);
+        }
+        let next = next_control_offset(control.len(), offset, cmsg_len)?;
+        if header.cmsg_level == linux_abi::SOL_SOCKET as u32
+            && header.cmsg_type == linux_abi::SCM_RIGHTS as u32
+        {
+            let data_start = offset + core::mem::size_of::<linux_abi::LinuxCmsghdr>();
+            let rewritten = rewrite(&control[data_start..offset + cmsg_len])?;
+            let new_len = core::mem::size_of::<linux_abi::LinuxCmsghdr>()
+                .checked_add(rewritten.len())
+                .ok_or(LINUX_EINVAL)?;
+            let mut new_header = header;
+            new_header.cmsg_len = new_len as u64;
+            let start = out.len();
+            out.resize(start + cmsg_align(new_len), 0);
+            write_control_header(
+                &mut out[start..start + core::mem::size_of::<linux_abi::LinuxCmsghdr>()],
+                new_header,
+            );
+            out[start + core::mem::size_of::<linux_abi::LinuxCmsghdr>()..start + new_len]
+                .copy_from_slice(rewritten.as_slice());
+        } else {
+            out.extend_from_slice(&control[offset..next]);
+        }
+        offset = next;
+    }
+    if offset != control.len() {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(out)
+}
+
+fn read_control_header(bytes: &[u8]) -> Result<linux_abi::LinuxCmsghdr, i64> {
+    if bytes.len() < core::mem::size_of::<linux_abi::LinuxCmsghdr>() {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(linux_abi::LinuxCmsghdr {
+        cmsg_len: u64::from_ne_bytes(bytes[0..8].try_into().map_err(|_| LINUX_EINVAL)?),
+        cmsg_level: u32::from_ne_bytes(bytes[8..12].try_into().map_err(|_| LINUX_EINVAL)?),
+        cmsg_type: u32::from_ne_bytes(bytes[12..16].try_into().map_err(|_| LINUX_EINVAL)?),
+    })
+}
+
+fn write_control_header(dest: &mut [u8], header: linux_abi::LinuxCmsghdr) {
+    dest[0..8].copy_from_slice(&header.cmsg_len.to_ne_bytes());
+    dest[8..12].copy_from_slice(&header.cmsg_level.to_ne_bytes());
+    dest[12..16].copy_from_slice(&header.cmsg_type.to_ne_bytes());
+}
+
+fn read_transfer_descriptor(
+    bytes: &[u8],
+) -> Result<kernel_ipc_runtime::api::KernelTransferredHandle, i64> {
+    if bytes.len() != core::mem::size_of::<kernel_ipc_runtime::api::KernelTransferredHandle>() {
+        return Err(LINUX_EINVAL);
+    }
+    let mut descriptor =
+        core::mem::MaybeUninit::<kernel_ipc_runtime::api::KernelTransferredHandle>::uninit();
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            descriptor.as_mut_ptr().cast::<u8>(),
+            bytes.len(),
+        );
+        Ok(descriptor.assume_init())
+    }
+}
+
+fn next_control_offset(total_len: usize, offset: usize, cmsg_len: usize) -> Result<usize, i64> {
+    let aligned_next = offset
+        .checked_add(cmsg_align(cmsg_len))
+        .ok_or(LINUX_EINVAL)?;
+    let unaligned_next = offset.checked_add(cmsg_len).ok_or(LINUX_EINVAL)?;
+    let next = if aligned_next <= total_len {
+        aligned_next
+    } else if unaligned_next == total_len {
+        unaligned_next
+    } else {
+        return Err(LINUX_EINVAL);
+    };
+    if next <= offset {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(next)
+}
+
+fn cmsg_align(len: usize) -> usize {
+    let align = core::mem::size_of::<usize>();
+    (len + align - 1) & !(align - 1)
 }
 
 fn write_current_sockaddr_payload(addr_ptr: u64, len_ptr: u64, payload: &[u8]) -> Result<(), i64> {
@@ -880,3 +1026,4 @@ fn write_current_sockopt_payload(
     let len = payload.len() as u32;
     usermem::write_current_user_struct(optlen_ptr, &len).map_err(address_space_error_to_linux_errno)
 }
+// RING3-MIGRATION-REFERENCE END: vfsd-owned VFS metadata syscall policy.

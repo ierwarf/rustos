@@ -16,13 +16,13 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DRIVER_INSTANCE, COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IRQ_ROUTE,
     COMMERCIAL_MAX_SERVICE_DRIVERD_OP_MMIO_LEASE, DRIVER_BUS_PCI, DRIVER_BUS_PLATFORM,
     DRIVER_BUS_SERIO, DRIVER_BUS_USB, DRIVER_BUS_VIRTIO, DRIVER_CLASS_DISPLAY, DRIVER_CLASS_INPUT,
-    DRIVER_CLASS_NETWORK, DRIVER_LOAD_POLICY_DISPLAY_FALLBACK,
-    DRIVER_LOAD_POLICY_DISPLAY_PREFERRED_SCANOUT, DRIVER_LOAD_POLICY_DISPLAY_PRIMARY,
-    IPC_SERVICE_DRIVERD, IPC_SERVICE_SERVICE_DRIVERD, SYSCALL_OFFLOAD_ABI_VERSION,
-    SYSCALL_OFFLOAD_OP_DRIVER_LOAD_POLICY, SYSCALL_OFFLOAD_PATH_CAPACITY, SYS_RUSTOS_DEBUG_PRINT,
-    SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER, SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER,
-    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
-    SYS_RUSTOS_IPC_REPLY,
+    DRIVER_CLASS_NETWORK, DRIVER_CLASS_STORAGE, DRIVER_CLASS_USB,
+    DRIVER_LOAD_POLICY_DISPLAY_FALLBACK, DRIVER_LOAD_POLICY_DISPLAY_PREFERRED_SCANOUT,
+    DRIVER_LOAD_POLICY_DISPLAY_PRIMARY, IPC_SERVICE_DRIVERD, IPC_SERVICE_SERVICE_DRIVERD,
+    SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_DRIVER_LOAD_POLICY,
+    SYSCALL_OFFLOAD_PATH_CAPACITY, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER,
+    SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV,
+    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
 };
 
 const RECV_BACKOFF: Duration = Duration::from_millis(10);
@@ -117,21 +117,52 @@ fn autoload_from_registry() {
         .iter()
         .map(|record| record.name.clone())
         .collect::<BTreeSet<_>>();
+    let mut primary_records = Vec::new();
+    let mut fallback_records = Vec::new();
+    for record in records {
+        if record.fallback_only {
+            fallback_records.push(record);
+        } else {
+            primary_records.push(record);
+        }
+    }
     let mut loaded = BTreeSet::new();
     let mut skipped = BTreeSet::new();
     let mut provider_groups = BTreeSet::new();
-    let mut pending = records;
+    autoload_queue(
+        primary_records,
+        &known_names,
+        &mut loaded,
+        &mut skipped,
+        &mut provider_groups,
+    );
+    autoload_queue(
+        fallback_records,
+        &known_names,
+        &mut loaded,
+        &mut skipped,
+        &mut provider_groups,
+    );
+    debug_line(&format!(
+        "driverd: autoload registry complete loaded={} skipped={} elapsed_ms={}",
+        loaded.len(),
+        skipped.len(),
+        started_at.elapsed().as_millis()
+    ));
+}
+
+fn autoload_queue(
+    mut pending: Vec<DriverRecord>,
+    known_names: &BTreeSet<String>,
+    loaded: &mut BTreeSet<String>,
+    skipped: &mut BTreeSet<String>,
+    provider_groups: &mut BTreeSet<String>,
+) {
     while !pending.is_empty() {
         let mut progress = false;
         let mut deferred = Vec::new();
         for record in pending.into_iter() {
-            match load_record(
-                &record,
-                &known_names,
-                &mut loaded,
-                &mut skipped,
-                &mut provider_groups,
-            ) {
+            match load_record(&record, &known_names, loaded, skipped, provider_groups) {
                 LoadResult::Progress => progress = true,
                 LoadResult::Deferred => deferred.push(record),
             }
@@ -147,12 +178,6 @@ fn autoload_from_registry() {
         }
         pending = deferred;
     }
-    debug_line(&format!(
-        "driverd: autoload registry complete loaded={} skipped={} elapsed_ms={}",
-        loaded.len(),
-        skipped.len(),
-        started_at.elapsed().as_millis()
-    ));
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -190,6 +215,19 @@ fn load_record(
             ));
             debug_line(&format!(
                 "driverd: record skipped name={} reason=dependency skipped elapsed_ms={}",
+                record.name,
+                started_at.elapsed().as_millis()
+            ));
+            return LoadResult::Progress;
+        }
+        if !known_names.contains(dep) {
+            skipped.insert(record.name.clone());
+            debug_line(&format!(
+                "driverd: skipped name={} reason=dependency missing dep={}",
+                record.name, dep
+            ));
+            debug_line(&format!(
+                "driverd: record skipped name={} reason=dependency missing elapsed_ms={}",
                 record.name,
                 started_at.elapsed().as_millis()
             ));
@@ -234,10 +272,10 @@ fn load_record(
         ));
         return LoadResult::Progress;
     }
-    if is_non_ko_virtio_display(record) && !authorize_display_service_driver(record) {
+    if requires_service_driver_authorization(record) && !authorize_service_driver(record) {
         skipped.insert(record.name.clone());
         debug_line(&format!(
-            "driverd: skipped name={} reason=service-driver display lease denied",
+            "driverd: skipped name={} reason=service-driver lease denied",
             record.name
         ));
         return LoadResult::Progress;
@@ -306,19 +344,25 @@ fn aliases_match(record: &DriverRecord) -> bool {
     !saw_alias
 }
 
-fn is_non_ko_virtio_display(record: &DriverRecord) -> bool {
-    record.class == DRIVER_CLASS_DISPLAY
-        && record.bus == DRIVER_BUS_VIRTIO
-        && !record.image_path.ends_with(".ko")
+fn requires_service_driver_authorization(record: &DriverRecord) -> bool {
+    !record.image_path.ends_with(".ko")
+        && matches!(
+            record.class,
+            DRIVER_CLASS_DISPLAY
+                | DRIVER_CLASS_INPUT
+                | DRIVER_CLASS_NETWORK
+                | DRIVER_CLASS_USB
+                | DRIVER_CLASS_STORAGE
+        )
 }
 
-fn authorize_display_service_driver(record: &DriverRecord) -> bool {
+fn authorize_service_driver(record: &DriverRecord) -> bool {
     if record.provider_group.trim().is_empty() || record.fallback_only {
         return false;
     }
     debug_line(&format!(
-        "driverd: service-driver display lease granted name={} group={} bus={}",
-        record.name, record.provider_group, record.bus
+        "driverd: service-driver lease granted name={} group={} class={} bus={}",
+        record.name, record.provider_group, record.class, record.bus
     ));
     true
 }
@@ -349,10 +393,12 @@ fn driver_load_policy(record: &DriverRecord) -> (u64, u32, u32) {
     let mut flags = 0;
     let mut preferred_width = 0;
     let mut preferred_height = 0;
-    if record.class == DRIVER_CLASS_DISPLAY && !record.provider_group.is_empty() {
-        flags |= DRIVER_LOAD_POLICY_DISPLAY_PRIMARY;
-        if record.fallback_only {
-            flags |= DRIVER_LOAD_POLICY_DISPLAY_FALLBACK;
+    if record.class == DRIVER_CLASS_DISPLAY {
+        if !record.provider_group.is_empty() {
+            flags |= DRIVER_LOAD_POLICY_DISPLAY_PRIMARY;
+            if record.fallback_only {
+                flags |= DRIVER_LOAD_POLICY_DISPLAY_FALLBACK;
+            }
         }
         if record.bus == DRIVER_BUS_VIRTIO && !record.fallback_only {
             flags |= DRIVER_LOAD_POLICY_DISPLAY_PREFERRED_SCANOUT;
@@ -441,6 +487,8 @@ fn parse_driver_class(name: &str) -> Option<u32> {
         "display" => Some(DRIVER_CLASS_DISPLAY),
         "input" => Some(DRIVER_CLASS_INPUT),
         "network" => Some(DRIVER_CLASS_NETWORK),
+        "usb" => Some(rustos_user_abi::syscall::DRIVER_CLASS_USB),
+        "storage" => Some(rustos_user_abi::syscall::DRIVER_CLASS_STORAGE),
         _ => None,
     }
 }

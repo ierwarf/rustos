@@ -1,7 +1,7 @@
 use rustos_user_abi::syscall::{
-    SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_STATX, SYSCALL_OFFLOAD_PATH_CAPACITY,
-    SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, VFS_IPC_ABI_VERSION, VFS_IPC_PATH_CAPACITY,
-    VFS_IPC_REQUEST_PAYLOAD_CAPACITY, VfsIpcRequest,
+    VfsIpcRequest, SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_STATX,
+    SYSCALL_OFFLOAD_PATH_CAPACITY, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, VFS_IPC_ABI_VERSION,
+    VFS_IPC_PATH_CAPACITY, VFS_IPC_REQUEST_PAYLOAD_CAPACITY,
 };
 
 use super::EINVAL;
@@ -146,9 +146,7 @@ impl Default for LinuxSyscallOffloadResponse {
     }
 }
 
-pub(crate) fn validate_linux_request(
-    request: &LinuxSyscallOffloadRequest,
-) -> Result<(), i32> {
+pub(crate) fn validate_linux_request(request: &LinuxSyscallOffloadRequest) -> Result<(), i32> {
     if request.version != SYSCALL_OFFLOAD_ABI_VERSION
         || request.reserved0 != 0
         || request.path_len as usize > SYSCALL_OFFLOAD_PATH_CAPACITY

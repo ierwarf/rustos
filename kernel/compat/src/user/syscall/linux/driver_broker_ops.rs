@@ -1,10 +1,13 @@
+// RING3-MIGRATION-REFERENCE START: driverd should own module-load, provider,
+// and alias policy. Ring0 keeps Linux .ko load/probe substrate and gated driver
+// broker entry points.
 use super::*;
 
 use alloc::string::String;
 use rustos_user_abi::syscall::{
-    RustosDriverLoadModuleBrokerArgs, RustosDriverProbeAliasBrokerArgs,
     DRIVER_BROKER_ALIAS_CAPACITY, DRIVER_BROKER_NAME_CAPACITY, DRIVER_BROKER_PATH_CAPACITY,
     DRIVER_LOAD_POLICY_KNOWN_FLAGS, IPC_SERVICE_CAP_DRIVER_POLICY,
+    RustosDriverLoadModuleBrokerArgs, RustosDriverProbeAliasBrokerArgs,
 };
 
 pub(super) fn syscall_linux_rustos_driver_load_module_broker(args_ptr: u64) -> u64 {
@@ -98,3 +101,4 @@ fn read_driver_text(ptr: u64, len: u64, max_len: usize) -> Result<String, i64> {
     }
     String::from_utf8(bytes).map_err(|_| LINUX_EINVAL)
 }
+// RING3-MIGRATION-REFERENCE END: driverd-owned driver broker policy.

@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: sessiond/runtimed should own TTY line
+// discipline, session routing, and console read/write policy. Ring0 keeps
+// bootstrap TTY buffers as temporary substrate.
 use alloc::vec::Vec;
 use nucleus_core::util::ring::RingBuffer;
 
@@ -122,7 +125,6 @@ impl TtyCollection {
             .expect("tty session state")
             .state
     }
-
 }
 
 struct BoundTtySessionState {
@@ -144,7 +146,6 @@ impl TtySessionState {
             input_waiter: None,
         }
     }
-
 }
 
 #[cfg(test)]
@@ -162,3 +163,4 @@ mod tests {
         assert_eq!(&read[..2], b"ab");
     }
 }
+// RING3-MIGRATION-REFERENCE END: sessiond/runtimed-owned TTY policy.

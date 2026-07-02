@@ -1,5 +1,6 @@
 use std::os::fd::AsRawFd;
 use std::string::String;
+use std::thread;
 use std::time::Instant;
 
 use runtime_control::RuntimeClient;
@@ -137,7 +138,7 @@ impl AppState {
         wayland: Option<&mut WaylandCompositor>,
     ) -> Result<VisualUpdate, i32> {
         if let Some(desktop_file_id) = self.launcher_program_under_cursor() {
-            let _ = runtime.request_launch_program_new_session(desktop_file_id.as_str());
+            launch_program_async(desktop_file_id);
             return Ok(VisualUpdate::default());
         }
 
@@ -638,4 +639,12 @@ impl AppState {
             None => VisualUpdate::default(),
         }
     }
+}
+
+fn launch_program_async(desktop_file_id: String) {
+    thread::spawn(move || {
+        if let Ok(runtime) = RuntimeClient::open_default() {
+            let _ = runtime.request_launch_program_new_session(desktop_file_id.as_str());
+        }
+    });
 }

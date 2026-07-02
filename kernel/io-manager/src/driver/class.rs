@@ -23,6 +23,16 @@ const SUPPORTED_CLASS_CORES: &[ClassCoreDescriptor] = &[
         name: "network",
         devnode_namespace: Some("/dev/net"),
     },
+    ClassCoreDescriptor {
+        class: DriverClass::Usb,
+        name: "usb",
+        devnode_namespace: Some("/dev/usb"),
+    },
+    ClassCoreDescriptor {
+        class: DriverClass::Storage,
+        name: "storage",
+        devnode_namespace: Some("/dev/block"),
+    },
 ];
 
 pub(crate) fn descriptor(class: DriverClass) -> Option<&'static ClassCoreDescriptor> {
@@ -42,4 +52,3 @@ pub(crate) fn name(class: DriverClass) -> &'static str {
         .map(|descriptor| descriptor.name)
         .unwrap_or("unknown")
 }
-

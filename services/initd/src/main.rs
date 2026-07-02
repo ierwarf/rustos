@@ -31,12 +31,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(2);
 const RETRY_BACKOFF: Duration = Duration::from_millis(50);
 const DEFAULT_INIT_TASK_WEIGHT_MICROS: u64 = 1_000;
 const DISPLAY_CRITICAL_TASK_WEIGHT_MICROS: u64 = 2_000;
-// Previously 6_000ms — designed to keep inputd/storaged off the spawn
-// path while display/UI came up. With directed-yield IPC the display bring-up
-// no longer starves on round-robin scheduling, so the defer dominates total
-// boot time (~6s of dead air post-runtimed). 750ms keeps a small ordering gap
-// after the UI is reachable without spending the entire boot budget on it.
-const SECONDARY_SERVICE_DEFER_AFTER_RUNTIMED: Duration = Duration::from_millis(750);
+// Keep secondary services on the boot path. Guest Instant can be unavailable
+// during early bring-up, so time-based deferral can leave storaged deferred
+// indefinitely under KVM.
+const SECONDARY_SERVICE_DEFER_AFTER_RUNTIMED: Duration = Duration::ZERO;
 static LOADER_ENDPOINT_CACHE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq)]

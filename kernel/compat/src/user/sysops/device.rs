@@ -1,19 +1,17 @@
-use core::convert::TryFrom;
+// RING3-MIGRATION-REFERENCE START: devmgrd/sessiond should own device sysop
+// policy and right reduction. Ring0 keeps native device operation substrate and
+// current-process user-copy.
 use core::mem::size_of;
 use core::slice;
 
-use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
 
 use crate::io::device::{self as device_ns};
 use crate::memory::paging;
 use crate::multitask;
 use crate::user::handles::{DisplaySurfaceHandle, KernelHandle, RemoteVfsHandleKind};
-use crate::user::linux as linux_abi;
 use crate::user::process_state::UserProcessState;
 use rustos_user_abi::device as device_abi;
-
-const PAGE_SIZE: u64 = 4096;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum DeviceSysopError {
@@ -30,21 +28,6 @@ impl From<paging::AddressSpaceError> for DeviceSysopError {
     fn from(value: paging::AddressSpaceError) -> Self {
         Self::AddressSpace(value)
     }
-}
-
-pub(crate) fn ioctl_current_process_device_handle(
-    device_handle: device_ns::DeviceHandle,
-    request: u64,
-    arg: u64,
-) -> Result<u64, DeviceSysopError> {
-    let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
-        device_ns::ioctl_from_user(device_handle, process_state, request, arg)
-            .map_err(map_device_error)
-    }) else {
-        return Err(DeviceSysopError::Unsupported);
-    };
-
-    result
 }
 
 pub(crate) fn ioctl_process_device_handle(
@@ -234,126 +217,6 @@ fn present_surface(
     }
 }
 
-pub(crate) fn mmap_current_process_handle(
-    fd: u64,
-    user_len: u64,
-    prot: u64,
-    flags: u64,
-    offset: u64,
-) -> Result<u64, DeviceSysopError> {
-    if flags & linux_abi::MAP_SHARED == 0 || flags & linux_abi::MAP_ANONYMOUS != 0 {
-        return Err(DeviceSysopError::InvalidArgument);
-    }
-
-    let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
-        let mut surface = match process_state.handles().get(fd) {
-            Some(KernelHandle::DisplaySurface(surface)) => *surface,
-            Some(_) => return Err(DeviceSysopError::Unsupported),
-            None => return Err(DeviceSysopError::BadFileDescriptor),
-        };
-        let mapped_addr = map_surface(process_state, &mut surface, user_len, prot, offset)?;
-        let slot = process_state
-            .handles_mut()
-            .get_mut(fd)
-            .ok_or(DeviceSysopError::BadFileDescriptor)?;
-        *slot = KernelHandle::DisplaySurface(surface);
-        Ok(mapped_addr)
-    }) else {
-        return Err(DeviceSysopError::Unsupported);
-    };
-
-    result
-}
-
-pub(crate) fn munmap_current_process_range(
-    start: u64,
-    user_len: u64,
-) -> Result<(), DeviceSysopError> {
-    let user_len = usize::try_from(user_len).map_err(|_| DeviceSysopError::InvalidArgument)?;
-    if user_len == 0 {
-        return Err(DeviceSysopError::InvalidArgument);
-    }
-
-    let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
-        let end = start
-            .checked_add(user_len as u64)
-            .ok_or(DeviceSysopError::InvalidArgument)?;
-        let shared_surface_segments = process_state.handles().surface_overlap_segments(start, end);
-        if shared_surface_segments.is_empty() {
-            let unmapped_pages = process_state
-                .address_space_mut()
-                .unmap_user_bytes(VirtAddr::new(start), user_len)?;
-            let unmapped_len = (unmapped_pages as u64)
-                .checked_mul(PAGE_SIZE)
-                .ok_or(DeviceSysopError::InvalidArgument)?;
-            process_state
-                .handles_mut()
-                .clear_surface_mappings_in_range(start, unmapped_len);
-            return Ok(());
-        }
-
-        for (segment_start, segment_len) in &shared_surface_segments {
-            let segment_len =
-                usize::try_from(*segment_len).map_err(|_| DeviceSysopError::InvalidArgument)?;
-            let page_count = segment_len.div_ceil(PAGE_SIZE as usize);
-            process_state
-                .address_space_mut()
-                .unmap_user_pages_without_free_at(VirtAddr::new(*segment_start), page_count)?;
-        }
-        process_state
-            .handles_mut()
-            .clear_surface_mappings_in_range(start, user_len as u64);
-        Ok(())
-    }) else {
-        return Err(DeviceSysopError::Unsupported);
-    };
-
-    result
-}
-
-fn map_surface(
-    process_state: &mut UserProcessState,
-    surface: &mut DisplaySurfaceHandle,
-    user_len: u64,
-    prot: u64,
-    offset: u64,
-) -> Result<u64, DeviceSysopError> {
-    let supported_prot = linux_abi::PROT_READ | linux_abi::PROT_WRITE;
-    if prot & !supported_prot != 0 || prot & linux_abi::PROT_EXEC != 0 {
-        return Err(DeviceSysopError::InvalidArgument);
-    }
-    if offset != 0 || user_len == 0 || user_len != surface.mapping_len() {
-        return Err(DeviceSysopError::InvalidArgument);
-    }
-
-    if let Some(region) = surface.mapped_region() {
-        return Ok(region.start.as_u64());
-    }
-
-    let shared_region = surface
-        .shared_region()
-        .ok_or(DeviceSysopError::InvalidArgument)?;
-    let frames =
-        crate::ipc::shared_region_frames(shared_region).ok_or(DeviceSysopError::InvalidArgument)?;
-    let page_flags = surface_page_flags(prot);
-    let expected_page_count = usize::try_from(surface.mapping_len() / PAGE_SIZE)
-        .map_err(|_| DeviceSysopError::InvalidArgument)?;
-    if frames.len() != expected_page_count {
-        return Err(DeviceSysopError::InvalidArgument);
-    }
-    let region = process_state.map_existing_pages_from_mapping_cursor(&frames, page_flags)?;
-    surface.set_mapped_region(region);
-    Ok(region.start.as_u64())
-}
-
-fn surface_page_flags(prot: u64) -> PageTableFlags {
-    let mut flags = PageTableFlags::NO_EXECUTE;
-    if prot & linux_abi::PROT_WRITE != 0 {
-        flags |= PageTableFlags::WRITABLE;
-    }
-    flags
-}
-
 fn read_process_struct<T: Copy + Default>(
     process_state: &UserProcessState,
     ptr: u64,
@@ -383,3 +246,4 @@ fn map_device_error(err: device_ns::DeviceError) -> DeviceSysopError {
         device_ns::DeviceError::Unsupported => DeviceSysopError::Unsupported,
     }
 }
+// RING3-MIGRATION-REFERENCE END: devmgrd/sessiond-owned device sysop policy.

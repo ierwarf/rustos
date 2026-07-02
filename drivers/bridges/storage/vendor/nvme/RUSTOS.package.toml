@@ -1,0 +1,31 @@
+id = "nvme"
+kind = "bridge-driver"
+execution_domain = "kernel"
+profiles = ["storage-dev"]
+
+[build]
+builder = "external-copy"
+source = "vendor/modules/storage/nvme.ko"
+source_env = "VENDOR_NVME_KO"
+optional = true
+
+[install]
+path = "system/drivers/storage/nvme.ko"
+
+[boot]
+preload = true
+required = false
+priority = 270
+
+startup = "none"
+
+[autoload]
+name = "nvme"
+class = "storage"
+bus = "pci"
+priority = 100
+when = "vfs-ready"
+aliases = ["pci:v*d*sv*sd*bc01sc08i02*"]
+deps = ["nvme-core"]
+linux_driver_names = ["nvme"]
+provider_group = "storage-primary"

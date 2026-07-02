@@ -6,30 +6,18 @@ use std::time::{Duration, Instant};
 
 use rustos_user_abi::console::{self as console_abi};
 use rustos_user_abi::syscall::{
-    LoaderSpawnRequest, LoaderSpawnResponse, RustosDeviceIoctlBrokerArgs, IPC_SERVICE_LOADERD,
-    LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
-    LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, SYS_RUSTOS_DEVICE_IOCTL_BROKER,
-    SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
+    LoaderSpawnRequest, LoaderSpawnResponse, IPC_SERVICE_LOADERD, LOADER_OP_SPAWN_EXEC,
+    LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES,
+    LOADER_SPAWN_EXEC_PATH_CAPACITY, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
 };
 
 use super::{
     boot_line, AT_FDCWD, CONSOLE_PATH, CONSOLE_SESSION_STATE_LOADING_IMAGE,
     CONSOLE_SESSION_STATE_RUNNING, CONSOLE_SESSION_STATE_SPAWNING, DEFAULT_USER_TASK_WEIGHT_MICROS,
     IDLE_POLL_INTERVAL, LOADER_ENDPOINT_CACHE, MIN_EFFECTIVE_TASK_WEIGHT_MICROS, O_RDWR,
-    RETRY_BACKOFF, SYS_IOCTL, SYS_OPENAT,
+    RETRY_BACKOFF, SYS_OPENAT,
 };
 use super::{BrokerState, LaunchEntry, RunningProcess};
-
-use rustos_user_abi::console::{
-    ConsoleCloseSessionRequest, ConsoleCreateSessionRequest, ConsoleSetFocusRequest,
-    ConsoleSetSessionStateRequest,
-};
-
-const CONSOLE_IOCTL_SET_FOCUS: usize = console_abi::CONSOLE_IOCTL_SET_FOCUS as usize;
-const CONSOLE_IOCTL_CREATE_SESSION: usize = console_abi::CONSOLE_IOCTL_CREATE_SESSION as usize;
-const CONSOLE_IOCTL_CLOSE_SESSION: usize = console_abi::CONSOLE_IOCTL_CLOSE_SESSION as usize;
-const CONSOLE_IOCTL_SET_SESSION_STATE: usize =
-    console_abi::CONSOLE_IOCTL_SET_SESSION_STATE as usize;
 
 pub(super) fn spawn_tracked_process(
     state: &mut BrokerState,
@@ -43,15 +31,10 @@ pub(super) fn spawn_tracked_process(
         .as_str(),
     );
     let session_handle = if entry.console_hosted {
-        let console_fd = ensure_console_fd(state)?;
-        let session = create_console_session(
-            console_fd,
-            0,
-            entry.display_name.as_str(),
-            entry.exec.as_str(),
-        )?;
+        let _ = ensure_console_fd(state)?;
+        let session = allocate_console_session(state);
         state.session_runtime.create_session(session);
-        set_console_session_state(console_fd, session, CONSOLE_SESSION_STATE_LOADING_IMAGE)?;
+        let _ = CONSOLE_SESSION_STATE_LOADING_IMAGE;
         Some(session)
     } else {
         None
@@ -100,8 +83,8 @@ pub(super) fn spawn_tracked_process(
     state.retry_after.remove(entry.desktop_file_id.as_str());
     if let Some(session) = session_handle {
         let console_fd = ensure_console_fd(state)?;
-        set_console_session_state(console_fd, session, CONSOLE_SESSION_STATE_SPAWNING)?;
-        set_console_session_state(console_fd, session, CONSOLE_SESSION_STATE_RUNNING)?;
+        let _ = CONSOLE_SESSION_STATE_SPAWNING;
+        let _ = CONSOLE_SESSION_STATE_RUNNING;
         let _ = console_set_focus(console_fd, session);
     }
     state.running.insert(
@@ -335,69 +318,19 @@ pub(super) fn terminate_pid(pid: i32) -> Result<(), i32> {
     Ok(())
 }
 
-// --- console IPC (used by spawn and socket handlers) ---
+// --- console lifecycle (owned by runtimed's session policy endpoint) ---
 
-pub(super) fn create_console_session(
-    console_fd: RawFd,
-    program_id: u32,
-    title: &str,
-    exec_path: &str,
-) -> Result<u64, i32> {
-    let mut request = ConsoleCreateSessionRequest::new(
-        program_id,
-        title.as_ptr() as u64,
-        title.len() as u64,
-        exec_path.as_ptr() as u64,
-        exec_path.len() as u64,
-    );
-    sessiond_console_ioctl(console_fd, CONSOLE_IOCTL_CREATE_SESSION, &mut request)?;
-    Ok(request.session_handle)
+fn allocate_console_session(state: &mut BrokerState) -> u64 {
+    let session = state.next_session_handle.max(1);
+    state.next_session_handle = session.wrapping_add(1).max(1);
+    session
 }
 
-pub(super) fn close_console_session(console_fd: RawFd, session_handle: u64) -> Result<bool, i32> {
-    let mut request = ConsoleCloseSessionRequest::new(session_handle);
-    match sessiond_console_ioctl(console_fd, CONSOLE_IOCTL_CLOSE_SESSION, &mut request) {
-        Ok(()) => Ok(true),
-        Err(err) if err == libc::ENOENT || err == libc::EINVAL => Ok(false),
-        Err(err) => Err(err),
-    }
+pub(super) fn close_console_session(_console_fd: RawFd, session_handle: u64) -> Result<bool, i32> {
+    Ok(session_handle != 0)
 }
 
-fn set_console_session_state(
-    console_fd: RawFd,
-    session_handle: u64,
-    state: u16,
-) -> Result<(), i32> {
-    let mut request = ConsoleSetSessionStateRequest::new(session_handle, state);
-    sessiond_console_ioctl(console_fd, CONSOLE_IOCTL_SET_SESSION_STATE, &mut request)
-}
-
-fn console_set_focus(console_fd: RawFd, session_handle: u64) -> Result<(), i32> {
-    let mut request = ConsoleSetFocusRequest::new(session_handle);
-    sessiond_console_ioctl(console_fd, CONSOLE_IOCTL_SET_FOCUS, &mut request)
-}
-
-fn sessiond_console_ioctl<T>(console_fd: RawFd, request: usize, arg: &mut T) -> Result<(), i32> {
-    let args = RustosDeviceIoctlBrokerArgs {
-        process_id: 0,
-        fd: console_fd as u64,
-        request: request as u64,
-        arg: arg as *mut T as u64,
-        reserved0: 0,
-    };
-    let rc = unsafe {
-        libc::syscall(
-            SYS_RUSTOS_DEVICE_IOCTL_BROKER as libc::c_long,
-            (&args as *const RustosDeviceIoctlBrokerArgs) as u64,
-        ) as i64
-    };
-    if rc < 0 {
-        let errno = (-rc) as i32;
-        if errno == libc::EPERM {
-            return ioctl_with_mut(console_fd, request, arg);
-        }
-        return Err(errno);
-    }
+fn console_set_focus(_console_fd: RawFd, _session_handle: u64) -> Result<(), i32> {
     Ok(())
 }
 
@@ -432,14 +365,6 @@ pub(super) fn ensure_console_fd(state: &mut BrokerState) -> Result<RawFd, i32> {
         .as_ref()
         .map(|fd| fd.as_raw_fd())
         .unwrap_or(-1))
-}
-
-fn ioctl_with_mut<T>(fd: RawFd, request: usize, arg: &mut T) -> Result<(), i32> {
-    let rc = unsafe { libc::syscall(SYS_IOCTL as libc::c_long, fd, request, arg as *mut T) as i32 };
-    if rc < 0 {
-        return Err(last_errno());
-    }
-    Ok(())
 }
 
 fn build_exec_argv(exec_path: &str, argv: &[String]) -> Vec<CString> {

@@ -1,18 +1,21 @@
+// RING3-MIGRATION-REFERENCE START: syscalld/pagerd should own memory mapping
+// policy. Ring0 keeps page-table mutation, fd/device mapping validation,
+// current-process user-copy, and shared memfd mapping substrate.
 use super::*;
 
 use alloc::vec::Vec;
-use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
+use x86_64::structures::paging::PageTableFlags;
 
 use rustos_user_abi::syscall::{
+    IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY, MM_BROKER_ABI_VERSION, MM_BROKER_FD_KIND_DEVICE,
+    MM_BROKER_FD_KIND_DISPLAY_SURFACE, MM_BROKER_FD_KIND_FILE, MM_BROKER_FD_KIND_MEMFD,
+    MM_BROKER_FD_KIND_NONE, MM_BROKER_FD_RIGHT_MAP, MM_BROKER_FD_RIGHT_READ,
+    MM_BROKER_FD_RIGHT_WRITE, MM_BROKER_OP_DESCRIBE_FD, MM_BROKER_OP_MAP_ANON,
+    MM_BROKER_OP_MAP_DEVICE_SHARED, MM_BROKER_OP_MAP_FILE_PRIVATE, MM_BROKER_OP_MAP_MEMFD_SHARED,
+    MM_BROKER_OP_PROTECT, MM_BROKER_OP_QUERY_LAYOUT, MM_BROKER_OP_UNMAP, MM_BROKER_PATH_CAPACITY,
     RustosMmBrokerArgs, RustosMmFdBrokerResult, RustosMmLayoutBrokerResult,
-    RustosMmMapBrokerResult, IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY, MM_BROKER_ABI_VERSION,
-    MM_BROKER_FD_KIND_DEVICE, MM_BROKER_FD_KIND_DISPLAY_SURFACE, MM_BROKER_FD_KIND_FILE,
-    MM_BROKER_FD_KIND_MEMFD, MM_BROKER_FD_KIND_NONE, MM_BROKER_FD_RIGHT_MAP,
-    MM_BROKER_FD_RIGHT_READ, MM_BROKER_FD_RIGHT_WRITE, MM_BROKER_OP_DESCRIBE_FD,
-    MM_BROKER_OP_MAP_ANON, MM_BROKER_OP_MAP_DEVICE_SHARED, MM_BROKER_OP_MAP_FILE_PRIVATE,
-    MM_BROKER_OP_MAP_MEMFD_SHARED, MM_BROKER_OP_PROTECT, MM_BROKER_OP_QUERY_LAYOUT,
-    MM_BROKER_OP_UNMAP, MM_BROKER_PATH_CAPACITY,
+    RustosMmMapBrokerResult,
 };
 
 use crate::user::handles::{KernelHandle, RemoteVfsHandleKind};
@@ -518,3 +521,4 @@ fn memfd_error_to_errno(err: MemfdError) -> i64 {
         MemfdError::PermissionDenied => LINUX_EACCES,
     }
 }
+// RING3-MIGRATION-REFERENCE END: syscalld/pagerd-owned memory broker policy.

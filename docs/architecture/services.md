@@ -51,8 +51,9 @@ happens inside the kernel module loader because they need ring0 access.
 `SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER` per record, and walks dependency
 edges. The on-boot probe loads:
 
-- `hid` (HID core) and `hid-generic` (generic HID input driver) for USB
-  pointers and keyboards.
+- Native RustOS xHCI for USB pointers and keyboards; raw HID reports are
+  routed to `inputd` for policy/translation. Linux USB HID `.ko` artifacts stay
+  staged only for compatibility work and are not the default boot input path.
 - `virtio-gpu` when present (otherwise `bootfb` is the active display
   provider).
 - `virtio-net` for the default emulated NIC.
@@ -108,8 +109,9 @@ driver module (`.ko`)은 `driverd`가 소유 정책이지만, ring0 접근이 �
 `SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER`를 호출하며 의존 edge를 따라
 순서를 정합니다. boot 중 probe되는 module 예:
 
-- USB pointer/keyboard용 `hid` (HID core)와 `hid-generic` (generic HID
-  input driver).
+- USB pointer/keyboard는 native RustOS xHCI가 잡고 raw HID report를
+  `inputd`로 넘깁니다. Linux USB HID `.ko` artifact는 호환 작업용으로만
+  stage되며 기본 부팅 입력 경로가 아닙니다.
 - 가능하면 `virtio-gpu` (없으면 `bootfb`가 display provider).
 - emulated NIC default인 `virtio-net`.
 

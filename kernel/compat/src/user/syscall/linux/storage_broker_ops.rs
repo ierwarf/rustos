@@ -1,8 +1,11 @@
+// RING3-MIGRATION-REFERENCE START: storaged should own block descriptor policy
+// and post-bootstrap storage inventory. Ring0 keeps gated descriptor export over
+// kernel-discovered physical transports.
 use super::*;
 
 use rustos_user_abi::syscall::{
-    StorageBlockDescriptorWire, StorageListBrokerArgs, IPC_SERVICE_CAP_STORAGE_POLICY,
-    STORAGE_FLAG_READONLY, STORAGE_LIST_MAX_DESCRIPTORS, STORAGE_LIST_PATH_CAPACITY,
+    IPC_SERVICE_CAP_STORAGE_POLICY, STORAGE_FLAG_READONLY, STORAGE_LIST_MAX_DESCRIPTORS,
+    STORAGE_LIST_PATH_CAPACITY, StorageBlockDescriptorWire, StorageListBrokerArgs,
 };
 use storage_core::TransportKind;
 
@@ -85,3 +88,4 @@ fn storage_transport_wire(transport: TransportKind) -> u32 {
         TransportKind::Usb => 3,
     }
 }
+// RING3-MIGRATION-REFERENCE END: storaged-owned block descriptor policy.

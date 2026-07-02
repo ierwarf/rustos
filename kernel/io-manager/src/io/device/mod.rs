@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: devmgrd should own device namespace, open,
+// and ioctl policy. Ring0 keeps native device handles and current-process
+// user-copy substrate.
 pub(crate) mod display;
 pub(crate) mod input;
 
@@ -201,3 +204,4 @@ mod tests {
         assert_eq!(restored.access_kind(), DeviceAccessKind::Evdev);
     }
 }
+// RING3-MIGRATION-REFERENCE END: devmgrd-owned device namespace policy.

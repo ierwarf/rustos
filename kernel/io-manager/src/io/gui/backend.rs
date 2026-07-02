@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: uiserver/driverd should own display backend
+// provider policy. Ring0 keeps framebuffer mapping and present substrate until
+// ring3 display service-drivers can own the provider path.
 #[cfg(rustos_debug_print_enabled)]
 use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
@@ -272,3 +275,4 @@ fn framebuffer_info_is_valid(info: FramebufferInfo) -> bool {
 
     min_size <= size
 }
+// RING3-MIGRATION-REFERENCE END: uiserver/driverd-owned display backend policy.

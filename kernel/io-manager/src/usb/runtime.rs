@@ -1,10 +1,15 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::sync::KernelSpinLock as Mutex;
 use heapless::Deque as HeaplessDeque;
+use rustos_user_abi::syscall::{
+    INPUTD_HID_POLICY_DESCRIPTOR_CAPACITY, INPUTD_HID_POLICY_KIND_KEYBOARD,
+    INPUTD_HID_POLICY_KIND_POINTER, INPUTD_HID_POLICY_KIND_UNKNOWN,
+    INPUTD_HID_POLICY_REPORT_CAPACITY, InputHidPolicyWire,
+};
 
 use crate::driver::linux::compat::{LinuxCompatHidDevice, LinuxCompatUrb, LinuxCompatUsbDevice};
 
@@ -31,6 +36,8 @@ const PENDING_COMPLETION_CAPACITY: usize = 64;
 const COMPLETIONS_PER_SERVICE: usize = 32;
 const URB_SUBMIT_LOG_LIMIT: usize = 0;
 const REPORT_DESCRIPTOR_LOG_LIMIT: usize = 0;
+const REPORT_DROP_LOG_INTERVAL: u64 = 1024;
+const MAX_RUNTIME_REPORT_BYTES: usize = 64;
 
 #[derive(Clone)]
 struct RuntimeUsbDevice {
@@ -56,71 +63,12 @@ struct UrbCompletion {
     callback: unsafe extern "C" fn(*mut LinuxCompatUrb),
 }
 
-// RING3-MIGRATION-COMMENTED-OUT START: inputd should own HID report layout
-// state. Ring0 keeps only raw USB report ingress and Linux .ko callback
-// substrate.
-/*
-#[derive(Clone, Debug)]
-struct HidValueField {
-    bits: Range<usize>,
-    signed: bool,
-    relative: bool,
-    logical_minimum: i32,
-    logical_maximum: i32,
-}
-
-#[derive(Clone, Debug)]
-struct HidArrayField {
-    bits: Range<usize>,
-    count: usize,
-    signed: bool,
-}
-
-#[derive(Clone, Debug)]
-struct BootKeyboardLayout {
-    report_id: u8,
-    required_bytes: usize,
-    modifier_fields: [Option<HidValueField>; 8],
-    key_array: HidArrayField,
-}
-
-#[derive(Clone, Debug)]
-struct PointerLayout {
-    report_id: u8,
-    required_bytes: usize,
-    button_fields: Vec<HidValueField>,
-    x_field: HidValueField,
-    y_field: HidValueField,
-    wheel_field: Option<HidValueField>,
-    relative: bool,
-    logical_min_x: i32,
-    logical_max_x: i32,
-    logical_min_y: i32,
-    logical_max_y: i32,
-}
-
-#[derive(Clone, Debug)]
-struct HidReportState {
-    hid_device_ptr: usize,
-    layout: Option<Arc<HidReportLayout>>,
-}
-
-impl Default for HidReportState {
-    fn default() -> Self {
-        Self {
-            hid_device_ptr: 0,
-            layout: None,
-        }
-    }
-}
-*/
-// RING3-MIGRATION-COMMENTED-OUT END
-
 static USB_RUNTIME_DEVICES: Mutex<Vec<RuntimeUsbDevice>> = Mutex::new(Vec::new());
 static PENDING_COMPLETIONS: Mutex<HeaplessDeque<UrbCompletion, PENDING_COMPLETION_CAPACITY>> =
     Mutex::new(HeaplessDeque::new());
 static URB_SUBMIT_LOGS: AtomicUsize = AtomicUsize::new(0);
 static REPORT_DESCRIPTOR_LOGS: AtomicUsize = AtomicUsize::new(0);
+static HID_POINTER_REPORT_COUNT: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn service_pending() -> usize {
     let mut completed = 0usize;
@@ -139,7 +87,10 @@ pub(crate) fn service_pending() -> usize {
 }
 
 pub(crate) fn has_pointer_device() -> bool {
-    false
+    USB_RUNTIME_DEVICES
+        .lock()
+        .iter()
+        .any(|device| report_descriptor_has_pointer(device.report_descriptor.as_ref()))
 }
 
 pub(crate) fn register_device(
@@ -242,25 +193,14 @@ pub(crate) fn unregister_interface(
 
 #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 pub(crate) fn enqueue_report(usb_device: *mut LinuxCompatUsbDevice, report: &[u8]) {
-    // RING3-MIGRATION-COMMENTED-OUT START: inputd should own runtime HID
-    // report buffering/coalescing and only receive bounded packets from ring0.
-    /*
     if usb_device.is_null() || report.is_empty() {
         return;
     }
     let Some(report) = RuntimeReport::from_slice(report) else {
         return;
     };
-    let report_len = report.len();
-    let native_report = report.clone();
-    let report_preview = [
-        report.as_slice().first().copied().unwrap_or(0),
-        report.as_slice().get(1).copied().unwrap_or(0),
-        report.as_slice().get(2).copied().unwrap_or(0),
-        report.as_slice().get(3).copied().unwrap_or(0),
-    ];
 
-    let (completion, native_layout, native_state_key) = {
+    let (completion, raw_report) = {
         let mut devices = USB_RUNTIME_DEVICES.lock();
         let Some(device) = devices
             .iter_mut()
@@ -268,76 +208,39 @@ pub(crate) fn enqueue_report(usb_device: *mut LinuxCompatUsbDevice, report: &[u8
         else {
             return;
         };
-        let native_layout = device.layout_hint.clone();
-        let native_state_key = device.usb_device_ptr;
+        let raw_report = hid_raw_report(device, report.as_slice());
 
         if let Some(urb_ptr) = device.pending_urbs.pop_front() {
             (
-                completion_from_report(urb_ptr as *mut LinuxCompatUrb, report),
-                native_layout,
-                native_state_key,
+                completion_from_report(urb_ptr as *mut LinuxCompatUrb, report.clone()),
+                raw_report,
             )
-        } else {
-            if let Some(last) = device.queued_reports.back_mut() {
-                if runtime_reports_can_coalesce(last, &report, device.layout_hint.as_deref()) {
-                    *last = report;
-                    (None, native_layout, native_state_key)
-                } else if device.queued_reports.len() >= REPORT_QUEUE_CAPACITY {
-                    device.dropped_reports = device.dropped_reports.saturating_add(1);
-                    if device
-                        .dropped_reports
-                        .is_multiple_of(REPORT_DROP_LOG_INTERVAL)
-                    {
-                        crate::debug::println!(
-                            "usb runtime report overload: usb_dev={:#x} dropped={} queued={}",
-                            device.usb_device_ptr,
-                            device.dropped_reports,
-                            device.queued_reports.len()
-                        );
-                    }
-                    (None, native_layout, native_state_key)
-                } else {
-                    let _ = device.queued_reports.push_back(report);
-                    (None, native_layout, native_state_key)
-                }
-            } else if device.queued_reports.len() >= REPORT_QUEUE_CAPACITY {
-                device.dropped_reports = device.dropped_reports.saturating_add(1);
-                if device
-                    .dropped_reports
-                    .is_multiple_of(REPORT_DROP_LOG_INTERVAL)
-                {
-                    crate::debug::println!(
-                        "usb runtime report overload: usb_dev={:#x} dropped={} queued={}",
-                        device.usb_device_ptr,
-                        device.dropped_reports,
-                        device.queued_reports.len()
-                    );
-                }
-                (None, native_layout, native_state_key)
-            } else {
-                let _ = device.queued_reports.push_back(report);
-                (None, native_layout, native_state_key)
+        } else if device.queued_reports.len() >= REPORT_QUEUE_CAPACITY {
+            device.dropped_reports = device.dropped_reports.saturating_add(1);
+            if device.dropped_reports % REPORT_DROP_LOG_INTERVAL == 0 {
+                crate::debug::println!(
+                    "usb runtime report overload: usb_dev={:#x} dropped={} queued={}",
+                    device.usb_device_ptr,
+                    device.dropped_reports,
+                    device.queued_reports.len()
+                );
             }
+            (None, raw_report)
+        } else {
+            let _ = device.queued_reports.push_back(report);
+            (None, raw_report)
         }
     };
 
-    translate_runtime_report(native_state_key, &native_report, native_layout);
-
-    if REPORT_ENQUEUE_LOGS.fetch_add(1, Ordering::Relaxed) < REPORT_ENQUEUE_LOG_LIMIT {
-        crate::debug::println!(
-            "usb runtime report queued: usb_dev={:#x} len={} first={:02x} {:02x} {:02x} {:02x}",
-            usb_device as usize,
-            report_len,
-            report_preview[0],
-            report_preview[1],
-            report_preview[2],
-            report_preview[3]
+    if let Some(raw_report) = raw_report {
+        HID_POINTER_REPORT_COUNT.fetch_add(
+            (raw_report.kind == INPUTD_HID_POLICY_KIND_POINTER) as u64,
+            Ordering::Relaxed,
         );
+        let _ = crate::input::event_queue::submit_hid_raw_report(raw_report);
     }
 
     queue_urb_completion(completion);
-    */
-    // RING3-MIGRATION-COMMENTED-OUT END
 }
 
 pub(crate) fn control_msg(
@@ -509,58 +412,6 @@ pub(crate) fn cancel_urb(urb: *mut LinuxCompatUrb) -> bool {
 
 #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 pub(crate) fn hid_input_report(dev: *mut LinuxCompatHidDevice, data: *mut u8, size: u32) -> i32 {
-    // RING3-MIGRATION-COMMENTED-OUT START: inputd should own HID report
-    // classification and event translation. Ring0 should only identify the HID
-    // source and forward the report bytes/capability.
-    /*
-    if dev.is_null() || data.is_null() || size == 0 || size as usize > MAX_REPORT_BYTES {
-        return -22;
-    }
-
-    let report = unsafe { core::slice::from_raw_parts(data, size as usize) };
-    let layout = match classify_hid_layout(dev, report.len()) {
-        Some(layout) => layout,
-        None => {
-            if HID_REPORT_ENTRY_LOGS.fetch_add(1, Ordering::Relaxed) < HID_REPORT_ENTRY_LOG_LIMIT {
-                crate::debug::println!(
-                    "usb hid report layout missing: dev={:#x} size={} first={:02x} {:02x} {:02x} {:02x}",
-                    dev as usize,
-                    report.len(),
-                    report.first().copied().unwrap_or(0),
-                    report.get(1).copied().unwrap_or(0),
-                    report.get(2).copied().unwrap_or(0),
-                    report.get(3).copied().unwrap_or(0),
-                );
-            }
-            return 0;
-        }
-    };
-
-    if HID_REPORT_ENTRY_LOGS.fetch_add(1, Ordering::Relaxed) < HID_REPORT_ENTRY_LOG_LIMIT {
-        let (kind, report_id, required_bytes) = hid_layout_summary(layout.as_ref());
-        crate::debug::println!(
-            "usb hid input report: dev={:#x} size={} kind={} report_id={} required={} first={:02x} {:02x} {:02x} {:02x}",
-            dev as usize,
-            report.len(),
-            kind,
-            report_id,
-            required_bytes,
-            report.first().copied().unwrap_or(0),
-            report.get(1).copied().unwrap_or(0),
-            report.get(2).copied().unwrap_or(0),
-            report.get(3).copied().unwrap_or(0),
-        );
-    }
-
-    let status = match layout.as_ref() {
-        HidReportLayout::BootKeyboard(layout) => {
-            handle_keyboard_report(dev as usize, report, layout)
-        }
-        HidReportLayout::Pointer(layout) => handle_pointer_report(dev as usize, report, layout),
-    };
-    status
-    */
-    // RING3-MIGRATION-COMMENTED-OUT END
     0
 }
 
@@ -569,6 +420,15 @@ pub(crate) fn hid_remove_device(dev: *mut LinuxCompatHidDevice) {
 }
 
 impl RuntimeReport {
+    fn from_slice(report: &[u8]) -> Option<Self> {
+        if report.is_empty() || report.len() > MAX_RUNTIME_REPORT_BYTES {
+            return None;
+        }
+        Some(Self {
+            bytes: report.to_vec().into_boxed_slice(),
+        })
+    }
+
     fn len(&self) -> usize {
         self.bytes.len()
     }
@@ -577,6 +437,64 @@ impl RuntimeReport {
         self.bytes.as_ref()
     }
 }
+
+pub(crate) fn debug_pointer_report_count() -> u64 {
+    HID_POINTER_REPORT_COUNT.load(Ordering::Relaxed)
+}
+
+// RING3-MIGRATION-REFERENCE START: inputd should own HID report classification
+// and descriptor-derived report metadata. Ring0 keeps raw USB report ingress and
+// Linux .ko URB callback substrate only.
+fn hid_raw_report(device: &RuntimeUsbDevice, report: &[u8]) -> Option<InputHidPolicyWire> {
+    if report.is_empty() || report.len() > INPUTD_HID_POLICY_REPORT_CAPACITY {
+        return None;
+    }
+    let descriptor = device.report_descriptor.as_ref();
+    let kind = if report_descriptor_has_pointer(descriptor) {
+        INPUTD_HID_POLICY_KIND_POINTER
+    } else if report_descriptor_has_keyboard(descriptor) {
+        INPUTD_HID_POLICY_KIND_KEYBOARD
+    } else {
+        INPUTD_HID_POLICY_KIND_UNKNOWN
+    };
+    if kind == INPUTD_HID_POLICY_KIND_UNKNOWN {
+        return None;
+    }
+    let mut wire = InputHidPolicyWire {
+        source_id: device.usb_device_ptr as u64,
+        kind,
+        report_len: report.len() as u16,
+        descriptor_len: descriptor.len().min(INPUTD_HID_POLICY_DESCRIPTOR_CAPACITY) as u16,
+        report_id: report_descriptor_id(descriptor),
+        required_bytes: report.len() as u16,
+        ..InputHidPolicyWire::default()
+    };
+    wire.report[..report.len()].copy_from_slice(report);
+    let descriptor_len = wire.descriptor_len as usize;
+    wire.descriptor_prefix[..descriptor_len].copy_from_slice(&descriptor[..descriptor_len]);
+    Some(wire)
+}
+
+fn report_descriptor_has_pointer(descriptor: &[u8]) -> bool {
+    let has_mouse_usage = descriptor.windows(2).any(|item| item == [0x09, 0x02]);
+    let has_x_usage = descriptor.windows(2).any(|item| item == [0x09, 0x30]);
+    let has_y_usage = descriptor.windows(2).any(|item| item == [0x09, 0x31]);
+    has_mouse_usage && has_x_usage && has_y_usage
+}
+
+fn report_descriptor_has_keyboard(descriptor: &[u8]) -> bool {
+    let has_keyboard_usage = descriptor.windows(2).any(|item| item == [0x09, 0x06]);
+    let has_key_usage_page = descriptor.windows(2).any(|item| item == [0x05, 0x07]);
+    has_keyboard_usage && has_key_usage_page
+}
+
+fn report_descriptor_id(descriptor: &[u8]) -> u8 {
+    descriptor
+        .windows(2)
+        .find_map(|item| (item[0] == 0x85).then_some(item[1]))
+        .unwrap_or(0)
+}
+// RING3-MIGRATION-REFERENCE END: inputd-owned HID report classification.
 
 fn submit_control_urb(urb: *mut LinuxCompatUrb) -> i32 {
     let setup = unsafe { (*urb).setup_packet };
@@ -745,603 +663,6 @@ fn dispatch_urb_completion(completion: Option<UrbCompletion>) {
     }
 }
 
-// RING3-MIGRATION-COMMENTED-OUT START: inputd should own HID layout parsing,
-// keyboard/pointer state, coordinate scaling, bit extraction, and event
-// translation. Ring0 keeps only the USB/.ko callback boundary.
-/*
-fn runtime_reports_can_coalesce(
-    existing: &RuntimeReport,
-    incoming: &RuntimeReport,
-    layout: Option<&HidReportLayout>,
-) -> bool {
-    let Some(HidReportLayout::Pointer(pointer)) = layout else {
-        return false;
-    };
-    if pointer.relative {
-        return false;
-    }
-    let Some(existing) = pointer_report_signature(pointer, existing) else {
-        return false;
-    };
-    let Some(incoming) = pointer_report_signature(pointer, incoming) else {
-        return false;
-    };
-    existing == incoming
-}
-
-fn pointer_report_signature(layout: &PointerLayout, report: &RuntimeReport) -> Option<(u8, i32)> {
-    let bytes = report.as_slice();
-    if bytes.len() < layout.required_bytes
-        || (layout.report_id != 0 && bytes.first().copied() != Some(layout.report_id))
-    {
-        return None;
-    }
-    let buttons = extract_pointer_buttons(layout, bytes);
-    let wheel = layout
-        .wheel_field
-        .as_ref()
-        .and_then(|field| extract_value_field_i32(field, bytes))
-        .unwrap_or(0);
-    Some((buttons, wheel))
-}
-
-fn classify_hid_layout(
-    dev: *mut LinuxCompatHidDevice,
-    report_len: usize,
-) -> Option<Arc<HidReportLayout>> {
-    let dev_ptr = dev as usize;
-    {
-        let states = HID_REPORT_STATES.lock();
-        if let Some(state) = states.iter().find(|state| state.hid_device_ptr == dev_ptr) {
-            if let Some(layout) = state.layout.clone() {
-                return Some(layout);
-            }
-        }
-    }
-
-    let layout = hid_report_descriptor(dev)
-        .and_then(parse_hid_layout)
-        .map(Arc::new)
-        .or_else(|| classify_runtime_hid_layout(dev, report_len))?;
-    let mut states = HID_REPORT_STATES.lock();
-    if let Some(index) = states
-        .iter()
-        .position(|state| state.hid_device_ptr == dev_ptr)
-    {
-        states[index].layout = Some(layout.clone());
-        return Some(layout);
-    }
-    states.push(HidReportState {
-        hid_device_ptr: dev_ptr,
-        layout: Some(layout.clone()),
-        ..HidReportState::default()
-    });
-    Some(layout)
-}
-
-fn hid_report_descriptor(dev: *mut LinuxCompatHidDevice) -> Option<&'static [u8]> {
-    let (ptr, size) = unsafe {
-        let ptr = if !(*dev).rdesc.is_null() {
-            (*dev).rdesc
-        } else {
-            (*dev).dev_rdesc
-        };
-        let size = if (*dev).rsize != 0 {
-            (*dev).rsize
-        } else {
-            (*dev).dev_rsize
-        };
-        (ptr, size)
-    };
-    if ptr.is_null() || size == 0 || size as usize > MAX_REPORT_BYTES {
-        return None;
-    }
-    Some(unsafe { core::slice::from_raw_parts(ptr, size as usize) })
-}
-
-#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
-fn classify_runtime_hid_layout(
-    dev: *mut LinuxCompatHidDevice,
-    report_len: usize,
-) -> Option<Arc<HidReportLayout>> {
-    if dev.is_null() {
-        return None;
-    }
-
-    let (vendor, product, bus) =
-        unsafe { ((*dev).vendor as u16, (*dev).product as u16, (*dev).bus) };
-    let devices = USB_RUNTIME_DEVICES.lock();
-    for device in devices.iter() {
-        let device_vendor =
-            u16::from_le_bytes([device.device_descriptor[8], device.device_descriptor[9]]);
-        let device_product =
-            u16::from_le_bytes([device.device_descriptor[10], device.device_descriptor[11]]);
-        if device_vendor != vendor || device_product != product {
-            continue;
-        }
-
-        let Some(layout) = device.layout_hint.as_ref() else {
-            continue;
-        };
-        if !layout_accepts_report_len(layout.as_ref(), report_len) {
-            continue;
-        }
-        if bus == 0x03 {
-            let (kind, report_id, required_bytes) = hid_layout_summary(layout.as_ref());
-            crate::debug::println!(
-                "usb hid layout fallback: hid_dev={:#x} vendor={:04x} product={:04x} len={} kind={} report_id={} required={}",
-                dev as usize,
-                vendor,
-                product,
-                report_len,
-                kind,
-                report_id,
-                required_bytes
-            );
-            return Some(layout.clone());
-        }
-    }
-    None
-}
-
-fn parse_hid_layout(descriptor: &[u8]) -> Option<HidReportLayout> {
-    let parsed = ReportDescriptor::try_from(descriptor).ok()?;
-
-    for report in parsed.input_reports().iter() {
-        if let Some(layout) = parse_boot_keyboard_layout(report) {
-            return Some(HidReportLayout::BootKeyboard(layout));
-        }
-    }
-
-    for report in parsed.input_reports().iter() {
-        if let Some(layout) = parse_pointer_layout(report) {
-            return Some(HidReportLayout::Pointer(layout));
-        }
-    }
-
-    None
-}
-
-fn layout_accepts_report_len(layout: &HidReportLayout, report_len: usize) -> bool {
-    report_len >= layout_required_bytes(layout)
-}
-
-fn layout_required_bytes(layout: &HidReportLayout) -> usize {
-    let required_bits = match layout {
-        HidReportLayout::BootKeyboard(layout) => layout.required_bytes,
-        HidReportLayout::Pointer(layout) => layout.required_bytes,
-    };
-    required_bits
-}
-
-fn parse_boot_keyboard_layout(report: &impl Report) -> Option<BootKeyboardLayout> {
-    let mut modifier_fields = core::array::from_fn(|_| None);
-    let mut key_array = None;
-
-    for field in report.fields() {
-        match field {
-            Field::Variable(field)
-                if u16::from(field.usage.usage_page) == 0x07
-                    && (0xE0..=0xE7).contains(&u16::from(field.usage.usage_id)) =>
-            {
-                let index = (u16::from(field.usage.usage_id) - 0xE0) as usize;
-                modifier_fields[index] = Some(HidValueField {
-                    bits: field.bits.clone(),
-                    signed: field.is_signed(),
-                    relative: field.is_relative(),
-                    logical_minimum: i32::from(field.logical_minimum),
-                    logical_maximum: i32::from(field.logical_maximum),
-                });
-            }
-            Field::Array(field) if is_keyboard_usage_array(field) => {
-                key_array = Some(HidArrayField {
-                    bits: field.bits.clone(),
-                    count: usize::from(field.report_count),
-                    signed: field.is_signed(),
-                });
-            }
-            _ => {}
-        }
-    }
-
-    if modifier_fields.iter().any(|field| field.is_none()) {
-        return None;
-    }
-
-    Some(BootKeyboardLayout {
-        report_id: report_id(report),
-        required_bytes: report.size_in_bytes(),
-        modifier_fields,
-        key_array: key_array?,
-    })
-}
-
-fn parse_pointer_layout(report: &impl Report) -> Option<PointerLayout> {
-    let mut button_fields = Vec::new();
-    let mut x_field = None;
-    let mut y_field = None;
-    let mut wheel_field = None;
-
-    for field in report.fields() {
-        match field {
-            Field::Variable(field) if u16::from(field.usage.usage_page) == 0x09 => {
-                if button_fields.len() < 8 {
-                    button_fields.push(HidValueField {
-                        bits: field.bits.clone(),
-                        signed: field.is_signed(),
-                        relative: field.is_relative(),
-                        logical_minimum: i32::from(field.logical_minimum),
-                        logical_maximum: i32::from(field.logical_maximum),
-                    });
-                }
-            }
-            Field::Variable(field)
-                if is_usage(
-                    u16::from(field.usage.usage_page),
-                    u16::from(field.usage.usage_id),
-                    0x01,
-                    0x30,
-                ) =>
-            {
-                x_field = Some(HidValueField {
-                    bits: field.bits.clone(),
-                    signed: field.is_signed(),
-                    relative: field.is_relative(),
-                    logical_minimum: i32::from(field.logical_minimum),
-                    logical_maximum: i32::from(field.logical_maximum),
-                });
-            }
-            Field::Variable(field)
-                if is_usage(
-                    u16::from(field.usage.usage_page),
-                    u16::from(field.usage.usage_id),
-                    0x01,
-                    0x31,
-                ) =>
-            {
-                y_field = Some(HidValueField {
-                    bits: field.bits.clone(),
-                    signed: field.is_signed(),
-                    relative: field.is_relative(),
-                    logical_minimum: i32::from(field.logical_minimum),
-                    logical_maximum: i32::from(field.logical_maximum),
-                });
-            }
-            Field::Variable(field)
-                if is_usage(
-                    u16::from(field.usage.usage_page),
-                    u16::from(field.usage.usage_id),
-                    0x01,
-                    0x38,
-                ) =>
-            {
-                wheel_field = Some(HidValueField {
-                    bits: field.bits.clone(),
-                    signed: field.is_signed(),
-                    relative: field.is_relative(),
-                    logical_minimum: i32::from(field.logical_minimum),
-                    logical_maximum: i32::from(field.logical_maximum),
-                });
-            }
-            _ => {}
-        }
-    }
-
-    let x_field = x_field?;
-    let y_field = y_field?;
-
-    Some(PointerLayout {
-        report_id: report_id(report),
-        required_bytes: report.size_in_bytes(),
-        button_fields,
-        relative: x_field.relative || y_field.relative,
-        logical_min_x: x_field.logical_minimum,
-        logical_max_x: x_field.logical_maximum,
-        logical_min_y: y_field.logical_minimum,
-        logical_max_y: y_field.logical_maximum,
-        x_field,
-        y_field,
-        wheel_field,
-    })
-}
-
-fn report_id(report: &impl Report) -> u8 {
-    report.report_id().as_ref().map(u8::from).unwrap_or(0)
-}
-
-fn is_keyboard_usage_array(field: &ArrayField) -> bool {
-    if field.bits.len() < 8 || field.bits.len() % 8 != 0 {
-        return false;
-    }
-    if let Some(range) = field.usage_range() {
-        return u16::from(range.minimum().usage_page()) == 0x07
-            && u16::from(range.maximum().usage_page()) == 0x07;
-    }
-    field
-        .usages()
-        .iter()
-        .any(|usage| u16::from(usage.usage_page) == 0x07)
-}
-
-fn is_usage(page: u16, id: u16, expected_page: u16, expected_id: u16) -> bool {
-    page == expected_page && id == expected_id
-}
-
-fn handle_keyboard_report(
-    hid_device_ptr: usize,
-    report: &[u8],
-    layout: &BootKeyboardLayout,
-) -> i32 {
-    if report.len() < layout.required_bytes
-        || (layout.report_id != 0 && report.first().copied() != Some(layout.report_id))
-    {
-        return 0;
-    }
-    let mut modifiers = 0u8;
-    for (bit, field) in layout.modifier_fields.iter().enumerate() {
-        if field
-            .as_ref()
-            .and_then(|field| extract_value_field_u32(field, report))
-            .unwrap_or(0)
-            != 0
-        {
-            modifiers |= 1 << bit;
-        }
-    }
-
-    let mut keys = [0u8; 16];
-    let mut key_count = 0usize;
-    for index in 0..layout.key_array.count {
-        let Some(usage) = extract_array_field_u32(&layout.key_array, report, index) else {
-            continue;
-        };
-        let usage = usage as u8;
-        if usage != 0 {
-            keys[key_count] = usage;
-            key_count += 1;
-            if key_count >= keys.len() {
-                break;
-            }
-        }
-    }
-
-    let _ = crate::input::event_queue::submit_hid_keyboard_report(InputHidKeyboardReportWire {
-        source_id: hid_device_ptr as u64,
-        modifiers,
-        key_count: key_count as u8,
-        reserved0: [0; 6],
-        keys,
-    });
-
-    if KEYBOARD_TRANSLATION_LOG_LIMIT != 0
-        && KEYBOARD_TRANSLATION_LOGS.fetch_add(1, Ordering::Relaxed)
-            < KEYBOARD_TRANSLATION_LOG_LIMIT
-    {
-        crate::debug::println!(
-            "usb hid keyboard report: dev={:#x} report_id={} modifiers={:#x} keys={:02x},{:02x},{:02x},{:02x},{:02x},{:02x}",
-            hid_device_ptr,
-            layout.report_id,
-            modifiers,
-            keys[0],
-            keys[1],
-            keys[2],
-            keys[3],
-            keys[4],
-            keys[5]
-        );
-    }
-
-    0
-}
-
-fn handle_pointer_report(hid_device_ptr: usize, report: &[u8], layout: &PointerLayout) -> i32 {
-    if report.len() < layout.required_bytes
-        || (layout.report_id != 0 && report.first().copied() != Some(layout.report_id))
-    {
-        return 0;
-    }
-    let button_bits = extract_pointer_buttons(&layout, report);
-    let buttons = pointer_buttons_from_report(button_bits);
-    let x = extract_value_field_i32(&layout.x_field, report).unwrap_or(0);
-    let y = extract_value_field_i32(&layout.y_field, report).unwrap_or(0);
-    let wheel = layout
-        .wheel_field
-        .as_ref()
-        .and_then(|field| extract_value_field_i32(field, report))
-        .unwrap_or(0);
-
-    if layout.relative {
-        HID_POINTER_REPORT_COUNT.fetch_add(1, Ordering::Relaxed);
-
-        let _ = crate::input::event_queue::submit_hid_pointer_report(InputHidPointerReportWire {
-            source_id: hid_device_ptr as u64,
-            buttons,
-            relative: 1,
-            reserved0: [0; 2],
-            x,
-            y,
-            wheel_vertical: wheel as i16,
-            reserved1: 0,
-        });
-
-        if POINTER_TRANSLATION_LOG_LIMIT != 0
-            && (x != 0 || y != 0 || wheel != 0 || buttons != 0)
-            && POINTER_TRANSLATION_LOGS.fetch_add(1, Ordering::Relaxed)
-                < POINTER_TRANSLATION_LOG_LIMIT
-        {
-            crate::debug::println!(
-                "usb hid pointer report: dev={:#x} dx={} dy={} wheel={} buttons={:#x} relative={}",
-                hid_device_ptr,
-                x,
-                y,
-                wheel,
-                buttons,
-                layout.relative
-            );
-        }
-
-        return 0;
-    }
-
-    let (display_max_x, display_max_y) = crate::io::gui::display_dimensions()
-        .map(|(width, height)| {
-            (
-                width.saturating_sub(1) as i32,
-                height.saturating_sub(1) as i32,
-            )
-        })
-        .unwrap_or((0, 0));
-    let target_x =
-        scale_absolute_coordinate(x, layout.logical_min_x, layout.logical_max_x, display_max_x);
-    let target_y =
-        scale_absolute_coordinate(y, layout.logical_min_y, layout.logical_max_y, display_max_y);
-
-    HID_POINTER_REPORT_COUNT.fetch_add(1, Ordering::Relaxed);
-    let _ = crate::input::event_queue::submit_hid_pointer_report(InputHidPointerReportWire {
-        source_id: hid_device_ptr as u64,
-        buttons,
-        relative: 0,
-        reserved0: [0; 2],
-        x: target_x,
-        y: target_y,
-        wheel_vertical: wheel as i16,
-        reserved1: 0,
-    });
-
-    if POINTER_TRANSLATION_LOG_LIMIT != 0
-        && POINTER_TRANSLATION_LOGS.fetch_add(1, Ordering::Relaxed) < POINTER_TRANSLATION_LOG_LIMIT
-    {
-        crate::debug::println!(
-            "usb hid pointer report: dev={:#x} abs=({}, {}) wheel={} buttons={:#x} relative={}",
-            hid_device_ptr,
-            target_x,
-            target_y,
-            wheel,
-            buttons,
-            layout.relative
-        );
-    }
-
-    0
-}
-
-pub(crate) fn debug_pointer_report_count() -> u64 {
-    HID_POINTER_REPORT_COUNT.load(Ordering::Relaxed)
-}
-
-fn hid_layout_summary(layout: &HidReportLayout) -> (&'static str, u8, usize) {
-    match layout {
-        HidReportLayout::BootKeyboard(layout) => {
-            ("keyboard", layout.report_id, layout.required_bytes)
-        }
-        HidReportLayout::Pointer(layout) => ("pointer", layout.report_id, layout.required_bytes),
-    }
-}
-
-fn scale_absolute_coordinate(
-    value: i32,
-    logical_min: i32,
-    logical_max: i32,
-    target_max: i32,
-) -> i32 {
-    if target_max <= 0 || logical_max <= logical_min {
-        return 0;
-    }
-    let clamped = value.clamp(logical_min, logical_max);
-    let numer = (clamped - logical_min) as i64 * target_max as i64;
-    let denom = (logical_max - logical_min) as i64;
-    (numer / denom) as i32
-}
-
-fn extract_pointer_buttons(layout: &PointerLayout, report: &[u8]) -> u8 {
-    let mut buttons = 0u8;
-    let count = core::cmp::min(layout.button_fields.len(), 8);
-    for bit in 0..count {
-        let value = extract_value_field_u32(&layout.button_fields[bit], report).unwrap_or(0);
-        if value != 0 {
-            buttons |= 1 << bit;
-        }
-    }
-    buttons
-}
-
-fn extract_value_field_u32(field: &HidValueField, report: &[u8]) -> Option<u32> {
-    let raw = extract_bits_u32(report, &field.bits)?;
-    if field.signed {
-        Some(sign_extend_u32(raw, field.bits.len()) as u32)
-    } else {
-        Some(raw)
-    }
-}
-
-fn extract_value_field_i32(field: &HidValueField, report: &[u8]) -> Option<i32> {
-    let raw = extract_bits_u32(report, &field.bits)?;
-    Some(if field.signed {
-        sign_extend_u32(raw, field.bits.len())
-    } else {
-        raw as i32
-    })
-}
-
-fn extract_array_field_u32(field: &HidArrayField, report: &[u8], index: usize) -> Option<u32> {
-    if index >= field.count {
-        return None;
-    }
-    let bits_per_value = field.bits.len().checked_div(field.count)?;
-    if bits_per_value == 0 || bits_per_value > 32 {
-        return None;
-    }
-    let start = field
-        .bits
-        .start
-        .checked_add(bits_per_value.checked_mul(index)?)?;
-    let end = start.checked_add(bits_per_value)?;
-    let raw = extract_bits_u32(report, &(start..end))?;
-    if field.signed {
-        Some(sign_extend_u32(raw, bits_per_value) as u32)
-    } else {
-        Some(raw)
-    }
-}
-
-fn extract_bits_u32(report: &[u8], bits: &Range<usize>) -> Option<u32> {
-    let bit_len = bits.len();
-    if bit_len == 0 || bit_len > 32 {
-        return None;
-    }
-    let start_byte = bits.start / 8;
-    let end_byte = (bits.end.checked_sub(1)?) / 8;
-    let bytes = report.get(start_byte..=end_byte)?;
-    let mut value = 0u64;
-    let mut index = 0usize;
-    while index < bytes.len() {
-        value |= u64::from(bytes[index]) << (index * 8);
-        index += 1;
-    }
-    let shifted = (value >> (bits.start % 8)) as u32;
-    let mask = if bit_len == 32 {
-        u32::MAX
-    } else {
-        (1u32 << bit_len) - 1
-    };
-    Some(shifted & mask)
-}
-
-fn sign_extend_u32(value: u32, bit_len: usize) -> i32 {
-    debug_assert!(bit_len > 0 && bit_len <= 32);
-    if bit_len == 32 {
-        return value as i32;
-    }
-    let sign_bit = 1u32 << (bit_len - 1);
-    if (value & sign_bit) == 0 {
-        value as i32
-    } else {
-        (value | (!0u32 << bit_len)) as i32
-    }
-}
-*/
-// RING3-MIGRATION-COMMENTED-OUT END
-
 fn usb_pipeint(pipe: u32) -> bool {
     ((pipe >> 30) & 3) == PIPE_INTERRUPT
 }
@@ -1369,37 +690,5 @@ fn usb_pipe_endpoint(dev: *mut LinuxCompatUsbDevice, pipe: u32) -> *mut c_void {
                 .copied()
                 .unwrap_or(core::ptr::null_mut()) as *mut c_void
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{HidReportLayout, parse_hid_layout};
-
-    #[test]
-    fn parses_qemu_usb_keyboard_layout() {
-        let descriptor = [
-            0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x75, 0x01, 0x95, 0x08, 0x05, 0x07, 0x19, 0xe0,
-            0x29, 0xe7, 0x15, 0x00, 0x25, 0x01, 0x81, 0x02, 0x95, 0x01, 0x75, 0x08, 0x81, 0x01,
-            0x95, 0x05, 0x75, 0x01, 0x05, 0x08, 0x19, 0x01, 0x29, 0x05, 0x91, 0x02, 0x95, 0x01,
-            0x75, 0x03, 0x91, 0x01, 0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x25, 0xff, 0x05, 0x07,
-            0x19, 0x00, 0x29, 0xff, 0x81, 0x00, 0xc0,
-        ];
-        let layout = parse_hid_layout(&descriptor);
-        assert!(matches!(layout, Some(HidReportLayout::BootKeyboard(_))));
-    }
-
-    #[test]
-    fn parses_qemu_usb_tablet_layout() {
-        let descriptor = [
-            0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01, 0xa1, 0x00, 0x05, 0x09, 0x19, 0x01,
-            0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01, 0x81, 0x02, 0x95, 0x01,
-            0x75, 0x05, 0x81, 0x01, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x00, 0x26, 0xff,
-            0x7f, 0x35, 0x00, 0x46, 0xff, 0x7f, 0x75, 0x10, 0x95, 0x02, 0x81, 0x02, 0x05, 0x01,
-            0x09, 0x38, 0x15, 0x81, 0x25, 0x7f, 0x35, 0x00, 0x45, 0x00, 0x75, 0x08, 0x95, 0x01,
-            0x81, 0x06, 0xc0, 0xc0,
-        ];
-        let layout = parse_hid_layout(&descriptor);
-        assert!(matches!(layout, Some(HidReportLayout::Pointer(_))));
     }
 }

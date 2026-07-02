@@ -52,4 +52,3 @@ pub(crate) fn name(bus: DriverBus) -> &'static str {
         .map(|descriptor| descriptor.name)
         .unwrap_or("unknown")
 }
-

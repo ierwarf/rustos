@@ -1,0 +1,30 @@
+id = "nvme-core"
+kind = "bridge-driver"
+execution_domain = "kernel"
+profiles = ["storage-dev"]
+
+[build]
+builder = "external-copy"
+source = "vendor/modules/storage/nvme-core.ko"
+source_env = "VENDOR_NVME_CORE_KO"
+optional = true
+
+[install]
+path = "system/drivers/storage/nvme-core.ko"
+
+[boot]
+preload = true
+required = false
+priority = 260
+
+startup = "none"
+
+[autoload]
+name = "nvme-core"
+class = "storage"
+bus = "pci"
+priority = 90
+when = "vfs-ready"
+aliases = ["pci:v*d*sv*sd*bc01sc08i02*"]
+linux_driver_names = ["nvme_core"]
+provider_group = "storage-nvme-core"

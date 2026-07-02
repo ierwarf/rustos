@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: usbdrv/inputd should own USB runtime
+// emulation policy. Ring0 keeps Linux .ko URB/HID callback forwarding into the
+// current native USB substrate.
 use core::ffi::c_void;
 
 use crate::driver::linux::compat::{LinuxCompatHidDevice, LinuxCompatUrb, LinuxCompatUsbDevice};
@@ -48,3 +51,4 @@ pub(crate) fn hid_input_report(dev: *mut LinuxCompatHidDevice, data: *mut u8, si
 pub(crate) fn hid_remove_device(dev: *mut LinuxCompatHidDevice) {
     runtime::hid_remove_device(dev);
 }
+// RING3-MIGRATION-REFERENCE END: usbdrv/inputd-owned USB runtime emulation policy.

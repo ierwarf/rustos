@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: inputd should own keyboard layout and key
+// transition policy. Ring0 keeps scancode ingress and bootstrap keyboard
+// substrate.
 use crate::sync::KernelSpinLock as Mutex;
 
 pub use keyboard_core::{KeyAction, KeyCode, KeyboardEvent, Modifiers};
@@ -39,3 +42,4 @@ pub(crate) fn inject_key_transition(code: KeyCode, released: bool) {
         crate::input::dispatcher::dispatch_keyboard_event(event);
     }
 }
+// RING3-MIGRATION-REFERENCE END: inputd-owned keyboard policy.

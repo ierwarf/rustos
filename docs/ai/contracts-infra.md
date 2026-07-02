@@ -6,6 +6,8 @@ Package/stage schemas, runtime control, kernel API, build, fault injection, logg
 
 - File: `RUSTOS.package.toml`. Parser: `tools/xtask/src/package_manifest.rs`.
 - Package ids = stable dependency keys. `runtime_deps` references package `id`, not path or desktop id.
+- `external-copy` accepts plain files and `.zst` sources; `.zst` sources are
+  decompressed into the configured artifact path during build.
 
 ### Valid Enum Values
 
@@ -20,10 +22,13 @@ Package/stage schemas, runtime control, kernel API, build, fault injection, logg
 ### Driver Autoload
 
 - `deps`: required module preloads (Linux `modules.dep` role).
+- Missing or skipped `deps` must skip the dependent driver; never autoload a
+  hard-dependent `.ko` after its required provider is absent.
 - `softdeps`: best-effort preloads (Linux `modprobe.d softdep pre:` role).
 - List fields stage as comma-separated registry values; items must not contain tab, newline, carriage return, or comma.
 - `linux_driver_names`: Linux in-module driver names allowed to register from that package. If omitted, defaults to autoload `name`. Linux driver compat registration must use this registry field — not hardcoded driver names.
 - `provider_group`: mutually exclusive provider contract. Once a loadable/native provider marks the group active, later candidates are skipped. `fallback_only` candidates ordered after normal candidates as lower-priority substitutes.
+- Driver `class` registry values: `display`, `input`, `network`, `usb`, `storage`. `usb` is reserved for explicit USB compat/dev bridge modules; native xHCI is the RustOS host-controller path and is not staged as a Linux `.ko`.
 - `display-primary` group: real hardware/virtio providers ordered ahead of firmware framebuffer fallbacks. `bootfb` is last-resort, **never** default primary for QEMU or hardware GPUs.
 - `driverd` owns autoload policy. Kernel driver brokers may expose narrow hardware-presence primitives for staged aliases (`platform:bootfb`, `pci:*`, `virtio:*`) but **must not** pick provider order or bypass registry `provider_group` policy.
 
@@ -140,6 +145,10 @@ Add new points only at realistic failure boundaries: allocation, block IO, devic
 - Kernel broker validates `.ko` images, relocates them, exposes `DriverKernelApiV1`, maps MMIO, executes module init. **Do not move `.ko` execution to ring3.**
 - Deleted io-manager policy files are not source of truth — do not restore.
 - Linux compat symbols must be explicitly implemented; no broad no-op fallbacks.
+- Vendor NVMe host `.ko` packages stay out of the default profile until block-layer/auth/io_uring compat is explicit; native RustOS NVMe remains the default boot/storage provider.
+- Vendor virtio-net `.ko` stays out of the default profile until post-init worker/IRQ behavior is non-blocking under QEMU; `netd` remains the default network policy owner.
+- Vendor HID core `.ko` stays out of the default profile while USB HID leaf modules are disabled; native RustOS input remains the default boot input provider.
+- Native xHCI is enabled with `RUSTOS_NATIVE_XHCI`; HID interrupt polling additionally requires `RUSTOS_NATIVE_XHCI_HID_POLL`. Keep both gated until they cannot delay display/runtime boot.
 - Optional net features (XDP, BPF, AF_XDP, ethtool offloads, DIM) may use per-symbol disabled shims; must fail closed — **never** fabricate packets or carrier state.
 
 ## Logging

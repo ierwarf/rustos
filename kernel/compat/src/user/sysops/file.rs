@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: vfsd should own file sysop helpers, path
+// normalization, and namespace policy. Ring0 keeps bootstrap path substrate and
+// current-process fd-table/user-copy mechanics.
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -66,3 +69,4 @@ fn normalize_absolute_path(base_path: &str, path: &str) -> Result<String, FileSy
 
     Ok(normalized)
 }
+// RING3-MIGRATION-REFERENCE END: vfsd-owned file sysop policy.

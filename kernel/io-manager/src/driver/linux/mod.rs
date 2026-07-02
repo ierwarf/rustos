@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: Linux .ko shim module is an explicit ring0
+// compatibility substrate. Driver policy belongs in driverd; .ko execution does
+// not move to ring3.
 pub mod aux;
 pub mod base;
 pub mod compat;
@@ -146,3 +149,4 @@ pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
         .or_else(|| usb::resolve_symbol(name))
         .or_else(|| virtio_drm::resolve_symbol(name))
 }
+// RING3-MIGRATION-REFERENCE END: Linux .ko shim compatibility substrate exception.

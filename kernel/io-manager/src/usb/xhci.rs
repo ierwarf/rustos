@@ -1,7 +1,11 @@
-// RING3-MIGRATION-REFERENCE START: commercial-max usbdrv/inputd should own USB
-// enumeration policy, transfer-ring policy, and HID delivery only for a non-.ko service
-// driver rewrite. RustOS-authored `.ko` xHCI drivers stay ring0 with Linux `.ko`
-// compatibility; ring0 also keeps MMIO/DMA/IRQ grant primitives.
+// RING3-MIGRATION-REFERENCE START: usbdrv/driverd/inputd should own the non-.ko
+// xHCI service-driver once a ring3 service-driver host can drive leased
+// MMIO/DMA/IRQ resources. Ring0 keeps this native path as the current privileged
+// transfer substrate; HID policy/translation is routed to inputd.
+// Native RustOS xHCI is the default USB 3 host-controller path. Keep Linux
+// `.ko` host-controller bridges out of the default boot profile; policy still
+// belongs in driverd/devmgrd/inputd, while this module owns the MMIO/DMA/IRQ
+// transfer engine.
 use alloc::vec;
 use alloc::vec::Vec;
 use core::convert::TryFrom;
@@ -44,6 +48,7 @@ const XHCI_REGISTER_WAIT_SPINS: usize = 1_000_000;
 const XHCI_EVENT_WAIT_SPINS: usize = 20_000_000;
 const XHCI_TRANSFER_LOG_LIMIT: usize = 0;
 const XHCI_POLL_SUBMIT_LOG_LIMIT: usize = 0;
+const ENABLE_NATIVE_XHCI_HID_POLL: bool = option_env!("RUSTOS_NATIVE_XHCI_HID_POLL").is_some();
 
 const USB_DT_DEVICE: u8 = 0x01;
 const USB_DT_CONFIG: u8 = 0x02;
@@ -199,7 +204,7 @@ static XHCI_TRANSFER_LOGS: AtomicUsize = AtomicUsize::new(0);
 static XHCI_POLL_SUBMIT_BEGIN_LOGS: AtomicUsize = AtomicUsize::new(0);
 static XHCI_POLL_SUBMIT_QUEUED_LOGS: AtomicUsize = AtomicUsize::new(0);
 static XHCI_POLL_SUBMIT_DONE_LOGS: AtomicUsize = AtomicUsize::new(0);
-const XHCI_EVENTS_PER_SERVICE: usize = 16;
+const XHCI_EVENTS_PER_SERVICE: usize = 64;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct XhciMmioMapper;
@@ -238,6 +243,9 @@ pub(crate) fn controllers() -> Vec<XhciControllerRecord> {
 }
 
 pub(crate) fn service_pending() -> usize {
+    if !ENABLE_NATIVE_XHCI_HID_POLL {
+        return 0;
+    }
     let mut work = 0usize;
     let mut controllers = XHCI_CONTROLLERS.lock();
     for controller in controllers.iter_mut() {
@@ -668,6 +676,14 @@ fn enumerate_boot_port(
         )
         .as_bytes(),
     );
+    if !ENABLE_NATIVE_XHCI_HID_POLL {
+        crate::debug::println!(
+            "xhci: native HID polling gated: port={} slot={} set RUSTOS_NATIVE_XHCI_HID_POLL=1 to enable",
+            port + 1,
+            slot_id
+        );
+        return None;
+    }
     if control_no_data(
         controller,
         &mut device,
@@ -2286,4 +2302,4 @@ mod tests {
         assert_eq!(decoded.slot_id(), 7);
     }
 }
-// RING3-MIGRATION-REFERENCE END: commercial-max usbdrv/inputd-owned non-.ko USB service driver.
+// RING3-MIGRATION-REFERENCE END: usbdrv/driverd/inputd-owned non-.ko xHCI service-driver.

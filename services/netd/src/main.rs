@@ -205,6 +205,7 @@ enum UnixSocketState {
 #[derive(Debug)]
 struct ConnectedState {
     incoming_bytes: VecDeque<u8>,
+    incoming_controls: VecDeque<Vec<u8>>,
     peer: u64,
     peer_closed: bool,
     peer_read_closed: bool,
@@ -323,6 +324,7 @@ fn handle_socketpair(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -
             peer_path: None,
             state: UnixSocketState::Connected(ConnectedState {
                 incoming_bytes: VecDeque::new(),
+                incoming_controls: VecDeque::new(),
                 peer: right,
                 peer_closed: false,
                 peer_read_closed: false,
@@ -344,6 +346,7 @@ fn handle_socketpair(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -
             peer_path: None,
             state: UnixSocketState::Connected(ConnectedState {
                 incoming_bytes: VecDeque::new(),
+                incoming_controls: VecDeque::new(),
                 peer: left,
                 peer_closed: false,
                 peer_read_closed: false,
@@ -401,6 +404,9 @@ fn handle_bind(request: &NetdIpcRequest) -> i32 {
         Ok(path) => path,
         Err(errno) => return errno,
     };
+    if is_wayland_path(path.as_str()) {
+        debug_line("netd: wayland bind");
+    }
     let mut state = net_state().lock().unwrap();
     if state.bindings.contains_key(&path) {
         return libc::EADDRINUSE;
@@ -422,6 +428,7 @@ fn handle_listen(request: &NetdIpcRequest) -> i32 {
     let Some(socket) = state.sockets.get_mut(&request.socket_token) else {
         return libc::EBADF;
     };
+    let is_wayland = socket.bound_path.as_deref().is_some_and(is_wayland_path);
     if socket.bound_path.is_none() || !matches!(socket.state, UnixSocketState::Idle) {
         return libc::EINVAL;
     }
@@ -432,6 +439,9 @@ fn handle_listen(request: &NetdIpcRequest) -> i32 {
         backlog,
         pending: VecDeque::new(),
     };
+    if is_wayland {
+        debug_line("netd: wayland listen");
+    }
     0
 }
 
@@ -446,6 +456,7 @@ fn handle_connect(request: &NetdIpcRequest) -> i32 {
         return libc::ENOENT;
     };
     let accepted = state.allocate_token();
+    let is_wayland = is_wayland_path(path.as_str());
     let Some(client) = state.sockets.get_mut(&request.socket_token) else {
         return libc::EBADF;
     };
@@ -456,6 +467,7 @@ fn handle_connect(request: &NetdIpcRequest) -> i32 {
     client.peer_path = Some(path.clone());
     client.state = UnixSocketState::Connected(ConnectedState {
         incoming_bytes: VecDeque::new(),
+        incoming_controls: VecDeque::new(),
         peer: accepted,
         peer_closed: false,
         peer_read_closed: false,
@@ -475,6 +487,9 @@ fn handle_connect(request: &NetdIpcRequest) -> i32 {
             return libc::EAGAIN;
         }
         pending.push_back(accepted);
+        if is_wayland {
+            debug_line("netd: wayland connect queued");
+        }
         (listener.owner, listener.local_path.clone())
     };
     state.sockets.insert(
@@ -488,6 +503,7 @@ fn handle_connect(request: &NetdIpcRequest) -> i32 {
             peer_path: client_local_path,
             state: UnixSocketState::Connected(ConnectedState {
                 incoming_bytes: VecDeque::new(),
+                incoming_controls: VecDeque::new(),
                 peer: request.socket_token,
                 peer_closed: false,
                 peer_read_closed: false,
@@ -509,9 +525,15 @@ fn handle_accept(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i3
         let Some(listener) = state.sockets.get_mut(&request.socket_token) else {
             return libc::EBADF;
         };
+        let is_wayland = listener.local_path.as_deref().is_some_and(is_wayland_path);
         match &mut listener.state {
             UnixSocketState::Listening { pending, .. } => match pending.pop_front() {
-                Some(token) => token,
+                Some(token) => {
+                    if is_wayland {
+                        debug_line("netd: wayland accept dequeued");
+                    }
+                    token
+                }
                 None if nonblocking => return libc::EAGAIN,
                 None => return libc::EAGAIN,
             },
@@ -529,6 +551,10 @@ fn handle_accept(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i3
         }
     }
     call_net_broker(request, response, 0, accepted, 0)
+}
+
+fn is_wayland_path(path: &str) -> bool {
+    path.ends_with("/wayland-0") || path == "wayland-0"
 }
 
 fn handle_send(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
@@ -569,7 +595,11 @@ fn handle_sendmsg(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i
     if let Err(errno) = validate_sendmsg_control(&request.payload[control_start..end]) {
         return errno;
     }
-    match send_socket_bytes(request, &request.payload[data_start..control_start]) {
+    match send_socket_message(
+        request,
+        &request.payload[data_start..control_start],
+        &request.payload[control_start..end],
+    ) {
         Ok(sent) => {
             response.value = sent as u64;
             0
@@ -599,21 +629,25 @@ fn handle_recv(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 
 }
 
 fn handle_recvmsg(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
-    let control = match recvmsg_control_payload(request) {
-        Ok(control) => control,
+    let control_len = match pending_recvmsg_control_len(request) {
+        Ok(control_len) => control_len,
         Err(errno) => return errno,
     };
     let available = response
         .payload
         .len()
         .saturating_sub(NETD_RECVMSG_PAYLOAD_HEADER_SIZE)
-        .saturating_sub(control.len());
+        .saturating_sub(control_len);
     let requested = request.payload_len as usize;
     let data_len = requested.min(available);
     let data_start = NETD_RECVMSG_PAYLOAD_HEADER_SIZE;
     let data_end = data_start + data_len;
     match recv_socket_bytes(request, &mut response.payload[data_start..data_end]) {
         Ok(read) => {
+            let control = match recvmsg_control_payload(request) {
+                Ok(control) => control,
+                Err(errno) => return errno,
+            };
             let control_start = data_start + read;
             let control_end = control_start + control.len();
             response.payload[control_start..control_end].copy_from_slice(&control);
@@ -702,8 +736,8 @@ fn handle_setsockopt(request: &NetdIpcRequest) -> i32 {
         linux_abi::SO_PASSCRED => socket.options.passcred = value != 0,
         linux_abi::SO_SNDBUF => socket.options.send_buffer = clamp_socket_buffer(value),
         linux_abi::SO_RCVBUF => socket.options.recv_buffer = clamp_socket_buffer(value),
-        _ => libc::EOPNOTSUPP,
-    };
+        _ => return libc::EOPNOTSUPP,
+    }
     0
 }
 
@@ -728,6 +762,14 @@ fn handle_shutdown(request: &NetdIpcRequest) -> i32 {
 }
 
 fn send_socket_bytes(request: &NetdIpcRequest, bytes: &[u8]) -> Result<usize, i32> {
+    send_socket_message(request, bytes, &[])
+}
+
+fn send_socket_message(
+    request: &NetdIpcRequest,
+    bytes: &[u8],
+    control: &[u8],
+) -> Result<usize, i32> {
     if bytes.is_empty() {
         return Ok(0);
     }
@@ -762,10 +804,16 @@ fn send_socket_bytes(request: &NetdIpcRequest, bytes: &[u8]) -> Result<usize, i3
             Err(libc::EAGAIN)
         };
     }
+    if !control.is_empty() && room < bytes.len() {
+        return Err(libc::EAGAIN);
+    }
     let write_len = room.min(bytes.len());
     peer_connected
         .incoming_bytes
         .extend(bytes[..write_len].iter().copied());
+    if !control.is_empty() {
+        peer_connected.incoming_controls.push_back(control.to_vec());
+    }
     Ok(write_len)
 }
 
@@ -800,20 +848,45 @@ fn recv_socket_bytes(request: &NetdIpcRequest, dest: &mut [u8]) -> Result<usize,
     Ok(count)
 }
 
-fn recvmsg_control_payload(request: &NetdIpcRequest) -> Result<Vec<u8>, i32> {
+fn pending_recvmsg_control_len(request: &NetdIpcRequest) -> Result<usize, i32> {
     let state = net_state().lock().unwrap();
     let socket = state
         .sockets
         .get(&request.socket_token)
         .ok_or(libc::EBADF)?;
-    if !socket.options.passcred {
-        return Ok(Vec::new());
-    }
     let UnixSocketState::Connected(connected) = &socket.state else {
         return Err(libc::ENOTCONN);
     };
+    let queued_len = connected
+        .incoming_controls
+        .front()
+        .map(Vec::len)
+        .unwrap_or(0);
+    let credentials_len = if socket.options.passcred {
+        size_of::<linux_abi::LinuxCmsghdr>() + size_of::<linux_abi::LinuxUCred>()
+    } else {
+        0
+    };
+    Ok(cmsg_align(queued_len) + credentials_len)
+}
+
+fn recvmsg_control_payload(request: &NetdIpcRequest) -> Result<Vec<u8>, i32> {
+    let mut state = net_state().lock().unwrap();
+    let socket = state
+        .sockets
+        .get_mut(&request.socket_token)
+        .ok_or(libc::EBADF)?;
+    let passcred = socket.options.passcred;
+    let UnixSocketState::Connected(connected) = &mut socket.state else {
+        return Err(libc::ENOTCONN);
+    };
+    let mut control = connected.incoming_controls.pop_front().unwrap_or_default();
+    if !passcred {
+        return Ok(control);
+    }
     let cmsg_len = size_of::<linux_abi::LinuxCmsghdr>() + size_of::<linux_abi::LinuxUCred>();
-    let mut control = vec![0_u8; cmsg_align(cmsg_len)];
+    let start = cmsg_align(control.len());
+    control.resize(start + cmsg_align(cmsg_len), 0);
     let header = linux_abi::LinuxCmsghdr {
         cmsg_len: cmsg_len as u64,
         cmsg_level: linux_abi::SOL_SOCKET as u32,
@@ -825,14 +898,14 @@ fn recvmsg_control_payload(request: &NetdIpcRequest) -> Result<Vec<u8>, i32> {
         gid: connected.peer_credentials.gid,
     };
     write_plain_old_data(
-        &mut control[..size_of::<linux_abi::LinuxCmsghdr>()],
+        &mut control[start..start + size_of::<linux_abi::LinuxCmsghdr>()],
         &header,
     );
     write_plain_old_data(
-        &mut control[size_of::<linux_abi::LinuxCmsghdr>()..cmsg_len],
+        &mut control[start + size_of::<linux_abi::LinuxCmsghdr>()..start + cmsg_len],
         &credentials,
     );
-    control.truncate(cmsg_len);
+    control.truncate(start + cmsg_len);
     Ok(control)
 }
 
@@ -849,7 +922,7 @@ fn validate_sendmsg_control(control: &[u8]) -> Result<(), i32> {
         }
         match header.cmsg_type {
             value if value == linux_abi::SCM_CREDENTIALS as u32 => {}
-            value if value == linux_abi::SCM_RIGHTS as u32 => return Err(libc::EOPNOTSUPP),
+            value if value == linux_abi::SCM_RIGHTS as u32 => {}
             _ => return Err(libc::EOPNOTSUPP),
         }
         let aligned_next = offset

@@ -1,3 +1,5 @@
+// RING3-MIGRATION-REFERENCE START: Linux .ko serio shims are explicit ring0
+// compatibility substrate. Serio provider policy belongs in inputd/driverd.
 use core::ffi::{c_char, c_void};
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -187,3 +189,4 @@ fn linux_device_id_matches(id: LinuxCompatSerioDeviceId, port: &LinuxCompatSerio
         && serio_any_matches(id.id, port.id.id)
         && serio_any_matches(id.extra, port.id.extra)
 }
+// RING3-MIGRATION-REFERENCE END: Linux .ko serio compatibility substrate exception.

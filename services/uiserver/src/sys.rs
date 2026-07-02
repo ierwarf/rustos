@@ -445,6 +445,21 @@ pub(crate) fn profile_line(message: &str) {
     let _ = std::io::stderr().write_all(b"\n");
 }
 
+pub(crate) fn debug_line(message: &str) {
+    unsafe {
+        let _ = syscall2(
+            syscall_abi::SYS_RUSTOS_DEBUG_PRINT as usize,
+            message.as_ptr() as usize,
+            message.len(),
+        );
+        let _ = syscall2(
+            syscall_abi::SYS_RUSTOS_DEBUG_PRINT as usize,
+            b"\n".as_ptr() as usize,
+            1,
+        );
+    }
+}
+
 pub(crate) fn display_get_info(fd: RawFd) -> Result<DisplayInfo, i32> {
     let mut info = DisplayInfo::default();
     ioctl_with_mut(fd, DISPLAY_IOCTL_GET_INFO, &mut info)?;

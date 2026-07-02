@@ -77,6 +77,7 @@ pub(crate) fn process_pending_input(
         if read_count == 0 {
             break;
         }
+        let read_filled_batch = read_count == events.len();
 
         for event in &events[..read_count] {
             input_events = input_events.saturating_add(1);
@@ -112,6 +113,9 @@ pub(crate) fn process_pending_input(
         let hit_time_budget = started_at.elapsed() >= INPUT_PROCESS_BUDGET;
         if hit_batch_limit || hit_time_budget {
             backlog_remaining = true;
+            break;
+        }
+        if !read_filled_batch {
             break;
         }
     }

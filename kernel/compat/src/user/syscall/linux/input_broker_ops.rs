@@ -1,9 +1,12 @@
+// RING3-MIGRATION-REFERENCE START: inputd should own input stats, ingress
+// admission, and event coalescing policy. Ring0 keeps bounded input ingest and
+// current-process user-copy substrate.
 use super::*;
 
 use rustos_user_abi::syscall::{
-    InputIngestBrokerArgs, InputIngressWire, InputStatsBrokerArgs, InputStatsWire,
-    INPUTD_ACCESS_NATIVE, INPUTD_INGEST_MAX_EVENTS, INPUT_STATS_FLAG_PENDING_COALESCED,
-    INPUT_STATS_FLAG_PENDING_POINTER_POSITION, IPC_SERVICE_CAP_INPUT_POLICY,
+    INPUT_STATS_FLAG_PENDING_COALESCED, INPUT_STATS_FLAG_PENDING_POINTER_POSITION,
+    INPUTD_INGEST_MAX_EVENTS, IPC_SERVICE_CAP_INPUT_POLICY, InputIngestBrokerArgs,
+    InputIngressWire, InputStatsBrokerArgs, InputStatsWire,
 };
 
 pub(super) fn syscall_linux_rustos_input_stats_broker(args_ptr: u64) -> u64 {
@@ -45,6 +48,7 @@ pub(super) fn syscall_linux_rustos_input_stats_broker(args_ptr: u64) -> u64 {
         Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
     }
 }
+// RING3-MIGRATION-REFERENCE END: inputd-owned input broker policy.
 
 pub(super) fn syscall_linux_rustos_input_ingest_broker(args_ptr: u64) -> u64 {
     if !ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_INPUT_POLICY) {

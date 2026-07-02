@@ -449,40 +449,62 @@ pub(super) fn load_module_image_explicit(
                 call_with_module_init_stack1(init_addr, super::exported_kernel_api() as usize)
             }
         }
-        ModuleAbi::LinuxCompat(_) => {
-            let init_addr = resolve_named_symbol_addr(
-                &elf,
-                memory.runtime_base(),
-                &layout.sections,
-                LINUX_COMPAT_INIT_SYMBOL,
-                ModuleSymbolType::Func,
-            )?;
-            driver_diag!(
-                crate::debug::LogLevel::Info,
-                21,
-                memory.runtime_base() as u64,
-                "driver module init begin: name={} abi=linux path={} base={:#x} host={:#x} entry={:#x}",
-                name,
-                image_path,
-                memory.runtime_base(),
-                memory.host_base() as usize,
-                init_addr
-            );
-            crate::debug::record_milestone(
-                crate::debug::LogCategory::Driver,
-                "module-init-linux-call",
-                image.len() as u64,
-                init_addr as u64,
-            );
-            let _policy_guard = super::linux::virtio::enter_module_init_policy(
-                super::linux::virtio::ModuleInitPolicy {
-                    class,
-                    bus,
-                    linux_driver_names,
-                },
-            );
-            unsafe { call_with_module_init_stack0(init_addr) }
-        }
+        ModuleAbi::LinuxCompat(_) => match find_symbol(&elf, LINUX_COMPAT_INIT_SYMBOL)? {
+            Some((_, init_entry)) => {
+                if init_entry.symbol_type()? != ModuleSymbolType::Func {
+                    return Err("driver module init symbol type is invalid");
+                }
+                let init_addr = resolve_named_symbol_addr(
+                    &elf,
+                    memory.runtime_base(),
+                    &layout.sections,
+                    LINUX_COMPAT_INIT_SYMBOL,
+                    ModuleSymbolType::Func,
+                )?;
+                driver_diag!(
+                    crate::debug::LogLevel::Info,
+                    21,
+                    memory.runtime_base() as u64,
+                    "driver module init begin: name={} abi=linux path={} base={:#x} host={:#x} entry={:#x}",
+                    name,
+                    image_path,
+                    memory.runtime_base(),
+                    memory.host_base() as usize,
+                    init_addr
+                );
+                crate::debug::record_milestone(
+                    crate::debug::LogCategory::Driver,
+                    "module-init-linux-call",
+                    image.len() as u64,
+                    init_addr as u64,
+                );
+                let _policy_guard = super::linux::virtio::enter_module_init_policy(
+                    super::linux::virtio::ModuleInitPolicy {
+                        class,
+                        bus,
+                        linux_driver_names,
+                    },
+                );
+                unsafe { call_with_module_init_stack0(init_addr) }
+            }
+            None => {
+                driver_diag!(
+                    crate::debug::LogLevel::Info,
+                    21,
+                    memory.runtime_base() as u64,
+                    "driver module init skipped: name={} abi=linux path={} reason=no-init-symbol",
+                    name,
+                    image_path
+                );
+                crate::debug::record_milestone(
+                    crate::debug::LogCategory::Driver,
+                    "module-init-linux-skipped",
+                    image.len() as u64,
+                    0,
+                );
+                0
+            }
+        },
     };
     crate::debug::record_milestone(
         crate::debug::LogCategory::Driver,
@@ -1684,11 +1706,10 @@ fn detect_module_abi(
         return Ok(ModuleAbi::RustOs(header));
     }
 
-    let Some((_, init_entry)) = find_symbol(elf, LINUX_COMPAT_INIT_SYMBOL)? else {
-        return Err("driver module init symbol is missing");
-    };
-    if init_entry.symbol_type()? != ModuleSymbolType::Func {
-        return Err("driver module init symbol type is invalid");
+    if let Some((_, init_entry)) = find_symbol(elf, LINUX_COMPAT_INIT_SYMBOL)? {
+        if init_entry.symbol_type()? != ModuleSymbolType::Func {
+            return Err("driver module init symbol type is invalid");
+        }
     }
 
     Ok(ModuleAbi::LinuxCompat(DriverModuleHeader::from_runtime(
@@ -2421,6 +2442,11 @@ fn resolve_linux_allowed_symbol(name: &str, policy: SymbolResolvePolicy) -> Opti
         (DriverClass::Network, DriverBus::Pci) => super::linux::pci::resolve_symbol(name)
             .or_else(|| super::linux::netdev::resolve_symbol(name))
             .or_else(|| super::linux::skbuff::resolve_symbol(name)),
+        (DriverClass::Usb, DriverBus::Pci) | (DriverClass::Usb, DriverBus::Platform) => {
+            super::linux::usb::resolve_symbol(name)
+                .or_else(|| super::linux::pci::resolve_symbol(name))
+        }
+        (DriverClass::Storage, DriverBus::Pci) => super::linux::pci::resolve_symbol(name),
         _ => None,
     }
 }
@@ -2470,6 +2496,11 @@ fn is_allowed_linux_external_symbol(name: &str, policy: SymbolResolvePolicy) -> 
                 || super::linux::netdev::resolve_symbol(name).is_some()
                 || super::linux::skbuff::resolve_symbol(name).is_some()
         }
+        (DriverClass::Usb, DriverBus::Pci) | (DriverClass::Usb, DriverBus::Platform) => {
+            super::linux::usb::resolve_symbol(name).is_some()
+                || super::linux::pci::resolve_symbol(name).is_some()
+        }
+        (DriverClass::Storage, DriverBus::Pci) => super::linux::pci::resolve_symbol(name).is_some(),
         _ => false,
     }
 }

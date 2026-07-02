@@ -1,7 +1,7 @@
 id = "virtio-net"
 kind = "bridge-driver"
 execution_domain = "kernel"
-profiles = ["default", "network-dev"]
+profiles = ["network-dev"]
 
 [build]
 builder = "external-copy"

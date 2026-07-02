@@ -49,12 +49,6 @@ pub(crate) mod io {
                 arg,
             )
         }
-
-        pub mod input {
-            pub fn has_pending_events() -> bool {
-                kernel_io_manager::api::device::input::has_pending_events()
-            }
-        }
     }
 
     pub(crate) mod session {
@@ -62,32 +56,7 @@ pub(crate) mod io {
     }
 
     pub(crate) mod tty {
-        pub(crate) use kernel_io_manager::api::tty::LinuxTermios;
         pub(crate) use kernel_object::api::session::ConsoleSessionHandle;
-
-        pub fn has_pending_input_for_session(session: ConsoleSessionHandle) -> bool {
-            kernel_io_manager::api::tty::has_pending_input_for_session(session.into())
-        }
-
-        pub fn pending_input_len_for_session(session: ConsoleSessionHandle) -> usize {
-            kernel_io_manager::api::tty::pending_input_len_for_session(session.into())
-        }
-
-        pub fn termios_for_session(session: ConsoleSessionHandle) -> LinuxTermios {
-            kernel_io_manager::api::tty::termios_for_session(session.into())
-        }
-
-        pub fn set_termios_for_session(
-            session: ConsoleSessionHandle,
-            termios: LinuxTermios,
-            flush_input: bool,
-        ) {
-            kernel_io_manager::api::tty::set_termios_for_session(
-                session.into(),
-                termios,
-                flush_input,
-            );
-        }
 
         pub fn write_to_session(session: ConsoleSessionHandle, bytes: &[u8]) -> usize {
             kernel_io_manager::api::tty::write_to_session(session.into(), bytes)
@@ -108,12 +77,6 @@ pub(crate) mod io {
 
 pub(crate) mod storage {
     pub(crate) mod boot_volume {
-        pub fn read_file_to_vec(
-            path: &str,
-        ) -> Result<alloc::vec::Vec<u8>, kernel_io_manager::api::VfsError> {
-            kernel_io_manager::api::vfs::read_path_to_vec_for_kernel(path)
-        }
-
         pub fn userspace_runtime_active() -> bool {
             kernel_io_manager::api::boot::userspace_ready()
         }
@@ -121,68 +84,16 @@ pub(crate) mod storage {
 }
 
 pub(crate) mod vfs {
-    pub use kernel_io_manager::api::{MountError, VfsError, VfsMetadata, VfsNodeKind};
+    pub use kernel_io_manager::api::VfsError;
 
     pub fn normalize_kernel_path(path: &str) -> Result<alloc::string::String, VfsError> {
         kernel_io_manager::api::vfs::normalize_kernel_path(path)
-    }
-
-    pub fn mount_for_current_process(
-        source_path: &str,
-        target_path: &str,
-        filesystem_type: &str,
-        flags: u64,
-        options: Option<&str>,
-    ) -> Result<(), MountError> {
-        kernel_io_manager::api::vfs::mount_for_current_process(
-            source_path,
-            target_path,
-            filesystem_type,
-            flags,
-            options,
-        )
-    }
-
-    pub fn umount_for_current_process(target_path: &str) -> Result<(), MountError> {
-        kernel_io_manager::api::vfs::umount_for_current_process(target_path)
-    }
-
-    pub fn open_path_for_current_process(
-        absolute_path: &str,
-        flags: u64,
-        mode: u64,
-    ) -> Result<u64, VfsError> {
-        kernel_io_manager::api::vfs::open_path_for_current_process(absolute_path, flags, mode)
-    }
-
-    pub fn metadata_for_current_process_path(absolute_path: &str) -> Result<VfsMetadata, VfsError> {
-        kernel_io_manager::api::vfs::metadata_for_current_process_path(absolute_path)
-    }
-
-    pub fn check_access_for_user_process(
-        absolute_path: &str,
-        mode: u64,
-        abi: crate::user::abi::UserAbi,
-        process_state: &mut crate::user::process_state::UserProcessState,
-    ) -> Result<(), VfsError> {
-        kernel_io_manager::api::vfs::check_access_for_user_process(
-            absolute_path,
-            mode,
-            abi,
-            process_state,
-        )
     }
 
     pub fn read_path_to_vec_for_kernel(
         absolute_path: &str,
     ) -> Result<alloc::vec::Vec<u8>, VfsError> {
         kernel_io_manager::api::vfs::read_path_to_vec_for_kernel(absolute_path)
-    }
-
-    pub fn readlink_for_current_process(
-        absolute_path: &str,
-    ) -> Result<alloc::string::String, VfsError> {
-        kernel_io_manager::api::vfs::readlink_for_current_process(absolute_path)
     }
 }
 

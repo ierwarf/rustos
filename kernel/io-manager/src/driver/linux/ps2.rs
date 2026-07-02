@@ -1,3 +1,5 @@
+// RING3-MIGRATION-REFERENCE START: Linux .ko PS/2 shims are explicit ring0
+// compatibility substrate. Native PS/2 service-driver policy belongs in inputd.
 use alloc::vec::Vec;
 use core::slice;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -281,3 +283,4 @@ fn ps2dev_port_id(ps2dev: *mut LinuxCompatPs2Dev) -> Option<u32> {
     }
     crate::driver::serio::port_id_for_linux_port(unsafe { (*ps2dev).serio })
 }
+// RING3-MIGRATION-REFERENCE END: Linux .ko PS/2 compatibility substrate exception.

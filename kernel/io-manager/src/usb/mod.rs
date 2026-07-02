@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: usbdrv/driverd/inputd should own the USB
+// runtime facade once non-.ko host-controller and HID service-drivers are hosted
+// in ring3. Ring0 keeps this facade as the current privileged USB substrate.
 mod core;
 mod emulation;
 mod host;
@@ -26,7 +29,7 @@ pub fn debug_transfer_event_count() -> u64 {
 }
 
 pub fn debug_pointer_report_count() -> u64 {
-    0
+    runtime::debug_pointer_report_count()
 }
 
 pub(crate) fn register_linux_driver(
@@ -113,3 +116,4 @@ pub(crate) fn hid_input_report(
 pub(crate) fn hid_remove_device(dev: *mut crate::driver::linux::compat::LinuxCompatHidDevice) {
     emulation::hid_remove_device(dev);
 }
+// RING3-MIGRATION-REFERENCE END: usbdrv/driverd/inputd-owned USB runtime facade.

@@ -1,6 +1,9 @@
+// RING3-MIGRATION-REFERENCE START: netd should own socket namespace and network
+// syscall policy. Ring0 keeps target process user-copy and gated net broker
+// substrate.
 use super::*;
 
-use rustos_user_abi::syscall::{RustosNetBrokerArgs, IPC_SERVICE_CAP_NET_POLICY};
+use rustos_user_abi::syscall::{IPC_SERVICE_CAP_NET_POLICY, RustosNetBrokerArgs};
 use x86_64::VirtAddr;
 
 pub(super) fn syscall_linux_rustos_net_broker(args_ptr: u64) -> u64 {
@@ -163,3 +166,4 @@ fn write_process_bytes(process_id: u64, ptr: u64, bytes: &[u8]) -> Result<(), i6
     };
     result.map_err(address_space_error_to_linux_errno)
 }
+// RING3-MIGRATION-REFERENCE END: netd-owned network broker policy.

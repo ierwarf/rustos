@@ -1,14 +1,17 @@
+// RING3-MIGRATION-REFERENCE START: devmgrd should own device access/right
+// reduction policy. Ring0 keeps handle installation, user-copy, and native
+// device operation substrate.
 use super::*;
 
 use crate::user::sysops::device::{self, DeviceSysopError};
 use kernel_object::api::device::DeviceAccessKind;
 use kernel_object::api::handle::{DeviceHandleRights, HandleRights};
 use rustos_user_abi::syscall::{
-    RustosDeviceIoctlBrokerArgs, RustosDeviceOpenBrokerArgs, DEVMGRD_DEVICE_ACCESS_EVDEV,
-    DEVMGRD_DEVICE_ACCESS_NATIVE, DEVMGRD_DEVICE_ID_CONSOLE, DEVMGRD_DEVICE_ID_DISPLAY,
-    DEVMGRD_DEVICE_ID_INPUT, DEVMGRD_DEVICE_RIGHT_ADMIN, DEVMGRD_DEVICE_RIGHT_IOCTL,
-    DEVMGRD_DEVICE_RIGHT_MAP, DEVMGRD_DEVICE_RIGHT_READ, DEVMGRD_DEVICE_RIGHT_TRANSFER,
-    DEVMGRD_DEVICE_RIGHT_WRITE, IPC_SERVICE_CAP_DEVICE_POLICY, IPC_SERVICE_CAP_SESSION_POLICY,
+    DEVMGRD_DEVICE_ACCESS_EVDEV, DEVMGRD_DEVICE_ACCESS_NATIVE, DEVMGRD_DEVICE_ID_CONSOLE,
+    DEVMGRD_DEVICE_ID_DISPLAY, DEVMGRD_DEVICE_ID_INPUT, DEVMGRD_DEVICE_RIGHT_ADMIN,
+    DEVMGRD_DEVICE_RIGHT_IOCTL, DEVMGRD_DEVICE_RIGHT_MAP, DEVMGRD_DEVICE_RIGHT_READ,
+    DEVMGRD_DEVICE_RIGHT_TRANSFER, DEVMGRD_DEVICE_RIGHT_WRITE, IPC_SERVICE_CAP_DEVICE_POLICY,
+    IPC_SERVICE_CAP_SESSION_POLICY, RustosDeviceIoctlBrokerArgs, RustosDeviceOpenBrokerArgs,
 };
 
 pub(super) fn syscall_linux_rustos_device_open_broker(args_ptr: u64) -> u64 {
@@ -162,6 +165,7 @@ fn map_device_id(id: u16) -> Option<crate::io::device::DeviceId> {
         _ => None,
     }
 }
+// RING3-MIGRATION-REFERENCE END: devmgrd-owned device broker policy.
 fn map_device_access(access: u16) -> Option<DeviceAccessKind> {
     match access {
         DEVMGRD_DEVICE_ACCESS_NATIVE => Some(DeviceAccessKind::Native),

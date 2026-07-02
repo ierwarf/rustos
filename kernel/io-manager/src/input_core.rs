@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: inputd should own input event coalescing,
+// lossy/drop policy, and evdev translation. Ring0 keeps shared queue state only
+// as temporary hardware ingress substrate.
 //! In-kernel input event queue.
 //!
 //! Owns the bounded ingress ring used by hardware callbacks. Reader queue
@@ -325,3 +328,4 @@ mod tests {
         assert_eq!(events[1].code, POINTER_BUTTON_LEFT);
     }
 }
+// RING3-MIGRATION-REFERENCE END: inputd-owned input core policy.

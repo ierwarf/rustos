@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: usbdrv/driverd should own USB runtime
+// initialization, controller provider order, and service scheduling policy.
+// Ring0 keeps native host-controller discovery and service hooks.
 use alloc::vec::Vec;
 
 use crate::sync::KernelSpinLock as Mutex;
@@ -8,6 +11,7 @@ use super::host::{UsbHostControllerInfo, controller_kind_name};
 use super::xhci;
 
 const USB_SERVICE_ROUNDS: usize = 2;
+const ENABLE_NATIVE_XHCI: bool = option_env!("RUSTOS_NATIVE_XHCI").is_some();
 
 struct UsbRuntimeState {
     controllers: Vec<UsbHostControllerInfo>,
@@ -33,13 +37,18 @@ pub(crate) fn init() {
     }
 
     let controllers = scan_host_controllers();
-    let xhci_count = xhci::initialize(&controllers);
+    let xhci_count = if ENABLE_NATIVE_XHCI {
+        xhci::initialize(&controllers)
+    } else {
+        0
+    };
     state.controllers = controllers;
     state.runtime_initialized = true;
     crate::debug::println!(
-        "usb: in-kernel runtime initialized controllers={} xhci={}",
+        "usb: in-kernel runtime initialized controllers={} xhci={} native_xhci={}",
         state.controllers.len(),
-        xhci_count
+        xhci_count,
+        if ENABLE_NATIVE_XHCI { 1 } else { 0 }
     );
 }
 
@@ -51,7 +60,11 @@ pub(crate) fn service_pending() -> usize {
 
     let mut total = 0;
     for _ in 0..USB_SERVICE_ROUNDS {
-        let host_work = xhci::service_pending();
+        let host_work = if ENABLE_NATIVE_XHCI {
+            xhci::service_pending()
+        } else {
+            0
+        };
         let emulation_work = emulation::service_pending();
         let round_work = host_work + emulation_work;
         total += round_work;
@@ -110,3 +123,4 @@ fn scan_host_controllers() -> Vec<UsbHostControllerInfo> {
 
     controllers
 }
+// RING3-MIGRATION-REFERENCE END: usbdrv/driverd-owned USB manager policy.

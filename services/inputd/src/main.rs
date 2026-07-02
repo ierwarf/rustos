@@ -22,19 +22,21 @@ use rustos_user_abi::syscall::{
     INPUTD_HID_POLICY_KIND_POINTER, INPUTD_HID_POLICY_KIND_UNKNOWN,
     INPUTD_HID_POLICY_REPORT_CAPACITY, INPUTD_INGEST_MAX_EVENTS, INPUTD_INGRESS_KIND_EVENT,
     INPUTD_INGRESS_KIND_HID_KEYBOARD_REPORT, INPUTD_INGRESS_KIND_HID_POINTER_REPORT,
-    INPUTD_INGRESS_KIND_KEYBOARD, INPUTD_INGRESS_KIND_POINTER_ABSOLUTE,
-    INPUTD_INGRESS_KIND_POINTER_PACKET, INPUTD_IPC_ABI_VERSION, INPUTD_IPC_OP_AUTHORIZE_READ,
-    INPUTD_IPC_OP_DRAIN_INGEST, INPUTD_IPC_OP_PING, INPUTD_IPC_OP_READ, INPUTD_IPC_OP_STATS,
-    INPUTD_READ_FLAG_NONBLOCK, INPUTD_READ_PAYLOAD_CAPACITY, IPC_MAX_INLINE_BYTES,
-    IPC_SERVICE_INPUTD, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_INPUT_INGEST_BROKER,
-    SYS_RUSTOS_INPUT_STATS_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV,
-    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
+    INPUTD_INGRESS_KIND_HID_RAW_REPORT, INPUTD_INGRESS_KIND_KEYBOARD,
+    INPUTD_INGRESS_KIND_POINTER_ABSOLUTE, INPUTD_INGRESS_KIND_POINTER_PACKET,
+    INPUTD_IPC_ABI_VERSION, INPUTD_IPC_OP_AUTHORIZE_READ, INPUTD_IPC_OP_DRAIN_INGEST,
+    INPUTD_IPC_OP_PING, INPUTD_IPC_OP_READ, INPUTD_IPC_OP_STATS, INPUTD_READ_FLAG_NONBLOCK,
+    INPUTD_READ_PAYLOAD_CAPACITY, IPC_MAX_INLINE_BYTES, IPC_SERVICE_INPUTD, SYS_RUSTOS_DEBUG_PRINT,
+    SYS_RUSTOS_INPUT_INGEST_BROKER, SYS_RUSTOS_INPUT_STATS_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
+    SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
 };
 
 const RECV_BACKOFF: Duration = Duration::from_millis(50);
 const INPUTD_QUEUE_MAX_EVENTS: usize = 4096;
 const INPUTD_MAX_NATIVE_READ_BYTES: u64 = input_evdev::MAX_NATIVE_READ_BYTES as u64;
 const INPUTD_MAX_EVDEV_READ_BYTES: u64 = input_evdev::MAX_EVDEV_READ_BYTES as u64;
+const DEFAULT_POINTER_WIDTH: i32 = 1600;
+const DEFAULT_POINTER_HEIGHT: i32 = 900;
 static INPUT_DELIVERY_LOGGED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Default)]
@@ -221,6 +223,41 @@ impl InputQueue {
         }
     }
 
+    fn push_hid_raw_report(&mut self, raw: InputHidPolicyWire) {
+        let report_len = (raw.report_len as usize).min(raw.report.len());
+        let descriptor_len = (raw.descriptor_len as usize).min(raw.descriptor_prefix.len());
+        if report_len == 0 {
+            return;
+        }
+        let report = &raw.report[..report_len];
+        let descriptor = &raw.descriptor_prefix[..descriptor_len];
+        match raw.kind {
+            INPUTD_HID_POLICY_KIND_KEYBOARD => {
+                if let Some(keyboard) =
+                    decode_hid_keyboard_report(raw.source_id, descriptor, report)
+                {
+                    self.push_hid_keyboard_report(keyboard);
+                }
+            }
+            INPUTD_HID_POLICY_KIND_POINTER => {
+                if let Some(pointer) = decode_hid_pointer_report(raw.source_id, descriptor, report)
+                {
+                    self.push_hid_pointer_report(pointer);
+                }
+            }
+            _ => {
+                if let Some(pointer) = decode_hid_pointer_report(raw.source_id, descriptor, report)
+                {
+                    self.push_hid_pointer_report(pointer);
+                } else if let Some(keyboard) =
+                    decode_hid_keyboard_report(raw.source_id, descriptor, report)
+                {
+                    self.push_hid_keyboard_report(keyboard);
+                }
+            }
+        }
+    }
+
     fn push_keycode_event(&mut self, code: u32, pressed: bool) {
         self.push(input_evdev::InputEvent {
             kind: input_evdev::INPUT_KIND_KEYBOARD,
@@ -289,10 +326,146 @@ fn merge_coalesced_event(existing: &mut input_evdev::InputEvent, next: input_evd
     existing.value1 = existing.value1.saturating_add(next.value1);
 }
 
+fn decode_hid_keyboard_report(
+    source_id: u64,
+    descriptor: &[u8],
+    report: &[u8],
+) -> Option<InputHidKeyboardReportWire> {
+    if !report_descriptor_has_keyboard(descriptor) {
+        return None;
+    }
+    let report = strip_report_id(descriptor, report)?;
+    if report.len() < 8 {
+        return None;
+    }
+    let mut keys = [0_u8; 16];
+    let mut key_count = 0usize;
+    for usage in report[2..].iter().copied().filter(|usage| *usage != 0) {
+        if key_count >= keys.len() {
+            break;
+        }
+        keys[key_count] = usage;
+        key_count += 1;
+    }
+    Some(InputHidKeyboardReportWire {
+        source_id,
+        modifiers: report[0],
+        key_count: key_count as u8,
+        reserved0: [0; 6],
+        keys,
+    })
+}
+
+fn decode_hid_pointer_report(
+    source_id: u64,
+    descriptor: &[u8],
+    report: &[u8],
+) -> Option<InputHidPointerReportWire> {
+    if !report_descriptor_has_pointer(descriptor) {
+        return None;
+    }
+    let report = strip_report_id(descriptor, report)?;
+    let buttons = report.first().copied().unwrap_or(0) & 0x1f;
+
+    if pointer_descriptor_is_relative(descriptor) {
+        if report.len() < 3 {
+            return None;
+        }
+        return Some(InputHidPointerReportWire {
+            source_id,
+            buttons,
+            relative: 1,
+            reserved0: [0; 2],
+            x: i32::from(report[1] as i8),
+            y: i32::from(report[2] as i8),
+            wheel_vertical: report
+                .get(3)
+                .copied()
+                .map(|value| value as i8 as i16)
+                .unwrap_or(0),
+            reserved1: 0,
+        });
+    }
+
+    if report.len() < 5 {
+        return None;
+    }
+    let raw_x = u16::from_le_bytes([report[1], report[2]]) as i32;
+    let raw_y = u16::from_le_bytes([report[3], report[4]]) as i32;
+    let logical_max = pointer_descriptor_logical_max(descriptor).max(1);
+    Some(InputHidPointerReportWire {
+        source_id,
+        buttons,
+        relative: 0,
+        reserved0: [0; 2],
+        x: scale_pointer_coordinate(raw_x, logical_max, DEFAULT_POINTER_WIDTH - 1),
+        y: scale_pointer_coordinate(raw_y, logical_max, DEFAULT_POINTER_HEIGHT - 1),
+        wheel_vertical: report
+            .get(5)
+            .copied()
+            .map(|value| value as i8 as i16)
+            .unwrap_or(0),
+        reserved1: 0,
+    })
+}
+
+fn report_descriptor_has_keyboard(descriptor: &[u8]) -> bool {
+    let has_keyboard_usage = descriptor.windows(2).any(|item| item == [0x09, 0x06]);
+    let has_key_usage_page = descriptor.windows(2).any(|item| item == [0x05, 0x07]);
+    has_keyboard_usage && has_key_usage_page
+}
+
+fn report_descriptor_has_pointer(descriptor: &[u8]) -> bool {
+    let has_mouse_usage = descriptor.windows(2).any(|item| item == [0x09, 0x02]);
+    let has_x_usage = descriptor.windows(2).any(|item| item == [0x09, 0x30]);
+    let has_y_usage = descriptor.windows(2).any(|item| item == [0x09, 0x31]);
+    has_mouse_usage && has_x_usage && has_y_usage
+}
+
+fn strip_report_id<'a>(descriptor: &[u8], report: &'a [u8]) -> Option<&'a [u8]> {
+    let Some(report_id) = descriptor
+        .windows(2)
+        .find_map(|item| (item[0] == 0x85).then_some(item[1]))
+    else {
+        return Some(report);
+    };
+    (report.first().copied() == Some(report_id)).then_some(&report[1..])
+}
+
+fn pointer_descriptor_is_relative(descriptor: &[u8]) -> bool {
+    descriptor.windows(2).any(|item| item == [0x81, 0x06])
+        && !descriptor.windows(3).any(|item| item == [0x26, 0xff, 0x7f])
+}
+
+fn pointer_descriptor_logical_max(descriptor: &[u8]) -> i32 {
+    let mut max_value = 0_i32;
+    for item in descriptor.windows(3) {
+        if item[0] == 0x26 {
+            max_value = max_value.max(u16::from_le_bytes([item[1], item[2]]) as i32);
+        }
+    }
+    if max_value > 1 {
+        max_value
+    } else {
+        0x7fff
+    }
+}
+
+fn scale_pointer_coordinate(value: i32, logical_max: i32, target_max: i32) -> i32 {
+    if target_max <= 0 || logical_max <= 0 {
+        return 0;
+    }
+    let clamped = value.clamp(0, logical_max);
+    ((clamped as i64 * target_max as i64) / logical_max as i64) as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::InputQueue;
-    use rustos_user_abi::syscall::{InputKeyboardEventWire, InputPointerPacketWire};
+    use rustos_user_abi::syscall::{
+        InputHidPolicyWire, InputKeyboardEventWire, InputPointerPacketWire,
+        INPUTD_HID_POLICY_KIND_KEYBOARD, INPUTD_HID_POLICY_KIND_POINTER,
+    };
 
     fn pointer_motion(dx: i32, dy: i32) -> input_evdev::InputEvent {
         input_evdev::InputEvent {
@@ -337,6 +510,19 @@ mod tests {
             modifiers: 0,
             text: b'a' as u32,
         }
+    }
+
+    fn hid_raw(kind: u16, report: &[u8], descriptor: &[u8]) -> InputHidPolicyWire {
+        let mut raw = InputHidPolicyWire {
+            source_id: 7,
+            kind,
+            report_len: report.len() as u16,
+            descriptor_len: descriptor.len() as u16,
+            ..InputHidPolicyWire::default()
+        };
+        raw.report[..report.len()].copy_from_slice(report);
+        raw.descriptor_prefix[..descriptor.len()].copy_from_slice(descriptor);
+        raw
     }
 
     #[test]
@@ -395,6 +581,42 @@ mod tests {
         assert_eq!(event.action, input_evdev::INPUT_ACTION_PRESSED);
         assert_eq!(event.code, 30);
         assert_eq!(event.text, b'a' as u32);
+    }
+
+    #[test]
+    fn inputd_decodes_raw_hid_keyboard_report() {
+        let mut queue = InputQueue::default();
+        let descriptor = [0x05, 0x01, 0x09, 0x06, 0x05, 0x07];
+        let report = [0, 0, 0x04, 0, 0, 0, 0, 0];
+        queue.push_hid_raw_report(hid_raw(
+            INPUTD_HID_POLICY_KIND_KEYBOARD,
+            &report,
+            &descriptor,
+        ));
+
+        let event = queue.pop_front().unwrap();
+        assert_eq!(event.kind, input_evdev::INPUT_KIND_KEYBOARD);
+        assert_eq!(event.action, input_evdev::INPUT_ACTION_PRESSED);
+    }
+
+    #[test]
+    fn inputd_decodes_raw_hid_pointer_report() {
+        let mut queue = InputQueue::default();
+        let descriptor = [0x05, 0x01, 0x09, 0x02, 0x09, 0x30, 0x09, 0x31, 0x81, 0x06];
+        let report = [1, 7_u8, 0xfd_u8];
+        queue.push_hid_raw_report(hid_raw(
+            INPUTD_HID_POLICY_KIND_POINTER,
+            &report,
+            &descriptor,
+        ));
+
+        let motion = queue.pop_front().unwrap();
+        assert_eq!(motion.kind, input_evdev::INPUT_KIND_POINTER_MOTION);
+        assert_eq!(motion.value0, 7);
+        assert_eq!(motion.value1, -3);
+        let button = queue.pop_front().unwrap();
+        assert_eq!(button.kind, input_evdev::INPUT_KIND_POINTER_BUTTON);
+        assert_eq!(button.action, input_evdev::INPUT_ACTION_PRESSED);
     }
 }
 
@@ -618,6 +840,9 @@ fn drain_ingest(queue: &mut InputQueue) -> Result<usize, i32> {
             }
             INPUTD_INGRESS_KIND_HID_POINTER_REPORT if wire.access == INPUTD_ACCESS_NATIVE => {
                 queue.push_hid_pointer_report(wire.hid_pointer);
+            }
+            INPUTD_INGRESS_KIND_HID_RAW_REPORT if wire.access == INPUTD_ACCESS_NATIVE => {
+                queue.push_hid_raw_report(wire.hid_raw);
             }
             _ => {}
         }

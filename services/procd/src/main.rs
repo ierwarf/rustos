@@ -5,6 +5,7 @@ extern crate alloc;
 
 use alloc::collections::BTreeMap;
 use core::mem::size_of;
+use core::panic::PanicInfo;
 
 use rustos_svc_runtime::ipc;
 use rustos_svc_runtime::syscall::{syscall1, syscall5};
@@ -28,9 +29,9 @@ use rustos_user_abi::syscall::{
     PROCD_SELECT_SIGNAL_HANDLER, PROCD_SELECT_SIGNAL_IGNORE, PROCD_SELECT_SIGNAL_NONE,
     PROCD_SELECT_SIGNAL_TERMINATE, PROC_BROKER_ABI_VERSION, PROC_BROKER_FORMAT_ELF64,
     PROC_BROKER_FORMAT_PE64, SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_PROCESS_EXIT,
-    SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
-    SYS_RUSTOS_PROC_AUTHORIZE_EXEC_BROKER, SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER,
-    SYS_RUSTOS_PROC_FORK_BROKER, SYS_RUSTOS_PROC_SIGNAL_QUEUE_BROKER,
+    SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER, SYS_RUSTOS_PROC_AUTHORIZE_EXEC_BROKER,
+    SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER, SYS_RUSTOS_PROC_FORK_BROKER,
+    SYS_RUSTOS_PROC_SIGNAL_QUEUE_BROKER,
 };
 use spin::Mutex;
 
@@ -55,6 +56,14 @@ static THREAD_SIGNAL_POLICY: Mutex<BTreeMap<(u64, u64), ThreadSignalPolicy>> =
     Mutex::new(BTreeMap::new());
 
 rustos_svc_runtime::entry!(service_main);
+
+#[panic_handler]
+fn panic(_info: &PanicInfo<'_>) -> ! {
+    loop {}
+}
+
+#[no_mangle]
+pub extern "C" fn rust_eh_personality() {}
 
 fn service_main() {
     let endpoint = ipc::endpoint_create();
@@ -237,11 +246,8 @@ fn handle_commercial_request(
             response.value0 = u64::from(format);
             response.value1 = PROC_BROKER_ABI_VERSION as u64;
             response.descriptor_count = 1;
-            response.descriptors[0] = procd_descriptor(
-                "process-prepare",
-                request.header.op,
-                response.value0,
-            );
+            response.descriptors[0] =
+                procd_descriptor("process-prepare", request.header.op, response.value0);
             response.capability = procd_capability("process-prepare", request.header.op);
         }
         COMMERCIAL_MAX_PROCD_OP_EXEC_TICKET => {

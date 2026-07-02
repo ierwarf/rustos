@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: DriverKernelApiV1 is an explicit ring0
+// substrate exception for Linux .ko compatibility. Policy belongs in driverd,
+// while privileged DMA/MMIO/IRQ/user-copy hooks stay in kernel.
 use core::{ptr, slice, str};
 
 use driver_abi::{
@@ -350,3 +353,4 @@ fn driver_pci_device_info(device: crate::arch::pci::PciDevice) -> DriverPciDevic
         reserved0: 0,
     }
 }
+// RING3-MIGRATION-REFERENCE END: Linux .ko kernel API compatibility substrate exception.

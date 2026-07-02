@@ -1,3 +1,7 @@
+// RING3-MIGRATION-REFERENCE START: inputd/driverd should own the non-.ko i8042
+// service-driver once a ring3 service-driver host can drive PS/2 command bytes
+// and IRQ delivery through narrow leases. Ring0 keeps this controller path as
+// privileged legacy input substrate until that host exists.
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -866,3 +870,4 @@ fn read_status() -> u8 {
 const fn is_ignorable_command_response(byte: u8) -> bool {
     byte == DEVICE_RESPONSE_SELF_TEST_PASSED
 }
+// RING3-MIGRATION-REFERENCE END: inputd/driverd-owned non-.ko i8042 service-driver.

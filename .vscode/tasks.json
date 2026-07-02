@@ -10,7 +10,11 @@
         "build"
       ],
       "options": {
-        "cwd": "${workspaceFolder}"
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "RUSTOS_NATIVE_XHCI": "1",
+          "RUSTOS_NATIVE_XHCI_HID_POLL": "1"
+        }
       },
       "problemMatcher": []
     }

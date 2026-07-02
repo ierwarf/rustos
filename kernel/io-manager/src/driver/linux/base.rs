@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: Linux .ko base helper shims are explicit
+// ring0 compatibility substrate. Policy belongs in driverd/syscalld, but these
+// ABI helpers stay in kernel for in-kernel Linux module execution.
 use alloc::alloc::{Layout, alloc, alloc_zeroed, dealloc, realloc};
 use alloc::vec::Vec;
 use core::ffi::{c_char, c_void};
@@ -150,6 +153,7 @@ pub(crate) unsafe extern "C" fn simple_strtoul(
         }
     }
 }
+// RING3-MIGRATION-REFERENCE END: Linux .ko base helper compatibility substrate exception.
 
 pub(crate) unsafe extern "C" fn kfree(ptr: *const c_void) {
     if zero_or_null_ptr(ptr) || !take_compat_allocation(ptr) {

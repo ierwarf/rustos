@@ -5,11 +5,10 @@ extern crate alloc;
 
 pub mod allocator;
 pub mod ipc;
-#[cfg(not(test))]
-mod panic;
 pub mod syscall;
 
 use core::ptr;
+use core::slice;
 
 use rustos_user_abi::syscall::{AT_RUSTOS_BOOTSTRAP_HEAP_BASE, AT_RUSTOS_BOOTSTRAP_HEAP_LEN};
 
@@ -54,6 +53,74 @@ pub unsafe fn __runtime_entry(stack_ptr: *const u64, main: fn()) -> ! {
     allocator::init(bootstrap);
     main();
     syscall::exit_group(0)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memset(dest: *mut u8, value: i32, len: usize) -> *mut u8 {
+    if !dest.is_null() && len != 0 {
+        let byte = value as u8;
+        let mut index = 0;
+        while index < len {
+            ptr::write_volatile(dest.add(index), byte);
+            index += 1;
+        }
+    }
+    dest
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, len: usize) -> *mut u8 {
+    if !dest.is_null() && !src.is_null() && len != 0 {
+        let mut index = 0;
+        while index < len {
+            let byte = ptr::read_volatile(src.add(index));
+            ptr::write_volatile(dest.add(index), byte);
+            index += 1;
+        }
+    }
+    dest
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, len: usize) -> *mut u8 {
+    if !dest.is_null() && !src.is_null() && len != 0 {
+        if (dest as usize) <= (src as usize) {
+            let mut index = 0;
+            while index < len {
+                let byte = ptr::read_volatile(src.add(index));
+                ptr::write_volatile(dest.add(index), byte);
+                index += 1;
+            }
+        } else {
+            let mut index = len;
+            while index != 0 {
+                index -= 1;
+                let byte = ptr::read_volatile(src.add(index));
+                ptr::write_volatile(dest.add(index), byte);
+            }
+        }
+    }
+    dest
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memcmp(lhs: *const u8, rhs: *const u8, len: usize) -> i32 {
+    if lhs.is_null() || rhs.is_null() || len == 0 {
+        return 0;
+    }
+    let lhs = slice::from_raw_parts(lhs, len);
+    let rhs = slice::from_raw_parts(rhs, len);
+    for (left, right) in lhs.iter().zip(rhs.iter()) {
+        if left != right {
+            return (*left as i32) - (*right as i32);
+        }
+    }
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn _Unwind_Resume() -> ! {
+    syscall::exit_group(101)
 }
 
 /// Parsed view of the bootstrap heap auxv pair handed to the service by the

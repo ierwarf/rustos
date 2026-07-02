@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: procd/syscalld should own futex and Linux
+// clone/thread policy. Ring0 keeps scheduler handoff, wait queues, and
+// current-process user-copy substrate.
 use super::*;
 use lazy_static::lazy_static;
 use spin::Mutex;
@@ -471,11 +474,7 @@ pub fn syscall_linux_arch_prctl(_code: u64, _arg: u64) -> u64 {
             else {
                 return linux_errno(LINUX_ENOSYS);
             };
-            if result {
-                0
-            } else {
-                linux_errno(LINUX_ENOSYS)
-            }
+            if result { 0 } else { linux_errno(LINUX_ENOSYS) }
         }
         linux_abi::ARCH_GET_FS => {
             let fs = x86_64::registers::model_specific::FsBase::read().as_u64();
@@ -568,6 +567,7 @@ pub fn syscall_linux_set_robust_list(head_ptr: u64, len: u64) -> u64 {
         Err(errno) => linux_errno(errno),
     }
 }
+// RING3-MIGRATION-REFERENCE END: procd/syscalld-owned futex/thread policy.
 
 pub fn syscall_linux_get_robust_list(pid: u64, head_ptr_ptr: u64, len_ptr: u64) -> u64 {
     let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_GET_ROBUST_LIST);

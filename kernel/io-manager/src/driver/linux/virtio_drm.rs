@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: Linux .ko virtio-drm shims are explicit
+// ring0 compatibility substrate. Display/provider policy belongs in
+// uiserver/driverd.
 use core::ffi::{c_char, c_void};
 
 static COMPAT_DATA: [usize; 64] = [0; 64];
@@ -391,3 +394,4 @@ fn resolve_alloc_stub(name: &str) -> usize {
         _ => compat_alloc as *const () as usize,
     }
 }
+// RING3-MIGRATION-REFERENCE END: Linux .ko virtio-drm compatibility substrate exception.

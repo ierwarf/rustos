@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: driverd should own driver/provider policy,
+// alias matching, and service-driver selection. Ring0 keeps Linux .ko loading,
+// DMA/MMIO/IRQ substrate, and narrow broker hooks.
 mod bus;
 mod class;
 mod devres;
@@ -120,10 +123,16 @@ pub fn hardware_alias_present(alias: &str, class: u32, bus: u32) -> bool {
     match bus {
         DriverBus::Platform => {
             matches!((class, alias), (DriverClass::Display, BOOTFB_ALIAS))
+                && !virtio_gpu::primary_display_enabled()
                 && crate::storage::boot_volume::boot_framebuffer_info().is_some()
         }
         DriverBus::Pci => pci_alias_present(alias),
-        DriverBus::Virtio => virtio_alias_present(alias),
+        DriverBus::Virtio => {
+            if class == DriverClass::Display && virtio_gpu::primary_display_enabled() {
+                return false;
+            }
+            virtio_alias_present(alias)
+        }
         DriverBus::Usb => usb_alias_present(alias, class),
         DriverBus::Serio => serio_alias_present(alias),
         _ => false,
@@ -155,6 +164,8 @@ fn decode_class(value: u32) -> Option<DriverClass> {
         value if value == DriverClass::Display as u32 => Some(DriverClass::Display),
         value if value == DriverClass::Input as u32 => Some(DriverClass::Input),
         value if value == DriverClass::Network as u32 => Some(DriverClass::Network),
+        value if value == DriverClass::Usb as u32 => Some(DriverClass::Usb),
+        value if value == DriverClass::Storage as u32 => Some(DriverClass::Storage),
         _ => None,
     }
 }
@@ -224,7 +235,7 @@ fn serio_alias_present(alias: &str) -> bool {
 
 fn pci_alias_matches(alias: &str, pci: crate::arch::pci::PciDevice) -> bool {
     let Some((matches_vendor, mut offset)) =
-        match_hex_field_at(alias, 0, "pci:v", u32::from(pci.vendor_id()), 8)
+        match_hex_field_at_with(alias, 0, "pci:v", || u32::from(pci.vendor_id()), 8)
     else {
         return false;
     };
@@ -233,7 +244,7 @@ fn pci_alias_matches(alias: &str, pci: crate::arch::pci::PciDevice) -> bool {
     }
 
     if let Some((matches_device, new_offset)) =
-        match_hex_field_at(alias, offset, "d", u32::from(pci.device_id()), 8)
+        match_hex_field_at_with(alias, offset, "d", || u32::from(pci.device_id()), 8)
     {
         if !matches_device {
             return false;
@@ -241,12 +252,21 @@ fn pci_alias_matches(alias: &str, pci: crate::arch::pci::PciDevice) -> bool {
         offset = new_offset;
     }
 
-    let _ = offset;
-    optional_hex_field_matches(alias, "sv", u32::from(pci.subsystem_vendor_id()), 8)
-        && optional_hex_field_matches(alias, "sd", u32::from(pci.subsystem_device_id()), 8)
-        && optional_hex_field_matches(alias, "bc", u32::from(pci.class_code()), 2)
-        && optional_hex_field_matches(alias, "sc", u32::from(pci.subclass()), 2)
-        && optional_hex_field_matches(alias, "i", u32::from(pci.prog_if()), 2)
+    optional_hex_field_matches_at(
+        alias,
+        &mut offset,
+        "sv",
+        || u32::from(pci.subsystem_vendor_id()),
+        8,
+    ) && optional_hex_field_matches_at(
+        alias,
+        &mut offset,
+        "sd",
+        || u32::from(pci.subsystem_device_id()),
+        8,
+    ) && optional_hex_field_matches_at(alias, &mut offset, "bc", || u32::from(pci.class_code()), 2)
+        && optional_hex_field_matches_at(alias, &mut offset, "sc", || u32::from(pci.subclass()), 2)
+        && optional_hex_field_matches_at(alias, &mut offset, "i", || u32::from(pci.prog_if()), 2)
 }
 
 fn virtio_device_type(device_id: u16) -> Option<u32> {
@@ -260,12 +280,28 @@ fn virtio_device_type(device_id: u16) -> Option<u32> {
     }
 }
 
-fn optional_hex_field_matches(alias: &str, marker: &str, value: u32, digits: usize) -> bool {
-    let Some(offset) = alias.find(marker) else {
-        return true;
+fn optional_hex_field_matches_at<F>(
+    alias: &str,
+    offset: &mut usize,
+    marker: &str,
+    value: F,
+    digits: usize,
+) -> bool
+where
+    F: FnOnce() -> u32,
+{
+    let Some(rest) = alias.get(*offset..) else {
+        return false;
     };
-    match_hex_field_at(alias, offset, marker, value, digits)
-        .map(|(matches, _)| matches)
+    if !rest.starts_with(marker) {
+        return true;
+    }
+
+    match_hex_field_at_with(alias, *offset, marker, value, digits)
+        .map(|(matches, new_offset)| {
+            *offset = new_offset;
+            matches
+        })
         .unwrap_or(false)
 }
 
@@ -276,6 +312,19 @@ fn match_hex_field_at(
     value: u32,
     digits: usize,
 ) -> Option<(bool, usize)> {
+    match_hex_field_at_with(alias, offset, marker, || value, digits)
+}
+
+fn match_hex_field_at_with<F>(
+    alias: &str,
+    offset: usize,
+    marker: &str,
+    value: F,
+    digits: usize,
+) -> Option<(bool, usize)>
+where
+    F: FnOnce() -> u32,
+{
     let rest = alias.get(offset..)?;
     if !rest.starts_with(marker) {
         return None;
@@ -287,7 +336,7 @@ fn match_hex_field_at(
     let value_end = value_start.checked_add(digits)?;
     let field = alias.get(value_start..value_end)?;
     let parsed = parse_fixed_hex(field)?;
-    Some((parsed == value, value_end))
+    Some((parsed == value(), value_end))
 }
 
 fn parse_fixed_hex(field: &str) -> Option<u32> {
@@ -303,3 +352,4 @@ fn parse_fixed_hex(field: &str) -> Option<u32> {
     }
     Some(value)
 }
+// RING3-MIGRATION-REFERENCE END: driverd-owned driver/provider policy.

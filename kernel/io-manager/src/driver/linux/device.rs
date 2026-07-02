@@ -1,3 +1,5 @@
+// RING3-MIGRATION-REFERENCE START: Linux .ko device-model shims are explicit
+// ring0 compatibility substrate. Device policy belongs in devmgrd/driverd.
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ffi::{c_char, c_void};
@@ -672,3 +674,4 @@ fn store_device_name(owner: usize, bytes: &[u8]) -> *const u8 {
     });
     names.last().expect("device name storage").bytes.as_ptr()
 }
+// RING3-MIGRATION-REFERENCE END: Linux .ko device-model compatibility substrate exception.

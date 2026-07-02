@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: rootd should own service namespace and
+// capability policy. Ring0 keeps endpoint tables, copy/handle transfer, and IPC
+// delivery substrate.
 use super::*;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -8,6 +11,15 @@ use kernel_ipc_runtime::api::{KernelEndpointHandle, KernelReplyHandle, KernelTra
 use lazy_static::lazy_static;
 use spin::Mutex;
 
+macro_rules! ipc_trace {
+    ($($arg:tt)*) => {
+        if IPC_TRACE_VERBOSE {
+            debug::println_emergency(format_args!($($arg)*));
+        }
+    };
+}
+
+const IPC_TRACE_VERBOSE: bool = false;
 const MAX_SERVICE_ENDPOINTS: usize = 16;
 const MAX_PENDING_TRANSFER_OBJECTS: usize = 1024;
 const SLOW_IPC_THRESHOLD_MS: u64 = 10;
@@ -49,6 +61,14 @@ pub(super) fn dispatch_linux_rustos_ipc_syscall(frame: &SyscallFrame) -> u64 {
     match frame.rax {
         linux_abi::SYS_RUSTOS_IPC_ENDPOINT_CREATE => syscall_linux_rustos_ipc_endpoint_create(),
         linux_abi::SYS_RUSTOS_IPC_CALL => {
+            ipc_trace!(
+                "ipc dispatch call: rdi={} rsi={:#x} rdx={} r10={:#x} r8={:#x}",
+                frame.rdi,
+                frame.rsi,
+                frame.rdx,
+                frame.r10,
+                frame.r8
+            );
             syscall_linux_rustos_ipc_call(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
         }
         linux_abi::SYS_RUSTOS_IPC_RECV => {
@@ -112,7 +132,7 @@ pub(crate) fn cleanup_service_endpoints_for_process(process_id: u64) {
             SERVICE_ENDPOINTS[i].store(0, Ordering::Release);
             SERVICE_ENDPOINT_OWNERS[i].store(0, Ordering::Release);
             SERVICE_ENDPOINT_CAPS[i].store(0, Ordering::Release);
-            debug::println!(
+            ipc_trace!(
                 "ipc service endpoint revoked on process exit: index={} process={}",
                 i,
                 process_id
@@ -137,22 +157,6 @@ pub(super) fn current_process_has_service_capability(capability: u64) -> bool {
         })
 }
 
-pub(super) fn current_process_has_any_service_capability(capability_mask: u64) -> bool {
-    if capability_mask == 0 {
-        return false;
-    }
-    let Some(process_id) = multitask::current_user_process_id() else {
-        return false;
-    };
-    SERVICE_ENDPOINT_OWNERS
-        .iter()
-        .zip(SERVICE_ENDPOINT_CAPS.iter())
-        .any(|(owner, caps)| {
-            owner.load(Ordering::Acquire) == process_id
-                && caps.load(Ordering::Acquire) & capability_mask != 0
-        })
-}
-
 fn service_endpoint_raw(service_id: u64) -> Option<u64> {
     service_index(service_id).map(|index| SERVICE_ENDPOINTS[index].load(Ordering::Acquire))
 }
@@ -166,9 +170,10 @@ pub(super) fn syscall_linux_rustos_ipc_endpoint_create() -> u64 {
     let Some(task_id) = multitask::current_task_id() else {
         return linux_errno(LINUX_EINVAL);
     };
+    ipc_trace!("ipc endpoint create: task={}", task_id);
     match kernel_ipc_runtime::api::create_endpoint_for_task(task_id) {
         Ok(endpoint) => {
-            debug::println!(
+            ipc_trace!(
                 "ipc endpoint created: task={} endpoint={}",
                 task_id,
                 endpoint.raw()
@@ -186,6 +191,11 @@ pub(super) fn syscall_linux_rustos_ipc_register_linux_syscall_endpoint(endpoint:
     let Some(process_id) = multitask::current_user_process_id() else {
         return linux_errno(LINUX_EINVAL);
     };
+    ipc_trace!(
+        "ipc register linux syscall endpoint: process={} endpoint={}",
+        process_id,
+        endpoint
+    );
     LINUX_SYSCALL_ENDPOINT.store(endpoint, Ordering::Release);
     SERVICE_ENDPOINTS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
         .store(endpoint, Ordering::Release);
@@ -195,7 +205,7 @@ pub(super) fn syscall_linux_rustos_ipc_register_linux_syscall_endpoint(endpoint:
         rustos_user_abi::syscall::IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY,
         Ordering::Release,
     );
-    debug::println!(
+    ipc_trace!(
         "ipc service registered: service={} endpoint={} owner={} caps={:#x}",
         linux_abi::IPC_SERVICE_LINUX_SYSCALLD,
         endpoint,
@@ -215,11 +225,17 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
     let Some(process_id) = multitask::current_user_process_id() else {
         return linux_errno(LINUX_EINVAL);
     };
+    ipc_trace!(
+        "ipc register service endpoint: service={} process={} endpoint={}",
+        service_id,
+        process_id,
+        endpoint
+    );
     if endpoint == 0 {
         SERVICE_ENDPOINTS[index].store(0, Ordering::Release);
         SERVICE_ENDPOINT_OWNERS[index].store(0, Ordering::Release);
         SERVICE_ENDPOINT_CAPS[index].store(0, Ordering::Release);
-        debug::println!("ipc service revoked: service={}", service_id);
+        ipc_trace!("ipc service revoked: service={}", service_id);
         return 0;
     }
     if SERVICE_ENDPOINTS[index].load(Ordering::Acquire) != 0 {
@@ -232,7 +248,7 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
     SERVICE_ENDPOINTS[index].store(endpoint, Ordering::Release);
     SERVICE_ENDPOINT_OWNERS[index].store(process_id, Ordering::Release);
     SERVICE_ENDPOINT_CAPS[index].store(capability, Ordering::Release);
-    debug::println!(
+    ipc_trace!(
         "ipc service registered: service={} endpoint={} owner={} caps={:#x}",
         service_id,
         endpoint,
@@ -270,6 +286,7 @@ fn service_capability(service_id: u64) -> u64 {
 }
 
 pub(super) fn syscall_linux_rustos_ipc_lookup_service_endpoint(service_id: u64) -> u64 {
+    ipc_trace!("ipc lookup service endpoint: service={}", service_id);
     let Some(raw) = service_endpoint_raw(service_id) else {
         return linux_errno(LINUX_EINVAL);
     };
@@ -287,17 +304,37 @@ pub(super) fn syscall_linux_rustos_ipc_call(
     reply_capacity: u64,
 ) -> u64 {
     let endpoint = KernelEndpointHandle::from_raw(endpoint);
+    ipc_trace!(
+        "ipc call start: endpoint={} request_ptr={:#x} request_len={} reply_ptr={:#x} reply_capacity={}",
+        endpoint.raw(),
+        request_ptr,
+        request_len,
+        reply_ptr,
+        reply_capacity
+    );
     let start_ticks = crate::arch::rtc::ticks();
     let request = match copy_request_from_user(request_ptr, request_len) {
         Ok(request) => request,
         Err(errno) => return linux_errno(errno),
     };
+    ipc_trace!(
+        "ipc call copied: endpoint={} request_len={}",
+        endpoint.raw(),
+        request.len()
+    );
     let copy_ticks = crate::arch::rtc::ticks();
     let reply = match enqueue_call_and_wake(endpoint, request.as_slice()) {
         Ok(reply) => reply,
         Err(errno) => return linux_errno(errno),
     };
+    ipc_trace!(
+        "ipc call enqueued: endpoint={} request_len={} reply_cap={}",
+        endpoint.raw(),
+        request.len(),
+        reply.raw()
+    );
     let send_ticks = crate::arch::rtc::ticks();
+    ipc_trace!("ipc call waiting: endpoint={}", endpoint.raw());
     let response = match wait_for_reply(reply) {
         Ok(response) => response,
         Err(errno) => return linux_errno(errno),
@@ -337,12 +374,25 @@ pub(super) fn syscall_linux_rustos_ipc_recv(
     reply_cap_ptr: u64,
 ) -> u64 {
     let endpoint = KernelEndpointHandle::from_raw(endpoint);
+    ipc_trace!(
+        "ipc recv start: endpoint={} request_ptr={:#x} request_capacity={} reply_cap_ptr={:#x}",
+        endpoint.raw(),
+        request_ptr,
+        request_capacity,
+        reply_cap_ptr
+    );
     let Ok(request_capacity) = usize::try_from(request_capacity) else {
         return linux_errno(LINUX_EINVAL);
     };
     loop {
         match kernel_ipc_runtime::api::recv_endpoint_with_limit(endpoint, request_capacity) {
             Ok(Some((reply, request))) => {
+                ipc_trace!(
+                    "ipc recv delivered: endpoint={} request_len={} reply_cap={}",
+                    endpoint.raw(),
+                    request.len(),
+                    reply.raw()
+                );
                 if !request.is_empty() {
                     if let Err(err) = usermem::write_current_user_bytes(request_ptr, &request) {
                         return linux_errno(address_space_error_to_linux_errno(err));
@@ -371,6 +421,12 @@ pub(super) fn syscall_linux_rustos_ipc_recv(
                         return linux_errno(ipc_error_to_linux_errno(err));
                     }
                 };
+                ipc_trace!(
+                    "ipc recv wait armed: endpoint={} task={} pending={}",
+                    endpoint.raw(),
+                    task_id,
+                    pending
+                );
                 if pending {
                     let _ = multitask::commit_block_current_task();
                     continue;
@@ -392,6 +448,13 @@ pub(super) fn syscall_linux_rustos_ipc_try_recv(
     request_capacity: u64,
     reply_cap_ptr: u64,
 ) -> u64 {
+    ipc_trace!(
+        "ipc try recv start: endpoint={} request_ptr={:#x} request_capacity={} reply_cap_ptr={:#x}",
+        endpoint,
+        request_ptr,
+        request_capacity,
+        reply_cap_ptr
+    );
     recv_endpoint_once(endpoint, request_ptr, request_capacity, reply_cap_ptr)
         .map_or_else(linux_errno, |received| received as u64)
 }
@@ -784,8 +847,19 @@ fn enqueue_call_and_wake_with_handles(
         attached_handles,
     )
     .map_err(ipc_error_to_linux_errno)?;
+    ipc_trace!(
+        "ipc call queued: endpoint={} receiver_to_wake={:?}",
+        endpoint.raw(),
+        receiver_to_wake
+    );
     if let Some(receiver_task_id) = receiver_to_wake {
-        let _ = multitask::wake_task(receiver_task_id);
+        let woke = multitask::wake_task(receiver_task_id);
+        ipc_trace!(
+            "ipc call wake: endpoint={} receiver_task={} woke={}",
+            endpoint.raw(),
+            receiver_task_id,
+            woke
+        );
         // L4-style direct switch: hint the scheduler to run the receiver next,
         // so the caller's subsequent `yield_now` in `wait_for_reply` immediately
         // hands the CPU to the service task. Without this, the receiver waits
@@ -856,9 +930,18 @@ fn export_current_fds_for_ipc(
     }
 
     let fds = read_user_fd_array(fds_ptr, fd_count)?;
+    export_current_fds_for_transfer(fds.as_slice())
+}
+
+pub(super) fn export_current_fds_for_transfer(
+    fds: &[i32],
+) -> Result<Vec<KernelTransferredHandle>, i64> {
+    if fds.len() > rustos_user_abi::syscall::IPC_MAX_TRANSFER_HANDLES {
+        return Err(LINUX_EINVAL);
+    }
     let Some(entries) = multitask::with_current_user_process_state(|_, _, process_state| {
         let mut entries = Vec::with_capacity(fds.len());
-        for fd in fds {
+        for &fd in fds {
             if fd < 0 {
                 return Err(LINUX_EBADF);
             }
@@ -957,6 +1040,24 @@ fn install_received_handles(
     fd_count_ptr: u64,
 ) -> Result<(), i64> {
     validate_received_handle_outputs(fds_ptr, fd_count_ptr, descriptors.len())?;
+    let fds = install_transfer_descriptors_for_current_process(descriptors)?;
+
+    if !fds.is_empty() {
+        let bytes = unsafe {
+            core::slice::from_raw_parts(fds.as_ptr().cast::<u8>(), fds.len() * size_of::<i32>())
+        };
+        usermem::write_current_user_bytes(fds_ptr, bytes)
+            .map_err(address_space_error_to_linux_errno)?;
+    }
+    let count = u16::try_from(fds.len()).map_err(|_| LINUX_EOVERFLOW)?;
+    usermem::write_current_user_bytes(fd_count_ptr, &count.to_ne_bytes())
+        .map_err(address_space_error_to_linux_errno)?;
+    Ok(())
+}
+
+pub(super) fn install_transfer_descriptors_for_current_process(
+    descriptors: &[KernelTransferredHandle],
+) -> Result<Vec<i32>, i64> {
     let entries = take_transfer_entries(descriptors)?;
     let Some(fds) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
         let mut fds = Vec::with_capacity(entries.len());
@@ -971,19 +1072,7 @@ fn install_received_handles(
     }) else {
         return Err(LINUX_EINVAL);
     };
-    let fds = fds?;
-
-    if !fds.is_empty() {
-        let bytes = unsafe {
-            core::slice::from_raw_parts(fds.as_ptr().cast::<u8>(), fds.len() * size_of::<i32>())
-        };
-        usermem::write_current_user_bytes(fds_ptr, bytes)
-            .map_err(address_space_error_to_linux_errno)?;
-    }
-    let count = u16::try_from(fds.len()).map_err(|_| LINUX_EOVERFLOW)?;
-    usermem::write_current_user_bytes(fd_count_ptr, &count.to_ne_bytes())
-        .map_err(address_space_error_to_linux_errno)?;
-    Ok(())
+    fds
 }
 
 fn take_transfer_entries(
@@ -1081,7 +1170,7 @@ fn log_slow_ipc_call(
         let send_ms = ticks_elapsed_ms(export_ticks, send_ticks);
         let wait_ms = ticks_elapsed_ms(send_ticks, wait_ticks);
         let write_ms = ticks_elapsed_ms(wait_ticks, write_ticks);
-        debug::println!(
+        ipc_trace!(
             "ipc slow {}: endpoint={} total_ms={} copy_ms={} export_ms={} send_ms={} wait_ms={} write_ms={} request_len={} response_len={}",
             kind,
             endpoint,
@@ -1096,25 +1185,7 @@ fn log_slow_ipc_call(
         );
     });
 }
-
-fn log_slow_ipc_recv(
-    kind: &str,
-    endpoint: u64,
-    start_ticks: u64,
-    recv_ticks: u64,
-    request_len: usize,
-) {
-    let total_ms = ticks_elapsed_ms(start_ticks, recv_ticks);
-    maybe_log_slow_ipc(total_ms, || {
-        debug::println!(
-            "ipc slow {}: endpoint={} total_ms={} request_len={}",
-            kind,
-            endpoint,
-            total_ms,
-            request_len,
-        );
-    });
-}
+// RING3-MIGRATION-REFERENCE END: rootd-owned IPC namespace/capability policy.
 
 fn log_slow_ipc_reply(
     kind: &str,
@@ -1128,7 +1199,7 @@ fn log_slow_ipc_reply(
     maybe_log_slow_ipc(total_ms, || {
         let copy_ms = ticks_elapsed_ms(start_ticks, copy_ticks);
         let reply_ms = ticks_elapsed_ms(copy_ticks, reply_ticks);
-        debug::println!(
+        ipc_trace!(
             "ipc slow {}: reply={} total_ms={} copy_ms={} reply_ms={} response_len={}",
             kind,
             reply,

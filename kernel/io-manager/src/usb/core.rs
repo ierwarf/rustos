@@ -1,3 +1,7 @@
+// RING3-MIGRATION-REFERENCE START: driverd/devmgrd/inputd should own USB
+// interface admission, provider matching, and class routing. Ring0 keeps Linux
+// .ko callback invocation plus compat object lifetime as the privileged bridge
+// substrate until those policies are brokered by services.
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ffi::c_void;
@@ -6,8 +10,8 @@ use core::ptr;
 use crate::sync::KernelSpinLock as Mutex;
 
 use crate::driver::linux::compat::{
-    LinuxCompatUsbBus, LinuxCompatUsbDevice, LinuxCompatUsbDriver,
-    LinuxCompatUsbHostEndpoint, LinuxCompatUsbHostInterface, LinuxCompatUsbInterface,
+    LinuxCompatUsbBus, LinuxCompatUsbDevice, LinuxCompatUsbDriver, LinuxCompatUsbHostEndpoint,
+    LinuxCompatUsbHostInterface, LinuxCompatUsbInterface,
 };
 
 const USB_DT_DEVICE: u8 = 0x01;
@@ -459,154 +463,9 @@ pub(crate) fn find_interface(
     ptr::null_mut()
 }
 
-// RING3-MIGRATION-COMMENTED-OUT START: devmgrd/inputd should own USB interface
-// class routing and driver-match policy. Ring0 keeps Linux .ko callback
-// invocation and compat object lifetime as substrate.
-/*
-fn bind_all_drivers_to_interface(interface_index: usize) {
-    let drivers = USB_DRIVERS.lock().clone();
-    for (driver_index, driver) in drivers.iter().enumerate() {
-        let driver_ptr = driver.ptr as *mut LinuxCompatUsbDriver;
-        if try_bind_interface_to_driver(interface_index, driver_index, driver_ptr) {
-            return;
-        }
-    }
-}
-
-fn bind_driver_to_interfaces(driver_index: usize, driver: *mut LinuxCompatUsbDriver) {
-    let interfaces = USB_INTERFACES.lock().len();
-    for interface_index in 0..interfaces {
-        if try_bind_interface_to_driver(interface_index, driver_index, driver) {
-            continue;
-        }
-    }
-}
-
-fn try_bind_interface_to_driver(
-    interface_index: usize,
-    driver_index: usize,
-    driver: *mut LinuxCompatUsbDriver,
-) -> bool {
-    if driver.is_null() {
-        return false;
-    }
-
-    let (interface_ptr, id_match) = {
-        let mut interfaces = USB_INTERFACES.lock();
-        let Some(interface) = interfaces.get_mut(interface_index) else {
-            return false;
-        };
-        if interface.bound_driver.is_some() {
-            return false;
-        }
-        let Some(id_match) = match_interface_id(interface, unsafe { (*driver).id_table }) else {
-            return false;
-        };
-        let interface_ptr = interface.ptr as *mut LinuxCompatUsbInterface;
-        unsafe {
-            (*interface_ptr).dev.driver = &mut (*driver).driver;
-            (*interface_ptr).flags_bits &= !USB_INTERFACE_FLAG_NEEDS_BINDING;
-        }
-        (interface_ptr, id_match)
-    };
-
-    let status = unsafe {
-        if let Some(probe) = (*driver).probe {
-            probe(interface_ptr, id_match)
-        } else {
-            0
-        }
-    };
-    if status != 0 {
-        unsafe {
-            (*interface_ptr).dev.driver = ptr::null_mut();
-        }
-        return false;
-    }
-
-    let mut interfaces = USB_INTERFACES.lock();
-    if let Some(interface) = interfaces.get_mut(interface_index) {
-        interface.bound_driver = Some(driver_index);
-    }
-    true
-}
-
-fn match_interface_id<'a>(
-    interface: &RegisteredUsbInterface,
-    id_table: *const LinuxCompatUsbDeviceId,
-) -> Option<*const LinuxCompatUsbDeviceId> {
-    if id_table.is_null() {
-        return None;
-    }
-
-    let mut index = 0usize;
-    loop {
-        let id = unsafe { *id_table.add(index) };
-        if id.is_terminator() {
-            return None;
-        }
-        if id_matches(interface, &id) {
-            return Some(unsafe { id_table.add(index) });
-        }
-        index += 1;
-    }
-}
-
-fn id_matches(interface: &RegisteredUsbInterface, id: &LinuxCompatUsbDeviceId) -> bool {
-    if id.match_flags & USB_DEVICE_ID_MATCH_VENDOR != 0 && id.id_vendor != interface.vendor_id {
-        return false;
-    }
-    if id.match_flags & USB_DEVICE_ID_MATCH_PRODUCT != 0 && id.id_product != interface.product_id {
-        return false;
-    }
-    if id.match_flags & USB_DEVICE_ID_MATCH_DEV_LO != 0 && interface.device_bcd < id.bcd_device_lo {
-        return false;
-    }
-    if id.match_flags & USB_DEVICE_ID_MATCH_DEV_HI != 0 && interface.device_bcd > id.bcd_device_hi {
-        return false;
-    }
-    if id.match_flags & USB_DEVICE_ID_MATCH_DEV_CLASS != 0
-        && id.b_device_class != interface.device_class
-    {
-        return false;
-    }
-    if id.match_flags & USB_DEVICE_ID_MATCH_DEV_SUBCLASS != 0
-        && id.b_device_sub_class != interface.device_sub_class
-    {
-        return false;
-    }
-    if id.match_flags & USB_DEVICE_ID_MATCH_DEV_PROTOCOL != 0
-        && id.b_device_protocol != interface.device_protocol
-    {
-        return false;
-    }
-    if id.match_flags & USB_DEVICE_ID_MATCH_INT_CLASS != 0
-        && id.b_interface_class != interface.interface_class
-    {
-        return false;
-    }
-    if id.match_flags & USB_DEVICE_ID_MATCH_INT_SUBCLASS != 0
-        && id.b_interface_sub_class != interface.interface_sub_class
-    {
-        return false;
-    }
-    if id.match_flags & USB_DEVICE_ID_MATCH_INT_PROTOCOL != 0
-        && id.b_interface_protocol != interface.interface_protocol
-    {
-        return false;
-    }
-    if id.match_flags & USB_DEVICE_ID_MATCH_INT_NUMBER != 0
-        && id.b_interface_number != interface.interface_number
-    {
-        return false;
-    }
-    true
-}
-*/
-// RING3-MIGRATION-COMMENTED-OUT END
-
 fn c_string_bytes(value: &str) -> Box<[u8]> {
     let mut bytes = value.as_bytes().to_vec();
     bytes.push(0);
     bytes.into_boxed_slice()
 }
+// RING3-MIGRATION-REFERENCE END: driverd/devmgrd/inputd-owned USB interface policy.

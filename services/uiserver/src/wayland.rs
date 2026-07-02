@@ -3,6 +3,7 @@ use std::io::ErrorKind;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::{
@@ -47,6 +48,9 @@ const MAX_WAYLAND_OUTPUT_RESOURCES: usize = 64;
 const MAX_WAYLAND_POINTER_RESOURCES: usize = 64;
 const MAX_WAYLAND_KEYBOARD_RESOURCES: usize = 64;
 const MAX_WAYLAND_FRAME_CALLBACKS_PER_SURFACE: usize = 8;
+const MAX_WAYLAND_DISPATCH_LOGS: usize = 16;
+
+static WAYLAND_DISPATCH_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 fn post_protocol_error<I: Resource>(resource: &I, message: String) {
     diag_line(format!("uiserver: wayland protocol error: {message}"));
@@ -85,6 +89,7 @@ impl Eq for WaylandWindowSnapshot {}
 pub(crate) struct WaylandCompositor {
     display: Display<WaylandState>,
     listener: UnixListener,
+    clients: Vec<ClientId>,
     state: WaylandState,
 }
 
@@ -126,10 +131,12 @@ impl WaylandCompositor {
             "uiserver: wayland compositor ready on {}/{}",
             runtime_dir, WAYLAND_SOCKET_NAME
         ));
+        crate::sys::debug_line("uiserver: wayland compositor ready");
 
         Some(Self {
             display,
             listener,
+            clients: Vec::new(),
             state,
         })
     }
@@ -137,8 +144,8 @@ impl WaylandCompositor {
     pub(crate) fn tick(&mut self) -> bool {
         let mut accepted = 0_usize;
         while accepted < MAX_WAYLAND_CLIENT_ACCEPTS_PER_TICK {
-            match self.listener.accept() {
-                Ok((stream, _)) => {
+            match accept_wayland_client(&self.listener) {
+                Ok(stream) => {
                     accepted = accepted.saturating_add(1);
                     if let Err(err) = set_fd_nonblocking(stream.as_raw_fd()) {
                         diag_line(format!(
@@ -146,14 +153,20 @@ impl WaylandCompositor {
                         ));
                         continue;
                     }
-                    if let Err(err) = self
+                    match self
                         .display
                         .handle()
                         .insert_client(stream, Arc::new(WaylandClientState))
                     {
-                        diag_line(format!("uiserver: wayland insert_client failed: {err}"));
-                    } else {
-                        self.state.dirty = true;
+                        Ok(client) => {
+                            self.clients.push(client.id());
+                            diag_line("uiserver: wayland client accepted");
+                            crate::sys::debug_line("uiserver: wayland client accepted");
+                            self.state.dirty = true;
+                        }
+                        Err(err) => {
+                            diag_line(format!("uiserver: wayland insert_client failed: {err}"));
+                        }
                     }
                 }
                 Err(err) if err.kind() == ErrorKind::WouldBlock => break,
@@ -164,10 +177,33 @@ impl WaylandCompositor {
             }
         }
 
-        match self.display.dispatch_clients(&mut self.state) {
-            Ok(_) => {}
-            Err(err) => {
-                diag_line(format!("uiserver: wayland dispatch failed: {err}"));
+        let clients = core::mem::take(&mut self.clients);
+        for client_id in clients {
+            match self
+                .display
+                .backend()
+                .dispatch_single_client(&mut self.state, client_id.clone())
+            {
+                Ok(dispatched) => {
+                    self.clients.push(client_id);
+                    if dispatched > 0
+                        && WAYLAND_DISPATCH_LOG_COUNT.fetch_add(1, Ordering::Relaxed)
+                            < MAX_WAYLAND_DISPATCH_LOGS
+                    {
+                        diag_line(format!("uiserver: wayland dispatched count={dispatched}"));
+                        crate::sys::debug_line("uiserver: wayland dispatched");
+                    }
+                }
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                    self.clients.push(client_id);
+                }
+                Err(err) => {
+                    if WAYLAND_DISPATCH_LOG_COUNT.fetch_add(1, Ordering::Relaxed)
+                        < MAX_WAYLAND_DISPATCH_LOGS
+                    {
+                        diag_line(format!("uiserver: wayland client dropped: {err}"));
+                    }
+                }
             }
         }
         self.flush_clients();
@@ -247,6 +283,21 @@ fn set_fd_nonblocking(fd: i32) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+fn accept_wayland_client(listener: &UnixListener) -> std::io::Result<UnixStream> {
+    let fd = unsafe {
+        libc::accept4(
+            listener.as_raw_fd(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { UnixStream::from_raw_fd(fd) })
 }
 
 fn current_runtime_dir() -> String {
@@ -2111,6 +2162,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
                         match data.shared.lock() {
                             Ok(surface)
                                 if surface.toplevel.is_some()
+                                    && surface.current_buffer.is_none()
                                     && (surface.configured_serial == 0
                                         || surface.acknowledged_serial
                                             != surface.configured_serial) =>

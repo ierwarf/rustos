@@ -4,6 +4,7 @@
 extern crate alloc;
 
 use core::mem::size_of;
+use core::panic::PanicInfo;
 
 use rustos_svc_runtime::ipc;
 use rustos_user_abi::syscall::{
@@ -46,25 +47,35 @@ mod win32_policy;
 
 rustos_svc_runtime::entry!(service_main);
 
+#[panic_handler]
+fn panic(_info: &PanicInfo<'_>) -> ! {
+    loop {}
+}
+
+#[no_mangle]
+pub extern "C" fn rust_eh_personality() {}
+
 fn service_main() {
+    ipc::debug_line("syscalld: service_main enter");
     let endpoint = ipc::endpoint_create();
     if endpoint < 0 {
         ipc::debug_line("syscalld: endpoint create failed");
         return;
     }
 
+    ipc::debug_line("syscalld: endpoint created");
     let register = ipc::register_linux_syscall_endpoint(endpoint as u64);
     if register < 0 {
         ipc::debug_line("syscalld: endpoint register failed");
         return;
     }
+    ipc::debug_line("syscalld: linux syscall endpoint registered");
     let pager_register = ipc::register_service_endpoint(IPC_SERVICE_PAGERD, endpoint as u64);
     if pager_register < 0 {
         ipc::debug_line("syscalld: pager endpoint register failed");
         return;
     }
 
-    ipc::debug_line("syscalld: linux syscall endpoint registered");
     ipc::debug_line("syscalld: pager policy endpoint registered");
     serve(endpoint as u64);
 }

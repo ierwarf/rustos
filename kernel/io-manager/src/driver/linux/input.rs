@@ -1,3 +1,5 @@
+// RING3-MIGRATION-REFERENCE START: Linux .ko input shims are explicit ring0
+// compatibility substrate. Input event policy belongs in inputd.
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::arch::asm;
@@ -768,3 +770,4 @@ fn apply_keyboard_event(code: u32, value: i32) {
     };
     crate::input::keyboard::inject_key_transition(key_code, value == 0);
 }
+// RING3-MIGRATION-REFERENCE END: Linux .ko input compatibility substrate exception.

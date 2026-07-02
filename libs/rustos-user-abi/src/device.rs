@@ -145,7 +145,6 @@ impl DisplayPresentRectRequest {
 pub const DISPLAY_IOCTL_GET_INFO: u64 = ioctl::ior::<DisplayInfo>(DISPLAY_IOCTL_TYPE, 1);
 pub const DISPLAY_IOCTL_CREATE_SURFACE: u64 =
     ioctl::iowr::<DisplaySurfaceCreate>(DISPLAY_IOCTL_TYPE, 2);
-pub const DISPLAY_IOCTL_PRESENT: u64 =
-    ioctl::iow::<DisplayPresentRequest>(DISPLAY_IOCTL_TYPE, 3);
+pub const DISPLAY_IOCTL_PRESENT: u64 = ioctl::iow::<DisplayPresentRequest>(DISPLAY_IOCTL_TYPE, 3);
 pub const DISPLAY_IOCTL_PRESENT_RECT: u64 =
     ioctl::iow::<DisplayPresentRectRequest>(DISPLAY_IOCTL_TYPE, 4);

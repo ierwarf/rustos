@@ -1,3 +1,5 @@
+// RING3-MIGRATION-REFERENCE START: Linux .ko HID shims are explicit ring0
+// compatibility substrate. HID report policy belongs in inputd.
 use alloc::alloc::{Layout, alloc};
 use alloc::boxed::Box;
 use alloc::vec;
@@ -1201,3 +1203,4 @@ fn hid_item_u32(payload: &[u8]) -> u32 {
         _ => 0,
     }
 }
+// RING3-MIGRATION-REFERENCE END: Linux .ko HID compatibility substrate exception.

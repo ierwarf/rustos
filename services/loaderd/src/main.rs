@@ -8,7 +8,8 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::mem::size_of;
+use core::mem::{size_of, MaybeUninit};
+use core::panic::PanicInfo;
 
 use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
@@ -20,8 +21,8 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_LOADERD_OP_ELF_RUNTIME_PLAN, COMMERCIAL_MAX_LOADERD_OP_IMAGE_PROBE,
     COMMERCIAL_MAX_LOADERD_OP_IMPORT_POLICY, COMMERCIAL_MAX_LOADERD_OP_INTERPRETER_PLAN,
     COMMERCIAL_MAX_LOADERD_OP_MAP_PLAN, COMMERCIAL_MAX_LOADERD_OP_PE_RUNTIME_PLAN,
-    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_LOADERD, IPC_MAX_INLINE_BYTES,
-    IPC_SERVICE_LOADERD, LOADER_OP_EXEC_TARGET, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_LOADERD, IPC_SERVICE_LOADERD,
+    LOADER_OP_EXEC_TARGET, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION,
     LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY,
     LOADER_SPAWN_MAX_ARG_COUNT, LOADER_SPAWN_MAX_ENV_COUNT, PROC_BROKER_ABI_VERSION,
     PROC_BROKER_BATCH_CAPACITY, PROC_BROKER_DATA_PAYLOAD_CAPACITY, PROC_BROKER_FORMAT_ELF64,
@@ -37,6 +38,15 @@ use rustos_user_abi::syscall::{
 mod commit;
 
 use commit::{commit_prepared_executable, LoaderOperation};
+use rustos_svc_runtime::ipc;
+
+#[panic_handler]
+fn panic(_info: &PanicInfo<'_>) -> ! {
+    loop {}
+}
+
+#[no_mangle]
+pub extern "C" fn rust_eh_personality() {}
 
 const O_RDONLY: u64 = 0;
 const SYS_OPENAT: u64 = 257;
@@ -143,22 +153,33 @@ fn service_main() {
 }
 
 fn serve(endpoint: u64) {
+    let mut recv_error_reported = false;
     loop {
-        let mut request = [0_u8; IPC_MAX_INLINE_BYTES];
+        let mut request = MaybeUninit::<LoaderdRecvBuffer>::uninit();
         let mut reply_cap = 0_u64;
         let received = syscall4(
             SYS_RUSTOS_IPC_RECV,
             endpoint,
-            request.as_mut_ptr() as u64,
-            request.len() as u64,
+            request.as_mut_ptr() as *mut u8 as u64,
+            LOADERD_RECV_BYTES as u64,
             (&mut reply_cap as *mut u64) as u64,
         );
         if received < 0 {
+            if !recv_error_reported {
+                debug_line("loaderd: recv failed");
+                recv_error_reported = true;
+            }
             rustos_svc_runtime::syscall::sleep_millis(1);
             continue;
         }
-
-        let response = handle_wire_request(received as usize, &request);
+        if received == 0 {
+            rustos_svc_runtime::syscall::sleep_millis(1);
+            continue;
+        }
+        let request = unsafe {
+            core::slice::from_raw_parts(request.as_ptr() as *const u8, received as usize)
+        };
+        let response = handle_wire_request(received as usize, request);
         let reply = syscall3(
             SYS_RUSTOS_IPC_REPLY,
             reply_cap,
@@ -175,6 +196,16 @@ enum LoaderReply {
     Spawn(LoaderSpawnResponse),
     Commercial(CommercialMaxProtocolResponse),
 }
+
+const LOADERD_RECV_BYTES: usize =
+    if size_of::<CommercialMaxProtocolRequest>() > size_of::<LoaderSpawnRequest>() {
+        size_of::<CommercialMaxProtocolRequest>()
+    } else {
+        size_of::<LoaderSpawnRequest>()
+    };
+
+#[repr(align(8))]
+struct LoaderdRecvBuffer([u8; LOADERD_RECV_BYTES]);
 
 impl LoaderReply {
     fn as_ptr(&self) -> *const u8 {
@@ -196,12 +227,12 @@ impl LoaderReply {
 
 fn handle_wire_request(received: usize, bytes: &[u8]) -> LoaderReply {
     if received == size_of::<CommercialMaxProtocolRequest>() {
-        let request = read_unaligned::<CommercialMaxProtocolRequest>(bytes);
-        return LoaderReply::Commercial(handle_commercial_request(&request));
+        let request = unsafe { &*bytes.as_ptr().cast::<CommercialMaxProtocolRequest>() };
+        return LoaderReply::Commercial(handle_commercial_request(request));
     }
     if received == size_of::<LoaderSpawnRequest>() {
-        let request = read_unaligned::<LoaderSpawnRequest>(bytes);
-        return LoaderReply::Spawn(handle_request(received, &request));
+        let request = unsafe { &*bytes.as_ptr().cast::<LoaderSpawnRequest>() };
+        return LoaderReply::Spawn(handle_request(received, request));
     }
     LoaderReply::Spawn(LoaderSpawnResponse {
         status: EINVAL,
@@ -236,14 +267,13 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> LoaderSpawnR
             return response;
         }
     };
-    let path = match CString::new(exec_path.as_str()) {
-        Ok(path) => path,
-        Err(_) => {
-            response.status = EINVAL;
-            return response;
-        }
-    };
-    let fd = syscall4(SYS_OPENAT, AT_FDCWD, path.as_ptr() as u64, O_RDONLY, 0) as i32;
+    let mut path_buf = MaybeUninit::<[u8; LOADER_SPAWN_EXEC_PATH_CAPACITY + 1]>::uninit();
+    let path_ptr = path_buf.as_mut_ptr().cast::<u8>();
+    for (index, byte) in exec_path.as_bytes().iter().copied().enumerate() {
+        unsafe { path_ptr.add(index).write(byte) };
+    }
+    unsafe { path_ptr.add(exec_path.len()).write(0) };
+    let fd = syscall4(SYS_OPENAT, AT_FDCWD, path_ptr as u64, O_RDONLY, 0) as i32;
     if fd < 0 {
         debug_line("loaderd: open executable failed");
         response.status = -fd;
@@ -311,7 +341,7 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> LoaderSpawnR
     }
     let prepared = match map_executable_segments(
         fd,
-        exec_path.as_str(),
+        exec_path,
         prepare_handle as u64,
         executable_format,
         &argv,
@@ -354,7 +384,7 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> LoaderSpawnR
         operation,
         request,
         prepare_handle as u64,
-        path.as_ptr() as u64,
+        path_ptr as u64,
         exec_path.len() as u64,
         argvp.as_ptr() as u64,
         envp.as_ptr() as u64,
@@ -684,13 +714,11 @@ fn read_unaligned<T: Copy>(bytes: &[u8]) -> T {
     unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) }
 }
 
-fn request_text(bytes: &[u8], len: usize) -> Result<String, i32> {
+fn request_text(bytes: &[u8], len: usize) -> Result<&str, i32> {
     if len == 0 || len > bytes.len() || bytes[..len].contains(&0) {
         return Err(EINVAL);
     }
-    core::str::from_utf8(&bytes[..len])
-        .map(str::to_string)
-        .map_err(|_| EINVAL)
+    core::str::from_utf8(&bytes[..len]).map_err(|_| EINVAL)
 }
 
 fn parse_blob(bytes: &[u8], len: usize, count: usize) -> Result<Vec<CString>, i32> {

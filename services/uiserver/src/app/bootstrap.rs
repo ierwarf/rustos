@@ -271,27 +271,38 @@ fn fetch_surface_state(display_fd: i32) -> Result<DisplaySurfaceState, i32> {
 
 impl AppState {
     pub(crate) fn initialize() -> Result<Self, i32> {
+        diag_line("uiserver: init open_display begin");
         boot_line("uiserver: init open_display begin");
         let display_fd = open_display().map_err(|_| {
+            diag_line("uiserver: open_display failed");
             boot_line("uiserver: open_display failed");
             10
         })?;
+        diag_line("uiserver: init open_display done");
         boot_line("uiserver: init open_display done");
+        diag_line("uiserver: init open_input begin");
         boot_line("uiserver: init open_input begin");
         let input_fds = open_input().map_err(|_| {
+            diag_line("uiserver: open_input failed");
             boot_line("uiserver: open_input failed");
             11
         })?;
+        diag_line("uiserver: init open_input done");
         boot_line("uiserver: init open_input done");
+        diag_line("uiserver: init open_console begin");
         boot_line("uiserver: init open_console begin");
         let console_fd = open_console().map_err(|_| {
+            diag_line("uiserver: open_console failed");
             boot_line("uiserver: open_console failed");
             12
         })?;
+        diag_line("uiserver: init open_console done");
         boot_line("uiserver: init open_console done");
 
+        diag_line("uiserver: init fetch_surface begin");
         boot_line("uiserver: init fetch_surface begin");
         let surface_state = fetch_surface_state(display_fd.as_raw_fd())?;
+        diag_line("uiserver: init fetch_surface done");
         boot_line("uiserver: init fetch_surface done");
         diag_line(
             format!(

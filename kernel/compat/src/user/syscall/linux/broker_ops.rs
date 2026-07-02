@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: rootd service capability policy should own
+// broker dispatch admission. Ring0 keeps the syscall demux and capability-gated
+// broker entry substrate.
 use super::*;
 
 #[path = "device_broker_ops.rs"]
@@ -67,3 +70,4 @@ pub(super) fn dispatch_linux_rustos_broker_syscall(frame: &SyscallFrame) -> u64 
         _ => linux_errno(LINUX_ENOSYS),
     }
 }
+// RING3-MIGRATION-REFERENCE END: rootd-owned broker dispatch capability policy.

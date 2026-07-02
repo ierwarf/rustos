@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: vfsd/netd should own poll/epoll readiness
+// policy. Ring0 keeps fd validation, epoll token handles, user-copy, and bounded
+// timeout sleep substrate.
 use super::*;
 
 const MAX_POLL_FDS: usize = 1024;
@@ -263,3 +266,4 @@ pub fn syscall_linux_epoll_wait(
     }
     written as u64
 }
+// RING3-MIGRATION-REFERENCE END: vfsd/netd-owned poll/epoll policy.

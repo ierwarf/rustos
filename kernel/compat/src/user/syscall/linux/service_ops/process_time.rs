@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: procd/syscalld should own scheduler/time and
+// process/thread syscall policy. Ring0 keeps scheduler yield and task creation
+// substrate.
 use super::*;
 
 pub fn syscall_linux_sched_yield() -> u64 {
@@ -363,17 +366,6 @@ pub fn syscall_linux_clock_nanosleep(
     }
 }
 
-pub fn syscall_linux_futex_minimal(
-    uaddr: u64,
-    op: u64,
-    val: u64,
-    timeout_ptr: u64,
-    uaddr2: u64,
-    val3: u64,
-) -> u64 {
-    futex_impl(uaddr, op, val, timeout_ptr, uaddr2, val3)
-}
-
 pub fn syscall_linux_clone(frame: &SyscallFrame) -> u64 {
     clone_linux_thread(frame, frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
 }
@@ -428,3 +420,4 @@ pub fn syscall_linux_clone3(frame: &SyscallFrame) -> u64 {
         args.tls,
     )
 }
+// RING3-MIGRATION-REFERENCE END: procd/syscalld-owned process/time policy.

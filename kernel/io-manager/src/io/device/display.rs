@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: devmgrd/uiserver should own display device
+// admission, surface policy, and presentation routing. Ring0 keeps framebuffer
+// mapping, current-process user-copy, and hot present substrate.
 use core::convert::TryFrom;
 
 use crate::io::gui;
@@ -54,14 +57,12 @@ pub(crate) fn ioctl(
             if process_state.handles().display_surface_count() >= MAX_DISPLAY_SURFACES_PER_PROCESS {
                 return Err(DeviceError::InvalidArgument);
             }
-            let surface =
-                create_surface(create.width, create.height, create.pixel_format, display)
-                    .ok_or(DeviceError::InvalidArgument)?;
+            let surface = create_surface(create.width, create.height, create.pixel_format, display)
+                .ok_or(DeviceError::InvalidArgument)?;
             let handle = process_state
                 .handles_mut()
                 .install(KernelHandle::DisplaySurface(surface));
-            create.handle =
-                u32::try_from(handle).map_err(|_| DeviceError::InvalidArgument)?;
+            create.handle = u32::try_from(handle).map_err(|_| DeviceError::InvalidArgument)?;
             create.bytes_per_pixel = surface.bytes_per_pixel();
             create.stride_bytes = surface.stride_bytes();
             create.mapping_len = surface.mapping_len();
@@ -84,10 +85,8 @@ pub(crate) fn ioctl(
             Ok(0)
         }
         device::DISPLAY_IOCTL_PRESENT_RECT => {
-            let request = read_user_struct::<DisplayPresentRectRequest>(
-                process_state.address_space(),
-                arg,
-            )?;
+            let request =
+                read_user_struct::<DisplayPresentRectRequest>(process_state.address_space(), arg)?;
             if request.reserved != 0 {
                 return Err(DeviceError::InvalidArgument);
             }
@@ -265,3 +264,4 @@ fn validate_surface_mapping(
         .ok_or(DeviceError::InvalidArgument)?;
     Ok(())
 }
+// RING3-MIGRATION-REFERENCE END: devmgrd/uiserver-owned display device policy.

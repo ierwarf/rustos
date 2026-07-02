@@ -767,6 +767,7 @@ pub(crate) fn resolve_symbol_meta(name: &str) -> Option<super::LinuxCompatSymbol
         "virtio_config_driver_disable" => virtio_config_driver_disable;
         "virtio_config_driver_enable" => virtio_config_driver_enable;
         "virtio_check_driver_offered_feature" => virtio_check_driver_offered_feature;
+        "dma_buf_export" => virtio_dma_buf_export;
         "virtio_dma_buf_export" => virtio_dma_buf_export;
         "virtio_dma_buf_attach" => virtio_dma_buf_attach;
         "is_virtio_dma_buf" => is_virtio_dma_buf;

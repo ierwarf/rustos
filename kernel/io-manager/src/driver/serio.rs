@@ -1,3 +1,7 @@
+// RING3-MIGRATION-REFERENCE START: inputd/driverd should own the non-.ko serio
+// service-driver once a ring3 service-driver host can drive the PS/2 serio bus
+// through narrow command/IRQ leases. Ring0 keeps the current serio bus as
+// privileged input substrate until that host exists.
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ffi::c_void;
@@ -1090,3 +1094,4 @@ fn device_id_matches(id: SerioDeviceId, port: SerioPortInfo) -> bool {
 fn field_matches(expected: u32, actual: u32) -> bool {
     expected == SERIO_ANY || expected == actual
 }
+// RING3-MIGRATION-REFERENCE END: inputd/driverd-owned non-.ko serio service-driver.

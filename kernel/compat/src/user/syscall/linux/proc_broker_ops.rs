@@ -1,29 +1,33 @@
+// RING3-MIGRATION-REFERENCE START: procd/loaderd should own process prepare,
+// image mapping policy, exec authorization, fork/wait/signal lifecycle, and
+// runtime metadata. Ring0 keeps address-space construction, handle validation,
+// and final commit/transition substrate.
 use super::*;
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
-use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
+use x86_64::structures::paging::PageTableFlags;
 
 use crate::user::handles::{KernelHandle, RemoteVfsHandleKind};
 use crate::user::memfd::MemfdHandle;
 use lazy_static::lazy_static;
 use rustos_user_abi::syscall::{
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, RustosProcAbortBrokerArgs,
+    COMMERCIAL_MAX_PROCD_OP_PROCESS_PREPARE, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_PROCD, CommercialMaxProtocolRequest, CommercialMaxProtocolResponse,
+    IPC_SERVICE_CAP_PROCESS_LOADER, IPC_SERVICE_CAP_PROCESS_POLICY, LOADER_SPAWN_ARG_BYTES,
+    LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_MAX_ARG_COUNT, LOADER_SPAWN_MAX_ENV_COUNT,
+    PROC_BROKER_ABI_VERSION, PROC_BROKER_BATCH_CAPACITY, PROC_BROKER_FORMAT_ELF64,
+    PROC_BROKER_FORMAT_PE64, PROC_BROKER_LINUX_INTERP_PATH_CAPACITY, PROC_BROKER_MAP_EXEC,
+    PROC_BROKER_MAP_PRIVATE, PROC_BROKER_MAP_READ, PROC_BROKER_MAP_WRITE,
+    PROC_BROKER_USER_SPACE_BASE, PROC_BROKER_USER_SPACE_END_EXCLUSIVE, RustosProcAbortBrokerArgs,
     RustosProcAuthorizeExecBrokerArgs, RustosProcCancelExecBrokerArgs, RustosProcCommitBrokerArgs,
     RustosProcExecTargetBrokerArgs, RustosProcForkBrokerArgs, RustosProcMapDataBrokerArgs,
     RustosProcMapFileBatchBrokerArgs, RustosProcMapFileBrokerArgs, RustosProcMapZeroedBrokerArgs,
     RustosProcPrepareBrokerArgs, RustosProcSetLinuxRuntimeBrokerArgs,
     RustosProcSetWindowsRuntimeBrokerArgs, RustosProcSignalQueueBrokerArgs, RustosUserRegisters,
-    COMMERCIAL_MAX_PROCD_OP_PROCESS_PREPARE, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
-    COMMERCIAL_MAX_PROTOCOL_PROCD, IPC_SERVICE_CAP_PROCESS_LOADER, IPC_SERVICE_CAP_PROCESS_POLICY,
-    LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_MAX_ARG_COUNT,
-    LOADER_SPAWN_MAX_ENV_COUNT, PROC_BROKER_ABI_VERSION, PROC_BROKER_BATCH_CAPACITY,
-    PROC_BROKER_FORMAT_ELF64, PROC_BROKER_FORMAT_PE64, PROC_BROKER_LINUX_INTERP_PATH_CAPACITY,
-    PROC_BROKER_MAP_EXEC, PROC_BROKER_MAP_PRIVATE, PROC_BROKER_MAP_READ, PROC_BROKER_MAP_WRITE,
-    PROC_BROKER_USER_SPACE_BASE, PROC_BROKER_USER_SPACE_END_EXCLUSIVE,
 };
 use spin::Mutex;
 
@@ -1273,21 +1277,4 @@ fn read_user_string_vector(
     }
     Ok(values)
 }
-
-fn console_host_error_to_linux_errno(error: crate::user::console_host::ConsoleHostError) -> i64 {
-    match error {
-        crate::user::console_host::ConsoleHostError::BootstrapBlocked => LINUX_EAGAIN,
-        crate::user::console_host::ConsoleHostError::Load { error, .. } => match error {
-            crate::vfs::VfsError::BadFileDescriptor => LINUX_EBADF,
-            crate::vfs::VfsError::InvalidArgument => LINUX_EINVAL,
-            crate::vfs::VfsError::NotFound => LINUX_ENOENT,
-            crate::vfs::VfsError::PermissionDenied => LINUX_EACCES,
-            crate::vfs::VfsError::NotDirectory => LINUX_ENOTDIR,
-            crate::vfs::VfsError::ReadOnlyFilesystem => LINUX_EROFS,
-            crate::vfs::VfsError::Unsupported => LINUX_ENOSYS,
-        },
-        crate::user::console_host::ConsoleHostError::Spawn { error } => {
-            process_load_error_to_linux_errno(error)
-        }
-    }
-}
+// RING3-MIGRATION-REFERENCE END: procd/loaderd-owned process broker policy.

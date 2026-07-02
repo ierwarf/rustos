@@ -336,6 +336,8 @@ pub const DRIVER_BROKER_ALIAS_CAPACITY: usize = 256;
 pub const DRIVER_CLASS_DISPLAY: u32 = 1;
 pub const DRIVER_CLASS_INPUT: u32 = 2;
 pub const DRIVER_CLASS_NETWORK: u32 = 3;
+pub const DRIVER_CLASS_USB: u32 = 4;
+pub const DRIVER_CLASS_STORAGE: u32 = 5;
 pub const DRIVER_BUS_PLATFORM: u32 = 1;
 pub const DRIVER_BUS_SERIO: u32 = 2;
 pub const DRIVER_BUS_USB: u32 = 3;
@@ -438,6 +440,7 @@ pub const COMMERCIAL_MAX_STORAGED_OP_ROOT_VOLUME_SELECT: u16 = 3;
 pub const COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE: u16 = 4;
 pub const COMMERCIAL_MAX_STORAGED_OP_VOLUME_METADATA: u16 = 5;
 pub const COMMERCIAL_MAX_STORAGED_OP_AHCI_POLICY: u16 = 6;
+pub const COMMERCIAL_MAX_STORAGED_OP_NVME_POLICY: u16 = 7;
 pub const COMMERCIAL_MAX_NETD_OP_SOCKET_NAMESPACE: u16 = 1;
 pub const COMMERCIAL_MAX_NETD_OP_SOCKET_OPTIONS: u16 = 2;
 pub const COMMERCIAL_MAX_NETD_OP_ADDRESS_BIND: u16 = 3;
@@ -656,6 +659,21 @@ pub struct StoragedAhciPolicyWire {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StoragedNvmePolicyWire {
+    pub abi_version: u16,
+    pub reserved0: u16,
+    pub flags: u32,
+    pub admin_queue_depth: u32,
+    pub io_queue_depth: u32,
+    pub max_transfer_bytes: u32,
+    pub page_bytes: u32,
+    pub wait_spins: u32,
+    pub max_namespaces: u32,
+    pub reserved1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct StorageListBrokerArgs {
     pub abi_version: u16,
     pub reserved0: u16,
@@ -787,6 +805,7 @@ pub const INPUTD_INGRESS_KIND_POINTER_ABSOLUTE: u16 = 3;
 pub const INPUTD_INGRESS_KIND_KEYBOARD: u16 = 4;
 pub const INPUTD_INGRESS_KIND_HID_KEYBOARD_REPORT: u16 = 5;
 pub const INPUTD_INGRESS_KIND_HID_POINTER_REPORT: u16 = 6;
+pub const INPUTD_INGRESS_KIND_HID_RAW_REPORT: u16 = 7;
 pub const INPUTD_HID_POLICY_REPORT_CAPACITY: usize = 64;
 pub const INPUTD_HID_POLICY_DESCRIPTOR_CAPACITY: usize = 128;
 pub const INPUTD_HID_POLICY_KIND_UNKNOWN: u16 = 0;
@@ -909,6 +928,7 @@ pub struct InputIngressWire {
     pub pointer_absolute: InputPointerAbsoluteWire,
     pub hid_keyboard: InputHidKeyboardReportWire,
     pub hid_pointer: InputHidPointerReportWire,
+    pub hid_raw: InputHidPolicyWire,
 }
 
 #[repr(C)]
@@ -2261,12 +2281,12 @@ mod syscall_tests {
     use core::mem::size_of;
 
     use super::{
-        LinuxRlimit, LinuxSigActionWire, LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse,
-        LinuxTimespecWire, LinuxUtsName, VfsIpcRequest, VfsIpcResponse, IPC_MAX_INLINE_BYTES,
-        LINUX_RLIMIT_SIZE, LINUX_SIGACTION_SIZE, LINUX_STATX_SIZE, LINUX_TIMESPEC_SIZE,
-        LINUX_UTSNAME_SIZE, SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_STATX,
-        SYSCALL_OFFLOAD_PATH_CAPACITY, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, VFS_IPC_ABI_VERSION,
-        VFS_IPC_OP_OPENAT,
+        IPC_MAX_INLINE_BYTES, LINUX_RLIMIT_SIZE, LINUX_SIGACTION_SIZE, LINUX_STATX_SIZE,
+        LINUX_TIMESPEC_SIZE, LINUX_UTSNAME_SIZE, LinuxRlimit, LinuxSigActionWire,
+        LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, LinuxTimespecWire, LinuxUtsName,
+        SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_STATX, SYSCALL_OFFLOAD_PATH_CAPACITY,
+        SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, VFS_IPC_ABI_VERSION, VFS_IPC_OP_OPENAT, VfsIpcRequest,
+        VfsIpcResponse,
     };
 
     #[test]

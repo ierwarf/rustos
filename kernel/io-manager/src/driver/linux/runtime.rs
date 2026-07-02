@@ -1,3 +1,5 @@
+// RING3-MIGRATION-REFERENCE START: Linux .ko runtime helpers are explicit ring0
+// compatibility substrate. Runtime policy belongs in driverd/syscalld.
 use core::ffi::{c_char, c_void};
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -337,3 +339,4 @@ fn cstr_bytes<'a>(fmt: *const c_char) -> Option<&'a [u8]> {
     }
     Some(unsafe { core::slice::from_raw_parts(fmt as *const u8, len) })
 }
+// RING3-MIGRATION-REFERENCE END: Linux .ko runtime compatibility substrate exception.

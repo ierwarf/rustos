@@ -2,11 +2,11 @@ use std::io::Write;
 use std::mem::size_of;
 use std::os::unix::net::UnixStream;
 
-use super::{MAX_REQUEST_PATH_BYTES, RuntimeRequest, RuntimeResponse};
+use super::{RuntimeRequest, RuntimeResponse, MAX_REQUEST_PATH_BYTES};
 use super::{
-    OP_SNAPSHOT_RUNNING_PROGRAMS, OP_NOTIFY_READY, OP_REQUEST_TERMINATE,
-    OP_REQUEST_LAUNCH_PATH, TERMINATE_TARGET_SESSION, TERMINATE_TARGET_PID,
-    READY_COMPONENT_UI_SERVER, LAUNCH_TARGET_NEW_SESSION,
+    LAUNCH_TARGET_NEW_SESSION, OP_NOTIFY_READY, OP_REQUEST_LAUNCH_PATH, OP_REQUEST_TERMINATE,
+    OP_SNAPSHOT_RUNNING_PROGRAMS, READY_COMPONENT_UI_SERVER, TERMINATE_TARGET_PID,
+    TERMINATE_TARGET_SESSION,
 };
 
 pub(super) fn as_bytes<T>(value: &T) -> &[u8] {
@@ -46,7 +46,10 @@ pub(super) fn io_errno(err: std::io::Error) -> i32 {
     err.raw_os_error().unwrap_or(libc::EIO)
 }
 
-pub(super) fn write_response(stream: &mut UnixStream, response: RuntimeResponse) -> Result<(), i32> {
+pub(super) fn write_response(
+    stream: &mut UnixStream,
+    response: RuntimeResponse,
+) -> Result<(), i32> {
     stream.write_all(as_bytes(&response)).map_err(io_errno)
 }
 

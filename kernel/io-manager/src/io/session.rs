@@ -1,3 +1,5 @@
+// RING3-MIGRATION-REFERENCE START: sessiond should own console session
+// lifecycle and routing policy. Ring0 keeps compact session handle substrate.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub struct ConsoleSessionHandle(u64);
 
@@ -51,3 +53,4 @@ impl From<kernel_object::api::session::ConsoleSessionHandle> for ConsoleSessionH
         Self::from_object_handle(value)
     }
 }
+// RING3-MIGRATION-REFERENCE END: sessiond-owned console session policy.

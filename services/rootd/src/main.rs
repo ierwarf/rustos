@@ -1,11 +1,14 @@
 #![no_std]
 #![no_main]
 
+use core::alloc::{GlobalAlloc, Layout};
 use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::mem::size_of;
 use core::panic::PanicInfo;
+use core::ptr;
 use core::slice;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
@@ -16,13 +19,12 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_CAPABILITY,
     COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR,
     COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST, COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE,
-    COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH, COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL,
-    COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY, IPC_SERVICE_DEVMGRD, IPC_SERVICE_DRIVERD,
-    IPC_SERVICE_INPUTD, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD, IPC_SERVICE_NETD,
-    IPC_SERVICE_PAGERD, IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD, IPC_SERVICE_SERVICE_DRIVERD,
-    IPC_SERVICE_SESSIOND, IPC_SERVICE_STORAGED, IPC_SERVICE_UISERVER, IPC_SERVICE_VFSD,
-    LIFECYCLE_DRAIN_MAX_EVENTS,
-    LIFECYCLE_EVENT_EXIT, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
+    COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH, COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY,
+    IPC_SERVICE_DEVMGRD, IPC_SERVICE_DRIVERD, IPC_SERVICE_INPUTD, IPC_SERVICE_LINUX_SYSCALLD,
+    IPC_SERVICE_LOADERD, IPC_SERVICE_NETD, IPC_SERVICE_PAGERD, IPC_SERVICE_PROCD,
+    IPC_SERVICE_ROOTD, IPC_SERVICE_SERVICE_DRIVERD, IPC_SERVICE_SESSIOND, IPC_SERVICE_STORAGED,
+    IPC_SERVICE_UISERVER, IPC_SERVICE_VFSD, LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT,
+    LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
     LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, ROOTD_IPC_ABI_VERSION,
     ROOTD_IPC_OP_LEASE_LIST, ROOTD_IPC_OP_STATUS, ROOTD_LEASE_STATE_EXITED,
     ROOTD_LEASE_STATE_FAILED, ROOTD_LEASE_STATE_RESTART_PENDING, ROOTD_LEASE_STATE_RUNNING,
@@ -114,6 +116,59 @@ static INITD_LOADER_REQUEST: RootdIpcCell<LoaderSpawnRequest> =
 static INITD_LOADER_RESPONSE: RootdIpcCell<LoaderSpawnResponse> =
     RootdIpcCell(UnsafeCell::new(empty_loader_spawn_response()));
 
+const ROOTD_HEAP_BYTES: usize = 8 * 1024 * 1024;
+
+#[repr(align(4096))]
+struct RootdHeap([u8; ROOTD_HEAP_BYTES]);
+
+static mut ROOTD_HEAP: RootdHeap = RootdHeap([0; ROOTD_HEAP_BYTES]);
+
+struct RootdBumpAllocator {
+    cursor: AtomicUsize,
+}
+
+unsafe impl Sync for RootdBumpAllocator {}
+
+impl RootdBumpAllocator {
+    const fn new() -> Self {
+        Self {
+            cursor: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[global_allocator]
+static ROOTD_ALLOCATOR: RootdBumpAllocator = RootdBumpAllocator::new();
+
+unsafe impl GlobalAlloc for RootdBumpAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let align = layout.align().max(1);
+        let size = layout.size();
+        let base = unsafe { ROOTD_HEAP.0.as_mut_ptr() as usize };
+        let mut cursor = self.cursor.load(Ordering::Relaxed);
+        loop {
+            let aligned = (cursor + align - 1) & !(align - 1);
+            let Some(new_cursor) = aligned.checked_add(size) else {
+                return ptr::null_mut();
+            };
+            if new_cursor > ROOTD_HEAP_BYTES {
+                return ptr::null_mut();
+            }
+            match self.cursor.compare_exchange(
+                cursor,
+                new_cursor,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return (base + aligned) as *mut u8,
+                Err(observed) => cursor = observed,
+            }
+        }
+    }
+
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
+}
+
 #[derive(Clone, Copy)]
 struct Lease {
     service_id: u64,
@@ -143,6 +198,13 @@ pub extern "C" fn _start() -> ! {
     // supervisor descriptors.
     for index in 0..leases.len() {
         if BOOTSTRAP_MANIFEST[index].bootstrap_direct {
+            match index {
+                0 => debug_line(b"rootd: spawn syscalld\n"),
+                1 => debug_line(b"rootd: spawn vfsd\n"),
+                2 => debug_line(b"rootd: spawn loaderd\n"),
+                3 => debug_line(b"rootd: spawn procd\n"),
+                _ => {}
+            }
             spawn_core_service_without_wait(&mut leases[index]);
         }
     }
@@ -242,11 +304,13 @@ fn spawn_exec(path: &'static [u8], weight_micros: u64) -> Result<u64, i64> {
 fn spawn_initd_via_loaderd(endpoint: u64, leases: &mut [Lease]) {
     let mut attempts = 0_u64;
     loop {
+        debug_line(b"rootd: initd spawn request to loaderd\n");
         match spawn_exec_via_loaderd(
             leases[INITD_LEASE_INDEX].exec_path,
             leases[INITD_LEASE_INDEX].weight_micros,
         ) {
             Ok(pid) => {
+                debug_line(b"rootd: initd loader spawn complete\n");
                 leases[INITD_LEASE_INDEX].pid = pid;
                 leases[INITD_LEASE_INDEX].state = ROOTD_LEASE_STATE_RUNNING;
                 leases[INITD_LEASE_INDEX].exit_status = 0;
@@ -450,8 +514,7 @@ fn validate_commercial_max_request(request: &CommercialMaxProtocolRequest) -> Re
             COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST
             | COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE
             | COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH
-            | COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY
-            | COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL => Ok(()),
+            | COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY => Ok(()),
             _ => Err(22),
         },
         COMMERCIAL_MAX_PROTOCOL_CAPABILITY => match request.header.op {
@@ -503,23 +566,6 @@ fn fill_commercial_max_response(
             response.descriptors[0] = lease_descriptor(lease, request.header.op, 0);
             response.value0 = lease.restart_budget as u64;
             response.value1 = lease.backoff_ms as u64;
-            Ok(())
-        }
-        COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL => {
-            let lease = match lease_by_service_or_index(leases, request.arg0, request.arg1 as usize)
-            {
-                Ok(lease) => lease,
-                Err(errno) => return Err(errno),
-            };
-            response.descriptor_count = 1;
-            response.descriptors[0] = lease_descriptor(lease, request.header.op, 0);
-            response.value0 =
-                if lease.service_id != INITD_LEASE_ID && service_ready(lease.service_id) {
-                    1
-                } else {
-                    0
-                };
-            response.value1 = lease.state as u64;
             Ok(())
         }
         _ => Err(22),
@@ -735,7 +781,6 @@ fn rootd_capability_mask(op: u16) -> u64 {
         COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE => 1 << 1,
         COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH => 1 << 2,
         COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY => 1 << 3,
-        COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL => 1 << 4,
         _ => 0,
     }
 }

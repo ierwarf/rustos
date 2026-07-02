@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: syscalld/procd should own Linux signal and
+// syscall support policy. Ring0 keeps signal-frame validation and current-task
+// syscall substrate.
 use super::*;
 
 const LINUX_SI_MAX_SIZE: usize = 128;
@@ -365,3 +368,4 @@ pub(super) fn syscall_check(frame: &SyscallFrame) -> Result<(), u64> {
 
     Ok(())
 }
+// RING3-MIGRATION-REFERENCE END: syscalld/procd-owned Linux syscall support policy.

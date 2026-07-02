@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: Linux .ko export resolution is an explicit
+// ring0 substrate exception. Policy belongs in driverd, but kernel symbol shims
+// stay in ring0 for Linux driver ABI compatibility.
 use alloc::alloc::{Layout, alloc, alloc_zeroed, dealloc, handle_alloc_error, realloc};
 
 use super::module_registry;
@@ -100,3 +103,4 @@ fn rust_module_from_utf8(bytes: &[u8]) -> Result<&str, core::str::Utf8Error> {
 fn rust_module_slice_index_fail(start: usize, end: usize, len: usize) -> ! {
     panic!("module slice index out of bounds: start={start} end={end} len={len}");
 }
+// RING3-MIGRATION-REFERENCE END: Linux .ko export compatibility substrate exception.

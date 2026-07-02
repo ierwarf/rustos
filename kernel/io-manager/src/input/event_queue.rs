@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: inputd should own input queue coalescing,
+// drop policy, and evdev/native read policy. Ring0 keeps bounded hardware
+// ingress buffers and stats substrate.
 use core::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) use crate::input_core::InputEventQueueState;
@@ -5,9 +8,11 @@ use crate::sync::KernelSpinLock as Mutex;
 use driver_abi::PointerPacket;
 use heapless::Deque as HeaplessDeque;
 use rustos_user_abi::syscall::{
-    INPUTD_ACCESS_NATIVE, INPUTD_INGRESS_KIND_EVENT, INPUTD_INGRESS_KIND_KEYBOARD,
+    INPUTD_ACCESS_NATIVE, INPUTD_INGRESS_KIND_EVENT, INPUTD_INGRESS_KIND_HID_POINTER_REPORT,
+    INPUTD_INGRESS_KIND_HID_RAW_REPORT, INPUTD_INGRESS_KIND_KEYBOARD,
     INPUTD_INGRESS_KIND_POINTER_PACKET, InputHidKeyboardReportWire, InputHidPointerReportWire,
-    InputIngressWire, InputKeyboardEventWire, InputPointerAbsoluteWire, InputPointerPacketWire,
+    InputHidPolicyWire, InputIngressWire, InputKeyboardEventWire, InputPointerAbsoluteWire,
+    InputPointerPacketWire,
 };
 #[cfg(not(test))]
 use x86_64::instructions::interrupts;
@@ -89,6 +94,7 @@ pub(crate) fn submit_keyboard_event(event: crate::input::keyboard::KeyboardEvent
         pointer_absolute: InputPointerAbsoluteWire::default(),
         hid_keyboard: InputHidKeyboardReportWire::default(),
         hid_pointer: InputHidPointerReportWire::default(),
+        hid_raw: InputHidPolicyWire::default(),
     })
 }
 
@@ -111,6 +117,38 @@ pub(crate) fn submit_pointer_packet(packet: PointerPacket) -> bool {
         pointer_absolute: InputPointerAbsoluteWire::default(),
         hid_keyboard: InputHidKeyboardReportWire::default(),
         hid_pointer: InputHidPointerReportWire::default(),
+        hid_raw: InputHidPolicyWire::default(),
+    })
+}
+
+pub(crate) fn submit_hid_pointer_report(report: InputHidPointerReportWire) -> bool {
+    POINTER_ABSOLUTE_SUBMIT_COUNT.fetch_add((report.relative == 0) as u64, Ordering::Relaxed);
+    push_ingress(InputIngressWire {
+        kind: INPUTD_INGRESS_KIND_HID_POINTER_REPORT,
+        access: INPUTD_ACCESS_NATIVE,
+        flags: 0,
+        event: InputEvent::default(),
+        keyboard: InputKeyboardEventWire::default(),
+        pointer_packet: InputPointerPacketWire::default(),
+        pointer_absolute: InputPointerAbsoluteWire::default(),
+        hid_keyboard: InputHidKeyboardReportWire::default(),
+        hid_pointer: report,
+        hid_raw: InputHidPolicyWire::default(),
+    })
+}
+
+pub(crate) fn submit_hid_raw_report(report: InputHidPolicyWire) -> bool {
+    push_ingress(InputIngressWire {
+        kind: INPUTD_INGRESS_KIND_HID_RAW_REPORT,
+        access: INPUTD_ACCESS_NATIVE,
+        flags: 0,
+        event: InputEvent::default(),
+        keyboard: InputKeyboardEventWire::default(),
+        pointer_packet: InputPointerPacketWire::default(),
+        pointer_absolute: InputPointerAbsoluteWire::default(),
+        hid_keyboard: InputHidKeyboardReportWire::default(),
+        hid_pointer: InputHidPointerReportWire::default(),
+        hid_raw: report,
     })
 }
 
@@ -180,6 +218,7 @@ pub(crate) fn drain_ingress(dest: &mut [InputIngressWire]) -> usize {
             pointer_absolute: InputPointerAbsoluteWire::default(),
             hid_keyboard: InputHidKeyboardReportWire::default(),
             hid_pointer: InputHidPointerReportWire::default(),
+            hid_raw: InputHidPolicyWire::default(),
         };
         count += 1;
     }
@@ -300,3 +339,4 @@ mod tests {
         assert_eq!(snapshot.queued, 1);
     }
 }
+// RING3-MIGRATION-REFERENCE END: inputd-owned input event queue policy.

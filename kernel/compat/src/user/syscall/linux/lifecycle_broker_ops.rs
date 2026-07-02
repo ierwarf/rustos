@@ -1,7 +1,9 @@
+// RING3-MIGRATION-REFERENCE START: procd/rootd should own lifecycle event
+// routing and restart policy. Ring0 keeps exit-event collection substrate.
 use super::*;
 
 use rustos_user_abi::syscall::{
-    LifecycleDrainBrokerArgs, IPC_SERVICE_CAP_PROCESS_POLICY, IPC_SERVICE_CAP_ROOT_SUPERVISOR,
+    IPC_SERVICE_CAP_PROCESS_POLICY, IPC_SERVICE_CAP_ROOT_SUPERVISOR, LifecycleDrainBrokerArgs,
 };
 
 pub(super) fn syscall_linux_rustos_lifecycle_drain_broker(args_ptr: u64) -> u64 {
@@ -21,3 +23,4 @@ pub(super) fn syscall_linux_rustos_lifecycle_drain_broker(args_ptr: u64) -> u64 
         Err(errno) => linux_errno(errno),
     }
 }
+// RING3-MIGRATION-REFERENCE END: procd/rootd-owned lifecycle broker policy.

@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: syscalld/pagerd should own Linux mmap/brk
+// policy. Ring0 keeps page-table mutation, VMA bookkeeping, and current-process
+// user address-space substrate.
 use core::mem::size_of;
 
 use x86_64::VirtAddr;
@@ -447,3 +450,4 @@ fn checked_align_up(value: u64, align: u64) -> Option<u64> {
     let mask = align.checked_sub(1)?;
     Some(value.checked_add(mask)? & !mask)
 }
+// RING3-MIGRATION-REFERENCE END: syscalld/pagerd-owned Linux memory policy.

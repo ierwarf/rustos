@@ -6,4 +6,4 @@ publish = false
 
 [dependencies]
 libc = "0.2"
-rustos-user-abi = { path = "../../libs/rustos-user-abi" }
+rustos-user-abi = { path = "../../libs/rustos-user-abi", features = ["linux-compat-state"] }

@@ -2,19 +2,19 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "QEMU",
+      "name": "QEMU NVMe",
       "type": "node-terminal",
       "request": "launch",
       "preLaunchTask": "Build OS",
-      "command": "exec cargo xtask run",
+      "command": "exec env RUSTOS_NATIVE_XHCI=1 RUSTOS_NATIVE_XHCI_HID_POLL=1 cargo xtask run --profile nvme --usb-input --debugcon file --summarize-log -- --no-reboot",
       "cwd": "${workspaceFolder}"
     },
     {
-      "name": "KVM",
+      "name": "KVM NVMe",
       "type": "node-terminal",
       "request": "launch",
       "preLaunchTask": "Build OS",
-      "command": "exec cargo xtask run --accel-profile kvm",
+      "command": "exec env RUSTOS_NATIVE_XHCI=1 RUSTOS_NATIVE_XHCI_HID_POLL=1 cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file --summarize-log -- --no-reboot",
       "cwd": "${workspaceFolder}"
     }
   ]

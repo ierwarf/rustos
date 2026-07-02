@@ -35,6 +35,8 @@ pub enum DriverClass {
     Display = 1,
     Input = 2,
     Network = 3,
+    Usb = 4,
+    Storage = 5,
 }
 
 #[repr(u32)]

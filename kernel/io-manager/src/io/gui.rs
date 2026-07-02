@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: uiserver should own normal display mode,
+// provider selection, and GUI presentation policy. Ring0 keeps boot framebuffer
+// transition and display substrate until service-driver display bring-up exists.
 mod backend;
 mod framebuffer;
 
@@ -210,3 +213,4 @@ fn finish_userspace_display_transition() {
         crate::debug::println!("userspace display active");
     }
 }
+// RING3-MIGRATION-REFERENCE END: uiserver-owned GUI/display policy.

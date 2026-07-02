@@ -1,5 +1,6 @@
-use alloc::vec;
-
+// RING3-MIGRATION-REFERENCE START: loaderd/procd should own generic executable
+// loading and process launch policy. Ring0 keeps address-space commit, stack
+// construction, and final task spawn substrate.
 use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
 
@@ -495,3 +496,4 @@ fn align_up(value: u64, align: u64) -> Option<u64> {
         .checked_add(align - 1)
         .map(|aligned| align_down(aligned, align))
 }
+// RING3-MIGRATION-REFERENCE END: loaderd/procd-owned generic process launch policy.

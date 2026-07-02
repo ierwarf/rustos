@@ -8,28 +8,35 @@ use rustos_user_abi::syscall::{
     BootExtentLeaseWire, BootExtentWire, CommercialMaxCapabilityLeaseWire,
     CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
     CommercialMaxProtocolResponse, StorageBlockDescriptorWire, StorageListBrokerArgs,
-    StoragedAhciPolicyWire, StoragedRequest, StoragedResponse, BOOT_EXTENT_FLAG_READONLY,
-    BOOT_EXTENT_MAX_EXTENTS, BOOT_EXTENT_PATH_CAPACITY, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
-    COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_STORAGED,
-    COMMERCIAL_MAX_STORAGED_OP_AHCI_POLICY, COMMERCIAL_MAX_STORAGED_OP_BLOCK_INVENTORY,
-    COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE, COMMERCIAL_MAX_STORAGED_OP_PARTITION_SCAN,
+    StoragedAhciPolicyWire, StoragedNvmePolicyWire, StoragedRequest, StoragedResponse,
+    BOOT_EXTENT_FLAG_READONLY, BOOT_EXTENT_MAX_EXTENTS, BOOT_EXTENT_PATH_CAPACITY,
+    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
+    COMMERCIAL_MAX_PROTOCOL_STORAGED, COMMERCIAL_MAX_STORAGED_OP_AHCI_POLICY,
+    COMMERCIAL_MAX_STORAGED_OP_BLOCK_INVENTORY, COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE,
+    COMMERCIAL_MAX_STORAGED_OP_NVME_POLICY, COMMERCIAL_MAX_STORAGED_OP_PARTITION_SCAN,
     COMMERCIAL_MAX_STORAGED_OP_ROOT_VOLUME_SELECT, COMMERCIAL_MAX_STORAGED_OP_VOLUME_METADATA,
     IPC_SERVICE_STORAGED, STORAGED_IPC_ABI_VERSION, STORAGED_OP_BOOT_EXTENT_LOOKUP,
     STORAGED_OP_LIST_COUNT, STORAGED_OP_LIST_GET, STORAGED_OP_PING, STORAGED_OP_ROOT_STATUS,
     STORAGE_AHCI_POLICY_FLAG_DMA_64, STORAGE_AHCI_POLICY_FLAG_SINGLE_SLOT, STORAGE_FLAG_READONLY,
-    STORAGE_LIST_MAX_DESCRIPTORS,
-    SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV,
-    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_STORAGE_LIST_BROKER,
+    STORAGE_LIST_MAX_DESCRIPTORS, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
+    SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
+    SYS_RUSTOS_STORAGE_LIST_BROKER,
 };
 
 const RECV_BACKOFF: Duration = Duration::from_millis(50);
 const ROOT_FILE_EXTENTS_REGISTRY_PATH: &str = "system/registry/kernel/root-file-extents.tsv";
 const AHCI_POLICY_COMMAND_SLOT: u32 = 0;
-const AHCI_POLICY_PRDT_ENTRIES: u32 = 16;
-const AHCI_POLICY_MAX_TRANSFER_BYTES: u32 = 1024 * 1024;
+const AHCI_POLICY_PRDT_ENTRIES: u32 = 1;
+const AHCI_POLICY_MAX_TRANSFER_BYTES: u32 = 64 * 1024;
 const AHCI_POLICY_LOGICAL_BLOCK_SIZE: u32 = 512;
-const AHCI_POLICY_WAIT_SPINS: u32 = 1_000_000;
+const AHCI_POLICY_WAIT_SPINS: u32 = 5_000_000;
 const AHCI_POLICY_MAX_PORTS: u32 = 32;
+const NVME_POLICY_ADMIN_QUEUE_DEPTH: u32 = 16;
+const NVME_POLICY_IO_QUEUE_DEPTH: u32 = 16;
+const NVME_POLICY_MAX_TRANSFER_BYTES: u32 = 64 * 1024;
+const NVME_POLICY_PAGE_BYTES: u32 = 4096;
+const NVME_POLICY_WAIT_SPINS: u32 = 5_000_000;
+const NVME_POLICY_MAX_NAMESPACES: u32 = 1;
 
 fn main() {
     observability_client::info!("storaged", service, "service started");
@@ -211,8 +218,18 @@ fn dispatch_commercial(
             response.value0 = policy.max_transfer_bytes as u64;
             response.value1 = policy.prdt_entries as u64;
             response.descriptor_count = 1;
-            response.descriptors[0] = ahci_policy_descriptor(request.header.op);
-            response.capability = ahci_policy_capability(request.header.op);
+            response.descriptors[0] = storage_policy_descriptor("ahci-policy", request.header.op);
+            response.capability = storage_policy_capability("ahci-policy", request.header.op);
+            response.payload_len = write_payload_struct(&policy, &mut response.payload);
+            Ok(())
+        }
+        COMMERCIAL_MAX_STORAGED_OP_NVME_POLICY => {
+            let policy = nvme_policy_response();
+            response.value0 = policy.max_transfer_bytes as u64;
+            response.value1 = policy.io_queue_depth as u64;
+            response.descriptor_count = 1;
+            response.descriptors[0] = storage_policy_descriptor("nvme-policy", request.header.op);
+            response.capability = storage_policy_capability("nvme-policy", request.header.op);
             response.payload_len = write_payload_struct(&policy, &mut response.payload);
             Ok(())
         }
@@ -231,6 +248,19 @@ fn ahci_policy_response() -> StoragedAhciPolicyWire {
         wait_spins: AHCI_POLICY_WAIT_SPINS,
         max_ports: AHCI_POLICY_MAX_PORTS,
         ..StoragedAhciPolicyWire::default()
+    }
+}
+
+fn nvme_policy_response() -> StoragedNvmePolicyWire {
+    StoragedNvmePolicyWire {
+        abi_version: STORAGED_IPC_ABI_VERSION,
+        admin_queue_depth: NVME_POLICY_ADMIN_QUEUE_DEPTH,
+        io_queue_depth: NVME_POLICY_IO_QUEUE_DEPTH,
+        max_transfer_bytes: NVME_POLICY_MAX_TRANSFER_BYTES,
+        page_bytes: NVME_POLICY_PAGE_BYTES,
+        wait_spins: NVME_POLICY_WAIT_SPINS,
+        max_namespaces: NVME_POLICY_MAX_NAMESPACES,
+        ..StoragedNvmePolicyWire::default()
     }
 }
 
@@ -423,7 +453,8 @@ fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result
         | COMMERCIAL_MAX_STORAGED_OP_ROOT_VOLUME_SELECT
         | COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE
         | COMMERCIAL_MAX_STORAGED_OP_VOLUME_METADATA
-        | COMMERCIAL_MAX_STORAGED_OP_AHCI_POLICY => Ok(()),
+        | COMMERCIAL_MAX_STORAGED_OP_AHCI_POLICY
+        | COMMERCIAL_MAX_STORAGED_OP_NVME_POLICY => Ok(()),
         _ => Err(libc::EINVAL),
     }
 }
@@ -518,32 +549,50 @@ fn boot_extent_capability(lease: &BootExtentLeaseWire) -> CommercialMaxCapabilit
     wire
 }
 
-fn ahci_policy_descriptor(op: u16) -> CommercialMaxProtocolDescriptorWire {
+fn storage_policy_descriptor(label: &str, op: u16) -> CommercialMaxProtocolDescriptorWire {
     let mut wire = CommercialMaxProtocolDescriptorWire {
         protocol: COMMERCIAL_MAX_PROTOCOL_STORAGED,
         op,
-        flags: STORAGE_AHCI_POLICY_FLAG_DMA_64 | STORAGE_AHCI_POLICY_FLAG_SINGLE_SLOT,
         service_id: IPC_SERVICE_STORAGED,
         capability_mask: storaged_capability_mask(op),
-        value0: AHCI_POLICY_MAX_TRANSFER_BYTES as u64,
-        value1: AHCI_POLICY_PRDT_ENTRIES as u64,
+        value0: storage_policy_value0(op),
+        value1: storage_policy_value1(op),
         ..CommercialMaxProtocolDescriptorWire::default()
     };
-    copy_label(b"ahci-policy", &mut wire.name, &mut wire.name_len);
+    if op == COMMERCIAL_MAX_STORAGED_OP_AHCI_POLICY {
+        wire.flags = STORAGE_AHCI_POLICY_FLAG_DMA_64 | STORAGE_AHCI_POLICY_FLAG_SINGLE_SLOT;
+    }
+    copy_label(label.as_bytes(), &mut wire.name, &mut wire.name_len);
     wire
 }
 
-fn ahci_policy_capability(op: u16) -> CommercialMaxCapabilityLeaseWire {
+fn storage_policy_capability(label: &str, op: u16) -> CommercialMaxCapabilityLeaseWire {
     let mut wire = CommercialMaxCapabilityLeaseWire {
         lease_id: op as u64,
         service_id: IPC_SERVICE_STORAGED,
         capability_mask: storaged_capability_mask(op),
         rights_mask: storaged_capability_mask(op),
-        generation: AHCI_POLICY_MAX_TRANSFER_BYTES as u64,
+        generation: storage_policy_value0(op),
         ..CommercialMaxCapabilityLeaseWire::default()
     };
-    copy_label(b"ahci-policy", &mut wire.label, &mut wire.label_len);
+    copy_label(label.as_bytes(), &mut wire.label, &mut wire.label_len);
     wire
+}
+
+fn storage_policy_value0(op: u16) -> u64 {
+    match op {
+        COMMERCIAL_MAX_STORAGED_OP_AHCI_POLICY => AHCI_POLICY_MAX_TRANSFER_BYTES as u64,
+        COMMERCIAL_MAX_STORAGED_OP_NVME_POLICY => NVME_POLICY_MAX_TRANSFER_BYTES as u64,
+        _ => 0,
+    }
+}
+
+fn storage_policy_value1(op: u16) -> u64 {
+    match op {
+        COMMERCIAL_MAX_STORAGED_OP_AHCI_POLICY => AHCI_POLICY_PRDT_ENTRIES as u64,
+        COMMERCIAL_MAX_STORAGED_OP_NVME_POLICY => NVME_POLICY_IO_QUEUE_DEPTH as u64,
+        _ => 0,
+    }
 }
 
 fn storaged_capability_mask(op: u16) -> u64 {
@@ -554,6 +603,7 @@ fn storaged_capability_mask(op: u16) -> u64 {
         COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE => 1 << 3,
         COMMERCIAL_MAX_STORAGED_OP_VOLUME_METADATA => 1 << 4,
         COMMERCIAL_MAX_STORAGED_OP_AHCI_POLICY => 1 << 5,
+        COMMERCIAL_MAX_STORAGED_OP_NVME_POLICY => 1 << 6,
         _ => 0,
     }
 }

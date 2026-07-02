@@ -1,3 +1,5 @@
+// RING3-MIGRATION-REFERENCE START: inputd should own keyboard dispatch policy.
+// Ring0 keeps hardware callback ingress into the bounded input queue.
 #[cfg(not(test))]
 use x86_64::instructions::interrupts;
 
@@ -53,3 +55,4 @@ mod tests {
         assert_eq!(ingress[0].keyboard.code, KeyCode::A as u32);
     }
 }
+// RING3-MIGRATION-REFERENCE END: inputd-owned keyboard dispatch policy.

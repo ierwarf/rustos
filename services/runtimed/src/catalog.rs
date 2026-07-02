@@ -4,12 +4,12 @@ use std::thread;
 use std::time::Instant;
 
 use runtime_control::{
-    DEFAULT_APPLICATIONS_DIR, DEFAULT_RUNTIME_LAUNCH_REGISTRY_PATH, DesktopProgramEntry,
-    StartupMode, load_desktop_program_entries, load_runtime_launch_program_entries,
+    load_desktop_program_entries, load_runtime_launch_program_entries, DesktopProgramEntry,
+    StartupMode, DEFAULT_APPLICATIONS_DIR, DEFAULT_RUNTIME_LAUNCH_REGISTRY_PATH,
 };
 
+use super::{boot_line, DEFAULT_USER_TASK_WEIGHT_MICROS, UI_SERVER_EXEC_PATH};
 use super::{BrokerState, LaunchCatalog, LaunchEntry, ProgramMetadata};
-use super::{DEFAULT_USER_TASK_WEIGHT_MICROS, UI_SERVER_EXEC_PATH, boot_line};
 
 pub(super) fn start_launch_catalog_loader() -> Receiver<LaunchCatalog> {
     let (sender, receiver) = mpsc::sync_channel(1);

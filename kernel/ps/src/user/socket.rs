@@ -1,3 +1,5 @@
+// RING3-MIGRATION-REFERENCE START: netd should own socket namespace, lifecycle,
+// and readiness policy. Ring0 keeps fd-table socket token substrate.
 use crate::user::handles::KernelHandle;
 use kernel_object::api::handle::HandleRights;
 
@@ -106,3 +108,4 @@ impl SocketHandle {
         None
     }
 }
+// RING3-MIGRATION-REFERENCE END: netd-owned socket token policy.

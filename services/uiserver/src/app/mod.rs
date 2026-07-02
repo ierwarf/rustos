@@ -457,6 +457,7 @@ impl AppState {
             && previous_focus == self.focused_wayland_surface_id
             && !has_damage
         {
+            self.wayland_windows = previous_windows;
             return canvas::Rect::empty();
         }
 

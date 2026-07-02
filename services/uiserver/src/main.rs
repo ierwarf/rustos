@@ -574,6 +574,7 @@ fn run() -> Result<(), i32> {
     let mut frames_rendered_window = 0_u64;
     let mut cursor_moves_window = 0_u64;
 
+    sys::debug_line("uiserver: main loop entered");
     'main_loop: loop {
         loop_count = loop_count.saturating_add(1);
         let iteration_started = Instant::now();
@@ -640,7 +641,10 @@ fn run() -> Result<(), i32> {
             PresentUpdateResult::Idle => false,
         };
         phase_timings.input_present = input_present_started.elapsed();
-        if rendered_input_update && input.backlog_remaining {
+        if rendered_input_update
+            && input.backlog_remaining
+            && Instant::now() < next_wayland_backlog_service
+        {
             let iteration_elapsed = iteration_started.elapsed();
             if iteration_elapsed >= SLOW_LOOP_THRESHOLD {
                 log_slow_loop_iteration(
@@ -798,6 +802,7 @@ fn run() -> Result<(), i32> {
                 .min(next_console_poll)
                 .min(next_cursor_blink)
                 .min(next_cursor_motion_settle)
+                .min(next_wayland_backlog_service)
                 .min(now + IDLE_SLEEP);
             input_loop::sleep_until(sleep_deadline);
         }

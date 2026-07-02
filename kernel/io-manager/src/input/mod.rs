@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: inputd/driverd should own input provider
+// selection and legacy bus service policy. Ring0 keeps interrupt lower-half
+// service hooks for native input substrate.
 use crate::driver;
 use driver_abi::{DriverBus, DriverClass};
 
@@ -94,3 +97,4 @@ pub(crate) fn initialize_aux_transport() -> bool {
 pub(crate) fn serio_lower_half_service_pending() -> usize {
     i8042::service_pending() + crate::driver::serio::service_pending()
 }
+// RING3-MIGRATION-REFERENCE END: inputd/driverd-owned input provider policy.

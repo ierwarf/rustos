@@ -1,3 +1,7 @@
+// RING3-MIGRATION-REFERENCE START: uiserver/driverd should own the non-.ko
+// virtio-gpu service-driver once a ring3 service-driver host can drive leased
+// MMIO/DMA/IRQ resources. Ring0 keeps this native provider as privileged display
+// substrate until that host exists.
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering, compiler_fence};
 
@@ -612,6 +616,10 @@ pub(crate) fn try_enable_primary_display() -> bool {
     enabled
 }
 
+pub(crate) fn primary_display_enabled() -> bool {
+    DISPLAY.lock().is_some()
+}
+
 fn try_enable_primary_display_once() -> bool {
     if DISPLAY.lock().is_some() {
         return true;
@@ -881,6 +889,7 @@ fn probe_and_init() -> Option<VirtioGpuDisplay> {
     trace_native("virtio-gpu-native-driver-ok", pci_bdf_key(pci), 0);
 
     let (width, height) = policy_scanout_size()
+        .or_else(default_scanout_size)
         .or_else(|| {
             query_display_info(&mut controller)
                 .filter(|&(width, height)| scanout_size_is_supported(width, height))
@@ -1052,6 +1061,11 @@ fn policy_scanout_size() -> Option<(u32, u32)> {
     let width = POLICY_SCANOUT_WIDTH.load(Ordering::Acquire);
     let height = POLICY_SCANOUT_HEIGHT.load(Ordering::Acquire);
     scanout_size_is_supported(width, height).then_some((width, height))
+}
+
+fn default_scanout_size() -> Option<(u32, u32)> {
+    scanout_size_is_supported(FRAMEBUFFER_WIDTH_DEFAULT, FRAMEBUFFER_HEIGHT_DEFAULT)
+        .then_some((FRAMEBUFFER_WIDTH_DEFAULT, FRAMEBUFFER_HEIGHT_DEFAULT))
 }
 
 fn scanout_size_is_supported(width: u32, height: u32) -> bool {
@@ -1294,3 +1308,4 @@ unsafe fn write_common_u64(base: *mut u8, offset: usize, value: u64) {
 fn align_up(value: usize, align: usize) -> usize {
     (value + align - 1) & !(align - 1)
 }
+// RING3-MIGRATION-REFERENCE END: uiserver/driverd-owned non-.ko virtio-gpu service-driver.

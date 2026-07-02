@@ -1,6 +1,7 @@
 use anyhow::{Context, anyhow, bail};
 use fs_err as fs;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -737,7 +738,7 @@ fn build_external_copy_manifest(config: &Config, manifest: &PackageManifest) -> 
             }
         }
         remove_file_if_exists(&artifact)?;
-        copy_with_parent(&source, &artifact)?;
+        copy_external_copy_source(&source, &artifact)?;
     } else if !manifest.build.optional {
         bail!(
             "required external package {} is missing source file",
@@ -748,6 +749,29 @@ fn build_external_copy_manifest(config: &Config, manifest: &PackageManifest) -> 
             "xtask: warning: optional vendor module not found: {}",
             manifest.id
         );
+    }
+    Ok(())
+}
+
+fn copy_external_copy_source(source: &Path, artifact: &Path) -> Result<()> {
+    if source.extension().and_then(|ext| ext.to_str()) != Some("zst") {
+        return copy_with_parent(source, artifact);
+    }
+    let parent = artifact
+        .parent()
+        .with_context(|| format!("artifact destination has no parent: {}", artifact.display()))?;
+    fs::create_dir_all(parent)?;
+    let zstd = command_in_path("zstd").context("missing zstd to unpack external .zst artifact")?;
+    let output = File::create(artifact)
+        .with_context(|| format!("failed to create {}", artifact.display()))?;
+    let status = Command::new(zstd)
+        .arg("-dc")
+        .arg(source)
+        .stdout(Stdio::from(output))
+        .status()
+        .with_context(|| format!("failed to run zstd for {}", source.display()))?;
+    if !status.success() {
+        bail!("failed to unpack {}", source.display());
     }
     Ok(())
 }

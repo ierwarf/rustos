@@ -76,8 +76,9 @@ context. Do not scan logs for build failures.
 
 **Active refactor — ring0 evacuation.** `rootd` is the first user process;
 starts `syscalld`, `vfsd`, `loaderd`, then hands off to `initd`. Push policy
-into services, not back into the kernel. Use `RING3-MIGRATION-REFERENCE`
-markers plus `cargo xtask ring3-inventory` as the migration source of truth.
+into services, not back into the kernel. Use `RING3-MIGRATION-REFERENCE` /
+`RING3-MIGRATION-COMMENTED-OUT` markers plus `cargo xtask ring3-inventory` as
+the migration source of truth.
 
 **Product goal.** Preserve native Linux ELF and Windows PE compatibility.
 Migration moves policy to user services without breaking observable app ABI;

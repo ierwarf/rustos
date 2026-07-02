@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: Linux .ko USB shims are explicit ring0
+// compatibility substrate. USB device/provider policy belongs in driverd,
+// devmgrd, and inputd.
 use super::compat::{
     LinuxCompatUrb, LinuxCompatUsbClassDriver, LinuxCompatUsbDevice, LinuxCompatUsbDriver,
     LinuxCompatUsbInterface,
@@ -546,3 +549,4 @@ pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
         _ => None,
     }
 }
+// RING3-MIGRATION-REFERENCE END: Linux .ko USB compatibility substrate exception.

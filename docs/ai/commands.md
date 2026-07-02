@@ -29,7 +29,7 @@ failure output as the primary debugging context.
 | --- | --- | --- | --- |
 | `cargo xtask selftest` | host selftests for fault parsing, ABI/layout, runtime contracts, module tests | `target/` | contract/layout regression |
 | `cargo xtask fuzz-host --target all` | deterministic host fuzz smoke for fault rules, project config, package manifest parsing | `logs/` on crash | parser panic or invariant bug |
-| `cargo xtask ring3-inventory` | classify remaining `RING3-MIGRATION-REFERENCE` marked LOC by owner/lane | none | stale marker classification or unexpected active LOC growth |
+| `cargo xtask ring3-inventory` | classify remaining `RING3-MIGRATION-REFERENCE` and `RING3-MIGRATION-COMMENTED-OUT` LOC by owner/lane | none | stale marker classification or unexpected active LOC growth |
 | `cargo test -p module-tests` | module tests | `target/` | unit/module regression |
 | `git diff --check` | whitespace sanity | none | trailing whitespace/conflict marker |
 

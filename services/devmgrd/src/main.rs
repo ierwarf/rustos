@@ -467,12 +467,10 @@ enum IoctlPolicyOwner {
 
 fn ioctl_policy_owner(request_number: u64) -> Option<IoctlPolicyOwner> {
     match request_number {
-        rustos_user_abi::device::DISPLAY_IOCTL_GET_INFO => Some(IoctlPolicyOwner::Uiserver(
-            COMMERCIAL_MAX_UISERVER_OP_DISPLAY_METADATA,
-        )),
-        rustos_user_abi::device::DISPLAY_IOCTL_CREATE_SURFACE => Some(IoctlPolicyOwner::Uiserver(
-            COMMERCIAL_MAX_UISERVER_OP_SURFACE_POLICY,
-        )),
+        rustos_user_abi::device::DISPLAY_IOCTL_GET_INFO
+        | rustos_user_abi::device::DISPLAY_IOCTL_CREATE_SURFACE
+        | rustos_user_abi::device::DISPLAY_IOCTL_PRESENT
+        | rustos_user_abi::device::DISPLAY_IOCTL_PRESENT_RECT => Some(IoctlPolicyOwner::Devmgrd),
         rustos_user_abi::console::CONSOLE_IOCTL_GET_STATE
         | rustos_user_abi::console::CONSOLE_IOCTL_SNAPSHOT_SESSIONS => Some(
             IoctlPolicyOwner::Sessiond(COMMERCIAL_MAX_SESSIOND_OP_SESSION_GRAPH),
