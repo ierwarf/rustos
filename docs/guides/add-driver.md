@@ -19,8 +19,10 @@
 5. Use `[build] builder = "module-image"` for Rust bridge modules.
 6. Use `[install] path = "system/drivers/<class>/<name>.ko"`.
 7. Add `[autoload]` metadata when the driver should be loaded by device policy.
-8. Put firmware or prebuilt external inputs under `vendor/`.
-9. Run `cargo xtask check`, then `cargo xtask build-driver-modules`, then
+8. Keep hardware-specific providers out of `profiles = ["default"]` unless the
+   default QEMU machine exposes that device.
+9. Put firmware or prebuilt external inputs under `vendor/`.
+10. Run `cargo xtask check`, then `cargo xtask build-driver-modules`, then
    `cargo xtask stage` or full `cargo xtask build`.
 
 ### Autoload Example
@@ -36,6 +38,9 @@ aliases = ["pci:vendor=0x1234,class=0x03"]
 provider_group = "display-primary"
 fallback_only = false
 ```
+
+Fallback providers in the same `provider_group` are loaded only when no primary
+provider in that group has loaded.
 
 ### Acceptance Criteria
 
@@ -60,8 +65,10 @@ fallback_only = false
 5. Rust bridge module에는 `[build] builder = "module-image"`를 사용합니다.
 6. `[install] path = "system/drivers/<class>/<name>.ko"`를 사용합니다.
 7. device policy로 load되어야 하면 `[autoload]` metadata를 추가합니다.
-8. firmware나 prebuilt external input은 `vendor/` 아래에 둡니다.
-9. `cargo xtask check`, `cargo xtask build-driver-modules`, 그 다음
+8. hardware-specific provider는 default QEMU machine에 그 device가 있을
+   때만 `profiles = ["default"]`에 넣습니다.
+9. firmware나 prebuilt external input은 `vendor/` 아래에 둡니다.
+10. `cargo xtask check`, `cargo xtask build-driver-modules`, 그 다음
    `cargo xtask stage` 또는 full `cargo xtask build`를 실행합니다.
 
 ### Autoload Example
@@ -77,6 +84,9 @@ aliases = ["pci:vendor=0x1234,class=0x03"]
 provider_group = "display-primary"
 fallback_only = false
 ```
+
+같은 `provider_group`의 fallback provider는 primary provider가 없을 때만
+load됩니다.
 
 ### Acceptance Criteria
 

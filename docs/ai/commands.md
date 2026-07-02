@@ -12,6 +12,7 @@ failure output as the primary debugging context.
 | `cargo xtask build-user` | userspace packages only | `target/`, `build/artifacts` | service/app compile error |
 | `cargo xtask build-driver-modules` | bridge modules only | `target/`, `build/artifacts` | driver/module build error |
 | `cargo xtask stage` | restage built artifacts | `build/image` | missing required artifact, bad install path |
+| `cargo xtask clean` | remove generated host/build/runtime outputs | removes `target/`, `build/`, `logs/` | stale generated artifact cleanup |
 
 ## Run and debug
 

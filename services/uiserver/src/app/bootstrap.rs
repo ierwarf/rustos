@@ -10,8 +10,9 @@ use super::{
 };
 use crate::sys::{
     boot_line, diag_line, display_create_surface, display_get_info, display_present,
-    display_present_rect, map_surface, open_console, open_display, open_input, DisplayInfo,
-    DisplaySurfaceCreate, SurfaceMapping, ESTALE, PIXEL_FORMAT_BGRA8888,
+    display_present_rect, map_surface, open_console, open_display, open_input,
+    publish_input_pointer_surface, DisplayInfo, DisplaySurfaceCreate, SurfaceMapping, ESTALE,
+    PIXEL_FORMAT_BGRA8888,
 };
 const SURFACE_CREATE_RETRIES: usize = 4;
 // Retry budget for waiting on the primary display provider (e.g. virtio-gpu).
@@ -304,6 +305,20 @@ impl AppState {
         let surface_state = fetch_surface_state(display_fd.as_raw_fd())?;
         diag_line("uiserver: init fetch_surface done");
         boot_line("uiserver: init fetch_surface done");
+        match publish_input_pointer_surface(surface_state.display) {
+            Ok(()) => diag_line(
+                format!(
+                    "uiserver: input pointer surface published width={} height={} gen={}",
+                    surface_state.display.width,
+                    surface_state.display.height,
+                    surface_state.display.generation,
+                )
+                .as_str(),
+            ),
+            Err(errno) => diag_line(
+                format!("uiserver: input pointer surface publish failed errno={errno}").as_str(),
+            ),
+        }
         diag_line(
             format!(
                 "uiserver: init surface meta display={}x{} stride={} gen={} surface={}x{} stride={} handle={} map_len={} gen={}",
@@ -335,6 +350,7 @@ impl AppState {
             left_button_down: false,
             focused_session_handle: 0,
             focused_wayland_surface_id: None,
+            pending_console_focus: None,
             desktop_cache: DesktopSurfaceCache::default(),
             launcher_programs: Vec::new(),
             console_windows: Vec::new(),

@@ -85,8 +85,32 @@ Kernel data paths (FD/socket/module/process/storage/input) remain narrow gated b
 - PS/2 keyboard scancodes and PS/2 mouse bytes are raw ingress. Packet
   assembly, button edges, motion conversion, and keyboard translation are
   `inputd` policy, not i8042 ring0 policy.
+- Native keyboard events must carry the full `InputEvent` contract:
+  `code/action/modifiers/text`. HID and PS/2 paths both pass through
+  `keyboard-core::KeyboardDriver`; do not emit keycode-only native events and
+  expect `uiserver` or the TTY layer to reconstruct printable text.
+- Absolute pointer coordinates are a two-part contract. `inputd` owns HID
+  logical axis decoding and event coalescing; `uiserver` owns the current
+  display/output extent and publishes it to inputd with
+  `INPUTD_IPC_OP_SET_POINTER_SURFACE` after display surface generation is
+  stable. Do not hardcode fallback display sizes in inputd. If the pointer
+  surface is not configured yet, inputd must not enqueue fabricated absolute
+  positions.
 - Ring0 performs only current-process user-copy of service-returned bytes.
 - `INPUTD_IPC_OP_AUTHORIZE_READ` + `SYS_RUSTOS_INPUT_STATS_BROKER` remain compat/observability surfaces while remaining event queue is evacuated.
+
+## Console / TTY Surface (`runtimed` session policy)
+
+- `runtimed::session::SessionRuntime` owns Linux-style line discipline for
+  console-hosted programs: canonical edit buffer, echo, cursor edit keys,
+  noncanonical byte translation, and termios state.
+- `uiserver` forwards focused keyboard `InputEvent`s to
+  `CONSOLE_IOCTL_SEND_INPUT_EVENT`; it must not implement shell line editing.
+- `runtimed` interprets key meanings through `keyboard-core::KeyCode`, not
+  duplicated numeric constants. `InputEvent.text` is the source of printable
+  bytes; Enter/backspace/arrows use `KeyCode`.
+- Kernel TTY substrate remains a bootstrap/user-copy fallback only. Do not add
+  new canonical editing or focus policy to ring0.
 
 ## Device Surface (`devmgrd`)
 
@@ -99,7 +123,7 @@ Kernel data paths (FD/socket/module/process/storage/input) remain narrow gated b
 ## Driver Surface (`driverd`)
 
 - Gated brokers: `SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER`, `SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER`. Kernel side only loads an explicit module image or probes hardware aliases.
-- Provider-group active state, fallback ordering, virtio display preferred scanout = **driverd state, not a ring0 broker**.
+- Provider-group active state and fallback ordering are **driverd state, not a ring0 broker**.
 - xHCI uses the native RustOS host-controller path by default. Linux USB host-controller `.ko` bridges stay out of the default profile; keep load/provider/device/input policy in driverd/devmgrd/inputd, not in the native transfer engine.
 - Native xHCI HID polling is always enabled for USB input.
 - The remaining `service-driver-host` lane is not `.ko` work. It is first-party

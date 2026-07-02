@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use keyboard_core::KeyCode;
 use runtime_control::{
     load_desktop_program_entries, load_runtime_default_env, RuntimeEnvScope,
     DEFAULT_APPLICATIONS_DIR, DEFAULT_RUNTIME_ENV_REGISTRY_PATH,
@@ -37,20 +38,6 @@ use super::{BrokerState, LaunchEntry};
 const INPUT_BUFFER_CAPACITY: usize = 1024;
 const EDIT_BUFFER_CAPACITY: usize = 256;
 const OUTPUT_BUFFER_CAPACITY: usize = 4096;
-const KEY_ESCAPE: u32 = 0;
-const KEY_BACKSPACE: u32 = 13;
-const KEY_ENTER: u32 = 27;
-const KEY_NUMPAD_ENTER: u32 = 88;
-const KEY_INSERT: u32 = 90;
-const KEY_DELETE: u32 = 91;
-const KEY_HOME: u32 = 92;
-const KEY_END: u32 = 93;
-const KEY_PAGE_UP: u32 = 94;
-const KEY_PAGE_DOWN: u32 = 95;
-const KEY_ARROW_UP: u32 = 96;
-const KEY_ARROW_DOWN: u32 = 97;
-const KEY_ARROW_LEFT: u32 = 98;
-const KEY_ARROW_RIGHT: u32 = 99;
 
 #[derive(Default)]
 pub(crate) struct SessionRuntime {
@@ -190,11 +177,11 @@ impl TtySessionState {
     }
 
     fn on_canonical_key_event(&mut self, event: InputEvent) -> Result<(), i32> {
-        match event.code {
-            KEY_ARROW_LEFT => self.move_cursor_left(),
-            KEY_ARROW_RIGHT => self.move_cursor_right(),
-            KEY_BACKSPACE => self.handle_backspace(),
-            KEY_ENTER | KEY_NUMPAD_ENTER => self.commit_line(),
+        match KeyCode::from_u32(event.code) {
+            Some(KeyCode::ArrowLeft) => self.move_cursor_left(),
+            Some(KeyCode::ArrowRight) => self.move_cursor_right(),
+            Some(KeyCode::Backspace) => self.handle_backspace(),
+            Some(KeyCode::Enter | KeyCode::NumpadEnter) => self.commit_line(),
             _ => {
                 let byte = input_event_text_byte(event)?;
                 self.insert_edit_byte(byte);
@@ -371,20 +358,20 @@ fn input_event_text_byte(event: InputEvent) -> Result<u8, i32> {
 }
 
 fn noncanonical_input_bytes(termios: LinuxTermios, event: InputEvent) -> Result<Vec<u8>, i32> {
-    let bytes: &[u8] = match event.code {
-        KEY_BACKSPACE => return Ok(vec![termios.erase_byte()]),
-        KEY_ENTER | KEY_NUMPAD_ENTER => b"\n",
-        KEY_ARROW_UP => b"\x1b[A",
-        KEY_ARROW_DOWN => b"\x1b[B",
-        KEY_ARROW_RIGHT => b"\x1b[C",
-        KEY_ARROW_LEFT => b"\x1b[D",
-        KEY_HOME => b"\x1b[H",
-        KEY_END => b"\x1b[F",
-        KEY_INSERT => b"\x1b[2~",
-        KEY_DELETE => b"\x1b[3~",
-        KEY_PAGE_UP => b"\x1b[5~",
-        KEY_PAGE_DOWN => b"\x1b[6~",
-        KEY_ESCAPE => b"\x1b",
+    let bytes: &[u8] = match KeyCode::from_u32(event.code) {
+        Some(KeyCode::Backspace) => return Ok(vec![termios.erase_byte()]),
+        Some(KeyCode::Enter | KeyCode::NumpadEnter) => b"\n",
+        Some(KeyCode::ArrowUp) => b"\x1b[A",
+        Some(KeyCode::ArrowDown) => b"\x1b[B",
+        Some(KeyCode::ArrowRight) => b"\x1b[C",
+        Some(KeyCode::ArrowLeft) => b"\x1b[D",
+        Some(KeyCode::Home) => b"\x1b[H",
+        Some(KeyCode::End) => b"\x1b[F",
+        Some(KeyCode::Insert) => b"\x1b[2~",
+        Some(KeyCode::Delete) => b"\x1b[3~",
+        Some(KeyCode::PageUp) => b"\x1b[5~",
+        Some(KeyCode::PageDown) => b"\x1b[6~",
+        Some(KeyCode::Escape) => b"\x1b",
         _ => return Ok(vec![input_event_text_byte(event)?]),
     };
     Ok(bytes.to_vec())
@@ -938,6 +925,49 @@ fn ui_server_bootstrap_args_env() -> (Vec<String>, Vec<String>) {
         }
     }
     (args, env)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionRuntime;
+    use keyboard_core::KeyCode;
+    use rustos_user_abi::device::{InputEvent, INPUT_ACTION_PRESSED, INPUT_KIND_KEYBOARD};
+
+    fn key_event(code: u32, text: u8) -> InputEvent {
+        InputEvent {
+            kind: INPUT_KIND_KEYBOARD,
+            action: INPUT_ACTION_PRESSED,
+            code,
+            value0: 0,
+            value1: 0,
+            modifiers: 0,
+            text: text as u32,
+        }
+    }
+
+    #[test]
+    fn canonical_console_input_commits_text_on_enter() {
+        let mut runtime = SessionRuntime::default();
+        let session = 7;
+        runtime.create_session(session);
+
+        for byte in b"pwd" {
+            runtime
+                .handle_input_event(session, key_event(30, *byte))
+                .expect("text key should be accepted");
+        }
+
+        let mut before_enter = [0_u8; 8];
+        assert_eq!(runtime.read_from_session(session, &mut before_enter), 0);
+
+        runtime
+            .handle_input_event(session, key_event(KeyCode::Enter as u32, b'\n'))
+            .expect("enter should commit the edited line");
+
+        let mut line = [0_u8; 8];
+        let read = runtime.read_from_session(session, &mut line);
+        assert_eq!(&line[..read], b"pwd\n");
+    }
 }
 
 fn merge_manifest_env_into(env: &mut Vec<String>, manifest_env: &[String]) {

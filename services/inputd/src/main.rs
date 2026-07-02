@@ -6,17 +6,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use keyboard_core::{KeyAction, KeyboardDriver, ScanCodeSet};
+use keyboard_core::{KeyAction, KeyboardDriver, KeyboardEvent, ScanCodeSet};
 use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, InputHidKeyboardReportWire,
     InputHidPointerReportWire, InputHidPolicyWire, InputIngestBrokerArgs, InputIngressWire,
     InputKeyboardEventWire, InputPointerAbsoluteWire, InputPointerPacketWire, InputStatsBrokerArgs,
-    InputStatsWire, InputdIpcRequest, InputdIpcResponse, InputdReadResponse,
-    COMMERCIAL_MAX_INPUTD_OP_DROP_POLICY, COMMERCIAL_MAX_INPUTD_OP_EVDEV_TRANSLATE,
-    COMMERCIAL_MAX_INPUTD_OP_HID_REPORT_POLICY, COMMERCIAL_MAX_INPUTD_OP_I8042_COMMAND_POLICY,
-    COMMERCIAL_MAX_INPUTD_OP_INPUT_INGEST, COMMERCIAL_MAX_INPUTD_OP_INPUT_READER,
-    COMMERCIAL_MAX_INPUTD_OP_INPUT_STATS, COMMERCIAL_MAX_INPUTD_OP_LAYOUT_POLICY,
+    InputStatsWire, InputdIpcRequest, InputdIpcResponse, InputdPointerSurfaceRequest,
+    InputdReadResponse, COMMERCIAL_MAX_INPUTD_OP_DROP_POLICY,
+    COMMERCIAL_MAX_INPUTD_OP_EVDEV_TRANSLATE, COMMERCIAL_MAX_INPUTD_OP_HID_REPORT_POLICY,
+    COMMERCIAL_MAX_INPUTD_OP_I8042_COMMAND_POLICY, COMMERCIAL_MAX_INPUTD_OP_INPUT_INGEST,
+    COMMERCIAL_MAX_INPUTD_OP_INPUT_READER, COMMERCIAL_MAX_INPUTD_OP_INPUT_STATS,
+    COMMERCIAL_MAX_INPUTD_OP_LAYOUT_POLICY, COMMERCIAL_MAX_INPUTD_OP_POINTER_SURFACE_POLICY,
     COMMERCIAL_MAX_INPUTD_OP_PS2_PACKET_POLICY, COMMERCIAL_MAX_INPUTD_OP_SERIO_BUS_POLICY,
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_INPUTD, INPUTD_ACCESS_EVDEV,
     INPUTD_ACCESS_NATIVE, INPUTD_HID_POLICY_DESCRIPTOR_CAPACITY, INPUTD_HID_POLICY_KIND_KEYBOARD,
@@ -27,19 +28,17 @@ use rustos_user_abi::syscall::{
     INPUTD_INGRESS_KIND_KEYBOARD, INPUTD_INGRESS_KIND_POINTER_ABSOLUTE,
     INPUTD_INGRESS_KIND_POINTER_PACKET, INPUTD_INGRESS_KIND_PS2_MOUSE_BYTE,
     INPUTD_INGRESS_KIND_PS2_SCANCODE, INPUTD_IPC_ABI_VERSION, INPUTD_IPC_OP_AUTHORIZE_READ,
-    INPUTD_IPC_OP_DRAIN_INGEST, INPUTD_IPC_OP_PING, INPUTD_IPC_OP_READ, INPUTD_IPC_OP_STATS,
-    INPUTD_READ_FLAG_NONBLOCK, INPUTD_READ_PAYLOAD_CAPACITY, IPC_MAX_INLINE_BYTES,
-    IPC_SERVICE_INPUTD, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_INPUT_INGEST_BROKER,
-    SYS_RUSTOS_INPUT_STATS_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV,
-    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
+    INPUTD_IPC_OP_DRAIN_INGEST, INPUTD_IPC_OP_PING, INPUTD_IPC_OP_READ,
+    INPUTD_IPC_OP_SET_POINTER_SURFACE, INPUTD_IPC_OP_STATS, INPUTD_READ_FLAG_NONBLOCK,
+    INPUTD_READ_PAYLOAD_CAPACITY, IPC_MAX_INLINE_BYTES, IPC_SERVICE_INPUTD, SYS_RUSTOS_DEBUG_PRINT,
+    SYS_RUSTOS_INPUT_INGEST_BROKER, SYS_RUSTOS_INPUT_STATS_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
+    SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
 };
 
 const RECV_BACKOFF: Duration = Duration::from_millis(50);
 const INPUTD_QUEUE_MAX_EVENTS: usize = 4096;
 const INPUTD_MAX_NATIVE_READ_BYTES: u64 = input_evdev::MAX_NATIVE_READ_BYTES as u64;
 const INPUTD_MAX_EVDEV_READ_BYTES: u64 = input_evdev::MAX_EVDEV_READ_BYTES as u64;
-const DEFAULT_POINTER_WIDTH: i32 = 1600;
-const DEFAULT_POINTER_HEIGHT: i32 = 900;
 const PS2_MOUSE_STATUS_LEFT: u8 = 1 << 0;
 const PS2_MOUSE_STATUS_RIGHT: u8 = 1 << 1;
 const PS2_MOUSE_STATUS_MIDDLE: u8 = 1 << 2;
@@ -54,6 +53,28 @@ struct HidKeyboardState {
     modifiers: u8,
     keys: [u8; 16],
     key_count: usize,
+    keyboard: KeyboardDriver,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PointerSurface {
+    width: u32,
+    height: u32,
+    generation: u64,
+}
+
+impl PointerSurface {
+    fn configured(self) -> bool {
+        self.width > 0 && self.height > 0
+    }
+
+    fn max_x(self) -> i32 {
+        self.width.saturating_sub(1).min(i32::MAX as u32) as i32
+    }
+
+    fn max_y(self) -> i32 {
+        self.height.saturating_sub(1).min(i32::MAX as u32) as i32
+    }
 }
 
 #[derive(Default)]
@@ -62,6 +83,7 @@ struct InputQueue {
     hid_keyboards: Vec<HidKeyboardState>,
     ps2_keyboard: KeyboardDriver,
     ps2_mouse: Ps2MousePacketState,
+    pointer_surface: PointerSurface,
     dropped_lossy: u64,
     pointer_buttons: u8,
 }
@@ -99,6 +121,21 @@ impl InputQueue {
         self.events.pop_front()
     }
 
+    fn set_pointer_surface(&mut self, width: u32, height: u32, generation: u64) -> Result<(), i32> {
+        if width == 0 || height == 0 {
+            return Err(libc::EINVAL);
+        }
+        if self.pointer_surface.configured() && generation < self.pointer_surface.generation {
+            return Err(libc::ESTALE);
+        }
+        self.pointer_surface = PointerSurface {
+            width,
+            height,
+            generation,
+        };
+        Ok(())
+    }
+
     fn push_keyboard_event(&mut self, event: InputKeyboardEventWire) {
         self.push(input_evdev::InputEvent {
             kind: input_evdev::INPUT_KIND_KEYBOARD,
@@ -120,15 +157,7 @@ impl InputQueue {
         self.ps2_keyboard.set_scan_code_set(scan_set);
         self.ps2_keyboard.feed_scancode(scancode);
         while let Some(event) = self.ps2_keyboard.pop_event() {
-            self.push(input_evdev::InputEvent {
-                kind: input_evdev::INPUT_KIND_KEYBOARD,
-                action: keyboard_action_to_inputd(event.action),
-                code: event.code as u32,
-                value0: 0,
-                value1: 0,
-                modifiers: event.modifiers.bits() as u32,
-                text: event.text.unwrap_or(0) as u32,
-            });
+            self.push_keyboard_driver_event(event);
         }
     }
 
@@ -210,12 +239,16 @@ impl InputQueue {
     }
 
     fn push_pointer_absolute(&mut self, absolute: InputPointerAbsoluteWire) {
+        if !self.pointer_surface.configured() {
+            self.push_pointer_button_edges(absolute.buttons);
+            return;
+        }
         self.push(input_evdev::InputEvent {
             kind: input_evdev::INPUT_KIND_POINTER_POSITION,
             action: input_evdev::INPUT_ACTION_NONE,
             code: 0,
-            value0: absolute.x as i32,
-            value1: absolute.y as i32,
+            value0: (absolute.x.min(self.pointer_surface.max_x() as u32)) as i32,
+            value1: (absolute.y.min(self.pointer_surface.max_y() as u32)) as i32,
             modifiers: 0,
             text: 0,
         });
@@ -263,7 +296,7 @@ impl InputQueue {
                 continue;
             }
             if let Some(code) = input_evdev::hid_usage_to_keycode(usage) {
-                self.push_keycode_event(code as u32, (report.modifiers & mask) != 0);
+                self.push_hid_key_transition(state_index, code, (report.modifiers & mask) == 0);
             }
         }
 
@@ -272,7 +305,7 @@ impl InputQueue {
             let usage = previous_keys[previous_index];
             if !keys[..key_count].contains(&usage) {
                 if let Some(code) = input_evdev::hid_usage_to_keycode(usage) {
-                    self.push_keycode_event(code as u32, false);
+                    self.push_hid_key_transition(state_index, code, true);
                 }
             }
             previous_index += 1;
@@ -283,7 +316,7 @@ impl InputQueue {
             let usage = keys[current_index];
             if !previous_keys[..previous_key_count].contains(&usage) {
                 if let Some(code) = input_evdev::hid_usage_to_keycode(usage) {
-                    self.push_keycode_event(code as u32, true);
+                    self.push_hid_key_transition(state_index, code, false);
                 }
             }
             current_index += 1;
@@ -329,14 +362,22 @@ impl InputQueue {
                 }
             }
             INPUTD_HID_POLICY_KIND_POINTER => {
-                if let Some(pointer) = decode_hid_pointer_report(raw.source_id, descriptor, report)
-                {
+                if let Some(pointer) = decode_hid_pointer_report(
+                    raw.source_id,
+                    descriptor,
+                    report,
+                    self.pointer_surface,
+                ) {
                     self.push_hid_pointer_report(pointer);
                 }
             }
             _ => {
-                if let Some(pointer) = decode_hid_pointer_report(raw.source_id, descriptor, report)
-                {
+                if let Some(pointer) = decode_hid_pointer_report(
+                    raw.source_id,
+                    descriptor,
+                    report,
+                    self.pointer_surface,
+                ) {
                     self.push_hid_pointer_report(pointer);
                 } else if let Some(keyboard) =
                     decode_hid_keyboard_report(raw.source_id, descriptor, report)
@@ -347,19 +388,29 @@ impl InputQueue {
         }
     }
 
-    fn push_keycode_event(&mut self, code: u32, pressed: bool) {
+    fn push_hid_key_transition(
+        &mut self,
+        state_index: usize,
+        code: input_evdev::KeyCode,
+        released: bool,
+    ) {
+        self.hid_keyboards[state_index]
+            .keyboard
+            .inject_key_transition(code, released);
+        while let Some(event) = self.hid_keyboards[state_index].keyboard.pop_event() {
+            self.push_keyboard_driver_event(event);
+        }
+    }
+
+    fn push_keyboard_driver_event(&mut self, event: KeyboardEvent) {
         self.push(input_evdev::InputEvent {
             kind: input_evdev::INPUT_KIND_KEYBOARD,
-            action: if pressed {
-                input_evdev::INPUT_ACTION_PRESSED
-            } else {
-                input_evdev::INPUT_ACTION_RELEASED
-            },
-            code,
+            action: keyboard_action_to_inputd(event.action),
+            code: event.code as u32,
             value0: 0,
             value1: 0,
-            modifiers: 0,
-            text: 0,
+            modifiers: event.modifiers.bits() as u32,
+            text: event.text.unwrap_or(0) as u32,
         });
     }
 
@@ -474,6 +525,7 @@ fn decode_hid_pointer_report(
     source_id: u64,
     descriptor: &[u8],
     report: &[u8],
+    pointer_surface: PointerSurface,
 ) -> Option<InputHidPointerReportWire> {
     let (report_id, report) = report_payload_for_descriptor(descriptor, report)?;
     let fields = parse_hid_input_fields(descriptor, report_id);
@@ -506,6 +558,9 @@ fn decode_hid_pointer_report(
     let (raw_x, x_field) = x?;
     let (raw_y, y_field) = y?;
     let relative = x_field.relative || y_field.relative;
+    if !relative && !pointer_surface.configured() {
+        return None;
+    }
     let x_value = if relative {
         raw_x
     } else {
@@ -513,7 +568,7 @@ fn decode_hid_pointer_report(
             raw_x,
             x_field.logical_min,
             x_field.logical_max,
-            DEFAULT_POINTER_WIDTH - 1,
+            pointer_surface.max_x(),
         )
     };
     let y_value = if relative {
@@ -523,7 +578,7 @@ fn decode_hid_pointer_report(
             raw_y,
             y_field.logical_min,
             y_field.logical_max,
-            DEFAULT_POINTER_HEIGHT - 1,
+            pointer_surface.max_y(),
         )
     };
 
@@ -966,6 +1021,8 @@ mod tests {
             event.code,
             input_evdev::hid_usage_to_keycode(0x04).unwrap() as u32
         );
+        assert_ne!(event.modifiers, 0);
+        assert_eq!(event.text, b'A' as u32);
     }
 
     #[test]
@@ -996,6 +1053,9 @@ mod tests {
     #[test]
     fn inputd_decodes_absolute_hid_tablet_report_from_descriptor_fields() {
         let mut queue = InputQueue::default();
+        queue
+            .set_pointer_surface(1280, 800, 9)
+            .expect("pointer surface should be accepted");
         let descriptor = [
             0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01, 0xa1, 0x00, 0x05, 0x09, 0x19, 0x01,
             0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01, 0x81, 0x02, 0x95, 0x01,
@@ -1012,8 +1072,27 @@ mod tests {
 
         let position = queue.pop_front().unwrap();
         assert_eq!(position.kind, input_evdev::INPUT_KIND_POINTER_POSITION);
-        assert_eq!(position.value0, 1599);
-        assert_eq!(position.value1, 899);
+        assert_eq!(position.value0, 1279);
+        assert_eq!(position.value1, 799);
+    }
+
+    #[test]
+    fn inputd_drops_absolute_hid_position_until_pointer_surface_is_known() {
+        let mut queue = InputQueue::default();
+        let descriptor = [
+            0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01, 0xa1, 0x00, 0x05, 0x09, 0x19, 0x01,
+            0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01, 0x81, 0x02, 0x95, 0x01,
+            0x75, 0x05, 0x81, 0x01, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x00, 0x26, 0xff,
+            0x7f, 0x75, 0x10, 0x95, 0x02, 0x81, 0x02, 0xc0, 0xc0,
+        ];
+        let report = [0, 0xff, 0x7f, 0xff, 0x7f];
+        queue.push_hid_raw_report(hid_raw(
+            INPUTD_HID_POLICY_KIND_POINTER,
+            &report,
+            &descriptor,
+        ));
+
+        assert!(queue.is_empty());
     }
 }
 
@@ -1065,6 +1144,26 @@ fn serve(endpoint: u64) {
         if request_size == size_of::<CommercialMaxProtocolRequest>() {
             let request = read_unaligned::<CommercialMaxProtocolRequest>(&request);
             let reply = reply_commercial_request(reply_cap, &request, &mut queue);
+            if reply < 0 {
+                let _ = writeln!(std::io::stderr(), "inputd: reply failed errno={}", -reply);
+            }
+            continue;
+        }
+        if request_size == size_of::<InputdPointerSurfaceRequest>() {
+            let request = read_unaligned::<InputdPointerSurfaceRequest>(&request);
+            let mut response = InputdIpcResponse {
+                version: INPUTD_IPC_ABI_VERSION,
+                op: request.op,
+                ..InputdIpcResponse::default()
+            };
+            response.status = dispatch_pointer_surface_request(&request, &mut queue);
+            response.approved_len = (response.status == 0) as u64;
+            let reply = syscall3(
+                SYS_RUSTOS_IPC_REPLY,
+                reply_cap,
+                (&response as *const InputdIpcResponse) as u64,
+                size_of::<InputdIpcResponse>() as u64,
+            );
             if reply < 0 {
                 let _ = writeln!(std::io::stderr(), "inputd: reply failed errno={}", -reply);
             }
@@ -1166,6 +1265,23 @@ fn dispatch(
         },
         _ => libc::EINVAL,
     }
+}
+
+fn dispatch_pointer_surface_request(
+    request: &InputdPointerSurfaceRequest,
+    queue: &mut InputQueue,
+) -> i32 {
+    if request.version != INPUTD_IPC_ABI_VERSION
+        || request.op != INPUTD_IPC_OP_SET_POINTER_SURFACE
+        || request.flags != 0
+        || request.reserved0 != 0
+    {
+        return libc::EINVAL;
+    }
+    queue
+        .set_pointer_surface(request.width, request.height, request.generation)
+        .err()
+        .unwrap_or(0)
 }
 
 fn dispatch_read(
@@ -1420,6 +1536,15 @@ fn dispatch_commercial_request(
             response.capability = input_capability("ps2-packet", request.header.op);
             Ok(())
         }
+        COMMERCIAL_MAX_INPUTD_OP_POINTER_SURFACE_POLICY => {
+            response.value0 = (u64::from(queue.pointer_surface.width) << 32)
+                | u64::from(queue.pointer_surface.height);
+            response.value1 = queue.pointer_surface.generation;
+            response.descriptor_count = 1;
+            response.descriptors[0] = input_descriptor("pointer-surface-policy", request.header.op);
+            response.capability = input_capability("pointer-surface", request.header.op);
+            Ok(())
+        }
         COMMERCIAL_MAX_INPUTD_OP_HID_REPORT_POLICY => {
             fill_hid_report_policy(request, response);
             Ok(())
@@ -1447,7 +1572,8 @@ fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result
         | COMMERCIAL_MAX_INPUTD_OP_SERIO_BUS_POLICY
         | COMMERCIAL_MAX_INPUTD_OP_I8042_COMMAND_POLICY
         | COMMERCIAL_MAX_INPUTD_OP_PS2_PACKET_POLICY
-        | COMMERCIAL_MAX_INPUTD_OP_HID_REPORT_POLICY => Ok(()),
+        | COMMERCIAL_MAX_INPUTD_OP_HID_REPORT_POLICY
+        | COMMERCIAL_MAX_INPUTD_OP_POINTER_SURFACE_POLICY => Ok(()),
         _ => Err(libc::EINVAL),
     }
 }
@@ -1568,6 +1694,7 @@ fn input_capability_mask(op: u16) -> u64 {
         COMMERCIAL_MAX_INPUTD_OP_I8042_COMMAND_POLICY => 1 << 7,
         COMMERCIAL_MAX_INPUTD_OP_PS2_PACKET_POLICY => 1 << 8,
         COMMERCIAL_MAX_INPUTD_OP_HID_REPORT_POLICY => 1 << 9,
+        COMMERCIAL_MAX_INPUTD_OP_POINTER_SURFACE_POLICY => 1 << 10,
         _ => 0,
     }
 }

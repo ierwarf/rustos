@@ -31,7 +31,11 @@ pub(super) fn syscall_linux_rustos_driver_load_module_broker(args_ptr: u64) -> u
         Ok(args) => args,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
     };
-    if args.reserved0 != 0 || args.policy_flags & !DRIVER_LOAD_POLICY_KNOWN_FLAGS != 0 {
+    if args.reserved0 != 0
+        || args.preferred_width != 0
+        || args.preferred_height != 0
+        || args.policy_flags & !DRIVER_LOAD_POLICY_KNOWN_FLAGS != 0
+    {
         return linux_errno(LINUX_EINVAL);
     }
 
@@ -59,8 +63,6 @@ pub(super) fn syscall_linux_rustos_driver_load_module_broker(args_ptr: u64) -> u
         path.as_str(),
         linux_driver_names.as_str(),
         args.policy_flags,
-        args.preferred_width,
-        args.preferred_height,
     ) {
         Ok(()) => 0,
         Err(kernel_io_manager::driver::DriverLoadError::LoaderUnimplemented) => {

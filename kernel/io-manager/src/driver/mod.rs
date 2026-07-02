@@ -73,8 +73,6 @@ pub fn load_module_image_from_policy(
     image_path: &str,
     linux_driver_names: &str,
     _policy_flags: u64,
-    _preferred_width: u32,
-    _preferred_height: u32,
 ) -> Result<(), DriverLoadError> {
     if nucleus_core::util::fault_injection::should_fail("driver.module.load") {
         return Err(DriverLoadError::FaultInjected);

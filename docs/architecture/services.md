@@ -59,7 +59,8 @@ edges. The on-boot probe loads:
 
 A skipped driver shows up as `driverd: skipped name=... reason=...` and is
 expected when the alias doesn't match the live hardware or when a higher
-priority provider in the same `provider_group` is already active.
+priority provider in the same `provider_group` is already active. Active
+provider groups skip later normal and fallback records before alias probing.
 
 <a id="korean"></a>
 
@@ -106,7 +107,8 @@ driver module (`.ko`)은 `driverd`가 소유 정책이지만, ring0 접근이 �
 실제 link + init은 kernel module loader 안에서 일어납니다. `driverd`는
 `system/registry/kernel/loadable-drivers.tsv`를 읽고 각 record에 대해
 `SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER`를 호출하며 의존 edge를 따라
-순서를 정합니다. boot 중 probe되는 module 예:
+순서를 정합니다. active provider group은 같은 group의 이후 normal/fallback
+record를 alias probe 전에 skip합니다. boot 중 probe되는 module 예:
 
 - USB pointer/keyboard는 native RustOS xHCI가 잡고 raw HID report를
   `inputd`로 넘깁니다. Linux USB HID `.ko` artifact는 호환 작업용으로만

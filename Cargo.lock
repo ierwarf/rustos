@@ -974,6 +974,7 @@ dependencies = [
 name = "runtimed"
 version = "0.1.0"
 dependencies = [
+ "keyboard-core",
  "libc",
  "observability-client",
  "runtime-control",

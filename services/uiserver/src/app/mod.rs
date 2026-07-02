@@ -413,6 +413,7 @@ pub(crate) struct AppState {
     pub(crate) left_button_down: bool,
     pub(crate) focused_session_handle: ConsoleSessionHandle,
     pub(crate) focused_wayland_surface_id: Option<u32>,
+    pending_console_focus: Option<ConsoleSessionHandle>,
     pub(crate) desktop_cache: DesktopSurfaceCache,
     pub(crate) launcher_programs: Vec<LauncherProgram>,
     pub(crate) console_windows: Vec<ConsoleWindow>,

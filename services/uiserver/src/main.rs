@@ -589,6 +589,9 @@ fn log_cursor_pipeline_sample(
     cursor_mismatch: bool,
     rendered: bool,
 ) {
+    if !profile::enabled() {
+        return;
+    }
     if !cursor_mismatch && update.is_empty() {
         return;
     }

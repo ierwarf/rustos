@@ -19,15 +19,15 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_SERVICE_DRIVERD_OP_MMIO_LEASE, DRIVER_BUS_PCI, DRIVER_BUS_PLATFORM,
     DRIVER_BUS_SERIO, DRIVER_BUS_USB, DRIVER_BUS_VIRTIO, DRIVER_CLASS_DISPLAY, DRIVER_CLASS_INPUT,
     DRIVER_CLASS_NETWORK, DRIVER_CLASS_STORAGE, DRIVER_CLASS_USB,
-    DRIVER_LOAD_POLICY_DISPLAY_FALLBACK, DRIVER_LOAD_POLICY_DISPLAY_PREFERRED_SCANOUT,
-    DRIVER_LOAD_POLICY_DISPLAY_PRIMARY, IPC_SERVICE_DRIVERD, IPC_SERVICE_SERVICE_DRIVERD,
-    SERVICE_DRIVER_RESOURCE_BROKER_ABI_VERSION, SERVICE_DRIVER_RESOURCE_OP_DMA_BUFFER,
-    SERVICE_DRIVER_RESOURCE_OP_IO_PORT_LEASE, SERVICE_DRIVER_RESOURCE_OP_IRQ_ROUTE,
-    SERVICE_DRIVER_RESOURCE_OP_MMIO_LEASE, SYSCALL_OFFLOAD_ABI_VERSION,
-    SYSCALL_OFFLOAD_OP_DRIVER_LOAD_POLICY, SYSCALL_OFFLOAD_PATH_CAPACITY, SYS_RUSTOS_DEBUG_PRINT,
-    SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER, SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER,
-    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
-    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_SERVICE_DRIVER_RESOURCE_BROKER,
+    DRIVER_LOAD_POLICY_DISPLAY_FALLBACK, DRIVER_LOAD_POLICY_DISPLAY_PRIMARY, IPC_SERVICE_DRIVERD,
+    IPC_SERVICE_SERVICE_DRIVERD, SERVICE_DRIVER_RESOURCE_BROKER_ABI_VERSION,
+    SERVICE_DRIVER_RESOURCE_OP_DMA_BUFFER, SERVICE_DRIVER_RESOURCE_OP_IO_PORT_LEASE,
+    SERVICE_DRIVER_RESOURCE_OP_IRQ_ROUTE, SERVICE_DRIVER_RESOURCE_OP_MMIO_LEASE,
+    SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_DRIVER_LOAD_POLICY,
+    SYSCALL_OFFLOAD_PATH_CAPACITY, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER,
+    SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV,
+    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
+    SYS_RUSTOS_SERVICE_DRIVER_RESOURCE_BROKER,
 };
 
 const RECV_BACKOFF: Duration = Duration::from_millis(10);
@@ -250,9 +250,7 @@ fn load_record(
             ));
         }
     }
-    if !record.fallback_only
-        && !record.provider_group.is_empty()
-        && provider_groups.contains(record.provider_group.as_str())
+    if !record.provider_group.is_empty() && provider_groups.contains(record.provider_group.as_str())
     {
         skipped.insert(record.name.clone());
         debug_line(&format!(
@@ -375,7 +373,7 @@ fn authorize_service_driver(record: &DriverRecord) -> bool {
 }
 
 fn load_module(record: &DriverRecord) -> i64 {
-    let (policy_flags, preferred_width, preferred_height) = driver_load_policy(record);
+    let policy_flags = driver_load_policy(record);
     let args = RustosDriverLoadModuleBrokerArgs {
         name_ptr: record.name.as_ptr() as u64,
         name_len: record.name.len() as u64,
@@ -386,8 +384,8 @@ fn load_module(record: &DriverRecord) -> i64 {
         linux_driver_names_ptr: record.linux_driver_names.as_ptr() as u64,
         linux_driver_names_len: record.linux_driver_names.len() as u64,
         policy_flags,
-        preferred_width,
-        preferred_height,
+        preferred_width: 0,
+        preferred_height: 0,
         reserved0: 0,
     };
     syscall1(
@@ -396,10 +394,8 @@ fn load_module(record: &DriverRecord) -> i64 {
     )
 }
 
-fn driver_load_policy(record: &DriverRecord) -> (u64, u32, u32) {
+fn driver_load_policy(record: &DriverRecord) -> u64 {
     let mut flags = 0;
-    let mut preferred_width = 0;
-    let mut preferred_height = 0;
     if record.class == DRIVER_CLASS_DISPLAY {
         if !record.provider_group.is_empty() {
             flags |= DRIVER_LOAD_POLICY_DISPLAY_PRIMARY;
@@ -407,13 +403,8 @@ fn driver_load_policy(record: &DriverRecord) -> (u64, u32, u32) {
                 flags |= DRIVER_LOAD_POLICY_DISPLAY_FALLBACK;
             }
         }
-        if record.bus == DRIVER_BUS_VIRTIO && !record.fallback_only {
-            flags |= DRIVER_LOAD_POLICY_DISPLAY_PREFERRED_SCANOUT;
-            preferred_width = 1600;
-            preferred_height = 900;
-        }
     }
-    (flags, preferred_width, preferred_height)
+    flags
 }
 
 fn probe_alias(alias: &str, class: u32, bus: u32) -> bool {

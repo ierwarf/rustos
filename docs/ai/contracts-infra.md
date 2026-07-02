@@ -27,7 +27,9 @@ Package/stage schemas, runtime control, kernel API, build, fault injection, logg
 - `softdeps`: best-effort preloads (Linux `modprobe.d softdep pre:` role).
 - List fields stage as comma-separated registry values; items must not contain tab, newline, carriage return, or comma.
 - `linux_driver_names`: Linux in-module driver names allowed to register from that package. If omitted, defaults to autoload `name`. Linux driver compat registration must use this registry field — not hardcoded driver names.
-- `provider_group`: mutually exclusive provider contract. Once a loadable/native provider marks the group active, later candidates are skipped. `fallback_only` candidates ordered after normal candidates as lower-priority substitutes.
+- `provider_group`: mutually exclusive provider contract. Once a loadable/native provider marks the group active, later normal and fallback candidates are skipped before alias probing. `fallback_only` candidates are lower-priority substitutes used only when no provider in the group loaded.
+- Retired display preferred-scanout policy flags/width/height are rejected by
+  the ring0 module-load broker; driverd/provider state owns scanout selection.
 - Driver `class` registry values: `display`, `input`, `network`, `usb`, `storage`. `usb` is reserved for explicit USB compat/dev bridge modules; native xHCI is the RustOS host-controller path and is not staged as a Linux `.ko`.
 - `display-primary` group: real hardware/virtio providers ordered ahead of firmware framebuffer fallbacks. `bootfb` is last-resort, **never** default primary for QEMU or hardware GPUs.
 - `driverd` owns autoload policy. Kernel driver brokers may expose narrow hardware-presence primitives for staged aliases (`platform:bootfb`, `pci:*`, `virtio:*`) but **must not** pick provider order or bypass registry `provider_group` policy.
@@ -151,6 +153,7 @@ Add new points only at realistic failure boundaries: allocation, block IO, devic
   count it as a ring3 service-driver migration target.
 - Vendor virtio-net `.ko` stays out of the default profile until post-init worker/IRQ behavior is non-blocking under QEMU; `netd` remains the default network policy owner.
 - Vendor HID core `.ko` stays out of the default profile while USB HID leaf modules are disabled; native RustOS input remains the default boot input provider.
+- Hardware-specific display drivers such as AMDGPU stay out of the default QEMU profile unless the default machine exposes matching hardware; use an explicit hardware profile instead.
 - Native xHCI and HID interrupt polling are always on for USB input/display probes.
 - Optional net features (XDP, BPF, AF_XDP, ethtool offloads, DIM) may use per-symbol disabled shims; must fail closed — **never** fabricate packets or carrier state.
 

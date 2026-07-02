@@ -34,10 +34,13 @@ const SYS_MUNMAP: usize = 11;
 const SYS_IOCTL: usize = 16;
 const SYS_OPENAT: usize = 257;
 const SYS_RUSTOS_IPC_ENDPOINT_CREATE: usize = syscall_abi::SYS_RUSTOS_IPC_ENDPOINT_CREATE as usize;
+const SYS_RUSTOS_IPC_CALL: usize = syscall_abi::SYS_RUSTOS_IPC_CALL as usize;
 const SYS_RUSTOS_IPC_RECV: usize = syscall_abi::SYS_RUSTOS_IPC_RECV as usize;
 const SYS_RUSTOS_IPC_REPLY: usize = syscall_abi::SYS_RUSTOS_IPC_REPLY as usize;
 const SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT: usize =
     syscall_abi::SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT as usize;
+const SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT: usize =
+    syscall_abi::SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT as usize;
 
 const AT_FDCWD: isize = -100;
 const O_RDONLY: usize = 0;
@@ -147,6 +150,60 @@ pub(crate) fn publish_display_policy_metadata(display: DisplayInfo) {
     DISPLAY_POLICY_FORMAT.store(display.pixel_format, Ordering::Release);
     DISPLAY_POLICY_FLAGS.store(display.flags, Ordering::Release);
     DISPLAY_POLICY_GENERATION.store(display.generation, Ordering::Release);
+}
+
+pub(crate) fn publish_input_pointer_surface(display: DisplayInfo) -> Result<(), i32> {
+    let request = syscall_abi::InputdPointerSurfaceRequest {
+        version: syscall_abi::INPUTD_IPC_ABI_VERSION,
+        op: syscall_abi::INPUTD_IPC_OP_SET_POINTER_SURFACE,
+        width: display.width,
+        height: display.height,
+        generation: display.generation,
+        ..syscall_abi::InputdPointerSurfaceRequest::default()
+    };
+    let mut last_errno = ENOENT;
+    for _ in 0..10 {
+        let endpoint = unsafe {
+            syscall1(
+                SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
+                syscall_abi::IPC_SERVICE_INPUTD as usize,
+            )
+        };
+        if is_syscall_error(endpoint) {
+            last_errno = errno_from_result(endpoint);
+            thread::sleep(std::time::Duration::from_millis(10));
+            continue;
+        }
+        let mut response = syscall_abi::InputdIpcResponse::default();
+        let call = unsafe {
+            syscall6(
+                SYS_RUSTOS_IPC_CALL,
+                endpoint as usize,
+                (&request as *const syscall_abi::InputdPointerSurfaceRequest) as usize,
+                size_of::<syscall_abi::InputdPointerSurfaceRequest>(),
+                (&mut response as *mut syscall_abi::InputdIpcResponse) as usize,
+                size_of::<syscall_abi::InputdIpcResponse>(),
+                0,
+            )
+        };
+        if is_syscall_error(call) {
+            last_errno = errno_from_result(call);
+            thread::sleep(std::time::Duration::from_millis(10));
+            continue;
+        }
+        if call as usize != size_of::<syscall_abi::InputdIpcResponse>()
+            || response.version != syscall_abi::INPUTD_IPC_ABI_VERSION
+            || response.op != syscall_abi::INPUTD_IPC_OP_SET_POINTER_SURFACE
+            || response.flags != 0
+        {
+            return Err(EINVAL);
+        }
+        if response.status != 0 {
+            return Err(response.status.unsigned_abs().min(i32::MAX as u32) as i32);
+        }
+        return Ok(());
+    }
+    Err(last_errno)
 }
 
 pub(crate) fn mark_display_policy_ready() {
@@ -622,7 +679,7 @@ fn translate_linux_input_event(
             let key_code = linux_key_code_to_rustos(u32::from(raw.code))?;
             state
                 .keyboard
-                .inject_key_transition(key_code, raw.value == 0);
+                .inject_key_transition(key_code, linux_key_value_is_release(raw.value)?);
             let keyboard_event = state.keyboard.pop_event()?;
             Some(InputEvent {
                 kind: INPUT_KIND_KEYBOARD,
@@ -710,6 +767,14 @@ fn linux_key_value_to_action(value: i32) -> Option<u16> {
         0 => Some(INPUT_ACTION_RELEASED),
         1 => Some(INPUT_ACTION_PRESSED),
         2 => Some(INPUT_ACTION_REPEATED),
+        _ => None,
+    }
+}
+
+fn linux_key_value_is_release(value: i32) -> Option<bool> {
+    match value {
+        0 => Some(true),
+        1 | 2 => Some(false),
         _ => None,
     }
 }
@@ -1079,6 +1144,55 @@ unsafe fn syscall0(number: usize) -> isize {
         );
     }
     result
+}
+
+unsafe fn syscall1(number: usize, arg0: usize) -> isize {
+    let result: isize;
+    unsafe {
+        asm!(
+            "syscall",
+            inlateout("rax") number as isize => result,
+            in("rdi") arg0 as isize,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        translate_linux_input_event, InputTranslationState, LinuxInputEvent, LinuxInputTimeval,
+        EV_KEY, INPUT_ACTION_PRESSED, INPUT_ACTION_RELEASED, INPUT_KIND_KEYBOARD,
+    };
+
+    fn key_event(code: u16, value: i32) -> LinuxInputEvent {
+        LinuxInputEvent {
+            time: LinuxInputTimeval::default(),
+            kind: EV_KEY,
+            code,
+            value,
+        }
+    }
+
+    #[test]
+    fn linux_key_press_emits_text_before_release() {
+        let mut state = InputTranslationState::default();
+
+        let press = translate_linux_input_event(&mut state, key_event(30, 1))
+            .expect("A press should translate");
+        assert_eq!(press.kind, INPUT_KIND_KEYBOARD);
+        assert_eq!(press.action, INPUT_ACTION_PRESSED);
+        assert_eq!(press.text, b'a' as u32);
+
+        let release = translate_linux_input_event(&mut state, key_event(30, 0))
+            .expect("A release should translate");
+        assert_eq!(release.kind, INPUT_KIND_KEYBOARD);
+        assert_eq!(release.action, INPUT_ACTION_RELEASED);
+        assert_eq!(release.text, 0);
+    }
 }
 
 unsafe fn syscall3(number: usize, arg0: usize, arg1: usize, arg2: usize) -> isize {

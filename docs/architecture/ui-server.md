@@ -78,6 +78,8 @@ Set `RUSTOS_UI_PROFILE=1` when profiling is needed to enable
 `uiserver profile: ...` get flushed to debugcon and are the primary tool
 for diagnosing slow refresh / slow present regressions. Use them before
 adding new diag prints.
+Per-frame cursor/render pipeline samples are also profile-gated; normal F5/QEMU
+runs keep only coarse `uiserver: update tick` liveness lines.
 
 <a id="korean"></a>
 
@@ -153,3 +155,5 @@ profiling이 필요할 때 `RUSTOS_UI_PROFILE=1`을 설정하면 `profile::recor
 경로가 활성화됩니다. `uiserver profile: ...` summary line이 debugcon으로
 flush 되며 slow refresh / slow present regression을 진단할 때 주된
 도구입니다. 새 diag print를 추가하기 전에 이 경로를 먼저 사용하세요.
+per-frame cursor/render pipeline sample도 profile-gated입니다. 일반 F5/QEMU
+실행은 coarse `uiserver: update tick` liveness line만 유지합니다.

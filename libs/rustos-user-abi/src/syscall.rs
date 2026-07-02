@@ -349,10 +349,11 @@ pub const DRIVER_BUS_PCI: u32 = 4;
 pub const DRIVER_BUS_VIRTIO: u32 = 5;
 pub const DRIVER_LOAD_POLICY_DISPLAY_PRIMARY: u64 = 1 << 0;
 pub const DRIVER_LOAD_POLICY_DISPLAY_FALLBACK: u64 = 1 << 1;
+/// Retired: preferred scanout sizing is driverd/provider policy and must not
+/// be interpreted by the ring0 module-load broker.
 pub const DRIVER_LOAD_POLICY_DISPLAY_PREFERRED_SCANOUT: u64 = 1 << 2;
-pub const DRIVER_LOAD_POLICY_KNOWN_FLAGS: u64 = DRIVER_LOAD_POLICY_DISPLAY_PRIMARY
-    | DRIVER_LOAD_POLICY_DISPLAY_FALLBACK
-    | DRIVER_LOAD_POLICY_DISPLAY_PREFERRED_SCANOUT;
+pub const DRIVER_LOAD_POLICY_KNOWN_FLAGS: u64 =
+    DRIVER_LOAD_POLICY_DISPLAY_PRIMARY | DRIVER_LOAD_POLICY_DISPLAY_FALLBACK;
 pub const STORAGE_LIST_PATH_CAPACITY: usize = 64;
 pub const STORAGE_LIST_MAX_DESCRIPTORS: usize = 16;
 pub const STORAGE_FLAG_READONLY: u32 = 1 << 0;
@@ -438,6 +439,7 @@ pub const COMMERCIAL_MAX_INPUTD_OP_SERIO_BUS_POLICY: u16 = 7;
 pub const COMMERCIAL_MAX_INPUTD_OP_I8042_COMMAND_POLICY: u16 = 8;
 pub const COMMERCIAL_MAX_INPUTD_OP_PS2_PACKET_POLICY: u16 = 9;
 pub const COMMERCIAL_MAX_INPUTD_OP_HID_REPORT_POLICY: u16 = 10;
+pub const COMMERCIAL_MAX_INPUTD_OP_POINTER_SURFACE_POLICY: u16 = 11;
 pub const COMMERCIAL_MAX_STORAGED_OP_BLOCK_INVENTORY: u16 = 1;
 pub const COMMERCIAL_MAX_STORAGED_OP_PARTITION_SCAN: u16 = 2;
 pub const COMMERCIAL_MAX_STORAGED_OP_ROOT_VOLUME_SELECT: u16 = 3;
@@ -853,6 +855,7 @@ pub const INPUTD_IPC_OP_STATS: u16 = 2;
 pub const INPUTD_IPC_OP_AUTHORIZE_READ: u16 = 3;
 pub const INPUTD_IPC_OP_DRAIN_INGEST: u16 = 4;
 pub const INPUTD_IPC_OP_READ: u16 = 5;
+pub const INPUTD_IPC_OP_SET_POINTER_SURFACE: u16 = 6;
 pub const INPUTD_ACCESS_NATIVE: u16 = 1;
 pub const INPUTD_ACCESS_EVDEV: u16 = 2;
 pub const INPUTD_READ_PAYLOAD_CAPACITY: usize = 32 * 1024;
@@ -1036,6 +1039,18 @@ pub struct InputdIpcRequest {
     pub reserved0: u16,
     pub reserved1: u32,
     pub requested_len: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct InputdPointerSurfaceRequest {
+    pub version: u16,
+    pub op: u16,
+    pub flags: u32,
+    pub width: u32,
+    pub height: u32,
+    pub reserved0: u32,
+    pub generation: u64,
 }
 
 #[repr(C)]

@@ -7,5 +7,6 @@ publish = false
 [dependencies]
 observability-client = { path = "../../libs/observability-client" }
 libc = "0.2"
+keyboard-core = { path = "../../drivers/libs/keyboard-core" }
 runtime-control = { path = "../../libs/runtime-control" }
 rustos-user-abi = { path = "../../libs/rustos-user-abi", features = ["linux-compat-state"] }

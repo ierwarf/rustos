@@ -75,8 +75,8 @@ Before any workflow: read `token-policy.md`, then `task-router.md`.
 5. Confirm `platform:bootfb` can match from
    `storage::boot_volume::boot_framebuffer_info()`, not from an
    already-installed GUI backend.
-6. Confirm `display-primary` fallback decisions use active display state, not
-   just a loaded module record.
+6. Confirm `display-primary` fallback decisions use active provider-group
+   state and skip fallback alias probes after a primary provider is loaded.
 7. For QEMU virtio-gpu, prefer the Linux `.ko` display path. If
    `virtio-gpu native: display registered` appears, the removed native fallback
    has regressed back into the kernel.

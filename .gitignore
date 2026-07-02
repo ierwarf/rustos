@@ -3,6 +3,8 @@
 
 # RustOS generated images, artifacts, registries, and mdBook output
 /build/
+/docs/book/
+/docs/src/
 
 # Runtime and debug logs
 /logs/
@@ -24,6 +26,7 @@
 
 # Local scratch files
 /settings.rs
+/kernel/to_codex
 
 # Agent/tool config is tracked: .codex/ (hooks, subagents, project config),
 # .agents/ (skills), and .cargo/ (workspace cargo config) live in-repo.

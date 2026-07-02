@@ -146,6 +146,7 @@ pub(crate) fn clean(config: &Config) -> Result<()> {
         .env("CARGO_TARGET_DIR", &config.cargo_target_dir);
     run_command(&mut clean_manifest)?;
     remove_dir_if_exists(&config.build_dir)?;
+    remove_dir_if_exists(&config.logs_dir)?;
     Ok(())
 }
 

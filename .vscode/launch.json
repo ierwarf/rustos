@@ -2,19 +2,19 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "QEMU NVMe",
-      "type": "node-terminal",
-      "request": "launch",
-      "preLaunchTask": "Build OS",
-      "command": "exec cargo xtask run --profile nvme --usb-input --debugcon file --summarize-log",
-      "cwd": "${workspaceFolder}"
-    },
-    {
       "name": "KVM NVMe",
       "type": "node-terminal",
       "request": "launch",
       "preLaunchTask": "Build OS",
       "command": "exec cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file --summarize-log",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "QEMU NVMe",
+      "type": "node-terminal",
+      "request": "launch",
+      "preLaunchTask": "Build OS",
+      "command": "exec cargo xtask run --profile nvme --usb-input --debugcon file --summarize-log",
       "cwd": "${workspaceFolder}"
     }
   ]
