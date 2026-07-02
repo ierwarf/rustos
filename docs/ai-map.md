@@ -25,7 +25,9 @@ output outside the cached unit.
 - `docs/ai/contracts-infra.md` — manifest/stage/build/logging/fault contracts.
 - `docs/ai/contracts-abi.md` — IPC service IDs, broker syscalls, service routing.
 - `cargo xtask ring3-inventory` — current `RING3-MIGRATION-REFERENCE` and
-  `RING3-MIGRATION-COMMENTED-OUT` LOC/owner/action snapshot for migration batches.
+  `RING3-MIGRATION-COMMENTED-OUT` LOC/owner/action snapshot. Use
+  `migration_candidate_loc` for true ring3 work and `cleanup_debt_loc` for
+  legacy native code that should be retired rather than migrated.
 
 ## Source entrypoints (minimal)
 

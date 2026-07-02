@@ -1,6 +1,3 @@
-// RING3-MIGRATION-REFERENCE START: syscalld/pagerd should own memory mapping
-// policy. Ring0 keeps page-table mutation, fd/device mapping validation,
-// current-process user-copy, and shared memfd mapping substrate.
 use super::*;
 
 use alloc::vec::Vec;
@@ -521,4 +518,3 @@ fn memfd_error_to_errno(err: MemfdError) -> i64 {
         MemfdError::PermissionDenied => LINUX_EACCES,
     }
 }
-// RING3-MIGRATION-REFERENCE END: syscalld/pagerd-owned memory broker policy.

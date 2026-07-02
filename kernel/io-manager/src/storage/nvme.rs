@@ -1,8 +1,8 @@
-// RING3-MIGRATION-REFERENCE START: storaged/driverd should own the non-.ko NVMe
-// service-driver once a ring3 service-driver host can drive leased MMIO/DMA
-// queues. Ring0 keeps this built-in NVMe path as early-boot/fallback privileged
-// transport substrate until that host can perform boot-volume reads before
-// rootd/vfsd need them.
+// RING3-MIGRATION-REFERENCE START: bootstrap exception: storaged/driverd own
+// post-bootstrap NVMe admission/provider policy. Ring0 keeps this built-in
+// NVMe path as early-boot/fallback privileged transport substrate until a
+// ring3 service-driver host can perform boot-volume reads before rootd/vfsd
+// need them.
 // Built-in NVMe is an early-boot/fallback path. Post-bootstrap storage policy is
 // routed through storaged, with Linux `.ko` bridge modules used for compat.
 use alloc::boxed::Box;
@@ -855,4 +855,4 @@ fn wait_until(mut predicate: impl FnMut() -> bool) -> bool {
     }
     false
 }
-// RING3-MIGRATION-REFERENCE END: storaged/driverd-owned non-.ko NVMe service-driver.
+// RING3-MIGRATION-REFERENCE END: storaged/driverd-owned NVMe bootstrap transport exception.

@@ -60,6 +60,10 @@ mod tests {
         assert_eq!(syscall::SYS_RUSTOS_INPUT_INGEST_BROKER, 0x5255_0033);
         assert_eq!(syscall::SYS_RUSTOS_BOOT_EXTENT_BROKER, 0x5255_0034);
         assert_eq!(syscall::SYS_RUSTOS_IPC_TRY_RECV, 0x5255_0035);
+        assert_eq!(
+            syscall::SYS_RUSTOS_SERVICE_DRIVER_RESOURCE_BROKER,
+            0x5255_0022
+        );
     }
 
     #[test]
@@ -98,6 +102,8 @@ mod tests {
         assert_eq!(syscall::INPUTD_INGRESS_KIND_HID_KEYBOARD_REPORT, 5);
         assert_eq!(syscall::INPUTD_INGRESS_KIND_HID_POINTER_REPORT, 6);
         assert_eq!(syscall::INPUTD_INGRESS_KIND_HID_RAW_REPORT, 7);
+        assert_eq!(syscall::INPUTD_INGRESS_KIND_PS2_SCANCODE, 8);
+        assert_eq!(syscall::INPUTD_INGRESS_KIND_PS2_MOUSE_BYTE, 9);
         assert_eq!(syscall::STORAGED_OP_ROOT_STATUS, 4);
         assert_eq!(syscall::STORAGED_OP_BOOT_EXTENT_LOOKUP, 5);
 
@@ -107,12 +113,14 @@ mod tests {
         assert!(size_of::<syscall::DevmgrdDeviceIoctlResponse>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert!(size_of::<syscall::InputIngestBrokerArgs>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert_eq!(size_of::<syscall::InputKeyboardEventWire>(), 16);
+        assert_eq!(size_of::<syscall::InputPs2ScancodeWire>(), 4);
+        assert_eq!(size_of::<syscall::InputPs2MouseByteWire>(), 4);
         assert_eq!(size_of::<syscall::InputPointerPacketWire>(), 12);
         assert_eq!(size_of::<syscall::InputPointerAbsoluteWire>(), 16);
         assert_eq!(size_of::<syscall::InputHidKeyboardReportWire>(), 32);
         assert_eq!(size_of::<syscall::InputHidPointerReportWire>(), 24);
         assert_eq!(size_of::<syscall::InputHidPolicyWire>(), 232);
-        assert_eq!(size_of::<syscall::InputIngressWire>(), 368);
+        assert_eq!(size_of::<syscall::InputIngressWire>(), 376);
         assert!(size_of::<syscall::InputdReadResponse>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert!(size_of::<syscall::RootdIpcRequest>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert!(size_of::<syscall::RootdIpcResponse>() <= syscall::IPC_MAX_INLINE_BYTES);
@@ -158,7 +166,10 @@ mod tests {
         assert_eq!(syscall::COMMERCIAL_MAX_NETD_OP_PACKET_LEASE, 5);
         assert_eq!(syscall::COMMERCIAL_MAX_DRIVERD_OP_PROVIDER_SELECT, 4);
         assert_eq!(syscall::COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP, 5);
+        assert_eq!(syscall::COMMERCIAL_MAX_SERVICE_DRIVERD_OP_MMIO_LEASE, 2);
+        assert_eq!(syscall::COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IRQ_ROUTE, 3);
         assert_eq!(syscall::COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DMA_BUFFER, 4);
+        assert_eq!(syscall::COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IO_PORT_LEASE, 5);
         assert_eq!(
             syscall::COMMERCIAL_MAX_UISERVER_OP_TERMINAL_PRESENT_POLICY,
             5
@@ -172,6 +183,15 @@ mod tests {
         );
         assert!(
             size_of::<syscall::CommercialMaxCapabilityLeaseWire>() <= syscall::IPC_MAX_INLINE_BYTES
+        );
+        assert_eq!(size_of::<syscall::ServiceDriverMmioLeaseWire>(), 32);
+        assert_eq!(size_of::<syscall::ServiceDriverIrqRouteWire>(), 24);
+        assert_eq!(size_of::<syscall::ServiceDriverDmaBufferWire>(), 32);
+        assert_eq!(size_of::<syscall::ServiceDriverIoPortLeaseWire>(), 16);
+        assert_eq!(size_of::<syscall::ServiceDriverIoPortValueWire>(), 8);
+        assert_eq!(
+            size_of::<syscall::RustosServiceDriverResourceBrokerArgs>(),
+            72
         );
     }
 

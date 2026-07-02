@@ -1,5 +1,6 @@
-// RING3-MIGRATION-REFERENCE START: user compat module routing is a ring0 ABI
-// substrate. Policy belongs in syscalld/loaderd/procd/vfsd/netd services.
+// RING3-MIGRATION-REFERENCE START: ABI substrate: user compat module routing is
+// a ring0 ABI surface. Policy belongs in syscalld/loaderd/procd/vfsd/netd
+// services.
 pub mod abi {
     pub use kernel_ps::api::abi::*;
 }
@@ -25,4 +26,4 @@ pub mod socket {
 }
 pub mod syscall;
 pub mod sysops;
-// RING3-MIGRATION-REFERENCE END: service-owned user compat module policy.
+// RING3-MIGRATION-REFERENCE END: service-owned user compat ABI substrate.

@@ -1,6 +1,3 @@
-// RING3-MIGRATION-REFERENCE START: rootd should own service namespace and
-// capability policy. Ring0 keeps endpoint tables, copy/handle transfer, and IPC
-// delivery substrate.
 use super::*;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -25,6 +22,9 @@ const MAX_PENDING_TRANSFER_OBJECTS: usize = 1024;
 const SLOW_IPC_THRESHOLD_MS: u64 = 10;
 const MAX_SLOW_IPC_LOGS: usize = 20;
 const EARLY_IPC_SAMPLE_COUNT: usize = 6;
+// RING3-MIGRATION-REFERENCE START: rootd should own service namespace endpoint
+// ownership and capability leases. Ring0 keeps the temporary service registry
+// table until rootd can mint narrow broker capabilities.
 static LINUX_SYSCALL_ENDPOINT: AtomicU64 = AtomicU64::new(0);
 static SERVICE_ENDPOINTS: [AtomicU64; MAX_SERVICE_ENDPOINTS] =
     [const { AtomicU64::new(0) }; MAX_SERVICE_ENDPOINTS];
@@ -32,6 +32,7 @@ static SERVICE_ENDPOINT_OWNERS: [AtomicU64; MAX_SERVICE_ENDPOINTS] =
     [const { AtomicU64::new(0) }; MAX_SERVICE_ENDPOINTS];
 static SERVICE_ENDPOINT_CAPS: [AtomicU64; MAX_SERVICE_ENDPOINTS] =
     [const { AtomicU64::new(0) }; MAX_SERVICE_ENDPOINTS];
+// RING3-MIGRATION-REFERENCE END: rootd-owned service endpoint registry state.
 static NEXT_TRANSFER_ID: AtomicU64 = AtomicU64::new(1);
 static SLOW_IPC_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -102,6 +103,9 @@ pub(super) fn dispatch_linux_rustos_ipc_syscall(frame: &SyscallFrame) -> u64 {
     }
 }
 
+// RING3-MIGRATION-REFERENCE START: rootd should own service endpoint lookup and
+// capability lease checks. Ring0 keeps direct table queries only for current
+// broker authorization and service-call routing.
 pub(super) fn linux_syscall_endpoint() -> Option<KernelEndpointHandle> {
     let raw = service_endpoint_raw(linux_abi::IPC_SERVICE_LINUX_SYSCALLD)
         .unwrap_or_else(|| LINUX_SYSCALL_ENDPOINT.load(Ordering::Acquire));
@@ -165,6 +169,7 @@ fn service_index(service_id: u64) -> Option<usize> {
     let index = usize::try_from(service_id).ok()?;
     (index < MAX_SERVICE_ENDPOINTS).then_some(index)
 }
+// RING3-MIGRATION-REFERENCE END: rootd-owned service lookup and capability checks.
 
 pub(super) fn syscall_linux_rustos_ipc_endpoint_create() -> u64 {
     let Some(task_id) = multitask::current_task_id() else {
@@ -184,6 +189,9 @@ pub(super) fn syscall_linux_rustos_ipc_endpoint_create() -> u64 {
     }
 }
 
+// RING3-MIGRATION-REFERENCE START: rootd should own service endpoint
+// registration, lookup, and capability assignment. Ring0 keeps this bridge
+// only while core services still register directly with the IPC substrate.
 pub(super) fn syscall_linux_rustos_ipc_register_linux_syscall_endpoint(endpoint: u64) -> u64 {
     if endpoint == 0 {
         return linux_errno(LINUX_EINVAL);
@@ -295,6 +303,7 @@ pub(super) fn syscall_linux_rustos_ipc_lookup_service_endpoint(service_id: u64) 
     }
     raw
 }
+// RING3-MIGRATION-REFERENCE END: rootd-owned service registration and capability policy.
 
 pub(super) fn syscall_linux_rustos_ipc_call(
     endpoint: u64,
@@ -1185,7 +1194,6 @@ fn log_slow_ipc_call(
         );
     });
 }
-// RING3-MIGRATION-REFERENCE END: rootd-owned IPC namespace/capability policy.
 
 fn log_slow_ipc_reply(
     kind: &str,

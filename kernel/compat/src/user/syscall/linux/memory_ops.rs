@@ -1,6 +1,3 @@
-// RING3-MIGRATION-REFERENCE START: syscalld/pagerd should own Linux mmap/brk
-// policy. Ring0 keeps page-table mutation, VMA bookkeeping, and current-process
-// user address-space substrate.
 use core::mem::size_of;
 
 use x86_64::VirtAddr;
@@ -220,6 +217,9 @@ pub(super) fn syscall_linux_munmap(start: u64, user_len: u64) -> u64 {
     }
 }
 
+// RING3-MIGRATION-REFERENCE START: syscalld/pagerd should own bootstrap Linux
+// mmap/brk policy. Ring0 keeps pre-syscalld page-table mutation and initial
+// user address-space substrate only.
 fn bootstrap_brk(addr: u64) -> u64 {
     let Some(result) = multitask::with_current_user_process_state_mut(|_, abi, process_state| {
         if abi != crate::user::abi::UserAbi::Linux {
@@ -450,4 +450,4 @@ fn checked_align_up(value: u64, align: u64) -> Option<u64> {
     let mask = align.checked_sub(1)?;
     Some(value.checked_add(mask)? & !mask)
 }
-// RING3-MIGRATION-REFERENCE END: syscalld/pagerd-owned Linux memory policy.
+// RING3-MIGRATION-REFERENCE END: syscalld/pagerd-owned bootstrap memory policy.

@@ -1,6 +1,3 @@
-// RING3-MIGRATION-REFERENCE START: vfsd should own VFS metadata syscall policy.
-// Ring0 keeps fd-table validation, memfd substrate, current-process user-copy,
-// and bootstrap-only stat materialization.
 use super::*;
 pub fn syscall_linux_vfs_lseek(fd: u64, offset: i64, whence: u64) -> u64 {
     if let Some(mut memfd) = current_memfd_handle(fd) {
@@ -331,6 +328,9 @@ pub fn memfd_error_to_linux_errno(err: multitask::MemfdError) -> i64 {
     }
 }
 
+// RING3-MIGRATION-REFERENCE START: bootstrap exception: vfsd owns bootstrap
+// stat materialization. Ring0 keeps this fd 0/1/2 and memfd stat fallback until
+// bootstrap descriptors are fully represented by service-owned handles.
 fn write_bootstrap_stat(user_ptr: u64, inode: u64, len: u64) -> u64 {
     if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, LINUX_STAT_SIZE) {
         return linux_errno(address_space_error_to_linux_errno(err));
@@ -347,6 +347,7 @@ fn write_bootstrap_stat(user_ptr: u64, inode: u64, len: u64) -> u64 {
         Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
     }
 }
+// RING3-MIGRATION-REFERENCE END: vfsd-owned bootstrap stat fallback exception.
 
 pub fn syscall_linux_vfs_getcwd(user_ptr: u64, user_len: u64) -> u64 {
     let Ok(user_len) = usize::try_from(user_len) else {
@@ -489,6 +490,9 @@ pub fn syscall_linux_ioctl(fd: u64, request_number: u64, arg: u64) -> u64 {
     }
 }
 
+// RING3-MIGRATION-REFERENCE START: hot-path exception: devmgrd/sessiond own
+// ioctl route policy. Ring0 keeps this selector only to preserve the direct hot
+// data path while policy-sensitive ioctls are service-routed.
 fn ioctl_requires_devmgrd_policy(request_number: u64) -> bool {
     matches!(
         request_number,
@@ -519,6 +523,7 @@ fn ioctl_requires_sessiond_tty_policy(request_number: u64) -> bool {
             | linux_abi::FIONREAD
     )
 }
+// RING3-MIGRATION-REFERENCE END: devmgrd/sessiond-owned ioctl route hot-path exception.
 
 const NETD_MAX_IOVEC_COUNT: usize = 16;
 
@@ -1026,4 +1031,3 @@ fn write_current_sockopt_payload(
     let len = payload.len() as u32;
     usermem::write_current_user_struct(optlen_ptr, &len).map_err(address_space_error_to_linux_errno)
 }
-// RING3-MIGRATION-REFERENCE END: vfsd-owned VFS metadata syscall policy.

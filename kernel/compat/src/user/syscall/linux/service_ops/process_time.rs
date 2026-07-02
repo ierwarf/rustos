@@ -1,6 +1,3 @@
-// RING3-MIGRATION-REFERENCE START: procd/syscalld should own scheduler/time and
-// process/thread syscall policy. Ring0 keeps scheduler yield and task creation
-// substrate.
 use super::*;
 
 pub fn syscall_linux_sched_yield() -> u64 {
@@ -185,33 +182,75 @@ fn sync_current_linux_signal_mask(how: u64, requested_mask: u64) {
 }
 
 pub fn syscall_linux_nanosleep(request_ptr: u64, _remaining_ptr: u64) -> u64 {
-    syscall_linux_policy_owner_nanosleep(request_ptr)
-}
-
-pub fn syscall_linux_clock_gettime(clock_id: u64, timespec_ptr: u64) -> u64 {
-    syscall_linux_policy_owner_clock_gettime(clock_id, timespec_ptr)
-}
-
-fn syscall_linux_policy_owner_nanosleep(request_ptr: u64) -> u64 {
     let ts = match usermem::read_current_user_struct::<LinuxTimespecWire>(request_ptr) {
         Ok(ts) => ts,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
     };
-    match sleep_relative_timespec(ts) {
+    if current_process_is_syscalld_policy_owner() {
+        if !is_valid_timespec(ts) {
+            return linux_errno(LINUX_EINVAL);
+        }
+        sleep_relative_timespec_substrate(ts);
+        return 0;
+    }
+    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_NANOSLEEP);
+    request.path_len = LINUX_TIMESPEC_SIZE as u32;
+    request.path[..LINUX_TIMESPEC_SIZE].copy_from_slice(as_bytes(&ts));
+    let response = match call_syscalld(request) {
+        Ok(response) => response,
+        Err(errno) => return linux_errno(errno),
+    };
+    if let Err(errno) = ensure_empty_syscalld_response(&response) {
+        return linux_errno(errno);
+    }
+    sleep_relative_timespec_substrate(ts);
+    0
+}
+
+pub fn syscall_linux_clock_gettime(clock_id: u64, timespec_ptr: u64) -> u64 {
+    if let Err(err) = usermem::validate_current_user_write_buffer(timespec_ptr, LINUX_TIMESPEC_SIZE)
+    {
+        return linux_errno(address_space_error_to_linux_errno(err));
+    }
+    if current_process_is_syscalld_policy_owner() {
+        if !is_supported_clock_id(clock_id) {
+            return linux_errno(LINUX_EINVAL);
+        }
+        return write_clock_timespec(clock_id, timespec_ptr);
+    }
+    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_CLOCK_GETTIME);
+    request.arg0 = clock_id;
+    let response = match call_syscalld(request) {
+        Ok(response) => response,
+        Err(errno) => return linux_errno(errno),
+    };
+    if let Err(errno) = ensure_empty_syscalld_response(&response) {
+        return linux_errno(errno);
+    }
+    write_clock_timespec(clock_id, timespec_ptr)
+}
+
+fn write_clock_timespec(clock_id: u64, timespec_ptr: u64) -> u64 {
+    let ts = current_clock_timespec_substrate(clock_id);
+    match usermem::write_current_user_bytes(timespec_ptr, as_bytes(&ts)) {
         Ok(()) => 0,
-        Err(errno) => linux_errno(errno),
+        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
     }
 }
 
-fn validate_timespec(ts: LinuxTimespecWire) -> Result<(), i64> {
-    if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
-        return Err(LINUX_EINVAL);
-    }
-    Ok(())
+fn current_process_is_syscalld_policy_owner() -> bool {
+    ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY)
 }
 
-pub fn sleep_relative_timespec(ts: LinuxTimespecWire) -> Result<(), i64> {
-    validate_timespec(ts)?;
+fn is_supported_clock_id(clock_id: u64) -> bool {
+    clock_id == linux_abi::CLOCK_MONOTONIC as u64 || clock_id == linux_abi::CLOCK_REALTIME as u64
+}
+
+fn is_valid_timespec(ts: LinuxTimespecWire) -> bool {
+    ts.tv_sec >= 0 && ts.tv_nsec >= 0 && ts.tv_nsec < 1_000_000_000
+}
+
+pub fn sleep_relative_timespec_substrate(ts: LinuxTimespecWire) {
     let nanos = (ts.tv_sec as u64)
         .saturating_mul(1_000_000_000)
         .saturating_add(ts.tv_nsec as u64);
@@ -219,14 +258,12 @@ pub fn sleep_relative_timespec(ts: LinuxTimespecWire) -> Result<(), i64> {
         let millis = nanos.saturating_add(999_999) / 1_000_000;
         crate::arch::rtc::sleep(millis.max(1));
     }
-    Ok(())
 }
 
-pub fn current_clock_timespec(clock_id: u64) -> Result<LinuxTimespecWire, i64> {
+pub fn current_clock_timespec_substrate(clock_id: u64) -> LinuxTimespecWire {
     match clock_id {
-        id if id == linux_abi::CLOCK_MONOTONIC as u64 => Ok(monotonic_timespec()),
-        id if id == linux_abi::CLOCK_REALTIME as u64 => Ok(realtime_timespec()),
-        _ => Err(LINUX_EINVAL),
+        id if id == linux_abi::CLOCK_REALTIME as u64 => realtime_timespec(),
+        _ => monotonic_timespec(),
     }
 }
 
@@ -234,11 +271,10 @@ fn timespec_lte(lhs: LinuxTimespecWire, rhs: LinuxTimespecWire) -> bool {
     lhs.tv_sec < rhs.tv_sec || lhs.tv_sec == rhs.tv_sec && lhs.tv_nsec <= rhs.tv_nsec
 }
 
-pub fn sleep_until_timespec(clock_id: u64, deadline: LinuxTimespecWire) -> Result<(), i64> {
-    validate_timespec(deadline)?;
-    let now = current_clock_timespec(clock_id)?;
+pub fn sleep_until_timespec_substrate(clock_id: u64, deadline: LinuxTimespecWire) {
+    let now = current_clock_timespec_substrate(clock_id);
     if timespec_lte(deadline, now) {
-        return Ok(());
+        return;
     }
     let mut tv_sec = deadline.tv_sec.saturating_sub(now.tv_sec);
     let mut tv_nsec = deadline.tv_nsec - now.tv_nsec;
@@ -246,23 +282,7 @@ pub fn sleep_until_timespec(clock_id: u64, deadline: LinuxTimespecWire) -> Resul
         tv_sec = tv_sec.saturating_sub(1);
         tv_nsec += 1_000_000_000;
     }
-    sleep_relative_timespec(LinuxTimespecWire { tv_sec, tv_nsec })
-}
-
-fn syscall_linux_policy_owner_clock_gettime(clock_id: u64, timespec_ptr: u64) -> u64 {
-    if let Err(err) = usermem::validate_current_user_write_buffer(timespec_ptr, LINUX_TIMESPEC_SIZE)
-    {
-        return linux_errno(address_space_error_to_linux_errno(err));
-    }
-
-    let ts = match current_clock_timespec(clock_id) {
-        Ok(ts) => ts,
-        Err(errno) => return linux_errno(errno),
-    };
-    match usermem::write_current_user_bytes(timespec_ptr, as_bytes(&ts)) {
-        Ok(()) => 0,
-        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
-    }
+    sleep_relative_timespec_substrate(LinuxTimespecWire { tv_sec, tv_nsec });
 }
 
 pub fn monotonic_timespec() -> LinuxTimespecWire {
@@ -349,23 +369,42 @@ pub fn syscall_linux_clock_nanosleep(
         Ok(ts) => ts,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
     };
-    if flags & !(linux_abi::TIMER_ABSTIME as u64) != 0 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let result = if flags & linux_abi::TIMER_ABSTIME as u64 != 0 {
-        sleep_until_timespec(clock_id, ts)
-    } else {
-        match current_clock_timespec(clock_id) {
-            Ok(_) => sleep_relative_timespec(ts),
-            Err(errno) => Err(errno),
+    if current_process_is_syscalld_policy_owner() {
+        if !is_supported_clock_id(clock_id)
+            || flags & !(linux_abi::TIMER_ABSTIME as u64) != 0
+            || !is_valid_timespec(ts)
+        {
+            return linux_errno(LINUX_EINVAL);
         }
-    };
-    match result {
-        Ok(()) => 0,
-        Err(errno) => linux_errno(errno),
+        return sleep_clock_nanosleep_substrate(clock_id, flags, ts);
     }
+    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_CLOCK_NANOSLEEP);
+    request.arg0 = clock_id;
+    request.flags = flags;
+    request.path_len = LINUX_TIMESPEC_SIZE as u32;
+    request.path[..LINUX_TIMESPEC_SIZE].copy_from_slice(as_bytes(&ts));
+    let response = match call_syscalld(request) {
+        Ok(response) => response,
+        Err(errno) => return linux_errno(errno),
+    };
+    if let Err(errno) = ensure_empty_syscalld_response(&response) {
+        return linux_errno(errno);
+    }
+    sleep_clock_nanosleep_substrate(clock_id, flags, ts)
 }
 
+fn sleep_clock_nanosleep_substrate(clock_id: u64, flags: u64, ts: LinuxTimespecWire) -> u64 {
+    if flags & linux_abi::TIMER_ABSTIME as u64 != 0 {
+        sleep_until_timespec_substrate(clock_id, ts);
+    } else {
+        sleep_relative_timespec_substrate(ts);
+    }
+    0
+}
+
+// RING3-MIGRATION-REFERENCE START: scheduler-thread substrate exception:
+// procd/syscalld own clone/futex/time admission policy. Ring0 keeps scheduler
+// mutation, futex wait queues, and task creation substrate.
 pub fn syscall_linux_clone(frame: &SyscallFrame) -> u64 {
     clone_linux_thread(frame, frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
 }
@@ -420,4 +459,4 @@ pub fn syscall_linux_clone3(frame: &SyscallFrame) -> u64 {
         args.tls,
     )
 }
-// RING3-MIGRATION-REFERENCE END: procd/syscalld-owned process/time policy.
+// RING3-MIGRATION-REFERENCE END: procd/syscalld-owned clone/futex/time substrate exception.

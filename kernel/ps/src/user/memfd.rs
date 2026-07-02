@@ -1,6 +1,7 @@
-// RING3-MIGRATION-REFERENCE START: pagerd/procd should own memfd lifecycle,
-// sealing policy, and shared mapping policy. Ring0 keeps physical frame backing
-// and page-table-visible mapping substrate.
+// RING3-MIGRATION-REFERENCE START: memfd-kernel-substrate exception:
+// syscalld validates memfd_create policy and pagerd/mm broker owns mapping
+// admission. Ring0 keeps fd-local cursor, seal enforcement, physical frame
+// backing, and page-table-visible shared mapping substrate.
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -360,4 +361,4 @@ fn write_at_locked(frames: &[u64], offset: usize, src: &[u8]) {
         copied += chunk_len;
     }
 }
-// RING3-MIGRATION-REFERENCE END: pagerd/procd-owned memfd lifecycle and mapping policy.
+// RING3-MIGRATION-REFERENCE END: memfd kernel backing substrate exception.

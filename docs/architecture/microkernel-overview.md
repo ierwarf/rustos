@@ -41,6 +41,12 @@ The kernel is split into crates so privileges and policy stay isolated:
 
 Anything that is *not* in the list above belongs in userspace.
 
+Ring3 migration status is read from `cargo xtask ring3-inventory`.
+`migration_candidate_loc` means real remaining ring3 work. `cleanup_debt_loc`
+means legacy native code that should be retired rather than migrated, and
+`excluded_exception_loc` means deliberate ring0 substrate or already-ring3
+reference surface.
+
 ### Boot Sequence
 
 ```text
@@ -152,6 +158,11 @@ ring0 권한과 policy가 섞이지 않도록 커널은 여러 crate로 나뉩�
 - `kernel/executive`: boot orchestration, finalize 시퀀스, nucleus run loop.
 
 위 목록에 없는 것은 모두 userspace에 둡니다.
+
+ring3 migration 상태는 `cargo xtask ring3-inventory`가 기준입니다.
+`migration_candidate_loc`는 실제 남은 ring3 작업, `cleanup_debt_loc`는
+마이그레이션이 아니라 제거해야 할 legacy native 코드, `excluded_exception_loc`는
+의도적으로 남기는 ring0 substrate 또는 이미 ring3인 reference surface입니다.
 
 ### Boot 순서
 

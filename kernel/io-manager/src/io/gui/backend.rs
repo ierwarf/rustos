@@ -1,6 +1,6 @@
-// RING3-MIGRATION-REFERENCE START: uiserver/driverd should own display backend
-// provider policy. Ring0 keeps framebuffer mapping and present substrate until
-// ring3 display service-drivers can own the provider path.
+// RING3-MIGRATION-REFERENCE START: display-present-substrate exception:
+// uiserver/driverd own display backend provider policy. Ring0 keeps framebuffer
+// mapping, write-combine setup, and present copy substrate.
 #[cfg(rustos_debug_print_enabled)]
 use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
@@ -155,9 +155,6 @@ pub(crate) fn present_bgra8888_from_kernel(
             false
         })
         .unwrap_or(false);
-    if presented {
-        crate::driver::virtio_gpu::queue_primary_flush();
-    }
     presented
 }
 
@@ -191,14 +188,6 @@ pub(crate) fn present_bgra8888_rect_from_kernel(
             false
         })
         .unwrap_or(false);
-    if presented {
-        crate::driver::virtio_gpu::queue_primary_flush_rect(
-            rect.x as u32,
-            rect.y as u32,
-            rect.width as u32,
-            rect.height as u32,
-        );
-    }
     presented
 }
 
@@ -275,4 +264,4 @@ fn framebuffer_info_is_valid(info: FramebufferInfo) -> bool {
 
     min_size <= size
 }
-// RING3-MIGRATION-REFERENCE END: uiserver/driverd-owned display backend policy.
+// RING3-MIGRATION-REFERENCE END: uiserver/driverd-owned display backend substrate exception.

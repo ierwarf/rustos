@@ -1,6 +1,7 @@
-// RING3-MIGRATION-REFERENCE START: devmgrd/uiserver should own display device
-// admission, surface policy, and presentation routing. Ring0 keeps framebuffer
-// mapping, current-process user-copy, and hot present substrate.
+// RING3-MIGRATION-REFERENCE START: hot-path exception: devmgrd/uiserver own
+// display ioctl admission, surface policy, and presentation routing. Ring0
+// keeps framebuffer mapping, current-process user-copy, display surface handles,
+// and hot present substrate.
 use core::convert::TryFrom;
 
 use crate::io::gui;
@@ -264,4 +265,4 @@ fn validate_surface_mapping(
         .ok_or(DeviceError::InvalidArgument)?;
     Ok(())
 }
-// RING3-MIGRATION-REFERENCE END: devmgrd/uiserver-owned display device policy.
+// RING3-MIGRATION-REFERENCE END: devmgrd/uiserver-owned display ioctl substrate exception.

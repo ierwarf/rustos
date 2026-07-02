@@ -4,6 +4,8 @@
 extern crate alloc;
 
 use alloc::collections::BTreeMap;
+use alloc::string::String;
+use alloc::vec::Vec;
 use core::mem::size_of;
 use core::panic::PanicInfo;
 
@@ -25,13 +27,13 @@ use rustos_user_abi::syscall::{
     LOADER_SPAWN_MAX_ARG_COUNT, LOADER_SPAWN_MAX_ENV_COUNT, PROCD_ARG_BYTES, PROCD_ENV_BYTES,
     PROCD_IPC_ABI_VERSION, PROCD_OP_EXECVE, PROCD_OP_EXECVEAT, PROCD_OP_FORK,
     PROCD_OP_RT_SIGACTION, PROCD_OP_RT_SIGPROCMASK, PROCD_OP_SELECT_SIGNAL, PROCD_OP_SIGALTSTACK,
-    PROCD_OP_TGKILL, PROCD_OP_WAIT4, PROCD_PATH_CAPACITY, PROCD_PAYLOAD_CAPACITY,
-    PROCD_SELECT_SIGNAL_HANDLER, PROCD_SELECT_SIGNAL_IGNORE, PROCD_SELECT_SIGNAL_NONE,
-    PROCD_SELECT_SIGNAL_TERMINATE, PROC_BROKER_ABI_VERSION, PROC_BROKER_FORMAT_ELF64,
-    PROC_BROKER_FORMAT_PE64, SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_PROCESS_EXIT,
-    SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER, SYS_RUSTOS_PROC_AUTHORIZE_EXEC_BROKER,
-    SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER, SYS_RUSTOS_PROC_FORK_BROKER,
-    SYS_RUSTOS_PROC_SIGNAL_QUEUE_BROKER,
+    PROCD_OP_TGKILL, PROCD_OP_THREAD_PLAN, PROCD_OP_WAIT4, PROCD_PATH_CAPACITY,
+    PROCD_PAYLOAD_CAPACITY, PROCD_SELECT_SIGNAL_HANDLER, PROCD_SELECT_SIGNAL_IGNORE,
+    PROCD_SELECT_SIGNAL_NONE, PROCD_SELECT_SIGNAL_TERMINATE, PROC_BROKER_ABI_VERSION,
+    PROC_BROKER_FORMAT_ELF64, PROC_BROKER_FORMAT_PE64, SYSCALL_OFFLOAD_ABI_VERSION,
+    SYSCALL_OFFLOAD_OP_LINUX_PROCESS_EXIT, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
+    SYS_RUSTOS_PROC_AUTHORIZE_EXEC_BROKER, SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER,
+    SYS_RUSTOS_PROC_FORK_BROKER, SYS_RUSTOS_PROC_SIGNAL_QUEUE_BROKER,
 };
 use spin::Mutex;
 
@@ -49,6 +51,8 @@ const SIG_SETMASK: u64 = 2;
 const SIG_IGN: u64 = 1;
 const SIGKILL: usize = 9;
 const SIGSTOP: usize = 19;
+const LINUX_USER_SPACE_BASE: u64 = 0x0000_0000_0000_1000;
+const LINUX_USER_SPACE_END: u64 = 0x0000_8000_0000;
 
 static PROCESS_SIGNAL_POLICY: Mutex<BTreeMap<u64, ProcessSignalPolicy>> =
     Mutex::new(BTreeMap::new());
@@ -223,6 +227,7 @@ fn handle_request(received: usize, request: &ProcdIpcRequest) -> ProcdIpcRespons
         PROCD_OP_SIGALTSTACK => handle_sigaltstack(request, &mut response),
         PROCD_OP_TGKILL => handle_tgkill(request, &mut response),
         PROCD_OP_SELECT_SIGNAL => handle_select_signal(request, &mut response),
+        PROCD_OP_THREAD_PLAN => handle_thread_plan(request, &mut response),
         _ => response.status = EINVAL,
     }
     response
@@ -400,8 +405,20 @@ fn handle_exec(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse) {
         response.status = ENOSYS;
         return;
     }
-    let path_len = request.path_len as usize;
-    if path_len == 0 || request.path[..path_len].contains(&0) {
+    let raw_path_len = request.path_len as usize;
+    if raw_path_len == 0 || request.path[..raw_path_len].contains(&0) {
+        response.status = EINVAL;
+        return;
+    }
+    let exec_path = match resolve_exec_path(request, raw_path_len) {
+        Ok(path) => path,
+        Err(status) => {
+            response.status = status;
+            return;
+        }
+    };
+    let exec_path_len = exec_path.len();
+    if exec_path_len > PROCD_PATH_CAPACITY {
         response.status = EINVAL;
         return;
     }
@@ -437,14 +454,14 @@ fn handle_exec(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse) {
         target_pid: request.pid,
         target_tid: request.tid,
         exec_ticket,
-        exec_path_len: request.path_len,
+        exec_path_len: exec_path_len as u32,
         argv_count: request.argv_count,
         env_count: request.env_count,
         argv_bytes_len: request.argv_bytes_len,
         env_bytes_len: request.env_bytes_len,
         ..LoaderSpawnRequest::default()
     };
-    loader_request.exec_path[..path_len].copy_from_slice(&request.path[..path_len]);
+    loader_request.exec_path[..exec_path_len].copy_from_slice(exec_path.as_bytes());
     loader_request.argv_bytes[..request.argv_bytes_len as usize]
         .copy_from_slice(&request.argv_bytes[..request.argv_bytes_len as usize]);
     loader_request.env_bytes[..request.env_bytes_len as usize]
@@ -481,6 +498,54 @@ fn handle_exec(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse) {
     } else {
         cancel_exec_ticket(exec_ticket, request.pid, request.tid);
     }
+}
+
+fn resolve_exec_path(request: &ProcdIpcRequest, path_len: usize) -> Result<String, i32> {
+    let path = core::str::from_utf8(&request.path[..path_len]).map_err(|_| EINVAL)?;
+    if path.starts_with('/') {
+        return normalize_absolute_path(path);
+    }
+    let cwd_len = request.payload_len as usize;
+    if cwd_len == 0 || cwd_len > request.payload.len() || request.payload[..cwd_len].contains(&0) {
+        return Err(EINVAL);
+    }
+    let cwd = core::str::from_utf8(&request.payload[..cwd_len]).map_err(|_| EINVAL)?;
+    if !cwd.starts_with('/') {
+        return Err(EINVAL);
+    }
+    let mut combined = String::from(cwd);
+    if !combined.ends_with('/') {
+        combined.push('/');
+    }
+    combined.push_str(path);
+    normalize_absolute_path(combined.as_str())
+}
+
+fn normalize_absolute_path(path: &str) -> Result<String, i32> {
+    if !path.starts_with('/') {
+        return Err(EINVAL);
+    }
+    let mut components = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                let _ = components.pop();
+            }
+            segment => components.push(segment),
+        }
+    }
+    let mut normalized = String::from("/");
+    for (index, component) in components.iter().enumerate() {
+        if index != 0 {
+            normalized.push('/');
+        }
+        normalized.push_str(component);
+    }
+    if normalized.len() > PROCD_PATH_CAPACITY {
+        return Err(EINVAL);
+    }
+    Ok(normalized)
 }
 
 fn cancel_exec_ticket(exec_ticket: u64, target_pid: u64, target_tid: u64) {
@@ -533,6 +598,45 @@ fn handle_fork(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse) {
         response.result = pid;
         inherit_signal_policy_after_fork(request.pid, request.tid, pid as u64);
     }
+}
+
+fn handle_thread_plan(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse) {
+    if !valid_thread_plan(request) {
+        response.status = EINVAL;
+    }
+}
+
+fn valid_thread_plan(request: &ProcdIpcRequest) -> bool {
+    const CSIGNAL: u64 = 0xff;
+    const CLONE_VM: u64 = 0x0000_0100;
+    const CLONE_FS: u64 = 0x0000_0200;
+    const CLONE_FILES: u64 = 0x0000_0400;
+    const CLONE_SIGHAND: u64 = 0x0000_0800;
+    const CLONE_THREAD: u64 = 0x0001_0000;
+    const CLONE_SYSVSEM: u64 = 0x0004_0000;
+    const CLONE_SETTLS: u64 = 0x0008_0000;
+    const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+    const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+    const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+    const REQUIRED_THREAD_FLAGS: u64 =
+        CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+    const OPTIONAL_THREAD_FLAGS: u64 = CLONE_SYSVSEM
+        | CLONE_SETTLS
+        | CLONE_PARENT_SETTID
+        | CLONE_CHILD_CLEARTID
+        | CLONE_CHILD_SETTID;
+    let flags = request.arg0;
+    let supported_flags = REQUIRED_THREAD_FLAGS | OPTIONAL_THREAD_FLAGS | CSIGNAL;
+    flags & REQUIRED_THREAD_FLAGS == REQUIRED_THREAD_FLAGS
+        && flags & CSIGNAL == 0
+        && flags & !supported_flags == 0
+        && request.arg1 != 0
+        && user_pointer_in_range(request.arg1)
+        && (flags & CLONE_SETTLS == 0 || request.arg4 == 0 || user_pointer_in_range(request.arg4))
+}
+
+fn user_pointer_in_range(ptr: u64) -> bool {
+    (LINUX_USER_SPACE_BASE..LINUX_USER_SPACE_END).contains(&ptr)
 }
 
 fn process_clone_unsupported_mask() -> u64 {

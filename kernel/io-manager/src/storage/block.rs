@@ -1,6 +1,7 @@
-// RING3-MIGRATION-REFERENCE START: storaged should own block inventory, root
-// selection, and post-bootstrap block policy. Ring0 keeps physical block
-// descriptor publication and boot-volume transport substrate.
+// RING3-MIGRATION-REFERENCE START: bootstrap exception: storaged owns
+// post-bootstrap inventory/root selection. Ring0 keeps physical descriptor
+// publication and current boot-volume transport substrate for early boot and
+// gated block brokers.
 mod boot;
 mod io;
 mod registry;
@@ -355,4 +356,4 @@ fn open_physical_boot_block_device(
     let handle = boot::open_physical_boot_handle(identity).map_err(fatfs::Error::Io)?;
     Ok(Box::new(FatRegistryDevice::new(handle)) as Box<dyn SharedBlockDevice>)
 }
-// RING3-MIGRATION-REFERENCE END: storaged-owned block inventory/selection policy.
+// RING3-MIGRATION-REFERENCE END: storaged-owned block policy bootstrap exception.

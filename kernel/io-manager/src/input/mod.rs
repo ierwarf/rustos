@@ -4,18 +4,14 @@
 use crate::driver;
 use driver_abi::{DriverBus, DriverClass};
 
-pub(crate) mod dispatcher;
 pub mod event_queue;
 pub(crate) mod i8042;
 pub(crate) mod keyboard;
 
 const KEYBOARD_DRIVER_NAME: &str = "rustos-keyboard";
-const PS2_MOUSE_DRIVER_NAME: &str = "rustos-ps2-mouse";
 
 pub fn init() {
     driver::register_kernel_builtin(KEYBOARD_DRIVER_NAME, DriverClass::Input, DriverBus::Serio);
-    driver::register_kernel_builtin(PS2_MOUSE_DRIVER_NAME, DriverClass::Input, DriverBus::Serio);
-    i8042::register_builtin_ps2_mouse_driver();
     report_keyboard_transport(i8042::init_keyboard_port());
     initialize_aux_transport();
 }

@@ -1,6 +1,6 @@
-// RING3-MIGRATION-REFERENCE START: sessiond/runtimed should own TTY line
-// discipline, session routing, and console read/write policy. Ring0 keeps
-// bootstrap TTY buffers as temporary substrate.
+// RING3-MIGRATION-REFERENCE START: bootstrap exception: sessiond/runtimed own
+// normal TTY line discipline, session routing, and console read/write policy.
+// Ring0 keeps the system console bootstrap buffer substrate.
 use alloc::vec::Vec;
 use nucleus_core::util::ring::RingBuffer;
 
@@ -163,4 +163,4 @@ mod tests {
         assert_eq!(&read[..2], b"ab");
     }
 }
-// RING3-MIGRATION-REFERENCE END: sessiond/runtimed-owned TTY policy.
+// RING3-MIGRATION-REFERENCE END: sessiond/runtimed-owned bootstrap TTY substrate exception.

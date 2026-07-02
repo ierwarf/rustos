@@ -494,6 +494,7 @@ name = "inputd"
 version = "0.1.0"
 dependencies = [
  "input-evdev",
+ "keyboard-core",
  "libc",
  "observability-client",
  "rustos-user-abi",

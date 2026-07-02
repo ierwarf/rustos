@@ -141,8 +141,6 @@ unsafe extern "C" fn register_virtio_driver(driver: *mut c_void) -> i32 {
     register_driver_record(driver, policy.class, driver_name_hash);
     if policy.class == DriverClass::Network {
         crate::network::note_virtio_net_driver_registered();
-    } else if policy.class == DriverClass::Display {
-        let _ = crate::driver::virtio_gpu::try_enable_primary_display();
     }
     let status = 0;
     crate::debug::record_milestone(

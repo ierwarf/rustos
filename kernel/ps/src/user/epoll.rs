@@ -1,5 +1,6 @@
-// RING3-MIGRATION-REFERENCE START: vfsd/netd should own epoll readiness policy.
-// Ring0 keeps epoll token storage and fd-table handle substrate.
+// RING3-MIGRATION-REFERENCE START: already migrated: vfsd/netd own epoll
+// readiness policy. Ring0 keeps epoll token storage and fd-table handle
+// substrate only.
 use core::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -40,4 +41,4 @@ impl EpollHandle {
         self.token
     }
 }
-// RING3-MIGRATION-REFERENCE END: vfsd/netd-owned epoll token policy.
+// RING3-MIGRATION-REFERENCE END: vfsd/netd-owned epoll policy token substrate.

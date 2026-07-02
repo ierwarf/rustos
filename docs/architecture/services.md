@@ -54,8 +54,8 @@ edges. The on-boot probe loads:
 - Native RustOS xHCI for USB pointers and keyboards; raw HID reports are
   routed to `inputd` for policy/translation. Linux USB HID `.ko` artifacts stay
   staged only for compatibility work and are not the default boot input path.
-- `virtio-gpu` when present (otherwise `bootfb` is the active display
-  provider).
+- Linux `.ko` `virtio-gpu` when present (otherwise `bootfb` is the active
+  display provider). Native virtio-gpu fallback must not be reintroduced.
 - `virtio-net` for the default emulated NIC.
 
 A skipped driver shows up as `driverd: skipped name=... reason=...` and is
@@ -112,7 +112,8 @@ driver module (`.ko`)은 `driverd`가 소유 정책이지만, ring0 접근이 �
 - USB pointer/keyboard는 native RustOS xHCI가 잡고 raw HID report를
   `inputd`로 넘깁니다. Linux USB HID `.ko` artifact는 호환 작업용으로만
   stage되며 기본 부팅 입력 경로가 아닙니다.
-- 가능하면 `virtio-gpu` (없으면 `bootfb`가 display provider).
+- 가능하면 Linux `.ko` `virtio-gpu` (없으면 `bootfb`가 display provider).
+  native virtio-gpu fallback은 다시 넣으면 안 됩니다.
 - emulated NIC default인 `virtio-net`.
 
 skip된 driver는 `driverd: skipped name=... reason=...`로 표시되며, alias가

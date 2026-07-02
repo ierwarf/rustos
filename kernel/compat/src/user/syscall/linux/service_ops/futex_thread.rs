@@ -1,8 +1,9 @@
-// RING3-MIGRATION-REFERENCE START: procd/syscalld should own futex and Linux
-// clone/thread policy. Ring0 keeps scheduler handoff, wait queues, and
-// current-process user-copy substrate.
 use super::*;
 use lazy_static::lazy_static;
+use rustos_user_abi::syscall::{
+    IPC_SERVICE_CAP_PROCESS_POLICY, PROCD_OP_THREAD_PLAN,
+    SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY, SYSCALL_OFFLOAD_OP_LINUX_FUTEX_POLICY,
+};
 use spin::Mutex;
 use x86_64::VirtAddr;
 
@@ -26,15 +27,28 @@ lazy_static! {
         Mutex::new([None; FUTEX_WAITERS_CAPACITY]);
 }
 
+// RING3-MIGRATION-REFERENCE START: scheduler-thread substrate exception:
+// syscalld owns Linux futex opcode admission policy. Ring0 keeps the scheduler
+// wait/wake queue substrate.
 pub fn futex_impl(uaddr: u64, op: u64, val: u64, timeout_ptr: u64, uaddr2: u64, val3: u64) -> u64 {
     if (uaddr & 0x3) != 0 {
         return linux_errno(LINUX_EINVAL);
     }
-    let cmd = op & linux_abi::FUTEX_CMD_MASK;
-    let supported_flags = linux_abi::FUTEX_PRIVATE_FLAG | linux_abi::FUTEX_CLOCK_REALTIME;
-    if (op & !linux_abi::FUTEX_CMD_MASK) & !supported_flags != 0 {
-        return linux_errno(LINUX_EINVAL);
+    if current_process_is_syscalld_policy_owner() {
+        if let Err(errno) = validate_futex_policy_locally(op, val3) {
+            return linux_errno(errno);
+        }
+    } else {
+        let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_FUTEX_POLICY);
+        request.arg0 = op;
+        request.arg1 = val3;
+        match call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response))
+        {
+            Ok(()) => {}
+            Err(errno) => return linux_errno(errno),
+        }
     }
+    let cmd = op & linux_abi::FUTEX_CMD_MASK;
     let result = match cmd {
         c if c == linux_abi::FUTEX_WAIT => futex_wait(
             uaddr,
@@ -44,9 +58,6 @@ pub fn futex_impl(uaddr: u64, op: u64, val: u64, timeout_ptr: u64, uaddr2: u64, 
         ),
         c if c == linux_abi::FUTEX_WAIT_BITSET => {
             let bitset = val3 as u32;
-            if bitset == 0 {
-                return linux_errno(LINUX_EINVAL);
-            }
             futex_wait(uaddr, val as u32, timeout_ptr, bitset)
         }
         c if c == linux_abi::FUTEX_WAKE => {
@@ -54,9 +65,6 @@ pub fn futex_impl(uaddr: u64, op: u64, val: u64, timeout_ptr: u64, uaddr2: u64, 
         }
         c if c == linux_abi::FUTEX_WAKE_BITSET => {
             let bitset = val3 as u32;
-            if bitset == 0 {
-                return linux_errno(LINUX_EINVAL);
-            }
             futex_wake(uaddr, val, bitset)
         }
         c if c == linux_abi::FUTEX_REQUEUE => futex_requeue(uaddr, val, timeout_ptr, uaddr2),
@@ -70,7 +78,40 @@ pub fn futex_impl(uaddr: u64, op: u64, val: u64, timeout_ptr: u64, uaddr2: u64, 
         Err(errno) => linux_errno(errno),
     }
 }
+// RING3-MIGRATION-REFERENCE END: syscalld-owned futex opcode substrate exception.
 
+fn validate_futex_policy_locally(op: u64, val3: u64) -> Result<(), i64> {
+    let cmd = op & linux_abi::FUTEX_CMD_MASK;
+    let supported_flags = linux_abi::FUTEX_PRIVATE_FLAG | linux_abi::FUTEX_CLOCK_REALTIME;
+    if (op & !linux_abi::FUTEX_CMD_MASK) & !supported_flags != 0 {
+        return Err(LINUX_EINVAL);
+    }
+    match cmd {
+        c if c == linux_abi::FUTEX_WAIT
+            || c == linux_abi::FUTEX_WAKE
+            || c == linux_abi::FUTEX_REQUEUE
+            || c == linux_abi::FUTEX_CMP_REQUEUE =>
+        {
+            Ok(())
+        }
+        c if c == linux_abi::FUTEX_WAIT_BITSET || c == linux_abi::FUTEX_WAKE_BITSET => {
+            if val3 == 0 { Err(LINUX_EINVAL) } else { Ok(()) }
+        }
+        _ => Err(LINUX_ENOSYS),
+    }
+}
+
+fn current_process_is_syscalld_policy_owner() -> bool {
+    ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY)
+}
+
+fn current_process_is_procd_policy_owner() -> bool {
+    ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_PROCESS_POLICY)
+}
+
+// RING3-MIGRATION-REFERENCE START: scheduler-thread substrate exception: procd
+// owns Linux clone/thread admission policy. Ring0 keeps final
+// same-address-space thread spawn and register substrate.
 pub fn clone_linux_thread(
     frame: &SyscallFrame,
     flags: u64,
@@ -90,8 +131,6 @@ pub fn clone_linux_thread(
         | linux_abi::CLONE_CHILD_CLEARTID
         | linux_abi::CLONE_CHILD_SETTID;
 
-    let exit_signal = flags & linux_abi::CSIGNAL;
-    let supported_flags = REQUIRED_THREAD_FLAGS | OPTIONAL_THREAD_FLAGS | linux_abi::CSIGNAL;
     if flags & REQUIRED_THREAD_FLAGS != REQUIRED_THREAD_FLAGS {
         return procd_fork(
             frame,
@@ -102,19 +141,21 @@ pub fn clone_linux_thread(
             tls,
         );
     }
-    if exit_signal != 0 || flags & !supported_flags != 0 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    if child_stack == 0
-        || !(paging::USER_SPACE_BASE..paging::USER_SPACE_END_EXCLUSIVE).contains(&child_stack)
-    {
-        return linux_errno(LINUX_EINVAL);
-    }
-    if flags & linux_abi::CLONE_SETTLS != 0
-        && tls != 0
-        && !(paging::USER_SPACE_BASE..paging::USER_SPACE_END_EXCLUSIVE).contains(&tls)
-    {
-        return linux_errno(LINUX_EINVAL);
+    if current_process_is_procd_policy_owner() {
+        if !valid_thread_plan_locally(flags, child_stack, tls) {
+            return linux_errno(LINUX_EINVAL);
+        }
+    } else {
+        let mut request = new_procd_request(PROCD_OP_THREAD_PLAN);
+        request.arg0 = flags;
+        request.arg1 = child_stack;
+        request.arg2 = parent_tid_ptr;
+        request.arg3 = child_tid_ptr;
+        request.arg4 = tls;
+        match call_procd(&request).and_then(|response| ensure_empty_procd_response(&response)) {
+            Ok(()) => {}
+            Err(errno) => return linux_errno(errno),
+        }
     }
 
     let console_session = multitask::current_console_session();
@@ -225,6 +266,29 @@ pub fn clone_linux_thread(
         }
     }
     child_tid
+}
+// RING3-MIGRATION-REFERENCE END: procd-owned Linux clone/thread substrate exception.
+
+fn valid_thread_plan_locally(flags: u64, child_stack: u64, tls: u64) -> bool {
+    const REQUIRED_THREAD_FLAGS: u64 = linux_abi::CLONE_VM
+        | linux_abi::CLONE_FS
+        | linux_abi::CLONE_FILES
+        | linux_abi::CLONE_SIGHAND
+        | linux_abi::CLONE_THREAD;
+    const OPTIONAL_THREAD_FLAGS: u64 = linux_abi::CLONE_SYSVSEM
+        | linux_abi::CLONE_SETTLS
+        | linux_abi::CLONE_PARENT_SETTID
+        | linux_abi::CLONE_CHILD_CLEARTID
+        | linux_abi::CLONE_CHILD_SETTID;
+    let supported_flags = REQUIRED_THREAD_FLAGS | OPTIONAL_THREAD_FLAGS | linux_abi::CSIGNAL;
+    flags & REQUIRED_THREAD_FLAGS == REQUIRED_THREAD_FLAGS
+        && flags & linux_abi::CSIGNAL == 0
+        && flags & !supported_flags == 0
+        && child_stack != 0
+        && (paging::USER_SPACE_BASE..paging::USER_SPACE_END_EXCLUSIVE).contains(&child_stack)
+        && (flags & linux_abi::CLONE_SETTLS == 0
+            || tls == 0
+            || (paging::USER_SPACE_BASE..paging::USER_SPACE_END_EXCLUSIVE).contains(&tls))
 }
 
 fn futex_wait(uaddr: u64, expected: u32, timeout_ptr: u64, bitset: u32) -> Result<u64, i64> {
@@ -451,14 +515,26 @@ pub fn cleanup_linux_thread_exit() {
     }
 }
 
+// RING3-MIGRATION-REFERENCE START: scheduler-thread substrate exception:
+// syscalld/procd own Linux thread metadata admission policy. Ring0 keeps
+// FS-base mutation and clear_child_tid substrate.
 pub fn syscall_linux_arch_prctl(_code: u64, _arg: u64) -> u64 {
+    if current_process_is_syscalld_policy_owner() {
+        if !valid_arch_prctl_locally(_code, _arg) {
+            return linux_errno(LINUX_EINVAL);
+        }
+    } else {
+        let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY);
+        request.arg0 = _code;
+        request.arg1 = _arg;
+        match call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response))
+        {
+            Ok(()) => {}
+            Err(errno) => return linux_errno(errno),
+        }
+    }
     match _code {
         linux_abi::ARCH_SET_FS => {
-            if _arg != 0
-                && !(paging::USER_SPACE_BASE..paging::USER_SPACE_END_EXCLUSIVE).contains(&_arg)
-            {
-                return linux_errno(LINUX_EINVAL);
-            }
             let Some(result) =
                 multitask::with_current_user_linux_state_mut(|_, _, abi, _, _, thread_state| {
                     if abi != crate::user::abi::UserAbi::Linux {
@@ -501,6 +577,17 @@ pub fn syscall_linux_set_tid_address(user_ptr: u64) -> u64 {
         return linux_errno(LINUX_ENOSYS);
     };
     result.unwrap_or_else(|| linux_errno(LINUX_ENOSYS))
+}
+// RING3-MIGRATION-REFERENCE END: syscalld/procd-owned Linux thread metadata substrate exception.
+
+fn valid_arch_prctl_locally(code: u64, arg: u64) -> bool {
+    match code {
+        linux_abi::ARCH_SET_FS => {
+            arg == 0 || (paging::USER_SPACE_BASE..paging::USER_SPACE_END_EXCLUSIVE).contains(&arg)
+        }
+        linux_abi::ARCH_GET_FS => true,
+        _ => false,
+    }
 }
 
 pub fn syscall_linux_kill(pid: u64, signal: u64) -> u64 {
@@ -567,7 +654,6 @@ pub fn syscall_linux_set_robust_list(head_ptr: u64, len: u64) -> u64 {
         Err(errno) => linux_errno(errno),
     }
 }
-// RING3-MIGRATION-REFERENCE END: procd/syscalld-owned futex/thread policy.
 
 pub fn syscall_linux_get_robust_list(pid: u64, head_ptr_ptr: u64, len_ptr: u64) -> u64 {
     let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_GET_ROBUST_LIST);

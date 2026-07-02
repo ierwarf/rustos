@@ -1,6 +1,6 @@
-// RING3-MIGRATION-REFERENCE START: syscalld should own Win32 syscall policy.
-// Ring0 keeps syscall frame validation, current-process user-copy, and dispatch
-// substrate.
+// RING3-MIGRATION-REFERENCE START: decode exception: syscalld owns Win32
+// syscall policy. Ring0 keeps syscall frame validation, current-process
+// user-copy, and dispatch substrate.
 use core::mem::size_of;
 use core::slice;
 
@@ -91,4 +91,4 @@ fn syscall_check(frame: &SyscallFrame) -> Result<Api, u64> {
     }
     Ok(api)
 }
-// RING3-MIGRATION-REFERENCE END: syscalld-owned Win32 syscall dispatch policy.
+// RING3-MIGRATION-REFERENCE END: syscalld-owned Win32 syscall dispatch decode exception.

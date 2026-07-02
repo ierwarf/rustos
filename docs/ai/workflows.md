@@ -77,8 +77,9 @@ Before any workflow: read `token-policy.md`, then `task-router.md`.
    already-installed GUI backend.
 6. Confirm `display-primary` fallback decisions use active display state, not
    just a loaded module record.
-7. For QEMU virtio-gpu, confirm `virtio-gpu native: display registered`
-   appears after `virtio register driver`.
+7. For QEMU virtio-gpu, prefer the Linux `.ko` display path. If
+   `virtio-gpu native: display registered` appears, the removed native fallback
+   has regressed back into the kernel.
 
 ## Reduce context mid-task
 

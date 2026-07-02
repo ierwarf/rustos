@@ -1,6 +1,6 @@
-// RING3-MIGRATION-REFERENCE START: storaged should own boot-volume candidate
-// selection and post-bootstrap root-device admission. Ring0 keeps early
-// physical boot-volume open substrate until storaged is available.
+// RING3-MIGRATION-REFERENCE START: bootstrap exception: storaged owns
+// post-bootstrap boot-volume admission. Ring0 keeps exact physical boot-volume
+// open fallback until storaged is available early enough for rootfs access.
 use alloc::vec::Vec;
 use boot_protocol::{BootVolumeIdentity, BootVolumeTransport};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -310,4 +310,4 @@ impl storage_core::BlockDevice for RegistryRootBlockDevice {
         io::flush_uncached(self.root_id)
     }
 }
-// RING3-MIGRATION-REFERENCE END: storaged-owned boot-volume selection policy.
+// RING3-MIGRATION-REFERENCE END: storaged-owned boot-volume admission bootstrap exception.

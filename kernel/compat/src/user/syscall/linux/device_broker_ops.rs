@@ -1,6 +1,3 @@
-// RING3-MIGRATION-REFERENCE START: devmgrd should own device access/right
-// reduction policy. Ring0 keeps handle installation, user-copy, and native
-// device operation substrate.
 use super::*;
 
 use crate::user::sysops::device::{self, DeviceSysopError};
@@ -38,12 +35,6 @@ pub(super) fn syscall_linux_rustos_device_open_broker(args_ptr: u64) -> u64 {
     let Some(access) = map_device_access(args.access) else {
         return linux_errno(LINUX_EINVAL);
     };
-    if matches!(device_id, crate::io::device::DeviceId::Input)
-        && matches!(access, DeviceAccessKind::Evdev)
-        && args.rights & (DEVMGRD_DEVICE_RIGHT_WRITE | DEVMGRD_DEVICE_RIGHT_ADMIN) != 0
-    {
-        return linux_errno(LINUX_EPERM);
-    }
     let Some(rights) = device_handle_rights(args.rights) else {
         return linux_errno(LINUX_EINVAL);
     };
@@ -96,6 +87,9 @@ pub(super) fn syscall_linux_rustos_device_ioctl_broker(args_ptr: u64) -> u64 {
     }
 }
 
+// RING3-MIGRATION-REFERENCE START: capability-broker exception: sessiond owns
+// session ioctl commit policy. Ring0 keeps capability-gated native ioctl commit
+// substrate.
 fn session_policy_device_ioctl_allowed(args: &RustosDeviceIoctlBrokerArgs) -> bool {
     (args.process_id == 0
         || multitask::current_user_process_id().is_some_and(|pid| pid == args.process_id))
@@ -107,6 +101,7 @@ fn session_policy_device_ioctl_allowed(args: &RustosDeviceIoctlBrokerArgs) -> bo
                 | rustos_user_abi::console::CONSOLE_IOCTL_SET_FOCUS
         )
 }
+// RING3-MIGRATION-REFERENCE END: sessiond-owned ioctl commit substrate exception.
 
 pub(in crate::user::syscall::linux) fn device_sysop_error_to_linux_errno(
     err: DeviceSysopError,
@@ -165,7 +160,6 @@ fn map_device_id(id: u16) -> Option<crate::io::device::DeviceId> {
         _ => None,
     }
 }
-// RING3-MIGRATION-REFERENCE END: devmgrd-owned device broker policy.
 fn map_device_access(access: u16) -> Option<DeviceAccessKind> {
     match access {
         DEVMGRD_DEVICE_ACCESS_NATIVE => Some(DeviceAccessKind::Native),

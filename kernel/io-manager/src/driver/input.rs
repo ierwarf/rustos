@@ -1,5 +1,6 @@
-// RING3-MIGRATION-REFERENCE START: inputd should own pointer delivery policy.
-// Ring0 keeps driver callback ingress into the bounded input queue.
+// RING3-MIGRATION-REFERENCE START: input-ingress exception: inputd owns pointer
+// delivery policy. Ring0 keeps driver callback ingress into the bounded input
+// queue.
 #[cfg(not(test))]
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::Ordering;
@@ -17,6 +18,18 @@ pub(crate) fn submit_pointer_packet(packet: PointerPacket) -> bool {
         log_pointer_delivery_once("relative");
     }
     submitted
+}
+
+pub(crate) fn submit_ps2_mouse_byte(byte: u8) -> bool {
+    let submitted = crate::input::event_queue::submit_ps2_mouse_byte(byte);
+    if submitted {
+        log_pointer_delivery_once("ps2-byte");
+    }
+    submitted
+}
+
+pub(crate) fn submit_ps2_mouse_reset() -> bool {
+    crate::input::event_queue::submit_ps2_mouse_reset()
 }
 
 fn log_pointer_delivery_once(kind: &'static str) {
@@ -73,4 +86,4 @@ mod tests {
         assert_eq!(ingress[0].pointer_packet.dy, -3);
     }
 }
-// RING3-MIGRATION-REFERENCE END: inputd-owned pointer delivery policy.
+// RING3-MIGRATION-REFERENCE END: inputd-owned pointer delivery ingress exception.

@@ -1,6 +1,7 @@
-// RING3-MIGRATION-REFERENCE START: rootd/vfsd/storaged should own post-bootstrap
-// root extent policy and normal runtime boot-volume file access. Ring0 keeps
-// early bootstrap file reads and physical boot-volume substrate.
+// RING3-MIGRATION-REFERENCE START: bootstrap exception: vfsd/storaged own
+// post-bootstrap root extent leases and normal runtime boot-volume policy.
+// Ring0 keeps boot info, early bootstrap FAT reads, and physical boot-volume
+// fallback substrate until vfsd/storaged can serve the root filesystem.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use alloc::boxed::Box;
@@ -875,4 +876,4 @@ fn boot_info() -> Option<&'static BootInfo> {
     let boot_info_ptr = BOOT_INFO_PTR.load(Ordering::Acquire);
     unsafe { BootInfo::from_ptr(boot_info_ptr.cast_const()) }.ok()
 }
-// RING3-MIGRATION-REFERENCE END: rootd/vfsd/storaged-owned root extent and boot file policy.
+// RING3-MIGRATION-REFERENCE END: vfsd/storaged-owned boot-volume policy bootstrap exception.

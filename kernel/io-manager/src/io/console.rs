@@ -1,6 +1,6 @@
-// RING3-MIGRATION-REFERENCE START: sessiond/runtimed should own console buffer
-// routing and presentation policy. Ring0 keeps bootstrap/system console
-// substrate.
+// RING3-MIGRATION-REFERENCE START: bootstrap exception: sessiond/runtimed own
+// console routing and presentation policy. Ring0 keeps bootstrap/system
+// console buffer substrate only.
 use nucleus_core::util::ring::RingBuffer;
 
 use crate::sync::KernelWaitLock;
@@ -28,4 +28,4 @@ impl ConsoleState {
         }
     }
 }
-// RING3-MIGRATION-REFERENCE END: sessiond/runtimed-owned console policy.
+// RING3-MIGRATION-REFERENCE END: sessiond/runtimed-owned console bootstrap substrate.

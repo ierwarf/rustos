@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use keyboard_core::{KeyAction, KeyboardDriver, ScanCodeSet};
 use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, InputHidKeyboardReportWire,
@@ -20,15 +21,17 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_INPUTD, INPUTD_ACCESS_EVDEV,
     INPUTD_ACCESS_NATIVE, INPUTD_HID_POLICY_DESCRIPTOR_CAPACITY, INPUTD_HID_POLICY_KIND_KEYBOARD,
     INPUTD_HID_POLICY_KIND_POINTER, INPUTD_HID_POLICY_KIND_UNKNOWN,
-    INPUTD_HID_POLICY_REPORT_CAPACITY, INPUTD_INGEST_MAX_EVENTS, INPUTD_INGRESS_KIND_EVENT,
-    INPUTD_INGRESS_KIND_HID_KEYBOARD_REPORT, INPUTD_INGRESS_KIND_HID_POINTER_REPORT,
-    INPUTD_INGRESS_KIND_HID_RAW_REPORT, INPUTD_INGRESS_KIND_KEYBOARD,
-    INPUTD_INGRESS_KIND_POINTER_ABSOLUTE, INPUTD_INGRESS_KIND_POINTER_PACKET,
-    INPUTD_IPC_ABI_VERSION, INPUTD_IPC_OP_AUTHORIZE_READ, INPUTD_IPC_OP_DRAIN_INGEST,
-    INPUTD_IPC_OP_PING, INPUTD_IPC_OP_READ, INPUTD_IPC_OP_STATS, INPUTD_READ_FLAG_NONBLOCK,
-    INPUTD_READ_PAYLOAD_CAPACITY, IPC_MAX_INLINE_BYTES, IPC_SERVICE_INPUTD, SYS_RUSTOS_DEBUG_PRINT,
-    SYS_RUSTOS_INPUT_INGEST_BROKER, SYS_RUSTOS_INPUT_STATS_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
-    SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
+    INPUTD_HID_POLICY_REPORT_CAPACITY, INPUTD_INGEST_MAX_EVENTS, INPUTD_INGRESS_FLAG_RESET_STATE,
+    INPUTD_INGRESS_KIND_EVENT, INPUTD_INGRESS_KIND_HID_KEYBOARD_REPORT,
+    INPUTD_INGRESS_KIND_HID_POINTER_REPORT, INPUTD_INGRESS_KIND_HID_RAW_REPORT,
+    INPUTD_INGRESS_KIND_KEYBOARD, INPUTD_INGRESS_KIND_POINTER_ABSOLUTE,
+    INPUTD_INGRESS_KIND_POINTER_PACKET, INPUTD_INGRESS_KIND_PS2_MOUSE_BYTE,
+    INPUTD_INGRESS_KIND_PS2_SCANCODE, INPUTD_IPC_ABI_VERSION, INPUTD_IPC_OP_AUTHORIZE_READ,
+    INPUTD_IPC_OP_DRAIN_INGEST, INPUTD_IPC_OP_PING, INPUTD_IPC_OP_READ, INPUTD_IPC_OP_STATS,
+    INPUTD_READ_FLAG_NONBLOCK, INPUTD_READ_PAYLOAD_CAPACITY, IPC_MAX_INLINE_BYTES,
+    IPC_SERVICE_INPUTD, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_INPUT_INGEST_BROKER,
+    SYS_RUSTOS_INPUT_STATS_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV,
+    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
 };
 
 const RECV_BACKOFF: Duration = Duration::from_millis(50);
@@ -37,6 +40,12 @@ const INPUTD_MAX_NATIVE_READ_BYTES: u64 = input_evdev::MAX_NATIVE_READ_BYTES as 
 const INPUTD_MAX_EVDEV_READ_BYTES: u64 = input_evdev::MAX_EVDEV_READ_BYTES as u64;
 const DEFAULT_POINTER_WIDTH: i32 = 1600;
 const DEFAULT_POINTER_HEIGHT: i32 = 900;
+const PS2_MOUSE_STATUS_LEFT: u8 = 1 << 0;
+const PS2_MOUSE_STATUS_RIGHT: u8 = 1 << 1;
+const PS2_MOUSE_STATUS_MIDDLE: u8 = 1 << 2;
+const PS2_MOUSE_STATUS_ALWAYS_ONE: u8 = 1 << 3;
+const PS2_MOUSE_STATUS_X_OVERFLOW: u8 = 1 << 6;
+const PS2_MOUSE_STATUS_Y_OVERFLOW: u8 = 1 << 7;
 static INPUT_DELIVERY_LOGGED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Default)]
@@ -51,8 +60,16 @@ struct HidKeyboardState {
 struct InputQueue {
     events: VecDeque<input_evdev::InputEvent>,
     hid_keyboards: Vec<HidKeyboardState>,
+    ps2_keyboard: KeyboardDriver,
+    ps2_mouse: Ps2MousePacketState,
     dropped_lossy: u64,
     pointer_buttons: u8,
+}
+
+#[derive(Default)]
+struct Ps2MousePacketState {
+    bytes: [u8; 3],
+    len: usize,
 }
 
 impl InputQueue {
@@ -92,6 +109,78 @@ impl InputQueue {
             modifiers: event.modifiers,
             text: event.text,
         });
+    }
+
+    fn push_ps2_scancode(&mut self, scancode: u8, translated: bool) {
+        let scan_set = if translated {
+            ScanCodeSet::Set1
+        } else {
+            ScanCodeSet::Set2
+        };
+        self.ps2_keyboard.set_scan_code_set(scan_set);
+        self.ps2_keyboard.feed_scancode(scancode);
+        while let Some(event) = self.ps2_keyboard.pop_event() {
+            self.push(input_evdev::InputEvent {
+                kind: input_evdev::INPUT_KIND_KEYBOARD,
+                action: keyboard_action_to_inputd(event.action),
+                code: event.code as u32,
+                value0: 0,
+                value1: 0,
+                modifiers: event.modifiers.bits() as u32,
+                text: event.text.unwrap_or(0) as u32,
+            });
+        }
+    }
+
+    fn push_ps2_mouse_byte(&mut self, byte: u8) {
+        let packet = match self.ps2_mouse.len {
+            0 => {
+                if byte & PS2_MOUSE_STATUS_ALWAYS_ONE == 0 {
+                    return;
+                }
+                self.ps2_mouse.bytes[0] = byte;
+                self.ps2_mouse.len = 1;
+                return;
+            }
+            1 => {
+                self.ps2_mouse.bytes[1] = byte;
+                self.ps2_mouse.len = 2;
+                return;
+            }
+            _ => {
+                self.ps2_mouse.bytes[2] = byte;
+                self.ps2_mouse.len = 0;
+                self.ps2_mouse.bytes
+            }
+        };
+
+        if packet[0] & (PS2_MOUSE_STATUS_X_OVERFLOW | PS2_MOUSE_STATUS_Y_OVERFLOW) != 0 {
+            return;
+        }
+
+        let mut buttons = 0u8;
+        if packet[0] & PS2_MOUSE_STATUS_LEFT != 0 {
+            buttons |= input_evdev::POINTER_BUTTON_LEFT as u8;
+        }
+        if packet[0] & PS2_MOUSE_STATUS_RIGHT != 0 {
+            buttons |= input_evdev::POINTER_BUTTON_RIGHT as u8;
+        }
+        if packet[0] & PS2_MOUSE_STATUS_MIDDLE != 0 {
+            buttons |= input_evdev::POINTER_BUTTON_MIDDLE as u8;
+        }
+
+        self.push_pointer_packet(InputPointerPacketWire {
+            buttons,
+            reserved0: [0; 3],
+            dx: i16::from(packet[1] as i8),
+            dy: -i16::from(packet[2] as i8),
+            wheel_vertical: 0,
+            wheel_horizontal: 0,
+        });
+    }
+
+    fn reset_ps2_mouse_packet(&mut self) {
+        self.ps2_mouse = Ps2MousePacketState::default();
     }
 
     fn push_pointer_packet(&mut self, packet: InputPointerPacketWire) {
@@ -324,6 +413,14 @@ fn merge_coalesced_event(existing: &mut input_evdev::InputEvent, next: input_evd
     }
     existing.value0 = existing.value0.saturating_add(next.value0);
     existing.value1 = existing.value1.saturating_add(next.value1);
+}
+
+fn keyboard_action_to_inputd(action: KeyAction) -> u16 {
+    match action {
+        KeyAction::Pressed => input_evdev::INPUT_ACTION_PRESSED,
+        KeyAction::Released => input_evdev::INPUT_ACTION_RELEASED,
+        KeyAction::Repeated => input_evdev::INPUT_ACTION_REPEATED,
+    }
 }
 
 fn decode_hid_keyboard_report(
@@ -569,6 +666,40 @@ mod tests {
         assert_eq!(release.kind, input_evdev::INPUT_KIND_POINTER_BUTTON);
         assert_eq!(release.action, input_evdev::INPUT_ACTION_RELEASED);
         assert_eq!(release.code, input_evdev::POINTER_BUTTON_LEFT);
+    }
+
+    #[test]
+    fn inputd_decodes_raw_ps2_mouse_bytes() {
+        let mut queue = InputQueue::default();
+        queue.push_ps2_mouse_byte(0x09);
+        queue.push_ps2_mouse_byte(7);
+        queue.push_ps2_mouse_byte(3_u8.wrapping_neg());
+
+        assert_eq!(queue.len(), 2);
+        let motion = queue.pop_front().unwrap();
+        assert_eq!(motion.kind, input_evdev::INPUT_KIND_POINTER_MOTION);
+        assert_eq!(motion.value0, 7);
+        assert_eq!(motion.value1, 3);
+        let button = queue.pop_front().unwrap();
+        assert_eq!(button.kind, input_evdev::INPUT_KIND_POINTER_BUTTON);
+        assert_eq!(button.action, input_evdev::INPUT_ACTION_PRESSED);
+        assert_eq!(button.code, input_evdev::POINTER_BUTTON_LEFT);
+    }
+
+    #[test]
+    fn inputd_resets_raw_ps2_mouse_packet_state() {
+        let mut queue = InputQueue::default();
+        queue.push_ps2_mouse_byte(0x09);
+        queue.reset_ps2_mouse_packet();
+        queue.push_ps2_mouse_byte(0x08);
+        queue.push_ps2_mouse_byte(4);
+        queue.push_ps2_mouse_byte(0);
+
+        assert_eq!(queue.len(), 1);
+        let motion = queue.pop_front().unwrap();
+        assert_eq!(motion.kind, input_evdev::INPUT_KIND_POINTER_MOTION);
+        assert_eq!(motion.value0, 4);
+        assert_eq!(motion.value1, 0);
     }
 
     #[test]
@@ -828,6 +959,19 @@ fn drain_ingest(queue: &mut InputQueue) -> Result<usize, i32> {
             }
             INPUTD_INGRESS_KIND_KEYBOARD if wire.access == INPUTD_ACCESS_NATIVE => {
                 queue.push_keyboard_event(wire.keyboard);
+            }
+            INPUTD_INGRESS_KIND_PS2_SCANCODE if wire.access == INPUTD_ACCESS_NATIVE => {
+                queue.push_ps2_scancode(
+                    wire.ps2_scancode.scancode,
+                    wire.ps2_scancode.translated != 0,
+                );
+            }
+            INPUTD_INGRESS_KIND_PS2_MOUSE_BYTE if wire.access == INPUTD_ACCESS_NATIVE => {
+                if wire.flags & INPUTD_INGRESS_FLAG_RESET_STATE != 0 {
+                    queue.reset_ps2_mouse_packet();
+                    continue;
+                }
+                queue.push_ps2_mouse_byte(wire.ps2_mouse_byte.byte);
             }
             INPUTD_INGRESS_KIND_POINTER_PACKET if wire.access == INPUTD_ACCESS_NATIVE => {
                 queue.push_pointer_packet(wire.pointer_packet);

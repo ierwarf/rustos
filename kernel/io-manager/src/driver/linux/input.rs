@@ -768,6 +768,13 @@ fn apply_keyboard_event(code: u32, value: i32) {
     let Some(key_code) = crate::input_core::linux_key_code_to_rustos(code) else {
         return;
     };
-    crate::input::keyboard::inject_key_transition(key_code, value == 0);
+    let action = if value == 0 {
+        crate::input_core::INPUT_ACTION_RELEASED
+    } else if value == 2 {
+        crate::input_core::INPUT_ACTION_REPEATED
+    } else {
+        crate::input_core::INPUT_ACTION_PRESSED
+    };
+    let _ = crate::input::event_queue::submit_keyboard_event(action, key_code as u32, 0, 0);
 }
 // RING3-MIGRATION-REFERENCE END: Linux .ko input compatibility substrate exception.

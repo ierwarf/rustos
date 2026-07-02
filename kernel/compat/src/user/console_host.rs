@@ -1,6 +1,6 @@
 // RING3-MIGRATION-REFERENCE START: loaderd/sessiond should own console-host
-// executable discovery and fallback policy. Ring0 keeps only bootstrap-local
-// console image materialization until loaderd can supply it as service metadata.
+// executable discovery and fallback policy. Ring0 keeps this bootstrap-local
+// console image materialization path for fixed pre-loaderd service bootstrap.
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::string::ToString;
@@ -133,8 +133,6 @@ impl ConsoleHostError {
         }
     }
 }
-// RING3-MIGRATION-REFERENCE END: loaderd/sessiond-owned console-host policy.
-
 pub fn spawn_program_in_session(
     session: ConsoleSessionHandle,
     program: ConsoleProgramSpec<'_>,
@@ -304,3 +302,4 @@ fn load_executable_image_path_uncached(
         }
     }
 }
+// RING3-MIGRATION-REFERENCE END: loaderd/sessiond-owned bootstrap console-host substrate exception.

@@ -16,14 +16,15 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_PROTOCOL_SESSIOND, COMMERCIAL_MAX_PROTOCOL_UISERVER,
     COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE, COMMERCIAL_MAX_SESSIOND_OP_FOREGROUND_FOCUS,
     COMMERCIAL_MAX_SESSIOND_OP_SESSION_GRAPH, COMMERCIAL_MAX_UISERVER_OP_DISPLAY_METADATA,
-    COMMERCIAL_MAX_UISERVER_OP_SURFACE_POLICY, DEVMGRD_DEVICE_ACCESS_EVDEV,
-    DEVMGRD_DEVICE_ACCESS_NATIVE, DEVMGRD_DEVICE_ID_CONSOLE, DEVMGRD_DEVICE_ID_DISPLAY,
-    DEVMGRD_DEVICE_ID_INPUT, DEVMGRD_DEVICE_RIGHT_ADMIN, DEVMGRD_DEVICE_RIGHT_IOCTL,
-    DEVMGRD_DEVICE_RIGHT_MAP, DEVMGRD_DEVICE_RIGHT_READ, DEVMGRD_DEVICE_RIGHT_TRANSFER,
-    DEVMGRD_DEVICE_RIGHT_WRITE, DEVMGRD_IPC_ABI_VERSION, DEVMGRD_IPC_OP_IOCTL_AUTHORIZE,
-    DEVMGRD_IPC_OP_LOOKUP, DEVMGRD_IPC_OP_OPEN, DEVMGRD_IPC_OP_READDIR, DEVMGRD_MAX_DIR_ENTRIES,
-    DEVMGRD_NAME_CAPACITY, DEVMGRD_NODE_KIND_DEVICE, DEVMGRD_NODE_KIND_DIR, IPC_MAX_INLINE_BYTES,
-    IPC_SERVICE_DEVMGRD, IPC_SERVICE_SESSIOND, IPC_SERVICE_UISERVER, SYS_RUSTOS_DEBUG_PRINT,
+    COMMERCIAL_MAX_UISERVER_OP_PRESENT_POLICY, COMMERCIAL_MAX_UISERVER_OP_SURFACE_POLICY,
+    DEVMGRD_DEVICE_ACCESS_EVDEV, DEVMGRD_DEVICE_ACCESS_NATIVE, DEVMGRD_DEVICE_ID_CONSOLE,
+    DEVMGRD_DEVICE_ID_DISPLAY, DEVMGRD_DEVICE_ID_INPUT, DEVMGRD_DEVICE_RIGHT_ADMIN,
+    DEVMGRD_DEVICE_RIGHT_IOCTL, DEVMGRD_DEVICE_RIGHT_MAP, DEVMGRD_DEVICE_RIGHT_READ,
+    DEVMGRD_DEVICE_RIGHT_TRANSFER, DEVMGRD_DEVICE_RIGHT_WRITE, DEVMGRD_IPC_ABI_VERSION,
+    DEVMGRD_IPC_OP_IOCTL_AUTHORIZE, DEVMGRD_IPC_OP_LOOKUP, DEVMGRD_IPC_OP_OPEN,
+    DEVMGRD_IPC_OP_READDIR, DEVMGRD_MAX_DIR_ENTRIES, DEVMGRD_NAME_CAPACITY,
+    DEVMGRD_NODE_KIND_DEVICE, DEVMGRD_NODE_KIND_DIR, IPC_MAX_INLINE_BYTES, IPC_SERVICE_DEVMGRD,
+    IPC_SERVICE_SESSIOND, IPC_SERVICE_UISERVER, SYS_RUSTOS_DEBUG_PRINT,
     SYS_RUSTOS_DEVICE_IOCTL_BROKER, SYS_RUSTOS_DEVICE_OPEN_BROKER, SYS_RUSTOS_IPC_CALL,
     SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_RECV,
     SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
@@ -368,7 +369,6 @@ fn authorize_ioctl_request(request: &DevmgrdDeviceIoctlRequest) -> Result<(), i3
         return Err(libc::EINVAL);
     }
     match ioctl_policy_owner(request.request) {
-        Some(IoctlPolicyOwner::Devmgrd) => Ok(()),
         Some(IoctlPolicyOwner::Sessiond(_)) if sessiond_broker_commits_ioctl(request.request) => {
             Ok(())
         }
@@ -460,17 +460,22 @@ fn call_sessiond_ioctl(
 
 #[derive(Clone, Copy)]
 enum IoctlPolicyOwner {
-    Devmgrd,
     Sessiond(u16),
     Uiserver(u16),
 }
 
 fn ioctl_policy_owner(request_number: u64) -> Option<IoctlPolicyOwner> {
     match request_number {
-        rustos_user_abi::device::DISPLAY_IOCTL_GET_INFO
-        | rustos_user_abi::device::DISPLAY_IOCTL_CREATE_SURFACE
-        | rustos_user_abi::device::DISPLAY_IOCTL_PRESENT
-        | rustos_user_abi::device::DISPLAY_IOCTL_PRESENT_RECT => Some(IoctlPolicyOwner::Devmgrd),
+        rustos_user_abi::device::DISPLAY_IOCTL_GET_INFO => Some(IoctlPolicyOwner::Uiserver(
+            COMMERCIAL_MAX_UISERVER_OP_DISPLAY_METADATA,
+        )),
+        rustos_user_abi::device::DISPLAY_IOCTL_CREATE_SURFACE => Some(IoctlPolicyOwner::Uiserver(
+            COMMERCIAL_MAX_UISERVER_OP_SURFACE_POLICY,
+        )),
+        rustos_user_abi::device::DISPLAY_IOCTL_PRESENT
+        | rustos_user_abi::device::DISPLAY_IOCTL_PRESENT_RECT => Some(IoctlPolicyOwner::Uiserver(
+            COMMERCIAL_MAX_UISERVER_OP_PRESENT_POLICY,
+        )),
         rustos_user_abi::console::CONSOLE_IOCTL_GET_STATE
         | rustos_user_abi::console::CONSOLE_IOCTL_SNAPSHOT_SESSIONS => Some(
             IoctlPolicyOwner::Sessiond(COMMERCIAL_MAX_SESSIOND_OP_SESSION_GRAPH),
@@ -488,10 +493,6 @@ fn ioctl_policy_owner(request_number: u64) -> Option<IoctlPolicyOwner> {
         ),
         _ => None,
     }
-}
-
-fn is_policy_owned_ioctl(request_number: u64) -> bool {
-    ioctl_policy_owner(request_number).is_some()
 }
 
 fn authorize_session_ioctl(op: u16, request_number: u64) -> Result<(), i32> {
@@ -605,10 +606,6 @@ fn dispatch_commercial_request(
             Ok(())
         }
         COMMERCIAL_MAX_DEVMGRD_OP_IOCTL_AUTHORIZE => match ioctl_policy_owner(request.arg0) {
-            Some(IoctlPolicyOwner::Devmgrd) => {
-                response.value0 = request.arg0;
-                Ok(())
-            }
             Some(IoctlPolicyOwner::Sessiond(op)) => {
                 response.value0 = request.arg0;
                 response.value1 = op as u64;

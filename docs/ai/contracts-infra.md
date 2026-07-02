@@ -146,6 +146,9 @@ Add new points only at realistic failure boundaries: allocation, block IO, devic
 - Deleted io-manager policy files are not source of truth — do not restore.
 - Linux compat symbols must be explicitly implemented; no broad no-op fallbacks.
 - Vendor NVMe host `.ko` packages stay out of the default profile until block-layer/auth/io_uring compat is explicit; native RustOS NVMe remains the default boot/storage provider.
+- Virtio-gpu is a display `.ko` path (`drivers/bridges/display/vendor/virtio-gpu`);
+  do not reintroduce native `kernel/io-manager/src/driver/virtio_gpu.rs` or
+  count it as a ring3 service-driver migration target.
 - Vendor virtio-net `.ko` stays out of the default profile until post-init worker/IRQ behavior is non-blocking under QEMU; `netd` remains the default network policy owner.
 - Vendor HID core `.ko` stays out of the default profile while USB HID leaf modules are disabled; native RustOS input remains the default boot input provider.
 - Native xHCI is enabled with `RUSTOS_NATIVE_XHCI`; HID interrupt polling additionally requires `RUSTOS_NATIVE_XHCI_HID_POLL`. Keep both gated until they cannot delay display/runtime boot.

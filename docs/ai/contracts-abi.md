@@ -12,6 +12,10 @@ IPC service IDs, broker syscalls, handle transfer, and service routing. For pack
   `cargo xtask ring3-inventory`.
 - `RING3-MIGRATION-REFERENCE` / `RING3-MIGRATION-COMMENTED-OUT` blocks are references for migration, not dormant code to revive. Do not fix breakage by uncommenting them unless the exact lines are the remaining ring0 substrate.
 - For each slice, move policy/state/lifecycle behavior into the owning service, leave only narrow ring0 fd-table/user-copy/page-table/privileged-device substrate, then delete or bypass the reference block.
+- Inventory interpretation: `excluded_exception_loc` is deliberate ring0 or
+  already-ring3 reference surface, `cleanup_debt_loc` is legacy code to retire
+  rather than migrate, and `migration_candidate_loc` is the remaining real
+  ring3 migration candidate set.
 
 ## Boot Initial Task
 
@@ -44,7 +48,7 @@ Endpoints registered via `SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT`, looked up b
 
 Broker authorization checks the caller's registered service capability — **not** its executable path.
 
-Kernel data paths (FD/socket/module/process/storage/input) remain narrow gated broker primitives for privileged DMA/MMIO/IRQ/module-load/user-copy/address-space mutation. Moving drivers to isolated ring-3 domains is **intentionally excluded** for Linux/Windows commercial compat.
+Kernel data paths (FD/socket/module/process/storage/input) remain narrow gated broker primitives for privileged DMA/MMIO/IRQ/module-load/user-copy/address-space mutation. Generic Linux `.ko` execution and compatibility driver domains are **not** moved to ring3. First-party non-`.ko` service-driver candidates are tracked separately by `cargo xtask ring3-inventory` under `service-driver-host`; mark them as explicit ring0 substrate exceptions if the design keeps them in ring0 permanently.
 
 ## Handle Transfer
 
@@ -78,6 +82,9 @@ Kernel data paths (FD/socket/module/process/storage/input) remain narrow gated b
 
 - Linux input reads call `InputdIpcRequest` with `INPUTD_IPC_OP_READ`.
 - inputd drains raw reports via gated `SYS_RUSTOS_INPUT_INGEST_BROKER`, chooses native/evdev bytes, returns bounded `InputdReadResponse` capped at 32 KiB.
+- PS/2 keyboard scancodes and PS/2 mouse bytes are raw ingress. Packet
+  assembly, button edges, motion conversion, and keyboard translation are
+  `inputd` policy, not i8042 ring0 policy.
 - Ring0 performs only current-process user-copy of service-returned bytes.
 - `INPUTD_IPC_OP_AUTHORIZE_READ` + `SYS_RUSTOS_INPUT_STATS_BROKER` remain compat/observability surfaces while remaining event queue is evacuated.
 
@@ -95,6 +102,15 @@ Kernel data paths (FD/socket/module/process/storage/input) remain narrow gated b
 - Provider-group active state, fallback ordering, virtio display preferred scanout = **driverd state, not a ring0 broker**.
 - xHCI uses the native RustOS host-controller path, gated by `RUSTOS_NATIVE_XHCI` until descriptor enumeration cannot delay display/runtime boot. Linux USB host-controller `.ko` bridges stay out of the default profile; keep load/provider/device/input policy in driverd/devmgrd/inputd, not in the native transfer engine.
 - Native xHCI HID polling is separately gated by `RUSTOS_NATIVE_XHCI_HID_POLL` until the post-configuration polling path is non-blocking under QEMU and real hardware.
+- The remaining `service-driver-host` lane is not `.ko` work. It is first-party
+  non-`.ko` native driver debt such as xHCI/legacy input: either implement an
+  explicit ring3 service-driver host with leased privileged resources, or
+  document the lane as a permanent ring0 substrate exception.
+- `SYS_RUSTOS_SERVICE_DRIVER_RESOURCE_BROKER` is the kernel substrate for
+  first-party ring3 service-driver resources. It returns typed MMIO, IRQ, DMA,
+  and IO-port leases, and exposes narrow IO-port read/write ops for leased
+  service-driver hosts; driver/provider policy stays in `driverd` and protocol
+  policy such as PS/2 packet handling stays in `inputd`.
 - Post-bootstrap NVMe may use Linux `.ko` bridge manifests only in storage-dev profiles where the compat surface is explicit. Built-in NVMe remains the boot/storage substrate.
 - Early boot may use legacy kernel registry path until driver-service bootstrap owns display/input/network bring-up.
 
@@ -153,8 +169,10 @@ Kernel keeps only: user-copy, address-space replacement, scheduler mutation, pen
 - `device::DisplayInfo.flags`: `DISPLAY_INFO_FLAG_PRIMARY_PROVIDER` distinguishes a real primary provider from GRUB/firmware framebuffers (default = early console + panic output only).
 - `bootfb` is the only last-resort exception: if exposed as primary, must stay behind hardware/virtio providers and preserve `DISPLAY_INFO_FLAG_BOOT_FRAMEBUFFER`.
 - Driver framebuffer registration carries explicit source flags in `drivers/libs/driver-abi::DisplayFramebufferRegistration`. **Do not infer primary ownership from framebuffer geometry or `display_info()` presence.**
-- Surface present = kernel fast path: copies validated shared-surface contents into active framebuffer + queues virtio-gpu flush for bounded housekeeping. **Do not reintroduce synchronous virtio-gpu command waits into app syscall context** for normal uiserver presents.
-- Native virtio-gpu scanout backing is DMA memory + must be mapped write-combining on CPU side. Latency regressions show as slow `present_ms` in uiserver. **Cache flag is level-specific:** 2 MiB PDEs use PAT bit 12, but split 4 KiB PTEs use the PTE PAT selector bit instead of carrying bit 12 into the physical-address field.
+- Surface present = kernel fast path: copies validated shared-surface contents into active framebuffer + queues provider flush for bounded housekeeping. **Do not reintroduce synchronous virtio-gpu command waits into app syscall context** for normal uiserver presents.
+- Virtio-gpu is a Linux `.ko` display path. Do not reintroduce a native
+  `kernel/io-manager/src/driver/virtio_gpu.rs` fallback or count it as a ring3
+  service-driver target.
 - `uiserver` partial dirty rects should stay split unless merged union is nearly as small as separate areas. Over-coalescing disjoint topbar/taskbar/window updates → large framebuffer copies + delayed input feedback.
 
 ## Scheduler

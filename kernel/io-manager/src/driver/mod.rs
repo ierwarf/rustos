@@ -1,6 +1,7 @@
-// RING3-MIGRATION-REFERENCE START: driverd should own driver/provider policy,
-// alias matching, and service-driver selection. Ring0 keeps Linux .ko loading,
-// DMA/MMIO/IRQ substrate, and narrow broker hooks.
+// RING3-MIGRATION-REFERENCE START: hardware-probe exception: driverd owns
+// driver/provider policy and service-driver selection. Ring0 keeps explicit
+// broker hooks for Linux .ko loading, DMA/MMIO/IRQ substrate, and hardware
+// alias probes over privileged bus state.
 mod bus;
 mod class;
 mod devres;
@@ -12,7 +13,6 @@ mod loader;
 mod module_registry;
 pub mod pci;
 pub mod serio;
-pub mod virtio_gpu;
 
 // Kernel driver role: privileged DMA/MMIO/IRQ substrate and narrow broker hooks.
 // Driver/provider policy belongs in driverd/devmgrd. Driver-domain isolation is
@@ -72,9 +72,9 @@ pub fn load_module_image_from_policy(
     bus: u32,
     image_path: &str,
     linux_driver_names: &str,
-    policy_flags: u64,
-    preferred_width: u32,
-    preferred_height: u32,
+    _policy_flags: u64,
+    _preferred_width: u32,
+    _preferred_height: u32,
 ) -> Result<(), DriverLoadError> {
     if nucleus_core::util::fault_injection::should_fail("driver.module.load") {
         return Err(DriverLoadError::FaultInjected);
@@ -89,16 +89,8 @@ pub fn load_module_image_from_policy(
     let name = leak_policy_text(name)?;
     let image_path = leak_policy_text(image_path)?;
     let linux_driver_names = leak_policy_text(linux_driver_names)?;
-    if class == DriverClass::Display && bus == DriverBus::Virtio {
-        virtio_gpu::apply_load_policy(policy_flags, preferred_width, preferred_height);
-    }
     match loader::load_module_image_explicit(name, class, bus, image_path, linux_driver_names) {
-        Ok(_) => {
-            if class == DriverClass::Display && bus == DriverBus::Virtio {
-                let _ = virtio_gpu::try_enable_primary_display();
-            }
-            Ok(())
-        }
+        Ok(_) => Ok(()),
         Err(_)
             if name == BOOTFB_DRIVER_NAME
                 && class == DriverClass::Display
@@ -123,12 +115,12 @@ pub fn hardware_alias_present(alias: &str, class: u32, bus: u32) -> bool {
     match bus {
         DriverBus::Platform => {
             matches!((class, alias), (DriverClass::Display, BOOTFB_ALIAS))
-                && !virtio_gpu::primary_display_enabled()
+                && !display_primary_provider_active()
                 && crate::storage::boot_volume::boot_framebuffer_info().is_some()
         }
         DriverBus::Pci => pci_alias_present(alias),
         DriverBus::Virtio => {
-            if class == DriverClass::Display && virtio_gpu::primary_display_enabled() {
+            if class == DriverClass::Display && display_primary_provider_active() {
                 return false;
             }
             virtio_alias_present(alias)
@@ -137,6 +129,14 @@ pub fn hardware_alias_present(alias: &str, class: u32, bus: u32) -> bool {
         DriverBus::Serio => serio_alias_present(alias),
         _ => false,
     }
+}
+
+fn display_primary_provider_active() -> bool {
+    crate::io::gui::display_info()
+        .map(|display| {
+            display.flags & crate::user::abi::device::DISPLAY_INFO_FLAG_PRIMARY_PROVIDER != 0
+        })
+        .unwrap_or(false)
 }
 
 fn load_boot_framebuffer_provider() -> Result<(), DriverLoadError> {
@@ -352,4 +352,4 @@ fn parse_fixed_hex(field: &str) -> Option<u32> {
     }
     Some(value)
 }
-// RING3-MIGRATION-REFERENCE END: driverd-owned driver/provider policy.
+// RING3-MIGRATION-REFERENCE END: driverd-owned policy hardware-probe exception.

@@ -1,6 +1,3 @@
-// RING3-MIGRATION-REFERENCE START: syscalld should own cold Linux syscall
-// policy, uname/personality/time/random decisions, and service offload replies.
-// Ring0 keeps user-copy and fallback syscall substrate.
 use super::*;
 
 pub(super) fn syscall_linux_syscalld_uname(buf_ptr: u64) -> u64 {
@@ -175,9 +172,6 @@ pub(super) fn syscall_linux_syscalld_setpgid(target_pid: u64, pgid: u64) -> u64 
 }
 
 pub(super) fn syscall_linux_syscalld_getrandom(user_ptr: u64, user_len: u64, flags: u64) -> u64 {
-    if flags & !(GETRANDOM_FLAG_NONBLOCK | GETRANDOM_FLAG_RANDOM) != 0 {
-        return linux_errno(LINUX_EINVAL);
-    }
     let Ok(len) = usize::try_from(user_len) else {
         return linux_errno(LINUX_EINVAL);
     };
@@ -189,6 +183,7 @@ pub(super) fn syscall_linux_syscalld_getrandom(user_ptr: u64, user_len: u64, fla
         let chunk_len = (len - copied).min(SYSCALL_OFFLOAD_PAYLOAD_CAPACITY);
         let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_GETRANDOM);
         request.flags = chunk_len as u64;
+        request.arg0 = flags;
         let response = match call_syscalld(request) {
             Ok(response) => response,
             Err(errno) => return linux_errno(errno),
@@ -393,4 +388,3 @@ pub(super) fn read_unaligned<T: Copy>(bytes: &[u8]) -> T {
     assert!(bytes.len() >= size_of::<T>());
     unsafe { bytes.as_ptr().cast::<T>().read_unaligned() }
 }
-// RING3-MIGRATION-REFERENCE END: syscalld-owned Linux syscall policy.

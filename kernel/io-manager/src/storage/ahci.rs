@@ -1,8 +1,8 @@
-// RING3-MIGRATION-REFERENCE START: storaged/driverd should own the non-.ko AHCI
-// service-driver once a ring3 service-driver host can perform boot-volume block
-// I/O through leased MMIO/DMA/IRQ resources before rootd/vfsd need storage.
-// Ring0 keeps this built-in AHCI path as early-boot/fallback privileged
-// transport substrate until that host exists.
+// RING3-MIGRATION-REFERENCE START: bootstrap exception: storaged/driverd own
+// post-bootstrap AHCI admission/provider policy. Ring0 keeps this built-in
+// AHCI path as early-boot/fallback privileged transport substrate until a
+// ring3 service-driver host can perform boot-volume reads before rootd/vfsd
+// need storage.
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -584,4 +584,4 @@ fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
     }
     false
 }
-// RING3-MIGRATION-REFERENCE END: storaged/driverd-owned non-.ko AHCI service-driver.
+// RING3-MIGRATION-REFERENCE END: storaged/driverd-owned AHCI bootstrap transport exception.

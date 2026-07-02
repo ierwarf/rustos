@@ -61,6 +61,9 @@ are enforced by `cargo xtask check`.
   requires them. This includes syscall entry/trap handling, gated syscall
   brokers, address-space mutation, scheduler state, user-copy operations,
   IRQ/MMIO/DMA/IOMMU access, and kernel-address-space `.ko` module execution.
+- For ring0/ring3 audits, use `cargo xtask ring3-inventory`: true remaining
+  migration is `migration_candidate_loc`; `cleanup_debt_loc` is code to retire
+  rather than migrate; `.ko` execution is a ring0 compatibility substrate.
 - Kernel-internal crate dependencies must not flow from lower layers back into
   higher layers. `cargo xtask check` validates these relationships.
 - `libs/` may depend only on boot protocol crates and other `libs/` crates.
@@ -171,6 +174,10 @@ source directories.
   여기에는 syscall entry/trap 처리, gated syscall broker, address-space
   mutation, scheduler state, user-copy, IRQ/MMIO/DMA/IOMMU 접근,
   kernel-address-space `.ko` module 실행이 포함됩니다.
+- ring0/ring3 audit는 `cargo xtask ring3-inventory`를 기준으로 합니다.
+  실제 남은 migration은 `migration_candidate_loc`, migration이 아니라
+  제거할 코드는 `cleanup_debt_loc`, `.ko` 실행은 ring0 compatibility
+  substrate입니다.
 - kernel 내부 crate dependency는 낮은 계층에서 높은 계층으로 역류하면
   안 됩니다. `cargo xtask check`가 이 관계를 검사합니다.
 - `libs/`는 boot protocol crate와 다른 `libs/` crate에만 의존할 수

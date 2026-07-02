@@ -1,5 +1,5 @@
-// RING3-MIGRATION-REFERENCE START: syscalld/loaderd should own Win32 syscall API
-// policy. Ring0 keeps syscall number decode substrate.
+// RING3-MIGRATION-REFERENCE START: decode exception: syscalld/loaderd own Win32
+// syscall policy. Ring0 keeps syscall number decode substrate.
 const SYSCALL_BASE: u64 = 0x1000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,4 +56,4 @@ impl Api {
         }
     }
 }
-// RING3-MIGRATION-REFERENCE END: syscalld/loaderd-owned Win32 syscall API policy.
+// RING3-MIGRATION-REFERENCE END: syscalld/loaderd-owned Win32 syscall decode exception.

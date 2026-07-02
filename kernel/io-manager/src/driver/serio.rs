@@ -1,35 +1,18 @@
-// RING3-MIGRATION-REFERENCE START: inputd/driverd should own the non-.ko serio
-// service-driver once a ring3 service-driver host can drive the PS/2 serio bus
-// through narrow command/IRQ leases. Ring0 keeps the current serio bus as
-// privileged input substrate until that host exists.
-use alloc::boxed::Box;
+// RING3-MIGRATION-REFERENCE START: Linux .ko serio compatibility bus
+// substrate exception. Native non-.ko serio driver registration has been
+// removed; ring0 keeps only compat port/driver callback dispatch.
 use alloc::vec::Vec;
 use core::ffi::c_void;
-use core::slice;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::sync::KernelSpinLock as Mutex;
-use driver_abi::{SERIO_ANY, SerioDeviceId, SerioDriverRegistration, SerioPortInfo};
+use driver_abi::{SERIO_ANY, SerioDeviceId, SerioPortInfo};
 use x86_64::instructions::interrupts;
 
 use super::linux::compat::{
     LinuxCompatSerio, LinuxCompatSerioCloseFn, LinuxCompatSerioDeviceId, LinuxCompatSerioDriver,
     LinuxCompatSerioOpenFn, LinuxCompatSerioWriteFn, compat_cstr,
 };
-
-#[derive(Clone, Copy, Default)]
-pub(crate) struct SerioPortOps {
-    pub(crate) open: Option<fn() -> i32>,
-    pub(crate) close: Option<fn()>,
-    pub(crate) write_byte: Option<fn(u8) -> i32>,
-    pub(crate) ps2_command: Option<fn(u8, &[u8], &mut [u8]) -> i32>,
-    pub(crate) drain: Option<fn(max_bytes: usize, timeout_ms: u32)>,
-}
-
-#[derive(Clone, Copy)]
-struct RegisteredSerioDriver {
-    registration: SerioDriverRegistration,
-}
 
 #[derive(Clone, Copy)]
 pub(crate) struct RegisteredLinuxSerioDriver {
@@ -40,32 +23,18 @@ unsafe impl Send for RegisteredLinuxSerioDriver {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BoundSerioDriver {
-    Native(usize),
     Linux(usize),
 }
 
-enum LinuxPortStorage {
-    Owned(Box<LinuxCompatSerio>),
-    Borrowed(*mut LinuxCompatSerio),
-}
+struct LinuxPortStorage(*mut LinuxCompatSerio);
 
 impl LinuxPortStorage {
     fn as_ptr(&self) -> *mut LinuxCompatSerio {
-        match self {
-            Self::Owned(port) => port.as_ref() as *const _ as *mut _,
-            Self::Borrowed(ptr) => *ptr,
-        }
+        self.0
     }
 
     unsafe fn as_mut(&mut self) -> &mut LinuxCompatSerio {
         unsafe { &mut *self.as_ptr() }
-    }
-
-    fn into_parts(self) -> (*mut LinuxCompatSerio, Option<Box<LinuxCompatSerio>>) {
-        match self {
-            Self::Owned(port) => (port.as_ref() as *const _ as *mut _, Some(port)),
-            Self::Borrowed(ptr) => (ptr, None),
-        }
     }
 }
 
@@ -75,12 +44,10 @@ struct RegisteredSerioPort {
     info: SerioPortInfo,
     linux_port: LinuxPortStorage,
     bound_driver: Option<BoundSerioDriver>,
-    ops: SerioPortOps,
     drvdata: usize,
     opened: bool,
 }
 
-static SERIO_DRIVERS: Mutex<Vec<RegisteredSerioDriver>> = Mutex::new(Vec::new());
 static LINUX_SERIO_DRIVERS: Mutex<Vec<RegisteredLinuxSerioDriver>> = Mutex::new(Vec::new());
 static SERIO_PORTS: Mutex<Vec<RegisteredSerioPort>> = Mutex::new(Vec::new());
 static SERIO_RESCAN_PENDING: AtomicBool = AtomicBool::new(false);
@@ -100,36 +67,6 @@ pub(crate) fn service_pending() -> usize {
     } else {
         0
     }
-}
-
-pub(crate) unsafe extern "C" fn register_driver(driver: *const SerioDriverRegistration) -> i32 {
-    if driver.is_null() {
-        return -22;
-    }
-
-    let driver = unsafe { *driver };
-    if driver.abi_version != driver_abi::DRIVER_MODULE_ABI_VERSION {
-        return -22;
-    }
-    if driver.struct_size != core::mem::size_of::<SerioDriverRegistration>() as u32 {
-        return -22;
-    }
-
-    {
-        let mut drivers = SERIO_DRIVERS.lock();
-        if drivers
-            .iter()
-            .any(|entry| entry.registration.name == driver.name)
-        {
-            return 0;
-        }
-        drivers.push(RegisteredSerioDriver {
-            registration: driver,
-        });
-    }
-
-    request_bind_rescan();
-    0
 }
 
 pub(crate) unsafe extern "C" fn register_linux_driver(driver: *mut LinuxCompatSerioDriver) -> i32 {
@@ -262,43 +199,8 @@ pub(crate) unsafe extern "C" fn unregister_linux_driver(driver: *mut LinuxCompat
     }
 }
 
-pub(crate) fn has_native_drivers() -> bool {
-    irq_safe(|| !SERIO_DRIVERS.lock().is_empty())
-}
-
 pub(crate) fn ports_available() -> bool {
     irq_safe(|| !SERIO_PORTS.lock().is_empty())
-}
-
-pub(crate) fn register_port_with_ops(info: SerioPortInfo, ops: SerioPortOps) {
-    irq_safe(|| {
-        let mut ports = SERIO_PORTS.lock();
-        if let Some(existing) = ports
-            .iter_mut()
-            .find(|port| port.info.port_id == info.port_id)
-        {
-            existing.info = info;
-            existing.bound_driver = None;
-            existing.ops = ops;
-            existing.drvdata = 0;
-            existing.opened = false;
-            sync_linux_port(existing);
-        } else {
-            let linux_port = Box::new(LinuxCompatSerio::from_port_info(info));
-            ports.push(RegisteredSerioPort {
-                info,
-                linux_port: LinuxPortStorage::Owned(linux_port),
-                bound_driver: None,
-                ops,
-                drvdata: 0,
-                opened: false,
-            });
-            let entry = ports.last_mut().expect("registered serio port");
-            sync_linux_port(entry);
-        }
-    });
-
-    request_bind_rescan();
 }
 
 pub(crate) unsafe fn register_linux_port(
@@ -316,18 +218,16 @@ pub(crate) unsafe fn register_linux_port(
             .find(|port| port.info.port_id == info.port_id)
         {
             existing.info = info;
-            existing.linux_port = LinuxPortStorage::Borrowed(linux_port);
+            existing.linux_port = LinuxPortStorage(linux_port);
             existing.bound_driver = None;
-            existing.ops = SerioPortOps::default();
             existing.drvdata = unsafe { (*linux_port).dev.driver_data as usize };
             existing.opened = false;
             sync_linux_port(existing);
         } else {
             ports.push(RegisteredSerioPort {
                 info,
-                linux_port: LinuxPortStorage::Borrowed(linux_port),
+                linux_port: LinuxPortStorage(linux_port),
                 bound_driver: None,
-                ops: SerioPortOps::default(),
                 drvdata: unsafe { (*linux_port).dev.driver_data as usize },
                 opened: false,
             });
@@ -360,42 +260,28 @@ pub(crate) fn update_port_info(port_id: u32, proto: u32, id: u32, extra: u32) ->
 
 pub(crate) fn unregister_port(port_id: u32) -> i32 {
     enum DisconnectSnapshot {
-        Native(
-            SerioPortInfo,
-            Option<unsafe extern "C" fn(*const SerioPortInfo)>,
-        ),
         Linux {
             port: *mut LinuxCompatSerio,
             disconnect: Option<unsafe extern "C" fn(*mut LinuxCompatSerio)>,
-            owned_port: Option<Box<LinuxCompatSerio>>,
         },
         None,
     }
 
     let snapshot = irq_safe(|| {
         let mut ports = SERIO_PORTS.lock();
-        let native_drivers = SERIO_DRIVERS.lock();
         let linux_drivers = LINUX_SERIO_DRIVERS.lock();
         let Some(index) = ports.iter().position(|port| port.info.port_id == port_id) else {
             return None;
         };
         let port = ports.remove(index);
         Some(match port.bound_driver {
-            Some(BoundSerioDriver::Native(driver_index)) => {
-                let disconnect = native_drivers
-                    .get(driver_index)
-                    .and_then(|driver| driver.registration.disconnect);
-                DisconnectSnapshot::Native(port.info, disconnect)
-            }
             Some(BoundSerioDriver::Linux(driver_index)) => {
                 let disconnect = linux_drivers
                     .get(driver_index)
                     .and_then(|driver| unsafe { (*driver.driver_ptr).disconnect });
-                let (linux_port, owned_port) = port.linux_port.into_parts();
                 DisconnectSnapshot::Linux {
-                    port: linux_port,
+                    port: port.linux_port.as_ptr(),
                     disconnect,
-                    owned_port,
                 }
             }
             None => DisconnectSnapshot::None,
@@ -406,19 +292,14 @@ pub(crate) fn unregister_port(port_id: u32) -> i32 {
     };
 
     match snapshot {
-        DisconnectSnapshot::Native(port, Some(disconnect)) => unsafe {
-            disconnect(&port);
-        },
         DisconnectSnapshot::Linux {
             port,
             disconnect: Some(disconnect),
-            owned_port,
         } => unsafe {
             disconnect(port);
-            drop(owned_port);
         },
-        DisconnectSnapshot::Linux { owned_port, .. } => drop(owned_port),
-        DisconnectSnapshot::Native(_, None) | DisconnectSnapshot::None => {}
+        DisconnectSnapshot::Linux { .. } => {}
+        DisconnectSnapshot::None => {}
     }
 
     0
@@ -426,7 +307,6 @@ pub(crate) fn unregister_port(port_id: u32) -> i32 {
 
 pub(crate) fn open(port_id: u32) -> i32 {
     enum OpenSnapshot {
-        Native(fn() -> i32),
         Linux(*mut LinuxCompatSerio, LinuxCompatSerioOpenFn),
         None,
     }
@@ -446,33 +326,17 @@ pub(crate) fn open(port_id: u32) -> i32 {
             return OpenPrepare::AlreadyOpen;
         }
         port.opened = true;
-        if let Some(open) = port.ops.open {
-            OpenPrepare::Snapshot(OpenSnapshot::Native(open))
-        } else {
-            match linux_port_open_callback(port.linux_port.as_ptr()) {
-                Some(open) => {
-                    OpenPrepare::Snapshot(OpenSnapshot::Linux(port.linux_port.as_ptr(), open))
-                }
-                None => OpenPrepare::Snapshot(OpenSnapshot::None),
+        match linux_port_open_callback(port.linux_port.as_ptr()) {
+            Some(open) => {
+                OpenPrepare::Snapshot(OpenSnapshot::Linux(port.linux_port.as_ptr(), open))
             }
+            None => OpenPrepare::Snapshot(OpenSnapshot::None),
         }
     });
 
     match open_snapshot {
         OpenPrepare::Missing => -19,
         OpenPrepare::AlreadyOpen => 0,
-        OpenPrepare::Snapshot(OpenSnapshot::Native(open)) => {
-            let status = open();
-            if status != 0 {
-                irq_safe(|| {
-                    let mut ports = SERIO_PORTS.lock();
-                    if let Some(port) = ports.iter_mut().find(|port| port.info.port_id == port_id) {
-                        port.opened = false;
-                    }
-                });
-            }
-            status
-        }
         OpenPrepare::Snapshot(OpenSnapshot::Linux(port, open)) => {
             let status = unsafe { open(port) };
             if status != 0 {
@@ -491,7 +355,6 @@ pub(crate) fn open(port_id: u32) -> i32 {
 
 pub(crate) fn close(port_id: u32) {
     enum CloseSnapshot {
-        Native(fn()),
         Linux(*mut LinuxCompatSerio, LinuxCompatSerioCloseFn),
         None,
     }
@@ -510,21 +373,16 @@ pub(crate) fn close(port_id: u32) {
             return ClosePrepare::Skip;
         }
         port.opened = false;
-        if let Some(close) = port.ops.close {
-            ClosePrepare::Snapshot(CloseSnapshot::Native(close))
-        } else {
-            match linux_port_close_callback(port.linux_port.as_ptr()) {
-                Some(close) => {
-                    ClosePrepare::Snapshot(CloseSnapshot::Linux(port.linux_port.as_ptr(), close))
-                }
-                None => ClosePrepare::Snapshot(CloseSnapshot::None),
+        match linux_port_close_callback(port.linux_port.as_ptr()) {
+            Some(close) => {
+                ClosePrepare::Snapshot(CloseSnapshot::Linux(port.linux_port.as_ptr(), close))
             }
+            None => ClosePrepare::Snapshot(CloseSnapshot::None),
         }
     });
 
     match close_snapshot {
         ClosePrepare::Skip => {}
-        ClosePrepare::Snapshot(CloseSnapshot::Native(close)) => close(),
         ClosePrepare::Snapshot(CloseSnapshot::Linux(port, close)) => unsafe { close(port) },
         ClosePrepare::Snapshot(CloseSnapshot::None) => {}
     }
@@ -577,11 +435,11 @@ pub(crate) fn rescan(port_id: u32) -> i32 {
 
 pub(crate) fn reconnect(port_id: u32) -> i32 {
     enum ReconnectSnapshot {
-        Native,
         Linux(
             *mut LinuxCompatSerio,
             Option<unsafe extern "C" fn(*mut LinuxCompatSerio) -> i32>,
         ),
+        Rescan,
     }
 
     let snapshot = irq_safe(|| {
@@ -591,7 +449,6 @@ pub(crate) fn reconnect(port_id: u32) -> i32 {
             return None;
         };
         Some(match port.bound_driver {
-            Some(BoundSerioDriver::Native(_)) => ReconnectSnapshot::Native,
             Some(BoundSerioDriver::Linux(index)) => {
                 let Some(driver) = linux_drivers.get(index) else {
                     return None;
@@ -599,7 +456,7 @@ pub(crate) fn reconnect(port_id: u32) -> i32 {
                 let reconnect = unsafe { (*driver.driver_ptr).reconnect };
                 ReconnectSnapshot::Linux(port.linux_port.as_ptr(), reconnect)
             }
-            None => ReconnectSnapshot::Native,
+            None => ReconnectSnapshot::Rescan,
         })
     });
     let Some(snapshot) = snapshot else {
@@ -607,18 +464,14 @@ pub(crate) fn reconnect(port_id: u32) -> i32 {
     };
 
     match snapshot {
-        ReconnectSnapshot::Native => rescan(port_id),
         ReconnectSnapshot::Linux(port, Some(reconnect)) => unsafe { reconnect(port) },
         ReconnectSnapshot::Linux(_, None) => 0,
+        ReconnectSnapshot::Rescan => rescan(port_id),
     }
 }
 
 pub(crate) fn receive_byte(port_id: u32, byte: u8, flags: u32) -> bool {
     enum InterruptSnapshot {
-        Native(
-            SerioPortInfo,
-            unsafe extern "C" fn(*const SerioPortInfo, u8, u32) -> i32,
-        ),
         Linux(
             *mut LinuxCompatSerio,
             unsafe extern "C" fn(*mut LinuxCompatSerio, u8, u32) -> i32,
@@ -627,7 +480,6 @@ pub(crate) fn receive_byte(port_id: u32, byte: u8, flags: u32) -> bool {
 
     let snapshot = irq_safe(|| {
         let ports = SERIO_PORTS.lock();
-        let native_drivers = SERIO_DRIVERS.lock();
         let linux_drivers = LINUX_SERIO_DRIVERS.lock();
         let Some(port) = ports.iter().find(|port| port.info.port_id == port_id) else {
             return None;
@@ -636,15 +488,6 @@ pub(crate) fn receive_byte(port_id: u32, byte: u8, flags: u32) -> bool {
             return None;
         }
         Some(match port.bound_driver {
-            Some(BoundSerioDriver::Native(index)) => {
-                let Some(driver) = native_drivers.get(index) else {
-                    return None;
-                };
-                let Some(interrupt) = driver.registration.interrupt else {
-                    return None;
-                };
-                InterruptSnapshot::Native(port.info, interrupt)
-            }
             Some(BoundSerioDriver::Linux(index)) => {
                 let Some(driver) = linux_drivers.get(index) else {
                     return None;
@@ -662,7 +505,6 @@ pub(crate) fn receive_byte(port_id: u32, byte: u8, flags: u32) -> bool {
     };
 
     match snapshot {
-        InterruptSnapshot::Native(port, interrupt) => unsafe { interrupt(&port, byte, flags) == 0 },
         InterruptSnapshot::Linux(port, interrupt) => unsafe { interrupt(port, byte, flags) != 0 },
     }
 }
@@ -676,56 +518,37 @@ pub(crate) fn interrupt(port_id: u32, byte: u8, flags: u32) -> i32 {
 }
 
 pub(crate) fn write(port_id: u32, byte: u8) -> i32 {
-    enum WriteSnapshot {
-        Native(fn(u8) -> i32),
-        Linux(*mut LinuxCompatSerio, LinuxCompatSerioWriteFn),
-    }
-
     let write_snapshot = irq_safe(|| {
         let ports = SERIO_PORTS.lock();
         let Some(port) = ports.iter().find(|port| port.info.port_id == port_id) else {
             return Err(-19);
         };
-        if let Some(write_byte) = port.ops.write_byte {
-            Ok(WriteSnapshot::Native(write_byte))
-        } else {
-            let Some(write_byte) = linux_port_write_callback(port.linux_port.as_ptr()) else {
-                return Err(-38);
-            };
-            Ok(WriteSnapshot::Linux(port.linux_port.as_ptr(), write_byte))
-        }
+        let Some(write_byte) = linux_port_write_callback(port.linux_port.as_ptr()) else {
+            return Err(-38);
+        };
+        Ok((port.linux_port.as_ptr(), write_byte))
     });
-    let write_snapshot = match write_snapshot {
+    let (port, write_byte) = match write_snapshot {
         Ok(snapshot) => snapshot,
         Err(status) => return status,
     };
 
-    match write_snapshot {
-        WriteSnapshot::Native(write_byte) => write_byte(byte),
-        WriteSnapshot::Linux(port, write_byte) => unsafe { write_byte(port, byte) },
-    }
+    unsafe { write_byte(port, byte) }
 }
 
-pub(crate) fn drain(port_id: u32, max_bytes: usize, timeout_ms: u32) {
-    let drain_fn = irq_safe(|| {
+pub(crate) fn drain(port_id: u32, _max_bytes: usize, _timeout_ms: u32) {
+    let _exists = irq_safe(|| {
         let ports = SERIO_PORTS.lock();
-        let Some(port) = ports.iter().find(|port| port.info.port_id == port_id) else {
-            return None;
-        };
-        port.ops.drain
+        ports.iter().any(|port| port.info.port_id == port_id)
     });
-
-    if let Some(drain_fn) = drain_fn {
-        drain_fn(max_bytes, timeout_ms);
-    }
 }
 
 pub(crate) unsafe extern "C" fn ps2_command(
     port_id: u32,
     command: u8,
-    data_ptr: *const u8,
+    _data_ptr: *const u8,
     data_len: u32,
-    response_ptr: *mut u8,
+    _response_ptr: *mut u8,
     response_len: u32,
 ) -> i32 {
     crate::debug::println!(
@@ -735,31 +558,14 @@ pub(crate) unsafe extern "C" fn ps2_command(
         data_len,
         response_len
     );
-    let command_fn = irq_safe(|| {
+    let status = irq_safe(|| {
         let ports = SERIO_PORTS.lock();
-        let Some(port) = ports.iter().find(|port| port.info.port_id == port_id) else {
-            return Err(-19);
-        };
-        let Some(command_fn) = port.ops.ps2_command else {
-            return Err(-38);
-        };
-        Ok(command_fn)
+        if ports.iter().any(|port| port.info.port_id == port_id) {
+            -38
+        } else {
+            -19
+        }
     });
-    let command_fn = match command_fn {
-        Ok(command_fn) => command_fn,
-        Err(status) => return status,
-    };
-
-    if data_len != 0 && data_ptr.is_null() {
-        return -22;
-    }
-    if response_len != 0 && response_ptr.is_null() {
-        return -22;
-    }
-
-    let data = unsafe { slice::from_raw_parts(data_ptr, data_len as usize) };
-    let response = unsafe { slice::from_raw_parts_mut(response_ptr, response_len as usize) };
-    let status = command_fn(command, data, response);
     crate::debug::println!(
         "serio ps2_command done: port={} cmd={:#x} status={}",
         port_id,
@@ -813,12 +619,10 @@ fn try_bind_all_ports() {
 }
 
 fn try_bind_port(port_id: u32) {
-    let Some((port_info, linux_port_ptr)) = irq_safe(|| {
+    let Some(linux_port_ptr) = irq_safe(|| {
         let ports = SERIO_PORTS.lock();
         match ports.iter().find(|port| port.info.port_id == port_id) {
-            Some(port) if port.bound_driver.is_none() => {
-                Some((port.info, port.linux_port.as_ptr()))
-            }
+            Some(port) if port.bound_driver.is_none() => Some(port.linux_port.as_ptr()),
             Some(_) => {
                 crate::debug::println!("serio bind: port={} already bound", port_id);
                 None
@@ -831,17 +635,6 @@ fn try_bind_port(port_id: u32) {
     }) else {
         return;
     };
-
-    if has_native_drivers() {
-        if let Some((index, registration)) = first_matching_native_driver(port_id, port_info) {
-            crate::debug::println!(
-                "serio bind snapshot resolved: port={} matched=true",
-                port_id
-            );
-            bind_native_port(port_id, index, registration, port_info);
-            return;
-        }
-    }
 
     crate::debug::println!("serio bind linux probe begin: port={}", port_id);
     if let Some((index, driver_ptr)) =
@@ -872,87 +665,6 @@ fn try_bind_port(port_id: u32) {
                 _port.info.extra
             );
         }
-    });
-}
-
-#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
-fn first_matching_native_driver(
-    port_id: u32,
-    port_info: SerioPortInfo,
-) -> Option<(usize, SerioDriverRegistration)> {
-    crate::debug::println!("serio bind native probe begin: port={}", port_id);
-    let matched = irq_safe(|| {
-        let native_drivers = SERIO_DRIVERS.lock();
-        crate::debug::println!(
-            "serio bind native driver count: port={} count={}",
-            port_id,
-            native_drivers.len()
-        );
-        for (index, driver) in native_drivers.iter().enumerate() {
-            if device_id_matches(driver.registration.id, port_info) {
-                crate::debug::println!(
-                    "serio bind native match hit: port={} idx={}",
-                    port_id,
-                    index
-                );
-                return Some((index, driver.registration));
-            }
-        }
-        None
-    });
-    crate::debug::println!(
-        "serio bind native probe end: port={} matched={}",
-        port_id,
-        matched.is_some()
-    );
-    matched
-}
-
-fn bind_native_port(
-    port_id: u32,
-    index: usize,
-    registration: SerioDriverRegistration,
-    port_info: SerioPortInfo,
-) {
-    crate::debug::println!("serio bind candidate ready(native): port={}", port_id);
-    let binding = BoundSerioDriver::Native(index);
-    if !apply_bound_driver_state(port_id, binding, None) {
-        return;
-    }
-
-    crate::debug::println!(
-        "serio connect begin(native): port={} type={} proto={} driver={}",
-        port_info.port_id,
-        port_info.type_,
-        port_info.proto,
-        registration.name_str().unwrap_or("invalid")
-    );
-    let connect_status = if let Some(connect) = registration.connect {
-        unsafe { connect(&port_info) }
-    } else {
-        0
-    };
-
-    if connect_status != 0 {
-        rollback_bound_driver_state(port_id, binding, connect_status);
-        return;
-    }
-
-    irq_safe(|| {
-        let ports = SERIO_PORTS.lock();
-        let Some(_port) = ports
-            .iter()
-            .find(|entry| entry.info.port_id == port_id && entry.bound_driver == Some(binding))
-        else {
-            return;
-        };
-        crate::debug::println!(
-            "serio bound: port={} type={} proto={} driver={}",
-            _port.info.port_id,
-            _port.info.type_,
-            _port.info.proto,
-            registration.name_str().unwrap_or("invalid")
-        );
     });
 }
 
@@ -1094,4 +806,4 @@ fn device_id_matches(id: SerioDeviceId, port: SerioPortInfo) -> bool {
 fn field_matches(expected: u32, actual: u32) -> bool {
     expected == SERIO_ANY || expected == actual
 }
-// RING3-MIGRATION-REFERENCE END: inputd/driverd-owned non-.ko serio service-driver.
+// RING3-MIGRATION-REFERENCE END: Linux .ko serio compatibility bus substrate exception.

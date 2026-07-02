@@ -1,45 +1,16 @@
-// RING3-MIGRATION-REFERENCE START: inputd should own keyboard layout and key
-// transition policy. Ring0 keeps scancode ingress and bootstrap keyboard
-// substrate.
-use crate::sync::KernelSpinLock as Mutex;
+// RING3-MIGRATION-REFERENCE START: input-ingress exception: inputd owns
+// keyboard layout and key transition policy. Ring0 keeps PS/2 scancode ingress
+// and transport mode state.
+use core::sync::atomic::{AtomicBool, Ordering};
 
-pub use keyboard_core::{KeyAction, KeyCode, KeyboardEvent, Modifiers};
-use keyboard_core::{KeyboardDriver, ScanCodeSet};
-
-static KEYBOARD_DRIVER: Mutex<KeyboardDriver> = Mutex::new(KeyboardDriver::new());
+static KEYBOARD_TRANSLATED: AtomicBool = AtomicBool::new(true);
 
 pub(crate) fn configure_scancode_transport(translated: bool) {
-    let scan_set = if translated {
-        ScanCodeSet::Set1
-    } else {
-        ScanCodeSet::Set2
-    };
-    KEYBOARD_DRIVER.lock().set_scan_code_set(scan_set);
+    KEYBOARD_TRANSLATED.store(translated, Ordering::Release);
 }
 
 pub(crate) fn on_scancode(scancode: u8) {
-    let mut first = true;
-    loop {
-        let maybe_event = {
-            let mut driver = KEYBOARD_DRIVER.lock();
-            if first {
-                driver.feed_scancode(scancode);
-                first = false;
-            }
-            driver.pop_event()
-        };
-        let Some(event) = maybe_event else {
-            break;
-        };
-        crate::input::dispatcher::dispatch_keyboard_event(event);
-    }
+    let translated = KEYBOARD_TRANSLATED.load(Ordering::Acquire);
+    let _ = crate::input::event_queue::submit_ps2_scancode(scancode, translated);
 }
-
-pub(crate) fn inject_key_transition(code: KeyCode, released: bool) {
-    let mut driver = KEYBOARD_DRIVER.lock();
-    driver.inject_key_transition(code, released);
-    while let Some(event) = driver.pop_event() {
-        crate::input::dispatcher::dispatch_keyboard_event(event);
-    }
-}
-// RING3-MIGRATION-REFERENCE END: inputd-owned keyboard policy.
+// RING3-MIGRATION-REFERENCE END: inputd-owned keyboard ingress exception.

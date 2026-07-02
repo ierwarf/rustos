@@ -1,6 +1,3 @@
-// RING3-MIGRATION-REFERENCE START: syscalld/procd should own Linux signal and
-// syscall support policy. Ring0 keeps signal-frame validation and current-task
-// syscall substrate.
 use super::*;
 
 const LINUX_SI_MAX_SIZE: usize = 128;
@@ -91,6 +88,10 @@ struct LinuxRtSigFrame {
     info: LinuxSigInfo,
 }
 
+// RING3-MIGRATION-REFERENCE START: signal-frame-substrate exception: procd owns
+// pending-signal selection and disposition policy. Ring0 keeps rt_sigframe
+// construction, current-thread pending-bit clearing, and final register
+// mutation substrate.
 pub(super) fn deliver_pending_signals_if_needed(frame: &mut SyscallFrame) -> bool {
     let Some(thread_state) = multitask::current_linux_thread_state() else {
         return false;
@@ -138,6 +139,7 @@ pub(super) fn deliver_pending_signals_if_needed(frame: &mut SyscallFrame) -> boo
     }
     false
 }
+// RING3-MIGRATION-REFERENCE END: procd-owned signal-frame substrate exception.
 
 pub(super) fn syscall_linux_rt_sigreturn(frame: &mut SyscallFrame) -> u64 {
     let saved = match read_rt_signal_frame(frame.user_rsp) {
@@ -368,4 +370,3 @@ pub(super) fn syscall_check(frame: &SyscallFrame) -> Result<(), u64> {
 
     Ok(())
 }
-// RING3-MIGRATION-REFERENCE END: syscalld/procd-owned Linux syscall support policy.

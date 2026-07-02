@@ -4,10 +4,10 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use rustos_user_abi::syscall::{
-    LinuxRlimit, LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, LinuxUtsName,
-    RustosMmBrokerArgs, RustosMmFdBrokerResult, RustosMmLayoutBrokerResult,
+    LinuxRlimit, LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, LinuxTimespecWire,
+    LinuxUtsName, RustosMmBrokerArgs, RustosMmFdBrokerResult, RustosMmLayoutBrokerResult,
     RustosMmMapBrokerResult, LINUX_CPUSET_BYTES, LINUX_DEFAULT_STACK_RLIMIT_BYTES,
-    LINUX_RLIMIT_SIZE, MM_BROKER_ABI_VERSION, MM_BROKER_FD_KIND_DEVICE,
+    LINUX_RLIMIT_SIZE, LINUX_TIMESPEC_SIZE, MM_BROKER_ABI_VERSION, MM_BROKER_FD_KIND_DEVICE,
     MM_BROKER_FD_KIND_DISPLAY_SURFACE, MM_BROKER_FD_KIND_FILE, MM_BROKER_FD_KIND_MEMFD,
     MM_BROKER_OP_DESCRIBE_FD, MM_BROKER_OP_MAP_ANON, MM_BROKER_OP_MAP_DEVICE_SHARED,
     MM_BROKER_OP_MAP_FILE_PRIVATE, MM_BROKER_OP_MAP_MEMFD_SHARED, MM_BROKER_OP_PROTECT,
@@ -20,6 +20,17 @@ use crate::errno;
 
 const DEFAULT_UMASK: u32 = 0o022;
 const GETRANDOM_MAX_BYTES: u32 = (SYSCALL_OFFLOAD_PAYLOAD_CAPACITY as u32) & !3;
+const GETRANDOM_FLAG_NONBLOCK: u64 = 0x0001;
+const GETRANDOM_FLAG_RANDOM: u64 = 0x0002;
+const FUTEX_WAIT: u64 = 0;
+const FUTEX_WAKE: u64 = 1;
+const FUTEX_REQUEUE: u64 = 3;
+const FUTEX_CMP_REQUEUE: u64 = 4;
+const FUTEX_WAIT_BITSET: u64 = 9;
+const FUTEX_WAKE_BITSET: u64 = 10;
+const FUTEX_PRIVATE_FLAG: u64 = 128;
+const FUTEX_CLOCK_REALTIME: u64 = 256;
+const FUTEX_CMD_MASK: u64 = !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
 
 const PAGE_SIZE: u64 = 4096;
 const MAP_TYPE: u64 = 0x0f;
@@ -32,6 +43,7 @@ const MAP_EXECUTABLE: u64 = 0x1000;
 const PROT_READ: u64 = 0x1;
 const PROT_WRITE: u64 = 0x2;
 const PROT_EXEC: u64 = 0x4;
+const LINUX_USER_SPACE_BASE: u64 = 0x0000_0000_0000_1000;
 const LINUX_USER_SPACE_END: u64 = 0x0000_8000_0000;
 // Linux madvise constants used by the service-side policy subset.
 const MADV_NORMAL: u64 = 0;
@@ -59,6 +71,11 @@ const MADV_DONTNEED_LOCKED: u64 = 24;
 const MFD_CLOEXEC: u64 = 0x0001;
 const MFD_ALLOW_SEALING: u64 = 0x0002;
 const MEMFD_NAME_MAX: usize = 249;
+const CLOCK_REALTIME: u64 = 0;
+const CLOCK_MONOTONIC: u64 = 1;
+const TIMER_ABSTIME: u64 = 1;
+const ARCH_SET_FS: u64 = 0x1002;
+const ARCH_GET_FS: u64 = 0x1003;
 
 #[derive(Clone, Copy, Debug)]
 struct LinuxPolicyState {
@@ -463,6 +480,10 @@ pub(crate) fn handle_getrandom(
     request: &LinuxSyscallOffloadRequest,
     response: &mut LinuxSyscallOffloadResponse,
 ) {
+    if request.arg0 & !(GETRANDOM_FLAG_NONBLOCK | GETRANDOM_FLAG_RANDOM) != 0 {
+        response.status = errno::EINVAL;
+        return;
+    }
     let requested_len = request.flags as u32;
     if requested_len == 0 {
         response.status = 0;
@@ -508,6 +529,96 @@ pub(crate) fn handle_rseq(
     response.payload_len = 0;
 }
 
+pub(crate) fn handle_nanosleep(
+    request: &LinuxSyscallOffloadRequest,
+    response: &mut LinuxSyscallOffloadResponse,
+) {
+    match read_valid_timespec(request) {
+        Ok(_) => {
+            response.status = 0;
+            response.payload_len = 0;
+        }
+        Err(errno) => response.status = errno,
+    }
+}
+
+pub(crate) fn handle_clock_gettime(
+    request: &LinuxSyscallOffloadRequest,
+    response: &mut LinuxSyscallOffloadResponse,
+) {
+    if !is_supported_clock_id(request.arg0) {
+        response.status = errno::EINVAL;
+        return;
+    }
+    response.status = 0;
+    response.payload_len = 0;
+}
+
+pub(crate) fn handle_clock_nanosleep(
+    request: &LinuxSyscallOffloadRequest,
+    response: &mut LinuxSyscallOffloadResponse,
+) {
+    if !is_supported_clock_id(request.arg0) || request.flags & !TIMER_ABSTIME != 0 {
+        response.status = errno::EINVAL;
+        return;
+    }
+    match read_valid_timespec(request) {
+        Ok(_) => {
+            response.status = 0;
+            response.payload_len = 0;
+        }
+        Err(errno) => response.status = errno,
+    }
+}
+
+pub(crate) fn handle_futex_policy(
+    request: &LinuxSyscallOffloadRequest,
+    response: &mut LinuxSyscallOffloadResponse,
+) {
+    let op = request.arg0;
+    let cmd = op & FUTEX_CMD_MASK;
+    let supported_flags = FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME;
+    if (op & !FUTEX_CMD_MASK) & !supported_flags != 0 {
+        response.status = errno::EINVAL;
+        return;
+    }
+    match cmd {
+        value
+            if value == FUTEX_WAIT
+                || value == FUTEX_WAKE
+                || value == FUTEX_REQUEUE
+                || value == FUTEX_CMP_REQUEUE =>
+        {
+            response.status = 0;
+        }
+        value if value == FUTEX_WAIT_BITSET || value == FUTEX_WAKE_BITSET => {
+            response.status = if request.arg1 == 0 { errno::EINVAL } else { 0 };
+        }
+        _ => response.status = errno::ENOSYS,
+    }
+    response.payload_len = 0;
+}
+
+pub(crate) fn handle_arch_prctl_policy(
+    request: &LinuxSyscallOffloadRequest,
+    response: &mut LinuxSyscallOffloadResponse,
+) {
+    match request.arg0 {
+        ARCH_SET_FS => {
+            if request.arg1 != 0
+                && !(LINUX_USER_SPACE_BASE..LINUX_USER_SPACE_END).contains(&request.arg1)
+            {
+                response.status = errno::EINVAL;
+            } else {
+                response.status = 0;
+            }
+        }
+        ARCH_GET_FS => response.status = 0,
+        _ => response.status = errno::EINVAL,
+    }
+    response.payload_len = 0;
+}
+
 fn fill_random_bytes(dest: &mut [u8], pid: u64, tid: u64) {
     static COUNTER: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
     let mut state = COUNTER.fetch_add(0xA076_1D64_78BD_642F, Ordering::Relaxed)
@@ -540,6 +651,37 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
         bytes[offset + 6],
         bytes[offset + 7],
     ])
+}
+
+fn read_i64(bytes: &[u8], offset: usize) -> i64 {
+    i64::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+        bytes[offset + 4],
+        bytes[offset + 5],
+        bytes[offset + 6],
+        bytes[offset + 7],
+    ])
+}
+
+fn read_valid_timespec(request: &LinuxSyscallOffloadRequest) -> Result<LinuxTimespecWire, i32> {
+    if request.path_len as usize != LINUX_TIMESPEC_SIZE {
+        return Err(errno::EINVAL);
+    }
+    let ts = LinuxTimespecWire {
+        tv_sec: read_i64(&request.path[..LINUX_TIMESPEC_SIZE], 0),
+        tv_nsec: read_i64(&request.path[..LINUX_TIMESPEC_SIZE], 8),
+    };
+    if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+        return Err(errno::EINVAL);
+    }
+    Ok(ts)
+}
+
+fn is_supported_clock_id(clock_id: u64) -> bool {
+    matches!(clock_id, CLOCK_REALTIME | CLOCK_MONOTONIC)
 }
 
 fn write_uts_field(dest: &mut [u8; 65], value: &[u8]) {
@@ -1319,6 +1461,66 @@ mod tests {
         };
         handle_setuid(&request, &mut response);
         assert_eq!(response.status, 0);
+    }
+
+    #[test]
+    fn time_policy_validates_timespec_and_clock_ids() {
+        let mut request = LinuxSyscallOffloadRequest::default();
+        write_timespec(
+            &mut request,
+            LinuxTimespecWire {
+                tv_sec: 0,
+                tv_nsec: 1,
+            },
+        );
+        let mut response = LinuxSyscallOffloadResponse::default();
+        handle_nanosleep(&request, &mut response);
+        assert_eq!(response.status, 0);
+        assert_eq!(response.payload_len, 0);
+
+        write_timespec(
+            &mut request,
+            LinuxTimespecWire {
+                tv_sec: 0,
+                tv_nsec: 1_000_000_000,
+            },
+        );
+        handle_nanosleep(&request, &mut response);
+        assert_eq!(response.status, errno::EINVAL);
+
+        request.arg0 = CLOCK_MONOTONIC;
+        request.flags = TIMER_ABSTIME;
+        write_timespec(
+            &mut request,
+            LinuxTimespecWire {
+                tv_sec: 1,
+                tv_nsec: 0,
+            },
+        );
+        handle_clock_nanosleep(&request, &mut response);
+        assert_eq!(response.status, 0);
+
+        request.arg0 = 99;
+        handle_clock_gettime(&request, &mut response);
+        assert_eq!(response.status, errno::EINVAL);
+    }
+
+    #[test]
+    fn getrandom_policy_rejects_unknown_flags() {
+        let request = LinuxSyscallOffloadRequest {
+            flags: 8,
+            arg0: 0x8000,
+            ..LinuxSyscallOffloadRequest::default()
+        };
+        let mut response = LinuxSyscallOffloadResponse::default();
+        handle_getrandom(&request, &mut response);
+        assert_eq!(response.status, errno::EINVAL);
+    }
+
+    fn write_timespec(request: &mut LinuxSyscallOffloadRequest, ts: LinuxTimespecWire) {
+        request.path_len = LINUX_TIMESPEC_SIZE as u32;
+        request.path[..8].copy_from_slice(&ts.tv_sec.to_le_bytes());
+        request.path[8..16].copy_from_slice(&ts.tv_nsec.to_le_bytes());
     }
 
     #[test]

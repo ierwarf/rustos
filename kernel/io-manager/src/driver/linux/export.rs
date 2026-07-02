@@ -1,3 +1,6 @@
+// RING3-MIGRATION-REFERENCE START: Linux .ko exported shim table is an explicit
+// ring0 compatibility substrate. inputd/driverd own policy; ring0 keeps symbol
+// entry points that Linux modules call while executing in ring0.
 use super::compat::{LinuxCompatInputDev, LinuxCompatSerio, LinuxCompatSerioDriver};
 
 #[cfg_attr(feature = "rustos_export_driver_symbols", unsafe(no_mangle))]
@@ -173,3 +176,4 @@ pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
         _ => None,
     }
 }
+// RING3-MIGRATION-REFERENCE END: Linux .ko exported shim compatibility substrate exception.

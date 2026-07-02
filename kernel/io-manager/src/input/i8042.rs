@@ -1,19 +1,12 @@
-// RING3-MIGRATION-REFERENCE START: inputd/driverd should own the non-.ko i8042
-// service-driver once a ring3 service-driver host can drive PS/2 command bytes
-// and IRQ delivery through narrow leases. Ring0 keeps this controller path as
-// privileged legacy input substrate until that host exists.
+// RING3-MIGRATION-REFERENCE START: i8042 input ingress substrate exception:
+// inputd owns keyboard/mouse policy. Ring0 keeps only privileged PS/2
+// controller IO-port setup, IRQ drain, and raw scancode/mouse-byte ingress.
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::sync::KernelSpinLock as Mutex;
-use driver_abi::{
-    POINTER_BUTTON_LEFT, POINTER_BUTTON_MIDDLE, POINTER_BUTTON_RIGHT, PointerPacket, SerioDeviceId,
-    SerioDriverRegistration, SerioPortInfo,
-};
 use nucleus_core::util::ring::RingBuffer;
 use x86_64::instructions::{interrupts, port::Port};
-
-use crate::driver::serio::SerioPortOps;
 
 const KEYBOARD_IRQ: u8 = 1;
 const MOUSE_IRQ: u8 = 12;
@@ -62,58 +55,18 @@ const DEFERRED_CONTROLLER_DROP_LOG_INTERVAL: u64 = 64;
 const PS2_CMD_GETID: u8 = 0xF2;
 const PS2_CMD_DISABLE_SCANNING: u8 = 0xF5;
 
-#[allow(dead_code)]
-pub(crate) const I8042_KEYBOARD_PORT_ID: u32 = 0;
-pub(crate) const I8042_AUX_MOUSE_PORT_ID: u32 = 1;
-
 static KEYBOARD_TRANSPORT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static AUX_TRANSPORT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CONTROLLER_ACCESS_ACTIVE: AtomicBool = AtomicBool::new(false);
-static AUX_INTERRUPT_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 static AUX_DEBUG_BYTES_REMAINING: AtomicUsize = AtomicUsize::new(0);
 static CONTROLLER_ACCESS_LOCK: Mutex<()> = Mutex::new(());
 static DEFERRED_CONTROLLER_BYTES: Mutex<DeferredControllerBytesState> =
     Mutex::new(DeferredControllerBytesState::new());
-static PS2_MOUSE_PACKET_STATE: Mutex<Ps2MousePacketState> = Mutex::new(Ps2MousePacketState::new());
-
-const PS2_MOUSE_STATUS_LEFT: u8 = 1 << 0;
-const PS2_MOUSE_STATUS_RIGHT: u8 = 1 << 1;
-const PS2_MOUSE_STATUS_MIDDLE: u8 = 1 << 2;
-const PS2_MOUSE_STATUS_ALWAYS_ONE: u8 = 1 << 3;
-const PS2_MOUSE_STATUS_X_OVERFLOW: u8 = 1 << 6;
-const PS2_MOUSE_STATUS_Y_OVERFLOW: u8 = 1 << 7;
 
 struct DeferredControllerBytesState {
     queued: RingBuffer<ControllerByte, DEFERRED_CONTROLLER_BYTES_CAPACITY>,
     dropped_bytes: u64,
 }
-
-struct Ps2MousePacketState {
-    bytes: [u8; 3],
-    len: usize,
-}
-
-impl Ps2MousePacketState {
-    const fn new() -> Self {
-        Self {
-            bytes: [0; 3],
-            len: 0,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.bytes = [0; 3];
-        self.len = 0;
-    }
-}
-
-static BUILTIN_PS2_MOUSE_DRIVER: SerioDriverRegistration = SerioDriverRegistration::new(
-    "rustos-ps2-mouse",
-    SerioDeviceId::i8042_mouse(),
-    Some(builtin_ps2_mouse_connect),
-    Some(builtin_ps2_mouse_disconnect),
-    Some(builtin_ps2_mouse_interrupt),
-);
 
 impl DeferredControllerBytesState {
     const fn new() -> Self {
@@ -189,28 +142,16 @@ pub(crate) fn init_aux_mouse_port() -> AuxTransportInitResult {
     match result {
         Ok(info) => {
             AUX_TRANSPORT_ACTIVE.store(false, Ordering::Release);
-            crate::driver::serio::register_port_with_ops(
-                SerioPortInfo::i8042_mouse(I8042_AUX_MOUSE_PORT_ID),
-                SerioPortOps {
-                    open: Some(serio_open_aux_port),
-                    close: Some(serio_close_aux_port),
-                    write_byte: Some(serio_write_aux_byte),
-                    ps2_command: Some(serio_aux_ps2_command),
-                    drain: Some(serio_drain_aux),
-                },
-            );
-            AuxTransportInitResult::Ready(info)
+            if open_aux_port() == 0 {
+                AuxTransportInitResult::Ready(info)
+            } else {
+                AuxTransportInitResult::Unavailable("i8042 aux open failed")
+            }
         }
         Err(reason) => {
             AUX_TRANSPORT_ACTIVE.store(false, Ordering::Release);
             AuxTransportInitResult::Unavailable(reason)
         }
-    }
-}
-
-pub(crate) fn register_builtin_ps2_mouse_driver() {
-    unsafe {
-        let _ = crate::driver::serio::register_driver(&BUILTIN_PS2_MOUSE_DRIVER as *const _);
     }
 }
 
@@ -406,45 +347,7 @@ fn serio_keyboard_ps2_command(command: u8, data: &[u8], response: &mut [u8]) -> 
     )
 }
 
-fn serio_write_aux_byte(byte: u8) -> i32 {
-    with_controller_access(|| {
-        if write_second_port_data_byte(byte) {
-            0
-        } else {
-            -110
-        }
-    })
-}
-
-fn serio_aux_ps2_command(command: u8, data: &[u8], response: &mut [u8]) -> i32 {
-    let aux_irq_enabled = AUX_TRANSPORT_ACTIVE.load(Ordering::Acquire);
-    AUX_INTERRUPT_SUPPRESSED.store(true, Ordering::Release);
-    if aux_irq_enabled {
-        crate::arch::pic::disable_irq(MOUSE_IRQ);
-    }
-    let status =
-        with_controller_access(
-            || match send_aux_command_sequence(command, data, response) {
-                Ok(()) => 0,
-                Err(status) => status,
-            },
-        );
-    if aux_irq_enabled && AUX_TRANSPORT_ACTIVE.load(Ordering::Acquire) {
-        crate::arch::pic::enable_irq(MOUSE_IRQ);
-    }
-    AUX_INTERRUPT_SUPPRESSED.store(false, Ordering::Release);
-    status
-}
-
-fn serio_drain_aux(max_bytes: usize, timeout_ms: u32) {
-    if max_bytes == 0 {
-        return;
-    }
-
-    with_controller_access(|| drain_aux_output_buffer(max_bytes, timeout_ms));
-}
-
-fn serio_open_aux_port() -> i32 {
+fn open_aux_port() -> i32 {
     let status = with_controller_access(|| {
         if AUX_TRANSPORT_ACTIVE.load(Ordering::Acquire) {
             return 0;
@@ -466,7 +369,7 @@ fn serio_open_aux_port() -> i32 {
         // is fully configured and drained.
         drain_output_buffer();
         crate::driver::input::reset_pointer_state();
-        PS2_MOUSE_PACKET_STATE.lock().reset();
+        crate::driver::input::submit_ps2_mouse_reset();
         AUX_TRANSPORT_ACTIVE.store(true, Ordering::Release);
         0
     });
@@ -474,93 +377,6 @@ fn serio_open_aux_port() -> i32 {
         crate::arch::pic::enable_irq(MOUSE_IRQ);
     }
     status
-}
-
-fn serio_close_aux_port() {
-    crate::arch::pic::disable_irq(MOUSE_IRQ);
-    with_controller_access(|| {
-        if !AUX_TRANSPORT_ACTIVE.swap(false, Ordering::AcqRel) {
-            return;
-        }
-        let keyboard_enabled = KEYBOARD_TRANSPORT_ACTIVE.load(Ordering::Acquire);
-        let _ = park_aux_port(keyboard_enabled);
-        crate::driver::input::reset_pointer_state();
-        PS2_MOUSE_PACKET_STATE.lock().reset();
-    });
-}
-
-unsafe extern "C" fn builtin_ps2_mouse_connect(port: *const SerioPortInfo) -> i32 {
-    let Some(port) = (unsafe { port.as_ref() }) else {
-        return -22;
-    };
-    PS2_MOUSE_PACKET_STATE.lock().reset();
-    crate::driver::serio::open(port.port_id)
-}
-
-unsafe extern "C" fn builtin_ps2_mouse_disconnect(port: *const SerioPortInfo) {
-    let Some(port) = (unsafe { port.as_ref() }) else {
-        return;
-    };
-    crate::driver::serio::close(port.port_id);
-    PS2_MOUSE_PACKET_STATE.lock().reset();
-}
-
-unsafe extern "C" fn builtin_ps2_mouse_interrupt(
-    _port: *const SerioPortInfo,
-    byte: u8,
-    _flags: u32,
-) -> i32 {
-    let packet = {
-        let mut state = PS2_MOUSE_PACKET_STATE.lock();
-        match state.len {
-            0 => {
-                if byte & PS2_MOUSE_STATUS_ALWAYS_ONE == 0 {
-                    return 0;
-                }
-                state.bytes[0] = byte;
-                state.len = 1;
-                return 1;
-            }
-            1 => {
-                state.bytes[1] = byte;
-                state.len = 2;
-                return 1;
-            }
-            _ => {
-                state.bytes[2] = byte;
-                let packet = state.bytes;
-                state.reset();
-                packet
-            }
-        }
-    };
-
-    if packet[0] & (PS2_MOUSE_STATUS_X_OVERFLOW | PS2_MOUSE_STATUS_Y_OVERFLOW) != 0 {
-        return 1;
-    }
-
-    let mut buttons = 0u8;
-    if packet[0] & PS2_MOUSE_STATUS_LEFT != 0 {
-        buttons |= POINTER_BUTTON_LEFT;
-    }
-    if packet[0] & PS2_MOUSE_STATUS_RIGHT != 0 {
-        buttons |= POINTER_BUTTON_RIGHT;
-    }
-    if packet[0] & PS2_MOUSE_STATUS_MIDDLE != 0 {
-        buttons |= POINTER_BUTTON_MIDDLE;
-    }
-
-    crate::driver::input::submit_pointer_packet(PointerPacket {
-        buttons,
-        dx: i16::from(packet[1] as i8),
-        dy: -i16::from(packet[2] as i8),
-        wheel_vertical: 0,
-        wheel_horizontal: 0,
-        reserved0: 0,
-        reserved1: 0,
-        reserved2: 0,
-    });
-    1
 }
 
 fn with_controller_access<T>(f: impl FnOnce() -> T) -> T {
@@ -805,9 +621,6 @@ fn dispatch_controller_byte(data: ControllerByte) {
 
 fn dispatch_controller_byte_lower_half(data: ControllerByte) {
     if data.aux {
-        if AUX_INTERRUPT_SUPPRESSED.load(Ordering::Acquire) {
-            return;
-        }
         if AUX_TRANSPORT_ACTIVE.load(Ordering::Acquire) {
             let remaining = AUX_DEBUG_BYTES_REMAINING.load(Ordering::Relaxed);
             if remaining != 0
@@ -827,7 +640,7 @@ fn dispatch_controller_byte_lower_half(data: ControllerByte) {
                     false
                 );
             }
-            let _ = crate::driver::serio::receive_byte(I8042_AUX_MOUSE_PORT_ID, data.byte, 0);
+            let _ = crate::driver::input::submit_ps2_mouse_byte(data.byte);
         }
         return;
     }
@@ -870,4 +683,4 @@ fn read_status() -> u8 {
 const fn is_ignorable_command_response(byte: u8) -> bool {
     byte == DEVICE_RESPONSE_SELF_TEST_PASSED
 }
-// RING3-MIGRATION-REFERENCE END: inputd/driverd-owned non-.ko i8042 service-driver.
+// RING3-MIGRATION-REFERENCE END: inputd-owned i8042 raw input ingress substrate exception.

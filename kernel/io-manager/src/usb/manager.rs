@@ -1,6 +1,7 @@
-// RING3-MIGRATION-REFERENCE START: usbdrv/driverd should own USB runtime
-// initialization, controller provider order, and service scheduling policy.
-// Ring0 keeps native host-controller discovery and service hooks.
+// RING3-MIGRATION-REFERENCE START: usb-runtime-substrate exception:
+// usbdrv/driverd own USB runtime initialization and controller provider policy.
+// Ring0 keeps native host-controller discovery, xHCI enable gating, and service
+// hooks until the service-driver host can drive leased hardware resources.
 use alloc::vec::Vec;
 
 use crate::sync::KernelSpinLock as Mutex;
@@ -123,4 +124,4 @@ fn scan_host_controllers() -> Vec<UsbHostControllerInfo> {
 
     controllers
 }
-// RING3-MIGRATION-REFERENCE END: usbdrv/driverd-owned USB manager policy.
+// RING3-MIGRATION-REFERENCE END: USB manager substrate exception.

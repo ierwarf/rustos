@@ -1,6 +1,6 @@
-// RING3-MIGRATION-REFERENCE START: storaged/pagerd should own block cache and
-// post-bootstrap block I/O policy. Ring0 keeps uncached physical I/O substrate
-// needed by boot-volume and gated block brokers.
+// RING3-MIGRATION-REFERENCE START: bootstrap exception: storaged/pagerd own
+// post-bootstrap block cache policy. Ring0 keeps bounded physical block I/O
+// substrate needed by boot-volume and gated block brokers.
 use crate::sync::KernelSpinLock as Mutex;
 use alloc::boxed::Box;
 use alloc::format;
@@ -262,4 +262,4 @@ pub(super) fn cache_lookup(device_id: u32, lba: u64) -> Option<Vec<u8>> {
 pub(super) fn clear_cache_for_tests() {
     BLOCK_CACHE.lock().clear();
 }
-// RING3-MIGRATION-REFERENCE END: storaged/pagerd-owned block I/O cache policy.
+// RING3-MIGRATION-REFERENCE END: storaged/pagerd-owned block policy bootstrap exception.

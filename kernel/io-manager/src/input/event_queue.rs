@@ -1,26 +1,22 @@
-// RING3-MIGRATION-REFERENCE START: inputd should own input queue coalescing,
-// drop policy, and evdev/native read policy. Ring0 keeps bounded hardware
-// ingress buffers and stats substrate.
+// RING3-MIGRATION-REFERENCE START: input-ingress exception: inputd owns input
+// queue coalescing, drop policy, and evdev/native read policy. Ring0 keeps
+// bounded hardware ingress buffers and stats substrate.
 use core::sync::atomic::{AtomicU64, Ordering};
 
-pub(crate) use crate::input_core::InputEventQueueState;
 use crate::sync::KernelSpinLock as Mutex;
 use driver_abi::PointerPacket;
 use heapless::Deque as HeaplessDeque;
 use rustos_user_abi::syscall::{
-    INPUTD_ACCESS_NATIVE, INPUTD_INGRESS_KIND_EVENT, INPUTD_INGRESS_KIND_HID_POINTER_REPORT,
+    INPUTD_ACCESS_NATIVE, INPUTD_INGRESS_FLAG_RESET_STATE, INPUTD_INGRESS_KIND_HID_POINTER_REPORT,
     INPUTD_INGRESS_KIND_HID_RAW_REPORT, INPUTD_INGRESS_KIND_KEYBOARD,
-    INPUTD_INGRESS_KIND_POINTER_PACKET, InputHidKeyboardReportWire, InputHidPointerReportWire,
+    INPUTD_INGRESS_KIND_POINTER_PACKET, INPUTD_INGRESS_KIND_PS2_MOUSE_BYTE,
+    INPUTD_INGRESS_KIND_PS2_SCANCODE, InputHidKeyboardReportWire, InputHidPointerReportWire,
     InputHidPolicyWire, InputIngressWire, InputKeyboardEventWire, InputPointerAbsoluteWire,
-    InputPointerPacketWire,
+    InputPointerPacketWire, InputPs2MouseByteWire, InputPs2ScancodeWire,
 };
 #[cfg(not(test))]
 use x86_64::instructions::interrupts;
 
-// `crate::user::abi::device::InputEvent` and `crate::input_core::InputEvent`
-// are both aliases of `rustos_user_abi::ui::UiInputEvent` via the shared
-// `input-evdev` crate, so callers can pass either name through the queue
-// without a layout cast.
 use crate::user::abi::device::InputEvent;
 
 static POINTER_PACKET_SUBMIT_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -28,9 +24,6 @@ static POINTER_ABSOLUTE_SUBMIT_COUNT: AtomicU64 = AtomicU64::new(0);
 static INPUT_READ_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
 static INPUT_READ_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
 static INPUT_INGRESS_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
-static EVENT_QUEUE_LOCK_ACTIVE: AtomicU64 = AtomicU64::new(0);
-static EVENT_QUEUE_LOCK_LAST_SEQ: AtomicU64 = AtomicU64::new(0);
-static EVENT_QUEUE_LOCK_NEXT_SEQ: AtomicU64 = AtomicU64::new(1);
 const INPUT_INGRESS_QUEUE_CAPACITY: usize = 2048;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -48,48 +41,83 @@ pub struct InputEventQueueDebugSnapshot {
     pub dropped_lossy: u64,
 }
 
-static INPUT_EVENTS: Mutex<InputEventQueueState> = Mutex::new(InputEventQueueState::new());
 static INPUT_INGRESS: Mutex<HeaplessDeque<InputIngressWire, INPUT_INGRESS_QUEUE_CAPACITY>> =
     Mutex::new(HeaplessDeque::new());
 
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn push_pointer_motion(dx: i16, dy: i16) {
-    with_event_queue(|events| events.push_pointer_motion(dx, dy));
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn push_pointer_position(x: u32, y: u32) {
-    with_event_queue(|events| events.push_pointer_position(x, y));
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn push_pointer_button(code: u32, pressed: bool) {
-    with_event_queue(|events| events.push_pointer_button(code, pressed));
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn push_pointer_scroll(vertical: i16, horizontal: i16) {
-    with_event_queue(|events| events.push_pointer_scroll(vertical, horizontal));
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn push_pointer_button_left(pressed: bool) {
-    push_pointer_button(crate::input_core::POINTER_BUTTON_LEFT, pressed);
-}
-
-pub(crate) fn submit_keyboard_event(event: crate::input::keyboard::KeyboardEvent) -> bool {
+pub(crate) fn submit_keyboard_event(action: u16, code: u32, modifiers: u32, text: u32) -> bool {
     push_ingress(InputIngressWire {
         kind: INPUTD_INGRESS_KIND_KEYBOARD,
         access: INPUTD_ACCESS_NATIVE,
         flags: 0,
         event: InputEvent::default(),
         keyboard: InputKeyboardEventWire {
-            action: keyboard_action_to_inputd(event.action),
+            action,
             reserved0: 0,
-            code: event.code as u32,
-            modifiers: event.modifiers.bits() as u32,
-            text: event.text.unwrap_or(0) as u32,
+            code,
+            modifiers,
+            text,
         },
+        ps2_scancode: InputPs2ScancodeWire::default(),
+        ps2_mouse_byte: InputPs2MouseByteWire::default(),
+        pointer_packet: InputPointerPacketWire::default(),
+        pointer_absolute: InputPointerAbsoluteWire::default(),
+        hid_keyboard: InputHidKeyboardReportWire::default(),
+        hid_pointer: InputHidPointerReportWire::default(),
+        hid_raw: InputHidPolicyWire::default(),
+    })
+}
+
+pub(crate) fn submit_ps2_scancode(scancode: u8, translated: bool) -> bool {
+    push_ingress(InputIngressWire {
+        kind: INPUTD_INGRESS_KIND_PS2_SCANCODE,
+        access: INPUTD_ACCESS_NATIVE,
+        flags: 0,
+        event: InputEvent::default(),
+        keyboard: InputKeyboardEventWire::default(),
+        ps2_scancode: InputPs2ScancodeWire {
+            scancode,
+            translated: translated as u8,
+            reserved0: 0,
+        },
+        ps2_mouse_byte: InputPs2MouseByteWire::default(),
+        pointer_packet: InputPointerPacketWire::default(),
+        pointer_absolute: InputPointerAbsoluteWire::default(),
+        hid_keyboard: InputHidKeyboardReportWire::default(),
+        hid_pointer: InputHidPointerReportWire::default(),
+        hid_raw: InputHidPolicyWire::default(),
+    })
+}
+
+pub(crate) fn submit_ps2_mouse_byte(byte: u8) -> bool {
+    push_ingress(InputIngressWire {
+        kind: INPUTD_INGRESS_KIND_PS2_MOUSE_BYTE,
+        access: INPUTD_ACCESS_NATIVE,
+        flags: 0,
+        event: InputEvent::default(),
+        keyboard: InputKeyboardEventWire::default(),
+        ps2_scancode: InputPs2ScancodeWire::default(),
+        ps2_mouse_byte: InputPs2MouseByteWire {
+            byte,
+            reserved0: 0,
+            reserved1: 0,
+        },
+        pointer_packet: InputPointerPacketWire::default(),
+        pointer_absolute: InputPointerAbsoluteWire::default(),
+        hid_keyboard: InputHidKeyboardReportWire::default(),
+        hid_pointer: InputHidPointerReportWire::default(),
+        hid_raw: InputHidPolicyWire::default(),
+    })
+}
+
+pub(crate) fn submit_ps2_mouse_reset() -> bool {
+    push_ingress(InputIngressWire {
+        kind: INPUTD_INGRESS_KIND_PS2_MOUSE_BYTE,
+        access: INPUTD_ACCESS_NATIVE,
+        flags: INPUTD_INGRESS_FLAG_RESET_STATE,
+        event: InputEvent::default(),
+        keyboard: InputKeyboardEventWire::default(),
+        ps2_scancode: InputPs2ScancodeWire::default(),
+        ps2_mouse_byte: InputPs2MouseByteWire::default(),
         pointer_packet: InputPointerPacketWire::default(),
         pointer_absolute: InputPointerAbsoluteWire::default(),
         hid_keyboard: InputHidKeyboardReportWire::default(),
@@ -106,6 +134,8 @@ pub(crate) fn submit_pointer_packet(packet: PointerPacket) -> bool {
         flags: 0,
         event: InputEvent::default(),
         keyboard: InputKeyboardEventWire::default(),
+        ps2_scancode: InputPs2ScancodeWire::default(),
+        ps2_mouse_byte: InputPs2MouseByteWire::default(),
         pointer_packet: InputPointerPacketWire {
             buttons: packet.buttons,
             reserved0: [0; 3],
@@ -129,6 +159,8 @@ pub(crate) fn submit_hid_pointer_report(report: InputHidPointerReportWire) -> bo
         flags: 0,
         event: InputEvent::default(),
         keyboard: InputKeyboardEventWire::default(),
+        ps2_scancode: InputPs2ScancodeWire::default(),
+        ps2_mouse_byte: InputPs2MouseByteWire::default(),
         pointer_packet: InputPointerPacketWire::default(),
         pointer_absolute: InputPointerAbsoluteWire::default(),
         hid_keyboard: InputHidKeyboardReportWire::default(),
@@ -144,6 +176,8 @@ pub(crate) fn submit_hid_raw_report(report: InputHidPolicyWire) -> bool {
         flags: 0,
         event: InputEvent::default(),
         keyboard: InputKeyboardEventWire::default(),
+        ps2_scancode: InputPs2ScancodeWire::default(),
+        ps2_mouse_byte: InputPs2MouseByteWire::default(),
         pointer_packet: InputPointerPacketWire::default(),
         pointer_absolute: InputPointerAbsoluteWire::default(),
         hid_keyboard: InputHidKeyboardReportWire::default(),
@@ -152,22 +186,11 @@ pub(crate) fn submit_hid_raw_report(report: InputHidPolicyWire) -> bool {
     })
 }
 
-pub(crate) fn read_input_events(dest: &mut [InputEvent]) -> usize {
-    let count = with_event_queue(|events| events.read_input_events(dest));
-    INPUT_READ_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
-    INPUT_READ_EVENT_COUNT.fetch_add(count as u64, Ordering::Relaxed);
-    count
-}
-
 pub(crate) fn has_pending_input_events() -> bool {
-    has_pending_ingress() || with_event_queue(|events| events.has_pending_events())
+    has_pending_ingress()
 }
 
 pub fn debug_snapshot() -> InputEventQueueDebugSnapshot {
-    let snapshot = INPUT_EVENTS
-        .try_lock()
-        .map(|events| events.snapshot())
-        .unwrap_or_default();
     let ingress_queued = INPUT_INGRESS
         .try_lock()
         .map(|ingress| ingress.len())
@@ -177,20 +200,18 @@ pub fn debug_snapshot() -> InputEventQueueDebugSnapshot {
         pointer_absolute_submits: POINTER_ABSOLUTE_SUBMIT_COUNT.load(Ordering::Relaxed),
         read_calls: INPUT_READ_CALL_COUNT.load(Ordering::Relaxed),
         read_events: INPUT_READ_EVENT_COUNT.load(Ordering::Relaxed),
-        lock_active: EVENT_QUEUE_LOCK_ACTIVE.load(Ordering::Acquire),
-        lock_last_seq: EVENT_QUEUE_LOCK_LAST_SEQ.load(Ordering::Acquire),
-        queued: snapshot.queued.saturating_add(ingress_queued),
-        pending_coalesced: snapshot.pending_coalesced,
-        pending_pointer_position: snapshot.pending_pointer_position,
-        dropped_discrete: snapshot.dropped_discrete,
-        dropped_lossy: snapshot
-            .dropped_lossy
-            .saturating_add(INPUT_INGRESS_DROP_COUNT.load(Ordering::Relaxed)),
+        lock_active: 0,
+        lock_last_seq: 0,
+        queued: ingress_queued,
+        pending_coalesced: false,
+        pending_pointer_position: false,
+        dropped_discrete: 0,
+        dropped_lossy: INPUT_INGRESS_DROP_COUNT.load(Ordering::Relaxed),
     }
 }
 
 pub(crate) fn drain_ingress(dest: &mut [InputIngressWire]) -> usize {
-    let mut count = with_ingress_queue(|ingress| {
+    let count = with_ingress_queue(|ingress| {
         let mut count = 0;
         for slot in dest.iter_mut() {
             let Some(wire) = ingress.pop_front() else {
@@ -201,42 +222,19 @@ pub(crate) fn drain_ingress(dest: &mut [InputIngressWire]) -> usize {
         }
         count
     });
-    if count == dest.len() {
-        return count;
-    }
-
-    let mut events = alloc::vec![InputEvent::default(); dest.len() - count];
-    let event_count = read_input_events(&mut events);
-    for event in events.into_iter().take(event_count) {
-        dest[count] = InputIngressWire {
-            kind: INPUTD_INGRESS_KIND_EVENT,
-            access: INPUTD_ACCESS_NATIVE,
-            flags: 0,
-            event,
-            keyboard: InputKeyboardEventWire::default(),
-            pointer_packet: InputPointerPacketWire::default(),
-            pointer_absolute: InputPointerAbsoluteWire::default(),
-            hid_keyboard: InputHidKeyboardReportWire::default(),
-            hid_pointer: InputHidPointerReportWire::default(),
-            hid_raw: InputHidPolicyWire::default(),
-        };
-        count += 1;
-    }
+    INPUT_READ_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+    INPUT_READ_EVENT_COUNT.fetch_add(count as u64, Ordering::Relaxed);
     count
 }
 
 #[cfg(test)]
 pub(crate) fn reset_for_tests() {
-    *INPUT_EVENTS.lock() = InputEventQueueState::new();
     *INPUT_INGRESS.lock() = HeaplessDeque::new();
     POINTER_PACKET_SUBMIT_COUNT.store(0, Ordering::Relaxed);
     POINTER_ABSOLUTE_SUBMIT_COUNT.store(0, Ordering::Relaxed);
     INPUT_READ_CALL_COUNT.store(0, Ordering::Relaxed);
     INPUT_READ_EVENT_COUNT.store(0, Ordering::Relaxed);
     INPUT_INGRESS_DROP_COUNT.store(0, Ordering::Relaxed);
-    EVENT_QUEUE_LOCK_ACTIVE.store(0, Ordering::Relaxed);
-    EVENT_QUEUE_LOCK_LAST_SEQ.store(0, Ordering::Relaxed);
-    EVENT_QUEUE_LOCK_NEXT_SEQ.store(1, Ordering::Relaxed);
 }
 
 fn push_ingress(wire: InputIngressWire) -> bool {
@@ -254,14 +252,6 @@ fn has_pending_ingress() -> bool {
     with_ingress_queue(|ingress| !ingress.is_empty())
 }
 
-fn keyboard_action_to_inputd(action: crate::input::keyboard::KeyAction) -> u16 {
-    match action {
-        crate::input::keyboard::KeyAction::Pressed => crate::input_core::INPUT_ACTION_PRESSED,
-        crate::input::keyboard::KeyAction::Released => crate::input_core::INPUT_ACTION_RELEASED,
-        crate::input::keyboard::KeyAction::Repeated => crate::input_core::INPUT_ACTION_REPEATED,
-    }
-}
-
 fn with_ingress_queue<R>(
     f: impl FnOnce(&mut HeaplessDeque<InputIngressWire, INPUT_INGRESS_QUEUE_CAPACITY>) -> R,
 ) -> R {
@@ -276,67 +266,58 @@ fn with_ingress_queue<R>(
     }
 }
 
-fn with_event_queue<R>(f: impl FnOnce(&mut InputEventQueueState) -> R) -> R {
-    let seq = EVENT_QUEUE_LOCK_NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
-    EVENT_QUEUE_LOCK_LAST_SEQ.store(seq, Ordering::Release);
-    EVENT_QUEUE_LOCK_ACTIVE.fetch_add(1, Ordering::AcqRel);
-
-    #[cfg(test)]
-    {
-        let result = f(&mut INPUT_EVENTS.lock());
-        EVENT_QUEUE_LOCK_LAST_SEQ.store(seq, Ordering::Release);
-        EVENT_QUEUE_LOCK_ACTIVE.fetch_sub(1, Ordering::AcqRel);
-        result
-    }
-
-    #[cfg(not(test))]
-    {
-        let result = interrupts::without_interrupts(|| f(&mut INPUT_EVENTS.lock()));
-        EVENT_QUEUE_LOCK_LAST_SEQ.store(seq, Ordering::Release);
-        EVENT_QUEUE_LOCK_ACTIVE.fetch_sub(1, Ordering::AcqRel);
-        result
-    }
-}
 #[cfg(test)]
 mod tests {
-    use super::{
-        debug_snapshot, push_pointer_button_left, push_pointer_motion, read_input_events,
-        reset_for_tests,
-    };
-    use crate::user::abi::device::{
-        INPUT_ACTION_PRESSED, INPUT_KIND_POINTER_BUTTON, INPUT_KIND_POINTER_MOTION, InputEvent,
-    };
+    use super::{debug_snapshot, drain_ingress, reset_for_tests, submit_pointer_packet};
+    use driver_abi::{POINTER_BUTTON_LEFT as POINTER_PACKET_LEFT, PointerPacket};
+    use rustos_user_abi::syscall::{INPUTD_INGRESS_KIND_POINTER_PACKET, InputIngressWire};
 
     fn isolated() -> std::sync::MutexGuard<'static, ()> {
         crate::test_support::exclusive_test()
     }
 
     #[test]
-    fn wrapper_reads_motion_and_button_events() {
+    fn pointer_packet_reaches_ingress_queue() {
         let _guard = isolated();
         reset_for_tests();
-        push_pointer_motion(5, -2);
-        push_pointer_button_left(true);
 
-        let mut events = [InputEvent::default(); 2];
-        let read = read_input_events(&mut events);
-        assert_eq!(read, 2);
-        assert_eq!(events[0].kind, INPUT_KIND_POINTER_MOTION);
-        assert_eq!(events[0].value0, 5);
-        assert_eq!(events[0].value1, -2);
-        assert_eq!(events[1].kind, INPUT_KIND_POINTER_BUTTON);
-        assert_eq!(events[1].action, INPUT_ACTION_PRESSED);
+        assert!(submit_pointer_packet(PointerPacket {
+            buttons: POINTER_PACKET_LEFT,
+            dx: 5,
+            dy: -2,
+            wheel_vertical: 0,
+            wheel_horizontal: 0,
+            reserved0: 0,
+            reserved1: 0,
+            reserved2: 0,
+        }));
+
+        let mut ingress = [InputIngressWire::default(); 2];
+        assert_eq!(drain_ingress(&mut ingress), 1);
+        assert_eq!(ingress[0].kind, INPUTD_INGRESS_KIND_POINTER_PACKET);
+        assert_eq!(ingress[0].pointer_packet.buttons, POINTER_PACKET_LEFT);
+        assert_eq!(ingress[0].pointer_packet.dx, 5);
+        assert_eq!(ingress[0].pointer_packet.dy, -2);
     }
 
     #[test]
-    fn debug_snapshot_reflects_queue_state() {
+    fn debug_snapshot_reflects_ingress_state() {
         let _guard = isolated();
         reset_for_tests();
-        push_pointer_motion(1, 1);
+        assert!(submit_pointer_packet(PointerPacket {
+            buttons: 0,
+            dx: 1,
+            dy: 1,
+            wheel_vertical: 0,
+            wheel_horizontal: 0,
+            reserved0: 0,
+            reserved1: 0,
+            reserved2: 0,
+        }));
 
         let snapshot = debug_snapshot();
         assert!(!snapshot.pending_coalesced);
         assert_eq!(snapshot.queued, 1);
     }
 }
-// RING3-MIGRATION-REFERENCE END: inputd-owned input event queue policy.
+// RING3-MIGRATION-REFERENCE END: inputd-owned input event queue ingress exception.

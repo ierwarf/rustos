@@ -1,7 +1,7 @@
-// RING3-MIGRATION-REFERENCE START: usbdrv/driverd/inputd should own the non-.ko
-// xHCI service-driver once a ring3 service-driver host can drive leased
-// MMIO/DMA/IRQ resources. Ring0 keeps this native path as the current privileged
-// transfer substrate; HID policy/translation is routed to inputd.
+// RING3-MIGRATION-REFERENCE START: xHCI native transfer substrate exception:
+// driverd/devmgrd/inputd own provider, device, and input policy. Ring0 keeps
+// the RustOS native xHCI MMIO/DMA/IRQ transfer engine as the explicit
+// privileged substrate.
 // Native RustOS xHCI is the default USB 3 host-controller path. Keep Linux
 // `.ko` host-controller bridges out of the default boot profile; policy still
 // belongs in driverd/devmgrd/inputd, while this module owns the MMIO/DMA/IRQ
@@ -2302,4 +2302,4 @@ mod tests {
         assert_eq!(decoded.slot_id(), 7);
     }
 }
-// RING3-MIGRATION-REFERENCE END: usbdrv/driverd/inputd-owned non-.ko xHCI service-driver.
+// RING3-MIGRATION-REFERENCE END: RustOS native xHCI transfer substrate exception.

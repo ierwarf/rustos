@@ -31,6 +31,7 @@ pub const SYS_RUSTOS_MM_BROKER: u64 = 0x5255_001e;
 pub const SYS_RUSTOS_DEVICE_IOCTL_BROKER: u64 = 0x5255_001f;
 pub const SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER: u64 = 0x5255_0020;
 pub const SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER: u64 = 0x5255_0021;
+pub const SYS_RUSTOS_SERVICE_DRIVER_RESOURCE_BROKER: u64 = 0x5255_0022;
 pub const SYS_RUSTOS_NET_BROKER: u64 = 0x5255_0023;
 pub const SYS_RUSTOS_BLOCK_BROKER: u64 = 0x5255_0024;
 pub const SYS_RUSTOS_STORAGE_LIST_BROKER: u64 = 0x5255_0025;
@@ -167,6 +168,8 @@ pub const SYSCALL_OFFLOAD_OP_LINUX_MUNMAP: u16 = 62;
 pub const SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE: u16 = 63;
 pub const SYSCALL_OFFLOAD_OP_DRIVER_LOAD_POLICY: u16 = 64;
 pub const SYSCALL_OFFLOAD_OP_LINUX_PROCESS_EXIT: u16 = 65;
+pub const SYSCALL_OFFLOAD_OP_LINUX_FUTEX_POLICY: u16 = 66;
+pub const SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY: u16 = 67;
 pub const WIN32_SYSCALL_OFFLOAD_ABI_VERSION: u16 = 1;
 pub const SYSCALL_OFFLOAD_OP_WIN32_WRITE_FILE: u16 = 80;
 pub const SYSCALL_OFFLOAD_OP_WIN32_READ_FILE: u16 = 81;
@@ -310,6 +313,7 @@ pub const PROCD_OP_RT_SIGPROCMASK: u16 = 6;
 pub const PROCD_OP_SIGALTSTACK: u16 = 7;
 pub const PROCD_OP_TGKILL: u16 = 8;
 pub const PROCD_OP_SELECT_SIGNAL: u16 = 9;
+pub const PROCD_OP_THREAD_PLAN: u16 = 10;
 pub const PROCD_PATH_CAPACITY: usize = LOADER_SPAWN_EXEC_PATH_CAPACITY;
 pub const PROCD_ARG_BYTES: usize = LOADER_SPAWN_ARG_BYTES;
 pub const PROCD_ENV_BYTES: usize = LOADER_SPAWN_ENV_BYTES;
@@ -468,6 +472,14 @@ pub const COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DRIVER_INSTANCE: u16 = 1;
 pub const COMMERCIAL_MAX_SERVICE_DRIVERD_OP_MMIO_LEASE: u16 = 2;
 pub const COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IRQ_ROUTE: u16 = 3;
 pub const COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DMA_BUFFER: u16 = 4;
+pub const COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IO_PORT_LEASE: u16 = 5;
+pub const SERVICE_DRIVER_RESOURCE_BROKER_ABI_VERSION: u16 = 1;
+pub const SERVICE_DRIVER_RESOURCE_OP_MMIO_LEASE: u16 = 1;
+pub const SERVICE_DRIVER_RESOURCE_OP_IRQ_ROUTE: u16 = 2;
+pub const SERVICE_DRIVER_RESOURCE_OP_DMA_BUFFER: u16 = 3;
+pub const SERVICE_DRIVER_RESOURCE_OP_IO_PORT_LEASE: u16 = 4;
+pub const SERVICE_DRIVER_RESOURCE_OP_IO_PORT_READ: u16 = 5;
+pub const SERVICE_DRIVER_RESOURCE_OP_IO_PORT_WRITE: u16 = 6;
 pub const COMMERCIAL_MAX_UISERVER_OP_DISPLAY_READINESS: u16 = 1;
 pub const COMMERCIAL_MAX_UISERVER_OP_DISPLAY_METADATA: u16 = 2;
 pub const COMMERCIAL_MAX_UISERVER_OP_SURFACE_POLICY: u16 = 3;
@@ -611,6 +623,53 @@ impl Default for CommercialMaxProtocolResponse {
             payload: [0; COMMERCIAL_MAX_PROTOCOL_PAYLOAD_CAPACITY],
         }
     }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ServiceDriverMmioLeaseWire {
+    pub phys_start: u64,
+    pub byte_len: u64,
+    pub cache_policy: u32,
+    pub flags: u32,
+    pub lease_id: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ServiceDriverIrqRouteWire {
+    pub irq: u32,
+    pub vector: u32,
+    pub flags: u32,
+    pub reserved0: u32,
+    pub route_id: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ServiceDriverDmaBufferWire {
+    pub byte_len: u64,
+    pub alignment: u64,
+    pub flags: u32,
+    pub reserved0: u32,
+    pub buffer_id: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ServiceDriverIoPortLeaseWire {
+    pub port_start: u16,
+    pub port_count: u16,
+    pub flags: u32,
+    pub lease_id: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ServiceDriverIoPortValueWire {
+    pub value: u32,
+    pub width: u16,
+    pub reserved0: u16,
 }
 
 #[repr(C)]
@@ -806,6 +865,9 @@ pub const INPUTD_INGRESS_KIND_KEYBOARD: u16 = 4;
 pub const INPUTD_INGRESS_KIND_HID_KEYBOARD_REPORT: u16 = 5;
 pub const INPUTD_INGRESS_KIND_HID_POINTER_REPORT: u16 = 6;
 pub const INPUTD_INGRESS_KIND_HID_RAW_REPORT: u16 = 7;
+pub const INPUTD_INGRESS_KIND_PS2_SCANCODE: u16 = 8;
+pub const INPUTD_INGRESS_KIND_PS2_MOUSE_BYTE: u16 = 9;
+pub const INPUTD_INGRESS_FLAG_RESET_STATE: u32 = 1 << 0;
 pub const INPUTD_HID_POLICY_REPORT_CAPACITY: usize = 64;
 pub const INPUTD_HID_POLICY_DESCRIPTOR_CAPACITY: usize = 128;
 pub const INPUTD_HID_POLICY_KIND_UNKNOWN: u16 = 0;
@@ -829,6 +891,22 @@ pub struct InputKeyboardEventWire {
     pub code: u32,
     pub modifiers: u32,
     pub text: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InputPs2ScancodeWire {
+    pub scancode: u8,
+    pub translated: u8,
+    pub reserved0: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InputPs2MouseByteWire {
+    pub byte: u8,
+    pub reserved0: u8,
+    pub reserved1: u16,
 }
 
 #[repr(C)]
@@ -924,6 +1002,8 @@ pub struct InputIngressWire {
     pub flags: u32,
     pub event: super::ui::UiInputEvent,
     pub keyboard: InputKeyboardEventWire,
+    pub ps2_scancode: InputPs2ScancodeWire,
+    pub ps2_mouse_byte: InputPs2MouseByteWire,
     pub pointer_packet: InputPointerPacketWire,
     pub pointer_absolute: InputPointerAbsoluteWire,
     pub hid_keyboard: InputHidKeyboardReportWire,
@@ -1145,6 +1225,22 @@ pub struct RustosDriverProbeAliasBrokerArgs {
     pub alias_len: u64,
     pub class: u32,
     pub bus: u32,
+    pub reserved0: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RustosServiceDriverResourceBrokerArgs {
+    pub abi_version: u16,
+    pub op: u16,
+    pub flags: u32,
+    pub subject_pid: u64,
+    pub subject_tid: u64,
+    pub arg0: u64,
+    pub arg1: u64,
+    pub arg2: u64,
+    pub out_ptr: u64,
+    pub out_len: u64,
     pub reserved0: u64,
 }
 

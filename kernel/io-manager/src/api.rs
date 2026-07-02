@@ -297,7 +297,7 @@ pub mod device {
 
     pub mod input {
         pub fn has_pending_events() -> bool {
-            crate::io::device::input::has_pending_events()
+            crate::input::event_queue::has_pending_input_events()
         }
     }
 }
@@ -399,7 +399,7 @@ pub mod io {
         }
 
         pub fn service_pending() -> usize {
-            crate::driver::virtio_gpu::service_pending()
+            0
         }
     }
 }

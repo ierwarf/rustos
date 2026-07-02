@@ -1,7 +1,3 @@
-// RING3-MIGRATION-REFERENCE START: procd/loaderd should own process prepare,
-// image mapping policy, exec authorization, fork/wait/signal lifecycle, and
-// runtime metadata. Ring0 keeps address-space construction, handle validation,
-// and final commit/transition substrate.
 use super::*;
 
 use alloc::collections::BTreeMap;
@@ -1126,6 +1122,9 @@ fn allocate_prepare_handle(prepares: &BTreeMap<u64, ProcPrepareState>) -> Option
     None
 }
 
+// RING3-MIGRATION-REFERENCE START: capability-broker exception: procd owns
+// process-prepare admission policy. Ring0 keeps the capability-gated broker
+// handle table and calls procd before allocating privileged prepare state.
 fn procd_process_prepare_policy(format: u16) -> Result<(), i64> {
     let Some(snapshot) = multitask::current_user_snapshot() else {
         return Err(LINUX_EPERM);
@@ -1161,6 +1160,7 @@ fn procd_process_prepare_policy(format: u16) -> Result<(), i64> {
         Err(i64::from(response.status))
     }
 }
+// RING3-MIGRATION-REFERENCE END: procd-owned process-prepare admission substrate exception.
 
 fn validate_mapping_region(target_addr: u64, mem_len: u64, flags: u64) -> Result<(), i64> {
     if mem_len == 0
@@ -1277,4 +1277,3 @@ fn read_user_string_vector(
     }
     Ok(values)
 }
-// RING3-MIGRATION-REFERENCE END: procd/loaderd-owned process broker policy.

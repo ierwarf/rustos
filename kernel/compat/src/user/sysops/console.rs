@@ -1,5 +1,3 @@
-// RING3-MIGRATION-REFERENCE START: sessiond/runtimed should own console sysop
-// policy. Ring0 keeps current-process console user-copy substrate.
 use alloc::string::String;
 use core::cmp::min;
 
@@ -157,4 +155,3 @@ pub(crate) fn read_into_current_process(
 
     Ok(total_read)
 }
-// RING3-MIGRATION-REFERENCE END: sessiond/runtimed-owned console sysop policy.

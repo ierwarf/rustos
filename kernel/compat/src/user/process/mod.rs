@@ -1,6 +1,3 @@
-// RING3-MIGRATION-REFERENCE START: loaderd/procd should own generic executable
-// loading and process launch policy. Ring0 keeps address-space commit, stack
-// construction, and final task spawn substrate.
 use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
 
@@ -250,6 +247,9 @@ impl<'a> Default for ProcessLaunchOptions<'a> {
 }
 
 #[inline(never)]
+// RING3-MIGRATION-REFERENCE START: loaderd/procd should own bootstrap Linux
+// image loading policy. Ring0 keeps this direct ELF path only for pre-loaderd
+// bootstrap services; normal launches arrive as prepared metadata.
 pub fn spawn_bootstrap_linux_process_with_launch(
     image: &[u8],
     weight_micros: u64,
@@ -265,6 +265,7 @@ fn prepare_bootstrap_linux_process_with_launch(
 ) -> Result<PreparedProcessImage, ProcessLoadError> {
     prepare_loaded_process_with_launch(linux::load_elf(image)?, launch)
 }
+// RING3-MIGRATION-REFERENCE END: loaderd/procd-owned bootstrap Linux image loading policy.
 
 pub fn prepare_windows_process_with_address_space(
     metadata: WindowsProcessLoaderRuntime,
@@ -496,4 +497,3 @@ fn align_up(value: u64, align: u64) -> Option<u64> {
         .checked_add(align - 1)
         .map(|aligned| align_down(aligned, align))
 }
-// RING3-MIGRATION-REFERENCE END: loaderd/procd-owned generic process launch policy.

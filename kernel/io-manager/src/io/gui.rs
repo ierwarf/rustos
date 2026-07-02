@@ -1,6 +1,7 @@
-// RING3-MIGRATION-REFERENCE START: uiserver should own normal display mode,
-// provider selection, and GUI presentation policy. Ring0 keeps boot framebuffer
-// transition and display substrate until service-driver display bring-up exists.
+// RING3-MIGRATION-REFERENCE START: display-present-substrate exception:
+// uiserver owns normal display mode and GUI presentation policy; driverd owns
+// provider ordering. Ring0 keeps boot framebuffer transition, explicit provider
+// registration validation, and fast present substrate.
 mod backend;
 mod framebuffer;
 
@@ -107,13 +108,6 @@ pub unsafe extern "C" fn register_driver_framebuffer(
     0
 }
 
-pub(crate) fn install_native_driver_framebuffer(framebuffer: FramebufferInfo) -> bool {
-    if framebuffer.validate().is_err() {
-        return false;
-    }
-    backend::install_driver_framebuffer(framebuffer, DISPLAY_INFO_FLAG_PRIMARY_PROVIDER)
-}
-
 pub(crate) fn install_boot_framebuffer_fallback(framebuffer: FramebufferInfo) -> bool {
     if framebuffer.validate().is_err() {
         return false;
@@ -213,4 +207,4 @@ fn finish_userspace_display_transition() {
         crate::debug::println!("userspace display active");
     }
 }
-// RING3-MIGRATION-REFERENCE END: uiserver-owned GUI/display policy.
+// RING3-MIGRATION-REFERENCE END: uiserver-owned GUI/display substrate exception.

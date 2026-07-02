@@ -1,6 +1,3 @@
-// RING3-MIGRATION-REFERENCE START: syscalld/procd/vfsd/netd should own Linux
-// syscall offload policy. Ring0 keeps bounded payload copy and lifecycle drain
-// substrate.
 use alloc::vec::Vec;
 
 use lazy_static::lazy_static;
@@ -90,4 +87,3 @@ pub(super) fn drain_lifecycle_events(args: &LifecycleDrainBrokerArgs) -> Result<
         .map_err(address_space_error_to_linux_errno)?;
     Ok(out_count as u64)
 }
-// RING3-MIGRATION-REFERENCE END: service-owned Linux syscall offload policy.

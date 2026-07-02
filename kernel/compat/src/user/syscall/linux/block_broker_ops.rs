@@ -1,6 +1,5 @@
-// RING3-MIGRATION-REFERENCE START: vfsd/storaged should own boot-info and
-// boot-block read policy. Ring0 keeps a gated physical block broker because
-// early boot-volume reads require privileged storage substrate.
+// RING3-MIGRATION-REFERENCE START: vfsd/storaged should own post-bootstrap
+// boot extent policy. Ring0 keeps the gated physical boot-block read substrate.
 use super::*;
 
 use alloc::vec::Vec;
@@ -113,4 +112,4 @@ fn storage_error_to_linux_errno(err: storage_core::StorageError) -> i64 {
         | storage_core::StorageError::DeviceFault => LINUX_EIO,
     }
 }
-// RING3-MIGRATION-REFERENCE END: vfsd/storaged-owned boot block broker policy.
+// RING3-MIGRATION-REFERENCE END: vfsd/storaged-owned boot-block substrate exception.

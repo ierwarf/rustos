@@ -7,22 +7,27 @@ use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, LinuxSyscallOffloadRequest,
     LinuxSyscallOffloadResponse, RustosDriverLoadModuleBrokerArgs,
-    RustosDriverProbeAliasBrokerArgs, COMMERCIAL_MAX_DRIVERD_OP_DRIVER_PLAN,
-    COMMERCIAL_MAX_DRIVERD_OP_FALLBACK_POLICY, COMMERCIAL_MAX_DRIVERD_OP_MODULE_LOAD_AUTHORIZE,
-    COMMERCIAL_MAX_DRIVERD_OP_PROVIDER_SELECT, COMMERCIAL_MAX_DRIVERD_OP_RETRY_BUDGET,
-    COMMERCIAL_MAX_DRIVERD_OP_SYMBOL_POLICY, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
-    COMMERCIAL_MAX_PROTOCOL_DRIVERD, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
-    COMMERCIAL_MAX_PROTOCOL_SERVICE_DRIVERD, COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DMA_BUFFER,
-    COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DRIVER_INSTANCE, COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IRQ_ROUTE,
+    RustosDriverProbeAliasBrokerArgs, RustosServiceDriverResourceBrokerArgs,
+    COMMERCIAL_MAX_DRIVERD_OP_DRIVER_PLAN, COMMERCIAL_MAX_DRIVERD_OP_FALLBACK_POLICY,
+    COMMERCIAL_MAX_DRIVERD_OP_MODULE_LOAD_AUTHORIZE, COMMERCIAL_MAX_DRIVERD_OP_PROVIDER_SELECT,
+    COMMERCIAL_MAX_DRIVERD_OP_RETRY_BUDGET, COMMERCIAL_MAX_DRIVERD_OP_SYMBOL_POLICY,
+    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_DRIVERD,
+    COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_SERVICE_DRIVERD,
+    COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DMA_BUFFER,
+    COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DRIVER_INSTANCE,
+    COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IO_PORT_LEASE, COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IRQ_ROUTE,
     COMMERCIAL_MAX_SERVICE_DRIVERD_OP_MMIO_LEASE, DRIVER_BUS_PCI, DRIVER_BUS_PLATFORM,
     DRIVER_BUS_SERIO, DRIVER_BUS_USB, DRIVER_BUS_VIRTIO, DRIVER_CLASS_DISPLAY, DRIVER_CLASS_INPUT,
     DRIVER_CLASS_NETWORK, DRIVER_CLASS_STORAGE, DRIVER_CLASS_USB,
     DRIVER_LOAD_POLICY_DISPLAY_FALLBACK, DRIVER_LOAD_POLICY_DISPLAY_PREFERRED_SCANOUT,
     DRIVER_LOAD_POLICY_DISPLAY_PRIMARY, IPC_SERVICE_DRIVERD, IPC_SERVICE_SERVICE_DRIVERD,
-    SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_DRIVER_LOAD_POLICY,
-    SYSCALL_OFFLOAD_PATH_CAPACITY, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER,
-    SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV,
-    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
+    SERVICE_DRIVER_RESOURCE_BROKER_ABI_VERSION, SERVICE_DRIVER_RESOURCE_OP_DMA_BUFFER,
+    SERVICE_DRIVER_RESOURCE_OP_IO_PORT_LEASE, SERVICE_DRIVER_RESOURCE_OP_IRQ_ROUTE,
+    SERVICE_DRIVER_RESOURCE_OP_MMIO_LEASE, SYSCALL_OFFLOAD_ABI_VERSION,
+    SYSCALL_OFFLOAD_OP_DRIVER_LOAD_POLICY, SYSCALL_OFFLOAD_PATH_CAPACITY, SYS_RUSTOS_DEBUG_PRINT,
+    SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER, SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER,
+    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_SERVICE_DRIVER_RESOURCE_BROKER,
 };
 
 const RECV_BACKOFF: Duration = Duration::from_millis(10);
@@ -601,10 +606,39 @@ fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result
             _ => Err(libc::EINVAL),
         },
         COMMERCIAL_MAX_PROTOCOL_SERVICE_DRIVERD => match request.header.op {
-            COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DRIVER_INSTANCE
-            | COMMERCIAL_MAX_SERVICE_DRIVERD_OP_MMIO_LEASE
-            | COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IRQ_ROUTE
-            | COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DMA_BUFFER => Ok(()),
+            COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DRIVER_INSTANCE => Ok(()),
+            COMMERCIAL_MAX_SERVICE_DRIVERD_OP_MMIO_LEASE => {
+                if request.arg0 == 0 || request.arg1 == 0 {
+                    Err(libc::EINVAL)
+                } else {
+                    Ok(())
+                }
+            }
+            COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IRQ_ROUTE => {
+                if request.arg0 > u32::MAX as u64 || request.arg1 > u32::MAX as u64 {
+                    Err(libc::EINVAL)
+                } else {
+                    Ok(())
+                }
+            }
+            COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DMA_BUFFER => {
+                if request.arg0 == 0 || request.arg1 != 0 && !request.arg1.is_power_of_two() {
+                    Err(libc::EINVAL)
+                } else {
+                    Ok(())
+                }
+            }
+            COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IO_PORT_LEASE => {
+                if request.arg0 > u16::MAX as u64
+                    || request.arg1 == 0
+                    || request.arg1 > u16::MAX as u64
+                    || request.arg0.saturating_add(request.arg1 - 1) > u16::MAX as u64
+                {
+                    Err(libc::EINVAL)
+                } else {
+                    Ok(())
+                }
+            }
             _ => Err(libc::EINVAL),
         },
         _ => Err(libc::EINVAL),
@@ -693,7 +727,11 @@ fn dispatch_service_driver_request(
                 request.arg1,
             );
             response.capability = service_driver_capability("mmio-lease", request.header.op);
-            0
+            fill_service_driver_resource_payload(
+                request,
+                SERVICE_DRIVER_RESOURCE_OP_MMIO_LEASE,
+                response,
+            )
         }
         COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IRQ_ROUTE => {
             response.descriptor_count = 1;
@@ -704,7 +742,11 @@ fn dispatch_service_driver_request(
                 request.arg1,
             );
             response.capability = service_driver_capability("irq-route", request.header.op);
-            0
+            fill_service_driver_resource_payload(
+                request,
+                SERVICE_DRIVER_RESOURCE_OP_IRQ_ROUTE,
+                response,
+            )
         }
         COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DMA_BUFFER => {
             response.descriptor_count = 1;
@@ -715,9 +757,75 @@ fn dispatch_service_driver_request(
                 request.arg1,
             );
             response.capability = service_driver_capability("dma-buffer", request.header.op);
-            0
+            fill_service_driver_resource_payload(
+                request,
+                SERVICE_DRIVER_RESOURCE_OP_DMA_BUFFER,
+                response,
+            )
+        }
+        COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IO_PORT_LEASE => {
+            response.descriptor_count = 1;
+            response.descriptors[0] = service_driver_descriptor(
+                "io-port-lease",
+                request.header.op,
+                request.arg0,
+                request.arg1,
+            );
+            response.capability = service_driver_capability("io-port-lease", request.header.op);
+            fill_service_driver_resource_payload(
+                request,
+                SERVICE_DRIVER_RESOURCE_OP_IO_PORT_LEASE,
+                response,
+            )
         }
         _ => libc::EINVAL,
+    }
+}
+
+fn fill_service_driver_resource_payload(
+    request: &CommercialMaxProtocolRequest,
+    broker_op: u16,
+    response: &mut CommercialMaxProtocolResponse,
+) -> i32 {
+    let args = RustosServiceDriverResourceBrokerArgs {
+        abi_version: SERVICE_DRIVER_RESOURCE_BROKER_ABI_VERSION,
+        op: broker_op,
+        flags: request.header.flags as u32,
+        subject_pid: request.header.subject_pid,
+        subject_tid: request.header.subject_tid,
+        arg0: request.arg0,
+        arg1: request.arg1,
+        arg2: 0,
+        out_ptr: response.payload.as_mut_ptr() as u64,
+        out_len: response.payload.len() as u64,
+        reserved0: 0,
+    };
+    let status = syscall1(
+        SYS_RUSTOS_SERVICE_DRIVER_RESOURCE_BROKER,
+        (&args as *const RustosServiceDriverResourceBrokerArgs) as u64,
+    );
+    if status < 0 {
+        return (-status) as i32;
+    }
+    response.payload_len = service_driver_resource_payload_len(broker_op);
+    0
+}
+
+fn service_driver_resource_payload_len(op: u16) -> u32 {
+    match op {
+        SERVICE_DRIVER_RESOURCE_OP_MMIO_LEASE => {
+            size_of::<rustos_user_abi::syscall::ServiceDriverMmioLeaseWire>() as u32
+        }
+        SERVICE_DRIVER_RESOURCE_OP_IRQ_ROUTE => {
+            size_of::<rustos_user_abi::syscall::ServiceDriverIrqRouteWire>() as u32
+        }
+        SERVICE_DRIVER_RESOURCE_OP_DMA_BUFFER => {
+            size_of::<rustos_user_abi::syscall::ServiceDriverDmaBufferWire>() as u32
+        }
+        SERVICE_DRIVER_RESOURCE_OP_IO_PORT_LEASE => {
+            size_of::<rustos_user_abi::syscall::ServiceDriverIoPortLeaseWire>() as u32
+        }
+        _ => 0,
     }
 }
 
@@ -817,6 +925,7 @@ fn service_driver_capability_mask(op: u16) -> u64 {
         COMMERCIAL_MAX_SERVICE_DRIVERD_OP_MMIO_LEASE => 1 << 1,
         COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IRQ_ROUTE => 1 << 2,
         COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DMA_BUFFER => 1 << 3,
+        COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IO_PORT_LEASE => 1 << 4,
         _ => 0,
     }
 }

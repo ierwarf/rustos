@@ -52,7 +52,23 @@ pub(crate) fn print_inventory(config: &Config) -> Result<()> {
         .filter(|entry| {
             matches!(
                 entry.lane,
-                "compat-ring0-exception" | "ring3-owner-reference" | "already-migrated-reference"
+                "compat-ring0-exception"
+                    | "bootstrap-ring0-exception"
+                    | "hot-path-ring0-exception"
+                    | "hardware-probe-ring0-exception"
+                    | "syscall-decode-ring0-exception"
+                    | "capability-broker-ring0-exception"
+                    | "input-ingress-ring0-exception"
+                    | "scheduler-thread-substrate-exception"
+                    | "memfd-kernel-substrate-exception"
+                    | "signal-frame-substrate-exception"
+                    | "usb-runtime-substrate-exception"
+                    | "display-present-substrate-exception"
+                    | "bootstrap-device-route-exception"
+                    | "vfs-bootstrap-hotpath-exception"
+                    | "abi-substrate-reference"
+                    | "ring3-owner-reference"
+                    | "already-migrated-reference"
             )
         })
         .map(|entry| entry.marked_loc)
@@ -62,7 +78,13 @@ pub(crate) fn print_inventory(config: &Config) -> Result<()> {
         .filter(|entry| entry.lane == "service-driver-host")
         .map(|entry| entry.marked_loc)
         .sum::<usize>();
+    let cleanup_debt = entries
+        .iter()
+        .filter(|entry| entry.lane == "legacy-native-removal")
+        .map(|entry| entry.marked_loc)
+        .sum::<usize>();
     let active = total.saturating_sub(excluded);
+    let migration_candidate = active.saturating_sub(cleanup_debt);
 
     println!("ring3 migration inventory");
     println!("total_marked_loc={total}");
@@ -70,6 +92,8 @@ pub(crate) fn print_inventory(config: &Config) -> Result<()> {
     println!("commented_out_loc={commented_out}");
     println!("excluded_exception_loc={excluded}");
     println!("service_driver_host_loc={service_driver_host}");
+    println!("cleanup_debt_loc={cleanup_debt}");
+    println!("migration_candidate_loc={migration_candidate}");
     println!("active_batch_marked_loc={active}");
     println!();
     println!("loc\treference\tcommented_out\tlane\towner\taction\tpath");
@@ -157,7 +181,13 @@ fn marked_source_loc(content: &str, marker_start: &str, marker_end: &str) -> usi
 fn owner_for_path(path: &Path) -> &'static str {
     let path = path.to_string_lossy();
     if path.contains("/usb/xhci.rs") {
-        "usbdrv-driverd"
+        "driverd-devmgrd-inputd"
+    } else if path.contains("/driver/serio.rs") {
+        "linux-ko-compat"
+    } else if path.contains("/input/i8042.rs") {
+        "inputd"
+    } else if path.contains("/virtio_gpu.rs") {
+        "display-ko-compat"
     } else if path.contains("/usb/core.rs") {
         "driverd-devmgrd-inputd"
     } else if path.contains("/storage/ahci.rs") {
@@ -168,6 +198,7 @@ fn owner_for_path(path: &Path) -> &'static str {
         || path.contains("/driver/devres.rs")
         || path.contains("/driver/export.rs")
         || path.contains("/driver/kernel_api.rs")
+        || path.contains("/driver/loader.rs")
         || path.contains("/driver/module_registry.rs")
     {
         "linux-ko-compat"
@@ -217,6 +248,8 @@ fn owner_for_path(path: &Path) -> &'static str {
         "syscalld-loaderd"
     } else if path.ends_with("/compat/src/user/sysops/mod.rs") {
         "vfsd-devmgrd-sessiond"
+    } else if path.ends_with("/compat/src/user/mod.rs") {
+        "syscalld-loaderd-procd-vfsd-netd"
     } else if path.contains("/memfd.rs") {
         "pagerd-procd"
     } else if path.contains("/sysops/console.rs") {
@@ -263,26 +296,94 @@ fn lane_for_path(path: &Path) -> &'static str {
         || path.contains("/driver/devres.rs")
         || path.contains("/driver/export.rs")
         || path.contains("/driver/kernel_api.rs")
+        || path.contains("/driver/loader.rs")
         || path.contains("/driver/module_registry.rs")
+        || path.contains("/usb/emulation.rs")
     {
         "compat-ring0-exception"
-    } else if path.contains("services/vfsd/") {
-        "ring3-owner-reference"
-    } else if path.contains("/sysops/stat.rs") || path.ends_with("/ps/src/user/linux.rs") {
-        "already-migrated-reference"
-    } else if path.contains("/usb/xhci.rs")
+    } else if path.ends_with("/compat/src/user/process/linux.rs")
+        || path.ends_with("/compat/src/user/console_host.rs")
+        || path.contains("/memory_ops.rs")
+        || path.contains("/block_broker_ops.rs")
         || path.contains("/storage/ahci.rs")
         || path.contains("/storage/nvme.rs")
+        || path.contains("/storage/boot_volume.rs")
+        || path.ends_with("/storage/block.rs")
+        || path.contains("/storage/block/boot.rs")
+        || path.contains("/storage/block/io.rs")
+        || path.contains("/io/console.rs")
+        || path.contains("/io/tty.rs")
     {
-        "service-driver-host"
+        "bootstrap-ring0-exception"
+    } else if path.contains("/service_ops/ipc_helpers.rs") {
+        "bootstrap-device-route-exception"
+    } else if path.contains("/sysops/device.rs") || path.contains("/io/device/display.rs") {
+        "hot-path-ring0-exception"
+    } else if path.ends_with("/driver/mod.rs") {
+        "hardware-probe-ring0-exception"
+    } else if path.contains("/syscall/windows/") {
+        "syscall-decode-ring0-exception"
+    } else if path.contains("/lifecycle_broker_ops.rs")
+        || path.contains("/proc_broker_ops.rs")
+        || path.contains("/device_broker_ops.rs")
+        || path.contains("/driver_broker_ops.rs")
+        || path.contains("/ipc_ops.rs")
+        || path.ends_with("/broker_ops.rs")
+    {
+        "capability-broker-ring0-exception"
+    } else if path.contains("/service_ops/vfs_meta.rs") {
+        "vfs-bootstrap-hotpath-exception"
+    } else if path.contains("/service_ops/futex_thread.rs")
+        || path.contains("/service_ops/process_time.rs")
+    {
+        "scheduler-thread-substrate-exception"
+    } else if path.contains("/input/i8042.rs")
+        || path.contains("/input_core.rs")
+        || path.contains("/input/event_queue.rs")
+        || path.ends_with("/input/mod.rs")
+        || path.ends_with("/driver/input.rs")
+        || path.contains("/input_broker_ops.rs")
+        || path.contains("/input/dispatcher.rs")
+        || path.contains("/input/keyboard.rs")
+        || path.contains("/usb/runtime.rs")
+    {
+        "input-ingress-ring0-exception"
+    } else if path.contains("/memfd.rs") {
+        "memfd-kernel-substrate-exception"
+    } else if path.contains("/io/gui") {
+        "display-present-substrate-exception"
+    } else if path.contains("/usb/xhci.rs")
+        || path.contains("/usb/core.rs")
+        || path.contains("/usb/manager.rs")
+        || path.ends_with("/usb/mod.rs")
+    {
+        "usb-runtime-substrate-exception"
+    } else if path.ends_with("/compat/src/user/mod.rs")
+        || path.ends_with("/compat/src/user/sysops/mod.rs")
+    {
+        "abi-substrate-reference"
+    } else if path.contains("/syscall/linux/support.rs") {
+        "signal-frame-substrate-exception"
+    } else if path.contains("services/vfsd/") {
+        "ring3-owner-reference"
+    } else if path.contains("/sysops/stat.rs")
+        || path.ends_with("/ps/src/user/linux.rs")
+        || path.ends_with("/compat/src/user/process/mod.rs")
+        || path.contains("/socket.rs")
+        || path.contains("/epoll.rs")
+        || path.contains("/io/session.rs")
+    {
+        "already-migrated-reference"
+    } else if path.contains("/driver/serio.rs") {
+        "compat-ring0-exception"
+    } else if path.contains("/virtio_gpu.rs") {
+        "legacy-native-removal"
     } else if path.contains("/process/")
         || path.contains("/proc_broker_ops.rs")
         || path.contains("/ipc_ops.rs")
-        || path.contains("/virtio_gpu.rs")
     {
         "abi-first-large"
     } else if path.contains("/usb/")
-        || path.contains("/serio.rs")
         || path.contains("/input/")
         || path.contains("/io/gui")
         || path.contains("/io/tty.rs")
@@ -300,21 +401,106 @@ fn lane_for_path(path: &Path) -> &'static str {
 
 fn action_for_path(path: &Path) -> &'static str {
     let path = path.to_string_lossy();
-    if path.contains("/usb/xhci.rs")
-        || path.contains("/storage/ahci.rs")
-        || path.contains("/storage/nvme.rs")
-    {
-        "migrate non-.ko service-driver to ring3 host, or document explicit privileged substrate exception"
+    if path.contains("/usb/xhci.rs") {
+        "RustOS native xHCI MMIO/DMA/IRQ transfer substrate exception; provider/device/input policy is driverd/devmgrd/inputd-owned"
+    } else if path.contains("/driver/serio.rs") {
+        "explicit Linux .ko serio compatibility bus substrate exception; do not migrate .ko execution to ring3"
+    } else if path.contains("/input/i8042.rs") {
+        "i8042 raw input ingress substrate exception; keyboard/mouse policy is inputd-owned"
+    } else if path.contains("/virtio_gpu.rs") {
+        "legacy native virtio-gpu fallback must stay deleted; use Linux .ko virtio-gpu/virtio-drm"
     } else if path.contains("/driver/linux/")
         || path.contains("/driver/devres.rs")
         || path.contains("/driver/export.rs")
         || path.contains("/driver/kernel_api.rs")
+        || path.contains("/driver/loader.rs")
         || path.contains("/driver/module_registry.rs")
+        || path.contains("/usb/emulation.rs")
     {
         "explicit Linux .ko ring0 compatibility substrate exception; do not migrate .ko execution to ring3"
+    } else if path.ends_with("/compat/src/user/process/linux.rs") {
+        "pre-loaderd bootstrap Linux ELF substrate exception; normal ELF policy is loaderd/procd-owned"
+    } else if path.ends_with("/compat/src/user/console_host.rs") {
+        "pre-loaderd bootstrap console-host substrate exception; normal launch policy is loaderd/sessiond-owned"
+    } else if path.contains("/memory_ops.rs") {
+        "pre-syscalld bootstrap memory substrate exception; post-bootstrap mmap/brk policy is syscalld-owned"
+    } else if path.contains("/block_broker_ops.rs") {
+        "physical boot-block substrate exception; boot extent policy is storaged/vfsd-owned"
+    } else if path.contains("/storage/ahci.rs") {
+        "built-in AHCI bootstrap transport exception; post-bootstrap storage/provider policy is storaged/driverd-owned"
+    } else if path.contains("/storage/nvme.rs") {
+        "built-in NVMe bootstrap transport exception; post-bootstrap storage/provider policy is storaged/driverd-owned"
+    } else if path.contains("/storage/boot_volume.rs") {
+        "boot-volume bootstrap substrate exception; normal rootfs policy is vfsd/storaged-owned"
+    } else if path.ends_with("/storage/block.rs")
+        || path.contains("/storage/block/boot.rs")
+        || path.contains("/storage/block/io.rs")
+    {
+        "physical boot-block substrate exception; post-bootstrap block policy is storaged/pagerd-owned"
+    } else if path.contains("/io/console.rs") {
+        "bootstrap console buffer substrate exception; console presentation policy is sessiond/runtimed-owned"
+    } else if path.contains("/io/tty.rs") {
+        "bootstrap TTY buffer substrate exception; normal line discipline and session routing are sessiond/runtimed-owned"
+    } else if path.contains("/service_ops/ipc_helpers.rs") {
+        "fixed bootstrap spawn and explicit device-route substrate exception; rootd/loaderd/vfsd/devmgrd own policy"
+    } else if path.contains("/sysops/device.rs") {
+        "hot display-present ioctl substrate exception; policy-sensitive ioctls route through devmgrd/sessiond"
+    } else if path.contains("/io/device/display.rs") {
+        "hot display ioctl execution substrate exception; admission and routing policy is devmgrd/uiserver-owned"
+    } else if path.ends_with("/driver/mod.rs") {
+        "privileged hardware-probe substrate exception; driver/provider policy is driverd-owned"
+    } else if path.contains("/syscall/windows/") {
+        "Win32 syscall decode substrate exception; syscall policy is syscalld/loaderd-owned"
+    } else if path.contains("/lifecycle_broker_ops.rs") {
+        "capability-gated lifecycle event substrate exception; restart policy is procd/rootd-owned"
+    } else if path.contains("/proc_broker_ops.rs") {
+        "capability-gated process prepare substrate exception; admission policy is procd-owned"
+    } else if path.contains("/device_broker_ops.rs") {
+        "capability-gated device/session ioctl substrate exception; policy is devmgrd/sessiond-owned"
+    } else if path.contains("/ipc_ops.rs") {
+        "service endpoint registry and capability-gate substrate exception; rootd owns capability lease policy"
+    } else if path.contains("/service_ops/vfs_meta.rs") {
+        "bootstrap stat and hot ioctl route substrate exception; policy is vfsd/devmgrd/sessiond-owned"
+    } else if path.contains("/service_ops/futex_thread.rs")
+        || path.contains("/service_ops/process_time.rs")
+    {
+        "scheduler/thread substrate exception; futex, clone, and time admission policy is procd/syscalld-owned"
+    } else if path.contains("/input/i8042.rs")
+        || path.contains("/input_core.rs")
+        || path.contains("/input/event_queue.rs")
+        || path.ends_with("/input/mod.rs")
+        || path.ends_with("/driver/input.rs")
+        || path.contains("/input_broker_ops.rs")
+        || path.contains("/input/dispatcher.rs")
+        || path.contains("/input/keyboard.rs")
+        || path.contains("/usb/runtime.rs")
+    {
+        "bounded input ingress substrate exception; read/coalescing/evdev policy is inputd-owned"
+    } else if path.contains("/memfd.rs") {
+        "memfd fd/frame/page-table substrate exception; creation and mapping admission policy is syscalld/pagerd-owned"
+    } else if path.contains("/io/gui") {
+        "display present/framebuffer substrate exception; mode, damage, and presentation policy is uiserver-owned"
+    } else if path.contains("/usb/xhci.rs")
+        || path.contains("/usb/core.rs")
+        || path.contains("/usb/manager.rs")
+        || path.ends_with("/usb/mod.rs")
+    {
+        "USB native/compat runtime substrate exception; provider/device/input policy is driverd/devmgrd/inputd-owned"
+    } else if path.ends_with("/compat/src/user/mod.rs")
+        || path.ends_with("/compat/src/user/sysops/mod.rs")
+    {
+        "ring0 ABI module substrate; compat policy is owned by services"
+    } else if path.contains("/syscall/linux/support.rs") {
+        "Linux signal frame substrate exception; pending-signal selection and disposition policy is procd-owned"
     } else if path.contains("services/vfsd/") {
         "already ring3 service owner; marker restored for historical audit only"
-    } else if path.contains("/sysops/stat.rs") || path.ends_with("/ps/src/user/linux.rs") {
+    } else if path.contains("/sysops/stat.rs")
+        || path.ends_with("/ps/src/user/linux.rs")
+        || path.ends_with("/compat/src/user/process/mod.rs")
+        || path.contains("/socket.rs")
+        || path.contains("/epoll.rs")
+        || path.contains("/io/session.rs")
+    {
         "already migrated/shared ABI reference; marker restored for historical audit only"
     } else if path.contains("/usb/core.rs") {
         "move USB interface admission/provider policy into driverd/devmgrd/inputd, keep compat callback substrate"
@@ -362,8 +548,6 @@ fn action_for_path(path: &Path) -> &'static str {
         "move Win32 syscall policy into syscalld/loaderd, keep syscall decode substrate"
     } else if path.ends_with("/compat/src/user/sysops/mod.rs") {
         "move sysop namespace policy into vfsd/devmgrd/sessiond, keep module routing substrate"
-    } else if path.contains("/memfd.rs") {
-        "move memfd lifecycle policy into pagerd/procd, keep frame backing substrate"
     } else if path.contains("/sysops/console.rs") || path.contains("/console_host.rs") {
         "move console host/sysop policy into loaderd/sessiond/runtimed"
     } else if path.contains("/usb/runtime.rs") || path.contains("/usb/synthetic.rs") {

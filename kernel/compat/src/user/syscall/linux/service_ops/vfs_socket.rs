@@ -1,6 +1,3 @@
-// RING3-MIGRATION-REFERENCE START: vfsd/netd should own Linux VFS and socket
-// namespace policy. Ring0 keeps fd-table mutation, user-copy, handle install,
-// and bootstrap/device bridge substrate.
 use super::*;
 
 pub fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64) -> u64 {
@@ -769,4 +766,3 @@ fn read_socket_writev_payload(iov_ptr: u64, iovcnt: u64) -> Result<Vec<u8>, i64>
     }
     Ok(payload)
 }
-// RING3-MIGRATION-REFERENCE END: vfsd/netd-owned VFS and socket syscall policy.

@@ -1,6 +1,3 @@
-// RING3-MIGRATION-REFERENCE START: rootd/loaderd/procd/vfsd should own direct
-// service-call routing policy. Ring0 keeps IPC call framing and user-copy
-// substrate.
 use super::*;
 use alloc::string::String;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -11,6 +8,10 @@ const MAX_SLOW_SERVICE_CALL_LOGS: usize = 20;
 
 static SLOW_SERVICE_CALL_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+// RING3-MIGRATION-REFERENCE START: bootstrap-device-route exception: rootd owns
+// the bootstrap manifest/restart policy and loaderd owns normal spawn policy.
+// Ring0 keeps the direct spawn substrate only for the fixed pre-loaderd core
+// service bootstrap plus loaderd recovery path.
 pub fn syscall_linux_loader_spawn_exec(
     path_ptr: u64,
     _argv_ptr: u64,
@@ -88,6 +89,8 @@ fn spawn_bootstrap_exec_direct(
         .map(|spawned| spawned.pid)
         .map_err(console_host_error_to_linux_errno)
 }
+// RING3-MIGRATION-REFERENCE END: rootd/loaderd bootstrap spawn substrate exception.
+
 fn console_host_error_to_linux_errno(error: crate::user::console_host::ConsoleHostError) -> i64 {
     match error {
         crate::user::console_host::ConsoleHostError::BootstrapBlocked => LINUX_EAGAIN,
@@ -161,24 +164,22 @@ pub fn procd_exec(
         Ok(path) => path,
         Err(errno) => return linux_errno(errno),
     };
-    let Some(process_id) = multitask::current_user_process_id() else {
-        return linux_errno(LINUX_ESRCH);
-    };
-    let exec_path = match crate::user::sysops::file::resolve_path_for_process(
-        process_id,
-        raw_exec_path.as_str(),
-    ) {
-        Ok(path) => path,
-        Err(errno) => return linux_errno(file_sysop_error_to_linux_errno(errno)),
+    let current_cwd = match multitask::with_current_user_process_state(|_, _, process_state| {
+        String::from(process_state.cwd())
+    }) {
+        Some(cwd) => cwd,
+        None => return linux_errno(LINUX_ESRCH),
     };
     let mut request = new_procd_request(op);
     request.dirfd = (linux_abi::AT_FDCWD as i64) as u64;
     request.flags = flags as u32;
-    if exec_path.len() > request.path.len() {
+    if raw_exec_path.len() > request.path.len() || current_cwd.len() > request.payload.len() {
         return linux_errno(LINUX_EINVAL);
     }
-    request.path_len = exec_path.len() as u32;
-    request.path[..exec_path.len()].copy_from_slice(exec_path.as_bytes());
+    request.path_len = raw_exec_path.len() as u32;
+    request.path[..raw_exec_path.len()].copy_from_slice(raw_exec_path.as_bytes());
+    request.payload_len = current_cwd.len() as u32;
+    request.payload[..current_cwd.len()].copy_from_slice(current_cwd.as_bytes());
     if let Err(errno) = copy_string_vector(
         argv_ptr,
         LOADER_SPAWN_MAX_ARG_COUNT,
@@ -208,13 +209,6 @@ fn is_linux_at_fdcwd(dirfd: u64) -> bool {
     const AT_FDCWD_I64: u64 = (-100_i64) as u64;
     const AT_FDCWD_I32: u64 = 0xffff_ff9c;
     dirfd == AT_FDCWD_I64 || dirfd == AT_FDCWD_I32 || dirfd == linux_abi::AT_FDCWD as u64
-}
-
-fn file_sysop_error_to_linux_errno(error: crate::user::sysops::file::FileSysopError) -> i64 {
-    match error {
-        crate::user::sysops::file::FileSysopError::InvalidArgument => LINUX_EINVAL,
-        crate::user::sysops::file::FileSysopError::NotFound => LINUX_ENOENT,
-    }
 }
 
 pub fn procd_fork(
@@ -392,12 +386,16 @@ pub fn call_vfs_ipc_request(request: &VfsIpcRequest) -> Result<VfsIpcResponse, i
     Ok(response)
 }
 
+// RING3-MIGRATION-REFERENCE START: bootstrap-device-route exception: vfsd and
+// devmgrd own explicit device path routing. Ring0 keeps this fixed pre-devmgrd
+// mirror set plus IPC/open-fd transfer helper.
 pub fn is_devmgrd_open_path(path: &str) -> bool {
     matches!(
         path,
         "/dev/input0" | "/dev/input/event0" | "/dev/display0" | "/dev/dri/card0" | "/dev/console0"
     )
 }
+// RING3-MIGRATION-REFERENCE END: vfsd/devmgrd device-route substrate exception.
 
 pub fn current_input_device_access(fd: u64) -> Option<(u16, u64)> {
     multitask::with_current_user_process_state(|_, _, process_state| {
@@ -1068,4 +1066,3 @@ pub fn copy_current_user_path(ptr: u64, capacity: usize) -> Result<String, i64> 
     }
     Ok(path)
 }
-// RING3-MIGRATION-REFERENCE END: service-owned direct IPC helper policy.

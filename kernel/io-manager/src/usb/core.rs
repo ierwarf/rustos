@@ -1,7 +1,7 @@
-// RING3-MIGRATION-REFERENCE START: driverd/devmgrd/inputd should own USB
-// interface admission, provider matching, and class routing. Ring0 keeps Linux
-// .ko callback invocation plus compat object lifetime as the privileged bridge
-// substrate until those policies are brokered by services.
+// RING3-MIGRATION-REFERENCE START: usb-runtime-substrate exception:
+// driverd/devmgrd/inputd own USB provider, device, and input policy. Ring0
+// keeps Linux .ko callback invocation, synthetic interface materialization, and
+// compat object lifetime as the privileged bridge substrate.
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ffi::c_void;
@@ -468,4 +468,4 @@ fn c_string_bytes(value: &str) -> Box<[u8]> {
     bytes.push(0);
     bytes.into_boxed_slice()
 }
-// RING3-MIGRATION-REFERENCE END: driverd/devmgrd/inputd-owned USB interface policy.
+// RING3-MIGRATION-REFERENCE END: USB compat/runtime bridge substrate exception.

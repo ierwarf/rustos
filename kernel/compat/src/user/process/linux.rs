@@ -1,7 +1,7 @@
-// RING3-MIGRATION-REFERENCE START: loaderd/procd should own normal Linux ELF
+// RING3-MIGRATION-REFERENCE START: loaderd/procd own normal Linux ELF
 // validation, mapping policy, interpreter selection, and runtime metadata.
-// Ring0 keeps this bootstrap-local ELF materializer only until bootstrap image
-// preparation can be represented entirely as service-owned map/commit metadata.
+// Ring0 keeps this bootstrap-local ELF materializer only for the fixed
+// pre-loaderd service bootstrap path.
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -1617,7 +1617,7 @@ fn make_interpreter_load_error(path: &str, error: vfs::VfsError) -> ProcessLoadE
 fn load_interpreter_image(path: &str) -> Result<Vec<u8>, ProcessLoadError> {
     vfs::read_path_to_vec_for_kernel(path).map_err(|error| make_interpreter_load_error(path, error))
 }
-// RING3-MIGRATION-REFERENCE END: loaderd/procd-owned Linux ELF materialization policy.
+// RING3-MIGRATION-REFERENCE END: loaderd/procd-owned bootstrap Linux ELF substrate exception.
 
 fn as_bytes<T>(value: &T) -> &[u8] {
     unsafe { slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }

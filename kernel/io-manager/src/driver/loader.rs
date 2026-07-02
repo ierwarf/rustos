@@ -1,3 +1,7 @@
+// RING3-MIGRATION-REFERENCE START: Linux .ko module loader is an explicit
+// ring0 compatibility substrate. Driver load/admission policy is driverd-owned;
+// ring0 keeps ELF relocation, module memory permissions, symbol binding, and
+// init execution because Linux .ko execution is intentionally ring0.
 use alloc::vec;
 use alloc::vec::Vec;
 use core::arch::asm;
@@ -3243,3 +3247,4 @@ mod tests {
         );
     }
 }
+// RING3-MIGRATION-REFERENCE END: Linux .ko module loader compatibility substrate exception.

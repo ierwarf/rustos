@@ -6,8 +6,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::sync::KernelSpinLock as Mutex;
 use heapless::Deque as HeaplessDeque;
 use rustos_user_abi::syscall::{
-    INPUTD_HID_POLICY_DESCRIPTOR_CAPACITY, INPUTD_HID_POLICY_KIND_KEYBOARD,
-    INPUTD_HID_POLICY_KIND_POINTER, INPUTD_HID_POLICY_KIND_UNKNOWN,
+    INPUTD_HID_POLICY_DESCRIPTOR_CAPACITY, INPUTD_HID_POLICY_KIND_UNKNOWN,
     INPUTD_HID_POLICY_REPORT_CAPACITY, InputHidPolicyWire,
 };
 
@@ -233,10 +232,11 @@ pub(crate) fn enqueue_report(usb_device: *mut LinuxCompatUsbDevice, report: &[u8
     };
 
     if let Some(raw_report) = raw_report {
-        HID_POINTER_REPORT_COUNT.fetch_add(
-            (raw_report.kind == INPUTD_HID_POLICY_KIND_POINTER) as u64,
-            Ordering::Relaxed,
-        );
+        let descriptor_len =
+            (raw_report.descriptor_len as usize).min(raw_report.descriptor_prefix.len());
+        let is_pointer =
+            report_descriptor_has_pointer(&raw_report.descriptor_prefix[..descriptor_len]);
+        HID_POINTER_REPORT_COUNT.fetch_add(is_pointer as u64, Ordering::Relaxed);
         let _ = crate::input::event_queue::submit_hid_raw_report(raw_report);
     }
 
@@ -442,27 +442,17 @@ pub(crate) fn debug_pointer_report_count() -> u64 {
     HID_POINTER_REPORT_COUNT.load(Ordering::Relaxed)
 }
 
-// RING3-MIGRATION-REFERENCE START: inputd should own HID report classification
-// and descriptor-derived report metadata. Ring0 keeps raw USB report ingress and
-// Linux .ko URB callback substrate only.
+// RING3-MIGRATION-REFERENCE START: input-ingress exception: inputd owns HID
+// report classification and descriptor-derived report metadata. Ring0 keeps raw
+// USB report ingress and Linux .ko URB callback substrate only.
 fn hid_raw_report(device: &RuntimeUsbDevice, report: &[u8]) -> Option<InputHidPolicyWire> {
     if report.is_empty() || report.len() > INPUTD_HID_POLICY_REPORT_CAPACITY {
         return None;
     }
     let descriptor = device.report_descriptor.as_ref();
-    let kind = if report_descriptor_has_pointer(descriptor) {
-        INPUTD_HID_POLICY_KIND_POINTER
-    } else if report_descriptor_has_keyboard(descriptor) {
-        INPUTD_HID_POLICY_KIND_KEYBOARD
-    } else {
-        INPUTD_HID_POLICY_KIND_UNKNOWN
-    };
-    if kind == INPUTD_HID_POLICY_KIND_UNKNOWN {
-        return None;
-    }
     let mut wire = InputHidPolicyWire {
         source_id: device.usb_device_ptr as u64,
-        kind,
+        kind: INPUTD_HID_POLICY_KIND_UNKNOWN,
         report_len: report.len() as u16,
         descriptor_len: descriptor.len().min(INPUTD_HID_POLICY_DESCRIPTOR_CAPACITY) as u16,
         report_id: report_descriptor_id(descriptor),
@@ -482,19 +472,13 @@ fn report_descriptor_has_pointer(descriptor: &[u8]) -> bool {
     has_mouse_usage && has_x_usage && has_y_usage
 }
 
-fn report_descriptor_has_keyboard(descriptor: &[u8]) -> bool {
-    let has_keyboard_usage = descriptor.windows(2).any(|item| item == [0x09, 0x06]);
-    let has_key_usage_page = descriptor.windows(2).any(|item| item == [0x05, 0x07]);
-    has_keyboard_usage && has_key_usage_page
-}
-
 fn report_descriptor_id(descriptor: &[u8]) -> u8 {
     descriptor
         .windows(2)
         .find_map(|item| (item[0] == 0x85).then_some(item[1]))
         .unwrap_or(0)
 }
-// RING3-MIGRATION-REFERENCE END: inputd-owned HID report classification.
+// RING3-MIGRATION-REFERENCE END: inputd-owned HID report ingress exception.
 
 fn submit_control_urb(urb: *mut LinuxCompatUrb) -> i32 {
     let setup = unsafe { (*urb).setup_packet };
