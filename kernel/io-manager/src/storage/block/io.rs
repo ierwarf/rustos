@@ -18,6 +18,7 @@ use super::{
 };
 
 const BLOCK_CACHE_CAPACITY: usize = 256;
+const UNCACHED_READ_LOCK_CHUNK_CAP: usize = 128 * 1024;
 
 static BLOCK_CACHE: Mutex<Vec<BlockCacheEntry>> = Mutex::new(Vec::new());
 static BLOCK_DEVICES_PUBLISHED: AtomicBool = AtomicBool::new(false);
@@ -84,23 +85,7 @@ pub(super) fn read_blocks_uncached_local(device_id: u32, lba: u64, out: &mut [u8
             ),
         );
     }
-    let mut device = resolved.device.lock();
-    if trace {
-        let raw: *const dyn BlockDeviceOps = &**device;
-        let (data_ptr, vtable_ptr): (usize, usize) = unsafe { mem::transmute(raw) };
-        emit_storage_read_trace(
-            21,
-            device_id as u64,
-            format!(
-                "storage uncached read: dispatch dev={} data_ptr={:#x} vtable_ptr={:#x} abs_lba={}",
-                device_id,
-                data_ptr,
-                vtable_ptr,
-                resolved.start_block + lba
-            ),
-        );
-    }
-    let result = device.read_blocks(resolved.start_block + lba, out);
+    let result = read_blocks_uncached_resolved(device_id, &resolved, lba, out, trace);
     if trace {
         emit_storage_read_trace(
             22,
@@ -113,6 +98,53 @@ pub(super) fn read_blocks_uncached_local(device_id: u32, lba: u64, out: &mut [u8
         );
     }
     result
+}
+
+fn read_blocks_uncached_resolved(
+    device_id: u32,
+    resolved: &ResolvedRootDevice,
+    lba: u64,
+    out: &mut [u8],
+    trace: bool,
+) -> IoResult<()> {
+    let block_size = resolved.logical_block_size;
+    let max_blocks_per_lock = (UNCACHED_READ_LOCK_CHUNK_CAP / block_size).max(1);
+    let mut done = 0usize;
+    let mut chunk_lba = lba;
+    while done < out.len() {
+        let remaining_blocks = (out.len() - done) / block_size;
+        let chunk_blocks = remaining_blocks.min(max_blocks_per_lock);
+        let chunk_len = chunk_blocks * block_size;
+        {
+            let mut device = resolved.device.lock();
+            if trace {
+                let raw: *const dyn BlockDeviceOps = &**device;
+                let (data_ptr, vtable_ptr): (usize, usize) = unsafe { mem::transmute(raw) };
+                emit_storage_read_trace(
+                    21,
+                    device_id as u64,
+                    format!(
+                        "storage uncached read: dispatch dev={} data_ptr={:#x} vtable_ptr={:#x} abs_lba={} bytes={}",
+                        device_id,
+                        data_ptr,
+                        vtable_ptr,
+                        resolved.start_block + chunk_lba,
+                        chunk_len
+                    ),
+                );
+            }
+            device.read_blocks(
+                resolved.start_block + chunk_lba,
+                &mut out[done..done + chunk_len],
+            )?;
+        }
+        done += chunk_len;
+        chunk_lba += chunk_blocks as u64;
+        if done < out.len() {
+            crate::multitask::cond_resched();
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn write_blocks_uncached(device_id: u32, lba: u64, input: &[u8]) -> IoResult<()> {

@@ -72,6 +72,23 @@ pub struct LoggingConfig {
     pub category_levels: [u8; LOG_CATEGORIES.len()],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LockTelemetryConfig {
+    pub enabled: bool,
+    pub warn_wait_cycles: u64,
+    pub warn_hold_cycles: u64,
+}
+
+impl LockTelemetryConfig {
+    pub const fn default() -> Self {
+        Self {
+            enabled: false,
+            warn_wait_cycles: 250_000,
+            warn_hold_cycles: 250_000,
+        }
+    }
+}
+
 impl LoggingConfig {
     pub const fn default() -> Self {
         Self {
@@ -96,6 +113,7 @@ pub fn emit_log_cfgs(logging_toml: &str) {
     let config = parse_logging_toml(logging_toml);
     emit_check_cfgs();
     emit_logging_env(&config);
+    emit_lock_telemetry_cfgs(logging_toml);
     if !config.enabled {
         return;
     }
@@ -167,10 +185,33 @@ pub fn generate_user_logging_helpers_rs() -> String {
 pub fn emit_check_cfgs() {
     println!("cargo:rustc-check-cfg=cfg(rustos_debug_print_enabled)");
     println!("cargo:rustc-check-cfg=cfg(rustos_boot_trace_enabled)");
+    println!("cargo:rustc-check-cfg=cfg(rustos_lock_telemetry_enabled)");
     for category in LOG_CATEGORIES {
         for (level, _) in LOG_LEVELS {
             println!("cargo:rustc-check-cfg=cfg(rustos_log_{category}_{level})");
         }
+    }
+}
+
+pub fn emit_lock_telemetry_cfgs(project_toml: &str) {
+    println!("cargo:rerun-if-env-changed=RUSTOS_LOCK_TELEMETRY");
+    println!("cargo:rerun-if-env-changed=RUSTOS_LOCK_TELEMETRY_WARN_WAIT_CYCLES");
+    println!("cargo:rerun-if-env-changed=RUSTOS_LOCK_TELEMETRY_WARN_HOLD_CYCLES");
+    let config = lock_telemetry_with_env_overrides(parse_lock_telemetry_toml(project_toml));
+    println!(
+        "cargo:rustc-env=RUSTOS_LOCK_TELEMETRY_ENABLED={}",
+        bool_name(config.enabled)
+    );
+    println!(
+        "cargo:rustc-env=RUSTOS_LOCK_TELEMETRY_WARN_WAIT_CYCLES={}",
+        config.warn_wait_cycles
+    );
+    println!(
+        "cargo:rustc-env=RUSTOS_LOCK_TELEMETRY_WARN_HOLD_CYCLES={}",
+        config.warn_hold_cycles
+    );
+    if config.enabled {
+        println!("cargo:rustc-cfg=rustos_lock_telemetry_enabled");
     }
 }
 
@@ -265,6 +306,67 @@ pub fn try_parse_logging_toml(source: &str) -> Result<LoggingConfig, String> {
     Ok(config)
 }
 
+pub fn parse_lock_telemetry_toml(source: &str) -> LockTelemetryConfig {
+    try_parse_lock_telemetry_toml(source).unwrap_or_else(|err| panic!("{err}"))
+}
+
+pub fn lock_telemetry_with_env_overrides(
+    mut config: LockTelemetryConfig,
+) -> LockTelemetryConfig {
+    if let Ok(value) = std::env::var("RUSTOS_LOCK_TELEMETRY") {
+        config.enabled = parse_bool_value(&value, "RUSTOS_LOCK_TELEMETRY")
+            .unwrap_or_else(|err| panic!("invalid RUSTOS_LOCK_TELEMETRY: {err}"));
+    }
+    if let Ok(value) = std::env::var("RUSTOS_LOCK_TELEMETRY_WARN_WAIT_CYCLES") {
+        config.warn_wait_cycles = parse_u64_value(&value, "RUSTOS_LOCK_TELEMETRY_WARN_WAIT_CYCLES")
+            .unwrap_or_else(|err| {
+                panic!("invalid RUSTOS_LOCK_TELEMETRY_WARN_WAIT_CYCLES: {err}")
+            });
+    }
+    if let Ok(value) = std::env::var("RUSTOS_LOCK_TELEMETRY_WARN_HOLD_CYCLES") {
+        config.warn_hold_cycles = parse_u64_value(&value, "RUSTOS_LOCK_TELEMETRY_WARN_HOLD_CYCLES")
+            .unwrap_or_else(|err| {
+                panic!("invalid RUSTOS_LOCK_TELEMETRY_WARN_HOLD_CYCLES: {err}")
+            });
+    }
+    config
+}
+
+pub fn try_parse_lock_telemetry_toml(source: &str) -> Result<LockTelemetryConfig, String> {
+    let mut config = LockTelemetryConfig::default();
+    let mut section = "";
+
+    for raw_line in source.lines() {
+        let line = strip_comment(raw_line).trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if let Some(name) = line.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+            section = name.trim();
+            continue;
+        }
+
+        if section != "lock_telemetry" {
+            continue;
+        }
+
+        let Some((raw_key, raw_value)) = line.split_once('=') else {
+            return Err(format!("invalid lock_telemetry config line: {line}"));
+        };
+        let key = raw_key.trim();
+        let value = raw_value.trim();
+        match key {
+            "enabled" => config.enabled = parse_bool_value(value, key)?,
+            "warn_wait_cycles" => config.warn_wait_cycles = parse_u64_value(value, key)?,
+            "warn_hold_cycles" => config.warn_hold_cycles = parse_u64_value(value, key)?,
+            other => return Err(format!("unknown lock_telemetry config key: {other}")),
+        }
+    }
+
+    Ok(config)
+}
+
 #[allow(dead_code)]
 pub fn parse_bool(source: &str, name: &str) -> bool {
     let prefix = format!("pub const {name}: bool =");
@@ -296,8 +398,8 @@ fn strip_comment(line: &str) -> &str {
 
 fn parse_bool_value(value: &str, key: &str) -> Result<bool, String> {
     match trim_string(value) {
-        "true" => Ok(true),
-        "false" => Ok(false),
+        "1" | "true" | "True" | "TRUE" | "yes" | "on" => Ok(true),
+        "0" | "false" | "False" | "FALSE" | "no" | "off" => Ok(false),
         other => Err(format!("invalid bool for {key}: {other}")),
     }
 }
@@ -306,6 +408,12 @@ fn parse_usize_value(value: &str, key: &str) -> Result<usize, String> {
     trim_string(value)
         .parse::<usize>()
         .map_err(|_| format!("invalid usize for {key}: {value}"))
+}
+
+fn parse_u64_value(value: &str, key: &str) -> Result<u64, String> {
+    trim_string(value)
+        .parse::<u64>()
+        .map_err(|_| format!("invalid u64 for {key}: {value}"))
 }
 
 fn parse_level_value(value: &str) -> Result<u8, String> {

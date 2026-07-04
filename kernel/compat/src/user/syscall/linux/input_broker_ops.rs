@@ -26,6 +26,7 @@ pub(super) fn syscall_linux_rustos_input_stats_broker(args_ptr: u64) -> u64 {
         return linux_errno(LINUX_EINVAL);
     }
 
+    service_polled_input_completion();
     let snapshot = kernel_io_manager::api::input::event_queue::debug_snapshot();
     let stats = InputStatsWire {
         pointer_packet_submits: snapshot.pointer_packet_submits,
@@ -73,6 +74,7 @@ pub(super) fn syscall_linux_rustos_input_ingest_broker(args_ptr: u64) -> u64 {
     if capacity > INPUTD_INGEST_MAX_EVENTS {
         return linux_errno(LINUX_EINVAL);
     }
+    service_polled_input_completion();
     let mut ingress = alloc::vec![InputIngressWire::default(); capacity];
     let count = kernel_io_manager::api::input::event_queue::drain_ingress(&mut ingress);
     for (index, wire) in ingress.iter().take(count).enumerate() {
@@ -90,4 +92,13 @@ pub(super) fn syscall_linux_rustos_input_ingest_broker(args_ptr: u64) -> u64 {
         Ok(()) => count as u64,
         Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
     }
+}
+
+fn service_polled_input_completion() -> usize {
+    if !kernel_io_manager::api::usb::uses_polled_input_completion() {
+        return 0;
+    }
+    let usb_work = kernel_io_manager::api::usb::service_pending();
+    let input_work = kernel_io_manager::api::input::service_pending();
+    usb_work.saturating_add(input_work)
 }

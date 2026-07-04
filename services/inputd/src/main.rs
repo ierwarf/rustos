@@ -2,7 +2,6 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::mem::size_of;
 use std::slice;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -45,8 +44,6 @@ const PS2_MOUSE_STATUS_MIDDLE: u8 = 1 << 2;
 const PS2_MOUSE_STATUS_ALWAYS_ONE: u8 = 1 << 3;
 const PS2_MOUSE_STATUS_X_OVERFLOW: u8 = 1 << 6;
 const PS2_MOUSE_STATUS_Y_OVERFLOW: u8 = 1 << 7;
-static INPUT_DELIVERY_LOGGED: AtomicBool = AtomicBool::new(false);
-
 #[derive(Default)]
 struct HidKeyboardState {
     source_id: u64,
@@ -84,8 +81,20 @@ struct InputQueue {
     ps2_keyboard: KeyboardDriver,
     ps2_mouse: Ps2MousePacketState,
     pointer_surface: PointerSurface,
+    last_pointer_position: Option<(i32, i32)>,
+    dropped_discrete: u64,
     dropped_lossy: u64,
     pointer_buttons: u8,
+    read_authorizations: VecDeque<InputReadAuthorization>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InputReadAuthorization {
+    pid: u64,
+    tid: u64,
+    fd: u64,
+    access: u16,
+    approved_len: u64,
 }
 
 #[derive(Default)]
@@ -110,11 +119,39 @@ impl InputQueue {
                 return;
             }
         }
-        if self.events.len() >= INPUTD_QUEUE_MAX_EVENTS {
-            let _ = self.events.pop_front();
-            self.dropped_lossy = self.dropped_lossy.saturating_add(1);
+        if !self.make_room_for(event) {
+            return;
         }
         self.events.push_back(event);
+    }
+
+    fn make_room_for(&mut self, event: input_evdev::InputEvent) -> bool {
+        if self.events.len() < INPUTD_QUEUE_MAX_EVENTS {
+            return true;
+        }
+        if self.drop_oldest_lossy_event() {
+            return true;
+        }
+        if is_lossy_pointer_event(event) {
+            self.dropped_lossy = self.dropped_lossy.saturating_add(1);
+            return false;
+        }
+        let _ = self.events.pop_front();
+        self.dropped_discrete = self.dropped_discrete.saturating_add(1);
+        true
+    }
+
+    fn drop_oldest_lossy_event(&mut self) -> bool {
+        let Some(index) = self
+            .events
+            .iter()
+            .position(|event| is_lossy_pointer_event(*event))
+        else {
+            return false;
+        };
+        let _ = self.events.remove(index);
+        self.dropped_lossy = self.dropped_lossy.saturating_add(1);
+        true
     }
 
     fn pop_front(&mut self) -> Option<input_evdev::InputEvent> {
@@ -133,6 +170,7 @@ impl InputQueue {
             height,
             generation,
         };
+        self.last_pointer_position = None;
         Ok(())
     }
 
@@ -214,6 +252,7 @@ impl InputQueue {
 
     fn push_pointer_packet(&mut self, packet: InputPointerPacketWire) {
         if packet.dx != 0 || packet.dy != 0 {
+            self.last_pointer_position = None;
             self.push(input_evdev::InputEvent {
                 kind: input_evdev::INPUT_KIND_POINTER_MOTION,
                 action: input_evdev::INPUT_ACTION_NONE,
@@ -243,15 +282,20 @@ impl InputQueue {
             self.push_pointer_button_edges(absolute.buttons);
             return;
         }
-        self.push(input_evdev::InputEvent {
-            kind: input_evdev::INPUT_KIND_POINTER_POSITION,
-            action: input_evdev::INPUT_ACTION_NONE,
-            code: 0,
-            value0: (absolute.x.min(self.pointer_surface.max_x() as u32)) as i32,
-            value1: (absolute.y.min(self.pointer_surface.max_y() as u32)) as i32,
-            modifiers: 0,
-            text: 0,
-        });
+        let x = (absolute.x.min(self.pointer_surface.max_x() as u32)) as i32;
+        let y = (absolute.y.min(self.pointer_surface.max_y() as u32)) as i32;
+        if self.last_pointer_position != Some((x, y)) {
+            self.push(input_evdev::InputEvent {
+                kind: input_evdev::INPUT_KIND_POINTER_POSITION,
+                action: input_evdev::INPUT_ACTION_NONE,
+                code: 0,
+                value0: x,
+                value1: y,
+                modifiers: 0,
+                text: 0,
+            });
+            self.last_pointer_position = Some((x, y));
+        }
         if absolute.wheel_vertical != 0 {
             self.push(input_evdev::InputEvent {
                 kind: input_evdev::INPUT_KIND_POINTER_SCROLL,
@@ -454,6 +498,13 @@ fn can_coalesce(existing: input_evdev::InputEvent, next: input_evdev::InputEvent
         && existing.code == next.code
         && existing.modifiers == next.modifiers
         && existing.text == next.text
+}
+
+fn is_lossy_pointer_event(event: input_evdev::InputEvent) -> bool {
+    matches!(
+        event.kind,
+        input_evdev::INPUT_KIND_POINTER_MOTION | input_evdev::INPUT_KIND_POINTER_POSITION
+    )
 }
 
 fn merge_coalesced_event(existing: &mut input_evdev::InputEvent, next: input_evdev::InputEvent) {
@@ -837,7 +888,7 @@ fn scale_pointer_coordinate(
 mod tests {
     use super::InputQueue;
     use rustos_user_abi::syscall::{
-        InputHidPolicyWire, InputKeyboardEventWire, InputPointerPacketWire,
+        InputHidPolicyWire, InputKeyboardEventWire, InputPointerPacketWire, InputdIpcRequest,
         INPUTD_HID_POLICY_KIND_KEYBOARD, INPUTD_HID_POLICY_KIND_POINTER,
     };
 
@@ -900,7 +951,7 @@ mod tests {
     }
 
     #[test]
-    fn inputd_queue_coalesces_pointer_motion() {
+    fn inputd_queue_coalesces_pointer_motion_samples() {
         let mut queue = InputQueue::default();
         queue.push(pointer_motion(3, -2));
         queue.push(pointer_motion(4, 6));
@@ -912,7 +963,7 @@ mod tests {
     }
 
     #[test]
-    fn inputd_queue_keeps_latest_pointer_position() {
+    fn inputd_queue_keeps_latest_pointer_position_sample() {
         let mut queue = InputQueue::default();
         queue.push(pointer_position(10, 20));
         queue.push(pointer_position(30, 40));
@@ -921,6 +972,47 @@ mod tests {
         let event = queue.pop_front().unwrap();
         assert_eq!(event.value0, 30);
         assert_eq!(event.value1, 40);
+    }
+
+    #[test]
+    fn inputd_queue_preserves_pointer_button_edges_between_positions() {
+        let mut queue = InputQueue::default();
+        queue.push(pointer_position(10, 20));
+        queue.push_pointer_packet(pointer_packet(1, 0, 0));
+        queue.push(pointer_position(30, 40));
+
+        assert_eq!(queue.len(), 3);
+        assert_eq!(
+            queue.pop_front().unwrap().kind,
+            input_evdev::INPUT_KIND_POINTER_POSITION
+        );
+        let button = queue.pop_front().unwrap();
+        assert_eq!(button.kind, input_evdev::INPUT_KIND_POINTER_BUTTON);
+        assert_eq!(button.action, input_evdev::INPUT_ACTION_PRESSED);
+        let position = queue.pop_front().unwrap();
+        assert_eq!(position.kind, input_evdev::INPUT_KIND_POINTER_POSITION);
+        assert_eq!(position.value0, 30);
+        assert_eq!(position.value1, 40);
+    }
+
+    #[test]
+    fn inputd_queue_overflow_drops_lossy_pointer_samples_before_button_edges() {
+        let mut queue = InputQueue::default();
+        for index in 0..super::INPUTD_QUEUE_MAX_EVENTS {
+            queue
+                .events
+                .push_back(pointer_position(index as i32, index as i32));
+        }
+
+        queue.push_pointer_packet(pointer_packet(1, 0, 0));
+
+        assert_eq!(queue.len(), super::INPUTD_QUEUE_MAX_EVENTS);
+        assert_eq!(queue.dropped_lossy, 1);
+        assert_eq!(queue.dropped_discrete, 0);
+        assert!(queue.events.iter().any(|event| {
+            event.kind == input_evdev::INPUT_KIND_POINTER_BUTTON
+                && event.action == input_evdev::INPUT_ACTION_PRESSED
+        }));
     }
 
     #[test]
@@ -1093,6 +1185,42 @@ mod tests {
         ));
 
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn inputd_read_authorization_is_bound_to_pid_tid_fd_and_access() {
+        let mut queue = InputQueue::default();
+        queue
+            .read_authorizations
+            .push_back(super::InputReadAuthorization {
+                pid: 10,
+                tid: 11,
+                fd: 3,
+                access: rustos_user_abi::syscall::INPUTD_ACCESS_EVDEV,
+                approved_len: 64,
+            });
+
+        let wrong_fd = InputdIpcRequest {
+            pid: 10,
+            tid: 11,
+            fd: 4,
+            access: rustos_user_abi::syscall::INPUTD_ACCESS_EVDEV,
+            ..InputdIpcRequest::default()
+        };
+        assert_eq!(
+            super::consume_read_authorization(&mut queue, &wrong_fd),
+            None
+        );
+
+        let matching = InputdIpcRequest { fd: 3, ..wrong_fd };
+        assert_eq!(
+            super::consume_read_authorization(&mut queue, &matching),
+            Some(64)
+        );
+        assert_eq!(
+            super::consume_read_authorization(&mut queue, &matching),
+            None
+        );
     }
 }
 
@@ -1292,11 +1420,15 @@ fn dispatch_read(
     if request.pid == 0 || request.tid == 0 || request.fd > i32::MAX as u64 {
         return libc::EINVAL;
     }
+    let Some(approved_len) = consume_read_authorization(queue, request) else {
+        return libc::EACCES;
+    };
     if let Err(errno) = drain_ingest(queue) {
         return errno;
     }
     let requested = request
         .requested_len
+        .min(approved_len)
         .min(INPUTD_READ_PAYLOAD_CAPACITY as u64) as usize;
     let status = match request.access {
         INPUTD_ACCESS_NATIVE => fill_native_payload(queue, &mut response.payload, requested),
@@ -1373,11 +1505,6 @@ fn drain_ingest(queue: &mut InputQueue) -> Result<usize, i32> {
             _ => {}
         }
     }
-    if count > 0 && !INPUT_DELIVERY_LOGGED.swap(true, Ordering::AcqRel) {
-        debug_line(&format!(
-            "input: pointer event delivered kind=inputd-drain count={count}"
-        ));
-    }
     Ok(count)
 }
 
@@ -1439,7 +1566,7 @@ fn fill_evdev_payload(
 fn authorize_read(
     request: &InputdIpcRequest,
     response: &mut InputdIpcResponse,
-    queue: &InputQueue,
+    queue: &mut InputQueue,
 ) -> i32 {
     if request.pid == 0 || request.tid == 0 || request.fd > i32::MAX as u64 {
         return libc::EINVAL;
@@ -1450,11 +1577,31 @@ fn authorize_read(
         _ => return libc::EINVAL,
     };
     response.approved_len = request.requested_len.min(max_len);
+    queue.read_authorizations.push_back(InputReadAuthorization {
+        pid: request.pid,
+        tid: request.tid,
+        fd: request.fd,
+        access: request.access,
+        approved_len: response.approved_len,
+    });
     match fetch_stats(queue) {
         Ok(stats) => response.stats = stats,
         Err(errno) => return errno,
     }
     0
+}
+
+fn consume_read_authorization(queue: &mut InputQueue, request: &InputdIpcRequest) -> Option<u64> {
+    let index = queue.read_authorizations.iter().position(|auth| {
+        auth.pid == request.pid
+            && auth.tid == request.tid
+            && auth.fd == request.fd
+            && auth.access == request.access
+    })?;
+    queue
+        .read_authorizations
+        .remove(index)
+        .map(|auth| auth.approved_len)
 }
 
 fn fetch_stats(queue: &InputQueue) -> Result<InputStatsWire, i32> {
@@ -1473,6 +1620,9 @@ fn fetch_stats(queue: &InputQueue) -> Result<InputStatsWire, i32> {
         return Err(last_errno());
     }
     stats.queued = stats.queued.saturating_add(queue.len() as u64);
+    stats.dropped_discrete = stats
+        .dropped_discrete
+        .saturating_add(queue.dropped_discrete);
     stats.dropped_lossy = stats.dropped_lossy.saturating_add(queue.dropped_lossy);
     Ok(stats)
 }

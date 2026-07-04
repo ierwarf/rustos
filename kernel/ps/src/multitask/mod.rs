@@ -29,19 +29,18 @@ use crate::user::process_state::{
 
 pub use self::current::{
     any_user_process_state, arm_block_current_task, block_current_task, block_current_user_task,
-    commit_block_current_task, current_last_error, current_linux_thread_state, current_task_id,
+    commit_block_current_task, current_linux_thread_state, current_task_id,
     current_user_address_space, current_user_id, current_user_log_ids, current_user_process_id,
     current_user_process_thread_count, current_user_snapshot, current_user_stack_state,
     current_user_thread_id, exec_current_user_process, exec_user_process_by_pid,
     exit_current_user_task, halt_current_retired_task, is_user_task_alive,
     linux_thread_snapshot_by_ids, note_process_exit_status, parent_process_id_of,
     queue_linux_signal, retain_current_user_process_state, retire_current_user_task_due_to_fault,
-    service_deferred_work, set_current_last_error, set_next_pick_hint, terminate_user_task,
+    service_deferred_work, set_next_pick_hint, terminate_user_task, user_log_ids_for_task,
     wait_for_child, wake_task, wake_user_task, with_current_mm, with_current_process_credentials,
     with_current_process_state, with_current_process_state_mut, with_current_user_linux_state_mut,
     with_current_user_process_and_linux_thread_state_mut, with_current_user_process_state,
-    with_current_user_process_state_mut, with_current_user_windows_thread_state_mut,
-    with_process_state_by_pid, with_process_state_by_pid_mut,
+    with_current_user_process_state_mut, with_process_state_by_pid, with_process_state_by_pid_mut,
 };
 #[allow(unused_imports)]
 pub(crate) use self::current::{current_console_session, set_current_console_session};
@@ -84,7 +83,6 @@ fn scheduler_initialized() -> bool {
     interrupts::without_interrupts(|| unsafe { scheduler_ref().initialized() })
 }
 
-#[allow(dead_code)]
 pub fn is_initialized() -> bool {
     scheduler_initialized()
 }
@@ -224,7 +222,6 @@ impl CurrentUserSnapshot {
 }
 
 impl SpawnTaskError {
-    #[allow(dead_code)]
     pub fn summary(&self) -> &'static str {
         match self {
             Self::InvalidWeightMicros => "thread weight is outside the supported range",
@@ -369,7 +366,6 @@ pub struct Thread {
     slot: Cell<Option<usize>>,
 }
 
-#[allow(dead_code)]
 impl Thread {
     pub fn new(entry: fn(u64), weight_micros: u64) -> Self {
         Self {
@@ -404,17 +400,6 @@ impl Thread {
             self.slot.set(Some(slot));
         });
     }
-
-    #[allow(dead_code)]
-    pub fn stop(&self) {
-        interrupts::without_interrupts(|| unsafe {
-            let Some(slot) = self.slot.replace(None) else {
-                return;
-            };
-
-            scheduler_mut().clear_slot(slot);
-        });
-    }
 }
 
 fn checked_thread_pit_divisor(weight_micros: u64) -> Result<u16, SpawnTaskError> {
@@ -434,13 +419,11 @@ fn initial_task_rflags() -> RFlags {
     RFlags::from_bits_retain(RESERVED_BIT_1 | RFlags::INTERRUPT_FLAG.bits())
 }
 
-#[allow(dead_code)]
 fn kernel_fn_in_higher_half(entry: fn(u64)) -> fn(u64) {
     let high_addr = crate::memory::paging::higher_half_addr(entry as usize as u64);
     unsafe { mem::transmute::<usize, fn(u64)>(high_addr as usize) }
 }
 
-#[allow(dead_code)]
 fn kernel_task_entry_trampoline_addr() -> u64 {
     crate::memory::paging::higher_half_addr(task_entry_trampoline as *const () as usize as u64)
 }

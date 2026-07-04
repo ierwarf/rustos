@@ -3,7 +3,7 @@ use core::hint::spin_loop;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::panic::Location;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use spin::{Mutex as RawSpinMutex, MutexGuard as RawSpinMutexGuard};
 use x86_64::instructions::interrupts;
@@ -23,12 +23,15 @@ pub(crate) struct KernelSpinLock<T: ?Sized> {
     owner_acquire_file_ptr: AtomicUsize,
     owner_acquire_file_len: AtomicUsize,
     owner_acquire_line: AtomicUsize,
+    owner_acquire_tsc: AtomicU64,
     inner: RawSpinMutex<T>,
 }
 
 pub(crate) struct KernelSpinGuard<'a, T: ?Sized> {
     lock: &'a KernelSpinLock<T>,
     guard: RawSpinMutexGuard<'a, T>,
+    acquire_site: &'static Location<'static>,
+    acquire_tsc: u64,
     _not_send: PhantomData<*mut ()>,
 }
 
@@ -39,12 +42,15 @@ pub(crate) struct KernelWaitLock<T: ?Sized> {
     owner_acquire_file_ptr: AtomicUsize,
     owner_acquire_file_len: AtomicUsize,
     owner_acquire_line: AtomicUsize,
+    owner_acquire_tsc: AtomicU64,
     waiters: RawSpinMutex<WaitQueue>,
     value: UnsafeCell<T>,
 }
 
 pub(crate) struct KernelWaitGuard<'a, T: ?Sized> {
     lock: &'a KernelWaitLock<T>,
+    acquire_site: &'static Location<'static>,
+    acquire_tsc: u64,
 }
 
 struct WaitQueue {
@@ -112,6 +118,7 @@ impl<T> KernelWaitLock<T> {
             owner_acquire_file_ptr: AtomicUsize::new(0),
             owner_acquire_file_len: AtomicUsize::new(0),
             owner_acquire_line: AtomicUsize::new(0),
+            owner_acquire_tsc: AtomicU64::new(0),
             waiters: RawSpinMutex::new(WaitQueue::new()),
             value: UnsafeCell::new(value),
         }
@@ -129,6 +136,7 @@ impl<T> KernelSpinLock<T> {
             owner_acquire_file_ptr: AtomicUsize::new(0),
             owner_acquire_file_len: AtomicUsize::new(0),
             owner_acquire_line: AtomicUsize::new(0),
+            owner_acquire_tsc: AtomicU64::new(0),
             inner: RawSpinMutex::new(value),
         }
     }
@@ -139,9 +147,18 @@ impl<T: ?Sized> KernelSpinLock<T> {
     pub(crate) fn lock(&self) -> KernelSpinGuard<'_, T> {
         let acquire_site = Location::caller();
         let owner = current_lock_owner_token();
+        let wait_start_tsc = read_tsc();
         self.assert_not_recursive(owner, acquire_site);
 
         if let Some(guard) = self.try_acquire_at(owner, acquire_site) {
+            maybe_report_lock_wait(
+                "KernelSpinLock",
+                core::any::type_name::<T>(),
+                acquire_site,
+                wait_start_tsc,
+                guard.acquire_tsc,
+                0,
+            );
             return guard;
         }
 
@@ -154,6 +171,14 @@ impl<T: ?Sized> KernelSpinLock<T> {
             }
             spin_loop();
             if let Some(guard) = self.try_acquire_at(owner, acquire_site) {
+                maybe_report_lock_wait(
+                    "KernelSpinLock",
+                    core::any::type_name::<T>(),
+                    acquire_site,
+                    wait_start_tsc,
+                    guard.acquire_tsc,
+                    spins,
+                );
                 return guard;
             }
         }
@@ -161,7 +186,8 @@ impl<T: ?Sized> KernelSpinLock<T> {
 
     #[track_caller]
     pub(crate) fn try_lock(&self) -> Option<KernelSpinGuard<'_, T>> {
-        self.try_acquire_at(current_lock_owner_token(), Location::caller())
+        let acquire_site = Location::caller();
+        self.try_acquire_at(current_lock_owner_token(), acquire_site)
     }
 
     fn try_acquire_at(
@@ -170,15 +196,18 @@ impl<T: ?Sized> KernelSpinLock<T> {
         acquire_site: &'static Location<'static>,
     ) -> Option<KernelSpinGuard<'_, T>> {
         let guard = self.inner.try_lock()?;
-        self.record_acquire(owner, acquire_site);
+        let acquire_tsc = self.record_acquire(owner, acquire_site);
         Some(KernelSpinGuard {
             lock: self,
             guard,
+            acquire_site,
+            acquire_tsc,
             _not_send: PhantomData,
         })
     }
 
-    fn record_acquire(&self, owner: usize, acquire_site: &'static Location<'static>) {
+    fn record_acquire(&self, owner: usize, acquire_site: &'static Location<'static>) -> u64 {
+        let acquire_tsc = read_tsc();
         let file = acquire_site.file();
         self.owner_acquire_file_len
             .store(file.len(), Ordering::Release);
@@ -186,8 +215,10 @@ impl<T: ?Sized> KernelSpinLock<T> {
             .store(acquire_site.line() as usize, Ordering::Release);
         self.owner_acquire_file_ptr
             .store(file.as_ptr() as usize, Ordering::Release);
+        self.owner_acquire_tsc.store(acquire_tsc, Ordering::Release);
         self.owner_depth.store(1, Ordering::Release);
         self.owner.store(owner, Ordering::Release);
+        acquire_tsc
     }
 
     fn clear_owner(&self) {
@@ -196,6 +227,7 @@ impl<T: ?Sized> KernelSpinLock<T> {
         self.owner_acquire_file_ptr.store(0, Ordering::Release);
         self.owner_acquire_file_len.store(0, Ordering::Release);
         self.owner_acquire_line.store(0, Ordering::Release);
+        self.owner_acquire_tsc.store(0, Ordering::Release);
     }
 
     fn assert_not_recursive(&self, owner: usize, acquire_site: &'static Location<'static>) {
@@ -282,6 +314,12 @@ impl<T: ?Sized> DerefMut for KernelSpinGuard<'_, T> {
 impl<T: ?Sized> Drop for KernelSpinGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.clear_owner();
+        maybe_report_lock_hold(
+            "KernelSpinLock",
+            core::any::type_name::<T>(),
+            self.acquire_site,
+            self.acquire_tsc,
+        );
     }
 }
 
@@ -290,17 +328,42 @@ impl<T: ?Sized> KernelWaitLock<T> {
     pub(crate) fn lock(&self) -> KernelWaitGuard<'_, T> {
         let acquire_site = Location::caller();
         let owner = current_lock_owner_token();
+        let wait_start_tsc = read_tsc();
         self.assert_not_recursive(owner, acquire_site);
         let mut spins = 0usize;
         loop {
-            if self.try_acquire_at(owner, acquire_site) {
-                return KernelWaitGuard { lock: self };
+            if let Some(acquire_tsc) = self.try_acquire_at(owner, acquire_site) {
+                maybe_report_lock_wait(
+                    "KernelWaitLock",
+                    core::any::type_name::<T>(),
+                    acquire_site,
+                    wait_start_tsc,
+                    acquire_tsc,
+                    spins,
+                );
+                return KernelWaitGuard {
+                    lock: self,
+                    acquire_site,
+                    acquire_tsc,
+                };
             }
 
             spins = spins.saturating_add(1);
             if can_block_current_task() && spins >= PRE_BLOCK_SPINS {
-                if self.block_until_woken_or_acquired(owner, acquire_site) {
-                    return KernelWaitGuard { lock: self };
+                if let Some(acquire_tsc) = self.block_until_woken_or_acquired(owner, acquire_site) {
+                    maybe_report_lock_wait(
+                        "KernelWaitLock",
+                        core::any::type_name::<T>(),
+                        acquire_site,
+                        wait_start_tsc,
+                        acquire_tsc,
+                        spins,
+                    );
+                    return KernelWaitGuard {
+                        lock: self,
+                        acquire_site,
+                        acquire_tsc,
+                    };
                 }
                 spins = 0;
                 continue;
@@ -336,31 +399,41 @@ impl<T: ?Sized> KernelWaitLock<T> {
 
     #[track_caller]
     pub(crate) fn try_lock(&self) -> Option<KernelWaitGuard<'_, T>> {
+        let acquire_site = Location::caller();
         self.try_acquire_at(current_lock_owner_token(), Location::caller())
-            .then_some(KernelWaitGuard { lock: self })
+            .map(|acquire_tsc| KernelWaitGuard {
+                lock: self,
+                acquire_site,
+                acquire_tsc,
+            })
     }
 
-    fn try_acquire_at(&self, owner: usize, acquire_site: &'static Location<'static>) -> bool {
+    fn try_acquire_at(
+        &self,
+        owner: usize,
+        acquire_site: &'static Location<'static>,
+    ) -> Option<u64> {
         let acquired = self
             .state
             .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
             .is_ok();
         if acquired {
-            self.record_acquire(owner, acquire_site);
+            Some(self.record_acquire(owner, acquire_site))
+        } else {
+            None
         }
-        acquired
     }
 
     fn block_until_woken_or_acquired(
         &self,
         owner: usize,
         acquire_site: &'static Location<'static>,
-    ) -> bool {
+    ) -> Option<u64> {
         let Some(task_id) = crate::multitask::current_task_id() else {
-            return false;
+            return None;
         };
 
-        let mut acquired = false;
+        let mut acquired_tsc = None;
         let mut blocked = false;
         interrupts::without_interrupts(|| {
             {
@@ -376,9 +449,9 @@ impl<T: ?Sized> KernelWaitLock<T> {
                 }
             }
 
-            if self.try_acquire_at(owner, acquire_site) {
+            if let Some(tsc) = self.try_acquire_at(owner, acquire_site) {
                 self.waiters.lock().remove(task_id);
-                acquired = true;
+                acquired_tsc = Some(tsc);
                 return;
             }
 
@@ -388,13 +461,13 @@ impl<T: ?Sized> KernelWaitLock<T> {
             }
         });
 
-        if acquired {
-            return true;
+        if acquired_tsc.is_some() {
+            return acquired_tsc;
         }
         if blocked {
             crate::multitask::yield_now();
         }
-        false
+        None
     }
 
     fn unlock(&self) {
@@ -405,7 +478,8 @@ impl<T: ?Sized> KernelWaitLock<T> {
         }
     }
 
-    fn record_acquire(&self, owner: usize, acquire_site: &'static Location<'static>) {
+    fn record_acquire(&self, owner: usize, acquire_site: &'static Location<'static>) -> u64 {
+        let acquire_tsc = read_tsc();
         let file = acquire_site.file();
         self.owner_acquire_file_len
             .store(file.len(), Ordering::Release);
@@ -413,8 +487,10 @@ impl<T: ?Sized> KernelWaitLock<T> {
             .store(acquire_site.line() as usize, Ordering::Release);
         self.owner_acquire_file_ptr
             .store(file.as_ptr() as usize, Ordering::Release);
+        self.owner_acquire_tsc.store(acquire_tsc, Ordering::Release);
         self.owner_depth.store(1, Ordering::Release);
         self.owner.store(owner, Ordering::Release);
+        acquire_tsc
     }
 
     fn clear_owner(&self) {
@@ -423,6 +499,7 @@ impl<T: ?Sized> KernelWaitLock<T> {
         self.owner_acquire_file_ptr.store(0, Ordering::Release);
         self.owner_acquire_file_len.store(0, Ordering::Release);
         self.owner_acquire_line.store(0, Ordering::Release);
+        self.owner_acquire_tsc.store(0, Ordering::Release);
     }
 
     fn assert_not_recursive(&self, owner: usize, acquire_site: &'static Location<'static>) {
@@ -476,7 +553,126 @@ impl<T: ?Sized> DerefMut for KernelWaitGuard<'_, T> {
 impl<T: ?Sized> Drop for KernelWaitGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.unlock();
+        maybe_report_lock_hold(
+            "KernelWaitLock",
+            core::any::type_name::<T>(),
+            self.acquire_site,
+            self.acquire_tsc,
+        );
     }
+}
+
+fn read_tsc() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { core::arch::x86_64::_rdtsc() }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        0
+    }
+}
+
+#[cfg(rustos_lock_telemetry_enabled)]
+fn maybe_report_lock_wait(
+    kind: &str,
+    type_name: &str,
+    acquire_site: &'static Location<'static>,
+    wait_start_tsc: u64,
+    acquire_tsc: u64,
+    spins: usize,
+) {
+    let wait_cycles = acquire_tsc.saturating_sub(wait_start_tsc);
+    let threshold = lock_telemetry_warn_wait_cycles();
+    if spins == 0 || wait_cycles < threshold {
+        return;
+    }
+    crate::debug::println_fmt(format_args!(
+        "lock-telemetry: wait kind={} type={} wait_cycles={} threshold={} spins={} wait_at={}:{} irq_enabled={} task={:?}",
+        kind,
+        type_name,
+        wait_cycles,
+        threshold,
+        spins,
+        acquire_site.file(),
+        acquire_site.line(),
+        interrupts::are_enabled(),
+        crate::multitask::current_task_id(),
+    ));
+}
+
+#[cfg(not(rustos_lock_telemetry_enabled))]
+fn maybe_report_lock_wait(
+    _kind: &str,
+    _type_name: &str,
+    _acquire_site: &'static Location<'static>,
+    _wait_start_tsc: u64,
+    _acquire_tsc: u64,
+    _spins: usize,
+) {
+}
+
+#[cfg(rustos_lock_telemetry_enabled)]
+fn maybe_report_lock_hold(
+    kind: &str,
+    type_name: &str,
+    acquire_site: &'static Location<'static>,
+    acquire_tsc: u64,
+) {
+    let hold_cycles = read_tsc().saturating_sub(acquire_tsc);
+    let threshold = lock_telemetry_warn_hold_cycles();
+    if hold_cycles < threshold {
+        return;
+    }
+    crate::debug::println_fmt(format_args!(
+        "lock-telemetry: hold kind={} type={} hold_cycles={} threshold={} held_from={}:{} irq_enabled={} task={:?}",
+        kind,
+        type_name,
+        hold_cycles,
+        threshold,
+        acquire_site.file(),
+        acquire_site.line(),
+        interrupts::are_enabled(),
+        crate::multitask::current_task_id(),
+    ));
+}
+
+#[cfg(not(rustos_lock_telemetry_enabled))]
+fn maybe_report_lock_hold(
+    _kind: &str,
+    _type_name: &str,
+    _acquire_site: &'static Location<'static>,
+    _acquire_tsc: u64,
+) {
+}
+
+#[cfg(rustos_lock_telemetry_enabled)]
+fn lock_telemetry_warn_wait_cycles() -> u64 {
+    option_env!("RUSTOS_LOCK_TELEMETRY_WARN_WAIT_CYCLES")
+        .and_then(parse_u64)
+        .unwrap_or(250_000)
+}
+
+#[cfg(rustos_lock_telemetry_enabled)]
+fn lock_telemetry_warn_hold_cycles() -> u64 {
+    option_env!("RUSTOS_LOCK_TELEMETRY_WARN_HOLD_CYCLES")
+        .and_then(parse_u64)
+        .unwrap_or(250_000)
+}
+
+#[cfg(rustos_lock_telemetry_enabled)]
+fn parse_u64(value: &str) -> Option<u64> {
+    let mut parsed = 0u64;
+    for byte in value.as_bytes() {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        parsed = parsed
+            .saturating_mul(10)
+            .saturating_add(u64::from(*byte - b'0'));
+    }
+    Some(parsed)
 }
 
 fn can_block_current_task() -> bool {

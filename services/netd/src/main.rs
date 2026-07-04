@@ -19,17 +19,19 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_OP_LINUX_CONNECT, SYSCALL_OFFLOAD_OP_LINUX_DUP,
     SYSCALL_OFFLOAD_OP_LINUX_GETPEERNAME, SYSCALL_OFFLOAD_OP_LINUX_GETSOCKNAME,
     SYSCALL_OFFLOAD_OP_LINUX_GETSOCKOPT, SYSCALL_OFFLOAD_OP_LINUX_LISTEN,
-    SYSCALL_OFFLOAD_OP_LINUX_RECVFROM, SYSCALL_OFFLOAD_OP_LINUX_RECVMSG,
-    SYSCALL_OFFLOAD_OP_LINUX_SENDMSG, SYSCALL_OFFLOAD_OP_LINUX_SENDTO,
-    SYSCALL_OFFLOAD_OP_LINUX_SETSOCKOPT, SYSCALL_OFFLOAD_OP_LINUX_SHUTDOWN,
-    SYSCALL_OFFLOAD_OP_LINUX_SOCKET, SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR, SYS_RUSTOS_DEBUG_PRINT,
-    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
-    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_NET_BROKER,
+    SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET, SYSCALL_OFFLOAD_OP_LINUX_RECVFROM,
+    SYSCALL_OFFLOAD_OP_LINUX_RECVMSG, SYSCALL_OFFLOAD_OP_LINUX_SENDMSG,
+    SYSCALL_OFFLOAD_OP_LINUX_SENDTO, SYSCALL_OFFLOAD_OP_LINUX_SETSOCKOPT,
+    SYSCALL_OFFLOAD_OP_LINUX_SHUTDOWN, SYSCALL_OFFLOAD_OP_LINUX_SOCKET,
+    SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
+    SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
+    SYS_RUSTOS_NET_BROKER,
 };
 
 const RECV_BACKOFF: Duration = Duration::from_millis(1);
 const MAX_LISTEN_BACKLOG: usize = 128;
 const SOCKET_BUFFER_CAPACITY: usize = 1024 * 1024;
+const SOCKET_CONTROL_BUFFER_CAPACITY: usize = 64 * 1024;
 
 fn main() {
     let endpoint = syscall0(SYS_RUSTOS_IPC_ENDPOINT_CREATE);
@@ -142,6 +144,7 @@ fn dispatch_request(request: &NetdIpcRequest, response: &mut NetdIpcResponse) ->
         SYSCALL_OFFLOAD_OP_LINUX_RECVFROM | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG => {
             handle_recv(request, response)
         }
+        SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET => handle_poll_socket(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_GETSOCKNAME => handle_getsockname(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_GETPEERNAME => handle_getpeername(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_SETSOCKOPT => handle_setsockopt(request),
@@ -180,7 +183,8 @@ fn validate_request(received: usize, request: &NetdIpcRequest) -> Result<(), i32
         | SYSCALL_OFFLOAD_OP_LINUX_SHUTDOWN
         | SYSCALL_OFFLOAD_OP_LINUX_SENDMSG
         | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG
-        | SYSCALL_OFFLOAD_OP_LINUX_RECVFROM => Ok(()),
+        | SYSCALL_OFFLOAD_OP_LINUX_RECVFROM
+        | SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET => Ok(()),
         _ => Err(libc::EINVAL),
     }
 }
@@ -206,6 +210,7 @@ enum UnixSocketState {
 struct ConnectedState {
     incoming_bytes: VecDeque<u8>,
     incoming_controls: VecDeque<Vec<u8>>,
+    incoming_control_bytes: usize,
     peer: u64,
     peer_closed: bool,
     peer_read_closed: bool,
@@ -325,6 +330,7 @@ fn handle_socketpair(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -
             state: UnixSocketState::Connected(ConnectedState {
                 incoming_bytes: VecDeque::new(),
                 incoming_controls: VecDeque::new(),
+                incoming_control_bytes: 0,
                 peer: right,
                 peer_closed: false,
                 peer_read_closed: false,
@@ -347,6 +353,7 @@ fn handle_socketpair(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -
             state: UnixSocketState::Connected(ConnectedState {
                 incoming_bytes: VecDeque::new(),
                 incoming_controls: VecDeque::new(),
+                incoming_control_bytes: 0,
                 peer: left,
                 peer_closed: false,
                 peer_read_closed: false,
@@ -468,6 +475,7 @@ fn handle_connect(request: &NetdIpcRequest) -> i32 {
     client.state = UnixSocketState::Connected(ConnectedState {
         incoming_bytes: VecDeque::new(),
         incoming_controls: VecDeque::new(),
+        incoming_control_bytes: 0,
         peer: accepted,
         peer_closed: false,
         peer_read_closed: false,
@@ -504,6 +512,7 @@ fn handle_connect(request: &NetdIpcRequest) -> i32 {
             state: UnixSocketState::Connected(ConnectedState {
                 incoming_bytes: VecDeque::new(),
                 incoming_controls: VecDeque::new(),
+                incoming_control_bytes: 0,
                 peer: request.socket_token,
                 peer_closed: false,
                 peer_read_closed: false,
@@ -663,6 +672,63 @@ fn handle_recvmsg(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i
     }
 }
 
+fn handle_poll_socket(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
+    let requested = request.arg1 as u32;
+    let mut revents = 0_u32;
+    let state = net_state().lock().unwrap();
+    let Some(socket) = state.sockets.get(&request.socket_token) else {
+        return libc::EBADF;
+    };
+    match &socket.state {
+        UnixSocketState::Listening { pending, .. } => {
+            if requested & linux_abi::POLLIN as u32 != 0 && !pending.is_empty() {
+                revents |= linux_abi::POLLIN as u32;
+            }
+        }
+        UnixSocketState::Connected(connected) => {
+            let peer_connected =
+                state
+                    .sockets
+                    .get(&connected.peer)
+                    .and_then(|peer| match &peer.state {
+                        UnixSocketState::Connected(peer_connected) => Some(peer_connected),
+                        _ => None,
+                    });
+            if requested & linux_abi::POLLIN as u32 != 0
+                && (!connected.incoming_bytes.is_empty()
+                    || connected.peer_write_closed
+                    || connected.peer_closed)
+            {
+                revents |= linux_abi::POLLIN as u32;
+            }
+            if requested & linux_abi::POLLOUT as u32 != 0 {
+                let writable = !connected.send_closed
+                    && !connected.peer_read_closed
+                    && !connected.peer_closed
+                    && peer_connected.is_some_and(|peer| {
+                        !peer.recv_closed
+                            && peer.incoming_bytes.len() < SOCKET_BUFFER_CAPACITY
+                            && peer.incoming_control_bytes < SOCKET_CONTROL_BUFFER_CAPACITY
+                    });
+                if writable {
+                    revents |= linux_abi::POLLOUT as u32;
+                }
+            }
+            if connected.peer_closed {
+                revents |= linux_abi::POLLHUP as u32;
+            }
+            if peer_connected.is_none() {
+                revents |= linux_abi::POLLERR as u32;
+            }
+        }
+        UnixSocketState::Idle => {
+            revents |= linux_abi::POLLERR as u32;
+        }
+    }
+    response.value = revents as u64;
+    0
+}
+
 fn handle_getsockname(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
     let state = net_state().lock().unwrap();
     let Some(socket) = state.sockets.get(&request.socket_token) else {
@@ -807,11 +873,22 @@ fn send_socket_message(
     if !control.is_empty() && room < bytes.len() {
         return Err(libc::EAGAIN);
     }
+    if !control.is_empty()
+        && peer_connected
+            .incoming_control_bytes
+            .saturating_add(control.len())
+            > SOCKET_CONTROL_BUFFER_CAPACITY
+    {
+        return Err(libc::EAGAIN);
+    }
     let write_len = room.min(bytes.len());
     peer_connected
         .incoming_bytes
         .extend(bytes[..write_len].iter().copied());
     if !control.is_empty() {
+        peer_connected.incoming_control_bytes = peer_connected
+            .incoming_control_bytes
+            .saturating_add(control.len());
         peer_connected.incoming_controls.push_back(control.to_vec());
     }
     Ok(write_len)
@@ -881,6 +958,9 @@ fn recvmsg_control_payload(request: &NetdIpcRequest) -> Result<Vec<u8>, i32> {
         return Err(libc::ENOTCONN);
     };
     let mut control = connected.incoming_controls.pop_front().unwrap_or_default();
+    connected.incoming_control_bytes = connected
+        .incoming_control_bytes
+        .saturating_sub(control.len());
     if !passcred {
         return Ok(control);
     }

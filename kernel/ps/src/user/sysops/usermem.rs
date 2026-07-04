@@ -24,8 +24,9 @@ pub fn copy_from_current_user_exact(
     dest: &mut [u8],
 ) -> Result<(), paging::AddressSpaceError> {
     with_current_address_space(|address_space| {
-        address_space.validate_user_read_buffer(VirtAddr::new(user_ptr), dest.len())?;
-        address_space.copy_from_user(VirtAddr::new(user_ptr), dest)
+        let start = user_virt_addr(user_ptr, dest.len())?;
+        address_space.validate_user_read_buffer(start, dest.len())?;
+        address_space.copy_from_user(start, dest)
     })
 }
 
@@ -48,8 +49,9 @@ pub fn write_current_user_bytes(
     bytes: &[u8],
 ) -> Result<(), paging::AddressSpaceError> {
     with_current_address_space(|address_space| {
-        address_space.validate_user_write_buffer(VirtAddr::new(user_ptr), bytes.len())?;
-        address_space.copy_into_user(VirtAddr::new(user_ptr), bytes)
+        let start = user_virt_addr(user_ptr, bytes.len())?;
+        address_space.validate_user_write_buffer(start, bytes.len())?;
+        address_space.copy_into_user(start, bytes)
     })
 }
 
@@ -58,7 +60,7 @@ pub fn validate_current_user_write_buffer(
     len: usize,
 ) -> Result<(), paging::AddressSpaceError> {
     with_current_address_space(|address_space| {
-        address_space.validate_user_write_buffer(VirtAddr::new(user_ptr), len)
+        address_space.validate_user_write_buffer(user_virt_addr(user_ptr, len)?, len)
     })
 }
 
@@ -99,7 +101,8 @@ pub fn read_current_user_c_string(
                 .ok_or(paging::AddressSpaceError::AddressOverflow)?;
             let page_remaining = USER_PAGE_SIZE - ((ptr as usize) & (USER_PAGE_SIZE - 1));
             let chunk_len = (max_len - bytes.len()).min(chunk.len()).min(page_remaining);
-            address_space.copy_from_user(VirtAddr::new(ptr), &mut chunk[..chunk_len])?;
+            let start = user_virt_addr(ptr, chunk_len)?;
+            address_space.copy_from_user(start, &mut chunk[..chunk_len])?;
             if let Some(nul_index) = chunk[..chunk_len].iter().position(|byte| *byte == 0) {
                 bytes.extend_from_slice(&chunk[..nul_index]);
                 return Ok(alloc::string::String::from_utf8_lossy(&bytes).into_owned());
@@ -109,4 +112,38 @@ pub fn read_current_user_c_string(
 
         Err(paging::AddressSpaceError::AddressOverflow)
     })
+}
+
+fn user_virt_addr(user_ptr: u64, len: usize) -> Result<VirtAddr, paging::AddressSpaceError> {
+    if len == 0 {
+        return Ok(VirtAddr::new(paging::USER_SPACE_BASE));
+    }
+    let last = user_ptr
+        .checked_add(len as u64 - 1)
+        .ok_or(paging::AddressSpaceError::AddressOverflow)?;
+    if user_ptr < paging::USER_SPACE_BASE || last >= paging::USER_SPACE_END_EXCLUSIVE {
+        return Err(paging::AddressSpaceError::AddressOutOfRange);
+    }
+    Ok(VirtAddr::new(user_ptr))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_virt_addr_rejects_out_of_range_without_panicking() {
+        assert_eq!(
+            user_virt_addr(paging::USER_SPACE_BASE, 1).map(VirtAddr::as_u64),
+            Ok(paging::USER_SPACE_BASE)
+        );
+        assert_eq!(
+            user_virt_addr(paging::USER_SPACE_END_EXCLUSIVE, 1),
+            Err(paging::AddressSpaceError::AddressOutOfRange)
+        );
+        assert_eq!(
+            user_virt_addr(u64::MAX, 8),
+            Err(paging::AddressSpaceError::AddressOverflow)
+        );
+    }
 }

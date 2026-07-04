@@ -3,8 +3,9 @@ use core::mem::size_of;
 use core::ptr;
 
 use boot_protocol::{
-    BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootInfo, BootMemoryKind, BootMemoryMap, BootMemoryRegion,
-    BootPixelFormat, BootVolumeIdentity, FramebufferInfo, NucleusImageInfo,
+    BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootExtentManifest, BootInfo, BootMemoryKind,
+    BootMemoryMap, BootMemoryRegion, BootPixelFormat, BootVolumeIdentity, FramebufferInfo,
+    NucleusImageInfo,
 };
 
 const MULTIBOOT2_BOOTLOADER_MAGIC: u32 = 0x36d7_6289;
@@ -12,12 +13,14 @@ const PAGE_SIZE: u64 = 4096;
 const MAX_BOOT_MEMORY_REGIONS: usize = 256;
 
 const TAG_END: u32 = 0;
+const TAG_MODULE: u32 = 3;
 const TAG_MMAP: u32 = 6;
 const TAG_FRAMEBUFFER: u32 = 8;
 const TAG_ACPI_OLD: u32 = 14;
 const TAG_ACPI_NEW: u32 = 15;
 const TAG_EFI_MMAP: u32 = 17;
 const TAG_LOAD_BASE_ADDR: u32 = 21;
+const ROOT_EXTENTS_MODULE_CMDLINE: &[u8] = b"rustos-root-extents";
 
 #[repr(C)]
 struct RawTag {
@@ -57,6 +60,14 @@ struct RawLoadBaseTag {
     ty: u32,
     size: u32,
     load_base_addr: u32,
+}
+
+#[repr(C, packed)]
+struct RawModuleTag {
+    ty: u32,
+    size: u32,
+    mod_start: u32,
+    mod_end: u32,
 }
 
 struct BootInfoStorage(UnsafeCell<BootInfo>);
@@ -105,6 +116,9 @@ pub fn build_boot_info(magic: u32, mbi_addr: u32) -> *const BootInfo {
             entry_count: entry_count as u32,
             _reserved0: 0,
         },
+        boot_extent_manifest: tags
+            .root_extent_manifest()
+            .unwrap_or_else(BootExtentManifest::empty),
     };
 
     if boot_info.validate().is_err() {
@@ -148,8 +162,8 @@ impl Tags {
 
         let bytes_per_pixel = (raw.bpp / 8).max(1);
         let pixel_format = match (raw.red_position, raw.blue_position) {
-            (16, 0) => BootPixelFormat::Rgb,
-            (0, 16) => BootPixelFormat::Bgr,
+            (0, 16) => BootPixelFormat::Rgb,
+            (16, 0) => BootPixelFormat::Bgr,
             _ => BootPixelFormat::Bitmask,
         };
         Some(FramebufferInfo {
@@ -250,6 +264,53 @@ impl Tags {
         }
     }
 
+    fn root_extent_manifest(&self) -> Option<BootExtentManifest> {
+        let mut cursor = self.base + 8;
+        let end = self.base.checked_add(self.total_size)?;
+        while cursor + size_of::<RawTag>() <= end {
+            let tag = unsafe { &*(cursor as *const RawTag) };
+            if tag.ty == TAG_END {
+                break;
+            }
+            if tag.size < size_of::<RawTag>() as u32 || cursor + tag.size as usize > end {
+                return None;
+            }
+            if tag.ty == TAG_MODULE {
+                if let Some(manifest) = self.root_extent_manifest_from_module_tag(tag)
+                    && manifest.is_present()
+                {
+                    return Some(manifest);
+                }
+            }
+            cursor = align_up(cursor + tag.size as usize, 8)?;
+        }
+        None
+    }
+
+    fn root_extent_manifest_from_module_tag(&self, tag: &RawTag) -> Option<BootExtentManifest> {
+        if (tag.size as usize) < size_of::<RawModuleTag>() + ROOT_EXTENTS_MODULE_CMDLINE.len() {
+            return None;
+        }
+        let raw = unsafe { ptr::read_unaligned(tag as *const RawTag as *const RawModuleTag) };
+        let start = u64::from(raw.mod_start);
+        let end = u64::from(raw.mod_end);
+        if end <= start {
+            return None;
+        }
+        let cmdline_start = tag as *const RawTag as usize + size_of::<RawModuleTag>();
+        let cmdline_len = tag.size as usize - size_of::<RawModuleTag>();
+        let cmdline =
+            unsafe { core::slice::from_raw_parts(cmdline_start as *const u8, cmdline_len) };
+        let cmdline = cmdline.split(|byte| *byte == 0).next().unwrap_or(cmdline);
+        if cmdline != ROOT_EXTENTS_MODULE_CMDLINE {
+            return None;
+        }
+        Some(BootExtentManifest {
+            ptr: start,
+            len: end - start,
+        })
+    }
+
     fn find_tag(&self, ty: u32) -> Option<&RawTag> {
         let mut cursor = self.base + 8;
         let end = self.base.checked_add(self.total_size)?;
@@ -340,6 +401,7 @@ const fn empty_boot_info() -> BootInfo {
         framebuffer: FramebufferInfo::empty(),
         nucleus_image: NucleusImageInfo::empty(),
         memory_map: BootMemoryMap::empty(),
+        boot_extent_manifest: BootExtentManifest::empty(),
     }
 }
 
@@ -425,7 +487,7 @@ mod tests {
 
     #[test]
     fn parses_rgb_and_bgr_framebuffers() {
-        let rgb = tags_with_framebuffer(16, 0);
+        let rgb = tags_with_framebuffer(0, 16);
         let rgb_tags = unsafe { Tags::new(rgb.as_ptr() as usize) };
         let rgb_info = rgb_tags.framebuffer().expect("rgb framebuffer");
         assert_eq!(rgb_info.pixel_format, BootPixelFormat::Rgb);
@@ -433,7 +495,7 @@ mod tests {
         assert_eq!(rgb_info.stride, 800);
         assert_eq!(rgb_info.back_buffer_addr, 0);
 
-        let bgr = tags_with_framebuffer(0, 16);
+        let bgr = tags_with_framebuffer(16, 0);
         let bgr_tags = unsafe { Tags::new(bgr.as_ptr() as usize) };
         assert_eq!(
             bgr_tags
@@ -465,7 +527,21 @@ mod tests {
 
         assert_eq!(tags.acpi_rsdp_addr(), None);
         assert_eq!(tags.load_base_addr(), None);
+        assert_eq!(tags.root_extent_manifest(), None);
         assert_eq!(tags.write_memory_map(&mut regions), 0);
+    }
+
+    #[test]
+    fn finds_root_extent_manifest_module() {
+        let mut mbi = mbi_header();
+        push_module_tag(&mut mbi, 0x4000, 0x4800, b"ignored-module");
+        push_module_tag(&mut mbi, 0x5000, 0x5400, ROOT_EXTENTS_MODULE_CMDLINE);
+        finish_mbi(&mut mbi);
+
+        let tags = unsafe { Tags::new(mbi.as_ptr() as usize) };
+        let manifest = tags.root_extent_manifest().expect("root extents module");
+        assert_eq!(manifest.ptr, 0x5000);
+        assert_eq!(manifest.len, 0x400);
     }
 
     fn tags_with_framebuffer(red_position: u8, blue_position: u8) -> Vec<u8> {
@@ -514,6 +590,16 @@ mod tests {
         push_u32(mbi, ty);
         push_u32(mbi, (8 + bytes.len()) as u32);
         mbi.extend_from_slice(bytes);
+    }
+
+    fn push_module_tag(mbi: &mut Vec<u8>, start: u32, end: u32, cmdline: &[u8]) {
+        align_mbi(mbi);
+        push_u32(mbi, TAG_MODULE);
+        push_u32(mbi, (size_of::<RawModuleTag>() + cmdline.len() + 1) as u32);
+        push_u32(mbi, start);
+        push_u32(mbi, end);
+        mbi.extend_from_slice(cmdline);
+        mbi.push(0);
     }
 
     fn align_mbi(mbi: &mut Vec<u8>) {

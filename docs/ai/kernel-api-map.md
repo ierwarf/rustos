@@ -45,6 +45,14 @@ Do not reorder without reading `kernel/src/main.rs` and
 - **Scheduler wait primitives:** use `current_task_id`, `block_current_task`,
   `wake_task` for kernel-capable wait queues; use `*_user_*` wrappers only
   for userspace-task waits.
+- **Input poll waits:** compat `poll()` arms
+  `kernel_io_manager::api::input::event_queue::{arm_input_waiter,disarm_input_waiter}`
+  only for input fds with indefinite timeouts; finite timeouts stay on the
+  generic timed poll path until timer-backed wait queues exist. Native xHCI
+  may wake those waiters through its IRQ completion handler, but active HID
+  interrupt transfers still report `usb::uses_polled_input_completion()` so
+  compat input poll keeps the completion service path active as a bounded
+  fallback instead of sleeping solely on legacy IRQ delivery.
 - **Scheduler preemption:** `cond_resched`/`reschedule_if_requested` only at
   Linux-style safe points outside spinlocked or IRQ-off regions. Timer IRQs
   should request reschedule for user-task kernel frames, not blindly switch

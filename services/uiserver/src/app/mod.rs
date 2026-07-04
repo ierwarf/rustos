@@ -21,10 +21,9 @@ use crate::terminal::TerminalState;
 use crate::wayland::WaylandWindowSnapshot;
 
 pub(crate) const INPUT_EVENT_BATCH: usize = 256;
-pub(crate) const MAX_INPUT_READ_BATCHES_PER_TICK: usize = 4;
+pub(crate) const MAX_INPUT_READ_BATCHES_PER_TICK: usize = 8;
 pub(crate) const MAX_RUNNING_PROGRAMS: usize = 8;
-pub(crate) const IDLE_SLEEP: Duration = Duration::from_millis(2);
-pub(crate) const INPUT_PROCESS_BUDGET: Duration = Duration::from_millis(2);
+pub(crate) const INPUT_PROCESS_BUDGET: Duration = Duration::from_millis(8);
 pub(crate) const RUNTIME_POLL_SLEEP: Duration = Duration::from_millis(16);
 pub(crate) const CONSOLE_POLL_SLEEP: Duration = Duration::from_millis(16);
 pub(crate) const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
@@ -57,10 +56,14 @@ impl CursorMotion {
 pub(crate) struct InputProcessingResult {
     pub(crate) visual_update: VisualUpdate,
     pub(crate) backlog_remaining: bool,
+    pub(crate) input_events: u64,
+    pub(crate) pointer_motion_events: u64,
+    pub(crate) pointer_position_events: u64,
+    pub(crate) wayland_motion_calls: u64,
 }
 
 const MAX_PARTIAL_RECTS: usize = 32;
-const MAX_PARTIAL_RECT_PIXELS: u64 = 96 * 1024;
+const MAX_PARTIAL_RECT_PIXELS: u64 = 16 * 1024;
 const PARTIAL_RECT_MERGE_NUMERATOR: u64 = 5;
 const PARTIAL_RECT_MERGE_DENOMINATOR: u64 = 4;
 const FULL_REDRAW_PROMOTION_NUMERATOR: u64 = 9;
@@ -592,6 +595,10 @@ impl AppState {
         let before = self.cursor_visual_dirty_rect(width, height);
         self.cursor_motion = CursorMotion::stationary();
         before.union(self.cursor_visual_dirty_rect(width, height))
+    }
+
+    pub(crate) fn cursor_motion_active(&self) -> bool {
+        self.cursor_motion.sprite_index != 0
     }
 
     pub(crate) fn cursor_visual_dirty_rect(&self, width: u32, height: u32) -> canvas::Rect {

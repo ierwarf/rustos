@@ -155,7 +155,11 @@ pub(crate) fn present_bgra8888_from_kernel(
             false
         })
         .unwrap_or(false);
-    presented
+    if presented {
+        crate::driver::linux::virtio_gpu::flush_primary_scanout()
+    } else {
+        false
+    }
 }
 
 pub(crate) fn present_bgra8888_rect_from_kernel(
@@ -171,6 +175,12 @@ pub(crate) fn present_bgra8888_rect_from_kernel(
     if display_present_faulted() {
         return false;
     }
+    let flush_rect = crate::driver::linux::virtio_gpu::ScanoutFlushRect {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+    };
     let presented = DISPLAY_BACKEND
         .lock()
         .with_framebuffer(|framebuffer| {
@@ -188,7 +198,11 @@ pub(crate) fn present_bgra8888_rect_from_kernel(
             false
         })
         .unwrap_or(false);
-    presented
+    if presented {
+        crate::driver::linux::virtio_gpu::flush_primary_scanout_rect(Some(flush_rect))
+    } else {
+        false
+    }
 }
 
 fn present_context_allows_blocking() -> bool {

@@ -19,8 +19,7 @@ use std::time::{Duration, Instant};
 
 use app::{
     start_console_refresh_worker, start_launcher_program_loader, AppState, VisualUpdate,
-    CONSOLE_POLL_SLEEP, CURSOR_BLINK_INTERVAL, CURSOR_MOTION_SETTLE_INTERVAL, IDLE_SLEEP,
-    RUNTIME_POLL_SLEEP,
+    CONSOLE_POLL_SLEEP, CURSOR_BLINK_INTERVAL, CURSOR_MOTION_SETTLE_INTERVAL, RUNTIME_POLL_SLEEP,
 };
 use render::start_desktop_background_loader;
 use render::{render_boot_frame, render_debug_white_box, render_frame, render_rect};
@@ -41,10 +40,11 @@ const MAX_SLOW_RUNTIME_REFRESH_LOGS: usize = 8;
 const MAX_WAYLAND_CALLBACK_ONLY_LOGS: usize = 8;
 const MAX_CURSOR_PIPELINE_LOGS: usize = 32;
 const UI_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const UI_INPUT_PULSE_INTERVAL: Duration = Duration::from_millis(40);
 const UI_WATCHDOG_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const UI_PHASE_PANIC_THRESHOLD_MS: u64 = 3_000;
 const WAYLAND_BACKLOG_SERVICE_INTERVAL: Duration = Duration::from_millis(4);
-const PARTIAL_RENDER_BUDGET: Duration = Duration::from_millis(80);
+const PARTIAL_RENDER_BUDGET: Duration = Duration::from_millis(8);
 const SLOW_LOOP_THRESHOLD: Duration = Duration::from_millis(50);
 const MAX_SLOW_LOOP_LOGS: usize = 16;
 
@@ -736,11 +736,20 @@ fn run() -> Result<(), i32> {
     let mut next_cursor_blink = Instant::now() + CURSOR_BLINK_INTERVAL;
     let mut next_cursor_motion_settle = Instant::now() + CURSOR_MOTION_SETTLE_INTERVAL;
     let mut next_loop_summary = Instant::now() + UI_HEARTBEAT_INTERVAL;
+    let mut next_input_pulse = Instant::now();
     let mut next_wayland_backlog_service = Instant::now();
     let mut loop_count = 0_u64;
     let mut total_loop_count = 0_u64;
     let mut frames_rendered_window = 0_u64;
     let mut cursor_moves_window = 0_u64;
+    let mut input_events_window = 0_u64;
+    let mut pointer_motion_events_window = 0_u64;
+    let mut pointer_position_events_window = 0_u64;
+    let mut wayland_motion_calls_window = 0_u64;
+    let mut input_backlog_window = 0_u64;
+    let mut processed_input_events_total = 0_u64;
+    let mut last_input_processed_at: Option<Instant> = None;
+    let mut max_input_gap_ms_window = 0_u64;
     let watchdog = UiLoopWatchdog::start(boot_started);
 
     sys::debug_line("uiserver: main loop entered");
@@ -790,6 +799,44 @@ fn run() -> Result<(), i32> {
             ),
         )?;
         watchdog.leave();
+        if input.input_events > 0 {
+            let now = Instant::now();
+            if let Some(previous) = last_input_processed_at {
+                max_input_gap_ms_window = max_input_gap_ms_window
+                    .max(previous.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
+            }
+            last_input_processed_at = Some(now);
+            if now >= next_input_pulse {
+                let input_reader = input_events.snapshot();
+                diag_line(format!(
+                    "uiserver: input pulse events={} cursor={},{} pointer_motion={} pointer_position={} wayland_motion_calls={} backlog={} input_raw_events={} input_events={} input_drops={} input_errors={}",
+                    input.input_events,
+                    state.cursor_x,
+                    state.cursor_y,
+                    input.pointer_motion_events,
+                    input.pointer_position_events,
+                    input.wayland_motion_calls,
+                    input.backlog_remaining,
+                    input_reader.raw_events,
+                    input_reader.delivered_events,
+                    input_reader.queue_drops,
+                    input_reader.errors,
+                ));
+                next_input_pulse = now + UI_INPUT_PULSE_INTERVAL;
+            }
+        }
+        processed_input_events_total =
+            processed_input_events_total.saturating_add(input.input_events);
+        input_events_window = input_events_window.saturating_add(input.input_events);
+        pointer_motion_events_window =
+            pointer_motion_events_window.saturating_add(input.pointer_motion_events);
+        pointer_position_events_window =
+            pointer_position_events_window.saturating_add(input.pointer_position_events);
+        wayland_motion_calls_window =
+            wayland_motion_calls_window.saturating_add(input.wayland_motion_calls);
+        if input.backlog_remaining {
+            input_backlog_window = input_backlog_window.saturating_add(1);
+        }
         pending_update.absorb(input.visual_update);
         phase_timings.input = input_started.elapsed();
 
@@ -941,7 +988,7 @@ fn run() -> Result<(), i32> {
             }
             next_cursor_blink = now + CURSOR_BLINK_INTERVAL;
         }
-        if now >= next_cursor_motion_settle {
+        if state.cursor_motion_active() && now >= next_cursor_motion_settle {
             let cursor_dirty_rect =
                 state.settle_cursor_motion(state.surface.width, state.surface.height);
             pending_update.absorb(VisualUpdate::partial(cursor_dirty_rect));
@@ -958,8 +1005,11 @@ fn run() -> Result<(), i32> {
         let now = Instant::now();
         if now >= next_loop_summary {
             let input_reader = input_events.snapshot();
+            let input_pending_reader = input_reader
+                .delivered_events
+                .saturating_sub(processed_input_events_total);
             diag_line(format!(
-                "uiserver: update tick loops={} total_loops={} frames={} cursor_moves={} cursor={},{} presented_cursor={},{} pending_update={} backlog={} input_read_active={} input_read_ms={} input_reads={}/{} input_events={} input_drops={} input_slow={} input_errors={} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
+                "uiserver: update tick loops={} total_loops={} frames={} cursor_moves={} cursor={},{} presented_cursor={},{} pending_update={} pending_full={} pending_rects={} drawable_full={} drawable_rects={} backlog={} backlog_loops={} input_loop_events={} pointer_motion={} pointer_position={} wayland_motion_calls={} input_pending={} input_gap_ms={} input_read_active={} input_read_ms={} input_last_age_ms={} input_reads={}/{} input_raw_events={} input_events={} input_drops={} input_slow={} input_errors={} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
                 loop_count,
                 total_loop_count,
                 frames_rendered_window,
@@ -969,11 +1019,24 @@ fn run() -> Result<(), i32> {
                 presented_cursor_x,
                 presented_cursor_y,
                 !drawable_update.is_empty(),
+                pending_update.needs_full_redraw,
+                pending_update.partial_rects().len(),
+                drawable_update.needs_full_redraw,
+                drawable_update.partial_rects().len(),
                 input.backlog_remaining,
+                input_backlog_window,
+                input_events_window,
+                pointer_motion_events_window,
+                pointer_position_events_window,
+                wayland_motion_calls_window,
+                input_pending_reader,
+                max_input_gap_ms_window,
                 input_reader.read_active,
                 input_reader.read_elapsed_ms,
+                input_reader.last_delivery_age_ms,
                 input_reader.completed_reads,
                 input_reader.read_attempts,
+                input_reader.raw_events,
                 input_reader.delivered_events,
                 input_reader.queue_drops,
                 input_reader.slow_reads,
@@ -987,6 +1050,12 @@ fn run() -> Result<(), i32> {
             loop_count = 0;
             frames_rendered_window = 0;
             cursor_moves_window = 0;
+            input_events_window = 0;
+            pointer_motion_events_window = 0;
+            pointer_position_events_window = 0;
+            wayland_motion_calls_window = 0;
+            input_backlog_window = 0;
+            max_input_gap_ms_window = 0;
         }
         let main_present_started = Instant::now();
         log_cursor_pipeline_sample(
@@ -1036,14 +1105,19 @@ fn run() -> Result<(), i32> {
 
         let sleep_started = Instant::now();
         let now = sleep_started;
-        if !rendered && pending_update.is_empty() && !input.backlog_remaining {
-            let sleep_deadline = next_runtime_poll
+        if !rendered
+            && drawable_update.is_empty()
+            && pending_update.is_empty()
+            && !input.backlog_remaining
+        {
+            let mut sleep_deadline = next_runtime_poll
                 .min(next_console_poll)
                 .min(next_cursor_blink)
-                .min(next_cursor_motion_settle)
-                .min(next_wayland_backlog_service)
-                .min(now + IDLE_SLEEP);
-            input_loop::sleep_until(sleep_deadline);
+                .min(now + RUNTIME_POLL_SLEEP);
+            if state.cursor_motion_active() {
+                sleep_deadline = sleep_deadline.min(next_cursor_motion_settle);
+            }
+            input_loop::sleep_until_input_or(&input_events, sleep_deadline);
         }
         phase_timings.sleep = sleep_started.elapsed();
 

@@ -595,9 +595,6 @@ pub fn syscall_linux_kill(pid: u64, signal: u64) -> u64 {
     if pid_i64 == 0 || pid_i64 < -1 {
         return linux_errno(LINUX_ENOSYS);
     }
-    if signal > 64 {
-        return linux_errno(LINUX_EINVAL);
-    }
     let target_pid = if pid_i64 == -1 {
         match multitask::current_user_process_id() {
             Some(id) => id,
@@ -606,35 +603,22 @@ pub fn syscall_linux_kill(pid: u64, signal: u64) -> u64 {
     } else {
         pid
     };
-    let mut request = new_procd_request(rustos_user_abi::syscall::PROCD_OP_TGKILL);
-    request.arg0 = target_pid;
-    request.arg1 = target_pid;
-    request.arg2 = signal;
-    match call_procd(&request).and_then(|response| ensure_empty_procd_response(&response)) {
-        Ok(()) => 0,
-        Err(errno) => linux_errno(errno),
-    }
+    procd_tgkill(target_pid, target_pid, signal)
 }
 
 pub fn syscall_linux_tkill(tid: u64, signal: u64) -> u64 {
-    if signal > 64 {
-        return linux_errno(LINUX_EINVAL);
-    }
     let pid = match multitask::current_user_process_id() {
         Some(id) => id,
         None => return linux_errno(LINUX_ENOSYS),
     };
-    let mut request = new_procd_request(rustos_user_abi::syscall::PROCD_OP_TGKILL);
-    request.arg0 = pid;
-    request.arg1 = tid;
-    request.arg2 = signal;
-    match call_procd(&request).and_then(|response| ensure_empty_procd_response(&response)) {
-        Ok(()) => 0,
-        Err(errno) => linux_errno(errno),
-    }
+    procd_tgkill(pid, tid, signal)
 }
 
 pub fn syscall_linux_tgkill(tgid: u64, tid: u64, signal: u64) -> u64 {
+    procd_tgkill(tgid, tid, signal)
+}
+
+fn procd_tgkill(tgid: u64, tid: u64, signal: u64) -> u64 {
     let mut request = new_procd_request(rustos_user_abi::syscall::PROCD_OP_TGKILL);
     request.arg0 = tgid;
     request.arg1 = tid;

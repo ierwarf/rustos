@@ -186,8 +186,10 @@ pub fn syscall_linux_nanosleep(request_ptr: u64, _remaining_ptr: u64) -> u64 {
         Ok(ts) => ts,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
     };
-    if !is_valid_timespec(ts) {
-        return linux_errno(LINUX_EINVAL);
+    if let Err(errno) =
+        request_syscalld_timespec_admission(SYSCALL_OFFLOAD_OP_LINUX_NANOSLEEP, 0, 0, ts)
+    {
+        return linux_errno(errno);
     }
     sleep_relative_timespec_substrate(ts);
     0
@@ -198,8 +200,8 @@ pub fn syscall_linux_clock_gettime(clock_id: u64, timespec_ptr: u64) -> u64 {
     {
         return linux_errno(address_space_error_to_linux_errno(err));
     }
-    if !is_supported_clock_id(clock_id) {
-        return linux_errno(LINUX_EINVAL);
+    if let Err(errno) = request_syscalld_clock_gettime_admission(clock_id) {
+        return linux_errno(errno);
     }
     write_clock_timespec(clock_id, timespec_ptr)
 }
@@ -210,14 +212,6 @@ fn write_clock_timespec(clock_id: u64, timespec_ptr: u64) -> u64 {
         Ok(()) => 0,
         Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
     }
-}
-
-fn is_supported_clock_id(clock_id: u64) -> bool {
-    clock_id == linux_abi::CLOCK_MONOTONIC as u64 || clock_id == linux_abi::CLOCK_REALTIME as u64
-}
-
-fn is_valid_timespec(ts: LinuxTimespecWire) -> bool {
-    ts.tv_sec >= 0 && ts.tv_nsec >= 0 && ts.tv_nsec < 1_000_000_000
 }
 
 pub fn sleep_relative_timespec_substrate(ts: LinuxTimespecWire) {
@@ -339,11 +333,13 @@ pub fn syscall_linux_clock_nanosleep(
         Ok(ts) => ts,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
     };
-    if !is_supported_clock_id(clock_id)
-        || flags & !(linux_abi::TIMER_ABSTIME as u64) != 0
-        || !is_valid_timespec(ts)
-    {
-        return linux_errno(LINUX_EINVAL);
+    if let Err(errno) = request_syscalld_timespec_admission(
+        SYSCALL_OFFLOAD_OP_LINUX_CLOCK_NANOSLEEP,
+        clock_id,
+        flags,
+        ts,
+    ) {
+        return linux_errno(errno);
     }
     sleep_clock_nanosleep_substrate(clock_id, flags, ts)
 }

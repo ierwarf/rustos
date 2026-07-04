@@ -1,3 +1,8 @@
+// RING3-MIGRATION-REFERENCE START: Linux .ko workqueue/timer shim is explicit
+// ring0 compatibility substrate. driverd may own sleepable creation,
+// destruction, and quiesce policy through slow-path symbol events, but .ko
+// callback execution, timer interrupt substrate, pending-bit mutation, and
+// flush/cancel safety stay ring0 while .ko text executes in ring0.
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ffi::{c_char, c_void};
@@ -86,6 +91,11 @@ pub(crate) unsafe extern "C" fn alloc_workqueue(
     flags: u32,
     max_active: i32,
 ) -> *mut c_void {
+    crate::driver::symbol_events::record_workqueue_timer_symbol(
+        "alloc_workqueue",
+        _fmt as usize,
+        ((flags as u64) << 32) | max_active as u32 as u64,
+    );
     super::compat_log::debugcon_line(
         alloc::format!(
             "linux alloc_workqueue: begin fmt={:#x} flags={:#x} max_active={}",
@@ -133,6 +143,7 @@ pub(crate) unsafe extern "C" fn destroy_workqueue(wq: *mut c_void) {
     let Some(wq_ptr) = ptr_to_usize(wq) else {
         return;
     };
+    crate::driver::symbol_events::record_workqueue_timer_symbol("destroy_workqueue", wq_ptr, 0);
 
     flush_matching_queue(wq_ptr);
     cancel_queue_timers(wq_ptr);
@@ -153,6 +164,7 @@ pub(crate) unsafe extern "C" fn __flush_workqueue(wq: *mut c_void) {
     let Some(wq_ptr) = ptr_to_usize(wq) else {
         return;
     };
+    crate::driver::symbol_events::record_workqueue_timer_symbol("__flush_workqueue", wq_ptr, 0);
     flush_matching_queue(wq_ptr);
 }
 
@@ -167,6 +179,11 @@ pub(crate) unsafe extern "C" fn queue_work_on(
     let Some(work_ptr) = ptr_to_usize(work.cast::<c_void>()) else {
         return false;
     };
+    crate::driver::symbol_events::record_workqueue_timer_symbol(
+        "queue_work_on",
+        wq_ptr,
+        work_ptr as u64,
+    );
     enqueue_work(wq_ptr, work_ptr, false)
 }
 
@@ -182,6 +199,11 @@ pub(crate) unsafe extern "C" fn queue_delayed_work_on(
     let Some(_dwork_ptr) = ptr_to_usize(dwork.cast::<c_void>()) else {
         return false;
     };
+    crate::driver::symbol_events::record_workqueue_timer_symbol(
+        "queue_delayed_work_on",
+        wq_ptr,
+        delay,
+    );
 
     let delayed = unsafe { &mut *dwork };
     let work_ptr = ptr_to_usize((&mut delayed.work as *mut LinuxWorkStruct).cast::<c_void>())
@@ -244,6 +266,7 @@ pub(crate) unsafe extern "C" fn mod_timer(timer: *mut LinuxTimerList, expires: u
     let Some(timer_ptr) = ptr_to_usize(timer.cast::<c_void>()) else {
         return 0;
     };
+    crate::driver::symbol_events::record_workqueue_timer_symbol("mod_timer", timer_ptr, expires);
 
     let was_pending = timer_is_pending(timer_ptr);
     unsafe {
@@ -267,6 +290,7 @@ pub(crate) unsafe extern "C" fn cancel_work_sync(work: *mut LinuxWorkStruct) -> 
     let Some(work_ptr) = ptr_to_usize(work.cast::<c_void>()) else {
         return false;
     };
+    crate::driver::symbol_events::record_workqueue_timer_symbol("cancel_work_sync", work_ptr, 0);
     let removed = {
         let mut pending = PENDING_WORK.lock();
         if let Some(index) = pending.iter().position(|entry| entry.work == work_ptr) {
@@ -321,6 +345,9 @@ pub(crate) unsafe extern "C" fn timer_init_key(
 }
 
 pub(crate) unsafe extern "C" fn timer_delete(timer: *mut LinuxTimerList) -> i32 {
+    if let Some(timer_ptr) = ptr_to_usize(timer.cast::<c_void>()) {
+        crate::driver::symbol_events::record_workqueue_timer_symbol("timer_delete", timer_ptr, 0);
+    }
     delete_timer(timer)
 }
 
@@ -538,5 +565,10 @@ fn delayed_work_queue_from_timer(timer_ptr: usize) -> Option<usize> {
 
 fn ptr_to_usize(ptr: *mut c_void) -> Option<usize> {
     let value = ptr as usize;
-    if value == 0 { None } else { Some(value) }
+    if value == 0 {
+        None
+    } else {
+        Some(value)
+    }
 }
+// RING3-MIGRATION-REFERENCE END: Linux .ko workqueue/timer compatibility substrate exception.

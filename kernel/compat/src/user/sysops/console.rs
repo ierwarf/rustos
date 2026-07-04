@@ -1,11 +1,10 @@
 use alloc::string::String;
 use core::cmp::min;
 
-use x86_64::VirtAddr;
-
 use crate::io::tty;
 use crate::memory::paging;
 use crate::multitask;
+use crate::user::sysops::usermem;
 
 const CONSOLE_IO_CHUNK_LEN: usize = 256;
 
@@ -26,13 +25,7 @@ pub(crate) fn write_from_current_process(
         let chunk_ptr = user_ptr
             .checked_add(copied as u64)
             .ok_or(paging::AddressSpaceError::AddressOverflow)?;
-        let read_result = multitask::with_current_mm(|address_space| {
-            if copied == 0 {
-                address_space.validate_user_read_buffer(VirtAddr::new(user_ptr), len)?;
-            }
-            address_space.copy_from_user(VirtAddr::new(chunk_ptr), &mut chunk[..chunk_len])
-        })
-        .ok_or(paging::AddressSpaceError::NotMapped)?;
+        let read_result = usermem::copy_from_current_user_exact(chunk_ptr, &mut chunk[..chunk_len]);
         if let Err(err) = read_result {
             crate::debug::trace_loc!();
             log_console_user_buffer_failure("copy", user_ptr, len, chunk_ptr, chunk_len, err);
@@ -56,14 +49,9 @@ fn log_console_user_buffer_failure(
     fault_len: usize,
     err: paging::AddressSpaceError,
 ) {
-    let Some(buffer_state) = multitask::with_current_mm(|address_space| {
-        let end_addr = fault_ptr.saturating_add(fault_len.saturating_sub(1) as u64);
-        (
-            address_space.root_phys().as_u64(),
-            address_space.translate_user_with_flags(VirtAddr::new(fault_ptr)),
-            address_space.translate_user_with_flags(VirtAddr::new(end_addr)),
-        )
-    }) else {
+    let Some(address_space_root) =
+        multitask::with_current_mm(|address_space| address_space.root_phys().as_u64())
+    else {
         crate::debug::println!(
             "console write {} failed: ptr={:#x} len={} fault_ptr={:#x} fault_len={} err={:?} reason=no-current-mm",
             stage,
@@ -75,7 +63,6 @@ fn log_console_user_buffer_failure(
         );
         return;
     };
-    let (address_space_root, start, end) = buffer_state;
     let end_addr = fault_ptr.saturating_add(fault_len.saturating_sub(1) as u64);
     let snapshot = multitask::current_user_snapshot();
     if let Some((tid, abi, exec_path)) =
@@ -84,7 +71,7 @@ fn log_console_user_buffer_failure(
         })
     {
         crate::debug::println!(
-            "console write {} failed: tid={} abi={:?} exec={} root={:#x} ptr={:#x} len={} fault_ptr={:#x} fault_len={} end={:#x} start_map={:?} end_map={:?} err={:?}",
+            "console write {} failed: tid={} abi={:?} exec={} root={:#x} ptr={:#x} len={} fault_ptr={:#x} fault_len={} end={:#x} err={:?}",
             stage,
             tid,
             abi,
@@ -95,13 +82,11 @@ fn log_console_user_buffer_failure(
             fault_ptr,
             fault_len,
             end_addr,
-            start,
-            end,
             err,
         );
     } else {
         crate::debug::println!(
-            "console write {} failed: snapshot={:?} ptr={:#x} len={} fault_ptr={:#x} fault_len={} end={:#x} root={:#x} start_map={:?} end_map={:?} err={:?}",
+            "console write {} failed: snapshot={:?} ptr={:#x} len={} fault_ptr={:#x} fault_len={} end={:#x} root={:#x} err={:?}",
             stage,
             snapshot,
             user_ptr,
@@ -110,8 +95,6 @@ fn log_console_user_buffer_failure(
             fault_len,
             end_addr,
             address_space_root,
-            start,
-            end,
             err,
         );
     }
@@ -121,10 +104,7 @@ pub(crate) fn read_into_current_process(
     user_ptr: u64,
     len: usize,
 ) -> Result<usize, paging::AddressSpaceError> {
-    multitask::with_current_mm(|address_space| {
-        address_space.validate_user_write_buffer(VirtAddr::new(user_ptr), len)
-    })
-    .ok_or(paging::AddressSpaceError::NotMapped)??;
+    usermem::validate_current_user_write_buffer(user_ptr, len)?;
 
     let mut total_read = 0usize;
     let mut chunk = [0_u8; CONSOLE_IO_CHUNK_LEN];
@@ -146,10 +126,7 @@ pub(crate) fn read_into_current_process(
         let chunk_ptr = user_ptr
             .checked_add(total_read as u64)
             .ok_or(paging::AddressSpaceError::AddressOverflow)?;
-        multitask::with_current_mm(|address_space| {
-            address_space.copy_into_user(VirtAddr::new(chunk_ptr), &chunk[..read])
-        })
-        .ok_or(paging::AddressSpaceError::NotMapped)??;
+        usermem::write_current_user_bytes(chunk_ptr, &chunk[..read])?;
         total_read += read;
     }
 

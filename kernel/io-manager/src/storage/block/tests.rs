@@ -9,8 +9,9 @@ use storage_core::BlockDevice as SharedBlockDevice;
 use super::io::{cache_lookup, clear_cache_for_tests, read_cached_block, write_cached_block};
 use super::registry::register_root_device;
 use super::{
-    BLOCK_DEVICES, BLOCK_INIT_DONE, BlockDeviceOps, BlockTransportKind, MIN_LOGICAL_BLOCK_SIZE,
-    descriptors, flush, lookup, open_boot_block_device, open_physical_boot_block_device,
+    BLOCK_DEVICES, BLOCK_INIT_DONE, BLOCK_INIT_STATE, BlockDeviceOps, BlockTransportKind,
+    MIN_LOGICAL_BLOCK_SIZE, descriptors, flush, lookup, open_boot_block_device,
+    open_physical_boot_block_device,
 };
 use crate::storage::fat::{DiskIoError, IoResult};
 
@@ -124,7 +125,7 @@ impl BlockDeviceOps for MockBlockDevice {
 fn reset_for_tests() {
     BLOCK_DEVICES.lock().clear();
     clear_cache_for_tests();
-    BLOCK_INIT_DONE.store(true, Ordering::Release);
+    BLOCK_INIT_STATE.store(BLOCK_INIT_DONE, Ordering::Release);
 }
 
 fn fat_boot_sector(

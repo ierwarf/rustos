@@ -172,7 +172,7 @@ pub(crate) fn build_efi(config: &Config) -> Result<()> {
     let grub_cfg = temp_dir.join("grub.cfg");
     fs::write(
         &grub_cfg,
-        "set check_signatures=enforce\nload_video\nset gfxmode=auto\nset gfxpayload=keep\nterminal_output gfxterm\nsearch --file --set=root /nucleus.elf\nmultiboot2 ($root)/nucleus.elf\nboot\n",
+        "set check_signatures=enforce\nload_video\nset gfxmode=auto\nset gfxpayload=keep\nterminal_output gfxterm\nsearch --file --set=root /nucleus.elf\nmultiboot2 ($root)/nucleus.elf\nmodule2 ($root)/system/registry/kernel/root-file-extents.tsv rustos-root-extents\nboot\n",
     )?;
     let grub_cfg_signature = temp_dir.join("grub.cfg.sig");
     sign_detached(config, &signing, &grub_cfg, &grub_cfg_signature)?;

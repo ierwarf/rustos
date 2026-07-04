@@ -54,6 +54,17 @@ Package/stage schemas, runtime control, kernel API, build, fault injection, logg
 - `system/registry/system/runtime-env.tsv` — `scope=init|runtime`, `key=NAME`, `value=VALUE`. `initd` and `runtimed` consume this instead of hardcoded default `PATH`, `HOME`, `XDG_*`, display env values.
 - `system/registry/compat/windows-system-dlls.txt`
 
+## Fuzzing
+
+- Policy: `config/rustos.toml` `[fuzzing]`.
+- `enabled=false` removes `abifuzz.desktop` autostart from the staged image
+  and excludes the `abifuzz` package from desktop/runtime launch registries.
+- When enabled, `abifuzz` launches after `wayclick` via `runtime_deps` so UI
+  smoke gets a chance to connect before ABI fuzzing starts.
+- `fd_transfer_stress=true` passes `--fd-transfer-stress` to `abifuzz`; keep it
+  separate from default ABI smoke because SCM_RIGHTS stress can perturb UI
+  launch diagnostics.
+
 ## Runtime Control
 
 - Client crate: `libs/runtime-control`.
@@ -92,6 +103,13 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
 
 - Kernel-target Cargo invocations route through `tools/xtask/src/build/cargo.rs::kernel_rustflags_env`.
 - Operational config: `config/rustos.toml`. Build-shape defaults: `[kernel.build]`. Set `KERNEL_BUILD_CONFIG` to test an alternate TOML file.
+- Lock telemetry policy: `[lock_telemetry]`. `enabled=true` emits
+  `rustos_lock_telemetry_enabled` for kernel crates and configures cycle
+  thresholds through `RUSTOS_LOCK_TELEMETRY_WARN_WAIT_CYCLES` /
+  `RUSTOS_LOCK_TELEMETRY_WARN_HOLD_CYCLES`.
+- Initial lock telemetry owner: `kernel/io-manager/src/sync.rs`
+  `KernelSpinLock` / `KernelWaitLock`. It warns on contended acquire latency and
+  long guard hold time with `lock-telemetry:` debugcon records.
 
 ### Default Kernel `RUSTFLAGS`
 

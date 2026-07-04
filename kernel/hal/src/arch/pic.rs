@@ -59,7 +59,6 @@ pub fn enable_irq(irq: u8) {
     set_irq_enabled(irq, true);
 }
 
-#[allow(dead_code)]
 pub fn disable_irq(irq: u8) {
     set_irq_enabled(irq, false);
 }

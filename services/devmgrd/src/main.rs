@@ -20,13 +20,17 @@ use rustos_user_abi::syscall::{
     DEVMGRD_DEVICE_ACCESS_EVDEV, DEVMGRD_DEVICE_ACCESS_NATIVE, DEVMGRD_DEVICE_ID_CONSOLE,
     DEVMGRD_DEVICE_ID_DISPLAY, DEVMGRD_DEVICE_ID_INPUT, DEVMGRD_DEVICE_RIGHT_ADMIN,
     DEVMGRD_DEVICE_RIGHT_IOCTL, DEVMGRD_DEVICE_RIGHT_MAP, DEVMGRD_DEVICE_RIGHT_READ,
-    DEVMGRD_DEVICE_RIGHT_TRANSFER, DEVMGRD_DEVICE_RIGHT_WRITE, DEVMGRD_IPC_ABI_VERSION,
-    DEVMGRD_IPC_OP_IOCTL_AUTHORIZE, DEVMGRD_IPC_OP_LOOKUP, DEVMGRD_IPC_OP_OPEN,
-    DEVMGRD_IPC_OP_READDIR, DEVMGRD_MAX_DIR_ENTRIES, DEVMGRD_NAME_CAPACITY,
-    DEVMGRD_NODE_KIND_DEVICE, DEVMGRD_NODE_KIND_DIR, IPC_MAX_INLINE_BYTES, IPC_SERVICE_DEVMGRD,
-    IPC_SERVICE_SESSIOND, IPC_SERVICE_UISERVER, SYS_RUSTOS_DEBUG_PRINT,
-    SYS_RUSTOS_DEVICE_IOCTL_BROKER, SYS_RUSTOS_DEVICE_OPEN_BROKER, SYS_RUSTOS_IPC_CALL,
-    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_RECV,
+    DEVMGRD_DEVICE_RIGHT_TRANSFER, DEVMGRD_DEVICE_RIGHT_WRITE, DEVMGRD_IOCTL_LINUX_TTY_FIONREAD,
+    DEVMGRD_IOCTL_LINUX_TTY_TCGETS, DEVMGRD_IOCTL_LINUX_TTY_TCSETS,
+    DEVMGRD_IOCTL_LINUX_TTY_TCSETSF, DEVMGRD_IOCTL_LINUX_TTY_TCSETSW, DEVMGRD_IOCTL_ROUTE_DEVMGRD,
+    DEVMGRD_IOCTL_ROUTE_DIRECT, DEVMGRD_IOCTL_ROUTE_SESSIOND_COMMIT,
+    DEVMGRD_IOCTL_ROUTE_SESSIOND_TTY, DEVMGRD_IPC_ABI_VERSION, DEVMGRD_IPC_OP_IOCTL_AUTHORIZE,
+    DEVMGRD_IPC_OP_IOCTL_ROUTE, DEVMGRD_IPC_OP_LOOKUP, DEVMGRD_IPC_OP_OPEN, DEVMGRD_IPC_OP_READDIR,
+    DEVMGRD_MAX_DIR_ENTRIES, DEVMGRD_NAME_CAPACITY, DEVMGRD_NODE_KIND_DEVICE,
+    DEVMGRD_NODE_KIND_DIR, IPC_MAX_INLINE_BYTES, IPC_SERVICE_DEVMGRD, IPC_SERVICE_SESSIOND,
+    IPC_SERVICE_UISERVER, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_DEVICE_IOCTL_BROKER,
+    SYS_RUSTOS_DEVICE_OPEN_BROKER, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
+    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_RECV,
     SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
     SYS_RUSTOS_IPC_REPLY_WITH_HANDLES,
 };
@@ -138,6 +142,9 @@ fn reply_commercial_request(reply_cap: u64, request: &CommercialMaxProtocolReque
 }
 
 fn reply_device_ioctl(reply_cap: u64, request: &DevmgrdDeviceIoctlRequest) -> i64 {
+    if request.op == DEVMGRD_IPC_OP_IOCTL_ROUTE {
+        return reply_ioctl_route(reply_cap, request);
+    }
     let mut response = DevmgrdDeviceIoctlResponse {
         version: DEVMGRD_IPC_ABI_VERSION,
         op: DEVMGRD_IPC_OP_IOCTL_AUTHORIZE,
@@ -175,6 +182,27 @@ fn reply_device_ioctl(reply_cap: u64, request: &DevmgrdDeviceIoctlRequest) -> i6
         }
     } else {
         authorize_and_broker_ioctl(request, &mut response)
+    };
+    syscall3(
+        SYS_RUSTOS_IPC_REPLY,
+        reply_cap,
+        (&response as *const DevmgrdDeviceIoctlResponse) as u64,
+        size_of::<DevmgrdDeviceIoctlResponse>() as u64,
+    )
+}
+
+fn reply_ioctl_route(reply_cap: u64, request: &DevmgrdDeviceIoctlRequest) -> i64 {
+    let mut response = DevmgrdDeviceIoctlResponse {
+        version: DEVMGRD_IPC_ABI_VERSION,
+        op: DEVMGRD_IPC_OP_IOCTL_ROUTE,
+        ..DevmgrdDeviceIoctlResponse::default()
+    };
+    response.status = match validate_ioctl_route_request(request) {
+        Ok(()) => {
+            response.value = ioctl_route(request.request);
+            0
+        }
+        Err(errno) => errno,
     };
     syscall3(
         SYS_RUSTOS_IPC_REPLY,
@@ -387,6 +415,22 @@ fn authorize_ioctl_request(request: &DevmgrdDeviceIoctlRequest) -> Result<(), i3
     }
 }
 
+fn validate_ioctl_route_request(request: &DevmgrdDeviceIoctlRequest) -> Result<(), i32> {
+    if request.version != DEVMGRD_IPC_ABI_VERSION
+        || request.op != DEVMGRD_IPC_OP_IOCTL_ROUTE
+        || request.flags != 0
+        || request.arg != 0
+        || request.payload_len != 0
+        || request.reserved1 != 0
+        || request.reserved0 != 0
+        || request.pid == 0
+        || request.tid == 0
+    {
+        return Err(libc::EINVAL);
+    }
+    Ok(())
+}
+
 fn sessiond_executes_ioctl(request_number: u64) -> bool {
     matches!(
         request_number,
@@ -513,6 +557,41 @@ fn ioctl_policy_owner(request_number: u64) -> Option<IoctlPolicyOwner> {
         ),
         _ => None,
     }
+}
+
+fn ioctl_route(request_number: u64) -> u64 {
+    if ioctl_requires_sessiond_tty_policy(request_number) {
+        return DEVMGRD_IOCTL_ROUTE_SESSIOND_TTY;
+    }
+    if ioctl_is_direct_hot_path(request_number) {
+        return DEVMGRD_IOCTL_ROUTE_DIRECT;
+    }
+    if sessiond_broker_commits_ioctl(request_number) {
+        return DEVMGRD_IOCTL_ROUTE_SESSIOND_COMMIT;
+    }
+    match ioctl_policy_owner(request_number) {
+        Some(_) => DEVMGRD_IOCTL_ROUTE_DEVMGRD,
+        None => DEVMGRD_IOCTL_ROUTE_DIRECT,
+    }
+}
+
+fn ioctl_requires_sessiond_tty_policy(request_number: u64) -> bool {
+    matches!(
+        request_number,
+        DEVMGRD_IOCTL_LINUX_TTY_TCGETS
+            | DEVMGRD_IOCTL_LINUX_TTY_TCSETS
+            | DEVMGRD_IOCTL_LINUX_TTY_TCSETSW
+            | DEVMGRD_IOCTL_LINUX_TTY_TCSETSF
+            | DEVMGRD_IOCTL_LINUX_TTY_FIONREAD
+    )
+}
+
+fn ioctl_is_direct_hot_path(request_number: u64) -> bool {
+    matches!(
+        request_number,
+        rustos_user_abi::device::DISPLAY_IOCTL_PRESENT
+            | rustos_user_abi::device::DISPLAY_IOCTL_PRESENT_RECT
+    )
 }
 
 fn authorize_session_ioctl(op: u16, request_number: u64) -> Result<(), i32> {

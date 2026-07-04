@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn device_handle_round_trip_keeps_id_and_access() {
-        let handle = DeviceHandle::with_access(DeviceId::Input, DeviceAccessKind::Evdev);
+        let handle = DeviceHandle::from_parts(DeviceId::Input, DeviceAccessKind::Evdev);
         let object = handle.into_object_handle();
         let restored = DeviceHandle::from_object_handle(object);
         assert_eq!(restored.device_id(), DeviceId::Input);

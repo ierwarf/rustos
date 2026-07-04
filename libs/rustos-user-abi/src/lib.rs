@@ -60,10 +60,13 @@ mod tests {
         assert_eq!(syscall::SYS_RUSTOS_INPUT_INGEST_BROKER, 0x5255_0033);
         assert_eq!(syscall::SYS_RUSTOS_BOOT_EXTENT_BROKER, 0x5255_0034);
         assert_eq!(syscall::SYS_RUSTOS_IPC_TRY_RECV, 0x5255_0035);
+        assert_eq!(syscall::SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, 0x5255_0036);
+        assert_eq!(syscall::SYS_RUSTOS_DRIVER_SYMBOL_EVENT_BROKER, 0x5255_0037);
         assert_eq!(
             syscall::SYS_RUSTOS_SERVICE_DRIVER_RESOURCE_BROKER,
             0x5255_0022
         );
+        assert_eq!(size_of::<syscall::LinuxDriverSymbolEventWire>(), 192);
     }
 
     #[test]
@@ -93,6 +96,16 @@ mod tests {
         assert_eq!(syscall::IPC_SERVICE_UISERVER, 14);
         assert_eq!(syscall::DEVMGRD_IPC_OP_OPEN, 3);
         assert_eq!(syscall::DEVMGRD_IPC_OP_IOCTL_AUTHORIZE, 4);
+        assert_eq!(syscall::DEVMGRD_IPC_OP_IOCTL_ROUTE, 5);
+        assert_eq!(syscall::DEVMGRD_IOCTL_ROUTE_DIRECT, 0);
+        assert_eq!(syscall::DEVMGRD_IOCTL_ROUTE_DEVMGRD, 1);
+        assert_eq!(syscall::DEVMGRD_IOCTL_ROUTE_SESSIOND_TTY, 2);
+        assert_eq!(syscall::DEVMGRD_IOCTL_ROUTE_SESSIOND_COMMIT, 3);
+        assert_eq!(syscall::DEVMGRD_IOCTL_LINUX_TTY_TCGETS, 0x5401);
+        assert_eq!(syscall::DEVMGRD_IOCTL_LINUX_TTY_TCSETS, 0x5402);
+        assert_eq!(syscall::DEVMGRD_IOCTL_LINUX_TTY_TCSETSW, 0x5403);
+        assert_eq!(syscall::DEVMGRD_IOCTL_LINUX_TTY_TCSETSF, 0x5404);
+        assert_eq!(syscall::DEVMGRD_IOCTL_LINUX_TTY_FIONREAD, 0x541b);
         assert_eq!(syscall::INPUTD_IPC_OP_DRAIN_INGEST, 4);
         assert_eq!(syscall::INPUTD_IPC_OP_READ, 5);
         assert_eq!(syscall::INPUTD_INGRESS_KIND_EVENT, 1);
@@ -152,6 +165,8 @@ mod tests {
         assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_CAPABILITY, 14);
         assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_UISERVER, 15);
         assert_eq!(syscall::COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL, 5);
+        assert_eq!(syscall::COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY, 6);
+        assert_eq!(syscall::COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP, 7);
         assert_eq!(syscall::COMMERCIAL_MAX_PROCD_OP_SESSION_MEMBERSHIP, 7);
         assert_eq!(syscall::COMMERCIAL_MAX_LOADERD_OP_AUXV_PLAN, 7);
         assert_eq!(syscall::COMMERCIAL_MAX_SYSCALLD_OP_COLD_SYSCALL_OFFLOAD, 7);

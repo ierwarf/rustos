@@ -15,7 +15,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use boot_protocol::BootVolumeIdentity;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::hint::spin_loop;
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use storage_core::BlockDevice as SharedBlockDevice;
 
 use crate::storage::fat::{DiskIoError, IoResult};
@@ -24,10 +25,12 @@ use crate::sync::KernelWaitLock;
 pub use storage_core::TransportKind as BlockTransportKind;
 
 const MIN_LOGICAL_BLOCK_SIZE: usize = 512;
+const BLOCK_INIT_UNINITIALIZED: u8 = 0;
+const BLOCK_INIT_INITIALIZING: u8 = 1;
+const BLOCK_INIT_DONE: u8 = 2;
 
 static BLOCK_DEVICES: Mutex<Vec<BlockDeviceRecord>> = Mutex::new(Vec::new());
-static BLOCK_INIT_DONE: AtomicBool = AtomicBool::new(false);
-static BLOCK_INIT_LOCK: KernelWaitLock<()> = KernelWaitLock::new(());
+static BLOCK_INIT_STATE: AtomicU8 = AtomicU8::new(BLOCK_INIT_UNINITIALIZED);
 static BOOT_VOLUME_HANDLE_LOGGED: AtomicBool = AtomicBool::new(false);
 static BOOT_VOLUME_HANDLE_ID: AtomicU32 = AtomicU32::new(u32::MAX);
 
@@ -88,7 +91,6 @@ pub fn init() {
 }
 
 pub fn register_boot_volume_opener() {
-    crate::storage::boot_volume::set_boot_block_device_opener(open_boot_block_device);
     crate::storage::boot_volume::set_physical_boot_block_device_opener(
         open_physical_boot_block_device,
     );
@@ -114,18 +116,29 @@ pub fn current_boot_volume_handle() -> Option<BlockDeviceHandle> {
 }
 
 fn ensure_initialized() {
-    if BLOCK_INIT_DONE.load(Ordering::Acquire) {
+    if BLOCK_INIT_STATE.load(Ordering::Acquire) == BLOCK_INIT_DONE {
         return;
     }
 
-    let _guard = BLOCK_INIT_LOCK.lock();
-    if BLOCK_INIT_DONE.load(Ordering::Relaxed) {
+    if BLOCK_INIT_STATE
+        .compare_exchange(
+            BLOCK_INIT_UNINITIALIZED,
+            BLOCK_INIT_INITIALIZING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        initialize_root_devices();
+        io::publish_block_devices_snapshot_once();
+        BLOCK_INIT_STATE.store(BLOCK_INIT_DONE, Ordering::Release);
         return;
     }
 
-    initialize_root_devices();
-    io::publish_block_devices_snapshot_once();
-    BLOCK_INIT_DONE.store(true, Ordering::Release);
+    while BLOCK_INIT_STATE.load(Ordering::Acquire) != BLOCK_INIT_DONE {
+        spin_loop();
+        crate::multitask::cond_resched();
+    }
 }
 
 fn initialize_root_devices() {
@@ -283,25 +296,31 @@ pub(crate) fn flush(handle: BlockDeviceHandle) -> IoResult<()> {
 
 pub(crate) struct FatRegistryDevice {
     handle: BlockDeviceHandle,
+    logical_block_size: usize,
+    block_count: u64,
 }
 
 impl FatRegistryDevice {
     pub(crate) fn new(handle: BlockDeviceHandle) -> Self {
-        Self { handle }
+        let descriptor = descriptor(handle);
+        Self {
+            handle,
+            logical_block_size: descriptor
+                .as_ref()
+                .map(|device| device.logical_block_size)
+                .unwrap_or(0),
+            block_count: descriptor.map(|device| device.block_count).unwrap_or(0),
+        }
     }
 }
 
 impl SharedBlockDevice for FatRegistryDevice {
     fn logical_block_size(&self) -> usize {
-        descriptor(self.handle)
-            .map(|device| device.logical_block_size)
-            .unwrap_or(0)
+        self.logical_block_size
     }
 
     fn block_count(&self) -> u64 {
-        descriptor(self.handle)
-            .map(|device| device.block_count)
-            .unwrap_or(0)
+        self.block_count
     }
 
     fn read_blocks(&mut self, lba: u64, out: &mut [u8]) -> IoResult<()> {

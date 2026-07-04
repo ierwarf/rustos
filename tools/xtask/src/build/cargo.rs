@@ -63,6 +63,18 @@ pub(crate) fn apply_kernel_cargo_env<'a>(
         .env("CARGO_TARGET_DIR", &config.cargo_target_dir)
         .env("RUSTFLAGS", kernel_rustflags_env(config))
         .env(
+            "RUSTOS_LOCK_TELEMETRY",
+            config.project.lock_telemetry.enabled.to_string(),
+        )
+        .env(
+            "RUSTOS_LOCK_TELEMETRY_WARN_WAIT_CYCLES",
+            config.project.lock_telemetry.warn_wait_cycles.to_string(),
+        )
+        .env(
+            "RUSTOS_LOCK_TELEMETRY_WARN_HOLD_CYCLES",
+            config.project.lock_telemetry.warn_hold_cycles.to_string(),
+        )
+        .env(
             "CARGO_INCREMENTAL",
             if config.project.kernel.build.incremental && !uses_sccache {
                 "1"

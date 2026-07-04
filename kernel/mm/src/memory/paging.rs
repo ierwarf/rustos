@@ -22,11 +22,6 @@ pub fn load_address_space_phys(root_phys: PhysAddr) {
     crate::memory::kernel_vm::load_address_space_phys(root_phys);
 }
 
-#[allow(dead_code)]
-pub fn load_kernel_address_space() {
-    crate::memory::kernel_vm::load_kernel_address_space();
-}
-
 pub fn with_kernel_address_space<R>(f: impl FnOnce() -> R) -> R {
     crate::memory::kernel_vm::with_kernel_address_space(f)
 }
@@ -87,16 +82,6 @@ pub fn map_mmio_range_wc(phys_addr: u64, size: usize) -> Option<u64> {
 
 pub fn unmap_mmio_range(virt_addr: u64, size: usize) -> bool {
     crate::memory::kernel_vm::unmap_mmio_range(virt_addr, size)
-}
-
-#[allow(dead_code)]
-pub fn mmio_addr(phys_addr: u64) -> Option<u64> {
-    crate::memory::kernel_vm::mmio_addr(phys_addr)
-}
-
-#[allow(dead_code)]
-pub fn mmio_addr_wc(phys_addr: u64) -> Option<u64> {
-    crate::memory::kernel_vm::mmio_addr_wc(phys_addr)
 }
 
 pub fn smoke_test() {

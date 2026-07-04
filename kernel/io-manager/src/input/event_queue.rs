@@ -25,6 +25,7 @@ static INPUT_READ_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
 static INPUT_READ_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
 static INPUT_INGRESS_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
 const INPUT_INGRESS_QUEUE_CAPACITY: usize = 2048;
+const INPUT_WAITERS_CAPACITY: usize = 32;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct InputEventQueueDebugSnapshot {
@@ -43,6 +44,8 @@ pub struct InputEventQueueDebugSnapshot {
 
 static INPUT_INGRESS: Mutex<HeaplessDeque<InputIngressWire, INPUT_INGRESS_QUEUE_CAPACITY>> =
     Mutex::new(HeaplessDeque::new());
+static INPUT_WAITERS: Mutex<[Option<u64>; INPUT_WAITERS_CAPACITY]> =
+    Mutex::new([None; INPUT_WAITERS_CAPACITY]);
 
 pub(crate) fn submit_keyboard_event(action: u16, code: u32, modifiers: u32, text: u32) -> bool {
     push_ingress(InputIngressWire {
@@ -190,6 +193,31 @@ pub(crate) fn has_pending_input_events() -> bool {
     has_pending_ingress()
 }
 
+pub(crate) fn arm_input_waiter(task_id: u64) -> bool {
+    with_input_waiters(|waiters| {
+        if waiters.iter().any(|waiter| *waiter == Some(task_id)) {
+            return true;
+        }
+        for waiter in waiters.iter_mut() {
+            if waiter.is_none() {
+                *waiter = Some(task_id);
+                return true;
+            }
+        }
+        false
+    })
+}
+
+pub(crate) fn disarm_input_waiter(task_id: u64) {
+    with_input_waiters(|waiters| {
+        for waiter in waiters.iter_mut() {
+            if *waiter == Some(task_id) {
+                *waiter = None;
+            }
+        }
+    });
+}
+
 pub fn debug_snapshot() -> InputEventQueueDebugSnapshot {
     let ingress_queued = INPUT_INGRESS
         .try_lock()
@@ -230,6 +258,7 @@ pub(crate) fn drain_ingress(dest: &mut [InputIngressWire]) -> usize {
 #[cfg(test)]
 pub(crate) fn reset_for_tests() {
     *INPUT_INGRESS.lock() = HeaplessDeque::new();
+    *INPUT_WAITERS.lock() = [None; INPUT_WAITERS_CAPACITY];
     POINTER_PACKET_SUBMIT_COUNT.store(0, Ordering::Relaxed);
     POINTER_ABSOLUTE_SUBMIT_COUNT.store(0, Ordering::Relaxed);
     INPUT_READ_CALL_COUNT.store(0, Ordering::Relaxed);
@@ -238,14 +267,18 @@ pub(crate) fn reset_for_tests() {
 }
 
 fn push_ingress(wire: InputIngressWire) -> bool {
-    with_ingress_queue(|ingress| {
+    let pushed = with_ingress_queue(|ingress| {
         if ingress.push_back(wire).is_ok() {
             true
         } else {
             INPUT_INGRESS_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
             false
         }
-    })
+    });
+    if pushed {
+        wake_input_waiters();
+    }
+    pushed
 }
 
 fn has_pending_ingress() -> bool {
@@ -263,6 +296,35 @@ fn with_ingress_queue<R>(
     #[cfg(not(test))]
     {
         interrupts::without_interrupts(|| f(&mut INPUT_INGRESS.lock()))
+    }
+}
+
+fn wake_input_waiters() {
+    let mut task_ids = [0_u64; INPUT_WAITERS_CAPACITY];
+    let count = with_input_waiters(|waiters| {
+        let mut count = 0;
+        for waiter in waiters.iter_mut() {
+            if let Some(task_id) = waiter.take() {
+                task_ids[count] = task_id;
+                count += 1;
+            }
+        }
+        count
+    });
+    for task_id in task_ids.iter().take(count).copied() {
+        let _ = crate::multitask::wake_task(task_id);
+    }
+}
+
+fn with_input_waiters<R>(f: impl FnOnce(&mut [Option<u64>; INPUT_WAITERS_CAPACITY]) -> R) -> R {
+    #[cfg(test)]
+    {
+        f(&mut INPUT_WAITERS.lock())
+    }
+
+    #[cfg(not(test))]
+    {
+        interrupts::without_interrupts(|| f(&mut INPUT_WAITERS.lock()))
     }
 }
 

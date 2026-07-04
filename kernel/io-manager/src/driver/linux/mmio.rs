@@ -8,18 +8,22 @@ use super::compat::LinuxCompatResource;
 const MEMREMAP_WC: u64 = 1 << 2;
 
 pub(crate) unsafe extern "C" fn ioremap(offset: u64, size: usize) -> *mut c_void {
+    crate::driver::symbol_events::record_mmio_symbol("ioremap", 0, offset, size as u64);
     map_mmio(offset, size, false)
 }
 
 pub(crate) unsafe extern "C" fn ioremap_uc(offset: u64, size: usize) -> *mut c_void {
+    crate::driver::symbol_events::record_mmio_symbol("ioremap_uc", 0, offset, size as u64);
     map_mmio(offset, size, false)
 }
 
 pub(crate) unsafe extern "C" fn ioremap_nocache(offset: u64, size: usize) -> *mut c_void {
+    crate::driver::symbol_events::record_mmio_symbol("ioremap_nocache", 0, offset, size as u64);
     map_mmio(offset, size, false)
 }
 
 pub(crate) unsafe extern "C" fn ioremap_wc(offset: u64, size: usize) -> *mut c_void {
+    crate::driver::symbol_events::record_mmio_symbol("ioremap_wc", 0, offset, size as u64);
     map_mmio(offset, size, true)
 }
 
@@ -35,6 +39,7 @@ pub(crate) unsafe extern "C" fn devm_ioremap(
     offset: u64,
     size: u64,
 ) -> *mut c_void {
+    crate::driver::symbol_events::record_mmio_symbol("devm_ioremap", dev as usize, offset, size);
     let Some(size) = usize::try_from(size).ok() else {
         return core::ptr::null_mut();
     };
@@ -48,6 +53,7 @@ pub(crate) unsafe extern "C" fn devm_ioremap_uc(
     offset: u64,
     size: u64,
 ) -> *mut c_void {
+    crate::driver::symbol_events::record_mmio_symbol("devm_ioremap_uc", dev as usize, offset, size);
     let Some(size) = usize::try_from(size).ok() else {
         return core::ptr::null_mut();
     };
@@ -61,6 +67,7 @@ pub(crate) unsafe extern "C" fn devm_ioremap_wc(
     offset: u64,
     size: u64,
 ) -> *mut c_void {
+    crate::driver::symbol_events::record_mmio_symbol("devm_ioremap_wc", dev as usize, offset, size);
     let Some(size) = usize::try_from(size).ok() else {
         return core::ptr::null_mut();
     };
@@ -75,6 +82,7 @@ pub(crate) unsafe extern "C" fn devm_iounmap(_dev: *mut c_void, addr: *mut c_voi
 }
 
 pub(crate) unsafe extern "C" fn memremap(offset: u64, size: usize, flags: u64) -> *mut c_void {
+    crate::driver::symbol_events::record_mmio_symbol("memremap", 0, offset, size as u64);
     map_mmio(offset, size, (flags & MEMREMAP_WC) != 0)
 }
 
@@ -84,6 +92,12 @@ pub(crate) unsafe extern "C" fn devm_memremap(
     size: usize,
     flags: u64,
 ) -> *mut c_void {
+    crate::driver::symbol_events::record_mmio_symbol(
+        "devm_memremap",
+        dev as usize,
+        offset,
+        size as u64,
+    );
     let addr = map_mmio(offset, size, (flags & MEMREMAP_WC) != 0);
     crate::driver::devres::register_mmio(dev, addr);
     addr
@@ -98,6 +112,12 @@ pub(crate) unsafe extern "C" fn devm_ioremap_resource(
     dev: *mut c_void,
     res: *const LinuxCompatResource,
 ) -> *mut c_void {
+    crate::driver::symbol_events::record_mmio_symbol(
+        "devm_ioremap_resource",
+        dev as usize,
+        res as u64,
+        0,
+    );
     let addr = map_resource(res, false);
     crate::driver::devres::register_mmio(dev, addr);
     addr
@@ -107,6 +127,12 @@ pub(crate) unsafe extern "C" fn devm_ioremap_resource_wc(
     dev: *mut c_void,
     res: *const LinuxCompatResource,
 ) -> *mut c_void {
+    crate::driver::symbol_events::record_mmio_symbol(
+        "devm_ioremap_resource_wc",
+        dev as usize,
+        res as u64,
+        0,
+    );
     let addr = map_resource(res, true);
     crate::driver::devres::register_mmio(dev, addr);
     addr

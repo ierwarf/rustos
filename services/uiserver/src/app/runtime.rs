@@ -383,8 +383,11 @@ impl AppState {
             0
         };
 
-        let mut dirty_rect = if previous_focused == 0 {
+        let mut dirty_rect = if previous_focused == self.focused_session_handle {
+            canvas::Rect::empty()
+        } else if previous_focused == 0 {
             self.window_rect_for_session(self.focused_session_handle)
+                .union(self.taskbar_slot_rect_for_session(self.focused_session_handle))
         } else {
             self.window_rect_for_session(previous_focused)
                 .union(self.taskbar_slot_rect_for_session(previous_focused))
@@ -405,10 +408,8 @@ impl AppState {
                 Ok(()) => {
                     self.focused_session_handle = fallback_session;
                     dirty_rect = dirty_rect.union(self.window_rect_for_session(fallback_session));
-                    if previous_focused != 0 {
-                        dirty_rect =
-                            dirty_rect.union(self.taskbar_slot_rect_for_session(fallback_session));
-                    }
+                    dirty_rect =
+                        dirty_rect.union(self.taskbar_slot_rect_for_session(fallback_session));
                 }
                 Err(err) if is_stale_console_focus_error(err) => {
                     let pruned =
@@ -423,7 +424,7 @@ impl AppState {
             }
         }
 
-        if self.focused_session_handle != 0 {
+        if self.focused_session_handle != 0 && self.focused_session_handle != previous_focused {
             dirty_rect = dirty_rect.union(self.focused_window_reorder_dirty_rect());
         }
         Ok(dirty_rect)

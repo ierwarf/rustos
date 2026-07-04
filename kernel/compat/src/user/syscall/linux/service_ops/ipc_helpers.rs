@@ -389,11 +389,10 @@ pub fn call_vfs_ipc_request(request: &VfsIpcRequest) -> Result<VfsIpcResponse, i
 // RING3-MIGRATION-REFERENCE START: bootstrap-device-route exception: vfsd and
 // devmgrd own explicit device path routing. Ring0 keeps this fixed pre-devmgrd
 // mirror set plus IPC/open-fd transfer helper.
-pub fn is_devmgrd_open_path(path: &str) -> bool {
-    matches!(
-        path,
-        "/dev/input0" | "/dev/input/event0" | "/dev/display0" | "/dev/dri/card0" | "/dev/console0"
-    )
+pub fn should_try_devmgrd_open(path: &str) -> bool {
+    ipc_ops::service_registered(IPC_SERVICE_DEVMGRD)
+        && path.starts_with("/dev/")
+        && !matches!(path, "/dev/input" | "/dev/dri")
 }
 // RING3-MIGRATION-REFERENCE END: vfsd/devmgrd device-route substrate exception.
 
@@ -447,6 +446,11 @@ pub fn read_input_device_via_inputd(
         request.pid = snapshot.process_id();
         request.tid = snapshot.thread_id();
     }
+    request.op = INPUTD_IPC_OP_AUTHORIZE_READ;
+    if let Err(errno) = call_inputd_ipc_request(&request) {
+        return linux_errno(errno);
+    }
+    request.op = INPUTD_IPC_OP_READ;
     let response = match call_inputd_read_request(&request) {
         Ok(response) => response,
         Err(errno) => return linux_errno(errno),
@@ -468,6 +472,58 @@ pub fn read_input_device_via_inputd(
         return linux_errno(address_space_error_to_linux_errno(err));
     }
     read as u64
+}
+
+fn call_inputd_ipc_request(request: &InputdIpcRequest) -> Result<InputdIpcResponse, i64> {
+    let response = ipc_ops::call_service_endpoint(IPC_SERVICE_INPUTD, as_bytes(request))?;
+    if response.len() != size_of::<InputdIpcResponse>() {
+        return Err(LINUX_EINVAL);
+    }
+    let response = read_unaligned::<InputdIpcResponse>(response.as_slice());
+    if response.version != INPUTD_IPC_ABI_VERSION
+        || response.op != request.op
+        || response.flags != 0
+    {
+        return Err(LINUX_EINVAL);
+    }
+    if response.status != 0 {
+        return Err(response.status.unsigned_abs() as i64);
+    }
+    if response.approved_len == 0 || response.approved_len > request.requested_len {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(response)
+}
+
+pub fn input_device_has_pending_events(fd: u64) -> Result<bool, i64> {
+    let mut request = InputdIpcRequest {
+        version: INPUTD_IPC_ABI_VERSION,
+        op: INPUTD_IPC_OP_STATS,
+        fd,
+        requested_len: 1,
+        ..InputdIpcRequest::default()
+    };
+    if let Some(snapshot) = multitask::current_user_snapshot() {
+        request.pid = snapshot.process_id();
+        request.tid = snapshot.thread_id();
+    }
+    let response = ipc_ops::call_service_endpoint(IPC_SERVICE_INPUTD, as_bytes(&request))?;
+    if response.len() != size_of::<InputdIpcResponse>() {
+        return Err(LINUX_EINVAL);
+    }
+    let response = read_unaligned::<InputdIpcResponse>(response.as_slice());
+    if response.version != INPUTD_IPC_ABI_VERSION
+        || response.op != INPUTD_IPC_OP_STATS
+        || response.flags != 0
+    {
+        return Err(LINUX_EINVAL);
+    }
+    if response.status != 0 {
+        return Err(response.status.unsigned_abs() as i64);
+    }
+    let pending_flags =
+        INPUT_STATS_FLAG_PENDING_COALESCED | INPUT_STATS_FLAG_PENDING_POINTER_POSITION;
+    Ok(response.stats.queued != 0 || response.stats.flags & pending_flags != 0)
 }
 
 pub fn current_console_session_is_system() -> bool {
@@ -792,6 +848,61 @@ pub fn ioctl_device_via_devmgrd(fd: u64, request_number: u64, arg: u64) -> Resul
     }
     apply_devmgrd_ioctl_payload(request_number, arg, &response)?;
     Ok(response.value)
+}
+
+pub fn ioctl_route_via_devmgrd(fd: u64, request_number: u64) -> Result<u64, i64> {
+    let mut request = DevmgrdDeviceIoctlRequest {
+        version: rustos_user_abi::syscall::DEVMGRD_IPC_ABI_VERSION,
+        op: rustos_user_abi::syscall::DEVMGRD_IPC_OP_IOCTL_ROUTE,
+        fd,
+        request: request_number,
+        ..DevmgrdDeviceIoctlRequest::default()
+    };
+    if let Some(snapshot) = multitask::current_user_snapshot() {
+        request.pid = snapshot.process_id();
+        request.tid = snapshot.thread_id();
+        request.session_handle = snapshot.console_session().raw();
+    }
+    if let Some(security) = multitask::with_current_process_credentials(|security| security) {
+        request.uid = security.uid();
+        request.gid = security.gid();
+        request.euid = security.euid();
+        request.egid = security.egid();
+    }
+
+    let start_ticks = crate::arch::rtc::ticks();
+    let response = ipc_ops::call_service_endpoint(IPC_SERVICE_DEVMGRD, as_bytes(&request))?;
+    log_slow_service_call(
+        "devmgrd",
+        request.op,
+        ticks_elapsed_ms(start_ticks, crate::arch::rtc::ticks()),
+        request.pid,
+        request.tid,
+        response.len() as i64,
+        None,
+    );
+    if response.len() != size_of::<DevmgrdDeviceIoctlResponse>() {
+        return Err(LINUX_EINVAL);
+    }
+    let response = read_unaligned::<DevmgrdDeviceIoctlResponse>(response.as_slice());
+    if response.version != rustos_user_abi::syscall::DEVMGRD_IPC_ABI_VERSION
+        || response.op != rustos_user_abi::syscall::DEVMGRD_IPC_OP_IOCTL_ROUTE
+        || response.payload_len != 0
+        || response.reserved1 != 0
+        || response.reserved0 != 0
+    {
+        return Err(LINUX_EINVAL);
+    }
+    if response.status != 0 {
+        return Err(response.status.unsigned_abs() as i64);
+    }
+    match response.value {
+        rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_DIRECT
+        | rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_DEVMGRD
+        | rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_SESSIOND_TTY
+        | rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_SESSIOND_COMMIT => Ok(response.value),
+        _ => Err(LINUX_EINVAL),
+    }
 }
 
 fn populate_devmgrd_ioctl_payload(

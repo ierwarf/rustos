@@ -1,6 +1,6 @@
 // RING3-MIGRATION-REFERENCE START: Linux .ko HID shims are explicit ring0
 // compatibility substrate. HID report policy belongs in inputd.
-use alloc::alloc::{Layout, alloc};
+use alloc::alloc::{alloc, Layout};
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -11,8 +11,8 @@ use core::ptr;
 use crate::sync::KernelSpinLock as Mutex;
 
 use super::compat::{
-    LinuxCompatHidDevice, LinuxCompatHidDeviceId, LinuxCompatHidDriver, LinuxCompatHidField,
-    LinuxCompatHidReport, compat_cstr,
+    compat_cstr, LinuxCompatHidDevice, LinuxCompatHidDeviceId, LinuxCompatHidDriver,
+    LinuxCompatHidField, LinuxCompatHidReport,
 };
 
 const HID_BUS_ANY: u16 = 0xffff;
@@ -75,6 +75,11 @@ pub(crate) unsafe extern "C" fn __hid_register_driver(
     if driver.is_null() {
         return -22;
     }
+    crate::driver::symbol_events::record_hid_probe_init_symbol(
+        "__hid_register_driver",
+        driver as usize,
+        0,
+    );
 
     unsafe {
         if (*driver).driver.name.is_null() {
@@ -129,6 +134,11 @@ pub(crate) unsafe extern "C" fn hid_unregister_driver(driver: *mut LinuxCompatHi
     if driver.is_null() {
         return;
     }
+    crate::driver::symbol_events::record_hid_probe_init_symbol(
+        "hid_unregister_driver",
+        driver as usize,
+        0,
+    );
     {
         let mut drivers = HID_DRIVERS.lock();
         if let Some(index) = drivers.iter().position(|entry| *entry == driver as usize) {

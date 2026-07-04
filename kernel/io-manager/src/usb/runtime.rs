@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use crate::sync::KernelSpinLock as Mutex;
+use crate::sync::KernelWaitLock as Mutex;
 use heapless::Deque as HeaplessDeque;
 use rustos_user_abi::syscall::{
     INPUTD_HID_POLICY_DESCRIPTOR_CAPACITY, INPUTD_HID_POLICY_KIND_UNKNOWN,
@@ -68,6 +68,11 @@ static PENDING_COMPLETIONS: Mutex<HeaplessDeque<UrbCompletion, PENDING_COMPLETIO
 static URB_SUBMIT_LOGS: AtomicUsize = AtomicUsize::new(0);
 static REPORT_DESCRIPTOR_LOGS: AtomicUsize = AtomicUsize::new(0);
 static HID_POINTER_REPORT_COUNT: AtomicU64 = AtomicU64::new(0);
+static HID_POINTER_LAST_REPORT_TICK: AtomicU64 = AtomicU64::new(0);
+static HID_POINTER_GAP_LOGS: AtomicUsize = AtomicUsize::new(0);
+
+const HID_POINTER_GAP_LOG_LIMIT: usize = 16;
+const HID_POINTER_GAP_WARN_MS: u64 = 50;
 
 pub(crate) fn service_pending() -> usize {
     let mut completed = 0usize;
@@ -153,45 +158,8 @@ pub(crate) fn register_device(
     );
 }
 
-// Retained for future USB hot-unplug cleanup once runtime HID detachment is wired up.
-#[allow(dead_code)]
-pub(crate) fn unregister_interface(
-    interface: *mut crate::driver::linux::compat::LinuxCompatUsbInterface,
-) {
-    if interface.is_null() {
-        return;
-    }
-
-    let removed = {
-        let mut devices = USB_RUNTIME_DEVICES.lock();
-        let Some(index) = devices
-            .iter()
-            .position(|entry| entry.interface_ptr == interface as usize)
-        else {
-            return;
-        };
-        devices.swap_remove(index)
-    };
-
-    for urb_ptr in removed.pending_urbs {
-        let urb = urb_ptr as *mut LinuxCompatUrb;
-        if !urb.is_null() {
-            unsafe {
-                (*urb).status = USB_URB_STATUS_UNLINKED;
-                (*urb).actual_length = 0;
-            }
-        }
-    }
-
-    crate::debug::println!(
-        "usb runtime device removed: usb_dev={:#x} intf={:#x}",
-        removed.usb_device_ptr,
-        removed.interface_ptr
-    );
-}
-
 #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
-pub(crate) fn enqueue_report(usb_device: *mut LinuxCompatUsbDevice, report: &[u8]) {
+pub(crate) fn enqueue_report_for_urb(usb_device: *mut LinuxCompatUsbDevice, report: &[u8]) {
     if usb_device.is_null() || report.is_empty() {
         return;
     }
@@ -199,7 +167,9 @@ pub(crate) fn enqueue_report(usb_device: *mut LinuxCompatUsbDevice, report: &[u8
         return;
     };
 
-    let (completion, raw_report) = {
+    let mut completion_input = None;
+    {
+        let mut report = Some(report);
         let mut devices = USB_RUNTIME_DEVICES.lock();
         let Some(device) = devices
             .iter_mut()
@@ -207,13 +177,9 @@ pub(crate) fn enqueue_report(usb_device: *mut LinuxCompatUsbDevice, report: &[u8
         else {
             return;
         };
-        let raw_report = hid_raw_report(device, report.as_slice());
 
         if let Some(urb_ptr) = device.pending_urbs.pop_front() {
-            (
-                completion_from_report(urb_ptr as *mut LinuxCompatUrb, report.clone()),
-                raw_report,
-            )
+            completion_input = report.take().map(|report| (urb_ptr, report));
         } else if device.queued_reports.len() >= REPORT_QUEUE_CAPACITY {
             device.dropped_reports = device.dropped_reports.saturating_add(1);
             if device.dropped_reports % REPORT_DROP_LOG_INTERVAL == 0 {
@@ -224,23 +190,34 @@ pub(crate) fn enqueue_report(usb_device: *mut LinuxCompatUsbDevice, report: &[u8
                     device.queued_reports.len()
                 );
             }
-            (None, raw_report)
         } else {
-            let _ = device.queued_reports.push_back(report);
-            (None, raw_report)
+            let _ = device.queued_reports.push_back(report.take().unwrap());
         }
     };
 
-    if let Some(raw_report) = raw_report {
-        let descriptor_len =
-            (raw_report.descriptor_len as usize).min(raw_report.descriptor_prefix.len());
-        let is_pointer =
-            report_descriptor_has_pointer(&raw_report.descriptor_prefix[..descriptor_len]);
-        HID_POINTER_REPORT_COUNT.fetch_add(is_pointer as u64, Ordering::Relaxed);
-        let _ = crate::input::event_queue::submit_hid_raw_report(raw_report);
-    }
-
+    let completion = completion_input
+        .map(|(urb_ptr, report)| completion_from_report(urb_ptr as *mut LinuxCompatUrb, report))
+        .flatten();
     queue_urb_completion(completion);
+}
+
+pub(crate) fn submit_hid_raw_report_from_descriptor(
+    usb_device_ptr: usize,
+    report: &[u8],
+    descriptor: &[u8],
+) -> bool {
+    let Some(raw_report) = hid_raw_report(usb_device_ptr, report, descriptor) else {
+        return false;
+    };
+    let descriptor_len =
+        (raw_report.descriptor_len as usize).min(raw_report.descriptor_prefix.len());
+    let is_pointer = report_descriptor_has_pointer(&raw_report.descriptor_prefix[..descriptor_len]);
+    if is_pointer {
+        record_hid_pointer_report_gap();
+        HID_POINTER_REPORT_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+    let _ = crate::input::event_queue::submit_hid_raw_report(raw_report);
+    true
 }
 
 pub(crate) fn control_msg(
@@ -327,7 +304,8 @@ pub(crate) fn submit_urb(urb: *mut LinuxCompatUrb) -> i32 {
         return 0;
     }
 
-    let completion = {
+    let mut completion_input = None;
+    {
         let dev = unsafe { (*urb).dev };
         let Some(device_ptr) = (!dev.is_null()).then_some(dev as usize) else {
             return -19;
@@ -345,12 +323,11 @@ pub(crate) fn submit_urb(urb: *mut LinuxCompatUrb) -> i32 {
             }
         }
         if let Some(report) = device.queued_reports.pop_front() {
-            completion_from_report(urb, report)
+            completion_input = Some((urb as usize, report));
         } else {
             if device.pending_urbs.push_back(urb as usize).is_err() {
                 return USB_URB_STATUS_IO_ERROR;
             }
-            None
         }
     };
 
@@ -368,6 +345,9 @@ pub(crate) fn submit_urb(urb: *mut LinuxCompatUrb) -> i32 {
         }
     }
 
+    let completion = completion_input
+        .map(|(urb_ptr, report)| completion_from_report(urb_ptr as *mut LinuxCompatUrb, report))
+        .flatten();
     queue_urb_completion(completion);
     0
 }
@@ -442,16 +422,40 @@ pub(crate) fn debug_pointer_report_count() -> u64 {
     HID_POINTER_REPORT_COUNT.load(Ordering::Relaxed)
 }
 
+fn record_hid_pointer_report_gap() {
+    let now = crate::arch::rtc::ticks();
+    let previous = HID_POINTER_LAST_REPORT_TICK.swap(now, Ordering::Relaxed);
+    if previous == 0 {
+        return;
+    }
+    let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
+    let gap_ms = now.saturating_sub(previous).saturating_mul(1000) / ticks_per_second;
+    if gap_ms >= HID_POINTER_GAP_WARN_MS
+        && HID_POINTER_GAP_LOGS.fetch_add(1, Ordering::Relaxed) < HID_POINTER_GAP_LOG_LIMIT
+    {
+        crate::debug::println!(
+            "usb runtime pointer report gap gap_ms={} count={}",
+            gap_ms,
+            HID_POINTER_REPORT_COUNT
+                .load(Ordering::Relaxed)
+                .saturating_add(1)
+        );
+    }
+}
+
 // RING3-MIGRATION-REFERENCE START: input-ingress exception: inputd owns HID
 // report classification and descriptor-derived report metadata. Ring0 keeps raw
 // USB report ingress and Linux .ko URB callback substrate only.
-fn hid_raw_report(device: &RuntimeUsbDevice, report: &[u8]) -> Option<InputHidPolicyWire> {
+fn hid_raw_report(
+    usb_device_ptr: usize,
+    report: &[u8],
+    descriptor: &[u8],
+) -> Option<InputHidPolicyWire> {
     if report.is_empty() || report.len() > INPUTD_HID_POLICY_REPORT_CAPACITY {
         return None;
     }
-    let descriptor = device.report_descriptor.as_ref();
     let mut wire = InputHidPolicyWire {
-        source_id: device.usb_device_ptr as u64,
+        source_id: usb_device_ptr as u64,
         kind: INPUTD_HID_POLICY_KIND_UNKNOWN,
         report_len: report.len() as u16,
         descriptor_len: descriptor.len().min(INPUTD_HID_POLICY_DESCRIPTOR_CAPACITY) as u16,

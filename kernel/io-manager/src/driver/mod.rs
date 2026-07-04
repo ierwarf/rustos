@@ -13,6 +13,7 @@ mod loader;
 mod module_registry;
 pub mod pci;
 pub mod serio;
+mod symbol_events;
 
 // Kernel driver role: privileged DMA/MMIO/IRQ substrate and narrow broker hooks.
 // Driver/provider policy belongs in driverd/devmgrd. Driver-domain isolation is
@@ -24,6 +25,9 @@ pub mod mmio;
 
 use alloc::string::ToString;
 use driver_abi::{DriverBus, DriverClass};
+use rustos_user_abi::syscall::{
+    DRIVER_LOAD_POLICY_DISPLAY_FALLBACK, DRIVER_LOAD_POLICY_DISPLAY_PRIMARY,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DriverLoadError {
@@ -72,7 +76,7 @@ pub fn load_module_image_from_policy(
     bus: u32,
     image_path: &str,
     linux_driver_names: &str,
-    _policy_flags: u64,
+    policy_flags: u64,
 ) -> Result<(), DriverLoadError> {
     if nucleus_core::util::fault_injection::should_fail("driver.module.load") {
         return Err(DriverLoadError::FaultInjected);
@@ -88,7 +92,26 @@ pub fn load_module_image_from_policy(
     let image_path = leak_policy_text(image_path)?;
     let linux_driver_names = leak_policy_text(linux_driver_names)?;
     match loader::load_module_image_explicit(name, class, bus, image_path, linux_driver_names) {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            if requires_display_provider_publish(class, policy_flags)
+                && !display_non_boot_primary_provider_active()
+            {
+                crate::debug::record_milestone(
+                    crate::debug::LogCategory::Driver,
+                    "module-load-display-provider-missing",
+                    stable_ascii_hash(name),
+                    stable_ascii_hash(image_path),
+                );
+                crate::debug::warn!(
+                    display,
+                    "driver module loaded without display provider publish: name={} path={}",
+                    name,
+                    image_path
+                );
+                return Err(DriverLoadError::LoaderFailed);
+            }
+            Ok(())
+        }
         Err(_)
             if name == BOOTFB_DRIVER_NAME
                 && class == DriverClass::Display
@@ -129,6 +152,10 @@ pub fn hardware_alias_present(alias: &str, class: u32, bus: u32) -> bool {
     }
 }
 
+pub fn drain_linux_symbol_event() -> Option<rustos_user_abi::syscall::LinuxDriverSymbolEventWire> {
+    symbol_events::drain_linux_symbol_event()
+}
+
 fn display_primary_provider_active() -> bool {
     crate::io::gui::display_info()
         .map(|display| {
@@ -147,6 +174,18 @@ fn display_non_boot_primary_provider_active() -> bool {
             primary && !boot
         })
         .unwrap_or(false)
+}
+
+fn requires_display_provider_publish(class: DriverClass, policy_flags: u64) -> bool {
+    class == DriverClass::Display
+        && policy_flags & DRIVER_LOAD_POLICY_DISPLAY_PRIMARY != 0
+        && policy_flags & DRIVER_LOAD_POLICY_DISPLAY_FALLBACK == 0
+}
+
+fn stable_ascii_hash(text: &str) -> u64 {
+    text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+        hash.wrapping_mul(0x1000_0000_01b3) ^ u64::from(byte.to_ascii_lowercase())
+    })
 }
 
 fn load_boot_framebuffer_provider() -> Result<(), DriverLoadError> {

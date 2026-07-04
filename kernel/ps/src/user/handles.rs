@@ -67,6 +67,7 @@ pub struct RemoteVfsHandle {
     kind: RemoteVfsHandleKind,
     path: String,
     len: u64,
+    device_access: u16,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -77,7 +78,13 @@ pub enum RemoteVfsHandleKind {
 }
 
 impl RemoteVfsHandle {
-    pub fn new(remote_id: u64, kind: RemoteVfsHandleKind, path: String, len: u64) -> Self {
+    pub fn new(
+        remote_id: u64,
+        kind: RemoteVfsHandleKind,
+        path: String,
+        len: u64,
+        device_access: u16,
+    ) -> Self {
         static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
         Self {
             token: NEXT_TOKEN.fetch_add(1, Ordering::Relaxed),
@@ -85,6 +92,7 @@ impl RemoteVfsHandle {
             kind,
             path,
             len,
+            device_access,
         }
     }
 
@@ -106,6 +114,10 @@ impl RemoteVfsHandle {
 
     pub const fn len(&self) -> u64 {
         self.len
+    }
+
+    pub const fn device_access(&self) -> u16 {
+        self.device_access
     }
 }
 

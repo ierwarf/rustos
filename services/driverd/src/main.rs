@@ -1,37 +1,40 @@
 use std::io::Write;
 use std::mem::size_of;
+use std::sync::Mutex;
 use std::time::Instant;
 use std::{collections::BTreeSet, fs, thread, time::Duration};
 
 use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, LinuxSyscallOffloadRequest,
-    LinuxSyscallOffloadResponse, RustosDriverLoadModuleBrokerArgs,
-    RustosDriverProbeAliasBrokerArgs, RustosServiceDriverResourceBrokerArgs,
-    COMMERCIAL_MAX_DRIVERD_OP_DRIVER_PLAN, COMMERCIAL_MAX_DRIVERD_OP_FALLBACK_POLICY,
-    COMMERCIAL_MAX_DRIVERD_OP_MODULE_LOAD_AUTHORIZE, COMMERCIAL_MAX_DRIVERD_OP_PROVIDER_SELECT,
-    COMMERCIAL_MAX_DRIVERD_OP_RETRY_BUDGET, COMMERCIAL_MAX_DRIVERD_OP_SYMBOL_POLICY,
-    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_DRIVERD,
-    COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_SERVICE_DRIVERD,
-    COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DMA_BUFFER,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, LinuxDriverSymbolEventWire,
+    LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, RustosDriverLoadModuleBrokerArgs,
+    RustosDriverProbeAliasBrokerArgs, RustosDriverSymbolEventBrokerArgs,
+    RustosServiceDriverResourceBrokerArgs, COMMERCIAL_MAX_DRIVERD_OP_DRIVER_PLAN,
+    COMMERCIAL_MAX_DRIVERD_OP_FALLBACK_POLICY, COMMERCIAL_MAX_DRIVERD_OP_MODULE_LOAD_AUTHORIZE,
+    COMMERCIAL_MAX_DRIVERD_OP_PROVIDER_SELECT, COMMERCIAL_MAX_DRIVERD_OP_RETRY_BUDGET,
+    COMMERCIAL_MAX_DRIVERD_OP_SYMBOL_POLICY, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_DRIVERD, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
+    COMMERCIAL_MAX_PROTOCOL_SERVICE_DRIVERD, COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DMA_BUFFER,
     COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DRIVER_INSTANCE,
     COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IO_PORT_LEASE, COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IRQ_ROUTE,
     COMMERCIAL_MAX_SERVICE_DRIVERD_OP_MMIO_LEASE, DRIVER_BUS_PCI, DRIVER_BUS_PLATFORM,
     DRIVER_BUS_SERIO, DRIVER_BUS_USB, DRIVER_BUS_VIRTIO, DRIVER_CLASS_DISPLAY, DRIVER_CLASS_INPUT,
     DRIVER_CLASS_NETWORK, DRIVER_CLASS_STORAGE, DRIVER_CLASS_USB,
-    DRIVER_LOAD_POLICY_DISPLAY_FALLBACK, DRIVER_LOAD_POLICY_DISPLAY_PRIMARY, IPC_SERVICE_DRIVERD,
+    DRIVER_LOAD_POLICY_DISPLAY_FALLBACK, DRIVER_LOAD_POLICY_DISPLAY_PRIMARY,
+    DRIVER_SYMBOL_EVENT_BROKER_ABI_VERSION, DRIVER_SYMBOL_EVENT_OP_DRAIN, IPC_SERVICE_DRIVERD,
     IPC_SERVICE_SERVICE_DRIVERD, SERVICE_DRIVER_RESOURCE_BROKER_ABI_VERSION,
     SERVICE_DRIVER_RESOURCE_OP_DMA_BUFFER, SERVICE_DRIVER_RESOURCE_OP_IO_PORT_LEASE,
     SERVICE_DRIVER_RESOURCE_OP_IRQ_ROUTE, SERVICE_DRIVER_RESOURCE_OP_MMIO_LEASE,
     SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_DRIVER_LOAD_POLICY,
     SYSCALL_OFFLOAD_PATH_CAPACITY, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER,
-    SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV,
-    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
-    SYS_RUSTOS_SERVICE_DRIVER_RESOURCE_BROKER,
+    SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER, SYS_RUSTOS_DRIVER_SYMBOL_EVENT_BROKER,
+    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_SERVICE_DRIVER_RESOURCE_BROKER,
 };
 
 const RECV_BACKOFF: Duration = Duration::from_millis(10);
 const LOADABLE_DRIVER_REGISTRY_PATH: &str = "system/registry/kernel/loadable-drivers.tsv";
+static SYMBOL_EVENTS: Mutex<Vec<LinuxDriverSymbolEventWire>> = Mutex::new(Vec::new());
 
 fn main() {
     debug_line("driverd: service start");
@@ -293,6 +296,7 @@ fn load_record(
         load_started.elapsed().as_millis(),
         result
     ));
+    drain_symbol_events(record);
     if result == 0 {
         loaded.insert(record.name.clone());
         if !record.provider_group.is_empty() {
@@ -324,6 +328,20 @@ fn load_record(
                 "driverd: skipped name={} reason=unsupported class/bus topology path={}",
                 record.name, record.image_path
             )),
+            libc::EIO
+                if record.class == DRIVER_CLASS_DISPLAY
+                    && !record.provider_group.is_empty()
+                    && !record.fallback_only =>
+            {
+                debug_line(&format!(
+                    "driverd: display provider not published name={} group={} path={}",
+                    record.name, record.provider_group, record.image_path
+                ));
+                debug_line(&format!(
+                    "driverd: load failed name={} path={} errno={errno}",
+                    record.name, record.image_path
+                ));
+            }
             _ => debug_line(&format!(
                 "driverd: load failed name={} path={} errno={errno}",
                 record.name, record.image_path
@@ -336,6 +354,92 @@ fn load_record(
         started_at.elapsed().as_millis()
     ));
     LoadResult::Progress
+}
+
+fn drain_symbol_events(record: &DriverRecord) {
+    let mut drained = 0usize;
+    loop {
+        let mut event = LinuxDriverSymbolEventWire::default();
+        let args = RustosDriverSymbolEventBrokerArgs {
+            abi_version: DRIVER_SYMBOL_EVENT_BROKER_ABI_VERSION,
+            op: DRIVER_SYMBOL_EVENT_OP_DRAIN,
+            flags: 0,
+            out_ptr: (&mut event as *mut LinuxDriverSymbolEventWire) as u64,
+            out_len: size_of::<LinuxDriverSymbolEventWire>() as u64,
+            reserved0: 0,
+        };
+        let result = syscall1(
+            SYS_RUSTOS_DRIVER_SYMBOL_EVENT_BROKER,
+            (&args as *const RustosDriverSymbolEventBrokerArgs) as u64,
+        );
+        if result == 0 {
+            break;
+        }
+        if result < 0 {
+            let errno = if result == -1 {
+                last_errno()
+            } else {
+                (-result) as i32
+            };
+            debug_line(&format!(
+                "driverd: symbol event drain failed name={} errno={errno}",
+                record.name
+            ));
+            break;
+        }
+        drained += 1;
+        record_symbol_event(event);
+        debug_line(&format!(
+            "driverd: linux .ko slow-path symbol observed record={} module={} symbol={} context={} scope={} arg0=0x{:x} arg1=0x{:x} arg2=0x{:x} dropped_before={}",
+            record.name,
+            event_module(&event),
+            event_symbol(&event),
+            event.context,
+            event.scope,
+            event.arg0,
+            event.arg1,
+            event.arg2,
+            event.dropped_before
+        ));
+    }
+    if drained != 0 {
+        debug_line(&format!(
+            "driverd: symbol event drain complete name={} count={drained}",
+            record.name
+        ));
+    }
+}
+
+fn record_symbol_event(event: LinuxDriverSymbolEventWire) {
+    match SYMBOL_EVENTS.lock() {
+        Ok(mut events) => events.push(event),
+        Err(_) => debug_line("driverd: symbol event state poisoned"),
+    }
+}
+
+fn symbol_event_count() -> u64 {
+    SYMBOL_EVENTS
+        .lock()
+        .map(|events| events.len() as u64)
+        .unwrap_or(0)
+}
+
+fn event_symbol(event: &LinuxDriverSymbolEventWire) -> String {
+    event_text(&event.symbol, event.symbol_len)
+}
+
+fn event_module(event: &LinuxDriverSymbolEventWire) -> String {
+    let value = event_text(&event.module, event.module_len);
+    if value.is_empty() {
+        "<unknown>".to_string()
+    } else {
+        value
+    }
+}
+
+fn event_text(bytes: &[u8], len: u16) -> String {
+    let len = usize::min(len as usize, bytes.len());
+    String::from_utf8_lossy(&bytes[..len]).into_owned()
 }
 
 fn aliases_match(record: &DriverRecord) -> bool {
@@ -601,21 +705,36 @@ fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result
         COMMERCIAL_MAX_PROTOCOL_SERVICE_DRIVERD => match request.header.op {
             COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DRIVER_INSTANCE => Ok(()),
             COMMERCIAL_MAX_SERVICE_DRIVERD_OP_MMIO_LEASE => {
-                if request.arg0 == 0 || request.arg1 == 0 {
+                if request.arg0 == 0
+                    || request.arg1 == 0
+                    || request.header.subject_pid == 0
+                    || request.header.subject_tid == 0
+                    || request.path_len == 0
+                {
                     Err(libc::EINVAL)
                 } else {
                     Ok(())
                 }
             }
             COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IRQ_ROUTE => {
-                if request.arg0 > u32::MAX as u64 || request.arg1 > u32::MAX as u64 {
+                if request.arg0 > u32::MAX as u64
+                    || request.arg1 > u32::MAX as u64
+                    || request.header.subject_pid == 0
+                    || request.header.subject_tid == 0
+                    || request.path_len == 0
+                {
                     Err(libc::EINVAL)
                 } else {
                     Ok(())
                 }
             }
             COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DMA_BUFFER => {
-                if request.arg0 == 0 || request.arg1 != 0 && !request.arg1.is_power_of_two() {
+                if request.arg0 == 0
+                    || request.arg1 != 0 && !request.arg1.is_power_of_two()
+                    || request.header.subject_pid == 0
+                    || request.header.subject_tid == 0
+                    || request.path_len == 0
+                {
                     Err(libc::EINVAL)
                 } else {
                     Ok(())
@@ -626,6 +745,9 @@ fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result
                     || request.arg1 == 0
                     || request.arg1 > u16::MAX as u64
                     || request.arg0.saturating_add(request.arg1 - 1) > u16::MAX as u64
+                    || request.header.subject_pid == 0
+                    || request.header.subject_tid == 0
+                    || request.path_len == 0
                 {
                     Err(libc::EINVAL)
                 } else {
@@ -672,6 +794,7 @@ fn dispatch_commercial_request(
         }
         COMMERCIAL_MAX_DRIVERD_OP_SYMBOL_POLICY => {
             fill_driver_descriptors(response, records.iter());
+            response.value0 = symbol_event_count();
             response.capability = driver_capability("symbol-policy", request.header.op);
             0
         }
@@ -702,6 +825,11 @@ fn dispatch_service_driver_request(
     request: &CommercialMaxProtocolRequest,
     response: &mut CommercialMaxProtocolResponse,
 ) -> i32 {
+    if request.header.op != COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DRIVER_INSTANCE
+        && authorized_service_driver_request(request).is_err()
+    {
+        return libc::EACCES;
+    }
     match request.header.op {
         COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DRIVER_INSTANCE => {
             match registry_records() {
@@ -772,6 +900,19 @@ fn dispatch_service_driver_request(
             )
         }
         _ => libc::EINVAL,
+    }
+}
+
+fn authorized_service_driver_request(request: &CommercialMaxProtocolRequest) -> Result<(), i32> {
+    let path = commercial_request_path(request)?;
+    let records = registry_records().map_err(|_| libc::ENOENT)?;
+    let Some(record) = records.iter().find(|record| record.image_path == path) else {
+        return Err(libc::EACCES);
+    };
+    if requires_service_driver_authorization(record) && authorize_service_driver(record) {
+        Ok(())
+    } else {
+        Err(libc::EACCES)
     }
 }
 

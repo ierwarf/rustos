@@ -3,10 +3,11 @@
 use core::mem::{align_of, size_of};
 
 pub const BOOT_INFO_MAGIC: u64 = 0x5255_5354_4F53_4749; // "RUSTOSGI"
-pub const BOOT_INFO_VERSION: u32 = 15;
+pub const BOOT_INFO_VERSION: u32 = 16;
 pub const MAX_BOOT_MEMORY_REGIONS: u32 = 4096;
 pub const MAX_BOOT_FRAMEBUFFER_WIDTH: u32 = 7680;
 pub const MAX_BOOT_FRAMEBUFFER_HEIGHT: u32 = 4320;
+pub const MAX_BOOT_EXTENT_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,6 +231,36 @@ pub struct BootVolumeIdentity {
     pub volume_sector_count: u64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BootExtentManifest {
+    pub ptr: u64,
+    pub len: u64,
+}
+
+impl BootExtentManifest {
+    pub const fn empty() -> Self {
+        Self { ptr: 0, len: 0 }
+    }
+
+    pub const fn is_present(&self) -> bool {
+        self.ptr != 0 || self.len != 0
+    }
+
+    pub fn validate(&self) -> Result<(), BootInfoValidationError> {
+        if !self.is_present() {
+            return Ok(());
+        }
+        if self.ptr == 0 || self.len == 0 || self.len > MAX_BOOT_EXTENT_MANIFEST_BYTES {
+            return Err(BootInfoValidationError::InvalidBootExtentManifest);
+        }
+        self.ptr
+            .checked_add(self.len)
+            .ok_or(BootInfoValidationError::InvalidBootExtentManifest)?;
+        Ok(())
+    }
+}
+
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BootVolumeTransport {
@@ -300,6 +331,7 @@ pub struct BootInfo {
     pub framebuffer: FramebufferInfo,
     pub nucleus_image: NucleusImageInfo,
     pub memory_map: BootMemoryMap,
+    pub boot_extent_manifest: BootExtentManifest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -311,6 +343,7 @@ pub enum BootInfoValidationError {
     InvalidKernelImage,
     InvalidMemoryMap,
     InvalidBootVolume,
+    InvalidBootExtentManifest,
 }
 
 impl BootInfoValidationError {
@@ -323,6 +356,7 @@ impl BootInfoValidationError {
             Self::InvalidKernelImage => "boot info kernel image is invalid",
             Self::InvalidMemoryMap => "boot info memory map is invalid",
             Self::InvalidBootVolume => "boot info boot volume identity is invalid",
+            Self::InvalidBootExtentManifest => "boot info boot extent manifest is invalid",
         }
     }
 }
@@ -338,6 +372,7 @@ impl BootInfo {
 
         self.framebuffer.validate()?;
         self.boot_volume.validate()?;
+        self.boot_extent_manifest.validate()?;
 
         if self.nucleus_image.is_present() {
             self.nucleus_image.validate()?;
@@ -435,6 +470,7 @@ mod tests {
                 entry_count: memory_map.len() as u32,
                 _reserved0: 0,
             },
+            boot_extent_manifest: BootExtentManifest::empty(),
         }
     }
 
@@ -465,6 +501,17 @@ mod tests {
     fn accepts_absent_framebuffer() {
         let mut info = valid_boot_info();
         info.framebuffer = FramebufferInfo::empty();
+        assert!(info.validate().is_ok());
+    }
+
+    #[test]
+    fn validates_present_boot_extent_manifest() {
+        let bytes = [1_u8, 2, 3, 4];
+        let mut info = valid_boot_info();
+        info.boot_extent_manifest = BootExtentManifest {
+            ptr: bytes.as_ptr() as u64,
+            len: bytes.len() as u64,
+        };
         assert!(info.validate().is_ok());
     }
 

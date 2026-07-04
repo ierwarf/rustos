@@ -11,4 +11,5 @@ pub mod ipc;
 #[path = "ipc_core.rs"]
 pub mod ipc_core;
 
+#[cfg(not(test))]
 pub(crate) use kernel_mm::api as memory;

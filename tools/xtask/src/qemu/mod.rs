@@ -2,7 +2,7 @@ use anyhow::{Context, anyhow, bail};
 use fs_err as fs;
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -13,13 +13,13 @@ use crate::Result;
 use crate::config::Config;
 use crate::util::{create_temp_dir, env_string, read_trimmed, resolve_command_path};
 
-const DEFAULT_QEMU_DISPLAY_WIDTH: u32 = 1600;
-const DEFAULT_QEMU_DISPLAY_HEIGHT: u32 = 900;
+const DEFAULT_QEMU_DISPLAY_DEVICE_ID: &str = "rustos_video0";
 
 struct RunOptions {
     profile: String,
     accel: String,
     usb_input: bool,
+    usb_input_device: UsbInputDevice,
     debugcon: DebugconMode,
     qemu_log: QemuLogMode,
     timeout: Option<Duration>,
@@ -39,6 +39,10 @@ impl RunOptions {
             profile: env_string("RUSTOS_QEMU_PROFILE").unwrap_or_else(|| String::from("default")),
             accel: env_string("RUSTOS_QEMU_ACCEL").unwrap_or_default(),
             usb_input: false,
+            usb_input_device: env_string("RUSTOS_QEMU_USB_INPUT_DEVICE")
+                .as_deref()
+                .and_then(UsbInputDevice::parse)
+                .unwrap_or_default(),
             debugcon: DebugconMode::File,
             qemu_log: QemuLogMode::None,
             timeout: None,
@@ -78,6 +82,7 @@ struct PreparedRun {
     vfio_args: Vec<OsString>,
     gpu_args: Vec<OsString>,
     usb_args: Vec<OsString>,
+    usb_input_device: UsbInputDevice,
     network_args: Vec<OsString>,
     display_args: Vec<OsString>,
     debugcon_args: Vec<OsString>,
@@ -91,6 +96,48 @@ struct PreparedRun {
 enum QemuBootDisk {
     Ahci,
     Nvme,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UsbInputDevice {
+    Tablet,
+    Mouse,
+}
+
+impl Default for UsbInputDevice {
+    fn default() -> Self {
+        Self::Tablet
+    }
+}
+
+impl UsbInputDevice {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "tablet" | "usb-tablet" | "usbtablet" | "absolute" | "abs" => Some(Self::Tablet),
+            "mouse" | "usb-mouse" | "usbmouse" | "relative" | "rel" => Some(Self::Mouse),
+            _ => None,
+        }
+    }
+
+    fn qemu_device_arg(self) -> String {
+        match self {
+            Self::Tablet => format!(
+                "usb-tablet,bus=xhci.0,id=usbtablet,display={DEFAULT_QEMU_DISPLAY_DEVICE_ID}"
+            ),
+            Self::Mouse => String::from("usb-mouse,bus=xhci.0,id=usbmouse"),
+        }
+    }
+
+    fn is_absolute(self) -> bool {
+        matches!(self, Self::Tablet)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Tablet => "usbtablet",
+            Self::Mouse => "usbmouse",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -169,6 +216,8 @@ const PROBE_QMP_TIMEOUT: Duration = Duration::from_secs(10);
 const PROBE_STEP_DELAY: Duration = Duration::from_millis(25);
 const PROBE_STRESS_DURATION_DEFAULT: Duration = Duration::from_secs(20);
 const PROBE_HEARTBEAT_STALL_DEFAULT: Duration = Duration::from_secs(15);
+const PROBE_INPUT_START_DEFAULT: Duration = Duration::from_secs(10);
+const PROBE_INPUT_STALL_DEFAULT: Duration = Duration::from_millis(2500);
 const QEMU_WAIT_POLL: Duration = Duration::from_millis(100);
 const FAULT_FW_CFG_NAME: &str = "opt/rustos/fault-injection";
 
@@ -412,6 +461,16 @@ where
                 options.accel = next_required_arg(args, arg.as_str())?;
             }
             "--usb-input" => options.usb_input = true,
+            "--usb-input-device" => {
+                let value = next_required_arg(args, "--usb-input-device")?;
+                options.usb_input_device = UsbInputDevice::parse(value.as_str())
+                    .with_context(|| format!("invalid --usb-input-device value: {value}"))?;
+                options.usb_input = true;
+            }
+            "--usb-mouse" => {
+                options.usb_input = true;
+                options.usb_input_device = UsbInputDevice::Mouse;
+            }
             "--debugcon" => {
                 let value = next_required_arg(args, "--debugcon")?;
                 options.debugcon = DebugconMode::parse(value.as_str())
@@ -765,9 +824,13 @@ fn prepare_run(config: &Config, options: RunOptions) -> Result<PreparedRun> {
 
     let vfio_args = configure_vfio_args(&mut profile_args, &vfio_hosts, options.vfio_force)?;
     let use_kvm = options.accel == "kvm";
-    let gpu_args = configure_default_gpu_args(&options.qemu_user_args, &vfio_hosts, use_kvm);
+    let gpu_args = configure_default_gpu_args(config, &options.qemu_user_args, &vfio_hosts);
     let use_low_latency_input = options.usb_input || options.accel == "kvm";
-    let usb_args = configure_usb_args(use_low_latency_input, &options.qemu_user_args);
+    let usb_args = configure_usb_args(
+        use_low_latency_input,
+        options.usb_input_device,
+        &options.qemu_user_args,
+    );
     let network_args = configure_network_args(options.network, &options.qemu_user_args);
     let display_args = configure_display_args(&options.qemu_user_args, use_kvm);
     let (debugcon_args, debugcon_log) = configure_debugcon(config, &mut session, options.debugcon)?;
@@ -781,6 +844,7 @@ fn prepare_run(config: &Config, options: RunOptions) -> Result<PreparedRun> {
         vfio_args,
         gpu_args,
         usb_args,
+        usb_input_device: options.usb_input_device,
         network_args,
         display_args,
         debugcon_args,
@@ -802,6 +866,8 @@ options:
                                      accelerator profile; use \"kvm\" for host CPU
   --usb-input                        attach qemu-xhci + usb-kbd + usb-tablet
                                      for USB HID testing
+  --usb-input-device <tablet|mouse>  choose USB HID pointer for --usb-input
+  --usb-mouse                        shorthand for --usb-input-device mouse
   --no-network                       do not attach default usernet + virtio-net-pci
   --debugcon <file|stdio|null>       route debugcon to file, terminal, or disable it
   --qemu-log <int|null>              write QEMU trace log to logs/qemu_interrupt.log or disable it
@@ -829,6 +895,8 @@ options:
                                      accelerator profile; use \"kvm\" for host CPU
   --usb-input                        attach qemu-xhci + usb-kbd + usb-tablet
                                      for USB HID testing
+  --usb-input-device <tablet|mouse>  choose USB HID pointer for --usb-input
+  --usb-mouse                        shorthand for --usb-input-device mouse
   --no-network                       do not attach default usernet + virtio-net-pci
   --debugcon <file|stdio|null>       route debugcon to file, terminal, or disable it
   --qemu-log <int|null>              write QEMU trace log to logs/qemu_interrupt.log or disable it
@@ -1276,20 +1344,22 @@ fn configure_display_args(qemu_user_args: &[String], _use_kvm: bool) -> Vec<OsSt
 }
 
 fn configure_default_gpu_args(
+    config: &Config,
     qemu_user_args: &[String],
     vfio_hosts: &[String],
-    _use_kvm: bool,
 ) -> Vec<OsString> {
     if !vfio_hosts.is_empty() || qemu_user_overrides_gpu(qemu_user_args) {
         return Vec::new();
     }
 
+    let display = &config.project.qemu.display;
     vec![
         OsString::from("-vga"),
         OsString::from("none"),
         OsString::from("-device"),
         OsString::from(format!(
-            "virtio-vga,xres={DEFAULT_QEMU_DISPLAY_WIDTH},yres={DEFAULT_QEMU_DISPLAY_HEIGHT},max_outputs=1,edid=off"
+            "virtio-vga,id={},xres={},yres={},max_outputs=1,edid=off",
+            DEFAULT_QEMU_DISPLAY_DEVICE_ID, display.width, display.height
         )),
     ]
 }
@@ -1332,7 +1402,11 @@ fn qemu_device_arg_is_graphics(arg: &str) -> bool {
         || arg.contains("ramfb")
 }
 
-fn configure_usb_args(enable_usb_input: bool, qemu_user_args: &[String]) -> Vec<OsString> {
+fn configure_usb_args(
+    enable_usb_input: bool,
+    input_device: UsbInputDevice,
+    qemu_user_args: &[String],
+) -> Vec<OsString> {
     if !enable_usb_input {
         return Vec::new();
     }
@@ -1353,7 +1427,7 @@ fn configure_usb_args(enable_usb_input: bool, qemu_user_args: &[String]) -> Vec<
         OsString::from("-device"),
         OsString::from("usb-kbd,bus=xhci.0,id=usbkbd"),
         OsString::from("-device"),
-        OsString::from("usb-tablet,bus=xhci.0,id=usbtablet"),
+        OsString::from(input_device.qemu_device_arg()),
     ]
 }
 
@@ -1485,7 +1559,7 @@ fn run_display_probe(config: &Config, options: RunOptions) -> Result<()> {
     let debugcon_log = config.logs_dir.join("debugcon.log");
     let probe_result = (|| -> Result<()> {
         let mut qmp = connect_qmp(&qmp_socket, PROBE_QMP_TIMEOUT)?;
-        wait_for_boot_marker(
+        wait_for_boot_marker_with_qmp(
             &debugcon_log,
             &[
                 "userspace display active",
@@ -1494,8 +1568,9 @@ fn run_display_probe(config: &Config, options: RunOptions) -> Result<()> {
                 "uiserver: init surface meta",
             ],
             probe_duration_env("RUSTOS_PROBE_BOOT_TIMEOUT_MS", PROBE_BOOT_TIMEOUT_DEFAULT),
+            &mut qmp,
         )?;
-        wait_for_boot_marker(
+        wait_for_boot_marker_with_qmp(
             &debugcon_log,
             &[
                 "uiserver: desktop background ready",
@@ -1503,9 +1578,15 @@ fn run_display_probe(config: &Config, options: RunOptions) -> Result<()> {
                 "uiserver: slow full present",
             ],
             PROBE_QMP_TIMEOUT,
+            &mut qmp,
         )?;
         for marker in &probe_expect_markers {
-            wait_for_boot_marker(&debugcon_log, &[marker.as_str()], PROBE_QMP_TIMEOUT)?;
+            wait_for_boot_marker_with_qmp(
+                &debugcon_log,
+                &[marker.as_str()],
+                PROBE_QMP_TIMEOUT,
+                &mut qmp,
+            )?;
         }
         if let Some(text) = probe_key_text.as_deref() {
             qmp_hmp_type_text(&mut qmp, text)?;
@@ -1515,6 +1596,13 @@ fn run_display_probe(config: &Config, options: RunOptions) -> Result<()> {
         let baseline_dump = prepared.session.temp_dir.join("probe-baseline.ppm");
         qmp_screendump(&mut qmp, &baseline_dump)?;
         let baseline = read_ppm_summary(&baseline_dump)?;
+        println!(
+            "probe baseline color avg_rgb=({},{},{}) dominant={}",
+            baseline.avg_r,
+            baseline.avg_g,
+            baseline.avg_b,
+            baseline.dominant_channel()
+        );
 
         if baseline.width == 0
             || baseline.height == 0
@@ -1534,31 +1622,53 @@ fn run_display_probe(config: &Config, options: RunOptions) -> Result<()> {
             println!("probe info mice:\n{info}");
         }
 
+        if !prepared.usb_args.is_empty() {
+            let service_ready_timeout =
+                probe_duration_env("RUSTOS_PROBE_BOOT_TIMEOUT_MS", PROBE_BOOT_TIMEOUT_DEFAULT);
+            wait_for_boot_marker_with_qmp(
+                &debugcon_log,
+                &["uiserver: input pointer surface published"],
+                service_ready_timeout,
+                &mut qmp,
+            )?;
+            wait_for_boot_marker_with_qmp(
+                &debugcon_log,
+                &["storaged: storage policy endpoint registered"],
+                service_ready_timeout,
+                &mut qmp,
+            )?;
+        }
+
         run_probe_mouse_stress(
             &mut qmp,
             &debugcon_log,
             if prepared.usb_args.is_empty() {
                 None
             } else {
-                Some("usbtablet")
+                Some(prepared.usb_input_device)
             },
+            (!prepared.usb_args.is_empty()).then_some(DEFAULT_QEMU_DISPLAY_DEVICE_ID),
+            Some((baseline.width, baseline.height)),
         )?;
         if !prepared.usb_args.is_empty() {
-            wait_for_boot_marker(
-                &debugcon_log,
-                &["input: pointer event delivered"],
-                PROBE_QMP_TIMEOUT,
-            )?;
-            wait_for_boot_marker(
+            wait_for_boot_marker_with_qmp(
                 &debugcon_log,
                 &["uiserver: pointer moved"],
                 PROBE_QMP_TIMEOUT,
+                &mut qmp,
             )?;
         }
 
         let stressed_dump = prepared.session.temp_dir.join("probe-stressed.ppm");
         qmp_screendump(&mut qmp, &stressed_dump)?;
         let stressed = read_ppm_summary(&stressed_dump)?;
+        println!(
+            "probe stressed color avg_rgb=({},{},{}) dominant={}",
+            stressed.avg_r,
+            stressed.avg_g,
+            stressed.avg_b,
+            stressed.dominant_channel()
+        );
         if stressed.dimensions() != baseline.dimensions() {
             bail!(
                 "display geometry changed during probe: baseline={}x{}, stressed={}x{}",
@@ -1636,10 +1746,61 @@ fn wait_for_boot_marker(log_path: &Path, markers: &[&str], timeout: Duration) ->
     }
 }
 
+fn wait_for_boot_marker_with_qmp(
+    log_path: &Path,
+    markers: &[&str],
+    timeout: Duration,
+    qmp: &mut UnixStream,
+) -> Result<()> {
+    match wait_for_boot_marker(log_path, markers, timeout) {
+        Ok(()) => Ok(()),
+        Err(err) => bail!("{err}; {}", probe_boot_timeout_context(log_path, qmp)),
+    }
+}
+
+fn probe_boot_timeout_context(log_path: &Path, qmp: &mut UnixStream) -> String {
+    let debugcon_bytes = fs::metadata(log_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or_default();
+    let qmp_status = qmp_hmp_capture(qmp, "info status", Instant::now() + PROBE_QMP_TIMEOUT)
+        .map(|status| compact_probe_text(&status))
+        .unwrap_or_else(|err| format!("qmp info status failed: {err}"));
+    let qmp_mice = qmp_hmp_capture(qmp, "info mice", Instant::now() + PROBE_QMP_TIMEOUT)
+        .map(|mice| compact_probe_text(&mice))
+        .unwrap_or_else(|err| format!("qmp info mice failed: {err}"));
+    let dump_path = log_path.with_file_name("probe-boot-timeout.ppm");
+    let screen = match qmp_screendump(qmp, &dump_path).and_then(|()| read_ppm_summary(&dump_path)) {
+        Ok(summary) => format!(
+            "{}x{} avg_rgb=({},{},{}) dominant={}",
+            summary.width,
+            summary.height,
+            summary.avg_r,
+            summary.avg_g,
+            summary.avg_b,
+            summary.dominant_channel()
+        ),
+        Err(err) => format!("screendump failed: {err}"),
+    };
+    format!(
+        "debugcon_bytes={} debugcon_path={} qmp_status={} qmp_mice={} screen={}",
+        debugcon_bytes,
+        log_path.display(),
+        qmp_status,
+        qmp_mice,
+        screen
+    )
+}
+
+fn compact_probe_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn run_probe_mouse_stress(
     qmp: &mut UnixStream,
     debugcon_log: &Path,
-    input_device: Option<&str>,
+    input_device: Option<UsbInputDevice>,
+    input_route_device: Option<&str>,
+    display_size: Option<(u32, u32)>,
 ) -> Result<()> {
     let stress_duration =
         probe_duration_env("RUSTOS_PROBE_STRESS_MS", PROBE_STRESS_DURATION_DEFAULT);
@@ -1647,32 +1808,71 @@ fn run_probe_mouse_stress(
         "RUSTOS_PROBE_HEARTBEAT_STALL_MS",
         PROBE_HEARTBEAT_STALL_DEFAULT,
     );
-    let end = Instant::now() + stress_duration;
+    let input_stall = probe_duration_env("RUSTOS_PROBE_INPUT_STALL_MS", PROBE_INPUT_STALL_DEFAULT);
+    let input_start = probe_duration_env("RUSTOS_PROBE_INPUT_START_MS", PROBE_INPUT_START_DEFAULT);
+    let step_delay = probe_duration_env("RUSTOS_PROBE_STEP_MS", PROBE_STEP_DELAY);
+    let mut started_at = Instant::now();
+    let mut end = started_at + stress_duration;
     let mut step = 0usize;
-    let mut last_heartbeat_second = latest_kernel_alive_second(debugcon_log);
-    let mut last_liveness_epoch = latest_probe_liveness_epoch(debugcon_log);
+    let mut log_tracker = ProbeLogTracker::new(debugcon_log);
+    log_tracker.refresh();
+    let mut last_heartbeat_second = log_tracker.latest_kernel_second;
+    let mut last_liveness_epoch =
+        (log_tracker.liveness_epoch > 0).then_some(log_tracker.liveness_epoch);
     let mut heartbeat_seen = last_liveness_epoch.is_some();
     let mut last_heartbeat_at = Instant::now();
+    let mut input_progress = log_tracker.input_progress;
+    let mut last_hid_progress_at = Instant::now();
+    let mut last_read_progress_at = Instant::now();
+    let mut last_ui_progress_at = Instant::now();
+    let mut first_ui_progress_at = None::<Instant>;
     let mut x = 0x4000_i32;
     let mut y = 0x3000_i32;
     let mut dx = 1400_i32;
     let mut dy = 900_i32;
-    const ABS_MIN: i32 = 0;
-    const ABS_MAX: i32 = 0x7fff;
+    let mut last_sent_x = x as u16;
+    let mut last_sent_y = y as u16;
+    let mut last_sent_dx = 0_i16;
+    let mut last_sent_dy = 0_i16;
+    let mut last_sent_at = Instant::now();
+    let mut max_qmp_send = Duration::ZERO;
+    let mut slow_qmp_sends = 0usize;
+    let mut changed_sends = 0usize;
+    let mut last_probe_notice = Instant::now();
+    const ABS_MIN: i32 = 0x0800;
+    const ABS_MAX: i32 = 0x77ff;
+
+    if input_device.is_some() && !input_start.is_zero() {
+        thread::sleep(input_start);
+        log_tracker.refresh();
+        input_progress = log_tracker.input_progress;
+        last_heartbeat_second = log_tracker.latest_kernel_second;
+        last_liveness_epoch =
+            (log_tracker.liveness_epoch > 0).then_some(log_tracker.liveness_epoch);
+        heartbeat_seen = last_liveness_epoch.is_some();
+        let now = Instant::now();
+        last_heartbeat_at = now;
+        last_hid_progress_at = now;
+        last_read_progress_at = now;
+        last_ui_progress_at = now;
+        first_ui_progress_at = None;
+        last_sent_at = now;
+        last_probe_notice = now;
+        started_at = now;
+        end = started_at + stress_duration;
+    }
 
     while Instant::now() < end {
-        let log = fs::read_to_string(debugcon_log).unwrap_or_default();
-        for marker in PROBE_BAD_MARKERS {
-            if log.contains(marker) {
-                bail!("probe detected bad marker in debugcon log: {marker}");
-            }
+        log_tracker.refresh();
+        if let Some(marker) = log_tracker.bad_marker {
+            bail!("probe detected bad marker in debugcon log: {marker}");
         }
 
-        if let Some(epoch) = latest_probe_liveness_epoch_in_log(&log) {
+        if log_tracker.liveness_epoch > 0 {
             heartbeat_seen = true;
-            if last_liveness_epoch != Some(epoch) {
-                last_liveness_epoch = Some(epoch);
-                last_heartbeat_second = latest_kernel_alive_second_in_log(&log);
+            if last_liveness_epoch != Some(log_tracker.liveness_epoch) {
+                last_liveness_epoch = Some(log_tracker.liveness_epoch);
+                last_heartbeat_second = log_tracker.latest_kernel_second;
                 last_heartbeat_at = Instant::now();
             }
         }
@@ -1689,6 +1889,165 @@ fn run_probe_mouse_stress(
             );
         }
 
+        if input_device.is_some() {
+            let next_progress = log_tracker.input_progress;
+            let now = Instant::now();
+            let xhci_advanced = next_progress.xhci_events > input_progress.xhci_events;
+            let hid_advanced =
+                next_progress.hid_pointer_reports > input_progress.hid_pointer_reports;
+            let read_advanced = next_progress.input_read_events > input_progress.input_read_events;
+            let ui_advanced = next_progress.ui_input_events > input_progress.ui_input_events;
+            let ui_caught_up = input_device.is_some_and(UsbInputDevice::is_absolute)
+                && display_size.is_some_and(|(width, height)| {
+                    next_progress.cursor_matches_abs(last_sent_x, last_sent_y, width, height)
+                });
+            if first_ui_progress_at.is_none() && ui_advanced {
+                first_ui_progress_at = Some(now);
+                last_ui_progress_at = now;
+            }
+            if hid_advanced {
+                last_hid_progress_at = now;
+            }
+            if xhci_advanced && !hid_advanced {
+                last_hid_progress_at = now;
+            }
+            if read_advanced {
+                last_read_progress_at = now;
+            }
+            if ui_advanced {
+                last_ui_progress_at = now;
+            }
+            if ui_caught_up {
+                first_ui_progress_at.get_or_insert(now);
+                last_ui_progress_at = now;
+            }
+            if next_progress.ui_input_last_age_ms.is_some_and(|age_ms| {
+                u128::from(age_ms) <= input_stall.as_millis()
+                    && next_progress.ui_input_delivered_events
+                        >= input_progress.ui_input_delivered_events
+            }) {
+                first_ui_progress_at.get_or_insert(now);
+                last_ui_progress_at = now;
+            }
+            input_progress = next_progress;
+            if now.saturating_duration_since(last_probe_notice) >= Duration::from_secs(2) {
+                println!(
+                    "probe input send progress steps={} last_abs={},{} last_rel={},{} changed_sends={} qmp_last_age_ms={} qmp_max_ms={} qmp_slow={} xhci_events={} xhci_success={} xhci_short={} xhci_empty={} xhci_reports={} hid_reports={} read_events={} ui_events={} ui_reader_age_ms={:?} ui_pending={:?} ui_raw_events={} ui_delivered_events={}",
+                    step,
+                    last_sent_x,
+                    last_sent_y,
+                    last_sent_dx,
+                    last_sent_dy,
+                    changed_sends,
+                    now.saturating_duration_since(last_sent_at).as_millis(),
+                    max_qmp_send.as_millis(),
+                    slow_qmp_sends,
+                    input_progress.xhci_events,
+                    input_progress.xhci_success,
+                    input_progress.xhci_short,
+                    input_progress.xhci_empty,
+                    input_progress.xhci_reports,
+                    input_progress.hid_pointer_reports,
+                    input_progress.input_read_events,
+                    input_progress.ui_input_events,
+                    input_progress.ui_input_last_age_ms,
+                    input_progress.ui_input_pending,
+                    input_progress.ui_input_raw_events,
+                    input_progress.ui_input_delivered_events,
+                );
+                last_probe_notice = now;
+            }
+            let input_start_expired = now.saturating_duration_since(started_at) > input_start;
+            let ui_progress_seen = first_ui_progress_at.is_some();
+            if input_start_expired && !ui_progress_seen {
+                let mice = qmp_probe_mice_status(qmp);
+                bail!(
+                    "probe UI input progress never started: elapsed_ms={} sent_steps={} last_abs={},{} last_rel={},{} qmp_max_ms={} qmp_slow={} changed_sends={} xhci_events={} xhci_success={} xhci_short={} xhci_empty={} xhci_reports={} hid_reports={} read_events={} ui_events={} ui_reader_age_ms={:?} ui_pending={:?} ui_raw_events={} ui_delivered_events={} mice={}",
+                    now.saturating_duration_since(started_at).as_millis(),
+                    step,
+                    last_sent_x,
+                    last_sent_y,
+                    last_sent_dx,
+                    last_sent_dy,
+                    max_qmp_send.as_millis(),
+                    slow_qmp_sends,
+                    changed_sends,
+                    input_progress.xhci_events,
+                    input_progress.xhci_success,
+                    input_progress.xhci_short,
+                    input_progress.xhci_empty,
+                    input_progress.xhci_reports,
+                    input_progress.hid_pointer_reports,
+                    input_progress.input_read_events,
+                    input_progress.ui_input_events,
+                    input_progress.ui_input_last_age_ms,
+                    input_progress.ui_input_pending,
+                    input_progress.ui_input_raw_events,
+                    input_progress.ui_input_delivered_events,
+                    mice
+                );
+            }
+            let ui_currently_caught_up = input_device.is_some_and(UsbInputDevice::is_absolute)
+                && display_size.is_some_and(|(width, height)| {
+                    input_progress.cursor_matches_abs(last_sent_x, last_sent_y, width, height)
+                });
+            if ui_currently_caught_up {
+                last_ui_progress_at = now;
+            }
+            let stall_stage = if now.saturating_duration_since(last_hid_progress_at) > input_stall {
+                "hid-ingress"
+            } else if now.saturating_duration_since(last_read_progress_at) > input_stall {
+                "inputd-read"
+            } else if input_progress
+                .ui_input_last_age_ms
+                .is_none_or(|age_ms| u128::from(age_ms) > input_stall.as_millis())
+            {
+                "uiserver-input-reader"
+            } else {
+                "cursor-present"
+            };
+            if ui_progress_seen
+                && !ui_currently_caught_up
+                && now.saturating_duration_since(last_ui_progress_at) > input_stall
+            {
+                let mice = qmp_probe_mice_status(qmp);
+                bail!(
+                    "probe UI input progress stalled: stage={} sent_steps={} qmp_last_age_ms={} hid_age_ms={} read_age_ms={} ui_age_ms={} last_abs={},{} last_rel={},{} cursor={:?},{:?} qmp_max_ms={} qmp_slow={} changed_sends={} xhci_events={} xhci_success={} xhci_short={} xhci_empty={} xhci_reports={} hid_reports={} read_events={} ui_events={} ui_reader_age_ms={:?} ui_pending={:?} ui_raw_events={} ui_delivered_events={} mice={}",
+                    stall_stage,
+                    step,
+                    now.saturating_duration_since(last_sent_at).as_millis(),
+                    now.saturating_duration_since(last_hid_progress_at)
+                        .as_millis(),
+                    now.saturating_duration_since(last_read_progress_at)
+                        .as_millis(),
+                    now.saturating_duration_since(last_ui_progress_at)
+                        .as_millis(),
+                    last_sent_x,
+                    last_sent_y,
+                    last_sent_dx,
+                    last_sent_dy,
+                    input_progress.cursor_x,
+                    input_progress.cursor_y,
+                    max_qmp_send.as_millis(),
+                    slow_qmp_sends,
+                    changed_sends,
+                    input_progress.xhci_events,
+                    input_progress.xhci_success,
+                    input_progress.xhci_short,
+                    input_progress.xhci_empty,
+                    input_progress.xhci_reports,
+                    input_progress.hid_pointer_reports,
+                    input_progress.input_read_events,
+                    input_progress.ui_input_events,
+                    input_progress.ui_input_last_age_ms,
+                    input_progress.ui_input_pending,
+                    input_progress.ui_input_raw_events,
+                    input_progress.ui_input_delivered_events,
+                    mice
+                );
+            }
+        }
+
         x += dx;
         y += dy;
         if !(ABS_MIN..=ABS_MAX).contains(&x) {
@@ -1700,50 +2059,119 @@ fn run_probe_mouse_stress(
             y = y.clamp(ABS_MIN, ABS_MAX);
         }
 
-        let button = if step % 16 == 0 {
-            Some(true)
-        } else if step % 16 == 8 {
-            Some(false)
-        } else {
-            None
-        };
-        if input_device.is_some() {
+        if input_device.is_some_and(UsbInputDevice::is_absolute) {
+            let prev_x = last_sent_x;
+            let prev_y = last_sent_y;
+            let send_started = Instant::now();
             qmp_input_send_pointer_abs(
                 qmp,
+                input_route_device,
                 x as u16,
                 y as u16,
-                button,
+                None,
                 Instant::now() + PROBE_QMP_TIMEOUT,
             )?;
+            let elapsed = send_started.elapsed();
+            max_qmp_send = max_qmp_send.max(elapsed);
+            if elapsed > step_delay.saturating_mul(2).max(Duration::from_millis(50)) {
+                slow_qmp_sends = slow_qmp_sends.saturating_add(1);
+            }
+            last_sent_x = x as u16;
+            last_sent_y = y as u16;
+            last_sent_dx = 0;
+            last_sent_dy = 0;
+            last_sent_at = Instant::now();
+            if last_sent_x != prev_x || last_sent_y != prev_y {
+                changed_sends = changed_sends.saturating_add(1);
+            }
         } else {
+            let rel_dx = (dx / 175).clamp(-32, 32) as i16;
+            let rel_dy = (dy / 175).clamp(-32, 32) as i16;
+            let send_started = Instant::now();
             qmp_input_send_pointer_rel(
                 qmp,
-                (dx / 175).clamp(-32, 32) as i16,
-                (dy / 175).clamp(-32, 32) as i16,
-                button,
+                input_route_device,
+                rel_dx,
+                rel_dy,
+                None,
                 Instant::now() + PROBE_QMP_TIMEOUT,
             )?;
+            let elapsed = send_started.elapsed();
+            max_qmp_send = max_qmp_send.max(elapsed);
+            if elapsed > step_delay.saturating_mul(2).max(Duration::from_millis(50)) {
+                slow_qmp_sends = slow_qmp_sends.saturating_add(1);
+            }
+            last_sent_dx = rel_dx;
+            last_sent_dy = rel_dy;
+            last_sent_at = Instant::now();
+            if rel_dx != 0 || rel_dy != 0 {
+                changed_sends = changed_sends.saturating_add(1);
+            }
         }
-        thread::sleep(PROBE_STEP_DELAY);
+        thread::sleep(step_delay);
         step += 1;
     }
-    if input_device.is_some() {
+    if input_device.is_some_and(UsbInputDevice::is_absolute) {
         qmp_input_send_pointer_abs(
             qmp,
+            input_route_device,
             x as u16,
             y as u16,
-            Some(false),
+            None,
             Instant::now() + PROBE_QMP_TIMEOUT,
         )?;
     } else {
-        qmp_input_send_pointer_rel(qmp, 0, 0, Some(false), Instant::now() + PROBE_QMP_TIMEOUT)?;
+        qmp_input_send_pointer_rel(
+            qmp,
+            input_route_device,
+            0,
+            0,
+            None,
+            Instant::now() + PROBE_QMP_TIMEOUT,
+        )?;
     }
     thread::sleep(Duration::from_millis(200));
+    println!(
+        "probe mouse stress sent steps={} elapsed_ms={} step_ms={} device={}",
+        step,
+        started_at.elapsed().as_millis(),
+        step_delay.as_millis(),
+        input_device
+            .map(UsbInputDevice::label)
+            .unwrap_or("relative"),
+    );
     Ok(())
+}
+
+fn qmp_probe_mice_status(qmp: &mut UnixStream) -> String {
+    let hmp = match qmp_hmp_capture(qmp, "info mice", Instant::now() + PROBE_QMP_TIMEOUT) {
+        Ok(status) => collapse_probe_status(&status, 512),
+        Err(error) => format!("unavailable:{error}"),
+    };
+    let query = match qmp_query_mice(qmp, Instant::now() + PROBE_QMP_TIMEOUT) {
+        Ok(status) => collapse_probe_status(&status, 512),
+        Err(error) => format!("unavailable:{error}"),
+    };
+    format!("info_mice={hmp} query_mice={query}")
+}
+
+fn qmp_query_mice(qmp: &mut UnixStream, deadline: Instant) -> Result<String> {
+    qmp.write_all(b"{\"execute\":\"query-mice\"}\n")?;
+    wait_for_qmp_return_message(qmp, deadline)
+}
+
+fn collapse_probe_status(status: &str, max_len: usize) -> String {
+    let mut compact = status.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.len() > max_len {
+        compact.truncate(max_len);
+        compact.push_str("...");
+    }
+    compact
 }
 
 fn qmp_input_send_pointer_abs(
     qmp: &mut UnixStream,
+    device: Option<&str>,
     x: u16,
     y: u16,
     button_down: Option<bool>,
@@ -1759,15 +2187,13 @@ fn qmp_input_send_pointer_abs(
         ));
     }
 
-    let command = format!(
-        r#"{{"execute":"input-send-event","arguments":{{{}}}}}"#,
-        format!(r#""events":[{}]"#, events)
-    );
+    let command = qmp_input_send_event_command(device, events.as_str());
     qmp_execute(qmp, &command, deadline)
 }
 
 fn qmp_input_send_pointer_rel(
     qmp: &mut UnixStream,
+    device: Option<&str>,
     dx: i16,
     dy: i16,
     button_down: Option<bool>,
@@ -1783,35 +2209,213 @@ fn qmp_input_send_pointer_rel(
         ));
     }
 
-    let command = format!(
-        r#"{{"execute":"input-send-event","arguments":{{{}}}}}"#,
-        format!(r#""events":[{}]"#, events)
-    );
+    let command = qmp_input_send_event_command(device, events.as_str());
     qmp_execute(qmp, &command, deadline)
 }
 
-fn latest_kernel_alive_second(log_path: &Path) -> Option<u64> {
-    let log = fs::read_to_string(log_path).ok()?;
-    latest_kernel_alive_second_in_log(&log)
+#[derive(Clone, Copy, Debug, Default)]
+struct ProbeInputProgress {
+    xhci_events: u64,
+    xhci_success: u64,
+    xhci_short: u64,
+    xhci_empty: u64,
+    xhci_reports: u64,
+    hid_pointer_reports: u64,
+    input_read_events: u64,
+    ui_input_events: u64,
+    ui_input_last_age_ms: Option<u64>,
+    ui_input_pending: Option<u64>,
+    ui_input_raw_events: u64,
+    ui_input_delivered_events: u64,
+    cursor_x: Option<i32>,
+    cursor_y: Option<i32>,
 }
 
-fn latest_probe_liveness_epoch(log_path: &Path) -> Option<u64> {
-    let log = fs::read_to_string(log_path).ok()?;
-    latest_probe_liveness_epoch_in_log(&log)
+impl ProbeInputProgress {
+    fn cursor_matches_abs(&self, abs_x: u16, abs_y: u16, width: u32, height: u32) -> bool {
+        let Some(cursor_x) = self.cursor_x else {
+            return false;
+        };
+        let Some(cursor_y) = self.cursor_y else {
+            return false;
+        };
+        if width == 0 || height == 0 {
+            return false;
+        }
+        let max_x = width.saturating_sub(1);
+        let max_y = height.saturating_sub(1);
+        let expected_x = ((u64::from(abs_x) * u64::from(max_x)) / 0x7fff) as i32;
+        let expected_y = ((u64::from(abs_y) * u64::from(max_y)) / 0x7fff) as i32;
+        cursor_x.abs_diff(expected_x) <= 3 && cursor_y.abs_diff(expected_y) <= 3
+    }
+
+    fn observe_line(&mut self, line: &str) {
+        if line.contains("usb input diag") {
+            self.xhci_events = self
+                .xhci_events
+                .saturating_add(parse_u64_metric(line, "xhci_delta=").unwrap_or(0));
+            self.xhci_success = self
+                .xhci_success
+                .saturating_add(parse_u64_metric(line, "xhci_success_delta=").unwrap_or(0));
+            self.xhci_short = self
+                .xhci_short
+                .saturating_add(parse_u64_metric(line, "xhci_short_delta=").unwrap_or(0));
+            self.xhci_empty = self
+                .xhci_empty
+                .saturating_add(parse_u64_metric(line, "xhci_empty_delta=").unwrap_or(0));
+            self.xhci_reports = self
+                .xhci_reports
+                .saturating_add(parse_u64_metric(line, "xhci_reports_delta=").unwrap_or(0));
+            self.hid_pointer_reports = self
+                .hid_pointer_reports
+                .saturating_add(parse_u64_metric(line, "hid_ptr_delta=").unwrap_or(0));
+            self.input_read_events = self
+                .input_read_events
+                .saturating_add(parse_u64_metric(line, "read_events_delta=").unwrap_or(0));
+        }
+        if line.contains("uiserver: update tick") {
+            self.ui_input_events = self
+                .ui_input_events
+                .saturating_add(parse_u64_metric(line, "input_loop_events=").unwrap_or(0));
+            self.ui_input_last_age_ms = parse_u64_metric(line, "input_last_age_ms=");
+            self.ui_input_pending = parse_u64_metric(line, "input_pending=");
+            if let Some(raw_events) = parse_u64_metric(line, "input_raw_events=") {
+                self.ui_input_raw_events = raw_events;
+            }
+            if let Some(delivered_events) = parse_u64_metric(line, "input_events=") {
+                self.ui_input_delivered_events = delivered_events;
+            }
+            if let Some((x, y)) = parse_i32_pair_metric(line, "cursor=") {
+                self.cursor_x = Some(x);
+                self.cursor_y = Some(y);
+            }
+        } else if line.contains("uiserver: input pulse") {
+            self.ui_input_events = self
+                .ui_input_events
+                .saturating_add(parse_u64_metric(line, "events=").unwrap_or(0));
+            if let Some(raw_events) = parse_u64_metric(line, "input_raw_events=") {
+                self.ui_input_raw_events = raw_events;
+            }
+            if let Some(delivered_events) = parse_u64_metric(line, "input_events=") {
+                self.ui_input_delivered_events = delivered_events;
+            }
+            if let Some((x, y)) = parse_i32_pair_metric(line, "cursor=") {
+                self.cursor_x = Some(x);
+                self.cursor_y = Some(y);
+            }
+        }
+    }
 }
 
-fn latest_probe_liveness_epoch_in_log(log: &str) -> Option<u64> {
-    let count = log
-        .lines()
-        .filter(|line| {
-            parse_kernel_alive_second(line).is_some() || line.contains("uiserver: heartbeat")
-        })
-        .count() as u64;
-    (count > 0).then_some(count)
+struct ProbeLogTracker {
+    path: PathBuf,
+    offset: u64,
+    pending: String,
+    bad_marker: Option<&'static str>,
+    liveness_epoch: u64,
+    latest_kernel_second: Option<u64>,
+    input_progress: ProbeInputProgress,
 }
 
-fn latest_kernel_alive_second_in_log(log: &str) -> Option<u64> {
-    log.lines().rev().find_map(parse_kernel_alive_second)
+impl ProbeLogTracker {
+    fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_owned(),
+            offset: 0,
+            pending: String::new(),
+            bad_marker: None,
+            liveness_epoch: 0,
+            latest_kernel_second: None,
+            input_progress: ProbeInputProgress::default(),
+        }
+    }
+
+    fn refresh(&mut self) {
+        let Ok(mut file) = fs::File::open(&self.path) else {
+            return;
+        };
+        let Ok(metadata) = file.metadata() else {
+            return;
+        };
+        let len = metadata.len();
+        if len < self.offset {
+            self.offset = 0;
+            self.pending.clear();
+            self.bad_marker = None;
+            self.liveness_epoch = 0;
+            self.latest_kernel_second = None;
+            self.input_progress = ProbeInputProgress::default();
+        }
+        if file.seek(SeekFrom::Start(self.offset)).is_err() {
+            return;
+        }
+        let mut bytes = Vec::new();
+        if file.read_to_end(&mut bytes).is_err() {
+            return;
+        }
+        self.offset = len;
+        if bytes.is_empty() {
+            return;
+        }
+
+        let chunk = String::from_utf8_lossy(&bytes);
+        self.observe_chunk(&chunk);
+    }
+
+    fn observe_chunk(&mut self, chunk: &str) {
+        self.pending.push_str(chunk);
+        while let Some(newline) = self.pending.find('\n') {
+            let mut line = self.pending.drain(..=newline).collect::<String>();
+            if line.ends_with('\n') {
+                line.pop();
+            }
+            if line.ends_with('\r') {
+                line.pop();
+            }
+            self.observe_line(&line);
+        }
+        if self.pending.len() > 64 * 1024 {
+            let line = std::mem::take(&mut self.pending);
+            self.observe_line(&line);
+        }
+    }
+
+    fn observe_line(&mut self, line: &str) {
+        if self.bad_marker.is_none() {
+            self.bad_marker = PROBE_BAD_MARKERS
+                .into_iter()
+                .find(|marker| line.contains(marker));
+        }
+        if let Some(second) = parse_kernel_alive_second(line) {
+            self.liveness_epoch = self.liveness_epoch.saturating_add(1);
+            self.latest_kernel_second = Some(second);
+        } else if line.contains("uiserver: heartbeat") {
+            self.liveness_epoch = self.liveness_epoch.saturating_add(1);
+        }
+        self.input_progress.observe_line(line);
+    }
+}
+
+fn parse_u64_metric(line: &str, key: &str) -> Option<u64> {
+    let value = line.split(key).nth(1)?.split_whitespace().next()?;
+    value.trim_end_matches(',').parse().ok()
+}
+
+fn parse_i32_pair_metric(line: &str, key: &str) -> Option<(i32, i32)> {
+    let value = line.split(key).nth(1)?.split_whitespace().next()?;
+    let value = value.trim_end_matches(',');
+    let (x, y) = value.split_once(',')?;
+    Some((x.parse().ok()?, y.parse().ok()?))
+}
+
+fn qmp_input_send_event_command(device: Option<&str>, events: &str) -> String {
+    let device = device
+        .map(|name| format!(r#""device":"{name}","#))
+        .unwrap_or_default();
+    format!(
+        r#"{{"execute":"input-send-event","arguments":{{{}"events":[{}]}}}}"#,
+        device, events
+    )
 }
 
 fn parse_kernel_alive_second(line: &str) -> Option<u64> {
@@ -2035,6 +2639,9 @@ struct PpmSummary {
     width: u32,
     height: u32,
     non_black_pixels: u64,
+    avg_r: u8,
+    avg_g: u8,
+    avg_b: u8,
 }
 
 impl PpmSummary {
@@ -2044,6 +2651,16 @@ impl PpmSummary {
 
     fn pixel_count(self) -> u64 {
         u64::from(self.width).saturating_mul(u64::from(self.height))
+    }
+
+    fn dominant_channel(self) -> &'static str {
+        if self.avg_r >= self.avg_g && self.avg_r >= self.avg_b {
+            "red"
+        } else if self.avg_g >= self.avg_b {
+            "green"
+        } else {
+            "blue"
+        }
     }
 }
 
@@ -2114,15 +2731,30 @@ fn read_ppm_summary(path: &Path) -> Result<PpmSummary> {
     let pixels = data
         .get(i..pixel_end)
         .ok_or_else(|| anyhow!("truncated screendump pixel data: {}", path.display()))?;
-    let non_black_pixels = pixels
-        .chunks_exact(3)
-        .filter(|pixel| pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0)
-        .count() as u64;
+    let mut non_black_pixels = 0u64;
+    let mut sum_r = 0u64;
+    let mut sum_g = 0u64;
+    let mut sum_b = 0u64;
+    for pixel in pixels.chunks_exact(3) {
+        let r = u64::from(pixel[0]);
+        let g = u64::from(pixel[1]);
+        let b = u64::from(pixel[2]);
+        if r != 0 || g != 0 || b != 0 {
+            non_black_pixels += 1;
+        }
+        sum_r += r;
+        sum_g += g;
+        sum_b += b;
+    }
+    let pixel_count = u64::from(width).saturating_mul(u64::from(height)).max(1);
 
     Ok(PpmSummary {
         width,
         height,
         non_black_pixels,
+        avg_r: (sum_r / pixel_count) as u8,
+        avg_g: (sum_g / pixel_count) as u8,
+        avg_b: (sum_b / pixel_count) as u8,
     })
 }
 

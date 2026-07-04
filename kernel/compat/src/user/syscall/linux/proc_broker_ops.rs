@@ -157,6 +157,9 @@ pub(super) fn syscall_linux_rustos_proc_map_file_broker(args_ptr: u64) -> u64 {
     if let Err(errno) = validate_mapping_region(args.target_addr, args.mem_len, args.flags) {
         return linux_errno(errno);
     }
+    if let Err(errno) = validate_file_mapping_len(args.mem_len, args.file_len) {
+        return linux_errno(errno);
+    }
     if state.mappings.len() >= MAX_MAPPINGS_PER_PREPARE {
         return linux_errno(LINUX_EINVAL);
     }
@@ -204,6 +207,9 @@ pub(super) fn syscall_linux_rustos_proc_map_file_batch_broker(args_ptr: u64) -> 
             return linux_errno(LINUX_EINVAL);
         }
         if let Err(errno) = validate_mapping_region(entry.target_addr, entry.mem_len, entry.flags) {
+            return linux_errno(errno);
+        }
+        if let Err(errno) = validate_file_mapping_len(entry.mem_len, entry.file_len) {
             return linux_errno(errno);
         }
     }
@@ -1067,6 +1073,13 @@ fn copy_file_into_address_space(
     Ok(())
 }
 
+fn validate_file_mapping_len(mem_len: u64, file_len: u64) -> Result<(), i64> {
+    if file_len > mem_len {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(())
+}
+
 fn pinned_file_backing_from_current(fd: u64) -> Result<PinnedFileBacking, i64> {
     let Some(result) = multitask::with_current_process_state(|_, process_state| {
         let entry = process_state.handles().get_entry(fd).ok_or(LINUX_EBADF)?;
@@ -1276,4 +1289,16 @@ fn read_user_string_vector(
         return Err(LINUX_EINVAL);
     }
     Ok(values)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_mapping_len_must_fit_inside_memory_mapping() {
+        assert_eq!(validate_file_mapping_len(4096, 4096), Ok(()));
+        assert_eq!(validate_file_mapping_len(4096, 0), Ok(()));
+        assert_eq!(validate_file_mapping_len(4096, 4097), Err(LINUX_EINVAL));
+    }
 }

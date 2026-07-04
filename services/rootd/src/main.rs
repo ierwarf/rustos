@@ -19,19 +19,20 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_CAPABILITY,
     COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR,
     COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST, COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE,
-    COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH, COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY,
-    IPC_SERVICE_DEVMGRD, IPC_SERVICE_DRIVERD, IPC_SERVICE_INPUTD, IPC_SERVICE_LINUX_SYSCALLD,
-    IPC_SERVICE_LOADERD, IPC_SERVICE_NETD, IPC_SERVICE_PAGERD, IPC_SERVICE_PROCD,
-    IPC_SERVICE_ROOTD, IPC_SERVICE_SERVICE_DRIVERD, IPC_SERVICE_SESSIOND, IPC_SERVICE_STORAGED,
-    IPC_SERVICE_UISERVER, IPC_SERVICE_VFSD, LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT,
-    LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
-    LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, ROOTD_IPC_ABI_VERSION,
-    ROOTD_IPC_OP_LEASE_LIST, ROOTD_IPC_OP_STATUS, ROOTD_LEASE_STATE_EXITED,
-    ROOTD_LEASE_STATE_FAILED, ROOTD_LEASE_STATE_RESTART_PENDING, ROOTD_LEASE_STATE_RUNNING,
-    SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
-    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
-    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_TRY_RECV, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
-    SYS_RUSTOS_SPAWN_EXEC,
+    COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH, COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL,
+    COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY, COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY,
+    COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP, IPC_SERVICE_DEVMGRD, IPC_SERVICE_DRIVERD,
+    IPC_SERVICE_INPUTD, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD, IPC_SERVICE_NETD,
+    IPC_SERVICE_PAGERD, IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD, IPC_SERVICE_SERVICE_DRIVERD,
+    IPC_SERVICE_SESSIOND, IPC_SERVICE_STORAGED, IPC_SERVICE_UISERVER, IPC_SERVICE_VFSD,
+    LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT, LOADER_OP_SPAWN_EXEC,
+    LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES,
+    LOADER_SPAWN_EXEC_PATH_CAPACITY, ROOTD_IPC_ABI_VERSION, ROOTD_IPC_OP_LEASE_LIST,
+    ROOTD_IPC_OP_STATUS, ROOTD_LEASE_STATE_EXITED, ROOTD_LEASE_STATE_FAILED,
+    ROOTD_LEASE_STATE_RESTART_PENDING, ROOTD_LEASE_STATE_RUNNING, SYS_RUSTOS_DEBUG_PRINT,
+    SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
+    SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER, SYS_RUSTOS_SPAWN_EXEC,
 };
 
 const SYS_SCHED_YIELD: u64 = 24;
@@ -47,6 +48,13 @@ const VFSD_EXEC: &[u8] = b"services/vfsd/vfsd.elf\0";
 const LOADERD_EXEC: &[u8] = b"services/loaderd/loaderd.elf\0";
 const PROCD_EXEC: &[u8] = b"services/procd/procd.elf\0";
 const INITD_EXEC: &[u8] = b"services/initd/initd.elf\0";
+const DRIVERD_EXEC: &[u8] = b"services/driverd/driverd.elf\0";
+const NETD_EXEC: &[u8] = b"services/netd/netd.elf\0";
+const DEVMGRD_EXEC: &[u8] = b"services/devmgrd/devmgrd.elf\0";
+const INPUTD_EXEC: &[u8] = b"services/inputd/inputd.elf\0";
+const STORAGED_EXEC: &[u8] = b"services/storaged/storaged.elf\0";
+const RUNTIMED_EXEC: &[u8] = b"services/runtimed/runtimed.elf\0";
+const UISERVER_EXEC: &[u8] = b"services/uiserver/uiserver.elf\0";
 const INITD_LEASE_ID: u64 = 0;
 const INITD_LEASE_INDEX: usize = 4;
 const DEP_SYSCALLD: u16 = 1 << 0;
@@ -107,9 +115,52 @@ const BOOTSTRAP_MANIFEST: [BootstrapServiceSpec; 5] = [
     },
 ];
 
+#[derive(Clone, Copy)]
+struct PostInitServiceSpec {
+    service_id: u64,
+    exec_path: &'static [u8],
+}
+
+const POST_INIT_MANIFEST: [PostInitServiceSpec; 7] = [
+    PostInitServiceSpec {
+        service_id: IPC_SERVICE_DRIVERD,
+        exec_path: DRIVERD_EXEC,
+    },
+    PostInitServiceSpec {
+        service_id: IPC_SERVICE_NETD,
+        exec_path: NETD_EXEC,
+    },
+    PostInitServiceSpec {
+        service_id: IPC_SERVICE_DEVMGRD,
+        exec_path: DEVMGRD_EXEC,
+    },
+    PostInitServiceSpec {
+        service_id: IPC_SERVICE_INPUTD,
+        exec_path: INPUTD_EXEC,
+    },
+    PostInitServiceSpec {
+        service_id: IPC_SERVICE_STORAGED,
+        exec_path: STORAGED_EXEC,
+    },
+    PostInitServiceSpec {
+        service_id: IPC_SERVICE_SESSIOND,
+        exec_path: RUNTIMED_EXEC,
+    },
+    PostInitServiceSpec {
+        service_id: IPC_SERVICE_UISERVER,
+        exec_path: UISERVER_EXEC,
+    },
+];
+
 struct RootdIpcCell<T>(UnsafeCell<T>);
 
 unsafe impl<T> Sync for RootdIpcCell<T> {}
+
+#[derive(Clone, Copy)]
+struct IpcSenderIdentity {
+    pid: u64,
+    tid: u64,
+}
 
 static INITD_LOADER_REQUEST: RootdIpcCell<LoaderSpawnRequest> =
     RootdIpcCell(UnsafeCell::new(empty_loader_spawn_request()));
@@ -181,6 +232,15 @@ struct Lease {
     weight_micros: u64,
 }
 
+#[derive(Clone, Copy)]
+struct PostInitLease {
+    service_id: u64,
+    exec_path: &'static [u8],
+    pid: u64,
+    state: u16,
+    exit_status: i32,
+}
+
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     debug_line(b"rootd: bootstrap enter\n");
@@ -191,6 +251,15 @@ pub extern "C" fn _start() -> ! {
         lease(BOOTSTRAP_MANIFEST[2]),
         lease(BOOTSTRAP_MANIFEST[3]),
         lease(BOOTSTRAP_MANIFEST[4]),
+    ];
+    let mut post_init_leases = [
+        post_init_lease(POST_INIT_MANIFEST[0]),
+        post_init_lease(POST_INIT_MANIFEST[1]),
+        post_init_lease(POST_INIT_MANIFEST[2]),
+        post_init_lease(POST_INIT_MANIFEST[3]),
+        post_init_lease(POST_INIT_MANIFEST[4]),
+        post_init_lease(POST_INIT_MANIFEST[5]),
+        post_init_lease(POST_INIT_MANIFEST[6]),
     ];
 
     // The bootstrap manifest is the rootd-owned policy boundary for direct
@@ -211,19 +280,19 @@ pub extern "C" fn _start() -> ! {
 
     debug_line(b"rootd: core services spawned, waiting for readiness\n");
     while !service_dependencies_ready(INITD_LEASE_INDEX) {
-        drain_lifecycle_events(&mut leases);
-        serve_rootd_once(endpoint, &leases);
+        drain_lifecycle_events(&mut leases, &mut post_init_leases);
+        serve_rootd_once(endpoint, &leases, &mut post_init_leases);
         restart_failed_leases(&mut leases);
         yield_now();
     }
 
     debug_line(b"rootd: core services ready, spawning initd via loaderd\n");
-    spawn_initd_via_loaderd(endpoint, &mut leases);
+    spawn_initd_via_loaderd(endpoint, &mut leases, &mut post_init_leases);
 
     debug_line(b"rootd: initd spawned\n");
     loop {
-        drain_lifecycle_events(&mut leases);
-        serve_rootd_once(endpoint, &leases);
+        drain_lifecycle_events(&mut leases, &mut post_init_leases);
+        serve_rootd_once(endpoint, &leases, &mut post_init_leases);
         restart_failed_leases(&mut leases);
         yield_now();
     }
@@ -239,6 +308,16 @@ fn lease(spec: BootstrapServiceSpec) -> Lease {
         state: rustos_user_abi::syscall::ROOTD_LEASE_STATE_EMPTY,
         exit_status: 0,
         weight_micros: spec.weight_micros,
+    }
+}
+
+fn post_init_lease(spec: PostInitServiceSpec) -> PostInitLease {
+    PostInitLease {
+        service_id: spec.service_id,
+        exec_path: spec.exec_path,
+        pid: 0,
+        state: rustos_user_abi::syscall::ROOTD_LEASE_STATE_EMPTY,
+        exit_status: 0,
     }
 }
 
@@ -301,7 +380,11 @@ fn spawn_exec(path: &'static [u8], weight_micros: u64) -> Result<u64, i64> {
     }
 }
 
-fn spawn_initd_via_loaderd(endpoint: u64, leases: &mut [Lease]) {
+fn spawn_initd_via_loaderd(
+    endpoint: u64,
+    leases: &mut [Lease],
+    post_init_leases: &mut [PostInitLease],
+) {
     let mut attempts = 0_u64;
     loop {
         debug_line(b"rootd: initd spawn request to loaderd\n");
@@ -321,8 +404,8 @@ fn spawn_initd_via_loaderd(endpoint: u64, leases: &mut [Lease]) {
                 if attempts <= 8 || attempts.is_power_of_two() {
                     debug_line(b"rootd: initd loader spawn retry\n");
                 }
-                drain_lifecycle_events(leases);
-                serve_rootd_once(endpoint, leases);
+                drain_lifecycle_events(leases, post_init_leases);
+                serve_rootd_once(endpoint, leases, post_init_leases);
                 restart_failed_leases(leases);
                 yield_now();
             }
@@ -345,7 +428,7 @@ fn service_dependencies_ready(index: usize) -> bool {
         && (mask & DEP_PROCD == 0 || service_ready(IPC_SERVICE_PROCD))
 }
 
-fn drain_lifecycle_events(leases: &mut [Lease]) {
+fn drain_lifecycle_events(leases: &mut [Lease], post_init_leases: &mut [PostInitLease]) {
     let mut events = [LifecycleEventWire::default(); LIFECYCLE_DRAIN_MAX_EVENTS];
     let mut count = 0_u32;
     let args = LifecycleDrainBrokerArgs {
@@ -375,27 +458,47 @@ fn drain_lifecycle_events(leases: &mut [Lease]) {
                 break;
             }
         }
+        for lease in post_init_leases.iter_mut() {
+            if lease.pid == event.pid {
+                lease.state = ROOTD_LEASE_STATE_EXITED;
+                lease.exit_status = event.exit_status;
+                break;
+            }
+        }
     }
 }
 
-fn serve_rootd_once(endpoint: u64, leases: &[Lease]) {
+fn serve_rootd_once(endpoint: u64, leases: &[Lease], post_init_leases: &mut [PostInitLease]) {
     if endpoint == 0 {
         return;
     }
     let mut request = CommercialMaxProtocolRequest::default();
     let mut reply_cap = 0_u64;
-    let received = syscall4(
-        SYS_RUSTOS_IPC_TRY_RECV,
+    let mut sender_pid = 0_u64;
+    let mut sender_tid = 0_u64;
+    let received = syscall6(
+        SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER,
         endpoint,
         (&mut request as *mut CommercialMaxProtocolRequest) as u64,
         size_of::<CommercialMaxProtocolRequest>() as u64,
         (&mut reply_cap as *mut u64) as u64,
+        (&mut sender_pid as *mut u64) as u64,
+        (&mut sender_tid as *mut u64) as u64,
     );
     if received < 0 {
         return;
     }
     if received as usize == size_of::<CommercialMaxProtocolRequest>() {
-        reply_commercial_max_request(reply_cap, &request, leases);
+        reply_commercial_max_request(
+            reply_cap,
+            &request,
+            leases,
+            post_init_leases,
+            IpcSenderIdentity {
+                pid: sender_pid,
+                tid: sender_tid,
+            },
+        );
         return;
     }
     if received as usize != size_of::<RootdIpcRequest>() {
@@ -437,6 +540,8 @@ fn reply_commercial_max_request(
     reply_cap: u64,
     request: &CommercialMaxProtocolRequest,
     leases: &[Lease],
+    post_init_leases: &mut [PostInitLease],
+    sender: IpcSenderIdentity,
 ) {
     let mut response = CommercialMaxProtocolResponse {
         header: request.header,
@@ -444,19 +549,27 @@ fn reply_commercial_max_request(
         ..CommercialMaxProtocolResponse::default()
     };
     response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
-    response.status = match validate_commercial_max_request(request) {
-        Ok(()) => match fill_commercial_max_response(request, leases, &mut response) {
-            Ok(()) => 0,
-            Err(errno) => errno,
-        },
+    response.status = match validate_commercial_max_request(request, sender) {
+        Ok(()) => {
+            match fill_commercial_max_response(request, leases, post_init_leases, &mut response) {
+                Ok(()) => 0,
+                Err(errno) => errno,
+            }
+        }
         Err(errno) => errno,
     };
-    let _ = syscall3(
+    if request.header.op == COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY && response.status != 0 {
+        debug_line(b"rootd: service capability denied\n");
+    }
+    let replied = syscall3(
         SYS_RUSTOS_IPC_REPLY,
         reply_cap,
         (&response as *const CommercialMaxProtocolResponse) as u64,
         size_of::<CommercialMaxProtocolResponse>() as u64,
     );
+    if request.header.op == COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY && replied < 0 {
+        debug_line(b"rootd: service capability reply failed\n");
+    }
 }
 
 fn validate_rootd_request(received: usize, request: &RootdIpcRequest) -> Result<(), i32> {
@@ -501,7 +614,10 @@ fn fill_rootd_response(
     }
 }
 
-fn validate_commercial_max_request(request: &CommercialMaxProtocolRequest) -> Result<(), i32> {
+fn validate_commercial_max_request(
+    request: &CommercialMaxProtocolRequest,
+    sender: IpcSenderIdentity,
+) -> Result<(), i32> {
     if request.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
         || request.header.flags != 0
         || request.path_len as usize > request.path.len()
@@ -515,6 +631,9 @@ fn validate_commercial_max_request(request: &CommercialMaxProtocolRequest) -> Re
             | COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE
             | COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH
             | COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY => Ok(()),
+            COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL
+            | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY
+            | COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP => validate_sender_subject(request, sender),
             _ => Err(22),
         },
         COMMERCIAL_MAX_PROTOCOL_CAPABILITY => match request.header.op {
@@ -527,9 +646,27 @@ fn validate_commercial_max_request(request: &CommercialMaxProtocolRequest) -> Re
     }
 }
 
+fn validate_sender_subject(
+    request: &CommercialMaxProtocolRequest,
+    sender: IpcSenderIdentity,
+) -> Result<(), i32> {
+    if request.header.subject_pid == 0
+        || request.header.subject_tid == 0
+        || sender.pid == 0
+        || sender.tid == 0
+    {
+        return Err(22);
+    }
+    if request.header.subject_pid != sender.pid || request.header.subject_tid != sender.tid {
+        return Err(13);
+    }
+    Ok(())
+}
+
 fn fill_commercial_max_response(
     request: &CommercialMaxProtocolRequest,
     leases: &[Lease],
+    post_init_leases: &mut [PostInitLease],
     response: &mut CommercialMaxProtocolResponse,
 ) -> Result<(), i32> {
     if request.header.protocol == COMMERCIAL_MAX_PROTOCOL_CAPABILITY {
@@ -566,6 +703,22 @@ fn fill_commercial_max_response(
             response.descriptors[0] = lease_descriptor(lease, request.header.op, 0);
             response.value0 = lease.restart_budget as u64;
             response.value1 = lease.backoff_ms as u64;
+            Ok(())
+        }
+        COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL => {
+            register_post_init_service_lease(post_init_leases, request)?;
+            response.value0 = request.arg0;
+            response.value1 = request.arg1;
+            Ok(())
+        }
+        COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY => {
+            let capability = service_capability_for_subject(leases, post_init_leases, request)?;
+            response.value0 = capability;
+            Ok(())
+        }
+        COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP => {
+            authorize_service_lookup_for_subject(leases, post_init_leases, request)?;
+            response.value0 = request.arg0;
             Ok(())
         }
         _ => Err(22),
@@ -781,6 +934,9 @@ fn rootd_capability_mask(op: u16) -> u64 {
         COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE => 1 << 1,
         COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH => 1 << 2,
         COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY => 1 << 3,
+        COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL => 1 << 4,
+        COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY => 1 << 5,
+        COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP => 1 << 6,
         _ => 0,
     }
 }
@@ -816,6 +972,134 @@ fn service_policy_capability(service_id: u64) -> u64 {
         IPC_SERVICE_UISERVER => rustos_user_abi::syscall::IPC_SERVICE_CAP_UI_POLICY,
         INITD_LEASE_ID => rustos_user_abi::syscall::IPC_SERVICE_CAP_ROOT_SUPERVISOR,
         _ => 0,
+    }
+}
+
+fn service_capability_for_subject(
+    leases: &[Lease],
+    post_init_leases: &[PostInitLease],
+    request: &CommercialMaxProtocolRequest,
+) -> Result<u64, i32> {
+    if request.arg0 == 0 || request.header.subject_pid == 0 || request.header.subject_tid == 0 {
+        return Err(22);
+    }
+    if let Some(capability) = post_init_reported_service_capability(
+        post_init_leases,
+        request.arg0,
+        request.header.subject_pid,
+    ) {
+        return Ok(capability);
+    }
+    if let Some(capability) = post_init_delegated_service_capability(
+        post_init_leases,
+        request.arg0,
+        request.header.subject_pid,
+    ) {
+        return Ok(capability);
+    }
+    if request.arg0 == IPC_SERVICE_PAGERD {
+        let syscalld = lease_by_service_or_index(leases, IPC_SERVICE_LINUX_SYSCALLD, 0)?;
+        if syscalld.pid == request.header.subject_pid && syscalld.state == ROOTD_LEASE_STATE_RUNNING
+        {
+            return Ok(rustos_user_abi::syscall::IPC_SERVICE_CAP_PAGER_POLICY);
+        }
+        return Err(13);
+    }
+    let lease = lease_by_service_or_index(leases, request.arg0, request.arg1 as usize)?;
+    if lease.pid != request.header.subject_pid || lease.state != ROOTD_LEASE_STATE_RUNNING {
+        return Err(13);
+    }
+    let capability = service_policy_capability(lease.service_id);
+    if capability == 0 {
+        return Err(22);
+    }
+    Ok(capability)
+}
+
+fn register_post_init_service_lease(
+    post_init_leases: &mut [PostInitLease],
+    request: &CommercialMaxProtocolRequest,
+) -> Result<(), i32> {
+    if request.arg0 == 0 || request.arg1 == 0 {
+        return Err(22);
+    }
+    let Some(lease) = post_init_leases
+        .iter_mut()
+        .find(|lease| lease.service_id == request.arg0)
+    else {
+        return Err(22);
+    };
+    if !request.path.is_empty() && request.path_len as usize > request.path.len() {
+        return Err(22);
+    }
+    if request.path_len != 0 {
+        let path_len = request.path_len as usize;
+        let expected = trim_nul(lease.exec_path);
+        if path_len != expected.len() || &request.path[..path_len] != expected {
+            return Err(13);
+        }
+    }
+    lease.pid = request.arg1;
+    lease.state = ROOTD_LEASE_STATE_RUNNING;
+    lease.exit_status = 0;
+    Ok(())
+}
+
+fn post_init_reported_service_capability(
+    post_init_leases: &[PostInitLease],
+    service_id: u64,
+    subject_pid: u64,
+) -> Option<u64> {
+    post_init_leases
+        .iter()
+        .find(|lease| {
+            lease.service_id == service_id
+                && lease.pid == subject_pid
+                && lease.state == ROOTD_LEASE_STATE_RUNNING
+        })
+        .map(|lease| service_policy_capability(lease.service_id))
+        .filter(|capability| *capability != 0)
+}
+
+fn post_init_delegated_service_capability(
+    post_init_leases: &[PostInitLease],
+    service_id: u64,
+    subject_pid: u64,
+) -> Option<u64> {
+    if service_id != IPC_SERVICE_SERVICE_DRIVERD {
+        return None;
+    }
+    let driverd_pid = post_init_leases
+        .iter()
+        .find(|lease| {
+            lease.service_id == IPC_SERVICE_DRIVERD && lease.state == ROOTD_LEASE_STATE_RUNNING
+        })
+        .map(|lease| lease.pid)?;
+    if driverd_pid != subject_pid {
+        return None;
+    }
+    Some(rustos_user_abi::syscall::IPC_SERVICE_CAP_SERVICE_DRIVER_POLICY)
+}
+
+fn authorize_service_lookup_for_subject(
+    leases: &[Lease],
+    post_init_leases: &[PostInitLease],
+    request: &CommercialMaxProtocolRequest,
+) -> Result<(), i32> {
+    if request.arg0 == 0 || request.header.subject_pid == 0 || request.header.subject_tid == 0 {
+        return Err(22);
+    }
+    if service_policy_capability(request.arg0) == 0 {
+        return Err(22);
+    }
+    if leases.iter().any(|lease| {
+        lease.pid == request.header.subject_pid && lease.state == ROOTD_LEASE_STATE_RUNNING
+    }) || post_init_leases.iter().any(|lease| {
+        lease.pid == request.header.subject_pid && lease.state == ROOTD_LEASE_STATE_RUNNING
+    }) {
+        Ok(())
+    } else {
+        Err(13)
     }
 }
 

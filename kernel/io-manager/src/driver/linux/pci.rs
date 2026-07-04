@@ -8,8 +8,9 @@ use super::compat::{LinuxCompatPciDev, LinuxCompatPciDriver};
 pub(crate) unsafe extern "C" fn __pci_register_driver(
     driver: *mut LinuxCompatPciDriver,
     _owner: *mut c_void,
-    _mod_name: *const c_char,
+    mod_name: *const c_char,
 ) -> i32 {
+    crate::driver::symbol_events::record_pci_probe_init_symbol("__pci_register_driver", mod_name);
     crate::driver::pci::register_linux_driver(driver)
 }
 
@@ -18,11 +19,24 @@ pub(crate) unsafe extern "C" fn pci_unregister_driver(driver: *mut LinuxCompatPc
 }
 
 pub(crate) unsafe extern "C" fn pci_enable_device(dev: *mut LinuxCompatPciDev) -> i32 {
-    crate::driver::pci::enable_device(dev)
+    let status = crate::driver::pci::enable_device(dev);
+    crate::driver::symbol_events::record_pci_resource_symbol(
+        "pci_enable_device",
+        dev,
+        0,
+        status as u32 as u64,
+    );
+    status
 }
 
 pub(crate) unsafe extern "C" fn pcim_enable_device(dev: *mut LinuxCompatPciDev) -> i32 {
     let status = crate::driver::pci::enable_device(dev);
+    crate::driver::symbol_events::record_pci_resource_symbol(
+        "pcim_enable_device",
+        dev,
+        0,
+        status as u32 as u64,
+    );
     if status == 0 && !dev.is_null() {
         let dev_ptr = unsafe { &mut (*dev).dev as *mut _ as *mut c_void };
         crate::driver::devres::register_pci_disable(dev_ptr, dev);
@@ -36,14 +50,17 @@ pub(crate) unsafe extern "C" fn pci_disable_device(dev: *mut LinuxCompatPciDev) 
         crate::driver::devres::forget_pci_disable(dev_ptr, dev);
     }
     crate::driver::pci::disable_device(dev);
+    crate::driver::symbol_events::record_pci_resource_symbol("pci_disable_device", dev, 0, 0);
 }
 
 pub(crate) unsafe extern "C" fn pci_set_master(dev: *mut LinuxCompatPciDev) {
     crate::driver::pci::set_master(dev);
+    crate::driver::symbol_events::record_pci_resource_symbol("pci_set_master", dev, 0, 0);
 }
 
 pub(crate) unsafe extern "C" fn pci_clear_master(dev: *mut LinuxCompatPciDev) {
     crate::driver::pci::clear_master(dev);
+    crate::driver::symbol_events::record_pci_resource_symbol("pci_clear_master", dev, 0, 0);
 }
 
 pub(crate) unsafe extern "C" fn pci_resource_start(dev: *mut LinuxCompatPciDev, bar: u32) -> u64 {
@@ -91,7 +108,16 @@ pub(crate) unsafe extern "C" fn pci_write_config_byte(
     offset: i32,
     value: u8,
 ) -> i32 {
-    crate::driver::pci::write_config_byte(dev, offset, value)
+    let status = crate::driver::pci::write_config_byte(dev, offset, value);
+    if status == 0 {
+        crate::driver::symbol_events::record_pci_config_symbol(
+            "pci_write_config_byte",
+            dev,
+            offset,
+            encode_config_value(value.into(), 1),
+        );
+    }
+    status
 }
 
 pub(crate) unsafe extern "C" fn pci_write_config_word(
@@ -99,7 +125,16 @@ pub(crate) unsafe extern "C" fn pci_write_config_word(
     offset: i32,
     value: u16,
 ) -> i32 {
-    crate::driver::pci::write_config_word(dev, offset, value)
+    let status = crate::driver::pci::write_config_word(dev, offset, value);
+    if status == 0 {
+        crate::driver::symbol_events::record_pci_config_symbol(
+            "pci_write_config_word",
+            dev,
+            offset,
+            encode_config_value(value.into(), 2),
+        );
+    }
+    status
 }
 
 pub(crate) unsafe extern "C" fn pci_write_config_dword(
@@ -107,7 +142,16 @@ pub(crate) unsafe extern "C" fn pci_write_config_dword(
     offset: i32,
     value: u32,
 ) -> i32 {
-    crate::driver::pci::write_config_dword(dev, offset, value)
+    let status = crate::driver::pci::write_config_dword(dev, offset, value);
+    if status == 0 {
+        crate::driver::symbol_events::record_pci_config_symbol(
+            "pci_write_config_dword",
+            dev,
+            offset,
+            encode_config_value(value.into(), 4),
+        );
+    }
+    status
 }
 
 pub(crate) unsafe extern "C" fn pci_set_drvdata(dev: *mut LinuxCompatPciDev, drvdata: usize) {
@@ -136,6 +180,12 @@ pub(crate) unsafe extern "C" fn pci_iomap_wc(
 
 pub(crate) unsafe extern "C" fn pci_iounmap(_dev: *mut LinuxCompatPciDev, addr: *mut c_void) {
     unsafe { crate::driver::linux::mmio::iounmap(addr) };
+    crate::driver::symbol_events::record_pci_resource_symbol(
+        "pci_iounmap",
+        _dev,
+        addr as usize as u64,
+        0,
+    );
 }
 
 pub(crate) fn resolve_symbol(name: &str) -> Option<usize> {
@@ -192,11 +242,32 @@ fn map_bar(
     let Some(size) = usize::try_from(selected_len).ok() else {
         return core::ptr::null_mut();
     };
-    unsafe {
+    let mapped = unsafe {
         if write_combine {
             crate::driver::linux::mmio::ioremap_wc(start, size)
         } else {
             crate::driver::linux::mmio::ioremap(start, size)
         }
+    };
+    if !mapped.is_null() {
+        crate::driver::symbol_events::record_pci_resource_symbol(
+            if write_combine {
+                "pci_iomap_wc"
+            } else {
+                "pci_iomap"
+            },
+            dev,
+            start,
+            encode_iomap_value(bar as u32, write_combine, selected_len),
+        );
     }
+    mapped
+}
+
+fn encode_config_value(value: u64, width: u64) -> u64 {
+    (width << 56) | (value & 0x00ff_ffff_ffff_ffff)
+}
+
+fn encode_iomap_value(bar: u32, write_combine: bool, selected_len: u64) -> u64 {
+    (u64::from(bar) << 56) | ((write_combine as u64) << 55) | (selected_len & 0x007f_ffff_ffff_ffff)
 }

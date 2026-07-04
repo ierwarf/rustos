@@ -5,7 +5,7 @@ use rustos_user_abi::syscall::{
     SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
     SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_RECV,
     SYS_RUSTOS_IPC_REGISTER_LINUX_SYSCALL_ENDPOINT, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
-    SYS_RUSTOS_IPC_REPLY,
+    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_TRY_RECV,
 };
 
 use crate::syscall::{syscall0, syscall1, syscall2, syscall3, syscall4, syscall5};
@@ -69,6 +69,24 @@ pub unsafe fn recv(
 ) -> i64 {
     syscall4(
         SYS_RUSTOS_IPC_RECV,
+        endpoint,
+        request_buf as u64,
+        request_capacity as u64,
+        reply_cap_out as u64,
+    )
+}
+
+/// Attempt to receive a request without blocking. Returns `0` when no request
+/// is currently queued, a positive byte count on success, or a negative errno.
+#[inline]
+pub unsafe fn try_recv(
+    endpoint: u64,
+    request_buf: *mut u8,
+    request_capacity: usize,
+    reply_cap_out: *mut u64,
+) -> i64 {
+    syscall4(
+        SYS_RUSTOS_IPC_TRY_RECV,
         endpoint,
         request_buf as u64,
         request_capacity as u64,

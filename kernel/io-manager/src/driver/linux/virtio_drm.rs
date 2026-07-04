@@ -11,16 +11,35 @@ unsafe extern "C" fn compat_printk(_fmt: *const c_char) -> i32 {
 }
 
 unsafe extern "C" fn drm_dev_register(_dev: *mut c_void, _flags: u64) -> i32 {
-    if crate::io::gui::install_inherited_primary_scanout_from_boot() {
-        crate::debug::info!(
+    crate::driver::symbol_events::record_drm_probe_init_symbol(
+        "drm_dev_register",
+        _dev as usize,
+        _flags,
+    );
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Driver,
+        "virtio-drm-dev-register",
+        _dev as usize as u64,
+        _flags,
+    );
+    match crate::driver::linux::virtio_gpu::ensure_primary_provider() {
+        Ok(()) => crate::debug::info!(display, "virtio-gpu: drm provider ready"),
+        Err(err) => crate::debug::warn!(
             display,
-            "virtio-gpu: inherited virtio-vga scanout registered"
-        );
+            "virtio-gpu: drm provider publish failed: {:?}",
+            err
+        ),
     }
     0
 }
 
-unsafe extern "C" fn drm_dev_unregister(_dev: *mut c_void) {}
+unsafe extern "C" fn drm_dev_unregister(_dev: *mut c_void) {
+    crate::driver::symbol_events::record_drm_probe_init_symbol(
+        "drm_dev_unregister",
+        _dev as usize,
+        0,
+    );
+}
 
 unsafe extern "C" fn drm_dev_alloc(_driver: *const c_void, _parent: *mut c_void) -> *mut c_void {
     core::ptr::null_mut()

@@ -20,6 +20,7 @@ priority = -290
 startup = "none"
 
 [autoload]
+enabled = false
 name = "virtio-gpu"
 class = "display"
 bus = "virtio"

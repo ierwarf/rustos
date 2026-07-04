@@ -200,8 +200,6 @@ impl WindowsLoadedModule {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WindowsAllocationKind {
-    #[allow(dead_code)]
-    Heap,
     Virtual,
 }
 
@@ -369,14 +367,8 @@ impl UserProcessState {
         &mut self.address_space
     }
 
-    #[allow(dead_code)]
     pub fn linux_process_state(&self) -> Option<&LinuxProcessState> {
         self.linux_process_state.as_ref()
-    }
-
-    #[allow(dead_code)]
-    pub fn linux_process_state_mut(&mut self) -> Option<&mut LinuxProcessState> {
-        self.linux_process_state.as_mut()
     }
 
     pub fn linux_memory_map(&self) -> Option<&LinuxMemoryMapState> {

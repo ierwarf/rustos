@@ -8,12 +8,18 @@ mod manager;
 mod runtime;
 mod xhci;
 
+pub use xhci::XhciInputDebugSnapshot;
+
 pub fn init() {
     manager::init();
 }
 
 pub(crate) fn service_pending() -> usize {
     manager::service_pending()
+}
+
+pub(crate) fn uses_polled_input_completion() -> bool {
+    manager::uses_polled_input_completion()
 }
 
 pub(crate) fn host_controllers_available() -> bool {
@@ -26,6 +32,10 @@ pub(crate) fn hid_interfaces_available() -> bool {
 
 pub fn debug_transfer_event_count() -> u64 {
     xhci::debug_transfer_event_count()
+}
+
+pub fn debug_input_snapshot() -> XhciInputDebugSnapshot {
+    xhci::debug_input_snapshot()
 }
 
 pub fn debug_pointer_report_count() -> u64 {
@@ -48,14 +58,6 @@ pub(crate) fn register_owned_interface(
     registration: core::UsbInterfaceRegistration<'_>,
 ) -> *mut crate::driver::linux::compat::LinuxCompatUsbInterface {
     core::register_owned_interface(registration)
-}
-
-// Hot-unplug support is staged but not yet wired into the current runtime path.
-#[allow(dead_code)]
-pub(crate) fn unregister_owned_interface(
-    interface: *mut crate::driver::linux::compat::LinuxCompatUsbInterface,
-) -> bool {
-    core::unregister_owned_interface(interface)
 }
 
 pub(crate) fn set_interface_minor(

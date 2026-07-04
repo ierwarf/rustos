@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=ABI fuzzer
+Exec=apps/abifuzz/abifuzz.elf
+OnlyShowIn=RustOS;
+Terminal=false
+X-GNOME-Autostart-enabled=true

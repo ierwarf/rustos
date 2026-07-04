@@ -5,6 +5,7 @@ use core::fmt;
 #[cfg(rustos_boot_trace_enabled)]
 use core::fmt::Write;
 use core::ptr;
+#[cfg(rustos_boot_trace_enabled)]
 use core::str;
 use core::sync::atomic::{AtomicPtr, Ordering};
 

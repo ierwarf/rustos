@@ -17,7 +17,7 @@ pub fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64
             path
         );
     }
-    if is_devmgrd_open_path(path.as_str()) {
+    if should_try_devmgrd_open(path.as_str()) {
         return match open_device_via_devmgrd(path.as_str(), flags) {
             Ok(fd) => fd,
             Err(errno) => linux_errno(errno),
@@ -56,6 +56,7 @@ pub fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64
         kind,
         handle_path,
         response.value,
+        response.aux as u16,
     ));
     match multitask::with_current_user_process_state_mut(|_, _, process_state| {
         process_state
@@ -344,12 +345,13 @@ pub fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
     let Some(remote) = current_remote_vfs_handle(fd) else {
         return linux_errno(LINUX_EBADF);
     };
-    if matches!(remote.path().as_str(), "/dev/input0" | "/dev/input/event0") {
-        let access = if remote.path().as_str() == "/dev/input/event0" {
-            INPUTD_ACCESS_EVDEV
-        } else {
-            INPUTD_ACCESS_NATIVE
-        };
+    if remote.kind() == multitask::RemoteVfsHandleKind::Device
+        && matches!(
+            remote.device_access(),
+            INPUTD_ACCESS_NATIVE | INPUTD_ACCESS_EVDEV
+        )
+    {
+        let access = remote.device_access();
         let status_flags = current_fd_status_flags(fd).unwrap_or(0);
         return read_input_device_via_inputd(fd, user_ptr, user_len, access, status_flags);
     }

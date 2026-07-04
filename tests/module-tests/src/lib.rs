@@ -1,8 +1,9 @@
 #[cfg(test)]
 mod tests {
     use boot_protocol::{
-        BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootInfo, BootMemoryKind, BootMemoryMap,
-        BootMemoryRegion, BootPixelFormat, BootVolumeIdentity, FramebufferInfo, NucleusImageInfo,
+        BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootExtentManifest, BootInfo, BootMemoryKind,
+        BootMemoryMap, BootMemoryRegion, BootPixelFormat, BootVolumeIdentity, FramebufferInfo,
+        NucleusImageInfo,
     };
     use boot_random::{Random, init as init_random};
     use core::mem::{align_of, size_of};
@@ -124,6 +125,7 @@ mod tests {
                 entry_count: memory_map.len() as u32,
                 _reserved0: 0,
             },
+            boot_extent_manifest: BootExtentManifest::empty(),
         };
 
         init_random(&boot_info);

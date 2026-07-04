@@ -91,6 +91,17 @@ impl SleepWaiterTable {
         }
         None
     }
+
+    fn remove_task(&mut self, task_id: u64) {
+        for slot in self.slots.iter_mut() {
+            if slot
+                .map(|waiter| waiter.task_id == task_id)
+                .unwrap_or(false)
+            {
+                *slot = None;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -466,6 +477,14 @@ fn register_sleep_waiter(task_id: u64, wake_tick: u64) {
             wake_tick
         );
     }
+}
+
+pub fn arm_sleep_waiter_until_tick(task_id: u64, wake_tick: u64) {
+    register_sleep_waiter(task_id, wake_tick);
+}
+
+pub fn disarm_sleep_waiter(task_id: u64) {
+    RTC_SLEEP_WAITERS.lock().remove_task(task_id);
 }
 
 fn wake_ready_sleepers(now: u64) {

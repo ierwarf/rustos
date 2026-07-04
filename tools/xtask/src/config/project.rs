@@ -25,6 +25,8 @@ const DEFAULT_KERNEL_EMBED_BITCODE: bool = false;
 const DEFAULT_KERNEL_PANIC: &str = "abort";
 const DEFAULT_KERNEL_RELOCATION_MODEL: &str = "none";
 const DEFAULT_KERNEL_STRIP: &str = "none";
+const DEFAULT_QEMU_DISPLAY_WIDTH: u32 = 1600;
+const DEFAULT_QEMU_DISPLAY_HEIGHT: u32 = 900;
 
 const PROJECT_CONFIG_ENV: &str = "RUSTOS_CONFIG";
 const KERNEL_BUILD_CONFIG_ENV: &str = "KERNEL_BUILD_CONFIG";
@@ -34,6 +36,9 @@ pub(crate) struct ProjectConfig {
     pub(crate) source: ProjectConfigSource,
     pub(crate) kernel: KernelConfig,
     pub(crate) fault_injection: FaultInjectionConfig,
+    pub(crate) fuzzing: FuzzingConfig,
+    pub(crate) lock_telemetry: LockTelemetryConfig,
+    pub(crate) qemu: QemuConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -64,6 +69,50 @@ pub(crate) struct KernelConfig {
 pub(crate) struct FaultInjectionConfig {
     pub(crate) enabled: bool,
     pub(crate) rules: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FuzzingConfig {
+    pub(crate) enabled: bool,
+    pub(crate) fd_transfer_stress: bool,
+    pub(crate) startup_delay_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct LockTelemetryConfig {
+    pub(crate) enabled: bool,
+    pub(crate) warn_wait_cycles: u64,
+    pub(crate) warn_hold_cycles: u64,
+}
+
+impl Default for LockTelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            warn_wait_cycles: 250_000,
+            warn_hold_cycles: 250_000,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct QemuConfig {
+    pub(crate) display: QemuDisplayConfig,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct QemuDisplayConfig {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
+impl Default for QemuDisplayConfig {
+    fn default() -> Self {
+        Self {
+            width: DEFAULT_QEMU_DISPLAY_WIDTH,
+            height: DEFAULT_QEMU_DISPLAY_HEIGHT,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -163,6 +212,9 @@ struct ProjectConfigFile {
     logging: Option<toml::Value>,
     kernel: KernelConfigFile,
     fault_injection: FaultInjectionConfigFile,
+    fuzzing: FuzzingConfigFile,
+    lock_telemetry: LockTelemetryConfigFile,
+    qemu: QemuConfigFile,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -198,6 +250,35 @@ struct FaultInjectionConfigFile {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+struct FuzzingConfigFile {
+    enabled: Option<bool>,
+    fd_transfer_stress: Option<bool>,
+    startup_delay_ms: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct LockTelemetryConfigFile {
+    enabled: Option<bool>,
+    warn_wait_cycles: Option<u64>,
+    warn_hold_cycles: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct QemuConfigFile {
+    display: QemuDisplayConfigFile,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct QemuDisplayConfigFile {
+    width: Option<u32>,
+    height: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 struct LegacyKernelBuildConfigFile {
     hardening: LegacyKernelHardeningConfigFile,
 }
@@ -212,12 +293,20 @@ pub(crate) fn load_project_config(root_dir: &Path) -> Result<ProjectConfig> {
     let (mut config, source) = load_project_config_file(root_dir)?;
     apply_env_overrides(&mut config.kernel.build)?;
     apply_fault_env_overrides(&mut config.fault_injection)?;
+    apply_fuzzing_env_overrides(&mut config.fuzzing)?;
+    apply_lock_telemetry_env_overrides(&mut config.lock_telemetry)?;
     validate_kernel_build(&config.kernel.build)?;
     validate_fault_injection(&config.fault_injection)?;
+    validate_fuzzing(&config.fuzzing)?;
+    validate_lock_telemetry(&config.lock_telemetry)?;
+    validate_qemu(&config.qemu)?;
     Ok(ProjectConfig {
         source,
         kernel: config.kernel,
         fault_injection: config.fault_injection,
+        fuzzing: config.fuzzing,
+        lock_telemetry: config.lock_telemetry,
+        qemu: config.qemu,
     })
 }
 
@@ -293,6 +382,9 @@ pub(crate) fn validate_project_config_text(text: &str) -> Result<()> {
     let config = project_from_file(parsed);
     validate_kernel_build(&config.kernel.build)?;
     validate_fault_injection(&config.fault_injection)?;
+    validate_fuzzing(&config.fuzzing)?;
+    validate_lock_telemetry(&config.lock_telemetry)?;
+    validate_qemu(&config.qemu)?;
     Ok(())
 }
 
@@ -367,6 +459,33 @@ fn project_from_file(file: ProjectConfigFile) -> ProjectConfig {
     if let Some(value) = fault.rules {
         config.fault_injection.rules = value;
     }
+    let fuzzing = file.fuzzing;
+    if let Some(value) = fuzzing.enabled {
+        config.fuzzing.enabled = value;
+    }
+    if let Some(value) = fuzzing.fd_transfer_stress {
+        config.fuzzing.fd_transfer_stress = value;
+    }
+    if let Some(value) = fuzzing.startup_delay_ms {
+        config.fuzzing.startup_delay_ms = value;
+    }
+    let lock_telemetry = file.lock_telemetry;
+    if let Some(value) = lock_telemetry.enabled {
+        config.lock_telemetry.enabled = value;
+    }
+    if let Some(value) = lock_telemetry.warn_wait_cycles {
+        config.lock_telemetry.warn_wait_cycles = value;
+    }
+    if let Some(value) = lock_telemetry.warn_hold_cycles {
+        config.lock_telemetry.warn_hold_cycles = value;
+    }
+    let qemu_display = file.qemu.display;
+    if let Some(value) = qemu_display.width {
+        config.qemu.display.width = value;
+    }
+    if let Some(value) = qemu_display.height {
+        config.qemu.display.height = value;
+    }
     config
 }
 
@@ -376,6 +495,9 @@ impl Default for ProjectConfig {
             source: ProjectConfigSource::BuiltInDefaults,
             kernel: KernelConfig::default(),
             fault_injection: FaultInjectionConfig::default(),
+            fuzzing: FuzzingConfig::default(),
+            lock_telemetry: LockTelemetryConfig::default(),
+            qemu: QemuConfig::default(),
         }
     }
 }
@@ -442,9 +564,43 @@ fn apply_fault_env_overrides(fault: &mut FaultInjectionConfig) -> Result<()> {
     Ok(())
 }
 
+fn apply_fuzzing_env_overrides(fuzzing: &mut FuzzingConfig) -> Result<()> {
+    if let Some(value) = env_string("RUSTOS_FUZZING") {
+        fuzzing.enabled = parse_bool_env("RUSTOS_FUZZING", &value)?;
+    }
+    if let Some(value) = env_string("RUSTOS_FUZZ_FD_TRANSFER_STRESS") {
+        fuzzing.fd_transfer_stress = parse_bool_env("RUSTOS_FUZZ_FD_TRANSFER_STRESS", &value)?;
+    }
+    if let Some(value) = env_string("RUSTOS_FUZZ_STARTUP_DELAY_MS") {
+        fuzzing.startup_delay_ms = parse_u64_env("RUSTOS_FUZZ_STARTUP_DELAY_MS", &value)?;
+    }
+    Ok(())
+}
+
+fn apply_lock_telemetry_env_overrides(lock_telemetry: &mut LockTelemetryConfig) -> Result<()> {
+    if let Some(value) = env_string("RUSTOS_LOCK_TELEMETRY") {
+        lock_telemetry.enabled = parse_bool_env("RUSTOS_LOCK_TELEMETRY", &value)?;
+    }
+    if let Some(value) = env_string("RUSTOS_LOCK_TELEMETRY_WARN_WAIT_CYCLES") {
+        lock_telemetry.warn_wait_cycles =
+            parse_u64_env("RUSTOS_LOCK_TELEMETRY_WARN_WAIT_CYCLES", &value)?;
+    }
+    if let Some(value) = env_string("RUSTOS_LOCK_TELEMETRY_WARN_HOLD_CYCLES") {
+        lock_telemetry.warn_hold_cycles =
+            parse_u64_env("RUSTOS_LOCK_TELEMETRY_WARN_HOLD_CYCLES", &value)?;
+    }
+    Ok(())
+}
+
 fn parse_u16_env(name: &str, value: &str) -> Result<u16> {
     value
         .parse::<u16>()
+        .map_err(|err| anyhow!("invalid {name}={value:?}: {err}"))
+}
+
+fn parse_u64_env(name: &str, value: &str) -> Result<u64> {
+    value
+        .parse::<u64>()
         .map_err(|err| anyhow!("invalid {name}={value:?}: {err}"))
 }
 
@@ -517,9 +673,47 @@ fn validate_fault_injection(fault: &FaultInjectionConfig) -> Result<()> {
     Ok(())
 }
 
+fn validate_fuzzing(fuzzing: &FuzzingConfig) -> Result<()> {
+    if fuzzing.startup_delay_ms > 60_000 {
+        bail!(
+            "fuzzing.startup_delay_ms must be <= 60000, got {}",
+            fuzzing.startup_delay_ms
+        );
+    }
+    Ok(())
+}
+
+fn validate_lock_telemetry(lock_telemetry: &LockTelemetryConfig) -> Result<()> {
+    if lock_telemetry.enabled
+        && (lock_telemetry.warn_wait_cycles == 0 || lock_telemetry.warn_hold_cycles == 0)
+    {
+        bail!("lock_telemetry thresholds must be non-zero when enabled");
+    }
+    Ok(())
+}
+
+fn validate_qemu(qemu: &QemuConfig) -> Result<()> {
+    if !(320..=8192).contains(&qemu.display.width) {
+        bail!(
+            "qemu.display.width must be in 320..=8192, got {}",
+            qemu.display.width
+        );
+    }
+    if !(200..=8192).contains(&qemu.display.height) {
+        bail!(
+            "qemu.display.height must be in 200..=8192, got {}",
+            qemu.display.height
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn effective_config_toml(config: &ProjectConfig) -> String {
     let build = &config.kernel.build;
     let fault = &config.fault_injection;
+    let fuzzing = &config.fuzzing;
+    let lock_telemetry = &config.lock_telemetry;
+    let qemu = &config.qemu;
     let extra = build
         .extra_rustflags
         .iter()
@@ -533,7 +727,7 @@ pub(crate) fn effective_config_toml(config: &ProjectConfig) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "# source: {}\n[kernel.build]\ncodegen_units = {}\nopt_level = {:?}\noverflow_checks = {}\ndebug_assertions = {}\nlto = {:?}\nforce_frame_pointers = {}\nincremental = {}\ndebuginfo = {:?}\nembed_bitcode = {}\npanic = {:?}\nrelocation_model = {:?}\nstrip = {:?}\nextra_rustflags = [{}]\n\n[fault_injection]\nenabled = {}\nrules = [{}]\n",
+        "# source: {}\n[kernel.build]\ncodegen_units = {}\nopt_level = {:?}\noverflow_checks = {}\ndebug_assertions = {}\nlto = {:?}\nforce_frame_pointers = {}\nincremental = {}\ndebuginfo = {:?}\nembed_bitcode = {}\npanic = {:?}\nrelocation_model = {:?}\nstrip = {:?}\nextra_rustflags = [{}]\n\n[fault_injection]\nenabled = {}\nrules = [{}]\n\n[fuzzing]\nenabled = {}\nfd_transfer_stress = {}\nstartup_delay_ms = {}\n\n[lock_telemetry]\nenabled = {}\nwarn_wait_cycles = {}\nwarn_hold_cycles = {}\n\n[qemu.display]\nwidth = {}\nheight = {}\n",
         config.source.label(),
         build.codegen_units,
         build.opt_level,
@@ -550,5 +744,13 @@ pub(crate) fn effective_config_toml(config: &ProjectConfig) -> String {
         extra,
         fault.enabled,
         fault_rules,
+        fuzzing.enabled,
+        fuzzing.fd_transfer_stress,
+        fuzzing.startup_delay_ms,
+        lock_telemetry.enabled,
+        lock_telemetry.warn_wait_cycles,
+        lock_telemetry.warn_hold_cycles,
+        qemu.display.width,
+        qemu.display.height,
     )
 }

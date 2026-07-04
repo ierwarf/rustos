@@ -10,8 +10,6 @@ use x86_64::instructions::{interrupts, port::Port};
 
 const KEYBOARD_IRQ: u8 = 1;
 const MOUSE_IRQ: u8 = 12;
-#[allow(dead_code)]
-const RTC_TIMER_IRQ: u8 = 8;
 const DATA_PORT: u16 = 0x60;
 const STATUS_PORT: u16 = 0x64;
 const STATUS_OUTPUT_READY: u8 = 1 << 0;
@@ -21,8 +19,8 @@ const STATUS_AUX_OUTPUT: u8 = 1 << 5;
 // busy-wait budgets here stall the whole machine during failed psmouse probe
 // sequences because controller access is serialized and temporarily
 // non-preemptible.
-const I8042_IO_TIMEOUT_SPINS: usize = 256;
-const I8042_PORT_TEST_TIMEOUT_SPINS: usize = 256;
+const I8042_IO_TIMEOUT_SPINS: usize = 128;
+const I8042_PORT_TEST_TIMEOUT_SPINS: usize = 128;
 const I8042_DRAIN_TIMEOUT_SPINS_PER_MS: usize = 10_000;
 const I8042_DRAIN_LIMIT: usize = 256;
 const I8042_READ_CONFIG: u8 = 0x20;
@@ -332,21 +330,6 @@ fn second_port_test() -> bool {
     )
 }
 
-#[allow(dead_code)]
-fn serio_write_keyboard_byte(byte: u8) -> i32 {
-    with_controller_access(|| if write_data_byte(byte) { 0 } else { -110 })
-}
-
-#[allow(dead_code)]
-fn serio_keyboard_ps2_command(command: u8, data: &[u8], response: &mut [u8]) -> i32 {
-    with_controller_access(
-        || match send_keyboard_command_sequence(command, data, response) {
-            Ok(()) => 0,
-            Err(status) => status,
-        },
-    )
-}
-
 fn open_aux_port() -> i32 {
     let status = with_controller_access(|| {
         if AUX_TRANSPORT_ACTIVE.load(Ordering::Acquire) {
@@ -368,12 +351,12 @@ fn open_aux_port() -> i32 {
         // Keep unsolicited bytes away from the serio receiver until the port
         // is fully configured and drained.
         drain_output_buffer();
-        crate::driver::input::reset_pointer_state();
-        crate::driver::input::submit_ps2_mouse_reset();
         AUX_TRANSPORT_ACTIVE.store(true, Ordering::Release);
         0
     });
     if status == 0 {
+        crate::driver::input::reset_pointer_state();
+        crate::driver::input::submit_ps2_mouse_reset();
         crate::arch::pic::enable_irq(MOUSE_IRQ);
     }
     status
@@ -387,31 +370,6 @@ fn with_controller_access<T>(f: impl FnOnce() -> T) -> T {
         CONTROLLER_ACCESS_ACTIVE.store(false, Ordering::Release);
         result
     })
-}
-
-#[allow(dead_code)]
-fn send_keyboard_command_sequence(
-    command: u8,
-    data: &[u8],
-    response: &mut [u8],
-) -> Result<(), i32> {
-    send_keyboard_byte_and_expect_ack(command)?;
-    for byte in data.iter().copied() {
-        send_keyboard_byte_and_expect_ack(byte)?;
-    }
-    for (index, slot) in response.iter_mut().enumerate() {
-        match read_keyboard_response_byte() {
-            Ok(value) => *slot = value,
-            Err(_status) if command == PS2_CMD_GETID && index != 0 => {
-                for tail in &mut response[index..] {
-                    *tail = 0;
-                }
-                return Ok(());
-            }
-            Err(status) => return Err(status),
-        }
-    }
-    Ok(())
 }
 
 fn send_aux_command_sequence(command: u8, data: &[u8], response: &mut [u8]) -> Result<(), i32> {
@@ -435,25 +393,6 @@ fn send_aux_command_sequence(command: u8, data: &[u8], response: &mut [u8]) -> R
     Ok(())
 }
 
-#[allow(dead_code)]
-fn send_keyboard_byte_and_expect_ack(byte: u8) -> Result<(), i32> {
-    for _ in 0..DEVICE_SEND_RETRIES {
-        if !write_data_byte(byte) {
-            return Err(-110);
-        }
-        for _ in 0..DEVICE_RESPONSE_READ_RETRIES {
-            match read_keyboard_data_byte_blocking() {
-                Some(DEVICE_RESPONSE_ACK) => return Ok(()),
-                Some(DEVICE_RESPONSE_RESEND) => break,
-                Some(value) if is_ignorable_command_response(value) => continue,
-                Some(_) => return Err(-5),
-                None => return Err(-110),
-            }
-        }
-    }
-    Err(-5)
-}
-
 fn send_aux_byte_and_expect_ack(byte: u8) -> Result<(), i32> {
     for _ in 0..DEVICE_SEND_RETRIES {
         if !write_second_port_data_byte(byte) {
@@ -475,18 +414,6 @@ fn send_aux_byte_and_expect_ack(byte: u8) -> Result<(), i32> {
         }
     }
     Err(-5)
-}
-
-#[allow(dead_code)]
-fn read_keyboard_response_byte() -> Result<u8, i32> {
-    for _ in 0..DEVICE_RESPONSE_READ_RETRIES {
-        match read_keyboard_data_byte_blocking() {
-            Some(value) if is_ignorable_command_response(value) => continue,
-            Some(value) => return Ok(value),
-            None => return Err(-110),
-        }
-    }
-    Err(-110)
 }
 
 fn read_aux_response_byte() -> Result<u8, i32> {

@@ -28,6 +28,12 @@ pub(crate) fn start_desktop_background_loader(
 ) -> Receiver<DesktopBackground> {
     let (sender, receiver) = mpsc::sync_channel(1);
     thread::spawn(move || {
+        let fast_pixels = build_fast_desktop_background(width, height);
+        let _ = sender.send(DesktopBackground {
+            width,
+            height,
+            pixels: fast_pixels,
+        });
         let pixels = build_desktop_background(width, height);
         let _ = sender.send(DesktopBackground {
             width,
@@ -36,6 +42,17 @@ pub(crate) fn start_desktop_background_loader(
         });
     });
     receiver
+}
+
+fn build_fast_desktop_background(width: usize, height: usize) -> Vec<u32> {
+    let mut pixels = vec![0; width.saturating_mul(height)];
+    if pixels.is_empty() {
+        return pixels;
+    }
+
+    let mut canvas = SurfaceCanvas::new(pixels.as_mut_slice(), width as u32, height as u32, width);
+    paint_sky_gradient(&mut canvas, width, height);
+    pixels
 }
 
 pub(crate) fn build_desktop_background(width: usize, height: usize) -> Vec<u32> {

@@ -772,6 +772,7 @@ impl VfsState {
                 response.remote_id = id;
                 response.handle_kind = handle_kind_u16(handle.kind);
                 response.value = handle.len;
+                response.aux = device_access_for_path(handle.path.as_str());
                 write_vfs_payload_bytes(response, handle.path.as_bytes());
             }
             Err(errno) => response.status = errno,
@@ -1431,6 +1432,14 @@ impl DirEntry {
 
 fn is_input_device_node(path: &str) -> bool {
     matches!(path, "/dev/input0" | "/dev/input/event0")
+}
+
+fn device_access_for_path(path: &str) -> u64 {
+    match path {
+        "/dev/input0" => rustos_user_abi::syscall::INPUTD_ACCESS_NATIVE as u64,
+        "/dev/input/event0" => rustos_user_abi::syscall::INPUTD_ACCESS_EVDEV as u64,
+        _ => 0,
+    }
 }
 
 #[cfg(test)]

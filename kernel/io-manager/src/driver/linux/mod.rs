@@ -21,6 +21,7 @@ pub mod skbuff;
 pub mod usb;
 pub mod virtio;
 pub mod virtio_drm;
+pub(crate) mod virtio_gpu;
 pub mod workqueue;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

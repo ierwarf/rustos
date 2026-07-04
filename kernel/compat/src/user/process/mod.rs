@@ -55,7 +55,6 @@ impl From<multitask::SpawnTaskError> for ProcessLoadError {
 }
 
 impl ProcessLoadError {
-    #[allow(dead_code)]
     pub fn summary(&self) -> &'static str {
         match self {
             Self::InvalidElf(reason) => reason,
@@ -133,13 +132,8 @@ pub struct LoadedProcessImage {
     runtime: LoadedProcessRuntime,
 }
 
-// Spawn metadata stays richer than current call sites so loader/runtime APIs can grow without
-// reshaping this return type.
-#[allow(dead_code)]
 pub struct SpawnedProcess {
-    pub abi: UserAbi,
     pub pid: u64,
-    pub entry: VirtAddr,
 }
 
 pub struct PreparedProcessImage {
@@ -305,11 +299,7 @@ pub fn spawn_prepared_process(
     let pid =
         multitask::spawn_user_process(prepared.address_space, prepared.bootstrap, weight_micros)?;
 
-    Ok(SpawnedProcess {
-        abi: prepared.abi,
-        pid,
-        entry: prepared.entry,
-    })
+    Ok(SpawnedProcess { pid })
 }
 
 fn prepare_loaded_process_with_launch(

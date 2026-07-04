@@ -12,6 +12,12 @@ pub(crate) unsafe extern "C" fn request_threaded_irq(
     _name: *const c_char,
     dev_id: *mut c_void,
 ) -> i32 {
+    crate::driver::symbol_events::record_irq_symbol(
+        "request_threaded_irq",
+        dev_id as usize,
+        irq,
+        flags,
+    );
     crate::driver::irq::request_threaded_irq(irq, handler, thread_fn, flags, dev_id)
 }
 
@@ -22,10 +28,17 @@ pub(crate) unsafe extern "C" fn request_any_context_irq(
     _name: *const c_char,
     dev_id: *mut c_void,
 ) -> i32 {
+    crate::driver::symbol_events::record_irq_symbol(
+        "request_any_context_irq",
+        dev_id as usize,
+        irq,
+        flags,
+    );
     crate::driver::irq::request_any_context_irq(irq, handler, flags, dev_id)
 }
 
 pub(crate) unsafe extern "C" fn free_irq(irq: u32, dev_id: *mut c_void) -> *const c_void {
+    crate::driver::symbol_events::record_irq_symbol("free_irq", dev_id as usize, irq, 0);
     crate::driver::irq::free_irq(irq, dev_id)
 }
 
@@ -38,6 +51,12 @@ pub(crate) unsafe extern "C" fn devm_request_threaded_irq(
     name: *const c_char,
     dev_id: *mut c_void,
 ) -> i32 {
+    crate::driver::symbol_events::record_irq_symbol(
+        "devm_request_threaded_irq",
+        dev as usize,
+        irq,
+        flags,
+    );
     let status = unsafe { request_threaded_irq(irq, handler, thread_fn, flags, name, dev_id) };
     if status == 0 {
         crate::driver::devres::register_irq(dev, irq, dev_id);
@@ -46,6 +65,7 @@ pub(crate) unsafe extern "C" fn devm_request_threaded_irq(
 }
 
 pub(crate) unsafe extern "C" fn devm_free_irq(dev: *mut c_void, irq: u32, dev_id: *mut c_void) {
+    crate::driver::symbol_events::record_irq_symbol("devm_free_irq", dev as usize, irq, 0);
     crate::driver::devres::forget_irq(dev, irq, dev_id);
     let _ = crate::driver::irq::free_irq(irq, dev_id);
 }

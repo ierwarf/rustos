@@ -44,6 +44,26 @@ rules = [
     "virtio-gpu.control.submit=off",
 ]
 
+[fuzzing]
+# Disabled by default so normal UI smoke boots are not perturbed by ABI fuzzers.
+# Set enabled=true to autostart apps/abifuzz after wayclick has launched.
+enabled = false
+fd_transfer_stress = false
+startup_delay_ms = 1500
+
+[lock_telemetry]
+# Disabled by default because lock timing warnings add overhead and can be noisy.
+# Enable for hardening runs to surface hidden contention and long critical sections.
+enabled = false
+warn_wait_cycles = 250000
+warn_hold_cycles = 250000
+
+[qemu.display]
+# Default virtual display mode for xtask QEMU runs. Override this instead of
+# patching tools/xtask when testing alternate UI geometries.
+width = 1600
+height = 900
+
 [kernel.build]
 # Hardened/release-oriented kernel build knobs. Copy this block, or this whole
 # file, into config/rustos.toml when testing a release-shaped image.

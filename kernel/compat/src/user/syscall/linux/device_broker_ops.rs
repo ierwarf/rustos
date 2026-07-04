@@ -1,5 +1,7 @@
 use super::*;
 
+use core::mem::size_of;
+
 use crate::user::sysops::device::{self, DeviceSysopError};
 use kernel_object::api::device::DeviceAccessKind;
 use kernel_object::api::handle::{DeviceHandleRights, HandleRights};
@@ -7,8 +9,10 @@ use rustos_user_abi::syscall::{
     DEVMGRD_DEVICE_ACCESS_EVDEV, DEVMGRD_DEVICE_ACCESS_NATIVE, DEVMGRD_DEVICE_ID_CONSOLE,
     DEVMGRD_DEVICE_ID_DISPLAY, DEVMGRD_DEVICE_ID_INPUT, DEVMGRD_DEVICE_RIGHT_ADMIN,
     DEVMGRD_DEVICE_RIGHT_IOCTL, DEVMGRD_DEVICE_RIGHT_MAP, DEVMGRD_DEVICE_RIGHT_READ,
-    DEVMGRD_DEVICE_RIGHT_TRANSFER, DEVMGRD_DEVICE_RIGHT_WRITE, IPC_SERVICE_CAP_DEVICE_POLICY,
-    IPC_SERVICE_CAP_SESSION_POLICY, RustosDeviceIoctlBrokerArgs, RustosDeviceOpenBrokerArgs,
+    DEVMGRD_DEVICE_RIGHT_TRANSFER, DEVMGRD_DEVICE_RIGHT_WRITE, DEVMGRD_IOCTL_ROUTE_SESSIOND_COMMIT,
+    DEVMGRD_IPC_ABI_VERSION, DEVMGRD_IPC_OP_IOCTL_ROUTE, DevmgrdDeviceIoctlRequest,
+    DevmgrdDeviceIoctlResponse, IPC_SERVICE_CAP_DEVICE_POLICY, IPC_SERVICE_CAP_SESSION_POLICY,
+    IPC_SERVICE_DEVMGRD, RustosDeviceIoctlBrokerArgs, RustosDeviceOpenBrokerArgs,
 };
 
 pub(super) fn syscall_linux_rustos_device_open_broker(args_ptr: u64) -> u64 {
@@ -91,15 +95,49 @@ pub(super) fn syscall_linux_rustos_device_ioctl_broker(args_ptr: u64) -> u64 {
 // session ioctl commit policy. Ring0 keeps capability-gated native ioctl commit
 // substrate.
 fn session_policy_device_ioctl_allowed(args: &RustosDeviceIoctlBrokerArgs) -> bool {
-    (args.process_id == 0
-        || multitask::current_user_process_id().is_some_and(|pid| pid == args.process_id))
-        && matches!(
-            args.request,
-            rustos_user_abi::console::CONSOLE_IOCTL_CREATE_SESSION
-                | rustos_user_abi::console::CONSOLE_IOCTL_CLOSE_SESSION
-                | rustos_user_abi::console::CONSOLE_IOCTL_SET_SESSION_STATE
-                | rustos_user_abi::console::CONSOLE_IOCTL_SET_FOCUS
-        )
+    if args.process_id != 0
+        && !multitask::current_user_process_id().is_some_and(|pid| pid == args.process_id)
+    {
+        return false;
+    }
+    match session_ioctl_route_via_devmgrd(args.request) {
+        Ok(route) => route == DEVMGRD_IOCTL_ROUTE_SESSIOND_COMMIT,
+        Err(_) => false,
+    }
+}
+
+fn session_ioctl_route_via_devmgrd(request_number: u64) -> Result<u64, i64> {
+    let mut request = DevmgrdDeviceIoctlRequest {
+        version: DEVMGRD_IPC_ABI_VERSION,
+        op: DEVMGRD_IPC_OP_IOCTL_ROUTE,
+        request: request_number,
+        ..DevmgrdDeviceIoctlRequest::default()
+    };
+    if let Some(snapshot) = multitask::current_user_snapshot() {
+        request.pid = snapshot.process_id();
+        request.tid = snapshot.thread_id();
+        request.session_handle = snapshot.console_session().raw();
+    }
+    if request.pid == 0 || request.tid == 0 {
+        return Err(LINUX_EINVAL);
+    }
+    let response = ipc_ops::call_service_endpoint(IPC_SERVICE_DEVMGRD, as_bytes(&request))?;
+    if response.len() != size_of::<DevmgrdDeviceIoctlResponse>() {
+        return Err(LINUX_EINVAL);
+    }
+    let response = read_unaligned::<DevmgrdDeviceIoctlResponse>(response.as_slice());
+    if response.version != DEVMGRD_IPC_ABI_VERSION
+        || response.op != DEVMGRD_IPC_OP_IOCTL_ROUTE
+        || response.payload_len != 0
+        || response.reserved1 != 0
+        || response.reserved0 != 0
+    {
+        return Err(LINUX_EINVAL);
+    }
+    if response.status != 0 {
+        return Err(response.status.unsigned_abs() as i64);
+    }
+    Ok(response.value)
 }
 // RING3-MIGRATION-REFERENCE END: sessiond-owned ioctl commit substrate exception.
 

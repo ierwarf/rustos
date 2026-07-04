@@ -6,11 +6,11 @@ use x86_64::instructions::interrupts;
 
 const PIC_IRQ_COUNT: usize = 16;
 const PENDING_THREADED_IRQ_CAPACITY: usize = 64;
-const IRQF_SHARED: u64 = 0x0000_0080;
+pub(crate) const IRQF_SHARED: u64 = 0x0000_0080;
 const IRQF_NO_AUTOEN: u64 = 0x0008_0000;
 const IRQ_NOTCONNECTED: u32 = 1_u32 << 31;
 
-const IRQ_HANDLED: i32 = 1;
+pub(crate) const IRQ_HANDLED: i32 = 1;
 const IRQ_WAKE_THREAD: i32 = 2;
 
 pub(crate) type LinuxIrqHandler = unsafe extern "C" fn(irq: i32, dev_id: *mut c_void) -> i32;

@@ -22,6 +22,7 @@ const MAX_PENDING_TRANSFER_OBJECTS: usize = 1024;
 const SLOW_IPC_THRESHOLD_MS: u64 = 10;
 const MAX_SLOW_IPC_LOGS: usize = 20;
 const EARLY_IPC_SAMPLE_COUNT: usize = 6;
+const SERVICE_IPC_TIMEOUT_MS: u64 = 30_000;
 // RING3-MIGRATION-REFERENCE START: rootd should own service namespace endpoint
 // ownership and capability leases. Ring0 keeps the temporary service registry
 // table until rootd can mint narrow broker capabilities.
@@ -48,6 +49,7 @@ pub(super) fn is_linux_rustos_ipc_syscall(syscall_number: u64) -> bool {
             | linux_abi::SYS_RUSTOS_IPC_CALL
             | linux_abi::SYS_RUSTOS_IPC_RECV
             | linux_abi::SYS_RUSTOS_IPC_TRY_RECV
+            | linux_abi::SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER
             | linux_abi::SYS_RUSTOS_IPC_REPLY
             | linux_abi::SYS_RUSTOS_IPC_CALL_WITH_HANDLES
             | linux_abi::SYS_RUSTOS_IPC_RECV_WITH_HANDLES
@@ -77,6 +79,11 @@ pub(super) fn dispatch_linux_rustos_ipc_syscall(frame: &SyscallFrame) -> u64 {
         }
         linux_abi::SYS_RUSTOS_IPC_TRY_RECV => {
             syscall_linux_rustos_ipc_try_recv(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+        }
+        linux_abi::SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER => {
+            syscall_linux_rustos_ipc_try_recv_with_sender(
+                frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
+            )
         }
         linux_abi::SYS_RUSTOS_IPC_REPLY => {
             syscall_linux_rustos_ipc_reply(frame.rdi, frame.rsi, frame.rdx)
@@ -161,6 +168,12 @@ pub(super) fn current_process_has_service_capability(capability: u64) -> bool {
         })
 }
 
+fn current_process_can_lookup_service_endpoint() -> bool {
+    current_process_has_service_capability(
+        rustos_user_abi::syscall::IPC_SERVICE_CAP_ROOT_SUPERVISOR,
+    )
+}
+
 fn service_endpoint_raw(service_id: u64) -> Option<u64> {
     service_index(service_id).map(|index| SERVICE_ENDPOINTS[index].load(Ordering::Acquire))
 }
@@ -204,21 +217,23 @@ pub(super) fn syscall_linux_rustos_ipc_register_linux_syscall_endpoint(endpoint:
         process_id,
         endpoint
     );
+    let capability = match service_capability(linux_abi::IPC_SERVICE_LINUX_SYSCALLD) {
+        Ok(capability) => capability,
+        Err(errno) => return linux_errno(errno),
+    };
     LINUX_SYSCALL_ENDPOINT.store(endpoint, Ordering::Release);
     SERVICE_ENDPOINTS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
         .store(endpoint, Ordering::Release);
     SERVICE_ENDPOINT_OWNERS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
         .store(process_id, Ordering::Release);
-    SERVICE_ENDPOINT_CAPS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize].store(
-        rustos_user_abi::syscall::IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY,
-        Ordering::Release,
-    );
+    SERVICE_ENDPOINT_CAPS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
+        .store(capability, Ordering::Release);
     ipc_trace!(
         "ipc service registered: service={} endpoint={} owner={} caps={:#x}",
         linux_abi::IPC_SERVICE_LINUX_SYSCALLD,
         endpoint,
         process_id,
-        rustos_user_abi::syscall::IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY
+        capability
     );
     0
 }
@@ -249,10 +264,10 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
     if SERVICE_ENDPOINTS[index].load(Ordering::Acquire) != 0 {
         return linux_errno(LINUX_EBUSY);
     }
-    let capability = service_capability(service_id);
-    if capability == 0 {
-        return linux_errno(LINUX_EINVAL);
-    }
+    let capability = match service_capability(service_id) {
+        Ok(capability) => capability,
+        Err(errno) => return linux_errno(errno),
+    };
     SERVICE_ENDPOINTS[index].store(endpoint, Ordering::Release);
     SERVICE_ENDPOINT_OWNERS[index].store(process_id, Ordering::Release);
     SERVICE_ENDPOINT_CAPS[index].store(capability, Ordering::Release);
@@ -266,35 +281,58 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
     0
 }
 
-fn service_capability(service_id: u64) -> u64 {
-    match service_id {
-        linux_abi::IPC_SERVICE_LINUX_SYSCALLD => {
-            rustos_user_abi::syscall::IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY
+fn service_capability(service_id: u64) -> Result<u64, i64> {
+    match service_capability_via_rootd(service_id) {
+        Ok(capability) => Ok(capability),
+        Err(_) if service_id == linux_abi::IPC_SERVICE_ROOTD => {
+            Ok(rustos_user_abi::syscall::IPC_SERVICE_CAP_ROOT_SUPERVISOR
+                | rustos_user_abi::syscall::IPC_SERVICE_CAP_PROCESS_POLICY)
         }
-        linux_abi::IPC_SERVICE_VFSD => rustos_user_abi::syscall::IPC_SERVICE_CAP_VFS_POLICY,
-        linux_abi::IPC_SERVICE_NETD => rustos_user_abi::syscall::IPC_SERVICE_CAP_NET_POLICY,
-        linux_abi::IPC_SERVICE_DEVMGRD => rustos_user_abi::syscall::IPC_SERVICE_CAP_DEVICE_POLICY,
-        linux_abi::IPC_SERVICE_DRIVERD => rustos_user_abi::syscall::IPC_SERVICE_CAP_DRIVER_POLICY,
-        linux_abi::IPC_SERVICE_LOADERD => rustos_user_abi::syscall::IPC_SERVICE_CAP_PROCESS_LOADER,
-        linux_abi::IPC_SERVICE_STORAGED => rustos_user_abi::syscall::IPC_SERVICE_CAP_STORAGE_POLICY,
-        linux_abi::IPC_SERVICE_INPUTD => rustos_user_abi::syscall::IPC_SERVICE_CAP_INPUT_POLICY,
-        linux_abi::IPC_SERVICE_PROCD => rustos_user_abi::syscall::IPC_SERVICE_CAP_PROCESS_POLICY,
-        linux_abi::IPC_SERVICE_ROOTD => {
-            rustos_user_abi::syscall::IPC_SERVICE_CAP_ROOT_SUPERVISOR
-                | rustos_user_abi::syscall::IPC_SERVICE_CAP_PROCESS_POLICY
-        }
-        linux_abi::IPC_SERVICE_SESSIOND => rustos_user_abi::syscall::IPC_SERVICE_CAP_SESSION_POLICY,
-        linux_abi::IPC_SERVICE_PAGERD => rustos_user_abi::syscall::IPC_SERVICE_CAP_PAGER_POLICY,
-        linux_abi::IPC_SERVICE_SERVICE_DRIVERD => {
-            rustos_user_abi::syscall::IPC_SERVICE_CAP_SERVICE_DRIVER_POLICY
-        }
-        linux_abi::IPC_SERVICE_UISERVER => rustos_user_abi::syscall::IPC_SERVICE_CAP_UI_POLICY,
-        _ => 0,
+        Err(errno) => Err(errno),
     }
+}
+
+fn service_capability_via_rootd(service_id: u64) -> Result<u64, i64> {
+    let mut request = CommercialMaxProtocolRequest::default();
+    request.header.version = rustos_user_abi::syscall::COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    request.header.protocol = rustos_user_abi::syscall::COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR;
+    request.header.op = rustos_user_abi::syscall::COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY;
+    let Some(snapshot) = multitask::current_user_snapshot() else {
+        return Err(LINUX_EINVAL);
+    };
+    request.header.subject_pid = snapshot.process_id();
+    request.header.subject_tid = snapshot.thread_id();
+    request.arg0 = service_id;
+    let response = call_service_endpoint(linux_abi::IPC_SERVICE_ROOTD, as_bytes(&request))?;
+    if response.len() != size_of::<CommercialMaxProtocolResponse>() {
+        return Err(LINUX_EINVAL);
+    }
+    let response = read_unaligned::<CommercialMaxProtocolResponse>(response.as_slice());
+    if response.header.version != rustos_user_abi::syscall::COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
+        || response.header.protocol
+            != rustos_user_abi::syscall::COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR
+        || response.header.op
+            != rustos_user_abi::syscall::COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY
+        || response.payload_len != 0
+    {
+        return Err(LINUX_EINVAL);
+    }
+    if response.status != 0 {
+        return Err(response.status.unsigned_abs() as i64);
+    }
+    if response.value0 == 0 {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(response.value0)
 }
 
 pub(super) fn syscall_linux_rustos_ipc_lookup_service_endpoint(service_id: u64) -> u64 {
     ipc_trace!("ipc lookup service endpoint: service={}", service_id);
+    if !current_process_can_lookup_service_endpoint() {
+        if let Err(errno) = authorize_service_lookup_via_rootd(service_id) {
+            return linux_errno(errno);
+        }
+    }
     let Some(raw) = service_endpoint_raw(service_id) else {
         return linux_errno(LINUX_EINVAL);
     };
@@ -302,6 +340,36 @@ pub(super) fn syscall_linux_rustos_ipc_lookup_service_endpoint(service_id: u64) 
         return linux_errno(LINUX_ENOSYS);
     }
     raw
+}
+
+fn authorize_service_lookup_via_rootd(service_id: u64) -> Result<(), i64> {
+    let mut request = CommercialMaxProtocolRequest::default();
+    request.header.version = rustos_user_abi::syscall::COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    request.header.protocol = rustos_user_abi::syscall::COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR;
+    request.header.op = rustos_user_abi::syscall::COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP;
+    let Some(snapshot) = multitask::current_user_snapshot() else {
+        return Err(LINUX_EINVAL);
+    };
+    request.header.subject_pid = snapshot.process_id();
+    request.header.subject_tid = snapshot.thread_id();
+    request.arg0 = service_id;
+    let response = call_service_endpoint(linux_abi::IPC_SERVICE_ROOTD, as_bytes(&request))?;
+    if response.len() != size_of::<CommercialMaxProtocolResponse>() {
+        return Err(LINUX_EINVAL);
+    }
+    let response = read_unaligned::<CommercialMaxProtocolResponse>(response.as_slice());
+    if response.header.version != rustos_user_abi::syscall::COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
+        || response.header.protocol
+            != rustos_user_abi::syscall::COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR
+        || response.header.op != rustos_user_abi::syscall::COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP
+        || response.payload_len != 0
+    {
+        return Err(LINUX_EINVAL);
+    }
+    if response.status != 0 {
+        return Err(response.status.unsigned_abs() as i64);
+    }
+    Ok(())
 }
 // RING3-MIGRATION-REFERENCE END: rootd-owned service registration and capability policy.
 
@@ -468,6 +536,30 @@ pub(super) fn syscall_linux_rustos_ipc_try_recv(
         .map_or_else(linux_errno, |received| received as u64)
 }
 
+pub(super) fn syscall_linux_rustos_ipc_try_recv_with_sender(
+    endpoint: u64,
+    request_ptr: u64,
+    request_capacity: u64,
+    reply_cap_ptr: u64,
+    sender_pid_ptr: u64,
+    sender_tid_ptr: u64,
+) -> u64 {
+    if !current_process_has_service_capability(
+        rustos_user_abi::syscall::IPC_SERVICE_CAP_ROOT_SUPERVISOR,
+    ) {
+        return linux_errno(LINUX_EPERM);
+    }
+    recv_endpoint_once_with_sender(
+        endpoint,
+        request_ptr,
+        request_capacity,
+        reply_cap_ptr,
+        sender_pid_ptr,
+        sender_tid_ptr,
+    )
+    .map_or_else(linux_errno, |received| received as u64)
+}
+
 fn recv_endpoint_once(
     endpoint: u64,
     request_ptr: u64,
@@ -483,6 +575,55 @@ fn recv_endpoint_once(
                     .map_err(address_space_error_to_linux_errno)?;
             }
             usermem::write_current_user_bytes(reply_cap_ptr, &reply.raw().to_ne_bytes())
+                .map_err(address_space_error_to_linux_errno)?;
+            Ok(request.len())
+        }
+        Ok(None) => Err(LINUX_EAGAIN),
+        Err(err) => Err(ipc_error_to_linux_errno(err)),
+    }
+}
+
+fn recv_endpoint_once_with_sender(
+    endpoint: u64,
+    request_ptr: u64,
+    request_capacity: u64,
+    reply_cap_ptr: u64,
+    sender_pid_ptr: u64,
+    sender_tid_ptr: u64,
+) -> Result<usize, i64> {
+    let endpoint = KernelEndpointHandle::from_raw(endpoint);
+    let request_capacity = usize::try_from(request_capacity).map_err(|_| LINUX_EINVAL)?;
+    if request_capacity > rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES {
+        return Err(LINUX_EINVAL);
+    }
+    if request_capacity > 0 {
+        usermem::validate_current_user_write_buffer(request_ptr, request_capacity)
+            .map_err(address_space_error_to_linux_errno)?;
+    }
+    usermem::validate_current_user_write_buffer(reply_cap_ptr, size_of::<u64>())
+        .map_err(address_space_error_to_linux_errno)?;
+    usermem::validate_current_user_write_buffer(sender_pid_ptr, size_of::<u64>())
+        .map_err(address_space_error_to_linux_errno)?;
+    usermem::validate_current_user_write_buffer(sender_tid_ptr, size_of::<u64>())
+        .map_err(address_space_error_to_linux_errno)?;
+
+    match kernel_ipc_runtime::api::recv_endpoint_with_sender_and_limits(
+        endpoint,
+        request_capacity,
+        0,
+    ) {
+        Ok(Some((reply, request, _handles, caller_task_id))) => {
+            let (sender_pid, sender_tid) =
+                multitask::user_log_ids_for_task(caller_task_id).unwrap_or((0, 0));
+            if !request.is_empty() {
+                usermem::write_current_user_bytes(request_ptr, &request)
+                    .map_err(address_space_error_to_linux_errno)?;
+            }
+            usermem::write_current_user_bytes(reply_cap_ptr, &reply.raw().to_ne_bytes())
+                .map_err(address_space_error_to_linux_errno)?;
+            usermem::write_current_user_bytes(sender_pid_ptr, &sender_pid.to_ne_bytes())
+                .map_err(address_space_error_to_linux_errno)?;
+            usermem::write_current_user_bytes(sender_tid_ptr, &sender_tid.to_ne_bytes())
                 .map_err(address_space_error_to_linux_errno)?;
             Ok(request.len())
         }
@@ -771,7 +912,7 @@ pub(super) fn call_linux_syscall_endpoint(request: &[u8]) -> Result<Vec<u8>, i64
     let start_ticks = crate::arch::rtc::ticks();
     let reply = enqueue_call_and_wake(endpoint, request)?;
     let send_ticks = crate::arch::rtc::ticks();
-    let response = wait_for_reply(reply)?;
+    let response = wait_for_service_reply(reply)?;
     let reply_ticks = crate::arch::rtc::ticks();
     log_slow_ipc_call(
         "linux-syscall",
@@ -793,7 +934,7 @@ pub(super) fn call_service_endpoint(service_id: u64, request: &[u8]) -> Result<V
     let start_ticks = crate::arch::rtc::ticks();
     let reply = enqueue_call_and_wake(endpoint, request)?;
     let send_ticks = crate::arch::rtc::ticks();
-    let response = wait_for_reply(reply)?;
+    let response = wait_for_service_reply(reply)?;
     let reply_ticks = crate::arch::rtc::ticks();
     log_slow_ipc_call(
         "service",
@@ -818,7 +959,7 @@ pub(super) fn call_service_endpoint_with_received_entries(
     let endpoint = service_endpoint(service_id).ok_or(LINUX_ENOSYS)?;
     let start_ticks = crate::arch::rtc::ticks();
     let reply = enqueue_call_and_wake(endpoint, request)?;
-    let (response, descriptors) = wait_for_reply_with_handle_limit(reply, handle_capacity)?;
+    let (response, descriptors) = wait_for_service_reply_with_handle_limit(reply, handle_capacity)?;
     let reply_ticks = crate::arch::rtc::ticks();
     let entries = take_transfer_entries(descriptors.as_slice())?;
     log_slow_ipc_call(
@@ -883,47 +1024,142 @@ fn wait_for_reply(reply: KernelReplyHandle) -> Result<Vec<u8>, i64> {
     Ok(wait_for_reply_with_handle_limit(reply, 0)?.0)
 }
 
+fn wait_for_service_reply(reply: KernelReplyHandle) -> Result<Vec<u8>, i64> {
+    Ok(wait_for_reply_with_deadline(reply, 0, Some(service_ipc_deadline_tick()))?.0)
+}
+
+fn wait_for_service_reply_with_handle_limit(
+    reply: KernelReplyHandle,
+    handle_capacity: usize,
+) -> Result<(Vec<u8>, Vec<KernelTransferredHandle>), i64> {
+    wait_for_reply_with_deadline(reply, handle_capacity, Some(service_ipc_deadline_tick()))
+}
+
 fn wait_for_reply_with_handle_limit(
     reply: KernelReplyHandle,
     handle_capacity: usize,
 ) -> Result<(Vec<u8>, Vec<KernelTransferredHandle>), i64> {
+    wait_for_reply_with_deadline(reply, handle_capacity, None)
+}
+
+fn wait_for_reply_with_deadline(
+    reply: KernelReplyHandle,
+    handle_capacity: usize,
+    deadline_tick: Option<u64>,
+) -> Result<(Vec<u8>, Vec<KernelTransferredHandle>), i64> {
+    let caller_task_id = if deadline_tick.is_some() {
+        Some(multitask::current_task_id().ok_or(LINUX_EINVAL)?)
+    } else {
+        None
+    };
     loop {
         match kernel_ipc_runtime::api::take_endpoint_response_with_handle_limit(
             reply,
             handle_capacity,
         ) {
-            Ok(Some(response)) => return Ok(response),
-            Ok(None) => {
-                if !multitask::arm_block_current_task() {
-                    return Err(LINUX_EINVAL);
-                }
-                // Re-poll after arming. If the replier completed the response between our
-                // first take and arming, the wake_task call landed before arm_block, so
-                // wake_armed would be set but no further wake arrives; re-checking the
-                // queue here picks up that response without sleeping.
-                match kernel_ipc_runtime::api::take_endpoint_response_with_handle_limit(
-                    reply,
-                    handle_capacity,
-                ) {
-                    Ok(Some(response)) => {
-                        let _ = multitask::commit_block_current_task();
-                        return Ok(response);
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        let _ = multitask::commit_block_current_task();
-                        return Err(ipc_error_to_linux_errno(err));
-                    }
-                }
-                match multitask::commit_block_current_task() {
-                    Some(true) => multitask::yield_now(),
-                    Some(false) => multitask::yield_now(),
-                    None => return Err(LINUX_EINVAL),
-                }
+            Ok(Some(response)) => {
+                disarm_reply_deadline_waiter(caller_task_id);
+                return Ok(response);
             }
-            Err(err) => return Err(ipc_error_to_linux_errno(err)),
+            Ok(None) => {}
+            Err(err) => {
+                disarm_reply_deadline_waiter(caller_task_id);
+                return Err(ipc_error_to_linux_errno(err));
+            }
+        }
+        if reply_deadline_expired(deadline_tick) {
+            cancel_deadline_reply(reply, caller_task_id);
+            return Err(LINUX_ETIMEDOUT);
+        }
+        if !multitask::arm_block_current_task() {
+            cancel_deadline_reply(reply, caller_task_id);
+            return Err(LINUX_EINVAL);
+        }
+        arm_reply_deadline_waiter(caller_task_id, deadline_tick);
+        // Re-poll after arming. If the replier completed the response between our
+        // first take and arming, the wake_task call landed before arm_block, so
+        // wake_armed would be set but no further wake arrives; re-checking the
+        // queue here picks up that response without sleeping.
+        match kernel_ipc_runtime::api::take_endpoint_response_with_handle_limit(
+            reply,
+            handle_capacity,
+        ) {
+            Ok(Some(response)) => {
+                disarm_reply_deadline_waiter(caller_task_id);
+                let _ = multitask::commit_block_current_task();
+                return Ok(response);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                disarm_reply_deadline_waiter(caller_task_id);
+                let _ = multitask::commit_block_current_task();
+                return Err(ipc_error_to_linux_errno(err));
+            }
+        }
+        if reply_deadline_expired(deadline_tick) {
+            disarm_reply_deadline_waiter(caller_task_id);
+            if let Some(task_id) = caller_task_id {
+                let _ = multitask::wake_task(task_id);
+            }
+            let _ = multitask::commit_block_current_task();
+            cancel_deadline_reply(reply, caller_task_id);
+            return Err(LINUX_ETIMEDOUT);
+        }
+        match multitask::commit_block_current_task() {
+            Some(true) => {
+                multitask::yield_now();
+                disarm_reply_deadline_waiter(caller_task_id);
+            }
+            Some(false) => {
+                disarm_reply_deadline_waiter(caller_task_id);
+                multitask::yield_now();
+            }
+            None => {
+                disarm_reply_deadline_waiter(caller_task_id);
+                cancel_deadline_reply(reply, caller_task_id);
+                return Err(LINUX_EINVAL);
+            }
         }
     }
+}
+
+fn service_ipc_deadline_tick() -> u64 {
+    let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
+    let timeout_ticks = SERVICE_IPC_TIMEOUT_MS
+        .saturating_mul(ticks_per_second)
+        .saturating_add(999)
+        .saturating_div(1000)
+        .max(1);
+    crate::arch::rtc::ticks().saturating_add(timeout_ticks)
+}
+
+fn reply_deadline_expired(deadline_tick: Option<u64>) -> bool {
+    deadline_tick.is_some_and(|deadline_tick| crate::arch::rtc::ticks() >= deadline_tick)
+}
+
+fn arm_reply_deadline_waiter(task_id: Option<u64>, deadline_tick: Option<u64>) {
+    if let (Some(task_id), Some(deadline_tick)) = (task_id, deadline_tick) {
+        crate::arch::rtc::arm_sleep_waiter_until_tick(task_id, deadline_tick);
+    }
+}
+
+fn disarm_reply_deadline_waiter(task_id: Option<u64>) {
+    if let Some(task_id) = task_id {
+        crate::arch::rtc::disarm_sleep_waiter(task_id);
+    }
+}
+
+fn cancel_deadline_reply(reply: KernelReplyHandle, caller_task_id: Option<u64>) {
+    let Some(caller_task_id) = caller_task_id else {
+        return;
+    };
+    let result = kernel_ipc_runtime::api::cancel_endpoint_call(reply, caller_task_id);
+    ipc_trace!(
+        "ipc reply timeout: reply={} caller={} cancel={:?}",
+        reply.raw(),
+        caller_task_id,
+        result
+    );
 }
 
 fn export_current_fds_for_ipc(
@@ -1107,7 +1343,7 @@ fn take_transfer_entries(
     Ok(entries)
 }
 
-fn drop_transfer_descriptors(descriptors: &[KernelTransferredHandle]) {
+pub(super) fn drop_transfer_descriptors(descriptors: &[KernelTransferredHandle]) {
     if descriptors.is_empty() {
         return;
     }

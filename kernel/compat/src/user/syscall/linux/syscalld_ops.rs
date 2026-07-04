@@ -335,6 +335,27 @@ pub(super) fn new_syscalld_request(op: u16) -> LinuxSyscallOffloadRequest {
     request
 }
 
+pub(super) fn request_syscalld_clock_gettime_admission(clock_id: u64) -> Result<(), i64> {
+    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_CLOCK_GETTIME);
+    request.arg0 = clock_id;
+    call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response))
+}
+
+pub(super) fn request_syscalld_timespec_admission(
+    op: u16,
+    clock_id: u64,
+    flags: u64,
+    ts: LinuxTimespecWire,
+) -> Result<(), i64> {
+    let mut request = new_syscalld_request(op);
+    request.arg0 = clock_id;
+    request.flags = flags;
+    request.path_len = LINUX_TIMESPEC_SIZE as u32;
+    request.path[..size_of::<i64>()].copy_from_slice(&ts.tv_sec.to_le_bytes());
+    request.path[size_of::<i64>()..LINUX_TIMESPEC_SIZE].copy_from_slice(&ts.tv_nsec.to_le_bytes());
+    call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response))
+}
+
 pub(super) fn call_syscalld(
     request: LinuxSyscallOffloadRequest,
 ) -> Result<LinuxSyscallOffloadResponse, i64> {

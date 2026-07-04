@@ -1,14 +1,22 @@
 use core::ffi::c_void;
 
 pub(crate) unsafe extern "C" fn dma_set_mask_and_coherent(dev: *mut c_void, mask: u64) -> i32 {
+    crate::driver::symbol_events::record_dma_symbol(
+        "dma_set_mask_and_coherent",
+        dev as usize,
+        mask,
+        0,
+    );
     crate::driver::dma::set_mask_and_coherent(dev, mask)
 }
 
 pub(crate) unsafe extern "C" fn dma_set_mask(dev: *mut c_void, mask: u64) -> i32 {
+    crate::driver::symbol_events::record_dma_symbol("dma_set_mask", dev as usize, mask, 0);
     crate::driver::dma::set_mask(dev, mask)
 }
 
 pub(crate) unsafe extern "C" fn dma_set_coherent_mask(dev: *mut c_void, mask: u64) -> i32 {
+    crate::driver::symbol_events::record_dma_symbol("dma_set_coherent_mask", dev as usize, mask, 0);
     crate::driver::dma::set_coherent_mask(dev, mask)
 }
 
@@ -19,6 +27,12 @@ pub(crate) unsafe extern "C" fn dma_alloc_attrs(
     _gfp: u32,
     _attrs: u64,
 ) -> *mut c_void {
+    crate::driver::symbol_events::record_dma_symbol(
+        "dma_alloc_attrs",
+        dev as usize,
+        size as u64,
+        0,
+    );
     crate::driver::dma::alloc_coherent(dev, size, dma_handle)
 }
 
@@ -38,6 +52,12 @@ pub(crate) unsafe extern "C" fn dma_free_attrs(
     dma_handle: u64,
     _attrs: u64,
 ) {
+    crate::driver::symbol_events::record_dma_symbol(
+        "dma_free_attrs",
+        dev as usize,
+        _size as u64,
+        dma_handle,
+    );
     crate::driver::dma::free_coherent(dev, cpu_addr, dma_handle);
 }
 
@@ -94,6 +114,12 @@ pub(crate) unsafe extern "C" fn dma_map_single(
     size: usize,
     _dir: u32,
 ) -> u64 {
+    crate::driver::symbol_events::record_dma_symbol(
+        "dma_map_single",
+        dev as usize,
+        size as u64,
+        cpu_addr as u64,
+    );
     crate::driver::dma::map_single(dev, cpu_addr, size)
 }
 
@@ -113,6 +139,12 @@ pub(crate) unsafe extern "C" fn dma_unmap_single(
     size: usize,
     _dir: u32,
 ) {
+    crate::driver::symbol_events::record_dma_symbol(
+        "dma_unmap_single",
+        dev as usize,
+        size as u64,
+        dma_addr,
+    );
     crate::driver::dma::unmap_single(dev, dma_addr, size);
 }
 

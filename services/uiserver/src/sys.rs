@@ -29,6 +29,7 @@ pub(crate) use device_abi::{
 use device_abi::{DisplayPresentRectRequest, DisplayPresentRequest};
 
 const SYS_READ: usize = 0;
+const SYS_POLL: usize = 7;
 const SYS_MMAP: usize = 9;
 const SYS_MUNMAP: usize = 11;
 const SYS_IOCTL: usize = 16;
@@ -46,6 +47,8 @@ const AT_FDCWD: isize = -100;
 const O_RDONLY: usize = 0;
 const O_RDWR: usize = 2;
 const O_NONBLOCK: usize = 0o4000;
+const POLLIN: i16 = 0x0001;
+const INPUT_READY_POLL_TIMEOUT_MS: isize = 8;
 
 const PROT_READ: usize = 0x1;
 const PROT_WRITE: usize = 0x2;
@@ -78,6 +81,13 @@ pub(crate) const MAX_CONSOLE_SNAPSHOT_BYTES: usize = 4096;
 const EAGAIN: i32 = 11;
 pub(crate) const ENOENT: i32 = 2;
 pub(crate) const EINVAL: i32 = 22;
+
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
 pub(crate) const ENOSYS: i32 = 38;
 pub(crate) const ESTALE: i32 = 116;
 pub(crate) type ConsoleSessionHandle = u64;
@@ -657,6 +667,30 @@ pub(crate) fn read_input(fds: &[OwnedFd], events: &mut [InputEvent]) -> Result<u
     Ok(written)
 }
 
+pub(crate) fn wait_for_input_ready(fds: &[OwnedFd]) -> Result<(), i32> {
+    if running_on_rustos() {
+        return Ok(());
+    }
+    let mut poll_fds = Vec::with_capacity(fds.len());
+    for fd in fds {
+        poll_fds.push(PollFd {
+            fd: fd.as_raw_fd(),
+            events: POLLIN,
+            revents: 0,
+        });
+    }
+    loop {
+        let ready = poll(&mut poll_fds, INPUT_READY_POLL_TIMEOUT_MS)?;
+        if ready == 0 {
+            return Ok(());
+        }
+        if poll_fds.iter().any(|fd| fd.revents & POLLIN != 0) {
+            return Ok(());
+        }
+        return Err(5);
+    }
+}
+
 fn translate_linux_input_event(
     state: &mut InputTranslationState,
     raw: LinuxInputEvent,
@@ -1056,6 +1090,18 @@ fn openat(dirfd: isize, path: &CString, flags: usize, mode: usize) -> Result<Raw
 
 fn read(fd: RawFd, buffer: *mut c_void, len: usize) -> Result<usize, i32> {
     let result = unsafe { syscall3(SYS_READ, fd as usize, buffer as usize, len) };
+    syscall_usize(result)
+}
+
+fn poll(fds: &mut [PollFd], timeout_ms: isize) -> Result<usize, i32> {
+    let result = unsafe {
+        syscall3(
+            SYS_POLL,
+            fds.as_mut_ptr() as usize,
+            fds.len(),
+            timeout_ms as usize,
+        )
+    };
     syscall_usize(result)
 }
 

@@ -27,16 +27,6 @@ pub(crate) struct FramebufferRect {
 }
 
 impl FramebufferRect {
-    #[allow(dead_code)]
-    pub(crate) const fn empty() -> Self {
-        Self {
-            x: 0,
-            y: 0,
-            width: 0,
-            height: 0,
-        }
-    }
-
     pub(crate) fn clip(
         framebuffer: &Framebuffer,
         x: i64,

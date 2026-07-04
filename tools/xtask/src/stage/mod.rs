@@ -11,7 +11,7 @@ use walkdir::WalkDir;
 use crate::Result;
 use crate::config::Config;
 use crate::package_manifest::{
-    BuilderKind, DesktopLaunchMode, InstallLayout, PackageManifest, StartupMode,
+    BuilderKind, DesktopEntrySpec, DesktopLaunchMode, InstallLayout, PackageManifest, StartupMode,
     load_default_manifests,
 };
 use crate::util::{
@@ -22,6 +22,8 @@ use crate::util::{
 const APPLICATIONS_DIR: &str = "usr/share/applications";
 const DRIVER_REGISTRY_PATH: &str = "system/registry/kernel/loadable-drivers.tsv";
 const ROOT_FILE_EXTENTS_REGISTRY_PATH: &str = "system/registry/kernel/root-file-extents.tsv";
+const ROOT_FILE_EXTENTS_REGISTRY_SIGNATURE_PATH: &str =
+    "system/registry/kernel/root-file-extents.tsv.sig";
 const DESKTOP_REGISTRY_PATH: &str = "system/registry/system/desktop-programs.tsv";
 const RUNTIME_LAUNCH_REGISTRY_PATH: &str = "system/registry/system/runtime-launch-programs.tsv";
 const STARTUP_REGISTRY_PATH: &str = "system/registry/system/startup-programs.tsv";
@@ -78,6 +80,9 @@ const STALE_BUILD_FILES: &[&str] = &[
     "sonic.gif",
 ];
 const STALE_ROOT_FILES: &[&str] = &["debugcon.log", "qemu_interrupt.log"];
+const ABI_FUZZ_PACKAGE_ID: &str = "abifuzz";
+const ABI_FUZZ_DESKTOP_ID: &str = "abifuzz.desktop";
+const DEFAULT_GRUB_DEV_KEY: &str = "RustOS Dev GRUB <rustos-dev-grub@example.invalid>";
 
 pub(crate) fn stage(config: &Config) -> Result<()> {
     let manifests = load_default_manifests(&config.root_dir)?;
@@ -86,6 +91,7 @@ pub(crate) fn stage(config: &Config) -> Result<()> {
     cleanup_legacy_build_layout(config)?;
 
     stage_image_asset_overlay(&config.image_asset_overlay_dir, &config.image_dir)?;
+    apply_configured_autostart_policy(config)?;
 
     for manifest in &manifests {
         stage_manifest(config, manifest)?;
@@ -236,7 +242,8 @@ fn write_boot_disk_image(config: &Config) -> Result<()> {
                 extents: collect_fat_file_extents(&mut dst)?,
             });
         }
-        write_root_file_extents_registry(&root, &extent_entries)?;
+        let extent_manifest = write_root_file_extents_registry(&root, &extent_entries)?;
+        write_root_file_extents_signature(config, &root, extent_manifest.as_bytes())?;
     }
     fs.unmount()?;
     Ok(())
@@ -283,7 +290,7 @@ where
 fn write_root_file_extents_registry<D: fatfs::ReadWriteSeek>(
     root: &fatfs::Dir<'_, D, fatfs::DefaultTimeProvider, fatfs::LossyOemCpConverter>,
     entries: &[BootDiskExtentEntry],
-) -> Result<()>
+) -> Result<String>
 where
     D::Error: std::error::Error + Send + Sync + 'static,
 {
@@ -314,7 +321,64 @@ where
     file.truncate()?;
     file.write_all(content.as_bytes())?;
     file.flush()?;
+    Ok(content)
+}
+
+fn write_root_file_extents_signature<D: fatfs::ReadWriteSeek>(
+    config: &Config,
+    root: &fatfs::Dir<'_, D, fatfs::DefaultTimeProvider, fatfs::LossyOemCpConverter>,
+    manifest: &[u8],
+) -> Result<()>
+where
+    D::Error: std::error::Error + Send + Sync + 'static,
+{
+    let work_dir = config.build_dir.join("boot-extent-manifest");
+    fs::create_dir_all(&work_dir)?;
+    let manifest_path = work_dir.join("root-file-extents.tsv");
+    let signature_path = work_dir.join("root-file-extents.tsv.sig");
+    fs::write(&manifest_path, manifest)?;
+    sign_detached_for_grub(config, &manifest_path, &signature_path)?;
+
+    ensure_fat_parent_dirs(root, ROOT_FILE_EXTENTS_REGISTRY_SIGNATURE_PATH)?;
+    if root
+        .open_file(ROOT_FILE_EXTENTS_REGISTRY_SIGNATURE_PATH)
+        .is_ok()
+    {
+        root.remove(ROOT_FILE_EXTENTS_REGISTRY_SIGNATURE_PATH)?;
+    }
+    let signature = fs::read(&signature_path)?;
+    let mut file = root.create_file(ROOT_FILE_EXTENTS_REGISTRY_SIGNATURE_PATH)?;
+    file.truncate()?;
+    file.write_all(&signature)?;
+    file.flush()?;
     Ok(())
+}
+
+fn sign_detached_for_grub(config: &Config, input: &Path, signature: &Path) -> Result<()> {
+    remove_file_if_exists(signature)?;
+    let gpg_home = config
+        .rustos_gpg_home
+        .clone()
+        .unwrap_or_else(|| config.build_dir.join("dev-grub-gpg"));
+    let signing_key = config
+        .rustos_grub_signing_key
+        .clone()
+        .unwrap_or_else(|| String::from(DEFAULT_GRUB_DEV_KEY));
+    let mut command = Command::new(&config.gpg);
+    command
+        .arg("--homedir")
+        .arg(gpg_home)
+        .arg("--batch")
+        .arg("--yes")
+        .arg("--pinentry-mode")
+        .arg("loopback")
+        .arg("--local-user")
+        .arg(signing_key)
+        .arg("--detach-sign")
+        .arg("--output")
+        .arg(signature)
+        .arg(input);
+    run_command(&mut command)
 }
 
 struct ImageFile {
@@ -508,6 +572,9 @@ fn should_generate_application_desktop(
 fn write_desktop_registry(config: &Config, manifests: &[PackageManifest]) -> Result<()> {
     let mut lines = Vec::new();
     for manifest in manifests {
+        if !runtime_launch_enabled_for_manifest(config, manifest) {
+            continue;
+        }
         if !manifest.artifact_path(config).exists() {
             continue;
         }
@@ -571,6 +638,9 @@ fn write_desktop_registry(config: &Config, manifests: &[PackageManifest]) -> Res
 fn write_runtime_launch_registry(config: &Config, manifests: &[PackageManifest]) -> Result<()> {
     let mut lines = Vec::new();
     for manifest in manifests {
+        if !runtime_launch_enabled_for_manifest(config, manifest) {
+            continue;
+        }
         if !manifest.artifact_path(config).exists() {
             continue;
         }
@@ -584,12 +654,11 @@ fn write_runtime_launch_registry(config: &Config, manifests: &[PackageManifest])
 
             let image = entry.image.as_deref().unwrap_or(&manifest.install.path);
             let exec = entry.exec.as_deref().unwrap_or(image);
-            let args = if entry.args.is_empty() {
+            let args = runtime_launch_args(config, manifest, entry, exec);
+            let args = if args.is_empty() {
                 String::new()
             } else {
-                entry
-                    .args
-                    .iter()
+                args.iter()
                     .map(|arg| registry_value(arg))
                     .collect::<Result<Vec<_>>>()?
                     .join("|")
@@ -634,6 +703,46 @@ fn write_runtime_launch_registry(config: &Config, manifests: &[PackageManifest])
     }
 
     write_registry_lines(config.image_dir.join(RUNTIME_LAUNCH_REGISTRY_PATH), &lines)
+}
+
+fn apply_configured_autostart_policy(config: &Config) -> Result<()> {
+    if config.project.fuzzing.enabled {
+        return Ok(());
+    }
+    remove_file_if_exists(
+        &config
+            .image_dir
+            .join("etc/xdg/autostart")
+            .join(ABI_FUZZ_DESKTOP_ID),
+    )
+}
+
+fn runtime_launch_enabled_for_manifest(config: &Config, manifest: &PackageManifest) -> bool {
+    manifest.id != ABI_FUZZ_PACKAGE_ID || config.project.fuzzing.enabled
+}
+
+fn runtime_launch_args(
+    config: &Config,
+    manifest: &PackageManifest,
+    entry: &DesktopEntrySpec,
+    exec: &str,
+) -> Vec<String> {
+    let mut args = entry.args.clone();
+    if manifest.id == ABI_FUZZ_PACKAGE_ID {
+        if args.is_empty() {
+            args.push(exec.to_string());
+        }
+        if config.project.fuzzing.startup_delay_ms > 0 {
+            args.push(format!(
+                "--delay-ms={}",
+                config.project.fuzzing.startup_delay_ms
+            ));
+        }
+        if config.project.fuzzing.fd_transfer_stress {
+            args.push(String::from("--fd-transfer-stress"));
+        }
+    }
+    args
 }
 
 fn desktop_file_id(manifest: &PackageManifest, index: usize) -> String {

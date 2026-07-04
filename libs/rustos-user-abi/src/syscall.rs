@@ -52,6 +52,8 @@ pub const SYS_RUSTOS_DEVICE_OPEN_BROKER: u64 = 0x5255_0032;
 pub const SYS_RUSTOS_INPUT_INGEST_BROKER: u64 = 0x5255_0033;
 pub const SYS_RUSTOS_BOOT_EXTENT_BROKER: u64 = 0x5255_0034;
 pub const SYS_RUSTOS_IPC_TRY_RECV: u64 = 0x5255_0035;
+pub const SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER: u64 = 0x5255_0036;
+pub const SYS_RUSTOS_DRIVER_SYMBOL_EVENT_BROKER: u64 = 0x5255_0037;
 
 /// RustOS-private auxv entry: virtual address of the bootstrap heap region
 /// that the kernel pre-maps for static-PIE policy services so they can run
@@ -163,6 +165,7 @@ pub const SYSCALL_OFFLOAD_OP_LINUX_MADVISE: u16 = 57;
 pub const SYSCALL_OFFLOAD_OP_LINUX_SIGALTSTACK: u16 = 58;
 pub const SYSCALL_OFFLOAD_OP_LINUX_BRK: u16 = 59;
 pub const SYSCALL_OFFLOAD_OP_LINUX_MMAP: u16 = 60;
+pub const SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET: u16 = 61;
 pub const SYSCALL_OFFLOAD_OP_LINUX_MPROTECT: u16 = 61;
 pub const SYSCALL_OFFLOAD_OP_LINUX_MUNMAP: u16 = 62;
 pub const SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE: u16 = 63;
@@ -248,6 +251,16 @@ pub const DEVMGRD_IPC_OP_LOOKUP: u16 = 1;
 pub const DEVMGRD_IPC_OP_READDIR: u16 = 2;
 pub const DEVMGRD_IPC_OP_OPEN: u16 = 3;
 pub const DEVMGRD_IPC_OP_IOCTL_AUTHORIZE: u16 = 4;
+pub const DEVMGRD_IPC_OP_IOCTL_ROUTE: u16 = 5;
+pub const DEVMGRD_IOCTL_ROUTE_DIRECT: u64 = 0;
+pub const DEVMGRD_IOCTL_ROUTE_DEVMGRD: u64 = 1;
+pub const DEVMGRD_IOCTL_ROUTE_SESSIOND_TTY: u64 = 2;
+pub const DEVMGRD_IOCTL_ROUTE_SESSIOND_COMMIT: u64 = 3;
+pub const DEVMGRD_IOCTL_LINUX_TTY_TCGETS: u64 = 0x5401;
+pub const DEVMGRD_IOCTL_LINUX_TTY_TCSETS: u64 = 0x5402;
+pub const DEVMGRD_IOCTL_LINUX_TTY_TCSETSW: u64 = 0x5403;
+pub const DEVMGRD_IOCTL_LINUX_TTY_TCSETSF: u64 = 0x5404;
+pub const DEVMGRD_IOCTL_LINUX_TTY_FIONREAD: u64 = 0x541b;
 pub const DEVMGRD_NODE_KIND_NONE: u16 = 0;
 pub const DEVMGRD_NODE_KIND_DIR: u16 = 1;
 pub const DEVMGRD_NODE_KIND_DEVICE: u16 = 2;
@@ -397,6 +410,8 @@ pub const COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE: u16 = 2;
 pub const COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH: u16 = 3;
 pub const COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY: u16 = 4;
 pub const COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL: u16 = 5;
+pub const COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY: u16 = 6;
+pub const COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP: u16 = 7;
 pub const COMMERCIAL_MAX_PROCD_OP_PROCESS_PREPARE: u16 = 1;
 pub const COMMERCIAL_MAX_PROCD_OP_EXEC_TICKET: u16 = 2;
 pub const COMMERCIAL_MAX_PROCD_OP_FORK_PLAN: u16 = 3;
@@ -482,6 +497,28 @@ pub const SERVICE_DRIVER_RESOURCE_OP_DMA_BUFFER: u16 = 3;
 pub const SERVICE_DRIVER_RESOURCE_OP_IO_PORT_LEASE: u16 = 4;
 pub const SERVICE_DRIVER_RESOURCE_OP_IO_PORT_READ: u16 = 5;
 pub const SERVICE_DRIVER_RESOURCE_OP_IO_PORT_WRITE: u16 = 6;
+pub const DRIVER_SYMBOL_EVENT_BROKER_ABI_VERSION: u16 = 1;
+pub const DRIVER_SYMBOL_EVENT_OP_DRAIN: u16 = 1;
+pub const DRIVER_SYMBOL_EVENT_SYMBOL_CAPACITY: usize = 64;
+pub const DRIVER_SYMBOL_EVENT_MODULE_CAPACITY: usize = 64;
+pub const DRIVER_SYMBOL_EVENT_CONTEXT_PROBE_INIT: u16 = 1;
+pub const DRIVER_SYMBOL_EVENT_CONTEXT_PCI_RESOURCE: u16 = 2;
+pub const DRIVER_SYMBOL_EVENT_CONTEXT_PCI_CONFIG: u16 = 3;
+pub const DRIVER_SYMBOL_EVENT_CONTEXT_DEVICE_MODEL: u16 = 4;
+pub const DRIVER_SYMBOL_EVENT_CONTEXT_RESOURCE_LEASE: u16 = 5;
+pub const DRIVER_SYMBOL_EVENT_CONTEXT_WORKQUEUE_TIMER: u16 = 6;
+pub const DRIVER_SYMBOL_EVENT_SCOPE_PCI: u16 = 1;
+pub const DRIVER_SYMBOL_EVENT_SCOPE_USB: u16 = 2;
+pub const DRIVER_SYMBOL_EVENT_SCOPE_HID: u16 = 3;
+pub const DRIVER_SYMBOL_EVENT_SCOPE_DEVICE_MODEL: u16 = 4;
+pub const DRIVER_SYMBOL_EVENT_SCOPE_VIRTIO: u16 = 5;
+pub const DRIVER_SYMBOL_EVENT_SCOPE_DRM: u16 = 6;
+pub const DRIVER_SYMBOL_EVENT_SCOPE_NETDEV: u16 = 7;
+pub const DRIVER_SYMBOL_EVENT_SCOPE_DMA: u16 = 8;
+pub const DRIVER_SYMBOL_EVENT_SCOPE_MMIO: u16 = 9;
+pub const DRIVER_SYMBOL_EVENT_SCOPE_IRQ: u16 = 10;
+pub const DRIVER_SYMBOL_EVENT_SCOPE_WORKQUEUE: u16 = 11;
+pub const DRIVER_SYMBOL_EVENT_FLAG_DROPPED_BEFORE: u32 = 1 << 0;
 pub const COMMERCIAL_MAX_UISERVER_OP_DISPLAY_READINESS: u16 = 1;
 pub const COMMERCIAL_MAX_UISERVER_OP_DISPLAY_METADATA: u16 = 2;
 pub const COMMERCIAL_MAX_UISERVER_OP_SURFACE_POLICY: u16 = 3;
@@ -1254,6 +1291,59 @@ pub struct RustosServiceDriverResourceBrokerArgs {
     pub arg0: u64,
     pub arg1: u64,
     pub arg2: u64,
+    pub out_ptr: u64,
+    pub out_len: u64,
+    pub reserved0: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LinuxDriverSymbolEventWire {
+    pub sequence: u64,
+    pub dropped_before: u64,
+    pub class: u32,
+    pub bus: u32,
+    pub context: u16,
+    pub scope: u16,
+    pub flags: u32,
+    pub arg0: u64,
+    pub arg1: u64,
+    pub arg2: u64,
+    pub symbol_len: u16,
+    pub module_len: u16,
+    pub reserved0: u32,
+    pub symbol: [u8; DRIVER_SYMBOL_EVENT_SYMBOL_CAPACITY],
+    pub module: [u8; DRIVER_SYMBOL_EVENT_MODULE_CAPACITY],
+}
+
+impl Default for LinuxDriverSymbolEventWire {
+    fn default() -> Self {
+        Self {
+            sequence: 0,
+            dropped_before: 0,
+            class: 0,
+            bus: 0,
+            context: 0,
+            scope: 0,
+            flags: 0,
+            arg0: 0,
+            arg1: 0,
+            arg2: 0,
+            symbol_len: 0,
+            module_len: 0,
+            reserved0: 0,
+            symbol: [0; DRIVER_SYMBOL_EVENT_SYMBOL_CAPACITY],
+            module: [0; DRIVER_SYMBOL_EVENT_MODULE_CAPACITY],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RustosDriverSymbolEventBrokerArgs {
+    pub abi_version: u16,
+    pub op: u16,
+    pub flags: u32,
     pub out_ptr: u64,
     pub out_len: u64,
     pub reserved0: u64,
@@ -2392,12 +2482,12 @@ mod syscall_tests {
     use core::mem::size_of;
 
     use super::{
-        IPC_MAX_INLINE_BYTES, LINUX_RLIMIT_SIZE, LINUX_SIGACTION_SIZE, LINUX_STATX_SIZE,
-        LINUX_TIMESPEC_SIZE, LINUX_UTSNAME_SIZE, LinuxRlimit, LinuxSigActionWire,
-        LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, LinuxTimespecWire, LinuxUtsName,
-        SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_STATX, SYSCALL_OFFLOAD_PATH_CAPACITY,
-        SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, VFS_IPC_ABI_VERSION, VFS_IPC_OP_OPENAT, VfsIpcRequest,
-        VfsIpcResponse,
+        LinuxRlimit, LinuxSigActionWire, LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse,
+        LinuxTimespecWire, LinuxUtsName, VfsIpcRequest, VfsIpcResponse, IPC_MAX_INLINE_BYTES,
+        LINUX_RLIMIT_SIZE, LINUX_SIGACTION_SIZE, LINUX_STATX_SIZE, LINUX_TIMESPEC_SIZE,
+        LINUX_UTSNAME_SIZE, SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_STATX,
+        SYSCALL_OFFLOAD_PATH_CAPACITY, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, VFS_IPC_ABI_VERSION,
+        VFS_IPC_OP_OPENAT,
     };
 
     #[test]

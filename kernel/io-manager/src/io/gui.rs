@@ -129,7 +129,8 @@ pub(crate) fn install_inherited_primary_scanout_from_boot() -> bool {
     if framebuffer.validate().is_err() {
         return false;
     }
-    backend::install_driver_framebuffer(framebuffer, DISPLAY_INFO_FLAG_PRIMARY_PROVIDER)
+    let flags = DISPLAY_INFO_FLAG_BOOT_FRAMEBUFFER | DISPLAY_INFO_FLAG_PRIMARY_PROVIDER;
+    backend::install_driver_framebuffer(framebuffer, flags)
 }
 
 pub fn display_info() -> Option<GuiDisplayInfo> {

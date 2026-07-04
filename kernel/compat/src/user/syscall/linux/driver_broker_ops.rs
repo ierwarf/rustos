@@ -6,9 +6,11 @@ use super::*;
 use alloc::string::String;
 use rustos_user_abi::syscall::{
     DRIVER_BROKER_ALIAS_CAPACITY, DRIVER_BROKER_NAME_CAPACITY, DRIVER_BROKER_PATH_CAPACITY,
-    DRIVER_LOAD_POLICY_KNOWN_FLAGS, IPC_SERVICE_CAP_DRIVER_POLICY,
-    IPC_SERVICE_CAP_SERVICE_DRIVER_POLICY, RustosDriverLoadModuleBrokerArgs,
-    RustosDriverProbeAliasBrokerArgs, RustosServiceDriverResourceBrokerArgs,
+    DRIVER_LOAD_POLICY_KNOWN_FLAGS, DRIVER_SYMBOL_EVENT_BROKER_ABI_VERSION,
+    DRIVER_SYMBOL_EVENT_OP_DRAIN, IPC_SERVICE_CAP_DRIVER_POLICY,
+    IPC_SERVICE_CAP_SERVICE_DRIVER_POLICY, LinuxDriverSymbolEventWire,
+    RustosDriverLoadModuleBrokerArgs, RustosDriverProbeAliasBrokerArgs,
+    RustosDriverSymbolEventBrokerArgs, RustosServiceDriverResourceBrokerArgs,
     SERVICE_DRIVER_RESOURCE_BROKER_ABI_VERSION, SERVICE_DRIVER_RESOURCE_OP_DMA_BUFFER,
     SERVICE_DRIVER_RESOURCE_OP_IO_PORT_LEASE, SERVICE_DRIVER_RESOURCE_OP_IO_PORT_READ,
     SERVICE_DRIVER_RESOURCE_OP_IO_PORT_WRITE, SERVICE_DRIVER_RESOURCE_OP_IRQ_ROUTE,
@@ -98,6 +100,43 @@ pub(super) fn syscall_linux_rustos_driver_probe_alias_broker(args_ptr: u64) -> u
         1
     } else {
         0
+    }
+}
+
+pub(super) fn syscall_linux_rustos_driver_symbol_event_broker(args_ptr: u64) -> u64 {
+    if !ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_DRIVER_POLICY) {
+        return linux_errno(LINUX_EPERM);
+    }
+
+    let args =
+        match usermem::read_current_user_struct::<RustosDriverSymbolEventBrokerArgs>(args_ptr) {
+            Ok(args) => args,
+            Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        };
+    if args.abi_version != DRIVER_SYMBOL_EVENT_BROKER_ABI_VERSION
+        || args.flags != 0
+        || args.reserved0 != 0
+    {
+        return linux_errno(LINUX_EINVAL);
+    }
+
+    match args.op {
+        DRIVER_SYMBOL_EVENT_OP_DRAIN => drain_driver_symbol_event(&args),
+        _ => linux_errno(LINUX_EINVAL),
+    }
+}
+
+fn drain_driver_symbol_event(args: &RustosDriverSymbolEventBrokerArgs) -> u64 {
+    if args.out_ptr == 0 || args.out_len < core::mem::size_of::<LinuxDriverSymbolEventWire>() as u64
+    {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let Some(event) = kernel_io_manager::driver::drain_linux_symbol_event() else {
+        return 0;
+    };
+    match usermem::write_current_user_struct(args.out_ptr, &event) {
+        Ok(()) => 1,
+        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
     }
 }
 

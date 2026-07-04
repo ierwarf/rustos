@@ -16,6 +16,7 @@ const ENABLE_NATIVE_XHCI: bool = true;
 
 struct UsbRuntimeState {
     controllers: Vec<UsbHostControllerInfo>,
+    runtime_initializing: bool,
     runtime_initialized: bool,
 }
 
@@ -23,6 +24,7 @@ impl UsbRuntimeState {
     const fn new() -> Self {
         Self {
             controllers: Vec::new(),
+            runtime_initializing: false,
             runtime_initialized: false,
         }
     }
@@ -32,9 +34,12 @@ static USB_STATE: Mutex<UsbRuntimeState> = Mutex::new(UsbRuntimeState::new());
 
 #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 pub(crate) fn init() {
-    let mut state = USB_STATE.lock();
-    if state.runtime_initialized {
-        return;
+    {
+        let mut state = USB_STATE.lock();
+        if state.runtime_initialized || state.runtime_initializing {
+            return;
+        }
+        state.runtime_initializing = true;
     }
 
     let controllers = scan_host_controllers();
@@ -43,7 +48,10 @@ pub(crate) fn init() {
     } else {
         0
     };
+
+    let mut state = USB_STATE.lock();
     state.controllers = controllers;
+    state.runtime_initializing = false;
     state.runtime_initialized = true;
     crate::debug::println!(
         "usb: in-kernel runtime initialized controllers={} xhci={} native_xhci={}",
@@ -54,7 +62,10 @@ pub(crate) fn init() {
 }
 
 pub(crate) fn service_pending() -> usize {
-    let initialized = USB_STATE.lock().runtime_initialized;
+    let initialized = USB_STATE
+        .try_lock()
+        .map(|state| state.runtime_initialized)
+        .unwrap_or(false);
     if !initialized {
         return 0;
     }
@@ -77,8 +88,18 @@ pub(crate) fn service_pending() -> usize {
 }
 
 pub(crate) fn host_controllers_available() -> bool {
-    let state = USB_STATE.lock();
-    state.runtime_initialized && !state.controllers.is_empty()
+    USB_STATE
+        .try_lock()
+        .map(|state| state.runtime_initialized && !state.controllers.is_empty())
+        .unwrap_or(false)
+}
+
+pub(crate) fn uses_polled_input_completion() -> bool {
+    let initialized = USB_STATE
+        .try_lock()
+        .map(|state| state.runtime_initialized)
+        .unwrap_or(false);
+    initialized && ENABLE_NATIVE_XHCI && xhci::has_active_input_polling()
 }
 
 #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]

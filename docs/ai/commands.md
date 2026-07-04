@@ -30,7 +30,7 @@ failure output as the primary debugging context.
 | --- | --- | --- | --- |
 | `cargo xtask selftest` | host selftests for fault parsing, ABI/layout, runtime contracts, module tests | `target/` | contract/layout regression |
 | `cargo xtask fuzz-host --target all` | deterministic host fuzz smoke for fault rules, project config, package manifest parsing | `logs/` on crash | parser panic or invariant bug |
-| `cargo xtask ring3-inventory` | classify remaining `RING3-MIGRATION-REFERENCE` and `RING3-MIGRATION-COMMENTED-OUT` LOC by owner/lane; read `migration_candidate_loc` as real ring3 work and `cleanup_debt_loc` as delete/retire work | none | stale marker classification or unexpected active LOC growth |
+| `cargo xtask ring3-inventory` | classify remaining `RING3-MIGRATION-REFERENCE` and `RING3-MIGRATION-COMMENTED-OUT` LOC by owner/lane; read `migration_candidate_loc` as real remaining ring3 work, `ko_slowpath_ring3_loc` as Linux `.ko` slow-path brokerization reference LOC, and `cleanup_debt_loc` as delete/retire work | none | stale marker classification or unexpected active LOC growth |
 | `cargo test -p module-tests` | module tests | `target/` | unit/module regression |
 | `git diff --check` | whitespace sanity | none | trailing whitespace/conflict marker |
 
@@ -50,6 +50,16 @@ failure output as the primary debugging context.
   ```
 - Use repeated `--expect <marker>` to stop as soon as specific debugcon
   markers appear. Without `--expect`, `--timeout` is a controlled stop.
+- For high-density USB pointer validation, use `cargo xtask probe-display
+  --accel-profile kvm --usb-input --usb-input-device tablet` or
+  `--usb-input-device mouse`. The probe attaches only the selected USB pointer
+  device, sends tablet absolute events directly, routes mouse relative events
+  through the default display device id, waits for the input surface/storage
+  post-boot markers before stressing input, and fails if HID reports, inputd
+  reads, or uiserver input ticks stop advancing.
+- Tune pointer stress with `RUSTOS_PROBE_STRESS_MS`, `RUSTOS_PROBE_STEP_MS`,
+  `RUSTOS_PROBE_INPUT_START_MS` (post-boot quiet time before sending input),
+  and `RUSTOS_PROBE_INPUT_STALL_MS` when reproducing short input stalls.
 - Use repeated `--fault <location=action>` to pass a validated fault-injection
   rule to the guest via QEMU fw_cfg (`opt/rustos/fault-injection`). Examples:
   `display.present=drop-every:10`, `block.read=fail-after:50`,

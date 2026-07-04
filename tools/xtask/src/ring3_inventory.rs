@@ -1,8 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::Result;
 use crate::config::Config;
+use crate::Result;
 
 const MARKER_START: &str = "RING3-MIGRATION-REFERENCE START";
 const MARKER_END: &str = "RING3-MIGRATION-REFERENCE END";
@@ -70,6 +70,10 @@ pub(crate) fn print_inventory(config: &Config) -> Result<()> {
                     | "abi-substrate-reference"
                     | "ring3-owner-reference"
                     | "already-migrated-reference"
+                    | "ko-slowpath-ring3"
+                    | "compat-slowpath-ring3"
+                    | "pager-slowpath-ring3"
+                    | "process-slowpath-ring3"
             )
         })
         .map(|entry| entry.marked_loc)
@@ -77,6 +81,26 @@ pub(crate) fn print_inventory(config: &Config) -> Result<()> {
     let service_driver_host = entries
         .iter()
         .filter(|entry| entry.lane == "service-driver-host")
+        .map(|entry| entry.marked_loc)
+        .sum::<usize>();
+    let ko_slowpath_ring3 = entries
+        .iter()
+        .filter(|entry| entry.lane == "ko-slowpath-ring3")
+        .map(|entry| entry.marked_loc)
+        .sum::<usize>();
+    let compat_slowpath_ring3 = entries
+        .iter()
+        .filter(|entry| entry.lane == "compat-slowpath-ring3")
+        .map(|entry| entry.marked_loc)
+        .sum::<usize>();
+    let pager_slowpath_ring3 = entries
+        .iter()
+        .filter(|entry| entry.lane == "pager-slowpath-ring3")
+        .map(|entry| entry.marked_loc)
+        .sum::<usize>();
+    let process_slowpath_ring3 = entries
+        .iter()
+        .filter(|entry| entry.lane == "process-slowpath-ring3")
         .map(|entry| entry.marked_loc)
         .sum::<usize>();
     let cleanup_debt = entries
@@ -93,6 +117,10 @@ pub(crate) fn print_inventory(config: &Config) -> Result<()> {
     println!("commented_out_loc={commented_out}");
     println!("excluded_exception_loc={excluded}");
     println!("service_driver_host_loc={service_driver_host}");
+    println!("ko_slowpath_ring3_loc={ko_slowpath_ring3}");
+    println!("compat_slowpath_ring3_loc={compat_slowpath_ring3}");
+    println!("pager_slowpath_ring3_loc={pager_slowpath_ring3}");
+    println!("process_slowpath_ring3_loc={process_slowpath_ring3}");
     println!("cleanup_debt_loc={cleanup_debt}");
     println!("migration_candidate_loc={migration_candidate}");
     println!("active_batch_marked_loc={active}");
@@ -181,13 +209,21 @@ fn marked_source_loc(content: &str, marker_start: &str, marker_end: &str) -> usi
 
 fn owner_for_path(path: &Path) -> &'static str {
     let path = path.to_string_lossy();
-    if path.contains("/usb/xhci.rs") {
+    if path.ends_with("/driver/ko_slowpath_migration.rs") {
+        "driverd-linux-ko-compat"
+    } else if path.ends_with("/user/compat_slowpath_migration.rs") {
+        "syscalld-procd-vfsd-netd-devmgrd"
+    } else if path.ends_with("/memory/pager_slowpath_migration.rs") {
+        "pagerd-syscalld-loaderd"
+    } else if path.ends_with("/user/process_slowpath_migration.rs") {
+        "procd-syscalld-loaderd"
+    } else if path.contains("/usb/xhci.rs") {
         "driverd-devmgrd-inputd"
     } else if path.contains("/driver/serio.rs") {
         "linux-ko-compat"
     } else if path.contains("/input/i8042.rs") {
         "inputd"
-    } else if path.contains("/virtio_gpu.rs") {
+    } else if path.ends_with("/driver/virtio_gpu.rs") {
         "display-ko-compat"
     } else if path.contains("/usb/core.rs") {
         "driverd-devmgrd-inputd"
@@ -294,7 +330,15 @@ fn owner_for_path(path: &Path) -> &'static str {
 
 fn lane_for_path(path: &Path) -> &'static str {
     let path = path.to_string_lossy();
-    if path.contains("/driver/linux/")
+    if path.ends_with("/driver/ko_slowpath_migration.rs") {
+        "ko-slowpath-ring3"
+    } else if path.ends_with("/user/compat_slowpath_migration.rs") {
+        "compat-slowpath-ring3"
+    } else if path.ends_with("/memory/pager_slowpath_migration.rs") {
+        "pager-slowpath-ring3"
+    } else if path.ends_with("/user/process_slowpath_migration.rs") {
+        "process-slowpath-ring3"
+    } else if path.contains("/driver/linux/")
         || path.contains("/driver/devres.rs")
         || path.contains("/driver/export.rs")
         || path.contains("/driver/kernel_api.rs")
@@ -381,7 +425,7 @@ fn lane_for_path(path: &Path) -> &'static str {
         "already-migrated-reference"
     } else if path.contains("/driver/serio.rs") {
         "compat-ring0-exception"
-    } else if path.contains("/virtio_gpu.rs") {
+    } else if path.ends_with("/driver/virtio_gpu.rs") {
         "legacy-native-removal"
     } else if path.contains("/process/")
         || path.contains("/proc_broker_ops.rs")
@@ -406,13 +450,21 @@ fn lane_for_path(path: &Path) -> &'static str {
 
 fn action_for_path(path: &Path) -> &'static str {
     let path = path.to_string_lossy();
-    if path.contains("/usb/xhci.rs") {
+    if path.ends_with("/driver/ko_slowpath_migration.rs") {
+        "migrate sleepable Linux .ko init/probe/resource policy into driverd while ring0 remains the privileged broker"
+    } else if path.ends_with("/user/compat_slowpath_migration.rs") {
+        "move residual Linux/Win32 syscall slow-path policy into owner services while ring0 keeps ABI decode and brokers"
+    } else if path.ends_with("/memory/pager_slowpath_migration.rs") {
+        "move VMA/backing/accounting policy into pagerd/syscalld while ring0 keeps page-table/frame substrate"
+    } else if path.ends_with("/user/process_slowpath_migration.rs") {
+        "move process hierarchy/wait/credentials/signal policy into procd/syscalld while ring0 keeps scheduler substrate"
+    } else if path.contains("/usb/xhci.rs") {
         "RustOS native xHCI MMIO/DMA/IRQ transfer substrate exception; provider/device/input policy is driverd/devmgrd/inputd-owned"
     } else if path.contains("/driver/serio.rs") {
         "explicit Linux .ko serio compatibility bus substrate exception; do not migrate .ko execution to ring3"
     } else if path.contains("/input/i8042.rs") {
         "i8042 raw input ingress substrate exception; keyboard/mouse policy is inputd-owned"
-    } else if path.contains("/virtio_gpu.rs") {
+    } else if path.ends_with("/driver/virtio_gpu.rs") {
         "legacy native virtio-gpu fallback must stay deleted; use Linux .ko virtio-gpu/virtio-drm"
     } else if path.contains("/driver/linux/")
         || path.contains("/driver/devres.rs")
@@ -562,7 +614,7 @@ fn action_for_path(path: &Path) -> &'static str {
         "move HID parse/state policy into inputd, keep USB callback source"
     } else if path.contains("/serio.rs") || path.contains("/input/i8042.rs") {
         "move legacy input routing into inputd service-driver path"
-    } else if path.contains("/io/gui") || path.contains("/virtio_gpu.rs") {
+    } else if path.contains("/io/gui") || path.ends_with("/driver/virtio_gpu.rs") {
         "move provider/display policy into uiserver or service-driver path"
     } else if path.contains("/storage/") {
         "move post-bootstrap storage policy into storaged, keep raw block broker"

@@ -264,6 +264,18 @@ pub mod input {
         pub fn drain_ingress(dest: &mut [rustos_user_abi::syscall::InputIngressWire]) -> usize {
             crate::input::event_queue::drain_ingress(dest)
         }
+
+        pub fn has_pending_input_events() -> bool {
+            crate::input::event_queue::has_pending_input_events()
+        }
+
+        pub fn arm_input_waiter(task_id: u64) -> bool {
+            crate::input::event_queue::arm_input_waiter(task_id)
+        }
+
+        pub fn disarm_input_waiter(task_id: u64) {
+            crate::input::event_queue::disarm_input_waiter(task_id);
+        }
     }
 
     pub fn init() {
@@ -405,6 +417,8 @@ pub mod io {
 }
 
 pub mod usb {
+    pub use crate::usb::XhciInputDebugSnapshot;
+
     pub fn debug_pointer_report_count() -> u64 {
         crate::usb::debug_pointer_report_count()
     }
@@ -413,12 +427,20 @@ pub mod usb {
         crate::usb::debug_transfer_event_count()
     }
 
+    pub fn debug_input_snapshot() -> XhciInputDebugSnapshot {
+        crate::usb::debug_input_snapshot()
+    }
+
     pub fn init() {
         crate::usb::init();
     }
 
     pub fn service_pending() -> usize {
         crate::usb::service_pending()
+    }
+
+    pub fn uses_polled_input_completion() -> bool {
+        crate::usb::uses_polled_input_completion()
     }
 }
 

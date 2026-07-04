@@ -56,8 +56,6 @@ const MMIO_WRITE_COMBINE_FLAGS: PageTableFlags = WRITE_COMBINE_BIT;
 #[derive(Clone, Copy)]
 struct MmioWindowSlot {
     phys_block: u64,
-    #[allow(dead_code)]
-    flags_bits: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -76,7 +74,6 @@ impl MmioWindowSlot {
     const fn unmapped() -> Self {
         Self {
             phys_block: MMIO_UNMAPPED_BLOCK,
-            flags_bits: 0,
         }
     }
 
@@ -201,10 +198,7 @@ impl<const SIZE_GB: usize> PML4<SIZE_GB> {
         for block_offset in 0..block_count {
             let slot = slot_start + block_offset;
             let phys_block = phys_block_start + block_offset as u64;
-            self.mmio_blocks[slot] = MmioWindowSlot {
-                phys_block,
-                flags_bits: mmio_flags.bits(),
-            };
+            self.mmio_blocks[slot] = MmioWindowSlot { phys_block };
             self.mmio_pd[slot].set_addr(PhysAddr::new(phys_block * HUGE_2MIB), huge_flags);
             tlb::flush(VirtAddr::new(mmio_slot_base(slot)));
         }
@@ -609,12 +603,6 @@ pub fn load_address_space_phys(root_phys: PhysAddr) {
     });
 }
 
-// Kept as explicit arch hooks even when current callers go through higher-level paging wrappers.
-#[allow(dead_code)]
-pub fn load_kernel_address_space() {
-    load_address_space_phys(kernel_root_phys());
-}
-
 pub fn with_kernel_address_space<R>(f: impl FnOnce() -> R) -> R {
     interrupts::without_interrupts(|| {
         let kernel_root = kernel_root_phys();
@@ -763,16 +751,6 @@ pub fn unmap_mmio_range(virt_addr: u64, size: usize) -> bool {
         let mut pml4 = KERNEL_PML4.lock();
         pml4.unmap_mmio_blocks(virt_base, block_count)
     })
-}
-
-#[allow(dead_code)]
-pub fn mmio_addr(phys_addr: u64) -> Option<u64> {
-    map_mmio_range(phys_addr, 1)
-}
-
-#[allow(dead_code)]
-pub fn mmio_addr_wc(phys_addr: u64) -> Option<u64> {
-    map_mmio_range_wc(phys_addr, 1)
 }
 
 pub(crate) unsafe fn phys_to_table_ref(phys: PhysAddr) -> &'static PageTable {

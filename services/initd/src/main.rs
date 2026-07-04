@@ -11,8 +11,12 @@ use runtime_control::{
     DEFAULT_RUNTIME_ENV_REGISTRY_PATH, DEFAULT_STARTUP_REGISTRY_PATH,
 };
 use rustos_user_abi::syscall::{
-    LoaderSpawnRequest, LoaderSpawnResponse, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD,
-    IPC_SERVICE_NETD, IPC_SERVICE_VFSD, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, LoaderSpawnRequest,
+    LoaderSpawnResponse, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR, COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL,
+    IPC_SERVICE_DEVMGRD, IPC_SERVICE_DRIVERD, IPC_SERVICE_INPUTD, IPC_SERVICE_LINUX_SYSCALLD,
+    IPC_SERVICE_LOADERD, IPC_SERVICE_NETD, IPC_SERVICE_ROOTD, IPC_SERVICE_SESSIOND,
+    IPC_SERVICE_STORAGED, IPC_SERVICE_VFSD, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION,
     LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY,
     SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
 };
@@ -134,6 +138,7 @@ fn main() {
                     );
                     running_packages.insert(entry.package_id.clone());
                     retry_after.remove(entry.exec.as_str());
+                    report_rootd_service_lease(entry.exec.as_str(), pid);
                     if !entry.restart {
                         launched_once_packages.insert(entry.package_id.clone());
                     }
@@ -299,6 +304,101 @@ fn service_ready(service_id: u64) -> bool {
         ) as i64
     };
     result > 0
+}
+
+fn report_rootd_service_lease(exec_path: &str, pid: i32) {
+    let Some(service_id) = rootd_service_id_for_exec(exec_path) else {
+        return;
+    };
+    if pid <= 0 {
+        return;
+    }
+    match report_rootd_service_lease_inner(service_id, exec_path, pid as u64) {
+        Ok(()) => {}
+        Err(err) => observability_client::warn!(
+            "initd",
+            service,
+            "rootd lease report failed exec={} pid={} errno={}",
+            exec_path,
+            pid,
+            err
+        ),
+    }
+}
+
+fn rootd_service_id_for_exec(exec_path: &str) -> Option<u64> {
+    match exec_path {
+        DRIVERD_EXEC_PATH => Some(IPC_SERVICE_DRIVERD),
+        NETD_EXEC_PATH => Some(IPC_SERVICE_NETD),
+        DEVMGRD_EXEC_PATH => Some(IPC_SERVICE_DEVMGRD),
+        INPUTD_EXEC_PATH => Some(IPC_SERVICE_INPUTD),
+        STORAGED_EXEC_PATH => Some(IPC_SERVICE_STORAGED),
+        RUNTIMED_EXEC_PATH => Some(IPC_SERVICE_SESSIOND),
+        _ => None,
+    }
+}
+
+fn report_rootd_service_lease_inner(service_id: u64, exec_path: &str, pid: u64) -> Result<(), i32> {
+    let endpoint = lookup_service_endpoint(IPC_SERVICE_ROOTD)?;
+    let mut request = CommercialMaxProtocolRequest::default();
+    request.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    request.header.protocol = COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR;
+    request.header.op = COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL;
+    request.header.subject_pid = u64::from(std::process::id());
+    request.header.subject_tid = current_tid();
+    request.arg0 = service_id;
+    request.arg1 = pid;
+    let path = exec_path.as_bytes();
+    if path.len() > request.path.len() || path.contains(&0) {
+        return Err(libc::EINVAL);
+    }
+    request.path_len = path.len() as u32;
+    request.path[..path.len()].copy_from_slice(path);
+    let mut response = CommercialMaxProtocolResponse::default();
+    let call = unsafe {
+        libc::syscall(
+            SYS_RUSTOS_IPC_CALL as libc::c_long,
+            endpoint,
+            (&request as *const CommercialMaxProtocolRequest) as u64,
+            size_of::<CommercialMaxProtocolRequest>() as u64,
+            (&mut response as *mut CommercialMaxProtocolResponse) as u64,
+            size_of::<CommercialMaxProtocolResponse>() as u64,
+        ) as i64
+    };
+    if call < 0 {
+        return Err((-call) as i32);
+    }
+    if call as usize != size_of::<CommercialMaxProtocolResponse>()
+        || response.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
+        || response.header.protocol != COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR
+        || response.header.op != COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL
+    {
+        return Err(libc::EINVAL);
+    }
+    if response.status != 0 {
+        return Err(response.status);
+    }
+    Ok(())
+}
+
+fn lookup_service_endpoint(service_id: u64) -> Result<u64, i32> {
+    let endpoint = unsafe {
+        libc::syscall(
+            SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT as libc::c_long,
+            service_id,
+        ) as i64
+    };
+    if endpoint < 0 {
+        Err((-endpoint) as i32)
+    } else if endpoint == 0 {
+        Err(libc::ENOENT)
+    } else {
+        Ok(endpoint as u64)
+    }
+}
+
+fn current_tid() -> u64 {
+    unsafe { libc::syscall(libc::SYS_gettid as libc::c_long) as u64 }
 }
 
 fn runtime_deps_satisfied(

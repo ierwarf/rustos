@@ -1,7 +1,7 @@
 use anyhow::{Context, anyhow, bail};
 use fs_err as fs;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 use walkdir::{DirEntry, WalkDir};
@@ -375,7 +375,7 @@ fn validate_manifests(manifests: &[PackageManifest]) -> Result<()> {
                 manifest.manifest_path.display()
             );
         }
-        if manifest.install.path.starts_with('/') || manifest.install.path.is_empty() {
+        if !is_normal_relative_install_path(&manifest.install.path) {
             bail!(
                 "package {} has invalid install path {}",
                 manifest.id,
@@ -606,6 +606,13 @@ fn validate_manifest_location(manifest: &PackageManifest) -> Result<()> {
     ))
 }
 
+fn is_normal_relative_install_path(path: &str) -> bool {
+    !path.is_empty()
+        && Path::new(path)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
 fn validate_install_taxonomy(manifest: &PackageManifest) -> Result<()> {
     let path = manifest.install.path.as_str();
 
@@ -676,6 +683,7 @@ mod tests {
                 dependency_crates: Vec::new(),
                 extra_args: Vec::new(),
                 optional: false,
+                linkage: None,
             },
             install: InstallSpec {
                 path: format!("services/{id}/{id}.elf"),
@@ -758,5 +766,20 @@ mod tests {
         assert!(
             err.contains("uiserver runtime_deps includes package storaged outside profile default")
         );
+    }
+
+    #[test]
+    fn install_paths_must_be_normal_relative_components() {
+        assert!(is_normal_relative_install_path("services/initd/initd.elf"));
+        assert!(!is_normal_relative_install_path(""));
+        assert!(!is_normal_relative_install_path(
+            "/services/initd/initd.elf"
+        ));
+        assert!(!is_normal_relative_install_path(
+            "services/../initd/initd.elf"
+        ));
+        assert!(!is_normal_relative_install_path(
+            "./services/initd/initd.elf"
+        ));
     }
 }

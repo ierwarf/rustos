@@ -63,6 +63,11 @@ pub(crate) unsafe extern "C" fn bus_register_notifier(
     bus: *mut c_void,
     notifier: *mut c_void,
 ) -> i32 {
+    crate::driver::symbol_events::record_device_model_symbol(
+        "bus_register_notifier",
+        bus as usize,
+        notifier as u64,
+    );
     super::compat_log::debugcon_line(
         alloc::format!(
             "linux compat: bus_register_notifier bus={:#x} notifier={:#x}",
@@ -90,6 +95,7 @@ pub(crate) unsafe extern "C" fn bus_unregister_notifier(
 }
 
 pub(crate) unsafe extern "C" fn bus_register(bus: *mut c_void) -> i32 {
+    crate::driver::symbol_events::record_device_model_symbol("bus_register", bus as usize, 0);
     super::compat_log::debugcon_line(
         alloc::format!("linux compat: bus_register begin ptr={:#x}", bus as usize).as_bytes(),
     );
@@ -179,6 +185,7 @@ pub(crate) unsafe extern "C" fn bus_rescan_devices(bus: *mut c_void) -> i32 {
 }
 
 pub(crate) unsafe extern "C" fn class_register(class: *mut c_void) -> i32 {
+    crate::driver::symbol_events::record_device_model_symbol("class_register", class as usize, 0);
     super::compat_log::debugcon_line(
         alloc::format!(
             "linux compat: class_register begin ptr={:#x}",
@@ -215,6 +222,11 @@ pub(crate) unsafe extern "C" fn driver_register(driver: *mut LinuxCompatDeviceDr
         return -22;
     }
     let bus = unsafe { (*driver).bus as usize };
+    crate::driver::symbol_events::record_device_model_symbol(
+        "driver_register",
+        driver as usize,
+        bus as u64,
+    );
     if bus != 0 {
         let _ = unsafe { bus_register(bus as *mut c_void) };
     }

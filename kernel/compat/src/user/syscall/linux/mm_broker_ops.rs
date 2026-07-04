@@ -212,17 +212,45 @@ fn broker_map_device_shared(args: &RustosMmBrokerArgs) -> Result<(), i64> {
     let page_count = page_count(len)?;
 
     let Some(result) = multitask::with_process_state_by_pid_mut(args.target_pid, |process_state| {
+        let mut surface_fd = args.fd;
         let entry = process_state
             .handles()
             .get_entry(args.fd)
             .ok_or(LINUX_EBADF)?;
-        if !entry.rights().allows_shared_map() {
+        match entry.handle() {
+            KernelHandle::DisplaySurface(_) => {
+                if !entry.rights().allows_shared_map() {
+                    return Err(LINUX_EACCES);
+                }
+            }
+            KernelHandle::RemoteVfs(remote)
+                if remote.kind() == RemoteVfsHandleKind::Device
+                    && remote.path().as_str() == "/dev/dri/card0" =>
+            {
+                if args.offset == 0 || !entry.rights().allows_read() {
+                    return Err(LINUX_EINVAL);
+                }
+                surface_fd = args.offset;
+            }
+            KernelHandle::Device(_) if args.offset != 0 => {
+                if !entry.rights().allows_shared_map() {
+                    return Err(LINUX_EACCES);
+                }
+                surface_fd = args.offset;
+            }
+            _ => return Err(LINUX_ENODEV),
+        }
+        let surface_entry = process_state
+            .handles()
+            .get_entry(surface_fd)
+            .ok_or(LINUX_EBADF)?;
+        if !surface_entry.rights().allows_shared_map() {
             return Err(LINUX_EACCES);
         }
-        let KernelHandle::DisplaySurface(mut surface) = *entry.handle() else {
+        let KernelHandle::DisplaySurface(mut surface) = *surface_entry.handle() else {
             return Err(LINUX_ENODEV);
         };
-        if args.offset != 0 || args.len != surface.mapping_len() {
+        if args.len != surface.mapping_len() {
             return Err(LINUX_EINVAL);
         }
         if let Some(region) = surface.mapped_region() {
@@ -243,7 +271,7 @@ fn broker_map_device_shared(args: &RustosMmBrokerArgs) -> Result<(), i64> {
         surface.set_mapped_region(region);
         let slot = process_state
             .handles_mut()
-            .get_mut(args.fd)
+            .get_mut(surface_fd)
             .ok_or(LINUX_EBADF)?;
         *slot = KernelHandle::DisplaySurface(surface);
         process_state.set_mapping_cursor(region.end().as_u64());

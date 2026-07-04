@@ -8,9 +8,7 @@ use crate::io::session::ConsoleSessionHandle;
 use crate::memory::paging::ProcessAddressSpace;
 use crate::user::abi::UserAbi;
 use crate::user::linux::{LinuxProcessState, LinuxThreadState};
-use crate::user::process_state::{
-    ProcessSecurityContext, UserProcessState, WindowsThreadRuntimeState,
-};
+use crate::user::process_state::{ProcessSecurityContext, UserProcessState};
 
 pub fn current_user_address_space() -> Option<RetainedCurrentUserAddressSpace> {
     let (_, abi, process) = retain_current_user_process_binding()?;
@@ -33,6 +31,10 @@ pub fn current_user_log_ids() -> Option<(u64, u64)> {
     interrupts::without_interrupts(|| unsafe { scheduler_ref().current_user_log_ids() })
 }
 
+pub fn user_log_ids_for_task(task_id: u64) -> Option<(u64, u64)> {
+    interrupts::without_interrupts(|| unsafe { scheduler_ref().user_log_ids_for_task(task_id) })
+}
+
 pub fn current_user_process_id() -> Option<u64> {
     current_user_snapshot().map(|snapshot| snapshot.process_id())
 }
@@ -50,7 +52,6 @@ pub fn current_user_stack_state() -> Option<super::UserStackState> {
     interrupts::without_interrupts(|| unsafe { scheduler_ref().current_user_stack_state() })
 }
 
-#[allow(dead_code)]
 pub fn current_user_thread_id() -> Option<u64> {
     current_user_snapshot().map(|snapshot| snapshot.thread_id())
 }
@@ -285,15 +286,6 @@ pub fn queue_linux_signal(process_id: u64, task_id: u64, signal: u64) -> bool {
     })
 }
 
-#[allow(dead_code)]
-pub fn with_current_user_windows_thread_state_mut<R>(
-    f: impl FnOnce(u64, &mut WindowsThreadRuntimeState) -> R,
-) -> Option<R> {
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().with_current_user_windows_thread_state_mut(f)
-    })
-}
-
 pub fn any_user_process_state(mut f: impl FnMut(u64, &UserProcessState) -> bool) -> bool {
     let (handles, len) = interrupts::without_interrupts(|| unsafe {
         scheduler_ref().user_process_handles_snapshot()
@@ -364,8 +356,9 @@ pub fn halt_current_retired_task() -> ! {
 pub(crate) fn exit_current_task() -> ! {
     interrupts::without_interrupts(|| unsafe {
         let task_id = scheduler_ref().current_task_id();
-        let callers_to_wake = task_id
+        let endpoint_wake_set = task_id
             .map(|task_id| {
+                kernel_ipc_runtime::api::remove_endpoint_waiters_for_task(task_id);
                 kernel_ipc_runtime::api::fail_endpoints_owned_by_task(
                     task_id,
                     kernel_ipc_runtime::api::IpcError::PeerClosed,
@@ -373,7 +366,10 @@ pub(crate) fn exit_current_task() -> ! {
             })
             .unwrap_or_default();
         let scheduler = scheduler_mut();
-        for task_id in callers_to_wake {
+        for task_id in endpoint_wake_set.callers {
+            let _ = scheduler.wake_task(task_id);
+        }
+        for task_id in endpoint_wake_set.receivers {
             let _ = scheduler.wake_task(task_id);
         }
         scheduler.exit_current_task();
@@ -383,17 +379,6 @@ pub(crate) fn exit_current_task() -> ! {
 
 pub fn exit_current_user_task() -> ! {
     exit_current_task()
-}
-
-#[allow(dead_code)]
-pub fn current_last_error() -> u32 {
-    interrupts::without_interrupts(|| unsafe { scheduler_ref().current_last_error() })
-}
-
-pub fn set_current_last_error(value: u32) {
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().set_current_last_error(value);
-    });
 }
 
 pub fn service_deferred_work() -> usize {

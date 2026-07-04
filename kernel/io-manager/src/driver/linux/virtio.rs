@@ -8,7 +8,7 @@ use core::{ptr, slice};
 use crate::sync::KernelSpinLock as Mutex;
 use driver_abi::{DriverBus, DriverClass};
 
-use super::compat::{LinuxCompatDeviceDriver, LinuxCompatListHead, compat_cstr};
+use super::compat::{compat_cstr, LinuxCompatDeviceDriver, LinuxCompatListHead};
 
 const ENODEV: i32 = -19;
 const EINVAL: i32 = -22;
@@ -126,6 +126,11 @@ pub(crate) fn enter_module_init_policy(policy: ModuleInitPolicy) -> ModuleInitPo
 unsafe extern "C" fn register_virtio_driver(driver: *mut c_void) -> i32 {
     let driver_name = virtio_driver_name(driver);
     let driver_name_hash = driver_name.map(stable_ascii_hash).unwrap_or(0);
+    crate::driver::symbol_events::record_virtio_probe_init_symbol(
+        "__register_virtio_driver",
+        driver as usize,
+        driver_name_hash,
+    );
     crate::debug::record_milestone(
         crate::debug::LogCategory::Driver,
         "linux-virtio-register",
@@ -144,19 +149,21 @@ unsafe extern "C" fn register_virtio_driver(driver: *mut c_void) -> i32 {
     register_driver_record(driver, policy.class, driver_name_hash);
     if policy.class == DriverClass::Network {
         crate::network::note_virtio_net_driver_registered();
-    } else if policy.class == DriverClass::Display
-        && crate::io::gui::install_inherited_primary_scanout_from_boot()
-    {
+    } else if policy.class == DriverClass::Display {
         crate::debug::record_milestone(
             crate::debug::LogCategory::Driver,
-            "virtio-gpu-inherited-scanout",
+            "virtio-gpu-driver-registered",
             driver as usize as u64,
             driver_name_hash,
         );
-        crate::debug::info!(
-            display,
-            "virtio-gpu: inherited virtio-vga scanout registered"
-        );
+        match crate::driver::linux::virtio_gpu::ensure_primary_provider() {
+            Ok(()) => crate::debug::info!(display, "virtio-gpu: primary provider ready"),
+            Err(err) => crate::debug::warn!(
+                display,
+                "virtio-gpu: native provider publish failed after driver register: {:?}",
+                err
+            ),
+        }
     }
     let status = 0;
     crate::debug::record_milestone(
@@ -169,6 +176,11 @@ unsafe extern "C" fn register_virtio_driver(driver: *mut c_void) -> i32 {
 }
 
 unsafe extern "C" fn unregister_virtio_driver(driver: *mut c_void) {
+    crate::driver::symbol_events::record_virtio_probe_init_symbol(
+        "unregister_virtio_driver",
+        driver as usize,
+        0,
+    );
     crate::debug::record_milestone(
         crate::debug::LogCategory::Driver,
         "linux-virtio-unregister",

@@ -57,6 +57,11 @@ pub(crate) unsafe extern "C" fn usb_register_driver(
     if driver.is_null() {
         return -22;
     }
+    crate::driver::symbol_events::record_usb_probe_init_symbol(
+        "usb_register_driver",
+        driver as usize,
+        0,
+    );
     usb_compat_diag!(debug, "linux compat: usb_register_driver nonnull");
 
     unsafe {
@@ -430,7 +435,13 @@ pub(crate) unsafe extern "C" fn __usb_get_extra_descriptor(
                 alloc::format!(
                     "__usb_get_extra_descriptor: found offset={} ptr={:#x}",
                     offset,
-                    unsafe { if out.is_null() { 0 } else { *out as usize } }
+                    unsafe {
+                        if out.is_null() {
+                            0
+                        } else {
+                            *out as usize
+                        }
+                    }
                 )
                 .as_bytes(),
             );

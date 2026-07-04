@@ -20,10 +20,7 @@ use crate::user::process_state::{UserProcessState, WindowsThreadRuntimeState};
 
 use super::context::{SAVED_CONTEXT_BYTES, SavedContext};
 use super::process_table::{self, ProcessHandle};
-use super::{
-    CurrentUserSnapshot, UserFaultDisposition, UserStackState, UserTaskBootstrap,
-    initial_task_rflags,
-};
+use super::{UserFaultDisposition, UserStackState, UserTaskBootstrap, initial_task_rflags};
 
 pub(super) const MAX_TASK: usize = 32;
 const ROOT_TASK_SLOT: usize = 0;
@@ -168,7 +165,6 @@ struct TaskContext {
     /// `commit_block_current_task` observes that a wake raced and refuses to
     /// block. Mirrors Linux's `prepare_to_wait` / `set_current_state` pattern.
     wake_armed: bool,
-    pit_divisor: u16,
     /// CFS-like load weight. Bigger weight -> larger CPU share. Derived from
     /// the task's `weight_micros` / pit_divisor at allocation time.
     weight: u32,
@@ -204,7 +200,6 @@ pub(super) struct Scheduler {
     contexts: [Option<TaskContext>; MAX_TASK],
     retired: [bool; MAX_TASK],
     retire_reasons: [Option<TaskRetireReason>; MAX_TASK],
-    last_errors: [u32; MAX_TASK],
     simd_states: [SimdState; MAX_TASK],
     starts: [Option<TaskStart>; MAX_TASK],
     stacks: [Option<Vec<u8>>; MAX_TASK],
@@ -237,7 +232,6 @@ impl Scheduler {
             contexts: [None; MAX_TASK],
             retired: [false; MAX_TASK],
             retire_reasons: [None; MAX_TASK],
-            last_errors: [0; MAX_TASK],
             simd_states: [SimdState::new(); MAX_TASK],
             starts: [None; MAX_TASK],
             stacks: [const { None }; MAX_TASK],
@@ -329,7 +323,6 @@ impl Scheduler {
         self.simd_states = [SimdState::new(); MAX_TASK];
         self.retired = [false; MAX_TASK];
         self.retire_reasons = [None; MAX_TASK];
-        self.last_errors = [0; MAX_TASK];
         self.current_task = ROOT_TASK_SLOT;
         self.pending_reap = false;
         self.root_idle = false;
@@ -351,7 +344,6 @@ impl Scheduler {
             blocked: false,
             blocked_since_ticks: 0,
             wake_armed: false,
-            pit_divisor: main_thread_pit_divisor,
             weight: Self::weight_from_pit_divisor(main_thread_pit_divisor),
             vruntime_ns: 0,
             exec_start_ticks: crate::arch::rtc::ticks(),
@@ -391,7 +383,6 @@ impl Scheduler {
         self.contexts[slot] = None;
         self.retired[slot] = false;
         self.retire_reasons[slot] = None;
-        self.last_errors[slot] = 0;
         self.simd_states[slot] = SimdState::new();
         self.starts[slot] = None;
         self.release_stack_storage(slot);
@@ -639,6 +630,33 @@ impl Scheduler {
                 None => best = Some((slot, key)),
                 Some((_, bk)) if key < bk => best = Some((slot, key)),
                 _ => {}
+            }
+        }
+        best.map(|(slot, _)| slot)
+    }
+
+    fn pick_burst_alternate_in_current_class(&self, current: usize) -> Option<usize> {
+        let class = self.slot_class(current)?;
+        let mut best: Option<(usize, u64)> = None;
+        for slot in 0..MAX_TASK {
+            if slot == current || !self.is_fair_candidate_slot(slot) {
+                continue;
+            }
+            let Some(ctx) = self.contexts[slot] else {
+                continue;
+            };
+            if !ctx.ready || !self.context_is_schedulable(slot, ctx) {
+                continue;
+            }
+            if self.slot_class(slot) != Some(class) {
+                continue;
+            }
+            let key = ctx.vruntime_ns;
+            if best
+                .map(|(_, current_key)| key < current_key)
+                .unwrap_or(true)
+            {
+                best = Some((slot, key));
             }
         }
         best.map(|(slot, _)| slot)
@@ -917,14 +935,6 @@ impl Scheduler {
             .err()
     }
 
-    // This validator is retained as a standalone probe for future scheduler self-tests.
-    #[allow(dead_code)]
-    fn validate_context_slot(&self, slot: usize) -> Result<TaskContext, &'static str> {
-        let context = self.contexts[slot].ok_or("task context is missing")?;
-        self.validate_saved_context(slot, context.user_mode, context.saved_rsp)?;
-        Ok(context)
-    }
-
     fn saved_context_ref(saved_rsp: usize) -> Option<&'static SavedContext> {
         if saved_rsp == 0 || (saved_rsp & (mem::align_of::<SavedContext>() - 1)) != 0 {
             return None;
@@ -1055,7 +1065,6 @@ impl Scheduler {
                     blocked: false,
                     blocked_since_ticks: 0,
                     wake_armed: false,
-                    pit_divisor,
                     weight: Self::weight_from_pit_divisor(pit_divisor),
                     vruntime_ns: self
                         .last_min_vruntime_ns
@@ -1142,7 +1151,6 @@ impl Scheduler {
                     blocked: false,
                     blocked_since_ticks: 0,
                     wake_armed: false,
-                    pit_divisor,
                     weight: Self::weight_from_pit_divisor(pit_divisor),
                     vruntime_ns: self
                         .last_min_vruntime_ns
@@ -1208,7 +1216,6 @@ impl Scheduler {
                     blocked: false,
                     blocked_since_ticks: 0,
                     wake_armed: false,
-                    pit_divisor,
                     weight: Self::weight_from_pit_divisor(pit_divisor),
                     vruntime_ns: self
                         .last_min_vruntime_ns
@@ -1275,7 +1282,6 @@ impl Scheduler {
                     blocked: false,
                     blocked_since_ticks: 0,
                     wake_armed: false,
-                    pit_divisor,
                     weight: Self::weight_from_pit_divisor(pit_divisor),
                     vruntime_ns: self
                         .last_min_vruntime_ns
@@ -1368,7 +1374,6 @@ impl Scheduler {
                     blocked: false,
                     blocked_since_ticks: 0,
                     wake_armed: false,
-                    pit_divisor,
                     weight: Self::weight_from_pit_divisor(pit_divisor),
                     vruntime_ns: self
                         .last_min_vruntime_ns
@@ -1689,6 +1694,11 @@ impl Scheduler {
         current_runtime_ns: u64,
     ) -> usize {
         if cfs_pick == current_slot {
+            if current_runtime_ns >= SCHED_MAX_BURST_NS {
+                if let Some(alternate) = self.pick_burst_alternate_in_current_class(current_slot) {
+                    return alternate;
+                }
+            }
             return cfs_pick;
         }
         if !self.is_fair_candidate_slot(current_slot) {
@@ -1910,27 +1920,6 @@ impl Scheduler {
         }
     }
 
-    #[allow(dead_code)]
-    pub(super) fn current_user_snapshot(&self) -> Option<CurrentUserSnapshot> {
-        let context = self.contexts[self.current_task]?;
-        if !context.user_mode {
-            return None;
-        }
-
-        let abi = context.user_abi?;
-        let thread_id = self.starts[self.current_task].map(|start| start.id)?;
-        let process_handle = context.process_handle?;
-        process_table::with_process_state(process_handle, |process_id, process_state| {
-            CurrentUserSnapshot::new(
-                abi,
-                thread_id,
-                process_id,
-                context.console_session,
-                process_state.security(),
-            )
-        })
-    }
-
     pub(super) fn current_user_process_binding(
         &self,
     ) -> Option<(u64, UserAbi, ProcessHandle, ConsoleSessionHandle)> {
@@ -1975,6 +1964,17 @@ impl Scheduler {
 
     pub(super) fn current_user_log_ids(&self) -> Option<(u64, u64)> {
         let slot = self.current_task;
+        let context = self.contexts[slot]?;
+        if !context.user_mode {
+            return None;
+        }
+        let process_id = context.process_id?;
+        let thread_id = self.starts[slot].map(|start| start.id)?;
+        Some((process_id, thread_id))
+    }
+
+    pub(super) fn user_log_ids_for_task(&self, task_id: u64) -> Option<(u64, u64)> {
+        let slot = self.find_task_slot(task_id)?;
         let context = self.contexts[slot]?;
         if !context.user_mode {
             return None;
@@ -2057,23 +2057,6 @@ impl Scheduler {
         (seen, seen_count)
     }
 
-    // Windows thread state mutation is a staged API even before more callers land.
-    #[allow(dead_code)]
-    pub(super) fn with_current_user_windows_thread_state_mut<R>(
-        &mut self,
-        f: impl FnOnce(u64, &mut WindowsThreadRuntimeState) -> R,
-    ) -> Option<R> {
-        let slot = self.current_task;
-        let context = self.contexts[slot].as_mut()?;
-        if !context.user_mode {
-            return None;
-        }
-
-        let tid = self.starts[slot].map(|start| start.id)?;
-        let thread_state = context.windows_thread_state.as_mut()?;
-        Some(f(tid, thread_state))
-    }
-
     pub(super) fn exec_current_user_process(
         &mut self,
         address_space: ProcessAddressSpace,
@@ -2137,7 +2120,6 @@ impl Scheduler {
 
         self.retired[slot] = false;
         self.retire_reasons[slot] = None;
-        self.last_errors[slot] = 0;
         self.simd_states[slot] = SimdState::new();
         self.starts[slot] = Some(TaskStart {
             entry: super::noop_task_entry,
@@ -2226,7 +2208,6 @@ impl Scheduler {
         }
         self.retired[slot] = false;
         self.retire_reasons[slot] = None;
-        self.last_errors[slot] = 0;
         self.simd_states[slot] = SimdState::new();
         self.starts[slot] = Some(TaskStart {
             entry: super::noop_task_entry,
@@ -2473,11 +2454,6 @@ impl Scheduler {
         UserFaultDisposition::Retired
     }
 
-    #[allow(dead_code)]
-    pub(super) fn current_last_error(&self) -> u32 {
-        self.last_errors[self.current_task]
-    }
-
     pub(super) fn is_user_task_alive(&self, task_id: u64) -> bool {
         let Some(slot) = self.find_user_task_slot(task_id) else {
             return false;
@@ -2697,10 +2673,6 @@ impl Scheduler {
         true
     }
 
-    pub(super) fn set_current_last_error(&mut self, value: u32) {
-        self.last_errors[self.current_task] = value;
-    }
-
     pub(super) fn exit_current_task(&mut self) {
         crate::debug::trace_loc!();
         let slot = self.current_task;
@@ -2851,7 +2823,7 @@ fn stack_range_contains(base: u64, top: u64, start: usize, end: usize) -> bool {
 mod tests {
     use alloc::boxed::Box;
 
-    use super::{ConsoleSessionHandle, MAX_TASK, Scheduler, TaskContext};
+    use super::{ConsoleSessionHandle, MAX_TASK, NICE_0_LOAD, Scheduler, TaskContext};
     use crate::memory::paging::ProcessAddressSpace;
     use crate::multitask::process_table;
     use crate::user::abi::UserAbi;
@@ -2865,7 +2837,6 @@ mod tests {
             blocked: false,
             blocked_since_ticks: 0,
             wake_armed: false,
-            pit_divisor: 0,
             weight: NICE_0_LOAD,
             vruntime_ns: 0,
             exec_start_ticks: 0,
@@ -2878,7 +2849,7 @@ mod tests {
             user_abi: Some(UserAbi::Linux),
             console_session: ConsoleSessionHandle::SYSTEM,
             process_handle: Some(handle),
-            process_id: process_table::process_id(handle),
+            process_id: process_table::with_process_state(handle, |pid, _| pid),
             user_stack: None,
             linux_thread_state: None,
             windows_thread_state: None,

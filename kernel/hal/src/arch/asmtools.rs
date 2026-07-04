@@ -1,7 +1,6 @@
 use core::arch::asm;
 
 #[inline]
-#[allow(dead_code)]
 pub fn current_rip() -> u64 {
     let rip: u64;
     unsafe {

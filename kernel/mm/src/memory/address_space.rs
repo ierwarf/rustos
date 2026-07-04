@@ -5,8 +5,8 @@ use core::ptr;
 use x86_64::PhysAddr;
 use x86_64::VirtAddr;
 use x86_64::instructions::{interrupts, tlb};
-use x86_64::registers::control::{Cr3, Cr3Flags};
-use x86_64::structures::paging::{PageTable, PageTableFlags, PhysFrame};
+use x86_64::registers::control::Cr3;
+use x86_64::structures::paging::{PageTable, PageTableFlags};
 
 use crate::memory::{kernel_vm, phys};
 
@@ -610,51 +610,6 @@ impl ProcessAddressSpace {
         Ok(())
     }
 
-    // Retained for future user-mode memset paths and zero-fill sysops.
-    #[allow(dead_code)]
-    pub fn zero_user_bytes(
-        &self,
-        start: VirtAddr,
-        byte_len: usize,
-    ) -> Result<(), AddressSpaceError> {
-        self.validate_user_buffer_access(start, byte_len, UserBufferAccess::Write)?;
-        self.zero_user_bytes_unchecked(start, byte_len)
-    }
-
-    #[allow(dead_code)]
-    pub fn zero_user_bytes_unchecked(
-        &self,
-        start: VirtAddr,
-        byte_len: usize,
-    ) -> Result<(), AddressSpaceError> {
-        if byte_len == 0 {
-            return Ok(());
-        }
-
-        let mut cursor = start.as_u64();
-        let mut zeroed = 0usize;
-
-        while zeroed < byte_len {
-            let virt = VirtAddr::new(cursor);
-            let phys = self
-                .translate_user(virt)
-                .ok_or(AddressSpaceError::NotMapped)?;
-            let page_offset = (cursor as usize) & (PAGE_4KIB - 1);
-            let chunk = min(PAGE_4KIB - page_offset, byte_len - zeroed);
-
-            unsafe {
-                ptr::write_bytes(higher_half_ptr(phys), 0, chunk);
-            }
-
-            cursor = cursor
-                .checked_add(chunk as u64)
-                .ok_or(AddressSpaceError::AddressOverflow)?;
-            zeroed += chunk;
-        }
-
-        Ok(())
-    }
-
     fn validate_user_buffer_access(
         &self,
         start: VirtAddr,
@@ -697,15 +652,6 @@ impl ProcessAddressSpace {
         }
 
         Ok(())
-    }
-
-    // Retained for future per-process CR3 switching outside the current scheduler path.
-    #[allow(dead_code)]
-    pub unsafe fn load(&self) {
-        let frame = PhysFrame::containing_address(self.root_phys());
-        unsafe {
-            Cr3::write(frame, Cr3Flags::empty());
-        }
     }
 
     fn root_table_ref(&self) -> &'static PageTable {

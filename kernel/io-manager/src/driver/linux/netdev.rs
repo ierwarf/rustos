@@ -19,6 +19,7 @@ unsafe extern "C" fn register_netdevice(dev: *mut c_void) -> i32 {
     if dev.is_null() {
         return -22;
     }
+    crate::driver::symbol_events::record_netdev_symbol("register_netdevice", dev as usize, 0);
     crate::network::register_linux_netdev(
         dev as usize,
         crate::network::current_linux_netdev_transport(),
@@ -27,11 +28,17 @@ unsafe extern "C" fn register_netdevice(dev: *mut c_void) -> i32 {
 
 unsafe extern "C" fn unregister_netdev(dev: *mut c_void) {
     if !dev.is_null() {
+        crate::driver::symbol_events::record_netdev_symbol("unregister_netdev", dev as usize, 0);
         crate::network::unregister_linux_netdev(dev as usize);
     }
 }
 
 unsafe extern "C" fn alloc_etherdev_mqs(sizeof_priv: i32, txqs: u32, rxqs: u32) -> *mut c_void {
+    crate::driver::symbol_events::record_netdev_symbol(
+        "alloc_etherdev_mqs",
+        0,
+        ((txqs as u64) << 32) | u64::from(rxqs),
+    );
     let Some(queue_count) = (txqs as usize).checked_add(rxqs as usize) else {
         return ptr::null_mut();
     };
@@ -54,18 +61,21 @@ unsafe extern "C" fn free_netdev(dev: *mut c_void) {
     if dev.is_null() {
         return;
     }
+    crate::driver::symbol_events::record_netdev_symbol("free_netdev", dev as usize, 0);
     crate::network::free_linux_netdev(dev as usize);
     unsafe { super::base::kfree(dev) };
 }
 
 unsafe extern "C" fn netif_carrier_on(dev: *mut c_void) {
     if !dev.is_null() {
+        crate::driver::symbol_events::record_netdev_symbol("netif_carrier_on", dev as usize, 1);
         crate::network::set_linux_netdev_carrier(dev as usize, true);
     }
 }
 
 unsafe extern "C" fn netif_carrier_off(dev: *mut c_void) {
     if !dev.is_null() {
+        crate::driver::symbol_events::record_netdev_symbol("netif_carrier_off", dev as usize, 0);
         crate::network::set_linux_netdev_carrier(dev as usize, false);
     }
 }

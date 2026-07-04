@@ -14,7 +14,7 @@ use core::hint::spin_loop;
 use core::mem::size_of;
 use core::num::NonZeroUsize;
 use core::ptr;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 
 use crate::sync::KernelSpinLock as Mutex;
 use xhci::Registers as XhciRegisters;
@@ -25,7 +25,8 @@ use xhci::registers::doorbell::Register as DoorbellRegister;
 use xhci::registers::operational::PortStatusAndControlRegister;
 use xhci::ring::trb::command::{
     AddressDevice as AddressDeviceCommand, ConfigureEndpoint as ConfigureEndpointCommand,
-    EnableSlot as EnableSlotCommand,
+    EnableSlot as EnableSlotCommand, SetTrDequeuePointer as SetTrDequeuePointerCommand,
+    StopEndpoint as StopEndpointCommand,
 };
 use xhci::ring::trb::event::{Allowed as EventTrb, CompletionCode};
 use xhci::ring::trb::transfer::{
@@ -43,11 +44,20 @@ const XHCI_TRB_TYPE_MASK: u32 = 0x3f << XHCI_TRB_TYPE_SHIFT;
 const XHCI_COMMAND_RING_TRBS: usize = 256;
 const XHCI_EVENT_RING_TRBS: usize = 256;
 const XHCI_TRANSFER_RING_TRBS: usize = 32;
+const XHCI_DEVICE_CONTEXT_COUNT: usize = 32;
+const XHCI_INPUT_CONTEXT_COUNT: usize = XHCI_DEVICE_CONTEXT_COUNT + 1;
+const XHCI_INTERRUPT_POLL_QUEUE_DEPTH: usize = 1;
 const XHCI_CONTROL_BUFFER_BYTES: usize = 4096;
 const XHCI_REGISTER_WAIT_SPINS: usize = 1_000_000;
 const XHCI_EVENT_WAIT_SPINS: usize = 20_000_000;
 const XHCI_TRANSFER_LOG_LIMIT: usize = 0;
 const XHCI_POLL_SUBMIT_LOG_LIMIT: usize = 0;
+const XHCI_POLL_IDLE_DOORBELL_MS: u64 = 96;
+// Interrupt IN transfers are allowed to remain pending while the device has no
+// fresh report. Stop Endpoint is a last-resort watchdog, not a short idle path.
+const XHCI_POLL_IDLE_RECOVERY_MS: u64 = 5_000;
+const XHCI_POLL_RECOVERY_COOLDOWN_MS: u64 = 5_000;
+const XHCI_RECOVERY_EVENT_DRAIN_LIMIT: usize = 32;
 const ENABLE_NATIVE_XHCI_HID_POLL: bool = true;
 
 const USB_DT_DEVICE: u8 = 0x01;
@@ -59,10 +69,13 @@ const USB_DT_REPORT: u8 = 0x22;
 
 const USB_REQ_GET_DESCRIPTOR: u8 = 0x06;
 const USB_REQ_SET_CONFIGURATION: u8 = 0x09;
+const USB_REQ_HID_SET_IDLE: u8 = 0x0a;
+const USB_HID_IDLE_RATE_EVENT_DRIVEN: u16 = 0;
 
 const USB_DIR_OUT: u8 = 0x00;
 const USB_DIR_IN: u8 = 0x80;
 const USB_TYPE_STANDARD: u8 = 0x00 << 5;
+const USB_TYPE_CLASS: u8 = 0x01 << 5;
 const USB_RECIP_DEVICE: u8 = 0x00;
 const USB_RECIP_INTERFACE: u8 = 0x01;
 const USB_ENDPOINT_XFER_INT: u8 = 0x03;
@@ -74,10 +87,19 @@ const XHCI_COMP_SLOT_NOT_ENABLED: u8 = CompletionCode::SlotNotEnabledError as u8
 const XHCI_COMP_ENDPOINT_NOT_ENABLED: u8 = CompletionCode::EndpointNotEnabledError as u8;
 const XHCI_COMP_STALL: u8 = CompletionCode::StallError as u8;
 const XHCI_COMP_CONTEXT_STATE: u8 = CompletionCode::ContextStateError as u8;
+const XHCI_COMP_STOPPED: u8 = CompletionCode::Stopped as u8;
+const XHCI_COMP_STOPPED_LENGTH_INVALID: u8 = CompletionCode::StoppedLengthInvalid as u8;
+const XHCI_COMP_STOPPED_SHORT_PACKET: u8 = CompletionCode::StoppedShortPacket as u8;
 
 type XhciTrb = [u32; 4];
 
 static XHCI_TRANSFER_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
+static XHCI_TRANSFER_SUCCESS_COUNT: AtomicU64 = AtomicU64::new(0);
+static XHCI_TRANSFER_SHORT_COUNT: AtomicU64 = AtomicU64::new(0);
+static XHCI_TRANSFER_EMPTY_COUNT: AtomicU64 = AtomicU64::new(0);
+static XHCI_TRANSFER_REPORT_COUNT: AtomicU64 = AtomicU64::new(0);
+static XHCI_TRANSFER_RESUBMIT_COUNT: AtomicU64 = AtomicU64::new(0);
+static XHCI_TRANSFER_RESUBMIT_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, FromBytes, Immutable, IntoBytes, KnownLayout)]
@@ -101,21 +123,78 @@ struct XhciRing {
     cycle_state: bool,
 }
 
+struct XhciPollTransfer {
+    buffer: XhciDmaBuffer,
+    trb_dma: u64,
+    active: bool,
+}
+
 struct XhciEnumeratedDevice {
     slot_id: u8,
+    speed: u8,
     usb_device_ptr: usize,
     interface_ptr: usize,
     interface_number: u8,
     endpoint_address: u8,
     endpoint_max_packet_size: u16,
+    endpoint_interval: u8,
+    endpoint_context_interval: u8,
+    context_size: usize,
+    report_descriptor: Vec<u8>,
     ep_index: usize,
     output_context: XhciDmaBuffer,
     input_context: XhciDmaBuffer,
     ep0_ring: XhciRing,
     interrupt_ring: XhciRing,
     control_buffer: XhciDmaBuffer,
-    poll_buffer: XhciDmaBuffer,
+    poll_transfers: Vec<XhciPollTransfer>,
     pending_poll_trb_dma: u64,
+    input_poll_last_activity_tick: u64,
+    input_poll_last_nudge_tick: u64,
+    input_poll_last_recovery_tick: u64,
+    input_poll_recovering: bool,
+    input_poll_report_seen: bool,
+    input_poll_last_completion_code: u8,
+    input_poll_recovery_stage: u8,
+    input_poll_recovery_drained_events: u64,
+    input_poll_doorbell_nudges: u64,
+    input_poll_ring_recoveries: u64,
+    input_poll_ring_recovery_failures: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct XhciInputDebugSnapshot {
+    pub slot_id: u8,
+    pub speed: u8,
+    pub endpoint_address: u8,
+    pub endpoint_max_packet_size: u16,
+    pub endpoint_interval: u8,
+    pub endpoint_context_interval: u8,
+    pub endpoint_context_state: u8,
+    pub endpoint_context_dequeue: u64,
+    pub endpoint_context_dcs: bool,
+    pub interrupt_ring_index: usize,
+    pub interrupt_ring_cycle_state: bool,
+    pub active_poll_transfers: usize,
+    pub pending_poll_trb_dma: u64,
+    pub pending_poll_trb_control: u32,
+    pub pending_poll_trb_cycle: bool,
+    pub transfer_success_count: u64,
+    pub transfer_short_count: u64,
+    pub transfer_empty_count: u64,
+    pub transfer_report_count: u64,
+    pub transfer_resubmit_count: u64,
+    pub transfer_resubmit_fail_count: u64,
+    pub input_poll_report_seen: bool,
+    pub input_poll_recovering: bool,
+    pub input_poll_idle_ms: u64,
+    pub input_poll_recovery_idle_ms: u64,
+    pub input_poll_last_completion_code: u8,
+    pub input_poll_recovery_stage: u8,
+    pub input_poll_recovery_drained_events: u64,
+    pub input_poll_doorbell_nudges: u64,
+    pub input_poll_ring_recoveries: u64,
+    pub input_poll_ring_recovery_failures: u64,
 }
 
 struct XhciControllerState {
@@ -147,6 +226,7 @@ struct XhciControlSetup {
 #[allow(dead_code)]
 pub(crate) struct XhciControllerRecord {
     pub(crate) bdf: crate::arch::pci::PciDevice,
+    pub(crate) irq_line: u8,
     pub(crate) mmio_base: usize,
     pub(crate) mmio_len: usize,
     pub(crate) cap_length: u8,
@@ -194,17 +274,34 @@ enum XhciEvent {
     },
 }
 
+struct XhciDeferredReport {
+    usb_device_ptr: usize,
+    bytes: Vec<u8>,
+    report_descriptor: Vec<u8>,
+    raw_submitted: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum XhciServiceMode {
+    Poll,
+    Irq,
+}
+
 unsafe impl Send for XhciDmaBuffer {}
 unsafe impl Send for XhciRing {}
 unsafe impl Send for XhciEnumeratedDevice {}
 unsafe impl Send for XhciControllerState {}
 
 static XHCI_CONTROLLERS: Mutex<Vec<XhciControllerState>> = Mutex::new(Vec::new());
+static XHCI_IRQ_DEFERRED_REPORTS: Mutex<Vec<XhciDeferredReport>> = Mutex::new(Vec::new());
 static XHCI_TRANSFER_LOGS: AtomicUsize = AtomicUsize::new(0);
+static XHCI_ACTIVE_INPUT_POLLS: AtomicUsize = AtomicUsize::new(0);
+static XHCI_INPUT_POLLING_CONFIGURED: AtomicUsize = AtomicUsize::new(0);
+static XHCI_IRQ_COMPLETION_CONFIGURED: AtomicUsize = AtomicUsize::new(0);
 static XHCI_POLL_SUBMIT_BEGIN_LOGS: AtomicUsize = AtomicUsize::new(0);
 static XHCI_POLL_SUBMIT_QUEUED_LOGS: AtomicUsize = AtomicUsize::new(0);
 static XHCI_POLL_SUBMIT_DONE_LOGS: AtomicUsize = AtomicUsize::new(0);
-const XHCI_EVENTS_PER_SERVICE: usize = 64;
+const XHCI_EVENTS_PER_SERVICE: usize = 128;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct XhciMmioMapper;
@@ -225,35 +322,117 @@ pub(crate) fn initialize(controllers: &[UsbHostControllerInfo]) -> usize {
             continue;
         }
         if let Some(state) = probe_controller(controller) {
+            let irq_line = state.record.irq_line;
+            let irq_dev_id = xhci_irq_dev_id(&state.record);
             XHCI_CONTROLLERS.lock().push(state);
+            register_xhci_irq(irq_line, irq_dev_id);
             initialized += 1;
         }
     }
     initialized
 }
 
-// Retained as an inspection surface for future USB diagnostics.
-#[allow(dead_code)]
-pub(crate) fn controllers() -> Vec<XhciControllerRecord> {
-    XHCI_CONTROLLERS
-        .lock()
-        .iter()
-        .map(|controller| controller.record)
-        .collect()
-}
-
 pub(crate) fn service_pending() -> usize {
     if !ENABLE_NATIVE_XHCI_HID_POLL {
         return 0;
     }
+    let mut reports = take_irq_deferred_reports();
+    let mut work = reports.len();
+    {
+        let Some(mut controllers) = XHCI_CONTROLLERS.try_lock() else {
+            flush_deferred_reports(reports);
+            return 0;
+        };
+        for controller in controllers.iter_mut() {
+            if work >= XHCI_EVENTS_PER_SERVICE {
+                break;
+            }
+            work += service_controller(
+                controller,
+                XHCI_EVENTS_PER_SERVICE - work,
+                &mut reports,
+                XhciServiceMode::Poll,
+            );
+        }
+    }
+    flush_deferred_reports(reports);
+    work
+}
+
+unsafe extern "C" fn xhci_irq_handler(irq: i32, dev_id: *mut c_void) -> i32 {
+    if irq < 0 {
+        return 0;
+    }
+    let work = service_irq(irq as u8, dev_id as usize);
+    if work == 0 {
+        0
+    } else {
+        crate::driver::irq::IRQ_HANDLED
+    }
+}
+
+fn register_xhci_irq(irq_line: u8, irq_dev_id: usize) {
+    if irq_line as usize >= 16 || irq_dev_id == 0 {
+        crate::debug::println!(
+            "xhci: legacy irq unavailable irq={} dev_id={:#x}; using polling completion fallback",
+            irq_line,
+            irq_dev_id
+        );
+        return;
+    }
+    let status = crate::driver::irq::request_any_context_irq(
+        irq_line as u32,
+        Some(xhci_irq_handler),
+        crate::driver::irq::IRQF_SHARED,
+        irq_dev_id as *mut c_void,
+    );
+    if status == 0 {
+        XHCI_IRQ_COMPLETION_CONFIGURED.store(1, Ordering::Release);
+        crate::debug::println!(
+            "xhci: legacy irq completion registered irq={} dev_id={:#x}",
+            irq_line,
+            irq_dev_id
+        );
+    } else {
+        crate::debug::println!(
+            "xhci: legacy irq registration failed irq={} dev_id={:#x} status={}; using polling completion fallback",
+            irq_line,
+            irq_dev_id,
+            status
+        );
+    }
+}
+
+fn xhci_irq_dev_id(record: &XhciControllerRecord) -> usize {
+    record.mmio_base
+}
+
+fn service_irq(irq_line: u8, irq_dev_id: usize) -> usize {
+    if !ENABLE_NATIVE_XHCI_HID_POLL {
+        return 0;
+    }
     let mut work = 0usize;
-    let mut controllers = XHCI_CONTROLLERS.lock();
-    for controller in controllers.iter_mut() {
-        if work >= XHCI_EVENTS_PER_SERVICE {
+    let mut reports = Vec::new();
+    {
+        let Some(mut controllers) = XHCI_CONTROLLERS.try_lock() else {
+            return 1;
+        };
+        for controller in controllers.iter_mut() {
+            if controller.record.irq_line != irq_line
+                || xhci_irq_dev_id(&controller.record) != irq_dev_id
+            {
+                continue;
+            }
+            work += service_controller(
+                controller,
+                XHCI_EVENTS_PER_SERVICE,
+                &mut reports,
+                XhciServiceMode::Irq,
+            );
             break;
         }
-        work += service_controller(controller, XHCI_EVENTS_PER_SERVICE - work);
     }
+    queue_irq_deferred_reports(reports);
     work
 }
 
@@ -327,6 +506,7 @@ fn probe_controller(controller: UsbHostControllerInfo) -> Option<XhciControllerS
 
     let record = XhciControllerRecord {
         bdf: controller.address,
+        irq_line: controller.irq_line,
         mmio_base,
         mmio_len,
         cap_length,
@@ -354,10 +534,11 @@ fn probe_controller(controller: UsbHostControllerInfo) -> Option<XhciControllerS
     }
 
     crate::debug::println!(
-        "xhci controller ready: bdf={:02x}:{:02x}.{} mmio={:#x}/len={:#x} caplen={:#x} version={:#x} slots={} irqs={} ports={} ctx={} op={:#x} rt={:#x} db={:#x}",
+        "xhci controller ready: bdf={:02x}:{:02x}.{} irq={} mmio={:#x}/len={:#x} caplen={:#x} version={:#x} slots={} irqs={} ports={} ctx={} op={:#x} rt={:#x} db={:#x}",
         controller.address.bus,
         controller.address.device,
         controller.address.function,
+        controller.irq_line,
         mmio_base,
         mmio_len,
         cap_length,
@@ -696,6 +877,26 @@ fn enumerate_boot_port(
         return None;
     }
 
+    if control_no_data(
+        controller,
+        &mut device,
+        XhciControlSetup {
+            request_type: USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
+            request: USB_REQ_HID_SET_IDLE,
+            value: USB_HID_IDLE_RATE_EVENT_DRIVEN << 8,
+            index: parsed.interface_number as u16,
+        },
+    )
+    .is_none()
+    {
+        crate::debug::println!(
+            "xhci: hid set-idle failed: port={} slot={} intf={}",
+            port + 1,
+            slot_id,
+            parsed.interface_number
+        );
+    }
+
     let mut report_desc = vec![0u8; parsed.report_descriptor_len as usize];
     if control_in(
         controller,
@@ -722,6 +923,10 @@ fn enumerate_boot_port(
     device.interface_number = parsed.interface_number;
     device.endpoint_address = parsed.endpoint_address;
     device.endpoint_max_packet_size = parsed.endpoint_max_packet_size;
+    device.endpoint_interval = parsed.endpoint_interval;
+    device.endpoint_context_interval =
+        endpoint_interval_value(speed, parsed.endpoint_interval) as u8;
+    device.report_descriptor = report_desc.clone();
     device.ep_index = endpoint_index_from_address(parsed.endpoint_address);
 
     zero_dma_words(&device.input_context);
@@ -838,6 +1043,7 @@ fn enumerate_boot_port(
         );
         return None;
     }
+    note_input_polling_configured();
     crate::debug::record_milestone(
         crate::debug::LogCategory::Usb,
         "xhci-poll-submit-done",
@@ -848,18 +1054,31 @@ fn enumerate_boot_port(
     Some(device)
 }
 
-fn service_controller(controller: &mut XhciControllerState, budget: usize) -> usize {
+fn service_controller(
+    controller: &mut XhciControllerState,
+    budget: usize,
+    reports: &mut Vec<XhciDeferredReport>,
+    mode: XhciServiceMode,
+) -> usize {
     if budget == 0 {
         return 0;
     }
 
     let mut work = 0usize;
+    let transfer_events_before = XHCI_TRANSFER_EVENT_COUNT.load(Ordering::Relaxed);
     while work < budget {
         let Some(event) = poll_event(controller) else {
             break;
         };
-        handle_async_event(controller, event);
+        handle_async_event(controller, event, reports);
         work += 1;
+    }
+    let transfer_events_after = XHCI_TRANSFER_EVENT_COUNT.load(Ordering::Relaxed);
+    if transfer_events_after == transfer_events_before {
+        work = work.saturating_add(nudge_stalled_interrupt_polls(
+            controller,
+            mode == XhciServiceMode::Poll,
+        ));
     }
 
     let status = controller.registers.operational.usbsts.read_volatile();
@@ -908,8 +1127,233 @@ fn service_controller(controller: &mut XhciControllerState, budget: usize) -> us
     work.saturating_add(port_log_work)
 }
 
+fn nudge_stalled_interrupt_polls(
+    controller: &mut XhciControllerState,
+    allow_recovery: bool,
+) -> usize {
+    let mut work = 0usize;
+    let now_tick = crate::arch::rtc::ticks();
+    for device_index in 0..controller.devices.len() {
+        let mut recover = false;
+        {
+            let Some(device) = controller
+                .devices
+                .get_mut(device_index)
+                .and_then(|device| device.as_mut())
+            else {
+                continue;
+            };
+            if device.usb_device_ptr == 0
+                || device
+                    .poll_transfers
+                    .iter()
+                    .all(|transfer| !transfer.active)
+            {
+                device.input_poll_last_activity_tick = now_tick;
+                continue;
+            }
+            if device.input_poll_last_activity_tick == 0 {
+                device.input_poll_last_activity_tick = now_tick;
+                continue;
+            }
+            let idle_ms = ticks_elapsed_ms(device.input_poll_last_activity_tick, now_tick);
+            if idle_ms < XHCI_POLL_IDLE_DOORBELL_MS {
+                continue;
+            }
+            if !device.input_poll_report_seen {
+                continue;
+            }
+            if allow_recovery
+                && idle_ms >= XHCI_POLL_IDLE_RECOVERY_MS
+                && device.pending_poll_trb_dma != 0
+                && ticks_elapsed_ms(device.input_poll_last_recovery_tick, now_tick)
+                    >= XHCI_POLL_RECOVERY_COOLDOWN_MS
+            {
+                device.input_poll_last_recovery_tick = now_tick;
+                recover = true;
+            } else if ticks_elapsed_ms(device.input_poll_last_nudge_tick, now_tick)
+                >= XHCI_POLL_IDLE_DOORBELL_MS
+            {
+                device.input_poll_last_nudge_tick = now_tick;
+                device.input_poll_doorbell_nudges =
+                    device.input_poll_doorbell_nudges.saturating_add(1);
+                ring_doorbell_at(
+                    &mut controller.registers,
+                    device.slot_id,
+                    endpoint_id_for_index(device.ep_index),
+                );
+                work = work.saturating_add(1);
+            }
+        }
+        if recover {
+            work = work.saturating_add(recover_stalled_interrupt_poll(controller, device_index));
+        }
+    }
+    work
+}
+
+fn ticks_elapsed_ms(start_tick: u64, now_tick: u64) -> u64 {
+    if start_tick == 0 {
+        return u64::MAX;
+    }
+    let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
+    now_tick.saturating_sub(start_tick).saturating_mul(1000) / ticks_per_second
+}
+
+fn recover_stalled_interrupt_poll(
+    controller: &mut XhciControllerState,
+    device_index: usize,
+) -> usize {
+    let Some(device) = controller
+        .devices
+        .get_mut(device_index)
+        .and_then(|device| device.as_mut())
+    else {
+        return 0;
+    };
+    if device.input_poll_recovering {
+        return 0;
+    }
+    device.input_poll_recovering = true;
+    device.input_poll_recovery_stage = 1;
+    let slot_id = device.slot_id;
+    let endpoint_id = endpoint_id_for_index(device.ep_index);
+    let pending_trb_dma = device.pending_poll_trb_dma;
+    let (_, pending_trb_cycle) = transfer_ring_trb_debug(device, pending_trb_dma);
+
+    if !command_stop_endpoint(controller, slot_id, endpoint_id as u8) {
+        if let Some(device) = controller
+            .devices
+            .get_mut(device_index)
+            .and_then(|device| device.as_mut())
+        {
+            device.input_poll_recovering = false;
+            device.input_poll_recovery_stage = 101;
+            device.input_poll_ring_recovery_failures =
+                device.input_poll_ring_recovery_failures.saturating_add(1);
+        }
+        return 0;
+    }
+    if let Some(device) = controller
+        .devices
+        .get_mut(device_index)
+        .and_then(|device| device.as_mut())
+    {
+        device.input_poll_recovery_stage = 2;
+    }
+    let drained = drain_pending_events(controller, XHCI_RECOVERY_EVENT_DRAIN_LIMIT);
+    if let Some(device) = controller
+        .devices
+        .get_mut(device_index)
+        .and_then(|device| device.as_mut())
+    {
+        device.input_poll_recovery_drained_events = device
+            .input_poll_recovery_drained_events
+            .saturating_add(drained as u64);
+        device.input_poll_recovery_stage = 3;
+    }
+
+    let Some(mut device) = controller
+        .devices
+        .get_mut(device_index)
+        .and_then(Option::take)
+    else {
+        return 0;
+    };
+    for transfer in device.poll_transfers.iter_mut() {
+        if transfer.active {
+            transfer.active = false;
+            note_poll_transfer_deactivated();
+        }
+        transfer.trb_dma = 0;
+    }
+    device.pending_poll_trb_dma = 0;
+    let now_tick = crate::arch::rtc::ticks();
+    device.input_poll_last_activity_tick = now_tick;
+    device.input_poll_last_nudge_tick = now_tick;
+
+    device.input_poll_recovery_stage = 4;
+    let ring_recovered = recover_transfer_ring_after_cancel(
+        &mut device.interrupt_ring,
+        pending_trb_dma,
+        pending_trb_cycle,
+    );
+    device.input_poll_recovery_stage = 5;
+    let dequeue_set = ring_recovered
+        .map(|(dequeue_dma, dequeue_cycle)| {
+            command_set_tr_dequeue_pointer(
+                controller,
+                slot_id,
+                endpoint_id as u8,
+                dequeue_dma,
+                dequeue_cycle,
+            )
+        })
+        .unwrap_or(false);
+    device.input_poll_recovery_stage = 6;
+    let recovered = dequeue_set && submit_interrupt_poll(&mut controller.registers, &mut device);
+
+    if recovered {
+        device.input_poll_recovery_stage = 7;
+        device.input_poll_ring_recoveries = device.input_poll_ring_recoveries.saturating_add(1);
+    } else {
+        device.input_poll_recovery_stage = 102;
+        device.input_poll_ring_recovery_failures =
+            device.input_poll_ring_recovery_failures.saturating_add(1);
+    }
+    device.input_poll_recovering = false;
+    controller.devices[device_index] = Some(device);
+    usize::from(recovered)
+}
+
+fn flush_deferred_reports(reports: Vec<XhciDeferredReport>) {
+    for report in reports {
+        if !report.raw_submitted {
+            let _ = super::runtime::submit_hid_raw_report_from_descriptor(
+                report.usb_device_ptr,
+                report.bytes.as_slice(),
+                report.report_descriptor.as_slice(),
+            );
+        }
+        super::runtime::enqueue_report_for_urb(
+            report.usb_device_ptr as *mut crate::driver::linux::compat::LinuxCompatUsbDevice,
+            report.bytes.as_slice(),
+        );
+    }
+}
+
+fn queue_irq_deferred_reports(mut reports: Vec<XhciDeferredReport>) {
+    if reports.is_empty() {
+        return;
+    }
+    for report in reports.iter_mut() {
+        if !report.raw_submitted {
+            report.raw_submitted = super::runtime::submit_hid_raw_report_from_descriptor(
+                report.usb_device_ptr,
+                report.bytes.as_slice(),
+                report.report_descriptor.as_slice(),
+            );
+        }
+    }
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut pending = XHCI_IRQ_DEFERRED_REPORTS.lock();
+        pending.append(&mut reports);
+    });
+}
+
+fn take_irq_deferred_reports() -> Vec<XhciDeferredReport> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut pending = XHCI_IRQ_DEFERRED_REPORTS.lock();
+        core::mem::take(&mut *pending)
+    })
+}
+
 #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
-fn handle_async_event(controller: &mut XhciControllerState, event: XhciEvent) {
+fn handle_async_event(
+    controller: &mut XhciControllerState,
+    event: XhciEvent,
+    reports: &mut Vec<XhciDeferredReport>,
+) {
     match event {
         XhciEvent::Transfer {
             transfer_trb_dma,
@@ -934,7 +1378,10 @@ fn handle_async_event(controller: &mut XhciControllerState, event: XhciEvent) {
                     return false;
                 };
                 device.slot_id == slot_id
-                    && device.pending_poll_trb_dma == transfer_trb_dma
+                    && device
+                        .poll_transfers
+                        .iter()
+                        .any(|transfer| transfer.active && transfer.trb_dma == transfer_trb_dma)
                     && ep_id == endpoint_id_for_index(device.ep_index) as u8
             });
             let Some(device_index) = device_index else {
@@ -951,24 +1398,77 @@ fn handle_async_event(controller: &mut XhciControllerState, event: XhciEvent) {
                     );
                     return;
                 };
+                let Some(transfer_index) = device
+                    .poll_transfers
+                    .iter()
+                    .position(|transfer| transfer.active && transfer.trb_dma == transfer_trb_dma)
+                else {
+                    return;
+                };
                 let request_len = device.endpoint_max_packet_size as usize;
                 let report_len = request_len.saturating_sub(residual_len as usize);
+                let now_tick = crate::arch::rtc::ticks();
+                device.input_poll_last_activity_tick = now_tick;
+                device.input_poll_last_nudge_tick = now_tick;
+                device.input_poll_last_completion_code = completion_code;
 
                 let completed_normally = completion_code == XHCI_COMP_SUCCESS
                     || completion_code == XHCI_COMP_SHORT_PACKET;
-
-                if completed_normally && report_len != 0 && report_len <= device.poll_buffer.size {
-                    let bytes = unsafe {
-                        core::slice::from_raw_parts(device.poll_buffer.cpu_ptr, report_len)
-                    };
-                    super::runtime::enqueue_report(
-                        device.usb_device_ptr
-                            as *mut crate::driver::linux::compat::LinuxCompatUsbDevice,
-                        bytes,
-                    );
+                let stopped_by_command = matches!(
+                    completion_code,
+                    XHCI_COMP_STOPPED
+                        | XHCI_COMP_STOPPED_LENGTH_INVALID
+                        | XHCI_COMP_STOPPED_SHORT_PACKET
+                );
+                if completion_code == XHCI_COMP_SUCCESS {
+                    XHCI_TRANSFER_SUCCESS_COUNT.fetch_add(1, Ordering::Relaxed);
+                } else if completion_code == XHCI_COMP_SHORT_PACKET {
+                    XHCI_TRANSFER_SHORT_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+                if completed_normally && report_len == 0 {
+                    XHCI_TRANSFER_EMPTY_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+                if completed_normally {
+                    device.input_poll_report_seen = true;
                 }
 
-                if !completed_normally {
+                if completed_normally
+                    && report_len != 0
+                    && report_len <= device.poll_transfers[transfer_index].buffer.size
+                {
+                    XHCI_TRANSFER_REPORT_COUNT.fetch_add(1, Ordering::Relaxed);
+                    let bytes = unsafe {
+                        core::slice::from_raw_parts(
+                            device.poll_transfers[transfer_index].buffer.cpu_ptr,
+                            report_len,
+                        )
+                    };
+                    reports.push(XhciDeferredReport {
+                        usb_device_ptr: device.usb_device_ptr,
+                        bytes: bytes.to_vec(),
+                        report_descriptor: device.report_descriptor.clone(),
+                        raw_submitted: false,
+                    });
+                }
+                if device.poll_transfers[transfer_index].active {
+                    device.poll_transfers[transfer_index].active = false;
+                    note_poll_transfer_deactivated();
+                }
+                device.poll_transfers[transfer_index].trb_dma = 0;
+                if device.pending_poll_trb_dma == transfer_trb_dma {
+                    device.pending_poll_trb_dma = device
+                        .poll_transfers
+                        .iter()
+                        .find(|transfer| transfer.active)
+                        .map(|transfer| transfer.trb_dma)
+                        .unwrap_or(0);
+                }
+
+                if stopped_by_command {
+                    should_resubmit = false;
+                } else if device.input_poll_recovering {
+                    should_resubmit = false;
+                } else if !completed_normally {
                     crate::debug::println!(
                         "xhci transfer completion anomaly: slot={} ep_id={} code={} residual={} report_len={}",
                         slot_id,
@@ -1000,11 +1500,14 @@ fn handle_async_event(controller: &mut XhciControllerState, event: XhciEvent) {
                     return;
                 };
                 if !submit_interrupt_poll(registers, device) {
+                    XHCI_TRANSFER_RESUBMIT_FAIL_COUNT.fetch_add(1, Ordering::Relaxed);
                     crate::debug::println!(
                         "xhci: failed to resubmit polling transfer: slot={} ep_id={}",
                         slot_id,
                         ep_id
                     );
+                } else {
+                    XHCI_TRANSFER_RESUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
                 }
             }
             return;
@@ -1031,6 +1534,138 @@ fn handle_async_event(controller: &mut XhciControllerState, event: XhciEvent) {
 
 pub(crate) fn debug_transfer_event_count() -> u64 {
     XHCI_TRANSFER_EVENT_COUNT.load(Ordering::Relaxed)
+}
+
+fn endpoint_context_debug(device: &XhciEnumeratedDevice) -> (u8, u64, bool) {
+    let dci = endpoint_id_for_index(device.ep_index);
+    let offset = device.context_size.saturating_mul(dci);
+    let word_count = device.context_size / size_of::<u32>();
+    if device.context_size == 0
+        || word_count < 4
+        || offset.saturating_add(device.context_size) > device.output_context.size
+        || device.output_context.cpu_ptr.is_null()
+    {
+        return (0xff, 0, false);
+    }
+    let words = unsafe {
+        core::slice::from_raw_parts(
+            device.output_context.cpu_ptr.add(offset).cast::<u32>(),
+            word_count,
+        )
+    };
+    let state = (words[0] & 0x7) as u8;
+    let dequeue_raw = (u64::from(words[3]) << 32) | u64::from(words[2]);
+    let dequeue = dequeue_raw & !0xf;
+    let dcs = (dequeue_raw & 1) != 0;
+    (state, dequeue, dcs)
+}
+
+fn transfer_ring_trb_debug(device: &XhciEnumeratedDevice, trb_dma: u64) -> (u32, bool) {
+    if trb_dma < device.interrupt_ring.buffer.dma_addr {
+        return (0, false);
+    }
+    let offset = trb_dma - device.interrupt_ring.buffer.dma_addr;
+    if offset % XHCI_TRB_BYTES as u64 != 0 {
+        return (0, false);
+    }
+    let index = (offset / XHCI_TRB_BYTES as u64) as usize;
+    if index >= device.interrupt_ring.trb_count {
+        return (0, false);
+    }
+    let Some(trbs) = dma_trb_slice_mut(
+        &device.interrupt_ring.buffer,
+        device.interrupt_ring.trb_count,
+    ) else {
+        return (0, false);
+    };
+    let control = trbs[index][3];
+    (control, (control & XHCI_TRB_CYCLE_BIT) != 0)
+}
+
+pub(crate) fn debug_input_snapshot() -> XhciInputDebugSnapshot {
+    let controllers = XHCI_CONTROLLERS.lock();
+    let now_tick = crate::arch::rtc::ticks();
+    for controller in controllers.iter() {
+        let Some(device) = controller
+            .devices
+            .iter()
+            .flatten()
+            .filter(|device| device.usb_device_ptr != 0)
+            .max_by_key(|device| {
+                (
+                    u8::from(device.input_poll_report_seen),
+                    device.input_poll_last_activity_tick,
+                    device.slot_id,
+                )
+            })
+        else {
+            continue;
+        };
+        let (endpoint_context_state, endpoint_context_dequeue, endpoint_context_dcs) =
+            endpoint_context_debug(device);
+        let (pending_poll_trb_control, pending_poll_trb_cycle) =
+            transfer_ring_trb_debug(device, device.pending_poll_trb_dma);
+        return XhciInputDebugSnapshot {
+            slot_id: device.slot_id,
+            speed: device.speed,
+            endpoint_address: device.endpoint_address,
+            endpoint_max_packet_size: device.endpoint_max_packet_size,
+            endpoint_interval: device.endpoint_interval,
+            endpoint_context_interval: device.endpoint_context_interval,
+            endpoint_context_state,
+            endpoint_context_dequeue,
+            endpoint_context_dcs,
+            interrupt_ring_index: device.interrupt_ring.enqueue_index,
+            interrupt_ring_cycle_state: device.interrupt_ring.cycle_state,
+            active_poll_transfers: device
+                .poll_transfers
+                .iter()
+                .filter(|transfer| transfer.active)
+                .count(),
+            pending_poll_trb_dma: device.pending_poll_trb_dma,
+            pending_poll_trb_control,
+            pending_poll_trb_cycle,
+            transfer_success_count: XHCI_TRANSFER_SUCCESS_COUNT.load(Ordering::Relaxed),
+            transfer_short_count: XHCI_TRANSFER_SHORT_COUNT.load(Ordering::Relaxed),
+            transfer_empty_count: XHCI_TRANSFER_EMPTY_COUNT.load(Ordering::Relaxed),
+            transfer_report_count: XHCI_TRANSFER_REPORT_COUNT.load(Ordering::Relaxed),
+            transfer_resubmit_count: XHCI_TRANSFER_RESUBMIT_COUNT.load(Ordering::Relaxed),
+            transfer_resubmit_fail_count: XHCI_TRANSFER_RESUBMIT_FAIL_COUNT.load(Ordering::Relaxed),
+            input_poll_report_seen: device.input_poll_report_seen,
+            input_poll_recovering: device.input_poll_recovering,
+            input_poll_idle_ms: ticks_elapsed_ms(device.input_poll_last_activity_tick, now_tick),
+            input_poll_recovery_idle_ms: ticks_elapsed_ms(
+                device.input_poll_last_recovery_tick,
+                now_tick,
+            ),
+            input_poll_last_completion_code: device.input_poll_last_completion_code,
+            input_poll_recovery_stage: device.input_poll_recovery_stage,
+            input_poll_recovery_drained_events: device.input_poll_recovery_drained_events,
+            input_poll_doorbell_nudges: device.input_poll_doorbell_nudges,
+            input_poll_ring_recoveries: device.input_poll_ring_recoveries,
+            input_poll_ring_recovery_failures: device.input_poll_ring_recovery_failures,
+        };
+    }
+    XhciInputDebugSnapshot::default()
+}
+
+pub(crate) fn has_active_input_polling() -> bool {
+    XHCI_INPUT_POLLING_CONFIGURED.load(Ordering::Acquire) != 0
+        || XHCI_ACTIVE_INPUT_POLLS.load(Ordering::Acquire) != 0
+}
+
+fn note_input_polling_configured() {
+    XHCI_INPUT_POLLING_CONFIGURED.store(1, Ordering::Release);
+}
+
+fn note_poll_transfer_activated() {
+    XHCI_ACTIVE_INPUT_POLLS.fetch_add(1, Ordering::AcqRel);
+}
+
+fn note_poll_transfer_deactivated() {
+    let _ = XHCI_ACTIVE_INPUT_POLLS.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+        Some(value.saturating_sub(1))
+    });
 }
 
 fn reset_port(controller: &mut XhciControllerState, port: usize) -> bool {
@@ -1081,11 +1716,21 @@ fn allocate_enumerated_device(
     controller: &XhciControllerState,
     _port: usize,
     slot_id: u8,
-    _speed: u8,
+    speed: u8,
 ) -> Option<XhciEnumeratedDevice> {
     let device_ptr = controller.record.mmio_base as *mut c_void;
-    let output_context = dma_buffer_alloc(device_ptr, controller.context_size * 4)?;
-    let input_context = dma_buffer_alloc(device_ptr, controller.context_size * 5)?;
+    let output_context = dma_buffer_alloc(
+        device_ptr,
+        controller
+            .context_size
+            .saturating_mul(XHCI_DEVICE_CONTEXT_COUNT),
+    )?;
+    let input_context = dma_buffer_alloc(
+        device_ptr,
+        controller
+            .context_size
+            .saturating_mul(XHCI_INPUT_CONTEXT_COUNT),
+    )?;
     let mut ep0_ring = XhciRing {
         buffer: dma_buffer_alloc(device_ptr, XHCI_TRANSFER_RING_TRBS * XHCI_TRB_BYTES)?,
         trb_count: XHCI_TRANSFER_RING_TRBS,
@@ -1102,21 +1747,46 @@ fn allocate_enumerated_device(
     };
     prime_ring_link(&mut interrupt_ring)?;
 
+    let mut poll_transfers = Vec::new();
+    for _ in 0..XHCI_INTERRUPT_POLL_QUEUE_DEPTH {
+        poll_transfers.push(XhciPollTransfer {
+            buffer: dma_buffer_alloc(device_ptr, XHCI_CONTROL_BUFFER_BYTES)?,
+            trb_dma: 0,
+            active: false,
+        });
+    }
+
     Some(XhciEnumeratedDevice {
         slot_id,
+        speed,
         usb_device_ptr: 0,
         interface_ptr: 0,
         interface_number: 0,
         endpoint_address: 0,
         endpoint_max_packet_size: 0,
+        endpoint_interval: 0,
+        endpoint_context_interval: 0,
+        context_size: controller.context_size,
+        report_descriptor: Vec::new(),
         ep_index: 0,
         output_context,
         input_context,
         ep0_ring,
         interrupt_ring,
         control_buffer: dma_buffer_alloc(device_ptr, XHCI_CONTROL_BUFFER_BYTES)?,
-        poll_buffer: dma_buffer_alloc(device_ptr, XHCI_CONTROL_BUFFER_BYTES)?,
+        poll_transfers,
         pending_poll_trb_dma: 0,
+        input_poll_last_activity_tick: 0,
+        input_poll_last_nudge_tick: 0,
+        input_poll_last_recovery_tick: 0,
+        input_poll_recovering: false,
+        input_poll_report_seen: false,
+        input_poll_last_completion_code: 0,
+        input_poll_recovery_stage: 0,
+        input_poll_recovery_drained_events: 0,
+        input_poll_doorbell_nudges: 0,
+        input_poll_ring_recoveries: 0,
+        input_poll_ring_recovery_failures: 0,
     })
 }
 
@@ -1150,7 +1820,7 @@ fn build_interrupt_endpoint_context(
     ep_index: usize,
     interrupt_ring_dma: u64,
     max_packet: u16,
-    interval: u8,
+    endpoint_interval: u8,
 ) {
     zero_dma_words(input_context);
     if controller.context_size == 64 {
@@ -1164,7 +1834,7 @@ fn build_interrupt_endpoint_context(
             ep_index,
             interrupt_ring_dma,
             max_packet,
-            interval,
+            endpoint_interval,
         );
         write_input_context(input_context, &input);
     } else {
@@ -1178,7 +1848,7 @@ fn build_interrupt_endpoint_context(
             ep_index,
             interrupt_ring_dma,
             max_packet,
-            interval,
+            endpoint_interval,
         );
         write_input_context(input_context, &input);
     }
@@ -1322,24 +1992,55 @@ fn submit_interrupt_poll(
     registers: &mut XhciRegisters<XhciMmioMapper>,
     device: &mut XhciEnumeratedDevice,
 ) -> bool {
+    let mut submitted = 0usize;
+    let transfer_count = device.poll_transfers.len();
+    for transfer_index in 0..transfer_count {
+        if device.poll_transfers[transfer_index].active {
+            continue;
+        }
+        if submit_interrupt_poll_slot(registers, device, transfer_index) {
+            submitted += 1;
+        } else if submitted == 0 {
+            return false;
+        } else {
+            break;
+        }
+    }
+    submitted != 0 || device.poll_transfers.iter().any(|transfer| transfer.active)
+}
+
+fn submit_interrupt_poll_slot(
+    registers: &mut XhciRegisters<XhciMmioMapper>,
+    device: &mut XhciEnumeratedDevice,
+    transfer_index: usize,
+) -> bool {
     let request_len = device.endpoint_max_packet_size as usize;
+    let Some(buffer_size) = device
+        .poll_transfers
+        .get(transfer_index)
+        .map(|transfer| transfer.buffer.size)
+    else {
+        return false;
+    };
     if XHCI_POLL_SUBMIT_BEGIN_LOGS.fetch_add(1, Ordering::Relaxed) < XHCI_POLL_SUBMIT_LOG_LIMIT {
         crate::debug::println!(
-            "xhci poll submit begin: slot={} ep_id={} req_len={} ring_index={} cycle={}",
+            "xhci poll submit begin: slot={} ep_id={} poll_slot={} req_len={} ring_index={} cycle={}",
             device.slot_id,
             endpoint_id_for_index(device.ep_index),
+            transfer_index,
             request_len,
             device.interrupt_ring.enqueue_index,
             device.interrupt_ring.cycle_state
         );
     }
-    if request_len == 0 || request_len > device.poll_buffer.size {
+    if request_len == 0 || request_len > buffer_size {
         crate::debug::println!(
-            "xhci poll submit invalid request: slot={} ep_id={} req_len={} poll_buffer_size={} ring_trbs={} ring_buffer_size={} enqueue_index={} cycle={} pending_trb={:#x}",
+            "xhci poll submit invalid request: slot={} ep_id={} poll_slot={} req_len={} poll_buffer_size={} ring_trbs={} ring_buffer_size={} enqueue_index={} cycle={} pending_trb={:#x}",
             device.slot_id,
             endpoint_id_for_index(device.ep_index),
+            transfer_index,
             request_len,
-            device.poll_buffer.size,
+            buffer_size,
             device.interrupt_ring.trb_count,
             device.interrupt_ring.buffer.size,
             device.interrupt_ring.enqueue_index,
@@ -1349,18 +2050,19 @@ fn submit_interrupt_poll(
         return false;
     }
     let mut trb = Normal::default();
-    trb.set_data_buffer_pointer(device.poll_buffer.dma_addr)
+    trb.set_data_buffer_pointer(device.poll_transfers[transfer_index].buffer.dma_addr)
         .set_trb_transfer_length(request_len as u32)
         .set_interrupt_on_completion()
         .set_interrupt_on_short_packet();
     let mut trb_dma = enqueue_trb(&mut device.interrupt_ring, trb.into_raw());
     if trb_dma.is_none() {
         crate::debug::println!(
-            "xhci poll submit enqueue failed: slot={} ep_id={} req_len={} poll_buffer_size={} ring_trbs={} ring_buffer_size={} enqueue_index={} cycle={} pending_trb={:#x}",
+            "xhci poll submit enqueue failed: slot={} ep_id={} poll_slot={} req_len={} poll_buffer_size={} ring_trbs={} ring_buffer_size={} enqueue_index={} cycle={} pending_trb={:#x}",
             device.slot_id,
             endpoint_id_for_index(device.ep_index),
+            transfer_index,
             request_len,
-            device.poll_buffer.size,
+            buffer_size,
             device.interrupt_ring.trb_count,
             device.interrupt_ring.buffer.size,
             device.interrupt_ring.enqueue_index,
@@ -1377,18 +2079,33 @@ fn submit_interrupt_poll(
                 device.interrupt_ring.enqueue_index,
                 device.interrupt_ring.cycle_state
             );
+            for transfer in device.poll_transfers.iter_mut() {
+                if transfer.active {
+                    transfer.active = false;
+                    note_poll_transfer_deactivated();
+                }
+                transfer.trb_dma = 0;
+            }
+            device.pending_poll_trb_dma = 0;
             trb_dma = enqueue_trb(&mut device.interrupt_ring, trb.into_raw());
         }
     }
     let Some(trb_dma) = trb_dma else {
         return false;
     };
+    let transfer = &mut device.poll_transfers[transfer_index];
+    transfer.trb_dma = trb_dma;
+    if !transfer.active {
+        transfer.active = true;
+        note_poll_transfer_activated();
+    }
     device.pending_poll_trb_dma = trb_dma;
     if XHCI_POLL_SUBMIT_QUEUED_LOGS.fetch_add(1, Ordering::Relaxed) < XHCI_POLL_SUBMIT_LOG_LIMIT {
         crate::debug::println!(
-            "xhci poll submit queued: slot={} ep_id={} trb={:#x} next_ring_index={} cycle={}",
+            "xhci poll submit queued: slot={} ep_id={} poll_slot={} trb={:#x} next_ring_index={} cycle={}",
             device.slot_id,
             endpoint_id_for_index(device.ep_index),
+            transfer_index,
             trb_dma,
             device.interrupt_ring.enqueue_index,
             device.interrupt_ring.cycle_state
@@ -1569,20 +2286,167 @@ fn command_configure_endpoint(
     }
 }
 
+fn command_stop_endpoint(
+    controller: &mut XhciControllerState,
+    slot_id: u8,
+    endpoint_id: u8,
+) -> bool {
+    let mut trb = StopEndpointCommand::default();
+    trb.set_slot_id(slot_id).set_endpoint_id(endpoint_id);
+    let Some(trb_dma) = enqueue_trb(&mut controller.command_ring, trb.into_raw()) else {
+        return false;
+    };
+    ring_doorbell(controller, 0, 0);
+    match wait_for_event(controller, |event| match event {
+        XhciEvent::CommandCompletion {
+            command_trb_dma, ..
+        } if command_trb_dma == trb_dma => true,
+        _ => false,
+    }) {
+        Some(XhciEvent::CommandCompletion {
+            completion_code: XHCI_COMP_SUCCESS,
+            ..
+        }) => true,
+        Some(XhciEvent::CommandCompletion {
+            completion_code, ..
+        }) => {
+            crate::debug::println!(
+                "xhci stop-endpoint failed: slot={} ep_id={} command_trb={:#x} code={}",
+                slot_id,
+                endpoint_id,
+                trb_dma,
+                completion_code,
+            );
+            false
+        }
+        Some(other) => {
+            crate::debug::println!(
+                "xhci stop-endpoint unexpected event: slot={} ep_id={} command_trb={:#x} event={:?}",
+                slot_id,
+                endpoint_id,
+                trb_dma,
+                other,
+            );
+            false
+        }
+        None => {
+            crate::debug::println!(
+                "xhci stop-endpoint timed out: slot={} ep_id={} command_trb={:#x}",
+                slot_id,
+                endpoint_id,
+                trb_dma,
+            );
+            false
+        }
+    }
+}
+
+fn command_set_tr_dequeue_pointer(
+    controller: &mut XhciControllerState,
+    slot_id: u8,
+    endpoint_id: u8,
+    dequeue_pointer: u64,
+    dequeue_cycle_state: bool,
+) -> bool {
+    let mut trb = SetTrDequeuePointerCommand::default();
+    trb.set_new_tr_dequeue_pointer(dequeue_pointer)
+        .set_slot_id(slot_id)
+        .set_endpoint_id(endpoint_id);
+    if dequeue_cycle_state {
+        trb.set_dequeue_cycle_state();
+    } else {
+        trb.clear_dequeue_cycle_state();
+    }
+    let Some(trb_dma) = enqueue_trb(&mut controller.command_ring, trb.into_raw()) else {
+        return false;
+    };
+    ring_doorbell(controller, 0, 0);
+    match wait_for_event(controller, |event| match event {
+        XhciEvent::CommandCompletion {
+            command_trb_dma, ..
+        } if command_trb_dma == trb_dma => true,
+        _ => false,
+    }) {
+        Some(XhciEvent::CommandCompletion {
+            completion_code: XHCI_COMP_SUCCESS,
+            ..
+        }) => true,
+        Some(XhciEvent::CommandCompletion {
+            completion_code, ..
+        }) => {
+            crate::debug::println!(
+                "xhci set-tr-dequeue failed: slot={} ep_id={} dequeue={:#x} command_trb={:#x} code={}",
+                slot_id,
+                endpoint_id,
+                dequeue_pointer,
+                trb_dma,
+                completion_code,
+            );
+            false
+        }
+        Some(other) => {
+            crate::debug::println!(
+                "xhci set-tr-dequeue unexpected event: slot={} ep_id={} dequeue={:#x} command_trb={:#x} event={:?}",
+                slot_id,
+                endpoint_id,
+                dequeue_pointer,
+                trb_dma,
+                other,
+            );
+            false
+        }
+        None => {
+            crate::debug::println!(
+                "xhci set-tr-dequeue timed out: slot={} ep_id={} dequeue={:#x} command_trb={:#x}",
+                slot_id,
+                endpoint_id,
+                dequeue_pointer,
+                trb_dma,
+            );
+            false
+        }
+    }
+}
+
 fn wait_for_event(
     controller: &mut XhciControllerState,
     matcher: impl Fn(XhciEvent) -> bool,
 ) -> Option<XhciEvent> {
+    let mut reports = Vec::new();
     for _ in 0..XHCI_EVENT_WAIT_SPINS {
         if let Some(event) = poll_event(controller) {
             if matcher(event) {
+                flush_deferred_reports(reports);
                 return Some(event);
             }
-            handle_async_event(controller, event);
+            handle_async_event(controller, event, &mut reports);
+            if !reports.is_empty() {
+                let pending = core::mem::take(&mut reports);
+                flush_deferred_reports(pending);
+            }
         }
         spin_loop();
     }
+    flush_deferred_reports(reports);
     None
+}
+
+fn drain_pending_events(controller: &mut XhciControllerState, max_events: usize) -> usize {
+    let mut reports = Vec::new();
+    let mut drained = 0usize;
+    for _ in 0..max_events {
+        let Some(event) = poll_event(controller) else {
+            break;
+        };
+        handle_async_event(controller, event, &mut reports);
+        drained = drained.saturating_add(1);
+        if !reports.is_empty() {
+            let pending = core::mem::take(&mut reports);
+            flush_deferred_reports(pending);
+        }
+    }
+    flush_deferred_reports(reports);
+    drained
 }
 
 #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
@@ -1701,20 +2565,17 @@ fn advance_event_ring(controller: &mut XhciControllerState) {
 
 fn enqueue_trb(ring: &mut XhciRing, mut trb: [u32; 4]) -> Option<u64> {
     let trbs = dma_trb_slice_mut(&ring.buffer, ring.trb_count)?;
-    if ring.enqueue_index >= ring.trb_count.saturating_sub(1) {
-        if let Some(link) = trbs.get_mut(ring.trb_count - 1) {
-            link[3] = (link[3] & !XHCI_TRB_CYCLE_BIT)
-                | if ring.cycle_state {
-                    XHCI_TRB_CYCLE_BIT
-                } else {
-                    0
-                };
-        }
-        ring.enqueue_index = 0;
-        ring.cycle_state = !ring.cycle_state;
+    if ring.trb_count < 2 {
+        return None;
+    }
+    if ring.enqueue_index >= ring.trb_count - 1 {
+        advance_enqueue_past_link(ring, trbs)?;
     }
 
     let index = ring.enqueue_index;
+    if index >= ring.trb_count - 1 {
+        return None;
+    }
     let trb_dma = ring.buffer.dma_addr + (index * XHCI_TRB_BYTES) as u64;
     trb[3] = (trb[3] & !XHCI_TRB_CYCLE_BIT)
         | if ring.cycle_state {
@@ -1723,8 +2584,24 @@ fn enqueue_trb(ring: &mut XhciRing, mut trb: [u32; 4]) -> Option<u64> {
             0
         };
     trbs[index] = trb;
+    fence(Ordering::Release);
     ring.enqueue_index += 1;
+    if ring.enqueue_index >= ring.trb_count - 1 {
+        advance_enqueue_past_link(ring, trbs)?;
+    }
     Some(trb_dma)
+}
+
+fn advance_enqueue_past_link(ring: &mut XhciRing, trbs: &mut [XhciTrb]) -> Option<()> {
+    let link_index = ring.trb_count.checked_sub(1)?;
+    let link = trbs.get_mut(link_index)?;
+    // Publish all normal TRBs before handing the Link TRB to the controller.
+    fence(Ordering::Release);
+    link[3] ^= XHCI_TRB_CYCLE_BIT;
+    fence(Ordering::Release);
+    ring.enqueue_index = 0;
+    ring.cycle_state = !ring.cycle_state;
+    Some(())
 }
 
 fn recover_transfer_ring(ring: &mut XhciRing, expected_trb_count: usize) -> bool {
@@ -1744,13 +2621,49 @@ fn recover_transfer_ring(ring: &mut XhciRing, expected_trb_count: usize) -> bool
     prime_ring_link(ring).is_some()
 }
 
+fn recover_transfer_ring_after_cancel(
+    ring: &mut XhciRing,
+    canceled_trb_dma: u64,
+    _canceled_cycle: bool,
+) -> Option<(u64, bool)> {
+    if canceled_trb_dma < ring.buffer.dma_addr {
+        return None;
+    }
+    let offset = canceled_trb_dma - ring.buffer.dma_addr;
+    if offset % XHCI_TRB_BYTES as u64 != 0 {
+        return None;
+    }
+    let canceled_index = (offset / XHCI_TRB_BYTES as u64) as usize;
+    if canceled_index >= ring.trb_count.saturating_sub(1) {
+        return None;
+    }
+    let Some(trbs) = dma_trb_slice_mut(&ring.buffer, ring.trb_count) else {
+        return None;
+    };
+    for trb in trbs.iter_mut() {
+        *trb = [0; 4];
+    }
+    ring.enqueue_index = 0;
+    ring.cycle_state = true;
+    prime_ring_link_for_cycle(ring, false)?;
+    Some((ring.buffer.dma_addr, true))
+}
+
 fn prime_ring_link(ring: &mut XhciRing) -> Option<()> {
+    prime_ring_link_for_cycle(ring, false)
+}
+
+fn prime_ring_link_for_cycle(ring: &mut XhciRing, cycle: bool) -> Option<()> {
     let trbs = dma_trb_slice_mut(&ring.buffer, ring.trb_count)?;
     let link = trbs.last_mut()?;
     let mut trb = LinkTrb::default();
     trb.set_ring_segment_pointer(ring.buffer.dma_addr)
-        .set_toggle_cycle()
-        .set_cycle_bit();
+        .set_toggle_cycle();
+    if cycle {
+        trb.set_cycle_bit();
+    } else {
+        trb.clear_cycle_bit();
+    }
     *link = trb.into_raw();
     Some(())
 }
@@ -1908,6 +2821,7 @@ fn ring_doorbell(controller: &mut XhciControllerState, slot_id: u8, target: usiz
     let Some(doorbell) = build_doorbell_register(slot_id, target) else {
         return;
     };
+    fence(Ordering::Release);
     controller
         .registers
         .doorbell
@@ -1918,6 +2832,7 @@ fn ring_doorbell_at(registers: &mut XhciRegisters<XhciMmioMapper>, slot_id: u8, 
     let Some(doorbell) = build_doorbell_register(slot_id, target) else {
         return;
     };
+    fence(Ordering::Release);
     registers
         .doorbell
         .write_volatile_at(slot_id as usize, doorbell);
@@ -2291,6 +3206,59 @@ mod tests {
 
         assert_eq!(decoded.input_context_pointer(), 0x4000);
         assert_eq!(decoded.slot_id(), 7);
+    }
+
+    #[test]
+    fn transfer_ring_hands_link_to_hardware_before_wrap_reuse() {
+        let mut storage = [[0u32; 4]; 4];
+        let mut ring = XhciRing {
+            buffer: XhciDmaBuffer {
+                cpu_ptr: storage.as_mut_ptr().cast::<u8>(),
+                dma_addr: 0x1000,
+                size: core::mem::size_of_val(&storage),
+            },
+            trb_count: storage.len(),
+            enqueue_index: 0,
+            cycle_state: true,
+        };
+        prime_ring_link(&mut ring).expect("link trb");
+
+        assert_eq!(storage[3][3] & XHCI_TRB_CYCLE_BIT, 0);
+        assert_eq!(
+            (storage[3][3] & XHCI_TRB_TYPE_MASK) >> XHCI_TRB_TYPE_SHIFT,
+            xhci::ring::trb::Type::Link as u32
+        );
+
+        assert_eq!(
+            enqueue_trb(&mut ring, Normal::default().into_raw()),
+            Some(0x1000)
+        );
+        assert_eq!(
+            enqueue_trb(&mut ring, Normal::default().into_raw()),
+            Some(0x1010)
+        );
+        assert!(ring.cycle_state);
+        assert_eq!(ring.enqueue_index, 2);
+        assert_eq!(storage[0][3] & XHCI_TRB_CYCLE_BIT, XHCI_TRB_CYCLE_BIT);
+        assert_eq!(storage[1][3] & XHCI_TRB_CYCLE_BIT, XHCI_TRB_CYCLE_BIT);
+        assert_eq!(storage[3][3] & XHCI_TRB_CYCLE_BIT, 0);
+
+        assert_eq!(
+            enqueue_trb(&mut ring, Normal::default().into_raw()),
+            Some(0x1020)
+        );
+        assert!(!ring.cycle_state);
+        assert_eq!(ring.enqueue_index, 0);
+        assert_eq!(storage[2][3] & XHCI_TRB_CYCLE_BIT, XHCI_TRB_CYCLE_BIT);
+        assert_eq!(storage[3][3] & XHCI_TRB_CYCLE_BIT, XHCI_TRB_CYCLE_BIT);
+
+        assert_eq!(
+            enqueue_trb(&mut ring, Normal::default().into_raw()),
+            Some(0x1000)
+        );
+        assert!(!ring.cycle_state);
+        assert_eq!(ring.enqueue_index, 1);
+        assert_eq!(storage[0][3] & XHCI_TRB_CYCLE_BIT, 0);
     }
 }
 // RING3-MIGRATION-REFERENCE END: RustOS native xHCI transfer substrate exception.

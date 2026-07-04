@@ -43,6 +43,7 @@ const MAX_WAYLAND_SHM_POOL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_WAYLAND_BUFFER_DIMENSION: usize = 8192;
 const MAX_WAYLAND_BUFFER_PIXELS: usize = MAX_WAYLAND_SHM_POOL_BYTES / 4;
 const MAX_WAYLAND_CLIENT_ACCEPTS_PER_TICK: usize = 8;
+const MAX_WAYLAND_CLIENT_DISPATCHES_PER_TICK: usize = 1;
 const MAX_WAYLAND_SURFACES: usize = 64;
 const MAX_WAYLAND_OUTPUT_RESOURCES: usize = 64;
 const MAX_WAYLAND_POINTER_RESOURCES: usize = 64;
@@ -114,6 +115,13 @@ impl WaylandCompositor {
                 return None;
             }
         };
+        if let Err(err) = set_fd_nonblocking(listener.as_raw_fd()) {
+            diag_line(format!(
+                "uiserver: wayland listener nonblocking failed path={} err={err}",
+                socket_path
+            ));
+            return None;
+        }
         let state = WaylandState::new(display_width, display_height);
         {
             let handle = display.handle();
@@ -178,7 +186,18 @@ impl WaylandCompositor {
         }
 
         let clients = core::mem::take(&mut self.clients);
+        let mut deferred_clients = Vec::new();
+        let mut dispatch_clients = Vec::new();
         for client_id in clients {
+            if dispatch_clients.len() < MAX_WAYLAND_CLIENT_DISPATCHES_PER_TICK {
+                dispatch_clients.push(client_id);
+            } else {
+                deferred_clients.push(client_id);
+            }
+        }
+        self.clients = deferred_clients;
+
+        for client_id in dispatch_clients {
             match self
                 .display
                 .backend()
@@ -208,7 +227,6 @@ impl WaylandCompositor {
             }
         }
         self.flush_clients();
-
         self.state.take_dirty()
     }
 
@@ -715,15 +733,29 @@ impl WaylandState {
     fn send_frame_callbacks(&mut self) {
         let time = self.event_time_ms();
         for surface in &self.surfaces {
-            let callbacks = {
+            let (callbacks, releases) = {
                 let Ok(mut surface) = surface.shared.lock() else {
                     continue;
                 };
-                if !surface.alive || surface.minimized || surface.pixels.is_empty() {
-                    continue;
-                }
-                surface.pending_callbacks.drain(..).collect::<Vec<_>>()
+                let releases = surface
+                    .pending_buffer_releases
+                    .drain(..)
+                    .collect::<Vec<_>>();
+                let callbacks = if surface.alive
+                    && !surface.minimized
+                    && !surface.pixels.is_empty()
+                    && surface.width != 0
+                    && surface.height != 0
+                {
+                    surface.pending_callbacks.drain(..).collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                (callbacks, releases)
             };
+            for buffer in releases {
+                buffer.release();
+            }
             for callback in callbacks {
                 callback.done(time);
             }
@@ -1022,13 +1054,29 @@ impl WaylandState {
     }
 
     fn pointer_motion(&mut self, x: u32, y: u32) {
-        self.pointer_x = x.min(self.display_width.saturating_sub(1));
-        self.pointer_y = y.min(self.display_height.saturating_sub(1));
+        let next_x = x.min(self.display_width.saturating_sub(1));
+        let next_y = y.min(self.display_height.saturating_sub(1));
+        let previous_x = self.pointer_x;
+        let previous_y = self.pointer_y;
+        let previous_surface = self
+            .pointer_focus
+            .as_ref()
+            .map(|focus| focus.surface.id().clone());
+        self.pointer_x = next_x;
+        self.pointer_y = next_y;
         let hit = self.hit_test_pointer(self.pointer_x, self.pointer_y);
         self.update_pointer_focus(hit.clone());
         let Some(focus) = self.pointer_focus.as_ref() else {
             return;
         };
+        if previous_x == self.pointer_x
+            && previous_y == self.pointer_y
+            && previous_surface
+                .as_ref()
+                .is_some_and(|surface| *surface == focus.surface.id())
+        {
+            return;
+        }
         let time = self.event_time_ms();
         for pointer in self
             .pointer_resources
@@ -1254,10 +1302,14 @@ impl WaylandState {
         state.current_buffer = None;
         state.content_version = next_content_version(state.content_version);
         state.pending_buffer = None;
+        let pending_releases = state.pending_buffer_releases.drain(..).collect::<Vec<_>>();
         state.pending_callbacks.clear();
         state.on_output = false;
         state.needs_initial_configure = false;
         drop(state);
+        for buffer in pending_releases {
+            buffer.release();
+        }
         self.mark_dirty();
         diag_line(format!("uiserver: retire_surface end surface={surface_id}"));
         true
@@ -1489,6 +1541,7 @@ struct WaylandSurfaceState {
     pending_damage: Rect,
     last_damage: Rect,
     pending_callbacks: Vec<wl_callback::WlCallback>,
+    pending_buffer_releases: Vec<wl_buffer::WlBuffer>,
     pixels: Arc<Vec<u32>>,
     width: usize,
     height: usize,
@@ -1551,6 +1604,91 @@ struct KeyboardData;
 struct CallbackData;
 
 impl BufferData {
+    fn copy_damage_into(
+        &self,
+        dst: &mut Arc<Vec<u32>>,
+        dst_width: usize,
+        dst_height: usize,
+        dst_stride_pixels: usize,
+        damage: Rect,
+    ) -> bool {
+        if dst_width != self.shared.width
+            || dst_height != self.shared.height
+            || dst_stride_pixels != self.shared.width
+            || dst.is_empty()
+        {
+            return false;
+        }
+        let damage = damage.intersect(Rect {
+            x: 0,
+            y: 0,
+            width: self.shared.width,
+            height: self.shared.height,
+        });
+        if damage.is_empty() {
+            return true;
+        }
+        let Ok(pool) = self.shared.pool.lock() else {
+            return false;
+        };
+        let bytes = pool.mapping.bytes();
+        let start = self.shared.offset;
+        if validate_wayland_buffer_layout(
+            start,
+            self.shared.width,
+            self.shared.height,
+            self.shared.stride,
+            pool.len.min(bytes.len()),
+        )
+        .is_none()
+        {
+            return false;
+        }
+        let Some(width_bytes) = damage.width.checked_mul(4) else {
+            return false;
+        };
+        let pixels = Arc::make_mut(dst);
+        for row in 0..damage.height {
+            let Some(src_row) = start
+                .checked_add(
+                    (damage.y + row)
+                        .checked_mul(self.shared.stride)
+                        .unwrap_or(usize::MAX),
+                )
+                .and_then(|row_start| row_start.checked_add(damage.x.saturating_mul(4)))
+            else {
+                return false;
+            };
+            let Some(src_end) = src_row.checked_add(width_bytes) else {
+                return false;
+            };
+            let Some(row_bytes) = bytes.get(src_row..src_end) else {
+                return false;
+            };
+            let Some(dst_row) = (damage.y + row)
+                .checked_mul(dst_stride_pixels)
+                .and_then(|row_start| row_start.checked_add(damage.x))
+            else {
+                return false;
+            };
+            let Some(dst_end) = dst_row.checked_add(damage.width) else {
+                return false;
+            };
+            let Some(row_pixels) = pixels.get_mut(dst_row..dst_end) else {
+                return false;
+            };
+            for (target, pixel) in row_pixels.iter_mut().zip(row_bytes.chunks_exact(4)) {
+                let alpha = if self.shared.has_alpha {
+                    pixel[3]
+                } else {
+                    0xff
+                };
+                *target = u32::from_le_bytes([pixel[0], pixel[1], pixel[2], alpha]);
+            }
+        }
+        true
+    }
+
     fn copy_pixels(&self) -> Option<(Arc<Vec<u32>>, usize, usize, usize)> {
         let pool = self.shared.pool.lock().ok()?;
         let bytes = pool.mapping.bytes();
@@ -2229,67 +2367,98 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
                 }
 
                 if let Some(copy_source) = copy_source {
-                    let copied = copy_source.copy_pixels();
                     let display_width = state.display_width;
                     let display_height = state.display_height;
-                    if let Ok(mut surface) = data.shared.lock() {
-                        if let Some((pixels, width, height, stride_pixels)) = copied {
-                            surface.current_buffer = Some(copy_source);
-                            surface.pixels = pixels;
-                            surface.width = width;
-                            surface.height = height;
-                            surface.stride_pixels = stride_pixels;
-                            surface.content_version = next_content_version(surface.content_version);
-                            // Clamp the rendered chrome to the desktop region.
-                            // The client buffer may be bigger than this (e.g.
-                            // wayclick hardcodes 800×520 and ignores our
-                            // configure); in that case the buffer is cropped
-                            // to what the chrome can show.
-                            let (visible_w, visible_h) = wayland_client_size_for_buffer(
+                    if has_damage {
+                        if let Ok(mut surface) = data.shared.lock() {
+                            let width = surface.width;
+                            let height = surface.height;
+                            let stride_pixels = surface.stride_pixels;
+                            if copy_source.copy_damage_into(
+                                &mut surface.pixels,
                                 width,
                                 height,
-                                display_width,
-                                display_height,
-                            );
-                            let clamped = clamp_wayland_frame(
-                                Rect {
-                                    x: surface.frame.x,
-                                    y: surface.frame.y,
-                                    width: visible_w,
-                                    height: visible_h,
-                                },
-                                display_width,
-                                display_height,
-                            );
-                            surface.frame = clamped;
-                            surface.last_damage = if has_damage {
-                                committed_damage_rect
-                            } else {
-                                Rect {
-                                    x: 0,
-                                    y: 0,
+                                stride_pixels,
+                                committed_damage_rect,
+                            ) {
+                                surface.current_buffer = Some(copy_source.clone());
+                                surface.last_damage = committed_damage_rect;
+                                surface.content_version =
+                                    next_content_version(surface.content_version);
+                                mapped = true;
+                                dirty = true;
+                            }
+                            trigger_initial_configure = surface.needs_initial_configure
+                                && !mapped
+                                && surface.toplevel.is_some();
+                        }
+                    }
+                    if !dirty {
+                        let copied = copy_source.copy_pixels();
+                        if let Ok(mut surface) = data.shared.lock() {
+                            if let Some((pixels, width, height, stride_pixels)) = copied {
+                                surface.current_buffer = Some(copy_source);
+                                surface.pixels = pixels;
+                                surface.width = width;
+                                surface.height = height;
+                                surface.stride_pixels = stride_pixels;
+                                surface.content_version =
+                                    next_content_version(surface.content_version);
+                                // Clamp the rendered chrome to the desktop region.
+                                // The client buffer may be bigger than this (e.g.
+                                // wayclick hardcodes 800×520 and ignores our
+                                // configure); in that case the buffer is cropped
+                                // to what the chrome can show.
+                                let (visible_w, visible_h) = wayland_client_size_for_buffer(
                                     width,
                                     height,
-                                }
-                            };
-                            mapped = true;
-                            dirty = true;
-                        } else {
-                            diag_line(
+                                    display_width,
+                                    display_height,
+                                );
+                                let clamped = clamp_wayland_frame(
+                                    Rect {
+                                        x: surface.frame.x,
+                                        y: surface.frame.y,
+                                        width: visible_w,
+                                        height: visible_h,
+                                    },
+                                    display_width,
+                                    display_height,
+                                );
+                                surface.frame = clamped;
+                                surface.last_damage = if has_damage {
+                                    committed_damage_rect
+                                } else {
+                                    Rect {
+                                        x: 0,
+                                        y: 0,
+                                        width,
+                                        height,
+                                    }
+                                };
+                                mapped = true;
+                                dirty = true;
+                            } else {
+                                diag_line(
                                 "uiserver: rejecting wl_shm buffer during commit due to invalid layout",
                             );
-                            mapped = !surface.pixels.is_empty()
-                                && surface.width != 0
-                                && surface.height != 0;
+                                mapped = !surface.pixels.is_empty()
+                                    && surface.width != 0
+                                    && surface.height != 0;
+                            }
+                            trigger_initial_configure = surface.needs_initial_configure
+                                && !mapped
+                                && surface.toplevel.is_some();
                         }
-                        trigger_initial_configure = surface.needs_initial_configure
-                            && !mapped
-                            && surface.toplevel.is_some();
                     }
                 }
 
                 if let Some(buffer) = release_buffer {
-                    buffer.release();
+                    if let Ok(mut surface) = data.shared.lock() {
+                        surface.pending_buffer_releases.push(buffer);
+                    } else {
+                        buffer.release();
+                    }
                 }
 
                 if has_damage && !dirty {

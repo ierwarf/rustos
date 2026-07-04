@@ -204,6 +204,26 @@ pub enum IpcError {
     NoMemory,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EndpointWakeSet {
+    pub callers: Vec<u64>,
+    pub receivers: Vec<u64>,
+}
+
+impl EndpointWakeSet {
+    fn push_caller(&mut self, task_id: u64) {
+        if !self.callers.contains(&task_id) {
+            self.callers.push(task_id);
+        }
+    }
+
+    fn push_receiver(&mut self, task_id: u64) {
+        if !self.receivers.contains(&task_id) {
+            self.receivers.push(task_id);
+        }
+    }
+}
+
 #[cfg(test)]
 #[derive(Default)]
 struct PortObject {
@@ -724,6 +744,27 @@ pub fn recv_endpoint_with_limits_and_handles(
     request_capacity: usize,
     handle_capacity: usize,
 ) -> Result<Option<(KernelReplyHandle, Vec<u8>, Vec<KernelTransferredHandle>)>, IpcError> {
+    let Some((reply, request, attached_handles, _caller_task_id)) =
+        recv_endpoint_with_sender_and_limits(endpoint, request_capacity, handle_capacity)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((reply, request, attached_handles)))
+}
+
+pub fn recv_endpoint_with_sender_and_limits(
+    endpoint: KernelEndpointHandle,
+    request_capacity: usize,
+    handle_capacity: usize,
+) -> Result<
+    Option<(
+        KernelReplyHandle,
+        Vec<u8>,
+        Vec<KernelTransferredHandle>,
+        u64,
+    )>,
+    IpcError,
+> {
     with_ipc_objects(|objects| {
         let Some(endpoint_object) = objects.endpoints.get_mut(&endpoint.raw()) else {
             return Err(IpcError::InvalidHandle);
@@ -740,6 +781,7 @@ pub fn recv_endpoint_with_limits_and_handles(
         {
             return Err(IpcError::BufferTooSmall);
         }
+        let caller_task_id = message.caller_task_id;
         let Some(reply_id) = objects
             .replies
             .iter()
@@ -766,6 +808,7 @@ pub fn recv_endpoint_with_limits_and_handles(
             KernelReplyHandle::from_raw(reply_id),
             request,
             attached_handles,
+            caller_task_id,
         )))
     })
 }
@@ -816,11 +859,14 @@ pub fn complete_endpoint_reply_with_handles(
         if reply_object.used {
             return Err(IpcError::InvalidArgument);
         }
-        reply_object.used = true;
 
         let Some(message) = objects.endpoint_messages.get_mut(&reply_object.message_id) else {
             return Err(IpcError::InvalidHandle);
         };
+        if message.response.is_some() {
+            return Err(IpcError::InvalidHandle);
+        }
+        reply_object.used = true;
         message.response = Some(EndpointResponse::Data {
             bytes: response.to_vec(),
             attached_handles: attached_handles.to_vec(),
@@ -876,7 +922,48 @@ pub fn take_endpoint_response_with_handle_limit(
     })
 }
 
-pub fn fail_endpoints_owned_by_task(task_id: u64, err: IpcError) -> Vec<u64> {
+pub fn cancel_endpoint_call(reply: KernelReplyHandle, caller_task_id: u64) -> Result<(), IpcError> {
+    with_ipc_objects(|objects| {
+        let Some(message_id) = objects
+            .replies
+            .get(&reply.raw())
+            .map(|reply| reply.message_id)
+        else {
+            return Err(IpcError::InvalidHandle);
+        };
+        let Some(message) = objects.endpoint_messages.get(&message_id) else {
+            return Err(IpcError::InvalidHandle);
+        };
+        if message.caller_task_id != caller_task_id {
+            return Err(IpcError::InvalidArgument);
+        }
+
+        if let Some(endpoint) = objects.endpoints.get_mut(&message.endpoint_id) {
+            endpoint
+                .pending_messages
+                .retain(|pending_message_id| *pending_message_id != message_id);
+        }
+        objects.endpoint_messages.remove(&message_id);
+        objects.replies.remove(&reply.raw());
+        Ok(())
+    })
+}
+
+pub fn remove_endpoint_waiters_for_task(task_id: u64) -> usize {
+    with_ipc_objects(|objects| {
+        let mut removed = 0;
+        for endpoint in objects.endpoints.values_mut() {
+            let before = endpoint.waiting_receivers.len();
+            endpoint
+                .waiting_receivers
+                .retain(|waiting_task_id| *waiting_task_id != task_id);
+            removed += before.saturating_sub(endpoint.waiting_receivers.len());
+        }
+        removed
+    })
+}
+
+pub fn fail_endpoints_owned_by_task(task_id: u64, err: IpcError) -> EndpointWakeSet {
     with_ipc_objects(|objects| {
         let endpoints = objects
             .endpoints
@@ -886,12 +973,16 @@ pub fn fail_endpoints_owned_by_task(task_id: u64, err: IpcError) -> Vec<u64> {
             })
             .collect::<Vec<_>>();
         if endpoints.is_empty() {
-            return Vec::new();
+            return EndpointWakeSet::default();
         }
 
-        let mut callers_to_wake = Vec::new();
+        let mut wake_set = EndpointWakeSet::default();
         for endpoint_id in endpoints {
-            objects.endpoints.remove(&endpoint_id);
+            if let Some(endpoint) = objects.endpoints.remove(&endpoint_id) {
+                for receiver in endpoint.waiting_receivers {
+                    wake_set.push_receiver(receiver);
+                }
+            }
             let message_ids = objects
                 .endpoint_messages
                 .iter()
@@ -905,11 +996,18 @@ pub fn fail_endpoints_owned_by_task(task_id: u64, err: IpcError) -> Vec<u64> {
                 };
                 if message.response.is_none() {
                     message.response = Some(EndpointResponse::Error(err));
-                    callers_to_wake.push(message.caller_task_id);
+                    wake_set.push_caller(message.caller_task_id);
+                    if let Some(reply_id) = objects.replies.iter().find_map(|(reply_id, reply)| {
+                        (reply.message_id == message_id).then_some(*reply_id)
+                    }) {
+                        if let Some(reply) = objects.replies.get_mut(&reply_id) {
+                            reply.used = true;
+                        }
+                    }
                 }
             }
         }
-        callers_to_wake
+        wake_set
     })
 }
 
@@ -1617,8 +1715,9 @@ mod tests {
             let (reply, _) =
                 super::enqueue_endpoint_call(endpoint, 22, b"request").expect("enqueue call");
 
-            let callers = super::fail_endpoints_owned_by_task(10, IpcError::PeerClosed);
-            assert_eq!(callers, alloc::vec![22]);
+            let wake_set = super::fail_endpoints_owned_by_task(10, IpcError::PeerClosed);
+            assert_eq!(wake_set.callers, alloc::vec![22]);
+            assert!(wake_set.receivers.is_empty());
             assert_eq!(
                 super::take_endpoint_response(reply),
                 Err(IpcError::PeerClosed)
@@ -1627,6 +1726,131 @@ mod tests {
                 super::enqueue_endpoint_call(endpoint, 23, b"request"),
                 Err(IpcError::InvalidHandle)
             );
+        });
+    }
+
+    #[test]
+    fn endpoint_cancel_pending_call_removes_queued_message() {
+        with_isolated_ipc_test(|| {
+            let endpoint = super::create_endpoint().expect("create endpoint");
+            let (reply, _) =
+                super::enqueue_endpoint_call(endpoint, 22, b"request").expect("enqueue call");
+
+            assert_eq!(super::cancel_endpoint_call(reply, 22), Ok(()));
+            assert_eq!(recv_endpoint(endpoint), Ok(None));
+            assert_eq!(
+                super::take_endpoint_response(reply),
+                Err(IpcError::InvalidHandle)
+            );
+            assert_eq!(
+                super::complete_endpoint_reply(reply, b"late"),
+                Err(IpcError::InvalidHandle)
+            );
+        });
+    }
+
+    #[test]
+    fn endpoint_cancel_dequeued_call_invalidates_late_reply() {
+        with_isolated_ipc_test(|| {
+            let endpoint = super::create_endpoint().expect("create endpoint");
+            let (reply, _) =
+                super::enqueue_endpoint_call(endpoint, 22, b"request").expect("enqueue call");
+            let (server_reply, request) = recv_endpoint(endpoint)
+                .expect("recv endpoint")
+                .expect("message queued");
+            assert_eq!(server_reply, reply);
+            assert_eq!(request, b"request");
+
+            assert_eq!(super::cancel_endpoint_call(reply, 22), Ok(()));
+            assert_eq!(
+                super::complete_endpoint_reply(reply, b"late"),
+                Err(IpcError::InvalidHandle)
+            );
+            assert_eq!(
+                super::take_endpoint_response(reply),
+                Err(IpcError::InvalidHandle)
+            );
+        });
+    }
+
+    #[test]
+    fn endpoint_cancel_rejects_wrong_caller_without_consuming_reply() {
+        with_isolated_ipc_test(|| {
+            let endpoint = super::create_endpoint().expect("create endpoint");
+            let (reply, _) =
+                super::enqueue_endpoint_call(endpoint, 22, b"request").expect("enqueue call");
+
+            assert_eq!(
+                super::cancel_endpoint_call(reply, 23),
+                Err(IpcError::InvalidArgument)
+            );
+            let (server_reply, request) = recv_endpoint(endpoint)
+                .expect("recv endpoint")
+                .expect("message queued");
+            assert_eq!(server_reply, reply);
+            assert_eq!(request, b"request");
+            assert_eq!(super::complete_endpoint_reply(reply, b"ok"), Ok(22));
+            assert_eq!(
+                super::take_endpoint_response(reply),
+                Ok(Some(alloc::vec![b'o', b'k']))
+            );
+        });
+    }
+
+    #[test]
+    fn endpoint_owner_exit_wakes_receivers() {
+        with_isolated_ipc_test(|| {
+            let endpoint = super::create_endpoint_for_task(Some(10)).expect("create endpoint");
+            super::add_endpoint_receiver_waiter(endpoint, 31).expect("add waiter");
+            super::add_endpoint_receiver_waiter(endpoint, 32).expect("add waiter");
+
+            let wake_set = super::fail_endpoints_owned_by_task(10, IpcError::PeerClosed);
+            assert!(wake_set.callers.is_empty());
+            assert_eq!(wake_set.receivers, alloc::vec![31, 32]);
+        });
+    }
+
+    #[test]
+    fn endpoint_owner_exit_fails_dequeued_call() {
+        with_isolated_ipc_test(|| {
+            let endpoint = super::create_endpoint_for_task(Some(10)).expect("create endpoint");
+            let (reply, _) =
+                super::enqueue_endpoint_call(endpoint, 22, b"request").expect("enqueue call");
+            let (server_reply, _request) = recv_endpoint(endpoint)
+                .expect("recv endpoint")
+                .expect("message queued");
+            assert_eq!(server_reply, reply);
+
+            let wake_set = super::fail_endpoints_owned_by_task(10, IpcError::PeerClosed);
+            assert_eq!(wake_set.callers, alloc::vec![22]);
+            assert!(wake_set.receivers.is_empty());
+            assert_eq!(
+                super::complete_endpoint_reply(reply, b"late"),
+                Err(IpcError::InvalidArgument)
+            );
+            assert_eq!(
+                super::take_endpoint_response(reply),
+                Err(IpcError::PeerClosed)
+            );
+        });
+    }
+
+    #[test]
+    fn endpoint_remove_waiters_for_task_prunes_stale_waiters() {
+        with_isolated_ipc_test(|| {
+            let first = super::create_endpoint().expect("create first endpoint");
+            let second = super::create_endpoint().expect("create second endpoint");
+            super::add_endpoint_receiver_waiter(first, 9).expect("add first stale waiter");
+            super::add_endpoint_receiver_waiter(first, 10).expect("add live waiter");
+            super::add_endpoint_receiver_waiter(second, 9).expect("add second stale waiter");
+
+            assert_eq!(super::remove_endpoint_waiters_for_task(9), 2);
+            let (_reply, receiver_to_wake) =
+                super::enqueue_endpoint_call(first, 22, b"request").expect("enqueue first");
+            assert_eq!(receiver_to_wake, Some(10));
+            let (_reply, receiver_to_wake) =
+                super::enqueue_endpoint_call(second, 23, b"request").expect("enqueue second");
+            assert_eq!(receiver_to_wake, None);
         });
     }
 }

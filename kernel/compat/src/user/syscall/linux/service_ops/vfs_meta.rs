@@ -465,65 +465,55 @@ pub fn syscall_linux_vfs_umount2(target_ptr: u64, flags: u64) -> u64 {
 }
 
 pub fn syscall_linux_ioctl(fd: u64, request_number: u64, arg: u64) -> u64 {
-    if ioctl_requires_sessiond_tty_policy(request_number) {
-        match ioctl_tty_via_sessiond(fd, request_number, arg) {
-            Ok(value) => return value,
+    let route = if ioctl_is_direct_display_present(request_number) {
+        rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_DIRECT
+    } else {
+        match ioctl_route_via_devmgrd(fd, request_number) {
+            Ok(route) => route,
+            Err(_) if !ipc_ops::service_registered(linux_abi::IPC_SERVICE_DEVMGRD) => {
+                rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_DIRECT
+            }
             Err(errno) => return linux_errno(errno),
         }
-    }
-
-    if ioctl_requires_devmgrd_policy(request_number) {
-        match ioctl_device_via_devmgrd(fd, request_number, arg) {
-            Ok(value) => return value,
-            Err(errno) => return linux_errno(errno),
+    };
+    match route {
+        rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_SESSIOND_TTY => {
+            match ioctl_tty_via_sessiond(fd, request_number, arg) {
+                Ok(value) => value,
+                Err(errno) => linux_errno(errno),
+            }
         }
-    }
-
-    // Hot data-path ioctls stay direct: display present/input delivery costs
-    // must stay on the narrow broker/data path instead of taking per-frame
-    // policy IPC.
-    match crate::user::sysops::device::ioctl_current_process_fd(fd, request_number, arg) {
-        Ok(value) => value,
-        Err(err) => linux_errno(super::super::broker_ops::device_sysop_error_to_linux_errno(
-            err,
-        )),
+        rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_DEVMGRD => {
+            match ioctl_device_via_devmgrd(fd, request_number, arg) {
+                Ok(value) => value,
+                Err(errno) => linux_errno(errno),
+            }
+        }
+        rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_SESSIOND_COMMIT => {
+            match ioctl_device_via_devmgrd(fd, request_number, arg) {
+                Ok(value) => value,
+                Err(errno) => linux_errno(errno),
+            }
+        }
+        rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_DIRECT => {
+            match crate::user::sysops::device::ioctl_current_process_fd(fd, request_number, arg) {
+                Ok(value) => value,
+                Err(err) => linux_errno(
+                    super::super::broker_ops::device_sysop_error_to_linux_errno(err),
+                ),
+            }
+        }
+        _ => linux_errno(LINUX_EINVAL),
     }
 }
 
-// RING3-MIGRATION-REFERENCE START: hot-path exception: devmgrd/sessiond own
-// ioctl route policy. Ring0 keeps this selector only to preserve the direct hot
-// data path while policy-sensitive ioctls are service-routed.
-fn ioctl_requires_devmgrd_policy(request_number: u64) -> bool {
+fn ioctl_is_direct_display_present(request_number: u64) -> bool {
     matches!(
         request_number,
-        // Display setup policy — devmgrd delegates UI policy to uiserver.
-        rustos_user_abi::device::DISPLAY_IOCTL_GET_INFO
-            | rustos_user_abi::device::DISPLAY_IOCTL_CREATE_SURFACE
-            // Console/session observation and input injection policy.
-            | rustos_user_abi::console::CONSOLE_IOCTL_GET_STATE
-            | rustos_user_abi::console::CONSOLE_IOCTL_SNAPSHOT_SESSION_OUTPUT
-            | rustos_user_abi::console::CONSOLE_IOCTL_SEND_INPUT_EVENT
-            | rustos_user_abi::console::CONSOLE_IOCTL_SNAPSHOT_SESSIONS
-            // Session lifecycle — devmgrd owns session-table bookkeeping.
-            | rustos_user_abi::console::CONSOLE_IOCTL_CREATE_SESSION
-            | rustos_user_abi::console::CONSOLE_IOCTL_CLOSE_SESSION
-            | rustos_user_abi::console::CONSOLE_IOCTL_BIND_CURRENT_SESSION
-            | rustos_user_abi::console::CONSOLE_IOCTL_SET_SESSION_STATE
-            | rustos_user_abi::console::CONSOLE_IOCTL_SET_FOCUS
+        rustos_user_abi::device::DISPLAY_IOCTL_PRESENT
+            | rustos_user_abi::device::DISPLAY_IOCTL_PRESENT_RECT
     )
 }
-
-fn ioctl_requires_sessiond_tty_policy(request_number: u64) -> bool {
-    matches!(
-        request_number,
-        linux_abi::TCGETS
-            | linux_abi::TCSETS
-            | linux_abi::TCSETSW
-            | linux_abi::TCSETSF
-            | linux_abi::FIONREAD
-    )
-}
-// RING3-MIGRATION-REFERENCE END: devmgrd/sessiond-owned ioctl route hot-path exception.
 
 const NETD_MAX_IOVEC_COUNT: usize = 16;
 
@@ -551,6 +541,7 @@ pub fn syscall_linux_net6(
         arg5,
         ..NetdIpcRequest::default()
     };
+    let mut pending_transfers = PendingNetdTransfers::default();
     if let Some(snapshot) = multitask::current_user_snapshot() {
         request.pid = snapshot.process_id();
         request.tid = snapshot.thread_id();
@@ -562,7 +553,8 @@ pub fn syscall_linux_net6(
         request.egid = security.egid();
     }
     populate_netd_socket_token(&mut request);
-    if let Err(errno) = populate_netd_request_payload(&mut request) {
+    if let Err(errno) = populate_netd_request_payload(&mut request, &mut pending_transfers) {
+        pending_transfers.drop_pending();
         return linux_errno(errno);
     }
     match call_netd_ipc_request(&request).and_then(|response| {
@@ -570,7 +562,29 @@ pub fn syscall_linux_net6(
         Ok(response.value)
     }) {
         Ok(value) => value,
-        Err(errno) => linux_errno(errno),
+        Err(errno) => {
+            pending_transfers.drop_pending();
+            linux_errno(errno)
+        }
+    }
+}
+
+#[derive(Default)]
+struct PendingNetdTransfers {
+    descriptors: Vec<kernel_ipc_runtime::api::KernelTransferredHandle>,
+}
+
+impl PendingNetdTransfers {
+    fn extend(&mut self, descriptors: &[kernel_ipc_runtime::api::KernelTransferredHandle]) {
+        self.descriptors.extend_from_slice(descriptors);
+    }
+
+    fn drop_pending(&mut self) {
+        if self.descriptors.is_empty() {
+            return;
+        }
+        super::super::ipc_ops::drop_transfer_descriptors(self.descriptors.as_slice());
+        self.descriptors.clear();
     }
 }
 
@@ -590,7 +604,8 @@ fn populate_netd_socket_token(request: &mut NetdIpcRequest) {
         | SYSCALL_OFFLOAD_OP_LINUX_SHUTDOWN
         | SYSCALL_OFFLOAD_OP_LINUX_SENDMSG
         | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG
-        | SYSCALL_OFFLOAD_OP_LINUX_RECVFROM => request.arg0,
+        | SYSCALL_OFFLOAD_OP_LINUX_RECVFROM
+        | SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET => request.arg0,
         _ => return,
     };
     let Some((token, status_flags)) =
@@ -610,7 +625,10 @@ fn populate_netd_socket_token(request: &mut NetdIpcRequest) {
     request.status_flags = status_flags;
 }
 
-fn populate_netd_request_payload(request: &mut NetdIpcRequest) -> Result<(), i64> {
+fn populate_netd_request_payload(
+    request: &mut NetdIpcRequest,
+    pending_transfers: &mut PendingNetdTransfers,
+) -> Result<(), i64> {
     match request.op {
         SYSCALL_OFFLOAD_OP_LINUX_BIND | SYSCALL_OFFLOAD_OP_LINUX_CONNECT => {
             copy_current_payload(request, request.arg1, request.arg2)
@@ -626,21 +644,22 @@ fn populate_netd_request_payload(request: &mut NetdIpcRequest) -> Result<(), i64
                 .map_err(address_space_error_to_linux_errno)?;
             let bytes = read_current_iovec_payload(header.msg_iov, header.msg_iovlen)?;
             let control = read_current_control_payload(header.msg_control, header.msg_controllen)?;
+            pending_transfers.extend(control.descriptors.as_slice());
             let payload_len = NETD_SENDMSG_PAYLOAD_HEADER_SIZE
                 .checked_add(bytes.len())
-                .and_then(|len| len.checked_add(control.len()))
+                .and_then(|len| len.checked_add(control.bytes.len()))
                 .ok_or(LINUX_EINVAL)?;
             if payload_len > NETD_IPC_PAYLOAD_CAPACITY {
                 return Err(LINUX_EINVAL);
             }
             request.payload[0..4].copy_from_slice(&(bytes.len() as u32).to_ne_bytes());
-            request.payload[4..8].copy_from_slice(&(control.len() as u32).to_ne_bytes());
+            request.payload[4..8].copy_from_slice(&(control.bytes.len() as u32).to_ne_bytes());
             request.payload[8..12].copy_from_slice(&0_u32.to_ne_bytes());
             request.payload[12..16].copy_from_slice(&0_u32.to_ne_bytes());
             let data_start = NETD_SENDMSG_PAYLOAD_HEADER_SIZE;
             let control_start = data_start + bytes.len();
             request.payload[data_start..control_start].copy_from_slice(bytes.as_slice());
-            request.payload[control_start..payload_len].copy_from_slice(control.as_slice());
+            request.payload[control_start..payload_len].copy_from_slice(control.bytes.as_slice());
             request.payload_len = payload_len as u32;
             request.arg4 = header.msg_controllen;
             Ok(())
@@ -812,26 +831,40 @@ fn write_current_control_payload(
     control_capacity: u64,
     control: &[u8],
 ) -> Result<(usize, u32), i64> {
-    let control = decode_transfer_control_payload(control)?;
     if control.is_empty() {
         return Ok((0, 0));
     }
+    let decoded_len = decoded_transfer_control_len(control)?;
     let capacity = usize::try_from(control_capacity).map_err(|_| LINUX_EINVAL)?;
     if control_ptr == 0 || capacity == 0 {
+        drop_encoded_transfer_descriptors(control)?;
         return Ok((0, linux_abi::MSG_CTRUNC as u32));
     }
-    if capacity < control.len() {
+    if capacity < decoded_len {
+        drop_encoded_transfer_descriptors(control)?;
         return Ok((0, linux_abi::MSG_CTRUNC as u32));
     }
+    let control = decode_transfer_control_payload(control)?;
     usermem::write_current_user_bytes(control_ptr, control.as_slice())
         .map_err(address_space_error_to_linux_errno)?;
     Ok((control.len(), 0))
 }
 
-fn read_current_control_payload(control_ptr: u64, control_len: u64) -> Result<Vec<u8>, i64> {
+struct EncodedControlPayload {
+    bytes: Vec<u8>,
+    descriptors: Vec<kernel_ipc_runtime::api::KernelTransferredHandle>,
+}
+
+fn read_current_control_payload(
+    control_ptr: u64,
+    control_len: u64,
+) -> Result<EncodedControlPayload, i64> {
     let control_len = usize::try_from(control_len).map_err(|_| LINUX_EINVAL)?;
     if control_ptr == 0 || control_len == 0 {
-        return Ok(Vec::new());
+        return Ok(EncodedControlPayload {
+            bytes: Vec::new(),
+            descriptors: Vec::new(),
+        });
     }
     if control_len > NETD_IPC_PAYLOAD_CAPACITY {
         return Err(LINUX_EINVAL);
@@ -842,8 +875,9 @@ fn read_current_control_payload(control_ptr: u64, control_len: u64) -> Result<Ve
     encode_transfer_control_payload(control.as_slice())
 }
 
-fn encode_transfer_control_payload(control: &[u8]) -> Result<Vec<u8>, i64> {
-    rewrite_scm_rights_control(control, |fd_bytes| {
+fn encode_transfer_control_payload(control: &[u8]) -> Result<EncodedControlPayload, i64> {
+    let mut all_descriptors = Vec::new();
+    let result = rewrite_scm_rights_control(control, |fd_bytes| {
         if fd_bytes.len() % core::mem::size_of::<i32>() != 0 {
             return Err(LINUX_EINVAL);
         }
@@ -853,8 +887,7 @@ fn encode_transfer_control_payload(control: &[u8]) -> Result<Vec<u8>, i64> {
                 chunk.try_into().map_err(|_| LINUX_EINVAL)?,
             ));
         }
-        let descriptors = super::super::ipc_ops::export_current_fds_for_transfer(fds.as_slice())
-            .map_err(|_| LINUX_EBADF)?;
+        let descriptors = super::super::ipc_ops::export_current_fds_for_transfer(fds.as_slice())?;
         let bytes = unsafe {
             core::slice::from_raw_parts(
                 descriptors.as_ptr().cast::<u8>(),
@@ -862,7 +895,19 @@ fn encode_transfer_control_payload(control: &[u8]) -> Result<Vec<u8>, i64> {
                     * core::mem::size_of::<kernel_ipc_runtime::api::KernelTransferredHandle>(),
             )
         };
+        all_descriptors.extend_from_slice(descriptors.as_slice());
         Ok(bytes.to_vec())
+    });
+    let bytes = match result {
+        Ok(bytes) => bytes,
+        Err(errno) => {
+            super::super::ipc_ops::drop_transfer_descriptors(all_descriptors.as_slice());
+            return Err(errno);
+        }
+    };
+    Ok(EncodedControlPayload {
+        bytes,
+        descriptors: all_descriptors,
     })
 }
 
@@ -888,6 +933,80 @@ fn decode_transfer_control_payload(control: &[u8]) -> Result<Vec<u8>, i64> {
         };
         Ok(bytes.to_vec())
     })
+}
+
+fn decoded_transfer_control_len(control: &[u8]) -> Result<usize, i64> {
+    let descriptor_size = core::mem::size_of::<kernel_ipc_runtime::api::KernelTransferredHandle>();
+    let mut total = 0usize;
+    let mut offset = 0usize;
+    while offset + core::mem::size_of::<linux_abi::LinuxCmsghdr>() <= control.len() {
+        let header = read_control_header(&control[offset..])?;
+        let cmsg_len = usize::try_from(header.cmsg_len).map_err(|_| LINUX_EINVAL)?;
+        if cmsg_len < core::mem::size_of::<linux_abi::LinuxCmsghdr>()
+            || offset + cmsg_len > control.len()
+        {
+            return Err(LINUX_EINVAL);
+        }
+        let next = next_control_offset(control.len(), offset, cmsg_len)?;
+        let data_len = cmsg_len - core::mem::size_of::<linux_abi::LinuxCmsghdr>();
+        let visible_len = if header.cmsg_level == linux_abi::SOL_SOCKET as u32
+            && header.cmsg_type == linux_abi::SCM_RIGHTS as u32
+        {
+            if descriptor_size == 0 || data_len % descriptor_size != 0 {
+                return Err(LINUX_EINVAL);
+            }
+            let fd_bytes = (data_len / descriptor_size)
+                .checked_mul(core::mem::size_of::<i32>())
+                .ok_or(LINUX_EINVAL)?;
+            core::mem::size_of::<linux_abi::LinuxCmsghdr>()
+                .checked_add(fd_bytes)
+                .ok_or(LINUX_EINVAL)?
+        } else {
+            cmsg_len
+        };
+        total = total
+            .checked_add(cmsg_align(visible_len))
+            .ok_or(LINUX_EINVAL)?;
+        offset = next;
+    }
+    if offset != control.len() {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(total)
+}
+
+fn drop_encoded_transfer_descriptors(control: &[u8]) -> Result<(), i64> {
+    let descriptor_size = core::mem::size_of::<kernel_ipc_runtime::api::KernelTransferredHandle>();
+    let mut descriptors = Vec::new();
+    let mut offset = 0usize;
+    while offset + core::mem::size_of::<linux_abi::LinuxCmsghdr>() <= control.len() {
+        let header = read_control_header(&control[offset..])?;
+        let cmsg_len = usize::try_from(header.cmsg_len).map_err(|_| LINUX_EINVAL)?;
+        if cmsg_len < core::mem::size_of::<linux_abi::LinuxCmsghdr>()
+            || offset + cmsg_len > control.len()
+        {
+            return Err(LINUX_EINVAL);
+        }
+        let next = next_control_offset(control.len(), offset, cmsg_len)?;
+        if header.cmsg_level == linux_abi::SOL_SOCKET as u32
+            && header.cmsg_type == linux_abi::SCM_RIGHTS as u32
+        {
+            let data_start = offset + core::mem::size_of::<linux_abi::LinuxCmsghdr>();
+            let data = &control[data_start..offset + cmsg_len];
+            if descriptor_size == 0 || data.len() % descriptor_size != 0 {
+                return Err(LINUX_EINVAL);
+            }
+            for chunk in data.chunks_exact(descriptor_size) {
+                descriptors.push(read_transfer_descriptor(chunk)?);
+            }
+        }
+        offset = next;
+    }
+    if offset != control.len() {
+        return Err(LINUX_EINVAL);
+    }
+    super::super::ipc_ops::drop_transfer_descriptors(descriptors.as_slice());
+    Ok(())
 }
 
 fn rewrite_scm_rights_control<F>(control: &[u8], mut rewrite: F) -> Result<Vec<u8>, i64>

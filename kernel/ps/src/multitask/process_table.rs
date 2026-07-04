@@ -136,18 +136,9 @@ impl ProcessTable {
         }
     }
 
-    fn lookup_slot(&self, handle: ProcessHandle) -> Option<&ProcessSlot> {
-        let slot = self.slots.get(handle.index())?;
-        (slot.generation == handle.generation()).then_some(slot)
-    }
-
     fn lookup_slot_mut(&mut self, handle: ProcessHandle) -> Option<&mut ProcessSlot> {
         let slot = self.slots.get_mut(handle.index())?;
         (slot.generation == handle.generation()).then_some(slot)
-    }
-
-    fn lookup_object(&self, handle: ProcessHandle) -> Option<&ProcessObject> {
-        self.lookup_slot(handle)?.object.as_deref()
     }
 
     fn lookup_object_mut(&mut self, handle: ProcessHandle) -> Option<&mut ProcessObject> {
@@ -298,11 +289,6 @@ pub fn release_process_ref(handle: ProcessHandle) {
     if should_queue {
         table.push_reap_handle(handle);
     }
-}
-
-pub fn process_id(handle: ProcessHandle) -> Option<u64> {
-    let table = PROCESS_TABLE.lock();
-    Some(table.lookup_object(handle)?.process_id)
 }
 
 pub fn parent_process_id_of(process_id: u64) -> Option<u64> {
