@@ -613,6 +613,7 @@ fn populate_netd_socket_token(request: &mut NetdIpcRequest) {
             let entry = process_state.handles().get_entry(fd)?;
             let token = match entry.handle() {
                 multitask::KernelHandle::Socket(socket) => socket.token_id(),
+                multitask::KernelHandle::InetSocket(socket) => socket.token_id(),
                 _ => return None,
             };
             Some((token, entry.status_flags()))

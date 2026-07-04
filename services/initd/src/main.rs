@@ -34,6 +34,7 @@ const INPUTD_EXEC_PATH: &str = "services/inputd/inputd.elf";
 const POLL_INTERVAL: Duration = Duration::from_millis(2);
 const RETRY_BACKOFF: Duration = Duration::from_millis(50);
 const DEFAULT_INIT_TASK_WEIGHT_MICROS: u64 = 1_000;
+const EARLY_POLICY_TASK_WEIGHT_MICROS: u64 = 4_000;
 const DISPLAY_CRITICAL_TASK_WEIGHT_MICROS: u64 = 2_000;
 // Keep secondary services on the boot path. Guest Instant can be unavailable
 // during early bring-up, so time-based deferral can leave storaged deferred
@@ -149,7 +150,7 @@ fn main() {
                             Some(Instant::now() + SECONDARY_SERVICE_DEFER_AFTER_RUNTIMED);
                     }
                     launched_this_round = true;
-                    break;
+                    continue;
                 }
                 Err(err) => {
                     observability_client::error!(
@@ -282,6 +283,9 @@ fn launch_gate_satisfied(exec: &str) -> bool {
                 && service_ready(rustos_user_abi::syscall::IPC_SERVICE_DEVMGRD)
                 && service_ready(rustos_user_abi::syscall::IPC_SERVICE_INPUTD)
         }
+        STORAGED_EXEC_PATH => {
+            foundation_policy_services_ready() && service_ready(IPC_SERVICE_SESSIOND)
+        }
         _ => foundation_policy_services_ready(),
     }
 }
@@ -307,23 +311,7 @@ fn service_ready(service_id: u64) -> bool {
 }
 
 fn report_rootd_service_lease(exec_path: &str, pid: i32) {
-    let Some(service_id) = rootd_service_id_for_exec(exec_path) else {
-        return;
-    };
-    if pid <= 0 {
-        return;
-    }
-    match report_rootd_service_lease_inner(service_id, exec_path, pid as u64) {
-        Ok(()) => {}
-        Err(err) => observability_client::warn!(
-            "initd",
-            service,
-            "rootd lease report failed exec={} pid={} errno={}",
-            exec_path,
-            pid,
-            err
-        ),
-    }
+    let _ = (exec_path, pid);
 }
 
 fn rootd_service_id_for_exec(exec_path: &str) -> Option<u64> {
@@ -564,6 +552,7 @@ fn lookup_loader_endpoint() -> Result<u64, i32> {
 
 fn exec_weight_micros(exec_path: &str) -> u64 {
     match exec_path {
+        NETD_EXEC_PATH | DEVMGRD_EXEC_PATH => EARLY_POLICY_TASK_WEIGHT_MICROS,
         RUNTIMED_EXEC_PATH | DRIVERD_EXEC_PATH | INPUTD_EXEC_PATH => {
             DISPLAY_CRITICAL_TASK_WEIGHT_MICROS
         }

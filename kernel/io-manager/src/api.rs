@@ -209,6 +209,22 @@ pub mod console {
     }
 }
 
+pub mod network {
+    pub use crate::network::{PACKET_MTU, PacketError};
+
+    pub fn available() -> bool {
+        crate::network::available()
+    }
+
+    pub fn transmit_frame(frame: &[u8]) -> Result<usize, PacketError> {
+        crate::network::transmit_frame(frame)
+    }
+
+    pub fn receive_frame(out: &mut [u8]) -> Result<usize, PacketError> {
+        crate::network::receive_frame(out)
+    }
+}
+
 pub mod driver {
     pub mod irq {
         pub fn dispatch_pic_irq(irq: u8) -> bool {

@@ -114,6 +114,7 @@ const LINUX_ENOTTY: i64 = 25;
 const LINUX_EOPNOTSUPP: i64 = 95;
 const LINUX_EAFNOSUPPORT: i64 = 97;
 const LINUX_EPIPE: i64 = 32;
+const LINUX_EMSGSIZE: i64 = 90;
 const LINUX_ERANGE: i64 = 34;
 const LINUX_EROFS: i64 = 30;
 const LINUX_ESTALE: i64 = 116;

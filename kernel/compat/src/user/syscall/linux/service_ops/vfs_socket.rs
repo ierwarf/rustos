@@ -672,7 +672,7 @@ fn current_socket_fd(fd: u64) -> bool {
     multitask::with_current_user_process_state(|_, _, process_state| {
         matches!(
             process_state.handles().get(fd),
-            Some(multitask::KernelHandle::Socket(_))
+            Some(multitask::KernelHandle::Socket(_) | multitask::KernelHandle::InetSocket(_))
         )
     })
     .unwrap_or(false)
@@ -682,6 +682,7 @@ fn current_socket_token(fd: u64) -> Option<u64> {
     multitask::with_current_user_process_state(|_, _, process_state| {
         match process_state.handles().get(fd) {
             Some(multitask::KernelHandle::Socket(socket)) => Some(socket.token_id()),
+            Some(multitask::KernelHandle::InetSocket(socket)) => Some(socket.token_id()),
             _ => None,
         }
     })
@@ -693,6 +694,9 @@ fn current_socket_token_and_flags(fd: u64) -> Option<(u64, u64)> {
         let entry = process_state.handles().get_entry(fd)?;
         match entry.handle() {
             multitask::KernelHandle::Socket(socket) => {
+                Some((socket.token_id(), entry.status_flags()))
+            }
+            multitask::KernelHandle::InetSocket(socket) => {
                 Some((socket.token_id(), entry.status_flags()))
             }
             _ => None,

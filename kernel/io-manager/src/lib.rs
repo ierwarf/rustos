@@ -51,46 +51,8 @@ pub mod input;
 #[path = "input_core.rs"]
 pub mod input_core;
 
-pub(crate) mod network {
-    use core::sync::atomic::{AtomicUsize, Ordering};
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(crate) enum LinuxNetdevTransport {
-        Unknown,
-        Pci,
-    }
-
-    static CURRENT_TRANSPORT: AtomicUsize = AtomicUsize::new(0);
-
-    pub(crate) fn note_virtio_net_driver_registered() {}
-
-    pub(crate) fn current_linux_netdev_transport() -> LinuxNetdevTransport {
-        match CURRENT_TRANSPORT.load(Ordering::Acquire) {
-            1 => LinuxNetdevTransport::Pci,
-            _ => LinuxNetdevTransport::Unknown,
-        }
-    }
-
-    pub(crate) fn set_current_linux_netdev_transport(transport: LinuxNetdevTransport) {
-        let value = match transport {
-            LinuxNetdevTransport::Unknown => 0,
-            LinuxNetdevTransport::Pci => 1,
-        };
-        CURRENT_TRANSPORT.store(value, Ordering::Release);
-    }
-
-    pub(crate) fn register_linux_netdev(_dev: usize, _transport: LinuxNetdevTransport) -> i32 {
-        0
-    }
-
-    pub(crate) fn unregister_linux_netdev(_dev: usize) {}
-
-    pub(crate) fn allocate_linux_netdev(_dev: usize, _sizeof_priv: usize, _txqs: u32, _rxqs: u32) {}
-
-    pub(crate) fn free_linux_netdev(_dev: usize) {}
-
-    pub(crate) fn set_linux_netdev_carrier(_dev: usize, _carrier: bool) {}
-}
+#[path = "network/mod.rs"]
+pub(crate) mod network;
 
 #[path = "io/mod.rs"]
 pub mod io;

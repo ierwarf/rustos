@@ -41,7 +41,7 @@ const SPAWN_FLAG_LOGICAL_ADMIN: u64 = 1;
 // Linux nice-like service boost so dynamic-linker and driver bursts do not
 // leave runnable servers behind for hundreds of milliseconds.
 const CORE_SERVICE_WEIGHT_MICROS: u64 = 4_000;
-const INITD_WEIGHT_MICROS: u64 = 2_000;
+const INITD_WEIGHT_MICROS: u64 = 4_000;
 
 const SYSCALLD_EXEC: &[u8] = b"services/syscalld/syscalld.elf\0";
 const VFSD_EXEC: &[u8] = b"services/vfsd/vfsd.elf\0";
@@ -712,7 +712,8 @@ fn fill_commercial_max_response(
             Ok(())
         }
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY => {
-            let capability = service_capability_for_subject(leases, post_init_leases, request)?;
+            let capability =
+                service_capability_for_subject(leases, post_init_leases, request)?;
             response.value0 = capability;
             Ok(())
         }
@@ -977,7 +978,7 @@ fn service_policy_capability(service_id: u64) -> u64 {
 
 fn service_capability_for_subject(
     leases: &[Lease],
-    post_init_leases: &[PostInitLease],
+    post_init_leases: &mut [PostInitLease],
     request: &CommercialMaxProtocolRequest,
 ) -> Result<u64, i32> {
     if request.arg0 == 0 || request.header.subject_pid == 0 || request.header.subject_tid == 0 {
@@ -991,6 +992,13 @@ fn service_capability_for_subject(
         return Ok(capability);
     }
     if let Some(capability) = post_init_delegated_service_capability(
+        post_init_leases,
+        request.arg0,
+        request.header.subject_pid,
+    ) {
+        return Ok(capability);
+    }
+    if let Some(capability) = post_init_claim_service_capability(
         post_init_leases,
         request.arg0,
         request.header.subject_pid,
@@ -1079,6 +1087,26 @@ fn post_init_delegated_service_capability(
         return None;
     }
     Some(rustos_user_abi::syscall::IPC_SERVICE_CAP_SERVICE_DRIVER_POLICY)
+}
+
+fn post_init_claim_service_capability(
+    post_init_leases: &mut [PostInitLease],
+    service_id: u64,
+    subject_pid: u64,
+) -> Option<u64> {
+    let lease = post_init_leases.iter_mut().find(|lease| {
+        lease.service_id == service_id
+            && (lease.state == rustos_user_abi::syscall::ROOTD_LEASE_STATE_EMPTY
+                || lease.pid == subject_pid)
+    })?;
+    let capability = service_policy_capability(lease.service_id);
+    if capability == 0 {
+        return None;
+    }
+    lease.pid = subject_pid;
+    lease.state = ROOTD_LEASE_STATE_RUNNING;
+    lease.exit_status = 0;
+    Some(capability)
 }
 
 fn authorize_service_lookup_for_subject(
@@ -1461,4 +1489,23 @@ pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, len: usize) -> *m
         offset += 1;
     }
     dest
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memcmp(lhs: *const u8, rhs: *const u8, len: usize) -> i32 {
+    let mut offset = 0usize;
+    while offset < len {
+        let left = lhs.add(offset).read();
+        let right = rhs.add(offset).read();
+        if left != right {
+            return left as i32 - right as i32;
+        }
+        offset += 1;
+    }
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bcmp(lhs: *const u8, rhs: *const u8, len: usize) -> i32 {
+    memcmp(lhs, rhs, len)
 }

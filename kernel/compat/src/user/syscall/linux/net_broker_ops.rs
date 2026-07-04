@@ -1,6 +1,9 @@
 use super::*;
 
-use rustos_user_abi::syscall::{IPC_SERVICE_CAP_NET_POLICY, RustosNetBrokerArgs};
+use rustos_user_abi::syscall::{
+    IPC_SERVICE_CAP_NET_POLICY, NET_BROKER_OP_PACKET_RX, NET_BROKER_OP_PACKET_STATUS,
+    NET_BROKER_OP_PACKET_TX, RustosNetBrokerArgs,
+};
 use x86_64::VirtAddr;
 
 pub(super) fn syscall_linux_rustos_net_broker(args_ptr: u64) -> u64 {
@@ -27,7 +30,53 @@ fn dispatch_net_broker(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
         SYSCALL_OFFLOAD_OP_LINUX_SOCKET => broker_socket(args),
         SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR => broker_socketpair(args),
         SYSCALL_OFFLOAD_OP_LINUX_ACCEPT => broker_accept(args),
+        NET_BROKER_OP_PACKET_STATUS => broker_packet_status(),
+        NET_BROKER_OP_PACKET_TX => broker_packet_tx(args),
+        NET_BROKER_OP_PACKET_RX => broker_packet_rx(args),
         _ => Err(LINUX_EINVAL),
+    }
+}
+
+fn broker_packet_status() -> Result<u64, i64> {
+    Ok(u64::from(kernel_io_manager::api::network::available()))
+}
+
+fn broker_packet_tx(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
+    let len = usize::try_from(args.arg1).map_err(|_| LINUX_EINVAL)?;
+    if len > kernel_io_manager::api::network::PACKET_MTU {
+        return Err(LINUX_EMSGSIZE);
+    }
+    if len == 0 {
+        return Ok(0);
+    }
+    let mut frame = alloc::vec![0_u8; len];
+    usermem::copy_from_current_user_exact(args.arg0, frame.as_mut_slice())
+        .map_err(address_space_error_to_linux_errno)?;
+    kernel_io_manager::api::network::transmit_frame(frame.as_slice())
+        .map(|count| count as u64)
+        .map_err(packet_error_to_linux_errno)
+}
+
+fn broker_packet_rx(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
+    let cap = usize::try_from(args.arg1).map_err(|_| LINUX_EINVAL)?;
+    if cap == 0 || cap > kernel_io_manager::api::network::PACKET_MTU {
+        return Err(LINUX_EINVAL);
+    }
+    let mut frame = alloc::vec![0_u8; cap];
+    let count = kernel_io_manager::api::network::receive_frame(frame.as_mut_slice())
+        .map_err(packet_error_to_linux_errno)?;
+    usermem::write_current_user_bytes(args.arg0, &frame[..count])
+        .map_err(address_space_error_to_linux_errno)?;
+    Ok(count as u64)
+}
+
+fn packet_error_to_linux_errno(err: kernel_io_manager::api::network::PacketError) -> i64 {
+    match err {
+        kernel_io_manager::api::network::PacketError::NoDevice => LINUX_ENODEV,
+        kernel_io_manager::api::network::PacketError::Invalid => LINUX_EINVAL,
+        kernel_io_manager::api::network::PacketError::Busy => LINUX_EAGAIN,
+        kernel_io_manager::api::network::PacketError::TooLarge => LINUX_EMSGSIZE,
+        kernel_io_manager::api::network::PacketError::WouldBlock => LINUX_EAGAIN,
     }
 }
 
@@ -48,9 +97,14 @@ fn broker_socket(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
             ))
         }
         (linux_abi::AF_INET, linux_abi::SOCK_STREAM)
-        | (linux_abi::AF_INET, linux_abi::SOCK_DGRAM) => multitask::KernelHandle::InetSocket(
-            multitask::InetSocketHandle::new(domain, base_type, protocol),
-        ),
+        | (linux_abi::AF_INET, linux_abi::SOCK_DGRAM) => {
+            let handle = if args.arg3 != 0 {
+                multitask::InetSocketHandle::from_token(args.arg3, domain, base_type, protocol)
+            } else {
+                multitask::InetSocketHandle::new(domain, base_type, protocol)
+            };
+            multitask::KernelHandle::InetSocket(handle)
+        }
         _ => return Err(LINUX_EAFNOSUPPORT),
     };
 

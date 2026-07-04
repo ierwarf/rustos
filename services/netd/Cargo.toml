@@ -7,3 +7,4 @@ publish = false
 [dependencies]
 libc = "0.2"
 rustos-user-abi = { path = "../../libs/rustos-user-abi", features = ["linux-compat-state"] }
+smoltcp = { version = "=0.13.0", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "socket-tcp"] }
