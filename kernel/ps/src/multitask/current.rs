@@ -102,6 +102,11 @@ pub fn arm_block_current_task() -> bool {
     interrupts::without_interrupts(|| unsafe { scheduler_mut().arm_block_current_task() })
 }
 
+/// Cancels a previously armed block without marking the current task blocked.
+pub fn cancel_block_current_task() -> bool {
+    interrupts::without_interrupts(|| unsafe { scheduler_mut().cancel_block_current_task() })
+}
+
 /// Commits a previously armed block. Returns `Some(true)` if blocked,
 /// `Some(false)` if a wake raced us and we stayed runnable, `None` on invalid
 /// context. Callers must re-check their wakeup condition when `Some(false)` is
@@ -119,6 +124,10 @@ pub fn wake_task(task_id: u64) -> bool {
 /// to the receiver), eliminating round-robin latency on IPC roundtrips.
 pub fn set_next_pick_hint(task_id: u64) {
     interrupts::without_interrupts(|| unsafe { scheduler_mut().set_next_pick_hint(task_id) })
+}
+
+pub fn set_next_spawn_pick_hint(task_id: u64) {
+    interrupts::without_interrupts(|| unsafe { scheduler_mut().set_next_spawn_pick_hint(task_id) })
 }
 
 pub fn current_console_session() -> ConsoleSessionHandle {

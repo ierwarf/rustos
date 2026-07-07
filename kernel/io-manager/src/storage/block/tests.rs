@@ -9,9 +9,8 @@ use storage_core::BlockDevice as SharedBlockDevice;
 use super::io::{cache_lookup, clear_cache_for_tests, read_cached_block, write_cached_block};
 use super::registry::register_root_device;
 use super::{
-    BLOCK_DEVICES, BLOCK_INIT_DONE, BLOCK_INIT_STATE, BlockDeviceOps, BlockTransportKind,
-    MIN_LOGICAL_BLOCK_SIZE, descriptors, flush, lookup, open_boot_block_device,
-    open_physical_boot_block_device,
+    descriptors, flush, lookup, open_physical_boot_block_device, BlockDeviceOps,
+    BlockTransportKind, BLOCK_DEVICES, BLOCK_INIT_DONE, BLOCK_INIT_STATE, MIN_LOGICAL_BLOCK_SIZE,
 };
 use crate::storage::fat::{DiskIoError, IoResult};
 
@@ -244,23 +243,4 @@ fn physical_boot_opener_matches_superfloppy_identity() {
     };
 
     assert!(open_physical_boot_block_device(identity).is_ok());
-}
-
-#[test]
-fn boot_opener_returns_detected_partition_extent() {
-    let _guard = TEST_LOCK.lock();
-    reset_for_tests();
-
-    let start_lba = 8;
-    let sectors = 16;
-    register_root_device(Box::new(MockBlockDevice::with_fat_partition(
-        start_lba,
-        sectors,
-        0x1111_2222,
-        false,
-    )));
-
-    let device = open_boot_block_device().expect("open detected FAT device");
-    assert_eq!(device.logical_block_size(), TEST_BLOCK_SIZE);
-    assert_eq!(device.block_count(), sectors as u64);
 }

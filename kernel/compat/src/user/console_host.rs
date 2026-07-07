@@ -1,5 +1,5 @@
 // RING3-MIGRATION-REFERENCE START: loaderd/sessiond should own console-host
-// executable discovery and fallback policy. Ring0 keeps this bootstrap-local
+// executable discovery policy. Ring0 keeps this bootstrap-local
 // console image materialization path for fixed pre-loaderd service bootstrap.
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -73,7 +73,6 @@ pub enum ConsoleHostError {
     BootstrapBlocked,
     Load {
         path: &'static str,
-        fallback_path: Option<&'static str>,
         error: vfs::VfsError,
     },
     Spawn {
@@ -101,33 +100,18 @@ impl ConsoleHostError {
             ),
             Self::Load {
                 path,
-                fallback_path,
                 error,
             } => {
-                if let Some(fallback_path) = fallback_path {
-                    emit_console(
-                        debug::LogLevel::Warn,
-                        0,
-                        0,
-                        alloc::format!(
-                            "failed to load boot program image from {} or {}: {:?}",
-                            path,
-                            fallback_path,
-                            error,
-                        ),
-                    );
-                } else {
-                    emit_console(
-                        debug::LogLevel::Warn,
-                        0,
-                        0,
-                        alloc::format!(
-                            "failed to load boot program image from {}: {:?}",
-                            path,
-                            error
-                        ),
-                    );
-                }
+                emit_console(
+                    debug::LogLevel::Warn,
+                    0,
+                    0,
+                    alloc::format!(
+                        "failed to load boot program image from {}: {:?}",
+                        path,
+                        error
+                    ),
+                );
             }
             Self::Spawn { error, .. } => error.log_debug_details(),
         }
@@ -199,7 +183,6 @@ pub fn spawn_program_in_session(
 
 pub fn load_executable_image_by_path(
     primary_path: &str,
-    fallback_path: Option<&str>,
 ) -> Result<LoadedExecutableImage, ConsoleHostError> {
     debug::record_milestone(debug::LogCategory::Console, "console-load-enter", 0, 0);
     if !crate::storage::boot_volume::userspace_runtime_active() {
@@ -213,14 +196,10 @@ pub fn load_executable_image_by_path(
             debug::LogLevel::Debug,
             5,
             0,
-            alloc::format!(
-                "console host: load image begin primary={} fallback={}",
-                primary_path,
-                fallback_path.unwrap_or("-"),
-            ),
+            alloc::format!("console host: load image begin path={}", primary_path),
         );
     }
-    match load_executable_image_path_uncached(primary_path, fallback_path) {
+    match load_executable_image_path_uncached(primary_path) {
         Ok(loaded) => {
             if trace {
                 emit_console(
@@ -246,13 +225,11 @@ fn reserve_console_host_trace() -> bool {
 
 fn load_executable_image_path_uncached(
     primary_path: &str,
-    fallback_path: Option<&str>,
 ) -> Result<LoadedExecutableImage, ConsoleHostError> {
     crate::debug::debug!(
         console,
-        "console host: primary read begin path={} fallback={}",
+        "console host: read begin path={}",
         primary_path,
-        fallback_path.unwrap_or("-"),
     );
     debug::record_milestone(debug::LogCategory::Console, "console-read-begin", 0, 0);
     match vfs::read_path_to_vec_for_kernel(primary_path) {
@@ -272,33 +249,14 @@ fn load_executable_image_path_uncached(
             debug::record_milestone(debug::LogCategory::Console, "console-read-failed", 0, 0);
             crate::debug::warn!(
                 console,
-                "console host: primary read failed path={} err={:?}",
+                "console host: read failed path={} err={:?}",
                 primary_path,
                 primary_error,
             );
-            let Some(fallback_path) = fallback_path else {
-                return Err(ConsoleHostError::Load {
-                    path: Box::leak(primary_path.to_string().into_boxed_str()),
-                    fallback_path: None,
-                    error: primary_error,
-                });
-            };
-
-            crate::debug::debug!(
-                console,
-                "console host: fallback read begin path={}",
-                fallback_path
-            );
-            vfs::read_path_to_vec_for_kernel(fallback_path)
-                .map(|bytes| LoadedExecutableImage {
-                    path: Box::leak(fallback_path.to_string().into_boxed_str()),
-                    bytes,
-                })
-                .map_err(|fallback_error| ConsoleHostError::Load {
-                    path: Box::leak(primary_path.to_string().into_boxed_str()),
-                    fallback_path: Some(Box::leak(fallback_path.to_string().into_boxed_str())),
-                    error: fallback_error,
-                })
+            Err(ConsoleHostError::Load {
+                path: Box::leak(primary_path.to_string().into_boxed_str()),
+                error: primary_error,
+            })
         }
     }
 }

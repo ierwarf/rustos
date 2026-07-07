@@ -18,6 +18,7 @@ const HEADER_TYPE_OFFSET: u8 = 0x0e;
 const CLASS_CODE_OFFSET: u8 = 0x0b;
 const SUBCLASS_OFFSET: u8 = 0x0a;
 const PROG_IF_OFFSET: u8 = 0x09;
+const SECONDARY_BUS_OFFSET: u8 = 0x19;
 const SUBSYSTEM_VENDOR_OFFSET: u8 = 0x2c;
 const SUBSYSTEM_DEVICE_OFFSET: u8 = 0x2e;
 const INTERRUPT_LINE_OFFSET: u8 = 0x3c;
@@ -312,7 +313,21 @@ fn usb_host_controller_kind(prog_if: u8) -> UsbHostControllerKind {
 
 pub fn visit_devices(mut visit: impl FnMut(PciDevice) -> bool) {
     crate::arch::acpi::for_each_pci_bus_region(|segment, start_bus, end_bus| {
-        for bus in start_bus..=end_bus {
+        let mut seen = [false; 256];
+        let mut queue = [0u8; 256];
+        let mut head = 0usize;
+        let mut tail = 0usize;
+
+        if start_bus <= end_bus {
+            seen[start_bus as usize] = true;
+            queue[tail] = start_bus;
+            tail += 1;
+        }
+
+        while head < tail {
+            let bus = queue[head];
+            head += 1;
+
             for device in 0..32 {
                 let function0 = PciDevice {
                     segment,
@@ -339,6 +354,17 @@ pub fn visit_devices(mut visit: impl FnMut(PciDevice) -> bool) {
 
                     if visit(pci) {
                         return true;
+                    }
+                    if pci.header_type() == HEADER_TYPE_BRIDGE {
+                        let secondary_bus = pci.read_u8(SECONDARY_BUS_OFFSET);
+                        if secondary_bus >= start_bus
+                            && secondary_bus <= end_bus
+                            && !seen[secondary_bus as usize]
+                        {
+                            seen[secondary_bus as usize] = true;
+                            queue[tail] = secondary_bus;
+                            tail += 1;
+                        }
                     }
                 }
             }

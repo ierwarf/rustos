@@ -1,7 +1,7 @@
 use super::*;
 
 pub fn syscall_linux_sched_yield() -> u64 {
-    multitask::yield_now();
+    multitask::request_deferred_reschedule();
     0
 }
 

@@ -107,11 +107,6 @@ pub fn current_boot_volume_handle() -> Option<BlockDeviceHandle> {
             return Some(cache_boot_volume_handle(handle));
         }
     }
-
-    let handle = boot::open_boot_handle().ok();
-    if let Some(handle) = handle {
-        return Some(cache_boot_volume_handle(handle));
-    }
     None
 }
 
@@ -359,13 +354,6 @@ impl SharedBlockDevice for FatRegistryDevice {
     fn flush(&mut self) -> IoResult<()> {
         flush(self.handle)
     }
-}
-
-#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
-fn open_boot_block_device()
--> core::result::Result<Box<dyn SharedBlockDevice>, fatfs::Error<DiskIoError>> {
-    let handle = boot::open_boot_handle().map_err(fatfs::Error::Io)?;
-    Ok(Box::new(FatRegistryDevice::new(handle)) as Box<dyn SharedBlockDevice>)
 }
 
 #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]

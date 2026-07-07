@@ -13,13 +13,14 @@ use rustos_user_abi::syscall::{
     MM_BROKER_OP_PROTECT, MM_BROKER_OP_QUERY_LAYOUT, MM_BROKER_OP_UNMAP, MM_BROKER_PATH_CAPACITY,
     RustosMmBrokerArgs, RustosMmFdBrokerResult, RustosMmLayoutBrokerResult,
     RustosMmMapBrokerResult,
+    VFS_IPC_PAYLOAD_CAPACITY,
 };
 
 use crate::user::handles::{KernelHandle, RemoteVfsHandleKind};
 use crate::user::memfd::{MemfdError, MemfdHandle};
 
 const PAGE_SIZE: u64 = 4096;
-const FILE_COPY_CHUNK: usize = 4096;
+const FILE_COPY_CHUNK: usize = VFS_IPC_PAYLOAD_CAPACITY;
 
 #[derive(Clone)]
 enum FileMappingSource {

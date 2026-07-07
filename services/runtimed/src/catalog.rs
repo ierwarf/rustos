@@ -1,6 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::mpsc::{self, Receiver};
-use std::thread;
 use std::time::Instant;
 
 use runtime_control::{
@@ -9,55 +7,37 @@ use runtime_control::{
 };
 
 use super::{boot_line, DEFAULT_USER_TASK_WEIGHT_MICROS, UI_SERVER_EXEC_PATH};
-use super::{BrokerState, LaunchCatalog, LaunchEntry, ProgramMetadata};
+use super::{BrokerState, LaunchEntry, ProgramMetadata};
 
-pub(super) fn start_launch_catalog_loader() -> Receiver<LaunchCatalog> {
-    let (sender, receiver) = mpsc::sync_channel(1);
-    thread::spawn(move || {
-        boot_line("runtimed: launch catalog load begin");
-        let started_at = Instant::now();
-        let (programs, launch_entries) = load_launch_catalog();
-        let elapsed_ms = started_at.elapsed().as_millis();
-        let _ = sender.send(LaunchCatalog {
-            programs,
-            launch_entries,
-            elapsed_ms,
-        });
-        boot_line("runtimed: launch catalog load done");
-    });
-    receiver
-}
-
-pub(super) fn receive_launch_catalog(
-    state: &mut BrokerState,
-    receiver: &Receiver<LaunchCatalog>,
-) -> bool {
+pub(super) fn load_launch_catalog_into_state(state: &mut BrokerState) -> bool {
     if state.launch_catalog_loaded {
         return false;
     }
-    let Ok(catalog) = receiver.try_recv() else {
-        return false;
-    };
+    boot_line("runtimed: launch catalog load begin");
+    let started_at = Instant::now();
+    let (programs, launch_entries) = load_launch_catalog();
+    let elapsed_ms = started_at.elapsed().as_millis();
     observability_client::info!(
         "runtimed",
         service,
         "launch catalog summary programs={} policies={} elapsed_ms={}",
-        catalog.programs.len(),
-        catalog.launch_entries.len(),
-        catalog.elapsed_ms
+        programs.len(),
+        launch_entries.len(),
+        elapsed_ms
     );
     boot_line(
         format!(
             "runtimed: launch catalog summary programs={} policies={} elapsed_ms={}",
-            catalog.programs.len(),
-            catalog.launch_entries.len(),
-            catalog.elapsed_ms
+            programs.len(),
+            launch_entries.len(),
+            elapsed_ms
         )
         .as_str(),
     );
-    state.programs = catalog.programs;
-    state.launch_entries = catalog.launch_entries;
+    state.programs = programs;
+    state.launch_entries = launch_entries;
     state.launch_catalog_loaded = true;
+    boot_line("runtimed: launch catalog load done");
     true
 }
 

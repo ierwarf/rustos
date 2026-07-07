@@ -557,7 +557,15 @@ pub mod vfs {
     }
 
     pub fn read_path_to_vec_for_kernel(path: &str) -> Result<alloc::vec::Vec<u8>, VfsError> {
+        crate::debug::println_fmt(format_args!(
+            "vfs: read_path_to_vec_for_kernel primary={}",
+            path
+        ));
         let path = boot_image_path(path)?;
+        crate::debug::println_fmt(format_args!(
+            "vfs: read_path_to_vec_for_kernel normalized={}",
+            path
+        ));
         crate::storage::boot_volume::read_file_to_vec(path).map_err(map_boot_volume_error)
     }
 

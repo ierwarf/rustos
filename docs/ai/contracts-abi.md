@@ -29,6 +29,11 @@ IPC service IDs, broker syscalls, handle transfer, and service routing. For pack
 ## IPC Service Registry
 
 Endpoints registered via `SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT`, looked up by stable `IPC_SERVICE_*` id. Registering endpoint `0` revokes; later lookups fail closed.
+The kernel compat service table records low-volume structured milestones for
+endpoint lifecycle transitions: `ipc-service-register`,
+`ipc-service-register-denied`, `ipc-service-register-busy`,
+`ipc-service-revoke`, and `ipc-service-exit-revoke`. These are diagnostic
+state only; rootd remains the service admission and capability policy owner.
 `SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT` is service/supervisor discovery: root-supervisor callers may use the kernel table directly; other callers are admitted through rootd `COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP`. Core services and post-init services are admitted only by matching a running rootd lease. Generic apps use Linux/Win32 ABI routes and kernel compat helpers, not raw policy-service endpoint lookup.
 Service capability assignment is rootd policy: after rootd self-registration, kernel compat asks `COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY` with the registering subject PID/TID and records the returned `IPC_SERVICE_CAP_*` mask only if rootd confirms the PID matches the running lease. This includes the legacy Linux-syscall endpoint registration path. Do not reintroduce a full `service_id -> capability` table in ring0.
 Post-init lease reporting is ring3-owned: `initd` reports successfully spawned
@@ -38,12 +43,29 @@ when answering kernel compat `SERVICE_CAPABILITY` / `SERVICE_LOOKUP` requests.
 Services launched by another supervisor must be reported by that supervisor
 before the child depends on service endpoint registration; `runtimed` reports
 the `uiserver` lease. There is no post-init capability or lookup allowlist
-fallback.
-rootd receives supervisor requests through root-supervisor-only
-`SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER`; `SERVICE_CAPABILITY`, `SERVICE_LOOKUP`,
-and `READINESS_SIGNAL` must reject payload `subject_pid/tid` values that do not
-match the kernel-stamped sender PID/TID. The sender-stamped recv path is not a
-generic app IPC ABI.
+fallback. `READINESS_SIGNAL` is a supervisor-spawn lease admission signal, not
+proof that the child has registered its own policy endpoint; endpoint readiness
+is still determined by `SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT` /
+`SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT`. `initd` post-init endpoint readiness
+waits must be bounded by scheduler-yield attempts rather than early-boot
+`Instant` deadlines or timer sleeps; a missing endpoint must fail closed instead
+of silently stalling. Post-init services may race their supervisor's synchronous
+lease report after spawn; service endpoint registration retry loops must use
+bounded scheduler yields, not timer sleeps, while waiting for rootd lease
+admission. rootd must authorize the reporter
+for each post-init lease: `initd` reports driverd/netd/devmgrd/inputd/storaged
+and runtimed-as-sessiond, while running sessiond/runtimed reports uiserver.
+Reports for an already-running lease are idempotent only for the same PID and
+must reject attempts to overwrite the lease with a different PID.
+rootd receives supervisor requests through root-supervisor-only sender-stamped
+receive syscalls; both pre-init and post-init supervisor turns must drain
+lifecycle/restart state before using `SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER`, so
+a failed child cannot hide behind an indefinite rootd IPC wait. `SERVICE_CAPABILITY`,
+`SERVICE_LOOKUP`, and `READINESS_SIGNAL` must reject payload `subject_pid/tid`
+values that do not match the kernel-stamped sender PID/TID. The sender-stamped
+recv path is not a generic app IPC ABI. rootd's supervisor loop must yield
+between nonblocking receive turns rather than sleep-polling, because service
+endpoint registration synchronously depends on rootd capability replies.
 
 | ID | Service | Capability (`IPC_SERVICE_CAP_*`) | Owns |
 |----|---------|----------------------------------|------|
@@ -63,6 +85,9 @@ generic app IPC ABI.
 
 Broker authorization checks the caller's registered service capability — **not** its executable path.
 Until a standalone `pagerd` lease exists, `syscalld` may register the reserved `IPC_SERVICE_PAGERD` endpoint and receive `PAGER_POLICY`; rootd must treat that as an explicit compatibility delegation, not a generic multi-service registration rule.
+`initd` must not be spawned until that delegated pager endpoint is registered;
+otherwise dynamic loader page-fault/backing policy can deadlock behind rootd's
+own initd spawn IPC.
 `driverd` may register the reserved `IPC_SERVICE_SERVICE_DRIVERD` endpoint with the same PID as its reported `IPC_SERVICE_DRIVERD` lease; rootd treats this as an explicit same-process delegation, not as a generic service-id fallback.
 
 Kernel data paths (FD/socket/module/process/storage/input) remain narrow gated broker primitives for privileged DMA/MMIO/IRQ/module-load/user-copy/address-space mutation. Generic Linux `.ko` text execution and compatibility hot paths are **not** moved to ring3. Sleepable `.ko` probe/init/resource policy slow paths are tracked separately in `kernel/io-manager/src/driver/ko_slowpath_migration.rs` and by `cargo xtask ring3-inventory` under `ko-slowpath-ring3`; the ring0 side remains a bounded broker for privileged symbols and driverd drains the symbol events. First-party non-`.ko` service-driver candidates are tracked separately under `service-driver-host`; mark them as explicit ring0 substrate exceptions if the design keeps them in ring0 permanently.
@@ -84,7 +109,9 @@ Residual app-ABI policy batches that are larger than a single broker are tracked
   Linux ELF or Windows PE callers.
 - Kernel compat calls into policy services may use a bounded internal deadline.
   On timeout, compat cancels the reply cap so queued and already-received
-  endpoint calls cannot be completed by a late reply.
+  endpoint calls cannot be completed by a late reply. Timeout cancellation
+  records an `ipc-reply-timeout` milestone with the reply cap, caller task, and
+  cancellation status.
 - Endpoint owner teardown wakes both pending callers and tasks blocked in
   receive on that endpoint. Task exit must also prune stale receiver waiters
   owned by the exiting task from every endpoint.
@@ -93,9 +120,10 @@ Residual app-ABI policy batches that are larger than a single broker are tracked
   `SYS_RUSTOS_IPC_TRY_RECV` / `rustos_svc_runtime::ipc::try_recv` and use a
   bounded yield/sleep between drain passes.
 - root-supervisor services that authorize subjects may use
-  `SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER` to receive the caller PID/TID stamped by
-  the kernel. Payload subject fields are not trusted unless they match this
-  sender identity.
+  `SYS_RUSTOS_IPC_{TRY_RECV,RECV}_WITH_SENDER` to receive the caller PID/TID
+  stamped by the kernel. Payload subject fields are not trusted unless they
+  match this sender identity. Use the blocking variant only when the supervisor
+  has no independent event source that must be polled before the next IPC.
 - IPC stability changes are substrate only. Service restart, admission, routing,
   and policy decisions stay in `rootd`/`syscalld`/`vfsd`/`loaderd`/other owning
   services, not in new ring0 policy tables.
@@ -274,6 +302,37 @@ Mapping ops use `PROC_BROKER_MAP_{READ,WRITE,EXEC,PRIVATE}` flags and record non
 **PE64:** PE validation, section materialization, base relocation, import/export resolution, staged system-DLL registry lookup, PEB/TEB/runtime blob construction all happen in loaderd before commit. PE64 commit includes `SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER` after all `MAP_DATA_BROKER` ops and before `COMMIT_BROKER`. Kernel validates metadata + spawns the materialized address space but **must not** reintroduce PE import/export/system-DLL policy.
 
 Commit (`COMMIT_BROKER`) builds the child address space from recorded mappings.
+By default, commit-broker spawns do not request immediate deferred reschedule so
+`loaderd` can reply to its supervisor before the spawned child runs startup
+policy. `rootd` may request child-first bootstrap handoff for `initd` after
+core leases are ready by setting `LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF`.
+Post-init supervisors such as `initd` and `runtimed` may use immediate handoff
+for latency-sensitive service bootstrap, but the child must not fabricate
+endpoint registration success before its `rootd` lease is admitted. Service
+endpoint registration retry loops must use bounded scheduler yields while
+waiting for lease admission and fail closed if admission never arrives.
+Immediate handoff uses a spawn-specific scheduler hint that is consumed before
+generic IPC reply hints, so the loader's reply to the supervisor cannot
+overwrite the freshly-created child. The spawn broker must set this hint without
+requesting or taking a reschedule before returning to `loaderd`. Spawn handoff
+is an explicit bootstrap transfer and may be consumed by the next scheduler
+dispatch, including deferred syscall-exit dispatch; it may bypass the generic
+IPC strict-class guard, otherwise a ready System-class task can indefinitely
+defer a rootd-to-initd child-first handoff. Services spawned this way must not
+fabricate endpoint registration before rootd lease admission; they must
+bounded-yield and fail closed if admission never arrives. IPC enqueue/reply
+completion wakes the receiver/caller and may set a direct pick hint for any
+currently ready and
+schedulable target; already-runnable service endpoints still need a handoff when
+the caller queued work before the service re-entered receive. Synchronous IPC
+enqueue only sets the receiver handoff hint; the caller must arm and re-poll its
+reply wait before yielding so a fast service reply cannot race a not-yet-armed
+waiter. Generic IPC hints are caller-local
+and the newest eligible receiver replaces older generic hints, even across
+scheduling classes; stale high-class service hints must not block the service
+that the current caller is waiting on.
+Both paths request a deferred reschedule at syscall exit; handoff hints must not
+wait for a later timer tick or a service's next blocking receive.
 
 ## Network Surface (`netd`)
 

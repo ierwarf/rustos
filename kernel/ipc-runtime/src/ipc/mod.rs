@@ -714,7 +714,11 @@ pub fn enqueue_endpoint_call_with_handles(
                 .get_mut(&endpoint.raw())
                 .expect("ipc endpoint disappeared while enqueueing call");
             endpoint_object.pending_messages.push_back(message_id);
-            endpoint_object.waiting_receivers.pop_front()
+            endpoint_object
+                .waiting_receivers
+                .pop_front()
+                .or(endpoint_object.owner_task_id)
+                .filter(|task_id| *task_id != caller_task_id)
         };
 
         Ok((KernelReplyHandle::from_raw(reply_id), receiver_to_wake))

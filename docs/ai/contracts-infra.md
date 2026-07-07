@@ -32,6 +32,10 @@ Package/stage schemas, runtime control, kernel API, build, fault injection, logg
   the ring0 module-load broker; driverd/provider state owns scanout selection.
 - Driver `class` registry values: `display`, `input`, `network`, `usb`, `storage`. `usb` is reserved for explicit USB compat/dev bridge modules; native xHCI is the RustOS host-controller path and is not staged as a Linux `.ko`.
 - `display-primary` group: real hardware/virtio providers ordered ahead of firmware framebuffer fallbacks. `bootfb` is last-resort, **never** default primary for QEMU or hardware GPUs.
+- When `driverd` selects the exact `bootfb` fallback request, ring0 may
+  materialize the already-owned boot framebuffer directly instead of executing
+  the `bootfb.ko` module. This does not bypass provider ordering; `driverd`
+  must still make the fallback selection through registry/provider_group policy.
 - `driverd` owns autoload policy. Kernel driver brokers may expose narrow hardware-presence primitives for staged aliases (`platform:bootfb`, `pci:*`, `virtio:*`) but **must not** pick provider order or bypass registry `provider_group` policy.
 
 ## Stage Outputs
@@ -71,6 +75,11 @@ Package/stage schemas, runtime control, kernel API, build, fault injection, logg
 - Default socket: `/run/runtimed.sock`.
 - Main methods: `snapshot_running_programs`, `request_launch_program_new_session`, `request_terminate_session`, `request_terminate_pid`, `notify_ui_ready`.
 - Request text max: `MAX_REQUEST_PATH_BYTES`.
+- `runtimed` loads the runtime launch catalog on its main loop after UI ready;
+  initial session autostart must not depend on a background thread running
+  before the first policy drain.
+- `runtimed` UI bootstrap readiness checks for prerequisite service endpoints
+  must use bounded scheduler-yield attempts, not early timer sleep deadlines.
 
 ## Kernel API
 

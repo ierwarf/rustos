@@ -1,6 +1,7 @@
 //! Thin convenience wrappers around the RustOS native IPC syscalls. Services
 //! can call these directly without going through libc.
 
+use alloc::vec::Vec;
 use rustos_user_abi::syscall::{
     SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
     SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_RECV,
@@ -109,13 +110,13 @@ pub unsafe fn reply(reply_cap: u64, response: *const u8, response_len: usize) ->
 /// the per-service `debug_line()` helpers that previously called
 /// `libc::syscall`.
 pub fn debug_line(message: &str) {
-    let bytes = message.as_bytes();
+    let mut line = Vec::from(message.as_bytes());
+    line.push(b'\n');
     unsafe {
         syscall2(
             SYS_RUSTOS_DEBUG_PRINT,
-            bytes.as_ptr() as u64,
-            bytes.len() as u64,
+            line.as_ptr() as u64,
+            line.len() as u64,
         );
-        syscall2(SYS_RUSTOS_DEBUG_PRINT, b"\n".as_ptr() as u64, 1);
     }
 }

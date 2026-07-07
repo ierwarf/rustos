@@ -117,19 +117,6 @@ fn should_trace_boot_path(path: &str) -> bool {
             || path.starts_with("/lib64/"))
 }
 
-#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
-fn ensure_bootstrap_fs_access(path: &str) -> core::result::Result<(), fatfs::Error<DiskIoError>> {
-    if kernel_vfs_runtime_active() {
-        crate::debug::println!(
-            "bootstrap fs: rejected late direct access path={} phase={:?}",
-            path,
-            bootstrap_phase()
-        );
-        return Err(fatfs::Error::Io(DiskIoError::Unsupported));
-    }
-    Ok(())
-}
-
 pub struct PhysicalBootVolume {
     fs: BootVolumeFs,
 }
@@ -436,6 +423,17 @@ impl RootFileExtentTable {
 fn load_root_file_extent_table()
 -> core::result::Result<RootFileExtentTable, fatfs::Error<DiskIoError>> {
     if let Some(manifest) = boot_extent_manifest() {
+        crate::debug::println_fmt(format_args!(
+            "boot volume debug: manifest ptr={:#x} len={}",
+            manifest.ptr,
+            manifest.len
+        ));
+        crate::debug::info!(
+            storage,
+            "boot volume extents: manifest ptr={:#x} len={}",
+            manifest.ptr,
+            manifest.len
+        );
         crate::debug::info!(
             storage,
             "boot volume extents: loading BootInfo manifest len={}",
@@ -447,9 +445,29 @@ fn load_root_file_extent_table()
                 usize::try_from(manifest.len).map_err(|_| fatfs::Error::InvalidInput)?,
             )
         };
-        return parse_root_file_extent_table(bytes).map_err(|_| fatfs::Error::InvalidInput);
+        let table = parse_root_file_extent_table(bytes)
+            .map_err(|_| fatfs::Error::InvalidInput)?;
+        let has_rootd = table
+            .entries
+            .iter()
+            .any(|entry| entry.path == "services/rootd/rootd.elf");
+        crate::debug::println_fmt(format_args!(
+            "boot volume debug: table includes rootd={}",
+            has_rootd
+        ));
+        crate::debug::println_fmt(format_args!(
+            "boot volume debug: parsed entries={}",
+            table.entries.len()
+        ));
+        crate::debug::info!(
+            storage,
+            "boot volume extents: parsed entries={}",
+            table.entries.len()
+        );
+        return Ok(table);
     }
 
+    crate::debug::println_fmt(format_args!("boot volume debug: missing root extent manifest"));
     crate::debug::warn!(storage, "boot volume extents: missing BootInfo manifest");
     Err(fatfs::Error::Io(DiskIoError::NotPresent))
 }
@@ -714,31 +732,8 @@ impl PhysicalBootVolume {
     }
 }
 
-pub fn open_physical_boot_volume(
-    identity: BootVolumeIdentity,
-) -> core::result::Result<PhysicalBootVolume, fatfs::Error<DiskIoError>> {
-    PhysicalBootVolume::open(identity)
-}
-
-pub fn open_current_physical_boot_volume()
--> core::result::Result<PhysicalBootVolume, fatfs::Error<DiskIoError>> {
-    PhysicalBootVolume::open_current()
-}
-
-pub fn read_bootstrap_file_to_vec(
-    path: &str,
-) -> core::result::Result<Vec<u8>, fatfs::Error<DiskIoError>> {
-    if should_trace_boot_path(path) {
-        crate::debug::println!("boot volume helper: read_file_to_vec begin path={}", path);
-    }
-    ensure_bootstrap_fs_access(path)?;
-    if let Some(bytes) = read_file_to_vec_from_extents(path)? {
-        return Ok(bytes);
-    }
-    Err(fatfs::Error::NotFound)
-}
-
 pub fn read_file_to_vec(path: &str) -> core::result::Result<Vec<u8>, fatfs::Error<DiskIoError>> {
+    crate::debug::println_fmt(format_args!("boot volume debug: read_file_to_vec called path={}", path));
     if should_trace_boot_path(path) {
         crate::debug::println!(
             "boot volume helper: runtime read_file_to_vec begin path={}",
@@ -747,6 +742,24 @@ pub fn read_file_to_vec(path: &str) -> core::result::Result<Vec<u8>, fatfs::Erro
     }
     if let Some(bytes) = read_file_to_vec_from_extents(path)? {
         return Ok(bytes);
+    }
+    if path == "services/rootd/rootd.elf" {
+        let (state, entries) = match &*ROOT_FILE_EXTENTS.lock() {
+            RootFileExtentState::Uninitialized => ("uninitialized", 0),
+            RootFileExtentState::Ready(table) => ("ready", table.entries.len()),
+            RootFileExtentState::Disabled => ("disabled", 0),
+        };
+        crate::debug::warn!(
+            storage,
+            "boot volume extents: services/rootd lookup state={} entries={}",
+            state,
+            entries
+        );
+        crate::debug::println_fmt(format_args!(
+            "boot volume debug: rootd lookup state={} entries={}",
+            state,
+            entries
+        ));
     }
     Err(fatfs::Error::NotFound)
 }

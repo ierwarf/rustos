@@ -40,6 +40,8 @@ mod commit;
 use commit::{commit_prepared_executable, LoaderOperation};
 use rustos_svc_runtime::ipc;
 
+const SYS_SCHED_YIELD: u64 = 24;
+
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
     loop {}
@@ -170,32 +172,38 @@ fn serve(endpoint: u64) {
                 debug_line("loaderd: recv failed");
                 recv_error_reported = true;
             }
-            rustos_svc_runtime::syscall::sleep_millis(1);
+            cooperate_after_spawn_step();
             continue;
         }
         if received == 0 {
-            rustos_svc_runtime::syscall::sleep_millis(1);
+            cooperate_after_spawn_step();
             continue;
         }
         let request = unsafe {
             core::slice::from_raw_parts(request.as_ptr() as *const u8, received as usize)
         };
-        let response = handle_wire_request(received as usize, request);
+        let handled = handle_wire_request(received as usize, request);
         let reply = syscall3(
             SYS_RUSTOS_IPC_REPLY,
             reply_cap,
-            response.as_ptr() as u64,
-            response.len() as u64,
+            handled.reply.as_ptr() as u64,
+            handled.reply.len() as u64,
         );
         if reply < 0 {
             rustos_svc_runtime::ipc::debug_line("loaderd: reply failed");
         }
+        close_fds(&handled.cleanup_fds);
     }
 }
 
 enum LoaderReply {
     Spawn(LoaderSpawnResponse),
     Commercial(CommercialMaxProtocolResponse),
+}
+
+struct HandledLoaderRequest {
+    reply: LoaderReply,
+    cleanup_fds: Vec<i32>,
 }
 
 const LOADERD_RECV_BYTES: usize =
@@ -226,22 +234,32 @@ impl LoaderReply {
     }
 }
 
-fn handle_wire_request(received: usize, bytes: &[u8]) -> LoaderReply {
+fn handle_wire_request(received: usize, bytes: &[u8]) -> HandledLoaderRequest {
     if received == size_of::<CommercialMaxProtocolRequest>() {
         let request = unsafe { &*bytes.as_ptr().cast::<CommercialMaxProtocolRequest>() };
-        return LoaderReply::Commercial(handle_commercial_request(request));
+        return HandledLoaderRequest {
+            reply: LoaderReply::Commercial(handle_commercial_request(request)),
+            cleanup_fds: Vec::new(),
+        };
     }
     if received == size_of::<LoaderSpawnRequest>() {
         let request = unsafe { &*bytes.as_ptr().cast::<LoaderSpawnRequest>() };
-        return LoaderReply::Spawn(handle_request(received, request));
+        return handle_request(received, request);
     }
-    LoaderReply::Spawn(LoaderSpawnResponse {
+    spawn_response(LoaderSpawnResponse {
         status: EINVAL,
         ..LoaderSpawnResponse::default()
     })
 }
 
-fn handle_request(received: usize, request: &LoaderSpawnRequest) -> LoaderSpawnResponse {
+fn spawn_response(response: LoaderSpawnResponse) -> HandledLoaderRequest {
+    HandledLoaderRequest {
+        reply: LoaderReply::Spawn(response),
+        cleanup_fds: Vec::new(),
+    }
+}
+
+fn handle_request(received: usize, request: &LoaderSpawnRequest) -> HandledLoaderRequest {
     let mut response = LoaderSpawnResponse {
         version: LOADER_REQUEST_ABI_VERSION,
         op: request.op,
@@ -251,13 +269,13 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> LoaderSpawnR
     };
     if let Err(errno) = validate_request(received, request) {
         response.status = errno;
-        return response;
+        return spawn_response(response);
     }
     let operation = match LoaderOperation::from_op(request.op) {
         Ok(operation) => operation,
         Err(errno) => {
             response.status = errno;
-            return response;
+            return spawn_response(response);
         }
     };
 
@@ -265,7 +283,7 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> LoaderSpawnR
         Ok(path) => path,
         Err(errno) => {
             response.status = errno;
-            return response;
+            return spawn_response(response);
         }
     };
     let mut path_buf = MaybeUninit::<[u8; LOADER_SPAWN_EXEC_PATH_CAPACITY + 1]>::uninit();
@@ -278,7 +296,7 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> LoaderSpawnR
     if fd < 0 {
         debug_line("loaderd: open executable failed");
         response.status = -fd;
-        return response;
+        return spawn_response(response);
     }
     let executable_format = match validate_executable_fd(fd) {
         Ok(format) => format,
@@ -286,13 +304,13 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> LoaderSpawnR
             debug_line("loaderd: validate executable failed");
             let _ = syscall1(SYS_CLOSE, fd as u64);
             response.status = errno;
-            return response;
+            return spawn_response(response);
         }
     };
     if !operation.allows_format(executable_format) {
         let _ = syscall1(SYS_CLOSE, fd as u64);
         response.status = ENOEXEC;
-        return response;
+        return spawn_response(response);
     }
 
     let argv = match parse_blob(
@@ -304,7 +322,7 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> LoaderSpawnR
         Err(errno) => {
             let _ = syscall1(SYS_CLOSE, fd as u64);
             response.status = errno;
-            return response;
+            return spawn_response(response);
         }
     };
     let env = match parse_blob(
@@ -316,7 +334,7 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> LoaderSpawnR
         Err(errno) => {
             let _ = syscall1(SYS_CLOSE, fd as u64);
             response.status = errno;
-            return response;
+            return spawn_response(response);
         }
     };
     let mut argvp = argv.iter().map(|value| value.as_ptr()).collect::<Vec<_>>();
@@ -338,7 +356,7 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> LoaderSpawnR
         debug_line("loaderd: prepare broker failed");
         let _ = syscall1(SYS_CLOSE, fd as u64);
         response.status = (-prepare_handle) as i32;
-        return response;
+        return spawn_response(response);
     }
     let prepared = match map_executable_segments(
         fd,
@@ -354,17 +372,19 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> LoaderSpawnR
             let _ = syscall1(SYS_CLOSE, fd as u64);
             abort_prepare(prepare_handle as u64, errno as u64);
             response.status = errno;
-            return response;
+            return spawn_response(response);
         }
     };
+    cooperate_after_spawn_step();
     if let Some(ref result) = prepared.linux_runtime {
         if let Err(errno) = set_linux_runtime_broker(prepare_handle as u64, result) {
             debug_line("loaderd: linux runtime broker failed");
             close_fds(&prepared.cleanup_fds);
             abort_prepare(prepare_handle as u64, errno as u64);
             response.status = errno;
-            return response;
+            return spawn_response(response);
         }
+        cooperate_after_spawn_step();
     }
     if let Some(runtime) = prepared.windows_runtime {
         let status = syscall1(
@@ -377,10 +397,12 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> LoaderSpawnR
             close_fds(&prepared.cleanup_fds);
             abort_prepare(prepare_handle as u64, errno as u64);
             response.status = errno;
-            return response;
+            return spawn_response(response);
         }
+        cooperate_after_spawn_step();
     }
 
+    cooperate_after_spawn_step();
     let pid = commit_prepared_executable(
         operation,
         request,
@@ -394,11 +416,17 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> LoaderSpawnR
         debug_line("loaderd: commit broker failed");
         close_fds(&prepared.cleanup_fds);
         response.status = (-pid) as i32;
-        return response;
+        return spawn_response(response);
     }
-    close_fds(&prepared.cleanup_fds);
     response.pid = pid;
-    response
+    HandledLoaderRequest {
+        reply: LoaderReply::Spawn(response),
+        cleanup_fds: prepared.cleanup_fds,
+    }
+}
+
+fn cooperate_after_spawn_step() {
+    let _ = syscall0(SYS_SCHED_YIELD);
 }
 
 fn handle_commercial_request(
@@ -2987,6 +3015,10 @@ fn syscall1(number: u64, arg0: u64) -> i64 {
     unsafe { rustos_svc_runtime::syscall::syscall1(number, arg0) }
 }
 
+fn syscall0(number: u64) -> i64 {
+    unsafe { rustos_svc_runtime::syscall::syscall0(number) }
+}
+
 fn syscall2(number: u64, arg0: u64, arg1: u64) -> i64 {
     unsafe { rustos_svc_runtime::syscall::syscall2(number, arg0, arg1) }
 }
@@ -3000,10 +3032,14 @@ fn syscall4(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
 }
 
 fn debug_line(message: &str) {
+    let bytes = message.as_bytes();
+    let len = bytes.len().min(1023);
+    let mut line = [0_u8; 1024];
+    line[..len].copy_from_slice(&bytes[..len]);
+    line[len] = b'\n';
     let _ = syscall2(
         SYS_RUSTOS_DEBUG_PRINT,
-        message.as_ptr() as u64,
-        message.len() as u64,
+        line.as_ptr() as u64,
+        (len + 1) as u64,
     );
-    let _ = syscall2(SYS_RUSTOS_DEBUG_PRINT, b"\n".as_ptr() as u64, 1);
 }

@@ -14,7 +14,7 @@ pub fn spawn_user_process(
     bootstrap: UserTaskBootstrap,
     weight_micros: u64,
 ) -> Result<u64, SpawnTaskError> {
-    spawn_user_process_with_parent(address_space, bootstrap, None, weight_micros)
+    spawn_user_process_inner(address_space, bootstrap, None, weight_micros, true)
 }
 
 pub fn spawn_user_process_with_parent(
@@ -22,6 +22,30 @@ pub fn spawn_user_process_with_parent(
     bootstrap: UserTaskBootstrap,
     parent_process_id: Option<u64>,
     weight_micros: u64,
+) -> Result<u64, SpawnTaskError> {
+    spawn_user_process_inner(
+        address_space,
+        bootstrap,
+        parent_process_id,
+        weight_micros,
+        true,
+    )
+}
+
+pub fn spawn_user_process_without_deferred_reschedule(
+    address_space: ProcessAddressSpace,
+    bootstrap: UserTaskBootstrap,
+    weight_micros: u64,
+) -> Result<u64, SpawnTaskError> {
+    spawn_user_process_inner(address_space, bootstrap, None, weight_micros, false)
+}
+
+fn spawn_user_process_inner(
+    address_space: ProcessAddressSpace,
+    bootstrap: UserTaskBootstrap,
+    parent_process_id: Option<u64>,
+    weight_micros: u64,
+    defer_reschedule: bool,
 ) -> Result<u64, SpawnTaskError> {
     if nucleus_core::util::fault_injection::should_fail("process.spawn") {
         crate::debug::warn!(process, "fault injection: process.spawn failed");
@@ -32,10 +56,10 @@ pub fn spawn_user_process_with_parent(
     let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
     let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
     let rflags = initial_task_rflags().bits();
-    let spawned_from_user = interrupts::without_interrupts(|| unsafe {
+    let (spawned_from_user, slot) = interrupts::without_interrupts(|| unsafe {
         let scheduler = scheduler_mut();
         let current_is_user = scheduler.current_task_is_user_task();
-        scheduler
+        let slot = scheduler
             .allocate_user_slot(
                 id,
                 address_space,
@@ -47,12 +71,18 @@ pub fn spawn_user_process_with_parent(
                 rflags,
                 noop_task_entry,
             )
-            .map(|_| current_is_user)
-            .ok_or(SpawnTaskError::NoFreeTaskSlot)
+            .ok_or(SpawnTaskError::NoFreeTaskSlot)?;
+        Ok((current_is_user, slot))
     })?;
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Sched,
+        "spawn-user-process",
+        id,
+        spawn_milestone_arg(slot, spawned_from_user, weight_micros),
+    );
 
-    if spawned_from_user {
-        super::request_deferred_reschedule();
+    if spawned_from_user && defer_reschedule {
+        super::set_next_spawn_pick_hint(id);
     }
 
     Ok(id)
@@ -73,10 +103,10 @@ pub fn spawn_user_process_state_with_parent(
     let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
     let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
     let rflags = initial_task_rflags().bits();
-    let spawned_from_user = interrupts::without_interrupts(|| unsafe {
+    let (spawned_from_user, slot) = interrupts::without_interrupts(|| unsafe {
         let scheduler = scheduler_mut();
         let current_is_user = scheduler.current_task_is_user_task();
-        scheduler
+        let slot = scheduler
             .allocate_user_process_state_slot(
                 id,
                 process_state,
@@ -88,9 +118,15 @@ pub fn spawn_user_process_state_with_parent(
                 rflags,
                 noop_task_entry,
             )
-            .map(|_| current_is_user)
-            .ok_or(SpawnTaskError::NoFreeTaskSlot)
+            .ok_or(SpawnTaskError::NoFreeTaskSlot)?;
+        Ok((current_is_user, slot))
     })?;
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Sched,
+        "spawn-user-process-state",
+        id,
+        spawn_milestone_arg(slot, spawned_from_user, weight_micros),
+    );
 
     if spawned_from_user {
         super::request_deferred_reschedule();
@@ -127,6 +163,10 @@ pub fn spawn_kernel_process(
     })?;
 
     Ok(id)
+}
+
+fn spawn_milestone_arg(slot: usize, spawned_from_user: bool, weight_micros: u64) -> u64 {
+    ((spawned_from_user as u64) << 63) | ((slot as u64) << 32) | (weight_micros & 0xffff_ffff)
 }
 
 pub fn spawn_user_thread(

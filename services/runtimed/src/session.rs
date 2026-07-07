@@ -1,8 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::mem::size_of;
 use std::sync::atomic::Ordering;
-use std::thread;
-use std::time::{Duration, Instant};
 
 use keyboard_core::KeyCode;
 use runtime_control::{
@@ -28,16 +26,16 @@ use rustos_user_abi::syscall::{
 };
 
 use super::{
-    boot_line, CONSOLE_SESSION_STATE_RUNNING, DEVMGRD_BOOTSTRAP_WAIT_TIMEOUT, LINUX_FIONREAD,
-    LINUX_TCGETS, LINUX_TCSETS, LINUX_TCSETSF, LINUX_TCSETSW, SERVICE_ENDPOINT_POLL_INTERVAL,
-    SESSION_GRAPH_GENERATION, UI_SERVER_DESKTOP_FILE_ID, UI_SERVER_DISPLAY_NAME,
-    UI_SERVER_EXEC_PATH, UI_SERVER_TASK_WEIGHT_MICROS,
+    boot_line, CONSOLE_SESSION_STATE_RUNNING, LINUX_FIONREAD, LINUX_TCGETS, LINUX_TCSETS,
+    LINUX_TCSETSF, LINUX_TCSETSW, SESSION_GRAPH_GENERATION, UI_SERVER_DESKTOP_FILE_ID,
+    UI_SERVER_DISPLAY_NAME, UI_SERVER_EXEC_PATH, UI_SERVER_TASK_WEIGHT_MICROS,
 };
 use super::{BrokerState, LaunchEntry};
 
 const INPUT_BUFFER_CAPACITY: usize = 1024;
 const EDIT_BUFFER_CAPACITY: usize = 256;
 const OUTPUT_BUFFER_CAPACITY: usize = 4096;
+const SERVICE_ENDPOINT_READY_ATTEMPTS: u32 = 4096;
 
 #[derive(Default)]
 pub(crate) struct SessionRuntime {
@@ -379,7 +377,7 @@ fn noncanonical_input_bytes(termios: LinuxTermios, event: InputEvent) -> Result<
 
 pub(super) fn bootstrap_ui_server(state: &mut BrokerState) -> Result<(), i32> {
     boot_line("runtimed: waiting for devmgrd before ui bootstrap");
-    wait_for_service_endpoint(IPC_SERVICE_DEVMGRD, DEVMGRD_BOOTSTRAP_WAIT_TIMEOUT)?;
+    wait_for_service_endpoint(IPC_SERVICE_DEVMGRD)?;
     let (args, env) = ui_server_bootstrap_args_env();
     super::spawn::spawn_tracked_process(
         state,
@@ -399,17 +397,14 @@ pub(super) fn bootstrap_ui_server(state: &mut BrokerState) -> Result<(), i32> {
     )
 }
 
-fn wait_for_service_endpoint(service_id: u64, timeout: Duration) -> Result<(), i32> {
-    let deadline = Instant::now() + timeout;
-    loop {
+fn wait_for_service_endpoint(service_id: u64) -> Result<(), i32> {
+    for _ in 0..SERVICE_ENDPOINT_READY_ATTEMPTS {
         if super::spawn::lookup_service_endpoint(service_id) > 0 {
             return Ok(());
         }
-        if Instant::now() >= deadline {
-            return Err(libc::ETIMEDOUT);
-        }
-        thread::sleep(SERVICE_ENDPOINT_POLL_INTERVAL);
+        std::thread::yield_now();
     }
+    Err(libc::ETIMEDOUT)
 }
 
 pub(super) fn create_session_endpoint() -> Option<u64> {

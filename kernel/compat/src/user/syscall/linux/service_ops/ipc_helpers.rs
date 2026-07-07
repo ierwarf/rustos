@@ -69,7 +69,7 @@ fn spawn_bootstrap_exec_direct(
     console_session: u64,
     weight_micros: u64,
 ) -> Result<u64, i64> {
-    let loaded = crate::user::console_host::load_executable_image_by_path(exec_path, None)
+    let loaded = crate::user::console_host::load_executable_image_by_path(exec_path)
         .map_err(console_host_error_to_linux_errno)?;
     let session = if console_session == 0 {
         multitask::current_user_snapshot()

@@ -1,28 +1,21 @@
 use std::fmt;
-use std::io::Write;
+use std::fmt::Write as FmtWrite;
+use std::io::Write as IoWrite;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use os_observatory::logging::{Level as ObservatoryLevel, Logger};
-use os_observatory::sink::Sink;
 pub use rustos_observability::{LogCategory, LogLevel};
 
 include!(concat!(env!("OUT_DIR"), "/logging_helpers.rs"));
 
-struct StderrSink;
+const SYS_RUSTOS_DEBUG_PRINT: libc::c_long = 0x5255_0001;
 
-impl Sink for StderrSink {
-    fn write_str(&self, s: &str) -> usize {
-        let _ = std::io::stderr().write_all(s.as_bytes());
-        s.len()
-    }
-}
-
-fn observatory_level(level: LogLevel) -> ObservatoryLevel {
+fn level_prefix(level: LogLevel) -> &'static str {
     match level {
-        LogLevel::Trace | LogLevel::Debug => ObservatoryLevel::Trace,
-        LogLevel::Info => ObservatoryLevel::Info,
-        LogLevel::Warn => ObservatoryLevel::Warn,
-        LogLevel::Error | LogLevel::Fatal => ObservatoryLevel::Error,
+        LogLevel::Trace => "[TRACE]",
+        LogLevel::Debug => "[DEBUG]",
+        LogLevel::Info => "[INFO ]",
+        LogLevel::Warn => "[WARN ]",
+        LogLevel::Error | LogLevel::Fatal => "[ERROR]",
     }
 }
 
@@ -42,19 +35,28 @@ pub fn log_args(service: &str, category: LogCategory, level: LogLevel, args: fmt
         return;
     }
 
-    Logger::new(&StderrSink)
-        .with_level(ObservatoryLevel::Trace)
-        .log_args(
-            observatory_level(level),
-            format_args!(
-                "ts={} service={} cat={} lvl={} {}",
-                timestamp_millis(),
-                service,
-                category.as_str(),
-                level.as_str(),
-                args
-            ),
-        );
+    let mut line = String::new();
+    let _ = write!(
+        line,
+        "{} ts={} service={} cat={} lvl={} {}",
+        level_prefix(level),
+        timestamp_millis(),
+        service,
+        category.as_str(),
+        level.as_str(),
+        args
+    );
+    line.push('\n');
+    let emitted = unsafe {
+        libc::syscall(
+            SYS_RUSTOS_DEBUG_PRINT,
+            line.as_ptr() as usize,
+            line.len(),
+        )
+    };
+    if emitted < 0 {
+        let _ = std::io::stderr().write_all(line.as_bytes());
+    }
 }
 
 #[doc(hidden)]

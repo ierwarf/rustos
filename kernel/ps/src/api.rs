@@ -4,12 +4,12 @@ pub use crate::multitask::{
     UserFaultDisposition, UserStackState, UserTaskBootstrap, UserTaskRegisters, WaitChildResult,
 };
 pub use crate::multitask::{
-    arm_block_current_task, block_current_task, block_current_user_task, commit_block_current_task,
-    current_linux_thread_state, current_user_address_space, current_user_process_thread_count,
-    current_user_stack_state, current_user_thread_id, exec_current_user_process,
-    exec_user_process_by_pid, exit_current_user_task, is_user_task_alive,
-    linux_thread_snapshot_by_ids, note_process_exit_status, queue_linux_signal,
-    restore_current_simd_state, save_current_simd_state, set_next_pick_hint,
+    arm_block_current_task, block_current_task, block_current_user_task, cancel_block_current_task,
+    commit_block_current_task, current_linux_thread_state, current_user_address_space,
+    current_user_process_thread_count, current_user_stack_state, current_user_thread_id,
+    exec_current_user_process, exec_user_process_by_pid, exit_current_user_task,
+    is_user_task_alive, linux_thread_snapshot_by_ids, note_process_exit_status,
+    queue_linux_signal, restore_current_simd_state, save_current_simd_state, set_next_pick_hint,
     spawn_user_process_state_with_parent, spawn_user_process_with_parent, spawn_user_thread,
     wake_task, wake_user_task, with_current_mm, with_current_process_state,
     with_current_process_state_mut, with_current_user_linux_state_mut,
@@ -40,6 +40,10 @@ pub fn current_console_session() -> kernel_object::api::session::ConsoleSessionH
 
 pub fn clear_deferred_reschedule_request() {
     crate::multitask::clear_deferred_reschedule_request();
+}
+
+pub fn request_deferred_reschedule() {
+    crate::multitask::request_deferred_reschedule();
 }
 
 pub fn reschedule_if_requested() {
@@ -135,6 +139,18 @@ pub mod process {
         weight_micros: u64,
     ) -> Result<u64, SpawnTaskError> {
         crate::multitask::spawn_user_process(address_space, bootstrap, weight_micros)
+    }
+
+    pub fn spawn_user_process_without_deferred_reschedule(
+        address_space: crate::memory::paging::ProcessAddressSpace,
+        bootstrap: UserTaskBootstrap,
+        weight_micros: u64,
+    ) -> Result<u64, SpawnTaskError> {
+        crate::multitask::spawn_user_process_without_deferred_reschedule(
+            address_space,
+            bootstrap,
+            weight_micros,
+        )
     }
 
     pub fn spawn_kernel_process(
@@ -271,6 +287,10 @@ pub mod task {
 
     pub fn arm_block_current_task() -> bool {
         crate::multitask::arm_block_current_task()
+    }
+
+    pub fn cancel_block_current_task() -> bool {
+        crate::multitask::cancel_block_current_task()
     }
 
     pub fn commit_block_current_task() -> Option<bool> {

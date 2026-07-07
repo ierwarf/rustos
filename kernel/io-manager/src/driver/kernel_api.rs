@@ -44,24 +44,17 @@ unsafe extern "C" fn driver_log(level: u32, message_ptr: *const u8, message_len:
     }
 
     let bytes = unsafe { slice::from_raw_parts(message_ptr, message_len as usize) };
-    let Ok(message) = str::from_utf8(bytes) else {
+    if str::from_utf8(bytes).is_err() {
         return -22;
-    };
-
-    match level {
-        value if value == DriverLogLevel::Error as u32 => {
-            crate::debug::error!(driver, "{}", message);
-        }
-        value if value == DriverLogLevel::Warn as u32 => {
-            crate::debug::warn!(driver, "{}", message);
-        }
-        value if value == DriverLogLevel::Info as u32 => {
-            crate::debug::info!(driver, "{}", message);
-        }
-        value if value == DriverLogLevel::Debug as u32 => {
-            crate::debug::debug!(driver, "{}", message);
-        }
-        _ => return -22,
+    }
+    if !matches!(
+        level,
+        value if value == DriverLogLevel::Error as u32
+            || value == DriverLogLevel::Warn as u32
+            || value == DriverLogLevel::Info as u32
+            || value == DriverLogLevel::Debug as u32
+    ) {
+        return -22;
     }
 
     0

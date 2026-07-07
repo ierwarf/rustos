@@ -302,6 +302,19 @@ pub fn spawn_prepared_process(
     Ok(SpawnedProcess { pid })
 }
 
+pub fn spawn_prepared_process_for_loader_reply(
+    prepared: PreparedProcessImage,
+    weight_micros: u64,
+) -> Result<SpawnedProcess, ProcessLoadError> {
+    let pid = kernel_ps::api::process::spawn_user_process_without_deferred_reschedule(
+        prepared.address_space,
+        prepared.bootstrap,
+        weight_micros,
+    )?;
+
+    Ok(SpawnedProcess { pid })
+}
+
 fn prepare_loaded_process_with_launch(
     mut loaded: LoadedProcessImage,
     launch: ProcessLaunchOptions<'_>,

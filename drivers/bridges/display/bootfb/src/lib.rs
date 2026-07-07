@@ -48,7 +48,6 @@ pub extern "C" fn rustos_driver_init(api: *const DriverKernelApiV1) -> i32 {
         return status;
     }
 
-    api::log_info("bootfb: boot framebuffer registered");
     0
 }
 

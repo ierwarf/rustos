@@ -33,6 +33,7 @@ use rustos_user_abi::syscall::{
 };
 
 const RECV_BACKOFF: Duration = Duration::from_millis(10);
+const SERVICE_ENDPOINT_REGISTER_ATTEMPTS: u32 = 65_536;
 const LOADABLE_DRIVER_REGISTRY_PATH: &str = "system/registry/kernel/loadable-drivers.tsv";
 static SYMBOL_EVENTS: Mutex<Vec<LinuxDriverSymbolEventWire>> = Mutex::new(Vec::new());
 
@@ -47,11 +48,7 @@ fn main() {
         );
         return;
     }
-    let register = syscall2(
-        SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
-        IPC_SERVICE_DRIVERD,
-        endpoint as u64,
-    );
+    let register = register_service_endpoint(IPC_SERVICE_DRIVERD, endpoint as u64);
     if register < 0 {
         let _ = writeln!(
             std::io::stderr(),
@@ -60,11 +57,8 @@ fn main() {
         );
         return;
     }
-    let service_driver_register = syscall2(
-        SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
-        IPC_SERVICE_SERVICE_DRIVERD,
-        endpoint as u64,
-    );
+    let service_driver_register =
+        register_service_endpoint(IPC_SERVICE_SERVICE_DRIVERD, endpoint as u64);
     if service_driver_register < 0 {
         let _ = writeln!(
             std::io::stderr(),
@@ -621,6 +615,10 @@ fn serve(endpoint: u64) {
             thread::sleep(RECV_BACKOFF);
             continue;
         }
+        if received == 0 {
+            thread::sleep(RECV_BACKOFF);
+            continue;
+        }
 
         if received as usize == size_of::<CommercialMaxProtocolRequest>() {
             let reply = reply_commercial_request(reply_cap, &request);
@@ -1096,6 +1094,22 @@ fn syscall4(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
     unsafe { libc::syscall(number as libc::c_long, arg0, arg1, arg2, arg3) as i64 }
 }
 
+fn register_service_endpoint(service_id: u64, endpoint: u64) -> i64 {
+    let mut last = 0;
+    for _ in 0..SERVICE_ENDPOINT_REGISTER_ATTEMPTS {
+        last = syscall2(SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, service_id, endpoint);
+        if last >= 0 {
+            return last;
+        }
+        let errno = (-last) as i32;
+        if errno != libc::EACCES && errno != libc::EPERM && errno != libc::ENOENT {
+            return last;
+        }
+        thread::yield_now();
+    }
+    last
+}
+
 fn last_errno() -> i32 {
     std::io::Error::last_os_error()
         .raw_os_error()
@@ -1103,10 +1117,14 @@ fn last_errno() -> i32 {
 }
 
 fn debug_line(message: &str) {
+    let bytes = message.as_bytes();
+    let len = bytes.len().min(1023);
+    let mut line = [0_u8; 1024];
+    line[..len].copy_from_slice(&bytes[..len]);
+    line[len] = b'\n';
     let _ = syscall2(
         SYS_RUSTOS_DEBUG_PRINT,
-        message.as_ptr() as u64,
-        message.len() as u64,
+        line.as_ptr() as u64,
+        (len + 1) as u64,
     );
-    let _ = syscall2(SYS_RUSTOS_DEBUG_PRINT, b"\n".as_ptr() as u64, 1);
 }

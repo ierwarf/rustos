@@ -77,6 +77,10 @@ fn serve(endpoint: u64) {
             thread::sleep(RECV_BACKOFF);
             continue;
         }
+        if received == 0 {
+            thread::sleep(RECV_BACKOFF);
+            continue;
+        }
         if received as usize == size_of::<CommercialMaxProtocolRequest>() {
             reply_commercial_request(reply_cap, &request);
             continue;
@@ -639,7 +643,7 @@ fn syscall4(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
 
 fn register_service_endpoint(service_id: u64, endpoint: u64) -> i64 {
     let mut last = 0;
-    for _ in 0..100 {
+    for _ in 0..65_536 {
         last = syscall2(SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, service_id, endpoint);
         if last >= 0 {
             return last;
@@ -648,7 +652,7 @@ fn register_service_endpoint(service_id: u64, endpoint: u64) -> i64 {
         if errno != libc::EACCES && errno != libc::EPERM && errno != libc::ENOENT {
             return last;
         }
-        thread::sleep(Duration::from_millis(1));
+        thread::yield_now();
     }
     last
 }
@@ -660,10 +664,14 @@ fn last_errno() -> i32 {
 }
 
 fn debug_line(message: &str) {
+    let bytes = message.as_bytes();
+    let len = bytes.len().min(1023);
+    let mut line = [0_u8; 1024];
+    line[..len].copy_from_slice(&bytes[..len]);
+    line[len] = b'\n';
     let _ = syscall2(
         SYS_RUSTOS_DEBUG_PRINT,
-        message.as_ptr() as u64,
-        message.len() as u64,
+        line.as_ptr() as u64,
+        (len + 1) as u64,
     );
-    let _ = syscall2(SYS_RUSTOS_DEBUG_PRINT, b"\n".as_ptr() as u64, 1);
 }

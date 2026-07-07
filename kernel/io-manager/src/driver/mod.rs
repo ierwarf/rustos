@@ -91,6 +91,10 @@ pub fn load_module_image_from_policy(
     let name = leak_policy_text(name)?;
     let image_path = leak_policy_text(image_path)?;
     let linux_driver_names = leak_policy_text(linux_driver_names)?;
+    if is_boot_framebuffer_request(name, class, bus, image_path, linux_driver_names) {
+        return load_boot_framebuffer_provider();
+    }
+
     match loader::load_module_image_explicit(name, class, bus, image_path, linux_driver_names) {
         Ok(_) => {
             if requires_display_provider_publish(class, policy_flags)
@@ -112,13 +116,7 @@ pub fn load_module_image_from_policy(
             }
             Ok(())
         }
-        Err(_)
-            if name == BOOTFB_DRIVER_NAME
-                && class == DriverClass::Display
-                && bus == DriverBus::Platform
-                && image_path == BOOTFB_DRIVER_MODULE_PATH
-                && (linux_driver_names.is_empty() || linux_driver_names == BOOTFB_DRIVER_NAME) =>
-        {
+        Err(_) if is_boot_framebuffer_request(name, class, bus, image_path, linux_driver_names) => {
             load_boot_framebuffer_provider()
         }
         Err(_) => Err(DriverLoadError::LoaderFailed),
@@ -196,6 +194,20 @@ fn load_boot_framebuffer_provider() -> Result<(), DriverLoadError> {
     } else {
         Err(DriverLoadError::LoaderFailed)
     }
+}
+
+fn is_boot_framebuffer_request(
+    name: &str,
+    class: DriverClass,
+    bus: DriverBus,
+    image_path: &str,
+    linux_driver_names: &str,
+) -> bool {
+    name == BOOTFB_DRIVER_NAME
+        && class == DriverClass::Display
+        && bus == DriverBus::Platform
+        && image_path == BOOTFB_DRIVER_MODULE_PATH
+        && (linux_driver_names.is_empty() || linux_driver_names == BOOTFB_DRIVER_NAME)
 }
 
 fn leak_policy_text(value: &str) -> Result<&'static str, DriverLoadError> {

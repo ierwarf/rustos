@@ -45,8 +45,6 @@ pub(crate) const LINUX_TCSETS: u64 = libc::TCSETS as u64;
 pub(crate) const LINUX_TCSETSW: u64 = libc::TCSETSW as u64;
 pub(crate) const LINUX_TCSETSF: u64 = libc::TCSETSF as u64;
 pub(crate) const LINUX_FIONREAD: u64 = libc::FIONREAD as u64;
-pub(crate) const DEVMGRD_BOOTSTRAP_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
-pub(crate) const SERVICE_ENDPOINT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 pub(crate) const CONSOLE_SESSION_STATE_LOADING_IMAGE: u16 =
     console_abi::CONSOLE_SESSION_STATE_LOADING_IMAGE;
 pub(crate) const CONSOLE_SESSION_STATE_SPAWNING: u16 = console_abi::CONSOLE_SESSION_STATE_SPAWNING;
@@ -149,12 +147,6 @@ pub(crate) struct BrokerState {
     pub(crate) launch_catalog_loaded: bool,
 }
 
-pub(crate) struct LaunchCatalog {
-    pub(crate) programs: BTreeMap<String, ProgramMetadata>,
-    pub(crate) launch_entries: Vec<LaunchEntry>,
-    pub(crate) elapsed_ms: u128,
-}
-
 pub(crate) fn boot_line(message: &str) {
     if option_env!("RUSTOS_LOGGING_BOOT_TRACE_ENABLED") != Some("true") {
         return;
@@ -196,7 +188,6 @@ fn main() {
         ui_ready: false,
         launch_catalog_loaded: false,
     };
-    let mut launch_catalog = Some(catalog::start_launch_catalog_loader());
     spawn::stderr_line("runtimed: bootstrap ui begin");
     boot_line("runtimed: bootstrap ui begin");
     if let Err(err) = session::bootstrap_ui_server(&mut state) {
@@ -215,12 +206,8 @@ fn main() {
         did_work |= session::service_session_endpoint(session_endpoint, &mut state);
         did_work |= spawn::reap_children(&mut state);
         did_work |= socket::service_listener(&listener, &mut state);
-        if state.ui_ready && !state.launch_catalog_loaded && launch_catalog.is_none() {
-            launch_catalog = Some(catalog::start_launch_catalog_loader());
-            did_work = true;
-        }
-        if let Some(receiver) = launch_catalog.as_ref() {
-            did_work |= catalog::receive_launch_catalog(&mut state, receiver);
+        if state.ui_ready && !state.launch_catalog_loaded {
+            did_work |= catalog::load_launch_catalog_into_state(&mut state);
         }
         did_work |= socket::ensure_policy_launches(&mut state);
         if did_work {

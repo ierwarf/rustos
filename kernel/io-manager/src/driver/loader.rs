@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::sync::KernelSpinLock as Mutex;
 use driver_abi::{
-    DriverBus, DriverClass, DriverModuleHeader, RUSTOS_DRIVER_ABI_VERSION_SYMBOL,
+    DriverBus, DriverClass, DriverInitFn, DriverModuleHeader, RUSTOS_DRIVER_ABI_VERSION_SYMBOL,
     RUSTOS_DRIVER_HEADER_SYMBOL, RUSTOS_DRIVER_INIT_SYMBOL,
 };
 use elf::ElfBytes;
@@ -130,35 +130,6 @@ unsafe fn call_with_module_init_stack0(entry: usize) -> i32 {
             "mov rsp, rbx",
             "pop rbx",
             in("rax") entry,
-            in("rdx") stack_top,
-            lateout("eax") result,
-            clobber_abi("C"),
-        );
-    }
-    result
-}
-
-#[inline(always)]
-unsafe fn call_with_module_init_stack1(entry: usize, arg0: usize) -> i32 {
-    let _guard = MODULE_INIT_STACK_LOCK.lock();
-    let mut stack = allocate_module_init_stack().expect("module init stack allocation failed");
-    let stack_base = stack.as_mut_ptr() as usize;
-    let stack_top = stack_base + stack.len();
-    let _stack_scope =
-        kernel_ps::api::CurrentKernelStackScope::enter(stack_base as u64, stack_top as u64)
-            .expect("scheduler must accept module init stack bounds");
-    let mut result: i32;
-    unsafe {
-        asm!(
-            "push rbx",
-            "mov rbx, rsp",
-            "mov rsp, rdx",
-            "and rsp, -16",
-            "call rax",
-            "mov rsp, rbx",
-            "pop rbx",
-            in("rax") entry,
-            in("rdi") arg0,
             in("rdx") stack_top,
             lateout("eax") result,
             clobber_abi("C"),
@@ -449,9 +420,8 @@ pub(super) fn load_module_image_explicit(
                 image.len() as u64,
                 init_addr as u64,
             );
-            unsafe {
-                call_with_module_init_stack1(init_addr, super::exported_kernel_api() as usize)
-            }
+            let init: DriverInitFn = unsafe { core::mem::transmute(init_addr) };
+            unsafe { init(super::exported_kernel_api()) }
         }
         ModuleAbi::LinuxCompat(_) => match find_symbol(&elf, LINUX_COMPAT_INIT_SYMBOL)? {
             Some((_, init_entry)) => {

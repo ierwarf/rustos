@@ -18,7 +18,8 @@ use rustos_user_abi::syscall::{
     IPC_SERVICE_LOADERD, IPC_SERVICE_NETD, IPC_SERVICE_ROOTD, IPC_SERVICE_SESSIOND,
     IPC_SERVICE_STORAGED, IPC_SERVICE_VFSD, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION,
     LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY,
-    SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
+    LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF, SYS_RUSTOS_IPC_CALL,
+    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
 };
 
 const INITD_EXEC_PATH: &str = "services/initd/initd.elf";
@@ -33,6 +34,10 @@ const STORAGED_EXEC_PATH: &str = "services/storaged/storaged.elf";
 const INPUTD_EXEC_PATH: &str = "services/inputd/inputd.elf";
 const POLL_INTERVAL: Duration = Duration::from_millis(2);
 const RETRY_BACKOFF: Duration = Duration::from_millis(50);
+const INITD_LAUNCH_MAX_FAILURES: u32 = 32;
+const POST_INIT_ENDPOINT_READY_ATTEMPTS: u32 = 65_536;
+const POST_INIT_ENDPOINT_READY_LOG_EVERY: u32 = 256;
+const ROOTD_LEASE_REPORT_MAX_ATTEMPTS: u32 = 16;
 const DEFAULT_INIT_TASK_WEIGHT_MICROS: u64 = 1_000;
 const EARLY_POLICY_TASK_WEIGHT_MICROS: u64 = 4_000;
 const DISPLAY_CRITICAL_TASK_WEIGHT_MICROS: u64 = 2_000;
@@ -57,6 +62,12 @@ struct RunningService {
     restart: bool,
 }
 
+#[derive(Clone, Debug)]
+struct RetryState {
+    next_attempt: Instant,
+    failures: u32,
+}
+
 fn main() {
     boot_line("initd: main enter");
     let load_started = Instant::now();
@@ -76,11 +87,11 @@ fn main() {
 
     let mut running = BTreeMap::<i32, RunningService>::new();
     let mut launched_once_packages = BTreeSet::new();
-    let mut retry_after = BTreeMap::<String, Instant>::new();
+    let mut retry_state = BTreeMap::<String, RetryState>::new();
     let mut defer_secondary_services_until = None::<Instant>;
 
     loop {
-        reap_children(&mut running, &mut retry_after);
+        reap_children(&mut running, &mut retry_state);
 
         let mut running_packages = running
             .values()
@@ -104,9 +115,9 @@ fn main() {
                 continue;
             }
 
-            if retry_after
+            if retry_state
                 .get(entry.exec.as_str())
-                .is_some_and(|deadline| now < *deadline)
+                .is_some_and(|state| now < state.next_attempt)
             {
                 continue;
             }
@@ -123,12 +134,6 @@ fn main() {
 
             match spawn_exec(entry.exec.as_str(), &init_env) {
                 Ok(pid) => {
-                    observability_client::info!(
-                        "initd",
-                        service,
-                        "launch {} pid={pid}",
-                        entry.exec
-                    );
                     running.insert(
                         pid,
                         RunningService {
@@ -138,8 +143,27 @@ fn main() {
                         },
                     );
                     running_packages.insert(entry.package_id.clone());
-                    retry_after.remove(entry.exec.as_str());
-                    report_rootd_service_lease(entry.exec.as_str(), pid);
+                    retry_state.remove(entry.exec.as_str());
+                    if let Err(err) = report_rootd_service_lease(entry.exec.as_str(), pid) {
+                        fail_closed(&format!(
+                            "initd: fatal rootd lease report failed exec={} pid={pid} errno={err}",
+                            entry.exec
+                        ));
+                    }
+                    boot_line(&format!(
+                        "initd: rootd lease report ok exec={} pid={pid}",
+                        entry.exec
+                    ));
+                    if let Err(err) = wait_reported_service_endpoint(entry.exec.as_str()) {
+                        fail_closed(&format!(
+                            "initd: fatal service endpoint not ready exec={} pid={pid} errno={err}",
+                            entry.exec
+                        ));
+                    }
+                    boot_line(&format!(
+                        "initd: service endpoint ready exec={} pid={pid}",
+                        entry.exec
+                    ));
                     if !entry.restart {
                         launched_once_packages.insert(entry.package_id.clone());
                     }
@@ -150,6 +174,7 @@ fn main() {
                             Some(Instant::now() + SECONDARY_SERVICE_DEFER_AFTER_RUNTIMED);
                     }
                     launched_this_round = true;
+                    thread::yield_now();
                     continue;
                 }
                 Err(err) => {
@@ -159,7 +184,12 @@ fn main() {
                         "launch {} failed: errno={err}",
                         entry.exec
                     );
-                    retry_after.insert(entry.exec.clone(), Instant::now() + RETRY_BACKOFF);
+                    record_launch_failure(
+                        &mut retry_state,
+                        entry.exec.as_str(),
+                        "spawn",
+                        err,
+                    );
                 }
             }
         }
@@ -300,18 +330,104 @@ fn foundation_policy_services_ready() -> bool {
     .all(service_ready)
 }
 
-fn service_ready(service_id: u64) -> bool {
-    let result = unsafe {
+fn service_ready_status(service_id: u64) -> i64 {
+    unsafe {
         libc::syscall(
             SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT as libc::c_long,
             service_id,
         ) as i64
-    };
-    result > 0
+    }
 }
 
-fn report_rootd_service_lease(exec_path: &str, pid: i32) {
-    let _ = (exec_path, pid);
+fn service_ready(service_id: u64) -> bool {
+    service_ready_status(service_id) > 0
+}
+
+fn report_rootd_service_lease(exec_path: &str, pid: i32) -> Result<(), i32> {
+    let Some(service_id) = rootd_service_id_for_exec(exec_path) else {
+        return Ok(());
+    };
+    if pid <= 0 {
+        observability_client::error!(
+            "initd",
+            service,
+            "rootd lease report skipped exec={} invalid_pid={pid}",
+            exec_path
+        );
+        return Err(libc::EINVAL);
+    }
+    let mut attempt = 0_u32;
+    loop {
+        attempt += 1;
+        if attempt == 1 {
+            if let Some(service_id) = rootd_service_id_for_exec(exec_path) {
+                boot_line(&format!(
+                    "initd: rootd lease report begin exec={} pid={pid} service_id={service_id}",
+                    exec_path
+                ));
+            }
+        }
+        match report_rootd_service_lease_inner(service_id, exec_path, pid as u64) {
+            Ok(()) => {
+                boot_line(&format!(
+                    "initd: rootd lease report success exec={} pid={pid} attempt={attempt}",
+                    exec_path
+                ));
+                return Ok(());
+            }
+            Err(errno) if attempt < ROOTD_LEASE_REPORT_MAX_ATTEMPTS => {
+                observability_client::warn!(
+                    "initd",
+                    service,
+                    "rootd lease report retry exec={} pid={pid} errno={errno} attempt={attempt}",
+                    exec_path
+                );
+                thread::yield_now();
+            }
+            Err(errno) => {
+                observability_client::error!(
+                    "initd",
+                    service,
+                    "rootd lease report failed exec={} pid={pid} errno={errno} attempts={attempt}",
+                    exec_path
+                );
+                return Err(errno);
+            }
+        }
+    }
+}
+
+fn wait_reported_service_endpoint(exec_path: &str) -> Result<(), i32> {
+    let Some(service_id) = rootd_service_id_for_exec(exec_path) else {
+        return Ok(());
+    };
+    for attempt in 0..POST_INIT_ENDPOINT_READY_ATTEMPTS {
+        let status = service_ready_status(service_id);
+        if status > 0 {
+            boot_line(&format!(
+                "initd: endpoint ready check success exec={} service_id={} attempt={attempt}",
+                exec_path,
+                service_id
+            ));
+            return Ok(());
+        }
+        if attempt % POST_INIT_ENDPOINT_READY_LOG_EVERY == 0 {
+            let status_text = if status == 0 {
+                "not-ready".to_string()
+            } else {
+                format!("errno={}", -status)
+            };
+            boot_line(&format!(
+                "initd: endpoint wait retry exec={} service_id={} attempt={} status={}",
+                exec_path,
+                service_id,
+                attempt,
+                status_text
+            ));
+        }
+        thread::yield_now();
+    }
+    Err(libc::ETIMEDOUT)
 }
 
 fn rootd_service_id_for_exec(exec_path: &str) -> Option<u64> {
@@ -400,7 +516,7 @@ fn runtime_deps_satisfied(
 
 fn reap_children(
     running: &mut BTreeMap<i32, RunningService>,
-    retry_after: &mut BTreeMap<String, Instant>,
+    retry_state: &mut BTreeMap<String, RetryState>,
 ) {
     loop {
         let mut status = 0_i32;
@@ -425,7 +541,12 @@ fn reap_children(
                     status
                 );
                 if service.restart {
-                    retry_after.insert(service.exec, Instant::now() + RETRY_BACKOFF);
+                    record_launch_failure(
+                        retry_state,
+                        service.exec.as_str(),
+                        "exit",
+                        status,
+                    );
                 }
             }
             continue;
@@ -435,6 +556,44 @@ fn reap_children(
         }
         break;
     }
+}
+
+fn record_launch_failure(
+    retry_state: &mut BTreeMap<String, RetryState>,
+    exec_path: &str,
+    reason: &str,
+    status: i32,
+) {
+    let state = retry_state
+        .entry(exec_path.to_string())
+        .or_insert_with(|| RetryState {
+            next_attempt: Instant::now(),
+            failures: 0,
+        });
+    state.failures = state.failures.saturating_add(1);
+    if state.failures >= INITD_LAUNCH_MAX_FAILURES {
+        fail_closed(&format!(
+            "initd: fatal launch failure exec={exec_path} reason={reason} status={status} failures={}",
+            state.failures
+        ));
+    }
+    state.next_attempt = Instant::now() + RETRY_BACKOFF;
+    observability_client::warn!(
+        "initd",
+        service,
+        "launch retry scheduled exec={} reason={} status={} failures={} max={}",
+        exec_path,
+        reason,
+        status,
+        state.failures,
+        INITD_LAUNCH_MAX_FAILURES
+    );
+}
+
+fn fail_closed(message: &str) -> ! {
+    boot_line(message);
+    observability_client::error!("initd", service, "{message}");
+    std::process::exit(111);
 }
 
 fn spawn_exec(exec_path: &str, env: &[CString]) -> Result<i32, i32> {
@@ -496,7 +655,7 @@ fn build_loader_spawn_request(
     let mut request = LoaderSpawnRequest {
         version: LOADER_REQUEST_ABI_VERSION,
         op: LOADER_OP_SPAWN_EXEC,
-        flags: 1,
+        flags: 1 | LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF,
         console_session: 0,
         weight_micros: exec_weight_micros(exec_path),
         exec_path_len: exec_bytes.len() as u32,
@@ -573,7 +732,8 @@ fn boot_line(message: &str) {
         return;
     }
     unsafe {
-        let _ = libc::syscall(0x5255_0001 as libc::c_long, message.as_ptr(), message.len());
-        let _ = libc::syscall(0x5255_0001 as libc::c_long, b"\n".as_ptr(), 1_usize);
+        let mut line = message.as_bytes().to_vec();
+        line.push(b'\n');
+        let _ = libc::syscall(0x5255_0001 as libc::c_long, line.as_ptr(), line.len());
     }
 }

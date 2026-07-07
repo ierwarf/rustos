@@ -15,7 +15,7 @@ use x86_64::VirtAddr;
 use crate::{announce_ready, debug, fatal, flow_debug, flow_info, hal_hooks, io_services, tasks};
 
 const ROOTD_EXEC_PATH: &str = "services/rootd/rootd.elf";
-const ROOTD_BOOTSTRAP_WEIGHT_MICROS: u64 = 1_000;
+const ROOTD_BOOTSTRAP_WEIGHT_MICROS: u64 = 4_000;
 const MAX_BACKTRACE_FRAME_STEP: u64 = 1024 * 1024;
 
 static LAST_USB_INPUT_DIAG_TICK: AtomicU64 = AtomicU64::new(0);
@@ -348,7 +348,7 @@ pub fn bootstrap_init_process() {
         0,
         "init bootstrap loading path={ROOTD_EXEC_PATH}",
     );
-    let loaded = match console_host::load_executable_image_by_path(ROOTD_EXEC_PATH, None) {
+    let loaded = match console_host::load_executable_image_by_path(ROOTD_EXEC_PATH) {
         Ok(loaded) => loaded,
         Err(err) => fatal::fatal_init_bootstrap_load(err),
     };

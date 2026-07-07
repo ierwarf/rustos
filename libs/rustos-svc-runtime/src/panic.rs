@@ -1,5 +1,6 @@
 use core::panic::PanicInfo;
 
+use alloc::vec::Vec;
 use rustos_user_abi::syscall::SYS_RUSTOS_DEBUG_PRINT;
 
 use crate::syscall;
@@ -15,14 +16,14 @@ fn panic(info: &PanicInfo<'_>) -> ! {
         );
     }
     if let Some(location) = info.location() {
-        let file = location.file().as_bytes();
+        let mut file = Vec::from(location.file().as_bytes());
+        file.push(b'\n');
         unsafe {
             syscall::syscall2(
                 SYS_RUSTOS_DEBUG_PRINT,
                 file.as_ptr() as u64,
                 file.len() as u64,
             );
-            syscall::syscall2(SYS_RUSTOS_DEBUG_PRINT, b"\n".as_ptr() as u64, 1);
         }
     }
     syscall::exit_group(101)

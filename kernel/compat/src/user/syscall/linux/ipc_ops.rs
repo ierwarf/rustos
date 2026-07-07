@@ -50,6 +50,7 @@ pub(super) fn is_linux_rustos_ipc_syscall(syscall_number: u64) -> bool {
             | linux_abi::SYS_RUSTOS_IPC_RECV
             | linux_abi::SYS_RUSTOS_IPC_TRY_RECV
             | linux_abi::SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER
+            | linux_abi::SYS_RUSTOS_IPC_RECV_WITH_SENDER
             | linux_abi::SYS_RUSTOS_IPC_REPLY
             | linux_abi::SYS_RUSTOS_IPC_CALL_WITH_HANDLES
             | linux_abi::SYS_RUSTOS_IPC_RECV_WITH_HANDLES
@@ -85,6 +86,9 @@ pub(super) fn dispatch_linux_rustos_ipc_syscall(frame: &SyscallFrame) -> u64 {
                 frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
             )
         }
+        linux_abi::SYS_RUSTOS_IPC_RECV_WITH_SENDER => syscall_linux_rustos_ipc_recv_with_sender(
+            frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
+        ),
         linux_abi::SYS_RUSTOS_IPC_REPLY => {
             syscall_linux_rustos_ipc_reply(frame.rdi, frame.rsi, frame.rdx)
         }
@@ -128,6 +132,20 @@ pub(super) fn service_registered(service_id: u64) -> bool {
     service_endpoint_raw(service_id).is_some_and(|raw| raw != 0)
 }
 
+fn record_service_endpoint_milestone(
+    name: &'static str,
+    service_id: u64,
+    process_id: u64,
+    endpoint_or_status: u64,
+) {
+    debug::record_milestone(
+        debug::LogCategory::Compat,
+        name,
+        service_id,
+        ((process_id & 0xffff_ffff) << 32) | (endpoint_or_status & 0xffff_ffff),
+    );
+}
+
 /// 프로세스 종료 시 해당 프로세스가 등록한 모든 IPC 서비스 엔드포인트를 해제한다.
 /// stale endpoint가 남아 있으면 이후 호출자가 wait_for_reply에서 무한 대기하게 되므로
 /// 반드시 프로세스 종료 경로에서 호출해야 한다.
@@ -143,6 +161,12 @@ pub(crate) fn cleanup_service_endpoints_for_process(process_id: u64) {
             SERVICE_ENDPOINTS[i].store(0, Ordering::Release);
             SERVICE_ENDPOINT_OWNERS[i].store(0, Ordering::Release);
             SERVICE_ENDPOINT_CAPS[i].store(0, Ordering::Release);
+            record_service_endpoint_milestone(
+                "ipc-service-exit-revoke",
+                i as u64,
+                process_id,
+                0,
+            );
             ipc_trace!(
                 "ipc service endpoint revoked on process exit: index={} process={}",
                 i,
@@ -219,7 +243,15 @@ pub(super) fn syscall_linux_rustos_ipc_register_linux_syscall_endpoint(endpoint:
     );
     let capability = match service_capability(linux_abi::IPC_SERVICE_LINUX_SYSCALLD) {
         Ok(capability) => capability,
-        Err(errno) => return linux_errno(errno),
+        Err(errno) => {
+            record_service_endpoint_milestone(
+                "ipc-service-register-denied",
+                linux_abi::IPC_SERVICE_LINUX_SYSCALLD,
+                process_id,
+                errno as u64,
+            );
+            return linux_errno(errno);
+        }
     };
     LINUX_SYSCALL_ENDPOINT.store(endpoint, Ordering::Release);
     SERVICE_ENDPOINTS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
@@ -234,6 +266,12 @@ pub(super) fn syscall_linux_rustos_ipc_register_linux_syscall_endpoint(endpoint:
         endpoint,
         process_id,
         capability
+    );
+    record_service_endpoint_milestone(
+        "ipc-service-register",
+        linux_abi::IPC_SERVICE_LINUX_SYSCALLD,
+        process_id,
+        endpoint,
     );
     0
 }
@@ -258,15 +296,30 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
         SERVICE_ENDPOINTS[index].store(0, Ordering::Release);
         SERVICE_ENDPOINT_OWNERS[index].store(0, Ordering::Release);
         SERVICE_ENDPOINT_CAPS[index].store(0, Ordering::Release);
+        record_service_endpoint_milestone("ipc-service-revoke", service_id, process_id, 0);
         ipc_trace!("ipc service revoked: service={}", service_id);
         return 0;
     }
     if SERVICE_ENDPOINTS[index].load(Ordering::Acquire) != 0 {
+        record_service_endpoint_milestone(
+            "ipc-service-register-busy",
+            service_id,
+            process_id,
+            LINUX_EBUSY as u64,
+        );
         return linux_errno(LINUX_EBUSY);
     }
     let capability = match service_capability(service_id) {
         Ok(capability) => capability,
-        Err(errno) => return linux_errno(errno),
+        Err(errno) => {
+            record_service_endpoint_milestone(
+                "ipc-service-register-denied",
+                service_id,
+                process_id,
+                errno as u64,
+            );
+            return linux_errno(errno);
+        }
     };
     SERVICE_ENDPOINTS[index].store(endpoint, Ordering::Release);
     SERVICE_ENDPOINT_OWNERS[index].store(process_id, Ordering::Release);
@@ -278,6 +331,7 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
         process_id,
         capability
     );
+    record_service_endpoint_milestone("ipc-service-register", service_id, process_id, endpoint);
     0
 }
 
@@ -328,7 +382,10 @@ fn service_capability_via_rootd(service_id: u64) -> Result<u64, i64> {
 
 pub(super) fn syscall_linux_rustos_ipc_lookup_service_endpoint(service_id: u64) -> u64 {
     ipc_trace!("ipc lookup service endpoint: service={}", service_id);
-    if !current_process_can_lookup_service_endpoint() {
+    // Rootd is the authorization broker for service lookup, so its own
+    // endpoint must remain directly discoverable as bootstrap substrate.
+    if service_id != linux_abi::IPC_SERVICE_ROOTD && !current_process_can_lookup_service_endpoint()
+    {
         if let Err(errno) = authorize_service_lookup_via_rootd(service_id) {
             return linux_errno(errno);
         }
@@ -494,7 +551,7 @@ pub(super) fn syscall_linux_rustos_ipc_recv(
                 ) {
                     Ok(pending) => pending,
                     Err(err) => {
-                        let _ = multitask::commit_block_current_task();
+                        let _ = multitask::cancel_block_current_task();
                         return linux_errno(ipc_error_to_linux_errno(err));
                     }
                 };
@@ -505,7 +562,7 @@ pub(super) fn syscall_linux_rustos_ipc_recv(
                     pending
                 );
                 if pending {
-                    let _ = multitask::commit_block_current_task();
+                    let _ = multitask::cancel_block_current_task();
                     continue;
                 }
                 match multitask::commit_block_current_task() {
@@ -558,6 +615,107 @@ pub(super) fn syscall_linux_rustos_ipc_try_recv_with_sender(
         sender_tid_ptr,
     )
     .map_or_else(linux_errno, |received| received as u64)
+}
+
+pub(super) fn syscall_linux_rustos_ipc_recv_with_sender(
+    endpoint: u64,
+    request_ptr: u64,
+    request_capacity: u64,
+    reply_cap_ptr: u64,
+    sender_pid_ptr: u64,
+    sender_tid_ptr: u64,
+) -> u64 {
+    if !current_process_has_service_capability(
+        rustos_user_abi::syscall::IPC_SERVICE_CAP_ROOT_SUPERVISOR,
+    ) {
+        return linux_errno(LINUX_EPERM);
+    }
+    let endpoint = KernelEndpointHandle::from_raw(endpoint);
+    let Ok(request_capacity) = usize::try_from(request_capacity) else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    if request_capacity > rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES {
+        return linux_errno(LINUX_EINVAL);
+    }
+    if request_capacity > 0 {
+        if let Err(err) = usermem::validate_current_user_write_buffer(request_ptr, request_capacity)
+        {
+            return linux_errno(address_space_error_to_linux_errno(err));
+        }
+    }
+    if let Err(err) = usermem::validate_current_user_write_buffer(reply_cap_ptr, size_of::<u64>())
+    {
+        return linux_errno(address_space_error_to_linux_errno(err));
+    }
+    if let Err(err) = usermem::validate_current_user_write_buffer(sender_pid_ptr, size_of::<u64>())
+    {
+        return linux_errno(address_space_error_to_linux_errno(err));
+    }
+    if let Err(err) = usermem::validate_current_user_write_buffer(sender_tid_ptr, size_of::<u64>())
+    {
+        return linux_errno(address_space_error_to_linux_errno(err));
+    }
+
+    loop {
+        match kernel_ipc_runtime::api::recv_endpoint_with_sender_and_limits(
+            endpoint,
+            request_capacity,
+            0,
+        ) {
+            Ok(Some((reply, request, _handles, caller_task_id))) => {
+                let (sender_pid, sender_tid) =
+                    multitask::user_log_ids_for_task(caller_task_id).unwrap_or((0, 0));
+                if !request.is_empty() {
+                    if let Err(err) = usermem::write_current_user_bytes(request_ptr, &request) {
+                        return linux_errno(address_space_error_to_linux_errno(err));
+                    }
+                }
+                if let Err(err) =
+                    usermem::write_current_user_bytes(reply_cap_ptr, &reply.raw().to_ne_bytes())
+                {
+                    return linux_errno(address_space_error_to_linux_errno(err));
+                }
+                if let Err(err) =
+                    usermem::write_current_user_bytes(sender_pid_ptr, &sender_pid.to_ne_bytes())
+                {
+                    return linux_errno(address_space_error_to_linux_errno(err));
+                }
+                if let Err(err) =
+                    usermem::write_current_user_bytes(sender_tid_ptr, &sender_tid.to_ne_bytes())
+                {
+                    return linux_errno(address_space_error_to_linux_errno(err));
+                }
+                return request.len() as u64;
+            }
+            Ok(None) => {
+                let Some(task_id) = multitask::current_task_id() else {
+                    return linux_errno(LINUX_EINVAL);
+                };
+                if !multitask::arm_block_current_task() {
+                    return linux_errno(LINUX_EINVAL);
+                }
+                let pending =
+                    match kernel_ipc_runtime::api::add_endpoint_receiver_waiter(endpoint, task_id)
+                    {
+                        Ok(pending) => pending,
+                        Err(err) => {
+                            let _ = multitask::cancel_block_current_task();
+                            return linux_errno(ipc_error_to_linux_errno(err));
+                        }
+                    };
+                if pending {
+                    let _ = multitask::cancel_block_current_task();
+                    continue;
+                }
+                match multitask::commit_block_current_task() {
+                    Some(true) => multitask::yield_now(),
+                    Some(false) => continue,
+                    None => return linux_errno(LINUX_EINVAL),
+                }
+            }
+            Err(err) => return linux_errno(ipc_error_to_linux_errno(err)),
+        }
+    }
 }
 
 fn recv_endpoint_once(
@@ -656,6 +814,7 @@ pub(super) fn syscall_linux_rustos_ipc_reply(
     // endpoint again, so donate the remaining quantum to the original caller
     // instead of round-robining away from a freshly-completed reply.
     multitask::set_next_pick_hint(task_id);
+    multitask::request_deferred_reschedule();
     log_slow_ipc_reply(
         "reply",
         reply,
@@ -853,12 +1012,12 @@ pub(super) fn syscall_linux_rustos_ipc_recv_with_handles(args_ptr: u64) -> u64 {
                 ) {
                     Ok(pending) => pending,
                     Err(err) => {
-                        let _ = multitask::commit_block_current_task();
+                        let _ = multitask::cancel_block_current_task();
                         return linux_errno(ipc_error_to_linux_errno(err));
                     }
                 };
                 if pending {
-                    let _ = multitask::commit_block_current_task();
+                    let _ = multitask::cancel_block_current_task();
                     continue;
                 }
                 match multitask::commit_block_current_task() {
@@ -904,6 +1063,7 @@ pub(super) fn syscall_linux_rustos_ipc_reply_with_handles(args_ptr: u64) -> u64 
     };
     let _ = multitask::wake_task(task_id);
     multitask::set_next_pick_hint(task_id);
+    multitask::request_deferred_reschedule();
     0
 }
 
@@ -1010,11 +1170,10 @@ fn enqueue_call_and_wake_with_handles(
             receiver_task_id,
             woke
         );
-        // L4-style direct switch: hint the scheduler to run the receiver next,
-        // so the caller's subsequent `yield_now` in `wait_for_reply` immediately
-        // hands the CPU to the service task. Without this, the receiver waits
-        // for a full round-robin trip — which on TCG dominates per-IPC latency
-        // and balloons service-spawn into multiple seconds.
+        // L4-style direct handoff hint: the caller still returns to arm its
+        // reply wait before yielding, so a fast service reply cannot race a
+        // not-yet-armed waiter. `wait_for_reply` performs the actual yield
+        // after the wait state is committed.
         multitask::set_next_pick_hint(receiver_task_id);
     }
     Ok(reply)
@@ -1086,13 +1245,13 @@ fn wait_for_reply_with_deadline(
         ) {
             Ok(Some(response)) => {
                 disarm_reply_deadline_waiter(caller_task_id);
-                let _ = multitask::commit_block_current_task();
+                let _ = multitask::cancel_block_current_task();
                 return Ok(response);
             }
             Ok(None) => {}
             Err(err) => {
                 disarm_reply_deadline_waiter(caller_task_id);
-                let _ = multitask::commit_block_current_task();
+                let _ = multitask::cancel_block_current_task();
                 return Err(ipc_error_to_linux_errno(err));
             }
         }
@@ -1112,7 +1271,7 @@ fn wait_for_reply_with_deadline(
             }
             Some(false) => {
                 disarm_reply_deadline_waiter(caller_task_id);
-                multitask::yield_now();
+                continue;
             }
             None => {
                 disarm_reply_deadline_waiter(caller_task_id);
@@ -1154,6 +1313,13 @@ fn cancel_deadline_reply(reply: KernelReplyHandle, caller_task_id: Option<u64>) 
         return;
     };
     let result = kernel_ipc_runtime::api::cancel_endpoint_call(reply, caller_task_id);
+    let status = u64::from(result.is_err());
+    debug::record_milestone(
+        debug::LogCategory::Compat,
+        "ipc-reply-timeout",
+        reply.raw(),
+        ((caller_task_id & 0xffff_ffff) << 32) | status,
+    );
     ipc_trace!(
         "ipc reply timeout: reply={} caller={} cancel={:?}",
         reply.raw(),

@@ -62,6 +62,7 @@ mod tests {
         assert_eq!(syscall::SYS_RUSTOS_IPC_TRY_RECV, 0x5255_0035);
         assert_eq!(syscall::SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, 0x5255_0036);
         assert_eq!(syscall::SYS_RUSTOS_DRIVER_SYMBOL_EVENT_BROKER, 0x5255_0037);
+        assert_eq!(syscall::SYS_RUSTOS_IPC_RECV_WITH_SENDER, 0x5255_0038);
         assert_eq!(
             syscall::SYS_RUSTOS_SERVICE_DRIVER_RESOURCE_BROKER,
             0x5255_0022

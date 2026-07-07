@@ -54,6 +54,7 @@ pub const SYS_RUSTOS_BOOT_EXTENT_BROKER: u64 = 0x5255_0034;
 pub const SYS_RUSTOS_IPC_TRY_RECV: u64 = 0x5255_0035;
 pub const SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER: u64 = 0x5255_0036;
 pub const SYS_RUSTOS_DRIVER_SYMBOL_EVENT_BROKER: u64 = 0x5255_0037;
+pub const SYS_RUSTOS_IPC_RECV_WITH_SENDER: u64 = 0x5255_0038;
 
 /// RustOS-private auxv entry: virtual address of the bootstrap heap region
 /// that the kernel pre-maps for static-PIE policy services so they can run
@@ -320,6 +321,7 @@ pub const LOADER_SPAWN_ARG_BYTES: usize = 1024;
 pub const LOADER_SPAWN_ENV_BYTES: usize = 2048;
 pub const LOADER_SPAWN_MAX_ARG_COUNT: usize = 32;
 pub const LOADER_SPAWN_MAX_ENV_COUNT: usize = 64;
+pub const LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF: u32 = 1 << 1;
 pub const PROCD_IPC_ABI_VERSION: u16 = 1;
 pub const PROCD_OP_EXECVE: u16 = 1;
 pub const PROCD_OP_EXECVEAT: u16 = 2;

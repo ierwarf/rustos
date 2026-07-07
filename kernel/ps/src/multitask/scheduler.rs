@@ -77,10 +77,9 @@ const SCHED_MIN_GRANULARITY_NS: u64 = 200_000;
 // call cond_resched.
 const SCHED_MAX_BURST_NS: u64 = 20_000_000;
 // Initial vruntime offset for newly-spawned tasks relative to current
-// min_vruntime. Linux uses sched_vslice ~ sched_latency * weight / total_weight
-// ~ a few ms. Using 6ms keeps a flood of spawns (initd starting 8 services)
-// from preempting steady-state workers like uiserver for too long.
-const SCHED_NEW_TASK_VRUNTIME_PENALTY_NS: u64 = 6_000_000;
+// min_vruntime. Keep this near min-granularity: a larger multi-ms penalty
+// leaves freshly spawned services behind polling System peers during boot.
+const SCHED_NEW_TASK_VRUNTIME_PENALTY_NS: u64 = SCHED_MIN_GRANULARITY_NS;
 
 /// Load-weight threshold that promotes latency-critical services to the
 /// `System` scheduling class. Effective 1000us service weights map to ~9544
@@ -209,9 +208,13 @@ pub(super) struct Scheduler {
     /// slot if it is ready. Set by IPC paths immediately before
     /// `yield_now()` so the caller hands its remaining timeslice to the
     /// receiver/replier instead of letting round-robin pick an unrelated task
-    /// and stalling for an entire PIT slice. Consumed (cleared) on the next
-    /// scheduler pick whether or not the hint was used.
+    /// and stalling for an entire PIT slice. The hint is kept while its target
+    /// is ready but temporarily blocked by a higher scheduling class, and is
+    /// cleared once consumed or once the target is no longer schedulable.
     next_pick_hint: Option<usize>,
+    /// Spawn handoff hint, kept separate from IPC reply hints so the loader's
+    /// reply to the supervisor cannot overwrite the freshly-created child.
+    next_spawn_pick_hint: Option<usize>,
     /// Cached minimum vruntime across the ready set, refreshed each pick.
     /// New tasks initialise their vruntime from this value (plus a small
     /// penalty) so they cannot preempt long-lived ready tasks just by virtue
@@ -238,6 +241,7 @@ impl Scheduler {
             current_task: 0,
             pending_reap: false,
             next_pick_hint: None,
+            next_spawn_pick_hint: None,
             last_min_vruntime_ns: 0,
             root_idle: false,
             scheduler_tick_divisor: 0,
@@ -247,15 +251,45 @@ impl Scheduler {
     /// Sets a "donate" hint that biases the next scheduler pick toward the
     /// given task id. IPC paths use this so that after `wake_task(target)` and
     /// `yield_now()`, the scheduler immediately runs `target` instead of
-    /// round-robining through unrelated ready tasks. The hint is consumed on
-    /// the next pick regardless of whether it was usable.
+    /// round-robining through unrelated ready tasks. Generic IPC hints are
+    /// caller-local handoffs: the most recent eligible receiver replaces any
+    /// older pending IPC hint, because a stale higher-class hint must not block
+    /// the service that the current caller is synchronously waiting on. Spawn
+    /// handoff has its own hint slot and remains protected from IPC replies.
     pub(super) fn set_next_pick_hint(&mut self, task_id: u64) {
         let Some(slot) = self.find_task_slot(task_id) else {
             self.next_pick_hint = None;
             return;
         };
+        if !self.handoff_hint_eligible(slot) {
+            return;
+        }
         self.apply_ipc_donation(slot);
         self.next_pick_hint = Some(slot);
+    }
+
+    pub(super) fn set_next_spawn_pick_hint(&mut self, task_id: u64) {
+        let Some(slot) = self.find_task_slot(task_id) else {
+            self.next_spawn_pick_hint = None;
+            return;
+        };
+        let Some(context) = self.contexts[slot] else {
+            self.next_spawn_pick_hint = None;
+            return;
+        };
+        if !context.ready || !self.context_is_schedulable(slot, context) {
+            self.next_spawn_pick_hint = None;
+            return;
+        }
+        self.apply_ipc_donation(slot);
+        self.next_spawn_pick_hint = Some(slot);
+    }
+
+    fn handoff_hint_eligible(&self, slot: usize) -> bool {
+        let Some(context) = self.contexts.get(slot).and_then(|context| *context) else {
+            return false;
+        };
+        context.ready && self.context_is_schedulable(slot, context)
     }
 
     fn apply_ipc_donation(&mut self, target_slot: usize) {
@@ -276,21 +310,36 @@ impl Scheduler {
         {
             return;
         }
-        let donated_floor = current.vruntime_ns.saturating_sub(IPC_DONATION_BONUS_NS);
+        let caller_floor = current.vruntime_ns.saturating_sub(IPC_DONATION_BONUS_NS);
+        let class_floor = self
+            .slot_class(target_slot)
+            .map(|class| {
+                self.min_ready_vruntime_in_class(class)
+                    .saturating_sub(IPC_DONATION_BONUS_NS)
+            })
+            .unwrap_or(caller_floor);
+        let donated_floor = caller_floor.min(class_floor);
         if let Some(target) = self.contexts[target_slot].as_mut() {
             target.vruntime_ns = target.vruntime_ns.min(donated_floor);
         }
     }
 
-    fn take_next_pick_hint_ready_slot(&mut self) -> Option<usize> {
-        let slot = self.next_pick_hint.take()?;
+    fn pick_hint_candidate_slot(&self, hint: Option<usize>) -> Option<usize> {
+        let slot = hint?;
         if slot >= MAX_TASK {
             return None;
         }
-        let context = self.contexts[slot]?;
+        let Some(context) = self.contexts[slot] else {
+            return None;
+        };
         if !context.ready || !self.context_is_schedulable(slot, context) {
             return None;
         }
+        Some(slot)
+    }
+
+    fn pick_hint_ready_slot(&self, hint: Option<usize>) -> Option<usize> {
+        let slot = self.pick_hint_candidate_slot(hint)?;
         // IPC donation must not violate strict class priority. If a class
         // higher than the hint has any ready work, fall through to the
         // regular pick so the hint cannot let a User-class IPC callee bypass
@@ -303,6 +352,38 @@ impl Scheduler {
         {
             return None;
         }
+        Some(slot)
+    }
+
+    fn next_pick_hint_candidate_slot(&self) -> Option<usize> {
+        self.pick_hint_candidate_slot(self.next_pick_hint)
+    }
+
+    fn next_pick_hint_ready_slot(&self) -> Option<usize> {
+        self.pick_hint_ready_slot(self.next_pick_hint)
+    }
+
+    fn take_next_spawn_pick_hint_ready_slot(&mut self) -> Option<usize> {
+        if self.next_spawn_pick_hint.is_some()
+            && self
+                .pick_hint_candidate_slot(self.next_spawn_pick_hint)
+                .is_none()
+        {
+            self.next_spawn_pick_hint = None;
+            return None;
+        }
+        let slot = self.pick_hint_candidate_slot(self.next_spawn_pick_hint)?;
+        self.next_spawn_pick_hint = None;
+        Some(slot)
+    }
+
+    fn take_next_pick_hint_ready_slot(&mut self) -> Option<usize> {
+        if self.next_pick_hint.is_some() && self.next_pick_hint_candidate_slot().is_none() {
+            self.next_pick_hint = None;
+            return None;
+        }
+        let slot = self.next_pick_hint_ready_slot()?;
+        self.next_pick_hint = None;
         Some(slot)
     }
 
@@ -325,6 +406,8 @@ impl Scheduler {
         self.retire_reasons = [None; MAX_TASK];
         self.current_task = ROOT_TASK_SLOT;
         self.pending_reap = false;
+        self.next_pick_hint = None;
+        self.next_spawn_pick_hint = None;
         self.root_idle = false;
         self.scheduler_tick_divisor = main_thread_pit_divisor;
         self.reset_stack_storage(ROOT_TASK_SLOT)
@@ -381,6 +464,12 @@ impl Scheduler {
         }
 
         self.contexts[slot] = None;
+        if self.next_pick_hint == Some(slot) {
+            self.next_pick_hint = None;
+        }
+        if self.next_spawn_pick_hint == Some(slot) {
+            self.next_spawn_pick_hint = None;
+        }
         self.retired[slot] = false;
         self.retire_reasons[slot] = None;
         self.simd_states[slot] = SimdState::new();
@@ -595,6 +684,49 @@ impl Scheduler {
             }
         }
         None
+    }
+
+    fn pick_min_vruntime_excluding(&self, excluded: usize) -> Option<usize> {
+        for class in [SchedClass::System, SchedClass::User, SchedClass::Idle] {
+            if let Some(slot) = self.pick_min_vruntime_in_class_excluding(excluded, class) {
+                return Some(slot);
+            }
+        }
+        None
+    }
+
+    fn pick_min_vruntime_in_class_excluding(
+        &self,
+        excluded: usize,
+        class: SchedClass,
+    ) -> Option<usize> {
+        let mut best: Option<(usize, u64, usize)> = None;
+        for slot in 0..MAX_TASK {
+            if slot == excluded || !self.is_fair_candidate_slot(slot) {
+                continue;
+            }
+            let Some(ctx) = self.contexts[slot] else {
+                continue;
+            };
+            if !ctx.ready || !self.context_is_schedulable(slot, ctx) {
+                continue;
+            }
+            if self.slot_class(slot) != Some(class) {
+                continue;
+            }
+            let distance = (slot + MAX_TASK - excluded) % MAX_TASK;
+            match best {
+                None => best = Some((slot, ctx.vruntime_ns, distance)),
+                Some((_, best_vruntime, best_distance))
+                    if ctx.vruntime_ns < best_vruntime
+                        || (ctx.vruntime_ns == best_vruntime && distance < best_distance) =>
+                {
+                    best = Some((slot, ctx.vruntime_ns, distance));
+                }
+                _ => {}
+            }
+        }
+        best.map(|(slot, _, _)| slot)
     }
 
     /// Picks the schedulable task with the smallest vruntime within a single
@@ -1615,13 +1747,20 @@ impl Scheduler {
         self.last_min_vruntime_ns = self.min_ready_vruntime();
 
         // Pick order:
-        //  1. IPC donation hint (if still ready/schedulable).
-        //  2. CFS-like smallest vruntime among ready tasks.
-        //  3. Root task as the unconditional fallback.
-        // The hint short-circuits CFS only when the donor is hot-handing off a
-        // reply to a specific receiver; otherwise vruntime decides fairness.
-        let hint = self.take_next_pick_hint_ready_slot();
-        let cfs_pick = self.pick_min_vruntime(current_slot);
+        //  1. Spawn handoff hint (if still ready/schedulable).
+        //  2. IPC donation hint (if still ready/schedulable).
+        //  3. CFS-like smallest vruntime among ready tasks.
+        //  4. Root task as the unconditional fallback.
+        // Hints short-circuit CFS only for direct handoff; otherwise vruntime
+        // decides fairness.
+        let spawn_hint = self.take_next_spawn_pick_hint_ready_slot();
+        let hint = spawn_hint.or_else(|| self.take_next_pick_hint_ready_slot());
+        let cfs_pick = if voluntary_yield {
+            self.pick_min_vruntime_excluding(current_slot)
+                .or_else(|| self.pick_min_vruntime(current_slot))
+        } else {
+            self.pick_min_vruntime(current_slot)
+        };
         let (next_idx, ipc_handoff) = match (hint, cfs_pick) {
             (Some(hint_slot), _) => (hint_slot, true),
             (None, Some(slot)) => (slot, false),
@@ -1633,12 +1772,11 @@ impl Scheduler {
         // a slice of at least SCHED_MIN_GRANULARITY_NS, keep current to avoid
         // context-switch ping-pong. This is the same heuristic Linux uses to
         // damp wake-preempt thrash.
-        let next_idx = if ipc_handoff {
+        let next_idx = if ipc_handoff || voluntary_yield {
             next_idx
         } else {
             self.maybe_keep_current(current_slot, next_idx, current_runtime_ns)
         };
-
         if let Some(next) = self.contexts[next_idx] {
             match self.context_validation_error(next_idx, next, next.saved_rsp) {
                 None => {
@@ -1753,7 +1891,6 @@ impl Scheduler {
         if from_slot == to_slot {
             return;
         }
-
         #[cfg(rustos_log_sched_debug)]
         {
             let from_context = self.contexts.get(from_slot).and_then(|context| *context);
@@ -2366,6 +2503,7 @@ impl Scheduler {
         if !context.user_mode {
             return false;
         }
+        let process_id = context.process_id.unwrap_or(0);
 
         let Some(mut stack_state) = context.user_stack else {
             return false;
@@ -2529,6 +2667,21 @@ impl Scheduler {
         true
     }
 
+    /// Cancels a previously armed block when the caller re-checked its wait
+    /// condition and found work available. The task is still executing, so this
+    /// must not mark it blocked.
+    pub(super) fn cancel_block_current_task(&mut self) -> bool {
+        let slot = self.current_task;
+        let Some(context) = self.contexts[slot].as_mut() else {
+            return false;
+        };
+        if slot == ROOT_TASK_SLOT {
+            return false;
+        }
+        context.wake_armed = false;
+        true
+    }
+
     /// Commits a previously armed block. Returns `Some(true)` if the task was
     /// blocked, `Some(false)` if a wake raced us (wake_armed cleared by
     /// `wake_task`) and we should re-check the condition without sleeping,
@@ -2577,10 +2730,18 @@ impl Scheduler {
             .unwrap_or(0);
         let task_id = self.starts[slot].map(|start| start.id);
         let process_id = self.contexts[slot].and_then(|context| context.process_id);
-        let (saved_rsp, user_mode) = match self.contexts[slot] {
-            Some(context) => (context.saved_rsp, context.user_mode),
-            None => return false,
-        };
+        let (saved_rsp, user_mode, was_ready, was_blocked, wake_was_armed) =
+            match self.contexts[slot] {
+                Some(context) => (
+                    context.saved_rsp,
+                    context.user_mode,
+                    context.ready,
+                    context.blocked,
+                    context.wake_armed,
+                ),
+                None => return false,
+            };
+        let already_runnable = was_ready && !was_blocked && !wake_was_armed;
         let invalid_reason = self
             .validate_saved_context(slot, user_mode, saved_rsp)
             .err();
@@ -2609,14 +2770,18 @@ impl Scheduler {
             // observes that a wake raced before the caller actually slept.
             context.wake_armed = false;
             context.blocked = false;
-            context.ready = invalid_reason.is_none();
+            context.ready = invalid_reason.is_none() || already_runnable;
             context.blocked_since_ticks = 0;
-            context.ready_since_ticks = if invalid_reason.is_none() {
-                now_ticks
+            if already_runnable {
+                // Leave ready_since_ticks and vruntime unchanged for tasks
+                // that were already runnable; wake is just a scheduling hint
+                // in this case, not a transition out of sleep.
+            } else if invalid_reason.is_none() {
+                context.ready_since_ticks = now_ticks;
             } else {
-                0
-            };
-            if invalid_reason.is_none() {
+                context.ready_since_ticks = 0;
+            }
+            if invalid_reason.is_none() && !already_runnable {
                 // Bound vruntime to the runqueue floor: prevents
                 // long-blocked tasks from running unimpeded after wake
                 // (which would just shift starvation onto the rest of the
@@ -2624,7 +2789,10 @@ impl Scheduler {
                 // priority via SLEEPER_LATENCY_BONUS_NS.
                 context.vruntime_ns = context.vruntime_ns.max(wake_floor);
             }
-            (context.vruntime_ns, context.ready)
+            (
+                context.vruntime_ns,
+                context.ready && invalid_reason.is_none(),
+            )
         };
 
         if invalid_reason.is_none() && blocked_since_ticks != 0 {

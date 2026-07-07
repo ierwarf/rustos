@@ -514,16 +514,13 @@ pub(crate) fn profile_line(message: &str) {
 }
 
 pub(crate) fn debug_line(message: &str) {
+    let mut line = message.as_bytes().to_vec();
+    line.push(b'\n');
     unsafe {
         let _ = syscall2(
             syscall_abi::SYS_RUSTOS_DEBUG_PRINT as usize,
-            message.as_ptr() as usize,
-            message.len(),
-        );
-        let _ = syscall2(
-            syscall_abi::SYS_RUSTOS_DEBUG_PRINT as usize,
-            b"\n".as_ptr() as usize,
-            1,
+            line.as_ptr() as usize,
+            line.len(),
         );
     }
 }
