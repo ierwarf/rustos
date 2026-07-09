@@ -176,7 +176,6 @@ fn block_current_poll_on_input(fds_ptr: u64, nfds: u64) -> PollInputBlockResult 
         if usb_work + input_work != 0 {
             return PollInputBlockResult::PolledCompletionServiced;
         }
-        return PollInputBlockResult::NoInputInterest;
     }
     let Some(task_id) = multitask::current_task_id() else {
         return PollInputBlockResult::NoInputInterest;
@@ -243,7 +242,12 @@ fn block_current_poll_on_input_until(
         let _ = multitask::commit_block_current_task();
         return PollInputBlockResult::NoInputInterest;
     }
-    crate::arch::rtc::arm_sleep_waiter_until_tick(task_id, deadline_tick);
+    if !crate::arch::rtc::arm_sleep_waiter_until_tick(task_id, deadline_tick) {
+        disarm_input_poll_wait(task_id);
+        let _ = multitask::wake_task(task_id);
+        let _ = multitask::commit_block_current_task();
+        return PollInputBlockResult::BlockedOrRaced;
+    }
     if kernel_io_manager::api::input::event_queue::has_pending_input_events()
         || crate::arch::rtc::ticks() >= deadline_tick
     {

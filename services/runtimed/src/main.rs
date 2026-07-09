@@ -205,10 +205,10 @@ fn main() {
         let mut did_work = false;
         did_work |= session::service_session_endpoint(session_endpoint, &mut state);
         did_work |= spawn::reap_children(&mut state);
-        did_work |= socket::service_listener(&listener, &mut state);
         if state.ui_ready && !state.launch_catalog_loaded {
             did_work |= catalog::load_launch_catalog_into_state(&mut state);
         }
+        did_work |= socket::service_listener(&listener, &mut state);
         did_work |= socket::ensure_policy_launches(&mut state);
         if did_work {
             continue;

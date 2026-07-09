@@ -116,8 +116,16 @@ pub(super) fn deliver_pending_signals_if_needed(frame: &mut SyscallFrame) -> boo
         PROCD_SELECT_SIGNAL_TERMINATE => {
             clear_current_pending_signal(signal);
             if let Some(process_id) = multitask::current_user_process_id() {
+                let last_thread = multitask::current_user_process_thread_count().unwrap_or(1) <= 1;
                 let wait_status = signal as i32;
-                let _ = multitask::note_process_exit_status(process_id, wait_status);
+                if last_thread {
+                    ipc_ops::cleanup_service_endpoints_for_process(process_id);
+                    let _ = multitask::note_process_exit_status(process_id, wait_status);
+                    let parent = multitask::parent_process_id_of(process_id).unwrap_or(0);
+                    if parent != 0 {
+                        multitask::queue_linux_signal(parent, parent, linux_abi::SIGCHLD as u64);
+                    }
+                }
             }
             let _ = multitask::exit_current_user_task();
         }

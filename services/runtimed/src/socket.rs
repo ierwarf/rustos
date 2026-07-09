@@ -119,6 +119,9 @@ pub(super) fn service_listener(listener: &UnixListener, state: &mut BrokerState)
                         },
                     );
                 }
+                if state.ui_ready && !state.launch_catalog_loaded {
+                    break;
+                }
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(err) => {

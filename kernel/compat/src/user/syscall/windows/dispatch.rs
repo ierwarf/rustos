@@ -17,6 +17,13 @@ use rustos_user_abi::syscall::{
 use super::super::SyscallFrame;
 use super::Api;
 
+const WIN32_ERROR_INVALID_FUNCTION: u32 = 1;
+const WIN32_ERROR_INVALID_HANDLE: u32 = 6;
+const WIN32_ERROR_INVALID_PARAMETER: u32 = 87;
+const STATUS_INVALID_HANDLE: u64 = 0xc000_0008;
+const STATUS_INVALID_PARAMETER: u64 = 0xc000_000d;
+const STATUS_INVALID_SYSTEM_SERVICE: u64 = 0xc000_001c;
+
 pub(crate) fn dispatch_syscall(frame: &mut SyscallFrame) -> u64 {
     let api = match syscall_check(frame) {
         Ok(api) => api,
@@ -49,11 +56,24 @@ pub(crate) fn dispatch_syscall(frame: &mut SyscallFrame) -> u64 {
                 || response.op != request.op
                 || response.reserved0 != 0
             {
-                return 0;
+                return STATUS_INVALID_SYSTEM_SERVICE;
             }
-            response.result
+            if response.status == 0 {
+                response.result
+            } else {
+                policy_status_to_ntstatus(response.status)
+            }
         }
-        _ => 0,
+        _ => STATUS_INVALID_SYSTEM_SERVICE,
+    }
+}
+
+fn policy_status_to_ntstatus(status: u32) -> u64 {
+    match status {
+        WIN32_ERROR_INVALID_FUNCTION => STATUS_INVALID_SYSTEM_SERVICE,
+        WIN32_ERROR_INVALID_HANDLE => STATUS_INVALID_HANDLE,
+        WIN32_ERROR_INVALID_PARAMETER => STATUS_INVALID_PARAMETER,
+        _ => STATUS_INVALID_PARAMETER,
     }
 }
 

@@ -702,6 +702,10 @@ fn consume_netd_response_payload(
     }
     match request.op {
         SYSCALL_OFFLOAD_OP_LINUX_RECVFROM => {
+            let max_len = usize::try_from(request.arg2).map_err(|_| LINUX_EINVAL)?;
+            if payload_len > max_len {
+                return Err(LINUX_EINVAL);
+            }
             if payload_len != 0 {
                 usermem::write_current_user_bytes(request.arg1, &response.payload[..payload_len])
                     .map_err(address_space_error_to_linux_errno)?;

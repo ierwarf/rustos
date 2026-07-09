@@ -216,8 +216,7 @@ pub(crate) fn submit_hid_raw_report_from_descriptor(
         record_hid_pointer_report_gap();
         HID_POINTER_REPORT_COUNT.fetch_add(1, Ordering::Relaxed);
     }
-    let _ = crate::input::event_queue::submit_hid_raw_report(raw_report);
-    true
+    crate::input::event_queue::submit_hid_raw_report(raw_report)
 }
 
 pub(crate) fn control_msg(

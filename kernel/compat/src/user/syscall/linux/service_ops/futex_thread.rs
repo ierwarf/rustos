@@ -295,23 +295,51 @@ fn futex_wait(uaddr: u64, expected: u32, timeout_ptr: u64, bitset: u32) -> Resul
     if timeout_ptr != 0 {
         return Err(LINUX_ENOSYS);
     }
-    let actual =
-        usermem::read_current_user_u32(uaddr).map_err(address_space_error_to_linux_errno)?;
-    if actual != expected {
-        return Err(LINUX_EAGAIN);
-    }
     let (task_id, mut key) = current_futex_waiter_context()?;
     key.uaddr = uaddr;
-    register_futex_waiter(FutexWaiter {
+    if !multitask::arm_block_current_task() {
+        return Err(LINUX_ENOSYS);
+    }
+    let actual = match usermem::read_current_user_u32(uaddr) {
+        Ok(actual) => actual,
+        Err(err) => {
+            let _ = multitask::cancel_block_current_task();
+            return Err(address_space_error_to_linux_errno(err));
+        }
+    };
+    if actual != expected {
+        let _ = multitask::cancel_block_current_task();
+        return Err(LINUX_EAGAIN);
+    }
+    if let Err(errno) = register_futex_waiter(FutexWaiter {
         key,
         task_id,
         bitset,
-    })?;
-    if !multitask::block_current_user_task() {
-        clear_futex_waiter(task_id, key);
-        return Err(LINUX_ENOSYS);
+    }) {
+        let _ = multitask::cancel_block_current_task();
+        return Err(errno);
     }
-    multitask::yield_now();
+    let actual = match usermem::read_current_user_u32(uaddr) {
+        Ok(actual) => actual,
+        Err(err) => {
+            clear_futex_waiter(task_id, key);
+            let _ = multitask::cancel_block_current_task();
+            return Err(address_space_error_to_linux_errno(err));
+        }
+    };
+    if actual != expected {
+        clear_futex_waiter(task_id, key);
+        let _ = multitask::cancel_block_current_task();
+        return Err(LINUX_EAGAIN);
+    }
+    match multitask::commit_block_current_task() {
+        Some(true) => multitask::yield_now(),
+        Some(false) => {}
+        None => {
+            clear_futex_waiter(task_id, key);
+            return Err(LINUX_EINVAL);
+        }
+    }
     clear_futex_waiter(task_id, key);
     Ok(0)
 }

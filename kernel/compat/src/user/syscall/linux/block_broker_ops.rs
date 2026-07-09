@@ -18,7 +18,7 @@ pub(super) fn syscall_linux_rustos_block_broker(args_ptr: u64) -> u64 {
         Ok(args) => args,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
     };
-    if args.abi_version != BLOCK_BROKER_ABI_VERSION {
+    if args.abi_version != BLOCK_BROKER_ABI_VERSION || args.reserved0 != 0 {
         return linux_errno(LINUX_EINVAL);
     }
 

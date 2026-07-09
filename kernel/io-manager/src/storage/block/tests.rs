@@ -244,3 +244,51 @@ fn physical_boot_opener_matches_superfloppy_identity() {
 
     assert!(open_physical_boot_block_device(identity).is_ok());
 }
+
+#[test]
+fn empty_identity_fallback_selects_only_unique_fat_partition() {
+    let _guard = TEST_LOCK.lock();
+    reset_for_tests();
+
+    let start_lba = 8;
+    let sectors = 16;
+    register_root_device(Box::new(MockBlockDevice::with_fat_partition(
+        start_lba,
+        sectors,
+        0x1234_5678,
+        false,
+    )));
+
+    let handle = super::boot::open_unique_fat_boot_handle().expect("unique FAT boot handle");
+    let descriptor = descriptors()
+        .into_iter()
+        .find(|descriptor| descriptor.id == handle.id())
+        .expect("selected descriptor");
+    assert_eq!(descriptor.path, "/dev/block0p1");
+    assert_eq!(descriptor.start_block, start_lba as u64);
+    assert_eq!(descriptor.block_count, sectors as u64);
+}
+
+#[test]
+fn empty_identity_fallback_rejects_ambiguous_fat_partitions() {
+    let _guard = TEST_LOCK.lock();
+    reset_for_tests();
+
+    register_root_device(Box::new(MockBlockDevice::with_fat_partition(
+        8,
+        16,
+        0x1234_5678,
+        false,
+    )));
+    register_root_device(Box::new(MockBlockDevice::with_fat_partition(
+        4,
+        8,
+        0x8765_4321,
+        false,
+    )));
+
+    assert!(matches!(
+        super::boot::open_unique_fat_boot_handle(),
+        Err(DiskIoError::InvalidInput)
+    ));
+}

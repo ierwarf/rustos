@@ -457,8 +457,12 @@ fn block_current_user_until(target: u64) -> bool {
         if !crate::hooks::block_current_user_task() {
             return false;
         }
-        register_sleep_waiter(task_id, target);
-        true
+        if register_sleep_waiter(task_id, target) {
+            true
+        } else {
+            let _ = crate::hooks::wake_user_task(task_id);
+            false
+        }
     });
     if !blocked {
         return false;
@@ -468,19 +472,22 @@ fn block_current_user_until(target: u64) -> bool {
     true
 }
 
-fn register_sleep_waiter(task_id: u64, wake_tick: u64) {
+fn register_sleep_waiter(task_id: u64, wake_tick: u64) -> bool {
     let mut waiters = RTC_SLEEP_WAITERS.lock();
-    if !waiters.insert_or_update(SleepWaiter { task_id, wake_tick }) {
+    if waiters.insert_or_update(SleepWaiter { task_id, wake_tick }) {
+        true
+    } else {
         crate::debug::println!(
             "rtc sleep waiter table full: task={} wake_tick={}",
             task_id,
             wake_tick
         );
+        false
     }
 }
 
-pub fn arm_sleep_waiter_until_tick(task_id: u64, wake_tick: u64) {
-    register_sleep_waiter(task_id, wake_tick);
+pub fn arm_sleep_waiter_until_tick(task_id: u64, wake_tick: u64) -> bool {
+    register_sleep_waiter(task_id, wake_tick)
 }
 
 pub fn disarm_sleep_waiter(task_id: u64) {

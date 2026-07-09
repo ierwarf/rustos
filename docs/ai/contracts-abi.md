@@ -32,8 +32,10 @@ Endpoints registered via `SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT`, looked up b
 The kernel compat service table records low-volume structured milestones for
 endpoint lifecycle transitions: `ipc-service-register`,
 `ipc-service-register-denied`, `ipc-service-register-busy`,
-`ipc-service-revoke`, and `ipc-service-exit-revoke`. These are diagnostic
-state only; rootd remains the service admission and capability policy owner.
+`ipc-service-revoke`, `ipc-service-revoke-denied`, and
+`ipc-service-exit-revoke`. These are diagnostic state only; rootd remains the
+service admission and capability policy owner. Endpoint revoke is owner-only
+unless the caller holds `ROOT_SUPERVISOR`.
 `SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT` is service/supervisor discovery: root-supervisor callers may use the kernel table directly; other callers are admitted through rootd `COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP`. Core services and post-init services are admitted only by matching a running rootd lease. Generic apps use Linux/Win32 ABI routes and kernel compat helpers, not raw policy-service endpoint lookup.
 Service capability assignment is rootd policy: after rootd self-registration, kernel compat asks `COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY` with the registering subject PID/TID and records the returned `IPC_SERVICE_CAP_*` mask only if rootd confirms the PID matches the running lease. This includes the legacy Linux-syscall endpoint registration path. Do not reintroduce a full `service_id -> capability` table in ring0.
 Post-init lease reporting is ring3-owned: `initd` reports successfully spawned
@@ -356,7 +358,7 @@ Kernel keeps only: user-copy, address-space replacement, scheduler mutation, pen
   Ring0 keeps only current-task user-copy plus RTC/tick sleep and clock
   substrate.
 - Linux `memfd_create`: policy validation in syscalld; kernel performs handle install + read/write/truncate/seal (current handles, user memory).
-- Windows syscall policy: `Win32SyscallOffloadRequest`/`Response` + `SYSCALL_OFFLOAD_OP_WIN32_*` range. Kernel dispatcher calls service policy first, then performs only the narrow privileged action.
+- Windows syscall policy: `Win32SyscallOffloadRequest`/`Response` + `SYSCALL_OFFLOAD_OP_WIN32_*` range. Kernel dispatcher calls service policy first, validates ABI/status, and must fail closed with a non-success NTSTATUS on malformed or denied responses before performing only the narrow privileged action.
 
 ## Commercial-Max Protocol
 
@@ -393,4 +395,4 @@ Kernel keeps only: user-copy, address-space replacement, scheduler mutation, pen
   strict System/User/Idle band ordering.
 - `.ko` module init runs as a user-service kernel frame. Long lock-free compat callbacks (`driver_register`, HID/USB/virtio probes) must call `cond_resched` at safe points so module init does not starve ready user tasks.
 - `KernelSpinLock` must not be held across disk/filesystem/IPC/framebuffer-copy loops. Use `KernelWaitLock` or split the section; add `cond_resched` in long loops.
-- Boot service order: driver/input policy services before UI launchers. `runtimed` waits on `devmgrd` endpoint before UI bootstrap.
+- Boot service order: driver/input/storage policy services before UI launchers. `runtimed` waits on `devmgrd` and `storaged` endpoints before UI bootstrap.

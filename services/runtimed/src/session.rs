@@ -36,6 +36,7 @@ const INPUT_BUFFER_CAPACITY: usize = 1024;
 const EDIT_BUFFER_CAPACITY: usize = 256;
 const OUTPUT_BUFFER_CAPACITY: usize = 4096;
 const SERVICE_ENDPOINT_READY_ATTEMPTS: u32 = 4096;
+const SERVICE_ENDPOINT_REGISTER_ATTEMPTS: u32 = 65_536;
 
 #[derive(Default)]
 pub(crate) struct SessionRuntime {
@@ -413,21 +414,43 @@ pub(super) fn create_session_endpoint() -> Option<u64> {
         super::spawn::stderr_line("runtimed: session endpoint create failed");
         return None;
     }
-    let register = unsafe {
-        libc::syscall(
-            SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT as libc::c_long,
-            IPC_SERVICE_SESSIOND,
-            endpoint as u64,
-        ) as i64
-    };
+    let register = register_service_endpoint(IPC_SERVICE_SESSIOND, endpoint as u64);
     if register < 0 {
-        super::spawn::stderr_line("runtimed: session endpoint register failed");
+        super::spawn::stderr_line(
+            format!(
+                "runtimed: session endpoint register failed errno={}",
+                -register
+            )
+            .as_str(),
+        );
         return None;
     }
     super::spawn::stderr_line(
         format!("runtimed: session policy endpoint registered endpoint={endpoint}").as_str(),
     );
     Some(endpoint as u64)
+}
+
+fn register_service_endpoint(service_id: u64, endpoint: u64) -> i64 {
+    let mut last = 0;
+    for _ in 0..SERVICE_ENDPOINT_REGISTER_ATTEMPTS {
+        last = unsafe {
+            libc::syscall(
+                SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT as libc::c_long,
+                service_id,
+                endpoint,
+            ) as i64
+        };
+        if last >= 0 {
+            return last;
+        }
+        let errno = (-last) as i32;
+        if errno != libc::EACCES && errno != libc::EPERM && errno != libc::ENOENT {
+            return last;
+        }
+        std::thread::yield_now();
+    }
+    last
 }
 
 pub(super) fn service_session_endpoint(endpoint: Option<u64>, state: &mut BrokerState) -> bool {

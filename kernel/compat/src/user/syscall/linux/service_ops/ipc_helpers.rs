@@ -399,6 +399,9 @@ pub fn should_try_devmgrd_open(path: &str) -> bool {
 pub fn current_input_device_access(fd: u64) -> Option<(u16, u64)> {
     multitask::with_current_user_process_state(|_, _, process_state| {
         let entry = process_state.handles().get_entry(fd)?;
+        if !entry.rights().allows_read() {
+            return None;
+        }
         let handle = entry.handle();
         let device = handle.device_handle()?;
         if device.device_id() != kernel_object::api::device::DeviceId::Input {

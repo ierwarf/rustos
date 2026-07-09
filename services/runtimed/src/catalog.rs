@@ -13,6 +13,7 @@ pub(super) fn load_launch_catalog_into_state(state: &mut BrokerState) -> bool {
     if state.launch_catalog_loaded {
         return false;
     }
+    super::spawn::stderr_line("runtimed: launch catalog load begin");
     boot_line("runtimed: launch catalog load begin");
     let started_at = Instant::now();
     let (programs, launch_entries) = load_launch_catalog();
@@ -34,9 +35,18 @@ pub(super) fn load_launch_catalog_into_state(state: &mut BrokerState) -> bool {
         )
         .as_str(),
     );
+    super::spawn::stderr_line(
+        format!(
+            "runtimed: launch catalog summary programs={} policies={}",
+            programs.len(),
+            launch_entries.len()
+        )
+        .as_str(),
+    );
     state.programs = programs;
     state.launch_entries = launch_entries;
     state.launch_catalog_loaded = true;
+    super::spawn::stderr_line("runtimed: launch catalog load done");
     boot_line("runtimed: launch catalog load done");
     true
 }

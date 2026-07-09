@@ -443,7 +443,7 @@ fn build_process_bootstrap(
 }
 
 // PE header validation, image-base selection, and Windows runtime metadata
-// derivation now live in `loaderd` (see `load_pe_image_fd`). Procd populates
+// derivation now live in `loaderd` (see `load_pe_image_fd`). Loaderd populates
 // `windows_runtime` via PROC_BROKER_OP_SET_WINDOWS_RUNTIME, and ring0 only
 // consumes the prepared metadata in `prepare_windows_process_with_address_space`.
 

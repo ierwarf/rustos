@@ -293,6 +293,24 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
         endpoint
     );
     if endpoint == 0 {
+        let owner = SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire);
+        let registered_endpoint = SERVICE_ENDPOINTS[index].load(Ordering::Acquire);
+        if owner == 0 && registered_endpoint == 0 {
+            return 0;
+        }
+        if owner != process_id
+            && !current_process_has_service_capability(
+                rustos_user_abi::syscall::IPC_SERVICE_CAP_ROOT_SUPERVISOR,
+            )
+        {
+            record_service_endpoint_milestone(
+                "ipc-service-revoke-denied",
+                service_id,
+                process_id,
+                LINUX_EPERM as u64,
+            );
+            return linux_errno(LINUX_EPERM);
+        }
         SERVICE_ENDPOINTS[index].store(0, Ordering::Release);
         SERVICE_ENDPOINT_OWNERS[index].store(0, Ordering::Release);
         SERVICE_ENDPOINT_CAPS[index].store(0, Ordering::Release);
@@ -339,8 +357,7 @@ fn service_capability(service_id: u64) -> Result<u64, i64> {
     match service_capability_via_rootd(service_id) {
         Ok(capability) => Ok(capability),
         Err(_) if service_id == linux_abi::IPC_SERVICE_ROOTD => {
-            Ok(rustos_user_abi::syscall::IPC_SERVICE_CAP_ROOT_SUPERVISOR
-                | rustos_user_abi::syscall::IPC_SERVICE_CAP_PROCESS_POLICY)
+            Ok(rustos_user_abi::syscall::IPC_SERVICE_CAP_ROOT_SUPERVISOR)
         }
         Err(errno) => Err(errno),
     }
@@ -1234,7 +1251,11 @@ fn wait_for_reply_with_deadline(
             cancel_deadline_reply(reply, caller_task_id);
             return Err(LINUX_EINVAL);
         }
-        arm_reply_deadline_waiter(caller_task_id, deadline_tick);
+        if !arm_reply_deadline_waiter(caller_task_id, deadline_tick) {
+            let _ = multitask::cancel_block_current_task();
+            multitask::yield_now();
+            continue;
+        }
         // Re-poll after arming. If the replier completed the response between our
         // first take and arming, the wake_task call landed before arm_block, so
         // wake_armed would be set but no further wake arrives; re-checking the
@@ -1296,9 +1317,11 @@ fn reply_deadline_expired(deadline_tick: Option<u64>) -> bool {
     deadline_tick.is_some_and(|deadline_tick| crate::arch::rtc::ticks() >= deadline_tick)
 }
 
-fn arm_reply_deadline_waiter(task_id: Option<u64>, deadline_tick: Option<u64>) {
+fn arm_reply_deadline_waiter(task_id: Option<u64>, deadline_tick: Option<u64>) -> bool {
     if let (Some(task_id), Some(deadline_tick)) = (task_id, deadline_tick) {
-        crate::arch::rtc::arm_sleep_waiter_until_tick(task_id, deadline_tick);
+        crate::arch::rtc::arm_sleep_waiter_until_tick(task_id, deadline_tick)
+    } else {
+        true
     }
 }
 

@@ -4,7 +4,9 @@
 use alloc::vec::Vec;
 use boot_protocol::BootVolumeIdentity;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use storage_core::{BootVolumeLocator, PartitionInfo as SharedPartitionInfo};
+use storage_core::{
+    BlockDevice, BlockSlice, BootVolumeLocator, PartitionInfo as SharedPartitionInfo,
+};
 
 use super::{
     BLOCK_DEVICES, BlockDeviceHandle, DiskIoError, IoResult, descriptor_without_init, io, registry,
@@ -131,6 +133,56 @@ pub(super) fn open_physical_boot_handle(
     Err(DiskIoError::NotPresent)
 }
 
+pub(super) fn open_unique_fat_boot_handle() -> IoResult<BlockDeviceHandle> {
+    super::ensure_initialized();
+    let mut selected = None;
+    let root_ids = {
+        let devices = BLOCK_DEVICES.lock();
+        registry::root_device_ids_locked(&devices)
+    };
+    crate::debug::println_fmt(format_args!(
+        "storage: empty boot identity fallback roots={}",
+        root_ids.len()
+    ));
+
+    for root_id in root_ids {
+        let Some(descriptor) = descriptor_without_init(BlockDeviceHandle::new(root_id)) else {
+            continue;
+        };
+        let mut root = RegistryRootBlockDevice {
+            root_id,
+            logical_block_size: descriptor.logical_block_size,
+            block_count: descriptor.block_count,
+        };
+        let partitions = candidate_partitions(&mut root)?;
+        crate::debug::println_fmt(format_args!(
+            "storage: empty boot identity candidate id={} path={} partitions={}",
+            root_id,
+            descriptor.path,
+            partitions.len()
+        ));
+        for partition in partitions {
+            if !partition_has_fat_boot_sector(&mut root, partition)? {
+                continue;
+            }
+            let Some(handle) = find_device_handle_for_partition(root_id, partition) else {
+                continue;
+            };
+            crate::debug::println_fmt(format_args!(
+                "storage: empty boot identity FAT candidate handle={} start_lba={} sectors={}",
+                handle.id(),
+                partition.start_lba,
+                partition.block_count
+            ));
+            if selected.replace(handle).is_some() {
+                return Err(DiskIoError::InvalidInput);
+            }
+        }
+    }
+
+    selected.ok_or(DiskIoError::NotPresent)
+}
+
 fn find_device_handle_for_partition(
     root_id: u32,
     partition: SharedPartitionInfo,
@@ -157,6 +209,21 @@ fn candidate_partitions(root: &mut RegistryRootBlockDevice) -> IoResult<Vec<Shar
         });
     }
     Ok(partitions)
+}
+
+fn partition_has_fat_boot_sector(
+    root: &mut RegistryRootBlockDevice,
+    partition: SharedPartitionInfo,
+) -> IoResult<bool> {
+    let mut slice = BlockSlice::new(&mut *root, partition.start_lba, partition.block_count)?;
+    let block_size = slice.logical_block_size();
+    if block_size < 512 {
+        return Err(DiskIoError::InvalidInput);
+    }
+    let mut boot_sector = Vec::new();
+    boot_sector.resize(block_size, 0);
+    slice.read_blocks(0, &mut boot_sector)?;
+    Ok(storage_core::fat_volume_id_from_boot_sector(&boot_sector).is_some())
 }
 
 pub(super) fn detect_partitions(root_id: u32) -> IoResult<Vec<SharedPartitionInfo>> {

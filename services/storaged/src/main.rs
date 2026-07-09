@@ -40,8 +40,10 @@ const NVME_POLICY_MAX_NAMESPACES: u32 = 1;
 
 fn main() {
     observability_client::info!("storaged", service, "service started");
+    debug_line("storaged: endpoint create begin");
     let endpoint = syscall0(SYS_RUSTOS_IPC_ENDPOINT_CREATE);
     if endpoint < 0 {
+        debug_line("storaged: endpoint create failed");
         let _ = writeln!(
             std::io::stderr(),
             "storaged: endpoint create failed errno={}",
@@ -49,8 +51,11 @@ fn main() {
         );
         return;
     }
+    debug_line("storaged: endpoint create done");
+    debug_line("storaged: endpoint register begin");
     let register = register_service_endpoint(IPC_SERVICE_STORAGED, endpoint as u64);
     if register < 0 {
+        debug_line(format!("storaged: endpoint register failed errno={}", -register).as_str());
         let _ = writeln!(
             std::io::stderr(),
             "storaged: endpoint register failed errno={}",

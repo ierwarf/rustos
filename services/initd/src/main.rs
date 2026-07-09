@@ -294,8 +294,8 @@ fn init_exec_priority(exec: &str) -> u8 {
         NETD_EXEC_PATH => 4,
         DEVMGRD_EXEC_PATH => 5,
         INPUTD_EXEC_PATH => 6,
-        RUNTIMED_EXEC_PATH => 7,
-        STORAGED_EXEC_PATH => 8,
+        STORAGED_EXEC_PATH => 7,
+        RUNTIMED_EXEC_PATH => 8,
         _ => 9,
     }
 }
@@ -312,9 +312,13 @@ fn launch_gate_satisfied(exec: &str) -> bool {
                 && service_ready(IPC_SERVICE_NETD)
                 && service_ready(rustos_user_abi::syscall::IPC_SERVICE_DEVMGRD)
                 && service_ready(rustos_user_abi::syscall::IPC_SERVICE_INPUTD)
+                && service_ready(IPC_SERVICE_STORAGED)
         }
         STORAGED_EXEC_PATH => {
-            foundation_policy_services_ready() && service_ready(IPC_SERVICE_SESSIOND)
+            foundation_policy_services_ready()
+                && service_ready(IPC_SERVICE_NETD)
+                && service_ready(rustos_user_abi::syscall::IPC_SERVICE_DEVMGRD)
+                && service_ready(rustos_user_abi::syscall::IPC_SERVICE_INPUTD)
         }
         _ => foundation_policy_services_ready(),
     }
@@ -425,7 +429,7 @@ fn wait_reported_service_endpoint(exec_path: &str) -> Result<(), i32> {
                 status_text
             ));
         }
-        thread::yield_now();
+        thread::sleep(POLL_INTERVAL);
     }
     Err(libc::ETIMEDOUT)
 }
@@ -610,6 +614,9 @@ fn spawn_exec_via_loaderd(exec_path: &str, env: &[CString]) -> Result<i32, i32> 
     let request = build_loader_spawn_request(exec_path, &argv, env)?;
     let endpoint = lookup_loader_endpoint()?;
     let mut response = LoaderSpawnResponse::default();
+    boot_line(&format!(
+        "initd: loader call begin exec={exec_path} endpoint={endpoint}"
+    ));
     let call = unsafe {
         libc::syscall(
             SYS_RUSTOS_IPC_CALL as libc::c_long,

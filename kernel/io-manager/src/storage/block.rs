@@ -106,6 +106,10 @@ pub fn current_boot_volume_handle() -> Option<BlockDeviceHandle> {
         if let Ok(handle) = boot::open_physical_boot_handle(identity) {
             return Some(cache_boot_volume_handle(handle));
         }
+    } else if crate::storage::boot_volume::boot_volume_transport_hint().is_some() {
+        if let Ok(handle) = boot::open_unique_fat_boot_handle() {
+            return Some(cache_boot_volume_handle(handle));
+        }
     }
     None
 }

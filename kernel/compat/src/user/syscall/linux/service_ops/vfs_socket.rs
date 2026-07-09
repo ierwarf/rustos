@@ -93,9 +93,6 @@ pub fn syscall_linux_vfs_close(fd: u64) -> u64 {
 }
 
 pub fn syscall_linux_vfs_dup(oldfd: u64, newfd: u64, flags: u64, mode: VfsDupMode) -> u64 {
-    if matches!(mode, VfsDupMode::Dup2) && oldfd == newfd {
-        return oldfd;
-    }
     if matches!(mode, VfsDupMode::Dup3) && (oldfd == newfd || flags & !linux_abi::O_CLOEXEC != 0) {
         return linux_errno(LINUX_EINVAL);
     }
@@ -104,6 +101,9 @@ pub fn syscall_linux_vfs_dup(oldfd: u64, newfd: u64, flags: u64, mode: VfsDupMod
     let remote = current_remote_vfs_handle(oldfd);
     if socket_token.is_none() && remote.is_none() && !current_fd_exists(oldfd) {
         return linux_errno(LINUX_EBADF);
+    }
+    if matches!(mode, VfsDupMode::Dup2) && oldfd == newfd {
+        return oldfd;
     }
 
     let close_on_exec = flags & linux_abi::O_CLOEXEC != 0;

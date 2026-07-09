@@ -286,6 +286,7 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> HandledLoade
             return spawn_response(response);
         }
     };
+    debug_line(&format!("loaderd: spawn begin exec={exec_path}"));
     let mut path_buf = MaybeUninit::<[u8; LOADER_SPAWN_EXEC_PATH_CAPACITY + 1]>::uninit();
     let path_ptr = path_buf.as_mut_ptr().cast::<u8>();
     for (index, byte) in exec_path.as_bytes().iter().copied().enumerate() {
@@ -298,6 +299,7 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> HandledLoade
         response.status = -fd;
         return spawn_response(response);
     }
+    debug_line(&format!("loaderd: open done exec={exec_path}"));
     let executable_format = match validate_executable_fd(fd) {
         Ok(format) => format,
         Err(errno) => {
@@ -375,6 +377,7 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> HandledLoade
             return spawn_response(response);
         }
     };
+    debug_line(&format!("loaderd: map done exec={exec_path}"));
     cooperate_after_spawn_step();
     if let Some(ref result) = prepared.linux_runtime {
         if let Err(errno) = set_linux_runtime_broker(prepare_handle as u64, result) {
@@ -403,6 +406,7 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> HandledLoade
     }
 
     cooperate_after_spawn_step();
+    debug_line(&format!("loaderd: commit begin exec={exec_path}"));
     let pid = commit_prepared_executable(
         operation,
         request,
@@ -419,6 +423,7 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> HandledLoade
         return spawn_response(response);
     }
     response.pid = pid;
+    debug_line(&format!("loaderd: spawn done exec={exec_path} pid={pid}"));
     HandledLoaderRequest {
         reply: LoaderReply::Spawn(response),
         cleanup_fds: prepared.cleanup_fds,

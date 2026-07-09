@@ -576,6 +576,12 @@ fn reply_commercial_max_request(
         value0: leases.len() as u64,
         ..CommercialMaxProtocolResponse::default()
     };
+    if request.header.op == COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL {
+        debug_line(b"rootd: readiness request received\n");
+    }
+    if request.header.op == COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY {
+        debug_line(b"rootd: service capability request received\n");
+    }
     response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
     response.status = match validate_commercial_max_request(request, sender) {
         Ok(()) => match fill_commercial_max_response(
@@ -605,8 +611,20 @@ fn reply_commercial_max_request(
     if request.header.op == COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL && replied < 0 {
         debug_line(b"rootd: readiness reply failed\n");
     }
+    if request.header.op == COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL
+        && response.status == 0
+        && replied >= 0
+    {
+        debug_line(b"rootd: readiness replied ok\n");
+    }
     if request.header.op == COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY && replied < 0 {
         debug_line(b"rootd: service capability reply failed\n");
+    }
+    if request.header.op == COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY
+        && response.status == 0
+        && replied >= 0
+    {
+        debug_line(b"rootd: service capability replied ok\n");
     }
 }
 
