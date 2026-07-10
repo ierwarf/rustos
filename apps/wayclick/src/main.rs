@@ -53,7 +53,7 @@ fn raw_debug_write(buffer: &[u8]) -> Result<usize, i32> {
 }
 
 fn syscall_usize(result: isize) -> Result<usize, i32> {
-    if result < 0 && result >= -4095 {
+    if (-4095..0).contains(&result) {
         return Err((-result) as i32);
     }
     usize::try_from(result).map_err(|_| 22)

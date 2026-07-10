@@ -535,8 +535,10 @@ fn write_application_desktop_files(config: &Config, manifests: &[PackageManifest
                 name = desktop_value(&entry.display_name)?,
                 exec_line = desktop_exec_line(&argv)?,
                 terminal = desktop_bool(entry.console_hosted),
-                no_display =
-                    desktop_bool(manifest.kind == crate::package_manifest::PackageKind::Service),
+                no_display = desktop_bool(
+                    manifest.kind == crate::package_manifest::PackageKind::Service
+                        || entry.no_display,
+                ),
                 desktop_id = desktop_value(&desktop_file_id)?,
                 package_id = desktop_value(&manifest.id)?,
                 startup = desktop_startup_mode(manifest.startup),
@@ -582,11 +584,11 @@ fn write_desktop_registry(config: &Config, manifests: &[PackageManifest]) -> Res
             let desktop_id = desktop_file_id(manifest, index);
             let image = entry.image.as_deref().unwrap_or(&manifest.install.path);
             let exec = entry.exec.as_deref().unwrap_or(image);
-            let args = if entry.args.is_empty() {
+            let args = runtime_launch_args(config, manifest, entry, exec);
+            let args = if args.is_empty() {
                 String::new()
             } else {
-                entry
-                    .args
+                args
                     .iter()
                     .map(|arg| registry_value(arg))
                     .collect::<Result<Vec<_>>>()?
@@ -608,7 +610,8 @@ fn write_desktop_registry(config: &Config, manifests: &[PackageManifest]) -> Res
                 DesktopLaunchMode::AllSessions => "all-sessions",
             };
             let startup = desktop_startup_mode(manifest.startup);
-            let no_display = manifest.kind == crate::package_manifest::PackageKind::Service;
+            let no_display = manifest.kind == crate::package_manifest::PackageKind::Service
+                || entry.no_display;
             let autostart_enabled = desktop_autostart_enabled(config, &desktop_id)?;
             let deps = registry_deps(&manifest.runtime_deps)?;
             lines.push(format!(
@@ -678,7 +681,8 @@ fn write_runtime_launch_registry(config: &Config, manifests: &[PackageManifest])
                 DesktopLaunchMode::NewSession => "new-session",
                 DesktopLaunchMode::AllSessions => "all-sessions",
             };
-            let no_display = manifest.kind == crate::package_manifest::PackageKind::Service;
+            let no_display = manifest.kind == crate::package_manifest::PackageKind::Service
+                || entry.no_display;
             let deps = registry_deps(&manifest.runtime_deps)?;
             lines.push(format!(
                 "desktop_id={}\tpackage_id={}\tstartup={}\tdisplay_name={}\timage={}\texec={}\tweight={}\tlogical_admin={}\tconsole_hosted={}\tterminal={}\thidden=0\tno_display={}\tautostart_enabled={}\tlaunch={}\tdeps={}\targs={}\tenv={}",

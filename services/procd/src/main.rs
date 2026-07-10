@@ -7,6 +7,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::mem::size_of;
+#[cfg(not(test))]
 use core::panic::PanicInfo;
 
 use rustos_svc_runtime::ipc;
@@ -62,6 +63,7 @@ static THREAD_SIGNAL_POLICY: Mutex<BTreeMap<(u64, u64), ThreadSignalPolicy>> =
 
 rustos_svc_runtime::entry!(service_main);
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
     loop {}
@@ -109,12 +111,15 @@ fn serve(endpoint: u64) {
         }
 
         drain_counter = drain_counter.wrapping_add(1);
-        if drain_counter % 16 == 0 {
+        if drain_counter.is_multiple_of(16) {
             drain_lifecycle_events();
         }
     }
 }
 
+// The reply is written directly to the IPC buffer and must not be boxed:
+// rustos-svc-runtime's bootstrap allocator is bump-only during early boot.
+#[allow(clippy::large_enum_variant)]
 enum ProcdReply {
     Ipc(ProcdIpcResponse),
     Commercial(CommercialMaxProtocolResponse),

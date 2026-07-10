@@ -4,6 +4,7 @@
 extern crate alloc;
 
 use core::mem::size_of;
+#[cfg(not(test))]
 use core::panic::PanicInfo;
 
 use rustos_svc_runtime::ipc;
@@ -37,9 +38,7 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_OP_LINUX_UMASK, SYSCALL_OFFLOAD_OP_LINUX_UNAME,
     SYSCALL_OFFLOAD_OP_WIN32_ALLOC_VIRTUAL_MEMORY, SYSCALL_OFFLOAD_OP_WIN32_CLOSE,
     SYSCALL_OFFLOAD_OP_WIN32_DELAY_EXECUTION, SYSCALL_OFFLOAD_OP_WIN32_EXIT_PROCESS,
-    SYSCALL_OFFLOAD_OP_WIN32_FREE_VIRTUAL_MEMORY, SYSCALL_OFFLOAD_OP_WIN32_GET_CONSOLE_MODE,
-    SYSCALL_OFFLOAD_OP_WIN32_PROTECT_VIRTUAL_MEMORY, SYSCALL_OFFLOAD_OP_WIN32_QUERY_VIRTUAL_MEMORY,
-    SYSCALL_OFFLOAD_OP_WIN32_READ_FILE, SYSCALL_OFFLOAD_OP_WIN32_SET_CONSOLE_MODE,
+    SYSCALL_OFFLOAD_OP_WIN32_GET_CONSOLE_MODE, SYSCALL_OFFLOAD_OP_WIN32_READ_FILE,
     SYSCALL_OFFLOAD_OP_WIN32_WRITE_FILE, SYSCALL_OFFLOAD_PATH_CAPACITY,
     WIN32_SYSCALL_OFFLOAD_ABI_VERSION,
 };
@@ -50,6 +49,7 @@ mod win32_policy;
 
 rustos_svc_runtime::entry!(service_main);
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
     loop {}
@@ -109,6 +109,9 @@ fn serve(endpoint: u64) {
     }
 }
 
+// Replies are sent immediately; boxing the commercial response would leak
+// from this early policy service's bootstrap allocator.
+#[allow(clippy::large_enum_variant)]
 enum SyscallOffloadReply {
     Linux(LinuxSyscallOffloadResponse),
     Win32(Win32SyscallOffloadResponse),

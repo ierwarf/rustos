@@ -53,6 +53,12 @@ impl SimdState {
     }
 }
 
+impl Default for SimdState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn init() {
     #[cfg(target_arch = "x86_64")]
     unsafe {
@@ -120,6 +126,9 @@ pub fn avx2_enabled() -> bool {
 }
 
 #[inline]
+/// # Safety
+///
+/// `area` must be writable, 64-byte aligned storage for the active SIMD mode.
 pub unsafe fn save_state(area: &mut SimdState) {
     match SIMD_MODE.load(Ordering::Acquire) {
         SIMD_MODE_XSAVE => unsafe { xsave(area, XSTATE_MASK.load(Ordering::Acquire)) },
@@ -128,6 +137,9 @@ pub unsafe fn save_state(area: &mut SimdState) {
 }
 
 #[inline]
+/// # Safety
+///
+/// `area` must contain state saved for the active SIMD mode on this CPU.
 pub unsafe fn restore_state(area: &SimdState) {
     match SIMD_MODE.load(Ordering::Acquire) {
         SIMD_MODE_XSAVE => unsafe { xrstor(area, XSTATE_MASK.load(Ordering::Acquire)) },
@@ -136,6 +148,9 @@ pub unsafe fn restore_state(area: &SimdState) {
 }
 
 #[inline]
+/// # Safety
+///
+/// `src` and `dst` must be valid for `len` bytes. Overlap is permitted.
 pub unsafe fn copy_fast(src: *const u8, dst: *mut u8, len: usize) {
     if len == 0 || src == dst {
         return;
@@ -165,6 +180,10 @@ pub unsafe fn copy_fast(src: *const u8, dst: *mut u8, len: usize) {
 }
 
 #[inline]
+/// # Safety
+///
+/// `src` and `dst` must be valid for `pixels * 4` source bytes and
+/// `pixels * dst_bpp` destination bytes. The regions must not overlap.
 pub unsafe fn blit_bgra8888_row(
     dst: *mut u8,
     src: *const u8,
@@ -199,6 +218,9 @@ pub unsafe fn blit_bgra8888_row(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
+/// # Safety
+///
+/// `src` and `dst` must be valid for `len` bytes. Overlap is permitted.
 pub unsafe fn copy_xmm(src: *const u8, dst: *mut u8, len: usize) {
     use core::arch::x86_64::*;
 
@@ -236,6 +258,9 @@ pub unsafe fn copy_xmm(src: *const u8, dst: *mut u8, len: usize) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx")]
+/// # Safety
+///
+/// `src` and `dst` must be valid for `len` bytes. Overlap is permitted.
 pub unsafe fn copy_ymm(src: *const u8, dst: *mut u8, len: usize) {
     use core::arch::x86_64::*;
 

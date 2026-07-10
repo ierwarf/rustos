@@ -10,12 +10,6 @@ package = "wayclick"
 [install]
 path = "apps/wayclick/wayclick.elf"
 
-[boot]
-preload = false
-required = false
-priority = 100
-
-startup = "none"
 
 [[desktop.entries]]
 display_name = "WayClick"

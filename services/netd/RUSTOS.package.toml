@@ -11,11 +11,6 @@ package = "netd"
 [install]
 path = "services/netd/netd.elf"
 
-[boot]
-preload = true
-required = false
-priority = -589
-
 [[desktop.entries]]
 display_name = "netd"
 weight_micros = 100

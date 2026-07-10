@@ -38,7 +38,7 @@ client.request_terminate_session(session_handle)?;
 | `request_launch_path_new_session(exec_path)` | Compatibility wrapper for path launch. |
 | `request_terminate_session(session_handle)` | Terminate a session. |
 | `request_terminate_pid(pid)` | Terminate a process id. |
-| `notify_ui_ready()` | Tell `runtimed` that the UI server is ready. |
+| `notify_ui_ready()` | Send a one-way UI-ready notification to `runtimed`. |
 
 ### Data Flow
 
@@ -47,14 +47,17 @@ client -> UnixStream(/run/runtimed.sock) -> RuntimeRequest -> runtimed
       <- RuntimeResponse + optional RuntimeRunningProgram payload
 ```
 
+`notify_ui_ready()` is intentionally one-way and has no response payload.
+
 The protocol is fixed-size and C-layout oriented. Keep path-like request text
 under `MAX_REQUEST_PATH_BYTES`.
 
 ### Registry Loading
 
-The same crate also parses generated desktop/startup/runtime registries. Use
-these helpers when a service needs launch policy instead of scanning staged
-files manually.
+The same crate also parses generated desktop/startup/runtime registries. Each
+default registry has its own immutable cache; cached desktop metadata is never
+substituted for runtime-launch policy. Use these helpers instead of scanning
+staged files manually.
 
 <a id="korean"></a>
 
@@ -92,7 +95,7 @@ client.request_terminate_session(session_handle)?;
 | `request_launch_path_new_session(exec_path)` | path launch용 compatibility wrapper입니다. |
 | `request_terminate_session(session_handle)` | session을 종료합니다. |
 | `request_terminate_pid(pid)` | process id를 종료합니다. |
-| `notify_ui_ready()` | UI server ready 상태를 `runtimed`에 알립니다. |
+| `notify_ui_ready()` | UI-ready를 `runtimed`에 one-way로 알립니다. |
 
 ### Data Flow
 
@@ -101,11 +104,15 @@ client -> UnixStream(/run/runtimed.sock) -> RuntimeRequest -> runtimed
       <- RuntimeResponse + optional RuntimeRunningProgram payload
 ```
 
+`notify_ui_ready()`는 의도적으로 one-way이며 response payload가 없습니다.
+
 protocol은 fixed-size C-layout 중심입니다. path-like request text는
 `MAX_REQUEST_PATH_BYTES`보다 짧게 유지해야 합니다.
 
 ### Registry Loading
 
-이 crate는 generated desktop/startup/runtime registry도 parsing합니다. service가
-launch policy를 알아야 할 때 staged file을 직접 scan하지 말고 이 helper를
+이 crate는 generated desktop/startup/runtime registry도 parsing합니다. 각 default
+registry는 별도 immutable cache를 사용하며, cached desktop metadata를
+runtime-launch policy 대신 사용하지 않습니다. service가 launch policy를 알아야 할
+때 staged file을 직접 scan하지 말고 이 helper를
 사용하세요.

@@ -63,7 +63,7 @@ impl AppState {
                         *event,
                     ) {
                         Ok(()) => {}
-                        Err(err) if matches!(err, sys::ENOENT | sys::EINVAL | sys::ESTALE) => {
+                        Err(sys::ENOENT | sys::EINVAL | sys::ESTALE) => {
                             self.focused_session_handle = 0;
                             return Ok(VisualUpdate::default());
                         }
@@ -335,7 +335,7 @@ impl AppState {
                 }
             }
             WindowHit::Wayland(surface_id, chrome_hit) => {
-                let Some(wayland) = wayland.as_deref_mut() else {
+                let Some(wayland) = wayland else {
                     return Ok(VisualUpdate::default());
                 };
                 match chrome_hit {

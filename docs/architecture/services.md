@@ -31,16 +31,15 @@ surfaces or sockets they expose.
 
 ### Bootstrap-launched vs Catalog-launched
 
-The first thing `runtimed` does is **bootstrap_ui_server**: it spawns
-`uiserver` immediately, before the desktop/runtime-launch registries are
-finished loading. That bootstrap path reads the uiserver desktop entry
-synchronously so manifest args/env are honored on the very first run, not just
-after the catalog loader finishes on a worker thread.
+The first thing `runtimed` does is **bootstrap_ui_server**. That path reads the
+uiserver desktop entry synchronously and honors manifest args/env on the very
+first run. It then uses the same suspended-create, lease-admit, activate, and
+exact-endpoint transaction as initd.
 
 All other services and apps are launched from the catalog. The catalog is
-loaded asynchronously to keep boot wall-clock short; the OnceLock cache in
-`runtime-control` makes the bootstrap read and the worker read share the
-same parse.
+materialized on runtimed's main loop after UI readiness. Desktop metadata and
+runtime-launch policy are cached separately so one registry can never be
+mistaken for the other.
 
 ### Driver Modules
 
@@ -91,15 +90,14 @@ ELF, 그리고 staged registry에 한 줄을 함께 가집니다. 아래 표는 
 
 ### 부트스트랩 launch vs catalog launch
 
-`runtimed`가 가장 먼저 하는 일은 **bootstrap_ui_server** 입니다. desktop /
-runtime-launch registry 로딩이 끝나기 전에 `uiserver`를 바로 spawn 합니다.
-이제 이 bootstrap 경로는 uiserver desktop entry를 동기적으로 읽어서
-manifest args/env를 첫 실행부터 반영합니다. catalog loader worker 완료를
-기다리던 이전 동작에서 회귀입니다.
+`runtimed`가 가장 먼저 하는 일은 **bootstrap_ui_server** 입니다. 이 경로는
+uiserver desktop entry를 동기적으로 읽어 manifest args/env를 첫 실행부터
+반영하고, initd와 같은 suspended-create, lease-admit, activate, exact-endpoint
+transaction을 사용합니다.
 
-다른 모든 service와 app은 catalog에서 launch 됩니다. catalog는 boot
-wall-clock을 줄이려고 비동기로 로드되며, `runtime-control`의 OnceLock
-cache가 bootstrap 경로와 worker 경로의 parsing을 공유하게 만듭니다.
+다른 모든 service와 app은 catalog에서 launch 됩니다. UI ready 뒤 runtimed의
+main loop가 catalog를 구성하며 desktop metadata와 runtime-launch policy는 별도
+cache를 사용하므로 서로 다른 registry가 뒤섞이지 않습니다.
 
 ### Driver module
 

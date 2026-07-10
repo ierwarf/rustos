@@ -48,13 +48,13 @@ the `uiserver` lease. There is no post-init capability or lookup allowlist
 fallback. `READINESS_SIGNAL` is a supervisor-spawn lease admission signal, not
 proof that the child has registered its own policy endpoint; endpoint readiness
 is still determined by `SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT` /
-`SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT`. `initd` post-init endpoint readiness
-waits must be bounded by scheduler-yield attempts rather than early-boot
-`Instant` deadlines or timer sleeps; a missing endpoint must fail closed instead
-of silently stalling. Post-init services may race their supervisor's synchronous
-lease report after spawn; service endpoint registration retry loops must use
-bounded scheduler yields, not timer sleeps, while waiting for rootd lease
-admission. rootd must authorize the reporter
+`SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT`. Supervised launches use the
+deferred-start transaction: loaderd creates the child suspended, the supervisor
+admits the exact PID lease in rootd, loaderd activates the child, and the
+supervisor waits with `SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT`. The wait is
+race-free, deadline bounded, keyed by service id plus expected PID, and wakes on
+registration or child exit. Polling endpoint lookup is not a readiness model.
+rootd must authorize the reporter
 for each post-init lease: `initd` reports driverd/netd/devmgrd/inputd/storaged
 and runtimed-as-sessiond, while running sessiond/runtimed reports uiserver.
 Reports for an already-running lease are idempotent only for the same PID and
@@ -305,14 +305,16 @@ Mapping ops use `PROC_BROKER_MAP_{READ,WRITE,EXEC,PRIVATE}` flags and record non
 
 Commit (`COMMIT_BROKER`) builds the child address space from recorded mappings.
 By default, commit-broker spawns do not request immediate deferred reschedule so
-`loaderd` can reply to its supervisor before the spawned child runs startup
-policy. `rootd` may request child-first bootstrap handoff for `initd` after
-core leases are ready by setting `LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF`.
-Post-init supervisors such as `initd` and `runtimed` may use immediate handoff
-for latency-sensitive service bootstrap, but the child must not fabricate
-endpoint registration success before its `rootd` lease is admitted. Service
-endpoint registration retry loops must use bounded scheduler yields while
-waiting for lease admission and fail closed if admission never arrives.
+`loaderd` can reply to its caller before the spawned child runs startup policy.
+Supervisors (`rootd` for initd, `initd` for post-init services, and `runtimed`
+for uiserver) set `LOADER_SPAWN_FLAG_DEFER_START` and complete lease admission
+before `LOADER_OP_ACTIVATE`. Activation is single-use and fails closed for an
+unknown, exited, already-running, or non-suspended PID. Endpoint-owning children
+must then be confirmed through the exact-PID endpoint wait syscall.
+
+`LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF` remains an ABI option for a child with a
+pre-admitted ownership contract; it is not valid for normal supervised service
+bootstrap.
 Immediate handoff uses a spawn-specific scheduler hint that is consumed before
 generic IPC reply hints, so the loader's reply to the supervisor cannot
 overwrite the freshly-created child. The spawn broker must set this hint without
@@ -320,9 +322,8 @@ requesting or taking a reschedule before returning to `loaderd`. Spawn handoff
 is an explicit bootstrap transfer and may be consumed by the next scheduler
 dispatch, including deferred syscall-exit dispatch; it may bypass the generic
 IPC strict-class guard, otherwise a ready System-class task can indefinitely
-defer a rootd-to-initd child-first handoff. Services spawned this way must not
-fabricate endpoint registration before rootd lease admission; they must
-bounded-yield and fail closed if admission never arrives. IPC enqueue/reply
+defer a child-first handoff. A service that lacks a pre-admitted lease must not
+use this legacy path. IPC enqueue/reply
 completion wakes the receiver/caller and may set a direct pick hint for any
 currently ready and
 schedulable target; already-runnable service endpoints still need a handoff when
@@ -342,6 +343,11 @@ Routed Linux ops after bootstrap: `socket`, `socketpair`, socket `dup`/`dup2`/`d
 
 netd invokes gated `SYS_RUSTOS_NET_BROKER` with target pid. Net broker arg struct carries six 64-bit syscall arg slots. Kernel performs handle install and target user-memory validation/copy; AF_UNIX socket lifecycle, binding/listen queues, byte queues, and socket option policy belong to netd. `NetdIpcRequest`/`Response` carry `socket_token`, fd `status_flags`, and a bounded inline payload for this service-owned socket path.
 
+Blocking INET connect/send/recv waits run as bounded netd workers that release
+the shared network-state lock between polls. The single policy receive loop
+must remain available for AF_UNIX and readiness traffic; no blocking INET
+request may hold that loop or its state lock across a timer sleep.
+
 ## Process Policy Surface (`procd`)
 
 procd owns Linux `execve`, `fork`/`clone`, `wait4`, `rt_sigaction`, `rt_sigprocmask`, `sigaltstack`, `tgkill`, signal selection.
@@ -357,6 +363,18 @@ Kernel keeps only: user-copy, address-space replacement, scheduler mutation, pen
   `clock_nanosleep`, and `ppoll` timespec validation belongs to `syscalld`.
   Ring0 keeps only current-task user-copy plus RTC/tick sleep and clock
   substrate.
+- Linux futex WAIT and WAIT_BITSET accept validated relative/absolute timeout
+  timespecs and block on the RTC waiter substrate; timeout-bearing futex calls
+  must not return `ENOSYS` or spin in libc retry loops. Any waiter table read by
+  an IRQ handler must be mutated from process context with interrupts excluded
+  while its spin lock is held.
+- `exit_group` and default fatal-signal termination retire every thread in the
+  process and fail every thread-owned IPC wait/endpoint before the current
+  thread halts. Never revoke process service endpoints while sibling threads
+  remain runnable.
+- uiserver opens input nonblocking and waits through bounded `poll`; RustOS must
+  not replace readiness with unconditional success followed by high-rate inputd
+  reads.
 - Linux `memfd_create`: policy validation in syscalld; kernel performs handle install + read/write/truncate/seal (current handles, user memory).
 - Windows syscall policy: `Win32SyscallOffloadRequest`/`Response` + `SYSCALL_OFFLOAD_OP_WIN32_*` range. Kernel dispatcher calls service policy first, validates ABI/status, and must fail closed with a non-success NTSTATUS on malformed or denied responses before performing only the narrow privileged action.
 

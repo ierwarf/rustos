@@ -4,14 +4,16 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use rustos_user_abi::console::{self as console_abi};
 use rustos_user_abi::syscall::{
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, LoaderSpawnRequest,
-    LoaderSpawnResponse, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    LoaderSpawnResponse, RustosIpcWaitServiceEndpointArgs, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
     COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR, COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL,
-    IPC_SERVICE_LOADERD, IPC_SERVICE_ROOTD, IPC_SERVICE_UISERVER, LOADER_OP_SPAWN_EXEC,
-    LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES,
-    LOADER_SPAWN_EXEC_PATH_CAPACITY, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
+    IPC_SERVICE_LOADERD, IPC_SERVICE_ROOTD, IPC_SERVICE_UISERVER,
+    IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION, IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS,
+    LOADER_OP_ACTIVATE, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
+    LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_FLAG_DEFER_START,
+    SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT,
 };
 
 use super::{
@@ -42,6 +44,7 @@ pub(super) fn spawn_tracked_process(
     } else {
         None
     };
+    let deferred_start = entry.exec == UI_SERVER_EXEC_PATH;
     let pid = match spawn_exec(
         entry.exec.as_str(),
         entry.args.as_slice(),
@@ -49,6 +52,7 @@ pub(super) fn spawn_tracked_process(
         entry.logical_admin,
         entry.weight_micros,
         session_handle.unwrap_or(0),
+        deferred_start,
     ) {
         Ok(pid) => pid,
         Err(err) => {
@@ -84,16 +88,21 @@ pub(super) fn spawn_tracked_process(
         .as_str(),
     );
     if entry.exec == UI_SERVER_EXEC_PATH {
-        if let Err(err) = report_rootd_service_lease(IPC_SERVICE_UISERVER, entry.exec.as_str(), pid)
-        {
-            stderr_line(
-                format!(
-                    "runtimed: rootd lease report failed exec={} pid={} errno={}",
-                    entry.exec, pid, err
-                )
-                .as_str(),
-            );
+        if let Err(err) = report_rootd_service_lease(IPC_SERVICE_UISERVER, entry.exec.as_str(), pid) {
+            // The child is still start-suspended, so it cannot race endpoint
+            // registration against the failed supervisor transaction. Make
+            // it runnable solely so the normal signal/lifecycle path can
+            // retire it, then fail this launch closed.
+            let _ = activate_spawned_process(pid);
+            let _ = terminate_pid(pid);
+            return Err(err);
         }
+        activate_spawned_process(pid)?;
+        if let Err(err) = wait_for_service_endpoint(IPC_SERVICE_UISERVER, pid) {
+            let _ = terminate_pid(pid);
+            return Err(err);
+        }
+        boot_line(format!("runtimed: uiserver endpoint ready pid={pid}").as_str());
     }
     state.retry_after.remove(entry.desktop_file_id.as_str());
     let inserted_session_handle = session_handle.unwrap_or(0);
@@ -235,6 +244,7 @@ pub(super) fn spawn_exec(
     logical_admin: bool,
     weight_micros: u64,
     session_handle: u64,
+    defer_start: bool,
 ) -> Result<i32, i32> {
     boot_line(format!("runtimed: loader request begin exec={}", exec_path).as_str());
     let argv_storage = build_exec_argv(exec_path, argv);
@@ -246,6 +256,7 @@ pub(super) fn spawn_exec(
         logical_admin,
         weight_micros,
         session_handle,
+        defer_start,
     )?;
     let endpoint = lookup_loader_endpoint()?;
     let mut response = LoaderSpawnResponse::default();
@@ -292,6 +303,7 @@ fn build_loader_spawn_request(
     logical_admin: bool,
     weight_micros: u64,
     session_handle: u64,
+    defer_start: bool,
 ) -> Result<LoaderSpawnRequest, i32> {
     let exec_bytes = exec_path.as_bytes();
     if exec_bytes.is_empty()
@@ -303,7 +315,12 @@ fn build_loader_spawn_request(
     let mut request = LoaderSpawnRequest {
         version: LOADER_REQUEST_ABI_VERSION,
         op: LOADER_OP_SPAWN_EXEC,
-        flags: u32::from(logical_admin),
+        flags: u32::from(logical_admin)
+            | if defer_start {
+                LOADER_SPAWN_FLAG_DEFER_START
+            } else {
+                0
+            },
         console_session: session_handle,
         weight_micros: effective_task_weight_micros(weight_micros),
         exec_path_len: exec_bytes.len() as u32,
@@ -316,6 +333,66 @@ fn build_loader_spawn_request(
         copy_cstring_blob(argv, &mut request.argv_bytes, LOADER_SPAWN_ARG_BYTES)?;
     request.env_bytes_len = copy_cstring_blob(env, &mut request.env_bytes, LOADER_SPAWN_ENV_BYTES)?;
     Ok(request)
+}
+
+fn activate_spawned_process(pid: i32) -> Result<(), i32> {
+    let request = LoaderSpawnRequest {
+        version: LOADER_REQUEST_ABI_VERSION,
+        op: LOADER_OP_ACTIVATE,
+        target_pid: u64::try_from(pid).map_err(|_| libc::EINVAL)?,
+        ..LoaderSpawnRequest::default()
+    };
+    let endpoint = lookup_loader_endpoint()?;
+    let mut response = LoaderSpawnResponse::default();
+    let call = unsafe {
+        libc::syscall(
+            SYS_RUSTOS_IPC_CALL as libc::c_long,
+            endpoint,
+            (&request as *const LoaderSpawnRequest) as u64,
+            size_of::<LoaderSpawnRequest>() as u64,
+            (&mut response as *mut LoaderSpawnResponse) as u64,
+            size_of::<LoaderSpawnResponse>() as u64,
+        ) as i64
+    };
+    if call < 0 {
+        LOADER_ENDPOINT_CACHE.store(0, Ordering::Relaxed);
+        return Err((-call) as i32);
+    }
+    if call as usize != size_of::<LoaderSpawnResponse>()
+        || response.version != LOADER_REQUEST_ABI_VERSION
+        || response.op != LOADER_OP_ACTIVATE
+        || response.pid != i64::from(pid)
+    {
+        return Err(libc::EINVAL);
+    }
+    if response.status != 0 {
+        return Err(response.status);
+    }
+    boot_line(format!("runtimed: activated uiserver pid={pid}").as_str());
+    Ok(())
+}
+
+fn wait_for_service_endpoint(service_id: u64, pid: i32) -> Result<u64, i32> {
+    let args = RustosIpcWaitServiceEndpointArgs {
+        abi_version: IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION,
+        service_id,
+        expected_pid: u64::try_from(pid).map_err(|_| libc::EINVAL)?,
+        timeout_ms: IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS,
+        ..RustosIpcWaitServiceEndpointArgs::default()
+    };
+    let result = unsafe {
+        libc::syscall(
+            SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT as libc::c_long,
+            (&args as *const RustosIpcWaitServiceEndpointArgs) as u64,
+        ) as i64
+    };
+    if result < 0 {
+        Err((-result) as i32)
+    } else if result == 0 {
+        Err(libc::ENOENT)
+    } else {
+        Ok(result as u64)
+    }
 }
 
 fn copy_cstring_blob(values: &[CString], dest: &mut [u8], capacity: usize) -> Result<u32, i32> {
@@ -374,16 +451,8 @@ pub(super) fn loader_endpoint_ready() -> bool {
     lookup_loader_endpoint().is_ok()
 }
 
-pub(super) fn stderr_line(message: &str) {
-    let mut line = message.as_bytes().to_vec();
-    line.push(b'\n');
-    unsafe {
-        libc::write(
-            libc::STDERR_FILENO,
-            line.as_ptr().cast::<libc::c_void>(),
-            line.len(),
-        );
-    }
+pub(super) fn debug_line(message: &str) {
+    super::debug_line(message);
 }
 
 pub(super) fn terminate_pid(pid: i32) -> Result<(), i32> {
@@ -426,10 +495,10 @@ fn open_device(path: &str, flags: usize) -> Result<OwnedFd, i32> {
 
 pub(super) fn ensure_console_fd(state: &mut BrokerState) -> Result<RawFd, i32> {
     if state.console_fd.is_none() {
-        stderr_line("runtimed: console open begin");
+        debug_line("runtimed: console open begin");
         boot_line("runtimed: console open begin");
         let fd = open_device(CONSOLE_PATH, O_RDWR)?;
-        stderr_line("runtimed: console open done");
+        debug_line("runtimed: console open done");
         boot_line("runtimed: console ready");
         state.console_fd = Some(fd);
     }

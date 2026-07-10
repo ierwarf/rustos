@@ -9,12 +9,14 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::{size_of, MaybeUninit};
+#[cfg(not(test))]
 use core::panic::PanicInfo;
 
 use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, LoaderSpawnRequest,
-    LoaderSpawnResponse, RustosProcAbortBrokerArgs, RustosProcMapDataBrokerArgs,
+    LoaderSpawnResponse, RustosProcAbortBrokerArgs, RustosProcActivateBrokerArgs,
+    RustosProcMapDataBrokerArgs,
     RustosProcMapFileBatchBrokerArgs, RustosProcMapFileBatchEntry, RustosProcMapZeroedBrokerArgs,
     RustosProcPrepareBrokerArgs, RustosProcSetLinuxRuntimeBrokerArgs,
     RustosProcSetWindowsRuntimeBrokerArgs, COMMERCIAL_MAX_LOADERD_OP_AUXV_PLAN,
@@ -22,7 +24,7 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_LOADERD_OP_IMPORT_POLICY, COMMERCIAL_MAX_LOADERD_OP_INTERPRETER_PLAN,
     COMMERCIAL_MAX_LOADERD_OP_MAP_PLAN, COMMERCIAL_MAX_LOADERD_OP_PE_RUNTIME_PLAN,
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_LOADERD, IPC_SERVICE_LOADERD,
-    LOADER_OP_EXEC_TARGET, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION,
+    LOADER_OP_ACTIVATE, LOADER_OP_EXEC_TARGET, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION,
     LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY,
     LOADER_SPAWN_MAX_ARG_COUNT, LOADER_SPAWN_MAX_ENV_COUNT, PROC_BROKER_ABI_VERSION,
     PROC_BROKER_BATCH_CAPACITY, PROC_BROKER_DATA_PAYLOAD_CAPACITY, PROC_BROKER_FORMAT_ELF64,
@@ -30,6 +32,7 @@ use rustos_user_abi::syscall::{
     PROC_BROKER_MAP_PRIVATE, PROC_BROKER_MAP_READ, PROC_BROKER_MAP_WRITE,
     PROC_BROKER_USER_SPACE_BASE, PROC_BROKER_USER_SPACE_END_EXCLUSIVE, SYS_RUSTOS_DEBUG_PRINT,
     SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_PROC_ABORT_BROKER,
+    SYS_RUSTOS_PROC_ACTIVATE_BROKER,
     SYS_RUSTOS_PROC_MAP_DATA_BROKER, SYS_RUSTOS_PROC_MAP_FILE_BATCH_BROKER,
     SYS_RUSTOS_PROC_MAP_ZEROED_BROKER, SYS_RUSTOS_PROC_PREPARE_BROKER,
     SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER, SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER,
@@ -38,10 +41,10 @@ use rustos_user_abi::syscall::{
 mod commit;
 
 use commit::{commit_prepared_executable, LoaderOperation};
-use rustos_svc_runtime::ipc;
 
 const SYS_SCHED_YIELD: u64 = 24;
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
     loop {}
@@ -196,6 +199,9 @@ fn serve(endpoint: u64) {
     }
 }
 
+// IPC replies are written immediately; boxing the commercial response would
+// leak from this early service's bump allocator.
+#[allow(clippy::large_enum_variant)]
 enum LoaderReply {
     Spawn(LoaderSpawnResponse),
     Commercial(CommercialMaxProtocolResponse),
@@ -214,6 +220,8 @@ const LOADERD_RECV_BYTES: usize =
     };
 
 #[repr(align(8))]
+// Raw IPC writes use this wrapper for alignment, not tuple-field reads.
+#[allow(dead_code)]
 struct LoaderdRecvBuffer([u8; LOADERD_RECV_BYTES]);
 
 impl LoaderReply {
@@ -269,6 +277,23 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> HandledLoade
     };
     if let Err(errno) = validate_request(received, request) {
         response.status = errno;
+        return spawn_response(response);
+    }
+    if request.op == LOADER_OP_ACTIVATE {
+        let args = RustosProcActivateBrokerArgs {
+            abi_version: PROC_BROKER_ABI_VERSION,
+            target_pid: request.target_pid,
+            ..RustosProcActivateBrokerArgs::default()
+        };
+        let status = syscall1(
+            SYS_RUSTOS_PROC_ACTIVATE_BROKER,
+            (&args as *const RustosProcActivateBrokerArgs) as u64,
+        );
+        if status < 0 {
+            response.status = (-status) as i32;
+        } else {
+            response.pid = request.target_pid as i64;
+        }
         return spawn_response(response);
     }
     let operation = match LoaderOperation::from_op(request.op) {
@@ -631,11 +656,10 @@ fn map_executable_segments(
                 linux_runtime: None,
                 cleanup_fds: vec![fd],
             })
-            .map_err(|errno| {
+            .inspect_err(|errno| {
                 debug_line(&format!(
                     "loaderd: map pe segments failed exec={exec_path} errno={errno}",
                 ));
-                errno
             }),
         _ => Err(EINVAL),
     }
@@ -644,14 +668,34 @@ fn map_executable_segments(
 fn validate_request(received: usize, request: &LoaderSpawnRequest) -> Result<(), i32> {
     if received != size_of::<LoaderSpawnRequest>()
         || request.version != LOADER_REQUEST_ABI_VERSION
-        || !matches!(request.op, LOADER_OP_SPAWN_EXEC | LOADER_OP_EXEC_TARGET)
         || request.reserved0 != 0
-        || request.exec_path_len == 0
-        || request.exec_path_len as usize > LOADER_SPAWN_EXEC_PATH_CAPACITY
         || request.argv_count as usize > LOADER_SPAWN_MAX_ARG_COUNT
         || request.env_count as usize > LOADER_SPAWN_MAX_ENV_COUNT
         || request.argv_bytes_len as usize > LOADER_SPAWN_ARG_BYTES
         || request.env_bytes_len as usize > LOADER_SPAWN_ENV_BYTES
+    {
+        return Err(EINVAL);
+    }
+    if request.op == LOADER_OP_ACTIVATE {
+        if request.flags != 0
+            || request.console_session != 0
+            || request.weight_micros != 0
+            || request.target_pid == 0
+            || request.target_tid != 0
+            || request.exec_ticket != 0
+            || request.exec_path_len != 0
+            || request.argv_count != 0
+            || request.env_count != 0
+            || request.argv_bytes_len != 0
+            || request.env_bytes_len != 0
+        {
+            return Err(EINVAL);
+        }
+        return Ok(());
+    }
+    if !matches!(request.op, LOADER_OP_SPAWN_EXEC | LOADER_OP_EXEC_TARGET)
+        || request.exec_path_len == 0
+        || request.exec_path_len as usize > LOADER_SPAWN_EXEC_PATH_CAPACITY
     {
         return Err(EINVAL);
     }
@@ -741,11 +785,6 @@ fn copy_label(label: &str, target: &mut [u8], len: &mut u16) {
     let count = bytes.len().min(target.len());
     target[..count].copy_from_slice(&bytes[..count]);
     *len = count as u16;
-}
-
-fn read_unaligned<T: Copy>(bytes: &[u8]) -> T {
-    debug_assert!(bytes.len() >= size_of::<T>());
-    unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) }
 }
 
 fn request_text(bytes: &[u8], len: usize) -> Result<&str, i32> {
@@ -892,7 +931,7 @@ fn map_elf_segments_fd(
     validate_elf_fd(fd, &header, &phdrs)?;
 
     let load_bias = elf_load_bias_from_phdrs(&header, &phdrs, dyn_load_offset)?;
-    let phoff = read_u64(&header, 32);
+    let _phoff = read_u64(&header, 32);
     let e_entry = read_u64(&header, 24);
     let phentsize = read_u16(&header, 54) as u64;
     let phnum = read_u16(&header, 56) as u64;
@@ -1525,7 +1564,7 @@ fn apply_pe_relocations(
         }
         let page_rva = read_u32(image, cursor) as u64;
         let block_size = read_u32(image, cursor + 4) as usize;
-        if block_size < 8 || block_size % 2 != 0 {
+        if block_size < 8 || !block_size.is_multiple_of(2) {
             return Err(ENOEXEC);
         }
         let block_end = cursor.checked_add(block_size).ok_or(EOVERFLOW)?;

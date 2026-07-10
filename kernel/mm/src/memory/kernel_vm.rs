@@ -231,7 +231,10 @@ impl<const SIZE_GB: usize> PML4<SIZE_GB> {
     }
 
     fn unmap_mmio_blocks(&mut self, virt_base: u64, block_count: usize) -> bool {
-        if block_count == 0 || virt_base < MMIO_WINDOW_BASE || virt_base % HUGE_2MIB != 0 {
+        if block_count == 0
+            || virt_base < MMIO_WINDOW_BASE
+            || !virt_base.is_multiple_of(HUGE_2MIB)
+        {
             return false;
         }
 
@@ -394,7 +397,7 @@ impl<const SIZE_GB: usize> PML4<SIZE_GB> {
         while page_phys < end {
             let block_index = page_phys / HUGE_2MIB;
             let block_end = (block_index + 1) * HUGE_2MIB;
-            if page_phys % HUGE_2MIB == 0
+            if page_phys.is_multiple_of(HUGE_2MIB)
                 && block_end <= end
                 && self.find_split_slot(block_index).is_none()
             {
@@ -552,6 +555,10 @@ impl<const SIZE_GB: usize> PML4<SIZE_GB> {
         Ok(())
     }
 
+    /// # Safety
+    ///
+    /// The table must be a valid, active x86_64 PML4 frame and callers must
+    /// ensure the switch cannot race with another address-space transition.
     pub unsafe fn load(&self) {
         let pml4_phys = PhysAddr::new(kernel_virtual_to_physical(addr_of!(self.pml4) as u64));
         let pml4_frame = PhysFrame::containing_address(pml4_phys);

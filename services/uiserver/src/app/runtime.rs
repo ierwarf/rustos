@@ -91,11 +91,7 @@ fn collect_console_refresh(
                 output_generation: session.output_generation,
                 bytes: snapshot[..count].to_vec(),
             }),
-            Err(err)
-                if matches!(
-                    err,
-                    crate::sys::ENOENT | crate::sys::EINVAL | crate::sys::ESTALE
-                ) => {}
+            Err(crate::sys::ENOENT | crate::sys::EINVAL | crate::sys::ESTALE) => {}
             Err(err) => return Err(err),
         }
         output_generations.insert(session.session_handle, session.output_generation);
@@ -324,11 +320,10 @@ impl AppState {
         if next
             .iter()
             .all(|window| window.session_handle != self.focused_session_handle)
+            && self.focused_session_handle != 0
         {
-            if self.focused_session_handle != 0 {
-                self.focused_session_handle = 0;
-                topology_changed = true;
-            }
+            self.focused_session_handle = 0;
+            topology_changed = true;
         }
 
         self.console_windows = next;

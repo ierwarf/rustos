@@ -223,7 +223,9 @@ impl KeyCode {
             return None;
         }
 
-        Some(unsafe { core::mem::transmute(value as u8) })
+        // `KeyCode` is a contiguous repr(u8) enum through `Pause`, checked
+        // immediately above.
+        Some(unsafe { core::mem::transmute::<u8, KeyCode>(value as u8) })
     }
 }
 

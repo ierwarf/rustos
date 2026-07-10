@@ -11,11 +11,6 @@ source = "netprobe.c"
 [install]
 path = "apps/netprobe/netprobe.elf"
 
-[boot]
-preload = false
-required = false
-priority = 130
-
 [[desktop.entries]]
 display_name = "netprobe"
 weight_micros = 100

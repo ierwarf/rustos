@@ -10,7 +10,11 @@ use driver_abi::{
 
 static mut KERNEL_API: *const DriverKernelApiV1 = ptr::null();
 
-pub fn bind(api_ptr: *const DriverKernelApiV1) -> Result<(), i32> {
+/// # Safety
+///
+/// `api_ptr` must reference a readable `DriverKernelApiV1` that remains valid
+/// for the lifetime of the loaded driver module.
+pub unsafe fn bind(api_ptr: *const DriverKernelApiV1) -> Result<(), i32> {
     if api_ptr.is_null() {
         return Err(-22);
     }

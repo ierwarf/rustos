@@ -6,17 +6,42 @@ use runtime_control::{
     StartupMode, DEFAULT_APPLICATIONS_DIR, DEFAULT_RUNTIME_LAUNCH_REGISTRY_PATH,
 };
 
-use super::{boot_line, DEFAULT_USER_TASK_WEIGHT_MICROS, UI_SERVER_EXEC_PATH};
+use super::{
+    boot_line, debug_line, DEFAULT_USER_TASK_WEIGHT_MICROS, RETRY_BACKOFF, UI_SERVER_EXEC_PATH,
+};
 use super::{BrokerState, LaunchEntry, ProgramMetadata};
 
 pub(super) fn load_launch_catalog_into_state(state: &mut BrokerState) -> bool {
     if state.launch_catalog_loaded {
         return false;
     }
-    super::spawn::stderr_line("runtimed: launch catalog load begin");
+    if state
+        .launch_catalog_retry_after
+        .is_some_and(|retry_after| Instant::now() < retry_after)
+    {
+        return false;
+    }
+    debug_line("runtimed: launch catalog load begin");
     boot_line("runtimed: launch catalog load begin");
     let started_at = Instant::now();
-    let (programs, launch_entries) = load_launch_catalog();
+    let (programs, launch_entries) = match load_launch_catalog() {
+        Ok(catalog) => catalog,
+        Err(errno) => {
+            state.launch_catalog_retry_after = Some(Instant::now() + RETRY_BACKOFF);
+            if state.launch_catalog_last_error != Some(errno) {
+                debug_line(
+                    format!("runtimed: launch catalog load failed errno={errno}").as_str(),
+                );
+                observability_client::warn!(
+                    "runtimed",
+                    service,
+                    "launch catalog load failed: errno={errno}; retrying"
+                );
+                state.launch_catalog_last_error = Some(errno);
+            }
+            return false;
+        }
+    };
     let elapsed_ms = started_at.elapsed().as_millis();
     observability_client::info!(
         "runtimed",
@@ -35,7 +60,7 @@ pub(super) fn load_launch_catalog_into_state(state: &mut BrokerState) -> bool {
         )
         .as_str(),
     );
-    super::spawn::stderr_line(
+    debug_line(
         format!(
             "runtimed: launch catalog summary programs={} policies={}",
             programs.len(),
@@ -46,22 +71,21 @@ pub(super) fn load_launch_catalog_into_state(state: &mut BrokerState) -> bool {
     state.programs = programs;
     state.launch_entries = launch_entries;
     state.launch_catalog_loaded = true;
-    super::spawn::stderr_line("runtimed: launch catalog load done");
+    state.launch_catalog_retry_after = None;
+    state.launch_catalog_last_error = None;
+    debug_line("runtimed: launch catalog load done");
     boot_line("runtimed: launch catalog load done");
     true
 }
 
-pub(super) fn load_launch_catalog() -> (BTreeMap<String, ProgramMetadata>, Vec<LaunchEntry>) {
-    let load_started = Instant::now();
-    let registry_entries =
-        load_runtime_launch_program_entries(DEFAULT_RUNTIME_LAUNCH_REGISTRY_PATH)
-            .unwrap_or_default();
-    let registry_elapsed = load_started.elapsed().as_millis();
-    boot_line(
+pub(super) fn load_launch_catalog(
+) -> Result<(BTreeMap<String, ProgramMetadata>, Vec<LaunchEntry>), i32> {
+    let registry_entries = load_runtime_launch_program_entries(DEFAULT_RUNTIME_LAUNCH_REGISTRY_PATH)
+        .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))?;
+    debug_line(
         format!(
-            "runtimed: launch registry entries={} elapsed_ms={}",
-            registry_entries.len(),
-            registry_elapsed
+            "runtimed: launch registry snapshot entries={}",
+            registry_entries.len()
         )
         .as_str(),
     );
@@ -88,7 +112,7 @@ pub(super) fn load_launch_catalog() -> (BTreeMap<String, ProgramMetadata>, Vec<L
         .as_str(),
     );
 
-    (programs, launch_entries)
+    Ok((programs, launch_entries))
 }
 
 fn load_launch_entries(

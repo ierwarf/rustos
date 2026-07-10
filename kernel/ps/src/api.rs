@@ -4,12 +4,15 @@ pub use crate::multitask::{
     UserFaultDisposition, UserStackState, UserTaskBootstrap, UserTaskRegisters, WaitChildResult,
 };
 pub use crate::multitask::{
-    arm_block_current_task, block_current_task, block_current_user_task, cancel_block_current_task,
+    activate_suspended_user_task, arm_block_current_task, block_current_task,
+    block_current_user_task, cancel_block_current_task,
     commit_block_current_task, current_linux_thread_state, current_user_address_space,
     current_user_process_thread_count, current_user_stack_state, current_user_thread_id,
-    exec_current_user_process, exec_user_process_by_pid, exit_current_user_task,
-    is_user_task_alive, linux_thread_snapshot_by_ids, note_process_exit_status,
+    exec_current_user_process, exec_user_process_by_pid, exit_current_user_process,
+    exit_current_user_task, is_user_task_alive, linux_thread_snapshot_by_ids,
+    note_process_exit_status,
     queue_linux_signal, restore_current_simd_state, save_current_simd_state, set_next_pick_hint,
+    set_next_spawn_pick_hint,
     spawn_user_process_state_with_parent, spawn_user_process_with_parent, spawn_user_thread,
     wake_task, wake_user_task, with_current_mm, with_current_process_state,
     with_current_process_state_mut, with_current_user_linux_state_mut,
@@ -151,6 +154,14 @@ pub mod process {
             bootstrap,
             weight_micros,
         )
+    }
+
+    pub fn spawn_user_process_suspended(
+        address_space: crate::memory::paging::ProcessAddressSpace,
+        bootstrap: UserTaskBootstrap,
+        weight_micros: u64,
+    ) -> Result<u64, SpawnTaskError> {
+        crate::multitask::spawn_user_process_suspended(address_space, bootstrap, weight_micros)
     }
 
     pub fn spawn_kernel_process(

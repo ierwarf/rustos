@@ -11,11 +11,6 @@ package = "driverd"
 [install]
 path = "services/driverd/driverd.elf"
 
-[boot]
-preload = true
-required = false
-priority = -590
-
 [[desktop.entries]]
 display_name = "driverd"
 weight_micros = 100

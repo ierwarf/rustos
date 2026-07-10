@@ -45,9 +45,7 @@ pub struct FatDisk<D: BlockDevice> {
 impl<D: BlockDevice> FatDisk<D> {
     pub fn new(dev: D) -> Self {
         let block_size = dev.logical_block_size();
-        let mut scratch = Vec::with_capacity(block_size);
-        // The scratch buffer is always filled by read_blocks before bytes are read from it.
-        unsafe { scratch.set_len(block_size) };
+        let scratch = vec![0; block_size];
         Self {
             dev,
             pos: 0,

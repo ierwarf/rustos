@@ -14,12 +14,14 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_PROCD_OP_PROCESS_PREPARE, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
     COMMERCIAL_MAX_PROTOCOL_PROCD, CommercialMaxProtocolRequest, CommercialMaxProtocolResponse,
     IPC_SERVICE_CAP_PROCESS_LOADER, IPC_SERVICE_CAP_PROCESS_POLICY, LOADER_SPAWN_ARG_BYTES,
-    LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF, LOADER_SPAWN_MAX_ARG_COUNT,
-    LOADER_SPAWN_MAX_ENV_COUNT, PROC_BROKER_ABI_VERSION, PROC_BROKER_BATCH_CAPACITY,
+    LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_FLAG_DEFER_START, LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF,
+    LOADER_SPAWN_MAX_ARG_COUNT, LOADER_SPAWN_MAX_ENV_COUNT, PROC_BROKER_ABI_VERSION,
+    PROC_BROKER_BATCH_CAPACITY,
     PROC_BROKER_FORMAT_ELF64, PROC_BROKER_FORMAT_PE64, PROC_BROKER_LINUX_INTERP_PATH_CAPACITY,
     PROC_BROKER_MAP_EXEC, PROC_BROKER_MAP_PRIVATE, PROC_BROKER_MAP_READ, PROC_BROKER_MAP_WRITE,
     PROC_BROKER_USER_SPACE_BASE, PROC_BROKER_USER_SPACE_END_EXCLUSIVE, RustosProcAbortBrokerArgs,
-    RustosProcAuthorizeExecBrokerArgs, RustosProcCancelExecBrokerArgs, RustosProcCommitBrokerArgs,
+    RustosProcActivateBrokerArgs, RustosProcAuthorizeExecBrokerArgs,
+    RustosProcCancelExecBrokerArgs, RustosProcCommitBrokerArgs,
     RustosProcExecTargetBrokerArgs, RustosProcForkBrokerArgs, RustosProcMapDataBrokerArgs,
     RustosProcMapFileBatchBrokerArgs, RustosProcMapFileBrokerArgs, RustosProcMapZeroedBrokerArgs,
     RustosProcPrepareBrokerArgs, RustosProcSetLinuxRuntimeBrokerArgs,
@@ -486,9 +488,15 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
         Ok(args) => args,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
     };
-    const KNOWN_SPAWN_FLAGS: u64 =
-        SPAWN_FLAG_LOGICAL_ADMIN | LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF as u64;
-    if args.reserved0 != 0 || args.prepare_handle == 0 || args.flags & !KNOWN_SPAWN_FLAGS != 0 {
+    const KNOWN_SPAWN_FLAGS: u64 = SPAWN_FLAG_LOGICAL_ADMIN
+        | LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF as u64
+        | LOADER_SPAWN_FLAG_DEFER_START as u64;
+    if args.reserved0 != 0
+        || args.prepare_handle == 0
+        || args.flags & !KNOWN_SPAWN_FLAGS != 0
+        || args.flags & LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF as u64 != 0
+            && args.flags & LOADER_SPAWN_FLAG_DEFER_START as u64 != 0
+    {
         return linux_errno(LINUX_EINVAL);
     }
     let state = {
@@ -587,7 +595,9 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
         }
         _ => return linux_errno(LINUX_EINVAL),
     };
-    let spawned = if args.flags & LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF as u64 != 0 {
+    let spawned = if args.flags & LOADER_SPAWN_FLAG_DEFER_START as u64 != 0 {
+        crate::user::process::spawn_prepared_process_suspended(prepared, args.weight_micros)
+    } else if args.flags & LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF as u64 != 0 {
         crate::user::process::spawn_prepared_process(prepared, args.weight_micros)
     } else {
         crate::user::process::spawn_prepared_process_for_loader_reply(
@@ -599,6 +609,27 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
         Ok(spawned) => spawned.pid,
         Err(err) => linux_errno(process_load_error_to_linux_errno(err)),
     }
+}
+
+pub(super) fn syscall_linux_rustos_proc_activate_broker(args_ptr: u64) -> u64 {
+    if !current_process_can_load() {
+        return linux_errno(LINUX_EPERM);
+    }
+    let args = match usermem::read_current_user_struct::<RustosProcActivateBrokerArgs>(args_ptr) {
+        Ok(args) => args,
+        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+    };
+    if args.abi_version != PROC_BROKER_ABI_VERSION
+        || args.reserved0 != 0
+        || args.flags != 0
+        || args.target_pid == 0
+    {
+        return linux_errno(LINUX_EINVAL);
+    }
+    if !multitask::activate_suspended_user_task(args.target_pid) {
+        return linux_errno(LINUX_ESRCH);
+    }
+    0
 }
 
 pub(super) fn syscall_linux_rustos_proc_authorize_exec_broker(args_ptr: u64) -> u64 {

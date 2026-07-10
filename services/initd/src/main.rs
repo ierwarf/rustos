@@ -12,14 +12,16 @@ use runtime_control::{
 };
 use rustos_user_abi::syscall::{
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, LoaderSpawnRequest,
-    LoaderSpawnResponse, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    LoaderSpawnResponse, RustosIpcWaitServiceEndpointArgs, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
     COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR, COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL,
     IPC_SERVICE_DEVMGRD, IPC_SERVICE_DRIVERD, IPC_SERVICE_INPUTD, IPC_SERVICE_LINUX_SYSCALLD,
     IPC_SERVICE_LOADERD, IPC_SERVICE_NETD, IPC_SERVICE_ROOTD, IPC_SERVICE_SESSIOND,
-    IPC_SERVICE_STORAGED, IPC_SERVICE_VFSD, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION,
+    IPC_SERVICE_STORAGED, IPC_SERVICE_VFSD, IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION,
+    IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS, LOADER_OP_ACTIVATE, LOADER_OP_SPAWN_EXEC,
+    LOADER_REQUEST_ABI_VERSION,
     LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY,
-    LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF, SYS_RUSTOS_IPC_CALL,
-    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
+    LOADER_SPAWN_FLAG_DEFER_START, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT,
 };
 
 const INITD_EXEC_PATH: &str = "services/initd/initd.elf";
@@ -35,8 +37,6 @@ const INPUTD_EXEC_PATH: &str = "services/inputd/inputd.elf";
 const POLL_INTERVAL: Duration = Duration::from_millis(2);
 const RETRY_BACKOFF: Duration = Duration::from_millis(50);
 const INITD_LAUNCH_MAX_FAILURES: u32 = 32;
-const POST_INIT_ENDPOINT_READY_ATTEMPTS: u32 = 65_536;
-const POST_INIT_ENDPOINT_READY_LOG_EVERY: u32 = 256;
 const ROOTD_LEASE_REPORT_MAX_ATTEMPTS: u32 = 16;
 const DEFAULT_INIT_TASK_WEIGHT_MICROS: u64 = 1_000;
 const EARLY_POLICY_TASK_WEIGHT_MICROS: u64 = 4_000;
@@ -154,7 +154,13 @@ fn main() {
                         "initd: rootd lease report ok exec={} pid={pid}",
                         entry.exec
                     ));
-                    if let Err(err) = wait_reported_service_endpoint(entry.exec.as_str()) {
+                    if let Err(err) = activate_spawned_service(pid) {
+                        fail_closed(&format!(
+                            "initd: fatal service activation failed exec={} pid={pid} errno={err}",
+                            entry.exec
+                        ));
+                    }
+                    if let Err(err) = wait_reported_service_endpoint(entry.exec.as_str(), pid) {
                         fail_closed(&format!(
                             "initd: fatal service endpoint not ready exec={} pid={pid} errno={err}",
                             entry.exec
@@ -401,37 +407,30 @@ fn report_rootd_service_lease(exec_path: &str, pid: i32) -> Result<(), i32> {
     }
 }
 
-fn wait_reported_service_endpoint(exec_path: &str) -> Result<(), i32> {
+fn wait_reported_service_endpoint(exec_path: &str, pid: i32) -> Result<(), i32> {
     let Some(service_id) = rootd_service_id_for_exec(exec_path) else {
         return Ok(());
     };
-    for attempt in 0..POST_INIT_ENDPOINT_READY_ATTEMPTS {
-        let status = service_ready_status(service_id);
-        if status > 0 {
-            boot_line(&format!(
-                "initd: endpoint ready check success exec={} service_id={} attempt={attempt}",
-                exec_path,
-                service_id
-            ));
-            return Ok(());
-        }
-        if attempt % POST_INIT_ENDPOINT_READY_LOG_EVERY == 0 {
-            let status_text = if status == 0 {
-                "not-ready".to_string()
-            } else {
-                format!("errno={}", -status)
-            };
-            boot_line(&format!(
-                "initd: endpoint wait retry exec={} service_id={} attempt={} status={}",
-                exec_path,
-                service_id,
-                attempt,
-                status_text
-            ));
-        }
-        thread::sleep(POLL_INTERVAL);
+    let args = RustosIpcWaitServiceEndpointArgs {
+        abi_version: IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION,
+        service_id,
+        expected_pid: u64::try_from(pid).map_err(|_| libc::EINVAL)?,
+        timeout_ms: IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS,
+        ..RustosIpcWaitServiceEndpointArgs::default()
+    };
+    let status = unsafe {
+        libc::syscall(
+            SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT as libc::c_long,
+            (&args as *const RustosIpcWaitServiceEndpointArgs) as u64,
+        ) as i64
+    };
+    if status < 0 {
+        return Err((-status) as i32);
     }
-    Err(libc::ETIMEDOUT)
+    boot_line(&format!(
+        "initd: endpoint ready event exec={exec_path} service_id={service_id} pid={pid}"
+    ));
+    Ok(())
 }
 
 fn rootd_service_id_for_exec(exec_path: &str) -> Option<u64> {
@@ -647,6 +646,43 @@ fn spawn_exec_via_loaderd(exec_path: &str, env: &[CString]) -> Result<i32, i32> 
     Ok(pid)
 }
 
+fn activate_spawned_service(pid: i32) -> Result<(), i32> {
+    let request = LoaderSpawnRequest {
+        version: LOADER_REQUEST_ABI_VERSION,
+        op: LOADER_OP_ACTIVATE,
+        target_pid: u64::try_from(pid).map_err(|_| libc::EINVAL)?,
+        ..LoaderSpawnRequest::default()
+    };
+    let endpoint = lookup_loader_endpoint()?;
+    let mut response = LoaderSpawnResponse::default();
+    let call = unsafe {
+        libc::syscall(
+            SYS_RUSTOS_IPC_CALL as libc::c_long,
+            endpoint,
+            (&request as *const LoaderSpawnRequest) as u64,
+            size_of::<LoaderSpawnRequest>() as u64,
+            (&mut response as *mut LoaderSpawnResponse) as u64,
+            size_of::<LoaderSpawnResponse>() as u64,
+        ) as i64
+    };
+    if call < 0 {
+        LOADER_ENDPOINT_CACHE.store(0, Ordering::Relaxed);
+        return Err((-call) as i32);
+    }
+    if call as usize != size_of::<LoaderSpawnResponse>()
+        || response.version != LOADER_REQUEST_ABI_VERSION
+        || response.op != LOADER_OP_ACTIVATE
+        || response.pid != i64::from(pid)
+    {
+        return Err(libc::EINVAL);
+    }
+    if response.status != 0 {
+        return Err(response.status);
+    }
+    boot_line(&format!("initd: service activated pid={pid}"));
+    Ok(())
+}
+
 fn build_loader_spawn_request(
     exec_path: &str,
     argv: &[CString],
@@ -662,7 +698,7 @@ fn build_loader_spawn_request(
     let mut request = LoaderSpawnRequest {
         version: LOADER_REQUEST_ABI_VERSION,
         op: LOADER_OP_SPAWN_EXEC,
-        flags: 1 | LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF,
+        flags: 1 | LOADER_SPAWN_FLAG_DEFER_START,
         console_session: 0,
         weight_micros: exec_weight_micros(exec_path),
         exec_path_len: exec_bytes.len() as u32,

@@ -11,11 +11,6 @@ package = "storaged"
 [install]
 path = "services/storaged/storaged.elf"
 
-[boot]
-preload = true
-required = false
-priority = -575
-
 [[desktop.entries]]
 display_name = "storaged"
 weight_micros = 100

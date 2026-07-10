@@ -318,6 +318,7 @@ fn present_drawable_update(
     Ok(PresentUpdateResult::Rendered { deferred_update })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn commit_rendered_update(
     phase: &str,
     state: &AppState,
@@ -497,6 +498,7 @@ fn log_slow_runtime_refresh(
     ));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn log_slow_present(
     state: &AppState,
     elapsed: Duration,
@@ -579,6 +581,7 @@ fn log_pointer_moved_once(state: &AppState) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn log_cursor_pipeline_sample(
     phase: &str,
     state: &AppState,

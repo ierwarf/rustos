@@ -115,25 +115,6 @@ pub(crate) fn terminal_line_height() -> usize {
     TERMINAL_ATLAS.line_height
 }
 
-#[allow(dead_code)]
-pub(crate) fn measure_text(text: &str, style: TextStyle) -> usize {
-    let atlas = atlas_for_style(style);
-    let mut width = 0usize;
-    for ch in text.chars() {
-        let glyph = atlas.glyph(ch);
-        width = width.saturating_add(if atlas.monospace {
-            atlas.cell_width
-        } else {
-            glyph.advance.saturating_add(style.tracking_px)
-        });
-    }
-    width.saturating_sub(if atlas.monospace || text.is_empty() {
-        0
-    } else {
-        style.tracking_px
-    })
-}
-
 pub(crate) fn draw_text(
     canvas: &mut SurfaceCanvas<'_>,
     x: usize,

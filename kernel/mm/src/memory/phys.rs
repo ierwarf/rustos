@@ -299,7 +299,7 @@ impl PhysAllocatorState {
 
     fn free_frame_locked(&mut self, phys: PhysAddr) -> Result<(), FreeFrameError> {
         let phys_addr = phys.as_u64();
-        if phys_addr % PAGE_SIZE != 0 {
+        if !phys_addr.is_multiple_of(PAGE_SIZE) {
             return Err(FreeFrameError::NonPageAligned);
         }
 

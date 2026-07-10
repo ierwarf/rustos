@@ -345,15 +345,10 @@ fn handle_ready(
     state.ui_ready = true;
     observability_client::info!("runtimed", service, "ui ready received");
     boot_line("runtimed: ui ready received");
-    super::util::write_response(
-        stream,
-        RuntimeResponse {
-            version: PROTOCOL_VERSION,
-            op: OP_NOTIFY_READY,
-            status: 0,
-            count: 0,
-        },
-    )
+    // RuntimeClient::notify_ui_ready is deliberately one-way; the compositor
+    // closes this stream after the request, so replying here can stall boot.
+    let _ = stream;
+    Ok(())
 }
 
 pub(super) fn ensure_policy_launches(state: &mut BrokerState) -> bool {

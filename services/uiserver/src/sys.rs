@@ -88,7 +88,6 @@ struct PollFd {
     events: i16,
     revents: i16,
 }
-pub(crate) const ENOSYS: i32 = 38;
 pub(crate) const ESTALE: i32 = 116;
 pub(crate) type ConsoleSessionHandle = u64;
 
@@ -561,8 +560,8 @@ pub(crate) fn display_present_rect(
 pub(crate) fn map_surface(surface_fd: RawFd, mapping_len: usize) -> Result<SurfaceMapping, i32> {
     if mapping_len == 0
         || mapping_len > MAX_SURFACE_MAPPING_BYTES
-        || mapping_len % PAGE_SIZE != 0
-        || mapping_len % size_of::<u32>() != 0
+        || !mapping_len.is_multiple_of(PAGE_SIZE)
+        || !mapping_len.is_multiple_of(size_of::<u32>())
     {
         return Err(22);
     }
@@ -665,9 +664,6 @@ pub(crate) fn read_input(fds: &[OwnedFd], events: &mut [InputEvent]) -> Result<u
 }
 
 pub(crate) fn wait_for_input_ready(fds: &[OwnedFd]) -> Result<(), i32> {
-    if running_on_rustos() {
-        return Ok(());
-    }
     let mut poll_fds = Vec::with_capacity(fds.len());
     for fd in fds {
         poll_fds.push(PollFd {
@@ -676,15 +672,11 @@ pub(crate) fn wait_for_input_ready(fds: &[OwnedFd]) -> Result<(), i32> {
             revents: 0,
         });
     }
-    loop {
-        let ready = poll(&mut poll_fds, INPUT_READY_POLL_TIMEOUT_MS)?;
-        if ready == 0 {
-            return Ok(());
-        }
-        if poll_fds.iter().any(|fd| fd.revents & POLLIN != 0) {
-            return Ok(());
-        }
-        return Err(5);
+    let ready = poll(&mut poll_fds, INPUT_READY_POLL_TIMEOUT_MS)?;
+    if ready == 0 || poll_fds.iter().any(|fd| fd.revents & POLLIN != 0) {
+        Ok(())
+    } else {
+        Err(5)
     }
 }
 
@@ -1205,6 +1197,7 @@ unsafe fn syscall1(number: usize, arg0: usize) -> isize {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
         translate_linux_input_event, InputTranslationState, LinuxInputEvent, LinuxInputTimeval,

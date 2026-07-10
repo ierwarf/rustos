@@ -50,10 +50,18 @@ pub mod boot {
         crate::arch::acpi::init(boot_info_ptr);
     }
 
+    /// # Safety
+    ///
+    /// See `arch::asmtools::enter_higher_half`; this wrapper preserves the
+    /// same entry and boot-info validity requirements.
     pub unsafe fn enter_higher_half(entry: u64, boot_info_ptr: u64) -> ! {
         unsafe { crate::arch::asmtools::enter_higher_half(entry, boot_info_ptr) }
     }
 
+    /// # Safety
+    ///
+    /// See `arch::asmtools::call_with_stack`; `stack_top` must name a valid
+    /// writable kernel stack for `entry`.
     pub unsafe fn call_with_stack(entry: u64, arg0: u64, stack_top: u64) -> ! {
         unsafe { crate::arch::asmtools::call_with_stack(entry, arg0, stack_top) }
     }
@@ -109,6 +117,11 @@ pub mod interrupts {
         install_heartbeat_hooks(hooks);
     }
 
+    /// # Safety
+    ///
+    /// `context` must be a valid saved kernel context created by the matching
+    /// low-level context-save path, and restoring it must be the next control
+    /// transfer on this CPU.
     pub unsafe fn restore_kernel_saved_context(context: *mut SavedContext) -> ! {
         unsafe extern "C" {
             #[link_name = "restore_kernel_saved_context"]

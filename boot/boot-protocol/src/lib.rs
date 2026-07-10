@@ -100,7 +100,7 @@ impl FramebufferInfo {
             return Err(BootInfoValidationError::InvalidFramebuffer);
         }
 
-        if (self.addr as usize) % bytes_per_pixel != 0 {
+        if !(self.addr as usize).is_multiple_of(bytes_per_pixel) {
             return Err(BootInfoValidationError::InvalidFramebuffer);
         }
 
@@ -171,7 +171,7 @@ impl BootMemoryMap {
         if bytes == 0 {
             return Err(BootInfoValidationError::InvalidMemoryMap);
         }
-        if (self.entries_ptr as usize) % align_of::<BootMemoryRegion>() != 0 {
+        if !(self.entries_ptr as usize).is_multiple_of(align_of::<BootMemoryRegion>()) {
             return Err(BootInfoValidationError::InvalidMemoryMap);
         }
         self.entries_ptr
@@ -398,11 +398,16 @@ impl BootInfo {
         Ok(())
     }
 
+    /// # Safety
+    ///
+    /// `ptr` must reference readable memory containing a complete, aligned
+    /// `BootInfo`. This function validates the encoded fields, but cannot make
+    /// an unmapped or concurrently modified pointer safe to dereference.
     pub unsafe fn from_ptr<'a>(ptr: *const Self) -> Result<&'a Self, BootInfoValidationError> {
         if ptr.is_null() {
             return Err(BootInfoValidationError::NullPointer);
         }
-        if (ptr as usize) % align_of::<Self>() != 0 {
+        if !(ptr as usize).is_multiple_of(align_of::<Self>()) {
             return Err(BootInfoValidationError::NullPointer);
         }
 

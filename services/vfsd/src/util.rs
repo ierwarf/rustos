@@ -205,15 +205,6 @@ pub(super) fn unlink_policy(path: &str) -> i32 {
     }
 }
 
-pub(super) fn read_unaligned<T: Copy + Default>(bytes: &[u8]) -> T {
-    let mut value = T::default();
-    let dest = unsafe {
-        core::slice::from_raw_parts_mut((&mut value as *mut T).cast::<u8>(), size_of::<T>())
-    };
-    dest.copy_from_slice(&bytes[..size_of::<T>()]);
-    value
-}
-
 pub(super) fn as_bytes<T>(value: &T) -> &[u8] {
     unsafe { core::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
 }

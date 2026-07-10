@@ -1,0 +1,39 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+#
+# The first appliance build intentionally has no RustOS-specific kernel driver.
+# Standard virtio carries the data plane. This agent only publishes a local,
+# fail-closed readiness record until L0 supplies the authenticated control
+# channel described in MODEL.md.
+
+set -eu
+
+state_dir=/run/rustos-dvm
+ready_file="$state_dir/ready"
+
+announce() {
+    umask 077
+    mkdir -p "$state_dir"
+    cat >"$ready_file" <<'EOF'
+protocol=1
+role=linux-driver-domain
+control=not-connected
+data-plane=virtio
+capabilities=virtio-net,virtio-blk,virtio-console,virtio-input,virtio-vsock
+EOF
+    printf '%s\n' 'rustos-dvm-agent: ready protocol=1 control=not-connected' \
+        >/dev/console 2>/dev/null || true
+}
+
+case "${1:-announce}" in
+    announce)
+        announce
+        ;;
+    health)
+        test -r "$ready_file"
+        ;;
+    *)
+        echo "usage: $0 {announce|health}" >&2
+        exit 64
+        ;;
+esac

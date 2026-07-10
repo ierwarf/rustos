@@ -87,9 +87,6 @@ struct LinuxPolicyState {
     sid: u64,
     robust_head: u64,
     robust_len: u64,
-    rseq_area: u64,
-    rseq_len: u64,
-    rseq_signature: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -325,9 +322,6 @@ fn initial_state(request: &LinuxSyscallOffloadRequest) -> LinuxPolicyState {
         sid: request.pid,
         robust_head: 0,
         robust_len: 0,
-        rseq_area: 0,
-        rseq_len: 0,
-        rseq_signature: 0,
     }
 }
 
@@ -783,7 +777,7 @@ pub(crate) fn handle_brk(
 
     if requested_end > state.brk_mapped_end {
         let delta = requested_end - state.brk_mapped_end;
-        if let Err(_) = broker_simple(
+        if broker_simple(
             request.pid,
             MM_BROKER_OP_MAP_ANON,
             state.brk_mapped_end,
@@ -792,7 +786,9 @@ pub(crate) fn handle_brk(
             0,
             u64::MAX,
             0,
-        ) {
+        )
+        .is_err()
+        {
             copy_payload(response, &state.brk_current);
             return;
         }
@@ -814,7 +810,7 @@ pub(crate) fn handle_mmap(
     let flags = request.flags & !(MAP_DENYWRITE | MAP_EXECUTABLE);
     let fd = request.dirfd;
     let offset = mmap_offset(request);
-    if flags & MAP_ANONYMOUS == 0 && offset % PAGE_SIZE != 0 {
+    if flags & MAP_ANONYMOUS == 0 && !offset.is_multiple_of(PAGE_SIZE) {
         response.status = errno::EINVAL;
         return;
     }
@@ -839,7 +835,7 @@ pub(crate) fn handle_mmap(
     }
     let fixed = flags & MAP_FIXED != 0;
     let addr = if fixed {
-        if requested_addr == 0 || requested_addr % PAGE_SIZE != 0 {
+        if requested_addr == 0 || !requested_addr.is_multiple_of(PAGE_SIZE) {
             response.status = errno::EINVAL;
             return;
         }
@@ -955,7 +951,7 @@ pub(crate) fn handle_mprotect(
     let start = request.arg0;
     let len = request.arg1;
     let prot = request.mask as u64;
-    if start == 0 || start % PAGE_SIZE != 0 {
+    if start == 0 || !start.is_multiple_of(PAGE_SIZE) {
         response.status = errno::EINVAL;
         return;
     }
@@ -1065,7 +1061,7 @@ pub(crate) fn handle_munmap(
 ) {
     let start = request.arg0;
     let len = request.arg1;
-    if start == 0 || start % PAGE_SIZE != 0 {
+    if start == 0 || !start.is_multiple_of(PAGE_SIZE) {
         response.status = errno::EINVAL;
         return;
     }
@@ -1160,6 +1156,7 @@ fn describe_fd(pid: u64, fd: u64) -> Result<RustosMmFdBrokerResult, i32> {
     Ok(info)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn broker_simple(
     pid: u64,
     op: u16,
@@ -1185,6 +1182,7 @@ fn broker_simple(
     mm_broker_call(&args)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn broker_map(
     pid: u64,
     op: u16,
@@ -1430,6 +1428,8 @@ fn set_vma_prot(state: &mut MmPolicyState, start: u64, end: u64, prot: u64) {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
     use rustos_user_abi::syscall::LINUX_UTSNAME_SIZE;
 

@@ -11,11 +11,6 @@ package = "runtimed"
 [install]
 path = "services/runtimed/runtimed.elf"
 
-[boot]
-preload = true
-required = false
-priority = -577
-
 [[desktop.entries]]
 display_name = "runtimed"
 weight_micros = 100

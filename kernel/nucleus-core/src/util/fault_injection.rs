@@ -127,7 +127,7 @@ impl RuntimeFaultRule {
         match self.action {
             FaultAction::Fail => true,
             FaultAction::Off | FaultAction::DelayMs(_) => false,
-            FaultAction::DropEvery(n) => n != 0 && self.hits % u64::from(n) == 0,
+            FaultAction::DropEvery(n) => n != 0 && self.hits.is_multiple_of(u64::from(n)),
             FaultAction::FailAfter(n) => self.hits > n,
             FaultAction::RatePermille(rate) => {
                 if rate == 0 {
@@ -159,9 +159,7 @@ fn read_qemu_fw_cfg_file(name: &[u8]) -> Option<Vec<u8>> {
         }
         if fw_cfg_name_matches(&entry_name, name) {
             if size > MAX_FAULT_SPEC_BYTES {
-                let mut oversized = Vec::new();
-                oversized.resize(MAX_FAULT_SPEC_BYTES + 1, 0);
-                return Some(oversized);
+                return Some(alloc::vec![0; MAX_FAULT_SPEC_BYTES + 1]);
             }
             fw_cfg_select(selector);
             let mut data = Vec::with_capacity(size);

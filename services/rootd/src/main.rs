@@ -5,6 +5,7 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::mem::size_of;
+#[cfg(not(test))]
 use core::panic::PanicInfo;
 use core::ptr;
 use core::slice;
@@ -25,9 +26,9 @@ use rustos_user_abi::syscall::{
     IPC_SERVICE_INPUTD, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD, IPC_SERVICE_NETD,
     IPC_SERVICE_PAGERD, IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD, IPC_SERVICE_SERVICE_DRIVERD,
     IPC_SERVICE_SESSIOND, IPC_SERVICE_STORAGED, IPC_SERVICE_UISERVER, IPC_SERVICE_VFSD,
-    LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT, LOADER_OP_SPAWN_EXEC,
+    LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT, LOADER_OP_ACTIVATE, LOADER_OP_SPAWN_EXEC,
     LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES,
-    LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF, ROOTD_IPC_ABI_VERSION,
+    LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_FLAG_DEFER_START, ROOTD_IPC_ABI_VERSION,
     ROOTD_IPC_OP_LEASE_LIST, ROOTD_IPC_OP_STATUS, ROOTD_LEASE_STATE_EXITED,
     ROOTD_LEASE_STATE_FAILED, ROOTD_LEASE_STATE_RESTART_PENDING, ROOTD_LEASE_STATE_RUNNING,
     SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
@@ -200,7 +201,7 @@ unsafe impl GlobalAlloc for RootdBumpAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let align = layout.align().max(1);
         let size = layout.size();
-        let base = unsafe { ROOTD_HEAP.0.as_mut_ptr() as usize };
+        let base = core::ptr::addr_of_mut!(ROOTD_HEAP.0).cast::<u8>() as usize;
         let mut cursor = self.cursor.load(Ordering::Relaxed);
         loop {
             let aligned = (cursor + align - 1) & !(align - 1);
@@ -410,7 +411,11 @@ fn spawn_initd_via_loaderd(
                 leases[INITD_LEASE_INDEX].pid = pid;
                 leases[INITD_LEASE_INDEX].state = ROOTD_LEASE_STATE_RUNNING;
                 leases[INITD_LEASE_INDEX].exit_status = 0;
-                return;
+                if activate_exec_via_loaderd(pid).is_ok() {
+                    debug_line(b"rootd: initd activated\n");
+                    return;
+                }
+                fail_closed(b"rootd: fatal initd activation failed\n");
             }
             Err(_) => {
                 attempts = attempts.saturating_add(1);
@@ -736,10 +741,7 @@ fn fill_commercial_max_response(
             Ok(())
         }
         COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE => {
-            let lease = match lease_by_index(leases, request.arg0 as usize) {
-                Ok(lease) => lease,
-                Err(errno) => return Err(errno),
-            };
+            let lease = lease_by_index(leases, request.arg0 as usize)?;
             response.descriptor_count = 1;
             response.descriptors[0] = lease_descriptor(lease, request.header.op, 0);
             response.capability = lease_capability(lease, request.header.op);
@@ -752,10 +754,7 @@ fn fill_commercial_max_response(
             Ok(())
         }
         COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY => {
-            let lease = match lease_by_index(leases, request.arg0 as usize) {
-                Ok(lease) => lease,
-                Err(errno) => return Err(errno),
-            };
+            let lease = lease_by_index(leases, request.arg0 as usize)?;
             response.descriptor_count = 1;
             response.descriptors[0] = lease_descriptor(lease, request.header.op, 0);
             response.value0 = lease.restart_budget as u64;
@@ -793,24 +792,16 @@ fn fill_capability_response(
                 fill_capability_descriptors(leases, response);
                 return Ok(());
             }
-            let lease = match lease_by_service_or_index(leases, request.arg0, request.arg1 as usize)
-            {
-                Ok(lease) => lease,
-                Err(errno) => return Err(errno),
-            };
+            let lease = lease_by_service_or_index(leases, request.arg0, request.arg1 as usize)?;
             response.descriptor_count = 1;
             response.descriptors[0] = capability_descriptor(lease, request.header.op, 0);
-            response.capability = service_capability_lease(lease, request.header.op);
+            response.capability = service_capability_lease(lease);
             response.value0 = service_policy_capability(lease.service_id);
             response.value1 = lease.pid;
             Ok(())
         }
         COMMERCIAL_MAX_CAPABILITY_OP_LEASE_REVOKE => {
-            let lease = match lease_by_service_or_index(leases, request.arg0, request.arg1 as usize)
-            {
-                Ok(lease) => lease,
-                Err(errno) => return Err(errno),
-            };
+            let lease = lease_by_service_or_index(leases, request.arg0, request.arg1 as usize)?;
             response.descriptor_count = 1;
             response.descriptors[0] = capability_descriptor(lease, request.header.op, 0);
             response.value0 = u64::from(lease.state == ROOTD_LEASE_STATE_FAILED);
@@ -818,14 +809,10 @@ fn fill_capability_response(
             Ok(())
         }
         COMMERCIAL_MAX_CAPABILITY_OP_LEASE_RENEW => {
-            let lease = match lease_by_service_or_index(leases, request.arg0, request.arg1 as usize)
-            {
-                Ok(lease) => lease,
-                Err(errno) => return Err(errno),
-            };
+            let lease = lease_by_service_or_index(leases, request.arg0, request.arg1 as usize)?;
             response.descriptor_count = 1;
             response.descriptors[0] = capability_descriptor(lease, request.header.op, 0);
-            response.capability = service_capability_lease(lease, request.header.op);
+            response.capability = service_capability_lease(lease);
             response.value0 = service_policy_capability(lease.service_id);
             response.value1 = u64::from(lease.state == ROOTD_LEASE_STATE_RUNNING);
             Ok(())
@@ -970,7 +957,7 @@ fn capability_descriptor(
     descriptor
 }
 
-fn service_capability_lease(lease: &Lease, op: u16) -> CommercialMaxCapabilityLeaseWire {
+fn service_capability_lease(lease: &Lease) -> CommercialMaxCapabilityLeaseWire {
     let mut capability = CommercialMaxCapabilityLeaseWire {
         lease_id: ((COMMERCIAL_MAX_PROTOCOL_CAPABILITY as u64) << 32) | lease.service_id,
         service_id: lease.service_id,
@@ -994,15 +981,6 @@ fn rootd_capability_mask(op: u16) -> u64 {
         COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL => 1 << 4,
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY => 1 << 5,
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP => 1 << 6,
-        _ => 0,
-    }
-}
-
-fn capability_protocol_mask(op: u16) -> u64 {
-    match op {
-        COMMERCIAL_MAX_CAPABILITY_OP_LEASE_GRANT => 1 << 0,
-        COMMERCIAL_MAX_CAPABILITY_OP_LEASE_REVOKE => 1 << 1,
-        COMMERCIAL_MAX_CAPABILITY_OP_LEASE_RENEW => 1 << 2,
         _ => 0,
     }
 }
@@ -1259,8 +1237,7 @@ fn trim_nul(bytes: &'static [u8]) -> &'static [u8] {
 }
 
 fn restart_failed_leases(leases: &mut [Lease]) {
-    for index in 0..leases.len() {
-        let lease = &mut leases[index];
+    for (index, lease) in leases.iter_mut().enumerate() {
         if !matches!(
             lease.state,
             ROOTD_LEASE_STATE_EXITED | ROOTD_LEASE_STATE_RESTART_PENDING
@@ -1272,11 +1249,15 @@ fn restart_failed_leases(leases: &mut [Lease]) {
             continue;
         }
         match restart_lease(index, lease) {
-            Ok(pid) => {
+            Ok((pid, deferred_start)) => {
                 lease.pid = pid;
                 lease.restart_budget -= 1;
                 lease.state = ROOTD_LEASE_STATE_RUNNING;
                 lease.exit_status = 0;
+                if deferred_start && activate_exec_via_loaderd(pid).is_err() {
+                    lease.state = ROOTD_LEASE_STATE_RESTART_PENDING;
+                    lease.exit_status = -11;
+                }
             }
             Err(_) => {
                 lease.restart_budget -= 1;
@@ -1292,14 +1273,14 @@ fn restart_failed_leases(leases: &mut [Lease]) {
     }
 }
 
-fn restart_lease(index: usize, lease: &Lease) -> Result<u64, i64> {
+fn restart_lease(index: usize, lease: &Lease) -> Result<(u64, bool), i64> {
     if BOOTSTRAP_MANIFEST[index].restart_direct {
-        return spawn_exec(lease.exec_path, lease.weight_micros);
+        return spawn_exec(lease.exec_path, lease.weight_micros).map(|pid| (pid, false));
     }
     if !service_dependencies_ready(index) || !service_ready(IPC_SERVICE_LOADERD) {
         return Err(11);
     }
-    spawn_exec_via_loaderd(lease.exec_path, lease.weight_micros)
+    spawn_exec_via_loaderd(lease.exec_path, lease.weight_micros).map(|pid| (pid, true))
 }
 
 fn spawn_exec_via_loaderd(path: &'static [u8], weight_micros: u64) -> Result<u64, i64> {
@@ -1319,7 +1300,7 @@ fn spawn_exec_via_loaderd(path: &'static [u8], weight_micros: u64) -> Result<u64
     *request = empty_loader_spawn_request();
     request.version = LOADER_REQUEST_ABI_VERSION;
     request.op = LOADER_OP_SPAWN_EXEC;
-    request.flags = SPAWN_FLAG_LOGICAL_ADMIN as u32 | LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF;
+    request.flags = SPAWN_FLAG_LOGICAL_ADMIN as u32 | LOADER_SPAWN_FLAG_DEFER_START;
     request.weight_micros = weight_micros;
     request.exec_path_len = path.len() as u32;
     request.argv_count = 1;
@@ -1354,6 +1335,43 @@ fn spawn_exec_via_loaderd(path: &'static [u8], weight_micros: u64) -> Result<u64
         return Err(22);
     }
     Ok(response.pid as u64)
+}
+
+fn activate_exec_via_loaderd(pid: u64) -> Result<(), i64> {
+    let endpoint = syscall1(SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, IPC_SERVICE_LOADERD);
+    if endpoint <= 0 {
+        return Err(if endpoint < 0 { -endpoint } else { 11 });
+    }
+    let request = unsafe { &mut *INITD_LOADER_REQUEST.0.get() };
+    *request = empty_loader_spawn_request();
+    request.version = LOADER_REQUEST_ABI_VERSION;
+    request.op = LOADER_OP_ACTIVATE;
+    request.target_pid = pid;
+
+    let response = unsafe { &mut *INITD_LOADER_RESPONSE.0.get() };
+    *response = empty_loader_spawn_response();
+    let result = syscall5(
+        SYS_RUSTOS_IPC_CALL,
+        endpoint as u64,
+        (request as *const LoaderSpawnRequest) as u64,
+        size_of::<LoaderSpawnRequest>() as u64,
+        (response as *mut LoaderSpawnResponse) as u64,
+        size_of::<LoaderSpawnResponse>() as u64,
+    );
+    if result < 0 {
+        return Err(-result);
+    }
+    if result as usize != size_of::<LoaderSpawnResponse>()
+        || response.version != LOADER_REQUEST_ABI_VERSION
+        || response.op != LOADER_OP_ACTIVATE
+        || response.pid != pid as i64
+    {
+        return Err(22);
+    }
+    if response.status != 0 {
+        return Err(response.status as i64);
+    }
+    Ok(())
 }
 
 const fn empty_loader_spawn_request() -> LoaderSpawnRequest {
@@ -1492,24 +1510,6 @@ fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
     result
 }
 
-fn syscall4(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
-    let result: i64;
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") number as i64 => result,
-            in("rdi") arg0,
-            in("rsi") arg1,
-            in("rdx") arg2,
-            in("r10") arg3,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    result
-}
-
 fn syscall5(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
     let result: i64;
     unsafe {
@@ -1549,6 +1549,7 @@ fn syscall6(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, 
     result
 }
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
     fail_closed(b"rootd: panic\n");
@@ -1558,6 +1559,9 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
 pub extern "C" fn rust_eh_personality() {}
 
 #[no_mangle]
+/// # Safety
+///
+/// `dest` must be valid and writable for `len` bytes.
 pub unsafe extern "C" fn memset(dest: *mut u8, value: i32, len: usize) -> *mut u8 {
     let mut offset = 0usize;
     while offset < len {
@@ -1568,6 +1572,9 @@ pub unsafe extern "C" fn memset(dest: *mut u8, value: i32, len: usize) -> *mut u
 }
 
 #[no_mangle]
+/// # Safety
+///
+/// `src` and `dest` must be valid for `len` bytes and must not overlap.
 pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, len: usize) -> *mut u8 {
     let mut offset = 0usize;
     while offset < len {
@@ -1578,6 +1585,9 @@ pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, len: usize) -> *m
 }
 
 #[no_mangle]
+/// # Safety
+///
+/// `lhs` and `rhs` must be valid for `len` bytes.
 pub unsafe extern "C" fn memcmp(lhs: *const u8, rhs: *const u8, len: usize) -> i32 {
     let mut offset = 0usize;
     while offset < len {
@@ -1592,6 +1602,9 @@ pub unsafe extern "C" fn memcmp(lhs: *const u8, rhs: *const u8, len: usize) -> i
 }
 
 #[no_mangle]
+/// # Safety
+///
+/// `lhs` and `rhs` must be valid for `len` bytes.
 pub unsafe extern "C" fn bcmp(lhs: *const u8, rhs: *const u8, len: usize) -> i32 {
     memcmp(lhs, rhs, len)
 }

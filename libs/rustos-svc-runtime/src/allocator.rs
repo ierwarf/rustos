@@ -25,7 +25,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::syscall;
 use crate::BootstrapHeap;
 
-const GROW_CHUNK_BYTES: usize = 1 * 1024 * 1024;
+const GROW_CHUNK_BYTES: usize = 1024 * 1024;
 
 #[cfg(feature = "global-allocator")]
 struct BumpRegion {
@@ -102,7 +102,7 @@ unsafe impl GlobalAlloc for BumpAllocator {
         // Out of room — request a new chunk via raw mmap and bump there.
         let chunk = grow_chunk_bytes(size);
         let mapped = syscall::mmap_anonymous(chunk);
-        if mapped < 0 || mapped == 0 {
+        if mapped <= 0 {
             self.unlock();
             return ptr::null_mut();
         }

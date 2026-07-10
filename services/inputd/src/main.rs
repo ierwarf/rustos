@@ -885,6 +885,7 @@ fn scale_pointer_coordinate(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::InputQueue;
     use rustos_user_abi::syscall::{

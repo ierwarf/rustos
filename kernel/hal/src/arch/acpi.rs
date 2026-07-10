@@ -157,11 +157,11 @@ fn load_mcfg_regions(rsdp_addr: u64, state: &mut AcpiState) -> bool {
             le_u32(&entries[index..index + 4]) as u64
         };
 
-        if let Some(table) = sdt_bytes(table_addr) {
-            if &table[..4] == b"MCFG" {
-                loaded |= parse_mcfg_table(table, state);
-                break;
-            }
+        if let Some(table) = sdt_bytes(table_addr)
+            && &table[..4] == b"MCFG"
+        {
+            loaded |= parse_mcfg_table(table, state);
+            break;
         }
 
         index += entry_size;

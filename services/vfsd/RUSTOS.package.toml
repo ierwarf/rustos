@@ -12,11 +12,6 @@ linkage = "static-pie"
 [install]
 path = "services/vfsd/vfsd.elf"
 
-[boot]
-preload = true
-required = false
-priority = -589
-
 [[desktop.entries]]
 display_name = "vfsd"
 weight_micros = 100

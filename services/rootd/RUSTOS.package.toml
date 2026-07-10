@@ -11,11 +11,6 @@ package = "rootd"
 [install]
 path = "services/rootd/rootd.elf"
 
-[boot]
-preload = true
-required = true
-priority = -700
-
 [[desktop.entries]]
 display_name = "rootd"
 weight_micros = 100

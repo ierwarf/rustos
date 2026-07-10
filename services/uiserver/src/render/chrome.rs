@@ -509,7 +509,7 @@ fn ensure_shadow_mask(outer_w: usize, outer_h: usize) -> &'static ShadowMask {
     {
         if let Ok(cache) = shadow_mask_cache().lock() {
             if let Some(mask) = cache.get(&key) {
-                return *mask;
+                return mask;
             }
         }
     }

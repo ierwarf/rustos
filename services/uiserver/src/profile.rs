@@ -154,14 +154,6 @@ pub(crate) fn record_present(
         .saturating_add(duration_micros(present_elapsed));
 }
 
-pub(crate) fn record_throttle_spin() {
-    if !enabled() {
-        return;
-    }
-    let mut window = window().lock().unwrap();
-    window.throttle_spins = window.throttle_spins.saturating_add(1);
-}
-
 pub(crate) fn maybe_emit() {
     if !enabled() {
         return;

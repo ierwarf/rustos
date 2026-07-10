@@ -235,8 +235,7 @@ impl<'a> SurfaceCanvas<'a> {
         // layer per frame.
         let profile = corner_profile(r);
 
-        for dy in 0..r {
-            let row = profile[dy];
+        for (dy, row) in profile.iter().copied().enumerate().take(r) {
             let inset = row.inset as usize;
             if inset >= rect.width {
                 continue;
@@ -651,7 +650,7 @@ fn integer_sqrt(value: i64) -> u64 {
     }
 
     let mut estimate = value as u64;
-    let mut next = (estimate + 1) / 2;
+    let mut next = estimate.div_ceil(2);
     while next < estimate {
         estimate = next;
         next = (estimate + value as u64 / estimate) / 2;

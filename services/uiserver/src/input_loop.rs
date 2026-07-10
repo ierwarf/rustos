@@ -460,7 +460,7 @@ pub(crate) fn process_pending_input(
         && input_events <= MAX_WAYLAND_POINTER_FLUSH_EVENTS
         && started_at.elapsed() < INPUT_PROCESS_BUDGET;
     let pointer_wayland = if allow_wayland_pointer {
-        wayland.as_deref_mut()
+        wayland
     } else {
         None
     };

@@ -36,9 +36,10 @@ pub const DEFAULT_RUNTIME_LAUNCH_REGISTRY_PATH: &str =
     "/system/registry/system/runtime-launch-programs.tsv";
 pub const DEFAULT_RUNTIME_ENV_REGISTRY_PATH: &str = "/system/registry/system/runtime-env.tsv";
 
-static STARTUP_REGISTRY_CACHE: OnceLock<Option<Vec<StartupEntry>>> = OnceLock::new();
-static DESKTOP_REGISTRY_CACHE: OnceLock<Option<Vec<DesktopProgramEntry>>> = OnceLock::new();
-static RUNTIME_ENV_REGISTRY_CACHE: OnceLock<Option<Vec<RuntimeEnvEntry>>> = OnceLock::new();
+static STARTUP_REGISTRY_CACHE: OnceLock<Vec<StartupEntry>> = OnceLock::new();
+static DESKTOP_REGISTRY_CACHE: OnceLock<Vec<DesktopProgramEntry>> = OnceLock::new();
+static RUNTIME_LAUNCH_REGISTRY_CACHE: OnceLock<Vec<DesktopProgramEntry>> = OnceLock::new();
+static RUNTIME_ENV_REGISTRY_CACHE: OnceLock<Vec<RuntimeEnvEntry>> = OnceLock::new();
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -444,7 +445,11 @@ pub fn load_autostart_program_entries(
 pub fn load_runtime_launch_program_entries(
     path: &str,
 ) -> Result<Vec<DesktopProgramEntry>, std::io::Error> {
-    let mut entries = load_desktop_registry_entries(path)?;
+    let mut entries = if path == DEFAULT_RUNTIME_LAUNCH_REGISTRY_PATH {
+        cached_runtime_launch_registry_entries()?
+    } else {
+        load_desktop_registry_entries(path)?
+    };
     entries.retain(|entry| {
         entry.startup != StartupMode::None || (entry.autostart_enabled && !entry.hidden)
     });
@@ -551,21 +556,41 @@ fn load_startup_registry_entries(path: &str) -> Result<Vec<StartupEntry>, std::i
 }
 
 fn cached_startup_registry_entries() -> Option<Vec<StartupEntry>> {
-    STARTUP_REGISTRY_CACHE
-        .get_or_init(|| load_startup_registry_entries(DEFAULT_STARTUP_REGISTRY_PATH).ok())
-        .clone()
+    if let Some(entries) = STARTUP_REGISTRY_CACHE.get() {
+        return Some(entries.clone());
+    }
+    let entries = load_startup_registry_entries(DEFAULT_STARTUP_REGISTRY_PATH).ok()?;
+    let _ = STARTUP_REGISTRY_CACHE.set(entries);
+    STARTUP_REGISTRY_CACHE.get().cloned()
 }
 
 fn cached_desktop_registry_entries() -> Option<Vec<DesktopProgramEntry>> {
-    DESKTOP_REGISTRY_CACHE
-        .get_or_init(|| load_desktop_registry_entries(DEFAULT_DESKTOP_REGISTRY_PATH).ok())
-        .clone()
+    if let Some(entries) = DESKTOP_REGISTRY_CACHE.get() {
+        return Some(entries.clone());
+    }
+    let entries = load_desktop_registry_entries(DEFAULT_DESKTOP_REGISTRY_PATH).ok()?;
+    let _ = DESKTOP_REGISTRY_CACHE.set(entries);
+    DESKTOP_REGISTRY_CACHE.get().cloned()
+}
+
+fn cached_runtime_launch_registry_entries() -> Result<Vec<DesktopProgramEntry>, std::io::Error> {
+    if let Some(entries) = RUNTIME_LAUNCH_REGISTRY_CACHE.get() {
+        return Ok(entries.clone());
+    }
+    let entries = load_desktop_registry_entries(DEFAULT_RUNTIME_LAUNCH_REGISTRY_PATH)?;
+    let _ = RUNTIME_LAUNCH_REGISTRY_CACHE.set(entries);
+    RUNTIME_LAUNCH_REGISTRY_CACHE.get().cloned().ok_or_else(|| {
+        std::io::Error::other("runtime launch registry cache initialization failed")
+    })
 }
 
 fn cached_runtime_env_registry_entries() -> Option<Vec<RuntimeEnvEntry>> {
-    RUNTIME_ENV_REGISTRY_CACHE
-        .get_or_init(|| load_runtime_env_registry_entries(DEFAULT_RUNTIME_ENV_REGISTRY_PATH).ok())
-        .clone()
+    if let Some(entries) = RUNTIME_ENV_REGISTRY_CACHE.get() {
+        return Some(entries.clone());
+    }
+    let entries = load_runtime_env_registry_entries(DEFAULT_RUNTIME_ENV_REGISTRY_PATH).ok()?;
+    let _ = RUNTIME_ENV_REGISTRY_CACHE.set(entries);
+    RUNTIME_ENV_REGISTRY_CACHE.get().cloned()
 }
 
 fn load_runtime_env_registry_entries(path: &str) -> Result<Vec<RuntimeEnvEntry>, std::io::Error> {

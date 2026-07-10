@@ -421,7 +421,7 @@ fn stale_wayland_socket(runtime_dir: &str, socket_path: &str) -> std::io::Result
 fn safe_runtime_dir(value: &str) -> bool {
     let path = Path::new(value);
     !value.is_empty()
-        && value.len() <= 108 - WAYLAND_SOCKET_NAME.len() - 1
+        && value.len() < 108 - WAYLAND_SOCKET_NAME.len()
         && path.is_absolute()
         && path.components().all(|component| {
             matches!(
@@ -1651,9 +1651,7 @@ impl BufferData {
         for row in 0..damage.height {
             let Some(src_row) = start
                 .checked_add(
-                    (damage.y + row)
-                        .checked_mul(self.shared.stride)
-                        .unwrap_or(usize::MAX),
+                    (damage.y + row).saturating_mul(self.shared.stride),
                 )
                 .and_then(|row_start| row_start.checked_add(damage.x.saturating_mul(4)))
             else {

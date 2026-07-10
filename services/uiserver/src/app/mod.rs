@@ -446,7 +446,7 @@ fn integer_sqrt(value: i64) -> u64 {
     }
 
     let mut estimate = value as u64;
-    let mut next = (estimate + 1) / 2;
+    let mut next = estimate.div_ceil(2);
     while next < estimate {
         estimate = next;
         next = (estimate + value as u64 / estimate) / 2;

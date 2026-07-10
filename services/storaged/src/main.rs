@@ -106,8 +106,8 @@ fn reply_legacy_request(reply_cap: u64, request: &StoragedRequest, received: usi
         op: request.op,
         ..StoragedResponse::default()
     };
-    response.status = match validate(received as usize, &request) {
-        Ok(()) => dispatch(&request, &mut response),
+    response.status = match validate(received, request) {
+        Ok(()) => dispatch(request, &mut response),
         Err(errno) => errno,
     };
     let reply = syscall3(

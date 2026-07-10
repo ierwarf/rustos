@@ -53,7 +53,7 @@ impl BlockDevice for BootBlockDevice {
 
     fn read_blocks(&mut self, lba: u64, out: &mut [u8]) -> IoResult<()> {
         if self.block_size == 0
-            || out.len() % self.block_size != 0
+            || !out.len().is_multiple_of(self.block_size)
             || BLOCK_BROKER_MAX_IO_BYTES < self.block_size
         {
             return Err(StorageError::InvalidInput);

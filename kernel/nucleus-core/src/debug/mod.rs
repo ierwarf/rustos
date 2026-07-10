@@ -122,8 +122,8 @@ impl MilestoneRing {
         } else {
             0
         };
-        for index in 0..count {
-            out[index] = self.records[(start + index) % MILESTONE_CAPACITY];
+        for (index, slot) in out.iter_mut().enumerate().take(count) {
+            *slot = self.records[(start + index) % MILESTONE_CAPACITY];
         }
         count
     }

@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: MIT
+# Keep sources pinned. `scripts/build.sh fetch` verifies both SHA-256 values
+# before extracting or invoking Buildroot.
+BUILDROOT_VERSION=2026.05
+BUILDROOT_URL=https://buildroot.org/downloads/buildroot-2026.05.tar.xz
+BUILDROOT_SHA256=9d2f3af10fcac763a61ff6e41894a033f9ecf9267ba13dd0912eedcd3be2b22a
+
+LINUX_VERSION=6.12.94
+LINUX_URL=https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.94.tar.xz
+LINUX_SHA256=e998a232b9418db3301cb58468e291a4f41d6ab8306029b30d991f56251dc8d2

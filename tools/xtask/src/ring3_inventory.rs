@@ -227,9 +227,7 @@ fn owner_for_path(path: &Path) -> &'static str {
         "display-ko-compat"
     } else if path.contains("/usb/core.rs") {
         "driverd-devmgrd-inputd"
-    } else if path.contains("/storage/ahci.rs") {
-        "storaged-driverd"
-    } else if path.contains("/storage/nvme.rs") {
+    } else if path.contains("/storage/ahci.rs") || path.contains("/storage/nvme.rs") {
         "storaged-driverd"
     } else if path.contains("/driver/linux/")
         || path.contains("/driver/devres.rs")
@@ -240,9 +238,7 @@ fn owner_for_path(path: &Path) -> &'static str {
         || path.ends_with("/driver/pci.rs")
     {
         "linux-ko-compat"
-    } else if path.contains("services/vfsd/") {
-        "vfsd"
-    } else if path.contains("/sysops/stat.rs") {
+    } else if path.contains("services/vfsd/") || path.contains("/sysops/stat.rs") {
         "vfsd"
     } else if path.ends_with("/ps/src/user/linux.rs") {
         "syscalld-loaderd-procd"
@@ -286,8 +282,6 @@ fn owner_for_path(path: &Path) -> &'static str {
         "syscalld-loaderd"
     } else if path.ends_with("/compat/src/user/sysops/mod.rs") {
         "vfsd-devmgrd-sessiond"
-    } else if path.ends_with("/compat/src/user/mod.rs") {
-        "syscalld-loaderd-procd-vfsd-netd"
     } else if path.contains("/memfd.rs") {
         "pagerd-procd"
     } else if path.contains("/sysops/console.rs") {
@@ -578,8 +572,6 @@ fn action_for_path(path: &Path) -> &'static str {
         || path.contains("/service_ops/process_time.rs")
     {
         "move thread/futex/time policy into procd/syscalld, keep scheduler substrate"
-    } else if path.contains("/service_ops/ipc_helpers.rs") {
-        "move direct service routing policy into owner services, keep IPC copy substrate"
     } else if path.contains("/block_broker_ops.rs") || path.contains("/storage_broker_ops.rs") {
         "move boot block/storage descriptor policy into storaged/vfsd, keep gated physical substrate"
     } else if path.contains("/device_broker_ops.rs")
@@ -604,8 +596,6 @@ fn action_for_path(path: &Path) -> &'static str {
         || path.contains("/syscall/linux/support.rs")
     {
         "move syscall support policy into syscalld/procd, keep syscall entry substrate"
-    } else if path.contains("/syscall/windows/") {
-        "move Win32 syscall policy into syscalld/loaderd, keep syscall decode substrate"
     } else if path.ends_with("/compat/src/user/sysops/mod.rs") {
         "move sysop namespace policy into vfsd/devmgrd/sessiond, keep module routing substrate"
     } else if path.contains("/sysops/console.rs") || path.contains("/console_host.rs") {
@@ -620,8 +610,6 @@ fn action_for_path(path: &Path) -> &'static str {
         "move post-bootstrap storage policy into storaged, keep raw block broker"
     } else if path.contains("/process/") || path.contains("/proc_broker_ops.rs") {
         "move cold image/process policy into loaderd/procd before deleting ring0 parser branches"
-    } else if path.contains("/ipc_ops.rs") {
-        "move namespace/capability policy behind rootd capability protocol"
     } else {
         "replace marked policy with service-owned protocol and then remove marker"
     }

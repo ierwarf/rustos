@@ -13,6 +13,10 @@ pub fn current_rip() -> u64 {
     rip
 }
 
+/// # Safety
+///
+/// `entry` must be a valid higher-half entry point and `boot_info_ptr` must
+/// remain valid under the higher-half mapping after the stack adjustment.
 pub unsafe fn enter_higher_half(entry: u64, boot_info_ptr: u64) -> ! {
     unsafe {
         // Pin inputs to fixed registers so the compiler cannot alias the jump
@@ -32,6 +36,10 @@ pub unsafe fn enter_higher_half(entry: u64, boot_info_ptr: u64) -> ! {
     }
 }
 
+/// # Safety
+///
+/// `entry` must follow the RustOS kernel calling convention and `stack_top`
+/// must name a writable, suitably sized stack that remains mapped after entry.
 pub unsafe fn call_with_stack(entry: u64, arg0: u64, stack_top: u64) -> ! {
     unsafe {
         asm!(

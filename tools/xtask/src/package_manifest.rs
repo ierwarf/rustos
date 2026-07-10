@@ -99,6 +99,7 @@ pub(crate) enum BuilderKind {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BuildSpec {
     pub(crate) builder: BuilderKind,
     #[serde(default)]
@@ -126,28 +127,15 @@ pub(crate) struct BuildSpec {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct InstallSpec {
     pub(crate) path: String,
     #[serde(default = "default_install_layout")]
     pub(crate) layout: InstallLayout,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
-#[allow(dead_code)]
-pub(crate) struct BootSpec {
-    #[serde(default)]
-    pub(crate) preload: bool,
-    // Parsed today to keep the package schema stable while boot policy migration catches up.
-    #[allow(dead_code)]
-    #[serde(default)]
-    pub(crate) required: bool,
-    // Parsed today to keep manifest-driven boot ordering forward-compatible.
-    #[allow(dead_code)]
-    #[serde(default)]
-    pub(crate) priority: i32,
-}
-
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AutoloadSpec {
     pub(crate) name: String,
     pub(crate) class: String,
@@ -177,12 +165,15 @@ fn default_autoload_enabled() -> bool {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DesktopEntrySpec {
     pub(crate) display_name: String,
     #[serde(default)]
     pub(crate) image: Option<String>,
     #[serde(default)]
     pub(crate) exec: Option<String>,
+    #[serde(default)]
+    pub(crate) no_display: bool,
     pub(crate) weight_micros: u64,
     #[serde(default)]
     pub(crate) logical_admin: bool,
@@ -201,12 +192,14 @@ fn default_console_hosted() -> bool {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DesktopSection {
     #[serde(default)]
     pub(crate) entries: Vec<DesktopEntrySpec>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PackageManifest {
     pub(crate) id: String,
     pub(crate) kind: PackageKind,
@@ -218,9 +211,6 @@ pub(crate) struct PackageManifest {
     pub(crate) install: InstallSpec,
     #[serde(default = "default_startup_mode")]
     pub(crate) startup: StartupMode,
-    #[allow(dead_code)]
-    #[serde(default)]
-    pub(crate) boot: BootSpec,
     #[serde(default)]
     pub(crate) autoload: Option<AutoloadSpec>,
     #[serde(default)]
@@ -690,7 +680,6 @@ mod tests {
                 layout: InstallLayout::File,
             },
             startup: StartupMode::None,
-            boot: BootSpec::default(),
             autoload: None,
             desktop: DesktopSection::default(),
             runtime_deps: runtime_deps.iter().map(|dep| dep.to_string()).collect(),
@@ -781,5 +770,36 @@ mod tests {
         assert!(!is_normal_relative_install_path(
             "./services/initd/initd.elf"
         ));
+    }
+
+    #[test]
+    fn rejects_retired_boot_metadata() {
+        let err = validate_manifest_text_for_testinfra(
+            "id = \"example\"\nkind = \"service\"\n[build]\nbuilder = \"cargo-kernel-binary\"\n[install]\npath = \"services/example/example.elf\"\n[boot]\npreload = true\nrequired = false\npriority = -1\n",
+        )
+        .expect_err("retired boot metadata must not be silently ignored");
+
+        assert!(err.to_string().contains("unknown field `boot`"));
+    }
+
+    #[test]
+    fn rejects_unknown_nested_metadata() {
+        let err = validate_manifest_text_for_testinfra(
+            "id = \"example\"\nkind = \"service\"\n[build]\nbuilder = \"cargo-kernel-binary\"\nunknown = true\n[install]\npath = \"services/example/example.elf\"\n",
+        )
+        .expect_err("unknown build metadata must not be silently ignored");
+
+        assert!(err.to_string().contains("unknown field `unknown`"));
+    }
+
+    #[test]
+    fn parses_top_level_startup_and_desktop_visibility() {
+        let manifest: PackageManifest = toml::from_str(
+            "id = \"example\"\nkind = \"app\"\nstartup = \"session\"\n[build]\nbuilder = \"cargo-kernel-binary\"\n[install]\npath = \"apps/example/example.elf\"\n[[desktop.entries]]\ndisplay_name = \"example\"\nweight_micros = 100\nno_display = true\n",
+        )
+        .expect("valid top-level startup metadata");
+
+        assert_eq!(manifest.startup, StartupMode::Session);
+        assert!(manifest.desktop.entries[0].no_display);
     }
 }

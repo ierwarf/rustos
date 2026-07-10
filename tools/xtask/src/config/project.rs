@@ -377,7 +377,7 @@ fn parse_project_config(path: &Path) -> Result<ProjectConfig> {
 }
 
 pub(crate) fn validate_project_config_text(text: &str) -> Result<()> {
-    let parsed = toml::from_str::<ProjectConfigFile>(&text)
+    let parsed = toml::from_str::<ProjectConfigFile>(text)
         .map_err(|err| anyhow!("invalid RustOS config: {err}"))?;
     let config = project_from_file(parsed);
     validate_kernel_build(&config.kernel.build)?;

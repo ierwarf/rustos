@@ -7,7 +7,9 @@
 ## English
 
 `RUSTOS.package.toml` is the deployment source of truth. The parser and schema
-types are in `tools/xtask/src/package_manifest.rs`.
+types are in `tools/xtask/src/package_manifest.rs`. Unknown top-level and
+nested fields are rejected; do not leave inactive compatibility metadata in a
+manifest.
 
 ### Minimal Shape
 
@@ -71,6 +73,7 @@ console_hosted = false
 | `display_name` | UI/runtime display name. |
 | `image` | Optional staged image path override. |
 | `exec` | Optional executable path override. |
+| `no_display` | Hide this entry from application discovery while retaining its launch policy. |
 | `weight_micros` | Scheduling/task weight metadata. |
 | `logical_admin` | Marks privileged/admin-style components. |
 | `console_hosted` | Whether runtime should host it through console. |
@@ -107,7 +110,8 @@ default QEMU machine exposes that hardware. Fallback providers in the same
 ## 한국어
 
 `RUSTOS.package.toml`은 deployment source of truth입니다. parser와 schema type은
-`tools/xtask/src/package_manifest.rs`에 있습니다.
+`tools/xtask/src/package_manifest.rs`에 있습니다. 알 수 없는 top-level/nested field는
+오류로 처리하므로, 효과 없는 compatibility metadata를 manifest에 남기지 마세요.
 
 ### 최소 형태
 
@@ -171,6 +175,7 @@ console_hosted = false
 | `display_name` | UI/runtime display name |
 | `image` | optional staged image path override |
 | `exec` | optional executable path override |
+| `no_display` | launch policy는 유지하고 application discovery에서는 숨깁니다. |
 | `weight_micros` | scheduling/task weight metadata |
 | `logical_admin` | privileged/admin-style component 표시 |
 | `console_hosted` | runtime이 console로 host할지 여부 |

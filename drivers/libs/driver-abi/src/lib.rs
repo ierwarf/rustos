@@ -670,6 +670,9 @@ pub struct DriverKernelApiV1 {
 }
 
 impl DriverKernelApiV1 {
+    // This mirrors the fixed C ABI callback table. Grouping the fields would
+    // change the constructor contract without reducing the exposed ABI width.
+    #[allow(clippy::too_many_arguments)]
     pub const fn new(
         register_serio_driver: Option<RegisterSerioDriverFn>,
         report_pointer_packet: Option<ReportPointerPacketFn>,

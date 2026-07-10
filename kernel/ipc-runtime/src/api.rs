@@ -1,5 +1,6 @@
 pub use crate::ipc::{
-    EndpointWakeSet, IpcError, KernelEndpointHandle, KernelReplyHandle, KernelSharedRegionHandle,
+    EndpointReceived, EndpointReceivedWithSender, EndpointResponseWithHandles, EndpointWakeSet,
+    IpcError, KernelEndpointHandle, KernelReplyHandle, KernelSharedRegionHandle,
     KernelTransferredHandle,
 };
 
@@ -55,14 +56,7 @@ pub mod endpoint {
         endpoint: KernelEndpointHandle,
         request_capacity: usize,
         handle_capacity: usize,
-    ) -> Result<
-        Option<(
-            KernelReplyHandle,
-            alloc::vec::Vec<u8>,
-            alloc::vec::Vec<KernelTransferredHandle>,
-        )>,
-        IpcError,
-    > {
+    ) -> Result<Option<super::EndpointReceived>, IpcError> {
         crate::ipc::recv_endpoint_with_limits_and_handles(
             endpoint,
             request_capacity,
@@ -74,15 +68,7 @@ pub mod endpoint {
         endpoint: KernelEndpointHandle,
         request_capacity: usize,
         handle_capacity: usize,
-    ) -> Result<
-        Option<(
-            KernelReplyHandle,
-            alloc::vec::Vec<u8>,
-            alloc::vec::Vec<KernelTransferredHandle>,
-            u64,
-        )>,
-        IpcError,
-    > {
+    ) -> Result<Option<super::EndpointReceivedWithSender>, IpcError> {
         crate::ipc::recv_endpoint_with_sender_and_limits(
             endpoint,
             request_capacity,
@@ -118,13 +104,7 @@ pub mod endpoint {
     pub fn take_response_with_handle_limit(
         reply: KernelReplyHandle,
         handle_capacity: usize,
-    ) -> Result<
-        Option<(
-            alloc::vec::Vec<u8>,
-            alloc::vec::Vec<KernelTransferredHandle>,
-        )>,
-        IpcError,
-    > {
+    ) -> Result<Option<super::EndpointResponseWithHandles>, IpcError> {
         crate::ipc::take_endpoint_response_with_handle_limit(reply, handle_capacity)
     }
 

@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::AtomicU64;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use runtime_control::{StartupMode, DEFAULT_RUNTIME_SOCKET_PATH};
-use rustos_user_abi::console::{self as console_abi};
+use rustos_user_abi::console as console_abi;
+use rustos_user_abi::syscall::SYS_RUSTOS_DEBUG_PRINT;
 
 mod catalog;
 mod session;
@@ -36,15 +36,14 @@ pub(crate) const MAX_RUNTIME_PROGRAMS: usize = 64;
 pub(crate) const MAX_EXEC_ARG_COUNT: usize = 32;
 pub(crate) const MAX_EXEC_ENV_COUNT: usize = 64;
 pub(crate) const MAX_EXEC_TEXT_BYTES: usize = 256;
-pub(crate) const SYS_IOCTL: usize = 16;
 pub(crate) const SYS_OPENAT: usize = 257;
 pub(crate) const AT_FDCWD: isize = -100;
 pub(crate) const O_RDWR: usize = 2;
-pub(crate) const LINUX_TCGETS: u64 = libc::TCGETS as u64;
-pub(crate) const LINUX_TCSETS: u64 = libc::TCSETS as u64;
-pub(crate) const LINUX_TCSETSW: u64 = libc::TCSETSW as u64;
-pub(crate) const LINUX_TCSETSF: u64 = libc::TCSETSF as u64;
-pub(crate) const LINUX_FIONREAD: u64 = libc::FIONREAD as u64;
+pub(crate) const LINUX_TCGETS: u64 = libc::TCGETS;
+pub(crate) const LINUX_TCSETS: u64 = libc::TCSETS;
+pub(crate) const LINUX_TCSETSW: u64 = libc::TCSETSW;
+pub(crate) const LINUX_TCSETSF: u64 = libc::TCSETSF;
+pub(crate) const LINUX_FIONREAD: u64 = libc::FIONREAD;
 pub(crate) const CONSOLE_SESSION_STATE_LOADING_IMAGE: u16 =
     console_abi::CONSOLE_SESSION_STATE_LOADING_IMAGE;
 pub(crate) const CONSOLE_SESSION_STATE_SPAWNING: u16 = console_abi::CONSOLE_SESSION_STATE_SPAWNING;
@@ -145,18 +144,35 @@ pub(crate) struct BrokerState {
     pub(crate) programs: BTreeMap<String, ProgramMetadata>,
     pub(crate) ui_ready: bool,
     pub(crate) launch_catalog_loaded: bool,
+    pub(crate) launch_catalog_retry_after: Option<Instant>,
+    pub(crate) launch_catalog_last_error: Option<i32>,
 }
 
 pub(crate) fn boot_line(message: &str) {
     if option_env!("RUSTOS_LOGGING_BOOT_TRACE_ENABLED") != Some("true") {
         return;
     }
-    let _ = std::io::stderr().write_all(message.as_bytes());
-    let _ = std::io::stderr().write_all(b"\n");
+    debug_line(message);
+}
+
+// Debugcon bypasses runtimed's own session/console IPC path during bootstrap.
+pub(crate) fn debug_line(message: &str) {
+    let bytes = message.as_bytes();
+    let len = bytes.len().min(1023);
+    let mut line = [0_u8; 1024];
+    line[..len].copy_from_slice(&bytes[..len]);
+    line[len] = b'\n';
+    unsafe {
+        let _ = libc::syscall(
+            SYS_RUSTOS_DEBUG_PRINT as libc::c_long,
+            line.as_ptr(),
+            len + 1,
+        );
+    }
 }
 
 fn main() {
-    spawn::stderr_line("runtimed: service start");
+    spawn::debug_line("runtimed: service start");
     boot_line("runtimed: service start");
     let listener = match socket::bind_listener(DEFAULT_RUNTIME_SOCKET_PATH) {
         Ok(listener) => listener,
@@ -170,7 +186,7 @@ fn main() {
             return;
         }
     };
-    spawn::stderr_line("runtimed: runtime socket ready");
+    spawn::debug_line("runtimed: runtime socket ready");
     boot_line("runtimed: runtime socket ready");
     let session_endpoint = session::create_session_endpoint();
 
@@ -187,8 +203,10 @@ fn main() {
         programs: BTreeMap::new(),
         ui_ready: false,
         launch_catalog_loaded: false,
+        launch_catalog_retry_after: None,
+        launch_catalog_last_error: None,
     };
-    spawn::stderr_line("runtimed: bootstrap ui begin");
+    spawn::debug_line("runtimed: bootstrap ui begin");
     boot_line("runtimed: bootstrap ui begin");
     if let Err(err) = session::bootstrap_ui_server(&mut state) {
         observability_client::error!(
@@ -198,7 +216,7 @@ fn main() {
             UI_SERVER_EXEC_PATH
         );
     } else {
-        spawn::stderr_line("runtimed: bootstrap ui done");
+        spawn::debug_line("runtimed: bootstrap ui done");
         boot_line("runtimed: bootstrap ui done");
     }
     loop {

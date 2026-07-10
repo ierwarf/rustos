@@ -118,3 +118,9 @@ impl<T: Copy, const CAPACITY: usize> RingBuffer<T, CAPACITY> {
         }
     }
 }
+
+impl<T: Copy, const CAPACITY: usize> Default for RingBuffer<T, CAPACITY> {
+    fn default() -> Self {
+        Self::new()
+    }
+}

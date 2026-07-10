@@ -219,7 +219,7 @@ impl MemBlockDevice {
     }
 
     pub fn from_bytes(block_size: usize, data: Vec<u8>) -> IoResult<Self> {
-        if block_size < 512 || data.len() % block_size != 0 {
+        if block_size < 512 || !data.len().is_multiple_of(block_size) {
             return Err(StorageError::InvalidInput);
         }
         Ok(Self { block_size, data })
@@ -524,7 +524,7 @@ fn parse_fat_volume_metadata(
 }
 
 fn validate_block_io(block_size: usize, lba: u64, total_blocks: u64, len: usize) -> IoResult<()> {
-    if block_size < 512 || len == 0 || len % block_size != 0 {
+    if block_size < 512 || len == 0 || !len.is_multiple_of(block_size) {
         return Err(StorageError::InvalidInput);
     }
     let blocks = (len / block_size) as u64;

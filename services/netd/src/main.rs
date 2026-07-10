@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io::Write;
 use std::mem::size_of;
 use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant as StdInstant};
 
@@ -36,6 +37,8 @@ use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
 const RECV_BACKOFF: Duration = Duration::from_millis(1);
+const MAX_PENDING_INET_REQUESTS: usize = 32;
+static PENDING_INET_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 const MAX_LISTEN_BACKLOG: usize = 128;
 const SOCKET_BUFFER_CAPACITY: usize = 1024 * 1024;
 const SOCKET_CONTROL_BUFFER_CAPACITY: usize = 64 * 1024;
@@ -109,6 +112,12 @@ fn serve(endpoint: u64) {
             ..NetdIpcResponse::default()
         };
         response.status = match validate_request(received as usize, &request) {
+            Ok(()) if is_blocking_inet_request(&request) => {
+                if spawn_blocking_inet_request(request, reply_cap) {
+                    continue;
+                }
+                libc::EAGAIN
+            }
             Ok(()) => dispatch_request(&request, &mut response),
             Err(errno) => errno,
         };
@@ -122,6 +131,83 @@ fn serve(endpoint: u64) {
             let _ = writeln!(std::io::stderr(), "netd: reply failed errno={}", -reply);
         }
     }
+}
+
+fn is_blocking_inet_request(request: &NetdIpcRequest) -> bool {
+    let inet_operation = match request.op {
+        SYSCALL_OFFLOAD_OP_LINUX_CONNECT => {
+            sockaddr_family(request) == Some(linux_abi::AF_INET)
+        }
+        SYSCALL_OFFLOAD_OP_LINUX_SENDTO
+        | SYSCALL_OFFLOAD_OP_LINUX_SENDMSG
+        | SYSCALL_OFFLOAD_OP_LINUX_RECVFROM
+        | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG => inet_socket_exists(request.socket_token),
+        _ => false,
+    };
+    inet_operation
+        && request.status_flags & linux_abi::O_NONBLOCK == 0
+        && request_msg_flags(request) & linux_abi::MSG_DONTWAIT == 0
+}
+
+fn spawn_blocking_inet_request(request: NetdIpcRequest, reply_cap: u64) -> bool {
+    if PENDING_INET_REQUESTS
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+            (pending < MAX_PENDING_INET_REQUESTS).then_some(pending + 1)
+        })
+        .is_err()
+    {
+        return false;
+    }
+    let spawned = thread::Builder::new()
+        .name(String::from("netd-inet-wait"))
+        .spawn(move || {
+            let mut response = NetdIpcResponse {
+                version: NETD_IPC_ABI_VERSION,
+                op: request.op,
+                ..NetdIpcResponse::default()
+            };
+            response.status = run_blocking_inet_request(&request, &mut response);
+            let _ = syscall3(
+                SYS_RUSTOS_IPC_REPLY,
+                reply_cap,
+                (&response as *const NetdIpcResponse) as u64,
+                size_of::<NetdIpcResponse>() as u64,
+            );
+            PENDING_INET_REQUESTS.fetch_sub(1, Ordering::AcqRel);
+        });
+    if spawned.is_err() {
+        PENDING_INET_REQUESTS.fetch_sub(1, Ordering::AcqRel);
+        return false;
+    }
+    true
+}
+
+fn run_blocking_inet_request(
+    request: &NetdIpcRequest,
+    response: &mut NetdIpcResponse,
+) -> i32 {
+    if request.op == SYSCALL_OFFLOAD_OP_LINUX_CONNECT {
+        let mut status = begin_inet_connect(request);
+        let deadline = StdInstant::now() + INET_CONNECT_TIMEOUT;
+        while status == libc::EINPROGRESS && StdInstant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+            status = poll_inet_connect(request);
+        }
+        return if status == libc::EINPROGRESS {
+            libc::ETIMEDOUT
+        } else {
+            status
+        };
+    }
+
+    for _ in 0..INET_IO_POLL_BUDGET {
+        let status = dispatch_request(request, response);
+        if status != libc::EAGAIN {
+            return status;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    libc::EAGAIN
 }
 
 fn reply_commercial_request(reply_cap: u64, request: &CommercialMaxProtocolRequest) -> i64 {
@@ -724,6 +810,10 @@ fn handle_connect(request: &NetdIpcRequest) -> i32 {
 }
 
 fn handle_inet_connect(request: &NetdIpcRequest) -> i32 {
+    begin_inet_connect(request)
+}
+
+fn begin_inet_connect(request: &NetdIpcRequest) -> i32 {
     let (remote, port) = match sockaddr_in_from_payload(request) {
         Ok(endpoint) => endpoint,
         Err(errno) => return errno,
@@ -740,8 +830,11 @@ fn handle_inet_connect(request: &NetdIpcRequest) -> i32 {
     let local_port = stack.next_ephemeral_port();
     {
         let socket = stack.sockets.get_mut::<tcp::Socket>(tcp_handle);
+        if socket.may_send() {
+            return 0;
+        }
         if socket.is_open() {
-            return libc::EISCONN;
+            return libc::EINPROGRESS;
         }
         socket.set_timeout(Some(smoltcp::time::Duration::from_millis(
             INET_CONNECT_TIMEOUT.as_millis().min(u64::MAX as u128) as u64,
@@ -753,21 +846,38 @@ fn handle_inet_connect(request: &NetdIpcRequest) -> i32 {
             return libc::EINVAL;
         }
     }
-    let start = StdInstant::now();
-    while start.elapsed() < INET_CONNECT_TIMEOUT {
-        stack.poll_budget(8);
-        let socket = stack.sockets.get_mut::<tcp::Socket>(tcp_handle);
-        if socket.may_send() {
-            debug_line("netd: inet connect ok");
-            return 0;
-        }
-        if !socket.is_open() {
-            return libc::ECONNREFUSED;
-        }
-        drop(socket);
-        thread::sleep(Duration::from_millis(1));
+    stack.poll_budget(8);
+    let socket = stack.sockets.get_mut::<tcp::Socket>(tcp_handle);
+    if socket.may_send() {
+        debug_line("netd: inet connect ok");
+        0
+    } else if !socket.is_open() {
+        libc::ECONNREFUSED
+    } else {
+        libc::EINPROGRESS
     }
-    libc::ETIMEDOUT
+}
+
+fn poll_inet_connect(request: &NetdIpcRequest) -> i32 {
+    let mut state = net_state().lock().unwrap();
+    let Some(inet) = state.inet_sockets.get(&request.socket_token) else {
+        return libc::EBADF;
+    };
+    let tcp_handle = inet.tcp;
+    let stack = match state.inet_stack() {
+        Ok(stack) => stack,
+        Err(errno) => return errno,
+    };
+    stack.poll_budget(8);
+    let socket = stack.sockets.get_mut::<tcp::Socket>(tcp_handle);
+    if socket.may_send() {
+        debug_line("netd: inet connect ok");
+        0
+    } else if !socket.is_open() {
+        libc::ECONNREFUSED
+    } else {
+        libc::EINPROGRESS
+    }
 }
 
 fn handle_accept(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
@@ -937,26 +1047,23 @@ fn handle_inet_send(request: &NetdIpcRequest, response: &mut NetdIpcResponse) ->
         Ok(stack) => stack,
         Err(errno) => return errno,
     };
-    for _ in 0..INET_IO_POLL_BUDGET {
-        stack.poll_budget(4);
-        let socket = stack.sockets.get_mut::<tcp::Socket>(tcp_handle);
-        if socket.can_send() {
-            match socket.send_slice(bytes) {
-                Ok(sent) => {
-                    response.value = sent as u64;
-                    stack.poll_budget(16);
-                    return 0;
-                }
-                Err(_) => return libc::EPIPE,
+    stack.poll_budget(4);
+    let socket = stack.sockets.get_mut::<tcp::Socket>(tcp_handle);
+    if socket.can_send() {
+        match socket.send_slice(bytes) {
+            Ok(sent) => {
+                response.value = sent as u64;
+                stack.poll_budget(16);
+                return 0;
             }
+            Err(_) => return libc::EPIPE,
         }
-        if !socket.may_send() {
-            return libc::EPIPE;
-        }
-        drop(socket);
-        thread::sleep(Duration::from_millis(1));
     }
-    libc::EAGAIN
+    if !socket.may_send() {
+        libc::EPIPE
+    } else {
+        libc::EAGAIN
+    }
 }
 
 fn handle_inet_recv(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
@@ -976,29 +1083,26 @@ fn handle_inet_recv(request: &NetdIpcRequest, response: &mut NetdIpcResponse) ->
         Ok(stack) => stack,
         Err(errno) => return errno,
     };
-    for _ in 0..INET_IO_POLL_BUDGET {
-        stack.poll_budget(8);
-        let socket = stack.sockets.get_mut::<tcp::Socket>(tcp_handle);
-        if socket.can_recv() {
-            match socket.recv_slice(&mut response.payload[..limit]) {
-                Ok(read) => {
-                    response.value = read as u64;
-                    response.payload_len = read as u32;
-                    stack.poll_budget(8);
-                    return 0;
-                }
-                Err(_) => return libc::ECONNRESET,
+    stack.poll_budget(8);
+    let socket = stack.sockets.get_mut::<tcp::Socket>(tcp_handle);
+    if socket.can_recv() {
+        match socket.recv_slice(&mut response.payload[..limit]) {
+            Ok(read) => {
+                response.value = read as u64;
+                response.payload_len = read as u32;
+                stack.poll_budget(8);
+                return 0;
             }
+            Err(_) => return libc::ECONNRESET,
         }
-        if !socket.may_recv() {
-            response.value = 0;
-            response.payload_len = 0;
-            return 0;
-        }
-        drop(socket);
-        thread::sleep(Duration::from_millis(1));
     }
-    libc::EAGAIN
+    if !socket.may_recv() {
+        response.value = 0;
+        response.payload_len = 0;
+        0
+    } else {
+        libc::EAGAIN
+    }
 }
 
 fn handle_inet_poll(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {

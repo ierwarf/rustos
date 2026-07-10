@@ -43,10 +43,12 @@ pub struct HeartbeatSnapshot {
     pub linux_input_lock_last_seq: u64,
 }
 
+pub type RetireCurrentUserTaskDueToFaultHook =
+    fn(u8, Option<u64>, u64, u64, u64) -> UserFaultDisposition;
+
 #[derive(Clone, Copy, Default)]
 pub struct TaskHooks {
-    pub retire_current_user_task_due_to_fault:
-        Option<fn(u8, Option<u64>, u64, u64, u64) -> UserFaultDisposition>,
+    pub retire_current_user_task_due_to_fault: Option<RetireCurrentUserTaskDueToFaultHook>,
     pub halt_current_retired_task: Option<fn() -> !>,
     pub current_user_snapshot: Option<fn() -> Option<CurrentUserSnapshot>>,
     pub is_scheduler_initialized: Option<fn() -> bool>,

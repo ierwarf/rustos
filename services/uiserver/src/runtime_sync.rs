@@ -96,9 +96,7 @@ pub(crate) fn runtime_program_is_hidden(program: &RuntimeRunningProgram) -> bool
 }
 
 pub(crate) fn runtime_title_is_hidden(title: &str) -> bool {
-    HIDDEN_RUNTIME_PROGRAM_TITLES
-        .iter()
-        .any(|hidden| *hidden == title)
+    HIDDEN_RUNTIME_PROGRAM_TITLES.contains(&title)
 }
 
 pub(crate) fn runtime_program_display_name(

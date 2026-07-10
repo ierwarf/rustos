@@ -9,7 +9,7 @@ prefix every agent should load. Everything else is opened on demand.
 1. Route the task through `docs/ai/task-router.md` before reading source.
 2. Use Serena MCP / ripgrep MCP for symbol- and pattern-scoped lookups; do not
    open whole files or whole subsystems.
-3. Sub-agents default to **GPT-5.4 mini**. Upgrading is the exception.
+3. Sub-agents use **GPT-5.6 terra** with `xhigh` reasoning. Do not use GPT-5.5.
 4. Never bypass hooks (`--no-verify`, `--no-gpg-sign`, etc.). Treat hook output
    as primary evidence.
 5. RustOS is mid-evacuation from ring0 to user services. Push policy into
@@ -48,19 +48,9 @@ Constraints:
 
 ### Model selection
 
-This repo runs on GPT Plus. The mini-first rule is binding.
-
-- **Overriding rule: prefer GPT-5.4 mini whenever possible.** If anything in
-  this file, sub-docs, or task prompts conflicts, mini-first wins. Upgrading
-  is the exception, never a tie-breaker.
-- Default: **GPT-5.4 mini**. Use `high` for non-trivial code reads, multi-file
-  triage, or tool-use judgement; `mid` for narrow lookups, single-file
-  grep/extract, log scans.
-- Upgrade only for: architectural/structural design, cross-subsystem refactor
-  planning, ABI/contract reasoning, or a deliberate hard root-cause chain that
-  mini genuinely cannot carry. Justify the upgrade in the spawn prompt.
-- When torn between mini-high and a larger model, choose mini-high plus a
-  tighter scope. Do not upgrade defensively.
+User-directed repository policy: every sub-agent must use **GPT-5.6 terra**
+with `xhigh` reasoning. Do not use GPT-5.5 for sub-agent work. This policy
+overrides the previous mini-first guidance until the user revises it.
 
 ## Do Not Inspect By Default
 

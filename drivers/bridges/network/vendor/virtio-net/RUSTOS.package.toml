@@ -12,12 +12,6 @@ optional = true
 [install]
 path = "system/drivers/network/virtio_net.ko"
 
-[boot]
-preload = true
-required = false
-priority = 320
-
-startup = "none"
 
 [autoload]
 name = "virtio_net"

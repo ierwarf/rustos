@@ -14,7 +14,7 @@ pub fn spawn_user_process(
     bootstrap: UserTaskBootstrap,
     weight_micros: u64,
 ) -> Result<u64, SpawnTaskError> {
-    spawn_user_process_inner(address_space, bootstrap, None, weight_micros, true)
+    spawn_user_process_inner(address_space, bootstrap, None, weight_micros, true, false)
 }
 
 pub fn spawn_user_process_with_parent(
@@ -29,6 +29,7 @@ pub fn spawn_user_process_with_parent(
         parent_process_id,
         weight_micros,
         true,
+        false,
     )
 }
 
@@ -37,7 +38,15 @@ pub fn spawn_user_process_without_deferred_reschedule(
     bootstrap: UserTaskBootstrap,
     weight_micros: u64,
 ) -> Result<u64, SpawnTaskError> {
-    spawn_user_process_inner(address_space, bootstrap, None, weight_micros, false)
+    spawn_user_process_inner(address_space, bootstrap, None, weight_micros, false, false)
+}
+
+pub fn spawn_user_process_suspended(
+    address_space: ProcessAddressSpace,
+    bootstrap: UserTaskBootstrap,
+    weight_micros: u64,
+) -> Result<u64, SpawnTaskError> {
+    spawn_user_process_inner(address_space, bootstrap, None, weight_micros, false, true)
 }
 
 fn spawn_user_process_inner(
@@ -46,6 +55,7 @@ fn spawn_user_process_inner(
     parent_process_id: Option<u64>,
     weight_micros: u64,
     defer_reschedule: bool,
+    start_suspended: bool,
 ) -> Result<u64, SpawnTaskError> {
     if nucleus_core::util::fault_injection::should_fail("process.spawn") {
         crate::debug::warn!(process, "fault injection: process.spawn failed");
@@ -69,6 +79,7 @@ fn spawn_user_process_inner(
                 user_cs,
                 user_ss,
                 rflags,
+                start_suspended,
                 noop_task_entry,
             )
             .ok_or(SpawnTaskError::NoFreeTaskSlot)?;
@@ -81,7 +92,7 @@ fn spawn_user_process_inner(
         spawn_milestone_arg(slot, spawned_from_user, weight_micros),
     );
 
-    if spawned_from_user && defer_reschedule {
+    if spawned_from_user && defer_reschedule && !start_suspended {
         super::set_next_spawn_pick_hint(id);
     }
 

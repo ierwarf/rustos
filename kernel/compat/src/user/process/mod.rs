@@ -250,7 +250,10 @@ pub fn spawn_bootstrap_linux_process_with_launch(
     launch: ProcessLaunchOptions<'_>,
 ) -> Result<SpawnedProcess, ProcessLoadError> {
     let prepared = prepare_bootstrap_linux_process_with_launch(image, launch)?;
-    spawn_prepared_process(prepared, weight_micros)
+    // Direct bootstrap is synchronously supervised by rootd. Return the PID
+    // before handing CPU to the child so rootd can publish the lease that the
+    // child's endpoint registration will be checked against.
+    spawn_prepared_process_for_loader_reply(prepared, weight_micros)
 }
 
 fn prepare_bootstrap_linux_process_with_launch(
@@ -307,6 +310,19 @@ pub fn spawn_prepared_process_for_loader_reply(
     weight_micros: u64,
 ) -> Result<SpawnedProcess, ProcessLoadError> {
     let pid = kernel_ps::api::process::spawn_user_process_without_deferred_reschedule(
+        prepared.address_space,
+        prepared.bootstrap,
+        weight_micros,
+    )?;
+
+    Ok(SpawnedProcess { pid })
+}
+
+pub fn spawn_prepared_process_suspended(
+    prepared: PreparedProcessImage,
+    weight_micros: u64,
+) -> Result<SpawnedProcess, ProcessLoadError> {
+    let pid = kernel_ps::api::process::spawn_user_process_suspended(
         prepared.address_space,
         prepared.bootstrap,
         weight_micros,

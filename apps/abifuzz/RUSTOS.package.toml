@@ -12,11 +12,6 @@ source = "abifuzz.c"
 [install]
 path = "apps/abifuzz/abifuzz.elf"
 
-[boot]
-preload = true
-required = false
-priority = 140
-
 [[desktop.entries]]
 display_name = "ABI fuzzer"
 weight_micros = 100

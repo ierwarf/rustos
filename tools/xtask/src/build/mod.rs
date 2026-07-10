@@ -172,7 +172,7 @@ pub(crate) fn build_efi(config: &Config) -> Result<()> {
     let grub_cfg = temp_dir.join("grub.cfg");
     fs::write(
         &grub_cfg,
-        "set check_signatures=enforce\nload_video\nset gfxmode=auto\nset gfxpayload=keep\nterminal_output gfxterm\nsearch --file --set=root /nucleus.elf\nmultiboot2 ($root)/nucleus.elf\nmodule2 ($root)/system/registry/kernel/root-file-extents.tsv rustos-root-extents\nboot\n",
+        "set check_signatures=enforce\ninsmod all_video\nset gfxmode=auto\nset gfxpayload=keep\nterminal_output gfxterm console\nsearch --file --set=root /nucleus.elf\nmultiboot2 ($root)/nucleus.elf\nmodule2 ($root)/system/registry/kernel/root-file-extents.tsv rustos-root-extents\nboot\n",
     )?;
     let grub_cfg_signature = temp_dir.join("grub.cfg.sig");
     sign_detached(config, &signing, &grub_cfg, &grub_cfg_signature)?;
@@ -594,7 +594,7 @@ fn build_cargo_kernel_binary_dynamic(config: &Config, manifest: &PackageManifest
         .cargo_target_dir
         .join(format!("{}/release/{package}", config.kernel_target));
     let artifact = manifest.artifact_path(config);
-    if output_is_fresh(&artifact, &[binary.clone()])? {
+    if output_is_fresh(&artifact, std::slice::from_ref(&binary))? {
         return Ok(());
     }
     copy_with_parent(&binary, &artifact)
@@ -641,7 +641,7 @@ fn build_cargo_kernel_binary_static_pie(config: &Config, manifest: &PackageManif
         .cargo_target_dir
         .join(format!("{}/release/{package}", config.kernel_target));
     let artifact = manifest.artifact_path(config);
-    if output_is_fresh(&artifact, &[binary.clone()])? {
+    if output_is_fresh(&artifact, std::slice::from_ref(&binary))? {
         return Ok(());
     }
     copy_with_parent(&binary, &artifact)
@@ -724,7 +724,7 @@ fn build_module_image_manifest(config: &Config, manifest: &PackageManifest) -> R
         crate_name,
         &manifest.artifact_path(config),
         &dependency_crates,
-        &[manifest.manifest_path.clone()],
+        std::slice::from_ref(&manifest.manifest_path),
     )
 }
 

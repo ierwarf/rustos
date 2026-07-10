@@ -19,6 +19,7 @@ macro_rules! ipc_trace {
 const IPC_TRACE_VERBOSE: bool = false;
 const MAX_SERVICE_ENDPOINTS: usize = 16;
 const MAX_PENDING_TRANSFER_OBJECTS: usize = 1024;
+const MAX_SERVICE_ENDPOINT_WAITERS: usize = 32;
 const SLOW_IPC_THRESHOLD_MS: u64 = 10;
 const MAX_SLOW_IPC_LOGS: usize = 20;
 const EARLY_IPC_SAMPLE_COUNT: usize = 6;
@@ -37,9 +38,18 @@ static SERVICE_ENDPOINT_CAPS: [AtomicU64; MAX_SERVICE_ENDPOINTS] =
 static NEXT_TRANSFER_ID: AtomicU64 = AtomicU64::new(1);
 static SLOW_IPC_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+#[derive(Clone, Copy)]
+struct ServiceEndpointWaiter {
+    task_id: u64,
+    service_id: u64,
+    expected_pid: u64,
+}
+
 lazy_static! {
     static ref TRANSFER_OBJECTS: Mutex<BTreeMap<u64, multitask::TransferredHandleEntry>> =
         Mutex::new(BTreeMap::new());
+    static ref SERVICE_ENDPOINT_WAITERS: Mutex<Vec<ServiceEndpointWaiter>> =
+        Mutex::new(Vec::new());
 }
 
 pub(super) fn is_linux_rustos_ipc_syscall(syscall_number: u64) -> bool {
@@ -58,6 +68,7 @@ pub(super) fn is_linux_rustos_ipc_syscall(syscall_number: u64) -> bool {
             | linux_abi::SYS_RUSTOS_IPC_REGISTER_LINUX_SYSCALL_ENDPOINT
             | linux_abi::SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT
             | linux_abi::SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT
+            | linux_abi::SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT
     )
 }
 
@@ -109,6 +120,9 @@ pub(super) fn dispatch_linux_rustos_ipc_syscall(frame: &SyscallFrame) -> u64 {
         }
         linux_abi::SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT => {
             syscall_linux_rustos_ipc_lookup_service_endpoint(frame.rdi)
+        }
+        linux_abi::SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT => {
+            syscall_linux_rustos_ipc_wait_service_endpoint(frame.rdi)
         }
         _ => linux_errno(LINUX_ENOSYS),
     }
@@ -174,6 +188,7 @@ pub(crate) fn cleanup_service_endpoints_for_process(process_id: u64) {
             );
         }
     }
+    wake_exited_service_endpoint_waiters(process_id);
 }
 
 pub(super) fn current_process_has_service_capability(capability: u64) -> bool {
@@ -205,6 +220,73 @@ fn service_endpoint_raw(service_id: u64) -> Option<u64> {
 fn service_index(service_id: u64) -> Option<usize> {
     let index = usize::try_from(service_id).ok()?;
     (index < MAX_SERVICE_ENDPOINTS).then_some(index)
+}
+
+fn register_service_endpoint_waiter(waiter: ServiceEndpointWaiter) -> bool {
+    let mut waiters = SERVICE_ENDPOINT_WAITERS.lock();
+    waiters.retain(|current| current.task_id != waiter.task_id);
+    if waiters.len() >= MAX_SERVICE_ENDPOINT_WAITERS {
+        return false;
+    }
+    waiters.push(waiter);
+    true
+}
+
+fn remove_service_endpoint_waiter(task_id: u64) {
+    SERVICE_ENDPOINT_WAITERS
+        .lock()
+        .retain(|waiter| waiter.task_id != task_id);
+}
+
+fn wake_registered_service_endpoint_waiters(service_id: u64, owner_pid: u64) {
+    let tasks = {
+        let mut waiters = SERVICE_ENDPOINT_WAITERS.lock();
+        let mut tasks = Vec::new();
+        waiters.retain(|waiter| {
+            let matched = waiter.service_id == service_id && waiter.expected_pid == owner_pid;
+            if matched {
+                tasks.push(waiter.task_id);
+            }
+            !matched
+        });
+        tasks
+    };
+    let mut woke = false;
+    for task_id in tasks {
+        if multitask::wake_task(task_id) {
+            multitask::set_next_pick_hint(task_id);
+            woke = true;
+        }
+    }
+    if woke {
+        multitask::request_deferred_reschedule();
+    }
+}
+
+fn wake_exited_service_endpoint_waiters(process_id: u64) {
+    let tasks = {
+        let mut waiters = SERVICE_ENDPOINT_WAITERS.lock();
+        let mut tasks = Vec::new();
+        waiters.retain(|waiter| {
+            if waiter.expected_pid == process_id {
+                tasks.push(waiter.task_id);
+                false
+            } else {
+                true
+            }
+        });
+        tasks
+    };
+    let mut woke = false;
+    for task_id in tasks {
+        if multitask::wake_task(task_id) {
+            multitask::set_next_pick_hint(task_id);
+            woke = true;
+        }
+    }
+    if woke {
+        multitask::request_deferred_reschedule();
+    }
 }
 // RING3-MIGRATION-REFERENCE END: rootd-owned service lookup and capability checks.
 
@@ -272,6 +354,10 @@ pub(super) fn syscall_linux_rustos_ipc_register_linux_syscall_endpoint(endpoint:
         linux_abi::IPC_SERVICE_LINUX_SYSCALLD,
         process_id,
         endpoint,
+    );
+    wake_registered_service_endpoint_waiters(
+        linux_abi::IPC_SERVICE_LINUX_SYSCALLD,
+        process_id,
     );
     0
 }
@@ -350,6 +436,7 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
         capability
     );
     record_service_endpoint_milestone("ipc-service-register", service_id, process_id, endpoint);
+    wake_registered_service_endpoint_waiters(service_id, process_id);
     0
 }
 
@@ -414,6 +501,130 @@ pub(super) fn syscall_linux_rustos_ipc_lookup_service_endpoint(service_id: u64) 
         return linux_errno(LINUX_ENOSYS);
     }
     raw
+}
+
+pub(super) fn syscall_linux_rustos_ipc_wait_service_endpoint(args_ptr: u64) -> u64 {
+    let args = match usermem::read_current_user_struct::<RustosIpcWaitServiceEndpointArgs>(args_ptr)
+    {
+        Ok(args) => args,
+        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+    };
+    if args.abi_version != IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION
+        || args.reserved0 != 0
+        || args.flags != 0
+        || service_index(args.service_id).is_none()
+        || args.expected_pid == 0
+        || args.timeout_ms == 0
+        || args.timeout_ms > IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS
+    {
+        return linux_errno(LINUX_EINVAL);
+    }
+    if args.service_id != linux_abi::IPC_SERVICE_ROOTD
+        && !current_process_can_lookup_service_endpoint()
+        && let Err(errno) = authorize_service_lookup_via_rootd(args.service_id)
+    {
+        return linux_errno(errno);
+    }
+
+    let Some(task_id) = multitask::current_task_id() else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
+    let timeout_ticks = args
+        .timeout_ms
+        .saturating_mul(ticks_per_second)
+        .saturating_add(999)
+        .saturating_div(1000)
+        .max(1);
+    let deadline_tick = crate::arch::rtc::ticks().saturating_add(timeout_ticks);
+
+    loop {
+        match service_endpoint_for_expected_process(args.service_id, args.expected_pid) {
+            Ok(Some(endpoint)) => {
+                remove_service_endpoint_waiter(task_id);
+                crate::arch::rtc::disarm_sleep_waiter(task_id);
+                return endpoint;
+            }
+            Ok(None) => {}
+            Err(errno) => return linux_errno(errno),
+        }
+        if !multitask::is_user_task_alive(args.expected_pid) {
+            remove_service_endpoint_waiter(task_id);
+            crate::arch::rtc::disarm_sleep_waiter(task_id);
+            return linux_errno(LINUX_ESRCH);
+        }
+        if crate::arch::rtc::ticks() >= deadline_tick {
+            remove_service_endpoint_waiter(task_id);
+            crate::arch::rtc::disarm_sleep_waiter(task_id);
+            return linux_errno(LINUX_ETIMEDOUT);
+        }
+        if !multitask::arm_block_current_task() {
+            return linux_errno(LINUX_EINVAL);
+        }
+        if !register_service_endpoint_waiter(ServiceEndpointWaiter {
+            task_id,
+            service_id: args.service_id,
+            expected_pid: args.expected_pid,
+        }) {
+            let _ = multitask::cancel_block_current_task();
+            return linux_errno(LINUX_EBUSY);
+        }
+
+        // Close the register-before-sleep race: endpoint registration may
+        // have completed between the first check and waiter insertion.
+        match service_endpoint_for_expected_process(args.service_id, args.expected_pid) {
+            Ok(Some(_)) => {
+                remove_service_endpoint_waiter(task_id);
+                let _ = multitask::cancel_block_current_task();
+                continue;
+            }
+            Ok(None) => {}
+            Err(errno) => {
+                remove_service_endpoint_waiter(task_id);
+                let _ = multitask::cancel_block_current_task();
+                return linux_errno(errno);
+            }
+        }
+        if !multitask::is_user_task_alive(args.expected_pid)
+            || crate::arch::rtc::ticks() >= deadline_tick
+        {
+            remove_service_endpoint_waiter(task_id);
+            let _ = multitask::cancel_block_current_task();
+            continue;
+        }
+        if !crate::arch::rtc::arm_sleep_waiter_until_tick(task_id, deadline_tick) {
+            remove_service_endpoint_waiter(task_id);
+            let _ = multitask::cancel_block_current_task();
+            return linux_errno(LINUX_EBUSY);
+        }
+        match multitask::commit_block_current_task() {
+            Some(true) => multitask::yield_now(),
+            Some(false) => {}
+            None => {
+                remove_service_endpoint_waiter(task_id);
+                crate::arch::rtc::disarm_sleep_waiter(task_id);
+                return linux_errno(LINUX_EINVAL);
+            }
+        }
+        remove_service_endpoint_waiter(task_id);
+        crate::arch::rtc::disarm_sleep_waiter(task_id);
+    }
+}
+
+fn service_endpoint_for_expected_process(
+    service_id: u64,
+    expected_pid: u64,
+) -> Result<Option<u64>, i64> {
+    let index = service_index(service_id).ok_or(LINUX_EINVAL)?;
+    let endpoint = SERVICE_ENDPOINTS[index].load(Ordering::Acquire);
+    if endpoint == 0 {
+        return Ok(None);
+    }
+    let owner = SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire);
+    if owner != expected_pid {
+        return Err(LINUX_EBUSY);
+    }
+    Ok(Some(endpoint))
 }
 
 fn authorize_service_lookup_via_rootd(service_id: u64) -> Result<(), i64> {

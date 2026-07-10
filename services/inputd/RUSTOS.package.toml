@@ -11,11 +11,6 @@ package = "inputd"
 [install]
 path = "services/inputd/inputd.elf"
 
-[boot]
-preload = true
-required = false
-priority = -579
-
 [[desktop.entries]]
 display_name = "inputd"
 weight_micros = 2000

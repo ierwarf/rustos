@@ -9,10 +9,3 @@ package = "nucleus"
 
 [install]
 path = "nucleus.elf"
-
-[boot]
-preload = true
-required = true
-priority = -1900
-
-startup = "none"

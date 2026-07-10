@@ -142,6 +142,15 @@ pub struct KernelTransferredHandle {
     rights: HandleRights,
 }
 
+pub type EndpointReceived = (KernelReplyHandle, Vec<u8>, Vec<KernelTransferredHandle>);
+pub type EndpointReceivedWithSender = (
+    KernelReplyHandle,
+    Vec<u8>,
+    Vec<KernelTransferredHandle>,
+    u64,
+);
+pub type EndpointResponseWithHandles = (Vec<u8>, Vec<KernelTransferredHandle>);
+
 impl KernelTransferredHandle {
     pub const fn new(transfer_id: u64, token: HandleToken, rights: HandleRights) -> Self {
         Self {
@@ -747,7 +756,7 @@ pub fn recv_endpoint_with_limits_and_handles(
     endpoint: KernelEndpointHandle,
     request_capacity: usize,
     handle_capacity: usize,
-) -> Result<Option<(KernelReplyHandle, Vec<u8>, Vec<KernelTransferredHandle>)>, IpcError> {
+) -> Result<Option<EndpointReceived>, IpcError> {
     let Some((reply, request, attached_handles, _caller_task_id)) =
         recv_endpoint_with_sender_and_limits(endpoint, request_capacity, handle_capacity)?
     else {
@@ -760,15 +769,7 @@ pub fn recv_endpoint_with_sender_and_limits(
     endpoint: KernelEndpointHandle,
     request_capacity: usize,
     handle_capacity: usize,
-) -> Result<
-    Option<(
-        KernelReplyHandle,
-        Vec<u8>,
-        Vec<KernelTransferredHandle>,
-        u64,
-    )>,
-    IpcError,
-> {
+) -> Result<Option<EndpointReceivedWithSender>, IpcError> {
     with_ipc_objects(|objects| {
         let Some(endpoint_object) = objects.endpoints.get_mut(&endpoint.raw()) else {
             return Err(IpcError::InvalidHandle);
@@ -889,7 +890,7 @@ pub fn take_endpoint_response(reply: KernelReplyHandle) -> Result<Option<Vec<u8>
 pub fn take_endpoint_response_with_handle_limit(
     reply: KernelReplyHandle,
     handle_capacity: usize,
-) -> Result<Option<(Vec<u8>, Vec<KernelTransferredHandle>)>, IpcError> {
+) -> Result<Option<EndpointResponseWithHandles>, IpcError> {
     with_ipc_objects(|objects| {
         let Some(reply_object) = objects.replies.get(&reply.raw()) else {
             return Err(IpcError::InvalidHandle);
@@ -1003,10 +1004,10 @@ pub fn fail_endpoints_owned_by_task(task_id: u64, err: IpcError) -> EndpointWake
                     wake_set.push_caller(message.caller_task_id);
                     if let Some(reply_id) = objects.replies.iter().find_map(|(reply_id, reply)| {
                         (reply.message_id == message_id).then_some(*reply_id)
-                    }) {
-                        if let Some(reply) = objects.replies.get_mut(&reply_id) {
-                            reply.used = true;
-                        }
+                    })
+                        && let Some(reply) = objects.replies.get_mut(&reply_id)
+                    {
+                        reply.used = true;
                     }
                 }
             }

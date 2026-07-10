@@ -11,11 +11,6 @@ package = "initd"
 [install]
 path = "services/initd/initd.elf"
 
-[boot]
-preload = true
-required = false
-priority = -600
-
 [[desktop.entries]]
 display_name = "initd"
 weight_micros = 100

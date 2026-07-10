@@ -30,7 +30,9 @@ pub extern "C" fn rustos_driver_abi_version() -> u32 {
 #[cfg(feature = "module-image")]
 #[unsafe(no_mangle)]
 pub extern "C" fn rustos_driver_init(api: *const DriverKernelApiV1) -> i32 {
-    if api::bind(api).is_err() {
+    // Safety: the module loader supplies an ABI table that remains mapped for
+    // the lifetime of this loaded module.
+    if unsafe { api::bind(api) }.is_err() {
         return -22;
     }
 

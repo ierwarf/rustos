@@ -55,10 +55,11 @@ pub fn futex_impl(uaddr: u64, op: u64, val: u64, timeout_ptr: u64, uaddr2: u64, 
             val as u32,
             timeout_ptr,
             linux_abi::FUTEX_BITSET_MATCH_ANY,
+            op,
         ),
         c if c == linux_abi::FUTEX_WAIT_BITSET => {
             let bitset = val3 as u32;
-            futex_wait(uaddr, val as u32, timeout_ptr, bitset)
+            futex_wait(uaddr, val as u32, timeout_ptr, bitset, op)
         }
         c if c == linux_abi::FUTEX_WAKE => {
             futex_wake(uaddr, val, linux_abi::FUTEX_BITSET_MATCH_ANY)
@@ -291,10 +292,14 @@ fn valid_thread_plan_locally(flags: u64, child_stack: u64, tls: u64) -> bool {
             || (paging::USER_SPACE_BASE..paging::USER_SPACE_END_EXCLUSIVE).contains(&tls))
 }
 
-fn futex_wait(uaddr: u64, expected: u32, timeout_ptr: u64, bitset: u32) -> Result<u64, i64> {
-    if timeout_ptr != 0 {
-        return Err(LINUX_ENOSYS);
-    }
+fn futex_wait(
+    uaddr: u64,
+    expected: u32,
+    timeout_ptr: u64,
+    bitset: u32,
+    op: u64,
+) -> Result<u64, i64> {
+    let deadline_tick = futex_wait_deadline_tick(op, timeout_ptr)?;
     let (task_id, mut key) = current_futex_waiter_context()?;
     key.uaddr = uaddr;
     if !multitask::arm_block_current_task() {
@@ -332,16 +337,106 @@ fn futex_wait(uaddr: u64, expected: u32, timeout_ptr: u64, bitset: u32) -> Resul
         let _ = multitask::cancel_block_current_task();
         return Err(LINUX_EAGAIN);
     }
+    if deadline_tick.is_some_and(|deadline| crate::arch::rtc::ticks() >= deadline) {
+        clear_futex_waiter(task_id, key);
+        let _ = multitask::cancel_block_current_task();
+        return Err(LINUX_ETIMEDOUT);
+    }
+    if let Some(deadline) = deadline_tick
+        && !crate::arch::rtc::arm_sleep_waiter_until_tick(task_id, deadline)
+    {
+        clear_futex_waiter(task_id, key);
+        let _ = multitask::cancel_block_current_task();
+        return Err(LINUX_EBUSY);
+    }
     match multitask::commit_block_current_task() {
         Some(true) => multitask::yield_now(),
         Some(false) => {}
         None => {
             clear_futex_waiter(task_id, key);
+            crate::arch::rtc::disarm_sleep_waiter(task_id);
             return Err(LINUX_EINVAL);
         }
     }
-    clear_futex_waiter(task_id, key);
-    Ok(0)
+    crate::arch::rtc::disarm_sleep_waiter(task_id);
+    let still_waiting = take_futex_waiter(task_id, key);
+    if still_waiting && deadline_tick.is_some_and(|deadline| crate::arch::rtc::ticks() >= deadline)
+    {
+        Err(LINUX_ETIMEDOUT)
+    } else {
+        // Linux permits spurious futex wakeups. A waiter removed by
+        // FUTEX_WAKE and a task woken for an unrelated reason both return
+        // success; userspace must re-check its atomic predicate.
+        Ok(0)
+    }
+}
+
+fn futex_wait_deadline_tick(op: u64, timeout_ptr: u64) -> Result<Option<u64>, i64> {
+    if timeout_ptr == 0 {
+        return Ok(None);
+    }
+    let timeout = usermem::read_current_user_struct::<LinuxTimespecWire>(timeout_ptr)
+        .map_err(address_space_error_to_linux_errno)?;
+    validate_futex_timespec(timeout)?;
+
+    let now_tick = crate::arch::rtc::ticks();
+    let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
+    let timeout_ticks = if op & linux_abi::FUTEX_CMD_MASK == linux_abi::FUTEX_WAIT_BITSET {
+        let clock_id = if op & linux_abi::FUTEX_CLOCK_REALTIME != 0 {
+            linux_abi::CLOCK_REALTIME as u64
+        } else {
+            linux_abi::CLOCK_MONOTONIC as u64
+        };
+        let now = process_time::current_clock_timespec_substrate(clock_id);
+        timespec_delta_ticks(timeout, now, ticks_per_second)
+    } else {
+        timespec_duration_ticks(timeout, ticks_per_second)
+    };
+    Ok(Some(now_tick.saturating_add(timeout_ticks)))
+}
+
+fn validate_futex_timespec(timespec: LinuxTimespecWire) -> Result<(), i64> {
+    if timespec.tv_sec < 0 || !(0..1_000_000_000).contains(&timespec.tv_nsec) {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(())
+}
+
+fn timespec_duration_ticks(timespec: LinuxTimespecWire, ticks_per_second: u64) -> u64 {
+    let nanos = (timespec.tv_sec as u128)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(timespec.tv_nsec as u128);
+    nanos
+        .saturating_mul(ticks_per_second as u128)
+        .saturating_add(999_999_999)
+        .saturating_div(1_000_000_000)
+        .min(u64::MAX as u128) as u64
+}
+
+fn timespec_delta_ticks(
+    deadline: LinuxTimespecWire,
+    now: LinuxTimespecWire,
+    ticks_per_second: u64,
+) -> u64 {
+    if deadline.tv_sec < now.tv_sec
+        || deadline.tv_sec == now.tv_sec && deadline.tv_nsec <= now.tv_nsec
+    {
+        return 0;
+    }
+    let mut seconds = deadline.tv_sec.saturating_sub(now.tv_sec);
+    let nanos = if deadline.tv_nsec >= now.tv_nsec {
+        deadline.tv_nsec - now.tv_nsec
+    } else {
+        seconds = seconds.saturating_sub(1);
+        deadline.tv_nsec + 1_000_000_000 - now.tv_nsec
+    };
+    timespec_duration_ticks(
+        LinuxTimespecWire {
+            tv_sec: seconds,
+            tv_nsec: nanos,
+        },
+        ticks_per_second,
+    )
 }
 
 fn futex_wake(uaddr: u64, max_wake: u64, bitset: u32) -> Result<u64, i64> {
@@ -437,15 +532,22 @@ fn register_futex_waiter(waiter: FutexWaiter) -> Result<(), i64> {
 }
 
 fn clear_futex_waiter(task_id: u64, key: FutexKey) {
+    let _ = take_futex_waiter(task_id, key);
+}
+
+fn take_futex_waiter(task_id: u64, key: FutexKey) -> bool {
     let mut waiters = FUTEX_WAITERS.lock();
+    let mut removed = false;
     for slot in 0..waiters.len() {
         if waiters[slot]
             .map(|waiter| waiter.task_id == task_id && waiter.key == key)
             .unwrap_or(false)
         {
             waiters[slot] = None;
+            removed = true;
         }
     }
+    removed
 }
 
 fn wake_futex_waiters(key: FutexKey, max_wake: usize, bitset: u32) -> usize {

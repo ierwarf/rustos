@@ -198,6 +198,7 @@ pub(super) struct TaskStart {
 pub(super) struct Scheduler {
     contexts: [Option<TaskContext>; MAX_TASK],
     retired: [bool; MAX_TASK],
+    start_suspended: [bool; MAX_TASK],
     retire_reasons: [Option<TaskRetireReason>; MAX_TASK],
     simd_states: [SimdState; MAX_TASK],
     starts: [Option<TaskStart>; MAX_TASK],
@@ -234,6 +235,7 @@ impl Scheduler {
         Self {
             contexts: [None; MAX_TASK],
             retired: [false; MAX_TASK],
+            start_suspended: [false; MAX_TASK],
             retire_reasons: [None; MAX_TASK],
             simd_states: [SimdState::new(); MAX_TASK],
             starts: [None; MAX_TASK],
@@ -403,6 +405,7 @@ impl Scheduler {
 
         self.simd_states = [SimdState::new(); MAX_TASK];
         self.retired = [false; MAX_TASK];
+        self.start_suspended = [false; MAX_TASK];
         self.retire_reasons = [None; MAX_TASK];
         self.current_task = ROOT_TASK_SLOT;
         self.pending_reap = false;
@@ -471,6 +474,7 @@ impl Scheduler {
             self.next_spawn_pick_hint = None;
         }
         self.retired[slot] = false;
+        self.start_suspended[slot] = false;
         self.retire_reasons[slot] = None;
         self.simd_states[slot] = SimdState::new();
         self.starts[slot] = None;
@@ -1235,6 +1239,7 @@ impl Scheduler {
         user_cs: u64,
         user_ss: u64,
         rflags: u64,
+        start_suspended: bool,
         idle_entry: fn(u64),
     ) -> Option<usize> {
         for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
@@ -1278,10 +1283,18 @@ impl Scheduler {
 
                 self.contexts[slot] = Some(TaskContext {
                     saved_rsp,
-                    ready: true,
-                    ready_since_ticks: crate::arch::rtc::ticks(),
-                    blocked: false,
-                    blocked_since_ticks: 0,
+                    ready: !start_suspended,
+                    ready_since_ticks: if start_suspended {
+                        0
+                    } else {
+                        crate::arch::rtc::ticks()
+                    },
+                    blocked: start_suspended,
+                    blocked_since_ticks: if start_suspended {
+                        crate::arch::rtc::ticks()
+                    } else {
+                        0
+                    },
                     wake_armed: false,
                     weight: Self::weight_from_pit_divisor(pit_divisor),
                     vruntime_ns: self
@@ -1310,6 +1323,7 @@ impl Scheduler {
                     entry: idle_entry,
                     id,
                 });
+                self.start_suspended[slot] = start_suspended;
                 return Some(slot);
             }
         }
@@ -2484,6 +2498,31 @@ impl Scheduler {
         (slots, count)
     }
 
+    pub(super) fn current_process_task_ids(&self) -> ([u64; MAX_TASK], usize) {
+        let mut task_ids = [0_u64; MAX_TASK];
+        let Some(process_handle) = self.contexts[self.current_task]
+            .and_then(|context| context.process_handle)
+        else {
+            return (task_ids, 0);
+        };
+        let mut count = 0usize;
+        for slot in 1..MAX_TASK {
+            if self.retired[slot]
+                || self.contexts[slot]
+                    .and_then(|context| context.process_handle)
+                    != Some(process_handle)
+            {
+                continue;
+            }
+            let Some(task_id) = self.starts[slot].map(|start| start.id) else {
+                continue;
+            };
+            task_ids[count] = task_id;
+            count += 1;
+        }
+        (task_ids, count)
+    }
+
     #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
     fn try_grow_current_user_stack_on_fault(
         &mut self,
@@ -2503,7 +2542,7 @@ impl Scheduler {
         if !context.user_mode {
             return false;
         }
-        let process_id = context.process_id.unwrap_or(0);
+        let _process_id = context.process_id.unwrap_or(0);
 
         let Some(mut stack_state) = context.user_stack else {
             return false;
@@ -2550,7 +2589,7 @@ impl Scheduler {
         debug::debug!(
             sched,
             "grew user stack pid={} slot={} cr2={:#x} rsp={:#x} new_start={:#x} pages={}",
-            process_id,
+            _process_id,
             slot,
             cr2,
             rsp,
@@ -2598,6 +2637,17 @@ impl Scheduler {
         };
 
         self.contexts[slot].is_some() && !self.retired[slot]
+    }
+
+    pub(super) fn activate_suspended_user_task(&mut self, task_id: u64) -> bool {
+        let Some(slot) = self.find_user_task_slot(task_id) else {
+            return false;
+        };
+        if self.retired[slot] || !self.start_suspended[slot] {
+            return false;
+        }
+        self.start_suspended[slot] = false;
+        self.wake_task_slot(slot)
     }
 
     pub(super) fn terminate_user_task(
@@ -2718,7 +2768,7 @@ impl Scheduler {
     }
 
     fn wake_task_slot(&mut self, slot: usize) -> bool {
-        if self.retired[slot] {
+        if self.retired[slot] || self.start_suspended[slot] {
             return false;
         }
 
@@ -2861,6 +2911,22 @@ impl Scheduler {
         }
     }
 
+    pub(super) fn exit_current_process(&mut self) {
+        let current_slot = self.current_task;
+        let Some(process_handle) = self.contexts[current_slot]
+            .and_then(|context| context.process_handle)
+        else {
+            self.exit_current_task();
+            return;
+        };
+        let (sibling_slots, sibling_count) =
+            self.collect_process_sibling_slots(current_slot, process_handle);
+        for slot in sibling_slots.into_iter().take(sibling_count) {
+            self.retire_slot(slot, TaskRetireReason::Exited);
+        }
+        self.exit_current_task();
+    }
+
     #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
     fn log_retired_slot(&self, slot: usize, context: TaskContext) {
         let id = self.starts[slot]
@@ -2991,9 +3057,11 @@ fn stack_range_contains(base: u64, top: u64, start: usize, end: usize) -> bool {
 mod tests {
     use alloc::boxed::Box;
 
-    use super::{ConsoleSessionHandle, MAX_TASK, NICE_0_LOAD, Scheduler, TaskContext};
+    use super::{
+        ConsoleSessionHandle, MAX_TASK, NICE_0_LOAD, Scheduler, TaskContext, TaskStart,
+    };
     use crate::memory::paging::ProcessAddressSpace;
-    use crate::multitask::process_table;
+    use crate::multitask::{noop_task_entry, process_table};
     use crate::user::abi::UserAbi;
     use crate::user::process_state::UserProcessState;
 
@@ -3063,5 +3131,43 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(slots[0], 2);
         assert!(slots[1..MAX_TASK].iter().all(|slot| *slot == 0));
+    }
+
+    #[test]
+    fn current_process_task_ids_excludes_other_and_retired_tasks() {
+        let mut scheduler = Box::<Scheduler>::new_uninit();
+        unsafe {
+            scheduler.as_mut_ptr().write_bytes(0, 1);
+        }
+        let mut scheduler = unsafe { scheduler.assume_init() };
+        let owner = test_process(11);
+        let other = test_process(22);
+
+        scheduler.current_task = 1;
+        scheduler.contexts[1] = Some(test_user_context(owner));
+        scheduler.contexts[2] = Some(test_user_context(owner));
+        scheduler.contexts[3] = Some(test_user_context(other));
+        scheduler.contexts[4] = Some(test_user_context(owner));
+        scheduler.starts[1] = Some(TaskStart {
+            entry: noop_task_entry,
+            id: 101,
+        });
+        scheduler.starts[2] = Some(TaskStart {
+            entry: noop_task_entry,
+            id: 102,
+        });
+        scheduler.starts[3] = Some(TaskStart {
+            entry: noop_task_entry,
+            id: 201,
+        });
+        scheduler.starts[4] = Some(TaskStart {
+            entry: noop_task_entry,
+            id: 103,
+        });
+        scheduler.retired[4] = true;
+
+        let (task_ids, count) = scheduler.current_process_task_ids();
+        assert_eq!(count, 2);
+        assert_eq!(&task_ids[..count], &[101, 102]);
     }
 }

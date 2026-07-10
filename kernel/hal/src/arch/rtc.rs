@@ -417,7 +417,7 @@ pub fn sleep(milliseconds: u64) {
         return;
     }
 
-    let ticks_needed = (milliseconds.saturating_mul(RTC_TICKS_PER_SEC) + 999) / 1000;
+    let ticks_needed = milliseconds.saturating_mul(RTC_TICKS_PER_SEC).div_ceil(1000);
     let ticks_needed = core::cmp::max(1, ticks_needed);
     let target = RTC_TICKS
         .load(Ordering::Acquire)
@@ -473,8 +473,16 @@ fn block_current_user_until(target: u64) -> bool {
 }
 
 fn register_sleep_waiter(task_id: u64, wake_tick: u64) -> bool {
-    let mut waiters = RTC_SLEEP_WAITERS.lock();
-    if waiters.insert_or_update(SleepWaiter { task_id, wake_tick }) {
+    // RTC_SLEEP_WAITERS is consumed directly by the RTC interrupt handler.
+    // Process context must therefore exclude that interrupt while holding the
+    // spin lock; otherwise the IRQ can preempt this CPU and deadlock trying to
+    // acquire the same non-reentrant lock.
+    let inserted = interrupts::without_interrupts(|| {
+        RTC_SLEEP_WAITERS
+            .lock()
+            .insert_or_update(SleepWaiter { task_id, wake_tick })
+    });
+    if inserted {
         true
     } else {
         crate::debug::println!(
@@ -491,7 +499,7 @@ pub fn arm_sleep_waiter_until_tick(task_id: u64, wake_tick: u64) -> bool {
 }
 
 pub fn disarm_sleep_waiter(task_id: u64) {
-    RTC_SLEEP_WAITERS.lock().remove_task(task_id);
+    interrupts::without_interrupts(|| RTC_SLEEP_WAITERS.lock().remove_task(task_id));
 }
 
 fn wake_ready_sleepers(now: u64) {

@@ -9,6 +9,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::mem::{size_of, MaybeUninit};
+#[cfg(all(not(test), not(clippy)))]
 use core::panic::PanicInfo;
 use core::str;
 
@@ -53,7 +54,7 @@ use linux_types::{
 use util::{
     build_linux_stat, build_linux_statx, encode_dirent, handle_kind_u16, is_at_fdcwd,
     linux_request_path, map_fat_error, mkdir_policy, normalize_absolute_path, path_inode,
-    read_unaligned, unlink_policy, vfs_request_path, write_payload_bytes, write_vfs_payload_bytes,
+    unlink_policy, vfs_request_path, write_payload_bytes, write_vfs_payload_bytes,
 };
 
 // Linux errno constants (x86_64)
@@ -85,6 +86,9 @@ const VFS_RECV_BYTES: usize = max_usize(
 );
 
 #[repr(align(8))]
+// Tuple storage is accessed through raw IPC buffers; the wrapper's alignment
+// rather than field reads is its purpose.
+#[allow(dead_code)]
 struct VfsRecvBuffer([u8; VFS_RECV_BYTES]);
 
 static mut VFS_RESPONSE_SLOT: VfsIpcResponse = VfsIpcResponse {
@@ -108,18 +112,6 @@ fn linux_response_for_op(op: u16) -> LinuxSyscallOffloadResponse {
     }
     let mut response = unsafe { response.assume_init() };
     response.version = SYSCALL_OFFLOAD_ABI_VERSION;
-    response.op = op;
-    response
-}
-
-fn vfs_response_for_op(op: u16) -> VfsIpcResponse {
-    let mut response = MaybeUninit::<VfsIpcResponse>::uninit();
-    let ptr = response.as_mut_ptr().cast::<u8>();
-    for offset in 0..size_of::<VfsIpcResponse>() {
-        unsafe { core::ptr::write_volatile(ptr.add(offset), 0) };
-    }
-    let mut response = unsafe { response.assume_init() };
-    response.version = VFS_IPC_ABI_VERSION;
     response.op = op;
     response
 }
@@ -165,6 +157,7 @@ pub(crate) const DEVICE_FILE_MODE_BITS: u32 = S_IFCHR | 0o600;
 
 rustos_svc_runtime::entry!(service_main);
 
+#[cfg(all(not(test), not(clippy)))]
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
     loop {}
@@ -492,7 +485,7 @@ impl VfsState {
     fn vfs_poll_once(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
         const POLLFD_SIZE: usize = size_of::<linux_abi::LinuxPollFd>();
         let len = request.payload_len as usize;
-        if len % POLLFD_SIZE != 0 || len > response.payload.len() {
+        if !len.is_multiple_of(POLLFD_SIZE) || len > response.payload.len() {
             response.status = EINVAL;
             return;
         }

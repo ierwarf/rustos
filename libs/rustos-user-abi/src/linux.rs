@@ -828,6 +828,15 @@ pub struct LinuxMemoryMapState {
     areas: Vec<LinuxVma>,
 }
 
+/// Failure category for in-memory Linux VMA bookkeeping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinuxMemoryMapError {
+    InvalidRange,
+    Overlap,
+    Unmapped,
+    Capacity,
+}
+
 impl LinuxMemoryMapState {
     pub fn new() -> Self {
         Self { areas: Vec::new() }
@@ -843,13 +852,13 @@ impl LinuxMemoryMapState {
             .find(|area| area.contains_range(start, end))
     }
 
-    pub fn insert_area(&mut self, area: LinuxVma) -> Result<(), ()> {
+    pub fn insert_area(&mut self, area: LinuxVma) -> Result<(), LinuxMemoryMapError> {
         if self
             .areas
             .iter()
             .any(|existing| existing.overlaps(area.start, area.end))
         {
-            return Err(());
+            return Err(LinuxMemoryMapError::Overlap);
         }
 
         self.areas.push(area);
@@ -875,15 +884,15 @@ impl LinuxMemoryMapState {
                 continue;
             }
 
-            if start > area.start {
-                if let Some(left) = area.subrange(area.start, start.min(area.end)) {
-                    updated.push(left);
-                }
+            if start > area.start
+                && let Some(left) = area.subrange(area.start, start.min(area.end))
+            {
+                updated.push(left);
             }
-            if end < area.end {
-                if let Some(right) = area.subrange(end.max(area.start), area.end) {
-                    updated.push(right);
-                }
+            if end < area.end
+                && let Some(right) = area.subrange(end.max(area.start), area.end)
+            {
+                updated.push(right);
             }
         }
 
@@ -891,7 +900,12 @@ impl LinuxMemoryMapState {
         self.normalize();
     }
 
-    pub fn protect_range(&mut self, start: u64, end: u64, flags: LinuxVmaFlags) -> Result<(), ()> {
+    pub fn protect_range(
+        &mut self,
+        start: u64,
+        end: u64,
+        flags: LinuxVmaFlags,
+    ) -> Result<(), LinuxMemoryMapError> {
         if start >= end {
             return Ok(());
         }
@@ -911,32 +925,34 @@ impl LinuxMemoryMapState {
             let overlap_end = area.end.min(end);
             if cursor < overlap_start {
                 self.areas = original;
-                return Err(());
+                return Err(LinuxMemoryMapError::Unmapped);
             }
 
-            if area.start < overlap_start {
-                if let Some(left) = area.subrange(area.start, overlap_start) {
-                    updated.push(left);
-                }
+            if area.start < overlap_start
+                && let Some(left) = area.subrange(area.start, overlap_start)
+            {
+                updated.push(left);
             }
 
-            let mut middle = area.subrange(overlap_start, overlap_end).ok_or(())?;
+            let mut middle = area
+                .subrange(overlap_start, overlap_end)
+                .ok_or(LinuxMemoryMapError::Unmapped)?;
             middle.flags =
                 LinuxVmaFlags::new(flags.read, flags.write, flags.execute, area.flags.private);
             updated.push(middle);
             covered = true;
             cursor = overlap_end;
 
-            if overlap_end < area.end {
-                if let Some(right) = area.subrange(overlap_end, area.end) {
-                    updated.push(right);
-                }
+            if overlap_end < area.end
+                && let Some(right) = area.subrange(overlap_end, area.end)
+            {
+                updated.push(right);
             }
         }
 
         if !covered || cursor < end {
             self.areas = original;
-            return Err(());
+            return Err(LinuxMemoryMapError::Unmapped);
         }
 
         self.areas = updated;
@@ -963,11 +979,11 @@ impl LinuxMemoryMapState {
         self.areas.sort_by_key(|area| area.start);
         let mut merged: Vec<LinuxVma> = Vec::with_capacity(self.areas.len());
         for area in self.areas.drain(..) {
-            if let Some(previous) = merged.last_mut() {
-                if previous.can_merge_with(&area) {
-                    previous.end = area.end;
-                    continue;
-                }
+            if let Some(previous) = merged.last_mut()
+                && previous.can_merge_with(&area)
+            {
+                previous.end = area.end;
+                continue;
             }
             merged.push(area);
         }
@@ -1150,9 +1166,16 @@ impl LinuxProcessState {
         true
     }
 
-    pub fn reserve_range(&mut self, start: u64, end: u64) -> Result<(), ()> {
-        if start >= end || self.has_reserved_overlap(start, end) {
-            return Err(());
+    pub fn reserve_range(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> Result<(), LinuxMemoryMapError> {
+        if start >= end {
+            return Err(LinuxMemoryMapError::InvalidRange);
+        }
+        if self.has_reserved_overlap(start, end) {
+            return Err(LinuxMemoryMapError::Overlap);
         }
 
         let Some(slot) = self
@@ -1160,15 +1183,22 @@ impl LinuxProcessState {
             .iter_mut()
             .find(|mapping| mapping.is_empty())
         else {
-            return Err(());
+            return Err(LinuxMemoryMapError::Capacity);
         };
         *slot = LinuxReservedMapping { start, end };
         Ok(())
     }
 
-    pub fn release_reserved_range(&mut self, start: u64, end: u64) -> Result<(), ()> {
-        if start >= end || !self.is_range_reserved(start, end) {
-            return Err(());
+    pub fn release_reserved_range(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> Result<(), LinuxMemoryMapError> {
+        if start >= end {
+            return Err(LinuxMemoryMapError::InvalidRange);
+        }
+        if !self.is_range_reserved(start, end) {
+            return Err(LinuxMemoryMapError::Unmapped);
         }
 
         for index in 0..self.reserved_mappings.len() {
@@ -1197,7 +1227,7 @@ impl LinuxProcessState {
                 .iter()
                 .position(|reserved| reserved.is_empty())
             else {
-                return Err(());
+                return Err(LinuxMemoryMapError::Capacity);
             };
 
             self.reserved_mappings[index].end = start;
@@ -1373,6 +1403,8 @@ pub const SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT: u64 =
     crate::syscall::SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT;
 pub const SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT: u64 =
     crate::syscall::SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT;
+pub const SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT: u64 =
+    crate::syscall::SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT;
 pub const SYS_RUSTOS_IPC_CALL_WITH_HANDLES: u64 = crate::syscall::SYS_RUSTOS_IPC_CALL_WITH_HANDLES;
 pub const SYS_RUSTOS_IPC_RECV_WITH_HANDLES: u64 = crate::syscall::SYS_RUSTOS_IPC_RECV_WITH_HANDLES;
 pub const SYS_RUSTOS_IPC_REPLY_WITH_HANDLES: u64 =
@@ -1404,6 +1436,8 @@ pub const SYS_RUSTOS_PROC_FORK_BROKER: u64 = crate::syscall::SYS_RUSTOS_PROC_FOR
 pub const SYS_RUSTOS_PROC_SIGNAL_QUEUE_BROKER: u64 =
     crate::syscall::SYS_RUSTOS_PROC_SIGNAL_QUEUE_BROKER;
 pub const SYS_RUSTOS_PROC_COMMIT_BROKER: u64 = crate::syscall::SYS_RUSTOS_PROC_COMMIT_BROKER;
+pub const SYS_RUSTOS_PROC_ACTIVATE_BROKER: u64 =
+    crate::syscall::SYS_RUSTOS_PROC_ACTIVATE_BROKER;
 pub const SYS_RUSTOS_PROC_ABORT_BROKER: u64 = crate::syscall::SYS_RUSTOS_PROC_ABORT_BROKER;
 pub const SYS_RUSTOS_MM_BROKER: u64 = crate::syscall::SYS_RUSTOS_MM_BROKER;
 pub const SYS_RUSTOS_DEVICE_IOCTL_BROKER: u64 = crate::syscall::SYS_RUSTOS_DEVICE_IOCTL_BROKER;

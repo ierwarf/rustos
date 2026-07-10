@@ -38,7 +38,9 @@ use rustos_user_abi::syscall::{
     INPUT_STATS_FLAG_PENDING_COALESCED, INPUT_STATS_FLAG_PENDING_POINTER_POSITION,
     INPUTD_ACCESS_EVDEV, INPUTD_ACCESS_NATIVE, INPUTD_IPC_ABI_VERSION,
     INPUTD_IPC_OP_AUTHORIZE_READ, INPUTD_IPC_OP_READ, INPUTD_IPC_OP_STATS,
-    INPUTD_READ_FLAG_NONBLOCK, INPUTD_READ_PAYLOAD_CAPACITY, IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY,
+    INPUTD_READ_FLAG_NONBLOCK, INPUTD_READ_PAYLOAD_CAPACITY,
+    IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION, IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS,
+    IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY,
     IPC_SERVICE_DEVMGRD, IPC_SERVICE_INPUTD, IPC_SERVICE_LOADERD, IPC_SERVICE_NETD,
     IPC_SERVICE_PROCD, IPC_SERVICE_SESSIOND, IPC_SERVICE_VFSD, InputdIpcRequest, InputdIpcResponse,
     InputdReadResponse, LINUX_CPUSET_BYTES, LINUX_RLIMIT_SIZE, LINUX_SIGACTION_SIZE,
@@ -50,7 +52,8 @@ use rustos_user_abi::syscall::{
     PROCD_OP_EXECVEAT, PROCD_OP_FORK, PROCD_OP_RT_SIGACTION, PROCD_OP_RT_SIGPROCMASK,
     PROCD_OP_SELECT_SIGNAL, PROCD_OP_WAIT4, PROCD_PATH_CAPACITY, PROCD_SELECT_SIGNAL_HANDLER,
     PROCD_SELECT_SIGNAL_IGNORE, PROCD_SELECT_SIGNAL_NONE, PROCD_SELECT_SIGNAL_TERMINATE,
-    ProcdIpcRequest, ProcdIpcResponse, RustosUserRegisters, SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER,
+    ProcdIpcRequest, ProcdIpcResponse, RustosIpcWaitServiceEndpointArgs, RustosUserRegisters,
+    SYS_RUSTOS_PROC_ACTIVATE_BROKER, SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER,
     SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER, SYSCALL_OFFLOAD_ABI_VERSION,
     SYSCALL_OFFLOAD_OP_LINUX_ACCEPT, SYSCALL_OFFLOAD_OP_LINUX_BIND, SYSCALL_OFFLOAD_OP_LINUX_BRK,
     SYSCALL_OFFLOAD_OP_LINUX_CLOCK_GETTIME, SYSCALL_OFFLOAD_OP_LINUX_CLOCK_NANOSLEEP,
@@ -169,6 +172,7 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         linux_abi::SYS_RUSTOS_PROC_COMMIT_BROKER => {
             syscall_linux_rustos_proc_commit_broker(frame.rdi)
         }
+        SYS_RUSTOS_PROC_ACTIVATE_BROKER => syscall_linux_rustos_proc_activate_broker(frame.rdi),
         linux_abi::SYS_RUSTOS_PROC_ABORT_BROKER => {
             syscall_linux_rustos_proc_abort_broker(frame.rdi)
         }
@@ -486,7 +490,11 @@ fn syscall_process_exit(status: u64, exit_group: bool) -> u64 {
             offload_ops::record_process_exit(process_id, parent, wait_status);
         }
     }
-    multitask::exit_current_user_task()
+    if exit_group {
+        multitask::exit_current_user_process()
+    } else {
+        multitask::exit_current_user_task()
+    }
 }
 
 #[derive(Clone, Copy)]

@@ -411,12 +411,12 @@ fn wait_for_service_endpoint(service_id: u64) -> Result<(), i32> {
 pub(super) fn create_session_endpoint() -> Option<u64> {
     let endpoint = unsafe { libc::syscall(SYS_RUSTOS_IPC_ENDPOINT_CREATE as libc::c_long) as i64 };
     if endpoint < 0 {
-        super::spawn::stderr_line("runtimed: session endpoint create failed");
+        super::spawn::debug_line("runtimed: session endpoint create failed");
         return None;
     }
     let register = register_service_endpoint(IPC_SERVICE_SESSIOND, endpoint as u64);
     if register < 0 {
-        super::spawn::stderr_line(
+        super::spawn::debug_line(
             format!(
                 "runtimed: session endpoint register failed errno={}",
                 -register
@@ -425,7 +425,7 @@ pub(super) fn create_session_endpoint() -> Option<u64> {
         );
         return None;
     }
-    super::spawn::stderr_line(
+    super::spawn::debug_line(
         format!("runtimed: session policy endpoint registered endpoint={endpoint}").as_str(),
     );
     Some(endpoint as u64)
@@ -490,7 +490,7 @@ pub(super) fn service_session_endpoint(endpoint: Option<u64>, state: &mut Broker
         ) as i64
     };
     if reply < 0 {
-        super::spawn::stderr_line("runtimed: session reply failed");
+        super::spawn::debug_line("runtimed: session reply failed");
     }
     true
 }
@@ -526,11 +526,9 @@ fn handle_session_request(
             if status != 0 {
                 return status;
             }
-            let focused_session = response.value0;
-            response.value0 = focused_session;
             response.descriptor_count = 1;
             response.descriptors[0] =
-                session_descriptor("foreground-focus", request.header.op, focused_session, 0);
+                session_descriptor("foreground-focus", request.header.op, response.value0, 0);
             response.capability = session_capability("foreground-focus", request.header.op);
             0
         }
@@ -945,6 +943,17 @@ fn ui_server_bootstrap_args_env() -> (Vec<String>, Vec<String>) {
     (args, env)
 }
 
+fn merge_manifest_env_into(env: &mut Vec<String>, manifest_env: &[String]) {
+    for value in manifest_env {
+        let Some(eq) = value.find('=') else {
+            continue;
+        };
+        let key_prefix = &value[..=eq];
+        env.retain(|existing| !existing.starts_with(key_prefix));
+        env.push(value.clone());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::SessionRuntime;
@@ -985,16 +994,5 @@ mod tests {
         let mut line = [0_u8; 8];
         let read = runtime.read_from_session(session, &mut line);
         assert_eq!(&line[..read], b"pwd\n");
-    }
-}
-
-fn merge_manifest_env_into(env: &mut Vec<String>, manifest_env: &[String]) {
-    for value in manifest_env {
-        let Some(eq) = value.find('=') else {
-            continue;
-        };
-        let key_prefix = &value[..=eq];
-        env.retain(|existing| !existing.starts_with(key_prefix));
-        env.push(value.clone());
     }
 }

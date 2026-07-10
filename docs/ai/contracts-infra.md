@@ -6,6 +6,9 @@ Package/stage schemas, runtime control, kernel API, build, fault injection, logg
 
 - File: `RUSTOS.package.toml`. Parser: `tools/xtask/src/package_manifest.rs`.
 - Package ids = stable dependency keys. `runtime_deps` references package `id`, not path or desktop id.
+- Manifest parsing is fail-closed: unknown top-level or nested fields fail the
+  build. Retired `[boot]` metadata is not accepted; rootd/initd and generated
+  registries are the boot-policy source of truth.
 - `external-copy` accepts plain files and `.zst` sources; `.zst` sources are
   decompressed into the configured artifact path during build.
 
@@ -18,6 +21,10 @@ Package/stage schemas, runtime control, kernel API, build, fault injection, logg
 | `startup` | `none`, `init`, `session`, `desktop` |
 | `install.layout` | `file`, `directory` |
 | `desktop.entries.launch` | `none`, `new-session`, `all-sessions` |
+
+`desktop.entries.no_display=true` is staged into both desktop registries and
+the `.desktop` file; it hides discovery without disabling an explicit startup
+or launch policy.
 
 ### Driver Autoload
 
@@ -74,12 +81,17 @@ Package/stage schemas, runtime control, kernel API, build, fault injection, logg
 - Client crate: `libs/runtime-control`.
 - Default socket: `/run/runtimed.sock`.
 - Main methods: `snapshot_running_programs`, `request_launch_program_new_session`, `request_terminate_session`, `request_terminate_pid`, `notify_ui_ready`.
+- `notify_ui_ready` is one-way: runtimed records readiness without replying,
+  so compositor bootstrap never waits on a closed readiness stream.
 - Request text max: `MAX_REQUEST_PATH_BYTES`.
-- `runtimed` loads the runtime launch catalog on its main loop after UI ready;
-  initial session autostart must not depend on a background thread running
-  before the first policy drain.
-- `runtimed` UI bootstrap readiness checks for prerequisite service endpoints
-  must use bounded scheduler-yield attempts, not early timer sleep deadlines.
+- `runtimed` loads the runtime launch catalog on its main loop after UI ready.
+  Desktop metadata and runtime-launch policy have separate immutable caches;
+  one registry must never satisfy a request for the other. Initial session
+  autostart must not depend on a background thread completing before the first
+  policy drain.
+- `runtimed` spawns uiserver suspended, admits its rootd lease, activates it,
+  and waits for the exact PID's display-policy endpoint before committing the
+  tracked process.
 
 ## Kernel API
 

@@ -76,6 +76,12 @@ pub fn is_user_task_alive(task_id: u64) -> bool {
     interrupts::without_interrupts(|| unsafe { scheduler_ref().is_user_task_alive(task_id) })
 }
 
+pub fn activate_suspended_user_task(task_id: u64) -> bool {
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().activate_suspended_user_task(task_id)
+    })
+}
+
 pub fn terminate_user_task(task_id: u64) -> bool {
     interrupts::without_interrupts(|| unsafe {
         let requested_by_pid = scheduler_ref().current_user_id();
@@ -388,6 +394,28 @@ pub(crate) fn exit_current_task() -> ! {
 
 pub fn exit_current_user_task() -> ! {
     exit_current_task()
+}
+
+pub fn exit_current_user_process() -> ! {
+    interrupts::without_interrupts(|| unsafe {
+        let (task_ids, task_count) = scheduler_ref().current_process_task_ids();
+        for task_id in task_ids.into_iter().take(task_count) {
+            kernel_ipc_runtime::api::remove_endpoint_waiters_for_task(task_id);
+            let endpoint_wake_set = kernel_ipc_runtime::api::fail_endpoints_owned_by_task(
+                task_id,
+                kernel_ipc_runtime::api::IpcError::PeerClosed,
+            );
+            let scheduler = scheduler_mut();
+            for caller in endpoint_wake_set.callers {
+                let _ = scheduler.wake_task(caller);
+            }
+            for receiver in endpoint_wake_set.receivers {
+                let _ = scheduler.wake_task(receiver);
+            }
+        }
+        scheduler_mut().exit_current_process();
+    });
+    halt_current_retired_task()
 }
 
 pub fn service_deferred_work() -> usize {

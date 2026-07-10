@@ -1,0 +1,16 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+
+case "$1" in
+    start)
+        /usr/libexec/rustos-dvm-agent announce
+        ;;
+    stop)
+        ;;
+    restart|reload)
+        ;;
+    *)
+        echo "usage: $0 {start|stop|restart|reload}" >&2
+        exit 1
+        ;;
+esac

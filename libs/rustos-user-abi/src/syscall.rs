@@ -55,6 +55,8 @@ pub const SYS_RUSTOS_IPC_TRY_RECV: u64 = 0x5255_0035;
 pub const SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER: u64 = 0x5255_0036;
 pub const SYS_RUSTOS_DRIVER_SYMBOL_EVENT_BROKER: u64 = 0x5255_0037;
 pub const SYS_RUSTOS_IPC_RECV_WITH_SENDER: u64 = 0x5255_0038;
+pub const SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT: u64 = 0x5255_0039;
+pub const SYS_RUSTOS_PROC_ACTIVATE_BROKER: u64 = 0x5255_003a;
 
 /// RustOS-private auxv entry: virtual address of the bootstrap heap region
 /// that the kernel pre-maps for static-PIE policy services so they can run
@@ -316,12 +318,16 @@ pub const LINUX_SIGACTION_SIZE: usize = 32;
 pub const LOADER_REQUEST_ABI_VERSION: u16 = 1;
 pub const LOADER_OP_SPAWN_EXEC: u16 = 1;
 pub const LOADER_OP_EXEC_TARGET: u16 = 2;
+pub const LOADER_OP_ACTIVATE: u16 = 3;
 pub const LOADER_SPAWN_EXEC_PATH_CAPACITY: usize = 256;
 pub const LOADER_SPAWN_ARG_BYTES: usize = 1024;
 pub const LOADER_SPAWN_ENV_BYTES: usize = 2048;
 pub const LOADER_SPAWN_MAX_ARG_COUNT: usize = 32;
 pub const LOADER_SPAWN_MAX_ENV_COUNT: usize = 64;
 pub const LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF: u32 = 1 << 1;
+pub const LOADER_SPAWN_FLAG_DEFER_START: u32 = 1 << 2;
+pub const IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION: u16 = 1;
+pub const IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS: u64 = 30_000;
 pub const PROCD_IPC_ABI_VERSION: u16 = 1;
 pub const PROCD_OP_EXECVE: u16 = 1;
 pub const PROCD_OP_EXECVEAT: u16 = 2;
@@ -2118,6 +2124,15 @@ pub struct RustosProcCommitBrokerArgs {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RustosProcActivateBrokerArgs {
+    pub abi_version: u16,
+    pub reserved0: u16,
+    pub flags: u32,
+    pub target_pid: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RustosProcAbortBrokerArgs {
     pub prepare_handle: u64,
     pub reason: u64,
@@ -2237,6 +2252,17 @@ pub struct LoaderSpawnResponse {
     pub status: i32,
     pub pid: i64,
     pub reserved0: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RustosIpcWaitServiceEndpointArgs {
+    pub abi_version: u16,
+    pub reserved0: u16,
+    pub flags: u32,
+    pub service_id: u64,
+    pub expected_pid: u64,
+    pub timeout_ms: u64,
 }
 
 #[repr(C)]

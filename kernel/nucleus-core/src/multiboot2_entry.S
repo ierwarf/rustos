@@ -108,7 +108,10 @@ _start:
     mov $rustos_boot_pml4, %eax
     mov %eax, %cr3
     mov %cr4, %eax
-    or $0x20, %eax
+    # Rust code may use baseline x86_64 SSE instructions before the higher-level
+    # SIMD initializer runs. Do not depend on the firmware or hypervisor having
+    # enabled the OS-managed SSE state bits already.
+    or $0x620, %eax
     mov %eax, %cr4
     mov $0xc0000080, %ecx
     rdmsr

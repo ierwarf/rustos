@@ -17,12 +17,8 @@ pub struct Random {
 static RNG_SEED: Mutex<[u8; 32]> = Mutex::new([0; 32]);
 static RNG_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-pub fn init(boot_info_ptr: *const BootInfo) {
-    let mut seed = [0u8; 32];
-    if let Ok(boot_info) = unsafe { BootInfo::from_ptr(boot_info_ptr) } {
-        seed = boot_info.rng_seed;
-    }
-    *RNG_SEED.lock() = seed;
+pub fn init(boot_info: &BootInfo) {
+    *RNG_SEED.lock() = boot_info.rng_seed;
 }
 
 impl Random {
@@ -67,5 +63,11 @@ impl Random {
         let offset = self.uniform_below(span) as i128;
 
         (min as i128 + offset) as i64
+    }
+}
+
+impl Default for Random {
+    fn default() -> Self {
+        Self::new()
     }
 }

@@ -117,8 +117,8 @@ impl ProcessAddressSpace {
                     .ok_or(AddressSpaceError::NotMapped)?;
                 unsafe {
                     ptr::copy_nonoverlapping(
-                        higher_half_ptr(src_phys) as *const u8,
-                        higher_half_ptr(dst_phys) as *mut u8,
+                        higher_half_ptr(src_phys),
+                        higher_half_ptr(dst_phys),
                         PAGE_4KIB,
                     );
                 }
@@ -508,7 +508,7 @@ impl ProcessAddressSpace {
             unsafe {
                 ptr::copy_nonoverlapping(
                     data.as_ptr().add(written),
-                    higher_half_ptr(phys) as *mut u8,
+                    higher_half_ptr(phys),
                     chunk,
                 );
             }
@@ -905,10 +905,10 @@ fn track_owned_frame(
     owned_frames: &mut Vec<u64>,
     frame_phys: u64,
 ) -> Result<(), AddressSpaceError> {
-    if frame_phys == 0 || frame_phys % PAGE_4KIB_U64 != 0 {
+    if frame_phys == 0 || !frame_phys.is_multiple_of(PAGE_4KIB_U64) {
         return Err(AddressSpaceError::InvalidFrameOwnership);
     }
-    if owned_frames.iter().any(|owned| *owned == frame_phys) {
+    if owned_frames.contains(&frame_phys) {
         return Err(AddressSpaceError::InvalidFrameOwnership);
     }
     owned_frames.push(frame_phys);

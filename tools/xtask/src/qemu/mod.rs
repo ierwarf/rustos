@@ -98,16 +98,11 @@ enum QemuBootDisk {
     Nvme,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum UsbInputDevice {
+    #[default]
     Tablet,
     Mouse,
-}
-
-impl Default for UsbInputDevice {
-    fn default() -> Self {
-        Self::Tablet
-    }
 }
 
 impl UsbInputDevice {
@@ -638,25 +633,25 @@ fn run_qemu_supervised(
             return Ok(());
         }
 
-        if let Some(deadline) = deadline {
-            if Instant::now() >= deadline {
-                terminate_qemu_child(&mut child)?;
-                println!(
-                    "\n====================================\nQEMU stopped after timeout {:?}\n====================================\n",
-                    timeout.unwrap_or_default()
-                );
-                if summarize_log {
-                    summarize_debugcon_log(debugcon_log)?;
-                }
-                let missing = expected_markers_satisfied(debugcon_log, expect_markers)?;
-                if !missing.is_empty() {
-                    bail!(
-                        "timed out waiting for expected marker(s): {}",
-                        missing.join(" | ")
-                    );
-                }
-                return Ok(());
+        if let Some(deadline) = deadline
+            && Instant::now() >= deadline
+        {
+            terminate_qemu_child(&mut child)?;
+            println!(
+                "\n====================================\nQEMU stopped after timeout {:?}\n====================================\n",
+                timeout.unwrap_or_default()
+            );
+            if summarize_log {
+                summarize_debugcon_log(debugcon_log)?;
             }
+            let missing = expected_markers_satisfied(debugcon_log, expect_markers)?;
+            if !missing.is_empty() {
+                bail!(
+                    "timed out waiting for expected marker(s): {}",
+                    missing.join(" | ")
+                );
+            }
+            return Ok(());
         }
 
         thread::sleep(QEMU_WAIT_POLL);
@@ -1494,6 +1489,7 @@ fn base_qemu_command(config: &Config, qemu_bin: &Path) -> Command {
     command
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_qemu_args(
     command: &mut Command,
     profile_args: &[OsString],
@@ -1692,9 +1688,7 @@ fn run_display_probe(config: &Config, options: RunOptions) -> Result<()> {
     })();
 
     let status = wait_for_child_or_kill(&mut child)?;
-    if let Err(err) = probe_result {
-        return Err(err);
-    }
+    probe_result?;
     if !status.success() {
         bail!("QEMU exited with status {status}");
     }
@@ -1717,12 +1711,8 @@ fn connect_qmp(path: &Path, timeout: Duration) -> Result<UnixStream> {
                 qmp_execute(&mut qmp, r#"{"execute":"qmp_capabilities"}"#, deadline)?;
                 return Ok(qmp);
             }
-            Err(err) if Instant::now() < deadline => {
-                if err.kind() != ErrorKind::NotFound && err.kind() != ErrorKind::ConnectionRefused {
-                    thread::sleep(Duration::from_millis(50));
-                } else {
-                    thread::sleep(Duration::from_millis(50));
-                }
+            Err(_) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(50));
             }
             Err(err) => bail!("failed to connect to QMP socket: {err}"),
         }

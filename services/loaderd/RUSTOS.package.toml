@@ -12,11 +12,6 @@ linkage = "static-pie"
 [install]
 path = "services/loaderd/loaderd.elf"
 
-[boot]
-preload = true
-required = false
-priority = -565
-
 [[desktop.entries]]
 display_name = "loaderd"
 weight_micros = 100
