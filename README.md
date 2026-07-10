@@ -20,7 +20,7 @@ RustOS is organized as an OS development platform rather than a single kernel
 crate. The main flow is:
 
 ```text
-cargo xtask build -> build/image -> cargo xtask run -> QEMU boot
+cargo xtask build -> build/rustos-boot.img -> Xen HVM input
 ```
 
 Start here:
@@ -51,11 +51,14 @@ Quick commands:
 ```bash
 cargo xtask check
 cargo xtask build
-cargo xtask run
+cargo xtask xen-smoke --dry-run
 ```
 
-The staged boot volume is `build/image`, and the default UEFI entry is the
-GRUB-generated `build/image/EFI/BOOT/BOOTX64.EFI`.
+The staged boot volume is `build/image`, the generated disk is
+`build/rustos-boot.img`, and the default UEFI entry is the GRUB-generated
+`build/image/EFI/BOOT/BOOTX64.EFI`. `cargo xtask run` is fail-closed until the
+authenticated RustOS↔Linux-DVM transport exists; use `xen-smoke` only for a
+non-product Xen lifecycle check.
 
 <a id="korean"></a>
 
@@ -65,7 +68,7 @@ RustOS는 단일 kernel crate가 아니라 OS 개발 플랫폼 형태로 구성�
 Rust-first 운영체제 workspace입니다. 기본 흐름은 다음과 같습니다.
 
 ```text
-cargo xtask build -> build/image -> cargo xtask run -> QEMU boot
+cargo xtask build -> build/rustos-boot.img -> Xen HVM input
 ```
 
 먼저 볼 문서:
@@ -96,8 +99,10 @@ cargo xtask build -> build/image -> cargo xtask run -> QEMU boot
 ```bash
 cargo xtask check
 cargo xtask build
-cargo xtask run
+cargo xtask xen-smoke --dry-run
 ```
 
-staged boot volume은 `build/image`이며, 기본 UEFI entry는 GRUB이 생성한
-`build/image/EFI/BOOT/BOOTX64.EFI`입니다.
+staged boot volume은 `build/image`, 생성 disk는 `build/rustos-boot.img`이며,
+기본 UEFI entry는 GRUB이 생성한 `build/image/EFI/BOOT/BOOTX64.EFI`입니다.
+인증된 RustOS↔Linux-DVM transport가 생기기 전 `cargo xtask run`은
+fail-closed합니다. `xen-smoke`는 비상용 Xen lifecycle check에만 사용합니다.

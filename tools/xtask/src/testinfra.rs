@@ -8,6 +8,7 @@ use crate::Result;
 use crate::config::{Config, validate_project_config_text};
 use crate::package_manifest::validate_manifest_text_for_testinfra;
 use crate::util::run_command;
+use crate::xen::validate_dvm_manifest_text_for_testinfra;
 
 pub(crate) fn selftest(config: &Config) -> Result<()> {
     for package in [
@@ -15,6 +16,7 @@ pub(crate) fn selftest(config: &Config) -> Result<()> {
         "rustos-user-abi",
         "runtime-control",
         "module-tests",
+        "xtask",
     ] {
         let mut command = Command::new(&config.cargo);
         command
@@ -42,10 +44,12 @@ pub(crate) fn fuzz_host(
             FuzzTarget::FaultRules,
             FuzzTarget::ProjectConfig,
             FuzzTarget::PackageManifest,
+            FuzzTarget::DvmManifest,
         ],
         "fault-rules" => vec![FuzzTarget::FaultRules],
         "project-config" => vec![FuzzTarget::ProjectConfig],
         "package-manifest" => vec![FuzzTarget::PackageManifest],
+        "dvm-manifest" => vec![FuzzTarget::DvmManifest],
         other => bail!("unknown fuzz target: {other}"),
     };
 
@@ -60,6 +64,7 @@ enum FuzzTarget {
     FaultRules,
     ProjectConfig,
     PackageManifest,
+    DvmManifest,
 }
 
 impl FuzzTarget {
@@ -68,6 +73,7 @@ impl FuzzTarget {
             Self::FaultRules => "fault-rules",
             Self::ProjectConfig => "project-config",
             Self::PackageManifest => "package-manifest",
+            Self::DvmManifest => "dvm-manifest",
         }
     }
 }
@@ -134,6 +140,14 @@ fn default_seeds(target: FuzzTarget) -> Vec<Vec<u8>> {
             b"id=\"sample-driver\"\nkind=\"bridge-driver\"\n[build]\nbuilder=\"module-image\"\npackage=\"sample-driver\"\n[install]\npath=\"system/drivers/sample.ko\"\n".to_vec(),
             b"id=\"hidden-app\"\nkind=\"app\"\nstartup=\"session\"\n[build]\nbuilder=\"cargo-kernel-binary\"\npackage=\"hidden-app\"\n[install]\npath=\"apps/hidden-app/hidden-app.elf\"\n[[desktop.entries]]\ndisplay_name=\"hidden\"\nweight_micros=100\nno_display=true\n".to_vec(),
         ],
+        FuzzTarget::DvmManifest => vec![
+            format!(
+                "schema=2\nid=rustos-linux-dvm-x86_64\narchitecture=x86_64\nboot=linux-bzimage+cpio-xz\ndata-plane=dvm-local-virtio\ncontrol-plane=agent-v1-pretransport\ncontrol-protocol=agent-v1\ncontrol-state=pretransport\ncontrol-transport=xen-vchan-pending\ncontrol-authentication=l0-domain-bound-pending\ncontrol-capabilities=health,device-inventory\ncontrol-contract-sha256={0}\nkernel_sha256={0}\nrootfs_sha256={0}\nconfig_sha256={0}\nsources_lock_sha256={0}\n",
+                "0".repeat(64)
+            )
+            .into_bytes(),
+            b"schema=2\nschema=2\n".to_vec(),
+        ],
     }
 }
 
@@ -148,6 +162,9 @@ fn exercise_target(target: FuzzTarget, bytes: &[u8]) {
         }
         FuzzTarget::PackageManifest => {
             let _ = validate_manifest_text_for_testinfra(&text);
+        }
+        FuzzTarget::DvmManifest => {
+            let _ = validate_dvm_manifest_text_for_testinfra(&text);
         }
     }
 }

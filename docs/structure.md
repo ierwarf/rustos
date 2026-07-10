@@ -24,7 +24,7 @@ are enforced by `cargo xtask check`.
 - `assets/ui/`: UI fonts and related UI assets
 - `build/artifacts/`: build artifact cache
 - `build/image/`: staged boot volume root
-- `logs/`: QEMU, debugcon, interrupt, and helper logs
+- `logs/`: host fuzz and local helper logs; Xen smoke logs are under `build/xen/`
 - `drivers/bridges/`: kernel-address-space bridge drivers and `.ko` modules
 - `drivers/user/`: userspace driver/service ELF packages
 - `drivers/libs/`: driver ABI, runtime, and helper crates
@@ -96,7 +96,7 @@ are enforced by `cargo xtask check`.
 - `build/`: reproducible build and stage output
 - `logs/`: run/debug output
 
-Do not put generated artifacts, QEMU run output, or local debug captures in
+Do not put generated artifacts, Xen smoke output, or local debug captures in
 source directories.
 
 ### Adding A New Module
@@ -137,7 +137,7 @@ source directories.
 - `assets/ui/`: UI font와 관련 UI asset
 - `build/artifacts/`: build artifact cache
 - `build/image/`: staged boot volume root
-- `logs/`: QEMU, debugcon, interrupt, helper log
+- `logs/`: host fuzz, local debug, helper log; Xen smoke log는 `build/xen/`
 - `drivers/bridges/`: kernel address space에 남는 bridge driver와 `.ko` module
 - `drivers/user/`: userspace driver/service ELF package
 - `drivers/libs/`: driver ABI, runtime, helper crate
@@ -210,7 +210,7 @@ source directories.
 - `build/`: 재생성 가능한 build/stage output
 - `logs/`: run/debug output
 
-생성 artifact, QEMU 실행 output, local debug capture를 source directory에
+생성 artifact, Xen smoke 실행 output, local debug capture를 source directory에
 두지 마세요.
 
 ### 새 모듈 추가 절차

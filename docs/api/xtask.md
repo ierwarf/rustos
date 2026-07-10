@@ -6,163 +6,83 @@
 
 ## English
 
-`cargo xtask` is the host-side control surface for RustOS. The command enum is
-defined in `tools/xtask/src/cli.rs`.
+`cargo xtask` builds RustOS and prepares Xen-domain inputs. The command surface
+is defined in `tools/xtask/src/cli.rs`.
 
-### Commands
-
-| Command | Purpose | Main output |
-| --- | --- | --- |
-| `cargo xtask check` | Validate layering, package manifests, targets, and workspace checks. | No image output. |
-| `cargo xtask build` | Full OS build and stage. | `build/artifacts`, `build/image`, registries. |
-| `cargo xtask stage` | Copy built artifacts and overlays into the boot image. | `build/image`. |
-| `cargo xtask run` | Run current staged image in QEMU. | QEMU session, `logs/debugcon.log`. |
-| `cargo xtask debug` | Run QEMU with GDB stub. | `logs/rustos-debug.gdb`. |
-| `cargo xtask probe-display` | Headless display probe/stress path. | Probe result and debug logs. |
-| `cargo xtask qemu-scenarios` | Run named QEMU regression scenarios. | QEMU logs and scenario result. |
-| `cargo xtask selftest` | Run host selftests for contracts and hardening helpers. | Cargo test output. |
-| `cargo xtask fuzz-host` | Run deterministic host parser fuzz smoke tests. | `logs/fuzz-crash-*.bin` on crash. |
-| `cargo xtask clean` | Remove cargo/build/runtime outputs. | Cleaned target/build/log dirs. |
-| `cargo xtask targets` | Install required Rust targets. | Rust target availability. |
-| `cargo xtask build-efi` | Build GRUB EFI boot manager only. Uses `RUSTOS_GRUB_*` when set, otherwise creates a local development key under `build/dev-grub-gpg`. | `build/artifacts/EFI/BOOT/BOOTX64.EFI`, `build/artifacts/nucleus.elf.sig`. |
-| `cargo xtask build-kernel` | Build Multiboot2 nucleus/kernel only. | `build/artifacts/nucleus.elf`. |
-| `cargo xtask build-user` | Build userspace packages. | service/app artifacts. |
-| `cargo xtask build-console-demo` | Build C demo/smoke programs. | app artifacts. |
-| `cargo xtask build-driver-modules` | Build bridge driver modules. | `.ko` artifacts. |
-
-### QEMU Options
-
-`cargo xtask run`, `debug`, and `probe-display` accept shared options:
-
-| Option | Meaning |
+| Command | Purpose |
 | --- | --- |
-| `--profile <default|g14|nvme>` | Select QEMU machine/storage/memory profile. |
-| `--accel-profile kvm` | Use KVM acceleration and host CPU profile. |
-| `--usb-input` | Attach `qemu-xhci`, `usb-kbd`, and `usb-tablet` so interactive GTK runs receive pointer input without click-to-grab. |
-| `--no-network` | Disable default usernet and `virtio-net-pci`. |
-| `--debugcon <file|stdio|null>` | Route debugcon to file, terminal, or disable it. |
-| `--qemu-log <int|null>` | Write QEMU interrupt trace or disable QEMU trace logging. |
-| `--timeout <seconds>` | Stop QEMU after a bounded run. No timeout is applied by default. |
-| `--expect <marker>` | Stop successfully once all repeated debugcon markers appear. |
-| `--fault <location=action>` | Add one validated fault-injection rule for this run. |
-| `--summarize-log` | Print high-signal debugcon markers after QEMU stops. |
-| `--vfio-pci <BDF>` | Attach a host vfio-pci device. |
-| `--phoenix3-passthrough` | Auto-detect and attach Phoenix3 GPU functions. |
-| `--vfio-force` | Allow devices driving active host display. |
+| `cargo xtask check` | Validate layering, manifests, targets, and workspace contracts. |
+| `cargo xtask build` | Build and stage the signed RustOS boot disk. |
+| `cargo xtask build-dvm` | Build and hash-verify the pinned Buildroot Linux DVM. |
+| `cargo xtask verify-dvm` | Verify DVM artifact and pre-transport contract hashes. |
+| `cargo xtask xen-smoke` | Concurrently create the Linux DVM and RustOS HVM through the active Xen control domain. |
+| `cargo xtask run` | Production Xen entry point. It fails closed until the authenticated RustOS↔DVM transport exists. |
+| `cargo xtask selftest` / `fuzz-host` | Run host contract tests and deterministic parser fuzzing. |
 
-Raw QEMU args go after `--`:
+`xen-smoke` is bounded to 30 seconds when waiting for markers:
 
 ```bash
-cargo xtask run -- -display none
+cargo xtask build
+cargo xtask build-dvm
+cargo xtask xen-smoke --expect 'uiserver: wayland compositor ready'
 ```
 
-Bounded KVM no-opt debugging uses NVMe storage by default while AHCI boundary
-issues are isolated separately:
+It requires an already booted Xen control domain with `xl`, and writes generated
+runtime inputs to `build/xen/`:
 
-```bash
-cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file --timeout 35 --summarize-log
-```
+- a private writable RustOS HVM disk copied from `build/rustos-boot.img`;
+- `linux-dvm.cfg` and `rustos-hvm.cfg`;
+- HVM debugcon and serial captures.
 
-Fault injection rules can come from `config/rustos.toml` or repeated
-`--fault` arguments:
+The HVM config uses the repository-pinned OVMF through an explicit Xen
+firmware path. It never silently falls back to the Dom0 distribution firmware.
+Its single bootstrap disk is an emulated AHCI `hda` backed by the staged raw
+FAT image; it never assumes an unimplemented Xen PV `xvda` frontend.
 
-```bash
-cargo xtask run --fault display.present=drop-every:10 --timeout 35 --summarize-log
-```
-
-Use `cargo xtask qemu-scenarios --list` to see the built-in scenario names.
-
-### When To Use Each Command
-
-- Use `check` before commits that change dependencies, manifests, or layer
-  boundaries. It also validates an existing `build/artifacts/nucleus.elf` with
-  `grub-file --is-x86-multiboot2` when present.
-- Use `build` after changing code or staged image content. The default build
-  requires GRUB public/signing key environment variables.
-- Use `stage` after changing only `assets/image` or package install metadata
-  when artifacts are already built.
-- Use `run` for normal boot testing.
-- Use `debug` when attaching GDB.
-- Use `probe-display` for display, framebuffer, surface, or dirty-rect bugs.
+`xen-smoke` submits Linux DVM and RustOS HVM creation concurrently, then always
+requires `rootd: core services ready, spawning initd via loaderd`. This rejects
+a merely-created, paused, or early-panicked HVM; `--expect` adds stricter
+milestones. The DVM manifest carries a hash-bound `agent-v1-pretransport`
+contract for future L0-authenticated Xen vchan control, not a live transport or
+driver data plane. Therefore `cargo xtask run` does not create a product session
+or claim device availability.
 
 <a id="korean"></a>
 
 ## 한국어
 
-`cargo xtask`는 RustOS의 host-side control surface입니다. command enum은
-`tools/xtask/src/cli.rs`에 정의되어 있습니다.
+`cargo xtask`는 RustOS를 빌드하고 Xen domain 입력을 준비합니다. command
+surface는 `tools/xtask/src/cli.rs`에 있습니다.
 
-### Commands
-
-| Command | Purpose | Main output |
-| --- | --- | --- |
-| `cargo xtask check` | layering, package manifest, target, workspace check를 검증합니다. | image output 없음 |
-| `cargo xtask build` | 전체 OS build와 stage를 수행합니다. | `build/artifacts`, `build/image`, registries |
-| `cargo xtask stage` | built artifact와 overlay를 boot image에 복사합니다. | `build/image` |
-| `cargo xtask run` | 현재 staged image를 QEMU에서 실행합니다. | QEMU session, `logs/debugcon.log` |
-| `cargo xtask debug` | GDB stub과 함께 QEMU를 실행합니다. | `logs/rustos-debug.gdb` |
-| `cargo xtask probe-display` | headless display probe/stress path를 실행합니다. | probe result와 debug logs |
-| `cargo xtask qemu-scenarios` | 이름이 있는 QEMU regression scenario를 실행합니다. | QEMU log와 scenario result |
-| `cargo xtask selftest` | contract와 hardening helper host selftest를 실행합니다. | Cargo test output |
-| `cargo xtask fuzz-host` | deterministic host parser fuzz smoke test를 실행합니다. | crash 시 `logs/fuzz-crash-*.bin` |
-| `cargo xtask clean` | cargo/build/runtime output을 지웁니다. | 정리된 target/build/log dirs |
-| `cargo xtask targets` | 필요한 Rust target을 설치합니다. | Rust target availability |
-| `cargo xtask build-efi` | GRUB EFI boot manager만 빌드합니다. `RUSTOS_GRUB_*` 값이 없으면 `build/dev-grub-gpg` 아래에 로컬 개발 키를 생성합니다. | `build/artifacts/EFI/BOOT/BOOTX64.EFI`, `build/artifacts/nucleus.elf.sig` |
-| `cargo xtask build-kernel` | Multiboot2 nucleus/kernel만 빌드합니다. | `build/artifacts/nucleus.elf` |
-| `cargo xtask build-user` | userspace package를 빌드합니다. | service/app artifacts |
-| `cargo xtask build-console-demo` | C demo/smoke program을 빌드합니다. | app artifacts |
-| `cargo xtask build-driver-modules` | bridge driver module을 빌드합니다. | `.ko` artifacts |
-
-### QEMU Options
-
-`cargo xtask run`, `debug`, `probe-display`는 같은 option을 받습니다.
-
-| Option | Meaning |
+| Command | 용도 |
 | --- | --- |
-| `--profile <default|g14|nvme>` | QEMU machine/storage/memory profile 선택 |
-| `--accel-profile kvm` | KVM acceleration과 host CPU profile 사용 |
-| `--usb-input` | `qemu-xhci`, `usb-kbd`, `usb-tablet` attach. GTK interactive run에서 click-to-grab 없이 pointer input을 받습니다. |
-| `--no-network` | default usernet과 `virtio-net-pci` 비활성화 |
-| `--debugcon <file|stdio|null>` | debugcon을 file, terminal로 보내거나 끔 |
-| `--qemu-log <int|null>` | QEMU interrupt trace를 쓰거나 QEMU trace logging을 끔 |
-| `--timeout <seconds>` | 제한 시간 후 QEMU를 종료. 기본값은 timeout 없음 |
-| `--expect <marker>` | 반복 지정한 debugcon marker가 모두 나오면 성공으로 종료 |
-| `--fault <location=action>` | 이번 실행에만 validated fault-injection rule 추가 |
-| `--summarize-log` | QEMU 종료 후 high-signal debugcon marker 요약 출력 |
-| `--vfio-pci <BDF>` | host vfio-pci device attach |
-| `--phoenix3-passthrough` | Phoenix3 GPU function 자동 탐지/attach |
-| `--vfio-force` | active host display를 구동 중인 device도 허용 |
+| `cargo xtask check` | layering, manifest, target, workspace contract를 검증합니다. |
+| `cargo xtask build` | 서명된 RustOS boot disk를 빌드·stage합니다. |
+| `cargo xtask build-dvm` | 고정된 Buildroot Linux DVM을 빌드하고 hash를 검증합니다. |
+| `cargo xtask verify-dvm` | DVM artifact와 pre-transport contract hash를 검증합니다. |
+| `cargo xtask xen-smoke` | 활성 Xen control domain에서 Linux DVM과 RustOS HVM을 병렬 생성합니다. |
+| `cargo xtask run` | 상용 Xen 진입점입니다. 인증된 RustOS↔DVM transport가 구현될 때까지 fail-closed합니다. |
+| `cargo xtask selftest` / `fuzz-host` | host contract test와 deterministic parser fuzz를 실행합니다. |
 
-Raw QEMU arg는 `--` 뒤에 둡니다.
+`xen-smoke`의 marker 대기는 최대 30초입니다.
 
 ```bash
-cargo xtask run -- -display none
+cargo xtask build
+cargo xtask build-dvm
+cargo xtask xen-smoke --expect 'uiserver: wayland compositor ready'
 ```
 
-KVM no-opt bounded debugging은 AHCI boundary issue를 별도로 격리하기 위해
-우선 NVMe storage profile을 사용합니다.
+이미 부팅된 Xen control domain과 `xl`이 필요합니다. 생성 입력과 로그는
+`build/xen/`에 기록됩니다. RustOS HVM disk는 `build/rustos-boot.img`를 복사한
+private writable image이며, Xen config는 저장소에 고정된 OVMF를 명시 경로로
+사용하므로 Dom0 배포판 firmware로 조용히 fallback하지 않습니다.
+bootstrap disk는 stage된 raw FAT image를 emulated AHCI `hda`로 연결하며,
+아직 구현되지 않은 Xen PV `xvda` frontend를 가정하지 않습니다.
 
-```bash
-cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file --timeout 35 --summarize-log
-```
-
-Fault injection rule은 `config/rustos.toml`에서 오거나 반복 지정한 `--fault`
-argument에서 옵니다.
-
-```bash
-cargo xtask run --fault display.present=drop-every:10 --timeout 35 --summarize-log
-```
-
-내장 scenario 이름은 `cargo xtask qemu-scenarios --list`로 확인합니다.
-
-### 언제 어떤 명령을 쓰는가
-
-- dependency, manifest, layer boundary를 바꿨다면 `check`를 사용합니다. 기존
-  `build/artifacts/nucleus.elf`가 있으면 `grub-file --is-x86-multiboot2`도
-  검증합니다.
-- code 또는 staged image content를 바꿨다면 `build`를 사용합니다. 기본 build는
-  GRUB public/signing key 환경 변수가 필요합니다.
-- artifact가 이미 있고 `assets/image` 또는 install metadata만 바꿨다면 `stage`를 사용합니다.
-- 일반 boot test에는 `run`을 사용합니다.
-- GDB를 붙일 때는 `debug`를 사용합니다.
-- display, framebuffer, surface, dirty-rect bug에는 `probe-display`를 사용합니다.
+`xen-smoke`는 Linux DVM과 RustOS HVM 생성 요청을 병렬로 내고, 항상
+`rootd: core services ready, spawning initd via loaderd`를 요구합니다. 생성만
+됐거나 pause 상태 또는 초기 panic인 HVM은 통과하지 않으며, `--expect`로 더
+엄격한 milestone을 추가합니다. DVM manifest의 hash-bound
+`agent-v1-pretransport` contract는 이후 L0 인증 Xen vchan control을 위한
+준비물일 뿐, 실제 transport나 driver data plane이 아닙니다. 따라서
+`cargo xtask run`은 device가 준비된 것처럼 성공을 보고하지 않습니다.

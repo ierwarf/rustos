@@ -12,8 +12,8 @@ purpose. It is for hardening recovery paths, not for random breakage.
 The current path is:
 
 1. Rules live in `config/rustos.toml` under `[fault_injection]`.
-2. `cargo xtask run`, `debug`, and `probe-display` pass the rules to QEMU
-   through fw_cfg as `opt/rustos/fault-injection`.
+2. When enabled, `cargo xtask xen-smoke` passes the rules through the Xen HVM
+   device model as fw_cfg `opt/rustos/fault-injection`.
 3. The kernel reads that fw_cfg file during boot after the heap is initialized.
 4. Selected kernel boundaries call `should_fail("fault.point")`.
 5. If a rule fires, that boundary returns the same kind of failure it would
@@ -119,7 +119,7 @@ RustOS fault injection은 OS의 중요한 경계가 일부러 실패한 것처�
 현재 흐름은 이렇습니다.
 
 1. 규칙은 `config/rustos.toml`의 `[fault_injection]`에 둡니다.
-2. `cargo xtask run`, `debug`, `probe-display`가 규칙을 QEMU fw_cfg의
+2. 활성화하면 `cargo xtask xen-smoke`가 규칙을 Xen HVM device model의 fw_cfg
    `opt/rustos/fault-injection`으로 넘깁니다.
 3. 커널은 heap 초기화 직후 부팅 중 fw_cfg 파일을 읽습니다.
 4. 선택된 커널 경계가 `should_fail("fault.point")`를 호출합니다.

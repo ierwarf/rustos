@@ -16,7 +16,10 @@ readonly DL_DIR="$OUT_DIR/dl"
 readonly SRC_DIR="$OUT_DIR/src"
 readonly BUILD_DIR="$OUT_DIR/buildroot-output"
 readonly ARTIFACT_DIR="$OUT_DIR/artifacts"
+readonly LIBELF_SYSROOT="${RUSTOS_DVM_LIBELF_SYSROOT:-}"
 BUILDROOT_DIR=""
+LIBELF_INCLUDE_DIR=""
+LIBELF_LIBRARY_DIR=""
 
 die() {
     echo "rustos-linux-dvm: $*" >&2
@@ -28,9 +31,33 @@ require_tool() {
 }
 
 require_kernel_build_headers() {
-    if test ! -f /usr/include/libelf.h || test ! -f /usr/include/gelf.h; then
-        die "missing libelf development headers; install the host libelf development package (Debian/Ubuntu: sudo apt install libelf-dev)"
+    local candidate
+
+    if test -f /usr/include/libelf.h && test -f /usr/include/gelf.h; then
+        LIBELF_INCLUDE_DIR=/usr/include
+        return
     fi
+
+    test -n "$LIBELF_SYSROOT" || die "missing libelf development headers; install the host libelf development package (Debian/Ubuntu: sudo apt install libelf-dev), or set RUSTOS_DVM_LIBELF_SYSROOT to an immutable extracted libelf-dev package"
+    candidate="$LIBELF_SYSROOT/usr/include"
+    if test ! -f "$candidate/libelf.h" || test ! -f "$candidate/gelf.h"; then
+        die "RUSTOS_DVM_LIBELF_SYSROOT does not contain usr/include/libelf.h and usr/include/gelf.h: $LIBELF_SYSROOT"
+    fi
+
+    for candidate in \
+        "$LIBELF_SYSROOT/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || true)" \
+        "$LIBELF_SYSROOT/usr/lib/x86_64-linux-gnu" \
+        "$LIBELF_SYSROOT/usr/lib"; do
+        if test -f "$candidate/libelf.so"; then
+            LIBELF_LIBRARY_DIR="$candidate"
+            break
+        fi
+    done
+    test -n "$LIBELF_LIBRARY_DIR" || die "RUSTOS_DVM_LIBELF_SYSROOT does not contain an unversioned libelf.so: $LIBELF_SYSROOT"
+
+    LIBELF_INCLUDE_DIR="$LIBELF_SYSROOT/usr/include"
+    export C_INCLUDE_PATH="$LIBELF_INCLUDE_DIR${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
+    export LIBRARY_PATH="$LIBELF_LIBRARY_DIR${LIBRARY_PATH:+:$LIBRARY_PATH}"
 }
 
 load_lock() {
@@ -92,6 +119,10 @@ input_hash() {
         cd "$ROOT"
         find configs board scripts -type f -print0 | sort -z | xargs -0 sha256sum
         sha256sum sources.lock external.desc external.mk Config.in
+        sha256sum "$LIBELF_INCLUDE_DIR/libelf.h" "$LIBELF_INCLUDE_DIR/gelf.h"
+        if test -n "$LIBELF_LIBRARY_DIR"; then
+            sha256sum "$LIBELF_LIBRARY_DIR/libelf.so"
+        fi
     ) | sha256sum | awk '{print $1}'
 }
 
@@ -103,6 +134,8 @@ make_buildroot() {
 configure() {
     local stamp="$BUILD_DIR/.rustos-config-input.sha256"
     local current
+
+    require_kernel_build_headers
     current="$(input_hash)"
 
     if test -f "$BUILD_DIR/.config" && test -f "$stamp" \

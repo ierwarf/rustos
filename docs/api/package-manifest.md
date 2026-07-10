@@ -102,7 +102,7 @@ fallback_only = false
 
 Stage writes enabled entries into `system/registry/kernel/loadable-drivers.tsv`.
 Keep hardware-specific providers out of the `default` profile unless the
-default QEMU machine exposes that hardware. Fallback providers in the same
+default Xen hardware profile exposes that hardware. Fallback providers in the same
 `provider_group` are skipped after a primary provider loads.
 
 <a id="korean"></a>
@@ -203,6 +203,6 @@ fallback_only = false
 ```
 
 stage는 enabled entry만 `system/registry/kernel/loadable-drivers.tsv`에 기록합니다.
-hardware-specific provider는 default QEMU machine에 실제 hardware가 있을 때만
+hardware-specific provider는 default Xen hardware profile에 실제 hardware가 있을 때만
 `default` profile에 넣습니다. 같은 `provider_group`의 fallback provider는
 primary provider가 load된 뒤에는 skip됩니다.

@@ -18,56 +18,33 @@ failure output as the primary debugging context.
 
 | Command | Use | Writes | Common failure meaning |
 | --- | --- | --- | --- |
-| `cargo xtask run` | boot current image in QEMU | `logs/`, temp dirs | missing `build/image`, missing OVMF, QEMU failure |
-| `cargo xtask debug` | QEMU with GDB stub | `logs/rustos-debug.gdb` | same as run plus debug setup |
-| `cargo xtask probe-display` | headless display probe with screendump geometry and non-black-frame validation | `logs/` | display/surface/present regression |
-| `cargo xtask qemu-scenarios --list` | list predefined QEMU regression scenarios | none | unknown local xtask binary |
-| `cargo xtask qemu-scenarios --scenario display-probe` | run one QEMU regression scenario | `logs/` | boot/display/input regression |
+| `cargo xtask build-dvm` | build the pinned Linux DVM and verify its manifest | `driver-domains/linux/out/` | missing Buildroot prerequisite or source/artifact mismatch |
+| `cargo xtask verify-dvm` | verify every DVM artifact and control-contract hash | none | altered/missing DVM artifact or contract |
+| `cargo xtask xen-smoke` | concurrently create Linux DVM and RustOS HVM through Xen Dom0 | `build/xen/` | missing `xl`, failed domain lifecycle, missing HVM marker |
+| `cargo xtask run` | production Xen entry | none until transport exists | deliberately fails while DVM is pre-transport |
 
 ## Tests and inventory
 
 | Command | Use | Writes | Common failure meaning |
 | --- | --- | --- | --- |
 | `cargo xtask selftest` | host selftests for fault parsing, ABI/layout, runtime contracts, module tests | `target/` | contract/layout regression |
-| `cargo xtask fuzz-host --target all` | deterministic host fuzz smoke for fault rules, project config, package manifest parsing | `logs/` on crash | parser panic or invariant bug |
+| `cargo xtask fuzz-host --target all` | deterministic host fuzz smoke for fault rules, project config, package manifest, and DVM manifest parsing | `logs/` on crash | parser panic or invariant bug |
 | `cargo xtask ring3-inventory` | classify remaining `RING3-MIGRATION-REFERENCE` and `RING3-MIGRATION-COMMENTED-OUT` LOC by owner/lane; read `migration_candidate_loc` as real remaining ring3 work, `ko_slowpath_ring3_loc` as Linux `.ko` slow-path brokerization reference LOC, and `cleanup_debt_loc` as delete/retire work | none | stale marker classification or unexpected active LOC growth |
 | `cargo test -p module-tests` | module tests | `target/` | unit/module regression |
 | `git diff --check` | whitespace sanity | none | trailing whitespace/conflict marker |
 
-## QEMU args
+## Xen smoke arguments
 
-- xtask args go before `--`; raw QEMU args after `--`.
-- Example: `cargo xtask run --profile nvme`.
-- Short KVM no-opt debug runs use the built-in timeout and summary:
-  ```
-  cargo xtask run --profile nvme --accel-profile kvm --usb-input \
-    --debugcon file --timeout 35 --summarize-log
-  ```
-- Commercial-max closure runs use the readiness signature bundle:
-  ```
-  cargo xtask run --profile nvme --accel-profile kvm --usb-input \
-    --debugcon file --commercial-max-ready
-  ```
-- Use repeated `--expect <marker>` to stop as soon as specific debugcon
-  markers appear. Without `--expect`, `--timeout` is a controlled stop.
-- For high-density USB pointer validation, use `cargo xtask probe-display
-  --accel-profile kvm --usb-input --usb-input-device tablet` or
-  `--usb-input-device mouse`. The probe attaches only the selected USB pointer
-  device, sends tablet absolute events directly, routes mouse relative events
-  through the default display device id, waits for the input surface/storage
-  post-boot markers before stressing input, and fails if HID reports, inputd
-  reads, or uiserver input ticks stop advancing.
-- Tune pointer stress with `RUSTOS_PROBE_STRESS_MS`, `RUSTOS_PROBE_STEP_MS`,
-  `RUSTOS_PROBE_INPUT_START_MS` (post-boot quiet time before sending input),
-  and `RUSTOS_PROBE_INPUT_STALL_MS` when reproducing short input stalls.
-- Use repeated `--fault <location=action>` to pass a validated fault-injection
-  rule to the guest via QEMU fw_cfg (`opt/rustos/fault-injection`). Examples:
-  `display.present=drop-every:10`, `block.read=fail-after:50`,
-  `socket.send=rate:5`.
-- Prefer `--summarize-log` and focused `rg` over opening whole log files.
-- Do not add ad hoc QEMU or kernel debug branches for one driver. Route
-  durable debug state through logging, milestones, registries, and common
-  subsystem APIs.
+- `xen-smoke` requires an active Xen Dom0 and `xl`; it never starts Xen itself.
+- `--timeout <seconds>` is bounded to `1..=30` and applies only while waiting
+  for expected HVM debugcon markers.
+- The default marker is `rootd: core services ready, spawning initd via loaderd`;
+  repeat `--expect <marker>` for each additional RustOS milestone.
+- `--dry-run` verifies DVM artifacts and writes `build/xen/*.cfg` without
+  invoking `xl`.
+- The DVM's `agent-v1-pretransport` contract is future L0-authenticated Xen
+  vchan control only. The lifecycle smoke is not a NIC, storage, `.ko`, PCI
+  passthrough, or transport test. Keep those claims behind explicit markers.
 
 ## Do not run
 

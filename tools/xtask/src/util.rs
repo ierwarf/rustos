@@ -176,10 +176,6 @@ pub(crate) fn resolve_command_path(command: &OsStr) -> Option<PathBuf> {
     command_in_path_os(command)
 }
 
-pub(crate) fn read_trimmed(path: impl AsRef<Path>) -> Result<String> {
-    Ok(fs::read_to_string(path)?.trim().to_string())
-}
-
 pub(crate) fn create_temp_dir(prefix: &str) -> Result<PathBuf> {
     Ok(tempfile::Builder::new().prefix(prefix).tempdir()?.keep())
 }

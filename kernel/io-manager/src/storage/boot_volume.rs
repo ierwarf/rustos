@@ -108,15 +108,6 @@ impl BootstrapPhase {
     }
 }
 
-fn should_trace_boot_path(path: &str) -> bool {
-    crate::debug::enabled!(storage, debug)
-        && (path.contains("services/")
-            || path.starts_with("lib/")
-            || path.starts_with("/lib/")
-            || path.starts_with("lib64/")
-            || path.starts_with("/lib64/"))
-}
-
 pub struct PhysicalBootVolume {
     fs: BootVolumeFs,
 }
@@ -423,11 +414,6 @@ impl RootFileExtentTable {
 fn load_root_file_extent_table()
 -> core::result::Result<RootFileExtentTable, fatfs::Error<DiskIoError>> {
     if let Some(manifest) = boot_extent_manifest() {
-        crate::debug::println_fmt(format_args!(
-            "boot volume debug: manifest ptr={:#x} len={}",
-            manifest.ptr,
-            manifest.len
-        ));
         crate::debug::info!(
             storage,
             "boot volume extents: manifest ptr={:#x} len={}",
@@ -445,20 +431,7 @@ fn load_root_file_extent_table()
                 usize::try_from(manifest.len).map_err(|_| fatfs::Error::InvalidInput)?,
             )
         };
-        let table = parse_root_file_extent_table(bytes)
-            .map_err(|_| fatfs::Error::InvalidInput)?;
-        let has_rootd = table
-            .entries
-            .iter()
-            .any(|entry| entry.path == "services/rootd/rootd.elf");
-        crate::debug::println_fmt(format_args!(
-            "boot volume debug: table includes rootd={}",
-            has_rootd
-        ));
-        crate::debug::println_fmt(format_args!(
-            "boot volume debug: parsed entries={}",
-            table.entries.len()
-        ));
+        let table = parse_root_file_extent_table(bytes).map_err(|_| fatfs::Error::InvalidInput)?;
         crate::debug::info!(
             storage,
             "boot volume extents: parsed entries={}",
@@ -467,7 +440,6 @@ fn load_root_file_extent_table()
         return Ok(table);
     }
 
-    crate::debug::println_fmt(format_args!("boot volume debug: missing root extent manifest"));
     crate::debug::warn!(storage, "boot volume extents: missing BootInfo manifest");
     Err(fatfs::Error::Io(DiskIoError::NotPresent))
 }
@@ -733,13 +705,6 @@ impl PhysicalBootVolume {
 }
 
 pub fn read_file_to_vec(path: &str) -> core::result::Result<Vec<u8>, fatfs::Error<DiskIoError>> {
-    crate::debug::println_fmt(format_args!("boot volume debug: read_file_to_vec called path={}", path));
-    if should_trace_boot_path(path) {
-        crate::debug::println!(
-            "boot volume helper: runtime read_file_to_vec begin path={}",
-            path
-        );
-    }
     if let Some(bytes) = read_file_to_vec_from_extents(path)? {
         return Ok(bytes);
     }
@@ -755,11 +720,6 @@ pub fn read_file_to_vec(path: &str) -> core::result::Result<Vec<u8>, fatfs::Erro
             state,
             entries
         );
-        crate::debug::println_fmt(format_args!(
-            "boot volume debug: rootd lookup state={} entries={}",
-            state,
-            entries
-        ));
     }
     Err(fatfs::Error::NotFound)
 }
@@ -768,13 +728,6 @@ pub fn read_file_into(
     path: &str,
     dest: &mut [u8],
 ) -> core::result::Result<usize, fatfs::Error<DiskIoError>> {
-    if should_trace_boot_path(path) {
-        crate::debug::println!(
-            "boot volume helper: read_file_into begin path={} len={}",
-            path,
-            dest.len()
-        );
-    }
     if let Some(bytes) = read_file_to_vec_from_extents(path)? {
         let len = bytes.len().min(dest.len());
         dest[..len].copy_from_slice(&bytes[..len]);
@@ -784,9 +737,6 @@ pub fn read_file_into(
 }
 
 pub fn metadata(path: &str) -> core::result::Result<BootVolumeMetadata, fatfs::Error<DiskIoError>> {
-    if should_trace_boot_path(path) {
-        crate::debug::println!("boot volume helper: metadata begin path={}", path);
-    }
     if let Some(metadata) = metadata_from_extents(path)? {
         return Ok(metadata);
     }
@@ -796,9 +746,7 @@ pub fn metadata(path: &str) -> core::result::Result<BootVolumeMetadata, fatfs::E
 pub fn read_dir(
     path: &str,
 ) -> core::result::Result<Vec<BootVolumeDirEntry>, fatfs::Error<DiskIoError>> {
-    if should_trace_boot_path(path) {
-        crate::debug::println!("boot volume helper: read_dir begin path={}", path);
-    }
+    let _ = path;
     Err(fatfs::Error::Io(DiskIoError::Unsupported))
 }
 

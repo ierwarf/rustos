@@ -38,7 +38,7 @@ or launch policy.
 - Retired display preferred-scanout policy flags/width/height are rejected by
   the ring0 module-load broker; driverd/provider state owns scanout selection.
 - Driver `class` registry values: `display`, `input`, `network`, `usb`, `storage`. `usb` is reserved for explicit USB compat/dev bridge modules; native xHCI is the RustOS host-controller path and is not staged as a Linux `.ko`.
-- `display-primary` group: real hardware/virtio providers ordered ahead of firmware framebuffer fallbacks. `bootfb` is last-resort, **never** default primary for QEMU or hardware GPUs.
+- `display-primary` group: real hardware/virtio providers ordered ahead of firmware framebuffer fallbacks. `bootfb` is last-resort, **never** default primary for Xen or hardware GPUs.
 - When `driverd` selects the exact `bootfb` fallback request, ring0 may
   materialize the already-owned boot framebuffer directly instead of executing
   the `bootfb.ko` module. This does not bypass provider ordering; `driverd`
@@ -150,14 +150,48 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
 - Driver module loading must be stable across `codegen_units=1..=256` × `opt_level=0..=3` sweep. Loader policy may ignore relocations targeting non-loaded or non-ALLOC debug sections; loaded text/data relocations must still resolve through explicit ABI surfaces.
 - Linux compat load failures: write first disallowed/unresolved external symbol to debugcon directly. **Do not** rely only on category-filtered logs for module ABI diagnostics.
 
+## Xen Launch
+
+- `cargo xtask run` is the production Xen entry point, not a direct emulator
+  runner. It must fail closed while the Linux DVM manifest declares
+  `control-plane=agent-v1-pretransport`.
+- `cargo xtask build-dvm` invokes `driver-domains/linux/Makefile`; `verify-dvm`
+  validates the manifest schema plus kernel, rootfs, config, source-lock, and
+  immutable DVM control-contract SHA-256 values before any Xen config is written.
+- The DVM wrapper requires host `libelf` headers and an unversioned linker
+  library. `RUSTOS_DVM_LIBELF_SYSROOT` may name an immutable extracted
+  `libelf-dev` package for non-root CI; the wrapper validates and hashes those
+  headers/library before it configures Buildroot.
+- `cargo xtask xen-smoke` writes `build/xen/linux-dvm.cfg` and
+  `build/xen/rustos-hvm.cfg`, makes a private writable copy of
+  `build/rustos-boot.img`, and uses the repository-pinned `OVMF_PATH` as an
+  explicit Xen firmware path. Its HVM bootstrap contract is one raw FAT disk
+  on emulated AHCI (`hdtype='ahci'`, `vdev=hda`), not an unimplemented Xen PV
+  block frontend. It submits the DVM/HVM creates concurrently, checks both
+  lifecycles independently, and refuses to replace existing Xen domains.
+- A successful lifecycle smoke requires RustOS's read-only
+  `xen-hvm: discovery ready` marker, its `xen-hvm: hypercall page ready`
+  W^X-install marker, and the default `rootd` readiness marker. A
+  merely-created, paused, non-Xen, or early-panicked HVM cannot pass. The
+  discovery API exposes no transport and treats its Xen-reported domain ID as
+  diagnostics, never authorization. The hypercall page is installed from the
+  Xen CPUID-provided MSR into a private page and is RX before it is reported
+  ready; RustOS still issues no hypercall and has no endpoint at this stage.
+  The DVM's `agent-v1-pretransport` contract names only future
+  L0-authenticated Xen-vchan control with `health,device-inventory`; it is not
+  a live endpoint. Additional `--expect` markers tighten lifecycle proof; none
+  of these prove a RustOS device, `.ko`, Xen grant/event transport, PCI
+  assignment, or network/backend route.
+
 ## Fault Injection
 
 - Human guide: `docs/fault-injection.md`.
 - Shared parser: `libs/rustos-fault-injection`.
 - Host config: `tools/xtask/src/config/project.rs` `[fault_injection]`.
-- QEMU handoff: `tools/xtask/src/qemu/mod.rs` → fw_cfg `opt/rustos/fault-injection`.
+- Xen HVM smoke passes enabled fault rules through its Xen device model as
+  fw_cfg `opt/rustos/fault-injection`. Production transport remains separate
+  from this development-only fault channel.
 - Kernel runtime: `kernel/nucleus-core/src/util/fault_injection.rs`.
-- Kernel init: `kernel/executive/src/boot.rs::fault_injection::init_from_qemu_fw_cfg()` (after heap init).
 
 ### Rule Format
 
@@ -190,9 +224,13 @@ Add new points only at realistic failure boundaries: allocation, block IO, devic
 - Virtio-gpu is a display `.ko` path (`drivers/bridges/display/vendor/virtio-gpu`);
   do not reintroduce native `kernel/io-manager/src/driver/virtio_gpu.rs` or
   count it as a ring3 service-driver migration target.
-- Vendor virtio-net `.ko` stays out of the default profile until post-init worker/IRQ behavior is non-blocking under QEMU; `netd` remains the default network policy owner.
+- Vendor virtio-net `.ko` stays out of the default Xen profile until post-init
+  worker/IRQ behavior and the RustOS↔DVM network route are explicit; `netd`
+  remains the default network policy owner.
 - Vendor HID core `.ko` stays out of the default profile while USB HID leaf modules are disabled; native RustOS input remains the default boot input provider.
-- Hardware-specific display drivers such as AMDGPU stay out of the default QEMU profile unless the default machine exposes matching hardware; use an explicit hardware profile instead.
+- Hardware-specific display drivers such as AMDGPU stay out of the default Xen
+  profile unless the assigned hardware matches; use an explicit hardware
+  profile instead.
 - Native xHCI and HID interrupt polling are always on for USB input/display probes.
 - Optional net features (XDP, BPF, AF_XDP, ethtool offloads, DIM) may use per-symbol disabled shims; must fail closed — **never** fabricate packets or carrier state.
 

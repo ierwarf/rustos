@@ -21,7 +21,7 @@ pub(crate) struct Config {
     pub(crate) ld: OsString,
     pub(crate) mingw_cc: OsString,
     pub(crate) objdump: OsString,
-    pub(crate) qemu_bin: OsString,
+    pub(crate) xen_xl_bin: OsString,
     pub(crate) grub_mkstandalone: OsString,
     pub(crate) grub_file: OsString,
     pub(crate) gpg: OsString,
@@ -63,7 +63,7 @@ impl Config {
         let mingw_cc =
             env_os("MINGW_CC").unwrap_or_else(|| OsString::from("x86_64-w64-mingw32-gcc"));
         let objdump = env_os("OBJDUMP").unwrap_or_else(|| OsString::from("objdump"));
-        let qemu_bin = env_os("QEMU_BIN").unwrap_or_else(|| OsString::from("qemu-system-x86_64"));
+        let xen_xl_bin = env_os("XEN_XL_BIN").unwrap_or_else(|| OsString::from("xl"));
         let grub_mkstandalone =
             env_os("GRUB_MKSTANDALONE").unwrap_or_else(|| OsString::from("grub-mkstandalone"));
         let grub_file = env_os("GRUB_FILE").unwrap_or_else(|| OsString::from("grub-file"));
@@ -147,7 +147,7 @@ impl Config {
             ld,
             mingw_cc,
             objdump,
-            qemu_bin,
+            xen_xl_bin,
             grub_mkstandalone,
             grub_file,
             gpg,

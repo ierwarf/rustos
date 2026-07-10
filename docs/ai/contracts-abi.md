@@ -235,12 +235,12 @@ Residual app-ABI policy batches that are larger than a single broker are tracked
 - Native xHCI HID interrupt endpoints keep one active interrupt IN transfer per
   endpoint and resubmit it on completion, matching the Linux usbhid single-URB
   polling model. Do not queue parallel HID input polls; they interact badly with
-  QEMU HID event compression and turn normal endpoint service intervals into
+  emulated HID event compression and turn normal endpoint service intervals into
   bursty multi-frame delivery.
 - Native xHCI sends HID `SET_IDLE=0` for pointer devices and relies on one
   event-driven interrupt IN transfer plus bounded, last-resort Stop Endpoint /
   Set TR Dequeue Pointer recovery. Do not emulate liveness with a short periodic HID
-  idle rate: QEMU xHCI/tablet repeats identical absolute samples at that rate
+  idle rate: emulated xHCI/tablet repeats identical absolute samples at that rate
   and turns input into queue pressure.
 - Active interrupt IN transfers may legitimately stay pending while no fresh
   report exists. Do not treat sub-second idle as an endpoint fault; keep
@@ -249,11 +249,11 @@ Residual app-ABI policy batches that are larger than a single broker are tracked
 - Native xHCI transfer rings must follow producer-cycle Link TRB rules: passing
   a toggle Link TRB flips the Link TRB cycle bit and then the software producer
   cycle. Do not assign the link cycle from the current producer state at wrap;
-  that can leave QEMU xHCI parked at the segment link after long HID runs.
+  that can leave emulated xHCI parked at the segment link after long HID runs.
 - Native xHCI registers its legacy IRQ completion handler when the controller
   exposes a usable PIC IRQ line, but active HID interrupt transfers still keep
   `usb::service_pending()` reachable from compat input `poll()` as a bounded
-  completion fallback. QEMU legacy IRQ routing can observe an interrupt without
+  completion fallback. Emulated legacy IRQ routing can observe an interrupt without
   reliably waking every later completion; do not let input readers block solely
   on the IRQ path until MSI/MSI-X or a proven interrupt-driven xHCI backend is
   available.

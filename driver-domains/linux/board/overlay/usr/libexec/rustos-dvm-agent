@@ -2,26 +2,34 @@
 # SPDX-License-Identifier: MIT
 #
 # The first appliance build intentionally has no RustOS-specific kernel driver.
-# Standard virtio carries the data plane. This agent only publishes a local,
-# fail-closed readiness record until L0 supplies the authenticated control
-# channel described in MODEL.md.
+# This agent only publishes the signed pre-transport control contract. It must
+# never claim that DVM-local virtio is a RustOS inter-domain data plane.
 
 set -eu
 
 state_dir=/run/rustos-dvm
 ready_file="$state_dir/ready"
+contract_file=/usr/share/rustos-dvm/control-plane-v1.env
 
 announce() {
     umask 077
+    test -r "$contract_file" || {
+        echo "rustos-dvm-agent: missing control contract $contract_file" >&2
+        exit 1
+    }
+    # shellcheck source=/dev/null
+    . "$contract_file"
     mkdir -p "$state_dir"
-    cat >"$ready_file" <<'EOF'
-protocol=1
+    cat >"$ready_file" <<EOF
+schema=$CONTROL_SCHEMA
 role=linux-driver-domain
-control=not-connected
-data-plane=virtio
-capabilities=virtio-net,virtio-blk,virtio-console,virtio-input,virtio-vsock
+protocol=$CONTROL_PROTOCOL
+state=$CONTROL_STATE
+transport=$CONTROL_TRANSPORT
+authentication=$CONTROL_AUTHENTICATION
+capabilities=$CONTROL_CAPABILITIES
 EOF
-    printf '%s\n' 'rustos-dvm-agent: ready protocol=1 control=not-connected' \
+    printf '%s\n' "rustos-dvm-agent: ready protocol=$CONTROL_PROTOCOL state=$CONTROL_STATE" \
         >/dev/console 2>/dev/null || true
 }
 

@@ -58,12 +58,6 @@ enabled = false
 warn_wait_cycles = 250000
 warn_hold_cycles = 250000
 
-[qemu.display]
-# Default virtual display mode for xtask QEMU runs. Override this instead of
-# patching tools/xtask when testing alternate UI geometries.
-width = 1600
-height = 900
-
 [kernel.build]
 # Hardened/release-oriented kernel build knobs. Copy this block, or this whole
 # file, into config/rustos.toml when testing a release-shaped image.

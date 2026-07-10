@@ -257,15 +257,11 @@ fn sign_nucleus_with(config: &Config, signing: &GrubSigningMaterial) -> Result<(
 fn refresh_nucleus_signature_after_build(config: &Config) -> Result<()> {
     let nucleus = config.artifact_nucleus_elf_path();
     let signature = config.artifact_nucleus_signature_path();
-    if config.rustos_grub_signing_key.is_some() {
-        if !output_is_fresh(&signature, &[nucleus])? {
-            sign_nucleus(config)?;
-        }
-    } else if signature.is_file() && !output_is_fresh(&signature, &[nucleus])? {
-        remove_file_if_exists(&signature)?;
-        eprintln!(
-            "xtask: warning: removed stale nucleus signature; set RUSTOS_GRUB_SIGNING_KEY before staging a signed boot image"
-        );
+    if !output_is_fresh(&signature, &[nucleus])? {
+        // `sign_nucleus` creates the local development signing material when a
+        // release key was not supplied. A fresh nucleus must never leave a
+        // stale or missing signature for a later stage invocation.
+        sign_nucleus(config)?;
     }
     Ok(())
 }

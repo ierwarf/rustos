@@ -14,7 +14,7 @@ Optimized for AI agents, not human onboarding. English-only, dense, contract-sha
 | `contracts-abi.md` | IPC service IDs, broker syscalls, service routing contracts. |
 | `performance-hardening.md` | Boot/runtime bottleneck triage, provider policy, cleanup rules. |
 | `kernel-api-map.md` | Cross-crate kernel API surfaces (`kernel_*::api`) and boot order. |
-| `workflows.md` | Step recipes: add service/app/driver, modify kernel API, debug QEMU boot. |
+| `workflows.md` | Step recipes: add service/app/driver, modify kernel API, debug Xen lifecycle. |
 
 ## Operating rules
 

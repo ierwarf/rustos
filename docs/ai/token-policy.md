@@ -122,7 +122,7 @@ external binary inputs: `build/`, `target/`, `logs/`, `vendor/`, `perf.data`,
 
 Allowed exceptions (inspect the narrowest file/path possible):
 
-- QEMU/debug failure investigation → `logs/`.
+- Xen/debug failure investigation → `build/xen/`.
 - Stage verification → `build/image/system/registry/`.
 - Firmware/module packaging → specific `vendor/` paths.
 - Dependency resolution work → focused `Cargo.lock` snippets via `rg` first.

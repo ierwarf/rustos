@@ -10,6 +10,7 @@ into another crate's private modules when `api.rs` exposes a wrapper.
 | Need | Import | Read |
 | --- | --- | --- |
 | GDT/IDT/ACPI/PIC/RTC/SIMD/hooks | `kernel_hal::api as hal_api` | `kernel/hal/src/api.rs` |
+| Xen HVM discovery / hypercall-page install | `kernel_hal::api::arch::xen` | `kernel/hal/src/arch/xen.rs` |
 | Heap/paging/frames/higher-half | `kernel_mm::api as mm_api` | `kernel/mm/src/api.rs` |
 | Handles/rights/session ids | `kernel_object::api as object_api` | `kernel/object/src/api.rs` |
 | Shared memory regions | `kernel_ipc_runtime::api as ipc_api` | `kernel/ipc-runtime/src/api.rs` |
@@ -65,6 +66,11 @@ Do not reorder without reading `kernel/src/main.rs` and
   service weights into vruntime/load accounting only. Root slot 0 is a fair
   task during bootstrap finalize, then becomes the idle fallback after
   `mark_root_idle()`.
+- **Xen HVM substrate:** CPUID domain identity is diagnostic only, never an
+  authorization token. The hypercall page must start as private writable RAM,
+  then become RX before it is reported ready; do not issue a Xen hypercall or
+  add a DVM endpoint from this path until L0-bound vchan/grant/event contracts
+  exist.
 - **VFS mount/unmount/open path helpers:** require current process context.
 
 ## Docs

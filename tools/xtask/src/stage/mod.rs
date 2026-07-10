@@ -1,6 +1,6 @@
 use anyhow::{Context, anyhow, bail};
 use fs_err as fs;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -79,7 +79,7 @@ const STALE_BUILD_FILES: &[&str] = &[
     "background.jpg",
     "sonic.gif",
 ];
-const STALE_ROOT_FILES: &[&str] = &["debugcon.log", "qemu_interrupt.log"];
+const STALE_ROOT_FILES: &[&str] = &["debugcon.log"];
 const ABI_FUZZ_PACKAGE_ID: &str = "abifuzz";
 const ABI_FUZZ_DESKTOP_ID: &str = "abifuzz.desktop";
 const DEFAULT_GRUB_DEV_KEY: &str = "RustOS Dev GRUB <rustos-dev-grub@example.invalid>";
@@ -227,10 +227,11 @@ fn write_boot_disk_image(config: &Config) -> Result<()> {
     )?;
     image.seek(fatfs::SeekFrom::Start(0))?;
     let fs = fatfs::FileSystem::new(image, fatfs::FsOptions::new())?;
+    let mut extent_entries = Vec::new();
+    let extent_manifest;
     {
         let root = fs.root_dir();
-        let mut extent_entries = Vec::new();
-        for file in files {
+        for file in &files {
             ensure_fat_parent_dirs(&root, &file.relative)?;
             let mut dst = root.create_file(file.relative.as_str())?;
             dst.truncate()?;
@@ -242,10 +243,16 @@ fn write_boot_disk_image(config: &Config) -> Result<()> {
                 extents: collect_fat_file_extents(&mut dst)?,
             });
         }
-        let extent_manifest = write_root_file_extents_registry(&root, &extent_entries)?;
+        extent_manifest = write_root_file_extents_registry(&root, &extent_entries)?;
         write_root_file_extents_signature(config, &root, extent_manifest.as_bytes())?;
     }
     fs.unmount()?;
+    verify_boot_disk_image_contract(
+        &config.boot_disk_image,
+        &files,
+        &extent_entries,
+        extent_manifest.as_str(),
+    )?;
     Ok(())
 }
 
@@ -258,6 +265,86 @@ struct BootDiskExtentEntry {
 struct BootDiskFileExtent {
     offset: u64,
     len: u64,
+}
+
+fn verify_boot_disk_image_contract(
+    boot_disk_image: &Path,
+    files: &[ImageFile],
+    extent_entries: &[BootDiskExtentEntry],
+    expected_manifest: &str,
+) -> Result<()> {
+    if files.len() != extent_entries.len() {
+        bail!(
+            "boot extent contract entry count mismatch: files={} extents={}",
+            files.len(),
+            extent_entries.len()
+        );
+    }
+
+    let mut raw_disk = fs::File::open(boot_disk_image)
+        .with_context(|| format!("failed to reopen boot disk {}", boot_disk_image.display()))?;
+    for (file, entry) in files.iter().zip(extent_entries) {
+        let expected_path = format!("/{}", file.relative);
+        if entry.path != expected_path || entry.len != file.len {
+            bail!(
+                "boot extent contract metadata mismatch for {}",
+                file.source.display()
+            );
+        }
+
+        let expected = fs::read(&file.source)
+            .with_context(|| format!("failed to reread staged source {}", file.source.display()))?;
+        let expected_len = usize::try_from(file.len)
+            .context("staged file length does not fit host address space")?;
+        if expected.len() != expected_len {
+            bail!(
+                "staged source changed while writing boot disk: {}",
+                file.source.display()
+            );
+        }
+
+        let mut actual = Vec::with_capacity(expected_len);
+        for extent in &entry.extents {
+            let extent_len = usize::try_from(extent.len)
+                .context("boot extent length does not fit host address space")?;
+            let next_len = actual
+                .len()
+                .checked_add(extent_len)
+                .context("boot extent length overflow")?;
+            if next_len > expected_len {
+                bail!("boot extents exceed staged file length for {}", entry.path);
+            }
+            raw_disk
+                .seek(SeekFrom::Start(extent.offset))
+                .with_context(|| format!("failed to seek boot extent for {}", entry.path))?;
+            let start = actual.len();
+            actual.resize(next_len, 0);
+            raw_disk
+                .read_exact(&mut actual[start..])
+                .with_context(|| format!("failed to read boot extent for {}", entry.path))?;
+        }
+        if actual != expected {
+            bail!("boot extent payload mismatch for {}", entry.path);
+        }
+    }
+
+    let image =
+        fatfs::StdIoWrapper::new(fs::File::open(boot_disk_image).with_context(|| {
+            format!("failed to reopen boot disk {}", boot_disk_image.display())
+        })?);
+    let fs = fatfs::FileSystem::new(image, fatfs::FsOptions::new())?;
+    let actual_manifest = {
+        let root = fs.root_dir();
+        let mut manifest_file = root.open_file(ROOT_FILE_EXTENTS_REGISTRY_PATH)?;
+        let mut bytes = Vec::new();
+        manifest_file.read_to_end(&mut bytes)?;
+        bytes
+    };
+    fs.unmount()?;
+    if actual_manifest != expected_manifest.as_bytes() {
+        bail!("boot extent manifest payload mismatch after image write");
+    }
+    Ok(())
 }
 
 fn collect_fat_file_extents<D: fatfs::ReadWriteSeek>(
@@ -588,8 +675,7 @@ fn write_desktop_registry(config: &Config, manifests: &[PackageManifest]) -> Res
             let args = if args.is_empty() {
                 String::new()
             } else {
-                args
-                    .iter()
+                args.iter()
                     .map(|arg| registry_value(arg))
                     .collect::<Result<Vec<_>>>()?
                     .join("|")
@@ -610,8 +696,8 @@ fn write_desktop_registry(config: &Config, manifests: &[PackageManifest]) -> Res
                 DesktopLaunchMode::AllSessions => "all-sessions",
             };
             let startup = desktop_startup_mode(manifest.startup);
-            let no_display = manifest.kind == crate::package_manifest::PackageKind::Service
-                || entry.no_display;
+            let no_display =
+                manifest.kind == crate::package_manifest::PackageKind::Service || entry.no_display;
             let autostart_enabled = desktop_autostart_enabled(config, &desktop_id)?;
             let deps = registry_deps(&manifest.runtime_deps)?;
             lines.push(format!(
@@ -681,8 +767,8 @@ fn write_runtime_launch_registry(config: &Config, manifests: &[PackageManifest])
                 DesktopLaunchMode::NewSession => "new-session",
                 DesktopLaunchMode::AllSessions => "all-sessions",
             };
-            let no_display = manifest.kind == crate::package_manifest::PackageKind::Service
-                || entry.no_display;
+            let no_display =
+                manifest.kind == crate::package_manifest::PackageKind::Service || entry.no_display;
             let deps = registry_deps(&manifest.runtime_deps)?;
             lines.push(format!(
                 "desktop_id={}\tpackage_id={}\tstartup={}\tdisplay_name={}\timage={}\texec={}\tweight={}\tlogical_admin={}\tconsole_hosted={}\tterminal={}\thidden=0\tno_display={}\tautostart_enabled={}\tlaunch={}\tdeps={}\targs={}\tenv={}",
@@ -1218,7 +1304,13 @@ fn generate_dynamic_linker_cache(image_dir: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{registry_deps, registry_list};
+    use super::{
+        BootDiskExtentEntry, ImageFile, collect_fat_file_extents, ensure_fat_parent_dirs,
+        registry_deps, registry_list, verify_boot_disk_image_contract,
+        write_root_file_extents_registry,
+    };
+    use fatfs::{Seek as _, Write as _};
+    use std::fs::OpenOptions;
 
     #[test]
     fn registry_deps_join_package_ids_with_commas() {
@@ -1259,5 +1351,56 @@ mod tests {
         let aliases = vec!["virtio:d00000010v*,platform:bootfb".to_string()];
 
         assert!(registry_list(&aliases).is_err());
+    }
+
+    #[test]
+    fn boot_disk_extent_contract_rechecks_raw_payload_and_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("rootd.elf");
+        let payload = b"rootd bootstrap payload";
+        std::fs::write(&source, payload).unwrap();
+
+        let boot_disk = temp.path().join("rustos-boot.img");
+        let image_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&boot_disk)
+            .unwrap();
+        image_file.set_len(2 * 1024 * 1024).unwrap();
+        let mut image = fatfs::StdIoWrapper::new(image_file);
+        fatfs::format_volume(&mut image, fatfs::FormatVolumeOptions::new()).unwrap();
+        image.seek(fatfs::SeekFrom::Start(0)).unwrap();
+        let fs = fatfs::FileSystem::new(image, fatfs::FsOptions::new()).unwrap();
+        let (entry, manifest) = {
+            let root = fs.root_dir();
+            let relative = "services/rootd/rootd.elf";
+            ensure_fat_parent_dirs(&root, relative).unwrap();
+            let mut staged = root.create_file(relative).unwrap();
+            staged.write_all(payload).unwrap();
+            staged.flush().unwrap();
+            let entry = BootDiskExtentEntry {
+                path: format!("/{relative}"),
+                len: payload.len() as u64,
+                extents: collect_fat_file_extents(&mut staged).unwrap(),
+            };
+            let manifest =
+                write_root_file_extents_registry(&root, std::slice::from_ref(&entry)).unwrap();
+            (entry, manifest)
+        };
+        fs.unmount().unwrap();
+
+        verify_boot_disk_image_contract(
+            &boot_disk,
+            &[ImageFile {
+                source,
+                relative: "services/rootd/rootd.elf".to_string(),
+                len: payload.len() as u64,
+            }],
+            &[entry],
+            &manifest,
+        )
+        .unwrap();
     }
 }

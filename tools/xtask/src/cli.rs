@@ -3,10 +3,10 @@ use clap::{CommandFactory, Parser, Subcommand};
 use crate::Result;
 use crate::build;
 use crate::config::{self as config_mod, Config};
-use crate::qemu;
 use crate::ring3_inventory;
 use crate::stage;
 use crate::testinfra;
+use crate::xen;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -25,25 +25,10 @@ enum XtaskCommand {
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         args: Vec<String>,
     },
-    Debug {
+    #[command(name = "xen-smoke", disable_help_flag = true)]
+    XenSmoke {
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         args: Vec<String>,
-    },
-    #[command(name = "probe-display")]
-    ProbeDisplay {
-        #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
-        args: Vec<String>,
-    },
-    #[command(name = "qemu-scenarios")]
-    QemuScenarios {
-        #[arg(long)]
-        list: bool,
-        #[arg(long = "scenario")]
-        scenarios: Vec<String>,
-        #[arg(long)]
-        dry_run: bool,
-        #[arg(long, default_value_t = 35)]
-        timeout: u64,
     },
     Selftest,
     #[command(name = "fuzz-host")]
@@ -68,6 +53,10 @@ enum XtaskCommand {
     BuildConsoleDemo,
     #[command(name = "build-driver-modules")]
     BuildDriverModules,
+    #[command(name = "build-dvm")]
+    BuildDvm,
+    #[command(name = "verify-dvm")]
+    VerifyDvm,
     #[command(name = "ring3-inventory")]
     Ring3Inventory,
     Config {
@@ -97,17 +86,8 @@ pub(crate) fn run() -> Result<()> {
         Some(XtaskCommand::Build) => build::build(&config),
         Some(XtaskCommand::Check) => build::check(&config),
         Some(XtaskCommand::Clean) => build::clean(&config),
-        Some(XtaskCommand::Run { args }) => qemu::run_qemu_command(&config, args.into_iter()),
-        Some(XtaskCommand::Debug { args }) => qemu::debug_qemu_command(&config, args.into_iter()),
-        Some(XtaskCommand::ProbeDisplay { args }) => {
-            qemu::probe_display_command(&config, args.into_iter())
-        }
-        Some(XtaskCommand::QemuScenarios {
-            list,
-            scenarios,
-            dry_run,
-            timeout,
-        }) => qemu::scenarios_command(&config, list, scenarios, dry_run, timeout),
+        Some(XtaskCommand::Run { args }) => xen::run_xen_command(&config, args.into_iter()),
+        Some(XtaskCommand::XenSmoke { args }) => xen::xen_smoke_command(&config, args.into_iter()),
         Some(XtaskCommand::Selftest) => testinfra::selftest(&config),
         Some(XtaskCommand::FuzzHost {
             target,
@@ -121,6 +101,8 @@ pub(crate) fn run() -> Result<()> {
         Some(XtaskCommand::BuildUser) => build::build_user(&config),
         Some(XtaskCommand::BuildConsoleDemo) => build::build_console_demo(&config),
         Some(XtaskCommand::BuildDriverModules) => build::build_driver_modules(&config),
+        Some(XtaskCommand::BuildDvm) => xen::build_dvm_command(&config),
+        Some(XtaskCommand::VerifyDvm) => xen::verify_dvm_command(&config),
         Some(XtaskCommand::Ring3Inventory) => ring3_inventory::print_inventory(&config),
         Some(XtaskCommand::Config { command }) => match command {
             ConfigCommand::Check => config_mod::check(&config),

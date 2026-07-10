@@ -11,12 +11,12 @@ opening anything under `Then read only if needed`.
 | User task | Read first | Then read only if needed |
 | --- | --- | --- |
 | Build/check issue | `commands.md` | exact failing command output, then `tools/xtask/src/build/` range found by search |
-| Run/QEMU/debug issue | `commands.md`, `repo-map.md` | exact `tools/xtask/src/qemu/mod.rs` range found by search; logs only via `tail -n 120` or focused scoped search |
+| Run/Xen/debug issue | `commands.md`, `repo-map.md` | exact `tools/xtask/src/xen.rs` range found by search; inspect `build/xen/` only through focused reads |
 | Package/stage/registry issue | `contracts-infra.md` | affected `RUSTOS.package.toml`, then exact `package_manifest.rs` or `stage/mod.rs` range |
 | Kernel API/change | `kernel-api-map.md` | relevant `kernel/*/src/api.rs`, then backing module range found by symbol search |
 | Kernel boot-order change | `kernel-api-map.md`, `contracts-infra.md` | `kernel/src/main.rs`, then exact `kernel/executive/src/boot.rs` range |
 | Logging change | `contracts-infra.md` | `config/rustos.toml`; open `tools/build_log_cfg.rs` only after searching category/level name |
-| Fault injection change | `contracts-infra.md`, `commands.md` | `config/rustos.toml`; exact `libs/rustos-fault-injection`, `tools/xtask/src/qemu/mod.rs`, or `kernel/nucleus-core/src/util/fault_injection.rs` range found by search |
+| Fault injection change | `contracts-infra.md`, `commands.md` | `config/rustos.toml`; exact `libs/rustos-fault-injection` or `kernel/nucleus-core/src/util/fault_injection.rs` range found by search |
 | Runtime launch/session issue | `contracts-infra.md` | `libs/runtime-control/src/lib.rs`, then exact `services/runtimed/src/main.rs` range; add `contracts-abi.md` only if IPC-level routing is involved |
 | UI/rendering issue | `repo-map.md` | search `services/uiserver/src`; open only the matching `render.rs` or `app/*` range |
 | Hardening request | `contracts-abi.md`, `kernel-api-map.md` | highest-risk boundary first; exact API, broker, service, lock, memory, or device path found by MCP search |
@@ -41,7 +41,7 @@ opening anything under `Then read only if needed`.
   contract shows the needed boundary.
 - Do not inspect `logs/` for build/check failures; use the failing command
   output first.
-- Do not inspect `logs/` for run/debug failures until the QEMU command line
+- Do not inspect `build/xen/` for run/debug failures until the Xen command line
   and failing symptom are known.
 - Follow `token-policy.md` for generated paths, logs, and `Cargo.lock`.
 - If a human doc duplicates an AI contract, use the AI contract unless writing

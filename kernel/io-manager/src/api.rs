@@ -545,7 +545,11 @@ pub mod vfs {
 
     fn map_boot_volume_error(error: FatError<StorageError>) -> VfsError {
         match error {
-            FatError::Io(StorageError::NotPresent) | FatError::NotFound => VfsError::NotFound,
+            // A missing bootstrap transport is not evidence that the requested
+            // file is absent. Keeping these distinct prevents an HVM storage
+            // contract failure from being misdiagnosed as a missing rootd ELF.
+            FatError::Io(StorageError::NotPresent) => VfsError::Unsupported,
+            FatError::NotFound => VfsError::NotFound,
             FatError::Io(StorageError::Unsupported) => VfsError::Unsupported,
             FatError::InvalidInput
             | FatError::InvalidFileNameLength
@@ -557,15 +561,7 @@ pub mod vfs {
     }
 
     pub fn read_path_to_vec_for_kernel(path: &str) -> Result<alloc::vec::Vec<u8>, VfsError> {
-        crate::debug::println_fmt(format_args!(
-            "vfs: read_path_to_vec_for_kernel primary={}",
-            path
-        ));
         let path = boot_image_path(path)?;
-        crate::debug::println_fmt(format_args!(
-            "vfs: read_path_to_vec_for_kernel normalized={}",
-            path
-        ));
         crate::storage::boot_volume::read_file_to_vec(path).map_err(map_boot_volume_error)
     }
 
@@ -602,5 +598,22 @@ pub mod vfs {
         _absolute_path: &str,
     ) -> Result<alloc::string::String, VfsError> {
         Err(VfsError::Unsupported)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn bootstrap_transport_failure_is_not_reported_as_missing_file() {
+            assert_eq!(
+                map_boot_volume_error(FatError::Io(StorageError::NotPresent)),
+                VfsError::Unsupported
+            );
+            assert_eq!(
+                map_boot_volume_error(FatError::NotFound),
+                VfsError::NotFound
+            );
+        }
     }
 }

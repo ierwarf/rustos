@@ -54,19 +54,19 @@ Before any workflow: read `token-policy.md`, then `task-router.md`.
 4. If behavior contracts changed, update `contracts-infra.md` or `contracts-abi.md`.
 5. Run mdBook / link sanity checks.
 
-## Debug QEMU boot
+## Debug Xen lifecycle
 
 1. Ensure `cargo xtask build` completed.
-2. Run `cargo xtask run --debugcon stdio` for immediate logs.
-3. Use `cargo xtask debug` for GDB attach.
-4. Inspect `logs/debugcon.log` and `logs/qemu_interrupt.log` if interrupt
-   trace is enabled.
-5. If a display issue, run `cargo xtask probe-display`.
+2. Build and verify the DVM: `cargo xtask build-dvm` then `verify-dvm`.
+3. Run `cargo xtask xen-smoke --expect '<milestone>'` from a Xen Dom0. It
+   submits DVM/HVM creates concurrently, then checks each lifecycle.
+4. Inspect focused lines in `build/xen/rustos-debugcon.log`.
+5. Treat a lifecycle pass as a lifecycle pass; do not infer device transport.
 
 ## Debug GRUB display boot
 
 1. Check `tools/xtask/src/build/mod.rs` embedded GRUB config before changing
-   QEMU flags.
+   Xen HVM firmware or disk inputs.
 2. Keep GRUB video setup conservative: `load_video`, `gfxmode=auto`,
    `gfxpayload=keep`.
 3. Check `kernel/nucleus-core/src/multiboot2_entry.S` for the Multiboot2
@@ -77,7 +77,7 @@ Before any workflow: read `token-policy.md`, then `task-router.md`.
    already-installed GUI backend.
 6. Confirm `display-primary` fallback decisions use active provider-group
    state and skip fallback alias probes after a primary provider is loaded.
-7. For QEMU virtio-gpu, prefer the Linux `.ko` display path. If
+7. For Xen virtual GPU profiles, prefer the Linux `.ko` display path. If
    `virtio-gpu native: display registered` appears, the removed native fallback
    has regressed back into the kernel.
 
