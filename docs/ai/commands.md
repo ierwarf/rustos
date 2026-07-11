@@ -20,8 +20,7 @@ failure output as the primary debugging context.
 | --- | --- | --- | --- |
 | `cargo xtask build-dvm` | build the pinned Linux DVM and verify its manifest | `driver-domains/linux/out/` | missing Buildroot prerequisite or source/artifact mismatch |
 | `cargo xtask verify-dvm` | verify every DVM artifact and control-contract hash | none | altered/missing DVM artifact or contract |
-| `cargo xtask xen-smoke` | concurrently create Linux DVM and RustOS HVM through Xen Dom0 | `build/xen/` | missing `xl`, failed domain lifecycle, missing HVM marker |
-| `cargo xtask run` | production Xen entry | none until transport exists | deliberately fails while DVM is pre-transport |
+| `cargo xtask kvm-smoke` | concurrently boot Linux DVM and RustOS with QEMU/KVM | `build/kvm/` | unavailable `/dev/kvm`, guest exit, missing readiness marker |
 
 ## Tests and inventory
 
@@ -33,17 +32,18 @@ failure output as the primary debugging context.
 | `cargo test -p module-tests` | module tests | `target/` | unit/module regression |
 | `git diff --check` | whitespace sanity | none | trailing whitespace/conflict marker |
 
-## Xen smoke arguments
+## KVM smoke arguments
 
-- `xen-smoke` requires an active Xen Dom0 and `xl`; it never starts Xen itself.
+- `kvm-smoke` requires `/dev/kvm` access and `qemu-system-x86_64`; it does not
+  alter host hypervisor configuration.
 - `--timeout <seconds>` is bounded to `1..=30` and applies only while waiting
-  for expected HVM debugcon markers.
+  for expected RustOS debugcon and Linux DVM serial markers.
 - The default marker is `rootd: core services ready, spawning initd via loaderd`;
   repeat `--expect <marker>` for each additional RustOS milestone.
-- `--dry-run` verifies DVM artifacts and writes `build/xen/*.cfg` without
-  invoking `xl`.
-- The DVM's `agent-v1-pretransport` contract is future L0-authenticated Xen
-  vchan control only. The lifecycle smoke is not a NIC, storage, `.ko`, PCI
+- `--dry-run` verifies DVM artifacts and prepares `build/kvm/` without
+  launching QEMU.
+- The DVM's `agent-v1-pretransport` contract is future host-authenticated KVM
+  vsock control only. The lifecycle smoke is not a NIC, storage, `.ko`, PCI
   passthrough, or transport test. Keep those claims behind explicit markers.
 
 ## Do not run
@@ -81,7 +81,7 @@ failure output as the primary debugging context.
 ## KVM display boot loop
 
 1. `cargo xtask build`
-2. `cargo xtask run --profile nvme --accel-profile kvm --usb-input --debugcon file`
+2. `cargo xtask kvm-smoke --expect 'runtimed: bootstrap ui done'`
 3. Search the relevant log for
    `error: no suitable video mode|boot framebuffer|bootfb|virtio-gpu|virtio register|DisplayUnavailable|uiserver|panic|scheduler invalid`.
 

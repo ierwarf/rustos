@@ -20,10 +20,9 @@ cargo xtask build
   -> write generated registries
 ```
 
-`cargo xtask run` is the production Xen entry point and does not rebuild the
-image. It remains fail-closed until the authenticated RustOS↔Linux-DVM
-transport is implemented. `cargo xtask xen-smoke` is the explicit non-product
-domain-lifecycle diagnostic path.
+`cargo xtask kvm-smoke` is the bounded parallel-boot diagnostic path. It does
+not rebuild the image and does not claim an authenticated RustOS↔Linux-DVM
+transport.
 
 ### Staged Image Flow
 
@@ -47,8 +46,8 @@ GRUB EFI binary is a release pipeline step outside the repository build.
 ### Boot Flow
 
 ```text
-Xen HVM firmware (repository-pinned OVMF)
-  -> emulated AHCI hda (single raw FAT bootstrap disk)
+KVM QEMU firmware (repository-pinned OVMF)
+  -> emulated IDE disk (single raw FAT bootstrap disk)
   -> EFI/BOOT/BOOTX64.EFI
   -> GRUB signature policy
   -> nucleus.elf
@@ -84,7 +83,7 @@ the UI server through framebuffer rendering.
 config/rustos.toml
   -> build.rs cfg generation
   -> kernel ring/debugcon and userspace stderr
-  -> build/xen/rustos-debugcon.log during Xen smoke
+  -> build/kvm/rustos-debugcon.log during KVM smoke
 ```
 
 Use [Logging Guide](logging.md) for logging categories, levels, and output
@@ -108,9 +107,8 @@ cargo xtask build
   -> generated registries 작성
 ```
 
-`cargo xtask run`은 상용 Xen 진입점이며 image를 다시 빌드하지 않습니다.
-인증된 RustOS↔Linux-DVM transport가 구현될 때까지 fail-closed합니다.
-`cargo xtask xen-smoke`는 명시적인 비상용 domain-lifecycle 진단 경로입니다.
+`cargo xtask kvm-smoke`는 bounded 병렬 부팅 진단 경로입니다. image를 다시
+빌드하지 않으며 인증된 RustOS↔Linux-DVM transport를 주장하지 않습니다.
 
 ### Staged Image Flow
 
@@ -135,8 +133,8 @@ Microsoft/OEM Secure Boot signing은 repository build 밖의 release pipeline
 ### Boot Flow
 
 ```text
-Xen HVM firmware (repository-pinned OVMF)
-  -> emulated AHCI hda (single raw FAT bootstrap disk)
+KVM QEMU firmware (repository-pinned OVMF)
+  -> emulated IDE disk (single raw FAT bootstrap disk)
   -> EFI/BOOT/BOOTX64.EFI
   -> GRUB signature policy
   -> nucleus.elf
@@ -171,7 +169,7 @@ console-hosted program과 Wayland-style window는 framebuffer rendering으로 �
 config/rustos.toml
   -> build.rs cfg generation
   -> kernel ring/debugcon and userspace stderr
-  -> Xen smoke 중 build/xen/rustos-debugcon.log
+  -> KVM smoke 중 build/kvm/rustos-debugcon.log
 ```
 
 logging category, level, output path는 [로깅 가이드](logging.md)를 참고하세요.

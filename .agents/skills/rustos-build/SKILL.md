@@ -35,7 +35,7 @@ errors. Build logs live in the command, not the runtime log dir.
 ## Quick Validation Loop
 
 For most code changes: `cargo xtask check` is enough. Only run the full
-`build` when packaging or preparing a Xen HVM run.
+`build` when packaging or preparing a KVM guest run.
 
 ## Do Not
 

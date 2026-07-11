@@ -54,21 +54,22 @@ Before any workflow: read `token-policy.md`, then `task-router.md`.
 4. If behavior contracts changed, update `contracts-infra.md` or `contracts-abi.md`.
 5. Run mdBook / link sanity checks.
 
-## Debug Xen lifecycle
+## Debug KVM lifecycle
 
 1. Ensure `cargo xtask build` completed.
 2. Build and verify the DVM: `cargo xtask build-dvm` then `verify-dvm`.
-3. Run `cargo xtask xen-smoke --expect '<milestone>'` from a Xen Dom0. It
-   submits DVM/HVM creates concurrently, then checks each lifecycle.
-4. Inspect focused lines in `build/xen/rustos-debugcon.log`.
+3. Run `cargo xtask kvm-smoke --expect '<milestone>'`. It boots RustOS and the
+   DVM concurrently, then checks both readiness signals.
+4. Inspect focused lines in `build/kvm/rustos-debugcon.log` and
+   `build/kvm/linux-dvm-serial.log`.
 5. Treat a lifecycle pass as a lifecycle pass; do not infer device transport.
 
 ## Debug GRUB display boot
 
 1. Check `tools/xtask/src/build/mod.rs` embedded GRUB config before changing
-   Xen HVM firmware or disk inputs.
-2. Keep GRUB video setup conservative: `load_video`, `gfxmode=auto`,
-   `gfxpayload=keep`.
+   KVM firmware or disk inputs.
+2. Keep GRUB on serial/firmware text consoles; RustOS owns graphical output
+   after the nucleus starts.
 3. Check `kernel/nucleus-core/src/multiboot2_entry.S` for the Multiboot2
    framebuffer request tag.
 4. Confirm the kernel log prints a nonzero `boot framebuffer addr`.
@@ -77,7 +78,7 @@ Before any workflow: read `token-policy.md`, then `task-router.md`.
    already-installed GUI backend.
 6. Confirm `display-primary` fallback decisions use active provider-group
    state and skip fallback alias probes after a primary provider is loaded.
-7. For Xen virtual GPU profiles, prefer the Linux `.ko` display path. If
+7. For KVM virtual GPU profiles, prefer the Linux `.ko` display path. If
    `virtio-gpu native: display registered` appears, the removed native fallback
    has regressed back into the kernel.
 

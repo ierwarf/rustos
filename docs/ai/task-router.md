@@ -11,7 +11,7 @@ opening anything under `Then read only if needed`.
 | User task | Read first | Then read only if needed |
 | --- | --- | --- |
 | Build/check issue | `commands.md` | exact failing command output, then `tools/xtask/src/build/` range found by search |
-| Run/Xen/debug issue | `commands.md`, `repo-map.md` | exact `tools/xtask/src/xen.rs` range found by search; inspect `build/xen/` only through focused reads |
+| Run/KVM/debug issue | `commands.md`, `repo-map.md` | exact `tools/xtask/src/kvm.rs` range found by search; inspect `build/kvm/` only through focused reads |
 | Package/stage/registry issue | `contracts-infra.md` | affected `RUSTOS.package.toml`, then exact `package_manifest.rs` or `stage/mod.rs` range |
 | Kernel API/change | `kernel-api-map.md` | relevant `kernel/*/src/api.rs`, then backing module range found by symbol search |
 | Kernel boot-order change | `kernel-api-map.md`, `contracts-infra.md` | `kernel/src/main.rs`, then exact `kernel/executive/src/boot.rs` range |
@@ -41,7 +41,7 @@ opening anything under `Then read only if needed`.
   contract shows the needed boundary.
 - Do not inspect `logs/` for build/check failures; use the failing command
   output first.
-- Do not inspect `build/xen/` for run/debug failures until the Xen command line
+- Do not inspect `build/kvm/` for run/debug failures until the KVM command line
   and failing symptom are known.
 - Follow `token-policy.md` for generated paths, logs, and `Cargo.lock`.
 - If a human doc duplicates an AI contract, use the AI contract unless writing

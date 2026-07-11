@@ -364,10 +364,31 @@ pub fn init(boot_info_ptr: *const BootInfo) {
             .and_then(|end| align_up(end, PAGE_SIZE))
             .unwrap_or(DIRECT_MAP_PHYS_LIMIT)
             .min(DIRECT_MAP_PHYS_LIMIT);
+        let extent_manifest = boot_info.boot_extent_manifest;
+        let extent_manifest_start = extent_manifest
+            .is_present()
+            .then(|| align_down(extent_manifest.ptr, PAGE_SIZE))
+            .unwrap_or(0);
+        let extent_manifest_end = extent_manifest
+            .is_present()
+            .then(|| {
+                extent_manifest
+                    .ptr
+                    .checked_add(extent_manifest.len)
+                    .and_then(|end| align_up(end, PAGE_SIZE))
+                    .unwrap_or(0)
+                    .min(DIRECT_MAP_PHYS_LIMIT)
+            })
+            .unwrap_or(0);
 
-        let Some(bitmap_phys) =
-            find_usable_span_excluding_range(memory_map, bitmap_pages, image_start, image_end)
-        else {
+        let Some(bitmap_phys) = find_usable_span_excluding_ranges(
+            memory_map,
+            bitmap_pages,
+            &[
+                (image_start, image_end),
+                (extent_manifest_start, extent_manifest_end),
+            ],
+        ) else {
             panic!("failed to reserve physical allocator bitmap");
         };
 
@@ -415,6 +436,9 @@ pub fn init(boot_info_ptr: *const BootInfo) {
             boot_info.nucleus_image.phys_start,
             boot_info.nucleus_image.size,
         );
+        if extent_manifest_start < extent_manifest_end {
+            new_state.reserve_phys_range(extent_manifest.ptr, extent_manifest.len);
+        }
         new_state.reserve_phys_range(bitmap_phys, bitmap_pages as u64 * PAGE_SIZE);
         new_state.initialized = true;
 
@@ -526,11 +550,10 @@ fn usable_region_spans<'a>(
     })
 }
 
-fn find_usable_span_excluding_range(
+fn find_usable_span_excluding_ranges(
     regions: &[BootMemoryRegion],
     required_pages: usize,
-    reserved_start: u64,
-    reserved_end: u64,
+    reserved_ranges: &[(u64, u64)],
 ) -> Option<u64> {
     if required_pages == 0 {
         return None;
@@ -539,34 +562,39 @@ fn find_usable_span_excluding_range(
     let required_bytes = required_pages as u64 * PAGE_SIZE;
     for (span_start, page_count) in usable_region_spans(regions) {
         let span_end = span_start + page_count as u64 * PAGE_SIZE;
-        if reserved_start >= reserved_end
-            || reserved_end <= span_start
-            || reserved_start >= span_end
-        {
-            if span_has_pages(span_start, span_end, required_bytes) {
-                return Some(span_start);
+        let mut candidate = span_start;
+        loop {
+            let candidate_end = candidate.checked_add(required_bytes)?;
+            if candidate_end > span_end {
+                break;
             }
-            continue;
-        }
-
-        let before_end = reserved_start.min(span_end);
-        if span_has_pages(span_start, before_end, required_bytes) {
-            return Some(span_start);
-        }
-
-        let after_start = reserved_end.max(span_start);
-        if span_has_pages(after_start, span_end, required_bytes) {
-            return Some(after_start);
+            let next_candidate = reserved_ranges
+                .iter()
+                .filter_map(|&(reserved_start, reserved_end)| {
+                    (reserved_start < reserved_end
+                        && candidate < reserved_end
+                        && reserved_start < candidate_end)
+                        .then_some(reserved_end)
+                })
+                .max();
+            let Some(next_candidate) = next_candidate else {
+                return Some(candidate);
+            };
+            candidate = align_up(next_candidate, PAGE_SIZE)?;
         }
     }
 
     None
 }
 
-fn span_has_pages(start: u64, end: u64, required_bytes: u64) -> bool {
-    end.checked_sub(start)
-        .map(|bytes| bytes >= required_bytes)
-        .unwrap_or(false)
+#[cfg(test)]
+fn find_usable_span_excluding_range(
+    regions: &[BootMemoryRegion],
+    required_pages: usize,
+    reserved_start: u64,
+    reserved_end: u64,
+) -> Option<u64> {
+    find_usable_span_excluding_ranges(regions, required_pages, &[(reserved_start, reserved_end)])
 }
 
 fn align_down(value: u64, align: u64) -> u64 {
@@ -690,6 +718,24 @@ mod tests {
         let bitmap = find_usable_span_excluding_range(&regions, 1, 0x200000, 0x5e6f000)
             .expect("bitmap backing should fit after kernel image");
         assert_eq!(bitmap, 0x5e6f000);
+    }
+
+    #[test]
+    fn bitmap_backing_skips_kernel_image_and_boot_extent_manifest() {
+        let regions = [BootMemoryRegion {
+            phys_start: 0x900000,
+            page_count: 0x6000,
+            kind: BootMemoryKind::Usable,
+            _reserved0: 0,
+        }];
+
+        let bitmap = find_usable_span_excluding_ranges(
+            &regions,
+            2,
+            &[(0x200000, 0x5e6f000), (0x5e6f000, 0x5e71000)],
+        )
+        .expect("bitmap backing should fit after reserved boot inputs");
+        assert_eq!(bitmap, 0x5e71000);
     }
 
     #[test]

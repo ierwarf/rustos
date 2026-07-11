@@ -12,7 +12,7 @@ Read `token-policy.md` and `task-router.md` first.
 - Build/run CLI: `tools/xtask/src/cli.rs`
 - Build orchestration: `tools/xtask/src/build/` (`mod.rs`, `cargo.rs`)
 - Stage/registries: `tools/xtask/src/stage/mod.rs`
-- Xen runner/config generator: `tools/xtask/src/xen.rs`
+- KVM parallel-boot runner: `tools/xtask/src/kvm.rs`
 - Host config/env: `tools/xtask/src/config/` (`mod.rs`, `project.rs`)
 - Package schema: `tools/xtask/src/package_manifest.rs`
 - Runtime client/protocol: `libs/runtime-control/src/lib.rs`
@@ -43,7 +43,7 @@ Read `token-policy.md` and `task-router.md` first.
 
 - Package/stage behavior → `tools/xtask/src/package_manifest.rs` and
   `tools/xtask/src/stage/mod.rs`.
-- Xen behavior → `tools/xtask/src/xen.rs`.
+- KVM behavior → `tools/xtask/src/kvm.rs`.
 - Runtime launch behavior → `services/runtimed/src/main.rs` and
   `libs/runtime-control/src/lib.rs`.
 - UI behavior → `services/uiserver/src/app/*` and `services/uiserver/src/render.rs`.

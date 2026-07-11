@@ -15,7 +15,7 @@
 | `RUSTUP` | `rustup` | rustup executable. |
 | `CC` | `gcc` | C compiler. |
 | `MINGW_CC` | `x86_64-w64-mingw32-gcc` | Windows PE compiler. |
-| `XEN_XL_BIN` | `xl` | Xen control-domain toolstack command. |
+| `KVM_QEMU_BIN` | `qemu-system-x86_64` | QEMU command used for KVM smoke. |
 | `KERNEL_TARGET` | `x86_64-unknown-linux-gnu` | Kernel/userspace target. |
 | `GRUB_MKSTANDALONE` | `grub-mkstandalone` | GRUB standalone EFI builder. |
 | `GRUB_FILE` | `grub-file` | Multiboot2 artifact validator. |
@@ -31,9 +31,9 @@
 | `RUSTOS_UI_BOOT_TRACE` | disabled | Enable uiserver local boot trace. |
 | `RUSTOS_UI_PROFILE` | disabled | Enable uiserver profiling lines. |
 
-Most build variables are parsed by `tools/xtask/src/config/mod.rs`. Xen
-execution is in `tools/xtask/src/xen.rs`; it requires a pre-existing Xen Dom0
-and never starts a host hypervisor itself.
+Most build variables are parsed by `tools/xtask/src/config/mod.rs`. KVM
+execution is in `tools/xtask/src/kvm.rs`; it requires `/dev/kvm` access and a
+QEMU binary, and never changes the host hypervisor configuration.
 
 <a id="korean"></a>
 
@@ -48,7 +48,7 @@ and never starts a host hypervisor itself.
 | `RUSTUP` | `rustup` | rustup executable |
 | `CC` | `gcc` | C compiler |
 | `MINGW_CC` | `x86_64-w64-mingw32-gcc` | Windows PE compiler |
-| `XEN_XL_BIN` | `xl` | Xen control-domain toolstack command |
+| `KVM_QEMU_BIN` | `qemu-system-x86_64` | KVM smoke에 사용하는 QEMU command |
 | `KERNEL_TARGET` | `x86_64-unknown-linux-gnu` | kernel/userspace target |
 | `GRUB_MKSTANDALONE` | `grub-mkstandalone` | GRUB standalone EFI builder |
 | `GRUB_FILE` | `grub-file` | Multiboot2 artifact validator |
@@ -64,6 +64,6 @@ and never starts a host hypervisor itself.
 | `RUSTOS_UI_BOOT_TRACE` | disabled | uiserver local boot trace 활성화 |
 | `RUSTOS_UI_PROFILE` | disabled | uiserver profiling line 활성화 |
 
-대부분의 build variable은 `tools/xtask/src/config/mod.rs`에서 읽습니다. Xen
-실행은 `tools/xtask/src/xen.rs`에 있으며, 이미 기동된 Xen Dom0가 필요합니다.
-xtask가 host hypervisor를 직접 시작하지는 않습니다.
+대부분의 build variable은 `tools/xtask/src/config/mod.rs`에서 읽습니다. KVM
+실행은 `tools/xtask/src/kvm.rs`에 있으며 `/dev/kvm` 접근과 QEMU가 필요합니다.
+xtask가 host hypervisor 설정을 바꾸지는 않습니다.

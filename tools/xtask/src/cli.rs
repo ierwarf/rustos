@@ -3,10 +3,10 @@ use clap::{CommandFactory, Parser, Subcommand};
 use crate::Result;
 use crate::build;
 use crate::config::{self as config_mod, Config};
+use crate::kvm;
 use crate::ring3_inventory;
 use crate::stage;
 use crate::testinfra;
-use crate::xen;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -21,12 +21,8 @@ enum XtaskCommand {
     Build,
     Check,
     Clean,
-    Run {
-        #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
-        args: Vec<String>,
-    },
-    #[command(name = "xen-smoke", disable_help_flag = true)]
-    XenSmoke {
+    #[command(name = "kvm-smoke", disable_help_flag = true)]
+    KvmSmoke {
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         args: Vec<String>,
     },
@@ -86,8 +82,7 @@ pub(crate) fn run() -> Result<()> {
         Some(XtaskCommand::Build) => build::build(&config),
         Some(XtaskCommand::Check) => build::check(&config),
         Some(XtaskCommand::Clean) => build::clean(&config),
-        Some(XtaskCommand::Run { args }) => xen::run_xen_command(&config, args.into_iter()),
-        Some(XtaskCommand::XenSmoke { args }) => xen::xen_smoke_command(&config, args.into_iter()),
+        Some(XtaskCommand::KvmSmoke { args }) => kvm::kvm_smoke_command(&config, args.into_iter()),
         Some(XtaskCommand::Selftest) => testinfra::selftest(&config),
         Some(XtaskCommand::FuzzHost {
             target,
@@ -101,8 +96,8 @@ pub(crate) fn run() -> Result<()> {
         Some(XtaskCommand::BuildUser) => build::build_user(&config),
         Some(XtaskCommand::BuildConsoleDemo) => build::build_console_demo(&config),
         Some(XtaskCommand::BuildDriverModules) => build::build_driver_modules(&config),
-        Some(XtaskCommand::BuildDvm) => xen::build_dvm_command(&config),
-        Some(XtaskCommand::VerifyDvm) => xen::verify_dvm_command(&config),
+        Some(XtaskCommand::BuildDvm) => kvm::build_dvm_command(&config),
+        Some(XtaskCommand::VerifyDvm) => kvm::verify_dvm_command(&config),
         Some(XtaskCommand::Ring3Inventory) => ring3_inventory::print_inventory(&config),
         Some(XtaskCommand::Config { command }) => match command {
             ConfigCommand::Check => config_mod::check(&config),

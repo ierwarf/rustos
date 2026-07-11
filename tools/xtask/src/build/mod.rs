@@ -172,7 +172,7 @@ pub(crate) fn build_efi(config: &Config) -> Result<()> {
     let grub_cfg = temp_dir.join("grub.cfg");
     fs::write(
         &grub_cfg,
-        "set check_signatures=enforce\ninsmod all_video\nset gfxmode=auto\nset gfxpayload=keep\nterminal_output gfxterm console\nsearch --file --set=root /nucleus.elf\nmultiboot2 ($root)/nucleus.elf\nmodule2 ($root)/system/registry/kernel/root-file-extents.tsv rustos-root-extents\nboot\n",
+        "# The standalone EFI image contains these preload modules. Load them before\n# enabling detached-signature enforcement, because Ubuntu GRUB does not ship\n# detached signatures for individual embedded modules.\ninsmod serial\nserial --speed=115200\nterminal_input serial\nterminal_output serial console\ninsmod search\ninsmod search_fs_file\ninsmod multiboot2\nset check_signatures=enforce\n# RustOS owns graphical output after the nucleus starts. Keep GRUB on the\n# firmware text/serial consoles because some OVMF GOP implementations reject\n# gfxterm's automatic mode selection.\nsearch --file --set=root /nucleus.elf\nmultiboot2 ($root)/nucleus.elf\nmodule2 ($root)/system/registry/kernel/root-file-extents.tsv rustos-root-extents\nboot\n",
     )?;
     let grub_cfg_signature = temp_dir.join("grub.cfg.sig");
     sign_detached(config, &signing, &grub_cfg, &grub_cfg_signature)?;
@@ -186,10 +186,10 @@ pub(crate) fn build_efi(config: &Config) -> Result<()> {
         .arg("--pubkey")
         .arg(&signing.pubkey)
         .arg("--modules")
-        .arg("memdisk tar normal pgp gcry_rsa gcry_sha256 gcry_sha512 fat part_msdos part_gpt search search_fs_file ls multiboot2 all_video video video_fb efi_gop efi_uga gfxterm")
+        .arg("memdisk tar normal serial pgp gcry_rsa gcry_sha256 gcry_sha512 fat part_msdos part_gpt search search_fs_file ls multiboot2")
         .arg("--install-modules")
         .arg(config.rustos_grub_modules.as_deref().unwrap_or(
-            "normal multiboot2 part_msdos part_gpt fat search search_fs_file ls all_video video video_fb efi_gop efi_uga gfxterm gcry_rsa gcry_sha256 gcry_sha512 pgp memdisk tar",
+            "normal serial multiboot2 part_msdos part_gpt fat search search_fs_file ls gcry_rsa gcry_sha256 gcry_sha512 pgp memdisk tar",
         ))
         .arg(format!("/boot/grub/grub.cfg={}", grub_cfg.display()))
         .arg(format!(

@@ -33,10 +33,6 @@ pub mod arch {
     pub mod simd {
         pub use crate::arch::simd::*;
     }
-
-    pub mod xen {
-        pub use crate::arch::xen::*;
-    }
 }
 
 pub mod boot {

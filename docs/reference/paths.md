@@ -22,8 +22,8 @@
 | `vendor/` | External firmware/prebuilt/module inputs. |
 | `build/artifacts/` | Build artifacts copied by stage. |
 | `build/image/` | Staged boot volume root. |
-| `build/rustos-boot.img` | Immutable source disk for a Xen HVM run. |
-| `build/xen/` | Generated Xen configs, private HVM disk, and Xen smoke logs. |
+| `build/rustos-boot.img` | Immutable source disk for a KVM RustOS guest. |
+| `build/kvm/` | Private KVM disk plus RustOS and Linux DVM logs. |
 | `build/image/EFI/BOOT/BOOTX64.EFI` | GRUB-generated default UEFI entry. |
 | `build/image/nucleus.elf.sig` | Detached GPG signature for `nucleus.elf`. |
 | `build/image/system/registry/` | Generated runtime/driver registries. |
@@ -58,8 +58,8 @@
 | `vendor/` | external firmware/prebuilt/module input |
 | `build/artifacts/` | stage가 복사하는 build artifact |
 | `build/image/` | staged boot volume root |
-| `build/rustos-boot.img` | Xen HVM 실행의 immutable source disk |
-| `build/xen/` | generated Xen config, private HVM disk, Xen smoke log |
+| `build/rustos-boot.img` | KVM RustOS guest 실행의 immutable source disk |
+| `build/kvm/` | private KVM disk, RustOS/Linux DVM log |
 | `build/image/EFI/BOOT/BOOTX64.EFI` | GRUB이 생성한 기본 UEFI entry |
 | `build/image/nucleus.elf.sig` | `nucleus.elf` detached GPG signature |
 | `build/image/system/registry/` | generated runtime/driver registry |

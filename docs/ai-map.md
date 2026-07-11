@@ -35,7 +35,7 @@ output outside the cached unit.
 - Workspace: `Cargo.toml`
 - Build/run CLI: `tools/xtask/src/cli.rs`
 - Stage/registries: `tools/xtask/src/stage/mod.rs`
-- Xen runner/config generator: `tools/xtask/src/xen.rs`
+- KVM parallel-boot runner: `tools/xtask/src/kvm.rs`
 - Kernel boot entry: `kernel/src/main.rs`
 - Kernel API surfaces: `kernel/*/src/api.rs`
 - Runtime protocol: `libs/runtime-control/src/lib.rs`

@@ -7,4 +7,3 @@ pub mod pic;
 pub mod pit;
 pub mod rtc;
 pub mod simd;
-pub mod xen;

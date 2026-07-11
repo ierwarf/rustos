@@ -17,7 +17,7 @@ body:
       description: Include commands, QEMU profile, firmware path, and relevant logs.
       placeholder: |
         1. cargo xtask build
-        2. cargo xtask run
+        2. cargo xtask kvm-smoke --timeout 30
         3. ...
     validations:
       required: true

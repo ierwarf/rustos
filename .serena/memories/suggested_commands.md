@@ -4,7 +4,7 @@
 - `cargo xtask build` — full OS build plus staging into `build/`.
 - `cargo xtask build-kernel` / `cargo xtask build-user` / `cargo xtask build-driver-modules` — scoped builds.
 - `cargo xtask stage` — restage already-built artifacts into `build/image`.
-- `cargo xtask run` — boot current image in QEMU; writes `logs/`.
+- `cargo xtask kvm-smoke --timeout 30` — boot RustOS and Linux DVM with KVM; writes `build/kvm/`.
 - `cargo xtask debug` — QEMU with GDB stub.
 - `cargo xtask probe-display` — headless display probe with non-black-frame validation.
 - `cargo xtask qemu-scenarios --list` and `cargo xtask qemu-scenarios --scenario display-probe` — QEMU regression scenario discovery/run.

@@ -50,8 +50,8 @@ heartbeat = "info"
 - `boot_trace_enabled`: emits `rustos_boot_trace_enabled` for early boot trace
   paths. This is intentionally separate from `enabled`.
 - `serial_mirror`: mirrors kernel structured log lines to debugcon port `0xe9`
-  in addition to keeping them in the kernel text ring. Xen HVM smoke captures
-  that port through its device model.
+  in addition to keeping them in the kernel text ring. KVM smoke captures that
+  port through QEMU.
 - `ring_buffer_bytes`: byte capacity of the kernel structured log ring.
 - `min_level`: default threshold for every category before per-category
   overrides are applied.
@@ -159,8 +159,8 @@ observability_client::error!("uiserver", display, "present failed errno={}", err
 The first argument is the service name string. The second argument is a category
 identifier, not a string. It must be one of the configured categories.
 
-Userspace log output is written to stderr using `os_observatory`. In Xen HVM
-smoke, kernel debugcon is captured under `build/xen/`; userspace stderr needs
+Userspace log output is written to stderr using `os_observatory`. In KVM
+smoke, kernel debugcon is captured under `build/kvm/`; userspace stderr needs
 an explicit guest console route before it is considered a test signal.
 
 ### Boot Trace And Ad-Hoc Lines
@@ -186,20 +186,21 @@ should use structured logging so category filtering works.
 
 ### Reading Logs
 
-Xen smoke output is written under `build/xen/`.
+KVM smoke output is written under `build/kvm/`.
 
-- `build/xen/rustos-debugcon.log`: HVM debugcon capture
-- `build/xen/rustos-serial.log`: HVM serial capture
-- `build/xen/linux-dvm.cfg`, `build/xen/rustos-hvm.cfg`: generated `xl` inputs
+- `build/kvm/rustos-debugcon.log`: RustOS debugcon capture
+- `build/kvm/rustos-serial.log`: RustOS serial capture
+- `build/kvm/linux-dvm-serial.log`: Linux DVM serial capture
+- `build/kvm/*-qemu.stderr.log`: per-guest QEMU diagnostics
 
 Common commands:
 
 ```bash
-cargo xtask xen-smoke --expect 'uiserver: wayland compositor ready'
+cargo xtask kvm-smoke --expect 'runtimed: bootstrap ui done'
 ```
 
-Use focused `rg` or `tail` against `build/xen/rustos-debugcon.log`; do not
-interpret an empty HVM debugcon file as successful boot.
+Use focused `rg` or `tail` against `build/kvm/rustos-debugcon.log`; do not
+interpret an empty RustOS debugcon file as successful boot.
 
 ### Recommended Profiles
 
@@ -340,8 +341,8 @@ heartbeat = "info"
   `rustos_boot_trace_enabled`를 생성합니다. `enabled`와 의도적으로 분리되어
   있습니다.
 - `serial_mirror`: kernel structured log line을 kernel text ring에 저장하는
-  것과 별도로 debugcon port `0xe9`에도 미러링합니다. Xen HVM smoke는 이 port를
-  device model로 capture합니다.
+  것과 별도로 debugcon port `0xe9`에도 미러링합니다. KVM smoke는 이 port를
+  QEMU로 capture합니다.
 - `ring_buffer_bytes`: kernel structured log ring의 byte capacity입니다.
 - `min_level`: category override가 적용되기 전 모든 category의 기본 threshold입니다.
 - `[logging.categories]`: category별 threshold입니다.
@@ -447,8 +448,8 @@ observability_client::error!("uiserver", display, "present failed errno={}", err
 첫 번째 인자는 service name string입니다. 두 번째 인자는 string이 아니라
 category identifier이며, 설정된 category 중 하나여야 합니다.
 
-Userspace log output은 `os_observatory`를 통해 stderr에 기록됩니다. Xen HVM
-smoke에서는 kernel debugcon이 `build/xen/`에 capture되며, userspace stderr는
+Userspace log output은 `os_observatory`를 통해 stderr에 기록됩니다. KVM
+smoke에서는 kernel debugcon이 `build/kvm/`에 capture되며, userspace stderr는
 명시적인 guest console route가 생기기 전에는 test signal로 사용하면 안 됩니다.
 
 ### Boot Trace와 임시 Line
@@ -474,20 +475,21 @@ category filtering이 동작하도록 structured logging을 사용하세요.
 
 ### Log 읽기
 
-Xen smoke output은 `build/xen/` 아래에 기록됩니다.
+KVM smoke output은 `build/kvm/` 아래에 기록됩니다.
 
-- `build/xen/rustos-debugcon.log`: HVM debugcon capture
-- `build/xen/rustos-serial.log`: HVM serial capture
-- `build/xen/linux-dvm.cfg`, `build/xen/rustos-hvm.cfg`: generated `xl` input
+- `build/kvm/rustos-debugcon.log`: RustOS debugcon capture
+- `build/kvm/rustos-serial.log`: RustOS serial capture
+- `build/kvm/linux-dvm-serial.log`: Linux DVM serial capture
+- `build/kvm/*-qemu.stderr.log`: guest별 QEMU diagnostic
 
 자주 쓰는 명령:
 
 ```bash
-cargo xtask xen-smoke --expect 'uiserver: wayland compositor ready'
+cargo xtask kvm-smoke --expect 'runtimed: bootstrap ui done'
 ```
 
-`build/xen/rustos-debugcon.log`에는 focused `rg` 또는 `tail`을 사용하세요.
-HVM debugcon이 비어 있다고 boot 성공으로 판단하면 안 됩니다.
+`build/kvm/rustos-debugcon.log`에는 focused `rg` 또는 `tail`을 사용하세요.
+RustOS debugcon이 비어 있다고 boot 성공으로 판단하면 안 됩니다.
 
 ### 추천 Profile
 

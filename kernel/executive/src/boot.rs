@@ -160,32 +160,6 @@ pub fn initialize_kernel(boot_info_ptr: *const BootInfo) {
         "simd initialized mode={}",
         hal_api::simd_mode_name(),
     );
-    match hal_api::arch::xen::probe_hvm() {
-        Some(xen) => {
-            let (major, minor) = xen.version().unwrap_or((0, 0));
-            let hypercall_pages = xen.hypercall().map_or(0, |page| page.page_count());
-            boot_log!(
-                debug::LogLevel::Info,
-                120,
-                xen.domain_id().unwrap_or(0) as u64,
-                "xen-hvm: discovery ready cpuid_base={:#x} version={}.{} domid={:?} vcpu={:?} hypercall_pages={}",
-                xen.cpuid_base(),
-                major,
-                minor,
-                xen.domain_id(),
-                xen.vcpu_id(),
-                hypercall_pages,
-            );
-            initialize_xen_hypercall_page(xen);
-        }
-        None => boot_log!(
-            debug::LogLevel::Debug,
-            120,
-            0,
-            "xen-hvm: interface not present; no Xen transport initialized",
-        ),
-    }
-
     io_services::init_boot_info(boot_info_ptr);
     let transport_hint =
         io_services::boot_volume_transport_hint().unwrap_or(BootVolumeTransport::Unknown);
@@ -604,64 +578,6 @@ pub fn kernel_main_bootstrap(boot_info_ptr: *const BootInfo) -> ! {
     flow_info(3, "kernel bootstrap higher-half entry");
     initialize_kernel(boot_info_ptr);
     ps_api::boot::start(scheduled_kernel_main)
-}
-
-fn initialize_xen_hypercall_page(xen: hal_api::arch::xen::XenHvmInfo) {
-    let Some(hypercall) = xen.hypercall() else {
-        boot_log!(
-            debug::LogLevel::Warn,
-            121,
-            0,
-            "xen-hvm: no hypercall transfer page advertised; Xen transport remains unavailable",
-        );
-        return;
-    };
-    let Some(phys) = mm_api::phys::alloc_frame() else {
-        boot_log!(
-            debug::LogLevel::Error,
-            121,
-            0,
-            "xen-hvm: unable to reserve a hypercall page; Xen transport remains unavailable",
-        );
-        return;
-    };
-    let guest_phys_addr = phys.as_u64();
-    let page = match unsafe { hypercall.install(guest_phys_addr) } {
-        Ok(page) => page,
-        Err(error) => {
-            mm_api::phys::free_frame(phys);
-            boot_log!(
-                debug::LogLevel::Error,
-                121,
-                0,
-                "xen-hvm: rejected hypercall page address {:#x}: {:?}",
-                guest_phys_addr,
-                error,
-            );
-            return;
-        }
-    };
-    if !mm_api::kernel_vm::mark_direct_map_range_executable(
-        page.guest_phys_addr(),
-        hal_api::arch::xen::HYPERCALL_PAGE_SIZE,
-    ) {
-        boot_log!(
-            debug::LogLevel::Error,
-            121,
-            0,
-            "xen-hvm: could not enforce RX on hypercall page {:#x}; page is retained and transport remains unavailable",
-            page.guest_phys_addr(),
-        );
-        return;
-    }
-    boot_log!(
-        debug::LogLevel::Info,
-        121,
-        0,
-        "xen-hvm: hypercall page ready phys={:#x} pages_advertised={}; no Xen endpoint is connected",
-        page.guest_phys_addr(),
-        hypercall.page_count(),
-    );
 }
 
 fn scheduled_kernel_main(_id: u64) {
