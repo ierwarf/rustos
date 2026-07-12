@@ -70,11 +70,12 @@ grant RustOS host authority.
 - L0 validates the source CID and the complete DVM control contract before it
   requests health, PCI device inventory, or one bounded keyboard event. The
   control request is host-to-DVM; it is not a direct RustOS-to-DVM channel.
-- `keyboard-events` is a KVM smoke-only proof: QEMU injects a synthetic `A`
-  into the DVM's `virtio-keyboard`, the DVM returns one Linux evdev key press,
-  and L0 accepts only evdev code `30` before injecting the same synthetic key
-  into RustOS's default PS/2 path. RustOS then has to show that `inputd`
-  consumed a new input batch.
+- `keyboard-events` is a KVM smoke-only proof: the DVM opens its allowlisted
+  `virtio-keyboard` evdev node and sends an exact readiness acknowledgement;
+  only then does QEMU inject a synthetic `A`. The DVM returns one Linux evdev
+  key press, and L0 accepts only evdev code `30` before injecting the same
+  synthetic key into RustOS's default PS/2 path. RustOS then has to show that
+  `inputd` consumed a new input batch.
 - This is intentionally not physical host-keyboard capture, arbitrary-key
   forwarding, or a live input data plane. RustOS still has no vsock endpoint.
   Network, block, display, GPU, and production input transports require

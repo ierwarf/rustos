@@ -943,7 +943,7 @@ impl HostControlListener {
     {
         let mut connection = self.accept_authenticated(timeout)?;
         let probe = self.probe_connection(&mut connection)?;
-        let event = request_with_injection(&mut connection, 3, "keyboard-event", inject_test_key)?;
+        let event = request_after_ready(&mut connection, 3, "keyboard-event", inject_test_key)?;
         if !has_exact_fields(&event, &["id", "op", "status", "type", "code", "value"])
             || event.get("status") != Some(&"ok".to_owned())
             || event.get("type") != Some(&"key".to_owned())
@@ -1092,7 +1092,7 @@ fn request(
     Ok(response.fields)
 }
 
-fn request_with_injection<F>(
+fn request_after_ready<F>(
     connection: &mut std::fs::File,
     id: u32,
     operation: &str,
@@ -1102,6 +1102,8 @@ where
     F: FnOnce() -> Result<()>,
 {
     write_message(connection, &format!("REQUEST\nid={id}\nop={operation}"))?;
+    let ready = parse_message(&read_message(connection)?)?;
+    validate_keyboard_ready(&ready, id, operation)?;
     inject_test_key()?;
     let response = parse_message(&read_message(connection)?)?;
     if response.kind != "RESPONSE"
@@ -1111,6 +1113,22 @@ where
         bail!("mismatched DVM control response");
     }
     Ok(response.fields)
+}
+
+fn validate_keyboard_ready(message: &Message, id: u32, operation: &str) -> Result<()> {
+    if message.kind != "READY"
+        || !has_exact_fields(&message.fields, &["id", "op", "status"])
+        || message.fields.get("id") != Some(&id.to_string())
+        || message.fields.get("op") != Some(&operation.to_owned())
+        || message.fields.get("status") != Some(&"ready".to_owned())
+    {
+        bail!(
+            "Linux DVM did not acknowledge keyboard event readiness: kind={} fields={:?}",
+            message.kind,
+            message.fields
+        );
+    }
+    Ok(())
 }
 
 fn welcome_message(contract: &ControlContract) -> String {
@@ -1223,7 +1241,7 @@ mod tests {
     use super::{
         ControlContract, FileLeaseStore, IommuTopology, LaunchPlan, ValidatedLease,
         VfioLeaseRecord, VfioLeaseState, VfioOps, acquire_vfio_lease, inspect_vfio_lease,
-        parse_message, restore_vfio_lease, validate_hello,
+        parse_message, restore_vfio_lease, validate_hello, validate_keyboard_ready,
     };
     use anyhow::Result;
 
@@ -1263,6 +1281,20 @@ mod tests {
         assert!(
             parse_message("HELLO\nrole=linux-driver-domain\nrole=linux-driver-domain").is_err()
         );
+    }
+
+    #[test]
+    fn keyboard_probe_requires_exact_ready_acknowledgement() {
+        let ready = parse_message("READY\nid=3\nop=keyboard-event\nstatus=ready").unwrap();
+        assert!(validate_keyboard_ready(&ready, 3, "keyboard-event").is_ok());
+
+        let wrong_status =
+            parse_message("READY\nid=3\nop=keyboard-event\nstatus=accepted").unwrap();
+        assert!(validate_keyboard_ready(&wrong_status, 3, "keyboard-event").is_err());
+
+        let extra =
+            parse_message("READY\nid=3\nop=keyboard-event\nstatus=ready\nextra=no").unwrap();
+        assert!(validate_keyboard_ready(&extra, 3, "keyboard-event").is_err());
     }
 
     #[test]

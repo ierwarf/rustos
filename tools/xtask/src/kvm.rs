@@ -723,7 +723,7 @@ fn wait_for_parallel_boot(
                     control_ready = Some(probe);
                 }
                 Ok(Err(error)) => {
-                    return Err(error).context("Linux DVM keyboard control probe failed");
+                    bail!("Linux DVM keyboard control probe failed: {error:#}");
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => {

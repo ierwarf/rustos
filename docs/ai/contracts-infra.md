@@ -168,9 +168,11 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   the L0-style host listener to complete the DVM
   `health,device-inventory,keyboard-events` probe using launch-assigned KVM
   vsock CID `4`. The keyboard step is bounded to one QEMU-injected `A`: the
-  agent must return Linux evdev code `30`, then RustOS must report a new
-  `inputd` read batch after L0 injects the same synthetic key through its
-  default PS/2 path. A guest that exits or merely starts cannot pass.
+  agent must open the allowlisted virtio evdev node and return an exact
+  `READY` acknowledgement before L0 injects the synthetic key. The agent must
+  then return Linux evdev code `30`, and RustOS must report a new `inputd`
+  read batch after L0 injects the same synthetic key through its default PS/2
+  path. A guest that exits or merely starts cannot pass.
   `agent-v1-control` remains host-to-DVM only; it is not a live RustOS vsock
   endpoint or physical-keyboard forwarding protocol. Additional `--expect`
   markers tighten RustOS proof; none prove a RustOS device, `.ko`, PCI

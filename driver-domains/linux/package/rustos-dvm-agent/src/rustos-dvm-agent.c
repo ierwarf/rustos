@@ -290,23 +290,27 @@ static int virtio_keyboard_event_path(char *path, size_t path_size) {
     return -1;
 }
 
-static int wait_for_virtio_keyboard_press(unsigned int *code) {
+static int open_virtio_keyboard(void) {
     char path[PATH_MAX];
-    struct pollfd pollfd;
-    struct timespec deadline;
     int fd;
     if (virtio_keyboard_event_path(path, sizeof(path)) != 0) {
         return -1;
     }
     fd = open(path, O_RDONLY | O_CLOEXEC);
+    return fd;
+}
+
+static int wait_for_virtio_keyboard_press(int fd, unsigned int *code) {
+    struct pollfd pollfd;
+    struct timespec deadline;
     if (fd < 0) {
+        errno = EINVAL;
         return -1;
     }
     pollfd.fd = fd;
     pollfd.events = POLLIN;
     pollfd.revents = 0;
     if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) {
-        close(fd);
         return -1;
     }
     deadline.tv_sec += KEYBOARD_EVENT_WAIT_MS / 1000U;
@@ -322,14 +326,12 @@ static int wait_for_virtio_keyboard_press(unsigned int *code) {
         long long remaining_ms;
         int ready;
         if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
-            close(fd);
             return -1;
         }
         remaining_ms = ((long long)deadline.tv_sec - (long long)now.tv_sec) * 1000LL +
                        ((long long)deadline.tv_nsec - (long long)now.tv_nsec + 999999LL) /
                            1000000LL;
         if (remaining_ms <= 0) {
-            close(fd);
             errno = ETIMEDOUT;
             return -1;
         }
@@ -341,12 +343,10 @@ static int wait_for_virtio_keyboard_press(unsigned int *code) {
             if (ready == 0) {
                 errno = ETIMEDOUT;
             }
-            close(fd);
             return -1;
         }
         if ((pollfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0 ||
             (pollfd.revents & POLLIN) == 0) {
-            close(fd);
             errno = EIO;
             return -1;
         }
@@ -355,12 +355,10 @@ static int wait_for_virtio_keyboard_press(unsigned int *code) {
             if (bytes < 0 && errno == EINTR) {
                 continue;
             }
-            close(fd);
             return -1;
         }
         if (event.type == EV_KEY && event.value == 1 && event.code != KEY_RESERVED) {
             *code = event.code;
-            close(fd);
             return 0;
         }
     }
@@ -396,14 +394,28 @@ static int serve_connection(int fd, const struct control_contract *contract) {
                      "RESPONSE\nid=%u\nop=device-inventory\nstatus=ok\ncount=%u", id, inventory);
         } else if (request_id(payload, "keyboard-event", &id) == 0) {
             unsigned int code;
-            if (wait_for_virtio_keyboard_press(&code) != 0) {
+            int keyboard_fd = open_virtio_keyboard();
+            if (keyboard_fd < 0) {
                 snprintf(payload, sizeof(payload),
                          "RESPONSE\nid=%u\nop=keyboard-event\nstatus=error\nreason=keyboard-unavailable",
                          id);
             } else {
-                snprintf(payload, sizeof(payload),
-                         "RESPONSE\nid=%u\nop=keyboard-event\nstatus=ok\ntype=key\ncode=%u\nvalue=1",
-                         id, code);
+                snprintf(payload, sizeof(payload), "READY\nid=%u\nop=keyboard-event\nstatus=ready",
+                         id);
+                if (send_frame(fd, payload) != 0) {
+                    close(keyboard_fd);
+                    return -1;
+                }
+                if (wait_for_virtio_keyboard_press(keyboard_fd, &code) != 0) {
+                    snprintf(payload, sizeof(payload),
+                             "RESPONSE\nid=%u\nop=keyboard-event\nstatus=error\nreason=keyboard-unavailable",
+                             id);
+                } else {
+                    snprintf(payload, sizeof(payload),
+                             "RESPONSE\nid=%u\nop=keyboard-event\nstatus=ok\ntype=key\ncode=%u\nvalue=1",
+                             id, code);
+                }
+                close(keyboard_fd);
             }
         } else {
             return -1;
