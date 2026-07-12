@@ -39,11 +39,14 @@ emulated IDE controller.
 
 `kvm-smoke` starts both guests, then requires RustOS's
 `rootd: core services ready, spawning initd via loaderd` marker and an L0-style
-host-to-DVM KVM-vsock health/PCI-inventory probe. This rejects an early panic
-or a guest that merely started; `--expect` adds stricter RustOS milestones. The
-DVM manifest carries a hash-bound
-`agent-v1-control` contract. RustOS has no vsock endpoint yet, so this is not a
-RustOS transport or driver data-plane proof.
+host-to-DVM KVM-vsock health/PCI-inventory/keyboard probe. The keyboard proof
+accepts only a QEMU-injected `A`: the DVM must return Linux evdev code `30`,
+then RustOS must show a new `inputd` read batch after the same synthetic key is
+injected through its default PS/2 path. This rejects an early panic or a guest
+that merely started; `--expect` adds stricter RustOS milestones. The DVM
+manifest carries a hash-bound `agent-v1-control` contract. RustOS has no vsock
+endpoint yet, so this is neither a RustOS transport nor a production input or
+driver data-plane proof.
 
 <a id="korean"></a>
 
@@ -77,8 +80,11 @@ private writable image이며, 저장소에 고정된 OVMF를 QEMU에 명시 경�
 
 `kvm-smoke`는 Linux DVM과 RustOS를 병렬 부팅하고 RustOS의
 `rootd: core services ready, spawning initd via loaderd` marker 및 L0-style
-host-to-DVM KVM-vsock health/PCI inventory probe를 모두 요구합니다. 초기 panic
-또는 단순히 생성된 guest는 통과하지 않으며,
-`--expect`로 RustOS milestone을 더 추가할 수 있습니다. DVM manifest의
-hash-bound `agent-v1-control` contract는 host-to-DVM control만 검증합니다.
-RustOS endpoint나 driver data plane 검증은 아닙니다.
+host-to-DVM KVM-vsock health/PCI inventory/keyboard probe를 모두 요구합니다.
+keyboard proof는 QEMU가 주입한 `A`만 받습니다. DVM은 Linux evdev code `30`을
+반환해야 하며, 이후 RustOS가 기본 PS/2 경로로 주입된 같은 합성 키를 `inputd`가
+새 batch로 소비했음을 보여야 합니다. 초기 panic 또는 단순히 생성된 guest는
+통과하지 않으며, `--expect`로 RustOS milestone을 더 추가할 수 있습니다. DVM
+manifest의 hash-bound `agent-v1-control` contract는 host-to-DVM control만
+검증합니다. RustOS endpoint, 물리 keyboard forwarding, production input 또는
+driver data plane 검증은 아닙니다.

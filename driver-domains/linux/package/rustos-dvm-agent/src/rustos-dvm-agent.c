@@ -6,12 +6,16 @@
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
+#include <linux/input.h>
 #include <linux/vm_sockets.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -23,6 +27,9 @@
 #define CONTROL_PORT 40500U
 #define MAX_FRAME 4096U
 #define HOST_CID VMADDR_CID_HOST
+#define KEYBOARD_EVENT_LIMIT 32U
+#define KEYBOARD_EVENT_WAIT_MS 5000
+#define VIRTIO_KEYBOARD_NAME "QEMU Virtio Keyboard"
 
 struct control_contract {
     char schema[16];
@@ -49,6 +56,7 @@ static void copy_value(char *destination, size_t destination_size, const char *v
 static void parse_contract(struct control_contract *contract) {
     FILE *file = fopen(CONTROL_FILE, "re");
     char line[160];
+    unsigned int seen = 0;
 
     if (file == NULL) {
         die("missing control contract");
@@ -69,24 +77,58 @@ static void parse_contract(struct control_contract *contract) {
         *equals = '\0';
         value = equals + 1;
         if (strcmp(line, "CONTROL_SCHEMA") == 0) {
+            if ((seen & (1U << 0)) != 0) {
+                fclose(file);
+                die("duplicate control contract key");
+            }
             copy_value(contract->schema, sizeof(contract->schema), value);
+            seen |= 1U << 0;
         } else if (strcmp(line, "CONTROL_PROTOCOL") == 0) {
+            if ((seen & (1U << 1)) != 0) {
+                fclose(file);
+                die("duplicate control contract key");
+            }
             copy_value(contract->protocol, sizeof(contract->protocol), value);
+            seen |= 1U << 1;
         } else if (strcmp(line, "CONTROL_STATE") == 0) {
+            if ((seen & (1U << 2)) != 0) {
+                fclose(file);
+                die("duplicate control contract key");
+            }
             copy_value(contract->state, sizeof(contract->state), value);
+            seen |= 1U << 2;
         } else if (strcmp(line, "CONTROL_TRANSPORT") == 0) {
+            if ((seen & (1U << 3)) != 0) {
+                fclose(file);
+                die("duplicate control contract key");
+            }
             copy_value(contract->transport, sizeof(contract->transport), value);
+            seen |= 1U << 3;
         } else if (strcmp(line, "CONTROL_AUTHENTICATION") == 0) {
+            if ((seen & (1U << 4)) != 0) {
+                fclose(file);
+                die("duplicate control contract key");
+            }
             copy_value(contract->authentication, sizeof(contract->authentication), value);
+            seen |= 1U << 4;
         } else if (strcmp(line, "CONTROL_CAPABILITIES") == 0) {
+            if ((seen & (1U << 5)) != 0) {
+                fclose(file);
+                die("duplicate control contract key");
+            }
             copy_value(contract->capabilities, sizeof(contract->capabilities), value);
+            seen |= 1U << 5;
+        } else {
+            fclose(file);
+            die("unexpected control contract key");
         }
     }
     fclose(file);
-    if (strcmp(contract->schema, "1") != 0 || strcmp(contract->protocol, "agent-v1") != 0 ||
+    if (seen != 0x3fU || strcmp(contract->schema, "1") != 0 ||
+        strcmp(contract->protocol, "agent-v1") != 0 ||
         strcmp(contract->state, "control") != 0 || strcmp(contract->transport, "kvm-vsock") != 0 ||
         strcmp(contract->authentication, "kvm-host-bound") != 0 ||
-        strcmp(contract->capabilities, "health,device-inventory") != 0) {
+        strcmp(contract->capabilities, "health,device-inventory,keyboard-events") != 0) {
         die("unsupported control contract");
     }
 }
@@ -199,29 +241,135 @@ static unsigned int pci_inventory_count(void) {
 }
 
 static int request_id(const char *payload, const char *operation, unsigned int *id) {
-    char expected[96];
-    const char *id_line = strstr(payload, "\nid=");
-    const char *op_line = strstr(payload, "\nop=");
+    const char *id_line;
+    const char *op_line;
     char *end;
     unsigned long parsed;
-    if (strncmp(payload, "REQUEST\n", 8) != 0 || id_line == NULL || op_line == NULL) {
+    if (strncmp(payload, "REQUEST\nid=", 11) != 0) {
         return -1;
     }
-    parsed = strtoul(id_line + 4, &end, 10);
-    if (end == id_line + 4 || *end != '\n' || parsed > UINT_MAX) {
+    id_line = payload + 11;
+    parsed = strtoul(id_line, &end, 10);
+    if (end == id_line || parsed > UINT_MAX || strncmp(end, "\nop=", 4) != 0) {
         return -1;
     }
-    snprintf(expected, sizeof(expected), "\nop=%s", operation);
-    if (strncmp(op_line, expected, strlen(expected)) != 0) {
+    op_line = end + 4;
+    if (strcmp(op_line, operation) != 0) {
         return -1;
     }
     *id = (unsigned int)parsed;
     return 0;
 }
 
+static int virtio_keyboard_event_path(char *path, size_t path_size) {
+    unsigned int index;
+    for (index = 0; index < KEYBOARD_EVENT_LIMIT; index++) {
+        char name_path[PATH_MAX];
+        char name[128];
+        FILE *file;
+        snprintf(name_path, sizeof(name_path), "/sys/class/input/event%u/device/name", index);
+        file = fopen(name_path, "re");
+        if (file == NULL) {
+            continue;
+        }
+        if (fgets(name, sizeof(name), file) == NULL) {
+            fclose(file);
+            continue;
+        }
+        fclose(file);
+        name[strcspn(name, "\r\n")] = '\0';
+        if (strcmp(name, VIRTIO_KEYBOARD_NAME) == 0) {
+            if (snprintf(path, path_size, "/dev/input/event%u", index) >= (int)path_size) {
+                errno = ENAMETOOLONG;
+                return -1;
+            }
+            return 0;
+        }
+    }
+    errno = ENODEV;
+    return -1;
+}
+
+static int wait_for_virtio_keyboard_press(unsigned int *code) {
+    char path[PATH_MAX];
+    struct pollfd pollfd;
+    struct timespec deadline;
+    int fd;
+    if (virtio_keyboard_event_path(path, sizeof(path)) != 0) {
+        return -1;
+    }
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return -1;
+    }
+    pollfd.fd = fd;
+    pollfd.events = POLLIN;
+    pollfd.revents = 0;
+    if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) {
+        close(fd);
+        return -1;
+    }
+    deadline.tv_sec += KEYBOARD_EVENT_WAIT_MS / 1000U;
+    deadline.tv_nsec += (long)(KEYBOARD_EVENT_WAIT_MS % 1000U) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    for (;;) {
+        struct input_event event;
+        struct timespec now;
+        ssize_t bytes;
+        long long remaining_ms;
+        int ready;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+            close(fd);
+            return -1;
+        }
+        remaining_ms = ((long long)deadline.tv_sec - (long long)now.tv_sec) * 1000LL +
+                       ((long long)deadline.tv_nsec - (long long)now.tv_nsec + 999999LL) /
+                           1000000LL;
+        if (remaining_ms <= 0) {
+            close(fd);
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        ready = poll(&pollfd, 1, (int)remaining_ms);
+        if (ready <= 0) {
+            if (ready < 0 && errno == EINTR) {
+                continue;
+            }
+            if (ready == 0) {
+                errno = ETIMEDOUT;
+            }
+            close(fd);
+            return -1;
+        }
+        if ((pollfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0 ||
+            (pollfd.revents & POLLIN) == 0) {
+            close(fd);
+            errno = EIO;
+            return -1;
+        }
+        bytes = read(fd, &event, sizeof(event));
+        if (bytes != (ssize_t)sizeof(event)) {
+            if (bytes < 0 && errno == EINTR) {
+                continue;
+            }
+            close(fd);
+            return -1;
+        }
+        if (event.type == EV_KEY && event.value == 1 && event.code != KEY_RESERVED) {
+            *code = event.code;
+            close(fd);
+            return 0;
+        }
+    }
+}
+
 static int serve_connection(int fd, const struct control_contract *contract) {
     char payload[MAX_FRAME + 1];
     char hello[MAX_FRAME + 1];
+    char welcome[192];
     unsigned int id;
     unsigned int inventory;
 
@@ -230,8 +378,10 @@ static int serve_connection(int fd, const struct control_contract *contract) {
              "authentication=%s\ncapabilities=%s",
              contract->protocol, contract->state, contract->transport, contract->authentication,
              contract->capabilities);
+    snprintf(welcome, sizeof(welcome), "WELCOME\nprotocol=%s\ncapabilities=%s", contract->protocol,
+             contract->capabilities);
     if (send_frame(fd, hello) != 0 || receive_frame(fd, payload, sizeof(payload)) != 0 ||
-        strcmp(payload, "WELCOME\nprotocol=agent-v1\ncapabilities=health,device-inventory") != 0) {
+        strcmp(payload, welcome) != 0) {
         return -1;
     }
     for (;;) {
@@ -244,6 +394,17 @@ static int serve_connection(int fd, const struct control_contract *contract) {
             inventory = pci_inventory_count();
             snprintf(payload, sizeof(payload),
                      "RESPONSE\nid=%u\nop=device-inventory\nstatus=ok\ncount=%u", id, inventory);
+        } else if (request_id(payload, "keyboard-event", &id) == 0) {
+            unsigned int code;
+            if (wait_for_virtio_keyboard_press(&code) != 0) {
+                snprintf(payload, sizeof(payload),
+                         "RESPONSE\nid=%u\nop=keyboard-event\nstatus=error\nreason=keyboard-unavailable",
+                         id);
+            } else {
+                snprintf(payload, sizeof(payload),
+                         "RESPONSE\nid=%u\nop=keyboard-event\nstatus=ok\ntype=key\ncode=%u\nvalue=1",
+                         id, code);
+            }
         } else {
             return -1;
         }

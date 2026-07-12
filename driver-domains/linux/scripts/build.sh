@@ -11,7 +11,7 @@ readonly ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 readonly LOCK_FILE="$ROOT/sources.lock"
 readonly COMMAND="${1:-build}"
 readonly OUT_DIR="${OUT:-$ROOT/out}"
-readonly JOBS="${JOBS:-1}"
+readonly JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)}"
 readonly DL_DIR="$OUT_DIR/dl"
 readonly SRC_DIR="$OUT_DIR/src"
 readonly BUILD_DIR="$OUT_DIR/buildroot-output"
@@ -21,14 +21,31 @@ BUILDROOT_DIR=""
 LIBELF_INCLUDE_DIR=""
 LIBELF_LIBRARY_DIR=""
 HOST_TOOL_DIR="$OUT_DIR/host-tools"
+readonly BUILD_LOCK_FILE="$ROOT/.rustos-dvm-build.lock"
 
 die() {
     echo "rustos-linux-dvm: $*" >&2
     exit 1
 }
 
+validate_jobs() {
+    case "$JOBS" in
+        '' | *[!0-9]*) die "JOBS must be a positive integer: $JOBS" ;;
+    esac
+    test "$JOBS" -gt 0 || die "JOBS must be a positive integer: $JOBS"
+}
+
 require_tool() {
     command -v "$1" >/dev/null 2>&1 || die "required host tool not found: $1"
+}
+
+acquire_build_lock() {
+    require_tool flock
+    # Buildroot permits separate output directories, but this appliance has one
+    # managed output tree. A second wrapper can otherwise remove the first
+    # wrapper's configure probes during input-hash invalidation.
+    exec 9>"$BUILD_LOCK_FILE"
+    flock -n 9 || die "another RustOS Linux DVM build is already using $OUT_DIR"
 }
 
 prepare_host_tools() {
@@ -154,11 +171,12 @@ configure() {
         return
     fi
     # Buildroot does not necessarily track edits to BR2_EXTERNAL local-package
-    # sources through its package stamps.  The DVM image must never report a
-    # manifest/control hash for an old agent binary, so any hashed input change
-    # invalidates the target tree before reconfiguration.
+    # sources through its package stamps. The host-package tree can also retain
+    # stale configure state across an external-package edit. The DVM image must
+    # never report a manifest/control hash for an old agent binary, so any
+    # hashed input change removes the complete output tree before reconfiguration.
     if test -f "$BUILD_DIR/.config"; then
-        make_buildroot clean
+        make_buildroot distclean
     fi
     mkdir -p "$BUILD_DIR"
     make_buildroot rustos_linux_dvm_x86_64_defconfig
@@ -210,7 +228,9 @@ distclean() {
 }
 
 main() {
+    validate_jobs
     load_lock
+    acquire_build_lock
     prepare_host_tools
     case "$COMMAND" in
         fetch)

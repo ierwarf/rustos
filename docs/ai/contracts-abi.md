@@ -162,7 +162,7 @@ Residual app-ABI policy batches that are larger than a single broker are tracked
 - Compat input-device reads call `INPUTD_IPC_OP_AUTHORIZE_READ` before
   `INPUTD_IPC_OP_READ`; inputd consumes the authorization by `(pid, tid, fd,
   access)` so raw reads are not accepted as standalone event-drain authority.
-- inputd drains raw reports via gated `SYS_RUSTOS_INPUT_INGEST_BROKER`, chooses native/evdev bytes, returns bounded `InputdReadResponse` capped at 32 KiB.
+- inputd drains raw reports via gated `SYS_RUSTOS_INPUT_INGEST_BROKER`, chooses native/evdev bytes, returns bounded `InputdReadResponse` capped at 32 KiB. Raw reports are an independent source from inputd IPC, so inputd uses a bounded 4 ms user-space ingest turn with `SYS_RUSTOS_IPC_TRY_RECV`; it must sleep when both sources are idle and reuse its fixed-size ingress scratch buffer rather than allocate per turn.
 - RustOS-native input readers should prefer short nonblocking `read()` attempts
   over a separate readiness-then-read cycle. `INPUTD_IPC_OP_READ` already drains
   ingest first, so routing through read avoids stale `STATS`/`poll` readiness

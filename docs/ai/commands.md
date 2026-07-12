@@ -45,9 +45,11 @@ failure output as the primary debugging context.
 - `--dry-run` verifies DVM artifacts and prepares `build/kvm/` without
   launching QEMU.
 - The DVM's `agent-v1-control` contract makes a host-authenticated KVM-vsock
-  health and PCI-inventory probe. It is not a RustOS endpoint, NIC, storage,
-  `.ko`, PCI-passthrough, or device-data-plane test. Keep those claims behind
-  explicit markers.
+  health, PCI-inventory, and bounded synthetic-key probe. The smoke accepts
+  only QEMU-injected `A` / Linux evdev code `30`, then requires RustOS
+  `inputd` to consume the matching synthetic PS/2 input. It is not a RustOS
+  endpoint, physical host-keyboard capture, arbitrary-key forwarding, NIC,
+  storage, `.ko`, PCI-passthrough, or a production device-data-plane test.
 
 ## L0 VFIO laboratory recovery
 

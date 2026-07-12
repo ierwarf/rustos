@@ -12,19 +12,19 @@ mod sys;
 mod terminal;
 mod wayland;
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use app::{
-    start_console_refresh_worker, start_launcher_program_loader, AppState, VisualUpdate,
-    CONSOLE_POLL_SLEEP, CURSOR_BLINK_INTERVAL, CURSOR_MOTION_SETTLE_INTERVAL, RUNTIME_POLL_SLEEP,
+    AppState, CONSOLE_POLL_SLEEP, CURSOR_BLINK_INTERVAL, CURSOR_MOTION_SETTLE_INTERVAL,
+    RUNTIME_POLL_SLEEP, VisualUpdate, start_console_refresh_worker, start_launcher_program_loader,
 };
 use render::start_desktop_background_loader;
 use render::{render_boot_frame, render_debug_white_box, render_frame, render_rect};
 use runtime_control::RuntimeClient;
-use runtime_sync::{refresh_runtime_state, start_runtime_sync, RuntimeState};
+use runtime_sync::{RuntimeState, refresh_runtime_state, start_runtime_sync};
 use sys::{boot_line, boot_trace_enabled, diag_line, profile_line};
 use wayland::WaylandCompositor;
 
@@ -117,25 +117,27 @@ impl UiLoopWatchdog {
         let thread_started = boot_started;
         let _ = thread::Builder::new()
             .name(String::from("uiserver-watchdog"))
-            .spawn(move || loop {
-                thread::sleep(UI_WATCHDOG_CHECK_INTERVAL);
-                let phase_id = phase.load(Ordering::Acquire);
-                if phase_id == UI_PHASE_IDLE {
-                    continue;
+            .spawn(move || {
+                loop {
+                    thread::sleep(UI_WATCHDOG_CHECK_INTERVAL);
+                    let phase_id = phase.load(Ordering::Acquire);
+                    if phase_id == UI_PHASE_IDLE {
+                        continue;
+                    }
+                    let started_ms = phase_started_ms.load(Ordering::Acquire);
+                    let now_ms = elapsed_ms_since(thread_started);
+                    let elapsed_ms = now_ms.saturating_sub(started_ms);
+                    if elapsed_ms < UI_PHASE_PANIC_THRESHOLD_MS {
+                        continue;
+                    }
+                    diag_line(format!(
+                        "uiserver watchdog panic: phase={} elapsed_ms={} loop_seq={}",
+                        ui_phase_name(phase_id),
+                        elapsed_ms,
+                        loop_seq.load(Ordering::Acquire),
+                    ));
+                    std::process::exit(134);
                 }
-                let started_ms = phase_started_ms.load(Ordering::Acquire);
-                let now_ms = elapsed_ms_since(thread_started);
-                let elapsed_ms = now_ms.saturating_sub(started_ms);
-                if elapsed_ms < UI_PHASE_PANIC_THRESHOLD_MS {
-                    continue;
-                }
-                diag_line(format!(
-                    "uiserver watchdog panic: phase={} elapsed_ms={} loop_seq={}",
-                    ui_phase_name(phase_id),
-                    elapsed_ms,
-                    loop_seq.load(Ordering::Acquire),
-                ));
-                std::process::exit(134);
             });
         watchdog
     }
@@ -1144,6 +1146,9 @@ fn main() {
     install_panic_hook();
     boot_line("uiserver: panic hook installed");
     if let Err(err) = sys::start_display_policy_endpoint() {
+        sys::debug_line(&format!(
+            "uiserver: display policy endpoint failed errno={err}"
+        ));
         diag_line(format!(
             "uiserver: display policy endpoint failed errno={err}"
         ));
@@ -1154,6 +1159,9 @@ fn main() {
         Err(code) => code,
     };
     if exit_code != 0 {
+        sys::debug_line(&format!(
+            "uiserver: exiting with nonzero status errno={exit_code}"
+        ));
         diag_line(format!(
             "uiserver: exiting with nonzero status errno={exit_code}"
         ));

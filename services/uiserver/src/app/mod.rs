@@ -15,7 +15,7 @@ use crate::canvas;
 use crate::cursor_sprites::CURSOR_SPRITE_MAX_DISTANCE;
 use crate::profile;
 use crate::sys::{
-    diag_line, ConsoleSessionHandle, DisplayInfo, DisplaySurfaceCreate, SurfaceMapping,
+    ConsoleSessionHandle, DisplayInfo, DisplaySurfaceCreate, SurfaceMapping, diag_line,
 };
 use crate::terminal::TerminalState;
 use crate::wayland::WaylandWindowSnapshot;

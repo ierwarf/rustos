@@ -68,17 +68,23 @@ grant RustOS host authority.
   `/run/rustos-dvm/ready`. In `state=control`, the agent connects only to the
   L0 host's KVM-vsock listener using its launch-assigned CID.
 - L0 validates the source CID and the complete DVM control contract before it
-  requests health or PCI device inventory. The control request is host-to-DVM;
-  it is not a direct RustOS-to-DVM channel.
-- Health and device inventory are the only implemented capabilities. RustOS
-  still has no vsock endpoint. Network, block, input, display, and GPU data
-  planes require separately versioned protocols and a RustOS-side consumer.
+  requests health, PCI device inventory, or one bounded keyboard event. The
+  control request is host-to-DVM; it is not a direct RustOS-to-DVM channel.
+- `keyboard-events` is a KVM smoke-only proof: QEMU injects a synthetic `A`
+  into the DVM's `virtio-keyboard`, the DVM returns one Linux evdev key press,
+  and L0 accepts only evdev code `30` before injecting the same synthetic key
+  into RustOS's default PS/2 path. RustOS then has to show that `inputd`
+  consumed a new input batch.
+- This is intentionally not physical host-keyboard capture, arbitrary-key
+  forwarding, or a live input data plane. RustOS still has no vsock endpoint.
+  Network, block, display, GPU, and production input transports require
+  separately versioned protocols and RustOS-side consumers.
 
 This avoids a Linux kernel fork. A small agent is still required for health,
 device state, and authenticated control messages. There is currently no live
-RustOS/Linux vsock endpoint, PCI assignment, or RustOS device consumption.
-High-performance page loans or device-specific protocols are future, versioned
-extensions, not part of this baseline.
+RustOS/Linux vsock endpoint, PCI assignment, or production RustOS device
+consumption. High-performance page loans or device-specific protocols are
+future, versioned extensions, not part of this baseline.
 
 ## Profile limits
 

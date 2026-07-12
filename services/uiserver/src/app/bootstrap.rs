@@ -2,17 +2,17 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
-use runtime_control::{load_desktop_program_entries, StartupMode, DEFAULT_APPLICATIONS_DIR};
+use runtime_control::{DEFAULT_APPLICATIONS_DIR, StartupMode, load_desktop_program_entries};
 
 use super::{
-    align_up, AppState, CursorMotion, DesktopSurfaceCache, LauncherProgram, MAX_DISPLAY_HEIGHT,
-    MAX_DISPLAY_WIDTH, PAGE_SIZE,
+    AppState, CursorMotion, DesktopSurfaceCache, LauncherProgram, MAX_DISPLAY_HEIGHT,
+    MAX_DISPLAY_WIDTH, PAGE_SIZE, align_up,
 };
 use crate::sys::{
-    boot_line, diag_line, display_create_surface, display_get_info, display_present,
+    DisplayInfo, DisplaySurfaceCreate, ESTALE, PIXEL_FORMAT_BGRA8888, SurfaceMapping, boot_line,
+    debug_line, diag_line, display_create_surface, display_get_info, display_present,
     display_present_rect, map_surface, open_console, open_display, open_input,
-    publish_input_pointer_surface, DisplayInfo, DisplaySurfaceCreate, SurfaceMapping, ESTALE,
-    PIXEL_FORMAT_BGRA8888,
+    publish_input_pointer_surface,
 };
 const SURFACE_CREATE_RETRIES: usize = 4;
 // Retry budget for waiting on the primary display provider (e.g. virtio-gpu).
@@ -153,7 +153,8 @@ fn fetch_surface_state(display_fd: i32) -> Result<DisplaySurfaceState, i32> {
         // Re-fetch display info each surface attempt: after a generation
         // mismatch (or the primary-provider wait below) the geometry may have
         // changed and we need fresh dimensions for create_surface.
-        let mut display: DisplayInfo = display_get_info(display_fd).map_err(|_| {
+        let mut display: DisplayInfo = display_get_info(display_fd).map_err(|errno| {
+            debug_line(&format!("uiserver: display_get_info failed errno={errno}"));
             diag_line("uiserver: display_get_info failed");
             13_i32
         })?;
@@ -177,7 +178,10 @@ fn fetch_surface_state(display_fd: i32) -> Result<DisplaySurfaceState, i32> {
                         return Err(14);
                     }
                     thread::sleep(PRIMARY_DISPLAY_WAIT_DELAY);
-                    display = display_get_info(display_fd).map_err(|_| {
+                    display = display_get_info(display_fd).map_err(|errno| {
+                        debug_line(&format!(
+                            "uiserver: display_get_info failed during primary wait errno={errno}"
+                        ));
                         diag_line("uiserver: display_get_info failed during primary wait");
                         13_i32
                     })?;
@@ -210,7 +214,10 @@ fn fetch_surface_state(display_fd: i32) -> Result<DisplaySurfaceState, i32> {
         );
 
         let surface =
-            display_create_surface(display_fd, display.width, display.height).map_err(|_| {
+            display_create_surface(display_fd, display.width, display.height).map_err(|errno| {
+                debug_line(&format!(
+                    "uiserver: display_create_surface failed errno={errno}"
+                ));
                 diag_line("uiserver: display_create_surface failed");
                 15
             })?;
@@ -254,7 +261,8 @@ fn fetch_surface_state(display_fd: i32) -> Result<DisplaySurfaceState, i32> {
 
         let surface_mapping_len =
             validate_surface_metadata(&display, &surface, display_stride_bytes)?;
-        let frame = map_surface(surface_fd.as_raw_fd(), surface_mapping_len).map_err(|_| {
+        let frame = map_surface(surface_fd.as_raw_fd(), surface_mapping_len).map_err(|errno| {
+            debug_line(&format!("uiserver: map_surface failed errno={errno}"));
             diag_line("uiserver: map_surface failed");
             17
         })?;
@@ -274,7 +282,8 @@ impl AppState {
     pub(crate) fn initialize() -> Result<Self, i32> {
         diag_line("uiserver: init open_display begin");
         boot_line("uiserver: init open_display begin");
-        let display_fd = open_display().map_err(|_| {
+        let display_fd = open_display().map_err(|errno| {
+            debug_line(&format!("uiserver: open_display failed errno={errno}"));
             diag_line("uiserver: open_display failed");
             boot_line("uiserver: open_display failed");
             10
@@ -283,7 +292,8 @@ impl AppState {
         boot_line("uiserver: init open_display done");
         diag_line("uiserver: init open_input begin");
         boot_line("uiserver: init open_input begin");
-        let input_fds = open_input().map_err(|_| {
+        let input_fds = open_input().map_err(|errno| {
+            debug_line(&format!("uiserver: open_input failed errno={errno}"));
             diag_line("uiserver: open_input failed");
             boot_line("uiserver: open_input failed");
             11
@@ -292,7 +302,8 @@ impl AppState {
         boot_line("uiserver: init open_input done");
         diag_line("uiserver: init open_console begin");
         boot_line("uiserver: init open_console begin");
-        let console_fd = open_console().map_err(|_| {
+        let console_fd = open_console().map_err(|errno| {
+            debug_line(&format!("uiserver: open_console failed errno={errno}"));
             diag_line("uiserver: open_console failed");
             boot_line("uiserver: open_console failed");
             12

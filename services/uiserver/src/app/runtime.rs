@@ -5,15 +5,15 @@ use std::thread;
 use std::vec::Vec;
 
 use super::{
-    AppState, ConsoleWindow, DragTarget, VisualUpdate, CONSOLE_POLL_SLEEP, MAX_RUNNING_PROGRAMS,
+    AppState, CONSOLE_POLL_SLEEP, ConsoleWindow, DragTarget, MAX_RUNNING_PROGRAMS, VisualUpdate,
 };
 use crate::canvas;
 use crate::render::{self, default_console_window_rect, taskbar_slot_rect};
-use crate::runtime_sync::{runtime_program_is_hidden, runtime_program_title, RuntimeState};
+use crate::runtime_sync::{RuntimeState, runtime_program_is_hidden, runtime_program_title};
 use crate::sys::{
+    ConsoleSessionHandle, ConsoleSessionInfo, ConsoleStateInfo, MAX_CONSOLE_SNAPSHOT_BYTES,
     console_get_state, console_set_focus, console_snapshot_session_output,
-    console_snapshot_sessions, open_console, ConsoleSessionHandle, ConsoleSessionInfo,
-    ConsoleStateInfo, MAX_CONSOLE_SNAPSHOT_BYTES,
+    console_snapshot_sessions, open_console,
 };
 use crate::wayland::WaylandCompositor;
 use runtime_control::RuntimeRunningProgram;

@@ -160,16 +160,21 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   `libelf-dev` package for non-root CI; the wrapper validates and hashes those
   headers/library before it configures Buildroot.
 - `cargo xtask kvm-smoke` requires `qemu-system-x86_64` and `/dev/kvm`, makes a
-  private writable copy of `build/rustos-boot.img`, and uses the
-  repository-pinned `OVMF_PATH` with QEMU. It starts RustOS and Linux DVM as
-  independent KVM guests and preserves their logs under `build/kvm/`.
+  private writable copy of `build/rustos-boot.img`, restricts `build/kvm/` to
+  the launch user, and uses the repository-pinned `OVMF_PATH` with QEMU. It
+  starts RustOS and Linux DVM as independent KVM guests and preserves their
+  logs under `build/kvm/`.
 - A successful smoke requires RustOS's default `rootd` readiness marker and
-  the L0-style host listener to complete the DVM `health,device-inventory`
-  probe using launch-assigned KVM vsock CID `4`. A guest that exits or merely
-  starts cannot pass: the host probe requires a validated DVM agent response.
-  The `agent-v1-control` endpoint is host-to-DVM only; it is not a live RustOS
-  endpoint. Additional `--expect` markers tighten RustOS proof; none prove a
-  RustOS device, `.ko`, PCI assignment, or a network route.
+  the L0-style host listener to complete the DVM
+  `health,device-inventory,keyboard-events` probe using launch-assigned KVM
+  vsock CID `4`. The keyboard step is bounded to one QEMU-injected `A`: the
+  agent must return Linux evdev code `30`, then RustOS must report a new
+  `inputd` read batch after L0 injects the same synthetic key through its
+  default PS/2 path. A guest that exits or merely starts cannot pass.
+  `agent-v1-control` remains host-to-DVM only; it is not a live RustOS vsock
+  endpoint or physical-keyboard forwarding protocol. Additional `--expect`
+  markers tighten RustOS proof; none prove a RustOS device, `.ko`, PCI
+  assignment, physical input capture, or a network route.
 - `rustos-hostd discover` and `rustos-hostd preflight --plan ...` are L0
   read-only ownership gates. `launch-plan-v1.env` must explicitly enumerate
   every function in one actual IOMMU group and reject host-protected BDFs;

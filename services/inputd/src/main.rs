@@ -7,19 +7,16 @@ use std::time::Duration;
 
 use keyboard_core::{KeyAction, KeyboardDriver, KeyboardEvent, ScanCodeSet};
 use rustos_user_abi::syscall::{
-    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, InputHidKeyboardReportWire,
-    InputHidPointerReportWire, InputHidPolicyWire, InputIngestBrokerArgs, InputIngressWire,
-    InputKeyboardEventWire, InputPointerAbsoluteWire, InputPointerPacketWire, InputStatsBrokerArgs,
-    InputStatsWire, InputdIpcRequest, InputdIpcResponse, InputdPointerSurfaceRequest,
-    InputdReadResponse, COMMERCIAL_MAX_INPUTD_OP_DROP_POLICY,
-    COMMERCIAL_MAX_INPUTD_OP_EVDEV_TRANSLATE, COMMERCIAL_MAX_INPUTD_OP_HID_REPORT_POLICY,
-    COMMERCIAL_MAX_INPUTD_OP_I8042_COMMAND_POLICY, COMMERCIAL_MAX_INPUTD_OP_INPUT_INGEST,
-    COMMERCIAL_MAX_INPUTD_OP_INPUT_READER, COMMERCIAL_MAX_INPUTD_OP_INPUT_STATS,
-    COMMERCIAL_MAX_INPUTD_OP_LAYOUT_POLICY, COMMERCIAL_MAX_INPUTD_OP_POINTER_SURFACE_POLICY,
-    COMMERCIAL_MAX_INPUTD_OP_PS2_PACKET_POLICY, COMMERCIAL_MAX_INPUTD_OP_SERIO_BUS_POLICY,
-    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_INPUTD, INPUTD_ACCESS_EVDEV,
-    INPUTD_ACCESS_NATIVE, INPUTD_HID_POLICY_DESCRIPTOR_CAPACITY, INPUTD_HID_POLICY_KIND_KEYBOARD,
+    COMMERCIAL_MAX_INPUTD_OP_DROP_POLICY, COMMERCIAL_MAX_INPUTD_OP_EVDEV_TRANSLATE,
+    COMMERCIAL_MAX_INPUTD_OP_HID_REPORT_POLICY, COMMERCIAL_MAX_INPUTD_OP_I8042_COMMAND_POLICY,
+    COMMERCIAL_MAX_INPUTD_OP_INPUT_INGEST, COMMERCIAL_MAX_INPUTD_OP_INPUT_READER,
+    COMMERCIAL_MAX_INPUTD_OP_INPUT_STATS, COMMERCIAL_MAX_INPUTD_OP_LAYOUT_POLICY,
+    COMMERCIAL_MAX_INPUTD_OP_POINTER_SURFACE_POLICY, COMMERCIAL_MAX_INPUTD_OP_PS2_PACKET_POLICY,
+    COMMERCIAL_MAX_INPUTD_OP_SERIO_BUS_POLICY, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_INPUTD, CommercialMaxCapabilityLeaseWire,
+    CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
+    CommercialMaxProtocolResponse, INPUTD_ACCESS_EVDEV, INPUTD_ACCESS_NATIVE,
+    INPUTD_HID_POLICY_DESCRIPTOR_CAPACITY, INPUTD_HID_POLICY_KIND_KEYBOARD,
     INPUTD_HID_POLICY_KIND_POINTER, INPUTD_HID_POLICY_KIND_UNKNOWN,
     INPUTD_HID_POLICY_REPORT_CAPACITY, INPUTD_INGEST_MAX_EVENTS, INPUTD_INGRESS_FLAG_RESET_STATE,
     INPUTD_INGRESS_KIND_EVENT, INPUTD_INGRESS_KIND_HID_KEYBOARD_REPORT,
@@ -29,12 +26,19 @@ use rustos_user_abi::syscall::{
     INPUTD_INGRESS_KIND_PS2_SCANCODE, INPUTD_IPC_ABI_VERSION, INPUTD_IPC_OP_AUTHORIZE_READ,
     INPUTD_IPC_OP_DRAIN_INGEST, INPUTD_IPC_OP_PING, INPUTD_IPC_OP_READ,
     INPUTD_IPC_OP_SET_POINTER_SURFACE, INPUTD_IPC_OP_STATS, INPUTD_READ_FLAG_NONBLOCK,
-    INPUTD_READ_PAYLOAD_CAPACITY, IPC_MAX_INLINE_BYTES, IPC_SERVICE_INPUTD, SYS_RUSTOS_DEBUG_PRINT,
+    INPUTD_READ_PAYLOAD_CAPACITY, IPC_MAX_INLINE_BYTES, IPC_SERVICE_INPUTD,
+    InputHidKeyboardReportWire, InputHidPointerReportWire, InputHidPolicyWire,
+    InputIngestBrokerArgs, InputIngressWire, InputKeyboardEventWire, InputPointerAbsoluteWire,
+    InputPointerPacketWire, InputStatsBrokerArgs, InputStatsWire, InputdIpcRequest,
+    InputdIpcResponse, InputdPointerSurfaceRequest, InputdReadResponse, SYS_RUSTOS_DEBUG_PRINT,
     SYS_RUSTOS_INPUT_INGEST_BROKER, SYS_RUSTOS_INPUT_STATS_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
-    SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
+    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_TRY_RECV,
 };
 
-const RECV_BACKOFF: Duration = Duration::from_millis(50);
+// Raw input is an independent source from the inputd endpoint.  A bounded
+// user-space poll keeps ring0 as a transport queue while avoiding a runnable
+// service spin when neither a request nor a hardware report is pending.
+const INPUT_INGEST_POLL_INTERVAL: Duration = Duration::from_millis(4);
 const INPUTD_QUEUE_MAX_EVENTS: usize = 4096;
 const INPUTD_MAX_NATIVE_READ_BYTES: u64 = input_evdev::MAX_NATIVE_READ_BYTES as u64;
 const INPUTD_MAX_EVDEV_READ_BYTES: u64 = input_evdev::MAX_EVDEV_READ_BYTES as u64;
@@ -889,8 +893,8 @@ fn scale_pointer_coordinate(
 mod tests {
     use super::InputQueue;
     use rustos_user_abi::syscall::{
-        InputHidPolicyWire, InputKeyboardEventWire, InputPointerPacketWire, InputdIpcRequest,
-        INPUTD_HID_POLICY_KIND_KEYBOARD, INPUTD_HID_POLICY_KIND_POINTER,
+        INPUTD_HID_POLICY_KIND_KEYBOARD, INPUTD_HID_POLICY_KIND_POINTER, InputHidPolicyWire,
+        InputKeyboardEventWire, InputPointerPacketWire, InputdIpcRequest,
     };
 
     fn pointer_motion(dx: i32, dy: i32) -> input_evdev::InputEvent {
@@ -1251,28 +1255,50 @@ fn main() {
 
 fn serve(endpoint: u64) {
     let mut queue = InputQueue::default();
+    // This buffer is reused by both the periodic ingress turn and request
+    // handlers.  Do not allocate a new 96 KiB wire batch on every poll.
+    let mut ingest_scratch = vec![InputIngressWire::default(); INPUTD_INGEST_MAX_EVENTS];
+    let mut ingest_failures = 0_u64;
     loop {
+        let ingested = match drain_ingest(&mut queue, &mut ingest_scratch) {
+            Ok(count) => {
+                ingest_failures = 0;
+                count
+            }
+            Err(errno) => {
+                ingest_failures = ingest_failures.saturating_add(1);
+                if ingest_failures <= 3 || ingest_failures.is_power_of_two() {
+                    debug_line(&format!(
+                        "inputd: input ingest broker failed errno={errno} failures={ingest_failures}"
+                    ));
+                }
+                0
+            }
+        };
         let mut request = [0_u8; IPC_MAX_INLINE_BYTES];
         let mut reply_cap = 0_u64;
         let received = syscall4(
-            SYS_RUSTOS_IPC_RECV,
+            SYS_RUSTOS_IPC_TRY_RECV,
             endpoint,
             request.as_mut_ptr() as u64,
             request.len() as u64,
             (&mut reply_cap as *mut u64) as u64,
         );
         if received < 0 {
-            thread::sleep(RECV_BACKOFF);
+            if ingested == 0 {
+                thread::sleep(INPUT_INGEST_POLL_INTERVAL);
+            }
             continue;
         }
         if received == 0 {
-            thread::sleep(RECV_BACKOFF);
+            thread::sleep(INPUT_INGEST_POLL_INTERVAL);
             continue;
         }
         let request_size = received as usize;
         if request_size == size_of::<CommercialMaxProtocolRequest>() {
             let request = read_unaligned::<CommercialMaxProtocolRequest>(&request);
-            let reply = reply_commercial_request(reply_cap, &request, &mut queue);
+            let reply =
+                reply_commercial_request(reply_cap, &request, &mut queue, &mut ingest_scratch);
             if reply < 0 {
                 let _ = writeln!(std::io::stderr(), "inputd: reply failed errno={}", -reply);
             }
@@ -1309,7 +1335,7 @@ fn serve(endpoint: u64) {
                 ..InputdReadResponse::default()
             };
             response.status = match validate(received as usize, &request) {
-                Ok(()) => dispatch_read(&request, &mut response, &mut queue),
+                Ok(()) => dispatch_read(&request, &mut response, &mut queue, &mut ingest_scratch),
                 Err(errno) => errno,
             };
             syscall3(
@@ -1325,7 +1351,7 @@ fn serve(endpoint: u64) {
                 ..InputdIpcResponse::default()
             };
             response.status = match validate(received as usize, &request) {
-                Ok(()) => dispatch(&request, &mut response, &mut queue),
+                Ok(()) => dispatch(&request, &mut response, &mut queue, &mut ingest_scratch),
                 Err(errno) => errno,
             };
             syscall3(
@@ -1345,6 +1371,7 @@ fn reply_commercial_request(
     reply_cap: u64,
     request: &CommercialMaxProtocolRequest,
     queue: &mut InputQueue,
+    ingest_scratch: &mut [InputIngressWire],
 ) -> i64 {
     let mut response = CommercialMaxProtocolResponse {
         header: request.header,
@@ -1352,7 +1379,7 @@ fn reply_commercial_request(
     };
     response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
     response.status = validate_commercial_request(request)
-        .and_then(|_| dispatch_commercial_request(request, &mut response, queue))
+        .and_then(|_| dispatch_commercial_request(request, &mut response, queue, ingest_scratch))
         .err()
         .unwrap_or(0);
     syscall3(
@@ -1367,6 +1394,7 @@ fn dispatch(
     request: &InputdIpcRequest,
     response: &mut InputdIpcResponse,
     queue: &mut InputQueue,
+    ingest_scratch: &mut [InputIngressWire],
 ) -> i32 {
     match request.op {
         INPUTD_IPC_OP_PING => {
@@ -1381,7 +1409,7 @@ fn dispatch(
             Err(errno) => errno,
         },
         INPUTD_IPC_OP_AUTHORIZE_READ => authorize_read(request, response, queue),
-        INPUTD_IPC_OP_DRAIN_INGEST => match drain_ingest(queue) {
+        INPUTD_IPC_OP_DRAIN_INGEST => match drain_ingest(queue, ingest_scratch) {
             Ok(count) => {
                 response.approved_len = count as u64;
                 match fetch_stats(queue) {
@@ -1417,6 +1445,7 @@ fn dispatch_read(
     request: &InputdIpcRequest,
     response: &mut InputdReadResponse,
     queue: &mut InputQueue,
+    ingest_scratch: &mut [InputIngressWire],
 ) -> i32 {
     if request.pid == 0 || request.tid == 0 || request.fd > i32::MAX as u64 {
         return libc::EINVAL;
@@ -1424,7 +1453,7 @@ fn dispatch_read(
     let Some(approved_len) = consume_read_authorization(queue, request) else {
         return libc::EACCES;
     };
-    if let Err(errno) = drain_ingest(queue) {
+    if let Err(errno) = drain_ingest(queue, ingest_scratch) {
         return errno;
     }
     let requested = request
@@ -1447,8 +1476,10 @@ fn dispatch_read(
     0
 }
 
-fn drain_ingest(queue: &mut InputQueue) -> Result<usize, i32> {
-    let mut events = vec![InputIngressWire::default(); INPUTD_INGEST_MAX_EVENTS];
+fn drain_ingest(queue: &mut InputQueue, events: &mut [InputIngressWire]) -> Result<usize, i32> {
+    if events.len() != INPUTD_INGEST_MAX_EVENTS {
+        return Err(libc::EINVAL);
+    }
     let mut count = 0_u32;
     let args = InputIngestBrokerArgs {
         abi_version: INPUTD_IPC_ABI_VERSION,
@@ -1632,10 +1663,11 @@ fn dispatch_commercial_request(
     request: &CommercialMaxProtocolRequest,
     response: &mut CommercialMaxProtocolResponse,
     queue: &mut InputQueue,
+    ingest_scratch: &mut [InputIngressWire],
 ) -> Result<(), i32> {
     match request.header.op {
         COMMERCIAL_MAX_INPUTD_OP_INPUT_INGEST => {
-            response.value0 = drain_ingest(queue)? as u64;
+            response.value0 = drain_ingest(queue, ingest_scratch)? as u64;
             write_stats_payload(queue, response)
         }
         COMMERCIAL_MAX_INPUTD_OP_INPUT_READER => {
@@ -1891,7 +1923,11 @@ fn syscall4(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
 fn register_service_endpoint(service_id: u64, endpoint: u64) -> i64 {
     let mut last = 0;
     for _ in 0..65_536 {
-        last = syscall2(SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, service_id, endpoint);
+        last = syscall2(
+            SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
+            service_id,
+            endpoint,
+        );
         if last >= 0 {
             return last;
         }

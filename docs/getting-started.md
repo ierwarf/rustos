@@ -52,10 +52,13 @@ RustOS concurrently, requires the RustOS readiness marker plus the validated
 host-to-DVM control probe, then stops only the QEMU children it created. It
 preserves their debugcon, serial, and stderr captures for inspection.
 
-The DVM currently advertises `agent-v1-control`: L0 can make an authenticated
-vsock health/PCI-inventory probe, but RustOS still has no endpoint or usable
-device data plane. Do not interpret a KVM smoke pass as NIC, storage, `.ko`,
-or passthrough validation.
+The DVM currently advertises `agent-v1-control`: L0 makes an authenticated
+vsock health/PCI-inventory probe and a bounded synthetic-key probe. QEMU
+injects `A` into the DVM's virtio keyboard, the DVM must report Linux evdev
+code `30`, then RustOS must show that `inputd` consumed a newly injected `A`.
+This proves only the smoke path; RustOS still has no vsock endpoint or usable
+device data plane. It is not physical host-keyboard capture, arbitrary-key
+forwarding, NIC, storage, `.ko`, or passthrough validation.
 
 <a id="korean"></a>
 
@@ -107,7 +110,10 @@ cargo xtask kvm-smoke --expect 'runtimed: bootstrap ui done'
 요구하며 자신이 만든 QEMU child만 종료합니다. debugcon, serial, stderr capture는
 분석용으로 유지합니다.
 
-현재 DVM은 `agent-v1-control`을 알립니다. L0가 인증된 vsock health/PCI
-inventory probe를 수행할 수 있지만, RustOS↔DVM endpoint와 device data plane은
-아직 없습니다. KVM smoke 통과를 NIC, storage, `.ko`, passthrough 검증으로
-해석하면 안 됩니다.
+현재 DVM은 `agent-v1-control`을 알립니다. L0는 인증된 vsock health/PCI
+inventory probe와 제한된 합성 키 probe를 수행합니다. QEMU가 DVM의 virtio
+keyboard에 `A`를 주입하면 DVM은 Linux evdev code `30`을 보고해야 하며,
+그 뒤 RustOS는 새로 주입된 `A`를 `inputd`가 소비했음을 보여야 합니다. 이는
+smoke 경로만 증명합니다. RustOS↔DVM vsock endpoint나 usable device data plane,
+물리 host keyboard capture, 임의 키 forwarding, NIC, storage, `.ko`, passthrough
+검증을 뜻하지 않습니다.

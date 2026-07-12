@@ -105,7 +105,7 @@ impl ControlContract {
         {
             bail!("unsupported DVM control contract {label}");
         }
-        if self.capabilities != ["health", "device-inventory"] {
+        if self.capabilities != ["health", "device-inventory", "keyboard-events"] {
             bail!("unsupported DVM capabilities in {label}");
         }
         Ok(())
@@ -868,6 +868,21 @@ pub struct ProbeResult {
     pub inventory_count: u32,
 }
 
+/// One Linux evdev key press reported by the launch-bound DVM.
+///
+/// This is deliberately a bounded control-plane event, not a general device
+/// data plane. The first KVM smoke accepts only the exact key it injected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KeyboardEvent {
+    pub linux_key_code: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyboardProbeResult {
+    pub probe: ProbeResult,
+    pub event: KeyboardEvent,
+}
+
 /// A listener bound by L0 before a DVM is started.
 ///
 /// An accepted source CID is necessary but not sufficient identity: the hello
@@ -911,6 +926,46 @@ impl HostControlListener {
     }
 
     pub fn probe_once(&self, timeout: Duration) -> Result<ProbeResult> {
+        let mut connection = self.accept_authenticated(timeout)?;
+        self.probe_connection(&mut connection)
+    }
+
+    /// Request one Linux evdev key press after the caller has injected the
+    /// matching test key into the DVM. The callback runs only after the
+    /// authenticated DVM has accepted the bounded request.
+    pub fn keyboard_probe_once<F>(
+        &self,
+        timeout: Duration,
+        inject_test_key: F,
+    ) -> Result<KeyboardProbeResult>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        let mut connection = self.accept_authenticated(timeout)?;
+        let probe = self.probe_connection(&mut connection)?;
+        let event = request_with_injection(&mut connection, 3, "keyboard-event", inject_test_key)?;
+        if !has_exact_fields(&event, &["id", "op", "status", "type", "code", "value"])
+            || event.get("status") != Some(&"ok".to_owned())
+            || event.get("type") != Some(&"key".to_owned())
+            || event.get("value") != Some(&"1".to_owned())
+        {
+            bail!("Linux DVM keyboard probe returned an invalid key event");
+        }
+        let linux_key_code = event
+            .get("code")
+            .ok_or_else(|| anyhow!("Linux DVM keyboard probe omitted key code"))?
+            .parse::<u16>()
+            .context("invalid Linux DVM keyboard key code")?;
+        if linux_key_code == 0 {
+            bail!("Linux DVM keyboard probe reported reserved key code zero");
+        }
+        Ok(KeyboardProbeResult {
+            probe,
+            event: KeyboardEvent { linux_key_code },
+        })
+    }
+
+    fn accept_authenticated(&self, timeout: Duration) -> Result<std::fs::File> {
         let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
         let mut pollfd = libc::pollfd {
             fd: self.fd.as_raw_fd(),
@@ -949,24 +1004,31 @@ impl HostControlListener {
         }
         let hello = read_message(&mut connection)?;
         validate_hello(&hello, &self.contract)?;
-        write_message(
-            &mut connection,
-            "WELCOME\nprotocol=agent-v1\ncapabilities=health,device-inventory",
-        )?;
-        let health = request(&mut connection, 1, "health")?;
-        if health.get("status") != Some(&"ok".to_owned())
+        write_message(&mut connection, &welcome_message(&self.contract))?;
+        Ok(connection)
+    }
+
+    fn probe_connection(&self, connection: &mut std::fs::File) -> Result<ProbeResult> {
+        let health = request(connection, 1, "health")?;
+        if !has_exact_fields(&health, &["id", "op", "status", "value"])
+            || health.get("status") != Some(&"ok".to_owned())
             || health.get("value") != Some(&"ready".to_owned())
         {
             bail!("Linux DVM health probe was not ready");
         }
-        let inventory = request(&mut connection, 2, "device-inventory")?;
+        let inventory = request(connection, 2, "device-inventory")?;
+        if !has_exact_fields(&inventory, &["id", "op", "status", "count"])
+            || inventory.get("status") != Some(&"ok".to_owned())
+        {
+            bail!("Linux DVM inventory probe was not ready");
+        }
         let inventory_count = inventory
             .get("count")
             .ok_or_else(|| anyhow!("Linux DVM inventory response omitted count"))?
             .parse::<u32>()
             .context("invalid Linux DVM inventory count")?;
         Ok(ProbeResult {
-            peer_cid: peer.cid,
+            peer_cid: self.expected_dvm_cid,
             inventory_count,
         })
     }
@@ -1030,9 +1092,53 @@ fn request(
     Ok(response.fields)
 }
 
+fn request_with_injection<F>(
+    connection: &mut std::fs::File,
+    id: u32,
+    operation: &str,
+    inject_test_key: F,
+) -> Result<BTreeMap<String, String>>
+where
+    F: FnOnce() -> Result<()>,
+{
+    write_message(connection, &format!("REQUEST\nid={id}\nop={operation}"))?;
+    inject_test_key()?;
+    let response = parse_message(&read_message(connection)?)?;
+    if response.kind != "RESPONSE"
+        || response.fields.get("id") != Some(&id.to_string())
+        || response.fields.get("op") != Some(&operation.to_owned())
+    {
+        bail!("mismatched DVM control response");
+    }
+    Ok(response.fields)
+}
+
+fn welcome_message(contract: &ControlContract) -> String {
+    format!(
+        "WELCOME\nprotocol={}\ncapabilities={}",
+        contract.protocol,
+        contract.capabilities.join(",")
+    )
+}
+
+fn has_exact_fields(fields: &BTreeMap<String, String>, expected: &[&str]) -> bool {
+    fields.len() == expected.len() && expected.iter().all(|key| fields.contains_key(*key))
+}
+
 fn validate_hello(source: &str, contract: &ControlContract) -> Result<()> {
     let hello = parse_message(source)?;
     if hello.kind != "HELLO"
+        || !has_exact_fields(
+            &hello.fields,
+            &[
+                "role",
+                "protocol",
+                "state",
+                "transport",
+                "authentication",
+                "capabilities",
+            ],
+        )
         || hello.fields.get("role") != Some(&LINUX_DVM_ROLE.to_owned())
         || hello.fields.get("protocol") != Some(&contract.protocol)
         || hello.fields.get("state") != Some(&contract.state)
@@ -1121,12 +1227,15 @@ mod tests {
     };
     use anyhow::Result;
 
-    const VALID: &str = "CONTROL_SCHEMA=1\nCONTROL_PROTOCOL=agent-v1\nCONTROL_STATE=control\nCONTROL_TRANSPORT=kvm-vsock\nCONTROL_AUTHENTICATION=kvm-host-bound\nCONTROL_CAPABILITIES=health,device-inventory\n";
+    const VALID: &str = "CONTROL_SCHEMA=1\nCONTROL_PROTOCOL=agent-v1\nCONTROL_STATE=control\nCONTROL_TRANSPORT=kvm-vsock\nCONTROL_AUTHENTICATION=kvm-host-bound\nCONTROL_CAPABILITIES=health,device-inventory,keyboard-events\n";
 
     #[test]
     fn control_contract_is_strict() {
         let contract = ControlContract::parse(VALID, "test").unwrap();
-        assert_eq!(contract.capabilities, ["health", "device-inventory"]);
+        assert_eq!(
+            contract.capabilities,
+            ["health", "device-inventory", "keyboard-events"]
+        );
         assert!(ControlContract::parse(&VALID.replace("control", "pretransport"), "test").is_err());
         assert!(
             ControlContract::parse(&VALID.replace("device-inventory", "network-rx"), "test")
@@ -1137,15 +1246,16 @@ mod tests {
     #[test]
     fn hello_is_bound_to_the_exact_control_contract() {
         let contract = ControlContract::parse(VALID, "test").unwrap();
-        let hello = "HELLO\nrole=linux-driver-domain\nprotocol=agent-v1\nstate=control\ntransport=kvm-vsock\nauthentication=kvm-host-bound\ncapabilities=health,device-inventory";
+        let hello = "HELLO\nrole=linux-driver-domain\nprotocol=agent-v1\nstate=control\ntransport=kvm-vsock\nauthentication=kvm-host-bound\ncapabilities=health,device-inventory,keyboard-events";
         assert!(validate_hello(hello, &contract).is_ok());
         assert!(
             validate_hello(
-                &hello.replace("health,device-inventory", "health"),
+                &hello.replace("health,device-inventory,keyboard-events", "health"),
                 &contract
             )
             .is_err()
         );
+        assert!(validate_hello(&format!("{hello}\nextra=unexpected"), &contract).is_err());
     }
 
     #[test]

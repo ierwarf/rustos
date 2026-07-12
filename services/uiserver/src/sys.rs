@@ -8,7 +8,7 @@ use std::fs;
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
 
 use keyboard_core::{KeyAction, KeyCode, KeyboardDriver};
@@ -20,9 +20,9 @@ use console_abi::{
 };
 pub(crate) use console_abi::{ConsoleSessionInfo, ConsoleStateInfo};
 pub(crate) use device_abi::{
-    DisplayInfo, DisplaySurfaceCreate, InputEvent, INPUT_ACTION_NONE, INPUT_ACTION_PRESSED,
+    DisplayInfo, DisplaySurfaceCreate, INPUT_ACTION_NONE, INPUT_ACTION_PRESSED,
     INPUT_ACTION_RELEASED, INPUT_ACTION_REPEATED, INPUT_KIND_KEYBOARD, INPUT_KIND_POINTER_BUTTON,
-    INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION, INPUT_KIND_POINTER_SCROLL,
+    INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION, INPUT_KIND_POINTER_SCROLL, InputEvent,
     PIXEL_FORMAT_BGRA8888, POINTER_BUTTON_LEFT, POINTER_BUTTON_MIDDLE, POINTER_BUTTON_RIGHT,
     POINTER_BUTTON_X1, POINTER_BUTTON_X2,
 };
@@ -1200,8 +1200,8 @@ unsafe fn syscall1(number: usize, arg0: usize) -> isize {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        translate_linux_input_event, InputTranslationState, LinuxInputEvent, LinuxInputTimeval,
         EV_KEY, INPUT_ACTION_PRESSED, INPUT_ACTION_RELEASED, INPUT_KIND_KEYBOARD,
+        InputTranslationState, LinuxInputEvent, LinuxInputTimeval, translate_linux_input_event,
     };
 
     fn key_event(code: u16, value: i32) -> LinuxInputEvent {

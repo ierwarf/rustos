@@ -26,12 +26,12 @@ use wayland_server::{
 
 use crate::canvas::Rect;
 use crate::layout::{
-    self, clamp_wayland_frame, wayland_client_size_for_buffer, wayland_max_client_size,
-    WINDOW_BORDER, WINDOW_TITLE_HEIGHT,
+    self, WINDOW_BORDER, WINDOW_TITLE_HEIGHT, clamp_wayland_frame, wayland_client_size_for_buffer,
+    wayland_max_client_size,
 };
 use crate::sys::{
-    diag_line, map_shared_fd_readable, ui_profile_enabled, InputEvent, SharedFdMapping,
     INPUT_ACTION_PRESSED, INPUT_ACTION_RELEASED, INPUT_ACTION_REPEATED, INPUT_KIND_KEYBOARD,
+    InputEvent, SharedFdMapping, diag_line, map_shared_fd_readable, ui_profile_enabled,
 };
 
 const WAYLAND_SOCKET_NAME: &str = "wayland-0";
@@ -506,8 +506,8 @@ fn surface_damage_rect(x: i32, y: i32, width: i32, height: i32) -> Option<Rect> 
 #[cfg(test)]
 mod tests {
     use super::{
+        MAX_WAYLAND_BUFFER_DIMENSION, MAX_WAYLAND_SHM_POOL_BYTES, WaylandWindowSnapshot,
         checked_wayland_pixel_count, validate_wayland_buffer_layout, wayland_nonnegative_i32,
-        WaylandWindowSnapshot, MAX_WAYLAND_BUFFER_DIMENSION, MAX_WAYLAND_SHM_POOL_BYTES,
     };
     use crate::canvas::Rect;
     use std::sync::Arc;
@@ -523,14 +523,16 @@ mod tests {
     fn wayland_buffer_layout_rejects_out_of_bounds_and_bad_stride() {
         assert!(validate_wayland_buffer_layout(0, 128, 128, 128 * 4, 128 * 128 * 4).is_some());
         assert!(validate_wayland_buffer_layout(0, 128, 128, 127 * 4, 128 * 128 * 4).is_none());
-        assert!(validate_wayland_buffer_layout(
-            MAX_WAYLAND_SHM_POOL_BYTES,
-            128,
-            128,
-            128 * 4,
-            MAX_WAYLAND_SHM_POOL_BYTES,
-        )
-        .is_none());
+        assert!(
+            validate_wayland_buffer_layout(
+                MAX_WAYLAND_SHM_POOL_BYTES,
+                128,
+                128,
+                128 * 4,
+                MAX_WAYLAND_SHM_POOL_BYTES,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1650,9 +1652,7 @@ impl BufferData {
         let pixels = Arc::make_mut(dst);
         for row in 0..damage.height {
             let Some(src_row) = start
-                .checked_add(
-                    (damage.y + row).saturating_mul(self.shared.stride),
-                )
+                .checked_add((damage.y + row).saturating_mul(self.shared.stride))
                 .and_then(|row_start| row_start.checked_add(damage.x.saturating_mul(4)))
             else {
                 return false;
@@ -2438,8 +2438,8 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
                                 dirty = true;
                             } else {
                                 diag_line(
-                                "uiserver: rejecting wl_shm buffer during commit due to invalid layout",
-                            );
+                                    "uiserver: rejecting wl_shm buffer during commit due to invalid layout",
+                                );
                                 mapped = !surface.pixels.is_empty()
                                     && surface.width != 0
                                     && surface.height != 0;

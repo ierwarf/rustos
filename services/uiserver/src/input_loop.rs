@@ -1,20 +1,20 @@
 use std::os::fd::OwnedFd;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
-use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
 use runtime_control::RuntimeClient;
 
 use crate::app::{
-    AppState, InputProcessingResult, VisualUpdate, INPUT_EVENT_BATCH, INPUT_PROCESS_BUDGET,
-    MAX_INPUT_READ_BATCHES_PER_TICK,
+    AppState, INPUT_EVENT_BATCH, INPUT_PROCESS_BUDGET, InputProcessingResult,
+    MAX_INPUT_READ_BATCHES_PER_TICK, VisualUpdate,
 };
 use crate::profile;
 use crate::sys::{
-    diag_line, read_input, wait_for_input_ready, InputEvent, INPUT_ACTION_NONE,
-    INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION,
+    INPUT_ACTION_NONE, INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION, InputEvent,
+    diag_line, read_input, wait_for_input_ready,
 };
 use crate::wayland::WaylandCompositor;
 
@@ -459,11 +459,7 @@ pub(crate) fn process_pending_input(
     let allow_wayland_pointer = !backlog_remaining
         && input_events <= MAX_WAYLAND_POINTER_FLUSH_EVENTS
         && started_at.elapsed() < INPUT_PROCESS_BUDGET;
-    let pointer_wayland = if allow_wayland_pointer {
-        wayland
-    } else {
-        None
-    };
+    let pointer_wayland = if allow_wayland_pointer { wayland } else { None };
     if flush_pending_pointer(
         state,
         runtime,
@@ -534,10 +530,10 @@ pub(crate) fn sleep_until_input_or(events: &InputReader, deadline: Instant) {
 
 #[cfg(test)]
 mod tests {
-    use super::{InputReaderBatchCoalescer, INPUT_EVENT_BATCH};
+    use super::{INPUT_EVENT_BATCH, InputReaderBatchCoalescer};
     use crate::sys::{
-        InputEvent, INPUT_ACTION_NONE, INPUT_ACTION_PRESSED, INPUT_KIND_KEYBOARD,
-        INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION,
+        INPUT_ACTION_NONE, INPUT_ACTION_PRESSED, INPUT_KIND_KEYBOARD, INPUT_KIND_POINTER_MOTION,
+        INPUT_KIND_POINTER_POSITION, InputEvent,
     };
 
     fn event(kind: u16, value0: i32, value1: i32) -> InputEvent {

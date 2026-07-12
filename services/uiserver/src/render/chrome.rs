@@ -10,10 +10,9 @@ use crate::app::ConsoleWindow;
 use crate::canvas::{Rect, SurfaceCanvas};
 use crate::font::{self, TextStyle};
 use crate::layout::{
-    window_button_cluster_width, window_client_rect, window_close_button_rect,
-    window_maximize_button_rect, window_minimize_button_rect, window_title_bar_rect,
     TOPBAR_BRAND_WIDTH, TOPBAR_INNER_PADDING_X, TOPBAR_STATUS_WIDTH, WINDOW_RADIUS,
-    WINDOW_SHADOW_STEPS,
+    WINDOW_SHADOW_STEPS, window_button_cluster_width, window_client_rect, window_close_button_rect,
+    window_maximize_button_rect, window_minimize_button_rect, window_title_bar_rect,
 };
 use crate::wayland::WaylandWindowSnapshot;
 

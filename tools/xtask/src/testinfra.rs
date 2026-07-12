@@ -148,7 +148,7 @@ fn default_seeds(target: FuzzTarget) -> Vec<Vec<u8>> {
         ],
         FuzzTarget::DvmManifest => vec![
             format!(
-                "schema=2\nid=rustos-linux-dvm-x86_64\narchitecture=x86_64\nboot=linux-bzimage+cpio-xz\ndata-plane=dvm-local-virtio\ncontrol-plane=agent-v1-control\ncontrol-protocol=agent-v1\ncontrol-state=control\ncontrol-transport=kvm-vsock\ncontrol-authentication=kvm-host-bound\ncontrol-capabilities=health,device-inventory\ncontrol-contract-sha256={0}\nkernel_sha256={0}\nrootfs_sha256={0}\nconfig_sha256={0}\nsources_lock_sha256={0}\n",
+                "schema=2\nid=rustos-linux-dvm-x86_64\narchitecture=x86_64\nboot=linux-bzimage+cpio-xz\ndata-plane=dvm-local-virtio\ncontrol-plane=agent-v1-control\ncontrol-protocol=agent-v1\ncontrol-state=control\ncontrol-transport=kvm-vsock\ncontrol-authentication=kvm-host-bound\ncontrol-capabilities=health,device-inventory,keyboard-events\ncontrol-contract-sha256={0}\nkernel_sha256={0}\nrootfs_sha256={0}\nconfig_sha256={0}\nsources_lock_sha256={0}\n",
                 "0".repeat(64)
             )
             .into_bytes(),
