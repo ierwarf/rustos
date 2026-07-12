@@ -1,8 +1,13 @@
 //! Host-owned control plane for RustOS Linux driver domains.
 //!
 //! The L0 host is the only authority that binds a KVM guest identity to a
-//! DVM image/control contract.  This crate intentionally exposes only a
-//! bounded health and inventory probe; it is not a guest-to-guest data plane.
+//! DVM image/control contract plus the narrow L0-owned event relay.
+//!
+//! A driver domain is never allowed to address RustOS directly.  It reports a
+//! versioned, allowlisted event to L0 over vsock; L0 validates it and writes a
+//! fixed binary frame to RustOS's dedicated virtual transport.  High bandwidth
+//! devices (network, block, GPU) need their own paravirtual backends and must
+//! not be tunneled through this control relay.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -10,14 +15,28 @@ use std::io::{Read, Write};
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 
 pub const DEFAULT_CONTROL_PORT: u32 = 40_500;
 pub const MAX_CONTROL_FRAME: usize = 4 * 1024;
 pub const LINUX_DVM_ROLE: &str = "linux-driver-domain";
+pub const RUSTOS_INPUT_FRAME_BYTES: usize = 32;
+
+const RUSTOS_INPUT_MAGIC: [u8; 4] = *b"RDI1";
+const RUSTOS_INPUT_VERSION: u8 = 2;
+const RUSTOS_INPUT_KIND_SESSION_START: u8 = 0;
+const RUSTOS_INPUT_KIND_KEY: u8 = 1;
+const RUSTOS_INPUT_KIND_POINTER: u8 = 2;
+const RUSTOS_INPUT_KIND_SESSION_END: u8 = 3;
+const LINUX_EVDEV_KEY_MAX: u16 = 0x02ff;
+const RUSTOS_POINTER_BUTTON_MASK: u8 = 0x1f;
+const INPUT_RELAY_MAX_SEQUENCE: u32 = u32::MAX - 1024;
+const INPUT_RELAY_MAX_FRAMES_PER_SECOND: u32 = 2048;
+const INPUT_RELAY_MAX_KEYS_PER_SECOND: u32 = 512;
 
 const VMADDR_CID_ANY: u32 = u32::MAX;
 const AF_VSOCK: libc::c_int = 40;
@@ -105,7 +124,7 @@ impl ControlContract {
         {
             bail!("unsupported DVM control contract {label}");
         }
-        if self.capabilities != ["health", "device-inventory", "keyboard-events"] {
+        if self.capabilities != ["health", "device-inventory", "input-stream"] {
             bail!("unsupported DVM capabilities in {label}");
         }
         Ok(())
@@ -209,6 +228,121 @@ impl LaunchPlan {
             iommu_group: self.iommu_group,
             pci_bdfs: actual.iter().cloned().collect(),
         })
+    }
+}
+
+/// Device classes that may be exported by a driver domain.  Adding a class to
+/// the policy does not create a data plane: it only names the owner and forces
+/// a future transport implementation to be explicit.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum DeviceClass {
+    Input,
+    Network,
+    Block,
+    Display,
+}
+
+impl DeviceClass {
+    pub const fn policy_key(self) -> &'static str {
+        match self {
+            Self::Input => "INPUT_TRANSPORT",
+            Self::Network => "NETWORK_TRANSPORT",
+            Self::Block => "BLOCK_TRANSPORT",
+            Self::Display => "DISPLAY_TRANSPORT",
+        }
+    }
+}
+
+/// Explicit DVM-to-RustOS transport selection for one device class.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeviceTransport {
+    Disabled,
+    /// Fixed, sequenced RDI2 input frames over the private RustOS COM2 device.
+    Rdi2Com2,
+}
+
+impl DeviceTransport {
+    fn parse(value: &str, key: &str, label: &str) -> Result<Self> {
+        match value {
+            "disabled" => Ok(Self::Disabled),
+            "rdi2-com2" if key == DeviceClass::Input.policy_key() => Ok(Self::Rdi2Com2),
+            _ => bail!("unsupported {label} {key} transport {value:?}"),
+        }
+    }
+}
+
+/// Immutable L0 policy that joins a validated launch plan to exactly one
+/// transport per class.  It deliberately rejects a generic "proxy" value:
+/// NIC, block, and display need distinct bounded protocols rather than an
+/// accidental extension of the input relay.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DriverDomainPolicy {
+    pub domain_id: String,
+    transports: BTreeMap<DeviceClass, DeviceTransport>,
+}
+
+impl DriverDomainPolicy {
+    pub fn from_env_file(path: &Path) -> Result<Self> {
+        let source = fs::read_to_string(path)
+            .with_context(|| format!("read driver-domain policy {}", path.display()))?;
+        Self::parse(&source, &path.display().to_string())
+    }
+
+    pub fn parse(source: &str, label: &str) -> Result<Self> {
+        let values = parse_launch_plan_values(source, label)?;
+        const REQUIRED: [&str; 6] = [
+            "DRIVER_DOMAIN_POLICY_SCHEMA",
+            "DOMAIN_ID",
+            "INPUT_TRANSPORT",
+            "NETWORK_TRANSPORT",
+            "BLOCK_TRANSPORT",
+            "DISPLAY_TRANSPORT",
+        ];
+        if values.len() != REQUIRED.len()
+            || values.keys().any(|key| !REQUIRED.contains(&key.as_str()))
+        {
+            bail!("unsupported key in {label}");
+        }
+        if launch_plan_value(&values, "DRIVER_DOMAIN_POLICY_SCHEMA", label)? != "1" {
+            bail!("unsupported {label} schema");
+        }
+        let domain_id = launch_plan_value(&values, "DOMAIN_ID", label)?.to_owned();
+        validate_domain_id(&domain_id, label)?;
+        let mut transports = BTreeMap::new();
+        for class in [
+            DeviceClass::Input,
+            DeviceClass::Network,
+            DeviceClass::Block,
+            DeviceClass::Display,
+        ] {
+            let key = class.policy_key();
+            transports.insert(
+                class,
+                DeviceTransport::parse(launch_plan_value(&values, key, label)?, key, label)?,
+            );
+        }
+        Ok(Self {
+            domain_id,
+            transports,
+        })
+    }
+
+    pub fn validate_for_lease(&self, lease: &ValidatedLease) -> Result<()> {
+        if self.domain_id != lease.domain_id {
+            bail!(
+                "driver-domain policy domain={} does not match launch plan domain={}",
+                self.domain_id,
+                lease.domain_id
+            );
+        }
+        Ok(())
+    }
+
+    pub fn transport_for(&self, class: DeviceClass) -> DeviceTransport {
+        self.transports
+            .get(&class)
+            .copied()
+            .expect("driver-domain policy has every fixed class")
     }
 }
 
@@ -868,19 +1002,202 @@ pub struct ProbeResult {
     pub inventory_count: u32,
 }
 
-/// One Linux evdev key press reported by the launch-bound DVM.
+/// A fixed, checksummed L0-to-RustOS input frame.
 ///
-/// This is deliberately a bounded control-plane event, not a general device
-/// data plane. The first KVM smoke accepts only the exact key it injected.
+/// This is a RustOS virtual-device transport frame, not a public application
+/// ABI. The session frame establishes a new host relay epoch; all input frames
+/// are accepted only once and only in that epoch by the RustOS transport
+/// receiver. Payloads are fixed-width so a DVM never controls a length or a
+/// native input ABI structure in RustOS.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct KeyboardEvent {
-    pub linux_key_code: u16,
+pub struct RustosInputFrame {
+    bytes: [u8; RUSTOS_INPUT_FRAME_BYTES],
+}
+
+impl RustosInputFrame {
+    pub fn session_start(epoch: u32) -> Result<Self> {
+        if epoch == 0 {
+            bail!("RustOS input relay epoch must be nonzero");
+        }
+        let mut frame = Self::new(RUSTOS_INPUT_KIND_SESSION_START, epoch, 0);
+        frame.finish_checksum();
+        Ok(frame)
+    }
+
+    pub fn session_end(epoch: u32, sequence: u32) -> Result<Self> {
+        if epoch == 0 || sequence == 0 {
+            bail!("RustOS input relay session end requires nonzero epoch and sequence");
+        }
+        let mut frame = Self::new(RUSTOS_INPUT_KIND_SESSION_END, epoch, sequence);
+        frame.finish_checksum();
+        Ok(frame)
+    }
+
+    pub fn linux_evdev_key(epoch: u32, sequence: u32, code: u16, value: u8) -> Result<Self> {
+        if epoch == 0 || sequence == 0 {
+            bail!("RustOS input relay key frame requires nonzero epoch and sequence");
+        }
+        if code == 0 || code > LINUX_EVDEV_KEY_MAX || value > 2 {
+            bail!("invalid Linux evdev key frame code={code} value={value}");
+        }
+        let mut frame = Self::new(RUSTOS_INPUT_KIND_KEY, epoch, sequence);
+        frame.bytes[16..18].copy_from_slice(&code.to_be_bytes());
+        frame.bytes[18] = value;
+        frame.finish_checksum();
+        Ok(frame)
+    }
+
+    pub fn linux_evdev_pointer(
+        epoch: u32,
+        sequence: u32,
+        dx: i16,
+        dy: i16,
+        wheel_vertical: i16,
+        wheel_horizontal: i16,
+        buttons: u8,
+    ) -> Result<Self> {
+        if epoch == 0 || sequence == 0 {
+            bail!("RustOS pointer frame requires nonzero epoch and sequence");
+        }
+        if buttons & !RUSTOS_POINTER_BUTTON_MASK != 0 {
+            bail!("invalid RustOS pointer buttons {buttons:#x}");
+        }
+        let mut frame = Self::new(RUSTOS_INPUT_KIND_POINTER, epoch, sequence);
+        frame.bytes[16..18].copy_from_slice(&dx.to_be_bytes());
+        frame.bytes[18..20].copy_from_slice(&dy.to_be_bytes());
+        frame.bytes[20..22].copy_from_slice(&wheel_vertical.to_be_bytes());
+        frame.bytes[22..24].copy_from_slice(&wheel_horizontal.to_be_bytes());
+        frame.bytes[24] = buttons;
+        frame.finish_checksum();
+        Ok(frame)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; RUSTOS_INPUT_FRAME_BYTES] {
+        &self.bytes
+    }
+
+    fn new(kind: u8, epoch: u32, sequence: u32) -> Self {
+        let mut bytes = [0_u8; RUSTOS_INPUT_FRAME_BYTES];
+        bytes[..4].copy_from_slice(&RUSTOS_INPUT_MAGIC);
+        bytes[4] = RUSTOS_INPUT_VERSION;
+        bytes[5] = kind;
+        bytes[8..12].copy_from_slice(&epoch.to_be_bytes());
+        bytes[12..16].copy_from_slice(&sequence.to_be_bytes());
+        Self { bytes }
+    }
+
+    fn finish_checksum(&mut self) {
+        let checksum = crc32(&self.bytes[..28]).to_be_bytes();
+        self.bytes[28..32].copy_from_slice(&checksum);
+    }
+}
+
+/// Destination controlled by L0 for sanitized DVM input frames.
+pub trait RustosInputSink {
+    fn send_input_frame(&mut self, frame: &RustosInputFrame) -> Result<()>;
+}
+
+/// QEMU's private, dedicated serial socket used by the current low-rate input
+/// transport.  The socket is intentionally distinct from QMP and from the
+/// debug/console serial channel.
+#[derive(Debug)]
+pub struct UnixInputSink {
+    stream: UnixStream,
+}
+
+impl UnixInputSink {
+    pub fn connect(path: &Path, timeout: Duration) -> Result<Self> {
+        let started = std::time::Instant::now();
+        loop {
+            match UnixStream::connect(path) {
+                Ok(stream) => {
+                    stream
+                        .set_write_timeout(Some(timeout.min(Duration::from_secs(1))))
+                        .with_context(|| {
+                            format!("set RustOS input socket timeout {}", path.display())
+                        })?;
+                    return Ok(Self { stream });
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound
+                            | std::io::ErrorKind::ConnectionRefused
+                            | std::io::ErrorKind::AddrNotAvailable
+                    ) && started.elapsed() < timeout =>
+                {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("connect RustOS input socket {}", path.display())
+                    });
+                }
+            }
+            if started.elapsed() >= timeout {
+                bail!(
+                    "timed out waiting for RustOS input socket {}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+impl RustosInputSink for UnixInputSink {
+    fn send_input_frame(&mut self, frame: &RustosInputFrame) -> Result<()> {
+        self.stream
+            .write_all(frame.as_bytes())
+            .and_then(|()| self.stream.flush())
+            .context("write sanitized frame to RustOS virtual input transport")
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct KeyboardProbeResult {
+pub struct InputRelayResult {
     pub probe: ProbeResult,
-    pub event: KeyboardEvent,
+    pub forwarded_events: u64,
+}
+
+/// L0-side CPU and serial-budget guard. It intentionally rejects an abusive
+/// DVM stream instead of allowing an unbounded input producer to starve the
+/// broker or fill RustOS's bounded ingress queue. The total still permits a
+/// 1 kHz pointer plus normal keyboard use.
+struct InputRelayRate {
+    window_started: Instant,
+    total_frames: u32,
+    key_frames: u32,
+}
+
+impl InputRelayRate {
+    fn new() -> Self {
+        Self {
+            window_started: Instant::now(),
+            total_frames: 0,
+            key_frames: 0,
+        }
+    }
+
+    fn admit(&mut self, event: LinuxEvdevInputEvent) -> Result<()> {
+        if self.window_started.elapsed() >= Duration::from_secs(1) {
+            self.window_started = Instant::now();
+            self.total_frames = 0;
+            self.key_frames = 0;
+        }
+        if self.total_frames >= INPUT_RELAY_MAX_FRAMES_PER_SECOND {
+            bail!("Linux DVM input stream exceeds L0 frame rate budget");
+        }
+        if matches!(event, LinuxEvdevInputEvent::Key(_))
+            && self.key_frames >= INPUT_RELAY_MAX_KEYS_PER_SECOND
+        {
+            bail!("Linux DVM input stream exceeds L0 keyboard rate budget");
+        }
+        self.total_frames += 1;
+        if matches!(event, LinuxEvdevInputEvent::Key(_)) {
+            self.key_frames += 1;
+        }
+        Ok(())
+    }
 }
 
 /// A listener bound by L0 before a DVM is started.
@@ -930,39 +1247,124 @@ impl HostControlListener {
         self.probe_connection(&mut connection)
     }
 
-    /// Request one Linux evdev key press after the caller has injected the
-    /// matching test key into the DVM. The callback runs only after the
-    /// authenticated DVM has accepted the bounded request.
-    pub fn keyboard_probe_once<F>(
+    /// Relay Linux evdev keyboard and pointer events from one authenticated
+    /// DVM into a host-owned RustOS virtual input endpoint.
+    ///
+    /// The DVM chooses neither the destination nor the wire format.  L0 sends
+    /// a fresh session frame, validates every event before assigning its own
+    /// monotonic sequence number, and fails closed on malformed stream data.
+    pub fn relay_input_once(
         &self,
         timeout: Duration,
-        inject_test_key: F,
-    ) -> Result<KeyboardProbeResult>
-    where
-        F: FnOnce() -> Result<()>,
-    {
+        sink: &mut impl RustosInputSink,
+    ) -> Result<InputRelayResult> {
+        self.relay_input_once_with_ready(timeout, sink, |_| Ok(()))
+    }
+
+    /// Like [`Self::relay_input_once`], but reports the verified DVM endpoint
+    /// after the RustOS relay session is installed and before waiting for the
+    /// first human input event.  KVM smoke uses this to prove endpoint setup
+    /// without reintroducing synthetic QMP input.
+    pub fn relay_input_once_with_ready(
+        &self,
+        timeout: Duration,
+        sink: &mut impl RustosInputSink,
+        on_ready: impl FnOnce(&ProbeResult) -> Result<()>,
+    ) -> Result<InputRelayResult> {
         let mut connection = self.accept_authenticated(timeout)?;
         let probe = self.probe_connection(&mut connection)?;
-        let event = request_after_ready(&mut connection, 3, "keyboard-event", inject_test_key)?;
-        if !has_exact_fields(&event, &["id", "op", "status", "type", "code", "value"])
-            || event.get("status") != Some(&"ok".to_owned())
-            || event.get("type") != Some(&"key".to_owned())
-            || event.get("value") != Some(&"1".to_owned())
+        let ready = request(&mut connection, 3, "input-stream")?;
+        if !has_exact_fields(
+            &ready,
+            &["id", "op", "status", "format", "keyboard", "pointer"],
+        ) || ready.get("status") != Some(&"ready".to_owned())
+            || ready.get("format") != Some(&"linux-evdev-v2".to_owned())
+            || !valid_evdev_endpoint(ready.get("keyboard"))
+            || !valid_evdev_endpoint(ready.get("pointer"))
         {
-            bail!("Linux DVM keyboard probe returned an invalid key event");
+            bail!("Linux DVM did not acknowledge input stream readiness");
         }
-        let linux_key_code = event
-            .get("code")
-            .ok_or_else(|| anyhow!("Linux DVM keyboard probe omitted key code"))?
-            .parse::<u16>()
-            .context("invalid Linux DVM keyboard key code")?;
-        if linux_key_code == 0 {
-            bail!("Linux DVM keyboard probe reported reserved key code zero");
+
+        let epoch = new_input_epoch();
+        sink.send_input_frame(&RustosInputFrame::session_start(epoch)?)?;
+        // Endpoint setup has a deadline, but a live input device may stay idle
+        // indefinitely. A disconnect is still reported as a relay failure after
+        // L0 emits releases and a session-end marker to prevent stuck input.
+        configure_socket_timeout(&connection, None)?;
+        if let Err(error) = on_ready(&probe) {
+            let _ = sink.send_input_frame(&RustosInputFrame::session_end(epoch, 1)?);
+            return Err(error);
         }
-        Ok(KeyboardProbeResult {
-            probe,
-            event: KeyboardEvent { linux_key_code },
-        })
+        let mut next_sequence = 1_u32;
+        let mut forwarded_events = 0_u64;
+        let mut pressed_keys = BTreeSet::new();
+        let mut pointer_buttons = 0_u8;
+        let mut rate = InputRelayRate::new();
+        let relay_result = loop {
+            if next_sequence > INPUT_RELAY_MAX_SEQUENCE {
+                break Err(anyhow!(
+                    "RustOS input relay sequence budget exhausted; reconnect DVM"
+                ));
+            }
+            let message = match read_message(&mut connection).and_then(|raw| parse_message(&raw)) {
+                Ok(message) => message,
+                Err(error) => break Err(error),
+            };
+            let event = match parse_linux_evdev_input_event(&message, 3, "input-stream") {
+                Ok(event) => event,
+                Err(error) => break Err(error),
+            };
+            if let Err(error) = rate.admit(event) {
+                break Err(error);
+            }
+            let frame = match event {
+                LinuxEvdevInputEvent::Key(event) => {
+                    if event.value == 0 {
+                        pressed_keys.remove(&event.code);
+                    } else if event.value == 1 {
+                        pressed_keys.insert(event.code);
+                    }
+                    RustosInputFrame::linux_evdev_key(epoch, next_sequence, event.code, event.value)
+                }
+                LinuxEvdevInputEvent::Pointer(event) => {
+                    pointer_buttons = event.buttons;
+                    RustosInputFrame::linux_evdev_pointer(
+                        epoch,
+                        next_sequence,
+                        event.dx,
+                        event.dy,
+                        event.wheel_vertical,
+                        event.wheel_horizontal,
+                        event.buttons,
+                    )
+                }
+            };
+            let frame = match frame.and_then(|frame| {
+                sink.send_input_frame(&frame)?;
+                Ok(frame)
+            }) {
+                Ok(frame) => frame,
+                Err(error) => break Err(error),
+            };
+            let _ = frame;
+            forwarded_events = forwarded_events.saturating_add(1);
+            next_sequence += 1;
+        };
+
+        let cleanup = send_input_cleanup(
+            sink,
+            epoch,
+            &mut next_sequence,
+            &pressed_keys,
+            pointer_buttons,
+        );
+        match (relay_result, cleanup) {
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(cleanup_error)) => Err(error).context(format!(
+                "RustOS input relay cleanup failed: {cleanup_error:#}"
+            )),
+            (Ok(()), _) => unreachable!("input relay is a continuous stream"),
+        }
     }
 
     fn accept_authenticated(&self, timeout: Duration) -> Result<std::fs::File> {
@@ -994,7 +1396,7 @@ impl HostControlListener {
                 .context("accept Linux DVM vsock connection");
         }
         let mut connection = unsafe { std::fs::File::from_raw_fd(connection) };
-        configure_socket_timeout(&connection, timeout)?;
+        configure_socket_timeout(&connection, Some(timeout))?;
         if peer.family != AF_VSOCK as libc::sa_family_t || peer.cid != self.expected_dvm_cid {
             bail!(
                 "rejected DVM vsock peer cid={} expected={}",
@@ -1034,6 +1436,174 @@ impl HostControlListener {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LinuxEvdevKeyEvent {
+    code: u16,
+    value: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LinuxEvdevPointerEvent {
+    dx: i16,
+    dy: i16,
+    wheel_vertical: i16,
+    wheel_horizontal: i16,
+    buttons: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LinuxEvdevInputEvent {
+    Key(LinuxEvdevKeyEvent),
+    Pointer(LinuxEvdevPointerEvent),
+}
+
+fn parse_linux_evdev_input_event(
+    message: &Message,
+    id: u32,
+    operation: &str,
+) -> Result<LinuxEvdevInputEvent> {
+    if message.kind != "EVENT"
+        || message.fields.get("id") != Some(&id.to_string())
+        || message.fields.get("op") != Some(&operation.to_owned())
+    {
+        bail!("invalid Linux DVM input stream event");
+    }
+    match message.fields.get("type").map(String::as_str) {
+        Some("key") => parse_linux_evdev_key_event(message),
+        Some("pointer") => parse_linux_evdev_pointer_event(message),
+        _ => bail!("rejected unknown Linux DVM input event type"),
+    }
+}
+
+fn parse_linux_evdev_key_event(message: &Message) -> Result<LinuxEvdevInputEvent> {
+    if message.kind != "EVENT"
+        || !has_exact_fields(&message.fields, &["id", "op", "type", "code", "value"])
+        || message.fields.get("type") != Some(&"key".to_owned())
+    {
+        bail!("invalid Linux DVM input stream event");
+    }
+    let code = message
+        .fields
+        .get("code")
+        .ok_or_else(|| anyhow!("Linux DVM input event omitted key code"))?
+        .parse::<u16>()
+        .context("invalid Linux DVM input key code")?;
+    let value = message
+        .fields
+        .get("value")
+        .ok_or_else(|| anyhow!("Linux DVM input event omitted key value"))?
+        .parse::<u8>()
+        .context("invalid Linux DVM input key value")?;
+    if code == 0 || code > LINUX_EVDEV_KEY_MAX || value > 2 {
+        bail!("rejected out-of-range Linux DVM key event code={code} value={value}");
+    }
+    Ok(LinuxEvdevInputEvent::Key(LinuxEvdevKeyEvent {
+        code,
+        value,
+    }))
+}
+
+fn parse_linux_evdev_pointer_event(message: &Message) -> Result<LinuxEvdevInputEvent> {
+    if !has_exact_fields(
+        &message.fields,
+        &[
+            "id", "op", "type", "dx", "dy", "wheel-v", "wheel-h", "buttons",
+        ],
+    ) {
+        bail!("invalid Linux DVM pointer event fields");
+    }
+    let parse_axis = |field: &str| -> Result<i16> {
+        message
+            .fields
+            .get(field)
+            .ok_or_else(|| anyhow!("Linux DVM pointer event omitted {field}"))?
+            .parse::<i16>()
+            .with_context(|| format!("invalid Linux DVM pointer {field}"))
+    };
+    let buttons = message
+        .fields
+        .get("buttons")
+        .ok_or_else(|| anyhow!("Linux DVM pointer event omitted buttons"))?
+        .parse::<u8>()
+        .context("invalid Linux DVM pointer buttons")?;
+    if buttons & !RUSTOS_POINTER_BUTTON_MASK != 0 {
+        bail!("rejected Linux DVM pointer buttons {buttons:#x}");
+    }
+    Ok(LinuxEvdevInputEvent::Pointer(LinuxEvdevPointerEvent {
+        dx: parse_axis("dx")?,
+        dy: parse_axis("dy")?,
+        wheel_vertical: parse_axis("wheel-v")?,
+        wheel_horizontal: parse_axis("wheel-h")?,
+        buttons,
+    }))
+}
+
+fn valid_evdev_endpoint(value: Option<&String>) -> bool {
+    value.is_some_and(|value| {
+        value.strip_prefix("event").is_some_and(|index| {
+            !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    })
+}
+
+fn send_input_cleanup(
+    sink: &mut impl RustosInputSink,
+    epoch: u32,
+    next_sequence: &mut u32,
+    pressed_keys: &BTreeSet<u16>,
+    pointer_buttons: u8,
+) -> Result<()> {
+    for &code in pressed_keys {
+        send_input_frame_with_sequence(sink, next_sequence, |sequence| {
+            RustosInputFrame::linux_evdev_key(epoch, sequence, code, 0)
+        })?;
+    }
+    if pointer_buttons != 0 {
+        send_input_frame_with_sequence(sink, next_sequence, |sequence| {
+            RustosInputFrame::linux_evdev_pointer(epoch, sequence, 0, 0, 0, 0, 0)
+        })?;
+    }
+    send_input_frame_with_sequence(sink, next_sequence, |sequence| {
+        RustosInputFrame::session_end(epoch, sequence)
+    })
+}
+
+fn send_input_frame_with_sequence(
+    sink: &mut impl RustosInputSink,
+    next_sequence: &mut u32,
+    make_frame: impl FnOnce(u32) -> Result<RustosInputFrame>,
+) -> Result<()> {
+    if *next_sequence == 0 || *next_sequence > u32::MAX - 1 {
+        bail!("RustOS input relay has no sequence reserved for cleanup");
+    }
+    let frame = make_frame(*next_sequence)?;
+    sink.send_input_frame(&frame)?;
+    *next_sequence += 1;
+    Ok(())
+}
+
+fn new_input_epoch() -> u32 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0);
+    let mixed = nanos ^ u64::from(std::process::id()).rotate_left(17);
+    let epoch = (mixed ^ (mixed >> 32)) as u32;
+    epoch.max(1)
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0_u32;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg() & 0xedb8_8320;
+            crc = (crc >> 1) ^ mask;
+        }
+    }
+    !crc
+}
+
 fn required<'a>(
     values: &'a BTreeMap<&str, &str>,
     key: &str,
@@ -1053,7 +1623,8 @@ fn required_value<'a>(values: &'a BTreeMap<&str, &str>, key: &str, label: &str) 
         .ok_or_else(|| anyhow!("missing {label} key {key}"))
 }
 
-fn configure_socket_timeout(connection: &std::fs::File, timeout: Duration) -> Result<()> {
+fn configure_socket_timeout(connection: &std::fs::File, timeout: Option<Duration>) -> Result<()> {
+    let timeout = timeout.unwrap_or_default();
     let timeout = libc::timeval {
         tv_sec: timeout.as_secs().min(libc::time_t::MAX as u64) as libc::time_t,
         tv_usec: timeout.subsec_micros().into(),
@@ -1090,45 +1661,6 @@ fn request(
         bail!("mismatched DVM control response");
     }
     Ok(response.fields)
-}
-
-fn request_after_ready<F>(
-    connection: &mut std::fs::File,
-    id: u32,
-    operation: &str,
-    inject_test_key: F,
-) -> Result<BTreeMap<String, String>>
-where
-    F: FnOnce() -> Result<()>,
-{
-    write_message(connection, &format!("REQUEST\nid={id}\nop={operation}"))?;
-    let ready = parse_message(&read_message(connection)?)?;
-    validate_keyboard_ready(&ready, id, operation)?;
-    inject_test_key()?;
-    let response = parse_message(&read_message(connection)?)?;
-    if response.kind != "RESPONSE"
-        || response.fields.get("id") != Some(&id.to_string())
-        || response.fields.get("op") != Some(&operation.to_owned())
-    {
-        bail!("mismatched DVM control response");
-    }
-    Ok(response.fields)
-}
-
-fn validate_keyboard_ready(message: &Message, id: u32, operation: &str) -> Result<()> {
-    if message.kind != "READY"
-        || !has_exact_fields(&message.fields, &["id", "op", "status"])
-        || message.fields.get("id") != Some(&id.to_string())
-        || message.fields.get("op") != Some(&operation.to_owned())
-        || message.fields.get("status") != Some(&"ready".to_owned())
-    {
-        bail!(
-            "Linux DVM did not acknowledge keyboard event readiness: kind={} fields={:?}",
-            message.kind,
-            message.fields
-        );
-    }
-    Ok(())
 }
 
 fn welcome_message(contract: &ControlContract) -> String {
@@ -1239,20 +1771,22 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        ControlContract, FileLeaseStore, IommuTopology, LaunchPlan, ValidatedLease,
-        VfioLeaseRecord, VfioLeaseState, VfioOps, acquire_vfio_lease, inspect_vfio_lease,
-        parse_message, restore_vfio_lease, validate_hello, validate_keyboard_ready,
+        ControlContract, DeviceClass, DeviceTransport, DriverDomainPolicy, FileLeaseStore,
+        InputRelayRate, IommuTopology, LaunchPlan, LinuxEvdevInputEvent, LinuxEvdevKeyEvent,
+        RustosInputFrame, ValidatedLease, VfioLeaseRecord, VfioLeaseState, VfioOps,
+        acquire_vfio_lease, inspect_vfio_lease, parse_linux_evdev_input_event, parse_message,
+        restore_vfio_lease, validate_hello,
     };
     use anyhow::Result;
 
-    const VALID: &str = "CONTROL_SCHEMA=1\nCONTROL_PROTOCOL=agent-v1\nCONTROL_STATE=control\nCONTROL_TRANSPORT=kvm-vsock\nCONTROL_AUTHENTICATION=kvm-host-bound\nCONTROL_CAPABILITIES=health,device-inventory,keyboard-events\n";
+    const VALID: &str = "CONTROL_SCHEMA=1\nCONTROL_PROTOCOL=agent-v1\nCONTROL_STATE=control\nCONTROL_TRANSPORT=kvm-vsock\nCONTROL_AUTHENTICATION=kvm-host-bound\nCONTROL_CAPABILITIES=health,device-inventory,input-stream\n";
 
     #[test]
     fn control_contract_is_strict() {
         let contract = ControlContract::parse(VALID, "test").unwrap();
         assert_eq!(
             contract.capabilities,
-            ["health", "device-inventory", "keyboard-events"]
+            ["health", "device-inventory", "input-stream"]
         );
         assert!(ControlContract::parse(&VALID.replace("control", "pretransport"), "test").is_err());
         assert!(
@@ -1264,11 +1798,11 @@ mod tests {
     #[test]
     fn hello_is_bound_to_the_exact_control_contract() {
         let contract = ControlContract::parse(VALID, "test").unwrap();
-        let hello = "HELLO\nrole=linux-driver-domain\nprotocol=agent-v1\nstate=control\ntransport=kvm-vsock\nauthentication=kvm-host-bound\ncapabilities=health,device-inventory,keyboard-events";
+        let hello = "HELLO\nrole=linux-driver-domain\nprotocol=agent-v1\nstate=control\ntransport=kvm-vsock\nauthentication=kvm-host-bound\ncapabilities=health,device-inventory,input-stream";
         assert!(validate_hello(hello, &contract).is_ok());
         assert!(
             validate_hello(
-                &hello.replace("health,device-inventory,keyboard-events", "health"),
+                &hello.replace("health,device-inventory,input-stream", "health"),
                 &contract
             )
             .is_err()
@@ -1284,17 +1818,74 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_probe_requires_exact_ready_acknowledgement() {
-        let ready = parse_message("READY\nid=3\nop=keyboard-event\nstatus=ready").unwrap();
-        assert!(validate_keyboard_ready(&ready, 3, "keyboard-event").is_ok());
+    fn input_stream_requires_bounded_exact_key_and_pointer_events() {
+        let event =
+            parse_message("EVENT\nid=3\nop=input-stream\ntype=key\ncode=30\nvalue=1").unwrap();
+        assert_eq!(
+            parse_linux_evdev_input_event(&event, 3, "input-stream").unwrap(),
+            super::LinuxEvdevInputEvent::Key(super::LinuxEvdevKeyEvent { code: 30, value: 1 })
+        );
+        let malformed =
+            parse_message("EVENT\nid=3\nop=input-stream\ntype=key\ncode=768\nvalue=1").unwrap();
+        assert!(parse_linux_evdev_input_event(&malformed, 3, "input-stream").is_err());
+        let pointer = parse_message(
+            "EVENT\nid=3\nop=input-stream\ntype=pointer\ndx=-4\ndy=2\nwheel-v=1\nwheel-h=0\nbuttons=3",
+        )
+        .unwrap();
+        assert!(parse_linux_evdev_input_event(&pointer, 3, "input-stream").is_ok());
+        let invalid_buttons = parse_message(
+            "EVENT\nid=3\nop=input-stream\ntype=pointer\ndx=0\ndy=0\nwheel-v=0\nwheel-h=0\nbuttons=32",
+        )
+        .unwrap();
+        assert!(parse_linux_evdev_input_event(&invalid_buttons, 3, "input-stream").is_err());
+    }
 
-        let wrong_status =
-            parse_message("READY\nid=3\nop=keyboard-event\nstatus=accepted").unwrap();
-        assert!(validate_keyboard_ready(&wrong_status, 3, "keyboard-event").is_err());
+    #[test]
+    fn input_relay_frames_are_bounded_and_distinct_by_sequence() {
+        let session = RustosInputFrame::session_start(7).unwrap();
+        let first = RustosInputFrame::linux_evdev_key(7, 1, 30, 1).unwrap();
+        let second = RustosInputFrame::linux_evdev_key(7, 2, 30, 0).unwrap();
+        let pointer = RustosInputFrame::linux_evdev_pointer(7, 3, -4, 2, 1, 0, 3).unwrap();
+        let end = RustosInputFrame::session_end(7, 4).unwrap();
+        assert_ne!(session.as_bytes(), first.as_bytes());
+        assert_ne!(first.as_bytes(), second.as_bytes());
+        assert_ne!(second.as_bytes(), pointer.as_bytes());
+        assert_ne!(pointer.as_bytes(), end.as_bytes());
+        assert!(RustosInputFrame::linux_evdev_key(7, 1, 0, 1).is_err());
+        assert!(RustosInputFrame::linux_evdev_key(7, 1, 30, 3).is_err());
+        assert!(RustosInputFrame::linux_evdev_pointer(7, 3, 0, 0, 0, 0, 0x20).is_err());
+    }
 
-        let extra =
-            parse_message("READY\nid=3\nop=keyboard-event\nstatus=ready\nextra=no").unwrap();
-        assert!(validate_keyboard_ready(&extra, 3, "keyboard-event").is_err());
+    #[test]
+    fn input_relay_rate_guard_rejects_keyboard_floods() {
+        let mut rate = InputRelayRate::new();
+        let key = LinuxEvdevInputEvent::Key(LinuxEvdevKeyEvent { code: 30, value: 1 });
+        for _ in 0..super::INPUT_RELAY_MAX_KEYS_PER_SECOND {
+            assert!(rate.admit(key).is_ok());
+        }
+        assert!(rate.admit(key).is_err());
+    }
+
+    #[test]
+    fn driver_domain_policy_names_one_explicit_transport_per_class() {
+        let policy = DriverDomainPolicy::parse(
+            "DRIVER_DOMAIN_POLICY_SCHEMA=1\nDOMAIN_ID=linux-dvm-net0\nINPUT_TRANSPORT=rdi2-com2\nNETWORK_TRANSPORT=disabled\nBLOCK_TRANSPORT=disabled\nDISPLAY_TRANSPORT=disabled\n",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(
+            policy.transport_for(DeviceClass::Input),
+            DeviceTransport::Rdi2Com2
+        );
+        assert_eq!(
+            policy.transport_for(DeviceClass::Network),
+            DeviceTransport::Disabled
+        );
+        assert!(DriverDomainPolicy::parse(
+            "DRIVER_DOMAIN_POLICY_SCHEMA=1\nDOMAIN_ID=linux-dvm-net0\nINPUT_TRANSPORT=rdi2-com2\nNETWORK_TRANSPORT=rdi2-com2\nBLOCK_TRANSPORT=disabled\nDISPLAY_TRANSPORT=disabled\n",
+            "test",
+        )
+        .is_err());
     }
 
     #[test]

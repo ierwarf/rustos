@@ -1,8 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
-use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -12,8 +10,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use fs_err as fs;
 use rustos_driver_domain_host::{
-    ControlContract as HostControlContract, DEFAULT_CONTROL_PORT, HostControlListener,
-    KeyboardProbeResult,
+    ControlContract as HostControlContract, DEFAULT_CONTROL_PORT, HostControlListener, ProbeResult,
+    UnixInputSink,
 };
 
 use crate::Result;
@@ -24,19 +22,17 @@ const DVM_KERNEL: &str = "rustos-linux-dvm-x86_64.bzImage";
 const DVM_ROOTFS: &str = "rustos-linux-dvm-x86_64.rootfs.cpio.xz";
 const DVM_CONFIG: &str = "rustos-linux-dvm-x86_64.config";
 const DVM_MANIFEST: &str = "rustos-linux-dvm-x86_64.manifest";
-const DVM_MANIFEST_SCHEMA: &str = "2";
+const DVM_MANIFEST_SCHEMA: &str = "4";
 const DVM_CONTROL_CONTRACT: &str = "board/overlay/usr/share/rustos-dvm/control-plane-v1.env";
 const DVM_CONTROL_PROTOCOL: &str = "agent-v1";
 const DVM_CONTROL_STATE: &str = "control";
 const DVM_CONTROL_TRANSPORT: &str = "kvm-vsock";
 const DVM_CONTROL_AUTHENTICATION: &str = "kvm-host-bound";
-const DVM_CONTROL_CAPABILITIES: &str = "health,device-inventory,keyboard-events";
+const DVM_CONTROL_CAPABILITIES: &str = "health,device-inventory,input-stream";
 const RUSTOS_BOOT_MARKER: &str = "rootd: core services ready, spawning initd via loaderd";
 const DVM_GUEST_CID: u32 = 4;
 const VHOST_VSOCK_DEVICE: &str = "/dev/vhost-vsock";
 const MAX_SMOKE_TIMEOUT: u64 = 30;
-const DVM_SMOKE_KEY_A: u16 = 30;
-const QMP_LINE_LIMIT: usize = 8 * 1024;
 
 #[derive(Debug)]
 struct DvmArtifacts {
@@ -69,8 +65,7 @@ struct KvmLayout {
     dvm_serial_log: PathBuf,
     rustos_stderr_log: PathBuf,
     dvm_stderr_log: PathBuf,
-    rustos_qmp: PathBuf,
-    dvm_qmp: PathBuf,
+    rustos_input_socket: PathBuf,
 }
 
 #[derive(Debug)]
@@ -132,35 +127,28 @@ where
 
     require_vhost_vsock()?;
     let deadline = Instant::now() + options.timeout;
-    let control_probe = start_dvm_keyboard_probe(config, options.timeout, layout.dvm_qmp.clone())?;
+    let control_relay =
+        start_dvm_input_relay(config, options.timeout, layout.rustos_input_socket.clone())?;
     let (mut rustos, mut dvm) = spawn_guests(&qemu, config, &artifacts, &layout)?;
-    let result: Result<KeyboardProbeResult> = (|| {
-        let keyboard = wait_for_parallel_boot(
+    let result: Result<ProbeResult> = (|| {
+        let probe = wait_for_parallel_boot(
             &mut rustos,
             &mut dvm,
             &layout,
             &options,
             deadline,
-            &control_probe,
+            &control_relay,
         )?;
-        let before_injection = fs::read_to_string(&layout.debugcon_log)?.len();
-        qmp_send_test_key(&layout.rustos_qmp, deadline)?;
-        wait_for_rustos_keyboard_consumption(
-            &mut rustos,
-            &layout.rustos_stderr_log,
-            &layout.debugcon_log,
-            before_injection,
-            deadline,
-        )?;
-        Ok(keyboard)
+        Ok(probe)
     })();
     stop_guest(&mut rustos);
     stop_guest(&mut dvm);
-    let keyboard = result?;
+    let probe = result?;
     println!(
-        "xtask: parallel KVM boot passed (RustOS + Linux DVM); control={} relayed synthetic Linux evdev key={} to RustOS inputd through L0 QMP only",
+        "xtask: parallel KVM boot passed (RustOS + Linux DVM); control={} established authenticated L0 input relay (DVM cid={}, inventory={}) without QMP",
         artifacts.control.control_plane(),
-        keyboard.event.linux_key_code,
+        probe.peer_cid,
+        probe.inventory_count,
     );
     Ok(())
 }
@@ -170,9 +158,9 @@ pub(crate) fn print_kvm_smoke_help() {
         "\
 usage: cargo xtask kvm-smoke [options]
 
-Boots the Linux DVM and RustOS concurrently with QEMU/KVM. This verifies a
-host-authenticated Linux-DVM vsock health/inventory control probe, not a
-production driver-domain data plane.
+Boots the Linux DVM and RustOS concurrently with QEMU/KVM. This verifies the
+host-authenticated Linux-DVM input relay endpoint and RustOS's dedicated
+framed virtual input transport. It does not synthesize QMP input.
 
 options:
   --timeout <seconds>  wait for readiness markers (1..={MAX_SMOKE_TIMEOUT}, default 30)
@@ -181,8 +169,9 @@ options:
   -h, --help           show this help
 
 The default proof requires RustOS to reach init handoff and the L0-style host
-control listener to complete an authenticated Linux-DVM health/inventory probe.
-RustOS still has no vsock endpoint or device data plane.
+broker to complete an authenticated Linux-DVM health/inventory/input-stream
+handshake. A real key requires a physical input source assigned to the DVM;
+this smoke command does not fabricate one.
 "
     );
 }
@@ -315,7 +304,7 @@ fn validate_manifest_values(values: &BTreeMap<String, String>) -> Result<DvmCont
     require_manifest_value(values, "id", "rustos-linux-dvm-x86_64")?;
     require_manifest_value(values, "architecture", "x86_64")?;
     require_manifest_value(values, "boot", "linux-bzimage+cpio-xz")?;
-    require_manifest_value(values, "data-plane", "dvm-local-virtio")?;
+    require_manifest_value(values, "data-plane", "hostd-rdi2-input")?;
     for key in [
         "kernel_sha256",
         "rootfs_sha256",
@@ -503,21 +492,22 @@ fn prepare_layout(config: &Config) -> Result<KvmLayout> {
     let dvm_serial_log = run_dir.join("linux-dvm-serial.log");
     let rustos_stderr_log = run_dir.join("rustos-qemu.stderr.log");
     let dvm_stderr_log = run_dir.join("linux-dvm-qemu.stderr.log");
-    let rustos_qmp = run_dir.join("rustos.qmp");
-    let dvm_qmp = run_dir.join("linux-dvm.qmp");
+    let rustos_input_socket = run_dir.join("rustos-dvm-input.sock");
     fs::write(&debugcon_log, "")?;
     fs::write(&rustos_serial_log, "")?;
     fs::write(&dvm_serial_log, "")?;
     fs::write(&rustos_stderr_log, "")?;
     fs::write(&dvm_stderr_log, "")?;
-    for socket in [&rustos_qmp, &dvm_qmp] {
-        match fs::remove_file(socket) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("remove stale QMP socket {}", socket.display()));
-            }
+    match fs::remove_file(&rustos_input_socket) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "remove stale RustOS DVM input socket {}",
+                    rustos_input_socket.display()
+                )
+            });
         }
     }
 
@@ -529,8 +519,7 @@ fn prepare_layout(config: &Config) -> Result<KvmLayout> {
         dvm_serial_log,
         rustos_stderr_log,
         dvm_stderr_log,
-        rustos_qmp,
-        dvm_qmp,
+        rustos_input_socket,
     })
 }
 
@@ -556,19 +545,28 @@ fn require_vhost_vsock() -> Result<()> {
     Ok(())
 }
 
-fn start_dvm_keyboard_probe(
+fn start_dvm_input_relay(
     config: &Config,
     timeout: Duration,
-    dvm_qmp: PathBuf,
-) -> Result<Receiver<Result<KeyboardProbeResult>>> {
+    rustos_input_socket: PathBuf,
+) -> Result<Receiver<Result<ProbeResult>>> {
     let contract_path = dvm_dir(config).join(DVM_CONTROL_CONTRACT);
     let contract = HostControlContract::from_env_file(&contract_path)?;
     let listener = HostControlListener::bind(DVM_GUEST_CID, DEFAULT_CONTROL_PORT, contract)?;
     let (sender, receiver) = mpsc::sync_channel(1);
     thread::spawn(move || {
-        let deadline = Instant::now() + timeout;
-        let _ = sender
-            .send(listener.keyboard_probe_once(timeout, || qmp_send_test_key(&dvm_qmp, deadline)));
+        let sender_ready = sender.clone();
+        let result = (|| {
+            let mut sink = UnixInputSink::connect(&rustos_input_socket, timeout)?;
+            listener.relay_input_once_with_ready(timeout, &mut sink, |probe| {
+                sender_ready
+                    .send(Ok(probe.clone()))
+                    .context("report Linux DVM input relay readiness")
+            })
+        })();
+        if let Err(error) = result {
+            let _ = sender.try_send(Err(error));
+        }
     });
     Ok(receiver)
 }
@@ -600,7 +598,19 @@ fn spawn_guests(
             "file={},format=raw,if=ide",
             layout.runtime_disk.display()
         ))
-        .args(["-display", "none", "-no-reboot", "-no-shutdown"])
+        // Keep the smoke headless while exposing the same modern virtio-gpu
+        // PCI function used by the interactive KVM profile. RustOS's display
+        // provider still owns initialization and may fail closed to bootfb.
+        .args([
+            "-display",
+            "none",
+            "-vga",
+            "none",
+            "-no-reboot",
+            "-no-shutdown",
+        ])
+        .arg("-device")
+        .arg("virtio-gpu-pci,id=rustos-virtio-gpu,xres=1280,yres=800")
         .arg("-chardev")
         .arg(format!(
             "file,id=debugcon,path={}",
@@ -613,11 +623,14 @@ fn spawn_guests(
             "file,id=serial,path={}",
             layout.rustos_serial_log.display()
         ))
-        .args(["-serial", "chardev:serial"]);
-    rustos_command.arg("-qmp").arg(format!(
-        "unix:{},server=on,wait=off",
-        layout.rustos_qmp.display()
-    ));
+        .args(["-serial", "chardev:serial"])
+        .arg("-chardev")
+        .arg(format!(
+            "socket,id=dvm-input,path={},server=on,wait=off",
+            layout.rustos_input_socket.display()
+        ))
+        .arg("-device")
+        .arg("isa-serial,chardev=dvm-input,index=1");
     append_fault_injection(config, &mut rustos_command);
     rustos_command
         .stdout(Stdio::null())
@@ -660,15 +673,12 @@ fn spawn_guests(
             layout.dvm_serial_log.display()
         ))
         .args(["-serial", "chardev:serial"])
-        .arg("-qmp")
-        .arg(format!(
-            "unix:{},server=on,wait=off",
-            layout.dvm_qmp.display()
-        ))
         .arg("-device")
         .arg(format!("vhost-vsock-pci,guest-cid={DVM_GUEST_CID}"))
         .arg("-device")
         .arg("virtio-keyboard-pci,id=dvm-keyboard")
+        .arg("-device")
+        .arg("virtio-mouse-pci,id=dvm-pointer")
         .stdout(Stdio::null())
         .stderr(Stdio::from(std::fs::File::create(&layout.dvm_stderr_log)?));
     let dvm = match dvm_command.spawn() {
@@ -700,8 +710,8 @@ fn wait_for_parallel_boot(
     layout: &KvmLayout,
     options: &SmokeOptions,
     deadline: Instant,
-    control_probe: &Receiver<Result<KeyboardProbeResult>>,
-) -> Result<KeyboardProbeResult> {
+    control_relay: &Receiver<Result<ProbeResult>>,
+) -> Result<ProbeResult> {
     let mut control_ready = None;
     loop {
         check_guest_running(rustos, "RustOS", &layout.rustos_stderr_log)?;
@@ -712,22 +722,16 @@ fn wait_for_parallel_boot(
             .iter()
             .all(|marker| rustos_log.contains(marker));
         if control_ready.is_none() {
-            match control_probe.try_recv() {
+            match control_relay.try_recv() {
                 Ok(Ok(probe)) => {
-                    if probe.event.linux_key_code != DVM_SMOKE_KEY_A {
-                        bail!(
-                            "Linux DVM keyboard probe received code={} expected={DVM_SMOKE_KEY_A}",
-                            probe.event.linux_key_code
-                        );
-                    }
                     control_ready = Some(probe);
                 }
                 Ok(Err(error)) => {
-                    bail!("Linux DVM keyboard control probe failed: {error:#}");
+                    bail!("Linux DVM input relay failed before readiness: {error:#}");
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    bail!("Linux DVM host control probe terminated without a result")
+                    bail!("Linux DVM host input relay terminated without a readiness result")
                 }
             }
         }
@@ -742,7 +746,7 @@ fn wait_for_parallel_boot(
                 .cloned()
                 .collect::<Vec<_>>();
             bail!(
-                "KVM parallel boot did not reach readiness within {:?}; RustOS missing={:?}; host-control-pending={}; inspect {}, {}, {}, and {}",
+                "KVM parallel boot did not reach readiness within {:?}; RustOS missing={:?}; host-input-relay-pending={}; inspect {}, {}, {}, and {}",
                 options.timeout,
                 missing_rustos,
                 control_ready.is_none(),
@@ -754,135 +758,6 @@ fn wait_for_parallel_boot(
         }
         thread::sleep(Duration::from_millis(100));
     }
-}
-
-fn qmp_send_test_key(path: &Path, deadline: Instant) -> Result<()> {
-    let stream = connect_qmp(path, deadline)?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(1)))
-        .with_context(|| format!("set QMP read timeout for {}", path.display()))?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(1)))
-        .with_context(|| format!("set QMP write timeout for {}", path.display()))?;
-    let reader_stream = stream
-        .try_clone()
-        .with_context(|| format!("clone QMP stream {}", path.display()))?;
-    let mut reader = BufReader::new(reader_stream);
-    let mut writer = stream;
-    let greeting = qmp_read_line(&mut reader, path)?;
-    if !greeting.contains("\"QMP\"") {
-        bail!("invalid QMP greeting from {}", path.display());
-    }
-    qmp_execute(
-        &mut writer,
-        &mut reader,
-        path,
-        r#"{"execute":"qmp_capabilities"}"#,
-    )?;
-    qmp_execute(
-        &mut writer,
-        &mut reader,
-        path,
-        r#"{"execute":"input-send-event","arguments":{"events":[{"type":"key","data":{"down":true,"key":{"type":"qcode","data":"a"}}},{"type":"key","data":{"down":false,"key":{"type":"qcode","data":"a"}}}]}}"#,
-    )
-}
-
-fn connect_qmp(path: &Path, deadline: Instant) -> Result<UnixStream> {
-    loop {
-        match UnixStream::connect(path) {
-            Ok(stream) => return Ok(stream),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound
-                        | std::io::ErrorKind::ConnectionRefused
-                        | std::io::ErrorKind::AddrNotAvailable
-                ) && Instant::now() < deadline =>
-            {
-                thread::sleep(Duration::from_millis(25));
-            }
-            Err(error) => {
-                return Err(error).with_context(|| format!("connect QMP {}", path.display()));
-            }
-        }
-        if Instant::now() >= deadline {
-            bail!("timed out waiting for QMP {}", path.display());
-        }
-    }
-}
-
-fn qmp_execute(
-    writer: &mut UnixStream,
-    reader: &mut BufReader<UnixStream>,
-    path: &Path,
-    command: &str,
-) -> Result<()> {
-    writer
-        .write_all(command.as_bytes())
-        .with_context(|| format!("write QMP command to {}", path.display()))?;
-    writer
-        .write_all(b"\n")
-        .with_context(|| format!("terminate QMP command to {}", path.display()))?;
-    writer
-        .flush()
-        .with_context(|| format!("flush QMP command to {}", path.display()))?;
-    for _ in 0..4 {
-        let response = qmp_read_line(reader, path)?;
-        if response.contains("\"return\"") {
-            return Ok(());
-        }
-        if response.contains("\"error\"") {
-            bail!("QMP command rejected by {}: {response}", path.display());
-        }
-    }
-    bail!("QMP {} returned no command response", path.display());
-}
-
-fn qmp_read_line(reader: &mut BufReader<UnixStream>, path: &Path) -> Result<String> {
-    let mut line = String::new();
-    let length = reader
-        .read_line(&mut line)
-        .with_context(|| format!("read QMP response from {}", path.display()))?;
-    if length == 0 || length > QMP_LINE_LIMIT {
-        bail!("invalid QMP response length from {}", path.display());
-    }
-    Ok(line)
-}
-
-fn wait_for_rustos_keyboard_consumption(
-    rustos: &mut Child,
-    rustos_stderr_log: &Path,
-    debugcon_log: &Path,
-    start_offset: usize,
-    deadline: Instant,
-) -> Result<()> {
-    loop {
-        check_guest_running(rustos, "RustOS", rustos_stderr_log)?;
-        let log = fs::read_to_string(debugcon_log)?;
-        let fresh = log.get(start_offset..).unwrap_or_default();
-        if fresh.lines().any(input_read_event_delta_is_positive) {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!(
-                "RustOS did not consume the relayed keyboard event before the KVM smoke deadline; inspect {}",
-                debugcon_log.display()
-            );
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn input_read_event_delta_is_positive(line: &str) -> bool {
-    if !line.starts_with("usb input diag ") {
-        return false;
-    }
-    line.split_whitespace().any(|field| {
-        field
-            .strip_prefix("read_events_delta=")
-            .and_then(|value| value.parse::<u64>().ok())
-            .is_some_and(|value| value > 0)
-    })
 }
 
 fn check_guest_running(guest: &mut Child, label: &str, stderr_log: &Path) -> Result<()> {
@@ -906,9 +781,9 @@ fn stop_guest(guest: &mut Child) {
 mod tests {
     use super::{
         DVM_CONTROL_AUTHENTICATION, DVM_CONTROL_CAPABILITIES, DVM_CONTROL_PROTOCOL,
-        DVM_CONTROL_STATE, DVM_CONTROL_TRANSPORT, RUSTOS_BOOT_MARKER,
-        input_read_event_delta_is_positive, is_sha256, parse_dvm_control_contract_text,
-        parse_manifest_text, parse_smoke_options, validate_manifest_values,
+        DVM_CONTROL_STATE, DVM_CONTROL_TRANSPORT, RUSTOS_BOOT_MARKER, is_sha256,
+        parse_dvm_control_contract_text, parse_manifest_text, parse_smoke_options,
+        validate_manifest_values,
     };
 
     #[test]
@@ -945,7 +820,7 @@ mod tests {
 
         let hash = "0".repeat(64);
         let manifest = format!(
-            "schema=2\nid=rustos-linux-dvm-x86_64\narchitecture=x86_64\nboot=linux-bzimage+cpio-xz\ndata-plane=dvm-local-virtio\ncontrol-plane=agent-v1-control\ncontrol-protocol=agent-v1\ncontrol-state=control\ncontrol-transport=kvm-vsock\ncontrol-authentication=kvm-host-bound\ncontrol-capabilities=health,device-inventory,keyboard-events\ncontrol-contract-sha256={hash}\nkernel_sha256={hash}\nrootfs_sha256={hash}\nconfig_sha256={hash}\nsources_lock_sha256={hash}\n"
+            "schema=4\nid=rustos-linux-dvm-x86_64\narchitecture=x86_64\nboot=linux-bzimage+cpio-xz\ndata-plane=hostd-rdi2-input\ncontrol-plane=agent-v1-control\ncontrol-protocol=agent-v1\ncontrol-state=control\ncontrol-transport=kvm-vsock\ncontrol-authentication=kvm-host-bound\ncontrol-capabilities=health,device-inventory,input-stream\ncontrol-contract-sha256={hash}\nkernel_sha256={hash}\nrootfs_sha256={hash}\nconfig_sha256={hash}\nsources_lock_sha256={hash}\n"
         );
         let values = parse_manifest_text(&manifest, "manifest").unwrap();
         assert_eq!(validate_manifest_values(&values).unwrap(), contract);
@@ -957,22 +832,9 @@ mod tests {
             "../../../driver-domains/linux/board/overlay/usr/share/rustos-dvm/control-plane-v1.env"
         );
         let invalid = contract_source.replace(
-            "CONTROL_CAPABILITIES=health,device-inventory,keyboard-events",
+            "CONTROL_CAPABILITIES=health,device-inventory,input-stream",
             "CONTROL_CAPABILITIES=health,network-rx",
         );
         assert!(parse_dvm_control_contract_text(&invalid, "invalid contract").is_err());
-    }
-
-    #[test]
-    fn input_diag_requires_a_positive_read_delta() {
-        assert!(input_read_event_delta_is_positive(
-            "usb input diag tick=1024 read_events_delta=2 queued=0"
-        ));
-        assert!(!input_read_event_delta_is_positive(
-            "usb input diag tick=1024 read_events_delta=0 queued=0"
-        ));
-        assert!(!input_read_event_delta_is_positive(
-            "heartbeat read_events_delta=2 queued=0"
-        ));
     }
 }

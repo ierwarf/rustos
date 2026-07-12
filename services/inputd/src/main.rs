@@ -18,16 +18,16 @@ use rustos_user_abi::syscall::{
     CommercialMaxProtocolResponse, INPUTD_ACCESS_EVDEV, INPUTD_ACCESS_NATIVE,
     INPUTD_HID_POLICY_DESCRIPTOR_CAPACITY, INPUTD_HID_POLICY_KIND_KEYBOARD,
     INPUTD_HID_POLICY_KIND_POINTER, INPUTD_HID_POLICY_KIND_UNKNOWN,
-    INPUTD_HID_POLICY_REPORT_CAPACITY, INPUTD_INGEST_MAX_EVENTS, INPUTD_INGRESS_FLAG_RESET_STATE,
-    INPUTD_INGRESS_KIND_EVENT, INPUTD_INGRESS_KIND_HID_KEYBOARD_REPORT,
-    INPUTD_INGRESS_KIND_HID_POINTER_REPORT, INPUTD_INGRESS_KIND_HID_RAW_REPORT,
-    INPUTD_INGRESS_KIND_KEYBOARD, INPUTD_INGRESS_KIND_POINTER_ABSOLUTE,
-    INPUTD_INGRESS_KIND_POINTER_PACKET, INPUTD_INGRESS_KIND_PS2_MOUSE_BYTE,
-    INPUTD_INGRESS_KIND_PS2_SCANCODE, INPUTD_IPC_ABI_VERSION, INPUTD_IPC_OP_AUTHORIZE_READ,
-    INPUTD_IPC_OP_DRAIN_INGEST, INPUTD_IPC_OP_PING, INPUTD_IPC_OP_READ,
-    INPUTD_IPC_OP_SET_POINTER_SURFACE, INPUTD_IPC_OP_STATS, INPUTD_READ_FLAG_NONBLOCK,
-    INPUTD_READ_PAYLOAD_CAPACITY, IPC_MAX_INLINE_BYTES, IPC_SERVICE_INPUTD,
-    InputHidKeyboardReportWire, InputHidPointerReportWire, InputHidPolicyWire,
+    INPUTD_HID_POLICY_REPORT_CAPACITY, INPUTD_INGEST_MAX_EVENTS, INPUTD_INGRESS_FLAG_DVM_SOURCE,
+    INPUTD_INGRESS_FLAG_RESET_STATE, INPUTD_INGRESS_KIND_DVM_LINUX_KEY, INPUTD_INGRESS_KIND_EVENT,
+    INPUTD_INGRESS_KIND_HID_KEYBOARD_REPORT, INPUTD_INGRESS_KIND_HID_POINTER_REPORT,
+    INPUTD_INGRESS_KIND_HID_RAW_REPORT, INPUTD_INGRESS_KIND_KEYBOARD,
+    INPUTD_INGRESS_KIND_POINTER_ABSOLUTE, INPUTD_INGRESS_KIND_POINTER_PACKET,
+    INPUTD_INGRESS_KIND_PS2_MOUSE_BYTE, INPUTD_INGRESS_KIND_PS2_SCANCODE, INPUTD_IPC_ABI_VERSION,
+    INPUTD_IPC_OP_AUTHORIZE_READ, INPUTD_IPC_OP_DRAIN_INGEST, INPUTD_IPC_OP_PING,
+    INPUTD_IPC_OP_READ, INPUTD_IPC_OP_SET_POINTER_SURFACE, INPUTD_IPC_OP_STATS,
+    INPUTD_READ_FLAG_NONBLOCK, INPUTD_READ_PAYLOAD_CAPACITY, IPC_MAX_INLINE_BYTES,
+    IPC_SERVICE_INPUTD, InputHidKeyboardReportWire, InputHidPointerReportWire, InputHidPolicyWire,
     InputIngestBrokerArgs, InputIngressWire, InputKeyboardEventWire, InputPointerAbsoluteWire,
     InputPointerPacketWire, InputStatsBrokerArgs, InputStatsWire, InputdIpcRequest,
     InputdIpcResponse, InputdPointerSurfaceRequest, InputdReadResponse, SYS_RUSTOS_DEBUG_PRINT,
@@ -83,12 +83,15 @@ struct InputQueue {
     events: VecDeque<input_evdev::InputEvent>,
     hid_keyboards: Vec<HidKeyboardState>,
     ps2_keyboard: KeyboardDriver,
+    dvm_keyboard: KeyboardDriver,
     ps2_mouse: Ps2MousePacketState,
     pointer_surface: PointerSurface,
     last_pointer_position: Option<(i32, i32)>,
     dropped_discrete: u64,
     dropped_lossy: u64,
-    pointer_buttons: u8,
+    native_pointer_buttons: u8,
+    dvm_pointer_buttons: u8,
+    published_pointer_buttons: u8,
     read_authorizations: VecDeque<InputReadAuthorization>,
 }
 
@@ -203,6 +206,30 @@ impl InputQueue {
         }
     }
 
+    /// Translate a Linux `EV_KEY` value from the DVM only in ring 3.  This
+    /// keeps layout, modifiers, lock state, and printable text identical to
+    /// the native HID/PS2 paths instead of leaking Linux codes into apps.
+    fn push_dvm_linux_key(&mut self, linux_code: u32, action: u16) {
+        let Some(code) = input_evdev::linux_key_code_to_rustos(linux_code) else {
+            return;
+        };
+        let released = match action {
+            input_evdev::INPUT_ACTION_PRESSED | input_evdev::INPUT_ACTION_REPEATED => false,
+            input_evdev::INPUT_ACTION_RELEASED => true,
+            _ => return,
+        };
+        self.dvm_keyboard.inject_key_transition(code, released);
+        while let Some(event) = self.dvm_keyboard.pop_event() {
+            self.push_keyboard_driver_event(event);
+        }
+    }
+
+    fn reset_dvm_input(&mut self) {
+        self.dvm_keyboard = KeyboardDriver::default();
+        self.dvm_pointer_buttons = 0;
+        self.publish_pointer_button_edges();
+    }
+
     fn push_ps2_mouse_byte(&mut self, byte: u8) {
         let packet = match self.ps2_mouse.len {
             0 => {
@@ -254,7 +281,7 @@ impl InputQueue {
         self.ps2_mouse = Ps2MousePacketState::default();
     }
 
-    fn push_pointer_packet(&mut self, packet: InputPointerPacketWire) {
+    fn push_pointer_motion_and_scroll(&mut self, packet: InputPointerPacketWire) {
         if packet.dx != 0 || packet.dy != 0 {
             self.last_pointer_position = None;
             self.push(input_evdev::InputEvent {
@@ -278,12 +305,24 @@ impl InputQueue {
                 text: 0,
             });
         }
-        self.push_pointer_button_edges(packet.buttons);
+    }
+
+    fn push_pointer_packet(&mut self, packet: InputPointerPacketWire) {
+        self.push_pointer_motion_and_scroll(packet);
+        self.native_pointer_buttons = packet.buttons;
+        self.publish_pointer_button_edges();
+    }
+
+    fn push_dvm_pointer_packet(&mut self, packet: InputPointerPacketWire) {
+        self.push_pointer_motion_and_scroll(packet);
+        self.dvm_pointer_buttons = packet.buttons;
+        self.publish_pointer_button_edges();
     }
 
     fn push_pointer_absolute(&mut self, absolute: InputPointerAbsoluteWire) {
         if !self.pointer_surface.configured() {
-            self.push_pointer_button_edges(absolute.buttons);
+            self.native_pointer_buttons = absolute.buttons;
+            self.publish_pointer_button_edges();
             return;
         }
         let x = (absolute.x.min(self.pointer_surface.max_x() as u32)) as i32;
@@ -311,7 +350,8 @@ impl InputQueue {
                 text: 0,
             });
         }
-        self.push_pointer_button_edges(absolute.buttons);
+        self.native_pointer_buttons = absolute.buttons;
+        self.publish_pointer_button_edges();
     }
 
     fn push_hid_keyboard_report(&mut self, report: InputHidKeyboardReportWire) {
@@ -462,9 +502,10 @@ impl InputQueue {
         });
     }
 
-    fn push_pointer_button_edges(&mut self, current: u8) {
-        let previous = self.pointer_buttons;
-        self.pointer_buttons = current;
+    fn publish_pointer_button_edges(&mut self) {
+        let current = self.native_pointer_buttons | self.dvm_pointer_buttons;
+        let previous = self.published_pointer_buttons;
+        self.published_pointer_buttons = current;
         self.push_pointer_button_edge(previous, current, input_evdev::POINTER_BUTTON_LEFT as u8);
         self.push_pointer_button_edge(previous, current, input_evdev::POINTER_BUTTON_RIGHT as u8);
         self.push_pointer_button_edge(previous, current, input_evdev::POINTER_BUTTON_MIDDLE as u8);
@@ -1043,6 +1084,38 @@ mod tests {
     }
 
     #[test]
+    fn inputd_keeps_dvm_pointer_buttons_separate_from_native_fallback() {
+        let mut queue = InputQueue::default();
+        queue.push_pointer_packet(pointer_packet(1, 0, 0));
+        let native_press = queue.pop_front().unwrap();
+        assert_eq!(native_press.action, input_evdev::INPUT_ACTION_PRESSED);
+
+        // A DVM press must not duplicate the button edge, and its disconnect
+        // must not release a simultaneously held fallback pointer button.
+        queue.push_dvm_pointer_packet(pointer_packet(1, 0, 0));
+        assert!(queue.is_empty());
+        queue.push_dvm_pointer_packet(pointer_packet(0, 0, 0));
+        assert!(queue.is_empty());
+
+        queue.push_pointer_packet(pointer_packet(0, 0, 0));
+        let native_release = queue.pop_front().unwrap();
+        assert_eq!(native_release.action, input_evdev::INPUT_ACTION_RELEASED);
+    }
+
+    #[test]
+    fn inputd_dvm_reset_releases_only_dvm_pointer_state() {
+        let mut queue = InputQueue::default();
+        queue.push_dvm_pointer_packet(pointer_packet(1, 0, 0));
+        let press = queue.pop_front().unwrap();
+        assert_eq!(press.action, input_evdev::INPUT_ACTION_PRESSED);
+
+        queue.reset_dvm_input();
+        let release = queue.pop_front().unwrap();
+        assert_eq!(release.action, input_evdev::INPUT_ACTION_RELEASED);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
     fn inputd_decodes_raw_ps2_mouse_bytes() {
         let mut queue = InputQueue::default();
         queue.push_ps2_mouse_byte(0x09);
@@ -1086,6 +1159,25 @@ mod tests {
         assert_eq!(event.action, input_evdev::INPUT_ACTION_PRESSED);
         assert_eq!(event.code, 30);
         assert_eq!(event.text, b'a' as u32);
+    }
+
+    #[test]
+    fn dvm_linux_evdev_key_preserves_text_and_modifier_policy() {
+        let mut queue = InputQueue::default();
+        // Linux KEY_LEFTSHIFT then KEY_A: only inputd translates the Linux
+        // codes and computes the printable native event.
+        queue.push_dvm_linux_key(42, input_evdev::INPUT_ACTION_PRESSED);
+        queue.push_dvm_linux_key(30, input_evdev::INPUT_ACTION_PRESSED);
+
+        let shift = queue.pop_front().unwrap();
+        assert_eq!(shift.kind, input_evdev::INPUT_KIND_KEYBOARD);
+        assert_eq!(shift.action, input_evdev::INPUT_ACTION_PRESSED);
+        assert_ne!(shift.modifiers, 0);
+
+        let a = queue.pop_front().unwrap();
+        assert_eq!(a.kind, input_evdev::INPUT_KIND_KEYBOARD);
+        assert_eq!(a.action, input_evdev::INPUT_ACTION_PRESSED);
+        assert_eq!(a.text, b'A' as u32);
     }
 
     #[test]
@@ -1506,6 +1598,13 @@ fn drain_ingest(queue: &mut InputQueue, events: &mut [InputIngressWire]) -> Resu
             INPUTD_INGRESS_KIND_KEYBOARD if wire.access == INPUTD_ACCESS_NATIVE => {
                 queue.push_keyboard_event(wire.keyboard);
             }
+            INPUTD_INGRESS_KIND_DVM_LINUX_KEY if wire.access == INPUTD_ACCESS_NATIVE => {
+                if wire.flags & INPUTD_INGRESS_FLAG_RESET_STATE != 0 {
+                    queue.reset_dvm_input();
+                    continue;
+                }
+                queue.push_dvm_linux_key(wire.keyboard.code, wire.keyboard.action);
+            }
             INPUTD_INGRESS_KIND_PS2_SCANCODE if wire.access == INPUTD_ACCESS_NATIVE => {
                 queue.push_ps2_scancode(
                     wire.ps2_scancode.scancode,
@@ -1520,7 +1619,11 @@ fn drain_ingest(queue: &mut InputQueue, events: &mut [InputIngressWire]) -> Resu
                 queue.push_ps2_mouse_byte(wire.ps2_mouse_byte.byte);
             }
             INPUTD_INGRESS_KIND_POINTER_PACKET if wire.access == INPUTD_ACCESS_NATIVE => {
-                queue.push_pointer_packet(wire.pointer_packet);
+                if wire.flags & INPUTD_INGRESS_FLAG_DVM_SOURCE != 0 {
+                    queue.push_dvm_pointer_packet(wire.pointer_packet);
+                } else {
+                    queue.push_pointer_packet(wire.pointer_packet);
+                }
             }
             INPUTD_INGRESS_KIND_POINTER_ABSOLUTE if wire.access == INPUTD_ACCESS_NATIVE => {
                 queue.push_pointer_absolute(wire.pointer_absolute);

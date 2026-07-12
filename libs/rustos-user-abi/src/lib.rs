@@ -44,8 +44,7 @@ mod tests {
             size_of::<syscall::RustosProcActivateBrokerArgs>() <= syscall::IPC_MAX_INLINE_BYTES
         );
         assert!(
-            size_of::<syscall::RustosIpcWaitServiceEndpointArgs>()
-                <= syscall::IPC_MAX_INLINE_BYTES
+            size_of::<syscall::RustosIpcWaitServiceEndpointArgs>() <= syscall::IPC_MAX_INLINE_BYTES
         );
         assert!(
             size_of::<syscall::RustosProcSetWindowsRuntimeBrokerArgs>()
@@ -70,10 +69,7 @@ mod tests {
         assert_eq!(syscall::SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, 0x5255_0036);
         assert_eq!(syscall::SYS_RUSTOS_DRIVER_SYMBOL_EVENT_BROKER, 0x5255_0037);
         assert_eq!(syscall::SYS_RUSTOS_IPC_RECV_WITH_SENDER, 0x5255_0038);
-        assert_eq!(
-            syscall::SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT,
-            0x5255_0039
-        );
+        assert_eq!(syscall::SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT, 0x5255_0039);
         assert_eq!(syscall::SYS_RUSTOS_PROC_ACTIVATE_BROKER, 0x5255_003a);
         assert_eq!(
             syscall::SYS_RUSTOS_SERVICE_DRIVER_RESOURCE_BROKER,
@@ -130,6 +126,8 @@ mod tests {
         assert_eq!(syscall::INPUTD_INGRESS_KIND_HID_RAW_REPORT, 7);
         assert_eq!(syscall::INPUTD_INGRESS_KIND_PS2_SCANCODE, 8);
         assert_eq!(syscall::INPUTD_INGRESS_KIND_PS2_MOUSE_BYTE, 9);
+        assert_eq!(syscall::INPUTD_INGRESS_KIND_DVM_LINUX_KEY, 10);
+        assert_eq!(syscall::INPUTD_INGRESS_FLAG_DVM_SOURCE, 1 << 1);
         assert_eq!(syscall::STORAGED_OP_ROOT_STATUS, 4);
         assert_eq!(syscall::STORAGED_OP_BOOT_EXTENT_LOOKUP, 5);
 

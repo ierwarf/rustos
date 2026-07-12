@@ -23,6 +23,7 @@ failure output as the primary debugging context.
 | `cargo xtask kvm-smoke` | concurrently boot Linux DVM and RustOS with QEMU/KVM | `build/kvm/` | unavailable `/dev/kvm`, guest exit, missing readiness marker |
 | `cargo run -p rustos-hostd -- discover` | read host IOMMU groups | none | IOMMU unavailable or unreadable sysfs |
 | `cargo run -p rustos-hostd -- preflight --plan <file>` | require complete, non-protected IOMMU-group ownership | none | incomplete group or host-critical BDF |
+| `cargo run -p rustos-hostd -- relay-input ...` | relay validated DVM Linux input into RustOS COM2 | QEMU-private input socket | policy mismatch, malformed DVM event, or endpoint disconnect |
 
 ## Tests and inventory
 
@@ -45,11 +46,13 @@ failure output as the primary debugging context.
 - `--dry-run` verifies DVM artifacts and prepares `build/kvm/` without
   launching QEMU.
 - The DVM's `agent-v1-control` contract makes a host-authenticated KVM-vsock
-  health, PCI-inventory, and bounded synthetic-key probe. The smoke accepts
-  only QEMU-injected `A` / Linux evdev code `30`, then requires RustOS
-  `inputd` to consume the matching synthetic PS/2 input. It is not a RustOS
-  endpoint, physical host-keyboard capture, arbitrary-key forwarding, NIC,
-  storage, `.ko`, PCI-passthrough, or a production device-data-plane test.
+  health, PCI-inventory, and `input-stream` handshake. L0 validates keyboard
+  and relative-pointer evdev records before forwarding sequenced, checksummed
+  RDI2 frames over RustOS's dedicated COM2 socket; no QMP socket is launched.
+  L0 releases tracked keys/buttons when the DVM stream ends. The smoke
+  establishes the relay but does not synthesize input, so a live event still
+  needs a real input source assigned to the DVM. It is not a NIC,
+  storage, `.ko`, PCI-passthrough, or high-bandwidth device-data-plane test.
 
 ## L0 VFIO laboratory recovery
 

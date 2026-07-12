@@ -8,7 +8,7 @@ owner.
 RustOS KVM guest           Linux DVM KVM guest
 driverd / netd / storaged  Linux LTS + firmware + supported .ko
           |                          |
-          +---- future vsock RPC ----+
+          +---- L0 versioned brokers -+
                                       PCI-assigned IOMMU group
 ```
 
@@ -33,6 +33,13 @@ name the complete actual IOMMU group, not a single desired PCI function, and
 must reject any host-protected PCI BDF in that group. Both commands are
 read-only: neither unbinds a driver, assigns VFIO, resets hardware, nor starts
 a DVM.
+
+`rustos-hostd relay-input` additionally requires a `driver-domain-policy-v1`
+file. Its domain ID must match the validated launch plan and it enables exactly
+one named transport per device class. The present input transport is
+`rdi2-com2`; network, block, and display are deliberately `disabled` until
+their own data-plane contracts exist. This prevents a convenient input relay
+from silently becoming an unbounded driver proxy.
 
 `rustos-hostd acquire` is also read-only by default. Its explicit laboratory
 path requires both `--activate` and `--allow-unsigned-test-bind`; it writes a
@@ -67,25 +74,44 @@ grant RustOS host authority.
   hashed into its artifact manifest, and written by the agent to
   `/run/rustos-dvm/ready`. In `state=control`, the agent connects only to the
   L0 host's KVM-vsock listener using its launch-assigned CID.
-- L0 validates the source CID and the complete DVM control contract before it
-  requests health, PCI device inventory, or one bounded keyboard event. The
-  control request is host-to-DVM; it is not a direct RustOS-to-DVM channel.
-- `keyboard-events` is a KVM smoke-only proof: the DVM opens its allowlisted
-  `virtio-keyboard` evdev node and sends an exact readiness acknowledgement;
-  only then does QEMU inject a synthetic `A`. The DVM returns one Linux evdev
-  key press, and L0 accepts only evdev code `30` before injecting the same
-  synthetic key into RustOS's default PS/2 path. RustOS then has to show that
-  `inputd` consumed a new input batch.
-- This is intentionally not physical host-keyboard capture, arbitrary-key
-  forwarding, or a live input data plane. RustOS still has no vsock endpoint.
-  Network, block, display, GPU, and production input transports require
-  separately versioned protocols and RustOS-side consumers.
+- L0 validates the source CID and complete DVM contract before it requests
+  health, PCI inventory, and the `input-stream` service. The agent discovers
+  a keyboard through `KEY_A`/`KEY_Z`/`KEY_SPACE` capabilities and a relative
+  pointer through `REL_X`/`REL_Y`/`BTN_LEFT`; it does not trust a QEMU device
+  name. It reports key records plus one coalesced pointer packet per
+  `SYN_REPORT`. L0 accepts only bounded key code/action, signed motion/wheel,
+  and five-button fields, assigns its own monotonic sequence, and forwards one
+  fixed RDI2 frame through a private QEMU COM2 socket to RustOS. The DVM never
+  learns a RustOS address or gains a generic RPC path.
+- RustOS accepts a nonzero relay epoch and contiguous sequence only, then
+  carries keyboard/pointer ingress to ring-3 `inputd`. `inputd` alone
+  translates key layout/modifier/text state and merges DVM pointer buttons
+  separately from native fallback providers. On a malformed, overflowed, or
+  disconnected DVM stream, L0 releases its tracked keys/buttons and sends a
+  session end; `inputd` clears remaining DVM-only state. QMP and synthetic
+  PS/2 injection are not part of this path. KVM smoke proves the authenticated
+  relay endpoint, not a fabricated key; a real event requires an input
+controller assigned to DVM.
+- `rustos-hostd relay-input` is a reconnecting L0 service by default. A DVM
+  agent reconnect or a RustOS serial endpoint restart creates a fresh epoch;
+  the diagnostic `--once` mode is the only one that exits on the first error.
+- This low-rate relay is intentionally not a network, block, display, or GPU
+  data plane. Those classes require separately versioned paravirtual
+  frontends/backends with queue, DMA, cancellation, reset, and revocation
+  semantics. The common pattern remains: DVM identifies the device, L0
+  validates ownership and protocol, then RustOS policy services consume the
+  narrow backend interface.
+
+The default KVM profile instead exposes `virtio-gpu-pci` directly to RustOS.
+Its Linux `.ko` compatibility path publishes the display provider through
+`driverd`; `uiserver` owns normal presentation and `bootfb` remains the
+explicit fail-closed fallback. It is intentionally not a DVM display proxy.
 
 This avoids a Linux kernel fork. A small agent is still required for health,
-device state, and authenticated control messages. There is currently no live
-RustOS/Linux vsock endpoint, PCI assignment, or production RustOS device
-consumption. High-performance page loans or device-specific protocols are
-future, versioned extensions, not part of this baseline.
+device state, and authenticated control messages. The input relay is the first
+RustOS device consumption path; PCI assignment remains gated by the durable
+VFIO lease. High-performance page loans and device-specific NIC/block/GPU
+protocols are future, versioned extensions, not part of this baseline.
 
 ## Profile limits
 

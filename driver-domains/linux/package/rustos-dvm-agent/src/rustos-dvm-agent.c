@@ -19,6 +19,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 
 #define CONTROL_FILE "/usr/share/rustos-dvm/control-plane-v1.env"
@@ -27,9 +28,23 @@
 #define CONTROL_PORT 40500U
 #define MAX_FRAME 4096U
 #define HOST_CID VMADDR_CID_HOST
-#define KEYBOARD_EVENT_LIMIT 32U
-#define KEYBOARD_EVENT_WAIT_MS 5000
-#define VIRTIO_KEYBOARD_NAME "QEMU Virtio Keyboard"
+#define INPUT_EVENT_LIMIT 64U
+#define INPUT_BITS_BYTES ((KEY_MAX / 8U) + 1U)
+#define POINTER_BUTTON_MASK 0x1fU
+
+enum input_device_kind {
+    INPUT_DEVICE_KEYBOARD,
+    INPUT_DEVICE_POINTER,
+};
+
+struct pointer_state {
+    int16_t dx;
+    int16_t dy;
+    int16_t wheel_vertical;
+    int16_t wheel_horizontal;
+    uint8_t buttons;
+    int pending;
+};
 
 struct control_contract {
     char schema[16];
@@ -128,7 +143,7 @@ static void parse_contract(struct control_contract *contract) {
         strcmp(contract->protocol, "agent-v1") != 0 ||
         strcmp(contract->state, "control") != 0 || strcmp(contract->transport, "kvm-vsock") != 0 ||
         strcmp(contract->authentication, "kvm-host-bound") != 0 ||
-        strcmp(contract->capabilities, "health,device-inventory,keyboard-events") != 0) {
+        strcmp(contract->capabilities, "health,device-inventory,input-stream") != 0) {
         die("unsupported control contract");
     }
 }
@@ -261,105 +276,222 @@ static int request_id(const char *payload, const char *operation, unsigned int *
     return 0;
 }
 
-static int virtio_keyboard_event_path(char *path, size_t path_size) {
+static int input_bit_is_set(const unsigned char *bits, unsigned int code) {
+    return (bits[code / 8U] & (unsigned char)(1U << (code % 8U))) != 0;
+}
+
+static int input_has_capability(int fd, unsigned int event_type, unsigned int code) {
+    unsigned char bits[INPUT_BITS_BYTES];
+    memset(bits, 0, sizeof(bits));
+    if (ioctl(fd, EVIOCGBIT(event_type, sizeof(bits)), bits) < 0) {
+        return 0;
+    }
+    return code <= KEY_MAX && input_bit_is_set(bits, code);
+}
+
+static int input_device_matches(int fd, enum input_device_kind kind) {
+    if (kind == INPUT_DEVICE_KEYBOARD) {
+        /* A real keyboard is identified by the printable key set, not the
+         * QEMU product name. This accepts physical keyboards passed through
+         * to the DVM as well as virtio-input keyboards. */
+        return input_has_capability(fd, EV_KEY, KEY_A) &&
+               input_has_capability(fd, EV_KEY, KEY_Z) &&
+               input_has_capability(fd, EV_KEY, KEY_SPACE);
+    }
+    return input_has_capability(fd, EV_REL, REL_X) && input_has_capability(fd, EV_REL, REL_Y) &&
+           input_has_capability(fd, EV_KEY, BTN_LEFT);
+}
+
+static int open_input_device(enum input_device_kind kind, int excluded_index, int *index_out) {
     unsigned int index;
-    for (index = 0; index < KEYBOARD_EVENT_LIMIT; index++) {
-        char name_path[PATH_MAX];
-        char name[128];
-        FILE *file;
-        snprintf(name_path, sizeof(name_path), "/sys/class/input/event%u/device/name", index);
-        file = fopen(name_path, "re");
-        if (file == NULL) {
+    for (index = 0; index < INPUT_EVENT_LIMIT; index++) {
+        char path[PATH_MAX];
+        int fd;
+        if ((int)index == excluded_index ||
+            snprintf(path, sizeof(path), "/dev/input/event%u", index) >= (int)sizeof(path)) {
             continue;
         }
-        if (fgets(name, sizeof(name), file) == NULL) {
-            fclose(file);
+        fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0) {
             continue;
         }
-        fclose(file);
-        name[strcspn(name, "\r\n")] = '\0';
-        if (strcmp(name, VIRTIO_KEYBOARD_NAME) == 0) {
-            if (snprintf(path, path_size, "/dev/input/event%u", index) >= (int)path_size) {
-                errno = ENAMETOOLONG;
-                return -1;
-            }
-            return 0;
+        if (input_device_matches(fd, kind)) {
+            *index_out = (int)index;
+            return fd;
         }
+        close(fd);
     }
     errno = ENODEV;
     return -1;
 }
 
-static int open_virtio_keyboard(void) {
-    char path[PATH_MAX];
-    int fd;
-    if (virtio_keyboard_event_path(path, sizeof(path)) != 0) {
-        return -1;
+static int16_t add_clamped_i16(int16_t current, int value) {
+    long sum = (long)current + (long)value;
+    if (sum > INT16_MAX) {
+        return INT16_MAX;
     }
-    fd = open(path, O_RDONLY | O_CLOEXEC);
-    return fd;
+    if (sum < INT16_MIN) {
+        return INT16_MIN;
+    }
+    return (int16_t)sum;
 }
 
-static int wait_for_virtio_keyboard_press(int fd, unsigned int *code) {
-    struct pollfd pollfd;
-    struct timespec deadline;
-    if (fd < 0) {
+static int pointer_button_mask(unsigned int code, uint8_t *mask) {
+    switch (code) {
+    case BTN_LEFT:
+        *mask = 1U << 0;
+        return 0;
+    case BTN_RIGHT:
+        *mask = 1U << 1;
+        return 0;
+    case BTN_MIDDLE:
+        *mask = 1U << 2;
+        return 0;
+    case BTN_SIDE:
+        *mask = 1U << 3;
+        return 0;
+    case BTN_EXTRA:
+        *mask = 1U << 4;
+        return 0;
+    default:
+        return -1;
+    }
+}
+
+static int send_keyboard_event(int fd, unsigned int request_id, const struct input_event *event) {
+    char payload[192];
+    if (event->code == KEY_RESERVED || event->code > KEY_MAX || event->value < 0 ||
+        event->value > 2) {
+        return 0;
+    }
+    if (snprintf(payload, sizeof(payload),
+                 "EVENT\nid=%u\nop=input-stream\ntype=key\ncode=%u\nvalue=%d", request_id,
+                 event->code, event->value) >= (int)sizeof(payload)) {
+        errno = EMSGSIZE;
+        return -1;
+    }
+    return send_frame(fd, payload);
+}
+
+static int send_pointer_packet(int fd, unsigned int request_id, struct pointer_state *state) {
+    char payload[256];
+    if (!state->pending) {
+        return 0;
+    }
+    if (snprintf(payload, sizeof(payload),
+                 "EVENT\nid=%u\nop=input-stream\ntype=pointer\ndx=%d\ndy=%d\nwheel-v=%d"
+                 "\nwheel-h=%d\nbuttons=%u",
+                 request_id, state->dx, state->dy, state->wheel_vertical,
+                 state->wheel_horizontal, state->buttons) >= (int)sizeof(payload)) {
+        errno = EMSGSIZE;
+        return -1;
+    }
+    if (send_frame(fd, payload) != 0) {
+        return -1;
+    }
+    state->dx = 0;
+    state->dy = 0;
+    state->wheel_vertical = 0;
+    state->wheel_horizontal = 0;
+    state->pending = 0;
+    return 0;
+}
+
+static int consume_pointer_event(int fd, unsigned int request_id, struct pointer_state *state,
+                                 const struct input_event *event) {
+    uint8_t mask;
+    if (event->type == EV_REL) {
+        switch (event->code) {
+        case REL_X:
+            state->dx = add_clamped_i16(state->dx, event->value);
+            break;
+        case REL_Y:
+            state->dy = add_clamped_i16(state->dy, event->value);
+            break;
+        case REL_WHEEL:
+            state->wheel_vertical = add_clamped_i16(state->wheel_vertical, event->value);
+            break;
+        case REL_HWHEEL:
+            state->wheel_horizontal = add_clamped_i16(state->wheel_horizontal, event->value);
+            break;
+        default:
+            return 0;
+        }
+        state->pending = 1;
+        return 0;
+    }
+    if (event->type == EV_KEY && pointer_button_mask(event->code, &mask) == 0) {
+        if (event->value != 0) {
+            state->buttons |= mask;
+        } else {
+            state->buttons &= (uint8_t)~mask;
+        }
+        state->buttons &= POINTER_BUTTON_MASK;
+        state->pending = 1;
+        return 0;
+    }
+    if (event->type == EV_SYN && event->code == SYN_REPORT) {
+        return send_pointer_packet(fd, request_id, state);
+    }
+    if (event->type == EV_SYN && event->code == SYN_DROPPED) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    return 0;
+}
+
+static int stream_input_devices(int control_fd, int keyboard_fd, int pointer_fd,
+                                unsigned int request_id) {
+    struct pollfd pollfds[2];
+    struct pointer_state pointer = {0};
+    if (keyboard_fd < 0 || pointer_fd < 0) {
         errno = EINVAL;
         return -1;
     }
-    pollfd.fd = fd;
-    pollfd.events = POLLIN;
-    pollfd.revents = 0;
-    if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) {
-        return -1;
-    }
-    deadline.tv_sec += KEYBOARD_EVENT_WAIT_MS / 1000U;
-    deadline.tv_nsec += (long)(KEYBOARD_EVENT_WAIT_MS % 1000U) * 1000000L;
-    if (deadline.tv_nsec >= 1000000000L) {
-        deadline.tv_sec++;
-        deadline.tv_nsec -= 1000000000L;
-    }
+    pollfds[0].fd = keyboard_fd;
+    pollfds[0].events = POLLIN;
+    pollfds[1].fd = pointer_fd;
+    pollfds[1].events = POLLIN;
     for (;;) {
-        struct input_event event;
-        struct timespec now;
-        ssize_t bytes;
-        long long remaining_ms;
         int ready;
-        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
-            return -1;
-        }
-        remaining_ms = ((long long)deadline.tv_sec - (long long)now.tv_sec) * 1000LL +
-                       ((long long)deadline.tv_nsec - (long long)now.tv_nsec + 999999LL) /
-                           1000000LL;
-        if (remaining_ms <= 0) {
-            errno = ETIMEDOUT;
-            return -1;
-        }
-        ready = poll(&pollfd, 1, (int)remaining_ms);
+        unsigned int index;
+        pollfds[0].revents = 0;
+        pollfds[1].revents = 0;
+        ready = poll(pollfds, 2, -1);
         if (ready <= 0) {
             if (ready < 0 && errno == EINTR) {
                 continue;
             }
-            if (ready == 0) {
-                errno = ETIMEDOUT;
+            return -1;
+        }
+        for (index = 0; index < 2; index++) {
+            struct input_event event;
+            ssize_t bytes;
+            if ((pollfds[index].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+                errno = EIO;
+                return -1;
             }
-            return -1;
-        }
-        if ((pollfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0 ||
-            (pollfd.revents & POLLIN) == 0) {
-            errno = EIO;
-            return -1;
-        }
-        bytes = read(fd, &event, sizeof(event));
-        if (bytes != (ssize_t)sizeof(event)) {
-            if (bytes < 0 && errno == EINTR) {
+            if ((pollfds[index].revents & POLLIN) == 0) {
                 continue;
             }
-            return -1;
-        }
-        if (event.type == EV_KEY && event.value == 1 && event.code != KEY_RESERVED) {
-            *code = event.code;
-            return 0;
+            bytes = read(pollfds[index].fd, &event, sizeof(event));
+            if (bytes != (ssize_t)sizeof(event)) {
+                if (bytes < 0 && (errno == EINTR || errno == EAGAIN)) {
+                    continue;
+                }
+                return -1;
+            }
+            if (event.type == EV_SYN && event.code == SYN_DROPPED) {
+                errno = EOVERFLOW;
+                return -1;
+            }
+            if (index == 0) {
+                if (event.type == EV_KEY && send_keyboard_event(control_fd, request_id, &event) != 0) {
+                    return -1;
+                }
+            } else if (consume_pointer_event(control_fd, request_id, &pointer, &event) != 0) {
+                return -1;
+            }
         }
     }
 }
@@ -392,30 +524,42 @@ static int serve_connection(int fd, const struct control_contract *contract) {
             inventory = pci_inventory_count();
             snprintf(payload, sizeof(payload),
                      "RESPONSE\nid=%u\nop=device-inventory\nstatus=ok\ncount=%u", id, inventory);
-        } else if (request_id(payload, "keyboard-event", &id) == 0) {
-            unsigned int code;
-            int keyboard_fd = open_virtio_keyboard();
-            if (keyboard_fd < 0) {
+        } else if (request_id(payload, "input-stream", &id) == 0) {
+            int keyboard_index = -1;
+            int keyboard_fd = open_input_device(INPUT_DEVICE_KEYBOARD, -1, &keyboard_index);
+            int pointer_index = -1;
+            int pointer_fd = keyboard_fd < 0
+                                 ? -1
+                                 : open_input_device(INPUT_DEVICE_POINTER, keyboard_index,
+                                                     &pointer_index);
+            if (keyboard_fd < 0 || pointer_fd < 0) {
+                if (keyboard_fd >= 0) {
+                    close(keyboard_fd);
+                }
+                if (pointer_fd >= 0) {
+                    close(pointer_fd);
+                }
                 snprintf(payload, sizeof(payload),
-                         "RESPONSE\nid=%u\nop=keyboard-event\nstatus=error\nreason=keyboard-unavailable",
+                         "RESPONSE\nid=%u\nop=input-stream\nstatus=error\nreason=input-unavailable",
                          id);
             } else {
-                snprintf(payload, sizeof(payload), "READY\nid=%u\nop=keyboard-event\nstatus=ready",
-                         id);
+                snprintf(payload, sizeof(payload),
+                         "RESPONSE\nid=%u\nop=input-stream\nstatus=ready\nformat=linux-evdev-v2"
+                         "\nkeyboard=event%d\npointer=event%d",
+                         id, keyboard_index, pointer_index);
                 if (send_frame(fd, payload) != 0) {
                     close(keyboard_fd);
+                    close(pointer_fd);
                     return -1;
                 }
-                if (wait_for_virtio_keyboard_press(keyboard_fd, &code) != 0) {
-                    snprintf(payload, sizeof(payload),
-                             "RESPONSE\nid=%u\nop=keyboard-event\nstatus=error\nreason=keyboard-unavailable",
-                             id);
-                } else {
-                    snprintf(payload, sizeof(payload),
-                             "RESPONSE\nid=%u\nop=keyboard-event\nstatus=ok\ntype=key\ncode=%u\nvalue=1",
-                             id, code);
+                if (stream_input_devices(fd, keyboard_fd, pointer_fd, id) != 0) {
+                    close(keyboard_fd);
+                    close(pointer_fd);
+                    return -1;
                 }
                 close(keyboard_fd);
+                close(pointer_fd);
+                return -1;
             }
         } else {
             return -1;

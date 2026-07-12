@@ -165,24 +165,32 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   starts RustOS and Linux DVM as independent KVM guests and preserves their
   logs under `build/kvm/`.
 - A successful smoke requires RustOS's default `rootd` readiness marker and
-  the L0-style host listener to complete the DVM
-  `health,device-inventory,keyboard-events` probe using launch-assigned KVM
-  vsock CID `4`. The keyboard step is bounded to one QEMU-injected `A`: the
-  agent must open the allowlisted virtio evdev node and return an exact
-  `READY` acknowledgement before L0 injects the synthetic key. The agent must
-  then return Linux evdev code `30`, and RustOS must report a new `inputd`
-  read batch after L0 injects the same synthetic key through its default PS/2
-  path. A guest that exits or merely starts cannot pass.
-  `agent-v1-control` remains host-to-DVM only; it is not a live RustOS vsock
-  endpoint or physical-keyboard forwarding protocol. Additional `--expect`
-  markers tighten RustOS proof; none prove a RustOS device, `.ko`, PCI
-  assignment, physical input capture, or a network route.
+  the L0 host broker to complete the DVM
+  `health,device-inventory,input-stream` handshake using launch-assigned KVM
+  vsock CID `4`. L0 then opens RustOS's dedicated QEMU COM2 socket and writes
+  only fixed RDI2 session/key/pointer frames; QMP is not launched. The DVM
+  discovers one keyboard and one relative pointer by evdev capabilities, not
+  by a QEMU product name. A guest that exits or merely starts cannot pass. The
+  smoke proves endpoint setup only: it does not fabricate an input event. A
+  live event needs a real input source assigned to the DVM, after which L0
+  range-checks each key/pointer field and RustOS feeds it to ring-3 `inputd`.
+- `agent-v1-control` remains DVM-to-L0 only. The RDI2 COM2 channel is a
+  bounded input relay, not a general vsock endpoint or a NIC/block/GPU data
+  plane. L0 limits event rate, emits held-key/button releases on disconnect,
+  and sends a session end so reconnects cannot inherit input state. Additional
+  `--expect` markers tighten RustOS proof; none prove a
+  `.ko`, PCI assignment, physical input capture, or a network route.
 - `rustos-hostd discover` and `rustos-hostd preflight --plan ...` are L0
   read-only ownership gates. `launch-plan-v1.env` must explicitly enumerate
   every function in one actual IOMMU group and reject host-protected BDFs;
   neither command performs a driver unbind, VFIO bind, device reset, guest
   launch, or PCI assignment. Do not turn a successful preflight into a
   passthrough claim.
+- `rustos-hostd relay-input` requires a matching `driver-domain-policy-v1`
+  file. Each class has an explicit transport; only `INPUT_TRANSPORT=rdi2-com2`
+  is implemented. Network, block, and display must remain `disabled` until
+  their separate queue/DMA/reset/revocation contracts are implemented. The
+  normal command is a reconnecting L0 service; `--once` is diagnostics-only.
 - `rustos-hostd acquire` remains read-only unless both `--activate` and
   `--allow-unsigned-test-bind` are supplied. That laboratory-only path first
   persists an owner-private `prepared` lease with each original PCI driver and

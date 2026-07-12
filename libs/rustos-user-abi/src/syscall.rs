@@ -919,7 +919,14 @@ pub const INPUTD_INGRESS_KIND_HID_POINTER_REPORT: u16 = 6;
 pub const INPUTD_INGRESS_KIND_HID_RAW_REPORT: u16 = 7;
 pub const INPUTD_INGRESS_KIND_PS2_SCANCODE: u16 = 8;
 pub const INPUTD_INGRESS_KIND_PS2_MOUSE_BYTE: u16 = 9;
+/// Linux evdev key transition normalized by an authenticated driver domain.
+/// `keyboard.code` is a Linux `KEY_*` value and `keyboard.action` uses the
+/// RustOS pressed/released/repeated action constants.
+pub const INPUTD_INGRESS_KIND_DVM_LINUX_KEY: u16 = 10;
 pub const INPUTD_INGRESS_FLAG_RESET_STATE: u32 = 1 << 0;
+/// The ingress packet was normalized by the authenticated Linux driver-domain
+/// relay. `inputd` keeps its button state separate from native fallback input.
+pub const INPUTD_INGRESS_FLAG_DVM_SOURCE: u32 = 1 << 1;
 pub const INPUTD_HID_POLICY_REPORT_CAPACITY: usize = 64;
 pub const INPUTD_HID_POLICY_DESCRIPTOR_CAPACITY: usize = 128;
 pub const INPUTD_HID_POLICY_KIND_UNKNOWN: u16 = 0;
@@ -2514,12 +2521,12 @@ mod syscall_tests {
     use core::mem::size_of;
 
     use super::{
-        LinuxRlimit, LinuxSigActionWire, LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse,
-        LinuxTimespecWire, LinuxUtsName, VfsIpcRequest, VfsIpcResponse, IPC_MAX_INLINE_BYTES,
-        LINUX_RLIMIT_SIZE, LINUX_SIGACTION_SIZE, LINUX_STATX_SIZE, LINUX_TIMESPEC_SIZE,
-        LINUX_UTSNAME_SIZE, SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_STATX,
-        SYSCALL_OFFLOAD_PATH_CAPACITY, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, VFS_IPC_ABI_VERSION,
-        VFS_IPC_OP_OPENAT,
+        IPC_MAX_INLINE_BYTES, LINUX_RLIMIT_SIZE, LINUX_SIGACTION_SIZE, LINUX_STATX_SIZE,
+        LINUX_TIMESPEC_SIZE, LINUX_UTSNAME_SIZE, LinuxRlimit, LinuxSigActionWire,
+        LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, LinuxTimespecWire, LinuxUtsName,
+        SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_STATX, SYSCALL_OFFLOAD_PATH_CAPACITY,
+        SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, VFS_IPC_ABI_VERSION, VFS_IPC_OP_OPENAT, VfsIpcRequest,
+        VfsIpcResponse,
     };
 
     #[test]

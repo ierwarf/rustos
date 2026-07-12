@@ -4,6 +4,7 @@
 use crate::driver;
 use driver_abi::{DriverBus, DriverClass};
 
+pub(crate) mod dvm_serial;
 pub mod event_queue;
 pub(crate) mod i8042;
 pub(crate) mod keyboard;
@@ -13,6 +14,7 @@ const KEYBOARD_DRIVER_NAME: &str = "rustos-keyboard";
 pub fn init() {
     driver::register_kernel_builtin(KEYBOARD_DRIVER_NAME, DriverClass::Input, DriverBus::Serio);
     report_keyboard_transport(i8042::init_keyboard_port());
+    dvm_serial::init();
     initialize_aux_transport();
 }
 
@@ -25,7 +27,7 @@ pub fn on_mouse_interrupt() {
 }
 
 pub fn service_pending() -> usize {
-    serio_lower_half_service_pending()
+    serio_lower_half_service_pending() + dvm_serial::service_pending()
 }
 
 fn report_keyboard_transport(result: i8042::KeyboardTransportInitResult) {

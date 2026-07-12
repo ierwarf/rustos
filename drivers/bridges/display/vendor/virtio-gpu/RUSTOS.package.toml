@@ -14,7 +14,10 @@ path = "system/drivers/display/virtio-gpu.ko"
 
 
 [autoload]
-enabled = false
+# The default KVM profile always exposes one modern virtio-gpu PCI function.
+# Keep loading device- and alias-gated in driverd; bootfb remains the explicit
+# fallback if the provider cannot publish.
+enabled = true
 name = "virtio-gpu"
 class = "display"
 bus = "virtio"

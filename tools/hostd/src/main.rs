@@ -4,9 +4,9 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use rustos_driver_domain_host::{
-    ControlContract, DEFAULT_CONTROL_PORT, FileLeaseStore, HostControlListener, IommuTopology,
-    LaunchPlan, SysfsVfioOps, ValidatedLease, VfioOps, acquire_vfio_lease, inspect_vfio_lease,
-    restore_vfio_lease,
+    ControlContract, DEFAULT_CONTROL_PORT, DeviceClass, DeviceTransport, DriverDomainPolicy,
+    FileLeaseStore, HostControlListener, IommuTopology, LaunchPlan, SysfsVfioOps, UnixInputSink,
+    ValidatedLease, VfioOps, acquire_vfio_lease, inspect_vfio_lease, restore_vfio_lease,
 };
 
 #[derive(Parser)]
@@ -45,6 +45,30 @@ enum Command {
         port: u32,
         #[arg(long, default_value_t = 30)]
         timeout_secs: u64,
+    },
+    /// Relay the authenticated DVM's Linux evdev stream into RustOS's
+    /// dedicated virtual input transport. This is not QMP and does not give
+    /// the DVM access to any RustOS management or filesystem interface.
+    RelayInput {
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long, default_value = "/sys")]
+        sysfs_root: PathBuf,
+        #[arg(long)]
+        control_contract: PathBuf,
+        /// Immutable L0 policy that enables the input transport for this exact domain.
+        #[arg(long)]
+        device_policy: PathBuf,
+        #[arg(long)]
+        rustos_input_socket: PathBuf,
+        #[arg(long, default_value_t = DEFAULT_CONTROL_PORT)]
+        port: u32,
+        /// Maximum time to establish the DVM and RustOS relay endpoints.
+        #[arg(long, default_value_t = 30)]
+        timeout_secs: u64,
+        /// Exit after the first relay failure. Intended only for focused diagnostics.
+        #[arg(long)]
+        once: bool,
     },
     /// Show or explicitly acquire a complete validated IOMMU group for vfio-pci.
     Acquire {
@@ -112,6 +136,62 @@ fn main() -> Result<()> {
                 "rustos-hostd: DVM control verified domain={} cid={} iommu_group={} inventory_count={}",
                 lease.domain_id, result.peer_cid, lease.iommu_group, result.inventory_count
             );
+        }
+        Command::RelayInput {
+            plan,
+            sysfs_root,
+            control_contract,
+            device_policy,
+            rustos_input_socket,
+            port,
+            timeout_secs,
+            once,
+        } => {
+            let lease = validate_plan(&plan, &sysfs_root)?;
+            let policy = DriverDomainPolicy::from_env_file(&device_policy)?;
+            policy.validate_for_lease(&lease)?;
+            if policy.transport_for(DeviceClass::Input) != DeviceTransport::Rdi2Com2 {
+                anyhow::bail!(
+                    "driver-domain policy does not enable rdi2-com2 input transport for {}",
+                    lease.domain_id
+                );
+            }
+            let contract = ControlContract::from_env_file(&control_contract)?;
+            let timeout = Duration::from_secs(timeout_secs.max(1));
+            let listener = HostControlListener::bind(lease.dvm_guest_cid, port, contract)?;
+            loop {
+                let mut sink = match UnixInputSink::connect(&rustos_input_socket, timeout) {
+                    Ok(sink) => sink,
+                    Err(error) if once => return Err(error),
+                    Err(error) => {
+                        eprintln!(
+                            "rustos-hostd: RustOS input endpoint unavailable domain={} reason={error:#}; retrying",
+                            lease.domain_id
+                        );
+                        std::thread::sleep(Duration::from_secs(1));
+                        continue;
+                    }
+                };
+                match listener.relay_input_once(timeout, &mut sink) {
+                    Ok(result) => println!(
+                        "rustos-hostd: DVM input relay ended domain={} cid={} iommu_group={} inventory_count={} forwarded_events={}",
+                        lease.domain_id,
+                        result.probe.peer_cid,
+                        lease.iommu_group,
+                        result.probe.inventory_count,
+                        result.forwarded_events,
+                    ),
+                    Err(error) if once => return Err(error),
+                    Err(error) => eprintln!(
+                        "rustos-hostd: input relay reset domain={} cid={} reason={error:#}; retrying",
+                        lease.domain_id, lease.dvm_guest_cid
+                    ),
+                }
+                if once {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
         }
         Command::Acquire {
             plan,

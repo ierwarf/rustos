@@ -384,6 +384,16 @@ fn initialize_primary_provider() -> Result<VirtioGpuState, VirtioGpuError> {
         state.height,
         state.stride_pixels
     );
+    // `debug::info!(display, ...)` can be filtered from the early debugcon
+    // stream. Keep one deterministic, bounded readiness marker so the KVM
+    // hardware-profile gate proves provider publication rather than merely a
+    // successful `.ko` load.
+    crate::debug::println!(
+        "virtio-gpu: primary provider published width={} height={} stride={}",
+        state.width,
+        state.height,
+        state.stride_pixels
+    );
     Ok(state)
 }
 
