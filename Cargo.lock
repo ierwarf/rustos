@@ -1012,8 +1012,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustos-driver-domain-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+]
+
+[[package]]
 name = "rustos-fault-injection"
 version = "0.1.0"
+
+[[package]]
+name = "rustos-hostd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "rustos-driver-domain-host",
+]
 
 [[package]]
 name = "rustos-keyboard-driver"
@@ -1729,6 +1746,7 @@ dependencies = [
  "clap",
  "fatfs",
  "fs-err",
+ "rustos-driver-domain-host",
  "rustos-fault-injection",
  "serde",
  "storage-core",

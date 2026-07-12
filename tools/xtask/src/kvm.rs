@@ -2,11 +2,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use fs_err as fs;
+use rustos_driver_domain_host::{
+    ControlContract as HostControlContract, DEFAULT_CONTROL_PORT, HostControlListener, ProbeResult,
+};
 
 use crate::Result;
 use crate::config::Config;
@@ -19,12 +23,13 @@ const DVM_MANIFEST: &str = "rustos-linux-dvm-x86_64.manifest";
 const DVM_MANIFEST_SCHEMA: &str = "2";
 const DVM_CONTROL_CONTRACT: &str = "board/overlay/usr/share/rustos-dvm/control-plane-v1.env";
 const DVM_CONTROL_PROTOCOL: &str = "agent-v1";
-const DVM_CONTROL_STATE: &str = "pretransport";
-const DVM_CONTROL_TRANSPORT: &str = "kvm-vsock-pending";
-const DVM_CONTROL_AUTHENTICATION: &str = "kvm-host-bound-pending";
+const DVM_CONTROL_STATE: &str = "control";
+const DVM_CONTROL_TRANSPORT: &str = "kvm-vsock";
+const DVM_CONTROL_AUTHENTICATION: &str = "kvm-host-bound";
 const DVM_CONTROL_CAPABILITIES: &str = "health,device-inventory";
 const RUSTOS_BOOT_MARKER: &str = "rootd: core services ready, spawning initd via loaderd";
-const DVM_READY_MARKER: &str = "rustos-dvm-agent: ready protocol=agent-v1 state=pretransport";
+const DVM_GUEST_CID: u32 = 4;
+const VHOST_VSOCK_DEVICE: &str = "/dev/vhost-vsock";
 const MAX_SMOKE_TIMEOUT: u64 = 30;
 
 #[derive(Debug)]
@@ -117,13 +122,15 @@ where
         return Ok(());
     }
 
+    require_vhost_vsock()?;
+    let control_probe = start_dvm_control_probe(config, options.timeout)?;
     let (mut rustos, mut dvm) = spawn_guests(&qemu, config, &artifacts, &layout)?;
-    let result = wait_for_parallel_boot(&mut rustos, &mut dvm, &layout, &options);
+    let result = wait_for_parallel_boot(&mut rustos, &mut dvm, &layout, &options, &control_probe);
     stop_guest(&mut rustos);
     stop_guest(&mut dvm);
     result?;
     println!(
-        "xtask: parallel KVM boot passed (RustOS + Linux DVM); control={} is pre-transport and does not assert a RustOS-to-DVM data plane",
+        "xtask: parallel KVM boot passed (RustOS + Linux DVM); control={} verified host-to-DVM health and inventory only; no RustOS-to-DVM data plane is asserted",
         artifacts.control.control_plane(),
     );
     Ok(())
@@ -134,9 +141,9 @@ pub(crate) fn print_kvm_smoke_help() {
         "\
 usage: cargo xtask kvm-smoke [options]
 
-Boots the Linux DVM and RustOS concurrently with QEMU/KVM. This is an isolated
-parallel-boot check, not a production driver-domain launch: the current DVM
-control contract is pre-transport.
+Boots the Linux DVM and RustOS concurrently with QEMU/KVM. This verifies a
+host-authenticated Linux-DVM vsock health/inventory control probe, not a
+production driver-domain data plane.
 
 options:
   --timeout <seconds>  wait for readiness markers (1..={MAX_SMOKE_TIMEOUT}, default 30)
@@ -144,9 +151,9 @@ options:
   --dry-run            validate inputs and prepare KVM log paths without launching QEMU
   -h, --help           show this help
 
-The default proof requires RustOS to reach init handoff and Linux DVM to report
-`rustos-dvm-agent` ready. Both guests are launched as independent KVM processes;
-no vsock control channel or device data plane is implied.
+The default proof requires RustOS to reach init handoff and the L0-style host
+control listener to complete an authenticated Linux-DVM health/inventory probe.
+RustOS still has no vsock endpoint or device data plane.
 "
     );
 }
@@ -297,7 +304,7 @@ fn validate_manifest_values(values: &BTreeMap<String, String>) -> Result<DvmCont
         authentication: manifest_value(values, "control-authentication")?.to_owned(),
         capabilities: parse_control_capabilities(manifest_value(values, "control-capabilities")?)?,
     };
-    validate_pretransport_control_contract(&control)?;
+    validate_control_contract(&control)?;
     require_manifest_value(values, "control-plane", &control.control_plane())?;
     if !is_sha256(manifest_value(values, "control-contract-sha256")?) {
         bail!("invalid SHA-256 value for Linux DVM control contract");
@@ -321,11 +328,11 @@ fn parse_dvm_control_contract_text(text: &str, source: &str) -> Result<DvmContro
         capabilities: parse_control_capabilities(manifest_value(&values, "CONTROL_CAPABILITIES")?)?,
     };
     require_manifest_value(&values, "CONTROL_SCHEMA", "1")?;
-    validate_pretransport_control_contract(&control)?;
+    validate_control_contract(&control)?;
     Ok(control)
 }
 
-fn validate_pretransport_control_contract(control: &DvmControlContract) -> Result<()> {
+fn validate_control_contract(control: &DvmControlContract) -> Result<()> {
     if control.protocol != DVM_CONTROL_PROTOCOL
         || control.state != DVM_CONTROL_STATE
         || control.transport != DVM_CONTROL_TRANSPORT
@@ -487,6 +494,33 @@ fn require_qemu(config: &Config) -> Result<PathBuf> {
     })
 }
 
+fn require_vhost_vsock() -> Result<()> {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(VHOST_VSOCK_DEVICE)
+        .with_context(|| {
+            format!(
+                "KVM DVM control requires read/write access to {VHOST_VSOCK_DEVICE}; grant the launch user access before running kvm-smoke"
+            )
+        })?;
+    Ok(())
+}
+
+fn start_dvm_control_probe(
+    config: &Config,
+    timeout: Duration,
+) -> Result<Receiver<Result<ProbeResult>>> {
+    let contract_path = dvm_dir(config).join(DVM_CONTROL_CONTRACT);
+    let contract = HostControlContract::from_env_file(&contract_path)?;
+    let listener = HostControlListener::bind(DVM_GUEST_CID, DEFAULT_CONTROL_PORT, contract)?;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = sender.send(listener.probe_once(timeout));
+    });
+    Ok(receiver)
+}
+
 fn spawn_guests(
     qemu: &Path,
     config: &Config,
@@ -570,6 +604,8 @@ fn spawn_guests(
             layout.dvm_serial_log.display()
         ))
         .args(["-serial", "chardev:serial"])
+        .arg("-device")
+        .arg(format!("vhost-vsock-pci,guest-cid={DVM_GUEST_CID}"))
         .stdout(Stdio::null())
         .stderr(Stdio::from(std::fs::File::create(&layout.dvm_stderr_log)?));
     let dvm = match dvm_command.spawn() {
@@ -600,19 +636,29 @@ fn wait_for_parallel_boot(
     dvm: &mut Child,
     layout: &KvmLayout,
     options: &SmokeOptions,
+    control_probe: &Receiver<Result<ProbeResult>>,
 ) -> Result<()> {
     let deadline = Instant::now() + options.timeout;
+    let mut control_ready = None;
     loop {
         check_guest_running(rustos, "RustOS", &layout.rustos_stderr_log)?;
         check_guest_running(dvm, "Linux DVM", &layout.dvm_stderr_log)?;
         let rustos_log = fs::read_to_string(&layout.debugcon_log)?;
-        let dvm_log = fs::read_to_string(&layout.dvm_serial_log)?;
         let rustos_ready = options
             .expected_markers
             .iter()
             .all(|marker| rustos_log.contains(marker));
-        let dvm_ready = dvm_log.contains(DVM_READY_MARKER);
-        if rustos_ready && dvm_ready {
+        if control_ready.is_none() {
+            match control_probe.try_recv() {
+                Ok(Ok(probe)) => control_ready = Some(probe),
+                Ok(Err(error)) => return Err(error).context("Linux DVM host control probe failed"),
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    bail!("Linux DVM host control probe terminated without a result")
+                }
+            }
+        }
+        if rustos_ready && control_ready.is_some() {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -622,12 +668,11 @@ fn wait_for_parallel_boot(
                 .filter(|marker| !rustos_log.contains(marker.as_str()))
                 .cloned()
                 .collect::<Vec<_>>();
-            let missing_dvm = (!dvm_ready).then_some(DVM_READY_MARKER);
             bail!(
-                "KVM parallel boot did not reach readiness within {:?}; RustOS missing={:?}; Linux DVM missing={:?}; inspect {}, {}, {}, and {}",
+                "KVM parallel boot did not reach readiness within {:?}; RustOS missing={:?}; host-control-pending={}; inspect {}, {}, {}, and {}",
                 options.timeout,
                 missing_rustos,
-                missing_dvm,
+                control_ready.is_none(),
                 layout.debugcon_log.display(),
                 layout.dvm_serial_log.display(),
                 layout.rustos_stderr_log.display(),
@@ -684,7 +729,7 @@ mod tests {
     }
 
     #[test]
-    fn dvm_pretransport_contract_and_manifest_are_bound() {
+    fn dvm_control_contract_and_manifest_are_bound() {
         let contract_source = include_str!(
             "../../../driver-domains/linux/board/overlay/usr/share/rustos-dvm/control-plane-v1.env"
         );
@@ -698,14 +743,14 @@ mod tests {
 
         let hash = "0".repeat(64);
         let manifest = format!(
-            "schema=2\nid=rustos-linux-dvm-x86_64\narchitecture=x86_64\nboot=linux-bzimage+cpio-xz\ndata-plane=dvm-local-virtio\ncontrol-plane=agent-v1-pretransport\ncontrol-protocol=agent-v1\ncontrol-state=pretransport\ncontrol-transport=kvm-vsock-pending\ncontrol-authentication=kvm-host-bound-pending\ncontrol-capabilities=health,device-inventory\ncontrol-contract-sha256={hash}\nkernel_sha256={hash}\nrootfs_sha256={hash}\nconfig_sha256={hash}\nsources_lock_sha256={hash}\n"
+            "schema=2\nid=rustos-linux-dvm-x86_64\narchitecture=x86_64\nboot=linux-bzimage+cpio-xz\ndata-plane=dvm-local-virtio\ncontrol-plane=agent-v1-control\ncontrol-protocol=agent-v1\ncontrol-state=control\ncontrol-transport=kvm-vsock\ncontrol-authentication=kvm-host-bound\ncontrol-capabilities=health,device-inventory\ncontrol-contract-sha256={hash}\nkernel_sha256={hash}\nrootfs_sha256={hash}\nconfig_sha256={hash}\nsources_lock_sha256={hash}\n"
         );
         let values = parse_manifest_text(&manifest, "manifest").unwrap();
         assert_eq!(validate_manifest_values(&values).unwrap(), contract);
     }
 
     #[test]
-    fn dvm_pretransport_contract_rejects_data_plane_capability() {
+    fn dvm_control_contract_rejects_data_plane_capability() {
         let contract_source = include_str!(
             "../../../driver-domains/linux/board/overlay/usr/share/rustos-dvm/control-plane-v1.env"
         );

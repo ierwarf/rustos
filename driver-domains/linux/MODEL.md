@@ -25,6 +25,32 @@ driverd / netd / storaged  Linux LTS + firmware + supported .ko
 - One PCI/IOMMU group has exactly one active owner. Failed revoke/reset is a
   fail-closed condition, never a reason to reassign the device anyway.
 
+## L0 launch-plan and VFIO lease
+
+`rustos-hostd discover` reads the host IOMMU topology and `rustos-hostd
+preflight --plan ...` validates a `launch-plan-v1.env` contract. The plan must
+name the complete actual IOMMU group, not a single desired PCI function, and
+must reject any host-protected PCI BDF in that group. Both commands are
+read-only: neither unbinds a driver, assigns VFIO, resets hardware, nor starts
+a DVM.
+
+`rustos-hostd acquire` is also read-only by default. Its explicit laboratory
+path requires both `--activate` and `--allow-unsigned-test-bind`; it writes a
+private `prepared` lease before changing any sysfs binding, snapshots every
+original driver and `driver_override`, binds the whole validated group to
+`vfio-pci`, then atomically marks the lease `active`. If acquisition fails, it
+rolls back in reverse order but retains the `prepared` record for explicit
+recovery. `release --activate` restores a `prepared` or `active` lease and
+removes its record only after restoration succeeds; a crash or failed restore
+also intentionally leaves the record for recovery. Lease files
+are owner-private and their directory is owner-private before use.
+
+Unsigned laboratory binding is deliberately not a production path. A release
+manifest must cryptographically bind the validated plan, DVM artifact hashes,
+and policy before normal hardware lifecycle activation is enabled. Do not use
+the laboratory flag for the L0 boot disk, active display/GPU, Wi-Fi, or any
+other host-critical IOMMU group.
+
 ## Transport contract
 
 The initial image uses unmodified upstream Linux interfaces inside the DVM:
@@ -39,14 +65,14 @@ grant RustOS host authority.
   RustOS guest-to-guest data plane.
 - The immutable `control-plane-v1.env` contract is carried in the DVM image,
   hashed into its artifact manifest, and written by the agent to
-  `/run/rustos-dvm/ready`. It declares `state=pretransport`.
-- Planned inter-domain transport is KVM vsock with explicit RustOS and Linux
-  endpoints. `pretransport` means neither endpoint, no control request, and no
-  device queue is live yet.
-- The future control endpoint is authenticated with host-bound domain identity
-  before it exposes an approved capability. Health and device inventory are the
-  only initial capabilities; network, block, input, display, and GPU data
-  planes require separately versioned protocols.
+  `/run/rustos-dvm/ready`. In `state=control`, the agent connects only to the
+  L0 host's KVM-vsock listener using its launch-assigned CID.
+- L0 validates the source CID and the complete DVM control contract before it
+  requests health or PCI device inventory. The control request is host-to-DVM;
+  it is not a direct RustOS-to-DVM channel.
+- Health and device inventory are the only implemented capabilities. RustOS
+  still has no vsock endpoint. Network, block, input, display, and GPU data
+  planes require separately versioned protocols and a RustOS-side consumer.
 
 This avoids a Linux kernel fork. A small agent is still required for health,
 device state, and authenticated control messages. There is currently no live

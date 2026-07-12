@@ -7,9 +7,9 @@
 This is a Buildroot-based, immutable Linux appliance for RustOS driver
 domains. `cargo xtask build-dvm` and `verify-dvm` use this exact wrapper and
 verify its manifest hashes. The image carries a hashed, fail-closed
-`agent-v1-pretransport` control contract, but is still not a usable RustOS
-driver domain: RustOS has no KVM vsock transport or device-consumption path
-yet.
+`agent-v1-control` contract. Its agent permits only an L0-host-authenticated
+KVM-vsock health and PCI-inventory probe; it is still not a usable RustOS
+driver domain because RustOS has no vsock endpoint or device-consumption path.
 
 The pinned inputs are in `sources.lock`:
 
@@ -58,9 +58,10 @@ See [MODEL.md](MODEL.md) for the ownership and transport boundary.
 
 RustOS Linux driver domain용 Buildroot 기반 불변 appliance입니다.
 `cargo xtask build-dvm`, `verify-dvm`가 이 wrapper를 사용하고 manifest hash를
-검증합니다. 해시로 검증되는 fail-closed `agent-v1-pretransport` control contract만
-들어 있고 RustOS에는 KVM vsock transport와 device-consumption 경로가 아직
-없으므로 이 이미지는 아직 사용 가능한 driver domain은 아닙니다.
+검증합니다. 해시로 검증되는 fail-closed `agent-v1-control` contract가 들어
+있습니다. 이 agent는 L0 host가 인증한 KVM vsock health/PCI inventory probe만
+허용합니다. RustOS에는 vsock endpoint와 device-consumption 경로가 아직 없으므로
+이 이미지는 아직 사용 가능한 driver domain은 아닙니다.
 
 고정 입력은 `sources.lock`에 있습니다.
 

@@ -20,6 +20,7 @@ readonly LIBELF_SYSROOT="${RUSTOS_DVM_LIBELF_SYSROOT:-}"
 BUILDROOT_DIR=""
 LIBELF_INCLUDE_DIR=""
 LIBELF_LIBRARY_DIR=""
+HOST_TOOL_DIR="$OUT_DIR/host-tools"
 
 die() {
     echo "rustos-linux-dvm: $*" >&2
@@ -28,6 +29,16 @@ die() {
 
 require_tool() {
     command -v "$1" >/dev/null 2>&1 || die "required host tool not found: $1"
+}
+
+prepare_host_tools() {
+    local gnu_install
+
+    gnu_install="$(command -v gnuinstall || true)"
+    test -n "$gnu_install" || die "missing GNU install; install gnu-coreutils"
+    mkdir -p "$HOST_TOOL_DIR"
+    ln -sfn "$gnu_install" "$HOST_TOOL_DIR/install"
+    export PATH="$HOST_TOOL_DIR:$PATH"
 }
 
 require_kernel_build_headers() {
@@ -117,7 +128,7 @@ prepare_sources() {
 input_hash() {
     (
         cd "$ROOT"
-        find configs board scripts -type f -print0 | sort -z | xargs -0 sha256sum
+        find configs board package scripts -type f -print0 | sort -z | xargs -0 sha256sum
         sha256sum sources.lock external.desc external.mk Config.in
         sha256sum "$LIBELF_INCLUDE_DIR/libelf.h" "$LIBELF_INCLUDE_DIR/gelf.h"
         if test -n "$LIBELF_LIBRARY_DIR"; then
@@ -141,6 +152,13 @@ configure() {
     if test -f "$BUILD_DIR/.config" && test -f "$stamp" \
         && test "$(cat "$stamp")" = "$current"; then
         return
+    fi
+    # Buildroot does not necessarily track edits to BR2_EXTERNAL local-package
+    # sources through its package stamps.  The DVM image must never report a
+    # manifest/control hash for an old agent binary, so any hashed input change
+    # invalidates the target tree before reconfiguration.
+    if test -f "$BUILD_DIR/.config"; then
+        make_buildroot clean
     fi
     mkdir -p "$BUILD_DIR"
     make_buildroot rustos_linux_dvm_x86_64_defconfig
@@ -193,6 +211,7 @@ distclean() {
 
 main() {
     load_lock
+    prepare_host_tools
     case "$COMMAND" in
         fetch)
             require_tool curl

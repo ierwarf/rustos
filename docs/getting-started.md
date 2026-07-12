@@ -46,15 +46,16 @@ cargo xtask kvm-smoke --expect 'runtimed: bootstrap ui done'
 ```
 
 `build-dvm` produces a pinned Buildroot Linux driver-domain appliance and
-`verify-dvm` checks its artifact and pre-transport control-contract hashes.
+`verify-dvm` checks its artifact and host-control-contract hashes.
 `kvm-smoke` creates a private disk under `build/kvm/`, launches Linux DVM and
-RustOS concurrently, requires both readiness markers, then stops only the
-QEMU children it created. It preserves their debugcon, serial, and stderr
-captures for inspection.
+RustOS concurrently, requires the RustOS readiness marker plus the validated
+host-to-DVM control probe, then stops only the QEMU children it created. It
+preserves their debugcon, serial, and stderr captures for inspection.
 
-The DVM currently advertises `agent-v1-pretransport`: there is no authenticated
-RustOS↔DVM transport or usable device data plane yet. Do not interpret a KVM
-smoke pass as NIC, storage, `.ko`, or passthrough validation.
+The DVM currently advertises `agent-v1-control`: L0 can make an authenticated
+vsock health/PCI-inventory probe, but RustOS still has no endpoint or usable
+device data plane. Do not interpret a KVM smoke pass as NIC, storage, `.ko`,
+or passthrough validation.
 
 <a id="korean"></a>
 
@@ -100,11 +101,13 @@ cargo xtask kvm-smoke --expect 'runtimed: bootstrap ui done'
 ```
 
 `build-dvm`은 고정된 Buildroot Linux driver-domain appliance를 만들고,
-`verify-dvm`은 artifact와 pre-transport control-contract hash를 검증합니다.
+`verify-dvm`은 artifact와 host-control contract hash를 검증합니다.
 `kvm-smoke`는 `build/kvm/`에 private disk를 만들고 Linux DVM과 RustOS를 병렬로
-부팅합니다. 양쪽 readiness marker를 모두 요구하며 자신이 만든 QEMU child만
-종료합니다. debugcon, serial, stderr capture는 분석용으로 유지합니다.
+부팅합니다. RustOS readiness marker와 검증된 host-to-DVM control probe를
+요구하며 자신이 만든 QEMU child만 종료합니다. debugcon, serial, stderr capture는
+분석용으로 유지합니다.
 
-현재 DVM이 `agent-v1-pretransport`만 알리므로 인증된 RustOS↔DVM transport와
-device data plane이 아직 없습니다. KVM smoke 통과를 NIC, storage, `.ko`,
-passthrough 검증으로 해석하면 안 됩니다.
+현재 DVM은 `agent-v1-control`을 알립니다. L0가 인증된 vsock health/PCI
+inventory probe를 수행할 수 있지만, RustOS↔DVM endpoint와 device data plane은
+아직 없습니다. KVM smoke 통과를 NIC, storage, `.ko`, passthrough 검증으로
+해석하면 안 됩니다.

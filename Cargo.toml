@@ -4,6 +4,7 @@ members = [
     "boot/boot-protocol",
     "kernel/nucleus-core",
     "libs/boot-random",
+    "libs/driver-domain-host",
     "libs/observability-client",
     "libs/runtime-control",
     "libs/rustos-user-abi",
@@ -47,6 +48,7 @@ members = [
     "drivers/bridges/input/keyboard",
     "tests/module-tests",
     "tools/xtask",
+    "tools/hostd",
 ]
 resolver = "3"
 

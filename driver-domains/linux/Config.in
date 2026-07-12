@@ -1,2 +1,7 @@
 # SPDX-License-Identifier: MIT
-# No Buildroot menu entries yet.
+
+menu "RustOS Linux driver-domain components"
+
+source "$BR2_EXTERNAL_RUSTOS_LINUX_DVM_PATH/package/rustos-dvm-agent/Config.in"
+
+endmenu

@@ -3,7 +3,7 @@
 
 case "$1" in
     start)
-        /usr/libexec/rustos-dvm-agent announce
+        /usr/libexec/rustos-dvm-agent serve &
         ;;
     stop)
         ;;

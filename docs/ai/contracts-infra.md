@@ -164,11 +164,27 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   repository-pinned `OVMF_PATH` with QEMU. It starts RustOS and Linux DVM as
   independent KVM guests and preserves their logs under `build/kvm/`.
 - A successful smoke requires RustOS's default `rootd` readiness marker and
-  Linux DVM's `rustos-dvm-agent` ready marker. A guest that exits or merely
-  starts cannot pass. The DVM's `agent-v1-pretransport` contract names only
-  future host-authenticated KVM-vsock control with `health,device-inventory`;
-  it is not a live endpoint. Additional `--expect` markers tighten RustOS
-  proof; none prove a RustOS device, `.ko`, PCI assignment, or a network route.
+  the L0-style host listener to complete the DVM `health,device-inventory`
+  probe using launch-assigned KVM vsock CID `4`. A guest that exits or merely
+  starts cannot pass: the host probe requires a validated DVM agent response.
+  The `agent-v1-control` endpoint is host-to-DVM only; it is not a live RustOS
+  endpoint. Additional `--expect` markers tighten RustOS proof; none prove a
+  RustOS device, `.ko`, PCI assignment, or a network route.
+- `rustos-hostd discover` and `rustos-hostd preflight --plan ...` are L0
+  read-only ownership gates. `launch-plan-v1.env` must explicitly enumerate
+  every function in one actual IOMMU group and reject host-protected BDFs;
+  neither command performs a driver unbind, VFIO bind, device reset, guest
+  launch, or PCI assignment. Do not turn a successful preflight into a
+  passthrough claim.
+- `rustos-hostd acquire` remains read-only unless both `--activate` and
+  `--allow-unsigned-test-bind` are supplied. That laboratory-only path first
+  persists an owner-private `prepared` lease with each original PCI driver and
+  `driver_override`, then binds the whole preflighted group to `vfio-pci` and
+  atomically marks it active. Reverse-order rollback is mandatory on failure;
+  failed acquisition retains the prepared record, and `release --activate`
+  restores either prepared or active records and deletes them only after
+  success. Do not enable ordinary activation until a release
+  manifest cryptographically binds the validated plan to the DVM artifacts.
 
 ## Fault Injection
 

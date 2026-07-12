@@ -21,30 +21,43 @@ failure output as the primary debugging context.
 | `cargo xtask build-dvm` | build the pinned Linux DVM and verify its manifest | `driver-domains/linux/out/` | missing Buildroot prerequisite or source/artifact mismatch |
 | `cargo xtask verify-dvm` | verify every DVM artifact and control-contract hash | none | altered/missing DVM artifact or contract |
 | `cargo xtask kvm-smoke` | concurrently boot Linux DVM and RustOS with QEMU/KVM | `build/kvm/` | unavailable `/dev/kvm`, guest exit, missing readiness marker |
+| `cargo run -p rustos-hostd -- discover` | read host IOMMU groups | none | IOMMU unavailable or unreadable sysfs |
+| `cargo run -p rustos-hostd -- preflight --plan <file>` | require complete, non-protected IOMMU-group ownership | none | incomplete group or host-critical BDF |
 
 ## Tests and inventory
 
 | Command | Use | Writes | Common failure meaning |
 | --- | --- | --- | --- |
 | `cargo xtask selftest` | host selftests for fault parsing, ABI/layout, runtime contracts, module tests | `target/` | contract/layout regression |
-| `cargo xtask fuzz-host --target all` | deterministic host fuzz smoke for fault rules, project config, package manifest, and DVM manifest parsing | `logs/` on crash | parser panic or invariant bug |
+| `cargo xtask fuzz-host --target all` | deterministic host fuzz smoke for fault rules, project config, package/DVM manifests, and hostd launch-plan parsing | `logs/` on crash | parser panic or invariant bug |
 | `cargo xtask ring3-inventory` | classify remaining `RING3-MIGRATION-REFERENCE` and `RING3-MIGRATION-COMMENTED-OUT` LOC by owner/lane; read `migration_candidate_loc` as real remaining ring3 work, `ko_slowpath_ring3_loc` as Linux `.ko` slow-path brokerization reference LOC, and `cleanup_debt_loc` as delete/retire work | none | stale marker classification or unexpected active LOC growth |
 | `cargo test -p module-tests` | module tests | `target/` | unit/module regression |
 | `git diff --check` | whitespace sanity | none | trailing whitespace/conflict marker |
 
 ## KVM smoke arguments
 
-- `kvm-smoke` requires `/dev/kvm` access and `qemu-system-x86_64`; it does not
-  alter host hypervisor configuration.
+- `kvm-smoke` requires read/write `/dev/kvm` and `/dev/vhost-vsock` access plus
+  `qemu-system-x86_64`; it does not alter host hypervisor configuration.
 - `--timeout <seconds>` is bounded to `1..=30` and applies only while waiting
   for expected RustOS debugcon and Linux DVM serial markers.
 - The default marker is `rootd: core services ready, spawning initd via loaderd`;
   repeat `--expect <marker>` for each additional RustOS milestone.
 - `--dry-run` verifies DVM artifacts and prepares `build/kvm/` without
   launching QEMU.
-- The DVM's `agent-v1-pretransport` contract is future host-authenticated KVM
-  vsock control only. The lifecycle smoke is not a NIC, storage, `.ko`, PCI
-  passthrough, or transport test. Keep those claims behind explicit markers.
+- The DVM's `agent-v1-control` contract makes a host-authenticated KVM-vsock
+  health and PCI-inventory probe. It is not a RustOS endpoint, NIC, storage,
+  `.ko`, PCI-passthrough, or device-data-plane test. Keep those claims behind
+  explicit markers.
+
+## L0 VFIO laboratory recovery
+
+- `rustos-hostd acquire --plan <file>` is dry-run by default. The only current
+  write path is `--activate --allow-unsigned-test-bind`; it is laboratory-only
+  until a signed release manifest binds the plan to the DVM artifacts.
+- Never use that path for the host boot disk, active display/GPU, Wi-Fi, or a
+  mixed IOMMU group. `release --activate` is the recovery path and removes the
+  durable lease only after all original driver and `driver_override` values are
+  restored.
 
 ## Do not run
 
