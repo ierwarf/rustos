@@ -143,7 +143,6 @@ fn default_seeds(target: FuzzTarget) -> Vec<Vec<u8>> {
         ],
         FuzzTarget::PackageManifest => vec![
             b"id=\"sample\"\nkind=\"service\"\n[build]\nbuilder=\"cargo-kernel-binary\"\npackage=\"sample\"\n[install]\npath=\"services/sample/sample.elf\"\n".to_vec(),
-            b"id=\"sample-driver\"\nkind=\"bridge-driver\"\n[build]\nbuilder=\"module-image\"\npackage=\"sample-driver\"\n[install]\npath=\"system/drivers/sample.ko\"\n".to_vec(),
             b"id=\"hidden-app\"\nkind=\"app\"\nstartup=\"session\"\n[build]\nbuilder=\"cargo-kernel-binary\"\npackage=\"hidden-app\"\n[install]\npath=\"apps/hidden-app/hidden-app.elf\"\n[[desktop.entries]]\ndisplay_name=\"hidden\"\nweight_micros=100\nno_display=true\n".to_vec(),
         ],
         FuzzTarget::DvmManifest => vec![

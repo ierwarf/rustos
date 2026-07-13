@@ -28,7 +28,6 @@
 
 - [Add a Service](guides/add-service.md)
 - [Add an App](guides/add-app.md)
-- [Add a Driver](guides/add-driver.md)
 
 # Reference
 

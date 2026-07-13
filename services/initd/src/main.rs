@@ -7,21 +7,20 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use runtime_control::{
-    load_runtime_default_env, load_startup_entries, RuntimeEnvScope, StartupEntry, StartupMode,
-    DEFAULT_RUNTIME_ENV_REGISTRY_PATH, DEFAULT_STARTUP_REGISTRY_PATH,
+    DEFAULT_RUNTIME_ENV_REGISTRY_PATH, DEFAULT_STARTUP_REGISTRY_PATH, RuntimeEnvScope,
+    StartupEntry, StartupMode, load_runtime_default_env, load_startup_entries,
 };
 use rustos_user_abi::syscall::{
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, LoaderSpawnRequest,
-    LoaderSpawnResponse, RustosIpcWaitServiceEndpointArgs, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
-    COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR, COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL,
-    IPC_SERVICE_DEVMGRD, IPC_SERVICE_DRIVERD, IPC_SERVICE_INPUTD, IPC_SERVICE_LINUX_SYSCALLD,
-    IPC_SERVICE_LOADERD, IPC_SERVICE_NETD, IPC_SERVICE_ROOTD, IPC_SERVICE_SESSIOND,
-    IPC_SERVICE_STORAGED, IPC_SERVICE_VFSD, IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION,
-    IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS, LOADER_OP_ACTIVATE, LOADER_OP_SPAWN_EXEC,
-    LOADER_REQUEST_ABI_VERSION,
-    LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY,
-    LOADER_SPAWN_FLAG_DEFER_START, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
-    SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT,
+    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR,
+    COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL, CommercialMaxProtocolRequest,
+    CommercialMaxProtocolResponse, IPC_SERVICE_DEVMGRD, IPC_SERVICE_INPUTD,
+    IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD, IPC_SERVICE_NETD, IPC_SERVICE_ROOTD,
+    IPC_SERVICE_SESSIOND, IPC_SERVICE_STORAGED, IPC_SERVICE_VFSD,
+    IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION, IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS,
+    LOADER_OP_ACTIVATE, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
+    LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_FLAG_DEFER_START,
+    LoaderSpawnRequest, LoaderSpawnResponse, RustosIpcWaitServiceEndpointArgs, SYS_RUSTOS_IPC_CALL,
+    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT,
 };
 
 const INITD_EXEC_PATH: &str = "services/initd/initd.elf";
@@ -29,7 +28,6 @@ const SYSCALLD_EXEC_PATH: &str = "services/syscalld/syscalld.elf";
 const VFSD_EXEC_PATH: &str = "services/vfsd/vfsd.elf";
 const NETD_EXEC_PATH: &str = "services/netd/netd.elf";
 const DEVMGRD_EXEC_PATH: &str = "services/devmgrd/devmgrd.elf";
-const DRIVERD_EXEC_PATH: &str = "services/driverd/driverd.elf";
 const LOADERD_EXEC_PATH: &str = "services/loaderd/loaderd.elf";
 const RUNTIMED_EXEC_PATH: &str = "services/runtimed/runtimed.elf";
 const STORAGED_EXEC_PATH: &str = "services/storaged/storaged.elf";
@@ -190,12 +188,7 @@ fn main() {
                         "launch {} failed: errno={err}",
                         entry.exec
                     );
-                    record_launch_failure(
-                        &mut retry_state,
-                        entry.exec.as_str(),
-                        "spawn",
-                        err,
-                    );
+                    record_launch_failure(&mut retry_state, entry.exec.as_str(), "spawn", err);
                 }
             }
         }
@@ -296,13 +289,12 @@ fn init_exec_priority(exec: &str) -> u8 {
         SYSCALLD_EXEC_PATH => 0,
         VFSD_EXEC_PATH => 1,
         LOADERD_EXEC_PATH => 2,
-        DRIVERD_EXEC_PATH => 3,
-        NETD_EXEC_PATH => 4,
-        DEVMGRD_EXEC_PATH => 5,
-        INPUTD_EXEC_PATH => 6,
-        STORAGED_EXEC_PATH => 7,
-        RUNTIMED_EXEC_PATH => 8,
-        _ => 9,
+        NETD_EXEC_PATH => 3,
+        DEVMGRD_EXEC_PATH => 4,
+        INPUTD_EXEC_PATH => 5,
+        STORAGED_EXEC_PATH => 6,
+        RUNTIMED_EXEC_PATH => 7,
+        _ => 8,
     }
 }
 
@@ -312,7 +304,6 @@ fn launch_gate_satisfied(exec: &str) -> bool {
         LOADERD_EXEC_PATH => {
             service_ready(IPC_SERVICE_LINUX_SYSCALLD) && service_ready(IPC_SERVICE_VFSD)
         }
-        DRIVERD_EXEC_PATH => foundation_policy_services_ready(),
         RUNTIMED_EXEC_PATH => {
             foundation_policy_services_ready()
                 && service_ready(IPC_SERVICE_NETD)
@@ -435,7 +426,6 @@ fn wait_reported_service_endpoint(exec_path: &str, pid: i32) -> Result<(), i32> 
 
 fn rootd_service_id_for_exec(exec_path: &str) -> Option<u64> {
     match exec_path {
-        DRIVERD_EXEC_PATH => Some(IPC_SERVICE_DRIVERD),
         NETD_EXEC_PATH => Some(IPC_SERVICE_NETD),
         DEVMGRD_EXEC_PATH => Some(IPC_SERVICE_DEVMGRD),
         INPUTD_EXEC_PATH => Some(IPC_SERVICE_INPUTD),
@@ -544,12 +534,7 @@ fn reap_children(
                     status
                 );
                 if service.restart {
-                    record_launch_failure(
-                        retry_state,
-                        service.exec.as_str(),
-                        "exit",
-                        status,
-                    );
+                    record_launch_failure(retry_state, service.exec.as_str(), "exit", status);
                 }
             }
             continue;
@@ -755,9 +740,7 @@ fn lookup_loader_endpoint() -> Result<u64, i32> {
 fn exec_weight_micros(exec_path: &str) -> u64 {
     match exec_path {
         NETD_EXEC_PATH | DEVMGRD_EXEC_PATH => EARLY_POLICY_TASK_WEIGHT_MICROS,
-        RUNTIMED_EXEC_PATH | DRIVERD_EXEC_PATH | INPUTD_EXEC_PATH => {
-            DISPLAY_CRITICAL_TASK_WEIGHT_MICROS
-        }
+        RUNTIMED_EXEC_PATH | INPUTD_EXEC_PATH => DISPLAY_CRITICAL_TASK_WEIGHT_MICROS,
         _ => DEFAULT_INIT_TASK_WEIGHT_MICROS,
     }
 }

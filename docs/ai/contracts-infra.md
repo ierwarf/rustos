@@ -16,7 +16,7 @@ Package/stage schemas, runtime control, kernel API, build, fault injection, logg
 
 | Field | Values |
 |-------|--------|
-| `kind` | `boot`, `kernel`, `bridge-driver`, `user-driver`, `service`, `app`, `compat` |
+| `kind` | `boot`, `kernel`, `user-driver`, `service`, `app`, `compat` |
 | `execution_domain` | `kernel`, `user` |
 | `startup` | `none`, `init`, `session`, `desktop` |
 | `install.layout` | `file`, `directory` |
@@ -26,25 +26,15 @@ Package/stage schemas, runtime control, kernel API, build, fault injection, logg
 the `.desktop` file; it hides discovery without disabling an explicit startup
 or launch policy.
 
-### Driver Autoload
+### Driver-domain policy
 
-- `deps`: required module preloads (Linux `modules.dep` role).
-- Missing or skipped `deps` must skip the dependent driver; never autoload a
-  hard-dependent `.ko` after its required provider is absent.
-- `softdeps`: best-effort preloads (Linux `modprobe.d softdep pre:` role).
-- List fields stage as comma-separated registry values; items must not contain tab, newline, carriage return, or comma.
-- `linux_driver_names`: Linux in-module driver names allowed to register from that package. If omitted, defaults to autoload `name`. Linux driver compat registration must use this registry field — not hardcoded driver names.
-- `provider_group`: mutually exclusive provider contract. Once a loadable/native provider marks the group active, later normal and fallback candidates are skipped before alias probing. `fallback_only` candidates are lower-priority substitutes used only when no provider in the group loaded.
-- Retired display preferred-scanout policy flags/width/height are rejected by
-  the ring0 module-load broker; driverd/provider state owns scanout selection.
-- Driver `class` registry values: `display`, `input`, `network`, `usb`, `storage`. `usb` is reserved for explicit USB compat/dev bridge modules; native xHCI is the RustOS host-controller path and is not staged as a Linux `.ko`.
-- `display-primary` group: real hardware/DVM providers are ordered ahead of the
-  kernel-owned firmware framebuffer fallback. The fallback is registered during
-  GUI bootstrap, never staged as a `.ko`, and is replaced only by a validated
-  primary provider.
-- `driverd` owns autoload policy. Kernel driver brokers may expose narrow
-  hardware-presence primitives for staged aliases (`pci:*`, `virtio:*`) but
-  **must not** pick provider order or bypass registry `provider_group` policy.
+- RustOS package manifests do not describe Linux modules or direct hardware
+  drivers. `bridge-driver` and `module-image` are invalid manifest values.
+- Linux DVM build inputs live under `driver-domains/linux/` and are verified by
+  `cargo xtask build-dvm` / `verify-dvm`, outside the RustOS package registry.
+- RustOS accepts fixed DVM input, display, and Ethernet transports only. If a
+  transport is absent or invalid, that device is unavailable; no native or
+  firmware fallback is selected.
 
 ## Stage Outputs
 
@@ -160,7 +150,8 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   (`rustos-dvm-agent`, `rustos-dvm-display`, `rustos-dvm-net`), and the rootfs
   overlay separately. Configuration or toolchain changes use `distclean`; a
   relay edit removes only that relay's Buildroot directory, while overlay-only
-  changes regenerate only the CPIO image. `make -C driver-domains/linux
+  changes prune retired overlay-owned files, synchronize current overlay files,
+  and regenerate only the CPIO image. `make -C driver-domains/linux
   rebuild-{agent,display,net}` are explicit package-only rebuild entrypoints.
 - The DVM wrapper requires host `libelf` headers and an unversioned linker
   library. `RUSTOS_DVM_LIBELF_SYSROOT` may name an immutable extracted
@@ -190,9 +181,16 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
 - `agent-v1-control` remains DVM-to-L0 only. The RDI2 COM2 channel is a
   bounded input relay, not a general vsock endpoint or a NIC/block/GPU data
   plane. L0 limits event rate, emits held-key/button releases on disconnect,
-  and sends a session end so reconnects cannot inherit input state. Additional
-  `--expect` markers tighten RustOS proof; none prove a
-  `.ko`, PCI assignment, physical input capture, or a network route.
+  and sends a session end so reconnects cannot inherit input state. COM2 has
+  no IRQ: the capability-gated `inputd` ingest broker drains at most sixteen
+  complete RDI2 frames on each normal 4ms ingest turn, so live pointer motion
+  never depends on the one-second housekeeping heartbeat. That broker is the
+  sole runtime COM2 drain owner; housekeeping services only native lower-half
+  input transport and cannot contend for the DVM decoder. The DVM coalesces
+  relative pointer samples at 125Hz (buttons are immediate), and L0 caps the
+  entire relay at 256 frames/s to stay within COM2's physical budget. Additional
+  `--expect` markers tighten RustOS proof; none prove PCI assignment, physical
+  input capture, or a network route.
 - `cargo xtask kvm-smoke --min-ui-fps N` modifies only the runner's fresh
   private FAT disk copy: the staged `uiserver.desktop` carries the
   equal-length disabled anchor `RUSTOS_UI_PROFILE=0`, which is changed to `1`
@@ -205,13 +203,19 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   separate Linux `rustos-dvm-display` service reads that aperture and uses its
   own DRM/KMS double-buffered page flips. The gate requires RustOS's observed
   display ABI to match the exact header and the DVM's active DRM relay marker.
-  This KVM topology proves the display transport; it is not PCI passthrough or
-  a physical-GPU assignment contract.
-- The default KVM image does not stage any `system/drivers/*.ko` artifact; the
-  manifest loader rejects one before image construction. RustOS virtio-GPU and
-  virtio-net `.ko` paths are removed; physical input artifacts require
-  `legacy-input-compat`. The kernel registers the bounded early-boot firmware
-  framebuffer directly until the DVM display provider is available.
+  Both smoke and interactive DVM launches disable QEMU's default VGA so the
+  service opens the sole virtio-GPU DRM device rather than a competing VGA DRM
+  node. The interactive GTK frontend uses `zoom-to-fit=off`, and the private
+  DVM virtio-GPU disables resize-aware EDID: otherwise GTK's bootstrap window
+  can request 640×480 before Linux DRM starts and force unnecessary scaling.
+  QEMU's explicit 1600×900 mode is therefore authoritative. The DVM relay
+  nevertheless preserves the fixed shared ABI and can scale only when a
+  display backend genuinely requires a different mode. This KVM topology
+  proves the display transport; it is not PCI
+  passthrough or a physical-GPU assignment contract.
+- The default KVM image contains no RustOS module artifact. RustOS has no
+  direct GPU, network, USB, or PS/2 provider; the UI and network fail closed
+  until their respective DVM transports validate.
 - `cargo xtask kvm-smoke --dvm-network-shmem` adds a host-created fixed 64-slot
   Ethernet aperture. RustOS may map only the validated header and fixed slots;
   it never follows DVM descriptors or allocations. Linux's `rustos-dvm-net`
@@ -277,29 +281,15 @@ Add new points only at realistic failure boundaries: allocation, block IO, devic
 
 `config/rustos.toml` may use normal TOML formatting for fault rules (including multiline arrays); logging extraction must ignore non-logging sections.
 
-## Linux Network & Driver Compat
+## Network and driver boundary
 
-- `netd` owns socket namespace/policy; `driverd` owns autoload/provider policy. `kernel/io-manager/src/driver/mod.rs` is limited to privileged DMA/IRQ/IOMMU + explicit module-load substrate.
-- The legacy-only kernel broker validates `.ko` images, relocates them, exposes
-  `DriverKernelApiV1`, maps MMIO, and executes module init. The default image
-  cannot stage a bridge-driver `.ko`; new device support belongs in a bounded
-  driver domain rather than this compatibility path.
-- Deleted io-manager policy files are not source of truth — do not restore.
-- Linux compat symbols must be explicitly implemented; no broad no-op fallbacks.
-- Vendor NVMe host `.ko` packages stay out of the default profile until block-layer/auth/io_uring compat is explicit; native RustOS NVMe remains the default boot/storage provider.
-- RustOS virtio-GPU `.ko` artifacts and their in-kernel scanout/DRM shim are
-  removed. Default KVM uses the isolated Linux DVM DRM/KMS relay; do not
-  reintroduce either path or count it as a ring3 service-driver migration
-  target.
-- RustOS's virtio-net `.ko` shim is removed. The KVM DVM route is a fixed
-  Ethernet-frame transport and `netd` remains the default network policy
-  owner; it does not authorize physical NIC passthrough.
-- Vendor HID core `.ko` stays out of the default profile while USB HID leaf modules are disabled; native RustOS input remains the default boot input provider.
-- Hardware-specific display drivers such as AMDGPU stay out of the default KVM
-  profile unless the assigned hardware matches; use an explicit hardware
-  profile instead.
-- Native xHCI and HID interrupt polling are always on for USB input/display probes.
-- Optional net features (XDP, BPF, AF_XDP, ethtool offloads, DIM) may use per-symbol disabled shims; must fail closed — **never** fabricate packets or carrier state.
+- `netd` owns socket policy. `kernel/io-manager/src/network/mod.rs` is only a
+  DVM fixed-frame transport facade and must never enumerate or initialize a
+  virtio NIC directly.
+- The DVM owns Linux driver lifecycle, DRM/KMS, evdev, and virtio-net. RustOS
+  validates transport headers and bounds, then fails closed on transport loss.
+- Deleted direct-driver sources are not a source of truth and must not be
+  restored as a recovery path.
 
 ## Logging
 

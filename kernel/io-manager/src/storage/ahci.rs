@@ -1,4 +1,4 @@
-// RING3-MIGRATION-REFERENCE START: bootstrap exception: storaged/driverd own
+// RING3-MIGRATION-REFERENCE START: bootstrap exception: storaged owns
 // post-bootstrap AHCI admission/provider policy. Ring0 keeps this built-in
 // AHCI path as early-boot/fallback privileged transport substrate until a
 // ring3 service-driver host can perform boot-volume reads before rootd/vfsd
@@ -584,4 +584,4 @@ fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
     }
     false
 }
-// RING3-MIGRATION-REFERENCE END: storaged/driverd-owned AHCI bootstrap transport exception.
+// RING3-MIGRATION-REFERENCE END: storaged-owned AHCI bootstrap transport exception.

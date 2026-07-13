@@ -1,5 +1,5 @@
 // RING3-MIGRATION-REFERENCE START: display-present-substrate exception:
-// uiserver/driverd own display backend provider policy. Ring0 keeps framebuffer
+// uiserver and the Linux DVM own display backend policy. Ring0 keeps framebuffer
 // mapping, write-combine setup, and present copy substrate.
 #[cfg(rustos_debug_print_enabled)]
 use core::sync::atomic::AtomicUsize;
@@ -271,4 +271,4 @@ fn framebuffer_info_is_valid(info: FramebufferInfo) -> bool {
 
     min_size <= size
 }
-// RING3-MIGRATION-REFERENCE END: uiserver/driverd-owned display backend substrate exception.
+// RING3-MIGRATION-REFERENCE END: uiserver/DVM-owned display backend substrate exception.

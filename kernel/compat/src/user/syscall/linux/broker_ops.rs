@@ -28,10 +28,7 @@ pub(super) use device_broker_ops::device_sysop_error_to_linux_errno;
 pub(super) fn is_linux_rustos_broker_syscall(syscall_number: u64) -> bool {
     matches!(
         syscall_number,
-        linux_abi::SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER
-            | linux_abi::SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER
-            | linux_abi::SYS_RUSTOS_DRIVER_SYMBOL_EVENT_BROKER
-            | linux_abi::SYS_RUSTOS_SERVICE_DRIVER_RESOURCE_BROKER
+        linux_abi::SYS_RUSTOS_SERVICE_DRIVER_RESOURCE_BROKER
             | linux_abi::SYS_RUSTOS_NET_BROKER
             | linux_abi::SYS_RUSTOS_STORAGE_LIST_BROKER
             | linux_abi::SYS_RUSTOS_INPUT_STATS_BROKER
@@ -44,15 +41,6 @@ pub(super) fn is_linux_rustos_broker_syscall(syscall_number: u64) -> bool {
 
 pub(super) fn dispatch_linux_rustos_broker_syscall(frame: &SyscallFrame) -> u64 {
     match frame.rax {
-        linux_abi::SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER => {
-            syscall_linux_rustos_driver_load_module_broker(frame.rdi)
-        }
-        linux_abi::SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER => {
-            syscall_linux_rustos_driver_probe_alias_broker(frame.rdi)
-        }
-        linux_abi::SYS_RUSTOS_DRIVER_SYMBOL_EVENT_BROKER => {
-            syscall_linux_rustos_driver_symbol_event_broker(frame.rdi)
-        }
         linux_abi::SYS_RUSTOS_SERVICE_DRIVER_RESOURCE_BROKER => {
             syscall_linux_rustos_service_driver_resource_broker(frame.rdi)
         }

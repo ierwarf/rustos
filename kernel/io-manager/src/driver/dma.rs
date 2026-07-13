@@ -18,24 +18,9 @@ struct DmaAllocation {
     mapping: DmaMapping,
 }
 
-struct StreamingDmaMapping {
-    device_ptr: usize,
-    _cpu_ptr: usize,
-    mapping: DmaMapping,
-}
-
 static DMA_ALLOCATIONS: Mutex<Vec<DmaAllocation>> = Mutex::new(Vec::new());
-static DMA_STREAMING_MAPPINGS: Mutex<Vec<StreamingDmaMapping>> = Mutex::new(Vec::new());
 
 pub(crate) const DMA_MAPPING_ERROR: u64 = u64::MAX;
-
-pub(crate) fn set_mask(device: *mut c_void, mask: u64) -> i32 {
-    iommu::set_mask(device, mask)
-}
-
-pub(crate) fn set_coherent_mask(device: *mut c_void, mask: u64) -> i32 {
-    iommu::set_coherent_mask(device, mask)
-}
 
 pub(crate) fn set_mask_and_coherent(device: *mut c_void, mask: u64) -> i32 {
     iommu::set_mask_and_coherent(device, mask)
@@ -89,28 +74,6 @@ pub(crate) fn alloc_coherent(
     cpu_ptr.cast()
 }
 
-pub(crate) fn map_single(device: *mut c_void, cpu_addr: *mut c_void, size: usize) -> u64 {
-    if cpu_addr.is_null() || size == 0 {
-        return DMA_MAPPING_ERROR;
-    }
-
-    let phys_addr = crate::memory::paging::kernel_virtual_to_physical_addr(cpu_addr as u64);
-    let Some(mapping) =
-        iommu::map_physical_range(device, phys_addr, size, DmaMappingKind::Streaming)
-    else {
-        return DMA_MAPPING_ERROR;
-    };
-
-    irq_safe(|| {
-        DMA_STREAMING_MAPPINGS.lock().push(StreamingDmaMapping {
-            device_ptr: device as usize,
-            _cpu_ptr: cpu_addr as usize,
-            mapping,
-        });
-    });
-    mapping.dma_addr.raw()
-}
-
 pub(crate) fn free_coherent(device: *mut c_void, cpu_addr: *mut c_void, dma_handle: u64) {
     if cpu_addr.is_null() {
         return;
@@ -135,32 +98,6 @@ pub(crate) fn free_coherent(device: *mut c_void, cpu_addr: *mut c_void, dma_hand
         phys::free_frame(PhysAddr::new(page_phys));
     }
 }
-
-pub(crate) fn unmap_single(device: *mut c_void, dma_addr: u64, size: usize) {
-    if dma_addr == DMA_MAPPING_ERROR {
-        return;
-    }
-
-    irq_safe(|| {
-        let mut mappings = DMA_STREAMING_MAPPINGS.lock();
-        if let Some(index) = mappings.iter().position(|mapping| {
-            mapping.device_ptr == device as usize
-                && mapping.mapping.dma_addr.raw() == dma_addr
-                && (size == 0 || mapping.mapping.size == size)
-        }) {
-            let mapping = mappings.remove(index);
-            iommu::unmap_range(device, mapping.mapping);
-        }
-    });
-}
-
-pub(crate) fn mapping_error(dma_addr: u64) -> i32 {
-    if dma_addr == DMA_MAPPING_ERROR { 1 } else { 0 }
-}
-
-pub(crate) fn sync_single_for_cpu(_device: *mut c_void, _dma_addr: u64, _size: usize) {}
-
-pub(crate) fn sync_single_for_device(_device: *mut c_void, _dma_addr: u64, _size: usize) {}
 
 fn irq_safe<T>(f: impl FnOnce() -> T) -> T {
     interrupts::without_interrupts(f)

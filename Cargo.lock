@@ -274,14 +274,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "driverd"
-version = "0.1.0"
-dependencies = [
- "libc",
- "rustos-user-abi",
-]
-
-[[package]]
 name = "elf"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1001,14 +993,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustos-amdgpu-driver"
-version = "0.1.0"
-dependencies = [
- "driver-abi",
- "driver-module-runtime",
-]
-
-[[package]]
 name = "rustos-driver-domain-host"
 version = "0.1.0"
 dependencies = [
@@ -1027,15 +1011,6 @@ dependencies = [
  "anyhow",
  "clap",
  "rustos-driver-domain-host",
-]
-
-[[package]]
-name = "rustos-keyboard-driver"
-version = "0.1.0"
-dependencies = [
- "bitflags 2.11.0",
- "driver-abi",
- "keyboard-core",
 ]
 
 [[package]]

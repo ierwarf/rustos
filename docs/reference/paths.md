@@ -14,7 +14,7 @@
 | `kernel/` | Kernel entry and subsystem crates. |
 | `services/` | Userspace system services. |
 | `apps/` | User/demo apps. |
-| `drivers/bridges/` | Kernel bridge drivers. |
+| `driver-domains/linux/` | Isolated Linux DVM image and relays. |
 | `drivers/libs/` | Driver ABI/runtime/helper crates. |
 | `libs/` | General shared crates. |
 | `compat/` | Compatibility layer sources. |
@@ -50,7 +50,7 @@
 | `kernel/` | kernel entry와 subsystem crate |
 | `services/` | userspace system service |
 | `apps/` | user/demo app |
-| `drivers/bridges/` | kernel bridge driver |
+| `driver-domains/linux/` | isolated Linux DVM image와 relay |
 | `drivers/libs/` | driver ABI/runtime/helper crate |
 | `libs/` | general shared crate |
 | `compat/` | compatibility layer source |

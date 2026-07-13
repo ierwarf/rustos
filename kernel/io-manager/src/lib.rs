@@ -59,8 +59,6 @@ pub mod io;
 #[path = "storage/mod.rs"]
 pub mod storage;
 pub(crate) mod sync;
-#[path = "usb/mod.rs"]
-pub mod usb;
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::sync::{Mutex, MutexGuard};

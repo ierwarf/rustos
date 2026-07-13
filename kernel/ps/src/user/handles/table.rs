@@ -112,9 +112,6 @@ pub struct HandleTable {
 
 impl Clone for HandleTable {
     fn clone(&self) -> Self {
-        for entry in self.entries.iter().flatten() {
-            on_handle_open(entry.handle());
-        }
         Self {
             entries: self.entries.clone(),
         }
@@ -175,7 +172,6 @@ impl HandleTable {
             .skip(start_index)
             .find_map(|(index, entry)| entry.is_none().then_some(index))
         {
-            on_handle_open(entry.handle());
             self.entries[index] = Some(entry);
             return FIRST_DYNAMIC_FD as u64 + index as u64;
         }
@@ -183,7 +179,6 @@ impl HandleTable {
         if self.entries.len() < start_index {
             self.entries.resize_with(start_index, || None);
         }
-        on_handle_open(entry.handle());
         self.entries.push(Some(entry));
         FIRST_DYNAMIC_FD as u64 + (self.entries.len() - 1) as u64
     }
@@ -239,12 +234,6 @@ impl HandleTable {
     pub fn replace_entry(&mut self, fd: u64, entry: Option<HandleEntry>) -> Option<()> {
         let index = dynamic_index(fd)?;
         self.ensure_entry_capacity(index);
-        if let Some(existing) = self.entries[index].as_ref() {
-            on_handle_close(existing.handle());
-        }
-        if let Some(new_entry) = entry.as_ref() {
-            on_handle_open(new_entry.handle());
-        }
         self.entries[index] = entry;
         Some(())
     }
@@ -256,7 +245,6 @@ impl HandleTable {
             .get_mut(index)?
             .take()
             .map(HandleEntry::into_handle)?;
-        on_handle_close(&handle);
         Some(handle)
     }
 
@@ -269,11 +257,7 @@ impl HandleTable {
                 continue;
             }
 
-            let handle = entry
-                .take()
-                .expect("close-on-exec entry must exist")
-                .into_handle();
-            on_handle_close(&handle);
+            let _ = entry.take();
         }
     }
 
@@ -292,10 +276,6 @@ impl HandleTable {
         entry.set_fd_flags(if close_on_exec { FD_CLOEXEC } else { 0 });
         let index = dynamic_index(new_fd)?;
         self.ensure_entry_capacity(index);
-        if let Some(existing) = self.entries[index].as_ref() {
-            on_handle_close(existing.handle());
-        }
-        on_handle_open(entry.handle());
         self.entries[index] = Some(entry);
         Some(new_fd)
     }
@@ -358,37 +338,9 @@ impl Default for HandleTable {
     }
 }
 
-impl Drop for HandleTable {
-    fn drop(&mut self) {
-        for entry in self.entries.iter().flatten() {
-            on_handle_close(entry.handle());
-        }
-    }
-}
-
 fn dynamic_index(fd: u64) -> Option<usize> {
     fd.checked_sub(FIRST_DYNAMIC_FD as u64)
         .and_then(|value| usize::try_from(value).ok())
-}
-
-fn on_handle_open(handle: &KernelHandle) {
-    if let KernelHandle::Device(device) = handle {
-        if device.device_id() == crate::io::device::DeviceId::Input
-            && device.access_kind() == crate::io::device::DeviceAccessKind::Native
-        {
-            crate::linux_runtime_hooks::input_consumer_acquire();
-        }
-    }
-}
-
-fn on_handle_close(handle: &KernelHandle) {
-    if let KernelHandle::Device(device) = handle {
-        if device.device_id() == crate::io::device::DeviceId::Input
-            && device.access_kind() == crate::io::device::DeviceAccessKind::Native
-        {
-            crate::linux_runtime_hooks::input_consumer_release();
-        }
-    }
 }
 
 #[cfg(test)]

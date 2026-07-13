@@ -58,7 +58,7 @@ injects `A` into the DVM's virtio keyboard, the DVM must report Linux evdev
 code `30`, then RustOS must show that `inputd` consumed a newly injected `A`.
 This proves only the smoke path; RustOS still has no vsock endpoint or usable
 device data plane. It is not physical host-keyboard capture, arbitrary-key
-forwarding, NIC, storage, `.ko`, or passthrough validation.
+forwarding, NIC, storage, or passthrough validation.
 
 <a id="korean"></a>
 
@@ -115,5 +115,5 @@ inventory probe와 제한된 합성 키 probe를 수행합니다. QEMU가 DVM의
 keyboard에 `A`를 주입하면 DVM은 Linux evdev code `30`을 보고해야 하며,
 그 뒤 RustOS는 새로 주입된 `A`를 `inputd`가 소비했음을 보여야 합니다. 이는
 smoke 경로만 증명합니다. RustOS↔DVM vsock endpoint나 usable device data plane,
-물리 host keyboard capture, 임의 키 forwarding, NIC, storage, `.ko`, passthrough
+물리 host keyboard capture, 임의 키 forwarding, NIC, storage, passthrough
 검증을 뜻하지 않습니다.

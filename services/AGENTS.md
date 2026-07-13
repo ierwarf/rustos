@@ -26,7 +26,8 @@ miss the first vsync, producing a visible black frame.
 - `vfsd`: filesystem namespace and mount table
 - `loaderd`: ELF/PE program loading, dynamic linker integration
 - `netd`: network stack policy
-- `devmgrd`, `driverd`: device enumeration and driver lifetime
+- `devmgrd`: RustOS device namespace and device lifetime
+- Linux DVM: Linux driver enumeration and driver lifetime
 - `storaged`: block/partition layer
 - `inputd`: HID + input routing
 - `procd`: process lifecycle for normal user procs (post-`rootd` handoff)

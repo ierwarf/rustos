@@ -170,12 +170,8 @@ fn block_current_poll_on_input(fds_ptr: u64, nfds: u64) -> PollInputBlockResult 
         Ok(false) => return PollInputBlockResult::NoInputInterest,
         Err(errno) => return PollInputBlockResult::Err(errno),
     }
-    if kernel_io_manager::api::usb::uses_polled_input_completion() {
-        let usb_work = kernel_io_manager::api::usb::service_pending();
-        let input_work = kernel_io_manager::api::input::service_pending();
-        if usb_work + input_work != 0 {
-            return PollInputBlockResult::PolledCompletionServiced;
-        }
+    if kernel_io_manager::api::input::service_dvm_input_pending() != 0 {
+        return PollInputBlockResult::PolledCompletionServiced;
     }
     let Some(task_id) = multitask::current_task_id() else {
         return PollInputBlockResult::NoInputInterest;
@@ -223,13 +219,8 @@ fn block_current_poll_on_input_until(
     if crate::arch::rtc::ticks() >= deadline_tick {
         return PollInputBlockResult::BlockedOrRaced;
     }
-    if kernel_io_manager::api::usb::uses_polled_input_completion() {
-        let usb_work = kernel_io_manager::api::usb::service_pending();
-        let input_work = kernel_io_manager::api::input::service_pending();
-        if usb_work + input_work != 0 {
-            return PollInputBlockResult::PolledCompletionServiced;
-        }
-        return PollInputBlockResult::NoInputInterest;
+    if kernel_io_manager::api::input::service_dvm_input_pending() != 0 {
+        return PollInputBlockResult::PolledCompletionServiced;
     }
     let Some(task_id) = multitask::current_task_id() else {
         return PollInputBlockResult::NoInputInterest;

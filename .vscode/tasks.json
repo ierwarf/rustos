@@ -13,6 +13,28 @@
         "cwd": "${workspaceFolder}"
       },
       "problemMatcher": []
+    },
+    {
+      "label": "Build Linux DVM",
+      "type": "process",
+      "command": "cargo",
+      "args": [
+        "xtask",
+        "build-dvm"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Prepare KVM DVM",
+      "dependsOn": [
+        "Build OS",
+        "Build Linux DVM"
+      ],
+      "dependsOrder": "sequence",
+      "problemMatcher": []
     }
   ]
 }

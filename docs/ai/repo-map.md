@@ -30,7 +30,7 @@ Read `token-policy.md` and `task-router.md` first.
 - `kernel/` — kernel entry and subsystem crates.
 - `services/` — userspace services (`initd`, `runtimed`, `uiserver`, etc.).
 - `apps/` — user/demo applications.
-- `drivers/bridges/` — kernel bridge drivers and `.ko` modules.
+- `driver-domains/linux/` — isolated Linux DVM image, relays, and contracts.
 - `drivers/libs/` — driver ABI/runtime/helper crates.
 - `libs/` — general shared crates.
 - `compat/` — compatibility layer and Windows userspace support.

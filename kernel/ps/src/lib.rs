@@ -46,7 +46,5 @@ pub(crate) mod io {
 pub mod api;
 pub mod user;
 
-mod linux_runtime_hooks;
-
 #[path = "multitask/mod.rs"]
 pub mod multitask;

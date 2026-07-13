@@ -183,6 +183,64 @@ overlay_input_hash() {
     ) | sha256sum | awk '{print $1}'
 }
 
+overlay_file_manifest() {
+    (
+        cd "$ROOT/board/overlay"
+        find . -type f -printf '%P\n' | LC_ALL=C sort
+    )
+}
+
+overlay_path_is_safe() {
+    case "$1" in
+        ''|/*|*'/../'*|../*|*/..|*'//'*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+write_overlay_file_manifest() {
+    local path=$1
+    local tmp="${path}.tmp"
+
+    mkdir -p "$(dirname -- "$path")"
+    overlay_file_manifest >"$tmp"
+    mv -- "$tmp" "$path"
+}
+
+sync_rootfs_overlay() {
+    local previous="$BUILD_DIR/.rustos-overlay-files-v1"
+    local current="$BUILD_DIR/.rustos-overlay-files-v1.current"
+    local target="$BUILD_DIR/target"
+    local path
+    local relative
+
+    test -d "$target" || return
+    overlay_file_manifest >"$current"
+
+    if test -f "$previous"; then
+        while IFS= read -r relative; do
+            overlay_path_is_safe "$relative" || die "unsafe retired overlay path: $relative"
+            rm -f -- "$target/$relative"
+        done < <(comm -23 "$previous" "$current")
+    else
+        # One-time migration for output trees created before overlay ownership
+        # was tracked. Restrict pruning to RustOS DVM init scripts so package
+        # output and unrelated Buildroot files are never inferred as overlay.
+        for path in "$target"/etc/init.d/S[0-9][0-9]rustos-dvm-*; do
+            test -f "$path" || continue
+            relative="etc/init.d/${path##*/}"
+            if ! grep -Fqx -- "$relative" "$current"; then
+                rm -f -- "$path"
+            fi
+        done
+    fi
+
+    # Buildroot's overlay copy is additive. Copy current files explicitly so
+    # modifications are reflected even when no package target is rebuilt;
+    # retired files were pruned above from an ownership manifest.
+    cp -a "$ROOT/board/overlay/." "$target/"
+    rm -f -- "$current"
+}
+
 write_stamp() {
     local path=$1
     local value=$2
@@ -225,6 +283,7 @@ configure() {
 prepare_mutable_inputs() {
     local legacy_service_stamp="$BUILD_DIR/.rustos-agent-input.sha256"
     local overlay_stamp="$BUILD_DIR/.rustos-overlay-input.sha256"
+    local overlay_files_stamp="$BUILD_DIR/.rustos-overlay-files-v1"
     local overlay_current
     local service
     local service_stamp
@@ -254,7 +313,10 @@ prepare_mutable_inputs() {
     # target changed. Deleting just the generated rootfs asks Buildroot to run
     # target-finalize and rebuild the image; it does not invalidate packages or
     # host tools.
-    if test -f "$overlay_stamp" && test "$(cat "$overlay_stamp")" != "$overlay_current"; then
+    if ! test -f "$overlay_files_stamp" \
+        || ! test -f "$overlay_stamp" \
+        || test "$(cat "$overlay_stamp")" != "$overlay_current"; then
+        sync_rootfs_overlay
         rm -f -- "$BUILD_DIR/images/rootfs.cpio.xz"
     fi
 }
@@ -265,6 +327,7 @@ commit_mutable_input_stamps() {
         write_stamp "$BUILD_DIR/.${service}-input-v1.sha256" "$(local_service_input_hash "$service")"
     done
     write_stamp "$BUILD_DIR/.rustos-overlay-input.sha256" "$(overlay_input_hash)"
+    write_overlay_file_manifest "$BUILD_DIR/.rustos-overlay-files-v1"
 }
 
 verify_config() {

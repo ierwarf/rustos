@@ -166,7 +166,14 @@ where
     let deadline = Instant::now() + options.timeout;
     let control_relay =
         start_dvm_input_relay(config, options.timeout, layout.rustos_input_socket.clone())?;
-    let (mut rustos, mut dvm) = spawn_guests(&qemu, config, &artifacts, &layout, &options)?;
+    let (mut rustos, mut dvm) = spawn_guests(
+        &qemu,
+        config,
+        &artifacts,
+        &layout,
+        &options,
+        GuestDisplay::Headless,
+    )?;
     let result: Result<ProbeResult> = (|| {
         let probe = wait_for_parallel_boot(
             &mut rustos,
@@ -202,6 +209,46 @@ where
     Ok(())
 }
 
+/// Start the normal KVM driver-domain topology as an interactive session.
+/// Unlike `kvm-smoke`, this has no readiness deadline or success criteria: it
+/// remains alive until the user closes the DVM QEMU window or interrupts it.
+pub(crate) fn kvm_run_command(config: &Config) -> Result<()> {
+    let artifacts = verify_dvm_artifacts(config)?;
+    let qemu = require_qemu(config)?;
+    let options = SmokeOptions {
+        dry_run: false,
+        exercise_input: false,
+        exercise_network: false,
+        dvm_display_shmem: true,
+        dvm_network_shmem: true,
+        min_ui_fps: None,
+        timeout: Duration::ZERO,
+        expected_markers: Vec::new(),
+    };
+    let layout = prepare_layout(config, &options)?;
+    require_vhost_vsock()?;
+    start_dvm_input_relay_unbounded(config, layout.rustos_input_socket.clone())?;
+    let (mut rustos, mut dvm) = spawn_guests(
+        &qemu,
+        config,
+        &artifacts,
+        &layout,
+        &options,
+        GuestDisplay::DvmGtk,
+    )?;
+
+    println!(
+        "xtask: interactive KVM DVM session is running; use the Linux DVM QEMU window for display/input and close it or press Ctrl-C to stop"
+    );
+    let status = dvm.wait().context("wait for Linux DVM QEMU session")?;
+    stop_guest(&mut rustos);
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("interactive Linux DVM QEMU session exited with {status}")
+    }
+}
+
 pub(crate) fn print_kvm_smoke_help() {
     println!(
         "\
@@ -235,6 +282,12 @@ then consumes it through its ordinary evdev relay. It never opens QMP or a
 host-to-DVM input injection endpoint.
 "
     );
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GuestDisplay {
+    Headless,
+    DvmGtk,
 }
 
 fn parse_smoke_options<I>(mut args: I) -> Result<SmokeOptions>
@@ -906,12 +959,33 @@ fn start_dvm_input_relay(
     Ok(receiver)
 }
 
+fn start_dvm_input_relay_unbounded(config: &Config, rustos_input_socket: PathBuf) -> Result<()> {
+    let contract_path = dvm_dir(config).join(DVM_CONTROL_CONTRACT);
+    let contract = HostControlContract::from_env_file(&contract_path)?;
+    let listener = HostControlListener::bind(DVM_GUEST_CID, DEFAULT_CONTROL_PORT, contract)?;
+    thread::spawn(move || {
+        loop {
+            let Ok(mut sink) = UnixInputSink::connect(&rustos_input_socket, Duration::from_secs(1))
+            else {
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            };
+            if let Err(error) = listener.relay_input_once_unbounded(&mut sink) {
+                eprintln!("xtask: interactive DVM input relay disconnected: {error:#}");
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    });
+    Ok(())
+}
+
 fn spawn_guests(
     qemu: &Path,
     config: &Config,
     artifacts: &DvmArtifacts,
     layout: &KvmLayout,
     options: &SmokeOptions,
+    guest_display: GuestDisplay,
 ) -> Result<(Child, Child)> {
     let mut rustos_command = Command::new(qemu);
     rustos_command
@@ -993,6 +1067,16 @@ fn spawn_guests(
     } else {
         "console=ttyS0"
     };
+    let dvm_display = match guest_display {
+        GuestDisplay::Headless => "none",
+        // The GTK backend defaults to `zoom-to-fit=on` for virtio-GPU.  That
+        // makes its initial small host window a guest resize request, so the
+        // DVM KMS relay selects 640x480 and needlessly downscales RustOS's
+        // fixed 1600x900 transport.  Keep the guest mode authoritative for
+        // the interactive topology; GTK will resize its window to the DVM
+        // scanout instead of feeding its bootstrap size back into the guest.
+        GuestDisplay::DvmGtk => "gtk,show-tabs=off,zoom-to-fit=off",
+    };
     dvm_command
         .arg("-name")
         .arg("rustos-linux-dvm-kvm")
@@ -1014,6 +1098,8 @@ fn spawn_guests(
             "-append",
             dvm_append,
             "-display",
+            dvm_display,
+            "-vga",
             "none",
             "-no-reboot",
             "-no-shutdown",
@@ -1036,7 +1122,12 @@ fn spawn_guests(
         .arg("virtio-net-pci,netdev=dvm-net,id=dvm-virtio-net,mac=52:54:00:12:34:56")
         .arg("-device")
         .arg(format!(
-            "virtio-gpu-pci,id=dvm-virtio-gpu,xres={},yres={}",
+            // The DVM display transport is deliberately fixed at 1600x900.
+            // GTK's resize-aware EDID starts at its tiny bootstrap window and
+            // can otherwise replace that mode with 640x480 before the Linux
+            // DRM relay starts.  Disable EDID for this private fixed-mode
+            // appliance so QEMU's explicit xres/yres are authoritative.
+            "virtio-gpu-pci,id=dvm-virtio-gpu,xres={},yres={},edid=off",
             DVM_DISPLAY_WIDTH, DVM_DISPLAY_HEIGHT
         ))
         .stdout(Stdio::null())

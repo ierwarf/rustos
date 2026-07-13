@@ -8,17 +8,11 @@ use driver_abi::PointerPacket;
 use heapless::Deque as HeaplessDeque;
 use rustos_user_abi::syscall::{
     INPUTD_ACCESS_NATIVE, INPUTD_INGRESS_FLAG_DVM_SOURCE, INPUTD_INGRESS_FLAG_RESET_STATE,
-    INPUTD_INGRESS_KIND_DVM_LINUX_KEY, INPUTD_INGRESS_KIND_HID_POINTER_REPORT,
-    INPUTD_INGRESS_KIND_HID_RAW_REPORT, INPUTD_INGRESS_KIND_KEYBOARD,
-    INPUTD_INGRESS_KIND_POINTER_PACKET, INPUTD_INGRESS_KIND_PS2_MOUSE_BYTE,
-    INPUTD_INGRESS_KIND_PS2_SCANCODE, InputHidKeyboardReportWire, InputHidPointerReportWire,
-    InputHidPolicyWire, InputIngressWire, InputKeyboardEventWire, InputPointerAbsoluteWire,
-    InputPointerPacketWire, InputPs2MouseByteWire, InputPs2ScancodeWire,
+    INPUTD_INGRESS_KIND_DVM_LINUX_KEY, INPUTD_INGRESS_KIND_POINTER_PACKET, InputIngressWire,
+    InputKeyboardEventWire, InputPointerPacketWire,
 };
 #[cfg(not(test))]
 use x86_64::instructions::interrupts;
-
-use crate::user::abi::device::InputEvent;
 
 static POINTER_PACKET_SUBMIT_COUNT: AtomicU64 = AtomicU64::new(0);
 static POINTER_ABSOLUTE_SUBMIT_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -48,73 +42,32 @@ static INPUT_INGRESS: Mutex<HeaplessDeque<InputIngressWire, INPUT_INGRESS_QUEUE_
 static INPUT_WAITERS: Mutex<[Option<u64>; INPUT_WAITERS_CAPACITY]> =
     Mutex::new([None; INPUT_WAITERS_CAPACITY]);
 
-pub(crate) fn submit_keyboard_event(action: u16, code: u32, modifiers: u32, text: u32) -> bool {
-    push_ingress(InputIngressWire {
-        kind: INPUTD_INGRESS_KIND_KEYBOARD,
-        access: INPUTD_ACCESS_NATIVE,
-        flags: 0,
-        event: InputEvent::default(),
-        keyboard: InputKeyboardEventWire {
-            action,
-            reserved0: 0,
-            code,
-            modifiers,
-            text,
-        },
-        ps2_scancode: InputPs2ScancodeWire::default(),
-        ps2_mouse_byte: InputPs2MouseByteWire::default(),
-        pointer_packet: InputPointerPacketWire::default(),
-        pointer_absolute: InputPointerAbsoluteWire::default(),
-        hid_keyboard: InputHidKeyboardReportWire::default(),
-        hid_pointer: InputHidPointerReportWire::default(),
-        hid_raw: InputHidPolicyWire::default(),
-    })
-}
-
 /// Queue a Linux `EV_KEY` transition only after the L0 DVM relay has checked
 /// its source, framing, sequence, and code range.  `inputd` owns Linux-keymap
 /// translation and modifier/text state; ring0 only carries the bounded event.
 pub(crate) fn submit_dvm_linux_key(action: u16, linux_key_code: u16) -> bool {
-    push_ingress(InputIngressWire {
-        kind: INPUTD_INGRESS_KIND_DVM_LINUX_KEY,
-        access: INPUTD_ACCESS_NATIVE,
-        flags: 0,
-        event: InputEvent::default(),
-        keyboard: InputKeyboardEventWire {
-            action,
-            reserved0: 0,
-            code: linux_key_code as u32,
-            modifiers: 0,
-            text: 0,
-        },
-        ps2_scancode: InputPs2ScancodeWire::default(),
-        ps2_mouse_byte: InputPs2MouseByteWire::default(),
-        pointer_packet: InputPointerPacketWire::default(),
-        pointer_absolute: InputPointerAbsoluteWire::default(),
-        hid_keyboard: InputHidKeyboardReportWire::default(),
-        hid_pointer: InputHidPointerReportWire::default(),
-        hid_raw: InputHidPolicyWire::default(),
-    })
+    let mut ingress = InputIngressWire::default();
+    ingress.kind = INPUTD_INGRESS_KIND_DVM_LINUX_KEY;
+    ingress.access = INPUTD_ACCESS_NATIVE;
+    ingress.keyboard = InputKeyboardEventWire {
+        action,
+        reserved0: 0,
+        code: linux_key_code as u32,
+        modifiers: 0,
+        text: 0,
+    };
+    push_ingress(ingress)
 }
 
 /// Clear DVM-owned keyboard and pointer state after an authenticated relay
 /// session ends. The host emits releases first; this is a fail-safe state
 /// reset so a reconnect cannot inherit modifiers or button state.
 pub(crate) fn submit_dvm_input_reset() -> bool {
-    push_ingress(InputIngressWire {
-        kind: INPUTD_INGRESS_KIND_DVM_LINUX_KEY,
-        access: INPUTD_ACCESS_NATIVE,
-        flags: INPUTD_INGRESS_FLAG_RESET_STATE | INPUTD_INGRESS_FLAG_DVM_SOURCE,
-        event: InputEvent::default(),
-        keyboard: InputKeyboardEventWire::default(),
-        ps2_scancode: InputPs2ScancodeWire::default(),
-        ps2_mouse_byte: InputPs2MouseByteWire::default(),
-        pointer_packet: InputPointerPacketWire::default(),
-        pointer_absolute: InputPointerAbsoluteWire::default(),
-        hid_keyboard: InputHidKeyboardReportWire::default(),
-        hid_pointer: InputHidPointerReportWire::default(),
-        hid_raw: InputHidPolicyWire::default(),
-    })
+    let mut ingress = InputIngressWire::default();
+    ingress.kind = INPUTD_INGRESS_KIND_DVM_LINUX_KEY;
+    ingress.access = INPUTD_ACCESS_NATIVE;
+    ingress.flags = INPUTD_INGRESS_FLAG_RESET_STATE | INPUTD_INGRESS_FLAG_DVM_SOURCE;
+    push_ingress(ingress)
 }
 
 /// Queue a normalized pointer packet from the authenticated DVM relay. The
@@ -122,146 +75,19 @@ pub(crate) fn submit_dvm_input_reset() -> bool {
 /// fallback providers before publishing user-visible edges.
 pub(crate) fn submit_dvm_pointer_packet(packet: PointerPacket) -> bool {
     POINTER_PACKET_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
-    push_ingress(InputIngressWire {
-        kind: INPUTD_INGRESS_KIND_POINTER_PACKET,
-        access: INPUTD_ACCESS_NATIVE,
-        flags: INPUTD_INGRESS_FLAG_DVM_SOURCE,
-        event: InputEvent::default(),
-        keyboard: InputKeyboardEventWire::default(),
-        ps2_scancode: InputPs2ScancodeWire::default(),
-        ps2_mouse_byte: InputPs2MouseByteWire::default(),
-        pointer_packet: InputPointerPacketWire {
-            buttons: packet.buttons,
-            reserved0: [0; 3],
-            dx: packet.dx,
-            dy: packet.dy,
-            wheel_vertical: packet.wheel_vertical,
-            wheel_horizontal: packet.wheel_horizontal,
-        },
-        pointer_absolute: InputPointerAbsoluteWire::default(),
-        hid_keyboard: InputHidKeyboardReportWire::default(),
-        hid_pointer: InputHidPointerReportWire::default(),
-        hid_raw: InputHidPolicyWire::default(),
-    })
-}
-
-pub(crate) fn submit_ps2_scancode(scancode: u8, translated: bool) -> bool {
-    push_ingress(InputIngressWire {
-        kind: INPUTD_INGRESS_KIND_PS2_SCANCODE,
-        access: INPUTD_ACCESS_NATIVE,
-        flags: 0,
-        event: InputEvent::default(),
-        keyboard: InputKeyboardEventWire::default(),
-        ps2_scancode: InputPs2ScancodeWire {
-            scancode,
-            translated: translated as u8,
-            reserved0: 0,
-        },
-        ps2_mouse_byte: InputPs2MouseByteWire::default(),
-        pointer_packet: InputPointerPacketWire::default(),
-        pointer_absolute: InputPointerAbsoluteWire::default(),
-        hid_keyboard: InputHidKeyboardReportWire::default(),
-        hid_pointer: InputHidPointerReportWire::default(),
-        hid_raw: InputHidPolicyWire::default(),
-    })
-}
-
-pub(crate) fn submit_ps2_mouse_byte(byte: u8) -> bool {
-    push_ingress(InputIngressWire {
-        kind: INPUTD_INGRESS_KIND_PS2_MOUSE_BYTE,
-        access: INPUTD_ACCESS_NATIVE,
-        flags: 0,
-        event: InputEvent::default(),
-        keyboard: InputKeyboardEventWire::default(),
-        ps2_scancode: InputPs2ScancodeWire::default(),
-        ps2_mouse_byte: InputPs2MouseByteWire {
-            byte,
-            reserved0: 0,
-            reserved1: 0,
-        },
-        pointer_packet: InputPointerPacketWire::default(),
-        pointer_absolute: InputPointerAbsoluteWire::default(),
-        hid_keyboard: InputHidKeyboardReportWire::default(),
-        hid_pointer: InputHidPointerReportWire::default(),
-        hid_raw: InputHidPolicyWire::default(),
-    })
-}
-
-pub(crate) fn submit_ps2_mouse_reset() -> bool {
-    push_ingress(InputIngressWire {
-        kind: INPUTD_INGRESS_KIND_PS2_MOUSE_BYTE,
-        access: INPUTD_ACCESS_NATIVE,
-        flags: INPUTD_INGRESS_FLAG_RESET_STATE,
-        event: InputEvent::default(),
-        keyboard: InputKeyboardEventWire::default(),
-        ps2_scancode: InputPs2ScancodeWire::default(),
-        ps2_mouse_byte: InputPs2MouseByteWire::default(),
-        pointer_packet: InputPointerPacketWire::default(),
-        pointer_absolute: InputPointerAbsoluteWire::default(),
-        hid_keyboard: InputHidKeyboardReportWire::default(),
-        hid_pointer: InputHidPointerReportWire::default(),
-        hid_raw: InputHidPolicyWire::default(),
-    })
-}
-
-pub(crate) fn submit_pointer_packet(packet: PointerPacket) -> bool {
-    POINTER_PACKET_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
-    push_ingress(InputIngressWire {
-        kind: INPUTD_INGRESS_KIND_POINTER_PACKET,
-        access: INPUTD_ACCESS_NATIVE,
-        flags: 0,
-        event: InputEvent::default(),
-        keyboard: InputKeyboardEventWire::default(),
-        ps2_scancode: InputPs2ScancodeWire::default(),
-        ps2_mouse_byte: InputPs2MouseByteWire::default(),
-        pointer_packet: InputPointerPacketWire {
-            buttons: packet.buttons,
-            reserved0: [0; 3],
-            dx: packet.dx,
-            dy: packet.dy,
-            wheel_vertical: packet.wheel_vertical,
-            wheel_horizontal: packet.wheel_horizontal,
-        },
-        pointer_absolute: InputPointerAbsoluteWire::default(),
-        hid_keyboard: InputHidKeyboardReportWire::default(),
-        hid_pointer: InputHidPointerReportWire::default(),
-        hid_raw: InputHidPolicyWire::default(),
-    })
-}
-
-pub(crate) fn submit_hid_pointer_report(report: InputHidPointerReportWire) -> bool {
-    POINTER_ABSOLUTE_SUBMIT_COUNT.fetch_add((report.relative == 0) as u64, Ordering::Relaxed);
-    push_ingress(InputIngressWire {
-        kind: INPUTD_INGRESS_KIND_HID_POINTER_REPORT,
-        access: INPUTD_ACCESS_NATIVE,
-        flags: 0,
-        event: InputEvent::default(),
-        keyboard: InputKeyboardEventWire::default(),
-        ps2_scancode: InputPs2ScancodeWire::default(),
-        ps2_mouse_byte: InputPs2MouseByteWire::default(),
-        pointer_packet: InputPointerPacketWire::default(),
-        pointer_absolute: InputPointerAbsoluteWire::default(),
-        hid_keyboard: InputHidKeyboardReportWire::default(),
-        hid_pointer: report,
-        hid_raw: InputHidPolicyWire::default(),
-    })
-}
-
-pub(crate) fn submit_hid_raw_report(report: InputHidPolicyWire) -> bool {
-    push_ingress(InputIngressWire {
-        kind: INPUTD_INGRESS_KIND_HID_RAW_REPORT,
-        access: INPUTD_ACCESS_NATIVE,
-        flags: 0,
-        event: InputEvent::default(),
-        keyboard: InputKeyboardEventWire::default(),
-        ps2_scancode: InputPs2ScancodeWire::default(),
-        ps2_mouse_byte: InputPs2MouseByteWire::default(),
-        pointer_packet: InputPointerPacketWire::default(),
-        pointer_absolute: InputPointerAbsoluteWire::default(),
-        hid_keyboard: InputHidKeyboardReportWire::default(),
-        hid_pointer: InputHidPointerReportWire::default(),
-        hid_raw: report,
-    })
+    let mut ingress = InputIngressWire::default();
+    ingress.kind = INPUTD_INGRESS_KIND_POINTER_PACKET;
+    ingress.access = INPUTD_ACCESS_NATIVE;
+    ingress.flags = INPUTD_INGRESS_FLAG_DVM_SOURCE;
+    ingress.pointer_packet = InputPointerPacketWire {
+        buttons: packet.buttons,
+        reserved0: [0; 3],
+        dx: packet.dx,
+        dy: packet.dy,
+        wheel_vertical: packet.wheel_vertical,
+        wheel_horizontal: packet.wheel_horizontal,
+    };
+    push_ingress(ingress)
 }
 
 pub(crate) fn has_pending_input_events() -> bool {
@@ -405,7 +231,7 @@ fn with_input_waiters<R>(f: impl FnOnce(&mut [Option<u64>; INPUT_WAITERS_CAPACIT
 
 #[cfg(test)]
 mod tests {
-    use super::{debug_snapshot, drain_ingress, reset_for_tests, submit_pointer_packet};
+    use super::{debug_snapshot, drain_ingress, reset_for_tests, submit_dvm_pointer_packet};
     use driver_abi::{POINTER_BUTTON_LEFT as POINTER_PACKET_LEFT, PointerPacket};
     use rustos_user_abi::syscall::{INPUTD_INGRESS_KIND_POINTER_PACKET, InputIngressWire};
 
@@ -418,7 +244,7 @@ mod tests {
         let _guard = isolated();
         reset_for_tests();
 
-        assert!(submit_pointer_packet(PointerPacket {
+        assert!(submit_dvm_pointer_packet(PointerPacket {
             buttons: POINTER_PACKET_LEFT,
             dx: 5,
             dy: -2,
@@ -441,7 +267,7 @@ mod tests {
     fn debug_snapshot_reflects_ingress_state() {
         let _guard = isolated();
         reset_for_tests();
-        assert!(submit_pointer_packet(PointerPacket {
+        assert!(submit_dvm_pointer_packet(PointerPacket {
             buttons: 0,
             dx: 1,
             dy: 1,

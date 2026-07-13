@@ -38,7 +38,6 @@ pub(crate) fn announce_ready(name: &str, console_line: &[u8]) {
 mod hal_hooks {
     use kernel_compat::api as compat_api;
     use kernel_hal::api as hal_api;
-    use kernel_io_manager::api as io_api;
     use kernel_ps::api as ps_api;
 
     fn retire_current_user_task_due_to_fault(
@@ -80,34 +79,12 @@ mod hal_hooks {
         })
     }
 
-    fn dispatch_pic_irq(irq: u8) -> bool {
-        compat_api::syscall::with_kernel_gs_base(|| crate::io_services::dispatch_pic_irq(irq))
-    }
-
-    fn handle_keyboard_interrupt() {
-        compat_api::syscall::with_kernel_gs_base(|| {
-            crate::io_services::on_keyboard_interrupt();
-            let _ = crate::io_services::dispatch_pic_irq(1);
-        });
-    }
-
-    fn handle_mouse_interrupt() {
-        compat_api::syscall::with_kernel_gs_base(|| {
-            crate::io_services::on_mouse_interrupt();
-            let _ = crate::io_services::dispatch_pic_irq(12);
-        });
-    }
-
     fn heartbeat_snapshot() -> hal_api::HeartbeatSnapshot {
         let input = crate::io_services::input_debug_snapshot();
-        let (linux_irq_owner_count, linux_irq_total_depth) =
-            crate::io_services::debug_irq_lock_snapshot();
-        let (linux_input_lock_active, linux_input_lock_last_seq) =
-            crate::io_services::debug_input_lock_snapshot();
         hal_api::HeartbeatSnapshot {
             userspace_display_active: crate::io_services::userspace_display_active(),
-            xhci_transfer_count: crate::io_services::debug_transfer_event_count(),
-            hid_pointer_report_count: crate::io_services::debug_pointer_report_count(),
+            xhci_transfer_count: 0,
+            hid_pointer_report_count: 0,
             input: hal_api::InputEventQueueDebugSnapshot {
                 pointer_packet_submits: input.pointer_packet_submits,
                 pointer_absolute_submits: input.pointer_absolute_submits,
@@ -121,10 +98,10 @@ mod hal_hooks {
                 dropped_discrete: input.dropped_discrete,
                 dropped_lossy: input.dropped_lossy,
             },
-            linux_irq_owner_count,
-            linux_irq_total_depth: linux_irq_total_depth as u64,
-            linux_input_lock_active: linux_input_lock_active != 0,
-            linux_input_lock_last_seq,
+            linux_irq_owner_count: 0,
+            linux_irq_total_depth: 0,
+            linux_input_lock_active: false,
+            linux_input_lock_last_seq: 0,
         }
     }
 
@@ -134,11 +111,6 @@ mod hal_hooks {
             ticks_per_second: Some(hal_api::arch::rtc::ticks_per_second),
             current_user_context: Some(current_debug_user_context),
         });
-        ps_api::register_tick_jiffies_hook(crate::io_services::tick_jiffies);
-        ps_api::register_input_consumer_hooks(
-            io_api::driver::linux::input::consumer_acquire,
-            io_api::driver::linux::input::consumer_release,
-        );
         hal_api::register_task_hooks(hal_api::TaskHooks {
             retire_current_user_task_due_to_fault: Some(retire_current_user_task_due_to_fault),
             halt_current_retired_task: Some(ps_api::halt_current_retired_task),
@@ -151,9 +123,9 @@ mod hal_hooks {
             yield_now: Some(ps_api::yield_now),
         });
         hal_api::register_interrupt_hooks(hal_api::InterruptHooks {
-            dispatch_pic_irq: Some(dispatch_pic_irq),
-            handle_keyboard_interrupt: Some(handle_keyboard_interrupt),
-            handle_mouse_interrupt: Some(handle_mouse_interrupt),
+            dispatch_pic_irq: None,
+            handle_keyboard_interrupt: None,
+            handle_mouse_interrupt: None,
         });
         hal_api::register_heartbeat_hooks(hal_api::HeartbeatHooks {
             snapshot: Some(heartbeat_snapshot),

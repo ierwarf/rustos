@@ -21,16 +21,14 @@ Before any workflow: read `token-policy.md`, then `task-router.md`.
 5. Run `cargo xtask check`.
 6. Update docs only if launch policy or app workflow changes.
 
-## Add bridge driver
+## Add a DVM driver capability
 
-1. Read `docs/guides/add-driver.md`.
-2. Inspect a matching existing manifest, for example
-   `drivers/bridges/storage/vendor/nvme/RUSTOS.package.toml`.
-3. Add source under `drivers/bridges/<class>/<name>`.
-4. Add manifest with `kind = "bridge-driver"`.
-5. Add `[autoload]` only if policy-loaded.
-6. Run `cargo xtask build-driver-modules`.
-7. If autoload policy changes, inspect the generated driver registry after stage.
+1. Add the Linux-side package or relay under `driver-domains/linux/`.
+2. Define a fixed, versioned transport contract before RustOS-side code.
+3. Keep RustOS changes to bounded transport validation and the owning service
+   (`inputd`, `netd`, or `uiserver`); do not add a direct hardware fallback.
+4. Run `cargo xtask build-dvm`, `cargo xtask verify-dvm`, then the focused KVM
+   smoke command.
 
 ## Modify kernel API
 
@@ -78,8 +76,8 @@ Before any workflow: read `token-policy.md`, then `task-router.md`.
    any optional provider; it must not be packaged as a loadable driver.
 6. Confirm `display-primary` provider decisions use active provider-group
    state and do not replace an active DVM/hardware provider with a fallback.
-7. For KVM virtual GPU profiles, require the Linux DVM DRM/KMS relay. A legacy
-   `.ko` display record in a default KVM log is a regression.
+7. For KVM virtual GPU profiles, require the Linux DVM DRM/KMS relay. Any
+   RustOS direct-GPU initialization is a regression.
 
 ## Reduce context mid-task
 

@@ -19,7 +19,7 @@ use crate::util::{
 
 mod cargo;
 
-use cargo::{apply_kernel_cargo_env, run_cargo_kernel_check, run_cargo_kernel_rustc};
+use cargo::{run_cargo_kernel_check, run_cargo_kernel_rustc};
 
 const DEFAULT_GRUB_DEV_KEY: &str = "RustOS Dev GRUB <rustos-dev-grub@example.invalid>";
 
@@ -51,7 +51,7 @@ pub(crate) fn build(config: &Config) -> Result<()> {
     build_manifests_matching(config, &manifests, |manifest| {
         matches!(
             manifest.build.builder,
-            BuilderKind::CDemo | BuilderKind::ModuleImage | BuilderKind::ExternalCopy
+            BuilderKind::CDemo | BuilderKind::ExternalCopy
         )
     })?;
     stage::stage(config)?;
@@ -82,7 +82,6 @@ fn check_os_target_manifests(config: &Config, manifests: &[PackageManifest]) -> 
         }
         match manifest.build.builder {
             BuilderKind::CargoKernelBinary => check_cargo_os_binary(config, package)?,
-            BuilderKind::ModuleImage => run_cargo_kernel_check(config, package)?,
             _ => {}
         }
     }
@@ -122,7 +121,7 @@ fn host_workspace_excludes(config: &Config, manifests: &[PackageManifest]) -> BT
     for manifest in manifests {
         if matches!(
             manifest.build.builder,
-            BuilderKind::CargoKernelBinary | BuilderKind::ModuleImage | BuilderKind::KernelRustc
+            BuilderKind::CargoKernelBinary | BuilderKind::KernelRustc
         ) && let Some(package) = manifest.build.package.as_deref()
         {
             excludes.insert(package.to_owned());
@@ -510,16 +509,6 @@ fn winsys_c_sources(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(sources)
 }
 
-pub(crate) fn build_driver_modules(config: &Config) -> Result<()> {
-    let manifests = load_default_manifests(&config.root_dir)?;
-    build_manifests_matching(config, &manifests, |manifest| {
-        matches!(
-            manifest.build.builder,
-            BuilderKind::ModuleImage | BuilderKind::ExternalCopy
-        )
-    })
-}
-
 fn build_manifests_matching(
     config: &Config,
     manifests: &[PackageManifest],
@@ -538,7 +527,6 @@ fn build_manifest(config: &Config, manifest: &PackageManifest) -> Result<()> {
         BuilderKind::CargoKernelBinary => build_cargo_kernel_binary(config, manifest),
         BuilderKind::MingwCExe => build_mingw_c_exe(config, manifest),
         BuilderKind::CDemo => build_c_demo_manifest(config, manifest),
-        BuilderKind::ModuleImage => build_module_image_manifest(config, manifest),
         BuilderKind::WinsysDllBundle => build_windows_system_dlls(config, manifest),
         BuilderKind::ExternalCopy => build_external_copy_manifest(config, manifest),
     }
@@ -697,33 +685,6 @@ fn build_c_demo_manifest(config: &Config, manifest: &PackageManifest) -> Result<
     build_c_demo(&config.cc, &source, &output, &extra_args)
 }
 
-fn build_module_image_manifest(config: &Config, manifest: &PackageManifest) -> Result<()> {
-    let package = manifest
-        .build
-        .package
-        .as_deref()
-        .with_context(|| format!("package {} missing build.package", manifest.id))?;
-    let crate_name = manifest
-        .build
-        .crate_name
-        .as_deref()
-        .with_context(|| format!("package {} missing build.crate_name", manifest.id))?;
-    let dependency_crates = manifest
-        .build
-        .dependency_crates
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>();
-    build_rust_module_image(
-        config,
-        package,
-        crate_name,
-        &manifest.artifact_path(config),
-        &dependency_crates,
-        std::slice::from_ref(&manifest.manifest_path),
-    )
-}
-
 fn build_external_copy_manifest(config: &Config, manifest: &PackageManifest) -> Result<()> {
     let source = resolve_external_copy_source(config, manifest);
     let artifact = manifest.artifact_path(config);
@@ -786,107 +747,6 @@ fn resolve_external_copy_source(config: &Config, manifest: &PackageManifest) -> 
                 .as_ref()
                 .map(|path| config.root_dir.join(path))
         })
-}
-
-fn build_rust_module_image(
-    config: &Config,
-    package: &str,
-    crate_name: &str,
-    output: &Path,
-    dependency_crates: &[&str],
-    extra_inputs: &[PathBuf],
-) -> Result<()> {
-    let output_parent = output
-        .parent()
-        .with_context(|| format!("module artifact path has no parent: {}", output.display()))?;
-    fs::create_dir_all(output_parent)?;
-
-    let deps_dir = config.kernel_release_deps_dir();
-
-    let mut command = Command::new(&config.cargo);
-    apply_kernel_cargo_env(config, &mut command);
-    command.arg("rustc");
-    for flag in &config.kernel_cargo_zflags {
-        command.arg(flag);
-    }
-    command
-        .arg("-p")
-        .arg(package)
-        .arg("--target")
-        .arg(&config.kernel_target)
-        .arg("--release")
-        .arg("--lib")
-        .arg("--features")
-        .arg("module-image")
-        .arg("--")
-        .arg("--emit=obj")
-        .arg("-C")
-        .arg("panic=abort")
-        .arg("-C")
-        .arg("no-redzone")
-        .arg("-C")
-        .arg("relocation-model=pic");
-    run_command(&mut command)?;
-
-    let mut archives = dependency_crates
-        .iter()
-        .map(|dependency| (*dependency).to_owned())
-        .collect::<Vec<_>>();
-    for builtin in ["core", "alloc", "compiler_builtins"] {
-        if !archives.iter().any(|existing| existing == builtin) {
-            archives.push(String::from(builtin));
-        }
-    }
-
-    let self_archive = find_latest_rlib_artifact(&deps_dir, &format!("lib{crate_name}-"))?;
-    let mut archive_paths = vec![self_archive.clone()];
-    for dependency in &archives {
-        archive_paths.push(find_latest_rlib_artifact(
-            &deps_dir,
-            &format!("lib{dependency}-"),
-        )?);
-    }
-    let mut freshness_inputs = archive_paths.clone();
-    freshness_inputs.extend(extra_inputs.iter().cloned());
-    if output_is_fresh(output, &freshness_inputs)? {
-        return Ok(());
-    }
-
-    remove_file_if_exists(output)?;
-    let ar_bin = command_in_path("llvm-ar")
-        .or_else(|| command_in_path("ar"))
-        .context("missing llvm-ar/ar for module archive extraction")?;
-    let temp_dir = create_temp_dir("rustos-module-link")?;
-    let mut link_inputs = Vec::new();
-    extract_archive_objects(
-        &ar_bin,
-        &self_archive,
-        &temp_dir.join(crate_name),
-        &mut link_inputs,
-    )?;
-
-    for (dependency, archive) in archives.iter().zip(archive_paths.iter().skip(1)) {
-        extract_archive_objects(
-            &ar_bin,
-            archive,
-            &temp_dir.join(dependency),
-            &mut link_inputs,
-        )?;
-    }
-
-    let result = if link_inputs.len() == 1 {
-        copy_with_parent(&link_inputs[0], output)
-    } else {
-        let mut command = Command::new(&config.ld);
-        command.arg("-r").arg("-o").arg(output);
-        for input in &link_inputs {
-            command.arg(input);
-        }
-        run_command(&mut command)
-    };
-
-    let _ = remove_dir_if_exists(&temp_dir);
-    result
 }
 
 fn build_c_demo(
@@ -1016,60 +876,6 @@ fn parse_objdump_imports(text: &str) -> Vec<(String, String)> {
     }
 
     imports
-}
-
-fn find_latest_rlib_artifact(dir: &Path, prefix: &str) -> Result<PathBuf> {
-    let mut latest: Option<(std::time::SystemTime, PathBuf)> = None;
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if path.extension().and_then(|ext| ext.to_str()) != Some("rlib")
-            || !file_name.starts_with(prefix)
-        {
-            continue;
-        }
-
-        let modified = entry.metadata()?.modified()?;
-        match &latest {
-            Some((best_time, _)) if &modified <= best_time => {}
-            _ => latest = Some((modified, path)),
-        }
-    }
-
-    latest
-        .map(|(_, path)| path)
-        .with_context(|| anyhow!("module rlib artifact not found under {}", dir.display()))
-}
-
-fn collect_object_files(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut paths = fs::read_dir(dir)?
-        .collect::<std::result::Result<Vec<_>, _>>()?
-        .into_iter()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("o"))
-        .collect::<Vec<_>>();
-    paths.sort();
-    Ok(paths)
-}
-
-fn extract_archive_objects(
-    ar_bin: &Path,
-    archive: &Path,
-    extract_dir: &Path,
-    link_inputs: &mut Vec<PathBuf>,
-) -> Result<()> {
-    fs::create_dir_all(extract_dir)?;
-    run_command(
-        Command::new(ar_bin)
-            .current_dir(extract_dir)
-            .arg("x")
-            .arg(archive),
-    )?;
-    link_inputs.extend(collect_object_files(extract_dir)?);
-    Ok(())
 }
 
 struct WinsysDllSpec {

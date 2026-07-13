@@ -8,7 +8,7 @@ contract file.
 
 1. Run or reuse one bounded KVM-smoke debugcon capture. Prefer focused `rg`;
    never read full logs.
-2. Rank by elapsed evidence: service startup, driver autoload, UI boot stages,
+2. Rank by elapsed evidence: service startup, DVM transport readiness, UI boot stages,
    update ticks, input errors/slow reads, watchdog/stall lines.
 3. Patch only the owner boundary that the log names. Do not harden unrelated
    helpers after the measured bottleneck is fixed.
@@ -16,16 +16,10 @@ contract file.
 
 ## Driver Boot
 
-- `driverd` owns provider policy. Kernel brokers only probe aliases and load
-  explicit module images.
-- Keep hardware-specific `.ko` packages out of `default` unless the default
-  KVM hardware profile actually needs them. Use explicit profiles such as `hardware-dev`,
-  `storage-dev`, `network-dev`, or `input-dev`.
-- `provider_group` is mutually exclusive for normal and fallback records. Once
-  a provider in the group loads, later records in the same group must skip
-  before alias probing.
-- `fallback_only` means "use only if no primary provider loaded", not "load
-  after primary".
+- Linux DVM owns device drivers. RustOS validates only the fixed DVM transport.
+- Missing or invalid DVM input, display, or network transport must leave that
+  device unavailable; do not install a native, firmware, or direct-virtio
+  fallback.
 
 ## UI Runtime
 

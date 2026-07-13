@@ -17,8 +17,6 @@ pub(crate) const DEFAULT_PROFILE: &str = "default";
 pub(crate) enum PackageKind {
     Boot,
     Kernel,
-    #[serde(alias = "driver")]
-    BridgeDriver,
     UserDriver,
     #[serde(alias = "system-app")]
     Service,
@@ -31,12 +29,12 @@ pub(crate) enum PackageKind {
 
 impl PackageKind {
     pub(crate) fn is_driver(&self) -> bool {
-        matches!(self, Self::BridgeDriver | Self::UserDriver)
+        matches!(self, Self::UserDriver)
     }
 
     pub(crate) fn default_execution_domain(&self) -> ExecutionDomain {
         match self {
-            Self::Boot | Self::Kernel | Self::BridgeDriver => ExecutionDomain::Kernel,
+            Self::Boot | Self::Kernel => ExecutionDomain::Kernel,
             Self::UserDriver | Self::Service | Self::App | Self::Compat => ExecutionDomain::User,
         }
     }
@@ -93,7 +91,6 @@ pub(crate) enum BuilderKind {
     CargoKernelBinary,
     MingwCExe,
     CDemo,
-    ModuleImage,
     WinsysDllBundle,
     ExternalCopy,
 }
@@ -105,13 +102,9 @@ pub(crate) struct BuildSpec {
     #[serde(default)]
     pub(crate) package: Option<String>,
     #[serde(default)]
-    pub(crate) crate_name: Option<String>,
-    #[serde(default)]
     pub(crate) source: Option<String>,
     #[serde(default)]
     pub(crate) source_env: Option<String>,
-    #[serde(default)]
-    pub(crate) dependency_crates: Vec<String>,
     #[serde(default)]
     pub(crate) extra_args: Vec<String>,
     #[serde(default)]
@@ -302,26 +295,7 @@ pub(crate) fn load_profile_manifests(
 }
 
 pub(crate) fn load_default_manifests(root_dir: &Path) -> Result<Vec<PackageManifest>> {
-    let manifests = load_profile_manifests(root_dir, DEFAULT_PROFILE)?;
-    reject_default_driver_modules(&manifests)?;
-    Ok(manifests)
-}
-
-/// The shipping KVM profile delegates device drivers to the isolated Linux
-/// domain. A bridge-driver `.ko` in this profile silently recreates an in-kernel
-/// compatibility path, so reject it before any image artifacts are built.
-fn reject_default_driver_modules(manifests: &[PackageManifest]) -> Result<()> {
-    if let Some(manifest) = manifests.iter().find(|manifest| {
-        manifest.kind.is_driver()
-            && manifest.install.path.starts_with("system/drivers/")
-            && manifest.install.path.ends_with(".ko")
-    }) {
-        bail!(
-            "default profile must not stage bridge-driver .ko artifacts; move {} to an explicit legacy profile",
-            manifest.id
-        );
-    }
-    Ok(())
+    load_profile_manifests(root_dir, DEFAULT_PROFILE)
 }
 
 pub(crate) fn required_manifest<'a>(
@@ -405,8 +379,7 @@ fn validate_manifests(manifests: &[PackageManifest]) -> Result<()> {
         match manifest.build.builder {
             BuilderKind::BootloaderUefi
             | BuilderKind::KernelRustc
-            | BuilderKind::CargoKernelBinary
-            | BuilderKind::ModuleImage => {
+            | BuilderKind::CargoKernelBinary => {
                 if manifest
                     .build
                     .package
@@ -456,7 +429,7 @@ fn validate_manifests(manifests: &[PackageManifest]) -> Result<()> {
         }
 
         match manifest.kind {
-            PackageKind::Boot | PackageKind::Kernel | PackageKind::BridgeDriver
+            PackageKind::Boot | PackageKind::Kernel
                 if execution_domain != ExecutionDomain::Kernel =>
             {
                 bail!(
@@ -595,7 +568,6 @@ fn validate_manifest_location(manifest: &PackageManifest) -> Result<()> {
     let expected_root = match manifest.kind {
         PackageKind::Boot => "boot/",
         PackageKind::Kernel => "kernel/",
-        PackageKind::BridgeDriver => "drivers/bridges/",
         PackageKind::UserDriver => "drivers/user/",
         PackageKind::Service => "services/",
         PackageKind::App => "apps/",
@@ -626,15 +598,6 @@ fn validate_install_taxonomy(manifest: &PackageManifest) -> Result<()> {
     let path = manifest.install.path.as_str();
 
     match manifest.kind {
-        PackageKind::BridgeDriver => {
-            if !path.starts_with("system/drivers/") || !path.ends_with(".ko") {
-                bail!(
-                    "bridge driver {} must install to system/drivers/*.ko, got {}",
-                    manifest.id,
-                    path
-                );
-            }
-        }
         PackageKind::UserDriver => {
             if !path.starts_with("drivers/user/") {
                 bail!(
@@ -686,10 +649,8 @@ mod tests {
             build: BuildSpec {
                 builder: BuilderKind::CargoKernelBinary,
                 package: Some(id.to_string()),
-                crate_name: None,
                 source: None,
                 source_env: None,
-                dependency_crates: Vec::new(),
                 extra_args: Vec::new(),
                 optional: false,
                 linkage: None,
@@ -789,33 +750,6 @@ mod tests {
         assert!(!is_normal_relative_install_path(
             "./services/initd/initd.elf"
         ));
-    }
-
-    #[test]
-    fn default_profile_rejects_bridge_driver_modules() {
-        let mut bridge = manifest("legacy-input", &["default"], &[]);
-        bridge.kind = PackageKind::BridgeDriver;
-        bridge.execution_domain = Some(ExecutionDomain::Kernel);
-        bridge.install.path = "system/drivers/input/legacy-input.ko".to_string();
-
-        let err = reject_default_driver_modules(&[bridge])
-            .expect_err("default profile must not regain an in-kernel .ko path");
-        assert!(err.to_string().contains("legacy-input"));
-    }
-
-    #[test]
-    fn explicit_legacy_profile_allows_bridge_driver_modules() {
-        let mut bridge = manifest("legacy-input", &["legacy-input-compat"], &[]);
-        bridge.kind = PackageKind::BridgeDriver;
-        bridge.execution_domain = Some(ExecutionDomain::Kernel);
-        bridge.install.path = "system/drivers/input/legacy-input.ko".to_string();
-
-        let default_manifests = [bridge]
-            .into_iter()
-            .filter(|manifest| manifest.profile_enabled(DEFAULT_PROFILE))
-            .collect::<Vec<_>>();
-        reject_default_driver_modules(&default_manifests)
-            .expect("only default profile is restricted");
     }
 
     #[test]

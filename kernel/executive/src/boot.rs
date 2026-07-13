@@ -2,8 +2,6 @@ use boot_protocol::{BootInfo, BootVolumeTransport};
 use core::arch::asm;
 use core::fmt::{self, Write};
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicU64, Ordering};
-use driver_abi::DriverClass;
 use kernel_compat::api as compat_api;
 use kernel_compat::api::console_host::{self, ConsoleProgramSpec};
 use kernel_hal::api as hal_api;
@@ -17,23 +15,6 @@ use crate::{announce_ready, debug, fatal, flow_debug, flow_info, hal_hooks, io_s
 const ROOTD_EXEC_PATH: &str = "services/rootd/rootd.elf";
 const ROOTD_BOOTSTRAP_WEIGHT_MICROS: u64 = 4_000;
 const MAX_BACKTRACE_FRAME_STEP: u64 = 1024 * 1024;
-
-static LAST_USB_INPUT_DIAG_TICK: AtomicU64 = AtomicU64::new(0);
-static LAST_USB_INPUT_DIAG_XHCI: AtomicU64 = AtomicU64::new(0);
-static LAST_USB_INPUT_DIAG_HID_POINTER: AtomicU64 = AtomicU64::new(0);
-static LAST_USB_INPUT_DIAG_PACKET_SUBMIT: AtomicU64 = AtomicU64::new(0);
-static LAST_USB_INPUT_DIAG_ABSOLUTE_SUBMIT: AtomicU64 = AtomicU64::new(0);
-static LAST_USB_INPUT_DIAG_READ_CALLS: AtomicU64 = AtomicU64::new(0);
-static LAST_USB_INPUT_DIAG_READ_EVENTS: AtomicU64 = AtomicU64::new(0);
-static LAST_USB_INPUT_DIAG_XHCI_SUCCESS: AtomicU64 = AtomicU64::new(0);
-static LAST_USB_INPUT_DIAG_XHCI_SHORT: AtomicU64 = AtomicU64::new(0);
-static LAST_USB_INPUT_DIAG_XHCI_EMPTY: AtomicU64 = AtomicU64::new(0);
-static LAST_USB_INPUT_DIAG_XHCI_REPORTS: AtomicU64 = AtomicU64::new(0);
-static LAST_USB_INPUT_DIAG_XHCI_RESUBMIT: AtomicU64 = AtomicU64::new(0);
-static LAST_USB_INPUT_DIAG_XHCI_RESUBMIT_FAIL: AtomicU64 = AtomicU64::new(0);
-static LAST_USB_INPUT_DIAG_XHCI_DOORBELL_NUDGE: AtomicU64 = AtomicU64::new(0);
-static LAST_USB_INPUT_DIAG_XHCI_RING_RECOVERY: AtomicU64 = AtomicU64::new(0);
-static LAST_USB_INPUT_DIAG_XHCI_RING_RECOVERY_FAIL: AtomicU64 = AtomicU64::new(0);
 
 macro_rules! boot_log {
     ($level:expr, $event_id:expr, $object_id:expr, $($arg:tt)+) => {{
@@ -213,17 +194,6 @@ pub fn initialize_kernel(boot_info_ptr: *const BootInfo) {
         );
     }
     boot_log!(debug::LogLevel::Debug, 114, 0, "block descriptor scan done");
-    boot_log!(debug::LogLevel::Debug, 115, 0, "cpu-local init begin");
-    io_services::init_linux_cpu_local_symbols();
-    boot_log!(debug::LogLevel::Debug, 116, 0, "cpu-local init done");
-    boot_log!(
-        debug::LogLevel::Info,
-        117,
-        0,
-        "linux cpu-local current_task_off={:#x} stack_guard_off={:#x}",
-        compat_api::linux::current_task_offset(),
-        compat_api::linux::stack_guard_offset(),
-    );
     hal_hooks::register();
 
     announce_ready("GUI", b"GUI initialized.\r\n");
@@ -235,7 +205,21 @@ pub fn initialize_kernel(boot_info_ptr: *const BootInfo) {
     // ivshmem is a PCI function. The DVM providers must be probed only after
     // ACPI has published the PCI bus regions; probing earlier silently sees no
     // device and can make a firmware framebuffer look like a live DVM path.
-    let _ = io_services::init_dvm_display_provider();
+    if io_services::init_dvm_display_provider() {
+        boot_log!(
+            debug::LogLevel::Info,
+            105,
+            0,
+            "DVM shared display transport initialized"
+        );
+    } else {
+        boot_log!(
+            debug::LogLevel::Warn,
+            105,
+            0,
+            "DVM shared display transport unavailable; UI remains disabled"
+        );
+    }
     if io_services::init_dvm_network_provider() {
         boot_log!(
             debug::LogLevel::Info,
@@ -243,16 +227,20 @@ pub fn initialize_kernel(boot_info_ptr: *const BootInfo) {
             0,
             "DVM shared network transport initialized"
         );
+    } else {
+        boot_log!(
+            debug::LogLevel::Warn,
+            106,
+            0,
+            "DVM shared network transport unavailable; network remains disabled"
+        );
     }
 
     hal_api::init_pic();
     announce_ready("PIC", b"PIC initialized.\r\n");
 
-    io_services::init_usb();
-    announce_ready("USB", b"USB initialized.\r\n");
-
     io_services::init_input();
-    announce_ready("Input", b"Input initialized.\r\n");
+    announce_ready("DVM input", b"DVM input transport initialized.\r\n");
 
     io_services::tty_init();
     hal_api::init_rtc();
@@ -290,30 +278,7 @@ pub fn finalize_kernel_initialization() {
     flow_info(12, "kernel finalize: vfs init done");
     io_services::enter_kernel_vfs_runtime();
     flow_info(13, "kernel finalize: kernel vfs runtime active");
-    flow_debug(14, "kernel finalize: display driver init begin");
-    if !io_services::initialize_loadable_modules_for_class(DriverClass::Display) {
-        flow_info(15, "kernel finalize: display driver init failed");
-        boot_log!(debug::LogLevel::Error, 133, 0, "display driver load failed");
-        io_services::console_write(b"Display driver load failed.\r\n");
-        panic!("display driver load failed");
-    }
-    flow_info(16, "kernel finalize: display driver init done");
-    flow_debug(17, "kernel finalize: input driver init begin");
-    if !io_services::initialize_loadable_modules_for_class(DriverClass::Input) {
-        flow_info(18, "kernel finalize: input driver init failed");
-        boot_log!(debug::LogLevel::Error, 134, 0, "input driver load failed");
-        io_services::console_write(b"Input driver load failed.\r\n");
-        panic!("input driver load failed");
-    }
-    flow_info(19, "kernel finalize: input driver init done");
-    flow_debug(20, "kernel finalize: network driver init begin");
-    if !io_services::initialize_loadable_modules_for_class(DriverClass::Network) {
-        flow_info(20, "kernel finalize: network driver init failed");
-        boot_log!(debug::LogLevel::Warn, 137, 0, "network driver load failed");
-        io_services::console_write(b"Network driver load failed.\r\n");
-    } else {
-        flow_info(20, "kernel finalize: network driver init done");
-    }
+    flow_info(14, "kernel finalize: DVM-only driver topology active");
 
     let service_thread = ps_api::Thread::new(tasks::nucleus_housekeeping_task, 100);
     service_thread.start();
@@ -422,16 +387,11 @@ pub fn housekeeping_once() -> usize {
     trace_service_phase("compat");
     compat_api::service_pending();
 
-    trace_service_phase("usb");
-    work += io_services::usb_service_pending();
-
     trace_service_phase("tty");
     work += io_services::input_service_pending();
 
     trace_service_phase("display");
     work += io_services::display_service_pending();
-
-    emit_usb_input_diag(work);
 
     trace_service_phase("reap");
     work += ps_api::service_deferred_work();
@@ -444,145 +404,6 @@ pub fn housekeeping_once() -> usize {
     work += hal_api::arch::rtc::drain_pending_heartbeat();
 
     work
-}
-
-fn emit_usb_input_diag(work: usize) {
-    let ticks_per_second = hal_api::arch::rtc::ticks_per_second();
-    let now = hal_api::arch::rtc::ticks();
-    let last_tick = LAST_USB_INPUT_DIAG_TICK.load(Ordering::Acquire);
-    if now.saturating_sub(last_tick) < ticks_per_second {
-        return;
-    }
-    if LAST_USB_INPUT_DIAG_TICK
-        .compare_exchange(last_tick, now, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return;
-    }
-
-    let input = io_services::input_debug_snapshot();
-    let usb_input = io_services::usb_input_debug_snapshot();
-    let xhci = io_services::debug_transfer_event_count();
-    let hid_pointer = io_services::debug_pointer_report_count();
-    let xhci_delta = xhci.saturating_sub(LAST_USB_INPUT_DIAG_XHCI.swap(xhci, Ordering::AcqRel));
-    let hid_pointer_delta = hid_pointer
-        .saturating_sub(LAST_USB_INPUT_DIAG_HID_POINTER.swap(hid_pointer, Ordering::AcqRel));
-    let packet_delta = input.pointer_packet_submits.saturating_sub(
-        LAST_USB_INPUT_DIAG_PACKET_SUBMIT.swap(input.pointer_packet_submits, Ordering::AcqRel),
-    );
-    let absolute_delta = input.pointer_absolute_submits.saturating_sub(
-        LAST_USB_INPUT_DIAG_ABSOLUTE_SUBMIT.swap(input.pointer_absolute_submits, Ordering::AcqRel),
-    );
-    let read_call_delta = input
-        .read_calls
-        .saturating_sub(LAST_USB_INPUT_DIAG_READ_CALLS.swap(input.read_calls, Ordering::AcqRel));
-    let read_event_delta = input
-        .read_events
-        .saturating_sub(LAST_USB_INPUT_DIAG_READ_EVENTS.swap(input.read_events, Ordering::AcqRel));
-    let xhci_success_delta = usb_input.transfer_success_count.saturating_sub(
-        LAST_USB_INPUT_DIAG_XHCI_SUCCESS.swap(usb_input.transfer_success_count, Ordering::AcqRel),
-    );
-    let xhci_short_delta = usb_input.transfer_short_count.saturating_sub(
-        LAST_USB_INPUT_DIAG_XHCI_SHORT.swap(usb_input.transfer_short_count, Ordering::AcqRel),
-    );
-    let xhci_empty_delta = usb_input.transfer_empty_count.saturating_sub(
-        LAST_USB_INPUT_DIAG_XHCI_EMPTY.swap(usb_input.transfer_empty_count, Ordering::AcqRel),
-    );
-    let xhci_reports_delta = usb_input.transfer_report_count.saturating_sub(
-        LAST_USB_INPUT_DIAG_XHCI_REPORTS.swap(usb_input.transfer_report_count, Ordering::AcqRel),
-    );
-    let xhci_resubmit_delta = usb_input.transfer_resubmit_count.saturating_sub(
-        LAST_USB_INPUT_DIAG_XHCI_RESUBMIT.swap(usb_input.transfer_resubmit_count, Ordering::AcqRel),
-    );
-    let xhci_resubmit_fail_delta = usb_input.transfer_resubmit_fail_count.saturating_sub(
-        LAST_USB_INPUT_DIAG_XHCI_RESUBMIT_FAIL
-            .swap(usb_input.transfer_resubmit_fail_count, Ordering::AcqRel),
-    );
-    let xhci_doorbell_nudge_delta = usb_input.input_poll_doorbell_nudges.saturating_sub(
-        LAST_USB_INPUT_DIAG_XHCI_DOORBELL_NUDGE
-            .swap(usb_input.input_poll_doorbell_nudges, Ordering::AcqRel),
-    );
-    let xhci_ring_recovery_delta = usb_input.input_poll_ring_recoveries.saturating_sub(
-        LAST_USB_INPUT_DIAG_XHCI_RING_RECOVERY
-            .swap(usb_input.input_poll_ring_recoveries, Ordering::AcqRel),
-    );
-    let xhci_ring_recovery_fail_delta = usb_input.input_poll_ring_recovery_failures.saturating_sub(
-        LAST_USB_INPUT_DIAG_XHCI_RING_RECOVERY_FAIL.swap(
-            usb_input.input_poll_ring_recovery_failures,
-            Ordering::AcqRel,
-        ),
-    );
-
-    if work == 0
-        && xhci_delta == 0
-        && xhci_success_delta == 0
-        && xhci_short_delta == 0
-        && xhci_empty_delta == 0
-        && xhci_reports_delta == 0
-        && xhci_resubmit_delta == 0
-        && xhci_resubmit_fail_delta == 0
-        && xhci_doorbell_nudge_delta == 0
-        && xhci_ring_recovery_delta == 0
-        && xhci_ring_recovery_fail_delta == 0
-        && hid_pointer_delta == 0
-        && packet_delta == 0
-        && absolute_delta == 0
-        && read_call_delta == 0
-        && read_event_delta == 0
-        && input.queued == 0
-        && !input.pending_coalesced
-        && !input.pending_pointer_position
-    {
-        return;
-    }
-
-    debug::println!(
-        "usb input diag tick={} work={} xhci_delta={} xhci_success_delta={} xhci_short_delta={} xhci_empty_delta={} xhci_reports_delta={} xhci_resubmit_delta={} xhci_resubmit_fail_delta={} xhci_doorbell_nudge_delta={} xhci_ring_recovery_delta={} xhci_ring_recovery_fail_delta={} hid_ptr_delta={} packet_delta={} abs_delta={} read_calls_delta={} read_events_delta={} queued={} pending_coalesced={} pending_pointer_position={} dropped_discrete={} dropped_lossy={} slot={} speed={} ep={:#x} mps={} b_interval={} ctx_interval={} ep_state={} ep_deq={:#x} ep_dcs={} ring_index={} ring_cycle={} active_polls={} pending_trb={:#x} pending_ctrl={:#x} pending_cycle={} report_seen={} recovering={} idle_ms={} recovery_idle_ms={} last_code={} recovery_stage={} recovery_drained={}",
-        now,
-        work,
-        xhci_delta,
-        xhci_success_delta,
-        xhci_short_delta,
-        xhci_empty_delta,
-        xhci_reports_delta,
-        xhci_resubmit_delta,
-        xhci_resubmit_fail_delta,
-        xhci_doorbell_nudge_delta,
-        xhci_ring_recovery_delta,
-        xhci_ring_recovery_fail_delta,
-        hid_pointer_delta,
-        packet_delta,
-        absolute_delta,
-        read_call_delta,
-        read_event_delta,
-        input.queued,
-        input.pending_coalesced,
-        input.pending_pointer_position,
-        input.dropped_discrete,
-        input.dropped_lossy,
-        usb_input.slot_id,
-        usb_input.speed,
-        usb_input.endpoint_address,
-        usb_input.endpoint_max_packet_size,
-        usb_input.endpoint_interval,
-        usb_input.endpoint_context_interval,
-        usb_input.endpoint_context_state,
-        usb_input.endpoint_context_dequeue,
-        usb_input.endpoint_context_dcs,
-        usb_input.interrupt_ring_index,
-        usb_input.interrupt_ring_cycle_state,
-        usb_input.active_poll_transfers,
-        usb_input.pending_poll_trb_dma,
-        usb_input.pending_poll_trb_control,
-        usb_input.pending_poll_trb_cycle,
-        usb_input.input_poll_report_seen,
-        usb_input.input_poll_recovering,
-        usb_input.input_poll_idle_ms,
-        usb_input.input_poll_recovery_idle_ms,
-        usb_input.input_poll_last_completion_code,
-        usb_input.input_poll_recovery_stage,
-        usb_input.input_poll_recovery_drained_events,
-    );
 }
 
 pub fn kernel_main_bootstrap(boot_info_ptr: *const BootInfo) -> ! {

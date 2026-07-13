@@ -49,7 +49,7 @@ boot orchestration, etc.) see `docs/ai/repo-map.md`.
 - `kernel/` — kernel entry and subsystem crates.
 - `services/` — userspace services.
 - `apps/` — demo/user applications.
-- `drivers/bridges/` — kernel bridge drivers and modules.
+- `driver-domains/linux/` — isolated Linux DVM image, relays, and contracts.
 - `drivers/libs/` — driver ABI/runtime/helper crates.
 - `libs/` — shared Rust crates.
 - `boot/` — boot protocol.

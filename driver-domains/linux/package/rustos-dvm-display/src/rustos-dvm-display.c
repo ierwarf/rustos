@@ -289,6 +289,9 @@ static int select_kms_target(int fd, const struct display_header *header, uint32
                              uint32_t *crtc_id, drmModeModeInfo *mode) {
     drmModeRes *resources = drmModeGetResources(fd);
     int result = -1;
+    uint32_t fallback_connector = 0U;
+    uint32_t fallback_crtc = 0U;
+    drmModeModeInfo fallback_mode;
     int connector_index;
     if (resources == NULL) {
         return -1;
@@ -310,13 +313,19 @@ static int select_kms_target(int fd, const struct display_header *header, uint32
             drmModeFreeConnector(connector);
             continue;
         }
-        *crtc_id = select_crtc(resources, encoder);
+        uint32_t candidate_crtc = select_crtc(resources, encoder);
+        if (candidate_crtc != 0U && fallback_connector == 0U) {
+            fallback_connector = connector->connector_id;
+            fallback_crtc = candidate_crtc;
+            fallback_mode = connector->modes[0];
+        }
         for (mode_index = 0; mode_index < connector->count_modes; mode_index++) {
             if ((uint32_t)connector->modes[mode_index].hdisplay == header->width &&
                 (uint32_t)connector->modes[mode_index].vdisplay == header->height) {
                 *connector_id = connector->connector_id;
+                *crtc_id = candidate_crtc;
                 *mode = connector->modes[mode_index];
-                result = *crtc_id == 0U ? -1 : 0;
+                result = candidate_crtc == 0U ? -1 : 0;
                 break;
             }
         }
@@ -327,6 +336,12 @@ static int select_kms_target(int fd, const struct display_header *header, uint32
         }
     }
     drmModeFreeResources(resources);
+    if (result != 0 && fallback_connector != 0U) {
+        *connector_id = fallback_connector;
+        *crtc_id = fallback_crtc;
+        *mode = fallback_mode;
+        return 0;
+    }
     if (result != 0) {
         errno = ENODEV;
     }
@@ -347,11 +362,11 @@ static void destroy_scanout_buffer(int fd, struct scanout_buffer *buffer) {
     memset(buffer, 0, sizeof(*buffer));
 }
 
-static int create_scanout_buffer(int fd, const struct display_header *header,
+static int create_scanout_buffer(int fd, uint32_t width, uint32_t height,
                                  struct scanout_buffer *buffer) {
     struct drm_mode_create_dumb create = {
-        .width = header->width,
-        .height = header->height,
+        .width = width,
+        .height = height,
         .bpp = 32U,
     };
     struct drm_mode_map_dumb map = {0};
@@ -364,16 +379,17 @@ static int create_scanout_buffer(int fd, const struct display_header *header,
     buffer->handle = create.handle;
     buffer->pitch = create.pitch;
     buffer->bytes = create.size;
-    if (buffer->pitch < header->stride_bytes || create.size < header->frame_bytes) {
+    if (buffer->pitch < width * DISPLAY_BYTES_PER_PIXEL ||
+        create.size < (uint64_t)width * height * DISPLAY_BYTES_PER_PIXEL) {
         errno = EOVERFLOW;
         destroy_scanout_buffer(fd, buffer);
         return -1;
     }
     handles[0] = buffer->handle;
     pitches[0] = buffer->pitch;
-    if (drmModeAddFB2(fd, header->width, header->height, DRM_FORMAT_XRGB8888, handles, pitches,
+    if (drmModeAddFB2(fd, width, height, DRM_FORMAT_XRGB8888, handles, pitches,
                       offsets, &buffer->framebuffer_id, 0U) != 0) {
-        if (drmModeAddFB(fd, header->width, header->height, 24U, 32U, buffer->pitch, buffer->handle,
+        if (drmModeAddFB(fd, width, height, 24U, 32U, buffer->pitch, buffer->handle,
                          &buffer->framebuffer_id) != 0) {
             destroy_scanout_buffer(fd, buffer);
             return -1;
@@ -421,7 +437,8 @@ static int open_kms_display(const struct display_header *header, struct kms_disp
         return -1;
     }
     for (index = 0; index < 2U; index++) {
-        if (create_scanout_buffer(display->fd, header, &display->buffers[index]) != 0) {
+        if (create_scanout_buffer(display->fd, display->mode.hdisplay, display->mode.vdisplay,
+                                  &display->buffers[index]) != 0) {
             while (index > 0U) {
                 index--;
                 destroy_scanout_buffer(display->fd, &display->buffers[index]);
@@ -475,14 +492,32 @@ static int copy_stable_frame(const struct shared_display *shared, struct kms_dis
     const volatile uint8_t *pixels = shared->base + DISPLAY_HEADER_BYTES;
     struct scanout_buffer *back = &display->buffers[display->front_index ^ 1U];
     uint64_t before = read_le64(shared->base + DISPLAY_GENERATION_OFFSET);
+    uint32_t target_width = display->mode.hdisplay;
+    uint32_t target_height = display->mode.vdisplay;
     unsigned int row;
     if (before == 0U || (before & 1U) != 0U) {
         return 0;
     }
-    for (row = 0; row < shared->header.height; row++) {
-        const volatile uint8_t *source = pixels + (size_t)row * shared->header.stride_bytes;
-        memcpy(back->map + (size_t)row * back->pitch, (const void *)source,
-               shared->header.stride_bytes);
+    if (target_width == shared->header.width && target_height == shared->header.height) {
+        for (row = 0; row < shared->header.height; row++) {
+            const volatile uint8_t *source = pixels + (size_t)row * shared->header.stride_bytes;
+            memcpy(back->map + (size_t)row * back->pitch, (const void *)source,
+                   shared->header.stride_bytes);
+        }
+    } else {
+        for (row = 0; row < target_height; row++) {
+            uint32_t source_row = (uint32_t)(((uint64_t)row * shared->header.height) / target_height);
+            const volatile uint8_t *source = pixels + (size_t)source_row * shared->header.stride_bytes;
+            uint8_t *destination = back->map + (size_t)row * back->pitch;
+            uint32_t column;
+            for (column = 0; column < target_width; column++) {
+                uint32_t source_column =
+                    (uint32_t)(((uint64_t)column * shared->header.width) / target_width);
+                memcpy(destination + (size_t)column * DISPLAY_BYTES_PER_PIXEL,
+                       (const void *)(source + (size_t)source_column * DISPLAY_BYTES_PER_PIXEL),
+                       DISPLAY_BYTES_PER_PIXEL);
+            }
+        }
     }
     __sync_synchronize();
     if (read_le64(shared->base + DISPLAY_GENERATION_OFFSET) != before) {
@@ -528,8 +563,9 @@ static int serve_display(void) {
                 presented_frames++;
                 if (presented_frames == 1U) {
                     fprintf(stderr,
-                            "rustos-dvm-display: active width=%u height=%u stride=%u format=BGRA8888 double-buffered\n",
-                            shared.header.width, shared.header.height, shared.header.stride_bytes);
+                            "rustos-dvm-display: active width=%u height=%u stride=%u format=BGRA8888 double-buffered scanout=%ux%u\n",
+                            shared.header.width, shared.header.height, shared.header.stride_bytes,
+                            display.mode.hdisplay, display.mode.vdisplay);
                     fflush(stderr);
                 }
             }

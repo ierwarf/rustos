@@ -12,29 +12,28 @@ use core::slice;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use rustos_user_abi::syscall::{
+    COMMERCIAL_MAX_CAPABILITY_OP_LEASE_GRANT, COMMERCIAL_MAX_CAPABILITY_OP_LEASE_RENEW,
+    COMMERCIAL_MAX_CAPABILITY_OP_LEASE_REVOKE, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_CAPABILITY, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
+    COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR, COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST,
+    COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE, COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH,
+    COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL, COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY,
+    COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY, COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP,
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, CoreServiceLeaseWire,
-    LifecycleDrainBrokerArgs, LifecycleEventWire, LoaderSpawnRequest, LoaderSpawnResponse,
-    RootdIpcRequest, RootdIpcResponse, COMMERCIAL_MAX_CAPABILITY_OP_LEASE_GRANT,
-    COMMERCIAL_MAX_CAPABILITY_OP_LEASE_RENEW, COMMERCIAL_MAX_CAPABILITY_OP_LEASE_REVOKE,
-    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_CAPABILITY,
-    COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR,
-    COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST, COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE,
-    COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH, COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL,
-    COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY, COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY,
-    COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP, IPC_SERVICE_DEVMGRD, IPC_SERVICE_DRIVERD,
-    IPC_SERVICE_INPUTD, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD, IPC_SERVICE_NETD,
-    IPC_SERVICE_PAGERD, IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD, IPC_SERVICE_SERVICE_DRIVERD,
+    IPC_SERVICE_DEVMGRD, IPC_SERVICE_INPUTD, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD,
+    IPC_SERVICE_NETD, IPC_SERVICE_PAGERD, IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD,
     IPC_SERVICE_SESSIOND, IPC_SERVICE_STORAGED, IPC_SERVICE_UISERVER, IPC_SERVICE_VFSD,
     LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT, LOADER_OP_ACTIVATE, LOADER_OP_SPAWN_EXEC,
     LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES,
-    LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_FLAG_DEFER_START, ROOTD_IPC_ABI_VERSION,
+    LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_FLAG_DEFER_START, LifecycleDrainBrokerArgs,
+    LifecycleEventWire, LoaderSpawnRequest, LoaderSpawnResponse, ROOTD_IPC_ABI_VERSION,
     ROOTD_IPC_OP_LEASE_LIST, ROOTD_IPC_OP_STATUS, ROOTD_LEASE_STATE_EXITED,
     ROOTD_LEASE_STATE_FAILED, ROOTD_LEASE_STATE_RESTART_PENDING, ROOTD_LEASE_STATE_RUNNING,
-    SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
-    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_RECV_WITH_SENDER,
-    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
-    SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
+    RootdIpcRequest, RootdIpcResponse, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_CALL,
+    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
     SYS_RUSTOS_SPAWN_EXEC,
 };
 
@@ -53,7 +52,6 @@ const VFSD_EXEC: &[u8] = b"services/vfsd/vfsd.elf\0";
 const LOADERD_EXEC: &[u8] = b"services/loaderd/loaderd.elf\0";
 const PROCD_EXEC: &[u8] = b"services/procd/procd.elf\0";
 const INITD_EXEC: &[u8] = b"services/initd/initd.elf\0";
-const DRIVERD_EXEC: &[u8] = b"services/driverd/driverd.elf\0";
 const NETD_EXEC: &[u8] = b"services/netd/netd.elf\0";
 const DEVMGRD_EXEC: &[u8] = b"services/devmgrd/devmgrd.elf\0";
 const INPUTD_EXEC: &[u8] = b"services/inputd/inputd.elf\0";
@@ -127,11 +125,7 @@ struct PostInitServiceSpec {
     exec_path: &'static [u8],
 }
 
-const POST_INIT_MANIFEST: [PostInitServiceSpec; 7] = [
-    PostInitServiceSpec {
-        service_id: IPC_SERVICE_DRIVERD,
-        exec_path: DRIVERD_EXEC,
-    },
+const POST_INIT_MANIFEST: [PostInitServiceSpec; 6] = [
     PostInitServiceSpec {
         service_id: IPC_SERVICE_NETD,
         exec_path: NETD_EXEC,
@@ -265,7 +259,6 @@ pub extern "C" fn _start() -> ! {
         post_init_lease(POST_INIT_MANIFEST[3]),
         post_init_lease(POST_INIT_MANIFEST[4]),
         post_init_lease(POST_INIT_MANIFEST[5]),
-        post_init_lease(POST_INIT_MANIFEST[6]),
     ];
 
     // The bootstrap manifest is the rootd-owned policy boundary for direct
@@ -993,7 +986,6 @@ fn service_policy_capability(service_id: u64) -> u64 {
         IPC_SERVICE_VFSD => rustos_user_abi::syscall::IPC_SERVICE_CAP_VFS_POLICY,
         IPC_SERVICE_NETD => rustos_user_abi::syscall::IPC_SERVICE_CAP_NET_POLICY,
         IPC_SERVICE_DEVMGRD => rustos_user_abi::syscall::IPC_SERVICE_CAP_DEVICE_POLICY,
-        IPC_SERVICE_DRIVERD => rustos_user_abi::syscall::IPC_SERVICE_CAP_DRIVER_POLICY,
         IPC_SERVICE_LOADERD => rustos_user_abi::syscall::IPC_SERVICE_CAP_PROCESS_LOADER,
         IPC_SERVICE_STORAGED => rustos_user_abi::syscall::IPC_SERVICE_CAP_STORAGE_POLICY,
         IPC_SERVICE_INPUTD => rustos_user_abi::syscall::IPC_SERVICE_CAP_INPUT_POLICY,
@@ -1001,9 +993,6 @@ fn service_policy_capability(service_id: u64) -> u64 {
         IPC_SERVICE_ROOTD => rustos_user_abi::syscall::IPC_SERVICE_CAP_ROOT_SUPERVISOR,
         IPC_SERVICE_SESSIOND => rustos_user_abi::syscall::IPC_SERVICE_CAP_SESSION_POLICY,
         IPC_SERVICE_PAGERD => rustos_user_abi::syscall::IPC_SERVICE_CAP_PAGER_POLICY,
-        IPC_SERVICE_SERVICE_DRIVERD => {
-            rustos_user_abi::syscall::IPC_SERVICE_CAP_SERVICE_DRIVER_POLICY
-        }
         IPC_SERVICE_UISERVER => rustos_user_abi::syscall::IPC_SERVICE_CAP_UI_POLICY,
         INITD_LEASE_ID => rustos_user_abi::syscall::IPC_SERVICE_CAP_ROOT_SUPERVISOR,
         _ => 0,
@@ -1019,13 +1008,6 @@ fn service_capability_for_subject(
         return Err(22);
     }
     if let Some(capability) = post_init_reported_service_capability(
-        post_init_leases,
-        request.arg0,
-        request.header.subject_pid,
-    ) {
-        return Ok(capability);
-    }
-    if let Some(capability) = post_init_delegated_service_capability(
         post_init_leases,
         request.arg0,
         request.header.subject_pid,
@@ -1112,11 +1094,7 @@ fn authorize_post_init_lease_reporter(
         return Err(13);
     }
     match service_id {
-        IPC_SERVICE_DRIVERD
-        | IPC_SERVICE_NETD
-        | IPC_SERVICE_DEVMGRD
-        | IPC_SERVICE_INPUTD
-        | IPC_SERVICE_STORAGED
+        IPC_SERVICE_NETD | IPC_SERVICE_DEVMGRD | IPC_SERVICE_INPUTD | IPC_SERVICE_STORAGED
         | IPC_SERVICE_SESSIOND => Ok(()),
         _ => Err(13),
     }
@@ -1136,26 +1114,6 @@ fn post_init_reported_service_capability(
         })
         .map(|lease| service_policy_capability(lease.service_id))
         .filter(|capability| *capability != 0)
-}
-
-fn post_init_delegated_service_capability(
-    post_init_leases: &[PostInitLease],
-    service_id: u64,
-    subject_pid: u64,
-) -> Option<u64> {
-    if service_id != IPC_SERVICE_SERVICE_DRIVERD {
-        return None;
-    }
-    let driverd_pid = post_init_leases
-        .iter()
-        .find(|lease| {
-            lease.service_id == IPC_SERVICE_DRIVERD && lease.state == ROOTD_LEASE_STATE_RUNNING
-        })
-        .map(|lease| lease.pid)?;
-    if driverd_pid != subject_pid {
-        return None;
-    }
-    Some(rustos_user_abi::syscall::IPC_SERVICE_CAP_SERVICE_DRIVER_POLICY)
 }
 
 fn authorize_service_lookup_for_subject(

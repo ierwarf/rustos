@@ -10,7 +10,6 @@ failure output as the primary debugging context.
 | `cargo xtask check` | validate layering/manifests/workspace | `target/` | dependency layer violation, bad manifest, missing target |
 | `cargo xtask build` | full OS build + stage | `target/`, `build/` | compile error, missing firmware/artifact, manifest staging error |
 | `cargo xtask build-user` | userspace packages only | `target/`, `build/artifacts` | service/app compile error |
-| `cargo xtask build-driver-modules` | bridge modules only | `target/`, `build/artifacts` | driver/module build error |
 | `cargo xtask stage` | restage built artifacts | `build/image` | missing required artifact, bad install path |
 | `cargo xtask clean` | remove generated host/build/runtime outputs | removes `target/`, `build/`, `logs/` | stale generated artifact cleanup |
 
@@ -21,6 +20,7 @@ failure output as the primary debugging context.
 | `cargo xtask build-dvm` | build the pinned Linux DVM and verify its manifest | `driver-domains/linux/out/` | missing Buildroot prerequisite or source/artifact mismatch |
 | `cargo xtask verify-dvm` | verify every DVM artifact and control-contract hash | none | altered/missing DVM artifact or contract |
 | `cargo xtask kvm-smoke` | concurrently boot Linux DVM and RustOS with QEMU/KVM | `build/kvm/` | unavailable `/dev/kvm`, guest exit, missing readiness marker |
+| `cargo xtask kvm-run` | start the interactive Linux-DVM display session with no readiness deadline | `build/kvm/` | unavailable GUI backend, `/dev/kvm`, or a guest exit |
 | `cargo run -p rustos-hostd -- discover` | read host IOMMU groups | none | IOMMU unavailable or unreadable sysfs |
 | `cargo run -p rustos-hostd -- preflight --plan <file>` | require complete, non-protected IOMMU-group ownership | none | incomplete group or host-critical BDF |
 | `cargo run -p rustos-hostd -- relay-input ...` | relay validated DVM Linux input into RustOS COM2 | QEMU-private input socket | policy mismatch, malformed DVM event, or endpoint disconnect |
@@ -31,7 +31,7 @@ failure output as the primary debugging context.
 | --- | --- | --- | --- |
 | `cargo xtask selftest` | host selftests for fault parsing, ABI/layout, runtime contracts, module tests | `target/` | contract/layout regression |
 | `cargo xtask fuzz-host --target all` | deterministic host fuzz smoke for fault rules, project config, package/DVM manifests, and hostd launch-plan parsing | `logs/` on crash | parser panic or invariant bug |
-| `cargo xtask ring3-inventory` | classify remaining `RING3-MIGRATION-REFERENCE` and `RING3-MIGRATION-COMMENTED-OUT` LOC by owner/lane; read `migration_candidate_loc` as real remaining ring3 work, `ko_slowpath_ring3_loc` as Linux `.ko` slow-path brokerization reference LOC, and `cleanup_debt_loc` as delete/retire work | none | stale marker classification or unexpected active LOC growth |
+| `cargo xtask ring3-inventory` | classify remaining migration markers by owner/lane; read `migration_candidate_loc` as real remaining ring3 work and `cleanup_debt_loc` as delete/retire work | none | stale marker classification or unexpected active LOC growth |
 | `cargo test -p module-tests` | module tests | `target/` | unit/module regression |
 | `git diff --check` | whitespace sanity | none | trailing whitespace/conflict marker |
 
@@ -51,7 +51,7 @@ failure output as the primary debugging context.
   RDI2 frames over RustOS's dedicated COM2 socket; no QMP socket is launched.
   L0 releases tracked keys/buttons when the DVM stream ends. The smoke
   establishes the relay but does not synthesize input, so a live event still
-  needs a real input source assigned to the DVM. It is not storage, `.ko`, or
+  needs a real input source assigned to the DVM. It is not storage or
   PCI-passthrough validation.
 - `--dvm-display-shmem` adds one private fixed-layout `ivshmem-plain` object
   to both KVM guests. It requires RustOS's primary display ABI to equal the

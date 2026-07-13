@@ -2500,16 +2500,15 @@ impl Scheduler {
 
     pub(super) fn current_process_task_ids(&self) -> ([u64; MAX_TASK], usize) {
         let mut task_ids = [0_u64; MAX_TASK];
-        let Some(process_handle) = self.contexts[self.current_task]
-            .and_then(|context| context.process_handle)
+        let Some(process_handle) =
+            self.contexts[self.current_task].and_then(|context| context.process_handle)
         else {
             return (task_ids, 0);
         };
         let mut count = 0usize;
         for slot in 1..MAX_TASK {
             if self.retired[slot]
-                || self.contexts[slot]
-                    .and_then(|context| context.process_handle)
+                || self.contexts[slot].and_then(|context| context.process_handle)
                     != Some(process_handle)
             {
                 continue;
@@ -2913,8 +2912,8 @@ impl Scheduler {
 
     pub(super) fn exit_current_process(&mut self) {
         let current_slot = self.current_task;
-        let Some(process_handle) = self.contexts[current_slot]
-            .and_then(|context| context.process_handle)
+        let Some(process_handle) =
+            self.contexts[current_slot].and_then(|context| context.process_handle)
         else {
             self.exit_current_task();
             return;
@@ -3057,9 +3056,7 @@ fn stack_range_contains(base: u64, top: u64, start: usize, end: usize) -> bool {
 mod tests {
     use alloc::boxed::Box;
 
-    use super::{
-        ConsoleSessionHandle, MAX_TASK, NICE_0_LOAD, Scheduler, TaskContext, TaskStart,
-    };
+    use super::{ConsoleSessionHandle, MAX_TASK, NICE_0_LOAD, Scheduler, TaskContext, TaskStart};
     use crate::memory::paging::ProcessAddressSpace;
     use crate::multitask::{noop_task_entry, process_table};
     use crate::user::abi::UserAbi;

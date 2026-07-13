@@ -38,7 +38,7 @@ console_hosted = false
 | Field | Values | Meaning |
 | --- | --- | --- |
 | `id` | string | Stable package id used by runtime deps and registries. |
-| `kind` | `boot`, `kernel`, `bridge-driver`, `user-driver`, `service`, `app`, `compat` | Package taxonomy. |
+| `kind` | `boot`, `kernel`, `user-driver`, `service`, `app`, `compat` | Package taxonomy. |
 | `execution_domain` | `kernel`, `user` | Optional explicit execution domain. |
 | `profiles` | string list | Build/profile membership; defaults to `["default"]`. |
 | `startup` | `none`, `init`, `session`, `desktop` | Startup policy for generated registries. |
@@ -53,7 +53,6 @@ console_hosted = false
 | `cargo-kernel-binary` | Rust userspace service/app ELF. |
 | `mingw-c-exe` | Windows PE executable demo. |
 | `c-demo` | Host C demo/smoke artifact. |
-| `module-image` | Kernel bridge `.ko` module image. |
 | `winsys-dll-bundle` | Windows system DLL bundle. |
 | `external-copy` | Copy externally provided artifact. |
 
@@ -140,7 +139,7 @@ console_hosted = false
 | Field | Values | Meaning |
 | --- | --- | --- |
 | `id` | string | runtime deps와 registry에서 쓰는 stable package id |
-| `kind` | `boot`, `kernel`, `bridge-driver`, `user-driver`, `service`, `app`, `compat` | package taxonomy |
+| `kind` | `boot`, `kernel`, `user-driver`, `service`, `app`, `compat` | package taxonomy |
 | `execution_domain` | `kernel`, `user` | optional explicit execution domain |
 | `profiles` | string list | build/profile membership, 기본값 `["default"]` |
 | `startup` | `none`, `init`, `session`, `desktop` | generated registry startup policy |
@@ -155,7 +154,6 @@ console_hosted = false
 | `cargo-kernel-binary` | Rust userspace service/app ELF |
 | `mingw-c-exe` | Windows PE executable demo |
 | `c-demo` | host C demo/smoke artifact |
-| `module-image` | kernel bridge `.ko` module image |
 | `winsys-dll-bundle` | Windows system DLL bundle |
 | `external-copy` | externally provided artifact copy |
 

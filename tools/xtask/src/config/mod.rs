@@ -18,7 +18,6 @@ pub(crate) struct Config {
     pub(crate) cargo: OsString,
     pub(crate) rustup: OsString,
     pub(crate) cc: OsString,
-    pub(crate) ld: OsString,
     pub(crate) mingw_cc: OsString,
     pub(crate) objdump: OsString,
     pub(crate) kvm_qemu_bin: OsString,
@@ -59,7 +58,6 @@ impl Config {
         let cargo = env_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
         let rustup = env_os("RUSTUP").unwrap_or_else(|| OsString::from("rustup"));
         let cc = env_os("CC").unwrap_or_else(|| OsString::from("gcc"));
-        let ld = env_os("LD").unwrap_or_else(|| OsString::from("ld"));
         let mingw_cc =
             env_os("MINGW_CC").unwrap_or_else(|| OsString::from("x86_64-w64-mingw32-gcc"));
         let objdump = env_os("OBJDUMP").unwrap_or_else(|| OsString::from("objdump"));
@@ -145,7 +143,6 @@ impl Config {
             cargo,
             rustup,
             cc,
-            ld,
             mingw_cc,
             objdump,
             kvm_qemu_bin,
@@ -199,11 +196,6 @@ impl Config {
 
     pub(crate) fn userdemo2_import_audit_log_path(&self) -> PathBuf {
         self.logs_dir.join("userdemo2-imports.txt")
-    }
-
-    pub(crate) fn kernel_release_deps_dir(&self) -> PathBuf {
-        self.cargo_target_dir
-            .join(format!("{}/release/deps", self.kernel_target))
     }
 }
 

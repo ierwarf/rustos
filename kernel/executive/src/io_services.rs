@@ -3,7 +3,6 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use boot_protocol::{BootInfo, BootVolumeIdentity, BootVolumeTransport};
-use driver_abi::DriverClass;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BootstrapPhase {
@@ -26,41 +25,6 @@ pub(crate) struct InputEventQueueDebugSnapshot {
     pub pending_pointer_position: bool,
     pub dropped_discrete: u64,
     pub dropped_lossy: u64,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct UsbInputDebugSnapshot {
-    pub slot_id: u8,
-    pub speed: u8,
-    pub endpoint_address: u8,
-    pub endpoint_max_packet_size: u16,
-    pub endpoint_interval: u8,
-    pub endpoint_context_interval: u8,
-    pub endpoint_context_state: u8,
-    pub endpoint_context_dequeue: u64,
-    pub endpoint_context_dcs: bool,
-    pub interrupt_ring_index: usize,
-    pub interrupt_ring_cycle_state: bool,
-    pub active_poll_transfers: usize,
-    pub pending_poll_trb_dma: u64,
-    pub pending_poll_trb_control: u32,
-    pub pending_poll_trb_cycle: bool,
-    pub transfer_success_count: u64,
-    pub transfer_short_count: u64,
-    pub transfer_empty_count: u64,
-    pub transfer_report_count: u64,
-    pub transfer_resubmit_count: u64,
-    pub transfer_resubmit_fail_count: u64,
-    pub input_poll_report_seen: bool,
-    pub input_poll_recovering: bool,
-    pub input_poll_idle_ms: u64,
-    pub input_poll_recovery_idle_ms: u64,
-    pub input_poll_last_completion_code: u8,
-    pub input_poll_recovery_stage: u8,
-    pub input_poll_recovery_drained_events: u64,
-    pub input_poll_doorbell_nudges: u64,
-    pub input_poll_ring_recoveries: u64,
-    pub input_poll_ring_recovery_failures: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -109,44 +73,6 @@ mod backend {
             pending_pointer_position: snapshot.pending_pointer_position,
             dropped_discrete: snapshot.dropped_discrete,
             dropped_lossy: snapshot.dropped_lossy,
-        }
-    }
-
-    fn map_usb_input_snapshot(
-        snapshot: kernel_io_manager::api::usb::XhciInputDebugSnapshot,
-    ) -> UsbInputDebugSnapshot {
-        UsbInputDebugSnapshot {
-            slot_id: snapshot.slot_id,
-            speed: snapshot.speed,
-            endpoint_address: snapshot.endpoint_address,
-            endpoint_max_packet_size: snapshot.endpoint_max_packet_size,
-            endpoint_interval: snapshot.endpoint_interval,
-            endpoint_context_interval: snapshot.endpoint_context_interval,
-            endpoint_context_state: snapshot.endpoint_context_state,
-            endpoint_context_dequeue: snapshot.endpoint_context_dequeue,
-            endpoint_context_dcs: snapshot.endpoint_context_dcs,
-            interrupt_ring_index: snapshot.interrupt_ring_index,
-            interrupt_ring_cycle_state: snapshot.interrupt_ring_cycle_state,
-            active_poll_transfers: snapshot.active_poll_transfers,
-            pending_poll_trb_dma: snapshot.pending_poll_trb_dma,
-            pending_poll_trb_control: snapshot.pending_poll_trb_control,
-            pending_poll_trb_cycle: snapshot.pending_poll_trb_cycle,
-            transfer_success_count: snapshot.transfer_success_count,
-            transfer_short_count: snapshot.transfer_short_count,
-            transfer_empty_count: snapshot.transfer_empty_count,
-            transfer_report_count: snapshot.transfer_report_count,
-            transfer_resubmit_count: snapshot.transfer_resubmit_count,
-            transfer_resubmit_fail_count: snapshot.transfer_resubmit_fail_count,
-            input_poll_report_seen: snapshot.input_poll_report_seen,
-            input_poll_recovering: snapshot.input_poll_recovering,
-            input_poll_idle_ms: snapshot.input_poll_idle_ms,
-            input_poll_recovery_idle_ms: snapshot.input_poll_recovery_idle_ms,
-            input_poll_last_completion_code: snapshot.input_poll_last_completion_code,
-            input_poll_recovery_stage: snapshot.input_poll_recovery_stage,
-            input_poll_recovery_drained_events: snapshot.input_poll_recovery_drained_events,
-            input_poll_doorbell_nudges: snapshot.input_poll_doorbell_nudges,
-            input_poll_ring_recoveries: snapshot.input_poll_ring_recoveries,
-            input_poll_ring_recovery_failures: snapshot.input_poll_ring_recovery_failures,
         }
     }
 
@@ -233,40 +159,8 @@ mod backend {
             .collect()
     }
 
-    pub(crate) fn init_linux_cpu_local_symbols() {
-        kernel_io_manager::api::driver::init_linux_cpu_local_symbols();
-    }
-
-    pub(crate) fn initialize_loadable_modules_for_class(class: DriverClass) -> bool {
-        kernel_io_manager::api::driver::initialize_loadable_modules_for_class(class)
-    }
-
-    pub(crate) fn dispatch_pic_irq(irq: u8) -> bool {
-        kernel_io_manager::api::driver::irq::dispatch_pic_irq(irq)
-    }
-
-    pub(crate) fn debug_irq_lock_snapshot() -> (usize, usize) {
-        kernel_io_manager::api::driver::linux::runtime::debug_irq_lock_snapshot()
-    }
-
-    pub(crate) fn tick_jiffies(delta: u64) -> u64 {
-        kernel_io_manager::api::driver::linux::runtime::tick_jiffies(delta)
-    }
-
-    pub(crate) fn debug_input_lock_snapshot() -> (usize, u64) {
-        kernel_io_manager::api::driver::linux::input::debug_lock_snapshot()
-    }
-
     pub(crate) fn init_input() {
         kernel_io_manager::api::input::init();
-    }
-
-    pub(crate) fn on_keyboard_interrupt() {
-        kernel_io_manager::api::input::on_keyboard_interrupt();
-    }
-
-    pub(crate) fn on_mouse_interrupt() {
-        kernel_io_manager::api::input::on_mouse_interrupt();
     }
 
     pub(crate) fn input_service_pending() -> usize {
@@ -275,26 +169,6 @@ mod backend {
 
     pub(crate) fn input_debug_snapshot() -> InputEventQueueDebugSnapshot {
         map_input_snapshot(kernel_io_manager::api::input::event_queue::debug_snapshot())
-    }
-
-    pub(crate) fn init_usb() {
-        kernel_io_manager::api::usb::init();
-    }
-
-    pub(crate) fn usb_service_pending() -> usize {
-        kernel_io_manager::api::usb::service_pending()
-    }
-
-    pub(crate) fn debug_transfer_event_count() -> u64 {
-        kernel_io_manager::api::usb::debug_transfer_event_count()
-    }
-
-    pub(crate) fn debug_pointer_report_count() -> u64 {
-        kernel_io_manager::api::usb::debug_pointer_report_count()
-    }
-
-    pub(crate) fn usb_input_debug_snapshot() -> UsbInputDebugSnapshot {
-        map_usb_input_snapshot(kernel_io_manager::api::usb::debug_input_snapshot())
     }
 
     pub(crate) fn init_vfs() {
@@ -309,13 +183,9 @@ mod backend {
 
 pub(crate) use backend::{
     block_descriptors, boot_volume_identity, boot_volume_transport_hint, bootstrap_phase,
-    console_write, debug_input_lock_snapshot, debug_irq_lock_snapshot, debug_pointer_report_count,
-    debug_transfer_event_count, dispatch_pic_irq, display_service_pending,
-    enter_kernel_vfs_runtime, enter_userspace_runtime, gui_init, gui_try_present_panic_blackout,
-    init_block_devices, init_boot_info, init_dvm_display_provider, init_dvm_network_provider, init_input,
-    init_linux_cpu_local_symbols, init_usb,
-    init_vfs, initialize_loadable_modules_for_class, input_debug_snapshot, input_service_pending,
-    on_keyboard_interrupt, on_mouse_interrupt, register_boot_volume_opener,
-    system_console_session_raw, tick_jiffies, tty_init, usb_input_debug_snapshot,
-    usb_service_pending, userspace_display_active, userspace_ready,
+    console_write, display_service_pending, enter_kernel_vfs_runtime, enter_userspace_runtime,
+    gui_init, gui_try_present_panic_blackout, init_block_devices, init_boot_info,
+    init_dvm_display_provider, init_dvm_network_provider, init_input, init_vfs,
+    input_debug_snapshot, input_service_pending, register_boot_volume_opener,
+    system_console_session_raw, tty_init, userspace_display_active, userspace_ready,
 };

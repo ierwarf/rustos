@@ -21,11 +21,11 @@ surfaces or sockets they expose.
 | `syscalld` | Linux MM/clock/signal policy. Calls into the gated `SYS_RUSTOS_MM_BROKER`. | `IPC_SERVICE_SYSCALLD`. |
 | `vfsd` | Linux VFS policy (mount table, openat resolution, FAT boot volume). | `IPC_SERVICE_VFSD`. |
 | `loaderd` | Process spawn: ELF dynamic main+interpreter, PE32+ main + System32 imports, Windows runtime broker registration. | `IPC_SERVICE_LOADERD`. |
-| `driverd` | `.ko` autoload, alias probe, provider-group arbitration. Single owner of `SYS_RUSTOS_DRIVER_*` brokers. | Driver registry tsv + brokers. |
-| `devmgrd` | Device manager / hotplug. Talks to driverd and consumers (`inputd`, `storaged`). | `IPC_SERVICE_DEVMGRD`. |
-| `inputd` | Input event routing from kernel HID/serio into Wayland and console clients. | Wayland seat + console focus. |
-| `storaged` | Block device policy and partition mapping over AHCI/NVMe. | Block API + driverd. |
-| `netd` | Network stack policy (virtio-net today, more to follow). | netprobe socket. |
+| Linux DVM | Linux driver lifecycle, DRM/KMS, evdev, and virtio-net. | Fixed RDI2/ivshmem transports. |
+| `devmgrd` | RustOS device namespace and hotplug policy. | `IPC_SERVICE_DEVMGRD`. |
+| `inputd` | Authenticated DVM input routing into Wayland and console clients. | Wayland seat + console focus. |
+| `storaged` | Block device policy and partition mapping over AHCI/NVMe. | Block API. |
+| `netd` | Network stack policy over DVM Ethernet transport. | netprobe socket. |
 | `procd` | Process accounting, signal delivery, kernel ↔ runtime bridges for `ps`-style listings. | Pairs with `runtimed`. |
 | `uiserver` | Display surface, compositor, Wayland server, console renderer. Profiling stays opt-in via `RUSTOS_UI_PROFILE`. | `/run/user/1000/wayland-0`, runtime client. |
 
@@ -41,27 +41,13 @@ materialized on runtimed's main loop after UI readiness. Desktop metadata and
 runtime-launch policy are cached separately so one registry can never be
 mistaken for the other.
 
-### Driver Modules
+### Linux Driver Domain
 
-Driver modules (`.ko`) are owned by `driverd`, but the actual link + init
-happens inside the kernel module loader because they need ring0 access.
-`driverd` reads `system/registry/kernel/loadable-drivers.tsv`, calls
-`SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER` per record, and walks dependency
-edges. The on-boot probe loads:
-
-- Linux DVM `virtio-input` relay for keyboard and pointer events; `inputd`
-  owns RustOS-side policy/translation. Physical USB HID `.ko` artifacts require
-  the explicit legacy compatibility profile.
-- Linux DVM DRM/KMS for the default KVM display path; the kernel boot
-  framebuffer is only the early fallback. Native virtio-gpu fallback must not
-  be reintroduced.
-- Linux DVM `virtio-net` relay for the default emulated NIC; `netd` retains
-  RustOS socket and route policy.
-
-A skipped driver shows up as `driverd: skipped name=... reason=...` and is
-expected when the alias doesn't match the live hardware or when a higher
-priority provider in the same `provider_group` is already active. Active
-provider groups skip later normal and fallback records before alias probing.
+Linux modules execute only in the isolated DVM. RustOS receives keyboard and
+pointer records through authenticated RDI2/COM2, and display/network through
+fixed validated ivshmem regions. `inputd`, `uiserver`, and `netd` own RustOS
+policy above those transports. A missing DVM transport disables its device;
+there is no direct hardware, firmware-display, or RustOS module fallback.
 
 <a id="korean"></a>
 
@@ -82,11 +68,11 @@ ELF, 그리고 staged registry에 한 줄을 함께 가집니다. 아래 표는 
 | `syscalld` | Linux MM/clock/signal policy. `SYS_RUSTOS_MM_BROKER` 호출. | `IPC_SERVICE_SYSCALLD`. |
 | `vfsd` | Linux VFS policy (mount table, openat resolution, FAT boot volume). | `IPC_SERVICE_VFSD`. |
 | `loaderd` | process spawn: ELF dynamic main+interpreter, PE32+ main + System32 import, Windows runtime broker 등록. | `IPC_SERVICE_LOADERD`. |
-| `driverd` | `.ko` autoload, alias probe, provider-group 중재. `SYS_RUSTOS_DRIVER_*` broker 단일 소유자. | driver registry tsv + broker. |
-| `devmgrd` | device manager / hotplug. driverd 및 consumer(`inputd`, `storaged`)와 통신. | `IPC_SERVICE_DEVMGRD`. |
-| `inputd` | kernel HID/serio에서 들어온 input event를 Wayland와 console client로 route. | Wayland seat + console focus. |
-| `storaged` | AHCI/NVMe 위 block device policy와 partition mapping. | Block API + driverd. |
-| `netd` | network stack policy (현재 virtio-net). | netprobe socket. |
+| Linux DVM | Linux driver lifecycle, DRM/KMS, evdev, virtio-net. | 고정 RDI2/ivshmem transport. |
+| `devmgrd` | RustOS device namespace와 hotplug policy. | `IPC_SERVICE_DEVMGRD`. |
+| `inputd` | 인증된 DVM input을 Wayland와 console client로 route. | Wayland seat + console focus. |
+| `storaged` | AHCI/NVMe 위 block device policy와 partition mapping. | Block API. |
+| `netd` | DVM Ethernet transport 위 network stack policy. | netprobe socket. |
 | `procd` | process accounting, signal 전달, ps-style listing용 kernel ↔ runtime bridge. | `runtimed`와 쌍. |
 | `uiserver` | display surface, compositor, Wayland server, console renderer. profiling은 `RUSTOS_UI_PROFILE`로 필요할 때만 켭니다. | `/run/user/1000/wayland-0`, runtime client. |
 
@@ -101,23 +87,10 @@ transaction을 사용합니다.
 main loop가 catalog를 구성하며 desktop metadata와 runtime-launch policy는 별도
 cache를 사용하므로 서로 다른 registry가 뒤섞이지 않습니다.
 
-### Driver module
+### Linux Driver Domain
 
-driver module (`.ko`)은 `driverd`가 소유 정책이지만, ring0 접근이 필요해
-실제 link + init은 kernel module loader 안에서 일어납니다. `driverd`는
-`system/registry/kernel/loadable-drivers.tsv`를 읽고 각 record에 대해
-`SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER`를 호출하며 의존 edge를 따라
-순서를 정합니다. active provider group은 같은 group의 이후 normal/fallback
-record를 alias probe 전에 skip합니다. boot 중 probe되는 module 예:
-
-- keyboard/pointer는 Linux DVM `virtio-input` relay가 전달하고, RustOS의
-  정책/변환은 `inputd`가 담당합니다. 물리 USB HID `.ko` artifact는 명시적
-  legacy compatibility profile에서만 사용합니다.
-- 기본 KVM display는 Linux DVM DRM/KMS이며 kernel boot framebuffer는 초기
-  fallback뿐입니다. native virtio-gpu fallback은 다시 넣으면 안 됩니다.
-- emulated NIC은 Linux DVM `virtio-net` relay가 맡고 RustOS `netd`가 socket과
-  route policy를 유지합니다.
-
-skip된 driver는 `driverd: skipped name=... reason=...`로 표시되며, alias가
-실제 hardware와 매칭되지 않거나 같은 `provider_group` 안에 더 높은 우선
-순위의 provider가 이미 활성일 때 정상적으로 발생합니다.
+Linux module은 격리된 DVM에서만 실행합니다. RustOS는 keyboard/pointer를
+인증된 RDI2/COM2으로 받고, display/network은 고정 크기와 버전이 검증된
+ivshmem transport로 받습니다. 그 위의 정책은 `inputd`, `uiserver`, `netd`가
+소유합니다. DVM transport가 없거나 검증에 실패하면 해당 장치는 사용할 수
+없으며, direct hardware·firmware display·RustOS module fallback은 없습니다.

@@ -34,7 +34,6 @@ extern "C" fn timer_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut S
     let current_rsp = context_ptr as usize;
     let next_rsp = unsafe {
         let scheduler = scheduler_mut();
-        let _ = crate::linux_runtime_hooks::tick_jiffies(1);
         if timer_interrupted_kernel_frame(context_ptr, scheduler) {
             crate::arch::pic::send_eoi(crate::arch::pic::PIC_1_OFFSET);
             return context_ptr;
@@ -70,7 +69,6 @@ extern "C" fn rtc_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut Sav
     let current_rsp = context_ptr as usize;
     let interrupted_kernel_frame = unsafe {
         let scheduler = scheduler_mut();
-        let _ = crate::linux_runtime_hooks::tick_jiffies(1);
         timer_interrupted_kernel_frame(context_ptr, scheduler)
     };
     if interrupted_kernel_frame {

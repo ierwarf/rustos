@@ -15,8 +15,8 @@ Inherits the repo root `AGENTS.md`. Add-only overrides below.
 ## Microkernel Offload Pattern
 
 Offload syscalls follow: ring0 entry → narrow privileged broker → user
-service (`syscalld`, `vfsd`, `loaderd`, `netd`, `devmgrd`, `driverd`,
-`storaged`, `inputd`). When extending:
+service (`syscalld`, `vfsd`, `loaderd`, `netd`, `devmgrd`, `storaged`,
+`inputd`). Linux driver policy remains in the isolated DVM. When extending:
 
 - Keep ring0 to **primitive** capability gates. No policy.
 - New brokers must be explicit (named `SYS_RUSTOS_*_BROKER`) and bounded.

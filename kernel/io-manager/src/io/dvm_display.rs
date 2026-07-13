@@ -1,5 +1,5 @@
 // RING3-MIGRATION-REFERENCE START: DVM display transport substrate.
-// Provider policy remains in driverd/uiserver. Ring0 only recognizes the
+// Provider policy remains in the Linux DVM and uiserver. Ring0 only recognizes the
 // exact ivshmem PCI function, validates a fixed host-created header, and maps
 // pixels as a framebuffer. It never accepts DVM pointers, command streams, or
 // variable-length metadata.

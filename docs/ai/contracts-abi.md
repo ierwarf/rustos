@@ -55,7 +55,7 @@ supervisor waits with `SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT`. The wait is
 race-free, deadline bounded, keyed by service id plus expected PID, and wakes on
 registration or child exit. Polling endpoint lookup is not a readiness model.
 rootd must authorize the reporter
-for each post-init lease: `initd` reports driverd/netd/devmgrd/inputd/storaged
+for each post-init lease: `initd` reports netd/devmgrd/inputd/storaged
 and runtimed-as-sessiond, while running sessiond/runtimed reports uiserver.
 Reports for an already-running lease are idempotent only for the same PID and
 must reject attempts to overwrite the lease with a different PID.
@@ -75,7 +75,6 @@ endpoint registration synchronously depends on rootd capability replies.
 | 2 | `vfsd` | `VFS_POLICY` | File namespace, cwd, dir/file cursors, mount/umount, metadata |
 | 3 | `netd` | `NET_POLICY` | Socket namespace + all socket syscalls (AF_UNIX too) |
 | 4 | `devmgrd` | `DEVICE_POLICY` | `/dev` registry, device open, ioctl auth |
-| 5 | `driverd` | `DRIVER_POLICY` | Registry parsing, provider order, autoload |
 | 6 | `loaderd` | `PROCESS_LOADER` | ELF/PE image policy, mapping, launch |
 | 7 | `storaged` | `STORAGE_POLICY` | Block inventory after registration |
 | 8 | `inputd` | `INPUT_POLICY` | Input ingest, read payload |
@@ -83,17 +82,31 @@ endpoint registration synchronously depends on rootd capability replies.
 | 10 | `rootd` | `ROOT_SUPERVISOR` | Core-service leases, restart budgets |
 | 11 | `sessiond` (reserved) | `SESSION_POLICY` | Console/TTY/session |
 | 12 | `pagerd` (reserved) | `PAGER_POLICY` | Backing/page-cache |
-| 13 | service-driver (reserved) | `SERVICE_DRIVER_POLICY` | Non-`.ko` driver coord |
+| 13 | service-driver (reserved) | `SERVICE_DRIVER_POLICY` | Future non-DVM privileged-resource coordination |
 
 Broker authorization checks the caller's registered service capability — **not** its executable path.
 Until a standalone `pagerd` lease exists, `syscalld` may register the reserved `IPC_SERVICE_PAGERD` endpoint and receive `PAGER_POLICY`; rootd must treat that as an explicit compatibility delegation, not a generic multi-service registration rule.
 `initd` must not be spawned until that delegated pager endpoint is registered;
 otherwise dynamic loader page-fault/backing policy can deadlock behind rootd's
 own initd spawn IPC.
-`driverd` may register the reserved `IPC_SERVICE_SERVICE_DRIVERD` endpoint with the same PID as its reported `IPC_SERVICE_DRIVERD` lease; rootd treats this as an explicit same-process delegation, not as a generic service-id fallback.
+## Driver domain contract
 
-Kernel data paths (FD/socket/module/process/storage/input) remain narrow gated broker primitives for privileged DMA/MMIO/IRQ/module-load/user-copy/address-space mutation. Generic Linux `.ko` text execution and compatibility hot paths are **not** moved to ring3. Sleepable `.ko` probe/init/resource policy slow paths are tracked separately in `kernel/io-manager/src/driver/ko_slowpath_migration.rs` and by `cargo xtask ring3-inventory` under `ko-slowpath-ring3`; the ring0 side remains a bounded broker for privileged symbols and driverd drains the symbol events. First-party non-`.ko` service-driver candidates are tracked separately under `service-driver-host`; mark them as explicit ring0 substrate exceptions if the design keeps them in ring0 permanently.
-Residual app-ABI policy batches that are larger than a single broker are tracked as planning-only source references: `compat-slowpath-ring3`, `pager-slowpath-ring3`, and `process-slowpath-ring3`. These lanes do **not** mean syscall entry, page tables, scheduler state, or `.ko` execution move to ring3; they are excluded from active migration LOC unless a future audit finds a concrete ring0 fallback to delete.
+Linux kernel modules execute only inside the Linux DVM. RustOS neither stages nor
+loads module images, probes module aliases, or retains native USB, PS/2, or
+virtio-net fallback providers. A missing DVM transport leaves that device
+unavailable; it must not select an alternate in-kernel provider.
+
+RustOS accepts only bounded DVM transports: RDI2 over COM2 for input, fixed
+ivshmem layouts for display and Ethernet frames. The Linux DRM/KMS relay inside
+the DVM remains the display owner. Ring0 validates fixed headers, sequence and
+bounds; `inputd`, `netd`, and `uiserver` own policy above those transports.
+The reserved service-driver resource broker is not a DVM module loader and has
+no currently admitted service endpoint.
+
+Residual app-ABI policy batches (`compat-slowpath-ring3`,
+`pager-slowpath-ring3`, and `process-slowpath-ring3`) are planning references.
+They do not move syscall entry, page tables, scheduler state, or privileged
+transport out of ring0.
 
 ## Handle Transfer
 
@@ -162,26 +175,18 @@ Residual app-ABI policy batches that are larger than a single broker are tracked
 - Compat input-device reads call `INPUTD_IPC_OP_AUTHORIZE_READ` before
   `INPUTD_IPC_OP_READ`; inputd consumes the authorization by `(pid, tid, fd,
   access)` so raw reads are not accepted as standalone event-drain authority.
-- inputd drains raw reports via gated `SYS_RUSTOS_INPUT_INGEST_BROKER`, chooses native/evdev bytes, returns bounded `InputdReadResponse` capped at 32 KiB. Raw reports are an independent source from inputd IPC, so inputd uses a bounded 4 ms user-space ingest turn with `SYS_RUSTOS_IPC_TRY_RECV`; it must sleep when both sources are idle and reuse its fixed-size ingress scratch buffer rather than allocate per turn.
+- inputd drains authenticated RDI2 records via gated
+  `SYS_RUSTOS_INPUT_INGEST_BROKER`, returns bounded `InputdReadResponse`
+  capped at 32 KiB, and uses a bounded 4 ms ingest turn. It must sleep when
+  both IPC and DVM input are idle and reuse its fixed-size ingress scratch.
 - RustOS-native input readers should prefer short nonblocking `read()` attempts
   over a separate readiness-then-read cycle. `INPUTD_IPC_OP_READ` already drains
   ingest first, so routing through read avoids stale `STATS`/`poll` readiness
   decisions while keeping HID decode policy in inputd.
-- inputd must coalesce lossy pointer-position/motion streams to the latest
-  position/delta while preserving keyboard and pointer-button edges. USB tablet
-  absolute-position samples are not discrete semantic events; preserving every
-  sample creates user-visible burst latency.
-- Native USB HID ingress must preserve raw interrupt reports across the kernel
-  boundary. Report descriptor decoding, duplicate-position suppression, lossy
-  pointer coalescing, logical-axis mapping, button-edge generation, and
-  display-surface scaling stay in inputd.
-- PS/2 keyboard scancodes and PS/2 mouse bytes are raw ingress. Packet
-  assembly, button edges, motion conversion, and keyboard translation are
-  `inputd` policy, not i8042 ring0 policy.
-- Native keyboard events must carry the full `InputEvent` contract:
-  `code/action/modifiers/text`. HID and PS/2 paths both pass through
-  `keyboard-core::KeyboardDriver`; do not emit keycode-only native events and
-  expect `uiserver` or the TTY layer to reconstruct printable text.
+- inputd must coalesce lossy DVM pointer motion to the latest delta while
+  preserving keyboard and pointer-button edges. Linux key translation and
+  modifier/text state remain inputd policy; RustOS receives only bounded,
+  authenticated relay records.
 - Absolute pointer coordinates are a two-part contract. `inputd` owns HID
   logical axis decoding and event coalescing; `uiserver` owns the current
   display/output extent and publishes it to inputd with
@@ -213,73 +218,6 @@ Residual app-ABI policy batches that are larger than a single broker are tracked
 - Device-open uses `DevmgrdDeviceOpenRequest`/`Response` with typed `DeviceId + access + rights`. Broker must install fd with the **exact reduced `DeviceHandleRights` chosen by devmgrd**, not default native-device rights. Broker must not infer policy from paths.
 - `ioctl` route ownership lives in devmgrd: kernel compat asks `DEVMGRD_IPC_OP_IOCTL_ROUTE` and follows `DEVMGRD_IOCTL_ROUTE_DEVMGRD`, `DEVMGRD_IOCTL_ROUTE_SESSIOND_TTY`, `DEVMGRD_IOCTL_ROUTE_SESSIOND_COMMIT`, or `DEVMGRD_IOCTL_ROUTE_DIRECT`. Do not add new ioctl policy match tables to ring0.
 - Policy-sensitive `ioctl` routes through devmgrd → `SYS_RUSTOS_DEVICE_IOCTL_BROKER` (gated by `DEVICE_POLICY`). Direct ioctl fallback allowed only pre-devmgrd. Hot data-path ioctls (display present) may stay direct broker calls to avoid per-frame policy IPC.
-
-## Driver Surface (`driverd`)
-
-- Gated brokers: `SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER`, `SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER`, `SYS_RUSTOS_DRIVER_SYMBOL_EVENT_BROKER`. Kernel side only loads an explicit module image, probes hardware aliases, or drains bounded Linux `.ko` slow-path symbol events for `driverd`.
-- Linux `.ko` text still executes in ring0. The migration path is symbol-by-symbol:
-  `probe/init` slow-path shims may record bounded events for ring3 `driverd`
-  policy/state, while IRQ/atomic/hot symbols stay ring0-local unless they are
-  explicitly converted to a sleepable broker boundary. Do not add synchronous
-  kernel-to-`driverd` IPC from inside module load/init; `driverd` calls the load
-  broker and then drains symbol events after the syscall returns.
-- PCI `.ko` probe/resource lifecycle state starts in ring3: `__pci_register_driver`,
-  `pci_enable_device`/`pcim_enable_device`, bus-master toggles, PCI config
-  writes, `pci_iomap*`, and `pci_iounmap` record bounded symbol events with
-  device/resource/config payloads. Ring0 still performs the privileged PCI
-  config/MMIO operation for compatibility; driverd owns the accumulated policy
-  state used to tighten future allow/deny decisions.
-- Provider-group active state and fallback ordering are **driverd state, not a ring0 broker**.
-- xHCI uses the native RustOS host-controller path by default. Linux USB host-controller `.ko` bridges stay out of the default profile; keep load/provider/device/input policy in driverd/devmgrd/inputd, not in the native transfer engine.
-- Native xHCI HID polling is always enabled for USB input.
-- Native xHCI HID interrupt endpoints keep one active interrupt IN transfer per
-  endpoint and resubmit it on completion, matching the Linux usbhid single-URB
-  polling model. Do not queue parallel HID input polls; they interact badly with
-  emulated HID event compression and turn normal endpoint service intervals into
-  bursty multi-frame delivery.
-- Native xHCI sends HID `SET_IDLE=0` for pointer devices and relies on one
-  event-driven interrupt IN transfer plus bounded, last-resort Stop Endpoint /
-  Set TR Dequeue Pointer recovery. Do not emulate liveness with a short periodic HID
-  idle rate: emulated xHCI/tablet repeats identical absolute samples at that rate
-  and turns input into queue pressure.
-- Active interrupt IN transfers may legitimately stay pending while no fresh
-  report exists. Do not treat sub-second idle as an endpoint fault; keep
-  doorbell nudges cheap and reserve Stop Endpoint recovery for multi-second
-  watchdog repair.
-- Native xHCI transfer rings must follow producer-cycle Link TRB rules: passing
-  a toggle Link TRB flips the Link TRB cycle bit and then the software producer
-  cycle. Do not assign the link cycle from the current producer state at wrap;
-  that can leave emulated xHCI parked at the segment link after long HID runs.
-- Native xHCI registers its legacy IRQ completion handler when the controller
-  exposes a usable PIC IRQ line, but active HID interrupt transfers still keep
-  `usb::service_pending()` reachable from compat input `poll()` as a bounded
-  completion fallback. Emulated legacy IRQ routing can observe an interrupt without
-  reliably waking every later completion; do not let input readers block solely
-  on the IRQ path until MSI/MSI-X or a proven interrupt-driven xHCI backend is
-  available.
-- Native xHCI IRQ service may drain completion events and enqueue deferred HID
-  reports, but bounded Stop Endpoint / Set TR Dequeue Pointer recovery stays on
-  the polled service path outside IRQ context.
-- The remaining `service-driver-host` lane is not `.ko` work. It is first-party
-  non-`.ko` native driver debt such as xHCI/legacy input: either implement an
-  explicit ring3 service-driver host with leased privileged resources, or
-  document the lane as a permanent ring0 substrate exception.
-- The `ko-slowpath-ring3` lane is `.ko` compatibility reference work. Keep `.ko` code
-  execution, IRQ/atomic callbacks, DMA/MMIO mutation, and hot data paths in
-  ring0, but move sleepable init/probe/resource policy state into `driverd`
-  through bounded symbol-event brokers and RustOS-private driver syscalls.
-- `compat-slowpath-ring3`, `pager-slowpath-ring3`, and
-  `process-slowpath-ring3` are planning-only reference lanes for app-ABI
-  policy/state ownership already routed through service/broker boundaries.
-  Ring0 keeps syscall decode/user-copy, page-table/frame mutation, task
-  scheduling, wait wakeups, and broker enforcement.
-- `SYS_RUSTOS_SERVICE_DRIVER_RESOURCE_BROKER` is the kernel substrate for
-  first-party ring3 service-driver resources. It returns typed MMIO, IRQ, DMA,
-  and IO-port leases, and exposes narrow IO-port read/write ops for leased
-  service-driver hosts; driver/provider policy stays in `driverd` and protocol
-  policy such as PS/2 packet handling stays in `inputd`.
-- Post-bootstrap NVMe may use Linux `.ko` bridge manifests only in storage-dev profiles where the compat surface is explicit. Built-in NVMe remains the boot/storage substrate.
-- Early boot may use legacy kernel registry path until driver-service bootstrap owns display/input/network bring-up.
 
 ## Process Loader Surface (`loaderd` + `procd`)
 
@@ -380,24 +318,25 @@ Kernel keeps only: user-copy, address-space replacement, scheduler mutation, pen
 
 ## Commercial-Max Protocol
 
-`rustos-user-abi::syscall::CommercialMaxProtocol*` reserves versioned protocol/op ids for rootd, procd, loaderd, syscalld, vfsd, devmgrd, inputd, storaged, netd, driverd, sessiond, pagerd, service-driver, and capability-lease work.
+`rustos-user-abi::syscall::CommercialMaxProtocol*` reserves versioned protocol/op
+ids for core services. Retired driverd values remain numeric ABI reservations;
+they do not admit a service or a module-loading path.
 
 **Shared ABI scaffolding only** — ring0 exposes new privileged actions only when a narrow broker is implemented and capability-gated.
 
 ## Display Surface
 
 - `device::DisplayInfo.flags`: `DISPLAY_INFO_FLAG_PRIMARY_PROVIDER` distinguishes a real primary provider from GRUB/firmware framebuffers (default = early console + panic output only).
-- The kernel-owned boot framebuffer is the only last-resort exception: it may
-  be primary only until a validated hardware/DVM provider replaces it, and it
-  must preserve `DISPLAY_INFO_FLAG_BOOT_FRAMEBUFFER`.
-- Driver framebuffer registration carries explicit source flags in `drivers/libs/driver-abi::DisplayFramebufferRegistration`. **Do not infer primary ownership from framebuffer geometry or `display_info()` presence.**
+- Firmware framebuffer data is diagnostic-only and is never a presentation
+  fallback. The only accepted normal provider is the validated DVM aperture.
+- Driver framebuffer registration accepts only the DVM primary-provider flag;
+  do not infer ownership from geometry or `display_info()` presence.
 - Surface present = kernel fast path: copies validated shared-surface contents into active framebuffer + queues provider flush for bounded housekeeping. **Do not reintroduce synchronous virtio-gpu command waits into app syscall context** for normal uiserver presents.
 - The KVM virtio-gpu path is Linux DVM DRM/KMS over the fixed display aperture.
   RustOS has no in-kernel virtio-gpu `.ko` path and must not regain a second
   display provider.
-- If a DVM/hardware provider is unavailable, normal presentation fails closed
-  on the kernel-owned boot framebuffer; it must not synthesize a second
-  virtio-gpu fallback or accept an unvalidated display command stream.
+- If the DVM provider is unavailable, normal presentation fails closed. It
+  must not synthesize a boot-framebuffer or direct-GPU fallback.
 - `uiserver` partial dirty rects should stay split unless merged union is nearly as small as separate areas. Over-coalescing disjoint topbar/taskbar/window updates → large framebuffer copies + delayed input feedback.
 
 ## Scheduler
@@ -409,6 +348,5 @@ Kernel keeps only: user-copy, address-space replacement, scheduler mutation, pen
   scheduling class even when the current task's weighted vruntime still wins;
   this is the last-resort rail for long UI/input kernel frames without breaking
   strict System/User/Idle band ordering.
-- `.ko` module init runs as a user-service kernel frame. Long lock-free compat callbacks (`driver_register`, HID/USB/virtio probes) must call `cond_resched` at safe points so module init does not starve ready user tasks.
 - `KernelSpinLock` must not be held across disk/filesystem/IPC/framebuffer-copy loops. Use `KernelWaitLock` or split the section; add `cond_resched` in long loops.
 - Boot service order: driver/input/storage policy services before UI launchers. `runtimed` waits on `devmgrd` and `storaged` endpoints before UI bootstrap.

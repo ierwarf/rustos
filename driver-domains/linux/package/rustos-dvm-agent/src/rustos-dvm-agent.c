@@ -36,6 +36,11 @@
 #define INPUT_SELFTEST_NAME "RustOS DVM input selftest"
 #define INPUT_SELFTEST_CYCLES 800U
 #define INPUT_SELFTEST_POLL_MS 25
+// RDI2 uses a deliberately bounded serial transport. Coalescing relative
+// motion at 125Hz preserves responsive desktop input while staying well below
+// the 115200-bps COM2 budget; button state is forwarded immediately.
+#define INPUT_POINTER_FLUSH_MS 8
+#define INPUT_POINTER_FLUSH_NS ((uint64_t)INPUT_POINTER_FLUSH_MS * 1000000ULL)
 
 enum input_device_kind {
     INPUT_DEVICE_KEYBOARD,
@@ -49,6 +54,8 @@ struct pointer_state {
     int16_t wheel_horizontal;
     uint8_t buttons;
     int pending;
+    int buttons_changed;
+    uint64_t flush_deadline_ns;
 };
 
 struct input_selftest {
@@ -523,6 +530,39 @@ static int16_t add_clamped_i16(int16_t current, int value) {
     return (int16_t)sum;
 }
 
+static int monotonic_time_ns(uint64_t *out) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0 || now.tv_nsec < 0) {
+        return -1;
+    }
+    *out = ((uint64_t)now.tv_sec * 1000000000ULL) + (uint64_t)now.tv_nsec;
+    return 0;
+}
+
+static void pointer_mark_pending(struct pointer_state *state) {
+    uint64_t now;
+    if (!state->pending && monotonic_time_ns(&now) == 0) {
+        state->flush_deadline_ns = now + INPUT_POINTER_FLUSH_NS;
+    }
+    state->pending = 1;
+}
+
+static int pointer_flush_timeout_ms(const struct pointer_state *state) {
+    uint64_t now;
+    uint64_t remaining_ns;
+    uint64_t remaining_ms;
+    if (!state->pending || state->buttons_changed) {
+        return state->pending ? 0 : -1;
+    }
+    if (state->flush_deadline_ns == 0 || monotonic_time_ns(&now) != 0 ||
+        now >= state->flush_deadline_ns) {
+        return 0;
+    }
+    remaining_ns = state->flush_deadline_ns - now;
+    remaining_ms = (remaining_ns + 999999ULL) / 1000000ULL;
+    return remaining_ms > (uint64_t)INT_MAX ? INT_MAX : (int)remaining_ms;
+}
+
 static int pointer_button_mask(unsigned int code, uint8_t *mask) {
     switch (code) {
     case BTN_LEFT:
@@ -581,11 +621,12 @@ static int send_pointer_packet(int fd, unsigned int request_id, struct pointer_s
     state->wheel_vertical = 0;
     state->wheel_horizontal = 0;
     state->pending = 0;
+    state->buttons_changed = 0;
+    state->flush_deadline_ns = 0;
     return 0;
 }
 
-static int consume_pointer_event(int fd, unsigned int request_id, struct pointer_state *state,
-                                 const struct input_event *event) {
+static int consume_pointer_event(struct pointer_state *state, const struct input_event *event) {
     uint8_t mask;
     if (event->type == EV_REL) {
         switch (event->code) {
@@ -604,7 +645,7 @@ static int consume_pointer_event(int fd, unsigned int request_id, struct pointer
         default:
             return 0;
         }
-        state->pending = 1;
+        pointer_mark_pending(state);
         return 0;
     }
     if (event->type == EV_KEY && pointer_button_mask(event->code, &mask) == 0) {
@@ -614,11 +655,12 @@ static int consume_pointer_event(int fd, unsigned int request_id, struct pointer
             state->buttons &= (uint8_t)~mask;
         }
         state->buttons &= POINTER_BUTTON_MASK;
-        state->pending = 1;
+        pointer_mark_pending(state);
+        state->buttons_changed = 1;
         return 0;
     }
     if (event->type == EV_SYN && event->code == SYN_REPORT) {
-        return send_pointer_packet(fd, request_id, state);
+        return 0;
     }
     if (event->type == EV_SYN && event->code == SYN_DROPPED) {
         errno = EOVERFLOW;
@@ -641,12 +683,25 @@ static int stream_input_devices(int control_fd, int keyboard_fd, int pointer_fd,
     pollfds[1].events = POLLIN;
     for (;;) {
         int ready;
+        int timeout_ms;
         unsigned int index;
         pollfds[0].revents = 0;
         pollfds[1].revents = 0;
-        ready = poll(pollfds, 2,
-                     selftest->armed && selftest->cycles_remaining > 0 ? INPUT_SELFTEST_POLL_MS : -1);
+        timeout_ms = pointer_flush_timeout_ms(&pointer);
+        if (selftest->armed && selftest->cycles_remaining > 0 &&
+            (timeout_ms < 0 || timeout_ms > INPUT_SELFTEST_POLL_MS)) {
+            timeout_ms = INPUT_SELFTEST_POLL_MS;
+        }
+        ready = poll(pollfds, 2, timeout_ms);
         if (ready == 0) {
+            if (pointer.pending && pointer_flush_timeout_ms(&pointer) == 0) {
+                if (send_pointer_packet(control_fd, request_id, &pointer) != 0) {
+                    return -1;
+                }
+                // A pointer flush can wake sooner than the self-test cadence;
+                // do not make the synthetic test stream exceed its 25ms rate.
+                continue;
+            }
             if (input_selftest_emit_cycle(selftest) != 0) {
                 return -1;
             }
@@ -683,8 +738,14 @@ static int stream_input_devices(int control_fd, int keyboard_fd, int pointer_fd,
                 if (event.type == EV_KEY && send_keyboard_event(control_fd, request_id, &event) != 0) {
                     return -1;
                 }
-            } else if (consume_pointer_event(control_fd, request_id, &pointer, &event) != 0) {
-                return -1;
+            } else {
+                if (consume_pointer_event(&pointer, &event) != 0) {
+                    return -1;
+                }
+                if (pointer.buttons_changed &&
+                    send_pointer_packet(control_fd, request_id, &pointer) != 0) {
+                    return -1;
+                }
             }
         }
     }

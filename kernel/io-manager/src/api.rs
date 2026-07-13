@@ -236,50 +236,6 @@ pub mod network {
     }
 }
 
-pub mod driver {
-    pub mod irq {
-        pub fn dispatch_pic_irq(irq: u8) -> bool {
-            crate::driver::irq::dispatch_pic_irq(irq)
-        }
-    }
-
-    pub mod linux {
-        pub mod input {
-            pub fn consumer_acquire() {
-                crate::driver::linux::input::consumer_acquire();
-            }
-
-            pub fn consumer_release() {
-                crate::driver::linux::input::consumer_release();
-            }
-
-            pub fn debug_lock_snapshot() -> (usize, u64) {
-                crate::driver::linux::input::debug_lock_snapshot()
-            }
-        }
-
-        pub mod runtime {
-            pub fn debug_irq_lock_snapshot() -> (usize, usize) {
-                (0, 0)
-            }
-
-            pub fn tick_jiffies(delta: u64) -> u64 {
-                delta
-            }
-        }
-    }
-
-    use driver_abi::DriverClass;
-
-    pub fn initialize_loadable_modules_for_class(class: DriverClass) -> bool {
-        crate::driver::initialize_loadable_modules_for_class(class)
-    }
-
-    pub fn init_linux_cpu_local_symbols() {
-        crate::driver::linux::init_cpu_local_symbols();
-    }
-}
-
 pub mod input {
     pub mod event_queue {
         pub use crate::input::event_queue::InputEventQueueDebugSnapshot;
@@ -309,12 +265,11 @@ pub mod input {
         crate::input::init();
     }
 
-    pub fn on_keyboard_interrupt() {
-        crate::input::on_keyboard_interrupt();
-    }
-
-    pub fn on_mouse_interrupt() {
-        crate::input::on_mouse_interrupt();
+    /// Bounded hardware transport drain for the capability-gated Linux-DVM
+    /// input ingress broker. Input policy and event translation stay in
+    /// `inputd`.
+    pub fn service_dvm_input_pending() -> usize {
+        crate::input::service_dvm_input_pending()
     }
 
     pub fn service_pending() -> usize {
@@ -440,34 +395,6 @@ pub mod io {
         pub fn service_pending() -> usize {
             0
         }
-    }
-}
-
-pub mod usb {
-    pub use crate::usb::XhciInputDebugSnapshot;
-
-    pub fn debug_pointer_report_count() -> u64 {
-        crate::usb::debug_pointer_report_count()
-    }
-
-    pub fn debug_transfer_event_count() -> u64 {
-        crate::usb::debug_transfer_event_count()
-    }
-
-    pub fn debug_input_snapshot() -> XhciInputDebugSnapshot {
-        crate::usb::debug_input_snapshot()
-    }
-
-    pub fn init() {
-        crate::usb::init();
-    }
-
-    pub fn service_pending() -> usize {
-        crate::usb::service_pending()
-    }
-
-    pub fn uses_polled_input_completion() -> bool {
-        crate::usb::uses_polled_input_completion()
     }
 }
 

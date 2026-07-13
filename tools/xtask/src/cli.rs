@@ -26,6 +26,8 @@ enum XtaskCommand {
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         args: Vec<String>,
     },
+    #[command(name = "kvm-run")]
+    KvmRun,
     Selftest,
     #[command(name = "fuzz-host")]
     FuzzHost {
@@ -47,8 +49,6 @@ enum XtaskCommand {
     BuildUser,
     #[command(name = "build-console-demo")]
     BuildConsoleDemo,
-    #[command(name = "build-driver-modules")]
-    BuildDriverModules,
     #[command(name = "build-dvm")]
     BuildDvm,
     #[command(name = "verify-dvm")]
@@ -83,6 +83,7 @@ pub(crate) fn run() -> Result<()> {
         Some(XtaskCommand::Check) => build::check(&config),
         Some(XtaskCommand::Clean) => build::clean(&config),
         Some(XtaskCommand::KvmSmoke { args }) => kvm::kvm_smoke_command(&config, args.into_iter()),
+        Some(XtaskCommand::KvmRun) => kvm::kvm_run_command(&config),
         Some(XtaskCommand::Selftest) => testinfra::selftest(&config),
         Some(XtaskCommand::FuzzHost {
             target,
@@ -95,7 +96,6 @@ pub(crate) fn run() -> Result<()> {
         Some(XtaskCommand::BuildKernel) => build::build_nucleus(&config),
         Some(XtaskCommand::BuildUser) => build::build_user(&config),
         Some(XtaskCommand::BuildConsoleDemo) => build::build_console_demo(&config),
-        Some(XtaskCommand::BuildDriverModules) => build::build_driver_modules(&config),
         Some(XtaskCommand::BuildDvm) => kvm::build_dvm_command(&config),
         Some(XtaskCommand::VerifyDvm) => kvm::verify_dvm_command(&config),
         Some(XtaskCommand::Ring3Inventory) => ring3_inventory::print_inventory(&config),

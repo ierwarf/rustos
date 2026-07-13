@@ -17,8 +17,12 @@ const MODEM_CONTROL_PORT: u16 = DATA_PORT + 4;
 const LINE_STATUS_PORT: u16 = DATA_PORT + 5;
 const LINE_STATUS_DATA_READY: u8 = 1 << 0;
 const LINE_STATUS_ABSENT: u8 = u8::MAX;
-const MAX_BYTES_PER_TURN: usize = 96;
 const FRAME_BYTES: usize = 32;
+// `inputd` polls the authenticated DVM ingress every 4ms.  Drain up to sixteen
+// complete RDI2 frames per request so a high-rate pointer never waits for the
+// housekeeping task's unrelated wakeups, while keeping this ring0 transport
+// operation bounded.
+const MAX_BYTES_PER_TURN: usize = FRAME_BYTES * 16;
 const MAGIC: [u8; 4] = *b"RDI1";
 const VERSION: u8 = 2;
 const KIND_SESSION_START: u8 = 0;
@@ -163,8 +167,9 @@ pub(crate) fn init() {
         let mut data = Port::<u8>::new(DATA_PORT);
         let mut fifo_control = Port::<u8>::new(FIFO_CONTROL_PORT);
         let mut modem_control = Port::<u8>::new(MODEM_CONTROL_PORT);
-        // Dedicated COM2 transport, 115200 8N1, IRQs intentionally disabled:
-        // inputd's bounded ingest cadence polls at the normal input boundary.
+        // Dedicated COM2 transport, 115200 8N1, IRQs intentionally disabled.
+        // The authenticated inputd ingest broker is the sole runtime drain
+        // owner and polls this bounded transport on its regular 4ms cadence.
         interrupt_enable.write(0);
         line_control.write(0x80);
         data.write(1);

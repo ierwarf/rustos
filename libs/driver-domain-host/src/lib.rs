@@ -35,8 +35,11 @@ const RUSTOS_INPUT_KIND_SESSION_END: u8 = 3;
 const LINUX_EVDEV_KEY_MAX: u16 = 0x02ff;
 const RUSTOS_POINTER_BUTTON_MASK: u8 = 0x1f;
 const INPUT_RELAY_MAX_SEQUENCE: u32 = u32::MAX - 1024;
-const INPUT_RELAY_MAX_FRAMES_PER_SECOND: u32 = 2048;
-const INPUT_RELAY_MAX_KEYS_PER_SECOND: u32 = 512;
+// RDI2 is carried by a bounded 115200-bps COM2 transport. The DVM coalesces
+// relative pointer samples to 125Hz, and L0 still enforces the resulting
+// physical transport budget against a compromised or buggy DVM.
+const INPUT_RELAY_MAX_FRAMES_PER_SECOND: u32 = 256;
+const INPUT_RELAY_MAX_KEYS_PER_SECOND: u32 = INPUT_RELAY_MAX_FRAMES_PER_SECOND;
 
 const VMADDR_CID_ANY: u32 = u32::MAX;
 const AF_VSOCK: libc::c_int = 40;
@@ -1178,8 +1181,9 @@ pub struct InputRelayResult {
 
 /// L0-side CPU and serial-budget guard. It intentionally rejects an abusive
 /// DVM stream instead of allowing an unbounded input producer to starve the
-/// broker or fill RustOS's bounded ingress queue. The total still permits a
-/// 1 kHz pointer plus normal keyboard use.
+/// broker or fill RustOS's bounded ingress queue. The total permits the
+/// 125Hz coalesced pointer stream plus normal keyboard use without overrunning
+/// the serial transport.
 struct InputRelayRate {
     window_started: Instant,
     total_frames: u32,
@@ -1260,7 +1264,7 @@ impl HostControlListener {
     }
 
     pub fn probe_once(&self, timeout: Duration) -> Result<ProbeResult> {
-        let mut connection = self.accept_authenticated(timeout)?;
+        let mut connection = self.accept_authenticated(Some(timeout))?;
         self.probe_connection(&mut connection)
     }
 
@@ -1275,7 +1279,7 @@ impl HostControlListener {
         timeout: Duration,
         sink: &mut impl RustosInputSink,
     ) -> Result<InputRelayResult> {
-        self.relay_input_once_with_ready(timeout, sink, |_| Ok(()))
+        self.relay_input_once_inner(Some(timeout), sink, |_| Ok(()))
     }
 
     /// Like [`Self::relay_input_once`], but reports the verified DVM endpoint
@@ -1288,7 +1292,27 @@ impl HostControlListener {
         sink: &mut impl RustosInputSink,
         on_ready: impl FnOnce(&ProbeResult) -> Result<()>,
     ) -> Result<InputRelayResult> {
-        let mut connection = self.accept_authenticated(timeout)?;
+        self.relay_input_once_inner(Some(timeout), sink, on_ready)
+    }
+
+    /// Relay one DVM input session without imposing a setup deadline. This is
+    /// for a developer-owned interactive VM session; smoke tests must use the
+    /// bounded methods above. A disconnect still emits input cleanup and
+    /// returns an error to the session supervisor for reconnect handling.
+    pub fn relay_input_once_unbounded(
+        &self,
+        sink: &mut impl RustosInputSink,
+    ) -> Result<InputRelayResult> {
+        self.relay_input_once_inner(None, sink, |_| Ok(()))
+    }
+
+    fn relay_input_once_inner(
+        &self,
+        setup_timeout: Option<Duration>,
+        sink: &mut impl RustosInputSink,
+        on_ready: impl FnOnce(&ProbeResult) -> Result<()>,
+    ) -> Result<InputRelayResult> {
+        let mut connection = self.accept_authenticated(setup_timeout)?;
         let probe = self.probe_connection(&mut connection)?;
         let ready = request(&mut connection, 4, "input-stream")?;
         if !has_exact_fields(
@@ -1384,8 +1408,10 @@ impl HostControlListener {
         }
     }
 
-    fn accept_authenticated(&self, timeout: Duration) -> Result<std::fs::File> {
-        let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+    fn accept_authenticated(&self, timeout: Option<Duration>) -> Result<std::fs::File> {
+        let timeout_ms = timeout
+            .map(|duration| duration.as_millis().min(i32::MAX as u128) as libc::c_int)
+            .unwrap_or(-1);
         let mut pollfd = libc::pollfd {
             fd: self.fd.as_raw_fd(),
             events: libc::POLLIN,
@@ -1413,7 +1439,7 @@ impl HostControlListener {
                 .context("accept Linux DVM vsock connection");
         }
         let mut connection = unsafe { std::fs::File::from_raw_fd(connection) };
-        configure_socket_timeout(&connection, Some(timeout))?;
+        configure_socket_timeout(&connection, timeout)?;
         if peer.family != AF_VSOCK as libc::sa_family_t || peer.cid != self.expected_dvm_cid {
             bail!(
                 "rejected DVM vsock peer cid={} expected={}",

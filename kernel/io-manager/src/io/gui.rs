@@ -1,7 +1,6 @@
 // RING3-MIGRATION-REFERENCE START: display-present-substrate exception:
-// uiserver owns normal display mode and GUI presentation policy; driverd owns
-// provider ordering. Ring0 keeps boot framebuffer transition, explicit provider
-// registration validation, and fast present substrate.
+// uiserver owns normal display mode and GUI presentation policy. Ring0 keeps
+// DVM framebuffer registration validation and the fast present substrate.
 mod backend;
 mod framebuffer;
 
@@ -9,14 +8,11 @@ use core::sync::atomic::{AtomicU8, Ordering};
 
 use boot_protocol::{BootInfo, FramebufferInfo};
 use driver_abi::{
-    DISPLAY_FRAMEBUFFER_FLAG_BOOT_FRAMEBUFFER, DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER,
-    DISPLAY_FRAMEBUFFER_KNOWN_FLAGS, DisplayFramebufferRegistration, DisplayPixelFormat,
+    DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER, DisplayFramebufferRegistration, DisplayPixelFormat,
 };
 use embedded_graphics::pixelcolor::Rgb888;
 
-use crate::user::abi::device::{
-    DISPLAY_INFO_FLAG_BOOT_FRAMEBUFFER, DISPLAY_INFO_FLAG_PRIMARY_PROVIDER,
-};
+use crate::user::abi::device::DISPLAY_INFO_FLAG_PRIMARY_PROVIDER;
 
 static USERSPACE_DISPLAY_MODE: AtomicU8 = AtomicU8::new(DISPLAY_MODE_BOOT_CONSOLE);
 
@@ -43,12 +39,9 @@ pub fn try_present_panic_blackout() -> bool {
     .unwrap_or(false)
 }
 
-pub fn init(boot_info_ptr: *const BootInfo) {
-    let boot_info = boot_info_from_ptr(boot_info_ptr);
-    // The firmware framebuffer is a kernel-owned bootstrap substrate, not a
-    // loadable driver. Register it as the bounded primary fallback before any
-    // optional DVM or hardware provider can replace it.
-    let _ = install_boot_framebuffer_fallback(boot_info.framebuffer);
+pub fn init(_boot_info_ptr: *const BootInfo) {
+    // Firmware output is never a normal presentation fallback. The UI stays
+    // unavailable until the validated DVM display aperture is installed.
 }
 
 pub unsafe extern "C" fn register_driver_framebuffer(
@@ -78,8 +71,7 @@ pub unsafe extern "C" fn register_driver_framebuffer(
     };
 
     if framebuffer.reserved != [0; 2]
-        || framebuffer.flags == 0
-        || framebuffer.flags & !DISPLAY_FRAMEBUFFER_KNOWN_FLAGS != 0
+        || framebuffer.flags != DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER
     {
         return -22;
     }
@@ -108,44 +100,12 @@ pub unsafe extern "C" fn register_driver_framebuffer(
     0
 }
 
-pub(crate) fn install_boot_framebuffer_fallback(framebuffer: FramebufferInfo) -> bool {
-    if framebuffer.validate().is_err() {
-        return false;
-    }
-    let flags = DISPLAY_INFO_FLAG_BOOT_FRAMEBUFFER | DISPLAY_INFO_FLAG_PRIMARY_PROVIDER;
-    backend::install_driver_framebuffer(framebuffer, flags)
-}
-
-pub(crate) fn install_inherited_primary_scanout_from_boot() -> bool {
-    if display_info().is_some_and(|display| {
-        display.flags & DISPLAY_INFO_FLAG_PRIMARY_PROVIDER != 0
-            && display.flags & DISPLAY_INFO_FLAG_BOOT_FRAMEBUFFER == 0
-    }) {
-        return true;
-    }
-    let Some(framebuffer) = crate::storage::boot_volume::boot_framebuffer_info() else {
-        return false;
-    };
-    if framebuffer.validate().is_err() {
-        return false;
-    }
-    let flags = DISPLAY_INFO_FLAG_BOOT_FRAMEBUFFER | DISPLAY_INFO_FLAG_PRIMARY_PROVIDER;
-    backend::install_driver_framebuffer(framebuffer, flags)
-}
-
 pub fn display_info() -> Option<GuiDisplayInfo> {
     backend::display_info()
 }
 
-fn display_flags_from_driver_registration(registration_flags: u8) -> u32 {
-    let mut flags = 0;
-    if registration_flags & DISPLAY_FRAMEBUFFER_FLAG_BOOT_FRAMEBUFFER != 0 {
-        flags |= DISPLAY_INFO_FLAG_BOOT_FRAMEBUFFER;
-    }
-    if registration_flags & DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER != 0 {
-        flags |= DISPLAY_INFO_FLAG_PRIMARY_PROVIDER;
-    }
-    flags
+fn display_flags_from_driver_registration(_registration_flags: u8) -> u32 {
+    DISPLAY_INFO_FLAG_PRIMARY_PROVIDER
 }
 
 pub fn present_userspace_frame_from_kernel_bgra8888(
@@ -197,13 +157,6 @@ pub fn present_userspace_frame_rect_from_kernel_bgra8888(
 
 pub fn is_userspace_display_active() -> bool {
     USERSPACE_DISPLAY_MODE.load(Ordering::Acquire) != DISPLAY_MODE_BOOT_CONSOLE
-}
-
-fn boot_info_from_ptr(boot_info_ptr: *const BootInfo) -> &'static BootInfo {
-    match unsafe { BootInfo::from_ptr(boot_info_ptr) } {
-        Ok(boot_info) => boot_info,
-        Err(error) => panic!("{}", error.as_str()),
-    }
 }
 
 fn begin_userspace_display_transition() -> bool {

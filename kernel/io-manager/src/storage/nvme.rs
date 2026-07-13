@@ -1,4 +1,4 @@
-// RING3-MIGRATION-REFERENCE START: bootstrap exception: storaged/driverd own
+// RING3-MIGRATION-REFERENCE START: bootstrap exception: storaged owns
 // post-bootstrap NVMe admission/provider policy. Ring0 keeps this built-in
 // NVMe path as early-boot/fallback privileged transport substrate until a
 // ring3 service-driver host can perform boot-volume reads before rootd/vfsd
@@ -855,4 +855,4 @@ fn wait_until(mut predicate: impl FnMut() -> bool) -> bool {
     }
     false
 }
-// RING3-MIGRATION-REFERENCE END: storaged/driverd-owned NVMe bootstrap transport exception.
+// RING3-MIGRATION-REFERENCE END: storaged-owned NVMe bootstrap transport exception.

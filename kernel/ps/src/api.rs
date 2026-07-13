@@ -5,16 +5,14 @@ pub use crate::multitask::{
 };
 pub use crate::multitask::{
     activate_suspended_user_task, arm_block_current_task, block_current_task,
-    block_current_user_task, cancel_block_current_task,
-    commit_block_current_task, current_linux_thread_state, current_user_address_space,
-    current_user_process_thread_count, current_user_stack_state, current_user_thread_id,
-    exec_current_user_process, exec_user_process_by_pid, exit_current_user_process,
-    exit_current_user_task, is_user_task_alive, linux_thread_snapshot_by_ids,
-    note_process_exit_status,
-    queue_linux_signal, restore_current_simd_state, save_current_simd_state, set_next_pick_hint,
-    set_next_spawn_pick_hint,
-    spawn_user_process_state_with_parent, spawn_user_process_with_parent, spawn_user_thread,
-    wake_task, wake_user_task, with_current_mm, with_current_process_state,
+    block_current_user_task, cancel_block_current_task, commit_block_current_task,
+    current_linux_thread_state, current_user_address_space, current_user_process_thread_count,
+    current_user_stack_state, current_user_thread_id, exec_current_user_process,
+    exec_user_process_by_pid, exit_current_user_process, exit_current_user_task,
+    is_user_task_alive, linux_thread_snapshot_by_ids, note_process_exit_status, queue_linux_signal,
+    restore_current_simd_state, save_current_simd_state, set_next_pick_hint,
+    set_next_spawn_pick_hint, spawn_user_process_state_with_parent, spawn_user_process_with_parent,
+    spawn_user_thread, wake_task, wake_user_task, with_current_mm, with_current_process_state,
     with_current_process_state_mut, with_current_user_linux_state_mut,
     with_current_user_process_and_linux_thread_state_mut, with_current_user_process_state,
     with_process_state_by_pid, with_process_state_by_pid_mut,
@@ -312,14 +310,6 @@ pub mod task {
         crate::multitask::wake_task(task_id)
     }
 
-    pub fn register_tick_jiffies_hook(hook: fn(u64) -> u64) {
-        crate::linux_runtime_hooks::register_tick_jiffies_hook(hook);
-    }
-
-    pub fn register_input_consumer_hooks(acquire: fn(), release: fn()) {
-        crate::linux_runtime_hooks::register_input_consumer_hooks(acquire, release);
-    }
-
     pub fn set_current_console_session(session: impl Into<ConsoleSessionHandle>) -> bool {
         crate::multitask::set_current_console_session(session)
     }
@@ -343,8 +333,7 @@ pub use snapshot::{
     with_current_user_process_state_mut,
 };
 pub use task::{
-    register_input_consumer_hooks, register_tick_jiffies_hook, rtc_interrupt_handler_addr,
-    set_current_console_session, software_schedule_interrupt_handler_addr,
-    timer_interrupt_handler_addr, yield_now,
+    rtc_interrupt_handler_addr, set_current_console_session,
+    software_schedule_interrupt_handler_addr, timer_interrupt_handler_addr, yield_now,
 };
 pub use wait::wait_for_child;

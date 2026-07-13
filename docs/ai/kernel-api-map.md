@@ -45,22 +45,13 @@ Do not reorder without reading `kernel/src/main.rs` and
 - **Scheduler wait primitives:** use `current_task_id`, `block_current_task`,
   `wake_task` for kernel-capable wait queues; use `*_user_*` wrappers only
   for userspace-task waits.
-- **Input poll waits:** compat `poll()` arms
-  `kernel_io_manager::api::input::event_queue::{arm_input_waiter,disarm_input_waiter}`
-  only for input fds with indefinite timeouts; finite timeouts stay on the
-  generic timed poll path until timer-backed wait queues exist. Native xHCI
-  may wake those waiters through its IRQ completion handler, but active HID
-  interrupt transfers still report `usb::uses_polled_input_completion()` so
-  compat input poll keeps the completion service path active as a bounded
-  fallback instead of sleeping solely on legacy IRQ delivery.
+- **Input poll waits:** compat `poll()` drains the bounded COM2 DVM transport
+  before arming `input::event_queue` waiters. There is no USB, PS/2, or native
+  interrupt-completion fallback.
 - **Scheduler preemption:** `cond_resched`/`reschedule_if_requested` only at
   Linux-style safe points outside spinlocked or IRQ-off regions. Timer IRQs
   should request reschedule for user-task kernel frames, not blindly switch
   away from arbitrary kernel code.
-- **Linux `.ko` init preemption:** module init runs as a user-service syscall
-  kernel frame, so long lock-free Linux compat callbacks must call
-  `cond_resched` at safe points. Do not hold RustOS spinlocks or IRQ-off
-  sections across those calls.
 - **Scheduler fairness:** keep the hardware timer tick fixed and route
   service weights into vruntime/load accounting only. Root slot 0 is a fair
   task during bootstrap finalize, then becomes the idle fallback after
