@@ -62,6 +62,19 @@ jobs:
         -p driver-abi
         -p keyboard-core
 
+  formal:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Java for TLC
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '17'
+    - name: Model check RustOS service-control contracts
+      run: bash formal/run-all-tlc.sh
+
   docs:
     runs-on: ubuntu-latest
 

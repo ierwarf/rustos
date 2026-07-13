@@ -1,5 +1,4 @@
 use super::*;
-use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -18,7 +17,6 @@ macro_rules! ipc_trace {
 
 const IPC_TRACE_VERBOSE: bool = false;
 const MAX_SERVICE_ENDPOINTS: usize = 16;
-const MAX_PENDING_TRANSFER_OBJECTS: usize = 1024;
 const MAX_SERVICE_ENDPOINT_WAITERS: usize = 32;
 const SLOW_IPC_THRESHOLD_MS: u64 = 10;
 const MAX_SLOW_IPC_LOGS: usize = 20;
@@ -34,8 +32,12 @@ static SERVICE_ENDPOINT_OWNERS: [AtomicU64; MAX_SERVICE_ENDPOINTS] =
     [const { AtomicU64::new(0) }; MAX_SERVICE_ENDPOINTS];
 static SERVICE_ENDPOINT_CAPS: [AtomicU64; MAX_SERVICE_ENDPOINTS] =
     [const { AtomicU64::new(0) }; MAX_SERVICE_ENDPOINTS];
+// Publication, revocation, and process-exit cleanup must share one mutation
+// critical section. The endpoint itself remains the lock-free commit point for
+// readers, but a second registrar or an exiting process must not interleave
+// between capability preparation and endpoint publication.
+static SERVICE_ENDPOINT_REGISTRY_MUTATION: Mutex<()> = Mutex::new(());
 // RING3-MIGRATION-REFERENCE END: rootd-owned service endpoint registry state.
-static NEXT_TRANSFER_ID: AtomicU64 = AtomicU64::new(1);
 static SLOW_IPC_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy)]
@@ -46,8 +48,6 @@ struct ServiceEndpointWaiter {
 }
 
 lazy_static! {
-    static ref TRANSFER_OBJECTS: Mutex<BTreeMap<u64, multitask::TransferredHandleEntry>> =
-        Mutex::new(BTreeMap::new());
     static ref SERVICE_ENDPOINT_WAITERS: Mutex<Vec<ServiceEndpointWaiter>> =
         Mutex::new(Vec::new());
 }
@@ -164,6 +164,7 @@ fn record_service_endpoint_milestone(
 /// stale endpoint가 남아 있으면 이후 호출자가 wait_for_reply에서 무한 대기하게 되므로
 /// 반드시 프로세스 종료 경로에서 호출해야 한다.
 pub(crate) fn cleanup_service_endpoints_for_process(process_id: u64) {
+    let registry_mutation = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
     if SERVICE_ENDPOINT_OWNERS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
         .load(Ordering::Acquire)
         == process_id
@@ -188,6 +189,7 @@ pub(crate) fn cleanup_service_endpoints_for_process(process_id: u64) {
             );
         }
     }
+    drop(registry_mutation);
     wake_exited_service_endpoint_waiters(process_id);
 }
 
@@ -198,11 +200,20 @@ pub(super) fn current_process_has_service_capability(capability: u64) -> bool {
     let Some(process_id) = multitask::current_user_process_id() else {
         return false;
     };
-    SERVICE_ENDPOINT_OWNERS
+    if multitask::is_user_process_exiting(process_id) {
+        return false;
+    }
+    SERVICE_ENDPOINTS
         .iter()
+        .zip(SERVICE_ENDPOINT_OWNERS.iter())
         .zip(SERVICE_ENDPOINT_CAPS.iter())
-        .any(|(owner, caps)| {
-            owner.load(Ordering::Acquire) == process_id
+        .any(|((endpoint, owner), caps)| {
+            // Endpoint publication is the registration commit point. Before
+            // it becomes visible, a pre-published owner/capability pair must
+            // fail closed; after revocation it must no longer authorize a
+            // broker even if another CPU still observes either stale field.
+            endpoint.load(Ordering::Acquire) != 0
+                && owner.load(Ordering::Acquire) == process_id
                 && caps.load(Ordering::Acquire) & capability == capability
         })
 }
@@ -214,7 +225,16 @@ fn current_process_can_lookup_service_endpoint() -> bool {
 }
 
 fn service_endpoint_raw(service_id: u64) -> Option<u64> {
-    service_index(service_id).map(|index| SERVICE_ENDPOINTS[index].load(Ordering::Acquire))
+    let index = service_index(service_id)?;
+    let endpoint = SERVICE_ENDPOINTS[index].load(Ordering::Acquire);
+    if endpoint == 0 {
+        return Some(0);
+    }
+    let owner = SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire);
+    if owner == 0 || multitask::is_user_process_exiting(owner) {
+        return Some(0);
+    }
+    Some(endpoint)
 }
 
 fn service_index(service_id: u64) -> Option<usize> {
@@ -335,13 +355,25 @@ pub(super) fn syscall_linux_rustos_ipc_register_linux_syscall_endpoint(endpoint:
             return linux_errno(errno);
         }
     };
-    LINUX_SYSCALL_ENDPOINT.store(endpoint, Ordering::Release);
-    SERVICE_ENDPOINTS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
-        .store(endpoint, Ordering::Release);
-    SERVICE_ENDPOINT_OWNERS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
-        .store(process_id, Ordering::Release);
+    let registry_mutation = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
+    if multitask::is_user_process_exiting(process_id) {
+        drop(registry_mutation);
+        record_service_endpoint_milestone(
+            "ipc-service-register-denied",
+            linux_abi::IPC_SERVICE_LINUX_SYSCALLD,
+            process_id,
+            LINUX_ESRCH as u64,
+        );
+        return linux_errno(LINUX_ESRCH);
+    }
     SERVICE_ENDPOINT_CAPS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
         .store(capability, Ordering::Release);
+    SERVICE_ENDPOINT_OWNERS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
+        .store(process_id, Ordering::Release);
+    SERVICE_ENDPOINTS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
+        .store(endpoint, Ordering::Release);
+    LINUX_SYSCALL_ENDPOINT.store(endpoint, Ordering::Release);
+    drop(registry_mutation);
     ipc_trace!(
         "ipc service registered: service={} endpoint={} owner={} caps={:#x}",
         linux_abi::IPC_SERVICE_LINUX_SYSCALLD,
@@ -379,6 +411,7 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
         endpoint
     );
     if endpoint == 0 {
+        let registry_mutation = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
         let owner = SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire);
         let registered_endpoint = SERVICE_ENDPOINTS[index].load(Ordering::Acquire);
         if owner == 0 && registered_endpoint == 0 {
@@ -400,18 +433,10 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
         SERVICE_ENDPOINTS[index].store(0, Ordering::Release);
         SERVICE_ENDPOINT_OWNERS[index].store(0, Ordering::Release);
         SERVICE_ENDPOINT_CAPS[index].store(0, Ordering::Release);
+        drop(registry_mutation);
         record_service_endpoint_milestone("ipc-service-revoke", service_id, process_id, 0);
         ipc_trace!("ipc service revoked: service={}", service_id);
         return 0;
-    }
-    if SERVICE_ENDPOINTS[index].load(Ordering::Acquire) != 0 {
-        record_service_endpoint_milestone(
-            "ipc-service-register-busy",
-            service_id,
-            process_id,
-            LINUX_EBUSY as u64,
-        );
-        return linux_errno(LINUX_EBUSY);
     }
     let capability = match service_capability(service_id) {
         Ok(capability) => capability,
@@ -425,9 +450,33 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
             return linux_errno(errno);
         }
     };
-    SERVICE_ENDPOINTS[index].store(endpoint, Ordering::Release);
-    SERVICE_ENDPOINT_OWNERS[index].store(process_id, Ordering::Release);
+    let registry_mutation = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
+    if multitask::is_user_process_exiting(process_id) {
+        drop(registry_mutation);
+        record_service_endpoint_milestone(
+            "ipc-service-register-denied",
+            service_id,
+            process_id,
+            LINUX_ESRCH as u64,
+        );
+        return linux_errno(LINUX_ESRCH);
+    }
+    if SERVICE_ENDPOINTS[index].load(Ordering::Acquire) != 0 {
+        drop(registry_mutation);
+        record_service_endpoint_milestone(
+            "ipc-service-register-busy",
+            service_id,
+            process_id,
+            LINUX_EBUSY as u64,
+        );
+        return linux_errno(LINUX_EBUSY);
+    }
     SERVICE_ENDPOINT_CAPS[index].store(capability, Ordering::Release);
+    SERVICE_ENDPOINT_OWNERS[index].store(process_id, Ordering::Release);
+    // Publish the endpoint last. Acquire readers that observe it also observe
+    // the rootd-authorized owner and capability written above.
+    SERVICE_ENDPOINTS[index].store(endpoint, Ordering::Release);
+    drop(registry_mutation);
     ipc_trace!(
         "ipc service registered: service={} endpoint={} owner={} caps={:#x}",
         service_id,
@@ -624,6 +673,9 @@ fn service_endpoint_for_expected_process(
     if owner != expected_pid {
         return Err(LINUX_EBUSY);
     }
+    if multitask::is_user_process_exiting(owner) {
+        return Err(LINUX_ESRCH);
+    }
     Ok(Some(endpoint))
 }
 
@@ -736,6 +788,12 @@ pub(super) fn syscall_linux_rustos_ipc_recv(
     reply_cap_ptr: u64,
 ) -> u64 {
     let endpoint = KernelEndpointHandle::from_raw(endpoint);
+    let Some(task_id) = multitask::current_task_id() else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    if let Err(err) = kernel_ipc_runtime::api::authorize_endpoint_receiver(endpoint, task_id) {
+        return linux_errno(ipc_error_to_linux_errno(err));
+    }
     ipc_trace!(
         "ipc recv start: endpoint={} request_ptr={:#x} request_capacity={} reply_cap_ptr={:#x}",
         endpoint.raw(),
@@ -768,9 +826,6 @@ pub(super) fn syscall_linux_rustos_ipc_recv(
                 return request.len() as u64;
             }
             Ok(None) => {
-                let Some(task_id) = multitask::current_task_id() else {
-                    return linux_errno(LINUX_EINVAL);
-                };
                 if !multitask::arm_block_current_task() {
                     return linux_errno(LINUX_EINVAL);
                 }
@@ -859,6 +914,12 @@ pub(super) fn syscall_linux_rustos_ipc_recv_with_sender(
         return linux_errno(LINUX_EPERM);
     }
     let endpoint = KernelEndpointHandle::from_raw(endpoint);
+    let Some(task_id) = multitask::current_task_id() else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    if let Err(err) = kernel_ipc_runtime::api::authorize_endpoint_receiver(endpoint, task_id) {
+        return linux_errno(ipc_error_to_linux_errno(err));
+    }
     let Ok(request_capacity) = usize::try_from(request_capacity) else {
         return linux_errno(LINUX_EINVAL);
     };
@@ -916,9 +977,6 @@ pub(super) fn syscall_linux_rustos_ipc_recv_with_sender(
                 return request.len() as u64;
             }
             Ok(None) => {
-                let Some(task_id) = multitask::current_task_id() else {
-                    return linux_errno(LINUX_EINVAL);
-                };
                 if !multitask::arm_block_current_task() {
                     return linux_errno(LINUX_EINVAL);
                 }
@@ -953,6 +1011,9 @@ fn recv_endpoint_once(
     reply_cap_ptr: u64,
 ) -> Result<usize, i64> {
     let endpoint = KernelEndpointHandle::from_raw(endpoint);
+    let task_id = multitask::current_task_id().ok_or(LINUX_EINVAL)?;
+    kernel_ipc_runtime::api::authorize_endpoint_receiver(endpoint, task_id)
+        .map_err(ipc_error_to_linux_errno)?;
     let request_capacity = usize::try_from(request_capacity).map_err(|_| LINUX_EINVAL)?;
     match kernel_ipc_runtime::api::recv_endpoint_with_limit(endpoint, request_capacity) {
         Ok(Some((reply, request))) => {
@@ -978,6 +1039,9 @@ fn recv_endpoint_once_with_sender(
     sender_tid_ptr: u64,
 ) -> Result<usize, i64> {
     let endpoint = KernelEndpointHandle::from_raw(endpoint);
+    let task_id = multitask::current_task_id().ok_or(LINUX_EINVAL)?;
+    kernel_ipc_runtime::api::authorize_endpoint_receiver(endpoint, task_id)
+        .map_err(ipc_error_to_linux_errno)?;
     let request_capacity = usize::try_from(request_capacity).map_err(|_| LINUX_EINVAL)?;
     if request_capacity > rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES {
         return Err(LINUX_EINVAL);
@@ -1029,8 +1093,12 @@ pub(super) fn syscall_linux_rustos_ipc_reply(
         Err(errno) => return linux_errno(errno),
     };
     let copy_ticks = crate::arch::rtc::ticks();
-    let task_id = match kernel_ipc_runtime::api::complete_endpoint_reply(
+    let Some(receiver_task_id) = multitask::current_task_id() else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    let task_id = match kernel_ipc_runtime::api::complete_endpoint_reply_for_task(
         KernelReplyHandle::from_raw(reply),
+        receiver_task_id,
         response.as_slice(),
     ) {
         Ok(task_id) => task_id,
@@ -1126,17 +1194,19 @@ pub(super) fn syscall_linux_rustos_ipc_call_with_handles(args_ptr: u64) -> u64 {
         drop_transfer_descriptors(reply_handles.as_slice());
         return linux_errno(errno);
     }
+    if !response.is_empty() {
+        if let Err(err) = usermem::write_current_user_bytes(args.reply_ptr, response.as_slice()) {
+            drop_transfer_descriptors(reply_handles.as_slice());
+            return linux_errno(address_space_error_to_linux_errno(err));
+        }
+    }
     if let Err(errno) = install_received_handles(
         reply_handles.as_slice(),
         args.recv_fds_ptr,
         args.recv_fd_count_ptr,
     ) {
+        drop_transfer_descriptors(reply_handles.as_slice());
         return linux_errno(errno);
-    }
-    if !response.is_empty() {
-        if let Err(err) = usermem::write_current_user_bytes(args.reply_ptr, response.as_slice()) {
-            return linux_errno(address_space_error_to_linux_errno(err));
-        }
     }
     let write_ticks = crate::arch::rtc::ticks();
     log_slow_ipc_call(
@@ -1166,6 +1236,12 @@ pub(super) fn syscall_linux_rustos_ipc_recv_with_handles(args_ptr: u64) -> u64 {
         return linux_errno(LINUX_EINVAL);
     }
     let endpoint = KernelEndpointHandle::from_raw(args.endpoint);
+    let Some(task_id) = multitask::current_task_id() else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    if let Err(err) = kernel_ipc_runtime::api::authorize_endpoint_receiver(endpoint, task_id) {
+        return linux_errno(ipc_error_to_linux_errno(err));
+    }
     let Ok(request_capacity) = usize::try_from(args.request_capacity) else {
         return linux_errno(LINUX_EINVAL);
     };
@@ -1205,18 +1281,13 @@ pub(super) fn syscall_linux_rustos_ipc_recv_with_handles(args_ptr: u64) -> u64 {
                     args.recv_fd_count_ptr,
                     handles.len(),
                 ) {
-                    return linux_errno(errno);
-                }
-                if let Err(errno) = install_received_handles(
-                    handles.as_slice(),
-                    args.recv_fds_ptr,
-                    args.recv_fd_count_ptr,
-                ) {
+                    drop_transfer_descriptors(handles.as_slice());
                     return linux_errno(errno);
                 }
                 if !request.is_empty() {
                     if let Err(err) = usermem::write_current_user_bytes(args.request_ptr, &request)
                     {
+                        drop_transfer_descriptors(handles.as_slice());
                         return linux_errno(address_space_error_to_linux_errno(err));
                     }
                 }
@@ -1224,14 +1295,20 @@ pub(super) fn syscall_linux_rustos_ipc_recv_with_handles(args_ptr: u64) -> u64 {
                     args.reply_cap_ptr,
                     &reply.raw().to_ne_bytes(),
                 ) {
+                    drop_transfer_descriptors(handles.as_slice());
                     return linux_errno(address_space_error_to_linux_errno(err));
+                }
+                if let Err(errno) = install_received_handles(
+                    handles.as_slice(),
+                    args.recv_fds_ptr,
+                    args.recv_fd_count_ptr,
+                ) {
+                    drop_transfer_descriptors(handles.as_slice());
+                    return linux_errno(errno);
                 }
                 return request.len() as u64;
             }
             Ok(None) => {
-                let Some(task_id) = multitask::current_task_id() else {
-                    return linux_errno(LINUX_EINVAL);
-                };
                 if !multitask::arm_block_current_task() {
                     return linux_errno(LINUX_EINVAL);
                 }
@@ -1278,8 +1355,13 @@ pub(super) fn syscall_linux_rustos_ipc_reply_with_handles(args_ptr: u64) -> u64 
         Ok(handles) => handles,
         Err(errno) => return linux_errno(errno),
     };
-    let task_id = match kernel_ipc_runtime::api::complete_endpoint_reply_with_handles(
+    let Some(receiver_task_id) = multitask::current_task_id() else {
+        drop_transfer_descriptors(send_handles.as_slice());
+        return linux_errno(LINUX_EINVAL);
+    };
+    let task_id = match kernel_ipc_runtime::api::complete_endpoint_reply_with_handles_for_task(
         KernelReplyHandle::from_raw(args.reply_cap),
+        receiver_task_id,
         response.as_slice(),
         send_handles.as_slice(),
     ) {
@@ -1440,18 +1522,15 @@ fn wait_for_reply_with_deadline(
         None
     };
     loop {
-        match kernel_ipc_runtime::api::take_endpoint_response_with_handle_limit(
-            reply,
-            handle_capacity,
-        ) {
+        match take_endpoint_response_for_wait(reply, handle_capacity) {
             Ok(Some(response)) => {
                 disarm_reply_deadline_waiter(caller_task_id);
                 return Ok(response);
             }
             Ok(None) => {}
-            Err(err) => {
+            Err(errno) => {
                 disarm_reply_deadline_waiter(caller_task_id);
-                return Err(ipc_error_to_linux_errno(err));
+                return Err(errno);
             }
         }
         if reply_deadline_expired(deadline_tick) {
@@ -1471,20 +1550,17 @@ fn wait_for_reply_with_deadline(
         // first take and arming, the wake_task call landed before arm_block, so
         // wake_armed would be set but no further wake arrives; re-checking the
         // queue here picks up that response without sleeping.
-        match kernel_ipc_runtime::api::take_endpoint_response_with_handle_limit(
-            reply,
-            handle_capacity,
-        ) {
+        match take_endpoint_response_for_wait(reply, handle_capacity) {
             Ok(Some(response)) => {
                 disarm_reply_deadline_waiter(caller_task_id);
                 let _ = multitask::cancel_block_current_task();
                 return Ok(response);
             }
             Ok(None) => {}
-            Err(err) => {
+            Err(errno) => {
                 disarm_reply_deadline_waiter(caller_task_id);
                 let _ = multitask::cancel_block_current_task();
-                return Err(ipc_error_to_linux_errno(err));
+                return Err(errno);
             }
         }
         if reply_deadline_expired(deadline_tick) {
@@ -1511,6 +1587,24 @@ fn wait_for_reply_with_deadline(
                 return Err(LINUX_EINVAL);
             }
         }
+    }
+}
+
+fn take_endpoint_response_for_wait(
+    reply: KernelReplyHandle,
+    handle_capacity: usize,
+) -> Result<Option<(Vec<u8>, Vec<KernelTransferredHandle>)>, i64> {
+    match kernel_ipc_runtime::api::take_endpoint_response_detailed(reply, handle_capacity) {
+        Ok(kernel_ipc_runtime::api::EndpointResponseTake::Pending) => Ok(None),
+        Ok(kernel_ipc_runtime::api::EndpointResponseTake::Response(response)) => Ok(Some(response)),
+        Ok(kernel_ipc_runtime::api::EndpointResponseTake::Error {
+            error,
+            discarded_request_handles,
+        }) => {
+            drop_transfer_descriptors(discarded_request_handles.as_slice());
+            Err(ipc_error_to_linux_errno(error))
+        }
+        Err(err) => Err(ipc_error_to_linux_errno(err)),
     }
 }
 
@@ -1546,7 +1640,10 @@ fn cancel_deadline_reply(reply: KernelReplyHandle, caller_task_id: Option<u64>) 
     let Some(caller_task_id) = caller_task_id else {
         return;
     };
-    let result = kernel_ipc_runtime::api::cancel_endpoint_call(reply, caller_task_id);
+    let result = kernel_ipc_runtime::api::cancel_endpoint_call_with_transfers(reply, caller_task_id);
+    if let Ok(discarded) = &result {
+        drop_transfer_descriptors(discarded.as_slice());
+    }
     let status = u64::from(result.is_err());
     debug::record_milestone(
         debug::LogCategory::Compat,
@@ -1606,41 +1703,7 @@ pub(super) fn export_current_fds_for_transfer(
     };
     let entries = entries?;
 
-    let mut objects = TRANSFER_OBJECTS.lock();
-    if objects.len().saturating_add(entries.len()) > MAX_PENDING_TRANSFER_OBJECTS {
-        return Err(LINUX_ENOMEM);
-    }
-
-    let mut inserted_ids = Vec::with_capacity(entries.len());
-    let mut descriptors = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let Some(transfer_id) = allocate_transfer_id(&objects) else {
-            for transfer_id in inserted_ids {
-                objects.remove(&transfer_id);
-            }
-            return Err(LINUX_ENOMEM);
-        };
-        let Some(descriptor) = entry.ipc_descriptor(transfer_id) else {
-            for transfer_id in inserted_ids {
-                objects.remove(&transfer_id);
-            }
-            return Err(LINUX_EINVAL);
-        };
-        objects.insert(transfer_id, entry);
-        inserted_ids.push(transfer_id);
-        descriptors.push(descriptor);
-    }
-    Ok(descriptors)
-}
-
-fn allocate_transfer_id(objects: &BTreeMap<u64, multitask::TransferredHandleEntry>) -> Option<u64> {
-    for _ in 0..MAX_PENDING_TRANSFER_OBJECTS {
-        let id = NEXT_TRANSFER_ID.fetch_add(1, Ordering::Relaxed);
-        if id != 0 && !objects.contains_key(&id) {
-            return Some(id);
-        }
-    }
-    None
+    multitask::register_ipc_transfer_entries(entries).map_err(ipc_transfer_error_to_linux_errno)
 }
 
 fn read_user_fd_array(fds_ptr: u64, fd_count: usize) -> Result<Vec<i32>, i64> {
@@ -1723,33 +1786,21 @@ pub(super) fn install_transfer_descriptors_for_current_process(
 fn take_transfer_entries(
     descriptors: &[KernelTransferredHandle],
 ) -> Result<Vec<multitask::TransferredHandleEntry>, i64> {
-    let mut objects = TRANSFER_OBJECTS.lock();
-    for descriptor in descriptors {
-        let Some(entry) = objects.get(&descriptor.transfer_id()) else {
-            return Err(LINUX_ESTALE);
-        };
-        if entry.ipc_descriptor(descriptor.transfer_id()) != Some(*descriptor) {
-            return Err(LINUX_EINVAL);
-        }
-    }
-
-    let mut entries = Vec::with_capacity(descriptors.len());
-    for descriptor in descriptors {
-        let Some(entry) = objects.remove(&descriptor.transfer_id()) else {
-            return Err(LINUX_ESTALE);
-        };
-        entries.push(entry);
-    }
-    Ok(entries)
+    multitask::take_ipc_transfer_entries(descriptors).map_err(ipc_transfer_error_to_linux_errno)
 }
 
 pub(super) fn drop_transfer_descriptors(descriptors: &[KernelTransferredHandle]) {
     if descriptors.is_empty() {
         return;
     }
-    let mut objects = TRANSFER_OBJECTS.lock();
-    for descriptor in descriptors {
-        objects.remove(&descriptor.transfer_id());
+    multitask::drop_ipc_transfer_descriptors(descriptors);
+}
+
+fn ipc_transfer_error_to_linux_errno(err: multitask::IpcTransferRegistryError) -> i64 {
+    match err {
+        multitask::IpcTransferRegistryError::Exhausted => LINUX_ENOMEM,
+        multitask::IpcTransferRegistryError::InvalidDescriptor => LINUX_EINVAL,
+        multitask::IpcTransferRegistryError::StaleDescriptor => LINUX_ESTALE,
     }
 }
 
@@ -1768,6 +1819,7 @@ fn ipc_error_to_linux_errno(err: kernel_ipc_runtime::api::IpcError) -> i64 {
     match err {
         kernel_ipc_runtime::api::IpcError::InvalidHandle
         | kernel_ipc_runtime::api::IpcError::InvalidArgument => LINUX_EINVAL,
+        kernel_ipc_runtime::api::IpcError::PermissionDenied => LINUX_EPERM,
         kernel_ipc_runtime::api::IpcError::PeerClosed => LINUX_EPIPE,
         kernel_ipc_runtime::api::IpcError::BufferTooSmall => LINUX_EOVERFLOW,
         kernel_ipc_runtime::api::IpcError::NoMemory => LINUX_ENOMEM,

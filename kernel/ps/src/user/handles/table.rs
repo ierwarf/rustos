@@ -262,13 +262,16 @@ impl HandleTable {
     }
 
     pub fn duplicate_min(&mut self, fd: u64, min_fd: u64, close_on_exec: bool) -> Option<u64> {
+        if min_fd > MAX_DYNAMIC_FD || self.entries.len() >= max_dynamic_entries() {
+            return None;
+        }
         let mut entry = self.get_entry(fd)?.clone();
         entry.set_fd_flags(if close_on_exec { FD_CLOEXEC } else { 0 });
         Some(self.install_entry_min(entry, min_fd))
     }
 
     pub fn duplicate_exact(&mut self, fd: u64, new_fd: u64, close_on_exec: bool) -> Option<u64> {
-        if new_fd < FIRST_DYNAMIC_FD as u64 {
+        if !(FIRST_DYNAMIC_FD as u64..=MAX_DYNAMIC_FD).contains(&new_fd) {
             return None;
         }
 
@@ -343,11 +346,18 @@ fn dynamic_index(fd: u64) -> Option<usize> {
         .and_then(|value| usize::try_from(value).ok())
 }
 
+fn max_dynamic_entries() -> usize {
+    usize::try_from(MAX_DYNAMIC_FD - FIRST_DYNAMIC_FD as u64 + 1)
+        .expect("dynamic descriptor ceiling must fit usize")
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::vec;
 
-    use super::{FD_CLOEXEC, HandleEntry, HandleTable, KernelHandle, VfsDirectoryHandle};
+    use super::{
+        FD_CLOEXEC, HandleEntry, HandleTable, KernelHandle, MAX_DYNAMIC_FD, VfsDirectoryHandle,
+    };
     use crate::memory::paging::UserRegion;
     use crate::user::linux as linux_abi;
     use kernel_object::api::handle::{FileHandleRights, HandleOwner, HandleRights};
@@ -454,6 +464,25 @@ mod tests {
         let target_fd = table.duplicate_exact(source_fd, 10, false).expect("dup");
 
         assert_eq!(table.get_entry(target_fd).expect("target").rights(), rights);
+    }
+
+    #[test]
+    fn duplication_rejects_sparse_descriptor_indices_above_the_ceiling() {
+        let mut table = HandleTable::new();
+        let source_fd = table.install(KernelHandle::VfsDirectory(VfsDirectoryHandle::new(
+            "/source".into(),
+            vec![],
+        )));
+
+        assert_eq!(
+            table.duplicate_exact(source_fd, MAX_DYNAMIC_FD + 1, false),
+            None
+        );
+        assert_eq!(
+            table.duplicate_min(source_fd, MAX_DYNAMIC_FD + 1, false),
+            None
+        );
+        assert_eq!(table.entries.len(), 1);
     }
 
     #[test]

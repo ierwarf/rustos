@@ -88,8 +88,13 @@ fn next_display_generation(current: u64) -> u64 {
 }
 
 pub(crate) fn install_driver_framebuffer(info: FramebufferInfo, flags: u32) -> bool {
+    // A DVM present keeps the shared generation odd only while this same
+    // backend lock is held. Serialize provider replacement with that present
+    // so on_framebuffer_installed cannot detach the shared header before
+    // finish_frame restores its even generation for the DVM consumer.
+    let mut backend = DISPLAY_BACKEND.lock();
     crate::io::dvm_display::on_framebuffer_installed(info.addr);
-    DISPLAY_BACKEND.lock().install_framebuffer(info, flags)
+    backend.install_framebuffer(info, flags)
 }
 
 pub(crate) fn try_with_framebuffer<R>(f: impl FnOnce(&mut Framebuffer) -> R) -> Option<R> {

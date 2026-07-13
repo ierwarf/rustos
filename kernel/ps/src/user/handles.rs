@@ -4,13 +4,18 @@ use crate::user::epoll::EpollHandle;
 use crate::user::linux as linux_abi;
 use crate::user::memfd::MemfdHandle;
 use crate::user::socket::SocketHandle;
+use alloc::collections::BTreeMap;
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use kernel_ipc_runtime::api::KernelTransferredHandle;
 use kernel_object::api::handle::{
     DeviceHandleRights, FileHandleRights, HandleOwner, HandleRights, HandleToken,
     SharedRegionRights, SocketHandleRights,
 };
+use lazy_static::lazy_static;
+use spin::Mutex;
 
 #[path = "handles/display_surface.rs"]
 mod display_surface;
@@ -27,7 +32,11 @@ pub use vfs::{
 };
 
 pub const FIRST_DYNAMIC_FD: u32 = 3;
+/// Per-process descriptor ceiling. This prevents sparse descriptor requests
+/// from turning a Linux ABI integer into an unbounded ring-0 `Vec` resize.
+pub const MAX_DYNAMIC_FD: u64 = 65_535;
 pub const FD_CLOEXEC: u32 = 0x1;
+const MAX_PENDING_IPC_TRANSFER_OBJECTS: usize = 1024;
 const STATUS_FLAG_MASK: u64 =
     linux_abi::O_ACCMODE | linux_abi::O_APPEND | linux_abi::O_NONBLOCK | linux_abi::O_NOCTTY;
 
@@ -36,6 +45,104 @@ pub enum ConsoleStreamKind {
     Input,
     Output,
     Error,
+}
+
+// The pending transfer registry belongs to the process/handle substrate rather
+// than compat. Endpoint cancellation and task exit run below compat, so they
+// must be able to discard opaque transfer descriptors without a reverse
+// kernel_ps -> kernel_compat dependency.
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IpcTransferRegistryError {
+    Exhausted,
+    InvalidDescriptor,
+    StaleDescriptor,
+}
+
+lazy_static! {
+    static ref IPC_TRANSFER_OBJECTS: Mutex<BTreeMap<u64, TransferredHandleEntry>> =
+        Mutex::new(BTreeMap::new());
+}
+
+static NEXT_IPC_TRANSFER_ID: AtomicU64 = AtomicU64::new(1);
+
+pub fn register_ipc_transfer_entries(
+    entries: Vec<TransferredHandleEntry>,
+) -> Result<Vec<KernelTransferredHandle>, IpcTransferRegistryError> {
+    let mut objects = IPC_TRANSFER_OBJECTS.lock();
+    if objects.len().saturating_add(entries.len()) > MAX_PENDING_IPC_TRANSFER_OBJECTS {
+        return Err(IpcTransferRegistryError::Exhausted);
+    }
+
+    let mut inserted_ids = Vec::with_capacity(entries.len());
+    let mut descriptors = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(transfer_id) = allocate_ipc_transfer_id(&objects) else {
+            for transfer_id in inserted_ids {
+                objects.remove(&transfer_id);
+            }
+            return Err(IpcTransferRegistryError::Exhausted);
+        };
+        let Some(descriptor) = entry.ipc_descriptor(transfer_id) else {
+            for transfer_id in inserted_ids {
+                objects.remove(&transfer_id);
+            }
+            return Err(IpcTransferRegistryError::InvalidDescriptor);
+        };
+        objects.insert(transfer_id, entry);
+        inserted_ids.push(transfer_id);
+        descriptors.push(descriptor);
+    }
+    Ok(descriptors)
+}
+
+pub fn take_ipc_transfer_entries(
+    descriptors: &[KernelTransferredHandle],
+) -> Result<Vec<TransferredHandleEntry>, IpcTransferRegistryError> {
+    let mut objects = IPC_TRANSFER_OBJECTS.lock();
+    for (index, descriptor) in descriptors.iter().enumerate() {
+        if descriptors[..index]
+            .iter()
+            .any(|prior| prior.transfer_id() == descriptor.transfer_id())
+        {
+            return Err(IpcTransferRegistryError::InvalidDescriptor);
+        }
+        let Some(entry) = objects.get(&descriptor.transfer_id()) else {
+            return Err(IpcTransferRegistryError::StaleDescriptor);
+        };
+        if entry.ipc_descriptor(descriptor.transfer_id()) != Some(*descriptor) {
+            return Err(IpcTransferRegistryError::InvalidDescriptor);
+        }
+    }
+
+    let mut entries = Vec::with_capacity(descriptors.len());
+    for descriptor in descriptors {
+        let entry = objects
+            .remove(&descriptor.transfer_id())
+            .expect("validated IPC transfer descriptor disappeared while taking");
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
+pub fn drop_ipc_transfer_descriptors(descriptors: &[KernelTransferredHandle]) {
+    if descriptors.is_empty() {
+        return;
+    }
+    let mut objects = IPC_TRANSFER_OBJECTS.lock();
+    for descriptor in descriptors {
+        objects.remove(&descriptor.transfer_id());
+    }
+}
+
+fn allocate_ipc_transfer_id(objects: &BTreeMap<u64, TransferredHandleEntry>) -> Option<u64> {
+    for _ in 0..MAX_PENDING_IPC_TRANSFER_OBJECTS {
+        let id = NEXT_IPC_TRANSFER_ID.fetch_add(1, Ordering::Relaxed);
+        if id != 0 && !objects.contains_key(&id) {
+            return Some(id);
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone)]

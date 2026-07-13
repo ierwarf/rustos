@@ -117,7 +117,9 @@ pub(super) fn deliver_pending_signals_if_needed(frame: &mut SyscallFrame) -> boo
             clear_current_pending_signal(signal);
             if let Some(process_id) = multitask::current_user_process_id() {
                 let wait_status = signal as i32;
+                let _ = multitask::mark_user_process_exiting(process_id);
                 ipc_ops::cleanup_service_endpoints_for_process(process_id);
+                super::cleanup_proc_broker_state_for_process(process_id);
                 let _ = multitask::note_process_exit_status(process_id, wait_status);
                 let parent = multitask::parent_process_id_of(process_id).unwrap_or(0);
                 if parent != 0 {

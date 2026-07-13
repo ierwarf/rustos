@@ -227,6 +227,18 @@ pub fn note_process_exit_status(process_id: u64, status: i32) -> Option<()> {
     process_table::note_process_exit_status(process_id, status)
 }
 
+/// Prevent new process-owned authority from being published while this process
+/// is draining its final resource teardown.
+pub fn mark_user_process_exiting(process_id: u64) -> bool {
+    process_table::mark_process_exiting(process_id).is_some()
+}
+
+/// Unknown process IDs fail closed: callers must never publish authority for a
+/// process that is absent from the process table.
+pub fn is_user_process_exiting(process_id: u64) -> bool {
+    process_table::is_process_exiting(process_id).unwrap_or(true)
+}
+
 pub fn parent_process_id_of(process_id: u64) -> Option<u64> {
     process_table::parent_process_id_of(process_id)
 }
@@ -374,6 +386,8 @@ pub(crate) fn exit_current_task() -> ! {
         let endpoint_wake_set = task_id
             .map(|task_id| {
                 kernel_ipc_runtime::api::remove_endpoint_waiters_for_task(task_id);
+                let discarded = kernel_ipc_runtime::api::cancel_endpoint_calls_for_task(task_id);
+                crate::user::handles::drop_ipc_transfer_descriptors(discarded.as_slice());
                 kernel_ipc_runtime::api::fail_endpoints_owned_by_task(
                     task_id,
                     kernel_ipc_runtime::api::IpcError::PeerClosed,
@@ -401,6 +415,8 @@ pub fn exit_current_user_process() -> ! {
         let (task_ids, task_count) = scheduler_ref().current_process_task_ids();
         for task_id in task_ids.into_iter().take(task_count) {
             kernel_ipc_runtime::api::remove_endpoint_waiters_for_task(task_id);
+            let discarded = kernel_ipc_runtime::api::cancel_endpoint_calls_for_task(task_id);
+            crate::user::handles::drop_ipc_transfer_descriptors(discarded.as_slice());
             let endpoint_wake_set = kernel_ipc_runtime::api::fail_endpoints_owned_by_task(
                 task_id,
                 kernel_ipc_runtime::api::IpcError::PeerClosed,

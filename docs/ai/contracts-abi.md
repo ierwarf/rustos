@@ -29,6 +29,13 @@ IPC service IDs, broker syscalls, handle transfer, and service routing. For pack
 ## IPC Service Registry
 
 Endpoints registered via `SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT`, looked up by stable `IPC_SERVICE_*` id. Registering endpoint `0` revokes; later lookups fail closed.
+Before final endpoint cleanup, a terminating process is marked exiting. Endpoint
+publication, explicit revoke, and exit cleanup share one registry mutation
+critical section; registration rechecks that marker inside it and fails with
+`ESRCH`. This prevents concurrent registrars or an exiting process from
+publishing a stale endpoint after the cleanup scan. Endpoint lookup and
+capability checks also fail closed when the recorded owner is already marked
+exiting, including the interval before the cleanup stores become visible.
 The kernel compat service table records low-volume structured milestones for
 endpoint lifecycle transitions: `ipc-service-register`,
 `ipc-service-register-denied`, `ipc-service-register-busy`,
@@ -100,6 +107,9 @@ RustOS accepts only bounded DVM transports: RDI2 over COM2 for input, fixed
 ivshmem layouts for display and Ethernet frames. The Linux DRM/KMS relay inside
 the DVM remains the display owner. Ring0 validates fixed headers, sequence and
 bounds; `inputd`, `netd`, and `uiserver` own policy above those transports.
+The display backend serializes provider replacement with an active DVM present:
+the shared display generation must return even before its header is detached,
+so a DVM consumer never observes a retired aperture permanently in-progress.
 The reserved service-driver resource broker is not a DVM module loader and has
 no currently admitted service endpoint.
 
@@ -113,6 +123,12 @@ transport out of ring0.
 - Bounded cap-transfer via `kernel_ipc_runtime::api::KernelTransferredHandle` + `*_with_handles` endpoint APIs.
 - Byte-only recv/take wrappers must fail with `BufferTooSmall` when a queued message contains transferred handles. Older paths must never silently drop capabilities.
 - Transferred handles require nonzero transfer ticket + `HandleRights::allows_transfer()` true.
+- Pending transferred-handle entries are owned by the process-handle substrate,
+  not an isolated compat cache. An endpoint message that is cancelled,
+  peer-closed before receive, rejected after receive-output validation, or
+  abandoned by caller task exit must return every opaque descriptor for exactly
+  one substrate drop. Successful receive installs the whole validated batch;
+  duplicate/stale descriptors and partial installation must fail closed.
 - Supervisor services polling independent brokers must use `SYS_RUSTOS_IPC_TRY_RECV`, not blocking `SYS_RUSTOS_IPC_RECV`.
 - FD-table transfer goes through `kernel_ps::api::TransferredHandleEntry` + `HandleTable::{duplicate_for_transfer, install_transferred}`. Source class + rights must permit descriptor transfer; directory FDs are file capabilities and transferable for VFS migration.
 - Userspace handle-aware IPC: `SYS_RUSTOS_IPC_{CALL,RECV,REPLY}_WITH_HANDLES` with `Ipc*WithHandlesArgs`. Send handles = Linux fd arrays; received handles install into receiver fd table and return as `i32` fd arrays + `u16` count. `recv_fd_count_ptr` mandatory even when no handles returned. Counts bounded by `IPC_MAX_TRANSFER_HANDLES`.
@@ -225,11 +241,19 @@ transport out of ring0.
 - `SYS_RUSTOS_PROC_*_BROKER` calls fail with `EACCES` unless caller owns `PROCESS_LOADER`.
 - `SYS_RUSTOS_SPAWN_EXEC` restricted to `rootd` spawning the fixed bootstrap allowlist (`syscalld`, `vfsd`, `loaderd`, `procd`, `initd`). Fails closed for `initd`, generic apps, broad service restarts. rootd may use direct spawn only during fixed bootstrap + `loaderd` recovery; post-bootstrap restarts of other leases must call loaderd.
 - Linux `execve` → `procd` (target auth) → `loaderd` (image materialization). If loader materialization fails, procd must cancel the exec ticket via `SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER` before replying.
+- An exec ticket binds one live, non-exiting Linux `(target_pid, target_tid)` pair. Cancel and exec-target validate that exact stored pair before consuming the ticket; a mismatched request must leave it live. The successful exec-target path publishes its register handoff before replacing the target image. Normal/signal process exit, a non-final target-thread exit, and sibling retirement caused by Linux exec remove stale ticket or handoff state.
+- `loaderd` must attempt `ABORT_BROKER` after every rejected commit/exec-target call. Commit is normally terminal, but this closes early rejection paths (such as an already-pending target handoff) before they can retain a bounded prepare slot.
 - **Do not move** executable-format, import/export, or DLL namespace policy back into the kernel.
 
 ### Process Broker Session
 
 Start: `SYS_RUSTOS_PROC_PREPARE_BROKER` with `PROC_BROKER_ABI_VERSION` + explicit format (`PROC_BROKER_FORMAT_ELF64` or `PROC_BROKER_FORMAT_PE64`). Returned `prepare_handle` is owned by the loader process; supply to `SYS_RUSTOS_PROC_COMMIT_BROKER` or `_ABORT_BROKER`.
+
+Prepare state is owner-bound and bounded. `COMMIT_BROKER` consumes the prepare
+handle before its later launch validation, so both successful and rejected
+commit attempts are terminal for that handle. Normal loader process exit and
+signal-driven process exit must remove every still-uncommitted prepare state;
+its pinned mapping metadata must not survive a crashed loader.
 
 Mapping ops use `PROC_BROKER_MAP_{READ,WRITE,EXEC,PRIVATE}` flags and record non-overlapping page-aligned mappings:
 

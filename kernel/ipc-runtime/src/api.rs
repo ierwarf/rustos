@@ -1,7 +1,7 @@
 pub use crate::ipc::{
-    EndpointReceived, EndpointReceivedWithSender, EndpointResponseWithHandles, EndpointWakeSet,
-    IpcError, KernelEndpointHandle, KernelReplyHandle, KernelSharedRegionHandle,
-    KernelTransferredHandle,
+    EndpointReceived, EndpointReceivedWithSender, EndpointResponseTake,
+    EndpointResponseWithHandles, EndpointWakeSet, IpcError, KernelEndpointHandle,
+    KernelReplyHandle, KernelSharedRegionHandle, KernelTransferredHandle,
 };
 
 pub mod endpoint {
@@ -76,6 +76,13 @@ pub mod endpoint {
         )
     }
 
+    pub fn authorize_receiver(
+        endpoint: KernelEndpointHandle,
+        receiver_task_id: u64,
+    ) -> Result<(), IpcError> {
+        crate::ipc::authorize_endpoint_receiver(endpoint, receiver_task_id)
+    }
+
     pub fn add_receiver_waiter(
         endpoint: KernelEndpointHandle,
         task_id: u64,
@@ -95,6 +102,28 @@ pub mod endpoint {
         crate::ipc::complete_endpoint_reply_with_handles(reply, response, attached_handles)
     }
 
+    pub fn reply_for_task(
+        reply: KernelReplyHandle,
+        receiver_task_id: u64,
+        response: &[u8],
+    ) -> Result<u64, IpcError> {
+        crate::ipc::complete_endpoint_reply_for_task(reply, receiver_task_id, response)
+    }
+
+    pub fn reply_with_handles_for_task(
+        reply: KernelReplyHandle,
+        receiver_task_id: u64,
+        response: &[u8],
+        attached_handles: &[KernelTransferredHandle],
+    ) -> Result<u64, IpcError> {
+        crate::ipc::complete_endpoint_reply_with_handles_for_task(
+            reply,
+            receiver_task_id,
+            response,
+            attached_handles,
+        )
+    }
+
     pub fn take_response(
         reply: KernelReplyHandle,
     ) -> Result<Option<alloc::vec::Vec<u8>>, IpcError> {
@@ -108,8 +137,26 @@ pub mod endpoint {
         crate::ipc::take_endpoint_response_with_handle_limit(reply, handle_capacity)
     }
 
+    pub fn take_response_detailed(
+        reply: KernelReplyHandle,
+        handle_capacity: usize,
+    ) -> Result<super::EndpointResponseTake, IpcError> {
+        crate::ipc::take_endpoint_response_detailed(reply, handle_capacity)
+    }
+
     pub fn cancel_call(reply: KernelReplyHandle, caller_task_id: u64) -> Result<(), IpcError> {
         crate::ipc::cancel_endpoint_call(reply, caller_task_id)
+    }
+
+    pub fn cancel_call_with_transfers(
+        reply: KernelReplyHandle,
+        caller_task_id: u64,
+    ) -> Result<alloc::vec::Vec<KernelTransferredHandle>, IpcError> {
+        crate::ipc::cancel_endpoint_call_with_transfers(reply, caller_task_id)
+    }
+
+    pub fn cancel_calls_for_task(task_id: u64) -> alloc::vec::Vec<KernelTransferredHandle> {
+        crate::ipc::cancel_endpoint_calls_for_task(task_id)
     }
 
     pub fn remove_waiters_for_task(task_id: u64) -> usize {
@@ -139,17 +186,22 @@ pub mod region {
 }
 
 pub use endpoint::{
-    add_receiver_waiter as add_endpoint_receiver_waiter, cancel_call as cancel_endpoint_call,
-    create as create_endpoint, create_for_task as create_endpoint_for_task,
-    enqueue_call as enqueue_endpoint_call,
+    add_receiver_waiter as add_endpoint_receiver_waiter,
+    authorize_receiver as authorize_endpoint_receiver, cancel_call as cancel_endpoint_call,
+    cancel_call_with_transfers as cancel_endpoint_call_with_transfers,
+    cancel_calls_for_task as cancel_endpoint_calls_for_task, create as create_endpoint,
+    create_for_task as create_endpoint_for_task, enqueue_call as enqueue_endpoint_call,
     enqueue_call_with_handles as enqueue_endpoint_call_with_handles,
     fail_owned_by_task as fail_endpoints_owned_by_task, recv as recv_endpoint,
     recv_with_limit as recv_endpoint_with_limit,
     recv_with_limits_and_handles as recv_endpoint_with_limits_and_handles,
     recv_with_sender_and_limits as recv_endpoint_with_sender_and_limits,
     remove_waiters_for_task as remove_endpoint_waiters_for_task, reply as complete_endpoint_reply,
+    reply_for_task as complete_endpoint_reply_for_task,
     reply_with_handles as complete_endpoint_reply_with_handles,
+    reply_with_handles_for_task as complete_endpoint_reply_with_handles_for_task,
     take_response as take_endpoint_response,
+    take_response_detailed as take_endpoint_response_detailed,
     take_response_with_handle_limit as take_endpoint_response_with_handle_limit,
 };
 pub use region::{

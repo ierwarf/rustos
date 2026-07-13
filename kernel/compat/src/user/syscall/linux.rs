@@ -476,18 +476,23 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
 }
 
 fn syscall_process_exit(status: u64, exit_group: bool) -> u64 {
+    let target = multitask::current_user_process_id().zip(multitask::current_user_thread_id());
     cleanup_linux_thread_exit();
-    if let Some(process_id) = multitask::current_user_process_id() {
+    if let Some((process_id, thread_id)) = target {
         let last_thread = multitask::current_user_process_thread_count().unwrap_or(1) <= 1;
         if exit_group || last_thread {
             let wait_status = ((status as i32) & 0xff) << 8;
+            let _ = multitask::mark_user_process_exiting(process_id);
             ipc_ops::cleanup_service_endpoints_for_process(process_id);
+            cleanup_proc_broker_state_for_process(process_id);
             let _ = multitask::note_process_exit_status(process_id, wait_status);
             let parent = multitask::parent_process_id_of(process_id).unwrap_or(0);
             if parent != 0 {
                 multitask::queue_linux_signal(parent, parent, linux_abi::SIGCHLD as u64);
             }
             offload_ops::record_process_exit(process_id, parent, wait_status);
+        } else {
+            cleanup_proc_broker_exec_state_for_thread(process_id, thread_id);
         }
     }
     if exit_group {

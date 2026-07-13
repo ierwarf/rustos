@@ -444,6 +444,11 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> HandledLoade
     if pid < 0 {
         debug_line("loaderd: commit broker failed");
         close_fds(&prepared.cleanup_fds);
+        // COMMIT normally consumes the prepare handle, but exec-target may be
+        // rejected before that point (for example, a concurrent handoff for
+        // the same target). Abort is idempotent and closes that early-reject
+        // path without leaving a bounded prepare slot pinned.
+        abort_prepare(prepare_handle as u64, (-pid) as u64);
         response.status = (-pid) as i32;
         return spawn_response(response);
     }

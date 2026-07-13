@@ -381,6 +381,31 @@ pub fn note_process_exit_status(process_id: u64, status: i32) -> Option<()> {
     Some(())
 }
 
+/// Mark a process as exiting before callers tear down resources that it owns.
+///
+/// The process object remains available until its tasks retire and its parent
+/// reaps it, but new authority publication must fail once this bit is set.
+pub fn mark_process_exiting(process_id: u64) -> Option<()> {
+    let mut table = PROCESS_TABLE.lock();
+    let object = table
+        .slots
+        .iter_mut()
+        .filter_map(|slot| slot.object.as_deref_mut())
+        .find(|object| object.process_id == process_id)?;
+    object.exiting = true;
+    Some(())
+}
+
+pub fn is_process_exiting(process_id: u64) -> Option<bool> {
+    let table = PROCESS_TABLE.lock();
+    table
+        .slots
+        .iter()
+        .filter_map(|slot| slot.object.as_deref())
+        .find(|object| object.process_id == process_id)
+        .map(|object| object.exiting)
+}
+
 pub fn thread_count_by_pid(process_id: u64) -> Option<usize> {
     let table = PROCESS_TABLE.lock();
     table

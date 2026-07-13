@@ -9,7 +9,8 @@ pub use crate::multitask::{
     current_linux_thread_state, current_user_address_space, current_user_process_thread_count,
     current_user_stack_state, current_user_thread_id, exec_current_user_process,
     exec_user_process_by_pid, exit_current_user_process, exit_current_user_task,
-    is_user_task_alive, linux_thread_snapshot_by_ids, note_process_exit_status, queue_linux_signal,
+    is_user_process_exiting, is_user_task_alive, linux_thread_snapshot_by_ids,
+    mark_user_process_exiting, note_process_exit_status, queue_linux_signal,
     restore_current_simd_state, save_current_simd_state, set_next_pick_hint,
     set_next_spawn_pick_hint, spawn_user_process_state_with_parent, spawn_user_process_with_parent,
     spawn_user_thread, wake_task, wake_user_task, with_current_mm, with_current_process_state,
@@ -21,9 +22,10 @@ pub use crate::user::abi::UserAbi;
 pub use crate::user::epoll::{EpollError, EpollHandle, EpollInterestSnapshot};
 pub use crate::user::handles::{
     ConsoleStreamKind, DisplaySurfaceHandle, FD_CLOEXEC, FIRST_DYNAMIC_FD, FileHandleSeekError,
-    FileHandleSeekWhence, HandleEntry, HandleTable, InetSocketHandle, KernelHandle,
-    RemoteVfsHandle, RemoteVfsHandleKind, TransferredHandleEntry, VfsDirectoryEntry,
-    VfsDirectoryEntryKind, VfsDirectoryHandle,
+    FileHandleSeekWhence, HandleEntry, HandleTable, InetSocketHandle, IpcTransferRegistryError,
+    KernelHandle, MAX_DYNAMIC_FD, RemoteVfsHandle, RemoteVfsHandleKind, TransferredHandleEntry,
+    VfsDirectoryEntry, VfsDirectoryEntryKind, VfsDirectoryHandle, drop_ipc_transfer_descriptors,
+    register_ipc_transfer_entries, take_ipc_transfer_entries,
 };
 pub use crate::user::linux::{
     LinuxMemoryMapState, LinuxProcessImageInfo, LinuxProcessLaunch, LinuxProcessState,

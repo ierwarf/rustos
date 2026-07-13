@@ -151,6 +151,19 @@ pub type EndpointReceivedWithSender = (
 );
 pub type EndpointResponseWithHandles = (Vec<u8>, Vec<KernelTransferredHandle>);
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EndpointResponseTake {
+    Pending,
+    Response(EndpointResponseWithHandles),
+    /// The endpoint owner failed before consuming request-attached handles.
+    /// The caller's handle substrate must drop these descriptors exactly once
+    /// before it reports `error` to userspace.
+    Error {
+        error: IpcError,
+        discarded_request_handles: Vec<KernelTransferredHandle>,
+    },
+}
+
 impl KernelTransferredHandle {
     pub const fn new(transfer_id: u64, token: HandleToken, rights: HandleRights) -> Self {
         Self {
@@ -207,6 +220,7 @@ pub(crate) struct IpcMessage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IpcError {
     InvalidHandle,
+    PermissionDenied,
     PeerClosed,
     BufferTooSmall,
     InvalidArgument,
@@ -279,6 +293,7 @@ struct EndpointMessageObject {
 
 struct ReplyObject {
     message_id: u64,
+    receiver_task_id: Option<u64>,
     used: bool,
 }
 
@@ -696,6 +711,7 @@ pub fn enqueue_endpoint_call_with_handles(
         if endpoint_object.pending_messages.len() >= MAX_ENDPOINT_PENDING_MESSAGES {
             return Err(IpcError::NoMemory);
         }
+        let receiver_task_id = endpoint_object.owner_task_id;
 
         let message_id = objects.allocate_id()?;
         let reply_id = objects.allocate_id()?;
@@ -713,6 +729,7 @@ pub fn enqueue_endpoint_call_with_handles(
             reply_id,
             ReplyObject {
                 message_id,
+                receiver_task_id,
                 used: false,
             },
         );
@@ -818,6 +835,27 @@ pub fn recv_endpoint_with_sender_and_limits(
     })
 }
 
+/// Confirms that an endpoint created for a user task is received only by that
+/// task. Kernel-internal anonymous endpoints retain their existing unowned
+/// behavior; user-visible endpoints are always created with an owner.
+pub fn authorize_endpoint_receiver(
+    endpoint: KernelEndpointHandle,
+    receiver_task_id: u64,
+) -> Result<(), IpcError> {
+    with_ipc_objects(|objects| {
+        let Some(endpoint_object) = objects.endpoints.get(&endpoint.raw()) else {
+            return Err(IpcError::InvalidHandle);
+        };
+        if endpoint_object
+            .owner_task_id
+            .is_some_and(|owner_task_id| owner_task_id != receiver_task_id)
+        {
+            return Err(IpcError::PermissionDenied);
+        }
+        Ok(())
+    })
+}
+
 /// Registers `task_id` as a receiver waiter on `endpoint`. Returns
 /// `Ok(has_pending)` where `has_pending == true` means a message is already
 /// queued on the endpoint at the moment of registration. Callers must use the
@@ -880,6 +918,57 @@ pub fn complete_endpoint_reply_with_handles(
     })
 }
 
+/// Completes a reply obtained through a user-visible endpoint receive. A
+/// reply capability is bound to the task that owns the destination endpoint,
+/// so a guessed raw reply id cannot authorize an unrelated process.
+pub fn complete_endpoint_reply_for_task(
+    reply: KernelReplyHandle,
+    receiver_task_id: u64,
+    response: &[u8],
+) -> Result<u64, IpcError> {
+    complete_endpoint_reply_with_handles_for_task(reply, receiver_task_id, response, &[])
+}
+
+pub fn complete_endpoint_reply_with_handles_for_task(
+    reply: KernelReplyHandle,
+    receiver_task_id: u64,
+    response: &[u8],
+    attached_handles: &[KernelTransferredHandle],
+) -> Result<u64, IpcError> {
+    if response.len() > MAX_ENDPOINT_INLINE_MESSAGE_BYTES {
+        return Err(IpcError::InvalidArgument);
+    }
+    validate_endpoint_transfer_handles(attached_handles)?;
+
+    with_ipc_objects(|objects| {
+        let Some(reply_object) = objects.replies.get_mut(&reply.raw()) else {
+            return Err(IpcError::InvalidHandle);
+        };
+        if reply_object
+            .receiver_task_id
+            .is_some_and(|owner_task_id| owner_task_id != receiver_task_id)
+        {
+            return Err(IpcError::PermissionDenied);
+        }
+        if reply_object.used {
+            return Err(IpcError::InvalidArgument);
+        }
+
+        let Some(message) = objects.endpoint_messages.get_mut(&reply_object.message_id) else {
+            return Err(IpcError::InvalidHandle);
+        };
+        if message.response.is_some() {
+            return Err(IpcError::InvalidHandle);
+        }
+        reply_object.used = true;
+        message.response = Some(EndpointResponse::Data {
+            bytes: response.to_vec(),
+            attached_handles: attached_handles.to_vec(),
+        });
+        Ok(message.caller_task_id)
+    })
+}
+
 pub fn take_endpoint_response(reply: KernelReplyHandle) -> Result<Option<Vec<u8>>, IpcError> {
     let Some((response, _handles)) = take_endpoint_response_with_handle_limit(reply, 0)? else {
         return Ok(None);
@@ -891,6 +980,21 @@ pub fn take_endpoint_response_with_handle_limit(
     reply: KernelReplyHandle,
     handle_capacity: usize,
 ) -> Result<Option<EndpointResponseWithHandles>, IpcError> {
+    match take_endpoint_response_detailed(reply, handle_capacity)? {
+        EndpointResponseTake::Pending => Ok(None),
+        EndpointResponseTake::Response(response) => Ok(Some(response)),
+        // This compatibility wrapper predates transferred handles in terminal
+        // error results. Its callers use handle_capacity = 0 and cannot have
+        // created request descriptors; handle-aware callers use the detailed
+        // API and return the descriptors to their owning substrate.
+        EndpointResponseTake::Error { error, .. } => Err(error),
+    }
+}
+
+pub fn take_endpoint_response_detailed(
+    reply: KernelReplyHandle,
+    handle_capacity: usize,
+) -> Result<EndpointResponseTake, IpcError> {
     with_ipc_objects(|objects| {
         let Some(reply_object) = objects.replies.get(&reply.raw()) else {
             return Err(IpcError::InvalidHandle);
@@ -900,7 +1004,7 @@ pub fn take_endpoint_response_with_handle_limit(
             return Err(IpcError::InvalidHandle);
         };
         match message.response.as_ref() {
-            None => Ok(None),
+            None => Ok(EndpointResponseTake::Pending),
             Some(EndpointResponse::Data {
                 attached_handles, ..
             }) if attached_handles.len() > handle_capacity => Err(IpcError::BufferTooSmall),
@@ -914,20 +1018,31 @@ pub fn take_endpoint_response_with_handle_limit(
                 };
                 objects.endpoint_messages.remove(&message_id);
                 objects.replies.remove(&reply.raw());
-                Ok(Some((bytes, attached_handles)))
+                Ok(EndpointResponseTake::Response((bytes, attached_handles)))
             }
             Some(EndpointResponse::Error(err)) => {
                 let err = *err;
                 message.response.take();
+                let discarded_request_handles = core::mem::take(&mut message.attached_handles);
                 objects.endpoint_messages.remove(&message_id);
                 objects.replies.remove(&reply.raw());
-                Err(err)
+                Ok(EndpointResponseTake::Error {
+                    error: err,
+                    discarded_request_handles,
+                })
             }
         }
     })
 }
 
 pub fn cancel_endpoint_call(reply: KernelReplyHandle, caller_task_id: u64) -> Result<(), IpcError> {
+    cancel_endpoint_call_with_transfers(reply, caller_task_id).map(|_| ())
+}
+
+pub fn cancel_endpoint_call_with_transfers(
+    reply: KernelReplyHandle,
+    caller_task_id: u64,
+) -> Result<Vec<KernelTransferredHandle>, IpcError> {
     with_ipc_objects(|objects| {
         let Some(message_id) = objects
             .replies
@@ -948,10 +1063,55 @@ pub fn cancel_endpoint_call(reply: KernelReplyHandle, caller_task_id: u64) -> Re
                 .pending_messages
                 .retain(|pending_message_id| *pending_message_id != message_id);
         }
-        objects.endpoint_messages.remove(&message_id);
+        let message = objects
+            .endpoint_messages
+            .remove(&message_id)
+            .expect("validated endpoint message disappeared while cancelling");
         objects.replies.remove(&reply.raw());
-        Ok(())
+        Ok(transfers_from_message(message))
     })
+}
+
+/// Cancels every endpoint call owned by a task being retired.  The caller may
+/// no longer reach the response path, so both request and already-queued reply
+/// descriptors are returned to the process-handle substrate for disposal.
+pub fn cancel_endpoint_calls_for_task(task_id: u64) -> Vec<KernelTransferredHandle> {
+    with_ipc_objects(|objects| {
+        let message_ids = objects
+            .endpoint_messages
+            .iter()
+            .filter_map(|(message_id, message)| {
+                (message.caller_task_id == task_id).then_some(*message_id)
+            })
+            .collect::<Vec<_>>();
+        let mut discarded = Vec::new();
+        for message_id in message_ids {
+            let Some(message) = objects.endpoint_messages.remove(&message_id) else {
+                continue;
+            };
+            if let Some(endpoint) = objects.endpoints.get_mut(&message.endpoint_id) {
+                endpoint
+                    .pending_messages
+                    .retain(|pending_message_id| *pending_message_id != message_id);
+            }
+            objects
+                .replies
+                .retain(|_, reply| reply.message_id != message_id);
+            discarded.extend(transfers_from_message(message));
+        }
+        discarded
+    })
+}
+
+fn transfers_from_message(mut message: EndpointMessageObject) -> Vec<KernelTransferredHandle> {
+    let mut transfers = core::mem::take(&mut message.attached_handles);
+    if let Some(EndpointResponse::Data {
+        attached_handles, ..
+    }) = message.response.take()
+    {
+        transfers.extend(attached_handles);
+    }
+    transfers
 }
 
 pub fn remove_endpoint_waiters_for_task(task_id: u64) -> usize {
@@ -1004,8 +1164,7 @@ pub fn fail_endpoints_owned_by_task(task_id: u64, err: IpcError) -> EndpointWake
                     wake_set.push_caller(message.caller_task_id);
                     if let Some(reply_id) = objects.replies.iter().find_map(|(reply_id, reply)| {
                         (reply.message_id == message_id).then_some(*reply_id)
-                    })
-                        && let Some(reply) = objects.replies.get_mut(&reply_id)
+                    }) && let Some(reply) = objects.replies.get_mut(&reply_id)
                     {
                         reply.used = true;
                     }
@@ -1516,6 +1675,29 @@ mod tests {
     }
 
     #[test]
+    fn owned_endpoint_rejects_foreign_receiver_and_reply_task() {
+        with_isolated_ipc_test(|| {
+            let endpoint = super::create_endpoint_for_task(Some(10)).expect("create endpoint");
+            let (reply, _) =
+                super::enqueue_endpoint_call(endpoint, 22, b"request").expect("enqueue call");
+
+            assert_eq!(
+                super::authorize_endpoint_receiver(endpoint, 11),
+                Err(super::IpcError::PermissionDenied)
+            );
+            assert_eq!(super::authorize_endpoint_receiver(endpoint, 10), Ok(()));
+            assert_eq!(
+                super::complete_endpoint_reply_for_task(reply, 11, b"forged"),
+                Err(super::IpcError::PermissionDenied)
+            );
+            assert_eq!(
+                super::complete_endpoint_reply_for_task(reply, 10, b"ok"),
+                Ok(22)
+            );
+        });
+    }
+
+    #[test]
     fn endpoint_request_handles_require_explicit_receive_capacity() {
         with_isolated_ipc_test(|| {
             let endpoint = super::create_endpoint().expect("create endpoint");
@@ -1735,6 +1917,27 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_peer_close_returns_unreceived_request_handles_for_cleanup() {
+        with_isolated_ipc_test(|| {
+            let endpoint = super::create_endpoint_for_task(Some(10)).expect("create endpoint");
+            let handle = transferable_file_handle(77);
+            let (reply, _) =
+                super::enqueue_endpoint_call_with_handles(endpoint, 22, b"request", &[handle])
+                    .expect("enqueue call");
+
+            let wake_set = super::fail_endpoints_owned_by_task(10, IpcError::PeerClosed);
+            assert_eq!(wake_set.callers, alloc::vec![22]);
+            assert_eq!(
+                super::take_endpoint_response_detailed(reply, 0),
+                Ok(super::EndpointResponseTake::Error {
+                    error: IpcError::PeerClosed,
+                    discarded_request_handles: alloc::vec![handle],
+                })
+            );
+        });
+    }
+
+    #[test]
     fn endpoint_cancel_pending_call_removes_queued_message() {
         with_isolated_ipc_test(|| {
             let endpoint = super::create_endpoint().expect("create endpoint");
@@ -1749,6 +1952,33 @@ mod tests {
             );
             assert_eq!(
                 super::complete_endpoint_reply(reply, b"late"),
+                Err(IpcError::InvalidHandle)
+            );
+        });
+    }
+
+    #[test]
+    fn retiring_caller_returns_all_outstanding_transfer_batches() {
+        with_isolated_ipc_test(|| {
+            let endpoint = super::create_endpoint().expect("create endpoint");
+            let first = transferable_file_handle(81);
+            let second = transferable_file_handle(82);
+            let (first_reply, _) =
+                super::enqueue_endpoint_call_with_handles(endpoint, 22, b"first", &[first])
+                    .expect("enqueue first");
+            let (second_reply, _) =
+                super::enqueue_endpoint_call_with_handles(endpoint, 22, b"second", &[second])
+                    .expect("enqueue second");
+
+            let discarded = super::cancel_endpoint_calls_for_task(22);
+            assert_eq!(discarded, alloc::vec![first, second]);
+            assert_eq!(recv_endpoint(endpoint), Ok(None));
+            assert_eq!(
+                super::take_endpoint_response(first_reply),
+                Err(IpcError::InvalidHandle)
+            );
+            assert_eq!(
+                super::take_endpoint_response(second_reply),
                 Err(IpcError::InvalidHandle)
             );
         });

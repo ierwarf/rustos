@@ -105,6 +105,9 @@ pub fn syscall_linux_vfs_dup(oldfd: u64, newfd: u64, flags: u64, mode: VfsDupMod
     if matches!(mode, VfsDupMode::Dup2) && oldfd == newfd {
         return oldfd;
     }
+    if matches!(mode, VfsDupMode::Dup2 | VfsDupMode::Dup3) && newfd > multitask::MAX_DYNAMIC_FD {
+        return linux_errno(LINUX_EBADF);
+    }
 
     let close_on_exec = flags & linux_abi::O_CLOEXEC != 0;
     let replaced_socket = match (socket_token, mode) {
@@ -171,6 +174,9 @@ pub fn syscall_linux_vfs_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
                 return linux_errno(LINUX_EINVAL);
             };
             if min_fd < 0 {
+                return linux_errno(LINUX_EINVAL);
+            }
+            if min_fd as u64 > multitask::MAX_DYNAMIC_FD {
                 return linux_errno(LINUX_EINVAL);
             }
             let socket_token = current_socket_token(fd);

@@ -84,6 +84,7 @@ struct ProcPrepareState {
     linux_runtime: Option<(crate::user::linux::LinuxProcessImageInfo, u64)>,
 }
 
+#[derive(Clone, Copy)]
 struct ExecTicketState {
     target_pid: u64,
     target_tid: u64,
@@ -649,21 +650,37 @@ pub(super) fn syscall_linux_rustos_proc_authorize_exec_broker(args_ptr: u64) -> 
     {
         return linux_errno(LINUX_EINVAL);
     }
-    if !multitask::is_user_task_alive(args.target_tid) {
+    if multitask::linux_thread_snapshot_by_ids(args.target_pid, args.target_tid).is_none()
+        || multitask::is_user_process_exiting(args.target_pid)
+    {
         return linux_errno(LINUX_ESRCH);
     }
-    let mut tickets = EXEC_TICKETS.lock();
-    if tickets.len() >= MAX_EXEC_TICKETS {
-        return linux_errno(LINUX_EAGAIN);
+    let ticket = {
+        let mut tickets = EXEC_TICKETS.lock();
+        if tickets.len() >= MAX_EXEC_TICKETS {
+            return linux_errno(LINUX_EAGAIN);
+        }
+        let Some(ticket) = allocate_exec_ticket(&tickets) else {
+            return linux_errno(LINUX_EAGAIN);
+        };
+        tickets.insert(
+            ticket,
+            ExecTicketState {
+                target_pid: args.target_pid,
+                target_tid: args.target_tid,
+            },
+        );
+        ticket
+    };
+    // Process teardown runs independently of procd authorization. Recheck
+    // after publication so an exit between the first snapshot and insertion
+    // cannot retain one of the bounded ticket slots.
+    if multitask::linux_thread_snapshot_by_ids(args.target_pid, args.target_tid).is_none()
+        || multitask::is_user_process_exiting(args.target_pid)
+    {
+        EXEC_TICKETS.lock().remove(&ticket);
+        return linux_errno(LINUX_ESRCH);
     }
-    let ticket = NEXT_EXEC_TICKET.fetch_add(1, Ordering::Relaxed).max(1);
-    tickets.insert(
-        ticket,
-        ExecTicketState {
-            target_pid: args.target_pid,
-            target_tid: args.target_tid,
-        },
-    );
     ticket
 }
 
@@ -684,12 +701,14 @@ pub(super) fn syscall_linux_rustos_proc_cancel_exec_broker(args_ptr: u64) -> u64
     {
         return linux_errno(LINUX_EINVAL);
     }
-    let Some(ticket) = EXEC_TICKETS.lock().remove(&args.exec_ticket) else {
+    let mut tickets = EXEC_TICKETS.lock();
+    let Some(ticket) = tickets.get(&args.exec_ticket).copied() else {
         return linux_errno(LINUX_EINVAL);
     };
     if ticket.target_pid != args.target_pid || ticket.target_tid != args.target_tid {
         return linux_errno(LINUX_EPERM);
     }
+    tickets.remove(&args.exec_ticket);
     0
 }
 
@@ -710,11 +729,15 @@ pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64
     {
         return linux_errno(LINUX_EINVAL);
     }
-    let Some(ticket) = EXEC_TICKETS.lock().remove(&args.exec_ticket) else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    if ticket.target_pid != args.target_pid || ticket.target_tid != args.target_tid {
-        return linux_errno(LINUX_EPERM);
+    {
+        let mut tickets = EXEC_TICKETS.lock();
+        let Some(ticket) = tickets.get(&args.exec_ticket).copied() else {
+            return linux_errno(LINUX_EINVAL);
+        };
+        if ticket.target_pid != args.target_pid || ticket.target_tid != args.target_tid {
+            return linux_errno(LINUX_EPERM);
+        }
+        tickets.remove(&args.exec_ticket);
     }
     let state = {
         let mut prepares = PROC_PREPARES.lock();
@@ -794,15 +817,30 @@ pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64
         Err(err) => return linux_errno(process_load_error_to_linux_errno(err)),
     };
     let transition = exec_transition_from_prepared(args.target_pid, args.target_tid, &prepared);
+    {
+        let mut transitions = EXEC_TRANSITIONS.lock();
+        // Publishing the transition before replacing the target address space
+        // closes the scheduler-visible window where a new image has no saved
+        // user-register handoff. A second concurrent exec for the same thread
+        // must not overwrite that handoff.
+        if transitions.contains_key(&args.target_tid) {
+            return linux_errno(LINUX_EBUSY);
+        }
+        transitions.insert(args.target_tid, transition);
+    }
     if multitask::exec_user_process_by_pid(
         args.target_pid,
         args.target_tid,
         prepared.address_space,
         prepared.bootstrap,
     ) {
-        EXEC_TRANSITIONS.lock().insert(args.target_tid, transition);
+        // Linux exec retires every sibling thread. Their exact tickets and
+        // handoffs can no longer become valid after the scheduler clears those
+        // slots, so release them with the same target identity boundary.
+        cleanup_proc_broker_exec_state_for_siblings(args.target_pid, args.target_tid);
         args.target_pid
     } else {
+        EXEC_TRANSITIONS.lock().remove(&args.target_tid);
         linux_errno(LINUX_ESRCH)
     }
 }
@@ -952,6 +990,70 @@ pub(super) fn syscall_linux_rustos_proc_abort_broker(args_ptr: u64) -> u64 {
     }
     prepares.remove(&args.prepare_handle);
     0
+}
+
+/// Process-broker state is bounded and process-scoped. A loader that exits
+/// between PREPARE and COMMIT cannot reach ABORT, and a target that exits after
+/// procd authorization cannot consume a later exec ticket. Process teardown
+/// therefore removes owner-bound prepares plus target-bound tickets and saved
+/// register transitions before the process table retires that process.
+pub(super) fn cleanup_proc_broker_state_for_process(process_id: u64) -> (usize, usize, usize) {
+    let mut prepares = PROC_PREPARES.lock();
+    let prepares_before = prepares.len();
+    prepares.retain(|_, state| state.owner_pid != process_id);
+    let removed_prepares = prepares_before.saturating_sub(prepares.len());
+    drop(prepares);
+
+    let mut tickets = EXEC_TICKETS.lock();
+    let tickets_before = tickets.len();
+    tickets.retain(|_, state| state.target_pid != process_id);
+    let removed_tickets = tickets_before.saturating_sub(tickets.len());
+    drop(tickets);
+
+    let mut transitions = EXEC_TRANSITIONS.lock();
+    let transitions_before = transitions.len();
+    transitions.retain(|_, state| state.target_pid != process_id);
+    let removed_transitions = transitions_before.saturating_sub(transitions.len());
+
+    (removed_prepares, removed_tickets, removed_transitions)
+}
+
+/// A non-final Linux thread exit, or a sibling retirement caused by exec,
+/// leaves the process table alive but invalidates the exact TID binding of its
+/// tickets and saved user-register handoff.
+pub(super) fn cleanup_proc_broker_exec_state_for_thread(
+    process_id: u64,
+    thread_id: u64,
+) -> (usize, usize) {
+    let mut tickets = EXEC_TICKETS.lock();
+    let tickets_before = tickets.len();
+    tickets.retain(|_, state| {
+        state.target_pid != process_id || state.target_tid != thread_id
+    });
+    let removed_tickets = tickets_before.saturating_sub(tickets.len());
+    drop(tickets);
+
+    let mut transitions = EXEC_TRANSITIONS.lock();
+    let transitions_before = transitions.len();
+    transitions.retain(|_, state| {
+        state.target_pid != process_id || state.target_tid != thread_id
+    });
+    let removed_transitions = transitions_before.saturating_sub(transitions.len());
+
+    (removed_tickets, removed_transitions)
+}
+
+fn cleanup_proc_broker_exec_state_for_siblings(process_id: u64, surviving_thread_id: u64) {
+    let mut tickets = EXEC_TICKETS.lock();
+    tickets.retain(|_, state| {
+        state.target_pid != process_id || state.target_tid == surviving_thread_id
+    });
+    drop(tickets);
+
+    let mut transitions = EXEC_TRANSITIONS.lock();
+    transitions.retain(|_, state| {
+        state.target_pid != process_id || state.target_tid == surviving_thread_id
+    });
 }
 
 fn current_process_can_load() -> bool {
@@ -1171,6 +1273,16 @@ fn allocate_prepare_handle(prepares: &BTreeMap<u64, ProcPrepareState>) -> Option
         let handle = NEXT_PREPARE_HANDLE.fetch_add(1, Ordering::Relaxed).max(1);
         if !prepares.contains_key(&handle) {
             return Some(handle);
+        }
+    }
+    None
+}
+
+fn allocate_exec_ticket(tickets: &BTreeMap<u64, ExecTicketState>) -> Option<u64> {
+    for _ in 0..MAX_EXEC_TICKETS {
+        let ticket = NEXT_EXEC_TICKET.fetch_add(1, Ordering::Relaxed).max(1);
+        if !tickets.contains_key(&ticket) {
+            return Some(ticket);
         }
     }
     None
