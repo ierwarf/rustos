@@ -45,10 +45,10 @@ pub fn try_present_panic_blackout() -> bool {
 
 pub fn init(boot_info_ptr: *const BootInfo) {
     let boot_info = boot_info_from_ptr(boot_info_ptr);
-    let _ = backend::install_boot_framebuffer(
-        boot_info.framebuffer,
-        DISPLAY_INFO_FLAG_BOOT_FRAMEBUFFER,
-    );
+    // The firmware framebuffer is a kernel-owned bootstrap substrate, not a
+    // loadable driver. Register it as the bounded primary fallback before any
+    // optional DVM or hardware provider can replace it.
+    let _ = install_boot_framebuffer_fallback(boot_info.framebuffer);
 }
 
 pub unsafe extern "C" fn register_driver_framebuffer(

@@ -142,10 +142,16 @@ prepare_sources() {
     printf '%s\n' "$BUILDROOT_SHA256" >"$marker"
 }
 
-input_hash() {
+config_input_hash() {
     (
         cd "$ROOT"
-        find configs board package scripts -type f -print0 | sort -z | xargs -0 sha256sum
+        # These inputs can change the generated Buildroot configuration or
+        # target-toolchain ABI. A change here deliberately starts from a clean
+        # output tree because Buildroot cannot, in general, reconcile it with
+        # already-built packages.
+        find configs -type f -print0 | sort -z | xargs -0 sha256sum
+        find package -name Config.in -type f -print0 | sort -z | xargs -0 sha256sum
+        sha256sum board/linux.fragment
         sha256sum sources.lock external.desc external.mk Config.in
         sha256sum "$LIBELF_INCLUDE_DIR/libelf.h" "$LIBELF_INCLUDE_DIR/gelf.h"
         if test -n "$LIBELF_LIBRARY_DIR"; then
@@ -154,34 +160,111 @@ input_hash() {
     ) | sha256sum | awk '{print $1}'
 }
 
+local_service_input_hash() {
+    local service=$1
+
+    case "$service" in
+        rustos-dvm-agent|rustos-dvm-display|rustos-dvm-net) ;;
+        *) die "unknown local DVM service: $service" ;;
+    esac
+    (
+        cd "$ROOT"
+        # Buildroot copies SITE_METHOD=local packages once. Keep a distinct
+        # stamp per package so a relay edit never rebuilds its independent
+        # DVM companions or the host toolchain.
+        find "package/$service" -type f ! -name Config.in -print0 | sort -z | xargs -0 sha256sum
+    ) | sha256sum | awk '{print $1}'
+}
+
+overlay_input_hash() {
+    (
+        cd "$ROOT"
+        find board/overlay -type f -print0 | sort -z | xargs -0 sha256sum
+    ) | sha256sum | awk '{print $1}'
+}
+
+write_stamp() {
+    local path=$1
+    local value=$2
+    local tmp="${path}.tmp"
+
+    mkdir -p "$(dirname -- "$path")"
+    printf '%s\n' "$value" >"$tmp"
+    mv -- "$tmp" "$path"
+}
+
 make_buildroot() {
     make -C "$BUILDROOT_DIR" O="$BUILD_DIR" \
         BR2_EXTERNAL="$ROOT" BR2_DL_DIR="$DL_DIR" "$@"
 }
 
 configure() {
-    local stamp="$BUILD_DIR/.rustos-config-input.sha256"
+    local stamp="$BUILD_DIR/.rustos-config-input-v2.sha256"
     local current
 
     require_kernel_build_headers
-    current="$(input_hash)"
+    current="$(config_input_hash)"
 
     if test -f "$BUILD_DIR/.config" && test -f "$stamp" \
         && test "$(cat "$stamp")" = "$current"; then
         return
     fi
-    # Buildroot does not necessarily track edits to BR2_EXTERNAL local-package
-    # sources through its package stamps. The host-package tree can also retain
-    # stale configure state across an external-package edit. The DVM image must
-    # never report a manifest/control hash for an old agent binary, so any
-    # hashed input change removes the complete output tree before reconfiguration.
+    # Buildroot cannot safely reconcile an external configuration or toolchain
+    # input change with already-built packages. Local package sources and the
+    # rootfs overlay are handled below with targeted invalidation; they must
+    # never force a host-toolchain rebuild.
     if test -f "$BUILD_DIR/.config"; then
         make_buildroot distclean
     fi
     mkdir -p "$BUILD_DIR"
     make_buildroot rustos_linux_dvm_x86_64_defconfig
     make_buildroot olddefconfig
-    printf '%s\n' "$current" >"$stamp"
+    write_stamp "$stamp" "$current"
+}
+
+prepare_mutable_inputs() {
+    local legacy_service_stamp="$BUILD_DIR/.rustos-agent-input.sha256"
+    local overlay_stamp="$BUILD_DIR/.rustos-overlay-input.sha256"
+    local overlay_current
+    local service
+    local service_stamp
+    local service_current
+
+    overlay_current="$(overlay_input_hash)"
+
+    # SITE_METHOD=local is intentionally explicit: Buildroot does not watch
+    # the external source tree after its first rsync. Remove only the local
+    # service package directories so the next ordinary make recreates and
+    # reinstalls them while retaining the verified host toolchain and kernel.
+    if test -f "$legacy_service_stamp"; then
+        rm -f -- "$legacy_service_stamp"
+        for service in rustos-dvm-agent rustos-dvm-display rustos-dvm-net; do
+            make_buildroot "${service}-dirclean"
+        done
+    fi
+    for service in rustos-dvm-agent rustos-dvm-display rustos-dvm-net; do
+        service_stamp="$BUILD_DIR/.${service}-input-v1.sha256"
+        service_current="$(local_service_input_hash "$service")"
+        if test -f "$service_stamp" && test "$(cat "$service_stamp")" != "$service_current"; then
+            make_buildroot "${service}-dirclean"
+        fi
+    done
+
+    # An overlay change must produce a new initramfs even when no package
+    # target changed. Deleting just the generated rootfs asks Buildroot to run
+    # target-finalize and rebuild the image; it does not invalidate packages or
+    # host tools.
+    if test -f "$overlay_stamp" && test "$(cat "$overlay_stamp")" != "$overlay_current"; then
+        rm -f -- "$BUILD_DIR/images/rootfs.cpio.xz"
+    fi
+}
+
+commit_mutable_input_stamps() {
+    local service
+    for service in rustos-dvm-agent rustos-dvm-display rustos-dvm-net; do
+        write_stamp "$BUILD_DIR/.${service}-input-v1.sha256" "$(local_service_input_hash "$service")"
+    done
+    write_stamp "$BUILD_DIR/.rustos-overlay-input.sha256" "$(overlay_input_hash)"
 }
 
 verify_config() {
@@ -202,10 +285,31 @@ build() {
     prepare_sources
     configure
     verify_config
+    prepare_mutable_inputs
     make_buildroot -j "$JOBS"
     verify_config
     verify_kernel_config
     write_manifest
+    commit_mutable_input_stamps
+}
+
+rebuild_service() {
+    local service=$1
+
+    case "$service" in
+        rustos-dvm-agent|rustos-dvm-display|rustos-dvm-net) ;;
+        *) die "unknown local DVM service: $service" ;;
+    esac
+    prepare_sources
+    configure
+    verify_config
+    make_buildroot "${service}-dirclean"
+    rm -f -- "$BUILD_DIR/images/rootfs.cpio.xz"
+    make_buildroot -j "$JOBS"
+    verify_config
+    verify_kernel_config
+    write_manifest
+    commit_mutable_input_stamps
 }
 
 print_artifacts() {
@@ -252,6 +356,30 @@ main() {
             require_tool tar
             require_kernel_build_headers
             build
+            ;;
+        rebuild-agent)
+            require_tool make
+            require_tool curl
+            require_tool sha256sum
+            require_tool tar
+            require_kernel_build_headers
+            rebuild_service rustos-dvm-agent
+            ;;
+        rebuild-display)
+            require_tool make
+            require_tool curl
+            require_tool sha256sum
+            require_tool tar
+            require_kernel_build_headers
+            rebuild_service rustos-dvm-display
+            ;;
+        rebuild-net)
+            require_tool make
+            require_tool curl
+            require_tool sha256sum
+            require_tool tar
+            require_kernel_build_headers
+            rebuild_service rustos-dvm-net
             ;;
         verify)
             verify_config

@@ -1,0 +1,64 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+
+run_dir=/run/rustos-dvm
+
+start_relay() {
+    name=$1
+    command=$2
+    pid_file="$run_dir/$name.pid"
+
+    if [ -r "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+        return 0
+    fi
+    rm -f "$pid_file"
+    "$command" serve &
+    echo "$!" >"$pid_file"
+}
+
+stop_relay() {
+    name=$1
+    pid_file="$run_dir/$name.pid"
+
+    if [ ! -r "$pid_file" ]; then
+        return 0
+    fi
+    pid=$(cat "$pid_file")
+    case "$pid" in
+        ''|*[!0-9]*) rm -f "$pid_file"; return 0 ;;
+    esac
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -TERM "$pid" 2>/dev/null || true
+        attempts=0
+        while kill -0 "$pid" 2>/dev/null && [ "$attempts" -lt 20 ]; do
+            sleep 1
+            attempts=$((attempts + 1))
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    fi
+    rm -f "$pid_file"
+}
+
+start_relays() {
+    mkdir -p "$run_dir"
+    # The display and Ethernet relays share one DVM boot lifecycle.  Their
+    # processes self-retry transient hardware readiness failures; this script
+    # owns the process lifetime so restart cannot leave duplicate consumers.
+    start_relay net /usr/libexec/rustos-dvm-net
+    start_relay display /usr/libexec/rustos-dvm-display
+}
+
+stop_relays() {
+    # Stop display first so it releases DRM master before networking or reboot.
+    stop_relay display
+    stop_relay net
+}
+
+case "$1" in
+    start) start_relays ;;
+    stop) stop_relays ;;
+    restart|reload) stop_relays; start_relays ;;
+    *) echo "usage: $0 {start|stop|restart|reload}" >&2; exit 1 ;;
+esac

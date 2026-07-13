@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/input.h>
+#include <linux/uinput.h>
 #include <linux/vm_sockets.h>
 #include <poll.h>
 #include <stdint.h>
@@ -31,6 +32,10 @@
 #define INPUT_EVENT_LIMIT 64U
 #define INPUT_BITS_BYTES ((KEY_MAX / 8U) + 1U)
 #define POINTER_BUTTON_MASK 0x1fU
+#define INPUT_SELFTEST_CMDLINE "rustos.dvm.input-selftest=1"
+#define INPUT_SELFTEST_NAME "RustOS DVM input selftest"
+#define INPUT_SELFTEST_CYCLES 800U
+#define INPUT_SELFTEST_POLL_MS 25
 
 enum input_device_kind {
     INPUT_DEVICE_KEYBOARD,
@@ -46,6 +51,13 @@ struct pointer_state {
     int pending;
 };
 
+struct input_selftest {
+    int uinput_fd;
+    unsigned int cycles_remaining;
+    int enabled;
+    int armed;
+};
+
 struct control_contract {
     char schema[16];
     char protocol[32];
@@ -58,6 +70,126 @@ struct control_contract {
 static void die(const char *message) {
     fprintf(stderr, "rustos-dvm-agent: %s\n", message);
     exit(EXIT_FAILURE);
+}
+
+static int cmdline_has_option(const char *option) {
+    FILE *file = fopen("/proc/cmdline", "re");
+    char buffer[4096];
+    size_t option_len = strlen(option);
+    size_t bytes;
+    char *cursor;
+
+    if (file == NULL || option_len == 0 || option_len >= sizeof(buffer)) {
+        if (file != NULL) {
+            fclose(file);
+        }
+        return 0;
+    }
+    bytes = fread(buffer, 1, sizeof(buffer) - 1U, file);
+    fclose(file);
+    buffer[bytes] = '\0';
+    cursor = buffer;
+    while (*cursor != '\0') {
+        char *end = cursor;
+        while (*end != '\0' && *end != ' ' && *end != '\n' && *end != '\t') {
+            end++;
+        }
+        if ((size_t)(end - cursor) == option_len && memcmp(cursor, option, option_len) == 0) {
+            return 1;
+        }
+        cursor = end;
+        while (*cursor == ' ' || *cursor == '\n' || *cursor == '\t') {
+            cursor++;
+        }
+    }
+    return 0;
+}
+
+static int write_input_event(int fd, uint16_t type, uint16_t code, int32_t value) {
+    struct input_event event;
+    ssize_t written;
+
+    memset(&event, 0, sizeof(event));
+    event.type = type;
+    event.code = code;
+    event.value = value;
+    written = write(fd, &event, sizeof(event));
+    return written == (ssize_t)sizeof(event) ? 0 : -1;
+}
+
+static void input_selftest_destroy(struct input_selftest *selftest) {
+    if (selftest->uinput_fd >= 0) {
+        (void)ioctl(selftest->uinput_fd, UI_DEV_DESTROY);
+        close(selftest->uinput_fd);
+    }
+    selftest->uinput_fd = -1;
+}
+
+static int input_selftest_start(struct input_selftest *selftest) {
+    struct uinput_setup setup;
+    struct timespec settle = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000};
+    int fd;
+
+    memset(selftest, 0, sizeof(*selftest));
+    selftest->uinput_fd = -1;
+    if (!cmdline_has_option(INPUT_SELFTEST_CMDLINE)) {
+        return 0;
+    }
+    fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0 || ioctl(fd, UI_SET_EVBIT, EV_KEY) < 0 || ioctl(fd, UI_SET_EVBIT, EV_REL) < 0 ||
+        ioctl(fd, UI_SET_EVBIT, EV_SYN) < 0 || ioctl(fd, UI_SET_KEYBIT, KEY_A) < 0 ||
+        ioctl(fd, UI_SET_KEYBIT, KEY_Z) < 0 || ioctl(fd, UI_SET_KEYBIT, KEY_SPACE) < 0 ||
+        ioctl(fd, UI_SET_KEYBIT, BTN_LEFT) < 0 || ioctl(fd, UI_SET_RELBIT, REL_X) < 0 ||
+        ioctl(fd, UI_SET_RELBIT, REL_Y) < 0 || ioctl(fd, UI_SET_RELBIT, REL_WHEEL) < 0) {
+        if (fd >= 0) {
+            close(fd);
+        }
+        return -1;
+    }
+    memset(&setup, 0, sizeof(setup));
+    snprintf(setup.name, sizeof(setup.name), "%s", INPUT_SELFTEST_NAME);
+    setup.id.bustype = BUS_VIRTUAL;
+    setup.id.vendor = 0x5255;
+    setup.id.product = 0x4456;
+    setup.id.version = 1;
+    if (ioctl(fd, UI_DEV_SETUP, &setup) < 0 || ioctl(fd, UI_DEV_CREATE) < 0) {
+        close(fd);
+        return -1;
+    }
+    (void)nanosleep(&settle, NULL);
+    selftest->uinput_fd = fd;
+    selftest->enabled = 1;
+    fprintf(stderr, "rustos-dvm-agent: input selftest evdev ready\n");
+    fflush(stderr);
+    return 0;
+}
+
+static int input_selftest_emit_cycle(struct input_selftest *selftest) {
+    int fd = selftest->uinput_fd;
+
+    if (!selftest->armed || selftest->cycles_remaining == 0) {
+        return 0;
+    }
+    if (write_input_event(fd, EV_KEY, KEY_A, 1) != 0 ||
+        write_input_event(fd, EV_SYN, SYN_REPORT, 0) != 0 ||
+        write_input_event(fd, EV_KEY, KEY_A, 0) != 0 ||
+        write_input_event(fd, EV_SYN, SYN_REPORT, 0) != 0 ||
+        write_input_event(fd, EV_REL, REL_X, 3) != 0 ||
+        write_input_event(fd, EV_REL, REL_Y, -2) != 0 ||
+        write_input_event(fd, EV_REL, REL_WHEEL, 1) != 0 ||
+        write_input_event(fd, EV_KEY, BTN_LEFT, 1) != 0 ||
+        write_input_event(fd, EV_SYN, SYN_REPORT, 0) != 0 ||
+        write_input_event(fd, EV_KEY, BTN_LEFT, 0) != 0 ||
+        write_input_event(fd, EV_SYN, SYN_REPORT, 0) != 0) {
+        return -1;
+    }
+    selftest->cycles_remaining--;
+    if (selftest->cycles_remaining == 0) {
+        fprintf(stderr, "rustos-dvm-agent: input selftest emitted %u cycles\n",
+                INPUT_SELFTEST_CYCLES);
+        fflush(stderr);
+    }
+    return 0;
 }
 
 static void copy_value(char *destination, size_t destination_size, const char *value) {
@@ -143,7 +275,8 @@ static void parse_contract(struct control_contract *contract) {
         strcmp(contract->protocol, "agent-v1") != 0 ||
         strcmp(contract->state, "control") != 0 || strcmp(contract->transport, "kvm-vsock") != 0 ||
         strcmp(contract->authentication, "kvm-host-bound") != 0 ||
-        strcmp(contract->capabilities, "health,device-inventory,input-stream") != 0) {
+        strcmp(contract->capabilities,
+               "health,device-inventory,driver-inventory,input-stream") != 0) {
         die("unsupported control contract");
     }
 }
@@ -255,6 +388,34 @@ static unsigned int pci_inventory_count(void) {
     return count;
 }
 
+/* A virtio driver's sysfs directory contains only its bind controls plus
+ * symlinks named virtio<N> for devices currently bound to that driver. The
+ * caller supplies fixed in-tree driver names; no host-provided path enters
+ * this probe. */
+static int virtio_driver_is_bound(const char *driver) {
+    char path[PATH_MAX];
+    DIR *directory;
+    struct dirent *entry;
+
+    if (driver == NULL || snprintf(path, sizeof(path), "/sys/bus/virtio/drivers/%s", driver) >=
+                              (int)sizeof(path)) {
+        return 0;
+    }
+    directory = opendir(path);
+    if (directory == NULL) {
+        return 0;
+    }
+    while ((entry = readdir(directory)) != NULL) {
+        const char *name = entry->d_name;
+        if (strncmp(name, "virtio", 6) == 0 && name[6] != '\0') {
+            closedir(directory);
+            return 1;
+        }
+    }
+    closedir(directory);
+    return 0;
+}
+
 static int request_id(const char *payload, const char *operation, unsigned int *id) {
     const char *id_line;
     const char *op_line;
@@ -302,24 +463,50 @@ static int input_device_matches(int fd, enum input_device_kind kind) {
            input_has_capability(fd, EV_KEY, BTN_LEFT);
 }
 
+static int input_device_name_matches(int fd, const char *expected) {
+    char name[256];
+
+    if (ioctl(fd, EVIOCGNAME(sizeof(name)), name) < 0) {
+        return 0;
+    }
+    name[sizeof(name) - 1U] = '\0';
+    return strcmp(name, expected) == 0;
+}
+
+static int open_input_device_index(unsigned int index) {
+    char path[PATH_MAX];
+
+    if (index >= INPUT_EVENT_LIMIT ||
+        snprintf(path, sizeof(path), "/dev/input/event%u", index) >= (int)sizeof(path)) {
+        errno = EINVAL;
+        return -1;
+    }
+    return open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+}
+
 static int open_input_device(enum input_device_kind kind, int excluded_index, int *index_out) {
+    int prefer_selftest = cmdline_has_option(INPUT_SELFTEST_CMDLINE);
+    unsigned int pass_count = prefer_selftest ? 2U : 1U;
+    unsigned int pass;
     unsigned int index;
-    for (index = 0; index < INPUT_EVENT_LIMIT; index++) {
-        char path[PATH_MAX];
-        int fd;
-        if ((int)index == excluded_index ||
-            snprintf(path, sizeof(path), "/dev/input/event%u", index) >= (int)sizeof(path)) {
-            continue;
+    for (pass = 0; pass < pass_count; pass++) {
+        for (index = 0; index < INPUT_EVENT_LIMIT; index++) {
+            int fd;
+            if ((int)index == excluded_index) {
+                continue;
+            }
+            fd = open_input_device_index(index);
+            if (fd < 0) {
+                continue;
+            }
+            if (input_device_matches(fd, kind) &&
+                (!prefer_selftest || pass != 0 ||
+                 input_device_name_matches(fd, INPUT_SELFTEST_NAME))) {
+                *index_out = (int)index;
+                return fd;
+            }
+            close(fd);
         }
-        fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-        if (fd < 0) {
-            continue;
-        }
-        if (input_device_matches(fd, kind)) {
-            *index_out = (int)index;
-            return fd;
-        }
-        close(fd);
     }
     errno = ENODEV;
     return -1;
@@ -441,7 +628,7 @@ static int consume_pointer_event(int fd, unsigned int request_id, struct pointer
 }
 
 static int stream_input_devices(int control_fd, int keyboard_fd, int pointer_fd,
-                                unsigned int request_id) {
+                                unsigned int request_id, struct input_selftest *selftest) {
     struct pollfd pollfds[2];
     struct pointer_state pointer = {0};
     if (keyboard_fd < 0 || pointer_fd < 0) {
@@ -457,7 +644,14 @@ static int stream_input_devices(int control_fd, int keyboard_fd, int pointer_fd,
         unsigned int index;
         pollfds[0].revents = 0;
         pollfds[1].revents = 0;
-        ready = poll(pollfds, 2, -1);
+        ready = poll(pollfds, 2,
+                     selftest->armed && selftest->cycles_remaining > 0 ? INPUT_SELFTEST_POLL_MS : -1);
+        if (ready == 0) {
+            if (input_selftest_emit_cycle(selftest) != 0) {
+                return -1;
+            }
+            continue;
+        }
         if (ready <= 0) {
             if (ready < 0 && errno == EINTR) {
                 continue;
@@ -496,7 +690,8 @@ static int stream_input_devices(int control_fd, int keyboard_fd, int pointer_fd,
     }
 }
 
-static int serve_connection(int fd, const struct control_contract *contract) {
+static int serve_connection(int fd, const struct control_contract *contract,
+                            struct input_selftest *selftest) {
     char payload[MAX_FRAME + 1];
     char hello[MAX_FRAME + 1];
     char welcome[192];
@@ -524,14 +719,31 @@ static int serve_connection(int fd, const struct control_contract *contract) {
             inventory = pci_inventory_count();
             snprintf(payload, sizeof(payload),
                      "RESPONSE\nid=%u\nop=device-inventory\nstatus=ok\ncount=%u", id, inventory);
+        } else if (request_id(payload, "driver-inventory", &id) == 0) {
+            const char *virtio_net = virtio_driver_is_bound("virtio_net") ? "bound" : "missing";
+            const char *virtio_gpu = virtio_driver_is_bound("virtio_gpu") ? "bound" : "missing";
+            snprintf(payload, sizeof(payload),
+                     "RESPONSE\nid=%u\nop=driver-inventory\nstatus=ok\nvirtio-net=%s\n"
+                     "virtio-gpu=%s",
+                     id, virtio_net, virtio_gpu);
         } else if (request_id(payload, "input-stream", &id) == 0) {
             int keyboard_index = -1;
             int keyboard_fd = open_input_device(INPUT_DEVICE_KEYBOARD, -1, &keyboard_index);
             int pointer_index = -1;
-            int pointer_fd = keyboard_fd < 0
-                                 ? -1
-                                 : open_input_device(INPUT_DEVICE_POINTER, keyboard_index,
-                                                     &pointer_index);
+            int pointer_fd = -1;
+            if (keyboard_fd >= 0 && input_device_matches(keyboard_fd, INPUT_DEVICE_POINTER)) {
+                /* A composite HID can expose keyboard and relative-pointer
+                 * capabilities through one evdev node. Reopen it instead of
+                 * dup(2): each evdev open needs its own event queue so the
+                 * keyboard and pointer consumers cannot steal each other's
+                 * records. */
+                pointer_fd = open_input_device_index((unsigned int)keyboard_index);
+                if (pointer_fd >= 0) {
+                    pointer_index = keyboard_index;
+                }
+            } else if (keyboard_fd >= 0) {
+                pointer_fd = open_input_device(INPUT_DEVICE_POINTER, keyboard_index, &pointer_index);
+            }
             if (keyboard_fd < 0 || pointer_fd < 0) {
                 if (keyboard_fd >= 0) {
                     close(keyboard_fd);
@@ -552,7 +764,23 @@ static int serve_connection(int fd, const struct control_contract *contract) {
                     close(pointer_fd);
                     return -1;
                 }
-                if (stream_input_devices(fd, keyboard_fd, pointer_fd, id) != 0) {
+                if (selftest->enabled) {
+                    selftest->armed = 1;
+                    selftest->cycles_remaining = INPUT_SELFTEST_CYCLES;
+                    /* Both evdev file descriptions are open now. Queue the
+                     * first cycle before entering poll(2), so readiness does
+                     * not depend on a timeout winning over unrelated input
+                     * wakeups during concurrent guest startup. Subsequent
+                     * cycles remain rate-limited by the normal poll loop. */
+                    if (input_selftest_emit_cycle(selftest) != 0) {
+                        close(keyboard_fd);
+                        close(pointer_fd);
+                        return -1;
+                    }
+                    fprintf(stderr, "rustos-dvm-agent: input selftest stream armed\n");
+                    fflush(stderr);
+                }
+                if (stream_input_devices(fd, keyboard_fd, pointer_fd, id, selftest) != 0) {
                     close(keyboard_fd);
                     close(pointer_fd);
                     return -1;
@@ -589,6 +817,11 @@ static int connect_host(void) {
 }
 
 static void serve(const struct control_contract *contract) {
+    struct input_selftest selftest;
+
+    if (input_selftest_start(&selftest) != 0) {
+        die("input selftest requested but uinput setup failed");
+    }
     announce(contract);
     fprintf(stderr, "rustos-dvm-agent: ready protocol=%s state=%s\n", contract->protocol,
             contract->state);
@@ -596,13 +829,14 @@ static void serve(const struct control_contract *contract) {
     for (;;) {
         int fd = connect_host();
         if (fd >= 0) {
-            if (serve_connection(fd, contract) != 0) {
+            if (serve_connection(fd, contract, &selftest) != 0) {
                 fprintf(stderr, "rustos-dvm-agent: host control disconnected\n");
             }
             close(fd);
         }
         sleep(1);
     }
+    input_selftest_destroy(&selftest);
 }
 
 int main(int argc, char **argv) {

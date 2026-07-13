@@ -1,7 +1,7 @@
 id = "psmouse"
 kind = "bridge-driver"
 execution_domain = "kernel"
-profiles = ["default"]
+profiles = ["legacy-input-compat"]
 
 [build]
 builder = "external-copy"
@@ -17,6 +17,8 @@ path = "system/drivers/input/psmouse.ko"
 name = "psmouse"
 class = "input"
 bus = "serio"
+# The default KVM path receives pointer events through Linux DVM inputd.
+# Keep PS/2 probing as an explicit physical-input compatibility fallback.
 priority = 900
 when = "vfs-ready"
 aliases = ["serio:ty05pr*id*ex*", "serio:ty01pr*id*ex*"]

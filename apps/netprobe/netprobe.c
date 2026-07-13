@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -12,7 +13,11 @@ static void log_line(const char *message) {
 }
 
 int main(void) {
-    log_line("netprobe: start");
+    const char *qemu_mode = getenv("RUSTOS_NETPROBE_QEMU");
+    int qemu_gateway = qemu_mode != NULL && strcmp(qemu_mode, "1") == 0;
+    const char *target = qemu_gateway ? "10.0.2.2" : "142.250.72.14";
+    unsigned short port = qemu_gateway ? 9 : 80;
+    log_line(qemu_gateway ? "netprobe: start target=qemu-gateway" : "netprobe: start");
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -24,18 +29,28 @@ int main(void) {
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(80);
-    if (inet_pton(AF_INET, "142.250.72.14", &addr.sin_addr) != 1) {
+    addr.sin_port = htons(port);
+    if (inet_pton(AF_INET, target, &addr.sin_addr) != 1) {
         log_line("netprobe: inet_pton failed");
         close(fd);
         return 1;
     }
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        if (qemu_gateway && errno == ECONNREFUSED) {
+            log_line("netprobe: qemu gateway reachable");
+            close(fd);
+            return 0;
+        }
         printf("netprobe: connect failed errno=%d\r\n", errno);
         fflush(stdout);
         close(fd);
         return 1;
+    }
+    if (qemu_gateway) {
+        log_line("netprobe: qemu gateway reachable");
+        close(fd);
+        return 0;
     }
     log_line("netprobe: connect ok");
 

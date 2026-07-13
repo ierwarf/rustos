@@ -38,12 +38,13 @@ or launch policy.
 - Retired display preferred-scanout policy flags/width/height are rejected by
   the ring0 module-load broker; driverd/provider state owns scanout selection.
 - Driver `class` registry values: `display`, `input`, `network`, `usb`, `storage`. `usb` is reserved for explicit USB compat/dev bridge modules; native xHCI is the RustOS host-controller path and is not staged as a Linux `.ko`.
-- `display-primary` group: real hardware/virtio providers ordered ahead of firmware framebuffer fallbacks. `bootfb` is last-resort, **never** default primary for KVM or hardware GPUs.
-- When `driverd` selects the exact `bootfb` fallback request, ring0 may
-  materialize the already-owned boot framebuffer directly instead of executing
-  the `bootfb.ko` module. This does not bypass provider ordering; `driverd`
-  must still make the fallback selection through registry/provider_group policy.
-- `driverd` owns autoload policy. Kernel driver brokers may expose narrow hardware-presence primitives for staged aliases (`platform:bootfb`, `pci:*`, `virtio:*`) but **must not** pick provider order or bypass registry `provider_group` policy.
+- `display-primary` group: real hardware/DVM providers are ordered ahead of the
+  kernel-owned firmware framebuffer fallback. The fallback is registered during
+  GUI bootstrap, never staged as a `.ko`, and is replaced only by a validated
+  primary provider.
+- `driverd` owns autoload policy. Kernel driver brokers may expose narrow
+  hardware-presence primitives for staged aliases (`pci:*`, `virtio:*`) but
+  **must not** pick provider order or bypass registry `provider_group` policy.
 
 ## Stage Outputs
 
@@ -155,6 +156,12 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
 - `cargo xtask build-dvm` invokes `driver-domains/linux/Makefile`; `verify-dvm`
   validates the manifest schema plus kernel, rootfs, config, source-lock, and
   immutable DVM control-contract SHA-256 values before a KVM guest starts.
+- The DVM wrapper fingerprints Buildroot configuration, each local relay
+  (`rustos-dvm-agent`, `rustos-dvm-display`, `rustos-dvm-net`), and the rootfs
+  overlay separately. Configuration or toolchain changes use `distclean`; a
+  relay edit removes only that relay's Buildroot directory, while overlay-only
+  changes regenerate only the CPIO image. `make -C driver-domains/linux
+  rebuild-{agent,display,net}` are explicit package-only rebuild entrypoints.
 - The DVM wrapper requires host `libelf` headers and an unversioned linker
   library. `RUSTOS_DVM_LIBELF_SYSROOT` may name an immutable extracted
   `libelf-dev` package for non-root CI; the wrapper validates and hashes those
@@ -166,7 +173,7 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   logs under `build/kvm/`.
 - A successful smoke requires RustOS's default `rootd` readiness marker and
   the L0 host broker to complete the DVM
-  `health,device-inventory,input-stream` handshake using launch-assigned KVM
+  `health,device-inventory,driver-inventory,input-stream` handshake using launch-assigned KVM
   vsock CID `4`. L0 then opens RustOS's dedicated QEMU COM2 socket and writes
   only fixed RDI2 session/key/pointer frames; QMP is not launched. The DVM
   discovers one keyboard and one relative pointer by evdev capabilities, not
@@ -174,12 +181,50 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   smoke proves endpoint setup only: it does not fabricate an input event. A
   live event needs a real input source assigned to the DVM, after which L0
   range-checks each key/pointer field and RustOS feeds it to ring-3 `inputd`.
+- `cargo xtask kvm-smoke --exercise-input` is a separate bounded integration
+  mode. It passes only the DVM boot flag `rustos.dvm.input-selftest=1`; the
+  agent creates a local `uinput` evdev device and reconsumes it through the
+  same relay before RustOS requires the one-shot `inputd` keyboard and pointer
+  ingress markers. No QMP socket, host-to-DVM input RPC, or production default
+  path is added.
 - `agent-v1-control` remains DVM-to-L0 only. The RDI2 COM2 channel is a
   bounded input relay, not a general vsock endpoint or a NIC/block/GPU data
   plane. L0 limits event rate, emits held-key/button releases on disconnect,
   and sends a session end so reconnects cannot inherit input state. Additional
   `--expect` markers tighten RustOS proof; none prove a
   `.ko`, PCI assignment, physical input capture, or a network route.
+- `cargo xtask kvm-smoke --min-ui-fps N` modifies only the runner's fresh
+  private FAT disk copy: the staged `uiserver.desktop` carries the
+  equal-length disabled anchor `RUSTOS_UI_PROFILE=0`, which is changed to `1`
+  without changing its extent length. `uiserver` emits one-second profile
+  windows with integer `frame_hz_milli`; the runner requires `N * 1000`.
+  Release images retain the disabled value.
+- `cargo xtask kvm-smoke --dvm-display-shmem` replaces RustOS's direct test
+  GPU with a private host-created `ivshmem-plain` aperture. RustOS maps only a
+  fixed validated header and publishes it as a primary framebuffer; the
+  separate Linux `rustos-dvm-display` service reads that aperture and uses its
+  own DRM/KMS double-buffered page flips. The gate requires RustOS's observed
+  display ABI to match the exact header and the DVM's active DRM relay marker.
+  This KVM topology proves the display transport; it is not PCI passthrough or
+  a physical-GPU assignment contract.
+- The default KVM image does not stage any `system/drivers/*.ko` artifact; the
+  manifest loader rejects one before image construction. RustOS virtio-GPU and
+  virtio-net `.ko` paths are removed; physical input artifacts require
+  `legacy-input-compat`. The kernel registers the bounded early-boot firmware
+  framebuffer directly until the DVM display provider is available.
+- `cargo xtask kvm-smoke --dvm-network-shmem` adds a host-created fixed 64-slot
+  Ethernet aperture. RustOS may map only the validated header and fixed slots;
+  it never follows DVM descriptors or allocations. Linux's `rustos-dvm-net`
+  relay owns the DVM virtio-net NIC, while RustOS `netd` keeps socket namespace,
+  TCP, and route policy. `--exercise-network` uses the private KVM copy of
+  `netprobe` against the QEMU gateway and requires both ring directions to
+  advance within their 64-slot invariants. This proves the KVM data transport,
+  not physical NIC passthrough, reset, DMA, or revocation policy.
+- The DVM `S48rustos-dvm-net` init service owns the display and network relay
+  PIDs. Start is idempotent; stop releases the display relay first, waits at
+  most 20 seconds for each process, then escalates only that recorded PID.
+  Each relay may retry a transient device-readiness error internally, but a
+  restart must never leave a second framebuffer consumer or Ethernet producer.
 - `rustos-hostd discover` and `rustos-hostd preflight --plan ...` are L0
   read-only ownership gates. `launch-plan-v1.env` must explicitly enumerate
   every function in one actual IOMMU group and reject host-protected BDFs;
@@ -235,16 +280,20 @@ Add new points only at realistic failure boundaries: allocation, block IO, devic
 ## Linux Network & Driver Compat
 
 - `netd` owns socket namespace/policy; `driverd` owns autoload/provider policy. `kernel/io-manager/src/driver/mod.rs` is limited to privileged DMA/IRQ/IOMMU + explicit module-load substrate.
-- Kernel broker validates `.ko` images, relocates them, exposes `DriverKernelApiV1`, maps MMIO, executes module init. **Do not move `.ko` execution to ring3.**
+- The legacy-only kernel broker validates `.ko` images, relocates them, exposes
+  `DriverKernelApiV1`, maps MMIO, and executes module init. The default image
+  cannot stage a bridge-driver `.ko`; new device support belongs in a bounded
+  driver domain rather than this compatibility path.
 - Deleted io-manager policy files are not source of truth — do not restore.
 - Linux compat symbols must be explicitly implemented; no broad no-op fallbacks.
 - Vendor NVMe host `.ko` packages stay out of the default profile until block-layer/auth/io_uring compat is explicit; native RustOS NVMe remains the default boot/storage provider.
-- Virtio-gpu is a display `.ko` path (`drivers/bridges/display/vendor/virtio-gpu`);
-  do not reintroduce native `kernel/io-manager/src/driver/virtio_gpu.rs` or
-  count it as a ring3 service-driver migration target.
-- Vendor virtio-net `.ko` stays out of the default KVM profile until post-init
-  worker/IRQ behavior and the RustOS↔DVM network route are explicit; `netd`
-  remains the default network policy owner.
+- RustOS virtio-GPU `.ko` artifacts and their in-kernel scanout/DRM shim are
+  removed. Default KVM uses the isolated Linux DVM DRM/KMS relay; do not
+  reintroduce either path or count it as a ring3 service-driver migration
+  target.
+- RustOS's virtio-net `.ko` shim is removed. The KVM DVM route is a fixed
+  Ethernet-frame transport and `netd` remains the default network policy
+  owner; it does not authorize physical NIC passthrough.
 - Vendor HID core `.ko` stays out of the default profile while USB HID leaf modules are disabled; native RustOS input remains the default boot input provider.
 - Hardware-specific display drivers such as AMDGPU stay out of the default KVM
   profile unless the assigned hardware matches; use an explicit hardware

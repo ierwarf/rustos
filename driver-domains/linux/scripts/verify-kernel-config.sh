@@ -26,4 +26,8 @@ require_enabled CONFIG_VIRTIO_NET
 require_enabled CONFIG_VIRTIO_BLK
 require_enabled CONFIG_VIRTIO_CONSOLE
 require_enabled CONFIG_VIRTIO_INPUT
+require_enabled CONFIG_INPUT_UINPUT
+require_enabled CONFIG_DRM
+require_enabled CONFIG_DRM_VIRTIO_GPU
+require_enabled CONFIG_DRM_FBDEV_EMULATION
 require_enabled CONFIG_VIRTIO_VSOCKETS

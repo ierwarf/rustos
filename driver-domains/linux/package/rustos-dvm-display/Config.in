@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: MIT
+
+config BR2_PACKAGE_RUSTOS_DVM_DISPLAY
+
+	bool "rustos-dvm-display"
+	select BR2_PACKAGE_LIBDRM
+	help
+	  Unprivileged-in-protocol display consumer for the RustOS Linux driver
+	  domain. It maps only the fixed ivshmem framebuffer contract and uses the
+	  DVM-owned DRM/KMS device for double-buffered scanout.

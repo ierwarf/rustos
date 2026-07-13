@@ -166,6 +166,17 @@ pub mod boot {
         crate::io::gui::init(boot_info_ptr);
     }
 
+    /// The boot framebuffer is allocation-free, while a DVM shared aperture
+    /// needs tracked MMIO mapping state. Call only after the kernel heap is
+    /// available.
+    pub fn init_dvm_display_provider() -> bool {
+        crate::io::dvm_display::try_install()
+    }
+
+    pub fn init_dvm_network_provider() -> bool {
+        crate::io::dvm_network::try_install()
+    }
+
     pub fn boot_volume_transport_hint() -> Option<BootVolumeTransport> {
         crate::storage::boot_volume::boot_volume_transport_hint()
     }

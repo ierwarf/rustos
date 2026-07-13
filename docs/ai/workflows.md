@@ -24,7 +24,8 @@ Before any workflow: read `token-policy.md`, then `task-router.md`.
 ## Add bridge driver
 
 1. Read `docs/guides/add-driver.md`.
-2. Inspect `drivers/bridges/display/bootfb/RUSTOS.package.toml`.
+2. Inspect a matching existing manifest, for example
+   `drivers/bridges/storage/vendor/nvme/RUSTOS.package.toml`.
 3. Add source under `drivers/bridges/<class>/<name>`.
 4. Add manifest with `kind = "bridge-driver"`.
 5. Add `[autoload]` only if policy-loaded.
@@ -73,14 +74,12 @@ Before any workflow: read `token-policy.md`, then `task-router.md`.
 3. Check `kernel/nucleus-core/src/multiboot2_entry.S` for the Multiboot2
    framebuffer request tag.
 4. Confirm the kernel log prints a nonzero `boot framebuffer addr`.
-5. Confirm `platform:bootfb` can match from
-   `storage::boot_volume::boot_framebuffer_info()`, not from an
-   already-installed GUI backend.
-6. Confirm `display-primary` fallback decisions use active provider-group
-   state and skip fallback alias probes after a primary provider is loaded.
-7. For KVM virtual GPU profiles, prefer the Linux `.ko` display path. If
-   `virtio-gpu native: display registered` appears, the removed native fallback
-   has regressed back into the kernel.
+5. Confirm GUI bootstrap registers the validated firmware framebuffer before
+   any optional provider; it must not be packaged as a loadable driver.
+6. Confirm `display-primary` provider decisions use active provider-group
+   state and do not replace an active DVM/hardware provider with a fallback.
+7. For KVM virtual GPU profiles, require the Linux DVM DRM/KMS relay. A legacy
+   `.ko` display record in a default KVM log is a regression.
 
 ## Reduce context mid-task
 

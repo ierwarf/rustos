@@ -302,7 +302,26 @@ pub(crate) fn load_profile_manifests(
 }
 
 pub(crate) fn load_default_manifests(root_dir: &Path) -> Result<Vec<PackageManifest>> {
-    load_profile_manifests(root_dir, DEFAULT_PROFILE)
+    let manifests = load_profile_manifests(root_dir, DEFAULT_PROFILE)?;
+    reject_default_driver_modules(&manifests)?;
+    Ok(manifests)
+}
+
+/// The shipping KVM profile delegates device drivers to the isolated Linux
+/// domain. A bridge-driver `.ko` in this profile silently recreates an in-kernel
+/// compatibility path, so reject it before any image artifacts are built.
+fn reject_default_driver_modules(manifests: &[PackageManifest]) -> Result<()> {
+    if let Some(manifest) = manifests.iter().find(|manifest| {
+        manifest.kind.is_driver()
+            && manifest.install.path.starts_with("system/drivers/")
+            && manifest.install.path.ends_with(".ko")
+    }) {
+        bail!(
+            "default profile must not stage bridge-driver .ko artifacts; move {} to an explicit legacy profile",
+            manifest.id
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn required_manifest<'a>(
@@ -770,6 +789,33 @@ mod tests {
         assert!(!is_normal_relative_install_path(
             "./services/initd/initd.elf"
         ));
+    }
+
+    #[test]
+    fn default_profile_rejects_bridge_driver_modules() {
+        let mut bridge = manifest("legacy-input", &["default"], &[]);
+        bridge.kind = PackageKind::BridgeDriver;
+        bridge.execution_domain = Some(ExecutionDomain::Kernel);
+        bridge.install.path = "system/drivers/input/legacy-input.ko".to_string();
+
+        let err = reject_default_driver_modules(&[bridge])
+            .expect_err("default profile must not regain an in-kernel .ko path");
+        assert!(err.to_string().contains("legacy-input"));
+    }
+
+    #[test]
+    fn explicit_legacy_profile_allows_bridge_driver_modules() {
+        let mut bridge = manifest("legacy-input", &["legacy-input-compat"], &[]);
+        bridge.kind = PackageKind::BridgeDriver;
+        bridge.execution_domain = Some(ExecutionDomain::Kernel);
+        bridge.install.path = "system/drivers/input/legacy-input.ko".to_string();
+
+        let default_manifests = [bridge]
+            .into_iter()
+            .filter(|manifest| manifest.profile_enabled(DEFAULT_PROFILE))
+            .collect::<Vec<_>>();
+        reject_default_driver_modules(&default_manifests)
+            .expect("only default profile is restricted");
     }
 
     #[test]

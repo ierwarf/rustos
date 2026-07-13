@@ -15,10 +15,10 @@ use crate::sys::{
     publish_input_pointer_surface,
 };
 const SURFACE_CREATE_RETRIES: usize = 4;
-// Retry budget for waiting on the primary display provider (e.g. virtio-gpu).
-// The earliest snapshot uiserver sees may still be the platform bootfb fallback
-// while `driverd` is still bringing virtio-gpu online. Polling for up to ~5s
-// at 50ms intervals covers boot-time ordering races without hanging forever.
+// Retry budget for waiting on a primary display provider (for example the DVM
+// display aperture). The earliest snapshot may still be the kernel firmware
+// framebuffer while the provider is being published. Polling for up to ~5s at
+// 50ms intervals covers boot-time ordering races without hanging forever.
 const PRIMARY_DISPLAY_WAIT_ATTEMPTS: usize = 100;
 const PRIMARY_DISPLAY_WAIT_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
@@ -145,9 +145,9 @@ fn validate_surface_metadata(
 fn fetch_surface_state(display_fd: i32) -> Result<DisplaySurfaceState, i32> {
     // Wait for the primary display provider to register before we attempt
     // surface creation. This guards against the boot-time race where
-    // `runtimed` spawns uiserver before `driverd` finishes loading the
-    // virtio-gpu module, leaving us with only the bootfb fallback for which
-    // surface creation is unsupported.
+    // `runtimed` can spawn uiserver before the DVM/hardware display provider
+    // is published, leaving only the firmware fallback for which surface
+    // creation is unsupported.
     let mut wait_attempts = 0usize;
     for attempt in 0..SURFACE_CREATE_RETRIES {
         // Re-fetch display info each surface attempt: after a generation

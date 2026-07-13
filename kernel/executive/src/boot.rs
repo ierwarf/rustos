@@ -232,6 +232,19 @@ pub fn initialize_kernel(boot_info_ptr: *const BootInfo) {
     hal_api::init_acpi(boot_info_ptr);
     announce_ready("ACPI", b"ACPI initialized.\r\n");
 
+    // ivshmem is a PCI function. The DVM providers must be probed only after
+    // ACPI has published the PCI bus regions; probing earlier silently sees no
+    // device and can make a firmware framebuffer look like a live DVM path.
+    let _ = io_services::init_dvm_display_provider();
+    if io_services::init_dvm_network_provider() {
+        boot_log!(
+            debug::LogLevel::Info,
+            106,
+            0,
+            "DVM shared network transport initialized"
+        );
+    }
+
     hal_api::init_pic();
     announce_ready("PIC", b"PIC initialized.\r\n");
 

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -8,7 +9,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
+use fatfs::Seek as FatSeek;
+use fatfs::Write as FatWrite;
 use fs_err as fs;
+use driver_domain_protocol::{
+    DVM_DISPLAY_HEADER_BYTES, DVM_DISPLAY_INITIAL_GENERATION, DVM_NET_APERTURE_BYTES,
+    DvmDisplayHeader, DvmNetHeader,
+};
 use rustos_driver_domain_host::{
     ControlContract as HostControlContract, DEFAULT_CONTROL_PORT, HostControlListener, ProbeResult,
     UnixInputSink,
@@ -28,8 +35,31 @@ const DVM_CONTROL_PROTOCOL: &str = "agent-v1";
 const DVM_CONTROL_STATE: &str = "control";
 const DVM_CONTROL_TRANSPORT: &str = "kvm-vsock";
 const DVM_CONTROL_AUTHENTICATION: &str = "kvm-host-bound";
-const DVM_CONTROL_CAPABILITIES: &str = "health,device-inventory,input-stream";
+const DVM_CONTROL_CAPABILITIES: &str =
+    "health,device-inventory,driver-inventory,input-stream";
 const RUSTOS_BOOT_MARKER: &str = "rootd: core services ready, spawning initd via loaderd";
+const DVM_KEYBOARD_INGRESS_MARKER: &str = "inputd: DVM keyboard ingress observed";
+const DVM_POINTER_INGRESS_MARKER: &str = "inputd: DVM pointer ingress observed";
+const DVM_DISPLAY_WIDTH: u32 = 1600;
+const DVM_DISPLAY_HEIGHT: u32 = 900;
+const DVM_DISPLAY_REGION_BYTES: u64 = 8 * 1024 * 1024;
+const DVM_NET_REGION_BYTES: u64 = DVM_NET_APERTURE_BYTES;
+// `sessiond` reads the desktop registry during its early bootstrap, while
+// `runtimed` reads the launch registry later. Both must agree for a private
+// KVM-only profiling override to reach the uiserver process.
+const UISERVER_PROFILE_REGISTRY_PATHS: &[&str] = &[
+    "system/registry/system/desktop-programs.tsv",
+    "system/registry/system/runtime-launch-programs.tsv",
+];
+const UISERVER_PROFILE_DISABLED: &str = "RUSTOS_UI_PROFILE=0";
+const UISERVER_PROFILE_ENABLED: &str = "RUSTOS_UI_PROFILE=1";
+const NETPROBE_REGISTRY_PATHS: &[&str] = &[
+    "system/registry/system/desktop-programs.tsv",
+    "system/registry/system/runtime-launch-programs.tsv",
+];
+const NETPROBE_QEMU_DISABLED: &str = "RUSTOS_NETPROBE_QEMU=0";
+const NETPROBE_QEMU_ENABLED: &str = "RUSTOS_NETPROBE_QEMU=1";
+const NETPROBE_QEMU_REACHABLE_MARKER: &str = "netprobe: qemu gateway reachable";
 const DVM_GUEST_CID: u32 = 4;
 const VHOST_VSOCK_DEVICE: &str = "/dev/vhost-vsock";
 const MAX_SMOKE_TIMEOUT: u64 = 30;
@@ -66,11 +96,18 @@ struct KvmLayout {
     rustos_stderr_log: PathBuf,
     dvm_stderr_log: PathBuf,
     rustos_input_socket: PathBuf,
+    dvm_display_shmem: Option<PathBuf>,
+    dvm_network_shmem: Option<PathBuf>,
 }
 
 #[derive(Debug)]
 struct SmokeOptions {
     dry_run: bool,
+    exercise_input: bool,
+    exercise_network: bool,
+    dvm_display_shmem: bool,
+    dvm_network_shmem: bool,
+    min_ui_fps: Option<u32>,
     timeout: Duration,
     expected_markers: Vec<String>,
 }
@@ -115,7 +152,7 @@ where
     let options = parse_smoke_options(args.into_iter())?;
     let artifacts = verify_dvm_artifacts(config)?;
     let qemu = require_qemu(config)?;
-    let layout = prepare_layout(config)?;
+    let layout = prepare_layout(config, &options)?;
 
     if options.dry_run {
         println!(
@@ -129,7 +166,7 @@ where
     let deadline = Instant::now() + options.timeout;
     let control_relay =
         start_dvm_input_relay(config, options.timeout, layout.rustos_input_socket.clone())?;
-    let (mut rustos, mut dvm) = spawn_guests(&qemu, config, &artifacts, &layout)?;
+    let (mut rustos, mut dvm) = spawn_guests(&qemu, config, &artifacts, &layout, &options)?;
     let result: Result<ProbeResult> = (|| {
         let probe = wait_for_parallel_boot(
             &mut rustos,
@@ -144,11 +181,23 @@ where
     stop_guest(&mut rustos);
     stop_guest(&mut dvm);
     let probe = result?;
+    if let Some(shared_display) = layout.dvm_display_shmem.as_deref() {
+        verify_dvm_display_surface(shared_display)?;
+    }
+    if options.exercise_network {
+        let shared_network = layout
+            .dvm_network_shmem
+            .as_deref()
+            .context("network exercise lost its shared DVM network aperture")?;
+        verify_dvm_network_round_trip(shared_network)?;
+    }
     println!(
-        "xtask: parallel KVM boot passed (RustOS + Linux DVM); control={} established authenticated L0 input relay (DVM cid={}, inventory={}) without QMP",
+        "xtask: parallel KVM boot passed (RustOS + Linux DVM); control={} established authenticated L0 input relay (DVM cid={}, inventory={}, virtio-net={}, virtio-gpu={}) without QMP",
         artifacts.control.control_plane(),
         probe.peer_cid,
         probe.inventory_count,
+        if probe.driver_inventory.virtio_net_bound { "bound" } else { "missing" },
+        if probe.driver_inventory.virtio_gpu_bound { "bound" } else { "missing" },
     );
     Ok(())
 }
@@ -165,13 +214,25 @@ framed virtual input transport. It does not synthesize QMP input.
 options:
   --timeout <seconds>  wait for readiness markers (1..={MAX_SMOKE_TIMEOUT}, default 30)
   --expect <marker>    require an additional RustOS debugcon marker (repeatable)
+  --exercise-input     run the DVM's bounded evdev loopback self-test and require
+                       RustOS inputd keyboard and pointer ingress markers
+  --exercise-network   run netprobe through netd and the DVM Ethernet ring
+  --min-ui-fps <fps>   enable the private KVM-only UI profiler and require a
+                       profile window at or above the requested integer FPS
+  --dvm-display-shmem  replace RustOS's native virtio-gpu test device with a
+                       host-initialized ivshmem framebuffer owned by the DVM path
+  --dvm-network-shmem  attach the bounded RustOS↔DVM Ethernet ring; RustOS keeps
+                       no native virtio-net device in this topology
   --dry-run            validate inputs and prepare KVM log paths without launching QEMU
   -h, --help           show this help
 
 The default proof requires RustOS to reach init handoff and the L0-style host
 broker to complete an authenticated Linux-DVM health/inventory/input-stream
 handshake. A real key requires a physical input source assigned to the DVM;
-this smoke command does not fabricate one.
+the default smoke command does not fabricate one. `--exercise-input` is an
+explicit KVM-only self-test: its Linux agent writes a bounded uinput device,
+then consumes it through its ordinary evdev relay. It never opens QMP or a
+host-to-DVM input injection endpoint.
 "
     );
 }
@@ -182,6 +243,11 @@ where
 {
     let mut options = SmokeOptions {
         dry_run: false,
+        exercise_input: false,
+        exercise_network: false,
+        dvm_display_shmem: false,
+        dvm_network_shmem: false,
+        min_ui_fps: None,
         timeout: Duration::from_secs(MAX_SMOKE_TIMEOUT),
         expected_markers: vec![RUSTOS_BOOT_MARKER.to_owned()],
     };
@@ -189,6 +255,20 @@ where
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--dry-run" => options.dry_run = true,
+            "--exercise-input" => options.exercise_input = true,
+            "--exercise-network" => options.exercise_network = true,
+            "--dvm-display-shmem" => options.dvm_display_shmem = true,
+            "--dvm-network-shmem" => options.dvm_network_shmem = true,
+            "--min-ui-fps" => {
+                let value = next_value(&mut args, "--min-ui-fps")?;
+                let fps = value
+                    .parse::<u32>()
+                    .with_context(|| format!("invalid --min-ui-fps value: {value}"))?;
+                if !(1..=240).contains(&fps) {
+                    bail!("--min-ui-fps must be in 1..=240, got {fps}");
+                }
+                options.min_ui_fps = Some(fps);
+            }
             "--timeout" => {
                 let value = next_value(&mut args, "--timeout")?;
                 let seconds = value
@@ -210,6 +290,17 @@ where
         }
     }
 
+    if options.exercise_input {
+        options
+            .expected_markers
+            .push(DVM_KEYBOARD_INGRESS_MARKER.to_owned());
+        options
+            .expected_markers
+            .push(DVM_POINTER_INGRESS_MARKER.to_owned());
+    }
+    if options.exercise_network && !options.dvm_network_shmem {
+        bail!("--exercise-network requires --dvm-network-shmem");
+    }
     Ok(options)
 }
 
@@ -457,7 +548,7 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(digest)
 }
 
-fn prepare_layout(config: &Config) -> Result<KvmLayout> {
+fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> {
     if !config.boot_disk_image.is_file() {
         bail!(
             "missing RustOS boot disk {}; run `cargo xtask build` first",
@@ -486,6 +577,26 @@ fn prepare_layout(config: &Config) -> Result<KvmLayout> {
             config.boot_disk_image.display()
         )
     })?;
+    if options.min_ui_fps.is_some() {
+        enable_private_ui_profile(&runtime_disk)?;
+    }
+    if options.exercise_network {
+        enable_private_network_exercise(&runtime_disk)?;
+    }
+    let dvm_display_shmem = if options.dvm_display_shmem {
+        let path = run_dir.join("dvm-display.ivshmem");
+        create_dvm_display_shmem(&path)?;
+        Some(path)
+    } else {
+        None
+    };
+    let dvm_network_shmem = if options.dvm_network_shmem {
+        let path = run_dir.join("dvm-network.ivshmem");
+        create_dvm_network_shmem(&path)?;
+        Some(path)
+    } else {
+        None
+    };
 
     let debugcon_log = run_dir.join("rustos-debugcon.log");
     let rustos_serial_log = run_dir.join("rustos-serial.log");
@@ -520,7 +631,231 @@ fn prepare_layout(config: &Config) -> Result<KvmLayout> {
         rustos_stderr_log,
         dvm_stderr_log,
         rustos_input_socket,
+        dvm_display_shmem,
+        dvm_network_shmem,
     })
+}
+
+fn create_dvm_network_shmem(path: &Path) -> Result<()> {
+    if path.to_string_lossy().contains(',') {
+        bail!("KVM shared-network path contains an unsupported QEMU option separator: {}", path.display());
+    }
+    let header = DvmNetHeader::new(DVM_NET_REGION_BYTES, 1);
+    if !header.is_valid() {
+        bail!("refusing to create invalid DVM shared-network header");
+    }
+    let mut file = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(path)?;
+    file.set_len(DVM_NET_REGION_BYTES)?;
+    file.write_all(&header.encode())?;
+    file.sync_all()?;
+    fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+/// Allocate the only shared display object used by the KVM smoke topology.
+///
+/// The runner owns the shape and initial contents before either guest starts.
+/// Guests receive the same plain ivshmem aperture, but RustOS accepts only the
+/// fixed header and never treats its contents as a command stream.
+fn create_dvm_display_shmem(path: &Path) -> Result<()> {
+    if path.to_string_lossy().contains(',') {
+        bail!(
+            "KVM shared-display path contains an unsupported QEMU option separator: {}",
+            path.display()
+        );
+    }
+    let header = DvmDisplayHeader::new(
+        DVM_DISPLAY_REGION_BYTES,
+        DVM_DISPLAY_WIDTH,
+        DVM_DISPLAY_HEIGHT,
+        DVM_DISPLAY_INITIAL_GENERATION,
+    );
+    if !header.is_valid() {
+        bail!("refusing to create invalid DVM shared-display header");
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("create DVM shared display {}", path.display()))?;
+    file.set_len(DVM_DISPLAY_REGION_BYTES)
+        .with_context(|| format!("size DVM shared display {}", path.display()))?;
+    file.write_all(&header.encode())
+        .with_context(|| format!("initialize DVM shared display {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("flush DVM shared display {}", path.display()))?;
+    fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).with_context(|| {
+        format!(
+            "restrict DVM shared display permissions {}",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// A successful shared-display smoke must show both the unchanged contract and
+/// an actual RustOS framebuffer write. This detects a host-only aperture that
+/// was mapped but never made it into the kernel display provider.
+fn verify_dvm_display_surface(path: &Path) -> Result<()> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("open DVM shared display {}", path.display()))?;
+    let mut encoded = [0_u8; DvmDisplayHeader::encoded_len()];
+    file.read_exact(&mut encoded)
+        .with_context(|| format!("read DVM shared display header {}", path.display()))?;
+    let header = DvmDisplayHeader::decode(&encoded)
+        .context("DVM shared display header changed or became invalid during smoke")?;
+    if header.region_bytes != DVM_DISPLAY_REGION_BYTES
+        || header.width != DVM_DISPLAY_WIDTH
+        || header.height != DVM_DISPLAY_HEIGHT
+    {
+        bail!(
+            "DVM shared display header differs from launch contract: region={} width={} height={}",
+            header.region_bytes,
+            header.width,
+            header.height
+        );
+    }
+    file.seek(SeekFrom::Start(u64::from(DVM_DISPLAY_HEADER_BYTES)))?;
+    let mut remaining = header.frame_bytes;
+    let mut block = [0_u8; 4096];
+    let mut wrote_pixels = false;
+    while remaining > 0 {
+        let bytes = usize::try_from(remaining.min(block.len() as u64))?;
+        file.read_exact(&mut block[..bytes])?;
+        if block[..bytes].iter().any(|byte| *byte != 0) {
+            wrote_pixels = true;
+            break;
+        }
+        remaining -= bytes as u64;
+    }
+    if !wrote_pixels {
+        bail!("DVM shared display provider published but RustOS wrote no framebuffer pixels");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DvmNetworkCounters {
+    tx_producer: u32,
+    tx_consumer: u32,
+    rx_producer: u32,
+    rx_consumer: u32,
+}
+
+impl DvmNetworkCounters {
+    fn is_valid(self, slots: u32) -> bool {
+        self.tx_producer.wrapping_sub(self.tx_consumer) <= slots
+            && self.rx_producer.wrapping_sub(self.rx_consumer) <= slots
+    }
+
+    fn round_trip_observed(self) -> bool {
+        self.tx_producer != 0
+            && self.tx_consumer != 0
+            && self.rx_producer != 0
+            && self.rx_consumer != 0
+    }
+}
+
+fn dvm_network_counters(path: &Path) -> Result<DvmNetworkCounters> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("open DVM shared network {}", path.display()))?;
+    let mut bytes = [0_u8; DvmNetHeader::encoded_len()];
+    file.read_exact(&mut bytes)
+        .with_context(|| format!("read DVM shared network header {}", path.display()))?;
+    let header = DvmNetHeader::decode(&bytes)
+        .context("DVM shared network header changed or became invalid during smoke")?;
+    let counters = DvmNetworkCounters {
+        tx_producer: u32::from_le_bytes(bytes[40..44].try_into().expect("fixed counter offset")),
+        tx_consumer: u32::from_le_bytes(bytes[44..48].try_into().expect("fixed counter offset")),
+        rx_producer: u32::from_le_bytes(bytes[48..52].try_into().expect("fixed counter offset")),
+        rx_consumer: u32::from_le_bytes(bytes[52..56].try_into().expect("fixed counter offset")),
+    };
+    if !counters.is_valid(header.slot_count) {
+        bail!(
+            "DVM shared network counters violate bounded-ring invariant: tx={}/{} rx={}/{} slots={}",
+            counters.tx_producer,
+            counters.tx_consumer,
+            counters.rx_producer,
+            counters.rx_consumer,
+            header.slot_count,
+        );
+    }
+    Ok(counters)
+}
+
+fn verify_dvm_network_round_trip(path: &Path) -> Result<()> {
+    let counters = dvm_network_counters(path)?;
+    if !counters.round_trip_observed() {
+        bail!(
+            "DVM network exercise did not show bidirectional ring consumption: tx={}/{} rx={}/{}",
+            counters.tx_producer,
+            counters.tx_consumer,
+            counters.rx_producer,
+            counters.rx_consumer,
+        );
+    }
+    Ok(())
+}
+
+fn enable_private_ui_profile(runtime_disk: &Path) -> Result<()> {
+    replace_private_registry_anchor(
+        runtime_disk,
+        UISERVER_PROFILE_REGISTRY_PATHS,
+        UISERVER_PROFILE_DISABLED,
+        UISERVER_PROFILE_ENABLED,
+        "UI profile",
+    )
+}
+
+fn enable_private_network_exercise(runtime_disk: &Path) -> Result<()> {
+    replace_private_registry_anchor(
+        runtime_disk,
+        NETPROBE_REGISTRY_PATHS,
+        NETPROBE_QEMU_DISABLED,
+        NETPROBE_QEMU_ENABLED,
+        "network exercise",
+    )
+}
+
+fn replace_private_registry_anchor(
+    runtime_disk: &Path,
+    paths: &[&str],
+    disabled: &str,
+    enabled: &str,
+    feature: &str,
+) -> Result<()> {
+    if disabled.len() != enabled.len() {
+        bail!("private KVM {feature} anchor changes length");
+    }
+    let disk = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(runtime_disk)
+        .with_context(|| format!("open private KVM disk {}", runtime_disk.display()))?;
+    let mut image = fatfs::StdIoWrapper::new(disk);
+    image.seek(fatfs::SeekFrom::Start(0))?;
+    let fs = fatfs::FileSystem::new(image, fatfs::FsOptions::new())?;
+    {
+        let root = fs.root_dir();
+        for path in paths {
+            let mut registry = root
+                .open_file(path)
+                .with_context(|| format!("open {path} for private KVM {feature}"))?;
+            let mut contents = String::new();
+            registry.read_to_string(&mut contents)?;
+            let updated = contents.replacen(disabled, enabled, 1);
+            if updated == contents || updated.len() != contents.len() {
+                bail!("private KVM {feature} anchor missing or length-changing in {path}");
+            }
+            FatSeek::seek(&mut registry, fatfs::SeekFrom::Start(0))?;
+            FatWrite::write_all(&mut registry, updated.as_bytes())?;
+            FatWrite::flush(&mut registry)?;
+        }
+    }
+    fs.unmount()?;
+    Ok(())
 }
 
 fn require_qemu(config: &Config) -> Result<PathBuf> {
@@ -576,6 +911,7 @@ fn spawn_guests(
     config: &Config,
     artifacts: &DvmArtifacts,
     layout: &KvmLayout,
+    options: &SmokeOptions,
 ) -> Result<(Child, Child)> {
     let mut rustos_command = Command::new(qemu);
     rustos_command
@@ -598,19 +934,19 @@ fn spawn_guests(
             "file={},format=raw,if=ide",
             layout.runtime_disk.display()
         ))
-        // Keep the smoke headless while exposing the same modern virtio-gpu
-        // PCI function used by the interactive KVM profile. RustOS's display
-        // provider still owns initialization and may fail closed to bootfb.
+        // Keep the smoke headless. The normal topology exposes a direct
+        // virtio-gpu test device; the DVM-display topology gets a separately
+        // initialized, fixed-layout ivshmem aperture below.
         .args([
             "-display",
             "none",
             "-vga",
             "none",
+            "-nic",
+            "none",
             "-no-reboot",
             "-no-shutdown",
         ])
-        .arg("-device")
-        .arg("virtio-gpu-pci,id=rustos-virtio-gpu,xres=1280,yres=800")
         .arg("-chardev")
         .arg(format!(
             "file,id=debugcon,path={}",
@@ -631,6 +967,16 @@ fn spawn_guests(
         ))
         .arg("-device")
         .arg("isa-serial,chardev=dvm-input,index=1");
+    if let Some(shared_display) = layout.dvm_display_shmem.as_deref() {
+        append_dvm_display_ivshmem(&mut rustos_command, shared_display);
+    } else {
+        rustos_command
+            .arg("-device")
+            .arg("virtio-gpu-pci,id=rustos-virtio-gpu,xres=1280,yres=800");
+    }
+    if let Some(shared_network) = layout.dvm_network_shmem.as_deref() {
+        append_dvm_network_ivshmem(&mut rustos_command, shared_network);
+    }
     append_fault_injection(config, &mut rustos_command);
     rustos_command
         .stdout(Stdio::null())
@@ -642,6 +988,11 @@ fn spawn_guests(
         .context("failed to start RustOS QEMU/KVM guest")?;
 
     let mut dvm_command = Command::new(qemu);
+    let dvm_append = if options.exercise_input {
+        "console=ttyS0 rustos.dvm.input-selftest=1"
+    } else {
+        "console=ttyS0"
+    };
     dvm_command
         .arg("-name")
         .arg("rustos-linux-dvm-kvm")
@@ -661,7 +1012,7 @@ fn spawn_guests(
         .arg(&artifacts.rootfs)
         .args([
             "-append",
-            "console=ttyS0",
+            dvm_append,
             "-display",
             "none",
             "-no-reboot",
@@ -679,8 +1030,23 @@ fn spawn_guests(
         .arg("virtio-keyboard-pci,id=dvm-keyboard")
         .arg("-device")
         .arg("virtio-mouse-pci,id=dvm-pointer")
+        .arg("-netdev")
+        .arg("user,id=dvm-net")
+        .arg("-device")
+        .arg("virtio-net-pci,netdev=dvm-net,id=dvm-virtio-net,mac=52:54:00:12:34:56")
+        .arg("-device")
+        .arg(format!(
+            "virtio-gpu-pci,id=dvm-virtio-gpu,xres={},yres={}",
+            DVM_DISPLAY_WIDTH, DVM_DISPLAY_HEIGHT
+        ))
         .stdout(Stdio::null())
         .stderr(Stdio::from(std::fs::File::create(&layout.dvm_stderr_log)?));
+    if let Some(shared_display) = layout.dvm_display_shmem.as_deref() {
+        append_dvm_display_ivshmem(&mut dvm_command, shared_display);
+    }
+    if let Some(shared_network) = layout.dvm_network_shmem.as_deref() {
+        append_dvm_network_ivshmem(&mut dvm_command, shared_network);
+    }
     let dvm = match dvm_command.spawn() {
         Ok(dvm) => dvm,
         Err(error) => {
@@ -690,6 +1056,29 @@ fn spawn_guests(
         }
     };
     Ok((rustos, dvm))
+}
+
+fn append_dvm_display_ivshmem(command: &mut Command, path: &Path) {
+    command
+        .arg("-object")
+        .arg(format!(
+            "memory-backend-file,id=dvm-display-shm,mem-path={},size={},share=on",
+            path.display(),
+            DVM_DISPLAY_REGION_BYTES
+        ))
+        .arg("-device")
+        .arg("ivshmem-plain,memdev=dvm-display-shm");
+}
+
+fn append_dvm_network_ivshmem(command: &mut Command, path: &Path) {
+    command
+        .arg("-object")
+        .arg(format!(
+            "memory-backend-file,id=dvm-network-shm,mem-path={},size={},share=on",
+            path.display(), DVM_NET_REGION_BYTES
+        ))
+        .arg("-device")
+        .arg("ivshmem-plain,memdev=dvm-network-shm");
 }
 
 fn append_fault_injection(config: &Config, command: &mut Command) {
@@ -717,6 +1106,7 @@ fn wait_for_parallel_boot(
         check_guest_running(rustos, "RustOS", &layout.rustos_stderr_log)?;
         check_guest_running(dvm, "Linux DVM", &layout.dvm_stderr_log)?;
         let rustos_log = fs::read_to_string(&layout.debugcon_log)?;
+        let dvm_log = fs::read_to_string(&layout.dvm_serial_log)?;
         let rustos_ready = options
             .expected_markers
             .iter()
@@ -735,7 +1125,31 @@ fn wait_for_parallel_boot(
                 }
             }
         }
-        if rustos_ready && control_ready.is_some() {
+        let ui_fps_ready = options
+            .min_ui_fps
+            .is_none_or(|minimum| uiserver_profile_meets_fps(&rustos_log, minimum));
+        let dvm_display_ready =
+            !options.dvm_display_shmem
+                || (dvm_display_provider_ready(&rustos_log) && dvm_display_relay_ready(&dvm_log));
+        let dvm_network_ready =
+            !options.dvm_network_shmem || dvm_network_relay_ready(&dvm_log);
+        let dvm_network_traffic_ready = if options.exercise_network {
+            let shared_network = layout
+                .dvm_network_shmem
+                .as_deref()
+                .context("network exercise lost its shared DVM network aperture")?;
+            dvm_network_counters(shared_network)?.round_trip_observed()
+                && rustos_log.contains(NETPROBE_QEMU_REACHABLE_MARKER)
+        } else {
+            true
+        };
+        if rustos_ready
+            && control_ready.is_some()
+            && ui_fps_ready
+            && dvm_display_ready
+            && dvm_network_ready
+            && dvm_network_traffic_ready
+        {
             return Ok(control_ready.expect("checked above"));
         }
         if Instant::now() >= deadline {
@@ -746,9 +1160,12 @@ fn wait_for_parallel_boot(
                 .cloned()
                 .collect::<Vec<_>>();
             bail!(
-                "KVM parallel boot did not reach readiness within {:?}; RustOS missing={:?}; host-input-relay-pending={}; inspect {}, {}, {}, and {}",
+                "KVM parallel boot did not reach readiness within {:?}; RustOS missing={:?}; dvm-display-ready={}; dvm-network-ready={}; dvm-network-traffic-ready={}; host-input-relay-pending={}; inspect {}, {}, {}, and {}",
                 options.timeout,
                 missing_rustos,
+                dvm_display_ready,
+                dvm_network_ready,
+                dvm_network_traffic_ready,
                 control_ready.is_none(),
                 layout.debugcon_log.display(),
                 layout.dvm_serial_log.display(),
@@ -758,6 +1175,70 @@ fn wait_for_parallel_boot(
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// The kernel's bootstrap trace intentionally does not promise runtime
+/// debugcon delivery. The userspace display-info ABI is the authoritative
+/// observation: the runner's fixed ivshmem header must emerge unchanged as the
+/// active primary display provider.
+fn dvm_display_provider_ready(log: &str) -> bool {
+    log.lines().any(|line| {
+        let Some((_, fields)) = line.split_once("uiserver: display_get_info ") else {
+            return false;
+        };
+        uiserver_display_field_is(fields, "width", DVM_DISPLAY_WIDTH)
+            && uiserver_display_field_is(fields, "height", DVM_DISPLAY_HEIGHT)
+            && uiserver_display_field_is(fields, "stride", DVM_DISPLAY_WIDTH * 4)
+            && uiserver_display_field_is(fields, "bpp", 4)
+            && uiserver_display_field_is(fields, "fmt", 1)
+            && fields.split_whitespace().any(|field| field == "flags=0x2")
+    })
+}
+
+fn dvm_display_relay_ready(log: &str) -> bool {
+    log.lines().any(|line| {
+        line.contains("rustos-dvm-display: active")
+            && line.contains(&format!("width={DVM_DISPLAY_WIDTH}"))
+            && line.contains(&format!("height={DVM_DISPLAY_HEIGHT}"))
+            && line.contains(&format!("stride={}", DVM_DISPLAY_WIDTH * 4))
+            && line.contains("format=BGRA8888 double-buffered")
+    })
+}
+
+fn dvm_network_relay_ready(log: &str) -> bool {
+    log.lines().any(|line| {
+        line.contains("rustos-dvm-net: active")
+            && line.contains("interface=eth0")
+            && line.contains("mtu=1514")
+            && line.contains("slots=64")
+    })
+}
+
+fn uiserver_display_field_is(fields: &str, name: &str, expected: u32) -> bool {
+    fields.split_whitespace().any(|field| {
+        field
+            .split_once('=')
+            .is_some_and(|(key, value)| key == name && value == expected.to_string())
+    })
+}
+
+fn uiserver_profile_meets_fps(log: &str, minimum_fps: u32) -> bool {
+    let required_milli = u64::from(minimum_fps).saturating_mul(1_000);
+    log.lines().any(|line| {
+        // Service logs normally carry an observability prefix, while early
+        // debugcon output may be bare. The KVM gate accepts either form but
+        // still requires the exact profile payload.
+        line.split_once("uiserver profile: ")
+            .map(|(_, profile)| profile)
+            .and_then(|fields| {
+                fields.split_whitespace().find_map(|field| {
+                    field
+                        .strip_prefix("frame_hz_milli=")
+                        .and_then(|value| value.parse::<u64>().ok())
+                })
+            })
+            .is_some_and(|rate| rate >= required_milli)
+    })
 }
 
 fn check_guest_running(guest: &mut Child, label: &str, stderr_log: &Path) -> Result<()> {
@@ -781,9 +1262,12 @@ fn stop_guest(guest: &mut Child) {
 mod tests {
     use super::{
         DVM_CONTROL_AUTHENTICATION, DVM_CONTROL_CAPABILITIES, DVM_CONTROL_PROTOCOL,
-        DVM_CONTROL_STATE, DVM_CONTROL_TRANSPORT, RUSTOS_BOOT_MARKER, is_sha256,
+        DVM_CONTROL_STATE, DVM_CONTROL_TRANSPORT, DVM_KEYBOARD_INGRESS_MARKER,
+        DVM_POINTER_INGRESS_MARKER, RUSTOS_BOOT_MARKER, DvmNetworkCounters,
+        dvm_display_provider_ready,
+        dvm_display_relay_ready, dvm_network_relay_ready, is_sha256,
         parse_dvm_control_contract_text, parse_manifest_text, parse_smoke_options,
-        validate_manifest_values,
+        uiserver_profile_meets_fps, validate_manifest_values,
     };
 
     #[test]
@@ -796,6 +1280,86 @@ mod tests {
             vec![RUSTOS_BOOT_MARKER.to_owned()]
         );
         assert!(parse_smoke_options(vec!["--timeout".into(), "31".into()].into_iter()).is_err());
+    }
+
+    #[test]
+    fn input_exercise_requires_both_ring3_ingress_markers() {
+        let options = parse_smoke_options(vec!["--exercise-input".into()].into_iter()).unwrap();
+        assert!(options.exercise_input);
+        assert!(options
+            .expected_markers
+            .contains(&DVM_KEYBOARD_INGRESS_MARKER.to_owned()));
+        assert!(options
+            .expected_markers
+            .contains(&DVM_POINTER_INGRESS_MARKER.to_owned()));
+    }
+
+    #[test]
+    fn dvm_display_mode_requires_the_observed_display_contract() {
+        let options = parse_smoke_options(vec!["--dvm-display-shmem".into()].into_iter()).unwrap();
+        assert!(options.dvm_display_shmem);
+        assert!(dvm_display_provider_ready(
+            "[INFO ] service=uiserver uiserver: display_get_info attempt=1 width=1600 height=900 stride=6400 bpp=4 fmt=1 flags=0x2 gen=1"
+        ));
+        assert!(!dvm_display_provider_ready(
+            "[INFO ] service=uiserver uiserver: display_get_info attempt=1 width=1600 height=900 stride=6400 bpp=4 fmt=1 flags=0x3 gen=1"
+        ));
+        assert!(dvm_display_relay_ready(
+            "rustos-dvm-display: active width=1600 height=900 stride=6400 format=BGRA8888 double-buffered"
+        ));
+        assert!(dvm_network_relay_ready(
+            "rustos-dvm-net: active interface=eth0 mtu=1514 slots=64"
+        ));
+    }
+
+    #[test]
+    fn dvm_network_mode_is_explicit() {
+        let options = parse_smoke_options(vec!["--dvm-network-shmem".into()].into_iter()).unwrap();
+        assert!(options.dvm_network_shmem);
+        let exercised = parse_smoke_options(
+            vec!["--dvm-network-shmem".into(), "--exercise-network".into()].into_iter(),
+        )
+        .unwrap();
+        assert!(exercised.exercise_network);
+        assert!(parse_smoke_options(vec!["--exercise-network".into()].into_iter()).is_err());
+    }
+
+    #[test]
+    fn dvm_network_counters_are_bounded_and_bidirectional() {
+        let observed = DvmNetworkCounters {
+            tx_producer: 2,
+            tx_consumer: 2,
+            rx_producer: 3,
+            rx_consumer: 2,
+        };
+        assert!(observed.is_valid(64));
+        assert!(observed.round_trip_observed());
+        assert!(!DvmNetworkCounters {
+            tx_producer: 65,
+            tx_consumer: 0,
+            rx_producer: 0,
+            rx_consumer: 0,
+        }
+        .is_valid(64));
+    }
+
+    #[test]
+    fn ui_fps_option_is_bounded_and_profile_rate_is_strict() {
+        let options = parse_smoke_options(
+            vec!["--min-ui-fps".into(), "20".into()].into_iter(),
+        )
+        .unwrap();
+        assert_eq!(options.min_ui_fps, Some(20));
+        assert!(parse_smoke_options(vec!["--min-ui-fps".into(), "241".into()].into_iter())
+            .is_err());
+        assert!(uiserver_profile_meets_fps(
+            "[INFO ] service=uiserver uiserver profile: elapsed_ms=1000 frame_hz_milli=20000 full=0 part=20",
+            20,
+        ));
+        assert!(!uiserver_profile_meets_fps(
+            "uiserver profile: elapsed_ms=1000 frame_hz_milli=19999 full=0 part=19",
+            20,
+        ));
     }
 
     #[test]
@@ -820,7 +1384,7 @@ mod tests {
 
         let hash = "0".repeat(64);
         let manifest = format!(
-            "schema=4\nid=rustos-linux-dvm-x86_64\narchitecture=x86_64\nboot=linux-bzimage+cpio-xz\ndata-plane=hostd-rdi2-input\ncontrol-plane=agent-v1-control\ncontrol-protocol=agent-v1\ncontrol-state=control\ncontrol-transport=kvm-vsock\ncontrol-authentication=kvm-host-bound\ncontrol-capabilities=health,device-inventory,input-stream\ncontrol-contract-sha256={hash}\nkernel_sha256={hash}\nrootfs_sha256={hash}\nconfig_sha256={hash}\nsources_lock_sha256={hash}\n"
+            "schema=4\nid=rustos-linux-dvm-x86_64\narchitecture=x86_64\nboot=linux-bzimage+cpio-xz\ndata-plane=hostd-rdi2-input\ncontrol-plane=agent-v1-control\ncontrol-protocol=agent-v1\ncontrol-state=control\ncontrol-transport=kvm-vsock\ncontrol-authentication=kvm-host-bound\ncontrol-capabilities=health,device-inventory,driver-inventory,input-stream\ncontrol-contract-sha256={hash}\nkernel_sha256={hash}\nrootfs_sha256={hash}\nconfig_sha256={hash}\nsources_lock_sha256={hash}\n"
         );
         let values = parse_manifest_text(&manifest, "manifest").unwrap();
         assert_eq!(validate_manifest_values(&values).unwrap(), contract);
@@ -832,7 +1396,7 @@ mod tests {
             "../../../driver-domains/linux/board/overlay/usr/share/rustos-dvm/control-plane-v1.env"
         );
         let invalid = contract_source.replace(
-            "CONTROL_CAPABILITIES=health,device-inventory,input-stream",
+            "CONTROL_CAPABILITIES=health,device-inventory,driver-inventory,input-stream",
             "CONTROL_CAPABILITIES=health,network-rx",
         );
         assert!(parse_dvm_control_contract_text(&invalid, "invalid contract").is_err());

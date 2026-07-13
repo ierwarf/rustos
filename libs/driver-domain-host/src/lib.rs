@@ -124,7 +124,14 @@ impl ControlContract {
         {
             bail!("unsupported DVM control contract {label}");
         }
-        if self.capabilities != ["health", "device-inventory", "input-stream"] {
+        if self.capabilities
+            != [
+                "health",
+                "device-inventory",
+                "driver-inventory",
+                "input-stream",
+            ]
+        {
             bail!("unsupported DVM capabilities in {label}");
         }
         Ok(())
@@ -1000,6 +1007,16 @@ fn validate_driver_name(driver: &str, label: &str) -> Result<()> {
 pub struct ProbeResult {
     pub peer_cid: u32,
     pub inventory_count: u32,
+    pub driver_inventory: DvmDriverInventory,
+}
+
+/// DVM-local driver binding snapshot. These values prove only that the Linux
+/// domain owns its virtual devices; they are deliberately not a claim that a
+/// high-bandwidth RustOS data plane exists yet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DvmDriverInventory {
+    pub virtio_net_bound: bool,
+    pub virtio_gpu_bound: bool,
 }
 
 /// A fixed, checksummed L0-to-RustOS input frame.
@@ -1273,7 +1290,7 @@ impl HostControlListener {
     ) -> Result<InputRelayResult> {
         let mut connection = self.accept_authenticated(timeout)?;
         let probe = self.probe_connection(&mut connection)?;
-        let ready = request(&mut connection, 3, "input-stream")?;
+        let ready = request(&mut connection, 4, "input-stream")?;
         if !has_exact_fields(
             &ready,
             &["id", "op", "status", "format", "keyboard", "pointer"],
@@ -1310,7 +1327,7 @@ impl HostControlListener {
                 Ok(message) => message,
                 Err(error) => break Err(error),
             };
-            let event = match parse_linux_evdev_input_event(&message, 3, "input-stream") {
+            let event = match parse_linux_evdev_input_event(&message, 4, "input-stream") {
                 Ok(event) => event,
                 Err(error) => break Err(error),
             };
@@ -1429,10 +1446,32 @@ impl HostControlListener {
             .ok_or_else(|| anyhow!("Linux DVM inventory response omitted count"))?
             .parse::<u32>()
             .context("invalid Linux DVM inventory count")?;
+        let drivers = request(connection, 3, "driver-inventory")?;
+        if !has_exact_fields(
+            &drivers,
+            &["id", "op", "status", "virtio-net", "virtio-gpu"],
+        ) || drivers.get("status") != Some(&"ok".to_owned())
+        {
+            bail!("Linux DVM driver inventory probe was not ready");
+        }
+        let driver_inventory = DvmDriverInventory {
+            virtio_net_bound: parse_driver_inventory_state(&drivers, "virtio-net")?,
+            virtio_gpu_bound: parse_driver_inventory_state(&drivers, "virtio-gpu")?,
+        };
         Ok(ProbeResult {
             peer_cid: self.expected_dvm_cid,
             inventory_count,
+            driver_inventory,
         })
+    }
+}
+
+fn parse_driver_inventory_state(fields: &BTreeMap<String, String>, key: &str) -> Result<bool> {
+    match fields.get(key).map(String::as_str) {
+        Some("bound") => Ok(true),
+        Some("missing") => Ok(false),
+        Some(value) => bail!("invalid Linux DVM driver inventory state {key}={value:?}"),
+        None => bail!("Linux DVM driver inventory omitted {key}"),
     }
 }
 
@@ -1779,14 +1818,14 @@ mod tests {
     };
     use anyhow::Result;
 
-    const VALID: &str = "CONTROL_SCHEMA=1\nCONTROL_PROTOCOL=agent-v1\nCONTROL_STATE=control\nCONTROL_TRANSPORT=kvm-vsock\nCONTROL_AUTHENTICATION=kvm-host-bound\nCONTROL_CAPABILITIES=health,device-inventory,input-stream\n";
+    const VALID: &str = "CONTROL_SCHEMA=1\nCONTROL_PROTOCOL=agent-v1\nCONTROL_STATE=control\nCONTROL_TRANSPORT=kvm-vsock\nCONTROL_AUTHENTICATION=kvm-host-bound\nCONTROL_CAPABILITIES=health,device-inventory,driver-inventory,input-stream\n";
 
     #[test]
     fn control_contract_is_strict() {
         let contract = ControlContract::parse(VALID, "test").unwrap();
         assert_eq!(
             contract.capabilities,
-            ["health", "device-inventory", "input-stream"]
+            ["health", "device-inventory", "driver-inventory", "input-stream"]
         );
         assert!(ControlContract::parse(&VALID.replace("control", "pretransport"), "test").is_err());
         assert!(
@@ -1798,11 +1837,11 @@ mod tests {
     #[test]
     fn hello_is_bound_to_the_exact_control_contract() {
         let contract = ControlContract::parse(VALID, "test").unwrap();
-        let hello = "HELLO\nrole=linux-driver-domain\nprotocol=agent-v1\nstate=control\ntransport=kvm-vsock\nauthentication=kvm-host-bound\ncapabilities=health,device-inventory,input-stream";
+        let hello = "HELLO\nrole=linux-driver-domain\nprotocol=agent-v1\nstate=control\ntransport=kvm-vsock\nauthentication=kvm-host-bound\ncapabilities=health,device-inventory,driver-inventory,input-stream";
         assert!(validate_hello(hello, &contract).is_ok());
         assert!(
             validate_hello(
-                &hello.replace("health,device-inventory,input-stream", "health"),
+                &hello.replace("health,device-inventory,driver-inventory,input-stream", "health"),
                 &contract
             )
             .is_err()

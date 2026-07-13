@@ -49,12 +49,14 @@ happens inside the kernel module loader because they need ring0 access.
 `SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER` per record, and walks dependency
 edges. The on-boot probe loads:
 
-- Native RustOS xHCI for USB pointers and keyboards; raw HID reports are
-  routed to `inputd` for policy/translation. Linux USB HID `.ko` artifacts stay
-  staged only for compatibility work and are not the default boot input path.
-- Linux `.ko` `virtio-gpu` when present (otherwise `bootfb` is the active
-  display provider). Native virtio-gpu fallback must not be reintroduced.
-- `virtio-net` for the default emulated NIC.
+- Linux DVM `virtio-input` relay for keyboard and pointer events; `inputd`
+  owns RustOS-side policy/translation. Physical USB HID `.ko` artifacts require
+  the explicit legacy compatibility profile.
+- Linux DVM DRM/KMS for the default KVM display path; the kernel boot
+  framebuffer is only the early fallback. Native virtio-gpu fallback must not
+  be reintroduced.
+- Linux DVM `virtio-net` relay for the default emulated NIC; `netd` retains
+  RustOS socket and route policy.
 
 A skipped driver shows up as `driverd: skipped name=... reason=...` and is
 expected when the alias doesn't match the live hardware or when a higher
@@ -108,12 +110,13 @@ driver module (`.ko`)은 `driverd`가 소유 정책이지만, ring0 접근이 �
 순서를 정합니다. active provider group은 같은 group의 이후 normal/fallback
 record를 alias probe 전에 skip합니다. boot 중 probe되는 module 예:
 
-- USB pointer/keyboard는 native RustOS xHCI가 잡고 raw HID report를
-  `inputd`로 넘깁니다. Linux USB HID `.ko` artifact는 호환 작업용으로만
-  stage되며 기본 부팅 입력 경로가 아닙니다.
-- 가능하면 Linux `.ko` `virtio-gpu` (없으면 `bootfb`가 display provider).
-  native virtio-gpu fallback은 다시 넣으면 안 됩니다.
-- emulated NIC default인 `virtio-net`.
+- keyboard/pointer는 Linux DVM `virtio-input` relay가 전달하고, RustOS의
+  정책/변환은 `inputd`가 담당합니다. 물리 USB HID `.ko` artifact는 명시적
+  legacy compatibility profile에서만 사용합니다.
+- 기본 KVM display는 Linux DVM DRM/KMS이며 kernel boot framebuffer는 초기
+  fallback뿐입니다. native virtio-gpu fallback은 다시 넣으면 안 됩니다.
+- emulated NIC은 Linux DVM `virtio-net` relay가 맡고 RustOS `netd`가 socket과
+  route policy를 유지합니다.
 
 skip된 driver는 `driverd: skipped name=... reason=...`로 표시되며, alias가
 실제 hardware와 매칭되지 않거나 같은 `provider_group` 안에 더 높은 우선

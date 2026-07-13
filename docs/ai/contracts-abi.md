@@ -387,19 +387,17 @@ Kernel keeps only: user-copy, address-space replacement, scheduler mutation, pen
 ## Display Surface
 
 - `device::DisplayInfo.flags`: `DISPLAY_INFO_FLAG_PRIMARY_PROVIDER` distinguishes a real primary provider from GRUB/firmware framebuffers (default = early console + panic output only).
-- `bootfb` is the only last-resort exception: if exposed as primary, must stay behind hardware/virtio providers and preserve `DISPLAY_INFO_FLAG_BOOT_FRAMEBUFFER`.
+- The kernel-owned boot framebuffer is the only last-resort exception: it may
+  be primary only until a validated hardware/DVM provider replaces it, and it
+  must preserve `DISPLAY_INFO_FLAG_BOOT_FRAMEBUFFER`.
 - Driver framebuffer registration carries explicit source flags in `drivers/libs/driver-abi::DisplayFramebufferRegistration`. **Do not infer primary ownership from framebuffer geometry or `display_info()` presence.**
 - Surface present = kernel fast path: copies validated shared-surface contents into active framebuffer + queues provider flush for bounded housekeeping. **Do not reintroduce synchronous virtio-gpu command waits into app syscall context** for normal uiserver presents.
-- Virtio-gpu is a Linux `.ko` display path backed by ring0 virtio PCI/MMIO/DMA
-  substrate. `kernel/io-manager/src/driver/linux/virtio_gpu.rs` may execute
-  modern virtio-gpu 2D controlq commands and publish a framebuffer provider only
-  from the `.ko` registration boundary (`__register_virtio_driver`/`drm_dev_register`);
-  provider selection remains `driverd` policy and normal present policy remains
-  `uiserver`-owned.
-- The native virtio-gpu substrate must not become a second standalone fallback
-  driver: if modern PCI caps, controlq setup, resource attach, scanout, or
-  provider registration fails, it fails closed and lets `driverd` load `bootfb`
-  as the explicit fallback provider.
+- The KVM virtio-gpu path is Linux DVM DRM/KMS over the fixed display aperture.
+  RustOS has no in-kernel virtio-gpu `.ko` path and must not regain a second
+  display provider.
+- If a DVM/hardware provider is unavailable, normal presentation fails closed
+  on the kernel-owned boot framebuffer; it must not synthesize a second
+  virtio-gpu fallback or accept an unvalidated display command stream.
 - `uiserver` partial dirty rects should stay split unless merged union is nearly as small as separate areas. Over-coalescing disjoint topbar/taskbar/window updates → large framebuffer copies + delayed input feedback.
 
 ## Scheduler

@@ -46,13 +46,37 @@ failure output as the primary debugging context.
 - `--dry-run` verifies DVM artifacts and prepares `build/kvm/` without
   launching QEMU.
 - The DVM's `agent-v1-control` contract makes a host-authenticated KVM-vsock
-  health, PCI-inventory, and `input-stream` handshake. L0 validates keyboard
+  health, PCI-inventory, driver-inventory, and `input-stream` handshake. L0 validates keyboard
   and relative-pointer evdev records before forwarding sequenced, checksummed
   RDI2 frames over RustOS's dedicated COM2 socket; no QMP socket is launched.
   L0 releases tracked keys/buttons when the DVM stream ends. The smoke
   establishes the relay but does not synthesize input, so a live event still
-  needs a real input source assigned to the DVM. It is not a NIC,
-  storage, `.ko`, PCI-passthrough, or high-bandwidth device-data-plane test.
+  needs a real input source assigned to the DVM. It is not storage, `.ko`, or
+  PCI-passthrough validation.
+- `--dvm-display-shmem` adds one private fixed-layout `ivshmem-plain` object
+  to both KVM guests. It requires RustOS's primary display ABI to equal the
+  runner-created 1600×900 BGRA contract and requires the Linux DVM DRM/KMS
+  double-buffered relay to become active. It does not imply physical GPU
+  passthrough or enable a general L0 display control plane.
+- `--exercise-input` is the explicit exception for bounded integration tests.
+  It adds a DVM kernel command-line flag; the DVM agent then creates a local
+  `uinput` device and consumes it through its ordinary evdev relay. RustOS
+  must log both ring-3 `inputd` keyboard and pointer ingress markers. It never
+  enables QMP or a host-to-DVM input endpoint, and normal DVM boots do not run
+  this self-test.
+- `--dvm-network-shmem` adds a private 512 KiB fixed-ring `ivshmem-plain`
+  aperture to both guests. RustOS owns only bounded Ethernet-frame ring access;
+  Linux owns the virtio-net NIC and raw socket relay; `netd` retains socket/TCP
+  policy. RustOS has no native virtio-net device in this topology.
+- `--exercise-network` requires `--dvm-network-shmem` and changes only the
+  private KVM disk copy so the existing `netprobe` reaches the QEMU gateway.
+  Passing requires the normal app result plus nonzero producer and consumer
+  counters in both bounded rings. It is an Ethernet transport proof, not a
+  physical NIC assignment or an L0 network control plane.
+- `--min-ui-fps <fps>` enables `RUSTOS_UI_PROFILE` only in the private KVM
+  disk copy by replacing the equal-length disabled value in `uiserver.desktop`.
+  It never alters the release boot image and requires a `uiserver profile`
+  window whose `frame_hz_milli` meets the requested rate.
 
 ## L0 VFIO laboratory recovery
 
@@ -101,7 +125,7 @@ failure output as the primary debugging context.
 1. `cargo xtask build`
 2. `cargo xtask kvm-smoke --expect 'runtimed: bootstrap ui done'`
 3. Search the relevant log for
-   `error: no suitable video mode|boot framebuffer|bootfb|virtio-gpu|virtio register|DisplayUnavailable|uiserver|panic|scheduler invalid`.
+   `error: no suitable video mode|boot framebuffer|virtio-gpu|virtio register|DisplayUnavailable|uiserver|panic|scheduler invalid`.
 
 ## Generated path exceptions
 

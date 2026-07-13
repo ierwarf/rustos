@@ -133,8 +133,13 @@ fn main() -> Result<()> {
             let listener = HostControlListener::bind(lease.dvm_guest_cid, port, contract)?;
             let result = listener.probe_once(Duration::from_secs(timeout_secs))?;
             println!(
-                "rustos-hostd: DVM control verified domain={} cid={} iommu_group={} inventory_count={}",
-                lease.domain_id, result.peer_cid, lease.iommu_group, result.inventory_count
+                "rustos-hostd: DVM control verified domain={} cid={} iommu_group={} inventory_count={} virtio_net={} virtio_gpu={}",
+                lease.domain_id,
+                result.peer_cid,
+                lease.iommu_group,
+                result.inventory_count,
+                result.driver_inventory.virtio_net_bound,
+                result.driver_inventory.virtio_gpu_bound,
             );
         }
         Command::RelayInput {
@@ -174,11 +179,13 @@ fn main() -> Result<()> {
                 };
                 match listener.relay_input_once(timeout, &mut sink) {
                     Ok(result) => println!(
-                        "rustos-hostd: DVM input relay ended domain={} cid={} iommu_group={} inventory_count={} forwarded_events={}",
+                        "rustos-hostd: DVM input relay ended domain={} cid={} iommu_group={} inventory_count={} virtio_net={} virtio_gpu={} forwarded_events={}",
                         lease.domain_id,
                         result.probe.peer_cid,
                         lease.iommu_group,
                         result.probe.inventory_count,
+                        result.probe.driver_inventory.virtio_net_bound,
+                        result.probe.driver_inventory.virtio_gpu_bound,
                         result.forwarded_events,
                     ),
                     Err(error) if once => return Err(error),

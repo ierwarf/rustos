@@ -84,6 +84,8 @@ struct InputQueue {
     hid_keyboards: Vec<HidKeyboardState>,
     ps2_keyboard: KeyboardDriver,
     dvm_keyboard: KeyboardDriver,
+    dvm_keyboard_observed: bool,
+    dvm_pointer_observed: bool,
     ps2_mouse: Ps2MousePacketState,
     pointer_surface: PointerSurface,
     last_pointer_position: Option<(i32, i32)>,
@@ -218,6 +220,7 @@ impl InputQueue {
             input_evdev::INPUT_ACTION_RELEASED => true,
             _ => return,
         };
+        self.dvm_keyboard_observed = true;
         self.dvm_keyboard.inject_key_transition(code, released);
         while let Some(event) = self.dvm_keyboard.pop_event() {
             self.push_keyboard_driver_event(event);
@@ -314,9 +317,27 @@ impl InputQueue {
     }
 
     fn push_dvm_pointer_packet(&mut self, packet: InputPointerPacketWire) {
+        if packet.dx != 0
+            || packet.dy != 0
+            || packet.wheel_vertical != 0
+            || packet.wheel_horizontal != 0
+            || packet.buttons != self.dvm_pointer_buttons
+        {
+            self.dvm_pointer_observed = true;
+        }
         self.push_pointer_motion_and_scroll(packet);
         self.dvm_pointer_buttons = packet.buttons;
         self.publish_pointer_button_edges();
+    }
+
+    /// Return the first accepted DVM keyboard/pointer observations since the
+    /// previous poll. These markers are intentionally one-shot diagnostics:
+    /// they prove the end-to-end ingress route without turning normal input
+    /// into a per-event logging channel.
+    fn take_dvm_ingress_observations(&mut self) -> (bool, bool) {
+        let keyboard = std::mem::take(&mut self.dvm_keyboard_observed);
+        let pointer = std::mem::take(&mut self.dvm_pointer_observed);
+        (keyboard, pointer)
     }
 
     fn push_pointer_absolute(&mut self, absolute: InputPointerAbsoluteWire) {
@@ -1178,6 +1199,18 @@ mod tests {
         assert_eq!(a.kind, input_evdev::INPUT_KIND_KEYBOARD);
         assert_eq!(a.action, input_evdev::INPUT_ACTION_PRESSED);
         assert_eq!(a.text, b'A' as u32);
+        assert_eq!(queue.take_dvm_ingress_observations(), (true, false));
+        assert_eq!(queue.take_dvm_ingress_observations(), (false, false));
+    }
+
+    #[test]
+    fn dvm_pointer_observation_requires_a_real_packet_change() {
+        let mut queue = InputQueue::default();
+        queue.push_dvm_pointer_packet(pointer_packet(0, 0, 0));
+        assert_eq!(queue.take_dvm_ingress_observations(), (false, false));
+
+        queue.push_dvm_pointer_packet(pointer_packet(1, 3, -2));
+        assert_eq!(queue.take_dvm_ingress_observations(), (false, true));
     }
 
     #[test]
@@ -1351,6 +1384,11 @@ fn serve(endpoint: u64) {
     // handlers.  Do not allocate a new 96 KiB wire batch on every poll.
     let mut ingest_scratch = vec![InputIngressWire::default(); INPUTD_INGEST_MAX_EVENTS];
     let mut ingest_failures = 0_u64;
+    // These are lifecycle observations, not event telemetry. Preserve the
+    // first proof of each DVM route without allowing an active device to flood
+    // debugcon and perturb the UI path it is meant to validate.
+    let mut dvm_keyboard_ingress_logged = false;
+    let mut dvm_pointer_ingress_logged = false;
     loop {
         let ingested = match drain_ingest(&mut queue, &mut ingest_scratch) {
             Ok(count) => {
@@ -1367,6 +1405,15 @@ fn serve(endpoint: u64) {
                 0
             }
         };
+        let (dvm_keyboard, dvm_pointer) = queue.take_dvm_ingress_observations();
+        if dvm_keyboard && !dvm_keyboard_ingress_logged {
+            debug_line("inputd: DVM keyboard ingress observed");
+            dvm_keyboard_ingress_logged = true;
+        }
+        if dvm_pointer && !dvm_pointer_ingress_logged {
+            debug_line("inputd: DVM pointer ingress observed");
+            dvm_pointer_ingress_logged = true;
+        }
         let mut request = [0_u8; IPC_MAX_INLINE_BYTES];
         let mut reply_cap = 0_u64;
         let received = syscall4(

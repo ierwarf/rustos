@@ -1,7 +1,6 @@
 use core::ffi::c_void;
 use core::mem::size_of;
 use core::ptr;
-use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::sync::KernelWaitLock;
 
@@ -51,14 +50,7 @@ const RX_DMA_LEN: usize = VIRTIO_NET_HDR_LEN + PACKET_MTU;
 const TX_DMA_LEN: usize = VIRTIO_NET_HDR_LEN + PACKET_MTU;
 const TX_POLL_BUDGET: usize = 100_000;
 
-static CURRENT_TRANSPORT: AtomicUsize = AtomicUsize::new(0);
 static STATE: KernelWaitLock<Option<VirtioNetState>> = KernelWaitLock::new(None);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum LinuxNetdevTransport {
-    Unknown,
-    Pci,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PacketError {
@@ -69,36 +61,11 @@ pub enum PacketError {
     WouldBlock,
 }
 
-pub(crate) fn note_virtio_net_driver_registered() {}
-
-pub(crate) fn current_linux_netdev_transport() -> LinuxNetdevTransport {
-    match CURRENT_TRANSPORT.load(Ordering::Acquire) {
-        1 => LinuxNetdevTransport::Pci,
-        _ => LinuxNetdevTransport::Unknown,
-    }
-}
-
-pub(crate) fn set_current_linux_netdev_transport(transport: LinuxNetdevTransport) {
-    let value = match transport {
-        LinuxNetdevTransport::Unknown => 0,
-        LinuxNetdevTransport::Pci => 1,
-    };
-    CURRENT_TRANSPORT.store(value, Ordering::Release);
-}
-
-pub(crate) fn register_linux_netdev(_dev: usize, _transport: LinuxNetdevTransport) -> i32 {
-    0
-}
-
-pub(crate) fn unregister_linux_netdev(_dev: usize) {}
-
-pub(crate) fn allocate_linux_netdev(_dev: usize, _sizeof_priv: usize, _txqs: u32, _rxqs: u32) {}
-
-pub(crate) fn free_linux_netdev(_dev: usize) {}
-
-pub(crate) fn set_linux_netdev_carrier(_dev: usize, _carrier: bool) {}
 
 pub fn available() -> bool {
+    if crate::io::dvm_network::available() {
+        return true;
+    }
     ensure_state().is_ok()
 }
 
@@ -108,6 +75,9 @@ pub fn transmit_frame(frame: &[u8]) -> Result<usize, PacketError> {
     }
     if frame.len() > PACKET_MTU {
         return Err(PacketError::TooLarge);
+    }
+    if crate::io::dvm_network::available() {
+        return crate::io::dvm_network::transmit(frame);
     }
     ensure_state()?;
     let mut guard = STATE.lock();
@@ -119,6 +89,9 @@ pub fn transmit_frame(frame: &[u8]) -> Result<usize, PacketError> {
 pub fn receive_frame(out: &mut [u8]) -> Result<usize, PacketError> {
     if out.is_empty() {
         return Err(PacketError::Invalid);
+    }
+    if crate::io::dvm_network::available() {
+        return crate::io::dvm_network::receive(out);
     }
     ensure_state()?;
     let mut guard = STATE.lock();

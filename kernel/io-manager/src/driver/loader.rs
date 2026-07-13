@@ -311,7 +311,7 @@ pub(super) fn load_module_image_explicit(
     class: DriverClass,
     bus: DriverBus,
     image_path: &'static str,
-    linux_driver_names: &'static str,
+    _linux_driver_names: &'static str,
 ) -> Result<LoadedModuleInfo, &'static str> {
     driver_diag!(
         crate::debug::LogLevel::Debug,
@@ -451,13 +451,6 @@ pub(super) fn load_module_image_explicit(
                     "module-init-linux-call",
                     image.len() as u64,
                     init_addr as u64,
-                );
-                let _policy_guard = super::linux::virtio::enter_module_init_policy(
-                    super::linux::virtio::ModuleInitPolicy {
-                        class,
-                        bus,
-                        linux_driver_names,
-                    },
                 );
                 unsafe { call_with_module_init_stack0(init_addr) }
             }
@@ -2392,12 +2385,8 @@ fn resolve_linux_allowed_symbol(name: &str, policy: SymbolResolvePolicy) -> Opti
         .or_else(|| super::linux::workqueue::resolve_symbol(name))
         .or_else(|| super::linux::irq::resolve_symbol(name))
         .or_else(|| super::linux::mmio::resolve_symbol(name))
-        .or_else(|| super::linux::virtio::resolve_symbol(name))
-        .or_else(|| super::linux::netdev::resolve_symbol(name))
-        .or_else(|| super::linux::skbuff::resolve_symbol(name))
         .or_else(|| super::linux::pci::resolve_symbol(name))
         .or_else(|| super::linux::input::resolve_symbol(name))
-        .or_else(|| super::linux::virtio_drm::resolve_symbol(name))
         .or_else(|| module_registry::resolve_symbol(name));
 
     if common.is_some() {
@@ -2409,13 +2398,8 @@ fn resolve_linux_allowed_symbol(name: &str, policy: SymbolResolvePolicy) -> Opti
             .or_else(|| super::linux::usb::resolve_symbol(name)),
         (DriverClass::Input, DriverBus::Serio) => super::linux::serio::resolve_symbol(name)
             .or_else(|| super::linux::ps2::resolve_symbol(name)),
-        (DriverClass::Network, DriverBus::Virtio) => super::linux::virtio::resolve_symbol(name)
-            .or_else(|| super::linux::netdev::resolve_symbol(name))
-            .or_else(|| super::linux::skbuff::resolve_symbol(name))
-            .or_else(|| super::linux::pci::resolve_symbol(name)),
-        (DriverClass::Network, DriverBus::Pci) => super::linux::pci::resolve_symbol(name)
-            .or_else(|| super::linux::netdev::resolve_symbol(name))
-            .or_else(|| super::linux::skbuff::resolve_symbol(name)),
+        (DriverClass::Network, DriverBus::Virtio)
+        | (DriverClass::Network, DriverBus::Pci) => None,
         (DriverClass::Usb, DriverBus::Pci) | (DriverClass::Usb, DriverBus::Platform) => {
             super::linux::usb::resolve_symbol(name)
                 .or_else(|| super::linux::pci::resolve_symbol(name))
@@ -2440,12 +2424,8 @@ fn is_allowed_linux_external_symbol(name: &str, policy: SymbolResolvePolicy) -> 
         || super::linux::workqueue::resolve_symbol(name).is_some()
         || super::linux::irq::resolve_symbol(name).is_some()
         || super::linux::mmio::resolve_symbol(name).is_some()
-        || super::linux::virtio::resolve_symbol(name).is_some()
-        || super::linux::netdev::resolve_symbol(name).is_some()
-        || super::linux::skbuff::resolve_symbol(name).is_some()
         || super::linux::pci::resolve_symbol(name).is_some()
-        || super::linux::input::resolve_symbol(name).is_some()
-        || super::linux::virtio_drm::resolve_symbol(name).is_some();
+        || super::linux::input::resolve_symbol(name).is_some();
     if common_allowed {
         return true;
     }
@@ -2459,17 +2439,8 @@ fn is_allowed_linux_external_symbol(name: &str, policy: SymbolResolvePolicy) -> 
             super::linux::serio::resolve_symbol(name).is_some()
                 || super::linux::ps2::resolve_symbol(name).is_some()
         }
-        (DriverClass::Network, DriverBus::Virtio) => {
-            super::linux::virtio::resolve_symbol(name).is_some()
-                || super::linux::netdev::resolve_symbol(name).is_some()
-                || super::linux::skbuff::resolve_symbol(name).is_some()
-                || super::linux::pci::resolve_symbol(name).is_some()
-        }
-        (DriverClass::Network, DriverBus::Pci) => {
-            super::linux::pci::resolve_symbol(name).is_some()
-                || super::linux::netdev::resolve_symbol(name).is_some()
-                || super::linux::skbuff::resolve_symbol(name).is_some()
-        }
+        (DriverClass::Network, DriverBus::Virtio)
+        | (DriverClass::Network, DriverBus::Pci) => false,
         (DriverClass::Usb, DriverBus::Pci) | (DriverClass::Usb, DriverBus::Platform) => {
             super::linux::usb::resolve_symbol(name).is_some()
                 || super::linux::pci::resolve_symbol(name).is_some()

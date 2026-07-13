@@ -1337,18 +1337,18 @@ mod tests {
     fn registry_list_join_driver_metadata_with_commas() {
         let aliases = vec![
             "virtio:d00000010v*".to_string(),
-            "platform:bootfb".to_string(),
+            "pci:v00001002d*".to_string(),
         ];
 
         assert_eq!(
             registry_list(&aliases).unwrap(),
-            "virtio:d00000010v*,platform:bootfb"
+            "virtio:d00000010v*,pci:v00001002d*"
         );
     }
 
     #[test]
     fn registry_list_rejects_embedded_commas() {
-        let aliases = vec!["virtio:d00000010v*,platform:bootfb".to_string()];
+        let aliases = vec!["virtio:d00000010v*,pci:v00001002d*".to_string()];
 
         assert!(registry_list(&aliases).is_err());
     }

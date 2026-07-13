@@ -263,6 +263,10 @@ name = "driver-abi"
 version = "0.1.0"
 
 [[package]]
+name = "driver-domain-protocol"
+version = "0.1.0"
+
+[[package]]
 name = "driver-module-runtime"
 version = "0.1.0"
 dependencies = [
@@ -569,6 +573,7 @@ version = "0.1.0"
 dependencies = [
  "boot-protocol",
  "driver-abi",
+ "driver-domain-protocol",
  "elf",
  "embedded-graphics",
  "fatfs",
@@ -997,14 +1002,6 @@ dependencies = [
 
 [[package]]
 name = "rustos-amdgpu-driver"
-version = "0.1.0"
-dependencies = [
- "driver-abi",
- "driver-module-runtime",
-]
-
-[[package]]
-name = "rustos-bootfb-driver"
 version = "0.1.0"
 dependencies = [
  "driver-abi",
@@ -1744,6 +1741,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "driver-domain-protocol",
  "fatfs",
  "fs-err",
  "rustos-driver-domain-host",

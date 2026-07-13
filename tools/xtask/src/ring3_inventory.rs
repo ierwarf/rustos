@@ -64,6 +64,7 @@ pub(crate) fn print_inventory(config: &Config) -> Result<()> {
                     | "signal-frame-substrate-exception"
                     | "usb-runtime-substrate-exception"
                     | "display-present-substrate-exception"
+                    | "dvm-transport-substrate-exception"
                     | "bootstrap-device-route-exception"
                     | "vfs-bootstrap-hotpath-exception"
                     | "vfs-socket-fd-substrate-exception"
@@ -223,8 +224,6 @@ fn owner_for_path(path: &Path) -> &'static str {
         "linux-ko-compat"
     } else if path.contains("/input/i8042.rs") {
         "inputd"
-    } else if path.ends_with("/driver/virtio_gpu.rs") {
-        "display-ko-compat"
     } else if path.contains("/usb/core.rs") {
         "driverd-devmgrd-inputd"
     } else if path.contains("/storage/ahci.rs") || path.contains("/storage/nvme.rs") {
@@ -288,6 +287,10 @@ fn owner_for_path(path: &Path) -> &'static str {
         "sessiond-runtimed"
     } else if path.contains("/console_host.rs") {
         "loaderd-sessiond"
+    } else if path.ends_with("/io/dvm_network.rs") {
+        "netd"
+    } else if path.ends_with("/io/dvm_display.rs") {
+        "uiserver"
     } else if path.contains("/usb/") || path.contains("/input/") || path.contains("/serio.rs") {
         "inputd"
     } else if path.contains("/io/tty.rs")
@@ -295,7 +298,7 @@ fn owner_for_path(path: &Path) -> &'static str {
         || path.contains("/io/console.rs")
     {
         "sessiond"
-    } else if path.contains("/io/gui") || path.contains("/virtio_gpu.rs") {
+    } else if path.contains("/io/gui") {
         "uiserver"
     } else if path.contains("/storage/") {
         "storaged"
@@ -393,6 +396,8 @@ fn lane_for_path(path: &Path) -> &'static str {
         "input-ingress-ring0-exception"
     } else if path.contains("/memfd.rs") {
         "memfd-kernel-substrate-exception"
+    } else if path.ends_with("/io/dvm_network.rs") || path.ends_with("/io/dvm_display.rs") {
+        "dvm-transport-substrate-exception"
     } else if path.contains("/io/gui") {
         "display-present-substrate-exception"
     } else if path.contains("/usb/xhci.rs")
@@ -419,8 +424,6 @@ fn lane_for_path(path: &Path) -> &'static str {
         "already-migrated-reference"
     } else if path.contains("/driver/serio.rs") {
         "compat-ring0-exception"
-    } else if path.ends_with("/driver/virtio_gpu.rs") {
-        "legacy-native-removal"
     } else if path.contains("/process/")
         || path.contains("/proc_broker_ops.rs")
         || path.contains("/ipc_ops.rs")
@@ -458,8 +461,6 @@ fn action_for_path(path: &Path) -> &'static str {
         "explicit Linux .ko serio compatibility bus substrate exception; do not migrate .ko execution to ring3"
     } else if path.contains("/input/i8042.rs") {
         "i8042 raw input ingress substrate exception; keyboard/mouse policy is inputd-owned"
-    } else if path.ends_with("/driver/virtio_gpu.rs") {
-        "legacy native virtio-gpu fallback must stay deleted; use Linux .ko virtio-gpu/virtio-drm"
     } else if path.contains("/driver/linux/")
         || path.contains("/driver/devres.rs")
         || path.contains("/driver/export.rs")
@@ -532,6 +533,10 @@ fn action_for_path(path: &Path) -> &'static str {
         "bounded input ingress substrate exception; read/coalescing/evdev policy is inputd-owned"
     } else if path.contains("/memfd.rs") {
         "memfd fd/frame/page-table substrate exception; creation and mapping admission policy is syscalld/pagerd-owned"
+    } else if path.ends_with("/io/dvm_network.rs") {
+        "fixed DVM Ethernet transport substrate exception; netd owns socket/TCP policy and L0 owns liveness/revocation policy"
+    } else if path.ends_with("/io/dvm_display.rs") {
+        "fixed DVM framebuffer transport substrate exception; uiserver owns mode, damage, and presentation policy"
     } else if path.contains("/io/gui") {
         "display present/framebuffer substrate exception; mode, damage, and presentation policy is uiserver-owned"
     } else if path.contains("/usb/xhci.rs")
@@ -604,7 +609,7 @@ fn action_for_path(path: &Path) -> &'static str {
         "move HID parse/state policy into inputd, keep USB callback source"
     } else if path.contains("/serio.rs") || path.contains("/input/i8042.rs") {
         "move legacy input routing into inputd service-driver path"
-    } else if path.contains("/io/gui") || path.ends_with("/driver/virtio_gpu.rs") {
+    } else if path.contains("/io/gui") {
         "move provider/display policy into uiserver or service-driver path"
     } else if path.contains("/storage/") {
         "move post-bootstrap storage policy into storaged, keep raw block broker"

@@ -43,15 +43,6 @@ pub enum DriverLoadError {
     FaultInjected,
 }
 
-const BOOTFB_DRIVER_NAME: &str = "bootfb";
-const BOOTFB_DRIVER_MODULE_PATH: &str = "system/drivers/display/bootfb.ko";
-const BOOTFB_ALIAS: &str = "platform:bootfb";
-const PCI_VENDOR_VIRTIO: u16 = 0x1af4;
-const PCI_DEVICE_VIRTIO_NET_TRANSITIONAL: u16 = 0x1000;
-const PCI_DEVICE_VIRTIO_GPU_TRANSITIONAL: u16 = 0x1010;
-const PCI_DEVICE_VIRTIO_MODERN_BASE: u16 = 0x1040;
-const PCI_DEVICE_VIRTIO_MODERN_END: u16 = 0x107f;
-
 pub(crate) fn exported_kernel_api() -> *const driver_abi::DriverKernelApiV1 {
     kernel_api::exported_kernel_api()
 }
@@ -91,10 +82,6 @@ pub fn load_module_image_from_policy(
     let name = leak_policy_text(name)?;
     let image_path = leak_policy_text(image_path)?;
     let linux_driver_names = leak_policy_text(linux_driver_names)?;
-    if is_boot_framebuffer_request(name, class, bus, image_path, linux_driver_names) {
-        return load_boot_framebuffer_provider();
-    }
-
     match loader::load_module_image_explicit(name, class, bus, image_path, linux_driver_names) {
         Ok(_) => {
             if requires_display_provider_publish(class, policy_flags)
@@ -116,9 +103,6 @@ pub fn load_module_image_from_policy(
             }
             Ok(())
         }
-        Err(_) if is_boot_framebuffer_request(name, class, bus, image_path, linux_driver_names) => {
-            load_boot_framebuffer_provider()
-        }
         Err(_) => Err(DriverLoadError::LoaderFailed),
     }
 }
@@ -132,34 +116,16 @@ pub fn hardware_alias_present(alias: &str, class: u32, bus: u32) -> bool {
     };
 
     match bus {
-        DriverBus::Platform => {
-            matches!((class, alias), (DriverClass::Display, BOOTFB_ALIAS))
-                && !display_primary_provider_active()
-                && crate::storage::boot_volume::boot_framebuffer_info().is_some()
-        }
+        DriverBus::Platform => false,
         DriverBus::Pci => pci_alias_present(alias),
-        DriverBus::Virtio => {
-            if class == DriverClass::Display && display_non_boot_primary_provider_active() {
-                return false;
-            }
-            virtio_alias_present(alias)
-        }
+        DriverBus::Virtio => false,
         DriverBus::Usb => usb_alias_present(alias, class),
         DriverBus::Serio => serio_alias_present(alias),
-        _ => false,
     }
 }
 
 pub fn drain_linux_symbol_event() -> Option<rustos_user_abi::syscall::LinuxDriverSymbolEventWire> {
     symbol_events::drain_linux_symbol_event()
-}
-
-fn display_primary_provider_active() -> bool {
-    crate::io::gui::display_info()
-        .map(|display| {
-            display.flags & crate::user::abi::device::DISPLAY_INFO_FLAG_PRIMARY_PROVIDER != 0
-        })
-        .unwrap_or(false)
 }
 
 fn display_non_boot_primary_provider_active() -> bool {
@@ -184,30 +150,6 @@ fn stable_ascii_hash(text: &str) -> u64 {
     text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
         hash.wrapping_mul(0x1000_0000_01b3) ^ u64::from(byte.to_ascii_lowercase())
     })
-}
-
-fn load_boot_framebuffer_provider() -> Result<(), DriverLoadError> {
-    let framebuffer = crate::storage::boot_volume::boot_framebuffer_info()
-        .ok_or(DriverLoadError::LoaderFailed)?;
-    if crate::io::gui::install_boot_framebuffer_fallback(framebuffer) {
-        Ok(())
-    } else {
-        Err(DriverLoadError::LoaderFailed)
-    }
-}
-
-fn is_boot_framebuffer_request(
-    name: &str,
-    class: DriverClass,
-    bus: DriverBus,
-    image_path: &str,
-    linux_driver_names: &str,
-) -> bool {
-    name == BOOTFB_DRIVER_NAME
-        && class == DriverClass::Display
-        && bus == DriverBus::Platform
-        && image_path == BOOTFB_DRIVER_MODULE_PATH
-        && (linux_driver_names.is_empty() || linux_driver_names == BOOTFB_DRIVER_NAME)
 }
 
 fn leak_policy_text(value: &str) -> Result<&'static str, DriverLoadError> {
@@ -250,29 +192,6 @@ fn pci_alias_present(alias: &str) -> bool {
     let mut present = false;
     crate::arch::pci::visit_devices(|pci| {
         present = pci_alias_matches(alias, pci);
-        present
-    });
-    present
-}
-
-fn virtio_alias_present(alias: &str) -> bool {
-    if !alias.starts_with("virtio:") {
-        return false;
-    }
-
-    let mut present = false;
-    crate::arch::pci::visit_devices(|pci| {
-        if pci.vendor_id() != PCI_VENDOR_VIRTIO {
-            return false;
-        }
-        let Some(device_type) = virtio_device_type(pci.device_id()) else {
-            return false;
-        };
-        let Some((matches_device, _)) = match_hex_field_at(alias, 0, "virtio:d", device_type, 8)
-        else {
-            return false;
-        };
-        present = matches_device;
         present
     });
     present
@@ -328,17 +247,6 @@ fn pci_alias_matches(alias: &str, pci: crate::arch::pci::PciDevice) -> bool {
     ) && optional_hex_field_matches_at(alias, &mut offset, "bc", || u32::from(pci.class_code()), 2)
         && optional_hex_field_matches_at(alias, &mut offset, "sc", || u32::from(pci.subclass()), 2)
         && optional_hex_field_matches_at(alias, &mut offset, "i", || u32::from(pci.prog_if()), 2)
-}
-
-fn virtio_device_type(device_id: u16) -> Option<u32> {
-    match device_id {
-        PCI_DEVICE_VIRTIO_NET_TRANSITIONAL => Some(1),
-        PCI_DEVICE_VIRTIO_GPU_TRANSITIONAL => Some(16),
-        PCI_DEVICE_VIRTIO_MODERN_BASE..=PCI_DEVICE_VIRTIO_MODERN_END => {
-            Some(u32::from(device_id - PCI_DEVICE_VIRTIO_MODERN_BASE))
-        }
-        _ => None,
-    }
 }
 
 fn optional_hex_field_matches_at<F>(

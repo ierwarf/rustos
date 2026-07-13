@@ -1,7 +1,7 @@
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::sys::{diag_line, ui_profile_enabled};
+use crate::sys::{profile_line, ui_profile_enabled};
 
 #[derive(Default)]
 struct ProfileWindow {
@@ -162,12 +162,23 @@ pub(crate) fn maybe_emit() {
     let mut window = window().lock().unwrap();
     let now = Instant::now();
     let started_at = window.started_at.get_or_insert(now);
-    if now.duration_since(*started_at) < Duration::from_secs(1) {
+    let elapsed = now.duration_since(*started_at);
+    if elapsed < Duration::from_secs(1) {
         return;
     }
 
+    let elapsed_micros = duration_micros(elapsed).max(1);
+    let presents = window.full_presents.saturating_add(window.partial_presents);
+    // Frames per second scaled by 1,000 keeps the KVM gate integer-only while
+    // retaining enough precision for a 20 FPS release criterion.
+    let frame_hz_milli = presents
+        .saturating_mul(1_000_000_000)
+        .saturating_div(elapsed_micros);
+
     let line = format!(
-        "uiserver profile: loops={} input_events={} input_ms={} motion={} position={} other={} backlog={} cursor_moves={} wayland_calls={} wayland_ms={} runtime_calls={} runtime_ms={} con_calls={} con_chg={} con_ms={} full={} part={} rects={} full_ren_ms={} full_prs_ms={} part_ren_ms={} part_prs_ms={} mpix={} spins={}",
+        "uiserver profile: elapsed_ms={} frame_hz_milli={} loops={} input_events={} input_ms={} motion={} position={} other={} backlog={} cursor_moves={} wayland_calls={} wayland_ms={} runtime_calls={} runtime_ms={} con_calls={} con_chg={} con_ms={} full={} part={} rects={} full_ren_ms={} full_prs_ms={} part_ren_ms={} part_prs_ms={} mpix={} spins={}",
+        elapsed_micros / 1_000,
+        frame_hz_milli,
         window.input_loops,
         window.input_events,
         window.input_loop_micros / 1000,
@@ -193,7 +204,10 @@ pub(crate) fn maybe_emit() {
         window.present_pixels / 1_000_000,
         window.throttle_spins,
     );
-    diag_line(line);
+    // Profiling is explicitly enabled only for diagnostics. Emit its bounded
+    // once-per-second summary directly so a saturated structured-log queue
+    // cannot hide the very signal the KVM gate is validating.
+    profile_line(&line);
     *window = ProfileWindow {
         started_at: Some(now),
         ..ProfileWindow::default()

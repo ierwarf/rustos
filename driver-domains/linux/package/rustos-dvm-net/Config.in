@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: MIT
+
+config BR2_PACKAGE_RUSTOS_DVM_NET
+	bool "rustos-dvm-net"
+	help
+	  Bounded raw Ethernet relay between the DVM-owned Linux NIC and the
+	  host-created RustOS two-ring ivshmem network transport.

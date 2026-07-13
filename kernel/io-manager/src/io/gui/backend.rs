@@ -87,11 +87,8 @@ fn next_display_generation(current: u64) -> u64 {
     if next == 0 { 1 } else { next }
 }
 
-pub(crate) fn install_boot_framebuffer(info: FramebufferInfo, flags: u32) -> bool {
-    DISPLAY_BACKEND.lock().install_framebuffer(info, flags)
-}
-
 pub(crate) fn install_driver_framebuffer(info: FramebufferInfo, flags: u32) -> bool {
+    crate::io::dvm_display::on_framebuffer_installed(info.addr);
     DISPLAY_BACKEND.lock().install_framebuffer(info, flags)
 }
 
@@ -137,6 +134,7 @@ pub(crate) fn present_bgra8888_from_kernel(
     height: usize,
     stride_bytes: usize,
 ) -> bool {
+    crate::io::dvm_display::ensure_installed_before_present();
     if !present_context_allows_blocking() {
         return false;
     }
@@ -146,20 +144,20 @@ pub(crate) fn present_bgra8888_from_kernel(
     let presented = DISPLAY_BACKEND
         .lock()
         .with_framebuffer(|framebuffer| {
+            let dvm_frame = crate::io::dvm_display::begin_frame();
             let drawn =
                 framebuffer.draw_bgra8888_frame_from_kernel(src_ptr, width, height, stride_bytes);
             log_backend_present_sample(framebuffer, drawn);
-            if drawn {
-                return framebuffer.present_scene();
-            }
-            false
+            let presented = if drawn {
+                framebuffer.present_scene()
+            } else {
+                false
+            };
+            crate::io::dvm_display::finish_frame(dvm_frame);
+            presented
         })
         .unwrap_or(false);
-    if presented {
-        crate::driver::linux::virtio_gpu::flush_primary_scanout()
-    } else {
-        false
-    }
+    presented
 }
 
 pub(crate) fn present_bgra8888_rect_from_kernel(
@@ -169,21 +167,17 @@ pub(crate) fn present_bgra8888_rect_from_kernel(
     stride_bytes: usize,
     rect: FramebufferRect,
 ) -> bool {
+    crate::io::dvm_display::ensure_installed_before_present();
     if !present_context_allows_blocking() {
         return false;
     }
     if display_present_faulted() {
         return false;
     }
-    let flush_rect = crate::driver::linux::virtio_gpu::ScanoutFlushRect {
-        x: rect.x,
-        y: rect.y,
-        width: rect.width,
-        height: rect.height,
-    };
     let presented = DISPLAY_BACKEND
         .lock()
         .with_framebuffer(|framebuffer| {
+            let dvm_frame = crate::io::dvm_display::begin_frame();
             let drawn = framebuffer.draw_bgra8888_frame_rect_from_kernel(
                 src_ptr,
                 width,
@@ -192,17 +186,16 @@ pub(crate) fn present_bgra8888_rect_from_kernel(
                 rect,
             );
             log_backend_present_sample(framebuffer, drawn);
-            if drawn {
-                return framebuffer.present_scene();
-            }
-            false
+            let presented = if drawn {
+                framebuffer.present_scene()
+            } else {
+                false
+            };
+            crate::io::dvm_display::finish_frame(dvm_frame);
+            presented
         })
         .unwrap_or(false);
-    if presented {
-        crate::driver::linux::virtio_gpu::flush_primary_scanout_rect(Some(flush_rect))
-    } else {
-        false
-    }
+    presented
 }
 
 fn present_context_allows_blocking() -> bool {
