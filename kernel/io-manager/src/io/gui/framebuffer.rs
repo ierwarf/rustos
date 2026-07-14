@@ -242,68 +242,6 @@ impl Framebuffer {
         self.fill_rect(0, 0, self.width as u32, self.height as u32, color, 255);
     }
 
-    pub(crate) fn scroll_rect_up(
-        &mut self,
-        x: usize,
-        y: usize,
-        width: usize,
-        height: usize,
-        rows: usize,
-        clear_color: Rgb888,
-    ) {
-        if rows == 0 || width == 0 || height == 0 || x >= self.width || y >= self.height {
-            return;
-        }
-        let width = width.min(self.width - x);
-        let height = height.min(self.height - y);
-        let rows = rows.min(height);
-        if rows == 0 {
-            return;
-        }
-
-        let rect = FramebufferRect {
-            x,
-            y,
-            width,
-            height,
-        };
-        let Some((offset, row_bytes)) = self.rect_copy_bounds(rect) else {
-            return;
-        };
-        let copy_height = height.saturating_sub(rows);
-
-        if copy_height != 0 {
-            unsafe {
-                let base = self.active_buffer();
-                let mut src = base.add(offset + rows * self.stride_bytes);
-                let mut dst = base.add(offset);
-                for _ in 0..copy_height {
-                    for byte in 0..row_bytes {
-                        let value = ptr::read(src.add(byte));
-                        ptr::write(dst.add(byte), value);
-                    }
-                    src = src.add(self.stride_bytes);
-                    dst = dst.add(self.stride_bytes);
-                }
-            }
-            self.mark_dirty_rect(FramebufferRect {
-                x,
-                y,
-                width,
-                height: copy_height,
-            });
-        }
-
-        self.fill_rect(
-            x as i64,
-            (y + copy_height) as i64,
-            width as u32,
-            rows as u32,
-            clear_color,
-            255,
-        );
-    }
-
     pub(crate) fn draw_pixel(&mut self, x: usize, y: usize, color: Rgb888, alpha: u8) {
         if alpha == 0 || x >= self.width || y >= self.height {
             return;
@@ -397,44 +335,6 @@ impl Framebuffer {
                 .active_buffer()
                 .add(rect.y * self.stride_bytes + rect.x * self.bpp);
             let mut src_row = src_ptr.add(rect.y * stride_bytes + rect.x * 4);
-            for _ in 0..rect.height {
-                self.blit_bgra8888_row(dst_row, src_row, rect.width);
-                src_row = src_row.add(stride_bytes);
-                dst_row = dst_row.add(self.stride_bytes);
-            }
-        }
-
-        self.mark_dirty_rect(rect);
-        true
-    }
-
-    pub(crate) fn draw_bgra8888_rect_from_kernel(
-        &mut self,
-        src_ptr: *const u8,
-        stride_bytes: usize,
-        rect: FramebufferRect,
-    ) -> bool {
-        if rect.width == 0 || rect.height == 0 {
-            return true;
-        }
-        if rect.x.saturating_add(rect.width) > self.width
-            || rect.y.saturating_add(rect.height) > self.height
-        {
-            return false;
-        }
-
-        let Some(min_stride) = rect.width.checked_mul(4) else {
-            return false;
-        };
-        if stride_bytes < min_stride || self.rect_copy_bounds(rect).is_none() {
-            return false;
-        }
-
-        unsafe {
-            let mut dst_row = self
-                .active_buffer()
-                .add(rect.y * self.stride_bytes + rect.x * self.bpp);
-            let mut src_row = src_ptr;
             for _ in 0..rect.height {
                 self.blit_bgra8888_row(dst_row, src_row, rect.width);
                 src_row = src_row.add(stride_bytes);
@@ -823,53 +723,5 @@ mod tests {
         (framebuffer, storage)
     }
 
-    #[test]
-    fn scroll_rect_up_moves_only_the_requested_region() {
-        let (mut framebuffer, mut storage) = test_framebuffer(6, 4, 4, 0);
-
-        for y in 0..4usize {
-            for x in 0..6usize {
-                let idx = y * framebuffer.stride_bytes + x * framebuffer.bpp;
-                storage[idx] = (x as u8) + 1;
-                storage[idx + 1] = (y as u8) + 1;
-                storage[idx + 2] = 0x7f;
-                storage[idx + 3] = 0;
-            }
-        }
-
-        framebuffer.scroll_rect_up(1, 1, 3, 3, 1, Rgb888::BLACK);
-
-        for y in 0..4usize {
-            for x in 0..6usize {
-                let idx = y * framebuffer.stride_bytes + x * framebuffer.bpp;
-                let actual = [
-                    storage[idx],
-                    storage[idx + 1],
-                    storage[idx + 2],
-                    storage[idx + 3],
-                ];
-                let expected = if (1..4).contains(&x) && (1..3).contains(&y) {
-                    [(x as u8) + 1, (y as u8) + 2, 0x7f, 0]
-                } else if (1..4).contains(&x) && y == 3 {
-                    [0, 0, 0, 0]
-                } else {
-                    [(x as u8) + 1, (y as u8) + 1, 0x7f, 0]
-                };
-                assert_eq!(actual, expected, "pixel mismatch at ({x}, {y})");
-            }
-        }
-    }
-
-    #[test]
-    fn scroll_rect_up_respects_framebuffer_bounds_with_padded_rectangles() {
-        let guard_len = 32usize;
-        let (mut framebuffer, mut storage) = test_framebuffer(8, 4, 4, guard_len);
-        let framebuffer_size = framebuffer.size;
-        storage[framebuffer_size..].fill(0xa5);
-
-        framebuffer.scroll_rect_up(1, 0, 7, 4, 1, Rgb888::BLACK);
-
-        assert!(storage[framebuffer_size..].iter().all(|&byte| byte == 0xa5));
-    }
 }
 // RING3-MIGRATION-REFERENCE END: uiserver-owned framebuffer substrate exception.

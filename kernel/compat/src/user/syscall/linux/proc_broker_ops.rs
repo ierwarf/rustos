@@ -16,12 +16,11 @@ use rustos_user_abi::syscall::{
     IPC_SERVICE_CAP_PROCESS_LOADER, IPC_SERVICE_CAP_PROCESS_POLICY, LOADER_SPAWN_ARG_BYTES,
     LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_FLAG_DEFER_START, LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF,
     LOADER_SPAWN_MAX_ARG_COUNT, LOADER_SPAWN_MAX_ENV_COUNT, PROC_BROKER_ABI_VERSION,
-    PROC_BROKER_BATCH_CAPACITY,
-    PROC_BROKER_FORMAT_ELF64, PROC_BROKER_FORMAT_PE64, PROC_BROKER_LINUX_INTERP_PATH_CAPACITY,
-    PROC_BROKER_MAP_EXEC, PROC_BROKER_MAP_PRIVATE, PROC_BROKER_MAP_READ, PROC_BROKER_MAP_WRITE,
-    PROC_BROKER_USER_SPACE_BASE, PROC_BROKER_USER_SPACE_END_EXCLUSIVE, RustosProcAbortBrokerArgs,
-    RustosProcActivateBrokerArgs, RustosProcAuthorizeExecBrokerArgs,
-    RustosProcCancelExecBrokerArgs, RustosProcCommitBrokerArgs,
+    PROC_BROKER_BATCH_CAPACITY, PROC_BROKER_FORMAT_ELF64, PROC_BROKER_FORMAT_PE64,
+    PROC_BROKER_LINUX_INTERP_PATH_CAPACITY, PROC_BROKER_MAP_EXEC, PROC_BROKER_MAP_PRIVATE,
+    PROC_BROKER_MAP_READ, PROC_BROKER_MAP_WRITE, PROC_BROKER_USER_SPACE_BASE,
+    PROC_BROKER_USER_SPACE_END_EXCLUSIVE, RustosProcAbortBrokerArgs, RustosProcActivateBrokerArgs,
+    RustosProcAuthorizeExecBrokerArgs, RustosProcCancelExecBrokerArgs, RustosProcCommitBrokerArgs,
     RustosProcExecTargetBrokerArgs, RustosProcForkBrokerArgs, RustosProcMapDataBrokerArgs,
     RustosProcMapFileBatchBrokerArgs, RustosProcMapFileBrokerArgs, RustosProcMapZeroedBrokerArgs,
     RustosProcPrepareBrokerArgs, RustosProcSetLinuxRuntimeBrokerArgs,
@@ -547,18 +546,19 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
         Err(errno) => return linux_errno(errno),
     };
     let session = if args.console_session == 0 {
-        multitask::current_user_snapshot()
-            .map(|snapshot| snapshot.console_session())
-            .unwrap_or(crate::io::session::ConsoleSessionHandle::SYSTEM)
+        match multitask::current_user_snapshot() {
+            Some(snapshot) => snapshot.console_session(),
+            None => return linux_errno(LINUX_EINVAL),
+        }
     } else {
         crate::io::session::ConsoleSessionHandle::from_raw(args.console_session)
     };
     let logical_admin = args.flags & SPAWN_FLAG_LOGICAL_ADMIN != 0;
     let launch = crate::user::process::ProcessLaunchOptions {
+        registers: crate::user::process::ProcessStartRegisters::new(),
         linux: linux_launch,
         console_session: session,
         logical_admin,
-        ..crate::user::process::ProcessLaunchOptions::default()
     };
     let prepared = match state.format {
         PROC_BROKER_FORMAT_ELF64 => {
@@ -601,10 +601,7 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
     } else if args.flags & LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF as u64 != 0 {
         crate::user::process::spawn_prepared_process(prepared, args.weight_micros)
     } else {
-        crate::user::process::spawn_prepared_process_for_loader_reply(
-            prepared,
-            args.weight_micros,
-        )
+        crate::user::process::spawn_prepared_process_for_loader_reply(prepared, args.weight_micros)
     };
     match spawned {
         Ok(spawned) => spawned.pid,
@@ -783,9 +780,10 @@ pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64
         Err(errno) => return linux_errno(errno),
     };
     let session = if args.console_session == 0 {
-        multitask::linux_thread_snapshot_by_ids(args.target_pid, args.target_tid)
-            .map(|snapshot| snapshot.console_session)
-            .unwrap_or(crate::io::session::ConsoleSessionHandle::SYSTEM)
+        match multitask::linux_thread_snapshot_by_ids(args.target_pid, args.target_tid) {
+            Some(snapshot) => snapshot.console_session,
+            None => return linux_errno(LINUX_EINVAL),
+        }
     } else {
         crate::io::session::ConsoleSessionHandle::from_raw(args.console_session)
     };
@@ -794,10 +792,10 @@ pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64
     })
     .unwrap_or(false);
     let launch = crate::user::process::ProcessLaunchOptions {
+        registers: crate::user::process::ProcessStartRegisters::new(),
         linux: linux_launch,
         console_session: session,
         logical_admin,
-        ..crate::user::process::ProcessLaunchOptions::default()
     };
     // Same loaderd contract as prepare: linux_runtime must be populated; the
     // bytes-image fallback into ring0 ELF parsing was retired.
@@ -1027,17 +1025,13 @@ pub(super) fn cleanup_proc_broker_exec_state_for_thread(
 ) -> (usize, usize) {
     let mut tickets = EXEC_TICKETS.lock();
     let tickets_before = tickets.len();
-    tickets.retain(|_, state| {
-        state.target_pid != process_id || state.target_tid != thread_id
-    });
+    tickets.retain(|_, state| state.target_pid != process_id || state.target_tid != thread_id);
     let removed_tickets = tickets_before.saturating_sub(tickets.len());
     drop(tickets);
 
     let mut transitions = EXEC_TRANSITIONS.lock();
     let transitions_before = transitions.len();
-    transitions.retain(|_, state| {
-        state.target_pid != process_id || state.target_tid != thread_id
-    });
+    transitions.retain(|_, state| state.target_pid != process_id || state.target_tid != thread_id);
     let removed_transitions = transitions_before.saturating_sub(transitions.len());
 
     (removed_tickets, removed_transitions)

@@ -63,19 +63,19 @@ fn broker_query_layout(args: &RustosMmBrokerArgs) -> Result<(), i64> {
         let linux = process_state
             .linux_process_state()
             .copied()
-            .unwrap_or_default();
-        RustosMmLayoutBrokerResult {
+            .ok_or(LINUX_EINVAL)?;
+        Ok::<_, i64>(RustosMmLayoutBrokerResult {
             brk_start: linux.brk_start,
             brk_current: linux.brk_current,
             brk_mapped_end: linux.brk_mapped_end,
             mmap_next: linux.mmap_next,
             user_range_start: paging::USER_SPACE_BASE,
             user_range_end: paging::USER_SPACE_END_EXCLUSIVE,
-        }
+        })
     }) else {
         return Err(LINUX_ESRCH);
     };
-    write_out(args, &result)
+    write_out(args, &result?)
 }
 
 fn broker_describe_fd(args: &RustosMmBrokerArgs) -> Result<(), i64> {

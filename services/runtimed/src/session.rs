@@ -379,7 +379,7 @@ fn noncanonical_input_bytes(termios: LinuxTermios, event: InputEvent) -> Result<
 pub(super) fn bootstrap_ui_server(state: &mut BrokerState) -> Result<(), i32> {
     boot_line("runtimed: waiting for devmgrd before ui bootstrap");
     wait_for_service_endpoint(IPC_SERVICE_DEVMGRD)?;
-    let (args, env) = ui_server_bootstrap_args_env();
+    let (args, env) = ui_server_bootstrap_args_env()?;
     super::spawn::spawn_tracked_process(
         state,
         LaunchEntry {
@@ -918,29 +918,30 @@ fn session_capability_mask(op: u16) -> u64 {
     }
 }
 
-fn ui_server_bootstrap_args_env() -> (Vec<String>, Vec<String>) {
+fn ui_server_bootstrap_args_env() -> Result<(Vec<String>, Vec<String>), i32> {
     // Bootstrap happens before the launch catalog loader has finished, so we
     // pull the uiserver desktop entry (and the Init-scope env defaults) up
     // front. Reading from the registry warms the OnceLock cache; the catalog
     // loader thread reuses it without a second disk read.
-    let mut env = Vec::new();
-    if let Ok(values) =
-        load_runtime_default_env(DEFAULT_RUNTIME_ENV_REGISTRY_PATH, RuntimeEnvScope::Init)
-    {
-        env.extend(values);
+    let mut env = load_runtime_default_env(DEFAULT_RUNTIME_ENV_REGISTRY_PATH, RuntimeEnvScope::Init)
+        .map_err(runtime_registry_errno)?;
+    let entry = load_desktop_program_entries(DEFAULT_APPLICATIONS_DIR)
+        .map_err(runtime_registry_errno)?
+        .into_iter()
+        .find(|entry| entry.desktop_file_id == UI_SERVER_DESKTOP_FILE_ID)
+        .ok_or(libc::ENOENT)?;
+    if entry.exec != UI_SERVER_EXEC_PATH {
+        return Err(libc::EINVAL);
     }
+    merge_manifest_env_into(&mut env, &entry.env);
+    Ok((entry.args, env))
+}
 
-    let mut args = Vec::new();
-    if let Ok(entries) = load_desktop_program_entries(DEFAULT_APPLICATIONS_DIR) {
-        if let Some(entry) = entries
-            .into_iter()
-            .find(|entry| entry.desktop_file_id == UI_SERVER_DESKTOP_FILE_ID)
-        {
-            args = entry.args;
-            merge_manifest_env_into(&mut env, &entry.env);
-        }
+fn runtime_registry_errno(error: std::io::Error) -> i32 {
+    match error.raw_os_error() {
+        Some(errno) if errno > 0 => errno,
+        _ => libc::EIO,
     }
-    (args, env)
 }
 
 fn merge_manifest_env_into(env: &mut Vec<String>, manifest_env: &[String]) {

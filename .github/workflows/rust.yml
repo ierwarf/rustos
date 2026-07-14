@@ -67,13 +67,29 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - name: Cache formal toolchains
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/bin/cargo-kani
+          ~/.cargo/bin/kani
+          ~/.kani
+          ~/.cache/rustos/verus
+          ~/.cargo/registry
+        key: ${{ runner.os }}-formal-${{ hashFiles('formal/tla2tools.lock', 'formal/kani.lock', 'formal/verus.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-formal-
     - name: Install Java for TLC
       uses: actions/setup-java@v4
       with:
         distribution: temurin
         java-version: '17'
-    - name: Model check RustOS service-control contracts
-      run: bash formal/run-all-tlc.sh
+    - name: Install pinned Kani verifier
+      run: bash formal/setup-kani.sh
+    - name: Install pinned Verus proof kernel
+      run: bash formal/setup-verus.sh
+    - name: Verify RustOS formal contracts and implementation boundaries
+      run: bash formal/verify-all.sh
 
   docs:
     runs-on: ubuntu-latest

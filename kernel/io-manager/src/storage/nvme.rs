@@ -1,9 +1,9 @@
 // RING3-MIGRATION-REFERENCE START: bootstrap exception: storaged owns
 // post-bootstrap NVMe admission/provider policy. Ring0 keeps this built-in
-// NVMe path as early-boot/fallback privileged transport substrate until a
+// NVMe path as early-boot privileged transport substrate until a
 // ring3 service-driver host can perform boot-volume reads before rootd/vfsd
 // need them.
-// Built-in NVMe is an early-boot/fallback path. Post-bootstrap storage policy is
+// Built-in NVMe is early-boot substrate. Post-bootstrap storage policy is
 // routed through storaged, with Linux `.ko` bridge modules used for compat.
 use alloc::boxed::Box;
 use alloc::format;
@@ -110,7 +110,6 @@ struct NvmeController {
     mmio_len: usize,
     dma_key: *mut c_void,
     doorbell_stride: usize,
-    #[allow(dead_code)]
     version: u32,
 }
 
@@ -133,13 +132,12 @@ struct NvmeQueue {
 unsafe impl Send for NvmeQueue {}
 
 struct NvmeRuntime {
-    #[allow(dead_code)]
-    admin: NvmeQueue,
+    // Retain the DMA-backed admin queue and identify buffer for the controller
+    // lifetime. The device can still DMA them after initialization.
+    _admin: NvmeQueue,
     io: NvmeQueue,
-    #[allow(dead_code)]
-    identify_cpu: *mut u8,
-    #[allow(dead_code)]
-    identify_dma: u64,
+    _identify_cpu: *mut u8,
+    _identify_dma: u64,
     data_cpu: *mut u8,
     data_dma: u64,
     prp_list_cpu: *mut u64,
@@ -153,8 +151,6 @@ struct NvmeBlockDevice {
     namespace_id: u32,
     block_count: u64,
     logical_block_size: usize,
-    #[allow(dead_code)]
-    model: String,
     runtime: KernelWaitLock<NvmeRuntime>,
 }
 
@@ -545,12 +541,11 @@ fn probe_controller(pci: PciDevice) -> Result<Option<NvmeBlockDevice>, DiskIoErr
         namespace_id,
         block_count,
         logical_block_size,
-        model,
         runtime: KernelWaitLock::new(NvmeRuntime {
-            admin,
+            _admin: admin,
             io,
-            identify_cpu,
-            identify_dma,
+            _identify_cpu: identify_cpu,
+            _identify_dma: identify_dma,
             data_cpu,
             data_dma,
             prp_list_cpu,

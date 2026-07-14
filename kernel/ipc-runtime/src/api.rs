@@ -43,6 +43,10 @@ pub mod endpoint {
         )
     }
 
+    pub fn receiver_process_for_reply(reply: KernelReplyHandle) -> Option<u64> {
+        crate::ipc::endpoint_receiver_process_for_reply(reply)
+    }
+
     pub fn recv(
         endpoint: KernelEndpointHandle,
     ) -> Result<Option<(KernelReplyHandle, alloc::vec::Vec<u8>)>, IpcError> {

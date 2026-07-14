@@ -5,6 +5,12 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 const EARLY_SERVICE_CALL_SAMPLES: usize = 6;
 const SLOW_SERVICE_CALL_THRESHOLD_MS: u64 = 10;
 const MAX_SLOW_SERVICE_CALL_LOGS: usize = 128;
+// A readiness probe cannot consume an event: it only transfers authenticated
+// ingress into inputd's policy queue. Bound that safe, idempotent operation so
+// a wedged inputd cannot freeze uiserver's input loop for the generic service
+// IPC deadline. Stateful authorize/read calls retain their completion wait
+// until the ABI carries a cancellable authorization lease.
+const INPUTD_READINESS_IPC_TIMEOUT_MS: u64 = 16;
 
 static SLOW_SERVICE_CALL_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -74,7 +80,7 @@ fn spawn_bootstrap_exec_direct(
     let session = if console_session == 0 {
         multitask::current_user_snapshot()
             .map(|snapshot| snapshot.console_session())
-            .unwrap_or(crate::io::session::ConsoleSessionHandle::SYSTEM)
+            .ok_or(LINUX_EINVAL)?
     } else {
         crate::io::session::ConsoleSessionHandle::from_raw(console_session)
     };
@@ -510,7 +516,11 @@ pub fn input_device_has_pending_events(fd: u64) -> Result<bool, i64> {
         request.pid = snapshot.process_id();
         request.tid = snapshot.thread_id();
     }
-    let response = ipc_ops::call_service_endpoint(IPC_SERVICE_INPUTD, as_bytes(&request))?;
+    let response = ipc_ops::call_service_endpoint_with_timeout(
+        IPC_SERVICE_INPUTD,
+        as_bytes(&request),
+        INPUTD_READINESS_IPC_TIMEOUT_MS,
+    )?;
     if response.len() != size_of::<InputdIpcResponse>() {
         return Err(LINUX_EINVAL);
     }
@@ -532,7 +542,8 @@ pub fn input_device_has_pending_events(fd: u64) -> Result<bool, i64> {
 pub fn current_console_session_is_system() -> bool {
     multitask::current_user_snapshot()
         .map(|snapshot| snapshot.console_session().is_system())
-        .unwrap_or(true)
+        // A missing user task must not be elevated into the system console.
+        .unwrap_or(false)
 }
 
 pub fn console_read_via_sessiond(user_ptr: u64, user_len: usize) -> Result<u64, i64> {

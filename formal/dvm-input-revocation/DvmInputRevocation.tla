@@ -24,15 +24,16 @@ Reset(epoch) == [kind |-> "reset", epoch |-> epoch, key |-> NoKey, pressed |-> F
 KeyTransition(epoch, key, pressed) ==
     [kind |-> "key", epoch |-> epoch, key |-> key, pressed |-> pressed]
 
-VARIABLES currentEpoch, resetDeliveredEpoch, queue, heldKeys, heldEpoch
+VARIABLES currentEpoch, resetDeliveredEpoch, issuedEpochs, queue, heldKeys, heldEpoch
 
-vars == <<currentEpoch, resetDeliveredEpoch, queue, heldKeys, heldEpoch>>
+vars == <<currentEpoch, resetDeliveredEpoch, issuedEpochs, queue, heldKeys, heldEpoch>>
 
 QueueHasReset == \E index \in 1..Len(queue): queue[index].kind = "reset"
 
 Init ==
     /\ currentEpoch = NoEpoch
     /\ resetDeliveredEpoch = NoEpoch
+    /\ issuedEpochs = {}
     /\ queue = <<>>
     /\ heldKeys = {}
     /\ heldEpoch = NoEpoch
@@ -42,7 +43,12 @@ Init ==
 \* event_queue::submit_dvm_input_reset.
 StartSession(epoch) ==
     /\ epoch \in Epochs
+    \* L0 allocates a fresh epoch for every authenticated relay.  Reusing a
+    \* retired epoch would let a recorded sequence restart at one after a
+    \* later reset barrier, turning the sequence check into a replay oracle.
+    /\ epoch \notin issuedEpochs
     /\ currentEpoch' = epoch
+    /\ issuedEpochs' = issuedEpochs \cup {epoch}
     /\ queue' = <<Reset(epoch)>>
     /\ UNCHANGED <<resetDeliveredEpoch, heldKeys, heldEpoch>>
 
@@ -54,7 +60,7 @@ QueueKey(key, pressed) ==
     /\ pressed \in BOOLEAN
     /\ Len(queue) < MaxQueue
     /\ queue' = Append(queue, KeyTransition(currentEpoch, key, pressed))
-    /\ UNCHANGED <<currentEpoch, resetDeliveredEpoch, heldKeys, heldEpoch>>
+    /\ UNCHANGED <<currentEpoch, resetDeliveredEpoch, issuedEpochs, heldKeys, heldEpoch>>
 
 \* SESSION_END uses the same priority reset. The old producer loses its
 \* current epoch immediately; inputd emits synthetic releases on delivery.
@@ -62,7 +68,7 @@ EndSession ==
     /\ currentEpoch \in Epochs
     /\ currentEpoch' = NoEpoch
     /\ queue' = <<Reset(currentEpoch)>>
-    /\ UNCHANGED <<resetDeliveredEpoch, heldKeys, heldEpoch>>
+    /\ UNCHANGED <<resetDeliveredEpoch, issuedEpochs, heldKeys, heldEpoch>>
 
 DeliverReset ==
     /\ Len(queue) > 0
@@ -71,7 +77,7 @@ DeliverReset ==
     /\ resetDeliveredEpoch' = queue[1].epoch
     /\ heldKeys' = {}
     /\ heldEpoch' = NoEpoch
-    /\ UNCHANGED currentEpoch
+    /\ UNCHANGED <<currentEpoch, issuedEpochs>>
 
 DeliverKey ==
     /\ Len(queue) > 0
@@ -85,7 +91,7 @@ DeliverKey ==
                       ELSE heldKeys \ {queue[1].key}
     /\ heldEpoch' = IF queue[1].pressed THEN currentEpoch
                     ELSE IF heldKeys \ {queue[1].key} = {} THEN NoEpoch ELSE currentEpoch
-    /\ UNCHANGED <<currentEpoch, resetDeliveredEpoch>>
+    /\ UNCHANGED <<currentEpoch, resetDeliveredEpoch, issuedEpochs>>
 
 Next ==
     \/ \E epoch \in Epochs: StartSession(epoch)
@@ -97,6 +103,7 @@ Next ==
 TypeOK ==
     /\ currentEpoch \in Epochs \cup {NoEpoch}
     /\ resetDeliveredEpoch \in Epochs \cup {NoEpoch}
+    /\ issuedEpochs \subseteq Epochs
     /\ queue \in Seq({Reset(epoch) : epoch \in Epochs}
                     \cup {KeyTransition(epoch, key, pressed) :
                               epoch \in Epochs, key \in Keys, pressed \in BOOLEAN})
@@ -123,6 +130,9 @@ DeliveredCurrentEpochOwnsEveryHeldKey ==
 NoActiveSessionAfterEndCanReceiveInput ==
     currentEpoch = NoEpoch =>
         \A index \in 1..Len(queue): queue[index].kind # "key"
+
+ActiveEpochWasIssuedExactlyOnce ==
+    currentEpoch \in Epochs => currentEpoch \in issuedEpochs
 
 Spec == Init /\ [][Next]_vars
 =============================================================================

@@ -178,6 +178,7 @@ AcceptExpectedPeer(cid, session) ==
     /\ cid = ExpectedCid
     /\ cid \in PeerCids
     /\ session \in SessionIds \ issuedSessions
+    /\ now <= MaxTime - HelloDeadline
     /\ phase' = AwaitHello
     /\ peerCid' = cid
     /\ controlSession' = session
@@ -217,6 +218,7 @@ AcceptMatchingHello(challenge) ==
     /\ peerCid = ExpectedCid
     /\ controlSession \in issuedSessions
     /\ now < helloDeadline
+    /\ now <= MaxTime - ProofDeadline
     /\ challenge \in ChallengeNonces \ issuedChallenges
     /\ phase' = AwaitProof
     /\ activeChallenge' = challenge
@@ -264,6 +266,7 @@ SendControlRequest(op) ==
     /\ pendingOp = NoOp
     /\ op = NextControlRequest(completedOps)
     /\ op \in Ops
+    /\ now <= MaxTime - ReplyDeadline
     /\ phase' = ControlReady
     /\ pendingOp' = op
     /\ pendingRequestId' = RequestId(op)
@@ -423,16 +426,16 @@ TypeOK ==
     /\ peerCid \in PeerCids \cup {NoCid}
     /\ controlSession \in SessionIds \cup {NoSession}
     /\ issuedSessions \subseteq SessionIds
-    /\ helloDeadline \in Nat
+    /\ helloDeadline \in 0..MaxTime
     /\ activeChallenge \in ChallengeNonces \cup {NoChallenge}
     /\ issuedChallenges \subseteq ChallengeNonces
-    /\ proofDeadline \in Nat
+    /\ proofDeadline \in 0..MaxTime
     /\ proofAccepted \in BOOLEAN
     /\ completedOps \subseteq Ops
     /\ pendingOp \in Ops \cup {NoOp}
     /\ pendingRequestId \in 0..4
     /\ pendingSession \in SessionIds \cup {NoSession}
-    /\ replyDeadline \in Nat
+    /\ replyDeadline \in 0..MaxTime
     /\ issuedRelayEpochs \subseteq RelayEpochs
     /\ activeRelayEpoch \in RelayEpochs \cup {NoEpoch}
     /\ receiverEpoch \in RelayEpochs \cup {NoEpoch}
@@ -534,5 +537,15 @@ RelayReceiverCannotOutliveItsControlChannel ==
         /\ phase = Relaying
         /\ receiverEpoch = activeRelayEpoch
         /\ peerCid = ExpectedCid
+
+HandshakeEventuallyResolves ==
+    (phase \in {AwaitHello, AwaitProof}) ~>
+        (phase \in {Idle, ControlReady, Relaying})
+
+PendingControlEventuallyResolves ==
+    (phase = ControlReady /\ pendingOp # NoOp) ~>
+        (phase = Idle \/ pendingOp = NoOp)
+
+Spec == Init /\ [][Next]_vars /\ WF_vars(AdvanceTime)
 
 =============================================================================

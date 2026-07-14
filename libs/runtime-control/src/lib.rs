@@ -186,9 +186,10 @@ impl RuntimeClient {
             return Ok(Vec::new());
         }
 
-        let count = usize::try_from(response.count)
-            .unwrap_or(0)
-            .min(MAX_RUNTIME_PROGRAMS);
+        let count = usize::try_from(response.count).map_err(|_| libc::EOVERFLOW)?;
+        if count > MAX_RUNTIME_PROGRAMS {
+            return Err(libc::EOVERFLOW);
+        }
         let expected = count
             .checked_mul(size_of::<RuntimeRunningProgram>())
             .ok_or(libc::EOVERFLOW)?;
@@ -265,31 +266,48 @@ impl RuntimeClient {
 
         let mut response = RuntimeResponse::default();
         read_exact_retry(&mut stream, as_bytes_mut(&mut response))?;
-        if response.version != PROTOCOL_VERSION {
-            return Err(libc::EPROTO);
-        }
-        if response.status != 0 {
-            return Err(-response.status);
-        }
-
-        let payload_len = match response.op {
-            OP_SNAPSHOT_RUNNING_PROGRAMS => {
-                let count = usize::try_from(response.count).map_err(|_| libc::EOVERFLOW)?;
-                if count > MAX_RUNTIME_PROGRAMS {
-                    return Err(libc::EOVERFLOW);
-                }
-                count
-                    .checked_mul(size_of::<RuntimeRunningProgram>())
-                    .ok_or(libc::EOVERFLOW)?
-            }
-            _ if response.count == 0 => 0,
-            _ => return Err(libc::EPROTO),
-        };
+        let payload_len = response_payload_len(request, &response)?;
         let mut payload = vec![0_u8; payload_len];
         if payload_len != 0 {
             read_exact_retry(&mut stream, &mut payload)?;
         }
         Ok((response, payload))
+    }
+}
+
+/// Validate the complete response identity before a caller can treat an RPC as
+/// successful.  A peer may return an error response with opcode zero, but a
+/// successful response must echo the exact request opcode and its payload
+/// shape.  This prevents a stale or cross-request reply from becoming a false
+/// launch/terminate success.
+fn response_payload_len(
+    request: &RuntimeRequest,
+    response: &RuntimeResponse,
+) -> Result<usize, i32> {
+    if response.version != PROTOCOL_VERSION {
+        return Err(libc::EPROTO);
+    }
+    if response.status < 0 {
+        return Err(response.status.checked_neg().ok_or(libc::EPROTO)?);
+    }
+    if response.status > 0 || response.op != request.op {
+        return Err(libc::EPROTO);
+    }
+
+    match request.op {
+        OP_SNAPSHOT_RUNNING_PROGRAMS => {
+            let count = usize::try_from(response.count).map_err(|_| libc::EOVERFLOW)?;
+            if count > MAX_RUNTIME_PROGRAMS {
+                return Err(libc::EOVERFLOW);
+            }
+            Ok(count
+                .checked_mul(size_of::<RuntimeRunningProgram>())
+                .ok_or(libc::EOVERFLOW)?)
+        }
+        OP_REQUEST_LAUNCH_PATH | OP_REQUEST_TERMINATE | OP_NOTIFY_READY if response.count == 0 => {
+            Ok(0)
+        }
+        _ => Err(libc::EPROTO),
     }
 }
 
@@ -385,15 +403,7 @@ pub fn load_startup_entries(path: &str) -> Result<Vec<StartupEntry>, std::io::Er
         path,
         DEFAULT_APPLICATIONS_DIR | DEFAULT_STARTUP_REGISTRY_PATH
     ) {
-        if let Some(entries) = cached_startup_registry_entries() {
-            return Ok(entries);
-        }
-        if path == DEFAULT_STARTUP_REGISTRY_PATH {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "startup registry unavailable",
-            ));
-        }
+        return cached_startup_registry_entries();
     }
 
     let mut entries = load_desktop_program_entries(path)?
@@ -421,9 +431,7 @@ pub fn load_desktop_program_entries(
     path: &str,
 ) -> Result<Vec<DesktopProgramEntry>, std::io::Error> {
     if path == DEFAULT_APPLICATIONS_DIR {
-        if let Some(entries) = cached_desktop_registry_entries() {
-            return Ok(entries);
-        }
+        return cached_desktop_registry_entries();
     }
     load_desktop_entries(path, DesktopLoadMode::Applications)
 }
@@ -432,12 +440,10 @@ pub fn load_autostart_program_entries(
     path: &str,
 ) -> Result<Vec<DesktopProgramEntry>, std::io::Error> {
     if path == DEFAULT_AUTOSTART_DIR {
-        if let Some(entries) = cached_desktop_registry_entries() {
-            return Ok(entries
-                .into_iter()
-                .filter(|entry| entry.autostart_enabled && !entry.hidden && !entry.no_display)
-                .collect());
-        }
+        return Ok(cached_desktop_registry_entries()?
+            .into_iter()
+            .filter(|entry| entry.autostart_enabled && !entry.hidden && !entry.no_display)
+            .collect());
     }
     load_desktop_entries(path, DesktopLoadMode::Autostart)
 }
@@ -461,12 +467,7 @@ pub fn load_runtime_default_env(
     scope: RuntimeEnvScope,
 ) -> Result<Vec<String>, std::io::Error> {
     let entries = if path == DEFAULT_RUNTIME_ENV_REGISTRY_PATH {
-        cached_runtime_env_registry_entries().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "runtime env registry unavailable",
-            )
-        })?
+        cached_runtime_env_registry_entries()?
     } else {
         load_runtime_env_registry_entries(path)?
     };
@@ -514,14 +515,18 @@ fn load_desktop_registry_entries(path: &str) -> Result<Vec<DesktopProgramEntry>,
     let contents = fs::read_to_string(path)?;
     let mut entries = Vec::new();
 
-    for line in contents.lines() {
+    for (line_number, line) in contents.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if let Some(entry) = parse_desktop_registry_entry(line) {
-            entries.push(entry);
-        }
+        let entry = parse_desktop_registry_entry(line).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid desktop registry entry at line {}", line_number + 1),
+            )
+        })?;
+        entries.push(entry);
     }
 
     entries.sort_by(|lhs, rhs| {
@@ -536,14 +541,18 @@ fn load_startup_registry_entries(path: &str) -> Result<Vec<StartupEntry>, std::i
     let contents = fs::read_to_string(path)?;
     let mut entries = Vec::new();
 
-    for line in contents.lines() {
+    for (line_number, line) in contents.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if let Some(entry) = parse_startup_registry_entry(line) {
-            entries.push(entry);
-        }
+        let entry = parse_startup_registry_entry(line).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid startup registry entry at line {}", line_number + 1),
+            )
+        })?;
+        entries.push(entry);
     }
 
     entries.sort_by(|lhs, rhs| {
@@ -555,22 +564,28 @@ fn load_startup_registry_entries(path: &str) -> Result<Vec<StartupEntry>, std::i
     Ok(entries)
 }
 
-fn cached_startup_registry_entries() -> Option<Vec<StartupEntry>> {
+fn cached_startup_registry_entries() -> Result<Vec<StartupEntry>, std::io::Error> {
     if let Some(entries) = STARTUP_REGISTRY_CACHE.get() {
-        return Some(entries.clone());
+        return Ok(entries.clone());
     }
-    let entries = load_startup_registry_entries(DEFAULT_STARTUP_REGISTRY_PATH).ok()?;
+    let entries = load_startup_registry_entries(DEFAULT_STARTUP_REGISTRY_PATH)?;
     let _ = STARTUP_REGISTRY_CACHE.set(entries);
-    STARTUP_REGISTRY_CACHE.get().cloned()
+    STARTUP_REGISTRY_CACHE
+        .get()
+        .cloned()
+        .ok_or_else(|| std::io::Error::other("startup registry cache initialization failed"))
 }
 
-fn cached_desktop_registry_entries() -> Option<Vec<DesktopProgramEntry>> {
+fn cached_desktop_registry_entries() -> Result<Vec<DesktopProgramEntry>, std::io::Error> {
     if let Some(entries) = DESKTOP_REGISTRY_CACHE.get() {
-        return Some(entries.clone());
+        return Ok(entries.clone());
     }
-    let entries = load_desktop_registry_entries(DEFAULT_DESKTOP_REGISTRY_PATH).ok()?;
+    let entries = load_desktop_registry_entries(DEFAULT_DESKTOP_REGISTRY_PATH)?;
     let _ = DESKTOP_REGISTRY_CACHE.set(entries);
-    DESKTOP_REGISTRY_CACHE.get().cloned()
+    DESKTOP_REGISTRY_CACHE
+        .get()
+        .cloned()
+        .ok_or_else(|| std::io::Error::other("desktop registry cache initialization failed"))
 }
 
 fn cached_runtime_launch_registry_entries() -> Result<Vec<DesktopProgramEntry>, std::io::Error> {
@@ -579,32 +594,42 @@ fn cached_runtime_launch_registry_entries() -> Result<Vec<DesktopProgramEntry>, 
     }
     let entries = load_desktop_registry_entries(DEFAULT_RUNTIME_LAUNCH_REGISTRY_PATH)?;
     let _ = RUNTIME_LAUNCH_REGISTRY_CACHE.set(entries);
-    RUNTIME_LAUNCH_REGISTRY_CACHE.get().cloned().ok_or_else(|| {
-        std::io::Error::other("runtime launch registry cache initialization failed")
-    })
+    RUNTIME_LAUNCH_REGISTRY_CACHE
+        .get()
+        .cloned()
+        .ok_or_else(|| std::io::Error::other("runtime launch registry cache initialization failed"))
 }
 
-fn cached_runtime_env_registry_entries() -> Option<Vec<RuntimeEnvEntry>> {
+fn cached_runtime_env_registry_entries() -> Result<Vec<RuntimeEnvEntry>, std::io::Error> {
     if let Some(entries) = RUNTIME_ENV_REGISTRY_CACHE.get() {
-        return Some(entries.clone());
+        return Ok(entries.clone());
     }
-    let entries = load_runtime_env_registry_entries(DEFAULT_RUNTIME_ENV_REGISTRY_PATH).ok()?;
+    let entries = load_runtime_env_registry_entries(DEFAULT_RUNTIME_ENV_REGISTRY_PATH)?;
     let _ = RUNTIME_ENV_REGISTRY_CACHE.set(entries);
-    RUNTIME_ENV_REGISTRY_CACHE.get().cloned()
+    RUNTIME_ENV_REGISTRY_CACHE.get().cloned().ok_or_else(|| {
+        std::io::Error::other("runtime environment registry cache initialization failed")
+    })
 }
 
 fn load_runtime_env_registry_entries(path: &str) -> Result<Vec<RuntimeEnvEntry>, std::io::Error> {
     let contents = fs::read_to_string(path)?;
     let mut entries = Vec::new();
 
-    for line in contents.lines() {
+    for (line_number, line) in contents.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if let Some(entry) = parse_runtime_env_registry_entry(line) {
-            entries.push(entry);
-        }
+        let entry = parse_runtime_env_registry_entry(line).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "invalid runtime environment registry entry at line {}",
+                    line_number + 1
+                ),
+            )
+        })?;
+        entries.push(entry);
     }
 
     entries.sort();
@@ -627,17 +652,18 @@ fn parse_runtime_env_registry_entry(line: &str) -> Option<RuntimeEnvEntry> {
 
 fn parse_startup_registry_entry(line: &str) -> Option<StartupEntry> {
     let exec = registry_field(line, "exec")?.to_string();
-    let desktop_file_id = registry_field(line, "desktop_id")
-        .map(str::to_string)
-        .unwrap_or_else(|| fallback_startup_desktop_file_id(exec.as_str()));
-    let package_id = registry_field(line, "package_id")
-        .map(str::to_string)
-        .unwrap_or_else(|| fallback_package_id(&desktop_file_id, exec.as_str()));
+    let desktop_file_id = registry_field(line, "desktop_id")?.to_string();
+    let package_id = registry_field(line, "package_id")?.to_string();
     let display_name = registry_field(line, "display_name")?.to_string();
     let mode = parse_startup_mode(registry_field(line, "mode")?)?;
-    let runtime_deps = registry_field(line, "deps")
-        .map(parse_registry_deps)
-        .unwrap_or_default();
+    let runtime_deps = parse_registry_deps(registry_field(line, "deps")?);
+    if desktop_file_id.is_empty()
+        || package_id.is_empty()
+        || display_name.is_empty()
+        || exec.is_empty()
+    {
+        return None;
+    }
 
     Some(StartupEntry {
         package_id,
@@ -651,44 +677,27 @@ fn parse_startup_registry_entry(line: &str) -> Option<StartupEntry> {
 
 fn parse_desktop_registry_entry(line: &str) -> Option<DesktopProgramEntry> {
     let desktop_file_id = registry_field(line, "desktop_id")?.to_string();
-    let package_id = registry_field(line, "package_id")
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            fallback_package_id(&desktop_file_id, registry_field(line, "exec").unwrap_or(""))
-        });
+    let package_id = registry_field(line, "package_id")?.to_string();
     let display_name = registry_field(line, "display_name")?.to_string();
     let exec = registry_field(line, "exec")?.to_string();
     let startup = parse_startup_mode(registry_field(line, "startup")?)?;
-    let weight_micros = registry_field(line, "weight")
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(DEFAULT_WEIGHT_MICROS);
-    let logical_admin = registry_field(line, "logical_admin")
-        .map(parse_registry_bool)
-        .unwrap_or(false);
-    let console_hosted = registry_field(line, "console_hosted")
-        .map(parse_registry_bool)
-        .unwrap_or(false);
-    let terminal = registry_field(line, "terminal")
-        .map(parse_registry_bool)
-        .unwrap_or(console_hosted);
-    let args = registry_field(line, "args")
-        .map(parse_registry_list)
-        .unwrap_or_default();
-    let env = registry_field(line, "env")
-        .map(parse_registry_list)
-        .unwrap_or_default();
-    let runtime_deps = registry_field(line, "deps")
-        .map(parse_registry_deps)
-        .unwrap_or_default();
-    let autostart_enabled = registry_field(line, "autostart_enabled")
-        .map(parse_registry_bool)
-        .unwrap_or(false);
-    let hidden = registry_field(line, "hidden")
-        .map(parse_registry_bool)
-        .unwrap_or(false);
-    let no_display = registry_field(line, "no_display")
-        .map(parse_registry_bool)
-        .unwrap_or(false);
+    let weight_micros = registry_field(line, "weight")?.parse().ok()?;
+    let logical_admin = parse_registry_bool(registry_field(line, "logical_admin")?)?;
+    let console_hosted = parse_registry_bool(registry_field(line, "console_hosted")?)?;
+    let terminal = parse_registry_bool(registry_field(line, "terminal")?)?;
+    let args = parse_registry_list(registry_field(line, "args")?);
+    let env = parse_registry_list(registry_field(line, "env")?);
+    let runtime_deps = parse_registry_deps(registry_field(line, "deps")?);
+    let autostart_enabled = parse_registry_bool(registry_field(line, "autostart_enabled")?)?;
+    let hidden = parse_registry_bool(registry_field(line, "hidden")?)?;
+    let no_display = parse_registry_bool(registry_field(line, "no_display")?)?;
+    if desktop_file_id.is_empty()
+        || package_id.is_empty()
+        || display_name.is_empty()
+        || exec.is_empty()
+    {
+        return None;
+    }
 
     Some(DesktopProgramEntry {
         package_id,
@@ -903,8 +912,12 @@ fn parse_desktop_deps(value: &str) -> Vec<String> {
         .collect()
 }
 
-fn parse_registry_bool(value: &str) -> bool {
-    matches!(value, "1" | "true" | "True")
+fn parse_registry_bool(value: &str) -> Option<bool> {
+    match value {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
+    }
 }
 
 fn parse_registry_list(value: &str) -> Vec<String> {
@@ -934,15 +947,6 @@ fn valid_env_key(key: &str) -> bool {
         && key
             .bytes()
             .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
-}
-
-fn fallback_startup_desktop_file_id(exec: &str) -> String {
-    Path::new(exec)
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .filter(|value| !value.is_empty())
-        .map(|value| format!("{value}.desktop"))
-        .unwrap_or_else(|| exec.to_string())
 }
 
 fn fallback_package_id(desktop_file_id: &str, exec: &str) -> String {
@@ -1027,8 +1031,10 @@ fn as_bytes_mut<T>(value: &mut T) -> &mut [u8] {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_desktop_program_entry, parse_exec_tokens, parse_startup_registry_entry,
-        DesktopLoadMode, StartupMode,
+        parse_desktop_program_entry, parse_desktop_registry_entry, parse_exec_tokens,
+        parse_startup_registry_entry, response_payload_len, DesktopLoadMode, RuntimeRequest,
+        RuntimeResponse, StartupMode, MAX_RUNTIME_PROGRAMS, OP_REQUEST_LAUNCH_PATH,
+        OP_SNAPSHOT_RUNNING_PROGRAMS, PROTOCOL_VERSION,
     };
     use std::path::Path;
 
@@ -1082,12 +1088,169 @@ mod tests {
     }
 
     #[test]
-    fn parse_registry_entries_default_to_empty_deps() {
+    fn parse_startup_registry_entry_rejects_missing_package_id() {
         let entry = parse_startup_registry_entry(
             "desktop_id=runtimed.desktop\tmode=init\tdisplay_name=runtimed\texec=services/runtimed/runtimed.elf\tlaunch=none",
-        )
-        .expect("startup entry");
-        assert_eq!(entry.package_id, "runtimed");
-        assert!(entry.runtime_deps.is_empty());
+        );
+        assert!(entry.is_none());
+    }
+
+    #[test]
+    fn parse_desktop_registry_entry_rejects_missing_policy_fields() {
+        let entry = parse_desktop_registry_entry(
+            "desktop_id=uiserver.desktop\tpackage_id=uiserver\tstartup=desktop\tdisplay_name=UI Server\texec=services/uiserver/uiserver.elf\tweight=100",
+        );
+        assert!(entry.is_none());
+    }
+
+    #[test]
+    fn successful_response_must_echo_the_request_opcode() {
+        let request = RuntimeRequest {
+            op: OP_REQUEST_LAUNCH_PATH,
+            ..RuntimeRequest::default()
+        };
+        let response = RuntimeResponse {
+            version: PROTOCOL_VERSION,
+            op: OP_SNAPSHOT_RUNNING_PROGRAMS,
+            status: 0,
+            count: 0,
+        };
+        assert_eq!(response_payload_len(&request, &response), Err(libc::EPROTO));
+    }
+
+    #[test]
+    fn malformed_status_and_oversized_snapshot_fail_closed() {
+        let launch = RuntimeRequest {
+            op: OP_REQUEST_LAUNCH_PATH,
+            ..RuntimeRequest::default()
+        };
+        let malformed_status = RuntimeResponse {
+            version: PROTOCOL_VERSION,
+            op: OP_REQUEST_LAUNCH_PATH,
+            status: i32::MIN,
+            count: 0,
+        };
+        assert_eq!(
+            response_payload_len(&launch, &malformed_status),
+            Err(libc::EPROTO)
+        );
+
+        let snapshot = RuntimeRequest {
+            op: OP_SNAPSHOT_RUNNING_PROGRAMS,
+            ..RuntimeRequest::default()
+        };
+        let oversized = RuntimeResponse {
+            version: PROTOCOL_VERSION,
+            op: OP_SNAPSHOT_RUNNING_PROGRAMS,
+            status: 0,
+            count: (MAX_RUNTIME_PROGRAMS + 1) as u32,
+        };
+        assert_eq!(
+            response_payload_len(&snapshot, &oversized),
+            Err(libc::EOVERFLOW)
+        );
+
+        let command_payload = RuntimeResponse {
+            version: PROTOCOL_VERSION,
+            op: OP_REQUEST_LAUNCH_PATH,
+            status: 0,
+            count: 1,
+        };
+        assert_eq!(
+            response_payload_len(&launch, &command_payload),
+            Err(libc::EPROTO)
+        );
+    }
+}
+
+#[cfg(kani)]
+mod verification {
+    use super::{
+        response_payload_len, RuntimeRequest, RuntimeResponse, MAX_RUNTIME_PROGRAMS,
+        OP_SNAPSHOT_RUNNING_PROGRAMS, PROTOCOL_VERSION,
+    };
+
+    #[kani::proof]
+    fn successful_response_never_crosses_rpc_identity() {
+        let request_op: u16 = kani::any();
+        let response_op: u16 = kani::any();
+        kani::assume(request_op != response_op);
+        let request = RuntimeRequest {
+            op: request_op,
+            ..RuntimeRequest::default()
+        };
+        let response = RuntimeResponse {
+            version: PROTOCOL_VERSION,
+            op: response_op,
+            status: 0,
+            count: kani::any(),
+        };
+        assert_eq!(response_payload_len(&request, &response), Err(libc::EPROTO));
+    }
+
+    #[kani::proof]
+    fn successful_snapshot_never_accepts_an_unbounded_payload_count() {
+        let count: u32 = kani::any();
+        kani::assume(count > MAX_RUNTIME_PROGRAMS as u32);
+        let request = RuntimeRequest {
+            op: OP_SNAPSHOT_RUNNING_PROGRAMS,
+            ..RuntimeRequest::default()
+        };
+        let response = RuntimeResponse {
+            version: PROTOCOL_VERSION,
+            op: OP_SNAPSHOT_RUNNING_PROGRAMS,
+            status: 0,
+            count,
+        };
+        assert_eq!(
+            response_payload_len(&request, &response),
+            Err(libc::EOVERFLOW)
+        );
+    }
+
+    #[kani::proof]
+    fn malformed_minimum_status_never_overflows_into_success() {
+        let request = RuntimeRequest::default();
+        let response = RuntimeResponse {
+            version: PROTOCOL_VERSION,
+            op: request.op,
+            status: i32::MIN,
+            count: 0,
+        };
+        assert_eq!(response_payload_len(&request, &response), Err(libc::EPROTO));
+    }
+
+    #[kani::proof]
+    fn successful_command_never_accepts_a_payload() {
+        let count: u32 = kani::any();
+        kani::assume(count > 0);
+        let request = RuntimeRequest {
+            op: super::OP_REQUEST_LAUNCH_PATH,
+            ..RuntimeRequest::default()
+        };
+        let response = RuntimeResponse {
+            version: PROTOCOL_VERSION,
+            op: super::OP_REQUEST_LAUNCH_PATH,
+            status: 0,
+            count,
+        };
+        assert_eq!(response_payload_len(&request, &response), Err(libc::EPROTO));
+    }
+
+    #[kani::proof]
+    fn well_formed_server_error_preserves_the_errno() {
+        let errno: i32 = kani::any();
+        kani::assume(errno > 0);
+        let request = RuntimeRequest {
+            op: super::OP_REQUEST_LAUNCH_PATH,
+            ..RuntimeRequest::default()
+        };
+        let response = RuntimeResponse {
+            version: PROTOCOL_VERSION,
+            op: kani::any(),
+            status: -errno,
+            count: kani::any(),
+        };
+        assert_eq!(response_payload_len(&request, &response), Err(errno));
     }
 }

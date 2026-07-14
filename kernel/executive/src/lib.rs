@@ -83,11 +83,8 @@ mod hal_hooks {
         let input = crate::io_services::input_debug_snapshot();
         hal_api::HeartbeatSnapshot {
             userspace_display_active: crate::io_services::userspace_display_active(),
-            xhci_transfer_count: 0,
-            hid_pointer_report_count: 0,
             input: hal_api::InputEventQueueDebugSnapshot {
                 pointer_packet_submits: input.pointer_packet_submits,
-                pointer_absolute_submits: input.pointer_absolute_submits,
                 read_calls: input.read_calls,
                 read_events: input.read_events,
                 lock_active: input.lock_active,
@@ -124,8 +121,6 @@ mod hal_hooks {
         });
         hal_api::register_interrupt_hooks(hal_api::InterruptHooks {
             dispatch_pic_irq: None,
-            handle_keyboard_interrupt: None,
-            handle_mouse_interrupt: None,
         });
         hal_api::register_heartbeat_hooks(hal_api::HeartbeatHooks {
             snapshot: Some(heartbeat_snapshot),

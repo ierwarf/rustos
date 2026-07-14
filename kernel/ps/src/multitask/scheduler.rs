@@ -189,6 +189,25 @@ struct TaskContext {
     windows_thread_state: Option<WindowsThreadRuntimeState>,
 }
 
+/// A bounded priority-inheritance edge for one synchronous IPC reply
+/// capability.  The edge lasts only while that reply capability is live: the
+/// caller donates its effective scheduling class to the receiver, and the
+/// class therefore propagates through a nested synchronous call chain.
+///
+/// Keeping this in the scheduler rather than in the IPC object store avoids a
+/// dependency from `kernel-ipc-runtime` back into `kernel-ps`.  Its lifetime
+/// is still tied to the reply capability by the compat IPC boundary.
+#[derive(Clone, Copy)]
+struct IpcPriorityDonation {
+    reply: u64,
+    donor_task_id: u64,
+    /// Task-owned endpoints donate to their exact receiver. Process-owned
+    /// endpoints may not have a waiter at enqueue time, so their donation
+    /// covers the receiver process until a worker is known.
+    receiver_task_id: Option<u64>,
+    receiver_process_id: Option<u64>,
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct TaskStart {
     pub(super) entry: fn(u64),
@@ -216,6 +235,10 @@ pub(super) struct Scheduler {
     /// Spawn handoff hint, kept separate from IPC reply hints so the loader's
     /// reply to the supervisor cannot overwrite the freshly-created child.
     next_spawn_pick_hint: Option<usize>,
+    /// At most one synchronous IPC wait can be active per runnable task, so
+    /// `MAX_TASK` fixed entries cover every live donation without allocating
+    /// from scheduler or IPC paths.
+    ipc_priority_donations: [Option<IpcPriorityDonation>; MAX_TASK],
     /// Cached minimum vruntime across the ready set, refreshed each pick.
     /// New tasks initialise their vruntime from this value (plus a small
     /// penalty) so they cannot preempt long-lived ready tasks just by virtue
@@ -244,6 +267,7 @@ impl Scheduler {
             pending_reap: false,
             next_pick_hint: None,
             next_spawn_pick_hint: None,
+            ipc_priority_donations: [None; MAX_TASK],
             last_min_vruntime_ns: 0,
             root_idle: false,
             scheduler_tick_divisor: 0,
@@ -268,6 +292,149 @@ impl Scheduler {
         }
         self.apply_ipc_donation(slot);
         self.next_pick_hint = Some(slot);
+    }
+
+    /// Makes `receiver_task_id` inherit the effective strict scheduling class
+    /// of `donor_task_id` until `reply` is completed or cancelled.  Repeating
+    /// this for a reply updates the receiver because a process-owned endpoint
+    /// may hand a queued request to a different worker than the one initially
+    /// woken by the sender.
+    pub(super) fn inherit_ipc_priority(
+        &mut self,
+        reply: u64,
+        donor_task_id: u64,
+        receiver_task_id: u64,
+    ) -> bool {
+        if reply == 0 || donor_task_id == receiver_task_id {
+            return false;
+        }
+        let Some(donor_slot) = self.find_task_slot(donor_task_id) else {
+            return false;
+        };
+        let Some(receiver_slot) = self.find_task_slot(receiver_task_id) else {
+            return false;
+        };
+        if self.retired[donor_slot] || self.retired[receiver_slot] {
+            return false;
+        }
+
+        self.upsert_ipc_priority_donation(reply, donor_task_id, Some(receiver_task_id), None)
+    }
+
+    /// Starts inheritance for every live worker of a process-owned endpoint.
+    /// This covers the enqueue-before-recv interval where no individual
+    /// receiver is sleeping in the endpoint waiter queue yet.
+    pub(super) fn inherit_ipc_priority_for_process(
+        &mut self,
+        reply: u64,
+        donor_task_id: u64,
+        receiver_process_id: u64,
+    ) -> bool {
+        if reply == 0 || receiver_process_id == 0 {
+            return false;
+        }
+        let Some(donor_slot) = self.find_task_slot(donor_task_id) else {
+            return false;
+        };
+        if self.retired[donor_slot]
+            || !self.contexts.iter().enumerate().any(|(slot, context)| {
+                !self.retired[slot]
+                    && context
+                        .is_some_and(|context| context.process_id == Some(receiver_process_id))
+            })
+        {
+            return false;
+        }
+
+        self.upsert_ipc_priority_donation(reply, donor_task_id, None, Some(receiver_process_id))
+    }
+
+    fn upsert_ipc_priority_donation(
+        &mut self,
+        reply: u64,
+        donor_task_id: u64,
+        receiver_task_id: Option<u64>,
+        receiver_process_id: Option<u64>,
+    ) -> bool {
+        if let Some(entry) = self
+            .ipc_priority_donations
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.reply == reply)
+        {
+            entry.donor_task_id = donor_task_id;
+            if receiver_task_id.is_some() {
+                entry.receiver_task_id = receiver_task_id;
+            }
+            if receiver_process_id.is_some() {
+                entry.receiver_process_id = receiver_process_id;
+            }
+            return true;
+        }
+        let Some(slot) = self
+            .ipc_priority_donations
+            .iter_mut()
+            .find(|entry| entry.is_none())
+        else {
+            // Do not turn a bounded accounting table into an availability
+            // failure on an ABI-visible IPC call.  The fixed bound covers the
+            // normal one-wait-per-task model; an exhausted table simply loses
+            // the latency boost for that call.
+            return false;
+        };
+        *slot = Some(IpcPriorityDonation {
+            reply,
+            donor_task_id,
+            receiver_task_id,
+            receiver_process_id,
+        });
+        true
+    }
+
+    /// Revokes the donation associated with a completed or cancelled reply
+    /// capability.  This is deliberately idempotent so reply/error/timeout
+    /// races cannot leave an inherited System class behind.
+    pub(super) fn release_ipc_priority(&mut self, reply: u64) -> bool {
+        let mut released = false;
+        for entry in &mut self.ipc_priority_donations {
+            if entry.is_some_and(|entry| entry.reply == reply) {
+                *entry = None;
+                released = true;
+            }
+        }
+        released
+    }
+
+    fn release_ipc_priorities_for_task(&mut self, task_id: u64) {
+        for entry in &mut self.ipc_priority_donations {
+            if entry.is_some_and(|entry| {
+                entry.donor_task_id == task_id || entry.receiver_task_id == Some(task_id)
+            }) {
+                *entry = None;
+            }
+        }
+    }
+
+    pub(super) fn release_ipc_priorities_for_process(&mut self, process_id: u64) {
+        for index in 0..MAX_TASK {
+            let Some(entry) = self.ipc_priority_donations[index] else {
+                continue;
+            };
+            if entry.receiver_process_id == Some(process_id)
+                || self.task_belongs_to_process(entry.donor_task_id, process_id)
+                || entry
+                    .receiver_task_id
+                    .is_some_and(|task_id| self.task_belongs_to_process(task_id, process_id))
+            {
+                self.ipc_priority_donations[index] = None;
+            }
+        }
+    }
+
+    fn task_belongs_to_process(&self, task_id: u64, process_id: u64) -> bool {
+        self.find_task_slot(task_id).is_some_and(|slot| {
+            self.contexts[slot].is_some_and(|context| context.process_id == Some(process_id))
+        })
     }
 
     pub(super) fn set_next_spawn_pick_hint(&mut self, task_id: u64) {
@@ -411,6 +578,7 @@ impl Scheduler {
         self.pending_reap = false;
         self.next_pick_hint = None;
         self.next_spawn_pick_hint = None;
+        self.ipc_priority_donations = [None; MAX_TASK];
         self.root_idle = false;
         self.scheduler_tick_divisor = main_thread_pit_divisor;
         self.reset_stack_storage(ROOT_TASK_SLOT)
@@ -459,6 +627,9 @@ impl Scheduler {
     }
 
     pub(super) fn clear_slot(&mut self, slot: usize) {
+        if let Some(task_id) = self.starts[slot].map(|start| start.id) {
+            self.release_ipc_priorities_for_task(task_id);
+        }
         if let Some(context) = self.contexts[slot] {
             if let Some(handle) = context.process_handle {
                 crate::debug::trace_loc!();
@@ -594,10 +765,11 @@ impl Scheduler {
         min.unwrap_or(0)
     }
 
-    /// Classifies a slot into one of the strict priority bands. Result is
-    /// derived (not stored) so changing `weight_micros` of a service via its
-    /// manifest is the single source of truth; no separate sched_class field
-    /// has to be kept in sync.
+    /// Classifies a slot into one of the strict priority bands, including the
+    /// bounded transitive priority inheritance carried by live reply
+    /// capabilities. Result is derived (not stored) so changing
+    /// `weight_micros` of a service via its manifest remains the single source
+    /// of truth; no separate sched_class field has to be kept in sync.
     ///
     /// Class is determined purely by load weight, not by user/kernel mode.
     /// Kernel-mode workers (housekeeping, future kernel daemons) intentionally
@@ -607,6 +779,49 @@ impl Scheduler {
     /// release the band. Promotion to System is an explicit per-service
     /// opt-in via `RUSTOS.package.toml::weight_micros`.
     fn slot_class(&self, slot: usize) -> Option<SchedClass> {
+        let mut visiting = [false; MAX_TASK];
+        self.effective_slot_class(slot, &mut visiting)
+    }
+
+    fn effective_slot_class(
+        &self,
+        slot: usize,
+        visiting: &mut [bool; MAX_TASK],
+    ) -> Option<SchedClass> {
+        let base = self.base_slot_class(slot)?;
+        // A System task cannot be promoted further and root-idle must remain
+        // an idle fallback even if stale external state tried to reference it.
+        if base != SchedClass::User || visiting[slot] {
+            return Some(base);
+        }
+        visiting[slot] = true;
+        let mut effective = base;
+        for donation in self.ipc_priority_donations.iter().flatten() {
+            let target_is_slot = donation
+                .receiver_task_id
+                .is_some_and(|task_id| self.starts[slot].is_some_and(|start| start.id == task_id))
+                || donation.receiver_process_id.is_some_and(|process_id| {
+                    self.contexts[slot]
+                        .is_some_and(|context| context.process_id == Some(process_id))
+                });
+            if !target_is_slot {
+                continue;
+            }
+            let Some(donor_slot) = self.find_task_slot(donation.donor_task_id) else {
+                continue;
+            };
+            let Some(donor_class) = self.effective_slot_class(donor_slot, visiting) else {
+                continue;
+            };
+            if donor_class < effective {
+                effective = donor_class;
+            }
+        }
+        visiting[slot] = false;
+        Some(effective)
+    }
+
+    fn base_slot_class(&self, slot: usize) -> Option<SchedClass> {
         let ctx = self.contexts[slot]?;
         if slot == ROOT_TASK_SLOT && self.root_idle {
             return Some(SchedClass::Idle);
@@ -891,6 +1106,9 @@ impl Scheduler {
             panic!("scheduler root kernel task cannot be retired");
         }
 
+        if let Some(task_id) = self.starts[slot].map(|start| start.id) {
+            self.release_ipc_priorities_for_task(task_id);
+        }
         self.retired[slot] = true;
         self.pending_reap = true;
         if let Some(context) = self.contexts[slot].as_mut() {
@@ -2139,21 +2357,8 @@ impl Scheduler {
         self.starts[self.current_task].map(|start| start.id)
     }
 
-    pub(super) fn current_console_session(&self) -> ConsoleSessionHandle {
-        self.contexts[self.current_task]
-            .map(|context| context.console_session)
-            .unwrap_or(ConsoleSessionHandle::SYSTEM)
-    }
-
-    pub(super) fn set_current_console_session(&mut self, session: ConsoleSessionHandle) -> bool {
-        let Some(context) = self.contexts[self.current_task].as_mut() else {
-            return false;
-        };
-        if !context.user_mode {
-            return false;
-        }
-        context.console_session = session;
-        true
+    pub(super) fn current_console_session(&self) -> Option<ConsoleSessionHandle> {
+        self.contexts[self.current_task].map(|context| context.console_session)
     }
 
     pub(super) fn current_linux_thread_binding(&mut self) -> Option<CurrentLinuxThreadBinding> {
@@ -3090,7 +3295,10 @@ fn stack_range_contains(base: u64, top: u64, start: usize, end: usize) -> bool {
 mod tests {
     use alloc::boxed::Box;
 
-    use super::{ConsoleSessionHandle, MAX_TASK, NICE_0_LOAD, Scheduler, TaskContext, TaskStart};
+    use super::{
+        ConsoleSessionHandle, MAX_TASK, NICE_0_LOAD, SYSTEM_CLASS_WEIGHT_THRESHOLD, SchedClass,
+        Scheduler, TaskContext, TaskStart,
+    };
     use crate::memory::paging::ProcessAddressSpace;
     use crate::multitask::{noop_task_entry, process_table};
     use crate::user::abi::UserAbi;
@@ -3232,5 +3440,62 @@ mod tests {
         assert!(scheduler.retired[1]);
         assert!(scheduler.retired[2]);
         assert!(!scheduler.retired[3]);
+    }
+
+    #[test]
+    fn synchronous_ipc_donation_promotes_and_revokes_a_transitive_user_chain() {
+        let mut scheduler = Box::<Scheduler>::new_uninit();
+        unsafe {
+            scheduler.as_mut_ptr().write_bytes(0, 1);
+        }
+        let mut scheduler = unsafe { scheduler.assume_init() };
+        let interactive = test_process(61);
+        let broker = test_process(62);
+        let policy = test_process(63);
+
+        let mut interactive_context = test_user_context(interactive);
+        interactive_context.weight = SYSTEM_CLASS_WEIGHT_THRESHOLD;
+        scheduler.contexts[1] = Some(interactive_context);
+        scheduler.contexts[2] = Some(test_user_context(broker));
+        scheduler.contexts[3] = Some(test_user_context(policy));
+        scheduler.starts[1] = Some(TaskStart {
+            entry: noop_task_entry,
+            id: 601,
+        });
+        scheduler.starts[2] = Some(TaskStart {
+            entry: noop_task_entry,
+            id: 602,
+        });
+        scheduler.starts[3] = Some(TaskStart {
+            entry: noop_task_entry,
+            id: 603,
+        });
+
+        assert_eq!(scheduler.slot_class(2), Some(SchedClass::User));
+        assert_eq!(scheduler.slot_class(3), Some(SchedClass::User));
+        assert!(scheduler.inherit_ipc_priority(10, 601, 602));
+        assert_eq!(scheduler.slot_class(2), Some(SchedClass::System));
+
+        // The broker's nested synchronous call must pass the original
+        // interactive class through to the final policy server.
+        assert!(scheduler.inherit_ipc_priority(11, 602, 603));
+        assert_eq!(scheduler.slot_class(3), Some(SchedClass::System));
+
+        // A completed outer reply immediately restores both servers to their
+        // manifest-derived class; no priority boost can leak past capability
+        // lifetime.
+        assert!(scheduler.release_ipc_priority(10));
+        assert_eq!(scheduler.slot_class(2), Some(SchedClass::User));
+        assert_eq!(scheduler.slot_class(3), Some(SchedClass::User));
+        assert!(scheduler.release_ipc_priority(11));
+        assert_eq!(scheduler.slot_class(3), Some(SchedClass::User));
+
+        // A process-owned endpoint can have no receiver waiter at enqueue
+        // time. Its live reply still promotes every runnable worker in the
+        // owner process until the reply terminally releases the donation.
+        assert!(scheduler.inherit_ipc_priority_for_process(12, 601, 62));
+        assert_eq!(scheduler.slot_class(2), Some(SchedClass::System));
+        assert!(scheduler.release_ipc_priority(12));
+        assert_eq!(scheduler.slot_class(2), Some(SchedClass::User));
     }
 }

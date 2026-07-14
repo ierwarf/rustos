@@ -1010,11 +1010,12 @@ fn run() -> Result<(), i32> {
         let now = Instant::now();
         if now >= next_loop_summary {
             let input_reader = input_events.snapshot();
+            let console_command = state.console_command_snapshot();
             let input_pending_reader = input_reader
                 .delivered_events
                 .saturating_sub(processed_input_events_total);
             diag_line(format!(
-                "uiserver: update tick loops={} total_loops={} frames={} cursor_moves={} cursor={},{} presented_cursor={},{} pending_update={} pending_full={} pending_rects={} drawable_full={} drawable_rects={} backlog={} backlog_loops={} input_loop_events={} pointer_motion={} pointer_position={} wayland_motion_calls={} input_pending={} input_gap_ms={} input_read_active={} input_read_ms={} input_last_age_ms={} input_reads={}/{} input_raw_events={} input_events={} input_drops={} input_slow={} input_errors={} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
+                "uiserver: update tick loops={} total_loops={} frames={} cursor_moves={} cursor={},{} presented_cursor={},{} pending_update={} pending_full={} pending_rects={} drawable_full={} drawable_rects={} backlog={} backlog_loops={} input_loop_events={} pointer_motion={} pointer_position={} wayland_motion_calls={} input_pending={} input_gap_ms={} input_read_active={} input_read_ms={} input_last_age_ms={} input_reads={}/{} input_raw_events={} input_events={} input_drops={} input_slow={} input_errors={} console_cmd_pending={} console_cmd_accepted={} console_cmd_completed={} console_cmd_rejected={} console_cmd_slow={} console_cmd_errors={} console_cmd_active={} console_cmd_active_ms={} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
                 loop_count,
                 total_loop_count,
                 frames_rendered_window,
@@ -1046,6 +1047,14 @@ fn run() -> Result<(), i32> {
                 input_reader.queue_drops,
                 input_reader.slow_reads,
                 input_reader.errors,
+                console_command.pending,
+                console_command.accepted,
+                console_command.completed,
+                console_command.rejected,
+                console_command.slow_commands,
+                console_command.errors,
+                console_command.active,
+                console_command.active_elapsed_ms,
                 state.console_windows.len(),
                 state.wayland_windows.len(),
                 state.focused_session_handle,

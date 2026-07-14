@@ -6,3 +6,9 @@ publish = false
 
 [dependencies]
 libc = "0.2"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+[package.metadata.kani.flags]
+default-unwind = "8"

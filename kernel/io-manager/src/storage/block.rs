@@ -67,11 +67,7 @@ pub(crate) trait BlockDeviceOps: SharedBlockDevice + Send {
 
 enum BlockDeviceKind {
     Root(Arc<KernelWaitLock<Box<dyn BlockDeviceOps>>>),
-    Slice {
-        parent_id: u32,
-        start_block: u64,
-        block_count: u64,
-    },
+    Slice { parent_id: u32 },
 }
 
 struct BlockDeviceRecord {
@@ -102,14 +98,18 @@ pub fn current_boot_volume_handle() -> Option<BlockDeviceHandle> {
         return Some(handle);
     }
 
-    if let Some(identity) = crate::storage::boot_volume::boot_volume_identity() {
-        if let Ok(handle) = boot::open_physical_boot_handle(identity) {
-            return Some(cache_boot_volume_handle(handle));
+    match crate::storage::boot_volume::boot_volume_identity() {
+        Some(identity) => {
+            if let Ok(handle) = boot::open_physical_boot_handle(identity) {
+                return Some(cache_boot_volume_handle(handle));
+            }
         }
-    } else if crate::storage::boot_volume::boot_volume_transport_hint().is_some() {
-        if let Ok(handle) = boot::open_unique_fat_boot_handle() {
-            return Some(cache_boot_volume_handle(handle));
+        None if crate::storage::boot_volume::boot_extent_manifest_present() => {
+            if let Ok(handle) = boot::open_unambiguous_manifest_boot_handle() {
+                return Some(cache_boot_volume_handle(handle));
+            }
         }
+        None => {}
     }
     None
 }
@@ -152,45 +152,32 @@ fn initialize_root_devices() {
         // Probe that first so an unrelated controller cannot stall userspace startup.
         let transport_hint = crate::storage::boot_volume::boot_volume_transport_hint()
             .unwrap_or(boot_protocol::BootVolumeTransport::Unknown);
-        let mut _registered = 0usize;
         match transport_hint {
             boot_protocol::BootVolumeTransport::Nvme => {
                 for device in crate::storage::nvme::probe_devices() {
                     registry::register_root_device(device);
-                    _registered += 1;
-                }
-                if _registered == 0 {
-                    for device in crate::storage::ahci::probe_devices() {
-                        registry::register_root_device(device);
-                        _registered += 1;
-                    }
                 }
             }
             boot_protocol::BootVolumeTransport::Ahci => {
                 for device in crate::storage::ahci::probe_devices() {
                     registry::register_root_device(device);
-                    _registered += 1;
-                }
-                if _registered == 0 {
-                    for device in crate::storage::nvme::probe_devices() {
-                        registry::register_root_device(device);
-                        _registered += 1;
-                    }
                 }
             }
             _ => {
                 for device in crate::storage::ahci::probe_devices() {
                     registry::register_root_device(device);
-                    _registered += 1;
                 }
                 for device in crate::storage::nvme::probe_devices() {
                     registry::register_root_device(device);
-                    _registered += 1;
                 }
             }
         }
 
-        crate::debug::println!("storage: registered {} block device(s)", _registered);
+        let registered = {
+            let devices = BLOCK_DEVICES.lock();
+            registry::root_device_ids_locked(&devices).len()
+        };
+        crate::debug::println!("storage: registered {} root block device(s)", registered);
     }
 }
 

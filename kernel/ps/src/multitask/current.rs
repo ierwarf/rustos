@@ -132,6 +132,38 @@ pub fn wake_task(task_id: u64) -> bool {
     interrupts::without_interrupts(|| unsafe { scheduler_mut().wake_task(task_id) })
 }
 
+/// Associates a live synchronous IPC reply with a caller-to-server priority
+/// donation. The reply/cancellation paths revoke it before waking the caller.
+pub fn inherit_ipc_priority(reply: u64, donor_task_id: u64, receiver_task_id: u64) -> bool {
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().inherit_ipc_priority(reply, donor_task_id, receiver_task_id)
+    })
+}
+
+/// Starts the same reply-scoped donation for a process-owned endpoint before a
+/// concrete receiver worker has entered `IPC_RECV`.
+pub fn inherit_ipc_priority_for_process(
+    reply: u64,
+    donor_task_id: u64,
+    receiver_process_id: u64,
+) -> bool {
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().inherit_ipc_priority_for_process(reply, donor_task_id, receiver_process_id)
+    })
+}
+
+/// Revokes the bounded priority donation owned by a completed or cancelled IPC
+/// reply capability. It is safe to call more than once for terminal races.
+pub fn release_ipc_priority(reply: u64) -> bool {
+    interrupts::without_interrupts(|| unsafe { scheduler_mut().release_ipc_priority(reply) })
+}
+
+pub fn release_ipc_priorities_for_process(process_id: u64) {
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().release_ipc_priorities_for_process(process_id)
+    });
+}
+
 /// Biases the next scheduler pick toward `task_id`. Combine with `wake_task` +
 /// `yield_now` to implement direct hand-off (caller donates remaining quantum
 /// to the receiver), eliminating round-robin latency on IPC roundtrips.
@@ -143,15 +175,8 @@ pub fn set_next_spawn_pick_hint(task_id: u64) {
     interrupts::without_interrupts(|| unsafe { scheduler_mut().set_next_spawn_pick_hint(task_id) })
 }
 
-pub fn current_console_session() -> ConsoleSessionHandle {
+pub fn current_console_session() -> Option<ConsoleSessionHandle> {
     interrupts::without_interrupts(|| unsafe { scheduler_ref().current_console_session() })
-}
-
-pub fn set_current_console_session(session: impl Into<ConsoleSessionHandle>) -> bool {
-    let session = session.into();
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().set_current_console_session(session)
-    })
 }
 
 pub fn exec_current_user_process(
@@ -389,9 +414,8 @@ pub fn halt_current_retired_task() -> ! {
 
 pub(crate) fn exit_current_task() -> ! {
     interrupts::without_interrupts(|| unsafe {
-        let task_id = scheduler_ref().current_task_id();
-        let endpoint_wake_set = task_id
-            .map(|task_id| {
+        if let Some(task_id) = scheduler_ref().current_task_id() {
+            let endpoint_wake_set = {
                 kernel_ipc_runtime::api::remove_endpoint_waiters_for_task(task_id);
                 let discarded = kernel_ipc_runtime::api::cancel_endpoint_calls_for_task(task_id);
                 crate::user::handles::drop_ipc_transfer_descriptors(discarded.as_slice());
@@ -399,16 +423,16 @@ pub(crate) fn exit_current_task() -> ! {
                     task_id,
                     kernel_ipc_runtime::api::IpcError::PeerClosed,
                 )
-            })
-            .unwrap_or_default();
-        let scheduler = scheduler_mut();
-        for task_id in endpoint_wake_set.callers {
-            let _ = scheduler.wake_task(task_id);
+            };
+            let scheduler = scheduler_mut();
+            for task_id in endpoint_wake_set.callers {
+                let _ = scheduler.wake_task(task_id);
+            }
+            for task_id in endpoint_wake_set.receivers {
+                let _ = scheduler.wake_task(task_id);
+            }
         }
-        for task_id in endpoint_wake_set.receivers {
-            let _ = scheduler.wake_task(task_id);
-        }
-        scheduler.exit_current_task();
+        scheduler_mut().exit_current_task();
     });
     halt_current_retired_task()
 }
@@ -438,6 +462,7 @@ pub fn exit_current_user_process() -> ! {
             }
         }
         if let Some(process_id) = process_id {
+            scheduler_mut().release_ipc_priorities_for_process(process_id);
             let endpoint_wake_set = kernel_ipc_runtime::api::fail_endpoints_owned_by_process(
                 process_id,
                 kernel_ipc_runtime::api::IpcError::PeerClosed,

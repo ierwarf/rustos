@@ -3,7 +3,10 @@ mod input;
 mod runtime;
 
 pub(crate) use bootstrap::start_launcher_program_loader;
-pub(crate) use runtime::start_console_refresh_worker;
+pub(crate) use runtime::{
+    ConsoleCommandDispatcher, ConsoleCommandSnapshot, start_console_command_dispatcher,
+    start_console_refresh_worker,
+};
 
 use std::os::fd::OwnedFd;
 use std::string::String;
@@ -406,7 +409,7 @@ pub(crate) struct AppState {
     pub(crate) surface: DisplaySurfaceCreate,
     display_fd: OwnedFd,
     pub(crate) input_fds: Vec<OwnedFd>,
-    console_fd: OwnedFd,
+    console_commands: ConsoleCommandDispatcher,
     surface_fd: OwnedFd,
     pub(crate) frame: SurfaceMapping,
     pub(crate) cursor_x: u32,
@@ -455,6 +458,10 @@ fn integer_sqrt(value: i64) -> u64 {
 }
 
 impl AppState {
+    pub(crate) fn console_command_snapshot(&self) -> ConsoleCommandSnapshot {
+        self.console_commands.snapshot()
+    }
+
     pub(crate) fn sync_wayland_windows(
         &mut self,
         windows: Vec<WaylandWindowSnapshot>,

@@ -9,12 +9,14 @@ pub use crate::multitask::{
     current_linux_thread_state, current_user_address_space, current_user_process_thread_count,
     current_user_stack_state, current_user_thread_id, exec_current_user_process,
     exec_user_process_by_pid, exit_current_user_process, exit_current_user_task,
-    is_user_process_exiting, is_user_task_alive, linux_thread_snapshot_by_ids,
-    mark_user_process_exiting, note_process_exit_status, queue_linux_signal,
-    restore_current_simd_state, save_current_simd_state, set_next_pick_hint,
-    set_next_spawn_pick_hint, spawn_user_process_state_with_parent, spawn_user_process_with_parent,
-    spawn_user_thread, terminate_user_process, wake_task, wake_user_task, with_current_mm,
-    with_current_process_state, with_current_process_state_mut, with_current_user_linux_state_mut,
+    inherit_ipc_priority, inherit_ipc_priority_for_process, is_user_process_exiting,
+    is_user_task_alive, linux_thread_snapshot_by_ids, mark_user_process_exiting,
+    note_process_exit_status, queue_linux_signal, release_ipc_priorities_for_process,
+    release_ipc_priority, restore_current_simd_state,
+    save_current_simd_state, set_next_pick_hint, set_next_spawn_pick_hint,
+    spawn_user_process_state_with_parent, spawn_user_process_with_parent, spawn_user_thread,
+    terminate_user_process, wake_task, wake_user_task, with_current_mm, with_current_process_state,
+    with_current_process_state_mut, with_current_user_linux_state_mut,
     with_current_user_process_and_linux_thread_state_mut, with_current_user_process_state,
     with_process_state_by_pid, with_process_state_by_pid_mut,
 };
@@ -37,7 +39,7 @@ pub use crate::user::process_state::{ProcessSecurityContext, UserProcessState};
 pub use crate::user::socket::{PassedHandle, SocketCredentials, SocketError, SocketHandle};
 pub use x86_64::VirtAddr;
 
-pub fn current_console_session() -> kernel_object::api::session::ConsoleSessionHandle {
+pub fn current_console_session() -> Option<kernel_object::api::session::ConsoleSessionHandle> {
     crate::multitask::current_console_session()
 }
 
@@ -274,8 +276,6 @@ pub mod snapshot {
 }
 
 pub mod task {
-    use kernel_object::api::session::ConsoleSessionHandle;
-
     pub fn timer_interrupt_handler_addr() -> u64 {
         crate::multitask::timer_interrupt_handler_addr()
     }
@@ -311,10 +311,6 @@ pub mod task {
     pub fn wake_task(task_id: u64) -> bool {
         crate::multitask::wake_task(task_id)
     }
-
-    pub fn set_current_console_session(session: impl Into<ConsoleSessionHandle>) -> bool {
-        crate::multitask::set_current_console_session(session)
-    }
 }
 
 pub mod wait {
@@ -335,7 +331,7 @@ pub use snapshot::{
     with_current_user_process_state_mut,
 };
 pub use task::{
-    rtc_interrupt_handler_addr, set_current_console_session,
-    software_schedule_interrupt_handler_addr, timer_interrupt_handler_addr, yield_now,
+    rtc_interrupt_handler_addr, software_schedule_interrupt_handler_addr,
+    timer_interrupt_handler_addr, yield_now,
 };
 pub use wait::wait_for_child;

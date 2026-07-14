@@ -96,6 +96,8 @@ Activate(s, supervisor) ==
     /\ spawnSupervisor[s] = supervisor
     /\ admittedSupervisor[s] = supervisor
     /\ activationCount[procPid[s]] = 0
+    \* Keep every finite-model wait inside the explored clock horizon.
+    /\ now <= MaxTime - WaitTimeout
     /\ procState' = [procState EXCEPT ![s] = Running]
     /\ activationCount' = [activationCount EXCEPT ![procPid[s]] = @ + 1]
     /\ waitState' = [waitState EXCEPT ![s] = Waiting]
@@ -171,7 +173,7 @@ TypeOK ==
     /\ activationCount \in [Pids -> 0..1]
     /\ waitState \in [Services -> {Idle, Waiting, Ready, TimedOut, Failed}]
     /\ waitPid \in [Services -> (Pids \cup {NoPid})]
-    /\ waitDeadline \in [Services -> Nat]
+    /\ waitDeadline \in [Services -> 0..MaxTime]
     /\ issuedPids \subseteq Pids
     /\ now \in 0..MaxTime
 
@@ -229,6 +231,10 @@ WaitOutcomeIsBounded ==
             /\ endpointPid[s] = waitPid[s]
             /\ endpointPid[s] # NoPid
 
+WaitEventuallySettles ==
+    \A s \in Services:
+        waitState[s] = Waiting ~> waitState[s] # Waiting
+
 AllLivePidsWereIssued ==
     \A s \in Services:
         /\ procPid[s] # NoPid => procPid[s] \in issuedPids
@@ -243,5 +249,7 @@ DistinctLivePids ==
             /\ procPid[s] # NoPid
             /\ procPid[t] # NoPid
             => procPid[s] # procPid[t]
+
+Spec == Init /\ [][Next]_vars /\ WF_vars(AdvanceTime)
 
 =============================================================================

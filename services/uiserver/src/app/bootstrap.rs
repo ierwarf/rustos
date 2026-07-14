@@ -6,7 +6,7 @@ use runtime_control::{DEFAULT_APPLICATIONS_DIR, StartupMode, load_desktop_progra
 
 use super::{
     AppState, CursorMotion, DesktopSurfaceCache, LauncherProgram, MAX_DISPLAY_HEIGHT,
-    MAX_DISPLAY_WIDTH, PAGE_SIZE, align_up,
+    MAX_DISPLAY_WIDTH, PAGE_SIZE, align_up, start_console_command_dispatcher,
 };
 use crate::sys::{
     DisplayInfo, DisplaySurfaceCreate, ESTALE, PIXEL_FORMAT_BGRA8888, SurfaceMapping, boot_line,
@@ -302,7 +302,7 @@ impl AppState {
         boot_line("uiserver: init open_input done");
         diag_line("uiserver: init open_console begin");
         boot_line("uiserver: init open_console begin");
-        let console_fd = open_console().map_err(|errno| {
+        let _console_fd = open_console().map_err(|errno| {
             debug_line(&format!("uiserver: open_console failed errno={errno}"));
             diag_line("uiserver: open_console failed");
             boot_line("uiserver: open_console failed");
@@ -351,7 +351,7 @@ impl AppState {
             surface: surface_state.surface,
             display_fd,
             input_fds,
-            console_fd,
+            console_commands: start_console_command_dispatcher(),
             surface_fd: surface_state.surface_fd,
             frame: surface_state.frame,
             cursor_x: surface_state.display.width / 2,

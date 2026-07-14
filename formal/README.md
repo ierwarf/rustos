@@ -9,6 +9,10 @@ The modeled Rust contracts and their remaining abstraction limits are recorded
 in [CONFORMANCE.md](CONFORMANCE.md). Update that audit whenever a mapped
 source transition or cleanup owner changes.
 
+[REVIEW.md](REVIEW.md) records the model-quality review: it distinguishes an
+exhaustive TLC result from the separate checks for clock horizon, freshness,
+terminal cleanup, and named liveness assumptions.
+
 ## Run the PR suite
 
 Java 11 or later plus curl and sha256sum are required. The runner fetches the
@@ -17,6 +21,16 @@ stores it outside the worktree. TLC state files also stay in a temporary
 directory.
 
     bash formal/run-all-tlc.sh
+
+The full formal gate also runs the Rust implementation proofs:
+
+    bash formal/setup-kani.sh   # once per pinned Kani version
+    bash formal/setup-verus.sh  # once per pinned Verus release
+    bash formal/verify-all.sh
+
+`PROOF-INFRA.md` records the evidence boundary and the rule for accepting a
+counterexample as an implementation bug. Do not treat a solver limitation or
+an unmapped model trace as a source defect.
 
 Run an individual model with:
 
@@ -31,6 +45,8 @@ runner disables TLC's deadlock report; configured invariants remain mandatory.
 
 | Model | Concrete owner | Required safety properties |
 | --- | --- | --- |
+| boot-volume-admission/BootVolumeAdmission | ring0 boot-volume block substrate, Multiboot2 extent manifest | supplied identity selects only its exact target; a mismatch never degrades into discovery; identity-free Multiboot2 admission requires an extent manifest and exactly one FAT candidate |
+| runtime-control-rpc/RuntimeControlRpc | `libs/runtime-control` request/reply client | only an exact successful opcode is admitted; snapshot payload count is bounded; non-snapshot success is payload-free; malformed statuses fail closed |
 | rootd-bootstrap/RootdBootstrap | rootd, loaderd, IPC endpoint wait | core dependency gate before initd; exact PID lease; endpoint/capability lifecycle; bounded waits; single initd launch |
 | endpoint-registry/EndpointRegistry | kernel compat IPC registry, rootd capability decision | publication is capability-complete; revoke/exit leave no authority; exact-PID wait cannot succeed on stale or foreign state |
 | endpoint-publication/EndpointPublication | kernel compat IPC registry, process-table exit marker | registry writers are serialized; an exit marker aborts in-flight publication; lookup/capability authority needs an exact running owner; cleanup leaves no terminal authority |
@@ -41,18 +57,24 @@ runner disables TLC's deadlock report; configured invariants remain mandatory.
 | dvm-control-relay/DvmControlRelay | L0 hostd, Linux DVM agent, RDI2 input receiver | launch-bound CID and exact HELLO issue a fresh challenge; only its HMAC proof permits WELCOME; serial allowlisted probes; stale/mismatched replies fail closed; a completed probe gates a fresh relay epoch; input is strictly sequenced and clears on disconnect |
 | dvm-control-endpoint/DvmControlEndpoint | L0 hostd/xtask, Linux DVM agent | only the root-only launch-secret holder derives the per-launch vsock listener port; a same-CID untrusted process cannot reserve setup; a reached endpoint still requires the separate HMAC proof |
 | dvm-network-ring/DvmNetworkRing | DVM network ivshmem mapper, Linux Ethernet relay, netd substrate | only a host-validated fixed header installs the aperture; DVM counters are bounded before either kernel cursor advances; malformed/forged RX work is rejected without delivery; DVM header mutation cannot alter installed bounds |
-| dvm-network-control/DvmNetworkControl | L0 RDI1 lifecycle, COM2 receiver, DVM network gate | aperture mapping alone has no authority; only an authenticated control epoch permits RustOS network access; exact end revokes it; stale end and DVM data writes cannot alter a replacement lease |
-| dvm-input-revocation/DvmInputRevocation | RDI2 receiver, ring0 ingress queue, inputd, keyboard-core | every epoch start/end is a priority reset barrier; queued keys are bound to the current epoch; no key is delivered before its epoch reset; inputd releases all retired provider key state |
-| trusted-ui-boundary/TrustedUiBoundary | DVM display/input provenance, GUI backend, uiserver trusted-UI status | a privileged prompt requires independently attested scanout and human input; DVM compromise or loss revokes it; a DVM transport may never self-attest |
-| input-readiness/InputReadiness | ring0 ingress queue, poll/epoll substrate, inputd | arming/recheck cannot hide ingress; only a poll-woken client read transfers an ingress record to inputd; every record has exactly one ring0-or-policy owner |
+| dvm-network-control/DvmNetworkControl | L0 RDI1 lifecycle, COM2 receiver, DVM network gate | aperture mapping alone has no authority; only a fresh authenticated control epoch permits RustOS network access; exact end revokes it; stale end, epoch reuse, and DVM data writes cannot alter a replacement lease |
+| dvm-input-revocation/DvmInputRevocation | RDI2 receiver, ring0 ingress queue, inputd, keyboard-core | every one-shot epoch start/end is a priority reset barrier; queued keys are bound to the current epoch; no key is delivered before its epoch reset; inputd releases all retired provider key state |
+| dvm-input-write-deadline/DvmInputWriteDeadline | L0 hostd fixed RDI2 Unix-socket FIFO and COM2 readiness signal | no DVM stream starts before RustOS has entered the COM2 drain path; every accepted token has exact FIFO accounting; normal traffic preserves cleanup reserve; a partial write retains its exact FIFO head; backpressure cannot move or commit a frame; deadline failure is explicit; clean close drains exactly |
+| dvm-input-drain-ownership/DvmInputDrainOwnership | COM2 decoder, task-context input broker, scheduler tick | only the capability-gated broker owns decoder state; an RTC/scheduler tick has no decoder authority; stream request follows task-context RDRY; raw and ingress work remain bounded |
+| trusted-ui-boundary/TrustedUiBoundary | DVM display/input provenance, GUI backend, uiserver trusted-UI status | a privileged prompt requires independently attested scanout and human input; DVM compromise, provider loss, or independent-attestation revocation cancels it; a DVM transport may never self-attest |
+| input-readiness/InputReadiness | ring0 ingress queue, poll/epoll substrate, inputd | arming/recheck cannot hide ingress; the poll STATS recheck or an authorized read transfers an ingress record to inputd; every record has exactly one ring0, policy, or delivered owner |
+| ui-frame-budget/UiFrameBudget | uiserver input loop, console-command worker, frame/present loop | console-policy IPC has bounded FIFO admission and one delivery owner; overload is recorded; an in-flight policy call cannot make local redraw debt wait; active-input feedback is eventually presented |
+| ui-input-motion/UiInputMotion | DVM KVM input selftest and uiserver present loop | the test pointer reverses both axes before permanent edge clamping; every initial cursor position yields bounded visible work, and the final visual state is eventually presented |
+| devmgrd-sessiond-isolation/DevmgrdSessiondIsolation | devmgrd receive loop and bounded sessiond ioctl workers | sessiond ioctls have bounded FIFO admission or EAGAIN; worker stalls never own devmgrd's receive loop; unrelated device traffic remains replyable |
 | vfio-release-authorization/VfioReleaseAuthorization | hostd release gate, durable VFIO lease | no topology preflight can bind a device; a pinned-key signature binds the exact group, CID, DVM artifact, and device policy; every bind mutation is within the signed validity window; restore leaves no authority |
 | driver-domain-fleet/DriverDomainFleet | hostd fleet policy and signed release gate | a fleet member is exactly encoded; CIDs, IOMMU groups, and representative PCI functions are globally disjoint; policy is immutable after sealing; only a signed release bound to that fleet can activate a member |
 | dvm-display-seqlock/DvmDisplaySeqlock | DVM display provider and GUI backend | begin/finish parity follows the backend lock; a replaced DVM header is always retired at an even generation; no frame outlives its provider |
 | ipc-reply-deadline/IpcReplyDeadline | kernel IPC runtime and compat deadline wait | exact caller/reply ownership; one-shot reply completion; owner exit and deadline clear the waiter; every blocked control cycle carries a finite break; stale or late replies cannot revive authority |
 | scheduler-wakeup/SchedulerWakeup | kernel scheduler, current-task block API, timer IRQ | arm/wake/commit uses a fresh epoch; a wake before commit cannot become a block; blocked tasks own one unexpired timer; timer expiry precedes subsequent dispatch; retired tasks retain no scheduler or timer authority |
-| ipc-handle-transfer/IpcHandleTransfer | process handle substrate, IPC runtime, compat IPC syscalls | a transferred descriptor is either installed or dropped exactly once; queue cancellation, peer-close, invalid receiver output, and caller exit leave no registry entry; batch transfer is all-or-nothing |
-| ipc-endpoint-ownership/IpcEndpointOwnership | kernel IPC runtime, compat IPC syscalls, process handle table | a process-owned endpoint/reply may be served by its worker threads but cannot be received, replied to, or handle-drained by a foreign process; process exit revokes queued/received authority; sparse descriptor duplication never grows beyond the process ceiling |
-| proc-broker-session/ProcBrokerSession | process broker, loaderd, Linux process teardown | exact loader ownership; mapping/runtime state only in a live prepare session; commit attempt is terminal; deferred children stay inert until activation; owner exit aborts every uncommitted prepare |
+| ipc-priority-inheritance/IpcPriorityInheritance | scheduler effective classes and compat synchronous IPC | a live reply capability owns the only priority donation; System class propagates through nested calls; completion, cancellation, and task exit revoke it; strict selection cannot choose an effective User task while an effective System task is ready |
+| ipc-handle-transfer/IpcHandleTransfer | process handle substrate, IPC runtime, compat IPC syscalls | a transferred descriptor is either installed or dropped exactly once; queue cancellation, peer-close, invalid receiver output, caller exit, and owner exit after dequeue leave no registry entry; batch transfer is all-or-nothing |
+| ipc-endpoint-ownership/IpcEndpointOwnership | kernel IPC runtime, compat IPC syscalls, process handle table | a process-owned endpoint/reply may be served by its worker threads but cannot be received, replied to, or handle-drained by a foreign process; transferred handles install before a reply becomes terminal; process exit revokes queued/received authority; sparse descriptor duplication never grows beyond the process ceiling |
+| proc-broker-session/ProcBrokerSession | process broker, loaderd, Linux process teardown | exact loader ownership and inherited console-session binding; mapping/runtime state only in a live prepare session; commit attempt is terminal; deferred children stay inert until activation; owner exit aborts every uncommitted prepare |
 | exec-ticket/ExecTicket | procd, loaderd, process broker, Linux thread/process teardown | exact live PID/TID ticket binding; mismatched cancel/exec cannot consume a ticket; one-shot execution and pre-image register handoff; target-thread exit and exec sibling retirement retain no ticket or transition authority |
 
 The rootd-bootstrap model covers the supervisor transaction for core services
@@ -128,12 +150,42 @@ uiserver endpoint currently reports the two missing-attestation blockers for
 every provider, with `DVM_SCANOUT` as additional provenance.
 
 `input-readiness` covers the availability boundary between the same ring0
-transport and its user-space policy owner. Ring0 poll readiness is derived
-from the bounded ingress queue, so `inputd` must transfer records only while
-serving the poll-woken reader; an eager periodic drain would leave a reader
-asleep after removing the only observable readiness record. It intentionally
-abstracts reader identity and key translation, which remain covered by the
-ABI, revocation model, and KVM input-stream gate.
+transport and its user-space policy owner. Ring0 poll wake is derived from the
+bounded ingress queue, so an eager periodic drain would leave a reader asleep
+after removing the only observable record. Instead, the poll recheck invokes
+`INPUTD_IPC_OP_STATS`, and inputd transfers ingress before reporting its
+service-owned queue. That non-consuming probe has a finite reply deadline: a
+retry sees either unchanged ingress or the policy record transferred just
+before cancellation. An authorized read retains the same transfer as a direct
+read operation. The model constrains every ingress record to a DVM-labelled
+Linux-key or pointer-packet kind; reader identity and key translation remain
+covered by the ABI, revocation model, and KVM input-stream gate.
+
+`ui-frame-budget` begins after that input ownership transfer. Keyboard routing
+and console focus updates cross the `uiserver -> devmgrd -> runtimed` policy
+boundary; the model treats their reply as independently slow or permanently
+stalled. The UI takes a bounded FIFO admission decision, records a queue
+rejection rather than waiting, and creates local redraw debt in the same
+transition. TLC checks that only the worker owns synchronous delivery, terminal
+accounting is exact, queue order/capacity hold, and redraw debt is eventually
+presented under UI scheduling fairness. It deliberately does not promise
+eventual policy delivery when the downstream owner is unavailable.
+
+`ui-input-motion` covers the KVM-only DVM input selftest used as the concrete
+FPS workload. Its relative pointer motion reverses on independent short x/y
+phases, so a pre-existing cursor at any edge cannot turn a sustained input
+stream into a visually idle sample. TLC explores every finite initial cursor
+position, bounds consecutive clamped cycles, requires visible work in a
+sample, and requires the final visual state to be presented. It is a workload
+validity proof; `ui-frame-budget` remains the proof that stalled policy IPC
+cannot block presentation.
+
+`devmgrd-sessiond-isolation` covers the next broker boundary. Console routing
+and focus ioctls may need a synchronous sessiond request, but devmgrd's receive
+loop now admits them to a bounded worker pool instead of performing that call
+inline. TLC checks admission, FIFO worker assignment, exact reply or EAGAIN
+accounting, and the key isolation property: a pending unrelated device request
+remains replyable while every sessiond worker is stalled.
 
 `rootd-restart-backoff` covers the core-service recovery boundary. An exit
 first revokes the old lease's authority and enters `RESTART_PENDING`; rootd's
@@ -162,6 +214,12 @@ the concrete deadline, cancellation, and peer-close rules eliminate any
 permanent blocked control wait. `scheduler-wakeup` then checks the lower-level
 arm–timer–recheck–commit race: an early wake invalidates the same arm epoch,
 and the timer IRQ wakes due tasks before a later dispatch can select work.
+
+`ipc-priority-inheritance` covers the strict-class boundary above that wake
+protocol. A reply capability installs its bounded donation before a receiver
+is woken, so a System caller can promote a User broker and its nested User
+policy dependency. TLC checks that the elevation is transitive but cannot
+survive reply completion, cancellation, or either task's exit.
 
 `ipc-handle-transfer` covers the cross-crate ownership boundary that ordinary
 endpoint models intentionally abstract away: IPC runtime queues opaque

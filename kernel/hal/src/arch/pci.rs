@@ -5,13 +5,6 @@ use x86_64::instructions::port::Port;
 const CONFIG_ADDRESS_PORT: u16 = 0x0cf8;
 const CONFIG_DATA_PORT: u16 = 0x0cfc;
 
-const CLASS_SERIAL_BUS: u8 = 0x0c;
-const SUBCLASS_USB: u8 = 0x03;
-const PROG_IF_UHCI: u8 = 0x00;
-const PROG_IF_OHCI: u8 = 0x10;
-const PROG_IF_EHCI: u8 = 0x20;
-const PROG_IF_XHCI: u8 = 0x30;
-
 const COMMAND_OFFSET: u8 = 0x04;
 const REVISION_OFFSET: u8 = 0x08;
 const HEADER_TYPE_OFFSET: u8 = 0x0e;
@@ -292,25 +285,6 @@ impl PciDevice {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum UsbHostControllerKind {
-    Uhci,
-    Ohci,
-    Ehci,
-    Xhci,
-    Unknown(u8),
-}
-
-fn usb_host_controller_kind(prog_if: u8) -> UsbHostControllerKind {
-    match prog_if {
-        PROG_IF_UHCI => UsbHostControllerKind::Uhci,
-        PROG_IF_OHCI => UsbHostControllerKind::Ohci,
-        PROG_IF_EHCI => UsbHostControllerKind::Ehci,
-        PROG_IF_XHCI => UsbHostControllerKind::Xhci,
-        other => UsbHostControllerKind::Unknown(other),
-    }
-}
-
 pub fn visit_devices(mut visit: impl FnMut(PciDevice) -> bool) {
     crate::arch::acpi::for_each_pci_bus_region(|segment, start_bus, end_bus| {
         let mut seen = [false; 256];
@@ -370,15 +344,6 @@ pub fn visit_devices(mut visit: impl FnMut(PciDevice) -> bool) {
             }
         }
 
-        false
-    });
-}
-
-pub fn visit_usb_controllers(mut visit: impl FnMut(PciDevice, UsbHostControllerKind) -> bool) {
-    visit_devices(|pci| {
-        if pci.class_code() == CLASS_SERIAL_BUS && pci.subclass() == SUBCLASS_USB {
-            return visit(pci, usb_host_controller_kind(pci.prog_if()));
-        }
         false
     });
 }

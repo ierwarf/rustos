@@ -65,7 +65,6 @@ extern "C" fn rtc_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut Sav
     // Matches Linux's `tick_sched_timer` -> `update_process_times` -> wake
     // ordering, and the Fuchsia Zircon "wake then reschedule" pattern.
     crate::arch::rtc::on_interrupt();
-
     let current_rsp = context_ptr as usize;
     let interrupted_kernel_frame = unsafe {
         let scheduler = scheduler_mut();

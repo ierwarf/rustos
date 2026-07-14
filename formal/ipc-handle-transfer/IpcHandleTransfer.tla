@@ -115,6 +115,20 @@ InstallBatch ==
     /\ messageState' = NoMessage
     /\ UNCHANGED receiverOutput
 
+\* A peer can die after dequeue but before the process substrate installs the
+\* descriptors.  This is distinct from a queued-message close: the registry
+\* is still the sole owner, so teardown must explicitly drop the received
+\* batch instead of leaving it detached from both endpoint and fd table.
+EndpointOwnerExitsWithReceivedBatch ==
+    /\ messageState = ReceivedMessage
+    /\ \A descriptor \in Descriptors :
+        /\ transferState[descriptor] = Received
+        /\ registryPresent[descriptor]
+    /\ transferState' = [descriptor \in Descriptors |-> Dropped]
+    /\ registryPresent' = [descriptor \in Descriptors |-> FALSE]
+    /\ messageState' = CancelledMessage
+    /\ UNCHANGED receiverOutput
+
 CallerCancelsQueuedBatch ==
     /\ messageState \in {QueuedMessage, PeerClosedMessage}
     /\ \A descriptor \in Descriptors : transferState[descriptor] = Queued
@@ -158,6 +172,7 @@ Next ==
     \/ RejectReceivedBatch
     \/ ReceiveBatch
     \/ InstallBatch
+    \/ EndpointOwnerExitsWithReceivedBatch
     \/ CallerCancelsQueuedBatch
     \/ EndpointOwnerCloses
     \/ CallerObservesPeerClose
@@ -192,6 +207,11 @@ ReceivedMessageHasExactlyOneRegistryBatch ==
         \A descriptor \in Descriptors :
             /\ transferState[descriptor] = Received
             /\ registryPresent[descriptor]
+
+TerminalMessageCannotPinReceivedDescriptors ==
+    messageState \in {NoMessage, CancelledMessage} =>
+        \A descriptor \in Descriptors:
+            transferState[descriptor] \notin {Queued, Received}
 
 InvalidReceiverOutputNeverInstallsDescriptors ==
     receiverOutput = OutputInvalid =>

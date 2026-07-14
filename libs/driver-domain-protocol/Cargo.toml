@@ -6,3 +6,11 @@ edition = "2024"
 [lib]
 path = "src/lib.rs"
 
+[features]
+std = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+[package.metadata.kani.flags]
+default-unwind = "8"

@@ -119,6 +119,9 @@ Activate(s) ==
     /\ procState[s] = Suspended
     /\ procPid[s] # NoPid
     /\ leasePid[s] = procPid[s]
+    \* The finite TLC clock must contain the whole wait.  Without this guard
+    \* a launch at the final model tick would create an unreachable timeout.
+    /\ now <= MaxTime - WaitDeadline
     /\ procState' = [procState EXCEPT ![s] = Running]
     /\ waitState' = [waitState EXCEPT ![s] = Waiting]
     /\ waitPid' = [waitPid EXCEPT ![s] = procPid[s]]
@@ -203,7 +206,7 @@ TypeOK ==
     /\ attempts \in [Services -> 0..MaxAttempts]
     /\ waitState \in [Services -> {Idle, Waiting, Ready, Failed, TimedOut, Revoked}]
     /\ waitPid \in [Services -> (Pids \cup {NoPid})]
-    /\ waitDeadline \in [Services -> Nat]
+    /\ waitDeadline \in [Services -> 0..MaxTime]
     /\ initdAuthorized \in BOOLEAN
     /\ issuedPids \subseteq Pids
     /\ now \in 0..MaxTime
@@ -293,6 +296,13 @@ WaitOutcomeRespectsDeadline ==
     /\ \A s \in Services:
         waitState[s] = TimedOut => now >= waitDeadline[s]
 
+\* With a fair timer, every admitted endpoint wait reaches a terminal outcome.
+\* This is deliberately separate from the safety invariant above: a deadline
+\* field alone does not prove that the timer path will ever be scheduled.
+WaitEventuallySettles ==
+    \A s \in Services:
+        waitState[s] = Waiting ~> waitState[s] # Waiting
+
 InitdWasAuthorized ==
     procState[Initd] # Absent => initdAuthorized
 
@@ -314,5 +324,7 @@ DistinctLivePids ==
             /\ procPid[s] # NoPid
             /\ procPid[t] # NoPid
             => procPid[s] # procPid[t]
+
+Spec == Init /\ [][Next]_vars /\ WF_vars(AdvanceTime)
 
 =============================================================================

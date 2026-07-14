@@ -159,57 +159,60 @@ pub(crate) fn maybe_emit() {
         return;
     }
 
-    let mut window = window().lock().unwrap();
-    let now = Instant::now();
-    let started_at = window.started_at.get_or_insert(now);
-    let elapsed = now.duration_since(*started_at);
-    if elapsed < Duration::from_secs(1) {
-        return;
-    }
+    let line = {
+        let mut window = window().lock().unwrap();
+        let now = Instant::now();
+        let started_at = window.started_at.get_or_insert(now);
+        let elapsed = now.duration_since(*started_at);
+        if elapsed < Duration::from_secs(1) {
+            return;
+        }
 
-    let elapsed_micros = duration_micros(elapsed).max(1);
-    let presents = window.full_presents.saturating_add(window.partial_presents);
-    // Frames per second scaled by 1,000 keeps the KVM gate integer-only while
-    // retaining enough precision for a 20 FPS release criterion.
-    let frame_hz_milli = presents
-        .saturating_mul(1_000_000_000)
-        .saturating_div(elapsed_micros);
+        let elapsed_micros = duration_micros(elapsed).max(1);
+        let presents = window.full_presents.saturating_add(window.partial_presents);
+        // Frames per second scaled by 1,000 keeps the KVM gate integer-only
+        // while retaining enough precision for the release criterion.
+        let frame_hz_milli = presents
+            .saturating_mul(1_000_000_000)
+            .saturating_div(elapsed_micros);
 
-    let line = format!(
-        "uiserver profile: elapsed_ms={} frame_hz_milli={} loops={} input_events={} input_ms={} motion={} position={} other={} backlog={} cursor_moves={} wayland_calls={} wayland_ms={} runtime_calls={} runtime_ms={} con_calls={} con_chg={} con_ms={} full={} part={} rects={} full_ren_ms={} full_prs_ms={} part_ren_ms={} part_prs_ms={} mpix={} spins={}",
-        elapsed_micros / 1_000,
-        frame_hz_milli,
-        window.input_loops,
-        window.input_events,
-        window.input_loop_micros / 1000,
-        window.pointer_motion_events,
-        window.pointer_position_events,
-        window.other_events,
-        window.backlog_loops,
-        window.cursor_moves,
-        window.wayland_motion_calls,
-        window.wayland_motion_micros / 1000,
-        window.runtime_refresh_calls,
-        window.runtime_refresh_micros / 1000,
-        window.console_refresh_calls,
-        window.console_refresh_changed,
-        window.console_refresh_micros / 1000,
-        window.full_presents,
-        window.partial_presents,
-        window.present_rects,
-        window.full_render_micros / 1000,
-        window.full_present_micros / 1000,
-        window.partial_render_micros / 1000,
-        window.partial_present_micros / 1000,
-        window.present_pixels / 1_000_000,
-        window.throttle_spins,
-    );
-    // Profiling is explicitly enabled only for diagnostics. Emit its bounded
-    // once-per-second summary directly so a saturated structured-log queue
-    // cannot hide the very signal the KVM gate is validating.
-    profile_line(&line);
-    *window = ProfileWindow {
-        started_at: Some(now),
-        ..ProfileWindow::default()
+        let line = format!(
+            "uiserver profile: elapsed_ms={} frame_hz_milli={} loops={} input_events={} input_ms={} motion={} position={} other={} backlog={} cursor_moves={} wayland_calls={} wayland_ms={} runtime_calls={} runtime_ms={} con_calls={} con_chg={} con_ms={} full={} part={} rects={} full_ren_ms={} full_prs_ms={} part_ren_ms={} part_prs_ms={} mpix={} spins={}",
+            elapsed_micros / 1_000,
+            frame_hz_milli,
+            window.input_loops,
+            window.input_events,
+            window.input_loop_micros / 1000,
+            window.pointer_motion_events,
+            window.pointer_position_events,
+            window.other_events,
+            window.backlog_loops,
+            window.cursor_moves,
+            window.wayland_motion_calls,
+            window.wayland_motion_micros / 1000,
+            window.runtime_refresh_calls,
+            window.runtime_refresh_micros / 1000,
+            window.console_refresh_calls,
+            window.console_refresh_changed,
+            window.console_refresh_micros / 1000,
+            window.full_presents,
+            window.partial_presents,
+            window.present_rects,
+            window.full_render_micros / 1000,
+            window.full_present_micros / 1000,
+            window.partial_render_micros / 1000,
+            window.partial_present_micros / 1000,
+            window.present_pixels / 1_000_000,
+            window.throttle_spins,
+        );
+        *window = ProfileWindow {
+            started_at: Some(now),
+            ..ProfileWindow::default()
+        };
+        line
     };
+    // The nonblocking profile channel is deliberately used after releasing
+    // the accounting lock: observability can never hold up render statistics
+    // or a future profiling consumer.
+    profile_line(&line);
 }

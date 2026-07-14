@@ -9,7 +9,6 @@ const OUTPUT_BUFFER_CAPACITY: usize = 4096;
 
 static CONSOLE: KernelWaitLock<ConsoleState> = KernelWaitLock::new(ConsoleState::new());
 
-#[allow(dead_code)]
 pub fn write(bytes: &[u8]) -> usize {
     if bytes.is_empty() {
         return 0;

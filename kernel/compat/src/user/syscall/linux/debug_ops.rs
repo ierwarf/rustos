@@ -50,9 +50,11 @@ pub(super) fn debug_log_secondary_linux_syscall(frame: &SyscallFrame) {
     {
         return;
     }
-    let session = snapshot
-        .map(|user| user.console_session())
-        .unwrap_or_else(multitask::current_console_session);
+    let Some(session) = snapshot.map(|user| user.console_session()) else {
+        // Debug output must not invent a privileged console identity when a
+        // syscall somehow arrives without its owning user task.
+        return;
+    };
     if frame.rax == linux_abi::SYS_OPENAT {
         debug::println!(
             "secondary linux syscall: pid={} session={} nr={} path={} flags={:#x}",

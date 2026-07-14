@@ -177,10 +177,6 @@ pub(crate) fn try_install() -> bool {
     true
 }
 
-pub(crate) fn available() -> bool {
-    transport_status() == PacketTransportStatus::Active
-}
-
 pub(crate) fn transport_status() -> PacketTransportStatus {
     if !INSTALLED.load(Ordering::Acquire) && !try_install() {
         return PacketTransportStatus::Unavailable;

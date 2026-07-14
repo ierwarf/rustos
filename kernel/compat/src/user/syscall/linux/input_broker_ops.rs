@@ -30,7 +30,6 @@ pub(super) fn syscall_linux_rustos_input_stats_broker(args_ptr: u64) -> u64 {
     let snapshot = kernel_io_manager::api::input::event_queue::debug_snapshot();
     let stats = InputStatsWire {
         pointer_packet_submits: snapshot.pointer_packet_submits,
-        pointer_absolute_submits: snapshot.pointer_absolute_submits,
         read_calls: snapshot.read_calls,
         read_events: snapshot.read_events,
         lock_active: snapshot.lock_active,
@@ -74,10 +73,8 @@ pub(super) fn syscall_linux_rustos_input_ingest_broker(args_ptr: u64) -> u64 {
     if capacity > INPUTD_INGEST_MAX_EVENTS {
         return linux_errno(LINUX_EINVAL);
     }
-    // COM2 has no IRQ by design.  Drain its bounded, authenticated DVM frames
-    // here, where inputd already polls at 4ms, rather than depending on an
-    // unrelated housekeeping/RTC wakeup that can make pointer motion arrive
-    // in one-second bursts.
+    // COM2 has no IRQ by design. Drain in this capability-gated broker before
+    // transferring ingress so decoder ownership remains task-context-only.
     kernel_io_manager::api::input::service_dvm_input_pending();
     let mut ingress = alloc::vec![InputIngressWire::default(); capacity];
     let count = kernel_io_manager::api::input::event_queue::drain_ingress(&mut ingress);

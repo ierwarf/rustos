@@ -775,6 +775,20 @@ pub fn enqueue_endpoint_call_with_handles(
     })
 }
 
+/// Returns the process owner of the endpoint bound into a live reply
+/// capability.  The scheduler uses this only to establish bounded priority
+/// inheritance before a process-owned endpoint has selected a specific worker.
+pub fn endpoint_receiver_process_for_reply(reply: KernelReplyHandle) -> Option<u64> {
+    with_ipc_objects_ref(|objects| {
+        objects.replies.get(&reply.raw()).and_then(|reply_object| {
+            match reply_object.receiver_owner {
+                Some(EndpointOwner::Process(process_id)) => Some(process_id),
+                Some(EndpointOwner::Task(_)) | None => None,
+            }
+        })
+    })
+}
+
 pub fn recv_endpoint(
     endpoint: KernelEndpointHandle,
 ) -> Result<Option<(KernelReplyHandle, Vec<u8>)>, IpcError> {

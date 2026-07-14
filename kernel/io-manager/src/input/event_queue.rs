@@ -15,7 +15,6 @@ use rustos_user_abi::syscall::{
 use x86_64::instructions::interrupts;
 
 static POINTER_PACKET_SUBMIT_COUNT: AtomicU64 = AtomicU64::new(0);
-static POINTER_ABSOLUTE_SUBMIT_COUNT: AtomicU64 = AtomicU64::new(0);
 static INPUT_READ_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
 static INPUT_READ_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
 static INPUT_INGRESS_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -25,7 +24,6 @@ const INPUT_WAITERS_CAPACITY: usize = 32;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct InputEventQueueDebugSnapshot {
     pub pointer_packet_submits: u64,
-    pub pointer_absolute_submits: u64,
     pub read_calls: u64,
     pub read_events: u64,
     pub lock_active: u64,
@@ -78,8 +76,7 @@ pub(crate) fn submit_dvm_input_reset() -> bool {
 }
 
 /// Queue a normalized pointer packet from the authenticated DVM relay. The
-/// source flag lets ring-3 inputd merge DVM buttons independently from native
-/// fallback providers before publishing user-visible edges.
+/// source flag proves that ring-3 inputd received an authenticated DVM record.
 pub(crate) fn submit_dvm_pointer_packet(packet: PointerPacket) -> bool {
     POINTER_PACKET_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
     let mut ingress = InputIngressWire::default();
@@ -127,13 +124,9 @@ pub(crate) fn disarm_input_waiter(task_id: u64) {
 }
 
 pub fn debug_snapshot() -> InputEventQueueDebugSnapshot {
-    let ingress_queued = INPUT_INGRESS
-        .try_lock()
-        .map(|ingress| ingress.len())
-        .unwrap_or_default();
+    let ingress_queued = INPUT_INGRESS.lock().len();
     InputEventQueueDebugSnapshot {
         pointer_packet_submits: POINTER_PACKET_SUBMIT_COUNT.load(Ordering::Relaxed),
-        pointer_absolute_submits: POINTER_ABSOLUTE_SUBMIT_COUNT.load(Ordering::Relaxed),
         read_calls: INPUT_READ_CALL_COUNT.load(Ordering::Relaxed),
         read_events: INPUT_READ_EVENT_COUNT.load(Ordering::Relaxed),
         lock_active: 0,
@@ -173,7 +166,6 @@ pub(crate) fn reset_for_tests() {
     INPUT_INGRESS.lock().clear();
     *INPUT_WAITERS.lock() = [None; INPUT_WAITERS_CAPACITY];
     POINTER_PACKET_SUBMIT_COUNT.store(0, Ordering::Relaxed);
-    POINTER_ABSOLUTE_SUBMIT_COUNT.store(0, Ordering::Relaxed);
     INPUT_READ_CALL_COUNT.store(0, Ordering::Relaxed);
     INPUT_READ_EVENT_COUNT.store(0, Ordering::Relaxed);
     INPUT_INGRESS_DROP_COUNT.store(0, Ordering::Relaxed);

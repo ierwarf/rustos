@@ -18,7 +18,7 @@ pub(crate) fn write_from_current_process(
     let snapshot = multitask::current_user_snapshot();
     let session = snapshot
         .map(|user| user.console_session())
-        .unwrap_or_else(multitask::current_console_session);
+        .ok_or(paging::AddressSpaceError::AddressOutOfRange)?;
 
     while copied < len {
         let chunk_len = min(len - copied, chunk.len());
@@ -110,7 +110,7 @@ pub(crate) fn read_into_current_process(
     let mut chunk = [0_u8; CONSOLE_IO_CHUNK_LEN];
     let session = multitask::current_user_snapshot()
         .map(|user| user.console_session())
-        .unwrap_or_else(multitask::current_console_session);
+        .ok_or(paging::AddressSpaceError::AddressOutOfRange)?;
 
     while total_read < len {
         let chunk_len = min(len - total_read, chunk.len());

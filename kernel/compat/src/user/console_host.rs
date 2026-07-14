@@ -9,7 +9,9 @@ use alloc::vec::Vec;
 use crate::debug;
 use crate::io::session::ConsoleSessionHandle;
 use crate::user::linux::LinuxProcessLaunch;
-use crate::user::process::{self, ProcessLaunchOptions, ProcessLoadError, SpawnedProcess};
+use crate::user::process::{
+    self, ProcessLaunchOptions, ProcessLoadError, ProcessStartRegisters, SpawnedProcess,
+};
 use crate::vfs;
 
 fn emit_console(level: debug::LogLevel, event_id: u16, object_id: u64, message: String) {
@@ -98,10 +100,7 @@ impl ConsoleHostError {
                 0,
                 String::from("userspace startup blocked before UserspaceReady"),
             ),
-            Self::Load {
-                path,
-                error,
-            } => {
+            Self::Load { path, error } => {
                 emit_console(
                     debug::LogLevel::Warn,
                     0,
@@ -148,6 +147,7 @@ pub fn spawn_program_in_session(
     };
 
     let launch = ProcessLaunchOptions {
+        registers: ProcessStartRegisters::new(),
         linux: LinuxProcessLaunch {
             exec_path: program.exec_path,
             argv,
@@ -155,7 +155,6 @@ pub fn spawn_program_in_session(
         },
         console_session: session,
         logical_admin: program.logical_admin,
-        ..ProcessLaunchOptions::default()
     };
 
     process::spawn_bootstrap_linux_process_with_launch(program.image, program.weight_micros, launch)
@@ -226,11 +225,7 @@ fn reserve_console_host_trace() -> bool {
 fn load_executable_image_path_uncached(
     primary_path: &str,
 ) -> Result<LoadedExecutableImage, ConsoleHostError> {
-    crate::debug::debug!(
-        console,
-        "console host: read begin path={}",
-        primary_path,
-    );
+    crate::debug::debug!(console, "console host: read begin path={}", primary_path,);
     debug::record_milestone(debug::LogCategory::Console, "console-read-begin", 0, 0);
     match vfs::read_path_to_vec_for_kernel(primary_path) {
         Ok(bytes) => {

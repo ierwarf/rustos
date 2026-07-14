@@ -166,12 +166,13 @@ pub fn pic_interrupt_handler(
     crate::arch::pic::send_eoi(index);
 }
 
-pub extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    crate::hooks::handle_keyboard_interrupt();
+/// DVM owns input delivery. Legacy keyboard IRQs have no RustOS input policy
+/// consumer; acknowledge them so a physical/spurious line cannot wedge PIC.
+pub extern "x86-interrupt" fn keyboard_interrupt_eoi_handler(_stack_frame: InterruptStackFrame) {
     crate::arch::pic::send_eoi(KEYBOARD_INTERRUPT_VECTOR);
 }
 
-pub extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    crate::hooks::handle_mouse_interrupt();
+/// See `keyboard_interrupt_eoi_handler`.
+pub extern "x86-interrupt" fn mouse_interrupt_eoi_handler(_stack_frame: InterruptStackFrame) {
     crate::arch::pic::send_eoi(MOUSE_INTERRUPT_VECTOR);
 }

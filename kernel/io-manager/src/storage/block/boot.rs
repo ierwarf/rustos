@@ -133,17 +133,17 @@ pub(super) fn open_physical_boot_handle(
     Err(DiskIoError::NotPresent)
 }
 
-pub(super) fn open_unique_fat_boot_handle() -> IoResult<BlockDeviceHandle> {
+/// Resolve the sole FAT volume only for a boot protocol that carries a root
+/// extent manifest but cannot carry a physical disk identity (currently
+/// Multiboot2). More than one candidate is an authentication failure, not a
+/// preference decision.
+pub(super) fn open_unambiguous_manifest_boot_handle() -> IoResult<BlockDeviceHandle> {
     super::ensure_initialized();
     let mut selected = None;
     let root_ids = {
         let devices = BLOCK_DEVICES.lock();
         registry::root_device_ids_locked(&devices)
     };
-    crate::debug::println!(
-        "storage: empty boot identity fallback roots={}",
-        root_ids.len()
-    );
 
     for root_id in root_ids {
         let Some(descriptor) = descriptor_without_init(BlockDeviceHandle::new(root_id)) else {
@@ -155,12 +155,6 @@ pub(super) fn open_unique_fat_boot_handle() -> IoResult<BlockDeviceHandle> {
             block_count: descriptor.block_count,
         };
         let partitions = candidate_partitions(&mut root)?;
-        crate::debug::println!(
-            "storage: empty boot identity candidate id={} path={} partitions={}",
-            root_id,
-            descriptor.path,
-            partitions.len()
-        );
         for partition in partitions {
             if !partition_has_fat_boot_sector(&mut root, partition)? {
                 continue;
@@ -168,12 +162,6 @@ pub(super) fn open_unique_fat_boot_handle() -> IoResult<BlockDeviceHandle> {
             let Some(handle) = find_device_handle_for_partition(root_id, partition) else {
                 continue;
             };
-            crate::debug::println!(
-                "storage: empty boot identity FAT candidate handle={} start_lba={} sectors={}",
-                handle.id(),
-                partition.start_lba,
-                partition.block_count
-            );
             if selected.replace(handle).is_some() {
                 return Err(DiskIoError::InvalidInput);
             }

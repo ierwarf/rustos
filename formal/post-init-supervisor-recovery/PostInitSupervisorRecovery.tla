@@ -53,6 +53,9 @@ Init ==
 \* knows none of them until it checks the exact-PID endpoint.
 CrashAndReplaceInitd ==
     /\ currentInitd = "old"
+    \* Every post-crash adoption/reclaim window must fit inside the finite
+    \* TLC clock; otherwise a final-tick replacement would hide the deadline.
+    /\ clock <= MaxTick - 2
     /\ currentInitd' = "new"
     /\ recovery' = [service \in Services |->
           service \in InitdManaged /\ state[service] # Empty]
@@ -154,7 +157,7 @@ TypeOK ==
     /\ endpoint \in [Services -> BOOLEAN]
     /\ reporter \in [Services -> {"old", "new", "none"}]
     /\ recovery \in [Services -> BOOLEAN]
-    /\ deadline \in [Services -> 0..(MaxTick + 2)]
+    /\ deadline \in [Services -> 0..MaxTick]
     /\ tracked \in [Services -> BOOLEAN]
     /\ clock \in 0..MaxTick
 

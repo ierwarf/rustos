@@ -468,7 +468,13 @@ impl Drop for SharedFdMapping {
 }
 
 pub(crate) fn open_display() -> Result<OwnedFd, i32> {
-    open_first_device("/dev/dri", "card", O_RDWR, "/dev/dri/card0")
+    if running_on_rustos() {
+        // RustOS exposes exactly one brokered display endpoint.  Do not fall
+        // through to host DRM discovery: accepting a different device would
+        // silently bypass the display-domain provenance contract.
+        return open_device(device_abi::DISPLAY_PATH, O_RDWR);
+    }
+    open_first_host_device("/dev/dri", "card", O_RDWR, "/dev/dri/card0")
 }
 
 pub(crate) fn open_console() -> Result<OwnedFd, i32> {
@@ -479,7 +485,7 @@ pub(crate) fn open_input() -> Result<Vec<OwnedFd>, i32> {
     if running_on_rustos() {
         return open_device(device_abi::INPUT_PATH, O_RDONLY | O_NONBLOCK).map(|fd| vec![fd]);
     }
-    open_all_devices(
+    open_all_host_devices(
         "/dev/input",
         "event",
         O_RDONLY | O_NONBLOCK,
@@ -529,8 +535,23 @@ pub(crate) fn profile_line(message: &str) {
     if !ui_profile_enabled() {
         return;
     }
-    let _ = std::io::stderr().write_all(message.as_bytes());
-    let _ = std::io::stderr().write_all(b"\n");
+    // Performance sampling must never synchronously write debugcon from the
+    // render thread.  A long profile record previously stalled that thread
+    // during the private debug-print syscall.  Keep an independent bounded
+    // channel so ordinary diagnostic bursts cannot crowd out KVM samples;
+    // a full channel drops only the observation, which makes the gate fail
+    // conservatively without affecting UI liveness.
+    static SENDER: OnceLock<mpsc::SyncSender<String>> = OnceLock::new();
+    let sender = SENDER.get_or_init(|| {
+        let (sender, receiver) = mpsc::sync_channel::<String>(4);
+        thread::spawn(move || {
+            while let Ok(message) = receiver.recv() {
+                observability_client::info!("uiserver", service, "{}", message);
+            }
+        });
+        sender
+    });
+    let _ = sender.try_send(message.to_owned());
 }
 
 pub(crate) fn debug_line(message: &str) {
@@ -1006,18 +1027,18 @@ fn open_device(path: &str, flags: usize) -> Result<OwnedFd, i32> {
     Ok(fd)
 }
 
-fn open_first_device(
+fn open_first_host_device(
     directory: &str,
     prefix: &str,
     flags: usize,
-    fallback: &str,
+    preferred_path: &str,
 ) -> Result<OwnedFd, i32> {
-    if let Ok(fd) = open_device(fallback, flags) {
+    if let Ok(fd) = open_device(preferred_path, flags) {
         return Ok(fd);
     }
     let mut last_err = ENOENT;
-    for path in enumerate_device_paths(directory, prefix, fallback) {
-        if path == fallback {
+    for path in enumerate_host_device_paths(directory, prefix, preferred_path) {
+        if path == preferred_path {
             continue;
         }
         match open_device(path.as_str(), flags) {
@@ -1028,20 +1049,20 @@ fn open_first_device(
     Err(last_err)
 }
 
-fn open_all_devices(
+fn open_all_host_devices(
     directory: &str,
     prefix: &str,
     flags: usize,
-    fallback: &str,
+    preferred_path: &str,
 ) -> Result<Vec<OwnedFd>, i32> {
     let mut opened = Vec::new();
     let mut last_err = ENOENT;
-    if let Ok(fd) = open_device(fallback, flags) {
+    if let Ok(fd) = open_device(preferred_path, flags) {
         opened.push(fd);
         last_err = 0;
     }
-    for path in enumerate_device_paths(directory, prefix, fallback) {
-        if path == fallback {
+    for path in enumerate_host_device_paths(directory, prefix, preferred_path) {
+        if path == preferred_path {
             continue;
         }
         match open_device(path.as_str(), flags) {
@@ -1055,9 +1076,9 @@ fn open_all_devices(
     Ok(opened)
 }
 
-fn enumerate_device_paths(directory: &str, prefix: &str, fallback: &str) -> Vec<String> {
+fn enumerate_host_device_paths(directory: &str, prefix: &str, preferred_path: &str) -> Vec<String> {
     let mut paths = Vec::new();
-    paths.push(String::from(fallback));
+    paths.push(String::from(preferred_path));
     if let Ok(entries) = fs::read_dir(directory) {
         let mut discovered = entries
             .filter_map(|entry| entry.ok())

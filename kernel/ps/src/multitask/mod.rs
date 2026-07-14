@@ -30,23 +30,22 @@ use crate::user::process_state::{
 pub use self::current::{
     activate_suspended_user_task, any_user_process_state, arm_block_current_task,
     block_current_task, block_current_user_task, cancel_block_current_task,
-    commit_block_current_task, current_linux_thread_state, current_task_id,
-    current_user_address_space, current_user_id, current_user_log_ids, current_user_process_id,
-    current_user_process_thread_count, current_user_snapshot, current_user_stack_state,
-    current_user_thread_id, exec_current_user_process, exec_user_process_by_pid,
-    exit_current_user_process, exit_current_user_task, halt_current_retired_task,
+    commit_block_current_task, current_console_session, current_linux_thread_state,
+    current_task_id, current_user_address_space, current_user_id, current_user_log_ids,
+    current_user_process_id, current_user_process_thread_count, current_user_snapshot,
+    current_user_stack_state, current_user_thread_id, exec_current_user_process,
+    exec_user_process_by_pid, exit_current_user_process, exit_current_user_task,
+    halt_current_retired_task, inherit_ipc_priority, inherit_ipc_priority_for_process,
     is_user_process_exiting, is_user_task_alive, linux_thread_snapshot_by_ids,
     mark_user_process_exiting, note_process_exit_status, parent_process_id_of, queue_linux_signal,
-    retain_current_user_process_state, retire_current_user_task_due_to_fault,
-    service_deferred_work, set_next_pick_hint, set_next_spawn_pick_hint, terminate_user_process,
-    terminate_user_task, user_log_ids_for_task, wait_for_child, wake_task, wake_user_task,
-    with_current_mm, with_current_process_credentials, with_current_process_state,
-    with_current_process_state_mut, with_current_user_linux_state_mut,
+    release_ipc_priorities_for_process, release_ipc_priority, retain_current_user_process_state,
+    retire_current_user_task_due_to_fault, service_deferred_work, set_next_pick_hint,
+    set_next_spawn_pick_hint, terminate_user_process, terminate_user_task, user_log_ids_for_task,
+    wait_for_child, wake_task, wake_user_task, with_current_mm, with_current_process_credentials,
+    with_current_process_state, with_current_process_state_mut, with_current_user_linux_state_mut,
     with_current_user_process_and_linux_thread_state_mut, with_current_user_process_state,
     with_current_user_process_state_mut, with_process_state_by_pid, with_process_state_by_pid_mut,
 };
-#[allow(unused_imports)]
-pub(crate) use self::current::{current_console_session, set_current_console_session};
 #[allow(unused_imports)]
 pub(crate) use self::irq::{
     clear_deferred_reschedule_request, cond_resched, request_deferred_reschedule,

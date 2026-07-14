@@ -52,11 +52,12 @@ VARIABLES mapped,
           lastOutcome,
           lastAccessEpoch,
           staleRevokedEpoch,
-          leaseBeforeAction
+          leaseBeforeAction,
+          issuedEpochs
 
 vars == <<mapped, activeEpoch, acceptedTx, acceptedRx, deniedTx, deniedRx,
           dvmWrites, lastOutcome, lastAccessEpoch, staleRevokedEpoch,
-          leaseBeforeAction>>
+          leaseBeforeAction, issuedEpochs>>
 
 TransportAvailable == mapped /\ activeEpoch \in Epochs
 
@@ -72,6 +73,7 @@ Init ==
     /\ lastAccessEpoch = NoEpoch
     /\ staleRevokedEpoch = NoEpoch
     /\ leaseBeforeAction = NoEpoch
+    /\ issuedEpochs = {}
 
 \* The source allows a session marker before a late PCI mapping. Mapping alone
 \* still does not establish availability; it only makes a pre-existing L0
@@ -82,13 +84,15 @@ Install ==
     /\ lastOutcome' = Mapped
     /\ leaseBeforeAction' = activeEpoch
     /\ UNCHANGED <<activeEpoch, acceptedTx, acceptedRx, deniedTx, deniedRx,
-                  dvmWrites, lastAccessEpoch, staleRevokedEpoch>>
+                  dvmWrites, lastAccessEpoch, staleRevokedEpoch, issuedEpochs>>
 
 \* Only an L0-authenticated SESSION_START may take this transition. DVM data
 \* writes do not have an action that changes activeEpoch.
 Activate(epoch) ==
     /\ epoch \in Epochs
+    /\ epoch \notin issuedEpochs
     /\ activeEpoch' = epoch
+    /\ issuedEpochs' = issuedEpochs \cup {epoch}
     /\ lastOutcome' = Activated
     /\ leaseBeforeAction' = activeEpoch
     /\ UNCHANGED <<mapped, acceptedTx, acceptedRx, deniedTx, deniedRx,
@@ -101,7 +105,7 @@ RevokeExact(epoch) ==
     /\ lastOutcome' = Revoked
     /\ leaseBeforeAction' = activeEpoch
     /\ UNCHANGED <<mapped, acceptedTx, acceptedRx, deniedTx, deniedRx,
-                  dvmWrites, lastAccessEpoch, staleRevokedEpoch>>
+                  dvmWrites, lastAccessEpoch, staleRevokedEpoch, issuedEpochs>>
 
 \* A delayed end marker either names a retired lease or arrives after the
 \* active lease was already cleared. It cannot alter the current lease.
@@ -112,7 +116,7 @@ IgnoreStaleRevoke(epoch) ==
     /\ staleRevokedEpoch' = epoch
     /\ leaseBeforeAction' = activeEpoch
     /\ UNCHANGED <<mapped, activeEpoch, acceptedTx, acceptedRx, deniedTx,
-                  deniedRx, dvmWrites, lastAccessEpoch>>
+                  deniedRx, dvmWrites, lastAccessEpoch, issuedEpochs>>
 
 KernelTransmit ==
     /\ TransportAvailable
@@ -122,7 +126,7 @@ KernelTransmit ==
     /\ lastAccessEpoch' = activeEpoch
     /\ leaseBeforeAction' = activeEpoch
     /\ UNCHANGED <<mapped, activeEpoch, acceptedRx, deniedTx, deniedRx,
-                  dvmWrites, staleRevokedEpoch>>
+                  dvmWrites, staleRevokedEpoch, issuedEpochs>>
 
 KernelReceive ==
     /\ TransportAvailable
@@ -132,7 +136,7 @@ KernelReceive ==
     /\ lastAccessEpoch' = activeEpoch
     /\ leaseBeforeAction' = activeEpoch
     /\ UNCHANGED <<mapped, activeEpoch, acceptedTx, deniedTx, deniedRx,
-                  dvmWrites, staleRevokedEpoch>>
+                  dvmWrites, staleRevokedEpoch, issuedEpochs>>
 
 \* An unavailable mapped aperture returns NoDevice rather than behaving as a
 \* busy but live ring. These actions model attempted RustOS packet access.
@@ -144,7 +148,7 @@ DenyTransmit ==
     /\ lastOutcome' = TxDenied
     /\ leaseBeforeAction' = activeEpoch
     /\ UNCHANGED <<mapped, activeEpoch, acceptedTx, acceptedRx, deniedRx,
-                  dvmWrites, lastAccessEpoch, staleRevokedEpoch>>
+                  dvmWrites, lastAccessEpoch, staleRevokedEpoch, issuedEpochs>>
 
 DenyReceive ==
     /\ mapped
@@ -154,7 +158,7 @@ DenyReceive ==
     /\ lastOutcome' = RxDenied
     /\ leaseBeforeAction' = activeEpoch
     /\ UNCHANGED <<mapped, activeEpoch, acceptedTx, acceptedRx, deniedTx,
-                  dvmWrites, lastAccessEpoch, staleRevokedEpoch>>
+                  dvmWrites, lastAccessEpoch, staleRevokedEpoch, issuedEpochs>>
 
 \* The DVM may mutate its fixed data plane at any time, including after
 \* revocation. This never grants, clears, or replaces a RustOS control lease.
@@ -165,7 +169,7 @@ UntrustedDvmWrite ==
     /\ lastOutcome' = DvmWrite
     /\ leaseBeforeAction' = activeEpoch
     /\ UNCHANGED <<mapped, activeEpoch, acceptedTx, acceptedRx, deniedTx,
-                  deniedRx, lastAccessEpoch, staleRevokedEpoch>>
+                  deniedRx, lastAccessEpoch, staleRevokedEpoch, issuedEpochs>>
 
 Next ==
     \/ Install
@@ -181,6 +185,7 @@ Next ==
 TypeOK ==
     /\ mapped \in BOOLEAN
     /\ activeEpoch \in Epochs \cup {NoEpoch}
+    /\ issuedEpochs \subseteq Epochs
     /\ acceptedTx \in 0..MaxPackets
     /\ acceptedRx \in 0..MaxPackets
     /\ deniedTx \in 0..MaxDenied
@@ -217,6 +222,9 @@ UnavailablePacketAttemptsFailClosed ==
 
 DvmWritesCannotChangeControlAuthority ==
     lastOutcome = DvmWrite => activeEpoch = leaseBeforeAction
+
+ActiveControlEpochWasIssuedExactlyOnce ==
+    activeEpoch \in Epochs => activeEpoch \in issuedEpochs
 
 Spec == Init /\ [][Next]_vars
 =============================================================================

@@ -15,7 +15,6 @@ pub(crate) enum BootstrapPhase {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct InputEventQueueDebugSnapshot {
     pub pointer_packet_submits: u64,
-    pub pointer_absolute_submits: u64,
     pub read_calls: u64,
     pub read_events: u64,
     pub lock_active: u64,
@@ -63,7 +62,6 @@ mod backend {
     ) -> InputEventQueueDebugSnapshot {
         InputEventQueueDebugSnapshot {
             pointer_packet_submits: snapshot.pointer_packet_submits,
-            pointer_absolute_submits: snapshot.pointer_absolute_submits,
             read_calls: snapshot.read_calls,
             read_events: snapshot.read_events,
             lock_active: snapshot.lock_active,
@@ -98,10 +96,6 @@ mod backend {
 
     pub(crate) fn gui_try_present_panic_blackout() -> bool {
         kernel_io_manager::api::io::gui::try_present_panic_blackout()
-    }
-
-    pub(crate) fn display_service_pending() -> usize {
-        kernel_io_manager::api::io::gui::service_pending()
     }
 
     pub(crate) fn userspace_display_active() -> bool {
@@ -163,10 +157,6 @@ mod backend {
         kernel_io_manager::api::input::init();
     }
 
-    pub(crate) fn input_service_pending() -> usize {
-        kernel_io_manager::api::input::service_pending()
-    }
-
     pub(crate) fn input_debug_snapshot() -> InputEventQueueDebugSnapshot {
         map_input_snapshot(kernel_io_manager::api::input::event_queue::debug_snapshot())
     }
@@ -183,9 +173,9 @@ mod backend {
 
 pub(crate) use backend::{
     block_descriptors, boot_volume_identity, boot_volume_transport_hint, bootstrap_phase,
-    console_write, display_service_pending, enter_kernel_vfs_runtime, enter_userspace_runtime,
-    gui_init, gui_try_present_panic_blackout, init_block_devices, init_boot_info,
-    init_dvm_display_provider, init_dvm_network_provider, init_input, init_vfs,
-    input_debug_snapshot, input_service_pending, register_boot_volume_opener,
-    system_console_session_raw, tty_init, userspace_display_active, userspace_ready,
+    console_write, enter_kernel_vfs_runtime, enter_userspace_runtime, gui_init,
+    gui_try_present_panic_blackout, init_block_devices, init_boot_info, init_dvm_display_provider,
+    init_dvm_network_provider, init_input, init_vfs, input_debug_snapshot,
+    register_boot_volume_opener, system_console_session_raw, tty_init,
+    userspace_display_active, userspace_ready,
 };

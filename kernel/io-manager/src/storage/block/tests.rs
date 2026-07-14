@@ -9,8 +9,8 @@ use storage_core::BlockDevice as SharedBlockDevice;
 use super::io::{cache_lookup, clear_cache_for_tests, read_cached_block, write_cached_block};
 use super::registry::register_root_device;
 use super::{
-    descriptors, flush, lookup, open_physical_boot_block_device, BlockDeviceOps,
-    BlockTransportKind, BLOCK_DEVICES, BLOCK_INIT_DONE, BLOCK_INIT_STATE, MIN_LOGICAL_BLOCK_SIZE,
+    BLOCK_DEVICES, BLOCK_INIT_DONE, BLOCK_INIT_STATE, BlockDeviceOps, BlockTransportKind,
+    MIN_LOGICAL_BLOCK_SIZE, descriptors, flush, lookup, open_physical_boot_block_device,
 };
 use crate::storage::fat::{DiskIoError, IoResult};
 
@@ -246,7 +246,7 @@ fn physical_boot_opener_matches_superfloppy_identity() {
 }
 
 #[test]
-fn empty_identity_fallback_selects_only_unique_fat_partition() {
+fn manifest_boot_opener_accepts_only_one_fat_volume() {
     let _guard = TEST_LOCK.lock();
     reset_for_tests();
 
@@ -259,7 +259,8 @@ fn empty_identity_fallback_selects_only_unique_fat_partition() {
         false,
     )));
 
-    let handle = super::boot::open_unique_fat_boot_handle().expect("unique FAT boot handle");
+    let handle = super::boot::open_unambiguous_manifest_boot_handle()
+        .expect("one manifest-backed FAT boot handle");
     let descriptor = descriptors()
         .into_iter()
         .find(|descriptor| descriptor.id == handle.id())
@@ -270,7 +271,7 @@ fn empty_identity_fallback_selects_only_unique_fat_partition() {
 }
 
 #[test]
-fn empty_identity_fallback_rejects_ambiguous_fat_partitions() {
+fn manifest_boot_opener_rejects_multiple_fat_volumes() {
     let _guard = TEST_LOCK.lock();
     reset_for_tests();
 
@@ -288,7 +289,7 @@ fn empty_identity_fallback_rejects_ambiguous_fat_partitions() {
     )));
 
     assert!(matches!(
-        super::boot::open_unique_fat_boot_handle(),
+        super::boot::open_unambiguous_manifest_boot_handle(),
         Err(DiskIoError::InvalidInput)
     ));
 }

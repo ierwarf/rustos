@@ -7,12 +7,6 @@ pub fn init() {
     dvm_serial::init();
 }
 
-/// Housekeeping intentionally has no native-input fallback.  The DVM UART is
-/// drained only by inputd's authenticated ingest broker below.
-pub fn service_pending() -> usize {
-    0
-}
-
 /// Bounded DVM transport drain called only by the capability-gated inputd
 /// ingest broker.
 pub fn service_dvm_input_pending() -> usize {

@@ -124,8 +124,6 @@ pub(crate) fn map_physical_range(
     })
 }
 
-pub(crate) fn unmap_range(_device: *mut c_void, _mapping: DmaMapping) {}
-
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn translate_dma_to_physical(
     device: *mut c_void,

@@ -16,12 +16,13 @@ const LINE_CONTROL_PORT: u16 = DATA_PORT + 3;
 const MODEM_CONTROL_PORT: u16 = DATA_PORT + 4;
 const LINE_STATUS_PORT: u16 = DATA_PORT + 5;
 const LINE_STATUS_DATA_READY: u8 = 1 << 0;
+const LINE_STATUS_TRANSMIT_HOLDING_EMPTY: u8 = 1 << 5;
 const LINE_STATUS_ABSENT: u8 = u8::MAX;
 const FRAME_BYTES: usize = 32;
-// `inputd` polls the authenticated DVM ingress every 4ms.  Drain up to sixteen
-// complete RDI2 frames per request so a high-rate pointer never waits for the
-// housekeeping task's unrelated wakeups, while keeping this ring0 transport
-// operation bounded.
+// A capability-gated input broker drain accepts at most sixteen complete RDI2
+// frames per turn into the bounded ingress queue. `inputd` still owns policy
+// transfer from that queue; this narrow ring0 work never runs from an IRQ, so
+// it cannot re-enter the decoder while a broker call owns its state.
 const MAX_BYTES_PER_TURN: usize = FRAME_BYTES * 16;
 const MAGIC: [u8; 4] = *b"RDI1";
 const VERSION: u8 = 2;
@@ -31,8 +32,13 @@ const KIND_POINTER: u8 = 2;
 const KIND_SESSION_END: u8 = 3;
 const LINUX_EVDEV_KEY_MAX: u16 = 0x02ff;
 const POINTER_BUTTON_MASK: u8 = 0x1f;
+// Private L0 readiness signal carried in the reverse direction of the same
+// QEMU chardev. It only gates when L0 asks the DVM to produce input; it never
+// grants authority and no DVM byte can forge it.
+const RECEIVER_READY_SIGNAL: [u8; 4] = *b"RDRY";
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+static RECEIVER_READY_ANNOUNCED: AtomicBool = AtomicBool::new(false);
 static DECODER: Mutex<Decoder> = Mutex::new(Decoder::new());
 
 struct Decoder {
@@ -181,8 +187,8 @@ pub(crate) fn init() {
         let mut fifo_control = Port::<u8>::new(FIFO_CONTROL_PORT);
         let mut modem_control = Port::<u8>::new(MODEM_CONTROL_PORT);
         // Dedicated COM2 transport, 115200 8N1, IRQs intentionally disabled.
-        // The authenticated inputd ingest broker is the sole runtime drain
-        // owner and polls this bounded transport on its regular 4ms cadence.
+        // A capability-gated broker drains it into ring0 ingress; inputd
+        // retains all translation, policy, and read ownership.
         interrupt_enable.write(0);
         line_control.write(0x80);
         data.write(1);
@@ -199,6 +205,7 @@ pub(crate) fn service_pending() -> usize {
     if !ACTIVE.load(Ordering::Acquire) {
         return 0;
     }
+    announce_receiver_ready();
     let mut accepted = 0;
     let mut decoder = DECODER.lock();
     for _ in 0..MAX_BYTES_PER_TURN {
@@ -216,6 +223,31 @@ pub(crate) fn service_pending() -> usize {
         accepted += decoder.feed(byte);
     }
     accepted
+}
+
+/// The first capability-gated drain attempt proves that a RustOS input
+/// consumer exists. Announce it to L0 before accepting a DVM stream, so the
+/// DVM cannot fill QEMU's bounded COM2 input buffer during boot. The UART FIFO
+/// is configured for at least this four-byte write; if it is not ready yet,
+/// leave the flag clear and retry on the next drain attempt.
+fn announce_receiver_ready() {
+    if RECEIVER_READY_ANNOUNCED.load(Ordering::Acquire) {
+        return;
+    }
+    let transmit_ready = unsafe {
+        let mut port = Port::<u8>::new(LINE_STATUS_PORT);
+        port.read() & LINE_STATUS_TRANSMIT_HOLDING_EMPTY != 0
+    };
+    if !transmit_ready {
+        return;
+    }
+    unsafe {
+        let mut data = Port::<u8>::new(DATA_PORT);
+        for byte in RECEIVER_READY_SIGNAL {
+            data.write(byte);
+        }
+    }
+    RECEIVER_READY_ANNOUNCED.store(true, Ordering::Release);
 }
 
 fn activate_network_control_from_session(epoch: u32) {

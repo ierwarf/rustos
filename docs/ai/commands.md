@@ -20,7 +20,7 @@ failure output as the primary debugging context.
 | `cargo xtask build-dvm` | build the pinned Linux DVM and verify its manifest | `driver-domains/linux/out/` | missing Buildroot prerequisite or source/artifact mismatch |
 | `cargo xtask verify-dvm` | verify every DVM artifact and control-contract hash | none | altered/missing DVM artifact or contract |
 | `cargo xtask kvm-smoke` | concurrently boot Linux DVM and RustOS with QEMU/KVM | `build/kvm/` | unavailable `/dev/kvm`, guest exit, missing readiness marker |
-| `cargo xtask kvm-run` | start the interactive Linux-DVM display session with no readiness deadline | `build/kvm/` | unavailable GUI backend, `/dev/kvm`, or a guest exit |
+| `cargo xtask kvm-run` | start the interactive Linux-DVM display session with no readiness deadline; its GTK window grabs the pointer on hover | `build/kvm/` | unavailable GUI backend, `/dev/kvm`, or a guest exit |
 | `cargo run -p rustos-hostd -- discover` | read host IOMMU groups | none | IOMMU unavailable or unreadable sysfs |
 | `cargo run -p rustos-hostd -- preflight --plan <file>` | require complete, non-protected IOMMU-group ownership | none | incomplete group or host-critical BDF |
 | `cargo run -p rustos-hostd -- relay-input ...` | relay validated DVM Linux input into RustOS COM2 | QEMU-private input socket | policy mismatch, malformed DVM event, or endpoint disconnect |

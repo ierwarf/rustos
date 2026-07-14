@@ -241,7 +241,7 @@ fn handle_launch(
         return Err(libc::EOPNOTSUPP);
     }
     let target = super::util::request_path(&request)?;
-    let metadata = super::catalog::resolve_program_request(state, target.as_str());
+    let metadata = super::catalog::resolve_program_request(state, target.as_str())?;
     if !super::catalog::runtime_deps_satisfied(
         &metadata.runtime_deps,
         &super::catalog::running_packages(state),

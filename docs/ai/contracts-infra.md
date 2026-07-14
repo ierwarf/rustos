@@ -74,6 +74,12 @@ or launch policy.
 - Main methods: `snapshot_running_programs`, `request_launch_program_new_session`, `request_terminate_session`, `request_terminate_pid`, `notify_ui_ready`.
 - `notify_ui_ready` is one-way: runtimed records readiness without replying,
   so compositor bootstrap never waits on a closed readiness stream.
+- For request/reply operations, a successful `RuntimeResponse` must echo the
+  exact request opcode. Only `OP_SNAPSHOT_RUNNING_PROGRAMS` may carry a count,
+  which is capped at `MAX_RUNTIME_PROGRAMS`; command replies have zero count.
+  After a current-version check, negative status is the server-error envelope
+  (whose opcode may be zero), but positive or `i32::MIN` status is malformed
+  and fails closed as `EPROTO`.
 - Request text max: `MAX_REQUEST_PATH_BYTES`.
 - `runtimed` loads the runtime launch catalog on its main loop after UI ready.
   Desktop metadata and runtime-launch policy have separate immutable caches;

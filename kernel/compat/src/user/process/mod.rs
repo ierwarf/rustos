@@ -229,17 +229,6 @@ pub struct ProcessLaunchOptions<'a> {
     pub logical_admin: bool,
 }
 
-impl<'a> Default for ProcessLaunchOptions<'a> {
-    fn default() -> Self {
-        Self {
-            registers: ProcessStartRegisters::new(),
-            linux: LinuxProcessLaunch::new(""),
-            console_session: ConsoleSessionHandle::SYSTEM,
-            logical_admin: false,
-        }
-    }
-}
-
 #[inline(never)]
 // RING3-MIGRATION-REFERENCE START: loaderd/procd should own bootstrap Linux
 // image loading policy. Ring0 keeps this direct ELF path only for pre-loaderd

@@ -1,4 +1,3 @@
-use std::os::fd::AsRawFd;
 use std::string::String;
 use std::thread;
 use std::time::Instant;
@@ -17,7 +16,6 @@ use crate::render::{
 use crate::sys::{
     self, ConsoleSessionHandle, INPUT_KIND_KEYBOARD, INPUT_KIND_POINTER_BUTTON,
     INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION, InputEvent, POINTER_BUTTON_LEFT,
-    console_send_input_event, console_set_focus,
 };
 use crate::wayland::WaylandCompositor;
 
@@ -57,18 +55,8 @@ impl AppState {
                     }
                 }
                 if self.focused_session_handle != 0 {
-                    match console_send_input_event(
-                        self.console_fd.as_raw_fd(),
-                        self.focused_session_handle,
-                        *event,
-                    ) {
-                        Ok(()) => {}
-                        Err(sys::ENOENT | sys::EINVAL | sys::ESTALE) => {
-                            self.focused_session_handle = 0;
-                            return Ok(VisualUpdate::default());
-                        }
-                        Err(err) => return Err(err),
-                    }
+                    self.console_commands
+                        .submit_input(self.focused_session_handle, *event);
                 }
                 Ok(self
                     .reveal_focused_terminal_cursor()
@@ -474,7 +462,8 @@ impl AppState {
                 .map(|window| window.session_handle);
             self.focused_session_handle = 0;
             if let Some(fallback_session) = fallback {
-                let _ = console_set_focus(self.console_fd.as_raw_fd(), fallback_session);
+                self.console_commands.submit_focus(fallback_session);
+                self.pending_console_focus = Some(fallback_session);
                 self.focused_session_handle = fallback_session;
             }
         }
@@ -511,7 +500,8 @@ impl AppState {
                 .find(|window| !window.minimized)
                 .map(|window| window.session_handle);
             if let Some(fallback_session) = fallback {
-                let _ = console_set_focus(self.console_fd.as_raw_fd(), fallback_session);
+                self.console_commands.submit_focus(fallback_session);
+                self.pending_console_focus = Some(fallback_session);
                 self.focused_session_handle = fallback_session;
             }
         }

@@ -229,4 +229,14 @@ RetiredTaskHasNoSchedulingOrTimerAuthority ==
             /\ current # task
             /\ timerDeadline[task] = NoTimer
 
+TimerArmedWaitEventuallyReleases ==
+    \A task \in Tasks:
+        timerDeadline[task] # NoTimer ~>
+            (timerDeadline[task] = NoTimer \/ taskState[task] = Retired)
+
+\* This is the explicit hardware-timer scheduling assumption.  The safety
+\* invariants above show what an interrupt must do; this fairness clause proves
+\* a successfully armed finite deadline cannot remain armed forever.
+Spec == Init /\ [][Next]_vars /\ WF_vars(Tick)
+
 =============================================================================

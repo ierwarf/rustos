@@ -192,7 +192,7 @@ fn install_rt_signal_frame(
     saved_mask: u64,
     action: LinuxSigActionWire,
 ) -> Result<(), i64> {
-    let saved_stack = current_signal_stack();
+    let saved_stack = current_signal_stack()?;
     let using_altstack = should_use_signal_altstack(frame.user_rsp, saved_stack, action.flags);
     let frame_top = signal_frame_top(frame.user_rsp, saved_stack, action.flags)?;
     let signal_frame = LinuxRtSigFrame {
@@ -291,10 +291,10 @@ fn frame_to_linux_sigcontext(frame: &SyscallFrame, saved_mask: u64) -> LinuxSigC
     }
 }
 
-fn current_signal_stack() -> linux_abi::LinuxSignalStack {
+fn current_signal_stack() -> Result<linux_abi::LinuxSignalStack, i64> {
     multitask::current_linux_thread_state()
         .map(|state| state.signal_stack)
-        .unwrap_or_default()
+        .ok_or(LINUX_EINVAL)
 }
 
 fn signal_frame_top(

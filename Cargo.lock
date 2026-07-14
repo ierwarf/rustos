@@ -997,6 +997,7 @@ name = "rustos-driver-domain-host"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "driver-domain-protocol",
  "libc",
 ]
 

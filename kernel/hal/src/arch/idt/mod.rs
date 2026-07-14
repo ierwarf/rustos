@@ -36,8 +36,8 @@ lazy_static! {
                 crate::lowlevel::interrupts::software_schedule_interrupt_handler_addr(),
             ));
         }
-        idt[KEYBOARD_INTERRUPT_VECTOR].set_handler_fn(keyboard_interrupt_handler);
-        idt[MOUSE_INTERRUPT_VECTOR].set_handler_fn(mouse_interrupt_handler);
+        idt[KEYBOARD_INTERRUPT_VECTOR].set_handler_fn(keyboard_interrupt_eoi_handler);
+        idt[MOUSE_INTERRUPT_VECTOR].set_handler_fn(mouse_interrupt_eoi_handler);
 
         idt
     };

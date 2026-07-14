@@ -121,6 +121,10 @@ OwnerProcessReplies ==
     /\ replyState = LiveReply
     /\ replyReceiverProcess = endpointOwnerProcess
     /\ ProcessOf(deliveredTo) = endpointOwnerProcess
+    \* `recvmsg` installs the transferred batch before the reply capability
+    \* is exposed to the service.  Otherwise a replied terminal message could
+    \* retain an unowned ReceivedTransfer indefinitely.
+    /\ transferState = InstalledTransfer
     /\ messageState' = Replied
     /\ replyState' = UsedReply
     /\ lastAttempt' = NoAttempt
@@ -223,6 +227,7 @@ ReplyCannotCompleteBeforeOwnerProcessReceive ==
     replyState = UsedReply /\ messageState = Replied =>
         /\ ProcessOf(deliveredTo) = endpointOwnerProcess
         /\ replyReceiverProcess = endpointOwnerProcess
+        /\ transferState = InstalledTransfer
 
 SparseFdRequestDoesNotGrowTable ==
     requestedFd = MaxFd + 1 => fdTable \subseteq 3..MaxFd
@@ -230,5 +235,9 @@ SparseFdRequestDoesNotGrowTable ==
 TerminalTransferHasNoQueuedAuthority ==
     transferState \in {InstalledTransfer, DroppedTransfer} =>
         messageState # Queued
+
+TerminalMessageHasNoDetachedTransfer ==
+    messageState \in {Replied, Cancelled} =>
+        transferState \in {InstalledTransfer, DroppedTransfer}
 
 =============================================================================

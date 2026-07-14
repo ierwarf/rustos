@@ -102,6 +102,26 @@ DvmCompromiseInput ==
     /\ UNCHANGED <<displaySource, inputSource, displayAttested,
                   displayCompromised, promptState>>
 
+\* An independently attested provider can remain physically present while its
+\* attestation lease is withdrawn.  Treat that as immediate prompt revocation;
+\* waiting for a device-removal event would leave a privileged decision on a
+\* stale trust assertion.
+RevokeDisplayAttestation ==
+    /\ displaySource = Trusted
+    /\ displayAttested
+    /\ displayAttested' = FALSE
+    /\ promptState' = IF promptState = Granted THEN Revoked ELSE promptState
+    /\ UNCHANGED <<displaySource, inputSource, inputAttested,
+                  displayCompromised, inputCompromised>>
+
+RevokeInputAttestation ==
+    /\ inputSource = Trusted
+    /\ inputAttested
+    /\ inputAttested' = FALSE
+    /\ promptState' = IF promptState = Granted THEN Revoked ELSE promptState
+    /\ UNCHANGED <<displaySource, inputSource, displayAttested,
+                  displayCompromised, inputCompromised>>
+
 LoseDisplay ==
     /\ displaySource # None
     /\ displaySource' = None
@@ -144,6 +164,8 @@ Next ==
     \/ InstallTrustedInput
     \/ DvmCompromiseDisplay
     \/ DvmCompromiseInput
+    \/ RevokeDisplayAttestation
+    \/ RevokeInputAttestation
     \/ LoseDisplay
     \/ LoseInput
     \/ RequestPrivilegedPrompt
@@ -171,5 +193,8 @@ DvmTransportCannotAuthorizePrivilegedPrompt ==
 
 CompromiseCannotRetainTrustedPrompt ==
     (displayCompromised \/ inputCompromised) => promptState # Granted
+
+AttestationRevocationCannotRetainTrustedPrompt ==
+    (~displayAttested \/ ~inputAttested) => promptState # Granted
 
 =============================================================================

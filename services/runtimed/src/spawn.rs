@@ -247,8 +247,8 @@ pub(super) fn spawn_exec(
     defer_start: bool,
 ) -> Result<i32, i32> {
     boot_line(format!("runtimed: loader request begin exec={}", exec_path).as_str());
-    let argv_storage = build_exec_argv(exec_path, argv);
-    let env_storage = build_exec_env(env);
+    let argv_storage = build_exec_argv(exec_path, argv)?;
+    let env_storage = build_exec_env(env)?;
     let request = build_loader_spawn_request(
         exec_path,
         &argv_storage,
@@ -509,67 +509,87 @@ pub(super) fn ensure_console_fd(state: &mut BrokerState) -> Result<RawFd, i32> {
         .unwrap_or(-1))
 }
 
-fn build_exec_argv(exec_path: &str, argv: &[String]) -> Vec<CString> {
+fn build_exec_argv(exec_path: &str, argv: &[String]) -> Result<Vec<CString>, i32> {
     use super::MAX_EXEC_ARG_COUNT;
+    if !valid_exec_text(exec_path, false) {
+        return Err(libc::EINVAL);
+    }
+    if argv.len() > MAX_EXEC_ARG_COUNT {
+        return Err(libc::E2BIG);
+    }
     if argv.is_empty() {
-        return vec![c_string_or_fallback(exec_path, "/")];
+        return CString::new(exec_path)
+            .map(|value| vec![value])
+            .map_err(|_| libc::EINVAL);
     }
-    let mut storage = argv
-        .iter()
-        .take(MAX_EXEC_ARG_COUNT)
-        .filter(|arg| valid_exec_text(arg.as_str(), false))
-        .filter_map(|arg| CString::new(arg.as_str()).ok())
-        .collect::<Vec<_>>();
-    if storage.is_empty() {
-        storage.push(c_string_or_fallback(exec_path, "/"));
-    }
-    storage
+    argv.iter()
+        .map(|arg| {
+            if !valid_exec_text(arg.as_str(), false) {
+                return Err(libc::EINVAL);
+            }
+            CString::new(arg.as_str()).map_err(|_| libc::EINVAL)
+        })
+        .collect()
 }
 
-fn build_exec_env(extra_env: &[String]) -> Vec<CString> {
+fn build_exec_env(extra_env: &[String]) -> Result<Vec<CString>, i32> {
     use runtime_control::{
         load_runtime_default_env, RuntimeEnvScope, DEFAULT_RUNTIME_ENV_REGISTRY_PATH,
     };
     let default_env =
         load_runtime_default_env(DEFAULT_RUNTIME_ENV_REGISTRY_PATH, RuntimeEnvScope::Runtime)
-            .unwrap_or_default();
+            .map_err(runtime_registry_errno)?;
     build_exec_env_with_defaults(extra_env, &default_env)
 }
 
-fn build_exec_env_with_defaults(extra_env: &[String], default_env: &[String]) -> Vec<CString> {
+fn build_exec_env_with_defaults(
+    extra_env: &[String],
+    default_env: &[String],
+) -> Result<Vec<CString>, i32> {
     use super::MAX_EXEC_ENV_COUNT;
-    let mut env = extra_env
-        .iter()
-        .filter(|item| valid_exec_text(item.as_str(), true))
-        .take(MAX_EXEC_ENV_COUNT)
-        .cloned()
-        .collect::<Vec<_>>();
+    if extra_env.len() > MAX_EXEC_ENV_COUNT {
+        return Err(libc::E2BIG);
+    }
+    let mut env = Vec::with_capacity(extra_env.len().saturating_add(default_env.len()));
+    for item in extra_env {
+        if !valid_exec_text(item.as_str(), true) {
+            return Err(libc::EINVAL);
+        }
+        env.push(item.clone());
+    }
     for item in default_env {
-        push_env_if_missing(&mut env, item);
+        if !valid_exec_text(item, true) {
+            return Err(libc::EINVAL);
+        }
+        push_env_if_missing(&mut env, item)?;
     }
     env.into_iter()
-        .filter_map(|item| CString::new(item).ok())
+        .map(|item| CString::new(item).map_err(|_| libc::EINVAL))
         .collect()
 }
 
-fn push_env_if_missing(env: &mut Vec<String>, item: &str) {
+fn push_env_if_missing(env: &mut Vec<String>, item: &str) -> Result<(), i32> {
     use super::MAX_EXEC_ENV_COUNT;
-    if env.len() >= MAX_EXEC_ENV_COUNT {
-        return;
-    }
     let key = env_key(item);
     if env.iter().any(|candidate| env_key(candidate) == key) {
-        return;
+        return Ok(());
+    }
+    if env.len() >= MAX_EXEC_ENV_COUNT {
+        return Err(libc::E2BIG);
     }
     env.push(item.to_string());
+    Ok(())
 }
 
 fn env_key(value: &str) -> &str {
     value.split_once('=').map(|(key, _)| key).unwrap_or(value)
 }
 
-fn c_string_or_fallback(value: &str, fallback: &str) -> CString {
-    CString::new(value).unwrap_or_else(|_| CString::new(fallback).unwrap())
+fn runtime_registry_errno(error: std::io::Error) -> i32 {
+    match error.raw_os_error() {
+        Some(errno) if errno > 0 => errno,
+        _ => libc::EIO,
+    }
 }
 
 fn valid_exec_text(value: &str, require_env_assignment: bool) -> bool {
@@ -615,7 +635,7 @@ mod tests {
 
     #[test]
     fn build_exec_argv_defaults_to_exec_path() {
-        let argv = build_exec_argv("apps/demo/demo.elf", &[]);
+        let argv = build_exec_argv("apps/demo/demo.elf", &[]).expect("valid default argv");
         assert_eq!(argv.len(), 1);
         assert_eq!(argv[0].to_str().unwrap(), "apps/demo/demo.elf");
     }
@@ -636,7 +656,8 @@ mod tests {
                 String::from("XDG_RUNTIME_DIR=/run/custom"),
             ],
             &defaults,
-        );
+        )
+        .expect("valid merged environment");
         let values = env
             .iter()
             .map(|item| item.to_str().unwrap().to_string())
@@ -659,5 +680,13 @@ mod tests {
         assert!(!values
             .iter()
             .any(|item| item == "XDG_RUNTIME_DIR=/run/user/1000"));
+    }
+
+    #[test]
+    fn build_exec_argv_rejects_invalid_input_instead_of_substituting_a_path() {
+        assert_eq!(
+            build_exec_argv("apps/demo\0demo.elf", &[]),
+            Err(libc::EINVAL)
+        );
     }
 }

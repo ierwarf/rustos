@@ -26,6 +26,9 @@ contract file.
 - Default KVM-smoke runs keep coarse `uiserver: update tick` logs only.
 - Detailed `uiserver profile: ...` and cursor/render pipeline diagnostics stay
   behind `RUSTOS_UI_PROFILE=1`.
+- Profile summaries use their own bounded asynchronous observability channel;
+  profile delivery must never synchronously block the render loop. A dropped
+  sample is a conservative KVM-gate failure, never a fabricated FPS success.
 - Under pointer stress, expected healthy markers are `input_errors=0`,
   `input_slow=0`, recurring `update tick`, and no watchdog/stall lines.
 

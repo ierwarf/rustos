@@ -42,36 +42,25 @@ fn register_partitions(root_id: u32) {
         return;
     }
 
-    let readonly = descriptor_without_init(BlockDeviceHandle::new(root_id))
-        .map(|device| device.readonly)
-        .unwrap_or(true);
-    let transport = descriptor_without_init(BlockDeviceHandle::new(root_id))
-        .map(|device| device.transport)
-        .unwrap_or(BlockTransportKind::Ahci);
+    let Some(root) = descriptor_without_init(BlockDeviceHandle::new(root_id)) else {
+        return;
+    };
 
     let mut devices = BLOCK_DEVICES.lock();
     for (index, partition) in partitions.into_iter().enumerate() {
         let id = devices.len() as u32;
         let partition_number = index + 1;
-        let start_block = device_start_block_locked(&devices, root_id)
-            .unwrap_or(0)
-            .saturating_add(partition.start_lba);
-        let logical_block_size = device_logical_block_size_locked(&devices, root_id).unwrap_or(0);
-        let root_device_id = device_root_id_locked(&devices, root_id).unwrap_or(root_id);
+        let start_block = root.start_block.saturating_add(partition.start_lba);
         devices.push(BlockDeviceRecord {
             id,
             path: alloc::format!("/dev/block{root_id}p{partition_number}"),
-            transport,
-            readonly,
-            logical_block_size,
+            transport: root.transport,
+            readonly: root.readonly,
+            logical_block_size: root.logical_block_size,
             start_block,
             block_count: partition.block_count,
-            root_id: root_device_id,
-            kind: BlockDeviceKind::Slice {
-                parent_id: root_id,
-                start_block: partition.start_lba,
-                block_count: partition.block_count,
-            },
+            root_id,
+            kind: BlockDeviceKind::Slice { parent_id: root_id },
         });
     }
 }

@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 use std::os::fd::AsRawFd;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread;
+use std::time::{Duration, Instant};
 use std::vec::Vec;
 
 use super::{
@@ -11,24 +14,174 @@ use crate::canvas;
 use crate::render::{self, default_console_window_rect, taskbar_slot_rect};
 use crate::runtime_sync::{RuntimeState, runtime_program_is_hidden, runtime_program_title};
 use crate::sys::{
-    ConsoleSessionHandle, ConsoleSessionInfo, ConsoleStateInfo, MAX_CONSOLE_SNAPSHOT_BYTES,
-    console_get_state, console_set_focus, console_snapshot_session_output,
-    console_snapshot_sessions, open_console,
+    ConsoleSessionHandle, ConsoleSessionInfo, ConsoleStateInfo, InputEvent,
+    MAX_CONSOLE_SNAPSHOT_BYTES, console_get_state, console_send_input_event, console_set_focus,
+    console_snapshot_session_output, console_snapshot_sessions, open_console,
 };
 use crate::wayland::WaylandCompositor;
 use runtime_control::RuntimeRunningProgram;
 
-fn is_stale_console_focus_error(errno: i32) -> bool {
-    matches!(
-        errno,
-        crate::sys::ENOENT | crate::sys::EINVAL | crate::sys::ESTALE
-    )
-}
+const CONSOLE_COMMAND_QUEUE_CAPACITY: usize = 512;
+const SLOW_CONSOLE_INPUT_COMMAND_THRESHOLD: Duration = Duration::from_millis(50);
 
 pub(crate) struct ConsoleRefresh {
     state: ConsoleStateInfo,
     sessions: Vec<ConsoleSessionInfo>,
     outputs: Vec<ConsoleSessionOutput>,
+}
+
+/// Console input and focus updates cross the `uiserver` -> `devmgrd` ->
+/// `runtimed` policy boundary. That IPC is allowed to wait for a recovering
+/// service, but the UI input/present loop is not. A bounded worker owns the
+/// wait so congestion is explicit telemetry rather than a frozen frame.
+pub(crate) struct ConsoleCommandDispatcher {
+    sender: SyncSender<ConsoleCommand>,
+    stats: Arc<ConsoleCommandStats>,
+}
+
+enum ConsoleCommand {
+    Input {
+        session_handle: ConsoleSessionHandle,
+        event: InputEvent,
+    },
+    SetFocus {
+        session_handle: ConsoleSessionHandle,
+    },
+}
+
+struct ConsoleCommandStats {
+    started: Instant,
+    accepted: AtomicU64,
+    completed: AtomicU64,
+    rejected: AtomicU64,
+    errors: AtomicU64,
+    slow_commands: AtomicU64,
+    active: AtomicBool,
+    active_started_ms: AtomicU64,
+}
+
+pub(crate) struct ConsoleCommandSnapshot {
+    pub(crate) pending: u64,
+    pub(crate) accepted: u64,
+    pub(crate) completed: u64,
+    pub(crate) rejected: u64,
+    pub(crate) errors: u64,
+    pub(crate) slow_commands: u64,
+    pub(crate) active: bool,
+    pub(crate) active_elapsed_ms: u64,
+}
+
+impl ConsoleCommandStats {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            accepted: AtomicU64::new(0),
+            completed: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
+            slow_commands: AtomicU64::new(0),
+            active: AtomicBool::new(false),
+            active_started_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+    }
+
+    fn snapshot(&self) -> ConsoleCommandSnapshot {
+        let accepted = self.accepted.load(Ordering::Relaxed);
+        let completed = self.completed.load(Ordering::Relaxed);
+        let active = self.active.load(Ordering::Acquire);
+        let active_elapsed_ms = if active {
+            self.elapsed_ms()
+                .saturating_sub(self.active_started_ms.load(Ordering::Acquire))
+        } else {
+            0
+        };
+        ConsoleCommandSnapshot {
+            pending: accepted.saturating_sub(completed),
+            accepted,
+            completed,
+            rejected: self.rejected.load(Ordering::Relaxed),
+            errors: self.errors.load(Ordering::Relaxed),
+            slow_commands: self.slow_commands.load(Ordering::Relaxed),
+            active,
+            active_elapsed_ms,
+        }
+    }
+}
+
+impl ConsoleCommandDispatcher {
+    pub(crate) fn submit_input(&self, session_handle: ConsoleSessionHandle, event: InputEvent) {
+        if session_handle == 0 {
+            return;
+        }
+        self.submit(ConsoleCommand::Input {
+            session_handle,
+            event,
+        });
+    }
+
+    pub(crate) fn submit_focus(&self, session_handle: ConsoleSessionHandle) {
+        if session_handle == 0 {
+            return;
+        }
+        self.submit(ConsoleCommand::SetFocus { session_handle });
+    }
+
+    fn submit(&self, command: ConsoleCommand) {
+        match self.sender.try_send(command) {
+            Ok(()) => {
+                self.stats.accepted.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                self.stats.rejected.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> ConsoleCommandSnapshot {
+        self.stats.snapshot()
+    }
+}
+
+pub(crate) fn start_console_command_dispatcher() -> ConsoleCommandDispatcher {
+    let (sender, receiver) = mpsc::sync_channel::<ConsoleCommand>(CONSOLE_COMMAND_QUEUE_CAPACITY);
+    let stats = Arc::new(ConsoleCommandStats::new());
+    let worker_stats = Arc::clone(&stats);
+    thread::spawn(move || {
+        let Ok(console_fd) = open_console() else {
+            worker_stats.errors.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        while let Ok(command) = receiver.recv() {
+            worker_stats
+                .active_started_ms
+                .store(worker_stats.elapsed_ms(), Ordering::Release);
+            worker_stats.active.store(true, Ordering::Release);
+            let started = Instant::now();
+            let result = match command {
+                ConsoleCommand::Input {
+                    session_handle,
+                    event,
+                } => console_send_input_event(console_fd.as_raw_fd(), session_handle, event),
+                ConsoleCommand::SetFocus { session_handle } => {
+                    console_set_focus(console_fd.as_raw_fd(), session_handle)
+                }
+            };
+            let elapsed = started.elapsed();
+            if elapsed >= SLOW_CONSOLE_INPUT_COMMAND_THRESHOLD {
+                worker_stats.slow_commands.fetch_add(1, Ordering::Relaxed);
+            }
+            if result.is_err() {
+                worker_stats.errors.fetch_add(1, Ordering::Relaxed);
+            }
+            worker_stats.completed.fetch_add(1, Ordering::Relaxed);
+            worker_stats.active.store(false, Ordering::Release);
+        }
+    });
+    ConsoleCommandDispatcher { sender, stats }
 }
 
 struct ConsoleSessionOutput {
@@ -399,24 +552,11 @@ impl AppState {
             else {
                 break;
             };
-            match console_set_focus(self.console_fd.as_raw_fd(), fallback_session) {
-                Ok(()) => {
-                    self.focused_session_handle = fallback_session;
-                    dirty_rect = dirty_rect.union(self.window_rect_for_session(fallback_session));
-                    dirty_rect =
-                        dirty_rect.union(self.taskbar_slot_rect_for_session(fallback_session));
-                }
-                Err(err) if is_stale_console_focus_error(err) => {
-                    let pruned =
-                        self.prune_windows(|session_handle| session_handle != fallback_session);
-                    if pruned {
-                        dirty_rect = dirty_rect
-                            .union(self.console_stack_dirty_rect())
-                            .union(self.taskbar_dirty_rect());
-                    }
-                }
-                Err(err) => return Err(err),
-            }
+            self.console_commands.submit_focus(fallback_session);
+            self.pending_console_focus = Some(fallback_session);
+            self.focused_session_handle = fallback_session;
+            dirty_rect = dirty_rect.union(self.window_rect_for_session(fallback_session));
+            dirty_rect = dirty_rect.union(self.taskbar_slot_rect_for_session(fallback_session));
         }
 
         if self.focused_session_handle != 0 && self.focused_session_handle != previous_focused {
@@ -554,18 +694,9 @@ impl AppState {
         let mut dirty_rect = self.window_rect_for_session(previous_focused);
         dirty_rect = dirty_rect.union(self.window_rect_for_session(session_handle));
         if self.focused_session_handle != session_handle {
-            match console_set_focus(self.console_fd.as_raw_fd(), session_handle) {
-                Ok(()) => {
-                    self.focused_session_handle = session_handle;
-                }
-                Err(err) if is_stale_console_focus_error(err) => {
-                    self.prune_windows(|existing_session| existing_session != session_handle);
-                    return Ok(dirty_rect
-                        .union(self.window_stack_dirty_rect())
-                        .union(self.taskbar_dirty_rect()));
-                }
-                Err(err) => return Err(err),
-            }
+            self.console_commands.submit_focus(session_handle);
+            self.pending_console_focus = Some(session_handle);
+            self.focused_session_handle = session_handle;
         }
 
         if self.bring_window_to_front(session_handle) {
@@ -620,20 +751,9 @@ impl AppState {
             .union(self.taskbar_slot_rect_for_session(session_handle))
             .union(self.focused_window_reorder_dirty_rect());
         if self.focused_session_handle != session_handle {
-            match console_set_focus(self.console_fd.as_raw_fd(), session_handle) {
-                Ok(()) => {
-                    self.focused_session_handle = session_handle;
-                }
-                Err(err) if is_stale_console_focus_error(err) => {
-                    self.prune_windows(|existing_session| existing_session != session_handle);
-                    self.focused_session_handle = 0;
-                    dirty_rect = dirty_rect
-                        .union(self.window_stack_dirty_rect())
-                        .union(self.taskbar_dirty_rect());
-                    return Ok(dirty_rect);
-                }
-                Err(err) => return Err(err),
-            }
+            self.console_commands.submit_focus(session_handle);
+            self.pending_console_focus = Some(session_handle);
+            self.focused_session_handle = session_handle;
         }
 
         Ok(dirty_rect)

@@ -4,6 +4,40 @@ const MAX_POLL_FDS: usize = 1024;
 const POLLFD_SIZE: usize = size_of::<linux_abi::LinuxPollFd>();
 const EPOLL_EVENT_SIZE: usize = size_of::<linux_abi::LinuxEpollEvent>();
 
+fn decode_pollfd(bytes: &[u8]) -> Result<(i32, u32), i64> {
+    let fd_bytes: [u8; 4] = bytes
+        .get(0..4)
+        .ok_or(LINUX_EINVAL)?
+        .try_into()
+        .map_err(|_| LINUX_EINVAL)?;
+    let event_bytes: [u8; 2] = bytes
+        .get(4..6)
+        .ok_or(LINUX_EINVAL)?
+        .try_into()
+        .map_err(|_| LINUX_EINVAL)?;
+    Ok((
+        i32::from_le_bytes(fd_bytes),
+        i16::from_le_bytes(event_bytes) as u32,
+    ))
+}
+
+fn decode_epoll_event(bytes: &[u8]) -> Result<(u32, u64), i64> {
+    let event_bytes: [u8; 4] = bytes
+        .get(0..4)
+        .ok_or(LINUX_EINVAL)?
+        .try_into()
+        .map_err(|_| LINUX_EINVAL)?;
+    let data_bytes: [u8; 8] = bytes
+        .get(4..12)
+        .ok_or(LINUX_EINVAL)?
+        .try_into()
+        .map_err(|_| LINUX_EINVAL)?;
+    Ok((
+        u32::from_le_bytes(event_bytes),
+        u64::from_le_bytes(data_bytes),
+    ))
+}
+
 pub fn syscall_linux_poll(fds_ptr: u64, nfds: u64, timeout_ms: i64) -> u64 {
     let start_tick = crate::arch::rtc::ticks();
     let ticks_per_second = crate::arch::rtc::ticks_per_second();
@@ -67,8 +101,10 @@ fn syscall_linux_poll_once(fds_ptr: u64, nfds: u64) -> u64 {
         if let Err(err) = usermem::copy_from_current_user_exact(entry_ptr, &mut entry) {
             return linux_errno(address_space_error_to_linux_errno(err));
         }
-        let fd = i32::from_le_bytes(entry[0..4].try_into().unwrap_or([0; 4]));
-        let events = i16::from_le_bytes(entry[4..6].try_into().unwrap_or([0; 2])) as u32;
+        let (fd, events) = match decode_pollfd(&entry) {
+            Ok(values) => values,
+            Err(errno) => return linux_errno(errno),
+        };
         let revents = if fd < 0 {
             0
         } else {
@@ -144,7 +180,10 @@ fn poll_vfs_revents(fd: u64, events: u32) -> Result<u32, i64> {
     if response.payload_len as usize != POLLFD_SIZE {
         return Err(LINUX_EINVAL);
     }
-    let revents = i16::from_le_bytes(response.payload[6..8].try_into().unwrap_or([0; 2]));
+    let revents_bytes: [u8; 2] = response.payload[6..8]
+        .try_into()
+        .map_err(|_| LINUX_EINVAL)?;
+    let revents = i16::from_le_bytes(revents_bytes);
     Ok(revents as u32)
 }
 
@@ -281,11 +320,10 @@ fn poll_has_input_read_interest(fds_ptr: u64, nfds: u64) -> Result<bool, i64> {
         let mut entry = [0_u8; POLLFD_SIZE];
         usermem::copy_from_current_user_exact(entry_ptr, &mut entry)
             .map_err(address_space_error_to_linux_errno)?;
-        let fd = i32::from_le_bytes(entry[0..4].try_into().unwrap_or([0; 4]));
+        let (fd, events) = decode_pollfd(&entry)?;
         if fd < 0 {
             continue;
         }
-        let events = i16::from_le_bytes(entry[4..6].try_into().unwrap_or([0; 2])) as u32;
         if events & (linux_abi::POLLIN as u32 | linux_abi::POLLPRI as u32) == 0 {
             continue;
         }
@@ -427,16 +465,13 @@ pub fn syscall_linux_epoll_wait(
     }
     for slot in 0..written {
         let offset = slot * EPOLL_EVENT_SIZE;
-        let events = u32::from_le_bytes(
-            response.payload[offset..offset + 4]
-                .try_into()
-                .unwrap_or([0; 4]),
-        );
-        let data = u64::from_le_bytes(
-            response.payload[offset + 4..offset + 12]
-                .try_into()
-                .unwrap_or([0; 8]),
-        );
+        let Some(wire_event) = response.payload.get(offset..offset + EPOLL_EVENT_SIZE) else {
+            return linux_errno(LINUX_EINVAL);
+        };
+        let (events, data) = match decode_epoll_event(wire_event) {
+            Ok(values) => values,
+            Err(errno) => return linux_errno(errno),
+        };
         let Some(entry_ptr) = events_ptr.checked_add((slot * EPOLL_EVENT_SIZE) as u64) else {
             return linux_errno(LINUX_EFAULT);
         };

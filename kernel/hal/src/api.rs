@@ -98,10 +98,10 @@ pub mod interrupts {
     pub fn init_pic() {
         crate::arch::pic::init();
         kernel_lowlevel::interrupts::register_timer_interrupt_dispatch(
-            super::timer_interrupt_fallback,
+            super::timer_interrupt_default_dispatch,
         );
         kernel_lowlevel::interrupts::register_software_schedule_interrupt_dispatch(
-            super::software_schedule_interrupt_fallback,
+            super::software_schedule_interrupt_default_dispatch,
         );
     }
 
@@ -134,7 +134,9 @@ pub mod interrupts {
 
 pub mod time {
     pub fn init_rtc() {
-        kernel_lowlevel::interrupts::register_rtc_interrupt_dispatch(super::rtc_interrupt_fallback);
+        kernel_lowlevel::interrupts::register_rtc_interrupt_dispatch(
+            super::rtc_interrupt_default_dispatch,
+        );
         crate::arch::rtc::init();
     }
 }
@@ -151,18 +153,20 @@ pub use interrupts::{
 };
 pub use time::init_rtc;
 
-extern "C" fn timer_interrupt_fallback(context_ptr: *mut SavedContext) -> *mut SavedContext {
+extern "C" fn timer_interrupt_default_dispatch(
+    context_ptr: *mut SavedContext,
+) -> *mut SavedContext {
     crate::arch::pic::send_eoi(crate::arch::pic::PIC_1_OFFSET);
     context_ptr
 }
 
-extern "C" fn rtc_interrupt_fallback(context_ptr: *mut SavedContext) -> *mut SavedContext {
+extern "C" fn rtc_interrupt_default_dispatch(context_ptr: *mut SavedContext) -> *mut SavedContext {
     crate::arch::rtc::on_interrupt();
     crate::arch::pic::send_eoi(crate::arch::pic::PIC_2_OFFSET);
     context_ptr
 }
 
-extern "C" fn software_schedule_interrupt_fallback(
+extern "C" fn software_schedule_interrupt_default_dispatch(
     context_ptr: *mut SavedContext,
 ) -> *mut SavedContext {
     context_ptr

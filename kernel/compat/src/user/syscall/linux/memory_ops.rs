@@ -34,14 +34,12 @@ pub(super) fn syscall_linux_sigaltstack(stack_ptr: u64, old_stack_ptr: u64) -> u
     const SIGALTSTACK_WIRE_SIZE: usize = 24; // ss_sp + ss_flags + (pad) + ss_size
     let mut request = new_procd_request(rustos_user_abi::syscall::PROCD_OP_SIGALTSTACK);
     let mut extra = SigaltstackRequestExtra::default();
-    let old_stack = multitask::current_linux_thread_state()
-        .map(|state| state.signal_stack)
-        .unwrap_or(linux_abi::LinuxSignalStack {
-            sp: 0,
-            flags: linux_abi::SS_DISABLE,
-            _pad: 0,
-            size: 0,
-        });
+    let Some(old_stack) = multitask::current_linux_thread_state().map(|state| state.signal_stack)
+    else {
+        // sigaltstack is per Linux thread.  Treating a missing thread state as
+        // a disabled stack would manufacture a valid-looking ABI response.
+        return linux_errno(LINUX_EINVAL);
+    };
     if stack_ptr != 0 {
         if old_stack.flags & linux_abi::SS_ONSTACK != 0 {
             return linux_errno(LINUX_EPERM);

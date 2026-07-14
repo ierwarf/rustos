@@ -156,6 +156,14 @@ pub fn boot_volume_identity() -> Option<BootVolumeIdentity> {
     identity.is_present().then_some(identity)
 }
 
+/// Multiboot2 supplies the root extent manifest but not a physical-volume
+/// identity. In that format, the block substrate may use only an unambiguous
+/// FAT volume selected for this manifest; it may never guess when an identity
+/// was supplied but did not match.
+pub fn boot_extent_manifest_present() -> bool {
+    boot_extent_manifest().is_some()
+}
+
 pub fn boot_volume_transport_hint() -> Option<BootVolumeTransport> {
     Some(boot_info()?.boot_volume.transport())
 }

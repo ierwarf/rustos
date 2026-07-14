@@ -616,18 +616,6 @@ fn milestone_debugcon_visible(name: &str) -> bool {
             | "module-init-unresolved-external"
             | "linux-virtio-register"
             | "linux-virtio-register-return"
-            | "usb-register-entry"
-            | "usb-register-bus-begin"
-            | "usb-register-driver-begin"
-            | "usb-register-linux-begin"
-            | "usb-register-done"
-            | "hid-quirks-enter"
-            | "hid-quirks-return"
-            | "xhci-core-register"
-            | "xhci-runtime-register-begin"
-            | "xhci-runtime-register-done"
-            | "xhci-poll-submit-begin"
-            | "xhci-poll-submit-done"
     )
 }
 

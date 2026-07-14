@@ -384,15 +384,6 @@ pub fn run_nucleus_loop() -> ! {
 pub fn housekeeping_once() -> usize {
     let mut work = 0;
 
-    trace_service_phase("compat");
-    compat_api::service_pending();
-
-    trace_service_phase("tty");
-    work += io_services::input_service_pending();
-
-    trace_service_phase("display");
-    work += io_services::display_service_pending();
-
     trace_service_phase("reap");
     work += ps_api::service_deferred_work();
 

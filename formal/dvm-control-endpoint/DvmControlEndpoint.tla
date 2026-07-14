@@ -62,6 +62,9 @@ UntrustedEndpointAttempt ==
 AgentConnect ==
     /\ phase = Idle
     /\ Agent \in portReaders
+    \* A proof transaction must fit in the finite TLC clock, otherwise the
+    \* final clock state could retain setup authority without a timeout step.
+    /\ now <= MaxTime - SetupDeadline
     /\ phase' = AwaitProof
     /\ setupOwner' = Agent
     /\ authenticated' = FALSE
@@ -110,7 +113,7 @@ TypeOK ==
     /\ portReaders \subseteq {Agent}
     /\ setupOwner \in {NoOwner, Agent}
     /\ authenticated \in BOOLEAN
-    /\ deadline \in Nat
+    /\ deadline \in 0..MaxTime
     /\ rejectedAttempts \in 0..MaxAttempts
     /\ now \in 0..MaxTime
 
@@ -134,10 +137,15 @@ SetupIsDeadlineBounded ==
         /\ ~authenticated
         /\ now < deadline
 
+SetupEventuallyResolves ==
+    phase = AwaitProof ~> phase # AwaitProof
+
 ClosedEndpointRetainsNoAuthority ==
     phase = Idle =>
         /\ setupOwner = NoOwner
         /\ ~authenticated
         /\ deadline = 0
+
+Spec == Init /\ [][Next]_vars /\ WF_vars(AdvanceTime)
 
 =============================================================================

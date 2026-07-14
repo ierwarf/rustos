@@ -33,7 +33,7 @@
         "Build OS",
         "Build Linux DVM"
       ],
-      "dependsOrder": "sequence",
+      "dependsOrder": "parallel",
       "problemMatcher": []
     }
   ]

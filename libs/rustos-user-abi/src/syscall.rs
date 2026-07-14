@@ -480,10 +480,6 @@ pub const COMMERCIAL_MAX_INPUTD_OP_EVDEV_TRANSLATE: u16 = 3;
 pub const COMMERCIAL_MAX_INPUTD_OP_LAYOUT_POLICY: u16 = 4;
 pub const COMMERCIAL_MAX_INPUTD_OP_DROP_POLICY: u16 = 5;
 pub const COMMERCIAL_MAX_INPUTD_OP_INPUT_STATS: u16 = 6;
-pub const COMMERCIAL_MAX_INPUTD_OP_SERIO_BUS_POLICY: u16 = 7;
-pub const COMMERCIAL_MAX_INPUTD_OP_I8042_COMMAND_POLICY: u16 = 8;
-pub const COMMERCIAL_MAX_INPUTD_OP_PS2_PACKET_POLICY: u16 = 9;
-pub const COMMERCIAL_MAX_INPUTD_OP_HID_REPORT_POLICY: u16 = 10;
 pub const COMMERCIAL_MAX_INPUTD_OP_POINTER_SURFACE_POLICY: u16 = 11;
 pub const COMMERCIAL_MAX_STORAGED_OP_BLOCK_INVENTORY: u16 = 1;
 pub const COMMERCIAL_MAX_STORAGED_OP_PARTITION_SCAN: u16 = 2;
@@ -908,7 +904,6 @@ pub struct RustosBootExtentBrokerArgs {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct InputStatsWire {
     pub pointer_packet_submits: u64,
-    pub pointer_absolute_submits: u64,
     pub read_calls: u64,
     pub read_events: u64,
     pub lock_active: u64,
@@ -934,28 +929,15 @@ pub const INPUTD_ACCESS_EVDEV: u16 = 2;
 pub const INPUTD_READ_PAYLOAD_CAPACITY: usize = 32 * 1024;
 pub const INPUTD_INGEST_MAX_EVENTS: usize = 256;
 pub const INPUTD_READ_FLAG_NONBLOCK: u32 = 1 << 0;
-pub const INPUTD_INGRESS_KIND_EVENT: u16 = 1;
 pub const INPUTD_INGRESS_KIND_POINTER_PACKET: u16 = 2;
-pub const INPUTD_INGRESS_KIND_POINTER_ABSOLUTE: u16 = 3;
-pub const INPUTD_INGRESS_KIND_KEYBOARD: u16 = 4;
-pub const INPUTD_INGRESS_KIND_HID_KEYBOARD_REPORT: u16 = 5;
-pub const INPUTD_INGRESS_KIND_HID_POINTER_REPORT: u16 = 6;
-pub const INPUTD_INGRESS_KIND_HID_RAW_REPORT: u16 = 7;
-pub const INPUTD_INGRESS_KIND_PS2_SCANCODE: u16 = 8;
-pub const INPUTD_INGRESS_KIND_PS2_MOUSE_BYTE: u16 = 9;
 /// Linux evdev key transition normalized by an authenticated driver domain.
 /// `keyboard.code` is a Linux `KEY_*` value and `keyboard.action` uses the
 /// RustOS pressed/released/repeated action constants.
 pub const INPUTD_INGRESS_KIND_DVM_LINUX_KEY: u16 = 10;
 pub const INPUTD_INGRESS_FLAG_RESET_STATE: u32 = 1 << 0;
 /// The ingress packet was normalized by the authenticated Linux driver-domain
-/// relay. `inputd` keeps its button state separate from native fallback input.
+/// relay. `inputd` accepts only this authenticated DVM provenance.
 pub const INPUTD_INGRESS_FLAG_DVM_SOURCE: u32 = 1 << 1;
-pub const INPUTD_HID_POLICY_REPORT_CAPACITY: usize = 64;
-pub const INPUTD_HID_POLICY_DESCRIPTOR_CAPACITY: usize = 128;
-pub const INPUTD_HID_POLICY_KIND_UNKNOWN: u16 = 0;
-pub const INPUTD_HID_POLICY_KIND_KEYBOARD: u16 = 1;
-pub const INPUTD_HID_POLICY_KIND_POINTER: u16 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -978,22 +960,6 @@ pub struct InputKeyboardEventWire {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-pub struct InputPs2ScancodeWire {
-    pub scancode: u8,
-    pub translated: u8,
-    pub reserved0: u16,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct InputPs2MouseByteWire {
-    pub byte: u8,
-    pub reserved0: u8,
-    pub reserved1: u16,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
 pub struct InputPointerPacketWire {
     pub buttons: u8,
     pub reserved0: [u8; 3],
@@ -1005,93 +971,12 @@ pub struct InputPointerPacketWire {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-pub struct InputPointerAbsoluteWire {
-    pub buttons: u8,
-    pub reserved0: [u8; 3],
-    pub x: u32,
-    pub y: u32,
-    pub wheel_vertical: i16,
-    pub reserved1: i16,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct InputHidKeyboardReportWire {
-    pub source_id: u64,
-    pub modifiers: u8,
-    pub key_count: u8,
-    pub reserved0: [u8; 6],
-    pub keys: [u8; 16],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct InputHidPointerReportWire {
-    pub source_id: u64,
-    pub buttons: u8,
-    pub relative: u8,
-    pub reserved0: [u8; 2],
-    pub x: i32,
-    pub y: i32,
-    pub wheel_vertical: i16,
-    pub reserved1: i16,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct InputHidPolicyWire {
-    pub source_id: u64,
-    pub kind: u16,
-    pub report_len: u16,
-    pub descriptor_len: u16,
-    pub report_id: u8,
-    pub flags: u8,
-    pub required_bytes: u16,
-    pub reserved0: u16,
-    pub logical_min_x: i32,
-    pub logical_max_x: i32,
-    pub logical_min_y: i32,
-    pub logical_max_y: i32,
-    pub report: [u8; INPUTD_HID_POLICY_REPORT_CAPACITY],
-    pub descriptor_prefix: [u8; INPUTD_HID_POLICY_DESCRIPTOR_CAPACITY],
-}
-
-impl Default for InputHidPolicyWire {
-    fn default() -> Self {
-        Self {
-            source_id: 0,
-            kind: INPUTD_HID_POLICY_KIND_UNKNOWN,
-            report_len: 0,
-            descriptor_len: 0,
-            report_id: 0,
-            flags: 0,
-            required_bytes: 0,
-            reserved0: 0,
-            logical_min_x: 0,
-            logical_max_x: 0,
-            logical_min_y: 0,
-            logical_max_y: 0,
-            report: [0; INPUTD_HID_POLICY_REPORT_CAPACITY],
-            descriptor_prefix: [0; INPUTD_HID_POLICY_DESCRIPTOR_CAPACITY],
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
 pub struct InputIngressWire {
     pub kind: u16,
     pub access: u16,
     pub flags: u32,
-    pub event: super::ui::UiInputEvent,
     pub keyboard: InputKeyboardEventWire,
-    pub ps2_scancode: InputPs2ScancodeWire,
-    pub ps2_mouse_byte: InputPs2MouseByteWire,
     pub pointer_packet: InputPointerPacketWire,
-    pub pointer_absolute: InputPointerAbsoluteWire,
-    pub hid_keyboard: InputHidKeyboardReportWire,
-    pub hid_pointer: InputHidPointerReportWire,
-    pub hid_raw: InputHidPolicyWire,
 }
 
 #[repr(C)]

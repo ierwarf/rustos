@@ -280,9 +280,13 @@ pub fn current_epoll_handle(fd: u64) -> Option<multitask::EpollHandle> {
 pub fn read_linux_epoll_event(user_ptr: u64) -> Result<(u32, u64), paging::AddressSpaceError> {
     let mut bytes = [0_u8; size_of::<linux_abi::LinuxEpollEvent>()];
     usermem::copy_from_current_user_exact(user_ptr, &mut bytes)?;
+    let mut event_bytes = [0_u8; 4];
+    event_bytes.copy_from_slice(&bytes[0..4]);
+    let mut data_bytes = [0_u8; 8];
+    data_bytes.copy_from_slice(&bytes[4..12]);
     Ok((
-        u32::from_le_bytes(bytes[0..4].try_into().unwrap_or([0; 4])),
-        u64::from_le_bytes(bytes[4..12].try_into().unwrap_or([0; 8])),
+        u32::from_le_bytes(event_bytes),
+        u64::from_le_bytes(data_bytes),
     ))
 }
 

@@ -1,14 +1,11 @@
 use std::io::Write;
 use std::mem::size_of;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread;
 use std::time::Duration;
 
 use rustos_user_abi::syscall::{
-    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, DevmgrdDeviceIoctlRequest,
-    DevmgrdDeviceIoctlResponse, DevmgrdDeviceOpenRequest, DevmgrdDeviceOpenResponse,
-    DevmgrdIpcRequest, DevmgrdIpcResponse, DevmgrdNodeEntry, IpcReplyWithHandlesArgs,
-    RustosDeviceIoctlBrokerArgs, RustosDeviceOpenBrokerArgs,
     COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_EVENT_SUBSCRIBE, COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_MAP,
     COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_OPEN, COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_REGISTRY,
     COMMERCIAL_MAX_DEVMGRD_OP_IOCTL_AUTHORIZE, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
@@ -17,25 +14,41 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE, COMMERCIAL_MAX_SESSIOND_OP_FOREGROUND_FOCUS,
     COMMERCIAL_MAX_SESSIOND_OP_SESSION_GRAPH, COMMERCIAL_MAX_UISERVER_OP_DISPLAY_METADATA,
     COMMERCIAL_MAX_UISERVER_OP_PRESENT_POLICY, COMMERCIAL_MAX_UISERVER_OP_SURFACE_POLICY,
-    DEVMGRD_DEVICE_ACCESS_EVDEV, DEVMGRD_DEVICE_ACCESS_NATIVE, DEVMGRD_DEVICE_ID_CONSOLE,
-    DEVMGRD_DEVICE_ID_DISPLAY, DEVMGRD_DEVICE_ID_INPUT, DEVMGRD_DEVICE_RIGHT_ADMIN,
-    DEVMGRD_DEVICE_RIGHT_IOCTL, DEVMGRD_DEVICE_RIGHT_MAP, DEVMGRD_DEVICE_RIGHT_READ,
-    DEVMGRD_DEVICE_RIGHT_TRANSFER, DEVMGRD_DEVICE_RIGHT_WRITE, DEVMGRD_IOCTL_LINUX_TTY_FIONREAD,
-    DEVMGRD_IOCTL_LINUX_TTY_TCGETS, DEVMGRD_IOCTL_LINUX_TTY_TCSETS,
-    DEVMGRD_IOCTL_LINUX_TTY_TCSETSF, DEVMGRD_IOCTL_LINUX_TTY_TCSETSW, DEVMGRD_IOCTL_ROUTE_DEVMGRD,
-    DEVMGRD_IOCTL_ROUTE_DIRECT, DEVMGRD_IOCTL_ROUTE_SESSIOND_COMMIT,
-    DEVMGRD_IOCTL_ROUTE_SESSIOND_TTY, DEVMGRD_IPC_ABI_VERSION, DEVMGRD_IPC_OP_IOCTL_AUTHORIZE,
-    DEVMGRD_IPC_OP_IOCTL_ROUTE, DEVMGRD_IPC_OP_LOOKUP, DEVMGRD_IPC_OP_OPEN, DEVMGRD_IPC_OP_READDIR,
-    DEVMGRD_MAX_DIR_ENTRIES, DEVMGRD_NAME_CAPACITY, DEVMGRD_NODE_KIND_DEVICE,
-    DEVMGRD_NODE_KIND_DIR, IPC_MAX_INLINE_BYTES, IPC_SERVICE_DEVMGRD, IPC_SERVICE_SESSIOND,
-    IPC_SERVICE_UISERVER, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_DEVICE_IOCTL_BROKER,
-    SYS_RUSTOS_DEVICE_OPEN_BROKER, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
-    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_RECV,
+    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, DEVMGRD_DEVICE_ACCESS_EVDEV,
+    DEVMGRD_DEVICE_ACCESS_NATIVE, DEVMGRD_DEVICE_ID_CONSOLE, DEVMGRD_DEVICE_ID_DISPLAY,
+    DEVMGRD_DEVICE_ID_INPUT, DEVMGRD_DEVICE_RIGHT_ADMIN, DEVMGRD_DEVICE_RIGHT_IOCTL,
+    DEVMGRD_DEVICE_RIGHT_MAP, DEVMGRD_DEVICE_RIGHT_READ, DEVMGRD_DEVICE_RIGHT_TRANSFER,
+    DEVMGRD_DEVICE_RIGHT_WRITE, DEVMGRD_IOCTL_LINUX_TTY_FIONREAD, DEVMGRD_IOCTL_LINUX_TTY_TCGETS,
+    DEVMGRD_IOCTL_LINUX_TTY_TCSETS, DEVMGRD_IOCTL_LINUX_TTY_TCSETSF,
+    DEVMGRD_IOCTL_LINUX_TTY_TCSETSW, DEVMGRD_IOCTL_ROUTE_DEVMGRD, DEVMGRD_IOCTL_ROUTE_DIRECT,
+    DEVMGRD_IOCTL_ROUTE_SESSIOND_COMMIT, DEVMGRD_IOCTL_ROUTE_SESSIOND_TTY, DEVMGRD_IPC_ABI_VERSION,
+    DEVMGRD_IPC_OP_IOCTL_AUTHORIZE, DEVMGRD_IPC_OP_IOCTL_ROUTE, DEVMGRD_IPC_OP_LOOKUP,
+    DEVMGRD_IPC_OP_OPEN, DEVMGRD_IPC_OP_READDIR, DEVMGRD_MAX_DIR_ENTRIES, DEVMGRD_NAME_CAPACITY,
+    DEVMGRD_NODE_KIND_DEVICE, DEVMGRD_NODE_KIND_DIR, DevmgrdDeviceIoctlRequest,
+    DevmgrdDeviceIoctlResponse, DevmgrdDeviceOpenRequest, DevmgrdDeviceOpenResponse,
+    DevmgrdIpcRequest, DevmgrdIpcResponse, DevmgrdNodeEntry, IPC_MAX_INLINE_BYTES,
+    IPC_SERVICE_DEVMGRD, IPC_SERVICE_SESSIOND, IPC_SERVICE_UISERVER, IpcReplyWithHandlesArgs,
+    RustosDeviceIoctlBrokerArgs, RustosDeviceOpenBrokerArgs, SYS_RUSTOS_DEBUG_PRINT,
+    SYS_RUSTOS_DEVICE_IOCTL_BROKER, SYS_RUSTOS_DEVICE_OPEN_BROKER, SYS_RUSTOS_IPC_CALL,
+    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_RECV,
     SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
     SYS_RUSTOS_IPC_REPLY_WITH_HANDLES,
 };
 
 const RECV_BACKOFF: Duration = Duration::from_millis(10);
+const SESSIOND_IOCTL_WORKERS: usize = 4;
+const SESSIOND_IOCTL_WORKER_QUEUE_CAPACITY: usize = 8;
+
+struct SessiondIoctlWork {
+    reply_cap: u64,
+    request: DevmgrdDeviceIoctlRequest,
+}
+
+struct SessiondIoctlWorkers {
+    senders: Vec<SyncSender<SessiondIoctlWork>>,
+    next_worker: AtomicUsize,
+}
 
 fn main() {
     debug_line("devmgrd: service start");
@@ -59,10 +72,53 @@ fn main() {
     }
 
     debug_line("devmgrd: device policy endpoint registered");
-    serve(endpoint as u64);
+    let sessiond_workers = start_sessiond_ioctl_workers();
+    serve(endpoint as u64, &sessiond_workers);
 }
 
-fn serve(endpoint: u64) {
+fn start_sessiond_ioctl_workers() -> SessiondIoctlWorkers {
+    let mut senders = Vec::with_capacity(SESSIOND_IOCTL_WORKERS);
+    for _ in 0..SESSIOND_IOCTL_WORKERS {
+        let (sender, receiver) =
+            mpsc::sync_channel::<SessiondIoctlWork>(SESSIOND_IOCTL_WORKER_QUEUE_CAPACITY);
+        thread::spawn(move || sessiond_ioctl_worker(receiver));
+        senders.push(sender);
+    }
+    SessiondIoctlWorkers {
+        senders,
+        next_worker: AtomicUsize::new(0),
+    }
+}
+
+impl SessiondIoctlWorkers {
+    fn try_send(&self, mut work: SessiondIoctlWork) -> Result<(), SessiondIoctlWork> {
+        for _ in 0..self.senders.len() {
+            let index = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.senders.len();
+            match self.senders[index].try_send(work) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Full(returned) | TrySendError::Disconnected(returned)) => {
+                    work = returned;
+                }
+            }
+        }
+        Err(work)
+    }
+}
+
+fn sessiond_ioctl_worker(receiver: Receiver<SessiondIoctlWork>) {
+    while let Ok(work) = receiver.recv() {
+        let reply = reply_device_ioctl(work.reply_cap, &work.request);
+        if reply < 0 {
+            let _ = writeln!(
+                std::io::stderr(),
+                "devmgrd: sessiond ioctl reply failed errno={}",
+                -reply
+            );
+        }
+    }
+}
+
+fn serve(endpoint: u64, sessiond_workers: &SessiondIoctlWorkers) {
     loop {
         let mut request = [0_u8; IPC_MAX_INLINE_BYTES];
         let mut reply_cap = 0_u64;
@@ -99,7 +155,16 @@ fn serve(endpoint: u64) {
             }
             size if size == size_of::<DevmgrdDeviceIoctlRequest>() => {
                 let request = read_unaligned::<DevmgrdDeviceIoctlRequest>(&request);
-                reply_device_ioctl(reply_cap, &request)
+                if request.op == DEVMGRD_IPC_OP_IOCTL_AUTHORIZE
+                    && sessiond_executes_ioctl(request.request)
+                {
+                    match sessiond_workers.try_send(SessiondIoctlWork { reply_cap, request }) {
+                        Ok(()) => continue,
+                        Err(work) => reply_device_ioctl_status(work.reply_cap, libc::EAGAIN),
+                    }
+                } else {
+                    reply_device_ioctl(reply_cap, &request)
+                }
             }
             size if size == size_of::<CommercialMaxProtocolRequest>() => {
                 let request = read_unaligned::<CommercialMaxProtocolRequest>(&request);
@@ -183,6 +248,21 @@ fn reply_device_ioctl(reply_cap: u64, request: &DevmgrdDeviceIoctlRequest) -> i6
         }
     } else {
         authorize_and_broker_ioctl(request, &mut response)
+    };
+    syscall3(
+        SYS_RUSTOS_IPC_REPLY,
+        reply_cap,
+        (&response as *const DevmgrdDeviceIoctlResponse) as u64,
+        size_of::<DevmgrdDeviceIoctlResponse>() as u64,
+    )
+}
+
+fn reply_device_ioctl_status(reply_cap: u64, status: i32) -> i64 {
+    let response = DevmgrdDeviceIoctlResponse {
+        version: DEVMGRD_IPC_ABI_VERSION,
+        op: DEVMGRD_IPC_OP_IOCTL_AUTHORIZE,
+        status,
+        ..DevmgrdDeviceIoctlResponse::default()
     };
     syscall3(
         SYS_RUSTOS_IPC_REPLY,
@@ -963,7 +1043,11 @@ fn syscall5(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
 fn register_service_endpoint(service_id: u64, endpoint: u64) -> i64 {
     let mut last = 0;
     for _ in 0..65_536 {
-        last = syscall2(SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, service_id, endpoint);
+        last = syscall2(
+            SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
+            service_id,
+            endpoint,
+        );
         if last >= 0 {
             return last;
         }

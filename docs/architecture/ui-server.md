@@ -75,9 +75,10 @@ ring. Layout uses the terminal monospace atlas; chrome uses the UI atlas.
 
 Set `RUSTOS_UI_PROFILE=1` when profiling is needed to enable
 `profile::record_*` paths. The summary lines tagged
-`uiserver profile: ...` get flushed to debugcon and are the primary tool
-for diagnosing slow refresh / slow present regressions. Use them before
-adding new diag prints.
+`uiserver profile: ...` pass through a dedicated bounded asynchronous
+observability channel to debugcon. A slow observability path can make the
+KVM gate fail conservatively, but cannot block the render loop. Use these
+samples before adding new diag prints.
 Per-frame cursor/render pipeline samples are also profile-gated; normal KVM
 runs keep only coarse `uiserver: update tick` liveness lines.
 

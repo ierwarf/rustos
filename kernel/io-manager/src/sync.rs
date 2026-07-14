@@ -184,12 +184,6 @@ impl<T: ?Sized> KernelSpinLock<T> {
         }
     }
 
-    #[track_caller]
-    pub(crate) fn try_lock(&self) -> Option<KernelSpinGuard<'_, T>> {
-        let acquire_site = Location::caller();
-        self.try_acquire_at(current_lock_owner_token(), acquire_site)
-    }
-
     fn try_acquire_at(
         &self,
         owner: usize,

@@ -19,7 +19,6 @@ pub struct CurrentUserSnapshot {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct InputEventQueueDebugSnapshot {
     pub pointer_packet_submits: u64,
-    pub pointer_absolute_submits: u64,
     pub read_calls: u64,
     pub read_events: u64,
     pub lock_active: u64,
@@ -34,8 +33,6 @@ pub struct InputEventQueueDebugSnapshot {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct HeartbeatSnapshot {
     pub userspace_display_active: bool,
-    pub xhci_transfer_count: u64,
-    pub hid_pointer_report_count: u64,
     pub input: InputEventQueueDebugSnapshot,
     pub linux_irq_owner_count: usize,
     pub linux_irq_total_depth: u64,
@@ -62,8 +59,6 @@ pub struct TaskHooks {
 #[derive(Clone, Copy, Default)]
 pub struct InterruptHooks {
     pub dispatch_pic_irq: Option<fn(u8) -> bool>,
-    pub handle_keyboard_interrupt: Option<fn()>,
-    pub handle_mouse_interrupt: Option<fn()>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -92,8 +87,6 @@ static HOOKS: RwLock<HookRegistry> = RwLock::new(HookRegistry {
     },
     interrupt: InterruptHooks {
         dispatch_pic_irq: None,
-        handle_keyboard_interrupt: None,
-        handle_mouse_interrupt: None,
     },
     heartbeat: HeartbeatHooks { snapshot: None },
 });
@@ -193,18 +186,6 @@ pub fn dispatch_pic_irq(irq: u8) -> bool {
         .dispatch_pic_irq
         .map(|hook| hook(irq))
         .unwrap_or(false)
-}
-
-pub fn handle_keyboard_interrupt() {
-    if let Some(hook) = HOOKS.read().interrupt.handle_keyboard_interrupt {
-        hook();
-    }
-}
-
-pub fn handle_mouse_interrupt() {
-    if let Some(hook) = HOOKS.read().interrupt.handle_mouse_interrupt {
-        hook();
-    }
 }
 
 pub fn heartbeat_snapshot() -> HeartbeatSnapshot {

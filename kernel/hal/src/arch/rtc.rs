@@ -33,10 +33,7 @@ static RTC_LAST_DIAG_PRINT_TICK: AtomicU64 = AtomicU64::new(0);
 // outside IRQ context by `drain_pending_heartbeat`. `u64::MAX` is the sentinel
 // for "no second has ever been observed" (matches RTC_LAST_ALIVE_SECOND).
 static HEARTBEAT_PENDING_SECOND: AtomicU64 = AtomicU64::new(u64::MAX);
-static RTC_LAST_XHCI_TRANSFER_COUNT: AtomicU64 = AtomicU64::new(0);
-static RTC_LAST_HID_POINTER_REPORT_COUNT: AtomicU64 = AtomicU64::new(0);
 static RTC_LAST_INPUT_PACKET_SUBMIT_COUNT: AtomicU64 = AtomicU64::new(0);
-static RTC_LAST_INPUT_ABSOLUTE_SUBMIT_COUNT: AtomicU64 = AtomicU64::new(0);
 static RTC_LAST_INPUT_READ_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
 static RTC_LAST_INPUT_READ_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
 static RTC_LAST_LINUX_IRQ_LOCK_DEPTH: AtomicU64 = AtomicU64::new(0);
@@ -354,25 +351,14 @@ pub fn drain_pending_heartbeat() -> usize {
 
 fn emit_heartbeat_log(current_second: u64) {
     let snapshot = crate::hooks::heartbeat_snapshot();
-    let xhci_transfer_count = snapshot.xhci_transfer_count;
-    let hid_pointer_report_count = snapshot.hid_pointer_report_count;
     let input_snapshot = snapshot.input;
     let linux_irq_owner_count = snapshot.linux_irq_owner_count;
     let linux_irq_total_depth = snapshot.linux_irq_total_depth as usize;
     let linux_input_lock_active = snapshot.linux_input_lock_active;
     let linux_input_lock_last_seq = snapshot.linux_input_lock_last_seq;
-    let xhci_delta = xhci_transfer_count
-        .saturating_sub(RTC_LAST_XHCI_TRANSFER_COUNT.swap(xhci_transfer_count, Ordering::AcqRel));
-    let hid_pointer_delta = hid_pointer_report_count.saturating_sub(
-        RTC_LAST_HID_POINTER_REPORT_COUNT.swap(hid_pointer_report_count, Ordering::AcqRel),
-    );
     let input_packet_delta = input_snapshot.pointer_packet_submits.saturating_sub(
         RTC_LAST_INPUT_PACKET_SUBMIT_COUNT
             .swap(input_snapshot.pointer_packet_submits, Ordering::AcqRel),
-    );
-    let input_absolute_delta = input_snapshot.pointer_absolute_submits.saturating_sub(
-        RTC_LAST_INPUT_ABSOLUTE_SUBMIT_COUNT
-            .swap(input_snapshot.pointer_absolute_submits, Ordering::AcqRel),
     );
     let input_read_call_delta = input_snapshot.read_calls.saturating_sub(
         RTC_LAST_INPUT_READ_CALL_COUNT.swap(input_snapshot.read_calls, Ordering::AcqRel),
@@ -386,13 +372,10 @@ fn emit_heartbeat_log(current_second: u64) {
     crate::debug::info!(
         heartbeat,
         alloc::format!(
-            "second={} userspace_display={} xhci_delta={} hid_ptr_delta={} input_packet_delta={} input_abs_delta={} input_read_calls_delta={} input_read_events_delta={} linux_irq_owners={} linux_irq_depth={} linux_irq_depth_delta={} input_lock_active={} input_lock_last_seq={} eventq_lock_active={} eventq_lock_last_seq={} queued={} pending_coalesced={} pending_pointer_position={} dropped_discrete={} dropped_lossy={}",
+            "second={} userspace_display={} input_packet_delta={} input_read_calls_delta={} input_read_events_delta={} linux_irq_owners={} linux_irq_depth={} linux_irq_depth_delta={} input_lock_active={} input_lock_last_seq={} eventq_lock_active={} eventq_lock_last_seq={} queued={} pending_coalesced={} pending_pointer_position={} dropped_discrete={} dropped_lossy={}",
             current_second,
             snapshot.userspace_display_active,
-            xhci_delta,
-            hid_pointer_delta,
             input_packet_delta,
-            input_absolute_delta,
             input_read_call_delta,
             input_read_event_delta,
             linux_irq_owner_count,

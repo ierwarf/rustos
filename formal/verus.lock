@@ -1,0 +1,4 @@
+version=0.2026.07.12.0b42f4c
+toolchain=1.96.0-x86_64-unknown-linux-gnu
+url=https://github.com/verus-lang/verus/releases/download/release/0.2026.07.12.0b42f4c/verus-0.2026.07.12.0b42f4c-x86-linux.zip
+sha256=f6f4f5d08e07d3e1ad721d775bda5ba96b9dd0c73b48fc17f2e071866fbd01c0

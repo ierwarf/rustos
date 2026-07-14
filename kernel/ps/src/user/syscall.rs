@@ -15,7 +15,9 @@ struct SyscallCpuLocal {
 }
 
 #[repr(align(16))]
-struct SyscallFallbackStack([u8; SYSCALL_STACK_SIZE]);
+/// Early CPU-local stack used before the scheduler installs the current task's
+/// kernel stack. This is bootstrap substrate, not a substitute execution path.
+struct SyscallBootstrapStack([u8; SYSCALL_STACK_SIZE]);
 
 const _: [(); 0x10] = [(); core::mem::offset_of!(SyscallCpuLocal, linux_compat_current_task)];
 const _: [(); 0x18] = [(); core::mem::offset_of!(SyscallCpuLocal, linux_compat_stack_guard)];
@@ -26,12 +28,12 @@ static mut SYSCALL_CPU_LOCAL: SyscallCpuLocal = SyscallCpuLocal {
     linux_compat_current_task: 0,
     linux_compat_stack_guard: 0,
 };
-static mut SYSCALL_FALLBACK_STACK: SyscallFallbackStack =
-    SyscallFallbackStack([0; SYSCALL_STACK_SIZE]);
+static mut SYSCALL_BOOTSTRAP_STACK: SyscallBootstrapStack =
+    SyscallBootstrapStack([0; SYSCALL_STACK_SIZE]);
 
 pub fn init_cpu_local() {
     let stack_base =
-        unsafe { paging::higher_half_addr(core::ptr::addr_of!(SYSCALL_FALLBACK_STACK.0) as u64) };
+        unsafe { paging::higher_half_addr(core::ptr::addr_of!(SYSCALL_BOOTSTRAP_STACK.0) as u64) };
     unsafe {
         SYSCALL_CPU_LOCAL.kernel_stack_top = stack_base + SYSCALL_STACK_SIZE as u64;
     }

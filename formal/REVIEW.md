@@ -1,0 +1,48 @@
+# Commercial-model review
+
+This is the model-quality review performed after the initial TLC suite was
+already passing. A passing finite safety check is not sufficient when the
+model silently assumes freshness, timer progress, a cleanup transition, or a
+well-formed configuration.
+
+## Review rule
+
+Each model was checked for its state type, authority identity, terminal
+cleanup, bounded-resource behavior, failure/revoke/exit transition, finite
+clock boundary, and—where the contract promises eventual release—an explicit
+fairness assumption plus a temporal property. The audit groups and outcome
+below cover every model currently invoked by `run-all-tlc.sh`.
+
+| Model group | Models reviewed | Result |
+| --- | --- | --- |
+| Bootstrap and service lifecycle | `rootd-bootstrap`, `endpoint-registry`, `endpoint-publication`, `deferred-start`, `post-init-leases`, `rootd-restart-backoff`, `post-init-supervisor-recovery` | Added finite-clock admission guards to every wait/backoff/recovery window that could otherwise be created at TLC's final tick. Rootd and endpoint/deferred waits now state timer-fair eventual settlement. Publication and post-init lease identity/cleanup models already contained their rejected and exit transitions. |
+| DVM authority and transports | `dvm-control-relay`, `dvm-control-endpoint`, `dvm-network-ring`, `dvm-network-control`, `dvm-input-revocation`, `trusted-ui-boundary`, `dvm-display-seqlock` | Added temporal timeout settlement to control setup/relay. Fresh relay epochs are now monotonic in hostd and one-shot in input/network models. VFIO-like data planes remain non-authoritative. Trusted UI now includes independent attestation-lease withdrawal, not only provider loss. Ring and display models already cover untrusted-header and even-generation cleanup paths. |
+| UI and readiness | `input-readiness`, `ui-frame-budget`, `ui-input-motion`, `devmgrd-sessiond-isolation` | Added fair timer/recheck progress and eventual poll settlement. Frame budget, motion, and devmgrd models already make the blocking worker independent from the UI/main-loop owner, with bounded admission and explicit rejection. |
+| Scheduler and IPC | `ipc-reply-deadline`, `scheduler-wakeup`, `ipc-priority-inheritance`, `ipc-handle-transfer`, `ipc-endpoint-ownership` | Added timer-fair unblocking for reply waits and scheduler arms. Added a received-batch owner-exit cleanup path, prohibited reply before transferred-handle installation, and made terminal messages reject detached transfers. The priority-inheritance model already covers process-owned broker workers, transitive donation, and every terminal revocation path. |
+| Process and hardware authority | `vfio-release-authorization`, `driver-domain-fleet`, `proc-broker-session`, `exec-ticket` | VFIO now explicitly generates a signed wrong-manifest candidate and rejects it; all distinct mismatch domains are asserted as configuration assumptions. Fleet, prepare-session, and exec-ticket models already encode signed-fleet exclusivity, owner-exit cleanup, exact PID/TID binding, and sibling/target teardown. |
+
+## Closed model defects
+
+1. Absolute bounded clocks allowed a new wait to be created after its final
+   timer transition. The affected models now admit a wait only when its full
+   interval fits, and the models that promise release check it temporally.
+2. Several timer models proved a deadline field but permitted infinite
+   stuttering. Their `Spec` now names the timer/recheck fairness assumption and
+   checks the resulting release property.
+3. DVM input/network models allowed retired epoch reuse. This could reset a
+   sequence counter and make an old sequence valid again. The L0 epoch is now
+   allocated atomically and monotonically by hostd, fails closed before wrap,
+   and is one-shot in both formal lifecycle models.
+4. The VFIO model constructed only a correct manifest and did not compare it
+   during authorization. It now explores a signed wrong-manifest release.
+5. The transferred-handle models permitted reply before installation and did
+   not represent owner death after dequeue. Terminal message states now cannot
+   retain received descriptors.
+6. Trusted-UI invalidation modeled a lost device but not a still-present
+   provider whose independent attestation lease was revoked. That revocation
+   now immediately cancels a granted prompt.
+
+The bounded models remain abstractions. They do not prove CPU memory ordering,
+ELF/PE parser correctness, DMA behavior, a physical trusted-UI device, or
+unbounded host lifetime. Those limits remain documented in `COVERAGE.md` and
+require source tests, fuzzing, and bounded KVM validation.

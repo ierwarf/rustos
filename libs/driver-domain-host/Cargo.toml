@@ -6,4 +6,5 @@ publish = false
 
 [dependencies]
 anyhow = "1"
+driver-domain-protocol = { path = "../driver-domain-protocol", features = ["std"] }
 libc = "0.2"

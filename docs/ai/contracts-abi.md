@@ -163,10 +163,11 @@ primary-provider flag alone is never such an attestation.
 The reserved service-driver resource broker is not a DVM module loader and has
 no currently admitted service endpoint.
 
-Residual app-ABI policy batches (`compat-slowpath-ring3`,
-`pager-slowpath-ring3`, and `process-slowpath-ring3`) are planning references.
-They do not move syscall entry, page tables, scheduler state, or privileged
-transport out of ring0.
+The retired `compat-slowpath-ring3`, `pager-slowpath-ring3`, and
+`process-slowpath-ring3` planning tables have no live ring0 source entry.
+Their ownership constraints remain: syscall entry, page tables, scheduler
+state, and privileged transport stay ring0 substrate while service-visible
+policy remains with the owning service.
 
 ## Handle Transfer
 
@@ -249,25 +250,32 @@ transport out of ring0.
 - Compat input-device reads call `INPUTD_IPC_OP_AUTHORIZE_READ` before
   `INPUTD_IPC_OP_READ`; inputd consumes the authorization by `(pid, tid, fd,
   access)` so raw reads are not accepted as standalone event-drain authority.
-- inputd drains authenticated RDI2 records via gated
-  `SYS_RUSTOS_INPUT_INGEST_BROKER`, returns bounded `InputdReadResponse`
-  capped at 32 KiB, and uses a bounded 4 ms ingest turn. It must sleep when
-  both IPC and DVM input are idle and reuse its fixed-size ingress scratch.
-- RustOS-native input readers should prefer short nonblocking `read()` attempts
-  over a separate readiness-then-read cycle. `INPUTD_IPC_OP_READ` already drains
-  ingest first, so routing through read avoids stale `STATS`/`poll` readiness
-  decisions while keeping HID decode policy in inputd.
+- inputd refreshes authenticated RDI2 records via gated
+  `SYS_RUSTOS_INPUT_INGEST_BROKER` before replying to either
+  `INPUTD_IPC_OP_STATS` (the kernel's poll recheck) or an authorized
+  `INPUTD_IPC_OP_READ`. It then reports only the service-owned policy queue,
+  returns bounded `InputdReadResponse` capped at 32 KiB, and reuses its
+  fixed-size ingress scratch. It must not drain ingress asynchronously while a
+  reader is armed in ring0, because that service turn cannot complete the
+  reader's wait. The non-consuming `STATS` probe has a 16 ms IPC reply
+  deadline, so a wedged inputd cannot freeze the UI poll loop behind the
+  generic service timeout; a retry sees either unchanged ingress or the
+  already-transferred policy record. `inputd` blocks in `SYS_RUSTOS_IPC_RECV`
+  while idle and is woken by that request; it must not add a periodic polling
+  sleep to the readiness/read critical path.
+- RustOS-native input readers may use readiness-then-read safely:
+  `INPUTD_IPC_OP_STATS` and `INPUTD_IPC_OP_READ` both refresh ingress before
+  observing policy state, so a poll wake cannot be followed by a stale empty
+  policy queue. Short nonblocking reads remain appropriate for latency-sensitive
+  paths and use the same explicit direct-read transfer.
 - inputd must coalesce lossy DVM pointer motion to the latest delta while
   preserving keyboard and pointer-button edges. Linux key translation and
   modifier/text state remain inputd policy; RustOS receives only bounded,
   authenticated relay records.
-- Absolute pointer coordinates are a two-part contract. `inputd` owns HID
-  logical axis decoding and event coalescing; `uiserver` owns the current
-  display/output extent and publishes it to inputd with
-  `INPUTD_IPC_OP_SET_POINTER_SURFACE` after display surface generation is
-  stable. Do not hardcode fallback display sizes in inputd. If the pointer
-  surface is not configured yet, inputd must not enqueue fabricated absolute
-  positions.
+- `InputIngressWire` accepts only a DVM-labelled Linux key or relative pointer
+  packet. Native PS/2, HID-report, and absolute-coordinate ingress are not
+  accepted ABI variants; an unknown kind, access mode, or provenance flag is
+  discarded rather than translated into a fabricated event.
 - Ring0 performs only current-process user-copy of service-returned bytes.
 - `INPUTD_IPC_OP_AUTHORIZE_READ` + `SYS_RUSTOS_INPUT_STATS_BROKER` remain compat/observability surfaces while remaining event queue is evacuated.
 
@@ -324,6 +332,9 @@ Mapping ops use `PROC_BROKER_MAP_{READ,WRITE,EXEC,PRIVATE}` flags and record non
 **PE64:** PE validation, section materialization, base relocation, import/export resolution, staged system-DLL registry lookup, PEB/TEB/runtime blob construction all happen in loaderd before commit. PE64 commit includes `SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER` after all `MAP_DATA_BROKER` ops and before `COMMIT_BROKER`. Kernel validates metadata + spawns the materialized address space but **must not** reintroduce PE import/export/system-DLL policy.
 
 Commit (`COMMIT_BROKER`) builds the child address space from recorded mappings.
+When a broker request supplies `console_session = 0`, the kernel inherits the
+exact live caller (or target thread) session. Missing process/thread state is
+`EINVAL`; it must never manufacture the privileged system session.
 By default, commit-broker spawns do not request immediate deferred reschedule so
 `loaderd` can reply to its caller before the spawned child runs startup policy.
 Supervisors (`rootd` for initd, `initd` for post-init services, and `runtimed`

@@ -126,12 +126,6 @@ pub fn clone_linux_thread(
         | linux_abi::CLONE_FILES
         | linux_abi::CLONE_SIGHAND
         | linux_abi::CLONE_THREAD;
-    const OPTIONAL_THREAD_FLAGS: u64 = linux_abi::CLONE_SYSVSEM
-        | linux_abi::CLONE_SETTLS
-        | linux_abi::CLONE_PARENT_SETTID
-        | linux_abi::CLONE_CHILD_CLEARTID
-        | linux_abi::CLONE_CHILD_SETTID;
-
     if flags & REQUIRED_THREAD_FLAGS != REQUIRED_THREAD_FLAGS {
         return procd_fork(
             frame,
@@ -159,7 +153,9 @@ pub fn clone_linux_thread(
         }
     }
 
-    let console_session = multitask::current_console_session();
+    let Some(console_session) = multitask::current_console_session() else {
+        return linux_errno(LINUX_EINVAL);
+    };
     let child_thread_state = match multitask::with_current_user_linux_state_mut(
         |_, _, abi, address_space, _, linux_thread_state| {
             if abi != crate::user::abi::UserAbi::Linux {

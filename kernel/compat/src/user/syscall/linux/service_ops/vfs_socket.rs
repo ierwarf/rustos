@@ -358,7 +358,12 @@ pub fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
         )
     {
         let access = remote.device_access();
-        let status_flags = current_fd_status_flags(fd).unwrap_or(0);
+        let Some(status_flags) = current_fd_status_flags(fd) else {
+            // The remote device handle and its descriptor state must be
+            // observed atomically from the current process. Do not turn a
+            // missing descriptor into a blocking read with synthetic flags.
+            return linux_errno(LINUX_EBADF);
+        };
         return read_input_device_via_inputd(fd, user_ptr, user_len, access, status_flags);
     }
     read_remote_vfs(fd, remote.remote_id(), user_ptr, user_len, None)

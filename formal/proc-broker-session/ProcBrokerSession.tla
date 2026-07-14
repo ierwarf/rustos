@@ -21,10 +21,16 @@ This model covers session authority/lifecycle rather than ELF/PE bytes,
 page-table contents, or loaderd's format parsers.
 *******************************************************************************)
 
-CONSTANTS Owners, Sessions, Pids, MaxMappings
+CONSTANTS Owners, Sessions, Pids, MaxMappings, ConsoleSessions
 
 NoOwner == 0
 NoPid == 0
+NoConsole == 0
+
+\* The checked finite instance has two owner contexts and two distinct console
+\* sessions. The concrete invariant is equality with the caller's context, not
+\* the particular numeric handles used here.
+OwnerConsole(owner) == owner + 9
 
 Alive == "alive"
 Exited == "exited"
@@ -49,10 +55,13 @@ VARIABLES ownerState,
           runtimeSet,
           childState,
           childSession,
-          childDeferred
+          childDeferred,
+          childConsole,
+          childInheritedConsole
 
 vars == <<ownerState, sessionState, sessionOwner, mappingCount, runtimeSet,
-          childState, childSession, childDeferred>>
+          childState, childSession, childDeferred, childConsole,
+          childInheritedConsole>>
 
 Uncommitted(state) == state \in {Prepared, Mapped, Ready}
 
@@ -65,6 +74,8 @@ Init ==
     /\ childState = [pid \in Pids |-> Absent]
     /\ childSession = [pid \in Pids |-> NoOwner]
     /\ childDeferred = [pid \in Pids |-> FALSE]
+    /\ childConsole = [pid \in Pids |-> NoConsole]
+    /\ childInheritedConsole = [pid \in Pids |-> FALSE]
 
 Prepare(owner, session) ==
     /\ owner \in Owners
@@ -74,7 +85,7 @@ Prepare(owner, session) ==
     /\ sessionState' = [sessionState EXCEPT ![session] = Prepared]
     /\ sessionOwner' = [sessionOwner EXCEPT ![session] = owner]
     /\ UNCHANGED <<ownerState, mappingCount, runtimeSet, childState, childSession,
-                  childDeferred>>
+                  childDeferred, childConsole, childInheritedConsole>>
 
 MapSegment(owner, session) ==
     /\ owner \in Owners
@@ -86,7 +97,7 @@ MapSegment(owner, session) ==
     /\ sessionState' = [sessionState EXCEPT ![session] = Mapped]
     /\ mappingCount' = [mappingCount EXCEPT ![session] = mappingCount[session] + 1]
     /\ UNCHANGED <<ownerState, sessionOwner, runtimeSet, childState, childSession,
-                  childDeferred>>
+                  childDeferred, childConsole, childInheritedConsole>>
 
 SetRuntimeMetadata(owner, session) ==
     /\ owner \in Owners
@@ -99,7 +110,7 @@ SetRuntimeMetadata(owner, session) ==
     /\ sessionState' = [sessionState EXCEPT ![session] = Ready]
     /\ runtimeSet' = [runtimeSet EXCEPT ![session] = TRUE]
     /\ UNCHANGED <<ownerState, sessionOwner, mappingCount, childState,
-                  childSession, childDeferred>>
+                  childSession, childDeferred, childConsole, childInheritedConsole>>
 
 Abort(owner, session) ==
     /\ owner \in Owners
@@ -111,7 +122,7 @@ Abort(owner, session) ==
     /\ mappingCount' = [mappingCount EXCEPT ![session] = 0]
     /\ runtimeSet' = [runtimeSet EXCEPT ![session] = FALSE]
     /\ UNCHANGED <<ownerState, sessionOwner, childState, childSession,
-                  childDeferred>>
+                  childDeferred, childConsole, childInheritedConsole>>
 
 (*******************************************************************************
 Commit removes the prepare handle before the subsequent argument/image checks.
@@ -128,13 +139,14 @@ RejectCommit(owner, session) ==
     /\ mappingCount' = [mappingCount EXCEPT ![session] = 0]
     /\ runtimeSet' = [runtimeSet EXCEPT ![session] = FALSE]
     /\ UNCHANGED <<ownerState, sessionOwner, childState, childSession,
-                  childDeferred>>
+                  childDeferred, childConsole, childInheritedConsole>>
 
-Commit(owner, session, pid, deferred) ==
+Commit(owner, session, pid, deferred, requestedConsole) ==
     /\ owner \in Owners
     /\ session \in Sessions
     /\ pid \in Pids
     /\ deferred \in BOOLEAN
+    /\ requestedConsole \in ConsoleSessions \cup {NoConsole}
     /\ ownerState[owner] = Alive
     /\ sessionOwner[session] = owner
     /\ sessionState[session] = Ready
@@ -145,6 +157,10 @@ Commit(owner, session, pid, deferred) ==
     /\ childState' = [childState EXCEPT ![pid] = IF deferred THEN Suspended ELSE Running]
     /\ childSession' = [childSession EXCEPT ![pid] = session]
     /\ childDeferred' = [childDeferred EXCEPT ![pid] = deferred]
+    /\ childConsole' = [childConsole EXCEPT ![pid] =
+        IF requestedConsole = NoConsole THEN OwnerConsole(owner) ELSE requestedConsole]
+    /\ childInheritedConsole' = [childInheritedConsole EXCEPT ![pid] =
+        requestedConsole = NoConsole]
     /\ UNCHANGED <<ownerState, sessionOwner>>
 
 ActivateDeferredChild(pid) ==
@@ -153,14 +169,16 @@ ActivateDeferredChild(pid) ==
     /\ childDeferred[pid]
     /\ childState' = [childState EXCEPT ![pid] = Running]
     /\ UNCHANGED <<ownerState, sessionState, sessionOwner, mappingCount,
-                  runtimeSet, childSession, childDeferred>>
+                  runtimeSet, childSession, childDeferred, childConsole,
+                  childInheritedConsole>>
 
 ExitChild(pid) ==
     /\ pid \in Pids
     /\ childState[pid] \in {Suspended, Running}
     /\ childState' = [childState EXCEPT ![pid] = ChildExited]
     /\ UNCHANGED <<ownerState, sessionState, sessionOwner, mappingCount,
-                  runtimeSet, childSession, childDeferred>>
+                  runtimeSet, childSession, childDeferred, childConsole,
+                  childInheritedConsole>>
 
 (*******************************************************************************
 Rust process teardown removes all live ProcPrepareState entries for the exiting
@@ -183,7 +201,8 @@ ExitOwner(owner) ==
         [session \in Sessions |->
             IF sessionOwner[session] = owner /\ Uncommitted(sessionState[session])
             THEN FALSE ELSE runtimeSet[session]]
-    /\ UNCHANGED <<sessionOwner, childState, childSession, childDeferred>>
+    /\ UNCHANGED <<sessionOwner, childState, childSession, childDeferred,
+                  childConsole, childInheritedConsole>>
 
 Next ==
     \/ \E owner \in Owners, session \in Sessions : Prepare(owner, session)
@@ -191,8 +210,9 @@ Next ==
     \/ \E owner \in Owners, session \in Sessions : SetRuntimeMetadata(owner, session)
     \/ \E owner \in Owners, session \in Sessions : Abort(owner, session)
     \/ \E owner \in Owners, session \in Sessions : RejectCommit(owner, session)
-    \/ \E owner \in Owners, session \in Sessions, pid \in Pids, deferred \in BOOLEAN :
-        Commit(owner, session, pid, deferred)
+    \/ \E owner \in Owners, session \in Sessions, pid \in Pids, deferred \in BOOLEAN,
+           requestedConsole \in ConsoleSessions \cup {NoConsole} :
+        Commit(owner, session, pid, deferred, requestedConsole)
     \/ \E pid \in Pids : ActivateDeferredChild(pid)
     \/ \E pid \in Pids : ExitChild(pid)
     \/ \E owner \in Owners : ExitOwner(owner)
@@ -204,6 +224,9 @@ TypeOK ==
     /\ Pids \subseteq Nat
     /\ NoPid \notin Pids
     /\ MaxMappings \in Nat
+    /\ ConsoleSessions \subseteq Nat
+    /\ NoConsole \notin ConsoleSessions
+    /\ \A owner \in Owners : OwnerConsole(owner) \in ConsoleSessions
     /\ ownerState \in [Owners -> {Alive, Exited}]
     /\ sessionState \in [Sessions -> {Free, Prepared, Mapped, Ready, Committed,
                                       Aborted, CommitRejected}]
@@ -213,6 +236,8 @@ TypeOK ==
     /\ childState \in [Pids -> {Absent, Suspended, Running, ChildExited}]
     /\ childSession \in [Pids -> Sessions \cup {NoOwner}]
     /\ childDeferred \in [Pids -> BOOLEAN]
+    /\ childConsole \in [Pids -> ConsoleSessions \cup {NoConsole}]
+    /\ childInheritedConsole \in [Pids -> BOOLEAN]
 
 EveryLiveSessionHasItsExactAliveOwner ==
     \A session \in Sessions :
@@ -244,6 +269,16 @@ DeferredChildIsInertUntilExplicitActivation ==
         childState[pid] = Suspended =>
             /\ childDeferred[pid]
             /\ sessionState[childSession[pid]] = Committed
+
+\* A zero console-session argument means inherit the caller's exact current
+\* session. There is deliberately no rule that replaces a missing caller
+\* context with the privileged system session.
+InheritedConsoleIsExactOwnerSession ==
+    \A pid \in Pids :
+        childState[pid] # Absent /\ childInheritedConsole[pid] =>
+            /\ childSession[pid] \in Sessions
+            /\ sessionOwner[childSession[pid]] \in Owners
+            /\ childConsole[pid] = OwnerConsole(sessionOwner[childSession[pid]])
 
 ExitedOwnerRetainsNoLivePrepareAuthority ==
     \A owner \in Owners :

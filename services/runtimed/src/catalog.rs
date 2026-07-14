@@ -2,13 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use runtime_control::{
-    load_desktop_program_entries, load_runtime_launch_program_entries, DesktopProgramEntry,
-    StartupMode, DEFAULT_APPLICATIONS_DIR, DEFAULT_RUNTIME_LAUNCH_REGISTRY_PATH,
+    load_runtime_launch_program_entries, DesktopProgramEntry, StartupMode,
+    DEFAULT_RUNTIME_LAUNCH_REGISTRY_PATH,
 };
 
-use super::{
-    boot_line, debug_line, DEFAULT_USER_TASK_WEIGHT_MICROS, RETRY_BACKOFF, UI_SERVER_EXEC_PATH,
-};
+use super::{boot_line, debug_line, RETRY_BACKOFF, UI_SERVER_EXEC_PATH};
 use super::{BrokerState, LaunchEntry, ProgramMetadata};
 
 pub(super) fn load_launch_catalog_into_state(state: &mut BrokerState) -> bool {
@@ -81,7 +79,7 @@ pub(super) fn load_launch_catalog_into_state(state: &mut BrokerState) -> bool {
 pub(super) fn load_launch_catalog(
 ) -> Result<(BTreeMap<String, ProgramMetadata>, Vec<LaunchEntry>), i32> {
     let registry_entries = load_runtime_launch_program_entries(DEFAULT_RUNTIME_LAUNCH_REGISTRY_PATH)
-        .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))?;
+        .map_err(runtime_registry_errno)?;
     debug_line(
         format!(
             "runtimed: launch registry snapshot entries={}",
@@ -101,7 +99,7 @@ pub(super) fn load_launch_catalog(
         .collect::<Vec<_>>();
 
     let launch_started = Instant::now();
-    let launch_entries = load_launch_entries(&programs, autostart_entries);
+    let launch_entries = load_launch_entries(&programs, autostart_entries)?;
     let launch_elapsed = launch_started.elapsed().as_millis();
     boot_line(
         format!(
@@ -118,7 +116,7 @@ pub(super) fn load_launch_catalog(
 fn load_launch_entries(
     programs: &BTreeMap<String, ProgramMetadata>,
     autostart_entries: Vec<DesktopProgramEntry>,
-) -> Vec<LaunchEntry> {
+) -> Result<Vec<LaunchEntry>, i32> {
     let mut seen = BTreeSet::<String>::new();
     let mut entries = Vec::<LaunchEntry>::new();
 
@@ -154,7 +152,7 @@ fn load_launch_entries(
         let metadata = programs
             .get(entry.desktop_file_id.as_str())
             .cloned()
-            .unwrap_or_else(|| program_metadata_from_desktop_entry(entry.clone()));
+            .ok_or(libc::EINVAL)?;
         entries.push(LaunchEntry {
             package_id: metadata.package_id,
             desktop_file_id: metadata.desktop_file_id,
@@ -178,7 +176,7 @@ fn load_launch_entries(
             .then_with(|| lhs.exec.cmp(&rhs.exec))
     });
 
-    entries
+    Ok(entries)
 }
 
 fn launch_entry_priority(entry: &LaunchEntry) -> (u8, u8, &str) {
@@ -195,25 +193,6 @@ fn launch_entry_priority(entry: &LaunchEntry) -> (u8, u8, &str) {
     (service_rank, restart_rank, entry.desktop_file_id.as_str())
 }
 
-fn load_program_metadata() -> BTreeMap<String, ProgramMetadata> {
-    let mut map = BTreeMap::new();
-    if let Ok(entries) = load_desktop_program_entries(DEFAULT_APPLICATIONS_DIR) {
-        for entry in entries {
-            insert_program_metadata(&mut map, entry);
-        }
-    }
-    map
-}
-
-fn load_program_metadata_for_target(target: &str) -> Option<ProgramMetadata> {
-    let mut programs = load_program_metadata();
-    programs.remove(target).or_else(|| {
-        programs
-            .into_values()
-            .find(|program| program.exec == target)
-    })
-}
-
 fn insert_program_metadata(
     map: &mut BTreeMap<String, ProgramMetadata>,
     entry: DesktopProgramEntry,
@@ -227,11 +206,7 @@ fn program_metadata_from_desktop_entry(entry: DesktopProgramEntry) -> ProgramMet
     ProgramMetadata {
         package_id: entry.package_id,
         desktop_file_id: entry.desktop_file_id,
-        display_name: if entry.display_name.is_empty() {
-            fallback_display_name(entry.exec.as_str())
-        } else {
-            entry.display_name
-        },
+        display_name: entry.display_name,
         exec: entry.exec,
         runtime_deps: entry.runtime_deps,
         startup: entry.startup,
@@ -243,7 +218,10 @@ fn program_metadata_from_desktop_entry(entry: DesktopProgramEntry) -> ProgramMet
     }
 }
 
-pub(super) fn resolve_program_request(state: &BrokerState, target: &str) -> ProgramMetadata {
+pub(super) fn resolve_program_request(
+    state: &BrokerState,
+    target: &str,
+) -> Result<ProgramMetadata, i32> {
     state
         .programs
         .get(target)
@@ -255,43 +233,14 @@ pub(super) fn resolve_program_request(state: &BrokerState, target: &str) -> Prog
                 .find(|program| program.exec == target)
                 .cloned()
         })
-        .or_else(|| load_program_metadata_for_target(target))
-        .unwrap_or_else(|| ProgramMetadata {
-            package_id: package_id_from_target(target),
-            desktop_file_id: target.to_string(),
-            display_name: fallback_display_name(target),
-            exec: target.to_string(),
-            runtime_deps: Vec::new(),
-            startup: StartupMode::None,
-            weight_micros: DEFAULT_USER_TASK_WEIGHT_MICROS,
-            logical_admin: false,
-            console_hosted: false,
-            args: Vec::new(),
-            env: Vec::new(),
-        })
+        .ok_or(libc::ENOENT)
 }
 
-fn fallback_display_name(exec: &str) -> String {
-    std::path::Path::new(exec)
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .unwrap_or(exec)
-        .to_string()
-}
-
-fn package_id_from_target(target: &str) -> String {
-    std::path::Path::new(target)
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .unwrap_or(target)
-        .strip_suffix(".desktop")
-        .unwrap_or_else(|| {
-            std::path::Path::new(target)
-                .file_stem()
-                .and_then(|name| name.to_str())
-                .unwrap_or(target)
-        })
-        .to_string()
+fn runtime_registry_errno(error: std::io::Error) -> i32 {
+    match error.raw_os_error() {
+        Some(errno) if errno > 0 => errno,
+        _ => libc::EIO,
+    }
 }
 
 pub(super) fn running_packages(state: &BrokerState) -> std::collections::BTreeSet<String> {

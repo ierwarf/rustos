@@ -35,9 +35,10 @@ Active == "active"
 Valid == "valid"
 NoSignature == "none"
 Times == 0..MaxTime
-AuthKinds == {"exact", "wrong-domain", "wrong-cid", "wrong-group",
+AuthKinds == {"exact", "wrong-manifest", "wrong-domain", "wrong-cid", "wrong-group",
               "wrong-artifact", "wrong-policy"}
 
+ForeignManifest == CHOOSE manifest \in Manifests: manifest # ExpectedManifest
 ForeignDomain == CHOOSE domain \in Domains: domain # ExpectedDomain
 ForeignCid == CHOOSE cid \in Cids: cid # ExpectedCid
 ForeignGroup == CHOOSE group \in Groups: group # ExpectedGroup
@@ -54,6 +55,8 @@ CandidateArtifact(kind) ==
     IF kind = "wrong-artifact" THEN ForeignArtifact ELSE ExpectedArtifact
 CandidatePolicy(kind) ==
     IF kind = "wrong-policy" THEN ForeignPolicy ELSE ExpectedPolicy
+CandidateManifest(kind) ==
+    IF kind = "wrong-manifest" THEN ForeignManifest ELSE ExpectedManifest
 
 VARIABLES phase, now,
           leaseDomain, leaseCid, leaseGroup, leaseArtifact, leasePolicy,
@@ -149,7 +152,7 @@ PresentSignedAuthorization(kind, from, until) ==
     /\ until \in Times
     /\ from < until
     /\ signature' = Valid
-    /\ authManifest' = ExpectedManifest
+    /\ authManifest' = CandidateManifest(kind)
     /\ authDomain' = CandidateDomain(kind)
     /\ authCid' = CandidateCid(kind)
     /\ authGroup' = CandidateGroup(kind)
@@ -164,6 +167,7 @@ PresentSignedAuthorization(kind, from, until) ==
 
 AuthorizationMatchesLease ==
     /\ signature = Valid
+    /\ authManifest = ExpectedManifest
     /\ authDomain = leaseDomain
     /\ authCid = leaseCid
     /\ authGroup = leaseGroup
@@ -292,6 +296,14 @@ TypeOK ==
     /\ ExpectedGroup \in Groups
     /\ ExpectedArtifact \in Artifacts
     /\ ExpectedPolicy \in Policies
+    \* Candidate mismatch transitions are meaningful only when the finite
+    \* configuration contains a distinct value for every signed field.
+    /\ ForeignManifest \in Manifests \ {ExpectedManifest}
+    /\ ForeignDomain \in Domains \ {ExpectedDomain}
+    /\ ForeignCid \in Cids \ {ExpectedCid}
+    /\ ForeignGroup \in Groups \ {ExpectedGroup}
+    /\ ForeignArtifact \in Artifacts \ {ExpectedArtifact}
+    /\ ForeignPolicy \in Policies \ {ExpectedPolicy}
     /\ phase \in {Idle, Preflight, Authorized, Prepared, Active}
     /\ now \in Times
     /\ leaseDomain \in Domains \cup {NoString}
@@ -325,6 +337,7 @@ NoUnsignedOrPartialVfio ==
     phase = Active =>
         /\ signature = Valid
         /\ recordDurable
+        /\ recordManifest = ExpectedManifest
         /\ boundGroup = leaseGroup
         /\ recordDomain = leaseDomain
         /\ recordCid = leaseCid
@@ -335,6 +348,7 @@ NoUnsignedOrPartialVfio ==
 
 EveryMutationWasWithinAuthorization ==
     phase \in {Prepared, Active} =>
+        /\ recordManifest = ExpectedManifest
         /\ recordAuthorizedAt >= authNotBefore
         /\ recordAuthorizedAt <= recordNotAfter
         /\ recordNotAfter = authNotAfter

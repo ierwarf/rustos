@@ -7,9 +7,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp;
 use core::convert::TryFrom;
-use core::mem::size_of;
 use core::ptr;
-use core::slice;
 
 use object::LittleEndian;
 use object::elf::{self as objelf, FileHeader64 as RawElfHeader};
@@ -30,11 +28,6 @@ use crate::user::linux::{
 };
 use crate::user::process_state::ProcessSecurityContext;
 use crate::vfs;
-use rustos_user_abi::syscall::{
-    COMMERCIAL_MAX_LOADERD_OP_ELF_RUNTIME_PLAN, COMMERCIAL_MAX_LOADERD_OP_MAP_PLAN,
-    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_LOADERD,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse,
-};
 
 use super::{
     LoadedProcessImage, LoadedProcessRuntime, MAX_LOAD_SEGMENTS, PAGE_SIZE, ProcessLoadError,
@@ -114,67 +107,6 @@ struct ElfTlsTemplateInfo {
     align: u64,
 }
 
-#[derive(Clone, Copy)]
-struct LoaderdLinuxElfPlan {
-    main_load_base: u64,
-    interpreter_load_base: u64,
-    user_space_base: u64,
-    user_space_end: u64,
-}
-
-impl LoaderdLinuxElfPlan {
-    const fn fallback() -> Self {
-        Self {
-            main_load_base: ELF_DYN_LOAD_BASE,
-            interpreter_load_base: ELF_INTERP_LOAD_BASE,
-            user_space_base: paging::USER_SPACE_BASE,
-            user_space_end: paging::USER_SPACE_END_EXCLUSIVE,
-        }
-    }
-}
-
-fn loaderd_linux_elf_plan() -> LoaderdLinuxElfPlan {
-    let mut plan = LoaderdLinuxElfPlan::fallback();
-    if let Some((main_offset, interpreter_offset)) =
-        call_loaderd_plan(COMMERCIAL_MAX_LOADERD_OP_ELF_RUNTIME_PLAN)
-    {
-        if let Some(base) = plan.user_space_base.checked_add(main_offset) {
-            plan.main_load_base = base;
-        }
-        if let Some(base) = plan.user_space_base.checked_add(interpreter_offset) {
-            plan.interpreter_load_base = base;
-        }
-    }
-    if let Some((base, end)) = call_loaderd_plan(COMMERCIAL_MAX_LOADERD_OP_MAP_PLAN) {
-        if base < end {
-            plan.user_space_base = base;
-            plan.user_space_end = end;
-        }
-    }
-    plan
-}
-
-fn call_loaderd_plan(op: u16) -> Option<(u64, u64)> {
-    let mut request = CommercialMaxProtocolRequest::default();
-    request.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
-    request.header.protocol = COMMERCIAL_MAX_PROTOCOL_LOADERD;
-    request.header.op = op;
-    request.header.service_id = rustos_user_abi::syscall::IPC_SERVICE_LOADERD;
-    let response = crate::user::syscall::linux::call_loaderd_raw(as_bytes(&request)).ok()?;
-    if response.len() != size_of::<CommercialMaxProtocolResponse>() {
-        return None;
-    }
-    let response = read_unaligned::<CommercialMaxProtocolResponse>(response.as_slice());
-    if response.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
-        || response.header.protocol != COMMERCIAL_MAX_PROTOCOL_LOADERD
-        || response.header.op != op
-        || response.status != 0
-    {
-        return None;
-    }
-    Some((response.value0, response.value1))
-}
-
 #[inline(never)]
 pub(super) fn load_elf(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadError> {
     validate_elf_kind(image)?;
@@ -182,8 +114,7 @@ pub(super) fn load_elf(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadEr
     let elf = ElfFile::new(image).map_err(ProcessLoadError::InvalidElf)?;
     let interpreter_path = elf_interpreter_path(image, &elf)?;
     let runtime_search_paths = elf_runtime_search_paths(image, &elf)?;
-    let loaderd_plan = loaderd_linux_elf_plan();
-    let load_bias = choose_elf_load_bias(&elf, header.image_type, loaderd_plan.main_load_base)?;
+    let load_bias = choose_elf_load_bias(&elf, header.image_type, ELF_DYN_LOAD_BASE)?;
     let mut address_space = ProcessAddressSpace::new()?;
     let mut image_mappings = Vec::new();
 
@@ -215,7 +146,7 @@ pub(super) fn load_elf(image: &[u8]) -> Result<LoadedProcessImage, ProcessLoadEr
             let interpreter_load_bias = choose_elf_load_bias(
                 &interpreter_elf,
                 interpreter_header.image_type,
-                loaderd_plan.interpreter_load_base,
+                ELF_INTERP_LOAD_BASE,
             )?;
             let interpreter = map_elf_image(
                 &interpreter_elf,
@@ -1618,15 +1549,6 @@ fn load_interpreter_image(path: &str) -> Result<Vec<u8>, ProcessLoadError> {
     vfs::read_path_to_vec_for_kernel(path).map_err(|error| make_interpreter_load_error(path, error))
 }
 // RING3-MIGRATION-REFERENCE END: loaderd/procd-owned bootstrap Linux ELF substrate exception.
-
-fn as_bytes<T>(value: &T) -> &[u8] {
-    unsafe { slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
-}
-
-fn read_unaligned<T: Copy>(bytes: &[u8]) -> T {
-    debug_assert!(bytes.len() >= size_of::<T>());
-    unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) }
-}
 
 #[cfg(test)]
 mod tests {

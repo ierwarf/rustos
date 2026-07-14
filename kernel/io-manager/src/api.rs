@@ -276,9 +276,6 @@ pub mod input {
         crate::input::service_dvm_input_pending()
     }
 
-    pub fn service_pending() -> usize {
-        crate::input::service_pending()
-    }
 }
 
 pub mod device {
@@ -396,9 +393,6 @@ pub mod io {
             crate::io::gui::try_present_panic_blackout()
         }
 
-        pub fn service_pending() -> usize {
-            0
-        }
     }
 }
 

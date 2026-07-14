@@ -2,7 +2,7 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "KVM DVM: interactive desktop",
+      "name": "KVM DVM: interactive tablet desktop (no manual pointer grab)",
       "type": "node-terminal",
       "request": "launch",
       "preLaunchTask": "Prepare KVM DVM",

@@ -117,6 +117,11 @@ BeginWait(w, s, p) ==
     /\ s \in Services
     /\ p \in Pids
     /\ waitState[w] = Idle
+    \* An immediate Ready/WaitExited result is valid at the final tick; only
+    \* a real pending wait needs enough bounded model time to expire.
+    /\ (procState[s] = Running /\ leasePid[s] = p
+        /\ ~(endpointPid[s] = p /\ capabilityPid[s] = p))
+        => now <= MaxTime - WaitTimeout
     /\ waitService' = [waitService EXCEPT ![w] = s]
     /\ waitPid' = [waitPid EXCEPT ![w] = p]
     /\ waitState' =
@@ -187,7 +192,7 @@ TypeOK ==
     /\ waitPid \in [Waiters -> (Pids \cup {NoPid})]
     /\ waitState \in [Waiters -> {Idle, Waiting, Ready, TimedOut, WaitExited, Rejected}]
     /\ waitResultPid \in [Waiters -> (Pids \cup {NoPid})]
-    /\ waitDeadline \in [Waiters -> Nat]
+    /\ waitDeadline \in [Waiters -> 0..MaxTime]
     /\ issuedPids \subseteq Pids
     /\ now \in 0..MaxTime
 
@@ -245,6 +250,10 @@ ReadyWaitHasIssuedExactPid ==
             /\ waitResultPid[w] \in issuedPids
             /\ waitResultPid[w] = waitPid[w]
 
+WaitEventuallySettles ==
+    \A w \in Waiters:
+        waitState[w] = Waiting ~> waitState[w] # Waiting
+
 AllLiveBindingsUseIssuedPids ==
     \A s \in Services:
         /\ leasePid[s] # NoPid => leasePid[s] \in issuedPids
@@ -258,5 +267,7 @@ DistinctLiveServicePids ==
             /\ leasePid[s] # NoPid
             /\ leasePid[t] # NoPid
             => leasePid[s] # leasePid[t]
+
+Spec == Init /\ [][Next]_vars /\ WF_vars(AdvanceTime)
 
 =============================================================================

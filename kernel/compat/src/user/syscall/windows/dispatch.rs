@@ -29,6 +29,11 @@ pub(crate) fn dispatch_syscall(frame: &mut SyscallFrame) -> u64 {
         Ok(api) => api,
         Err(error) => return error,
     };
+    let Some(current) = crate::multitask::current_user_snapshot() else {
+        // A Win32 syscall is never valid without its owning user task.  Do
+        // not send a forged pid/tid/session triple to syscalld.
+        return STATUS_INVALID_PARAMETER;
+    };
     let request = Win32SyscallOffloadRequest {
         version: WIN32_SYSCALL_OFFLOAD_ABI_VERSION,
         op: win32_offload_op(api),
@@ -38,15 +43,9 @@ pub(crate) fn dispatch_syscall(frame: &mut SyscallFrame) -> u64 {
         arg3: frame.r8,
         arg4: frame.r9,
         arg5: 0,
-        pid: crate::multitask::current_user_snapshot()
-            .map(|s| s.process_id())
-            .unwrap_or(0),
-        tid: crate::multitask::current_user_snapshot()
-            .map(|s| s.thread_id())
-            .unwrap_or(0),
-        session_handle: crate::multitask::current_user_snapshot()
-            .map(|s| s.console_session().raw())
-            .unwrap_or(0),
+        pid: current.process_id(),
+        tid: current.thread_id(),
+        session_handle: current.console_session().raw(),
         ..Win32SyscallOffloadRequest::default()
     };
     match super::super::linux::call_syscalld_raw(as_bytes(&request)) {

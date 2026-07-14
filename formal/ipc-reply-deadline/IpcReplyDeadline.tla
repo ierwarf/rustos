@@ -381,4 +381,13 @@ ExitedTaskRetainsNoWaitAuthority ==
             /\ waitFor[t] = NoReply
             /\ timerDeadline[t] = NoTimer
 
+BlockedCallerEventuallyUnblocks ==
+    \A t \in Tasks:
+        taskState[t] = Blocked ~> taskState[t] \in {Runnable, Exited}
+
+\* Timer delivery is the liveness assumption behind the explicit deadline.
+\* The model otherwise permits stuttering, which would make a finite numeric
+\* deadline look safe while never actually releasing a blocked control call.
+Spec == Init /\ [][Next]_vars /\ WF_vars(Tick)
+
 =============================================================================

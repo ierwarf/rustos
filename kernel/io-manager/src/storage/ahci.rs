@@ -1,6 +1,6 @@
 // RING3-MIGRATION-REFERENCE START: bootstrap exception: storaged owns
 // post-bootstrap AHCI admission/provider policy. Ring0 keeps this built-in
-// AHCI path as early-boot/fallback privileged transport substrate until a
+// AHCI path as early-boot privileged transport substrate until a
 // ring3 service-driver host can perform boot-volume reads before rootd/vfsd
 // need storage.
 use alloc::boxed::Box;
@@ -96,14 +96,12 @@ struct AhciRuntime {
 
 unsafe impl Send for AhciRuntime {}
 
-// Built-in AHCI is an early-boot/fallback path. Post-bootstrap storage policy,
+// Built-in AHCI is early-boot substrate. Post-bootstrap storage policy,
 // port admission, and long-term I/O ownership still belong in storaged.
 struct AhciBlockDevice {
     controller: Arc<AhciController>,
     port: usize,
     sector_count: u64,
-    #[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code))]
-    model: String,
     runtime: KernelWaitLock<AhciRuntime>,
 }
 
@@ -401,7 +399,6 @@ fn probe_port(controller: Arc<AhciController>, port: usize) -> IoResult<Option<A
         controller,
         port,
         sector_count,
-        model,
         runtime: KernelWaitLock::new(runtime),
     }))
 }

@@ -52,6 +52,8 @@ DeferExitedService(service) ==
     /\ service \in Services
     /\ state[service] = Exited
     /\ budget[service] > 0
+    \* The finite TLC clock must include the complete backoff interval.
+    /\ clock <= MaxTick - Backoff
     /\ state' = [state EXCEPT ![service] = Pending]
     /\ retryAfter' = [retryAfter EXCEPT ![service] = clock + Backoff]
     /\ UNCHANGED <<budget, published, clock, attempts>>
@@ -68,6 +70,10 @@ ExhaustLease(service) ==
 \* The bounded rootd wait advances the only modeled time source.
 AdvanceClock ==
     /\ clock < MaxTick
+    \* Once a restart is due, time cannot silently move past it. TLC must
+    \* explore success, a rescheduled failure, or exhausted-budget teardown.
+    /\ \A service \in Services:
+          state[service] = Pending => clock + 1 <= retryAfter[service]
     /\ clock' = clock + 1
     /\ UNCHANGED <<state, budget, published, retryAfter, attempts>>
 
@@ -92,6 +98,7 @@ RestartFails(service) ==
     /\ state[service] = Pending
     /\ budget[service] > 0
     /\ clock >= retryAfter[service]
+    /\ clock <= MaxTick - Backoff
     /\ state' = state
     /\ budget' = [budget EXCEPT ![service] = @ - 1]
     /\ published' = [published EXCEPT ![service] = FALSE]
@@ -111,7 +118,7 @@ TypeOK ==
     /\ state \in [Services -> LeaseStates]
     /\ budget \in [Services -> 0..MaxRestarts]
     /\ published \in [Services -> BOOLEAN]
-    /\ retryAfter \in [Services -> 0..(MaxTick + Backoff)]
+    /\ retryAfter \in [Services -> 0..MaxTick]
     /\ clock \in 0..MaxTick
     /\ attempts \in [Services -> 0..MaxRestarts]
 
@@ -125,6 +132,10 @@ PendingOrTerminalLeaseHasNoAuthority ==
 NoRetryAuthorityBeforePublishedDeadline ==
     \A service \in Services:
         state[service] = Pending /\ clock < retryAfter[service] => ~published[service]
+
+PendingRestartDoesNotOutliveDeadline ==
+    \A service \in Services:
+        state[service] = Pending => clock <= retryAfter[service]
 
 RestartBudgetIsFiniteAndMonotonic ==
     \A service \in Services: attempts[service] + budget[service] = MaxRestarts

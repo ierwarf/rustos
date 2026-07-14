@@ -39,6 +39,8 @@ const DVM_CONTROL_CAPABILITIES: &str = "health,device-inventory,driver-inventory
 const RUSTOS_BOOT_MARKER: &str = "rootd: core services ready, spawning initd via loaderd";
 const DVM_KEYBOARD_INGRESS_MARKER: &str = "inputd: DVM keyboard ingress observed";
 const DVM_POINTER_INGRESS_MARKER: &str = "inputd: DVM pointer ingress observed";
+const MIN_UI_FPS_ACTIVE_WINDOWS: usize = 3;
+const MIN_UI_FPS_INPUT_EVENTS: u64 = 192;
 const DVM_DISPLAY_WIDTH: u32 = 1600;
 const DVM_DISPLAY_HEIGHT: u32 = 900;
 const DVM_DISPLAY_REGION_BYTES: u64 = 8 * 1024 * 1024;
@@ -192,6 +194,7 @@ where
     stop_guest(&mut rustos);
     stop_guest(&mut dvm);
     let probe = result?;
+    validate_ui_fps_proof(&layout, &options)?;
     if let Some(shared_display) = layout.dvm_display_shmem.as_deref() {
         verify_dvm_display_surface(shared_display)?;
     }
@@ -225,6 +228,7 @@ where
 /// Unlike `kvm-smoke`, this has no readiness deadline or success criteria: it
 /// remains alive until the user closes the DVM QEMU window or interrupts it.
 pub(crate) fn kvm_run_command(config: &Config) -> Result<()> {
+    let started_at = Instant::now();
     let artifacts = verify_dvm_artifacts(config)?;
     let qemu = require_qemu(config)?;
     let options = SmokeOptions {
@@ -254,7 +258,8 @@ pub(crate) fn kvm_run_command(config: &Config) -> Result<()> {
     )?;
 
     println!(
-        "xtask: interactive KVM DVM session is running; use the Linux DVM QEMU window for display/input and close it or press Ctrl-C to stop"
+        "xtask: interactive KVM DVM session started in {} ms; move the pointer into the Linux DVM window to use the absolute tablet input, then close it or press Ctrl-C to stop",
+        started_at.elapsed().as_millis(),
     );
     let status = dvm.wait().context("wait for Linux DVM QEMU session")?;
     stop_guest(&mut rustos);
@@ -280,8 +285,8 @@ options:
   --exercise-input     run the DVM's bounded evdev loopback self-test and require
                        RustOS inputd keyboard and pointer ingress markers
   --exercise-network   run netprobe through netd and the DVM Ethernet ring
-  --min-ui-fps <fps>   enable the private KVM-only UI profiler and require a
-                       profile window at or above the requested integer FPS
+  --min-ui-fps <fps>   enable the private KVM-only UI profiler and require three
+                       high-volume input windows at or above this integer FPS
   --dvm-display-shmem  replace RustOS's native virtio-gpu test device with a
                        host-initialized ivshmem framebuffer owned by the DVM path
   --dvm-network-shmem  attach the bounded RustOS↔DVM Ethernet ring; RustOS keeps
@@ -304,6 +309,22 @@ host-to-DVM input injection endpoint.
 enum GuestDisplay {
     Headless,
     DvmGtk,
+}
+
+fn qemu_display_backend(display: GuestDisplay) -> &'static str {
+    match display {
+        GuestDisplay::Headless => "none",
+        // GTK captures keyboard focus on hover. Pointer input is supplied by
+        // the absolute tablet below, so F5 never needs a manual mouse grab.
+        GuestDisplay::DvmGtk => "gtk,show-tabs=off,zoom-to-fit=off,grab-on-hover=on,show-cursor=on",
+    }
+}
+
+fn dvm_pointer_device() -> &'static str {
+    // An absolute tablet keeps host pointer motion available while the GTK
+    // window is merely hovered. The DVM agent normalizes the tablet range to
+    // the fixed 1600x900 scanout before it emits the authenticated RDI2 frame.
+    "virtio-tablet-pci,id=dvm-pointer"
 }
 
 fn parse_smoke_options<I>(mut args: I) -> Result<SmokeOptions>
@@ -639,13 +660,22 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
             run_dir.display()
         )
     })?;
-    let runtime_disk = run_dir.join("rustos-kvm.img");
-    fs::copy(&config.boot_disk_image, &runtime_disk).with_context(|| {
-        format!(
-            "failed to create KVM runtime disk from {}",
-            config.boot_disk_image.display()
-        )
-    })?;
+    // Normal interactive KVM sessions do not alter the boot image. QEMU's
+    // snapshot mode below protects it from guest writes, avoiding a full disk
+    // copy on every F5. Only proof options that patch private boot content
+    // receive a per-run image.
+    let runtime_disk = if options.min_ui_fps.is_some() || options.exercise_network {
+        let runtime_disk = run_dir.join("rustos-kvm.img");
+        fs::copy(&config.boot_disk_image, &runtime_disk).with_context(|| {
+            format!(
+                "failed to create KVM runtime disk from {}",
+                config.boot_disk_image.display()
+            )
+        })?;
+        runtime_disk
+    } else {
+        config.boot_disk_image.clone()
+    };
     if options.min_ui_fps.is_some() {
         enable_private_ui_profile(&runtime_disk)?;
     }
@@ -968,7 +998,10 @@ fn start_dvm_input_relay(
     let contract = HostControlContract::from_env_file(&contract_path)?;
     let control_secret = ControlSecret::from_hex_file(&control_secret_path)?;
     let listener = HostControlListener::bind(DVM_GUEST_CID, contract, control_secret)?;
-    let (sender, receiver) = mpsc::sync_channel(1);
+    // Preserve both the one-time readiness proof and a terminal relay error.
+    // A one-slot channel can otherwise drop an error that races immediately
+    // after readiness, turning a broken input stream into an unrelated timeout.
+    let (sender, receiver) = mpsc::sync_channel(2);
     thread::spawn(move || {
         let sender_ready = sender.clone();
         let result = (|| {
@@ -1052,6 +1085,7 @@ fn spawn_guests(
             "none",
             "-no-reboot",
             "-no-shutdown",
+            "-snapshot",
         ])
         .arg("-chardev")
         .arg(format!(
@@ -1099,16 +1133,7 @@ fn spawn_guests(
     } else {
         "console=ttyS0"
     };
-    let dvm_display = match guest_display {
-        GuestDisplay::Headless => "none",
-        // The GTK backend defaults to `zoom-to-fit=on` for virtio-GPU.  That
-        // makes its initial small host window a guest resize request, so the
-        // DVM KMS relay selects 640x480 and needlessly downscales RustOS's
-        // fixed 1600x900 transport.  Keep the guest mode authoritative for
-        // the interactive topology; GTK will resize its window to the DVM
-        // scanout instead of feeding its bootstrap size back into the guest.
-        GuestDisplay::DvmGtk => "gtk,show-tabs=off,zoom-to-fit=off",
-    };
+    let dvm_display = qemu_display_backend(guest_display);
     dvm_command
         .arg("-name")
         .arg("rustos-linux-dvm-kvm")
@@ -1152,7 +1177,7 @@ fn spawn_guests(
         .arg("-device")
         .arg("virtio-keyboard-pci,id=dvm-keyboard")
         .arg("-device")
-        .arg("virtio-mouse-pci,id=dvm-pointer")
+        .arg(dvm_pointer_device())
         .arg("-netdev")
         .arg("user,id=dvm-net")
         .arg("-device")
@@ -1240,19 +1265,23 @@ fn wait_for_parallel_boot(
             .expected_markers
             .iter()
             .all(|marker| rustos_log.contains(marker));
-        if control_ready.is_none() {
-            match control_relay.try_recv() {
-                Ok(Ok(probe)) => {
-                    control_ready = Some(probe);
-                }
-                Ok(Err(error)) => {
-                    bail!("Linux DVM input relay failed before readiness: {error:#}");
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    bail!("Linux DVM host input relay terminated without a readiness result")
+        match control_relay.try_recv() {
+            Ok(Ok(probe)) => {
+                if control_ready.replace(probe).is_some() {
+                    bail!("Linux DVM input relay reported readiness more than once");
                 }
             }
+            Ok(Err(error)) => {
+                if control_ready.is_some() {
+                    bail!("Linux DVM input relay failed after readiness: {error:#}");
+                }
+                bail!("Linux DVM input relay failed before readiness: {error:#}");
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) if control_ready.is_none() => {
+                bail!("Linux DVM host input relay terminated without a readiness result")
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {}
         }
         let ui_fps_ready = options
             .min_ui_fps
@@ -1287,9 +1316,10 @@ fn wait_for_parallel_boot(
                 .cloned()
                 .collect::<Vec<_>>();
             bail!(
-                "KVM parallel boot did not reach readiness within {:?}; RustOS missing={:?}; dvm-display-ready={}; dvm-network-ready={}; dvm-network-traffic-ready={}; host-input-relay-pending={}; inspect {}, {}, {}, and {}",
+                "KVM parallel boot did not reach readiness within {:?}; RustOS missing={:?}; ui-fps-ready={}; dvm-display-ready={}; dvm-network-ready={}; dvm-network-traffic-ready={}; host-input-relay-pending={}; inspect {}, {}, {}, and {}",
                 options.timeout,
                 missing_rustos,
+                ui_fps_ready,
                 dvm_display_ready,
                 dvm_network_ready,
                 dvm_network_traffic_ready,
@@ -1318,7 +1348,12 @@ fn dvm_display_provider_ready(log: &str) -> bool {
             && uiserver_display_field_is(fields, "stride", DVM_DISPLAY_WIDTH * 4)
             && uiserver_display_field_is(fields, "bpp", 4)
             && uiserver_display_field_is(fields, "fmt", 1)
-            && fields.split_whitespace().any(|field| field == "flags=0x2")
+            // A DVM scanout is still the active primary provider. Requiring
+            // both provenance bits prevents the smoke from accepting either a
+            // generic primary framebuffer or a non-primary DVM aperture.
+            && fields
+                .split_whitespace()
+                .any(|field| field == "flags=0x6")
     })
 }
 
@@ -1351,20 +1386,77 @@ fn uiserver_display_field_is(fields: &str, name: &str, expected: u32) -> bool {
 
 fn uiserver_profile_meets_fps(log: &str, minimum_fps: u32) -> bool {
     let required_milli = u64::from(minimum_fps).saturating_mul(1_000);
-    log.lines().any(|line| {
+    let active_windows = log.lines().filter_map(|line| {
         // Service logs normally carry an observability prefix, while early
         // debugcon output may be bare. The KVM gate accepts either form but
-        // still requires the exact profile payload.
+        // still requires the exact profile payload.  An idle desktop has no
+        // presents by design, so only a window that actually processed input
+        // is an FPS sample.
         line.split_once("uiserver profile: ")
             .map(|(_, profile)| profile)
             .and_then(|fields| {
-                fields.split_whitespace().find_map(|field| {
+                let input_events = fields.split_whitespace().find_map(|field| {
+                    field
+                        .strip_prefix("input_events=")
+                        .and_then(|value| value.parse::<u64>().ok())
+                })?;
+                let frame_hz_milli = fields.split_whitespace().find_map(|field| {
                     field
                         .strip_prefix("frame_hz_milli=")
                         .and_then(|value| value.parse::<u64>().ok())
-                })
+                })?;
+                (input_events >= MIN_UI_FPS_INPUT_EVENTS).then_some(frame_hz_milli)
             })
-            .is_some_and(|rate| rate >= required_milli)
+    });
+    let mut count = 0_usize;
+    for frame_hz_milli in active_windows {
+        if frame_hz_milli < required_milli {
+            return false;
+        }
+        count = count.saturating_add(1);
+    }
+    count >= MIN_UI_FPS_ACTIVE_WINDOWS
+}
+
+fn validate_ui_fps_proof(layout: &KvmLayout, options: &SmokeOptions) -> Result<()> {
+    let Some(minimum_fps) = options.min_ui_fps else {
+        return Ok(());
+    };
+    let log = fs::read_to_string(&layout.debugcon_log)?;
+    if !uiserver_profile_meets_fps(&log, minimum_fps) {
+        bail!(
+            "KVM UI FPS proof failed after guest shutdown: require {} high-volume input windows at or above {} FPS; inspect {}",
+            MIN_UI_FPS_ACTIVE_WINDOWS,
+            minimum_fps,
+            layout.debugcon_log.display(),
+        );
+    }
+    if uiserver_has_interactive_slow_loop(&log) {
+        bail!(
+            "KVM UI FPS proof found an interactive slow uiserver loop; inspect {}",
+            layout.debugcon_log.display(),
+        );
+    }
+    Ok(())
+}
+
+fn uiserver_has_interactive_slow_loop(log: &str) -> bool {
+    log.lines().any(|line| {
+        let Some((_, fields)) = line.split_once("uiserver: slow loop ") else {
+            return false;
+        };
+        uiserver_log_field_is_nonzero(fields, "console_windows")
+            || uiserver_log_field_is_nonzero(fields, "wayland_windows")
+    })
+}
+
+fn uiserver_log_field_is_nonzero(fields: &str, name: &str) -> bool {
+    fields.split_whitespace().any(|field| {
+        field
+            .split_once('=')
+            .and_then(|(key, value)| (key == name).then_some(value))
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|value| value != 0)
     })
 }
 
@@ -1390,9 +1482,10 @@ mod tests {
     use super::{
         DVM_CONTROL_AUTHENTICATION, DVM_CONTROL_CAPABILITIES, DVM_CONTROL_PROTOCOL,
         DVM_CONTROL_STATE, DVM_CONTROL_TRANSPORT, DVM_KEYBOARD_INGRESS_MARKER,
-        DVM_POINTER_INGRESS_MARKER, DvmNetworkCounters, RUSTOS_BOOT_MARKER,
-        dvm_display_provider_ready, dvm_display_relay_ready, dvm_network_relay_ready, is_sha256,
-        parse_dvm_control_contract_text, parse_manifest_text, parse_smoke_options,
+        DVM_POINTER_INGRESS_MARKER, DvmNetworkCounters, GuestDisplay, RUSTOS_BOOT_MARKER,
+        dvm_display_provider_ready, dvm_display_relay_ready, dvm_network_relay_ready,
+        dvm_pointer_device, is_sha256, parse_dvm_control_contract_text, parse_manifest_text,
+        parse_smoke_options, qemu_display_backend, uiserver_has_interactive_slow_loop,
         uiserver_profile_meets_fps, validate_manifest_values,
     };
 
@@ -1429,10 +1522,10 @@ mod tests {
         let options = parse_smoke_options(vec!["--dvm-display-shmem".into()].into_iter()).unwrap();
         assert!(options.dvm_display_shmem);
         assert!(dvm_display_provider_ready(
-            "[INFO ] service=uiserver uiserver: display_get_info attempt=1 width=1600 height=900 stride=6400 bpp=4 fmt=1 flags=0x2 gen=1"
+            "[INFO ] service=uiserver uiserver: display_get_info attempt=1 width=1600 height=900 stride=6400 bpp=4 fmt=1 flags=0x6 gen=1"
         ));
         assert!(!dvm_display_provider_ready(
-            "[INFO ] service=uiserver uiserver: display_get_info attempt=1 width=1600 height=900 stride=6400 bpp=4 fmt=1 flags=0x3 gen=1"
+            "[INFO ] service=uiserver uiserver: display_get_info attempt=1 width=1600 height=900 stride=6400 bpp=4 fmt=1 flags=0x2 gen=1"
         ));
         assert!(dvm_display_relay_ready(
             "rustos-dvm-display: active width=1600 height=900 stride=6400 format=BGRA8888 double-buffered"
@@ -1476,7 +1569,7 @@ mod tests {
     }
 
     #[test]
-    fn ui_fps_option_is_bounded_and_profile_rate_is_strict() {
+    fn ui_fps_option_requires_sustained_high_volume_input_rate() {
         let options =
             parse_smoke_options(vec!["--min-ui-fps".into(), "20".into()].into_iter()).unwrap();
         assert_eq!(options.min_ui_fps, Some(20));
@@ -1484,13 +1577,36 @@ mod tests {
             parse_smoke_options(vec!["--min-ui-fps".into(), "241".into()].into_iter()).is_err()
         );
         assert!(uiserver_profile_meets_fps(
-            "[INFO ] service=uiserver uiserver profile: elapsed_ms=1000 frame_hz_milli=20000 full=0 part=20",
+            "[INFO ] service=uiserver uiserver profile: elapsed_ms=1000 frame_hz_milli=20000 input_events=192 full=0 part=20\nuiserver profile: elapsed_ms=1000 frame_hz_milli=20000 input_events=192 full=0 part=20\nuiserver profile: elapsed_ms=1000 frame_hz_milli=20000 input_events=192 full=0 part=20",
             20,
         ));
         assert!(!uiserver_profile_meets_fps(
-            "uiserver profile: elapsed_ms=1000 frame_hz_milli=19999 full=0 part=19",
+            "uiserver profile: elapsed_ms=1000 frame_hz_milli=20000 input_events=192 full=0 part=20\nuiserver profile: elapsed_ms=1000 frame_hz_milli=20000 input_events=192 full=0 part=20\nuiserver profile: elapsed_ms=1000 frame_hz_milli=19999 input_events=192 full=0 part=19",
             20,
         ));
+    }
+
+    #[test]
+    fn ui_fps_gate_ignores_pre_window_slow_loop_but_not_interactive_one() {
+        assert!(!uiserver_has_interactive_slow_loop(
+            "uiserver: slow loop iter_ms=72 wayland_ms=70 console_windows=0 wayland_windows=0"
+        ));
+        assert!(uiserver_has_interactive_slow_loop(
+            "uiserver: slow loop iter_ms=72 wayland_ms=70 console_windows=1 wayland_windows=0"
+        ));
+        assert!(uiserver_has_interactive_slow_loop(
+            "uiserver: slow loop iter_ms=72 wayland_ms=70 console_windows=0 wayland_windows=1"
+        ));
+    }
+
+    #[test]
+    fn interactive_gtk_display_grabs_pointer_on_hover() {
+        assert_eq!(qemu_display_backend(GuestDisplay::Headless), "none");
+        assert_eq!(
+            qemu_display_backend(GuestDisplay::DvmGtk),
+            "gtk,show-tabs=off,zoom-to-fit=off,grab-on-hover=on,show-cursor=on"
+        );
+        assert_eq!(dvm_pointer_device(), "virtio-tablet-pci,id=dvm-pointer");
     }
 
     #[test]
