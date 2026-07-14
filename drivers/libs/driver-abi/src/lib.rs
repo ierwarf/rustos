@@ -648,8 +648,12 @@ pub struct DisplayFramebufferRegistration {
 
 pub const DISPLAY_FRAMEBUFFER_FLAG_BOOT_FRAMEBUFFER: u8 = 1 << 0;
 pub const DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER: u8 = 1 << 1;
-pub const DISPLAY_FRAMEBUFFER_KNOWN_FLAGS: u8 =
-    DISPLAY_FRAMEBUFFER_FLAG_BOOT_FRAMEBUFFER | DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER;
+/// The scanout is relayed by an isolated driver domain. This is provenance
+/// only: it can only make a presentation less trusted, never attest one.
+pub const DISPLAY_FRAMEBUFFER_FLAG_DVM_SCANOUT: u8 = 1 << 2;
+pub const DISPLAY_FRAMEBUFFER_KNOWN_FLAGS: u8 = DISPLAY_FRAMEBUFFER_FLAG_BOOT_FRAMEBUFFER
+    | DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER
+    | DISPLAY_FRAMEBUFFER_FLAG_DVM_SCANOUT;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]

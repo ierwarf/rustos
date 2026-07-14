@@ -89,6 +89,13 @@ pub fn terminate_user_task(task_id: u64) -> bool {
     })
 }
 
+pub fn terminate_user_process(process_id: u64) -> bool {
+    interrupts::without_interrupts(|| unsafe {
+        let requested_by_pid = scheduler_ref().current_user_id();
+        scheduler_mut().terminate_user_process(process_id, requested_by_pid)
+    })
+}
+
 pub fn block_current_user_task() -> bool {
     interrupts::without_interrupts(|| unsafe { scheduler_mut().block_current_user_task() })
 }
@@ -411,6 +418,7 @@ pub fn exit_current_user_task() -> ! {
 }
 
 pub fn exit_current_user_process() -> ! {
+    let process_id = current_user_process_id();
     interrupts::without_interrupts(|| unsafe {
         let (task_ids, task_count) = scheduler_ref().current_process_task_ids();
         for task_id in task_ids.into_iter().take(task_count) {
@@ -419,6 +427,19 @@ pub fn exit_current_user_process() -> ! {
             crate::user::handles::drop_ipc_transfer_descriptors(discarded.as_slice());
             let endpoint_wake_set = kernel_ipc_runtime::api::fail_endpoints_owned_by_task(
                 task_id,
+                kernel_ipc_runtime::api::IpcError::PeerClosed,
+            );
+            let scheduler = scheduler_mut();
+            for caller in endpoint_wake_set.callers {
+                let _ = scheduler.wake_task(caller);
+            }
+            for receiver in endpoint_wake_set.receivers {
+                let _ = scheduler.wake_task(receiver);
+            }
+        }
+        if let Some(process_id) = process_id {
+            let endpoint_wake_set = kernel_ipc_runtime::api::fail_endpoints_owned_by_process(
+                process_id,
                 kernel_ipc_runtime::api::IpcError::PeerClosed,
             );
             let scheduler = scheduler_mut();

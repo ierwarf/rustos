@@ -12,6 +12,7 @@ use runtime_control::{
 };
 use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR,
+    COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY, COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM,
     COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL, CommercialMaxProtocolRequest,
     CommercialMaxProtocolResponse, IPC_SERVICE_DEVMGRD, IPC_SERVICE_INPUTD,
     IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD, IPC_SERVICE_NETD, IPC_SERVICE_ROOTD,
@@ -19,7 +20,8 @@ use rustos_user_abi::syscall::{
     IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION, IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS,
     LOADER_OP_ACTIVATE, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
     LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_FLAG_DEFER_START,
-    LoaderSpawnRequest, LoaderSpawnResponse, RustosIpcWaitServiceEndpointArgs, SYS_RUSTOS_IPC_CALL,
+    LoaderSpawnRequest, LoaderSpawnResponse, ROOTD_LEASE_STATE_EMPTY, ROOTD_LEASE_STATE_EXITED,
+    ROOTD_LEASE_STATE_RUNNING, RustosIpcWaitServiceEndpointArgs, SYS_RUSTOS_IPC_CALL,
     SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT,
 };
 
@@ -34,6 +36,9 @@ const STORAGED_EXEC_PATH: &str = "services/storaged/storaged.elf";
 const INPUTD_EXEC_PATH: &str = "services/inputd/inputd.elf";
 const POLL_INTERVAL: Duration = Duration::from_millis(2);
 const RETRY_BACKOFF: Duration = Duration::from_millis(50);
+const ROOTD_LEASE_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(100);
+const ROOTD_LEASE_RECOVERY_TIMEOUT: Duration =
+    Duration::from_millis(IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS);
 const INITD_LAUNCH_MAX_FAILURES: u32 = 32;
 const ROOTD_LEASE_REPORT_MAX_ATTEMPTS: u32 = 16;
 const DEFAULT_INIT_TASK_WEIGHT_MICROS: u64 = 1_000;
@@ -66,6 +71,12 @@ struct RetryState {
     failures: u32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RootdLeaseRecovery {
+    pid: i32,
+    deadline: Instant,
+}
+
 fn main() {
     boot_line("initd: main enter");
     let load_started = Instant::now();
@@ -86,10 +97,25 @@ fn main() {
     let mut running = BTreeMap::<i32, RunningService>::new();
     let mut launched_once_packages = BTreeSet::new();
     let mut retry_state = BTreeMap::<String, RetryState>::new();
+    let mut rootd_lease_recovery = BTreeMap::<u64, RootdLeaseRecovery>::new();
     let mut defer_secondary_services_until = None::<Instant>;
+    let mut next_rootd_lease_reconciliation = Instant::now();
 
     loop {
         reap_children(&mut running, &mut retry_state);
+
+        let now = Instant::now();
+        if now >= next_rootd_lease_reconciliation {
+            reconcile_rootd_post_init_leases(
+                &startup_entries,
+                &mut running,
+                &mut launched_once_packages,
+                &mut retry_state,
+                &mut rootd_lease_recovery,
+                now,
+            );
+            next_rootd_lease_reconciliation = now + ROOTD_LEASE_RECONCILIATION_INTERVAL;
+        }
 
         let mut running_packages = running
             .values()
@@ -117,6 +143,15 @@ fn main() {
                 .get(entry.exec.as_str())
                 .is_some_and(|state| now < state.next_attempt)
             {
+                continue;
+            }
+
+            if rootd_service_id_for_exec(entry.exec.as_str())
+                .is_some_and(|service_id| rootd_lease_recovery.contains_key(&service_id))
+            {
+                // rootd has an older admitted PID whose exact endpoint is
+                // still within the bounded adoption window.  Do not create a
+                // duplicate service or overwrite its authority lease.
                 continue;
             }
 
@@ -398,7 +433,124 @@ fn report_rootd_service_lease(exec_path: &str, pid: i32) -> Result<(), i32> {
     }
 }
 
+fn reconcile_rootd_post_init_leases(
+    startup_entries: &[StartupLaunchEntry],
+    running: &mut BTreeMap<i32, RunningService>,
+    launched_once_packages: &mut BTreeSet<String>,
+    retry_state: &mut BTreeMap<String, RetryState>,
+    recovery: &mut BTreeMap<u64, RootdLeaseRecovery>,
+    now: Instant,
+) {
+    for entry in startup_entries {
+        let Some(service_id) = rootd_service_id_for_exec(entry.exec.as_str()) else {
+            continue;
+        };
+        let (pid, state) = rootd_post_init_lease_query(service_id).unwrap_or_else(|errno| {
+            fail_closed(&format!(
+                "initd: fatal rootd post-init lease query failed service_id={service_id} errno={errno}"
+            ))
+        });
+        match state {
+            ROOTD_LEASE_STATE_EMPTY => {
+                recovery.remove(&service_id);
+            }
+            ROOTD_LEASE_STATE_RUNNING => {
+                let pid = i32::try_from(pid).unwrap_or_else(|_| {
+                    fail_closed(&format!(
+                        "initd: fatal rootd lease pid overflow service_id={service_id} pid={pid}"
+                    ))
+                });
+                if running.contains_key(&pid) {
+                    recovery.remove(&service_id);
+                    continue;
+                }
+                let state = recovery.entry(service_id).or_insert(RootdLeaseRecovery {
+                    pid,
+                    deadline: now + ROOTD_LEASE_RECOVERY_TIMEOUT,
+                });
+                if state.pid != pid {
+                    *state = RootdLeaseRecovery {
+                        pid,
+                        deadline: now + ROOTD_LEASE_RECOVERY_TIMEOUT,
+                    };
+                }
+                match wait_reported_service_endpoint_with_timeout(entry.exec.as_str(), pid, 1) {
+                    Ok(()) => {
+                        running.insert(
+                            pid,
+                            RunningService {
+                                package_id: entry.package_id.clone(),
+                                exec: entry.exec.clone(),
+                                restart: entry.restart,
+                            },
+                        );
+                        if !entry.restart {
+                            launched_once_packages.insert(entry.package_id.clone());
+                        }
+                        recovery.remove(&service_id);
+                        boot_line(&format!(
+                            "initd: adopted rootd lease exec={} pid={pid}",
+                            entry.exec
+                        ));
+                    }
+                    Err(errno) if errno == libc::ETIMEDOUT && now < state.deadline => {}
+                    Err(errno) if errno == libc::ETIMEDOUT || errno == libc::ESRCH => {
+                        reclaim_rootd_post_init_lease(service_id, pid as u64).unwrap_or_else(
+                            |reclaim_errno| {
+                                fail_closed(&format!(
+                                    "initd: fatal rootd stale lease reclaim failed service_id={service_id} pid={pid} errno={reclaim_errno}"
+                                ))
+                            },
+                        );
+                        recovery.remove(&service_id);
+                    }
+                    Err(errno) => fail_closed(&format!(
+                        "initd: fatal rootd lease endpoint probe failed service_id={service_id} pid={pid} errno={errno}"
+                    )),
+                }
+            }
+            ROOTD_LEASE_STATE_EXITED => {
+                recovery.remove(&service_id);
+                if let Some(service) = running.remove(&i32::try_from(pid).unwrap_or(-1)) {
+                    if service.restart {
+                        record_launch_failure(retry_state, service.exec.as_str(), "rootd-exit", 0);
+                    }
+                }
+                if pid != 0 {
+                    reclaim_rootd_post_init_lease(service_id, pid).unwrap_or_else(|errno| {
+                        fail_closed(&format!(
+                            "initd: fatal rootd exited lease reclaim failed service_id={service_id} pid={pid} errno={errno}"
+                        ))
+                    });
+                }
+            }
+            _ => {
+                recovery.remove(&service_id);
+                if pid != 0 {
+                    reclaim_rootd_post_init_lease(service_id, pid).unwrap_or_else(|errno| {
+                        fail_closed(&format!(
+                            "initd: fatal rootd terminal lease reclaim failed service_id={service_id} pid={pid} errno={errno}"
+                        ))
+                    });
+                }
+            }
+        }
+    }
+}
+
 fn wait_reported_service_endpoint(exec_path: &str, pid: i32) -> Result<(), i32> {
+    wait_reported_service_endpoint_with_timeout(
+        exec_path,
+        pid,
+        IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS,
+    )
+}
+
+fn wait_reported_service_endpoint_with_timeout(
+    exec_path: &str,
+    pid: i32,
+    timeout_ms: u64,
+) -> Result<(), i32> {
     let Some(service_id) = rootd_service_id_for_exec(exec_path) else {
         return Ok(());
     };
@@ -406,7 +558,7 @@ fn wait_reported_service_endpoint(exec_path: &str, pid: i32) -> Result<(), i32> 
         abi_version: IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION,
         service_id,
         expected_pid: u64::try_from(pid).map_err(|_| libc::EINVAL)?,
-        timeout_ms: IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS,
+        timeout_ms,
         ..RustosIpcWaitServiceEndpointArgs::default()
     };
     let status = unsafe {
@@ -422,6 +574,67 @@ fn wait_reported_service_endpoint(exec_path: &str, pid: i32) -> Result<(), i32> 
         "initd: endpoint ready event exec={exec_path} service_id={service_id} pid={pid}"
     ));
     Ok(())
+}
+
+fn rootd_post_init_lease_query(service_id: u64) -> Result<(u64, u16), i32> {
+    let response =
+        call_rootd_supervisor(COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY, service_id, 0)?;
+    u16::try_from(response.value1)
+        .map(|state| (response.value0, state))
+        .map_err(|_| libc::EINVAL)
+}
+
+fn reclaim_rootd_post_init_lease(service_id: u64, pid: u64) -> Result<(), i32> {
+    if pid == 0 {
+        return Err(libc::EINVAL);
+    }
+    let _ = call_rootd_supervisor(
+        COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM,
+        service_id,
+        pid,
+    )?;
+    Ok(())
+}
+
+fn call_rootd_supervisor(
+    op: u16,
+    arg0: u64,
+    arg1: u64,
+) -> Result<CommercialMaxProtocolResponse, i32> {
+    let endpoint = lookup_service_endpoint(IPC_SERVICE_ROOTD)?;
+    let mut request = CommercialMaxProtocolRequest::default();
+    request.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    request.header.protocol = COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR;
+    request.header.op = op;
+    request.header.subject_pid = u64::from(std::process::id());
+    request.header.subject_tid = current_tid();
+    request.arg0 = arg0;
+    request.arg1 = arg1;
+    let mut response = CommercialMaxProtocolResponse::default();
+    let call = unsafe {
+        libc::syscall(
+            SYS_RUSTOS_IPC_CALL as libc::c_long,
+            endpoint,
+            (&request as *const CommercialMaxProtocolRequest) as u64,
+            size_of::<CommercialMaxProtocolRequest>() as u64,
+            (&mut response as *mut CommercialMaxProtocolResponse) as u64,
+            size_of::<CommercialMaxProtocolResponse>() as u64,
+        ) as i64
+    };
+    if call < 0 {
+        return Err((-call) as i32);
+    }
+    if call as usize != size_of::<CommercialMaxProtocolResponse>()
+        || response.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
+        || response.header.protocol != COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR
+        || response.header.op != op
+    {
+        return Err(libc::EINVAL);
+    }
+    if response.status != 0 {
+        return Err(response.status);
+    }
+    Ok(response)
 }
 
 fn rootd_service_id_for_exec(exec_path: &str) -> Option<u64> {

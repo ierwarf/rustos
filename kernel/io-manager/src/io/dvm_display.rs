@@ -6,9 +6,12 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
 
 use driver_abi::{
-    DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER, DisplayFramebufferRegistration, DisplayPixelFormat,
+    DISPLAY_FRAMEBUFFER_FLAG_DVM_SCANOUT, DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER,
+    DisplayFramebufferRegistration, DisplayPixelFormat,
 };
-use driver_domain_protocol::{DVM_DISPLAY_HEADER_BYTES, DVM_DISPLAY_RECORD_BYTES, DvmDisplayHeader};
+use driver_domain_protocol::{
+    DVM_DISPLAY_HEADER_BYTES, DVM_DISPLAY_RECORD_BYTES, DvmDisplayHeader,
+};
 
 const IVSHMEM_VENDOR_ID: u16 = 0x1af4;
 const IVSHMEM_DEVICE_ID: u16 = 0x1110;
@@ -67,7 +70,10 @@ pub(crate) fn try_install() -> bool {
         stride: header.stride_bytes / 4,
         pixel_format: DisplayPixelFormat::Bgr as u32,
         bytes_per_pixel: 4,
-        flags: DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER,
+        // The DVM consumes this aperture and owns physical KMS. Mark that
+        // provenance all the way to uiserver so no privileged UI path can
+        // mistake a bounded-but-DVM-controlled scanout for an attested one.
+        flags: DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER | DISPLAY_FRAMEBUFFER_FLAG_DVM_SCANOUT,
         reserved: [0; 2],
     };
     if unsafe { crate::io::gui::register_driver_framebuffer(&registration) } != 0 {
@@ -143,7 +149,9 @@ pub(crate) fn finish_frame(started: bool) {
 /// Stop publishing when another provider replaces the DVM aperture.
 pub(crate) fn on_framebuffer_installed(framebuffer_addr: u64) {
     let header_addr = SHARED_HEADER_ADDR.load(Ordering::Acquire);
-    if header_addr != 0 && framebuffer_addr != header_addr as u64 + u64::from(DVM_DISPLAY_HEADER_BYTES) {
+    if header_addr != 0
+        && framebuffer_addr != header_addr as u64 + u64::from(DVM_DISPLAY_HEADER_BYTES)
+    {
         SHARED_HEADER_ADDR.store(0, Ordering::Release);
         FRAME_GENERATION.store(0, Ordering::Release);
     }
@@ -187,11 +195,18 @@ fn read_header(mapped: *const u8) -> Option<DvmDisplayHeader> {
 
 fn header_fits_resource(header: DvmDisplayHeader, resource_len: u64) -> bool {
     header.region_bytes <= resource_len
-        && header.frame_bytes <= header.region_bytes.saturating_sub(u64::from(DVM_DISPLAY_HEADER_BYTES))
+        && header.frame_bytes
+            <= header
+                .region_bytes
+                .saturating_sub(u64::from(DVM_DISPLAY_HEADER_BYTES))
 }
 
 fn warn_rejected(reason: &str) {
-    crate::debug::warn!(display, "dvm-display: shared provider rejected reason={}", reason);
+    crate::debug::warn!(
+        display,
+        "dvm-display: shared provider rejected reason={}",
+        reason
+    );
 }
 
 #[cfg(test)]
@@ -204,7 +219,10 @@ mod tests {
     fn header_must_stay_inside_the_mapped_bar() {
         let header = DvmDisplayHeader::new(8 * 1024 * 1024, 1600, 900, 1);
         assert!(header_fits_resource(header, 8 * 1024 * 1024));
-        assert!(!header_fits_resource(header, u64::from(DVM_DISPLAY_HEADER_BYTES)));
+        assert!(!header_fits_resource(
+            header,
+            u64::from(DVM_DISPLAY_HEADER_BYTES)
+        ));
     }
 }
 // RING3-MIGRATION-REFERENCE END: DVM display transport substrate.

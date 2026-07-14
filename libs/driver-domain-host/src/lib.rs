@@ -21,7 +21,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 
-pub const DEFAULT_CONTROL_PORT: u32 = 40_500;
+/// The DVM control listener port is derived from the owner-private per-launch
+/// secret.  It is an endpoint capability, not a stable service discovery port:
+/// an ordinary process sharing the DVM CID cannot hold the listener's setup
+/// slot unless it can first read that root-only launch secret.
+pub const CONTROL_PORT_FLOOR: u32 = 49_152;
 pub const MAX_CONTROL_FRAME: usize = 4 * 1024;
 pub const LINUX_DVM_ROLE: &str = "linux-driver-domain";
 pub const RUSTOS_INPUT_FRAME_BYTES: usize = 32;
@@ -40,9 +44,15 @@ const INPUT_RELAY_MAX_SEQUENCE: u32 = u32::MAX - 1024;
 // physical transport budget against a compromised or buggy DVM.
 const INPUT_RELAY_MAX_FRAMES_PER_SECOND: u32 = 256;
 const INPUT_RELAY_MAX_KEYS_PER_SECOND: u32 = INPUT_RELAY_MAX_FRAMES_PER_SECOND;
+const CONTROL_AUTHENTICATION: &str = "dvm-agent-hmac-sha256-v1";
+const CONTROL_PROOF_CONTEXT: &[u8] = b"rustos-dvm-control-hmac-v1\0";
+const CONTROL_SECRET_BYTES: usize = 32;
 
 const VMADDR_CID_ANY: u32 = u32::MAX;
 const AF_VSOCK: libc::c_int = 40;
+const AF_ALG: libc::c_int = 38;
+const SOL_ALG: libc::c_int = 279;
+const ALG_SET_KEY: libc::c_int = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -63,6 +73,112 @@ impl SockaddrVm {
             cid,
             zero: [0; 4],
         }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SockaddrAlg {
+    family: libc::sa_family_t,
+    algorithm_type: [u8; 14],
+    feature: u32,
+    mask: u32,
+    name: [u8; 64],
+}
+
+/// Per-DVM secret used only to derive the private control endpoint and prove a
+/// fresh challenge on that narrow channel. It is intentionally not a release
+/// authorization or a RustOS transport credential.
+pub struct ControlSecret {
+    bytes: [u8; CONTROL_SECRET_BYTES],
+}
+
+impl std::fmt::Debug for ControlSecret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ControlSecret(<redacted>)")
+    }
+}
+
+impl ControlSecret {
+    pub fn from_hex_file(path: &Path) -> Result<Self> {
+        let mut source = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .with_context(|| {
+                format!(
+                    "open DVM control secret {} without following symlinks",
+                    path.display()
+                )
+            })?;
+        let metadata = source
+            .metadata()
+            .with_context(|| format!("read DVM control secret metadata {}", path.display()))?;
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o077 != 0
+        {
+            bail!(
+                "DVM control secret {} must be a regular file owned by the current user with mode 0600 or stricter",
+                path.display()
+            );
+        }
+        let mut encoded = String::new();
+        source
+            .read_to_string(&mut encoded)
+            .with_context(|| format!("read DVM control secret {}", path.display()))?;
+        Self::from_hex(encoded.trim_end_matches(['\n', '\r']))
+    }
+
+    pub fn from_bytes(bytes: [u8; CONTROL_SECRET_BYTES]) -> Result<Self> {
+        if bytes.iter().all(|byte| *byte == 0) {
+            bail!("DVM control secret must not be all zero");
+        }
+        Ok(Self { bytes })
+    }
+
+    pub fn random() -> Result<Self> {
+        let mut bytes = [0_u8; CONTROL_SECRET_BYTES];
+        fs::File::open("/dev/urandom")
+            .context("open /dev/urandom for DVM control secret")?
+            .read_exact(&mut bytes)
+            .context("read DVM control secret from /dev/urandom")?;
+        Self::from_bytes(bytes)
+    }
+
+    pub fn as_hex(&self) -> String {
+        encode_hex(&self.bytes)
+    }
+
+    /// Return the per-launch host-vsock endpoint capability.
+    ///
+    /// The mapping deliberately uses only a nonzero private-port range, and
+    /// must remain byte-for-byte aligned with `rustos-dvm-agent.c`.  It is not
+    /// an authorization credential: the HMAC challenge still authenticates a
+    /// peer that reaches this endpoint.
+    pub fn control_port(&self) -> u32 {
+        let entropy = u32::from_be_bytes(self.bytes[..4].try_into().expect("control secret"));
+        let span = u32::MAX - CONTROL_PORT_FLOOR + 1;
+        CONTROL_PORT_FLOOR + entropy % span
+    }
+
+    fn from_hex(source: &str) -> Result<Self> {
+        if source.len() != CONTROL_SECRET_BYTES * 2
+            || !source.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            bail!("DVM control secret must be exactly 64 hexadecimal characters");
+        }
+        let mut bytes = [0_u8; CONTROL_SECRET_BYTES];
+        for (index, chunk) in source.as_bytes().chunks_exact(2).enumerate() {
+            bytes[index] = (hex_value(chunk[0])? << 4) | hex_value(chunk[1])?;
+        }
+        Self::from_bytes(bytes)
+    }
+}
+
+impl Drop for ControlSecret {
+    fn drop(&mut self) {
+        self.bytes.fill(0);
     }
 }
 
@@ -123,7 +239,7 @@ impl ControlContract {
         if self.protocol != "agent-v1"
             || self.state != "control"
             || self.transport != "kvm-vsock"
-            || self.authentication != "kvm-host-bound"
+            || self.authentication != CONTROL_AUTHENTICATION
         {
             bail!("unsupported DVM control contract {label}");
         }
@@ -356,6 +472,345 @@ impl DriverDomainPolicy {
     }
 }
 
+/// Immutable inventory of every hardware-backed driver domain permitted on
+/// one L0 host.  Individual launch plans are useful for local preflight, but
+/// cannot by themselves prove that a second plan does not reuse a CID, an
+/// IOMMU group, or one PCI function.  A signed release binds this complete
+/// fleet policy before any member may receive VFIO ownership.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DriverDomainFleetPolicy {
+    members: BTreeMap<String, DriverDomainFleetMember>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DriverDomainFleetMember {
+    dvm_guest_cid: u32,
+    iommu_group: u32,
+    pci_bdfs: BTreeSet<String>,
+}
+
+impl DriverDomainFleetPolicy {
+    pub fn from_env_file(path: &Path) -> Result<Self> {
+        let source = fs::read_to_string(path)
+            .with_context(|| format!("read driver-domain fleet policy {}", path.display()))?;
+        Self::parse(&source, &path.display().to_string())
+    }
+
+    /// The compact member encoding is deliberately not a generic nested
+    /// language: `domain@cid@iommu-group@bdf+bdf;...`.  The release signature
+    /// covers its exact bytes, while this parser makes every identity explicit
+    /// before a member can be activated.
+    pub fn parse(source: &str, label: &str) -> Result<Self> {
+        let values = parse_launch_plan_values(source, label)?;
+        const REQUIRED: [&str; 2] = ["DRIVER_DOMAIN_FLEET_POLICY_SCHEMA", "FLEET_MEMBERS"];
+        if values.len() != REQUIRED.len()
+            || values.keys().any(|key| !REQUIRED.contains(&key.as_str()))
+        {
+            bail!("unsupported key in {label}");
+        }
+        if launch_plan_value(&values, "DRIVER_DOMAIN_FLEET_POLICY_SCHEMA", label)? != "1" {
+            bail!("unsupported {label} schema");
+        }
+
+        let mut members = BTreeMap::new();
+        let mut cids = BTreeSet::new();
+        let mut groups = BTreeSet::new();
+        let mut bdfs = BTreeSet::new();
+        let raw_members = launch_plan_value(&values, "FLEET_MEMBERS", label)?;
+        for raw_member in raw_members.split(';') {
+            let fields = raw_member.split('@').collect::<Vec<_>>();
+            if fields.len() != 4 {
+                bail!("invalid {label} FLEET_MEMBERS entry");
+            }
+            let domain_id = fields[0];
+            validate_domain_id(domain_id, label)?;
+            let dvm_guest_cid = fields[1]
+                .parse::<u32>()
+                .context("invalid FLEET_MEMBERS DVM guest CID")?;
+            if dvm_guest_cid <= 2 {
+                bail!("invalid {label} FLEET_MEMBERS DVM guest CID");
+            }
+            let iommu_group = fields[2]
+                .parse::<u32>()
+                .context("invalid FLEET_MEMBERS IOMMU group")?;
+            let pci_bdfs = parse_fleet_member_pci_bdfs(fields[3], label)?;
+            if !cids.insert(dvm_guest_cid) {
+                bail!("duplicate DVM guest CID {dvm_guest_cid} in {label}");
+            }
+            if !groups.insert(iommu_group) {
+                bail!("duplicate IOMMU group {iommu_group} in {label}");
+            }
+            for bdf in &pci_bdfs {
+                if !bdfs.insert(bdf.clone()) {
+                    bail!("duplicate PCI BDF {bdf:?} in {label}");
+                }
+            }
+            if members
+                .insert(
+                    domain_id.to_owned(),
+                    DriverDomainFleetMember {
+                        dvm_guest_cid,
+                        iommu_group,
+                        pci_bdfs,
+                    },
+                )
+                .is_some()
+            {
+                bail!("duplicate driver domain {domain_id:?} in {label}");
+            }
+        }
+        if members.is_empty() {
+            bail!("empty {label} FLEET_MEMBERS");
+        }
+        Ok(Self { members })
+    }
+
+    /// Validates that a preflighted plan is exactly one fleet member.  This is
+    /// intentionally equality rather than subset matching: a plan cannot add
+    /// a function to a member or silently split an IOMMU group.
+    pub fn validate_for_lease(&self, lease: &ValidatedLease) -> Result<()> {
+        let member = self.members.get(&lease.domain_id).ok_or_else(|| {
+            anyhow!(
+                "driver domain {} is absent from fleet policy",
+                lease.domain_id
+            )
+        })?;
+        if member.dvm_guest_cid != lease.dvm_guest_cid
+            || member.iommu_group != lease.iommu_group
+            || member.pci_bdfs != lease.pci_bdfs.iter().cloned().collect::<BTreeSet<_>>()
+        {
+            bail!(
+                "fleet policy member {} does not exactly match the validated launch plan",
+                lease.domain_id
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Signed release authorization for an irreversible VFIO device handoff.
+///
+/// A launch plan is only a topology preflight input. Before `hostd acquire
+/// --activate` may detach a real device, release engineering must sign this
+/// authorization and bind the exact DVM artifact manifest and per-domain
+/// transport policy to the complete IOMMU group. The signature is verified by
+/// `hostd` with a pinned release keyring; this type keeps that payload strict.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleaseAuthorization {
+    domain_id: String,
+    dvm_guest_cid: u32,
+    iommu_group: u32,
+    assigned_pci_bdfs: BTreeSet<String>,
+    dvm_artifact_manifest_sha256: String,
+    device_policy_sha256: String,
+    fleet_policy_sha256: String,
+    not_before_unix: u64,
+    not_after_unix: u64,
+}
+
+impl ReleaseAuthorization {
+    pub fn from_env_file(path: &Path) -> Result<Self> {
+        let source = fs::read_to_string(path)
+            .with_context(|| format!("read release authorization {}", path.display()))?;
+        Self::parse(&source, &path.display().to_string())
+    }
+
+    pub fn parse(source: &str, label: &str) -> Result<Self> {
+        let values = parse_launch_plan_values(source, label)?;
+        const REQUIRED: [&str; 10] = [
+            "RELEASE_AUTHORIZATION_SCHEMA",
+            "DOMAIN_ID",
+            "DVM_GUEST_CID",
+            "IOMMU_GROUP",
+            "ASSIGNED_PCI_BDFS",
+            "DVM_ARTIFACT_MANIFEST_SHA256",
+            "DEVICE_POLICY_SHA256",
+            "FLEET_POLICY_SHA256",
+            "NOT_BEFORE_UNIX",
+            "NOT_AFTER_UNIX",
+        ];
+        if values.len() != REQUIRED.len()
+            || values.keys().any(|key| !REQUIRED.contains(&key.as_str()))
+        {
+            bail!("unsupported key in {label}");
+        }
+        if launch_plan_value(&values, "RELEASE_AUTHORIZATION_SCHEMA", label)? != "1" {
+            bail!("unsupported {label} schema");
+        }
+        let domain_id = launch_plan_value(&values, "DOMAIN_ID", label)?.to_owned();
+        validate_domain_id(&domain_id, label)?;
+        let dvm_guest_cid = launch_plan_value(&values, "DVM_GUEST_CID", label)?
+            .parse::<u32>()
+            .context("invalid DVM_GUEST_CID")?;
+        if dvm_guest_cid <= 2 {
+            bail!("invalid {label} DVM_GUEST_CID");
+        }
+        let iommu_group = launch_plan_value(&values, "IOMMU_GROUP", label)?
+            .parse::<u32>()
+            .context("invalid IOMMU_GROUP")?;
+        let assigned_pci_bdfs = parse_pci_bdf_list(
+            launch_plan_value(&values, "ASSIGNED_PCI_BDFS", label)?,
+            false,
+            label,
+        )?;
+        let dvm_artifact_manifest_sha256 = parse_sha256(
+            launch_plan_value(&values, "DVM_ARTIFACT_MANIFEST_SHA256", label)?,
+            label,
+        )?;
+        let device_policy_sha256 = parse_sha256(
+            launch_plan_value(&values, "DEVICE_POLICY_SHA256", label)?,
+            label,
+        )?;
+        let fleet_policy_sha256 = parse_sha256(
+            launch_plan_value(&values, "FLEET_POLICY_SHA256", label)?,
+            label,
+        )?;
+        let not_before_unix = launch_plan_value(&values, "NOT_BEFORE_UNIX", label)?
+            .parse::<u64>()
+            .context("invalid NOT_BEFORE_UNIX")?;
+        let not_after_unix = launch_plan_value(&values, "NOT_AFTER_UNIX", label)?
+            .parse::<u64>()
+            .context("invalid NOT_AFTER_UNIX")?;
+        if not_before_unix == 0 || not_after_unix <= not_before_unix {
+            bail!("invalid release authorization validity window in {label}");
+        }
+        Ok(Self {
+            domain_id,
+            dvm_guest_cid,
+            iommu_group,
+            assigned_pci_bdfs,
+            dvm_artifact_manifest_sha256,
+            device_policy_sha256,
+            fleet_policy_sha256,
+            not_before_unix,
+            not_after_unix,
+        })
+    }
+
+    pub fn validate_for_lease(&self, lease: &ValidatedLease, now_unix: u64) -> Result<()> {
+        if self.domain_id != lease.domain_id
+            || self.dvm_guest_cid != lease.dvm_guest_cid
+            || self.iommu_group != lease.iommu_group
+            || self.assigned_pci_bdfs.iter().cloned().collect::<Vec<_>>() != lease.pci_bdfs
+        {
+            bail!("release authorization does not match the validated launch plan");
+        }
+        if now_unix < self.not_before_unix || now_unix > self.not_after_unix {
+            bail!("release authorization is outside its validity window");
+        }
+        Ok(())
+    }
+
+    pub fn dvm_artifact_manifest_sha256(&self) -> &str {
+        &self.dvm_artifact_manifest_sha256
+    }
+
+    pub fn device_policy_sha256(&self) -> &str {
+        &self.device_policy_sha256
+    }
+
+    pub fn fleet_policy_sha256(&self) -> &str {
+        &self.fleet_policy_sha256
+    }
+
+    pub fn not_after_unix(&self) -> u64 {
+        self.not_after_unix
+    }
+
+    pub fn into_vfio_release_binding(
+        &self,
+        release_manifest_sha256: &str,
+        authorized_at_unix: u64,
+    ) -> Result<VfioReleaseBinding> {
+        if authorized_at_unix < self.not_before_unix || authorized_at_unix > self.not_after_unix {
+            bail!("VFIO release binding was created outside authorization validity window");
+        }
+        VfioReleaseBinding::new(
+            release_manifest_sha256,
+            &self.dvm_artifact_manifest_sha256,
+            &self.device_policy_sha256,
+            &self.fleet_policy_sha256,
+            authorized_at_unix,
+            self.not_after_unix,
+        )
+    }
+}
+
+/// Evidence retained with a durable VFIO lease after a release authorization
+/// was verified. Recovery may restore a legacy record, but no new bind may be
+/// prepared or activated without this exact immutable evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VfioReleaseBinding {
+    release_manifest_sha256: String,
+    dvm_artifact_manifest_sha256: String,
+    device_policy_sha256: String,
+    fleet_policy_sha256: Option<String>,
+    authorized_at_unix: u64,
+    authorization_not_after_unix: u64,
+}
+
+impl VfioReleaseBinding {
+    pub fn new(
+        release_manifest_sha256: &str,
+        dvm_artifact_manifest_sha256: &str,
+        device_policy_sha256: &str,
+        fleet_policy_sha256: &str,
+        authorized_at_unix: u64,
+        authorization_not_after_unix: u64,
+    ) -> Result<Self> {
+        if authorized_at_unix == 0 || authorization_not_after_unix < authorized_at_unix {
+            bail!("invalid VFIO release binding validity window");
+        }
+        Ok(Self {
+            release_manifest_sha256: parse_sha256(release_manifest_sha256, "VFIO release binding")?,
+            dvm_artifact_manifest_sha256: parse_sha256(
+                dvm_artifact_manifest_sha256,
+                "VFIO release binding",
+            )?,
+            device_policy_sha256: parse_sha256(device_policy_sha256, "VFIO release binding")?,
+            fleet_policy_sha256: Some(parse_sha256(fleet_policy_sha256, "VFIO release binding")?),
+            authorized_at_unix,
+            authorization_not_after_unix,
+        })
+    }
+
+    /// V2 records predate fleet binding.  They remain restorable so a host
+    /// never loses recovery for an already-bound group, but are ineligible for
+    /// every future prepare/bind/active mutation.
+    fn legacy_v2(
+        release_manifest_sha256: &str,
+        dvm_artifact_manifest_sha256: &str,
+        device_policy_sha256: &str,
+        authorized_at_unix: u64,
+        authorization_not_after_unix: u64,
+    ) -> Result<Self> {
+        if authorized_at_unix == 0 || authorization_not_after_unix < authorized_at_unix {
+            bail!("invalid VFIO release binding validity window");
+        }
+        Ok(Self {
+            release_manifest_sha256: parse_sha256(release_manifest_sha256, "VFIO release binding")?,
+            dvm_artifact_manifest_sha256: parse_sha256(
+                dvm_artifact_manifest_sha256,
+                "VFIO release binding",
+            )?,
+            device_policy_sha256: parse_sha256(device_policy_sha256, "VFIO release binding")?,
+            fleet_policy_sha256: None,
+            authorized_at_unix,
+            authorization_not_after_unix,
+        })
+    }
+
+    fn validate_at(&self, now_unix: u64) -> Result<()> {
+        if self.fleet_policy_sha256.is_none() {
+            bail!("VFIO release authorization lacks fleet-policy evidence");
+        }
+        if now_unix < self.authorized_at_unix || now_unix > self.authorization_not_after_unix {
+            bail!("VFIO release authorization is outside its validity window");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidatedLease {
     pub domain_id: String,
@@ -426,6 +881,7 @@ pub struct VfioLeaseRecord {
     pub original_drivers: BTreeMap<String, Option<String>>,
     /// Empty means that the kernel reported no override (`(null)`).
     pub original_driver_overrides: BTreeMap<String, String>,
+    release_binding: Option<VfioReleaseBinding>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -439,6 +895,7 @@ impl VfioLeaseRecord {
         lease: &ValidatedLease,
         original_drivers: BTreeMap<String, Option<String>>,
         original_driver_overrides: BTreeMap<String, String>,
+        release_binding: Option<VfioReleaseBinding>,
     ) -> Result<Self> {
         let expected = lease.pci_bdfs.iter().cloned().collect::<BTreeSet<_>>();
         if original_drivers.keys().cloned().collect::<BTreeSet<_>>() != expected {
@@ -459,6 +916,7 @@ impl VfioLeaseRecord {
             iommu_group: lease.iommu_group,
             original_drivers,
             original_driver_overrides,
+            release_binding,
         })
     }
 
@@ -481,6 +939,33 @@ impl VfioLeaseRecord {
             })
             .collect::<Vec<_>>()
             .join(",");
+        if let Some(binding) = &self.release_binding {
+            if let Some(fleet_policy_sha256) = &binding.fleet_policy_sha256 {
+                return format!(
+                    "VFIO_LEASE_SCHEMA=3\nLEASE_STATE={state}\nDOMAIN_ID={}\nDVM_GUEST_CID={}\nIOMMU_GROUP={}\nORIGINAL_DRIVERS={drivers}\nORIGINAL_DRIVER_OVERRIDES={overrides}\nRELEASE_MANIFEST_SHA256={}\nDVM_ARTIFACT_MANIFEST_SHA256={}\nDEVICE_POLICY_SHA256={}\nFLEET_POLICY_SHA256={}\nAUTHORIZED_AT_UNIX={}\nAUTHORIZATION_NOT_AFTER_UNIX={}\n",
+                    self.domain_id,
+                    self.dvm_guest_cid,
+                    self.iommu_group,
+                    binding.release_manifest_sha256,
+                    binding.dvm_artifact_manifest_sha256,
+                    binding.device_policy_sha256,
+                    fleet_policy_sha256,
+                    binding.authorized_at_unix,
+                    binding.authorization_not_after_unix,
+                );
+            }
+            return format!(
+                "VFIO_LEASE_SCHEMA=2\nLEASE_STATE={state}\nDOMAIN_ID={}\nDVM_GUEST_CID={}\nIOMMU_GROUP={}\nORIGINAL_DRIVERS={drivers}\nORIGINAL_DRIVER_OVERRIDES={overrides}\nRELEASE_MANIFEST_SHA256={}\nDVM_ARTIFACT_MANIFEST_SHA256={}\nDEVICE_POLICY_SHA256={}\nAUTHORIZED_AT_UNIX={}\nAUTHORIZATION_NOT_AFTER_UNIX={}\n",
+                self.domain_id,
+                self.dvm_guest_cid,
+                self.iommu_group,
+                binding.release_manifest_sha256,
+                binding.dvm_artifact_manifest_sha256,
+                binding.device_policy_sha256,
+                binding.authorized_at_unix,
+                binding.authorization_not_after_unix,
+            );
+        }
         format!(
             "VFIO_LEASE_SCHEMA=1\nLEASE_STATE={state}\nDOMAIN_ID={}\nDVM_GUEST_CID={}\nIOMMU_GROUP={}\nORIGINAL_DRIVERS={drivers}\nORIGINAL_DRIVER_OVERRIDES={overrides}\n",
             self.domain_id, self.dvm_guest_cid, self.iommu_group
@@ -489,7 +974,7 @@ impl VfioLeaseRecord {
 
     fn parse(source: &str, label: &str) -> Result<Self> {
         let values = parse_launch_plan_values(source, label)?;
-        const REQUIRED: [&str; 7] = [
+        const V1_REQUIRED: [&str; 7] = [
             "VFIO_LEASE_SCHEMA",
             "LEASE_STATE",
             "DOMAIN_ID",
@@ -498,14 +983,81 @@ impl VfioLeaseRecord {
             "ORIGINAL_DRIVERS",
             "ORIGINAL_DRIVER_OVERRIDES",
         ];
-        if values.len() != REQUIRED.len()
-            || values.keys().any(|key| !REQUIRED.contains(&key.as_str()))
-        {
-            bail!("unsupported key in {label}");
-        }
-        if launch_plan_value(&values, "VFIO_LEASE_SCHEMA", label)? != "1" {
-            bail!("unsupported {label} schema");
-        }
+        const V2_REQUIRED: [&str; 12] = [
+            "VFIO_LEASE_SCHEMA",
+            "LEASE_STATE",
+            "DOMAIN_ID",
+            "DVM_GUEST_CID",
+            "IOMMU_GROUP",
+            "ORIGINAL_DRIVERS",
+            "ORIGINAL_DRIVER_OVERRIDES",
+            "RELEASE_MANIFEST_SHA256",
+            "DVM_ARTIFACT_MANIFEST_SHA256",
+            "DEVICE_POLICY_SHA256",
+            "AUTHORIZED_AT_UNIX",
+            "AUTHORIZATION_NOT_AFTER_UNIX",
+        ];
+        const V3_REQUIRED: [&str; 13] = [
+            "VFIO_LEASE_SCHEMA",
+            "LEASE_STATE",
+            "DOMAIN_ID",
+            "DVM_GUEST_CID",
+            "IOMMU_GROUP",
+            "ORIGINAL_DRIVERS",
+            "ORIGINAL_DRIVER_OVERRIDES",
+            "RELEASE_MANIFEST_SHA256",
+            "DVM_ARTIFACT_MANIFEST_SHA256",
+            "DEVICE_POLICY_SHA256",
+            "FLEET_POLICY_SHA256",
+            "AUTHORIZED_AT_UNIX",
+            "AUTHORIZATION_NOT_AFTER_UNIX",
+        ];
+        let schema = launch_plan_value(&values, "VFIO_LEASE_SCHEMA", label)?;
+        let release_binding = match schema {
+            "1" if values.len() == V1_REQUIRED.len()
+                && !values
+                    .keys()
+                    .any(|key| !V1_REQUIRED.contains(&key.as_str())) =>
+            {
+                None
+            }
+            "2" if values.len() == V2_REQUIRED.len()
+                && !values
+                    .keys()
+                    .any(|key| !V2_REQUIRED.contains(&key.as_str())) =>
+            {
+                Some(VfioReleaseBinding::legacy_v2(
+                    launch_plan_value(&values, "RELEASE_MANIFEST_SHA256", label)?,
+                    launch_plan_value(&values, "DVM_ARTIFACT_MANIFEST_SHA256", label)?,
+                    launch_plan_value(&values, "DEVICE_POLICY_SHA256", label)?,
+                    launch_plan_value(&values, "AUTHORIZED_AT_UNIX", label)?
+                        .parse::<u64>()
+                        .context("invalid AUTHORIZED_AT_UNIX")?,
+                    launch_plan_value(&values, "AUTHORIZATION_NOT_AFTER_UNIX", label)?
+                        .parse::<u64>()
+                        .context("invalid AUTHORIZATION_NOT_AFTER_UNIX")?,
+                )?)
+            }
+            "3" if values.len() == V3_REQUIRED.len()
+                && !values
+                    .keys()
+                    .any(|key| !V3_REQUIRED.contains(&key.as_str())) =>
+            {
+                Some(VfioReleaseBinding::new(
+                    launch_plan_value(&values, "RELEASE_MANIFEST_SHA256", label)?,
+                    launch_plan_value(&values, "DVM_ARTIFACT_MANIFEST_SHA256", label)?,
+                    launch_plan_value(&values, "DEVICE_POLICY_SHA256", label)?,
+                    launch_plan_value(&values, "FLEET_POLICY_SHA256", label)?,
+                    launch_plan_value(&values, "AUTHORIZED_AT_UNIX", label)?
+                        .parse::<u64>()
+                        .context("invalid AUTHORIZED_AT_UNIX")?,
+                    launch_plan_value(&values, "AUTHORIZATION_NOT_AFTER_UNIX", label)?
+                        .parse::<u64>()
+                        .context("invalid AUTHORIZATION_NOT_AFTER_UNIX")?,
+                )?)
+            }
+            _ => bail!("unsupported key or schema in {label}"),
+        };
         let state = match launch_plan_value(&values, "LEASE_STATE", label)? {
             "prepared" => VfioLeaseState::Prepared,
             "active" => VfioLeaseState::Active,
@@ -573,6 +1125,7 @@ impl VfioLeaseRecord {
             iommu_group,
             original_drivers,
             original_driver_overrides,
+            release_binding,
         })
     }
 }
@@ -590,19 +1143,33 @@ impl FileLeaseStore {
         Self { root: root.into() }
     }
 
-    pub fn create_prepared(&self, record: &VfioLeaseRecord) -> Result<()> {
+    pub fn create_prepared(&self, record: &VfioLeaseRecord, now_unix: u64) -> Result<()> {
         if record.state != VfioLeaseState::Prepared {
             bail!("only a prepared VFIO lease can be created");
         }
+        record
+            .release_binding
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow!("prepared VFIO lease lacks signed release authorization evidence")
+            })?
+            .validate_at(now_unix)?;
         self.ensure_private_root()?;
         write_new_private(&self.path_for(&record.domain_id)?, &record.to_env())?;
         sync_directory(&self.root)
     }
 
-    pub fn mark_active(&self, record: &mut VfioLeaseRecord) -> Result<()> {
+    pub fn mark_active(&self, record: &mut VfioLeaseRecord, now_unix: u64) -> Result<()> {
         if record.state != VfioLeaseState::Prepared {
             bail!("only a prepared VFIO lease can become active");
         }
+        record
+            .release_binding
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow!("active VFIO lease lacks signed release authorization evidence")
+            })?
+            .validate_at(now_unix)?;
         self.ensure_private_root()?;
         let path = self.path_for(&record.domain_id)?;
         if !path.is_file() {
@@ -765,7 +1332,28 @@ impl VfioOps for SysfsVfioOps {
     }
 }
 
-pub fn inspect_vfio_lease(lease: &ValidatedLease, ops: &impl VfioOps) -> Result<VfioLeaseRecord> {
+pub fn inspect_vfio_lease(
+    lease: &ValidatedLease,
+    ops: &impl VfioOps,
+    release_binding: VfioReleaseBinding,
+) -> Result<VfioLeaseRecord> {
+    inspect_vfio_lease_inner(lease, ops, Some(release_binding))
+}
+
+/// Read-only driver snapshot for an `acquire` dry run. The returned record is
+/// intentionally ineligible for `create_prepared` or `acquire_vfio_lease`.
+pub fn inspect_vfio_lease_preflight(
+    lease: &ValidatedLease,
+    ops: &impl VfioOps,
+) -> Result<VfioLeaseRecord> {
+    inspect_vfio_lease_inner(lease, ops, None)
+}
+
+fn inspect_vfio_lease_inner(
+    lease: &ValidatedLease,
+    ops: &impl VfioOps,
+    release_binding: Option<VfioReleaseBinding>,
+) -> Result<VfioLeaseRecord> {
     let mut original_drivers = BTreeMap::new();
     let mut original_driver_overrides = BTreeMap::new();
     for bdf in &lease.pci_bdfs {
@@ -776,15 +1364,29 @@ pub fn inspect_vfio_lease(lease: &ValidatedLease, ops: &impl VfioOps) -> Result<
         original_drivers.insert(bdf.clone(), driver);
         original_driver_overrides.insert(bdf.clone(), ops.current_driver_override(bdf)?);
     }
-    VfioLeaseRecord::from_validated_lease(lease, original_drivers, original_driver_overrides)
+    VfioLeaseRecord::from_validated_lease(
+        lease,
+        original_drivers,
+        original_driver_overrides,
+        release_binding,
+    )
 }
 
 /// Acquire the complete validated IOMMU group. On every failure this function
 /// attempts a reverse-order rollback to the record's original host drivers.
-pub fn acquire_vfio_lease(record: &VfioLeaseRecord, ops: &mut impl VfioOps) -> Result<()> {
+pub fn acquire_vfio_lease(
+    record: &VfioLeaseRecord,
+    ops: &mut impl VfioOps,
+    now_unix: u64,
+) -> Result<()> {
     if record.state != VfioLeaseState::Prepared {
         bail!("VFIO acquire requires a prepared lease");
     }
+    record
+        .release_binding
+        .as_ref()
+        .ok_or_else(|| anyhow!("VFIO acquire requires signed release authorization evidence"))?
+        .validate_at(now_unix)?;
     if !ops.vfio_driver_present()? {
         bail!("vfio-pci is not loaded on L0");
     }
@@ -929,7 +1531,7 @@ fn parse_launch_plan_values(source: &str, label: &str) -> Result<BTreeMap<String
             || value.is_empty()
             || !key
                 .bytes()
-                .all(|byte| byte.is_ascii_uppercase() || byte == b'_')
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
             || values.insert(key.to_owned(), value.to_owned()).is_some()
         {
             bail!("invalid or duplicate {label} key {key:?}");
@@ -949,6 +1551,13 @@ fn launch_plan_value<'a>(
         .ok_or_else(|| anyhow!("missing {label} key {key}"))
 }
 
+fn parse_sha256(value: &str, label: &str) -> Result<String> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("invalid SHA-256 value in {label}");
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
 fn parse_pci_bdf_list(value: &str, allow_none: bool, label: &str) -> Result<BTreeSet<String>> {
     if allow_none && value == "none" {
         return Ok(BTreeSet::new());
@@ -962,6 +1571,20 @@ fn parse_pci_bdf_list(value: &str, allow_none: bool, label: &str) -> Result<BTre
     }
     if bdfs.is_empty() {
         bail!("empty PCI BDF list in {label}");
+    }
+    Ok(bdfs)
+}
+
+fn parse_fleet_member_pci_bdfs(value: &str, label: &str) -> Result<BTreeSet<String>> {
+    let mut bdfs = BTreeSet::new();
+    for bdf in value.split('+') {
+        validate_pci_bdf(bdf, label)?;
+        if !bdfs.insert(bdf.to_owned()) {
+            bail!("duplicate PCI BDF {bdf:?} in {label} FLEET_MEMBERS entry");
+        }
+    }
+    if bdfs.is_empty() {
+        bail!("empty PCI BDF list in {label} FLEET_MEMBERS entry");
     }
     Ok(bdfs)
 }
@@ -1230,13 +1853,22 @@ pub struct HostControlListener {
     fd: OwnedFd,
     expected_dvm_cid: u32,
     contract: ControlContract,
+    control_secret: ControlSecret,
 }
 
 impl HostControlListener {
-    pub fn bind(expected_dvm_cid: u32, port: u32, contract: ControlContract) -> Result<Self> {
-        if expected_dvm_cid <= 2 || port == 0 {
-            bail!("invalid DVM vsock identity cid={expected_dvm_cid} port={port}");
+    pub fn bind(
+        expected_dvm_cid: u32,
+        contract: ControlContract,
+        control_secret: ControlSecret,
+    ) -> Result<Self> {
+        if expected_dvm_cid <= 2 {
+            bail!("invalid DVM vsock identity cid={expected_dvm_cid}");
         }
+        // Keep endpoint selection at the secret-owning L0 boundary. Exposing a
+        // caller-selected public port here would let a future caller silently
+        // undo the same-CID setup-slot isolation.
+        let port = control_secret.control_port();
         let fd = unsafe { libc::socket(AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error()).context("create host AF_VSOCK listener");
@@ -1260,6 +1892,7 @@ impl HostControlListener {
             fd,
             expected_dvm_cid,
             contract,
+            control_secret,
         })
     }
 
@@ -1295,15 +1928,18 @@ impl HostControlListener {
         self.relay_input_once_inner(Some(timeout), sink, on_ready)
     }
 
-    /// Relay one DVM input session without imposing a setup deadline. This is
-    /// for a developer-owned interactive VM session; smoke tests must use the
-    /// bounded methods above. A disconnect still emits input cleanup and
-    /// returns an error to the session supervisor for reconnect handling.
+    /// Relay one DVM input session with a bounded authentication/setup stage
+    /// and no deadline for a healthy, idle input stream. This is for a
+    /// developer-owned interactive VM session; smoke tests must use the
+    /// caller-selected bounded methods above. A same-CID peer that never sends
+    /// a HELLO or proof therefore cannot hold the listener forever. A
+    /// disconnect still emits input cleanup and returns an error to the
+    /// session supervisor for reconnect handling.
     pub fn relay_input_once_unbounded(
         &self,
         sink: &mut impl RustosInputSink,
     ) -> Result<InputRelayResult> {
-        self.relay_input_once_inner(None, sink, |_| Ok(()))
+        self.relay_input_once_inner(Some(Duration::from_secs(5)), sink, |_| Ok(()))
     }
 
     fn relay_input_once_inner(
@@ -1327,6 +1963,11 @@ impl HostControlListener {
         }
 
         let epoch = new_input_epoch();
+        // This remains an input relay: it sends no Ethernet payload. In the
+        // current combined-DVM profile, its L0-authenticated start/end markers
+        // also bound the lifetime of RustOS's independent fixed network ring.
+        // A later network-only domain must receive a distinct authenticated
+        // lifecycle signal rather than inheriting this input-DVM epoch.
         sink.send_input_frame(&RustosInputFrame::session_start(epoch)?)?;
         // Endpoint setup has a deadline, but a live input device may stay idle
         // indefinitely. A disconnect is still reported as a relay failure after
@@ -1449,6 +2090,7 @@ impl HostControlListener {
         }
         let hello = read_message(&mut connection)?;
         validate_hello(&hello, &self.contract)?;
+        authenticate_control_peer(&mut connection, &hello, &self.control_secret)?;
         write_message(&mut connection, &welcome_message(&self.contract))?;
         Ok(connection)
     }
@@ -1766,6 +2408,162 @@ fn validate_hello(source: &str, contract: &ControlContract) -> Result<()> {
     Ok(())
 }
 
+fn authenticate_control_peer(
+    connection: &mut std::fs::File,
+    hello: &str,
+    control_secret: &ControlSecret,
+) -> Result<()> {
+    let mut nonce = [0_u8; CONTROL_SECRET_BYTES];
+    fs::File::open("/dev/urandom")
+        .context("open /dev/urandom for DVM control challenge")?
+        .read_exact(&mut nonce)
+        .context("read DVM control challenge")?;
+    write_message(
+        connection,
+        &format!("CHALLENGE\nnonce={}", encode_hex(&nonce)),
+    )?;
+    let proof = parse_message(&read_message(connection)?)?;
+    if proof.kind != "PROOF" || !has_exact_fields(&proof.fields, &["mac"]) {
+        bail!("rejected Linux DVM control proof shape");
+    }
+    let supplied = decode_hex_exact(
+        proof
+            .fields
+            .get("mac")
+            .ok_or_else(|| anyhow!("DVM control proof omitted mac"))?,
+        CONTROL_SECRET_BYTES,
+    )?;
+    let expected = control_proof(control_secret, &nonce, hello)?;
+    if !constant_time_eq(&supplied, &expected) {
+        bail!("rejected Linux DVM control proof");
+    }
+    Ok(())
+}
+
+fn control_proof(
+    control_secret: &ControlSecret,
+    nonce: &[u8; CONTROL_SECRET_BYTES],
+    hello: &str,
+) -> Result<[u8; CONTROL_SECRET_BYTES]> {
+    let mut transcript =
+        Vec::with_capacity(CONTROL_PROOF_CONTEXT.len() + nonce.len() + hello.len());
+    transcript.extend_from_slice(CONTROL_PROOF_CONTEXT);
+    transcript.extend_from_slice(nonce);
+    transcript.extend_from_slice(hello.as_bytes());
+    hmac_sha256(&control_secret.bytes, &transcript)
+}
+
+fn hmac_sha256(
+    key: &[u8; CONTROL_SECRET_BYTES],
+    message: &[u8],
+) -> Result<[u8; CONTROL_SECRET_BYTES]> {
+    let fd = unsafe { libc::socket(AF_ALG, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("create AF_ALG HMAC socket");
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut address = SockaddrAlg {
+        family: AF_ALG as libc::sa_family_t,
+        algorithm_type: [0; 14],
+        feature: 0,
+        mask: 0,
+        name: [0; 64],
+    };
+    copy_c_string(&mut address.algorithm_type, b"hash")?;
+    copy_c_string(&mut address.name, b"hmac(sha256)")?;
+    if unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            (&raw const address).cast::<libc::sockaddr>(),
+            size_of::<SockaddrAlg>() as libc::socklen_t,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error()).context("bind AF_ALG HMAC socket");
+    }
+    if unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            SOL_ALG,
+            ALG_SET_KEY,
+            key.as_ptr().cast(),
+            key.len() as libc::socklen_t,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error()).context("set AF_ALG HMAC key");
+    }
+    let operation = unsafe {
+        libc::accept4(
+            fd.as_raw_fd(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            libc::SOCK_CLOEXEC,
+        )
+    };
+    if operation < 0 {
+        return Err(std::io::Error::last_os_error()).context("accept AF_ALG HMAC operation");
+    }
+    let mut operation = unsafe { std::fs::File::from_raw_fd(operation) };
+    operation
+        .write_all(message)
+        .context("write AF_ALG HMAC transcript")?;
+    let mut digest = [0_u8; CONTROL_SECRET_BYTES];
+    operation
+        .read_exact(&mut digest)
+        .context("read AF_ALG HMAC digest")?;
+    Ok(digest)
+}
+
+fn copy_c_string(destination: &mut [u8], value: &[u8]) -> Result<()> {
+    if value.is_empty() || value.len() >= destination.len() || value.contains(&0) {
+        bail!("invalid AF_ALG algorithm name");
+    }
+    destination[..value.len()].copy_from_slice(value);
+    Ok(())
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn decode_hex_exact(source: &str, expected_bytes: usize) -> Result<Vec<u8>> {
+    if source.len() != expected_bytes * 2 || !source.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("invalid hexadecimal DVM control proof");
+    }
+    source
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|chunk| Ok((hex_value(chunk[0])? << 4) | hex_value(chunk[1])?))
+        .collect()
+}
+
+fn hex_value(byte: u8) -> Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => bail!("invalid hexadecimal digit"),
+    }
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut different = 0_u8;
+    for (left, right) in left.iter().zip(right) {
+        different |= left ^ right;
+    }
+    different == 0
+}
+
 struct Message {
     kind: String,
     fields: BTreeMap<String, String>,
@@ -1832,26 +2630,34 @@ fn write_message(connection: &mut std::fs::File, message: &str) -> Result<()> {
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        ControlContract, DeviceClass, DeviceTransport, DriverDomainPolicy, FileLeaseStore,
+        CONTROL_PORT_FLOOR, CONTROL_SECRET_BYTES, ControlContract, ControlSecret, DeviceClass,
+        DeviceTransport, DriverDomainFleetPolicy, DriverDomainPolicy, FileLeaseStore,
         InputRelayRate, IommuTopology, LaunchPlan, LinuxEvdevInputEvent, LinuxEvdevKeyEvent,
-        RustosInputFrame, ValidatedLease, VfioLeaseRecord, VfioLeaseState, VfioOps,
-        acquire_vfio_lease, inspect_vfio_lease, parse_linux_evdev_input_event, parse_message,
+        ReleaseAuthorization, RustosInputFrame, ValidatedLease, VfioLeaseRecord, VfioLeaseState,
+        VfioOps, VfioReleaseBinding, acquire_vfio_lease, control_proof, inspect_vfio_lease,
+        inspect_vfio_lease_preflight, parse_linux_evdev_input_event, parse_message,
         restore_vfio_lease, validate_hello,
     };
     use anyhow::Result;
 
-    const VALID: &str = "CONTROL_SCHEMA=1\nCONTROL_PROTOCOL=agent-v1\nCONTROL_STATE=control\nCONTROL_TRANSPORT=kvm-vsock\nCONTROL_AUTHENTICATION=kvm-host-bound\nCONTROL_CAPABILITIES=health,device-inventory,driver-inventory,input-stream\n";
+    const VALID: &str = "CONTROL_SCHEMA=1\nCONTROL_PROTOCOL=agent-v1\nCONTROL_STATE=control\nCONTROL_TRANSPORT=kvm-vsock\nCONTROL_AUTHENTICATION=dvm-agent-hmac-sha256-v1\nCONTROL_CAPABILITIES=health,device-inventory,driver-inventory,input-stream\n";
 
     #[test]
     fn control_contract_is_strict() {
         let contract = ControlContract::parse(VALID, "test").unwrap();
         assert_eq!(
             contract.capabilities,
-            ["health", "device-inventory", "driver-inventory", "input-stream"]
+            [
+                "health",
+                "device-inventory",
+                "driver-inventory",
+                "input-stream"
+            ]
         );
         assert!(ControlContract::parse(&VALID.replace("control", "pretransport"), "test").is_err());
         assert!(
@@ -1863,16 +2669,78 @@ mod tests {
     #[test]
     fn hello_is_bound_to_the_exact_control_contract() {
         let contract = ControlContract::parse(VALID, "test").unwrap();
-        let hello = "HELLO\nrole=linux-driver-domain\nprotocol=agent-v1\nstate=control\ntransport=kvm-vsock\nauthentication=kvm-host-bound\ncapabilities=health,device-inventory,driver-inventory,input-stream";
+        let hello = "HELLO\nrole=linux-driver-domain\nprotocol=agent-v1\nstate=control\ntransport=kvm-vsock\nauthentication=dvm-agent-hmac-sha256-v1\ncapabilities=health,device-inventory,driver-inventory,input-stream";
         assert!(validate_hello(hello, &contract).is_ok());
         assert!(
             validate_hello(
-                &hello.replace("health,device-inventory,driver-inventory,input-stream", "health"),
+                &hello.replace(
+                    "health,device-inventory,driver-inventory,input-stream",
+                    "health"
+                ),
                 &contract
             )
             .is_err()
         );
         assert!(validate_hello(&format!("{hello}\nextra=unexpected"), &contract).is_err());
+    }
+
+    #[test]
+    fn control_secret_and_proof_bind_each_session() {
+        assert!(ControlSecret::from_bytes([0; CONTROL_SECRET_BYTES]).is_err());
+        let secret = ControlSecret::from_bytes([0x5a; CONTROL_SECRET_BYTES]).unwrap();
+        let hello = "HELLO\nrole=linux-driver-domain\nprotocol=agent-v1\nstate=control\ntransport=kvm-vsock\nauthentication=dvm-agent-hmac-sha256-v1\ncapabilities=health,device-inventory,driver-inventory,input-stream";
+        let first = control_proof(&secret, &[1; CONTROL_SECRET_BYTES], hello).unwrap();
+        assert_eq!(
+            first,
+            control_proof(&secret, &[1; CONTROL_SECRET_BYTES], hello).unwrap()
+        );
+        assert_ne!(
+            first,
+            control_proof(&secret, &[2; CONTROL_SECRET_BYTES], hello).unwrap()
+        );
+        assert_ne!(
+            first,
+            control_proof(
+                &secret,
+                &[1; CONTROL_SECRET_BYTES],
+                &format!("{hello}\nextra=x")
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn control_endpoint_is_a_secret_derived_private_port() {
+        let mut low_entropy = [0_u8; CONTROL_SECRET_BYTES];
+        low_entropy[CONTROL_SECRET_BYTES - 1] = 1;
+        let low = ControlSecret::from_bytes(low_entropy).unwrap();
+        assert_eq!(low.control_port(), CONTROL_PORT_FLOOR);
+
+        let high = ControlSecret::from_bytes([0xff; CONTROL_SECRET_BYTES]).unwrap();
+        assert!(high.control_port() >= CONTROL_PORT_FLOOR);
+        assert_ne!(low.control_port(), high.control_port());
+        assert_eq!(high.control_port(), high.control_port());
+    }
+
+    #[test]
+    fn control_secret_file_is_owner_private_and_not_a_symlink() {
+        let sysfs = TestSysfs::new(&[]);
+        fs::create_dir_all(sysfs.path()).unwrap();
+        let secret_path = sysfs.path().join("dvm-control-secret");
+        let secret = ControlSecret::from_bytes([0x5a; CONTROL_SECRET_BYTES]).unwrap();
+        fs::write(&secret_path, format!("{}\n", secret.as_hex())).unwrap();
+        fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            ControlSecret::from_hex_file(&secret_path).unwrap().as_hex(),
+            secret.as_hex()
+        );
+
+        let symlink_path = sysfs.path().join("dvm-control-secret-link");
+        symlink(&secret_path, &symlink_path).unwrap();
+        assert!(ControlSecret::from_hex_file(&symlink_path).is_err());
+
+        fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(ControlSecret::from_hex_file(&secret_path).is_err());
     }
 
     #[test]
@@ -1954,6 +2822,74 @@ mod tests {
     }
 
     #[test]
+    fn fleet_policy_requires_disjoint_domain_cid_group_and_pci_authority() {
+        let policy = DriverDomainFleetPolicy::parse(
+            "DRIVER_DOMAIN_FLEET_POLICY_SCHEMA=1\nFLEET_MEMBERS=linux-dvm-net0@4@17@0000:04:00.0+0000:04:00.1;linux-dvm-net1@5@18@0000:05:00.0\n",
+            "test",
+        )
+        .unwrap();
+        let first = ValidatedLease {
+            domain_id: "linux-dvm-net0".to_owned(),
+            dvm_guest_cid: 4,
+            iommu_group: 17,
+            pci_bdfs: vec!["0000:04:00.0".to_owned(), "0000:04:00.1".to_owned()],
+        };
+        policy.validate_for_lease(&first).unwrap();
+
+        let wrong_cid = ValidatedLease {
+            dvm_guest_cid: 5,
+            ..first.clone()
+        };
+        assert!(policy.validate_for_lease(&wrong_cid).is_err());
+        assert!(DriverDomainFleetPolicy::parse(
+            "DRIVER_DOMAIN_FLEET_POLICY_SCHEMA=1\nFLEET_MEMBERS=linux-dvm-net0@4@17@0000:04:00.0;linux-dvm-net1@4@18@0000:05:00.0\n",
+            "test",
+        )
+        .is_err());
+        assert!(DriverDomainFleetPolicy::parse(
+            "DRIVER_DOMAIN_FLEET_POLICY_SCHEMA=1\nFLEET_MEMBERS=linux-dvm-net0@4@17@0000:04:00.0;linux-dvm-net1@5@17@0000:05:00.0\n",
+            "test",
+        )
+        .is_err());
+        assert!(DriverDomainFleetPolicy::parse(
+            "DRIVER_DOMAIN_FLEET_POLICY_SCHEMA=1\nFLEET_MEMBERS=linux-dvm-net0@4@17@0000:04:00.0;linux-dvm-net1@5@18@0000:04:00.0\n",
+            "test",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn release_authorization_binds_artifacts_policy_and_complete_iommu_group() {
+        let lease = ValidatedLease {
+            domain_id: "linux-dvm-net0".to_owned(),
+            dvm_guest_cid: 4,
+            iommu_group: 17,
+            pci_bdfs: vec!["0000:04:00.0".to_owned(), "0000:04:00.1".to_owned()],
+        };
+        let digest = "a".repeat(64);
+        let authorization = ReleaseAuthorization::parse(
+            &format!(
+                "RELEASE_AUTHORIZATION_SCHEMA=1\nDOMAIN_ID=linux-dvm-net0\nDVM_GUEST_CID=4\nIOMMU_GROUP=17\nASSIGNED_PCI_BDFS=0000:04:00.0,0000:04:00.1\nDVM_ARTIFACT_MANIFEST_SHA256={digest}\nDEVICE_POLICY_SHA256={digest}\nFLEET_POLICY_SHA256={digest}\nNOT_BEFORE_UNIX=100\nNOT_AFTER_UNIX=200\n"
+            ),
+            "test",
+        )
+        .unwrap();
+        authorization.validate_for_lease(&lease, 150).unwrap();
+        assert_eq!(authorization.dvm_artifact_manifest_sha256(), digest);
+        assert!(authorization.validate_for_lease(&lease, 99).is_err());
+        assert!(authorization.validate_for_lease(&lease, 201).is_err());
+
+        let wrong_group = ReleaseAuthorization::parse(
+            &format!(
+                "RELEASE_AUTHORIZATION_SCHEMA=1\nDOMAIN_ID=linux-dvm-net0\nDVM_GUEST_CID=4\nIOMMU_GROUP=18\nASSIGNED_PCI_BDFS=0000:04:00.0,0000:04:00.1\nDVM_ARTIFACT_MANIFEST_SHA256={digest}\nDEVICE_POLICY_SHA256={digest}\nFLEET_POLICY_SHA256={digest}\nNOT_BEFORE_UNIX=100\nNOT_AFTER_UNIX=200\n"
+            ),
+            "test",
+        )
+        .unwrap();
+        assert!(wrong_group.validate_for_lease(&lease, 150).is_err());
+    }
+
+    #[test]
     fn launch_plan_requires_the_complete_iommu_group() {
         let sysfs = TestSysfs::new(&[(17, &["0000:04:00.0", "0000:04:00.1"])]);
         let plan = LaunchPlan::parse(
@@ -1995,8 +2931,8 @@ mod tests {
         ]);
         ops.overrides
             .insert("0000:02:00.0".to_owned(), "other-driver".to_owned());
-        let record = inspect_vfio_lease(&lease, &ops).unwrap();
-        acquire_vfio_lease(&record, &mut ops).unwrap();
+        let record = inspect_vfio_lease(&lease, &ops, release_binding()).unwrap();
+        acquire_vfio_lease(&record, &mut ops, 150).unwrap();
         assert_eq!(
             ops.current_driver("0000:02:00.0").unwrap().as_deref(),
             Some("vfio-pci")
@@ -2029,8 +2965,8 @@ mod tests {
             ("0000:02:00.1", Some("second-driver")),
         ]);
         ops.fail_bind = Some(("0000:02:00.1".to_owned(), "vfio-pci".to_owned()));
-        let record = inspect_vfio_lease(&lease, &ops).unwrap();
-        assert!(acquire_vfio_lease(&record, &mut ops).is_err());
+        let record = inspect_vfio_lease(&lease, &ops, release_binding()).unwrap();
+        assert!(acquire_vfio_lease(&record, &mut ops, 150).is_err());
         assert_eq!(
             ops.current_driver("0000:02:00.0").unwrap().as_deref(),
             Some("first-driver")
@@ -2040,6 +2976,36 @@ mod tests {
             Some("second-driver")
         );
         assert!(ops.overrides.is_empty());
+    }
+
+    #[test]
+    fn unsigned_vfio_preflight_cannot_persist_or_bind() {
+        let root = TestSysfs::new(&[]);
+        let lease = validated_lease(&["0000:02:00.0"]);
+        let mut ops = FakeVfioOps::with_drivers(&[("0000:02:00.0", Some("first-driver"))]);
+        let record = inspect_vfio_lease_preflight(&lease, &ops).unwrap();
+        let store = FileLeaseStore::new(root.path().join("leases"));
+        assert!(store.create_prepared(&record, 150).is_err());
+        assert!(acquire_vfio_lease(&record, &mut ops, 150).is_err());
+        assert_eq!(
+            ops.current_driver("0000:02:00.0").unwrap().as_deref(),
+            Some("first-driver")
+        );
+    }
+
+    #[test]
+    fn expired_release_binding_cannot_prepare_or_bind() {
+        let root = TestSysfs::new(&[]);
+        let lease = validated_lease(&["0000:02:00.0"]);
+        let mut ops = FakeVfioOps::with_drivers(&[("0000:02:00.0", Some("first-driver"))]);
+        let record = inspect_vfio_lease(&lease, &ops, release_binding()).unwrap();
+        let store = FileLeaseStore::new(root.path().join("leases"));
+        assert!(store.create_prepared(&record, 201).is_err());
+        assert!(acquire_vfio_lease(&record, &mut ops, 201).is_err());
+        assert_eq!(
+            ops.current_driver("0000:02:00.0").unwrap().as_deref(),
+            Some("first-driver")
+        );
     }
 
     #[test]
@@ -2056,13 +3022,14 @@ mod tests {
                 Some("rtsx-pci".to_owned()),
             )]),
             original_driver_overrides: BTreeMap::from([("0000:02:00.0".to_owned(), String::new())]),
+            release_binding: Some(release_binding()),
         };
-        store.create_prepared(&record).unwrap();
+        store.create_prepared(&record, 150).unwrap();
         assert_eq!(
             store.load("linux-dvm-net0").unwrap().state,
             VfioLeaseState::Prepared
         );
-        store.mark_active(&mut record).unwrap();
+        store.mark_active(&mut record, 150).unwrap();
         assert_eq!(
             store.load("linux-dvm-net0").unwrap().state,
             VfioLeaseState::Active
@@ -2077,6 +3044,11 @@ mod tests {
             iommu_group: 15,
             pci_bdfs: bdfs.iter().map(|bdf| (*bdf).to_owned()).collect(),
         }
+    }
+
+    fn release_binding() -> VfioReleaseBinding {
+        let digest = "a".repeat(64);
+        VfioReleaseBinding::new(&digest, &digest, &digest, &digest, 100, 200).unwrap()
     }
 
     struct FakeVfioOps {

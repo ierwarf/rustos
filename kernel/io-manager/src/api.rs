@@ -221,10 +221,14 @@ pub mod console {
 }
 
 pub mod network {
-    pub use crate::network::{PACKET_MTU, PacketError};
+    pub use crate::network::{PACKET_MTU, PacketError, PacketTransportStatus};
 
     pub fn available() -> bool {
         crate::network::available()
+    }
+
+    pub fn transport_status() -> PacketTransportStatus {
+        crate::network::transport_status()
     }
 
     pub fn transmit_frame(frame: &[u8]) -> Result<usize, PacketError> {

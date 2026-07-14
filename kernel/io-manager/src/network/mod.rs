@@ -4,6 +4,15 @@
 pub const PACKET_MTU: usize = rustos_user_abi::syscall::NET_BROKER_PACKET_MTU;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u64)]
+pub enum PacketTransportStatus {
+    Unavailable = rustos_user_abi::syscall::NET_BROKER_PACKET_STATUS_UNAVAILABLE,
+    AwaitingAuthenticatedControl =
+        rustos_user_abi::syscall::NET_BROKER_PACKET_STATUS_AWAITING_AUTHENTICATED_CONTROL,
+    Active = rustos_user_abi::syscall::NET_BROKER_PACKET_STATUS_ACTIVE,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PacketError {
     NoDevice,
     Invalid,
@@ -13,7 +22,11 @@ pub enum PacketError {
 }
 
 pub fn available() -> bool {
-    crate::io::dvm_network::available()
+    transport_status() == PacketTransportStatus::Active
+}
+
+pub fn transport_status() -> PacketTransportStatus {
+    crate::io::dvm_network::transport_status()
 }
 
 pub fn transmit_frame(frame: &[u8]) -> Result<usize, PacketError> {

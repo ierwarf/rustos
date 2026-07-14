@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/input.h>
+#include <linux/if_alg.h>
 #include <linux/uinput.h>
 #include <linux/vm_sockets.h>
 #include <poll.h>
@@ -18,6 +19,7 @@
 #include <string.h>
 #include <time.h>
 #include <sys/socket.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
@@ -26,9 +28,16 @@
 #define CONTROL_FILE "/usr/share/rustos-dvm/control-plane-v1.env"
 #define READY_DIR "/run/rustos-dvm"
 #define READY_FILE READY_DIR "/ready"
-#define CONTROL_PORT 40500U
+#define CONTROL_PORT_FLOOR 49152U
+#define CONTROL_PORT_SPAN (UINT32_MAX - CONTROL_PORT_FLOOR + 1U)
 #define MAX_FRAME 4096U
 #define HOST_CID VMADDR_CID_HOST
+#define CONTROL_SECRET_BYTES 32U
+#define CONTROL_SECRET_HEX_BYTES (CONTROL_SECRET_BYTES * 2U)
+#define CONTROL_SECRET_FW_CFG \
+    "/sys/firmware/qemu_fw_cfg/by_name/opt/rustos/dvm-control-secret/raw"
+#define CONTROL_PROOF_CONTEXT "rustos-dvm-control-hmac-v1"
+#define CONTROL_PROOF_CONTEXT_BYTES (sizeof(CONTROL_PROOF_CONTEXT))
 #define INPUT_EVENT_LIMIT 64U
 #define INPUT_BITS_BYTES ((KEY_MAX / 8U) + 1U)
 #define POINTER_BUTTON_MASK 0x1fU
@@ -281,7 +290,7 @@ static void parse_contract(struct control_contract *contract) {
     if (seen != 0x3fU || strcmp(contract->schema, "1") != 0 ||
         strcmp(contract->protocol, "agent-v1") != 0 ||
         strcmp(contract->state, "control") != 0 || strcmp(contract->transport, "kvm-vsock") != 0 ||
-        strcmp(contract->authentication, "kvm-host-bound") != 0 ||
+        strcmp(contract->authentication, "dvm-agent-hmac-sha256-v1") != 0 ||
         strcmp(contract->capabilities,
                "health,device-inventory,driver-inventory,input-stream") != 0) {
         die("unsupported control contract");
@@ -344,6 +353,174 @@ static int read_all(int fd, void *buffer, size_t length) {
         cursor += (size_t)received;
         length -= (size_t)received;
     }
+    return 0;
+}
+
+static int hex_nibble(char value, unsigned char *decoded) {
+    if (value >= '0' && value <= '9') {
+        *decoded = (unsigned char)(value - '0');
+        return 0;
+    }
+    if (value >= 'a' && value <= 'f') {
+        *decoded = (unsigned char)(value - 'a' + 10);
+        return 0;
+    }
+    if (value >= 'A' && value <= 'F') {
+        *decoded = (unsigned char)(value - 'A' + 10);
+        return 0;
+    }
+    errno = EINVAL;
+    return -1;
+}
+
+static int decode_hex_exact(const char *encoded, size_t encoded_length, unsigned char *decoded,
+                            size_t decoded_length) {
+    size_t index;
+
+    if (encoded_length != decoded_length * 2U) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (index = 0; index < decoded_length; index++) {
+        unsigned char high;
+        unsigned char low;
+        if (hex_nibble(encoded[index * 2U], &high) != 0 ||
+            hex_nibble(encoded[index * 2U + 1U], &low) != 0) {
+            return -1;
+        }
+        decoded[index] = (unsigned char)((high << 4U) | low);
+    }
+    return 0;
+}
+
+static void encode_hex(const unsigned char *decoded, size_t decoded_length, char *encoded) {
+    static const char hex[] = "0123456789abcdef";
+    size_t index;
+
+    for (index = 0; index < decoded_length; index++) {
+        encoded[index * 2U] = hex[decoded[index] >> 4U];
+        encoded[index * 2U + 1U] = hex[decoded[index] & 0x0fU];
+    }
+    encoded[decoded_length * 2U] = '\0';
+}
+
+static int read_control_secret(unsigned char secret[CONTROL_SECRET_BYTES]) {
+    char encoded[CONTROL_SECRET_HEX_BYTES];
+    unsigned char extra;
+    int fd;
+    int result = -1;
+    ssize_t bytes;
+    size_t index;
+
+    /* qemu_fw_cfg's `raw` file is mode 0400 in the kernel. Requiring root
+     * here keeps the per-launch secret out of ordinary processes sharing the
+     * DVM CID; privileged guest code remains explicitly inside the DVM TCB. */
+    if (geteuid() != 0) {
+        errno = EPERM;
+        return -1;
+    }
+    fd = open(CONTROL_SECRET_FW_CFG, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return -1;
+    }
+    if (read_all(fd, encoded, sizeof(encoded)) != 0) {
+        goto out;
+    }
+    do {
+        bytes = read(fd, &extra, sizeof(extra));
+    } while (bytes < 0 && errno == EINTR);
+    if (bytes != 0 ||
+        decode_hex_exact(encoded, sizeof(encoded), secret, CONTROL_SECRET_BYTES) != 0) {
+        errno = EINVAL;
+        goto out;
+    }
+    for (index = 0; index < CONTROL_SECRET_BYTES; index++) {
+        if (secret[index] != 0) {
+            result = 0;
+            break;
+        }
+    }
+    if (result != 0) {
+        errno = EINVAL;
+    }
+out:
+    if (close(fd) != 0 && result == 0) {
+        result = -1;
+    }
+    if (result != 0) {
+        memset(secret, 0, CONTROL_SECRET_BYTES);
+    }
+    return result;
+}
+
+static int hmac_sha256(const unsigned char secret[CONTROL_SECRET_BYTES], const unsigned char *message,
+                       size_t message_length, unsigned char digest[CONTROL_SECRET_BYTES]) {
+    struct sockaddr_alg address;
+    int algorithm_fd = -1;
+    int operation_fd = -1;
+    int result = -1;
+
+    memset(&address, 0, sizeof(address));
+    address.salg_family = AF_ALG;
+    memcpy(address.salg_type, "hash", sizeof("hash"));
+    memcpy(address.salg_name, "hmac(sha256)", sizeof("hmac(sha256)"));
+    algorithm_fd = socket(AF_ALG, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    if (algorithm_fd < 0 ||
+        bind(algorithm_fd, (const struct sockaddr *)&address, sizeof(address)) != 0 ||
+        setsockopt(algorithm_fd, SOL_ALG, ALG_SET_KEY, secret, CONTROL_SECRET_BYTES) != 0) {
+        goto out;
+    }
+    operation_fd = accept4(algorithm_fd, NULL, NULL, SOCK_CLOEXEC);
+    if (operation_fd < 0 || write_all(operation_fd, message, message_length) != 0 ||
+        read_all(operation_fd, digest, CONTROL_SECRET_BYTES) != 0) {
+        goto out;
+    }
+    result = 0;
+out:
+    if (operation_fd >= 0) {
+        close(operation_fd);
+    }
+    if (algorithm_fd >= 0) {
+        close(algorithm_fd);
+    }
+    return result;
+}
+
+static int parse_challenge(const char *payload, unsigned char nonce[CONTROL_SECRET_BYTES]) {
+    static const char prefix[] = "CHALLENGE\nnonce=";
+    size_t length = strlen(payload);
+
+    if (length != sizeof(prefix) - 1U + CONTROL_SECRET_HEX_BYTES ||
+        memcmp(payload, prefix, sizeof(prefix) - 1U) != 0) {
+        errno = EPROTO;
+        return -1;
+    }
+    return decode_hex_exact(payload + sizeof(prefix) - 1U, CONTROL_SECRET_HEX_BYTES, nonce,
+                            CONTROL_SECRET_BYTES);
+}
+
+static int make_control_proof(const unsigned char secret[CONTROL_SECRET_BYTES],
+                              const unsigned char nonce[CONTROL_SECRET_BYTES], const char *hello,
+                              char proof[sizeof("PROOF\nmac=") + CONTROL_SECRET_HEX_BYTES]) {
+    unsigned char transcript[CONTROL_PROOF_CONTEXT_BYTES + CONTROL_SECRET_BYTES + MAX_FRAME];
+    unsigned char digest[CONTROL_SECRET_BYTES];
+    size_t hello_length = strlen(hello);
+
+    if (hello_length > MAX_FRAME) {
+        errno = EMSGSIZE;
+        return -1;
+    }
+    memcpy(transcript, CONTROL_PROOF_CONTEXT, CONTROL_PROOF_CONTEXT_BYTES);
+    memcpy(transcript + CONTROL_PROOF_CONTEXT_BYTES, nonce, CONTROL_SECRET_BYTES);
+    memcpy(transcript + CONTROL_PROOF_CONTEXT_BYTES + CONTROL_SECRET_BYTES, hello, hello_length);
+    if (hmac_sha256(secret, transcript,
+                    CONTROL_PROOF_CONTEXT_BYTES + CONTROL_SECRET_BYTES + hello_length, digest) != 0) {
+        return -1;
+    }
+    memcpy(proof, "PROOF\nmac=", sizeof("PROOF\nmac=") - 1U);
+    encode_hex(digest, sizeof(digest), proof + sizeof("PROOF\nmac=") - 1U);
+    memset(digest, 0, sizeof(digest));
+    memset(transcript, 0, sizeof(transcript));
     return 0;
 }
 
@@ -752,10 +929,13 @@ static int stream_input_devices(int control_fd, int keyboard_fd, int pointer_fd,
 }
 
 static int serve_connection(int fd, const struct control_contract *contract,
-                            struct input_selftest *selftest) {
+                            struct input_selftest *selftest,
+                            const unsigned char secret[CONTROL_SECRET_BYTES]) {
     char payload[MAX_FRAME + 1];
     char hello[MAX_FRAME + 1];
     char welcome[192];
+    char proof[sizeof("PROOF\nmac=") + CONTROL_SECRET_HEX_BYTES];
+    unsigned char nonce[CONTROL_SECRET_BYTES];
     unsigned int id;
     unsigned int inventory;
 
@@ -767,6 +947,8 @@ static int serve_connection(int fd, const struct control_contract *contract,
     snprintf(welcome, sizeof(welcome), "WELCOME\nprotocol=%s\ncapabilities=%s", contract->protocol,
              contract->capabilities);
     if (send_frame(fd, hello) != 0 || receive_frame(fd, payload, sizeof(payload)) != 0 ||
+        parse_challenge(payload, nonce) != 0 || make_control_proof(secret, nonce, hello, proof) != 0 ||
+        send_frame(fd, proof) != 0 || receive_frame(fd, payload, sizeof(payload)) != 0 ||
         strcmp(payload, welcome) != 0) {
         return -1;
     }
@@ -859,11 +1041,21 @@ static int serve_connection(int fd, const struct control_contract *contract,
     }
 }
 
-static int connect_host(void) {
+static uint32_t control_port_from_secret(const unsigned char secret[CONTROL_SECRET_BYTES]) {
+    uint32_t entropy = ((uint32_t)secret[0] << 24U) | ((uint32_t)secret[1] << 16U) |
+                       ((uint32_t)secret[2] << 8U) | (uint32_t)secret[3];
+
+    /* This must match ControlSecret::control_port() in the L0 broker.  The
+     * root-only fw_cfg secret therefore also hides the per-launch vsock endpoint
+     * from ordinary processes that share this DVM CID. */
+    return CONTROL_PORT_FLOOR + entropy % CONTROL_PORT_SPAN;
+}
+
+static int connect_host(uint32_t control_port) {
     int fd;
     struct sockaddr_vm address = {
         .svm_family = AF_VSOCK,
-        .svm_port = CONTROL_PORT,
+        .svm_port = control_port,
         .svm_cid = HOST_CID,
     };
     fd = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -879,7 +1071,16 @@ static int connect_host(void) {
 
 static void serve(const struct control_contract *contract) {
     struct input_selftest selftest;
+    unsigned char secret[CONTROL_SECRET_BYTES];
+    uint32_t control_port;
 
+    if (read_control_secret(secret) != 0) {
+        die("load owner-provisioned DVM control secret failed");
+    }
+    control_port = control_port_from_secret(secret);
+    if (prctl(PR_SET_DUMPABLE, 0) != 0) {
+        die("disable DVM control agent dumpability failed");
+    }
     if (input_selftest_start(&selftest) != 0) {
         die("input selftest requested but uinput setup failed");
     }
@@ -888,9 +1089,9 @@ static void serve(const struct control_contract *contract) {
             contract->state);
     fflush(stderr);
     for (;;) {
-        int fd = connect_host();
+        int fd = connect_host(control_port);
         if (fd >= 0) {
-            if (serve_connection(fd, contract, &selftest) != 0) {
+            if (serve_connection(fd, contract, &selftest, secret) != 0) {
                 fprintf(stderr, "rustos-dvm-agent: host control disconnected\n");
             }
             close(fd);

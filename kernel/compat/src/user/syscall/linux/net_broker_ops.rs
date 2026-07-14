@@ -38,7 +38,7 @@ fn dispatch_net_broker(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
 }
 
 fn broker_packet_status() -> Result<u64, i64> {
-    Ok(u64::from(kernel_io_manager::api::network::available()))
+    Ok(kernel_io_manager::api::network::transport_status() as u64)
 }
 
 fn broker_packet_tx(args: &RustosNetBrokerArgs) -> Result<u64, i64> {

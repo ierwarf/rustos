@@ -74,8 +74,19 @@ grant RustOS host authority.
   hashed into its artifact manifest, and written by the agent to
   `/run/rustos-dvm/ready`. In `state=control`, the agent connects only to the
   L0 host's KVM-vsock listener using its launch-assigned CID.
-- L0 validates the source CID and complete DVM contract before it requests
-  health, PCI inventory, and the `input-stream` service. The agent discovers
+- L0 validates the source CID and complete DVM contract, then sends a fresh
+  challenge. The agent must return `dvm-agent-hmac-sha256-v1`, an HMAC-SHA256
+  proof over the challenge and exact HELLO bytes using the per-launch 256-bit
+  secret. Its first four bytes also derive the per-launch private KVM-vsock
+  listener port on both sides, so a same-CID ordinary process cannot reserve
+  the pre-authentication setup slot. L0 writes `WELCOME` only after that proof
+  succeeds; all failed or
+  timed-out proofs close the connection without a probe or input relay. The
+  secret is generated and retained by L0, injected as QEMU fw_cfg, and read
+  through its root-only `raw` attribute. This authenticates the DVM control
+  agent against ordinary same-CID guest processes; guest root and the
+  hypervisor remain explicit TCB boundaries. Only then does L0 request health,
+  PCI inventory, and the `input-stream` service. The agent discovers
   a keyboard through `KEY_A`/`KEY_Z`/`KEY_SPACE` capabilities and a relative
   pointer through `REL_X`/`REL_Y`/`BTN_LEFT`; it does not trust a QEMU device
   name. It reports key records plus one coalesced pointer packet per
@@ -91,12 +102,20 @@ grant RustOS host authority.
   session end; `inputd` clears remaining DVM-only state. QMP and synthetic
   PS/2 injection are not part of this path. KVM smoke proves the authenticated
   relay endpoint, not a fabricated key; a real event requires an input
-controller assigned to DVM.
+  controller assigned to DVM. In the current combined-DVM profile, that same
+  L0-authenticated start/end epoch is also a lifecycle lease for RustOS's
+  independently bounded Ethernet ivshmem provider. It does not carry Ethernet
+  data: RustOS requires both the fixed mapped ring and this live lease, and an
+  exact end makes later packet operations fail closed. DVM-writable ring state
+  cannot create or extend the lease; a future network-only DVM needs its own
+  authenticated lifecycle channel.
 - `rustos-hostd relay-input` is a reconnecting L0 service by default. A DVM
   agent reconnect or a RustOS serial endpoint restart creates a fresh epoch;
   the diagnostic `--once` mode is the only one that exits on the first error.
 - This low-rate relay is intentionally not a network, block, display, or GPU
-  data plane. Those classes require separately versioned paravirtual
+  data plane. Its authenticated session markers may gate the current combined
+  DVM's separately bounded Ethernet backend, but no network payload uses this
+  relay. Those classes require separately versioned paravirtual
   frontends/backends with queue, DMA, cancellation, reset, and revocation
   semantics. The common pattern remains: DVM identifies the device, L0
   validates ownership and protocol, then RustOS policy services consume the

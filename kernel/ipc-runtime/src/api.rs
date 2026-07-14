@@ -17,6 +17,10 @@ pub mod endpoint {
         crate::ipc::create_endpoint_for_task(Some(owner_task_id))
     }
 
+    pub fn create_for_process(owner_process_id: u64) -> Result<KernelEndpointHandle, IpcError> {
+        crate::ipc::create_endpoint_for_process(owner_process_id)
+    }
+
     pub fn enqueue_call(
         endpoint: KernelEndpointHandle,
         caller_task_id: u64,
@@ -83,6 +87,13 @@ pub mod endpoint {
         crate::ipc::authorize_endpoint_receiver(endpoint, receiver_task_id)
     }
 
+    pub fn authorize_receiver_for_process(
+        endpoint: KernelEndpointHandle,
+        receiver_process_id: u64,
+    ) -> Result<(), IpcError> {
+        crate::ipc::authorize_endpoint_receiver_for_process(endpoint, receiver_process_id)
+    }
+
     pub fn add_receiver_waiter(
         endpoint: KernelEndpointHandle,
         task_id: u64,
@@ -119,6 +130,28 @@ pub mod endpoint {
         crate::ipc::complete_endpoint_reply_with_handles_for_task(
             reply,
             receiver_task_id,
+            response,
+            attached_handles,
+        )
+    }
+
+    pub fn reply_for_process(
+        reply: KernelReplyHandle,
+        receiver_process_id: u64,
+        response: &[u8],
+    ) -> Result<u64, IpcError> {
+        crate::ipc::complete_endpoint_reply_for_process(reply, receiver_process_id, response)
+    }
+
+    pub fn reply_with_handles_for_process(
+        reply: KernelReplyHandle,
+        receiver_process_id: u64,
+        response: &[u8],
+        attached_handles: &[KernelTransferredHandle],
+    ) -> Result<u64, IpcError> {
+        crate::ipc::complete_endpoint_reply_with_handles_for_process(
+            reply,
+            receiver_process_id,
             response,
             attached_handles,
         )
@@ -166,6 +199,10 @@ pub mod endpoint {
     pub fn fail_owned_by_task(task_id: u64, err: IpcError) -> EndpointWakeSet {
         crate::ipc::fail_endpoints_owned_by_task(task_id, err)
     }
+
+    pub fn fail_owned_by_process(process_id: u64, err: IpcError) -> EndpointWakeSet {
+        crate::ipc::fail_endpoints_owned_by_process(process_id, err)
+    }
 }
 
 pub mod region {
@@ -187,18 +224,24 @@ pub mod region {
 
 pub use endpoint::{
     add_receiver_waiter as add_endpoint_receiver_waiter,
-    authorize_receiver as authorize_endpoint_receiver, cancel_call as cancel_endpoint_call,
+    authorize_receiver as authorize_endpoint_receiver,
+    authorize_receiver_for_process as authorize_endpoint_receiver_for_process,
+    cancel_call as cancel_endpoint_call,
     cancel_call_with_transfers as cancel_endpoint_call_with_transfers,
     cancel_calls_for_task as cancel_endpoint_calls_for_task, create as create_endpoint,
-    create_for_task as create_endpoint_for_task, enqueue_call as enqueue_endpoint_call,
+    create_for_process as create_endpoint_for_process, create_for_task as create_endpoint_for_task,
+    enqueue_call as enqueue_endpoint_call,
     enqueue_call_with_handles as enqueue_endpoint_call_with_handles,
+    fail_owned_by_process as fail_endpoints_owned_by_process,
     fail_owned_by_task as fail_endpoints_owned_by_task, recv as recv_endpoint,
     recv_with_limit as recv_endpoint_with_limit,
     recv_with_limits_and_handles as recv_endpoint_with_limits_and_handles,
     recv_with_sender_and_limits as recv_endpoint_with_sender_and_limits,
     remove_waiters_for_task as remove_endpoint_waiters_for_task, reply as complete_endpoint_reply,
+    reply_for_process as complete_endpoint_reply_for_process,
     reply_for_task as complete_endpoint_reply_for_task,
     reply_with_handles as complete_endpoint_reply_with_handles,
+    reply_with_handles_for_process as complete_endpoint_reply_with_handles_for_process,
     reply_with_handles_for_task as complete_endpoint_reply_with_handles_for_task,
     take_response as take_endpoint_response,
     take_response_detailed as take_endpoint_response_detailed,

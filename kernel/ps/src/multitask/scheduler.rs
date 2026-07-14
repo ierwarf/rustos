@@ -2665,6 +2665,40 @@ impl Scheduler {
         true
     }
 
+    /// Retire every thread of one user process.  Privileged lifecycle brokers
+    /// use this only after marking process authority unavailable and recording
+    /// its exit; task-only retirement would otherwise leave sibling threads
+    /// and process-owned endpoint state live.
+    pub(super) fn terminate_user_process(
+        &mut self,
+        process_id: u64,
+        requested_by_pid: Option<u64>,
+    ) -> bool {
+        let Some(leader_slot) = self.find_user_task_slot(process_id) else {
+            return false;
+        };
+        let Some(process_handle) =
+            self.contexts[leader_slot].and_then(|context| context.process_handle)
+        else {
+            return false;
+        };
+        if self.retired[leader_slot] {
+            return false;
+        }
+        let (sibling_slots, sibling_count) =
+            self.collect_process_sibling_slots(leader_slot, process_handle);
+        for slot in sibling_slots.into_iter().take(sibling_count) {
+            if !self.retired[slot] {
+                self.retire_slot(slot, TaskRetireReason::Terminated { requested_by_pid });
+            }
+        }
+        self.retire_slot(
+            leader_slot,
+            TaskRetireReason::Terminated { requested_by_pid },
+        );
+        true
+    }
+
     pub(super) fn block_current_user_task(&mut self) -> bool {
         let slot = self.current_task;
         let Some(context) = self.contexts[slot].as_mut() else {
@@ -3166,5 +3200,37 @@ mod tests {
         let (task_ids, count) = scheduler.current_process_task_ids();
         assert_eq!(count, 2);
         assert_eq!(&task_ids[..count], &[101, 102]);
+    }
+
+    #[test]
+    fn terminate_user_process_retires_every_live_sibling() {
+        let mut scheduler = Box::<Scheduler>::new_uninit();
+        unsafe {
+            scheduler.as_mut_ptr().write_bytes(0, 1);
+        }
+        let mut scheduler = unsafe { scheduler.assume_init() };
+        let owner = test_process(41);
+        let other = test_process(42);
+
+        scheduler.contexts[1] = Some(test_user_context(owner));
+        scheduler.contexts[2] = Some(test_user_context(owner));
+        scheduler.contexts[3] = Some(test_user_context(other));
+        scheduler.starts[1] = Some(TaskStart {
+            entry: noop_task_entry,
+            id: 41,
+        });
+        scheduler.starts[2] = Some(TaskStart {
+            entry: noop_task_entry,
+            id: 43,
+        });
+        scheduler.starts[3] = Some(TaskStart {
+            entry: noop_task_entry,
+            id: 42,
+        });
+
+        assert!(scheduler.terminate_user_process(41, Some(7)));
+        assert!(scheduler.retired[1]);
+        assert!(scheduler.retired[2]);
+        assert!(!scheduler.retired[3]);
     }
 }

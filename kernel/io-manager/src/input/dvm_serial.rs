@@ -89,6 +89,16 @@ impl Decoder {
                     && sequence == 0
                     && self.bytes[16..28].iter().all(|&byte| byte == 0) =>
             {
+                // A new authenticated relay epoch revokes every prior DVM
+                // key/button assertion, including a session that died before
+                // it could send SESSION_END.  The reset barrier also purges
+                // queued retired-session frames before this epoch starts.
+                let _ = submit_dvm_input_reset();
+                // RDI1 session markers are L0-authenticated lifecycle
+                // signals, not guest-provided input. The fixed Ethernet ring
+                // reuses only this lifecycle lease: no network frame travels
+                // over COM2 and a DVM-writable ring header cannot activate it.
+                activate_network_control_from_session(epoch);
                 self.epoch = epoch;
                 self.sequence = 0;
                 false
@@ -112,7 +122,7 @@ impl Decoder {
                     _ => return false,
                 };
                 self.sequence = sequence;
-                crate::input::event_queue::submit_dvm_linux_key(action, code)
+                submit_dvm_linux_key(action, code)
             }
             KIND_POINTER
                 if epoch == self.epoch
@@ -121,7 +131,7 @@ impl Decoder {
                     && self.bytes[24] & !POINTER_BUTTON_MASK == 0 =>
             {
                 self.sequence = sequence;
-                crate::input::event_queue::submit_dvm_pointer_packet(PointerPacket {
+                submit_dvm_pointer_packet(PointerPacket {
                     buttons: self.bytes[24],
                     reserved0: 0,
                     reserved1: 0,
@@ -143,9 +153,12 @@ impl Decoder {
                     && self.sequence.checked_add(1) == Some(sequence)
                     && self.bytes[16..28].iter().all(|&byte| byte == 0) =>
             {
+                // Exact-epoch revoke prevents a delayed cleanup from an old
+                // L0 relay session from disabling a newer authenticated DVM.
+                revoke_network_control_from_session(epoch);
                 self.epoch = 0;
                 self.sequence = 0;
-                crate::input::event_queue::submit_dvm_input_reset();
+                let _ = submit_dvm_input_reset();
                 false
             }
             _ => false,
@@ -203,6 +216,68 @@ pub(crate) fn service_pending() -> usize {
         accepted += decoder.feed(byte);
     }
     accepted
+}
+
+fn activate_network_control_from_session(epoch: u32) {
+    #[cfg(not(test))]
+    {
+        let _ = crate::io::dvm_network::activate_authenticated_control(epoch);
+    }
+    #[cfg(test)]
+    {
+        // Decoder tests have no live COM2/PCI topology. Lease semantics are
+        // covered by dvm_network's host-independent ControlLease tests.
+        let _ = epoch;
+    }
+}
+
+fn revoke_network_control_from_session(epoch: u32) {
+    #[cfg(not(test))]
+    {
+        let _ = crate::io::dvm_network::revoke_authenticated_control(epoch);
+    }
+    #[cfg(test)]
+    {
+        let _ = epoch;
+    }
+}
+
+fn submit_dvm_input_reset() -> bool {
+    #[cfg(not(test))]
+    {
+        crate::input::event_queue::submit_dvm_input_reset()
+    }
+    #[cfg(test)]
+    {
+        // Decoder tests validate framing/order only. Queue/barrier behavior is
+        // tested in input::event_queue and must not invoke scheduler wakeups
+        // from a host unit-test thread.
+        true
+    }
+}
+
+fn submit_dvm_linux_key(action: u16, code: u16) -> bool {
+    #[cfg(not(test))]
+    {
+        crate::input::event_queue::submit_dvm_linux_key(action, code)
+    }
+    #[cfg(test)]
+    {
+        let _ = (action, code);
+        true
+    }
+}
+
+fn submit_dvm_pointer_packet(packet: PointerPacket) -> bool {
+    #[cfg(not(test))]
+    {
+        crate::input::event_queue::submit_dvm_pointer_packet(packet)
+    }
+    #[cfg(test)]
+    {
+        let _ = packet;
+        true
+    }
 }
 
 fn crc32(bytes: &[u8]) -> u32 {

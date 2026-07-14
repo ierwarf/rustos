@@ -6,6 +6,9 @@ pub const DISPLAY_IOCTL_TYPE: u8 = b'D';
 
 pub const DISPLAY_INFO_FLAG_BOOT_FRAMEBUFFER: u32 = 1 << 0;
 pub const DISPLAY_INFO_FLAG_PRIMARY_PROVIDER: u32 = 1 << 1;
+/// The physical scanout is owned by a driver-domain relay. It is usable for
+/// normal desktop presentation but is not an attested trusted-UI channel.
+pub const DISPLAY_INFO_FLAG_DVM_SCANOUT: u32 = 1 << 2;
 
 pub const PIXEL_FORMAT_BGRA8888: u32 = ui::PIXEL_FORMAT_BGRA8888;
 pub const INPUT_KIND_KEYBOARD: u16 = ui::INPUT_KIND_KEYBOARD;
@@ -65,6 +68,10 @@ impl DisplayInfo {
 
     pub const fn is_primary_provider(self) -> bool {
         self.flags & DISPLAY_INFO_FLAG_PRIMARY_PROVIDER != 0
+    }
+
+    pub const fn is_dvm_scanout(self) -> bool {
+        self.flags & DISPLAY_INFO_FLAG_DVM_SCANOUT != 0
     }
 }
 

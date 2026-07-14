@@ -311,15 +311,15 @@ fn wake_exited_service_endpoint_waiters(process_id: u64) {
 // RING3-MIGRATION-REFERENCE END: rootd-owned service lookup and capability checks.
 
 pub(super) fn syscall_linux_rustos_ipc_endpoint_create() -> u64 {
-    let Some(task_id) = multitask::current_task_id() else {
+    let Some(process_id) = multitask::current_user_process_id() else {
         return linux_errno(LINUX_EINVAL);
     };
-    ipc_trace!("ipc endpoint create: task={}", task_id);
-    match kernel_ipc_runtime::api::create_endpoint_for_task(task_id) {
+    ipc_trace!("ipc endpoint create: process={}", process_id);
+    match kernel_ipc_runtime::api::create_endpoint_for_process(process_id) {
         Ok(endpoint) => {
             ipc_trace!(
-                "ipc endpoint created: task={} endpoint={}",
-                task_id,
+                "ipc endpoint created: process={} endpoint={}",
+                process_id,
                 endpoint.raw()
             );
             endpoint.raw()
@@ -791,7 +791,12 @@ pub(super) fn syscall_linux_rustos_ipc_recv(
     let Some(task_id) = multitask::current_task_id() else {
         return linux_errno(LINUX_EINVAL);
     };
-    if let Err(err) = kernel_ipc_runtime::api::authorize_endpoint_receiver(endpoint, task_id) {
+    let Some(process_id) = multitask::current_user_process_id() else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    if let Err(err) =
+        kernel_ipc_runtime::api::authorize_endpoint_receiver_for_process(endpoint, process_id)
+    {
         return linux_errno(ipc_error_to_linux_errno(err));
     }
     ipc_trace!(
@@ -917,7 +922,12 @@ pub(super) fn syscall_linux_rustos_ipc_recv_with_sender(
     let Some(task_id) = multitask::current_task_id() else {
         return linux_errno(LINUX_EINVAL);
     };
-    if let Err(err) = kernel_ipc_runtime::api::authorize_endpoint_receiver(endpoint, task_id) {
+    let Some(process_id) = multitask::current_user_process_id() else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    if let Err(err) =
+        kernel_ipc_runtime::api::authorize_endpoint_receiver_for_process(endpoint, process_id)
+    {
         return linux_errno(ipc_error_to_linux_errno(err));
     }
     let Ok(request_capacity) = usize::try_from(request_capacity) else {
@@ -1011,8 +1021,8 @@ fn recv_endpoint_once(
     reply_cap_ptr: u64,
 ) -> Result<usize, i64> {
     let endpoint = KernelEndpointHandle::from_raw(endpoint);
-    let task_id = multitask::current_task_id().ok_or(LINUX_EINVAL)?;
-    kernel_ipc_runtime::api::authorize_endpoint_receiver(endpoint, task_id)
+    let process_id = multitask::current_user_process_id().ok_or(LINUX_EINVAL)?;
+    kernel_ipc_runtime::api::authorize_endpoint_receiver_for_process(endpoint, process_id)
         .map_err(ipc_error_to_linux_errno)?;
     let request_capacity = usize::try_from(request_capacity).map_err(|_| LINUX_EINVAL)?;
     match kernel_ipc_runtime::api::recv_endpoint_with_limit(endpoint, request_capacity) {
@@ -1039,8 +1049,8 @@ fn recv_endpoint_once_with_sender(
     sender_tid_ptr: u64,
 ) -> Result<usize, i64> {
     let endpoint = KernelEndpointHandle::from_raw(endpoint);
-    let task_id = multitask::current_task_id().ok_or(LINUX_EINVAL)?;
-    kernel_ipc_runtime::api::authorize_endpoint_receiver(endpoint, task_id)
+    let process_id = multitask::current_user_process_id().ok_or(LINUX_EINVAL)?;
+    kernel_ipc_runtime::api::authorize_endpoint_receiver_for_process(endpoint, process_id)
         .map_err(ipc_error_to_linux_errno)?;
     let request_capacity = usize::try_from(request_capacity).map_err(|_| LINUX_EINVAL)?;
     if request_capacity > rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES {
@@ -1093,12 +1103,12 @@ pub(super) fn syscall_linux_rustos_ipc_reply(
         Err(errno) => return linux_errno(errno),
     };
     let copy_ticks = crate::arch::rtc::ticks();
-    let Some(receiver_task_id) = multitask::current_task_id() else {
+    let Some(receiver_process_id) = multitask::current_user_process_id() else {
         return linux_errno(LINUX_EINVAL);
     };
-    let task_id = match kernel_ipc_runtime::api::complete_endpoint_reply_for_task(
+    let task_id = match kernel_ipc_runtime::api::complete_endpoint_reply_for_process(
         KernelReplyHandle::from_raw(reply),
-        receiver_task_id,
+        receiver_process_id,
         response.as_slice(),
     ) {
         Ok(task_id) => task_id,
@@ -1239,7 +1249,12 @@ pub(super) fn syscall_linux_rustos_ipc_recv_with_handles(args_ptr: u64) -> u64 {
     let Some(task_id) = multitask::current_task_id() else {
         return linux_errno(LINUX_EINVAL);
     };
-    if let Err(err) = kernel_ipc_runtime::api::authorize_endpoint_receiver(endpoint, task_id) {
+    let Some(process_id) = multitask::current_user_process_id() else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    if let Err(err) =
+        kernel_ipc_runtime::api::authorize_endpoint_receiver_for_process(endpoint, process_id)
+    {
         return linux_errno(ipc_error_to_linux_errno(err));
     }
     let Ok(request_capacity) = usize::try_from(args.request_capacity) else {
@@ -1355,13 +1370,13 @@ pub(super) fn syscall_linux_rustos_ipc_reply_with_handles(args_ptr: u64) -> u64 
         Ok(handles) => handles,
         Err(errno) => return linux_errno(errno),
     };
-    let Some(receiver_task_id) = multitask::current_task_id() else {
+    let Some(receiver_process_id) = multitask::current_user_process_id() else {
         drop_transfer_descriptors(send_handles.as_slice());
         return linux_errno(LINUX_EINVAL);
     };
-    let task_id = match kernel_ipc_runtime::api::complete_endpoint_reply_with_handles_for_task(
+    let task_id = match kernel_ipc_runtime::api::complete_endpoint_reply_with_handles_for_process(
         KernelReplyHandle::from_raw(args.reply_cap),
-        receiver_task_id,
+        receiver_process_id,
         response.as_slice(),
         send_handles.as_slice(),
     ) {

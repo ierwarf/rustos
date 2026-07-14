@@ -315,6 +315,26 @@ impl KeyboardDriver {
         }
     }
 
+    /// End one untrusted input-provider session without leaving its pressed
+    /// keys or modifier state visible to the next provider session.  Pending
+    /// events are discarded before the synthetic releases so consumers never
+    /// observe stale text or a key press after its provider was revoked.
+    pub fn reset_provider_state(&mut self) {
+        self.parser = ScanCodeParser::new();
+        self.events = RingBuffer::new();
+        self.text = RingBuffer::new();
+        self.caps_lock = false;
+        self.num_lock = false;
+        self.scroll_lock = false;
+        for index in 0..KEY_CODE_COUNT {
+            if !self.pressed[index] {
+                continue;
+            }
+            let code = KeyCode::from_u32(index as u32).expect("contiguous keyboard key code");
+            self.inject_key_transition(code, true);
+        }
+    }
+
     pub fn read_text(&mut self, dest: &mut [u8]) -> usize {
         self.text.pop_into(dest)
     }
@@ -733,5 +753,36 @@ mod tests {
         keyboard.inject_key_transition(KeyCode::A, true);
         assert_eq!(keyboard.pop_event().unwrap().action, KeyAction::Pressed);
         assert_eq!(keyboard.pop_event().unwrap().action, KeyAction::Released);
+    }
+
+    #[test]
+    fn provider_reset_emits_release_for_every_pressed_key_and_clears_modifiers() {
+        let mut keyboard = KeyboardDriver::new();
+        keyboard.inject_key_transition(KeyCode::LeftCtrl, false);
+        keyboard.inject_key_transition(KeyCode::A, false);
+        assert!(keyboard.modifiers().contains(Modifiers::CTRL));
+
+        keyboard.reset_provider_state();
+
+        assert_eq!(
+            keyboard.pop_event(),
+            Some(KeyboardEvent {
+                code: KeyCode::LeftCtrl,
+                action: KeyAction::Released,
+                modifiers: Modifiers::empty(),
+                text: None,
+            })
+        );
+        assert_eq!(
+            keyboard.pop_event(),
+            Some(KeyboardEvent {
+                code: KeyCode::A,
+                action: KeyAction::Released,
+                modifiers: Modifiers::empty(),
+                text: None,
+            })
+        );
+        assert!(keyboard.pop_event().is_none());
+        assert_eq!(keyboard.modifiers(), Modifiers::empty());
     }
 }

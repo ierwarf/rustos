@@ -13,8 +13,8 @@ pub use crate::multitask::{
     mark_user_process_exiting, note_process_exit_status, queue_linux_signal,
     restore_current_simd_state, save_current_simd_state, set_next_pick_hint,
     set_next_spawn_pick_hint, spawn_user_process_state_with_parent, spawn_user_process_with_parent,
-    spawn_user_thread, wake_task, wake_user_task, with_current_mm, with_current_process_state,
-    with_current_process_state_mut, with_current_user_linux_state_mut,
+    spawn_user_thread, terminate_user_process, wake_task, wake_user_task, with_current_mm,
+    with_current_process_state, with_current_process_state_mut, with_current_user_linux_state_mut,
     with_current_user_process_and_linux_thread_state_mut, with_current_user_process_state,
     with_process_state_by_pid, with_process_state_by_pid_mut,
 };

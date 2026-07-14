@@ -10,12 +10,13 @@ Concrete owners and source anchors:
     src/rustos-dvm-agent.c
   * RDI2 receiver: kernel/io-manager/src/input/dvm_serial.rs
 
-The host accepts a KVM-vsock connection only from its launch-bound CID, then
-accepts the channel at the WELCOME write after an exact agent-v1-control HELLO.
-That is the control-plane linearization point.  Requests are serial, use the
-fixed allowlist and IDs, and time out closed.  Only after the three mandatory
-probes and the input-stream ready reply may L0 create a fresh RDI2 relay
-epoch.  The receiver accepts frames
+The host accepts a KVM-vsock connection only from its launch-bound CID. An
+exact agent-v1-control HELLO causes L0 to issue one fresh challenge. Only the
+matching HMAC proof over that challenge and exact HELLO permits the WELCOME
+write; that is the control-plane linearization point. Requests are serial, use
+the fixed allowlist and IDs, and time out closed. Only after the three mandatory
+probes and the input-stream ready reply may L0 create a fresh RDI2 relay epoch.
+The receiver accepts frames
 only in that epoch and only at the next sequence number.  Session end is
 modeled atomically with its key/button cleanup and clears receiver authority.
 
@@ -27,27 +28,32 @@ data planes.  Those have separate source checks and need independent models.
 CONSTANTS ExpectedCid,
           PeerCids,
           SessionIds,
+          ChallengeNonces,
           RelayEpochs,
           MaxTime,
           HelloDeadline,
+          ProofDeadline,
           ReplyDeadline,
           MaxSequence,
           MaxRejections
 
 NoCid == 0
 NoSession == 0
+NoChallenge == "none"
 NoEpoch == 0
 NoOp == "none"
 NoRequestId == 0
 
 Idle == "idle"
 AwaitHello == "await-hello"
+AwaitProof == "await-proof"
 ControlReady == "control-ready"
 Relaying == "relaying"
 
 None == "none"
 PeerRejected == "peer-rejected"
 HelloRejected == "hello-rejected"
+ProofRejected == "proof-rejected"
 TimedOut == "timed-out"
 Disconnected == "disconnected"
 RelayEnded == "relay-ended"
@@ -86,6 +92,10 @@ VARIABLES phase,
           controlSession,
           issuedSessions,
           helloDeadline,
+          activeChallenge,
+          issuedChallenges,
+          proofDeadline,
+          proofAccepted,
           completedOps,
           pendingOp,
           pendingRequestId,
@@ -104,6 +114,7 @@ VARIABLES phase,
           now
 
 vars == <<phase, peerCid, controlSession, issuedSessions, helloDeadline,
+          activeChallenge, issuedChallenges, proofDeadline, proofAccepted,
           completedOps, pendingOp, pendingRequestId, pendingSession,
           replyDeadline, issuedRelayEpochs, activeRelayEpoch, receiverEpoch,
           receiverSequence, acceptedSequences, nextSequence, cleanupComplete,
@@ -115,6 +126,10 @@ Init ==
     /\ controlSession = NoSession
     /\ issuedSessions = {}
     /\ helloDeadline = 0
+    /\ activeChallenge = NoChallenge
+    /\ issuedChallenges = {}
+    /\ proofDeadline = 0
+    /\ proofAccepted = FALSE
     /\ completedOps = {}
     /\ pendingOp = NoOp
     /\ pendingRequestId = NoRequestId
@@ -142,6 +157,9 @@ ClearSession(outcome) ==
     /\ peerCid' = NoCid
     /\ controlSession' = NoSession
     /\ helloDeadline' = 0
+    /\ activeChallenge' = NoChallenge
+    /\ proofDeadline' = 0
+    /\ proofAccepted' = FALSE
     /\ completedOps' = {}
     /\ pendingOp' = NoOp
     /\ pendingRequestId' = NoRequestId
@@ -165,6 +183,9 @@ AcceptExpectedPeer(cid, session) ==
     /\ controlSession' = session
     /\ issuedSessions' = issuedSessions \cup {session}
     /\ helloDeadline' = now + HelloDeadline
+    /\ activeChallenge' = NoChallenge
+    /\ proofDeadline' = 0
+    /\ proofAccepted' = FALSE
     /\ completedOps' = {}
     /\ pendingOp' = NoOp
     /\ pendingRequestId' = NoRequestId
@@ -177,24 +198,31 @@ AcceptExpectedPeer(cid, session) ==
     /\ nextSequence' = 1
     /\ cleanupComplete' = TRUE
     /\ lastOutcome' = None
-    /\ UNCHANGED <<issuedRelayEpochs, rejectedReplies, rejectedFrames, now>>
+    /\ UNCHANGED <<issuedChallenges, issuedRelayEpochs, rejectedReplies,
+                  rejectedFrames, now>>
 
 RejectForeignPeer(cid) ==
     /\ phase = Idle
     /\ cid \in PeerCids \ {ExpectedCid}
     /\ lastOutcome' = PeerRejected
     /\ UNCHANGED <<phase, peerCid, controlSession, issuedSessions, helloDeadline,
+                  activeChallenge, issuedChallenges, proofDeadline, proofAccepted,
                   completedOps, pendingOp, pendingRequestId, pendingSession,
                   replyDeadline, issuedRelayEpochs, activeRelayEpoch, receiverEpoch,
                   receiverSequence, acceptedSequences, nextSequence, cleanupComplete,
                   rejectedReplies, rejectedFrames, now>>
 
-AcceptMatchingHello ==
+AcceptMatchingHello(challenge) ==
     /\ phase = AwaitHello
     /\ peerCid = ExpectedCid
     /\ controlSession \in issuedSessions
     /\ now < helloDeadline
-    /\ phase' = ControlReady
+    /\ challenge \in ChallengeNonces \ issuedChallenges
+    /\ phase' = AwaitProof
+    /\ activeChallenge' = challenge
+    /\ issuedChallenges' = issuedChallenges \cup {challenge}
+    /\ proofDeadline' = now + ProofDeadline
+    /\ proofAccepted' = FALSE
     /\ lastOutcome' = None
     /\ UNCHANGED <<peerCid, controlSession, issuedSessions, helloDeadline,
                   completedOps, pendingOp, pendingRequestId, pendingSession,
@@ -202,11 +230,34 @@ AcceptMatchingHello ==
                   receiverSequence, acceptedSequences, nextSequence, cleanupComplete,
                   rejectedReplies, rejectedFrames, now>>
 
+AcceptMatchingProof ==
+    /\ phase = AwaitProof
+    /\ peerCid = ExpectedCid
+    /\ controlSession \in issuedSessions
+    /\ activeChallenge \in issuedChallenges
+    /\ activeChallenge # NoChallenge
+    /\ now < proofDeadline
+    /\ phase' = ControlReady
+    /\ proofAccepted' = TRUE
+    /\ lastOutcome' = None
+    /\ UNCHANGED <<peerCid, controlSession, issuedSessions, helloDeadline,
+                  activeChallenge, issuedChallenges, proofDeadline, completedOps,
+                  pendingOp, pendingRequestId, pendingSession, replyDeadline,
+                  issuedRelayEpochs, activeRelayEpoch, receiverEpoch,
+                  receiverSequence, acceptedSequences, nextSequence, cleanupComplete,
+                  rejectedReplies, rejectedFrames, now>>
+
 RejectMismatchingHello ==
     /\ phase = AwaitHello
     /\ ClearSession(HelloRejected)
-    /\ UNCHANGED <<issuedSessions, issuedRelayEpochs, rejectedReplies,
+    /\ UNCHANGED <<issuedSessions, issuedChallenges, issuedRelayEpochs, rejectedReplies,
                   rejectedFrames, now>>
+
+RejectInvalidProof ==
+    /\ phase = AwaitProof
+    /\ ClearSession(ProofRejected)
+    /\ UNCHANGED <<issuedSessions, issuedChallenges, issuedRelayEpochs,
+                  rejectedReplies, rejectedFrames, now>>
 
 SendControlRequest(op) ==
     /\ phase = ControlReady
@@ -219,6 +270,7 @@ SendControlRequest(op) ==
     /\ pendingSession' = controlSession
     /\ replyDeadline' = now + ReplyDeadline
     /\ UNCHANGED <<peerCid, controlSession, issuedSessions, helloDeadline,
+                  activeChallenge, issuedChallenges, proofDeadline, proofAccepted,
                   completedOps, issuedRelayEpochs, activeRelayEpoch, receiverEpoch,
                   receiverSequence, acceptedSequences, nextSequence, cleanupComplete,
                   rejectedReplies, rejectedFrames, lastOutcome, now>>
@@ -238,6 +290,7 @@ AcceptMatchingResponse(op, requestId, session) ==
     /\ pendingSession' = NoSession
     /\ replyDeadline' = 0
     /\ UNCHANGED <<phase, peerCid, controlSession, issuedSessions, helloDeadline,
+                  activeChallenge, issuedChallenges, proofDeadline, proofAccepted,
                   issuedRelayEpochs, activeRelayEpoch, receiverEpoch, receiverSequence,
                   acceptedSequences, nextSequence, cleanupComplete, rejectedReplies,
                   rejectedFrames, lastOutcome, now>>
@@ -250,6 +303,7 @@ RejectMismatchedResponse(op, requestId, session) ==
     /\ <<op, requestId, session>> # <<pendingOp, pendingRequestId, pendingSession>>
     /\ rejectedReplies' = rejectedReplies + 1
     /\ UNCHANGED <<phase, peerCid, controlSession, issuedSessions, helloDeadline,
+                  activeChallenge, issuedChallenges, proofDeadline, proofAccepted,
                   completedOps, pendingOp, pendingRequestId, pendingSession,
                   replyDeadline, issuedRelayEpochs, activeRelayEpoch, receiverEpoch,
                   receiverSequence, acceptedSequences, nextSequence, cleanupComplete,
@@ -269,6 +323,7 @@ OpenInputRelay(epoch) ==
     /\ nextSequence' = 1
     /\ cleanupComplete' = FALSE
     /\ UNCHANGED <<peerCid, controlSession, issuedSessions, helloDeadline,
+                  activeChallenge, issuedChallenges, proofDeadline, proofAccepted,
                   completedOps, pendingOp, pendingRequestId, pendingSession,
                   replyDeadline, rejectedReplies, rejectedFrames, lastOutcome, now>>
 
@@ -281,6 +336,7 @@ ForwardValidInput(sequence) ==
     /\ acceptedSequences' = acceptedSequences \cup {sequence}
     /\ nextSequence' = sequence + 1
     /\ UNCHANGED <<phase, peerCid, controlSession, issuedSessions, helloDeadline,
+                  activeChallenge, issuedChallenges, proofDeadline, proofAccepted,
                   completedOps, pendingOp, pendingRequestId, pendingSession,
                   replyDeadline, issuedRelayEpochs, activeRelayEpoch, receiverEpoch,
                   cleanupComplete, rejectedReplies, rejectedFrames, lastOutcome, now>>
@@ -292,6 +348,7 @@ RejectInvalidInput(epoch, sequence) ==
     /\ ~ (phase = Relaying /\ epoch = activeRelayEpoch /\ sequence = receiverSequence + 1)
     /\ rejectedFrames' = rejectedFrames + 1
     /\ UNCHANGED <<phase, peerCid, controlSession, issuedSessions, helloDeadline,
+                  activeChallenge, issuedChallenges, proofDeadline, proofAccepted,
                   completedOps, pendingOp, pendingRequestId, pendingSession,
                   replyDeadline, issuedRelayEpochs, activeRelayEpoch, receiverEpoch,
                   receiverSequence, acceptedSequences, nextSequence, cleanupComplete,
@@ -300,13 +357,13 @@ RejectInvalidInput(epoch, sequence) ==
 EndInputRelay ==
     /\ phase = Relaying
     /\ ClearSession(RelayEnded)
-    /\ UNCHANGED <<issuedSessions, issuedRelayEpochs, rejectedReplies,
+    /\ UNCHANGED <<issuedSessions, issuedChallenges, issuedRelayEpochs, rejectedReplies,
                   rejectedFrames, now>>
 
 DisconnectControl ==
-    /\ phase \in {AwaitHello, ControlReady}
+    /\ phase \in {AwaitHello, AwaitProof, ControlReady}
     /\ ClearSession(Disconnected)
-    /\ UNCHANGED <<issuedSessions, issuedRelayEpochs, rejectedReplies,
+    /\ UNCHANGED <<issuedSessions, issuedChallenges, issuedRelayEpochs, rejectedReplies,
                   rejectedFrames, now>>
 
 AdvanceTime ==
@@ -314,21 +371,26 @@ AdvanceTime ==
     /\ now' = now + 1
     /\ IF phase = AwaitHello /\ now + 1 >= helloDeadline
        THEN ClearSession(TimedOut)
-       ELSE IF phase = ControlReady /\ pendingOp # NoOp /\ now + 1 >= replyDeadline
+       ELSE IF phase = AwaitProof /\ now + 1 >= proofDeadline
+            THEN ClearSession(TimedOut)
+            ELSE IF phase = ControlReady /\ pendingOp # NoOp /\ now + 1 >= replyDeadline
             THEN ClearSession(TimedOut)
             ELSE UNCHANGED <<phase, peerCid, controlSession, helloDeadline,
+                            activeChallenge, proofDeadline, proofAccepted,
                             completedOps, pendingOp, pendingRequestId, pendingSession,
                             replyDeadline, activeRelayEpoch, receiverEpoch,
                             receiverSequence, acceptedSequences, nextSequence,
                             cleanupComplete, lastOutcome>>
-    /\ UNCHANGED <<issuedSessions, issuedRelayEpochs, rejectedReplies,
+    /\ UNCHANGED <<issuedSessions, issuedChallenges, issuedRelayEpochs, rejectedReplies,
                   rejectedFrames>>
 
 Next ==
     \/ \E cid \in PeerCids, session \in SessionIds : AcceptExpectedPeer(cid, session)
     \/ \E cid \in PeerCids : RejectForeignPeer(cid)
-    \/ AcceptMatchingHello
+    \/ \E challenge \in ChallengeNonces : AcceptMatchingHello(challenge)
+    \/ AcceptMatchingProof
     \/ RejectMismatchingHello
+    \/ RejectInvalidProof
     \/ \E op \in Ops : SendControlRequest(op)
     \/ \E op \in Ops, requestId \in 1..4, session \in SessionIds :
         AcceptMatchingResponse(op, requestId, session)
@@ -348,18 +410,24 @@ TypeOK ==
     /\ NoCid \notin PeerCids
     /\ SessionIds \subseteq Nat
     /\ NoSession \notin SessionIds
+    /\ ChallengeNonces # {}
     /\ RelayEpochs \subseteq Nat
     /\ NoEpoch \notin RelayEpochs
     /\ MaxTime \in Nat
     /\ HelloDeadline \in Nat \ {0}
+    /\ ProofDeadline \in Nat \ {0}
     /\ ReplyDeadline \in Nat \ {0}
     /\ MaxSequence \in Nat \ {0}
     /\ MaxRejections \in Nat
-    /\ phase \in {Idle, AwaitHello, ControlReady, Relaying}
+    /\ phase \in {Idle, AwaitHello, AwaitProof, ControlReady, Relaying}
     /\ peerCid \in PeerCids \cup {NoCid}
     /\ controlSession \in SessionIds \cup {NoSession}
     /\ issuedSessions \subseteq SessionIds
     /\ helloDeadline \in Nat
+    /\ activeChallenge \in ChallengeNonces \cup {NoChallenge}
+    /\ issuedChallenges \subseteq ChallengeNonces
+    /\ proofDeadline \in Nat
+    /\ proofAccepted \in BOOLEAN
     /\ completedOps \subseteq Ops
     /\ pendingOp \in Ops \cup {NoOp}
     /\ pendingRequestId \in 0..4
@@ -374,21 +442,36 @@ TypeOK ==
     /\ cleanupComplete \in BOOLEAN
     /\ rejectedReplies \in 0..MaxRejections
     /\ rejectedFrames \in 0..MaxRejections
-    /\ lastOutcome \in {None, PeerRejected, HelloRejected, TimedOut, Disconnected, RelayEnded}
+    /\ lastOutcome \in {None, PeerRejected, HelloRejected, ProofRejected, TimedOut, Disconnected, RelayEnded}
     /\ now \in 0..MaxTime
 
 AuthenticatedChannelHasLaunchBoundIdentity ==
-    phase \in {AwaitHello, ControlReady, Relaying} =>
+    phase \in {AwaitHello, AwaitProof, ControlReady, Relaying} =>
         /\ peerCid = ExpectedCid
         /\ controlSession \in issuedSessions
         /\ controlSession # NoSession
 
 HandshakeIsDeadlineBounded ==
-    phase = AwaitHello =>
+    /\ phase = AwaitHello =>
         /\ now < helloDeadline
         /\ completedOps = {}
         /\ pendingOp = NoOp
+        /\ activeChallenge = NoChallenge
         /\ activeRelayEpoch = NoEpoch
+    /\ phase = AwaitProof =>
+        /\ now < proofDeadline
+        /\ activeChallenge \in issuedChallenges
+        /\ activeChallenge # NoChallenge
+        /\ ~proofAccepted
+        /\ completedOps = {}
+        /\ pendingOp = NoOp
+        /\ activeRelayEpoch = NoEpoch
+
+ControlAuthorityRequiresFreshProof ==
+    phase \in {ControlReady, Relaying} =>
+        /\ proofAccepted
+        /\ activeChallenge \in issuedChallenges
+        /\ activeChallenge # NoChallenge
 
 ControlProtocolIsSerialAndExact ==
     /\ ControlPrefix(completedOps)
@@ -406,6 +489,8 @@ InputRequiresAuthenticatedCompletedControl ==
         /\ pendingOp = NoOp
         /\ peerCid = ExpectedCid
         /\ controlSession \in issuedSessions
+        /\ proofAccepted
+        /\ activeChallenge \in issuedChallenges
         /\ activeRelayEpoch \in issuedRelayEpochs
         /\ activeRelayEpoch # NoEpoch
         /\ receiverEpoch = activeRelayEpoch
@@ -422,6 +507,9 @@ ClosedChannelsRetainNoAuthority ==
         /\ peerCid = NoCid
         /\ controlSession = NoSession
         /\ helloDeadline = 0
+        /\ activeChallenge = NoChallenge
+        /\ proofDeadline = 0
+        /\ ~proofAccepted
         /\ completedOps = {}
         /\ pendingOp = NoOp
         /\ pendingRequestId = NoRequestId
@@ -437,6 +525,7 @@ ClosedChannelsRetainNoAuthority ==
 AllLiveIdentitiesWereIssued ==
     /\ controlSession # NoSession => controlSession \in issuedSessions
     /\ pendingSession # NoSession => pendingSession \in issuedSessions
+    /\ activeChallenge # NoChallenge => activeChallenge \in issuedChallenges
     /\ activeRelayEpoch # NoEpoch => activeRelayEpoch \in issuedRelayEpochs
     /\ receiverEpoch # NoEpoch => receiverEpoch \in issuedRelayEpochs
 

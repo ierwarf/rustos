@@ -5,14 +5,21 @@ EXTENDS Naturals, FiniteSets
 Models rootd post-init lease admission and restart budgets. Initd owns the
 netd launch report and runtimed owns the uiserver report. A capability is
 granted only to the exact running PID that an authorized supervisor reported.
+An attempted re-registration by any other actor is a stateful rejection: it
+may be observed for diagnostics, but cannot change the live PID, reporter, or
+capability binding.
 ***************************************************************************)
 
 CONSTANTS Services, Supervisors, Pids, InitialRestartBudget
 
 NoPid == 0
 NoSupervisor == "none"
+NoService == "none-service"
+NoActor == "none-actor"
 InitdSupervisor == "initd"
 RuntimedSupervisor == "runtimed"
+Intruder == "intruder"
+Actors == Supervisors \cup {Intruder}
 
 Unlaunched == "unlaunched"
 PendingReport == "pending-report"
@@ -29,10 +36,16 @@ VARIABLES leaseState,
           capabilityPid,
           restartRemaining,
           restartCount,
-          issuedPids
+          issuedPids,
+          lastRebindService,
+          lastRebindActor,
+          lastRebindLeasePid,
+          lastRebindReporter,
+          lastRebindCapabilityPid
 
 vars == <<leaseState, leasePid, reportedBy, capabilityPid, restartRemaining,
-          restartCount, issuedPids>>
+          restartCount, issuedPids, lastRebindService, lastRebindActor,
+          lastRebindLeasePid, lastRebindReporter, lastRebindCapabilityPid>>
 
 Init ==
     /\ leaseState = [s \in Services |-> Unlaunched]
@@ -42,6 +55,18 @@ Init ==
     /\ restartRemaining = [s \in Services |-> InitialRestartBudget]
     /\ restartCount = [s \in Services |-> 0]
     /\ issuedPids = {}
+    /\ lastRebindService = NoService
+    /\ lastRebindActor = NoActor
+    /\ lastRebindLeasePid = NoPid
+    /\ lastRebindReporter = NoSupervisor
+    /\ lastRebindCapabilityPid = NoPid
+
+ClearRebindAttempt ==
+    /\ lastRebindService' = NoService
+    /\ lastRebindActor' = NoActor
+    /\ lastRebindLeasePid' = NoPid
+    /\ lastRebindReporter' = NoSupervisor
+    /\ lastRebindCapabilityPid' = NoPid
 
 InitialLaunch(s, p, supervisor) ==
     /\ s \in Services
@@ -52,6 +77,7 @@ InitialLaunch(s, p, supervisor) ==
     /\ leasePid' = [leasePid EXCEPT ![s] = p]
     /\ reportedBy' = [reportedBy EXCEPT ![s] = NoSupervisor]
     /\ issuedPids' = issuedPids \cup {p}
+    /\ ClearRebindAttempt
     /\ UNCHANGED <<capabilityPid, restartRemaining, restartCount>>
 
 ReportReadiness(s, p, supervisor) ==
@@ -63,6 +89,7 @@ ReportReadiness(s, p, supervisor) ==
     /\ reportedBy[s] = NoSupervisor
     /\ leaseState' = [leaseState EXCEPT ![s] = Running]
     /\ reportedBy' = [reportedBy EXCEPT ![s] = supervisor]
+    /\ ClearRebindAttempt
     /\ UNCHANGED <<leasePid, capabilityPid, restartRemaining, restartCount, issuedPids>>
 
 GrantCapability(s, p) ==
@@ -73,6 +100,7 @@ GrantCapability(s, p) ==
     /\ reportedBy[s] = SupervisorFor(s)
     /\ capabilityPid[s] = NoPid
     /\ capabilityPid' = [capabilityPid EXCEPT ![s] = p]
+    /\ ClearRebindAttempt
     /\ UNCHANGED <<leaseState, leasePid, reportedBy, restartRemaining,
                   restartCount, issuedPids>>
 
@@ -83,6 +111,7 @@ Exit(s) ==
     /\ leasePid' = [leasePid EXCEPT ![s] = NoPid]
     /\ reportedBy' = [reportedBy EXCEPT ![s] = NoSupervisor]
     /\ capabilityPid' = [capabilityPid EXCEPT ![s] = NoPid]
+    /\ ClearRebindAttempt
     /\ UNCHANGED <<restartRemaining, restartCount, issuedPids>>
 
 Restart(s, p, supervisor) ==
@@ -97,6 +126,7 @@ Restart(s, p, supervisor) ==
     /\ restartRemaining' = [restartRemaining EXCEPT ![s] = @ - 1]
     /\ restartCount' = [restartCount EXCEPT ![s] = @ + 1]
     /\ issuedPids' = issuedPids \cup {p}
+    /\ ClearRebindAttempt
     /\ UNCHANGED <<capabilityPid>>
 
 Exhaust(s) ==
@@ -104,8 +134,26 @@ Exhaust(s) ==
     /\ leaseState[s] = Exited
     /\ restartRemaining[s] = 0
     /\ leaseState' = [leaseState EXCEPT ![s] = Failed]
+    /\ ClearRebindAttempt
     /\ UNCHANGED <<leasePid, reportedBy, capabilityPid, restartRemaining,
                   restartCount, issuedPids>>
+
+\* This corresponds to rootd rejecting a readiness registration when a live
+\* lease has the same exact child PID but a different `reporter_pid` sender.
+\* Recording the rejected request makes the preservation guarantee checkable;
+\* the authority-bearing fields themselves are intentionally unchanged.
+RejectForeignRebind(s, actor) ==
+    /\ s \in Services
+    /\ actor \in Actors
+    /\ leaseState[s] = Running
+    /\ actor # reportedBy[s]
+    /\ lastRebindService' = s
+    /\ lastRebindActor' = actor
+    /\ lastRebindLeasePid' = leasePid[s]
+    /\ lastRebindReporter' = reportedBy[s]
+    /\ lastRebindCapabilityPid' = capabilityPid[s]
+    /\ UNCHANGED <<leaseState, leasePid, reportedBy, capabilityPid,
+                  restartRemaining, restartCount, issuedPids>>
 
 Next ==
     \/ \E s \in Services, p \in Pids, supervisor \in Supervisors :
@@ -117,6 +165,7 @@ Next ==
     \/ \E s \in Services, p \in Pids, supervisor \in Supervisors :
         Restart(s, p, supervisor)
     \/ \E s \in Services : Exhaust(s)
+    \/ \E s \in Services, actor \in Actors : RejectForeignRebind(s, actor)
 
 TypeOK ==
     /\ Services = {"netd", "uiserver"}
@@ -131,6 +180,11 @@ TypeOK ==
     /\ restartRemaining \in [Services -> 0..InitialRestartBudget]
     /\ restartCount \in [Services -> 0..InitialRestartBudget]
     /\ issuedPids \subseteq Pids
+    /\ lastRebindService \in Services \cup {NoService}
+    /\ lastRebindActor \in Actors \cup {NoActor}
+    /\ lastRebindLeasePid \in Pids \cup {NoPid}
+    /\ lastRebindReporter \in Supervisors \cup {NoSupervisor}
+    /\ lastRebindCapabilityPid \in Pids \cup {NoPid}
 
 PendingLeaseHasNoAuthority ==
     \A s \in Services:
@@ -180,5 +234,13 @@ DistinctLiveLeasePids ==
             /\ leasePid[s] # NoPid
             /\ leasePid[t] # NoPid
             => leasePid[s] # leasePid[t]
+
+RejectedForeignRebindPreservesBinding ==
+    lastRebindService # NoService =>
+        /\ lastRebindActor # lastRebindReporter
+        /\ leaseState[lastRebindService] = Running
+        /\ leasePid[lastRebindService] = lastRebindLeasePid
+        /\ reportedBy[lastRebindService] = lastRebindReporter
+        /\ capabilityPid[lastRebindService] = lastRebindCapabilityPid
 
 =============================================================================

@@ -1,12 +1,15 @@
 use std::path::PathBuf;
+use std::process::Command as ProcessCommand;
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use rustos_driver_domain_host::{
-    ControlContract, DEFAULT_CONTROL_PORT, DeviceClass, DeviceTransport, DriverDomainPolicy,
-    FileLeaseStore, HostControlListener, IommuTopology, LaunchPlan, SysfsVfioOps, UnixInputSink,
-    ValidatedLease, VfioOps, acquire_vfio_lease, inspect_vfio_lease, restore_vfio_lease,
+    ControlContract, ControlSecret, DeviceClass, DeviceTransport, DriverDomainFleetPolicy,
+    DriverDomainPolicy, FileLeaseStore, HostControlListener, IommuTopology, LaunchPlan,
+    ReleaseAuthorization, SysfsVfioOps, UnixInputSink, ValidatedLease, VfioOps, VfioReleaseBinding,
+    acquire_vfio_lease, inspect_vfio_lease, inspect_vfio_lease_preflight, restore_vfio_lease,
 };
 
 #[derive(Parser)]
@@ -41,8 +44,9 @@ enum Command {
         sysfs_root: PathBuf,
         #[arg(long)]
         control_contract: PathBuf,
-        #[arg(long, default_value_t = DEFAULT_CONTROL_PORT)]
-        port: u32,
+        /// Owner-private 256-bit control secret, provisioned to this DVM at launch.
+        #[arg(long)]
+        control_secret: PathBuf,
         #[arg(long, default_value_t = 30)]
         timeout_secs: u64,
     },
@@ -56,13 +60,14 @@ enum Command {
         sysfs_root: PathBuf,
         #[arg(long)]
         control_contract: PathBuf,
+        /// Owner-private 256-bit control secret, provisioned to this DVM at launch.
+        #[arg(long)]
+        control_secret: PathBuf,
         /// Immutable L0 policy that enables the input transport for this exact domain.
         #[arg(long)]
         device_policy: PathBuf,
         #[arg(long)]
         rustos_input_socket: PathBuf,
-        #[arg(long, default_value_t = DEFAULT_CONTROL_PORT)]
-        port: u32,
         /// Maximum time to establish the DVM and RustOS relay endpoints.
         #[arg(long, default_value_t = 30)]
         timeout_secs: u64,
@@ -81,9 +86,24 @@ enum Command {
         /// Perform driver override, unbind, and vfio-pci bind after durable state is written.
         #[arg(long)]
         activate: bool,
-        /// Permit an unsigned lab-only bind. Production release-manifest authorization is not implemented.
-        #[arg(long, requires = "activate")]
-        allow_unsigned_test_bind: bool,
+        /// Signed release authorization binding this exact IOMMU group to DVM artifacts.
+        #[arg(long)]
+        release_manifest: Option<PathBuf>,
+        /// Detached OpenPGP signature for `--release-manifest`.
+        #[arg(long)]
+        release_signature: Option<PathBuf>,
+        /// Pinned release keyring accepted by gpgv.
+        #[arg(long)]
+        release_keyring: Option<PathBuf>,
+        /// Hash-bound Linux DVM artifact manifest named by the release authorization.
+        #[arg(long)]
+        dvm_artifact_manifest: Option<PathBuf>,
+        /// Hash-bound immutable driver-domain policy named by the release authorization.
+        #[arg(long)]
+        device_policy: Option<PathBuf>,
+        /// Hash-bound fleet policy that proves no other domain reuses this CID, IOMMU group, or PCI function.
+        #[arg(long)]
+        fleet_policy: Option<PathBuf>,
     },
     /// Show or explicitly restore the original host drivers from a durable VFIO lease.
     Release {
@@ -125,12 +145,14 @@ fn main() -> Result<()> {
             plan,
             sysfs_root,
             control_contract,
-            port,
+            control_secret,
             timeout_secs,
         } => {
             let lease = validate_plan(&plan, &sysfs_root)?;
             let contract = ControlContract::from_env_file(&control_contract)?;
-            let listener = HostControlListener::bind(lease.dvm_guest_cid, port, contract)?;
+            let control_secret = ControlSecret::from_hex_file(&control_secret)?;
+            let listener =
+                HostControlListener::bind(lease.dvm_guest_cid, contract, control_secret)?;
             let result = listener.probe_once(Duration::from_secs(timeout_secs))?;
             println!(
                 "rustos-hostd: DVM control verified domain={} cid={} iommu_group={} inventory_count={} virtio_net={} virtio_gpu={}",
@@ -146,9 +168,9 @@ fn main() -> Result<()> {
             plan,
             sysfs_root,
             control_contract,
+            control_secret,
             device_policy,
             rustos_input_socket,
-            port,
             timeout_secs,
             once,
         } => {
@@ -162,8 +184,10 @@ fn main() -> Result<()> {
                 );
             }
             let contract = ControlContract::from_env_file(&control_contract)?;
+            let control_secret = ControlSecret::from_hex_file(&control_secret)?;
             let timeout = Duration::from_secs(timeout_secs.max(1));
-            let listener = HostControlListener::bind(lease.dvm_guest_cid, port, contract)?;
+            let listener =
+                HostControlListener::bind(lease.dvm_guest_cid, contract, control_secret)?;
             loop {
                 let mut sink = match UnixInputSink::connect(&rustos_input_socket, timeout) {
                     Ok(sink) => sink,
@@ -205,11 +229,32 @@ fn main() -> Result<()> {
             sysfs_root,
             state_root,
             activate,
-            allow_unsigned_test_bind,
+            release_manifest,
+            release_signature,
+            release_keyring,
+            dvm_artifact_manifest,
+            device_policy,
+            fleet_policy,
         } => {
             let lease = validate_plan(&plan, &sysfs_root)?;
             let mut ops = SysfsVfioOps::new(&sysfs_root);
-            let mut record = inspect_vfio_lease(&lease, &ops)?;
+            let release_binding = if activate {
+                Some(verify_release_authorization(
+                    &lease,
+                    required_path(release_manifest, "--release-manifest")?,
+                    required_path(release_signature, "--release-signature")?,
+                    required_path(release_keyring, "--release-keyring")?,
+                    required_path(dvm_artifact_manifest, "--dvm-artifact-manifest")?,
+                    required_path(device_policy, "--device-policy")?,
+                    required_path(fleet_policy, "--fleet-policy")?,
+                )?)
+            } else {
+                None
+            };
+            let mut record = match release_binding {
+                Some(binding) => inspect_vfio_lease(&lease, &ops, binding)?,
+                None => inspect_vfio_lease_preflight(&lease, &ops)?,
+            };
             println!(
                 "rustos-hostd: VFIO {} domain={} cid={} iommu_group={} pci_bdfs={} original_drivers={:?} vfio_pci_loaded={}",
                 if activate { "acquire" } else { "dry-run" },
@@ -223,19 +268,14 @@ fn main() -> Result<()> {
             if !activate {
                 return Ok(());
             }
-            if !allow_unsigned_test_bind {
-                anyhow::bail!(
-                    "refusing VFIO acquire without --allow-unsigned-test-bind; production release-manifest authorization is not implemented"
-                );
-            }
             let store = FileLeaseStore::new(state_root);
-            store.create_prepared(&record)?;
-            if let Err(error) = acquire_vfio_lease(&record, &mut ops) {
+            store.create_prepared(&record, current_unix_time()?)?;
+            if let Err(error) = acquire_vfio_lease(&record, &mut ops, current_unix_time()?) {
                 anyhow::bail!(
                     "VFIO acquire failed; prepared lease retained for explicit recovery with release --activate: {error:#}"
                 );
             }
-            if let Err(error) = store.mark_active(&mut record) {
+            if let Err(error) = store.mark_active(&mut record, current_unix_time()?) {
                 let restore_error = restore_vfio_lease(&record, &mut ops).err();
                 if let Some(restore_error) = restore_error {
                     anyhow::bail!(
@@ -304,4 +344,81 @@ fn validate_record_matches_lease(
         anyhow::bail!("durable VFIO lease does not match the current validated launch plan");
     }
     Ok(())
+}
+
+fn required_path(path: Option<PathBuf>, flag: &str) -> Result<PathBuf> {
+    path.ok_or_else(|| anyhow::anyhow!("{flag} is required with --activate"))
+}
+
+fn verify_release_authorization(
+    lease: &ValidatedLease,
+    release_manifest: PathBuf,
+    release_signature: PathBuf,
+    release_keyring: PathBuf,
+    dvm_artifact_manifest: PathBuf,
+    device_policy: PathBuf,
+    fleet_policy: PathBuf,
+) -> Result<VfioReleaseBinding> {
+    let status = ProcessCommand::new("gpgv")
+        .arg("--keyring")
+        .arg(&release_keyring)
+        .arg(&release_signature)
+        .arg(&release_manifest)
+        .status()
+        .map_err(|error| anyhow::anyhow!("start gpgv for release authorization: {error}"))?;
+    if !status.success() {
+        anyhow::bail!("release authorization signature verification failed");
+    }
+    let authorization = ReleaseAuthorization::from_env_file(&release_manifest)?;
+    let now_unix = current_unix_time()?;
+    authorization.validate_for_lease(lease, now_unix)?;
+    let release_manifest_sha256 = sha256_file(&release_manifest)?;
+    verify_sha256_file(
+        &dvm_artifact_manifest,
+        authorization.dvm_artifact_manifest_sha256(),
+    )?;
+    verify_sha256_file(&device_policy, authorization.device_policy_sha256())?;
+    verify_sha256_file(&fleet_policy, authorization.fleet_policy_sha256())?;
+    DriverDomainFleetPolicy::from_env_file(&fleet_policy)?.validate_for_lease(lease)?;
+    authorization.into_vfio_release_binding(&release_manifest_sha256, now_unix)
+}
+
+fn current_unix_time() -> Result<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| anyhow::anyhow!("system clock before Unix epoch: {error}"))
+        .map(|duration| duration.as_secs())
+}
+
+fn verify_sha256_file(path: &std::path::Path, expected: &str) -> Result<()> {
+    let actual = sha256_file(path)?;
+    if actual != expected {
+        anyhow::bail!(
+            "release authorization hash mismatch for {}: expected {expected}, got {actual}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn sha256_file(path: &std::path::Path) -> Result<String> {
+    let output = ProcessCommand::new("sha256sum")
+        .arg(path)
+        .output()
+        .map_err(|error| anyhow::anyhow!("hash {}: {error}", path.display()))?;
+    if !output.status.success() {
+        anyhow::bail!("sha256sum failed for {}", path.display());
+    }
+    let actual = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| anyhow::anyhow!("sha256sum produced no digest for {}", path.display()))?;
+    if actual.len() != 64 || !actual.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!(
+            "sha256sum produced an invalid digest for {}",
+            path.display()
+        );
+    }
+    Ok(actual)
 }

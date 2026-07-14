@@ -346,6 +346,7 @@ fn lane_for_path(path: &Path) -> &'static str {
         "scheduler-thread-substrate-exception"
     } else if path.contains("/input_core.rs")
         || path.contains("/input/event_queue.rs")
+        || path.ends_with("/input/dvm_serial.rs")
         || path.ends_with("/input/mod.rs")
         || path.ends_with("/driver/input.rs")
         || path.contains("/input_broker_ops.rs")
@@ -427,5 +428,18 @@ fn action_for_path(path: &Path) -> &'static str {
         "keep capability-gated transport narrow; rootd owns admission policy"
     } else {
         "replace marked policy with a service-owned protocol before removing the marker"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lane_for_path;
+    use std::path::Path;
+
+    #[test]
+    fn dvm_serial_is_classified_as_bounded_input_substrate() {
+        let path = Path::new("kernel/io-manager/src/input/dvm_serial.rs");
+
+        assert_eq!(lane_for_path(path), "input-ingress-ring0-exception");
     }
 }

@@ -1166,11 +1166,7 @@ impl LinuxProcessState {
         true
     }
 
-    pub fn reserve_range(
-        &mut self,
-        start: u64,
-        end: u64,
-    ) -> Result<(), LinuxMemoryMapError> {
+    pub fn reserve_range(&mut self, start: u64, end: u64) -> Result<(), LinuxMemoryMapError> {
         if start >= end {
             return Err(LinuxMemoryMapError::InvalidRange);
         }
@@ -1436,8 +1432,7 @@ pub const SYS_RUSTOS_PROC_FORK_BROKER: u64 = crate::syscall::SYS_RUSTOS_PROC_FOR
 pub const SYS_RUSTOS_PROC_SIGNAL_QUEUE_BROKER: u64 =
     crate::syscall::SYS_RUSTOS_PROC_SIGNAL_QUEUE_BROKER;
 pub const SYS_RUSTOS_PROC_COMMIT_BROKER: u64 = crate::syscall::SYS_RUSTOS_PROC_COMMIT_BROKER;
-pub const SYS_RUSTOS_PROC_ACTIVATE_BROKER: u64 =
-    crate::syscall::SYS_RUSTOS_PROC_ACTIVATE_BROKER;
+pub const SYS_RUSTOS_PROC_ACTIVATE_BROKER: u64 = crate::syscall::SYS_RUSTOS_PROC_ACTIVATE_BROKER;
 pub const SYS_RUSTOS_PROC_ABORT_BROKER: u64 = crate::syscall::SYS_RUSTOS_PROC_ABORT_BROKER;
 pub const SYS_RUSTOS_MM_BROKER: u64 = crate::syscall::SYS_RUSTOS_MM_BROKER;
 pub const SYS_RUSTOS_DEVICE_IOCTL_BROKER: u64 = crate::syscall::SYS_RUSTOS_DEVICE_IOCTL_BROKER;
@@ -1461,8 +1456,10 @@ pub const SYS_RUSTOS_BOOT_EXTENT_BROKER: u64 = crate::syscall::SYS_RUSTOS_BOOT_E
 pub const SYS_RUSTOS_IPC_TRY_RECV: u64 = crate::syscall::SYS_RUSTOS_IPC_TRY_RECV;
 pub const SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER: u64 =
     crate::syscall::SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER;
-pub const SYS_RUSTOS_IPC_RECV_WITH_SENDER: u64 =
-    crate::syscall::SYS_RUSTOS_IPC_RECV_WITH_SENDER;
+pub const SYS_RUSTOS_IPC_RECV_WITH_SENDER: u64 = crate::syscall::SYS_RUSTOS_IPC_RECV_WITH_SENDER;
+pub const SYS_RUSTOS_ROOTD_WAIT_BROKER: u64 = crate::syscall::SYS_RUSTOS_ROOTD_WAIT_BROKER;
+pub const SYS_RUSTOS_ROOTD_TERMINATE_BROKER: u64 =
+    crate::syscall::SYS_RUSTOS_ROOTD_TERMINATE_BROKER;
 pub const SYS_RUSTOS_STATX_METADATA: u64 = crate::syscall::SYS_RUSTOS_STATX_METADATA;
 pub const SYS_RUSTOS_STAT_METADATA: u64 = crate::syscall::SYS_RUSTOS_STAT_METADATA;
 pub const SYS_RUSTOS_READLINK_METADATA: u64 = crate::syscall::SYS_RUSTOS_READLINK_METADATA;

@@ -9,21 +9,29 @@ Concrete owners:
   * kernel/compat/src/user/syscall/linux/ipc_ops.rs
   * kernel/ps/src/user/handles/table.rs
 
-An endpoint created by a user task has exactly one receiving task.  A queued
-reply capability is bound to that same task at enqueue time, before the raw
-reply id becomes observable.  A foreign task may probe raw numeric endpoint or
-reply values, but it must not dequeue a message, install transferred handles,
-complete the reply, or change the endpoint state.  Descriptor duplication also
-rejects sparse targets above the process descriptor ceiling without growing the
-table.
+An endpoint created by a user process may be served by a worker in that same
+process. A queued reply capability is bound to the owning process at enqueue
+time, before the raw reply id becomes observable. A foreign-process task may
+probe raw numeric endpoint or reply values, but it must not dequeue a message,
+install transferred handles, complete the reply, or change the endpoint state.
+When the owner process exits, queued or received authority is terminally
+revoked. Descriptor duplication also rejects sparse targets above the process
+descriptor ceiling without growing the table.
 *******************************************************************************)
 
 CONSTANTS Tasks, MaxFd
 
-Owner == 1
-Foreign == 2
-Caller == 3
+OwnerMain == 1
+OwnerWorker == 2
+Foreign == 3
+Caller == 4
 NoTask == 0
+
+OwnerProcess == 1
+ForeignProcess == 2
+
+ProcessOf(task) ==
+    IF task \in {OwnerMain, OwnerWorker} THEN OwnerProcess ELSE ForeignProcess
 
 NoMessage == "none"
 Queued == "queued"
@@ -47,24 +55,24 @@ ForeignReply == "foreign-reply"
 ForeignHandleReceive == "foreign-handle-receive"
 HugeDup == "huge-dup"
 
-VARIABLES endpointOwner,
+VARIABLES endpointOwnerProcess,
           messageState,
           replyState,
-          replyReceiver,
+          replyReceiverProcess,
           deliveredTo,
           transferState,
           fdTable,
           requestedFd,
           lastAttempt
 
-vars == <<endpointOwner, messageState, replyState, replyReceiver, deliveredTo,
+vars == <<endpointOwnerProcess, messageState, replyState, replyReceiverProcess, deliveredTo,
           transferState, fdTable, requestedFd, lastAttempt>>
 
 Init ==
-    /\ endpointOwner = Owner
+    /\ endpointOwnerProcess = OwnerProcess
     /\ messageState = NoMessage
     /\ replyState = NoReply
-    /\ replyReceiver = NoTask
+    /\ replyReceiverProcess = NoTask
     /\ deliveredTo = NoTask
     /\ transferState = NoTransfer
     /\ fdTable = {3}
@@ -76,56 +84,56 @@ EnqueueWithTransfer ==
     /\ replyState = NoReply
     /\ messageState' = Queued
     /\ replyState' = LiveReply
-    /\ replyReceiver' = endpointOwner
+    /\ replyReceiverProcess' = endpointOwnerProcess
     /\ transferState' = QueuedTransfer
     /\ lastAttempt' = NoAttempt
-    /\ UNCHANGED <<endpointOwner, deliveredTo, fdTable, requestedFd>>
+    /\ UNCHANGED <<endpointOwnerProcess, deliveredTo, fdTable, requestedFd>>
 
-OwnerReceives ==
+OwnerProcessReceives ==
     /\ messageState = Queued
     /\ messageState' = Received
-    /\ deliveredTo' = endpointOwner
+    /\ deliveredTo' \in {OwnerMain, OwnerWorker}
     /\ transferState' = ReceivedTransfer
     /\ lastAttempt' = NoAttempt
-    /\ UNCHANGED <<endpointOwner, replyState, replyReceiver, fdTable, requestedFd>>
+    /\ UNCHANGED <<endpointOwnerProcess, replyState, replyReceiverProcess, fdTable, requestedFd>>
 
 ForeignReceiveAttempt ==
     /\ messageState = Queued
     /\ lastAttempt' = ForeignReceive
-    /\ UNCHANGED <<endpointOwner, messageState, replyState, replyReceiver,
+    /\ UNCHANGED <<endpointOwnerProcess, messageState, replyState, replyReceiverProcess,
                    deliveredTo, transferState, fdTable, requestedFd>>
 
 ForeignHandleReceiveAttempt ==
     /\ messageState = Queued
     /\ transferState = QueuedTransfer
     /\ lastAttempt' = ForeignHandleReceive
-    /\ UNCHANGED <<endpointOwner, messageState, replyState, replyReceiver,
+    /\ UNCHANGED <<endpointOwnerProcess, messageState, replyState, replyReceiverProcess,
                    deliveredTo, transferState, fdTable, requestedFd>>
 
 ForeignReplyAttempt ==
     /\ replyState = LiveReply
     /\ lastAttempt' = ForeignReply
-    /\ UNCHANGED <<endpointOwner, messageState, replyState, replyReceiver,
+    /\ UNCHANGED <<endpointOwnerProcess, messageState, replyState, replyReceiverProcess,
                    deliveredTo, transferState, fdTable, requestedFd>>
 
-OwnerReplies ==
+OwnerProcessReplies ==
     /\ messageState = Received
     /\ replyState = LiveReply
-    /\ replyReceiver = endpointOwner
-    /\ deliveredTo = endpointOwner
+    /\ replyReceiverProcess = endpointOwnerProcess
+    /\ ProcessOf(deliveredTo) = endpointOwnerProcess
     /\ messageState' = Replied
     /\ replyState' = UsedReply
     /\ lastAttempt' = NoAttempt
-    /\ UNCHANGED <<endpointOwner, replyReceiver, deliveredTo, transferState,
+    /\ UNCHANGED <<endpointOwnerProcess, replyReceiverProcess, deliveredTo, transferState,
                    fdTable, requestedFd>>
 
-OwnerInstallsTransfer ==
+OwnerProcessInstallsTransfer ==
     /\ messageState = Received
-    /\ deliveredTo = endpointOwner
+    /\ ProcessOf(deliveredTo) = endpointOwnerProcess
     /\ transferState = ReceivedTransfer
     /\ transferState' = InstalledTransfer
     /\ lastAttempt' = NoAttempt
-    /\ UNCHANGED <<endpointOwner, messageState, replyState, replyReceiver,
+    /\ UNCHANGED <<endpointOwnerProcess, messageState, replyState, replyReceiverProcess,
                    deliveredTo, fdTable, requestedFd>>
 
 CancelQueued ==
@@ -134,14 +142,23 @@ CancelQueued ==
     /\ replyState' = UsedReply
     /\ transferState' = DroppedTransfer
     /\ lastAttempt' = NoAttempt
-    /\ UNCHANGED <<endpointOwner, replyReceiver, deliveredTo, fdTable,
+    /\ UNCHANGED <<endpointOwnerProcess, replyReceiverProcess, deliveredTo, fdTable,
+                   requestedFd>>
+
+OwnerProcessExits ==
+    /\ messageState \in {Queued, Received}
+    /\ messageState' = Cancelled
+    /\ replyState' = UsedReply
+    /\ transferState' = DroppedTransfer
+    /\ lastAttempt' = NoAttempt
+    /\ UNCHANGED <<endpointOwnerProcess, replyReceiverProcess, deliveredTo, fdTable,
                    requestedFd>>
 
 RejectSparseDup ==
     /\ requestedFd = MaxFd
     /\ requestedFd' = MaxFd + 1
     /\ lastAttempt' = HugeDup
-    /\ UNCHANGED <<endpointOwner, messageState, replyState, replyReceiver,
+    /\ UNCHANGED <<endpointOwnerProcess, messageState, replyState, replyReceiverProcess,
                    deliveredTo, transferState, fdTable>>
 
 BoundedDup ==
@@ -149,27 +166,28 @@ BoundedDup ==
     /\ requestedFd' \in 3..MaxFd
     /\ fdTable' = fdTable \cup {requestedFd'}
     /\ lastAttempt' = NoAttempt
-    /\ UNCHANGED <<endpointOwner, messageState, replyState, replyReceiver,
+    /\ UNCHANGED <<endpointOwnerProcess, messageState, replyState, replyReceiverProcess,
                    deliveredTo, transferState>>
 
 Next ==
     \/ EnqueueWithTransfer
-    \/ OwnerReceives
+    \/ OwnerProcessReceives
     \/ ForeignReceiveAttempt
     \/ ForeignHandleReceiveAttempt
     \/ ForeignReplyAttempt
-    \/ OwnerReplies
-    \/ OwnerInstallsTransfer
+    \/ OwnerProcessReplies
+    \/ OwnerProcessInstallsTransfer
     \/ CancelQueued
+    \/ OwnerProcessExits
     \/ RejectSparseDup
     \/ BoundedDup
 
 TypeOK ==
-    /\ Tasks = {Owner, Foreign, Caller}
-    /\ endpointOwner \in Tasks
+    /\ Tasks = {OwnerMain, OwnerWorker, Foreign, Caller}
+    /\ endpointOwnerProcess \in {OwnerProcess, ForeignProcess}
     /\ messageState \in {NoMessage, Queued, Received, Replied, Cancelled}
     /\ replyState \in {NoReply, LiveReply, UsedReply}
-    /\ replyReceiver \in Tasks \cup {NoTask}
+    /\ replyReceiverProcess \in {OwnerProcess, ForeignProcess, NoTask}
     /\ deliveredTo \in Tasks \cup {NoTask}
     /\ transferState \in {NoTransfer, QueuedTransfer, ReceivedTransfer,
                             InstalledTransfer, DroppedTransfer}
@@ -178,11 +196,11 @@ TypeOK ==
     /\ lastAttempt \in {NoAttempt, ForeignReceive, ForeignReply,
                           ForeignHandleReceive, HugeDup}
 
-QueuedReplyIsBoundToEndpointOwner ==
-    replyState = LiveReply => replyReceiver = endpointOwner
+QueuedReplyIsBoundToEndpointOwnerProcess ==
+    replyState = LiveReply => replyReceiverProcess = endpointOwnerProcess
 
-OnlyEndpointOwnerReceives ==
-    messageState = Received => deliveredTo = endpointOwner
+OnlyEndpointOwnerProcessReceives ==
+    messageState = Received => ProcessOf(deliveredTo) = endpointOwnerProcess
 
 ForeignProbesAreNonDestructive ==
     /\ lastAttempt = ForeignReceive =>
@@ -196,15 +214,15 @@ ForeignProbesAreNonDestructive ==
     /\ lastAttempt = ForeignReply =>
         /\ replyState = LiveReply
         /\ messageState \in {Queued, Received}
-        /\ replyReceiver = endpointOwner
+        /\ replyReceiverProcess = endpointOwnerProcess
 
-OnlyOwnerCanInstallTransferredHandle ==
-    transferState = InstalledTransfer => deliveredTo = endpointOwner
+OnlyOwnerProcessCanInstallTransferredHandle ==
+    transferState = InstalledTransfer => ProcessOf(deliveredTo) = endpointOwnerProcess
 
-ReplyCannotCompleteBeforeOwnedReceive ==
+ReplyCannotCompleteBeforeOwnerProcessReceive ==
     replyState = UsedReply /\ messageState = Replied =>
-        /\ deliveredTo = endpointOwner
-        /\ replyReceiver = endpointOwner
+        /\ ProcessOf(deliveredTo) = endpointOwnerProcess
+        /\ replyReceiverProcess = endpointOwnerProcess
 
 SparseFdRequestDoesNotGrowTable ==
     requestedFd = MaxFd + 1 => fdTable \subseteq 3..MaxFd

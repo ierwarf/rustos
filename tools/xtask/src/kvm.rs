@@ -9,15 +9,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
-use fatfs::Seek as FatSeek;
-use fatfs::Write as FatWrite;
-use fs_err as fs;
 use driver_domain_protocol::{
     DVM_DISPLAY_HEADER_BYTES, DVM_DISPLAY_INITIAL_GENERATION, DVM_NET_APERTURE_BYTES,
     DvmDisplayHeader, DvmNetHeader,
 };
+use fatfs::Seek as FatSeek;
+use fatfs::Write as FatWrite;
+use fs_err as fs;
 use rustos_driver_domain_host::{
-    ControlContract as HostControlContract, DEFAULT_CONTROL_PORT, HostControlListener, ProbeResult,
+    ControlContract as HostControlContract, ControlSecret, HostControlListener, ProbeResult,
     UnixInputSink,
 };
 
@@ -34,9 +34,8 @@ const DVM_CONTROL_CONTRACT: &str = "board/overlay/usr/share/rustos-dvm/control-p
 const DVM_CONTROL_PROTOCOL: &str = "agent-v1";
 const DVM_CONTROL_STATE: &str = "control";
 const DVM_CONTROL_TRANSPORT: &str = "kvm-vsock";
-const DVM_CONTROL_AUTHENTICATION: &str = "kvm-host-bound";
-const DVM_CONTROL_CAPABILITIES: &str =
-    "health,device-inventory,driver-inventory,input-stream";
+const DVM_CONTROL_AUTHENTICATION: &str = "dvm-agent-hmac-sha256-v1";
+const DVM_CONTROL_CAPABILITIES: &str = "health,device-inventory,driver-inventory,input-stream";
 const RUSTOS_BOOT_MARKER: &str = "rootd: core services ready, spawning initd via loaderd";
 const DVM_KEYBOARD_INGRESS_MARKER: &str = "inputd: DVM keyboard ingress observed";
 const DVM_POINTER_INGRESS_MARKER: &str = "inputd: DVM pointer ingress observed";
@@ -96,6 +95,7 @@ struct KvmLayout {
     rustos_stderr_log: PathBuf,
     dvm_stderr_log: PathBuf,
     rustos_input_socket: PathBuf,
+    dvm_control_secret: PathBuf,
     dvm_display_shmem: Option<PathBuf>,
     dvm_network_shmem: Option<PathBuf>,
 }
@@ -164,8 +164,12 @@ where
 
     require_vhost_vsock()?;
     let deadline = Instant::now() + options.timeout;
-    let control_relay =
-        start_dvm_input_relay(config, options.timeout, layout.rustos_input_socket.clone())?;
+    let control_relay = start_dvm_input_relay(
+        config,
+        options.timeout,
+        layout.rustos_input_socket.clone(),
+        layout.dvm_control_secret.clone(),
+    )?;
     let (mut rustos, mut dvm) = spawn_guests(
         &qemu,
         config,
@@ -203,8 +207,16 @@ where
         artifacts.control.control_plane(),
         probe.peer_cid,
         probe.inventory_count,
-        if probe.driver_inventory.virtio_net_bound { "bound" } else { "missing" },
-        if probe.driver_inventory.virtio_gpu_bound { "bound" } else { "missing" },
+        if probe.driver_inventory.virtio_net_bound {
+            "bound"
+        } else {
+            "missing"
+        },
+        if probe.driver_inventory.virtio_gpu_bound {
+            "bound"
+        } else {
+            "missing"
+        },
     );
     Ok(())
 }
@@ -227,7 +239,11 @@ pub(crate) fn kvm_run_command(config: &Config) -> Result<()> {
     };
     let layout = prepare_layout(config, &options)?;
     require_vhost_vsock()?;
-    start_dvm_input_relay_unbounded(config, layout.rustos_input_socket.clone())?;
+    start_dvm_input_relay_unbounded(
+        config,
+        layout.rustos_input_socket.clone(),
+        layout.dvm_control_secret.clone(),
+    )?;
     let (mut rustos, mut dvm) = spawn_guests(
         &qemu,
         config,
@@ -657,6 +673,10 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
     let rustos_stderr_log = run_dir.join("rustos-qemu.stderr.log");
     let dvm_stderr_log = run_dir.join("linux-dvm-qemu.stderr.log");
     let rustos_input_socket = run_dir.join("rustos-dvm-input.sock");
+    let dvm_control_secret = run_dir.join("linux-dvm-control.secret");
+    let control_secret = ControlSecret::random()?;
+    fs::write(&dvm_control_secret, control_secret.as_hex())?;
+    fs::set_permissions(&dvm_control_secret, std::fs::Permissions::from_mode(0o600))?;
     fs::write(&debugcon_log, "")?;
     fs::write(&rustos_serial_log, "")?;
     fs::write(&dvm_serial_log, "")?;
@@ -684,6 +704,7 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
         rustos_stderr_log,
         dvm_stderr_log,
         rustos_input_socket,
+        dvm_control_secret,
         dvm_display_shmem,
         dvm_network_shmem,
     })
@@ -691,13 +712,21 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
 
 fn create_dvm_network_shmem(path: &Path) -> Result<()> {
     if path.to_string_lossy().contains(',') {
-        bail!("KVM shared-network path contains an unsupported QEMU option separator: {}", path.display());
+        bail!(
+            "KVM shared-network path contains an unsupported QEMU option separator: {}",
+            path.display()
+        );
     }
     let header = DvmNetHeader::new(DVM_NET_REGION_BYTES, 1);
     if !header.is_valid() {
         bail!("refusing to create invalid DVM shared-network header");
     }
-    let mut file = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(path)?;
     file.set_len(DVM_NET_REGION_BYTES)?;
     file.write_all(&header.encode())?;
     file.sync_all()?;
@@ -739,12 +768,8 @@ fn create_dvm_display_shmem(path: &Path) -> Result<()> {
         .with_context(|| format!("initialize DVM shared display {}", path.display()))?;
     file.sync_all()
         .with_context(|| format!("flush DVM shared display {}", path.display()))?;
-    fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).with_context(|| {
-        format!(
-            "restrict DVM shared display permissions {}",
-            path.display()
-        )
-    })?;
+    fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("restrict DVM shared display permissions {}", path.display()))?;
     Ok(())
 }
 
@@ -937,10 +962,12 @@ fn start_dvm_input_relay(
     config: &Config,
     timeout: Duration,
     rustos_input_socket: PathBuf,
+    control_secret_path: PathBuf,
 ) -> Result<Receiver<Result<ProbeResult>>> {
     let contract_path = dvm_dir(config).join(DVM_CONTROL_CONTRACT);
     let contract = HostControlContract::from_env_file(&contract_path)?;
-    let listener = HostControlListener::bind(DVM_GUEST_CID, DEFAULT_CONTROL_PORT, contract)?;
+    let control_secret = ControlSecret::from_hex_file(&control_secret_path)?;
+    let listener = HostControlListener::bind(DVM_GUEST_CID, contract, control_secret)?;
     let (sender, receiver) = mpsc::sync_channel(1);
     thread::spawn(move || {
         let sender_ready = sender.clone();
@@ -959,10 +986,15 @@ fn start_dvm_input_relay(
     Ok(receiver)
 }
 
-fn start_dvm_input_relay_unbounded(config: &Config, rustos_input_socket: PathBuf) -> Result<()> {
+fn start_dvm_input_relay_unbounded(
+    config: &Config,
+    rustos_input_socket: PathBuf,
+    control_secret_path: PathBuf,
+) -> Result<()> {
     let contract_path = dvm_dir(config).join(DVM_CONTROL_CONTRACT);
     let contract = HostControlContract::from_env_file(&contract_path)?;
-    let listener = HostControlListener::bind(DVM_GUEST_CID, DEFAULT_CONTROL_PORT, contract)?;
+    let control_secret = ControlSecret::from_hex_file(&control_secret_path)?;
+    let listener = HostControlListener::bind(DVM_GUEST_CID, contract, control_secret)?;
     thread::spawn(move || {
         loop {
             let Ok(mut sink) = UnixInputSink::connect(&rustos_input_socket, Duration::from_secs(1))
@@ -1112,6 +1144,11 @@ fn spawn_guests(
         .args(["-serial", "chardev:serial"])
         .arg("-device")
         .arg(format!("vhost-vsock-pci,guest-cid={DVM_GUEST_CID}"))
+        .arg("-fw_cfg")
+        .arg(format!(
+            "name=opt/rustos/dvm-control-secret,file={}",
+            layout.dvm_control_secret.display()
+        ))
         .arg("-device")
         .arg("virtio-keyboard-pci,id=dvm-keyboard")
         .arg("-device")
@@ -1166,7 +1203,8 @@ fn append_dvm_network_ivshmem(command: &mut Command, path: &Path) {
         .arg("-object")
         .arg(format!(
             "memory-backend-file,id=dvm-network-shm,mem-path={},size={},share=on",
-            path.display(), DVM_NET_REGION_BYTES
+            path.display(),
+            DVM_NET_REGION_BYTES
         ))
         .arg("-device")
         .arg("ivshmem-plain,memdev=dvm-network-shm");
@@ -1219,11 +1257,9 @@ fn wait_for_parallel_boot(
         let ui_fps_ready = options
             .min_ui_fps
             .is_none_or(|minimum| uiserver_profile_meets_fps(&rustos_log, minimum));
-        let dvm_display_ready =
-            !options.dvm_display_shmem
-                || (dvm_display_provider_ready(&rustos_log) && dvm_display_relay_ready(&dvm_log));
-        let dvm_network_ready =
-            !options.dvm_network_shmem || dvm_network_relay_ready(&dvm_log);
+        let dvm_display_ready = !options.dvm_display_shmem
+            || (dvm_display_provider_ready(&rustos_log) && dvm_display_relay_ready(&dvm_log));
+        let dvm_network_ready = !options.dvm_network_shmem || dvm_network_relay_ready(&dvm_log);
         let dvm_network_traffic_ready = if options.exercise_network {
             let shared_network = layout
                 .dvm_network_shmem
@@ -1354,9 +1390,8 @@ mod tests {
     use super::{
         DVM_CONTROL_AUTHENTICATION, DVM_CONTROL_CAPABILITIES, DVM_CONTROL_PROTOCOL,
         DVM_CONTROL_STATE, DVM_CONTROL_TRANSPORT, DVM_KEYBOARD_INGRESS_MARKER,
-        DVM_POINTER_INGRESS_MARKER, RUSTOS_BOOT_MARKER, DvmNetworkCounters,
-        dvm_display_provider_ready,
-        dvm_display_relay_ready, dvm_network_relay_ready, is_sha256,
+        DVM_POINTER_INGRESS_MARKER, DvmNetworkCounters, RUSTOS_BOOT_MARKER,
+        dvm_display_provider_ready, dvm_display_relay_ready, dvm_network_relay_ready, is_sha256,
         parse_dvm_control_contract_text, parse_manifest_text, parse_smoke_options,
         uiserver_profile_meets_fps, validate_manifest_values,
     };
@@ -1377,12 +1412,16 @@ mod tests {
     fn input_exercise_requires_both_ring3_ingress_markers() {
         let options = parse_smoke_options(vec!["--exercise-input".into()].into_iter()).unwrap();
         assert!(options.exercise_input);
-        assert!(options
-            .expected_markers
-            .contains(&DVM_KEYBOARD_INGRESS_MARKER.to_owned()));
-        assert!(options
-            .expected_markers
-            .contains(&DVM_POINTER_INGRESS_MARKER.to_owned()));
+        assert!(
+            options
+                .expected_markers
+                .contains(&DVM_KEYBOARD_INGRESS_MARKER.to_owned())
+        );
+        assert!(
+            options
+                .expected_markers
+                .contains(&DVM_POINTER_INGRESS_MARKER.to_owned())
+        );
     }
 
     #[test]
@@ -1425,24 +1464,25 @@ mod tests {
         };
         assert!(observed.is_valid(64));
         assert!(observed.round_trip_observed());
-        assert!(!DvmNetworkCounters {
-            tx_producer: 65,
-            tx_consumer: 0,
-            rx_producer: 0,
-            rx_consumer: 0,
-        }
-        .is_valid(64));
+        assert!(
+            !DvmNetworkCounters {
+                tx_producer: 65,
+                tx_consumer: 0,
+                rx_producer: 0,
+                rx_consumer: 0,
+            }
+            .is_valid(64)
+        );
     }
 
     #[test]
     fn ui_fps_option_is_bounded_and_profile_rate_is_strict() {
-        let options = parse_smoke_options(
-            vec!["--min-ui-fps".into(), "20".into()].into_iter(),
-        )
-        .unwrap();
+        let options =
+            parse_smoke_options(vec!["--min-ui-fps".into(), "20".into()].into_iter()).unwrap();
         assert_eq!(options.min_ui_fps, Some(20));
-        assert!(parse_smoke_options(vec!["--min-ui-fps".into(), "241".into()].into_iter())
-            .is_err());
+        assert!(
+            parse_smoke_options(vec!["--min-ui-fps".into(), "241".into()].into_iter()).is_err()
+        );
         assert!(uiserver_profile_meets_fps(
             "[INFO ] service=uiserver uiserver profile: elapsed_ms=1000 frame_hz_milli=20000 full=0 part=20",
             20,
@@ -1475,7 +1515,7 @@ mod tests {
 
         let hash = "0".repeat(64);
         let manifest = format!(
-            "schema=4\nid=rustos-linux-dvm-x86_64\narchitecture=x86_64\nboot=linux-bzimage+cpio-xz\ndata-plane=hostd-rdi2-input\ncontrol-plane=agent-v1-control\ncontrol-protocol=agent-v1\ncontrol-state=control\ncontrol-transport=kvm-vsock\ncontrol-authentication=kvm-host-bound\ncontrol-capabilities=health,device-inventory,driver-inventory,input-stream\ncontrol-contract-sha256={hash}\nkernel_sha256={hash}\nrootfs_sha256={hash}\nconfig_sha256={hash}\nsources_lock_sha256={hash}\n"
+            "schema=4\nid=rustos-linux-dvm-x86_64\narchitecture=x86_64\nboot=linux-bzimage+cpio-xz\ndata-plane=hostd-rdi2-input\ncontrol-plane=agent-v1-control\ncontrol-protocol=agent-v1\ncontrol-state=control\ncontrol-transport=kvm-vsock\ncontrol-authentication=dvm-agent-hmac-sha256-v1\ncontrol-capabilities=health,device-inventory,driver-inventory,input-stream\ncontrol-contract-sha256={hash}\nkernel_sha256={hash}\nrootfs_sha256={hash}\nconfig_sha256={hash}\nsources_lock_sha256={hash}\n"
         );
         let values = parse_manifest_text(&manifest, "manifest").unwrap();
         assert_eq!(validate_manifest_values(&values).unwrap(), contract);

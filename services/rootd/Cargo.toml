@@ -6,5 +6,10 @@ publish = false
 
 build = "build.rs"
 
+[features]
+# Enables a native Cargo test harness.  The production service is a
+# freestanding ELF whose linker entrypoint is supplied by build.rs.
+host-test = []
+
 [dependencies]
 rustos-user-abi = { path = "../../libs/rustos-user-abi" }

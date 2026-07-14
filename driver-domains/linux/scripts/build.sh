@@ -213,7 +213,10 @@ sync_rootfs_overlay() {
     local path
     local relative
 
-    test -d "$target" || return
+    # A freshly reconfigured Buildroot tree has no target root yet. There is
+    # nothing to synchronize at this point; return success so the normal make
+    # step can create it rather than aborting the first clean build.
+    test -d "$target" || return 0
     overlay_file_manifest >"$current"
 
     if test -f "$previous"; then

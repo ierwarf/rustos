@@ -1,23 +1,26 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io::Write;
 use std::mem::size_of;
-use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant as StdInstant};
 
 use rustos_user_abi::linux as linux_abi;
 use rustos_user_abi::syscall::{
-    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, NetdIpcRequest, NetdIpcResponse,
-    RustosNetBrokerArgs, COMMERCIAL_MAX_NETD_OP_ADDRESS_BIND, COMMERCIAL_MAX_NETD_OP_FD_TRANSFER,
+    COMMERCIAL_MAX_NETD_OP_ADDRESS_BIND, COMMERCIAL_MAX_NETD_OP_FD_TRANSFER,
     COMMERCIAL_MAX_NETD_OP_PACKET_LEASE, COMMERCIAL_MAX_NETD_OP_ROUTE_POLICY,
     COMMERCIAL_MAX_NETD_OP_SOCKET_NAMESPACE, COMMERCIAL_MAX_NETD_OP_SOCKET_OPTIONS,
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
-    COMMERCIAL_MAX_PROTOCOL_NETD, IPC_SERVICE_NETD, NETD_IPC_ABI_VERSION,
-    NETD_RECVMSG_PAYLOAD_HEADER_SIZE, NETD_SENDMSG_PAYLOAD_HEADER_SIZE,
-    NET_BROKER_OP_PACKET_RX, NET_BROKER_OP_PACKET_STATUS, NET_BROKER_OP_PACKET_TX,
-    NET_BROKER_PACKET_MTU,
+    COMMERCIAL_MAX_PROTOCOL_NETD, CommercialMaxCapabilityLeaseWire,
+    CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
+    CommercialMaxProtocolResponse, IPC_SERVICE_NETD, NET_BROKER_OP_PACKET_RX,
+    NET_BROKER_OP_PACKET_STATUS, NET_BROKER_OP_PACKET_TX, NET_BROKER_PACKET_MTU,
+    NET_BROKER_PACKET_STATUS_ACTIVE, NET_BROKER_PACKET_STATUS_AWAITING_AUTHENTICATED_CONTROL,
+    NET_BROKER_PACKET_STATUS_UNAVAILABLE, NETD_IPC_ABI_VERSION, NETD_RECVMSG_PAYLOAD_HEADER_SIZE,
+    NETD_SENDMSG_PAYLOAD_HEADER_SIZE, NetdIpcRequest, NetdIpcResponse, RustosNetBrokerArgs,
+    SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV,
+    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_NET_BROKER,
     SYSCALL_OFFLOAD_OP_LINUX_ACCEPT, SYSCALL_OFFLOAD_OP_LINUX_BIND, SYSCALL_OFFLOAD_OP_LINUX_CLOSE,
     SYSCALL_OFFLOAD_OP_LINUX_CONNECT, SYSCALL_OFFLOAD_OP_LINUX_DUP,
     SYSCALL_OFFLOAD_OP_LINUX_GETPEERNAME, SYSCALL_OFFLOAD_OP_LINUX_GETSOCKNAME,
@@ -26,9 +29,7 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_OP_LINUX_RECVMSG, SYSCALL_OFFLOAD_OP_LINUX_SENDMSG,
     SYSCALL_OFFLOAD_OP_LINUX_SENDTO, SYSCALL_OFFLOAD_OP_LINUX_SETSOCKOPT,
     SYSCALL_OFFLOAD_OP_LINUX_SHUTDOWN, SYSCALL_OFFLOAD_OP_LINUX_SOCKET,
-    SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
-    SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
-    SYS_RUSTOS_NET_BROKER,
+    SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR,
 };
 use smoltcp::iface::{Config as SmolConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -45,6 +46,12 @@ const SOCKET_CONTROL_BUFFER_CAPACITY: usize = 64 * 1024;
 const INET_TCP_BUFFER_CAPACITY: usize = 16 * 1024;
 const INET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const INET_IO_POLL_BUDGET: usize = 256;
+// A mapped aperture can appear before the L0-authenticated control relay has
+// delivered SESSION_START. Delay only that explicitly transitional state so a
+// boot-time client does not race into a fabricated permanent ENODEV. A truly
+// absent/invalid provider still fails immediately, and the wait is bounded.
+const AUTHENTICATED_CONTROL_WAIT: Duration = Duration::from_millis(250);
+const AUTHENTICATED_CONTROL_RETRY: Duration = Duration::from_millis(4);
 const QEMU_USERNET_ADDR: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
 const QEMU_USERNET_GATEWAY: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
 const QEMU_USERNET_MAC: EthernetAddress = EthernetAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
@@ -135,9 +142,7 @@ fn serve(endpoint: u64) {
 
 fn is_blocking_inet_request(request: &NetdIpcRequest) -> bool {
     let inet_operation = match request.op {
-        SYSCALL_OFFLOAD_OP_LINUX_CONNECT => {
-            sockaddr_family(request) == Some(linux_abi::AF_INET)
-        }
+        SYSCALL_OFFLOAD_OP_LINUX_CONNECT => sockaddr_family(request) == Some(linux_abi::AF_INET),
         SYSCALL_OFFLOAD_OP_LINUX_SENDTO
         | SYSCALL_OFFLOAD_OP_LINUX_SENDMSG
         | SYSCALL_OFFLOAD_OP_LINUX_RECVFROM
@@ -182,10 +187,7 @@ fn spawn_blocking_inet_request(request: NetdIpcRequest, reply_cap: u64) -> bool 
     true
 }
 
-fn run_blocking_inet_request(
-    request: &NetdIpcRequest,
-    response: &mut NetdIpcResponse,
-) -> i32 {
+fn run_blocking_inet_request(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
     if request.op == SYSCALL_OFFLOAD_OP_LINUX_CONNECT {
         let mut status = begin_inet_connect(request);
         let deadline = StdInstant::now() + INET_CONNECT_TIMEOUT;
@@ -407,7 +409,7 @@ struct InetStack {
 
 impl InetStack {
     fn new() -> Result<Self, i32> {
-        if packet_status()? == 0 {
+        if packet_provider_state()? != PacketProviderState::Active {
             return Err(libc::ENODEV);
         }
         let mut device = BrokerDevice;
@@ -474,7 +476,10 @@ impl Device for BrokerDevice {
     type RxToken<'a> = BrokerRxToken;
     type TxToken<'a> = BrokerTxToken;
 
-    fn receive(&mut self, _timestamp: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+    fn receive(
+        &mut self,
+        _timestamp: SmolInstant,
+    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let mut frame = vec![0_u8; NET_BROKER_PACKET_MTU];
         match packet_rx(frame.as_mut_slice()) {
             Ok(0) => None,
@@ -531,6 +536,9 @@ fn handle_socket(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i3
     let socket_type = request.arg1;
     let base_type = socket_type & linux_abi::SOCK_TYPE_MASK;
     if domain == linux_abi::AF_INET && base_type == linux_abi::SOCK_STREAM {
+        if let Err(errno) = await_authenticated_packet_provider() {
+            return errno;
+        }
         let mut state = net_state().lock().unwrap();
         let token = state.allocate_token();
         let tcp = match state.inet_stack() {
@@ -840,7 +848,11 @@ fn begin_inet_connect(request: &NetdIpcRequest) -> i32 {
             INET_CONNECT_TIMEOUT.as_millis().min(u64::MAX as u128) as u64,
         )));
         if socket
-            .connect(stack.iface.context(), (IpAddress::Ipv4(remote), port), local_port)
+            .connect(
+                stack.iface.context(),
+                (IpAddress::Ipv4(remote), port),
+                local_port,
+            )
             .is_err()
         {
             return libc::EINVAL;
@@ -1642,6 +1654,81 @@ fn packet_status() -> Result<u64, i32> {
     call_packet_broker(NET_BROKER_OP_PACKET_STATUS, 0, 0)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PacketProviderState {
+    Unavailable,
+    AwaitingAuthenticatedControl,
+    Active,
+}
+
+fn packet_provider_state() -> Result<PacketProviderState, i32> {
+    packet_provider_state_from_wire(packet_status()?)
+}
+
+fn packet_provider_state_from_wire(value: u64) -> Result<PacketProviderState, i32> {
+    match value {
+        NET_BROKER_PACKET_STATUS_UNAVAILABLE => Ok(PacketProviderState::Unavailable),
+        NET_BROKER_PACKET_STATUS_AWAITING_AUTHENTICATED_CONTROL => {
+            Ok(PacketProviderState::AwaitingAuthenticatedControl)
+        }
+        NET_BROKER_PACKET_STATUS_ACTIVE => Ok(PacketProviderState::Active),
+        _ => Err(libc::EPROTO),
+    }
+}
+
+fn await_authenticated_packet_provider() -> Result<(), i32> {
+    let deadline = StdInstant::now() + AUTHENTICATED_CONTROL_WAIT;
+    let mut logged_wait = false;
+    loop {
+        match packet_provider_state()? {
+            PacketProviderState::Active => {
+                if logged_wait {
+                    debug_line("netd: authenticated DVM network control active");
+                }
+                return Ok(());
+            }
+            PacketProviderState::Unavailable => return Err(libc::ENODEV),
+            PacketProviderState::AwaitingAuthenticatedControl => {
+                if !logged_wait {
+                    debug_line("netd: waiting for authenticated DVM network control");
+                    logged_wait = true;
+                }
+            }
+        }
+        if StdInstant::now() >= deadline {
+            return Err(libc::ENODEV);
+        }
+        thread::sleep(AUTHENTICATED_CONTROL_RETRY);
+    }
+}
+
+#[cfg(test)]
+mod packet_provider_state_tests {
+    use super::{
+        NET_BROKER_PACKET_STATUS_ACTIVE, NET_BROKER_PACKET_STATUS_AWAITING_AUTHENTICATED_CONTROL,
+        NET_BROKER_PACKET_STATUS_UNAVAILABLE, PacketProviderState, packet_provider_state_from_wire,
+    };
+
+    #[test]
+    fn packet_provider_wire_states_are_explicit_and_fail_closed() {
+        assert_eq!(
+            packet_provider_state_from_wire(NET_BROKER_PACKET_STATUS_UNAVAILABLE),
+            Ok(PacketProviderState::Unavailable)
+        );
+        assert_eq!(
+            packet_provider_state_from_wire(
+                NET_BROKER_PACKET_STATUS_AWAITING_AUTHENTICATED_CONTROL
+            ),
+            Ok(PacketProviderState::AwaitingAuthenticatedControl)
+        );
+        assert_eq!(
+            packet_provider_state_from_wire(NET_BROKER_PACKET_STATUS_ACTIVE),
+            Ok(PacketProviderState::Active)
+        );
+        assert_eq!(packet_provider_state_from_wire(99), Err(libc::EPROTO));
+    }
+}
+
 fn packet_tx(frame: &[u8]) -> Result<usize, i32> {
     call_packet_broker(
         NET_BROKER_OP_PACKET_TX,
@@ -1931,7 +2018,11 @@ fn syscall4(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
 fn register_service_endpoint(service_id: u64, endpoint: u64) -> i64 {
     let mut last = 0;
     for _ in 0..65_536 {
-        last = syscall2(SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, service_id, endpoint);
+        last = syscall2(
+            SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
+            service_id,
+            endpoint,
+        );
         if last >= 0 {
             return last;
         }

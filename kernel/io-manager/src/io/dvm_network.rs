@@ -8,7 +8,7 @@ use driver_domain_protocol::{
     DVM_NET_HEADER_BYTES, DVM_NET_RECORD_BYTES, DVM_NET_SLOT_BYTES, DvmNetHeader,
 };
 
-use crate::network::PacketError;
+use crate::network::{PacketError, PacketTransportStatus};
 use crate::sync::KernelWaitLock;
 
 const IVSHMEM_VENDOR_ID: u16 = 0x1af4;
@@ -23,12 +23,48 @@ const SLOT_LEN_BYTES: usize = 4;
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 static UNAVAILABLE_LOGGED: AtomicBool = AtomicBool::new(false);
 static STATE: KernelWaitLock<Option<DvmNetworkState>> = KernelWaitLock::new(None);
+// The fixed ivshmem header and counters are DVM-writable after installation.
+// They can describe bounded frame state, but cannot attest that the L0-vetted
+// DVM control session is still alive.  This lease is changed only by the
+// authenticated RDI1 session markers delivered over L0's dedicated COM2 path.
+static CONTROL_LEASE: KernelWaitLock<ControlLease> = KernelWaitLock::new(ControlLease::inactive());
 
 struct DvmNetworkState {
     base: *mut u8,
     header: DvmNetHeader,
     tx_producer: u32,
     rx_consumer: u32,
+}
+
+#[derive(Clone, Copy)]
+struct ControlLease {
+    epoch: u32,
+}
+
+impl ControlLease {
+    const fn inactive() -> Self {
+        Self { epoch: 0 }
+    }
+
+    fn activate(&mut self, epoch: u32) -> bool {
+        if epoch == 0 {
+            return false;
+        }
+        self.epoch = epoch;
+        true
+    }
+
+    fn revoke_exact(&mut self, epoch: u32) -> bool {
+        if epoch == 0 || self.epoch != epoch {
+            return false;
+        }
+        self.epoch = 0;
+        true
+    }
+
+    const fn is_active(self) -> bool {
+        self.epoch != 0
+    }
 }
 
 // The state is accessed only while STATE is held. The aperture lifetime is the
@@ -86,11 +122,33 @@ pub(crate) fn try_install() -> bool {
             last_rejection = "header-outside-bar";
             return false;
         }
+        let tx_producer = read_u32(mapped, TX_PRODUCER_OFFSET);
+        let initial_rx_consumer = read_u32(mapped, RX_CONSUMER_OFFSET);
+        let initial_rx_producer = read_u32(mapped, RX_PRODUCER_OFFSET);
+        let rx_consumer =
+            if initial_rx_producer.wrapping_sub(initial_rx_consumer) <= header.slot_count {
+                // The host may map the aperture after the DVM is already running.
+                // A bounded backlog from before this kernel control lease is not
+                // delivered into netd. A forged producer cannot advance the
+                // RustOS-owned consumer because this distance was validated first.
+                write_u32(mapped, RX_CONSUMER_OFFSET, initial_rx_producer);
+                initial_rx_producer
+            } else {
+                // Preserve the last kernel cursor so every receive fails Invalid
+                // until the DVM restores a valid fixed-ring relation.
+                initial_rx_consumer
+            };
         installed = Some(DvmNetworkState {
             base: mapped,
             header,
-            tx_producer: read_u32(mapped, TX_PRODUCER_OFFSET),
-            rx_consumer: read_u32(mapped, RX_CONSUMER_OFFSET),
+            // A ring mapped after the DVM has started must not replay frames
+            // which predate the current authenticated control lease.  Do not
+            // rewind the DVM-visible TX producer; begin at its observed value.
+            tx_producer,
+            // RX is RustOS-owned state.  It may move only after the producer
+            // distance is bounded; a forged producer leaves the queue fail
+            // closed until the DVM restores a valid fixed-ring state.
+            rx_consumer,
         });
         true
     });
@@ -120,18 +178,36 @@ pub(crate) fn try_install() -> bool {
 }
 
 pub(crate) fn available() -> bool {
+    transport_status() == PacketTransportStatus::Active
+}
+
+pub(crate) fn transport_status() -> PacketTransportStatus {
     if !INSTALLED.load(Ordering::Acquire) && !try_install() {
-        return false;
+        return PacketTransportStatus::Unavailable;
     }
-    // The aperture is host-created and header-validated. DVM liveness is not
-    // a kernel authority decision: a guest-writable bit could be forged, and
-    // the bounded ring already returns Busy/Invalid rather than allocating or
-    // following guest-controlled descriptors. L0's authenticated health
-    // channel owns reset/revocation policy.
-    STATE.lock().is_some()
+    // The aperture is host-created and header-validated, but mapping it does
+    // not make a DVM live.  A guest-writable ready bit could be forged.  Hold
+    // the lease across the state check so SESSION_END cannot race a reported
+    // available transport with a later packet submission.
+    let lease = CONTROL_LEASE.lock();
+    if STATE.lock().is_none() {
+        return PacketTransportStatus::Unavailable;
+    }
+    if lease.is_active() {
+        PacketTransportStatus::Active
+    } else {
+        PacketTransportStatus::AwaitingAuthenticatedControl
+    }
 }
 
 pub(crate) fn transmit(frame: &[u8]) -> Result<usize, PacketError> {
+    // Lock ordering is always control lease, then ring state.  Revocation
+    // waits for an already-started bounded packet operation, then makes every
+    // later operation fail as NoDevice rather than using an untrusted aperture.
+    let lease = CONTROL_LEASE.lock();
+    if !lease.is_active() {
+        return Err(PacketError::NoDevice);
+    }
     let mut state = STATE.lock();
     let state = state.as_mut().ok_or(PacketError::NoDevice)?;
     if frame.len() > state.header.mtu as usize {
@@ -159,6 +235,10 @@ pub(crate) fn transmit(frame: &[u8]) -> Result<usize, PacketError> {
 }
 
 pub(crate) fn receive(out: &mut [u8]) -> Result<usize, PacketError> {
+    let lease = CONTROL_LEASE.lock();
+    if !lease.is_active() {
+        return Err(PacketError::NoDevice);
+    }
     let mut state = STATE.lock();
     let state = state.as_mut().ok_or(PacketError::NoDevice)?;
     let producer = read_u32(state.base, RX_PRODUCER_OFFSET);
@@ -184,6 +264,76 @@ pub(crate) fn receive(out: &mut [u8]) -> Result<usize, PacketError> {
     state.rx_consumer = state.rx_consumer.wrapping_add(1);
     write_u32(state.base, RX_CONSUMER_OFFSET, state.rx_consumer);
     Ok(len)
+}
+
+/// Admit a network lease from an L0-authenticated RDI1 session start.
+///
+/// This is intentionally a control-plane signal only. Ethernet frames remain
+/// on the bounded ivshmem transport; COM2 never becomes a network data proxy.
+/// The present single-DVM topology shares this authenticated lifecycle with
+/// input. A future independently supervised network DVM needs its own
+/// domain-specific authenticated lifecycle signal before it can use this API.
+pub(crate) fn activate_authenticated_control(epoch: u32) -> bool {
+    if epoch == 0 {
+        return false;
+    }
+
+    if !INSTALLED.load(Ordering::Acquire) && !try_install() {
+        // Remember a live authenticated control session even when PCI probing
+        // is temporarily early. A later install starts with an empty receive
+        // view and can then use this lease; no DVM header value can create it.
+        return CONTROL_LEASE.lock().activate(epoch);
+    }
+
+    // Readers hold CONTROL_LEASE before STATE, so reset the receive cursor
+    // before publishing the new lease. This drops only a bounded, validated
+    // backlog from a retired session. A forged producer never advances a
+    // RustOS-owned cursor during this reset.
+    let (activated, discarded) = {
+        let mut lease = CONTROL_LEASE.lock();
+        let mut state = STATE.lock();
+        let Some(state) = state.as_mut() else {
+            return false;
+        };
+        let discarded = state.discard_retired_receive_backlog();
+        (lease.activate(epoch), discarded)
+    };
+    if activated {
+        // Do not call the logging path while either transport lock is held.
+        crate::debug::println!(
+            "dvm-network: authenticated control lease active discarded_rx={}",
+            discarded
+        );
+    }
+    activated
+}
+
+/// Revoke exactly the L0-authenticated control lease named by SESSION_END.
+/// An old relay cleanup cannot tear down a newer session that has already
+/// replaced it. The shared aperture remains mapped, but all later RustOS
+/// packet operations fail closed until a new authenticated start arrives.
+pub(crate) fn revoke_authenticated_control(epoch: u32) -> bool {
+    let revoked = {
+        let mut lease = CONTROL_LEASE.lock();
+        lease.revoke_exact(epoch)
+    };
+    if revoked {
+        crate::debug::println!("dvm-network: authenticated control lease revoked");
+    }
+    revoked
+}
+
+impl DvmNetworkState {
+    fn discard_retired_receive_backlog(&mut self) -> bool {
+        let producer = read_u32(self.base, RX_PRODUCER_OFFSET);
+        let available = producer.wrapping_sub(self.rx_consumer);
+        if available > self.header.slot_count {
+            return false;
+        }
+        self.rx_consumer = producer;
+        write_u32(self.base, RX_CONSUMER_OFFSET, self.rx_consumer);
+        true
+    }
 }
 
 fn tx_slot(state: &DvmNetworkState, sequence: u32) -> Option<*mut u8> {
@@ -218,6 +368,36 @@ fn read_u32(base: *const u8, offset: usize) -> u32 {
 
 fn write_u32(base: *mut u8, offset: usize, value: u32) {
     // See `read_u32`: fixed aligned offsets are part of the transport ABI.
-    unsafe { (&*base.add(offset).cast::<AtomicU32>()).store(u32::from_le(value), Ordering::Release) };
+    unsafe {
+        (&*base.add(offset).cast::<AtomicU32>()).store(u32::from_le(value), Ordering::Release)
+    };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ControlLease;
+
+    #[test]
+    fn control_lease_requires_nonzero_epoch_and_exact_revocation() {
+        let mut lease = ControlLease::inactive();
+        assert!(!lease.is_active());
+        assert!(!lease.activate(0));
+        assert!(lease.activate(7));
+        assert!(lease.is_active());
+        assert!(!lease.revoke_exact(6));
+        assert!(lease.is_active());
+        assert!(lease.revoke_exact(7));
+        assert!(!lease.is_active());
+    }
+
+    #[test]
+    fn stale_cleanup_cannot_revoke_replaced_control_lease() {
+        let mut lease = ControlLease::inactive();
+        assert!(lease.activate(7));
+        assert!(lease.activate(11));
+        assert!(!lease.revoke_exact(7));
+        assert!(lease.is_active());
+        assert!(lease.revoke_exact(11));
+    }
 }
 // RING3-MIGRATION-REFERENCE END: DVM Ethernet transport substrate.

@@ -8,11 +8,12 @@ use core::sync::atomic::{AtomicU8, Ordering};
 
 use boot_protocol::{BootInfo, FramebufferInfo};
 use driver_abi::{
-    DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER, DisplayFramebufferRegistration, DisplayPixelFormat,
+    DISPLAY_FRAMEBUFFER_FLAG_DVM_SCANOUT, DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER,
+    DisplayFramebufferRegistration, DisplayPixelFormat,
 };
 use embedded_graphics::pixelcolor::Rgb888;
 
-use crate::user::abi::device::DISPLAY_INFO_FLAG_PRIMARY_PROVIDER;
+use crate::user::abi::device::{DISPLAY_INFO_FLAG_DVM_SCANOUT, DISPLAY_INFO_FLAG_PRIMARY_PROVIDER};
 
 static USERSPACE_DISPLAY_MODE: AtomicU8 = AtomicU8::new(DISPLAY_MODE_BOOT_CONSOLE);
 
@@ -70,8 +71,11 @@ pub unsafe extern "C" fn register_driver_framebuffer(
         _ => return -22,
     };
 
+    let allowed_flags =
+        DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER | DISPLAY_FRAMEBUFFER_FLAG_DVM_SCANOUT;
     if framebuffer.reserved != [0; 2]
-        || framebuffer.flags != DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER
+        || framebuffer.flags & DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER == 0
+        || framebuffer.flags & !allowed_flags != 0
     {
         return -22;
     }
@@ -104,8 +108,12 @@ pub fn display_info() -> Option<GuiDisplayInfo> {
     backend::display_info()
 }
 
-fn display_flags_from_driver_registration(_registration_flags: u8) -> u32 {
-    DISPLAY_INFO_FLAG_PRIMARY_PROVIDER
+fn display_flags_from_driver_registration(registration_flags: u8) -> u32 {
+    let mut flags = DISPLAY_INFO_FLAG_PRIMARY_PROVIDER;
+    if registration_flags & DISPLAY_FRAMEBUFFER_FLAG_DVM_SCANOUT != 0 {
+        flags |= DISPLAY_INFO_FLAG_DVM_SCANOUT;
+    }
+    flags
 }
 
 pub fn present_userspace_frame_from_kernel_bgra8888(
@@ -122,6 +130,29 @@ pub fn present_userspace_frame_from_kernel_bgra8888(
         USERSPACE_DISPLAY_MODE.store(DISPLAY_MODE_BOOT_CONSOLE, Ordering::Release);
     }
     presented
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DISPLAY_FRAMEBUFFER_FLAG_DVM_SCANOUT, DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER,
+        DISPLAY_INFO_FLAG_DVM_SCANOUT, DISPLAY_INFO_FLAG_PRIMARY_PROVIDER,
+        display_flags_from_driver_registration,
+    };
+
+    #[test]
+    fn dvm_scanout_provenance_survives_driver_registration() {
+        assert_eq!(
+            display_flags_from_driver_registration(DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER),
+            DISPLAY_INFO_FLAG_PRIMARY_PROVIDER
+        );
+        assert_eq!(
+            display_flags_from_driver_registration(
+                DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER | DISPLAY_FRAMEBUFFER_FLAG_DVM_SCANOUT
+            ),
+            DISPLAY_INFO_FLAG_PRIMARY_PROVIDER | DISPLAY_INFO_FLAG_DVM_SCANOUT
+        );
+    }
 }
 
 pub fn present_userspace_frame_rect_from_kernel_bgra8888(

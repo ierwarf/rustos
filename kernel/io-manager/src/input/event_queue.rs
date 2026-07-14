@@ -49,6 +49,10 @@ pub(crate) fn submit_dvm_linux_key(action: u16, linux_key_code: u16) -> bool {
     let mut ingress = InputIngressWire::default();
     ingress.kind = INPUTD_INGRESS_KIND_DVM_LINUX_KEY;
     ingress.access = INPUTD_ACCESS_NATIVE;
+    // Preserve the authenticated relay provenance all the way to inputd.
+    // The service rejects untagged Linux-key ingress so native producers
+    // cannot impersonate the DVM channel.
+    ingress.flags = INPUTD_INGRESS_FLAG_DVM_SOURCE;
     ingress.keyboard = InputKeyboardEventWire {
         action,
         reserved0: 0,
@@ -67,7 +71,10 @@ pub(crate) fn submit_dvm_input_reset() -> bool {
     ingress.kind = INPUTD_INGRESS_KIND_DVM_LINUX_KEY;
     ingress.access = INPUTD_ACCESS_NATIVE;
     ingress.flags = INPUTD_INGRESS_FLAG_RESET_STATE | INPUTD_INGRESS_FLAG_DVM_SOURCE;
-    push_ingress(ingress)
+    // A reset is a revocation barrier, not another input sample.  Purge any
+    // queued frames from the retired DVM session so an adversarial or wedged
+    // producer cannot make old key presses overtake its disconnect cleanup.
+    push_dvm_reset_ingress(ingress)
 }
 
 /// Queue a normalized pointer packet from the authenticated DVM relay. The
@@ -158,7 +165,12 @@ pub(crate) fn drain_ingress(dest: &mut [InputIngressWire]) -> usize {
 
 #[cfg(test)]
 pub(crate) fn reset_for_tests() {
-    *INPUT_INGRESS.lock() = HeaplessDeque::new();
+    // InputIngressWire carries a full bounded payload. Reconstructing all
+    // 2,048 slots as a temporary places the complete queue on the host test
+    // thread's stack and can overflow it before the test reaches the queue.
+    // Clear the static queue in place instead; production never uses this
+    // helper and retains the same fixed allocation.
+    INPUT_INGRESS.lock().clear();
     *INPUT_WAITERS.lock() = [None; INPUT_WAITERS_CAPACITY];
     POINTER_PACKET_SUBMIT_COUNT.store(0, Ordering::Relaxed);
     POINTER_ABSOLUTE_SUBMIT_COUNT.store(0, Ordering::Relaxed);
@@ -180,6 +192,25 @@ fn push_ingress(wire: InputIngressWire) -> bool {
         wake_input_waiters();
     }
     pushed
+}
+
+fn push_dvm_reset_ingress(wire: InputIngressWire) -> bool {
+    let discarded = with_ingress_queue(|ingress| replace_pending_with_reset(ingress, wire));
+    if discarded != 0 {
+        INPUT_INGRESS_DROP_COUNT.fetch_add(discarded as u64, Ordering::Relaxed);
+    }
+    wake_input_waiters();
+    true
+}
+
+fn replace_pending_with_reset<const CAPACITY: usize>(
+    ingress: &mut HeaplessDeque<InputIngressWire, CAPACITY>,
+    reset: InputIngressWire,
+) -> usize {
+    let discarded = ingress.len();
+    ingress.clear();
+    debug_assert!(ingress.push_back(reset).is_ok());
+    discarded
 }
 
 fn has_pending_ingress() -> bool {
@@ -231,9 +262,16 @@ fn with_input_waiters<R>(f: impl FnOnce(&mut [Option<u64>; INPUT_WAITERS_CAPACIT
 
 #[cfg(test)]
 mod tests {
-    use super::{debug_snapshot, drain_ingress, reset_for_tests, submit_dvm_pointer_packet};
+    use super::{
+        debug_snapshot, drain_ingress, replace_pending_with_reset, reset_for_tests,
+        submit_dvm_pointer_packet,
+    };
     use driver_abi::{POINTER_BUTTON_LEFT as POINTER_PACKET_LEFT, PointerPacket};
-    use rustos_user_abi::syscall::{INPUTD_INGRESS_KIND_POINTER_PACKET, InputIngressWire};
+    use heapless::Deque as HeaplessDeque;
+    use rustos_user_abi::syscall::{
+        INPUTD_INGRESS_FLAG_DVM_SOURCE, INPUTD_INGRESS_FLAG_RESET_STATE,
+        INPUTD_INGRESS_KIND_DVM_LINUX_KEY, INPUTD_INGRESS_KIND_POINTER_PACKET, InputIngressWire,
+    };
 
     fn isolated() -> std::sync::MutexGuard<'static, ()> {
         crate::test_support::exclusive_test()
@@ -281,6 +319,24 @@ mod tests {
         let snapshot = debug_snapshot();
         assert!(!snapshot.pending_coalesced);
         assert_eq!(snapshot.queued, 1);
+    }
+
+    #[test]
+    fn dvm_reset_is_a_priority_revocation_barrier() {
+        let mut ingress = HeaplessDeque::<InputIngressWire, 4>::new();
+        assert!(ingress.push_back(InputIngressWire::default()).is_ok());
+        assert!(ingress.push_back(InputIngressWire::default()).is_ok());
+        let mut reset = InputIngressWire::default();
+        reset.kind = INPUTD_INGRESS_KIND_DVM_LINUX_KEY;
+        reset.flags = INPUTD_INGRESS_FLAG_DVM_SOURCE | INPUTD_INGRESS_FLAG_RESET_STATE;
+        assert_eq!(replace_pending_with_reset(&mut ingress, reset), 2);
+        assert_eq!(ingress.len(), 1);
+        let queued = ingress.pop_front().unwrap();
+        assert_eq!(queued.kind, INPUTD_INGRESS_KIND_DVM_LINUX_KEY);
+        assert_eq!(
+            queued.flags,
+            INPUTD_INGRESS_FLAG_DVM_SOURCE | INPUTD_INGRESS_FLAG_RESET_STATE
+        );
     }
 }
 // RING3-MIGRATION-REFERENCE END: inputd-owned input event queue ingress exception.

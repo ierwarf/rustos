@@ -161,7 +161,10 @@ impl InputQueue {
     }
 
     fn reset_dvm_input(&mut self) {
-        self.dvm_keyboard = KeyboardDriver::default();
+        self.dvm_keyboard.reset_provider_state();
+        while let Some(event) = self.dvm_keyboard.pop_event() {
+            self.push_keyboard_driver_event(event);
+        }
         self.dvm_pointer_buttons = 0;
         self.publish_pointer_button_edges();
     }
@@ -663,8 +666,12 @@ mod retired_hid_parser {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::InputQueue;
-    use rustos_user_abi::syscall::{InputPointerPacketWire, InputdIpcRequest};
+    use super::{InputQueue, apply_dvm_ingress_wire};
+    use rustos_user_abi::syscall::{
+        INPUTD_ACCESS_NATIVE, INPUTD_INGRESS_FLAG_DVM_SOURCE, INPUTD_INGRESS_FLAG_RESET_STATE,
+        INPUTD_INGRESS_KIND_DVM_LINUX_KEY, InputIngressWire, InputPointerPacketWire,
+        InputdIpcRequest,
+    };
 
     fn pointer_motion(dx: i32, dy: i32) -> input_evdev::InputEvent {
         input_evdev::InputEvent {
@@ -809,15 +816,48 @@ mod tests {
     }
 
     #[test]
-    fn inputd_dvm_reset_releases_only_dvm_pointer_state() {
+    fn inputd_dvm_reset_releases_dvm_keyboard_and_pointer_state() {
         let mut queue = InputQueue::default();
+        queue.push_dvm_linux_key(29, input_evdev::INPUT_ACTION_PRESSED);
+        queue.push_dvm_linux_key(30, input_evdev::INPUT_ACTION_PRESSED);
+        let _ = queue.pop_front();
+        let _ = queue.pop_front();
         queue.push_dvm_pointer_packet(pointer_packet(1, 0, 0));
         let press = queue.pop_front().unwrap();
         assert_eq!(press.action, input_evdev::INPUT_ACTION_PRESSED);
 
         queue.reset_dvm_input();
-        let release = queue.pop_front().unwrap();
-        assert_eq!(release.action, input_evdev::INPUT_ACTION_RELEASED);
+        let ctrl_release = queue.pop_front().unwrap();
+        assert_eq!(ctrl_release.kind, input_evdev::INPUT_KIND_KEYBOARD);
+        assert_eq!(ctrl_release.action, input_evdev::INPUT_ACTION_RELEASED);
+        assert_eq!(ctrl_release.modifiers, 0);
+        let key_release = queue.pop_front().unwrap();
+        assert_eq!(key_release.kind, input_evdev::INPUT_KIND_KEYBOARD);
+        assert_eq!(key_release.action, input_evdev::INPUT_ACTION_RELEASED);
+        let pointer_release = queue.pop_front().unwrap();
+        assert_eq!(pointer_release.kind, input_evdev::INPUT_KIND_POINTER_BUTTON);
+        assert_eq!(pointer_release.action, input_evdev::INPUT_ACTION_RELEASED);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn inputd_accepts_the_dvm_reset_barrier_and_rejects_unknown_flags() {
+        let mut queue = InputQueue::default();
+        queue.push_dvm_linux_key(29, input_evdev::INPUT_ACTION_PRESSED);
+        let _ = queue.pop_front();
+
+        let mut reset = InputIngressWire::default();
+        reset.kind = INPUTD_INGRESS_KIND_DVM_LINUX_KEY;
+        reset.access = INPUTD_ACCESS_NATIVE;
+        reset.flags = INPUTD_INGRESS_FLAG_DVM_SOURCE | INPUTD_INGRESS_FLAG_RESET_STATE;
+        apply_dvm_ingress_wire(&mut queue, &reset);
+        assert_eq!(
+            queue.pop_front().unwrap().action,
+            input_evdev::INPUT_ACTION_RELEASED
+        );
+
+        reset.flags |= 1 << 15;
+        apply_dvm_ingress_wire(&mut queue, &reset);
         assert!(queue.is_empty());
     }
 
@@ -1072,40 +1112,15 @@ fn main() {
 
 fn serve(endpoint: u64) {
     let mut queue = InputQueue::default();
-    // This buffer is reused by both the periodic ingress turn and request
-    // handlers.  Do not allocate a new 96 KiB wire batch on every poll.
+    // This buffer is reused by request handlers. Do not allocate a new 96 KiB
+    // wire batch for every client read.
     let mut ingest_scratch = vec![InputIngressWire::default(); INPUTD_INGEST_MAX_EVENTS];
-    let mut ingest_failures = 0_u64;
     // These are lifecycle observations, not event telemetry. Preserve the
     // first proof of each DVM route without allowing an active device to flood
     // debugcon and perturb the UI path it is meant to validate.
     let mut dvm_keyboard_ingress_logged = false;
     let mut dvm_pointer_ingress_logged = false;
     loop {
-        let ingested = match drain_ingest(&mut queue, &mut ingest_scratch) {
-            Ok(count) => {
-                ingest_failures = 0;
-                count
-            }
-            Err(errno) => {
-                ingest_failures = ingest_failures.saturating_add(1);
-                if ingest_failures <= 3 || ingest_failures.is_power_of_two() {
-                    debug_line(&format!(
-                        "inputd: input ingest broker failed errno={errno} failures={ingest_failures}"
-                    ));
-                }
-                0
-            }
-        };
-        let (dvm_keyboard, dvm_pointer) = queue.take_dvm_ingress_observations();
-        if dvm_keyboard && !dvm_keyboard_ingress_logged {
-            debug_line("inputd: DVM keyboard ingress observed");
-            dvm_keyboard_ingress_logged = true;
-        }
-        if dvm_pointer && !dvm_pointer_ingress_logged {
-            debug_line("inputd: DVM pointer ingress observed");
-            dvm_pointer_ingress_logged = true;
-        }
         let mut request = [0_u8; IPC_MAX_INLINE_BYTES];
         let mut reply_cap = 0_u64;
         let received = syscall4(
@@ -1116,9 +1131,7 @@ fn serve(endpoint: u64) {
             (&mut reply_cap as *mut u64) as u64,
         );
         if received < 0 {
-            if ingested == 0 {
-                thread::sleep(INPUT_INGEST_POLL_INTERVAL);
-            }
+            thread::sleep(INPUT_INGEST_POLL_INTERVAL);
             continue;
         }
         if received == 0 {
@@ -1133,6 +1146,11 @@ fn serve(endpoint: u64) {
             if reply < 0 {
                 let _ = writeln!(std::io::stderr(), "inputd: reply failed errno={}", -reply);
             }
+            log_dvm_ingress_observations(
+                &mut queue,
+                &mut dvm_keyboard_ingress_logged,
+                &mut dvm_pointer_ingress_logged,
+            );
             continue;
         }
         if request_size == size_of::<InputdPointerSurfaceRequest>() {
@@ -1153,6 +1171,11 @@ fn serve(endpoint: u64) {
             if reply < 0 {
                 let _ = writeln!(std::io::stderr(), "inputd: reply failed errno={}", -reply);
             }
+            log_dvm_ingress_observations(
+                &mut queue,
+                &mut dvm_keyboard_ingress_logged,
+                &mut dvm_pointer_ingress_logged,
+            );
             continue;
         }
         if request_size != size_of::<InputdIpcRequest>() {
@@ -1195,6 +1218,27 @@ fn serve(endpoint: u64) {
         if reply < 0 {
             let _ = writeln!(std::io::stderr(), "inputd: reply failed errno={}", -reply);
         }
+        log_dvm_ingress_observations(
+            &mut queue,
+            &mut dvm_keyboard_ingress_logged,
+            &mut dvm_pointer_ingress_logged,
+        );
+    }
+}
+
+fn log_dvm_ingress_observations(
+    queue: &mut InputQueue,
+    dvm_keyboard_ingress_logged: &mut bool,
+    dvm_pointer_ingress_logged: &mut bool,
+) {
+    let (dvm_keyboard, dvm_pointer) = queue.take_dvm_ingress_observations();
+    if dvm_keyboard && !*dvm_keyboard_ingress_logged {
+        debug_line("inputd: DVM keyboard ingress observed");
+        *dvm_keyboard_ingress_logged = true;
+    }
+    if dvm_pointer && !*dvm_pointer_ingress_logged {
+        debug_line("inputd: DVM pointer ingress observed");
+        *dvm_pointer_ingress_logged = true;
     }
 }
 
@@ -1330,27 +1374,33 @@ fn drain_ingest(queue: &mut InputQueue, events: &mut [InputIngressWire]) -> Resu
     }
     let count = (count as usize).min(events.len());
     for wire in events.iter().take(count) {
-        match wire.kind {
-            INPUTD_INGRESS_KIND_DVM_LINUX_KEY
-                if wire.access == INPUTD_ACCESS_NATIVE
-                    && wire.flags & !INPUTD_INGRESS_FLAG_DVM_SOURCE == 0 =>
-            {
-                if wire.flags & INPUTD_INGRESS_FLAG_RESET_STATE != 0 {
-                    queue.reset_dvm_input();
-                    continue;
-                }
-                queue.push_dvm_linux_key(wire.keyboard.code, wire.keyboard.action);
-            }
-            INPUTD_INGRESS_KIND_POINTER_PACKET
-                if wire.access == INPUTD_ACCESS_NATIVE
-                    && wire.flags == INPUTD_INGRESS_FLAG_DVM_SOURCE =>
-            {
-                queue.push_dvm_pointer_packet(wire.pointer_packet);
-            }
-            _ => {}
-        }
+        apply_dvm_ingress_wire(queue, wire);
     }
     Ok(count)
+}
+
+fn apply_dvm_ingress_wire(queue: &mut InputQueue, wire: &InputIngressWire) {
+    match wire.kind {
+        INPUTD_INGRESS_KIND_DVM_LINUX_KEY
+            if wire.access == INPUTD_ACCESS_NATIVE
+                && (wire.flags == INPUTD_INGRESS_FLAG_DVM_SOURCE
+                    || wire.flags
+                        == (INPUTD_INGRESS_FLAG_DVM_SOURCE | INPUTD_INGRESS_FLAG_RESET_STATE)) =>
+        {
+            if wire.flags & INPUTD_INGRESS_FLAG_RESET_STATE != 0 {
+                queue.reset_dvm_input();
+                return;
+            }
+            queue.push_dvm_linux_key(wire.keyboard.code, wire.keyboard.action);
+        }
+        INPUTD_INGRESS_KIND_POINTER_PACKET
+            if wire.access == INPUTD_ACCESS_NATIVE
+                && wire.flags == INPUTD_INGRESS_FLAG_DVM_SOURCE =>
+        {
+            queue.push_dvm_pointer_packet(wire.pointer_packet);
+        }
+        _ => {}
+    }
 }
 
 fn fill_native_payload(

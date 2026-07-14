@@ -276,9 +276,15 @@ struct SharedRegionObject {
     page_count: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EndpointOwner {
+    Task(u64),
+    Process(u64),
+}
+
 #[derive(Default)]
 struct EndpointObject {
-    owner_task_id: Option<u64>,
+    owner: Option<EndpointOwner>,
     pending_messages: VecDeque<u64>,
     waiting_receivers: VecDeque<u64>,
 }
@@ -293,7 +299,7 @@ struct EndpointMessageObject {
 
 struct ReplyObject {
     message_id: u64,
-    receiver_task_id: Option<u64>,
+    receiver_owner: Option<EndpointOwner>,
     used: bool,
 }
 
@@ -650,18 +656,33 @@ pub fn create_shared_region(byte_len: usize) -> Result<KernelSharedRegionHandle,
 }
 
 pub fn create_endpoint() -> Result<KernelEndpointHandle, IpcError> {
-    create_endpoint_for_task(None)
+    create_endpoint_with_owner(None)
 }
 
 pub fn create_endpoint_for_task(
     owner_task_id: Option<u64>,
+) -> Result<KernelEndpointHandle, IpcError> {
+    create_endpoint_with_owner(owner_task_id.map(EndpointOwner::Task))
+}
+
+/// User-visible endpoints are process-owned: a service may safely receive and
+/// reply on a worker thread, while another process cannot consume its queue or
+/// forge a reply with a guessed raw capability.
+pub fn create_endpoint_for_process(
+    owner_process_id: u64,
+) -> Result<KernelEndpointHandle, IpcError> {
+    create_endpoint_with_owner(Some(EndpointOwner::Process(owner_process_id)))
+}
+
+fn create_endpoint_with_owner(
+    owner: Option<EndpointOwner>,
 ) -> Result<KernelEndpointHandle, IpcError> {
     with_ipc_objects(|objects| {
         let id = objects.allocate_id()?;
         objects.endpoints.insert(
             id,
             EndpointObject {
-                owner_task_id,
+                owner,
                 pending_messages: VecDeque::with_capacity(INITIAL_PENDING_CHANNEL_CAPACITY),
                 waiting_receivers: VecDeque::with_capacity(INITIAL_PENDING_CHANNEL_CAPACITY),
             },
@@ -711,7 +732,7 @@ pub fn enqueue_endpoint_call_with_handles(
         if endpoint_object.pending_messages.len() >= MAX_ENDPOINT_PENDING_MESSAGES {
             return Err(IpcError::NoMemory);
         }
-        let receiver_task_id = endpoint_object.owner_task_id;
+        let receiver_owner = endpoint_object.owner;
 
         let message_id = objects.allocate_id()?;
         let reply_id = objects.allocate_id()?;
@@ -729,7 +750,7 @@ pub fn enqueue_endpoint_call_with_handles(
             reply_id,
             ReplyObject {
                 message_id,
-                receiver_task_id,
+                receiver_owner,
                 used: false,
             },
         );
@@ -743,7 +764,10 @@ pub fn enqueue_endpoint_call_with_handles(
             endpoint_object
                 .waiting_receivers
                 .pop_front()
-                .or(endpoint_object.owner_task_id)
+                .or(match endpoint_object.owner {
+                    Some(EndpointOwner::Task(task_id)) => Some(task_id),
+                    Some(EndpointOwner::Process(_)) | None => None,
+                })
                 .filter(|task_id| *task_id != caller_task_id)
         };
 
@@ -835,9 +859,9 @@ pub fn recv_endpoint_with_sender_and_limits(
     })
 }
 
-/// Confirms that an endpoint created for a user task is received only by that
-/// task. Kernel-internal anonymous endpoints retain their existing unowned
-/// behavior; user-visible endpoints are always created with an owner.
+/// Confirms that a task-owned internal endpoint is received only by that task.
+/// User-visible endpoints use `authorize_endpoint_receiver_for_process` so
+/// workers in the owning process are valid receivers.
 pub fn authorize_endpoint_receiver(
     endpoint: KernelEndpointHandle,
     receiver_task_id: u64,
@@ -846,14 +870,33 @@ pub fn authorize_endpoint_receiver(
         let Some(endpoint_object) = objects.endpoints.get(&endpoint.raw()) else {
             return Err(IpcError::InvalidHandle);
         };
-        if endpoint_object
-            .owner_task_id
-            .is_some_and(|owner_task_id| owner_task_id != receiver_task_id)
-        {
+        if !endpoint_owner_allows(endpoint_object.owner, EndpointOwner::Task(receiver_task_id)) {
             return Err(IpcError::PermissionDenied);
         }
         Ok(())
     })
+}
+
+pub fn authorize_endpoint_receiver_for_process(
+    endpoint: KernelEndpointHandle,
+    receiver_process_id: u64,
+) -> Result<(), IpcError> {
+    with_ipc_objects(|objects| {
+        let Some(endpoint_object) = objects.endpoints.get(&endpoint.raw()) else {
+            return Err(IpcError::InvalidHandle);
+        };
+        if !endpoint_owner_allows(
+            endpoint_object.owner,
+            EndpointOwner::Process(receiver_process_id),
+        ) {
+            return Err(IpcError::PermissionDenied);
+        }
+        Ok(())
+    })
+}
+
+fn endpoint_owner_allows(owner: Option<EndpointOwner>, receiver: EndpointOwner) -> bool {
+    owner.is_none_or(|owner| owner == receiver)
 }
 
 /// Registers `task_id` as a receiver waiter on `endpoint`. Returns
@@ -918,20 +961,67 @@ pub fn complete_endpoint_reply_with_handles(
     })
 }
 
-/// Completes a reply obtained through a user-visible endpoint receive. A
-/// reply capability is bound to the task that owns the destination endpoint,
-/// so a guessed raw reply id cannot authorize an unrelated process.
+/// Completes a reply obtained through a task-owned internal endpoint.
 pub fn complete_endpoint_reply_for_task(
     reply: KernelReplyHandle,
     receiver_task_id: u64,
     response: &[u8],
 ) -> Result<u64, IpcError> {
-    complete_endpoint_reply_with_handles_for_task(reply, receiver_task_id, response, &[])
+    complete_endpoint_reply_with_handles_for_owner(
+        reply,
+        EndpointOwner::Task(receiver_task_id),
+        response,
+        &[],
+    )
 }
 
 pub fn complete_endpoint_reply_with_handles_for_task(
     reply: KernelReplyHandle,
     receiver_task_id: u64,
+    response: &[u8],
+    attached_handles: &[KernelTransferredHandle],
+) -> Result<u64, IpcError> {
+    complete_endpoint_reply_with_handles_for_owner(
+        reply,
+        EndpointOwner::Task(receiver_task_id),
+        response,
+        attached_handles,
+    )
+}
+
+/// Completes a reply obtained through a process-owned user endpoint. The
+/// capability is bound to the destination process, allowing its worker
+/// threads while rejecting unrelated processes.
+pub fn complete_endpoint_reply_for_process(
+    reply: KernelReplyHandle,
+    receiver_process_id: u64,
+    response: &[u8],
+) -> Result<u64, IpcError> {
+    complete_endpoint_reply_with_handles_for_owner(
+        reply,
+        EndpointOwner::Process(receiver_process_id),
+        response,
+        &[],
+    )
+}
+
+pub fn complete_endpoint_reply_with_handles_for_process(
+    reply: KernelReplyHandle,
+    receiver_process_id: u64,
+    response: &[u8],
+    attached_handles: &[KernelTransferredHandle],
+) -> Result<u64, IpcError> {
+    complete_endpoint_reply_with_handles_for_owner(
+        reply,
+        EndpointOwner::Process(receiver_process_id),
+        response,
+        attached_handles,
+    )
+}
+
+fn complete_endpoint_reply_with_handles_for_owner(
+    reply: KernelReplyHandle,
+    receiver_owner: EndpointOwner,
     response: &[u8],
     attached_handles: &[KernelTransferredHandle],
 ) -> Result<u64, IpcError> {
@@ -944,10 +1034,7 @@ pub fn complete_endpoint_reply_with_handles_for_task(
         let Some(reply_object) = objects.replies.get_mut(&reply.raw()) else {
             return Err(IpcError::InvalidHandle);
         };
-        if reply_object
-            .receiver_task_id
-            .is_some_and(|owner_task_id| owner_task_id != receiver_task_id)
-        {
+        if !endpoint_owner_allows(reply_object.receiver_owner, receiver_owner) {
             return Err(IpcError::PermissionDenied);
         }
         if reply_object.used {
@@ -1129,12 +1216,20 @@ pub fn remove_endpoint_waiters_for_task(task_id: u64) -> usize {
 }
 
 pub fn fail_endpoints_owned_by_task(task_id: u64, err: IpcError) -> EndpointWakeSet {
+    fail_endpoints_owned_by(EndpointOwner::Task(task_id), err)
+}
+
+pub fn fail_endpoints_owned_by_process(process_id: u64, err: IpcError) -> EndpointWakeSet {
+    fail_endpoints_owned_by(EndpointOwner::Process(process_id), err)
+}
+
+fn fail_endpoints_owned_by(owner: EndpointOwner, err: IpcError) -> EndpointWakeSet {
     with_ipc_objects(|objects| {
         let endpoints = objects
             .endpoints
             .iter()
             .filter_map(|(endpoint_id, endpoint)| {
-                (endpoint.owner_task_id == Some(task_id)).then_some(*endpoint_id)
+                (endpoint.owner == Some(owner)).then_some(*endpoint_id)
             })
             .collect::<Vec<_>>();
         if endpoints.is_empty() {
@@ -1698,6 +1793,34 @@ mod tests {
     }
 
     #[test]
+    fn process_owned_endpoint_allows_worker_and_rejects_foreign_process() {
+        with_isolated_ipc_test(|| {
+            let endpoint = super::create_endpoint_for_process(10).expect("create endpoint");
+            let (reply, _) =
+                super::enqueue_endpoint_call(endpoint, 22, b"request").expect("enqueue call");
+
+            assert_eq!(
+                super::authorize_endpoint_receiver_for_process(endpoint, 11),
+                Err(super::IpcError::PermissionDenied)
+            );
+            // A different task in the owning service process may receive and
+            // reply; this is how uiserver's display-policy worker operates.
+            assert_eq!(
+                super::authorize_endpoint_receiver_for_process(endpoint, 10),
+                Ok(())
+            );
+            assert_eq!(
+                super::complete_endpoint_reply_for_process(reply, 11, b"forged"),
+                Err(super::IpcError::PermissionDenied)
+            );
+            assert_eq!(
+                super::complete_endpoint_reply_for_process(reply, 10, b"ok"),
+                Ok(22)
+            );
+        });
+    }
+
+    #[test]
     fn endpoint_request_handles_require_explicit_receive_capacity() {
         with_isolated_ipc_test(|| {
             let endpoint = super::create_endpoint().expect("create endpoint");
@@ -1912,6 +2035,22 @@ mod tests {
             assert_eq!(
                 super::enqueue_endpoint_call(endpoint, 23, b"request"),
                 Err(IpcError::InvalidHandle)
+            );
+        });
+    }
+
+    #[test]
+    fn process_owner_exit_fails_pending_callers() {
+        with_isolated_ipc_test(|| {
+            let endpoint = super::create_endpoint_for_process(10).expect("create endpoint");
+            let (reply, _) =
+                super::enqueue_endpoint_call(endpoint, 22, b"request").expect("enqueue call");
+
+            let wake_set = super::fail_endpoints_owned_by_process(10, IpcError::PeerClosed);
+            assert_eq!(wake_set.callers, alloc::vec![22]);
+            assert_eq!(
+                super::take_endpoint_response(reply),
+                Err(IpcError::PeerClosed)
             );
         });
     }

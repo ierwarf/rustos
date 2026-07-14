@@ -288,7 +288,8 @@ fn validate_display_policy_request(
         | syscall_abi::COMMERCIAL_MAX_UISERVER_OP_DISPLAY_METADATA
         | syscall_abi::COMMERCIAL_MAX_UISERVER_OP_SURFACE_POLICY
         | syscall_abi::COMMERCIAL_MAX_UISERVER_OP_PRESENT_POLICY
-        | syscall_abi::COMMERCIAL_MAX_UISERVER_OP_TERMINAL_PRESENT_POLICY => Ok(()),
+        | syscall_abi::COMMERCIAL_MAX_UISERVER_OP_TERMINAL_PRESENT_POLICY
+        | syscall_abi::COMMERCIAL_MAX_UISERVER_OP_TRUSTED_UI_STATUS => Ok(()),
         _ => Err(libc::EINVAL),
     }
 }
@@ -338,6 +339,12 @@ fn fill_display_policy_response(
                 display_policy_capability("terminal-present-policy", request.header.op);
             0
         }
+        syscall_abi::COMMERCIAL_MAX_UISERVER_OP_TRUSTED_UI_STATUS => {
+            response.value0 = trusted_ui_status(DISPLAY_POLICY_FLAGS.load(Ordering::Acquire));
+            response.value1 = DISPLAY_POLICY_GENERATION.load(Ordering::Acquire);
+            response.capability = display_policy_capability("trusted-ui-status", request.header.op);
+            0
+        }
         _ => libc::EINVAL,
     }
 }
@@ -382,8 +389,22 @@ fn display_policy_capability_mask(op: u16) -> u64 {
         syscall_abi::COMMERCIAL_MAX_UISERVER_OP_SURFACE_POLICY => 1 << 2,
         syscall_abi::COMMERCIAL_MAX_UISERVER_OP_PRESENT_POLICY => 1 << 3,
         syscall_abi::COMMERCIAL_MAX_UISERVER_OP_TERMINAL_PRESENT_POLICY => 1 << 4,
+        syscall_abi::COMMERCIAL_MAX_UISERVER_OP_TRUSTED_UI_STATUS => 1 << 5,
         _ => 0,
     }
+}
+
+/// Current RustOS DVM transports deliberately provide no attested physical
+/// display or human-input path. A future trusted UI implementation may clear
+/// these blockers only after independently attesting both channels; a normal
+/// primary provider, including a native one, is not sufficient.
+fn trusted_ui_status(display_flags: u32) -> u64 {
+    let mut status = syscall_abi::UISERVER_TRUSTED_UI_STATUS_UNATTESTED_SCANOUT
+        | syscall_abi::UISERVER_TRUSTED_UI_STATUS_UNATTESTED_INPUT;
+    if display_flags & device_abi::DISPLAY_INFO_FLAG_DVM_SCANOUT != 0 {
+        status |= syscall_abi::UISERVER_TRUSTED_UI_STATUS_DVM_SCANOUT;
+    }
+    status
 }
 
 fn copy_policy_label(label: &str, target: &mut [u8], len: &mut u16) {
@@ -1202,7 +1223,9 @@ mod tests {
     use super::{
         EV_KEY, INPUT_ACTION_PRESSED, INPUT_ACTION_RELEASED, INPUT_KIND_KEYBOARD,
         InputTranslationState, LinuxInputEvent, LinuxInputTimeval, translate_linux_input_event,
+        trusted_ui_status,
     };
+    use rustos_user_abi::{device, syscall};
 
     fn key_event(code: u16, value: i32) -> LinuxInputEvent {
         LinuxInputEvent {
@@ -1228,6 +1251,23 @@ mod tests {
         assert_eq!(release.kind, INPUT_KIND_KEYBOARD);
         assert_eq!(release.action, INPUT_ACTION_RELEASED);
         assert_eq!(release.text, 0);
+    }
+
+    #[test]
+    fn trusted_ui_status_fails_closed_for_every_current_scanout() {
+        let baseline = syscall::UISERVER_TRUSTED_UI_STATUS_UNATTESTED_SCANOUT
+            | syscall::UISERVER_TRUSTED_UI_STATUS_UNATTESTED_INPUT;
+        assert_eq!(trusted_ui_status(0), baseline);
+        assert_eq!(
+            trusted_ui_status(device::DISPLAY_INFO_FLAG_PRIMARY_PROVIDER),
+            baseline
+        );
+        assert_eq!(
+            trusted_ui_status(
+                device::DISPLAY_INFO_FLAG_PRIMARY_PROVIDER | device::DISPLAY_INFO_FLAG_DVM_SCANOUT
+            ),
+            baseline | syscall::UISERVER_TRUSTED_UI_STATUS_DVM_SCANOUT
+        );
     }
 }
 

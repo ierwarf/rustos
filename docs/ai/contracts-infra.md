@@ -146,6 +146,15 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
 - `cargo xtask build-dvm` invokes `driver-domains/linux/Makefile`; `verify-dvm`
   validates the manifest schema plus kernel, rootfs, config, source-lock, and
   immutable DVM control-contract SHA-256 values before a KVM guest starts.
+- Each KVM launch creates a fresh 256-bit DVM control secret in the L0 runtime
+  directory (directory `0700`, file `0600`) and injects it as QEMU fw_cfg.
+  The Linux agent may read that value only through fw_cfg's root-only `raw`
+  attribute. The static contract and vsock CID select the expected DVM, but
+  `dvm-agent-hmac-sha256-v1` must prove the fresh challenge plus exact HELLO
+  before L0 writes `WELCOME` or allows a probe/input relay. `rustos-hostd
+  probe` and `relay-input` therefore require `--control-secret` from the same
+  owner-private launch material. Do not put the secret on a kernel command
+  line, image filesystem, manifest, log, or service environment.
 - The DVM wrapper fingerprints Buildroot configuration, each local relay
   (`rustos-dvm-agent`, `rustos-dvm-display`, `rustos-dvm-net`), and the rootfs
   overlay separately. Configuration or toolchain changes use `distclean`; a
@@ -240,15 +249,20 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   is implemented. Network, block, and display must remain `disabled` until
   their separate queue/DMA/reset/revocation contracts are implemented. The
   normal command is a reconnecting L0 service; `--once` is diagnostics-only.
-- `rustos-hostd acquire` remains read-only unless both `--activate` and
-  `--allow-unsigned-test-bind` are supplied. That laboratory-only path first
-  persists an owner-private `prepared` lease with each original PCI driver and
-  `driver_override`, then binds the whole preflighted group to `vfio-pci` and
-  atomically marks it active. Reverse-order rollback is mandatory on failure;
-  failed acquisition retains the prepared record, and `release --activate`
-  restores either prepared or active records and deletes them only after
-  success. Do not enable ordinary activation until a release
-  manifest cryptographically binds the validated plan to the DVM artifacts.
+- `rustos-hostd acquire` remains read-only unless `--activate` is supplied
+  together with a detached OpenPGP signature, an explicit pinned release
+  keyring, a strict `release-authorization-v1` payload, the bound DVM artifact
+  manifest, the bound driver-domain policy, and a bound fleet policy. The
+  signed authorization binds the complete validated IOMMU group, domain CID,
+  all three file hashes, and a bounded validity window. The fleet policy must
+  contain an exact matching member and rejects cross-domain CID, IOMMU-group,
+  and PCI-BDF reuse; unsigned activation is unavailable. Only after all of
+  those checks does hostd persist an owner-private `prepared` lease with each
+  original PCI driver and `driver_override`, bind the whole preflighted group
+  to `vfio-pci`, and atomically mark it active. Reverse-order rollback is
+  mandatory on failure; failed acquisition retains the prepared record, and
+  `release --activate` restores either prepared or active records and deletes
+  them only after success.
 
 ## Fault Injection
 

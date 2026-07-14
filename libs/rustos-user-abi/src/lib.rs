@@ -71,6 +71,11 @@ mod tests {
         assert_eq!(syscall::SYS_RUSTOS_IPC_RECV_WITH_SENDER, 0x5255_0038);
         assert_eq!(syscall::SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT, 0x5255_0039);
         assert_eq!(syscall::SYS_RUSTOS_PROC_ACTIVATE_BROKER, 0x5255_003a);
+        assert_eq!(syscall::SYS_RUSTOS_ROOTD_WAIT_BROKER, 0x5255_003b);
+        assert_eq!(syscall::SYS_RUSTOS_ROOTD_TERMINATE_BROKER, 0x5255_003c);
+        assert!(
+            size_of::<syscall::RustosRootdTerminateBrokerArgs>() <= syscall::IPC_MAX_INLINE_BYTES
+        );
         assert_eq!(
             syscall::SYS_RUSTOS_SERVICE_DRIVER_RESOURCE_BROKER,
             0x5255_0022
@@ -200,6 +205,8 @@ mod tests {
             syscall::COMMERCIAL_MAX_UISERVER_OP_TERMINAL_PRESENT_POLICY,
             5
         );
+        assert_eq!(syscall::COMMERCIAL_MAX_UISERVER_OP_TRUSTED_UI_STATUS, 6);
+        assert_eq!(device::DISPLAY_INFO_FLAG_DVM_SCANOUT, 1 << 2);
         assert_eq!(syscall::COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE, 3);
         assert!(
             size_of::<syscall::CommercialMaxProtocolRequest>() <= syscall::IPC_MAX_INLINE_BYTES

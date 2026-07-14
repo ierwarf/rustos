@@ -57,6 +57,12 @@ pub const SYS_RUSTOS_DRIVER_SYMBOL_EVENT_BROKER: u64 = 0x5255_0037;
 pub const SYS_RUSTOS_IPC_RECV_WITH_SENDER: u64 = 0x5255_0038;
 pub const SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT: u64 = 0x5255_0039;
 pub const SYS_RUSTOS_PROC_ACTIVATE_BROKER: u64 = 0x5255_003a;
+/// Capability-gated timer substrate for rootd's bounded restart backoff.
+/// Restart policy remains in rootd; ring0 only waits for the supplied interval.
+pub const SYS_RUSTOS_ROOTD_WAIT_BROKER: u64 = 0x5255_003b;
+/// Rootd-only final process teardown.  Admission and target selection remain
+/// rootd lease policy; ring0 atomically performs the process-resource cleanup.
+pub const SYS_RUSTOS_ROOTD_TERMINATE_BROKER: u64 = 0x5255_003c;
 
 /// RustOS-private auxv entry: virtual address of the bootstrap heap region
 /// that the kernel pre-maps for static-PIE policy services so they can run
@@ -298,6 +304,13 @@ pub const NET_BROKER_OP_PACKET_STATUS: u16 = 0x8001;
 pub const NET_BROKER_OP_PACKET_TX: u16 = 0x8002;
 pub const NET_BROKER_OP_PACKET_RX: u16 = 0x8003;
 pub const NET_BROKER_PACKET_MTU: usize = 1514;
+/// No validated DVM Ethernet aperture is currently mapped.
+pub const NET_BROKER_PACKET_STATUS_UNAVAILABLE: u64 = 0;
+/// A validated aperture exists, but L0 has not authenticated a live control
+/// epoch. Packet operations remain fail-closed until it becomes active.
+pub const NET_BROKER_PACKET_STATUS_AWAITING_AUTHENTICATED_CONTROL: u64 = 1;
+/// Both a validated aperture and its L0-authenticated control epoch are live.
+pub const NET_BROKER_PACKET_STATUS_ACTIVE: u64 = 2;
 pub const VFS_LIFECYCLE_FORK: u16 = 1;
 pub const VFS_LIFECYCLE_EXEC_CLOEXEC: u16 = 2;
 pub const VFS_LIFECYCLE_EXIT: u16 = 3;
@@ -424,6 +437,11 @@ pub const COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY: u16 = 4;
 pub const COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL: u16 = 5;
 pub const COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY: u16 = 6;
 pub const COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP: u16 = 7;
+/// Return the current post-init service lease for the authenticated initd.
+pub const COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY: u16 = 8;
+/// Revoke and, when still live, terminate an unrecoverable post-init lease.
+/// Only the current initd may reclaim its own service classes.
+pub const COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM: u16 = 9;
 pub const COMMERCIAL_MAX_PROCD_OP_PROCESS_PREPARE: u16 = 1;
 pub const COMMERCIAL_MAX_PROCD_OP_EXEC_TICKET: u16 = 2;
 pub const COMMERCIAL_MAX_PROCD_OP_FORK_PLAN: u16 = 3;
@@ -536,6 +554,12 @@ pub const COMMERCIAL_MAX_UISERVER_OP_DISPLAY_METADATA: u16 = 2;
 pub const COMMERCIAL_MAX_UISERVER_OP_SURFACE_POLICY: u16 = 3;
 pub const COMMERCIAL_MAX_UISERVER_OP_PRESENT_POLICY: u16 = 4;
 pub const COMMERCIAL_MAX_UISERVER_OP_TERMINAL_PRESENT_POLICY: u16 = 5;
+/// Reports whether a trusted prompt may use the current presentation/input
+/// path. A caller may treat the path as trusted only when `value0 == 0`.
+pub const COMMERCIAL_MAX_UISERVER_OP_TRUSTED_UI_STATUS: u16 = 6;
+pub const UISERVER_TRUSTED_UI_STATUS_UNATTESTED_SCANOUT: u64 = 1 << 0;
+pub const UISERVER_TRUSTED_UI_STATUS_UNATTESTED_INPUT: u64 = 1 << 1;
+pub const UISERVER_TRUSTED_UI_STATUS_DVM_SCANOUT: u64 = 1 << 2;
 pub const COMMERCIAL_MAX_CAPABILITY_OP_LEASE_GRANT: u16 = 1;
 pub const COMMERCIAL_MAX_CAPABILITY_OP_LEASE_REVOKE: u16 = 2;
 pub const COMMERCIAL_MAX_CAPABILITY_OP_LEASE_RENEW: u16 = 3;
@@ -2132,6 +2156,15 @@ pub struct RustosProcCommitBrokerArgs {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RustosProcActivateBrokerArgs {
+    pub abi_version: u16,
+    pub reserved0: u16,
+    pub flags: u32,
+    pub target_pid: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RustosRootdTerminateBrokerArgs {
     pub abi_version: u16,
     pub reserved0: u16,
     pub flags: u32,

@@ -1,12 +1,14 @@
-#![no_std]
-#![no_main]
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
 
+#[cfg(not(test))]
 use core::alloc::{GlobalAlloc, Layout};
 use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::mem::size_of;
 #[cfg(not(test))]
 use core::panic::PanicInfo;
+#[cfg(not(test))]
 use core::ptr;
 use core::slice;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -17,6 +19,7 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_PROTOCOL_CAPABILITY, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
     COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR, COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST,
     COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE, COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH,
+    COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY, COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM,
     COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL, COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY, COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP,
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
@@ -30,11 +33,11 @@ use rustos_user_abi::syscall::{
     LifecycleEventWire, LoaderSpawnRequest, LoaderSpawnResponse, ROOTD_IPC_ABI_VERSION,
     ROOTD_IPC_OP_LEASE_LIST, ROOTD_IPC_OP_STATUS, ROOTD_LEASE_STATE_EXITED,
     ROOTD_LEASE_STATE_FAILED, ROOTD_LEASE_STATE_RESTART_PENDING, ROOTD_LEASE_STATE_RUNNING,
-    RootdIpcRequest, RootdIpcResponse, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_CALL,
-    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
+    RootdIpcRequest, RootdIpcResponse, RustosRootdTerminateBrokerArgs, SYS_RUSTOS_DEBUG_PRINT,
+    SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
     SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
     SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
-    SYS_RUSTOS_SPAWN_EXEC,
+    SYS_RUSTOS_ROOTD_TERMINATE_BROKER, SYS_RUSTOS_ROOTD_WAIT_BROKER, SYS_RUSTOS_SPAWN_EXEC,
 };
 
 const SYS_SCHED_YIELD: u64 = 24;
@@ -167,19 +170,25 @@ static INITD_LOADER_REQUEST: RootdIpcCell<LoaderSpawnRequest> =
 static INITD_LOADER_RESPONSE: RootdIpcCell<LoaderSpawnResponse> =
     RootdIpcCell(UnsafeCell::new(empty_loader_spawn_response()));
 
+#[cfg(not(test))]
 const ROOTD_HEAP_BYTES: usize = 8 * 1024 * 1024;
 
+#[cfg(not(test))]
 #[repr(align(4096))]
 struct RootdHeap([u8; ROOTD_HEAP_BYTES]);
 
+#[cfg(not(test))]
 static mut ROOTD_HEAP: RootdHeap = RootdHeap([0; ROOTD_HEAP_BYTES]);
 
+#[cfg(not(test))]
 struct RootdBumpAllocator {
     cursor: AtomicUsize,
 }
 
+#[cfg(not(test))]
 unsafe impl Sync for RootdBumpAllocator {}
 
+#[cfg(not(test))]
 impl RootdBumpAllocator {
     const fn new() -> Self {
         Self {
@@ -188,9 +197,11 @@ impl RootdBumpAllocator {
     }
 }
 
+#[cfg(not(test))]
 #[global_allocator]
 static ROOTD_ALLOCATOR: RootdBumpAllocator = RootdBumpAllocator::new();
 
+#[cfg(not(test))]
 unsafe impl GlobalAlloc for RootdBumpAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let align = layout.align().max(1);
@@ -237,10 +248,12 @@ struct PostInitLease {
     service_id: u64,
     exec_path: &'static [u8],
     pid: u64,
+    reporter_pid: u64,
     state: u16,
     exit_status: i32,
 }
 
+#[cfg(not(test))]
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     debug_line(b"rootd: bootstrap enter\n");
@@ -316,6 +329,7 @@ fn post_init_lease(spec: PostInitServiceSpec) -> PostInitLease {
         service_id: spec.service_id,
         exec_path: spec.exec_path,
         pid: 0,
+        reporter_pid: 0,
         state: rustos_user_abi::syscall::ROOTD_LEASE_STATE_EMPTY,
         exit_status: 0,
     }
@@ -478,6 +492,26 @@ fn drain_lifecycle_events(leases: &mut [Lease], post_init_leases: &mut [PostInit
                 break;
             }
         }
+        revoke_post_init_dependents(post_init_leases, event.pid);
+    }
+}
+
+/// A running child inherits supervisor admission only while that supervisor is
+/// alive.  In particular, uiserver must not keep SESSION_POLICY-derived
+/// authority after the session service that reported it has exited.
+fn revoke_post_init_dependents(post_init_leases: &mut [PostInitLease], reporter_pid: u64) {
+    if reporter_pid == 0 {
+        return;
+    }
+    for lease in post_init_leases.iter_mut() {
+        if lease.reporter_pid != reporter_pid || lease.state != ROOTD_LEASE_STATE_RUNNING {
+            continue;
+        }
+        if terminate_post_init_process(lease.pid).is_err() {
+            fail_closed(b"rootd: fatal dependent post-init lease termination rejected\n");
+        }
+        lease.state = ROOTD_LEASE_STATE_EXITED;
+        lease.exit_status = 9;
     }
 }
 
@@ -687,7 +721,11 @@ fn validate_commercial_max_request(
             | COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY => Ok(()),
             COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY
-            | COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP => validate_sender_subject(request, sender),
+            | COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP
+            | COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY
+            | COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM => {
+                validate_sender_subject(request, sender)
+            }
             _ => Err(22),
         },
         COMMERCIAL_MAX_PROTOCOL_CAPABILITY => match request.header.op {
@@ -768,6 +806,18 @@ fn fill_commercial_max_response(
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP => {
             authorize_service_lookup_for_subject(leases, post_init_leases, request)?;
             response.value0 = request.arg0;
+            Ok(())
+        }
+        COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY => {
+            let lease = query_post_init_lease(leases, post_init_leases, request, sender)?;
+            response.value0 = lease.pid;
+            response.value1 = u64::from(lease.state);
+            Ok(())
+        }
+        COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM => {
+            reclaim_post_init_lease(leases, post_init_leases, request, sender)?;
+            response.value0 = request.arg0;
+            response.value1 = 0;
             Ok(())
         }
         _ => Err(22),
@@ -1061,14 +1111,126 @@ fn register_post_init_service_lease(
     }
     if lease.state == ROOTD_LEASE_STATE_RUNNING {
         if lease.pid == request.arg1 {
+            if lease.reporter_pid != sender.pid {
+                return Err(13);
+            }
             return Ok(());
         }
         return Err(16);
     }
     lease.pid = request.arg1;
+    lease.reporter_pid = sender.pid;
     lease.state = ROOTD_LEASE_STATE_RUNNING;
     lease.exit_status = 0;
     Ok(())
+}
+
+fn query_post_init_lease<'a>(
+    leases: &[Lease],
+    post_init_leases: &'a [PostInitLease],
+    request: &CommercialMaxProtocolRequest,
+    sender: IpcSenderIdentity,
+) -> Result<&'a PostInitLease, i32> {
+    if request.arg0 == 0 || request.arg1 != 0 || request.path_len != 0 || request.payload_len != 0 {
+        return Err(22);
+    }
+    authorize_current_initd(leases, sender)?;
+    if !initd_manages_post_init_service(request.arg0) {
+        return Err(13);
+    }
+    post_init_leases
+        .iter()
+        .find(|lease| lease.service_id == request.arg0)
+        .ok_or(22)
+}
+
+fn reclaim_post_init_lease(
+    leases: &[Lease],
+    post_init_leases: &mut [PostInitLease],
+    request: &CommercialMaxProtocolRequest,
+    sender: IpcSenderIdentity,
+) -> Result<(), i32> {
+    if request.arg0 == 0 || request.arg1 == 0 || request.path_len != 0 || request.payload_len != 0 {
+        return Err(22);
+    }
+    authorize_current_initd(leases, sender)?;
+    if !initd_manages_post_init_service(request.arg0) {
+        return Err(13);
+    }
+    let Some(index) = post_init_leases
+        .iter()
+        .position(|lease| lease.service_id == request.arg0)
+    else {
+        return Err(22);
+    };
+    let target = post_init_leases[index];
+    if target.pid != request.arg1
+        || target.state == rustos_user_abi::syscall::ROOTD_LEASE_STATE_EMPTY
+    {
+        return Err(16);
+    }
+
+    // A session policy service may have admitted a UI child.  Reclaim the
+    // dependent child first, so a dead session supervisor cannot leave a live
+    // cross-domain UI endpoint behind when initd replaces the session lease.
+    for lease in post_init_leases.iter() {
+        if lease.reporter_pid == target.pid && lease.state == ROOTD_LEASE_STATE_RUNNING {
+            terminate_post_init_process(lease.pid)?;
+        }
+    }
+    if target.state == ROOTD_LEASE_STATE_RUNNING {
+        terminate_post_init_process(target.pid)?;
+    }
+    for lease in post_init_leases.iter_mut() {
+        if lease.pid == target.pid || lease.reporter_pid == target.pid {
+            lease.pid = 0;
+            lease.reporter_pid = 0;
+            lease.state = rustos_user_abi::syscall::ROOTD_LEASE_STATE_EMPTY;
+            lease.exit_status = 0;
+        }
+    }
+    Ok(())
+}
+
+fn terminate_post_init_process(pid: u64) -> Result<(), i32> {
+    if pid == 0 {
+        return Err(22);
+    }
+    let args = RustosRootdTerminateBrokerArgs {
+        abi_version: 1,
+        target_pid: pid,
+        ..RustosRootdTerminateBrokerArgs::default()
+    };
+    let status = syscall1(
+        SYS_RUSTOS_ROOTD_TERMINATE_BROKER,
+        (&args as *const RustosRootdTerminateBrokerArgs) as u64,
+    );
+    if status >= 0 || status == -3 {
+        // ESRCH means lifecycle observation raced the reclaim; it is already
+        // unable to publish authority and can be cleared safely.
+        return Ok(());
+    }
+    Err((-status) as i32)
+}
+
+fn authorize_current_initd(leases: &[Lease], sender: IpcSenderIdentity) -> Result<(), i32> {
+    let initd = lease_by_service_or_index(leases, INITD_LEASE_ID, INITD_LEASE_INDEX)?;
+    if initd.pid == sender.pid && initd.state == ROOTD_LEASE_STATE_RUNNING {
+        Ok(())
+    } else {
+        Err(13)
+    }
+}
+
+fn initd_manages_post_init_service(service_id: u64) -> bool {
+    matches!(
+        service_id,
+        IPC_SERVICE_NETD
+            | IPC_SERVICE_DEVMGRD
+            | IPC_SERVICE_INPUTD
+            | IPC_SERVICE_STORAGED
+            | IPC_SERVICE_SESSIOND
+    )
 }
 
 fn authorize_post_init_lease_reporter(
@@ -1089,14 +1251,11 @@ fn authorize_post_init_lease_reporter(
         }
         return Err(13);
     }
-    let initd = lease_by_service_or_index(leases, INITD_LEASE_ID, INITD_LEASE_INDEX)?;
-    if initd.pid != sender.pid || initd.state != ROOTD_LEASE_STATE_RUNNING {
-        return Err(13);
-    }
-    match service_id {
-        IPC_SERVICE_NETD | IPC_SERVICE_DEVMGRD | IPC_SERVICE_INPUTD | IPC_SERVICE_STORAGED
-        | IPC_SERVICE_SESSIOND => Ok(()),
-        _ => Err(13),
+    authorize_current_initd(leases, sender)?;
+    if initd_manages_post_init_service(service_id) {
+        Ok(())
+    } else {
+        Err(13)
     }
 }
 
@@ -1195,6 +1354,7 @@ fn trim_nul(bytes: &'static [u8]) -> &'static [u8] {
 }
 
 fn restart_failed_leases(leases: &mut [Lease]) {
+    let mut restart_backoff_ms = 0_u32;
     for (index, lease) in leases.iter_mut().enumerate() {
         if !matches!(
             lease.state,
@@ -1206,6 +1366,15 @@ fn restart_failed_leases(leases: &mut [Lease]) {
             lease.state = ROOTD_LEASE_STATE_FAILED;
             continue;
         }
+        // An observed process exit is itself a failed service turn. Defer its
+        // first replacement as well as failed spawn/activation attempts, or a
+        // crash loop can consume the entire restart budget in scheduler turns
+        // despite the lease advertising a real backoff policy.
+        if lease.state == ROOTD_LEASE_STATE_EXITED {
+            lease.state = ROOTD_LEASE_STATE_RESTART_PENDING;
+            restart_backoff_ms = restart_backoff_ms.max(lease.backoff_ms);
+            continue;
+        }
         match restart_lease(index, lease) {
             Ok((pid, deferred_start)) => {
                 lease.pid = pid;
@@ -1215,6 +1384,7 @@ fn restart_failed_leases(leases: &mut [Lease]) {
                 if deferred_start && activate_exec_via_loaderd(pid).is_err() {
                     lease.state = ROOTD_LEASE_STATE_RESTART_PENDING;
                     lease.exit_status = -11;
+                    restart_backoff_ms = restart_backoff_ms.max(lease.backoff_ms);
                 }
             }
             Err(_) => {
@@ -1225,9 +1395,22 @@ fn restart_failed_leases(leases: &mut [Lease]) {
                     debug_line(b"rootd: restart budget exhausted\n");
                 } else {
                     lease.state = ROOTD_LEASE_STATE_RESTART_PENDING;
+                    restart_backoff_ms = restart_backoff_ms.max(lease.backoff_ms);
                 }
             }
         }
+    }
+    if restart_backoff_ms != 0 {
+        wait_for_restart_backoff(restart_backoff_ms);
+    }
+}
+
+/// Apply the rootd-owned retry delay with a capability-gated timer substrate.
+/// A rejected wait would make the published restart contract unenforceable, so
+/// it is a supervisor-fatal condition rather than a busy-loop fallback.
+fn wait_for_restart_backoff(backoff_ms: u32) {
+    if syscall1(SYS_RUSTOS_ROOTD_WAIT_BROKER, u64::from(backoff_ms)) < 0 {
+        fail_closed(b"rootd: fatal restart backoff wait rejected\n");
     }
 }
 
@@ -1513,6 +1696,7 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
     fail_closed(b"rootd: panic\n");
 }
 
+#[cfg(not(test))]
 #[no_mangle]
 pub extern "C" fn rust_eh_personality() {}
 
@@ -1565,4 +1749,90 @@ pub unsafe extern "C" fn memcmp(lhs: *const u8, rhs: *const u8, len: usize) -> i
 /// `lhs` and `rhs` must be valid for `len` bytes.
 pub unsafe extern "C" fn bcmp(lhs: *const u8, rhs: *const u8, len: usize) -> i32 {
     memcmp(lhs, rhs, len)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn leases_with_live_initd(initd_pid: u64) -> [Lease; 5] {
+        let mut leases = [
+            lease(BOOTSTRAP_MANIFEST[0]),
+            lease(BOOTSTRAP_MANIFEST[1]),
+            lease(BOOTSTRAP_MANIFEST[2]),
+            lease(BOOTSTRAP_MANIFEST[3]),
+            lease(BOOTSTRAP_MANIFEST[4]),
+        ];
+        leases[INITD_LEASE_INDEX].pid = initd_pid;
+        leases[INITD_LEASE_INDEX].state = ROOTD_LEASE_STATE_RUNNING;
+        leases
+    }
+
+    fn post_init_request(service_id: u64, pid: u64) -> CommercialMaxProtocolRequest {
+        CommercialMaxProtocolRequest {
+            arg0: service_id,
+            arg1: pid,
+            ..CommercialMaxProtocolRequest::default()
+        }
+    }
+
+    #[test]
+    fn post_init_lease_cannot_be_rebound_by_a_different_reporter() {
+        let initd_pid = 41;
+        let leases = leases_with_live_initd(initd_pid);
+        let request = post_init_request(IPC_SERVICE_NETD, 71);
+        let mut post_init = [post_init_lease(POST_INIT_MANIFEST[0])];
+
+        assert_eq!(
+            register_post_init_service_lease(
+                &leases,
+                &mut post_init,
+                &request,
+                IpcSenderIdentity {
+                    pid: initd_pid,
+                    tid: 1,
+                },
+            ),
+            Ok(())
+        );
+        assert_eq!(post_init[0].reporter_pid, initd_pid);
+
+        assert_eq!(
+            register_post_init_service_lease(
+                &leases,
+                &mut post_init,
+                &request,
+                IpcSenderIdentity { pid: 99, tid: 2 },
+            ),
+            Err(13)
+        );
+        assert_eq!(post_init[0].reporter_pid, initd_pid);
+    }
+
+    #[test]
+    fn uiserver_admission_requires_its_live_sessiond_reporter() {
+        let leases = leases_with_live_initd(41);
+        let mut post_init = [post_init_lease(POST_INIT_MANIFEST[4])];
+        post_init[0].pid = 73;
+        post_init[0].state = ROOTD_LEASE_STATE_RUNNING;
+
+        assert_eq!(
+            authorize_post_init_lease_reporter(
+                &leases,
+                &post_init,
+                IPC_SERVICE_UISERVER,
+                IpcSenderIdentity { pid: 73, tid: 1 },
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            authorize_post_init_lease_reporter(
+                &leases,
+                &post_init,
+                IPC_SERVICE_UISERVER,
+                IpcSenderIdentity { pid: 41, tid: 1 },
+            ),
+            Err(13)
+        );
+    }
 }

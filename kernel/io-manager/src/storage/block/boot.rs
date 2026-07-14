@@ -140,10 +140,10 @@ pub(super) fn open_unique_fat_boot_handle() -> IoResult<BlockDeviceHandle> {
         let devices = BLOCK_DEVICES.lock();
         registry::root_device_ids_locked(&devices)
     };
-    crate::debug::println_fmt(format_args!(
+    crate::debug::println!(
         "storage: empty boot identity fallback roots={}",
         root_ids.len()
-    ));
+    );
 
     for root_id in root_ids {
         let Some(descriptor) = descriptor_without_init(BlockDeviceHandle::new(root_id)) else {
@@ -155,12 +155,12 @@ pub(super) fn open_unique_fat_boot_handle() -> IoResult<BlockDeviceHandle> {
             block_count: descriptor.block_count,
         };
         let partitions = candidate_partitions(&mut root)?;
-        crate::debug::println_fmt(format_args!(
+        crate::debug::println!(
             "storage: empty boot identity candidate id={} path={} partitions={}",
             root_id,
             descriptor.path,
             partitions.len()
-        ));
+        );
         for partition in partitions {
             if !partition_has_fat_boot_sector(&mut root, partition)? {
                 continue;
@@ -168,12 +168,12 @@ pub(super) fn open_unique_fat_boot_handle() -> IoResult<BlockDeviceHandle> {
             let Some(handle) = find_device_handle_for_partition(root_id, partition) else {
                 continue;
             };
-            crate::debug::println_fmt(format_args!(
+            crate::debug::println!(
                 "storage: empty boot identity FAT candidate handle={} start_lba={} sectors={}",
                 handle.id(),
                 partition.start_lba,
                 partition.block_count
-            ));
+            );
             if selected.replace(handle).is_some() {
                 return Err(DiskIoError::InvalidInput);
             }
