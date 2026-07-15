@@ -37,7 +37,7 @@ a DVM.
 `rustos-hostd relay-input` additionally requires a `driver-domain-policy-v1`
 file. Its domain ID must match the validated launch plan and it enables exactly
 one named transport per device class. The present input transport is
-`rdi2-com2`; network, block, and display are deliberately `disabled` until
+`input-ring-msix`; network, block, and display are deliberately `disabled` until
 their own data-plane contracts exist. This prevents a convenient input relay
 from silently becoming an unbounded driver proxy.
 
@@ -92,8 +92,9 @@ grant RustOS host authority.
   name. It reports key records plus one coalesced pointer packet per
   `SYN_REPORT`. L0 accepts only bounded key code/action, signed motion/wheel,
   and five-button fields, assigns its own monotonic sequence, and forwards one
-  fixed RDI2 frame through a private QEMU COM2 socket to RustOS. The DVM never
-  learns a RustOS address or gains a generic RPC path.
+  fixed RDI3 frame through an L0-owned fixed input ring and one RustOS-only
+  MSI-X wake vector. The DVM never maps that ring, learns a RustOS address, or
+  gains a generic RPC path.
 - RustOS accepts a nonzero relay epoch and contiguous sequence only, then
   carries keyboard/pointer ingress to ring-3 `inputd`. `inputd` alone
   translates key layout/modifier/text state and merges DVM pointer buttons
@@ -107,8 +108,8 @@ grant RustOS host authority.
   independently bounded Ethernet ivshmem provider. It does not carry Ethernet
   data: RustOS requires both the fixed mapped ring and this live lease, and an
   exact end makes later packet operations fail closed. DVM-writable ring state
-  cannot create or extend the lease; a future network-only DVM needs its own
-  authenticated lifecycle channel.
+  cannot create or extend the lease; a network-only DVM is not an enabled
+  topology because it lacks its own authenticated lifecycle channel.
 - `rustos-hostd relay-input` is a reconnecting L0 service by default. A DVM
   agent reconnect or a RustOS serial endpoint restart creates a fresh epoch;
   the diagnostic `--once` mode is the only one that exits on the first error.
@@ -121,16 +122,24 @@ grant RustOS host authority.
   validates ownership and protocol, then RustOS policy services consume the
   narrow backend interface.
 
-The default KVM profile instead exposes `virtio-gpu-pci` directly to RustOS.
-Its Linux `.ko` compatibility path publishes the display provider through
-`driverd`; `uiserver` owns normal presentation and `bootfb` remains the
-explicit fail-closed fallback. It is intentionally not a DVM display proxy.
+The commercial KVM profile always enables `--gui-dvm-surfaces`. L0 creates the
+fixed V3 `RSGUI002` three-slot transport: ivshmem carries only uncached control
+records and MSI-X, while a separate cacheable pixel pool is writable by
+RustOS and read-only in the Linux GUI-DVM. RustOS is observed as ivshmem peer 0
+before the DVM becomes peer 1, and Linux alone receives its private
+virtio-GPU DRM/KMS device. RustOS has no direct virtio-GPU module or native-GPU
+presentation path: `uiserver` submits only to the validated DVM pool, and a
+missing, malformed, or revoked provider is `Unavailable` rather than a
+boot-framebuffer or generic-provider fallback. The non-DVM direct-GPU test
+profile is diagnostic-only and cannot satisfy commercial GUI acceptance.
 
-This avoids a Linux kernel fork. A small agent is still required for health,
-device state, and authenticated control messages. The input relay is the first
-RustOS device consumption path; PCI assignment remains gated by the durable
-VFIO lease. High-performance page loans and device-specific NIC/block/GPU
-protocols are future, versioned extensions, not part of this baseline.
+This avoids a Linux kernel fork while retaining a narrow agent for health,
+device state, and authenticated control messages. Input, Ethernet, and GUI
+each have bounded, versioned transport contracts; PCI assignment remains
+gated by the durable VFIO lease. Any later page-loan or device-specific
+NIC/block/GPU transport is disabled by default and release-blocked until it
+has its own queue, DMA/IOMMU, cancellation, reset, revocation, conformance,
+and runtime evidence.
 
 ## Profile limits
 

@@ -8,14 +8,14 @@ Concrete owners and source anchors:
   * L0 control listener: libs/driver-domain-host/src/lib.rs
   * Linux DVM agent: driver-domains/linux/package/rustos-dvm-agent/
     src/rustos-dvm-agent.c
-  * RDI2 receiver: kernel/io-manager/src/input/dvm_serial.rs
+  * RDI3 receiver: kernel/io-manager/src/input/dvm_frames.rs
 
 The host accepts a KVM-vsock connection only from its launch-bound CID. An
 exact agent-v1-control HELLO causes L0 to issue one fresh challenge. Only the
 matching HMAC proof over that challenge and exact HELLO permits the WELCOME
 write; that is the control-plane linearization point. Requests are serial, use
 the fixed allowlist and IDs, and time out closed. Only after the three mandatory
-probes and the input-stream ready reply may L0 create a fresh RDI2 relay epoch.
+probes and the input-stream ready reply may L0 create a fresh RDI3 relay epoch.
 The receiver accepts frames
 only in that epoch and only at the next sequence number.  Session end is
 modeled atomically with its key/button cleanup and clears receiver authority.
@@ -149,7 +149,7 @@ Init ==
 
 (*******************************************************************************
 ClearSession represents a failed-close socket teardown.  For a relay it also
-represents L0's release/key-button cleanup plus RDI2 SESSION_END; the RustOS
+represents L0's release/key-button cleanup plus RDI3 SESSION_END; the RustOS
 decoder cannot retain an epoch or sequence after it.
 *******************************************************************************)
 ClearSession(outcome) ==

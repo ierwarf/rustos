@@ -13,7 +13,7 @@ Concrete owners:
 `arm_block_current_task` records an armed wake without removing the current
 task from the runnable path. `wake_task_slot` clears that arm before a later
 `commit_block_current_task` can make the task blocked.  The timer IRQ runs its
-RTC wake processing before the scheduler chooses a subsequent task.  This
+monotonic deadline processing before the scheduler chooses a subsequent task. This
 model makes the arm identity explicit: a wake invalidates that identity, so a
 later block must come from a newly armed epoch rather than a lost wakeup.
 
@@ -136,9 +136,9 @@ CancelCurrentArm(task) ==
     /\ UNCHANGED <<now, current, armEpoch, blockedEpoch>>
 
 (*******************************************************************************
-irq.rs invokes rtc::on_interrupt before scheduler selection. Due waits are
-therefore made Ready in the same Tick transition, before Dispatch can be
-enabled from the resulting state.
+irq.rs invokes the PIT clockevent's monotonic deadline service before scheduler
+selection. Due waits are therefore made Ready in the same Tick transition,
+before Dispatch can be enabled from the resulting state.
 *******************************************************************************)
 Tick ==
     LET DueTasks ==

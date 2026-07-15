@@ -25,7 +25,10 @@ use render::start_desktop_background_loader;
 use render::{render_boot_frame, render_debug_white_box, render_frame, render_rect};
 use runtime_control::RuntimeClient;
 use runtime_sync::{RuntimeState, refresh_runtime_state, start_runtime_sync};
-use sys::{boot_line, boot_trace_enabled, diag_line, profile_line};
+use sys::{
+    background_thread_demotion_count, boot_line, boot_trace_enabled, diag_line, heartbeat_line,
+    profile_line, require_background_thread_class,
+};
 use wayland::WaylandCompositor;
 
 const DEBUG_FREEZE_ON_WHITE_BOX: bool = false;
@@ -45,6 +48,7 @@ const UI_WATCHDOG_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const UI_PHASE_PANIC_THRESHOLD_MS: u64 = 3_000;
 const WAYLAND_BACKLOG_SERVICE_INTERVAL: Duration = Duration::from_millis(4);
 const PARTIAL_RENDER_BUDGET: Duration = Duration::from_millis(8);
+const DISPLAY_BACKPRESSURE_RETRY_DELAY: Duration = Duration::from_millis(1);
 const SLOW_LOOP_THRESHOLD: Duration = Duration::from_millis(50);
 const MAX_SLOW_LOOP_LOGS: usize = 16;
 
@@ -92,6 +96,7 @@ impl LoopPhaseTimings {
 enum PresentUpdateResult {
     Idle,
     Rendered { deferred_update: VisualUpdate },
+    Backpressured,
     StaleSurface,
 }
 
@@ -118,6 +123,7 @@ impl UiLoopWatchdog {
         let _ = thread::Builder::new()
             .name(String::from("uiserver-watchdog"))
             .spawn(move || {
+                require_background_thread_class();
                 loop {
                     thread::sleep(UI_WATCHDOG_CHECK_INTERVAL);
                     let phase_id = phase.load(Ordering::Acquire);
@@ -224,6 +230,7 @@ fn present_drawable_update(
         let present_started = Instant::now();
         match state.present() {
             Ok(()) => {}
+            Err(crate::sys::EAGAIN) => return Ok(PresentUpdateResult::Backpressured),
             Err(err) if state.recover_if_stale_surface_error(err)? => {
                 return Ok(PresentUpdateResult::StaleSurface);
             }
@@ -261,21 +268,17 @@ fn present_drawable_update(
     }
 
     let render_rects = drawable_update.partial_rects().to_vec();
-    let mut rendered_rects = Vec::with_capacity(render_rects.len());
     let mut render_elapsed = Duration::ZERO;
     let mut present_elapsed = Duration::ZERO;
     let mut present_union = canvas::Rect::empty();
-    let mut pixel_count = 0_u64;
     let mut deferred_update = VisualUpdate::default();
 
     for (index, rect) in render_rects.iter().enumerate() {
         present_union = present_union.union(*rect);
-        pixel_count = pixel_count.saturating_add(rect.width.saturating_mul(rect.height) as u64);
 
         let render_started = Instant::now();
         render_rect(state, *rect);
         render_elapsed += render_started.elapsed();
-        rendered_rects.push(*rect);
         if index + 1 < render_rects.len() && render_elapsed >= PARTIAL_RENDER_BUDGET {
             for deferred_rect in &render_rects[index + 1..] {
                 deferred_update.add_partial_rect(*deferred_rect);
@@ -285,17 +288,22 @@ fn present_drawable_update(
     }
 
     let present_started = Instant::now();
-    for rect in &rendered_rects {
-        match state.present_rect(*rect) {
-            Ok(()) => {}
-            Err(err) if state.recover_if_stale_surface_error(err)? => {
-                return Ok(PresentUpdateResult::StaleSurface);
-            }
-            Err(err) => return Err(err),
+    // The GUI-DVM transport admits one bounded damage descriptor per slot.
+    // Submitting each logical damage rectangle separately made a single UI
+    // frame non-atomic: the first ioctls could commit and a later one could
+    // hit EAGAIN, forcing the same prefix to be submitted forever. Render the
+    // precise rectangles locally, then publish their bounded union once.
+    match state.present_rect(present_union) {
+        Ok(()) => {}
+        Err(crate::sys::EAGAIN) => return Ok(PresentUpdateResult::Backpressured),
+        Err(err) if state.recover_if_stale_surface_error(err)? => {
+            return Ok(PresentUpdateResult::StaleSurface);
         }
+        Err(err) => return Err(err),
     }
     present_elapsed += present_started.elapsed();
-    let rect_count = rendered_rects.len() as u64;
+    let rect_count = 1;
+    let pixel_count = present_union.width.saturating_mul(present_union.height) as u64;
     profile::record_present(
         false,
         rect_count,
@@ -670,15 +678,28 @@ fn log_wayland_callback_only(state: &AppState, rect: canvas::Rect) {
 
 fn run() -> Result<(), i32> {
     let boot_started = Instant::now();
+    boot_line("uiserver: run initialize begin");
     diag_line("uiserver: run initialize begin");
+    boot_line("uiserver: run diagnostic worker ready");
     let mut state = AppState::initialize()?;
+    // Input ingress is independent of runtime catalog and Wayland startup.
+    // Arm it immediately after the display/input handles are validated so a
+    // slow policy socket or compositor bootstrap cannot leave the DVM relay
+    // without a live consumer. The bounded reader channel safely queues and
+    // coalesces events until the render loop begins draining it.
+    boot_line("uiserver: input reader spawn begin");
+    let input_events = input_loop::start_input_reader(std::mem::take(&mut state.input_fds));
+    boot_line("uiserver: input reader spawn done");
+    boot_line("uiserver: run initialize done");
     sys::publish_display_policy_metadata(state.display);
     diag_line("uiserver: run initialize done");
     log_boot_stage(boot_started, "initialize");
+    boot_line("uiserver: desktop background worker spawn begin");
     let desktop_background = start_desktop_background_loader(
         state.surface.width as usize,
         state.surface.height as usize,
     );
+    boot_line("uiserver: desktop background worker spawn done");
     if DEBUG_FREEZE_ON_WHITE_BOX {
         boot_line("uiserver: debug white box begin");
         render_debug_white_box(&mut state);
@@ -689,6 +710,7 @@ fn run() -> Result<(), i32> {
         boot_line("uiserver: debug white box halt");
         halt_after_debug_present();
     }
+    boot_line("uiserver: boot frame begin");
     diag_line("uiserver: boot frame begin");
     render_boot_frame(&mut state);
     if DEBUG_DIRECT_SURFACE_PROBE {
@@ -696,11 +718,14 @@ fn run() -> Result<(), i32> {
     }
     log_frame_sample("boot", &mut state);
     diag_line("uiserver: boot frame done");
+    boot_line("uiserver: boot frame done");
     log_boot_stage(boot_started, "boot_frame");
     diag_line("uiserver: first present begin");
+    boot_line("uiserver: first present begin");
     let first_present_started = Instant::now();
     state.present()?;
     diag_line("uiserver: first present done");
+    boot_line("uiserver: first present done");
     log_boot_stage(first_present_started, "first_present");
     diag_line("uiserver: post-present init begin");
     let mut pending_update = VisualUpdate::default();
@@ -735,7 +760,6 @@ fn run() -> Result<(), i32> {
     log_boot_stage(boot_started, "post_present_init");
     let launcher_programs = start_launcher_program_loader();
     let console_refreshes = start_console_refresh_worker();
-    let input_events = input_loop::start_input_reader(std::mem::take(&mut state.input_fds));
     let mut next_runtime_poll = Instant::now();
     let mut next_console_poll = Instant::now() + CONSOLE_POLL_SLEEP;
     let mut next_cursor_blink = Instant::now() + CURSOR_BLINK_INTERVAL;
@@ -886,6 +910,19 @@ fn run() -> Result<(), i32> {
                 pending_update.request_full();
                 continue 'main_loop;
             }
+            PresentUpdateResult::Backpressured => {
+                watchdog.leave();
+                // Pool saturation does not invalidate the local surface or
+                // its damage. Retain the exact pending update: promoting a
+                // cursor rectangle to a 1600x900 redraw multiplied traffic
+                // and made a transient three-slot flow-control event self-
+                // sustaining. A bounded yield prevents a System-class UI
+                // thread from spinning while the DVM returns a slot.
+                profile::record_backpressure_retry();
+                profile::maybe_emit();
+                thread::sleep(DISPLAY_BACKPRESSURE_RETRY_DELAY);
+                continue 'main_loop;
+            }
             PresentUpdateResult::Idle => false,
         };
         watchdog.leave();
@@ -1014,8 +1051,8 @@ fn run() -> Result<(), i32> {
             let input_pending_reader = input_reader
                 .delivered_events
                 .saturating_sub(processed_input_events_total);
-            diag_line(format!(
-                "uiserver: update tick loops={} total_loops={} frames={} cursor_moves={} cursor={},{} presented_cursor={},{} pending_update={} pending_full={} pending_rects={} drawable_full={} drawable_rects={} backlog={} backlog_loops={} input_loop_events={} pointer_motion={} pointer_position={} wayland_motion_calls={} input_pending={} input_gap_ms={} input_read_active={} input_read_ms={} input_last_age_ms={} input_reads={}/{} input_raw_events={} input_events={} input_drops={} input_slow={} input_errors={} console_cmd_pending={} console_cmd_accepted={} console_cmd_completed={} console_cmd_rejected={} console_cmd_slow={} console_cmd_errors={} console_cmd_active={} console_cmd_active_ms={} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
+            heartbeat_line(&format!(
+                "uiserver: update tick loops={} total_loops={} frames={} cursor_moves={} cursor={},{} presented_cursor={},{} pending_update={} pending_full={} pending_rects={} drawable_full={} drawable_rects={} backlog={} backlog_loops={} input_loop_events={} pointer_motion={} pointer_position={} wayland_motion_calls={} input_pending={} input_gap_ms={} input_wait_active={} input_wait_ms={} input_waits={}/{} input_read_active={} input_read_ms={} input_last_age_ms={} input_reads={}/{} input_raw_events={} input_events={} input_drops={} input_slow={} input_errors={} background_thread_demotions={} console_cmd_pending={} console_cmd_accepted={} console_cmd_completed={} console_cmd_rejected={} console_cmd_slow={} console_cmd_errors={} console_cmd_active={} console_cmd_active_ms={} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
                 loop_count,
                 total_loop_count,
                 frames_rendered_window,
@@ -1037,6 +1074,10 @@ fn run() -> Result<(), i32> {
                 wayland_motion_calls_window,
                 input_pending_reader,
                 max_input_gap_ms_window,
+                input_reader.wait_active,
+                input_reader.wait_elapsed_ms,
+                input_reader.completed_waits,
+                input_reader.wait_attempts,
                 input_reader.read_active,
                 input_reader.read_elapsed_ms,
                 input_reader.last_delivery_age_ms,
@@ -1047,6 +1088,7 @@ fn run() -> Result<(), i32> {
                 input_reader.queue_drops,
                 input_reader.slow_reads,
                 input_reader.errors,
+                background_thread_demotion_count(),
                 console_command.pending,
                 console_command.accepted,
                 console_command.completed,
@@ -1106,6 +1148,13 @@ fn run() -> Result<(), i32> {
                 pending_update.request_full();
                 continue 'main_loop;
             }
+            PresentUpdateResult::Backpressured => {
+                watchdog.leave();
+                profile::record_backpressure_retry();
+                profile::maybe_emit();
+                thread::sleep(DISPLAY_BACKPRESSURE_RETRY_DELAY);
+                continue 'main_loop;
+            }
             PresentUpdateResult::Idle => false,
         };
         watchdog.leave();
@@ -1116,6 +1165,20 @@ fn run() -> Result<(), i32> {
             }
         }
         phase_timings.main_present = main_present_started.elapsed();
+
+        let input_reader = input_events.snapshot();
+        profile::record_input_health(
+            input.input_events,
+            input_reader.last_delivery_age_ms,
+            input_reader.queue_drops,
+            input_reader.slow_reads,
+            input_reader.errors,
+            state.cursor_x,
+            state.cursor_y,
+            presented_cursor_x,
+            presented_cursor_y,
+            state.cursor_x == presented_cursor_x && state.cursor_y == presented_cursor_y,
+        );
 
         let sleep_started = Instant::now();
         let now = sleep_started;
@@ -1151,7 +1214,6 @@ fn run() -> Result<(), i32> {
 
 fn main() {
     boot_line("uiserver: main enter");
-    profile_line("uiserver profile: startup");
     install_panic_hook();
     boot_line("uiserver: panic hook installed");
     if let Err(err) = sys::start_display_policy_endpoint() {

@@ -42,7 +42,6 @@ Actions:
 | `drop-every:N` | Fail every Nth call. |
 | `fail-after:N` | Let N calls pass, then fail later calls. |
 | `rate:N` | Fail about N out of 1000 calls. |
-| `delay-ms:N` | Parsed for future use; delay injection is not wired yet. |
 
 Keep the `rules = [...]` array on one physical line for now. The current logging
 cfg generator also scans `config/rustos.toml`, and standalone multiline array
@@ -150,7 +149,6 @@ fault.point=action
 | `drop-every:N` | N번째 호출마다 실패 |
 | `fail-after:N` | N번은 통과시키고 이후 호출 실패 |
 | `rate:N` | 1000번 중 대략 N번 실패 |
-| `delay-ms:N` | 현재는 파싱만 됩니다. 실제 delay 주입은 아직 연결되지 않았습니다. |
 
 현재는 `rules = [...]` 배열을 한 줄에 유지하세요. 기존 logging cfg generator가
 `config/rustos.toml` 전체를 같이 스캔하기 때문에, 독립된 줄의 multiline 배열

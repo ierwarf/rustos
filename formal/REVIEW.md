@@ -1,9 +1,9 @@
 # Commercial-model review
 
-This is the model-quality review performed after the initial TLC suite was
-already passing. A passing finite safety check is not sufficient when the
-model silently assumes freshness, timer progress, a cleanup transition, or a
-well-formed configuration.
+This is the commercial-model quality review for every enabled topology. A
+passing finite safety check is not sufficient when the model silently assumes
+freshness, timer progress, a cleanup transition, or a well-formed
+configuration.
 
 ## Review rule
 
@@ -16,9 +16,9 @@ below cover every model currently invoked by `run-all-tlc.sh`.
 | Model group | Models reviewed | Result |
 | --- | --- | --- |
 | Bootstrap and service lifecycle | `rootd-bootstrap`, `endpoint-registry`, `endpoint-publication`, `deferred-start`, `post-init-leases`, `rootd-restart-backoff`, `post-init-supervisor-recovery` | Added finite-clock admission guards to every wait/backoff/recovery window that could otherwise be created at TLC's final tick. Rootd and endpoint/deferred waits now state timer-fair eventual settlement. Publication and post-init lease identity/cleanup models already contained their rejected and exit transitions. |
-| DVM authority and transports | `dvm-control-relay`, `dvm-control-endpoint`, `dvm-network-ring`, `dvm-network-control`, `dvm-input-revocation`, `trusted-ui-boundary`, `dvm-display-seqlock` | Added temporal timeout settlement to control setup/relay. Fresh relay epochs are now monotonic in hostd and one-shot in input/network models. VFIO-like data planes remain non-authoritative. Trusted UI now includes independent attestation-lease withdrawal, not only provider loss. Ring and display models already cover untrusted-header and even-generation cleanup paths. |
+| DVM authority and transports | `dvm-control-relay`, `dvm-control-endpoint`, `dvm-network-ring`, `dvm-network-control`, `dvm-input-revocation`, `trusted-ui-boundary`, `gui-dvm-surface`, `dvm-atomic-scanout`, `gui-dvm-install` | Added temporal timeout settlement to control setup/relay. Fresh relay epochs are now monotonic in hostd and one-shot in input/network models. VFIO-like data planes remain non-authoritative. Trusted UI includes independent attestation-lease withdrawal, not only provider loss. GUI-DVM proofs cover fixed three-slot ownership, exact release acknowledgement, restart recovery, bounded backpressure, atomic page-flip completion before source release, strictly advancing in-flight generations, synchronized damage shadowing, serialized installer ownership, and map/vector cleanup on every rejected installation. |
 | UI and readiness | `input-readiness`, `ui-frame-budget`, `ui-input-motion`, `devmgrd-sessiond-isolation` | Added fair timer/recheck progress and eventual poll settlement. Frame budget, motion, and devmgrd models already make the blocking worker independent from the UI/main-loop owner, with bounded admission and explicit rejection. |
-| Scheduler and IPC | `ipc-reply-deadline`, `scheduler-wakeup`, `ipc-priority-inheritance`, `ipc-handle-transfer`, `ipc-endpoint-ownership` | Added timer-fair unblocking for reply waits and scheduler arms. Added a received-batch owner-exit cleanup path, prohibited reply before transferred-handle installation, and made terminal messages reject detached transfers. The priority-inheritance model already covers process-owned broker workers, transitive donation, and every terminal revocation path. |
+| Scheduler, clock, and IPC | `ipc-reply-deadline`, `scheduler-wakeup`, `clocksource-deadline`, `scheduler-admission`, `ipc-priority-inheritance`, `ipc-handle-transfer`, `ipc-endpoint-ownership` | Added timer-fair unblocking for reply waits and scheduler arms. Elapsed time is now clocksource-based rather than RTC-edge-counted; delayed PIT delivery catches absolute deadlines, and sleep identity cannot re-enter process policy locks. Runtime-catalog weight is capability-separated from System admission: only the exact UI owner receives its pinned critical weight. System work has an eight-dispatch cap before a ready User turn is mandatory, while reply-scoped inheritance remains transitive and terminally revocable. Added a received-batch owner-exit cleanup path, prohibited reply before transferred-handle installation, and made terminal messages reject detached transfers. |
 | Process and hardware authority | `vfio-release-authorization`, `driver-domain-fleet`, `proc-broker-session`, `exec-ticket` | VFIO now explicitly generates a signed wrong-manifest candidate and rejects it; all distinct mismatch domains are asserted as configuration assumptions. Fleet, prepare-session, and exec-ticket models already encode signed-fleet exclusivity, owner-exit cleanup, exact PID/TID binding, and sibling/target teardown. |
 
 ## Closed model defects

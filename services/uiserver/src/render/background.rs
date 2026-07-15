@@ -10,11 +10,14 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
 use crate::canvas::{Rect, SurfaceCanvas};
+use crate::sys::require_background_thread_class;
 
 use super::colors::{
     COLOR_AURORA_CYAN, COLOR_AURORA_MINT, COLOR_AURORA_VIOLET, COLOR_BG_DEEP, COLOR_BG_MID,
     COLOR_BG_TOP, COLOR_STARFIELD,
 };
+
+const BACKGROUND_YIELD_ROWS: usize = 16;
 
 pub(crate) struct DesktopBackground {
     pub(crate) width: usize,
@@ -28,6 +31,7 @@ pub(crate) fn start_desktop_background_loader(
 ) -> Receiver<DesktopBackground> {
     let (sender, receiver) = mpsc::sync_channel(1);
     thread::spawn(move || {
+        require_background_thread_class();
         let fast_pixels = build_fast_desktop_background(width, height);
         let _ = sender.send(DesktopBackground {
             width,
@@ -106,33 +110,37 @@ pub(super) fn paint_sky(canvas: &mut SurfaceCanvas<'_>, width: usize, height: us
     let h_i = height as i32;
     let base_radius = (w_i.max(h_i)) as u32;
 
-    canvas.fill_radial_glow(
+    canvas.fill_radial_glow_cooperative(
         (w_i * 22) / 100,
         (h_i * 18) / 100,
         (base_radius * 6) / 10,
         COLOR_AURORA_CYAN,
         120,
+        BACKGROUND_YIELD_ROWS,
     );
-    canvas.fill_radial_glow(
+    canvas.fill_radial_glow_cooperative(
         (w_i * 82) / 100,
         (h_i * 28) / 100,
         (base_radius * 5) / 10,
         COLOR_AURORA_VIOLET,
         110,
+        BACKGROUND_YIELD_ROWS,
     );
-    canvas.fill_radial_glow(
+    canvas.fill_radial_glow_cooperative(
         (w_i * 18) / 100,
         (h_i * 92) / 100,
         (base_radius * 4) / 10,
         COLOR_AURORA_MINT,
         70,
+        BACKGROUND_YIELD_ROWS,
     );
-    canvas.fill_radial_glow(
+    canvas.fill_radial_glow_cooperative(
         (w_i * 70) / 100,
         (h_i * 80) / 100,
         (base_radius * 5) / 10,
         COLOR_AURORA_VIOLET,
         55,
+        BACKGROUND_YIELD_ROWS,
     );
 
     sprinkle_starfield(canvas, screen);

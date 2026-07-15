@@ -11,6 +11,7 @@
 #include <net/if.h>
 #include <netinet/ether.h>
 #include <poll.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,6 +44,20 @@
 
 struct shared_net { int fd; volatile uint8_t *base; size_t bytes; uint32_t tx_tail; uint32_t rx_head; int last_tx_errno; };
 struct raw_endpoint { int fd; struct sockaddr_ll address; };
+
+static void relay_log(const char *format, ...) __attribute__((format(printf, 1, 2)));
+
+static void relay_log(const char *format, ...) {
+    char line[512];
+    va_list arguments;
+    int length;
+    va_start(arguments, format);
+    length = vsnprintf(line, sizeof(line), format, arguments);
+    va_end(arguments);
+    if (length <= 0) return;
+    if ((size_t)length >= sizeof(line)) length = (int)sizeof(line) - 1;
+    (void)write(STDERR_FILENO, line, (size_t)length);
+}
 
 static uint32_t le32(const volatile uint8_t *p) { return __atomic_load_n((const volatile uint32_t *)p, __ATOMIC_ACQUIRE); }
 static uint64_t le64(const volatile uint8_t *p) { uint64_t v = 0; unsigned int i; for (i = 0; i < 8; i++) v |= (uint64_t)p[i] << (8U * i); return v; }
@@ -149,7 +164,7 @@ static void drain_tx(const struct raw_endpoint *raw, struct shared_net *net) {
             if (tx_errno != EAGAIN && tx_errno != EWOULDBLOCK && tx_errno != net->last_tx_errno) {
                 struct ifreq state;
                 unsigned int flags = interface_flags("eth0", &state) ? 0U : (unsigned int)state.ifr_flags;
-                fprintf(stderr, "rustos-dvm-net: transmit paused errno=%d flags=0x%x\n", tx_errno, flags);
+                relay_log("rustos-dvm-net: transmit paused errno=%d flags=0x%x\n", tx_errno, flags);
             }
             net->last_tx_errno = tx_errno;
             return;
@@ -178,7 +193,7 @@ int main(int argc, char **argv) {
         if (open_shared(&net) || activate_interface("eth0") || raw_socket(&raw)) { close_shared(&net); sleep(1); continue; }
         struct ifreq state;
         mark_dvm_ready(&net);
-        fprintf(stderr, "rustos-dvm-net: active interface=eth0 mtu=%u slots=%u flags=0x%x\n", MTU, SLOT_COUNT, interface_flags("eth0", &state) ? 0U : (unsigned int)state.ifr_flags); fflush(stderr);
+        relay_log("rustos-dvm-net: active interface=eth0 mtu=%u slots=%u flags=0x%x\n", MTU, SLOT_COUNT, interface_flags("eth0", &state) ? 0U : (unsigned int)state.ifr_flags);
         for (;;) { struct pollfd p = {.fd = raw.fd, .events = POLLIN}; drain_tx(&raw, &net); (void)poll(&p, 1, 20); if (p.revents) drain_rx(&raw, &net); }
     }
 }

@@ -41,7 +41,7 @@ hash() {
     echo 'id=rustos-linux-dvm-x86_64'
     echo 'architecture=x86_64'
     echo 'boot=linux-bzimage+cpio-xz'
-    echo 'data-plane=hostd-rdi2-input'
+    echo 'data-plane=hostd-input-ring-msix'
     printf 'control-plane=%s-%s\n' "$CONTROL_PROTOCOL" "$CONTROL_STATE"
     printf 'control-protocol=%s\n' "$CONTROL_PROTOCOL"
     printf 'control-state=%s\n' "$CONTROL_STATE"

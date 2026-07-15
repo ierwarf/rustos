@@ -27,9 +27,7 @@ pub(super) fn load_launch_catalog_into_state(state: &mut BrokerState) -> bool {
         Err(errno) => {
             state.launch_catalog_retry_after = Some(Instant::now() + RETRY_BACKOFF);
             if state.launch_catalog_last_error != Some(errno) {
-                debug_line(
-                    format!("runtimed: launch catalog load failed errno={errno}").as_str(),
-                );
+                debug_line(format!("runtimed: launch catalog load failed errno={errno}").as_str());
                 observability_client::warn!(
                     "runtimed",
                     service,
@@ -78,8 +76,9 @@ pub(super) fn load_launch_catalog_into_state(state: &mut BrokerState) -> bool {
 
 pub(super) fn load_launch_catalog(
 ) -> Result<(BTreeMap<String, ProgramMetadata>, Vec<LaunchEntry>), i32> {
-    let registry_entries = load_runtime_launch_program_entries(DEFAULT_RUNTIME_LAUNCH_REGISTRY_PATH)
-        .map_err(runtime_registry_errno)?;
+    let registry_entries =
+        load_runtime_launch_program_entries(DEFAULT_RUNTIME_LAUNCH_REGISTRY_PATH)
+            .map_err(runtime_registry_errno)?;
     debug_line(
         format!(
             "runtimed: launch registry snapshot entries={}",

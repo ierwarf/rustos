@@ -120,9 +120,11 @@ mod tests {
         assert_eq!(syscall::DEVMGRD_IOCTL_LINUX_TTY_TCSETSW, 0x5403);
         assert_eq!(syscall::DEVMGRD_IOCTL_LINUX_TTY_TCSETSF, 0x5404);
         assert_eq!(syscall::DEVMGRD_IOCTL_LINUX_TTY_FIONREAD, 0x541b);
+        assert_eq!(syscall::INPUTD_IPC_ABI_VERSION, 2);
         assert_eq!(syscall::INPUTD_IPC_OP_DRAIN_INGEST, 4);
         assert_eq!(syscall::INPUTD_IPC_OP_READ, 5);
         assert_eq!(syscall::INPUTD_INGRESS_KIND_POINTER_PACKET, 2);
+        assert_eq!(syscall::INPUTD_INGRESS_KIND_POINTER_POSITION, 3);
         assert_eq!(syscall::INPUTD_INGRESS_KIND_DVM_LINUX_KEY, 10);
         assert_eq!(syscall::INPUTD_INGRESS_FLAG_DVM_SOURCE, 1 << 1);
         assert_eq!(syscall::STORAGED_OP_ROOT_STATUS, 4);
@@ -135,7 +137,8 @@ mod tests {
         assert!(size_of::<syscall::InputIngestBrokerArgs>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert_eq!(size_of::<syscall::InputKeyboardEventWire>(), 16);
         assert_eq!(size_of::<syscall::InputPointerPacketWire>(), 12);
-        assert_eq!(size_of::<syscall::InputIngressWire>(), 36);
+        assert_eq!(size_of::<syscall::InputPointerPositionWire>(), 16);
+        assert_eq!(size_of::<syscall::InputIngressWire>(), 52);
         assert!(size_of::<syscall::InputdReadResponse>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert!(size_of::<syscall::RootdIpcRequest>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert!(size_of::<syscall::RootdIpcResponse>() <= syscall::IPC_MAX_INLINE_BYTES);

@@ -12,7 +12,7 @@ use crate::sys::{
     DisplayInfo, DisplaySurfaceCreate, ESTALE, PIXEL_FORMAT_BGRA8888, SurfaceMapping, boot_line,
     debug_line, diag_line, display_create_surface, display_get_info, display_present,
     display_present_rect, map_surface, open_console, open_display, open_input,
-    publish_input_pointer_surface,
+    publish_input_pointer_surface, require_background_thread_class,
 };
 const SURFACE_CREATE_RETRIES: usize = 4;
 // Retry budget for waiting on a primary display provider (for example the DVM
@@ -302,7 +302,7 @@ impl AppState {
         boot_line("uiserver: init open_input done");
         diag_line("uiserver: init open_console begin");
         boot_line("uiserver: init open_console begin");
-        let _console_fd = open_console().map_err(|errno| {
+        let console_fd = open_console().map_err(|errno| {
             debug_line(&format!("uiserver: open_console failed errno={errno}"));
             diag_line("uiserver: open_console failed");
             boot_line("uiserver: open_console failed");
@@ -316,19 +316,27 @@ impl AppState {
         let surface_state = fetch_surface_state(display_fd.as_raw_fd())?;
         diag_line("uiserver: init fetch_surface done");
         boot_line("uiserver: init fetch_surface done");
+        boot_line("uiserver: input pointer surface publish begin");
         match publish_input_pointer_surface(surface_state.display) {
-            Ok(()) => diag_line(
-                format!(
-                    "uiserver: input pointer surface published width={} height={} gen={}",
-                    surface_state.display.width,
-                    surface_state.display.height,
-                    surface_state.display.generation,
-                )
-                .as_str(),
-            ),
-            Err(errno) => diag_line(
-                format!("uiserver: input pointer surface publish failed errno={errno}").as_str(),
-            ),
+            Ok(()) => {
+                boot_line("uiserver: input pointer surface publish done");
+                diag_line(
+                    format!(
+                        "uiserver: input pointer surface published width={} height={} gen={}",
+                        surface_state.display.width,
+                        surface_state.display.height,
+                        surface_state.display.generation,
+                    )
+                    .as_str(),
+                );
+            }
+            Err(errno) => {
+                boot_line("uiserver: input pointer surface publish failed");
+                diag_line(
+                    format!("uiserver: input pointer surface publish failed errno={errno}")
+                        .as_str(),
+                );
+            }
         }
         diag_line(
             format!(
@@ -346,12 +354,15 @@ impl AppState {
             )
             .as_str(),
         );
+        boot_line("uiserver: console command dispatcher spawn begin");
+        let console_commands = start_console_command_dispatcher(console_fd);
+        boot_line("uiserver: console command dispatcher spawn done");
         Ok(Self {
             display: surface_state.display,
             surface: surface_state.surface,
             display_fd,
             input_fds,
-            console_commands: start_console_command_dispatcher(),
+            console_commands,
             surface_fd: surface_state.surface_fd,
             frame: surface_state.frame,
             cursor_x: surface_state.display.width / 2,
@@ -447,6 +458,7 @@ impl AppState {
 pub(crate) fn start_launcher_program_loader() -> Receiver<Vec<LauncherProgram>> {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
+        require_background_thread_class();
         let _ = sender.send(load_launcher_programs());
     });
     receiver

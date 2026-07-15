@@ -257,7 +257,6 @@ struct VfsState {
     volume: Option<FatVolume<BootBlockDevice>>,
     cwd: BTreeMap<u64, String>,
     handles: BTreeMap<u64, RemoteHandle>,
-    file_cache: BTreeMap<String, Vec<u8>>,
     /// Positive + negative metadata cache. `Ok(_)` is a resolved entry;
     /// `Err(errno)` is a negative cache (e.g. ENOENT) so back-to-back stat()s
     /// of common missing libc paths return without touching FAT. The whole map
@@ -314,7 +313,6 @@ impl VfsState {
             volume: None,
             cwd: BTreeMap::new(),
             handles: BTreeMap::new(),
-            file_cache: BTreeMap::new(),
             metadata_cache: BTreeMap::new(),
             dir_entries_cache: BTreeMap::new(),
             epolls: BTreeMap::new(),
@@ -328,7 +326,6 @@ impl VfsState {
         if self.cache_generation != self.mount_generation {
             self.metadata_cache.clear();
             self.dir_entries_cache.clear();
-            self.file_cache.clear();
             self.cache_generation = self.mount_generation;
         }
     }
@@ -1123,7 +1120,7 @@ impl VfsState {
         let read = if len == 0 {
             0
         } else {
-            self.cached_file_slice_into(path.as_str(), start, &mut dest[..len])?
+            self.read_file_slice_into(path.as_str(), start, &mut dest[..len])?
         };
         if offset.is_none() {
             if let Some(handle) = self.handles.get_mut(&id) {
@@ -1133,30 +1130,15 @@ impl VfsState {
         Ok(read)
     }
 
-    fn cached_file_slice_into(
+    fn read_file_slice_into(
         &mut self,
         path: &str,
         start: u64,
         dest: &mut [u8],
     ) -> Result<usize, i32> {
-        if !self.file_cache.contains_key(path) {
-            let bytes = self
-                .volume()?
-                .read_file_to_vec(path)
-                .map_err(map_fat_error)?;
-            self.file_cache.insert(path.to_string(), bytes);
-        }
-        let Some(bytes) = self.file_cache.get(path) else {
-            return Err(ENOENT);
-        };
-        let start = usize::try_from(start).map_err(|_| EINVAL)?;
-        if start >= bytes.len() {
-            return Ok(0);
-        }
-        let end = start.saturating_add(dest.len()).min(bytes.len());
-        let read = end - start;
-        dest[..read].copy_from_slice(&bytes[start..end]);
-        Ok(read)
+        self.volume()?
+            .read_file_range_into(path, start, dest)
+            .map_err(map_fat_error)
     }
 
     fn getdents_payload(

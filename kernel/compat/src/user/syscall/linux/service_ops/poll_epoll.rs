@@ -66,20 +66,16 @@ pub fn syscall_linux_poll(fds_ptr: u64, nfds: u64, timeout_ms: i64) -> u64 {
         if can_block_on_input {
             match block_current_poll_on_input(fds_ptr, nfds) {
                 PollInputBlockResult::BlockedOrRaced => continue,
-                PollInputBlockResult::PolledCompletionServiced => continue,
                 PollInputBlockResult::NoInputInterest => {}
                 PollInputBlockResult::Err(errno) => return linux_errno(errno),
             }
         }
-        if let Some(timeout_ticks) = timeout_ticks {
-            let deadline_tick = start_tick.saturating_add(timeout_ticks);
-            match block_current_poll_on_input_until(fds_ptr, nfds, deadline_tick) {
-                PollInputBlockResult::BlockedOrRaced => continue,
-                PollInputBlockResult::PolledCompletionServiced => continue,
-                PollInputBlockResult::NoInputInterest => {}
-                PollInputBlockResult::Err(errno) => return linux_errno(errno),
-            }
-        }
+        // A finite poll already owns a hard RTC deadline. Recheck once per
+        // tick instead of registering the same task simultaneously in the
+        // input-waiter and RTC-waiter tables. The dual registration could
+        // lose both wake paths under an MSI-X/deadline race and strand an 8 ms
+        // UI poll indefinitely. Indefinite polls above remain event-driven;
+        // finite polls add at most one 1024 Hz tick of readiness latency.
         crate::arch::rtc::sleep(1);
     }
 }
@@ -159,10 +155,16 @@ fn poll_socket_revents(fd: u64, events: u32) -> Result<u32, i64> {
 
 fn poll_input_device_revents(fd: u64, events: u32) -> Result<u32, i64> {
     let mut revents = 0_u32;
-    if events & (linux_abi::POLLIN as u32 | linux_abi::POLLPRI as u32) != 0
-        && input_device_has_pending_events(fd)?
-    {
-        revents |= events & (linux_abi::POLLIN as u32 | linux_abi::POLLPRI as u32);
+    if events & (linux_abi::POLLIN as u32 | linux_abi::POLLPRI as u32) != 0 {
+        let pending = input_device_has_pending_events(fd)?;
+        // A successful policy-backed query proves both a valid input handle
+        // and a responsive inputd. Only now may L0 ask the DVM to start its
+        // continuous stream; MSI-X installation by itself is not consumer
+        // readiness.
+        let _ = kernel_io_manager::api::input::mark_dvm_policy_consumer_ready();
+        if pending {
+            revents |= events & (linux_abi::POLLIN as u32 | linux_abi::POLLPRI as u32);
+        }
     }
     Ok(revents)
 }
@@ -198,7 +200,6 @@ fn poll_ready_bits(requested: u32) -> u32 {
 
 enum PollInputBlockResult {
     BlockedOrRaced,
-    PolledCompletionServiced,
     NoInputInterest,
     Err(i64),
 }
@@ -208,9 +209,6 @@ fn block_current_poll_on_input(fds_ptr: u64, nfds: u64) -> PollInputBlockResult 
         Ok(true) => {}
         Ok(false) => return PollInputBlockResult::NoInputInterest,
         Err(errno) => return PollInputBlockResult::Err(errno),
-    }
-    if kernel_io_manager::api::input::service_dvm_input_pending() != 0 {
-        return PollInputBlockResult::PolledCompletionServiced;
     }
     let Some(task_id) = multitask::current_task_id() else {
         return PollInputBlockResult::NoInputInterest;
@@ -243,69 +241,6 @@ fn block_current_poll_on_input(fds_ptr: u64, nfds: u64) -> PollInputBlockResult 
             PollInputBlockResult::Err(LINUX_EINVAL)
         }
     }
-}
-
-fn block_current_poll_on_input_until(
-    fds_ptr: u64,
-    nfds: u64,
-    deadline_tick: u64,
-) -> PollInputBlockResult {
-    match poll_has_input_read_interest(fds_ptr, nfds) {
-        Ok(true) => {}
-        Ok(false) => return PollInputBlockResult::NoInputInterest,
-        Err(errno) => return PollInputBlockResult::Err(errno),
-    }
-    if crate::arch::rtc::ticks() >= deadline_tick {
-        return PollInputBlockResult::BlockedOrRaced;
-    }
-    if kernel_io_manager::api::input::service_dvm_input_pending() != 0 {
-        return PollInputBlockResult::PolledCompletionServiced;
-    }
-    let Some(task_id) = multitask::current_task_id() else {
-        return PollInputBlockResult::NoInputInterest;
-    };
-    if !multitask::arm_block_current_task() {
-        return PollInputBlockResult::NoInputInterest;
-    }
-    if !kernel_io_manager::api::input::event_queue::arm_input_waiter(task_id) {
-        let _ = multitask::wake_task(task_id);
-        let _ = multitask::commit_block_current_task();
-        return PollInputBlockResult::NoInputInterest;
-    }
-    if !crate::arch::rtc::arm_sleep_waiter_until_tick(task_id, deadline_tick) {
-        disarm_input_poll_wait(task_id);
-        let _ = multitask::wake_task(task_id);
-        let _ = multitask::commit_block_current_task();
-        return PollInputBlockResult::BlockedOrRaced;
-    }
-    if kernel_io_manager::api::input::event_queue::has_pending_input_events()
-        || crate::arch::rtc::ticks() >= deadline_tick
-    {
-        disarm_input_poll_wait(task_id);
-        let _ = multitask::wake_task(task_id);
-        let _ = multitask::commit_block_current_task();
-        return PollInputBlockResult::BlockedOrRaced;
-    }
-    match multitask::commit_block_current_task() {
-        Some(true) => {
-            multitask::yield_now();
-            disarm_input_poll_wait(task_id);
-            PollInputBlockResult::BlockedOrRaced
-        }
-        Some(false) => {
-            disarm_input_poll_wait(task_id);
-            PollInputBlockResult::BlockedOrRaced
-        }
-        None => {
-            disarm_input_poll_wait(task_id);
-            PollInputBlockResult::Err(LINUX_EINVAL)
-        }
-    }
-}
-
-fn disarm_input_poll_wait(task_id: u64) {
-    kernel_io_manager::api::input::event_queue::disarm_input_waiter(task_id);
-    crate::arch::rtc::disarm_sleep_waiter(task_id);
 }
 
 fn poll_has_input_read_interest(fds_ptr: u64, nfds: u64) -> Result<bool, i64> {

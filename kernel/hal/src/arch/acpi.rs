@@ -6,6 +6,8 @@ const RSDP_V2_LEN: usize = 36;
 const SDT_HEADER_LEN: usize = 36;
 const MCFG_HEADER_LEN: usize = 44;
 const MCFG_ENTRY_LEN: usize = 16;
+const HPET_TABLE_LEN: usize = 56;
+const ACPI_ADDRESS_SPACE_SYSTEM_MEMORY: u8 = 0;
 const MAX_MCFG_REGIONS: usize = 8;
 const IDENTITY_MAPPED_PHYS_LIMIT: u64 = 512 * 1024 * 1024 * 1024;
 
@@ -39,6 +41,7 @@ impl PciConfigRegion {
 
 struct AcpiState {
     rsdp_addr: u64,
+    hpet_address: u64,
     region_count: usize,
     regions: [PciConfigRegion; MAX_MCFG_REGIONS],
 }
@@ -47,6 +50,7 @@ impl AcpiState {
     const fn new() -> Self {
         Self {
             rsdp_addr: 0,
+            hpet_address: 0,
             region_count: 0,
             regions: [PciConfigRegion::empty(); MAX_MCFG_REGIONS],
         }
@@ -54,6 +58,7 @@ impl AcpiState {
 
     fn reset(&mut self, rsdp_addr: u64) {
         self.rsdp_addr = rsdp_addr;
+        self.hpet_address = 0;
         self.region_count = 0;
         self.regions = [PciConfigRegion::empty(); MAX_MCFG_REGIONS];
     }
@@ -81,7 +86,8 @@ pub fn init(boot_info_ptr: *const BootInfo) {
         return;
     }
 
-    if load_mcfg_regions(state.rsdp_addr, &mut state) {
+    let rsdp_addr = state.rsdp_addr;
+    if load_mcfg_regions(rsdp_addr, &mut state) {
         crate::debug::println!(
             "ACPI MCFG loaded from {:#x}: {} region(s).",
             state.rsdp_addr,
@@ -90,6 +96,17 @@ pub fn init(boot_info_ptr: *const BootInfo) {
     } else {
         crate::debug::println!("ACPI MCFG unavailable; falling back to legacy PCI config access.");
     }
+    state.hpet_address = load_hpet_address(rsdp_addr).unwrap_or(0);
+    if state.hpet_address != 0 {
+        crate::debug::println!("ACPI HPET available at {:#x}.", state.hpet_address);
+    } else {
+        crate::debug::println!("ACPI HPET unavailable.");
+    }
+}
+
+pub fn hpet_address() -> Option<u64> {
+    let address = ACPI_STATE.lock().hpet_address;
+    (address != 0).then_some(address)
 }
 
 pub fn pci_config_address(
@@ -168,6 +185,44 @@ fn load_mcfg_regions(rsdp_addr: u64, state: &mut AcpiState) -> bool {
     }
 
     loaded
+}
+
+fn load_hpet_address(rsdp_addr: u64) -> Option<u64> {
+    let (root_addr, entry_size) = root_sdt_from_rsdp(rsdp_addr)?;
+    let root_table = sdt_bytes(root_addr)?;
+    let entries = &root_table[SDT_HEADER_LEN..];
+    let mut index = 0;
+    while index + entry_size <= entries.len() {
+        let table_addr = if entry_size == 8 {
+            le_u64(&entries[index..index + 8])
+        } else {
+            le_u32(&entries[index..index + 4]) as u64
+        };
+        if let Some(table) = sdt_bytes(table_addr)
+            && &table[..4] == b"HPET"
+        {
+            return parse_hpet_table(table);
+        }
+        index += entry_size;
+    }
+    None
+}
+
+fn parse_hpet_table(table: &[u8]) -> Option<u64> {
+    // ACPI header (36) + Event Timer Block ID (4) precede the GAS.
+    const GAS_OFFSET: usize = 40;
+    if table.len() < HPET_TABLE_LEN || table[GAS_OFFSET] != ACPI_ADDRESS_SPACE_SYSTEM_MEMORY {
+        return None;
+    }
+    // Some firmware leaves GAS.RegisterBitWidth as zero/unspecified. Accept
+    // that encoding and let the HPET capability register provide the
+    // authoritative 64-bit check; reject only an explicit sub-64-bit width.
+    if table[GAS_OFFSET + 1] != 0 && table[GAS_OFFSET + 1] < 64 {
+        return None;
+    }
+    let address = le_u64(&table[GAS_OFFSET + 4..GAS_OFFSET + 12]);
+    let end = address.checked_add(1024)?;
+    (address != 0 && end <= IDENTITY_MAPPED_PHYS_LIMIT).then_some(address)
 }
 
 fn root_sdt_from_rsdp(rsdp_addr: u64) -> Option<(u64, usize)> {

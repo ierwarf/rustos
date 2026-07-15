@@ -33,13 +33,14 @@ pub use self::current::{
     commit_block_current_task, current_console_session, current_linux_thread_state,
     current_task_id, current_user_address_space, current_user_id, current_user_log_ids,
     current_user_process_id, current_user_process_thread_count, current_user_snapshot,
-    current_user_stack_state, current_user_thread_id, exec_current_user_process,
-    exec_user_process_by_pid, exit_current_user_process, exit_current_user_task,
-    halt_current_retired_task, inherit_ipc_priority, inherit_ipc_priority_for_process,
-    is_user_process_exiting, is_user_task_alive, linux_thread_snapshot_by_ids,
-    mark_user_process_exiting, note_process_exit_status, parent_process_id_of, queue_linux_signal,
-    release_ipc_priorities_for_process, release_ipc_priority, retain_current_user_process_state,
-    retire_current_user_task_due_to_fault, service_deferred_work, set_next_pick_hint,
+    current_user_stack_state, current_user_thread_id, demote_current_user_task_to_user_class,
+    exec_current_user_process, exec_user_process_by_pid, exit_current_user_process,
+    exit_current_user_task, halt_current_retired_task, inherit_ipc_priority,
+    inherit_ipc_priority_for_process, is_user_process_exiting, is_user_task_alive,
+    linux_thread_snapshot_by_ids, mark_user_process_exiting, note_process_exit_status,
+    parent_process_id_of, queue_linux_signal, release_ipc_priorities_for_process,
+    release_ipc_priority, retain_current_user_process_state, retire_current_user_task_due_to_fault,
+    service_deferred_work, set_next_pick_hint, set_next_process_pick_hint,
     set_next_spawn_pick_hint, terminate_user_process, terminate_user_task, user_log_ids_for_task,
     wait_for_child, wake_task, wake_user_task, with_current_mm, with_current_process_credentials,
     with_current_process_state, with_current_process_state_mut, with_current_user_linux_state_mut,
@@ -49,7 +50,7 @@ pub use self::current::{
 #[allow(unused_imports)]
 pub(crate) use self::irq::{
     clear_deferred_reschedule_request, cond_resched, request_deferred_reschedule,
-    reschedule_if_requested,
+    request_user_return_reschedule, reschedule_if_requested,
 };
 pub use self::irq::{
     rtc_interrupt_handler_addr, software_schedule_interrupt_handler_addr,
@@ -59,12 +60,13 @@ pub use self::spawn::{
     restore_current_simd_state, save_current_simd_state, spawn_kernel_process, spawn_user_process,
     spawn_user_process_state_with_parent, spawn_user_process_suspended,
     spawn_user_process_with_parent, spawn_user_process_without_deferred_reschedule,
-    spawn_user_thread, start,
+    spawn_user_thread_suspended, start,
 };
 
 const MAIN_THREAD_SLICE_MICROS: u64 = 1_000;
 const MIN_THREAD_WEIGHT_MICROS: u64 = 1;
 const MAX_THREAD_WEIGHT_MICROS: u64 = 10_000;
+const INTERACTIVE_PIT_DIVISOR_FLAG: u16 = 1 << 15;
 pub const DEFAULT_USER_TASK_WEIGHT_MICROS: u64 = 100;
 const USER_TASK_EXEC_PATH_CAPACITY: usize = 192;
 const USER_STACK_PAGE_SIZE: u64 = 4096;
@@ -72,6 +74,7 @@ const USER_STACK_PAGE_SIZE: u64 = 4096;
 static mut SCHEDULER: Scheduler = Scheduler::new();
 static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(0);
 static DEFERRED_RESCHEDULE_REQUESTED: AtomicU64 = AtomicU64::new(0);
+static USER_RETURN_RESCHEDULE_ARMED: AtomicU64 = AtomicU64::new(0);
 
 #[inline(always)]
 unsafe fn scheduler_mut() -> &'static mut Scheduler {
@@ -411,11 +414,24 @@ fn checked_thread_pit_divisor(weight_micros: u64) -> Result<u16, SpawnTaskError>
         return Err(SpawnTaskError::InvalidWeightMicros);
     }
 
-    Ok(crate::arch::pit::divisor_from_micros(weight_micros))
+    let value = weight_micros & rustos_user_abi::syscall::TASK_WEIGHT_VALUE_MASK;
+    let divisor = crate::arch::pit::divisor_from_micros(value);
+    Ok(
+        if weight_micros & rustos_user_abi::syscall::TASK_WEIGHT_INTERACTIVE_FLAG != 0 {
+            divisor | INTERACTIVE_PIT_DIVISOR_FLAG
+        } else {
+            divisor
+        },
+    )
 }
 
 pub const fn thread_weight_is_valid(weight_micros: u64) -> bool {
-    weight_micros >= MIN_THREAD_WEIGHT_MICROS && weight_micros <= MAX_THREAD_WEIGHT_MICROS
+    let value = weight_micros & rustos_user_abi::syscall::TASK_WEIGHT_VALUE_MASK;
+    let known_bits = rustos_user_abi::syscall::TASK_WEIGHT_VALUE_MASK
+        | rustos_user_abi::syscall::TASK_WEIGHT_INTERACTIVE_FLAG;
+    weight_micros & !known_bits == 0
+        && value >= MIN_THREAD_WEIGHT_MICROS
+        && value <= MAX_THREAD_WEIGHT_MICROS
 }
 
 fn initial_task_rflags() -> RFlags {

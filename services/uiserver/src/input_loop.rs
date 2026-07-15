@@ -14,7 +14,7 @@ use crate::app::{
 use crate::profile;
 use crate::sys::{
     INPUT_ACTION_NONE, INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION, InputEvent,
-    diag_line, read_input, wait_for_input_ready,
+    boot_line, diag_line, read_input, require_background_thread_class, wait_for_input_ready,
 };
 use crate::wayland::WaylandCompositor;
 
@@ -34,6 +34,10 @@ pub(crate) struct InputReader {
 
 struct InputReaderStats {
     started: Instant,
+    wait_active: AtomicBool,
+    wait_started_ms: AtomicU64,
+    wait_attempts: AtomicU64,
+    completed_waits: AtomicU64,
     read_active: AtomicBool,
     read_started_ms: AtomicU64,
     read_attempts: AtomicU64,
@@ -47,6 +51,10 @@ struct InputReaderStats {
 }
 
 pub(crate) struct InputReaderSnapshot {
+    pub(crate) wait_active: bool,
+    pub(crate) wait_elapsed_ms: u64,
+    pub(crate) wait_attempts: u64,
+    pub(crate) completed_waits: u64,
     pub(crate) read_active: bool,
     pub(crate) read_elapsed_ms: u64,
     pub(crate) read_attempts: u64,
@@ -89,6 +97,10 @@ impl InputReaderStats {
     fn new() -> Self {
         Self {
             started: Instant::now(),
+            wait_active: AtomicBool::new(false),
+            wait_started_ms: AtomicU64::new(0),
+            wait_attempts: AtomicU64::new(0),
+            completed_waits: AtomicU64::new(0),
             read_active: AtomicBool::new(false),
             read_started_ms: AtomicU64::new(0),
             read_attempts: AtomicU64::new(0),
@@ -108,10 +120,20 @@ impl InputReaderStats {
 
     fn snapshot(&self) -> InputReaderSnapshot {
         let now_ms = self.elapsed_ms();
+        let wait_active = self.wait_active.load(Ordering::Acquire);
+        let wait_started_ms = self.wait_started_ms.load(Ordering::Acquire);
         let read_active = self.read_active.load(Ordering::Acquire);
         let read_started_ms = self.read_started_ms.load(Ordering::Acquire);
         let last_delivery_ms = self.last_delivery_ms.load(Ordering::Acquire);
         InputReaderSnapshot {
+            wait_active,
+            wait_elapsed_ms: if wait_active {
+                now_ms.saturating_sub(wait_started_ms)
+            } else {
+                0
+            },
+            wait_attempts: self.wait_attempts.load(Ordering::Acquire),
+            completed_waits: self.completed_waits.load(Ordering::Acquire),
             read_active,
             read_elapsed_ms: if read_active {
                 now_ms.saturating_sub(read_started_ms)
@@ -142,13 +164,34 @@ pub(crate) fn start_input_reader(input_fds: Vec<OwnedFd>) -> InputReader {
     thread::Builder::new()
         .name(String::from("uiserver-input-reader"))
         .spawn(move || {
+            boot_line("uiserver: input reader worker enter");
             let mut events = [InputEvent::default(); INPUT_EVENT_BATCH];
+            let mut first_wait = true;
             loop {
-                if let Err(errno) = wait_for_input_ready(&input_fds) {
-                    reader_stats.errors.fetch_add(1, Ordering::Relaxed);
-                    diag_line(format!("uiserver: input readiness wait failed errno={errno}"));
-                    thread::sleep(INPUT_READER_IDLE_SLEEP);
-                    continue;
+                reader_stats
+                    .wait_started_ms
+                    .store(reader_stats.elapsed_ms(), Ordering::Release);
+                reader_stats.wait_active.store(true, Ordering::Release);
+                reader_stats.wait_attempts.fetch_add(1, Ordering::Relaxed);
+                if first_wait {
+                    boot_line("uiserver: input reader first poll begin");
+                }
+                let wait_result = wait_for_input_ready(&input_fds);
+                if first_wait {
+                    boot_line("uiserver: input reader first poll returned");
+                    first_wait = false;
+                }
+                reader_stats.wait_active.store(false, Ordering::Release);
+                reader_stats.completed_waits.fetch_add(1, Ordering::Relaxed);
+                match wait_result {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(errno) => {
+                        reader_stats.errors.fetch_add(1, Ordering::Relaxed);
+                        diag_line(format!("uiserver: input readiness wait failed errno={errno}"));
+                        thread::sleep(INPUT_READER_IDLE_SLEEP);
+                        continue;
+                    }
                 }
                 reader_stats
                     .read_started_ms
@@ -227,9 +270,27 @@ pub(crate) fn start_input_reader(input_fds: Vec<OwnedFd>) -> InputReader {
     let watchdog_stats = Arc::clone(&stats);
     thread::Builder::new()
         .name(String::from("uiserver-input-watchdog"))
-        .spawn(move || loop {
+        .spawn(move || {
+            require_background_thread_class();
+            loop {
             thread::sleep(INPUT_READER_WATCHDOG_INTERVAL);
             let snapshot = watchdog_stats.snapshot();
+            if snapshot.wait_active && snapshot.wait_elapsed_ms >= INPUT_READER_PANIC_THRESHOLD_MS {
+                diag_line(format!(
+                    "uiserver input watchdog panic: wait_for_input_ready blocked elapsed_ms={} wait_attempts={} completed_waits={} read_attempts={} completed_reads={} raw_events={} delivered_events={} queue_drops={} slow_reads={} errors={}",
+                    snapshot.wait_elapsed_ms,
+                    snapshot.wait_attempts,
+                    snapshot.completed_waits,
+                    snapshot.read_attempts,
+                    snapshot.completed_reads,
+                    snapshot.raw_events,
+                    snapshot.delivered_events,
+                    snapshot.queue_drops,
+                    snapshot.slow_reads,
+                    snapshot.errors,
+                ));
+                std::process::exit(134);
+            }
             if snapshot.read_active && snapshot.read_elapsed_ms >= INPUT_READER_PANIC_THRESHOLD_MS {
                 diag_line(format!(
                     "uiserver input watchdog panic: read_input blocked elapsed_ms={} read_attempts={} completed_reads={} raw_events={} delivered_events={} queue_drops={} slow_reads={} errors={}",
@@ -243,6 +304,7 @@ pub(crate) fn start_input_reader(input_fds: Vec<OwnedFd>) -> InputReader {
                     snapshot.errors,
                 ));
                 std::process::exit(134);
+            }
             }
         })
         .unwrap_or_else(|_| {

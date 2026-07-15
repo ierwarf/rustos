@@ -1,21 +1,14 @@
 // RING3-MIGRATION-REFERENCE START: display-present-substrate exception:
 // uiserver and the Linux DVM own display backend policy. Ring0 keeps framebuffer
 // mapping, write-combine setup, and present copy substrate.
-#[cfg(rustos_debug_print_enabled)]
-use core::sync::atomic::AtomicUsize;
-use core::sync::atomic::Ordering;
-
 use boot_protocol::FramebufferInfo;
-use x86_64::instructions::interrupts;
 
-use super::GuiDisplayInfo;
 use super::framebuffer::{Framebuffer, FramebufferRect, build_framebuffer};
+use super::{GuiDisplayInfo, GuiPresentOutcome};
 use crate::memory::paging;
 use crate::sync::KernelWaitLock;
 
 const ENABLE_FRAMEBUFFER_WRITE_COMBINE: bool = true;
-#[cfg(rustos_debug_print_enabled)]
-const MAX_BACKEND_PRESENT_SAMPLE_LOGS: usize = 8;
 
 enum BackendInstance {
     Unavailable,
@@ -34,8 +27,6 @@ pub(crate) struct DisplayBackend {
 
 static DISPLAY_BACKEND: KernelWaitLock<DisplayBackend> =
     KernelWaitLock::new(DisplayBackend::empty());
-#[cfg(rustos_debug_print_enabled)]
-static BACKEND_PRESENT_SAMPLE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 impl DisplayBackend {
     const fn empty() -> Self {
@@ -88,10 +79,9 @@ fn next_display_generation(current: u64) -> u64 {
 }
 
 pub(crate) fn install_driver_framebuffer(info: FramebufferInfo, flags: u32) -> bool {
-    // A DVM present keeps the shared generation odd only while this same
-    // backend lock is held. Serialize provider replacement with that present
-    // so on_framebuffer_installed cannot detach the shared header before
-    // finish_frame restores its even generation for the DVM consumer.
+    // Serialize provider replacement with a GUI-DVM publish so the pool cannot
+    // be detached while a slot is being copied and its fixed PRESENT record is
+    // being committed.
     let mut backend = DISPLAY_BACKEND.lock();
     crate::io::dvm_display::on_framebuffer_installed(info.addr);
     backend.install_framebuffer(info, flags)
@@ -102,67 +92,51 @@ pub(crate) fn try_with_framebuffer<R>(f: impl FnOnce(&mut Framebuffer) -> R) -> 
     backend.with_framebuffer(f)
 }
 
+/// `Err(())` means the backend lock is contended.  A syscall present must
+/// preserve its damage and retry; it must not wait while the entry path may
+/// have interrupts masked.
+fn try_with_framebuffer_nonblocking<R>(
+    f: impl FnOnce(&mut Framebuffer) -> R,
+) -> Result<Option<R>, ()> {
+    let Some(mut backend) = DISPLAY_BACKEND.try_lock() else {
+        return Err(());
+    };
+    Ok(backend.with_framebuffer(f))
+}
+
 pub(crate) fn display_info() -> Option<GuiDisplayInfo> {
     DISPLAY_BACKEND.lock().display_info()
 }
-
-#[cfg(rustos_debug_print_enabled)]
-fn log_backend_present_sample(framebuffer: &Framebuffer, drawn: bool) {
-    let sample_index = BACKEND_PRESENT_SAMPLE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if sample_index >= MAX_BACKEND_PRESENT_SAMPLE_LOGS {
-        return;
-    }
-
-    let (active, front) = framebuffer.debug_sample_buffers();
-    crate::debug::println!(
-        "display backend sample #{} drawn={} active={:02x}{:02x}{:02x}{:02x} front={:02x}{:02x}{:02x}{:02x} double_buffer={}",
-        sample_index + 1,
-        drawn,
-        active[0],
-        active[1],
-        active[2],
-        active[3],
-        front[0],
-        front[1],
-        front[2],
-        front[3],
-        framebuffer.debug_uses_double_buffer(),
-    );
-}
-
-#[cfg(not(rustos_debug_print_enabled))]
-fn log_backend_present_sample(_framebuffer: &Framebuffer, _drawn: bool) {}
 
 pub(crate) fn present_bgra8888_from_kernel(
     src_ptr: *const u8,
     width: usize,
     height: usize,
     stride_bytes: usize,
-) -> bool {
+) -> GuiPresentOutcome {
     crate::io::dvm_display::ensure_installed_before_present();
-    if !present_context_allows_blocking() {
-        return false;
-    }
     if display_present_faulted() {
-        return false;
+        return GuiPresentOutcome::Unavailable;
     }
-    let presented = DISPLAY_BACKEND
-        .lock()
-        .with_framebuffer(|framebuffer| {
-            let dvm_frame = crate::io::dvm_display::begin_frame();
-            let drawn =
-                framebuffer.draw_bgra8888_frame_from_kernel(src_ptr, width, height, stride_bytes);
-            log_backend_present_sample(framebuffer, drawn);
-            let presented = if drawn {
-                framebuffer.present_scene()
-            } else {
-                false
-            };
-            crate::io::dvm_display::finish_frame(dvm_frame);
-            presented
-        })
-        .unwrap_or(false);
-    presented
+    // A display ioctl may arrive through an entry path with interrupts masked.
+    // Presentation must never turn that into a spurious device removal or wait
+    // on a contended backend lock.  A busy compositor has an explicit
+    // non-blocking drop outcome; the next damage update will repaint it.
+    let dvm_published = match try_with_framebuffer_nonblocking(|_| {
+        crate::io::dvm_display::try_publish_full(src_ptr, width, height, stride_bytes)
+    }) {
+        Ok(value) => value,
+        Err(()) => return GuiPresentOutcome::Backpressured,
+    };
+    match dvm_published {
+        Some(crate::io::dvm_display::DvmPresentOutcome::Presented) => GuiPresentOutcome::Presented,
+        Some(crate::io::dvm_display::DvmPresentOutcome::Backpressured) => {
+            GuiPresentOutcome::Backpressured
+        }
+        Some(crate::io::dvm_display::DvmPresentOutcome::Unavailable) | None => {
+            GuiPresentOutcome::Unavailable
+        }
+    }
 }
 
 pub(crate) fn present_bgra8888_rect_from_kernel(
@@ -171,40 +145,35 @@ pub(crate) fn present_bgra8888_rect_from_kernel(
     height: usize,
     stride_bytes: usize,
     rect: FramebufferRect,
-) -> bool {
+) -> GuiPresentOutcome {
     crate::io::dvm_display::ensure_installed_before_present();
-    if !present_context_allows_blocking() {
-        return false;
-    }
     if display_present_faulted() {
-        return false;
+        return GuiPresentOutcome::Unavailable;
     }
-    let presented = DISPLAY_BACKEND
-        .lock()
-        .with_framebuffer(|framebuffer| {
-            let dvm_frame = crate::io::dvm_display::begin_frame();
-            let drawn = framebuffer.draw_bgra8888_frame_rect_from_kernel(
-                src_ptr,
-                width,
-                height,
-                stride_bytes,
-                rect,
-            );
-            log_backend_present_sample(framebuffer, drawn);
-            let presented = if drawn {
-                framebuffer.present_scene()
-            } else {
-                false
-            };
-            crate::io::dvm_display::finish_frame(dvm_frame);
-            presented
-        })
-        .unwrap_or(false);
-    presented
-}
-
-fn present_context_allows_blocking() -> bool {
-    interrupts::are_enabled()
+    let dvm_published = match try_with_framebuffer_nonblocking(|_| {
+        crate::io::dvm_display::try_publish_rect(
+            src_ptr,
+            width,
+            height,
+            stride_bytes,
+            rect.x as u32,
+            rect.y as u32,
+            rect.width as u32,
+            rect.height as u32,
+        )
+    }) {
+        Ok(value) => value,
+        Err(()) => return GuiPresentOutcome::Backpressured,
+    };
+    match dvm_published {
+        Some(crate::io::dvm_display::DvmPresentOutcome::Presented) => GuiPresentOutcome::Presented,
+        Some(crate::io::dvm_display::DvmPresentOutcome::Backpressured) => {
+            GuiPresentOutcome::Backpressured
+        }
+        Some(crate::io::dvm_display::DvmPresentOutcome::Unavailable) | None => {
+            GuiPresentOutcome::Unavailable
+        }
+    }
 }
 
 fn display_present_faulted() -> bool {

@@ -265,15 +265,10 @@ fn wake_registered_service_endpoint_waiters(service_id: u64, owner_pid: u64) {
         });
         tasks
     };
-    let mut woke = false;
     for task_id in tasks {
         if multitask::wake_task(task_id) {
             multitask::set_next_pick_hint(task_id);
-            woke = true;
         }
-    }
-    if woke {
-        multitask::request_deferred_reschedule();
     }
 }
 
@@ -1034,11 +1029,7 @@ fn recv_endpoint_once(
             }
             usermem::write_current_user_bytes(reply_cap_ptr, &reply.raw().to_ne_bytes())
                 .map_err(address_space_error_to_linux_errno)?;
-            let _ = multitask::inherit_ipc_priority(
-                reply.raw(),
-                caller_task_id,
-                receiver_task_id,
-            );
+            let _ = multitask::inherit_ipc_priority(reply.raw(), caller_task_id, receiver_task_id);
             Ok(request.len())
         }
         Ok(None) => Err(LINUX_EAGAIN),
@@ -1092,11 +1083,7 @@ fn recv_endpoint_once_with_sender(
             usermem::write_current_user_bytes(sender_tid_ptr, &sender_tid.to_ne_bytes())
                 .map_err(address_space_error_to_linux_errno)?;
             let receiver_task_id = multitask::current_task_id().ok_or(LINUX_EINVAL)?;
-            let _ = multitask::inherit_ipc_priority(
-                reply.raw(),
-                caller_task_id,
-                receiver_task_id,
-            );
+            let _ = multitask::inherit_ipc_priority(reply.raw(), caller_task_id, receiver_task_id);
             Ok(request.len())
         }
         Ok(None) => Err(LINUX_EAGAIN),
@@ -1510,14 +1497,13 @@ fn enqueue_call_and_wake_with_handles(
         endpoint.raw(),
         receiver_to_wake
     );
-    if let Some(receiver_process_id) =
-        kernel_ipc_runtime::api::endpoint::receiver_process_for_reply(reply)
-    {
-        let _ = multitask::inherit_ipc_priority_for_process(
-            reply.raw(),
-            task_id,
-            receiver_process_id,
-        );
+    let receiver_process_id = kernel_ipc_runtime::api::endpoint::receiver_process_for_reply(reply);
+    if let Some(receiver_process_id) = receiver_process_id {
+        let _ =
+            multitask::inherit_ipc_priority_for_process(reply.raw(), task_id, receiver_process_id);
+        if receiver_to_wake.is_none() {
+            let _ = multitask::set_next_process_pick_hint(receiver_process_id);
+        }
     }
     if let Some(receiver_task_id) = receiver_to_wake {
         // The reply capability is the lifetime authority for this donation.

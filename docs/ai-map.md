@@ -24,6 +24,8 @@ output outside the cached unit.
 - `docs/ai/commands.md` — quiet build/check commands and focused debug commands.
 - `docs/ai/contracts-infra.md` — manifest/stage/build/logging/fault contracts.
 - `docs/ai/contracts-abi.md` — IPC service IDs, broker syscalls, service routing.
+- `docs/ai/commercial-quality-gates.md` — non-negotiable completion and
+  retirement gates for enabled product topologies.
 - `docs/ai/performance-hardening.md` — boot/runtime bottleneck and cleanup runbook.
 - `cargo xtask ring3-inventory` — current `RING3-MIGRATION-REFERENCE` and
   `RING3-MIGRATION-COMMENTED-OUT` LOC/owner/action snapshot. Use

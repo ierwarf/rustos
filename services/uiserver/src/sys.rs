@@ -42,6 +42,7 @@ const SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT: usize =
     syscall_abi::SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT as usize;
 const SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT: usize =
     syscall_abi::SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT as usize;
+const SYS_RUSTOS_SCHED_DEMOTE_SELF: usize = syscall_abi::SYS_RUSTOS_SCHED_DEMOTE_SELF as usize;
 
 const AT_FDCWD: isize = -100;
 const O_RDONLY: usize = 0;
@@ -78,7 +79,7 @@ const BTN_SIDE: u16 = 0x113;
 const BTN_EXTRA: u16 = 0x114;
 pub(crate) const CONSOLE_SESSION_CAPACITY: usize = console_abi::MAX_CONSOLE_SESSIONS;
 pub(crate) const MAX_CONSOLE_SNAPSHOT_BYTES: usize = 4096;
-const EAGAIN: i32 = 11;
+pub(crate) const EAGAIN: i32 = 11;
 pub(crate) const ENOENT: i32 = 2;
 pub(crate) const EINVAL: i32 = 22;
 
@@ -99,6 +100,7 @@ static DISPLAY_POLICY_BPP: AtomicU32 = AtomicU32::new(0);
 static DISPLAY_POLICY_FORMAT: AtomicU32 = AtomicU32::new(0);
 static DISPLAY_POLICY_FLAGS: AtomicU32 = AtomicU32::new(0);
 static DISPLAY_POLICY_GENERATION: AtomicU64 = AtomicU64::new(0);
+static BACKGROUND_THREAD_DEMOTIONS: AtomicU64 = AtomicU64::new(0);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -143,10 +145,12 @@ pub(crate) fn start_display_policy_endpoint() -> Result<(), i32> {
     if is_syscall_error(register) {
         return Err(errno_from_result(register));
     }
+    boot_line("uiserver: display policy worker spawn begin");
     thread::Builder::new()
         .name(String::from("uiserver-display-policy"))
         .spawn(move || serve_display_policy(endpoint as u64))
         .map_err(|_| EINVAL)?;
+    boot_line("uiserver: display policy worker spawn done");
     diag_line("uiserver: display policy endpoint registered");
     Ok(())
 }
@@ -220,6 +224,8 @@ pub(crate) fn mark_display_policy_ready() {
 }
 
 fn serve_display_policy(endpoint: u64) {
+    boot_line("uiserver: display policy worker enter");
+    let mut first_request = true;
     loop {
         let mut request = syscall_abi::CommercialMaxProtocolRequest::default();
         let mut reply_cap = 0_u64;
@@ -236,7 +242,15 @@ fn serve_display_policy(endpoint: u64) {
             thread::sleep(std::time::Duration::from_millis(10));
             continue;
         }
+        let trace_first_request = first_request;
+        if trace_first_request {
+            boot_line("uiserver: display policy first request received");
+            first_request = false;
+        }
         let response = dispatch_display_policy_request(received as usize, &request);
+        if trace_first_request {
+            boot_line("uiserver: display policy first response built");
+        }
         let reply = unsafe {
             syscall3(
                 SYS_RUSTOS_IPC_REPLY,
@@ -245,6 +259,9 @@ fn serve_display_policy(endpoint: u64) {
                 size_of::<syscall_abi::CommercialMaxProtocolResponse>(),
             )
         };
+        if trace_first_request {
+            boot_line("uiserver: display policy first reply returned");
+        }
         if is_syscall_error(reply) {
             diag_line(format!(
                 "uiserver: display policy reply failed errno={}",
@@ -498,6 +515,7 @@ pub(crate) fn diag_line(message: impl Into<String>) {
     let sender = SENDER.get_or_init(|| {
         let (sender, receiver) = mpsc::sync_channel::<String>(128);
         thread::spawn(move || {
+            require_background_thread_class();
             while let Ok(message) = receiver.recv() {
                 observability_client::info!("uiserver", service, "{}", message);
             }
@@ -535,23 +553,27 @@ pub(crate) fn profile_line(message: &str) {
     if !ui_profile_enabled() {
         return;
     }
-    // Performance sampling must never synchronously write debugcon from the
-    // render thread.  A long profile record previously stalled that thread
-    // during the private debug-print syscall.  Keep an independent bounded
-    // channel so ordinary diagnostic bursts cannot crowd out KVM samples;
-    // a full channel drops only the observation, which makes the gate fail
-    // conservatively without affecting UI liveness.
-    static SENDER: OnceLock<mpsc::SyncSender<String>> = OnceLock::new();
-    let sender = SENDER.get_or_init(|| {
-        let (sender, receiver) = mpsc::sync_channel::<String>(4);
-        thread::spawn(move || {
-            while let Ok(message) = receiver.recv() {
-                observability_client::info!("uiserver", service, "{}", message);
-            }
-        });
-        sender
-    });
-    let _ = sender.try_send(message.to_owned());
+    // The profile path is only enabled by the KVM acceptance harness. It is
+    // deliberately emitted by the interactive loop itself, after the frame
+    // accounting lock has been released: a User-class relay can legitimately
+    // be starved by a bounded System-class workload under strict priority
+    // scheduling, which would make an otherwise live UI unverifiable.
+    //
+    // `debug_line` maps to the kernel's try-lock debugcon sink. It never
+    // waits for a competing logger; a contended attempt is dropped and the
+    // next one-second proof window retries. Thus profiling cannot block a
+    // present or mutate production behaviour, while the harness still fails
+    // closed if it cannot collect all required windows.
+    debug_line(message);
+}
+
+/// Production liveness telemetry. It cannot wait behind diagnostics: strict
+/// priority scheduling may legitimately starve a User-class relay, while a UI
+/// heartbeat must describe the interactive loop that created it.
+pub(crate) fn heartbeat_line(message: &str) {
+    // This is a lossy try-lock debugcon attempt. A contended logger drops the
+    // sample, rather than delaying a present; the next heartbeat retries.
+    debug_line(message);
 }
 
 pub(crate) fn debug_line(message: &str) {
@@ -564,6 +586,29 @@ pub(crate) fn debug_line(message: &str) {
             line.len(),
         );
     }
+}
+
+/// Makes an auxiliary uiserver thread surrender the System-class admission it
+/// inherited from the interactive process.  This has no host-test effect.
+///
+/// The ABI is self-demotion only, so failure must not leave a background or
+/// untrusted worker competing with input/present at elevated priority.  Exit
+/// the process rather than silently accepting that invalid scheduling model.
+pub(crate) fn require_background_thread_class() {
+    if !running_on_rustos() {
+        return;
+    }
+    let result = unsafe { syscall0(SYS_RUSTOS_SCHED_DEMOTE_SELF) };
+    if result == 0 {
+        BACKGROUND_THREAD_DEMOTIONS.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    debug_line("uiserver: background scheduling demotion failed");
+    std::process::exit(134);
+}
+
+pub(crate) fn background_thread_demotion_count() -> u64 {
+    BACKGROUND_THREAD_DEMOTIONS.load(Ordering::Relaxed)
 }
 
 pub(crate) fn display_get_info(fd: RawFd) -> Result<DisplayInfo, i32> {
@@ -705,7 +750,7 @@ pub(crate) fn read_input(fds: &[OwnedFd], events: &mut [InputEvent]) -> Result<u
     Ok(written)
 }
 
-pub(crate) fn wait_for_input_ready(fds: &[OwnedFd]) -> Result<(), i32> {
+pub(crate) fn wait_for_input_ready(fds: &[OwnedFd]) -> Result<bool, i32> {
     let mut poll_fds = Vec::with_capacity(fds.len());
     for fd in fds {
         poll_fds.push(PollFd {
@@ -715,8 +760,11 @@ pub(crate) fn wait_for_input_ready(fds: &[OwnedFd]) -> Result<(), i32> {
         });
     }
     let ready = poll(&mut poll_fds, INPUT_READY_POLL_TIMEOUT_MS)?;
-    if ready == 0 || poll_fds.iter().any(|fd| fd.revents & POLLIN != 0) {
-        Ok(())
+    if ready == 0 {
+        return Ok(false);
+    }
+    if poll_fds.iter().any(|fd| fd.revents & POLLIN != 0) {
+        Ok(true)
     } else {
         Err(5)
     }

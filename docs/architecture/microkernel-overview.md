@@ -12,7 +12,7 @@ Linux Driver VM (DVM) for Linux driver compatibility.
 UEFI/GRUB -> nucleus -> rootd -> core services -> initd -> runtimed/uiserver
                          |
                          +-> fixed DVM transports
-                             input: RDI2 over COM2
+                             input: RDI3 over L0-owned MSI-X input ring
                              display: validated ivshmem framebuffer
                              network: validated ivshmem frame ring
                          |
@@ -41,7 +41,7 @@ Linux Driver VM(DVM)으로 처리합니다.
 UEFI/GRUB -> nucleus -> rootd -> core service -> initd -> runtimed/uiserver
                          |
                          +-> 고정 DVM transport
-                             input: COM2 위 RDI2
+                             input: L0 소유 MSI-X input ring 위 RDI3
                              display: 검증된 ivshmem framebuffer
                              network: 검증된 ivshmem frame ring
                          |

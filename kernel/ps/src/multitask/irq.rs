@@ -1,9 +1,11 @@
 use x86_64::instructions::interrupts;
 
 use super::{
-    DEFERRED_RESCHEDULE_REQUESTED, context::SavedContext, scheduler::Scheduler,
-    scheduler_initialized, scheduler_mut,
+    DEFERRED_RESCHEDULE_REQUESTED, USER_RETURN_RESCHEDULE_ARMED, context::SavedContext,
+    scheduler::Scheduler, scheduler_initialized, scheduler_mut,
 };
+
+const USER_RETURN_RESCHEDULE_MICROS: u64 = 100;
 
 pub fn timer_interrupt_handler_addr() -> u64 {
     crate::lowlevel::interrupts::timer_interrupt_handler_addr()
@@ -26,6 +28,11 @@ pub(crate) fn install_interrupt_dispatch_callbacks() {
 }
 
 extern "C" fn timer_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut SavedContext {
+    // Expire sleepers against invariant-TSC/HPET time before selecting the
+    // next task. This is deliberately independent of how many PIT/RTC edges
+    // the hypervisor delivered: one delayed edge catches up every absolute
+    // deadline that passed while the vCPU was descheduled.
+    crate::arch::rtc::service_clock_event();
     if !scheduler_initialized() {
         crate::arch::pic::send_eoi(crate::arch::pic::PIC_1_OFFSET);
         return context_ptr;
@@ -38,6 +45,11 @@ extern "C" fn timer_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut S
             crate::arch::pic::send_eoi(crate::arch::pic::PIC_1_OFFSET);
             return context_ptr;
         }
+        // A voluntary userspace yield cannot switch from its syscall kernel
+        // continuation: doing so saves an IF-cleared kernel frame and can
+        // strand every runnable user task. The short PIT edge is armed in the
+        // syscall and consumed only after an interrupt observes a user frame.
+        USER_RETURN_RESCHEDULE_ARMED.store(0, core::sync::atomic::Ordering::Release);
         scheduler.save_current_simd_state();
         let (next_rsp, next_pit_divisor) = scheduler.on_timer_interrupt(current_rsp);
         crate::arch::pit::set_divisor(0, next_pit_divisor);
@@ -121,13 +133,32 @@ pub(crate) fn request_deferred_reschedule() {
     DEFERRED_RESCHEDULE_REQUESTED.store(1, core::sync::atomic::Ordering::Release);
 }
 
+/// Requests a voluntary switch at the first timer edge that observes a user
+/// frame. Reprogramming is one-shot: a tight sched_yield loop cannot keep
+/// pushing the deadline away by restarting the PIT counter on every syscall.
+pub(crate) fn request_user_return_reschedule() {
+    if USER_RETURN_RESCHEDULE_ARMED
+        .compare_exchange(
+            0,
+            1,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        crate::arch::pit::set_divisor(
+            0,
+            crate::arch::pit::divisor_from_micros(USER_RETURN_RESCHEDULE_MICROS),
+        );
+    }
+}
+
 extern "C" fn software_schedule_interrupt_dispatch(
     context_ptr: *mut SavedContext,
 ) -> *mut SavedContext {
     if !scheduler_initialized() {
         return context_ptr;
     }
-
     let current_rsp = context_ptr as usize;
     let next_rsp = unsafe {
         let scheduler = scheduler_mut();

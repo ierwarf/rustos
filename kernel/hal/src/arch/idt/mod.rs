@@ -20,6 +20,11 @@ lazy_static! {
             pic_interrupt_handler,
             crate::arch::pic::PIC_1_OFFSET..=crate::arch::pic::PIC_2_OFFSET + 7
         );
+        set_general_handler!(
+            &mut idt,
+            msi_interrupt_handler,
+            crate::arch::msi::MSI_VECTOR_FIRST..=crate::arch::msi::MSI_VECTOR_LAST
+        );
         unsafe {
             idt.non_maskable_interrupt
                 .set_handler_fn(non_maskable_interrupt_handler);

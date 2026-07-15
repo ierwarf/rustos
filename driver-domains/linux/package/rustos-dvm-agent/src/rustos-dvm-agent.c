@@ -43,17 +43,18 @@
 #define POINTER_BUTTON_MASK 0x1fU
 #define INPUT_SELFTEST_CMDLINE "rustos.dvm.input-selftest=1"
 #define INPUT_SELFTEST_NAME "RustOS DVM input selftest"
-#define INPUT_SELFTEST_CYCLES 800U
-#define INPUT_SELFTEST_POLL_MS 25
-#define INPUT_SELFTEST_MOTION_PHASE_CYCLES 8U
-// RDI2 uses a deliberately bounded serial transport. Coalescing relative
-// motion at 125Hz preserves responsive desktop input while staying well below
-// the 115200-bps COM2 budget; button state is forwarded immediately.
-#define INPUT_POINTER_FLUSH_MS 8
+#define INPUT_SELFTEST_CYCLES 3200U
+#define INPUT_SELFTEST_POLL_MS 5
+#define INPUT_SELFTEST_LEG_CYCLES 64U
+// RDI3 uses a deliberately bounded serial transport. Coalescing relative
+// motion at 200Hz preserves responsive desktop input while remaining below
+// the fixed L0 256-frame/s admission budget; button state is forwarded immediately.
+#define INPUT_POINTER_FLUSH_MS 5
 #define INPUT_POINTER_FLUSH_NS ((uint64_t)INPUT_POINTER_FLUSH_MS * 1000000ULL)
 // The interactive KVM topology has a fixed 1600x900 DVM scanout. An absolute
-// virtio tablet is normalized to that scanout before it enters the unchanged
-// relative RDI2 frame, so hovering the QEMU window needs no manual grab.
+// virtio tablet is normalized to that scanout and remains absolute through
+// the authenticated RDI3 frame, so hovering needs no manual grab and an
+// initial/duplicate tablet report cannot synthesize relative cursor motion.
 #define DVM_POINTER_WIDTH 1600
 #define DVM_POINTER_HEIGHT 900
 
@@ -73,6 +74,7 @@ struct pointer_state {
     uint64_t flush_deadline_ns;
     int absolute_mode;
     int absolute_initialized;
+    int absolute_published;
     int absolute_seen_x;
     int absolute_seen_y;
     int absolute_min_x;
@@ -87,6 +89,8 @@ struct pointer_state {
 
 struct input_selftest {
     int uinput_fd;
+    int32_t pointer_x;
+    int32_t pointer_y;
     unsigned int cycles_remaining;
     unsigned int motion_phase;
     int enabled;
@@ -161,6 +165,7 @@ static void input_selftest_destroy(struct input_selftest *selftest) {
 }
 
 static int input_selftest_start(struct input_selftest *selftest) {
+    struct uinput_abs_setup abs_setup;
     struct uinput_setup setup;
     struct timespec settle = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000};
     int fd;
@@ -171,11 +176,11 @@ static int input_selftest_start(struct input_selftest *selftest) {
         return 0;
     }
     fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
-    if (fd < 0 || ioctl(fd, UI_SET_EVBIT, EV_KEY) < 0 || ioctl(fd, UI_SET_EVBIT, EV_REL) < 0 ||
+    if (fd < 0 || ioctl(fd, UI_SET_EVBIT, EV_KEY) < 0 || ioctl(fd, UI_SET_EVBIT, EV_ABS) < 0 ||
         ioctl(fd, UI_SET_EVBIT, EV_SYN) < 0 || ioctl(fd, UI_SET_KEYBIT, KEY_A) < 0 ||
         ioctl(fd, UI_SET_KEYBIT, KEY_Z) < 0 || ioctl(fd, UI_SET_KEYBIT, KEY_SPACE) < 0 ||
-        ioctl(fd, UI_SET_KEYBIT, BTN_LEFT) < 0 || ioctl(fd, UI_SET_RELBIT, REL_X) < 0 ||
-        ioctl(fd, UI_SET_RELBIT, REL_Y) < 0 || ioctl(fd, UI_SET_RELBIT, REL_WHEEL) < 0) {
+        ioctl(fd, UI_SET_KEYBIT, KEY_F12) < 0 || ioctl(fd, UI_SET_KEYBIT, BTN_LEFT) < 0 ||
+        ioctl(fd, UI_SET_ABSBIT, ABS_X) < 0 || ioctl(fd, UI_SET_ABSBIT, ABS_Y) < 0) {
         if (fd >= 0) {
             close(fd);
         }
@@ -187,12 +192,28 @@ static int input_selftest_start(struct input_selftest *selftest) {
     setup.id.vendor = 0x5255;
     setup.id.product = 0x4456;
     setup.id.version = 1;
-    if (ioctl(fd, UI_DEV_SETUP, &setup) < 0 || ioctl(fd, UI_DEV_CREATE) < 0) {
+    if (ioctl(fd, UI_DEV_SETUP, &setup) < 0) {
+        close(fd);
+        return -1;
+    }
+    memset(&abs_setup, 0, sizeof(abs_setup));
+    abs_setup.code = ABS_X;
+    abs_setup.absinfo.minimum = 0;
+    abs_setup.absinfo.maximum = DVM_POINTER_WIDTH - 1;
+    if (ioctl(fd, UI_ABS_SETUP, &abs_setup) < 0) {
+        close(fd);
+        return -1;
+    }
+    abs_setup.code = ABS_Y;
+    abs_setup.absinfo.maximum = DVM_POINTER_HEIGHT - 1;
+    if (ioctl(fd, UI_ABS_SETUP, &abs_setup) < 0 || ioctl(fd, UI_DEV_CREATE) < 0) {
         close(fd);
         return -1;
     }
     (void)nanosleep(&settle, NULL);
     selftest->uinput_fd = fd;
+    selftest->pointer_x = DVM_POINTER_WIDTH / 2;
+    selftest->pointer_y = DVM_POINTER_HEIGHT / 2;
     selftest->enabled = 1;
     fprintf(stderr, "rustos-dvm-agent: input selftest evdev ready\n");
     fflush(stderr);
@@ -208,24 +229,59 @@ static int input_selftest_emit_cycle(struct input_selftest *selftest) {
         return 0;
     }
     /*
-     * Keep the synthetic pointer inside a small rectangle instead of pushing
-     * it permanently into a screen edge. A clamped cursor still carries
-     * input events but does not require a compositor present, which would
-     * make an input-active FPS proof measure idle frames rather than render
-     * throughput. The two independent phase bits exercise both axes.
+     * Trace a 192-pixel absolute square at constant speed. The former 24x16-pixel
+     * center oscillation looked like a broken, trembling physical mouse even
+     * when transport was healthy. This path stays away from screen edges but
+     * makes every accepted motion visually distinguishable.
      */
-    dx = (selftest->motion_phase & INPUT_SELFTEST_MOTION_PHASE_CYCLES) != 0U ? -3 : 3;
-    dy = (selftest->motion_phase & (INPUT_SELFTEST_MOTION_PHASE_CYCLES << 1U)) != 0U ? -2 : 2;
-    if (write_input_event(fd, EV_KEY, KEY_A, 1) != 0 ||
-        write_input_event(fd, EV_SYN, SYN_REPORT, 0) != 0 ||
-        write_input_event(fd, EV_KEY, KEY_A, 0) != 0 ||
-        write_input_event(fd, EV_SYN, SYN_REPORT, 0) != 0 ||
-        write_input_event(fd, EV_REL, REL_X, dx) != 0 ||
-        write_input_event(fd, EV_REL, REL_Y, dy) != 0 ||
-        write_input_event(fd, EV_REL, REL_WHEEL, 1) != 0 ||
-        write_input_event(fd, EV_KEY, BTN_LEFT, 1) != 0 ||
-        write_input_event(fd, EV_SYN, SYN_REPORT, 0) != 0 ||
-        write_input_event(fd, EV_KEY, BTN_LEFT, 0) != 0 ||
+    switch ((selftest->motion_phase / INPUT_SELFTEST_LEG_CYCLES) % 4U) {
+    case 0U:
+        dx = 3;
+        dy = 0;
+        break;
+    case 1U:
+        dx = 0;
+        dy = 3;
+        break;
+    case 2U:
+        dx = -3;
+        dy = 0;
+        break;
+    default:
+        dx = 0;
+        dy = -3;
+        break;
+    }
+    /*
+     * The validation stream must never type into a focused shell or click a
+     * user's desktop. One initial KEY_F12 press/release proves keyboard
+     * ingress; every later cycle is pointer-only, so a long motion run cannot
+     * become a console-command flood. BTN_LEFT is advertised only so this
+     * intentionally composite uinput device is selected by the normal pointer
+     * capability test; no button event is emitted. Printable keys, wheel
+     * motion, and pointer buttons are deliberately excluded.
+     */
+    if (selftest->motion_phase == 0U &&
+        (write_input_event(fd, EV_KEY, KEY_F12, 1) != 0 ||
+         write_input_event(fd, EV_SYN, SYN_REPORT, 0) != 0 ||
+         write_input_event(fd, EV_KEY, KEY_F12, 0) != 0 ||
+         write_input_event(fd, EV_SYN, SYN_REPORT, 0) != 0)) {
+        return -1;
+    }
+    selftest->pointer_x += dx;
+    selftest->pointer_y += dy;
+    if (selftest->pointer_x < 0) {
+        selftest->pointer_x = 0;
+    } else if (selftest->pointer_x >= DVM_POINTER_WIDTH) {
+        selftest->pointer_x = DVM_POINTER_WIDTH - 1;
+    }
+    if (selftest->pointer_y < 0) {
+        selftest->pointer_y = 0;
+    } else if (selftest->pointer_y >= DVM_POINTER_HEIGHT) {
+        selftest->pointer_y = DVM_POINTER_HEIGHT - 1;
+    }
+    if (write_input_event(fd, EV_ABS, ABS_X, selftest->pointer_x) != 0 ||
+        write_input_event(fd, EV_ABS, ABS_Y, selftest->pointer_y) != 0 ||
         write_input_event(fd, EV_SYN, SYN_REPORT, 0) != 0) {
         return -1;
     }
@@ -856,11 +912,22 @@ static int send_pointer_packet(int fd, unsigned int request_id, struct pointer_s
     if (!state->pending) {
         return 0;
     }
-    if (snprintf(payload, sizeof(payload),
-                 "EVENT\nid=%u\nop=input-stream\ntype=pointer\ndx=%d\ndy=%d\nwheel-v=%d"
-                 "\nwheel-h=%d\nbuttons=%u",
-                 request_id, state->dx, state->dy, state->wheel_vertical,
-                 state->wheel_horizontal, state->buttons) >= (int)sizeof(payload)) {
+    if (state->absolute_mode) {
+        if (!state->absolute_initialized ||
+            snprintf(payload, sizeof(payload),
+                     "EVENT\nid=%u\nop=input-stream\ntype=pointer-position\nx=%d\ny=%d"
+                     "\nwheel-v=%d\nwheel-h=%d\nbuttons=%u",
+                     request_id, state->absolute_x, state->absolute_y,
+                     state->wheel_vertical, state->wheel_horizontal,
+                     state->buttons) >= (int)sizeof(payload)) {
+            errno = EMSGSIZE;
+            return -1;
+        }
+    } else if (snprintf(payload, sizeof(payload),
+                        "EVENT\nid=%u\nop=input-stream\ntype=pointer\ndx=%d\ndy=%d"
+                        "\nwheel-v=%d\nwheel-h=%d\nbuttons=%u",
+                        request_id, state->dx, state->dy, state->wheel_vertical,
+                        state->wheel_horizontal, state->buttons) >= (int)sizeof(payload)) {
         errno = EMSGSIZE;
         return -1;
     }
@@ -874,6 +941,11 @@ static int send_pointer_packet(int fd, unsigned int request_id, struct pointer_s
     state->pending = 0;
     state->buttons_changed = 0;
     state->flush_deadline_ns = 0;
+    if (state->absolute_mode) {
+        state->absolute_previous_x = state->absolute_x;
+        state->absolute_previous_y = state->absolute_y;
+        state->absolute_published = 1;
+    }
     return 0;
 }
 
@@ -882,9 +954,15 @@ static int consume_pointer_event(struct pointer_state *state, const struct input
     if (event->type == EV_REL) {
         switch (event->code) {
         case REL_X:
+            if (state->absolute_mode) {
+                return 0;
+            }
             state->dx = add_clamped_i16(state->dx, event->value);
             break;
         case REL_Y:
+            if (state->absolute_mode) {
+                return 0;
+            }
             state->dy = add_clamped_i16(state->dy, event->value);
             break;
         case REL_WHEEL:
@@ -896,7 +974,9 @@ static int consume_pointer_event(struct pointer_state *state, const struct input
         default:
             return 0;
         }
-        pointer_mark_pending(state);
+        if (!state->absolute_mode) {
+            pointer_mark_pending(state);
+        }
         return 0;
     }
     if (state->absolute_mode && event->type == EV_ABS) {
@@ -922,19 +1002,7 @@ static int consume_pointer_event(struct pointer_state *state, const struct input
         } else {
             return 0;
         }
-        if (!state->absolute_initialized) {
-            if (state->absolute_seen_x && state->absolute_seen_y) {
-                state->absolute_previous_x = state->absolute_x;
-                state->absolute_previous_y = state->absolute_y;
-                state->absolute_initialized = 1;
-            }
-            return 0;
-        }
-        state->dx = add_clamped_i16(state->dx, state->absolute_x - state->absolute_previous_x);
-        state->dy = add_clamped_i16(state->dy, state->absolute_y - state->absolute_previous_y);
-        state->absolute_previous_x = state->absolute_x;
-        state->absolute_previous_y = state->absolute_y;
-        pointer_mark_pending(state);
+        state->absolute_initialized = state->absolute_seen_x && state->absolute_seen_y;
         return 0;
     }
     if (event->type == EV_KEY && pointer_button_mask(event->code, &mask) == 0) {
@@ -944,11 +1012,21 @@ static int consume_pointer_event(struct pointer_state *state, const struct input
             state->buttons &= (uint8_t)~mask;
         }
         state->buttons &= POINTER_BUTTON_MASK;
-        pointer_mark_pending(state);
+        if (!state->absolute_mode) {
+            pointer_mark_pending(state);
+        }
         state->buttons_changed = 1;
         return 0;
     }
     if (event->type == EV_SYN && event->code == SYN_REPORT) {
+        if (state->absolute_mode && state->absolute_initialized &&
+            (!state->absolute_published ||
+             state->absolute_x != state->absolute_previous_x ||
+             state->absolute_y != state->absolute_previous_y ||
+             state->wheel_vertical != 0 || state->wheel_horizontal != 0 ||
+             state->buttons_changed)) {
+            pointer_mark_pending(state);
+        }
         return 0;
     }
     if (event->type == EV_SYN && event->code == SYN_DROPPED) {
@@ -991,7 +1069,7 @@ static int stream_input_devices(int control_fd, int keyboard_fd, int pointer_fd,
                     return -1;
                 }
                 // A pointer flush can wake sooner than the self-test cadence;
-                // do not make the synthetic test stream exceed its 25ms rate.
+                // do not make the synthetic test stream exceed its 200Hz rate.
                 continue;
             }
             if (input_selftest_emit_cycle(selftest) != 0) {
@@ -1043,6 +1121,8 @@ static int stream_input_devices(int control_fd, int keyboard_fd, int pointer_fd,
                     return -1;
                 }
                 if (pointer.buttons_changed &&
+                    (!pointer.absolute_mode ||
+                     (event.type == EV_SYN && event.code == SYN_REPORT)) &&
                     send_pointer_packet(control_fd, request_id, &pointer) != 0) {
                     return -1;
                 }
@@ -1122,7 +1202,7 @@ static int serve_connection(int fd, const struct control_contract *contract,
                          id);
             } else {
                 snprintf(payload, sizeof(payload),
-                         "RESPONSE\nid=%u\nop=input-stream\nstatus=ready\nformat=linux-evdev-v2"
+                         "RESPONSE\nid=%u\nop=input-stream\nstatus=ready\nformat=linux-evdev-v3"
                          "\nkeyboard=event%d\npointer=event%d",
                          id, keyboard_index, pointer_index);
                 if (send_frame(fd, payload) != 0) {

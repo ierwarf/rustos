@@ -19,7 +19,7 @@ opening anything under `Then read only if needed`.
 | Fault injection change | `contracts-infra.md`, `commands.md` | `config/rustos.toml`; exact `libs/rustos-fault-injection` or `kernel/nucleus-core/src/util/fault_injection.rs` range found by search |
 | Runtime launch/session issue | `contracts-infra.md` | `libs/runtime-control/src/lib.rs`, then exact `services/runtimed/src/main.rs` range; add `contracts-abi.md` only if IPC-level routing is involved |
 | UI/rendering issue | `repo-map.md` | search `services/uiserver/src`; open only the matching `render.rs` or `app/*` range |
-| Hardening request | `contracts-abi.md`, `kernel-api-map.md` | highest-risk boundary first; exact API, broker, service, lock, memory, or device path found by MCP search |
+| Hardening request | `commercial-quality-gates.md`, `contracts-abi.md`, `kernel-api-map.md` | highest-risk boundary first; exact API, broker, service, lock, memory, or device path found by MCP search |
 | Boot/runtime performance cleanup | `performance-hardening.md`, `commands.md` | one focused log extract; exact `services/*`, `kernel/*`, `drivers/*`, or `tools/xtask/*` owner range named by the log |
 | Ring0/ring3 ownership or microkernel boundary | `contracts-abi.md`, `commands.md` | `cargo xtask ring3-inventory` for current marker LOC/owner/action snapshots; `kernel-api-map.md`, then exact broker, service, driver, input, storage, or compat path found by MCP search |
 | Add service/app/driver | `workflows.md` | one closest existing manifest, one closest source file, target manifest/source only |

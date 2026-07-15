@@ -6,6 +6,7 @@ const CONFIG_ADDRESS_PORT: u16 = 0x0cf8;
 const CONFIG_DATA_PORT: u16 = 0x0cfc;
 
 const COMMAND_OFFSET: u8 = 0x04;
+const STATUS_OFFSET: u8 = 0x06;
 const REVISION_OFFSET: u8 = 0x08;
 const HEADER_TYPE_OFFSET: u8 = 0x0e;
 const CLASS_CODE_OFFSET: u8 = 0x0b;
@@ -17,6 +18,7 @@ const SUBSYSTEM_DEVICE_OFFSET: u8 = 0x2e;
 const INTERRUPT_LINE_OFFSET: u8 = 0x3c;
 const INTERRUPT_PIN_OFFSET: u8 = 0x3d;
 const BAR0_OFFSET: u8 = 0x10;
+const CAPABILITIES_POINTER_OFFSET: u8 = 0x34;
 
 const COMMAND_IO_SPACE: u16 = 1 << 0;
 const COMMAND_MEMORY_SPACE: u16 = 1 << 1;
@@ -36,6 +38,17 @@ const PCI_BAR_MEM_TYPE_64: u32 = 0x4;
 const PCI_BAR_PREFETCH: u32 = 0x8;
 const PCI_BAR_IO_ADDRESS_MASK: u32 = !0x3;
 const PCI_BAR_MEM_ADDRESS_MASK: u32 = !0xf;
+const PCI_STATUS_CAPABILITIES_LIST: u16 = 1 << 4;
+const PCI_CAP_ID_MSIX: u8 = 0x11;
+const PCI_CAP_NEXT_OFFSET: u8 = 1;
+const PCI_MSIX_CONTROL_OFFSET: u8 = 2;
+const PCI_MSIX_TABLE_OFFSET: u8 = 4;
+const PCI_MSIX_CAPABILITY_BYTES: usize = 12;
+const PCI_MSIX_TABLE_BIR_MASK: u32 = 0x7;
+const PCI_MSIX_TABLE_OFFSET_MASK: u32 = !PCI_MSIX_TABLE_BIR_MASK;
+const PCI_MSIX_TABLE_SIZE_MASK: u16 = 0x07ff;
+const PCI_MSIX_CONTROL_FUNCTION_MASK: u16 = 1 << 14;
+const PCI_MSIX_CONTROL_ENABLE: u16 = 1 << 15;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PciResource {
@@ -44,6 +57,65 @@ pub struct PciResource {
     pub is_io: bool,
     pub prefetchable: bool,
     pub is_64bit: bool,
+}
+
+/// One PCI MSI-X capability. The table BAR/offset is device-provided but
+/// remains bounded by `table_resource()` before a driver can map it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MsixCapability {
+    config_offset: u8,
+    table_bar: usize,
+    table_offset: u64,
+    table_entries: u16,
+}
+
+impl MsixCapability {
+    pub const fn table_bar(self) -> usize {
+        self.table_bar
+    }
+
+    pub const fn table_offset(self) -> u64 {
+        self.table_offset
+    }
+
+    pub const fn table_entries(self) -> u16 {
+        self.table_entries
+    }
+
+    /// Resolve the one table BAR while checking that every table entry fits.
+    pub fn table_resource(self, device: PciDevice) -> Option<PciResource> {
+        let resource = device.resource(self.table_bar)?;
+        if resource.is_io {
+            return None;
+        }
+        let table_bytes = u64::from(self.table_entries).checked_mul(16)?;
+        let end = self.table_offset.checked_add(table_bytes)?;
+        (end <= resource.size).then_some(resource)
+    }
+
+    /// Mask the entire function before table programming. The device owner
+    /// must unmask the selected table entry before enabling the function.
+    pub fn set_function_masked(self, device: PciDevice, masked: bool) {
+        let mut control = device.read_u16(self.config_offset + PCI_MSIX_CONTROL_OFFSET);
+        if masked {
+            control |= PCI_MSIX_CONTROL_FUNCTION_MASK;
+        } else {
+            control &= !PCI_MSIX_CONTROL_FUNCTION_MASK;
+        }
+        device.write_u16(self.config_offset + PCI_MSIX_CONTROL_OFFSET, control);
+    }
+
+    /// Enable MSI-X only after a driver has populated and unmasked an owned
+    /// table entry. Callers must never enable it as a legacy-IRQ fallback.
+    pub fn set_enabled(self, device: PciDevice, enabled: bool) {
+        let mut control = device.read_u16(self.config_offset + PCI_MSIX_CONTROL_OFFSET);
+        if enabled {
+            control |= PCI_MSIX_CONTROL_ENABLE;
+        } else {
+            control &= !PCI_MSIX_CONTROL_ENABLE;
+        }
+        device.write_u16(self.config_offset + PCI_MSIX_CONTROL_OFFSET, control);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -133,6 +205,50 @@ impl PciDevice {
 
     pub fn is_present(self) -> bool {
         self.vendor_id() != 0xffff
+    }
+
+    /// Find the MSI-X capability using the conventional PCI capability list.
+    /// Extended capabilities are intentionally not searched: MSI-X is a
+    /// standard capability, and accepting an arbitrary extended structure
+    /// would weaken this fixed transport substrate.
+    pub fn msix_capability(self) -> Option<MsixCapability> {
+        if self.header_type() != HEADER_TYPE_NORMAL
+            || self.read_u16(STATUS_OFFSET) & PCI_STATUS_CAPABILITIES_LIST == 0
+        {
+            return None;
+        }
+        let mut offset = self.read_u8(CAPABILITIES_POINTER_OFFSET);
+        for _ in 0..48 {
+            if offset < 0x40
+                || offset & 0x3 != 0
+                || usize::from(offset)
+                    .checked_add(PCI_MSIX_CAPABILITY_BYTES)
+                    .is_none_or(|end| end > self.config_size() as usize)
+            {
+                return None;
+            }
+            let capability_id = self.read_u8(offset);
+            let next = self.read_u8(offset + PCI_CAP_NEXT_OFFSET);
+            if capability_id == PCI_CAP_ID_MSIX {
+                let control = self.read_u16(offset + PCI_MSIX_CONTROL_OFFSET);
+                let table = self.read_u32(offset + PCI_MSIX_TABLE_OFFSET);
+                let table_bar = (table & PCI_MSIX_TABLE_BIR_MASK) as usize;
+                if table_bar >= self.standard_bar_count() {
+                    return None;
+                }
+                return Some(MsixCapability {
+                    config_offset: offset,
+                    table_bar,
+                    table_offset: u64::from(table & PCI_MSIX_TABLE_OFFSET_MASK),
+                    table_entries: (control & PCI_MSIX_TABLE_SIZE_MASK) + 1,
+                });
+            }
+            if next == 0 {
+                return None;
+            }
+            offset = next;
+        }
+        None
     }
 
     pub fn enable_memory_bus_master(self) {
@@ -424,4 +540,16 @@ fn decode_mem_resource(
         prefetchable: (original_low & PCI_BAR_PREFETCH) != 0,
         is_64bit,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PCI_MSIX_TABLE_BIR_MASK, PCI_MSIX_TABLE_OFFSET_MASK};
+
+    #[test]
+    fn msix_table_word_preserves_bar_and_page_aligned_offset() {
+        let word = 0x0012_3003_u32;
+        assert_eq!(word & PCI_MSIX_TABLE_BIR_MASK, 3);
+        assert_eq!(word & PCI_MSIX_TABLE_OFFSET_MASK, 0x0012_3000);
+    }
 }

@@ -101,7 +101,7 @@ endpoint registration synchronously depends on rootd capability replies.
 | 10 | `rootd` | `ROOT_SUPERVISOR` | Core-service leases, restart budgets |
 | 11 | `sessiond` (reserved) | `SESSION_POLICY` | Console/TTY/session |
 | 12 | `pagerd` (reserved) | `PAGER_POLICY` | Backing/page-cache |
-| 13 | service-driver (reserved) | `SERVICE_DRIVER_POLICY` | Future non-DVM privileged-resource coordination |
+| 13 | service-driver (reserved) | `SERVICE_DRIVER_POLICY` | Reserved non-DVM privileged-resource coordination; no endpoint is admitted until a capability-gated broker exists |
 
 Broker authorization checks the caller's registered service capability — **not** its executable path.
 Until a standalone `pagerd` lease exists, `syscalld` may register the reserved `IPC_SERVICE_PAGERD` endpoint and receive `PAGER_POLICY`; rootd must treat that as an explicit compatibility delegation, not a generic multi-service registration rule.
@@ -115,10 +115,44 @@ loads module images, probes module aliases, or retains native USB, PS/2, or
 virtio-net fallback providers. A missing DVM transport leaves that device
 unavailable; it must not select an alternate in-kernel provider.
 
-RustOS accepts only bounded DVM transports: RDI2 over COM2 for input, fixed
-ivshmem layouts for display and Ethernet frames. The Linux DRM/KMS relay inside
-the DVM remains the display owner. Ring0 validates fixed headers, sequence and
-bounds; `inputd`, `netd`, and `uiserver` own policy above those transports.
+RustOS accepts only bounded DVM transports: RDI3 records in a host-owned 128
+KiB ivshmem input ring with 2,048 fixed 32-byte slots and exactly one MSI-X
+wake vector; fixed layouts for display control/pixels and Ethernet frames. The DVM
+never maps the input ring. L0 is its sole producer, RustOS is its sole
+consumer, and the producer/consumer cursor cache lines are distinct. Ring0
+validates fixed headers, sequence and bounds; `inputd`, `netd`, and `uiserver`
+own policy above those transports. Input attachment is serialized, has a
+boot-wide eight-attempt recovery budget, and may reuse its permanent MSI-X
+vector only for the originally pinned PCI aperture; revoke releases the old
+MMIO mapping. The sole accepted GUI topology is the V3 `RSGUI002` three-slot
+GUI-DVM pool; V2, polling, a firmware framebuffer, and a native-GPU fallback
+are not parsed or selected.
+
+RDI3 preserves pointer semantics end to end. Relative evdev devices produce
+bounded delta records; absolute tablets produce bounded `0..1599 x 0..899`
+position records only after a complete `SYN_REPORT`. Partial X/Y reports are
+staging state, identical positions are idempotent, and neither L0, ring0 nor
+`inputd` may reinterpret an absolute position as a relative delta. The inputd
+ingress ABI uses distinct packet and position payloads so a provider cannot
+make one physical report travel through both paths.
+
+The GUI-DVM contract fixes three host-provisioned surfaces and 64-byte
+`PRESENT`/`RELEASE` records, never guest-selected pointers, vectors, or
+variable-length payloads. The ivshmem BAR contains only uncached control state;
+the separate cacheable pixel device is writable only by RustOS QEMU and is
+read-only/ROM in the DVM. Every READY slot is a complete immutable snapshot,
+even when its PRESENT damage hint is partial. The DVM module requires matching
+control/pixel headers, exposes only WB read-only pixel pages to its relay, and
+rejects writable VMAs. It validates each release against the
+matching host record before it writes the one outstanding control sequence.
+Its MSI-X leaves only mark pending state in IRQ context; normal context checks
+the exact readiness invitation, confirmation, release generation, and ACK.
+An offline notification clears readiness confirmation. If a restart finds all
+three slots READY, the next bounded producer attempt re-invites the newest
+slot; no polling or alternate provider is selected. Unsupported multi-domain
+focus records are rejected fail-closed because no focus authority is present in
+this single-GUI-DVM topology. Commercial acceptance requires the source, DVM
+package, launch path, conformance tests, and recovery proof to remain aligned.
 Before L0 writes `WELCOME` or opens a control relay, the launch-bound Linux DVM
 agent must prove possession of the per-launch 256-bit secret with
 `dvm-agent-hmac-sha256-v1`: HMAC-SHA256 over a fresh L0 challenge and the exact
@@ -134,31 +168,36 @@ inside the DVM trusted-computing base and must be contained by its device/IOMMU
 boundary; this handshake prevents ordinary same-CID guest processes from
 impersonating the agent.
 The display backend serializes provider replacement with an active DVM present:
-the shared display generation must return even before its header is detached,
-so a DVM consumer never observes a retired aperture permanently in-progress.
+the V3 pool cannot be detached while a host slot is being copied and its fixed
+`PRESENT` record is committed. A missing or revoked GUI-DVM provider returns
+`Unavailable`; the normal present syscall never writes a firmware, native-GPU,
+or generic framebuffer substitute.
 An installed DVM Ethernet aperture is similarly not evidence of a live or
 authorized network peer. The current single-DVM topology admits RustOS
 transmit/receive only while the L0-authenticated RDI1 control session's exact
 nonzero epoch is active. `SESSION_END` revokes that epoch synchronously; an
 old end marker cannot revoke a newer epoch, and guest-writable ivshmem headers,
-ready bits, counters, or frames cannot create a lease. COM2 carries these
-bounded lifecycle markers only, never Ethernet data. The aperture remains
+ready bits, counters, or frames cannot create a lease. The L0-authenticated
+RDI3 lifecycle records carried by the fixed input ring never carry Ethernet
+data. The aperture remains
 mapped after revocation so lifecycle changes do not race an unmap, but packet
-operations fail closed as `NoDevice` until a new authenticated start. A future
-network-only DVM must introduce a domain-specific authenticated lifecycle
-channel rather than inheriting the input-DVM lease. The capability-gated
+operations fail closed as `NoDevice` until a new authenticated start. A
+network-only DVM is not an enabled topology: it cannot inherit the input-DVM
+lease and has no packet authority without a domain-specific authenticated
+lifecycle channel.
+The capability-gated
 `NET_BROKER_OP_PACKET_STATUS` ABI distinguishes `UNAVAILABLE` (no valid
 aperture), `AWAITING_AUTHENTICATED_CONTROL` (mapped but fail-closed), and
-`ACTIVE`; netd may use only a bounded wait for the middle transitional state.
+`ACTIVE`; netd may use only a bounded wait while authentication is pending.
 `DISPLAY_INFO_FLAG_DVM_SCANOUT` is a one-way provenance bit propagated from
 the DVM framebuffer registration. It can only downgrade trust: it never
 attests the display. `COMMERCIAL_MAX_UISERVER_OP_TRUSTED_UI_STATUS` reports
 blocker bits in `value0`; callers may permit a privileged prompt only when the
 value is zero. The current DVM (and native) paths always report unattested
 scanout plus unattested input, so no existing provider is a trusted UI path.
-The DVM flag adds the diagnostic `DVM_SCANOUT` blocker. A future path must
-independently attest both the physical scanout and human-input source before
-clearing either blocker. A bounded ivshmem header, authenticated DVM agent, or
+The DVM flag adds the diagnostic `DVM_SCANOUT` blocker. Any path that clears a
+trusted-UI blocker must independently attest both the physical scanout and
+human-input source. A bounded ivshmem header, authenticated DVM agent, or
 primary-provider flag alone is never such an attestation.
 The reserved service-driver resource broker is not a DVM module loader and has
 no currently admitted service endpoint.
@@ -250,19 +289,28 @@ policy remains with the owning service.
 - Compat input-device reads call `INPUTD_IPC_OP_AUTHORIZE_READ` before
   `INPUTD_IPC_OP_READ`; inputd consumes the authorization by `(pid, tid, fd,
   access)` so raw reads are not accepted as standalone event-drain authority.
-- inputd refreshes authenticated RDI2 records via gated
-  `SYS_RUSTOS_INPUT_INGEST_BROKER` before replying to either
-  `INPUTD_IPC_OP_STATS` (the kernel's poll recheck) or an authorized
-  `INPUTD_IPC_OP_READ`. It then reports only the service-owned policy queue,
-  returns bounded `InputdReadResponse` capped at 32 KiB, and reuses its
-  fixed-size ingress scratch. It must not drain ingress asynchronously while a
-  reader is armed in ring0, because that service turn cannot complete the
-  reader's wait. The non-consuming `STATS` probe has a 16 ms IPC reply
-  deadline, so a wedged inputd cannot freeze the UI poll loop behind the
-  generic service timeout; a retry sees either unchanged ingress or the
-  already-transferred policy record. `inputd` blocks in `SYS_RUSTOS_IPC_RECV`
-  while idle and is woken by that request; it must not add a periodic polling
-  sleep to the readiness/read critical path.
+- inputd owns a single System-class `inputd-dvm-ingress` worker. It waits in
+  `SYS_RUSTOS_INPUT_WAIT_BROKER`, which arms before sleeping and rechecks raw
+  producer/consumer cursors after registration; the MSI-X leaf only wakes that
+  worker. Its dedicated kernel wake slot is separate from the finite generic
+  application poll-waiter set, and a dead predecessor is reclaimed before an
+  inputd restart may arm it. The worker alone calls gated
+  `SYS_RUSTOS_INPUT_INGEST_BROKER`, drains at most
+  `INPUTD_INGEST_MAX_EVENTS` records per turn, then yields before a recovery
+  batch. Thus a stalled or absent application reader cannot fill the fixed DVM
+  ring, while no periodic polling loop is introduced. L0 signals the one
+  MSI-X doorbell only on an empty-to-nonempty transition (or an authenticated
+  cleanup record); the post-arm cursor recheck makes a suppressed duplicate
+  edge safe and prevents one interrupt/context switch per pointer frame.
+- `INPUTD_IPC_OP_STATS` (the kernel's poll recheck) and an authorized
+  `INPUTD_IPC_OP_READ` also refresh ingress under the same inputd queue lock,
+  closing the wake/read race without becoming the sole progress path. Inputd
+  reports only its service-owned policy queue, returns a bounded
+  `InputdReadResponse` capped at 32 KiB, and uses fixed-size ingress scratch.
+  The non-consuming `STATS` probe has a 16 ms IPC reply deadline, so a wedged
+  inputd cannot freeze the UI poll loop behind the generic service timeout; a
+  retry sees either unchanged ingress or the already-transferred policy record.
+  The endpoint server still blocks in `SYS_RUSTOS_IPC_RECV` while idle.
 - RustOS-native input readers may use readiness-then-read safely:
   `INPUTD_IPC_OP_STATS` and `INPUTD_IPC_OP_READ` both refresh ingress before
   observing policy state, so a poll wake cannot be followed by a stale empty
@@ -272,10 +320,14 @@ policy remains with the owning service.
   preserving keyboard and pointer-button edges. Linux key translation and
   modifier/text state remain inputd policy; RustOS receives only bounded,
   authenticated relay records.
-- `InputIngressWire` accepts only a DVM-labelled Linux key or relative pointer
-  packet. Native PS/2, HID-report, and absolute-coordinate ingress are not
-  accepted ABI variants; an unknown kind, access mode, or provenance flag is
-  discarded rather than translated into a fabricated event.
+- Input IPC ABI version 2 extends `InputIngressWire` with a distinct,
+  report-atomic DVM absolute-pointer position. It is never reinterpreted as a
+  relative delta: complete `SYN_REPORT` positions are bounded to the declared
+  surface and identical positions are idempotent. The relative-pointer kind
+  remains separate for truly relative devices. Native PS/2 and raw HID-report
+  ingress are not accepted ABI variants; an unknown kind, access mode, ABI
+  version, or provenance flag is discarded rather than translated into a
+  fabricated event.
 - Ring0 performs only current-process user-copy of service-returned bytes.
 - `INPUTD_IPC_OP_AUTHORIZE_READ` + `SYS_RUSTOS_INPUT_STATS_BROKER` remain compat/observability surfaces while remaining event queue is evacuated.
 
@@ -406,6 +458,13 @@ Kernel keeps only: user-copy, address-space replacement, scheduler mutation, pen
 - uiserver opens input nonblocking and waits through bounded `poll`; RustOS must
   not replace readiness with unconditional success followed by high-rate inputd
   reads.
+- `SYS_RUSTOS_SCHED_DEMOTE_SELF` is a narrow scheduler substrate for an
+  already-running user thread to irreversibly surrender its inherited base
+  System class. It takes no priority argument, cannot promote any thread, and
+  preserves only live reply-scoped IPC inheritance until that reply's normal
+  release. uiserver uses it for background and untrusted client-accept workers;
+  failure terminates the UI process instead of letting those workers contend
+  with input/present at System priority.
 - Linux `memfd_create`: policy validation in syscalld; kernel performs handle install + read/write/truncate/seal (current handles, user memory).
 - Windows syscall policy: `Win32SyscallOffloadRequest`/`Response` + `SYSCALL_OFFLOAD_OP_WIN32_*` range. Kernel dispatcher calls service policy first, validates ABI/status, and must fail closed with a non-success NTSTATUS on malformed or denied responses before performing only the narrow privileged action.
 
@@ -440,10 +499,11 @@ they do not admit a service or a module-loading path.
 
 - Linux CFS-like: fixed tick, nanosecond vruntime, weighted share, bounded sleeper credit. Weights affect vruntime only — **never reprogram hardware timer**.
 - Timer IRQ hitting a user-task kernel frame: set deferred reschedule; **do not preempt arbitrary kernel frames**.
-- Task weights = microsecond vruntime budgets (default 100 µs). `uiserver` gets a longer render/present slice, and latency-critical brokers it calls in-frame, especially `inputd`, must stay in the same order of weight so UI loops do not block behind input IPC. `runtimed` must pass manifest `weight_micros` through `loaderd`; never replace with default.
+- Task weights = microsecond vruntime budgets (default 100 µs). `uiserver` gets a longer render/present slice, and latency-critical brokers it calls in-frame, especially `inputd`, must stay in the same order of weight so UI loops do not block behind input IPC. Runtime catalog metadata is not a realtime capability: `runtimed` pins only the exact UI executable to System weight and clamps every other launch below System admission before calling `loaderd`.
 - The max-burst guard rotates to another ready peer within the current
-  scheduling class even when the current task's weighted vruntime still wins;
-  this is the last-resort rail for long UI/input kernel frames without breaking
-  strict System/User/Idle band ordering.
+  scheduling class even when the current task's weighted vruntime still wins.
+  Separately, after eight consecutive System dispatches, one ready User task
+  must run before System selection resumes; this is the explicit recovery and
+  application CPU reservation under DVM/UI load.
 - `KernelSpinLock` must not be held across disk/filesystem/IPC/framebuffer-copy loops. Use `KernelWaitLock` or split the section; add `cond_resched` in long loops.
 - Boot service order: driver/input/storage policy services before UI launchers. `runtimed` waits on `devmgrd` and `storaged` endpoints before UI bootstrap.

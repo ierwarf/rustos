@@ -47,7 +47,7 @@ lazy_static! {
 
 #[derive(Clone)]
 enum PinnedFileBacking {
-    Remote { remote_id: u64 },
+    Remote { remote_id: u64, path: String },
     Memfd(MemfdHandle),
 }
 
@@ -1180,18 +1180,25 @@ fn copy_file_into_address_space(
     while copied < total {
         let count = (total - copied).min(chunk.len());
         let read = match backing {
-            PinnedFileBacking::Remote { remote_id } => {
-                match offload_ops::call_remote_vfs_read_bytes(
-                    *remote_id,
-                    file_offset.saturating_add(copied as u64),
-                    count,
+            PinnedFileBacking::Remote { remote_id, path } => {
+                let offset = file_offset.saturating_add(copied as u64);
+                match kernel_io_manager::api::block::read_boot_extent_file_range(
+                    path,
+                    offset,
+                    &mut chunk[..count],
                 ) {
-                    Ok(bytes) => {
-                        let n = bytes.len().min(count);
-                        chunk[..n].copy_from_slice(&bytes[..n]);
-                        n
+                    Ok(Some(read)) => read,
+                    Ok(None) => {
+                        match offload_ops::call_remote_vfs_read_bytes(*remote_id, offset, count) {
+                            Ok(bytes) => {
+                                let n = bytes.len().min(count);
+                                chunk[..n].copy_from_slice(&bytes[..n]);
+                                n
+                            }
+                            Err(err) => return Err(err),
+                        }
                     }
-                    Err(err) => return Err(err),
+                    Err(_) => return Err(LINUX_EIO),
                 }
             }
             PinnedFileBacking::Memfd(memfd) => {
@@ -1227,6 +1234,7 @@ fn pinned_file_backing_from_current(fd: u64) -> Result<PinnedFileBacking, i64> {
             KernelHandle::RemoteVfs(r) if r.kind() == RemoteVfsHandleKind::File => {
                 Ok(PinnedFileBacking::Remote {
                     remote_id: r.remote_id(),
+                    path: r.path(),
                 })
             }
             KernelHandle::Memfd(m) => Ok(PinnedFileBacking::Memfd(m.clone())),

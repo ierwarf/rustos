@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::mem::size_of;
 use std::slice;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 
 use keyboard_core::{KeyAction, KeyboardDriver, KeyboardEvent};
@@ -14,20 +15,22 @@ use rustos_user_abi::syscall::{
     CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
     CommercialMaxProtocolResponse, INPUTD_ACCESS_EVDEV, INPUTD_ACCESS_NATIVE,
     INPUTD_INGEST_MAX_EVENTS, INPUTD_INGRESS_FLAG_DVM_SOURCE, INPUTD_INGRESS_FLAG_RESET_STATE,
-    INPUTD_INGRESS_KIND_DVM_LINUX_KEY, INPUTD_INGRESS_KIND_POINTER_PACKET, INPUTD_IPC_ABI_VERSION,
-    INPUTD_IPC_OP_AUTHORIZE_READ, INPUTD_IPC_OP_DRAIN_INGEST, INPUTD_IPC_OP_PING,
-    INPUTD_IPC_OP_READ, INPUTD_IPC_OP_SET_POINTER_SURFACE, INPUTD_IPC_OP_STATS,
-    INPUTD_READ_FLAG_NONBLOCK, INPUTD_READ_PAYLOAD_CAPACITY, IPC_MAX_INLINE_BYTES,
-    IPC_SERVICE_INPUTD, InputIngestBrokerArgs, InputIngressWire, InputPointerPacketWire,
-    InputStatsBrokerArgs, InputStatsWire, InputdIpcRequest, InputdIpcResponse,
-    InputdPointerSurfaceRequest, InputdReadResponse, SYS_RUSTOS_DEBUG_PRINT,
-    SYS_RUSTOS_INPUT_INGEST_BROKER, SYS_RUSTOS_INPUT_STATS_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
+    INPUTD_INGRESS_KIND_DVM_LINUX_KEY, INPUTD_INGRESS_KIND_POINTER_PACKET,
+    INPUTD_INGRESS_KIND_POINTER_POSITION, INPUTD_IPC_ABI_VERSION, INPUTD_IPC_OP_AUTHORIZE_READ,
+    INPUTD_IPC_OP_DRAIN_INGEST, INPUTD_IPC_OP_PING, INPUTD_IPC_OP_READ,
+    INPUTD_IPC_OP_SET_POINTER_SURFACE, INPUTD_IPC_OP_STATS, INPUTD_READ_FLAG_NONBLOCK,
+    INPUTD_READ_PAYLOAD_CAPACITY, IPC_MAX_INLINE_BYTES, IPC_SERVICE_INPUTD, InputIngestBrokerArgs,
+    InputIngressWire, InputPointerPacketWire, InputPointerPositionWire, InputStatsBrokerArgs,
+    InputStatsWire, InputdIpcRequest, InputdIpcResponse, InputdPointerSurfaceRequest,
+    InputdReadResponse, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_INPUT_INGEST_BROKER,
+    SYS_RUSTOS_INPUT_STATS_BROKER, SYS_RUSTOS_INPUT_WAIT_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
     SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
 };
 
-// DVM ingress is transferred only in a readiness probe or authorized read.
-// inputd can therefore block on its service endpoint: request enqueue wakes it
-// directly, avoiding a polling/sleep interval on the UI input critical path.
+// The DVM ingestion worker waits on the MSI-X-published ring and transfers
+// bounded batches into this user-space queue independently of app reads. App
+// requests still own reader authorization and event serialization; no polling
+// client is allowed to become the liveness dependency for transport progress.
 const INPUTD_QUEUE_MAX_EVENTS: usize = 4096;
 const INPUTD_MAX_NATIVE_READ_BYTES: u64 = input_evdev::MAX_NATIVE_READ_BYTES as u64;
 const INPUTD_MAX_EVDEV_READ_BYTES: u64 = input_evdev::MAX_EVDEV_READ_BYTES as u64;
@@ -55,7 +58,17 @@ struct InputQueue {
     dropped_lossy: u64,
     dvm_pointer_buttons: u8,
     published_pointer_buttons: u8,
+    dvm_pointer_position: Option<(i32, i32)>,
     read_authorizations: VecDeque<InputReadAuthorization>,
+}
+
+type SharedInputQueue = Arc<Mutex<InputQueue>>;
+
+fn lock_input_queue(queue: &SharedInputQueue) -> MutexGuard<'_, InputQueue> {
+    queue.lock().unwrap_or_else(|_| {
+        debug_line("inputd: input queue synchronization failed");
+        std::process::exit(134);
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -162,6 +175,7 @@ impl InputQueue {
             self.push_keyboard_driver_event(event);
         }
         self.dvm_pointer_buttons = 0;
+        self.dvm_pointer_position = None;
         self.publish_pointer_button_edges();
     }
 
@@ -201,6 +215,52 @@ impl InputQueue {
         }
         self.push_pointer_motion_and_scroll(packet);
         self.dvm_pointer_buttons = packet.buttons;
+        self.publish_pointer_button_edges();
+    }
+
+    fn push_dvm_pointer_position(&mut self, position: InputPointerPositionWire) {
+        if position.x < 0 || position.y < 0 {
+            return;
+        }
+        if self.pointer_surface.configured()
+            && (position.x as u32 >= self.pointer_surface.width
+                || position.y as u32 >= self.pointer_surface.height)
+        {
+            return;
+        }
+        let coordinates = (position.x, position.y);
+        let changed = self.dvm_pointer_position != Some(coordinates);
+        if changed {
+            self.push(input_evdev::InputEvent {
+                kind: input_evdev::INPUT_KIND_POINTER_POSITION,
+                action: input_evdev::INPUT_ACTION_NONE,
+                code: 0,
+                value0: position.x,
+                value1: position.y,
+                modifiers: 0,
+                text: 0,
+            });
+            self.dvm_pointer_position = Some(coordinates);
+        }
+        if position.wheel_vertical != 0 || position.wheel_horizontal != 0 {
+            self.push(input_evdev::InputEvent {
+                kind: input_evdev::INPUT_KIND_POINTER_SCROLL,
+                action: input_evdev::INPUT_ACTION_NONE,
+                code: 0,
+                value0: position.wheel_vertical as i32,
+                value1: position.wheel_horizontal as i32,
+                modifiers: 0,
+                text: 0,
+            });
+        }
+        if changed
+            || position.wheel_vertical != 0
+            || position.wheel_horizontal != 0
+            || position.buttons != self.dvm_pointer_buttons
+        {
+            self.dvm_pointer_observed = true;
+        }
+        self.dvm_pointer_buttons = position.buttons;
         self.publish_pointer_button_edges();
     }
 
@@ -301,7 +361,7 @@ mod tests {
     use rustos_user_abi::syscall::{
         INPUTD_ACCESS_NATIVE, INPUTD_INGRESS_FLAG_DVM_SOURCE, INPUTD_INGRESS_FLAG_RESET_STATE,
         INPUTD_INGRESS_KIND_DVM_LINUX_KEY, InputIngressWire, InputPointerPacketWire,
-        InputdIpcRequest,
+        InputPointerPositionWire, InputdIpcRequest,
     };
 
     fn pointer_motion(dx: i32, dy: i32) -> input_evdev::InputEvent {
@@ -361,6 +421,31 @@ mod tests {
         let event = queue.pop_front().unwrap();
         assert_eq!(event.value0, 30);
         assert_eq!(event.value1, 40);
+    }
+
+    #[test]
+    fn authenticated_absolute_pointer_duplicates_are_idempotent() {
+        let mut queue = InputQueue::default();
+        queue.set_pointer_surface(1600, 900, 1).unwrap();
+        let position = InputPointerPositionWire {
+            x: 800,
+            y: 450,
+            ..InputPointerPositionWire::default()
+        };
+        queue.push_dvm_pointer_position(position);
+        queue.push_dvm_pointer_position(position);
+
+        assert_eq!(queue.len(), 1);
+        let event = queue.pop_front().unwrap();
+        assert_eq!(event.kind, input_evdev::INPUT_KIND_POINTER_POSITION);
+        assert_eq!((event.value0, event.value1), (800, 450));
+
+        queue.push_dvm_pointer_position(InputPointerPositionWire {
+            x: 1600,
+            y: 450,
+            ..position
+        });
+        assert!(queue.is_empty());
     }
 
     #[test]
@@ -564,8 +649,58 @@ fn main() {
     serve(endpoint as u64);
 }
 
+/// Runs at the input-service priority but has no policy authority beyond the
+/// existing inputd capability. It sleeps on the MSI-X-associated wait broker,
+/// drains at most one ABI-bounded batch, and yields before a recovery backlog
+/// can take another batch. This is the QNX-style interrupt-to-service handoff:
+/// device progress is independent of any application's read cadence.
+fn start_dvm_ingestion_worker(queue: SharedInputQueue) {
+    let result = thread::Builder::new()
+        .name(String::from("inputd-dvm-ingress"))
+        .spawn(move || {
+            let mut ingest_scratch = vec![InputIngressWire::default(); INPUTD_INGEST_MAX_EVENTS];
+            loop {
+                if let Err(errno) = wait_for_dvm_ingress() {
+                    debug_line(&format!("inputd: DVM ingestion wait failed errno={errno}"));
+                    std::process::exit(134);
+                }
+                let drained = {
+                    let mut queue = lock_input_queue(&queue);
+                    match drain_ingest(&mut queue, &mut ingest_scratch) {
+                        Ok(count) => count,
+                        Err(errno) => {
+                            debug_line(&format!(
+                                "inputd: DVM ingestion drain failed errno={errno}"
+                            ));
+                            std::process::exit(134);
+                        }
+                    }
+                };
+                if drained == INPUTD_INGEST_MAX_EVENTS {
+                    // A hostile or recovering producer cannot retain the
+                    // interactive class across unbounded batches.
+                    thread::yield_now();
+                }
+            }
+        });
+    if result.is_err() {
+        debug_line("inputd: DVM ingestion worker spawn failed");
+        std::process::exit(134);
+    }
+}
+
+fn wait_for_dvm_ingress() -> Result<(), i32> {
+    let result = syscall0(SYS_RUSTOS_INPUT_WAIT_BROKER);
+    if result < 0 {
+        Err(last_errno())
+    } else {
+        Ok(())
+    }
+}
+
 fn serve(endpoint: u64) {
-    let mut queue = InputQueue::default();
+    let queue = Arc::new(Mutex::new(InputQueue::default()));
+    start_dvm_ingestion_worker(Arc::clone(&queue));
     // This buffer is reused by request handlers. Do not allocate a new 96 KiB
     // wire batch for every client read.
     let mut ingest_scratch = vec![InputIngressWire::default(); INPUTD_INGEST_MAX_EVENTS];
@@ -590,38 +725,46 @@ fn serve(endpoint: u64) {
         let request_size = received as usize;
         if request_size == size_of::<CommercialMaxProtocolRequest>() {
             let request = read_unaligned::<CommercialMaxProtocolRequest>(&request);
-            let reply =
-                reply_commercial_request(reply_cap, &request, &mut queue, &mut ingest_scratch);
+            let reply = {
+                let mut queue = lock_input_queue(&queue);
+                reply_commercial_request(reply_cap, &request, &mut queue, &mut ingest_scratch)
+            };
             if reply < 0 {
                 let _ = writeln!(std::io::stderr(), "inputd: reply failed errno={}", -reply);
             }
             log_dvm_ingress_observations(
-                &mut queue,
+                &queue,
                 &mut dvm_keyboard_ingress_logged,
                 &mut dvm_pointer_ingress_logged,
             );
             continue;
         }
         if request_size == size_of::<InputdPointerSurfaceRequest>() {
+            debug_line("inputd: pointer surface request received");
             let request = read_unaligned::<InputdPointerSurfaceRequest>(&request);
             let mut response = InputdIpcResponse {
                 version: INPUTD_IPC_ABI_VERSION,
                 op: request.op,
                 ..InputdIpcResponse::default()
             };
-            response.status = dispatch_pointer_surface_request(&request, &mut queue);
+            response.status = {
+                let mut queue = lock_input_queue(&queue);
+                dispatch_pointer_surface_request(&request, &mut queue)
+            };
             response.approved_len = (response.status == 0) as u64;
+            debug_line("inputd: pointer surface state applied");
             let reply = syscall3(
                 SYS_RUSTOS_IPC_REPLY,
                 reply_cap,
                 (&response as *const InputdIpcResponse) as u64,
                 size_of::<InputdIpcResponse>() as u64,
             );
+            debug_line("inputd: pointer surface reply returned");
             if reply < 0 {
                 let _ = writeln!(std::io::stderr(), "inputd: reply failed errno={}", -reply);
             }
             log_dvm_ingress_observations(
-                &mut queue,
+                &queue,
                 &mut dvm_keyboard_ingress_logged,
                 &mut dvm_pointer_ingress_logged,
             );
@@ -638,7 +781,10 @@ fn serve(endpoint: u64) {
                 ..InputdReadResponse::default()
             };
             response.status = match validate(received as usize, &request) {
-                Ok(()) => dispatch_read(&request, &mut response, &mut queue, &mut ingest_scratch),
+                Ok(()) => {
+                    let mut queue = lock_input_queue(&queue);
+                    dispatch_read(&request, &mut response, &mut queue, &mut ingest_scratch)
+                }
                 Err(errno) => errno,
             };
             syscall3(
@@ -654,7 +800,10 @@ fn serve(endpoint: u64) {
                 ..InputdIpcResponse::default()
             };
             response.status = match validate(received as usize, &request) {
-                Ok(()) => dispatch(&request, &mut response, &mut queue, &mut ingest_scratch),
+                Ok(()) => {
+                    let mut queue = lock_input_queue(&queue);
+                    dispatch(&request, &mut response, &mut queue, &mut ingest_scratch)
+                }
                 Err(errno) => errno,
             };
             syscall3(
@@ -668,7 +817,7 @@ fn serve(endpoint: u64) {
             let _ = writeln!(std::io::stderr(), "inputd: reply failed errno={}", -reply);
         }
         log_dvm_ingress_observations(
-            &mut queue,
+            &queue,
             &mut dvm_keyboard_ingress_logged,
             &mut dvm_pointer_ingress_logged,
         );
@@ -676,11 +825,11 @@ fn serve(endpoint: u64) {
 }
 
 fn log_dvm_ingress_observations(
-    queue: &mut InputQueue,
+    queue: &SharedInputQueue,
     dvm_keyboard_ingress_logged: &mut bool,
     dvm_pointer_ingress_logged: &mut bool,
 ) {
-    let (dvm_keyboard, dvm_pointer) = queue.take_dvm_ingress_observations();
+    let (dvm_keyboard, dvm_pointer) = lock_input_queue(queue).take_dvm_ingress_observations();
     if dvm_keyboard && !*dvm_keyboard_ingress_logged {
         debug_line("inputd: DVM keyboard ingress observed");
         *dvm_keyboard_ingress_logged = true;
@@ -727,7 +876,7 @@ fn dispatch(
         }
         INPUTD_IPC_OP_STATS => {
             // `poll(2)` obtains readiness through this operation. Refresh the
-            // DVM-backed ingress before answering so a COM2 record that woke a
+            // DVM-backed ingress before answering so an input-ring record that woke a
             // kernel poll waiter is visible to the same readiness recheck.
             //
             // Keep this transfer request-driven. An idle background turn must
@@ -857,6 +1006,12 @@ fn apply_dvm_ingress_wire(queue: &mut InputQueue, wire: &InputIngressWire) {
         {
             queue.push_dvm_pointer_packet(wire.pointer_packet);
         }
+        INPUTD_INGRESS_KIND_POINTER_POSITION
+            if wire.access == INPUTD_ACCESS_NATIVE
+                && wire.flags == INPUTD_INGRESS_FLAG_DVM_SOURCE =>
+        {
+            queue.push_dvm_pointer_position(wire.pointer_position);
+        }
         _ => {}
     }
 }
@@ -960,7 +1115,7 @@ fn consume_read_authorization(queue: &mut InputQueue, request: &InputdIpcRequest
 fn fetch_stats(queue: &InputQueue) -> Result<InputStatsWire, i32> {
     let mut stats = InputStatsWire::default();
     let args = InputStatsBrokerArgs {
-        abi_version: 1,
+        abi_version: INPUTD_IPC_ABI_VERSION,
         reserved0: 0,
         reserved1: 0,
         out_stats_ptr: (&mut stats as *mut InputStatsWire) as u64,

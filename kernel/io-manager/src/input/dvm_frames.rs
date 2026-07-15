@@ -1,49 +1,25 @@
 // RING3-MIGRATION-REFERENCE START: DVM input relay transport exception.
 // L0 owns DVM admission and event validation; inputd owns Linux-keymap,
-// modifier, text, and session policy. Ring0 only polls the dedicated virtual
-// UART and carries bounded, sequenced frames into the existing ingress queue.
-use core::sync::atomic::{AtomicBool, Ordering};
-
+// modifier, text, and session policy. Ring0 validates only fixed, sequenced
+// frames drained from the host-owned input ring in task context.
 use crate::sync::KernelSpinLock as Mutex;
 use driver_abi::PointerPacket;
 use rustos_user_abi::ui::{INPUT_ACTION_PRESSED, INPUT_ACTION_RELEASED, INPUT_ACTION_REPEATED};
-use x86_64::instructions::port::Port;
-
-const DATA_PORT: u16 = 0x02f8;
-const INTERRUPT_ENABLE_PORT: u16 = DATA_PORT + 1;
-const FIFO_CONTROL_PORT: u16 = DATA_PORT + 2;
-const LINE_CONTROL_PORT: u16 = DATA_PORT + 3;
-const MODEM_CONTROL_PORT: u16 = DATA_PORT + 4;
-const LINE_STATUS_PORT: u16 = DATA_PORT + 5;
-const LINE_STATUS_DATA_READY: u8 = 1 << 0;
-const LINE_STATUS_TRANSMIT_HOLDING_EMPTY: u8 = 1 << 5;
-const LINE_STATUS_ABSENT: u8 = u8::MAX;
 const FRAME_BYTES: usize = 32;
-// A capability-gated input broker drain accepts at most sixteen complete RDI2
-// frames per turn into the bounded ingress queue. `inputd` still owns policy
-// transfer from that queue; this narrow ring0 work never runs from an IRQ, so
-// it cannot re-enter the decoder while a broker call owns its state.
-const MAX_BYTES_PER_TURN: usize = FRAME_BYTES * 16;
 const MAGIC: [u8; 4] = *b"RDI1";
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
 const KIND_SESSION_START: u8 = 0;
 const KIND_KEY: u8 = 1;
 const KIND_POINTER: u8 = 2;
 const KIND_SESSION_END: u8 = 3;
+const KIND_POINTER_POSITION: u8 = 4;
 const LINUX_EVDEV_KEY_MAX: u16 = 0x02ff;
 const POINTER_BUTTON_MASK: u8 = 0x1f;
-// Private L0 readiness signal carried in the reverse direction of the same
-// QEMU chardev. It only gates when L0 asks the DVM to produce input; it never
-// grants authority and no DVM byte can forge it.
-const RECEIVER_READY_SIGNAL: [u8; 4] = *b"RDRY";
-
-static ACTIVE: AtomicBool = AtomicBool::new(false);
-static RECEIVER_READY_ANNOUNCED: AtomicBool = AtomicBool::new(false);
+const POINTER_POSITION_MAX_X: u16 = 1599;
+const POINTER_POSITION_MAX_Y: u16 = 899;
 static DECODER: Mutex<Decoder> = Mutex::new(Decoder::new());
 
 struct Decoder {
-    bytes: [u8; FRAME_BYTES],
-    len: usize,
     epoch: u32,
     sequence: u32,
 }
@@ -51,49 +27,27 @@ struct Decoder {
 impl Decoder {
     const fn new() -> Self {
         Self {
-            bytes: [0; FRAME_BYTES],
-            len: 0,
             epoch: 0,
             sequence: 0,
         }
     }
 
-    fn feed(&mut self, byte: u8) -> usize {
-        if self.len < FRAME_BYTES {
-            self.bytes[self.len] = byte;
-            self.len += 1;
-        }
-        if self.len != FRAME_BYTES {
-            return 0;
-        }
-        if !self.frame_is_well_formed() {
-            self.bytes.copy_within(1..FRAME_BYTES, 0);
-            self.len = FRAME_BYTES - 1;
-            return 0;
-        }
-        let accepted = self.consume_frame();
-        self.len = 0;
-        accepted as usize
+    fn frame_is_well_formed(bytes: &[u8; FRAME_BYTES]) -> bool {
+        bytes[..4] == MAGIC
+            && bytes[4] == VERSION
+            && bytes[6] == 0
+            && bytes[7] == 0
+            && u32::from_be_bytes(bytes[28..32].try_into().expect("frame checksum"))
+                == crc32(&bytes[..28])
     }
 
-    fn frame_is_well_formed(&self) -> bool {
-        self.bytes[..4] == MAGIC
-            && self.bytes[4] == VERSION
-            && self.bytes[6] == 0
-            && self.bytes[7] == 0
-            && u32::from_be_bytes(self.bytes[28..32].try_into().expect("frame checksum"))
-                == crc32(&self.bytes[..28])
-    }
-
-    fn consume_frame(&mut self) -> bool {
-        let kind = self.bytes[5];
-        let epoch = u32::from_be_bytes(self.bytes[8..12].try_into().expect("frame epoch"));
-        let sequence = u32::from_be_bytes(self.bytes[12..16].try_into().expect("frame sequence"));
+    fn consume_frame(&mut self, bytes: &[u8; FRAME_BYTES]) -> bool {
+        let kind = bytes[5];
+        let epoch = u32::from_be_bytes(bytes[8..12].try_into().expect("frame epoch"));
+        let sequence = u32::from_be_bytes(bytes[12..16].try_into().expect("frame sequence"));
         match kind {
             KIND_SESSION_START
-                if epoch != 0
-                    && sequence == 0
-                    && self.bytes[16..28].iter().all(|&byte| byte == 0) =>
+                if epoch != 0 && sequence == 0 && bytes[16..28].iter().all(|&byte| byte == 0) =>
             {
                 // A new authenticated relay epoch revokes every prior DVM
                 // key/button assertion, including a session that died before
@@ -103,7 +57,7 @@ impl Decoder {
                 // RDI1 session markers are L0-authenticated lifecycle
                 // signals, not guest-provided input. The fixed Ethernet ring
                 // reuses only this lifecycle lease: no network frame travels
-                // over COM2 and a DVM-writable ring header cannot activate it.
+                // over the input ring and its bounded header cannot activate it.
                 activate_network_control_from_session(epoch);
                 self.epoch = epoch;
                 self.sequence = 0;
@@ -112,12 +66,11 @@ impl Decoder {
             KIND_KEY
                 if epoch == self.epoch
                     && self.sequence.checked_add(1) == Some(sequence)
-                    && self.bytes[16..18] != [0, 0]
-                    && self.bytes[19..28].iter().all(|&byte| byte == 0) =>
+                    && bytes[16..18] != [0, 0]
+                    && bytes[19..28].iter().all(|&byte| byte == 0) =>
             {
-                let code =
-                    u16::from_be_bytes(self.bytes[16..18].try_into().expect("frame key code"));
-                let value = self.bytes[18];
+                let code = u16::from_be_bytes(bytes[16..18].try_into().expect("frame key code"));
+                let value = bytes[18];
                 if code > LINUX_EVDEV_KEY_MAX {
                     return false;
                 }
@@ -133,31 +86,51 @@ impl Decoder {
             KIND_POINTER
                 if epoch == self.epoch
                     && self.sequence.checked_add(1) == Some(sequence)
-                    && self.bytes[25..28].iter().all(|&byte| byte == 0)
-                    && self.bytes[24] & !POINTER_BUTTON_MASK == 0 =>
+                    && bytes[25..28].iter().all(|&byte| byte == 0)
+                    && bytes[24] & !POINTER_BUTTON_MASK == 0 =>
             {
                 self.sequence = sequence;
                 submit_dvm_pointer_packet(PointerPacket {
-                    buttons: self.bytes[24],
+                    buttons: bytes[24],
                     reserved0: 0,
                     reserved1: 0,
                     reserved2: 0,
-                    dx: i16::from_be_bytes(self.bytes[16..18].try_into().expect("frame dx")),
-                    dy: i16::from_be_bytes(self.bytes[18..20].try_into().expect("frame dy")),
+                    dx: i16::from_be_bytes(bytes[16..18].try_into().expect("frame dx")),
+                    dy: i16::from_be_bytes(bytes[18..20].try_into().expect("frame dy")),
                     wheel_vertical: i16::from_be_bytes(
-                        self.bytes[20..22].try_into().expect("frame vertical wheel"),
+                        bytes[20..22].try_into().expect("frame vertical wheel"),
                     ),
                     wheel_horizontal: i16::from_be_bytes(
-                        self.bytes[22..24]
-                            .try_into()
-                            .expect("frame horizontal wheel"),
+                        bytes[22..24].try_into().expect("frame horizontal wheel"),
                     ),
                 })
+            }
+            KIND_POINTER_POSITION
+                if epoch == self.epoch
+                    && self.sequence.checked_add(1) == Some(sequence)
+                    && bytes[25..28].iter().all(|&byte| byte == 0)
+                    && bytes[24] & !POINTER_BUTTON_MASK == 0 =>
+            {
+                let x =
+                    u16::from_be_bytes(bytes[16..18].try_into().expect("frame absolute pointer x"));
+                let y =
+                    u16::from_be_bytes(bytes[18..20].try_into().expect("frame absolute pointer y"));
+                if x > POINTER_POSITION_MAX_X || y > POINTER_POSITION_MAX_Y {
+                    return false;
+                }
+                self.sequence = sequence;
+                submit_dvm_pointer_position(
+                    x,
+                    y,
+                    i16::from_be_bytes(bytes[20..22].try_into().expect("frame vertical wheel")),
+                    i16::from_be_bytes(bytes[22..24].try_into().expect("frame horizontal wheel")),
+                    bytes[24],
+                )
             }
             KIND_SESSION_END
                 if epoch == self.epoch
                     && self.sequence.checked_add(1) == Some(sequence)
-                    && self.bytes[16..28].iter().all(|&byte| byte == 0) =>
+                    && bytes[16..28].iter().all(|&byte| byte == 0) =>
             {
                 // Exact-epoch revoke prevents a delayed cleanup from an old
                 // L0 relay session from disabling a newer authenticated DVM.
@@ -172,82 +145,33 @@ impl Decoder {
     }
 }
 
-pub(crate) fn init() {
-    let status = unsafe {
-        let mut port = Port::<u8>::new(LINE_STATUS_PORT);
-        port.read()
-    };
-    if status == LINE_STATUS_ABSENT {
-        return;
-    }
-    unsafe {
-        let mut interrupt_enable = Port::<u8>::new(INTERRUPT_ENABLE_PORT);
-        let mut line_control = Port::<u8>::new(LINE_CONTROL_PORT);
-        let mut data = Port::<u8>::new(DATA_PORT);
-        let mut fifo_control = Port::<u8>::new(FIFO_CONTROL_PORT);
-        let mut modem_control = Port::<u8>::new(MODEM_CONTROL_PORT);
-        // Dedicated COM2 transport, 115200 8N1, IRQs intentionally disabled.
-        // A capability-gated broker drains it into ring0 ingress; inputd
-        // retains all translation, policy, and read ownership.
-        interrupt_enable.write(0);
-        line_control.write(0x80);
-        data.write(1);
-        interrupt_enable.write(0);
-        line_control.write(0x03);
-        fifo_control.write(0xc7);
-        modem_control.write(0x0b);
-    }
-    ACTIVE.store(true, Ordering::Release);
-    crate::debug::println!("DVM input relay transport ready: COM2 framed ingress");
-}
-
-pub(crate) fn service_pending() -> usize {
-    if !ACTIVE.load(Ordering::Acquire) {
-        return 0;
-    }
-    announce_receiver_ready();
-    let mut accepted = 0;
+/// Consume one complete fixed ring record. The caller owns cursor validation
+/// and invokes this only from the capability-gated inputd broker, never from
+/// the MSI-X leaf callback.
+pub(crate) fn consume_record(record: &[u8; FRAME_BYTES]) -> usize {
     let mut decoder = DECODER.lock();
-    for _ in 0..MAX_BYTES_PER_TURN {
-        let status = unsafe {
-            let mut port = Port::<u8>::new(LINE_STATUS_PORT);
-            port.read()
-        };
-        if status & LINE_STATUS_DATA_READY == 0 {
-            break;
-        }
-        let byte = unsafe {
-            let mut port = Port::<u8>::new(DATA_PORT);
-            port.read()
-        };
-        accepted += decoder.feed(byte);
-    }
-    accepted
+    let accepted = Decoder::frame_is_well_formed(record) && decoder.consume_frame(record);
+    // Ring slots are independently framed. Invalid slots are rejected as one
+    // record and can never borrow bytes from a successor.
+    accepted as usize
 }
 
-/// The first capability-gated drain attempt proves that a RustOS input
-/// consumer exists. Announce it to L0 before accepting a DVM stream, so the
-/// DVM cannot fill QEMU's bounded COM2 input buffer during boot. The UART FIFO
-/// is configured for at least this four-byte write; if it is not ready yet,
-/// leave the flag clear and retry on the next drain attempt.
-fn announce_receiver_ready() {
-    if RECEIVER_READY_ANNOUNCED.load(Ordering::Acquire) {
-        return;
-    }
-    let transmit_ready = unsafe {
-        let mut port = Port::<u8>::new(LINE_STATUS_PORT);
-        port.read() & LINE_STATUS_TRANSMIT_HOLDING_EMPTY != 0
+/// Revoke decoder and policy authority when the transport itself is revoked.
+/// L0 cannot reliably append SESSION_END after RustOS has rejected the shared
+/// header, so transport teardown must not leave an authenticated epoch, a
+/// network lease, or pressed input state behind.
+pub(crate) fn revoke_active_session() {
+    let epoch = {
+        let mut decoder = DECODER.lock();
+        let epoch = decoder.epoch;
+        decoder.epoch = 0;
+        decoder.sequence = 0;
+        epoch
     };
-    if !transmit_ready {
-        return;
+    if epoch != 0 {
+        revoke_network_control_from_session(epoch);
     }
-    unsafe {
-        let mut data = Port::<u8>::new(DATA_PORT);
-        for byte in RECEIVER_READY_SIGNAL {
-            data.write(byte);
-        }
-    }
-    RECEIVER_READY_ANNOUNCED.store(true, Ordering::Release);
+    let _ = submit_dvm_input_reset();
 }
 
 fn activate_network_control_from_session(epoch: u32) {
@@ -257,7 +181,7 @@ fn activate_network_control_from_session(epoch: u32) {
     }
     #[cfg(test)]
     {
-        // Decoder tests have no live COM2/PCI topology. Lease semantics are
+        // Decoder tests have no live input-ring/PCI topology. Lease semantics are
         // covered by dvm_network's host-independent ControlLease tests.
         let _ = epoch;
     }
@@ -312,6 +236,30 @@ fn submit_dvm_pointer_packet(packet: PointerPacket) -> bool {
     }
 }
 
+fn submit_dvm_pointer_position(
+    x: u16,
+    y: u16,
+    wheel_vertical: i16,
+    wheel_horizontal: i16,
+    buttons: u8,
+) -> bool {
+    #[cfg(not(test))]
+    {
+        crate::input::event_queue::submit_dvm_pointer_position(
+            x,
+            y,
+            wheel_vertical,
+            wheel_horizontal,
+            buttons,
+        )
+    }
+    #[cfg(test)]
+    {
+        let _ = (x, y, wheel_vertical, wheel_horizontal, buttons);
+        true
+    }
+}
+
 fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = !0_u32;
     for &byte in bytes {
@@ -327,8 +275,8 @@ fn crc32(bytes: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Decoder, FRAME_BYTES, KIND_KEY, KIND_POINTER, KIND_SESSION_END, KIND_SESSION_START, MAGIC,
-        VERSION, crc32,
+        Decoder, FRAME_BYTES, KIND_KEY, KIND_POINTER, KIND_POINTER_POSITION, KIND_SESSION_END,
+        KIND_SESSION_START, MAGIC, VERSION, crc32,
     };
 
     fn frame(kind: u8, epoch: u32, sequence: u32, code: u16, value: u8) -> [u8; FRAME_BYTES] {
@@ -350,16 +298,12 @@ mod tests {
         let mut decoder = Decoder::new();
         let session = frame(KIND_SESSION_START, 7, 0, 0, 0);
         let first_key = frame(KIND_KEY, 7, 1, 30, 1);
-        for byte in session {
-            assert_eq!(decoder.feed(byte), 0);
-        }
+        assert!(!decoder.consume_frame(&session));
         assert_eq!(decoder.epoch, 7);
         assert_eq!(decoder.sequence, 0);
-        decoder.bytes = first_key;
-        decoder.len = FRAME_BYTES;
-        assert!(decoder.frame_is_well_formed());
+        assert!(Decoder::frame_is_well_formed(&first_key));
         assert_eq!(
-            u32::from_be_bytes(decoder.bytes[12..16].try_into().unwrap()),
+            u32::from_be_bytes(first_key[12..16].try_into().unwrap()),
             decoder.sequence + 1
         );
     }
@@ -370,9 +314,8 @@ mod tests {
         let mut malformed = frame(KIND_SESSION_START, 11, 0, 0, 0);
         malformed[28] ^= 1;
         let session = frame(KIND_SESSION_START, 11, 0, 0, 0);
-        for byte in malformed.into_iter().chain(session) {
-            let _ = decoder.feed(byte);
-        }
+        assert!(!Decoder::frame_is_well_formed(&malformed));
+        assert!(!decoder.consume_frame(&session));
         assert_eq!(decoder.epoch, 11);
         assert_eq!(decoder.sequence, 0);
     }
@@ -388,11 +331,30 @@ mod tests {
         let checksum = crc32(&pointer[..28]).to_be_bytes();
         pointer[28..32].copy_from_slice(&checksum);
         let end = frame(KIND_SESSION_END, 19, 2, 0, 0);
-        for byte in session.into_iter().chain(pointer).chain(end) {
-            let _ = decoder.feed(byte);
-        }
+        assert!(!decoder.consume_frame(&session));
+        assert!(decoder.consume_frame(&pointer));
+        assert!(!decoder.consume_frame(&end));
         assert_eq!(decoder.epoch, 0);
         assert_eq!(decoder.sequence, 0);
+    }
+
+    #[test]
+    fn decoder_accepts_bounded_absolute_position_and_rejects_out_of_range() {
+        let mut decoder = Decoder::new();
+        assert!(!decoder.consume_frame(&frame(KIND_SESSION_START, 23, 0, 0, 0)));
+
+        let mut position = frame(KIND_POINTER_POSITION, 23, 1, 800, 0);
+        position[18..20].copy_from_slice(&450_u16.to_be_bytes());
+        let checksum = crc32(&position[..28]).to_be_bytes();
+        position[28..32].copy_from_slice(&checksum);
+        assert!(decoder.consume_frame(&position));
+
+        let mut invalid = frame(KIND_POINTER_POSITION, 23, 2, 1600, 0);
+        invalid[18..20].copy_from_slice(&450_u16.to_be_bytes());
+        let checksum = crc32(&invalid[..28]).to_be_bytes();
+        invalid[28..32].copy_from_slice(&checksum);
+        assert!(!decoder.consume_frame(&invalid));
+        assert_eq!(decoder.sequence, 1);
     }
 }
 // RING3-MIGRATION-REFERENCE END: DVM input relay transport exception.

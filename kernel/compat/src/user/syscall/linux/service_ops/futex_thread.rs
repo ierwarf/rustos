@@ -229,14 +229,13 @@ pub fn clone_linux_thread(
         r15: frame.r15,
     };
 
-    let child_tid =
-        match multitask::spawn_user_thread(bootstrap, multitask::DEFAULT_USER_TASK_WEIGHT_MICROS) {
-            Ok(tid) => tid,
-            Err(multitask::SpawnTaskError::InvalidWeightMicros) => {
-                return linux_errno(LINUX_EINVAL);
-            }
-            Err(multitask::SpawnTaskError::NoFreeTaskSlot) => return linux_errno(LINUX_EAGAIN),
-        };
+    let child_tid = match multitask::spawn_user_thread_suspended(bootstrap) {
+        Ok(tid) => tid,
+        Err(multitask::SpawnTaskError::InvalidWeightMicros) => {
+            return linux_errno(LINUX_EINVAL);
+        }
+        Err(multitask::SpawnTaskError::NoFreeTaskSlot) => return linux_errno(LINUX_EAGAIN),
+    };
     let child_tid_bytes = (child_tid as u32).to_le_bytes();
     if flags & (linux_abi::CLONE_PARENT_SETTID | linux_abi::CLONE_CHILD_SETTID) != 0 {
         let result = multitask::with_current_user_process_state_mut(|_, abi, process_state| {
@@ -258,10 +257,25 @@ pub fn clone_linux_thread(
         });
         match result {
             Some(Ok(())) => {}
-            Some(Err(errno)) => return linux_errno(errno),
-            None => return linux_errno(LINUX_ENOSYS),
+            Some(Err(errno)) => {
+                let _ = multitask::terminate_user_task(child_tid);
+                return linux_errno(errno);
+            }
+            None => {
+                let _ = multitask::terminate_user_task(child_tid);
+                return linux_errno(LINUX_ENOSYS);
+            }
         }
     }
+    if !multitask::activate_suspended_user_task(child_tid) {
+        let _ = multitask::terminate_user_task(child_tid);
+        return linux_errno(LINUX_EAGAIN);
+    }
+    // Publish the runnable child only after every shared-memory clone field is
+    // committed. The one-shot handoff is now safe: the child cannot observe a
+    // zero/stale TID or race its parent's rollback path.
+    multitask::set_next_spawn_pick_hint(child_tid);
+    multitask::request_deferred_reschedule();
     child_tid
 }
 // RING3-MIGRATION-REFERENCE END: procd-owned Linux clone/thread substrate exception.

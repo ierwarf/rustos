@@ -60,30 +60,6 @@ impl FramebufferRect {
             height: y1 - y0,
         })
     }
-
-    pub(crate) fn intersection(self, other: Self) -> Option<Self> {
-        let x0 = self.x.max(other.x);
-        let y0 = self.y.max(other.y);
-        let x1 = self
-            .x
-            .saturating_add(self.width)
-            .min(other.x.saturating_add(other.width));
-        let y1 = self
-            .y
-            .saturating_add(self.height)
-            .min(other.y.saturating_add(other.height));
-
-        if x0 >= x1 || y0 >= y1 {
-            return None;
-        }
-
-        Some(Self {
-            x: x0,
-            y: y0,
-            width: x1 - x0,
-            height: y1 - y0,
-        })
-    }
 }
 
 pub(crate) struct Framebuffer {
@@ -256,96 +232,6 @@ impl Framebuffer {
         self.mark_dirty_tile_for_point(x, y);
     }
 
-    pub(crate) fn draw_bgra8888_frame_from_kernel(
-        &mut self,
-        src_ptr: *const u8,
-        width: usize,
-        height: usize,
-        stride_bytes: usize,
-    ) -> bool {
-        if width != self.width || height != self.height {
-            return false;
-        }
-
-        let Some(min_stride) = width.checked_mul(4) else {
-            return false;
-        };
-        if stride_bytes < min_stride {
-            return false;
-        }
-        if self
-            .rect_copy_bounds(FramebufferRect {
-                x: 0,
-                y: 0,
-                width,
-                height,
-            })
-            .is_none()
-        {
-            return false;
-        }
-
-        unsafe {
-            let mut src_row = src_ptr;
-            let mut dst_row = self.active_buffer();
-            for _ in 0..height {
-                self.blit_bgra8888_row(dst_row, src_row, width);
-                src_row = src_row.add(stride_bytes);
-                dst_row = dst_row.add(self.stride_bytes);
-            }
-        }
-
-        self.mark_all_dirty();
-        true
-    }
-
-    pub(crate) fn draw_bgra8888_frame_rect_from_kernel(
-        &mut self,
-        src_ptr: *const u8,
-        width: usize,
-        height: usize,
-        stride_bytes: usize,
-        rect: FramebufferRect,
-    ) -> bool {
-        if width != self.width || height != self.height {
-            return false;
-        }
-
-        let Some(min_stride) = width.checked_mul(4) else {
-            return false;
-        };
-        if stride_bytes < min_stride {
-            return false;
-        }
-
-        let Some(rect) = rect.intersection(FramebufferRect {
-            x: 0,
-            y: 0,
-            width: self.width,
-            height: self.height,
-        }) else {
-            return true;
-        };
-        if self.rect_copy_bounds(rect).is_none() {
-            return false;
-        }
-
-        unsafe {
-            let mut dst_row = self
-                .active_buffer()
-                .add(rect.y * self.stride_bytes + rect.x * self.bpp);
-            let mut src_row = src_ptr.add(rect.y * stride_bytes + rect.x * 4);
-            for _ in 0..rect.height {
-                self.blit_bgra8888_row(dst_row, src_row, rect.width);
-                src_row = src_row.add(stride_bytes);
-                dst_row = dst_row.add(self.stride_bytes);
-            }
-        }
-
-        self.mark_dirty_rect(rect);
-        true
-    }
-
     pub(crate) fn present_scene(&mut self) -> bool {
         if !self.use_double_buffer || !self.dirty_any {
             return true;
@@ -380,35 +266,12 @@ impl Framebuffer {
         true
     }
 
-    pub(crate) fn debug_sample_buffers(&self) -> ([u8; 4], [u8; 4]) {
-        (
-            self.debug_sample_bytes(self.active_buffer()),
-            self.debug_sample_bytes(self.front_base),
-        )
-    }
-
-    #[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code))]
-    pub(crate) fn debug_uses_double_buffer(&self) -> bool {
-        self.use_double_buffer
-    }
-
     fn active_buffer(&self) -> *mut u8 {
         if self.use_double_buffer {
             self.back_base
         } else {
             self.front_base
         }
-    }
-
-    fn debug_sample_bytes(&self, base: *mut u8) -> [u8; 4] {
-        let mut sample = [0_u8; 4];
-        let byte_len = self.size.min(sample.len());
-        unsafe {
-            for (index, byte) in sample.iter_mut().enumerate().take(byte_len) {
-                *byte = ptr::read_volatile(base.add(index));
-            }
-        }
-        sample
     }
 
     fn rect_copy_bounds(&self, rect: FramebufferRect) -> Option<(usize, usize)> {
@@ -570,18 +433,6 @@ impl Framebuffer {
             }
         }
     }
-
-    unsafe fn blit_bgra8888_row(&self, dst: *mut u8, src: *const u8, pixels: usize) {
-        unsafe {
-            crate::arch::simd::blit_bgra8888_row(
-                dst,
-                src,
-                pixels,
-                self.bpp,
-                matches!(self.format, BootPixelFormat::Rgb),
-            );
-        }
-    }
 }
 
 impl DrawTarget for Framebuffer {
@@ -690,38 +541,4 @@ fn can_use_double_buffer(front_addr: u64, back_addr: u64, size: usize, back_size
     back_start >= front_end || front_start >= back_end
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use alloc::vec;
-    use alloc::vec::Vec;
-
-    fn test_framebuffer(
-        width: usize,
-        height: usize,
-        bytes_per_pixel: usize,
-        guard_bytes: usize,
-    ) -> (Framebuffer, Vec<u8>) {
-        let stride_bytes = width * bytes_per_pixel;
-        let framebuffer_size = stride_bytes * height;
-        let mut storage = vec![0u8; framebuffer_size + guard_bytes];
-        let framebuffer = Framebuffer {
-            front_base: storage.as_mut_ptr(),
-            back_base: core::ptr::null_mut(),
-            size: framebuffer_size,
-            width,
-            height,
-            stride_bytes,
-            bpp: bytes_per_pixel,
-            format: BootPixelFormat::Rgb,
-            use_double_buffer: false,
-            dirty_cols: width.div_ceil(DIRTY_TILE_WIDTH),
-            dirty_rows: height.div_ceil(DIRTY_TILE_HEIGHT),
-            dirty_any: false,
-            dirty_tiles: [[false; MAX_DIRTY_COLS]; MAX_DIRTY_ROWS],
-        };
-        (framebuffer, storage)
-    }
-
-}
 // RING3-MIGRATION-REFERENCE END: uiserver-owned framebuffer substrate exception.

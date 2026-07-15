@@ -145,20 +145,16 @@ unsafe extern "C" {
 extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
     let frame = unsafe { &mut *frame };
     let abi = validate_syscall_entry_or_terminate(frame);
-    let user_rip_before_dispatch = frame.user_rip;
-    let user_rsp_before_dispatch = frame.user_rsp;
     trace_syscall_entry(frame, abi);
     multitask::save_current_simd_state();
     let result = dispatch_syscall(frame, abi);
     multitask::restore_current_simd_state();
     let return_abi = validate_syscall_entry_or_terminate(frame);
-    let exec_transition_applied =
-        frame.user_rip != user_rip_before_dispatch || frame.user_rsp != user_rsp_before_dispatch;
-    if exec_transition_applied {
-        multitask::clear_deferred_reschedule_request();
-    } else {
-        multitask::reschedule_if_requested();
-    }
+    // Wakeups raised while servicing another syscall are handled by the next
+    // ordinary PIT tick. Never enter the software scheduler from a live
+    // syscall continuation. sched_yield separately arms a short one-shot edge
+    // which is consumed only after the CPU has returned to a user frame.
+    multitask::clear_deferred_reschedule_request();
     trace_syscall_exit(frame, return_abi, result);
     result
 }

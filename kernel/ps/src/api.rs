@@ -7,18 +7,18 @@ pub use crate::multitask::{
     activate_suspended_user_task, arm_block_current_task, block_current_task,
     block_current_user_task, cancel_block_current_task, commit_block_current_task,
     current_linux_thread_state, current_user_address_space, current_user_process_thread_count,
-    current_user_stack_state, current_user_thread_id, exec_current_user_process,
-    exec_user_process_by_pid, exit_current_user_process, exit_current_user_task,
-    inherit_ipc_priority, inherit_ipc_priority_for_process, is_user_process_exiting,
-    is_user_task_alive, linux_thread_snapshot_by_ids, mark_user_process_exiting,
-    note_process_exit_status, queue_linux_signal, release_ipc_priorities_for_process,
-    release_ipc_priority, restore_current_simd_state,
-    save_current_simd_state, set_next_pick_hint, set_next_spawn_pick_hint,
-    spawn_user_process_state_with_parent, spawn_user_process_with_parent, spawn_user_thread,
-    terminate_user_process, wake_task, wake_user_task, with_current_mm, with_current_process_state,
-    with_current_process_state_mut, with_current_user_linux_state_mut,
-    with_current_user_process_and_linux_thread_state_mut, with_current_user_process_state,
-    with_process_state_by_pid, with_process_state_by_pid_mut,
+    current_user_stack_state, current_user_thread_id, demote_current_user_task_to_user_class,
+    exec_current_user_process, exec_user_process_by_pid, exit_current_user_process,
+    exit_current_user_task, inherit_ipc_priority, inherit_ipc_priority_for_process,
+    is_user_process_exiting, is_user_task_alive, linux_thread_snapshot_by_ids,
+    mark_user_process_exiting, note_process_exit_status, queue_linux_signal,
+    release_ipc_priorities_for_process, release_ipc_priority, restore_current_simd_state,
+    save_current_simd_state, set_next_pick_hint, set_next_process_pick_hint,
+    set_next_spawn_pick_hint, spawn_user_process_state_with_parent, spawn_user_process_with_parent,
+    spawn_user_thread_suspended, terminate_user_process, terminate_user_task, wake_task,
+    wake_user_task, with_current_mm, with_current_process_state, with_current_process_state_mut,
+    with_current_user_linux_state_mut, with_current_user_process_and_linux_thread_state_mut,
+    with_current_user_process_state, with_process_state_by_pid, with_process_state_by_pid_mut,
 };
 pub use crate::user::abi::UserAbi;
 pub use crate::user::epoll::{EpollError, EpollHandle, EpollInterestSnapshot};
@@ -49,6 +49,10 @@ pub fn clear_deferred_reschedule_request() {
 
 pub fn request_deferred_reschedule() {
     crate::multitask::request_deferred_reschedule();
+}
+
+pub fn request_user_return_reschedule() {
+    crate::multitask::request_user_return_reschedule();
 }
 
 pub fn reschedule_if_requested() {

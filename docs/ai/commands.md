@@ -20,10 +20,10 @@ failure output as the primary debugging context.
 | `cargo xtask build-dvm` | build the pinned Linux DVM and verify its manifest | `driver-domains/linux/out/` | missing Buildroot prerequisite or source/artifact mismatch |
 | `cargo xtask verify-dvm` | verify every DVM artifact and control-contract hash | none | altered/missing DVM artifact or contract |
 | `cargo xtask kvm-smoke` | concurrently boot Linux DVM and RustOS with QEMU/KVM | `build/kvm/` | unavailable `/dev/kvm`, guest exit, missing readiness marker |
-| `cargo xtask kvm-run` | start the interactive Linux-DVM display session with no readiness deadline; its GTK window grabs the pointer on hover | `build/kvm/` | unavailable GUI backend, `/dev/kvm`, or a guest exit |
+| `cargo xtask kvm-run` | start the interactive Linux-DVM display session; it waits for an atomic three-buffer/page-flip-ready scanout before exposing the window, then records real pointer ingress and healthy idle UI ticks when QEMU closes | `build/kvm/` | unavailable GUI backend, `/dev/kvm`, display readiness failure, missing real pointer evidence, or a guest exit |
 | `cargo run -p rustos-hostd -- discover` | read host IOMMU groups | none | IOMMU unavailable or unreadable sysfs |
 | `cargo run -p rustos-hostd -- preflight --plan <file>` | require complete, non-protected IOMMU-group ownership | none | incomplete group or host-critical BDF |
-| `cargo run -p rustos-hostd -- relay-input ...` | relay validated DVM Linux input into RustOS COM2 | QEMU-private input socket | policy mismatch, malformed DVM event, or endpoint disconnect |
+| `cargo run -p rustos-hostd -- relay-input ...` | relay validated DVM Linux input into RustOS's fixed input ring | launch-owned ivshmem backing and doorbell | policy mismatch, malformed DVM event, or peer lifecycle failure |
 
 ## Tests and inventory
 
@@ -48,22 +48,40 @@ failure output as the primary debugging context.
 - The DVM's `agent-v1-control` contract makes a host-authenticated KVM-vsock
   health, PCI-inventory, driver-inventory, and `input-stream` handshake. L0 validates keyboard
   and relative-pointer evdev records before forwarding sequenced, checksummed
-  RDI2 frames over RustOS's dedicated COM2 socket; no QMP socket is launched.
+  RDI3 frames into an L0-owned 128 KiB fixed ring, then signals RustOS's one
+  MSI-X eventfd; no QMP socket is launched and the DVM never maps the ring.
   L0 releases tracked keys/buttons when the DVM stream ends. The smoke
   establishes the relay but does not synthesize input, so a live event still
   needs a real input source assigned to the DVM. It is not storage or
   PCI-passthrough validation.
-- `--dvm-display-shmem` adds one private fixed-layout `ivshmem-plain` object
-  to both KVM guests. It requires RustOS's primary display ABI to equal the
-  runner-created 1600×900 BGRA contract and requires the Linux DVM DRM/KMS
-  double-buffered relay to become active. It does not imply physical GPU
-  passthrough or enable a general L0 display control plane.
+- `--gui-dvm-surfaces` adds the private launch-owned production
+  `ivshmem-doorbell` topology to both KVM guests. Its broker accepts exactly
+  two same-UID QEMU peers and two fixed reverse-vector meanings, then passes
+  only the host-created control records and eventfds. A separate 32 MiB
+  cacheable pixel pool is writable in RustOS QEMU and read-only/ROM in the DVM.
+  RustOS copies a complete immutable 1600×900 BGRA snapshot, fences the slot,
+  then rings the DVM; the Linux relay reconstructs a
+  pre-load invitation through its validating UIO module, returns a readiness
+  acknowledgement bound to that exact generation, and permits one validated
+  RELEASE until the host ACK. The second reverse vector revokes availability;
+  restart clears confirmation and a saturated pool re-invites its newest READY
+  slot. The relay maps only the pixel pages WB read-only, writes only inactive
+  local scanout buffers, and attaches an exact full-frame or bounded-damage
+  `FB_DAMAGE_CLIPS` blob to each atomic page flip. V2, polling, synchronous
+  `DirtyFB`, and a native-GPU fallback are rejected.
+  This does not imply physical GPU passthrough or create a general L0 display
+  control plane.
+  This KVM validation profile explicitly disables guest x2APIC because the
+  current RustOS MSI-X receiver requires an xAPIC destination until a complete
+  interrupt-remapping substrate exists; the kernel fails closed on x2APIC.
 - `--exercise-input` is the explicit exception for bounded integration tests.
   It adds a DVM kernel command-line flag; the DVM agent then creates a local
   `uinput` device and consumes it through its ordinary evdev relay. RustOS
-  must log both ring-3 `inputd` keyboard and pointer ingress markers. It never
-  enables QMP or a host-to-DVM input endpoint, and normal DVM boots do not run
-  this self-test.
+  must log both ring-3 `inputd` keyboard and pointer ingress markers. It emits
+  no printable key or click: one F12 proof is followed by pointer-only motion,
+  tracing a 192-pixel square, so the test cannot type into a focused shell or
+  masquerade as a trembling cursor. It neither enables QMP nor a host-to-DVM
+  input endpoint, and normal DVM boots do not run this self-test.
 - `--dvm-network-shmem` adds a private 512 KiB fixed-ring `ivshmem-plain`
   aperture to both guests. RustOS owns only bounded Ethernet-frame ring access;
   Linux owns the virtio-net NIC and raw socket relay; `netd` retains socket/TCP

@@ -12,7 +12,12 @@ start_relay() {
         return 0
     fi
     rm -f "$pid_file"
-    "$command" serve &
+    # SysV init executes this script without a stable controlling terminal.
+    # Keep the relay detached, but make its bounded lifecycle diagnostics
+    # observable on the guest's serial console.  A silently daemonized GUI
+    # relay makes a failed capability handshake indistinguishable from a
+    # healthy idle relay and invalidates the host readiness gate.
+    "$command" serve </dev/null >/dev/console 2>&1 &
     echo "$!" >"$pid_file"
 }
 
@@ -43,11 +48,15 @@ stop_relay() {
 
 start_relays() {
     mkdir -p "$run_dir"
-    # The display and Ethernet relays share one DVM boot lifecycle.  Their
-    # processes self-retry transient hardware readiness failures; this script
-    # owns the process lifetime so restart cannot leave duplicate consumers.
+    # The Ethernet relay is independent. The display relay is admitted only
+    # after the fixed-header MSI-X adapter is bound; generic UIO/INTx is not a
+    # compatibility path because it cannot receive ivshmem doorbells.
     start_relay net /usr/libexec/rustos-dvm-net
-    start_relay display /usr/libexec/rustos-dvm-display
+    if modprobe rustos_dvm_ivshmem_uio; then
+        start_relay display /usr/libexec/rustos-dvm-display
+    else
+        echo "rustos-dvm: display MSI-X UIO module unavailable; refusing display relay" >&2
+    fi
 }
 
 stop_relays() {

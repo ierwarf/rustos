@@ -132,6 +132,15 @@ pub fn wake_task(task_id: u64) -> bool {
     interrupts::without_interrupts(|| unsafe { scheduler_mut().wake_task(task_id) })
 }
 
+/// Permanently removes the current user task's base System-class admission.
+/// A reply-scoped IPC priority donation, if any, remains owned by that reply
+/// capability and therefore remains effective until the normal release path.
+pub fn demote_current_user_task_to_user_class() -> bool {
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().demote_current_user_task_to_user_class()
+    })
+}
+
 /// Associates a live synchronous IPC reply with a caller-to-server priority
 /// donation. The reply/cancellation paths revoke it before waking the caller.
 pub fn inherit_ipc_priority(reply: u64, donor_task_id: u64, receiver_task_id: u64) -> bool {
@@ -169,6 +178,12 @@ pub fn release_ipc_priorities_for_process(process_id: u64) {
 /// to the receiver), eliminating round-robin latency on IPC roundtrips.
 pub fn set_next_pick_hint(task_id: u64) {
     interrupts::without_interrupts(|| unsafe { scheduler_mut().set_next_pick_hint(task_id) })
+}
+
+pub fn set_next_process_pick_hint(process_id: u64) -> Option<u64> {
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().set_next_process_pick_hint(process_id)
+    })
 }
 
 pub fn set_next_spawn_pick_hint(task_id: u64) {

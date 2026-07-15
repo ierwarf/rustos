@@ -176,6 +176,6 @@ pub(crate) use backend::{
     console_write, enter_kernel_vfs_runtime, enter_userspace_runtime, gui_init,
     gui_try_present_panic_blackout, init_block_devices, init_boot_info, init_dvm_display_provider,
     init_dvm_network_provider, init_input, init_vfs, input_debug_snapshot,
-    register_boot_volume_opener, system_console_session_raw, tty_init,
-    userspace_display_active, userspace_ready,
+    register_boot_volume_opener, system_console_session_raw, tty_init, userspace_display_active,
+    userspace_ready,
 };

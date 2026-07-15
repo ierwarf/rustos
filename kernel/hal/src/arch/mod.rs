@@ -1,7 +1,9 @@
 pub mod acpi;
 pub mod asmtools;
+pub mod clock;
 pub mod gdt;
 pub mod idt;
+pub mod msi;
 pub mod pci;
 pub mod pic;
 pub mod pit;

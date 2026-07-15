@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -17,6 +17,7 @@ use crate::sys::{
     ConsoleSessionHandle, ConsoleSessionInfo, ConsoleStateInfo, InputEvent,
     MAX_CONSOLE_SNAPSHOT_BYTES, console_get_state, console_send_input_event, console_set_focus,
     console_snapshot_session_output, console_snapshot_sessions, open_console,
+    require_background_thread_class,
 };
 use crate::wayland::WaylandCompositor;
 use runtime_control::RuntimeRunningProgram;
@@ -146,15 +147,11 @@ impl ConsoleCommandDispatcher {
     }
 }
 
-pub(crate) fn start_console_command_dispatcher() -> ConsoleCommandDispatcher {
+pub(crate) fn start_console_command_dispatcher(console_fd: OwnedFd) -> ConsoleCommandDispatcher {
     let (sender, receiver) = mpsc::sync_channel::<ConsoleCommand>(CONSOLE_COMMAND_QUEUE_CAPACITY);
     let stats = Arc::new(ConsoleCommandStats::new());
     let worker_stats = Arc::clone(&stats);
     thread::spawn(move || {
-        let Ok(console_fd) = open_console() else {
-            worker_stats.errors.fetch_add(1, Ordering::Relaxed);
-            return;
-        };
         while let Ok(command) = receiver.recv() {
             worker_stats
                 .active_started_ms
@@ -193,6 +190,7 @@ struct ConsoleSessionOutput {
 pub(crate) fn start_console_refresh_worker() -> Receiver<ConsoleRefresh> {
     let (sender, receiver) = mpsc::sync_channel(2);
     thread::spawn(move || {
+        require_background_thread_class();
         let Ok(console_fd) = open_console() else {
             return;
         };

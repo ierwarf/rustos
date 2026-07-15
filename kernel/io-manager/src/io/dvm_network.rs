@@ -26,7 +26,7 @@ static STATE: KernelWaitLock<Option<DvmNetworkState>> = KernelWaitLock::new(None
 // The fixed ivshmem header and counters are DVM-writable after installation.
 // They can describe bounded frame state, but cannot attest that the L0-vetted
 // DVM control session is still alive.  This lease is changed only by the
-// authenticated RDI1 session markers delivered over L0's dedicated COM2 path.
+// authenticated RDI1 session markers delivered through L0's input-ring path.
 static CONTROL_LEASE: KernelWaitLock<ControlLease> = KernelWaitLock::new(ControlLease::inactive());
 
 struct DvmNetworkState {
@@ -265,10 +265,10 @@ pub(crate) fn receive(out: &mut [u8]) -> Result<usize, PacketError> {
 /// Admit a network lease from an L0-authenticated RDI1 session start.
 ///
 /// This is intentionally a control-plane signal only. Ethernet frames remain
-/// on the bounded ivshmem transport; COM2 never becomes a network data proxy.
-/// The present single-DVM topology shares this authenticated lifecycle with
-/// input. A future independently supervised network DVM needs its own
-/// domain-specific authenticated lifecycle signal before it can use this API.
+/// on the bounded ivshmem transport; the input ring never becomes a network proxy.
+/// Only the combined-DVM topology is admitted: it shares this authenticated
+/// lifecycle with input. An independently supervised network DVM is forbidden
+/// from using this API because it has no domain-specific authenticated lease.
 pub(crate) fn activate_authenticated_control(epoch: u32) -> bool {
     if epoch == 0 {
         return false;

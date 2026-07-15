@@ -7,8 +7,8 @@ Models authenticated control-lease gating for the fixed DVM Ethernet ring.
 Concrete owners and source anchors:
   * L0-authenticated RDI1 session lifecycle:
     libs/driver-domain-host/src/lib.rs
-  * COM2 receiver and exact epoch ordering:
-    kernel/io-manager/src/input/dvm_serial.rs
+  * host-owned input-ring receiver and exact epoch ordering:
+    kernel/io-manager/src/input/dvm_frames.rs
   * ivshmem network gate:
     kernel/io-manager/src/io/dvm_network.rs
 

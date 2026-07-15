@@ -156,6 +156,15 @@ pub mod block {
         let mut device = crate::storage::block::FatRegistryDevice::new(handle);
         device.read_blocks(lba, out)
     }
+
+    pub fn read_boot_extent_file_range(
+        path: &str,
+        offset: u64,
+        out: &mut [u8],
+    ) -> storage_core::IoResult<Option<usize>> {
+        crate::storage::boot_volume::read_file_range_from_extents(path, offset, out)
+            .map_err(|_| storage_core::StorageError::DeviceFault)
+    }
 }
 
 pub mod boot {
@@ -263,6 +272,14 @@ pub mod input {
         pub fn disarm_input_waiter(task_id: u64) {
             crate::input::event_queue::disarm_input_waiter(task_id);
         }
+
+        pub fn arm_inputd_ingestion_waiter(task_id: u64) -> bool {
+            crate::input::event_queue::arm_inputd_ingestion_waiter(task_id)
+        }
+
+        pub fn disarm_inputd_ingestion_waiter(task_id: u64) {
+            crate::input::event_queue::disarm_inputd_ingestion_waiter(task_id);
+        }
     }
 
     pub fn init() {
@@ -276,6 +293,9 @@ pub mod input {
         crate::input::service_dvm_input_pending()
     }
 
+    pub fn mark_dvm_policy_consumer_ready() -> bool {
+        crate::input::mark_dvm_policy_consumer_ready()
+    }
 }
 
 pub mod device {
@@ -344,6 +364,7 @@ pub mod session {
 pub mod io {
     pub mod gui {
         pub type GuiDisplayInfo = crate::io::gui::GuiDisplayInfo;
+        pub type GuiPresentOutcome = crate::io::gui::GuiPresentOutcome;
 
         pub fn display_info() -> Option<GuiDisplayInfo> {
             crate::io::gui::display_info()
@@ -358,7 +379,7 @@ pub mod io {
             width: usize,
             height: usize,
             stride_bytes: usize,
-        ) -> bool {
+        ) -> GuiPresentOutcome {
             crate::io::gui::present_userspace_frame_from_kernel_bgra8888(
                 src_ptr,
                 width,
@@ -376,7 +397,7 @@ pub mod io {
             y: usize,
             rect_width: usize,
             rect_height: usize,
-        ) -> bool {
+        ) -> GuiPresentOutcome {
             crate::io::gui::present_userspace_frame_rect_from_kernel_bgra8888(
                 src_ptr,
                 width,
@@ -392,7 +413,6 @@ pub mod io {
         pub fn try_present_panic_blackout() -> bool {
             crate::io::gui::try_present_panic_blackout()
         }
-
     }
 }
 

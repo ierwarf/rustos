@@ -31,6 +31,15 @@ pub struct GuiDisplayInfo {
     pub generation: u64,
 }
 
+/// Result of one non-blocking compositor present attempt.  Pool saturation is
+/// normal flow control, not evidence that the display provider disappeared.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuiPresentOutcome {
+    Presented,
+    Backpressured,
+    Unavailable,
+}
+
 pub fn try_present_panic_blackout() -> bool {
     backend::try_with_framebuffer(|framebuffer| {
         framebuffer.fill(Rgb888::new(0, 0, 0));
@@ -105,6 +114,10 @@ pub unsafe extern "C" fn register_driver_framebuffer(
 }
 
 pub fn display_info() -> Option<GuiDisplayInfo> {
+    // A GUI-DVM peer may attach after the early PCI probe. This call is an
+    // explicit consumer lifecycle boundary; the transport owns a small fixed
+    // retry budget and otherwise remains unavailable without a fallback.
+    crate::io::dvm_display::ensure_installed_before_present();
     backend::display_info()
 }
 
@@ -121,10 +134,10 @@ pub fn present_userspace_frame_from_kernel_bgra8888(
     width: usize,
     height: usize,
     stride_bytes: usize,
-) -> bool {
+) -> GuiPresentOutcome {
     let claimed_boot_console = begin_userspace_display_transition();
     let presented = backend::present_bgra8888_from_kernel(src_ptr, width, height, stride_bytes);
-    if presented {
+    if presented == GuiPresentOutcome::Presented {
         finish_userspace_display_transition();
     } else if claimed_boot_console {
         USERSPACE_DISPLAY_MODE.store(DISPLAY_MODE_BOOT_CONSOLE, Ordering::Release);
@@ -164,7 +177,7 @@ pub fn present_userspace_frame_rect_from_kernel_bgra8888(
     y: usize,
     rect_width: usize,
     rect_height: usize,
-) -> bool {
+) -> GuiPresentOutcome {
     let claimed_boot_console = begin_userspace_display_transition();
     let presented = backend::present_bgra8888_rect_from_kernel(
         src_ptr,
@@ -178,7 +191,7 @@ pub fn present_userspace_frame_rect_from_kernel_bgra8888(
             height: rect_height,
         },
     );
-    if presented {
+    if presented == GuiPresentOutcome::Presented {
         finish_userspace_display_transition();
     } else if claimed_boot_console {
         USERSPACE_DISPLAY_MODE.store(DISPLAY_MODE_BOOT_CONSOLE, Ordering::Release);

@@ -138,16 +138,16 @@ pub(crate) fn present_surface(
     validate_surface_mapping(surface, region)?;
     let _ = address_space;
     let (ptr, _) = surface_kernel_ptr(surface)?;
-    let presented = gui::present_userspace_frame_from_kernel_bgra8888(
+    match gui::present_userspace_frame_from_kernel_bgra8888(
         ptr,
         surface.width() as usize,
         surface.height() as usize,
         surface.stride_bytes() as usize,
-    );
-    if !presented {
-        return Err(DeviceError::DisplayUnavailable);
+    ) {
+        gui::GuiPresentOutcome::Presented => Ok(()),
+        gui::GuiPresentOutcome::Backpressured => Err(DeviceError::TryAgain),
+        gui::GuiPresentOutcome::Unavailable => Err(DeviceError::DisplayUnavailable),
     }
-    Ok(())
 }
 
 pub(crate) fn present_surface_rect(
@@ -176,7 +176,7 @@ pub(crate) fn present_surface_rect(
         .ok_or(DeviceError::InvalidArgument)?;
     validate_surface_mapping(surface, region)?;
     let (ptr, _) = surface_kernel_ptr(surface)?;
-    let presented = gui::present_userspace_frame_rect_from_kernel_bgra8888(
+    match gui::present_userspace_frame_rect_from_kernel_bgra8888(
         ptr,
         surface.width() as usize,
         surface.height() as usize,
@@ -185,11 +185,11 @@ pub(crate) fn present_surface_rect(
         y,
         width,
         height,
-    );
-    if !presented {
-        return Err(DeviceError::DisplayUnavailable);
+    ) {
+        gui::GuiPresentOutcome::Presented => Ok(()),
+        gui::GuiPresentOutcome::Backpressured => Err(DeviceError::TryAgain),
+        gui::GuiPresentOutcome::Unavailable => Err(DeviceError::DisplayUnavailable),
     }
-    Ok(())
 }
 
 fn align_up_u64(value: u64, align: u64) -> Option<u64> {

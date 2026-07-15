@@ -19,8 +19,9 @@ use rustos_user_abi::syscall::{
 use super::{
     boot_line, AT_FDCWD, CONSOLE_PATH, CONSOLE_SESSION_STATE_LOADING_IMAGE,
     CONSOLE_SESSION_STATE_RUNNING, CONSOLE_SESSION_STATE_SPAWNING, DEFAULT_USER_TASK_WEIGHT_MICROS,
-    IDLE_POLL_INTERVAL, LOADER_ENDPOINT_CACHE, MIN_EFFECTIVE_TASK_WEIGHT_MICROS, O_RDWR,
-    RETRY_BACKOFF, SYS_OPENAT, UI_SERVER_EXEC_PATH,
+    IDLE_POLL_INTERVAL, LOADER_ENDPOINT_CACHE, MAX_UNTRUSTED_TASK_WEIGHT_MICROS,
+    MIN_EFFECTIVE_TASK_WEIGHT_MICROS, O_RDWR, RETRY_BACKOFF, SYS_OPENAT, UI_SERVER_EXEC_PATH,
+    UI_SERVER_TASK_WEIGHT_MICROS,
 };
 use super::{BrokerState, LaunchEntry, RunningProcess};
 
@@ -88,7 +89,8 @@ pub(super) fn spawn_tracked_process(
         .as_str(),
     );
     if entry.exec == UI_SERVER_EXEC_PATH {
-        if let Err(err) = report_rootd_service_lease(IPC_SERVICE_UISERVER, entry.exec.as_str(), pid) {
+        if let Err(err) = report_rootd_service_lease(IPC_SERVICE_UISERVER, entry.exec.as_str(), pid)
+        {
             // The child is still start-suspended, so it cannot race endpoint
             // registration against the failed supervisor transaction. Make
             // it runnable solely so the normal signal/lifecycle path can
@@ -322,7 +324,7 @@ fn build_loader_spawn_request(
                 0
             },
         console_session: session_handle,
-        weight_micros: effective_task_weight_micros(weight_micros),
+        weight_micros: admitted_task_weight_micros(exec_path, weight_micros),
         exec_path_len: exec_bytes.len() as u32,
         argv_count: u16::try_from(argv.len()).map_err(|_| libc::E2BIG)?,
         env_count: u16::try_from(env.len()).map_err(|_| libc::E2BIG)?,
@@ -413,13 +415,24 @@ fn copy_cstring_blob(values: &[CString], dest: &mut [u8], capacity: usize) -> Re
     u32::try_from(offset).map_err(|_| libc::E2BIG)
 }
 
-fn effective_task_weight_micros(weight_micros: u64) -> u64 {
+/// Runtime catalog metadata can request ordinary fair-share weight, but it
+/// cannot grant strict System scheduling. The sole exception is the fixed UI
+/// server executable, whose launch is created by the trusted session path and
+/// whose exact value is pinned here. This prevents a writable/compromised
+/// desktop entry from starving input, bootstrap, or recovery by requesting a
+/// large `X-RustOS-WeightMicros` value.
+fn admitted_task_weight_micros(exec_path: &str, weight_micros: u64) -> u64 {
+    if exec_path == UI_SERVER_EXEC_PATH {
+        return UI_SERVER_TASK_WEIGHT_MICROS;
+    }
     let requested = if weight_micros == 0 {
         DEFAULT_USER_TASK_WEIGHT_MICROS
     } else {
         weight_micros
     };
-    requested.max(MIN_EFFECTIVE_TASK_WEIGHT_MICROS)
+    requested
+        .max(MIN_EFFECTIVE_TASK_WEIGHT_MICROS)
+        .min(MAX_UNTRUSTED_TASK_WEIGHT_MICROS)
 }
 
 pub(super) fn lookup_service_endpoint(service_id: u64) -> i64 {
@@ -631,7 +644,30 @@ fn last_errno() -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_exec_argv, build_exec_env_with_defaults};
+    use super::{admitted_task_weight_micros, build_exec_argv, build_exec_env_with_defaults};
+    use crate::{
+        MAX_UNTRUSTED_TASK_WEIGHT_MICROS, UI_SERVER_EXEC_PATH, UI_SERVER_TASK_WEIGHT_MICROS,
+    };
+
+    #[test]
+    fn catalog_weight_cannot_promote_an_untrusted_program() {
+        assert_eq!(
+            admitted_task_weight_micros("apps/shell/shell.elf", u64::MAX),
+            MAX_UNTRUSTED_TASK_WEIGHT_MICROS
+        );
+    }
+
+    #[test]
+    fn only_the_exact_ui_server_path_receives_system_weight() {
+        assert_eq!(
+            admitted_task_weight_micros(UI_SERVER_EXEC_PATH, 1),
+            UI_SERVER_TASK_WEIGHT_MICROS
+        );
+        assert_eq!(
+            admitted_task_weight_micros("services/uiserver/uiserver.elf.bak", 2_000),
+            MAX_UNTRUSTED_TASK_WEIGHT_MICROS
+        );
+    }
 
     #[test]
     fn build_exec_argv_defaults_to_exec_path() {

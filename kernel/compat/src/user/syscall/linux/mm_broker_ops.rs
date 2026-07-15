@@ -12,8 +12,7 @@ use rustos_user_abi::syscall::{
     MM_BROKER_OP_MAP_DEVICE_SHARED, MM_BROKER_OP_MAP_FILE_PRIVATE, MM_BROKER_OP_MAP_MEMFD_SHARED,
     MM_BROKER_OP_PROTECT, MM_BROKER_OP_QUERY_LAYOUT, MM_BROKER_OP_UNMAP, MM_BROKER_PATH_CAPACITY,
     RustosMmBrokerArgs, RustosMmFdBrokerResult, RustosMmLayoutBrokerResult,
-    RustosMmMapBrokerResult,
-    VFS_IPC_PAYLOAD_CAPACITY,
+    RustosMmMapBrokerResult, VFS_IPC_PAYLOAD_CAPACITY,
 };
 
 use crate::user::handles::{KernelHandle, RemoteVfsHandleKind};
@@ -24,7 +23,7 @@ const FILE_COPY_CHUNK: usize = VFS_IPC_PAYLOAD_CAPACITY;
 
 #[derive(Clone)]
 enum FileMappingSource {
-    Remote { remote_id: u64 },
+    Remote { remote_id: u64, path: String },
 }
 
 pub(super) fn syscall_linux_rustos_mm_broker(args_ptr: u64) -> u64 {
@@ -387,6 +386,7 @@ fn file_mapping_source(target_pid: u64, fd: u64) -> Result<FileMappingSource, i6
             KernelHandle::RemoteVfs(remote) if remote.kind() == RemoteVfsHandleKind::File => {
                 Ok(FileMappingSource::Remote {
                     remote_id: remote.remote_id(),
+                    path: remote.path(),
                 })
             }
             _ => Err(LINUX_EINVAL),
@@ -424,18 +424,29 @@ fn copy_file_mapping(
     while copied < len {
         let count = (len - copied).min(chunk.len());
         let read = match source {
-            FileMappingSource::Remote { remote_id } => {
-                match offload_ops::call_remote_vfs_read_bytes(
-                    *remote_id,
-                    offset.saturating_add(copied as u64),
-                    count,
+            FileMappingSource::Remote { remote_id, path } => {
+                let file_offset = offset.saturating_add(copied as u64);
+                match kernel_io_manager::api::block::read_boot_extent_file_range(
+                    path,
+                    file_offset,
+                    &mut chunk[..count],
                 ) {
-                    Ok(bytes) => {
-                        let read = bytes.len().min(count);
-                        chunk[..read].copy_from_slice(&bytes[..read]);
-                        read
+                    Ok(Some(read)) => read,
+                    Ok(None) => {
+                        match offload_ops::call_remote_vfs_read_bytes(
+                            *remote_id,
+                            file_offset,
+                            count,
+                        ) {
+                            Ok(bytes) => {
+                                let read = bytes.len().min(count);
+                                chunk[..read].copy_from_slice(&bytes[..read]);
+                                read
+                            }
+                            Err(err) => return Err(err),
+                        }
                     }
-                    Err(err) => return Err(err),
+                    Err(_) => return Err(LINUX_EIO),
                 }
             }
         };

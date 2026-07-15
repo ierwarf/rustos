@@ -469,7 +469,12 @@ pub fn syscall_linux_vfs_umount2(target_ptr: u64, flags: u64) -> u64 {
 }
 
 pub fn syscall_linux_ioctl(fd: u64, request_number: u64, arg: u64) -> u64 {
-    let route = if ioctl_is_direct_display_present(request_number) {
+    let ui_policy_owner = ipc_ops::current_process_has_service_capability(
+        rustos_user_abi::syscall::IPC_SERVICE_CAP_UI_POLICY,
+    );
+    let route = if ioctl_is_direct_display_present(request_number)
+        || (ui_policy_owner && ioctl_is_display_policy_request(request_number))
+    {
         rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_DIRECT
     } else {
         match ioctl_route_via_devmgrd(fd, request_number) {
@@ -515,6 +520,16 @@ fn ioctl_is_direct_display_present(request_number: u64) -> bool {
     matches!(
         request_number,
         rustos_user_abi::device::DISPLAY_IOCTL_PRESENT
+            | rustos_user_abi::device::DISPLAY_IOCTL_PRESENT_RECT
+    )
+}
+
+fn ioctl_is_display_policy_request(request_number: u64) -> bool {
+    matches!(
+        request_number,
+        rustos_user_abi::device::DISPLAY_IOCTL_GET_INFO
+            | rustos_user_abi::device::DISPLAY_IOCTL_CREATE_SURFACE
+            | rustos_user_abi::device::DISPLAY_IOCTL_PRESENT
             | rustos_user_abi::device::DISPLAY_IOCTL_PRESENT_RECT
     )
 }
@@ -1158,4 +1173,22 @@ fn write_current_sockopt_payload(
         .map_err(address_space_error_to_linux_errno)?;
     let len = payload.len() as u32;
     usermem::write_current_user_struct(optlen_ptr, &len).map_err(address_space_error_to_linux_errno)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ioctl_is_display_policy_request;
+
+    #[test]
+    fn ui_policy_direct_set_is_limited_to_display_contracts() {
+        assert!(ioctl_is_display_policy_request(
+            rustos_user_abi::device::DISPLAY_IOCTL_GET_INFO
+        ));
+        assert!(ioctl_is_display_policy_request(
+            rustos_user_abi::device::DISPLAY_IOCTL_CREATE_SURFACE
+        ));
+        assert!(!ioctl_is_display_policy_request(
+            rustos_user_abi::console::CONSOLE_IOCTL_GET_STATE
+        ));
+    }
 }

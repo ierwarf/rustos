@@ -10,8 +10,16 @@ pub mod arch {
         pub use crate::arch::asmtools::*;
     }
 
+    pub mod clock {
+        pub use crate::arch::clock::*;
+    }
+
     pub mod gdt {
         pub use crate::arch::gdt::*;
+    }
+
+    pub mod msi {
+        pub use crate::arch::msi::*;
     }
 
     pub mod pci {
@@ -48,6 +56,10 @@ pub mod boot {
 
     pub fn init_acpi(boot_info_ptr: *const BootInfo) {
         crate::arch::acpi::init(boot_info_ptr);
+    }
+
+    pub fn init_clocksource() -> Option<crate::arch::clock::ClockSourceInfo> {
+        crate::arch::clock::init()
     }
 
     /// # Safety
@@ -97,6 +109,7 @@ pub mod interrupts {
 
     pub fn init_pic() {
         crate::arch::pic::init();
+        let _ = crate::arch::msi::init();
         kernel_lowlevel::interrupts::register_timer_interrupt_dispatch(
             super::timer_interrupt_default_dispatch,
         );
@@ -145,7 +158,9 @@ pub use crate::hooks::{
     CurrentUserSnapshot, HeartbeatHooks, HeartbeatSnapshot, InputEventQueueDebugSnapshot,
     InterruptHooks, TaskHooks, UserFaultDisposition,
 };
-pub use boot::{call_with_stack, enter_higher_half, init_acpi, init_gdt, init_idt};
+pub use boot::{
+    call_with_stack, enter_higher_half, init_acpi, init_clocksource, init_gdt, init_idt,
+};
 pub use cpu::{current_rip, init_simd, simd_mode_name};
 pub use interrupts::{
     disable_interrupts, init_pic, register_heartbeat_hooks, register_interrupt_hooks,

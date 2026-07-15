@@ -114,8 +114,9 @@ mod hal_hooks {
             current_user_snapshot: Some(current_user_snapshot),
             is_scheduler_initialized: Some(ps_api::is_initialized),
             current_task_id: Some(ps_api::current_task_id),
-            current_user_thread_id: Some(ps_api::current_user_id),
-            block_current_user_task: Some(ps_api::block_current_user_task),
+            arm_block_current_task: Some(ps_api::arm_block_current_task),
+            cancel_block_current_task: Some(ps_api::cancel_block_current_task),
+            commit_block_current_task: Some(ps_api::commit_block_current_task),
             wake_user_task: Some(ps_api::wake_user_task),
             yield_now: Some(ps_api::yield_now),
         });

@@ -47,13 +47,8 @@ pub fn log_args(service: &str, category: LogCategory, level: LogLevel, args: fmt
         args
     );
     line.push('\n');
-    let emitted = unsafe {
-        libc::syscall(
-            SYS_RUSTOS_DEBUG_PRINT,
-            line.as_ptr() as usize,
-            line.len(),
-        )
-    };
+    let emitted =
+        unsafe { libc::syscall(SYS_RUSTOS_DEBUG_PRINT, line.as_ptr() as usize, line.len()) };
     if emitted < 0 {
         let _ = std::io::stderr().write_all(line.as_bytes());
     }

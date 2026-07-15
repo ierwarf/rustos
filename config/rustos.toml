@@ -26,8 +26,8 @@ heartbeat = "info"
 
 [fault_injection]
 # Runtime fault profiles are enabled for hardening runs. The default rule is
-# non-failing; replace "off" with fail, drop-every:N, fail-after:N, rate:N, or
-# delay-ms:N to exercise a fault path.
+# non-failing; replace "off" with fail, drop-every:N, fail-after:N, or rate:N
+# to exercise a fault path.
 enabled = true
 rules = [
     "alloc.frame=off",

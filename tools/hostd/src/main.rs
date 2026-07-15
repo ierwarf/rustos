@@ -7,8 +7,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use rustos_driver_domain_host::{
     ControlContract, ControlSecret, DeviceClass, DeviceTransport, DriverDomainFleetPolicy,
-    DriverDomainPolicy, FileLeaseStore, HostControlListener, IommuTopology, LaunchPlan,
-    ReleaseAuthorization, SysfsVfioOps, UnixInputSink, ValidatedLease, VfioOps, VfioReleaseBinding,
+    DriverDomainPolicy, FileLeaseStore, HostControlListener, InputRingSink, IommuTopology,
+    LaunchPlan, ReleaseAuthorization, SysfsVfioOps, ValidatedLease, VfioOps, VfioReleaseBinding,
     acquire_vfio_lease, inspect_vfio_lease, inspect_vfio_lease_preflight, restore_vfio_lease,
 };
 
@@ -67,7 +67,12 @@ enum Command {
         #[arg(long)]
         device_policy: PathBuf,
         #[arg(long)]
-        rustos_input_socket: PathBuf,
+        /// Launch-owned fixed 128 KiB input-ring backing, mapped only by L0 and RustOS.
+        #[arg(long)]
+        input_ring: PathBuf,
+        /// Launch-owned ivshmem-doorbell socket after RustOS has claimed peer 0.
+        #[arg(long)]
+        input_doorbell: PathBuf,
         /// Maximum time to establish the DVM and RustOS relay endpoints.
         #[arg(long, default_value_t = 30)]
         timeout_secs: u64,
@@ -170,16 +175,17 @@ fn main() -> Result<()> {
             control_contract,
             control_secret,
             device_policy,
-            rustos_input_socket,
+            input_ring,
+            input_doorbell,
             timeout_secs,
             once,
         } => {
             let lease = validate_plan(&plan, &sysfs_root)?;
             let policy = DriverDomainPolicy::from_env_file(&device_policy)?;
             policy.validate_for_lease(&lease)?;
-            if policy.transport_for(DeviceClass::Input) != DeviceTransport::Rdi2Com2 {
+            if policy.transport_for(DeviceClass::Input) != DeviceTransport::InputRingMsix {
                 anyhow::bail!(
-                    "driver-domain policy does not enable rdi2-com2 input transport for {}",
+                    "driver-domain policy does not enable input-ring-msix transport for {}",
                     lease.domain_id
                 );
             }
@@ -189,12 +195,12 @@ fn main() -> Result<()> {
             let listener =
                 HostControlListener::bind(lease.dvm_guest_cid, contract, control_secret)?;
             loop {
-                let mut sink = match UnixInputSink::connect(&rustos_input_socket, timeout) {
+                let mut sink = match InputRingSink::connect(&input_doorbell, &input_ring, timeout) {
                     Ok(sink) => sink,
                     Err(error) if once => return Err(error),
                     Err(error) => {
                         eprintln!(
-                            "rustos-hostd: RustOS input endpoint unavailable domain={} reason={error:#}; retrying",
+                            "rustos-hostd: fixed RustOS input ring unavailable domain={} reason={error:#}; retrying",
                             lease.domain_id
                         );
                         std::thread::sleep(Duration::from_secs(1));

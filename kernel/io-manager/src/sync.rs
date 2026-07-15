@@ -17,6 +17,19 @@ const MAX_WAITERS: usize = 64;
 const KERNEL_SPIN_LOCK_IRQ_OFF_SPIN_LIMIT: usize = 100_000;
 const KERNEL_SPIN_LOCK_SCHED_SPIN_LIMIT: usize = 1_000_000;
 
+#[cfg(test)]
+static NEXT_TEST_LOCK_OWNER: AtomicUsize = AtomicUsize::new(1);
+
+#[cfg(test)]
+std::thread_local! {
+    /// Host unit tests execute concurrently without RustOS task identities.
+    /// Giving every host thread token 1 makes ordinary contention look like a
+    /// recursive acquire and can drive the diagnostic path through guest-only
+    /// scheduler state. Preserve recursive-acquire detection with one stable,
+    /// nonzero token per host test thread instead.
+    static TEST_LOCK_OWNER: usize = NEXT_TEST_LOCK_OWNER.fetch_add(1, Ordering::Relaxed);
+}
+
 pub(crate) struct KernelSpinLock<T: ?Sized> {
     owner: AtomicUsize,
     owner_depth: AtomicUsize,
@@ -686,7 +699,7 @@ fn can_block_current_task() -> bool {
 fn current_lock_owner_token() -> usize {
     #[cfg(test)]
     {
-        1
+        TEST_LOCK_OWNER.with(|owner| *owner)
     }
 
     #[cfg(not(test))]

@@ -26,7 +26,11 @@ pub const DIRECT_MAP_PHYS_LIMIT: u64 = 512 * 1024 * 1024 * 1024;
 const MAX_PAGE_BLOCK: u64 = DIRECT_MAP_PHYS_LIMIT / HUGE_2MIB;
 const KERNEL_HIGHER_HALF_PML4_INDEX: usize = 256;
 const MMIO_WINDOW_PML4_INDEX: usize = KERNEL_HIGHER_HALF_PML4_INDEX + 1;
-const MMIO_WINDOW_SLOTS: usize = 16;
+// One page-directory is dedicated to high PCI apertures that cannot use the
+// 512 GiB direct map.  Track its complete, bounded 1 GiB reach.  The old
+// 16-entry/32 MiB budget was exactly consumed by the production GUI-DVM pool,
+// making the next fixed input/network BAR impossible to map.
+const MMIO_WINDOW_SLOTS: usize = ENTRIES_PER_TABLE;
 const DIRECT_MAP_SPLIT_TABLES: usize = 128;
 pub use crate::lowlevel::address::KERNEL_VIRT_OFFSET;
 const MMIO_WINDOW_BASE: u64 = KERNEL_VIRT_OFFSET + (1_u64 << 39);
@@ -231,9 +235,7 @@ impl<const SIZE_GB: usize> PML4<SIZE_GB> {
     }
 
     fn unmap_mmio_blocks(&mut self, virt_base: u64, block_count: usize) -> bool {
-        if block_count == 0
-            || virt_base < MMIO_WINDOW_BASE
-            || !virt_base.is_multiple_of(HUGE_2MIB)
+        if block_count == 0 || virt_base < MMIO_WINDOW_BASE || !virt_base.is_multiple_of(HUGE_2MIB)
         {
             return false;
         }

@@ -649,7 +649,11 @@ fn syscall4(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
 fn register_service_endpoint(service_id: u64, endpoint: u64) -> i64 {
     let mut last = 0;
     for _ in 0..65_536 {
-        last = syscall2(SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, service_id, endpoint);
+        last = syscall2(
+            SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
+            service_id,
+            endpoint,
+        );
         if last >= 0 {
             return last;
         }

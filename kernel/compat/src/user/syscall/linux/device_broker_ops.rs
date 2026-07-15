@@ -151,6 +151,7 @@ pub(in crate::user::syscall::linux) fn device_sysop_error_to_linux_errno(
         DeviceSysopError::DisplayUnavailable => LINUX_ENODEV,
         DeviceSysopError::NotFound => LINUX_ENOENT,
         DeviceSysopError::StaleSurface => LINUX_ESTALE,
+        DeviceSysopError::TryAgain => LINUX_EAGAIN,
         DeviceSysopError::Unsupported => LINUX_ENOSYS,
     }
 }

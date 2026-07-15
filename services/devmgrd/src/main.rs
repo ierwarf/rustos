@@ -6,6 +6,11 @@ use std::thread;
 use std::time::Duration;
 
 use rustos_user_abi::syscall::{
+    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, DevmgrdDeviceIoctlRequest,
+    DevmgrdDeviceIoctlResponse, DevmgrdDeviceOpenRequest, DevmgrdDeviceOpenResponse,
+    DevmgrdIpcRequest, DevmgrdIpcResponse, DevmgrdNodeEntry, IpcReplyWithHandlesArgs,
+    RustosDeviceIoctlBrokerArgs, RustosDeviceOpenBrokerArgs,
     COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_EVENT_SUBSCRIBE, COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_MAP,
     COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_OPEN, COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_REGISTRY,
     COMMERCIAL_MAX_DEVMGRD_OP_IOCTL_AUTHORIZE, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
@@ -14,24 +19,20 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE, COMMERCIAL_MAX_SESSIOND_OP_FOREGROUND_FOCUS,
     COMMERCIAL_MAX_SESSIOND_OP_SESSION_GRAPH, COMMERCIAL_MAX_UISERVER_OP_DISPLAY_METADATA,
     COMMERCIAL_MAX_UISERVER_OP_PRESENT_POLICY, COMMERCIAL_MAX_UISERVER_OP_SURFACE_POLICY,
-    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, DEVMGRD_DEVICE_ACCESS_EVDEV,
-    DEVMGRD_DEVICE_ACCESS_NATIVE, DEVMGRD_DEVICE_ID_CONSOLE, DEVMGRD_DEVICE_ID_DISPLAY,
-    DEVMGRD_DEVICE_ID_INPUT, DEVMGRD_DEVICE_RIGHT_ADMIN, DEVMGRD_DEVICE_RIGHT_IOCTL,
-    DEVMGRD_DEVICE_RIGHT_MAP, DEVMGRD_DEVICE_RIGHT_READ, DEVMGRD_DEVICE_RIGHT_TRANSFER,
-    DEVMGRD_DEVICE_RIGHT_WRITE, DEVMGRD_IOCTL_LINUX_TTY_FIONREAD, DEVMGRD_IOCTL_LINUX_TTY_TCGETS,
-    DEVMGRD_IOCTL_LINUX_TTY_TCSETS, DEVMGRD_IOCTL_LINUX_TTY_TCSETSF,
-    DEVMGRD_IOCTL_LINUX_TTY_TCSETSW, DEVMGRD_IOCTL_ROUTE_DEVMGRD, DEVMGRD_IOCTL_ROUTE_DIRECT,
-    DEVMGRD_IOCTL_ROUTE_SESSIOND_COMMIT, DEVMGRD_IOCTL_ROUTE_SESSIOND_TTY, DEVMGRD_IPC_ABI_VERSION,
-    DEVMGRD_IPC_OP_IOCTL_AUTHORIZE, DEVMGRD_IPC_OP_IOCTL_ROUTE, DEVMGRD_IPC_OP_LOOKUP,
-    DEVMGRD_IPC_OP_OPEN, DEVMGRD_IPC_OP_READDIR, DEVMGRD_MAX_DIR_ENTRIES, DEVMGRD_NAME_CAPACITY,
-    DEVMGRD_NODE_KIND_DEVICE, DEVMGRD_NODE_KIND_DIR, DevmgrdDeviceIoctlRequest,
-    DevmgrdDeviceIoctlResponse, DevmgrdDeviceOpenRequest, DevmgrdDeviceOpenResponse,
-    DevmgrdIpcRequest, DevmgrdIpcResponse, DevmgrdNodeEntry, IPC_MAX_INLINE_BYTES,
-    IPC_SERVICE_DEVMGRD, IPC_SERVICE_SESSIOND, IPC_SERVICE_UISERVER, IpcReplyWithHandlesArgs,
-    RustosDeviceIoctlBrokerArgs, RustosDeviceOpenBrokerArgs, SYS_RUSTOS_DEBUG_PRINT,
-    SYS_RUSTOS_DEVICE_IOCTL_BROKER, SYS_RUSTOS_DEVICE_OPEN_BROKER, SYS_RUSTOS_IPC_CALL,
-    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_RECV,
+    DEVMGRD_DEVICE_ACCESS_EVDEV, DEVMGRD_DEVICE_ACCESS_NATIVE, DEVMGRD_DEVICE_ID_CONSOLE,
+    DEVMGRD_DEVICE_ID_DISPLAY, DEVMGRD_DEVICE_ID_INPUT, DEVMGRD_DEVICE_RIGHT_ADMIN,
+    DEVMGRD_DEVICE_RIGHT_IOCTL, DEVMGRD_DEVICE_RIGHT_MAP, DEVMGRD_DEVICE_RIGHT_READ,
+    DEVMGRD_DEVICE_RIGHT_TRANSFER, DEVMGRD_DEVICE_RIGHT_WRITE, DEVMGRD_IOCTL_LINUX_TTY_FIONREAD,
+    DEVMGRD_IOCTL_LINUX_TTY_TCGETS, DEVMGRD_IOCTL_LINUX_TTY_TCSETS,
+    DEVMGRD_IOCTL_LINUX_TTY_TCSETSF, DEVMGRD_IOCTL_LINUX_TTY_TCSETSW, DEVMGRD_IOCTL_ROUTE_DEVMGRD,
+    DEVMGRD_IOCTL_ROUTE_DIRECT, DEVMGRD_IOCTL_ROUTE_SESSIOND_COMMIT,
+    DEVMGRD_IOCTL_ROUTE_SESSIOND_TTY, DEVMGRD_IPC_ABI_VERSION, DEVMGRD_IPC_OP_IOCTL_AUTHORIZE,
+    DEVMGRD_IPC_OP_IOCTL_ROUTE, DEVMGRD_IPC_OP_LOOKUP, DEVMGRD_IPC_OP_OPEN, DEVMGRD_IPC_OP_READDIR,
+    DEVMGRD_MAX_DIR_ENTRIES, DEVMGRD_NAME_CAPACITY, DEVMGRD_NODE_KIND_DEVICE,
+    DEVMGRD_NODE_KIND_DIR, IPC_MAX_INLINE_BYTES, IPC_SERVICE_DEVMGRD, IPC_SERVICE_SESSIOND,
+    IPC_SERVICE_UISERVER, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_DEVICE_IOCTL_BROKER,
+    SYS_RUSTOS_DEVICE_OPEN_BROKER, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
+    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_RECV,
     SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
     SYS_RUSTOS_IPC_REPLY_WITH_HANDLES,
 };
@@ -155,6 +156,11 @@ fn serve(endpoint: u64, sessiond_workers: &SessiondIoctlWorkers) {
             }
             size if size == size_of::<DevmgrdDeviceIoctlRequest>() => {
                 let request = read_unaligned::<DevmgrdDeviceIoctlRequest>(&request);
+                if request.pid == 18
+                    && request.request == rustos_user_abi::device::DISPLAY_IOCTL_GET_INFO
+                {
+                    debug_line(format!("devmgrd: ui display get-info op={}", request.op).as_str());
+                }
                 if request.op == DEVMGRD_IPC_OP_IOCTL_AUTHORIZE
                     && sessiond_executes_ioctl(request.request)
                 {
@@ -712,6 +718,9 @@ fn authorize_session_ioctl(op: u16, request_number: u64) -> Result<(), i32> {
 }
 
 fn authorize_uiserver_ioctl(op: u16, request_number: u64) -> Result<(), i32> {
+    if request_number == rustos_user_abi::device::DISPLAY_IOCTL_GET_INFO {
+        debug_line("devmgrd: uiserver display policy call begin");
+    }
     let endpoint = syscall1(SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, IPC_SERVICE_UISERVER);
     if endpoint <= 0 {
         return Err(libc::ENOSYS);
@@ -730,6 +739,9 @@ fn authorize_uiserver_ioctl(op: u16, request_number: u64) -> Result<(), i32> {
         (&mut response as *mut CommercialMaxProtocolResponse) as u64,
         size_of::<CommercialMaxProtocolResponse>() as u64,
     );
+    if request_number == rustos_user_abi::device::DISPLAY_IOCTL_GET_INFO {
+        debug_line("devmgrd: uiserver display policy call returned");
+    }
     if result < 0 {
         return Err(last_errno());
     }

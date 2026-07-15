@@ -8,8 +8,9 @@ use driver_abi::PointerPacket;
 use heapless::Deque as HeaplessDeque;
 use rustos_user_abi::syscall::{
     INPUTD_ACCESS_NATIVE, INPUTD_INGRESS_FLAG_DVM_SOURCE, INPUTD_INGRESS_FLAG_RESET_STATE,
-    INPUTD_INGRESS_KIND_DVM_LINUX_KEY, INPUTD_INGRESS_KIND_POINTER_PACKET, InputIngressWire,
-    InputKeyboardEventWire, InputPointerPacketWire,
+    INPUTD_INGRESS_KIND_DVM_LINUX_KEY, INPUTD_INGRESS_KIND_POINTER_PACKET,
+    INPUTD_INGRESS_KIND_POINTER_POSITION, InputIngressWire, InputKeyboardEventWire,
+    InputPointerPacketWire, InputPointerPositionWire,
 };
 #[cfg(not(test))]
 use x86_64::instructions::interrupts;
@@ -39,6 +40,10 @@ static INPUT_INGRESS: Mutex<HeaplessDeque<InputIngressWire, INPUT_INGRESS_QUEUE_
     Mutex::new(HeaplessDeque::new());
 static INPUT_WAITERS: Mutex<[Option<u64>; INPUT_WAITERS_CAPACITY]> =
     Mutex::new([None; INPUT_WAITERS_CAPACITY]);
+// The capability-gated inputd ingestion worker must never compete with
+// untrusted application poll waiters for a finite shared slot. One dedicated
+// waiter is sufficient because input policy has exactly one service owner.
+static INPUTD_INGESTION_WAITER: AtomicU64 = AtomicU64::new(0);
 
 /// Queue a Linux `EV_KEY` transition only after the L0 DVM relay has checked
 /// its source, framing, sequence, and code range.  `inputd` owns Linux-keymap
@@ -94,8 +99,37 @@ pub(crate) fn submit_dvm_pointer_packet(packet: PointerPacket) -> bool {
     push_ingress(ingress)
 }
 
+/// Preserve an authenticated absolute tablet report as a position. Converting
+/// it into relative deltas loses the initial origin and can turn host/frontend
+/// rounding near the centre into visible back-and-forth cursor motion.
+pub(crate) fn submit_dvm_pointer_position(
+    x: u16,
+    y: u16,
+    wheel_vertical: i16,
+    wheel_horizontal: i16,
+    buttons: u8,
+) -> bool {
+    POINTER_PACKET_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
+    let mut ingress = InputIngressWire::default();
+    ingress.kind = INPUTD_INGRESS_KIND_POINTER_POSITION;
+    ingress.access = INPUTD_ACCESS_NATIVE;
+    ingress.flags = INPUTD_INGRESS_FLAG_DVM_SOURCE;
+    ingress.pointer_position = InputPointerPositionWire {
+        buttons,
+        reserved0: [0; 3],
+        x: i32::from(x),
+        y: i32::from(y),
+        wheel_vertical,
+        wheel_horizontal,
+    };
+    push_ingress(ingress)
+}
+
 pub(crate) fn has_pending_input_events() -> bool {
-    has_pending_ingress()
+    // The post-arm readiness check must cover both policy-ready ingress and a
+    // raw DVM record whose MSI-X edge raced waiter registration. Decoding and
+    // consumer advancement still happen only in inputd's broker turn.
+    has_pending_ingress() || super::dvm_ring::has_pending_records()
 }
 
 pub(crate) fn arm_input_waiter(task_id: u64) -> bool {
@@ -121,6 +155,41 @@ pub(crate) fn disarm_input_waiter(task_id: u64) {
             }
         }
     });
+}
+
+/// Reserve the one event-driven DVM-ingestion wake slot for inputd. A dead
+/// predecessor is reclaimed before a restarted service may arm itself; a live
+/// different task is a split-brain service violation and is rejected.
+pub(crate) fn arm_inputd_ingestion_waiter(task_id: u64) -> bool {
+    if task_id == 0 {
+        return false;
+    }
+    loop {
+        let current = INPUTD_INGESTION_WAITER.load(Ordering::Acquire);
+        if current == task_id {
+            return true;
+        }
+        if current != 0 && crate::multitask::is_user_task_alive(current) {
+            return false;
+        }
+        if INPUTD_INGESTION_WAITER
+            .compare_exchange(current, task_id, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return true;
+        }
+    }
+}
+
+pub(crate) fn disarm_inputd_ingestion_waiter(task_id: u64) {
+    if task_id != 0 {
+        let _ = INPUTD_INGESTION_WAITER.compare_exchange(
+            task_id,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
 }
 
 pub fn debug_snapshot() -> InputEventQueueDebugSnapshot {
@@ -165,6 +234,7 @@ pub(crate) fn reset_for_tests() {
     // helper and retains the same fixed allocation.
     INPUT_INGRESS.lock().clear();
     *INPUT_WAITERS.lock() = [None; INPUT_WAITERS_CAPACITY];
+    INPUTD_INGESTION_WAITER.store(0, Ordering::Release);
     POINTER_PACKET_SUBMIT_COUNT.store(0, Ordering::Relaxed);
     INPUT_READ_CALL_COUNT.store(0, Ordering::Relaxed);
     INPUT_READ_EVENT_COUNT.store(0, Ordering::Relaxed);
@@ -223,7 +293,11 @@ fn with_ingress_queue<R>(
     }
 }
 
-fn wake_input_waiters() {
+/// Wake poll waiters after a transport IRQ has made a bounded record available
+/// but before task-context code has decoded it. The ISR performs no parsing or
+/// allocation; the next inputd broker turn owns the ring drain.
+pub(crate) fn wake_input_waiters() {
+    let inputd_waiter = INPUTD_INGESTION_WAITER.swap(0, Ordering::AcqRel);
     let mut task_ids = [0_u64; INPUT_WAITERS_CAPACITY];
     let count = with_input_waiters(|waiters| {
         let mut count = 0;
@@ -237,6 +311,9 @@ fn wake_input_waiters() {
     });
     for task_id in task_ids.iter().take(count).copied() {
         let _ = crate::multitask::wake_task(task_id);
+    }
+    if inputd_waiter != 0 {
+        let _ = crate::multitask::wake_task(inputd_waiter);
     }
 }
 

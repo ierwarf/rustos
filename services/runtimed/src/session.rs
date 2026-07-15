@@ -923,8 +923,9 @@ fn ui_server_bootstrap_args_env() -> Result<(Vec<String>, Vec<String>), i32> {
     // pull the uiserver desktop entry (and the Init-scope env defaults) up
     // front. Reading from the registry warms the OnceLock cache; the catalog
     // loader thread reuses it without a second disk read.
-    let mut env = load_runtime_default_env(DEFAULT_RUNTIME_ENV_REGISTRY_PATH, RuntimeEnvScope::Init)
-        .map_err(runtime_registry_errno)?;
+    let mut env =
+        load_runtime_default_env(DEFAULT_RUNTIME_ENV_REGISTRY_PATH, RuntimeEnvScope::Init)
+            .map_err(runtime_registry_errno)?;
     let entry = load_desktop_program_entries(DEFAULT_APPLICATIONS_DIR)
         .map_err(runtime_registry_errno)?
         .into_iter()

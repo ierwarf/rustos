@@ -5,13 +5,13 @@ EXTENDS Naturals, Sequences, FiniteSets
 Models DVM input-session revocation.
 
 Concrete owners and source anchors:
-  * RDI2 epoch replacement: kernel/io-manager/src/input/dvm_serial.rs
+  * RDI3 epoch replacement: kernel/io-manager/src/input/dvm_frames.rs
   * priority reset queue barrier: kernel/io-manager/src/input/event_queue.rs
   * reset-wire admission and synthetic key releases: services/inputd/src/main.rs
   * provider key-state reset: drivers/libs/keyboard-core/src/lib.rs
 
 The model abstracts frame CRC/serial parsing and mouse motion. A queued key
-stands for an already-validated RDI2 key transition. The queue has a small
+stands for an already-validated RDI3 key transition. The queue has a small
 capacity; its important property is that a reset replaces every older queued
 frame rather than waiting behind a hostile producer.
 *******************************************************************************)
@@ -38,7 +38,7 @@ Init ==
     /\ heldKeys = {}
     /\ heldEpoch = NoEpoch
 
-\* A RDI2 SESSION_START always inserts a revocation barrier, even when the
+\* A RDI3 SESSION_START always inserts a revocation barrier, even when the
 \* preceding DVM died without SESSION_END. This is the queue replacement in
 \* event_queue::submit_dvm_input_reset.
 StartSession(epoch) ==

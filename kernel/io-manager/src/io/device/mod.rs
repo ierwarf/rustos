@@ -142,6 +142,7 @@ pub enum DeviceError {
     InvalidArgument,
     NotFound,
     StaleSurface,
+    TryAgain,
     Unsupported,
 }
 

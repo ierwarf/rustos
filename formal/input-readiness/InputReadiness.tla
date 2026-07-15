@@ -6,7 +6,7 @@ Models the RustOS DVM input readiness handoff.
 
 Concrete owners and source anchors:
   * ring0 bounded ingress and waiter wake:
-      kernel/io-manager/src/input/event_queue.rs
+      kernel/io-manager/src/input/{event_queue.rs,dvm_ring.rs}
   * poll arm/recheck/commit:
       kernel/compat/src/user/syscall/linux/service_ops/poll_epoll.rs
   * input-policy ingestion on a poll probe or authorized read:
@@ -16,14 +16,23 @@ Concrete owners and source anchors:
 
 The ownership boundary is deliberately narrow. Ring0 exposes wakeable bounded
 ingress, while inputd owns translation and its policy queue. A poll recheck
-uses INPUTD_IPC_OP_STATS, which first transfers ingress then reports policy
-readiness. That idempotent probe has a finite IPC deadline; an authorized read
-uses the same explicit transfer operation when it owns a real DVM ingress
+uses the 16 ms-bounded INPUTD_IPC_OP_STATS request, which makes inputd first
+transfer ingress then report policy readiness. The kernel poll path can wake or
+ask that question but cannot consume a ring slot. An authorized read uses the
+same explicit inputd-owned transfer operation when it owns a real DVM ingress
 record.
 
 There is intentionally no idle background-drain action. It could consume the
 only ring0-observable record after a client armed poll but before it received a
 service-owned readiness result, leaving that client asleep.
+
+The concrete arm/recheck path reads both decoded ingress and the raw fixed-ring
+producer/consumer state. This implements the model's `ArmPoll` observation of
+`ingress`: a producer edge racing between STATS and waiter registration cannot
+be lost merely because no waiter existed at interrupt time.
+Finite polls advance through one-tick RTC rechecks until `pollDeadline` rather
+than registering one task in independent input and timer waiter tables;
+indefinite polls retain the event-driven arm/recheck/commit path.
 
 The model abstracts authorization identity, key translation, and UI rendering;
 those are covered by the endpoint/input-revocation models and Rust/KVM tests.
@@ -33,17 +42,21 @@ CONSTANTS MaxIngress, MaxEvents, PollBound
 
 ReaderStates == {"idle", "armed", "recheck", "ready"}
 TransferReasons == {"poll-recheck", "authorized-read"}
+NoOwner == "none"
+InputdBrokerOwner == "inputd-broker"
 DvmSource == "dvm"
 DvmIngressKinds == {"linux-key", "pointer-packet"}
 IngressRecord == [id: 1..MaxEvents, source: {DvmSource}, kind: DvmIngressKinds]
 NoDeadline == 0
 MaxTime == (MaxEvents + 1) * PollBound
 
-VARIABLES ingress, policyQueue, delivered, readerState, nextEvent,
-          pollDeadline, now, transferHistory
+VARIABLES ingress, policyQueue, delivered, readerState, readPermit, nextEvent,
+          pollDeadline, now, transferHistory, lastTransferOwner,
+          unprivilegedPollAttempted
 
-vars == <<ingress, policyQueue, delivered, readerState, nextEvent,
-          pollDeadline, now, transferHistory>>
+vars == <<ingress, policyQueue, delivered, readerState, readPermit, nextEvent,
+          pollDeadline, now, transferHistory, lastTransferOwner,
+          unprivilegedPollAttempted>>
 
 SeqSet(sequence) == {sequence[index] : index \in 1..Len(sequence)}
 
@@ -61,10 +74,13 @@ Init ==
     /\ policyQueue = <<>>
     /\ delivered = <<>>
     /\ readerState = "idle"
+    /\ readPermit = FALSE
     /\ nextEvent = 1
     /\ pollDeadline = NoDeadline
     /\ now = 0
     /\ transferHistory = <<>>
+    /\ lastTransferOwner = NoOwner
+    /\ unprivilegedPollAttempted = FALSE
 
 \* poll(2) first checks service-owned readiness. A policy record that survived
 \* a timed-out probe is immediately readable on retry; otherwise ring0 ingress
@@ -75,10 +91,12 @@ ArmPoll ==
     /\ readerState' =
         IF Len(policyQueue) > 0 THEN "ready"
         ELSE IF Len(ingress) = 0 THEN "armed" ELSE "recheck"
+    /\ readPermit' = (Len(policyQueue) > 0)
     /\ pollDeadline' =
         IF Len(policyQueue) > 0 THEN NoDeadline
         ELSE IF Len(ingress) = 0 THEN now + PollBound ELSE now
-    /\ UNCHANGED <<ingress, policyQueue, delivered, nextEvent, now, transferHistory>>
+    /\ UNCHANGED <<ingress, policyQueue, delivered, nextEvent, now, transferHistory,
+                  lastTransferOwner, unprivilegedPollAttempted>>
 
 \* The DVM relay appends a bounded, source-validated ingress record. An armed
 \* waiter becomes eligible for a service readiness recheck in the same step.
@@ -90,7 +108,8 @@ ProduceIngress ==
             [id |-> nextEvent, source |-> DvmSource, kind |-> kind])
         /\ nextEvent' = nextEvent + 1
         /\ readerState' = IF readerState = "armed" THEN "recheck" ELSE readerState
-        /\ UNCHANGED <<policyQueue, delivered, pollDeadline, now, transferHistory>>
+        /\ UNCHANGED <<policyQueue, delivered, readPermit, pollDeadline, now, transferHistory,
+                      lastTransferOwner, unprivilegedPollAttempted>>
 
 \* The kernel's poll recheck asks inputd for STATS. inputd linearizes the
 \* ingress-to-policy transfer before reporting readable; a timeout with no
@@ -100,13 +119,15 @@ PollRecheck ==
     /\ ingress' = <<>>
     /\ policyQueue' = policyQueue \o ingress
     /\ readerState' = IF Len(policyQueue \o ingress) = 0 THEN "idle" ELSE "ready"
+    /\ readPermit' = (Len(policyQueue \o ingress) > 0)
     /\ pollDeadline' = NoDeadline
     /\ transferHistory' =
         IF Len(ingress) = 0
         THEN transferHistory
         ELSE Append(transferHistory,
             [reason |-> "poll-recheck", events |-> ingress])
-    /\ UNCHANGED <<delivered, nextEvent, now>>
+    /\ lastTransferOwner' = InputdBrokerOwner
+    /\ UNCHANGED <<delivered, nextEvent, now, unprivilegedPollAttempted>>
 
 \* The readiness request is bounded. If inputd has not received it by the
 \* deadline, poll returns control without moving ingress; a subsequent probe
@@ -115,8 +136,10 @@ ReadinessProbeTimeout ==
     /\ readerState \in {"armed", "recheck"}
     /\ now = pollDeadline
     /\ readerState' = "idle"
+    /\ readPermit' = FALSE
     /\ pollDeadline' = NoDeadline
-    /\ UNCHANGED <<ingress, policyQueue, delivered, nextEvent, now, transferHistory>>
+    /\ UNCHANGED <<ingress, policyQueue, delivered, nextEvent, now, transferHistory,
+                  lastTransferOwner, unprivilegedPollAttempted>>
 
 \* inputd can complete its transfer just as the caller's bounded reply wait
 \* expires. The caller receives no stale ready result, but retry must observe
@@ -128,28 +151,42 @@ TransferThenProbeTimeout ==
     /\ ingress' = <<>>
     /\ policyQueue' = policyQueue \o ingress
     /\ readerState' = "idle"
+    /\ readPermit' = FALSE
     /\ pollDeadline' = NoDeadline
     /\ transferHistory' = Append(transferHistory,
         [reason |-> "poll-recheck", events |-> ingress])
-    /\ UNCHANGED <<delivered, nextEvent, now>>
+    /\ lastTransferOwner' = InputdBrokerOwner
+    /\ UNCHANGED <<delivered, nextEvent, now, unprivilegedPollAttempted>>
 
 \* inputd accepts only an authorized read. It drains any ingress not yet
 \* observed by poll, then materializes one policy event for the caller. This
 \* is the normal direct-read operation after a race with the readiness path.
 AuthorizedRead ==
+    /\ readPermit
     /\ Len(policyQueue \o ingress) > 0
     /\ ingress' = <<>>
     /\ delivered' = Append(delivered, (policyQueue \o ingress)[1])
     /\ policyQueue' = SubSeq(policyQueue \o ingress, 2, Len(policyQueue \o ingress))
     /\ readerState' =
         IF Len(policyQueue \o ingress) = 1 THEN "idle" ELSE "ready"
+    /\ readPermit' = (Len(policyQueue \o ingress) > 1)
     /\ pollDeadline' = NoDeadline
     /\ transferHistory' =
         IF Len(ingress) = 0
         THEN transferHistory
         ELSE Append(transferHistory,
             [reason |-> "authorized-read", events |-> ingress])
-    /\ UNCHANGED <<nextEvent, now>>
+    /\ lastTransferOwner' = InputdBrokerOwner
+    /\ UNCHANGED <<nextEvent, now, unprivilegedPollAttempted>>
+
+\* A non-inputd poll caller can observe a wake but has no ingest capability.
+\* Its drain attempt must not consume a ring0 ingress record, change the
+\* policy queue, or claim the consumer identity.
+UnprivilegedPollDrainAttempt ==
+    /\ ~unprivilegedPollAttempted
+    /\ unprivilegedPollAttempted' = TRUE
+    /\ UNCHANGED <<ingress, policyQueue, delivered, readerState, readPermit, nextEvent,
+                  pollDeadline, now, transferHistory, lastTransferOwner>>
 
 \* Time cannot advance through an armed poll deadline. TLC must therefore
 \* explore a recheck or a bounded probe-timeout resolution before the bound is
@@ -158,8 +195,9 @@ Tick ==
     /\ now < MaxTime
     /\ (readerState \in {"armed", "recheck"} => now < pollDeadline)
     /\ now' = now + 1
-    /\ UNCHANGED <<ingress, policyQueue, delivered, readerState, nextEvent,
-                  pollDeadline, transferHistory>>
+    /\ UNCHANGED <<ingress, policyQueue, delivered, readerState, readPermit, nextEvent,
+                  pollDeadline, transferHistory, lastTransferOwner,
+                  unprivilegedPollAttempted>>
 
 Next ==
     \/ ArmPoll
@@ -168,6 +206,7 @@ Next ==
     \/ ReadinessProbeTimeout
     \/ TransferThenProbeTimeout
     \/ AuthorizedRead
+    \/ UnprivilegedPollDrainAttempt
     \/ Tick
 
 ResolvePoll ==
@@ -178,10 +217,13 @@ TypeOK ==
     /\ policyQueue \in Seq(IngressRecord)
     /\ delivered \in Seq(IngressRecord)
     /\ readerState \in ReaderStates
+    /\ readPermit \in BOOLEAN
     /\ nextEvent \in 1..(MaxEvents + 1)
     /\ pollDeadline \in 0..MaxTime
     /\ now \in 0..MaxTime
     /\ transferHistory \in Seq([reason: TransferReasons, events: Seq(IngressRecord)])
+    /\ lastTransferOwner \in {NoOwner, InputdBrokerOwner}
+    /\ unprivilegedPollAttempted \in BOOLEAN
     /\ Len(ingress) <= MaxIngress
 
 \* A waiting reader has a finite service-recheck deadline. The Tick action
@@ -195,6 +237,14 @@ ArmedPollIsBounded ==
 \* no ring0-only wake or fabricated STATS reply can make it readable.
 ReadyReaderHasReachablePolicy ==
     readerState = "ready" => Len(policyQueue) > 0
+
+\* A finite poll timeout returns `false`, not a read permit.  The reader may
+\* invoke the inputd read operation only after a positive readiness result;
+\* this excludes the concrete bug where `ready = 0` still triggered an empty
+\* service read on every 8 ms timeout.
+ReadPermitIsPositiveReadiness ==
+    /\ (readPermit => readerState = "ready" /\ Len(policyQueue \o ingress) > 0)
+    /\ (readerState = "idle" => ~readPermit)
 
 \* While a poll is waiting/rechecking, no prior service queue can be hidden.
 WaitingReaderHasNoHiddenPolicy ==
@@ -226,6 +276,12 @@ EveryIngressTransferHasTrustedWitness ==
             /\ record.source = DvmSource
             /\ record.kind \in DvmIngressKinds
     /\ TransferCount(transferHistory) = Len(policyQueue \o delivered)
+
+OnlyInputdMovesIngress ==
+    lastTransferOwner \in {NoOwner, InputdBrokerOwner}
+
+UnprivilegedPollCannotConsume ==
+    unprivilegedPollAttempted => lastTransferOwner \in {NoOwner, InputdBrokerOwner}
 
 \* The timeout field and the Tick guard prove safety, but not that the timer
 \* interrupt and inputd recheck are dispatched.  Make both scheduling

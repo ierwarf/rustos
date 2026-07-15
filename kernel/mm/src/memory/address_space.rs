@@ -506,11 +506,7 @@ impl ProcessAddressSpace {
             let chunk = min(PAGE_4KIB - page_offset, data.len() - written);
 
             unsafe {
-                ptr::copy_nonoverlapping(
-                    data.as_ptr().add(written),
-                    higher_half_ptr(phys),
-                    chunk,
-                );
+                ptr::copy_nonoverlapping(data.as_ptr().add(written), higher_half_ptr(phys), chunk);
             }
 
             cursor = cursor

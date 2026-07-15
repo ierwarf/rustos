@@ -18,4 +18,4 @@ logical_admin = false
 console_hosted = false
 # KVM validation flips only the private runtime-disk copy from `0` to `1`.
 # Release images keep the profiler disabled without a separate binary.
-env = ["RUSTOS_UI_PROFILE=0"]
+env = ["RUSTOS_UI_PROFILE=0", "RUSTOS_UI_BOOT_TRACE=0"]

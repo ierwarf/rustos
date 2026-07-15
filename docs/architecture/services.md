@@ -21,7 +21,7 @@ surfaces or sockets they expose.
 | `syscalld` | Linux MM/clock/signal policy. Calls into the gated `SYS_RUSTOS_MM_BROKER`. | `IPC_SERVICE_SYSCALLD`. |
 | `vfsd` | Linux VFS policy (mount table, openat resolution, FAT boot volume). | `IPC_SERVICE_VFSD`. |
 | `loaderd` | Process spawn: ELF dynamic main+interpreter, PE32+ main + System32 imports, Windows runtime broker registration. | `IPC_SERVICE_LOADERD`. |
-| Linux DVM | Linux driver lifecycle, DRM/KMS, evdev, and virtio-net. | Fixed RDI2/ivshmem transports. |
+| Linux DVM | Linux driver lifecycle, DRM/KMS, evdev, and virtio-net. | Fixed RDI3/ivshmem transports. |
 | `devmgrd` | RustOS device namespace and hotplug policy. | `IPC_SERVICE_DEVMGRD`. |
 | `inputd` | Authenticated DVM input routing into Wayland and console clients. | Wayland seat + console focus. |
 | `storaged` | Block device policy and partition mapping over AHCI/NVMe. | Block API. |
@@ -44,7 +44,7 @@ mistaken for the other.
 ### Linux Driver Domain
 
 Linux modules execute only in the isolated DVM. RustOS receives keyboard and
-pointer records through authenticated RDI2/COM2, and display/network through
+pointer records through authenticated RDI3 over an L0-owned MSI-X input ring, and display/network through
 fixed validated ivshmem regions. `inputd`, `uiserver`, and `netd` own RustOS
 policy above those transports. A missing DVM transport disables its device;
 there is no direct hardware, firmware-display, or RustOS module fallback.
@@ -68,7 +68,7 @@ ELF, 그리고 staged registry에 한 줄을 함께 가집니다. 아래 표는 
 | `syscalld` | Linux MM/clock/signal policy. `SYS_RUSTOS_MM_BROKER` 호출. | `IPC_SERVICE_SYSCALLD`. |
 | `vfsd` | Linux VFS policy (mount table, openat resolution, FAT boot volume). | `IPC_SERVICE_VFSD`. |
 | `loaderd` | process spawn: ELF dynamic main+interpreter, PE32+ main + System32 import, Windows runtime broker 등록. | `IPC_SERVICE_LOADERD`. |
-| Linux DVM | Linux driver lifecycle, DRM/KMS, evdev, virtio-net. | 고정 RDI2/ivshmem transport. |
+| Linux DVM | Linux driver lifecycle, DRM/KMS, evdev, virtio-net. | 고정 RDI3/ivshmem transport. |
 | `devmgrd` | RustOS device namespace와 hotplug policy. | `IPC_SERVICE_DEVMGRD`. |
 | `inputd` | 인증된 DVM input을 Wayland와 console client로 route. | Wayland seat + console focus. |
 | `storaged` | AHCI/NVMe 위 block device policy와 partition mapping. | Block API. |
@@ -90,7 +90,7 @@ cache를 사용하므로 서로 다른 registry가 뒤섞이지 않습니다.
 ### Linux Driver Domain
 
 Linux module은 격리된 DVM에서만 실행합니다. RustOS는 keyboard/pointer를
-인증된 RDI2/COM2으로 받고, display/network은 고정 크기와 버전이 검증된
+인증된 L0 소유 MSI-X input ring의 RDI3로 받고, display/network은 고정 크기와 버전이 검증된
 ivshmem transport로 받습니다. 그 위의 정책은 `inputd`, `uiserver`, `netd`가
 소유합니다. DVM transport가 없거나 검증에 실패하면 해당 장치는 사용할 수
 없으며, direct hardware·firmware display·RustOS module fallback은 없습니다.

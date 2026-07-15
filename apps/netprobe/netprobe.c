@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
@@ -7,7 +9,22 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#define SYS_RUSTOS_DEBUG_PRINT 0x52550001UL
+
+static void debug_line(const char *message) {
+    size_t len = strlen(message);
+    if (len != 0) {
+        (void)syscall(SYS_RUSTOS_DEBUG_PRINT, message, len);
+    }
+    (void)syscall(SYS_RUSTOS_DEBUG_PRINT, "\n", 1UL);
+}
+
 static void log_line(const char *message) {
+    // netprobe is deliberately no-display and may have no console consumer.
+    // The KVM acceptance gate reads debugcon, so publish lifecycle/proof
+    // markers to the same bounded diagnostic ABI used by shell and abifuzz.
+    // stdout remains useful when the probe is launched manually.
+    debug_line(message);
     printf("%s\r\n", message);
     fflush(stdout);
 }

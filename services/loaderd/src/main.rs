@@ -16,15 +16,15 @@ use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, LoaderSpawnRequest,
     LoaderSpawnResponse, RustosProcAbortBrokerArgs, RustosProcActivateBrokerArgs,
-    RustosProcMapDataBrokerArgs,
-    RustosProcMapFileBatchBrokerArgs, RustosProcMapFileBatchEntry, RustosProcMapZeroedBrokerArgs,
-    RustosProcPrepareBrokerArgs, RustosProcSetLinuxRuntimeBrokerArgs,
-    RustosProcSetWindowsRuntimeBrokerArgs, COMMERCIAL_MAX_LOADERD_OP_AUXV_PLAN,
-    COMMERCIAL_MAX_LOADERD_OP_ELF_RUNTIME_PLAN, COMMERCIAL_MAX_LOADERD_OP_IMAGE_PROBE,
-    COMMERCIAL_MAX_LOADERD_OP_IMPORT_POLICY, COMMERCIAL_MAX_LOADERD_OP_INTERPRETER_PLAN,
-    COMMERCIAL_MAX_LOADERD_OP_MAP_PLAN, COMMERCIAL_MAX_LOADERD_OP_PE_RUNTIME_PLAN,
-    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_LOADERD, IPC_SERVICE_LOADERD,
-    LOADER_OP_ACTIVATE, LOADER_OP_EXEC_TARGET, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION,
+    RustosProcMapDataBrokerArgs, RustosProcMapFileBatchBrokerArgs, RustosProcMapFileBatchEntry,
+    RustosProcMapZeroedBrokerArgs, RustosProcPrepareBrokerArgs,
+    RustosProcSetLinuxRuntimeBrokerArgs, RustosProcSetWindowsRuntimeBrokerArgs,
+    COMMERCIAL_MAX_LOADERD_OP_AUXV_PLAN, COMMERCIAL_MAX_LOADERD_OP_ELF_RUNTIME_PLAN,
+    COMMERCIAL_MAX_LOADERD_OP_IMAGE_PROBE, COMMERCIAL_MAX_LOADERD_OP_IMPORT_POLICY,
+    COMMERCIAL_MAX_LOADERD_OP_INTERPRETER_PLAN, COMMERCIAL_MAX_LOADERD_OP_MAP_PLAN,
+    COMMERCIAL_MAX_LOADERD_OP_PE_RUNTIME_PLAN, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_LOADERD, IPC_SERVICE_LOADERD, LOADER_OP_ACTIVATE,
+    LOADER_OP_EXEC_TARGET, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION,
     LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY,
     LOADER_SPAWN_MAX_ARG_COUNT, LOADER_SPAWN_MAX_ENV_COUNT, PROC_BROKER_ABI_VERSION,
     PROC_BROKER_BATCH_CAPACITY, PROC_BROKER_DATA_PAYLOAD_CAPACITY, PROC_BROKER_FORMAT_ELF64,
@@ -32,10 +32,10 @@ use rustos_user_abi::syscall::{
     PROC_BROKER_MAP_PRIVATE, PROC_BROKER_MAP_READ, PROC_BROKER_MAP_WRITE,
     PROC_BROKER_USER_SPACE_BASE, PROC_BROKER_USER_SPACE_END_EXCLUSIVE, SYS_RUSTOS_DEBUG_PRINT,
     SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_PROC_ABORT_BROKER,
-    SYS_RUSTOS_PROC_ACTIVATE_BROKER,
-    SYS_RUSTOS_PROC_MAP_DATA_BROKER, SYS_RUSTOS_PROC_MAP_FILE_BATCH_BROKER,
-    SYS_RUSTOS_PROC_MAP_ZEROED_BROKER, SYS_RUSTOS_PROC_PREPARE_BROKER,
-    SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER, SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER,
+    SYS_RUSTOS_PROC_ACTIVATE_BROKER, SYS_RUSTOS_PROC_MAP_DATA_BROKER,
+    SYS_RUSTOS_PROC_MAP_FILE_BATCH_BROKER, SYS_RUSTOS_PROC_MAP_ZEROED_BROKER,
+    SYS_RUSTOS_PROC_PREPARE_BROKER, SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER,
+    SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER,
 };
 
 mod commit;
@@ -325,6 +325,7 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> HandledLoade
         return spawn_response(response);
     }
     debug_line(&format!("loaderd: open done exec={exec_path}"));
+    debug_line(&format!("loaderd: validate begin exec={exec_path}"));
     let executable_format = match validate_executable_fd(fd) {
         Ok(format) => format,
         Err(errno) => {
@@ -334,6 +335,7 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> HandledLoade
             return spawn_response(response);
         }
     };
+    debug_line(&format!("loaderd: validate done exec={exec_path}"));
     if !operation.allows_format(executable_format) {
         let _ = syscall1(SYS_CLOSE, fd as u64);
         response.status = ENOEXEC;

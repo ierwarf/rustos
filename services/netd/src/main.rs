@@ -8,20 +8,18 @@ use std::time::{Duration, Instant as StdInstant};
 
 use rustos_user_abi::linux as linux_abi;
 use rustos_user_abi::syscall::{
-    COMMERCIAL_MAX_NETD_OP_ADDRESS_BIND, COMMERCIAL_MAX_NETD_OP_FD_TRANSFER,
+    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, NetdIpcRequest, NetdIpcResponse,
+    RustosNetBrokerArgs, COMMERCIAL_MAX_NETD_OP_ADDRESS_BIND, COMMERCIAL_MAX_NETD_OP_FD_TRANSFER,
     COMMERCIAL_MAX_NETD_OP_PACKET_LEASE, COMMERCIAL_MAX_NETD_OP_ROUTE_POLICY,
     COMMERCIAL_MAX_NETD_OP_SOCKET_NAMESPACE, COMMERCIAL_MAX_NETD_OP_SOCKET_OPTIONS,
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
-    COMMERCIAL_MAX_PROTOCOL_NETD, CommercialMaxCapabilityLeaseWire,
-    CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
-    CommercialMaxProtocolResponse, IPC_SERVICE_NETD, NET_BROKER_OP_PACKET_RX,
+    COMMERCIAL_MAX_PROTOCOL_NETD, IPC_SERVICE_NETD, NETD_IPC_ABI_VERSION,
+    NETD_RECVMSG_PAYLOAD_HEADER_SIZE, NETD_SENDMSG_PAYLOAD_HEADER_SIZE, NET_BROKER_OP_PACKET_RX,
     NET_BROKER_OP_PACKET_STATUS, NET_BROKER_OP_PACKET_TX, NET_BROKER_PACKET_MTU,
     NET_BROKER_PACKET_STATUS_ACTIVE, NET_BROKER_PACKET_STATUS_AWAITING_AUTHENTICATED_CONTROL,
-    NET_BROKER_PACKET_STATUS_UNAVAILABLE, NETD_IPC_ABI_VERSION, NETD_RECVMSG_PAYLOAD_HEADER_SIZE,
-    NETD_SENDMSG_PAYLOAD_HEADER_SIZE, NetdIpcRequest, NetdIpcResponse, RustosNetBrokerArgs,
-    SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV,
-    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_NET_BROKER,
-    SYSCALL_OFFLOAD_OP_LINUX_ACCEPT, SYSCALL_OFFLOAD_OP_LINUX_BIND, SYSCALL_OFFLOAD_OP_LINUX_CLOSE,
+    NET_BROKER_PACKET_STATUS_UNAVAILABLE, SYSCALL_OFFLOAD_OP_LINUX_ACCEPT,
+    SYSCALL_OFFLOAD_OP_LINUX_BIND, SYSCALL_OFFLOAD_OP_LINUX_CLOSE,
     SYSCALL_OFFLOAD_OP_LINUX_CONNECT, SYSCALL_OFFLOAD_OP_LINUX_DUP,
     SYSCALL_OFFLOAD_OP_LINUX_GETPEERNAME, SYSCALL_OFFLOAD_OP_LINUX_GETSOCKNAME,
     SYSCALL_OFFLOAD_OP_LINUX_GETSOCKOPT, SYSCALL_OFFLOAD_OP_LINUX_LISTEN,
@@ -29,7 +27,9 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_OP_LINUX_RECVMSG, SYSCALL_OFFLOAD_OP_LINUX_SENDMSG,
     SYSCALL_OFFLOAD_OP_LINUX_SENDTO, SYSCALL_OFFLOAD_OP_LINUX_SETSOCKOPT,
     SYSCALL_OFFLOAD_OP_LINUX_SHUTDOWN, SYSCALL_OFFLOAD_OP_LINUX_SOCKET,
-    SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR,
+    SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
+    SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
+    SYS_RUSTOS_NET_BROKER,
 };
 use smoltcp::iface::{Config as SmolConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -50,7 +50,11 @@ const INET_IO_POLL_BUDGET: usize = 256;
 // delivered SESSION_START. Delay only that explicitly transitional state so a
 // boot-time client does not race into a fabricated permanent ENODEV. A truly
 // absent/invalid provider still fails immediately, and the wait is bounded.
-const AUTHENTICATED_CONTROL_WAIT: Duration = Duration::from_millis(250);
+// The DVM agent, L0 HMAC handshake, and RustOS session-start record boot in
+// parallel with runtimed clients. Use the same five-second setup budget as the
+// authenticated relay; 250 ms was shorter than a normal cold KVM handshake and
+// turned a healthy transitional aperture into a permanent ENODEV for netprobe.
+const AUTHENTICATED_CONTROL_WAIT: Duration = Duration::from_secs(5);
 const AUTHENTICATED_CONTROL_RETRY: Duration = Duration::from_millis(4);
 const QEMU_USERNET_ADDR: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
 const QEMU_USERNET_GATEWAY: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
@@ -1705,8 +1709,9 @@ fn await_authenticated_packet_provider() -> Result<(), i32> {
 #[cfg(test)]
 mod packet_provider_state_tests {
     use super::{
-        NET_BROKER_PACKET_STATUS_ACTIVE, NET_BROKER_PACKET_STATUS_AWAITING_AUTHENTICATED_CONTROL,
-        NET_BROKER_PACKET_STATUS_UNAVAILABLE, PacketProviderState, packet_provider_state_from_wire,
+        packet_provider_state_from_wire, PacketProviderState, NET_BROKER_PACKET_STATUS_ACTIVE,
+        NET_BROKER_PACKET_STATUS_AWAITING_AUTHENTICATED_CONTROL,
+        NET_BROKER_PACKET_STATUS_UNAVAILABLE,
     };
 
     #[test]

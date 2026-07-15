@@ -9,7 +9,7 @@ into another crate's private modules when `api.rs` exposes a wrapper.
 
 | Need | Import | Read |
 | --- | --- | --- |
-| GDT/IDT/ACPI/PIC/RTC/SIMD/hooks | `kernel_hal::api as hal_api` | `kernel/hal/src/api.rs` |
+| GDT/IDT/ACPI/PIC/MSI-X receive substrate/RTC/SIMD/hooks | `kernel_hal::api as hal_api` | `kernel/hal/src/api.rs` |
 | Heap/paging/frames/higher-half | `kernel_mm::api as mm_api` | `kernel/mm/src/api.rs` |
 | Handles/rights/session ids | `kernel_object::api as object_api` | `kernel/object/src/api.rs` |
 | Shared memory regions | `kernel_ipc_runtime::api as ipc_api` | `kernel/ipc-runtime/src/api.rs` |
@@ -45,9 +45,11 @@ Do not reorder without reading `kernel/src/main.rs` and
 - **Scheduler wait primitives:** use `current_task_id`, `block_current_task`,
   `wake_task` for kernel-capable wait queues; use `*_user_*` wrappers only
   for userspace-task waits.
-- **Input poll waits:** compat `poll()` drains the bounded COM2 DVM transport
-  before arming `input::event_queue` waiters. There is no USB, PS/2, or native
-  interrupt-completion fallback.
+- **Input poll waits:** compat `poll()` only asks inputd's deadline-bounded
+  `STATS` request and arms `input::event_queue` waiters. Only inputd's
+  capability-gated ingest broker drains the bounded L0-owned input ring. The
+  one MSI-X leaf only wakes; it never decodes. There is no USB, PS/2, serial,
+  or native fallback.
 - **Scheduler preemption:** `cond_resched`/`reschedule_if_requested` only at
   Linux-style safe points outside spinlocked or IRQ-off regions. Timer IRQs
   should request reschedule for user-task kernel frames, not blindly switch
@@ -56,6 +58,12 @@ Do not reorder without reading `kernel/src/main.rs` and
   service weights into vruntime/load accounting only. Root slot 0 is a fair
   task during bootstrap finalize, then becomes the idle fallback after
   `mark_root_idle()`.
+- **MSI-X/device events:** allocate only a bounded vector through
+  `hal_api::arch::msi`, register a lock-free leaf callback once, and program a
+  masked PCI MSI-X table before enabling it. The IRQ callback may set pending
+  state only; display/input/network policy and buffer work stay in their
+  owning service/broker turn. x2APIC or interrupt-remapping absence fails
+  closed rather than truncating a destination ID.
 - **VFS mount/unmount/open path helpers:** require current process context.
 
 ## Docs

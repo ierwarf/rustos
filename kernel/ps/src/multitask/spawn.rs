@@ -180,19 +180,15 @@ fn spawn_milestone_arg(slot: usize, spawned_from_user: bool, weight_micros: u64)
     ((spawned_from_user as u64) << 63) | ((slot as u64) << 32) | (weight_micros & 0xffff_ffff)
 }
 
-pub fn spawn_user_thread(
-    bootstrap: UserTaskBootstrap,
-    weight_micros: u64,
-) -> Result<u64, SpawnTaskError> {
+pub fn spawn_user_thread_suspended(bootstrap: UserTaskBootstrap) -> Result<u64, SpawnTaskError> {
     let id = NEXT_TASK_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let pit_divisor = checked_thread_pit_divisor(weight_micros)?;
     let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
     let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
     let rflags = initial_task_rflags().bits();
 
     interrupts::without_interrupts(|| unsafe {
         scheduler_mut()
-            .allocate_user_thread_slot(id, bootstrap, pit_divisor, user_cs, user_ss, rflags)
+            .allocate_user_thread_slot(id, bootstrap, user_cs, user_ss, rflags)
             .ok_or(SpawnTaskError::NoFreeTaskSlot)
     })?;
 

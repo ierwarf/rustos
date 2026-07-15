@@ -26,8 +26,6 @@ const SIMD_STATE_BYTES: usize = 4096;
 const FXSAVE_STATE_BYTES: usize = 512;
 const XMM_COPY_THRESHOLD_BYTES: usize = 256;
 const YMM_COPY_THRESHOLD_BYTES: usize = 256;
-const BGRA_BLIT_AVX2_THRESHOLD_PIXELS: usize = 16;
-const ENABLE_SIMD_BGRA_BLIT: bool = true;
 
 static SIMD_MODE: AtomicU8 = AtomicU8::new(SIMD_MODE_FXSAVE);
 static XSTATE_MASK: AtomicU64 = AtomicU64::new(XFEATURE_X87 | XFEATURE_SSE);
@@ -179,43 +177,6 @@ pub unsafe fn copy_fast(src: *const u8, dst: *mut u8, len: usize) {
     }
 }
 
-#[inline]
-/// # Safety
-///
-/// `src` and `dst` must be valid for `pixels * 4` source bytes and
-/// `pixels * dst_bpp` destination bytes. The regions must not overlap.
-pub unsafe fn blit_bgra8888_row(
-    dst: *mut u8,
-    src: *const u8,
-    pixels: usize,
-    dst_bpp: usize,
-    rgb_format: bool,
-) {
-    if pixels == 0 {
-        return;
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    if ENABLE_SIMD_BGRA_BLIT
-        && dst_bpp == 4
-        && avx2_enabled()
-        && pixels >= BGRA_BLIT_AVX2_THRESHOLD_PIXELS
-    {
-        unsafe {
-            if rgb_format {
-                blit_bgra8888_to_rgbx_ymm(dst, src, pixels);
-            } else {
-                blit_bgra8888_to_bgrx_ymm(dst, src, pixels);
-            }
-        }
-        return;
-    }
-
-    unsafe {
-        blit_bgra8888_row_scalar(dst, src, pixels, dst_bpp, rgb_format);
-    }
-}
-
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
 /// # Safety
@@ -292,123 +253,6 @@ pub unsafe fn copy_ymm(src: *const u8, dst: *mut u8, len: usize) {
 
         if i < len {
             ptr::copy_nonoverlapping(src.add(i), dst.add(i), len - i);
-        }
-        _mm256_zeroupper();
-    }
-}
-
-unsafe fn blit_bgra8888_row_scalar(
-    mut dst: *mut u8,
-    mut src: *const u8,
-    pixels: usize,
-    dst_bpp: usize,
-    rgb_format: bool,
-) {
-    if dst_bpp == 4 {
-        unsafe {
-            if rgb_format {
-                blit_bgra8888_to_rgbx_scalar_u32(dst, src, pixels);
-            } else {
-                blit_bgra8888_to_bgrx_scalar_u32(dst, src, pixels);
-            }
-        }
-        return;
-    }
-
-    unsafe {
-        for _ in 0..pixels {
-            let b = ptr::read(src);
-            let g = ptr::read(src.add(1));
-            let r = ptr::read(src.add(2));
-            if rgb_format {
-                ptr::write(dst, r);
-                ptr::write(dst.add(1), g);
-                ptr::write(dst.add(2), b);
-            } else {
-                ptr::write(dst, b);
-                ptr::write(dst.add(1), g);
-                ptr::write(dst.add(2), r);
-            }
-            if dst_bpp == 4 {
-                ptr::write(dst.add(3), 0);
-            }
-            src = src.add(4);
-            dst = dst.add(dst_bpp);
-        }
-    }
-}
-
-unsafe fn blit_bgra8888_to_bgrx_scalar_u32(mut dst: *mut u8, mut src: *const u8, pixels: usize) {
-    unsafe {
-        for _ in 0..pixels {
-            let bgra = ptr::read_unaligned(src as *const u32);
-            ptr::write_unaligned(dst as *mut u32, bgra & 0x00ff_ffff);
-            src = src.add(4);
-            dst = dst.add(4);
-        }
-    }
-}
-
-unsafe fn blit_bgra8888_to_rgbx_scalar_u32(mut dst: *mut u8, mut src: *const u8, pixels: usize) {
-    unsafe {
-        for _ in 0..pixels {
-            let bgra = ptr::read_unaligned(src as *const u32);
-            let rgbx =
-                ((bgra & 0x00ff_0000) >> 16) | (bgra & 0x0000_ff00) | ((bgra & 0x0000_00ff) << 16);
-            ptr::write_unaligned(dst as *mut u32, rgbx);
-            src = src.add(4);
-            dst = dst.add(4);
-        }
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn blit_bgra8888_to_rgbx_ymm(dst: *mut u8, src: *const u8, pixels: usize) {
-    use core::arch::x86_64::*;
-
-    let shuffle = _mm256_setr_epi8(
-        2, 1, 0, -128, 6, 5, 4, -128, 10, 9, 8, -128, 14, 13, 12, -128, 2, 1, 0, -128, 6, 5, 4,
-        -128, 10, 9, 8, -128, 14, 13, 12, -128,
-    );
-
-    let len = pixels * 4;
-    let mut offset = 0usize;
-    unsafe {
-        while offset + 32 <= len {
-            let chunk = _mm256_loadu_si256(src.add(offset) as *const __m256i);
-            let converted = _mm256_shuffle_epi8(chunk, shuffle);
-            _mm256_storeu_si256(dst.add(offset) as *mut __m256i, converted);
-            offset += 32;
-        }
-
-        let tail_pixels = (len - offset) / 4;
-        if tail_pixels != 0 {
-            blit_bgra8888_row_scalar(dst.add(offset), src.add(offset), tail_pixels, 4, true);
-        }
-        _mm256_zeroupper();
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn blit_bgra8888_to_bgrx_ymm(dst: *mut u8, src: *const u8, pixels: usize) {
-    use core::arch::x86_64::*;
-
-    let alpha_mask = _mm256_set1_epi32(0x00ff_ffffu32 as i32);
-    let len = pixels * 4;
-    let mut offset = 0usize;
-    unsafe {
-        while offset + 32 <= len {
-            let chunk = _mm256_loadu_si256(src.add(offset) as *const __m256i);
-            let converted = _mm256_and_si256(chunk, alpha_mask);
-            _mm256_storeu_si256(dst.add(offset) as *mut __m256i, converted);
-            offset += 32;
-        }
-
-        let tail_pixels = (len - offset) / 4;
-        if tail_pixels != 0 {
-            blit_bgra8888_row_scalar(dst.add(offset), src.add(offset), tail_pixels, 4, false);
         }
         _mm256_zeroupper();
     }

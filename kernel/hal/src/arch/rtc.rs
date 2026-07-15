@@ -20,7 +20,6 @@ const RTC_REG_MONTH: u8 = 0x08;
 const RTC_REG_YEAR: u8 = 0x09;
 const RTC_UPDATE_IN_PROGRESS: u8 = 1 << 7;
 const RTC_PERIODIC_INTERRUPT_ENABLE: u8 = 1 << 6;
-const RTC_RATE_1024_HZ: u8 = 6;
 const RTC_TICKS_PER_SEC: u64 = 1024;
 const RTC_SLEEP_WAITER_CAPACITY: usize = 256;
 
@@ -252,7 +251,14 @@ pub fn now() -> RtcDateTime {
 }
 
 pub fn ticks() -> u64 {
-    RTC_TICKS.load(Ordering::Acquire)
+    let nanos = crate::arch::clock::monotonic_nanos();
+    if nanos == 0 && crate::arch::clock::current_source().is_none() {
+        return RTC_TICKS.load(Ordering::Acquire);
+    }
+    u64::try_from(
+        u128::from(nanos).saturating_mul(u128::from(RTC_TICKS_PER_SEC)) / 1_000_000_000_u128,
+    )
+    .unwrap_or(u64::MAX)
 }
 
 pub const fn ticks_per_second() -> u64 {
@@ -266,13 +272,14 @@ pub fn is_initialized() -> bool {
 pub fn init() {
     interrupts::without_interrupts(|| {
         enable_nmi();
-
-        // Program RTC periodic interrupt rate to 1024 Hz.
-        let prev_a = cmos_read(RTC_REG_A);
-        cmos_write(RTC_REG_A, (prev_a & 0xF0) | RTC_RATE_1024_HZ);
-
+        // The RTC remains the battery-backed calendar source, but its periodic
+        // interrupt is not a monotonic clockevent. Hypervisors are permitted to
+        // coalesce those edges while a vCPU is descheduled; counting them made
+        // RustOS time run at less than half wall rate under UI load. PIT drives
+        // scheduling/deadline service and the invariant-TSC/HPET clocksource
+        // supplies elapsed time.
         let prev_b = cmos_read(RTC_REG_B);
-        cmos_write(RTC_REG_B, prev_b | RTC_PERIODIC_INTERRUPT_ENABLE);
+        cmos_write(RTC_REG_B, prev_b & !RTC_PERIODIC_INTERRUPT_ENABLE);
 
         // Read C once to clear any pending interrupt latch.
         let _ = cmos_read(RTC_REG_C);
@@ -281,29 +288,33 @@ pub fn init() {
     });
 
     RTC_INITIALIZED.store(true, Ordering::Release);
-    crate::arch::pic::enable_irq(8);
 }
 
 pub fn on_interrupt() {
-    let ticks = RTC_TICKS.fetch_add(1, Ordering::AcqRel).saturating_add(1);
-    wake_ready_sleepers(ticks);
+    let interrupt_count = RTC_TICKS.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+    service_clock_event();
     // Only emit the diagnostic when we observe more than one in-flight tick
     // (re-entrance or a missed completion). In the steady state delta is
     // always 1 — logging that every few ticks dominates the debugcon stream
     // (≈90% of boot output) without adding signal.
     let completed = RTC_TICKS_COMPLETED.load(Ordering::Acquire);
-    let inflight = ticks.saturating_sub(completed);
+    let inflight = interrupt_count.saturating_sub(completed);
     if inflight > 1 {
         let last_diag_tick = RTC_LAST_DIAG_PRINT_TICK.load(Ordering::Acquire);
-        if ticks.saturating_sub(last_diag_tick) >= 4
+        if interrupt_count.saturating_sub(last_diag_tick) >= 4
             && RTC_LAST_DIAG_PRINT_TICK
-                .compare_exchange(last_diag_tick, ticks, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(
+                    last_diag_tick,
+                    interrupt_count,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
                 .is_ok()
         {
             let task = crate::hooks::current_task_id().unwrap_or(u64::MAX);
             crate::debug::println!(
                 "rtc diag: tick={} completed={} delta={} task={}",
-                ticks,
+                interrupt_count,
                 completed,
                 inflight,
                 task,
@@ -314,14 +325,23 @@ pub fn on_interrupt() {
     // debugcon is a VMExit, so emitting ~700 bytes from IRQ context drops the
     // current second's frame — visible as a periodic stutter. Just mark the
     // second as pending; housekeeping picks it up outside IRQ context.
-    let current_second = ticks / RTC_TICKS_PER_SEC;
+    // Must read register C to acknowledge and re-arm RTC interrupts.
+    let _ = cmos_read(RTC_REG_C);
+    RTC_TICKS_COMPLETED.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Services absolute monotonic deadlines from any reliable clockevent. PIT
+/// calls this before each scheduler pick; therefore a delayed or coalesced
+/// interrupt catches up all expired waiters from the clocksource rather than
+/// extending every timeout by the number of lost RTC edges.
+pub fn service_clock_event() {
+    let now_ticks = ticks();
+    wake_ready_sleepers(now_ticks);
+    let current_second = crate::arch::clock::monotonic_nanos() / 1_000_000_000;
     let last_reported_second = RTC_LAST_ALIVE_SECOND.load(Ordering::Acquire);
     if current_second != last_reported_second {
         HEARTBEAT_PENDING_SECOND.store(current_second, Ordering::Release);
     }
-    // Must read register C to acknowledge and re-arm RTC interrupts.
-    let _ = cmos_read(RTC_REG_C);
-    RTC_TICKS_COMPLETED.fetch_add(1, Ordering::AcqRel);
 }
 
 /// Drain a pending heartbeat second (if any) and emit its diagnostic log. Must
@@ -400,14 +420,10 @@ pub fn sleep(milliseconds: u64) {
         return;
     }
 
-    let ticks_needed = milliseconds.saturating_mul(RTC_TICKS_PER_SEC).div_ceil(1000);
-    let ticks_needed = core::cmp::max(1, ticks_needed);
-    let target = RTC_TICKS
-        .load(Ordering::Acquire)
-        .saturating_add(ticks_needed);
+    let target = sleep_deadline_from_ticks(ticks(), milliseconds);
 
     let restore_disabled = !interrupts::are_enabled();
-    while RTC_TICKS.load(Ordering::Acquire) < target {
+    while ticks() < target {
         if !restore_disabled && block_current_user_until(target) {
             continue;
         }
@@ -424,35 +440,70 @@ pub fn sleep(milliseconds: u64) {
     }
 }
 
+fn sleep_deadline_from_ticks(now: u64, milliseconds: u64) -> u64 {
+    let ticks_needed = milliseconds
+        .saturating_mul(RTC_TICKS_PER_SEC)
+        .div_ceil(1000);
+    let ticks_needed = core::cmp::max(1, ticks_needed);
+    // Sleepers and the PIT clockevent service must share one time domain.
+    // RTC periodic interrupts are deliberately disabled after clock-source
+    // initialization, so RTC_TICKS stops advancing there. Mixing that legacy
+    // counter with monotonic `ticks()` in block_current_user_until made every
+    // post-init sleep loop forever: the waiter was immediately past its
+    // monotonic deadline while the outer RTC_TICKS condition never changed.
+    now.saturating_add(ticks_needed)
+}
+
 fn block_current_user_until(target: u64) -> bool {
     if !crate::hooks::is_scheduler_initialized() {
         return false;
     }
 
-    let Some(task_id) = crate::hooks::current_user_thread_id() else {
+    // This executes inside syscall substrate. Resolving a "user snapshot"
+    // would re-enter the process-table lock that the syscall may already
+    // retain and self-deadlock before the sleep waiter is even registered.
+    // The scheduler task id is the exact wake authority and is lockless under
+    // the scheduler's interrupt exclusion.
+    let Some(task_id) = crate::hooks::current_task_id() else {
         return false;
     };
 
-    let blocked = interrupts::without_interrupts(|| {
-        if RTC_TICKS.load(Ordering::Acquire) >= target {
-            return true;
-        }
-        if !crate::hooks::block_current_user_task() {
-            return false;
-        }
-        if register_sleep_waiter(task_id, target) {
-            true
-        } else {
-            let _ = crate::hooks::wake_user_task(task_id);
-            false
-        }
-    });
-    if !blocked {
+    if ticks() >= target {
+        return true;
+    }
+    if !crate::hooks::arm_block_current_task() {
         return false;
     }
-
-    crate::hooks::yield_now();
-    true
+    if !register_sleep_waiter(task_id, target) {
+        let _ = crate::hooks::cancel_block_current_task();
+        return false;
+    }
+    // Recheck after both the scheduler arm and deadline registration. A PIT
+    // edge or unrelated wake in either gap clears the arm; the commit then
+    // refuses to sleep instead of consuming the only wakeup.
+    if ticks() >= target {
+        disarm_sleep_waiter(task_id);
+        let _ = crate::hooks::cancel_block_current_task();
+        return true;
+    }
+    match crate::hooks::commit_block_current_task() {
+        Some(true) => {
+            crate::hooks::yield_now();
+            // A non-deadline wake may have resumed the task early. Remove its
+            // stale timer record before the outer loop computes a new target.
+            disarm_sleep_waiter(task_id);
+            true
+        }
+        Some(false) => {
+            disarm_sleep_waiter(task_id);
+            true
+        }
+        None => {
+            disarm_sleep_waiter(task_id);
+            let _ = crate::hooks::cancel_block_current_task();
+            false
+        }
+    }
 }
 
 fn register_sleep_waiter(task_id: u64, wake_tick: u64) -> bool {
@@ -575,5 +626,12 @@ mod tests {
         assert_eq!(enabled, 0x4a);
         assert_eq!(disabled & NMI_DISABLE, NMI_DISABLE);
         assert_eq!(enabled & NMI_DISABLE, 0);
+    }
+
+    #[test]
+    fn sleep_deadline_uses_monotonic_ticks_with_ceil_and_saturation() {
+        assert_eq!(sleep_deadline_from_ticks(10_000, 1), 10_002);
+        assert_eq!(sleep_deadline_from_ticks(10_000, 8), 10_009);
+        assert_eq!(sleep_deadline_from_ticks(u64::MAX - 1, 1), u64::MAX);
     }
 }

@@ -292,6 +292,77 @@ fn read_file_to_vec_from_extents(
     Ok(Some(bytes))
 }
 
+pub fn read_file_range_from_extents(
+    path: &str,
+    file_offset: u64,
+    dest: &mut [u8],
+) -> core::result::Result<Option<usize>, fatfs::Error<DiskIoError>> {
+    let Some(path) = normalized_extent_path(path) else {
+        return Ok(None);
+    };
+    ensure_root_file_extent_table_loaded();
+    let cache = ROOT_FILE_EXTENTS.lock();
+    let entry = match &*cache {
+        RootFileExtentState::Ready(table) => table.find(path).cloned(),
+        _ => None,
+    };
+    drop(cache);
+    let Some(entry) = entry else {
+        return Ok(None);
+    };
+    if dest.is_empty() || file_offset >= entry.len {
+        return Ok(Some(0));
+    }
+
+    let requested = dest
+        .len()
+        .min(usize::try_from(entry.len - file_offset).map_err(|_| fatfs::Error::InvalidInput)?);
+    let request_end = file_offset
+        .checked_add(requested as u64)
+        .ok_or(fatfs::Error::InvalidInput)?;
+    let handle = crate::storage::block::current_boot_volume_handle()
+        .ok_or(fatfs::Error::Io(DiskIoError::NotPresent))?;
+    let mut device = crate::storage::block::FatRegistryDevice::new(handle);
+    let block_size = Some(device.logical_block_size())
+        .filter(|block_size| *block_size != 0)
+        .ok_or(fatfs::Error::Io(DiskIoError::NotPresent))?;
+
+    let mut logical_start = 0_u64;
+    let mut written = 0usize;
+    for extent in &entry.extents {
+        let logical_end = logical_start
+            .checked_add(extent.len)
+            .ok_or(fatfs::Error::InvalidInput)?;
+        let overlap_start = file_offset.max(logical_start);
+        let overlap_end = request_end.min(logical_end);
+        if overlap_start < overlap_end {
+            let within_extent = overlap_start - logical_start;
+            let physical_offset = extent
+                .offset
+                .checked_add(within_extent)
+                .ok_or(fatfs::Error::InvalidInput)?;
+            let count = usize::try_from(overlap_end - overlap_start)
+                .map_err(|_| fatfs::Error::InvalidInput)?;
+            read_extent_bytes(
+                &mut device,
+                block_size,
+                usize::try_from(physical_offset).map_err(|_| fatfs::Error::InvalidInput)?,
+                count,
+                &mut dest[written..written + count],
+            )?;
+            written += count;
+            if written == requested {
+                break;
+            }
+        }
+        logical_start = logical_end;
+    }
+    if written != requested {
+        return Err(fatfs::Error::UnexpectedEof);
+    }
+    Ok(Some(written))
+}
+
 fn metadata_from_extents(
     path: &str,
 ) -> core::result::Result<Option<BootVolumeMetadata>, fatfs::Error<DiskIoError>> {
@@ -558,7 +629,9 @@ fn read_extent_bytes(
         done += chunk_payload;
         offset += chunk_payload;
         len -= chunk_payload;
-        crate::multitask::cond_resched();
+        if len != 0 {
+            crate::multitask::cond_resched();
+        }
     }
     Ok(())
 }
@@ -579,7 +652,9 @@ fn read_file_into_from_fs(
             break;
         }
         done += count;
-        crate::multitask::cond_resched();
+        if done < dest.len() {
+            crate::multitask::cond_resched();
+        }
     }
     Ok(done)
 }

@@ -5,9 +5,14 @@ use super::*;
 
 use rustos_user_abi::syscall::{
     INPUT_STATS_FLAG_PENDING_COALESCED, INPUT_STATS_FLAG_PENDING_POINTER_POSITION,
-    INPUTD_INGEST_MAX_EVENTS, IPC_SERVICE_CAP_INPUT_POLICY, InputIngestBrokerArgs,
-    InputIngressWire, InputStatsBrokerArgs, InputStatsWire,
+    INPUTD_INGEST_MAX_EVENTS, INPUTD_IPC_ABI_VERSION, IPC_SERVICE_CAP_INPUT_POLICY,
+    InputIngestBrokerArgs, InputIngressWire, InputStatsBrokerArgs, InputStatsWire,
 };
+
+#[inline]
+fn input_broker_abi_is_current(abi_version: u16) -> bool {
+    abi_version == INPUTD_IPC_ABI_VERSION
+}
 
 pub(super) fn syscall_linux_rustos_input_stats_broker(args_ptr: u64) -> u64 {
     if !ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_INPUT_POLICY) {
@@ -18,7 +23,7 @@ pub(super) fn syscall_linux_rustos_input_stats_broker(args_ptr: u64) -> u64 {
         Ok(args) => args,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
     };
-    if args.abi_version != 1
+    if !input_broker_abi_is_current(args.abi_version)
         || args.reserved0 != 0
         || args.reserved1 != 0
         || args.out_stats_ptr == 0
@@ -59,7 +64,7 @@ pub(super) fn syscall_linux_rustos_input_ingest_broker(args_ptr: u64) -> u64 {
         Ok(args) => args,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
     };
-    if args.abi_version != 1
+    if !input_broker_abi_is_current(args.abi_version)
         || args.reserved0 != 0
         || args.reserved1 != 0
         || args.reserved2 != 0
@@ -73,8 +78,8 @@ pub(super) fn syscall_linux_rustos_input_ingest_broker(args_ptr: u64) -> u64 {
     if capacity > INPUTD_INGEST_MAX_EVENTS {
         return linux_errno(LINUX_EINVAL);
     }
-    // COM2 has no IRQ by design. Drain in this capability-gated broker before
-    // transferring ingress so decoder ownership remains task-context-only.
+    // The MSI-X leaf only wakes waiters. Drain in this capability-gated broker
+    // before transferring ingress so decoder ownership remains task-context-only.
     kernel_io_manager::api::input::service_dvm_input_pending();
     let mut ingress = alloc::vec![InputIngressWire::default(); capacity];
     let count = kernel_io_manager::api::input::event_queue::drain_ingress(&mut ingress);
@@ -92,5 +97,60 @@ pub(super) fn syscall_linux_rustos_input_ingest_broker(args_ptr: u64) -> u64 {
     match usermem::write_current_user_u32(args.out_count_ptr, count as u32) {
         Ok(()) => count as u64,
         Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
+    }
+}
+
+/// Sleep the inputd-owned ingestion worker until either a decoded ingress
+/// record or a raw DVM ring record is available. The MSI-X leaf only wakes the
+/// waiter; this capability-gated task-context turn remains the sole consumer
+/// and therefore cannot move input policy back into ring0.
+pub(super) fn syscall_linux_rustos_input_wait_broker() -> u64 {
+    if !ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_INPUT_POLICY) {
+        return linux_errno(LINUX_EPERM);
+    }
+
+    loop {
+        if kernel_io_manager::api::input::event_queue::has_pending_input_events() {
+            return 0;
+        }
+        let Some(task_id) = multitask::current_task_id() else {
+            return linux_errno(LINUX_EINVAL);
+        };
+        if !multitask::arm_block_current_task() {
+            return linux_errno(LINUX_EINVAL);
+        }
+        if !kernel_io_manager::api::input::event_queue::arm_inputd_ingestion_waiter(task_id) {
+            let _ = multitask::cancel_block_current_task();
+            return linux_errno(LINUX_EBUSY);
+        }
+        // Close the interrupt→wait registration race. A producer that commits
+        // after the first check must either wake this task or be observed here.
+        if kernel_io_manager::api::input::event_queue::has_pending_input_events() {
+            kernel_io_manager::api::input::event_queue::disarm_inputd_ingestion_waiter(task_id);
+            let _ = multitask::cancel_block_current_task();
+            continue;
+        }
+        match multitask::commit_block_current_task() {
+            Some(true) => multitask::yield_now(),
+            Some(false) => {}
+            None => {
+                kernel_io_manager::api::input::event_queue::disarm_inputd_ingestion_waiter(task_id);
+                return linux_errno(LINUX_EINVAL);
+            }
+        }
+        kernel_io_manager::api::input::event_queue::disarm_inputd_ingestion_waiter(task_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_brokers_reject_stale_wire_versions() {
+        assert!(input_broker_abi_is_current(INPUTD_IPC_ABI_VERSION));
+        assert!(!input_broker_abi_is_current(
+            INPUTD_IPC_ABI_VERSION.saturating_sub(1)
+        ));
     }
 }

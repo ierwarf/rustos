@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use runtime_control::{StartupMode, DEFAULT_RUNTIME_SOCKET_PATH};
 use rustos_user_abi::console as console_abi;
-use rustos_user_abi::syscall::SYS_RUSTOS_DEBUG_PRINT;
+use rustos_user_abi::syscall::{SYS_RUSTOS_DEBUG_PRINT, TASK_WEIGHT_INTERACTIVE_FLAG};
 
 mod catalog;
 mod session;
@@ -16,7 +16,11 @@ mod util;
 
 pub(crate) const DEFAULT_USER_TASK_WEIGHT_MICROS: u64 = 100;
 pub(crate) const MIN_EFFECTIVE_TASK_WEIGHT_MICROS: u64 = 1_000;
-pub(crate) const UI_SERVER_TASK_WEIGHT_MICROS: u64 = 2_000;
+/// A runtime launch-catalog entry is data, not a realtime capability. Keep all
+/// non-UI launches below the kernel's strict System-class admission point even
+/// if a compromised or malformed registry asks for an arbitrarily high weight.
+pub(crate) const MAX_UNTRUSTED_TASK_WEIGHT_MICROS: u64 = 1_000;
+pub(crate) const UI_SERVER_TASK_WEIGHT_MICROS: u64 = TASK_WEIGHT_INTERACTIVE_FLAG | 2_000;
 pub(crate) const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(2);
 pub(crate) const RETRY_BACKOFF: Duration = Duration::from_millis(100);
 pub(crate) const SERVICE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);

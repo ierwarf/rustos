@@ -16,11 +16,21 @@ require_enabled() {
     }
 }
 
+require_disabled() {
+    ! grep -Eq "^${1}=(y|m)$" "$config" || {
+        echo "rustos-linux-dvm: forbidden kernel fallback enabled: $1" >&2
+        exit 1
+    }
+}
+
 require_enabled CONFIG_MODULES
 require_enabled CONFIG_MODVERSIONS
 require_enabled CONFIG_DEVTMPFS
 require_enabled CONFIG_DEVTMPFS_MOUNT
 require_enabled CONFIG_PCI
+require_enabled CONFIG_PCI_MSI
+require_enabled CONFIG_UIO
+require_disabled CONFIG_UIO_PCI_GENERIC
 require_enabled CONFIG_VIRTIO_PCI
 require_enabled CONFIG_VIRTIO_NET
 require_enabled CONFIG_VIRTIO_BLK

@@ -192,6 +192,7 @@ pub(crate) enum DeviceSysopError {
     DisplayUnavailable,
     NotFound,
     StaleSurface,
+    TryAgain,
     Unsupported,
 }
 
@@ -737,10 +738,14 @@ fn present_surface(
             stride,
         ),
     };
-    if presented {
-        Ok(())
-    } else {
-        Err(DeviceSysopError::DisplayUnavailable)
+    match presented {
+        kernel_io_manager::api::io::gui::GuiPresentOutcome::Presented => Ok(()),
+        kernel_io_manager::api::io::gui::GuiPresentOutcome::Backpressured => {
+            Err(DeviceSysopError::TryAgain)
+        }
+        kernel_io_manager::api::io::gui::GuiPresentOutcome::Unavailable => {
+            Err(DeviceSysopError::DisplayUnavailable)
+        }
     }
 }
 
@@ -788,6 +793,7 @@ fn map_device_error(err: device_ns::DeviceError) -> DeviceSysopError {
         device_ns::DeviceError::InvalidArgument => DeviceSysopError::InvalidArgument,
         device_ns::DeviceError::NotFound => DeviceSysopError::NotFound,
         device_ns::DeviceError::StaleSurface => DeviceSysopError::StaleSurface,
+        device_ns::DeviceError::TryAgain => DeviceSysopError::TryAgain,
         device_ns::DeviceError::Unsupported => DeviceSysopError::Unsupported,
     }
 }

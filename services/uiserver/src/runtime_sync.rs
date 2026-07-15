@@ -6,6 +6,7 @@ use std::time::Duration;
 use runtime_control::{RuntimeClient, RuntimeRunningProgram, decode_c_string};
 
 use crate::app::{HIDDEN_RUNTIME_PROGRAM_TITLES, MAX_RUNNING_PROGRAMS};
+use crate::sys::require_background_thread_class;
 
 const RUNTIME_SYNC_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -43,7 +44,10 @@ pub(crate) struct RuntimeSyncHandle {
 pub(crate) fn start_runtime_sync(runtime: RuntimeClient) -> RuntimeSyncHandle {
     let shared = Arc::new(Mutex::new(SharedRuntimeState::default()));
     let worker_shared = Arc::clone(&shared);
-    thread::spawn(move || runtime_sync_worker(runtime, worker_shared));
+    thread::spawn(move || {
+        require_background_thread_class();
+        runtime_sync_worker(runtime, worker_shared)
+    });
     RuntimeSyncHandle { shared }
 }
 

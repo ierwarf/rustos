@@ -166,6 +166,17 @@ pub fn pic_interrupt_handler(
     crate::arch::pic::send_eoi(index);
 }
 
+/// Generic MSI/MSI-X dispatch is intentionally separate from the legacy PIC
+/// range. The per-vector callback is lock-free and device-local; policy work
+/// is deferred to the owning broker/service turn.
+pub fn msi_interrupt_handler(
+    _stack_frame: InterruptStackFrame,
+    index: u8,
+    _error_code: Option<u64>,
+) {
+    crate::arch::msi::dispatch(index);
+}
+
 /// DVM owns input delivery. Legacy keyboard IRQs have no RustOS input policy
 /// consumer; acknowledge them so a physical/spurious line cannot wedge PIC.
 pub extern "x86-interrupt" fn keyboard_interrupt_eoi_handler(_stack_frame: InterruptStackFrame) {

@@ -6,5 +6,9 @@ config BR2_PACKAGE_RUSTOS_DVM_DISPLAY
 	select BR2_PACKAGE_LIBDRM
 	help
 	  Unprivileged-in-protocol display consumer for the RustOS Linux driver
-	  domain. It maps only the fixed ivshmem framebuffer contract and uses the
-	  DVM-owned DRM/KMS device for double-buffered scanout.
+	  domain. It maps only the fixed ivshmem framebuffer contract, receives
+	  host-published frames through a fixed-header, one-vector MSI-X UIO
+	  doorbell, and uses the DVM-owned DRM/KMS device for pinned DirtyFB
+	  scanout. The package ships the dedicated ivshmem adapter because generic
+	  UIO accepts only INTx and cannot service the doorbell. It never polls the
+	  shared framebuffer or accepts a guest-selected control address.

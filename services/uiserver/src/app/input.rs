@@ -653,6 +653,7 @@ impl AppState {
 
 fn launch_program_async(desktop_file_id: String) {
     thread::spawn(move || {
+        sys::require_background_thread_class();
         if let Ok(runtime) = RuntimeClient::open_default() {
             let _ = runtime.request_launch_program_new_session(desktop_file_id.as_str());
         }

@@ -180,9 +180,11 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
 - A successful smoke requires RustOS's default `rootd` readiness marker and
   the L0 host broker to complete the DVM
   `health,device-inventory,driver-inventory,input-stream` handshake using launch-assigned KVM
-  vsock CID `4`. L0 then opens RustOS's dedicated QEMU COM2 socket and writes
-  only fixed RDI2 session/key/pointer frames; QMP is not launched. The DVM
-  discovers one keyboard and one relative pointer by evdev capabilities, not
+  vsock CID `4`. L0 then attaches as the fixed ivshmem peer 1 only after
+  RustOS has claimed peer 0, writes only fixed RDI3 session/key/pointer frames
+  into the host-owned 128 KiB input ring, and signals the one RustOS MSI-X
+  eventfd; QMP is not launched and the DVM never maps that aperture. The DVM
+  discovers one keyboard and one relative or absolute pointer by evdev capabilities, not
   by a QEMU product name. A guest that exits or merely starts cannot pass. The
   smoke proves endpoint setup only: it does not fabricate an input event. A
   live event needs a real input source assigned to the DVM, after which L0
@@ -191,19 +193,27 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   mode. It passes only the DVM boot flag `rustos.dvm.input-selftest=1`; the
   agent creates a local `uinput` evdev device and reconsumes it through the
   same relay before RustOS requires the one-shot `inputd` keyboard and pointer
-  ingress markers. No QMP socket, host-to-DVM input RPC, or production default
-  path is added.
-- `agent-v1-control` remains DVM-to-L0 only. The RDI2 COM2 channel is a
-  bounded input relay, not a general vsock endpoint or a NIC/block/GPU data
+  ingress markers. The composite device advertises pointer selection capability,
+  emits one non-printable F12 keyboard proof, then emits pointer-only absolute positions;
+  it never emits printable keys or clicks. It traces a 192-pixel axis-aligned
+  square for 3,200 cycles, with source polling no faster than 5 ms. A
+  `--min-ui-fps` proof requires three consecutive active one-second windows at
+  the requested uiserver and DVM rate, at least 55 accepted events and 50
+  presented cursor moves, zero loss/slow/error/backlog, at most 50 ms input
+  gap/age, exact logical/presented cursor agreement, and at least 96 pixels of
+  travel on both axes. An absent or dropped sample fails the gate. No QMP
+  socket, host-to-DVM input RPC, or production default path is added.
+- `agent-v1-control` remains DVM-to-L0 only. The RDI3 input ring is a bounded
+  L0-to-RustOS relay, not a general vsock endpoint or a NIC/block/GPU data
   plane. L0 limits event rate, emits held-key/button releases on disconnect,
-  and sends a session end so reconnects cannot inherit input state. COM2 has
-  no IRQ: the capability-gated `inputd` ingest broker drains at most sixteen
-  complete RDI2 frames on each normal 4ms ingest turn, so live pointer motion
-  never depends on the one-second housekeeping heartbeat. That broker is the
-  sole runtime COM2 drain owner; housekeeping services only native lower-half
-  input transport and cannot contend for the DVM decoder. The DVM coalesces
-  relative pointer samples at 125Hz (buttons are immediate), and L0 caps the
-  entire relay at 256 frames/s to stay within COM2's physical budget. Additional
+  and sends a session end so reconnects cannot inherit input state. RustOS
+  validates the header and arms exactly one MSI-X leaf before L0 requests the
+  input stream. The leaf only wakes waiters; the capability-gated `inputd`
+  ingest broker drains at most 256 complete frames per normal turn, so decoding
+  and policy never run in IRQ context. The DVM coalesces relative pointer
+  samples at a 5 ms interval; an absolute device publishes only complete,
+  changed `SYN_REPORT` positions and keeps button edges report-atomic. L0 caps the relay at
+  256 frames/s to preserve cleanup reserve. Additional
   `--expect` markers tighten RustOS proof; none prove PCI assignment, physical
   input capture, or a network route.
 - `cargo xtask kvm-smoke --min-ui-fps N` modifies only the runner's fresh
@@ -212,18 +222,45 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   without changing its extent length. `uiserver` emits one-second profile
   windows with integer `frame_hz_milli`; the runner requires `N * 1000`.
   Release images retain the disabled value.
-- `cargo xtask kvm-smoke --dvm-display-shmem` replaces RustOS's direct test
-  GPU with a private host-created `ivshmem-plain` aperture. RustOS maps only a
-  fixed validated header and publishes it as a primary framebuffer; the
-  separate Linux `rustos-dvm-display` service reads that aperture and uses its
-  own DRM/KMS double-buffered page flips. The gate requires RustOS's observed
-  display ABI to match the exact header and the DVM's active DRM relay marker.
+- `cargo xtask kvm-smoke --gui-dvm-surfaces` exercises the production V3
+  `RSGUI002` three-slot GUI-DVM pool. The launch-local, owner-private
+  `ivshmem-doorbell` broker gives exactly the RustOS compositor and GUI DVM one
+  host-to-DVM wake vector and exactly two host receive vector meanings
+  (`control`, `offline`) plus the fixed validated UC control plane; it rejects
+  other UIDs and peers. A separate 32 MiB `virtio-pmem` pixel device is writable
+  in RustOS QEMU and read-only/ROM in the DVM. RustOS copies a complete immutable
+  frame into each slot, fences it before publishing its exact even generation,
+  and rings only the fixed DVM peer. The DVM-only
+  `rustos_dvm_ivshmem_uio` module validates the pool header, reconstructs an
+  invitation that predates module load, allocates one local MSI-X UIO receive
+  vector, requires the control and pixel headers to match, exposes only the
+  pixel pages WB read-only to `rustos-dvm-display`, and accepts only an exact
+  ready word or a module-validated 64-byte RELEASE record through private sysfs
+  attributes. It rejects writable VMAs. It permits one outstanding release
+  until host ACK; a later host event retries bounded flow control rather than
+  terminating the relay.
+  Offline clears the confirmation, while a full pool re-invites its newest
+  READY slot after restart. The relay rejects generic-UIO/INTx binding, releases
+  superseded READY slots through the same validated path, and requires atomic
+  KMS with one primary plane and three local scanout buffers. It writes a
+  validated damage rectangle only when a destination contains the exact
+  predecessor generation; otherwise it copies the complete immutable snapshot.
+  It submits a nonblocking atomic page flip and retains the source slot until
+  page-flip completion plus shadow-buffer synchronization. `FB_DAMAGE_CLIPS`
+  travels with that atomic commit; only then may the validated RELEASE return
+  capacity to RustOS. A CPU copy or accepted atomic ioctl alone is not scanout
+  completion.
+  V2, polling, and native-GPU fallback are not accepted as test or release
+  topology.
   Both smoke and interactive DVM launches disable QEMU's default VGA so the
   service opens the sole virtio-GPU DRM device rather than a competing VGA DRM
   node. The interactive GTK frontend uses `zoom-to-fit=off`, and the private
   DVM virtio-GPU disables resize-aware EDID: otherwise GTK's bootstrap window
   can request 640×480 before Linux DRM starts and force unnecessary scaling.
-  QEMU's explicit 1600×900 mode is therefore authoritative. The DVM relay
+  QEMU's explicit 1600×900 mode is therefore authoritative. The 60 FPS proof
+  requires an active GTK consumer, atomic three-buffer page-flip completion,
+  and a standard 2D virtio-GPU consumer; the headless device
+  cannot satisfy it. The DVM relay
   nevertheless preserves the fixed shared ABI and can scale only when a
   display backend genuinely requires a different mode. This KVM topology
   proves the display transport; it is not PCI
@@ -251,7 +288,7 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   launch, or PCI assignment. Do not turn a successful preflight into a
   passthrough claim.
 - `rustos-hostd relay-input` requires a matching `driver-domain-policy-v1`
-  file. Each class has an explicit transport; only `INPUT_TRANSPORT=rdi2-com2`
+  file. Each class has an explicit transport; only `INPUT_TRANSPORT=input-ring-msix`
   is implemented. Network, block, and display must remain `disabled` until
   their separate queue/DMA/reset/revocation contracts are implemented. The
   normal command is a reconnecting L0 service; `--once` is diagnostics-only.
@@ -291,7 +328,6 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
 | `drop-every:N` | Drop every Nth |
 | `fail-after:N` | Fail after N hits |
 | `rate:N` | Fail at rate N |
-| `delay-ms:N` | Parsed but not wired to sleep/delay yet |
 
 ### Current Fault Points
 

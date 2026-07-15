@@ -22,7 +22,13 @@ use super::context::{SAVED_CONTEXT_BYTES, SavedContext};
 use super::process_table::{self, ProcessHandle};
 use super::{UserFaultDisposition, UserStackState, UserTaskBootstrap, initial_task_rflags};
 
-pub(super) const MAX_TASK: usize = 32;
+// The enabled product topology boots roughly twenty policy/service processes
+// before the UI creates its bounded input, display, diagnostics, console, and
+// Wayland workers. A 32-slot table therefore exhausted during normal shell
+// launch and turned a recoverable capacity error into uiserver thread-spawn
+// panic. Keep the scheduler allocation-free and explicitly bounded, but size
+// the product contract for service growth and application headroom.
+pub(super) const MAX_TASK: usize = 128;
 const ROOT_TASK_SLOT: usize = 0;
 const FIRST_DYNAMIC_TASK_SLOT: usize = 1;
 // Kernel worker threads run fairly deep Rust call chains during process/module
@@ -50,13 +56,16 @@ static LONG_WAIT_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 const NICE_0_LOAD: u32 = 1024;
 const MIN_LOAD_WEIGHT: u32 = 32;
 const MAX_LOAD_WEIGHT: u32 = 1_000_000;
+const SYSTEM_CLASS_WEIGHT_FLAG: u32 = 1 << 31;
+const LOAD_WEIGHT_MASK: u32 = !SYSTEM_CLASS_WEIGHT_FLAG;
+const INTERACTIVE_PIT_DIVISOR_FLAG: u16 = 1 << 15;
 // Latency credit applied when a sleeper wakes: their vruntime is bounded by
 // (min_vruntime - SLEEPER_LATENCY_BONUS_NS), so I/O-bound tasks get
 // preferential dispatch but cannot stockpile unbounded credit while idle.
 // 1.5ms (matches Linux CFS `sysctl_sched_wakeup_granularity`'s default class)
 // — large enough to give a freshly-woken IPC replier preemption priority
 // against a peer's tail latency, but small enough that a high-weight task
-// like `uiserver` (weight_micros=1000, real weight ~8000) is not repeatedly
+// like `uiserver` (weight_micros=2000, real weight ~19000) is not repeatedly
 // starved by I/O-bound peers (~weight 952) waking from short syscall blocks.
 // At 12ms, the per-wake real-time advantage to a light peer over a heavy
 // task was `12ms * heavy_weight / light_weight ≈ 100ms`, which let services
@@ -76,21 +85,31 @@ const SCHED_MIN_GRANULARITY_NS: u64 = 200_000;
 // last-resort anti-starvation rail for long-running kernel paths that finally
 // call cond_resched.
 const SCHED_MAX_BURST_NS: u64 = 20_000_000;
+/// A runnable strict-class task must not wait behind a sequence of other
+/// strict-class tasks indefinitely. This is a dispatch-latency rail, not a
+/// CPU-share boost: once the bound expires the oldest ready System task gets
+/// one turn, after which normal weighted vruntime resumes.
+const SYSTEM_READY_LATENCY_BOUND_MS: u64 = 10;
 // Initial vruntime offset for newly-spawned tasks relative to current
 // min_vruntime. Keep this near min-granularity: a larger multi-ms penalty
 // leaves freshly spawned services behind polling System peers during boot.
 const SCHED_NEW_TASK_VRUNTIME_PENALTY_NS: u64 = SCHED_MIN_GRANULARITY_NS;
 
-/// Load-weight threshold that promotes latency-critical services to the
-/// `System` scheduling class. Effective 1000us service weights map to ~9544
-/// and remain User; 2000us UI/input services map to ~19088 and opt into
-/// System. This keeps the strict band off for normal poll loops while giving
-/// the interactive path a real wakeup-latency contract.
-const SYSTEM_CLASS_WEIGHT_THRESHOLD: u32 = 16_000;
+/// Strict class is an explicit admission property, not an accidental result
+/// of a large CFS share. Bootstrap brokers legitimately use larger weights
+/// than uiserver/inputd; deriving class from the number let those pollers
+/// crowd the interactive band and caused multi-second UI starvation.
+/// A critical service remains latency-favoured, but it cannot consume every
+/// dispatch indefinitely while ordinary work is ready. Eight System turns
+/// followed by one mandatory User turn reserve at least one ninth of dispatch
+/// opportunities for recovery and application work under a hostile input or
+/// GUI-DVM flood.
+const MAX_CONSECUTIVE_SYSTEM_DISPATCHES: u8 = 8;
 
-/// Strict priority bands. Higher class (smaller discriminant) is always
-/// scheduled before lower classes while it has any ready task. Within a class
-/// the existing CFS-style vruntime accounting decides fairness.
+/// Priority bands. System work wins latency-sensitive selection until its
+/// bounded consecutive-dispatch reservation is exhausted; then one ready User
+/// task must run before System selection resumes. Within a class the existing
+/// CFS-style vruntime accounting decides fairness.
 ///
 /// This mirrors the way commercial microkernels structure mixed workloads:
 ///
@@ -99,8 +118,9 @@ const SYSTEM_CLASS_WEIGHT_THRESHOLD: u32 = 16_000;
 ///   the timeshare policy.
 /// - Fuchsia Zircon stacks a deadline scheduler above the fair scheduler,
 ///   with deadline threads always preempting fair threads.
-/// - QNX Neutrino uses 256 priority levels with strict priority between
-///   them and round-robin within a level.
+/// - QNX Neutrino uses priority levels with explicit partition/budget controls;
+///   RustOS keeps the latency ordering but reserves a bounded User turn so a
+///   flooded critical lane cannot consume all CPU dispatch opportunities.
 /// - Linux stacks SCHED_DEADLINE > SCHED_FIFO/RR > SCHED_OTHER (CFS) so RT
 ///   threads always run ahead of CFS when ready.
 ///
@@ -113,13 +133,13 @@ const SYSTEM_CLASS_WEIGHT_THRESHOLD: u32 = 16_000;
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum SchedClass {
     /// Kernel-mode tasks (root during boot, housekeeping, kernel workers)
-    /// and user-mode services whose `weight_micros` is at or above
-    /// `SYSTEM_CLASS_WEIGHT_THRESHOLD`. Examples: `uiserver`, future
-    /// `inputd`/`syscalld` once their manifests bump weight.
+    /// and user-mode services admitted with `TASK_WEIGHT_INTERACTIVE_FLAG`.
+    /// Current owners are uiserver and inputd; ordinary policy brokers stay
+    /// in User even when their CFS share is numerically larger.
     System = 0,
     /// Default class for user-spawned applications (`apps/*`) and services
-    /// that have not opted into System latency. Runs only when no System
-    /// task is ready.
+    /// that have not opted into System latency. Runs when no System task is
+    /// ready, or once the bounded System burst requires its reserved turn.
     User = 1,
     /// The root halt loop after `mark_root_idle()`. Picked only as the last
     /// resort fallback when literally nothing else is ready.
@@ -247,6 +267,11 @@ pub(super) struct Scheduler {
     /// True after the bootstrap root task has entered the permanent hlt loop.
     /// Before that, slot 0 still runs finalize work and remains schedulable.
     root_idle: bool,
+    /// Number of immediately preceding System-class dispatches. Once the
+    /// bounded maximum is reached a ready User task receives one mandatory
+    /// dispatch, preventing a critical-lane flood from starving recovery or
+    /// ordinary applications forever.
+    system_dispatch_streak: u8,
     /// Fixed scheduler tick divisor. CFS-style scheduling accounts CPU share
     /// through vruntime weights; it must not also shorten/lengthen the hardware
     /// tick per task or low-weight services pay excessive interrupt overhead.
@@ -270,6 +295,7 @@ impl Scheduler {
             ipc_priority_donations: [None; MAX_TASK],
             last_min_vruntime_ns: 0,
             root_idle: false,
+            system_dispatch_streak: 0,
             scheduler_tick_divisor: 0,
         }
     }
@@ -292,6 +318,30 @@ impl Scheduler {
         }
         self.apply_ipc_donation(slot);
         self.next_pick_hint = Some(slot);
+    }
+
+    /// Selects a runnable worker for a process-owned endpoint when the sender
+    /// enqueues between the server's reply and its next `IPC_RECV`. In that
+    /// window the endpoint has no waiter task to return, but the process worker
+    /// is ready and must receive the same direct-handoff treatment.
+    pub(super) fn set_next_process_pick_hint(&mut self, process_id: u64) -> Option<u64> {
+        let slot = (0..MAX_TASK)
+            .filter(|slot| *slot != self.current_task)
+            .filter(|slot| {
+                self.contexts[*slot].is_some_and(|context| {
+                    context.process_id == Some(process_id)
+                        && context.ready
+                        && self.context_is_schedulable(*slot, context)
+                })
+            })
+            .min_by_key(|slot| {
+                self.contexts[*slot]
+                    .map(|context| (context.vruntime_ns, *slot))
+                    .unwrap_or((u64::MAX, *slot))
+            })?;
+        self.apply_ipc_donation(slot);
+        self.next_pick_hint = Some(slot);
+        self.starts[slot].map(|start| start.id)
     }
 
     /// Makes `receiver_task_id` inherit the effective strict scheduling class
@@ -580,6 +630,7 @@ impl Scheduler {
         self.next_spawn_pick_hint = None;
         self.ipc_priority_donations = [None; MAX_TASK];
         self.root_idle = false;
+        self.system_dispatch_streak = 0;
         self.scheduler_tick_divisor = main_thread_pit_divisor;
         self.reset_stack_storage(ROOT_TASK_SLOT)
             .expect("scheduler root stack allocation failed");
@@ -690,7 +741,7 @@ impl Scheduler {
     /// Heavier-weight tasks accrue vruntime more slowly and therefore receive
     /// a proportionally larger share of CPU time.
     fn weighted_vruntime_delta(elapsed_ns: u64, weight: u32) -> u64 {
-        let w = weight.clamp(MIN_LOAD_WEIGHT, MAX_LOAD_WEIGHT) as u64;
+        let w = (weight & LOAD_WEIGHT_MASK).clamp(MIN_LOAD_WEIGHT, MAX_LOAD_WEIGHT) as u64;
         elapsed_ns
             .saturating_mul(NICE_0_LOAD as u64)
             .saturating_div(w)
@@ -706,8 +757,15 @@ impl Scheduler {
         // is monotonically increasing in weight_micros. Using `divisor * 8`
         // keeps default-weight tasks near NICE_0_LOAD without arithmetic that
         // requires knowing the PIT base frequency at this layer.
-        let scaled = (divisor.max(1) as u32).saturating_mul(8);
-        scaled.clamp(MIN_LOAD_WEIGHT, MAX_LOAD_WEIGHT)
+        let interactive = divisor & INTERACTIVE_PIT_DIVISOR_FLAG != 0;
+        let raw_divisor = divisor & !INTERACTIVE_PIT_DIVISOR_FLAG;
+        let scaled = (raw_divisor.max(1) as u32).saturating_mul(8);
+        let load = scaled.clamp(MIN_LOAD_WEIGHT, MAX_LOAD_WEIGHT);
+        load | if interactive {
+            SYSTEM_CLASS_WEIGHT_FLAG
+        } else {
+            0
+        }
     }
 
     /// Returns the smallest vruntime across all ready (or current-running)
@@ -771,13 +829,11 @@ impl Scheduler {
     /// `weight_micros` of a service via its manifest remains the single source
     /// of truth; no separate sched_class field has to be kept in sync.
     ///
-    /// Class is determined purely by load weight, not by user/kernel mode.
-    /// Kernel-mode workers (housekeeping, future kernel daemons) intentionally
-    /// run at default weight and stay in User — they are polling loops that
-    /// yield often, and putting them in System above User-class services
-    /// would deadlock IPC because housekeeping never blocks long enough to
-    /// release the band. Promotion to System is an explicit per-service
-    /// opt-in via `RUSTOS.package.toml::weight_micros`.
+    /// Class is determined by the explicit admission bit carried with the
+    /// launch weight, not by user/kernel mode or the magnitude of the CFS
+    /// share. Kernel workers and bootstrap brokers stay in User unless their
+    /// trusted launcher opts them in; this prevents a high-throughput weight
+    /// from silently becoming a strict-priority capability.
     fn slot_class(&self, slot: usize) -> Option<SchedClass> {
         let mut visiting = [false; MAX_TASK];
         self.effective_slot_class(slot, &mut visiting)
@@ -826,7 +882,7 @@ impl Scheduler {
         if slot == ROOT_TASK_SLOT && self.root_idle {
             return Some(SchedClass::Idle);
         }
-        if ctx.weight >= SYSTEM_CLASS_WEIGHT_THRESHOLD {
+        if ctx.weight & SYSTEM_CLASS_WEIGHT_FLAG != 0 {
             Some(SchedClass::System)
         } else {
             Some(SchedClass::User)
@@ -887,10 +943,9 @@ impl Scheduler {
         context.exec_start_ticks = 0;
     }
 
-    /// Walks scheduling classes in strict priority order (System > User >
-    /// Idle) and within each picks the smallest-vruntime ready task. A class
-    /// is fully drained before the next is consulted: once any System task
-    /// is ready, no User or Idle task is ever returned by this function.
+    /// Walks scheduling classes in priority order (System > User > Idle) and
+    /// within each picks the smallest-vruntime ready task. The dispatcher
+    /// applies the bounded User reservation before calling this normal path.
     ///
     /// Returns `None` only if literally nothing is ready and schedulable in
     /// any class (including the current task and root) — in which case
@@ -912,6 +967,83 @@ impl Scheduler {
             }
         }
         None
+    }
+
+    /// Returns one ready User task after a bounded System burst. The selected
+    /// User turn is not a best-effort hint: callers skip spawn/IPC handoff and
+    /// min-granularity retention for this turn, so a ready critical task cannot
+    /// silently bypass the reservation.
+    fn reserved_user_pick(&self, current: usize) -> Option<usize> {
+        self.user_reservation_due()
+            .then(|| self.pick_min_vruntime_in_class(current, SchedClass::User))
+            .flatten()
+    }
+
+    fn overdue_system_pick(&self, current: usize, now_ticks: u64) -> Option<usize> {
+        let mut oldest: Option<(usize, u64, u64)> = None;
+        for slot in 0..MAX_TASK {
+            if slot == current || !self.is_fair_candidate_slot(slot) {
+                continue;
+            }
+            let Some(context) = self.contexts[slot] else {
+                continue;
+            };
+            if !context.ready
+                || context.ready_since_ticks == 0
+                || !self.context_is_schedulable(slot, context)
+                || self.slot_class(slot) != Some(SchedClass::System)
+                || Self::ticks_elapsed_ms(context.ready_since_ticks, now_ticks)
+                    < SYSTEM_READY_LATENCY_BOUND_MS
+            {
+                continue;
+            }
+            let candidate = (slot, context.ready_since_ticks, context.vruntime_ns);
+            match oldest {
+                None => oldest = Some(candidate),
+                Some((_, oldest_since, oldest_vruntime))
+                    if context.ready_since_ticks < oldest_since
+                        || (context.ready_since_ticks == oldest_since
+                            && context.vruntime_ns < oldest_vruntime) =>
+                {
+                    oldest = Some(candidate);
+                }
+                _ => {}
+            }
+        }
+        oldest.map(|(slot, _, _)| slot)
+    }
+
+    fn user_reservation_due(&self) -> bool {
+        self.system_dispatch_streak >= MAX_CONSECUTIVE_SYSTEM_DISPATCHES
+    }
+
+    fn record_dispatch_class(&mut self, slot: usize) {
+        self.system_dispatch_streak = match self.slot_class(slot) {
+            Some(SchedClass::System) => self
+                .system_dispatch_streak
+                .saturating_add(1)
+                .min(MAX_CONSECUTIVE_SYSTEM_DISPATCHES),
+            Some(SchedClass::User | SchedClass::Idle) | None => 0,
+        };
+    }
+
+    /// Removes the current user task's *base* System-class admission.
+    ///
+    /// This is an irreversible self-demotion for a process helper such as a
+    /// telemetry, catalog, or untrusted client-accept worker.  It preserves
+    /// the load weight and intentionally does not touch a live reply-scoped
+    /// IPC donation: a caller's bounded priority inheritance must outlive a
+    /// helper's local base-class choice and is released only by that reply's
+    /// terminal path.
+    pub(super) fn demote_current_user_task_to_user_class(&mut self) -> bool {
+        let Some(context) = self.contexts[self.current_task].as_mut() else {
+            return false;
+        };
+        if !context.user_mode {
+            return false;
+        }
+        context.weight &= LOAD_WEIGHT_MASK;
+        true
     }
 
     fn pick_min_vruntime_in_class_excluding(
@@ -1692,11 +1824,10 @@ impl Scheduler {
         &mut self,
         id: u64,
         bootstrap: UserTaskBootstrap,
-        pit_divisor: u16,
         user_cs: u64,
         user_ss: u64,
         rflags: u64,
-    ) -> Option<usize> {
+    ) -> Option<(usize, u32)> {
         let current = self.contexts[self.current_task]?;
         if !current.user_mode {
             return None;
@@ -1733,14 +1864,23 @@ impl Scheduler {
                 self.contexts[slot] = Some(TaskContext {
                     saved_rsp: self
                         .init_user_task_context(slot, &bootstrap, user_cs, user_ss, rflags),
-                    ready: true,
-                    ready_since_ticks: crate::arch::rtc::ticks(),
-                    blocked: false,
-                    blocked_since_ticks: 0,
+                    // Clone publication is transactional. The child must not
+                    // execute until the caller has committed parent_tid and
+                    // child_tid in the shared address space.
+                    ready: false,
+                    ready_since_ticks: 0,
+                    blocked: true,
+                    blocked_since_ticks: crate::arch::rtc::ticks(),
                     wake_armed: false,
-                    weight: Self::weight_from_pit_divisor(pit_divisor),
-                    vruntime_ns: self
-                        .last_min_vruntime_ns
+                    // POSIX threads share one process scheduling policy.  A
+                    // hard-coded default here creates a cross-class priority
+                    // inversion when a System UI thread waits on a helper it
+                    // just cloned.  Inherit the parent's base load weight and
+                    // fair position; transient IPC donations remain scoped to
+                    // their reply capability and are intentionally not copied.
+                    weight: current.weight,
+                    vruntime_ns: current
+                        .vruntime_ns
                         .saturating_add(SCHED_NEW_TASK_VRUNTIME_PENALTY_NS),
                     exec_start_ticks: 0,
                     address_space_root: root_phys,
@@ -1761,11 +1901,12 @@ impl Scheduler {
                     }),
                 });
                 self.simd_states[slot] = SimdState::new();
+                self.start_suspended[slot] = true;
                 self.starts[slot] = Some(TaskStart {
                     entry: super::noop_task_entry,
                     id,
                 });
-                return Some(slot);
+                return Some((slot, current.weight));
             }
         }
 
@@ -1985,18 +2126,37 @@ impl Scheduler {
         //  4. Root task as the unconditional fallback.
         // Hints short-circuit CFS only for direct handoff; otherwise vruntime
         // decides fairness.
-        let spawn_hint = self.take_next_spawn_pick_hint_ready_slot();
-        let hint = spawn_hint.or_else(|| self.take_next_pick_hint_ready_slot());
-        let cfs_pick = if voluntary_yield {
-            self.pick_min_vruntime_excluding(current_slot)
-                .or_else(|| self.pick_min_vruntime(current_slot))
-        } else {
-            self.pick_min_vruntime(current_slot)
-        };
-        let (next_idx, ipc_handoff) = match (hint, cfs_pick) {
-            (Some(hint_slot), _) => (hint_slot, true),
-            (None, Some(slot)) => (slot, false),
-            (None, None) => (ROOT_TASK_SLOT, false),
+        // A caller that committed a synchronous IPC block has no remaining
+        // work until its exact receiver runs. Honor that reply-scoped direct
+        // handoff before the unrelated User reservation; selecting a polling
+        // User task here can otherwise strand the entire causal chain. Normal
+        // yields and spawn hints still remain behind the bounded reservation.
+        let blocking_ipc_handoff = self.contexts[current_slot]
+            .is_some_and(|context| context.blocked)
+            .then(|| self.take_next_pick_hint_ready_slot())
+            .flatten();
+        let (next_idx, ipc_handoff, reserved_user_pick) = match blocking_ipc_handoff {
+            Some(receiver_slot) => (receiver_slot, true, None),
+            None => match self.reserved_user_pick(current_slot) {
+                Some(user_slot) => (user_slot, false, Some(user_slot)),
+                None => {
+                    let spawn_hint = self.take_next_spawn_pick_hint_ready_slot();
+                    let hint = spawn_hint.or_else(|| self.take_next_pick_hint_ready_slot());
+                    let overdue = self.overdue_system_pick(current_slot, now_ticks);
+                    let cfs_pick = if voluntary_yield {
+                        self.pick_min_vruntime_excluding(current_slot)
+                            .or_else(|| self.pick_min_vruntime(current_slot))
+                    } else {
+                        self.pick_min_vruntime(current_slot)
+                    };
+                    match (hint, overdue, cfs_pick) {
+                        (Some(hint_slot), _, _) => (hint_slot, true, None),
+                        (None, Some(overdue_slot), _) => (overdue_slot, true, None),
+                        (None, None, Some(slot)) => (slot, false, None),
+                        (None, None, None) => (ROOT_TASK_SLOT, false, None),
+                    }
+                }
+            },
         };
 
         // Apply min-granularity guard: if the CFS pick differs from current
@@ -2004,7 +2164,7 @@ impl Scheduler {
         // a slice of at least SCHED_MIN_GRANULARITY_NS, keep current to avoid
         // context-switch ping-pong. This is the same heuristic Linux uses to
         // damp wake-preempt thrash.
-        let next_idx = if ipc_handoff || voluntary_yield {
+        let next_idx = if ipc_handoff || voluntary_yield || reserved_user_pick.is_some() {
             next_idx
         } else {
             self.maybe_keep_current(current_slot, next_idx, current_runtime_ns)
@@ -2029,6 +2189,7 @@ impl Scheduler {
                         context.ready_since_ticks = 0;
                         context.exec_start_ticks = now_ticks;
                     }
+                    self.record_dispatch_class(next_idx);
                     self.current_task = next_idx;
                     return (next.saved_rsp, self.scheduler_tick_divisor);
                 }
@@ -3101,11 +3262,11 @@ impl Scheduler {
         // yield (could be tens to hundreds of ms in a user-task syscall that
         // doesn't cond_resched). Linux's `check_preempt_wakeup` uses a
         // wakeup_granularity threshold; Mach signals
-        // `AST_PREEMPT | AST_URGENT` on cross-band wake. We use the
-        // existing DEFERRED_RESCHEDULE flag — it is checked at syscall exit
-        // and on every IRQ tail, so once raised it is consumed at the
-        // earliest safe point regardless of whether the wake originated from
-        // an IRQ or a kernel-mode syscall (futex/IPC reply paths).
+        // `AST_PREEMPT | AST_URGENT` on cross-band wake. We use the existing
+        // DEFERRED_RESCHEDULE flag for explicit in-kernel cond_resched points.
+        // An ordinary syscall return clears it and relies on the next PIT,
+        // avoiding a nested voluntary-yield frame while keeping wake latency
+        // bounded by one scheduler tick.
         if waker_ready && slot != self.current_task {
             let current_class = self.slot_class(self.current_task);
             let should_preempt = match (woken_class, current_class) {
@@ -3296,11 +3457,11 @@ mod tests {
     use alloc::boxed::Box;
 
     use super::{
-        ConsoleSessionHandle, MAX_TASK, NICE_0_LOAD, SYSTEM_CLASS_WEIGHT_THRESHOLD, SchedClass,
-        Scheduler, TaskContext, TaskStart,
+        ConsoleSessionHandle, MAX_CONSECUTIVE_SYSTEM_DISPATCHES, MAX_TASK, NICE_0_LOAD,
+        SYSTEM_CLASS_WEIGHT_FLAG, SchedClass, Scheduler, TaskContext, TaskStart,
     };
     use crate::memory::paging::ProcessAddressSpace;
-    use crate::multitask::{noop_task_entry, process_table};
+    use crate::multitask::{UserTaskBootstrap, noop_task_entry, process_table};
     use crate::user::abi::UserAbi;
     use crate::user::process_state::UserProcessState;
 
@@ -3349,11 +3510,7 @@ mod tests {
 
     #[test]
     fn collect_process_sibling_slots_returns_matching_user_slots_only() {
-        let mut scheduler = Box::<Scheduler>::new_uninit();
-        unsafe {
-            scheduler.as_mut_ptr().write_bytes(0, 1);
-        }
-        let mut scheduler = unsafe { scheduler.assume_init() };
+        let mut scheduler = Box::new(Scheduler::new());
         let owner = test_process(1);
         let other = test_process(2);
 
@@ -3374,11 +3531,7 @@ mod tests {
 
     #[test]
     fn current_process_task_ids_excludes_other_and_retired_tasks() {
-        let mut scheduler = Box::<Scheduler>::new_uninit();
-        unsafe {
-            scheduler.as_mut_ptr().write_bytes(0, 1);
-        }
-        let mut scheduler = unsafe { scheduler.assume_init() };
+        let mut scheduler = Box::new(Scheduler::new());
         let owner = test_process(11);
         let other = test_process(22);
 
@@ -3412,11 +3565,7 @@ mod tests {
 
     #[test]
     fn terminate_user_process_retires_every_live_sibling() {
-        let mut scheduler = Box::<Scheduler>::new_uninit();
-        unsafe {
-            scheduler.as_mut_ptr().write_bytes(0, 1);
-        }
-        let mut scheduler = unsafe { scheduler.assume_init() };
+        let mut scheduler = Box::new(Scheduler::new());
         let owner = test_process(41);
         let other = test_process(42);
 
@@ -3444,17 +3593,13 @@ mod tests {
 
     #[test]
     fn synchronous_ipc_donation_promotes_and_revokes_a_transitive_user_chain() {
-        let mut scheduler = Box::<Scheduler>::new_uninit();
-        unsafe {
-            scheduler.as_mut_ptr().write_bytes(0, 1);
-        }
-        let mut scheduler = unsafe { scheduler.assume_init() };
+        let mut scheduler = Box::new(Scheduler::new());
         let interactive = test_process(61);
         let broker = test_process(62);
         let policy = test_process(63);
 
         let mut interactive_context = test_user_context(interactive);
-        interactive_context.weight = SYSTEM_CLASS_WEIGHT_THRESHOLD;
+        interactive_context.weight = SYSTEM_CLASS_WEIGHT_FLAG | NICE_0_LOAD;
         scheduler.contexts[1] = Some(interactive_context);
         scheduler.contexts[2] = Some(test_user_context(broker));
         scheduler.contexts[3] = Some(test_user_context(policy));
@@ -3497,5 +3642,206 @@ mod tests {
         assert_eq!(scheduler.slot_class(2), Some(SchedClass::System));
         assert!(scheduler.release_ipc_priority(12));
         assert_eq!(scheduler.slot_class(2), Some(SchedClass::User));
+    }
+
+    #[test]
+    fn strict_class_requires_explicit_admission_not_a_large_cfs_weight() {
+        let mut scheduler = Box::new(Scheduler::new());
+        let broker = test_process(69);
+        let interactive = test_process(70);
+
+        let mut broker_context = test_user_context(broker);
+        broker_context.weight = 4 * NICE_0_LOAD;
+        let mut interactive_context = test_user_context(interactive);
+        interactive_context.weight = SYSTEM_CLASS_WEIGHT_FLAG | NICE_0_LOAD;
+        scheduler.contexts[1] = Some(broker_context);
+        scheduler.contexts[2] = Some(interactive_context);
+
+        assert_eq!(scheduler.slot_class(1), Some(SchedClass::User));
+        assert_eq!(scheduler.slot_class(2), Some(SchedClass::System));
+    }
+
+    #[test]
+    fn self_demotion_removes_only_the_base_system_class() {
+        let mut scheduler = Box::new(Scheduler::new());
+        let helper = test_process(73);
+        let donor = test_process(74);
+
+        let mut helper_context = test_user_context(helper);
+        helper_context.weight = SYSTEM_CLASS_WEIGHT_FLAG | NICE_0_LOAD;
+        let mut donor_context = test_user_context(donor);
+        donor_context.weight = SYSTEM_CLASS_WEIGHT_FLAG | NICE_0_LOAD;
+        scheduler.contexts[1] = Some(helper_context);
+        scheduler.contexts[2] = Some(donor_context);
+        scheduler.starts[1] = Some(TaskStart {
+            entry: noop_task_entry,
+            id: 702,
+        });
+        scheduler.starts[2] = Some(TaskStart {
+            entry: noop_task_entry,
+            id: 701,
+        });
+        scheduler.current_task = 1;
+
+        assert!(scheduler.demote_current_user_task_to_user_class());
+        assert_eq!(scheduler.slot_class(1), Some(SchedClass::User));
+        assert_eq!(
+            scheduler.contexts[1].expect("current context").weight,
+            NICE_0_LOAD
+        );
+
+        // A synchronous reply donation is a separate, capability-scoped
+        // source of priority.  Demotion must not turn a pending interactive
+        // request into an unbounded priority inversion.
+        assert!(scheduler.inherit_ipc_priority(13, 701, 702));
+        assert_eq!(scheduler.slot_class(1), Some(SchedClass::System));
+        assert!(scheduler.demote_current_user_task_to_user_class());
+        assert_eq!(scheduler.slot_class(1), Some(SchedClass::System));
+        assert!(scheduler.release_ipc_priority(13));
+        assert_eq!(scheduler.slot_class(1), Some(SchedClass::User));
+    }
+
+    #[test]
+    fn bounded_system_burst_reserves_a_ready_user_turn() {
+        let mut scheduler = Box::new(Scheduler::new());
+        let system = test_process(71);
+        let user = test_process(72);
+
+        let mut system_context = test_user_context(system);
+        system_context.weight = SYSTEM_CLASS_WEIGHT_FLAG | NICE_0_LOAD;
+        scheduler.contexts[1] = Some(system_context);
+        scheduler.contexts[2] = Some(test_user_context(user));
+        scheduler.system_dispatch_streak = MAX_CONSECUTIVE_SYSTEM_DISPATCHES;
+
+        assert!(scheduler.user_reservation_due());
+        scheduler.record_dispatch_class(2);
+        assert_eq!(scheduler.system_dispatch_streak, 0);
+        assert!(!scheduler.user_reservation_due());
+
+        scheduler.record_dispatch_class(1);
+        assert_eq!(scheduler.system_dispatch_streak, 1);
+    }
+
+    #[test]
+    fn overdue_system_task_is_forced_after_latency_bound() {
+        let mut scheduler = Box::new(Scheduler::new());
+        let base = crate::memory::paging::USER_SPACE_BASE;
+        let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
+        let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
+        let bootstrap = |offset| {
+            UserTaskBootstrap::new(
+                UserAbi::Linux,
+                x86_64::VirtAddr::new(base + offset),
+                x86_64::VirtAddr::new(base + offset + 0x1_000),
+            )
+        };
+        let current = scheduler
+            .allocate_user_slot(
+                701,
+                ProcessAddressSpace::empty_for_tests(),
+                bootstrap(0x2_000),
+                None,
+                crate::arch::pit::divisor_from_micros(100),
+                user_cs,
+                user_ss,
+                super::RFLAGS_RESERVED_BIT_1,
+                false,
+                noop_task_entry,
+            )
+            .expect("current slot");
+        let interactive = scheduler
+            .allocate_user_slot(
+                702,
+                ProcessAddressSpace::empty_for_tests(),
+                bootstrap(0x4_000),
+                None,
+                crate::arch::pit::divisor_from_micros(2_000) | super::INTERACTIVE_PIT_DIVISOR_FLAG,
+                user_cs,
+                user_ss,
+                super::RFLAGS_RESERVED_BIT_1,
+                false,
+                noop_task_entry,
+            )
+            .expect("interactive slot");
+        scheduler.contexts[interactive]
+            .as_mut()
+            .expect("interactive context")
+            .ready_since_ticks = 1;
+
+        let now_ticks = crate::arch::rtc::ticks_per_second().saturating_mul(2);
+        assert_eq!(
+            scheduler.overdue_system_pick(current, now_ticks),
+            Some(interactive)
+        );
+    }
+
+    #[test]
+    fn spawn_handoff_is_one_shot_and_precedes_ipc_handoff() {
+        let mut scheduler = Box::new(Scheduler::new());
+        let base = crate::memory::paging::USER_SPACE_BASE;
+        let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
+        let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
+        let parent_bootstrap = UserTaskBootstrap::new(
+            UserAbi::Linux,
+            x86_64::VirtAddr::new(base + 0x2_000),
+            x86_64::VirtAddr::new(base + 0x4_000),
+        );
+        let parent_slot = scheduler
+            .allocate_user_slot(
+                801,
+                ProcessAddressSpace::empty_for_tests(),
+                parent_bootstrap,
+                None,
+                crate::arch::pit::divisor_from_micros(2_000) | super::INTERACTIVE_PIT_DIVISOR_FLAG,
+                user_cs,
+                user_ss,
+                super::RFLAGS_RESERVED_BIT_1,
+                false,
+                noop_task_entry,
+            )
+            .expect("parent slot");
+        scheduler.current_task = parent_slot;
+
+        for (task_id, entry_offset, stack_offset) in
+            [(802, 0x3_000, 0x5_000), (803, 0x3_800, 0x5_800)]
+        {
+            let bootstrap = UserTaskBootstrap::new(
+                UserAbi::Linux,
+                x86_64::VirtAddr::new(base + entry_offset),
+                x86_64::VirtAddr::new(base + stack_offset),
+            );
+            let (thread_slot, inherited_weight) = scheduler
+                .allocate_user_thread_slot(
+                    task_id,
+                    bootstrap,
+                    user_cs,
+                    user_ss,
+                    super::RFLAGS_RESERVED_BIT_1,
+                )
+                .expect("thread slot");
+            assert_eq!(scheduler.slot_class(thread_slot), Some(SchedClass::System));
+            assert!(
+                !scheduler.contexts[thread_slot]
+                    .expect("thread context")
+                    .ready
+            );
+            assert!(scheduler.start_suspended[thread_slot]);
+            assert_eq!(
+                inherited_weight,
+                scheduler.contexts[parent_slot]
+                    .expect("parent context")
+                    .weight
+            );
+        }
+
+        assert!(scheduler.activate_suspended_user_task(802));
+        assert!(scheduler.activate_suspended_user_task(803));
+
+        scheduler.set_next_spawn_pick_hint(802);
+        scheduler.set_next_pick_hint(803);
+
+        assert_eq!(scheduler.take_next_spawn_pick_hint_ready_slot(), Some(2));
+        assert_eq!(scheduler.take_next_spawn_pick_hint_ready_slot(), None);
+        assert_eq!(scheduler.take_next_pick_hint_ready_slot(), Some(3));
     }
 }

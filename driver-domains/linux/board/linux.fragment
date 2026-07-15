@@ -17,6 +17,10 @@ CONFIG_PCI=y
 CONFIG_PCIEPORTBUS=y
 CONFIG_HOTPLUG_PCI=y
 CONFIG_HOTPLUG_PCI_PCIE=y
+CONFIG_UIO=y
+# Generic UIO is INTx-only and cannot provide an ivshmem-doorbell MSI-X
+# interrupt. The DVM packages its fixed-header-specific MSI-X adapter instead.
+# CONFIG_UIO_PCI_GENERIC is not set
 CONFIG_VIRTIO=y
 CONFIG_VIRTIO_PCI=y
 CONFIG_VIRTIO_PCI_LEGACY=y

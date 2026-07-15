@@ -50,8 +50,9 @@ pub struct TaskHooks {
     pub current_user_snapshot: Option<fn() -> Option<CurrentUserSnapshot>>,
     pub is_scheduler_initialized: Option<fn() -> bool>,
     pub current_task_id: Option<fn() -> Option<u64>>,
-    pub current_user_thread_id: Option<fn() -> Option<u64>>,
-    pub block_current_user_task: Option<fn() -> bool>,
+    pub arm_block_current_task: Option<fn() -> bool>,
+    pub cancel_block_current_task: Option<fn() -> bool>,
+    pub commit_block_current_task: Option<fn() -> Option<bool>>,
     pub wake_user_task: Option<fn(u64) -> bool>,
     pub yield_now: Option<fn()>,
 }
@@ -80,8 +81,9 @@ static HOOKS: RwLock<HookRegistry> = RwLock::new(HookRegistry {
         current_user_snapshot: None,
         is_scheduler_initialized: None,
         current_task_id: None,
-        current_user_thread_id: None,
-        block_current_user_task: None,
+        arm_block_current_task: None,
+        cancel_block_current_task: None,
+        commit_block_current_task: None,
         wake_user_task: None,
         yield_now: None,
     },
@@ -143,25 +145,34 @@ pub fn is_scheduler_initialized() -> bool {
         .unwrap_or(false)
 }
 
-pub fn current_user_thread_id() -> Option<u64> {
-    HOOKS
-        .read()
-        .task
-        .current_user_thread_id
-        .and_then(|hook| hook())
-}
-
 pub fn current_task_id() -> Option<u64> {
     HOOKS.read().task.current_task_id.and_then(|hook| hook())
 }
 
-pub fn block_current_user_task() -> bool {
+pub fn arm_block_current_task() -> bool {
     HOOKS
         .read()
         .task
-        .block_current_user_task
+        .arm_block_current_task
         .map(|hook| hook())
         .unwrap_or(false)
+}
+
+pub fn cancel_block_current_task() -> bool {
+    HOOKS
+        .read()
+        .task
+        .cancel_block_current_task
+        .map(|hook| hook())
+        .unwrap_or(false)
+}
+
+pub fn commit_block_current_task() -> Option<bool> {
+    HOOKS
+        .read()
+        .task
+        .commit_block_current_task
+        .and_then(|hook| hook())
 }
 
 pub fn wake_user_task(task_id: u64) -> bool {

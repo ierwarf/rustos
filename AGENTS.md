@@ -74,6 +74,19 @@ the migration source of truth.
 Migration moves policy to user services without breaking observable app ABI;
 ring0 code removal must go through narrow explicit brokers.
 
+## Commercial Completion Bar
+
+No path, document, test plan, or review may excuse a missing required property
+because the system is "early", experimental, transitional, or a prototype.
+For every enabled product topology, completion requires explicit ownership and
+least authority, bounded failure detection and recovery, authenticated and
+versioned cross-domain contracts, observable latency/throughput limits, and
+evidence that the implementation satisfies its stated invariants. A mandatory
+capability that is absent, unverified, or retained only behind a fallback is a
+failed acceptance gate, not a caveat. Retire replaced code, contracts, and
+documentation after dependency proof; do not preserve a legacy route merely to
+make an incomplete primary route appear successful.
+
 **General principles.**
 
 - Hardening over symptom patches: make ownership, timeouts, queue bounds, and

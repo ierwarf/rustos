@@ -202,6 +202,35 @@ pub fn initialize_kernel(boot_info_ptr: *const BootInfo) {
     hal_api::init_acpi(boot_info_ptr);
     announce_ready("ACPI", b"ACPI initialized.\r\n");
 
+    let clocksource = hal_api::init_clocksource().unwrap_or_else(|| {
+        panic!(
+            "no validated monotonic clocksource (invariant TSC or 64-bit HPET); acpi_hpet={:?}",
+            hal_api::arch::acpi::hpet_address(),
+        )
+    });
+    boot_log!(
+        debug::LogLevel::Info,
+        104,
+        clocksource.frequency_hz,
+        "monotonic clocksource={} frequency_hz={}",
+        clocksource.name,
+        clocksource.frequency_hz,
+    );
+    debug::record_milestone(
+        debug::LogCategory::Boot,
+        "clocksource-ready",
+        clocksource.frequency_hz,
+        u64::from(clocksource.name == "invariant-tsc"),
+    );
+    announce_ready("Clocksource", b"Monotonic clocksource initialized.\r\n");
+
+    // The DVM display receiver programs a masked MSI-X table entry. Its
+    // bounded xAPIC/MSI substrate must therefore exist before PCI probing;
+    // probing after ACPI but before `init_pic` would correctly fail closed on
+    // every otherwise valid ivshmem function.
+    hal_api::init_pic();
+    announce_ready("PIC", b"PIC initialized.\r\n");
+
     // ivshmem is a PCI function. The DVM providers must be probed only after
     // ACPI has published the PCI bus regions; probing earlier silently sees no
     // device and can make a firmware framebuffer look like a live DVM path.
@@ -235,9 +264,6 @@ pub fn initialize_kernel(boot_info_ptr: *const BootInfo) {
             "DVM shared network transport unavailable; network remains disabled"
         );
     }
-
-    hal_api::init_pic();
-    announce_ready("PIC", b"PIC initialized.\r\n");
 
     io_services::init_input();
     announce_ready("DVM input", b"DVM input transport initialized.\r\n");

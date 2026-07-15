@@ -9,21 +9,26 @@
 //! devices (network, block, GPU) need their own paravirtual backends and must
 //! not be tunneled through this control relay.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+pub mod ivshmem;
+pub use ivshmem::{IvshmemDoorbellServer, IvshmemInputProducer};
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{Read, Write};
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 pub use driver_domain_protocol::{
-    DvmInputFrameError, LINUX_EVDEV_KEY_MAX, RUSTOS_INPUT_FRAME_BYTES, RUSTOS_POINTER_BUTTON_MASK,
-    RustosInputFrame,
+    DVM_INPUT_RING_APERTURE_BYTES, DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY,
+    DVM_INPUT_RING_FLAG_RUSTOS_READY, DVM_INPUT_RING_HEADER_BYTES, DVM_INPUT_RING_PRODUCER_OFFSET,
+    DVM_INPUT_RING_RECORD_BYTES, DVM_INPUT_RING_SLOT_COUNT, DvmInputFrameError, DvmInputRingHeader,
+    LINUX_EVDEV_KEY_MAX, RUSTOS_INPUT_FRAME_BYTES, RUSTOS_POINTER_BUTTON_MASK,
+    RUSTOS_POINTER_POSITION_MAX_X, RUSTOS_POINTER_POSITION_MAX_Y, RustosInputFrame,
 };
 
 /// The DVM control listener port is derived from the owner-private per-launch
@@ -35,44 +40,14 @@ pub const MAX_CONTROL_FRAME: usize = 4 * 1024;
 pub const LINUX_DVM_ROLE: &str = "linux-driver-domain";
 
 const INPUT_RELAY_MAX_SEQUENCE: u32 = u32::MAX - 1024;
-// RDI2 is carried by a bounded 115200-bps COM2 transport. The DVM coalesces
-// relative pointer samples to 125Hz, and L0 still enforces the resulting
-// physical transport budget against a compromised or buggy DVM.
+// The Linux DVM relay coalesces relative pointer samples to 125Hz; L0 still
+// enforces the resulting physical transport budget against a compromised or
+// buggy DVM before it commits the fixed shared-memory input ring.
 const INPUT_RELAY_MAX_FRAMES_PER_SECOND: u32 = 256;
-// The L0 socket is the only boot-time elasticity layer between a live DVM and
-// QEMU's small serial frontend. It holds at most 30 seconds at the enforced
-// relay rate; an unavailable RustOS receiver still becomes an explicit bounded
-// failure instead of granting an unbounded host queue to the DVM.
-const INPUT_SINK_BOOT_BUFFER_SECONDS: usize = 30;
-const INPUT_SINK_BUFFER_BYTES: usize = RUSTOS_INPUT_FRAME_BYTES
-    * INPUT_RELAY_MAX_FRAMES_PER_SECOND as usize
-    * INPUT_SINK_BOOT_BUFFER_SECONDS;
-// A malicious DVM can hold every valid Linux key at once. Keep two additional
-// frames for pointer release and session end, so normal traffic can never
-// consume the L0-owned cleanup reserve.
-const INPUT_SINK_CLEANUP_RESERVE_FRAMES: usize = LINUX_EVDEV_KEY_MAX as usize + 2;
-const INPUT_SINK_MAX_PENDING_FRAMES: usize = INPUT_RELAY_MAX_FRAMES_PER_SECOND as usize
-    * INPUT_SINK_BOOT_BUFFER_SECONDS
-    + INPUT_SINK_CLEANUP_RESERVE_FRAMES;
-const INPUT_SINK_NORMAL_PENDING_LIMIT: usize =
-    INPUT_SINK_MAX_PENDING_FRAMES - INPUT_SINK_CLEANUP_RESERVE_FRAMES;
-const INPUT_SINK_QUEUE_DRAIN_DEADLINE: Duration =
-    Duration::from_secs(INPUT_SINK_BOOT_BUFFER_SECONDS as u64);
-const INPUT_SINK_IO_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(20);
-const INPUT_SINK_RETRY_DELAY: Duration = Duration::from_millis(1);
-// RustOS emits this only after an input consumer has entered the COM2 drain
-// path. It is a private QEMU chardev readiness signal, never an authorization
-// token and never DVM-provided data.
-const RUSTOS_INPUT_RECEIVER_READY: [u8; 4] = *b"RDRY";
-// Firmware or a pre-kernel serial console may emit bounded terminal-control
-// bytes on COM2 before RustOS owns it. Accept only the exact readiness token,
-// but scan a finite prefix rather than treating that harmless startup noise as
-// a transport authorization failure.
-const MAX_INPUT_RECEIVER_READY_NOISE_BYTES: usize = 4096;
-// Every live hostd process allocates a relay epoch once.  The COM2 receiver
-// uses an epoch plus a per-epoch sequence as its replay boundary, so time/PID
-// derived values are not sufficient: two rapid reconnects can collide.  Stop
-// before wrapping rather than silently reusing an authenticated epoch.
+// Every live hostd process allocates a relay epoch once. The fixed input ring
+// carries that epoch plus a per-epoch frame sequence, so time/PID derived
+// values are not sufficient: two rapid reconnects can collide. Stop before
+// wrapping rather than silently reusing an authenticated epoch.
 static NEXT_INPUT_EPOCH: AtomicU32 = AtomicU32::new(1);
 const INPUT_RELAY_MAX_KEYS_PER_SECOND: u32 = INPUT_RELAY_MAX_FRAMES_PER_SECOND;
 const CONTROL_AUTHENTICATION: &str = "dvm-agent-hmac-sha256-v1";
@@ -414,15 +389,15 @@ impl DeviceClass {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeviceTransport {
     Disabled,
-    /// Fixed, sequenced RDI2 input frames over the private RustOS COM2 device.
-    Rdi2Com2,
+    /// Fixed RDI3 records in the host-owned input ring plus one MSI-X wake.
+    InputRingMsix,
 }
 
 impl DeviceTransport {
     fn parse(value: &str, key: &str, label: &str) -> Result<Self> {
         match value {
             "disabled" => Ok(Self::Disabled),
-            "rdi2-com2" if key == DeviceClass::Input.policy_key() => Ok(Self::Rdi2Com2),
+            "input-ring-msix" if key == DeviceClass::Input.policy_key() => Ok(Self::InputRingMsix),
             _ => bail!("unsupported {label} {key} transport {value:?}"),
         }
     }
@@ -1678,10 +1653,8 @@ pub struct DvmDriverInventory {
 
 /// Destination controlled by L0 for sanitized DVM input frames.
 pub trait RustosInputSink {
-    /// Wait until RustOS has entered the bounded COM2 drain path. L0 must not
-    /// request an event stream before this succeeds, because doing so lets a
-    /// healthy-but-early DVM fill QEMU's serial backpressure buffer before a
-    /// RustOS consumer can observe it.
+    /// Wait until RustOS has validated the exact shared ring and armed its one
+    /// MSI-X receiver. This is boot admission, never a data-plane poll.
     fn wait_for_receiver_ready(&mut self, timeout: Duration) -> Result<()>;
 
     fn send_input_frame(&mut self, frame: &RustosInputFrame) -> Result<()>;
@@ -1698,248 +1671,179 @@ pub trait RustosInputSink {
     }
 }
 
-/// QEMU's private, dedicated serial socket used by the current low-rate input
-/// transport.  The socket is intentionally distinct from QMP and from the
-/// debug/console serial channel.
-#[derive(Debug)]
-pub struct UnixInputSink {
-    stream: UnixStream,
-    pending: VecDeque<PendingInputFrame>,
+/// Host producer for the one-way fixed ivshmem input ring. It maps the
+/// launch-owned backing file itself, commits a complete validated L0 frame,
+/// then signals RustOS's one MSI-X eventfd only for an empty-to-nonempty
+/// transition (or authenticated cleanup). No serial queue, QMP path,
+/// guest-selected descriptor, or data-plane retry is retained.
+pub struct InputRingSink {
+    producer: IvshmemInputProducer,
+    mapped: *mut u8,
+    mapped_len: usize,
+    generation: u64,
+    producer_cursor: u64,
 }
 
-impl UnixInputSink {
-    pub fn connect(path: &Path, timeout: Duration) -> Result<Self> {
-        let started = std::time::Instant::now();
-        loop {
-            match UnixStream::connect(path) {
-                Ok(stream) => {
-                    configure_input_socket_buffer(&stream)?;
-                    stream.set_nonblocking(true).with_context(|| {
-                        format!("set nonblocking RustOS input socket {}", path.display())
-                    })?;
-                    return Ok(Self {
-                        stream,
-                        pending: VecDeque::new(),
-                    });
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::NotFound
-                            | std::io::ErrorKind::ConnectionRefused
-                            | std::io::ErrorKind::AddrNotAvailable
-                    ) && started.elapsed() < timeout =>
-                {
-                    std::thread::sleep(Duration::from_millis(25));
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("connect RustOS input socket {}", path.display())
-                    });
-                }
-            }
-            if started.elapsed() >= timeout {
-                bail!(
-                    "timed out waiting for RustOS input socket {}",
-                    path.display()
-                );
-            }
+unsafe impl Send for InputRingSink {}
+
+impl InputRingSink {
+    pub fn connect(doorbell: &Path, backing: &Path, timeout: Duration) -> Result<Self> {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(backing)
+            .with_context(|| format!("open input-ring backing {}", backing.display()))?;
+        let mapped_len = usize::try_from(file.metadata().context("stat input-ring backing")?.len())
+            .context("input-ring backing length does not fit usize")?;
+        if mapped_len != DVM_INPUT_RING_APERTURE_BYTES as usize {
+            bail!("input-ring backing has unexpected length {mapped_len}");
         }
-    }
-}
-
-fn configure_input_socket_buffer(stream: &UnixStream) -> Result<()> {
-    let buffer_bytes = i32::try_from(INPUT_SINK_BUFFER_BYTES)
-        .expect("bounded RustOS input socket buffer must fit c_int");
-    let result = unsafe {
-        libc::setsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_SNDBUF,
-            (&raw const buffer_bytes).cast(),
-            size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if result != 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("set bounded RustOS input socket send buffer");
-    }
-    Ok(())
-}
-
-impl RustosInputSink for UnixInputSink {
-    fn wait_for_receiver_ready(&mut self, timeout: Duration) -> Result<()> {
-        let deadline = Instant::now() + timeout;
-        let mut scanner = InputReceiverReadyScanner::default();
-        let mut input = [0_u8; 64];
-        self.stream
-            .set_read_timeout(Some(timeout.min(INPUT_SINK_IO_ATTEMPT_TIMEOUT)))
-            .context("set RustOS input receiver readiness timeout")?;
-        loop {
-            match self.stream.read(&mut input) {
-                Ok(0) => {
-                    bail!("RustOS input receiver closed before its readiness signal");
-                }
-                Ok(count) if scanner.consume(&input[..count])? => return Ok(()),
-                Ok(_) => {}
-                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-                Err(error)
-                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
-                        && Instant::now() < deadline =>
-                {
-                    std::thread::sleep(INPUT_SINK_RETRY_DELAY);
-                }
-                Err(error) => {
-                    return Err(error).context("wait for RustOS input receiver readiness");
-                }
-            }
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                mapped_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
         }
-    }
-
-    fn send_input_frame(&mut self, frame: &RustosInputFrame) -> Result<()> {
-        self.queue_input_frame(frame, false)
-    }
-
-    fn send_input_cleanup_frame(&mut self, frame: &RustosInputFrame) -> Result<()> {
-        self.queue_input_frame(frame, true)
-    }
-
-    fn finish_input_relay(&mut self) -> Result<()> {
-        self.flush_pending_until(Instant::now() + INPUT_SINK_QUEUE_DRAIN_DEADLINE)
-            .context("flush bounded RustOS input relay queue")
-    }
-}
-
-#[derive(Default)]
-struct InputReceiverReadyScanner {
-    matched: usize,
-    skipped: usize,
-}
-
-impl InputReceiverReadyScanner {
-    fn consume(&mut self, bytes: &[u8]) -> Result<bool> {
-        for &byte in bytes {
-            self.skipped = self.skipped.saturating_add(1);
-            if self.skipped > MAX_INPUT_RECEIVER_READY_NOISE_BYTES {
-                bail!("RustOS input receiver readiness signal exceeded its bounded prelude");
-            }
-            if byte == RUSTOS_INPUT_RECEIVER_READY[self.matched] {
-                self.matched += 1;
-                if self.matched == RUSTOS_INPUT_RECEIVER_READY.len() {
-                    return Ok(true);
-                }
-            } else {
-                self.matched = usize::from(byte == RUSTOS_INPUT_RECEIVER_READY[0]);
-            }
+        .cast::<u8>();
+        if mapped == libc::MAP_FAILED.cast::<u8>() {
+            return Err(std::io::Error::last_os_error()).context("map input-ring backing");
         }
-        Ok(false)
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct PendingInputFrame {
-    bytes: [u8; RUSTOS_INPUT_FRAME_BYTES],
-    offset: usize,
-}
-
-impl UnixInputSink {
-    fn queue_input_frame(&mut self, frame: &RustosInputFrame, cleanup: bool) -> Result<()> {
-        self.flush_pending_nonblocking()
-            .context("flush queued RustOS input frames")?;
-        let limit = if cleanup {
-            INPUT_SINK_MAX_PENDING_FRAMES
-        } else {
-            INPUT_SINK_NORMAL_PENDING_LIMIT
+        let header = read_input_ring_header(mapped)?;
+        if header.region_bytes != DVM_INPUT_RING_APERTURE_BYTES {
+            unsafe { libc::munmap(mapped.cast::<libc::c_void>(), mapped_len) };
+            bail!("input-ring backing did not contain the required fixed header");
+        }
+        let producer = match IvshmemInputProducer::connect(doorbell, timeout) {
+            Ok(producer) => producer,
+            Err(error) => {
+                unsafe { libc::munmap(mapped.cast::<libc::c_void>(), mapped_len) };
+                return Err(error);
+            }
         };
-        if self.pending.len() >= limit {
+        Ok(Self {
+            producer,
+            mapped,
+            mapped_len,
+            generation: header.generation,
+            producer_cursor: header.producer,
+        })
+    }
+
+    fn header(&self) -> Result<DvmInputRingHeader> {
+        let header = read_input_ring_header(self.mapped)?;
+        std::sync::atomic::fence(Ordering::Acquire);
+        Ok(header)
+    }
+
+    fn write_frame(&mut self, frame: &RustosInputFrame, cleanup: bool) -> Result<()> {
+        let header = self.header()?;
+        if header.generation != self.generation || header.producer != self.producer_cursor {
+            bail!("input-ring producer lifecycle changed while L0 relay was live");
+        }
+        let required_ready =
+            DVM_INPUT_RING_FLAG_RUSTOS_READY | DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY;
+        if header.flags & required_ready != required_ready {
+            bail!("RustOS revoked input-ring transport or policy-consumer readiness");
+        }
+        let outstanding = header.producer.saturating_sub(header.consumer);
+        let cleanup_reserve = u64::from(LINUX_EVDEV_KEY_MAX) + 2;
+        let normal_limit = u64::from(DVM_INPUT_RING_SLOT_COUNT).saturating_sub(cleanup_reserve);
+        let limit = if cleanup {
+            u64::from(DVM_INPUT_RING_SLOT_COUNT)
+        } else {
+            normal_limit
+        };
+        if outstanding >= limit {
             bail!(
-                "bounded RustOS input relay queue is full pending={} limit={} cleanup={cleanup}",
-                self.pending.len(),
-                limit,
+                "fixed input-ring is saturated outstanding={outstanding} limit={limit} cleanup={cleanup}"
             );
         }
-        self.pending.push_back(PendingInputFrame {
-            bytes: *frame.as_bytes(),
-            offset: 0,
-        });
-        self.flush_pending_nonblocking()
-            .context("write queued RustOS input frame")
-    }
-
-    fn flush_pending_nonblocking(&mut self) -> std::io::Result<()> {
-        while !self.pending.is_empty() {
-            let (written, complete) = {
-                let frame = self.pending.front_mut().expect("checked nonempty queue");
-                match self.stream.write(&frame.bytes[frame.offset..]) {
-                    Ok(0) => {
-                        return Err(std::io::Error::new(
-                            ErrorKind::WriteZero,
-                            "RustOS input transport accepted an empty partial write",
-                        ));
-                    }
-                    Ok(written) => {
-                        frame.offset += written;
-                        (written, frame.offset == frame.bytes.len())
-                    }
-                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-                    Err(error)
-                        if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
-                    {
-                        return Ok(());
-                    }
-                    Err(error) => return Err(error),
-                }
-            };
-            debug_assert!(written > 0);
-            if complete {
-                let _ = self.pending.pop_front();
-            }
+        let offset = usize::try_from(DvmInputRingHeader::record_offset(header.producer))
+            .context("input-ring record offset does not fit usize")?;
+        let end = offset
+            .checked_add(DVM_INPUT_RING_RECORD_BYTES)
+            .filter(|end| *end <= self.mapped_len)
+            .ok_or_else(|| anyhow!("input-ring record is outside launch-owned aperture"))?;
+        for (index, byte) in frame.as_bytes().iter().enumerate() {
+            unsafe { self.mapped.add(offset + index).write_volatile(*byte) };
+        }
+        debug_assert_eq!(end - offset, RUSTOS_INPUT_FRAME_BYTES);
+        std::sync::atomic::fence(Ordering::Release);
+        let next = header
+            .producer
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("input-ring producer wrapped"))?;
+        unsafe {
+            self.mapped
+                .add(DVM_INPUT_RING_PRODUCER_OFFSET)
+                .cast::<u64>()
+                .write_volatile(next.to_le());
+        }
+        self.producer_cursor = next;
+        // The inputd worker rechecks producer/consumer after it arms its
+        // dedicated wait slot, so one edge for an empty-to-nonempty transition
+        // is sufficient. Ringing for every pointer frame forces avoidable
+        // MSI-X exits and priority handoffs that compete with presentation.
+        // Cleanup remains urgent even behind normal data, because releases
+        // must not wait for an already-coalesced producer batch to empty.
+        if input_doorbell_needed(outstanding, cleanup) {
+            self.producer.notify_rustos()?;
         }
         Ok(())
     }
+}
 
-    fn flush_pending_until(&mut self, deadline: Instant) -> Result<()> {
+fn input_doorbell_needed(outstanding: u64, cleanup: bool) -> bool {
+    cleanup || outstanding == 0
+}
+
+impl Drop for InputRingSink {
+    fn drop(&mut self) {
+        if !self.mapped.is_null() {
+            unsafe { libc::munmap(self.mapped.cast::<libc::c_void>(), self.mapped_len) };
+        }
+    }
+}
+
+impl RustosInputSink for InputRingSink {
+    fn wait_for_receiver_ready(&mut self, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
         loop {
-            self.flush_pending_nonblocking()
-                .context("flush queued RustOS input frame")?;
-            if self.pending.is_empty() {
+            let header = self.header()?;
+            if header.generation == self.generation
+                && header.flags & DVM_INPUT_RING_FLAG_RUSTOS_READY != 0
+                && header.flags & DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY != 0
+            {
                 return Ok(());
             }
             if Instant::now() >= deadline {
                 bail!(
-                    "RustOS input relay queue did not drain before deadline pending={}",
-                    self.pending.len()
+                    "RustOS did not arm both the fixed input-ring vector and a live policy consumer before deadline"
                 );
             }
-            std::thread::sleep(INPUT_SINK_RETRY_DELAY);
+            std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    fn send_input_frame(&mut self, frame: &RustosInputFrame) -> Result<()> {
+        self.write_frame(frame, false)
+    }
+
+    fn send_input_cleanup_frame(&mut self, frame: &RustosInputFrame) -> Result<()> {
+        self.write_frame(frame, true)
     }
 }
 
-#[cfg(test)]
-fn write_input_frame_with_deadline(writer: &mut impl Write, bytes: &[u8]) -> std::io::Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(1);
-    let mut written = 0usize;
-    while written < bytes.len() {
-        match writer.write(&bytes[written..]) {
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    ErrorKind::WriteZero,
-                    "RustOS input transport accepted an empty partial write",
-                ));
-            }
-            Ok(count) => written += count,
-            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-            Err(error)
-                if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
-                    && Instant::now() < deadline =>
-            {
-                std::thread::sleep(INPUT_SINK_RETRY_DELAY);
-            }
-            Err(error) => return Err(error),
-        }
+fn read_input_ring_header(mapped: *const u8) -> Result<DvmInputRingHeader> {
+    let mut bytes = [0_u8; DvmInputRingHeader::encoded_len()];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = unsafe { mapped.add(index).read_volatile() };
     }
-    Ok(())
+    DvmInputRingHeader::decode(&bytes).ok_or_else(|| anyhow!("invalid fixed input-ring header"))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1948,11 +1852,8 @@ pub struct InputRelayResult {
     pub forwarded_events: u64,
 }
 
-/// L0-side CPU and serial-budget guard. It intentionally rejects an abusive
-/// DVM stream instead of allowing an unbounded input producer to starve the
-/// broker or fill RustOS's bounded ingress queue. The total permits the
-/// 125Hz coalesced pointer stream plus normal keyboard use without overrunning
-/// the serial transport.
+/// L0-side admission guard. It rejects an abusive DVM stream before it can
+/// consume the fixed ring's cleanup reserve or starve inputd's bounded broker.
 struct InputRelayRate {
     window_started: Instant,
     total_frames: u32,
@@ -2058,7 +1959,7 @@ impl HostControlListener {
         timeout: Duration,
         sink: &mut impl RustosInputSink,
     ) -> Result<InputRelayResult> {
-        self.relay_input_once_inner(Some(timeout), sink, |_| Ok(()))
+        self.relay_input_once_inner(Some(timeout), timeout, sink, |_| Ok(()))
     }
 
     /// Like [`Self::relay_input_once`], but reports the verified DVM endpoint
@@ -2067,11 +1968,12 @@ impl HostControlListener {
     /// without reintroducing synthetic QMP input.
     pub fn relay_input_once_with_ready(
         &self,
-        timeout: Duration,
+        setup_timeout: Duration,
+        receiver_timeout: Duration,
         sink: &mut impl RustosInputSink,
         on_ready: impl FnOnce(&ProbeResult) -> Result<()>,
     ) -> Result<InputRelayResult> {
-        self.relay_input_once_inner(Some(timeout), sink, on_ready)
+        self.relay_input_once_inner(Some(setup_timeout), receiver_timeout, sink, on_ready)
     }
 
     /// Relay one DVM input session with a bounded authentication/setup stage
@@ -2085,29 +1987,34 @@ impl HostControlListener {
         &self,
         sink: &mut impl RustosInputSink,
     ) -> Result<InputRelayResult> {
-        self.relay_input_once_inner(Some(Duration::from_secs(5)), sink, |_| Ok(()))
+        self.relay_input_once_inner(
+            Some(Duration::from_secs(5)),
+            Duration::from_secs(30),
+            sink,
+            |_| Ok(()),
+        )
     }
 
     fn relay_input_once_inner(
         &self,
         setup_timeout: Option<Duration>,
+        receiver_timeout: Duration,
         sink: &mut impl RustosInputSink,
         on_ready: impl FnOnce(&ProbeResult) -> Result<()>,
     ) -> Result<InputRelayResult> {
         let mut connection = self.accept_authenticated(setup_timeout)?;
         let probe = self.probe_connection(&mut connection)?;
-        // The private COM2 receiver must have a live RustOS consumer before
-        // asking the DVM agent to open its input stream. In the KVM self-test,
-        // that request arms uinput immediately; requesting it earlier can fill
-        // a serial FIFO during userspace bootstrap and deadlock the relay.
-        let receiver_timeout = setup_timeout.unwrap_or(Duration::from_secs(5));
+        // RustOS must have validated the fixed ring and armed its wake vector
+        // before L0 asks the DVM agent to open the input stream. In the KVM
+        // self-test that request arms uinput immediately, so this admission
+        // prevents a boot-time producer from racing an uninstalled consumer.
         sink.wait_for_receiver_ready(receiver_timeout)?;
         let ready = request(&mut connection, 4, "input-stream")?;
         if !has_exact_fields(
             &ready,
             &["id", "op", "status", "format", "keyboard", "pointer"],
         ) || ready.get("status") != Some(&"ready".to_owned())
-            || ready.get("format") != Some(&"linux-evdev-v2".to_owned())
+            || ready.get("format") != Some(&"linux-evdev-v3".to_owned())
             || !valid_evdev_endpoint(ready.get("keyboard"))
             || !valid_evdev_endpoint(ready.get("pointer"))
         {
@@ -2169,6 +2076,19 @@ impl HostControlListener {
                         next_sequence,
                         event.dx,
                         event.dy,
+                        event.wheel_vertical,
+                        event.wheel_horizontal,
+                        event.buttons,
+                    )
+                    .map_err(Into::into)
+                }
+                LinuxEvdevInputEvent::PointerPosition(event) => {
+                    pointer_buttons = event.buttons;
+                    RustosInputFrame::linux_evdev_pointer_position(
+                        epoch,
+                        next_sequence,
+                        event.x,
+                        event.y,
                         event.wheel_vertical,
                         event.wheel_horizontal,
                         event.buttons,
@@ -2317,9 +2237,19 @@ struct LinuxEvdevPointerEvent {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LinuxEvdevPointerPositionEvent {
+    x: u16,
+    y: u16,
+    wheel_vertical: i16,
+    wheel_horizontal: i16,
+    buttons: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LinuxEvdevInputEvent {
     Key(LinuxEvdevKeyEvent),
     Pointer(LinuxEvdevPointerEvent),
+    PointerPosition(LinuxEvdevPointerPositionEvent),
 }
 
 fn parse_linux_evdev_input_event(
@@ -2336,6 +2266,7 @@ fn parse_linux_evdev_input_event(
     match message.fields.get("type").map(String::as_str) {
         Some("key") => parse_linux_evdev_key_event(message),
         Some("pointer") => parse_linux_evdev_pointer_event(message),
+        Some("pointer-position") => parse_linux_evdev_pointer_position_event(message),
         _ => bail!("rejected unknown Linux DVM input event type"),
     }
 }
@@ -2401,6 +2332,58 @@ fn parse_linux_evdev_pointer_event(message: &Message) -> Result<LinuxEvdevInputE
         wheel_horizontal: parse_axis("wheel-h")?,
         buttons,
     }))
+}
+
+fn parse_linux_evdev_pointer_position_event(message: &Message) -> Result<LinuxEvdevInputEvent> {
+    if !has_exact_fields(
+        &message.fields,
+        &[
+            "id", "op", "type", "x", "y", "wheel-v", "wheel-h", "buttons",
+        ],
+    ) {
+        bail!("invalid Linux DVM absolute pointer event fields");
+    }
+    let parse_axis = |field: &str| -> Result<i16> {
+        message
+            .fields
+            .get(field)
+            .ok_or_else(|| anyhow!("Linux DVM absolute pointer event omitted {field}"))?
+            .parse::<i16>()
+            .with_context(|| format!("invalid Linux DVM absolute pointer {field}"))
+    };
+    let x = message
+        .fields
+        .get("x")
+        .ok_or_else(|| anyhow!("Linux DVM absolute pointer event omitted x"))?
+        .parse::<u16>()
+        .context("invalid Linux DVM absolute pointer x")?;
+    let y = message
+        .fields
+        .get("y")
+        .ok_or_else(|| anyhow!("Linux DVM absolute pointer event omitted y"))?
+        .parse::<u16>()
+        .context("invalid Linux DVM absolute pointer y")?;
+    let buttons = message
+        .fields
+        .get("buttons")
+        .ok_or_else(|| anyhow!("Linux DVM absolute pointer event omitted buttons"))?
+        .parse::<u8>()
+        .context("invalid Linux DVM absolute pointer buttons")?;
+    if x > RUSTOS_POINTER_POSITION_MAX_X
+        || y > RUSTOS_POINTER_POSITION_MAX_Y
+        || buttons & !RUSTOS_POINTER_BUTTON_MASK != 0
+    {
+        bail!("rejected out-of-range Linux DVM absolute pointer event");
+    }
+    Ok(LinuxEvdevInputEvent::PointerPosition(
+        LinuxEvdevPointerPositionEvent {
+            x,
+            y,
+            wheel_vertical: parse_axis("wheel-v")?,
+            wheel_horizontal: parse_axis("wheel-h")?,
+            buttons,
+        },
+    ))
 }
 
 fn valid_evdev_endpoint(value: Option<&String>) -> bool {
@@ -2794,11 +2777,10 @@ mod tests {
         CONTROL_PORT_FLOOR, CONTROL_SECRET_BYTES, ControlContract, ControlSecret, DeviceClass,
         DeviceTransport, DriverDomainFleetPolicy, DriverDomainPolicy, FileLeaseStore,
         InputRelayRate, IommuTopology, LaunchPlan, LinuxEvdevInputEvent, LinuxEvdevKeyEvent,
-        RUSTOS_INPUT_FRAME_BYTES, ReleaseAuthorization, RustosInputFrame, ValidatedLease,
-        VfioLeaseRecord, VfioLeaseState, VfioOps, VfioReleaseBinding, acquire_vfio_lease,
-        allocate_input_epoch, control_proof, inspect_vfio_lease, inspect_vfio_lease_preflight,
-        parse_linux_evdev_input_event, parse_message, restore_vfio_lease, validate_hello,
-        write_input_frame_with_deadline,
+        ReleaseAuthorization, RustosInputFrame, ValidatedLease, VfioLeaseRecord, VfioLeaseState,
+        VfioOps, VfioReleaseBinding, acquire_vfio_lease, allocate_input_epoch, control_proof,
+        inspect_vfio_lease, inspect_vfio_lease_preflight, parse_linux_evdev_input_event,
+        parse_message, restore_vfio_lease, validate_hello,
     };
     use anyhow::Result;
 
@@ -2938,6 +2920,16 @@ mod tests {
         )
         .unwrap();
         assert!(parse_linux_evdev_input_event(&invalid_buttons, 3, "input-stream").is_err());
+        let position = parse_message(
+            "EVENT\nid=3\nop=input-stream\ntype=pointer-position\nx=800\ny=450\nwheel-v=0\nwheel-h=0\nbuttons=0",
+        )
+        .unwrap();
+        assert!(parse_linux_evdev_input_event(&position, 3, "input-stream").is_ok());
+        let invalid_position = parse_message(
+            "EVENT\nid=3\nop=input-stream\ntype=pointer-position\nx=1600\ny=450\nwheel-v=0\nwheel-h=0\nbuttons=0",
+        )
+        .unwrap();
+        assert!(parse_linux_evdev_input_event(&invalid_position, 3, "input-stream").is_err());
     }
 
     #[test]
@@ -2946,114 +2938,18 @@ mod tests {
         let first = RustosInputFrame::linux_evdev_key(7, 1, 30, 1).unwrap();
         let second = RustosInputFrame::linux_evdev_key(7, 2, 30, 0).unwrap();
         let pointer = RustosInputFrame::linux_evdev_pointer(7, 3, -4, 2, 1, 0, 3).unwrap();
-        let end = RustosInputFrame::session_end(7, 4).unwrap();
+        let position =
+            RustosInputFrame::linux_evdev_pointer_position(7, 4, 800, 450, 0, 0, 0).unwrap();
+        let end = RustosInputFrame::session_end(7, 5).unwrap();
         assert_ne!(session.as_bytes(), first.as_bytes());
         assert_ne!(first.as_bytes(), second.as_bytes());
         assert_ne!(second.as_bytes(), pointer.as_bytes());
-        assert_ne!(pointer.as_bytes(), end.as_bytes());
+        assert_ne!(pointer.as_bytes(), position.as_bytes());
+        assert_ne!(position.as_bytes(), end.as_bytes());
         assert!(RustosInputFrame::linux_evdev_key(7, 1, 0, 1).is_err());
         assert!(RustosInputFrame::linux_evdev_key(7, 1, 30, 3).is_err());
         assert!(RustosInputFrame::linux_evdev_pointer(7, 3, 0, 0, 0, 0, 0x20).is_err());
-    }
-
-    #[test]
-    fn input_receiver_readiness_is_exact_and_not_an_authorization_fallback() {
-        assert_eq!(super::RUSTOS_INPUT_RECEIVER_READY, *b"RDRY");
-        assert_ne!(super::RUSTOS_INPUT_RECEIVER_READY, *b"RDRX");
-        assert_ne!(super::RUSTOS_INPUT_RECEIVER_READY, *b"\0\0\0\0");
-
-        let mut scanner = super::InputReceiverReadyScanner::default();
-        assert!(!scanner.consume(b"\x1b[2JR").unwrap());
-        assert!(scanner.consume(b"DRY").unwrap());
-
-        let mut exhausted = super::InputReceiverReadyScanner::default();
-        assert!(
-            exhausted
-                .consume(&vec![0_u8; super::MAX_INPUT_RECEIVER_READY_NOISE_BYTES + 1])
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn input_boot_buffer_is_bounded_by_the_admitted_relay_rate() {
-        assert_eq!(
-            super::INPUT_SINK_BUFFER_BYTES,
-            super::RUSTOS_INPUT_FRAME_BYTES
-                * super::INPUT_RELAY_MAX_FRAMES_PER_SECOND as usize
-                * super::INPUT_SINK_BOOT_BUFFER_SECONDS
-        );
-        assert!(super::INPUT_SINK_BOOT_BUFFER_SECONDS <= 30);
-    }
-
-    #[test]
-    fn input_transport_retries_partial_would_block_without_duplication() {
-        struct PartialWouldBlockWriter {
-            calls: usize,
-            bytes: Vec<u8>,
-        }
-
-        impl std::io::Write for PartialWouldBlockWriter {
-            fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
-                self.calls += 1;
-                match self.calls {
-                    1 => {
-                        let count = input.len().min(3);
-                        self.bytes.extend_from_slice(&input[..count]);
-                        Ok(count)
-                    }
-                    2 => Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
-                    _ => {
-                        self.bytes.extend_from_slice(input);
-                        Ok(input.len())
-                    }
-                }
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let expected = [0x5a_u8; RUSTOS_INPUT_FRAME_BYTES];
-        let mut writer = PartialWouldBlockWriter {
-            calls: 0,
-            bytes: Vec::new(),
-        };
-        write_input_frame_with_deadline(&mut writer, &expected).unwrap();
-        assert_eq!(writer.bytes, expected);
-        assert_eq!(writer.calls, 3);
-    }
-
-    #[test]
-    fn input_transport_retries_transient_backpressure_without_dropping_a_frame() {
-        struct TransientBackpressureWriter {
-            attempts: usize,
-            bytes: Vec<u8>,
-        }
-
-        impl std::io::Write for TransientBackpressureWriter {
-            fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
-                self.attempts += 1;
-                if self.attempts <= 3 {
-                    return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
-                }
-                self.bytes.extend_from_slice(input);
-                Ok(input.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let expected = [0xa5_u8; RUSTOS_INPUT_FRAME_BYTES];
-        let mut writer = TransientBackpressureWriter {
-            attempts: 0,
-            bytes: Vec::new(),
-        };
-        write_input_frame_with_deadline(&mut writer, &expected).unwrap();
-        assert_eq!(writer.bytes, expected);
-        assert_eq!(writer.attempts, 4);
+        assert!(RustosInputFrame::linux_evdev_pointer_position(7, 4, 1600, 450, 0, 0, 0).is_err());
     }
 
     #[test]
@@ -3067,22 +2963,29 @@ mod tests {
     }
 
     #[test]
+    fn input_ring_doorbell_is_edge_triggered_but_cleanup_is_urgent() {
+        assert!(super::input_doorbell_needed(0, false));
+        assert!(!super::input_doorbell_needed(1, false));
+        assert!(super::input_doorbell_needed(1, true));
+    }
+
+    #[test]
     fn driver_domain_policy_names_one_explicit_transport_per_class() {
         let policy = DriverDomainPolicy::parse(
-            "DRIVER_DOMAIN_POLICY_SCHEMA=1\nDOMAIN_ID=linux-dvm-net0\nINPUT_TRANSPORT=rdi2-com2\nNETWORK_TRANSPORT=disabled\nBLOCK_TRANSPORT=disabled\nDISPLAY_TRANSPORT=disabled\n",
+            "DRIVER_DOMAIN_POLICY_SCHEMA=1\nDOMAIN_ID=linux-dvm-net0\nINPUT_TRANSPORT=input-ring-msix\nNETWORK_TRANSPORT=disabled\nBLOCK_TRANSPORT=disabled\nDISPLAY_TRANSPORT=disabled\n",
             "test",
         )
         .unwrap();
         assert_eq!(
             policy.transport_for(DeviceClass::Input),
-            DeviceTransport::Rdi2Com2
+            DeviceTransport::InputRingMsix
         );
         assert_eq!(
             policy.transport_for(DeviceClass::Network),
             DeviceTransport::Disabled
         );
         assert!(DriverDomainPolicy::parse(
-            "DRIVER_DOMAIN_POLICY_SCHEMA=1\nDOMAIN_ID=linux-dvm-net0\nINPUT_TRANSPORT=rdi2-com2\nNETWORK_TRANSPORT=rdi2-com2\nBLOCK_TRANSPORT=disabled\nDISPLAY_TRANSPORT=disabled\n",
+            "DRIVER_DOMAIN_POLICY_SCHEMA=1\nDOMAIN_ID=linux-dvm-net0\nINPUT_TRANSPORT=input-ring-msix\nNETWORK_TRANSPORT=input-ring-msix\nBLOCK_TRANSPORT=disabled\nDISPLAY_TRANSPORT=disabled\n",
             "test",
         )
         .is_err());

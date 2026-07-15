@@ -33,6 +33,7 @@ pub(super) fn is_linux_rustos_broker_syscall(syscall_number: u64) -> bool {
             | linux_abi::SYS_RUSTOS_STORAGE_LIST_BROKER
             | linux_abi::SYS_RUSTOS_INPUT_STATS_BROKER
             | linux_abi::SYS_RUSTOS_INPUT_INGEST_BROKER
+            | linux_abi::SYS_RUSTOS_INPUT_WAIT_BROKER
             | linux_abi::SYS_RUSTOS_DEVICE_OPEN_BROKER
             | linux_abi::SYS_RUSTOS_DEVICE_IOCTL_BROKER
             | linux_abi::SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER
@@ -56,6 +57,7 @@ pub(super) fn dispatch_linux_rustos_broker_syscall(frame: &SyscallFrame) -> u64 
         linux_abi::SYS_RUSTOS_INPUT_INGEST_BROKER => {
             syscall_linux_rustos_input_ingest_broker(frame.rdi)
         }
+        linux_abi::SYS_RUSTOS_INPUT_WAIT_BROKER => syscall_linux_rustos_input_wait_broker(),
         linux_abi::SYS_RUSTOS_DEVICE_OPEN_BROKER => {
             syscall_linux_rustos_device_open_broker(frame.rdi)
         }

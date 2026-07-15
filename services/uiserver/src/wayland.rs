@@ -3,9 +3,11 @@ use std::io::ErrorKind;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
 use std::{
     fs,
     path::{Component, Path},
@@ -31,7 +33,8 @@ use crate::layout::{
 };
 use crate::sys::{
     INPUT_ACTION_PRESSED, INPUT_ACTION_RELEASED, INPUT_ACTION_REPEATED, INPUT_KIND_KEYBOARD,
-    InputEvent, SharedFdMapping, diag_line, map_shared_fd_readable, ui_profile_enabled,
+    InputEvent, SharedFdMapping, diag_line, map_shared_fd_readable,
+    require_background_thread_class, ui_profile_enabled,
 };
 
 const WAYLAND_SOCKET_NAME: &str = "wayland-0";
@@ -43,6 +46,9 @@ const MAX_WAYLAND_SHM_POOL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_WAYLAND_BUFFER_DIMENSION: usize = 8192;
 const MAX_WAYLAND_BUFFER_PIXELS: usize = MAX_WAYLAND_SHM_POOL_BYTES / 4;
 const MAX_WAYLAND_CLIENT_ACCEPTS_PER_TICK: usize = 8;
+const WAYLAND_ACCEPT_QUEUE_CAPACITY: usize = 16;
+const WAYLAND_ACCEPT_IDLE_RETRY_MS: u64 = 4;
+const WAYLAND_ACCEPT_ERROR_RETRY_MS: u64 = 16;
 const MAX_WAYLAND_CLIENT_DISPATCHES_PER_TICK: usize = 1;
 const MAX_WAYLAND_SURFACES: usize = 64;
 const MAX_WAYLAND_OUTPUT_RESOURCES: usize = 64;
@@ -50,8 +56,11 @@ const MAX_WAYLAND_POINTER_RESOURCES: usize = 64;
 const MAX_WAYLAND_KEYBOARD_RESOURCES: usize = 64;
 const MAX_WAYLAND_FRAME_CALLBACKS_PER_SURFACE: usize = 8;
 const MAX_WAYLAND_DISPATCH_LOGS: usize = 16;
+const MAX_WAYLAND_SLOW_TICK_LOGS: usize = 8;
+const SLOW_WAYLAND_TICK_MS: u128 = 16;
 
 static WAYLAND_DISPATCH_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static WAYLAND_SLOW_TICK_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 fn post_protocol_error<I: Resource>(resource: &I, message: String) {
     diag_line(format!("uiserver: wayland protocol error: {message}"));
@@ -89,9 +98,20 @@ impl Eq for WaylandWindowSnapshot {}
 
 pub(crate) struct WaylandCompositor {
     display: Display<WaylandState>,
-    listener: UnixListener,
+    acceptor: WaylandAcceptor,
     clients: Vec<ClientId>,
     state: WaylandState,
+}
+
+struct WaylandAcceptor {
+    receiver: Receiver<UnixStream>,
+    running: Arc<AtomicBool>,
+}
+
+impl Drop for WaylandAcceptor {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Release);
+    }
 }
 
 impl WaylandCompositor {
@@ -122,6 +142,16 @@ impl WaylandCompositor {
             ));
             return None;
         }
+        let acceptor = match start_wayland_acceptor(listener) {
+            Ok(acceptor) => acceptor,
+            Err(err) => {
+                diag_line(format!(
+                    "uiserver: wayland accept worker start failed path={} err={err}",
+                    socket_path
+                ));
+                return None;
+            }
+        };
         let state = WaylandState::new(display_width, display_height);
         {
             let handle = display.handle();
@@ -143,24 +173,20 @@ impl WaylandCompositor {
 
         Some(Self {
             display,
-            listener,
+            acceptor,
             clients: Vec::new(),
             state,
         })
     }
 
     pub(crate) fn tick(&mut self) -> bool {
+        let tick_started = Instant::now();
+        let accept_started = tick_started;
         let mut accepted = 0_usize;
         while accepted < MAX_WAYLAND_CLIENT_ACCEPTS_PER_TICK {
-            match accept_wayland_client(&self.listener) {
+            match self.acceptor.receiver.try_recv() {
                 Ok(stream) => {
                     accepted = accepted.saturating_add(1);
-                    if let Err(err) = set_fd_nonblocking(stream.as_raw_fd()) {
-                        diag_line(format!(
-                            "uiserver: accepted wayland client nonblocking failed: {err}"
-                        ));
-                        continue;
-                    }
                     match self
                         .display
                         .handle()
@@ -177,14 +203,12 @@ impl WaylandCompositor {
                         }
                     }
                 }
-                Err(err) if err.kind() == ErrorKind::WouldBlock => break,
-                Err(err) => {
-                    diag_line(format!("uiserver: wayland accept failed: {err}"));
-                    break;
-                }
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
         }
+        let accept_elapsed = accept_started.elapsed();
 
+        let dispatch_started = Instant::now();
         let clients = core::mem::take(&mut self.clients);
         let mut deferred_clients = Vec::new();
         let mut dispatch_clients = Vec::new();
@@ -197,6 +221,7 @@ impl WaylandCompositor {
         }
         self.clients = deferred_clients;
 
+        let mut dispatched_requests = 0_usize;
         for client_id in dispatch_clients {
             match self
                 .display
@@ -204,6 +229,7 @@ impl WaylandCompositor {
                 .dispatch_single_client(&mut self.state, client_id.clone())
             {
                 Ok(dispatched) => {
+                    dispatched_requests = dispatched_requests.saturating_add(dispatched);
                     self.clients.push(client_id);
                     if ui_profile_enabled()
                         && dispatched > 0
@@ -226,7 +252,27 @@ impl WaylandCompositor {
                 }
             }
         }
+        let dispatch_elapsed = dispatch_started.elapsed();
+        let flush_started = Instant::now();
         self.flush_clients();
+        let flush_elapsed = flush_started.elapsed();
+        let tick_elapsed = tick_started.elapsed();
+        if ui_profile_enabled()
+            && tick_elapsed.as_millis() >= SLOW_WAYLAND_TICK_MS
+            && WAYLAND_SLOW_TICK_LOG_COUNT.fetch_add(1, Ordering::Relaxed)
+                < MAX_WAYLAND_SLOW_TICK_LOGS
+        {
+            diag_line(format!(
+                "uiserver: wayland slow tick total_ms={} accept_ms={} accepted={} dispatch_ms={} dispatched={} flush_ms={} clients={}",
+                tick_elapsed.as_millis(),
+                accept_elapsed.as_millis(),
+                accepted,
+                dispatch_elapsed.as_millis(),
+                dispatched_requests,
+                flush_elapsed.as_millis(),
+                self.clients.len(),
+            ));
+        }
         self.state.take_dirty()
     }
 
@@ -317,6 +363,45 @@ fn accept_wayland_client(listener: &UnixListener) -> std::io::Result<UnixStream>
         return Err(std::io::Error::last_os_error());
     }
     Ok(unsafe { UnixStream::from_raw_fd(fd) })
+}
+
+fn start_wayland_acceptor(listener: UnixListener) -> std::io::Result<WaylandAcceptor> {
+    let (sender, receiver) = sync_channel(WAYLAND_ACCEPT_QUEUE_CAPACITY);
+    let running = Arc::new(AtomicBool::new(true));
+    let worker_running = Arc::clone(&running);
+    thread::Builder::new()
+        .name(String::from("wayland-accept"))
+        .spawn(move || {
+            require_background_thread_class();
+            while worker_running.load(Ordering::Acquire) {
+                match accept_wayland_client(&listener) {
+                    Ok(stream) => {
+                        if let Err(err) = set_fd_nonblocking(stream.as_raw_fd()) {
+                            diag_line(format!(
+                                "uiserver: accepted wayland client nonblocking failed: {err}"
+                            ));
+                            continue;
+                        }
+                        match sender.try_send(stream) {
+                            Ok(()) => {}
+                            Err(TrySendError::Full(_)) => {
+                                diag_line("uiserver: wayland accept queue full; client rejected");
+                                thread::sleep(Duration::from_millis(WAYLAND_ACCEPT_IDLE_RETRY_MS));
+                            }
+                            Err(TrySendError::Disconnected(_)) => break,
+                        }
+                    }
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(WAYLAND_ACCEPT_IDLE_RETRY_MS));
+                    }
+                    Err(err) => {
+                        diag_line(format!("uiserver: wayland accept failed: {err}"));
+                        thread::sleep(Duration::from_millis(WAYLAND_ACCEPT_ERROR_RETRY_MS));
+                    }
+                }
+            }
+        })?;
+    Ok(WaylandAcceptor { receiver, running })
 }
 
 fn current_runtime_dir() -> String {

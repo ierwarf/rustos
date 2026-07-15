@@ -1,0 +1,410 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * RustOS GUI-DVM three-surface MSI-X -> UIO adapter.
+ *
+ * BAR2 is an uncached control plane and is never mapped to userspace. A
+ * separate cacheable pixel region is exposed WB and read-only; VM_WRITE and
+ * VM_MAYWRITE are rejected. Userspace cannot write shared control state or
+ * select a doorbell peer/vector. A completed DRM copy is returned through one
+ * fixed 64-byte RELEASE record which this module validates against the
+ * matching host PRESENT record before it writes the return slot and rings the
+ * sole host control vector.
+ */
+
+#include <linux/io.h>
+#include <linux/mm.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/pci.h>
+#include <linux/string.h>
+#include <linux/uio_driver.h>
+#include <asm/pgtable.h>
+
+#define RUSTOS_IVSHMEM_VENDOR_ID 0x1af4
+#define RUSTOS_IVSHMEM_DEVICE_ID 0x1110
+#define RUSTOS_IVSHMEM_REGISTERS_BAR 0
+#define RUSTOS_IVSHMEM_SHARED_BAR 2
+#define RUSTOS_IVSHMEM_DOORBELL_OFFSET 12
+#define RUSTOS_DVM_HOST_CONTROL_VECTOR 0
+#define RUSTOS_DVM_HOST_OFFLINE_VECTOR 1
+#define RUSTOS_DVM_MSIX_VECTOR_COUNT 2
+#define RUSTOS_GUI_PIXEL_REGION_PHYS 0x100000000ULL
+#define RUSTOS_GUI_PIXEL_REGION_BYTES (32ULL * 1024ULL * 1024ULL)
+
+#define RUSTOS_GUI_POOL_HEADER_BYTES 4096
+#define RUSTOS_GUI_POOL_VERSION 1
+#define RUSTOS_GUI_POOL_SLOT_COUNT 3
+#define RUSTOS_GUI_POOL_RECORD_BYTES 64
+#define RUSTOS_GUI_POOL_HOST_RECORD_OFFSET 64
+#define RUSTOS_GUI_POOL_DVM_RECORD_OFFSET 256
+#define RUSTOS_GUI_POOL_DVM_SEQUENCE_OFFSET 320
+#define RUSTOS_GUI_POOL_HOST_ACK_OFFSET 328
+#define RUSTOS_GUI_POOL_INVITATION_OFFSET 336
+#define RUSTOS_GUI_POOL_READY_ACK_OFFSET 344
+#define RUSTOS_GUI_POOL_READY_CONFIRMATION_OFFSET 352
+
+#define RUSTOS_GUI_MESSAGE_VERSION 1
+#define RUSTOS_GUI_MESSAGE_KIND_PRESENT 1
+#define RUSTOS_GUI_MESSAGE_KIND_RELEASE 2
+#define RUSTOS_GUI_DAMAGE_FULL 1
+#define RUSTOS_DVM_UIO_NAME "rustos-dvm-ivshmem-uio"
+
+struct rustos_dvm_ivshmem {
+	struct uio_info uio;
+	void __iomem *doorbell;
+	void __iomem *shared;
+	atomic_t host_invited;
+	atomic_t relay_ready;
+	atomic64_t invitation_generation;
+	atomic64_t control_sequence;
+	struct mutex control_lock;
+};
+
+static const u8 rustos_gui_pool_magic[] = "RSGUI002";
+static const u8 rustos_gui_message_magic[] = "RSGUI001";
+
+static u32 rustos_dvm_read_le32(const u8 *bytes)
+{
+	return (u32)bytes[0] | ((u32)bytes[1] << 8) |
+		((u32)bytes[2] << 16) | ((u32)bytes[3] << 24);
+}
+
+static u64 rustos_dvm_read_le64(const u8 *bytes)
+{
+	u64 value = 0;
+	unsigned int index;
+
+	for (index = 0; index < sizeof(value); index++)
+		value |= (u64)bytes[index] << (index * 8);
+	return value;
+}
+
+static bool rustos_dvm_host_present_matches(struct rustos_dvm_ivshmem *state,
+						      const u8 *record)
+{
+	u32 slot = rustos_dvm_read_le32(record + 16);
+	u64 generation = rustos_dvm_read_le64(record + 24);
+	u8 present[RUSTOS_GUI_POOL_RECORD_BYTES];
+
+	if (slot >= RUSTOS_GUI_POOL_SLOT_COUNT)
+		return false;
+	memcpy_fromio(present, state->shared + RUSTOS_GUI_POOL_HOST_RECORD_OFFSET +
+		      slot * RUSTOS_GUI_POOL_RECORD_BYTES, sizeof(present));
+	return !memcmp(present, rustos_gui_message_magic, sizeof(rustos_gui_message_magic) - 1) &&
+		rustos_dvm_read_le32(present + 8) == RUSTOS_GUI_MESSAGE_VERSION &&
+		rustos_dvm_read_le32(present + 12) == RUSTOS_GUI_MESSAGE_KIND_PRESENT &&
+		rustos_dvm_read_le32(present + 16) == slot &&
+		rustos_dvm_read_le64(present + 24) == generation;
+}
+
+static bool rustos_dvm_valid_release(struct rustos_dvm_ivshmem *state,
+					     const u8 *record)
+{
+	if (memcmp(record, rustos_gui_message_magic, sizeof(rustos_gui_message_magic) - 1) ||
+	    rustos_dvm_read_le32(record + 8) != RUSTOS_GUI_MESSAGE_VERSION ||
+	    rustos_dvm_read_le32(record + 12) != RUSTOS_GUI_MESSAGE_KIND_RELEASE ||
+	    rustos_dvm_read_le32(record + 16) >= RUSTOS_GUI_POOL_SLOT_COUNT ||
+	    memchr_inv(record + 20, 0, 4) ||
+	    !rustos_dvm_read_le64(record + 24) ||
+	    rustos_dvm_read_le64(record + 24) & 1 ||
+	    memchr_inv(record + 32, 0, 16) ||
+	    rustos_dvm_read_le32(record + 48) != RUSTOS_GUI_DAMAGE_FULL ||
+	    memchr_inv(record + 52, 0, 12))
+		return false;
+	return rustos_dvm_host_present_matches(state, record);
+}
+
+static void rustos_dvm_ivshmem_latch_host_invitation(struct rustos_dvm_ivshmem *state)
+{
+	u64 generation;
+
+	/* The host records this exact even generation before ringing peer 1. */
+	generation = readq(state->shared + RUSTOS_GUI_POOL_INVITATION_OFFSET);
+	if (!generation || generation & 1)
+		return;
+	atomic64_set(&state->invitation_generation, generation);
+	atomic_set(&state->host_invited, 1);
+
+}
+
+static irqreturn_t rustos_dvm_ivshmem_irq(int irq, struct uio_info *info)
+{
+	struct rustos_dvm_ivshmem *state = info->priv;
+
+	rustos_dvm_ivshmem_latch_host_invitation(state);
+	return IRQ_HANDLED;
+}
+
+static int rustos_dvm_ivshmem_irq_control(struct uio_info *info, s32 irq_on)
+{
+	/* Eventfd-backed MSI-X has no guest-controlled INTx mask state. */
+	return 0;
+}
+
+static int rustos_dvm_ivshmem_mmap(struct uio_info *info,
+				   struct vm_area_struct *vma)
+{
+	struct rustos_dvm_ivshmem *state = info->priv;
+	struct uio_mem *memory = &info->mem[0];
+	unsigned long mapped_bytes = vma->vm_end - vma->vm_start;
+
+	/*
+	 * The bulk pixel pool is a QEMU memory device, not PCI MMIO. Generic UIO
+	 * forces UIO_MEM_PHYS through pgprot_noncached(), so keep this exact range
+	 * write-back and read-only. The separate ivshmem BAR remains uncached and
+	 * carries only authenticated control records and doorbells.
+	 */
+	if (!state || vma->vm_pgoff != 0 || !mapped_bytes ||
+	    mapped_bytes > memory->size)
+		return -EINVAL;
+	if (vma->vm_flags & (VM_WRITE | VM_MAYWRITE))
+		return -EPERM;
+	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
+	/* x86 PAT encodes WB as zero: remove any inherited PCI cache bits. */
+	vma->vm_page_prot = __pgprot(pgprot_val(vma->vm_page_prot) &
+				     ~_PAGE_CACHE_MASK);
+	dev_info_once(info->uio_dev->dev.parent,
+		      "RustOS GUI pixel pool mapped WB read-only bytes=%lu\n",
+		      mapped_bytes);
+	return remap_pfn_range(vma, vma->vm_start,
+			       memory->addr >> PAGE_SHIFT, mapped_bytes,
+			       vma->vm_page_prot);
+}
+
+static void rustos_dvm_ivshmem_free_vectors(void *data)
+{
+	pci_free_irq_vectors(data);
+}
+
+static ssize_t rustos_dvm_host_invited_show(struct device *dev,
+					    struct device_attribute *attr, char *buf)
+{
+	struct rustos_dvm_ivshmem *state = dev_get_drvdata(dev);
+
+	if (!state)
+		return -ENODEV;
+	return sysfs_emit(buf, "%u\n", atomic_read(&state->host_invited) ? 1 : 0);
+}
+static DEVICE_ATTR_RO(rustos_dvm_host_invited);
+
+static ssize_t rustos_dvm_display_ready_store(struct device *dev,
+					       struct device_attribute *attr,
+					       const char *buf, size_t count)
+{
+	struct rustos_dvm_ivshmem *state = dev_get_drvdata(dev);
+	u64 generation;
+
+	if (!state || count != 6 || memcmp(buf, "ready\n", 6))
+		return -EINVAL;
+	if (atomic_cmpxchg(&state->host_invited, 1, 0) != 1)
+		return -EAGAIN;
+	generation = atomic64_read(&state->invitation_generation);
+	if (!generation || generation & 1)
+		return -EPROTO;
+	writeq(generation, state->shared + RUSTOS_GUI_POOL_READY_ACK_OFFSET);
+	wmb();
+	atomic_set(&state->relay_ready, 1);
+	iowrite32(RUSTOS_DVM_HOST_CONTROL_VECTOR,
+		  state->doorbell + RUSTOS_IVSHMEM_DOORBELL_OFFSET);
+	return count;
+}
+static DEVICE_ATTR_WO(rustos_dvm_display_ready);
+
+static ssize_t rustos_dvm_display_control_store(struct device *dev,
+					  struct device_attribute *attr,
+					  const char *buf, size_t count)
+{
+	struct rustos_dvm_ivshmem *state = dev_get_drvdata(dev);
+	u64 control_sequence;
+	u64 next;
+	ssize_t result = count;
+
+	if (!state || count != RUSTOS_GUI_POOL_RECORD_BYTES)
+		return -EINVAL;
+	if (!atomic_read(&state->relay_ready) ||
+	    !rustos_dvm_valid_release(state, (const u8 *)buf))
+		return -EPERM;
+	mutex_lock(&state->control_lock);
+	control_sequence = atomic64_read(&state->control_sequence);
+	if (readq(state->shared + RUSTOS_GUI_POOL_HOST_ACK_OFFSET) != control_sequence) {
+		result = -EAGAIN;
+		goto out;
+	}
+	next = control_sequence + 1;
+	if (!next)
+		next = 1;
+	memcpy_toio(state->shared + RUSTOS_GUI_POOL_DVM_RECORD_OFFSET, buf, count);
+	wmb();
+	writeq(next, state->shared + RUSTOS_GUI_POOL_DVM_SEQUENCE_OFFSET);
+	wmb();
+	atomic64_set(&state->control_sequence, next);
+	iowrite32(RUSTOS_DVM_HOST_CONTROL_VECTOR,
+		  state->doorbell + RUSTOS_IVSHMEM_DOORBELL_OFFSET);
+out:
+	mutex_unlock(&state->control_lock);
+	return result;
+}
+static DEVICE_ATTR_WO(rustos_dvm_display_control);
+
+static ssize_t rustos_dvm_display_offline_store(struct device *dev,
+					 struct device_attribute *attr,
+					 const char *buf, size_t count)
+{
+	struct rustos_dvm_ivshmem *state = dev_get_drvdata(dev);
+
+	if (!state || count != 8 || memcmp(buf, "offline\n", 8))
+		return -EINVAL;
+	atomic_set(&state->host_invited, 0);
+	atomic_set(&state->relay_ready, 0);
+	atomic64_set(&state->invitation_generation, 0);
+	writeq(0, state->shared + RUSTOS_GUI_POOL_READY_ACK_OFFSET);
+	wmb();
+	iowrite32(RUSTOS_DVM_HOST_OFFLINE_VECTOR,
+		  state->doorbell + RUSTOS_IVSHMEM_DOORBELL_OFFSET);
+	return count;
+}
+static DEVICE_ATTR_WO(rustos_dvm_display_offline);
+
+static struct attribute *rustos_dvm_ivshmem_attributes[] = {
+	&dev_attr_rustos_dvm_host_invited.attr,
+	&dev_attr_rustos_dvm_display_ready.attr,
+	&dev_attr_rustos_dvm_display_control.attr,
+	&dev_attr_rustos_dvm_display_offline.attr,
+	NULL,
+};
+
+static const struct attribute_group rustos_dvm_ivshmem_attribute_group = {
+	.attrs = rustos_dvm_ivshmem_attributes,
+};
+
+static int rustos_dvm_ivshmem_is_gui_pool(struct pci_dev *pdev)
+{
+	void __iomem *header;
+	void *pixel_header;
+	u8 bytes[RUSTOS_GUI_POOL_RECORD_BYTES];
+	u8 pixel_bytes[RUSTOS_GUI_POOL_RECORD_BYTES];
+	resource_size_t region_bytes;
+	int result = -ENODEV;
+
+	region_bytes = pci_resource_len(pdev, RUSTOS_IVSHMEM_SHARED_BAR);
+	if (region_bytes < RUSTOS_GUI_POOL_HEADER_BYTES)
+		return -ENODEV;
+	header = pci_iomap(pdev, RUSTOS_IVSHMEM_SHARED_BAR, sizeof(bytes));
+	if (!header)
+		return -ENOMEM;
+	memcpy_fromio(bytes, header, sizeof(bytes));
+	pixel_header = memremap(RUSTOS_GUI_PIXEL_REGION_PHYS,
+				sizeof(pixel_bytes), MEMREMAP_WB);
+	if (pixel_header) {
+		memcpy(pixel_bytes, pixel_header, sizeof(pixel_bytes));
+		memunmap(pixel_header);
+	} else {
+		memset(pixel_bytes, 0, sizeof(pixel_bytes));
+	}
+	if (!memcmp(bytes, rustos_gui_pool_magic, sizeof(rustos_gui_pool_magic) - 1) &&
+	    rustos_dvm_read_le32(bytes + 8) == RUSTOS_GUI_POOL_VERSION &&
+	    rustos_dvm_read_le32(bytes + 12) == RUSTOS_GUI_POOL_HEADER_BYTES &&
+	    rustos_dvm_read_le32(bytes + 44) == RUSTOS_GUI_POOL_SLOT_COUNT &&
+	    rustos_dvm_read_le64(bytes + 16) == RUSTOS_GUI_PIXEL_REGION_BYTES &&
+	    !memcmp(bytes, pixel_bytes, sizeof(bytes)))
+		result = 0;
+	pci_iounmap(pdev, header);
+	return result;
+}
+
+static int rustos_dvm_ivshmem_probe(struct pci_dev *pdev,
+				    const struct pci_device_id *id)
+{
+	struct rustos_dvm_ivshmem *state;
+	struct resource *registers;
+	struct resource *shared;
+	int result;
+
+	result = pcim_enable_device(pdev);
+	if (result)
+		return result;
+	result = rustos_dvm_ivshmem_is_gui_pool(pdev);
+	if (result)
+		return result;
+	if (pci_msix_vec_count(pdev) != RUSTOS_DVM_MSIX_VECTOR_COUNT)
+		return -ENODEV;
+	result = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSIX);
+	if (result < 0)
+		return result;
+	result = devm_add_action_or_reset(&pdev->dev,
+					 rustos_dvm_ivshmem_free_vectors, pdev);
+	if (result)
+		return result;
+	shared = &pdev->resource[RUSTOS_IVSHMEM_SHARED_BAR];
+	if (!(shared->flags & IORESOURCE_MEM) ||
+	    resource_size(shared) < RUSTOS_GUI_POOL_HEADER_BYTES)
+		return -ENODEV;
+	registers = &pdev->resource[RUSTOS_IVSHMEM_REGISTERS_BAR];
+	if (!(registers->flags & IORESOURCE_MEM) ||
+	    resource_size(registers) < RUSTOS_IVSHMEM_DOORBELL_OFFSET + sizeof(u32))
+		return -ENODEV;
+	state = devm_kzalloc(&pdev->dev, sizeof(*state), GFP_KERNEL);
+	if (!state)
+		return -ENOMEM;
+	state->doorbell = pcim_iomap(pdev, RUSTOS_IVSHMEM_REGISTERS_BAR,
+				    RUSTOS_IVSHMEM_DOORBELL_OFFSET + sizeof(u32));
+	if (!state->doorbell)
+		return -ENOMEM;
+	state->shared = pcim_iomap(pdev, RUSTOS_IVSHMEM_SHARED_BAR,
+				  RUSTOS_GUI_POOL_READY_CONFIRMATION_OFFSET + sizeof(u64));
+	if (!state->shared)
+		return -ENOMEM;
+	atomic_set(&state->host_invited, 0);
+	atomic_set(&state->relay_ready, 0);
+	atomic64_set(&state->invitation_generation, 0);
+	atomic64_set(&state->control_sequence, 0);
+	mutex_init(&state->control_lock);
+	/*
+	 * A RustOS present can precede Linux-DVM boot. ivshmem has no retained
+	 * interrupt edge, so reconstruct the invitation from its fixed shared
+	 * record before userspace opens /dev/uio. This is not a fallback: the same
+	 * generation is later matched exactly by the ready sysfs transaction.
+	 */
+	rustos_dvm_ivshmem_latch_host_invitation(state);
+	pci_set_drvdata(pdev, state);
+	state->uio.name = RUSTOS_DVM_UIO_NAME;
+	state->uio.version = "3";
+	state->uio.irq = pci_irq_vector(pdev, 0);
+	state->uio.handler = rustos_dvm_ivshmem_irq;
+	state->uio.irqcontrol = rustos_dvm_ivshmem_irq_control;
+	state->uio.mmap = rustos_dvm_ivshmem_mmap;
+	state->uio.mem[0].name = "rustos-gui-surface-pixels-wb-ro";
+	state->uio.mem[0].memtype = UIO_MEM_PHYS;
+	state->uio.mem[0].addr =
+		RUSTOS_GUI_PIXEL_REGION_PHYS + RUSTOS_GUI_POOL_HEADER_BYTES;
+	state->uio.mem[0].size =
+		RUSTOS_GUI_PIXEL_REGION_BYTES - RUSTOS_GUI_POOL_HEADER_BYTES;
+	state->uio.priv = state;
+	result = devm_uio_register_device(&pdev->dev, &state->uio);
+	if (!result)
+		result = devm_device_add_group(&pdev->dev,
+					       &rustos_dvm_ivshmem_attribute_group);
+	if (!result)
+		dev_info(&pdev->dev,
+			 "RustOS GUI surface UIO bound: MSI-X vector=%ld control_BAR2=%pa pixels=%pa+%pa\n",
+			 (long)state->uio.irq, &shared->start,
+			 &state->uio.mem[0].addr, &state->uio.mem[0].size);
+	return result;
+}
+
+static const struct pci_device_id rustos_dvm_ivshmem_ids[] = {
+	{ PCI_DEVICE(RUSTOS_IVSHMEM_VENDOR_ID, RUSTOS_IVSHMEM_DEVICE_ID) },
+	{ }
+};
+MODULE_DEVICE_TABLE(pci, rustos_dvm_ivshmem_ids);
+
+static struct pci_driver rustos_dvm_ivshmem_driver = {
+	.name = RUSTOS_DVM_UIO_NAME,
+	.id_table = rustos_dvm_ivshmem_ids,
+	.probe = rustos_dvm_ivshmem_probe,
+};
+module_pci_driver(rustos_dvm_ivshmem_driver);
+
+MODULE_AUTHOR("RustOS");
+MODULE_DESCRIPTION("RustOS GUI-DVM three-surface MSI-X UIO transport");
+MODULE_LICENSE("GPL");

@@ -23,6 +23,11 @@ Optimized for AI agents, not human onboarding. English-only, dense, contract-sha
 - Treat human docs (`docs/*.md` outside `docs/ai/`) as explanatory; AI docs as compact contracts.
 - Verify code truth before editing when a contract references a source path.
 - For OS hardening, prioritize high-risk boundaries over broad cleanup.
+- For debugging, classify every decisive property as `implemented and evidenced`,
+  `implemented but unverified`, or `absent`. If the cause is absent or structurally
+  unsupported, report that gap, its owner, and the acceptance consequence before
+  proposing a patch. Do not disguise an unimplemented path with a fallback,
+  synthetic success signal, or symptom-only tuning.
 - For blocked debugging, stop and report the structural blocker — no speculative patches.
 
 ## Stable cache prefix

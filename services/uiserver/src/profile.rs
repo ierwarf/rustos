@@ -1,7 +1,7 @@
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::sys::{profile_line, ui_profile_enabled};
+use crate::sys::{background_thread_demotion_count, profile_line, ui_profile_enabled};
 
 #[derive(Default)]
 struct ProfileWindow {
@@ -9,6 +9,17 @@ struct ProfileWindow {
     input_loops: u64,
     input_loop_micros: u64,
     input_events: u64,
+    last_input_at: Option<Instant>,
+    input_gap_millis: u64,
+    input_last_age_millis: u64,
+    input_drops: u64,
+    input_slow: u64,
+    input_errors: u64,
+    cursor_mismatches: u64,
+    cursor_x: u32,
+    cursor_y: u32,
+    presented_cursor_x: u32,
+    presented_cursor_y: u32,
     pointer_motion_events: u64,
     pointer_position_events: u64,
     other_events: u64,
@@ -91,6 +102,47 @@ pub(crate) fn record_wayland_motion(elapsed: Duration) {
         .saturating_add(duration_micros(elapsed));
 }
 
+/// Captures the input-side safety and latency state in the same bounded
+/// profile window as FPS.  The KVM gate consumes this record rather than a
+/// best-effort boot diagnostic channel, so it cannot mistake missing
+/// observability for healthy input.
+pub(crate) fn record_input_health(
+    input_events: u64,
+    input_last_age_millis: u64,
+    input_drops: u64,
+    input_slow: u64,
+    input_errors: u64,
+    cursor_x: u32,
+    cursor_y: u32,
+    presented_cursor_x: u32,
+    presented_cursor_y: u32,
+    cursor_synchronized: bool,
+) {
+    if !enabled() {
+        return;
+    }
+    let mut window = window().lock().unwrap();
+    if input_events > 0 {
+        let now = Instant::now();
+        if let Some(previous) = window.last_input_at.replace(now) {
+            window.input_gap_millis = window
+                .input_gap_millis
+                .max(duration_micros(now.duration_since(previous)) / 1_000);
+        }
+    }
+    window.input_last_age_millis = window.input_last_age_millis.max(input_last_age_millis);
+    window.input_drops = window.input_drops.max(input_drops);
+    window.input_slow = window.input_slow.max(input_slow);
+    window.input_errors = window.input_errors.max(input_errors);
+    window.cursor_x = cursor_x;
+    window.cursor_y = cursor_y;
+    window.presented_cursor_x = presented_cursor_x;
+    window.presented_cursor_y = presented_cursor_y;
+    if !cursor_synchronized {
+        window.cursor_mismatches = window.cursor_mismatches.saturating_add(1);
+    }
+}
+
 pub(crate) fn record_runtime_refresh(elapsed: Duration) {
     if !enabled() {
         return;
@@ -154,6 +206,14 @@ pub(crate) fn record_present(
         .saturating_add(duration_micros(present_elapsed));
 }
 
+pub(crate) fn record_backpressure_retry() {
+    if !enabled() {
+        return;
+    }
+    let mut window = window().lock().unwrap();
+    window.throttle_spins = window.throttle_spins.saturating_add(1);
+}
+
 pub(crate) fn maybe_emit() {
     if !enabled() {
         return;
@@ -177,12 +237,23 @@ pub(crate) fn maybe_emit() {
             .saturating_div(elapsed_micros);
 
         let line = format!(
-            "uiserver profile: elapsed_ms={} frame_hz_milli={} loops={} input_events={} input_ms={} motion={} position={} other={} backlog={} cursor_moves={} wayland_calls={} wayland_ms={} runtime_calls={} runtime_ms={} con_calls={} con_chg={} con_ms={} full={} part={} rects={} full_ren_ms={} full_prs_ms={} part_ren_ms={} part_prs_ms={} mpix={} spins={}",
+            "uiserver profile: elapsed_ms={} frame_hz_milli={} loops={} input_events={} input_ms={} input_gap_ms={} input_last_age_ms={} input_drops={} input_slow={} input_errors={} cursor_mismatches={} cursor={},{} presented_cursor={},{} background_thread_demotions={} motion={} position={} other={} backlog={} cursor_moves={} wayland_calls={} wayland_ms={} runtime_calls={} runtime_ms={} con_calls={} con_chg={} con_ms={} full={} part={} rects={} full_ren_ms={} full_prs_ms={} part_ren_ms={} part_prs_ms={} mpix={} spins={}",
             elapsed_micros / 1_000,
             frame_hz_milli,
             window.input_loops,
             window.input_events,
             window.input_loop_micros / 1000,
+            window.input_gap_millis,
+            window.input_last_age_millis,
+            window.input_drops,
+            window.input_slow,
+            window.input_errors,
+            window.cursor_mismatches,
+            window.cursor_x,
+            window.cursor_y,
+            window.presented_cursor_x,
+            window.presented_cursor_y,
+            background_thread_demotion_count(),
             window.pointer_motion_events,
             window.pointer_position_events,
             window.other_events,

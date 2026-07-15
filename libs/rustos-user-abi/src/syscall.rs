@@ -63,6 +63,17 @@ pub const SYS_RUSTOS_ROOTD_WAIT_BROKER: u64 = 0x5255_003b;
 /// Rootd-only final process teardown.  Admission and target selection remain
 /// rootd lease policy; ring0 atomically performs the process-resource cleanup.
 pub const SYS_RUSTOS_ROOTD_TERMINATE_BROKER: u64 = 0x5255_003c;
+/// Capability-gated, event-driven wait for the DVM input transport. Only
+/// inputd may use this to wait for an MSI-X-published ingress batch; input
+/// policy and translation remain in the service.
+pub const SYS_RUSTOS_INPUT_WAIT_BROKER: u64 = 0x5255_003e;
+/// Irreversibly removes the caller's base System scheduling admission.
+///
+/// This is deliberately a self-demotion only: it never accepts a requested
+/// priority or permits a User task to enter the System class.  A live,
+/// reply-scoped IPC priority donation remains effective until its exact reply
+/// capability is released.
+pub const SYS_RUSTOS_SCHED_DEMOTE_SELF: u64 = 0x5255_003d;
 
 /// RustOS-private auxv entry: virtual address of the bootstrap heap region
 /// that the kernel pre-maps for static-PIE policy services so they can run
@@ -75,6 +86,12 @@ pub const AT_RUSTOS_BOOTSTRAP_HEAP_LEN: u64 = 0x5255_1001;
 /// services. 16 MiB is enough for syscalld's BTreeMap<pid, state> and
 /// vfsd's FAT volume metadata without falling back to mmap.
 pub const RUSTOS_BOOTSTRAP_HEAP_DEFAULT_LEN: u64 = 16 * 1024 * 1024;
+
+/// Explicit admission bit for latency-critical display/input tasks.  The low
+/// bits remain the ordinary CFS load weight in microseconds; callers must not
+/// infer strict scheduling class from a numerically large weight.
+pub const TASK_WEIGHT_INTERACTIVE_FLAG: u64 = 1 << 63;
+pub const TASK_WEIGHT_VALUE_MASK: u64 = !TASK_WEIGHT_INTERACTIVE_FLAG;
 
 pub const IPC_ABI_VERSION: u16 = 1;
 pub const IPC_MAX_INLINE_BYTES: usize = 64 * 1024;
@@ -917,7 +934,10 @@ pub struct InputStatsWire {
 
 pub const INPUT_STATS_FLAG_PENDING_COALESCED: u32 = 1 << 0;
 pub const INPUT_STATS_FLAG_PENDING_POINTER_POSITION: u32 = 1 << 1;
-pub const INPUTD_IPC_ABI_VERSION: u16 = 1;
+/// Version 2 adds the report-atomic absolute pointer position member to
+/// `InputIngressWire`.  The size/layout change is intentionally incompatible
+/// with version 1 so a mixed kernel/inputd image fails closed.
+pub const INPUTD_IPC_ABI_VERSION: u16 = 2;
 pub const INPUTD_IPC_OP_PING: u16 = 1;
 pub const INPUTD_IPC_OP_STATS: u16 = 2;
 pub const INPUTD_IPC_OP_AUTHORIZE_READ: u16 = 3;
@@ -930,6 +950,7 @@ pub const INPUTD_READ_PAYLOAD_CAPACITY: usize = 32 * 1024;
 pub const INPUTD_INGEST_MAX_EVENTS: usize = 256;
 pub const INPUTD_READ_FLAG_NONBLOCK: u32 = 1 << 0;
 pub const INPUTD_INGRESS_KIND_POINTER_PACKET: u16 = 2;
+pub const INPUTD_INGRESS_KIND_POINTER_POSITION: u16 = 3;
 /// Linux evdev key transition normalized by an authenticated driver domain.
 /// `keyboard.code` is a Linux `KEY_*` value and `keyboard.action` uses the
 /// RustOS pressed/released/repeated action constants.
@@ -971,12 +992,24 @@ pub struct InputPointerPacketWire {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct InputPointerPositionWire {
+    pub buttons: u8,
+    pub reserved0: [u8; 3],
+    pub x: i32,
+    pub y: i32,
+    pub wheel_vertical: i16,
+    pub wheel_horizontal: i16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct InputIngressWire {
     pub kind: u16,
     pub access: u16,
     pub flags: u32,
     pub keyboard: InputKeyboardEventWire,
     pub pointer_packet: InputPointerPacketWire,
+    pub pointer_position: InputPointerPositionWire,
 }
 
 #[repr(C)]

@@ -23,7 +23,7 @@ elevate a server, the elevation crosses nested synchronous calls, and a lower
 effective class is never chosen while a higher effective class is ready.
 *******************************************************************************)
 
-CONSTANTS Tasks, Replies, InteractiveTask, BrokerTasks
+CONSTANTS Tasks, Replies, InteractiveTask, BrokerTasks, MaxSystemBurst
 
 NoTask == 0
 NoReply == 0
@@ -46,9 +46,11 @@ VARIABLES taskState,
           callerOf,
           receiverOf,
           donation,
-          lastPick
+          lastPick,
+          systemDispatchStreak
 
-vars == <<taskState, replyState, callerOf, receiverOf, donation, lastPick>>
+vars == <<taskState, replyState, callerOf, receiverOf, donation, lastPick,
+          systemDispatchStreak>>
 
 LiveReply(reply) == replyState[reply] \in {Queued, Serving}
 
@@ -82,6 +84,16 @@ SystemReady ==
         /\ taskState[task] = Runnable
         /\ EffectiveClass(task) = System
 
+UserReady ==
+    \E task \in Tasks:
+        /\ taskState[task] = Runnable
+        /\ EffectiveClass(task) = User
+
+UserReservationDue ==
+    /\ SystemReady
+    /\ UserReady
+    /\ systemDispatchStreak = MaxSystemBurst
+
 NoLiveCallFrom(task) ==
     \A reply \in Replies:
         \neg(LiveReply(reply) /\ callerOf[reply] = task)
@@ -96,6 +108,7 @@ Init ==
     /\ receiverOf = [reply \in Replies |-> NoTask]
     /\ donation = [reply \in Replies |-> FALSE]
     /\ lastPick = NoTask
+    /\ systemDispatchStreak = 0
 
 (*******************************************************************************
 The sender installs the reply-scoped donation before it wakes or hands off to
@@ -118,6 +131,7 @@ StartCall(caller, receiver, reply) ==
     /\ receiverOf' = [receiverOf EXCEPT ![reply] = receiver]
     /\ donation' = [donation EXCEPT ![reply] = TRUE]
     /\ lastPick' = NoTask
+    /\ UNCHANGED systemDispatchStreak
 
 DequeueCall(receiver, reply) ==
     /\ receiver \in Tasks
@@ -128,6 +142,7 @@ DequeueCall(receiver, reply) ==
     /\ replyState' = [replyState EXCEPT ![reply] = Serving]
     /\ UNCHANGED <<taskState, callerOf, receiverOf, donation>>
     /\ lastPick' = NoTask
+    /\ UNCHANGED systemDispatchStreak
 
 (*******************************************************************************
 A server may synchronously call another server while it still owns an inbound
@@ -147,6 +162,7 @@ CompleteReply(receiver, reply) ==
     /\ donation' = [donation EXCEPT ![reply] = FALSE]
     /\ UNCHANGED <<callerOf, receiverOf>>
     /\ lastPick' = NoTask
+    /\ UNCHANGED systemDispatchStreak
 
 CancelReply(caller, reply) ==
     /\ caller \in Tasks
@@ -159,6 +175,7 @@ CancelReply(caller, reply) ==
     /\ donation' = [donation EXCEPT ![reply] = FALSE]
     /\ UNCHANGED <<callerOf, receiverOf>>
     /\ lastPick' = NoTask
+    /\ UNCHANGED systemDispatchStreak
 
 (*******************************************************************************
 Task teardown is a second, independent revocation path. It revokes both
@@ -180,18 +197,31 @@ ExitTask(task) ==
           ELSE donation[reply]]
     /\ UNCHANGED <<callerOf, receiverOf>>
     /\ lastPick' = NoTask
+    /\ UNCHANGED systemDispatchStreak
 
 (*******************************************************************************
-Strict bands select an effective-System receiver before every effective-User
-task. CFS vruntime fairness inside that band is intentionally abstracted; the
-invariant captures the boundary that previously admitted inversion.
+System work selects an effective-System receiver until its bounded burst is
+exhausted. A ready effective-User task then receives one mandatory dispatch.
+CFS vruntime fairness inside each band is intentionally abstracted; the model
+captures both reply-scoped inversion prevention and the critical-lane CPU
+reservation.
 *******************************************************************************)
 Schedule(task) ==
     /\ task \in Tasks
     /\ taskState[task] = Runnable
-    /\ ~SystemReady \/ EffectiveClass(task) = System
+    /\ IF UserReservationDue
+          THEN EffectiveClass(task) = User
+          ELSE ~SystemReady \/ EffectiveClass(task) = System
     /\ lastPick' = task
     /\ UNCHANGED <<taskState, replyState, callerOf, receiverOf, donation>>
+    /\ systemDispatchStreak' =
+          IF EffectiveClass(task) = System
+          THEN IF systemDispatchStreak < MaxSystemBurst
+               THEN systemDispatchStreak + 1
+               ELSE MaxSystemBurst
+          ELSE 0
+
+ScheduleAny == \E task \in Tasks: Schedule(task)
 
 Next ==
     \/ \E caller \in Tasks, receiver \in Tasks, reply \in Replies:
@@ -202,7 +232,7 @@ Next ==
     \/ \E receiver \in Tasks, reply \in Replies: CompleteReply(receiver, reply)
     \/ \E caller \in Tasks, reply \in Replies: CancelReply(caller, reply)
     \/ \E task \in Tasks: ExitTask(task)
-    \/ \E task \in Tasks: Schedule(task)
+    \/ ScheduleAny
 
 Spec == Init /\ [][Next]_vars
 
@@ -213,6 +243,7 @@ TypeOK ==
     /\ receiverOf \in [Replies -> (Tasks \cup {NoTask})]
     /\ donation \in [Replies -> BOOLEAN]
     /\ lastPick \in Tasks \cup {NoTask}
+    /\ systemDispatchStreak \in 0..MaxSystemBurst
 
 DonationHasLiveReply ==
     \A reply \in Replies:
@@ -245,8 +276,12 @@ BlockedSystemCallerHasSystemReceiver ==
         => \A receiver \in OwnerTasks(receiverOf[reply]):
                EffectiveClass(receiver) = System
 
-StrictPrioritySelection ==
-    lastPick # NoTask /\ SystemReady => EffectiveClass(lastPick) = System
+BoundedSystemBurst == systemDispatchStreak <= MaxSystemBurst
+
+UserPickRequiresReservation ==
+    lastPick # NoTask /\ SystemReady /\ EffectiveClass(lastPick) = User =>
+        /\ UserReady
+        /\ systemDispatchStreak = 0
 
 NoPromotionAfterTerminalReply ==
     \A reply \in Replies:

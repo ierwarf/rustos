@@ -19,7 +19,6 @@ pub enum FaultAction {
     DropEvery(u32),
     FailAfter(u64),
     RatePermille(u16),
-    DelayMs(u64),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -99,9 +98,6 @@ fn parse_action(action: &str) -> Result<FaultAction, ParseFaultRuleError> {
         }
         return Ok(FaultAction::RatePermille(value));
     }
-    if let Some(value) = action.strip_prefix("delay-ms:") {
-        return Ok(FaultAction::DelayMs(parse_u64(value)?));
-    }
     Err(ParseFaultRuleError::InvalidAction)
 }
 
@@ -145,10 +141,7 @@ mod tests {
             parse_rule("alloc.page=rate:25").unwrap().action,
             FaultAction::RatePermille(25)
         );
-        assert_eq!(
-            parse_rule("virtio.queue=delay-ms:10").unwrap().action,
-            FaultAction::DelayMs(10)
-        );
+        assert!(parse_rule("virtio.queue=unsupported-action").is_err());
     }
 
     #[test]

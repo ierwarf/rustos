@@ -126,7 +126,7 @@ impl RuntimeFaultRule {
         self.hits = self.hits.saturating_add(1);
         match self.action {
             FaultAction::Fail => true,
-            FaultAction::Off | FaultAction::DelayMs(_) => false,
+            FaultAction::Off => false,
             FaultAction::DropEvery(n) => n != 0 && self.hits.is_multiple_of(u64::from(n)),
             FaultAction::FailAfter(n) => self.hits > n,
             FaultAction::RatePermille(rate) => {
