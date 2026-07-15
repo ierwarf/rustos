@@ -36,30 +36,11 @@ pub const LOG_LEVELS: [(&str, u8); 6] = [
 ];
 
 pub fn emit_project_config_rerun(config_path: &std::path::Path) {
-    let tracked_path = if config_path.is_file() {
-        config_path.to_path_buf()
-    } else {
-        legacy_logging_path(config_path)
-    };
-    println!(
-        "cargo:rerun-if-changed={}",
-        tracked_path.display()
-    );
+    println!("cargo:rerun-if-changed={}", config_path.display());
 }
 
 pub fn read_project_config(config_path: &std::path::Path) -> std::io::Result<String> {
-    if config_path.is_file() {
-        std::fs::read_to_string(config_path)
-    } else {
-        std::fs::read_to_string(legacy_logging_path(config_path))
-    }
-}
-
-fn legacy_logging_path(config_path: &std::path::Path) -> std::path::PathBuf {
-    config_path
-        .parent()
-        .map(|parent| parent.join("logging.toml"))
-        .unwrap_or_else(|| std::path::PathBuf::from("logging.toml"))
+    std::fs::read_to_string(config_path)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -127,8 +127,7 @@ mod tests {
         assert_eq!(syscall::INPUTD_INGRESS_KIND_POINTER_POSITION, 3);
         assert_eq!(syscall::INPUTD_INGRESS_KIND_DVM_LINUX_KEY, 10);
         assert_eq!(syscall::INPUTD_INGRESS_FLAG_DVM_SOURCE, 1 << 1);
-        assert_eq!(syscall::STORAGED_OP_ROOT_STATUS, 4);
-        assert_eq!(syscall::STORAGED_OP_BOOT_EXTENT_LOOKUP, 5);
+        assert_eq!(syscall::STORAGED_POLICY_ABI_VERSION, 1);
 
         assert!(size_of::<syscall::DevmgrdDeviceOpenRequest>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert!(size_of::<syscall::DevmgrdDeviceOpenResponse>() <= syscall::IPC_MAX_INLINE_BYTES);
@@ -140,12 +139,8 @@ mod tests {
         assert_eq!(size_of::<syscall::InputPointerPositionWire>(), 16);
         assert_eq!(size_of::<syscall::InputIngressWire>(), 52);
         assert!(size_of::<syscall::InputdReadResponse>() <= syscall::IPC_MAX_INLINE_BYTES);
-        assert!(size_of::<syscall::RootdIpcRequest>() <= syscall::IPC_MAX_INLINE_BYTES);
-        assert!(size_of::<syscall::RootdIpcResponse>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert_eq!(size_of::<syscall::StoragedAhciPolicyWire>(), 32);
         assert_eq!(size_of::<syscall::StoragedNvmePolicyWire>(), 36);
-        assert!(size_of::<syscall::StoragedRequest>() <= syscall::IPC_MAX_INLINE_BYTES);
-        assert!(size_of::<syscall::StoragedResponse>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert!(size_of::<syscall::RustosBootExtentBrokerArgs>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert!(size_of::<syscall::NetdIpcRequest>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert!(size_of::<syscall::NetdIpcResponse>() <= syscall::IPC_MAX_INLINE_BYTES);

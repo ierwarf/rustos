@@ -17,27 +17,25 @@ use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, CoreServiceLeaseWire,
     LifecycleDrainBrokerArgs, LifecycleEventWire, LoaderSpawnRequest, LoaderSpawnResponse,
-    RootdIpcRequest, RootdIpcResponse, RustosRootdTerminateBrokerArgs,
-    COMMERCIAL_MAX_CAPABILITY_OP_LEASE_GRANT, COMMERCIAL_MAX_CAPABILITY_OP_LEASE_RENEW,
-    COMMERCIAL_MAX_CAPABILITY_OP_LEASE_REVOKE, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
-    COMMERCIAL_MAX_PROTOCOL_CAPABILITY, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
-    COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR, COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST,
-    COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE, COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH,
-    COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY, COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM,
-    COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL, COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY,
-    COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY, COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP,
-    IPC_SERVICE_DEVMGRD, IPC_SERVICE_INPUTD, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD,
-    IPC_SERVICE_NETD, IPC_SERVICE_PAGERD, IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD,
-    IPC_SERVICE_SESSIOND, IPC_SERVICE_STORAGED, IPC_SERVICE_UISERVER, IPC_SERVICE_VFSD,
-    LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT, LOADER_OP_ACTIVATE, LOADER_OP_SPAWN_EXEC,
-    LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES,
-    LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_FLAG_DEFER_START, ROOTD_IPC_ABI_VERSION,
-    ROOTD_IPC_OP_LEASE_LIST, ROOTD_IPC_OP_STATUS, ROOTD_LEASE_STATE_EXITED,
-    ROOTD_LEASE_STATE_FAILED, ROOTD_LEASE_STATE_RESTART_PENDING, ROOTD_LEASE_STATE_RUNNING,
-    SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
-    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_RECV_WITH_SENDER,
-    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
-    SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
+    RustosRootdTerminateBrokerArgs, COMMERCIAL_MAX_CAPABILITY_OP_LEASE_GRANT,
+    COMMERCIAL_MAX_CAPABILITY_OP_LEASE_RENEW, COMMERCIAL_MAX_CAPABILITY_OP_LEASE_REVOKE,
+    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_CAPABILITY,
+    COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR,
+    COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST, COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE,
+    COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH, COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY,
+    COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM, COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL,
+    COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY, COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY,
+    COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP, IPC_SERVICE_DEVMGRD, IPC_SERVICE_INPUTD,
+    IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD, IPC_SERVICE_NETD, IPC_SERVICE_PAGERD,
+    IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD, IPC_SERVICE_SESSIOND, IPC_SERVICE_STORAGED,
+    IPC_SERVICE_UISERVER, IPC_SERVICE_VFSD, LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT,
+    LOADER_OP_ACTIVATE, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
+    LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_FLAG_DEFER_START,
+    ROOTD_LEASE_STATE_EXITED, ROOTD_LEASE_STATE_FAILED, ROOTD_LEASE_STATE_RESTART_PENDING,
+    ROOTD_LEASE_STATE_RUNNING, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_CALL,
+    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
     SYS_RUSTOS_ROOTD_TERMINATE_BROKER, SYS_RUSTOS_ROOTD_WAIT_BROKER, SYS_RUSTOS_SPAWN_EXEC,
     TASK_WEIGHT_INTERACTIVE_FLAG,
 };
@@ -554,51 +552,34 @@ fn serve_rootd_once(
         }
         return;
     }
-    if received as usize == size_of::<CommercialMaxProtocolRequest>() {
-        reply_commercial_max_request(
-            reply_cap,
-            &request,
-            leases,
-            post_init_leases,
-            IpcSenderIdentity {
-                pid: sender_pid,
-                tid: sender_tid,
-            },
-        );
+    if received as usize != size_of::<CommercialMaxProtocolRequest>() {
+        reply_commercial_max_error(reply_cap, &request, 22);
         return;
     }
-    if received as usize != size_of::<RootdIpcRequest>() {
-        return;
-    }
-    let legacy =
-        unsafe { &*((&request as *const CommercialMaxProtocolRequest).cast::<RootdIpcRequest>()) };
-    reply_legacy_rootd_request(reply_cap, legacy, leases, received as usize);
+    reply_commercial_max_request(
+        reply_cap,
+        &request,
+        leases,
+        post_init_leases,
+        IpcSenderIdentity {
+            pid: sender_pid,
+            tid: sender_tid,
+        },
+    );
 }
 
-fn reply_legacy_rootd_request(
-    reply_cap: u64,
-    request: &RootdIpcRequest,
-    leases: &[Lease],
-    received: usize,
-) {
-    let mut response = RootdIpcResponse {
-        version: ROOTD_IPC_ABI_VERSION,
-        op: request.op,
-        lease_count: leases.len() as u32,
-        ..RootdIpcResponse::default()
+fn reply_commercial_max_error(reply_cap: u64, request: &CommercialMaxProtocolRequest, status: i32) {
+    let mut response = CommercialMaxProtocolResponse {
+        header: request.header,
+        status,
+        ..CommercialMaxProtocolResponse::default()
     };
-    response.status = match validate_rootd_request(received, request) {
-        Ok(()) => match fill_rootd_response(request, leases, &mut response) {
-            Ok(()) => 0,
-            Err(errno) => errno,
-        },
-        Err(errno) => errno,
-    };
+    response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
     let _ = syscall3(
         SYS_RUSTOS_IPC_REPLY,
         reply_cap,
-        (&response as *const RootdIpcResponse) as u64,
-        size_of::<RootdIpcResponse>() as u64,
+        (&response as *const CommercialMaxProtocolResponse) as u64,
+        size_of::<CommercialMaxProtocolResponse>() as u64,
     );
 }
 
@@ -663,48 +644,6 @@ fn reply_commercial_max_request(
         && replied >= 0
     {
         debug_line(b"rootd: service capability replied ok\n");
-    }
-}
-
-fn validate_rootd_request(received: usize, request: &RootdIpcRequest) -> Result<(), i32> {
-    if received != size_of::<RootdIpcRequest>()
-        || request.version != ROOTD_IPC_ABI_VERSION
-        || request.flags != 0
-        || request.reserved0 != 0
-    {
-        return Err(22);
-    }
-    match request.op {
-        ROOTD_IPC_OP_STATUS | ROOTD_IPC_OP_LEASE_LIST => Ok(()),
-        _ => Err(22),
-    }
-}
-
-fn fill_rootd_response(
-    request: &RootdIpcRequest,
-    leases: &[Lease],
-    response: &mut RootdIpcResponse,
-) -> Result<(), i32> {
-    match request.op {
-        ROOTD_IPC_OP_STATUS => {
-            let mut running = 0_u64;
-            for lease in leases {
-                if lease.state == ROOTD_LEASE_STATE_RUNNING {
-                    running += 1;
-                }
-            }
-            response.value = running;
-            Ok(())
-        }
-        ROOTD_IPC_OP_LEASE_LIST => {
-            let index = request.index as usize;
-            if index >= leases.len() {
-                return Err(34);
-            }
-            response.lease = lease_wire(&leases[index]);
-            Ok(())
-        }
-        _ => Err(22),
     }
 }
 

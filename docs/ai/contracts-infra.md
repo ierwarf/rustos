@@ -226,9 +226,13 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   host-to-DVM wake vector and exactly two host receive vector meanings
   (`control`, `offline`) plus the fixed validated UC control plane; it rejects
   other UIDs and peers. A separate 32 MiB `virtio-pmem` pixel device is writable
-  in RustOS QEMU and read-only/ROM in the DVM. RustOS copies a complete immutable
-  frame into each slot, fences it before publishing its exact even generation,
-  and rings only the fixed DVM peer. The DVM-only
+  in RustOS QEMU and read-only/ROM in the DVM. RustOS publishes a complete
+  immutable frame in each slot. It may patch only the declared damage when a
+  released slot retains the exact immediately preceding content generation and
+  the compositor source mapping is unchanged; otherwise it copies the complete
+  frame. Retained content generation never restores the cleared release token.
+  RustOS fences the completed snapshot before publishing its exact even
+  generation and rings only the fixed DVM peer. The DVM-only
   `rustos_dvm_ivshmem_uio` module validates the pool header, reconstructs an
   invitation that predates module load, allocates one local MSI-X UIO receive
   vector, requires the control and pixel headers to match, exposes only the
@@ -301,7 +305,10 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   contain an exact matching member and rejects cross-domain CID, IOMMU-group,
   and PCI-BDF reuse; unsigned activation is unavailable. Only after all of
   those checks does hostd persist an owner-private `prepared` lease with each
-  original PCI driver and `driver_override`, bind the whole preflighted group
+  original PCI driver and `driver_override`. Durable leases use only
+  `VFIO_LEASE_SCHEMA=3` and always bind release, artifact, device-policy, and
+  fleet-policy digests; older schemas are rejected instead of being restored
+  into the active authority graph. Hostd then binds the whole preflighted group
   to `vfio-pci`, and atomically mark it active. Reverse-order rollback is
   mandatory on failure; failed acquisition retains the prepared record, and
   `release --activate` restores either prepared or active records and deletes

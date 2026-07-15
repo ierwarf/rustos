@@ -284,7 +284,6 @@ configure() {
 }
 
 prepare_mutable_inputs() {
-    local legacy_service_stamp="$BUILD_DIR/.rustos-agent-input.sha256"
     local overlay_stamp="$BUILD_DIR/.rustos-overlay-input.sha256"
     local overlay_files_stamp="$BUILD_DIR/.rustos-overlay-files-v1"
     local overlay_current
@@ -298,12 +297,6 @@ prepare_mutable_inputs() {
     # the external source tree after its first rsync. Remove only the local
     # service package directories so the next ordinary make recreates and
     # reinstalls them while retaining the verified host toolchain and kernel.
-    if test -f "$legacy_service_stamp"; then
-        rm -f -- "$legacy_service_stamp"
-        for service in rustos-dvm-agent rustos-dvm-display rustos-dvm-net; do
-            make_buildroot "${service}-dirclean"
-        done
-    fi
     for service in rustos-dvm-agent rustos-dvm-display rustos-dvm-net; do
         service_stamp="$BUILD_DIR/.${service}-input-v1.sha256"
         service_current="$(local_service_input_hash "$service")"

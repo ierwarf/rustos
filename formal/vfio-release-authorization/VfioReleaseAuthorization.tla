@@ -22,7 +22,8 @@ of gpgv against the pinned keyring, not a guest assertion.
 
 CONSTANTS Domains, Cids, Groups, Artifacts, Policies, Manifests,
           ExpectedManifest, ExpectedDomain, ExpectedCid, ExpectedGroup,
-          ExpectedArtifact, ExpectedPolicy, MaxTime
+          ExpectedArtifact, ExpectedPolicy, CurrentLeaseSchema,
+          RetiredLeaseSchemas, MaxTime
 
 NoString == "none"
 NoCid == 0
@@ -62,7 +63,7 @@ VARIABLES phase, now,
           leaseDomain, leaseCid, leaseGroup, leaseArtifact, leasePolicy,
           signature, authManifest, authDomain, authCid, authGroup, authArtifact, authPolicy,
           authNotBefore, authNotAfter,
-          recordDurable, recordManifest, recordDomain, recordCid, recordGroup,
+          recordDurable, recordSchema, recordManifest, recordDomain, recordCid, recordGroup,
           recordArtifact, recordPolicy, recordAuthorizedAt, recordNotAfter,
           boundGroup, activationTime, rejected
 
@@ -70,7 +71,7 @@ vars == <<phase, now,
           leaseDomain, leaseCid, leaseGroup, leaseArtifact, leasePolicy,
           signature, authManifest, authDomain, authCid, authGroup, authArtifact, authPolicy,
           authNotBefore, authNotAfter,
-          recordDurable, recordManifest, recordDomain, recordCid, recordGroup,
+          recordDurable, recordSchema, recordManifest, recordDomain, recordCid, recordGroup,
           recordArtifact, recordPolicy, recordAuthorizedAt, recordNotAfter,
           boundGroup, activationTime, rejected>>
 
@@ -87,6 +88,7 @@ ClearAuthorization ==
 
 ClearRecord ==
     /\ recordDurable' = FALSE
+    /\ recordSchema' = 0
     /\ recordManifest' = NoString
     /\ recordDomain' = NoString
     /\ recordCid' = NoCid
@@ -116,6 +118,7 @@ Init ==
     /\ authNotBefore = 0
     /\ authNotAfter = 0
     /\ recordDurable = FALSE
+    /\ recordSchema = 0
     /\ recordManifest = NoString
     /\ recordDomain = NoString
     /\ recordCid = NoCid
@@ -161,7 +164,7 @@ PresentSignedAuthorization(kind, from, until) ==
     /\ authNotBefore' = from
     /\ authNotAfter' = until
     /\ UNCHANGED <<phase, now, leaseDomain, leaseCid, leaseGroup, leaseArtifact, leasePolicy,
-                  recordDurable, recordManifest, recordDomain, recordCid, recordGroup,
+                  recordDurable, recordSchema, recordManifest, recordDomain, recordCid, recordGroup,
                   recordArtifact, recordPolicy, recordAuthorizedAt, recordNotAfter,
                   boundGroup, activationTime, rejected>>
 
@@ -182,7 +185,7 @@ VerifyExactAuthorization ==
     /\ phase' = Authorized
     /\ UNCHANGED <<now, leaseDomain, leaseCid, leaseGroup, leaseArtifact, leasePolicy,
                   signature, authManifest, authDomain, authCid, authGroup, authArtifact,
-                  authPolicy, authNotBefore, authNotAfter, recordDurable, recordManifest,
+                  authPolicy, authNotBefore, authNotAfter, recordDurable, recordSchema, recordManifest,
                   recordDomain, recordCid, recordGroup, recordArtifact, recordPolicy,
                   recordAuthorizedAt, recordNotAfter, boundGroup, activationTime, rejected>>
 
@@ -206,6 +209,7 @@ PrepareDurableLease ==
     /\ AuthorizationMatchesLease
     /\ phase' = Prepared
     /\ recordDurable' = TRUE
+    /\ recordSchema' = CurrentLeaseSchema
     /\ recordManifest' = authManifest
     /\ recordDomain' = authDomain
     /\ recordCid' = authCid
@@ -240,7 +244,7 @@ ActivateVfio ==
     /\ activationTime' = now
     /\ UNCHANGED <<now, leaseDomain, leaseCid, leaseGroup, leaseArtifact, leasePolicy,
                   signature, authManifest, authDomain, authCid, authGroup, authArtifact,
-                  authPolicy, authNotBefore, authNotAfter, recordDurable, recordManifest,
+                  authPolicy, authNotBefore, authNotAfter, recordDurable, recordSchema, recordManifest,
                   recordDomain, recordCid, recordGroup, recordArtifact, recordPolicy,
                   recordAuthorizedAt, recordNotAfter, rejected>>
 
@@ -268,12 +272,24 @@ AbandonUnboundAuthorization ==
     /\ ClearRecord
     /\ UNCHANGED <<now, rejected>>
 
+AttemptRestoreRetiredSchema(schema) ==
+    /\ phase = Idle
+    /\ schema \in RetiredLeaseSchemas
+    /\ rejected' = TRUE
+    /\ UNCHANGED <<phase, now, leaseDomain, leaseCid, leaseGroup, leaseArtifact,
+                  leasePolicy, signature, authManifest, authDomain, authCid,
+                  authGroup, authArtifact, authPolicy, authNotBefore,
+                  authNotAfter, recordDurable, recordSchema, recordManifest,
+                  recordDomain, recordCid, recordGroup, recordArtifact,
+                  recordPolicy, recordAuthorizedAt, recordNotAfter, boundGroup,
+                  activationTime>>
+
 AdvanceTime ==
     /\ now < MaxTime
     /\ now' = now + 1
     /\ UNCHANGED <<phase, leaseDomain, leaseCid, leaseGroup, leaseArtifact, leasePolicy,
                   signature, authManifest, authDomain, authCid, authGroup, authArtifact,
-                  authPolicy, authNotBefore, authNotAfter, recordDurable, recordManifest,
+                  authPolicy, authNotBefore, authNotAfter, recordDurable, recordSchema, recordManifest,
                   recordDomain, recordCid, recordGroup, recordArtifact, recordPolicy,
                   recordAuthorizedAt, recordNotAfter, boundGroup, activationTime, rejected>>
 
@@ -287,6 +303,7 @@ Next ==
     \/ ActivateVfio
     \/ RestoreOriginalDrivers
     \/ AbandonUnboundAuthorization
+    \/ \E schema \in RetiredLeaseSchemas : AttemptRestoreRetiredSchema(schema)
     \/ AdvanceTime
 
 TypeOK ==
@@ -296,6 +313,8 @@ TypeOK ==
     /\ ExpectedGroup \in Groups
     /\ ExpectedArtifact \in Artifacts
     /\ ExpectedPolicy \in Policies
+    /\ CurrentLeaseSchema \in Nat \ {0}
+    /\ RetiredLeaseSchemas \subseteq Nat \ {0, CurrentLeaseSchema}
     \* Candidate mismatch transitions are meaningful only when the finite
     \* configuration contains a distinct value for every signed field.
     /\ ForeignManifest \in Manifests \ {ExpectedManifest}
@@ -321,6 +340,7 @@ TypeOK ==
     /\ authNotBefore \in Times
     /\ authNotAfter \in Times
     /\ recordDurable \in BOOLEAN
+    /\ recordSchema \in {0, CurrentLeaseSchema}
     /\ recordManifest \in Manifests \cup {NoString}
     /\ recordDomain \in Domains \cup {NoString}
     /\ recordCid \in Cids \cup {NoCid}
@@ -355,6 +375,9 @@ EveryMutationWasWithinAuthorization ==
 
 IdleHasNoDeviceAuthority ==
     phase = Idle => /\ ~recordDurable /\ boundGroup = NoGroup
+
+DurableRecordUsesCurrentSchema ==
+    recordDurable <=> recordSchema = CurrentLeaseSchema
 
 Spec == Init /\ [][Next]_vars
 =============================================================================

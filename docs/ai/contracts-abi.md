@@ -20,7 +20,9 @@ IPC service IDs, broker syscalls, handle transfer, and service routing. For pack
 - Must avoid Linux libc/std dynamic runtime deps.
 - Spawns `syscalld`, `vfsd`, `loaderd`, `procd`, then hands off to `services/initd/initd.elf`.
 - Kernel boot code must not grow generic POSIX compat exceptions for `initd`; early bootstrap surface stays narrow, explicit, tied to `rootd` bringing up foundational policy services.
-- Stays resident as `IPC_SERVICE_ROOTD`; serves `ROOTD_IPC_OP_STATUS`, `ROOTD_IPC_OP_LEASE_LIST`; tracks `CoreServiceLeaseWire` via `SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER`.
+- Stays resident as `IPC_SERVICE_ROOTD`; serves only the versioned
+  `COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR` contract and tracks
+  `CoreServiceLeaseWire` via `SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER`.
 
 ## IPC Service Registry
 
@@ -40,7 +42,7 @@ endpoint lifecycle transitions: `ipc-service-register`,
 service admission and capability policy owner. Endpoint revoke is owner-only
 unless the caller holds `ROOT_SUPERVISOR`.
 `SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT` is service/supervisor discovery: root-supervisor callers may use the kernel table directly; other callers are admitted through rootd `COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP`. Core services and post-init services are admitted only by matching a running rootd lease. Generic apps use Linux/Win32 ABI routes and kernel compat helpers, not raw policy-service endpoint lookup.
-Service capability assignment is rootd policy: after rootd self-registration, kernel compat asks `COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY` with the registering subject PID/TID and records the returned `IPC_SERVICE_CAP_*` mask only if rootd confirms the PID matches the running lease. This includes the legacy Linux-syscall endpoint registration path. Do not reintroduce a full `service_id -> capability` table in ring0.
+Service capability assignment is rootd policy: after rootd self-registration, kernel compat asks `COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY` with the registering subject PID/TID and records the returned `IPC_SERVICE_CAP_*` mask only if rootd confirms the PID matches the running lease. This includes endpoint registration through the Linux syscall ABI. Do not reintroduce a full `service_id -> capability` table in ring0.
 Post-init lease reporting is ring3-owned: `initd` reports successfully spawned
 policy services to rootd with `COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL`
 (`arg0=IPC_SERVICE_*`, `arg1=pid`, `path=exec`). rootd uses that lease registry
@@ -64,7 +66,7 @@ Reports for an already-running lease are idempotent only for the same PID and
 must reject attempts to overwrite the lease with a different PID. rootd also
 records the kernel-stamped reporter PID. A newly restarted `initd` reconciles
 its five service leases through `COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY`:
-it adopts only an exact-PID endpoint, keeps an endpoint-less legacy lease in a
+it adopts only an exact-PID endpoint, keeps an endpoint-pending admitted lease in a
 bounded 30-second recovery window, then requests
 `COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM` for the exact stale PID.
 Only the current initd may query/reclaim its own service classes; sessiond's
@@ -137,7 +139,12 @@ The GUI-DVM contract fixes three host-provisioned surfaces and 64-byte
 variable-length payloads. The ivshmem BAR contains only uncached control state;
 the separate cacheable pixel device is writable only by RustOS QEMU and is
 read-only/ROM in the DVM. Every READY slot is a complete immutable snapshot,
-even when its PRESENT damage hint is partial. The DVM module requires matching
+even when its PRESENT damage hint is partial. RustOS may construct that
+snapshot with a damage-only patch only after reclaiming a FREE slot whose
+retained pixel-content generation is the exact immediately preceding
+generation and whose source mapping is unchanged; retained content generation
+is not release authority. An uninitialized/stale slot, a source replacement,
+or full damage forces a complete copy. The DVM module requires matching
 control/pixel headers, exposes only WB read-only pixel pages to its relay, and
 rejects writable VMAs. It validates each release against the
 matching host record before it writes the one outstanding control sequence.
@@ -273,8 +280,12 @@ policy remains with the owning service.
 ## Storage Surface (`storaged`)
 
 - Gated `SYS_RUSTOS_STORAGE_LIST_BROKER` (gated by `STORAGE_POLICY`) enumerates kernel-discovered descriptors; no direct generic-app storage probing.
-- `StoragedRequest`/`Response` exposes `STORAGED_OP_ROOT_STATUS`, `STORAGED_OP_BOOT_EXTENT_LOOKUP`.
-- Boot extent leases are storaged policy, sourced from `system/registry/kernel/root-file-extents.tsv` and returned over `STORAGED_OP_BOOT_EXTENT_LOOKUP`. Do not reintroduce generic ring0 boot-extent policy; ring0 storage brokers remain descriptor/block substrate only.
+- Storaged accepts only the versioned `CommercialMaxProtocolRequest` contract.
+  Boot extent leases are storaged policy, sourced from
+  `system/registry/kernel/root-file-extents.tsv` and returned over
+  `COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE`. Do not reintroduce generic
+  ring0 boot-extent policy; ring0 storage brokers remain descriptor/block
+  substrate only.
 - Root extent manifests are bootloader-supplied data, not ring0 filesystem policy. GRUB signature enforcement authenticates `system/registry/kernel/root-file-extents.tsv` before loading it as the `rustos-root-extents` multiboot2 module, and `BootInfo.boot_extent_manifest` points at that immutable memory. Each row binds an exact path and extent coverage to ordered `sha256_chunks` digests over 64-KiB file chunks. Kernel boot may parse that manifest and perform physical extent reads, but must reject duplicate paths, overlapping/inexact extents, digest-count mismatch, and content mismatch; it must not need FAT directory traversal just to discover the manifest.
 - Ring0 boot-volume FAT traversal is not part of the direct boot-file path. Entering `KernelVfsReady` must preload the root extent table from `BootInfo.boot_extent_manifest`; if the manifest is absent or a path is missing from it, direct boot-volume helpers fail closed. Directory traversal and generic FAT fallback must stay out of ring0 so namespace policy stays in `vfsd`/`storaged`.
 - AHCI/NVMe post-bootstrap selection, inventory, partition, and extent policy lives in `storaged`/`vfsd`, but physical boot-volume block reads still require kernel io-manager transport substrate. Do not delete AHCI MMIO/DMA command execution until an explicit ring3 service-driver protocol can perform real block I/O before `rootd` and `vfsd` need it.
@@ -416,7 +427,7 @@ is an explicit bootstrap transfer and may be consumed by the next scheduler
 dispatch, including deferred syscall-exit dispatch; it may bypass the generic
 IPC strict-class guard, otherwise a ready System-class task can indefinitely
 defer a child-first handoff. A service that lacks a pre-admitted lease must not
-use this legacy path. IPC enqueue/reply
+use this direct bootstrap handoff. IPC enqueue/reply
 completion wakes the receiver/caller and may set a direct pick hint for any
 currently ready and
 schedulable target; already-runnable service endpoints still need a handoff when

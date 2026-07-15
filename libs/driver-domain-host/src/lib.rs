@@ -743,14 +743,13 @@ impl ReleaseAuthorization {
 }
 
 /// Evidence retained with a durable VFIO lease after a release authorization
-/// was verified. Recovery may restore a legacy record, but no new bind may be
-/// prepared or activated without this exact immutable evidence.
+/// was verified. Every durable record carries this exact immutable evidence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VfioReleaseBinding {
     release_manifest_sha256: String,
     dvm_artifact_manifest_sha256: String,
     device_policy_sha256: String,
-    fleet_policy_sha256: Option<String>,
+    fleet_policy_sha256: String,
     authorized_at_unix: u64,
     authorization_not_after_unix: u64,
 }
@@ -774,42 +773,13 @@ impl VfioReleaseBinding {
                 "VFIO release binding",
             )?,
             device_policy_sha256: parse_sha256(device_policy_sha256, "VFIO release binding")?,
-            fleet_policy_sha256: Some(parse_sha256(fleet_policy_sha256, "VFIO release binding")?),
-            authorized_at_unix,
-            authorization_not_after_unix,
-        })
-    }
-
-    /// V2 records predate fleet binding.  They remain restorable so a host
-    /// never loses recovery for an already-bound group, but are ineligible for
-    /// every future prepare/bind/active mutation.
-    fn legacy_v2(
-        release_manifest_sha256: &str,
-        dvm_artifact_manifest_sha256: &str,
-        device_policy_sha256: &str,
-        authorized_at_unix: u64,
-        authorization_not_after_unix: u64,
-    ) -> Result<Self> {
-        if authorized_at_unix == 0 || authorization_not_after_unix < authorized_at_unix {
-            bail!("invalid VFIO release binding validity window");
-        }
-        Ok(Self {
-            release_manifest_sha256: parse_sha256(release_manifest_sha256, "VFIO release binding")?,
-            dvm_artifact_manifest_sha256: parse_sha256(
-                dvm_artifact_manifest_sha256,
-                "VFIO release binding",
-            )?,
-            device_policy_sha256: parse_sha256(device_policy_sha256, "VFIO release binding")?,
-            fleet_policy_sha256: None,
+            fleet_policy_sha256: parse_sha256(fleet_policy_sha256, "VFIO release binding")?,
             authorized_at_unix,
             authorization_not_after_unix,
         })
     }
 
     fn validate_at(&self, now_unix: u64) -> Result<()> {
-        if self.fleet_policy_sha256.is_none() {
-            bail!("VFIO release authorization lacks fleet-policy evidence");
-        }
         if now_unix < self.authorized_at_unix || now_unix > self.authorization_not_after_unix {
             bail!("VFIO release authorization is outside its validity window");
         }
@@ -926,7 +896,7 @@ impl VfioLeaseRecord {
         })
     }
 
-    fn to_env(&self) -> String {
+    fn to_env(&self) -> Result<String> {
         let state = match self.state {
             VfioLeaseState::Prepared => "prepared",
             VfioLeaseState::Active => "active",
@@ -945,64 +915,25 @@ impl VfioLeaseRecord {
             })
             .collect::<Vec<_>>()
             .join(",");
-        if let Some(binding) = &self.release_binding {
-            if let Some(fleet_policy_sha256) = &binding.fleet_policy_sha256 {
-                return format!(
-                    "VFIO_LEASE_SCHEMA=3\nLEASE_STATE={state}\nDOMAIN_ID={}\nDVM_GUEST_CID={}\nIOMMU_GROUP={}\nORIGINAL_DRIVERS={drivers}\nORIGINAL_DRIVER_OVERRIDES={overrides}\nRELEASE_MANIFEST_SHA256={}\nDVM_ARTIFACT_MANIFEST_SHA256={}\nDEVICE_POLICY_SHA256={}\nFLEET_POLICY_SHA256={}\nAUTHORIZED_AT_UNIX={}\nAUTHORIZATION_NOT_AFTER_UNIX={}\n",
-                    self.domain_id,
-                    self.dvm_guest_cid,
-                    self.iommu_group,
-                    binding.release_manifest_sha256,
-                    binding.dvm_artifact_manifest_sha256,
-                    binding.device_policy_sha256,
-                    fleet_policy_sha256,
-                    binding.authorized_at_unix,
-                    binding.authorization_not_after_unix,
-                );
-            }
-            return format!(
-                "VFIO_LEASE_SCHEMA=2\nLEASE_STATE={state}\nDOMAIN_ID={}\nDVM_GUEST_CID={}\nIOMMU_GROUP={}\nORIGINAL_DRIVERS={drivers}\nORIGINAL_DRIVER_OVERRIDES={overrides}\nRELEASE_MANIFEST_SHA256={}\nDVM_ARTIFACT_MANIFEST_SHA256={}\nDEVICE_POLICY_SHA256={}\nAUTHORIZED_AT_UNIX={}\nAUTHORIZATION_NOT_AFTER_UNIX={}\n",
-                self.domain_id,
-                self.dvm_guest_cid,
-                self.iommu_group,
-                binding.release_manifest_sha256,
-                binding.dvm_artifact_manifest_sha256,
-                binding.device_policy_sha256,
-                binding.authorized_at_unix,
-                binding.authorization_not_after_unix,
-            );
-        }
-        format!(
-            "VFIO_LEASE_SCHEMA=1\nLEASE_STATE={state}\nDOMAIN_ID={}\nDVM_GUEST_CID={}\nIOMMU_GROUP={}\nORIGINAL_DRIVERS={drivers}\nORIGINAL_DRIVER_OVERRIDES={overrides}\n",
-            self.domain_id, self.dvm_guest_cid, self.iommu_group
-        )
+        let binding = self.release_binding.as_ref().ok_or_else(|| {
+            anyhow!("durable VFIO lease lacks signed release authorization evidence")
+        })?;
+        Ok(format!(
+            "VFIO_LEASE_SCHEMA=3\nLEASE_STATE={state}\nDOMAIN_ID={}\nDVM_GUEST_CID={}\nIOMMU_GROUP={}\nORIGINAL_DRIVERS={drivers}\nORIGINAL_DRIVER_OVERRIDES={overrides}\nRELEASE_MANIFEST_SHA256={}\nDVM_ARTIFACT_MANIFEST_SHA256={}\nDEVICE_POLICY_SHA256={}\nFLEET_POLICY_SHA256={}\nAUTHORIZED_AT_UNIX={}\nAUTHORIZATION_NOT_AFTER_UNIX={}\n",
+            self.domain_id,
+            self.dvm_guest_cid,
+            self.iommu_group,
+            binding.release_manifest_sha256,
+            binding.dvm_artifact_manifest_sha256,
+            binding.device_policy_sha256,
+            binding.fleet_policy_sha256,
+            binding.authorized_at_unix,
+            binding.authorization_not_after_unix,
+        ))
     }
 
     fn parse(source: &str, label: &str) -> Result<Self> {
         let values = parse_launch_plan_values(source, label)?;
-        const V1_REQUIRED: [&str; 7] = [
-            "VFIO_LEASE_SCHEMA",
-            "LEASE_STATE",
-            "DOMAIN_ID",
-            "DVM_GUEST_CID",
-            "IOMMU_GROUP",
-            "ORIGINAL_DRIVERS",
-            "ORIGINAL_DRIVER_OVERRIDES",
-        ];
-        const V2_REQUIRED: [&str; 12] = [
-            "VFIO_LEASE_SCHEMA",
-            "LEASE_STATE",
-            "DOMAIN_ID",
-            "DVM_GUEST_CID",
-            "IOMMU_GROUP",
-            "ORIGINAL_DRIVERS",
-            "ORIGINAL_DRIVER_OVERRIDES",
-            "RELEASE_MANIFEST_SHA256",
-            "DVM_ARTIFACT_MANIFEST_SHA256",
-            "DEVICE_POLICY_SHA256",
-            "AUTHORIZED_AT_UNIX",
-            "AUTHORIZATION_NOT_AFTER_UNIX",
-        ];
         const V3_REQUIRED: [&str; 13] = [
             "VFIO_LEASE_SCHEMA",
             "LEASE_STATE",
@@ -1020,30 +951,6 @@ impl VfioLeaseRecord {
         ];
         let schema = launch_plan_value(&values, "VFIO_LEASE_SCHEMA", label)?;
         let release_binding = match schema {
-            "1" if values.len() == V1_REQUIRED.len()
-                && !values
-                    .keys()
-                    .any(|key| !V1_REQUIRED.contains(&key.as_str())) =>
-            {
-                None
-            }
-            "2" if values.len() == V2_REQUIRED.len()
-                && !values
-                    .keys()
-                    .any(|key| !V2_REQUIRED.contains(&key.as_str())) =>
-            {
-                Some(VfioReleaseBinding::legacy_v2(
-                    launch_plan_value(&values, "RELEASE_MANIFEST_SHA256", label)?,
-                    launch_plan_value(&values, "DVM_ARTIFACT_MANIFEST_SHA256", label)?,
-                    launch_plan_value(&values, "DEVICE_POLICY_SHA256", label)?,
-                    launch_plan_value(&values, "AUTHORIZED_AT_UNIX", label)?
-                        .parse::<u64>()
-                        .context("invalid AUTHORIZED_AT_UNIX")?,
-                    launch_plan_value(&values, "AUTHORIZATION_NOT_AFTER_UNIX", label)?
-                        .parse::<u64>()
-                        .context("invalid AUTHORIZATION_NOT_AFTER_UNIX")?,
-                )?)
-            }
             "3" if values.len() == V3_REQUIRED.len()
                 && !values
                     .keys()
@@ -1161,7 +1068,8 @@ impl FileLeaseStore {
             })?
             .validate_at(now_unix)?;
         self.ensure_private_root()?;
-        write_new_private(&self.path_for(&record.domain_id)?, &record.to_env())?;
+        let encoded = record.to_env()?;
+        write_new_private(&self.path_for(&record.domain_id)?, &encoded)?;
         sync_directory(&self.root)
     }
 
@@ -1182,7 +1090,14 @@ impl FileLeaseStore {
             bail!("missing prepared VFIO lease {}", path.display());
         }
         record.state = VfioLeaseState::Active;
-        if let Err(error) = replace_private(&path, &record.to_env()) {
+        let encoded = match record.to_env() {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                record.state = VfioLeaseState::Prepared;
+                return Err(error);
+            }
+        };
+        if let Err(error) = replace_private(&path, &encoded) {
             record.state = VfioLeaseState::Prepared;
             return Err(error);
         }
@@ -3205,6 +3120,25 @@ mod tests {
             VfioLeaseState::Active
         );
         store.remove("linux-dvm-net0").unwrap();
+    }
+
+    #[test]
+    fn durable_vfio_leases_reject_retired_schemas() {
+        let v1 = "VFIO_LEASE_SCHEMA=1\nLEASE_STATE=prepared\nDOMAIN_ID=linux-dvm-net0\nDVM_GUEST_CID=4\nIOMMU_GROUP=15\nORIGINAL_DRIVERS=0000:02:00.0@rtsx-pci\nORIGINAL_DRIVER_OVERRIDES=0000:02:00.0@none\n";
+        let digest = "a".repeat(64);
+        let v2 = format!(
+            "VFIO_LEASE_SCHEMA=2\nLEASE_STATE=prepared\nDOMAIN_ID=linux-dvm-net0\nDVM_GUEST_CID=4\nIOMMU_GROUP=15\nORIGINAL_DRIVERS=0000:02:00.0@rtsx-pci\nORIGINAL_DRIVER_OVERRIDES=0000:02:00.0@none\nRELEASE_MANIFEST_SHA256={digest}\nDVM_ARTIFACT_MANIFEST_SHA256={digest}\nDEVICE_POLICY_SHA256={digest}\nAUTHORIZED_AT_UNIX=100\nAUTHORIZATION_NOT_AFTER_UNIX=200\n"
+        );
+        assert!(VfioLeaseRecord::parse(v1, "retired-v1").is_err());
+        assert!(VfioLeaseRecord::parse(&v2, "retired-v2").is_err());
+    }
+
+    #[test]
+    fn preflight_snapshot_cannot_be_serialized_as_a_durable_lease() {
+        let lease = validated_lease(&["0000:02:00.0"]);
+        let ops = FakeVfioOps::with_drivers(&[("0000:02:00.0", Some("first-driver"))]);
+        let record = inspect_vfio_lease_preflight(&lease, &ops).unwrap();
+        assert!(record.to_env().is_err());
     }
 
     fn validated_lease(bdfs: &[&str]) -> ValidatedLease {

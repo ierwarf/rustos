@@ -8,15 +8,13 @@ use rustos_user_abi::syscall::{
     BootExtentLeaseWire, BootExtentWire, CommercialMaxCapabilityLeaseWire,
     CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
     CommercialMaxProtocolResponse, StorageBlockDescriptorWire, StorageListBrokerArgs,
-    StoragedAhciPolicyWire, StoragedNvmePolicyWire, StoragedRequest, StoragedResponse,
-    BOOT_EXTENT_FLAG_READONLY, BOOT_EXTENT_MAX_EXTENTS, BOOT_EXTENT_PATH_CAPACITY,
-    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
-    COMMERCIAL_MAX_PROTOCOL_STORAGED, COMMERCIAL_MAX_STORAGED_OP_AHCI_POLICY,
-    COMMERCIAL_MAX_STORAGED_OP_BLOCK_INVENTORY, COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE,
-    COMMERCIAL_MAX_STORAGED_OP_NVME_POLICY, COMMERCIAL_MAX_STORAGED_OP_PARTITION_SCAN,
-    COMMERCIAL_MAX_STORAGED_OP_ROOT_VOLUME_SELECT, COMMERCIAL_MAX_STORAGED_OP_VOLUME_METADATA,
-    IPC_SERVICE_STORAGED, STORAGED_IPC_ABI_VERSION, STORAGED_OP_BOOT_EXTENT_LOOKUP,
-    STORAGED_OP_LIST_COUNT, STORAGED_OP_LIST_GET, STORAGED_OP_PING, STORAGED_OP_ROOT_STATUS,
+    StoragedAhciPolicyWire, StoragedNvmePolicyWire, BOOT_EXTENT_FLAG_READONLY,
+    BOOT_EXTENT_MAX_EXTENTS, BOOT_EXTENT_PATH_CAPACITY, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_STORAGED,
+    COMMERCIAL_MAX_STORAGED_OP_AHCI_POLICY, COMMERCIAL_MAX_STORAGED_OP_BLOCK_INVENTORY,
+    COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE, COMMERCIAL_MAX_STORAGED_OP_NVME_POLICY,
+    COMMERCIAL_MAX_STORAGED_OP_PARTITION_SCAN, COMMERCIAL_MAX_STORAGED_OP_ROOT_VOLUME_SELECT,
+    COMMERCIAL_MAX_STORAGED_OP_VOLUME_METADATA, IPC_SERVICE_STORAGED, STORAGED_POLICY_ABI_VERSION,
     STORAGE_AHCI_POLICY_FLAG_DMA_64, STORAGE_AHCI_POLICY_FLAG_SINGLE_SLOT, STORAGE_FLAG_READONLY,
     STORAGE_LIST_MAX_DESCRIPTORS, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
     SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
@@ -82,39 +80,26 @@ fn serve(endpoint: u64) {
             thread::sleep(RECV_BACKOFF);
             continue;
         }
-        if received == 0 {
-            thread::sleep(RECV_BACKOFF);
+        if received as usize != size_of::<CommercialMaxProtocolRequest>() {
+            reply_commercial_error(reply_cap, &request, libc::EINVAL);
             continue;
         }
-        if received as usize == size_of::<CommercialMaxProtocolRequest>() {
-            reply_commercial_request(reply_cap, &request);
-            continue;
-        }
-        if received as usize != size_of::<StoragedRequest>() {
-            continue;
-        }
-        let legacy = unsafe {
-            &*((&request as *const CommercialMaxProtocolRequest).cast::<StoragedRequest>())
-        };
-        reply_legacy_request(reply_cap, legacy, received as usize);
+        reply_commercial_request(reply_cap, &request);
     }
 }
 
-fn reply_legacy_request(reply_cap: u64, request: &StoragedRequest, received: usize) {
-    let mut response = StoragedResponse {
-        version: STORAGED_IPC_ABI_VERSION,
-        op: request.op,
-        ..StoragedResponse::default()
+fn reply_commercial_error(reply_cap: u64, request: &CommercialMaxProtocolRequest, status: i32) {
+    let mut response = CommercialMaxProtocolResponse {
+        header: request.header,
+        status,
+        ..CommercialMaxProtocolResponse::default()
     };
-    response.status = match validate(received, request) {
-        Ok(()) => dispatch(request, &mut response),
-        Err(errno) => errno,
-    };
+    response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
     let reply = syscall3(
         SYS_RUSTOS_IPC_REPLY,
         reply_cap,
-        (&response as *const StoragedResponse) as u64,
-        size_of::<StoragedResponse>() as u64,
+        (&response as *const CommercialMaxProtocolResponse) as u64,
+        size_of::<CommercialMaxProtocolResponse>() as u64,
     );
     if reply < 0 {
         let _ = writeln!(std::io::stderr(), "storaged: reply failed errno={}", -reply);
@@ -142,52 +127,6 @@ fn reply_commercial_request(reply_cap: u64, request: &CommercialMaxProtocolReque
     }
 }
 
-fn dispatch(request: &StoragedRequest, response: &mut StoragedResponse) -> i32 {
-    match request.op {
-        STORAGED_OP_PING => {
-            response.value = request.arg0;
-            0
-        }
-        STORAGED_OP_LIST_COUNT => match list_descriptors() {
-            Ok(descriptors) => {
-                response.value = descriptors.len() as u64;
-                0
-            }
-            Err(errno) => errno,
-        },
-        STORAGED_OP_LIST_GET => match list_descriptors() {
-            Ok(descriptors) => {
-                let index = request.arg0 as usize;
-                if index >= descriptors.len() {
-                    libc::ERANGE
-                } else {
-                    response.payload = descriptors[index];
-                    response.value = descriptors.len() as u64;
-                    0
-                }
-            }
-            Err(errno) => errno,
-        },
-        STORAGED_OP_ROOT_STATUS => match selected_root_descriptor() {
-            Ok(descriptor) => {
-                response.payload = descriptor;
-                response.value = descriptor.id as u64;
-                0
-            }
-            Err(errno) => errno,
-        },
-        STORAGED_OP_BOOT_EXTENT_LOOKUP => match boot_extent_lookup(request) {
-            Ok(lease) => {
-                response.boot_extent = lease;
-                response.value = lease.file_len;
-                0
-            }
-            Err(errno) => errno,
-        },
-        _ => libc::EINVAL,
-    }
-}
-
 fn dispatch_commercial(
     request: &CommercialMaxProtocolRequest,
     response: &mut CommercialMaxProtocolResponse,
@@ -210,8 +149,7 @@ fn dispatch_commercial(
             Ok(())
         }
         COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE => {
-            let storaged_request = storaged_request_from_commercial(request)?;
-            let lease = boot_extent_lookup(&storaged_request)?;
+            let lease = boot_extent_lookup(&request.path[..request.path_len as usize])?;
             response.value0 = lease.file_len;
             response.value1 = lease.hash_or_generation;
             response.capability = boot_extent_capability(&lease);
@@ -244,7 +182,7 @@ fn dispatch_commercial(
 
 fn ahci_policy_response() -> StoragedAhciPolicyWire {
     StoragedAhciPolicyWire {
-        abi_version: STORAGED_IPC_ABI_VERSION,
+        abi_version: STORAGED_POLICY_ABI_VERSION,
         flags: STORAGE_AHCI_POLICY_FLAG_DMA_64 | STORAGE_AHCI_POLICY_FLAG_SINGLE_SLOT,
         command_slot: AHCI_POLICY_COMMAND_SLOT,
         prdt_entries: AHCI_POLICY_PRDT_ENTRIES,
@@ -258,7 +196,7 @@ fn ahci_policy_response() -> StoragedAhciPolicyWire {
 
 fn nvme_policy_response() -> StoragedNvmePolicyWire {
     StoragedNvmePolicyWire {
-        abi_version: STORAGED_IPC_ABI_VERSION,
+        abi_version: STORAGED_POLICY_ABI_VERSION,
         admin_queue_depth: NVME_POLICY_ADMIN_QUEUE_DEPTH,
         io_queue_depth: NVME_POLICY_IO_QUEUE_DEPTH,
         max_transfer_bytes: NVME_POLICY_MAX_TRANSFER_BYTES,
@@ -284,19 +222,19 @@ fn root_selection_rank(descriptor: &StorageBlockDescriptorWire) -> (u8, u8, u32)
     (partition_rank, readonly_rank, descriptor.id)
 }
 
-fn boot_extent_lookup(request: &StoragedRequest) -> Result<BootExtentLeaseWire, i32> {
-    if request.path_len == 0 || request.path_len as usize > BOOT_EXTENT_PATH_CAPACITY {
+fn boot_extent_lookup(request_path: &[u8]) -> Result<BootExtentLeaseWire, i32> {
+    if request_path.is_empty() || request_path.len() > BOOT_EXTENT_PATH_CAPACITY {
         return Err(libc::EINVAL);
     }
-    let len = request.path_len as usize;
-    let path = std::str::from_utf8(&request.path[..len]).map_err(|_| libc::EINVAL)?;
+    let len = request_path.len();
+    let path = std::str::from_utf8(request_path).map_err(|_| libc::EINVAL)?;
     let mut lease = BootExtentLeaseWire {
-        path_len: request.path_len,
+        path_len: len as u32,
         flags: BOOT_EXTENT_FLAG_READONLY,
         ..BootExtentLeaseWire::default()
     };
-    lease.path[..len].copy_from_slice(&request.path[..len]);
-    let registry_lease = boot_extent_lookup_registry(path, &request.path[..len])?;
+    lease.path[..len].copy_from_slice(request_path);
+    let registry_lease = boot_extent_lookup_registry(path, request_path)?;
     lease.file_len = registry_lease.file_len;
     lease.hash_or_generation = registry_lease.hash_or_generation;
     lease.extent_count = registry_lease.extent_count;
@@ -425,30 +363,17 @@ fn list_descriptors() -> Result<Vec<StorageBlockDescriptorWire>, i32> {
     Ok(buffer)
 }
 
-fn validate(received: usize, request: &StoragedRequest) -> Result<(), i32> {
-    if received != size_of::<StoragedRequest>()
-        || request.version != STORAGED_IPC_ABI_VERSION
-        || request.flags != 0
-        || request.reserved0 != 0
-    {
-        return Err(libc::EINVAL);
-    }
-    match request.op {
-        STORAGED_OP_PING => Ok(()),
-        STORAGED_OP_LIST_COUNT => Ok(()),
-        STORAGED_OP_LIST_GET => Ok(()),
-        STORAGED_OP_ROOT_STATUS => Ok(()),
-        STORAGED_OP_BOOT_EXTENT_LOOKUP => Ok(()),
-        _ => Err(libc::EINVAL),
-    }
-}
-
 fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result<(), i32> {
     if request.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
         || request.header.protocol != COMMERCIAL_MAX_PROTOCOL_STORAGED
         || request.header.flags != 0
         || request.path_len as usize > request.path.len()
         || request.payload_len as usize > request.payload.len()
+        || request.payload_len != 0
+        || request.arg0 != 0
+        || request.arg1 != 0
+        || request.arg2 != 0
+        || request.arg3 != 0
     {
         return Err(libc::EINVAL);
     }
@@ -456,29 +381,16 @@ fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result
         COMMERCIAL_MAX_STORAGED_OP_BLOCK_INVENTORY
         | COMMERCIAL_MAX_STORAGED_OP_PARTITION_SCAN
         | COMMERCIAL_MAX_STORAGED_OP_ROOT_VOLUME_SELECT
-        | COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE
         | COMMERCIAL_MAX_STORAGED_OP_VOLUME_METADATA
         | COMMERCIAL_MAX_STORAGED_OP_AHCI_POLICY
-        | COMMERCIAL_MAX_STORAGED_OP_NVME_POLICY => Ok(()),
+        | COMMERCIAL_MAX_STORAGED_OP_NVME_POLICY
+            if request.path_len == 0 =>
+        {
+            Ok(())
+        }
+        COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE if request.path_len != 0 => Ok(()),
         _ => Err(libc::EINVAL),
     }
-}
-
-fn storaged_request_from_commercial(
-    request: &CommercialMaxProtocolRequest,
-) -> Result<StoragedRequest, i32> {
-    let len = request.path_len as usize;
-    if len == 0 || len > BOOT_EXTENT_PATH_CAPACITY {
-        return Err(libc::EINVAL);
-    }
-    let mut storaged_request = StoragedRequest {
-        version: STORAGED_IPC_ABI_VERSION,
-        op: STORAGED_OP_BOOT_EXTENT_LOOKUP,
-        path_len: len as u32,
-        ..StoragedRequest::default()
-    };
-    storaged_request.path[..len].copy_from_slice(&request.path[..len]);
-    Ok(storaged_request)
 }
 
 fn fill_storage_descriptors(
@@ -683,4 +595,43 @@ fn debug_line(message: &str) {
         line.as_ptr() as u64,
         (len + 1) as u64,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(op: u16) -> CommercialMaxProtocolRequest {
+        let mut request = CommercialMaxProtocolRequest::default();
+        request.header.protocol = COMMERCIAL_MAX_PROTOCOL_STORAGED;
+        request.header.op = op;
+        request
+    }
+
+    #[test]
+    fn commercial_storage_operations_reject_unconsumed_fields() {
+        let mut inventory = request(COMMERCIAL_MAX_STORAGED_OP_BLOCK_INVENTORY);
+        assert_eq!(validate_commercial_request(&inventory), Ok(()));
+        inventory.path_len = 1;
+        inventory.path[0] = b'x';
+        assert_eq!(validate_commercial_request(&inventory), Err(libc::EINVAL));
+
+        let mut policy = request(COMMERCIAL_MAX_STORAGED_OP_NVME_POLICY);
+        policy.arg0 = 1;
+        assert_eq!(validate_commercial_request(&policy), Err(libc::EINVAL));
+
+        let mut payload = request(COMMERCIAL_MAX_STORAGED_OP_AHCI_POLICY);
+        payload.payload_len = 1;
+        payload.payload[0] = 1;
+        assert_eq!(validate_commercial_request(&payload), Err(libc::EINVAL));
+    }
+
+    #[test]
+    fn boot_extent_operation_requires_one_bounded_path() {
+        let mut request = request(COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE);
+        assert_eq!(validate_commercial_request(&request), Err(libc::EINVAL));
+        request.path_len = 4;
+        request.path[..4].copy_from_slice(b"boot");
+        assert_eq!(validate_commercial_request(&request), Ok(()));
+    }
 }

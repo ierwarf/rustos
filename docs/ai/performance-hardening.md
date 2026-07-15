@@ -50,6 +50,11 @@ contract file.
   page flip, and keeps the source slot until its page-flip completion fence plus
   shadow-buffer synchronization. A CPU copy or accepted atomic ioctl is never a
   presentation claim; only the page-flip event completes scanout.
+- The RustOS-to-DVM snapshot copy follows the same exact-predecessor rule. A
+  released slot may receive a damage-only patch only when its retained content
+  generation equals the immediately preceding published generation and the
+  compositor source mapping is unchanged. Stale slots and replacement sources
+  force a complete snapshot; release authority remains cleared independently.
 - `cargo xtask kvm-run` is the real-use acceptance path: it enables no input
   self-test or private UI profiler. Startup requires an atomic three-buffer
   relay, an active RustOS provider, and a non-zero immutable source frame.

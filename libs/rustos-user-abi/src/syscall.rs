@@ -303,9 +303,6 @@ pub const DEVMGRD_DEVICE_RIGHT_MAP: u64 = 1 << 4;
 pub const DEVMGRD_DEVICE_RIGHT_TRANSFER: u64 = 1 << 5;
 pub const DEVMGRD_MAX_DIR_ENTRIES: usize = 16;
 pub const DEVMGRD_NAME_CAPACITY: usize = 32;
-pub const ROOTD_IPC_ABI_VERSION: u16 = 1;
-pub const ROOTD_IPC_OP_STATUS: u16 = 1;
-pub const ROOTD_IPC_OP_LEASE_LIST: u16 = 2;
 pub const ROOTD_MAX_LEASES: usize = 8;
 pub const ROOTD_EXEC_PATH_CAPACITY: usize = 256;
 pub const ROOTD_LEASE_STATE_EMPTY: u16 = 0;
@@ -414,12 +411,7 @@ pub const STORAGE_LIST_MAX_DESCRIPTORS: usize = 16;
 pub const STORAGE_FLAG_READONLY: u32 = 1 << 0;
 pub const STORAGE_AHCI_POLICY_FLAG_DMA_64: u32 = 1 << 0;
 pub const STORAGE_AHCI_POLICY_FLAG_SINGLE_SLOT: u32 = 1 << 1;
-pub const STORAGED_IPC_ABI_VERSION: u16 = 1;
-pub const STORAGED_OP_PING: u16 = 1;
-pub const STORAGED_OP_LIST_COUNT: u16 = 2;
-pub const STORAGED_OP_LIST_GET: u16 = 3;
-pub const STORAGED_OP_ROOT_STATUS: u16 = 4;
-pub const STORAGED_OP_BOOT_EXTENT_LOOKUP: u16 = 5;
+pub const STORAGED_POLICY_ABI_VERSION: u16 = 1;
 pub const BOOT_EXTENT_PATH_CAPACITY: usize = 256;
 pub const BOOT_EXTENT_MAX_EXTENTS: usize = 16;
 pub const BOOT_EXTENT_FLAG_READONLY: u32 = 1 << 0;
@@ -864,46 +856,6 @@ impl Default for BootExtentLeaseWire {
             path: [0; BOOT_EXTENT_PATH_CAPACITY],
         }
     }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct StoragedRequest {
-    pub version: u16,
-    pub op: u16,
-    pub flags: u32,
-    pub arg0: u64,
-    pub arg1: u64,
-    pub path_len: u32,
-    pub reserved0: u32,
-    pub path: [u8; BOOT_EXTENT_PATH_CAPACITY],
-}
-
-impl Default for StoragedRequest {
-    fn default() -> Self {
-        Self {
-            version: STORAGED_IPC_ABI_VERSION,
-            op: STORAGED_OP_PING,
-            flags: 0,
-            arg0: 0,
-            arg1: 0,
-            path_len: 0,
-            reserved0: 0,
-            path: [0; BOOT_EXTENT_PATH_CAPACITY],
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct StoragedResponse {
-    pub version: u16,
-    pub op: u16,
-    pub status: i32,
-    pub reserved0: u32,
-    pub value: u64,
-    pub payload: StorageBlockDescriptorWire,
-    pub boot_extent: BootExtentLeaseWire,
 }
 
 #[repr(C)]
@@ -1556,28 +1508,6 @@ impl Default for CoreServiceLeaseWire {
             exec_path: [0; ROOTD_EXEC_PATH_CAPACITY],
         }
     }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct RootdIpcRequest {
-    pub version: u16,
-    pub op: u16,
-    pub flags: u32,
-    pub index: u32,
-    pub reserved0: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct RootdIpcResponse {
-    pub version: u16,
-    pub op: u16,
-    pub status: i32,
-    pub lease_count: u32,
-    pub reserved0: u32,
-    pub value: u64,
-    pub lease: CoreServiceLeaseWire,
 }
 
 #[repr(C)]

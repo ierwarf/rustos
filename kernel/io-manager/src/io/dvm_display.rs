@@ -74,6 +74,17 @@ static SLOT_STATE: [AtomicU8; GUI_SLOT_COUNT] = [
 ];
 static SLOT_GENERATION: [AtomicU64; GUI_SLOT_COUNT] =
     [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+/// Pixel contents survive a validated RELEASE even though release authority
+/// does not.  Retaining this separate generation lets a later host writer
+/// patch only the declared damage when it reclaims the exact immediately
+/// preceding snapshot.  `SLOT_GENERATION` remains the live capability token
+/// and is still cleared on release.
+static SLOT_CONTENT_GENERATION: [AtomicU64; GUI_SLOT_COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+/// A different shared-surface backing may contain unrelated pixels at the
+/// same geometry.  Such a source always forces a complete snapshot before
+/// incremental reuse resumes.
+static LAST_SOURCE_PTR: AtomicUsize = AtomicUsize::new(0);
 static DROPPED_FRAMES: AtomicU64 = AtomicU64::new(0);
 /// IRQ callbacks only set these pending bits. All control-record validation and
 /// state transitions run at the next normal present boundary.
@@ -189,6 +200,10 @@ fn try_install_serialized() -> bool {
     for generation in &SLOT_GENERATION {
         generation.store(0, Ordering::Release);
     }
+    for generation in &SLOT_CONTENT_GENERATION {
+        generation.store(0, Ordering::Release);
+    }
+    LAST_SOURCE_PTR.store(0, Ordering::Release);
     write_u64(DVM_GUI_SURFACE_POOL_DVM_SEQUENCE_OFFSET, 0);
     write_u64(DVM_GUI_SURFACE_POOL_HOST_ACK_OFFSET, 0);
     write_u64(DVM_GUI_SURFACE_POOL_INVITATION_OFFSET, 0);
@@ -272,7 +287,13 @@ fn publish_frame(
     if TRANSPORT_REVOKED.load(Ordering::Acquire) {
         return DvmPresentOutcome::Unavailable;
     }
-    let Some(slot) = reserve_free_slot() else {
+    let preferred_generation = PUBLISHED_GENERATION.load(Ordering::Acquire);
+    let Some(generation) = preferred_generation.checked_add(2) else {
+        let sequence = GUI_DVM_ACKED_CONTROL_SEQUENCE.load(Ordering::Acquire);
+        revoke_transport("host-generation-exhausted", sequence);
+        return DvmPresentOutcome::Unavailable;
+    };
+    let Some(slot) = reserve_free_slot(preferred_generation) else {
         // A relay can restart after all three slots were committed.  There is
         // then no new frame to create an invitation, so a bounded producer
         // must re-advertise the newest extant READY slot exactly once after an
@@ -282,9 +303,17 @@ fn publish_frame(
         DROPPED_FRAMES.fetch_add(1, Ordering::Relaxed);
         return DvmPresentOutcome::Backpressured;
     };
-    let generation = next_even_generation();
-    let copied = copy_into_slot(slot, src_ptr, width, height, stride_bytes, damage);
+    let copied = copy_into_slot(
+        slot,
+        src_ptr,
+        width,
+        height,
+        stride_bytes,
+        damage,
+        preferred_generation,
+    );
     if !copied {
+        SLOT_CONTENT_GENERATION[slot].store(0, Ordering::Release);
         SLOT_STATE[slot].store(GUI_SLOT_FREE, Ordering::Release);
         return DvmPresentOutcome::Unavailable;
     }
@@ -293,18 +322,55 @@ fn publish_frame(
         POOL_WIDTH.load(Ordering::Acquire),
         POOL_HEIGHT.load(Ordering::Acquire),
     ) {
+        SLOT_CONTENT_GENERATION[slot].store(0, Ordering::Release);
         SLOT_STATE[slot].store(GUI_SLOT_FREE, Ordering::Release);
         warn_rejected("host-present-record-invalid");
         return DvmPresentOutcome::Unavailable;
     }
+    if PUBLISHED_GENERATION
+        .compare_exchange(
+            preferred_generation,
+            generation,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        // The display backend contract permits one host snapshot writer. If
+        // that invariant is ever violated, this slot may have been patched
+        // from a non-predecessor base and must never be published or reused.
+        SLOT_CONTENT_GENERATION[slot].store(0, Ordering::Release);
+        SLOT_STATE[slot].store(GUI_SLOT_FREE, Ordering::Release);
+        let sequence = GUI_DVM_ACKED_CONTROL_SEQUENCE.load(Ordering::Acquire);
+        revoke_transport("concurrent-host-writer", sequence);
+        return DvmPresentOutcome::Unavailable;
+    }
     write_host_record(slot, message);
+    SLOT_CONTENT_GENERATION[slot].store(generation, Ordering::Release);
+    LAST_SOURCE_PTR.store(src_ptr as usize, Ordering::Release);
     SLOT_GENERATION[slot].store(generation, Ordering::Release);
     SLOT_STATE[slot].store(GUI_SLOT_READY, Ordering::Release);
     signal_gui_dvm(generation);
     DvmPresentOutcome::Presented
 }
 
-fn reserve_free_slot() -> Option<usize> {
+fn reserve_free_slot(preferred_generation: u64) -> Option<usize> {
+    if preferred_generation != 0 {
+        for (slot, state) in SLOT_STATE.iter().enumerate() {
+            if SLOT_CONTENT_GENERATION[slot].load(Ordering::Acquire) == preferred_generation
+                && state
+                    .compare_exchange(
+                        GUI_SLOT_FREE,
+                        GUI_SLOT_WRITING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+            {
+                return Some(slot);
+            }
+        }
+    }
     for (slot, state) in SLOT_STATE.iter().enumerate() {
         if state
             .compare_exchange(
@@ -321,20 +387,40 @@ fn reserve_free_slot() -> Option<usize> {
     None
 }
 
-fn next_even_generation() -> u64 {
-    loop {
-        let current = PUBLISHED_GENERATION.load(Ordering::Acquire);
-        let mut next = current.wrapping_add(2);
-        if next == 0 {
-            next = 2;
-        }
-        if PUBLISHED_GENERATION
-            .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            return next;
-        }
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SnapshotCopyPlan {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    incremental: bool,
+}
+
+fn snapshot_copy_plan(
+    damage: DvmDisplayDamage,
+    width: usize,
+    height: usize,
+    slot_content_generation: u64,
+    previous_generation: u64,
+    source_matches: bool,
+) -> Option<SnapshotCopyPlan> {
+    let damage_bounds = damage_bounds(damage, width, height)?;
+    let incremental = damage.flags != driver_domain_protocol::DVM_DISPLAY_DAMAGE_FULL
+        && source_matches
+        && previous_generation != 0
+        && slot_content_generation == previous_generation;
+    let (x, y, copy_width, copy_height) = if incremental {
+        damage_bounds
+    } else {
+        (0, 0, width, height)
+    };
+    Some(SnapshotCopyPlan {
+        x,
+        y,
+        width: copy_width,
+        height: copy_height,
+        incremental,
+    })
 }
 
 fn copy_into_slot(
@@ -344,6 +430,7 @@ fn copy_into_slot(
     height: usize,
     stride_bytes: usize,
     damage: DvmDisplayDamage,
+    previous_generation: u64,
 ) -> bool {
     if src_ptr.is_null()
         || width != POOL_WIDTH.load(Ordering::Acquire) as usize
@@ -358,14 +445,30 @@ fn copy_into_slot(
         warn_rejected("slot-offset-invalid");
         return false;
     };
-    if damage_bounds(damage, width, height).is_none() {
+    let source_matches = LAST_SOURCE_PTR.load(Ordering::Acquire) == src_ptr as usize;
+    let Some(plan) = snapshot_copy_plan(
+        damage,
+        width,
+        height,
+        SLOT_CONTENT_GENERATION[slot].load(Ordering::Acquire),
+        previous_generation,
+        source_matches,
+    ) else {
         warn_rejected("damage-bounds-invalid");
         return false;
-    }
+    };
     // Every published slot is a self-contained immutable frame snapshot.
-    // Damage remains scheduling metadata for the consumer, never a license
-    // to depend on the previous contents of a recycled capability slot.
-    let (x, y, copy_width, copy_height) = (0_usize, 0_usize, width, height);
+    // A partial copy is valid only when this free slot still contains the
+    // exact immediately preceding snapshot from the same source mapping.
+    // Stale/uninitialized slots and replacement surfaces always receive a
+    // complete copy, so damage never creates a dependency on unknown bytes.
+    let SnapshotCopyPlan {
+        x,
+        y,
+        width: copy_width,
+        height: copy_height,
+        incremental: _,
+    } = plan;
     let bytes_per_pixel = 4_usize;
     let Some(row_bytes) = copy_width.checked_mul(bytes_per_pixel) else {
         return false;
@@ -838,9 +941,12 @@ fn release_gui_mappings(mapped: *mut u8, doorbell: *mut u8) {
 
 #[cfg(test)]
 mod tests {
-    use driver_domain_protocol::DvmGuiSurfacePoolHeader;
+    use driver_domain_protocol::{DvmDisplayDamage, DvmGuiSurfacePoolHeader};
 
-    use super::{DvmPresentOutcome, damage_bounds, header_fits_resource, try_publish_full};
+    use super::{
+        DvmPresentOutcome, SnapshotCopyPlan, damage_bounds, header_fits_resource,
+        snapshot_copy_plan, try_publish_full,
+    };
 
     #[test]
     fn pool_header_must_cover_all_three_slots() {
@@ -862,6 +968,45 @@ mod tests {
                 900
             ),
             None
+        );
+    }
+
+    #[test]
+    fn exact_predecessor_snapshot_copies_only_declared_damage() {
+        let damage = DvmDisplayDamage::rect(100, 200, 32, 48);
+        assert_eq!(
+            snapshot_copy_plan(damage, 1600, 900, 40, 40, true),
+            Some(SnapshotCopyPlan {
+                x: 100,
+                y: 200,
+                width: 32,
+                height: 48,
+                incremental: true,
+            })
+        );
+    }
+
+    #[test]
+    fn stale_or_replaced_snapshot_forces_a_complete_copy() {
+        let damage = DvmDisplayDamage::rect(100, 200, 32, 48);
+        let complete = Some(SnapshotCopyPlan {
+            x: 0,
+            y: 0,
+            width: 1600,
+            height: 900,
+            incremental: false,
+        });
+        assert_eq!(
+            snapshot_copy_plan(damage, 1600, 900, 38, 40, true),
+            complete
+        );
+        assert_eq!(
+            snapshot_copy_plan(damage, 1600, 900, 40, 40, false),
+            complete
+        );
+        assert_eq!(
+            snapshot_copy_plan(DvmDisplayDamage::full(), 1600, 900, 40, 40, true),
+            complete
         );
     }
 
