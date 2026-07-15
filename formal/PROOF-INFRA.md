@@ -43,6 +43,25 @@ bounded payload; malformed status values must fail closed without arithmetic
 overflow. The proof is deliberately a narrow host boundary, not a claim that
 all socket or scheduler behavior has been proved.
 
+The shared executable-image proof targets are the exact little-endian field
+decoder, `admit_image`, `admit_elf64_load_segment`, the PE section admission
+helper, and the bounded relocation/import validators. For every symbolic
+single-region plan accepted inside the configured process window, the entry is
+in bounds and in executable, non-writable memory. Arbitrary ELF load-segment
+and PE section bytes preserve their window and W^X contracts. One arbitrary
+relocation entry has only an allowed bounded exact effect, and one arbitrary
+import thunk has a valid ordinal or bounded name identity. Unit tests, host
+fuzzing, and the dual-ABI TLA+ models cover multi-region overlap and lifecycle
+integration. These compositional harnesses are not a claim that arbitrary-length
+multi-block/multi-descriptor parser executions are exhaustively proved.
+
+The release-blocker models extend that plan gate to bounded byte-parser,
+page-table lifecycle, DMA-domain, boot-content, Ethernet-payload, and scheduler
+distribution abstractions. Their source correspondence is listed in
+`CONFORMANCE.md`. None is hardware proof: in particular, the DMA model cannot
+turn the current identity-only kernel backend into an IOMMU implementation,
+and the scheduler model cannot replace multicore CPU-time captures.
+
 The DVM proof target is
 `driver-domain-protocol::RustosInputFrame`, the shared no_std wire-format
 implementation consumed by hostd: every accepted key or relative pointer frame

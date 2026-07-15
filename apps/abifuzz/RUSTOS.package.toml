@@ -1,7 +1,6 @@
 id = "abifuzz"
 kind = "app"
 execution_domain = "user"
-profiles = ["default"]
 startup = "session"
 runtime_deps = ["wayclick"]
 

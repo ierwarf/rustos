@@ -15,9 +15,10 @@ pub fn service_dvm_input_pending() -> usize {
     dvm_ring::service_pending()
 }
 
-/// Publish that a policy-backed input client is live. This is deliberately
-/// separate from transport installation so L0 cannot produce into an
-/// otherwise healthy ring before `inputd` has a consumer.
+/// Publish that inputd's capability-gated ingestion worker has armed its sole
+/// kernel waiter. This is deliberately separate from transport installation
+/// so L0 cannot produce into an otherwise healthy ring before the fixed
+/// user-space consumer can drain it.
 pub fn mark_dvm_policy_consumer_ready() -> bool {
     dvm_ring::mark_policy_consumer_ready()
 }

@@ -28,6 +28,7 @@ fatfs = { git = "https://github.com/rafalh/rust-fatfs", default-features = false
 hidreport = { version = "0.6.0", default-features = false }
 heapless = { version = "0.9.3", default-features = false }
 object = { version = "0.38.1", default-features = false, features = ["read_core", "elf"] }
+sha2 = { version = "0.10", default-features = false }
 smoltcp = { version = "=0.13.0", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp"] }
 spin = "0.10.0"
 tock-registers = { version = "0.10.1", default-features = false }

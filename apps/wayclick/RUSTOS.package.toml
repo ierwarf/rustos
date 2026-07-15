@@ -1,7 +1,6 @@
 id = "wayclick"
 kind = "app"
 execution_domain = "user"
-profiles = ["default"]
 
 [build]
 builder = "cargo-kernel-binary"

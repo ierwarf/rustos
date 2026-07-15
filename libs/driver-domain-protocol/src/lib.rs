@@ -699,6 +699,77 @@ pub const DVM_NET_MIN_REGION_BYTES: u64 =
 /// the two fixed rings bounded to `DVM_NET_MIN_REGION_BYTES`.
 pub const DVM_NET_APERTURE_BYTES: u64 = 512 * 1024;
 
+const ETHERNET_HEADER_BYTES: usize = 14;
+const ETHERTYPE_IPV4: u16 = 0x0800;
+const ETHERTYPE_ARP: u16 = 0x0806;
+const IPV4_MIN_HEADER_BYTES: usize = 20;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EthernetFrameError {
+    Length,
+    UnsupportedEtherType,
+    InvalidArp,
+    InvalidIpv4,
+    InvalidIpv4Checksum,
+    FragmentedIpv4,
+}
+
+/// Validate the complete Ethernet payload accepted by the enabled RustOS
+/// network topology.  The netd stack is IPv4-only, so admitting an unknown
+/// EtherType or fragmented datagram would create an unmodelled payload path.
+/// Ethernet padding is allowed after the IPv4 total length.
+pub fn validate_dvm_ethernet_frame(frame: &[u8]) -> Result<(), EthernetFrameError> {
+    if !(ETHERNET_HEADER_BYTES..=DVM_NET_MTU as usize).contains(&frame.len()) {
+        return Err(EthernetFrameError::Length);
+    }
+    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+    match ethertype {
+        ETHERTYPE_ARP => validate_arp_payload(&frame[ETHERNET_HEADER_BYTES..]),
+        ETHERTYPE_IPV4 => validate_ipv4_payload(&frame[ETHERNET_HEADER_BYTES..]),
+        _ => Err(EthernetFrameError::UnsupportedEtherType),
+    }
+}
+
+fn validate_arp_payload(payload: &[u8]) -> Result<(), EthernetFrameError> {
+    if payload.len() < 28
+        || payload[0..2] != 1_u16.to_be_bytes()
+        || payload[2..4] != ETHERTYPE_IPV4.to_be_bytes()
+        || payload[4] != 6
+        || payload[5] != 4
+        || !matches!(u16::from_be_bytes([payload[6], payload[7]]), 1 | 2)
+    {
+        return Err(EthernetFrameError::InvalidArp);
+    }
+    Ok(())
+}
+
+fn validate_ipv4_payload(payload: &[u8]) -> Result<(), EthernetFrameError> {
+    if payload.len() < IPV4_MIN_HEADER_BYTES || payload[0] >> 4 != 4 {
+        return Err(EthernetFrameError::InvalidIpv4);
+    }
+    let header_len = usize::from(payload[0] & 0x0f) * 4;
+    if header_len < IPV4_MIN_HEADER_BYTES || header_len > payload.len() {
+        return Err(EthernetFrameError::InvalidIpv4);
+    }
+    let total_len = usize::from(u16::from_be_bytes([payload[2], payload[3]]));
+    if total_len < header_len || total_len > payload.len() {
+        return Err(EthernetFrameError::InvalidIpv4);
+    }
+    let fragment = u16::from_be_bytes([payload[6], payload[7]]);
+    if fragment & 0x3fff != 0 {
+        return Err(EthernetFrameError::FragmentedIpv4);
+    }
+    let mut sum = 0_u32;
+    for chunk in payload[..header_len].chunks_exact(2) {
+        sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    if sum != 0xffff {
+        return Err(EthernetFrameError::InvalidIpv4Checksum);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DvmNetHeader {
     pub region_bytes: u64,
@@ -1096,8 +1167,9 @@ mod tests {
         DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY, DVM_INPUT_RING_FLAG_RUSTOS_READY,
         DVM_INPUT_RING_PRODUCER_OFFSET, DVM_NET_APERTURE_BYTES, DVM_NET_FLAG_DVM_READY,
         DVM_NET_MIN_REGION_BYTES, DvmDisplayDamage, DvmDisplayHeader, DvmGuiSurfaceMessage,
-        DvmInputRingHeader, DvmNetHeader, RUSTOS_INPUT_KIND_POINTER_POSITION, RUSTOS_INPUT_VERSION,
-        RustosInputFrame,
+        DvmInputRingHeader, DvmNetHeader, ETHERTYPE_ARP, ETHERTYPE_IPV4, EthernetFrameError,
+        RUSTOS_INPUT_KIND_POINTER_POSITION, RUSTOS_INPUT_VERSION, RustosInputFrame,
+        validate_dvm_ethernet_frame,
     };
 
     #[test]
@@ -1202,6 +1274,66 @@ mod tests {
         assert!(ready.dvm_ready());
         assert!(DVM_NET_APERTURE_BYTES >= DVM_NET_MIN_REGION_BYTES);
         assert!(DVM_NET_APERTURE_BYTES.is_power_of_two());
+    }
+
+    fn ipv4_test_frame(fragment: u16) -> [u8; 34] {
+        let mut frame = [0_u8; 34];
+        frame[12..14].copy_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
+        let ip = &mut frame[14..];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&20_u16.to_be_bytes());
+        ip[6..8].copy_from_slice(&fragment.to_be_bytes());
+        ip[8] = 64;
+        ip[9] = 1;
+        ip[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        ip[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        let mut sum = 0_u32;
+        for chunk in ip.chunks_exact(2) {
+            sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        ip[10..12].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+        frame
+    }
+
+    #[test]
+    fn dvm_ethernet_payload_rejects_bad_checksum_and_fragments() {
+        let frame = ipv4_test_frame(0);
+        assert_eq!(validate_dvm_ethernet_frame(&frame), Ok(()));
+
+        let mut corrupt = frame;
+        corrupt[22] ^= 1;
+        assert_eq!(
+            validate_dvm_ethernet_frame(&corrupt),
+            Err(EthernetFrameError::InvalidIpv4Checksum)
+        );
+
+        assert_eq!(
+            validate_dvm_ethernet_frame(&ipv4_test_frame(0x2000)),
+            Err(EthernetFrameError::FragmentedIpv4)
+        );
+    }
+
+    #[test]
+    fn dvm_ethernet_payload_accepts_only_bounded_ipv4_or_arp() {
+        let mut arp = [0_u8; 42];
+        arp[12..14].copy_from_slice(&ETHERTYPE_ARP.to_be_bytes());
+        arp[14..16].copy_from_slice(&1_u16.to_be_bytes());
+        arp[16..18].copy_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
+        arp[18] = 6;
+        arp[19] = 4;
+        arp[20..22].copy_from_slice(&1_u16.to_be_bytes());
+        assert_eq!(validate_dvm_ethernet_frame(&arp), Ok(()));
+
+        arp[12..14].copy_from_slice(&0x86dd_u16.to_be_bytes());
+        assert_eq!(
+            validate_dvm_ethernet_frame(&arp),
+            Err(EthernetFrameError::UnsupportedEtherType)
+        );
+        assert_eq!(
+            validate_dvm_ethernet_frame(&[0_u8; 13]),
+            Err(EthernetFrameError::Length)
+        );
     }
 
     #[test]

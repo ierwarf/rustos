@@ -5,6 +5,5 @@ edition = "2024"
 publish = false
 
 [dependencies]
-driver-abi = { path = "../driver-abi" }
 keyboard-core = { path = "../keyboard-core" }
 rustos-user-abi = { path = "../../../libs/rustos-user-abi" }

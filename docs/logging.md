@@ -268,7 +268,7 @@ Then run:
 
 ```bash
 cargo fmt --check
-cargo test -p module-tests
+cargo test -p contract-tests
 cargo xtask check
 ```
 
@@ -557,7 +557,7 @@ heartbeat = "off"
 
 ```bash
 cargo fmt --check
-cargo test -p module-tests
+cargo test -p contract-tests
 cargo xtask check
 ```
 

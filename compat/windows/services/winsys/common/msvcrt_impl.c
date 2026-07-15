@@ -261,6 +261,11 @@ void abort(void)
     rustos_exit_process(3u);
 }
 
+int atexit(void (*callback)(void))
+{
+    return RtlMsvcrtOnexit((void *)callback) != NULL ? 0 : -1;
+}
+
 void *malloc(size_t size)
 {
     rustos_sync_runtime_globals();
@@ -538,6 +543,12 @@ size_t wcslen(const WCHAR *text)
 int getc(void *stream)
 {
     return RtlMsvcrtGetc(stream);
+}
+
+int isdigit(int ch)
+{
+    unsigned char value = (unsigned char)ch;
+    return value >= (unsigned char)'0' && value <= (unsigned char)'9';
 }
 
 int isspace(int ch)

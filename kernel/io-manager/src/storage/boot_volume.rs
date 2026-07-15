@@ -13,6 +13,7 @@ use boot_protocol::{
 };
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
+use sha2::{Digest, Sha256};
 
 use crate::sync::{KernelSpinLock as Mutex, KernelWaitLock};
 use fatfs::{IoBase, Read, Seek, SeekFrom, Write};
@@ -37,6 +38,7 @@ const ROOT_EXTENT_READ_CHUNK_CAP: usize = 512 * 1024;
 const ROOT_EXTENT_FILE_CACHE_CAPACITY: usize = 8;
 const ROOT_EXTENT_FILE_CACHE_MAX_ENTRY_BYTES: usize = 768 * 1024;
 const ROOT_EXTENT_FILE_CACHE_MAX_BYTES: usize = 2 * 1024 * 1024;
+const ROOT_CONTENT_CHUNK_BYTES: usize = 64 * 1024;
 
 static ROOT_FILE_EXTENTS: KernelWaitLock<RootFileExtentState> =
     KernelWaitLock::new(RootFileExtentState::Uninitialized);
@@ -68,11 +70,13 @@ struct RootFileExtentEntry {
     path: String,
     len: u64,
     extents: Vec<RootFileExtent>,
+    chunk_sha256: Vec<[u8; 32]>,
 }
 
 #[derive(Debug)]
 struct RootExtentFileCacheEntry {
     path: String,
+    chunk_index: Option<usize>,
     bytes: Vec<u8>,
 }
 
@@ -284,11 +288,12 @@ fn read_file_to_vec_from_extents(
         return Ok(None);
     };
     trace_extent_read(entry.path.as_str(), entry.len);
-    if let Some(bytes) = root_extent_file_cache_lookup(entry.path.as_str()) {
+    if let Some(bytes) = root_extent_file_cache_lookup(entry.path.as_str(), None) {
         return Ok(Some(bytes));
     }
     let bytes = read_extent_entry(&entry)?;
-    root_extent_file_cache_store(entry.path.as_str(), &bytes);
+    verify_all_content_chunks(&entry, &bytes)?;
+    root_extent_file_cache_store(entry.path.as_str(), None, &bytes);
     Ok(Some(bytes))
 }
 
@@ -317,50 +322,39 @@ pub fn read_file_range_from_extents(
     let requested = dest
         .len()
         .min(usize::try_from(entry.len - file_offset).map_err(|_| fatfs::Error::InvalidInput)?);
-    let request_end = file_offset
-        .checked_add(requested as u64)
-        .ok_or(fatfs::Error::InvalidInput)?;
-    let handle = crate::storage::block::current_boot_volume_handle()
-        .ok_or(fatfs::Error::Io(DiskIoError::NotPresent))?;
-    let mut device = crate::storage::block::FatRegistryDevice::new(handle);
-    let block_size = Some(device.logical_block_size())
-        .filter(|block_size| *block_size != 0)
-        .ok_or(fatfs::Error::Io(DiskIoError::NotPresent))?;
-
-    let mut logical_start = 0_u64;
-    let mut written = 0usize;
-    for extent in &entry.extents {
-        let logical_end = logical_start
-            .checked_add(extent.len)
+    let mut copied = 0usize;
+    while copied < requested {
+        let logical_offset = file_offset
+            .checked_add(copied as u64)
             .ok_or(fatfs::Error::InvalidInput)?;
-        let overlap_start = file_offset.max(logical_start);
-        let overlap_end = request_end.min(logical_end);
-        if overlap_start < overlap_end {
-            let within_extent = overlap_start - logical_start;
-            let physical_offset = extent
-                .offset
-                .checked_add(within_extent)
-                .ok_or(fatfs::Error::InvalidInput)?;
-            let count = usize::try_from(overlap_end - overlap_start)
+        let chunk_index = usize::try_from(logical_offset / ROOT_CONTENT_CHUNK_BYTES as u64)
+            .map_err(|_| fatfs::Error::InvalidInput)?;
+        let chunk_start = (chunk_index as u64)
+            .checked_mul(ROOT_CONTENT_CHUNK_BYTES as u64)
+            .ok_or(fatfs::Error::InvalidInput)?;
+        let chunk_len =
+            usize::try_from((entry.len - chunk_start).min(ROOT_CONTENT_CHUNK_BYTES as u64))
                 .map_err(|_| fatfs::Error::InvalidInput)?;
-            read_extent_bytes(
-                &mut device,
-                block_size,
-                usize::try_from(physical_offset).map_err(|_| fatfs::Error::InvalidInput)?,
-                count,
-                &mut dest[written..written + count],
-            )?;
-            written += count;
-            if written == requested {
-                break;
+        let chunk = match root_extent_file_cache_lookup(entry.path.as_str(), Some(chunk_index)) {
+            Some(bytes) => bytes,
+            None => {
+                let mut bytes = vec![0_u8; chunk_len];
+                read_extent_entry_range(&entry, chunk_start, &mut bytes)?;
+                verify_content_chunk(&entry, chunk_index, &bytes)?;
+                root_extent_file_cache_store(entry.path.as_str(), Some(chunk_index), &bytes);
+                bytes
             }
+        };
+        let within_chunk = usize::try_from(logical_offset - chunk_start)
+            .map_err(|_| fatfs::Error::InvalidInput)?;
+        let count = (requested - copied).min(chunk.len().saturating_sub(within_chunk));
+        if count == 0 {
+            return Err(fatfs::Error::UnexpectedEof);
         }
-        logical_start = logical_end;
+        dest[copied..copied + count].copy_from_slice(&chunk[within_chunk..within_chunk + count]);
+        copied += count;
     }
-    if written != requested {
-        return Err(fatfs::Error::UnexpectedEof);
-    }
-    Ok(Some(written))
+    Ok(Some(copied))
 }
 
 fn metadata_from_extents(
@@ -396,21 +390,26 @@ fn trace_extent_read(path: &str, len: u64) {
     }
 }
 
-fn root_extent_file_cache_lookup(path: &str) -> Option<Vec<u8>> {
+fn root_extent_file_cache_lookup(path: &str, chunk_index: Option<usize>) -> Option<Vec<u8>> {
     let mut cache = ROOT_EXTENT_FILE_CACHE.lock();
-    let index = cache.iter().position(|entry| entry.path == path)?;
+    let index = cache
+        .iter()
+        .position(|entry| entry.path == path && entry.chunk_index == chunk_index)?;
     let entry = cache.remove(index);
     let bytes = entry.bytes.clone();
     cache.push(entry);
     Some(bytes)
 }
 
-fn root_extent_file_cache_store(path: &str, bytes: &[u8]) {
+fn root_extent_file_cache_store(path: &str, chunk_index: Option<usize>, bytes: &[u8]) {
     if bytes.is_empty() || bytes.len() > ROOT_EXTENT_FILE_CACHE_MAX_ENTRY_BYTES {
         return;
     }
     let mut cache = ROOT_EXTENT_FILE_CACHE.lock();
-    if let Some(index) = cache.iter().position(|entry| entry.path == path) {
+    if let Some(index) = cache
+        .iter()
+        .position(|entry| entry.path == path && entry.chunk_index == chunk_index)
+    {
         let mut entry = cache.remove(index);
         entry.bytes.clear();
         entry.bytes.extend_from_slice(bytes);
@@ -428,6 +427,7 @@ fn root_extent_file_cache_store(path: &str, bytes: &[u8]) {
     }
     cache.push(RootExtentFileCacheEntry {
         path: path.to_string(),
+        chunk_index,
         bytes: bytes.to_vec(),
     });
 }
@@ -479,6 +479,12 @@ fn root_file_extent_generation(entry: &RootFileExtentEntry) -> u64 {
                 hash ^= byte as u64;
                 hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
             }
+        }
+    }
+    for digest in &entry.chunk_sha256 {
+        for byte in digest {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
     }
     hash.max(1)
@@ -537,10 +543,77 @@ fn parse_root_file_extent_table(bytes: &[u8]) -> Result<RootFileExtentTable, ()>
             .parse::<u64>()
             .map_err(|_| ())?;
         let extents = parse_extent_list(registry_field(line, "extents").ok_or(())?)?;
+        let chunk_sha256 = parse_sha256_list(registry_field(line, "sha256_chunks").ok_or(())?)?;
         let path = normalized_extent_path(path).ok_or(())?.to_string();
-        entries.push(RootFileExtentEntry { path, len, extents });
+        let expected_chunks =
+            usize::try_from(len.div_ceil(ROOT_CONTENT_CHUNK_BYTES as u64)).map_err(|_| ())?;
+        if chunk_sha256.len() != expected_chunks
+            || entries
+                .iter()
+                .any(|entry: &RootFileExtentEntry| entry.path == path)
+        {
+            return Err(());
+        }
+        entries.push(RootFileExtentEntry {
+            path,
+            len,
+            extents,
+            chunk_sha256,
+        });
     }
+    validate_extent_table(&entries)?;
     Ok(RootFileExtentTable { entries })
+}
+
+fn parse_sha256_list(text: &str) -> Result<Vec<[u8; 32]>, ()> {
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    text.split(',').map(parse_sha256).collect()
+}
+
+fn parse_sha256(text: &str) -> Result<[u8; 32], ()> {
+    if text.len() != 64 {
+        return Err(());
+    }
+    let mut digest = [0_u8; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        let start = index * 2;
+        let high = hex_nibble(text.as_bytes()[start]).ok_or(())?;
+        let low = hex_nibble(text.as_bytes()[start + 1]).ok_or(())?;
+        *byte = (high << 4) | low;
+    }
+    Ok(digest)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn validate_extent_table(entries: &[RootFileExtentEntry]) -> Result<(), ()> {
+    let mut physical_ranges = Vec::new();
+    for entry in entries {
+        let mut total = 0_u64;
+        for extent in &entry.extents {
+            let end = extent.offset.checked_add(extent.len).ok_or(())?;
+            if physical_ranges
+                .iter()
+                .any(|&(start, previous_end)| extent.offset < previous_end && start < end)
+            {
+                return Err(());
+            }
+            physical_ranges.push((extent.offset, end));
+            total = total.checked_add(extent.len).ok_or(())?;
+        }
+        if total != entry.len || (entry.len == 0 && !entry.extents.is_empty()) {
+            return Err(());
+        }
+    }
+    Ok(())
 }
 
 fn registry_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
@@ -604,6 +677,94 @@ fn read_extent_entry(
         return Err(fatfs::Error::UnexpectedEof);
     }
     Ok(bytes)
+}
+
+fn read_extent_entry_range(
+    entry: &RootFileExtentEntry,
+    file_offset: u64,
+    dest: &mut [u8],
+) -> core::result::Result<(), fatfs::Error<DiskIoError>> {
+    let request_end = file_offset
+        .checked_add(dest.len() as u64)
+        .ok_or(fatfs::Error::InvalidInput)?;
+    if request_end > entry.len {
+        return Err(fatfs::Error::UnexpectedEof);
+    }
+    let handle = crate::storage::block::current_boot_volume_handle()
+        .ok_or(fatfs::Error::Io(DiskIoError::NotPresent))?;
+    let mut device = crate::storage::block::FatRegistryDevice::new(handle);
+    let block_size = Some(device.logical_block_size())
+        .filter(|block_size| *block_size != 0)
+        .ok_or(fatfs::Error::Io(DiskIoError::NotPresent))?;
+
+    let mut logical_start = 0_u64;
+    let mut written = 0usize;
+    for extent in &entry.extents {
+        let logical_end = logical_start
+            .checked_add(extent.len)
+            .ok_or(fatfs::Error::InvalidInput)?;
+        let overlap_start = file_offset.max(logical_start);
+        let overlap_end = request_end.min(logical_end);
+        if overlap_start < overlap_end {
+            let physical_offset = extent
+                .offset
+                .checked_add(overlap_start - logical_start)
+                .ok_or(fatfs::Error::InvalidInput)?;
+            let count = usize::try_from(overlap_end - overlap_start)
+                .map_err(|_| fatfs::Error::InvalidInput)?;
+            read_extent_bytes(
+                &mut device,
+                block_size,
+                usize::try_from(physical_offset).map_err(|_| fatfs::Error::InvalidInput)?,
+                count,
+                &mut dest[written..written + count],
+            )?;
+            written += count;
+            if written == dest.len() {
+                break;
+            }
+        }
+        logical_start = logical_end;
+    }
+    if written != dest.len() {
+        return Err(fatfs::Error::UnexpectedEof);
+    }
+    Ok(())
+}
+
+fn verify_all_content_chunks(
+    entry: &RootFileExtentEntry,
+    bytes: &[u8],
+) -> core::result::Result<(), fatfs::Error<DiskIoError>> {
+    if bytes.len() as u64 != entry.len {
+        return Err(fatfs::Error::UnexpectedEof);
+    }
+    for (chunk_index, chunk) in bytes.chunks(ROOT_CONTENT_CHUNK_BYTES).enumerate() {
+        verify_content_chunk(entry, chunk_index, chunk)?;
+    }
+    Ok(())
+}
+
+fn verify_content_chunk(
+    entry: &RootFileExtentEntry,
+    chunk_index: usize,
+    bytes: &[u8],
+) -> core::result::Result<(), fatfs::Error<DiskIoError>> {
+    let expected = entry
+        .chunk_sha256
+        .get(chunk_index)
+        .ok_or(fatfs::Error::InvalidInput)?;
+    let actual: [u8; 32] = Sha256::digest(bytes).into();
+    if &actual != expected {
+        crate::debug::error!(
+            storage,
+            "boot volume content digest mismatch path={} chunk={}",
+            entry.path,
+            chunk_index
+        );
+        return Err(fatfs::Error::InvalidInput);
+    }
+    Ok(())
 }
 
 fn read_extent_bytes(
@@ -841,5 +1002,58 @@ fn boot_info() -> Option<&'static BootInfo> {
 fn boot_extent_manifest() -> Option<BootExtentManifest> {
     let manifest = boot_info()?.boot_extent_manifest;
     manifest.validate().is_ok().then_some(manifest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RootFileExtentEntry, parse_root_file_extent_table, verify_all_content_chunks};
+    use alloc::string::ToString;
+    use alloc::vec;
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn root_extent_manifest_binds_exact_file_content_and_coverage() {
+        let payload = b"rootd bootstrap payload";
+        let digest: [u8; 32] = Sha256::digest(payload).into();
+        let digest_hex = digest
+            .iter()
+            .map(|byte| alloc::format!("{byte:02x}"))
+            .collect::<alloc::string::String>();
+        let manifest = alloc::format!(
+            "path=/services/rootd/rootd.elf\tlen={}\textents=4096:{}\tsha256_chunks={}\n",
+            payload.len(),
+            payload.len(),
+            digest_hex,
+        );
+        let table = parse_root_file_extent_table(manifest.as_bytes()).unwrap();
+        assert_eq!(table.entries.len(), 1);
+        assert!(verify_all_content_chunks(&table.entries[0], payload).is_ok());
+        assert!(verify_all_content_chunks(&table.entries[0], b"mutated payload").is_err());
+    }
+
+    #[test]
+    fn root_extent_manifest_rejects_aliases_gaps_and_digest_shape() {
+        let digest = "00".repeat(32);
+        let duplicate = alloc::format!(
+            "path=/a\tlen=1\textents=1:1\tsha256_chunks={digest}\n\
+             path=/a\tlen=1\textents=2:1\tsha256_chunks={digest}\n"
+        );
+        assert!(parse_root_file_extent_table(duplicate.as_bytes()).is_err());
+
+        let short_coverage =
+            alloc::format!("path=/a\tlen=2\textents=1:1\tsha256_chunks={digest}\n");
+        assert!(parse_root_file_extent_table(short_coverage.as_bytes()).is_err());
+
+        let bad_digest = b"path=/a\tlen=1\textents=1:1\tsha256_chunks=abcd\n";
+        assert!(parse_root_file_extent_table(bad_digest).is_err());
+
+        let empty = RootFileExtentEntry {
+            path: "/empty".to_string(),
+            len: 0,
+            extents: vec![],
+            chunk_sha256: vec![],
+        };
+        assert!(verify_all_content_chunks(&empty, &[]).is_ok());
+    }
 }
 // RING3-MIGRATION-REFERENCE END: vfsd/storaged-owned boot-volume policy bootstrap exception.

@@ -12,6 +12,10 @@ use core::mem::{size_of, MaybeUninit};
 #[cfg(not(test))]
 use core::panic::PanicInfo;
 
+use rustos_image_admission::{
+    admit_elf64_image, admit_pe64_image_headers, apply_pe64_base_relocations,
+    validate_pe64_import_table, ByteAdmissionError,
+};
 use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, LoaderSpawnRequest,
@@ -68,9 +72,6 @@ const ELF_MAX_PROGRAM_HEADERS: u16 = 128;
 const ELF_PT_LOAD: u32 = 1;
 const ELF_PT_INTERP: u32 = 3;
 const ELF_PT_PHDR: u32 = 6;
-const ELF_ET_EXEC: u16 = 2;
-const ELF_ET_DYN: u16 = 3;
-const ELF_EM_X86_64: u16 = 62;
 const ELF_PF_X: u32 = 1;
 const ELF_PF_W: u32 = 2;
 const ELF_PF_R: u32 = 4;
@@ -82,7 +83,6 @@ const PE_FILE_HEADER_SIZE: usize = 20;
 const PE_SECTION_HEADER_SIZE: usize = 40;
 const PE_OPTIONAL_MAGIC_PE32_PLUS: u16 = 0x20b;
 const PE_MACHINE_AMD64: u16 = 0x8664;
-const PE_FILE_RELOCS_STRIPPED: u16 = 0x0001;
 const PE_FILE_DLL: u16 = 0x2000;
 const PE_DIRECTORY_EXPORT: usize = 0;
 const PE_DIRECTORY_IMPORT: usize = 1;
@@ -90,12 +90,11 @@ const PE_DIRECTORY_BASERELOC: usize = 5;
 const PE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const PE_SCN_MEM_READ: u32 = 0x4000_0000;
 const PE_SCN_MEM_WRITE: u32 = 0x8000_0000;
-const PE_REL_BASED_ABSOLUTE: u16 = 0;
-const PE_REL_BASED_DIR64: u16 = 10;
 const PE_LOAD_OFFSET: u64 = 0x0040_0000;
 const PE_MAX_SECTIONS: u16 = 128;
 const PE_MAX_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
 const PE_MAX_IMPORT_MODULES: usize = 64;
+const PE_MAX_IMPORTS: usize = 65_536;
 const PE_MAX_FORWARDER_DEPTH: usize = 8;
 const WINDOWS_DLL_REGISTRY_PATH: &str = "system/registry/compat/windows-system-dlls.txt";
 const WINDOWS_RUNTIME_STRING_LIMIT: usize = 64 * 1024;
@@ -831,7 +830,7 @@ fn validate_executable_fd(fd: i32) -> Result<u16, i32> {
     read_exact_at(fd, 0, &mut header)?;
     if header[..4] == *b"\x7fELF" {
         let phdrs = read_program_headers(fd, &header)?;
-        validate_elf_fd(fd, &header, &phdrs)?;
+        validate_elf_fd(fd, &header, &phdrs, ELF_MAIN_DYN_LOAD_OFFSET)?;
         return Ok(PROC_BROKER_FORMAT_ELF64);
     }
     if &header[..2] == b"MZ" {
@@ -882,48 +881,30 @@ fn program_header_at(phdrs: &[u8], index: u64) -> Result<&[u8], i32> {
     phdrs.get(start..end).ok_or(ENOEXEC)
 }
 
-fn validate_elf_fd(fd: i32, header: &[u8; ELF_HEADER_SIZE], phdrs: &[u8]) -> Result<(), i32> {
-    if header[4] != 2 || header[5] != 1 || header[6] != 1 {
-        return Err(ENOEXEC);
-    }
-    let image_type = read_u16(header, 16);
-    if image_type != ELF_ET_EXEC && image_type != ELF_ET_DYN {
-        return Err(ENOEXEC);
-    }
-    if read_u16(header, 18) != ELF_EM_X86_64
-        || read_u32(header, 20) != 1
-        || read_u16(header, 52) != ELF_HEADER_SIZE as u16
-        || read_u16(header, 54) != ELF_PROGRAM_HEADER_SIZE as u16
-    {
-        return Err(ENOEXEC);
-    }
-
-    let phnum = read_u16(header, 56) as u64;
-
-    let mut load_ranges = Vec::<(u64, u64)>::new();
-    let mut saw_load = false;
+fn validate_elf_fd(
+    fd: i32,
+    header: &[u8; ELF_HEADER_SIZE],
+    phdrs: &[u8],
+    dyn_load_offset: u64,
+) -> Result<u64, i32> {
+    let summary = admit_elf64_image(
+        header,
+        phdrs,
+        dyn_load_offset,
+        PROC_BROKER_USER_SPACE_BASE,
+        PROC_BROKER_USER_SPACE_END_EXCLUSIVE,
+    )
+    .map_err(byte_admission_errno)?;
+    let phnum = u64::from(summary.program_headers);
     for index in 0..phnum {
         let ph_slice = program_header_at(phdrs, index)?;
         let mut ph = [0_u8; ELF_PROGRAM_HEADER_SIZE];
         ph.copy_from_slice(ph_slice);
-        let kind = read_u32(&ph, 0);
-        let flags = read_u32(&ph, 4);
-        if flags & !(ELF_PF_X | ELF_PF_W | ELF_PF_R) != 0 {
-            return Err(ENOEXEC);
-        }
-        match kind {
-            ELF_PT_LOAD => {
-                validate_elf_load_segment(&ph, &mut load_ranges)?;
-                saw_load = true;
-            }
-            ELF_PT_INTERP => validate_elf_interp(fd, &ph)?,
-            _ => {}
+        if read_u32(&ph, 0) == ELF_PT_INTERP {
+            validate_elf_interp(fd, &ph)?;
         }
     }
-    if !saw_load {
-        return Err(ENOEXEC);
-    }
-    Ok(())
+    Ok(summary.load_bias)
 }
 
 fn map_elf_segments_fd(
@@ -935,14 +916,12 @@ fn map_elf_segments_fd(
     let mut header = [0_u8; ELF_HEADER_SIZE];
     read_exact_at(fd, 0, &mut header)?;
     let phdrs = read_program_headers(fd, &header)?;
-    validate_elf_fd(fd, &header, &phdrs)?;
-
-    let load_bias = elf_load_bias_from_phdrs(&header, &phdrs, dyn_load_offset)?;
+    let load_bias = validate_elf_fd(fd, &header, &phdrs, dyn_load_offset)?;
     let _phoff = read_u64(&header, 32);
     let e_entry = read_u64(&header, 24);
     let phentsize = read_u16(&header, 54) as u64;
     let phnum = read_u16(&header, 56) as u64;
-    let entry = e_entry.wrapping_add(load_bias);
+    let entry = e_entry.checked_add(load_bias).ok_or(EOVERFLOW)?;
     let phdr_addr = program_header_table_addr_from_phdrs(&header, &phdrs, load_bias)?;
 
     let mut max_loaded_end: u64 = load_bias;
@@ -1028,33 +1007,6 @@ fn map_elf_interpreter(path: &str, prepare_handle: u64) -> Result<ElfMapResult, 
     };
     result.backing_fds.push(fd);
     Ok(result)
-}
-
-fn elf_load_bias_from_phdrs(
-    header: &[u8; ELF_HEADER_SIZE],
-    phdrs: &[u8],
-    dyn_load_offset: u64,
-) -> Result<u64, i32> {
-    if read_u16(header, 16) == ELF_ET_EXEC {
-        return Ok(0);
-    }
-    let phnum = read_u16(header, 56) as u64;
-    let mut min_load_addr = u64::MAX;
-    for index in 0..phnum {
-        let ph_slice = program_header_at(phdrs, index)?;
-        let mut ph = [0_u8; ELF_PROGRAM_HEADER_SIZE];
-        ph.copy_from_slice(ph_slice);
-        if read_u32(&ph, 0) == ELF_PT_LOAD && read_u64(&ph, 40) != 0 {
-            min_load_addr = min_load_addr.min(read_u64(&ph, 16) & !0xfff);
-        }
-    }
-    if min_load_addr == u64::MAX {
-        return Err(ENOEXEC);
-    }
-    PROC_BROKER_USER_SPACE_BASE
-        .checked_add(dyn_load_offset)
-        .and_then(|base| base.checked_sub(min_load_addr))
-        .ok_or(EOVERFLOW)
 }
 
 fn program_header_table_addr_from_phdrs(
@@ -1203,38 +1155,6 @@ fn proc_map_flags(elf_flags: u32) -> u64 {
     flags
 }
 
-fn validate_elf_load_segment(
-    ph: &[u8; ELF_PROGRAM_HEADER_SIZE],
-    load_ranges: &mut Vec<(u64, u64)>,
-) -> Result<(), i32> {
-    let offset = read_u64(ph, 8);
-    let vaddr = read_u64(ph, 16);
-    let file_size = read_u64(ph, 32);
-    let mem_size = read_u64(ph, 40);
-    let align = read_u64(ph, 48);
-    if mem_size == 0 || file_size > mem_size {
-        return Err(ENOEXEC);
-    }
-    if align != 0 && !align.is_power_of_two() {
-        return Err(ENOEXEC);
-    }
-    if align > 1 && (offset & (align - 1)) != (vaddr & (align - 1)) {
-        return Err(ENOEXEC);
-    }
-    let end = vaddr.checked_add(mem_size).ok_or(EOVERFLOW)?;
-    let file_end = offset.checked_add(file_size).ok_or(EOVERFLOW)?;
-    if file_end > i64::MAX as u64 {
-        return Err(EOVERFLOW);
-    }
-    for (existing_start, existing_end) in load_ranges.iter().copied() {
-        if vaddr < existing_end && existing_start < end {
-            return Err(ENOEXEC);
-        }
-    }
-    load_ranges.push((vaddr, end));
-    Ok(())
-}
-
 fn validate_elf_interp(fd: i32, ph: &[u8; ELF_PROGRAM_HEADER_SIZE]) -> Result<(), i32> {
     read_elf_interp_path(fd, ph).map(|_| ())
 }
@@ -1361,7 +1281,6 @@ fn load_pe_image_fd(
     if read_u16(&optional_header, 0) != PE_OPTIONAL_MAGIC_PE32_PLUS {
         return Err(ENOEXEC);
     }
-    let entry_rva = read_u32(&optional_header, 16);
     let preferred_base = read_u64(&optional_header, 24);
     let section_alignment = read_u32(&optional_header, 32) as u64;
     let file_alignment = read_u32(&optional_header, 36) as u64;
@@ -1369,12 +1288,15 @@ fn load_pe_image_fd(
     let size_of_headers = read_u32(&optional_header, 60) as u64;
     if section_alignment < 4096
         || !section_alignment.is_power_of_two()
-        || file_alignment == 0
+        || !(512..=65_536).contains(&file_alignment)
         || !file_alignment.is_power_of_two()
+        || file_alignment > section_alignment
         || size_of_image == 0
         || size_of_headers == 0
         || size_of_image > PE_MAX_IMAGE_BYTES
         || size_of_headers > size_of_image
+        || !size_of_image.is_multiple_of(section_alignment)
+        || !size_of_headers.is_multiple_of(file_alignment)
     {
         return Err(ENOEXEC);
     }
@@ -1393,44 +1315,77 @@ fn load_pe_image_fd(
     let section_table = optional_header_offset
         .checked_add(u64::from(optional_header_size))
         .ok_or(EOVERFLOW)?;
-    let mut sections = Vec::new();
-    for index in 0..section_count {
-        let mut section = [0_u8; PE_SECTION_HEADER_SIZE];
-        let offset = section_table
-            .checked_add(u64::from(index) * PE_SECTION_HEADER_SIZE as u64)
-            .ok_or(EOVERFLOW)?;
-        read_exact_at(fd, offset, &mut section)?;
-        materialize_pe_section(fd, &mut image, load_base, &section, &mut sections)?;
+    let section_table_len = u64::from(section_count)
+        .checked_mul(PE_SECTION_HEADER_SIZE as u64)
+        .ok_or(EOVERFLOW)?;
+    let section_table_end = section_table
+        .checked_add(section_table_len)
+        .ok_or(EOVERFLOW)?;
+    if section_table_end > size_of_headers {
+        return Err(ENOEXEC);
     }
 
-    let reloc_dir_offset = 112 + PE_DIRECTORY_BASERELOC * 8;
-    let reloc_rva = if reloc_dir_offset + 8 <= optional_header.len() {
-        read_u32(&optional_header, reloc_dir_offset)
-    } else {
-        0
-    };
-    let reloc_size = if reloc_dir_offset + 8 <= optional_header.len() {
-        read_u32(&optional_header, reloc_dir_offset + 4)
-    } else {
-        0
-    };
-    apply_pe_relocations(
+    // The section table is immutable launch metadata. Fetch it in one VFS
+    // roundtrip rather than issuing up to PE_MAX_SECTIONS pread64 calls.
+    let mut section_headers = vec![0_u8; section_table_len as usize];
+    read_exact_at(fd, section_table, &mut section_headers)?;
+    let admitted = admit_pe64_image_headers(
+        &dos_header,
+        &file_header,
+        &optional_header,
+        &section_headers,
+        load_base,
+        PROC_BROKER_USER_SPACE_BASE,
+        PROC_BROKER_USER_SPACE_END_EXCLUSIVE,
+        PE_MAX_IMAGE_BYTES,
+        require_dll,
+    )
+    .map_err(byte_admission_errno)?;
+    let minimum_section_rva = align_up(size_of_headers, section_alignment)?;
+    let mut sections = Vec::new();
+    for index in 0..section_count {
+        let start = usize::from(index)
+            .checked_mul(PE_SECTION_HEADER_SIZE)
+            .ok_or(EOVERFLOW)?;
+        let end = start.checked_add(PE_SECTION_HEADER_SIZE).ok_or(EOVERFLOW)?;
+        let mut section = [0_u8; PE_SECTION_HEADER_SIZE];
+        section.copy_from_slice(section_headers.get(start..end).ok_or(ENOEXEC)?);
+        materialize_pe_section(
+            fd,
+            &mut image,
+            load_base,
+            &section,
+            section_alignment,
+            file_alignment,
+            minimum_section_rva,
+            &mut sections,
+        )?;
+    }
+
+    let entry_point = admitted.entry_point;
+    let directories = admitted.directories.map(|directory| PeDataDirectory {
+        rva: directory.rva,
+        size: directory.size,
+    });
+    let reloc_rva = directories[PE_DIRECTORY_BASERELOC].rva;
+    let reloc_size = directories[PE_DIRECTORY_BASERELOC].size;
+    apply_pe64_base_relocations(
         &mut image,
         preferred_base,
         load_base,
         reloc_rva,
         reloc_size,
         characteristics,
-    )?;
+    )
+    .map_err(byte_admission_errno)?;
 
-    let directories = pe_directories(&optional_header)?;
     let exports = build_export_cache(&image, directories[PE_DIRECTORY_EXPORT])?;
     Ok(LoadedPeModule {
         path: path.to_string(),
         base_name: file_name_from_path(path).to_string(),
         load_base,
         image_size: align_up(size_of_image, 4096)?,
-        entry_point: load_base.checked_add(entry_rva as u64).ok_or(EOVERFLOW)?,
+        entry_point,
         image,
         headers_len: align_up(size_of_headers, 4096)?,
         sections,
@@ -1496,6 +1451,9 @@ fn materialize_pe_section(
     image: &mut [u8],
     load_base: u64,
     section: &[u8; PE_SECTION_HEADER_SIZE],
+    section_alignment: u64,
+    file_alignment: u64,
+    minimum_section_rva: u64,
     sections: &mut Vec<PeMappedSection>,
 ) -> Result<(), i32> {
     let virtual_size = read_u32(section, 8) as u64;
@@ -1506,6 +1464,14 @@ fn materialize_pe_section(
     let section_size = virtual_size.max(raw_size);
     if section_size == 0 {
         return Ok(());
+    }
+    if virtual_address < minimum_section_rva
+        || !virtual_address.is_multiple_of(section_alignment)
+        || (raw_size != 0
+            && (!raw_offset.is_multiple_of(file_alignment)
+                || !raw_size.is_multiple_of(file_alignment)))
+    {
+        return Err(ENOEXEC);
     }
     let section_end = virtual_address.checked_add(section_size).ok_or(EOVERFLOW)?;
     if section_end > image.len() as u64 {
@@ -1534,97 +1500,6 @@ fn materialize_pe_section(
         flags,
     });
     Ok(())
-}
-
-fn apply_pe_relocations(
-    image: &mut [u8],
-    preferred_base: u64,
-    load_base: u64,
-    reloc_rva: u32,
-    reloc_size: u32,
-    characteristics: u16,
-) -> Result<(), i32> {
-    if preferred_base == load_base {
-        return Ok(());
-    }
-    if characteristics & PE_FILE_RELOCS_STRIPPED != 0 {
-        return Err(ENOEXEC);
-    }
-    if reloc_rva == 0 && reloc_size == 0 {
-        return Ok(());
-    }
-    if reloc_rva == 0 || reloc_size == 0 {
-        return Err(ENOEXEC);
-    }
-    let reloc_start = reloc_rva as usize;
-    let reloc_len = reloc_size as usize;
-    let reloc_end = reloc_start.checked_add(reloc_len).ok_or(EOVERFLOW)?;
-    if reloc_end > image.len() {
-        return Err(ENOEXEC);
-    }
-
-    let mut cursor = reloc_start;
-    while cursor < reloc_end {
-        let block_end_header = cursor.checked_add(8).ok_or(EOVERFLOW)?;
-        if block_end_header > reloc_end {
-            return Err(ENOEXEC);
-        }
-        let page_rva = read_u32(image, cursor) as u64;
-        let block_size = read_u32(image, cursor + 4) as usize;
-        if block_size < 8 || !block_size.is_multiple_of(2) {
-            return Err(ENOEXEC);
-        }
-        let block_end = cursor.checked_add(block_size).ok_or(EOVERFLOW)?;
-        if block_end > reloc_end {
-            return Err(ENOEXEC);
-        }
-        let mut entry_offset = cursor + 8;
-        while entry_offset < block_end {
-            let entry = read_u16(image, entry_offset);
-            let reloc_type = entry >> 12;
-            let reloc_offset = u64::from(entry & 0x0fff);
-            match reloc_type {
-                PE_REL_BASED_ABSOLUTE => {}
-                PE_REL_BASED_DIR64 => {
-                    let target_rva = page_rva.checked_add(reloc_offset).ok_or(EOVERFLOW)?;
-                    let target = usize::try_from(target_rva).map_err(|_| EOVERFLOW)?;
-                    let target_end = target.checked_add(8).ok_or(EOVERFLOW)?;
-                    if target_end > image.len() {
-                        return Err(ENOEXEC);
-                    }
-                    let old = read_u64(image, target);
-                    let patched = if load_base >= preferred_base {
-                        old.checked_add(load_base - preferred_base)
-                            .ok_or(EOVERFLOW)?
-                    } else {
-                        old.checked_sub(preferred_base - load_base)
-                            .ok_or(EOVERFLOW)?
-                    };
-                    image[target..target_end].copy_from_slice(&patched.to_le_bytes());
-                }
-                _ => return Err(ENOEXEC),
-            }
-            entry_offset += 2;
-        }
-        cursor = block_end;
-    }
-    Ok(())
-}
-
-fn pe_directories(optional_header: &[u8]) -> Result<[PeDataDirectory; 16], i32> {
-    let number = read_u32(optional_header, 108) as usize;
-    let mut directories = [PeDataDirectory { rva: 0, size: 0 }; 16];
-    for (index, entry) in directories.iter_mut().enumerate().take(number.min(16)) {
-        let offset = 112 + index * 8;
-        if offset + 8 > optional_header.len() {
-            return Err(ENOEXEC);
-        }
-        *entry = PeDataDirectory {
-            rva: read_u32(optional_header, offset),
-            size: read_u32(optional_header, offset + 4),
-        };
-    }
-    Ok(directories)
 }
 
 fn map_loaded_pe_module(prepare_handle: u64, module: &LoadedPeModule) -> Result<(), i32> {
@@ -1702,6 +1577,13 @@ struct ImportPatch {
 
 fn collect_imports(module: &LoadedPeModule) -> Result<Vec<ImportPatch>, i32> {
     let import_dir = module.directories[PE_DIRECTORY_IMPORT];
+    validate_pe64_import_table(
+        &module.image,
+        import_dir.rva,
+        import_dir.size,
+        PE_MAX_IMPORTS,
+    )
+    .map_err(byte_admission_errno)?;
     if import_dir.rva == 0 || import_dir.size == 0 {
         return Ok(Vec::new());
     }
@@ -1753,6 +1635,13 @@ fn collect_imports(module: &LoadedPeModule) -> Result<Vec<ImportPatch>, i32> {
         descriptor += 20;
     }
     Ok(imports)
+}
+
+fn byte_admission_errno(error: ByteAdmissionError) -> i32 {
+    match error {
+        ByteAdmissionError::AddressOverflow => EOVERFLOW,
+        _ => ENOEXEC,
+    }
 }
 
 fn ensure_system_dll_loaded(

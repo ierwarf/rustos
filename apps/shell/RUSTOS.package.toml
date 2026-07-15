@@ -1,7 +1,6 @@
 id = "shell"
 kind = "app"
 execution_domain = "user"
-profiles = ["default"]
 
 [build]
 builder = "c-demo"

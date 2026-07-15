@@ -4,7 +4,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, TryRecvError, TrySendError, sync_channel};
+use std::sync::mpsc::{sync_channel, Receiver, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -28,13 +28,13 @@ use wayland_server::{
 
 use crate::canvas::Rect;
 use crate::layout::{
-    self, WINDOW_BORDER, WINDOW_TITLE_HEIGHT, clamp_wayland_frame, wayland_client_size_for_buffer,
-    wayland_max_client_size,
+    self, clamp_wayland_frame, wayland_client_size_for_buffer, wayland_max_client_size,
+    WINDOW_BORDER, WINDOW_TITLE_HEIGHT,
 };
 use crate::sys::{
-    INPUT_ACTION_PRESSED, INPUT_ACTION_RELEASED, INPUT_ACTION_REPEATED, INPUT_KIND_KEYBOARD,
-    InputEvent, SharedFdMapping, diag_line, map_shared_fd_readable,
-    require_background_thread_class, ui_profile_enabled,
+    diag_line, map_shared_fd_readable, require_background_thread_class, ui_profile_enabled,
+    InputEvent, SharedFdMapping, INPUT_ACTION_PRESSED, INPUT_ACTION_RELEASED,
+    INPUT_ACTION_REPEATED, INPUT_KIND_KEYBOARD,
 };
 
 const WAYLAND_SOCKET_NAME: &str = "wayland-0";
@@ -591,8 +591,8 @@ fn surface_damage_rect(x: i32, y: i32, width: i32, height: i32) -> Option<Rect> 
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_WAYLAND_BUFFER_DIMENSION, MAX_WAYLAND_SHM_POOL_BYTES, WaylandWindowSnapshot,
         checked_wayland_pixel_count, validate_wayland_buffer_layout, wayland_nonnegative_i32,
+        WaylandWindowSnapshot, MAX_WAYLAND_BUFFER_DIMENSION, MAX_WAYLAND_SHM_POOL_BYTES,
     };
     use crate::canvas::Rect;
     use std::sync::Arc;
@@ -608,16 +608,14 @@ mod tests {
     fn wayland_buffer_layout_rejects_out_of_bounds_and_bad_stride() {
         assert!(validate_wayland_buffer_layout(0, 128, 128, 128 * 4, 128 * 128 * 4).is_some());
         assert!(validate_wayland_buffer_layout(0, 128, 128, 127 * 4, 128 * 128 * 4).is_none());
-        assert!(
-            validate_wayland_buffer_layout(
-                MAX_WAYLAND_SHM_POOL_BYTES,
-                128,
-                128,
-                128 * 4,
-                MAX_WAYLAND_SHM_POOL_BYTES,
-            )
-            .is_none()
-        );
+        assert!(validate_wayland_buffer_layout(
+            MAX_WAYLAND_SHM_POOL_BYTES,
+            128,
+            128,
+            128 * 4,
+            MAX_WAYLAND_SHM_POOL_BYTES,
+        )
+        .is_none());
     }
 
     #[test]

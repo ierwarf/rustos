@@ -13,8 +13,7 @@ use std::time::{Duration, Instant};
 use crate::app::{AppState, ConsoleWindow, CursorMotion, DesktopSurfaceCache};
 use crate::canvas::{Rect, SurfaceCanvas};
 use crate::layout::{
-    WINDOW_SHADOW_STEPS, clamp_window_rect,
-    default_console_window_rect as layout_default_console_window_rect,
+    clamp_window_rect, default_console_window_rect as layout_default_console_window_rect,
     launcher_button_rect as layout_launcher_button_rect, taskbar_rail_rect,
     taskbar_slot_rect as layout_taskbar_slot_rect, topbar_rail_rect,
     wayland_client_rect as layout_wayland_client_rect,
@@ -22,9 +21,9 @@ use crate::layout::{
     window_close_button_rect as layout_window_close_button_rect,
     window_maximize_button_rect as layout_window_maximize_button_rect,
     window_minimize_button_rect as layout_window_minimize_button_rect,
-    window_title_bar_rect as layout_window_title_bar_rect,
+    window_title_bar_rect as layout_window_title_bar_rect, WINDOW_SHADOW_STEPS,
 };
-use crate::sys::{ConsoleSessionHandle, diag_line, ui_profile_enabled};
+use crate::sys::{diag_line, ui_profile_enabled, ConsoleSessionHandle};
 use crate::wayland::WaylandWindowSnapshot;
 
 mod background;

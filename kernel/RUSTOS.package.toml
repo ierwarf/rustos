@@ -1,7 +1,6 @@
 id = "nucleus"
 kind = "kernel"
 execution_domain = "kernel"
-profiles = ["default"]
 
 [build]
 builder = "kernel-rustc"

@@ -159,21 +159,34 @@ fn try_install_serialized() -> bool {
     true
 }
 
-/// Admit DVM production only after a real input client has successfully
-/// reached `inputd` through the policy-backed poll path. The transport-ready
-/// flag above proves only that MSI-X is armed; it does not prove that anyone
-/// will advance the consumer cursor.
+/// Admit DVM production only after inputd's capability-gated ingestion worker
+/// has armed its kernel waiter. The transport-ready flag above proves only
+/// that MSI-X is armed; it does not prove that the sole ring consumer can
+/// advance the cursor.
 pub(crate) fn mark_policy_consumer_ready() -> bool {
-    if !INSTALLED.load(Ordering::Acquire) {
+    if !INSTALLED.load(Ordering::Acquire) && !try_install() {
         return false;
     }
     let mapped = SHARED_ADDR.load(Ordering::Acquire) as *mut u8;
     if mapped.is_null() {
         return false;
     }
-    let flags = read_u32(mapped, DVM_INPUT_RING_FLAGS_OFFSET);
-    if flags & DVM_INPUT_RING_FLAG_RUSTOS_READY == 0 {
+    let Some(header) = read_header(mapped) else {
+        revoke("policy-ready-header-invalid");
         return false;
+    };
+    if header.generation != GENERATION.load(Ordering::Acquire)
+        || header.consumer != CONSUMER.load(Ordering::Acquire)
+    {
+        revoke("policy-ready-lifecycle-invalid");
+        return false;
+    }
+    let Some(flags) = admitted_policy_ready_flags(header.flags) else {
+        revoke("policy-ready-transport-not-ready");
+        return false;
+    };
+    if flags == header.flags {
+        return true;
     }
     write_u32(
         mapped,
@@ -182,6 +195,11 @@ pub(crate) fn mark_policy_consumer_ready() -> bool {
     );
     fence(Ordering::SeqCst);
     true
+}
+
+fn admitted_policy_ready_flags(flags: u32) -> Option<u32> {
+    (flags & DVM_INPUT_RING_FLAG_RUSTOS_READY != 0)
+        .then_some(flags | DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY)
 }
 
 /// Drain a bounded batch only on inputd's broker call. The interrupt callback
@@ -557,4 +575,20 @@ fn read_u64(base: *const u8, offset: usize) -> u64 {
 
 fn write_u32(base: *mut u8, offset: usize, value: u32) {
     unsafe { base.add(offset).cast::<u32>().write_volatile(value.to_le()) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_consumer_readiness_requires_transport_and_is_idempotent() {
+        let provider_ready = driver_domain_protocol::DVM_INPUT_RING_FLAG_READY;
+        assert_eq!(admitted_policy_ready_flags(provider_ready), None);
+
+        let transport_ready = provider_ready | DVM_INPUT_RING_FLAG_RUSTOS_READY;
+        let admitted = transport_ready | DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY;
+        assert_eq!(admitted_policy_ready_flags(transport_ready), Some(admitted));
+        assert_eq!(admitted_policy_ready_flags(admitted), Some(admitted));
+    }
 }

@@ -39,15 +39,20 @@ use rustos_user_abi::syscall::{
     SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
     SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
     SYS_RUSTOS_ROOTD_TERMINATE_BROKER, SYS_RUSTOS_ROOTD_WAIT_BROKER, SYS_RUSTOS_SPAWN_EXEC,
+    TASK_WEIGHT_INTERACTIVE_FLAG,
 };
 
 const SYS_SCHED_YIELD: u64 = 24;
 const SPAWN_FLAG_LOGICAL_ADMIN: u64 = 1;
-// Bootstrap IPC hosts sit on hot syscall/loader/VFS paths. Give them a modest
-// Linux nice-like service boost so dynamic-linker and driver bursts do not
-// leave runnable servers behind for hundreds of milliseconds.
-const CORE_SERVICE_WEIGHT_MICROS: u64 = 4_000;
+// Bootstrap IPC hosts sit on the syscall/loader/VFS causal path. Their strict
+// latency admission is fixed in rootd's immutable manifest, never accepted
+// from a package or desktop entry. This lets the scheduler's bounded System
+// ready-wait rail break priority inversion when an ordinary caller blocks on
+// one of these servers under sustained display/input load.
+const CORE_SERVICE_WEIGHT_MICROS: u64 = TASK_WEIGHT_INTERACTIVE_FLAG | 4_000;
 const INITD_WEIGHT_MICROS: u64 = 4_000;
+const _: () = assert!(CORE_SERVICE_WEIGHT_MICROS & TASK_WEIGHT_INTERACTIVE_FLAG != 0);
+const _: () = assert!(INITD_WEIGHT_MICROS & TASK_WEIGHT_INTERACTIVE_FLAG == 0);
 const BOOTSTRAP_SPAWN_MAX_ATTEMPTS: u32 = 64;
 const INITD_SPAWN_MAX_ATTEMPTS: u32 = 64;
 
@@ -1701,6 +1706,7 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
 #[no_mangle]
 pub extern "C" fn rust_eh_personality() {}
 
+#[cfg(not(test))]
 #[no_mangle]
 /// # Safety
 ///
@@ -1714,6 +1720,7 @@ pub unsafe extern "C" fn memset(dest: *mut u8, value: i32, len: usize) -> *mut u
     dest
 }
 
+#[cfg(not(test))]
 #[no_mangle]
 /// # Safety
 ///
@@ -1727,6 +1734,7 @@ pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, len: usize) -> *m
     dest
 }
 
+#[cfg(not(test))]
 #[no_mangle]
 /// # Safety
 ///
@@ -1744,6 +1752,7 @@ pub unsafe extern "C" fn memcmp(lhs: *const u8, rhs: *const u8, len: usize) -> i
     0
 }
 
+#[cfg(not(test))]
 #[no_mangle]
 /// # Safety
 ///

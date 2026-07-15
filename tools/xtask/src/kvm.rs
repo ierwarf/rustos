@@ -421,7 +421,8 @@ options:
   --expect <marker>    require an additional RustOS debugcon marker (repeatable)
   --exercise-input     run the DVM's bounded evdev loopback self-test and require
                        RustOS inputd keyboard and pointer ingress markers
-  --exercise-network   run netprobe through netd and the DVM Ethernet ring
+  --exercise-network   run netprobe through netd and the DVM Ethernet ring;
+                       requires --gui-dvm-surfaces and --dvm-network-shmem
   --min-ui-fps <fps>   enable the private KVM-only UI profiler and require three
                        high-volume input windows and three accepted DVM atomic-page-flip
                        relay samples at or above this integer FPS; this uses
@@ -569,6 +570,11 @@ where
     }
     if options.exercise_network && !options.dvm_network_shmem {
         bail!("--exercise-network requires --dvm-network-shmem");
+    }
+    if options.exercise_network && !options.gui_dvm_surfaces {
+        bail!(
+            "--exercise-network requires --gui-dvm-surfaces so runtimed can admit the app catalog"
+        );
     }
     if options.ui_proof_windows != DEFAULT_UI_FPS_ACTIVE_WINDOWS && options.min_ui_fps.is_none() {
         bail!("--ui-proof-windows requires --min-ui-fps");
@@ -1096,6 +1102,28 @@ struct DvmNetworkCounters {
     rx_producer: u32,
     rx_consumer: u32,
     dvm_ready: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DvmInputCounters {
+    producer: u64,
+    consumer: u64,
+    flags: u32,
+}
+
+fn dvm_input_counters(path: &Path) -> Result<DvmInputCounters> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("open DVM shared input {}", path.display()))?;
+    let mut bytes = [0_u8; DvmInputRingHeader::encoded_len()];
+    file.read_exact(&mut bytes)
+        .with_context(|| format!("read DVM shared input header {}", path.display()))?;
+    let header = DvmInputRingHeader::decode(&bytes)
+        .context("DVM shared input header changed or became invalid during smoke")?;
+    Ok(DvmInputCounters {
+        producer: header.producer,
+        consumer: header.consumer,
+        flags: header.flags,
+    })
 }
 
 impl DvmNetworkCounters {
@@ -1683,6 +1711,7 @@ fn wait_for_parallel_boot(
             return Ok(control_ready.expect("checked above"));
         }
         if Instant::now() >= deadline {
+            let input = dvm_input_counters(&layout.dvm_input_ring)?;
             let missing_rustos = options
                 .expected_markers
                 .iter()
@@ -1690,7 +1719,7 @@ fn wait_for_parallel_boot(
                 .cloned()
                 .collect::<Vec<_>>();
             bail!(
-                "KVM parallel boot did not reach readiness within {:?}; RustOS missing={:?}; ui-fps-ready={}; dvm-display-ready={}; dvm-network-ready={}; dvm-network-traffic-ready={}; host-input-relay-pending={}; inspect {}, {}, {}, and {}",
+                "KVM parallel boot did not reach readiness within {:?}; RustOS missing={:?}; ui-fps-ready={}; dvm-display-ready={}; dvm-network-ready={}; dvm-network-traffic-ready={}; host-input-relay-pending={}; input-ring={}/{} flags={:#x}; network-ring={:?}; inspect {}, {}, {}, and {}",
                 options.timeout,
                 missing_rustos,
                 ui_fps_ready,
@@ -1698,6 +1727,10 @@ fn wait_for_parallel_boot(
                 dvm_network_ready,
                 dvm_network_traffic_ready,
                 control_ready.is_none(),
+                input.producer,
+                input.consumer,
+                input.flags,
+                dvm_network,
                 layout.debugcon_log.display(),
                 layout.dvm_serial_log.display(),
                 layout.rustos_stderr_log.display(),
@@ -2275,10 +2308,21 @@ mod tests {
         let options = parse_smoke_options(vec!["--dvm-network-shmem".into()].into_iter()).unwrap();
         assert!(options.dvm_network_shmem);
         let exercised = parse_smoke_options(
-            vec!["--dvm-network-shmem".into(), "--exercise-network".into()].into_iter(),
+            vec![
+                "--gui-dvm-surfaces".into(),
+                "--dvm-network-shmem".into(),
+                "--exercise-network".into(),
+            ]
+            .into_iter(),
         )
         .unwrap();
         assert!(exercised.exercise_network);
+        assert!(
+            parse_smoke_options(
+                vec!["--dvm-network-shmem".into(), "--exercise-network".into()].into_iter()
+            )
+            .is_err()
+        );
         assert!(parse_smoke_options(vec!["--exercise-network".into()].into_iter()).is_err());
     }
 

@@ -29,7 +29,6 @@
 id = "exampled"
 kind = "service"
 execution_domain = "user"
-profiles = ["default"]
 startup = "init"
 
 [build]
@@ -81,7 +80,6 @@ console_hosted = false
 id = "exampled"
 kind = "service"
 execution_domain = "user"
-profiles = ["default"]
 startup = "init"
 
 [build]

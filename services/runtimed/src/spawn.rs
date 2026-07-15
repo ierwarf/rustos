@@ -45,7 +45,13 @@ pub(super) fn spawn_tracked_process(
     } else {
         None
     };
-    let deferred_start = entry.exec == UI_SERVER_EXEC_PATH;
+    let is_ui_server = entry.exec == UI_SERVER_EXEC_PATH;
+    // Every catalog launch is a supervisor transaction: create the task in a
+    // start-suspended state, record its ownership below, then activate it.
+    // Letting ordinary apps become runnable before runtimed records the PID
+    // leaves an unsupervised window and gives the scheduler no safe post-reply
+    // handoff point under a busy UI/input IPC workload.
+    let deferred_start = true;
     let pid = match spawn_exec(
         entry.exec.as_str(),
         entry.args.as_slice(),
@@ -88,7 +94,7 @@ pub(super) fn spawn_tracked_process(
         )
         .as_str(),
     );
-    if entry.exec == UI_SERVER_EXEC_PATH {
+    if is_ui_server {
         if let Err(err) = report_rootd_service_lease(IPC_SERVICE_UISERVER, entry.exec.as_str(), pid)
         {
             // The child is still start-suspended, so it cannot race endpoint
@@ -97,17 +103,18 @@ pub(super) fn spawn_tracked_process(
             // retire it, then fail this launch closed.
             let _ = activate_spawned_process(pid);
             let _ = terminate_pid(pid);
+            release_failed_session(state, session_handle);
             return Err(err);
         }
-        activate_spawned_process(pid)?;
-        if let Err(err) = wait_for_service_endpoint(IPC_SERVICE_UISERVER, pid) {
-            let _ = terminate_pid(pid);
-            return Err(err);
-        }
-        boot_line(format!("runtimed: uiserver endpoint ready pid={pid}").as_str());
     }
-    state.retry_after.remove(entry.desktop_file_id.as_str());
+    let desktop_file_id = entry.desktop_file_id.clone();
     let inserted_session_handle = session_handle.unwrap_or(0);
+    if state.running.contains_key(&pid) {
+        let _ = activate_spawned_process(pid);
+        let _ = terminate_pid(pid);
+        release_failed_session(state, session_handle);
+        return Err(libc::EEXIST);
+    }
     state.running.insert(
         pid,
         RunningProcess {
@@ -120,6 +127,23 @@ pub(super) fn spawn_tracked_process(
             restart: entry.restart,
         },
     );
+
+    if let Err(err) = activate_spawned_process(pid) {
+        state.running.remove(&pid);
+        let _ = terminate_pid(pid);
+        release_failed_session(state, session_handle);
+        return Err(err);
+    }
+    if is_ui_server {
+        if let Err(err) = wait_for_service_endpoint(IPC_SERVICE_UISERVER, pid) {
+            state.running.remove(&pid);
+            let _ = terminate_pid(pid);
+            release_failed_session(state, session_handle);
+            return Err(err);
+        }
+        boot_line(format!("runtimed: uiserver endpoint ready pid={pid}").as_str());
+    }
+    state.retry_after.remove(desktop_file_id.as_str());
     if inserted_session_handle != 0 {
         let _ = ensure_console_fd(state)?;
         let _ = CONSOLE_SESSION_STATE_SPAWNING;
@@ -127,6 +151,17 @@ pub(super) fn spawn_tracked_process(
         super::session::focus_session_after_spawn(state, inserted_session_handle);
     }
     Ok(())
+}
+
+fn release_failed_session(state: &mut BrokerState, session_handle: Option<u64>) {
+    let Some(session) = session_handle else {
+        return;
+    };
+    state.session_runtime.remove_session(session);
+    super::session::clear_focused_session_if(state, session);
+    if let Ok(console_fd) = ensure_console_fd(state) {
+        let _ = close_console_session(console_fd, session);
+    }
 }
 
 fn report_rootd_service_lease(service_id: u64, exec_path: &str, pid: i32) -> Result<(), i32> {
@@ -370,7 +405,7 @@ fn activate_spawned_process(pid: i32) -> Result<(), i32> {
     if response.status != 0 {
         return Err(response.status);
     }
-    boot_line(format!("runtimed: activated uiserver pid={pid}").as_str());
+    boot_line(format!("runtimed: activated process pid={pid}").as_str());
     Ok(())
 }
 

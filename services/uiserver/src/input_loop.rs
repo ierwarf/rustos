@@ -1,20 +1,20 @@
 use std::os::fd::OwnedFd;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
+use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
 use runtime_control::RuntimeClient;
 
 use crate::app::{
-    AppState, INPUT_EVENT_BATCH, INPUT_PROCESS_BUDGET, InputProcessingResult,
-    MAX_INPUT_READ_BATCHES_PER_TICK, VisualUpdate,
+    AppState, InputProcessingResult, VisualUpdate, INPUT_EVENT_BATCH, INPUT_PROCESS_BUDGET,
+    MAX_INPUT_READ_BATCHES_PER_TICK,
 };
 use crate::profile;
 use crate::sys::{
-    INPUT_ACTION_NONE, INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION, InputEvent,
     boot_line, diag_line, read_input, require_background_thread_class, wait_for_input_ready,
+    InputEvent, INPUT_ACTION_NONE, INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION,
 };
 use crate::wayland::WaylandCompositor;
 
@@ -592,10 +592,10 @@ pub(crate) fn sleep_until_input_or(events: &InputReader, deadline: Instant) {
 
 #[cfg(test)]
 mod tests {
-    use super::{INPUT_EVENT_BATCH, InputReaderBatchCoalescer};
+    use super::{InputReaderBatchCoalescer, INPUT_EVENT_BATCH};
     use crate::sys::{
-        INPUT_ACTION_NONE, INPUT_ACTION_PRESSED, INPUT_KIND_KEYBOARD, INPUT_KIND_POINTER_MOTION,
-        INPUT_KIND_POINTER_POSITION, InputEvent,
+        InputEvent, INPUT_ACTION_NONE, INPUT_ACTION_PRESSED, INPUT_KIND_KEYBOARD,
+        INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION,
     };
 
     fn event(kind: u16, value0: i32, value1: i32) -> InputEvent {

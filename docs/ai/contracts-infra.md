@@ -9,14 +9,12 @@ Package/stage schemas, runtime control, kernel API, build, fault injection, logg
 - Manifest parsing is fail-closed: unknown top-level or nested fields fail the
   build. Retired `[boot]` metadata is not accepted; rootd/initd and generated
   registries are the boot-policy source of truth.
-- `external-copy` accepts plain files and `.zst` sources; `.zst` sources are
-  decompressed into the configured artifact path during build.
 
 ### Valid Enum Values
 
 | Field | Values |
 |-------|--------|
-| `kind` | `boot`, `kernel`, `user-driver`, `service`, `app`, `compat` |
+| `kind` | `kernel`, `service`, `app`, `compat` |
 | `execution_domain` | `kernel`, `user` |
 | `startup` | `none`, `init`, `session`, `desktop` |
 | `install.layout` | `file`, `directory` |
@@ -48,7 +46,6 @@ or launch policy.
 
 ### Registries
 
-- `system/registry/kernel/loadable-drivers.tsv`
 - `system/registry/system/desktop-programs.tsv`
 - `system/registry/system/runtime-launch-programs.tsv`
 - `system/registry/system/startup-programs.tsv`
@@ -120,7 +117,8 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
 ## Kernel Build
 
 - Kernel-target Cargo invocations route through `tools/xtask/src/build/cargo.rs::kernel_rustflags_env`.
-- Operational config: `config/rustos.toml`. Build-shape defaults: `[kernel.build]`. Set `KERNEL_BUILD_CONFIG` to test an alternate TOML file.
+- Operational config: `config/rustos.toml`. Build-shape defaults:
+  `[kernel.build]`. Set `RUSTOS_CONFIG` to test an alternate complete config.
 - Lock telemetry policy: `[lock_telemetry]`. `enabled=true` emits
   `rustos_lock_telemetry_enabled` for kernel crates and configures cycle
   thresholds through `RUSTOS_LOCK_TELEMETRY_WARN_WAIT_CYCLES` /
@@ -268,11 +266,13 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
 - The default KVM image contains no RustOS module artifact. RustOS has no
   direct GPU, network, USB, or PS/2 provider; the UI and network fail closed
   until their respective DVM transports validate.
-- `cargo xtask kvm-smoke --dvm-network-shmem` adds a host-created fixed 64-slot
+- `cargo xtask kvm-smoke --gui-dvm-surfaces --dvm-network-shmem` adds a
+  host-created fixed 64-slot
   Ethernet aperture. RustOS may map only the validated header and fixed slots;
   it never follows DVM descriptors or allocations. Linux's `rustos-dvm-net`
   relay owns the DVM virtio-net NIC, while RustOS `netd` keeps socket namespace,
-  TCP, and route policy. `--exercise-network` uses the private KVM copy of
+  TCP, and route policy. `--exercise-network` requires both topology flags,
+  uses the private KVM copy of
   `netprobe` against the QEMU gateway and requires both ring directions to
   advance within their 64-slot invariants. This proves the KVM data transport,
   not physical NIC passthrough, reset, DMA, or revocation policy.

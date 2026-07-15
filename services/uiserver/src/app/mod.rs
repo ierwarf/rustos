@@ -4,8 +4,8 @@ mod runtime;
 
 pub(crate) use bootstrap::start_launcher_program_loader;
 pub(crate) use runtime::{
-    ConsoleCommandDispatcher, ConsoleCommandSnapshot, start_console_command_dispatcher,
-    start_console_refresh_worker,
+    start_console_command_dispatcher, start_console_refresh_worker, ConsoleCommandDispatcher,
+    ConsoleCommandSnapshot,
 };
 
 use std::os::fd::OwnedFd;
@@ -18,7 +18,7 @@ use crate::canvas;
 use crate::cursor_sprites::CURSOR_SPRITE_MAX_DISTANCE;
 use crate::profile;
 use crate::sys::{
-    ConsoleSessionHandle, DisplayInfo, DisplaySurfaceCreate, SurfaceMapping, diag_line,
+    diag_line, ConsoleSessionHandle, DisplayInfo, DisplaySurfaceCreate, SurfaceMapping,
 };
 use crate::terminal::TerminalState;
 use crate::wayland::WaylandWindowSnapshot;

@@ -8,3 +8,4 @@ build = "build.rs"
 [dependencies]
 rustos-svc-runtime = { path = "../../libs/rustos-svc-runtime" }
 rustos-user-abi = { path = "../../libs/rustos-user-abi" }
+rustos-image-admission = { path = "../../libs/rustos-image-admission" }

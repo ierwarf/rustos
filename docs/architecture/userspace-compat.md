@@ -19,6 +19,7 @@ runtimed (or initd autostart)
   -> request_launch_path or spawn_exec
   -> loaderd (IPC_SERVICE_LOADERD)
        open executable, validate ELF, read program headers in one pread64
+       enforce the shared bounded/non-overlapping W^X + executable-entry gate
        SYS_RUSTOS_PROC_PREPARE_BROKER
        map main segments (+ interpreter if PT_INTERP)
        set Linux runtime broker on the prepared process
@@ -46,6 +47,7 @@ GUI apps are limited until the compositor adds the Win32 GDI bridge.
 runtimed
   -> loaderd
        open executable, validate DOS+PE+OPTIONAL_HEADER
+       read the bounded section table in one pread64 and enforce the same image gate
        load PE main image at default base
        load_system_dll_registry (system/registry/compat/windows-system-dlls.txt)
        preload system DLLs (ntdll, kernel32, kernelbase, msvcrt, ucrtbase, ...)
@@ -108,6 +110,7 @@ runtimed (또는 initd autostart)
   -> request_launch_path 또는 spawn_exec
   -> loaderd (IPC_SERVICE_LOADERD)
        executable open, ELF 검증, program header를 pread64 한 번으로 읽기
+       공통 주소 범위/비중첩/W^X/실행 진입점 gate 적용
        SYS_RUSTOS_PROC_PREPARE_BROKER
        main segment map (필요하면 PT_INTERP interpreter 포함)
        prepared process에 Linux runtime broker set
@@ -136,6 +139,7 @@ GUI app은 compositor에 Win32 GDI bridge가 들어오기 전까지 제한적입
 runtimed
   -> loaderd
        executable open, DOS+PE+OPTIONAL_HEADER 검증
+       bounded section table을 pread64 한 번으로 읽고 동일 image gate 적용
        PE main image를 default base에 load
        load_system_dll_registry (system/registry/compat/windows-system-dlls.txt)
        system DLL preload (ntdll, kernel32, kernelbase, msvcrt, ucrtbase, ...)

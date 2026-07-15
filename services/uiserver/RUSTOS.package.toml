@@ -1,7 +1,6 @@
 id = "uiserver"
 kind = "service"
 execution_domain = "user"
-profiles = ["default"]
 startup = "desktop"
 
 [build]

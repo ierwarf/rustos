@@ -42,6 +42,39 @@ An unmet mandatory item blocks release and remains an implementation task with
 an owner and a verification command. It must not be relabeled as a known issue,
 future enhancement, or acceptable transitional limitation.
 
+## Risk-ordered acceptance scope
+
+Run and report these lanes in order. A lower lane cannot compensate for an
+open higher lane, and a model name is not a pass unless its mapped source and
+runtime evidence also pass.
+
+| Priority | Release surface | Required implementation property | Canonical evidence |
+| --- | --- | --- | --- |
+| P0.1 | Linux ELF / Windows PE64 launch | `loaderd` owns raw parsing; the shared admission gate rejects overflow, out-of-window and overlapping regions, W+X, and non-executable main entries before any broker map. ELF/PE parser bytes, relocations, imports, and file-mutation behavior need adversarial source tests, not only a plan model. | `dual-abi-image-admission`, pinned Kani `rustos-image-admission` compositional proofs, `fuzz-host --target image-admission`, Linux and PE launch smokes |
+| P0.2 | Identity, capability, and namespace | Every endpoint, handle, ticket, broker call, and cross-domain request binds an L0/kernel-stamped subject plus exact destination and operation. A path, CID, DVM field, or service name cannot manufacture authority. | endpoint/publication/ownership, handle-transfer, proc/exec, DVM-control models plus denial/revoke/restart tests |
+| P0.3 | User memory and page tables | Every user-copy and map operation proves canonical range, page rounding, access direction, non-overlap, backing lifetime, and teardown. Kernel mappings never follow guest pointers. | source tests for `kernel-mm`/user-copy/brokers; dedicated page-table model remains mandatory |
+| P0.4 | Bounded lifecycle and IPC | Startup, readiness, reply, timeout, cancellation, crash, restart, and teardown converge on one terminal owner state. No core service or policy call can wait indefinitely or retain a stale capability. | rootd/endpoint/IPC deadline/wakeup models, fault injection, 30-second KVM gates |
+| P0.5 | DVM memory and device authority | Host-created apertures, IOMMU groups, MSI-X meanings, control secrets, epochs, and revocation are exact and disjoint. Display/input/network readiness never substitutes for authentication or trusted-attention evidence. | DVM fleet/control/ring/pixel/scanout models, `verify-dvm`, signed VFIO release tests, KVM transport exercises |
+| P1.1 | Scheduler and queue overload | Critical work has explicit admission, priority inheritance, bounded turns and queues, measurable wait/frame thresholds, and a guaranteed recovery/User share under flood. IRQ leaves policy and unbounded work to schedulable context. | scheduler admission/demotion/wakeup/IPC PI models, `kernel-ps` tests, UI profile and stall markers |
+| P1.2 | Storage and filesystem mutation | Boot substrate is descriptor/extent bounded; namespace, mount, metadata, and post-bootstrap storage policy stay in services. Power loss, partial write, media removal, and replay have explicit terminal results. | boot-volume model, manifest fuzz, storage fault tests; filesystem-content/crash-consistency model remains mandatory |
+| P1.3 | Network and message payloads | DVM Ethernet is only a bounded authenticated transport; `netd` owns socket policy, queue limits, cancellation, and peer namespaces. Payload length/checksum/fragment adversaries cannot escape their session. | DVM network models and KVM exercise; packet-payload and socket-backpressure models remain mandatory |
+| P1.4 | Display and input integrity | Only authenticated DVM ingress reaches inputd; UI policy never runs in IRQ context; scanout completion is a fence, not an ioctl return; queues coalesce only lossy motion and preserve edges. | input/display/scanout/frame-budget models and 60 FPS DVM profile gate |
+| P2 | Capacity, update, and operability | Boot time, steady-state CPU/memory/IO pressure, storage growth, update rollback, telemetry loss, and recovery budgets have published thresholds with reproducible collection commands. | bounded performance captures, pressure/latency counters, upgrade/rollback and long-duration soak gates |
+
+Current known release blockers must stay visible in `formal/COVERAGE.md` and
+`formal/CONFORMANCE.md`. Dedicated finite abstractions now exist for ELF/PE
+byte admission, page-table lifecycle, DMA-domain isolation, boot-file content,
+DVM Ethernet payloads, and bounded System-to-User dispatch. Pinned Kani now
+proves the compositional byte decoder, segment/section, entry, single-relocation,
+and single-import contracts, but not arbitrary-length table equivalence. These
+do not replace runtime fault evidence. Multi-block native loader corpora, target page-table/TLB checks,
+non-identity VT-d/IOMMU fault-and-revoke captures, corrupted-media recovery,
+network saturation/cancellation/backpressure plus physical-NIC captures, and
+multicore CPU-time measurements remain failed release gates until their
+evidence artifacts pass. The composite 30-second KVM GUI/input/netprobe gate is
+now a passing normal-path virtual-transport artifact; it does not waive those
+remaining fault and hardware gates.
+
 ## Architecture baselines
 
 These are acceptance baselines, not branding claims or a substitute for direct

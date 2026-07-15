@@ -4,7 +4,6 @@ use crate::Result;
 use crate::build;
 use crate::config::{self as config_mod, Config};
 use crate::kvm;
-use crate::ring3_inventory;
 use crate::stage;
 use crate::testinfra;
 use std::path::PathBuf;
@@ -39,22 +38,16 @@ enum XtaskCommand {
         corpus: Option<PathBuf>,
     },
     Stage,
-    #[command(name = "targets", visible_alias = "target")]
-    Targets,
     #[command(name = "build-efi")]
     BuildEfi,
     #[command(name = "build-kernel")]
     BuildKernel,
     #[command(name = "build-user")]
     BuildUser,
-    #[command(name = "build-console-demo")]
-    BuildConsoleDemo,
     #[command(name = "build-dvm")]
     BuildDvm,
     #[command(name = "verify-dvm")]
     VerifyDvm,
-    #[command(name = "ring3-inventory")]
-    Ring3Inventory,
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -91,14 +84,11 @@ pub(crate) fn run() -> Result<()> {
             corpus,
         }) => testinfra::fuzz_host(&config, &target, iterations, corpus.as_deref()),
         Some(XtaskCommand::Stage) => stage::stage(&config),
-        Some(XtaskCommand::Targets) => build::ensure_targets(&config),
         Some(XtaskCommand::BuildEfi) => build::build_efi(&config),
         Some(XtaskCommand::BuildKernel) => build::build_nucleus(&config),
         Some(XtaskCommand::BuildUser) => build::build_user(&config),
-        Some(XtaskCommand::BuildConsoleDemo) => build::build_console_demo(&config),
         Some(XtaskCommand::BuildDvm) => kvm::build_dvm_command(&config),
         Some(XtaskCommand::VerifyDvm) => kvm::verify_dvm_command(&config),
-        Some(XtaskCommand::Ring3Inventory) => ring3_inventory::print_inventory(&config),
         Some(XtaskCommand::Config { command }) => match command {
             ConfigCommand::Check => config_mod::check(&config),
             ConfigCommand::Show => config_mod::show(&config),

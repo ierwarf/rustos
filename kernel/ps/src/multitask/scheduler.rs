@@ -134,8 +134,9 @@ const MAX_CONSECUTIVE_SYSTEM_DISPATCHES: u8 = 8;
 enum SchedClass {
     /// Kernel-mode tasks (root during boot, housekeeping, kernel workers)
     /// and user-mode services admitted with `TASK_WEIGHT_INTERACTIVE_FLAG`.
-    /// Current owners are uiserver and inputd; ordinary policy brokers stay
-    /// in User even when their CFS share is numerically larger.
+    /// Current owners are uiserver, inputd, and rootd's immutable core-service
+    /// manifest. Ordinary packages and dynamic policy metadata stay in User
+    /// even when their CFS share is numerically larger.
     System = 0,
     /// Default class for user-spawned applications (`apps/*`) and services
     /// that have not opted into System latency. Runs when no System task is
@@ -144,6 +145,18 @@ enum SchedClass {
     /// The root halt loop after `mark_root_idle()`. Picked only as the last
     /// resort fallback when literally nothing else is ready.
     Idle = 2,
+}
+
+impl SchedClass {
+    const COUNT: usize = 3;
+
+    const fn index(self) -> usize {
+        match self {
+            Self::System => 0,
+            Self::User => 1,
+            Self::Idle => 2,
+        }
+    }
 }
 
 pub(super) struct CurrentLinuxThreadBinding {
@@ -951,22 +964,77 @@ impl Scheduler {
     /// any class (including the current task and root) — in which case
     /// `dispatch_schedule` falls back to ROOT_TASK_SLOT.
     fn pick_min_vruntime(&self, current: usize) -> Option<usize> {
-        // Order matters: must walk in `SchedClass::Ord` (System=0 first).
-        for class in [SchedClass::System, SchedClass::User, SchedClass::Idle] {
-            if let Some(slot) = self.pick_min_vruntime_in_class(current, class) {
-                return Some(slot);
+        // Keep one candidate per priority band in a single fixed-table scan.
+        // The previous implementation rescanned all 128 slots once per empty
+        // higher band; because class resolution also walks live IPC donations,
+        // an ordinary User-only workload paid up to three full classification
+        // passes on every timer tick.
+        let mut best_by_class = [None::<(usize, u64)>; SchedClass::COUNT];
+        for slot in 0..MAX_TASK {
+            if !self.is_fair_candidate_slot(slot) {
+                continue;
+            }
+            let Some(context) = self.contexts[slot] else {
+                continue;
+            };
+            if !context.ready || !self.context_is_schedulable(slot, context) {
+                continue;
+            }
+            let Some(class) = self.slot_class(slot) else {
+                continue;
+            };
+            let key = if slot == current {
+                context.vruntime_ns.saturating_add(1)
+            } else {
+                context.vruntime_ns
+            };
+            let candidate = &mut best_by_class[class.index()];
+            if candidate
+                .map(|(_, best_key)| key < best_key)
+                .unwrap_or(true)
+            {
+                *candidate = Some((slot, key));
             }
         }
-        None
+        best_by_class
+            .into_iter()
+            .flatten()
+            .next()
+            .map(|(slot, _)| slot)
     }
 
     fn pick_min_vruntime_excluding(&self, excluded: usize) -> Option<usize> {
-        for class in [SchedClass::System, SchedClass::User, SchedClass::Idle] {
-            if let Some(slot) = self.pick_min_vruntime_in_class_excluding(excluded, class) {
-                return Some(slot);
+        let mut best_by_class = [None::<(usize, u64, usize)>; SchedClass::COUNT];
+        for slot in 0..MAX_TASK {
+            if slot == excluded || !self.is_fair_candidate_slot(slot) {
+                continue;
+            }
+            let Some(context) = self.contexts[slot] else {
+                continue;
+            };
+            if !context.ready || !self.context_is_schedulable(slot, context) {
+                continue;
+            }
+            let Some(class) = self.slot_class(slot) else {
+                continue;
+            };
+            let distance = (slot + MAX_TASK - excluded) % MAX_TASK;
+            let candidate = &mut best_by_class[class.index()];
+            if candidate
+                .map(|(_, best_vruntime, best_distance)| {
+                    context.vruntime_ns < best_vruntime
+                        || (context.vruntime_ns == best_vruntime && distance < best_distance)
+                })
+                .unwrap_or(true)
+            {
+                *candidate = Some((slot, context.vruntime_ns, distance));
             }
         }
-        None
+        best_by_class
+            .into_iter()
+            .flatten()
+            .next()
+            .map(|(slot, _, _)| slot)
     }
 
     /// Returns one ready User task after a bounded System burst. The selected
@@ -1044,40 +1112,6 @@ impl Scheduler {
         }
         context.weight &= LOAD_WEIGHT_MASK;
         true
-    }
-
-    fn pick_min_vruntime_in_class_excluding(
-        &self,
-        excluded: usize,
-        class: SchedClass,
-    ) -> Option<usize> {
-        let mut best: Option<(usize, u64, usize)> = None;
-        for slot in 0..MAX_TASK {
-            if slot == excluded || !self.is_fair_candidate_slot(slot) {
-                continue;
-            }
-            let Some(ctx) = self.contexts[slot] else {
-                continue;
-            };
-            if !ctx.ready || !self.context_is_schedulable(slot, ctx) {
-                continue;
-            }
-            if self.slot_class(slot) != Some(class) {
-                continue;
-            }
-            let distance = (slot + MAX_TASK - excluded) % MAX_TASK;
-            match best {
-                None => best = Some((slot, ctx.vruntime_ns, distance)),
-                Some((_, best_vruntime, best_distance))
-                    if ctx.vruntime_ns < best_vruntime
-                        || (ctx.vruntime_ns == best_vruntime && distance < best_distance) =>
-                {
-                    best = Some((slot, ctx.vruntime_ns, distance));
-                }
-                _ => {}
-            }
-        }
-        best.map(|(slot, _, _)| slot)
     }
 
     /// Picks the schedulable task with the smallest vruntime within a single
@@ -3012,7 +3046,15 @@ impl Scheduler {
             return false;
         }
         self.start_suspended[slot] = false;
-        self.wake_task_slot(slot)
+        if !self.wake_task_slot(slot) {
+            return false;
+        }
+        // Activation is the supervisor's commit point. A distinct one-shot
+        // spawn hint gives the newly owned task its first turn after the
+        // loader/supervisor reply chain without letting an earlier create
+        // race supervision. Generic IPC reply hints cannot overwrite it.
+        self.set_next_spawn_pick_hint(task_id);
+        true
     }
 
     pub(super) fn terminate_user_task(
@@ -3835,13 +3877,12 @@ mod tests {
         }
 
         assert!(scheduler.activate_suspended_user_task(802));
-        assert!(scheduler.activate_suspended_user_task(803));
-
-        scheduler.set_next_spawn_pick_hint(802);
-        scheduler.set_next_pick_hint(803);
-
         assert_eq!(scheduler.take_next_spawn_pick_hint_ready_slot(), Some(2));
         assert_eq!(scheduler.take_next_spawn_pick_hint_ready_slot(), None);
-        assert_eq!(scheduler.take_next_pick_hint_ready_slot(), Some(3));
+
+        assert!(scheduler.activate_suspended_user_task(803));
+        scheduler.set_next_pick_hint(802);
+        assert_eq!(scheduler.take_next_spawn_pick_hint_ready_slot(), Some(3));
+        assert_eq!(scheduler.take_next_pick_hint_ready_slot(), Some(2));
     }
 }

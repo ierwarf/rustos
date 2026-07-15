@@ -1214,7 +1214,11 @@ fn copy_file_into_address_space(
             .map_err(address_space_error_to_linux_errno)?;
         copied += read;
     }
-    Ok(())
+    validate_complete_file_copy(total, copied)
+}
+
+fn validate_complete_file_copy(expected: usize, copied: usize) -> Result<(), i64> {
+    (copied == expected).then_some(()).ok_or(LINUX_EIO)
 }
 
 fn validate_file_mapping_len(mem_len: u64, file_len: u64) -> Result<(), i64> {
@@ -1455,5 +1459,12 @@ mod tests {
         assert_eq!(validate_file_mapping_len(4096, 4096), Ok(()));
         assert_eq!(validate_file_mapping_len(4096, 0), Ok(()));
         assert_eq!(validate_file_mapping_len(4096, 4097), Err(LINUX_EINVAL));
+    }
+
+    #[test]
+    fn truncated_file_mapping_never_commits_zero_filled_tail() {
+        assert_eq!(validate_complete_file_copy(4096, 4096), Ok(()));
+        assert_eq!(validate_complete_file_copy(4096, 4095), Err(LINUX_EIO));
+        assert_eq!(validate_complete_file_copy(1, 0), Err(LINUX_EIO));
     }
 }

@@ -10,14 +10,19 @@ use crate::kvm::validate_dvm_manifest_text_for_testinfra;
 use crate::package_manifest::validate_manifest_text_for_testinfra;
 use crate::util::run_command;
 use rustos_driver_domain_host::{DriverDomainPolicy, LaunchPlan};
+use rustos_image_admission::{
+    ELF64_HEADER_SIZE, ImageRegion, PE64_DOS_HEADER_SIZE, PE64_FILE_HEADER_SIZE, admit_elf64_image,
+    admit_image, admit_pe64_image_headers, apply_pe64_base_relocations, validate_pe64_import_table,
+};
 
 pub(crate) fn selftest(config: &Config) -> Result<()> {
     for package in [
         "rustos-fault-injection",
         "rustos-driver-domain-host",
+        "rustos-image-admission",
         "rustos-user-abi",
         "runtime-control",
-        "module-tests",
+        "contract-tests",
         "xtask",
     ] {
         let mut command = Command::new(&config.cargo);
@@ -48,12 +53,14 @@ pub(crate) fn fuzz_host(
             FuzzTarget::PackageManifest,
             FuzzTarget::DvmManifest,
             FuzzTarget::HostdLaunchPlan,
+            FuzzTarget::ImageAdmission,
         ],
         "fault-rules" => vec![FuzzTarget::FaultRules],
         "project-config" => vec![FuzzTarget::ProjectConfig],
         "package-manifest" => vec![FuzzTarget::PackageManifest],
         "dvm-manifest" => vec![FuzzTarget::DvmManifest],
         "hostd-launch-plan" => vec![FuzzTarget::HostdLaunchPlan],
+        "image-admission" => vec![FuzzTarget::ImageAdmission],
         other => bail!("unknown fuzz target: {other}"),
     };
 
@@ -70,6 +77,7 @@ enum FuzzTarget {
     PackageManifest,
     DvmManifest,
     HostdLaunchPlan,
+    ImageAdmission,
 }
 
 impl FuzzTarget {
@@ -80,6 +88,7 @@ impl FuzzTarget {
             Self::PackageManifest => "package-manifest",
             Self::DvmManifest => "dvm-manifest",
             Self::HostdLaunchPlan => "hostd-launch-plan",
+            Self::ImageAdmission => "image-admission",
         }
     }
 }
@@ -158,7 +167,94 @@ fn default_seeds(target: FuzzTarget) -> Vec<Vec<u8>> {
             b"DRIVER_DOMAIN_POLICY_SCHEMA=1\nDOMAIN_ID=linux-dvm-net0\nINPUT_TRANSPORT=input-ring-msix\nNETWORK_TRANSPORT=disabled\nBLOCK_TRANSPORT=disabled\nDISPLAY_TRANSPORT=disabled\n".to_vec(),
             b"LAUNCH_PLAN_SCHEMA=1\nLAUNCH_PLAN_SCHEMA=1\n".to_vec(),
         ],
+        FuzzTarget::ImageAdmission => vec![
+            vec![
+                0x05, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ],
+            vec![0xff; 34],
+            valid_elf64_fuzz_seed(),
+            valid_pe64_fuzz_seed(),
+            valid_pe64_relocation_fuzz_seed(),
+            valid_pe64_import_fuzz_seed(),
+        ],
     }
+}
+
+fn valid_elf64_fuzz_seed() -> Vec<u8> {
+    let mut bytes = vec![0_u8; ELF64_HEADER_SIZE + 56];
+    bytes[0..4].copy_from_slice(b"\x7fELF");
+    bytes[4] = 2;
+    bytes[5] = 1;
+    bytes[6] = 1;
+    bytes[16..18].copy_from_slice(&2_u16.to_le_bytes());
+    bytes[18..20].copy_from_slice(&62_u16.to_le_bytes());
+    bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
+    bytes[24..32].copy_from_slice(&0x2100_u64.to_le_bytes());
+    bytes[32..40].copy_from_slice(&(ELF64_HEADER_SIZE as u64).to_le_bytes());
+    bytes[52..54].copy_from_slice(&(ELF64_HEADER_SIZE as u16).to_le_bytes());
+    bytes[54..56].copy_from_slice(&56_u16.to_le_bytes());
+    bytes[56..58].copy_from_slice(&1_u16.to_le_bytes());
+    let ph = ELF64_HEADER_SIZE;
+    bytes[ph..ph + 4].copy_from_slice(&1_u32.to_le_bytes());
+    bytes[ph + 4..ph + 8].copy_from_slice(&5_u32.to_le_bytes());
+    bytes[ph + 16..ph + 24].copy_from_slice(&0x2000_u64.to_le_bytes());
+    bytes[ph + 32..ph + 40].copy_from_slice(&0x100_u64.to_le_bytes());
+    bytes[ph + 40..ph + 48].copy_from_slice(&0x1000_u64.to_le_bytes());
+    bytes[ph + 48..ph + 56].copy_from_slice(&0x1000_u64.to_le_bytes());
+    bytes
+}
+
+fn valid_pe64_fuzz_seed() -> Vec<u8> {
+    const OPTIONAL_BYTES: usize = 241;
+    let mut bytes = vec![0_u8; PE64_DOS_HEADER_SIZE + PE64_FILE_HEADER_SIZE + OPTIONAL_BYTES + 40];
+    bytes[0..2].copy_from_slice(b"MZ");
+    bytes[0x3c..0x40].copy_from_slice(&0x80_u32.to_le_bytes());
+    let file = PE64_DOS_HEADER_SIZE;
+    bytes[file..file + 4].copy_from_slice(b"PE\0\0");
+    bytes[file + 4..file + 6].copy_from_slice(&0x8664_u16.to_le_bytes());
+    bytes[file + 6..file + 8].copy_from_slice(&1_u16.to_le_bytes());
+    bytes[file + 20..file + 22].copy_from_slice(&(OPTIONAL_BYTES as u16).to_le_bytes());
+    let optional = file + PE64_FILE_HEADER_SIZE;
+    bytes[optional..optional + 2].copy_from_slice(&0x20b_u16.to_le_bytes());
+    bytes[optional + 16..optional + 20].copy_from_slice(&0x1000_u32.to_le_bytes());
+    bytes[optional + 24..optional + 32].copy_from_slice(&0x400000_u64.to_le_bytes());
+    bytes[optional + 32..optional + 36].copy_from_slice(&0x1000_u32.to_le_bytes());
+    bytes[optional + 36..optional + 40].copy_from_slice(&0x200_u32.to_le_bytes());
+    bytes[optional + 56..optional + 60].copy_from_slice(&0x2000_u32.to_le_bytes());
+    bytes[optional + 60..optional + 64].copy_from_slice(&0x200_u32.to_le_bytes());
+    bytes[optional + 108..optional + 112].copy_from_slice(&16_u32.to_le_bytes());
+    let section = optional + OPTIONAL_BYTES;
+    bytes[section + 8..section + 12].copy_from_slice(&0x1000_u32.to_le_bytes());
+    bytes[section + 12..section + 16].copy_from_slice(&0x1000_u32.to_le_bytes());
+    bytes[section + 16..section + 20].copy_from_slice(&0x200_u32.to_le_bytes());
+    bytes[section + 20..section + 24].copy_from_slice(&0x200_u32.to_le_bytes());
+    bytes[section + 36..section + 40].copy_from_slice(&0x6000_0000_u32.to_le_bytes());
+    bytes
+}
+
+fn valid_pe64_relocation_fuzz_seed() -> Vec<u8> {
+    let mut bytes = vec![0_u8; 256];
+    bytes[0..4].copy_from_slice(&0x20_u32.to_le_bytes());
+    bytes[4..8].copy_from_slice(&10_u32.to_le_bytes());
+    bytes[0x20..0x24].copy_from_slice(&0_u32.to_le_bytes());
+    bytes[0x24..0x28].copy_from_slice(&10_u32.to_le_bytes());
+    bytes[0x28..0x2a].copy_from_slice(&0xa080_u16.to_le_bytes());
+    bytes[0x80..0x88].copy_from_slice(&0x400000_u64.to_le_bytes());
+    bytes
+}
+
+fn valid_pe64_import_fuzz_seed() -> Vec<u8> {
+    let mut bytes = vec![0_u8; 256];
+    bytes[0..4].copy_from_slice(&0x20_u32.to_le_bytes());
+    bytes[4..8].copy_from_slice(&40_u32.to_le_bytes());
+    bytes[0x20..0x24].copy_from_slice(&0xa0_u32.to_le_bytes());
+    bytes[0x2c..0x30].copy_from_slice(&0x80_u32.to_le_bytes());
+    bytes[0x30..0x34].copy_from_slice(&0xb0_u32.to_le_bytes());
+    bytes[0x80..0x89].copy_from_slice(b"test.dll\0");
+    bytes[0xa0..0xa8].copy_from_slice(&0xc0_u64.to_le_bytes());
+    bytes[0xc2..0xc7].copy_from_slice(b"Func\0");
+    bytes
 }
 
 fn exercise_target(target: FuzzTarget, bytes: &[u8]) {
@@ -180,7 +276,76 @@ fn exercise_target(target: FuzzTarget, bytes: &[u8]) {
             let _ = LaunchPlan::parse(&text, "fuzz-host");
             let _ = DriverDomainPolicy::parse(&text, "fuzz-host");
         }
+        FuzzTarget::ImageAdmission => exercise_image_admission(bytes),
     }
+}
+
+fn exercise_image_admission(bytes: &[u8]) {
+    let mut regions = Vec::new();
+    for chunk in bytes.chunks_exact(17).take(128) {
+        regions.push(ImageRegion {
+            flags: chunk[0],
+            start: u64::from_le_bytes(chunk[1..9].try_into().unwrap()),
+            len: u64::from_le_bytes(chunk[9..17].try_into().unwrap()),
+        });
+    }
+    let entry_point = bytes
+        .get(..8)
+        .map(|value| u64::from_le_bytes(value.try_into().unwrap()))
+        .unwrap_or(0);
+    let _ = admit_image(
+        entry_point,
+        &regions,
+        0x1000,
+        0x1_0000,
+        bytes.len() % 2 == 0,
+    );
+
+    let mut elf_header = [0_u8; ELF64_HEADER_SIZE];
+    let elf_header_len = bytes.len().min(elf_header.len());
+    elf_header[..elf_header_len].copy_from_slice(&bytes[..elf_header_len]);
+    let elf_program_headers = bytes.get(ELF64_HEADER_SIZE..).unwrap_or_default();
+    let _ = admit_elf64_image(&elf_header, elf_program_headers, 0x400000, 0x1000, 0x800000);
+
+    let mut dos_header = [0_u8; PE64_DOS_HEADER_SIZE];
+    let dos_len = bytes.len().min(dos_header.len());
+    dos_header[..dos_len].copy_from_slice(&bytes[..dos_len]);
+    let mut file_header = [0_u8; PE64_FILE_HEADER_SIZE];
+    if let Some(file_bytes) = bytes.get(PE64_DOS_HEADER_SIZE..) {
+        let file_len = file_bytes.len().min(file_header.len());
+        file_header[..file_len].copy_from_slice(&file_bytes[..file_len]);
+    }
+    let optional_start = PE64_DOS_HEADER_SIZE + PE64_FILE_HEADER_SIZE;
+    let optional_size = usize::from(u16::from_le_bytes([file_header[20], file_header[21]]));
+    let optional_end = optional_start
+        .checked_add(optional_size)
+        .filter(|end| *end <= bytes.len())
+        .unwrap_or(bytes.len());
+    let optional_header = bytes.get(optional_start..optional_end).unwrap_or_default();
+    let section_headers = bytes.get(optional_end..).unwrap_or_default();
+    let _ = admit_pe64_image_headers(
+        &dos_header,
+        &file_header,
+        optional_header,
+        section_headers,
+        0x400000,
+        0x1000,
+        0x800000,
+        128 * 1024 * 1024,
+        bytes.len() % 2 == 0,
+    );
+
+    let mut image = bytes.iter().copied().take(64 * 1024).collect::<Vec<_>>();
+    let reloc_rva = bytes
+        .get(..4)
+        .map(|raw| u32::from_le_bytes(raw.try_into().unwrap()))
+        .unwrap_or(0);
+    let reloc_size = bytes
+        .get(4..8)
+        .map(|raw| u32::from_le_bytes(raw.try_into().unwrap()))
+        .unwrap_or(0);
+    let _ = apply_pe64_base_relocations(&mut image, 0x400000, 0x500000, reloc_rva, reloc_size, 0);
+    let _ = validate_pe64_import_table(&image, reloc_rva, reloc_size, 65_536);
 }
 
 fn mutate(seed: &[u8], index: usize, state: &mut u64) -> Vec<u8> {

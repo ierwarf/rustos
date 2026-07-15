@@ -1,7 +1,6 @@
 id = "userdemo2"
 kind = "app"
 execution_domain = "user"
-profiles = ["default"]
 startup = "none"
 
 [build]

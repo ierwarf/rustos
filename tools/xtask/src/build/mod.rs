@@ -1,20 +1,17 @@
 use anyhow::{Context, anyhow, bail};
 use fs_err as fs;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::Result;
 use crate::config::Config;
 use crate::layering::validate_workspace_layering;
-use crate::package_manifest::{
-    BuilderKind, PackageManifest, load_default_manifests, required_manifest,
-};
+use crate::package_manifest::{BuilderKind, PackageManifest, load_manifests, required_manifest};
 use crate::stage;
 use crate::util::{
-    command_in_path, copy_with_parent, create_temp_dir, output_is_fresh, outputs_are_fresh,
-    remove_dir_if_exists, remove_file_if_exists, run_command,
+    copy_with_parent, create_temp_dir, output_is_fresh, outputs_are_fresh, remove_dir_if_exists,
+    remove_file_if_exists, run_command,
 };
 
 mod cargo;
@@ -31,36 +28,18 @@ struct GrubSigningMaterial {
 
 pub(crate) fn build(config: &Config) -> Result<()> {
     validate_workspace_layering(&config.root_dir)?;
-    let manifests = load_default_manifests(&config.root_dir)?;
+    let manifests = load_manifests(&config.root_dir)?;
     ensure_targets(config)?;
-    let winsys_root = required_manifest(&manifests, "winsys")?
-        .package_root
-        .clone();
-    validate_winsys_export_contracts(winsys_root.as_path())?;
     build_nucleus(config)?;
     build_efi(config)?;
-    build_manifests_matching(config, &manifests, |manifest| {
-        matches!(
-            manifest.build.builder,
-            BuilderKind::CargoKernelBinary | BuilderKind::MingwCExe
-        )
-    })?;
-    build_manifests_matching(config, &manifests, |manifest| {
-        matches!(manifest.build.builder, BuilderKind::WinsysDllBundle)
-    })?;
-    build_manifests_matching(config, &manifests, |manifest| {
-        matches!(
-            manifest.build.builder,
-            BuilderKind::CDemo | BuilderKind::ExternalCopy
-        )
-    })?;
+    build_userspace_manifests(config, &manifests)?;
     stage::stage(config)?;
     Ok(())
 }
 
 pub(crate) fn check(config: &Config) -> Result<()> {
     validate_workspace_layering(&config.root_dir)?;
-    let manifests = load_default_manifests(&config.root_dir)?;
+    let manifests = load_manifests(&config.root_dir)?;
     ensure_targets(config)?;
 
     run_cargo_kernel_check(config, &config.nucleus_package)?;
@@ -149,7 +128,7 @@ pub(crate) fn clean(config: &Config) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn ensure_targets(config: &Config) -> Result<()> {
+fn ensure_targets(config: &Config) -> Result<()> {
     let mut command = Command::new(&config.rustup);
     command.arg("target").arg("add").arg(&config.kernel_target);
     run_command(&mut command)
@@ -394,18 +373,24 @@ fn export_grub_pubkey(
 }
 
 pub(crate) fn build_user(config: &Config) -> Result<()> {
-    let manifests = load_default_manifests(&config.root_dir)?;
-    build_manifests_matching(config, &manifests, |manifest| {
+    let manifests = load_manifests(&config.root_dir)?;
+    ensure_targets(config)?;
+    build_userspace_manifests(config, &manifests)
+}
+
+fn build_userspace_manifests(config: &Config, manifests: &[PackageManifest]) -> Result<()> {
+    let winsys_root = required_manifest(manifests, "winsys")?.package_root.clone();
+    validate_winsys_export_contracts(winsys_root.as_path())?;
+    build_manifests_matching(config, manifests, |manifest| {
         matches!(
             manifest.build.builder,
             BuilderKind::CargoKernelBinary | BuilderKind::MingwCExe
         )
-    })
-}
-
-pub(crate) fn build_console_demo(config: &Config) -> Result<()> {
-    let manifests = load_default_manifests(&config.root_dir)?;
-    build_manifests_matching(config, &manifests, |manifest| {
+    })?;
+    build_manifests_matching(config, manifests, |manifest| {
+        matches!(manifest.build.builder, BuilderKind::WinsysDllBundle)
+    })?;
+    build_manifests_matching(config, manifests, |manifest| {
         matches!(manifest.build.builder, BuilderKind::CDemo)
     })
 }
@@ -522,13 +507,11 @@ fn build_manifests_matching(
 
 fn build_manifest(config: &Config, manifest: &PackageManifest) -> Result<()> {
     match manifest.build.builder {
-        BuilderKind::BootloaderUefi => build_efi(config),
         BuilderKind::KernelRustc => build_nucleus(config),
         BuilderKind::CargoKernelBinary => build_cargo_kernel_binary(config, manifest),
         BuilderKind::MingwCExe => build_mingw_c_exe(config, manifest),
         BuilderKind::CDemo => build_c_demo_manifest(config, manifest),
         BuilderKind::WinsysDllBundle => build_windows_system_dlls(config, manifest),
-        BuilderKind::ExternalCopy => build_external_copy_manifest(config, manifest),
     }
 }
 
@@ -660,7 +643,7 @@ fn build_mingw_c_exe(config: &Config, manifest: &PackageManifest) -> Result<()> 
             .arg(&source),
     )?;
     if manifest.id == "userdemo2" {
-        let winsys_root = required_manifest(&load_default_manifests(&config.root_dir)?, "winsys")?
+        let winsys_root = required_manifest(&load_manifests(&config.root_dir)?, "winsys")?
             .package_root
             .clone();
         audit_userdemo2_imports_for_path(config, winsys_root.as_path(), &output)?;
@@ -683,70 +666,6 @@ fn build_c_demo_manifest(config: &Config, manifest: &PackageManifest) -> Result<
         return Ok(());
     }
     build_c_demo(&config.cc, &source, &output, &extra_args)
-}
-
-fn build_external_copy_manifest(config: &Config, manifest: &PackageManifest) -> Result<()> {
-    let source = resolve_external_copy_source(config, manifest);
-    let artifact = manifest.artifact_path(config);
-    if let Some(source) = source.filter(|path| path.is_file()) {
-        if manifest.build.source_env.is_none() {
-            let inputs = vec![source.clone(), manifest.manifest_path.clone()];
-            if output_is_fresh(&artifact, &inputs)? {
-                return Ok(());
-            }
-        }
-        remove_file_if_exists(&artifact)?;
-        copy_external_copy_source(&source, &artifact)?;
-    } else if !manifest.build.optional {
-        bail!(
-            "required external package {} is missing source file",
-            manifest.id
-        );
-    } else {
-        eprintln!(
-            "xtask: warning: optional vendor module not found: {}",
-            manifest.id
-        );
-    }
-    Ok(())
-}
-
-fn copy_external_copy_source(source: &Path, artifact: &Path) -> Result<()> {
-    if source.extension().and_then(|ext| ext.to_str()) != Some("zst") {
-        return copy_with_parent(source, artifact);
-    }
-    let parent = artifact
-        .parent()
-        .with_context(|| format!("artifact destination has no parent: {}", artifact.display()))?;
-    fs::create_dir_all(parent)?;
-    let zstd = command_in_path("zstd").context("missing zstd to unpack external .zst artifact")?;
-    let output = File::create(artifact)
-        .with_context(|| format!("failed to create {}", artifact.display()))?;
-    let status = Command::new(zstd)
-        .arg("-dc")
-        .arg(source)
-        .stdout(Stdio::from(output))
-        .status()
-        .with_context(|| format!("failed to run zstd for {}", source.display()))?;
-    if !status.success() {
-        bail!("failed to unpack {}", source.display());
-    }
-    Ok(())
-}
-
-fn resolve_external_copy_source(config: &Config, manifest: &PackageManifest) -> Option<PathBuf> {
-    manifest
-        .build
-        .source_env
-        .as_deref()
-        .and_then(crate::util::env_path)
-        .or_else(|| {
-            manifest
-                .build
-                .source
-                .as_ref()
-                .map(|path| config.root_dir.join(path))
-        })
 }
 
 fn build_c_demo(
@@ -782,7 +701,12 @@ fn audit_userdemo2_imports_for_path(
         bail!("objdump failed for {}", executable.display());
     }
 
-    fs::write(config.userdemo2_import_audit_log_path(), &output.stdout)?;
+    let audit_path = config.userdemo2_import_audit_log_path();
+    let audit_parent = audit_path
+        .parent()
+        .with_context(|| format!("import audit path has no parent: {}", audit_path.display()))?;
+    fs::create_dir_all(audit_parent)?;
+    fs::write(&audit_path, &output.stdout)?;
     let text = String::from_utf8_lossy(&output.stdout);
     let imports = parse_objdump_imports(text.as_ref());
     validate_imports_exported_by_winsys(winsys_root, &imports)?;

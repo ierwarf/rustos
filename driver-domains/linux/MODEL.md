@@ -6,7 +6,7 @@ owner.
 
 ```text
 RustOS KVM guest           Linux DVM KVM guest
-driverd / netd / storaged  Linux LTS + firmware + supported .ko
+inputd/netd/uiserver       Linux LTS + firmware + supported .ko
           |                          |
           +---- L0 versioned brokers -+
                                       PCI-assigned IOMMU group

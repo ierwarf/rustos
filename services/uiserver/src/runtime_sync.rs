@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use runtime_control::{RuntimeClient, RuntimeRunningProgram, decode_c_string};
+use runtime_control::{decode_c_string, RuntimeClient, RuntimeRunningProgram};
 
 use crate::app::{HIDDEN_RUNTIME_PROGRAM_TITLES, MAX_RUNNING_PROGRAMS};
 use crate::sys::require_background_thread_class;

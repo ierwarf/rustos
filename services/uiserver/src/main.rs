@@ -12,19 +12,19 @@ mod sys;
 mod terminal;
 mod wayland;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use app::{
-    AppState, CONSOLE_POLL_SLEEP, CURSOR_BLINK_INTERVAL, CURSOR_MOTION_SETTLE_INTERVAL,
-    RUNTIME_POLL_SLEEP, VisualUpdate, start_console_refresh_worker, start_launcher_program_loader,
+    start_console_refresh_worker, start_launcher_program_loader, AppState, VisualUpdate,
+    CONSOLE_POLL_SLEEP, CURSOR_BLINK_INTERVAL, CURSOR_MOTION_SETTLE_INTERVAL, RUNTIME_POLL_SLEEP,
 };
 use render::start_desktop_background_loader;
 use render::{render_boot_frame, render_debug_white_box, render_frame, render_rect};
 use runtime_control::RuntimeClient;
-use runtime_sync::{RuntimeState, refresh_runtime_state, start_runtime_sync};
+use runtime_sync::{refresh_runtime_state, start_runtime_sync, RuntimeState};
 use sys::{
     background_thread_demotion_count, boot_line, boot_trace_enabled, diag_line, heartbeat_line,
     profile_line, require_background_thread_class,

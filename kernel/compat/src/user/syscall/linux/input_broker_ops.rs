@@ -123,6 +123,16 @@ pub(super) fn syscall_linux_rustos_input_wait_broker() -> u64 {
             let _ = multitask::cancel_block_current_task();
             return linux_errno(LINUX_EBUSY);
         }
+        // This capability check plus the successfully armed single waiter is
+        // the input-ring consumer admission point. Publishing readiness from
+        // an application's poll path creates a boot cycle: L0 waits for the
+        // flag before producing, while no app is required to poll during
+        // bootstrap. Fail closed if the DVM aperture cannot be admitted.
+        if !kernel_io_manager::api::input::mark_dvm_policy_consumer_ready() {
+            kernel_io_manager::api::input::event_queue::disarm_inputd_ingestion_waiter(task_id);
+            let _ = multitask::cancel_block_current_task();
+            return linux_errno(LINUX_ENODEV);
+        }
         // Close the interrupt→wait registration race. A producer that commits
         // after the first check must either wake this task or be observed here.
         if kernel_io_manager::api::input::event_queue::has_pending_input_events() {

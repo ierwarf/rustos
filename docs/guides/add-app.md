@@ -27,7 +27,6 @@
 id = "example-app"
 kind = "app"
 execution_domain = "user"
-profiles = ["default"]
 startup = "none"
 
 [build]
@@ -74,7 +73,6 @@ console_hosted = false
 id = "example-app"
 kind = "app"
 execution_domain = "user"
-profiles = ["default"]
 startup = "none"
 
 [build]

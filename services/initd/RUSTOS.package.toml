@@ -1,7 +1,6 @@
 id = "initd"
 kind = "service"
 execution_domain = "user"
-profiles = ["default"]
 startup = "init"
 
 [build]

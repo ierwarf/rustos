@@ -1055,6 +1055,9 @@ fn normalize_user_page_flags(flags: PageTableFlags) -> Result<PageTableFlags, Ad
     if flags.contains(PageTableFlags::HUGE_PAGE) {
         return Err(AddressSpaceError::HugePageConflict);
     }
+    if flags.contains(PageTableFlags::WRITABLE) && !flags.contains(PageTableFlags::NO_EXECUTE) {
+        return Err(AddressSpaceError::ProtectionViolation);
+    }
 
     Ok(flags | PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE)
 }
@@ -1186,7 +1189,7 @@ pub fn smoke_test() {
     let mut space =
         ProcessAddressSpace::new().expect("process address space allocation must succeed");
     let region = space
-        .alloc_user_bytes(8192, PageTableFlags::WRITABLE)
+        .alloc_user_bytes(8192, PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE)
         .expect("process user region allocation must succeed");
     let sample = b"proc-paging-ok";
     space
@@ -1238,5 +1241,24 @@ mod tests {
             Err(AddressSpaceError::AddressOutOfRange)
         );
         assert!(validate_user_page_range(VirtAddr::new(USER_SPACE_BASE), 1).is_ok());
+    }
+
+    #[test]
+    fn user_page_flags_enforce_wx_and_reject_huge_pages() {
+        assert_eq!(
+            normalize_user_page_flags(PageTableFlags::WRITABLE),
+            Err(AddressSpaceError::ProtectionViolation)
+        );
+        assert_eq!(
+            normalize_user_page_flags(PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE),
+            Ok(PageTableFlags::PRESENT
+                | PageTableFlags::USER_ACCESSIBLE
+                | PageTableFlags::WRITABLE
+                | PageTableFlags::NO_EXECUTE)
+        );
+        assert_eq!(
+            normalize_user_page_flags(PageTableFlags::HUGE_PAGE | PageTableFlags::NO_EXECUTE),
+            Err(AddressSpaceError::HugePageConflict)
+        );
     }
 }

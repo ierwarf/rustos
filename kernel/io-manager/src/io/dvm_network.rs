@@ -6,6 +6,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering, fence};
 
 use driver_domain_protocol::{
     DVM_NET_HEADER_BYTES, DVM_NET_RECORD_BYTES, DVM_NET_SLOT_BYTES, DvmNetHeader,
+    validate_dvm_ethernet_frame,
 };
 
 use crate::network::{PacketError, PacketTransportStatus};
@@ -209,6 +210,9 @@ pub(crate) fn transmit(frame: &[u8]) -> Result<usize, PacketError> {
     if frame.len() > state.header.mtu as usize {
         return Err(PacketError::TooLarge);
     }
+    if validate_dvm_ethernet_frame(frame).is_err() {
+        return Err(PacketError::Invalid);
+    }
     let consumer = read_u32(state.base, TX_CONSUMER_OFFSET);
     let used = state.tx_producer.wrapping_sub(consumer);
     if used > state.header.slot_count {
@@ -249,6 +253,7 @@ pub(crate) fn receive(out: &mut [u8]) -> Result<usize, PacketError> {
     let slot = rx_slot(state, state.rx_consumer).ok_or(PacketError::Invalid)?;
     let len = read_u32(slot, 0) as usize;
     if len == 0 || len > state.header.mtu as usize || len > out.len() {
+        advance_rx_consumer(state);
         return Err(PacketError::Invalid);
     }
     unsafe {
@@ -256,10 +261,18 @@ pub(crate) fn receive(out: &mut [u8]) -> Result<usize, PacketError> {
             *byte = slot.add(SLOT_LEN_BYTES + index).read_volatile();
         }
     }
+    if validate_dvm_ethernet_frame(&out[..len]).is_err() {
+        advance_rx_consumer(state);
+        return Err(PacketError::Invalid);
+    }
+    advance_rx_consumer(state);
+    Ok(len)
+}
+
+fn advance_rx_consumer(state: &mut DvmNetworkState) {
     fence(Ordering::Release);
     state.rx_consumer = state.rx_consumer.wrapping_add(1);
     write_u32(state.base, RX_CONSUMER_OFFSET, state.rx_consumer);
-    Ok(len)
 }
 
 /// Admit a network lease from an L0-authenticated RDI1 session start.

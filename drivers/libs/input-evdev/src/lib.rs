@@ -197,13 +197,13 @@ pub fn hid_modifier_mask(usage: u8) -> Option<u8> {
 
 pub fn mouse_buttons(buttons: u8) -> u8 {
     let mut value = 0u8;
-    if buttons & driver_abi::POINTER_BUTTON_LEFT != 0 {
+    if buttons & rustos_user_abi::ui::POINTER_BUTTON_LEFT as u8 != 0 {
         value |= 1 << 0;
     }
-    if buttons & driver_abi::POINTER_BUTTON_RIGHT != 0 {
+    if buttons & rustos_user_abi::ui::POINTER_BUTTON_RIGHT as u8 != 0 {
         value |= 1 << 1;
     }
-    if buttons & driver_abi::POINTER_BUTTON_MIDDLE != 0 {
+    if buttons & rustos_user_abi::ui::POINTER_BUTTON_MIDDLE as u8 != 0 {
         value |= 1 << 2;
     }
     value
@@ -212,13 +212,13 @@ pub fn mouse_buttons(buttons: u8) -> u8 {
 pub fn pointer_buttons_from_report(buttons: u8) -> u8 {
     let mut value = 0u8;
     if buttons & (1 << 0) != 0 {
-        value |= driver_abi::POINTER_BUTTON_LEFT;
+        value |= rustos_user_abi::ui::POINTER_BUTTON_LEFT as u8;
     }
     if buttons & (1 << 1) != 0 {
-        value |= driver_abi::POINTER_BUTTON_RIGHT;
+        value |= rustos_user_abi::ui::POINTER_BUTTON_RIGHT as u8;
     }
     if buttons & (1 << 2) != 0 {
-        value |= driver_abi::POINTER_BUTTON_MIDDLE;
+        value |= rustos_user_abi::ui::POINTER_BUTTON_MIDDLE as u8;
     }
     value
 }

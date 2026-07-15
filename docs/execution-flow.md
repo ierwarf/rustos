@@ -60,8 +60,7 @@ KVM QEMU firmware (repository-pinned OVMF)
 ```
 
 The kernel and services rely on generated registries for startup policy,
-desktop entries, runtime launch policy, driver autoload metadata, and Windows
-system DLL inventory.
+desktop entries, runtime launch policy, and Windows system DLL inventory.
 
 ### Runtime Flow
 
@@ -147,8 +146,7 @@ KVM QEMU firmware (repository-pinned OVMF)
 ```
 
 kernel과 service는 startup policy, desktop entry, runtime launch policy,
-driver autoload metadata, Windows system DLL inventory를 generated registry에서
-읽습니다.
+Windows system DLL inventory를 generated registry에서 읽습니다.
 
 ### Runtime Flow
 

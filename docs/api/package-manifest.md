@@ -17,7 +17,6 @@ manifest.
 id = "example"
 kind = "service"
 execution_domain = "user"
-profiles = ["default"]
 startup = "none"
 
 [build]
@@ -38,9 +37,8 @@ console_hosted = false
 | Field | Values | Meaning |
 | --- | --- | --- |
 | `id` | string | Stable package id used by runtime deps and registries. |
-| `kind` | `boot`, `kernel`, `user-driver`, `service`, `app`, `compat` | Package taxonomy. |
-| `execution_domain` | `kernel`, `user` | Optional explicit execution domain. |
-| `profiles` | string list | Build/profile membership; defaults to `["default"]`. |
+| `kind` | `kernel`, `service`, `app`, `compat` | Package taxonomy. |
+| `execution_domain` | `kernel`, `user` | Required execution domain. |
 | `startup` | `none`, `init`, `session`, `desktop` | Startup policy for generated registries. |
 | `runtime_deps` | package id list | Runtime ordering/exposure dependency metadata. |
 
@@ -48,13 +46,11 @@ console_hosted = false
 
 | `builder` | Purpose |
 | --- | --- |
-| `bootloader-uefi` | Compatibility alias for GRUB EFI boot manager generation. |
 | `kernel-rustc` | Kernel/nucleus artifact build. |
 | `cargo-kernel-binary` | Rust userspace service/app ELF. |
 | `mingw-c-exe` | Windows PE executable demo. |
 | `c-demo` | Host C demo/smoke artifact. |
 | `winsys-dll-bundle` | Windows system DLL bundle. |
-| `external-copy` | Copy externally provided artifact. |
 
 ### Install Section
 
@@ -80,30 +76,6 @@ console_hosted = false
 | `args` | Command argv metadata. |
 | `env` | Environment entries. |
 
-### Autoload Section
-
-Bridge drivers can declare autoload metadata:
-
-```toml
-profiles = ["hardware-dev"]
-
-[autoload]
-name = "amdgpu"
-class = "display"
-bus = "pci"
-enabled = true
-priority = 10
-when = "vfs-ready"
-aliases = ["pci:vendor=0x1002,class=0x03"]
-provider_group = "display-primary"
-fallback_only = false
-```
-
-Stage writes enabled entries into `system/registry/kernel/loadable-drivers.tsv`.
-Keep hardware-specific providers out of the `default` profile unless the
-default KVM hardware profile exposes that hardware. Fallback providers in the same
-`provider_group` are skipped after a primary provider loads.
-
 <a id="korean"></a>
 
 ## 한국어
@@ -118,7 +90,6 @@ default KVM hardware profile exposes that hardware. Fallback providers in the sa
 id = "example"
 kind = "service"
 execution_domain = "user"
-profiles = ["default"]
 startup = "none"
 
 [build]
@@ -139,9 +110,8 @@ console_hosted = false
 | Field | Values | Meaning |
 | --- | --- | --- |
 | `id` | string | runtime deps와 registry에서 쓰는 stable package id |
-| `kind` | `boot`, `kernel`, `user-driver`, `service`, `app`, `compat` | package taxonomy |
-| `execution_domain` | `kernel`, `user` | optional explicit execution domain |
-| `profiles` | string list | build/profile membership, 기본값 `["default"]` |
+| `kind` | `kernel`, `service`, `app`, `compat` | package taxonomy |
+| `execution_domain` | `kernel`, `user` | 필수 execution domain |
 | `startup` | `none`, `init`, `session`, `desktop` | generated registry startup policy |
 | `runtime_deps` | package id list | runtime ordering/exposure dependency metadata |
 
@@ -149,13 +119,11 @@ console_hosted = false
 
 | `builder` | Purpose |
 | --- | --- |
-| `bootloader-uefi` | GRUB EFI boot manager 생성용 compatibility alias |
 | `kernel-rustc` | kernel/nucleus artifact build |
 | `cargo-kernel-binary` | Rust userspace service/app ELF |
 | `mingw-c-exe` | Windows PE executable demo |
 | `c-demo` | host C demo/smoke artifact |
 | `winsys-dll-bundle` | Windows system DLL bundle |
-| `external-copy` | externally provided artifact copy |
 
 ### Install Section
 
@@ -180,27 +148,3 @@ console_hosted = false
 | `launch` | `none`, `new-session`, `all-sessions` |
 | `args` | command argv metadata |
 | `env` | environment entries |
-
-### Autoload Section
-
-Bridge driver는 autoload metadata를 선언할 수 있습니다.
-
-```toml
-profiles = ["hardware-dev"]
-
-[autoload]
-name = "amdgpu"
-class = "display"
-bus = "pci"
-enabled = true
-priority = 10
-when = "vfs-ready"
-aliases = ["pci:vendor=0x1002,class=0x03"]
-provider_group = "display-primary"
-fallback_only = false
-```
-
-stage는 enabled entry만 `system/registry/kernel/loadable-drivers.tsv`에 기록합니다.
-hardware-specific provider는 default KVM hardware profile에 실제 hardware가 있을 때만
-`default` profile에 넣습니다. 같은 `provider_group`의 fallback provider는
-primary provider가 load된 뒤에는 skip됩니다.

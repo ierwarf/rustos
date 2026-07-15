@@ -25,4 +25,5 @@ fi
 
 cd "$repo_root"
 cargo kani -p runtime-control --output-format terse -Z unstable-options --run-sanity-checks
+cargo kani -p rustos-image-admission --output-format terse -Z unstable-options --run-sanity-checks
 cargo kani -p driver-domain-protocol --output-format terse -Z unstable-options --run-sanity-checks

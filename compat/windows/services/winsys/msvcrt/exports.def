@@ -27,6 +27,7 @@ EXPORTS
     _strtoui64
     _unlock
     abort
+    atexit
     calloc
     exit
     fflush
@@ -37,6 +38,7 @@ EXPORTS
     free
     getchar
     getc
+    isdigit
     isspace
     isxdigit
     localeconv

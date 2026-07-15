@@ -1,23 +1,23 @@
 use std::collections::BTreeMap;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use std::vec::Vec;
 
 use super::{
-    AppState, CONSOLE_POLL_SLEEP, ConsoleWindow, DragTarget, MAX_RUNNING_PROGRAMS, VisualUpdate,
+    AppState, ConsoleWindow, DragTarget, VisualUpdate, CONSOLE_POLL_SLEEP, MAX_RUNNING_PROGRAMS,
 };
 use crate::canvas;
 use crate::render::{self, default_console_window_rect, taskbar_slot_rect};
-use crate::runtime_sync::{RuntimeState, runtime_program_is_hidden, runtime_program_title};
+use crate::runtime_sync::{runtime_program_is_hidden, runtime_program_title, RuntimeState};
 use crate::sys::{
-    ConsoleSessionHandle, ConsoleSessionInfo, ConsoleStateInfo, InputEvent,
-    MAX_CONSOLE_SNAPSHOT_BYTES, console_get_state, console_send_input_event, console_set_focus,
+    console_get_state, console_send_input_event, console_set_focus,
     console_snapshot_session_output, console_snapshot_sessions, open_console,
-    require_background_thread_class,
+    require_background_thread_class, ConsoleSessionHandle, ConsoleSessionInfo, ConsoleStateInfo,
+    InputEvent, MAX_CONSOLE_SNAPSHOT_BYTES,
 };
 use crate::wayland::WaylandCompositor;
 use runtime_control::RuntimeRunningProgram;

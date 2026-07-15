@@ -1,7 +1,6 @@
 id = "loaderd"
 kind = "service"
 execution_domain = "user"
-profiles = ["default"]
 startup = "none"
 
 [build]

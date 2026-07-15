@@ -8,14 +8,10 @@ IPC service IDs, broker syscalls, handle transfer, and service routing. For pack
 - Kernel re-export: `kernel/ps/src/user/{abi,handles,sysops}.rs`. `kernel/compat` re-exports through `kernel_ps::api`; no shadow ABI/handle/user-memory sysop files.
 - Device/console/UI `repr(C)` structs and ioctl numbers must live in `rustos-user-abi`. Services (`uiserver`, `runtimed`) consume that crate — never duplicate request structs or ioctl encoding.
 - Evacuation policy, ring0/ring3 boundary, service ownership: live source
-  `RING3-MIGRATION-REFERENCE` / `RING3-MIGRATION-COMMENTED-OUT` markers plus
-  `cargo xtask ring3-inventory`.
+  `RING3-MIGRATION-REFERENCE` / `RING3-MIGRATION-COMMENTED-OUT` markers, exact
+  broker call paths, and owning service contracts.
 - `RING3-MIGRATION-REFERENCE` / `RING3-MIGRATION-COMMENTED-OUT` blocks are references for migration, not dormant code to revive. Do not fix breakage by uncommenting them unless the exact lines are the remaining ring0 substrate.
 - For each slice, move policy/state/lifecycle behavior into the owning service, leave only narrow ring0 fd-table/user-copy/page-table/privileged-device substrate, then delete or bypass the reference block.
-- Inventory interpretation: `excluded_exception_loc` is deliberate ring0 or
-  already-ring3 reference surface, `cleanup_debt_loc` is legacy code to retire
-  rather than migrate, and `migration_candidate_loc` is the remaining real
-  ring3 migration candidate set.
 
 ## Boot Initial Task
 
@@ -279,7 +275,7 @@ policy remains with the owning service.
 - Gated `SYS_RUSTOS_STORAGE_LIST_BROKER` (gated by `STORAGE_POLICY`) enumerates kernel-discovered descriptors; no direct generic-app storage probing.
 - `StoragedRequest`/`Response` exposes `STORAGED_OP_ROOT_STATUS`, `STORAGED_OP_BOOT_EXTENT_LOOKUP`.
 - Boot extent leases are storaged policy, sourced from `system/registry/kernel/root-file-extents.tsv` and returned over `STORAGED_OP_BOOT_EXTENT_LOOKUP`. Do not reintroduce generic ring0 boot-extent policy; ring0 storage brokers remain descriptor/block substrate only.
-- Root extent manifests are bootloader-supplied data, not ring0 filesystem policy. GRUB loads `system/registry/kernel/root-file-extents.tsv` as the `rustos-root-extents` multiboot2 module and `BootInfo.boot_extent_manifest` points at that memory. Kernel boot may parse that manifest and perform physical extent reads, but must not need FAT directory traversal just to discover the manifest.
+- Root extent manifests are bootloader-supplied data, not ring0 filesystem policy. GRUB signature enforcement authenticates `system/registry/kernel/root-file-extents.tsv` before loading it as the `rustos-root-extents` multiboot2 module, and `BootInfo.boot_extent_manifest` points at that immutable memory. Each row binds an exact path and extent coverage to ordered `sha256_chunks` digests over 64-KiB file chunks. Kernel boot may parse that manifest and perform physical extent reads, but must reject duplicate paths, overlapping/inexact extents, digest-count mismatch, and content mismatch; it must not need FAT directory traversal just to discover the manifest.
 - Ring0 boot-volume FAT traversal is not part of the direct boot-file path. Entering `KernelVfsReady` must preload the root extent table from `BootInfo.boot_extent_manifest`; if the manifest is absent or a path is missing from it, direct boot-volume helpers fail closed. Directory traversal and generic FAT fallback must stay out of ring0 so namespace policy stays in `vfsd`/`storaged`.
 - AHCI/NVMe post-bootstrap selection, inventory, partition, and extent policy lives in `storaged`/`vfsd`, but physical boot-volume block reads still require kernel io-manager transport substrate. Do not delete AHCI MMIO/DMA command execution until an explicit ring3 service-driver protocol can perform real block I/O before `rootd` and `vfsd` need it.
 
@@ -379,9 +375,20 @@ Mapping ops use `PROC_BROKER_MAP_{READ,WRITE,EXEC,PRIVATE}` flags and record non
 - `SYS_RUSTOS_PROC_MAP_DATA_BROKER`
 - `SYS_RUSTOS_PROC_MAP_FILE_BROKER` + batch variant `_BATCH_BROKER` — **fd/cap-backed only**. Kernel resolves fd to pinned `KernelHandle` at registration; no path re-open at commit. Backing must be file-kind (`VfsFile`, `RemoteVfs(File)`, `Memfd`); directory/device/socket fd rejected with `EINVAL`/`EACCES`.
 
+Before any mapping broker call, parsed ELF64 and PE64 regions cross the shared
+`rustos-image-admission` gate. Every region must remain inside the single
+process window, have a non-overflowing nonzero extent, not overlap another
+region, and satisfy W^X. A main-image entry must fall inside an executable
+region; only a PE DLL may explicitly use entry zero. The same crate parses the
+bounded ELF64/PE64 layout bytes and validates PE64 base relocation and import
+tables against an isolated image snapshot. Loaderd retains format policy and
+exact file reads, while a short read in the process broker aborts rather than
+committing a zero-filled file tail. The TLA+ models, source-level tests, and
+`fuzz-host --target image-admission` are complementary gates.
+
 **ELF:** loaderd emits `PT_LOAD` mappings for main image + `PT_INTERP` via `MAP_FILE_BROKER`. Static-PIE biases: main = `PROC_BROKER_USER_SPACE_BASE + 0x0040_0000`, interpreter = `+ 0x0200_0000`. Must use `SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER` for minimal launch metadata (entry, phdr, phnum, phent, brk_start, interpreter_base) — **not** raw blob streaming via `SET_IMAGE_BLOB_BROKER`. Kernel derives launch state from this metadata and the pre-built address space.
 
-**PE64:** PE validation, section materialization, base relocation, import/export resolution, staged system-DLL registry lookup, PEB/TEB/runtime blob construction all happen in loaderd before commit. PE64 commit includes `SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER` after all `MAP_DATA_BROKER` ops and before `COMMIT_BROKER`. Kernel validates metadata + spawns the materialized address space but **must not** reintroduce PE import/export/system-DLL policy.
+**PE64:** PE validation, section materialization, base relocation, import/export resolution, staged system-DLL registry lookup, PEB/TEB/runtime blob construction all happen in loaderd before commit. The bounded section-header table is fetched with one `pread64`, not one policy/VFS roundtrip per section. PE64 commit includes `SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER` after all `MAP_DATA_BROKER` ops and before `COMMIT_BROKER`. Kernel validates metadata + spawns the materialized address space but **must not** reintroduce PE import/export/system-DLL policy.
 
 Commit (`COMMIT_BROKER`) builds the child address space from recorded mappings.
 When a broker request supplies `console_session = 0`, the kernel inherits the
@@ -390,10 +397,13 @@ exact live caller (or target thread) session. Missing process/thread state is
 By default, commit-broker spawns do not request immediate deferred reschedule so
 `loaderd` can reply to its caller before the spawned child runs startup policy.
 Supervisors (`rootd` for initd, `initd` for post-init services, and `runtimed`
-for uiserver) set `LOADER_SPAWN_FLAG_DEFER_START` and complete lease admission
-before `LOADER_OP_ACTIVATE`. Activation is single-use and fails closed for an
-unknown, exited, already-running, or non-suspended PID. Endpoint-owning children
-must then be confirmed through the exact-PID endpoint wait syscall.
+for every catalog launch) set `LOADER_SPAWN_FLAG_DEFER_START`. `runtimed`
+records ordinary app ownership before `LOADER_OP_ACTIVATE`; endpoint-owning
+services also complete lease admission before activation and are then confirmed
+through the exact-PID endpoint wait syscall. Activation is single-use, fails
+closed for an unknown, exited, already-running, or non-suspended PID, and
+publishes one spawn-specific scheduler handoff only after this supervisor
+commit point.
 
 `LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF` remains an ABI option for a child with a
 pre-admitted ownership contract; it is not valid for normal supervised service
@@ -505,5 +515,14 @@ they do not admit a service or a module-loading path.
   Separately, after eight consecutive System dispatches, one ready User task
   must run before System selection resumes; this is the explicit recovery and
   application CPU reservation under DVM/UI load.
+- Normal and voluntary-yield task selection each scan the fixed 128-slot table
+  once and retain one minimum-vruntime candidate per class. Do not restore a
+  separate full-table pass for each empty higher class: effective class
+  resolution also walks live reply donations, so repeated scans multiply the
+  timer-tick cost under User-only and recovery workloads.
+- Strict admission for bootstrap syscall/VFS/loader/process/pager brokers comes
+  only from `rootd`'s fixed manifest. Dynamic package metadata cannot set
+  `TASK_WEIGHT_INTERACTIVE_FLAG`; admitted ready brokers are covered by the
+  bounded System-class wait rail.
 - `KernelSpinLock` must not be held across disk/filesystem/IPC/framebuffer-copy loops. Use `KernelWaitLock` or split the section; add `cond_resched` in long loops.
 - Boot service order: driver/input/storage policy services before UI launchers. `runtimed` waits on `devmgrd` and `storaged` endpoints before UI bootstrap.

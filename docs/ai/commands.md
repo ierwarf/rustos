@@ -19,6 +19,9 @@ failure output as the primary debugging context.
 | --- | --- | --- | --- |
 | `cargo xtask build-dvm` | build the pinned Linux DVM and verify its manifest | `driver-domains/linux/out/` | missing Buildroot prerequisite or source/artifact mismatch |
 | `cargo xtask verify-dvm` | verify every DVM artifact and control-contract hash | none | altered/missing DVM artifact or contract |
+| `make -C driver-domains/linux rebuild-agent` | rebuild only the DVM control/input agent while preserving the Buildroot host toolchain | DVM package/artifacts only | agent compile or artifact refresh failure |
+| `make -C driver-domains/linux rebuild-display` | rebuild only the DVM display relay while preserving the Buildroot host toolchain | DVM package/artifacts only | display relay compile or artifact refresh failure |
+| `make -C driver-domains/linux rebuild-net` | rebuild only the DVM network relay while preserving the Buildroot host toolchain | DVM package/artifacts only | network relay compile or artifact refresh failure |
 | `cargo xtask kvm-smoke` | concurrently boot Linux DVM and RustOS with QEMU/KVM | `build/kvm/` | unavailable `/dev/kvm`, guest exit, missing readiness marker |
 | `cargo xtask kvm-run` | start the interactive Linux-DVM display session; it waits for an atomic three-buffer/page-flip-ready scanout before exposing the window, then records real pointer ingress and healthy idle UI ticks when QEMU closes | `build/kvm/` | unavailable GUI backend, `/dev/kvm`, display readiness failure, missing real pointer evidence, or a guest exit |
 | `cargo run -p rustos-hostd -- discover` | read host IOMMU groups | none | IOMMU unavailable or unreadable sysfs |
@@ -29,10 +32,15 @@ failure output as the primary debugging context.
 
 | Command | Use | Writes | Common failure meaning |
 | --- | --- | --- | --- |
-| `cargo xtask selftest` | host selftests for fault parsing, ABI/layout, runtime contracts, module tests | `target/` | contract/layout regression |
-| `cargo xtask fuzz-host --target all` | deterministic host fuzz smoke for fault rules, project config, package/DVM manifests, and hostd launch-plan parsing | `logs/` on crash | parser panic or invariant bug |
-| `cargo xtask ring3-inventory` | classify remaining migration markers by owner/lane; read `migration_candidate_loc` as real remaining ring3 work and `cleanup_debt_loc` as delete/retire work | none | stale marker classification or unexpected active LOC growth |
-| `cargo test -p module-tests` | module tests | `target/` | unit/module regression |
+| `cargo xtask selftest` | host selftests for fault parsing, executable-image admission, ABI/layout, and runtime contracts | `target/` | contract/layout regression |
+| `cargo xtask fuzz-host --target all` | deterministic host fuzz smoke for fault rules, executable-image admission, project config, package/DVM manifests, and hostd launch-plan parsing | `logs/` on crash | parser panic or invariant bug |
+| `cargo xtask fuzz-host --target image-admission --iterations 1000` | exercise overflow, bounds, overlap, W^X, and entry-point admission without booting a guest | `logs/` on crash | shared ELF/PE admission panic or invariant bug |
+
+Do not rerun `cargo xtask build-dvm` for RustOS-only, documentation, formal,
+manifest-consumer, or unrelated service changes. Reuse the verified artifact;
+for a local DVM relay source change, use the matching `rebuild-*` target above
+and then `cargo xtask verify-dvm`.
+| `cargo test -p contract-tests` | active DVM transport, user ABI, keyboard, boot-random, and fault-rule layout tests | `target/` | active contract/layout regression |
 | `git diff --check` | whitespace sanity | none | trailing whitespace/conflict marker |
 
 ## KVM smoke arguments
@@ -86,8 +94,10 @@ failure output as the primary debugging context.
   aperture to both guests. RustOS owns only bounded Ethernet-frame ring access;
   Linux owns the virtio-net NIC and raw socket relay; `netd` retains socket/TCP
   policy. RustOS has no native virtio-net device in this topology.
-- `--exercise-network` requires `--dvm-network-shmem` and changes only the
-  private KVM disk copy so the existing `netprobe` reaches the QEMU gateway.
+- `--exercise-network` requires both `--gui-dvm-surfaces` and
+  `--dvm-network-shmem`; the GUI provider is required because runtimed admits
+  the app catalog only after UI readiness. The option changes only the private
+  KVM disk copy so the existing `netprobe` reaches the QEMU gateway.
   Passing requires the normal app result plus nonzero producer and consumer
   counters in both bounded rings. It is an Ethernet transport proof, not a
   physical NIC assignment or an L0 network control plane.

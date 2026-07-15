@@ -26,13 +26,12 @@
 | `build/kvm/` | Private KVM disk plus RustOS and Linux DVM logs. |
 | `build/image/EFI/BOOT/BOOTX64.EFI` | GRUB-generated default UEFI entry. |
 | `build/image/nucleus.elf.sig` | Detached GPG signature for `nucleus.elf`. |
-| `build/image/system/registry/` | Generated runtime/driver registries. |
+| `build/image/system/registry/` | Generated runtime registries. |
 
 ### Generated Registries
 
 | Registry | Purpose |
 | --- | --- |
-| `system/registry/kernel/loadable-drivers.tsv` | Driver autoload metadata. |
 | `system/registry/system/desktop-programs.tsv` | Desktop app/service metadata. |
 | `system/registry/system/runtime-launch-programs.tsv` | Runtime launch policy. |
 | `system/registry/system/startup-programs.tsv` | Startup ordering/policy. |
@@ -62,13 +61,12 @@
 | `build/kvm/` | private KVM disk, RustOS/Linux DVM log |
 | `build/image/EFI/BOOT/BOOTX64.EFI` | GRUB이 생성한 기본 UEFI entry |
 | `build/image/nucleus.elf.sig` | `nucleus.elf` detached GPG signature |
-| `build/image/system/registry/` | generated runtime/driver registry |
+| `build/image/system/registry/` | generated runtime registry |
 
 ### Generated Registries
 
 | Registry | Purpose |
 | --- | --- |
-| `system/registry/kernel/loadable-drivers.tsv` | driver autoload metadata |
 | `system/registry/system/desktop-programs.tsv` | desktop app/service metadata |
 | `system/registry/system/runtime-launch-programs.tsv` | runtime launch policy |
 | `system/registry/system/startup-programs.tsv` | startup ordering/policy |

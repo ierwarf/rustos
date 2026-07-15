@@ -157,11 +157,6 @@ fn poll_input_device_revents(fd: u64, events: u32) -> Result<u32, i64> {
     let mut revents = 0_u32;
     if events & (linux_abi::POLLIN as u32 | linux_abi::POLLPRI as u32) != 0 {
         let pending = input_device_has_pending_events(fd)?;
-        // A successful policy-backed query proves both a valid input handle
-        // and a responsive inputd. Only now may L0 ask the DVM to start its
-        // continuous stream; MSI-X installation by itself is not consumer
-        // readiness.
-        let _ = kernel_io_manager::api::input::mark_dvm_policy_consumer_ready();
         if pending {
             revents |= events & (linux_abi::POLLIN as u32 | linux_abi::POLLPRI as u32);
         }

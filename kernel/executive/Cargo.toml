@@ -13,6 +13,5 @@ kernel-ps = { path = "../ps" }
 kernel-io-manager = { path = "../io-manager", default-features = false }
 kernel-compat = { path = "../compat" }
 boot-protocol = { path = "../../boot/boot-protocol" }
-driver-abi = { path = "../../drivers/libs/driver-abi" }
 storage-core = { path = "../../libs/storage-core" }
 x86_64 = { version = "0.15.4", default-features = false, features = ["instructions", "abi_x86_interrupt"] }

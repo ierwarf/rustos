@@ -2,17 +2,17 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
-use runtime_control::{DEFAULT_APPLICATIONS_DIR, StartupMode, load_desktop_program_entries};
+use runtime_control::{load_desktop_program_entries, StartupMode, DEFAULT_APPLICATIONS_DIR};
 
 use super::{
-    AppState, CursorMotion, DesktopSurfaceCache, LauncherProgram, MAX_DISPLAY_HEIGHT,
-    MAX_DISPLAY_WIDTH, PAGE_SIZE, align_up, start_console_command_dispatcher,
+    align_up, start_console_command_dispatcher, AppState, CursorMotion, DesktopSurfaceCache,
+    LauncherProgram, MAX_DISPLAY_HEIGHT, MAX_DISPLAY_WIDTH, PAGE_SIZE,
 };
 use crate::sys::{
-    DisplayInfo, DisplaySurfaceCreate, ESTALE, PIXEL_FORMAT_BGRA8888, SurfaceMapping, boot_line,
-    debug_line, diag_line, display_create_surface, display_get_info, display_present,
+    boot_line, debug_line, diag_line, display_create_surface, display_get_info, display_present,
     display_present_rect, map_surface, open_console, open_display, open_input,
-    publish_input_pointer_surface, require_background_thread_class,
+    publish_input_pointer_surface, require_background_thread_class, DisplayInfo,
+    DisplaySurfaceCreate, SurfaceMapping, ESTALE, PIXEL_FORMAT_BGRA8888,
 };
 const SURFACE_CREATE_RETRIES: usize = 4;
 // Retry budget for waiting on a primary display provider (for example the DVM

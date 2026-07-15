@@ -1,7 +1,6 @@
 id = "winsys"
 kind = "compat"
 execution_domain = "user"
-profiles = ["default"]
 
 [build]
 builder = "winsys-dll-bundle"

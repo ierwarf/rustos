@@ -27,10 +27,9 @@ output outside the cached unit.
 - `docs/ai/commercial-quality-gates.md` — non-negotiable completion and
   retirement gates for enabled product topologies.
 - `docs/ai/performance-hardening.md` — boot/runtime bottleneck and cleanup runbook.
-- `cargo xtask ring3-inventory` — current `RING3-MIGRATION-REFERENCE` and
-  `RING3-MIGRATION-COMMENTED-OUT` LOC/owner/action snapshot. Use
-  `migration_candidate_loc` for true ring3 work and `cleanup_debt_loc` for
-  legacy native code that should be retired rather than migrated.
+- Ring0/ring3 ownership decisions come from the exact broker call path,
+  owning service contract, and local `RING3-MIGRATION-*` annotation. LOC
+  inventory is not an architecture gate.
 
 ## Source entrypoints (minimal)
 
@@ -62,7 +61,7 @@ boot orchestration, etc.) see `docs/ai/repo-map.md`.
 
 - `cargo xtask check` — fast validation.
 - `cargo xtask build` — full image.
-- `cargo xtask build-kernel` / `build-user` / `build-driver-modules` — scoped.
+- `cargo xtask build-kernel` / `build-user` / `build-dvm` — scoped.
 - `cargo xtask stage` — restage existing artifacts.
 
 Quiet on success. On failure, treat the command output as primary context.

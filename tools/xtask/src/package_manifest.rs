@@ -10,34 +10,14 @@ use crate::Result;
 use crate::config::Config;
 
 pub(crate) const PACKAGE_MANIFEST_NAME: &str = "RUSTOS.package.toml";
-pub(crate) const DEFAULT_PROFILE: &str = "default";
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum PackageKind {
-    Boot,
     Kernel,
-    UserDriver,
-    #[serde(alias = "system-app")]
     Service,
-    #[serde(alias = "sample")]
     App,
-    #[serde(alias = "compat-user")]
-    #[serde(alias = "compat-kernel")]
     Compat,
-}
-
-impl PackageKind {
-    pub(crate) fn is_driver(&self) -> bool {
-        matches!(self, Self::UserDriver)
-    }
-
-    pub(crate) fn default_execution_domain(&self) -> ExecutionDomain {
-        match self {
-            Self::Boot | Self::Kernel => ExecutionDomain::Kernel,
-            Self::UserDriver | Self::Service | Self::App | Self::Compat => ExecutionDomain::User,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
@@ -86,13 +66,11 @@ fn default_startup_mode() -> StartupMode {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum BuilderKind {
-    BootloaderUefi,
     KernelRustc,
     CargoKernelBinary,
     MingwCExe,
     CDemo,
     WinsysDllBundle,
-    ExternalCopy,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -104,11 +82,7 @@ pub(crate) struct BuildSpec {
     #[serde(default)]
     pub(crate) source: Option<String>,
     #[serde(default)]
-    pub(crate) source_env: Option<String>,
-    #[serde(default)]
     pub(crate) extra_args: Vec<String>,
-    #[serde(default)]
-    pub(crate) optional: bool,
     /// Per-package linkage override. Currently understood values:
     /// - `None` / `Some("dynamic")`: link as a dynamic Linux ELF (default).
     /// - `Some("static-pie")`: link as a static PIE with no `PT_INTERP`. Used
@@ -125,36 +99,6 @@ pub(crate) struct InstallSpec {
     pub(crate) path: String,
     #[serde(default = "default_install_layout")]
     pub(crate) layout: InstallLayout,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct AutoloadSpec {
-    pub(crate) name: String,
-    pub(crate) class: String,
-    pub(crate) bus: String,
-    #[serde(default = "default_autoload_enabled")]
-    pub(crate) enabled: bool,
-    #[serde(default)]
-    pub(crate) priority: i32,
-    #[serde(default)]
-    pub(crate) when: Option<String>,
-    #[serde(default)]
-    pub(crate) aliases: Vec<String>,
-    #[serde(default)]
-    pub(crate) deps: Vec<String>,
-    #[serde(default)]
-    pub(crate) softdeps: Vec<String>,
-    #[serde(default)]
-    pub(crate) linux_driver_names: Vec<String>,
-    #[serde(default)]
-    pub(crate) provider_group: Option<String>,
-    #[serde(default)]
-    pub(crate) fallback_only: bool,
-}
-
-fn default_autoload_enabled() -> bool {
-    true
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -196,20 +140,13 @@ pub(crate) struct DesktopSection {
 pub(crate) struct PackageManifest {
     pub(crate) id: String,
     pub(crate) kind: PackageKind,
-    #[serde(default)]
-    pub(crate) execution_domain: Option<ExecutionDomain>,
-    #[serde(default = "default_profiles")]
-    pub(crate) profiles: Vec<String>,
+    pub(crate) execution_domain: ExecutionDomain,
     pub(crate) build: BuildSpec,
     pub(crate) install: InstallSpec,
     #[serde(default = "default_startup_mode")]
     pub(crate) startup: StartupMode,
     #[serde(default)]
-    pub(crate) autoload: Option<AutoloadSpec>,
-    #[serde(default)]
     pub(crate) desktop: DesktopSection,
-    // Runtime dependency enforcement is planned, but the current orchestrator only records it.
-    #[allow(dead_code)]
     #[serde(default)]
     pub(crate) runtime_deps: Vec<String>,
     #[serde(skip)]
@@ -218,26 +155,13 @@ pub(crate) struct PackageManifest {
     pub(crate) package_root: PathBuf,
 }
 
-fn default_profiles() -> Vec<String> {
-    vec![String::from(DEFAULT_PROFILE)]
-}
-
 impl PackageManifest {
-    pub(crate) fn execution_domain(&self) -> ExecutionDomain {
-        self.execution_domain
-            .unwrap_or_else(|| self.kind.default_execution_domain())
-    }
-
     pub(crate) fn artifact_path(&self, config: &Config) -> PathBuf {
         config.artifact_dir.join(&self.install.path)
     }
 
     pub(crate) fn image_path(&self, config: &Config) -> PathBuf {
         config.image_dir.join(&self.install.path)
-    }
-
-    pub(crate) fn profile_enabled(&self, profile: &str) -> bool {
-        self.profiles.iter().any(|candidate| candidate == profile)
     }
 
     pub(crate) fn resolved_source_path(&self) -> Option<PathBuf> {
@@ -267,6 +191,7 @@ pub(crate) fn load_manifests(root_dir: &Path) -> Result<Vec<PackageManifest>> {
     }
 
     validate_manifests(&manifests)?;
+    validate_runtime_deps(&manifests)?;
     manifests.sort_by(|lhs, rhs| lhs.id.cmp(&rhs.id));
     Ok(manifests)
 }
@@ -275,27 +200,6 @@ pub(crate) fn validate_manifest_text_for_testinfra(text: &str) -> Result<()> {
     let _: PackageManifest =
         toml::from_str(text).map_err(|err| anyhow!("invalid package manifest: {err}"))?;
     Ok(())
-}
-
-pub(crate) fn load_profile_manifests(
-    root_dir: &Path,
-    profile: &str,
-) -> Result<Vec<PackageManifest>> {
-    let manifests = load_manifests(root_dir)?;
-    let known_ids = manifests
-        .iter()
-        .map(|manifest| manifest.id.clone())
-        .collect::<BTreeSet<_>>();
-    let profile_manifests = manifests
-        .into_iter()
-        .filter(|manifest| manifest.profile_enabled(profile))
-        .collect::<Vec<_>>();
-    validate_profile_runtime_deps(&profile_manifests, profile, &known_ids)?;
-    Ok(profile_manifests)
-}
-
-pub(crate) fn load_default_manifests(root_dir: &Path) -> Result<Vec<PackageManifest>> {
-    load_profile_manifests(root_dir, DEFAULT_PROFILE)
 }
 
 pub(crate) fn required_manifest<'a>(
@@ -341,7 +245,7 @@ fn validate_manifests(manifests: &[PackageManifest]) -> Result<()> {
     let mut install_paths = BTreeMap::<&str, &Path>::new();
 
     for manifest in manifests {
-        let execution_domain = manifest.execution_domain();
+        let execution_domain = manifest.execution_domain;
         if manifest.id.trim().is_empty() {
             bail!(
                 "package id is empty in {}",
@@ -350,13 +254,6 @@ fn validate_manifests(manifests: &[PackageManifest]) -> Result<()> {
         }
         if !ids.insert(manifest.id.as_str()) {
             bail!("duplicate package id: {}", manifest.id);
-        }
-        if manifest.profiles.is_empty() {
-            bail!(
-                "package {} has no build profiles in {}",
-                manifest.id,
-                manifest.manifest_path.display()
-            );
         }
         if !is_normal_relative_install_path(&manifest.install.path) {
             bail!(
@@ -377,9 +274,7 @@ fn validate_manifests(manifests: &[PackageManifest]) -> Result<()> {
         }
 
         match manifest.build.builder {
-            BuilderKind::BootloaderUefi
-            | BuilderKind::KernelRustc
-            | BuilderKind::CargoKernelBinary => {
+            BuilderKind::KernelRustc | BuilderKind::CargoKernelBinary => {
                 if manifest
                     .build
                     .package
@@ -411,36 +306,16 @@ fn validate_manifests(manifests: &[PackageManifest]) -> Result<()> {
                     );
                 }
             }
-            BuilderKind::ExternalCopy => {
-                if manifest.build.source.is_none() && manifest.build.source_env.is_none() {
-                    bail!(
-                        "package {} must define build.source or build.source_env",
-                        manifest.id
-                    );
-                }
-            }
-        }
-
-        if manifest.autoload.is_some() && !manifest.kind.is_driver() {
-            bail!(
-                "package {} defines autoload metadata but is not a driver",
-                manifest.id
-            );
         }
 
         match manifest.kind {
-            PackageKind::Boot | PackageKind::Kernel
-                if execution_domain != ExecutionDomain::Kernel =>
-            {
+            PackageKind::Kernel if execution_domain != ExecutionDomain::Kernel => {
                 bail!(
                     "package {} must use execution_domain = \"kernel\"",
                     manifest.id
                 );
             }
-            PackageKind::UserDriver
-            | PackageKind::Service
-            | PackageKind::App
-            | PackageKind::Compat
+            PackageKind::Service | PackageKind::App | PackageKind::Compat
                 if execution_domain != ExecutionDomain::User =>
             {
                 bail!(
@@ -470,15 +345,7 @@ fn validate_manifests(manifests: &[PackageManifest]) -> Result<()> {
     Ok(())
 }
 
-fn validate_profile_runtime_deps(
-    manifests: &[PackageManifest],
-    profile: &str,
-    known_ids: &BTreeSet<String>,
-) -> Result<()> {
-    let active_ids = manifests
-        .iter()
-        .map(|manifest| manifest.id.as_str())
-        .collect::<BTreeSet<_>>();
+fn validate_runtime_deps(manifests: &[PackageManifest]) -> Result<()> {
     let manifest_by_id = manifests
         .iter()
         .map(|manifest| (manifest.id.as_str(), manifest))
@@ -489,19 +356,11 @@ fn validate_profile_runtime_deps(
             if dep == &manifest.id {
                 bail!("package {} runtime_deps includes itself", manifest.id);
             }
-            if !known_ids.contains(dep.as_str()) {
+            if !manifest_by_id.contains_key(dep.as_str()) {
                 bail!(
                     "package {} runtime_deps includes missing package {}",
                     manifest.id,
                     dep
-                );
-            }
-            if !active_ids.contains(dep.as_str()) {
-                bail!(
-                    "package {} runtime_deps includes package {} outside profile {}",
-                    manifest.id,
-                    dep,
-                    profile
                 );
             }
         }
@@ -566,9 +425,7 @@ fn validate_manifest_location(manifest: &PackageManifest) -> Result<()> {
     let relative = manifest.manifest_path.to_string_lossy().replace('\\', "/");
 
     let expected_root = match manifest.kind {
-        PackageKind::Boot => "boot/",
         PackageKind::Kernel => "kernel/",
-        PackageKind::UserDriver => "drivers/user/",
         PackageKind::Service => "services/",
         PackageKind::App => "apps/",
         PackageKind::Compat => "compat/",
@@ -598,15 +455,6 @@ fn validate_install_taxonomy(manifest: &PackageManifest) -> Result<()> {
     let path = manifest.install.path.as_str();
 
     match manifest.kind {
-        PackageKind::UserDriver => {
-            if !path.starts_with("drivers/user/") {
-                bail!(
-                    "user driver {} must install under drivers/user/, got {}",
-                    manifest.id,
-                    path
-                );
-            }
-        }
         PackageKind::Service => {
             if !path.starts_with("services/") {
                 bail!(
@@ -630,7 +478,7 @@ fn validate_install_taxonomy(manifest: &PackageManifest) -> Result<()> {
                 );
             }
         }
-        PackageKind::Boot | PackageKind::Kernel => {}
+        PackageKind::Kernel => {}
     }
 
     Ok(())
@@ -640,19 +488,16 @@ fn validate_install_taxonomy(manifest: &PackageManifest) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn manifest(id: &str, profiles: &[&str], runtime_deps: &[&str]) -> PackageManifest {
+    fn manifest(id: &str, runtime_deps: &[&str]) -> PackageManifest {
         PackageManifest {
             id: id.to_string(),
             kind: PackageKind::Service,
-            execution_domain: Some(ExecutionDomain::User),
-            profiles: profiles.iter().map(|profile| profile.to_string()).collect(),
+            execution_domain: ExecutionDomain::User,
             build: BuildSpec {
                 builder: BuilderKind::CargoKernelBinary,
                 package: Some(id.to_string()),
                 source: None,
-                source_env: None,
                 extra_args: Vec::new(),
-                optional: false,
                 linkage: None,
             },
             install: InstallSpec {
@@ -660,7 +505,6 @@ mod tests {
                 layout: InstallLayout::File,
             },
             startup: StartupMode::None,
-            autoload: None,
             desktop: DesktopSection::default(),
             runtime_deps: runtime_deps.iter().map(|dep| dep.to_string()).collect(),
             manifest_path: PathBuf::from(format!("services/{id}/RUSTOS.package.toml")),
@@ -668,73 +512,47 @@ mod tests {
         }
     }
 
-    fn validate_profile(
-        manifests: &[PackageManifest],
-        profile: &str,
-    ) -> std::result::Result<(), String> {
-        let known_ids = manifests
-            .iter()
-            .map(|manifest| manifest.id.clone())
-            .collect::<BTreeSet<_>>();
-        let profile_manifests = manifests
-            .iter()
-            .filter(|manifest| manifest.profile_enabled(profile))
-            .cloned()
-            .collect::<Vec<_>>();
-        validate_profile_runtime_deps(&profile_manifests, profile, &known_ids)
-            .map_err(|err| err.to_string())
+    fn validate_deps(manifests: &[PackageManifest]) -> std::result::Result<(), String> {
+        validate_runtime_deps(manifests).map_err(|err| err.to_string())
     }
 
     #[test]
     fn accepts_valid_runtime_dependency_graph() {
         let manifests = vec![
-            manifest("runtimed", &["default"], &[]),
-            manifest("uiserver", &["default"], &["runtimed"]),
+            manifest("runtimed", &[]),
+            manifest("uiserver", &["runtimed"]),
         ];
 
-        validate_profile(&manifests, "default").expect("valid runtime deps");
+        validate_deps(&manifests).expect("valid runtime deps");
     }
 
     #[test]
     fn rejects_missing_runtime_dependency_package() {
-        let manifests = vec![manifest("uiserver", &["default"], &["runtimed"])];
+        let manifests = vec![manifest("uiserver", &["runtimed"])];
 
-        let err = validate_profile(&manifests, "default").expect_err("missing dep");
+        let err = validate_deps(&manifests).expect_err("missing dep");
         assert!(err.contains("uiserver runtime_deps includes missing package runtimed"));
     }
 
     #[test]
     fn rejects_self_runtime_dependency() {
-        let manifests = vec![manifest("uiserver", &["default"], &["uiserver"])];
+        let manifests = vec![manifest("uiserver", &["uiserver"])];
 
-        let err = validate_profile(&manifests, "default").expect_err("self dep");
+        let err = validate_deps(&manifests).expect_err("self dep");
         assert!(err.contains("uiserver runtime_deps includes itself"));
     }
 
     #[test]
     fn rejects_runtime_dependency_cycle() {
         let manifests = vec![
-            manifest("runtimed", &["default"], &["uiserver"]),
-            manifest("uiserver", &["default"], &["runtimed"]),
+            manifest("runtimed", &["uiserver"]),
+            manifest("uiserver", &["runtimed"]),
         ];
 
-        let err = validate_profile(&manifests, "default").expect_err("cycle");
+        let err = validate_deps(&manifests).expect_err("cycle");
         assert!(err.contains("runtime_deps cycle detected"));
         assert!(err.contains("runtimed"));
         assert!(err.contains("uiserver"));
-    }
-
-    #[test]
-    fn rejects_runtime_dependency_outside_selected_profile() {
-        let manifests = vec![
-            manifest("storaged", &["legacy-services"], &[]),
-            manifest("uiserver", &["default"], &["storaged"]),
-        ];
-
-        let err = validate_profile(&manifests, "default").expect_err("profile dep");
-        assert!(
-            err.contains("uiserver runtime_deps includes package storaged outside profile default")
-        );
     }
 
     #[test]
@@ -755,7 +573,7 @@ mod tests {
     #[test]
     fn rejects_retired_boot_metadata() {
         let err = validate_manifest_text_for_testinfra(
-            "id = \"example\"\nkind = \"service\"\n[build]\nbuilder = \"cargo-kernel-binary\"\n[install]\npath = \"services/example/example.elf\"\n[boot]\npreload = true\nrequired = false\npriority = -1\n",
+            "id = \"example\"\nkind = \"service\"\nexecution_domain = \"user\"\n[build]\nbuilder = \"cargo-kernel-binary\"\n[install]\npath = \"services/example/example.elf\"\n[boot]\npreload = true\nrequired = false\npriority = -1\n",
         )
         .expect_err("retired boot metadata must not be silently ignored");
 
@@ -765,7 +583,7 @@ mod tests {
     #[test]
     fn rejects_unknown_nested_metadata() {
         let err = validate_manifest_text_for_testinfra(
-            "id = \"example\"\nkind = \"service\"\n[build]\nbuilder = \"cargo-kernel-binary\"\nunknown = true\n[install]\npath = \"services/example/example.elf\"\n",
+            "id = \"example\"\nkind = \"service\"\nexecution_domain = \"user\"\n[build]\nbuilder = \"cargo-kernel-binary\"\nunknown = true\n[install]\npath = \"services/example/example.elf\"\n",
         )
         .expect_err("unknown build metadata must not be silently ignored");
 
@@ -775,7 +593,7 @@ mod tests {
     #[test]
     fn parses_top_level_startup_and_desktop_visibility() {
         let manifest: PackageManifest = toml::from_str(
-            "id = \"example\"\nkind = \"app\"\nstartup = \"session\"\n[build]\nbuilder = \"cargo-kernel-binary\"\n[install]\npath = \"apps/example/example.elf\"\n[[desktop.entries]]\ndisplay_name = \"example\"\nweight_micros = 100\nno_display = true\n",
+            "id = \"example\"\nkind = \"app\"\nexecution_domain = \"user\"\nstartup = \"session\"\n[build]\nbuilder = \"cargo-kernel-binary\"\n[install]\npath = \"apps/example/example.elf\"\n[[desktop.entries]]\ndisplay_name = \"example\"\nweight_micros = 100\nno_display = true\n",
         )
         .expect("valid top-level startup metadata");
 

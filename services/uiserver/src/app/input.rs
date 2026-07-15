@@ -14,8 +14,8 @@ use crate::render::{
     window_maximize_button_rect, window_minimize_button_rect, window_title_bar_rect,
 };
 use crate::sys::{
-    self, ConsoleSessionHandle, INPUT_KIND_KEYBOARD, INPUT_KIND_POINTER_BUTTON,
-    INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION, InputEvent, POINTER_BUTTON_LEFT,
+    self, ConsoleSessionHandle, InputEvent, INPUT_KIND_KEYBOARD, INPUT_KIND_POINTER_BUTTON,
+    INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION, POINTER_BUTTON_LEFT,
 };
 use crate::wayland::WaylandCompositor;
 

@@ -4,7 +4,7 @@
 // ring3 service-driver host can perform boot-volume reads before rootd/vfsd
 // need them.
 // Built-in NVMe is early-boot substrate. Post-bootstrap storage policy is
-// routed through storaged, with Linux `.ko` bridge modules used for compat.
+// routed through storaged; Linux driver compatibility exists only in a DVM.
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;

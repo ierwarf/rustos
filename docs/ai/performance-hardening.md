@@ -75,8 +75,24 @@ contract file.
   requires a nonzero `background_thread_demotions` count; a demotion failure
   exits uiserver rather than quietly running the wrong scheduling model.
 
+## Scheduler Dispatch
+
+- The scheduler keeps a fixed 128-slot task table. A normal or
+  voluntary-yield pick performs one table scan and records the best candidate
+  for System, User, and Idle simultaneously. This preserves strict class
+  ordering and vruntime tie behavior while avoiding two extra full-table plus
+  IPC-donation classification passes when no System task is ready.
+- The one-in-nine ready User reservation and 10 ms ready-System latency rail
+  remain admission/overload invariants. A selection micro-optimization must not
+  bypass either rail or convert launch weights into strict-class authority.
+- `rootd`'s immutable bootstrap manifest explicitly admits only the fixed
+  syscall/VFS/loader/process/pager brokers to the System latency class.
+  Package and desktop metadata cannot request that bit. The scheduler's 10 ms
+  ready-wait rail therefore covers causal core servers without making dynamic
+  applications strict-priority work.
+
 ## Cleanup Rule
 
-- `cargo xtask ring3-inventory` decides migration cleanup scope. If
-  `migration_candidate_loc=0` and `cleanup_debt_loc=0`, do not delete marked
-  substrate just because it looks old.
+- Delete a marked path only after its broker callers and owning service prove
+  that it is replaced. A marker or LOC total alone does not prove that ring0
+  substrate is obsolete.

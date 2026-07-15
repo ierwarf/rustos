@@ -29,6 +29,17 @@ static void log_line(const char *message) {
     fflush(stdout);
 }
 
+static void log_errno_line(const char *operation, int error) {
+    char message[128];
+    int written = snprintf(message, sizeof(message), "netprobe: %s failed errno=%d", operation,
+                           error);
+    if (written > 0 && (size_t)written < sizeof(message)) {
+        log_line(message);
+    } else {
+        log_line("netprobe: failure diagnostic truncated");
+    }
+}
+
 int main(void) {
     const char *qemu_mode = getenv("RUSTOS_NETPROBE_QEMU");
     int qemu_gateway = qemu_mode != NULL && strcmp(qemu_mode, "1") == 0;
@@ -38,8 +49,7 @@ int main(void) {
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
-        printf("netprobe: socket failed errno=%d\r\n", errno);
-        fflush(stdout);
+        log_errno_line("socket", errno);
         return 1;
     }
 
@@ -59,8 +69,7 @@ int main(void) {
             close(fd);
             return 0;
         }
-        printf("netprobe: connect failed errno=%d\r\n", errno);
-        fflush(stdout);
+        log_errno_line("connect", errno);
         close(fd);
         return 1;
     }
@@ -78,8 +87,7 @@ int main(void) {
         "\r\n";
     ssize_t sent = send(fd, request, sizeof(request) - 1, 0);
     if (sent < 0) {
-        printf("netprobe: send failed errno=%d\r\n", errno);
-        fflush(stdout);
+        log_errno_line("send", errno);
         close(fd);
         return 1;
     }
@@ -89,8 +97,7 @@ int main(void) {
     char buffer[512];
     ssize_t received = recv(fd, buffer, sizeof(buffer) - 1, 0);
     if (received < 0) {
-        printf("netprobe: recv failed errno=%d\r\n", errno);
-        fflush(stdout);
+        log_errno_line("recv", errno);
         close(fd);
         return 1;
     }

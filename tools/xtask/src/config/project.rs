@@ -27,7 +27,6 @@ const DEFAULT_KERNEL_RELOCATION_MODEL: &str = "none";
 const DEFAULT_KERNEL_STRIP: &str = "none";
 
 const PROJECT_CONFIG_ENV: &str = "RUSTOS_CONFIG";
-const KERNEL_BUILD_CONFIG_ENV: &str = "KERNEL_BUILD_CONFIG";
 
 #[derive(Clone, Debug)]
 pub(crate) struct ProjectConfig {
@@ -43,16 +42,14 @@ pub(crate) enum ProjectConfigSource {
     BuiltInDefaults,
     Canonical(PathBuf),
     Override(PathBuf),
-    LegacyKernelBuild(PathBuf),
 }
 
 impl ProjectConfigSource {
     pub(crate) fn label(&self) -> String {
         match self {
-            Self::BuiltInDefaults => String::from("built-in defaults"),
+            Self::BuiltInDefaults => String::from("internal defaults"),
             Self::Canonical(path) => format!("canonical {}", path_label(path)),
             Self::Override(path) => format!("override {}", path_label(path)),
-            Self::LegacyKernelBuild(path) => format!("legacy {}", path_label(path)),
         }
     }
 }
@@ -240,18 +237,6 @@ struct LockTelemetryConfigFile {
     warn_hold_cycles: Option<u64>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct LegacyKernelBuildConfigFile {
-    hardening: LegacyKernelHardeningConfigFile,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct LegacyKernelHardeningConfigFile {
-    codegen_units: Option<u16>,
-}
-
 pub(crate) fn load_project_config(root_dir: &Path) -> Result<ProjectConfig> {
     let (mut config, source) = load_project_config_file(root_dir)?;
     apply_env_overrides(&mut config.kernel.build)?;
@@ -272,59 +257,28 @@ pub(crate) fn load_project_config(root_dir: &Path) -> Result<ProjectConfig> {
 }
 
 fn load_project_config_file(root_dir: &Path) -> Result<(ProjectConfig, ProjectConfigSource)> {
-    if let Some(path) = env_path(KERNEL_BUILD_CONFIG_ENV) {
-        return load_override_config(path);
-    }
-
-    let canonical_path = if let Some(path) = env_path(PROJECT_CONFIG_ENV) {
+    let (canonical_path, overridden) = if let Some(path) = env_path(PROJECT_CONFIG_ENV) {
         if !path.is_file() {
             bail!("{PROJECT_CONFIG_ENV} is not a file: {}", path.display());
         }
-        path
+        (path, true)
     } else {
-        root_dir.join("config/rustos.toml")
+        (root_dir.join("config/rustos.toml"), false)
     };
     if canonical_path.is_file() {
         let parsed = parse_project_config(&canonical_path)?;
-        return Ok((parsed, ProjectConfigSource::Canonical(canonical_path)));
+        let source = if overridden {
+            ProjectConfigSource::Override(canonical_path)
+        } else {
+            ProjectConfigSource::Canonical(canonical_path)
+        };
+        return Ok((parsed, source));
     }
 
-    let legacy_kernel_path = root_dir.join("config/kernel-build.toml");
-    if legacy_kernel_path.is_file() {
-        let parsed = parse_legacy_kernel_build_config(&legacy_kernel_path)?;
-        return Ok((
-            parsed,
-            ProjectConfigSource::LegacyKernelBuild(legacy_kernel_path),
-        ));
-    }
-
-    Ok((
-        ProjectConfig::default(),
-        ProjectConfigSource::BuiltInDefaults,
-    ))
-}
-
-fn load_override_config(path: PathBuf) -> Result<(ProjectConfig, ProjectConfigSource)> {
-    let text = fs::read_to_string(&path)?;
-    match toml::from_str::<ProjectConfigFile>(&text) {
-        Ok(parsed) => {
-            validate_logging_config(&text, &path)?;
-            Ok((
-                project_from_file(parsed),
-                ProjectConfigSource::Override(path),
-            ))
-        }
-        Err(project_err) => match toml::from_str::<LegacyKernelBuildConfigFile>(&text) {
-            Ok(_) => {
-                let parsed = parse_legacy_kernel_build_config(&path)?;
-                Ok((parsed, ProjectConfigSource::Override(path)))
-            }
-            Err(_) => Err(anyhow!(
-                "invalid RustOS config {}: {project_err}",
-                path.display()
-            )),
-        },
-    }
+    bail!(
+        "missing canonical RustOS config: {}",
+        canonical_path.display()
+    )
 }
 
 fn parse_project_config(path: &Path) -> Result<ProjectConfig> {
@@ -352,21 +306,6 @@ fn validate_logging_config(text: &str, path: &Path) -> Result<()> {
     build_log_cfg::try_parse_logging_toml(text)
         .map(|_| ())
         .map_err(|err| anyhow!("invalid logging config {}: {err}", path.display()))
-}
-
-fn parse_legacy_kernel_build_config(path: &Path) -> Result<ProjectConfig> {
-    let text = fs::read_to_string(path)?;
-    let parsed = toml::from_str::<LegacyKernelBuildConfigFile>(&text).map_err(|err| {
-        anyhow!(
-            "invalid legacy kernel build config {}: {err}",
-            path.display()
-        )
-    })?;
-    let mut config = ProjectConfig::default();
-    if let Some(value) = parsed.hardening.codegen_units {
-        config.kernel.build.codegen_units = value;
-    }
-    Ok(config)
 }
 
 fn project_from_file(file: ProjectConfigFile) -> ProjectConfig {

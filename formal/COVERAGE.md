@@ -21,6 +21,13 @@ passes TLC.
 
 | Risk | Model | Source anchor |
 | --- | --- | --- |
+| A malformed ELF64 or PE64 plan maps outside the process window, overlaps another region, creates a writable executable image, or starts outside executable memory | dual-abi-image-admission | libs/rustos-image-admission/src/lib.rs and services/loaderd/src/main.rs |
+| A malformed ELF64/PE64 byte table, relocation, import, or changed post-parse snapshot reaches a process mapping | dual-abi-byte-parser | libs/rustos-image-admission/src/lib.rs, services/loaderd/src/main.rs, and kernel/compat/src/user/syscall/linux/proc_broker_ops.rs |
+| A user page aliases a kernel/dead frame, remains W+X, or retains access authority after unmap | page-table-lifecycle | kernel/mm/src/memory/address_space.rs |
+| A device maps outside its assigned DMA aperture or keeps DMA authority after domain revoke | dma-iommu-isolation | tools/hostd/src/main.rs, libs/driver-domain-host/src/lib.rs, and kernel/io-manager/src/driver/iommu.rs |
+| Boot extents return content different from the authenticated staged file | filesystem-content-integrity | tools/xtask/src/stage/mod.rs and kernel/io-manager/src/storage/boot_volume.rs |
+| A malformed checksum, fragment, unsupported EtherType, or stale session payload reaches netd | network-payload-session | libs/driver-domain-protocol/src/lib.rs and kernel/io-manager/src/io/dvm_network.rs |
+| Continuously runnable System work consumes every dispatch while User work remains runnable | scheduler-cpu-distribution | kernel/ps/src/multitask/scheduler.rs |
 | Stale service endpoint or capability after revoke/exit | endpoint-registry | kernel/compat/src/user/syscall/linux/ipc_ops.rs |
 | Concurrent registration wins after another registrar or exit cleanup has observed an empty endpoint | endpoint-publication | kernel/compat/src/user/syscall/linux/ipc_ops.rs and kernel/ps/src/multitask/process_table.rs |
 | Child runs before exact supervisor lease admission | deferred-start | services/rootd/src/main.rs and services/loaderd/src/main.rs |
@@ -50,6 +57,7 @@ passes TLC.
 | A wake between arm and commit is lost, a timer-expired task remains blocked, or a retired task is selected/woken through stale scheduler state | scheduler-wakeup | kernel/ps/src/multitask/scheduler.rs, kernel/ps/src/multitask/current.rs, and kernel/ps/src/multitask/irq.rs |
 | Monotonic time is inferred from lossy RTC interrupt count, a delayed virtual clockevent extends every deadline, an unvalidated TSC becomes authoritative, or sleep reacquires the process-table lock already held by its syscall | clocksource-deadline | kernel/hal/src/arch/{acpi.rs,clock.rs,rtc.rs}, kernel/hal/src/hooks.rs, kernel/ps/src/multitask/{current.rs,scheduler.rs,irq.rs} |
 | A mutable or malformed runtime launch record requests strict System weight for an ordinary app, or UI weight is granted to a path that merely resembles the trusted UI executable | scheduler-admission | services/runtimed/src/{main.rs,spawn.rs} |
+| A catalog child becomes runnable before runtimed records its PID, or an activated child never receives its one-shot first turn while UI/input IPC handoffs remain busy | deferred-start, scheduler-cpu-distribution | services/runtimed/src/spawn.rs and kernel/ps/src/multitask/scheduler.rs |
 | A System caller waits on a User broker or nested User policy server without reply-scoped donation; a critical DVM/UI flood exceeds its bounded System burst while User work is ready; or a completed/cancelled/exited reply leaks an inherited System class | ipc-priority-inheritance | kernel/ps/src/multitask/{scheduler.rs,current.rs}, kernel/compat/src/user/syscall/linux/ipc_ops.rs |
 | Opaque IPC descriptors remain in the pending registry after queue cancellation, peer-close, invalid receiver output, or caller exit; one batch is partially installed | ipc-handle-transfer | kernel/ps/src/user/handles.rs, kernel/ipc-runtime/src/ipc/mod.rs, kernel/compat/src/user/syscall/linux/ipc_ops.rs, and kernel/ps/src/multitask/current.rs |
 | A foreign process receives a process-owned endpoint, completes a guessed reply capability, installs attached handles, prevents worker-thread service, leaves authority after owner-process exit, or makes `dup2`/`F_DUPFD` sparsely expand a ring-0 descriptor table | ipc-endpoint-ownership | kernel/ipc-runtime/src/ipc/mod.rs, kernel/compat/src/user/syscall/linux/ipc_ops.rs, kernel/ps/src/multitask/current.rs, kernel/ps/src/user/handles/table.rs, and kernel/compat/src/user/syscall/linux/service_ops/vfs_socket.rs |
@@ -58,10 +66,26 @@ passes TLC.
 
 ## Release-blocking proof gaps
 
-The suite does not yet model ELF/PE image bytes, page tables, DMA/IOMMU
-hardware behavior, filesystem contents, network packet payloads, or full
-scheduler CPU-time distribution. Any enabled commercial topology that depends on one
-of these surfaces is blocked until it has a dedicated abstraction with safety,
-progress, adversarial-transition checks, source conformance, and runtime fault
-evidence. Source tests, fuzzing, hardware-bound checks, and KVM validation are
-additional evidence; they do not waive the missing model.
+Dedicated finite abstractions now cover raw ELF/PE parser admission, page-table
+lifecycle, DMA-domain isolation, authenticated boot-file contents, DVM packet
+payload admission, and the bounded System-to-User CPU reservation. Pinned Kani
+0.67.0 source proofs additionally cover exact little-endian field decoding,
+arbitrary ELF load-segment and PE section admission, entry/W^X invariants,
+missing relocation tables, one arbitrary relocation entry's bounded exact
+effect, and one arbitrary import thunk's identity and bounds. Verus proves the
+five unbounded runtime-response theorems. These proofs do not by themselves
+close the release gates: arbitrary-length multi-block/multi-descriptor parser
+equivalence and runtime fault evidence still require independent artifacts.
+Commercial release remains blocked until the same properties have source
+conformance plus runtime fault evidence.
+The 30-second composite KVM gate now passes authenticated GUI-DVM readiness,
+synthetic evdev keyboard/pointer ingress, and the netprobe Ethernet round trip
+with nonzero producer/consumer activity in both fixed rings. That is a normal
+virtual-transport capture, not the remaining denial/fault/hardware evidence:
+ELF/PE multi-block corpus fuzz and native launch captures; page-table/TLB tests
+on target hardware; non-identity VT-d/IOMMU mappings with fault injection and revoke;
+boot-media corruption/recovery; packet saturation/cancellation/backpressure and
+physical-NIC behavior; and
+multicore CPU-time distribution under interrupt and DVM load. The current
+kernel IOMMU backend is identity-only, so the DMA hardware gate is explicitly
+failed even though its abstraction passes TLC.

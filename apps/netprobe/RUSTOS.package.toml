@@ -1,7 +1,6 @@
 id = "netprobe"
 kind = "app"
 execution_domain = "user"
-profiles = ["default"]
 startup = "session"
 
 [build]

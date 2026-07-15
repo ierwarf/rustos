@@ -6,13 +6,14 @@ use std::process::Command;
 
 use fatfs::Seek as FatSeek;
 use fatfs::Write as FatWrite;
+use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::Result;
 use crate::config::Config;
 use crate::package_manifest::{
     BuilderKind, DesktopEntrySpec, DesktopLaunchMode, InstallLayout, PackageManifest, StartupMode,
-    load_default_manifests,
+    load_manifests,
 };
 use crate::util::{
     command_in_path, copy_or_unpack_firmware, copy_tree_files, copy_with_parent,
@@ -20,10 +21,10 @@ use crate::util::{
 };
 
 const APPLICATIONS_DIR: &str = "usr/share/applications";
-const DRIVER_REGISTRY_PATH: &str = "system/registry/kernel/loadable-drivers.tsv";
 const ROOT_FILE_EXTENTS_REGISTRY_PATH: &str = "system/registry/kernel/root-file-extents.tsv";
 const ROOT_FILE_EXTENTS_REGISTRY_SIGNATURE_PATH: &str =
     "system/registry/kernel/root-file-extents.tsv.sig";
+const ROOT_CONTENT_CHUNK_BYTES: usize = 64 * 1024;
 const DESKTOP_REGISTRY_PATH: &str = "system/registry/system/desktop-programs.tsv";
 const RUNTIME_LAUNCH_REGISTRY_PATH: &str = "system/registry/system/runtime-launch-programs.tsv";
 const STARTUP_REGISTRY_PATH: &str = "system/registry/system/startup-programs.tsv";
@@ -85,10 +86,10 @@ const ABI_FUZZ_DESKTOP_ID: &str = "abifuzz.desktop";
 const DEFAULT_GRUB_DEV_KEY: &str = "RustOS Dev GRUB <rustos-dev-grub@example.invalid>";
 
 pub(crate) fn stage(config: &Config) -> Result<()> {
-    let manifests = load_default_manifests(&config.root_dir)?;
+    let manifests = load_manifests(&config.root_dir)?;
 
     remove_dir_if_exists(&config.image_dir)?;
-    cleanup_legacy_build_layout(config)?;
+    cleanup_stale_build_paths(config)?;
 
     stage_image_asset_overlay(&config.image_asset_overlay_dir, &config.image_dir)?;
     apply_configured_autostart_policy(config)?;
@@ -106,7 +107,6 @@ pub(crate) fn stage(config: &Config) -> Result<()> {
         copy_or_unpack_firmware(&config.amdgpu_firmware_dir, basename, &dst)?;
     }
 
-    write_driver_registry(config, &manifests)?;
     write_application_desktop_files(config, &manifests)?;
     write_desktop_registry(config, &manifests)?;
     write_runtime_launch_registry(config, &manifests)?;
@@ -136,12 +136,6 @@ fn stage_manifest(config: &Config, manifest: &PackageManifest) -> Result<()> {
                 return Ok(());
             }
         }
-    }
-
-    if manifest.build.optional {
-        remove_file_if_exists(&image)?;
-        remove_dir_if_exists(&image)?;
-        return Ok(());
     }
 
     Err(anyhow!(
@@ -241,6 +235,7 @@ fn write_boot_disk_image(config: &Config) -> Result<()> {
                 path: format!("/{}", file.relative),
                 len: file.len,
                 extents: collect_fat_file_extents(&mut dst)?,
+                chunk_sha256: file.chunk_sha256.clone(),
             });
         }
         extent_manifest = write_root_file_extents_registry(&root, &extent_entries)?;
@@ -260,6 +255,7 @@ struct BootDiskExtentEntry {
     path: String,
     len: u64,
     extents: Vec<BootDiskFileExtent>,
+    chunk_sha256: Vec<[u8; 32]>,
 }
 
 struct BootDiskFileExtent {
@@ -290,6 +286,9 @@ fn verify_boot_disk_image_contract(
                 "boot extent contract metadata mismatch for {}",
                 file.source.display()
             );
+        }
+        if entry.chunk_sha256 != file.chunk_sha256 {
+            bail!("boot extent content digest mismatch for {}", entry.path);
         }
 
         let expected = fs::read(&file.source)
@@ -401,6 +400,13 @@ where
             content.push(':');
             content.push_str(extent.len.to_string().as_str());
         }
+        content.push_str("\tsha256_chunks=");
+        for (index, digest) in entry.chunk_sha256.iter().enumerate() {
+            if index != 0 {
+                content.push(',');
+            }
+            content.push_str(sha256_hex(digest).as_str());
+        }
         content.push('\n');
     }
 
@@ -472,6 +478,7 @@ struct ImageFile {
     source: PathBuf,
     relative: String,
     len: u64,
+    chunk_sha256: Vec<[u8; 32]>,
 }
 
 fn collect_image_files(image_dir: &Path) -> Result<Vec<ImageFile>> {
@@ -493,15 +500,53 @@ fn collect_image_files(image_dir: &Path) -> Result<Vec<ImageFile>> {
             let len = fs::metadata(&path)
                 .map_err(|err| anyhow!("failed to stat image file {}: {err}", path.display()))?
                 .len();
+            let chunk_sha256 = sha256_file_chunks(&path)?;
             Ok(ImageFile {
                 source: path,
                 relative,
                 len,
+                chunk_sha256,
             })
         })
         .collect::<Result<Vec<_>>>()?;
     files.sort_by(|lhs, rhs| lhs.relative.cmp(&rhs.relative));
     Ok(files)
+}
+
+fn sha256_file_chunks(path: &Path) -> Result<Vec<[u8; 32]>> {
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("failed to hash staged file {}", path.display()))?;
+    let mut buffer = vec![0_u8; ROOT_CONTENT_CHUNK_BYTES];
+    let mut chunks = Vec::new();
+    loop {
+        let mut used = 0usize;
+        while used < buffer.len() {
+            let read = file.read(&mut buffer[used..])?;
+            if read == 0 {
+                break;
+            }
+            used += read;
+        }
+        if used == 0 {
+            break;
+        }
+        let digest: [u8; 32] = Sha256::digest(&buffer[..used]).into();
+        chunks.push(digest);
+        if used < buffer.len() {
+            break;
+        }
+    }
+    Ok(chunks)
+}
+
+fn sha256_hex(digest: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        out.push(HEX[usize::from(byte >> 4)] as char);
+        out.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    out
 }
 
 fn boot_disk_image_len(payload_bytes: u64) -> u64 {
@@ -555,45 +600,6 @@ where
         dst.write_all(&buf[..read])?;
     }
     Ok(())
-}
-
-fn write_driver_registry(config: &Config, manifests: &[PackageManifest]) -> Result<()> {
-    let mut lines = Vec::new();
-    for manifest in manifests {
-        let Some(autoload) = manifest.autoload.as_ref() else {
-            continue;
-        };
-        if !autoload.enabled {
-            continue;
-        }
-        if !manifest.artifact_path(config).is_file() {
-            continue;
-        }
-        let aliases = registry_list(&autoload.aliases)?;
-        let deps = registry_list(&autoload.deps)?;
-        let softdeps = registry_list(&autoload.softdeps)?;
-        let linux_driver_names = if autoload.linux_driver_names.is_empty() {
-            registry_list(std::slice::from_ref(&autoload.name))?
-        } else {
-            registry_list(&autoload.linux_driver_names)?
-        };
-        lines.push(format!(
-            "name={}\tclass={}\tbus={}\tpriority={}\tpath={}\twhen={}\taliases={}\tdeps={}\tsoftdeps={}\tlinux_driver_names={}\tprovider_group={}\tfallback_only={}",
-            registry_value(&autoload.name)?,
-            registry_value(&autoload.class)?,
-            registry_value(&autoload.bus)?,
-            autoload.priority,
-            registry_value(&manifest.install.path)?,
-            registry_value(autoload.when.as_deref().unwrap_or("vfs-ready"))?,
-            aliases,
-            deps,
-            softdeps,
-            linux_driver_names,
-            registry_value(autoload.provider_group.as_deref().unwrap_or(""))?,
-            if autoload.fallback_only { 1 } else { 0 },
-        ));
-    }
-    write_registry_lines(config.image_dir.join(DRIVER_REGISTRY_PATH), &lines)
 }
 
 fn write_application_desktop_files(config: &Config, manifests: &[PackageManifest]) -> Result<()> {
@@ -1055,12 +1061,7 @@ fn registry_value(value: &str) -> Result<String> {
 }
 
 fn registry_deps(deps: &[String]) -> Result<String> {
-    registry_list(deps)
-}
-
-fn registry_list(values: &[String]) -> Result<String> {
-    values
-        .iter()
+    deps.iter()
         .map(|value| {
             if value.contains(',') {
                 bail!("registry list value contains unsupported separator: {value:?}");
@@ -1262,7 +1263,7 @@ fn path_join_unix(prefix: &str, suffix: &Path) -> Result<String> {
     Ok(format!("{prefix}/{suffix}"))
 }
 
-fn cleanup_legacy_build_layout(config: &Config) -> Result<()> {
+fn cleanup_stale_build_paths(config: &Config) -> Result<()> {
     // Keep staging cleanup bounded to known stale paths; a broad build tree walk
     // makes `cargo xtask stage` slower and can remove still-valid artifacts.
     for relative in STALE_BUILD_DIRS {
@@ -1306,7 +1307,7 @@ fn generate_dynamic_linker_cache(image_dir: &Path) -> Result<()> {
 mod tests {
     use super::{
         BootDiskExtentEntry, ImageFile, collect_fat_file_extents, ensure_fat_parent_dirs,
-        registry_deps, registry_list, verify_boot_disk_image_contract,
+        registry_deps, sha256_file_chunks, verify_boot_disk_image_contract,
         write_root_file_extents_registry,
     };
     use fatfs::{Seek as _, Write as _};
@@ -1334,23 +1335,10 @@ mod tests {
     }
 
     #[test]
-    fn registry_list_join_driver_metadata_with_commas() {
-        let aliases = vec![
-            "virtio:d00000010v*".to_string(),
-            "pci:v00001002d*".to_string(),
-        ];
+    fn registry_deps_rejects_embedded_commas() {
+        let deps = vec!["runtimed,sessiond".to_string()];
 
-        assert_eq!(
-            registry_list(&aliases).unwrap(),
-            "virtio:d00000010v*,pci:v00001002d*"
-        );
-    }
-
-    #[test]
-    fn registry_list_rejects_embedded_commas() {
-        let aliases = vec!["virtio:d00000010v*,pci:v00001002d*".to_string()];
-
-        assert!(registry_list(&aliases).is_err());
+        assert!(registry_deps(&deps).is_err());
     }
 
     #[test]
@@ -1359,6 +1347,7 @@ mod tests {
         let source = temp.path().join("rootd.elf");
         let payload = b"rootd bootstrap payload";
         std::fs::write(&source, payload).unwrap();
+        let chunk_sha256 = sha256_file_chunks(&source).unwrap();
 
         let boot_disk = temp.path().join("rustos-boot.img");
         let image_file = OpenOptions::new()
@@ -1384,6 +1373,7 @@ mod tests {
                 path: format!("/{relative}"),
                 len: payload.len() as u64,
                 extents: collect_fat_file_extents(&mut staged).unwrap(),
+                chunk_sha256: chunk_sha256.clone(),
             };
             let manifest =
                 write_root_file_extents_registry(&root, std::slice::from_ref(&entry)).unwrap();
@@ -1397,6 +1387,7 @@ mod tests {
                 source,
                 relative: "services/rootd/rootd.elf".to_string(),
                 len: payload.len() as u64,
+                chunk_sha256,
             }],
             &[entry],
             &manifest,

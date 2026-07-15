@@ -5,6 +5,13 @@ set -eo pipefail
 models='
 boot-volume-admission/BootVolumeAdmission
 runtime-control-rpc/RuntimeControlRpc
+dual-abi-image-admission/DualAbiImageAdmission
+dual-abi-byte-parser/DualAbiByteParser
+page-table-lifecycle/PageTableLifecycle
+dma-iommu-isolation/DmaIommuIsolation
+filesystem-content-integrity/FilesystemContentIntegrity
+network-payload-session/NetworkPayloadSession
+scheduler-cpu-distribution/SchedulerCpuDistribution
 rootd-bootstrap/RootdBootstrap
 endpoint-registry/EndpointRegistry
 endpoint-publication/EndpointPublication

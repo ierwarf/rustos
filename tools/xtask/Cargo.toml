@@ -11,8 +11,10 @@ fatfs = { git = "https://github.com/rafalh/rust-fatfs", default-features = false
 fs-err = "3"
 rustos-fault-injection = { path = "../../libs/rustos-fault-injection" }
 rustos-driver-domain-host = { path = "../../libs/driver-domain-host" }
+rustos-image-admission = { path = "../../libs/rustos-image-admission" }
 driver-domain-protocol = { path = "../../libs/driver-domain-protocol" }
 serde = { version = "1.0", features = ["derive"] }
+sha2 = "0.10"
 storage-core = { path = "../../libs/storage-core" }
 storage-fat = { path = "../../libs/storage-fat" }
 tempfile = "3"

@@ -1691,7 +1691,10 @@ fn await_authenticated_packet_provider() -> Result<(), i32> {
                 }
                 return Ok(());
             }
-            PacketProviderState::Unavailable => return Err(libc::ENODEV),
+            PacketProviderState::Unavailable => {
+                debug_line("netd: DVM network transport unavailable");
+                return Err(libc::ENODEV);
+            }
             PacketProviderState::AwaitingAuthenticatedControl => {
                 if !logged_wait {
                     debug_line("netd: waiting for authenticated DVM network control");
@@ -1700,6 +1703,7 @@ fn await_authenticated_packet_provider() -> Result<(), i32> {
             }
         }
         if StdInstant::now() >= deadline {
+            debug_line("netd: authenticated DVM network control timed out");
             return Err(libc::ENODEV);
         }
         thread::sleep(AUTHENTICATED_CONTROL_RETRY);

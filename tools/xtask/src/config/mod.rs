@@ -49,9 +49,8 @@ impl Config {
     pub(crate) fn from_env() -> Result<Self> {
         let root_dir = env_path("ROOT_DIR").unwrap_or_else(default_root_dir);
         let project = load_project_config(&root_dir)?;
-        let workspace_manifest = env_path("WORKSPACE_MANIFEST")
-            .or_else(|| env_path("KERNEL_GROUND_MANIFEST"))
-            .unwrap_or_else(|| root_dir.join("Cargo.toml"));
+        let workspace_manifest =
+            env_path("WORKSPACE_MANIFEST").unwrap_or_else(|| root_dir.join("Cargo.toml"));
         let cargo_target_dir =
             env_path("CARGO_TARGET_DIR").unwrap_or_else(|| root_dir.join("target"));
 
@@ -70,9 +69,8 @@ impl Config {
 
         let kernel_target =
             env_string("KERNEL_TARGET").unwrap_or_else(|| String::from("x86_64-unknown-linux-gnu"));
-        let nucleus_package = env_string("NUCLEUS_PACKAGE")
-            .or_else(|| env_string("KERNEL_PACKAGE"))
-            .unwrap_or_else(|| String::from("nucleus"));
+        let nucleus_package =
+            env_string("NUCLEUS_PACKAGE").unwrap_or_else(|| String::from("nucleus"));
         let user_elf_linkage =
             env_string("USER_ELF_LINKAGE").unwrap_or_else(|| String::from("dynamic"));
 
@@ -93,7 +91,6 @@ impl Config {
                 )
             });
         let nucleus_rustc_args = env_string("NUCLEUS_RUSTC_ARGS")
-            .or_else(|| env_string("KERNEL_RUSTC_ARGS"))
             .map(|value| split_whitespace_owned(&value))
             .unwrap_or_else(|| {
                 let linker_script = root_dir.join("kernel/linker-multiboot2.ld");
