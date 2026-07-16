@@ -465,9 +465,10 @@ fn admitted_task_weight_micros(exec_path: &str, weight_micros: u64) -> u64 {
     } else {
         weight_micros
     };
-    requested
-        .max(MIN_EFFECTIVE_TASK_WEIGHT_MICROS)
-        .min(MAX_UNTRUSTED_TASK_WEIGHT_MICROS)
+    requested.clamp(
+        MIN_EFFECTIVE_TASK_WEIGHT_MICROS,
+        MAX_UNTRUSTED_TASK_WEIGHT_MICROS,
+    )
 }
 
 pub(super) fn lookup_service_endpoint(service_id: u64) -> i64 {

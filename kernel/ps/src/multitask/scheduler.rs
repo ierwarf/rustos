@@ -561,9 +561,7 @@ impl Scheduler {
         if slot >= MAX_TASK {
             return None;
         }
-        let Some(context) = self.contexts[slot] else {
-            return None;
-        };
+        let context = self.contexts[slot]?;
         if !context.ready || !self.context_is_schedulable(slot, context) {
             return None;
         }
@@ -619,6 +617,9 @@ impl Scheduler {
         Some(slot)
     }
 
+    // Architectural register and entry fields stay explicit at scheduler
+    // context construction boundaries.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn reset(
         &mut self,
         main_thread_pit_divisor: u16,
@@ -694,11 +695,11 @@ impl Scheduler {
         if let Some(task_id) = self.starts[slot].map(|start| start.id) {
             self.release_ipc_priorities_for_task(task_id);
         }
-        if let Some(context) = self.contexts[slot] {
-            if let Some(handle) = context.process_handle {
-                crate::debug::trace_loc!();
-                let _ = process_table::detach_task(handle);
-            }
+        if let Some(context) = self.contexts[slot]
+            && let Some(handle) = context.process_handle
+        {
+            crate::debug::trace_loc!();
+            let _ = process_table::detach_task(handle);
         }
 
         self.contexts[slot] = None;
@@ -1557,6 +1558,7 @@ impl Scheduler {
             .is_none()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn allocate_kernel_slot(
         &mut self,
         entry: fn(u64),
@@ -1613,6 +1615,7 @@ impl Scheduler {
         None
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn allocate_user_slot(
         &mut self,
         id: u64,
@@ -1641,15 +1644,15 @@ impl Scheduler {
                     bootstrap.logical_admin,
                     exec_path.as_str(),
                 );
-                if let Some(thread_state) = bootstrap.windows_thread_state {
-                    if let Err(error) = process::initialize_windows_thread_identifiers(
+                if let Some(thread_state) = bootstrap.windows_thread_state
+                    && let Err(error) = process::initialize_windows_thread_identifiers(
                         boxed_state.address_space_mut(),
                         thread_state.teb_address,
                         id,
                         id,
-                    ) {
-                        panic!("failed to initialize windows thread ids: {:?}", error);
-                    }
+                    )
+                {
+                    panic!("failed to initialize windows thread ids: {:?}", error);
                 }
                 let root_phys = boxed_state.address_space().root_phys().as_u64();
                 let process_handle =
@@ -1715,6 +1718,7 @@ impl Scheduler {
         None
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn allocate_user_process_state_slot(
         &mut self,
         id: u64,
@@ -1780,6 +1784,7 @@ impl Scheduler {
         None
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn allocate_kernel_process_slot(
         &mut self,
         id: u64,
@@ -1868,12 +1873,8 @@ impl Scheduler {
         }
 
         let root_phys = current.address_space_root;
-        let Some(process_handle) = current.process_handle else {
-            return None;
-        };
-        let Some(process_id) = current.process_id else {
-            return None;
-        };
+        let process_handle = current.process_handle?;
+        let process_id = current.process_id?;
         for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
             if self.contexts[slot].is_none() {
                 self.reset_stack_storage(slot)?;
@@ -2124,11 +2125,10 @@ impl Scheduler {
         // floor the charge — see `account_current_runtime` for the rationale.
         self.account_current_runtime(current_slot, now_ticks, voluntary_yield);
 
-        if self.retired[current_slot] {
-            self.mark_slot_ready(current_slot, current_rsp, false);
-        } else if self.contexts[current_slot]
-            .map(|ctx| ctx.blocked)
-            .unwrap_or(false)
+        if self.retired[current_slot]
+            || self.contexts[current_slot]
+                .map(|ctx| ctx.blocked)
+                .unwrap_or(false)
         {
             self.mark_slot_ready(current_slot, current_rsp, false);
         } else if self.contexts[current_slot]
@@ -2259,10 +2259,10 @@ impl Scheduler {
         current_runtime_ns: u64,
     ) -> usize {
         if cfs_pick == current_slot {
-            if current_runtime_ns >= SCHED_MAX_BURST_NS {
-                if let Some(alternate) = self.pick_burst_alternate_in_current_class(current_slot) {
-                    return alternate;
-                }
+            if current_runtime_ns >= SCHED_MAX_BURST_NS
+                && let Some(alternate) = self.pick_burst_alternate_in_current_class(current_slot)
+            {
+                return alternate;
             }
             return cfs_pick;
         }
@@ -2288,10 +2288,9 @@ impl Scheduler {
         // sched_min_granularity check between policies" stacking.
         if let (Some(current_class), Some(pick_class)) =
             (self.slot_class(current_slot), self.slot_class(cfs_pick))
+            && pick_class < current_class
         {
-            if pick_class < current_class {
-                return cfs_pick;
-            }
+            return cfs_pick;
         }
 
         // If the pick's vruntime advantage is large, preempt unconditionally:
@@ -2314,6 +2313,7 @@ impl Scheduler {
         }
     }
 
+    #[allow(clippy::needless_return)]
     fn trace_switch(&self, from_slot: usize, to_slot: usize) {
         if from_slot == to_slot {
             return;
@@ -2595,10 +2595,7 @@ impl Scheduler {
             let Some(process_handle) = context.process_handle else {
                 continue;
             };
-            if seen[..seen_count]
-                .iter()
-                .any(|seen_owner| *seen_owner == Some(process_handle))
-            {
+            if seen[..seen_count].contains(&Some(process_handle)) {
                 continue;
             }
 
@@ -2688,8 +2685,8 @@ impl Scheduler {
         )
         .expect("current process handle disappeared during exec");
 
-        for index in 0..sibling_count {
-            self.clear_slot(sibling_slots[index]);
+        for sibling_slot in sibling_slots.iter().take(sibling_count) {
+            self.clear_slot(*sibling_slot);
         }
 
         FsBase::write(VirtAddr::new(new_fs_base));
@@ -2779,8 +2776,8 @@ impl Scheduler {
         )
         .expect("target process handle disappeared during exec");
 
-        for index in 0..sibling_count {
-            self.clear_slot(sibling_slots[index]);
+        for sibling_slot in sibling_slots.iter().take(sibling_count) {
+            self.clear_slot(*sibling_slot);
         }
         true
     }

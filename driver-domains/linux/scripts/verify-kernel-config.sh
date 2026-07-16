@@ -25,6 +25,19 @@ require_disabled() {
 
 require_enabled CONFIG_MODULES
 require_enabled CONFIG_MODVERSIONS
+require_enabled CONFIG_MODULE_SIG
+require_enabled CONFIG_MODULE_SIG_FORCE
+require_enabled CONFIG_MODULE_SIG_ALL
+require_enabled CONFIG_MODULE_SIG_SHA256
+require_enabled CONFIG_MODULE_SIG_KEY_TYPE_RSA
+grep -qx 'CONFIG_MODULE_SIG_HASH="sha256"' "$config" || {
+    echo "rustos-linux-dvm: module signature hash is not pinned to sha256" >&2
+    exit 1
+}
+grep -qx 'CONFIG_MODULE_SIG_KEY="certs/signing_key.pem"' "$config" || {
+    echo "rustos-linux-dvm: module signing key path is not the image-private build key" >&2
+    exit 1
+}
 require_enabled CONFIG_DEVTMPFS
 require_enabled CONFIG_DEVTMPFS_MOUNT
 require_enabled CONFIG_PCI
@@ -39,5 +52,8 @@ require_enabled CONFIG_VIRTIO_INPUT
 require_enabled CONFIG_INPUT_UINPUT
 require_enabled CONFIG_DRM
 require_enabled CONFIG_DRM_VIRTIO_GPU
+require_enabled CONFIG_DRM_I915
+require_enabled CONFIG_DRM_XE
+require_enabled CONFIG_DRM_AMDGPU
 require_enabled CONFIG_DRM_FBDEV_EMULATION
 require_enabled CONFIG_VIRTIO_VSOCKETS

@@ -10,7 +10,16 @@ use rustos_driver_domain_host::{
     DriverDomainPolicy, FileLeaseStore, HostControlListener, InputRingSink, IommuTopology,
     LaunchPlan, ReleaseAuthorization, SysfsVfioOps, ValidatedLease, VfioOps, VfioReleaseBinding,
     acquire_vfio_lease, inspect_vfio_lease, inspect_vfio_lease_preflight, restore_vfio_lease,
+    validate_host_display_assignment,
 };
+
+mod runtime;
+
+use runtime::{
+    RuntimeStore, SuperviseConfig, preflight_physical_runtime_inputs, recover_domain,
+    supervise_domain, verify_artifacts,
+};
+use runtime::{sha256_file, trusted_canonical_regular_file};
 
 #[derive(Parser)]
 #[command(
@@ -35,6 +44,19 @@ enum Command {
         plan: PathBuf,
         #[arg(long, default_value = "/sys")]
         sysfs_root: PathBuf,
+    },
+    /// Validate the complete display-DVM runtime without changing a device binding.
+    PreflightPhysical {
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long, default_value = "/sys")]
+        sysfs_root: PathBuf,
+        #[arg(long, default_value = "/usr/bin/qemu-system-x86_64")]
+        qemu: PathBuf,
+        #[arg(long)]
+        dvm_artifact_manifest: PathBuf,
+        #[arg(long)]
+        device_policy: PathBuf,
     },
     /// Preflight the lease, then accept one bounded host-to-DVM control probe.
     Probe {
@@ -109,6 +131,9 @@ enum Command {
         /// Hash-bound fleet policy that proves no other domain reuses this CID, IOMMU group, or PCI function.
         #[arg(long)]
         fleet_policy: Option<PathBuf>,
+        /// Exact production QEMU admitted by the signed device policy before VFIO binding.
+        #[arg(long, default_value = "/usr/bin/qemu-system-x86_64")]
+        qemu: PathBuf,
     },
     /// Show or explicitly restore the original host drivers from a durable VFIO lease.
     Release {
@@ -121,6 +146,47 @@ enum Command {
         /// Restore original drivers and remove the durable lease only after success.
         #[arg(long)]
         activate: bool,
+    },
+    /// Supervise one already-authorized VFIO display DVM through authenticated
+    /// readiness, bounded shutdown, device reset, and original-driver restore.
+    Supervise {
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long, default_value = "/sys")]
+        sysfs_root: PathBuf,
+        #[arg(long, default_value = "/run/rustos-hostd/leases")]
+        state_root: PathBuf,
+        #[arg(long, default_value = "/run/rustos-hostd/domains")]
+        runtime_root: PathBuf,
+        #[arg(long, default_value = "/usr/bin/qemu-system-x86_64")]
+        qemu: PathBuf,
+        #[arg(long)]
+        dvm_artifact_manifest: PathBuf,
+        #[arg(long)]
+        device_policy: PathBuf,
+        #[arg(long)]
+        display_doorbell: PathBuf,
+        #[arg(long)]
+        display_pixels: PathBuf,
+        #[arg(long, default_value_t = 30)]
+        timeout_secs: u64,
+    },
+    /// Recover an active durable lease after hostd or the DVM crashed. A PID
+    /// is signalled only when its /proc start time matches the durable record.
+    Recover {
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long, default_value = "/sys")]
+        sysfs_root: PathBuf,
+        #[arg(long, default_value = "/run/rustos-hostd/leases")]
+        state_root: PathBuf,
+        #[arg(long, default_value = "/run/rustos-hostd/domains")]
+        runtime_root: PathBuf,
+    },
+    /// Verify one self-contained schema-8 DVM release bundle without launching it.
+    VerifyArtifacts {
+        #[arg(long)]
+        dvm_artifact_manifest: PathBuf,
     },
 }
 
@@ -137,9 +203,31 @@ fn main() -> Result<()> {
             }
         }
         Command::Preflight { plan, sysfs_root } => {
-            let lease = validate_plan(&plan, &sysfs_root)?;
+            let lease = validate_assignment_plan(&plan, &sysfs_root)?;
             println!(
                 "rustos-hostd: lease preflight passed domain={} cid={} iommu_group={} pci_bdfs={}",
+                lease.domain_id,
+                lease.dvm_guest_cid,
+                lease.iommu_group,
+                lease.pci_bdfs.join(","),
+            );
+        }
+        Command::PreflightPhysical {
+            plan,
+            sysfs_root,
+            qemu,
+            dvm_artifact_manifest,
+            device_policy,
+        } => {
+            let lease = validate_assignment_plan(&plan, &sysfs_root)?;
+            preflight_physical_runtime_inputs(
+                &lease,
+                &qemu,
+                &dvm_artifact_manifest,
+                &device_policy,
+            )?;
+            println!(
+                "rustos-hostd: physical runtime preflight passed domain={} cid={} iommu_group={} pci_bdfs={} iommufd=ready",
                 lease.domain_id,
                 lease.dvm_guest_cid,
                 lease.iommu_group,
@@ -160,13 +248,15 @@ fn main() -> Result<()> {
                 HostControlListener::bind(lease.dvm_guest_cid, contract, control_secret)?;
             let result = listener.probe_once(Duration::from_secs(timeout_secs))?;
             println!(
-                "rustos-hostd: DVM control verified domain={} cid={} iommu_group={} inventory_count={} virtio_net={} virtio_gpu={}",
+                "rustos-hostd: DVM control verified domain={} cid={} iommu_group={} inventory_count={} virtio_net={} virtio_gpu={} display_driver={} display_relay={}",
                 lease.domain_id,
                 result.peer_cid,
                 lease.iommu_group,
                 result.inventory_count,
                 result.driver_inventory.virtio_net_bound,
                 result.driver_inventory.virtio_gpu_bound,
+                result.driver_inventory.display_driver_bound,
+                result.driver_inventory.display_relay_ready,
             );
         }
         Command::RelayInput {
@@ -209,13 +299,15 @@ fn main() -> Result<()> {
                 };
                 match listener.relay_input_once(timeout, &mut sink) {
                     Ok(result) => println!(
-                        "rustos-hostd: DVM input relay ended domain={} cid={} iommu_group={} inventory_count={} virtio_net={} virtio_gpu={} forwarded_events={}",
+                        "rustos-hostd: DVM input relay ended domain={} cid={} iommu_group={} inventory_count={} virtio_net={} virtio_gpu={} display_driver={} display_relay={} forwarded_events={}",
                         lease.domain_id,
                         result.probe.peer_cid,
                         lease.iommu_group,
                         result.probe.inventory_count,
                         result.probe.driver_inventory.virtio_net_bound,
                         result.probe.driver_inventory.virtio_gpu_bound,
+                        result.probe.driver_inventory.display_driver_bound,
+                        result.probe.driver_inventory.display_relay_ready,
                         result.forwarded_events,
                     ),
                     Err(error) if once => return Err(error),
@@ -241,19 +333,30 @@ fn main() -> Result<()> {
             dvm_artifact_manifest,
             device_policy,
             fleet_policy,
+            qemu,
         } => {
-            let lease = validate_plan(&plan, &sysfs_root)?;
+            let lease = validate_assignment_plan(&plan, &sysfs_root)?;
             let mut ops = SysfsVfioOps::new(&sysfs_root);
             let release_binding = if activate {
-                Some(verify_release_authorization(
+                let dvm_artifact_manifest =
+                    required_path(dvm_artifact_manifest, "--dvm-artifact-manifest")?;
+                let device_policy = required_path(device_policy, "--device-policy")?;
+                let binding = verify_release_authorization(
                     &lease,
                     required_path(release_manifest, "--release-manifest")?,
                     required_path(release_signature, "--release-signature")?,
                     required_path(release_keyring, "--release-keyring")?,
-                    required_path(dvm_artifact_manifest, "--dvm-artifact-manifest")?,
-                    required_path(device_policy, "--device-policy")?,
+                    dvm_artifact_manifest.clone(),
+                    device_policy.clone(),
                     required_path(fleet_policy, "--fleet-policy")?,
-                )?)
+                )?;
+                preflight_physical_runtime_inputs(
+                    &lease,
+                    &qemu,
+                    &dvm_artifact_manifest,
+                    &device_policy,
+                )?;
+                Some(binding)
             } else {
                 None
             };
@@ -276,6 +379,17 @@ fn main() -> Result<()> {
             }
             let store = FileLeaseStore::new(state_root);
             store.create_prepared(&record, current_unix_time()?)?;
+            if let Err(error) = validate_host_display_assignment(&lease, &sysfs_root) {
+                let cleanup_error = store.remove(&record.domain_id).err();
+                if let Some(cleanup_error) = cleanup_error {
+                    anyhow::bail!(
+                        "host display became active before VFIO binding: {error:#}; prepared lease cleanup failed: {cleanup_error:#}"
+                    );
+                }
+                anyhow::bail!(
+                    "host display became active before VFIO binding; prepared lease removed: {error:#}"
+                );
+            }
             if let Err(error) = acquire_vfio_lease(&record, &mut ops, current_unix_time()?) {
                 anyhow::bail!(
                     "VFIO acquire failed; prepared lease retained for explicit recovery with release --activate: {error:#}"
@@ -325,6 +439,70 @@ fn main() -> Result<()> {
                 record.domain_id, record.iommu_group
             );
         }
+        Command::Supervise {
+            plan,
+            sysfs_root,
+            state_root,
+            runtime_root,
+            qemu,
+            dvm_artifact_manifest,
+            device_policy,
+            display_doorbell,
+            display_pixels,
+            timeout_secs,
+        } => {
+            let lease = validate_plan(&plan, &sysfs_root)?;
+            let lease_store = FileLeaseStore::new(&state_root);
+            let mut record = lease_store.load(&lease.domain_id)?;
+            validate_record_matches_lease(&record, &lease)?;
+            let runtime_store = RuntimeStore::new(runtime_root);
+            let status = supervise_domain(
+                &mut record,
+                &sysfs_root,
+                &runtime_store,
+                SuperviseConfig {
+                    qemu: &qemu,
+                    artifact_manifest: &dvm_artifact_manifest,
+                    device_policy: &device_policy,
+                    display_doorbell: &display_doorbell,
+                    display_pixels: &display_pixels,
+                    setup_timeout: Duration::from_secs(timeout_secs.clamp(1, 30)),
+                },
+            )?;
+            lease_store.remove(&lease.domain_id)?;
+            println!(
+                "rustos-hostd: supervised DVM stopped domain={} status={status}",
+                lease.domain_id
+            );
+        }
+        Command::Recover {
+            plan,
+            sysfs_root,
+            state_root,
+            runtime_root,
+        } => {
+            let lease = validate_plan(&plan, &sysfs_root)?;
+            let lease_store = FileLeaseStore::new(&state_root);
+            let record = lease_store.load(&lease.domain_id)?;
+            validate_record_matches_lease(&record, &lease)?;
+            recover_domain(&record, &sysfs_root, &RuntimeStore::new(runtime_root))?;
+            lease_store.remove(&lease.domain_id)?;
+            println!(
+                "rustos-hostd: recovered DVM lease domain={} iommu_group={}",
+                lease.domain_id, lease.iommu_group
+            );
+        }
+        Command::VerifyArtifacts {
+            dvm_artifact_manifest,
+        } => {
+            let artifacts = verify_artifacts(&dvm_artifact_manifest)?;
+            println!(
+                "rustos-hostd: verified self-contained DVM release kernel={} rootfs={} control={}",
+                artifacts.kernel.display(),
+                artifacts.rootfs.display(),
+                artifacts.control_contract.display()
+            );
+        }
     }
     Ok(())
 }
@@ -336,6 +514,15 @@ fn validate_plan(
     let plan = LaunchPlan::from_env_file(plan_path)?;
     let topology = IommuTopology::discover(sysfs_root)?;
     plan.validate_topology(&topology)
+}
+
+fn validate_assignment_plan(
+    plan_path: &std::path::Path,
+    sysfs_root: &std::path::Path,
+) -> Result<rustos_driver_domain_host::ValidatedLease> {
+    let lease = validate_plan(plan_path, sysfs_root)?;
+    validate_host_display_assignment(&lease, sysfs_root)?;
+    Ok(lease)
 }
 
 fn validate_record_matches_lease(
@@ -365,7 +552,15 @@ fn verify_release_authorization(
     device_policy: PathBuf,
     fleet_policy: PathBuf,
 ) -> Result<VfioReleaseBinding> {
-    let status = ProcessCommand::new("gpgv")
+    let owner = unsafe { libc::geteuid() };
+    let release_manifest = trusted_canonical_regular_file(&release_manifest, owner)?;
+    let release_signature = trusted_canonical_regular_file(&release_signature, owner)?;
+    let release_keyring = trusted_canonical_regular_file(&release_keyring, owner)?;
+    let dvm_artifact_manifest = trusted_canonical_regular_file(&dvm_artifact_manifest, owner)?;
+    let device_policy = trusted_canonical_regular_file(&device_policy, owner)?;
+    let fleet_policy = trusted_canonical_regular_file(&fleet_policy, owner)?;
+    let gpgv = trusted_canonical_regular_file(std::path::Path::new("/usr/bin/gpgv"), 0)?;
+    let status = ProcessCommand::new(gpgv)
         .arg("--keyring")
         .arg(&release_keyring)
         .arg(&release_signature)
@@ -405,26 +600,4 @@ fn verify_sha256_file(path: &std::path::Path, expected: &str) -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn sha256_file(path: &std::path::Path) -> Result<String> {
-    let output = ProcessCommand::new("sha256sum")
-        .arg(path)
-        .output()
-        .map_err(|error| anyhow::anyhow!("hash {}: {error}", path.display()))?;
-    if !output.status.success() {
-        anyhow::bail!("sha256sum failed for {}", path.display());
-    }
-    let actual = String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
-        .next()
-        .map(str::to_ascii_lowercase)
-        .ok_or_else(|| anyhow::anyhow!("sha256sum produced no digest for {}", path.display()))?;
-    if actual.len() != 64 || !actual.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        anyhow::bail!(
-            "sha256sum produced an invalid digest for {}",
-            path.display()
-        );
-    }
-    Ok(actual)
 }

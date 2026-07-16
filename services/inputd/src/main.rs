@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::mem::size_of;
 use std::slice;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 
@@ -63,6 +64,21 @@ struct InputQueue {
 }
 
 type SharedInputQueue = Arc<Mutex<InputQueue>>;
+
+#[derive(Default)]
+struct DvmIngressLogState {
+    keyboard: AtomicBool,
+    pointer: AtomicBool,
+}
+
+impl DvmIngressLogState {
+    fn claim(&self, keyboard: bool, pointer: bool) -> (bool, bool) {
+        (
+            keyboard && !self.keyboard.swap(true, Ordering::AcqRel),
+            pointer && !self.pointer.swap(true, Ordering::AcqRel),
+        )
+    }
+}
 
 fn lock_input_queue(queue: &SharedInputQueue) -> MutexGuard<'_, InputQueue> {
     queue.lock().unwrap_or_else(|_| {
@@ -357,7 +373,10 @@ fn keyboard_action_to_inputd(action: KeyAction) -> u16 {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{apply_dvm_ingress_wire, InputQueue};
+    use super::{
+        apply_dvm_ingress_wire, ingest_batch_needs_immediate_retry, DvmIngressLogState, InputQueue,
+        INPUTD_INGEST_MAX_EVENTS,
+    };
     use rustos_user_abi::syscall::{
         InputIngressWire, InputPointerPacketWire, InputPointerPositionWire, InputdIpcRequest,
         INPUTD_ACCESS_NATIVE, INPUTD_INGRESS_FLAG_DVM_SOURCE, INPUTD_INGRESS_FLAG_RESET_STATE,
@@ -542,10 +561,12 @@ mod tests {
         queue.push_dvm_linux_key(29, input_evdev::INPUT_ACTION_PRESSED);
         let _ = queue.pop_front();
 
-        let mut reset = InputIngressWire::default();
-        reset.kind = INPUTD_INGRESS_KIND_DVM_LINUX_KEY;
-        reset.access = INPUTD_ACCESS_NATIVE;
-        reset.flags = INPUTD_INGRESS_FLAG_DVM_SOURCE | INPUTD_INGRESS_FLAG_RESET_STATE;
+        let mut reset = InputIngressWire {
+            kind: INPUTD_INGRESS_KIND_DVM_LINUX_KEY,
+            access: INPUTD_ACCESS_NATIVE,
+            flags: INPUTD_INGRESS_FLAG_DVM_SOURCE | INPUTD_INGRESS_FLAG_RESET_STATE,
+            ..InputIngressWire::default()
+        };
         apply_dvm_ingress_wire(&mut queue, &reset);
         assert_eq!(
             queue.pop_front().unwrap().action,
@@ -586,6 +607,23 @@ mod tests {
 
         queue.push_dvm_pointer_packet(pointer_packet(1, 3, -2));
         assert_eq!(queue.take_dvm_ingress_observations(), (false, true));
+    }
+
+    #[test]
+    fn dvm_ingress_lifecycle_markers_are_claimed_once_across_workers() {
+        let state = DvmIngressLogState::default();
+        assert_eq!(state.claim(true, false), (true, false));
+        assert_eq!(state.claim(true, true), (false, true));
+        assert_eq!(state.claim(true, true), (false, false));
+    }
+
+    #[test]
+    fn full_dvm_ingest_batch_retries_without_requiring_another_irq() {
+        assert!(!ingest_batch_needs_immediate_retry(0));
+        assert!(!ingest_batch_needs_immediate_retry(
+            INPUTD_INGEST_MAX_EVENTS - 1
+        ));
+        assert!(ingest_batch_needs_immediate_retry(INPUTD_INGEST_MAX_EVENTS));
     }
 
     #[test]
@@ -654,15 +692,18 @@ fn main() {
 /// drains at most one ABI-bounded batch, and yields before a recovery backlog
 /// can take another batch. This is the QNX-style interrupt-to-service handoff:
 /// device progress is independent of any application's read cadence.
-fn start_dvm_ingestion_worker(queue: SharedInputQueue) {
+fn start_dvm_ingestion_worker(queue: SharedInputQueue, log_state: Arc<DvmIngressLogState>) {
     let result = thread::Builder::new()
         .name(String::from("inputd-dvm-ingress"))
         .spawn(move || {
             let mut ingest_scratch = vec![InputIngressWire::default(); INPUTD_INGEST_MAX_EVENTS];
+            let mut retry_without_wait = false;
             loop {
-                if let Err(errno) = wait_for_dvm_ingress() {
-                    debug_line(&format!("inputd: DVM ingestion wait failed errno={errno}"));
-                    std::process::exit(134);
+                if !retry_without_wait {
+                    if let Err(errno) = wait_for_dvm_ingress() {
+                        debug_line(&format!("inputd: DVM ingestion wait failed errno={errno}"));
+                        std::process::exit(134);
+                    }
                 }
                 let drained = {
                     let mut queue = lock_input_queue(&queue);
@@ -676,9 +717,14 @@ fn start_dvm_ingestion_worker(queue: SharedInputQueue) {
                         }
                     }
                 };
-                if drained == INPUTD_INGEST_MAX_EVENTS {
+                log_dvm_ingress_observations(&queue, &log_state);
+                retry_without_wait = ingest_batch_needs_immediate_retry(drained);
+                if retry_without_wait {
                     // A hostile or recovering producer cannot retain the
-                    // interactive class across unbounded batches.
+                    // interactive class across unbounded batches. Continue
+                    // after the yield without waiting for another MSI-X edge:
+                    // a full batch is proof that backlog may remain, and L0
+                    // intentionally rings only on empty-to-nonempty.
                     thread::yield_now();
                 }
             }
@@ -687,6 +733,10 @@ fn start_dvm_ingestion_worker(queue: SharedInputQueue) {
         debug_line("inputd: DVM ingestion worker spawn failed");
         std::process::exit(134);
     }
+}
+
+fn ingest_batch_needs_immediate_retry(drained: usize) -> bool {
+    drained == INPUTD_INGEST_MAX_EVENTS
 }
 
 fn wait_for_dvm_ingress() -> Result<(), i32> {
@@ -700,15 +750,11 @@ fn wait_for_dvm_ingress() -> Result<(), i32> {
 
 fn serve(endpoint: u64) {
     let queue = Arc::new(Mutex::new(InputQueue::default()));
-    start_dvm_ingestion_worker(Arc::clone(&queue));
+    let dvm_ingress_log_state = Arc::new(DvmIngressLogState::default());
+    start_dvm_ingestion_worker(Arc::clone(&queue), Arc::clone(&dvm_ingress_log_state));
     // This buffer is reused by request handlers. Do not allocate a new 96 KiB
     // wire batch for every client read.
     let mut ingest_scratch = vec![InputIngressWire::default(); INPUTD_INGEST_MAX_EVENTS];
-    // These are lifecycle observations, not event telemetry. Preserve the
-    // first proof of each DVM route without allowing an active device to flood
-    // debugcon and perturb the UI path it is meant to validate.
-    let mut dvm_keyboard_ingress_logged = false;
-    let mut dvm_pointer_ingress_logged = false;
     loop {
         let mut request = [0_u8; IPC_MAX_INLINE_BYTES];
         let mut reply_cap = 0_u64;
@@ -732,11 +778,7 @@ fn serve(endpoint: u64) {
             if reply < 0 {
                 let _ = writeln!(std::io::stderr(), "inputd: reply failed errno={}", -reply);
             }
-            log_dvm_ingress_observations(
-                &queue,
-                &mut dvm_keyboard_ingress_logged,
-                &mut dvm_pointer_ingress_logged,
-            );
+            log_dvm_ingress_observations(&queue, &dvm_ingress_log_state);
             continue;
         }
         if request_size == size_of::<InputdPointerSurfaceRequest>() {
@@ -763,11 +805,7 @@ fn serve(endpoint: u64) {
             if reply < 0 {
                 let _ = writeln!(std::io::stderr(), "inputd: reply failed errno={}", -reply);
             }
-            log_dvm_ingress_observations(
-                &queue,
-                &mut dvm_keyboard_ingress_logged,
-                &mut dvm_pointer_ingress_logged,
-            );
+            log_dvm_ingress_observations(&queue, &dvm_ingress_log_state);
             continue;
         }
         if request_size != size_of::<InputdIpcRequest>() {
@@ -816,27 +854,18 @@ fn serve(endpoint: u64) {
         if reply < 0 {
             let _ = writeln!(std::io::stderr(), "inputd: reply failed errno={}", -reply);
         }
-        log_dvm_ingress_observations(
-            &queue,
-            &mut dvm_keyboard_ingress_logged,
-            &mut dvm_pointer_ingress_logged,
-        );
+        log_dvm_ingress_observations(&queue, &dvm_ingress_log_state);
     }
 }
 
-fn log_dvm_ingress_observations(
-    queue: &SharedInputQueue,
-    dvm_keyboard_ingress_logged: &mut bool,
-    dvm_pointer_ingress_logged: &mut bool,
-) {
+fn log_dvm_ingress_observations(queue: &SharedInputQueue, state: &DvmIngressLogState) {
     let (dvm_keyboard, dvm_pointer) = lock_input_queue(queue).take_dvm_ingress_observations();
-    if dvm_keyboard && !*dvm_keyboard_ingress_logged {
+    let (log_keyboard, log_pointer) = state.claim(dvm_keyboard, dvm_pointer);
+    if log_keyboard {
         debug_line("inputd: DVM keyboard ingress observed");
-        *dvm_keyboard_ingress_logged = true;
     }
-    if dvm_pointer && !*dvm_pointer_ingress_logged {
+    if log_pointer {
         debug_line("inputd: DVM pointer ingress observed");
-        *dvm_pointer_ingress_logged = true;
     }
 }
 

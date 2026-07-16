@@ -495,12 +495,10 @@ fn probe_controller(pci: PciDevice) -> Result<Option<NvmeBlockDevice>, DiskIoErr
 
     let mut admin = allocate_queue(controller.dma_key, 0, NVME_ADMIN_QUEUE_DEPTH)?;
     controller.configure_admin_queue(&admin)?;
-    let identify_cpu = alloc_dma_buffer(controller.dma_key, NVME_IDENTIFY_BYTES)?;
-    let identify_dma = crate::memory::paging::kernel_virtual_to_physical_addr(identify_cpu as u64);
-    let data_cpu = alloc_dma_buffer(controller.dma_key, NVME_DATA_BUFFER_BYTES)?;
-    let data_dma = crate::memory::paging::kernel_virtual_to_physical_addr(data_cpu as u64);
-    let prp_list_cpu = alloc_dma_buffer(controller.dma_key, NVME_PRP_LIST_BYTES)?.cast::<u64>();
-    let prp_list_dma = crate::memory::paging::kernel_virtual_to_physical_addr(prp_list_cpu as u64);
+    let (identify_cpu, identify_dma) = alloc_dma_buffer(controller.dma_key, NVME_IDENTIFY_BYTES)?;
+    let (data_cpu, data_dma) = alloc_dma_buffer(controller.dma_key, NVME_DATA_BUFFER_BYTES)?;
+    let (prp_list_bytes, prp_list_dma) = alloc_dma_buffer(controller.dma_key, NVME_PRP_LIST_BYTES)?;
+    let prp_list_cpu = prp_list_bytes.cast::<u64>();
 
     let model =
         identify_controller_model(controller.as_ref(), &mut admin, identify_dma, identify_cpu)?;
@@ -557,14 +555,16 @@ fn probe_controller(pci: PciDevice) -> Result<Option<NvmeBlockDevice>, DiskIoErr
 fn allocate_queue(device: *mut c_void, qid: u16, entry_count: u16) -> IoResult<NvmeQueue> {
     let sq_bytes = entry_count as usize * core::mem::size_of::<NvmeSubmission>();
     let cq_bytes = entry_count as usize * core::mem::size_of::<NvmeCompletion>();
-    let sq_cpu = alloc_dma_buffer(device, sq_bytes)?.cast::<NvmeSubmission>();
-    let cq_cpu = alloc_dma_buffer(device, cq_bytes)?.cast::<NvmeCompletion>();
+    let (sq_bytes_cpu, sq_dma) = alloc_dma_buffer(device, sq_bytes)?;
+    let (cq_bytes_cpu, cq_dma) = alloc_dma_buffer(device, cq_bytes)?;
+    let sq_cpu = sq_bytes_cpu.cast::<NvmeSubmission>();
+    let cq_cpu = cq_bytes_cpu.cast::<NvmeCompletion>();
     Ok(NvmeQueue {
         qid,
         sq_cpu,
-        sq_dma: crate::memory::paging::kernel_virtual_to_physical_addr(sq_cpu as u64),
+        sq_dma,
         cq_cpu,
-        cq_dma: crate::memory::paging::kernel_virtual_to_physical_addr(cq_cpu as u64),
+        cq_dma,
         entry_count,
         sq_tail: 0,
         cq_head: 0,
@@ -573,13 +573,13 @@ fn allocate_queue(device: *mut c_void, qid: u16, entry_count: u16) -> IoResult<N
     })
 }
 
-fn alloc_dma_buffer(device: *mut c_void, size: usize) -> IoResult<*mut u8> {
+fn alloc_dma_buffer(device: *mut c_void, size: usize) -> IoResult<(*mut u8, u64)> {
     let mut dma_handle = 0_u64;
     let cpu = crate::driver::dma::alloc_coherent(device, size, &mut dma_handle).cast::<u8>();
     if cpu.is_null() {
         Err(DiskIoError::NotPresent)
     } else {
-        Ok(cpu)
+        Ok((cpu, dma_handle))
     }
 }
 

@@ -571,8 +571,13 @@ impl UserProcessState {
         fresh.cwd = cwd;
         fresh.handles = handles;
         fresh.security = security;
-        for signal in 1..=MAX_SIGNAL_NUMBER {
-            if preserved_ignored[signal] {
+        for (signal, ignored) in preserved_ignored
+            .iter()
+            .enumerate()
+            .take(MAX_SIGNAL_NUMBER + 1)
+            .skip(1)
+        {
+            if *ignored {
                 fresh.linux_sigactions[signal] = self.linux_sigactions[signal];
             }
         }
@@ -597,10 +602,10 @@ impl UserProcessState {
             .checked_add(span)
             .ok_or(AddressSpaceError::AddressOverflow)?;
 
-        if let Some(linux_process_state) = self.linux_process_state.as_ref() {
-            if end > linux_process_state.brk_limit() || start < linux_process_state.brk_mapped_end {
-                return Err(AddressSpaceError::OutOfFrames);
-            }
+        if let Some(linux_process_state) = self.linux_process_state.as_ref()
+            && (end > linux_process_state.brk_limit() || start < linux_process_state.brk_mapped_end)
+        {
+            return Err(AddressSpaceError::OutOfFrames);
         }
 
         let region =
@@ -627,10 +632,10 @@ impl UserProcessState {
             .checked_add(span)
             .ok_or(AddressSpaceError::AddressOverflow)?;
 
-        if let Some(linux_process_state) = self.linux_process_state.as_ref() {
-            if end > linux_process_state.brk_limit() || start < linux_process_state.brk_mapped_end {
-                return Err(AddressSpaceError::OutOfFrames);
-            }
+        if let Some(linux_process_state) = self.linux_process_state.as_ref()
+            && (end > linux_process_state.brk_limit() || start < linux_process_state.brk_mapped_end)
+        {
+            return Err(AddressSpaceError::OutOfFrames);
         }
 
         let region =

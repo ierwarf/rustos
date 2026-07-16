@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: MIT
+
+config BR2_PACKAGE_RUSTOS_DVM_NVIDIA_OPEN
+	bool "rustos-dvm-nvidia-open"
+	depends on BR2_x86_64
+	depends on BR2_LINUX_KERNEL
+	help
+	  Pinned NVIDIA open kernel-module flavor and matching GSP firmware
+	  for a physical display driver domain.  Only nvidia, nvidia-modeset,
+	  and nvidia-drm are built; CUDA/UVM and the NVIDIA userspace stack are
+	  deliberately excluded from this KMS-only appliance.
+
+	  The firmware is under the NVIDIA Software License and is marked
+	  non-redistributable by this package.  Product distribution requires
+	  a separately satisfied NVIDIA redistribution license gate.

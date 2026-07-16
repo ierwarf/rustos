@@ -134,7 +134,7 @@ staging state, identical positions are idempotent, and neither L0, ring0 nor
 ingress ABI uses distinct packet and position payloads so a provider cannot
 make one physical report travel through both paths.
 
-The GUI-DVM contract fixes three host-provisioned surfaces and 64-byte
+The GUI-DVM contract fixes three page-aligned host-provisioned surfaces and 64-byte
 `PRESENT`/`RELEASE` records, never guest-selected pointers, vectors, or
 variable-length payloads. The ivshmem BAR contains only uncached control state;
 the separate cacheable pixel device is writable only by RustOS QEMU and is
@@ -146,11 +146,18 @@ generation and whose source mapping is unchanged; retained content generation
 is not release authority. An uninitialized/stale slot, a source replacement,
 or full damage forces a complete copy. The DVM module requires matching
 control/pixel headers, exposes only WB read-only pixel pages to its relay, and
-rejects writable VMAs. It validates each release against the
+rejects writable VMAs. Each immutable slot is also exported as a read-only
+DMA-BUF. Standard DRM PRIME may request a bidirectional import, but the exporter
+maps its scatterlist as `DMA_TO_DEVICE`; device-to-memory mapping is rejected.
+The relay imports those three slots directly as KMS framebuffers, never copies
+pixels into a guest-owned scanout buffer, and keeps the current front slot
+pinned. It validates each release against the
 matching host record before it writes the one outstanding control sequence.
 Its MSI-X leaves only mark pending state in IRQ context; normal context checks
 the exact readiness invitation, confirmation, release generation, and ACK.
-An offline notification clears readiness confirmation. If a restart finds all
+Only a completed page-flip fences the replacement front and releases the old
+front; the new front is not reusable until a later fenced flip. An offline
+notification clears readiness confirmation and revokes all slot authority. If a restart finds all
 three slots READY, the next bounded producer attempt re-invites the newest
 slot; no polling or alternate provider is selected. Unsupported multi-domain
 focus records are rejected fail-closed because no focus authority is present in

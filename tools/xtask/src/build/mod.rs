@@ -59,9 +59,8 @@ fn check_os_target_manifests(config: &Config, manifests: &[PackageManifest]) -> 
         if !checked.insert(package.to_owned()) {
             continue;
         }
-        match manifest.build.builder {
-            BuilderKind::CargoKernelBinary => check_cargo_os_binary(config, package)?,
-            _ => {}
+        if manifest.build.builder == BuilderKind::CargoKernelBinary {
+            check_cargo_os_binary(config, package)?;
         }
     }
 

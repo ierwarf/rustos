@@ -2,29 +2,36 @@
 EXTENDS Naturals, FiniteSets
 
 (*******************************************************************************
-Atomic GUI-DVM scanout completion contract.
+Direct DMA-BUF GUI-DVM scanout ownership contract.
 
-Concrete owner:
+Concrete owners:
   driver-domains/linux/package/rustos-dvm-display/src/rustos-dvm-display.c
+  driver-domains/linux/package/rustos-dvm-display/src/rustos_dvm_ivshmem_uio.c
 
-The RustOS slot is an immutable source snapshot. The DVM may copy it into a
-non-front KMS buffer and submit an atomic nonblocking page flip, but cannot
-release the source slot at submission time. The page-flip event is the display
-completion fence. Before release, the old front buffer must receive the same
-generation, leaving a synchronized shadow for the following damage rectangle.
+The root-only exporter opens and grants device-read mappings before any host
+invitation. This breaks the otherwise impossible cycle in which KMS readiness
+would require a relay acknowledgement that itself required completed imports.
+Relay readiness still requires all three read-only imports, KMS setup, and an
+actual published host slot. Device-write authority is never granted.
 
-This model intentionally excludes GPU command execution and timing. It proves
-the authority/order rule that makes a bounded page-flip event meaningful:
-there is no state in which a source slot becomes reusable before the display
-has completed it and another local buffer contains that exact generation.
+A page-flip event fences the new front slot. The previous front is released
+only after that fence, while the new front remains pinned until a later flip.
+An offline transition revokes the entire pool instead of fabricating releases.
 *******************************************************************************)
 
-CONSTANTS Slots, Buffers, MaxGeneration
+CONSTANTS Slots, MaxGeneration
 
 Free == "free"
 Ready == "ready"
+Front == "front"
 NoSlot == 99
-NoBuffer == 99
+
+Bound == "bound"
+ExporterOpen == "exporter-open"
+SlotsImported == "slots-imported"
+KmsReady == "kms-ready"
+RelayReady == "relay-ready"
+Offline == "offline"
 
 VARIABLES slotState,
           slotGeneration,
@@ -32,23 +39,25 @@ VARIABLES slotState,
           displayedGeneration,
           fencedGeneration,
           releasedGeneration,
-          bufferGeneration,
-          frontBuffer,
+          revokedGeneration,
+          frontSlot,
           pendingSlot,
-          pendingBuffer,
           pendingGeneration,
           pageFlipPending,
           pageFlipComplete,
-          shadowSynchronized
+          dmaReadSlots,
+          dmaWriteSlots,
+          setupPhase,
+          online
 
 vars == <<slotState, slotGeneration, publishedGeneration, displayedGeneration,
-          fencedGeneration, releasedGeneration, bufferGeneration, frontBuffer,
-          pendingSlot, pendingBuffer, pendingGeneration, pageFlipPending,
-          pageFlipComplete, shadowSynchronized>>
+          fencedGeneration, releasedGeneration, revokedGeneration, frontSlot,
+          pendingSlot, pendingGeneration, pageFlipPending, pageFlipComplete,
+          dmaReadSlots, dmaWriteSlots, setupPhase, online>>
 
-ReadySlots == {s \in Slots : slotState[s] = Ready}
 FreeSlots == {s \in Slots : slotState[s] = Free}
-BackBuffers == Buffers \ {frontBuffer}
+ReadySlots == {s \in Slots : slotState[s] = Ready}
+FrontSlots == {s \in Slots : slotState[s] = Front}
 
 Init ==
     /\ slotState = [s \in Slots |-> Free]
@@ -57,140 +66,213 @@ Init ==
     /\ displayedGeneration = 0
     /\ fencedGeneration = 0
     /\ releasedGeneration = [s \in Slots |-> 0]
-    /\ bufferGeneration = [b \in Buffers |-> 0]
-    /\ frontBuffer \in Buffers
+    /\ revokedGeneration = [s \in Slots |-> 0]
+    /\ frontSlot = NoSlot
     /\ pendingSlot = NoSlot
-    /\ pendingBuffer = NoBuffer
     /\ pendingGeneration = 0
     /\ pageFlipPending = FALSE
     /\ pageFlipComplete = FALSE
-    /\ shadowSynchronized = FALSE
+    /\ dmaReadSlots = {}
+    /\ dmaWriteSlots = {}
+    /\ setupPhase = Bound
+    /\ online = TRUE
+
+OpenExporter ==
+    /\ online
+    /\ setupPhase = Bound
+    /\ setupPhase' = ExporterOpen
+    /\ UNCHANGED <<slotState, slotGeneration, publishedGeneration,
+                  displayedGeneration, fencedGeneration, releasedGeneration,
+                  revokedGeneration, frontSlot, pendingSlot, pendingGeneration,
+                  pageFlipPending, pageFlipComplete, dmaReadSlots,
+                  dmaWriteSlots, online>>
+
+ImportReadOnlySlots ==
+    /\ online
+    /\ setupPhase = ExporterOpen
+    /\ setupPhase' = SlotsImported
+    /\ dmaReadSlots' = Slots
+    /\ UNCHANGED <<slotState, slotGeneration, publishedGeneration,
+                  displayedGeneration, fencedGeneration, releasedGeneration,
+                  revokedGeneration, frontSlot, pendingSlot, pendingGeneration,
+                  pageFlipPending, pageFlipComplete, dmaWriteSlots, online>>
+
+CompleteKmsSetup ==
+    /\ online
+    /\ setupPhase = SlotsImported
+    /\ setupPhase' = KmsReady
+    /\ UNCHANGED <<slotState, slotGeneration, publishedGeneration,
+                  displayedGeneration, fencedGeneration, releasedGeneration,
+                  revokedGeneration, frontSlot, pendingSlot, pendingGeneration,
+                  pageFlipPending, pageFlipComplete, dmaReadSlots,
+                  dmaWriteSlots, online>>
+
+AcknowledgeRelay ==
+    /\ online
+    /\ setupPhase = KmsReady
+    /\ ReadySlots # {}
+    /\ setupPhase' = RelayReady
+    /\ UNCHANGED <<slotState, slotGeneration, publishedGeneration,
+                  displayedGeneration, fencedGeneration, releasedGeneration,
+                  revokedGeneration, frontSlot, pendingSlot, pendingGeneration,
+                  pageFlipPending, pageFlipComplete, dmaReadSlots,
+                  dmaWriteSlots, online>>
 
 Publish(s) ==
+    /\ online
     /\ s \in FreeSlots
     /\ publishedGeneration <= MaxGeneration - 2
     /\ slotState' = [slotState EXCEPT ![s] = Ready]
     /\ slotGeneration' = [slotGeneration EXCEPT ![s] = publishedGeneration + 2]
     /\ publishedGeneration' = publishedGeneration + 2
     /\ UNCHANGED <<displayedGeneration, fencedGeneration, releasedGeneration,
-                  bufferGeneration, frontBuffer, pendingSlot, pendingBuffer,
-                  pendingGeneration, pageFlipPending, pageFlipComplete,
-                  shadowSynchronized>>
+                  revokedGeneration, frontSlot, pendingSlot, pendingGeneration,
+                  pageFlipPending, pageFlipComplete, dmaReadSlots,
+                  dmaWriteSlots, setupPhase, online>>
 
-BeginAtomicFlip(s, b) ==
+BeginDirectFlip(s) ==
+    /\ online
+    /\ setupPhase = RelayReady
     /\ s \in ReadySlots
     /\ slotGeneration[s] > displayedGeneration
     /\ ~pageFlipPending
-    /\ b \in BackBuffers
     /\ pendingSlot' = s
-    /\ pendingBuffer' = b
     /\ pendingGeneration' = slotGeneration[s]
-    /\ bufferGeneration' = [bufferGeneration EXCEPT ![b] = slotGeneration[s]]
     /\ pageFlipPending' = TRUE
     /\ pageFlipComplete' = FALSE
-    /\ shadowSynchronized' = FALSE
     /\ UNCHANGED <<slotState, slotGeneration, publishedGeneration,
                   displayedGeneration, fencedGeneration, releasedGeneration,
-                  frontBuffer>>
+                  revokedGeneration, frontSlot, dmaReadSlots, dmaWriteSlots,
+                  setupPhase, online>>
 
 CompletePageFlip ==
+    /\ online
     /\ pageFlipPending
     /\ ~pageFlipComplete
     /\ pageFlipComplete' = TRUE
     /\ fencedGeneration' = pendingGeneration
     /\ UNCHANGED <<slotState, slotGeneration, publishedGeneration,
-                  displayedGeneration, releasedGeneration, bufferGeneration,
-                  frontBuffer, pendingSlot, pendingBuffer, pendingGeneration,
-                  pageFlipPending, shadowSynchronized>>
+                  displayedGeneration, releasedGeneration, revokedGeneration,
+                  frontSlot, pendingSlot, pendingGeneration, pageFlipPending,
+                  dmaReadSlots, dmaWriteSlots, setupPhase, online>>
 
-SynchronizeShadow ==
+CommitPageFlip ==
+    /\ online
     /\ pageFlipPending
     /\ pageFlipComplete
-    /\ ~shadowSynchronized
-    /\ frontBuffer # pendingBuffer
-    /\ bufferGeneration' = [bufferGeneration EXCEPT ![frontBuffer] = pendingGeneration]
-    /\ shadowSynchronized' = TRUE
-    /\ UNCHANGED <<slotState, slotGeneration, publishedGeneration,
-                  displayedGeneration, fencedGeneration, releasedGeneration,
-                  frontBuffer, pendingSlot, pendingBuffer, pendingGeneration,
-                  pageFlipPending, pageFlipComplete>>
-
-ReleaseAfterFence ==
-    /\ pageFlipPending
-    /\ pageFlipComplete
-    /\ shadowSynchronized
     /\ pendingSlot \in Slots
     /\ slotState[pendingSlot] = Ready
     /\ slotGeneration[pendingSlot] = pendingGeneration
-    /\ bufferGeneration[pendingBuffer] = pendingGeneration
-    /\ bufferGeneration[frontBuffer] = pendingGeneration
-    /\ slotState' = [slotState EXCEPT ![pendingSlot] = Free]
-    /\ releasedGeneration' = [releasedGeneration EXCEPT ![pendingSlot] = pendingGeneration]
+    /\ slotState' = [s \in Slots |->
+         IF s = pendingSlot THEN Front
+         ELSE IF s = frontSlot THEN Free
+         ELSE slotState[s]]
+    /\ releasedGeneration' =
+         IF frontSlot \in Slots
+         THEN [releasedGeneration EXCEPT ![frontSlot] = slotGeneration[frontSlot]]
+         ELSE releasedGeneration
     /\ displayedGeneration' = pendingGeneration
-    /\ frontBuffer' = pendingBuffer
+    /\ frontSlot' = pendingSlot
     /\ pendingSlot' = NoSlot
-    /\ pendingBuffer' = NoBuffer
     /\ pendingGeneration' = 0
     /\ pageFlipPending' = FALSE
     /\ pageFlipComplete' = FALSE
-    /\ shadowSynchronized' = FALSE
     /\ UNCHANGED <<slotGeneration, publishedGeneration, fencedGeneration,
-                  bufferGeneration>>
+                  revokedGeneration, dmaReadSlots, dmaWriteSlots, setupPhase,
+                  online>>
+
+GoOffline ==
+    /\ online
+    /\ online' = FALSE
+    /\ slotState' = [s \in Slots |-> Free]
+    /\ revokedGeneration' = [s \in Slots |-> slotGeneration[s]]
+    /\ frontSlot' = NoSlot
+    /\ pendingSlot' = NoSlot
+    /\ pendingGeneration' = 0
+    /\ pageFlipPending' = FALSE
+    /\ pageFlipComplete' = FALSE
+    /\ dmaReadSlots' = {}
+    /\ dmaWriteSlots' = {}
+    /\ setupPhase' = Offline
+    /\ UNCHANGED <<slotGeneration, publishedGeneration, displayedGeneration,
+                  fencedGeneration, releasedGeneration>>
 
 Idle == UNCHANGED vars
 
 Next ==
+    \/ OpenExporter
+    \/ ImportReadOnlySlots
+    \/ CompleteKmsSetup
+    \/ AcknowledgeRelay
     \/ \E s \in Slots : Publish(s)
-    \/ \E s \in Slots : \E b \in Buffers : BeginAtomicFlip(s, b)
+    \/ \E s \in Slots : BeginDirectFlip(s)
     \/ CompletePageFlip
-    \/ SynchronizeShadow
-    \/ ReleaseAfterFence
+    \/ CommitPageFlip
+    \/ GoOffline
     \/ Idle
 
 TypeOK ==
-    /\ slotState \in [Slots -> {Free, Ready}]
+    /\ slotState \in [Slots -> {Free, Ready, Front}]
     /\ slotGeneration \in [Slots -> 0..MaxGeneration]
     /\ publishedGeneration \in 0..MaxGeneration
     /\ displayedGeneration \in 0..MaxGeneration
     /\ fencedGeneration \in 0..MaxGeneration
     /\ releasedGeneration \in [Slots -> 0..MaxGeneration]
-    /\ bufferGeneration \in [Buffers -> 0..MaxGeneration]
-    /\ frontBuffer \in Buffers
+    /\ revokedGeneration \in [Slots -> 0..MaxGeneration]
+    /\ frontSlot \in Slots \cup {NoSlot}
     /\ pendingSlot \in Slots \cup {NoSlot}
-    /\ pendingBuffer \in Buffers \cup {NoBuffer}
     /\ pendingGeneration \in 0..MaxGeneration
     /\ pageFlipPending \in BOOLEAN
     /\ pageFlipComplete \in BOOLEAN
-    /\ shadowSynchronized \in BOOLEAN
+    /\ dmaReadSlots \subseteq Slots
+    /\ dmaWriteSlots \subseteq Slots
+    /\ setupPhase \in {Bound, ExporterOpen, SlotsImported, KmsReady,
+                         RelayReady, Offline}
+    /\ online \in BOOLEAN
 
-FixedTripleBuffers == Cardinality(Buffers) = 3
+FixedTripleSlots == Cardinality(Slots) = 3
 
-PendingNamesOneImmutableReadySlot ==
+AtMostOnePinnedFront == Cardinality(FrontSlots) <= 1
+
+DisplayedSlotRemainsPinned ==
+    frontSlot \in Slots =>
+        /\ slotState[frontSlot] = Front
+        /\ slotGeneration[frontSlot] = displayedGeneration
+
+PendingNamesImmutableReadySlot ==
     pageFlipPending =>
         /\ pendingSlot \in Slots
-        /\ pendingBuffer \in Buffers
-        /\ pendingBuffer # frontBuffer
         /\ slotState[pendingSlot] = Ready
         /\ slotGeneration[pendingSlot] = pendingGeneration
+        /\ pendingSlot # frontSlot
 
 FencePrecedesRelease ==
     \A s \in Slots : releasedGeneration[s] <= fencedGeneration
 
-PendingGenerationNeverRegresses ==
-    pageFlipPending => pendingGeneration > displayedGeneration
+NoReleaseOfCurrentFront ==
+    frontSlot \in Slots => releasedGeneration[frontSlot] < slotGeneration[frontSlot]
 
-DisplayPrecedesRelease ==
-    \A s \in Slots : releasedGeneration[s] <= displayedGeneration
+NoDeviceWriteAuthority == dmaWriteSlots = {}
 
-ReleasedDisplayHasShadow ==
-    displayedGeneration > 0 /\ ~pageFlipPending =>
-        \E b \in Buffers :
-            /\ b # frontBuffer
-            /\ bufferGeneration[b] = displayedGeneration
+SetupOrderPreservesReadOnlyAuthority ==
+    /\ (setupPhase \in {Bound, ExporterOpen} => dmaReadSlots = {})
+    /\ (setupPhase \in {SlotsImported, KmsReady, RelayReady} => dmaReadSlots = Slots)
 
-NoReleaseBeforeShadow ==
-    pageFlipPending /\ pageFlipComplete /\ ~shadowSynchronized =>
-        \A s \in Slots : releasedGeneration[s] # pendingGeneration
+RelayReadinessRequiresCompleteSetup ==
+    setupPhase = RelayReady =>
+        /\ dmaReadSlots = Slots
+        /\ publishedGeneration > 0
+
+PageFlipRequiresRelayReadiness ==
+    pageFlipPending => setupPhase = RelayReady
+
+OfflineRevokesEverySlot ==
+    ~online =>
+        /\ frontSlot = NoSlot
+        /\ pendingSlot = NoSlot
+        /\ dmaReadSlots = {}
+        /\ setupPhase = Offline
+        /\ \A s \in Slots : revokedGeneration[s] = slotGeneration[s]
 
 Spec == Init /\ [][Next]_vars
 =============================================================================

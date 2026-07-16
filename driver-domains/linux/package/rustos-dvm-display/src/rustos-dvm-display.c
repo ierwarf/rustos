@@ -3,8 +3,8 @@
 //
 // This process deliberately has no host-control, input, or device-management
 // protocol. It reads only the module-validated, cacheable read-only pixel pool;
-// control stays in the kernel module. Stable snapshots are copied to Linux's
-// pinned DRM scanout buffers and submitted through atomic page flips.
+// control stays in the kernel module. Each immutable, page-aligned snapshot is
+// exported as a read-only DMA-BUF and submitted directly through DRM/KMS.
 
 #define _GNU_SOURCE
 
@@ -18,6 +18,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -36,9 +38,12 @@
 #define RUSTOS_DVM_DISPLAY_READY_ATTRIBUTE "rustos_dvm_display_ready"
 #define RUSTOS_DVM_DISPLAY_CONTROL_ATTRIBUTE "rustos_dvm_display_control"
 #define RUSTOS_DVM_DISPLAY_OFFLINE_ATTRIBUTE "rustos_dvm_display_offline"
+#define RUSTOS_DVM_DMABUF_DEVICE "/dev/rustos-dvm-display-dmabuf"
+#define RUSTOS_DVM_DISPLAY_READY_LOCK "/run/rustos-dvm/display-ready.lock"
+#define RUSTOS_DVM_DMABUF_IOCTL_EXPORT _IOW('R', 0x41, struct rustos_dvm_dmabuf_request)
 #define IVSHMEM_UIO_VECTOR_BYTES 4U
 #define GUI_POOL_MAGIC "RSGUI002"
-#define GUI_POOL_VERSION 1U
+#define GUI_POOL_VERSION 2U
 #define GUI_POOL_HEADER_BYTES 4096U
 #define GUI_POOL_RECORD_BYTES 64U
 #define GUI_POOL_SLOT_COUNT 3U
@@ -106,7 +111,6 @@ struct shared_display {
     int uio_fd;
     volatile uint8_t *base;
     size_t bytes;
-    const uint8_t *pixels;
     size_t pixel_bytes;
     char pci_bdf[32];
     struct gui_pool_header header;
@@ -118,6 +122,12 @@ struct scanout_buffer {
     uint64_t bytes;
     uint32_t framebuffer_id;
     uint8_t *map;
+    int imported;
+};
+
+struct rustos_dvm_dmabuf_request {
+    uint32_t slot;
+    uint32_t flags;
 };
 
 struct atomic_property_ids {
@@ -140,15 +150,18 @@ struct atomic_property_ids {
 struct pending_scanout {
     int active;
     int page_flip_complete;
-    int clone_complete;
+    int switch_complete;
     uint32_t slot;
     uint32_t target_buffer;
+    uint32_t release_slot;
     uint64_t generation;
+    uint64_t release_generation;
     struct display_damage damage;
 };
 
 struct kms_display {
     int fd;
+    const char *setup_stage;
     uint32_t connector_id;
     uint32_t crtc_id;
     uint32_t primary_plane_id;
@@ -156,8 +169,11 @@ struct kms_display {
     drmModeModeInfo mode;
     struct atomic_property_ids properties;
     struct scanout_buffer scanout[SCANOUT_BUFFER_COUNT];
+    struct scanout_buffer bootstrap;
     uint64_t buffer_generation[SCANOUT_BUFFER_COUNT];
     uint32_t front_buffer;
+    uint32_t source_width;
+    uint32_t source_height;
     struct pending_scanout pending;
 };
 
@@ -338,6 +354,7 @@ static int parse_gui_pool_header(const volatile uint8_t *bytes, size_t mapped_by
         header->stride_bytes < header->width * DISPLAY_BYTES_PER_PIXEL ||
         header->stride_bytes % DISPLAY_BYTES_PER_PIXEL != 0U ||
         header->slot_bytes != (uint64_t)header->stride_bytes * header->height ||
+        header->slot_bytes % 4096U != 0U ||
         required < header->slot_bytes || required > header->region_bytes) {
         errno = EPROTO;
         return -1;
@@ -429,9 +446,6 @@ static int open_shared_display(struct shared_display *shared) {
 }
 
 static void close_shared_display(struct shared_display *shared) {
-    if (shared->pixels != NULL) {
-        munmap((void *)shared->pixels, shared->pixel_bytes);
-    }
     if (shared->base != NULL) {
         munmap((void *)shared->base, shared->bytes);
     }
@@ -502,25 +516,6 @@ static int open_uio_interrupt(struct shared_display *shared) {
         (void)nanosleep(&retry_delay, NULL);
     }
     return -1;
-}
-
-static int map_shared_pixels(struct shared_display *shared) {
-    uint64_t required_pixels;
-    if (shared == NULL || shared->uio_fd < 0 || shared->pixel_bytes == 0U) {
-        errno = EINVAL;
-        return -1;
-    }
-    required_pixels = shared->header.slot_bytes * GUI_POOL_SLOT_COUNT;
-    if (required_pixels > shared->pixel_bytes) {
-        errno = EPROTO;
-        return -1;
-    }
-    shared->pixels = mmap(NULL, shared->pixel_bytes, PROT_READ, MAP_SHARED, shared->uio_fd, 0);
-    if (shared->pixels == MAP_FAILED) {
-        shared->pixels = NULL;
-        return -1;
-    }
-    return 0;
 }
 
 static int wait_for_relay_event(int uio_fd, int drm_fd, uint32_t *event_count,
@@ -881,8 +876,8 @@ static int load_atomic_property_ids(struct kms_display *display) {
 static int add_plane_properties(const struct kms_display *display, drmModeAtomicReq *request,
                                 uint32_t framebuffer_id, uint32_t damage_blob_id) {
     const struct atomic_property_ids *properties = &display->properties;
-    uint64_t source_width = (uint64_t)display->mode.hdisplay << 16U;
-    uint64_t source_height = (uint64_t)display->mode.vdisplay << 16U;
+    uint64_t source_width = (uint64_t)display->source_width << 16U;
+    uint64_t source_height = (uint64_t)display->source_height << 16U;
     if (drmModeAtomicAddProperty(request, display->primary_plane_id, properties->plane_fb_id,
                                  framebuffer_id) < 0 ||
         drmModeAtomicAddProperty(request, display->primary_plane_id, properties->plane_crtc_id,
@@ -927,7 +922,7 @@ static int atomic_initial_modeset(struct kms_display *display) {
                                       display->mode_blob_id) < 0 ||
              drmModeAtomicAddProperty(request, display->crtc_id, display->properties.crtc_active,
                                       1U) < 0 ||
-             add_plane_properties(display, request, display->scanout[0].framebuffer_id, 0U) != 0
+             add_plane_properties(display, request, display->bootstrap.framebuffer_id, 0U) != 0
                  ? -1
                  : drmModeAtomicCommit(display->fd, request, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
     drmModeAtomicFree(request);
@@ -942,10 +937,43 @@ static void destroy_scanout_buffer(int fd, struct scanout_buffer *buffer) {
     if (buffer->framebuffer_id != 0U) {
         (void)drmModeRmFB(fd, buffer->framebuffer_id);
     }
-    if (buffer->handle != 0U) {
+    if (buffer->handle != 0U && buffer->imported) {
+        (void)drmCloseBufferHandle(fd, buffer->handle);
+    } else if (buffer->handle != 0U) {
         (void)drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy);
     }
     memset(buffer, 0, sizeof(*buffer));
+}
+
+static int create_direct_scanout_buffer(int drm_fd, int dmabuf_device, uint32_t slot,
+                                        const struct gui_pool_header *header,
+                                        struct scanout_buffer *buffer) {
+    struct rustos_dvm_dmabuf_request request = {.slot = slot, .flags = 0U};
+    uint32_t handles[4] = {0U};
+    uint32_t pitches[4] = {0U};
+    uint32_t offsets[4] = {0U};
+    int prime_fd;
+
+    memset(buffer, 0, sizeof(*buffer));
+    prime_fd = ioctl(dmabuf_device, RUSTOS_DVM_DMABUF_IOCTL_EXPORT, &request);
+    if (prime_fd < 0)
+        return -1;
+    if (drmPrimeFDToHandle(drm_fd, prime_fd, &buffer->handle) != 0) {
+        close(prime_fd);
+        return -1;
+    }
+    close(prime_fd);
+    buffer->imported = 1;
+    buffer->pitch = header->stride_bytes;
+    buffer->bytes = header->slot_bytes;
+    handles[0] = buffer->handle;
+    pitches[0] = buffer->pitch;
+    if (drmModeAddFB2(drm_fd, header->width, header->height, DRM_FORMAT_XRGB8888, handles,
+                      pitches, offsets, &buffer->framebuffer_id, 0U) != 0) {
+        destroy_scanout_buffer(drm_fd, buffer);
+        return -1;
+    }
+    return 0;
 }
 
 static int create_scanout_buffer(int fd, uint32_t width, uint32_t height,
@@ -998,49 +1026,104 @@ static int create_scanout_buffer(int fd, uint32_t width, uint32_t height,
 
 static int open_kms_display(const struct gui_pool_header *header, struct kms_display *display) {
     uint32_t buffer_index;
+    uint64_t prime_capability = 0U;
+    int dmabuf_device;
+    int saved;
     memset(display, 0, sizeof(*display));
+    display->fd = -1;
+    display->setup_stage = "open-card";
     display->fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC | O_NONBLOCK);
     if (display->fd < 0) {
         return -1;
     }
-    display->front_buffer = 0U;
+    display->front_buffer = NO_SCANOUT_BUFFER;
+    display->source_width = header->width;
+    display->source_height = header->height;
     display->pending.target_buffer = NO_SCANOUT_BUFFER;
-    if (drmSetMaster(display->fd) != 0 ||
-        drmSetClientCap(display->fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1U) != 0 ||
-        drmSetClientCap(display->fd, DRM_CLIENT_CAP_ATOMIC, 1U) != 0 ||
-        select_kms_target(display->fd, header, &display->connector_id, &display->crtc_id,
-                          &display->mode) != 0 ||
-        select_primary_plane(display->fd, display->crtc_id, &display->primary_plane_id) != 0 ||
-        load_atomic_property_ids(display) != 0) {
+    display->pending.release_slot = NO_SCANOUT_BUFFER;
+    display->setup_stage = "set-master";
+    if (drmSetMaster(display->fd) != 0)
+        goto fail_fd;
+    display->setup_stage = "universal-planes";
+    if (drmSetClientCap(display->fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1U) != 0)
+        goto fail_fd;
+    display->setup_stage = "atomic-capability";
+    if (drmSetClientCap(display->fd, DRM_CLIENT_CAP_ATOMIC, 1U) != 0)
+        goto fail_fd;
+    display->setup_stage = "kms-target";
+    if (select_kms_target(display->fd, header, &display->connector_id, &display->crtc_id,
+                          &display->mode) != 0)
+        goto fail_fd;
+    display->setup_stage = "primary-plane";
+    if (select_primary_plane(display->fd, display->crtc_id, &display->primary_plane_id) != 0)
+        goto fail_fd;
+    display->setup_stage = "atomic-properties";
+    if (load_atomic_property_ids(display) != 0)
+        goto fail_fd;
+    display->setup_stage = "prime-capability";
+    if (drmGetCap(display->fd, DRM_CAP_PRIME, &prime_capability) != 0)
+        goto fail_fd;
+    if ((prime_capability & DRM_PRIME_CAP_IMPORT) == 0U) {
+        errno = EOPNOTSUPP;
+        goto fail_fd;
+    }
+    display->setup_stage = "open-dmabuf-exporter";
+    dmabuf_device = open(RUSTOS_DVM_DMABUF_DEVICE, O_RDONLY | O_CLOEXEC);
+    if (dmabuf_device < 0)
+        goto fail_fd;
+    display->setup_stage = "bootstrap-buffer";
+    if (create_scanout_buffer(display->fd, header->width, header->height,
+                              &display->bootstrap) != 0) {
+        saved = errno == 0 ? EIO : errno;
+        close(dmabuf_device);
         close(display->fd);
         display->fd = -1;
+        errno = saved;
         return -1;
     }
+    display->setup_stage = "direct-dmabuf-import";
     for (buffer_index = 0U; buffer_index < SCANOUT_BUFFER_COUNT; buffer_index++) {
-        if (create_scanout_buffer(display->fd, display->mode.hdisplay, display->mode.vdisplay,
-                                  &display->scanout[buffer_index]) != 0) {
+        if (create_direct_scanout_buffer(display->fd, dmabuf_device, buffer_index, header,
+                                         &display->scanout[buffer_index]) != 0) {
+            saved = errno == 0 ? EIO : errno;
             while (buffer_index > 0U) {
                 buffer_index--;
                 destroy_scanout_buffer(display->fd, &display->scanout[buffer_index]);
             }
+            destroy_scanout_buffer(display->fd, &display->bootstrap);
+            close(dmabuf_device);
             close(display->fd);
             display->fd = -1;
+            errno = saved;
             return -1;
         }
     }
+    close(dmabuf_device);
+    display->setup_stage = "initial-atomic-modeset";
     if (atomic_initial_modeset(display) != 0) {
+        saved = errno == 0 ? EIO : errno;
         for (buffer_index = 0U; buffer_index < SCANOUT_BUFFER_COUNT; buffer_index++) {
             destroy_scanout_buffer(display->fd, &display->scanout[buffer_index]);
         }
+        destroy_scanout_buffer(display->fd, &display->bootstrap);
         if (display->mode_blob_id != 0U) {
             (void)drmModeDestroyPropertyBlob(display->fd, display->mode_blob_id);
             display->mode_blob_id = 0U;
         }
         close(display->fd);
         display->fd = -1;
+        errno = saved;
         return -1;
     }
+    display->setup_stage = "ready";
     return 0;
+
+fail_fd:
+    saved = errno == 0 ? EIO : errno;
+    close(display->fd);
+    display->fd = -1;
+    errno = saved;
+    return -1;
 }
 
 static void close_kms_display(struct kms_display *display) {
@@ -1052,6 +1135,7 @@ static void close_kms_display(struct kms_display *display) {
         for (buffer_index = 0U; buffer_index < SCANOUT_BUFFER_COUNT; buffer_index++) {
             destroy_scanout_buffer(display->fd, &display->scanout[buffer_index]);
         }
+        destroy_scanout_buffer(display->fd, &display->bootstrap);
         (void)drmDropMaster(display->fd);
         close(display->fd);
     }
@@ -1068,47 +1152,49 @@ static int monotonic_time_ns(uint64_t *value) {
     return 0;
 }
 
-static void report_relay_stats(uint64_t pageflip_submissions, uint64_t source_read_time_ns,
-                               uint64_t scanout_write_time_ns, uint64_t atomic_commit_time_ns,
-                               uint64_t *last_reported_ns, uint64_t *last_pageflip_submissions,
-                               uint64_t *last_source_read_time_ns,
-                               uint64_t *last_scanout_write_time_ns,
+static int publish_display_ready_lock(void) {
+    static const char state[] =
+        "DISPLAY_RELAY_SCHEMA=1\nSTATE=ready\nMODE=dmabuf-direct-scanout\n";
+    int fd = open(RUSTOS_DVM_DISPLAY_READY_LOCK,
+                  O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0 || flock(fd, LOCK_EX | LOCK_NB) != 0 || ftruncate(fd, 0) != 0 ||
+        write(fd, state, sizeof(state) - 1U) != (ssize_t)(sizeof(state) - 1U) || fsync(fd) != 0) {
+        int saved = errno;
+        if (fd >= 0)
+            close(fd);
+        errno = saved;
+        return -1;
+    }
+    return fd;
+}
+
+static void report_relay_stats(uint64_t pageflip_completions, uint64_t atomic_commit_time_ns,
+                               uint64_t *last_reported_ns, uint64_t *last_pageflip_completions,
                                uint64_t *last_atomic_commit_time_ns) {
     uint64_t now;
     uint64_t elapsed_ns;
     uint64_t submitted_frames;
     uint64_t frame_hz_milli;
-    uint64_t average_source_read_us;
-    uint64_t average_scanout_write_us;
     uint64_t average_atomic_commit_us;
     if (monotonic_time_ns(&now) != 0 || now <= *last_reported_ns ||
         now - *last_reported_ns < DISPLAY_STATS_INTERVAL_NS) {
         return;
     }
     elapsed_ns = now - *last_reported_ns;
-    submitted_frames = pageflip_submissions - *last_pageflip_submissions;
+    submitted_frames = pageflip_completions - *last_pageflip_completions;
     if (submitted_frames != 0U) {
         frame_hz_milli = (submitted_frames * 1000ULL * 1000ULL * 1000ULL * 1000ULL) /
                          elapsed_ns;
-        average_source_read_us =
-            ((source_read_time_ns - *last_source_read_time_ns) / submitted_frames) / 1000ULL;
-        average_scanout_write_us =
-            ((scanout_write_time_ns - *last_scanout_write_time_ns) / submitted_frames) / 1000ULL;
         average_atomic_commit_us =
             ((atomic_commit_time_ns - *last_atomic_commit_time_ns) / submitted_frames) / 1000ULL;
         relay_log(
-            "rustos-dvm-display: stats elapsed_ms=%llu frame_hz_milli=%llu pageflip_submissions=%llu copy_us_avg=%llu source_read_us_avg=%llu scanout_write_us_avg=%llu atomic_commit_us_avg=%llu\n",
+            "rustos-dvm-display: stats elapsed_ms=%llu frame_hz_milli=%llu pageflip_completions=%llu relay_cpu_copy_us_avg=0 atomic_commit_us_avg=%llu\n",
             (unsigned long long)(elapsed_ns / (1000ULL * 1000ULL)),
             (unsigned long long)frame_hz_milli, (unsigned long long)submitted_frames,
-            (unsigned long long)(average_source_read_us + average_scanout_write_us),
-            (unsigned long long)average_source_read_us,
-            (unsigned long long)average_scanout_write_us,
             (unsigned long long)average_atomic_commit_us);
     }
     *last_reported_ns = now;
-    *last_pageflip_submissions = pageflip_submissions;
-    *last_source_read_time_ns = source_read_time_ns;
-    *last_scanout_write_time_ns = scanout_write_time_ns;
+    *last_pageflip_completions = pageflip_completions;
     *last_atomic_commit_time_ns = atomic_commit_time_ns;
 }
 
@@ -1162,7 +1248,8 @@ static int select_next_or_newest_present(
  */
 static int select_stale_present(const struct shared_display *shared,
                                 const uint64_t released_generation[GUI_POOL_SLOT_COUNT],
-                                uint64_t displayed_generation, uint32_t *selected_slot,
+                                uint64_t displayed_generation, uint32_t protected_slot,
+                                uint32_t *selected_slot,
                                 uint64_t *selected_generation) {
     uint32_t slot;
     uint64_t oldest_generation = 0U;
@@ -1177,7 +1264,7 @@ static int select_stale_present(const struct shared_display *shared,
         if (present < 0) {
             return -1;
         }
-        if (present == 0 || generation <= released_generation[slot] ||
+        if (slot == protected_slot || present == 0 || generation <= released_generation[slot] ||
             generation > displayed_generation) {
             continue;
         }
@@ -1201,86 +1288,6 @@ static int has_incremental_damage(const struct shared_display *shared,
            generation - base_generation == 2U;
 }
 
-static int copy_snapshot_to_scanout(const struct shared_display *shared,
-                                    struct kms_display *display, uint32_t slot,
-                                    uint32_t buffer_index,
-                                    struct display_damage damage, uint64_t generation,
-                                    uint64_t base_generation, uint64_t *source_read_time_ns,
-                                    uint64_t *scanout_write_time_ns) {
-    const uint8_t *pixels = shared->pixels + (size_t)slot * shared->header.slot_bytes;
-    struct scanout_buffer *scanout;
-    uint32_t target_width = display->mode.hdisplay;
-    uint32_t target_height = display->mode.vdisplay;
-    uint32_t copy_x = 0U;
-    uint32_t copy_y = 0U;
-    uint32_t copy_width = target_width;
-    uint32_t copy_height = target_height;
-    unsigned int row;
-    uint64_t source_read_started_ns = 0U;
-    uint64_t scanout_write_started_ns = 0U;
-    uint64_t completed_ns = 0U;
-    if (buffer_index >= SCANOUT_BUFFER_COUNT) {
-        errno = EPROTO;
-        return -1;
-    }
-    scanout = &display->scanout[buffer_index];
-    /*
-     * Damage is relative to the immediately preceding published generation.
-     * It is safe to preserve the existing scanout only when the relay actually
-     * displayed that exact predecessor. First presentation, generation wrap,
-     * a skipped slot, and scaled output all require a complete snapshot copy.
-     */
-    if (has_incremental_damage(shared, display, damage, generation, base_generation)) {
-        copy_x = damage.x;
-        copy_y = damage.y;
-        copy_width = damage.width;
-        copy_height = damage.height;
-    }
-    /*
-     * The source slot is immutable until the page-flip completion handler
-     * returns it, so copying through a second CPU staging surface adds neither
-     * isolation nor ordering. Write directly into the inactive KMS buffer:
-     * this halves full-snapshot memory traffic and keeps the atomic commit as
-     * the only device-upload boundary.
-     */
-    (void)monotonic_time_ns(&source_read_started_ns);
-    if (target_width == shared->header.width && target_height == shared->header.height) {
-        for (row = copy_y; row < copy_y + copy_height; row++) {
-            const uint8_t *source = pixels + (size_t)row * shared->header.stride_bytes +
-                                    (size_t)copy_x * DISPLAY_BYTES_PER_PIXEL;
-            uint8_t *destination = scanout->map + (size_t)row * scanout->pitch +
-                                   (size_t)copy_x * DISPLAY_BYTES_PER_PIXEL;
-            memcpy(destination, source, (size_t)copy_width * DISPLAY_BYTES_PER_PIXEL);
-        }
-    } else if (damage.flags == GUI_DAMAGE_FULL) {
-        for (row = 0; row < target_height; row++) {
-            uint32_t source_row = (uint32_t)(((uint64_t)row * shared->header.height) / target_height);
-            const uint8_t *source = pixels + (size_t)source_row * shared->header.stride_bytes;
-            uint8_t *destination = scanout->map + (size_t)row * scanout->pitch;
-            uint32_t column;
-            for (column = 0; column < target_width; column++) {
-                uint32_t source_column =
-                    (uint32_t)(((uint64_t)column * shared->header.width) / target_width);
-                memcpy(destination + (size_t)column * DISPLAY_BYTES_PER_PIXEL,
-                       source + (size_t)source_column * DISPLAY_BYTES_PER_PIXEL,
-                       DISPLAY_BYTES_PER_PIXEL);
-            }
-        }
-    } else {
-        errno = EPROTO;
-        return -1;
-    }
-    if (source_read_started_ns != 0U && monotonic_time_ns(&scanout_write_started_ns) == 0 &&
-        scanout_write_started_ns > source_read_started_ns) {
-        *source_read_time_ns += scanout_write_started_ns - source_read_started_ns;
-    }
-    if (scanout_write_started_ns != 0U && monotonic_time_ns(&completed_ns) == 0 &&
-        completed_ns > scanout_write_started_ns) {
-        *scanout_write_time_ns += completed_ns - scanout_write_started_ns;
-    }
-    return 1;
-}
-
 static void page_flip_completed(int fd, unsigned int sequence, unsigned int seconds,
                                 unsigned int microseconds, void *user_data) {
     struct kms_display *display = user_data;
@@ -1301,25 +1308,6 @@ static int drain_page_flip_event(struct kms_display *display) {
     return drmHandleEvent(display->fd, &events);
 }
 
-static uint32_t select_back_buffer(const struct kms_display *display,
-                                   uint64_t displayed_generation) {
-    uint32_t fallback = NO_SCANOUT_BUFFER;
-    uint32_t index;
-    for (index = 0U; index < SCANOUT_BUFFER_COUNT; index++) {
-        if (index == display->front_buffer ||
-            (display->pending.active && index == display->pending.target_buffer)) {
-            continue;
-        }
-        if (display->buffer_generation[index] == displayed_generation) {
-            return index;
-        }
-        if (fallback == NO_SCANOUT_BUFFER) {
-            fallback = index;
-        }
-    }
-    return fallback;
-}
-
 static int create_damage_blob(const struct shared_display *shared,
                               const struct kms_display *display,
                               struct display_damage damage, uint64_t generation,
@@ -1327,8 +1315,8 @@ static int create_damage_blob(const struct shared_display *shared,
     struct drm_mode_rect clip = {
         .x1 = 0,
         .y1 = 0,
-        .x2 = (int32_t)display->mode.hdisplay,
-        .y2 = (int32_t)display->mode.vdisplay,
+        .x2 = (int32_t)display->source_width,
+        .y2 = (int32_t)display->source_height,
     };
     if (damage_blob_id == NULL) {
         errno = EINVAL;
@@ -1390,31 +1378,29 @@ static int submit_atomic_page_flip(struct kms_display *display, uint32_t buffer_
     }
     display->pending.active = 1;
     display->pending.page_flip_complete = 0;
-    display->pending.clone_complete = 0;
+    display->pending.switch_complete = 0;
     display->pending.slot = slot;
     display->pending.target_buffer = buffer_index;
+    display->pending.release_slot = display->front_buffer;
     display->pending.generation = generation;
+    display->pending.release_generation =
+        display->front_buffer == NO_SCANOUT_BUFFER
+            ? 0U
+            : display->buffer_generation[display->front_buffer];
     display->pending.damage = damage;
     return 0;
 }
 
 static int start_scanout(const struct shared_display *shared, struct kms_display *display,
                          uint32_t slot, uint64_t generation, struct display_damage damage,
-                         uint64_t displayed_generation, uint64_t *source_read_time_ns,
-                         uint64_t *scanout_write_time_ns,
-                         uint64_t *atomic_commit_time_ns) {
-    uint32_t buffer_index = select_back_buffer(display, displayed_generation);
-    uint64_t base_generation;
-    if (buffer_index == NO_SCANOUT_BUFFER) {
+                         uint64_t displayed_generation, uint64_t *atomic_commit_time_ns) {
+    uint32_t buffer_index = slot;
+    if (slot >= SCANOUT_BUFFER_COUNT || slot == display->front_buffer) {
         errno = EBUSY;
         return -1;
     }
-    base_generation = display->buffer_generation[buffer_index];
-    if (copy_snapshot_to_scanout(shared, display, slot, buffer_index, damage, generation,
-                                 base_generation, source_read_time_ns,
-                                 scanout_write_time_ns) < 0 ||
-        submit_atomic_page_flip(display, buffer_index, slot, generation, damage, base_generation,
-                                shared, atomic_commit_time_ns) != 0) {
+    if (submit_atomic_page_flip(display, buffer_index, slot, generation, damage,
+                                displayed_generation, shared, atomic_commit_time_ns) != 0) {
         return -1;
     }
     display->buffer_generation[buffer_index] = generation;
@@ -1423,37 +1409,34 @@ static int start_scanout(const struct shared_display *shared, struct kms_display
 
 static int complete_scanout(const struct shared_display *shared, struct kms_display *display,
                             uint64_t released_generation[GUI_POOL_SLOT_COUNT],
-                            uint64_t *displayed_generation, uint64_t *source_read_time_ns,
-                            uint64_t *scanout_write_time_ns) {
+                            uint64_t *displayed_generation) {
     int release_result;
     if (!display->pending.active || !display->pending.page_flip_complete) {
         return 0;
     }
-    if (!display->pending.clone_complete) {
-        uint32_t old_front = display->front_buffer;
+    if (!display->pending.switch_complete) {
         display->front_buffer = display->pending.target_buffer;
-        if (copy_snapshot_to_scanout(shared, display, display->pending.slot, old_front,
-                                     display->pending.damage, display->pending.generation,
-                                     display->buffer_generation[old_front], source_read_time_ns,
-                                     scanout_write_time_ns) < 0) {
+        *displayed_generation = display->pending.generation;
+        display->pending.switch_complete = 1;
+    }
+    if (display->pending.release_slot != NO_SCANOUT_BUFFER) {
+        release_result = release_surface(shared, display->pending.release_slot,
+                                         display->pending.release_generation);
+        if (release_result != 0) {
+            if (errno == EAGAIN) {
+                return 0;
+            }
             return -1;
         }
-        display->buffer_generation[old_front] = display->pending.generation;
-        *displayed_generation = display->pending.generation;
-        display->pending.clone_complete = 1;
+        released_generation[display->pending.release_slot] =
+            display->pending.release_generation;
     }
-    release_result = release_surface(shared, display->pending.slot, display->pending.generation);
-    if (release_result != 0) {
-        if (errno == EAGAIN) {
-            return 0;
-        }
-        return -1;
-    }
-    released_generation[display->pending.slot] = display->pending.generation;
     display->pending.active = 0;
     display->pending.page_flip_complete = 0;
-    display->pending.clone_complete = 0;
+    display->pending.switch_complete = 0;
     display->pending.target_buffer = NO_SCANOUT_BUFFER;
+    display->pending.release_slot = NO_SCANOUT_BUFFER;
+    display->pending.release_generation = 0U;
     return 1;
 }
 
@@ -1463,36 +1446,29 @@ static int serve_display(void) {
     uint64_t released_generation[GUI_POOL_SLOT_COUNT] = {0U};
     uint64_t displayed_generation = 0U;
     uint64_t last_reported_ns;
-    uint64_t pageflip_submissions = 0U;
-    uint64_t last_pageflip_submissions = 0U;
-    uint64_t source_read_time_ns = 0U;
-    uint64_t scanout_write_time_ns = 0U;
+    uint64_t pageflip_completions = 0U;
+    uint64_t last_pageflip_completions = 0U;
     uint64_t atomic_commit_time_ns = 0U;
-    uint64_t last_source_read_time_ns = 0U;
-    uint64_t last_scanout_write_time_ns = 0U;
     uint64_t last_atomic_commit_time_ns = 0U;
     uint64_t interrupt_count = 0U;
     int active_after_interrupt = 0;
     int peer_ready_sent = 0;
     int peer_ready_confirmed = 0;
+    int display_ready_lock = -1;
+    (void)unlink(RUSTOS_DVM_DISPLAY_READY_LOCK);
     if (open_shared_display(&shared) != 0) {
         relay_log("rustos-dvm-display: shared aperture unavailable errno=%d\n", errno);
         return -1;
     }
     if (open_kms_display(&shared.header, &display) != 0) {
-        relay_log("rustos-dvm-display: KMS setup unavailable errno=%d\n", errno);
+        relay_log("rustos-dvm-display: KMS setup unavailable stage=%s errno=%d\n",
+                  display.setup_stage == NULL ? "unknown" : display.setup_stage, errno);
         close_shared_display(&shared);
         return -1;
     }
     shared.uio_fd = open_uio_interrupt(&shared);
     if (shared.uio_fd < 0) {
         relay_log("rustos-dvm-display: ivshmem UIO interrupt unavailable errno=%d\n", errno);
-        close_kms_display(&display);
-        close_shared_display(&shared);
-        return -1;
-    }
-    if (map_shared_pixels(&shared) != 0) {
-        relay_log("rustos-dvm-display: write-back pixel map unavailable errno=%d\n", errno);
         close_kms_display(&display);
         close_shared_display(&shared);
         return -1;
@@ -1557,15 +1533,20 @@ static int serve_display(void) {
                     "rustos-dvm-display: host confirmed peer readiness event=ivshmem-msix-uio\n");
             }
         }
-        completed = complete_scanout(&shared, &display, released_generation, &displayed_generation,
-                                     &source_read_time_ns, &scanout_write_time_ns);
+        completed =
+            complete_scanout(&shared, &display, released_generation, &displayed_generation);
         if (completed < 0) {
             fatal = 1;
         } else if (completed > 0) {
-            pageflip_submissions++;
-            if (interrupt_count != 0U && active_after_interrupt == 0) {
+            pageflip_completions++;
+            if (interrupt_count != 0U && peer_ready_confirmed && active_after_interrupt == 0) {
+                display_ready_lock = publish_display_ready_lock();
+                if (display_ready_lock < 0) {
+                    fatal = 1;
+                    break;
+                }
                 relay_log(
-                    "rustos-dvm-display: active width=%u height=%u stride=%u format=BGRA8888 event=ivshmem-msix-uio irq_count=%llu cacheable-atomic-scanout=%ux%u atomic-pageflip-fence=1 scanout_buffers=%u\n",
+                    "rustos-dvm-display: active width=%u height=%u stride=%u format=BGRA8888 event=ivshmem-msix-uio irq_count=%llu dmabuf-direct-scanout=%ux%u atomic-pageflip-fence=1 scanout_buffers=%u cpu-copy=0\n",
                     shared.header.width, shared.header.height, shared.header.stride_bytes,
                     (unsigned long long)interrupt_count, display.mode.hdisplay,
                     display.mode.vdisplay, SCANOUT_BUFFER_COUNT);
@@ -1593,8 +1574,8 @@ static int serve_display(void) {
                  * pool slots. Cleanup is safe only when no generation newer
                  * than the displayed frame is waiting.
                  */
-                stale = select_stale_present(&shared, released_generation,
-                                             displayed_generation, &slot, &generation);
+                stale = select_stale_present(&shared, released_generation, displayed_generation,
+                                             display.front_buffer, &slot, &generation);
                 if (stale < 0) {
                     fatal = 1;
                 } else if (stale > 0) {
@@ -1608,17 +1589,14 @@ static int serve_display(void) {
                     if (fatal != 0) {
                         break;
                     }
-                    report_relay_stats(
-                        pageflip_submissions, source_read_time_ns, scanout_write_time_ns,
-                        atomic_commit_time_ns, &last_reported_ns, &last_pageflip_submissions,
-                        &last_source_read_time_ns, &last_scanout_write_time_ns,
-                        &last_atomic_commit_time_ns);
+                    report_relay_stats(pageflip_completions, atomic_commit_time_ns,
+                                       &last_reported_ns, &last_pageflip_completions,
+                                       &last_atomic_commit_time_ns);
                 }
             }
             if (selected > 0 && fatal == 0) {
                 if (start_scanout(&shared, &display, slot, generation, damage,
-                                  displayed_generation, &source_read_time_ns,
-                                  &scanout_write_time_ns, &atomic_commit_time_ns) != 0 &&
+                                  displayed_generation, &atomic_commit_time_ns) != 0 &&
                     errno != EBUSY) {
                     fatal = 1;
                 }
@@ -1627,15 +1605,16 @@ static int serve_display(void) {
         if (fatal != 0) {
             break;
         }
-        report_relay_stats(pageflip_submissions, source_read_time_ns, scanout_write_time_ns,
-                           atomic_commit_time_ns, &last_reported_ns, &last_pageflip_submissions,
-                           &last_source_read_time_ns, &last_scanout_write_time_ns,
-                           &last_atomic_commit_time_ns);
+        report_relay_stats(pageflip_completions, atomic_commit_time_ns, &last_reported_ns,
+                           &last_pageflip_completions, &last_atomic_commit_time_ns);
     }
     relay_log("rustos-dvm-display: relay stopped errno=%d\n", errno);
     /* A failed relay can only revoke host availability. The next successful
      * instance must consume a new host invitation and send a fresh ready. */
     report_host_offline(&shared);
+    if (display_ready_lock >= 0)
+        close(display_ready_lock);
+    (void)unlink(RUSTOS_DVM_DISPLAY_READY_LOCK);
     close_kms_display(&display);
     close_shared_display(&shared);
     return -1;

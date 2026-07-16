@@ -23,11 +23,13 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
+#include <sys/file.h>
 #include <unistd.h>
 
 #define CONTROL_FILE "/usr/share/rustos-dvm/control-plane-v1.env"
 #define READY_DIR "/run/rustos-dvm"
 #define READY_FILE READY_DIR "/ready"
+#define DISPLAY_READY_LOCK READY_DIR "/display-ready.lock"
 #define CONTROL_PORT_FLOOR 49152U
 #define CONTROL_PORT_SPAN (UINT32_MAX - CONTROL_PORT_FLOOR + 1U)
 #define MAX_FRAME 4096U
@@ -687,6 +689,45 @@ static int virtio_driver_is_bound(const char *driver) {
     return 0;
 }
 
+static int supported_display_driver_is_bound(void) {
+    char target[PATH_MAX];
+    const char *driver;
+    ssize_t length = readlink("/sys/class/drm/card0/device/driver", target,
+                              sizeof(target) - 1U);
+    if (length <= 0 || (size_t)length >= sizeof(target))
+        return 0;
+    target[length] = '\0';
+    driver = strrchr(target, '/');
+    driver = driver == NULL ? target : driver + 1;
+    return strcmp(driver, "virtio_gpu") == 0 || strcmp(driver, "i915") == 0 ||
+           strcmp(driver, "xe") == 0 || strcmp(driver, "amdgpu") == 0 ||
+           strcmp(driver, "nvidia") == 0;
+}
+
+static int display_relay_is_ready(void) {
+    static const char expected[] =
+        "DISPLAY_RELAY_SCHEMA=1\nSTATE=ready\nMODE=dmabuf-direct-scanout\n";
+    char state[sizeof(expected)];
+    int fd = open(DISPLAY_READY_LOCK, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    ssize_t length;
+    int locked;
+    int saved;
+    if (fd < 0)
+        return 0;
+    length = read(fd, state, sizeof(state));
+    if (length != (ssize_t)(sizeof(expected) - 1U) ||
+        memcmp(state, expected, sizeof(expected) - 1U) != 0) {
+        close(fd);
+        return 0;
+    }
+    locked = flock(fd, LOCK_EX | LOCK_NB);
+    saved = errno;
+    if (locked == 0)
+        (void)flock(fd, LOCK_UN);
+    close(fd);
+    return locked != 0 && (saved == EWOULDBLOCK || saved == EAGAIN);
+}
+
 static int request_id(const char *payload, const char *operation, unsigned int *id) {
     const char *id_line;
     const char *op_line;
@@ -1168,10 +1209,13 @@ static int serve_connection(int fd, const struct control_contract *contract,
         } else if (request_id(payload, "driver-inventory", &id) == 0) {
             const char *virtio_net = virtio_driver_is_bound("virtio_net") ? "bound" : "missing";
             const char *virtio_gpu = virtio_driver_is_bound("virtio_gpu") ? "bound" : "missing";
+            const char *display_driver =
+                supported_display_driver_is_bound() ? "bound" : "missing";
+            const char *display_relay = display_relay_is_ready() ? "ready" : "missing";
             snprintf(payload, sizeof(payload),
                      "RESPONSE\nid=%u\nop=driver-inventory\nstatus=ok\nvirtio-net=%s\n"
-                     "virtio-gpu=%s",
-                     id, virtio_net, virtio_gpu);
+                     "virtio-gpu=%s\ndisplay-driver=%s\ndisplay-relay=%s",
+                     id, virtio_net, virtio_gpu, display_driver, display_relay);
         } else if (request_id(payload, "input-stream", &id) == 0) {
             int keyboard_index = -1;
             int keyboard_fd = open_input_device(INPUT_DEVICE_KEYBOARD, -1, &keyboard_index);

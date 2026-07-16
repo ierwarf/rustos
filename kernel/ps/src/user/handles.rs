@@ -223,6 +223,10 @@ impl RemoteVfsHandle {
         self.len
     }
 
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     pub const fn device_access(&self) -> u16 {
         self.device_access
     }

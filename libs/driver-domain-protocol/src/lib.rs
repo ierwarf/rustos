@@ -61,7 +61,8 @@ pub const DVM_GUI_SURFACE_KIND_FOCUS: u32 = 3;
 /// is intentionally distinct from the retired V2 single-frame aperture:
 /// three equally sized pixel slots follow one read-mostly control page.
 pub const DVM_GUI_SURFACE_POOL_MAGIC: [u8; 8] = *b"RSGUI002";
-pub const DVM_GUI_SURFACE_POOL_VERSION: u32 = 1;
+pub const DVM_GUI_SURFACE_POOL_VERSION: u32 = 2;
+pub const DVM_GUI_SURFACE_SLOT_ALIGNMENT: u32 = 4096;
 pub const DVM_GUI_SURFACE_POOL_HEADER_BYTES: u32 = 4096;
 pub const DVM_GUI_SURFACE_POOL_RECORD_BYTES: usize = 64;
 pub const DVM_GUI_SURFACE_POOL_HOST_RECORD_OFFSET: usize = 64;
@@ -247,7 +248,14 @@ impl DvmGuiSurfacePoolHeader {
     }
 
     pub fn new(region_bytes: u64, width: u32, height: u32) -> Self {
-        let stride_bytes = width.saturating_mul(DVM_GUI_SURFACE_POOL_BYTES_PER_PIXEL);
+        // Every slot starts on a page boundary so the DVM can export the
+        // immutable snapshot as one DMA-BUF without granting access to an
+        // adjacent slot. Since slot_bytes = stride * height, align the stride
+        // by PAGE_SIZE / gcd(height, PAGE_SIZE).
+        let height_gcd = gcd_u32(height.max(1), DVM_GUI_SURFACE_SLOT_ALIGNMENT);
+        let stride_alignment = DVM_GUI_SURFACE_SLOT_ALIGNMENT / height_gcd;
+        let packed_stride = width.saturating_mul(DVM_GUI_SURFACE_POOL_BYTES_PER_PIXEL);
+        let stride_bytes = align_up_u32(packed_stride, stride_alignment);
         let slot_bytes = u64::from(stride_bytes).saturating_mul(u64::from(height));
         Self {
             region_bytes,
@@ -314,6 +322,9 @@ impl DvmGuiSurfacePoolHeader {
                 .is_multiple_of(DVM_GUI_SURFACE_POOL_BYTES_PER_PIXEL)
             || self.slot_bytes
                 != u64::from(self.stride_bytes).saturating_mul(u64::from(self.height))
+            || !self
+                .slot_bytes
+                .is_multiple_of(u64::from(DVM_GUI_SURFACE_SLOT_ALIGNMENT))
         {
             return false;
         }
@@ -337,6 +348,23 @@ impl DvmGuiSurfacePoolHeader {
         u64::from(DVM_GUI_SURFACE_POOL_HEADER_BYTES)
             .checked_add(self.slot_bytes.checked_mul(u64::from(slot))?)
     }
+}
+
+fn gcd_u32(mut left: u32, mut right: u32) -> u32 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
+}
+
+fn align_up_u32(value: u32, alignment: u32) -> u32 {
+    debug_assert!(alignment != 0);
+    value
+        .checked_add(alignment - 1)
+        .map(|rounded| rounded / alignment * alignment)
+        .unwrap_or(u32::MAX)
 }
 
 fn read_gui_u32(bytes: &[u8; DVM_GUI_SURFACE_MESSAGE_BYTES], offset: usize) -> Option<u32> {
@@ -1222,6 +1250,11 @@ mod tests {
         assert_eq!(header.slot_offset(0), Some(4096));
         assert_eq!(header.slot_offset(2), Some(4096 + header.slot_bytes * 2));
         assert_eq!(header.slot_offset(3), None);
+        assert_eq!(header.slot_bytes % 4096, 0);
+        assert_eq!(header.slot_offset(1).unwrap() % 4096, 0);
+        assert!(
+            header.slot_offset(1).unwrap() >= header.slot_offset(0).unwrap() + header.slot_bytes
+        );
 
         let mut encoded = header.encode();
         encoded[44..48].copy_from_slice(&2_u32.to_le_bytes());

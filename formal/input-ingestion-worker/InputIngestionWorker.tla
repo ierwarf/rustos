@@ -9,7 +9,10 @@ Concrete source anchors:
     `SYS_RUSTOS_INPUT_WAIT_BROKER` arms a task before sleeping and rechecks
     producer/consumer after registration.
   * `services/inputd/src/main.rs`: `inputd-dvm-ingress` is the sole
-    event-driven worker that invokes the existing bounded ingest broker.
+    event-driven worker that invokes the existing bounded ingest broker. A
+    full batch yields and immediately starts another bounded broker turn; it
+    does not wait for an edge that the empty-to-nonempty producer intentionally
+    will not send while backlog remains.
   * `kernel/io-manager/src/input/{dvm_ring,event_queue}.rs`: the MSI-X leaf
     wakes the dedicated inputd slot independently of application poll waiters;
     it neither decodes nor advances the consumer.

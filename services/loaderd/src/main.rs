@@ -1446,6 +1446,9 @@ struct ExportCache {
     names: Vec<(Vec<u8>, u32)>,
 }
 
+// Keep raw section bytes, both alignment contracts, address floor, and the
+// accumulated map explicit at the PE admission boundary.
+#[allow(clippy::too_many_arguments)]
 fn materialize_pe_section(
     fd: i32,
     image: &mut [u8],
@@ -2761,47 +2764,6 @@ fn directory_name_from_path(path: &str) -> &str {
         Some(index) => &path[..index],
         None => ".",
     }
-}
-
-fn map_data_pages_from_file(
-    fd: i32,
-    prepare_handle: u64,
-    file_offset: u64,
-    file_len: u64,
-    target_addr: u64,
-    mem_len: u64,
-    flags: u64,
-) -> Result<(), i32> {
-    let mut cursor = 0_u64;
-    while cursor < mem_len {
-        let page_len = (mem_len - cursor).min(PROC_BROKER_DATA_PAYLOAD_CAPACITY as u64);
-        let mut args = RustosProcMapDataBrokerArgs {
-            prepare_handle,
-            target_addr: target_addr.checked_add(cursor).ok_or(EOVERFLOW)?,
-            mem_len: align_up(page_len, 4096)?,
-            flags,
-            data_offset: 0,
-            ..RustosProcMapDataBrokerArgs::default()
-        };
-        let read_len = page_len.min(file_len.saturating_sub(cursor));
-        if read_len != 0 {
-            read_exact_at(
-                fd,
-                file_offset.checked_add(cursor).ok_or(EOVERFLOW)?,
-                &mut args.data[..read_len as usize],
-            )?;
-            args.data_len = read_len as u32;
-        }
-        let status = syscall1(
-            SYS_RUSTOS_PROC_MAP_DATA_BROKER,
-            (&args as *const RustosProcMapDataBrokerArgs) as u64,
-        );
-        if status < 0 {
-            return Err((-status) as i32);
-        }
-        cursor = cursor.checked_add(page_len).ok_or(EOVERFLOW)?;
-    }
-    Ok(())
 }
 
 fn map_data_pages_from_image(

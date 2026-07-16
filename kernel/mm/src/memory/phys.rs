@@ -365,21 +365,21 @@ pub fn init(boot_info_ptr: *const BootInfo) {
             .unwrap_or(DIRECT_MAP_PHYS_LIMIT)
             .min(DIRECT_MAP_PHYS_LIMIT);
         let extent_manifest = boot_info.boot_extent_manifest;
-        let extent_manifest_start = extent_manifest
-            .is_present()
-            .then(|| align_down(extent_manifest.ptr, PAGE_SIZE))
-            .unwrap_or(0);
-        let extent_manifest_end = extent_manifest
-            .is_present()
-            .then(|| {
-                extent_manifest
-                    .ptr
-                    .checked_add(extent_manifest.len)
-                    .and_then(|end| align_up(end, PAGE_SIZE))
-                    .unwrap_or(0)
-                    .min(DIRECT_MAP_PHYS_LIMIT)
-            })
-            .unwrap_or(0);
+        let extent_manifest_start = if extent_manifest.is_present() {
+            align_down(extent_manifest.ptr, PAGE_SIZE)
+        } else {
+            0
+        };
+        let extent_manifest_end = if extent_manifest.is_present() {
+            extent_manifest
+                .ptr
+                .checked_add(extent_manifest.len)
+                .and_then(|end| align_up(end, PAGE_SIZE))
+                .unwrap_or(0)
+                .min(DIRECT_MAP_PHYS_LIMIT)
+        } else {
+            0
+        };
 
         let Some(bitmap_phys) = find_usable_span_excluding_ranges(
             memory_map,

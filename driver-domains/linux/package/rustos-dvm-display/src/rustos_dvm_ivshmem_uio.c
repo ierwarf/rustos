@@ -5,18 +5,25 @@
  * BAR2 is an uncached control plane and is never mapped to userspace. A
  * separate cacheable pixel region is exposed WB and read-only; VM_WRITE and
  * VM_MAYWRITE are rejected. Userspace cannot write shared control state or
- * select a doorbell peer/vector. A completed DRM copy is returned through one
- * fixed 64-byte RELEASE record which this module validates against the
- * matching host PRESENT record before it writes the return slot and rings the
- * sole host control vector.
+ * select a doorbell peer/vector. Each immutable slot can be exported as a
+ * read-only DMA-BUF for direct KMS scanout. A completed page-flip fence is
+ * returned through one fixed 64-byte RELEASE record which this module validates
+ * against the matching host PRESENT record before it writes the return slot and
+ * rings the sole host control vector.
  */
 
 #include <linux/io.h>
+#include <linux/dma-buf.h>
+#include <linux/dma-mapping.h>
+#include <linux/fs.h>
 #include <linux/mm.h>
+#include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
+#include <linux/scatterlist.h>
 #include <linux/string.h>
+#include <linux/uaccess.h>
 #include <linux/uio_driver.h>
 #include <asm/pgtable.h>
 
@@ -32,7 +39,7 @@
 #define RUSTOS_GUI_PIXEL_REGION_BYTES (32ULL * 1024ULL * 1024ULL)
 
 #define RUSTOS_GUI_POOL_HEADER_BYTES 4096
-#define RUSTOS_GUI_POOL_VERSION 1
+#define RUSTOS_GUI_POOL_VERSION 2
 #define RUSTOS_GUI_POOL_SLOT_COUNT 3
 #define RUSTOS_GUI_POOL_RECORD_BYTES 64
 #define RUSTOS_GUI_POOL_HOST_RECORD_OFFSET 64
@@ -48,11 +55,25 @@
 #define RUSTOS_GUI_MESSAGE_KIND_RELEASE 2
 #define RUSTOS_GUI_DAMAGE_FULL 1
 #define RUSTOS_DVM_UIO_NAME "rustos-dvm-ivshmem-uio"
+#define RUSTOS_DVM_DMABUF_NAME "rustos-dvm-display-dmabuf"
+#define RUSTOS_DVM_DMABUF_IOCTL_EXPORT _IOW('R', 0x41, struct rustos_dvm_dmabuf_request)
+
+struct rustos_dvm_dmabuf_request {
+	__u32 slot;
+	__u32 flags;
+};
+
+struct rustos_dvm_dmabuf_export {
+	phys_addr_t phys;
+	size_t bytes;
+};
 
 struct rustos_dvm_ivshmem {
 	struct uio_info uio;
+	struct miscdevice dmabuf_misc;
 	void __iomem *doorbell;
 	void __iomem *shared;
+	u64 slot_bytes;
 	atomic_t host_invited;
 	atomic_t relay_ready;
 	atomic64_t invitation_generation;
@@ -62,6 +83,151 @@ struct rustos_dvm_ivshmem {
 
 static const u8 rustos_gui_pool_magic[] = "RSGUI002";
 static const u8 rustos_gui_message_magic[] = "RSGUI001";
+
+static struct sg_table *rustos_dvm_dmabuf_map(struct dma_buf_attachment *attachment,
+					      enum dma_data_direction direction)
+{
+	struct rustos_dvm_dmabuf_export *export = attachment->dmabuf->priv;
+	struct sg_table *table;
+	struct scatterlist *entry;
+	unsigned int index;
+	unsigned int pages;
+
+	/* DRM PRIME asks exporters for DMA_BIDIRECTIONAL even for scanout-only
+	 * imports. Accept that API request, but deliberately map the pages with
+	 * DMA_TO_DEVICE permissions so the IOMMU never grants device writes to
+	 * RustOS-owned pixels. Explicit device-to-memory imports stay forbidden. */
+	if (direction != DMA_TO_DEVICE && direction != DMA_BIDIRECTIONAL)
+		return ERR_PTR(-EPERM);
+	if (!export || !export->bytes || export->phys & ~PAGE_MASK || export->bytes & ~PAGE_MASK)
+		return ERR_PTR(-EINVAL);
+	pages = export->bytes >> PAGE_SHIFT;
+	table = kzalloc(sizeof(*table), GFP_KERNEL);
+	if (!table)
+		return ERR_PTR(-ENOMEM);
+	if (sg_alloc_table(table, pages, GFP_KERNEL)) {
+		kfree(table);
+		return ERR_PTR(-ENOMEM);
+	}
+	for_each_sg(table->sgl, entry, pages, index) {
+		unsigned long pfn = PHYS_PFN(export->phys) + index;
+
+		if (!pfn_valid(pfn)) {
+			sg_free_table(table);
+			kfree(table);
+			return ERR_PTR(-ENXIO);
+		}
+		sg_set_page(entry, pfn_to_page(pfn), PAGE_SIZE, 0);
+	}
+	if (dma_map_sgtable(attachment->dev, table, DMA_TO_DEVICE,
+			    DMA_ATTR_SKIP_CPU_SYNC)) {
+		sg_free_table(table);
+		kfree(table);
+		return ERR_PTR(-EIO);
+	}
+	return table;
+}
+
+static void rustos_dvm_dmabuf_unmap(struct dma_buf_attachment *attachment,
+				    struct sg_table *table,
+				    enum dma_data_direction direction)
+{
+	(void)direction;
+	if (!table)
+		return;
+	dma_unmap_sgtable(attachment->dev, table, DMA_TO_DEVICE,
+			  DMA_ATTR_SKIP_CPU_SYNC);
+	sg_free_table(table);
+	kfree(table);
+}
+
+static int rustos_dvm_dmabuf_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma)
+{
+	return -EPERM;
+}
+
+static void rustos_dvm_dmabuf_release(struct dma_buf *dmabuf)
+{
+	struct rustos_dvm_dmabuf_export *export = dmabuf->priv;
+
+	if (export) {
+		memzero_explicit(export, sizeof(*export));
+		kfree(export);
+	}
+}
+
+static const struct dma_buf_ops rustos_dvm_dmabuf_ops = {
+	.map_dma_buf = rustos_dvm_dmabuf_map,
+	.unmap_dma_buf = rustos_dvm_dmabuf_unmap,
+	.mmap = rustos_dvm_dmabuf_mmap,
+	.release = rustos_dvm_dmabuf_release,
+};
+
+static int rustos_dvm_dmabuf_open(struct inode *inode, struct file *file)
+{
+	struct miscdevice *misc = file->private_data;
+	struct rustos_dvm_ivshmem *state;
+
+	state = container_of(misc, struct rustos_dvm_ivshmem, dmabuf_misc);
+	if (!state)
+		return -ENODEV;
+	/*
+	 * DMA-BUF import and the initial black modeset precede the relay-ready
+	 * acknowledgement. Requiring an invitation or relay_ready here creates a
+	 * lifecycle cycle in which readiness can never be reached. The module has
+	 * already validated the fixed pool and exports only device-read mappings;
+	 * opening it early grants no device-write or host-control authority.
+	 */
+	file->private_data = state;
+	return nonseekable_open(inode, file);
+}
+
+static long rustos_dvm_dmabuf_ioctl(struct file *file, unsigned int command,
+				    unsigned long argument)
+{
+	struct rustos_dvm_ivshmem *state = file->private_data;
+	struct rustos_dvm_dmabuf_request request;
+	struct rustos_dvm_dmabuf_export *export;
+	DEFINE_DMA_BUF_EXPORT_INFO(info);
+	struct dma_buf *dmabuf;
+	int fd;
+
+	if (command != RUSTOS_DVM_DMABUF_IOCTL_EXPORT ||
+	    copy_from_user(&request, (void __user *)argument, sizeof(request)))
+		return -EINVAL;
+	if (!state || request.flags ||
+	    request.slot >= RUSTOS_GUI_POOL_SLOT_COUNT || !state->slot_bytes)
+		return -EPERM;
+	export = kzalloc(sizeof(*export), GFP_KERNEL);
+	if (!export)
+		return -ENOMEM;
+	export->phys = RUSTOS_GUI_PIXEL_REGION_PHYS + RUSTOS_GUI_POOL_HEADER_BYTES +
+		       request.slot * state->slot_bytes;
+	export->bytes = state->slot_bytes;
+	info.ops = &rustos_dvm_dmabuf_ops;
+	info.size = export->bytes;
+	info.flags = O_RDONLY;
+	info.priv = export;
+	dmabuf = dma_buf_export(&info);
+	if (IS_ERR(dmabuf)) {
+		fd = PTR_ERR(dmabuf);
+		kfree(export);
+		return fd;
+	}
+	fd = dma_buf_fd(dmabuf, O_CLOEXEC);
+	if (fd < 0)
+		dma_buf_put(dmabuf);
+	return fd;
+}
+
+static const struct file_operations rustos_dvm_dmabuf_fops = {
+	.owner = THIS_MODULE,
+	.open = rustos_dvm_dmabuf_open,
+	.unlocked_ioctl = rustos_dvm_dmabuf_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl = rustos_dvm_dmabuf_ioctl,
+#endif
+};
 
 static u32 rustos_dvm_read_le32(const u8 *bytes)
 {
@@ -174,6 +340,11 @@ static int rustos_dvm_ivshmem_mmap(struct uio_info *info,
 static void rustos_dvm_ivshmem_free_vectors(void *data)
 {
 	pci_free_irq_vectors(data);
+}
+
+static void rustos_dvm_ivshmem_unregister_misc(void *data)
+{
+	misc_deregister(data);
 }
 
 static ssize_t rustos_dvm_host_invited_show(struct device *dev,
@@ -354,6 +525,12 @@ static int rustos_dvm_ivshmem_probe(struct pci_dev *pdev,
 				  RUSTOS_GUI_POOL_READY_CONFIRMATION_OFFSET + sizeof(u64));
 	if (!state->shared)
 		return -ENOMEM;
+	state->slot_bytes = readq(state->shared + 48U);
+	if (!state->slot_bytes || state->slot_bytes & (PAGE_SIZE - 1) ||
+	    state->slot_bytes >
+		(RUSTOS_GUI_PIXEL_REGION_BYTES - RUSTOS_GUI_POOL_HEADER_BYTES) /
+		RUSTOS_GUI_POOL_SLOT_COUNT)
+		return -EPROTO;
 	atomic_set(&state->host_invited, 0);
 	atomic_set(&state->relay_ready, 0);
 	atomic64_set(&state->invitation_generation, 0);
@@ -384,6 +561,18 @@ static int rustos_dvm_ivshmem_probe(struct pci_dev *pdev,
 	if (!result)
 		result = devm_device_add_group(&pdev->dev,
 					       &rustos_dvm_ivshmem_attribute_group);
+	if (!result) {
+		state->dmabuf_misc.minor = MISC_DYNAMIC_MINOR;
+		state->dmabuf_misc.name = RUSTOS_DVM_DMABUF_NAME;
+		state->dmabuf_misc.fops = &rustos_dvm_dmabuf_fops;
+		state->dmabuf_misc.parent = &pdev->dev;
+		state->dmabuf_misc.mode = 0600;
+		result = misc_register(&state->dmabuf_misc);
+	}
+	if (!result)
+		result = devm_add_action_or_reset(&pdev->dev,
+						  rustos_dvm_ivshmem_unregister_misc,
+						  &state->dmabuf_misc);
 	if (!result)
 		dev_info(&pdev->dev,
 			 "RustOS GUI surface UIO bound: MSI-X vector=%ld control_BAR2=%pa pixels=%pa+%pa\n",
@@ -407,4 +596,5 @@ module_pci_driver(rustos_dvm_ivshmem_driver);
 
 MODULE_AUTHOR("RustOS");
 MODULE_DESCRIPTION("RustOS GUI-DVM three-surface MSI-X UIO transport");
+MODULE_IMPORT_NS(DMA_BUF);
 MODULE_LICENSE("GPL");

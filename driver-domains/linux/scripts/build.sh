@@ -151,6 +151,7 @@ config_input_hash() {
         # already-built packages.
         find configs -type f -print0 | sort -z | xargs -0 sha256sum
         find package -name Config.in -type f -print0 | sort -z | xargs -0 sha256sum
+        find package/rustos-dvm-nvidia-open -type f -print0 | sort -z | xargs -0 sha256sum
         sha256sum board/linux.fragment
         sha256sum sources.lock external.desc external.mk Config.in
         sha256sum "$LIBELF_INCLUDE_DIR/libelf.h" "$LIBELF_INCLUDE_DIR/gelf.h"
@@ -335,6 +336,17 @@ verify_kernel_config() {
     "$ROOT/scripts/verify-kernel-config.sh" "$config"
 }
 
+verify_module_signatures() {
+    local kernel_build="$BUILD_DIR/build/linux-${LINUX_VERSION}"
+    "$ROOT/scripts/verify-module-signatures.sh" \
+        "$BUILD_DIR/target" "$kernel_build" "$kernel_build/certs/signing_key.x509" \
+        "$LOCK_FILE"
+}
+
+verify_release_artifacts() {
+    "$ROOT/scripts/verify-release-artifacts.sh" "$ARTIFACT_DIR"
+}
+
 write_manifest() {
     "$ROOT/scripts/write-manifest.sh" \
         "$BUILD_DIR" "$ARTIFACT_DIR" "$LOCK_FILE"
@@ -348,7 +360,9 @@ build() {
     make_buildroot -j "$JOBS"
     verify_config
     verify_kernel_config
+    verify_module_signatures
     write_manifest
+    verify_release_artifacts
     commit_mutable_input_stamps
 }
 
@@ -367,7 +381,9 @@ rebuild_service() {
     make_buildroot -j "$JOBS"
     verify_config
     verify_kernel_config
+    verify_module_signatures
     write_manifest
+    verify_release_artifacts
     commit_mutable_input_stamps
 }
 
@@ -442,7 +458,9 @@ main() {
             ;;
         verify)
             verify_config
-            test -f "$ARTIFACT_DIR/rustos-linux-dvm-x86_64.manifest"
+            verify_kernel_config
+            verify_module_signatures
+            verify_release_artifacts
             ;;
         print-artifacts)
             print_artifacts

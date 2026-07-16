@@ -195,6 +195,9 @@ fn admit_pe64_section(
 /// Validate all PE32+ byte tables that select image layout. The caller reads
 /// section payloads with exact-length I/O, materializes them into an isolated
 /// zeroed snapshot, then applies the relocation/import validators below.
+// Keep the independently bounded PE tables and address window visible at the
+// admission boundary; grouping them would obscure which raw input was proved.
+#[allow(clippy::too_many_arguments)]
 pub fn admit_pe64_image_headers(
     dos_header: &[u8; PE64_DOS_HEADER_SIZE],
     file_header: &[u8; PE64_FILE_HEADER_SIZE],
@@ -251,8 +254,8 @@ pub fn admit_pe64_image_headers(
         || headers_size == 0
         || image_size > max_image_bytes
         || headers_size > image_size
-        || image_size % section_alignment != 0
-        || headers_size % file_alignment != 0
+        || !image_size.is_multiple_of(section_alignment)
+        || !headers_size.is_multiple_of(file_alignment)
     {
         return Err(ByteAdmissionError::InvalidValue);
     }
@@ -661,7 +664,7 @@ pub fn apply_pe64_base_relocations(
             return Err(ByteAdmissionError::InvalidValue);
         }
         let block_size = read_u32(image, cursor + 4)? as usize;
-        if block_size < 8 || block_size % 2 != 0 {
+        if block_size < 8 || !block_size.is_multiple_of(2) {
             return Err(ByteAdmissionError::InvalidValue);
         }
         let block_end = cursor

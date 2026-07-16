@@ -17,15 +17,21 @@ failure output as the primary debugging context.
 
 | Command | Use | Writes | Common failure meaning |
 | --- | --- | --- | --- |
-| `cargo xtask build-dvm` | build the pinned Linux DVM and verify its manifest | `driver-domains/linux/out/` | missing Buildroot prerequisite or source/artifact mismatch |
-| `cargo xtask verify-dvm` | verify every DVM artifact and control-contract hash | none | altered/missing DVM artifact or contract |
+| `cargo xtask build-dvm` | build the pinned Linux DVM, cryptographically verify every installed module against its generated X.509 certificate, and emit a self-contained schema-8 bundle | `driver-domains/linux/out/` | missing Buildroot prerequisite, unsigned/foreign module, or source/artifact mismatch |
+| `cargo xtask verify-dvm` | verify every co-located DVM artifact, kernel signature-enforcement configuration, certificate, source lock, and control contract | none | altered/missing DVM artifact, signing policy, source input, or contract |
+| `make -C driver-domains/linux verify` | recheck Buildroot/kernel configuration and every installed module's detached PKCS#7 signature without rebuilding the DVM | temporary files under `/tmp` only | unsigned, malformed, or foreign-signed module; stale build tree |
+| `make -C driver-domains/linux stage-release DEST=/trusted/new/path` | verify, copy, reverify, and atomically publish the eight-file DVM bundle to a fresh owner-controlled path | the new destination only | existing destination, symlink/mutable ancestor, or artifact mutation |
 | `make -C driver-domains/linux rebuild-agent` | rebuild only the DVM control/input agent while preserving the Buildroot host toolchain | DVM package/artifacts only | agent compile or artifact refresh failure |
 | `make -C driver-domains/linux rebuild-display` | rebuild only the DVM display relay while preserving the Buildroot host toolchain | DVM package/artifacts only | display relay compile or artifact refresh failure |
 | `make -C driver-domains/linux rebuild-net` | rebuild only the DVM network relay while preserving the Buildroot host toolchain | DVM package/artifacts only | network relay compile or artifact refresh failure |
 | `cargo xtask kvm-smoke` | concurrently boot Linux DVM and RustOS with QEMU/KVM | `build/kvm/` | unavailable `/dev/kvm`, guest exit, missing readiness marker |
 | `cargo xtask kvm-run` | start the interactive Linux-DVM display session; it waits for an atomic three-buffer/page-flip-ready scanout before exposing the window, then records real pointer ingress and healthy idle UI ticks when QEMU closes | `build/kvm/` | unavailable GUI backend, `/dev/kvm`, display readiness failure, missing real pointer evidence, or a guest exit |
 | `cargo run -p rustos-hostd -- discover` | read host IOMMU groups | none | IOMMU unavailable or unreadable sysfs |
-| `cargo run -p rustos-hostd -- preflight --plan <file>` | require complete, non-protected IOMMU-group ownership | none | incomplete group or host-critical BDF |
+| `cargo run -p rustos-hostd -- preflight --plan <file>` | require complete, non-protected IOMMU-group ownership and reject live `boot_vga`/connected DRM displays | none | incomplete group, declared host-critical BDF, or active L0 display |
+| `cargo run -p rustos-hostd -- preflight-physical --plan <file> --dvm-artifact-manifest <file> --device-policy <file> --qemu <file>` | before any VFIO bind, validate topology, live display safety, exact policy/QEMU/bundle, and an empty IOMMUFD IOAS allocate/destroy probe | none | unsafe/mismatched runtime input or unusable IOMMUFD ABI |
+| `cargo run -p rustos-hostd -- supervise ...` | launch one signed display-only physical-device DVM with IOMMUFD, authenticated readiness, bounded stop, reset, and restore | private runtime record and supervised QEMU | stale authorization, artifact/policy/QEMU mismatch, absent IOMMUFD/reset, failed authentication, signaled/nonzero QEMU exit, or quarantine |
+| `cargo run -p rustos-hostd -- verify-artifacts --dvm-artifact-manifest <release/rustos-linux-dvm-x86_64.manifest>` | independently admit one staged self-contained schema-8 DVM bundle | none | mutable path, missing/extra metadata, or companion-file hash mismatch |
+| `cargo run -p rustos-hostd -- recover --plan <file>` | recover an active lease by canonical runtime record plus exact post-open PID/start-time identity, signal only through pidfd, then reset and restore the whole group | removes runtime/lease state only after success | unsafe/stale runtime identity, unavailable pidfd, or reset/restore failure |
 | `cargo run -p rustos-hostd -- relay-input ...` | relay validated DVM Linux input into RustOS's fixed input ring | launch-owned ivshmem backing and doorbell | policy mismatch, malformed DVM event, or peer lifecycle failure |
 
 ## Tests and inventory
@@ -33,7 +39,7 @@ failure output as the primary debugging context.
 | Command | Use | Writes | Common failure meaning |
 | --- | --- | --- | --- |
 | `cargo xtask selftest` | host selftests for fault parsing, executable-image admission, ABI/layout, and runtime contracts | `target/` | contract/layout regression |
-| `cargo xtask fuzz-host --target all` | deterministic host fuzz smoke for fault rules, executable-image admission, project config, package/DVM manifests, and hostd launch-plan parsing | `logs/` on crash | parser panic or invariant bug |
+| `cargo xtask fuzz-host --target all` | deterministic host fuzz smoke for fault rules, executable-image admission, project config, package/DVM manifests, and hostd launch-plan/device-policy/control-contract parsing | `logs/` on crash | parser panic or invariant bug |
 | `cargo xtask fuzz-host --target image-admission --iterations 1000` | exercise overflow, bounds, overlap, W^X, and entry-point admission without booting a guest | `logs/` on crash | shared ELF/PE admission panic or invariant bug |
 
 Do not rerun `cargo xtask build-dvm` for RustOS-only, documentation, formal,
@@ -73,12 +79,19 @@ and then `cargo xtask verify-dvm`.
   acknowledgement bound to that exact generation, and permits one validated
   RELEASE until the host ACK. The second reverse vector revokes availability;
   restart clears confirmation and a saturated pool re-invites its newest READY
-  slot. The relay maps only the pixel pages WB read-only, writes only inactive
-  local scanout buffers, and attaches an exact full-frame or bounded-damage
-  `FB_DAMAGE_CLIPS` blob to each atomic page flip. V2, polling, synchronous
-  `DirtyFB`, and a native-GPU fallback are rejected.
-  This does not imply physical GPU passthrough or create a general L0 display
-  control plane.
+  slot. The module exports each page-aligned slot as a DMA-BUF whose device
+  mapping is read-only; the relay imports all three slots directly as KMS
+  framebuffers. It performs no relay CPU copy, keeps the current front pinned,
+  and releases only the previous front after the replacement page-flip event.
+  V2, polling, synchronous `DirtyFB`, and a native-GPU fallback are rejected.
+  Linux 6.12 `virtio_gpu` rejects foreign SG-table DMA-BUF imports, so the
+  direct-scanout FPS gate cannot pass on the standard virtual KVM GPU. It must
+  run with an assigned physical i915, xe, amdgpu, or pinned NVIDIA-open
+  `nvidia-drm` device; there is no CPU-copy validation fallback. The NVIDIA
+  package admits only the exact 580.173.02 open-module/GSP pair and excludes
+  UVM/CUDA; redistribution authorization remains a separate release gate.
+  This KVM command does not imply physical GPU passthrough; the separate signed
+  `rustos-hostd supervise` lifecycle owns that evidence.
   This KVM validation profile explicitly disables guest x2APIC because the
   current RustOS MSI-X receiver requires an xAPIC destination until a complete
   interrupt-remapping substrate exists; the kernel fails closed on x2APIC.
@@ -106,15 +119,23 @@ and then `cargo xtask verify-dvm`.
   It never alters the release boot image and requires a `uiserver profile`
   window whose `frame_hz_milli` meets the requested rate.
 
-## L0 VFIO laboratory recovery
+## L0 VFIO lifecycle
 
-- `rustos-hostd acquire --plan <file>` is dry-run by default. The only current
-  write path is `--activate --allow-unsigned-test-bind`; it is laboratory-only
-  until a signed release manifest binds the plan to the DVM artifacts.
-- Never use that path for the host boot disk, active display/GPU, Wi-Fi, or a
-  mixed IOMMU group. `release --activate` is the recovery path and removes the
-  durable lease only after all original driver and `driver_override` values are
-  restored.
+- `rustos-hostd acquire --plan <file>` is dry-run by default. Production
+  activation requires the detached release signature, pinned keyring, exact
+  artifact manifest, schema-2 device policy, and fleet policy. Unsigned device
+  binding is unavailable. Before writing a prepared lease or changing any
+  driver binding, activation also runs the same physical runtime preflight
+  against `--qemu`; an absent `/dev/iommu` therefore cannot detach the GPU.
+- `supervise` accepts only an already-active, signed display-only lease and a
+  policy whose QEMU digest matches the root-owned executable. It uses one
+  non-identity IOMMUFD VFIO address space, a durable pre-exec runtime identity,
+  authenticated readiness, bounded process teardown, and group reset before
+  launch and before restore.
+- Never assign the host boot disk, active host display, or a mixed/protected
+  IOMMU group. `recover` is the crash path; `release --activate` is only for a
+  prepared lease or a known non-running active lease. Both retain the durable
+  lease on any reset/restore failure.
 
 ## Do not run
 

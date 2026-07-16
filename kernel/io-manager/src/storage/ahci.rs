@@ -344,28 +344,24 @@ fn probe_port(controller: Arc<AhciController>, port: usize) -> IoResult<Option<A
         return Ok(None);
     }
 
+    let (cmd_list_cpu, cmd_list_dma) = alloc_dma_buffer(controller.dma_key, AHCI_CMD_LIST_BYTES)?;
+    let (fis_cpu, fis_dma) = alloc_dma_buffer(controller.dma_key, AHCI_FIS_BYTES)?;
+    let (cmd_table_cpu, cmd_table_dma) =
+        alloc_dma_buffer(controller.dma_key, AHCI_CMD_TABLE_BYTES)?;
+    let (identify_cpu, identify_dma) = alloc_dma_buffer(controller.dma_key, AHCI_IDENTIFY_BYTES)?;
+    let (data_cpu, data_dma) = alloc_dma_buffer(controller.dma_key, AHCI_DATA_BUFFER_BYTES)?;
     let mut runtime = AhciRuntime {
-        cmd_list_cpu: alloc_dma_buffer(controller.dma_key, AHCI_CMD_LIST_BYTES)?,
-        cmd_list_dma: 0,
-        fis_cpu: alloc_dma_buffer(controller.dma_key, AHCI_FIS_BYTES)?,
-        fis_dma: 0,
-        cmd_table_cpu: alloc_dma_buffer(controller.dma_key, AHCI_CMD_TABLE_BYTES)?,
-        cmd_table_dma: 0,
-        identify_cpu: alloc_dma_buffer(controller.dma_key, AHCI_IDENTIFY_BYTES)?,
-        identify_dma: 0,
-        data_cpu: alloc_dma_buffer(controller.dma_key, AHCI_DATA_BUFFER_BYTES)?,
-        data_dma: 0,
+        cmd_list_cpu,
+        cmd_list_dma,
+        fis_cpu,
+        fis_dma,
+        cmd_table_cpu,
+        cmd_table_dma,
+        identify_cpu,
+        identify_dma,
+        data_cpu,
+        data_dma,
     };
-    runtime.cmd_list_dma =
-        crate::memory::paging::kernel_virtual_to_physical_addr(runtime.cmd_list_cpu as u64);
-    runtime.fis_dma =
-        crate::memory::paging::kernel_virtual_to_physical_addr(runtime.fis_cpu as u64);
-    runtime.cmd_table_dma =
-        crate::memory::paging::kernel_virtual_to_physical_addr(runtime.cmd_table_cpu as u64);
-    runtime.identify_dma =
-        crate::memory::paging::kernel_virtual_to_physical_addr(runtime.identify_cpu as u64);
-    runtime.data_dma =
-        crate::memory::paging::kernel_virtual_to_physical_addr(runtime.data_cpu as u64);
 
     configure_port(controller.as_ref(), port, &runtime)?;
     unsafe {
@@ -510,13 +506,13 @@ fn issue_ata_command(
     Ok(())
 }
 
-fn alloc_dma_buffer(device: *mut c_void, size: usize) -> IoResult<*mut u8> {
+fn alloc_dma_buffer(device: *mut c_void, size: usize) -> IoResult<(*mut u8, u64)> {
     let mut dma_handle = 0_u64;
     let cpu = crate::driver::dma::alloc_coherent(device, size, &mut dma_handle).cast::<u8>();
     if cpu.is_null() {
         Err(DiskIoError::NotPresent)
     } else {
-        Ok(cpu)
+        Ok((cpu, dma_handle))
     }
 }
 

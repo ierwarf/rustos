@@ -41,4 +41,10 @@ impl EpollHandle {
         self.token
     }
 }
+
+impl Default for EpollHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 // RING3-MIGRATION-REFERENCE END: vfsd/netd-owned epoll policy token substrate.

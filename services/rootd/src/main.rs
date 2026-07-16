@@ -1,5 +1,8 @@
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
+// The host test target intentionally omits the no_std entrypoint, so the
+// complete production supervisor graph is unreachable only in that harness.
+#![cfg_attr(test, allow(dead_code, unused_imports))]
 
 #[cfg(not(test))]
 use core::alloc::{GlobalAlloc, Layout};

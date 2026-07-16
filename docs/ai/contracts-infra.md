@@ -147,9 +147,12 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
 
 ## KVM Launch
 
-- `cargo xtask build-dvm` invokes `driver-domains/linux/Makefile`; `verify-dvm`
-  validates the manifest schema plus kernel, rootfs, config, source-lock, and
-  immutable DVM control-contract SHA-256 values before a KVM guest starts.
+- `cargo xtask build-dvm` invokes `driver-domains/linux/Makefile`; the build
+  cryptographically verifies every installed module's detached PKCS#7 payload
+  against the generated X.509 certificate. `verify-dvm` validates schema 8 plus
+  kernel, rootfs, Buildroot and kernel configs, signing certificate, source
+  lock, and immutable DVM control-contract SHA-256 values before a KVM guest
+  starts.
 - Each KVM launch creates a fresh 256-bit DVM control secret in the L0 runtime
   directory (directory `0700`, file `0600`) and injects it as QEMU fw_cfg.
   The Linux agent may read that value only through fw_cfg's root-only `raw`
@@ -244,14 +247,20 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   Offline clears the confirmation, while a full pool re-invites its newest
   READY slot after restart. The relay rejects generic-UIO/INTx binding, releases
   superseded READY slots through the same validated path, and requires atomic
-  KMS with one primary plane and three local scanout buffers. It writes a
-  validated damage rectangle only when a destination contains the exact
-  predecessor generation; otherwise it copies the complete immutable snapshot.
-  It submits a nonblocking atomic page flip and retains the source slot until
-  page-flip completion plus shadow-buffer synchronization. `FB_DAMAGE_CLIPS`
-  travels with that atomic commit; only then may the validated RELEASE return
-  capacity to RustOS. A CPU copy or accepted atomic ioctl alone is not scanout
-  completion.
+  KMS with one primary plane plus DMA-BUF import support. Each page-aligned
+  immutable slot is exported directly as one scanout framebuffer; there is no
+  relay CPU copy or guest-writable pixel mapping. DRM PRIME's generic
+  bidirectional import request is backed by a deliberately `DMA_TO_DEVICE`
+  mapping, so the display device receives read-only DMA authority. The relay
+  submits a nonblocking atomic page flip, keeps the new front slot pinned, and
+  returns the previous front slot only after the new page-flip event. Offline
+  revokes the entire pool. An accepted import or atomic ioctl alone is not
+  scanout completion.
+  The exporter device is explicitly root-only and may open before a host
+  invitation so the relay can import all three read-only slots and complete
+  its initial black modeset. Host control/readiness authority is still granted
+  only after those steps and an exact published invitation; requiring
+  readiness at exporter open would create an impossible lifecycle cycle.
   V2, polling, and native-GPU fallback are not accepted as test or release
   topology.
   Both smoke and interactive DVM launches disable QEMU's default VGA so the
@@ -260,13 +269,36 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   DVM virtio-GPU disables resize-aware EDID: otherwise GTK's bootstrap window
   can request 640×480 before Linux DRM starts and force unnecessary scaling.
   QEMU's explicit 1600×900 mode is therefore authoritative. The 60 FPS proof
-  requires an active GTK consumer, atomic three-buffer page-flip completion,
-  and a standard 2D virtio-GPU consumer; the headless device
-  cannot satisfy it. The DVM relay
+  requires an active GTK consumer and atomic three-buffer page-flip
+  completion. Linux 6.12 virtio-gpu cannot import the foreign SG-table
+  DMA-BUF, so the standard virtual GPU cannot satisfy this gate; current QEMU
+  vmware-svga also lacks the pitchlock capability required by vmwgfx. The DVM
+  relay
   nevertheless preserves the fixed shared ABI and can scale only when a
-  display backend genuinely requires a different mode. This KVM topology
-  proves the display transport; it is not PCI
-  passthrough or a physical-GPU assignment contract.
+  display backend genuinely requires a different mode. KVM still proves the
+  bounded control apertures, but direct scanout remains failed until a physical
+  i915/xe/amdgpu or pinned NVIDIA-open `nvidia-drm` assignment supplies the
+  import and page-flip evidence. The Linux appliance selects a display-class
+  device only through its kernel-generated PCI modalias. NVIDIA initialization
+  then requires `nvidia`, `nvidia_modeset`, and `nvidia_drm modeset=1 fbdev=0`
+  from one pinned 580.173.02 release plus the matching GSP images; a partial or
+  mixed-version stack never starts the display relay.
+  Artifact-manifest schema 8 binds an exact 25-key set: Buildroot and Linux
+  versions, the NVIDIA-open release and source hash, the non-redistributable
+  release posture, the permitted display-module set, every boot artifact, the
+  kernel-enforced module-signing certificate and exact kernel configuration,
+  the source lock, and the authenticated control contract. Both hostd and xtask
+  reject missing, duplicate, or additional keys instead of treating unknown
+  supply metadata as advisory. The manifest and all seven named payloads must
+  remain co-located in one self-contained release directory; no verifier or
+  supervisor accepts an external config, source lock, certificate, or control
+  contract. `make stage-release DEST=<fresh-absolute-path>` verifies before and
+  after copy and atomically publishes only below an owner-controlled path with
+  no symlink or group/world-writable ancestor.
+  The per-image private key is retained only in the build tree as an exact 0600
+  non-symlinked file owned by the build user. It is never exported; the signed
+  release authorization instead binds the public certificate and immutable
+  kernel/rootfs hashes.
 - The default KVM image contains no RustOS module artifact. RustOS has no
   direct GPU, network, USB, or PS/2 provider; the UI and network fail closed
   until their respective DVM transports validate.
@@ -285,17 +317,39 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   most 20 seconds for each process, then escalates only that recorded PID.
   Each relay may retry a transient device-readiness error internally, but a
   restart must never leave a second framebuffer consumer or Ethernet producer.
+- The physical AMD display profile is PCI `1002:1900` (Phoenix/HawkPoint GC
+  11.0.1). DVM image verification requires the signed `amdgpu.ko` plus its
+  exact GC 11.0.1, PSP 13.0.4, SDMA 6.0.1, and VCN 4.0.2 firmware files; a
+  broad Buildroot `linux-firmware` selection alone is not supply evidence.
+  Every required firmware file is a regular non-symlink whose SHA-256 is pinned
+  in `driver-domains/linux/sources.lock` and checked before release hashing.
 - `rustos-hostd discover` and `rustos-hostd preflight --plan ...` are L0
   read-only ownership gates. `launch-plan-v1.env` must explicitly enumerate
   every function in one actual IOMMU group and reject host-protected BDFs;
+  hostd independently reads each assigned function's live `boot_vga` state and
+  DRM connector status and rejects the L0 boot display or any connected host
+  display even when the plan omits it from `HOST_PROTECTED_PCI_BDFS`;
+  activated acquisition repeats this live check after the durable prepared
+  record is written and immediately before the first driver mutation, removing
+  that record if the display became active;
   neither command performs a driver unbind, VFIO bind, device reset, guest
   launch, or PCI assignment. Do not turn a successful preflight into a
   passthrough claim.
-- `rustos-hostd relay-input` requires a matching `driver-domain-policy-v1`
-  file. Each class has an explicit transport; only `INPUT_TRANSPORT=input-ring-msix`
-  is implemented. Network, block, and display must remain `disabled` until
-  their separate queue/DMA/reset/revocation contracts are implemented. The
-  normal command is a reconnecting L0 service; `--once` is diagnostics-only.
+- `rustos-hostd preflight-physical` adds the complete reversible runtime gate:
+  exact display-only policy and QEMU digest, the self-contained schema-8 DVM
+  bundle, a writable `/dev/iommu`, successful empty-IOAS allocate/destroy
+  ioctls, and the same live host-display safety check. `acquire --activate`
+  repeats this gate
+  after signed-release verification and before it creates durable prepared
+  state or changes any driver binding. A host lacking IOMMUFD therefore fails
+  without detaching the assigned GPU.
+- `rustos-hostd relay-input` requires a matching strict
+  `driver-domain-policy-v2` file. The signed policy binds the production QEMU
+  digest and one transport per device class. `input-ring-msix` and
+  `display-dmabuf-kms` are the admitted transports. The current commercial
+  physical-device slice requires network and block to remain `disabled`; their
+  virtual KVM test transports do not authorize physical assignment. The normal
+  input command is a reconnecting L0 service; `--once` is diagnostics-only.
 - `rustos-hostd acquire` remains read-only unless `--activate` is supplied
   together with a detached OpenPGP signature, an explicit pinned release
   keyring, a strict `release-authorization-v1` payload, the bound DVM artifact
@@ -313,6 +367,36 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   mandatory on failure; failed acquisition retains the prepared record, and
   `release --activate` restores either prepared or active records and deletes
   them only after success.
+- `rustos-hostd supervise` is the only admitted physical display-DVM launch
+  path. It revalidates the active lease and authorization window, exact signed
+  artifact/policy hashes, QEMU hash, complete group, display-only policy, owner-
+  private control/pixel files, and `/dev/iommu`. It resets the whole group,
+  creates one QEMU IOMMUFD object, attaches every `vfio-pci` function to that
+  non-identity address space, and permits no physical network or block device.
+  A pre-exec gate prevents QEMU from opening VFIO until the private schema-2
+  runtime record containing exact PID plus `/proc` start time has been fsync'd.
+  Authenticated readiness is bounded to 30 seconds and additionally requires
+  the agent to observe a supported DRM driver plus the direct relay's kernel-
+  released lifetime lock after a real page flip. A fresh authenticated health
+  exchange rechecks both every five seconds with a three-second response bound.
+  Guest shutdown exits QEMU; a lost health/display exchange enters the same
+  teardown path. All release inputs, the signature verifier, QEMU, artifacts,
+  and policy files are canonical regular files beneath root/service-owned,
+  non-group/world-writable directory chains; hashing is in-process, so neither
+  `PATH` substitution nor an untrusted symlink/parent can change the checked
+  object. TERM has a five-second bound before KILL and reap; original drivers are restored only after child
+  exit and a second complete-group reset. A signaled or nonzero QEMU exit is a
+  failed supervision result even when reset and restoration succeed; the CLI
+  cannot report a crashed DVM as a completed run. A reset failure keeps the active
+  durable lease and `vfio-pci` quarantine instead of rebinding a possibly dirty
+  device.
+- `rustos-hostd recover` signals a process only when the runtime record matches
+  the lease and the live PID has the exact recorded start time. Recovery opens
+  a pidfd, rechecks the start token after the open, and sends TERM/KILL only via
+  that descriptor. A missing kernel pidfd facility fails the commercial gate;
+  there is no numeric-PID fallback. A reused numeric PID is never signaled. It then applies
+  the same bounded stop, post-stop reset, restore, and durable-record deletion
+  order. Missing, unsafe, stale, or foreign runtime state fails closed.
 
 ## Fault Injection
 

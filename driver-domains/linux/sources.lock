@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
-# Keep sources pinned. `scripts/build.sh fetch` verifies both SHA-256 values
-# before extracting or invoking Buildroot.
+# Keep sources and target firmware pinned. `scripts/build.sh fetch` verifies
+# source archives before extraction; the completed target verification checks
+# the per-firmware SHA-256 values before release hashing.
 BUILDROOT_VERSION=2026.05
 BUILDROOT_URL=https://buildroot.org/downloads/buildroot-2026.05.tar.xz
 BUILDROOT_SHA256=9d2f3af10fcac763a61ff6e41894a033f9ecf9267ba13dd0912eedcd3be2b22a
@@ -8,3 +9,26 @@ BUILDROOT_SHA256=9d2f3af10fcac763a61ff6e41894a033f9ecf9267ba13dd0912eedcd3be2b22
 LINUX_VERSION=6.12.94
 LINUX_URL=https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.94.tar.xz
 LINUX_SHA256=e998a232b9418db3301cb58468e291a4f41d6ab8306029b30d991f56251dc8d2
+
+# Exact firmware supply for the AMD PCI 1002:1900 Phoenix/HawkPoint display
+# profile. These are verified in the completed target rootfs before its hash is
+# admitted into the release manifest.
+AMDGPU_GC_11_0_1_IMU_SHA256=ac71f4eec713fc35b4a1fe27531e3eb04edd81eeac2cef64df01ac50d8510805
+AMDGPU_GC_11_0_1_ME_SHA256=70e07022844fecc47c52ff91c2158b89456d8f5a55ca92d87fd8c31e13ffaa5f
+AMDGPU_GC_11_0_1_MEC_SHA256=a40b2e4d0c71c2c4d400947421b82b35149a25fcff15aa20fbdd8e884487700a
+AMDGPU_GC_11_0_1_MES_SHA256=4844bb3873ba1c141aa4f1374ab7ceca0c832f769e58efae82e25380bebfd5b9
+AMDGPU_GC_11_0_1_MES1_SHA256=8f2c02490e295197e3996dd2c0c0356d0636bc45f35577d08a989cefbec366d7
+AMDGPU_GC_11_0_1_MES_2_SHA256=51ef8444ff5736d80d0b7a85f85df94bba5f0c72c0b17581bc6e150ca9e548a6
+AMDGPU_GC_11_0_1_PFP_SHA256=511bce6f785a36b59166d83eda7998ca00b5e2aaf1313e66c8dfd050e8a44e80
+AMDGPU_GC_11_0_1_RLC_SHA256=93cfd6ae60b3b8b9fef78e88d8f82a546ff6a118c25fc7a430776ec392730fc6
+AMDGPU_PSP_13_0_4_TA_SHA256=d507c039ba2195ac0d5bfe600394172d045c9e4306e674672b81c2d87c830233
+AMDGPU_PSP_13_0_4_TOC_SHA256=11e3529d748e2b6b204681183360a6ead80665b8deda996dfcf35973f789fc3d
+AMDGPU_SDMA_6_0_1_SHA256=3765f6daee68d9fb5c62aebcaa9c1581e78fc742b1185c15bd4b3f7859d58834
+AMDGPU_VCN_4_0_2_SHA256=48f2db5d642446024d06c235b6e2f57add16edcf0b43040a3e037fe30ce0badb
+
+# The physical display-DVM target is an NVIDIA Blackwell GPU.  The open
+# kernel-module flavor and its GSP firmware must come from the exact same
+# NVIDIA release; mixing versions is an unsupported fail-open substitute.
+NVIDIA_OPEN_VERSION=580.173.02
+NVIDIA_OPEN_URL=https://us.download.nvidia.com/XFree86/Linux-x86_64/580.173.02/NVIDIA-Linux-x86_64-580.173.02.run
+NVIDIA_OPEN_SHA256=8d8eb9001e05a9a8a663d3d5d304feb64ef2844ee185ccdfd952786820f46e1b

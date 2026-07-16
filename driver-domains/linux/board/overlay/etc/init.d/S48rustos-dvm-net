@@ -46,17 +46,51 @@ stop_relay() {
     rm -f "$pid_file"
 }
 
+load_display_drivers() {
+    device=
+    vendor=
+    class=
+    alias=
+
+    # Match only assigned display-class PCI functions.  modprobe receives a
+    # kernel-produced modalias, never host control-plane text, so it selects
+    # exactly the packaged driver for that device instead of probing every GPU
+    # driver.  NVIDIA KMS is a separate module and must be enabled explicitly.
+    for device in /sys/bus/pci/devices/*; do
+        [ -r "$device/class" ] && [ -r "$device/vendor" ] && [ -r "$device/modalias" ] || continue
+        class=$(cat "$device/class")
+        case "$class" in
+            0x03*) ;;
+            *) continue ;;
+        esac
+        alias=$(cat "$device/modalias")
+        modprobe "$alias" || continue
+        vendor=$(cat "$device/vendor")
+        if [ "$vendor" = 0x10de ]; then
+            modprobe nvidia_modeset || return 1
+            modprobe nvidia_drm modeset=1 fbdev=0 || return 1
+        fi
+    done
+}
+
 start_relays() {
     mkdir -p "$run_dir"
     # The Ethernet relay is independent. The display relay is admitted only
     # after the fixed-header MSI-X adapter is bound; generic UIO/INTx is not a
-    # compatibility path because it cannot receive ivshmem doorbells.
-    start_relay net /usr/libexec/rustos-dvm-net
+    # compatibility path because it cannot receive ivshmem doorbells. Do not
+    # start an independent relay before the display prerequisite is admitted;
+    # a failed composite start must not leave a partially started appliance.
+    if ! load_display_drivers; then
+        echo "rustos-dvm: assigned display driver failed to initialize" >&2
+        return 1
+    fi
     if modprobe rustos_dvm_ivshmem_uio; then
         start_relay display /usr/libexec/rustos-dvm-display
     else
         echo "rustos-dvm: display MSI-X UIO module unavailable; refusing display relay" >&2
+        return 1
     fi
+    start_relay net /usr/libexec/rustos-dvm-net
 }
 
 stop_relays() {

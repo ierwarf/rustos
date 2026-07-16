@@ -32,31 +32,42 @@ preflight --plan ...` validates a `launch-plan-v1.env` contract. The plan must
 name the complete actual IOMMU group, not a single desired PCI function, and
 must reject any host-protected PCI BDF in that group. Both commands are
 read-only: neither unbinds a driver, assigns VFIO, resets hardware, nor starts
-a DVM.
+a DVM. Hostd also derives display safety from live sysfs: `boot_vga=1` and any
+connected DRM connector are unconditional assignment failures, even if an
+operator omitted that BDF from the plan's protected set. Activated acquisition
+repeats the live check after durable prepare and immediately before unbind.
+`rustos-hostd preflight-physical` additionally verifies the exact production
+QEMU, display-only policy, schema-8 bundle, writable `/dev/iommu`, and a
+successful empty-IOAS allocate/destroy ioctl probe without changing a binding.
+`acquire --activate` repeats that complete reversible gate
+after signed-release admission and before it writes prepared state or detaches
+the group from its host drivers.
 
-`rustos-hostd relay-input` additionally requires a `driver-domain-policy-v1`
-file. Its domain ID must match the validated launch plan and it enables exactly
-one named transport per device class. The present input transport is
-`input-ring-msix`; network, block, and display are deliberately `disabled` until
-their own data-plane contracts exist. This prevents a convenient input relay
-from silently becoming an unbounded driver proxy.
+`rustos-hostd relay-input` and the physical-device supervisor require a strict
+`driver-domain-policy-v2` file. Its domain ID must match the validated plan, its
+signed bytes bind the exact production QEMU SHA-256, and it enables exactly one
+named transport per class. Input uses `input-ring-msix`; the commercial display
+slice uses `display-dmabuf-kms`. Physical network and block remain disabled.
 
-`rustos-hostd acquire` is also read-only by default. Its explicit laboratory
-path requires both `--activate` and `--allow-unsigned-test-bind`; it writes a
-private `prepared` lease before changing any sysfs binding, snapshots every
-original driver and `driver_override`, binds the whole validated group to
-`vfio-pci`, then atomically marks the lease `active`. If acquisition fails, it
-rolls back in reverse order but retains the `prepared` record for explicit
-recovery. `release --activate` restores a `prepared` or `active` lease and
-removes its record only after restoration succeeds; a crash or failed restore
-also intentionally leaves the record for recovery. Lease files
-are owner-private and their directory is owner-private before use.
+`rustos-hostd acquire --activate` requires a detached signature verified by a
+pinned keyring. The release binds the exact plan, DVM artifacts, schema-2 device
+policy, fleet, and validity window before hostd writes a private `prepared`
+lease, snapshots every original driver/override, binds the complete group to
+`vfio-pci`, and atomically marks it active. Unsigned binding is unavailable.
 
-Unsigned laboratory binding is deliberately not a production path. A release
-manifest must cryptographically bind the validated plan, DVM artifact hashes,
-and policy before normal hardware lifecycle activation is enabled. Do not use
-the laboratory flag for the L0 boot disk, active display/GPU, Wi-Fi, or any
-other host-critical IOMMU group.
+`rustos-hostd supervise` then resets the complete group, requires `/dev/iommu`,
+launches the signed QEMU with one IOMMUFD and every group function attached to
+it, and authenticates the DVM control channel within 30 seconds. A pre-exec
+gate keeps QEMU from opening VFIO until the exact PID/start-time and all bound
+digests are fsync'd in the private runtime record. The launcher accepts only
+canonical trusted-owner launch files under non-mutable directory chains and
+computes their SHA-256 internally. Stop is bounded TERM/KILL; crash recovery
+rechecks the start token after `pidfd_open` and signals only through that pidfd;
+original drivers return only after child reap and a second group reset. Reset
+failure retains `vfio-pci` plus the durable quarantine evidence. `recover`
+signals only an exact PID/start-time match and follows the same order.
+A signaled or nonzero QEMU exit remains a failed supervision result after safe
+restoration and cannot be reported as a completed physical-DVM run.
 
 ## Transport contract
 
@@ -132,6 +143,40 @@ presentation path: `uiserver` submits only to the validated DVM pool, and a
 missing, malformed, or revoked provider is `Unavailable` rather than a
 boot-framebuffer or generic-provider fallback. The non-DVM direct-GPU test
 profile is diagnostic-only and cannot satisfy commercial GUI acceptance.
+Linux 6.12 virtio-gpu rejects the foreign SG-table DMA-BUF needed by direct
+scanout, and current QEMU vmware-svga cannot bind vmwgfx because pitchlock is
+absent. Therefore virtual KVM cannot close the direct-scanout gate; the required
+runtime capture uses a physically assigned i915, xe, amdgpu, or pinned
+NVIDIA-open `nvidia-drm` device and no CPU-copy fallback. The current Blackwell
+target is packaged from the SHA-256-pinned 580.173.02 official release: only
+the open `nvidia`, `nvidia-modeset`, and `nvidia-drm` modules plus matching
+`gsp_ga10x.bin`/`gsp_tu10x.bin` are installed. UVM, CUDA, the proprietary
+kernel flavor, and the NVIDIA userspace graphics stack are absent. The init
+service loads only a kernel-produced display-class PCI modalias and refuses the
+relay if NVIDIA KMS does not initialize completely. Firmware redistribution
+authorization and target-hardware evidence remain mandatory release gates.
+Artifact-manifest schema 8 makes this supply contract executable. Its exact
+25-key vocabulary pins Buildroot 2026.05, Linux 6.12.94, NVIDIA-open 580.173.02,
+the source and boot-artifact hashes, the allowed display modules, redistribution
+posture, the enforced module-signing policy, its certificate, the exact kernel
+configuration that proves enforcement, and the authenticated control-plane
+contract. The manifest and its seven named payloads form one co-located,
+self-contained release bundle; `hostd` does not accept an out-of-bundle config,
+source lock, certificate, or control contract. Unknown, duplicate, or omitted
+manifest keys, any key outside the control contract's exact six-key vocabulary,
+and any companion-file hash mismatch are admission failures in `hostd`,
+`xtask`, and the staging verifier. Staging requires a fresh destination below
+owner-controlled, non-symlinked, non-group/world-writable ancestors and publishes
+only by atomic rename after a second complete verification.
+The build and `make verify` run Linux's signature extractor over every
+installed `.ko`, then ask OpenSSL CMS to verify the detached module payload
+against the bound X.509 certificate. A trailer-shaped but invalid or
+foreign-signed module therefore cannot pass the artifact gate.
+The per-image signing private key never enters the artifact directory. Build
+and verification require it to remain a non-symlinked, build-user-owned 0600
+regular file at the kernel's pinned `certs/signing_key.pem` path; the outer
+signed release authorization binds the exported public certificate and exact
+kernel/rootfs hashes.
 
 This avoids a Linux kernel fork while retaining a narrow agent for health,
 device state, and authenticated control messages. Input, Ethernet, and GUI
@@ -143,7 +188,11 @@ and runtime evidence.
 
 ## Profile limits
 
-`rustos_linux_dvm_x86_64_defconfig` is a net/USB/auxiliary-storage baseline.
-It is not a primary-GPU or boot-disk profile. Release images must pin the
-kernel, module set, firmware bundle, signed module admission policy, and
-source/SBOM manifest for each supported hardware profile.
+`rustos_linux_dvm_x86_64_defconfig` is a display-DVM plus virtual
+net/USB/auxiliary-storage baseline. It may own a dedicated assigned GPU, but is
+not a host-primary-GPU or boot-disk profile. Manifest schema 8 exposes the
+exact NVIDIA release digest, non-redistribution status, and admitted KMS module
+set in addition to binding the complete source lock and the certificate for
+the kernel-enforced signed-module policy. Release images must pin the kernel,
+module set, firmware bundle, signed module admission policy, and source/SBOM
+manifest for each supported hardware profile.

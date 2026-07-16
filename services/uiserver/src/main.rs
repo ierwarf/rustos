@@ -27,7 +27,7 @@ use runtime_control::RuntimeClient;
 use runtime_sync::{refresh_runtime_state, start_runtime_sync, RuntimeState};
 use sys::{
     background_thread_demotion_count, boot_line, boot_trace_enabled, diag_line, heartbeat_line,
-    profile_line, require_background_thread_class,
+    require_background_thread_class,
 };
 use wayland::WaylandCompositor;
 

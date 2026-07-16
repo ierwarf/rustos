@@ -211,12 +211,32 @@ impl ControlContract {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
+            if line != raw_line {
+                bail!("invalid {label} line {raw_line:?}");
+            }
             let (key, value) = line
                 .split_once('=')
                 .ok_or_else(|| anyhow!("invalid {label} line {line:?}"))?;
-            if key.is_empty() || value.is_empty() || values.insert(key, value).is_some() {
+            if key.is_empty()
+                || value.is_empty()
+                || key.contains(char::is_whitespace)
+                || value.contains(char::is_whitespace)
+                || values.insert(key, value).is_some()
+            {
                 bail!("invalid or duplicate {label} key {key:?}");
             }
+        }
+
+        const KEYS: [&str; 6] = [
+            "CONTROL_SCHEMA",
+            "CONTROL_PROTOCOL",
+            "CONTROL_STATE",
+            "CONTROL_TRANSPORT",
+            "CONTROL_AUTHENTICATION",
+            "CONTROL_CAPABILITIES",
+        ];
+        if values.len() != KEYS.len() || values.keys().any(|key| !KEYS.contains(key)) {
+            bail!("unsupported {label} key set");
         }
 
         required(&values, "CONTROL_SCHEMA", "1", label)?;
@@ -391,6 +411,9 @@ pub enum DeviceTransport {
     Disabled,
     /// Fixed RDI3 records in the host-owned input ring plus one MSI-X wake.
     InputRingMsix,
+    /// Read-only RustOS snapshot slots exported by the GUI DVM as DMA-BUFs
+    /// and imported by the DVM-owned DRM/KMS device for direct scanout.
+    DisplayDmaBufKms,
 }
 
 impl DeviceTransport {
@@ -398,6 +421,9 @@ impl DeviceTransport {
         match value {
             "disabled" => Ok(Self::Disabled),
             "input-ring-msix" if key == DeviceClass::Input.policy_key() => Ok(Self::InputRingMsix),
+            "display-dmabuf-kms" if key == DeviceClass::Display.policy_key() => {
+                Ok(Self::DisplayDmaBufKms)
+            }
             _ => bail!("unsupported {label} {key} transport {value:?}"),
         }
     }
@@ -410,6 +436,7 @@ impl DeviceTransport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DriverDomainPolicy {
     pub domain_id: String,
+    qemu_sha256: String,
     transports: BTreeMap<DeviceClass, DeviceTransport>,
 }
 
@@ -422,9 +449,10 @@ impl DriverDomainPolicy {
 
     pub fn parse(source: &str, label: &str) -> Result<Self> {
         let values = parse_launch_plan_values(source, label)?;
-        const REQUIRED: [&str; 6] = [
+        const REQUIRED: [&str; 7] = [
             "DRIVER_DOMAIN_POLICY_SCHEMA",
             "DOMAIN_ID",
+            "QEMU_SHA256",
             "INPUT_TRANSPORT",
             "NETWORK_TRANSPORT",
             "BLOCK_TRANSPORT",
@@ -435,11 +463,12 @@ impl DriverDomainPolicy {
         {
             bail!("unsupported key in {label}");
         }
-        if launch_plan_value(&values, "DRIVER_DOMAIN_POLICY_SCHEMA", label)? != "1" {
+        if launch_plan_value(&values, "DRIVER_DOMAIN_POLICY_SCHEMA", label)? != "2" {
             bail!("unsupported {label} schema");
         }
         let domain_id = launch_plan_value(&values, "DOMAIN_ID", label)?.to_owned();
         validate_domain_id(&domain_id, label)?;
+        let qemu_sha256 = parse_sha256(launch_plan_value(&values, "QEMU_SHA256", label)?, label)?;
         let mut transports = BTreeMap::new();
         for class in [
             DeviceClass::Input,
@@ -455,6 +484,7 @@ impl DriverDomainPolicy {
         }
         Ok(Self {
             domain_id,
+            qemu_sha256,
             transports,
         })
     }
@@ -475,6 +505,10 @@ impl DriverDomainPolicy {
             .get(&class)
             .copied()
             .expect("driver-domain policy has every fixed class")
+    }
+
+    pub fn qemu_sha256(&self) -> &str {
+        &self.qemu_sha256
     }
 }
 
@@ -847,6 +881,77 @@ impl IommuTopology {
     }
 }
 
+/// Refuse a new VFIO assignment that would detach the L0 boot display or a
+/// DRM device with a physically connected connector.  The launch plan's
+/// `HOST_PROTECTED_PCI_BDFS` remains an operator-supplied deny-list, but it is
+/// not authoritative evidence that a display is idle: that fact must be
+/// derived from the same live sysfs snapshot used for assignment.
+pub fn validate_host_display_assignment(lease: &ValidatedLease, sysfs_root: &Path) -> Result<()> {
+    for bdf in &lease.pci_bdfs {
+        let device = sysfs_root.join("bus/pci/devices").join(bdf);
+        let metadata =
+            fs::metadata(&device).with_context(|| format!("inspect host PCI function {bdf}"))?;
+        if !metadata.is_dir() {
+            bail!("host PCI function {bdf} is not a sysfs directory");
+        }
+
+        let boot_vga = device.join("boot_vga");
+        match fs::read_to_string(&boot_vga) {
+            Ok(value) => match value.trim() {
+                "0" => {}
+                "1" => bail!("refusing VFIO assignment of L0 boot display {bdf}"),
+                other => bail!("invalid boot_vga value {other:?} for PCI function {bdf}"),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("read boot_vga for PCI function {bdf}"));
+            }
+        }
+
+        let drm = device.join("drm");
+        let cards = match fs::read_dir(&drm) {
+            Ok(cards) => cards,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("read DRM devices for PCI function {bdf}"));
+            }
+        };
+        for card in cards {
+            let card = card?;
+            if !card.file_type()?.is_dir() {
+                continue;
+            }
+            for connector in fs::read_dir(card.path())
+                .with_context(|| format!("read DRM connectors for PCI function {bdf}"))?
+            {
+                let connector = connector?;
+                let status = connector.path().join("status");
+                let value = match fs::read_to_string(&status) {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("read DRM connector status for PCI function {bdf}")
+                        });
+                    }
+                };
+                match value.trim() {
+                    "connected" => {
+                        bail!(
+                            "refusing VFIO assignment of L0 display {bdf} with connected DRM connector {}",
+                            connector.file_name().to_string_lossy()
+                        );
+                    }
+                    "disconnected" | "unknown" => {}
+                    other => bail!("invalid DRM connector status {other:?} for PCI function {bdf}"),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Durable recovery record for one whole-IOMMU-group VFIO handoff.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VfioLeaseRecord {
@@ -867,6 +972,34 @@ pub enum VfioLeaseState {
 }
 
 impl VfioLeaseRecord {
+    pub fn dvm_artifact_manifest_sha256(&self) -> Result<&str> {
+        self.release_binding
+            .as_ref()
+            .map(|binding| binding.dvm_artifact_manifest_sha256.as_str())
+            .ok_or_else(|| anyhow!("VFIO lease lacks DVM artifact binding"))
+    }
+
+    pub fn device_policy_sha256(&self) -> Result<&str> {
+        self.release_binding
+            .as_ref()
+            .map(|binding| binding.device_policy_sha256.as_str())
+            .ok_or_else(|| anyhow!("VFIO lease lacks device-policy binding"))
+    }
+
+    pub fn release_manifest_sha256(&self) -> Result<&str> {
+        self.release_binding
+            .as_ref()
+            .map(|binding| binding.release_manifest_sha256.as_str())
+            .ok_or_else(|| anyhow!("VFIO lease lacks release-manifest binding"))
+    }
+
+    pub fn authorization_valid_at(&self, now_unix: u64) -> Result<()> {
+        self.release_binding
+            .as_ref()
+            .ok_or_else(|| anyhow!("VFIO lease lacks signed release authorization evidence"))?
+            .validate_at(now_unix)
+    }
+
     fn from_validated_lease(
         lease: &ValidatedLease,
         original_drivers: BTreeMap<String, Option<String>>,
@@ -1166,6 +1299,10 @@ pub trait VfioOps {
     fn clear_driver_override(&mut self, bdf: &str) -> Result<()>;
     fn unbind_driver(&mut self, bdf: &str, driver: &str) -> Result<()>;
     fn bind_driver(&mut self, bdf: &str, driver: &str) -> Result<()>;
+    /// Reset one function after it is VFIO-bound and before assignment, and
+    /// again after the guest has stopped but before the original driver is
+    /// restored. Absence of the reset attribute is a failed commercial gate.
+    fn reset_device(&mut self, bdf: &str) -> Result<()>;
 }
 
 /// Real L0 sysfs implementation. Constructing this object is read-only;
@@ -1250,6 +1387,42 @@ impl VfioOps for SysfsVfioOps {
 
     fn bind_driver(&mut self, bdf: &str, driver: &str) -> Result<()> {
         self.write_driver_attr(driver, "bind", bdf)
+    }
+
+    fn reset_device(&mut self, bdf: &str) -> Result<()> {
+        validate_pci_bdf(bdf, "VFIO reset")?;
+        let reset = self.device_path(bdf).join("reset");
+        let metadata = fs::symlink_metadata(&reset)
+            .with_context(|| format!("inspect PCI reset attribute for {bdf}"))?;
+        if !metadata.file_type().is_file() {
+            bail!("PCI reset attribute for {bdf} is not a regular sysfs file");
+        }
+        fs::write(&reset, b"1\n").with_context(|| format!("reset PCI device {bdf}"))
+    }
+}
+
+/// Reset every function in deterministic order. A partial reset never grants
+/// launch authority: callers must restore the complete durable lease instead.
+pub fn reset_vfio_group(record: &VfioLeaseRecord, ops: &mut impl VfioOps) -> Result<()> {
+    if record.state != VfioLeaseState::Active {
+        bail!("VFIO group reset requires an active durable lease");
+    }
+    let mut failures = Vec::new();
+    for bdf in record.original_drivers.keys() {
+        let result = (|| {
+            if ops.current_driver(bdf)?.as_deref() != Some("vfio-pci") {
+                bail!("PCI device {bdf} is not VFIO-bound at reset");
+            }
+            ops.reset_device(bdf)
+        })();
+        if let Err(error) = result {
+            failures.push(format!("{bdf}: {error:#}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("VFIO group reset incomplete: {}", failures.join("; "))
     }
 }
 
@@ -1350,6 +1523,12 @@ pub fn acquire_vfio_lease(
 
 /// Restore every device from either a prepared or active durable lease.
 pub fn restore_vfio_lease(record: &VfioLeaseRecord, ops: &mut impl VfioOps) -> Result<()> {
+    if record.state == VfioLeaseState::Active {
+        // Never hand a device that may retain guest-programmed queues back to
+        // a host driver. If reset fails, leave it quarantined on vfio-pci and
+        // retain the durable lease for explicit recovery.
+        reset_vfio_group(record, ops)?;
+    }
     let bdfs = record
         .original_drivers
         .keys()
@@ -1386,10 +1565,8 @@ fn rollback_vfio_lease(
             // Clear the VFIO override before explicitly re-binding the original
             // driver: an inherited nonmatching override would block that bind.
             ops.clear_driver_override(bdf)?;
-            if needs_rebind {
-                if let Some(driver) = original_driver {
-                    ops.bind_driver(bdf, driver)?;
-                }
+            if needs_rebind && let Some(driver) = original_driver {
+                ops.bind_driver(bdf, driver)?;
             }
             if ops.current_driver(bdf)? != *original_driver {
                 bail!("failed to restore original driver for {bdf}");
@@ -1564,6 +1741,8 @@ pub struct ProbeResult {
 pub struct DvmDriverInventory {
     pub virtio_net_bound: bool,
     pub virtio_gpu_bound: bool,
+    pub display_driver_bound: bool,
+    pub display_relay_ready: bool,
 }
 
 /// Destination controlled by L0 for sanitized DVM input frames.
@@ -2110,7 +2289,15 @@ impl HostControlListener {
         let drivers = request(connection, 3, "driver-inventory")?;
         if !has_exact_fields(
             &drivers,
-            &["id", "op", "status", "virtio-net", "virtio-gpu"],
+            &[
+                "id",
+                "op",
+                "status",
+                "virtio-net",
+                "virtio-gpu",
+                "display-driver",
+                "display-relay",
+            ],
         ) || drivers.get("status") != Some(&"ok".to_owned())
         {
             bail!("Linux DVM driver inventory probe was not ready");
@@ -2118,6 +2305,8 @@ impl HostControlListener {
         let driver_inventory = DvmDriverInventory {
             virtio_net_bound: parse_driver_inventory_state(&drivers, "virtio-net")?,
             virtio_gpu_bound: parse_driver_inventory_state(&drivers, "virtio-gpu")?,
+            display_driver_bound: parse_driver_inventory_state(&drivers, "display-driver")?,
+            display_relay_ready: parse_ready_inventory_state(&drivers, "display-relay")?,
         };
         Ok(ProbeResult {
             peer_cid: self.expected_dvm_cid,
@@ -2133,6 +2322,15 @@ fn parse_driver_inventory_state(fields: &BTreeMap<String, String>, key: &str) ->
         Some("missing") => Ok(false),
         Some(value) => bail!("invalid Linux DVM driver inventory state {key}={value:?}"),
         None => bail!("Linux DVM driver inventory omitted {key}"),
+    }
+}
+
+fn parse_ready_inventory_state(fields: &BTreeMap<String, String>, key: &str) -> Result<bool> {
+    match fields.get(key).map(String::as_str) {
+        Some("ready") => Ok(true),
+        Some("missing") => Ok(false),
+        Some(value) => bail!("invalid Linux DVM readiness inventory state {key}={value:?}"),
+        None => bail!("Linux DVM readiness inventory omitted {key}"),
     }
 }
 
@@ -2364,12 +2562,7 @@ fn allocate_input_epoch(next: &AtomicU32) -> Result<u32> {
     }
 }
 
-fn required<'a>(
-    values: &'a BTreeMap<&str, &str>,
-    key: &str,
-    expected: &str,
-    label: &str,
-) -> Result<()> {
+fn required(values: &BTreeMap<&str, &str>, key: &str, expected: &str, label: &str) -> Result<()> {
     if required_value(values, key, label)? != expected {
         bail!("unsupported {label} {key}");
     }
@@ -2695,7 +2888,8 @@ mod tests {
         ReleaseAuthorization, RustosInputFrame, ValidatedLease, VfioLeaseRecord, VfioLeaseState,
         VfioOps, VfioReleaseBinding, acquire_vfio_lease, allocate_input_epoch, control_proof,
         inspect_vfio_lease, inspect_vfio_lease_preflight, parse_linux_evdev_input_event,
-        parse_message, restore_vfio_lease, validate_hello,
+        parse_message, reset_vfio_group, restore_vfio_lease, validate_hello,
+        validate_host_display_assignment,
     };
     use anyhow::Result;
 
@@ -2726,6 +2920,11 @@ mod tests {
         assert!(ControlContract::parse(&VALID.replace("control", "pretransport"), "test").is_err());
         assert!(
             ControlContract::parse(&VALID.replace("device-inventory", "network-rx"), "test")
+                .is_err()
+        );
+        assert!(ControlContract::parse(&format!("{VALID}CONTROL_DEBUG=yes\n"), "test").is_err());
+        assert!(
+            ControlContract::parse(&VALID.replace("CONTROL_STATE", " CONTROL_STATE"), "test")
                 .is_err()
         );
     }
@@ -2887,7 +3086,7 @@ mod tests {
     #[test]
     fn driver_domain_policy_names_one_explicit_transport_per_class() {
         let policy = DriverDomainPolicy::parse(
-            "DRIVER_DOMAIN_POLICY_SCHEMA=1\nDOMAIN_ID=linux-dvm-net0\nINPUT_TRANSPORT=input-ring-msix\nNETWORK_TRANSPORT=disabled\nBLOCK_TRANSPORT=disabled\nDISPLAY_TRANSPORT=disabled\n",
+            &format!("DRIVER_DOMAIN_POLICY_SCHEMA=2\nDOMAIN_ID=linux-dvm-net0\nQEMU_SHA256={}\nINPUT_TRANSPORT=input-ring-msix\nNETWORK_TRANSPORT=disabled\nBLOCK_TRANSPORT=disabled\nDISPLAY_TRANSPORT=disabled\n", "a".repeat(64)),
             "test",
         )
         .unwrap();
@@ -2900,10 +3099,19 @@ mod tests {
             DeviceTransport::Disabled
         );
         assert!(DriverDomainPolicy::parse(
-            "DRIVER_DOMAIN_POLICY_SCHEMA=1\nDOMAIN_ID=linux-dvm-net0\nINPUT_TRANSPORT=input-ring-msix\nNETWORK_TRANSPORT=input-ring-msix\nBLOCK_TRANSPORT=disabled\nDISPLAY_TRANSPORT=disabled\n",
+            &format!("DRIVER_DOMAIN_POLICY_SCHEMA=2\nDOMAIN_ID=linux-dvm-net0\nQEMU_SHA256={}\nINPUT_TRANSPORT=input-ring-msix\nNETWORK_TRANSPORT=input-ring-msix\nBLOCK_TRANSPORT=disabled\nDISPLAY_TRANSPORT=disabled\n", "a".repeat(64)),
             "test",
         )
         .is_err());
+        let display = DriverDomainPolicy::parse(
+            &format!("DRIVER_DOMAIN_POLICY_SCHEMA=2\nDOMAIN_ID=linux-dvm-gpu0\nQEMU_SHA256={}\nINPUT_TRANSPORT=input-ring-msix\nNETWORK_TRANSPORT=disabled\nBLOCK_TRANSPORT=disabled\nDISPLAY_TRANSPORT=display-dmabuf-kms\n", "a".repeat(64)),
+            "display-test",
+        )
+        .unwrap();
+        assert_eq!(
+            display.transport_for(DeviceClass::Display),
+            DeviceTransport::DisplayDmaBufKms
+        );
     }
 
     #[test]
@@ -3008,6 +3216,27 @@ mod tests {
     }
 
     #[test]
+    fn vfio_assignment_rejects_live_host_displays() {
+        let sysfs = TestSysfs::new(&[(18, &["0000:65:00.0"])]);
+        let lease = ValidatedLease {
+            domain_id: "linux-dvm-gpu0".to_owned(),
+            dvm_guest_cid: 4,
+            iommu_group: 18,
+            pci_bdfs: vec!["0000:65:00.0".to_owned()],
+        };
+
+        sysfs.write_pci_attr("0000:65:00.0", "boot_vga", "1\n");
+        assert!(validate_host_display_assignment(&lease, sysfs.path()).is_err());
+
+        sysfs.write_pci_attr("0000:65:00.0", "boot_vga", "0\n");
+        sysfs.write_connector_status("0000:65:00.0", "card0-eDP-1", "connected\n");
+        assert!(validate_host_display_assignment(&lease, sysfs.path()).is_err());
+
+        sysfs.write_connector_status("0000:65:00.0", "card0-eDP-1", "disconnected\n");
+        validate_host_display_assignment(&lease, sysfs.path()).unwrap();
+    }
+
+    #[test]
     fn vfio_acquire_and_restore_are_transactional() {
         let lease = validated_lease(&["0000:02:00.0", "0000:02:00.1"]);
         let mut ops = FakeVfioOps::with_drivers(&[
@@ -3016,8 +3245,12 @@ mod tests {
         ]);
         ops.overrides
             .insert("0000:02:00.0".to_owned(), "other-driver".to_owned());
-        let record = inspect_vfio_lease(&lease, &ops, release_binding()).unwrap();
+        let mut record = inspect_vfio_lease(&lease, &ops, release_binding()).unwrap();
         acquire_vfio_lease(&record, &mut ops, 150).unwrap();
+        reset_vfio_group(&record, &mut ops).unwrap_err();
+        record.state = VfioLeaseState::Active;
+        reset_vfio_group(&record, &mut ops).unwrap();
+        assert_eq!(ops.reset_bdfs, ["0000:02:00.0", "0000:02:00.1"]);
         assert_eq!(
             ops.current_driver("0000:02:00.0").unwrap().as_deref(),
             Some("vfio-pci")
@@ -3160,6 +3393,8 @@ mod tests {
         drivers: BTreeMap<String, Option<String>>,
         overrides: BTreeMap<String, String>,
         fail_bind: Option<(String, String)>,
+        fail_reset: Option<String>,
+        reset_bdfs: Vec<String>,
     }
 
     impl FakeVfioOps {
@@ -3172,6 +3407,8 @@ mod tests {
                     .collect(),
                 overrides: BTreeMap::new(),
                 fail_bind: None,
+                fail_reset: None,
+                reset_bdfs: Vec::new(),
             }
         }
     }
@@ -3227,6 +3464,17 @@ mod tests {
             self.drivers.insert(bdf.to_owned(), Some(driver.to_owned()));
             Ok(())
         }
+
+        fn reset_device(&mut self, bdf: &str) -> Result<(), anyhow::Error> {
+            if self.fail_reset.as_deref() == Some(bdf) {
+                anyhow::bail!("injected fake reset failure for {bdf}");
+            }
+            if self.current_driver(bdf)?.as_deref() != Some("vfio-pci") {
+                anyhow::bail!("fake reset requires vfio-pci for {bdf}");
+            }
+            self.reset_bdfs.push(bdf.to_owned());
+            Ok(())
+        }
     }
 
     struct TestSysfs {
@@ -3248,9 +3496,29 @@ mod tests {
                 fs::create_dir_all(&devices).unwrap();
                 for bdf in *bdfs {
                     fs::create_dir(devices.join(bdf)).unwrap();
+                    fs::create_dir_all(root.join("bus/pci/devices").join(bdf)).unwrap();
                 }
             }
             Self { root }
+        }
+
+        fn write_pci_attr(&self, bdf: &str, name: &str, value: &str) {
+            fs::write(
+                self.root.join("bus/pci/devices").join(bdf).join(name),
+                value,
+            )
+            .unwrap();
+        }
+
+        fn write_connector_status(&self, bdf: &str, connector: &str, value: &str) {
+            let connector = self
+                .root
+                .join("bus/pci/devices")
+                .join(bdf)
+                .join("drm/card0")
+                .join(connector);
+            fs::create_dir_all(&connector).unwrap();
+            fs::write(connector.join("status"), value).unwrap();
         }
 
         fn path(&self) -> &Path {

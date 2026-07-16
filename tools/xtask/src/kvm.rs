@@ -33,8 +33,12 @@ use crate::util::{resolve_command_path, run_command};
 const DVM_KERNEL: &str = "rustos-linux-dvm-x86_64.bzImage";
 const DVM_ROOTFS: &str = "rustos-linux-dvm-x86_64.rootfs.cpio.xz";
 const DVM_CONFIG: &str = "rustos-linux-dvm-x86_64.config";
+const DVM_KERNEL_CONFIG: &str = "rustos-linux-dvm-x86_64.kernel.config";
+const DVM_MODULE_SIGNING_CERT: &str = "rustos-linux-dvm-x86_64.module-signing.x509";
+const DVM_SOURCES_LOCK: &str = "rustos-linux-dvm-x86_64.sources.lock";
+const DVM_CONTROL_ARTIFACT: &str = "rustos-linux-dvm-x86_64.control.env";
 const DVM_MANIFEST: &str = "rustos-linux-dvm-x86_64.manifest";
-const DVM_MANIFEST_SCHEMA: &str = "4";
+const DVM_MANIFEST_SCHEMA: &str = "8";
 const DVM_CONTROL_CONTRACT: &str = "board/overlay/usr/share/rustos-dvm/control-plane-v1.env";
 const DVM_CONTROL_PROTOCOL: &str = "agent-v1";
 const DVM_CONTROL_STATE: &str = "control";
@@ -53,12 +57,17 @@ const MIN_UI_FPS_INPUT_EVENTS: u64 = 55;
 const MIN_UI_FPS_CURSOR_MOVES: u64 = 50;
 const MAX_UI_INPUT_GAP_MS: u64 = 50;
 const MIN_UI_CURSOR_SPAN: u64 = 96;
-// Copying the immutable frame snapshot and completing the DRM damage update
-// must leave meaningful headroom inside a 16.67 ms 60 Hz frame.
+// Completing the direct DMA-BUF atomic commit must leave meaningful headroom
+// inside a 16.67 ms 60 Hz frame.  The relay never copies pixel payloads.
 const MAX_DVM_DISPLAY_RELAY_US: u64 = 12_000;
 const DVM_DISPLAY_WIDTH: u32 = 1600;
 const DVM_DISPLAY_HEIGHT: u32 = 900;
 const DVM_DISPLAY_REGION_BYTES: u64 = 32 * 1024 * 1024;
+// Keep the KVM proof topology identical to the supervised physical-display
+// DVM.  The GPU-capable image contains roughly 200 MiB of uncompressed rootfs
+// (including firmware), and a 512 MiB guest can exhaust early-boot ramfs while
+// the compressed initrd and XZ workspace are still resident.
+const DVM_GUEST_MEMORY: &str = "1024M,maxmem=2G,slots=2";
 // QEMU maps the shared pixel backend as cacheable device memory at this
 // reserved, 2 MiB-aligned guest-physical address in both guests. The ivshmem
 // BAR carries only bounded control records and MSI-X doorbells.
@@ -464,10 +473,9 @@ fn qemu_display_backend(display: GuestDisplay) -> &'static str {
         // result to the frontend default and previously left the host pointer
         // visible over the guest UI on some GTK versions.
         //
-        // The DVM relay uses atomic KMS page flips over 2D virtio-gpu and never
-        // submits virgl commands. Keep the interactive path on QEMU's 2D
-        // frontend: gtk,gl=on has had independent black-scanout regressions,
-        // while adding no capability to this display contract.
+        // The DVM relay uses atomic KMS page flips and never submits virgl
+        // commands. Keep the interactive path on QEMU's 2D frontend: host GL
+        // adds no capability to this display contract.
         GuestDisplay::DvmGtk => {
             "gtk,gl=off,show-tabs=off,zoom-to-fit=off,grab-on-hover=on,show-cursor=off"
         }
@@ -476,10 +484,10 @@ fn qemu_display_backend(display: GuestDisplay) -> &'static str {
 
 fn dvm_gpu_device(_display: GuestDisplay) -> String {
     format!(
-        // The DVM display transport is deliberately fixed at 1600x900.
-        // GTK's resize-aware EDID starts at its tiny bootstrap window and can
-        // otherwise replace that mode with 640x480 before the Linux DRM relay
-        // starts. Disable EDID so QEMU's explicit dimensions are authoritative.
+        // The standard virtual control/input topology stays on virtio-gpu.
+        // Linux 6.12 rejects foreign SG-table DMA-BUF imports for this driver,
+        // so a direct-scanout FPS gate remains failed until it runs with an
+        // assigned physical i915/xe/amdgpu device; no CPU-copy fallback exists.
         "virtio-gpu-pci,id=dvm-virtio-gpu,xres={},yres={},edid=off",
         DVM_DISPLAY_WIDTH, DVM_DISPLAY_HEIGHT
     )
@@ -608,19 +616,47 @@ fn verify_dvm_artifacts(config: &Config) -> Result<DvmArtifacts> {
     let kernel = artifact_dir.join(DVM_KERNEL);
     let rootfs = artifact_dir.join(DVM_ROOTFS);
     let build_config = artifact_dir.join(DVM_CONFIG);
+    let kernel_config = artifact_dir.join(DVM_KERNEL_CONFIG);
+    let module_signing_cert = artifact_dir.join(DVM_MODULE_SIGNING_CERT);
+    let packaged_sources_lock = artifact_dir.join(DVM_SOURCES_LOCK);
+    let packaged_control_contract = artifact_dir.join(DVM_CONTROL_ARTIFACT);
     verify_manifest_hash(&kernel, manifest_value(&values, "kernel_sha256")?)?;
     verify_manifest_hash(&rootfs, manifest_value(&values, "rootfs_sha256")?)?;
     verify_manifest_hash(&build_config, manifest_value(&values, "config_sha256")?)?;
+    verify_manifest_hash(
+        &kernel_config,
+        manifest_value(&values, "kernel-config-sha256")?,
+    )?;
+    validate_signed_module_kernel_config(&kernel_config)?;
+    verify_manifest_hash(
+        &module_signing_cert,
+        manifest_value(&values, "module-signing-cert-sha256")?,
+    )?;
+    verify_manifest_hash(
+        &packaged_sources_lock,
+        manifest_value(&values, "sources_lock_sha256")?,
+    )?;
     verify_manifest_hash(
         &dvm_dir(config).join("sources.lock"),
         manifest_value(&values, "sources_lock_sha256")?,
     )?;
     let control_contract_path = dvm_dir(config).join(DVM_CONTROL_CONTRACT);
     verify_manifest_hash(
+        &packaged_control_contract,
+        manifest_value(&values, "control-contract-sha256")?,
+    )?;
+    verify_manifest_hash(
         &control_contract_path,
         manifest_value(&values, "control-contract-sha256")?,
     )?;
     let source_contract = parse_dvm_control_contract(&control_contract_path)?;
+    let packaged_contract = parse_dvm_control_contract(&packaged_control_contract)?;
+    if control != packaged_contract {
+        bail!(
+            "Linux DVM control contract mismatch between manifest and {}",
+            packaged_control_contract.display()
+        );
+    }
     if control != source_contract {
         bail!(
             "Linux DVM control contract mismatch between manifest and {}",
@@ -669,16 +705,68 @@ fn parse_manifest_text(text: &str, source: &str) -> Result<BTreeMap<String, Stri
 }
 
 fn validate_manifest_values(values: &BTreeMap<String, String>) -> Result<DvmControlContract> {
+    const REQUIRED_KEYS: [&str; 25] = [
+        "schema",
+        "id",
+        "architecture",
+        "boot",
+        "data-plane",
+        "control-plane",
+        "control-protocol",
+        "control-state",
+        "control-transport",
+        "control-authentication",
+        "control-capabilities",
+        "control-contract-sha256",
+        "buildroot_version",
+        "linux_version",
+        "nvidia-open-version",
+        "nvidia-open-sha256",
+        "nvidia-open-redistribute",
+        "display-kernel-modules",
+        "module-signing-enforced",
+        "module-signing-cert-sha256",
+        "kernel_sha256",
+        "rootfs_sha256",
+        "config_sha256",
+        "kernel-config-sha256",
+        "sources_lock_sha256",
+    ];
+    if values.len() != REQUIRED_KEYS.len()
+        || values
+            .keys()
+            .any(|key| !REQUIRED_KEYS.contains(&key.as_str()))
+    {
+        bail!("unsupported Linux DVM manifest key set");
+    }
     require_manifest_value(values, "schema", DVM_MANIFEST_SCHEMA)?;
     require_manifest_value(values, "id", "rustos-linux-dvm-x86_64")?;
     require_manifest_value(values, "architecture", "x86_64")?;
     require_manifest_value(values, "boot", "linux-bzimage+cpio-xz")?;
     require_manifest_value(values, "data-plane", "hostd-input-ring-msix")?;
+    require_manifest_value(values, "buildroot_version", "2026.05")?;
+    require_manifest_value(values, "linux_version", "6.12.94")?;
+    require_manifest_value(values, "nvidia-open-version", "580.173.02")?;
+    require_manifest_value(
+        values,
+        "nvidia-open-sha256",
+        "8d8eb9001e05a9a8a663d3d5d304feb64ef2844ee185ccdfd952786820f46e1b",
+    )?;
+    require_manifest_value(values, "nvidia-open-redistribute", "no")?;
+    require_manifest_value(
+        values,
+        "display-kernel-modules",
+        "i915,xe,amdgpu,nvidia-drm",
+    )?;
+    require_manifest_value(values, "module-signing-enforced", "yes")?;
     for key in [
         "kernel_sha256",
         "rootfs_sha256",
         "config_sha256",
+        "kernel-config-sha256",
         "sources_lock_sha256",
+        "nvidia-open-sha256",
+        "module-signing-cert-sha256",
     ] {
         if !is_sha256(manifest_value(values, key)?) {
             bail!("invalid SHA-256 value for Linux DVM manifest key {key}");
@@ -699,6 +787,28 @@ fn validate_manifest_values(values: &BTreeMap<String, String>) -> Result<DvmCont
     Ok(control)
 }
 
+fn validate_signed_module_kernel_config(path: &Path) -> Result<()> {
+    let source = fs::read_to_string(path)
+        .with_context(|| format!("read Linux DVM kernel configuration {}", path.display()))?;
+    for required in [
+        "CONFIG_MODULE_SIG=y",
+        "CONFIG_MODULE_SIG_FORCE=y",
+        "CONFIG_MODULE_SIG_ALL=y",
+        "CONFIG_MODULE_SIG_SHA256=y",
+        "CONFIG_MODULE_SIG_HASH=\"sha256\"",
+        "CONFIG_MODULE_SIG_KEY=\"certs/signing_key.pem\"",
+        "CONFIG_MODULE_SIG_KEY_TYPE_RSA=y",
+    ] {
+        if !source.lines().any(|line| line == required) {
+            bail!(
+                "Linux DVM kernel configuration {} lacks {required}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn parse_dvm_control_contract(path: &Path) -> Result<DvmControlContract> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("missing Linux DVM control contract {}", path.display()))?;
@@ -707,6 +817,21 @@ fn parse_dvm_control_contract(path: &Path) -> Result<DvmControlContract> {
 
 fn parse_dvm_control_contract_text(text: &str, source: &str) -> Result<DvmControlContract> {
     let values = parse_manifest_text(text, source)?;
+    const REQUIRED_KEYS: [&str; 6] = [
+        "CONTROL_SCHEMA",
+        "CONTROL_PROTOCOL",
+        "CONTROL_STATE",
+        "CONTROL_TRANSPORT",
+        "CONTROL_AUTHENTICATION",
+        "CONTROL_CAPABILITIES",
+    ];
+    if values.len() != REQUIRED_KEYS.len()
+        || values
+            .keys()
+            .any(|key| !REQUIRED_KEYS.contains(&key.as_str()))
+    {
+        bail!("unsupported Linux DVM control-contract key set in {source}");
+    }
     let control = DvmControlContract {
         protocol: manifest_value(&values, "CONTROL_PROTOCOL")?.to_owned(),
         state: manifest_value(&values, "CONTROL_STATE")?.to_owned(),
@@ -727,9 +852,8 @@ fn validate_control_contract(control: &DvmControlContract) -> Result<()> {
         || control.capabilities.join(",") != DVM_CONTROL_CAPABILITIES
     {
         bail!(
-            "unsupported Linux DVM control contract {}; expected {} with transport={} authentication={} capabilities={}",
+            "unsupported Linux DVM control contract {}; expected {DVM_CONTROL_PROTOCOL}-{DVM_CONTROL_STATE} with transport={} authentication={} capabilities={}",
             control.control_plane(),
-            format!("{DVM_CONTROL_PROTOCOL}-{DVM_CONTROL_STATE}"),
             DVM_CONTROL_TRANSPORT,
             DVM_CONTROL_AUTHENTICATION,
             DVM_CONTROL_CAPABILITIES,
@@ -1389,6 +1513,9 @@ fn start_dvm_input_doorbell(layout: &KvmLayout) -> Result<IvshmemDoorbellServer>
     IvshmemDoorbellServer::start_input(&layout.dvm_input_doorbell, &backing)
 }
 
+// The paired launch keeps both guest, transport, display, and relay-gate
+// ownership arguments explicit at the orchestration boundary.
+#[allow(clippy::too_many_arguments)]
 fn spawn_guests(
     qemu: &Path,
     config: &Config,
@@ -1485,13 +1612,12 @@ fn spawn_guests(
     }
     input_relay_gate.store(true, Ordering::Release);
 
-    if let Some(display_doorbell) = display_doorbell {
-        if let Err(error) = display_doorbell.wait_for_peer_count(1, DVM_DISPLAY_FIRST_PEER_TIMEOUT)
-        {
-            let mut rustos = rustos;
-            stop_guest(&mut rustos);
-            return Err(error).context("RustOS did not claim ivshmem peer ID 0 before DVM launch");
-        }
+    if let Some(display_doorbell) = display_doorbell
+        && let Err(error) = display_doorbell.wait_for_peer_count(1, DVM_DISPLAY_FIRST_PEER_TIMEOUT)
+    {
+        let mut rustos = rustos;
+        stop_guest(&mut rustos);
+        return Err(error).context("RustOS did not claim ivshmem peer ID 0 before DVM launch");
     }
 
     let mut dvm_command = Command::new(qemu);
@@ -1510,7 +1636,7 @@ fn spawn_guests(
             "-cpu",
             "host",
             "-m",
-            "512M,maxmem=1G,slots=2",
+            DVM_GUEST_MEMORY,
             "-smp",
             "2",
         ])
@@ -1656,6 +1782,11 @@ fn wait_for_parallel_boot(
         check_guest_running(dvm, "Linux DVM", &layout.dvm_stderr_log)?;
         let rustos_log = fs::read_to_string(&layout.debugcon_log)?;
         let dvm_log = fs::read_to_string(&layout.dvm_serial_log)?;
+        if options.gui_dvm_surfaces
+            && let Some(failure) = dvm_display_failure(&dvm_log)
+        {
+            bail!("Linux DVM display relay failed before readiness: {failure}");
+        }
         let rustos_ready = options
             .expected_markers
             .iter()
@@ -1702,13 +1833,13 @@ fn wait_for_parallel_boot(
             || (dvm_network.is_some_and(DvmNetworkCounters::round_trip_observed)
                 && rustos_log.contains(NETPROBE_QEMU_REACHABLE_MARKER));
         if rustos_ready
-            && control_ready.is_some()
             && ui_fps_ready
             && dvm_display_ready
             && dvm_network_ready
             && dvm_network_traffic_ready
+            && let Some(control_ready) = control_ready
         {
-            return Ok(control_ready.expect("checked above"));
+            return Ok(control_ready);
         }
         if Instant::now() >= deadline {
             let input = dvm_input_counters(&layout.dvm_input_ring)?;
@@ -1739,6 +1870,13 @@ fn wait_for_parallel_boot(
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn dvm_display_failure(log: &str) -> Option<&str> {
+    const MARKER: &str = "rustos-dvm-display: KMS setup unavailable stage=";
+    log.lines()
+        .rev()
+        .find_map(|line| line.find(MARKER).map(|offset| &line[offset..]))
 }
 
 /// The kernel's bootstrap trace intentionally does not promise runtime
@@ -1778,9 +1916,10 @@ fn dvm_display_relay_ready(log: &str) -> bool {
             && line.contains("event=ivshmem-msix-uio")
             && has_interrupt
             && line.contains("format=BGRA8888")
-            && line.contains("cacheable-atomic-scanout=")
+            && line.contains("dmabuf-direct-scanout=")
             && line.contains("atomic-pageflip-fence=1")
             && line.contains("scanout_buffers=3")
+            && line.contains("cpu-copy=0")
     });
     active
         && log.lines().any(|line| {
@@ -1938,9 +2077,9 @@ fn dvm_display_relay_meets_fps(log: &str, minimum_fps: u32, required_windows: us
         let Some((_, fields)) = line.split_once("rustos-dvm-display: stats ") else {
             continue;
         };
-        let pageflip_submissions = fields.split_whitespace().find_map(|field| {
+        let pageflip_completions = fields.split_whitespace().find_map(|field| {
             field
-                .strip_prefix("pageflip_submissions=")
+                .strip_prefix("pageflip_completions=")
                 .and_then(|value| value.parse::<u64>().ok())
         });
         let frame_hz_milli = fields.split_whitespace().find_map(|field| {
@@ -1948,19 +2087,20 @@ fn dvm_display_relay_meets_fps(log: &str, minimum_fps: u32, required_windows: us
                 .strip_prefix("frame_hz_milli=")
                 .and_then(|value| value.parse::<u64>().ok())
         });
-        let copy_us = log_u64(fields, "copy_us_avg");
+        let relay_cpu_copy_us = log_u64(fields, "relay_cpu_copy_us_avg");
         let atomic_commit_us = log_u64(fields, "atomic_commit_us_avg");
-        let Some((pageflip_submissions, frame_hz_milli, copy_us, atomic_commit_us)) =
-            pageflip_submissions
+        let Some((pageflip_completions, frame_hz_milli, relay_cpu_copy_us, atomic_commit_us)) =
+            pageflip_completions
                 .zip(frame_hz_milli)
-                .zip(copy_us.zip(atomic_commit_us))
+                .zip(relay_cpu_copy_us.zip(atomic_commit_us))
                 .map(|((submissions, hz), (copy, commit))| (submissions, hz, copy, commit))
         else {
             continue;
         };
-        if pageflip_submissions == 0
+        if pageflip_completions == 0
             || frame_hz_milli < required_milli
-            || copy_us.saturating_add(atomic_commit_us) > MAX_DVM_DISPLAY_RELAY_US
+            || relay_cpu_copy_us != 0
+            || atomic_commit_us > MAX_DVM_DISPLAY_RELAY_US
         {
             consecutive_samples = 0;
             continue;
@@ -2241,9 +2381,9 @@ mod tests {
         DEFAULT_UI_FPS_ACTIVE_WINDOWS, DVM_CONTROL_AUTHENTICATION, DVM_CONTROL_CAPABILITIES,
         DVM_CONTROL_PROTOCOL, DVM_CONTROL_STATE, DVM_CONTROL_TRANSPORT,
         DVM_KEYBOARD_INGRESS_MARKER, DVM_POINTER_INGRESS_MARKER, DvmNetworkCounters, GuestDisplay,
-        RUSTOS_BOOT_MARKER, dvm_display_provider_ready, dvm_display_relay_meets_fps,
-        dvm_display_relay_ready, dvm_gpu_device, dvm_pointer_device, is_sha256,
-        parse_dvm_control_contract_text, parse_manifest_text, parse_smoke_options,
+        RUSTOS_BOOT_MARKER, dvm_display_failure, dvm_display_provider_ready,
+        dvm_display_relay_meets_fps, dvm_display_relay_ready, dvm_gpu_device, dvm_pointer_device,
+        is_sha256, parse_dvm_control_contract_text, parse_manifest_text, parse_smoke_options,
         qemu_display_backend, runtime_stall_or_crash_observed, select_smoke_guest_display,
         uiserver_has_interactive_slow_loop, uiserver_idle_ticks_healthy,
         uiserver_profile_input_pipeline_healthy, uiserver_profile_meets_fps,
@@ -2291,16 +2431,23 @@ mod tests {
         assert!(dvm_display_relay_ready(
             "rustos-dvm-display: peer readiness sent event=ivshmem-msix-uio\n\
              rustos-dvm-display: host confirmed peer readiness event=ivshmem-msix-uio\n\
-             rustos-dvm-display: active width=1600 height=900 stride=6400 format=BGRA8888 event=ivshmem-msix-uio irq_count=1 cacheable-atomic-scanout=1600x900 atomic-pageflip-fence=1 scanout_buffers=3"
+             rustos-dvm-display: active width=1600 height=900 stride=6400 format=BGRA8888 event=ivshmem-msix-uio irq_count=1 dmabuf-direct-scanout=1600x900 atomic-pageflip-fence=1 scanout_buffers=3 cpu-copy=0"
         ));
         assert!(!dvm_display_relay_ready(
-            "rustos-dvm-display: active width=1600 height=900 stride=6400 format=BGRA8888 cacheable-atomic-scanout"
+            "rustos-dvm-display: active width=1600 height=900 stride=6400 format=BGRA8888 dmabuf-direct-scanout"
         ));
         assert!(!dvm_display_relay_ready(
             "rustos-dvm-display: peer readiness sent event=ivshmem-msix-uio\n\
              rustos-dvm-display: host confirmed peer readiness event=ivshmem-msix-uio\n\
-             rustos-dvm-display: active width=1600 height=900 stride=6400 format=BGRA8888 event=ivshmem-msix-uio irq_count=0 cacheable-atomic-scanout=1600x900 atomic-pageflip-fence=1 scanout_buffers=3"
+             rustos-dvm-display: active width=1600 height=900 stride=6400 format=BGRA8888 event=ivshmem-msix-uio irq_count=0 dmabuf-direct-scanout=1600x900 atomic-pageflip-fence=1 scanout_buffers=3 cpu-copy=0"
         ));
+        assert_eq!(
+            dvm_display_failure(
+                "boot\nStarting crond: rustos-dvm-display: KMS setup unavailable stage=direct-dmabuf-import errno=6\n"
+            ),
+            Some("rustos-dvm-display: KMS setup unavailable stage=direct-dmabuf-import errno=6")
+        );
+        assert_eq!(dvm_display_failure("boot\nrelay pending\n"), None);
     }
 
     #[test]
@@ -2389,23 +2536,23 @@ mod tests {
             DEFAULT_UI_FPS_ACTIVE_WINDOWS,
         ));
         assert!(dvm_display_relay_meets_fps(
-            "rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60000 pageflip_submissions=60 copy_us_avg=3000 atomic_commit_us_avg=1000\n\
-             rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60001 pageflip_submissions=60 copy_us_avg=3000 atomic_commit_us_avg=1000\n\
-             rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60000 pageflip_submissions=60 copy_us_avg=3000 atomic_commit_us_avg=1000",
+            "rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60000 pageflip_completions=60 relay_cpu_copy_us_avg=0 atomic_commit_us_avg=1000\n\
+             rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60001 pageflip_completions=60 relay_cpu_copy_us_avg=0 atomic_commit_us_avg=1000\n\
+             rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60000 pageflip_completions=60 relay_cpu_copy_us_avg=0 atomic_commit_us_avg=1000",
             60,
             DEFAULT_UI_FPS_ACTIVE_WINDOWS,
         ));
         assert!(!dvm_display_relay_meets_fps(
-            "rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60000 pageflip_submissions=60 copy_us_avg=3000 atomic_commit_us_avg=1000\n\
-             rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=59999 pageflip_submissions=60 copy_us_avg=3000 atomic_commit_us_avg=1000\n\
-             rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60000 pageflip_submissions=60 copy_us_avg=3000 atomic_commit_us_avg=1000",
+            "rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60000 pageflip_completions=60 relay_cpu_copy_us_avg=0 atomic_commit_us_avg=1000\n\
+             rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=59999 pageflip_completions=60 relay_cpu_copy_us_avg=0 atomic_commit_us_avg=1000\n\
+             rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60000 pageflip_completions=60 relay_cpu_copy_us_avg=0 atomic_commit_us_avg=1000",
             60,
             DEFAULT_UI_FPS_ACTIVE_WINDOWS,
         ));
         assert!(!dvm_display_relay_meets_fps(
-            "rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60000 pageflip_submissions=60 copy_us_avg=8000 atomic_commit_us_avg=5000\n\
-             rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60000 pageflip_submissions=60 copy_us_avg=3000 atomic_commit_us_avg=1000\n\
-             rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60000 pageflip_submissions=60 copy_us_avg=3000 atomic_commit_us_avg=1000",
+            "rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60000 pageflip_completions=60 relay_cpu_copy_us_avg=1 atomic_commit_us_avg=5000\n\
+             rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60000 pageflip_completions=60 relay_cpu_copy_us_avg=0 atomic_commit_us_avg=1000\n\
+             rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60000 pageflip_completions=60 relay_cpu_copy_us_avg=0 atomic_commit_us_avg=1000",
             60,
             DEFAULT_UI_FPS_ACTIVE_WINDOWS,
         ));
@@ -2534,10 +2681,14 @@ uiserver: update tick backlog=false input_drops=0 input_slow=0 input_errors=0";
 
         let hash = "0".repeat(64);
         let manifest = format!(
-            "schema=4\nid=rustos-linux-dvm-x86_64\narchitecture=x86_64\nboot=linux-bzimage+cpio-xz\ndata-plane=hostd-input-ring-msix\ncontrol-plane=agent-v1-control\ncontrol-protocol=agent-v1\ncontrol-state=control\ncontrol-transport=kvm-vsock\ncontrol-authentication=dvm-agent-hmac-sha256-v1\ncontrol-capabilities=health,device-inventory,driver-inventory,input-stream\ncontrol-contract-sha256={hash}\nkernel_sha256={hash}\nrootfs_sha256={hash}\nconfig_sha256={hash}\nsources_lock_sha256={hash}\n"
+            "schema=8\nid=rustos-linux-dvm-x86_64\narchitecture=x86_64\nboot=linux-bzimage+cpio-xz\ndata-plane=hostd-input-ring-msix\ncontrol-plane=agent-v1-control\ncontrol-protocol=agent-v1\ncontrol-state=control\ncontrol-transport=kvm-vsock\ncontrol-authentication=dvm-agent-hmac-sha256-v1\ncontrol-capabilities=health,device-inventory,driver-inventory,input-stream\ncontrol-contract-sha256={hash}\nbuildroot_version=2026.05\nlinux_version=6.12.94\nnvidia-open-version=580.173.02\nnvidia-open-sha256=8d8eb9001e05a9a8a663d3d5d304feb64ef2844ee185ccdfd952786820f46e1b\nnvidia-open-redistribute=no\ndisplay-kernel-modules=i915,xe,amdgpu,nvidia-drm\nmodule-signing-enforced=yes\nmodule-signing-cert-sha256={hash}\nkernel_sha256={hash}\nrootfs_sha256={hash}\nconfig_sha256={hash}\nkernel-config-sha256={hash}\nsources_lock_sha256={hash}\n"
         );
         let values = parse_manifest_text(&manifest, "manifest").unwrap();
         assert_eq!(validate_manifest_values(&values).unwrap(), contract);
+
+        let mut extra = values;
+        extra.insert("unexpected".to_owned(), "1".to_owned());
+        assert!(validate_manifest_values(&extra).is_err());
     }
 
     #[test]

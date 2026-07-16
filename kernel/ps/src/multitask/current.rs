@@ -383,13 +383,15 @@ fn retain_current_user_process_binding() -> Option<(u64, UserAbi, process_table:
     Some((thread_id, abi, process))
 }
 
-fn retain_current_linux_thread_binding() -> Option<(
+type RetainedLinuxThreadBinding = (
     u64,
     u64,
     UserAbi,
     process_table::ProcessRef,
     core::ptr::NonNull<Option<LinuxThreadState>>,
-)> {
+);
+
+fn retain_current_linux_thread_binding() -> Option<RetainedLinuxThreadBinding> {
     let binding = interrupts::without_interrupts(|| unsafe {
         scheduler_mut().current_linux_thread_binding()
     })?;

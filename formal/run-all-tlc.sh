@@ -39,6 +39,10 @@ driver-domain-fleet/DriverDomainFleet
 ivshmem-pairing/IvshmemPairing
 gui-dvm-surface/GuiDvmSurface
 dvm-atomic-scanout/DvmAtomicScanout
+dvm-commercial-lifecycle/DvmCommercialLifecycle
+dvm-release-bundle/DvmReleaseBundle
+dvm-display-driver-supply/DvmDisplayDriverSupply
+dvm-amdgpu-supply/DvmAmdgpuSupply
 gui-dvm-pixel-authority/GuiDvmPixelAuthority
 gui-dvm-install/GuiDvmInstall
 ipc-reply-deadline/IpcReplyDeadline

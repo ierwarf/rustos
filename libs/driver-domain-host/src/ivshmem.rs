@@ -228,7 +228,7 @@ fn accept_ready_peers(
     }
 }
 
-fn reap_disconnected_peers(peers: &mut Vec<Peer>) -> Result<()> {
+fn reap_disconnected_peers(peers: &mut [Peer]) -> Result<()> {
     for peer in peers.iter() {
         let fd = peer.stream.as_raw_fd();
         let mut byte = [0_u8; 1];

@@ -54,7 +54,7 @@ runtime evidence also pass.
 | P0.2 | Identity, capability, and namespace | Every endpoint, handle, ticket, broker call, and cross-domain request binds an L0/kernel-stamped subject plus exact destination and operation. A path, CID, DVM field, or service name cannot manufacture authority. | endpoint/publication/ownership, handle-transfer, proc/exec, DVM-control models plus denial/revoke/restart tests |
 | P0.3 | User memory and page tables | Every user-copy and map operation proves canonical range, page rounding, access direction, non-overlap, backing lifetime, and teardown. Kernel mappings never follow guest pointers. | source tests for `kernel-mm`/user-copy/brokers; dedicated page-table model remains mandatory |
 | P0.4 | Bounded lifecycle and IPC | Startup, readiness, reply, timeout, cancellation, crash, restart, and teardown converge on one terminal owner state. No core service or policy call can wait indefinitely or retain a stale capability. | rootd/endpoint/IPC deadline/wakeup models, fault injection, 30-second KVM gates |
-| P0.5 | DVM memory and device authority | Host-created apertures, IOMMU groups, MSI-X meanings, control secrets, epochs, and revocation are exact and disjoint. Display/input/network readiness never substitutes for authentication or trusted-attention evidence. | DVM fleet/control/ring/pixel/scanout models, `verify-dvm`, signed VFIO release tests, KVM transport exercises |
+| P0.5 | DVM memory and device authority | Host-created apertures, IOMMU groups, MSI-X meanings, control secrets, epochs, reset order, runtime process identity, and revocation are exact and disjoint. A physical-device child requires a durable signed lease, non-identity IOMMUFD, authenticated readiness, and bounded post-stop reset. Direct display scanout grants device-read but never device-write DMA authority. | DVM fleet/control/ring/pixel/scanout/commercial-lifecycle models, `verify-dvm`, signed VFIO release tests, KVM transport exercises, target IOMMU fault/reset/revoke captures |
 | P1.1 | Scheduler and queue overload | Critical work has explicit admission, priority inheritance, bounded turns and queues, measurable wait/frame thresholds, and a guaranteed recovery/User share under flood. IRQ leaves policy and unbounded work to schedulable context. | scheduler admission/demotion/wakeup/IPC PI models, `kernel-ps` tests, UI profile and stall markers |
 | P1.2 | Storage and filesystem mutation | Boot substrate is descriptor/extent bounded; namespace, mount, metadata, and post-bootstrap storage policy stay in services. Power loss, partial write, media removal, and replay have explicit terminal results. | boot-volume model, manifest fuzz, storage fault tests; filesystem-content/crash-consistency model remains mandatory |
 | P1.3 | Network and message payloads | DVM Ethernet is only a bounded authenticated transport; `netd` owns socket policy, queue limits, cancellation, and peer namespaces. Payload length/checksum/fragment adversaries cannot escape their session. | DVM network models and KVM exercise; packet-payload and socket-backpressure models remain mandatory |
@@ -72,8 +72,24 @@ non-identity VT-d/IOMMU fault-and-revoke captures, corrupted-media recovery,
 network saturation/cancellation/backpressure plus physical-NIC captures, and
 multicore CPU-time measurements remain failed release gates until their
 evidence artifacts pass. The composite 30-second KVM GUI/input/netprobe gate is
-now a passing normal-path virtual-transport artifact; it does not waive those
-remaining fault and hardware gates.
+currently failed: the standard Linux 6.12 virtio-gpu cannot import the foreign
+SG-table DMA-BUF used by direct scanout, while QEMU's legacy VMware SVGA device
+cannot bind current vmwgfx. Only a physical i915/xe/amdgpu or pinned
+NVIDIA-open `nvidia-drm` assignment can close that runtime gate; a CPU-copy
+validation fallback is forbidden. The current Blackwell target uses the exact
+580.173.02 open-module/GSP pair and requires kernel-enforced signatures bound
+with their certificate and enforcement configuration to artifact-manifest
+schema 8. The manifest and seven named payload files must be admitted as one
+self-contained, immutable, safely staged release directory. Its
+non-redistributable firmware license, target
+connector, DMA fault, reset, and 60 FPS page-flip captures are separate failed
+release gates until evidence is filed.
+
+The current implementation slice intentionally excludes trusted UI/multi-DVM
+focus authority and physical network/block DVM assignment. Their existing
+fail-closed or virtual-transport models remain useful, but they are not enabled
+commercial product topologies and must not inherit authority from the physical
+display-DVM lifecycle.
 
 ## Architecture baselines
 

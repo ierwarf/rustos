@@ -1,3 +1,7 @@
+// Provider-state tests sit beside the state machine they exercise; production
+// items intentionally continue below that test-only module.
+#![cfg_attr(test, allow(clippy::items_after_test_module))]
+
 use std::collections::{BTreeMap, VecDeque};
 use std::io::Write;
 use std::mem::size_of;
@@ -1355,8 +1359,6 @@ fn send_socket_message(
     if bytes.is_empty() {
         return Ok(0);
     }
-    let nonblocking = request.status_flags & linux_abi::O_NONBLOCK != 0
-        || request_msg_flags(request) & linux_abi::MSG_DONTWAIT != 0;
     let mut state = net_state().lock().unwrap();
     let peer = {
         let socket = state
@@ -1380,11 +1382,7 @@ fn send_socket_message(
     }
     let room = SOCKET_BUFFER_CAPACITY.saturating_sub(peer_connected.incoming_bytes.len());
     if room == 0 {
-        return if nonblocking {
-            Err(libc::EAGAIN)
-        } else {
-            Err(libc::EAGAIN)
-        };
+        return Err(libc::EAGAIN);
     }
     if !control.is_empty() && room < bytes.len() {
         return Err(libc::EAGAIN);
@@ -1414,8 +1412,6 @@ fn recv_socket_bytes(request: &NetdIpcRequest, dest: &mut [u8]) -> Result<usize,
     if dest.is_empty() {
         return Ok(0);
     }
-    let nonblocking = request.status_flags & linux_abi::O_NONBLOCK != 0
-        || request_msg_flags(request) & linux_abi::MSG_DONTWAIT != 0;
     let mut state = net_state().lock().unwrap();
     let socket = state
         .sockets
@@ -1428,11 +1424,7 @@ fn recv_socket_bytes(request: &NetdIpcRequest, dest: &mut [u8]) -> Result<usize,
         if connected.peer_closed || connected.peer_write_closed {
             return Ok(0);
         }
-        return if nonblocking {
-            Err(libc::EAGAIN)
-        } else {
-            Err(libc::EAGAIN)
-        };
+        return Err(libc::EAGAIN);
     }
     let count = dest.len().min(connected.incoming_bytes.len());
     for slot in &mut dest[..count] {

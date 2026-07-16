@@ -93,6 +93,10 @@ impl MemfdHandle {
         self.object().state.lock().len
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn token_id(&self) -> u64 {
         Arc::as_ptr(&self.inner) as usize as u64
     }

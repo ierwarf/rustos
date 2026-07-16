@@ -75,10 +75,14 @@ runner disables TLC's deadlock report; configured invariants remain mandatory.
 | dvm-absolute-pointer/DvmAbsolutePointer | DVM evdev agent, L0 RDI3 relay, ring0 decoder, inputd, uiserver | partial axis reports never publish; duplicate complete positions are idempotent; every position has exactly one pipeline owner; absolute coordinates stay bounded and cannot cause phantom UI motion; finite accepted work drains under fairness |
 | devmgrd-sessiond-isolation/DevmgrdSessiondIsolation | devmgrd receive loop and bounded sessiond ioctl workers | sessiond ioctls have bounded FIFO admission or EAGAIN; worker stalls never own devmgrd's receive loop; unrelated device traffic remains replyable |
 | vfio-release-authorization/VfioReleaseAuthorization | hostd release gate, durable VFIO lease | no topology preflight can bind a device; a pinned-key signature binds the exact group, CID, DVM artifact, and device policy; every bind mutation is within the signed validity window; restore leaves no authority |
+| dvm-commercial-lifecycle/DvmCommercialLifecycle | hostd physical display-DVM supervisor and VFIO recovery | VFIO binding requires a completed reversible runtime preflight including IOMMUFD and live proof that no L0 boot/connected display is assigned; mutable launch inputs cannot authorize a child; a child exists only behind a durable exact lease, complete VFIO group, pre-launch reset, non-identity IOMMUFD, and runtime identity; readiness needs authenticated control; recovery signaling requires an exact pidfd and rejects numeric PID reuse; restoration follows child exit and post-stop reset, but a failed child exit is never accepted as a successful run; reset failure retains quarantine; physical network and block stay disabled |
+| dvm-release-bundle/DvmReleaseBundle | DVM artifact writer, safe staging, xtask and hostd admission | exactly one strict 25-key manifest, one strict six-key control contract, and the other six co-located payloads must verify before atomic publication; unsafe/mutable paths, missing or corrupted companions, replacement, and post-publication mutation cannot grant launch authority; hostd independently reverifies and snapshots the published bundle |
+| dvm-display-driver-supply/DvmDisplayDriverSupply | pinned Linux DVM physical-display package and boot admission | KMS requires the exact open-module/GSP release selected only by a kernel PCI modalias plus a bound kernel-enforced module-signing certificate; UVM/compute authority is absent; relay readiness follows complete KMS initialization; firmware distribution requires an independent authorization and cannot mix releases |
+| dvm-amdgpu-supply/DvmAmdgpuSupply | AMD `1002:1900` DVM module, firmware, and KMS admission | KMS and relay readiness require the signed upstream amdgpu module, its bound certificate, kernel PCI modalias selection, and all twelve GC 11.0.1, PSP 13.0.4, SDMA 6.0.1, and VCN 4.0.2 firmware payloads; incomplete or revoked supply remains offline |
 | driver-domain-fleet/DriverDomainFleet | hostd fleet policy and signed release gate | a fleet member is exactly encoded; CIDs, IOMMU groups, and representative PCI functions are globally disjoint; policy is immutable after sealing; only a signed release bound to that fleet can activate a member |
 | ivshmem-pairing/IvshmemPairing | launch-private ivshmem broker and KVM launcher | the RustOS QEMU connection is observed as peer 0 before GUI-DVM launch; peer 1 cannot exist without peer 0; disconnect fails the complete pair closed and no reconnect can reuse the assignment |
 | gui-dvm-surface/GuiDvmSurface | RustOS compositor to the sole supported GUI-DVM transport | `RSGUI002` has exactly three host-provisioned slots, exact even PRESENT/RELEASE generations, one outstanding DVM control record, module-latched pre-boot invitations, offline confirmation clearing, saturated-pool re-invitation, and stale-slot reclamation. It asserts bounded backpressure without fabricating capacity. Multi-domain focus is unavailable and rejected by the source rather than modeled as authority. |
-| dvm-atomic-scanout/DvmAtomicScanout | Linux DVM DRM/KMS relay | an immutable source slot remains owned until its nonblocking atomic page flip completes and the old front buffer is synchronized as a shadow of that exact generation; release cannot precede the completion fence, an in-flight generation is strictly newer than the displayed generation, and the fixed local scanout set has exactly three buffers |
+| dvm-atomic-scanout/DvmAtomicScanout | Linux DVM DRM/KMS relay | root-only exporter open and all three read-only imports precede KMS/relay readiness without requiring a host invitation; each immutable slot is a direct DMA-BUF framebuffer, the new front remains pinned, the old front is released only after the replacement page-flip fence, device-write DMA authority is absent, and offline revokes the pool |
 | gui-dvm-install/GuiDvmInstall | GUI-DVM ivshmem installer in the I/O manager | one serialized installer owns both BAR mappings, two permanent MSI-X vectors, and provider registration. Every malformed, absent, or failed installation releases mappings before terminal rejection; a concurrent caller cannot allocate a second installation; a revoked transport never reopens or falls back. |
 | ipc-reply-deadline/IpcReplyDeadline | kernel IPC runtime and compat deadline wait | exact caller/reply ownership; one-shot reply completion; owner exit and deadline clear the waiter; every blocked control cycle carries a finite break; stale or late replies cannot revive authority |
 | scheduler-wakeup/SchedulerWakeup | kernel scheduler, current-task block API, timer IRQ | arm/wake/commit uses a fresh epoch; a wake before commit cannot become a block; blocked tasks own one unexpired timer; timer expiry precedes subsequent dispatch; retired tasks retain no scheduler or timer authority |
@@ -211,6 +215,24 @@ authorization whose signature has been verified against a pinned keyring and
 whose exact artifact/policy digests match may create a durable VFIO record or
 bind the complete IOMMU group. Restoring a record is intentionally allowed
 after expiry so a failed release cannot strand host hardware.
+
+`dvm-commercial-lifecycle` begins after that authorization. It models the
+runtime manager's preflight-bind-reset-launch-authenticate-stop-reset-restore
+order, including
+trusted immutable launch inputs, the exact PID/start-time recovery identity,
+pidfd-bound signaling after a second identity check, numeric-PID reuse rejection,
+nonzero/signaled child-exit rejection, and fail-closed VFIO quarantine. The
+model deliberately fixes physical network and block assignment to disabled;
+those excluded topologies gain no authority from this display-DVM proof.
+
+`dvm-release-bundle` covers the artifact boundary immediately before that
+lifecycle. Its staging linearization point is the atomic rename of a complete,
+fsync'd, twice-verified temporary directory to a fresh trusted destination.
+Launch authority has a separate linearization point: hostd's independent
+verification of that published directory. The finite state space enumerates
+all subsets of the eight required files plus valid and corrupted copies, and
+checks that replacement or mutation never turns an incomplete bundle into
+launch authority.
 
 `driver-domain-fleet` models the cross-domain policy that surrounds that
 handoff. A representative PCI BDF stands for every BDF in a real complete

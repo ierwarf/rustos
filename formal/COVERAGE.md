@@ -48,10 +48,13 @@ passes TLC.
 | A composite DVM selftest device is selected only as a keyboard, silently loses relative-pointer events, or turns a long motion proof into repeated keyboard/console input | dvm-input-selftest | driver-domains/linux/package/rustos-dvm-agent/src/rustos-dvm-agent.c and tools/xtask/src/kvm.rs |
 | A recovering sessiond call holds devmgrd's only receiver, starving unrelated input/device work; or a sessiond ioctl burst grows without bound, silently drops, or reorders work | devmgrd-sessiond-isolation | services/devmgrd/src/main.rs |
 | A topology-only VFIO preflight, unsigned/foreign/expired release authorization, retired durable-lease schema, partial IOMMU-group binding, or mismatched DVM artifact/device policy becomes an active device assignment | vfio-release-authorization | tools/hostd/src/main.rs and libs/driver-domain-host/src/lib.rs |
+| An absent, unopenable, or ioctl-incompatible IOMMUFD or invalid runtime input is discovered only after VFIO binding; a plan omission detaches the L0 boot display or a connected DRM display; a mutable/symlinked launch artifact changes after authorization; a physical display DVM executes before its exact runtime identity is durable, launches without a complete-group reset or non-identity IOMMUFD, reports ready without authenticated control, treats a signaled/nonzero child exit as success, restores a dirty/live device, signals a PID-reused process without an exact pidfd, or enables excluded physical network/block assignment | dvm-commercial-lifecycle | tools/hostd/src/{main.rs,runtime.rs} and libs/driver-domain-host/src/lib.rs |
+| A schema-8 DVM release omits or substitutes a companion config, source lock, certificate, or control contract; uses an unknown/duplicate manifest or control-contract key; is published through an unsafe or pre-existing path; changes after verification; or gains launch authority without hostd independently rechecking and snapshotting the co-located eight-file bundle | dvm-release-bundle | driver-domains/linux/scripts/{write-manifest,verify-release-artifacts,stage-release}.sh, tools/xtask/src/kvm.rs, and tools/hostd/src/runtime.rs |
+| A physical display DVM omits the exact AMD `1002:1900` GC/PSP/SDMA/VCN firmware; or a Blackwell profile uses the proprietary kernel flavor, mismatches NVIDIA module and GSP releases, admits an unsigned module or unbound signing certificate, loads a host-selected module name instead of the assigned PCI modalias, admits UVM/CUDA authority, starts its relay after partial KMS initialization, or ships restricted firmware without redistribution authorization | dvm-amdgpu-supply and dvm-display-driver-supply | driver-domains/linux/{sources.lock,Config.in,configs/rustos_linux_dvm_x86_64_defconfig,board/linux.fragment,scripts/verify-module-signatures.sh}, package/rustos-dvm-nvidia-open, and board/overlay/etc/init.d/S48rustos-dvm-net |
 | Another driver domain reuses a vsock CID, IOMMU group, or PCI function; a fleet policy changes after release binding; or a signed release names a different fleet | driver-domain-fleet | tools/hostd/src/main.rs and libs/driver-domain-host/src/lib.rs |
 | GUI-DVM scheduling races RustOS for ivshmem peer 0, a GUI DVM connects without the pinned RustOS peer, or either peer disconnects and a replacement reuses the stale pair | ivshmem-pairing | libs/driver-domain-host/src/ivshmem.rs and tools/xtask/src/kvm.rs |
 | A GUI-DVM overwrites a host-owned writing/ready surface; concurrent host writers advance the snapshot generation; accepts an odd, forged, stale, or unacknowledged release; loses a pre-module invitation or post-ready confirmation; retains readiness after offline; leaks stale startup slots; fabricates capacity under a saturated pool; reuses stale or different-source pixels for a damage-only snapshot; regresses the displayed generation; or treats an unavailable multi-domain focus authority as valid | gui-dvm-surface and gui-dvm-pixel-authority | tools/xtask/src/kvm.rs, kernel/io-manager/src/io/{dvm_display.rs,gui/backend.rs}, kernel/compat/src/user/{sysops/device.rs,syscall/linux/device_broker_ops.rs}, services/uiserver/src/main.rs, and driver-domains/linux/package/rustos-dvm-display/src/{rustos_dvm_ivshmem_uio.c,rustos-dvm-display.c} |
-| A GUI-DVM returns a host source slot after CPU copy but before atomic scanout completion, flips an unsynchronized frame, selects an older READY generation after a newer scanout, or loses the predecessor needed for damage-only copy | dvm-atomic-scanout | driver-domains/linux/package/rustos-dvm-display/src/rustos-dvm-display.c |
+| A GUI-DVM grants device-write DMA authority, returns the current direct-scanout slot, releases the old front before its replacement page-flip fence, reuses a stale generation, or retains DMA authority after offline | dvm-atomic-scanout | driver-domains/linux/package/rustos-dvm-display/src/{rustos-dvm-display.c,rustos_dvm_ivshmem_uio.c} |
 | Concurrent GUI-DVM install calls allocate duplicate MSI-X vectors; malformed/absent BARs retain either mapping; an MSI/provider-registration failure retains mappings; or a revoked GUI transport reopens through a fallback path | gui-dvm-install | kernel/io-manager/src/io/dvm_display.rs |
 | A deadline-bounded IPC caller remains blocked after a reply, endpoint owner exit, or timeout; a late reply revives a cancelled call | ipc-reply-deadline | kernel/ipc-runtime/src/ipc/mod.rs and kernel/compat/src/user/syscall/linux/ipc_ops.rs |
 | A wake between arm and commit is lost, a timer-expired task remains blocked, or a retired task is selected/woken through stale scheduler state | scheduler-wakeup | kernel/ps/src/multitask/scheduler.rs, kernel/ps/src/multitask/current.rs, and kernel/ps/src/multitask/irq.rs |
@@ -79,14 +82,31 @@ close the release gates: arbitrary-length multi-block/multi-descriptor parser
 equivalence and runtime fault evidence still require independent artifacts.
 Commercial release remains blocked until the same properties have source
 conformance plus runtime fault evidence.
-The 30-second composite KVM gate now passes authenticated GUI-DVM readiness,
-synthetic evdev keyboard/pointer ingress, and the netprobe Ethernet round trip
-with nonzero producer/consumer activity in both fixed rings. That is a normal
-virtual-transport capture, not the remaining denial/fault/hardware evidence:
+The current 30-second composite KVM gate fails before GUI-DVM readiness. Linux
+6.12 `virtio_gpu` deliberately rejects a foreign SG-table DMA-BUF import, and
+QEMU's legacy VMware SVGA device lacks the pitchlock capability required by
+`vmwgfx`; neither can supply honest direct-scanout evidence. The run reaches an
+authenticated control session, drains the input ring without saturation,
+observes both keyboard and pointer ingress, and reaches DVM network readiness.
+The display relay fails precisely at `direct-dmabuf-import`, so `uiserver`
+fails closed and the UI-dependent netprobe round trip does not start. No
+CPU-copy or shadow-buffer fallback is accepted. Release additionally remains
+blocked on:
 ELF/PE multi-block corpus fuzz and native launch captures; page-table/TLB tests
-on target hardware; non-identity VT-d/IOMMU mappings with fault injection and revoke;
+on target hardware; target captures proving the supervised IOMMUFD VFIO
+non-identity map, read-only display DMA fault, reset, fault injection, and revoke;
 boot-media corruption/recovery; packet saturation/cancellation/backpressure and
 physical-NIC behavior; and
-multicore CPU-time distribution under interrupt and DVM load. The current
-kernel IOMMU backend is identity-only, so the DMA hardware gate is explicitly
-failed even though its abstraction passes TLC.
+multicore CPU-time distribution under interrupt and DVM load. The supervised
+physical display-DVM source now requires QEMU IOMMUFD and rejects an absent
+`/dev/iommu`; this source gate is not hardware evidence. The current host now
+has root-only `/dev/iommu`, translated AMD-Vi domains, interrupt remapping, and
+complete IOMMU groups. Its requested AMD `1002:1900` function is the L0
+`boot_vga` device with a connected eDP connector, so the live assignment gate
+correctly rejects it before any driver mutation. No physical capture was
+fabricated by detaching the active host display. NVIDIA GSP firmware also
+remains non-redistributable until a product redistribution authorization is
+recorded. The separate RustOS
+native boot-device DMA backend remains identity-only. Therefore the DMA
+hardware gate stays explicitly failed even though both finite abstractions pass
+TLC.

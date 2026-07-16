@@ -742,7 +742,7 @@ impl AppState {
                 .union(self.taskbar_slot_rect_for_session(previous_focused)));
         };
 
-        let mut dirty_rect = self
+        let dirty_rect = self
             .window_rect_for_session(previous_focused)
             .union(self.window_rect_for_session(session_handle))
             .union(self.taskbar_slot_rect_for_session(previous_focused))

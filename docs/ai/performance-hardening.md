@@ -44,12 +44,19 @@ contract file.
   cursor moves, zero drop/slow/error/backlog, no input gap or age over 50 ms,
   exact logical/presented cursor agreement, and at least 96 pixels of travel on
   both axes. It also requires three DVM samples at or above 60 FPS with
-  snapshot-copy plus atomic-commit time no greater than 12 ms. The DVM relay owns
-  three KMS scanout buffers, writes an inactive buffer directly from the immutable
-  source slot, attaches the bounded `FB_DAMAGE_CLIPS` blob to a nonblocking atomic
-  page flip, and keeps the source slot until its page-flip completion fence plus
-  shadow-buffer synchronization. A CPU copy or accepted atomic ioctl is never a
-  presentation claim; only the page-flip event completes scanout.
+  publish-to-page-flip time no greater than 12 ms. The DVM relay imports the
+  three immutable, page-aligned source slots as DMA-BUF KMS framebuffers. It
+  submits the chosen slot in a nonblocking atomic page flip without a relay CPU
+  copy, keeps the new front pinned, and releases only the old front after the
+  replacement page-flip event. An accepted DMA-BUF import or atomic ioctl is
+  never a presentation claim; only the page-flip event completes scanout.
+  The standard Linux 6.12 virtio-gpu cannot import these foreign SG tables, so
+  this proof is intentionally failed on the virtual KVM GPU. It must pass on an
+  assigned i915/xe/amdgpu device or the pinned NVIDIA-open `nvidia-drm` path;
+  no CPU-copy or shadow-buffer substitute is accepted as performance evidence.
+  For NVIDIA, the open modules and both requested GSP images must have the same
+  release identity, KMS must report the assigned PCI function as its DRM owner,
+  and only page-flip events on the physical connector count as presentation.
 - The RustOS-to-DVM snapshot copy follows the same exact-predecessor rule. A
   released slot may receive a damage-only patch only when its retained content
   generation equals the immediately preceding published generation and the

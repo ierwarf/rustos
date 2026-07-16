@@ -106,6 +106,9 @@ pub(crate) fn record_wayland_motion(elapsed: Duration) {
 /// profile window as FPS.  The KVM gate consumes this record rather than a
 /// best-effort boot diagnostic channel, so it cannot mistake missing
 /// observability for healthy input.
+// Keep each acceptance counter and cursor coordinate explicit so callers
+// cannot accidentally report a partially initialized aggregate snapshot.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn record_input_health(
     input_events: u64,
     input_last_age_millis: u64,
