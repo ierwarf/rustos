@@ -74,7 +74,7 @@ impl AppState {
                 self.cursor_y = next_y.min(self.display.height.saturating_sub(1));
                 self.record_cursor_motion(previous_x, previous_y);
                 let mut cursor_update =
-                    VisualUpdate::partial(previous_dirty.union(
+                    VisualUpdate::cursor(previous_dirty.union(
                         self.cursor_visual_dirty_rect(self.surface.width, self.surface.height),
                     ));
                 let drag_update = self.drag_window_to_cursor(wayland.as_deref_mut());
@@ -103,7 +103,7 @@ impl AppState {
                     (event.value1.max(0) as u32).min(self.display.height.saturating_sub(1));
                 self.record_cursor_motion(previous_x, previous_y);
                 let mut cursor_update =
-                    VisualUpdate::partial(previous_dirty.union(
+                    VisualUpdate::cursor(previous_dirty.union(
                         self.cursor_visual_dirty_rect(self.surface.width, self.surface.height),
                     ));
                 let drag_update = self.drag_window_to_cursor(wayland.as_deref_mut());

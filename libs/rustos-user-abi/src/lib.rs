@@ -24,6 +24,10 @@ mod tests {
         assert_eq!(size_of::<device::DisplaySurfaceCreate>(), 48);
         assert_eq!(size_of::<device::DisplayPresentRequest>(), 8);
         assert_eq!(size_of::<device::DisplayPresentRectRequest>(), 24);
+        assert_eq!(size_of::<device::DisplayGpuInfo>(), 64);
+        assert_eq!(size_of::<device::DisplayGpuDamage>(), 16);
+        assert_eq!(size_of::<device::DisplayGpuSubmitRequest>(), 40);
+        assert_eq!(size_of::<device::DisplayGpuCompletionQuery>(), 264);
     }
 
     #[test]

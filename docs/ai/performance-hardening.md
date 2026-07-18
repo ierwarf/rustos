@@ -94,9 +94,16 @@ contract file.
   for System, User, and Idle simultaneously. This preserves strict class
   ordering and vruntime tie behavior while avoiding two extra full-table plus
   IPC-donation classification passes when no System task is ready.
-- The one-in-nine ready User reservation and 10 ms ready-System latency rail
-  remain admission/overload invariants. A selection micro-optimization must not
-  bypass either rail or convert launch weights into strict-class authority.
+- At most two consecutive System dispatches may run while User work is ready;
+  the next dispatch is reserved for User work. Independently, every ready User
+  task has an 8 ms ready-age rail and every ready System task has a 10 ms rail.
+  A selection micro-optimization must not bypass these limits or convert launch
+  weights into strict-class authority.
+- An authenticated netd local-socket completion may enqueue only a User task in
+  the deduplicated 16-entry latency FIFO. At most eight such handoffs run
+  consecutively, stale tasks are discarded, and a full queue drops the new
+  hint rather than overwriting an older owner. The hint improves wake latency;
+  it does not move AF_UNIX ownership or protocol policy into ring0.
 - `rootd`'s immutable bootstrap manifest explicitly admits only the fixed
   syscall/VFS/loader/process/pager brokers to the System latency class.
   Package and desktop metadata cannot request that bit. The scheduler's 10 ms

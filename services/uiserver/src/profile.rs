@@ -54,6 +54,17 @@ fn duration_micros(duration: Duration) -> u64 {
     duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
+fn record_input_arrival(window: &mut ProfileWindow, input_events: u64, now: Instant) {
+    if input_events == 0 {
+        return;
+    }
+    if let Some(previous) = window.last_input_at.replace(now) {
+        window.input_gap_millis = window
+            .input_gap_millis
+            .max(duration_micros(now.duration_since(previous)) / 1_000);
+    }
+}
+
 pub(crate) fn enabled() -> bool {
     ui_profile_enabled()
 }
@@ -76,6 +87,11 @@ pub(crate) fn record_input_loop(
         .input_loop_micros
         .saturating_add(duration_micros(elapsed));
     window.input_events = window.input_events.saturating_add(input_events);
+    // Record arrival at the actual queue-consumption boundary. A later GPU
+    // backpressure retry may intentionally leave the main loop before its
+    // end-of-turn health snapshot; measuring there fabricated an input gap
+    // even though the cursor update and redraw debt were already retained.
+    record_input_arrival(&mut window, input_events, Instant::now());
     window.pointer_motion_events = window
         .pointer_motion_events
         .saturating_add(pointer_motion_events);
@@ -110,7 +126,6 @@ pub(crate) fn record_wayland_motion(elapsed: Duration) {
 // cannot accidentally report a partially initialized aggregate snapshot.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_input_health(
-    input_events: u64,
     input_last_age_millis: u64,
     input_drops: u64,
     input_slow: u64,
@@ -125,14 +140,6 @@ pub(crate) fn record_input_health(
         return;
     }
     let mut window = window().lock().unwrap();
-    if input_events > 0 {
-        let now = Instant::now();
-        if let Some(previous) = window.last_input_at.replace(now) {
-            window.input_gap_millis = window
-                .input_gap_millis
-                .max(duration_micros(now.duration_since(previous)) / 1_000);
-        }
-    }
     window.input_last_age_millis = window.input_last_age_millis.max(input_last_age_millis);
     window.input_drops = window.input_drops.max(input_drops);
     window.input_slow = window.input_slow.max(input_slow);
@@ -279,8 +286,12 @@ pub(crate) fn maybe_emit() {
             window.present_pixels / 1_000_000,
             window.throttle_spins,
         );
+        let last_input_at = window.last_input_at;
         *window = ProfileWindow {
             started_at: Some(now),
+            // Preserve the boundary timestamp so a stall spanning two
+            // one-second samples cannot disappear from both windows.
+            last_input_at,
             ..ProfileWindow::default()
         };
         line
@@ -289,4 +300,26 @@ pub(crate) fn maybe_emit() {
     // the accounting lock: observability can never hold up render statistics
     // or a future profiling consumer.
     profile_line(&line);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{record_input_arrival, ProfileWindow};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn input_gap_is_measured_at_queue_consumption() {
+        let mut window = ProfileWindow::default();
+        let start = Instant::now();
+
+        record_input_arrival(&mut window, 1, start);
+        record_input_arrival(&mut window, 3, start + Duration::from_millis(27));
+        record_input_arrival(&mut window, 0, start + Duration::from_millis(200));
+
+        assert_eq!(window.input_gap_millis, 27);
+        assert_eq!(
+            window.last_input_at,
+            Some(start + Duration::from_millis(27))
+        );
+    }
 }

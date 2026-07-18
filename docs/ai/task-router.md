@@ -8,9 +8,14 @@ Pick the smallest context set. Do not load all docs.
 `Read first` files, then use symbol-aware or scoped text search before
 opening anything under `Then read only if needed`.
 
+**After edits:** run `cargo xtask dev-plan`. Execute its `now` commands during
+the edit loop and its `stable-batch` commands once after the related change
+set settles. The printed plan is not validation evidence.
+
 | User task | Read first | Then read only if needed |
 | --- | --- | --- |
 | Build/check issue | `commands.md` | exact failing command output, then `tools/xtask/src/build/` range found by search |
+| Development-speed/tooling change | `commands.md`, `token-policy.md` | exact `tools/xtask/src/dev.rs`, build wrapper, or validation runner range found by search |
 | Run/KVM/debug issue | `commands.md`, `repo-map.md` | exact `tools/xtask/src/kvm.rs` range found by search; inspect `build/kvm/` only through focused reads |
 | Package/stage/registry issue | `contracts-infra.md` | affected `RUSTOS.package.toml`, then exact `package_manifest.rs` or `stage/mod.rs` range |
 | Kernel API/change | `kernel-api-map.md` | relevant `kernel/*/src/api.rs`, then backing module range found by symbol search |

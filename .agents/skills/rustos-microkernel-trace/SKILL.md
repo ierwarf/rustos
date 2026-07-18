@@ -31,6 +31,13 @@ When the user reports a syscall stall, slowdown, or unexpected IPC churn:
    stall.
 5. **Check the service side** — `services/<svc>d/` — is it draining the
    request ring promptly, or blocked on its own dependency?
+6. **Count one logical operation** — look for query/wait/query sequences,
+   fixed-capacity payload copies, a single receiver serializing callers, or a
+   one-slot handoff that overwrites an earlier owner.
+7. **Name the ABI boundary** — if every data byte still crosses synchronous
+   broker IPC, scheduler hints can reduce wake delay but cannot provide a
+   shared data fast path. Record the missing userspace ABI as a failed gate;
+   do not add an application-specific ring or move socket policy into ring0.
 
 ## Common Patterns
 
@@ -40,6 +47,9 @@ When the user reports a syscall stall, slowdown, or unexpected IPC churn:
 | Stall on first call after fork | Shared region pointer not cached per task | call site in `kernel/ps/` |
 | Service spins but never replies | Service ring drain stuck on a dep | `services/<svc>d/src/main.rs` |
 | Black frame after policy change | Surface re-prime in `apply_runtime_state` | `services/uiserver/` |
+| Local socket client is slow while compositor is fast | Per-send/recv synchronous service IPC or redundant readiness queries | `kernel/compat/.../service_ops`, `services/netd/`, ABI crate |
+| One caller delays unrelated clients | Single service receiver or unbounded blocking worker | service receiver and fixed worker admission |
+| Wake optimization loses an earlier target | One-slot or cross-class handoff overwrite | bounded scheduler FIFO plus exact endpoint authorization |
 
 ## Cross-Reference
 
@@ -54,3 +64,5 @@ When the user reports a syscall stall, slowdown, or unexpected IPC churn:
 - Do not add a new broker unless the new syscall family genuinely needs
   capability arbitration. Otherwise the service can be called directly
   through an existing port.
+- Do not call a scheduler handoff a data fast path. Validate payload copies,
+  request count, service ownership, and end-to-end throughput separately.

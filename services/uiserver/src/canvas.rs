@@ -15,7 +15,8 @@ use crate::simd;
 const COLOR_CURSOR_BLUE: u32 = 0x0036_94ff;
 const COLOR_CURSOR_WHITE: u32 = 0x00ec_faff;
 const CURSOR_ROTATION_FP: i32 = 1024;
-const CURSOR_VISUAL_RADIUS: usize = 72;
+pub(crate) const CURSOR_VISUAL_RADIUS: usize = 72;
+pub(crate) const CURSOR_TEXTURE_SIZE: usize = CURSOR_VISUAL_RADIUS * 2 + 1;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Rect {
@@ -653,6 +654,85 @@ fn cursor_motion_rotation(motion: CursorMotion) -> (i32, i32) {
         ((dx * i64::from(CURSOR_ROTATION_FP)) / length) as i32,
         ((dy * i64::from(CURSOR_ROTATION_FP)) / length) as i32,
     )
+}
+
+pub(crate) fn render_cursor_bgra(pixels: &mut [u32], motion: CursorMotion) -> bool {
+    if pixels.len() != CURSOR_TEXTURE_SIZE * CURSOR_TEXTURE_SIZE {
+        return false;
+    }
+    pixels.fill(0);
+    let sprite_index = motion.sprite_index.min(CURSOR_SPRITE_MAX_DISTANCE) as usize;
+    let sprite_area = CURSOR_SPRITE_SIZE
+        .saturating_mul(CURSOR_SPRITE_SIZE)
+        .saturating_mul(CURSOR_SPRITE_CHANNELS);
+    let sprite_offset = sprite_index.saturating_mul(sprite_area);
+    let Some(sprite_alpha) =
+        CURSOR_SPRITE_ALPHA.get(sprite_offset..sprite_offset.saturating_add(sprite_area))
+    else {
+        return false;
+    };
+    let (cos_fp, sin_fp) = cursor_motion_rotation(motion);
+    let radius = CURSOR_VISUAL_RADIUS as i32;
+    let hotspot = (CURSOR_SPRITE_SIZE / 2) as i32;
+    for local_y in -radius..=radius {
+        for local_x in -radius..=radius {
+            let source_x = div_round(
+                local_x
+                    .saturating_mul(cos_fp)
+                    .saturating_add(local_y.saturating_mul(sin_fp)),
+                CURSOR_ROTATION_FP,
+            )
+            .saturating_add(hotspot);
+            let source_y = div_round(
+                local_y
+                    .saturating_mul(cos_fp)
+                    .saturating_sub(local_x.saturating_mul(sin_fp)),
+                CURSOR_ROTATION_FP,
+            )
+            .saturating_add(hotspot);
+            if source_x < 0
+                || source_y < 0
+                || source_x as usize >= CURSOR_SPRITE_SIZE
+                || source_y as usize >= CURSOR_SPRITE_SIZE
+            {
+                continue;
+            }
+            let alpha_index = (source_y as usize)
+                .saturating_mul(CURSOR_SPRITE_SIZE)
+                .saturating_add(source_x as usize)
+                .saturating_mul(CURSOR_SPRITE_CHANNELS);
+            let blue_alpha = sprite_alpha.get(alpha_index).copied().unwrap_or_default();
+            let white_alpha = sprite_alpha
+                .get(alpha_index.saturating_add(1))
+                .copied()
+                .unwrap_or_default();
+            let index =
+                (local_y + radius) as usize * CURSOR_TEXTURE_SIZE + (local_x + radius) as usize;
+            premultiplied_source_over(&mut pixels[index], COLOR_CURSOR_BLUE, blue_alpha);
+            premultiplied_source_over(&mut pixels[index], COLOR_CURSOR_WHITE, white_alpha);
+        }
+    }
+    true
+}
+
+fn premultiplied_source_over(destination: &mut u32, color: u32, alpha: u8) {
+    if alpha == 0 {
+        return;
+    }
+    let alpha = u32::from(alpha);
+    let inverse = 255 - alpha;
+    let destination_alpha = *destination >> 24;
+    let source_r = ((color >> 16) & 0xff) * alpha / 255;
+    let source_g = ((color >> 8) & 0xff) * alpha / 255;
+    let source_b = (color & 0xff) * alpha / 255;
+    let out_r = source_r + (((*destination >> 16) & 0xff) * inverse + 127) / 255;
+    let out_g = source_g + (((*destination >> 8) & 0xff) * inverse + 127) / 255;
+    let out_b = source_b + ((*destination & 0xff) * inverse + 127) / 255;
+    let out_alpha = alpha + (destination_alpha * inverse + 127) / 255;
+    *destination = (out_alpha.min(255) << 24)
+        | (out_r.min(255) << 16)
+        | (out_g.min(255) << 8)
+        | out_b.min(255);
 }
 
 fn integer_sqrt(value: i64) -> u64 {

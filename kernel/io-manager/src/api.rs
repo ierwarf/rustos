@@ -310,6 +310,17 @@ pub mod device {
         crate::io::device::ioctl_from_user(handle.into(), process_state, request, arg)
     }
 
+    /// Exact RustOS display-device ABI entry used when VFS represents
+    /// `/dev/display0` as a remote device handle. Policy routing remains in
+    /// devmgrd/uiserver; this is only the common user-copy/handle substrate.
+    pub fn ioctl_display_from_user(
+        process_state: &mut crate::user::process_state::UserProcessState,
+        request: u64,
+        arg: u64,
+    ) -> Result<u64, DeviceError> {
+        crate::io::device::display::ioctl(process_state, request, arg)
+    }
+
     pub mod input {
         pub fn has_pending_events() -> bool {
             crate::input::event_queue::has_pending_input_events()

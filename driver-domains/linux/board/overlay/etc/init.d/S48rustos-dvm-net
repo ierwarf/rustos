@@ -46,6 +46,37 @@ stop_relay() {
     rm -f "$pid_file"
 }
 
+wait_gpu_compositor_ready() {
+    pid_file="$run_dir/gpu.pid"
+    attempts=0
+    while [ "$attempts" -lt 100 ]; do
+        [ -r "$run_dir/gpu-compositor-evidence-v1.env" ] && return 0
+        if [ ! -r "$pid_file" ] || ! kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+            return 1
+        fi
+        sleep 0.1
+        attempts=$((attempts + 1))
+    done
+    return 1
+}
+
+# EGL/context/program setup is part of the GPU pipeline prime, not of a
+# best-effort first frame.  A successful steady-state proof is not accepted
+# until this separate, atomic marker arrives within the 500 ms contract.
+wait_gpu_pipeline_prime() {
+    pid_file="$run_dir/gpu.pid"
+    attempts=0
+    while [ "$attempts" -lt 5 ]; do
+        [ -r "$run_dir/gpu-pipeline-prime-v1.env" ] && return 0
+        if [ ! -r "$pid_file" ] || ! kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+            return 1
+        fi
+        sleep 0.1
+        attempts=$((attempts + 1))
+    done
+    return 1
+}
+
 load_display_drivers() {
     device=
     vendor=
@@ -84,6 +115,21 @@ start_relays() {
         echo "rustos-dvm: assigned display driver failed to initialize" >&2
         return 1
     fi
+    # Remove a prior run's completion before forking: readiness must be fresh
+    # evidence from this exact GPU relay PID, never a stale /run artifact.
+    rm -f "$run_dir/gpu-pipeline-prime-v1.env" "$run_dir/gpu-pipeline-prime-v1.env.tmp" \
+        "$run_dir/gpu-compositor-evidence-v1.env" "$run_dir/gpu-compositor-evidence-v1.env.tmp"
+    start_relay gpu /usr/libexec/rustos-dvm-gpu-probe
+    if ! wait_gpu_pipeline_prime; then
+        echo "rustos-dvm: GPU pipeline prime exceeded its 500 ms admission budget" >&2
+        stop_relay gpu
+        return 1
+    fi
+    if ! wait_gpu_compositor_ready; then
+        echo "rustos-dvm: fixed-command GPU compositor proof unavailable" >&2
+        stop_relay gpu
+        return 1
+    fi
     if modprobe rustos_dvm_ivshmem_uio; then
         start_relay display /usr/libexec/rustos-dvm-display
     else
@@ -96,6 +142,7 @@ start_relays() {
 stop_relays() {
     # Stop display first so it releases DRM master before networking or reboot.
     stop_relay display
+    stop_relay gpu
     stop_relay net
 }
 

@@ -63,6 +63,12 @@ Reserve extended reasoning for debugging, failure analysis, structural review,
 security review, or explicit design decisions. For debugging, reason from
 symptoms, command output, logs, or probes before editing.
 
+After edits, use `cargo xtask dev-plan` instead of reconstructing the
+changed-file validation matrix from prose. Run the listed `now` checks during
+the edit loop. Defer `stable-batch` DVM rebuild and KVM preparation until the
+related change set settles, then run that batch once. `dev-plan` only selects
+commands; a printed command is never evidence that the command passed.
+
 ## 6. OS Debugging Stop Rule
 
 Do not drift into speculative patches. If execution is blocked by a structural

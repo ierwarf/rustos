@@ -1,12 +1,13 @@
 use crate::ipc::{self, KernelSharedRegionHandle};
 use crate::memory::paging::UserRegion;
-use crate::user::abi::device::PIXEL_FORMAT_BGRA8888;
+use crate::user::abi::device::{
+    DISPLAY_SURFACE_MAX_HEIGHT, DISPLAY_SURFACE_MAX_MAPPING_BYTES,
+    DISPLAY_SURFACE_MAX_STRIDE_BYTES, DISPLAY_SURFACE_MAX_WIDTH, PIXEL_FORMAT_BGRA8888,
+};
 
 const PAGE_SIZE: u64 = 4096;
-const MAX_DISPLAY_SURFACE_WIDTH: u32 = 7680;
-const MAX_DISPLAY_SURFACE_HEIGHT: u32 = 4320;
-const MAX_DISPLAY_SURFACE_BYTES: u64 =
-    MAX_DISPLAY_SURFACE_WIDTH as u64 * MAX_DISPLAY_SURFACE_HEIGHT as u64 * 4;
+const DISPLAY_SURFACE_USAGE_FRAMEBUFFER: u32 = 0;
+const DISPLAY_SURFACE_USAGE_GPU_ATLAS: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DisplaySurfaceHandle {
@@ -16,6 +17,8 @@ pub struct DisplaySurfaceHandle {
     bytes_per_pixel: u32,
     pixel_format: u32,
     generation: u64,
+    usage: u32,
+    binding_slot: u32,
     frame_len: u64,
     mapping_len: u64,
     shared_region: Option<KernelSharedRegionHandle>,
@@ -29,10 +32,59 @@ pub struct DisplaySurfaceHandle {
 
 impl DisplaySurfaceHandle {
     pub fn new(width: u32, height: u32, pixel_format: u32, generation: u64) -> Option<Self> {
+        let stride_bytes = width.checked_mul(4)?;
+        Self::new_with_stride(width, height, stride_bytes, pixel_format, generation)
+    }
+
+    pub fn new_with_stride(
+        width: u32,
+        height: u32,
+        stride_bytes: u32,
+        pixel_format: u32,
+        generation: u64,
+    ) -> Option<Self> {
+        Self::new_with_usage(
+            width,
+            height,
+            stride_bytes,
+            pixel_format,
+            generation,
+            DISPLAY_SURFACE_USAGE_FRAMEBUFFER,
+            u32::MAX,
+        )
+    }
+
+    pub fn new_gpu_atlas(
+        width: u32,
+        height: u32,
+        pixel_format: u32,
+        generation: u64,
+        binding_slot: u32,
+    ) -> Option<Self> {
+        Self::new_with_usage(
+            width,
+            height,
+            width.checked_mul(4)?,
+            pixel_format,
+            generation,
+            DISPLAY_SURFACE_USAGE_GPU_ATLAS,
+            binding_slot,
+        )
+    }
+
+    fn new_with_usage(
+        width: u32,
+        height: u32,
+        stride_bytes: u32,
+        pixel_format: u32,
+        generation: u64,
+        usage: u32,
+        binding_slot: u32,
+    ) -> Option<Self> {
         if width == 0
             || height == 0
-            || width > MAX_DISPLAY_SURFACE_WIDTH
-            || height > MAX_DISPLAY_SURFACE_HEIGHT
+            || width > DISPLAY_SURFACE_MAX_WIDTH
+            || height > DISPLAY_SURFACE_MAX_HEIGHT
             || pixel_format != PIXEL_FORMAT_BGRA8888
             || generation == 0
         {
@@ -40,9 +92,15 @@ impl DisplaySurfaceHandle {
         }
 
         let bytes_per_pixel = 4_u32;
-        let stride_bytes = width.checked_mul(bytes_per_pixel)?;
+        let packed_stride = width.checked_mul(bytes_per_pixel)?;
+        if stride_bytes < packed_stride
+            || stride_bytes > DISPLAY_SURFACE_MAX_STRIDE_BYTES
+            || !stride_bytes.is_multiple_of(bytes_per_pixel)
+        {
+            return None;
+        }
         let frame_len = (stride_bytes as u64).checked_mul(height as u64)?;
-        if frame_len == 0 || frame_len > MAX_DISPLAY_SURFACE_BYTES {
+        if frame_len == 0 || frame_len > DISPLAY_SURFACE_MAX_MAPPING_BYTES {
             return None;
         }
         let mapping_len = align_up(frame_len, PAGE_SIZE)?;
@@ -54,6 +112,8 @@ impl DisplaySurfaceHandle {
             bytes_per_pixel,
             pixel_format,
             generation,
+            usage,
+            binding_slot,
             frame_len,
             mapping_len,
             shared_region: None,
@@ -85,6 +145,14 @@ impl DisplaySurfaceHandle {
 
     pub fn generation(self) -> u64 {
         self.generation
+    }
+
+    pub fn is_gpu_atlas(self) -> bool {
+        self.usage == DISPLAY_SURFACE_USAGE_GPU_ATLAS
+    }
+
+    pub fn binding_slot(self) -> Option<u32> {
+        self.is_gpu_atlas().then_some(self.binding_slot)
     }
 
     pub fn frame_len(self) -> u64 {
@@ -145,4 +213,32 @@ fn align_up(value: u64, align: u64) -> Option<u64> {
     value
         .checked_add(align - 1)
         .map(|aligned| aligned & !(align - 1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DisplaySurfaceHandle, PIXEL_FORMAT_BGRA8888};
+
+    #[test]
+    fn provider_surface_preserves_padded_stride() {
+        let surface =
+            DisplaySurfaceHandle::new_with_stride(1600, 900, 7168, PIXEL_FORMAT_BGRA8888, 1)
+                .expect("valid padded provider surface");
+
+        assert_eq!(surface.stride_bytes(), 7168);
+        assert_eq!(surface.frame_len(), 7168 * 900);
+        assert_eq!(surface.mapping_len(), 6_451_200);
+    }
+
+    #[test]
+    fn provider_surface_rejects_invalid_stride_contracts() {
+        assert!(
+            DisplaySurfaceHandle::new_with_stride(1600, 900, 6396, PIXEL_FORMAT_BGRA8888, 1,)
+                .is_none()
+        );
+        assert!(
+            DisplaySurfaceHandle::new_with_stride(1600, 900, 6402, PIXEL_FORMAT_BGRA8888, 1,)
+                .is_none()
+        );
+    }
 }

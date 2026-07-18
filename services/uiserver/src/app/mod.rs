@@ -16,6 +16,7 @@ use std::vec::Vec;
 
 use crate::canvas;
 use crate::cursor_sprites::CURSOR_SPRITE_MAX_DISTANCE;
+use crate::gpu_runtime::GpuCompositorRuntime;
 use crate::profile;
 use crate::sys::{
     diag_line, ConsoleSessionHandle, DisplayInfo, DisplaySurfaceCreate, SurfaceMapping,
@@ -79,6 +80,7 @@ static WAYLAND_SYNC_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 pub(crate) struct VisualUpdate {
     pub(crate) needs_full_redraw: bool,
     partial_rects: Vec<canvas::Rect>,
+    scene_dirty: bool,
 }
 
 impl VisualUpdate {
@@ -86,10 +88,18 @@ impl VisualUpdate {
         Self {
             needs_full_redraw: true,
             partial_rects: Vec::new(),
+            scene_dirty: true,
         }
     }
 
     pub(crate) fn partial(rect: canvas::Rect) -> Self {
+        let mut update = Self::default();
+        update.scene_dirty = !rect.is_empty();
+        update.add_partial_rect(rect);
+        update
+    }
+
+    pub(crate) fn cursor(rect: canvas::Rect) -> Self {
         let mut update = Self::default();
         update.add_partial_rect(rect);
         update
@@ -100,6 +110,7 @@ impl VisualUpdate {
     }
 
     pub(crate) fn absorb(&mut self, other: Self) {
+        self.scene_dirty |= other.scene_dirty;
         if self.needs_full_redraw || other.needs_full_redraw {
             self.request_full();
             return;
@@ -121,8 +132,13 @@ impl VisualUpdate {
         &self.partial_rects
     }
 
+    pub(crate) fn scene_dirty(&self) -> bool {
+        self.scene_dirty
+    }
+
     pub(crate) fn request_full(&mut self) {
         self.needs_full_redraw = true;
+        self.scene_dirty = true;
         self.partial_rects.clear();
     }
 
@@ -408,6 +424,7 @@ pub(crate) struct AppState {
     pub(crate) display: DisplayInfo,
     pub(crate) surface: DisplaySurfaceCreate,
     display_fd: OwnedFd,
+    gpu_compositor: Option<GpuCompositorRuntime>,
     pub(crate) input_fds: Vec<OwnedFd>,
     console_commands: ConsoleCommandDispatcher,
     surface_fd: OwnedFd,

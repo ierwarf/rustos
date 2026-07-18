@@ -3,12 +3,18 @@
 config BR2_PACKAGE_RUSTOS_DVM_DISPLAY
 
 	bool "rustos-dvm-display"
+	depends on BR2_PACKAGE_HAS_LIBEGL
+	depends on BR2_PACKAGE_HAS_LIBGLES
+	depends on BR2_PACKAGE_HAS_LIBGBM
 	select BR2_PACKAGE_LIBDRM
 	help
 	  Unprivileged-in-protocol display consumer for the RustOS Linux driver
 	  domain. It maps only the fixed ivshmem framebuffer contract, receives
 	  host-published frames through a fixed-header, one-vector MSI-X UIO
 	  doorbell, and uses the DVM-owned DRM/KMS device for pinned DirtyFB
-	  scanout. The package ships the dedicated ivshmem adapter because generic
+	  scanout. It also ships the private fixed-command GPU executor proof used
+	  before the application graphics ABI is admitted. That proof accepts no
+	  raw shaders, GPU addresses, or command buffers and rejects software Mesa.
+	  The package ships the dedicated ivshmem adapter because generic
 	  UIO accepts only INTx and cannot service the doorbell. It never polls the
 	  shared framebuffer or accepts a guest-selected control address.

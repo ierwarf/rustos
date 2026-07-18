@@ -8,6 +8,7 @@ use super::{
     align_up, start_console_command_dispatcher, AppState, CursorMotion, DesktopSurfaceCache,
     LauncherProgram, MAX_DISPLAY_HEIGHT, MAX_DISPLAY_WIDTH, PAGE_SIZE,
 };
+use crate::gpu_runtime::GpuCompositorRuntime;
 use crate::sys::{
     boot_line, debug_line, diag_line, display_create_surface, display_get_info, display_present,
     display_present_rect, map_surface, open_console, open_display, open_input,
@@ -131,7 +132,7 @@ fn validate_surface_metadata(
         || surface.bytes_per_pixel != display.bytes_per_pixel
         || surface.pixel_format != display.pixel_format
         || surface_stride_bytes != display_stride_bytes
-        || surface_stride_bytes != required_stride_bytes
+        || surface_stride_bytes < required_stride_bytes
         || surface_mapping_len != expected_mapping_len
         || surface.generation != display.generation
     {
@@ -198,20 +199,22 @@ fn fetch_surface_state(display_fd: i32) -> Result<DisplaySurfaceState, i32> {
             );
         }
 
-        diag_line(
-            format!(
-                "uiserver: display_get_info attempt={} width={} height={} stride={} bpp={} fmt={} flags={:#x} gen={}",
-                attempt + 1,
-                display.width,
-                display.height,
-                display.stride_bytes,
-                display.bytes_per_pixel,
-                display.pixel_format,
-                display.flags,
-                display.generation,
-            )
-            .as_str(),
+        let display_contract = format!(
+            "uiserver: display_get_info attempt={} width={} height={} stride={} bpp={} fmt={} flags={:#x} gen={}",
+            attempt + 1,
+            display.width,
+            display.height,
+            display.stride_bytes,
+            display.bytes_per_pixel,
+            display.pixel_format,
+            display.flags,
+            display.generation,
         );
+        // Early fatal diagnostics cannot rely only on the asynchronous
+        // observability queue: the process may exit before that worker drains.
+        // This bounded contract snapshot is also the KVM acceptance evidence.
+        debug_line(&display_contract);
+        diag_line(display_contract);
 
         let surface =
             display_create_surface(display_fd, display.width, display.height).map_err(|errno| {
@@ -221,21 +224,22 @@ fn fetch_surface_state(display_fd: i32) -> Result<DisplaySurfaceState, i32> {
                 diag_line("uiserver: display_create_surface failed");
                 15
             })?;
-        diag_line(
-            format!(
-                "uiserver: display_create_surface attempt={} width={} height={} stride={} handle={} bpp={} fmt={} map_len={} gen={}",
-                attempt + 1,
-                surface.width,
-                surface.height,
-                surface.stride_bytes,
-                surface.handle,
-                surface.bytes_per_pixel,
-                surface.pixel_format,
-                surface.mapping_len,
-                surface.generation,
-            )
-            .as_str(),
+        let surface_contract = format!(
+            "uiserver: display_create_surface attempt={} width={} height={} stride={} handle={} bpp={} fmt={} flags={:#x} slot={} map_len={} gen={}",
+            attempt + 1,
+            surface.width,
+            surface.height,
+            surface.stride_bytes,
+            surface.handle,
+            surface.bytes_per_pixel,
+            surface.pixel_format,
+            surface.flags,
+            surface.reserved,
+            surface.mapping_len,
+            surface.generation,
         );
+        debug_line(&surface_contract);
+        diag_line(surface_contract);
         let surface_handle = i32::try_from(surface.handle).map_err(|_| {
             diag_line("uiserver: surface handle overflow");
             16
@@ -276,6 +280,58 @@ fn fetch_surface_state(display_fd: i32) -> Result<DisplaySurfaceState, i32> {
 
     diag_line("uiserver: display surface generation kept changing");
     Err(16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_surface_metadata;
+    use crate::sys::{DisplayInfo, DisplaySurfaceCreate, PIXEL_FORMAT_BGRA8888};
+
+    fn padded_display() -> DisplayInfo {
+        DisplayInfo {
+            width: 1600,
+            height: 900,
+            stride_bytes: 7168,
+            bytes_per_pixel: 4,
+            pixel_format: PIXEL_FORMAT_BGRA8888,
+            flags: rustos_user_abi::device::DISPLAY_INFO_FLAG_PRIMARY_PROVIDER,
+            generation: 1,
+        }
+    }
+
+    fn padded_surface() -> DisplaySurfaceCreate {
+        DisplaySurfaceCreate {
+            width: 1600,
+            height: 900,
+            pixel_format: PIXEL_FORMAT_BGRA8888,
+            flags: 0,
+            handle: 6,
+            bytes_per_pixel: 4,
+            stride_bytes: 7168,
+            reserved: 0,
+            mapping_len: 6_451_200,
+            generation: 1,
+        }
+    }
+
+    #[test]
+    fn surface_metadata_accepts_provider_padding() {
+        assert_eq!(
+            validate_surface_metadata(&padded_display(), &padded_surface(), 7168),
+            Ok(6_451_200)
+        );
+    }
+
+    #[test]
+    fn surface_metadata_rejects_pitch_drift() {
+        let mut surface = padded_surface();
+        surface.stride_bytes = 6400;
+        surface.mapping_len = 5_763_072;
+        assert_eq!(
+            validate_surface_metadata(&padded_display(), &surface, 7168),
+            Err(16)
+        );
+    }
 }
 
 impl AppState {
@@ -357,10 +413,14 @@ impl AppState {
         boot_line("uiserver: console command dispatcher spawn begin");
         let console_commands = start_console_command_dispatcher(console_fd);
         boot_line("uiserver: console command dispatcher spawn done");
+        boot_line("uiserver: gpu compositor init begin");
+        let gpu_compositor = Some(GpuCompositorRuntime::new(surface_state.display)?);
+        boot_line("uiserver: gpu compositor init done");
         Ok(Self {
             display: surface_state.display,
             surface: surface_state.surface,
             display_fd,
+            gpu_compositor,
             input_fds,
             console_commands,
             surface_fd: surface_state.surface_fd,
@@ -386,11 +446,13 @@ impl AppState {
     }
 
     pub(crate) fn refresh_display_surface(&mut self) -> Result<(), i32> {
+        self.gpu_compositor = None;
         let surface_state = fetch_surface_state(self.display_fd.as_raw_fd())?;
         self.display = surface_state.display;
         self.surface = surface_state.surface;
         self.surface_fd = surface_state.surface_fd;
         self.frame = surface_state.frame;
+        self.gpu_compositor = Some(GpuCompositorRuntime::new(self.display)?);
         self.cursor_x = self.cursor_x.min(self.display.width.saturating_sub(1));
         self.cursor_y = self.cursor_y.min(self.display.height.saturating_sub(1));
         self.dragging_window = None;
@@ -399,6 +461,20 @@ impl AppState {
             window.invalidate_surface();
         }
         Ok(())
+    }
+
+    pub(crate) fn present_gpu_update(&mut self, scene_dirty: bool) -> Result<bool, i32> {
+        let mut runtime = self.gpu_compositor.take().ok_or(22)?;
+        let result = runtime.present(self, scene_dirty);
+        self.gpu_compositor = Some(runtime);
+        result
+    }
+
+    pub(crate) fn poll_gpu_completions(&mut self) -> Result<bool, i32> {
+        let mut runtime = self.gpu_compositor.take().ok_or(22)?;
+        let result = runtime.poll(self.display_fd.as_raw_fd(), &mut self.display);
+        self.gpu_compositor = Some(runtime);
+        result
     }
 
     pub(crate) fn present(&self) -> Result<(), i32> {

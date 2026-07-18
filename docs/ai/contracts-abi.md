@@ -163,6 +163,102 @@ slot; no polling or alternate provider is selected. Unsupported multi-domain
 focus records are rejected fail-closed because no focus authority is present in
 this single-GUI-DVM topology. Commercial acceptance requires the source, DVM
 package, launch path, conformance tests, and recovery proof to remain aligned.
+
+GPU composition uses a separate private version-1 contract and does not expand
+the application ABI. `uiserver` is the sole retained-scene, visibility,
+z-order, damage, atlas-packing, and admission-policy owner. Each atlas-bearing
+frame binds exactly one immutable BGRA generation from a fixed three-slot pool
+and emits at most 512 commands. The atlas contains only independently
+rasterized visible layer regions (for example a Wayland SHM surface, terminal
+cache, glyph/icon tile, or cursor), never a CPU-precomposed final framebuffer.
+Solid UI regions remain solid-quad commands instead of being baked into the
+atlas. Textured commands name bounded normalized subrectangles of the one bound
+atlas, so the DVM cannot select another slot or reinterpret an offset as an
+address. The atlas is at most 8192×8192 and 256 MiB; three submissions may be in
+flight. A frame has a 16.667 ms commercial performance target and a separate
+50 ms hard execution timeout. Crossing the target keeps the previous front
+buffer visible and fails the performance sample; only the hard timeout or an
+explicit device/context error invalidates the epoch.
+
+The only commands are clear, solid quad, and textured quad with bounded
+fixed-point depth/rotation/tilt/perspective parameters. A batch cannot contain a
+shader, GPU virtual address, DMA-BUF fd, arbitrary command-buffer byte, or
+peer-selected queue. The atlas token binds one exact physical slot, generation,
+geometry, stride, and content epoch. A batch that binds a second source, uses a
+slot outside `0..2`, names an empty/out-of-atlas subrectangle, or rebinds a token
+is a protocol error. RustOS owns the context id, epoch, monotonic
+acquire/submit/completion/release values, queue admission, and reset.
+The acquire value names an independently signalled RustOS source fence, never a
+numerically plausible submit value. Timeout, context loss, or revoke invalidates
+every unfinished command and all source/output authority in the epoch; an old
+completion cannot revive the reset context. The DVM may write only DVM-private
+render targets and receives only device-read authority to RustOS sources. A
+completed GPU fence releases sources; an explicit later present fence alone
+retires the previous DVM-private front output. Built-in shader translation,
+EGL context construction, and host pipeline creation are one context-prime
+phase: admission stays closed until its explicit GPU fence completes, its
+end-to-end wall time is bounded to 500,000 us, and timeout invalidates the
+context. The per-frame 16.667 ms target and 50 ms hard timeout are measured
+only after that bounded setup phase; prime time cannot be reported as a
+completed frame. A target miss cannot be relabeled as success, but it also
+cannot manufacture device loss while the bounded fence wait is still live.
+
+The transport has two explicit, non-interchangeable evidence modes. QEMU uses
+`source-path=staged-copy zero-copy=0`: only damaged atlas rectangles are copied
+once into a virtio-GPU texture, after which the fixed GLES commands perform the
+actual composition into a DVM-private output. This is a valid GPU-composition
+test but can never satisfy the physical zero-copy gate. Physical AMD uses
+`source-path=dmabuf zero-copy=1`: the same atlas slot is imported read-only and
+sampled without a CPU or shadow-buffer copy. Direct scanout is a separate
+optimization admitted only for one opaque, untransformed, full-screen source;
+ordinary multi-layer frames still use GPU composition. GPU completion releases
+the atlas read lease. A later KMS page-flip/present fence releases the previous
+front output. Neither completion may be synthesized from command acceptance.
+These ownership rules follow the consumer-owned dequeue/queue/acquire/release
+shape documented by [Android BufferQueue](https://source.android.com/docs/core/graphics/arch-bq-gralloc),
+the shared-buffer constraint/lifetime split used by [Fuchsia Flatland](https://fuchsia.dev/fuchsia-src/concepts/ui/scenic/life_of_a_flatland_image),
+and Linux DRM's distinct
+[input and output fences](https://www.kernel.org/doc/html/latest/gpu/drm-kms.html#explicit-fencing-properties).
+The retained scene is published as one atomic batch, matching the transactional
+commit property of
+[DirectComposition](https://learn.microsoft.com/en-us/windows/win32/directcomp/architecture-and-components).
+Virtio resource blobs are optional, so their presence is never assumed to turn
+the QEMU staged path into zero copy; see the
+[Virtio 1.3 GPU contract](https://docs.oasis-open.org/virtio/virtio/v1.3/virtio-v1.3.html#x1-3320007).
+
+The current pre-public-ABI slice includes a source-level `uiserver` scene
+compiler and a separate Linux-DVM GLES executor proof. The DVM compiles only
+built-in shaders, rejects
+software renderers, waits explicit acquire and completion fences, validates
+output pixels plus stable/dynamic frame-hash pairs, and keeps a bounded health
+submission active. QEMU uses virgl on an explicitly validated AMD host render
+node in both headless and GTK modes, then requires 120 proof frames at at least
+60 FPS with both GPU completion and wall-clock per-frame intervals no greater
+than 16.667 ms and three fresh health samples. Its scope declaration must say
+`scope-public-abi=0`, `scope-ui-connected=0`, and `scope-scanout=0`; these are
+explicit limits of this isolated proof, not runtime evidence of an endpoint's
+absence. Functional fixed-command/hash/fence proof and performance acceptance
+are separate: a bounded proof with `performance-target=0` may allow the display
+relay to retain the last valid front, but it cannot satisfy the GPU readiness
+or release gate. Therefore the proof cannot be mistaken for end-to-end RustOS
+UI acceleration. Until the atlas compiler, private submit transport, live
+AppState-to-layer adapter, and GPU-output-to-KMS handoff all pass together, the
+existing CPU framebuffer path remains the active implementation and the GPU UI
+gate remains failed. The app-visible 2D/3D ABI is deliberately the next
+boundary, not part of this private compositor slice. Physical AMD zero-copy
+capture also remains a failed gate rather than a CPU fallback.
+
+The enabled physical release profile is AMDGPU-only. Its signed schema-3 device
+policy binds `amdgpu` plus PCI `1002:1900` and nominal-60-Hz throughput,
+page-flip completion latency, atomic-commit latency, freshness, and consecutive
+sample bounds. The relay atomically publishes one sequence-numbered sample per
+second from completed DRM page-flip events; the authenticated DVM agent exposes
+it through `display-evidence-v1`. Hostd admits readiness only after five fresh
+consecutive samples and requires the sequence to keep advancing during health
+checks. A wrong host/DVM identity, CPU-copy path, stale or restarted sequence,
+low page-flip rate, or excessive latency revokes readiness and enters bounded
+stop/reset/restore. These source checks do not replace the required physical
+capture.
 Before L0 writes `WELCOME` or opens a control relay, the launch-bound Linux DVM
 agent must prove possession of the per-launch 256-bit secret with
 `dvm-agent-hmac-sha256-v1`: HMAC-SHA256 over a fresh L0 challenge and the exact
@@ -325,11 +421,23 @@ policy remains with the owning service.
   inputd cannot freeze the UI poll loop behind the generic service timeout; a
   retry sees either unchanged ingress or the already-transferred policy record.
   The endpoint server still blocks in `SYS_RUSTOS_IPC_RECV` while idle.
-- RustOS-native input readers may use readiness-then-read safely:
+- Finite RustOS-native input polls may use readiness-then-read safely:
   `INPUTD_IPC_OP_STATS` and `INPUTD_IPC_OP_READ` both refresh ingress before
-  observing policy state, so a poll wake cannot be followed by a stale empty
-  policy queue. Short nonblocking reads remain appropriate for latency-sensitive
-  paths and use the same explicit direct-read transfer.
+  observing policy state, and the finite poll loop rechecks service policy on
+  each timer tick. The latency-sensitive uiserver path uses its already
+  nonblocking native input fd directly from a dedicated reader thread on a
+  cumulative 4 ms cadence; missed slots never accumulate burst credit. This
+  bounds the current pre-ABI service-queue wake gap without moving input policy
+  or transport-consumer authority out of inputd. A service-owned readiness
+  object is still required before generic indefinite input poll/epoll can be a
+  passed commercial userspace-ABI gate: the MSI-X worker may otherwise move the
+  last ring0-visible record into inputd policy between a STATS probe and waiter
+  registration.
+- KVM latency evidence records input arrival at uiserver queue consumption,
+  before a GPU backpressure retry may leave the turn. The previous end-of-turn
+  sample counted consumed input and cursor motion but skipped their timestamp
+  on that retry, fabricating 100+ ms gaps. One-second profile rollover preserves
+  the prior arrival timestamp so a real cross-window stall still fails closed.
 - inputd must coalesce lossy DVM pointer motion to the latest delta while
   preserving keyboard and pointer-button edges. Linux key translation and
   modifier/text state remain inputd policy; RustOS receives only bounded,
@@ -441,23 +549,42 @@ schedulable target; already-runnable service endpoints still need a handoff when
 the caller queued work before the service re-entered receive. Synchronous IPC
 enqueue only sets the receiver handoff hint; the caller must arm and re-poll its
 reply wait before yielding so a fast service reply cannot race a not-yet-armed
-waiter. Generic IPC hints are caller-local
-and the newest eligible receiver replaces older generic hints, even across
-scheduling classes; stale high-class service hints must not block the service
-that the current caller is waiting on.
-Both paths request a deferred reschedule at syscall exit; handoff hints must not
-wait for a later timer tick or a service's next blocking receive.
+waiter. Generic IPC hints are caller-local and the newest eligible receiver
+replaces older generic hints, even across scheduling classes; stale high-class
+service hints must not block the service that the current caller is waiting on.
+A generic receiver hint is consumed when the server blocks or the scheduler
+next selects work; it must not switch away from a live syscall continuation.
+
+The separate local-socket completion path accepts a netd latency flag only
+from the currently registered netd endpoint, only for the exact versioned
+response length, and only for successful local data/event transfer or the one
+armed nonblocking-receive drain. It queues only ready User tasks in a bounded,
+deduplicated FIFO and requests a user-return reschedule edge. Unknown flags,
+foreign endpoints, System targets, stale tasks, and malformed replies cannot
+create scheduler authority. The 100 us PIT edge is an upper bound if the
+normal user-return scheduler check is missed; no handoff preempts an arbitrary
+kernel frame.
 
 ## Network Surface (`netd`)
 
 Routed Linux ops after bootstrap: `socket`, `socketpair`, socket `dup`/`dup2`/`dup3`, socket `close`, socket `read`/`write`/`writev`, `bind`, `listen`, `accept`/`accept4`, `connect`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `getsockname`, `getpeername`, `setsockopt`, `getsockopt`, `shutdown`.
 
-netd invokes gated `SYS_RUSTOS_NET_BROKER` with target pid. Net broker arg struct carries six 64-bit syscall arg slots. Kernel performs handle install and target user-memory validation/copy; AF_UNIX socket lifecycle, binding/listen queues, byte queues, and socket option policy belong to netd. `NetdIpcRequest`/`Response` carry `socket_token`, fd `status_flags`, and a bounded inline payload for this service-owned socket path.
+netd invokes gated `SYS_RUSTOS_NET_BROKER` with target pid. Net broker arg struct carries six 64-bit syscall arg slots. Kernel performs handle install and target user-memory validation/copy; AF_UNIX socket lifecycle, binding/listen queues, byte queues, and socket option policy belong to netd. Version-2 `NetdIpcRequest`/`Response` frames copy an exact 120/32-byte header plus only the actual bounded payload, rather than a fixed maximum-size buffer. They carry `socket_token`, fd `status_flags`, and a bounded inline payload for this service-owned socket path.
 
-Blocking INET connect/send/recv waits run as bounded netd workers that release
-the shared network-state lock between polls. The single policy receive loop
-must remain available for AF_UNIX and readiness traffic; no blocking INET
-request may hold that loop or its state lock across a timer sleep.
+Four fixed netd request receivers prevent an unrelated caller from serializing
+all local AF_UNIX work. Blocking INET connect/send/recv waits run in a separate
+fixed eight-worker pool that releases the shared network-state lock between
+polls; there is no thread-per-request fallback. A single indefinite socket
+`poll` issues one event-driven `WAIT` request and consumes that reply directly,
+without a `QUERY`-`WAIT`-`QUERY` sequence. Finite and multi-fd polling retains
+the bounded compatibility loop.
+
+This removes avoidable copies and waits, but standard AF_UNIX data still makes
+a synchronous compat-to-netd service round trip for every send/receive. The
+current WayClick KVM gate proves that this path does not yet sustain 55 FPS.
+A shared fast data plane would require a separately designed general userspace
+ABI; until that boundary is implemented and reviewed, the 55 FPS gate remains
+failed rather than being hidden behind a special WayClick or compositor path.
 
 ## Process Policy Surface (`procd`)
 
@@ -530,9 +657,12 @@ they do not admit a service or a module-loading path.
 - Task weights = microsecond vruntime budgets (default 100 µs). `uiserver` gets a longer render/present slice, and latency-critical brokers it calls in-frame, especially `inputd`, must stay in the same order of weight so UI loops do not block behind input IPC. Runtime catalog metadata is not a realtime capability: `runtimed` pins only the exact UI executable to System weight and clamps every other launch below System admission before calling `loaderd`.
 - The max-burst guard rotates to another ready peer within the current
   scheduling class even when the current task's weighted vruntime still wins.
-  Separately, after eight consecutive System dispatches, one ready User task
-  must run before System selection resumes; this is the explicit recovery and
-  application CPU reservation under DVM/UI load.
+  Separately, after two consecutive System dispatches, one ready User task must
+  run before System selection resumes. Each ready User task also has an 8 ms
+  age bound, so a single busy User task cannot consume every reserved turn.
+  Authenticated User-only event handoffs use a deduplicated 16-entry FIFO and
+  are capped at eight consecutive picks. These are the explicit recovery and
+  application CPU reservations under DVM/UI load.
 - Normal and voluntary-yield task selection each scan the fixed 128-slot table
   once and retain one minimum-vruntime candidate per class. Do not restore a
   separate full-table pass for each empty higher class: effective class

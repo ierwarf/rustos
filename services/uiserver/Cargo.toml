@@ -8,6 +8,7 @@ publish = false
 fontdue = "0.9.3"
 
 [dependencies]
+driver-domain-protocol = { path = "../../libs/driver-domain-protocol" }
 observability-client = { path = "../../libs/observability-client" }
 rustos-user-abi = { path = "../../libs/rustos-user-abi" }
 embedded-graphics = "0.8"

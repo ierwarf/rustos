@@ -13,6 +13,19 @@ model="$1"
 spec="$formal_dir/$model.tla"
 config="$formal_dir/$model.cfg"
 lock="$formal_dir/tla2tools.lock"
+workers="${TLC_WORKERS:-auto}"
+
+case "$workers" in
+    auto) ;;
+    '' | *[!0-9]*)
+        echo "TLC_WORKERS must be auto or a positive integer: $workers" >&2
+        exit 2
+        ;;
+    0)
+        echo "TLC_WORKERS must be auto or a positive integer: $workers" >&2
+        exit 2
+        ;;
+esac
 
 if [[ ! -f "$spec" || ! -f "$config" ]]; then
     echo "missing TLA+ model or configuration for $model" >&2
@@ -66,7 +79,7 @@ trap 'rm -rf "$state_dir"' EXIT
 (
     cd "$model_dir"
     java -XX:+UseParallelGC -jar "$jar" \
-        -workers 1 \
+        -workers "$workers" \
         -fp 0 \
         -seed 1 \
         -deadlock \

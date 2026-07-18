@@ -4,7 +4,7 @@ ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 OUT ?= $(ROOT)/out
 JOBS ?= $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
 
-.PHONY: all fetch configure build verify stage-release clean distclean print-artifacts rebuild-agent rebuild-display rebuild-net
+.PHONY: all fetch configure build verify stage-release clean distclean print-artifacts rebuild-agent rebuild-display rebuild-net dev-agent dev-display dev-net
 
 all: build
 
@@ -21,6 +21,17 @@ rebuild-display:
 
 rebuild-net:
 	@OUT="$(OUT)" JOBS="$(JOBS)" "$(ROOT)/scripts/build.sh" rebuild-net
+
+# Compile one relay against the cached DVM sysroot without producing a rootfs,
+# manifest, or release artifact.  rebuild-* is the one-time integration step.
+dev-agent:
+	@OUT="$(OUT)" JOBS="$(JOBS)" "$(ROOT)/scripts/build.sh" dev-agent
+
+dev-display:
+	@OUT="$(OUT)" JOBS="$(JOBS)" "$(ROOT)/scripts/build.sh" dev-display
+
+dev-net:
+	@OUT="$(OUT)" JOBS="$(JOBS)" "$(ROOT)/scripts/build.sh" dev-net
 
 stage-release:
 	@test -n "$(DEST)" || { echo 'usage: make stage-release DEST=/trusted/absolute/release/path' >&2; exit 1; }

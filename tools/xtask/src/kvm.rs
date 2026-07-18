@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,9 +14,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use driver_domain_protocol::{
-    DVM_GUI_SURFACE_POOL_HOST_RECORD_OFFSET, DVM_GUI_SURFACE_SLOT_COUNT,
-    DVM_INPUT_RING_APERTURE_BYTES, DVM_NET_APERTURE_BYTES, DvmGuiSurfaceMessage,
-    DvmGuiSurfacePoolHeader, DvmInputRingHeader, DvmNetHeader,
+    DVM_GPU_ATLAS_POOL_HEADER_OFFSET, DVM_GUI_SURFACE_POOL_HOST_RECORD_OFFSET,
+    DVM_GUI_SURFACE_SLOT_COUNT, DVM_INPUT_RING_APERTURE_BYTES, DVM_NET_APERTURE_BYTES,
+    DvmGpuAtlasPoolHeader, DvmGuiSurfaceMessage, DvmGuiSurfacePoolHeader, DvmInputRingHeader,
+    DvmNetHeader,
 };
 use fatfs::Seek as FatSeek;
 use fatfs::Write as FatWrite;
@@ -37,6 +38,7 @@ const DVM_KERNEL_CONFIG: &str = "rustos-linux-dvm-x86_64.kernel.config";
 const DVM_MODULE_SIGNING_CERT: &str = "rustos-linux-dvm-x86_64.module-signing.x509";
 const DVM_SOURCES_LOCK: &str = "rustos-linux-dvm-x86_64.sources.lock";
 const DVM_CONTROL_ARTIFACT: &str = "rustos-linux-dvm-x86_64.control.env";
+const DVM_DEV_OUTPUT_MARKER: &str = "out/buildroot-output/.rustos-dvm-dev-output-v1";
 const DVM_MANIFEST: &str = "rustos-linux-dvm-x86_64.manifest";
 const DVM_MANIFEST_SCHEMA: &str = "8";
 const DVM_CONTROL_CONTRACT: &str = "board/overlay/usr/share/rustos-dvm/control-plane-v1.env";
@@ -44,10 +46,18 @@ const DVM_CONTROL_PROTOCOL: &str = "agent-v1";
 const DVM_CONTROL_STATE: &str = "control";
 const DVM_CONTROL_TRANSPORT: &str = "kvm-vsock";
 const DVM_CONTROL_AUTHENTICATION: &str = "dvm-agent-hmac-sha256-v1";
-const DVM_CONTROL_CAPABILITIES: &str = "health,device-inventory,driver-inventory,input-stream";
+const DVM_CONTROL_CAPABILITIES: &str =
+    "health,device-inventory,driver-inventory,display-evidence-v1,input-stream";
 const RUSTOS_BOOT_MARKER: &str = "rootd: core services ready, spawning initd via loaderd";
+const RUSTOS_GPU_SCENE_COMPILER_MARKER: &str =
+    "uiserver: gpu-scene compiler ready contract=3 public-abi=0 dvm-submit=1";
+const RUSTOS_GPU_ACTIVE_MARKER: &str = "uiserver: gpu-compositor active contract=3";
 const DVM_KEYBOARD_INGRESS_MARKER: &str = "inputd: DVM keyboard ingress observed";
 const DVM_POINTER_INGRESS_MARKER: &str = "inputd: DVM pointer ingress observed";
+const DVM_GPU_COMPOSITOR_MARKER: &str = "rustos-dvm-gpu: ready contract=1";
+const DVM_GPU_LIVE_MARKER: &str = "rustos-dvm-display: gpu-compositor primed contract=3";
+const DVM_GPU_PIPELINE_PRIME_TIMEOUT_US: u64 = 500_000;
+const DVM_GPU_HEALTH_SAMPLES: u64 = 3;
 const DEFAULT_UI_FPS_ACTIVE_WINDOWS: usize = 3;
 const MAX_UI_FPS_ACTIVE_WINDOWS: usize = 20;
 // The end-to-end cursor contract is 60 accepted motion updates per second.
@@ -60,14 +70,18 @@ const MIN_UI_CURSOR_SPAN: u64 = 96;
 // Completing the direct DMA-BUF atomic commit must leave meaningful headroom
 // inside a 16.67 ms 60 Hz frame.  The relay never copies pixel payloads.
 const MAX_DVM_DISPLAY_RELAY_US: u64 = 12_000;
+const MAX_DVM_GPU_RENDER_US: u64 = 16_667;
 const DVM_DISPLAY_WIDTH: u32 = 1600;
 const DVM_DISPLAY_HEIGHT: u32 = 900;
-const DVM_DISPLAY_REGION_BYTES: u64 = 32 * 1024 * 1024;
+const DVM_DISPLAY_REGION_BYTES: u64 = 128 * 1024 * 1024;
+const DVM_GPU_ATLAS_WIDTH: u32 = 2048;
+const DVM_GPU_ATLAS_HEIGHT: u32 = 2048;
 // Keep the KVM proof topology identical to the supervised physical-display
-// DVM.  The GPU-capable image contains roughly 200 MiB of uncompressed rootfs
-// (including firmware), and a 512 MiB guest can exhaust early-boot ramfs while
-// the compressed initrd and XZ workspace are still resident.
-const DVM_GUEST_MEMORY: &str = "1024M,maxmem=2G,slots=2";
+// DVM. Mesa virgl plus the AMD radeonsi/LLVM runtime, firmware, the compressed
+// initrd, XZ workspace, and unpacked ramfs coexist during early boot. Keep a
+// measured two-GiB floor so GPU enablement cannot turn memory pressure into a
+// nondeterministic 30-second readiness failure.
+const DVM_GUEST_MEMORY: &str = "2048M,maxmem=3G,slots=2";
 // QEMU maps the shared pixel backend as cacheable device memory at this
 // reserved, 2 MiB-aligned guest-physical address in both guests. The ivshmem
 // BAR carries only bounded control records and MSI-X doorbells.
@@ -76,7 +90,6 @@ const DVM_DISPLAY_FIRST_PEER_TIMEOUT: Duration = Duration::from_secs(5);
 const INTERACTIVE_DISPLAY_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const INTERACTIVE_IDLE_TICKS: usize = 3;
 const DVM_INPUT_FIRST_PEER_TIMEOUT: Duration = Duration::from_secs(5);
-const DVM_INPUT_RELAY_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Authentication remains a five-second setup gate, but a real RustOS input
 /// consumer appears only after the policy services and uiserver are running.
 /// Keep that distinct boot dependency bounded without falsely admitting the
@@ -107,6 +120,8 @@ const UISERVER_PROFILE_DISABLED: &str = "RUSTOS_UI_PROFILE=0";
 const UISERVER_PROFILE_ENABLED: &str = "RUSTOS_UI_PROFILE=1";
 const UISERVER_BOOT_TRACE_DISABLED: &str = "RUSTOS_UI_BOOT_TRACE=0";
 const UISERVER_BOOT_TRACE_ENABLED: &str = "RUSTOS_UI_BOOT_TRACE=1";
+const WAYCLICK_PROFILE_DISABLED: &str = "RUSTOS_WAYCLICK_PROFILE=0";
+const WAYCLICK_PROFILE_ENABLED: &str = "RUSTOS_WAYCLICK_PROFILE=1";
 const NETPROBE_REGISTRY_PATHS: &[&str] = &[
     "system/registry/system/desktop-programs.tsv",
     "system/registry/system/runtime-launch-programs.tsv",
@@ -116,6 +131,7 @@ const NETPROBE_QEMU_ENABLED: &str = "RUSTOS_NETPROBE_QEMU=1";
 const NETPROBE_QEMU_REACHABLE_MARKER: &str = "netprobe: qemu gateway reachable";
 const DVM_GUEST_CID: u32 = 4;
 const VHOST_VSOCK_DEVICE: &str = "/dev/vhost-vsock";
+const HOST_GPU_RENDER_NODE: &str = "/dev/dri/renderD128";
 const MAX_SMOKE_TIMEOUT: u64 = 30;
 
 #[derive(Debug)]
@@ -169,6 +185,7 @@ struct SmokeOptions {
     ui_proof_windows: usize,
     timeout: Duration,
     expected_markers: Vec<String>,
+    expected_dvm_markers: Vec<String>,
 }
 
 pub(crate) fn build_dvm_command(config: &Config) -> Result<()> {
@@ -227,7 +244,7 @@ where
     let input_relay_gate = Arc::new(AtomicBool::new(false));
     let control_relay = start_dvm_input_relay(
         config,
-        DVM_INPUT_RELAY_SETUP_TIMEOUT,
+        options.timeout,
         layout.dvm_input_doorbell.clone(),
         layout.dvm_input_ring.clone(),
         layout.dvm_control_secret.clone(),
@@ -235,6 +252,10 @@ where
     )?;
     let display_doorbell = start_dvm_display_doorbell(&layout)?;
     let guest_display = smoke_guest_display(&options)?;
+    require_amd_host_render_node()?;
+    if guest_display == GuestDisplay::DvmGtk {
+        require_sole_host_render_node()?;
+    }
     let (mut rustos, mut dvm) = spawn_guests(
         &qemu,
         config,
@@ -335,11 +356,17 @@ pub(crate) fn kvm_run_command(config: &Config) -> Result<()> {
         min_ui_fps: None,
         ui_proof_windows: DEFAULT_UI_FPS_ACTIVE_WINDOWS,
         timeout: Duration::ZERO,
-        expected_markers: Vec::new(),
+        expected_markers: vec![RUSTOS_GPU_ACTIVE_MARKER.to_owned()],
+        expected_dvm_markers: vec![
+            DVM_GPU_COMPOSITOR_MARKER.to_owned(),
+            DVM_GPU_LIVE_MARKER.to_owned(),
+        ],
     };
     let layout = prepare_layout(config, &options)?;
     log_kvm_start_phase("prepared-kvm-layout", started_at);
     require_vhost_vsock()?;
+    require_amd_host_render_node()?;
+    require_sole_host_render_node()?;
     log_kvm_start_phase("verified-vhost-vsock", started_at);
     let input_doorbell = start_dvm_input_doorbell(&layout)?;
     log_kvm_start_phase("started-input-doorbell", started_at);
@@ -428,14 +455,18 @@ framed virtual input transport. It does not synthesize QMP input.
 options:
   --timeout <seconds>  wait for readiness markers (1..={MAX_SMOKE_TIMEOUT}, default 30)
   --expect <marker>    require an additional RustOS debugcon marker (repeatable)
+  --expect-dvm <marker>
+                       require an additional Linux-DVM serial marker (repeatable)
   --exercise-input     run the DVM's bounded evdev loopback self-test and require
                        RustOS inputd keyboard and pointer ingress markers
   --exercise-network   run netprobe through netd and the DVM Ethernet ring;
                        requires --gui-dvm-surfaces and --dvm-network-shmem
-  --min-ui-fps <fps>   enable the private KVM-only UI profiler and require three
-                       high-volume input windows and three accepted DVM atomic-page-flip
-                       relay samples at or above this integer FPS; this uses
-                       QEMU GTK and therefore requires a host GUI session
+  --min-ui-fps <fps>   enable the private KVM-only UI profiler and bounded DVM
+                       uinput/evdev load, then require three high-volume input
+                       windows, WayClick commit/frame-callback windows, and three
+                       accepted DVM atomic-page-flip relay samples at or above
+                       this integer FPS; this uses QEMU GTK and therefore
+                       requires a host GUI session
   --ui-proof-windows <count>
                        require 3..={MAX_UI_FPS_ACTIVE_WINDOWS} consecutive one-second UI/input
                        and DVM relay samples (default {DEFAULT_UI_FPS_ACTIVE_WINDOWS}); requires
@@ -466,29 +497,28 @@ enum GuestDisplay {
 
 fn qemu_display_backend(display: GuestDisplay) -> &'static str {
     match display {
-        GuestDisplay::Headless => "none",
+        // Keep the noninteractive proof on the physical host render node.
+        // Allowing QEMU to pick a software EGL device would fabricate GPU
+        // execution evidence even though the guest-visible driver is virgl.
+        GuestDisplay::Headless => "egl-headless,rendernode=/dev/dri/renderD128",
         // GTK captures keyboard focus on hover. Pointer input is supplied by
         // the absolute tablet below, so F5 never needs a manual mouse grab.
         // Force-hide the host cursor. Leaving this option unset delegates the
         // result to the frontend default and previously left the host pointer
         // visible over the guest UI on some GTK versions.
         //
-        // The DVM relay uses atomic KMS page flips and never submits virgl
-        // commands. Keep the interactive path on QEMU's 2D frontend: host GL
-        // adds no capability to this display contract.
         GuestDisplay::DvmGtk => {
-            "gtk,gl=off,show-tabs=off,zoom-to-fit=off,grab-on-hover=on,show-cursor=off"
+            "gtk,gl=on,show-tabs=off,zoom-to-fit=off,grab-on-hover=on,show-cursor=off"
         }
     }
 }
 
 fn dvm_gpu_device(_display: GuestDisplay) -> String {
     format!(
-        // The standard virtual control/input topology stays on virtio-gpu.
-        // Linux 6.12 rejects foreign SG-table DMA-BUF imports for this driver,
-        // so a direct-scanout FPS gate remains failed until it runs with an
-        // assigned physical i915/xe/amdgpu device; no CPU-copy fallback exists.
-        "virtio-gpu-pci,id=dvm-virtio-gpu,xres={},yres={},edid=off",
+        // Virgl executes the same fixed GLES vocabulary intended for the AMD
+        // DVM. Foreign SG-table DMA-BUF import remains a separately failed
+        // direct-scanout gate; this enables no CPU composition fallback.
+        "virtio-gpu-gl-pci,id=dvm-virtio-gpu,xres={},yres={},edid=off,blob=on,hostmem=256M",
         DVM_DISPLAY_WIDTH, DVM_DISPLAY_HEIGHT
     )
 }
@@ -513,7 +543,11 @@ where
         min_ui_fps: None,
         ui_proof_windows: DEFAULT_UI_FPS_ACTIVE_WINDOWS,
         timeout: Duration::from_secs(MAX_SMOKE_TIMEOUT),
-        expected_markers: vec![RUSTOS_BOOT_MARKER.to_owned()],
+        expected_markers: vec![
+            RUSTOS_BOOT_MARKER.to_owned(),
+            RUSTOS_GPU_SCENE_COMPILER_MARKER.to_owned(),
+        ],
+        expected_dvm_markers: vec![DVM_GPU_COMPOSITOR_MARKER.to_owned()],
     };
 
     while let Some(arg) = args.next() {
@@ -564,10 +598,23 @@ where
                 }
                 options.expected_markers.push(marker);
             }
+            "--expect-dvm" => {
+                let marker = next_value(&mut args, "--expect-dvm")?;
+                if marker.is_empty() || marker.contains(['\n', '\r']) {
+                    bail!("--expect-dvm must be a non-empty single-line marker");
+                }
+                options.expected_dvm_markers.push(marker);
+            }
             unknown => bail!("unknown KVM smoke option: {unknown}"),
         }
     }
 
+    // A frame-rate proof without an input producer can only time out with idle
+    // zero-event windows. Reuse the normal DVM uinput -> evdev -> authenticated
+    // relay path; no QMP-only shortcut is introduced.
+    if options.min_ui_fps.is_some() {
+        options.exercise_input = true;
+    }
     if options.exercise_input {
         options
             .expected_markers
@@ -575,6 +622,14 @@ where
         options
             .expected_markers
             .push(DVM_POINTER_INGRESS_MARKER.to_owned());
+    }
+    if options.gui_dvm_surfaces {
+        options
+            .expected_markers
+            .push(RUSTOS_GPU_ACTIVE_MARKER.to_owned());
+        options
+            .expected_dvm_markers
+            .push(DVM_GPU_LIVE_MARKER.to_owned());
     }
     if options.exercise_network && !options.dvm_network_shmem {
         bail!("--exercise-network requires --dvm-network-shmem");
@@ -608,6 +663,14 @@ fn dvm_artifact_dir(config: &Config) -> PathBuf {
 }
 
 fn verify_dvm_artifacts(config: &Config) -> Result<DvmArtifacts> {
+    let dvm_root = dvm_dir(config);
+    let dev_output_marker = dvm_root.join(DVM_DEV_OUTPUT_MARKER);
+    if dev_output_marker.is_file() {
+        bail!(
+            "Linux DVM artifacts are stale after a development-only package build ({}); run the matching make rebuild-* target before verification or KVM",
+            dev_output_marker.display()
+        );
+    }
     let artifact_dir = dvm_artifact_dir(config);
     let manifest_path = artifact_dir.join(DVM_MANIFEST);
     let values = parse_manifest(&manifest_path)?;
@@ -1125,6 +1188,13 @@ fn create_gui_dvm_surfaces(path: &Path) -> Result<()> {
     if !header.is_valid() {
         bail!("refusing to create invalid GUI-DVM surface-pool header");
     }
+    let atlas_header = DvmGpuAtlasPoolHeader::new(
+        DVM_DISPLAY_REGION_BYTES,
+        header,
+        DVM_GPU_ATLAS_WIDTH,
+        DVM_GPU_ATLAS_HEIGHT,
+    )
+    .ok_or_else(|| anyhow::anyhow!("refusing to create invalid GPU atlas-pool header"))?;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -1136,6 +1206,10 @@ fn create_gui_dvm_surfaces(path: &Path) -> Result<()> {
         .with_context(|| format!("size DVM shared display {}", path.display()))?;
     file.write_all(&header.encode())
         .with_context(|| format!("initialize DVM shared display {}", path.display()))?;
+    file.seek(SeekFrom::Start(DVM_GPU_ATLAS_POOL_HEADER_OFFSET as u64))
+        .with_context(|| format!("seek DVM GPU atlas header {}", path.display()))?;
+    file.write_all(&atlas_header.encode())
+        .with_context(|| format!("initialize DVM GPU atlas header {}", path.display()))?;
     file.sync_all()
         .with_context(|| format!("flush DVM shared display {}", path.display()))?;
     fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
@@ -1320,6 +1394,13 @@ fn enable_private_ui_profile(runtime_disk: &Path) -> Result<()> {
         UISERVER_BOOT_TRACE_DISABLED,
         UISERVER_BOOT_TRACE_ENABLED,
         "UI boot trace",
+    )?;
+    replace_private_registry_anchor(
+        runtime_disk,
+        UISERVER_PROFILE_REGISTRY_PATHS,
+        WAYCLICK_PROFILE_DISABLED,
+        WAYCLICK_PROFILE_ENABLED,
+        "WayClick frame profile",
     )
 }
 
@@ -1379,6 +1460,47 @@ fn require_qemu(config: &Config) -> Result<PathBuf> {
             Path::new(&config.kvm_qemu_bin).display()
         )
     })
+}
+
+fn require_amd_host_render_node() -> Result<()> {
+    let metadata = std::fs::symlink_metadata(HOST_GPU_RENDER_NODE)
+        .with_context(|| format!("missing AMD render node {HOST_GPU_RENDER_NODE}"))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_char_device() {
+        bail!("{HOST_GPU_RENDER_NODE} must be a direct character-device render node");
+    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(HOST_GPU_RENDER_NODE)
+        .with_context(|| {
+            format!("KVM virgl requires read/write access to {HOST_GPU_RENDER_NODE}")
+        })?;
+    let vendor = std::fs::read_to_string("/sys/class/drm/renderD128/device/vendor")?;
+    let driver = std::fs::canonicalize("/sys/class/drm/renderD128/device/driver")?;
+    if vendor.trim() != "0x1002" || driver.file_name() != Some(OsStr::new("amdgpu")) {
+        bail!(
+            "refusing non-AMDGPU KVM render node: vendor={} driver={}",
+            vendor.trim(),
+            driver.display()
+        );
+    }
+    Ok(())
+}
+
+fn require_sole_host_render_node() -> Result<()> {
+    let mut render_nodes = std::fs::read_dir("/dev/dri")?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.starts_with("renderD"))
+        .collect::<Vec<_>>();
+    render_nodes.sort();
+    if render_nodes.as_slice() != ["renderD128"] {
+        bail!(
+            "QEMU GTK cannot pin rendernode; refusing ambiguous host render nodes: {}",
+            render_nodes.join(",")
+        );
+    }
+    Ok(())
 }
 
 fn require_vhost_vsock() -> Result<()> {
@@ -1622,9 +1744,9 @@ fn spawn_guests(
 
     let mut dvm_command = Command::new(qemu);
     let dvm_append = if options.exercise_input {
-        "console=ttyS0 rustos.dvm.input-selftest=1"
+        "console=ttyS0 preempt=full rustos.dvm.input-selftest=1"
     } else {
-        "console=ttyS0"
+        "console=ttyS0 preempt=full"
     };
     let dvm_display = qemu_display_backend(guest_display);
     dvm_command
@@ -1791,6 +1913,11 @@ fn wait_for_parallel_boot(
             .expected_markers
             .iter()
             .all(|marker| rustos_log.contains(marker));
+        let dvm_ready = options
+            .expected_dvm_markers
+            .iter()
+            .all(|marker| dvm_log.contains(marker));
+        let dvm_gpu_ready = dvm_gpu_compositor_ready(&dvm_log);
         match control_relay.try_recv() {
             Ok(Ok(probe)) => {
                 if control_ready.replace(probe).is_some() {
@@ -1809,14 +1936,31 @@ fn wait_for_parallel_boot(
             }
             Err(mpsc::TryRecvError::Disconnected) => {}
         }
-        let ui_fps_ready = options.min_ui_fps.is_none_or(|minimum| {
+        let ui_render_fps_ready = options.min_ui_fps.is_none_or(|minimum| {
             uiserver_profile_meets_fps(&rustos_log, minimum, options.ui_proof_windows)
-                && uiserver_profile_input_pipeline_healthy(&rustos_log, options.ui_proof_windows)
-                && !runtime_stall_or_crash_observed(&rustos_log)
-                && (!options.gui_dvm_surfaces
-                    || (dvm_display_relay_meets_fps(&dvm_log, minimum, options.ui_proof_windows)
-                        && !runtime_stall_or_crash_observed(&dvm_log)))
         });
+        let ui_input_ready = options.min_ui_fps.is_none_or(|minimum| {
+            uiserver_profile_input_pipeline_healthy(
+                &rustos_log,
+                options.ui_proof_windows,
+                Some(minimum),
+            )
+        });
+        let wayclick_fps_ready = options.min_ui_fps.is_none_or(|minimum| {
+            wayclick_profile_meets_fps(&rustos_log, minimum, options.ui_proof_windows)
+        });
+        let ui_runtime_ready = !runtime_stall_or_crash_observed(&rustos_log);
+        let dvm_relay_fps_ready = options.min_ui_fps.is_none_or(|minimum| {
+            !options.gui_dvm_surfaces
+                || dvm_display_relay_meets_fps(&dvm_log, minimum, options.ui_proof_windows)
+        });
+        let dvm_runtime_ready = !runtime_stall_or_crash_observed(&dvm_log);
+        let ui_fps_ready = ui_render_fps_ready
+            && ui_input_ready
+            && wayclick_fps_ready
+            && ui_runtime_ready
+            && dvm_relay_fps_ready
+            && dvm_runtime_ready;
         let dvm_display_ready = !options.gui_dvm_surfaces
             || (dvm_display_provider_ready(&rustos_log) && dvm_display_relay_ready(&dvm_log));
         let dvm_network = if options.dvm_network_shmem {
@@ -1833,6 +1977,8 @@ fn wait_for_parallel_boot(
             || (dvm_network.is_some_and(DvmNetworkCounters::round_trip_observed)
                 && rustos_log.contains(NETPROBE_QEMU_REACHABLE_MARKER));
         if rustos_ready
+            && dvm_ready
+            && dvm_gpu_ready
             && ui_fps_ready
             && dvm_display_ready
             && dvm_network_ready
@@ -1849,11 +1995,25 @@ fn wait_for_parallel_boot(
                 .filter(|marker| !rustos_log.contains(marker.as_str()))
                 .cloned()
                 .collect::<Vec<_>>();
+            let missing_dvm = options
+                .expected_dvm_markers
+                .iter()
+                .filter(|marker| !dvm_log.contains(marker.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
             bail!(
-                "KVM parallel boot did not reach readiness within {:?}; RustOS missing={:?}; ui-fps-ready={}; dvm-display-ready={}; dvm-network-ready={}; dvm-network-traffic-ready={}; host-input-relay-pending={}; input-ring={}/{} flags={:#x}; network-ring={:?}; inspect {}, {}, {}, and {}",
+                "KVM parallel boot did not reach readiness within {:?}; RustOS missing={:?}; Linux-DVM missing={:?}; dvm-gpu-ready={}; ui-fps-ready={} (render={} input={} wayclick={} rustos-runtime={} dvm-relay={} dvm-runtime={}); dvm-display-ready={}; dvm-network-ready={}; dvm-network-traffic-ready={}; host-input-relay-pending={}; input-ring={}/{} flags={:#x}; network-ring={:?}; inspect {}, {}, {}, and {}",
                 options.timeout,
                 missing_rustos,
+                missing_dvm,
+                dvm_gpu_ready,
                 ui_fps_ready,
+                ui_render_fps_ready,
+                ui_input_ready,
+                wayclick_fps_ready,
+                ui_runtime_ready,
+                dvm_relay_fps_ready,
+                dvm_runtime_ready,
                 dvm_display_ready,
                 dvm_network_ready,
                 dvm_network_traffic_ready,
@@ -1872,11 +2032,117 @@ fn wait_for_parallel_boot(
     }
 }
 
+fn dvm_gpu_compositor_ready(log: &str) -> bool {
+    let failure_after_ready = [
+        "rustos-dvm-gpu: context lost",
+        "rustos-dvm-gpu: executor unavailable",
+        "rustos-dvm-gpu: pipeline prime failed",
+        "rustos-dvm-gpu: proof failed",
+        "rustos-dvm-gpu: evidence publish failed",
+        "rustos-dvm-gpu: contract negative selftest failed",
+    ];
+    let mut ready = false;
+    let mut health_sequence = 0_u64;
+    for line in log.lines() {
+        if failure_after_ready
+            .iter()
+            .any(|marker| line.contains(marker))
+        {
+            ready = false;
+            health_sequence = 0;
+            continue;
+        }
+        if let Some((_, fields)) = line.split_once("rustos-dvm-gpu: health ") {
+            let sequence = log_u64(fields, "sequence");
+            let completion = log_u64(fields, "completion_us");
+            if sequence.is_some_and(|value| value == health_sequence + 1)
+                && completion.is_some_and(|value| value > 0 && value <= 16_667)
+                && fields
+                    .split_whitespace()
+                    .any(|field| field == "acquire-fence=1")
+            {
+                health_sequence += 1;
+            } else {
+                ready = false;
+                health_sequence = 0;
+            }
+            continue;
+        }
+        let Some((_, fields)) = line.split_once(DVM_GPU_COMPOSITOR_MARKER) else {
+            continue;
+        };
+        let frames = log_u64(fields, "frames");
+        let prime = log_u64(fields, "prime_us");
+        let fps = log_u64(fields, "fps_milli");
+        let average = log_u64(fields, "avg_us");
+        let maximum = log_u64(fields, "max_us");
+        let wall_maximum = log_u64(fields, "wall_max_us");
+        let frame_hash_a = fields
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("frame_hash_a="))
+            .filter(|value| value.len() == 16 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .and_then(|value| u64::from_str_radix(value, 16).ok());
+        let frame_hash_b = fields
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("frame_hash_b="))
+            .filter(|value| value.len() == 16 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .and_then(|value| u64::from_str_radix(value, 16).ok());
+        ready = fields.contains("driver=virtio_gpu")
+            && fields.contains("renderer=virgl")
+            && fields
+                .split_whitespace()
+                .any(|field| field == "hardware=amd")
+            && fields.split_whitespace().any(|field| field == "commands=3")
+            && fields
+                .split_whitespace()
+                .any(|field| field == "gpu-fence=1")
+            && fields
+                .split_whitespace()
+                .any(|field| field == "acquire-fence=1")
+            && fields.split_whitespace().any(|field| field == "negative=5")
+            && fields.split_whitespace().any(|field| field == "software=0")
+            && fields
+                .split_whitespace()
+                .any(|field| field == "performance-target=1")
+            && fields
+                .split_whitespace()
+                .any(|field| field == "scope-public-abi=0")
+            && fields
+                .split_whitespace()
+                .any(|field| field == "scope-ui-connected=0")
+            && fields
+                .split_whitespace()
+                .any(|field| field == "scope-scanout=0")
+            && frames.is_some_and(|value| value >= 120)
+            && prime.is_some_and(|value| value > 0 && value <= DVM_GPU_PIPELINE_PRIME_TIMEOUT_US)
+            && fps.is_some_and(|value| value >= 60_000)
+            && maximum.is_some_and(|value| value <= 16_667)
+            && wall_maximum.is_some_and(|value| value > 0 && value <= 16_667)
+            && average.zip(maximum).is_some_and(|(avg, max)| avg <= max)
+            && frame_hash_a
+                .zip(frame_hash_b)
+                .is_some_and(|(left, right)| left != 0 && right != 0 && left != right)
+            && fields
+                .split_whitespace()
+                .any(|field| field == "hash-stable=1")
+            && fields
+                .split_whitespace()
+                .any(|field| field == "hash-dynamic=1");
+        health_sequence = 0;
+    }
+    ready && health_sequence >= DVM_GPU_HEALTH_SAMPLES
+}
+
 fn dvm_display_failure(log: &str) -> Option<&str> {
-    const MARKER: &str = "rustos-dvm-display: KMS setup unavailable stage=";
-    log.lines()
-        .rev()
-        .find_map(|line| line.find(MARKER).map(|offset| &line[offset..]))
+    const MARKERS: [&str; 2] = [
+        "rustos-dvm-display: KMS setup unavailable stage=",
+        "rustos-dvm-display: GPU KMS setup unavailable stage=",
+    ];
+    log.lines().rev().find_map(|line| {
+        MARKERS
+            .iter()
+            .find_map(|marker| line.find(marker).map(|offset| &line[offset..]))
+    })
 }
 
 /// The kernel's bootstrap trace intentionally does not promise runtime
@@ -1884,13 +2150,19 @@ fn dvm_display_failure(log: &str) -> Option<&str> {
 /// observation: the runner's fixed ivshmem header must emerge unchanged as the
 /// active primary display provider.
 fn dvm_display_provider_ready(log: &str) -> bool {
+    let expected_stride = DvmGuiSurfacePoolHeader::new(
+        DVM_DISPLAY_REGION_BYTES,
+        DVM_DISPLAY_WIDTH,
+        DVM_DISPLAY_HEIGHT,
+    )
+    .stride_bytes;
     log.lines().any(|line| {
         let Some((_, fields)) = line.split_once("uiserver: display_get_info ") else {
             return false;
         };
         uiserver_display_field_is(fields, "width", DVM_DISPLAY_WIDTH)
             && uiserver_display_field_is(fields, "height", DVM_DISPLAY_HEIGHT)
-            && uiserver_display_field_is(fields, "stride", DVM_DISPLAY_WIDTH * 4)
+            && uiserver_display_field_is(fields, "stride", expected_stride)
             && uiserver_display_field_is(fields, "bpp", 4)
             && uiserver_display_field_is(fields, "fmt", 1)
             // A DVM scanout is still the active primary provider. Requiring
@@ -1898,11 +2170,17 @@ fn dvm_display_provider_ready(log: &str) -> bool {
             // generic primary framebuffer or a non-primary DVM aperture.
             && fields
                 .split_whitespace()
-                .any(|field| field == "flags=0x6")
+                .any(|field| field == "flags=0xe")
     })
 }
 
 fn dvm_display_relay_ready(log: &str) -> bool {
+    let expected_stride = DvmGuiSurfacePoolHeader::new(
+        DVM_DISPLAY_REGION_BYTES,
+        DVM_DISPLAY_WIDTH,
+        DVM_DISPLAY_HEIGHT,
+    )
+    .stride_bytes;
     let active = log.lines().any(|line| {
         let has_interrupt = line
             .split_whitespace()
@@ -1912,19 +2190,27 @@ fn dvm_display_relay_ready(log: &str) -> bool {
         line.contains("rustos-dvm-display: active")
             && line.contains(&format!("width={DVM_DISPLAY_WIDTH}"))
             && line.contains(&format!("height={DVM_DISPLAY_HEIGHT}"))
-            && line.contains(&format!("stride={}", DVM_DISPLAY_WIDTH * 4))
+            && line.contains(&format!("stride={expected_stride}"))
             && line.contains("event=ivshmem-msix-uio")
             && has_interrupt
             && line.contains("format=BGRA8888")
-            && line.contains("dmabuf-direct-scanout=")
-            && line.contains("atomic-pageflip-fence=1")
+            && line.contains("source-path=staged-copy")
+            && line.contains("zero-copy=0")
+            && line.contains("gpu-composition=1")
+            && line.contains("explicit-fence=1")
             && line.contains("scanout_buffers=3")
-            && line.contains("cpu-copy=0")
+            && line.contains("cpu-final-compose=0")
+            && line.contains("staged-damage-copy=1")
     });
     active
         && log.lines().any(|line| {
             line.contains(
                 "rustos-dvm-display: host confirmed peer readiness event=ivshmem-msix-uio",
+            )
+        })
+        && log.lines().any(|line| {
+            line.contains(
+                "rustos-dvm-display: scheduler admitted policy=rr priority=9 rttime_soft_us=50000 rttime_hard_us=100000",
             )
         })
 }
@@ -2089,11 +2375,41 @@ fn dvm_display_relay_meets_fps(log: &str, minimum_fps: u32, required_windows: us
         });
         let relay_cpu_copy_us = log_u64(fields, "relay_cpu_copy_us_avg");
         let atomic_commit_us = log_u64(fields, "atomic_commit_us_avg");
-        let Some((pageflip_completions, frame_hz_milli, relay_cpu_copy_us, atomic_commit_us)) =
-            pageflip_completions
-                .zip(frame_hz_milli)
-                .zip(relay_cpu_copy_us.zip(atomic_commit_us))
-                .map(|((submissions, hz), (copy, commit))| (submissions, hz, copy, commit))
+        let gpu_render_us_avg = log_u64(fields, "gpu_render_us_avg");
+        let gpu_render_us_max = log_u64(fields, "gpu_render_us_max");
+        let gpu_fence_completions = log_u64(fields, "gpu_fence_completions");
+        let present_fence_completions = log_u64(fields, "present_fence_completions");
+        let Some((
+            pageflip_completions,
+            frame_hz_milli,
+            relay_cpu_copy_us,
+            atomic_commit_us,
+            gpu_render_us_avg,
+            gpu_render_us_max,
+            gpu_fence_completions,
+            present_fence_completions,
+        )) = pageflip_completions
+            .zip(frame_hz_milli)
+            .zip(relay_cpu_copy_us.zip(atomic_commit_us))
+            .zip(gpu_render_us_avg.zip(gpu_render_us_max))
+            .zip(gpu_fence_completions.zip(present_fence_completions))
+            .map(
+                |(
+                    (((submissions, hz), (copy, commit)), (gpu_avg, gpu_max)),
+                    (gpu_fences, present_fences),
+                )| {
+                    (
+                        submissions,
+                        hz,
+                        copy,
+                        commit,
+                        gpu_avg,
+                        gpu_max,
+                        gpu_fences,
+                        present_fences,
+                    )
+                },
+            )
         else {
             continue;
         };
@@ -2101,6 +2417,12 @@ fn dvm_display_relay_meets_fps(log: &str, minimum_fps: u32, required_windows: us
             || frame_hz_milli < required_milli
             || relay_cpu_copy_us != 0
             || atomic_commit_us > MAX_DVM_DISPLAY_RELAY_US
+            || gpu_render_us_avg == 0
+            || gpu_render_us_avg > MAX_DVM_DISPLAY_RELAY_US
+            || gpu_render_us_max == 0
+            || gpu_render_us_max > MAX_DVM_GPU_RENDER_US
+            || gpu_fence_completions != pageflip_completions
+            || present_fence_completions != pageflip_completions
         {
             consecutive_samples = 0;
             continue;
@@ -2132,6 +2454,7 @@ fn log_point(fields: &str, name: &str) -> Option<(u64, u64)> {
 
 #[derive(Clone, Copy, Debug)]
 struct UiProfileInputWindow {
+    frame_hz_milli: u64,
     input_events: u64,
     backlog: u64,
     cursor_moves: u64,
@@ -2153,6 +2476,7 @@ fn parse_ui_profile_input_window(line: &str) -> Option<UiProfileInputWindow> {
     let (cursor_x, cursor_y) = log_point(fields, "cursor")?;
     let (presented_cursor_x, presented_cursor_y) = log_point(fields, "presented_cursor")?;
     Some(UiProfileInputWindow {
+        frame_hz_milli: log_u64(fields, "frame_hz_milli")?,
         input_events: log_u64(fields, "input_events")?,
         backlog: log_u64(fields, "backlog")?,
         cursor_moves: log_u64(fields, "cursor_moves")?,
@@ -2170,10 +2494,16 @@ fn parse_ui_profile_input_window(line: &str) -> Option<UiProfileInputWindow> {
     })
 }
 
-fn uiserver_profile_input_pipeline_healthy(log: &str, required_windows: usize) -> bool {
+fn uiserver_profile_input_pipeline_healthy(
+    log: &str,
+    required_windows: usize,
+    minimum_fps: Option<u32>,
+) -> bool {
+    let required_frame_hz_milli = minimum_fps.map(|fps| u64::from(fps).saturating_mul(1_000));
     let mut windows = Vec::new();
     for window in log.lines().filter_map(parse_ui_profile_input_window) {
-        if window.input_events < MIN_UI_FPS_INPUT_EVENTS
+        if required_frame_hz_milli.is_some_and(|minimum| window.frame_hz_milli < minimum)
+            || window.input_events < MIN_UI_FPS_INPUT_EVENTS
             || window.cursor_moves < MIN_UI_FPS_CURSOR_MOVES
             || window.backlog != 0
             || window.input_gap_ms > MAX_UI_INPUT_GAP_MS
@@ -2287,6 +2617,57 @@ fn uiserver_profile_meets_fps(log: &str, minimum_fps: u32, required_windows: usi
     false
 }
 
+fn wayclick_profile_meets_fps(log: &str, minimum_fps: u32, required_windows: usize) -> bool {
+    let required_milli = u64::from(minimum_fps).saturating_mul(1_000);
+    let mut consecutive = 0_usize;
+    for fields in log.lines().filter_map(|line| {
+        line.split_once("wayclick profile: ")
+            .map(|(_, fields)| fields)
+    }) {
+        let Some(commit_hz) = log_u64(fields, "commit_hz_milli") else {
+            consecutive = 0;
+            continue;
+        };
+        let Some(callback_hz) = log_u64(fields, "callback_hz_milli") else {
+            consecutive = 0;
+            continue;
+        };
+        let Some(commits) = log_u64(fields, "commits") else {
+            consecutive = 0;
+            continue;
+        };
+        let Some(callbacks) = log_u64(fields, "callbacks") else {
+            consecutive = 0;
+            continue;
+        };
+        let Some(releases) = log_u64(fields, "buffer_releases") else {
+            consecutive = 0;
+            continue;
+        };
+        let Some(max_gap_ms) = log_u64(fields, "max_callback_gap_ms") else {
+            consecutive = 0;
+            continue;
+        };
+        let balanced = commits.abs_diff(callbacks) <= 2 && callbacks.abs_diff(releases) <= 2;
+        if commit_hz < required_milli
+            || callback_hz < required_milli
+            || commits == 0
+            || callbacks == 0
+            || releases == 0
+            || max_gap_ms > MAX_UI_INPUT_GAP_MS
+            || !balanced
+        {
+            consecutive = 0;
+            continue;
+        }
+        consecutive = consecutive.saturating_add(1);
+        if consecutive >= required_windows {
+            return true;
+        }
+    }
+    false
+}
+
 fn validate_ui_fps_proof(layout: &KvmLayout, options: &SmokeOptions) -> Result<()> {
     let Some(minimum_fps) = options.min_ui_fps else {
         return Ok(());
@@ -2306,9 +2687,16 @@ fn validate_ui_fps_proof(layout: &KvmLayout, options: &SmokeOptions) -> Result<(
             layout.debugcon_log.display(),
         );
     }
-    if !uiserver_profile_input_pipeline_healthy(&log, options.ui_proof_windows) {
+    if !uiserver_profile_input_pipeline_healthy(&log, options.ui_proof_windows, Some(minimum_fps)) {
         bail!(
-            "KVM UI proof found input loss, backlog, excessive input gap, cursor/present mismatch, or insufficient cursor travel; inspect {}",
+            "KVM UI proof found no single consecutive window set satisfying both FPS and input loss/backlog/gap/cursor requirements; inspect {}",
+            layout.debugcon_log.display(),
+        );
+    }
+    if !wayclick_profile_meets_fps(&log, minimum_fps, options.ui_proof_windows) {
+        bail!(
+            "KVM WayClick FPS proof found no consecutive commit/frame-callback/release window set at or above {} FPS; inspect {}",
+            minimum_fps,
             layout.debugcon_log.display(),
         );
     }
@@ -2379,15 +2767,16 @@ fn stop_guest(guest: &mut Child) {
 mod tests {
     use super::{
         DEFAULT_UI_FPS_ACTIVE_WINDOWS, DVM_CONTROL_AUTHENTICATION, DVM_CONTROL_CAPABILITIES,
-        DVM_CONTROL_PROTOCOL, DVM_CONTROL_STATE, DVM_CONTROL_TRANSPORT,
+        DVM_CONTROL_PROTOCOL, DVM_CONTROL_STATE, DVM_CONTROL_TRANSPORT, DVM_GPU_COMPOSITOR_MARKER,
         DVM_KEYBOARD_INGRESS_MARKER, DVM_POINTER_INGRESS_MARKER, DvmNetworkCounters, GuestDisplay,
-        RUSTOS_BOOT_MARKER, dvm_display_failure, dvm_display_provider_ready,
-        dvm_display_relay_meets_fps, dvm_display_relay_ready, dvm_gpu_device, dvm_pointer_device,
-        is_sha256, parse_dvm_control_contract_text, parse_manifest_text, parse_smoke_options,
+        RUSTOS_BOOT_MARKER, RUSTOS_GPU_SCENE_COMPILER_MARKER, dvm_display_failure,
+        dvm_display_provider_ready, dvm_display_relay_meets_fps, dvm_display_relay_ready,
+        dvm_gpu_compositor_ready, dvm_gpu_device, dvm_pointer_device, is_sha256,
+        parse_dvm_control_contract_text, parse_manifest_text, parse_smoke_options,
         qemu_display_backend, runtime_stall_or_crash_observed, select_smoke_guest_display,
         uiserver_has_interactive_slow_loop, uiserver_idle_ticks_healthy,
         uiserver_profile_input_pipeline_healthy, uiserver_profile_meets_fps,
-        validate_manifest_values,
+        validate_manifest_values, wayclick_profile_meets_fps,
     };
 
     #[test]
@@ -2397,8 +2786,19 @@ mod tests {
         assert_eq!(options.timeout.as_secs(), 30);
         assert_eq!(
             options.expected_markers,
-            vec![RUSTOS_BOOT_MARKER.to_owned()]
+            vec![
+                RUSTOS_BOOT_MARKER.to_owned(),
+                RUSTOS_GPU_SCENE_COMPILER_MARKER.to_owned()
+            ]
         );
+        assert_eq!(
+            options.expected_dvm_markers,
+            vec![DVM_GPU_COMPOSITOR_MARKER.to_owned()]
+        );
+        let extra =
+            parse_smoke_options(vec!["--expect-dvm".into(), "gpu-extra".into()].into_iter())
+                .unwrap();
+        assert!(extra.expected_dvm_markers.contains(&"gpu-extra".to_owned()));
         assert!(parse_smoke_options(vec!["--timeout".into(), "31".into()].into_iter()).is_err());
     }
 
@@ -2423,23 +2823,24 @@ mod tests {
         let options = parse_smoke_options(vec!["--gui-dvm-surfaces".into()].into_iter()).unwrap();
         assert!(options.gui_dvm_surfaces);
         assert!(dvm_display_provider_ready(
-            "[INFO ] service=uiserver uiserver: display_get_info attempt=1 width=1600 height=900 stride=6400 bpp=4 fmt=1 flags=0x6 gen=1"
+            "[INFO ] service=uiserver uiserver: display_get_info attempt=1 width=1600 height=900 stride=7168 bpp=4 fmt=1 flags=0xe gen=1"
         ));
         assert!(!dvm_display_provider_ready(
-            "[INFO ] service=uiserver uiserver: display_get_info attempt=1 width=1600 height=900 stride=6400 bpp=4 fmt=1 flags=0x2 gen=1"
+            "[INFO ] service=uiserver uiserver: display_get_info attempt=1 width=1600 height=900 stride=7168 bpp=4 fmt=1 flags=0x6 gen=1"
         ));
         assert!(dvm_display_relay_ready(
             "rustos-dvm-display: peer readiness sent event=ivshmem-msix-uio\n\
              rustos-dvm-display: host confirmed peer readiness event=ivshmem-msix-uio\n\
-             rustos-dvm-display: active width=1600 height=900 stride=6400 format=BGRA8888 event=ivshmem-msix-uio irq_count=1 dmabuf-direct-scanout=1600x900 atomic-pageflip-fence=1 scanout_buffers=3 cpu-copy=0"
+             rustos-dvm-display: scheduler admitted policy=rr priority=9 rttime_soft_us=50000 rttime_hard_us=100000\n\
+             rustos-dvm-display: active width=1600 height=900 stride=7168 format=BGRA8888 event=ivshmem-msix-uio irq_count=1 source-path=staged-copy zero-copy=0 gpu-composition=1 explicit-fence=1 scanout_buffers=3 cpu-final-compose=0 staged-damage-copy=1"
         ));
         assert!(!dvm_display_relay_ready(
-            "rustos-dvm-display: active width=1600 height=900 stride=6400 format=BGRA8888 dmabuf-direct-scanout"
+            "rustos-dvm-display: active width=1600 height=900 stride=7168 format=BGRA8888 dmabuf-direct-scanout"
         ));
         assert!(!dvm_display_relay_ready(
             "rustos-dvm-display: peer readiness sent event=ivshmem-msix-uio\n\
              rustos-dvm-display: host confirmed peer readiness event=ivshmem-msix-uio\n\
-             rustos-dvm-display: active width=1600 height=900 stride=6400 format=BGRA8888 event=ivshmem-msix-uio irq_count=0 dmabuf-direct-scanout=1600x900 atomic-pageflip-fence=1 scanout_buffers=3 cpu-copy=0"
+             rustos-dvm-display: active width=1600 height=900 stride=7168 format=BGRA8888 event=ivshmem-msix-uio irq_count=0 source-path=staged-copy zero-copy=0 gpu-composition=1 explicit-fence=1 scanout_buffers=3 cpu-final-compose=0 staged-damage-copy=1"
         ));
         assert_eq!(
             dvm_display_failure(
@@ -2448,6 +2849,30 @@ mod tests {
             Some("rustos-dvm-display: KMS setup unavailable stage=direct-dmabuf-import errno=6")
         );
         assert_eq!(dvm_display_failure("boot\nrelay pending\n"), None);
+    }
+
+    #[test]
+    fn dvm_gpu_compositor_requires_real_virgl_fences_and_bounded_latency() {
+        let ready = "rustos-dvm-gpu: ready contract=1 driver=virtio_gpu renderer=virgl_(AMD_Radeon_780M) commands=3 gpu-fence=1 acquire-fence=1 prime_us=12000 frames=120 fps_milli=60001 avg_us=400 max_us=900 wall_max_us=1000 frame_hash_a=ac8906df9029660b frame_hash_b=bc8906df9029660b hash-stable=1 hash-dynamic=1 negative=5 software=0 performance-target=1 hardware=amd scope-public-abi=0 scope-ui-connected=0 scope-scanout=0\nrustos-dvm-gpu: health sequence=1 completion_us=900 acquire-fence=1\nrustos-dvm-gpu: health sequence=2 completion_us=900 acquire-fence=1\nrustos-dvm-gpu: health sequence=3 completion_us=900 acquire-fence=1";
+        assert!(dvm_gpu_compositor_ready(ready));
+        assert!(!dvm_gpu_compositor_ready(
+            &ready.replace("software=0", "software=1")
+        ));
+        assert!(!dvm_gpu_compositor_ready(
+            &ready.replace("performance-target=1", "performance-target=0")
+        ));
+        assert!(!dvm_gpu_compositor_ready(
+            &ready.replace("max_us=900", "max_us=16668")
+        ));
+        assert!(!dvm_gpu_compositor_ready(
+            &ready.replace("wall_max_us=1000", "wall_max_us=16668")
+        ));
+        assert!(!dvm_gpu_compositor_ready(
+            &ready.replace("prime_us=12000", "prime_us=500001")
+        ));
+        assert!(!dvm_gpu_compositor_ready(&format!(
+            "{ready}\nrustos-dvm-gpu: context lost errno=5"
+        )));
     }
 
     #[test]
@@ -2502,6 +2927,13 @@ mod tests {
             parse_smoke_options(vec!["--min-ui-fps".into(), "20".into()].into_iter()).unwrap();
         assert_eq!(options.min_ui_fps, Some(20));
         assert_eq!(options.ui_proof_windows, DEFAULT_UI_FPS_ACTIVE_WINDOWS);
+        assert!(options.exercise_input);
+        assert!(
+            options
+                .expected_markers
+                .iter()
+                .any(|marker| marker == DVM_POINTER_INGRESS_MARKER)
+        );
         let soak = parse_smoke_options(
             vec![
                 "--min-ui-fps".into(),
@@ -2535,24 +2967,40 @@ mod tests {
             20,
             DEFAULT_UI_FPS_ACTIVE_WINDOWS,
         ));
+        let wayclick = "wayclick profile: elapsed_ms=1000 commit_hz_milli=60000 callback_hz_milli=60000 redraw_requests=60 pointer_updates=0 commits=60 callbacks=60 buffer_releases=60 max_callback_gap_ms=18 callback_in_flight=1 redraw_pending=0\n".repeat(3);
+        assert!(wayclick_profile_meets_fps(
+            &wayclick,
+            60,
+            DEFAULT_UI_FPS_ACTIVE_WINDOWS,
+        ));
+        assert!(!wayclick_profile_meets_fps(
+            &wayclick.replacen("callback_hz_milli=60000", "callback_hz_milli=1000", 1),
+            60,
+            DEFAULT_UI_FPS_ACTIVE_WINDOWS,
+        ));
+        assert!(!wayclick_profile_meets_fps(
+            &wayclick.replace("max_callback_gap_ms=18", "max_callback_gap_ms=51"),
+            60,
+            DEFAULT_UI_FPS_ACTIVE_WINDOWS,
+        ));
         assert!(dvm_display_relay_meets_fps(
-            "rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60000 pageflip_completions=60 relay_cpu_copy_us_avg=0 atomic_commit_us_avg=1000\n\
-             rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60001 pageflip_completions=60 relay_cpu_copy_us_avg=0 atomic_commit_us_avg=1000\n\
-             rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60000 pageflip_completions=60 relay_cpu_copy_us_avg=0 atomic_commit_us_avg=1000",
+            "rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60000 pageflip_completions=60 relay_cpu_copy_us_avg=0 atomic_commit_us_avg=1000 gpu_render_us_avg=9000 gpu_render_us_max=11000 gpu_fence_completions=60 present_fence_completions=60\n\
+             rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60001 pageflip_completions=60 relay_cpu_copy_us_avg=0 atomic_commit_us_avg=1000 gpu_render_us_avg=9000 gpu_render_us_max=11000 gpu_fence_completions=60 present_fence_completions=60\n\
+             rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60000 pageflip_completions=60 relay_cpu_copy_us_avg=0 atomic_commit_us_avg=1000 gpu_render_us_avg=9000 gpu_render_us_max=11000 gpu_fence_completions=60 present_fence_completions=60",
             60,
             DEFAULT_UI_FPS_ACTIVE_WINDOWS,
         ));
         assert!(!dvm_display_relay_meets_fps(
-            "rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60000 pageflip_completions=60 relay_cpu_copy_us_avg=0 atomic_commit_us_avg=1000\n\
-             rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=59999 pageflip_completions=60 relay_cpu_copy_us_avg=0 atomic_commit_us_avg=1000\n\
-             rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60000 pageflip_completions=60 relay_cpu_copy_us_avg=0 atomic_commit_us_avg=1000",
+            "rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60000 pageflip_completions=60 relay_cpu_copy_us_avg=0 atomic_commit_us_avg=1000 gpu_render_us_avg=9000 gpu_render_us_max=11000 gpu_fence_completions=60 present_fence_completions=60\n\
+             rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=59999 pageflip_completions=60 relay_cpu_copy_us_avg=0 atomic_commit_us_avg=1000 gpu_render_us_avg=9000 gpu_render_us_max=11000 gpu_fence_completions=60 present_fence_completions=60\n\
+             rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60000 pageflip_completions=60 relay_cpu_copy_us_avg=0 atomic_commit_us_avg=1000 gpu_render_us_avg=9000 gpu_render_us_max=11000 gpu_fence_completions=60 present_fence_completions=60",
             60,
             DEFAULT_UI_FPS_ACTIVE_WINDOWS,
         ));
         assert!(!dvm_display_relay_meets_fps(
-            "rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60000 pageflip_completions=60 relay_cpu_copy_us_avg=1 atomic_commit_us_avg=5000\n\
-             rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60000 pageflip_completions=60 relay_cpu_copy_us_avg=0 atomic_commit_us_avg=1000\n\
-             rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60000 pageflip_completions=60 relay_cpu_copy_us_avg=0 atomic_commit_us_avg=1000",
+            "rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60000 pageflip_completions=60 relay_cpu_copy_us_avg=1 atomic_commit_us_avg=5000 gpu_render_us_avg=9000 gpu_render_us_max=11000 gpu_fence_completions=60 present_fence_completions=60\n\
+             rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60000 pageflip_completions=60 relay_cpu_copy_us_avg=0 atomic_commit_us_avg=1000 gpu_render_us_avg=9000 gpu_render_us_max=11000 gpu_fence_completions=60 present_fence_completions=60\n\
+             rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60000 pageflip_completions=60 relay_cpu_copy_us_avg=0 atomic_commit_us_avg=1000 gpu_render_us_avg=9000 gpu_render_us_max=16668 gpu_fence_completions=60 present_fence_completions=60",
             60,
             DEFAULT_UI_FPS_ACTIVE_WINDOWS,
         ));
@@ -2565,15 +3013,23 @@ uiserver profile: elapsed_ms=1000 frame_hz_milli=60000 input_events=60 input_gap
 uiserver profile: elapsed_ms=1000 frame_hz_milli=60000 input_events=60 input_gap_ms=20 input_last_age_ms=5 input_drops=0 input_slow=0 input_errors=0 cursor_mismatches=0 cursor=992,642 presented_cursor=992,642 background_thread_demotions=7 backlog=0 cursor_moves=60";
         assert!(uiserver_profile_input_pipeline_healthy(
             healthy,
-            DEFAULT_UI_FPS_ACTIVE_WINDOWS
+            DEFAULT_UI_FPS_ACTIVE_WINDOWS,
+            Some(60),
         ));
         assert!(!uiserver_profile_input_pipeline_healthy(
             &healthy.replace("cursor=992,642", "cursor=803,452"),
             DEFAULT_UI_FPS_ACTIVE_WINDOWS,
+            Some(60),
         ));
         assert!(!uiserver_profile_input_pipeline_healthy(
             &healthy.replace("input_drops=0", "input_drops=1"),
             DEFAULT_UI_FPS_ACTIVE_WINDOWS,
+            Some(60),
+        ));
+        assert!(!uiserver_profile_input_pipeline_healthy(
+            &healthy.replacen("frame_hz_milli=60000", "frame_hz_milli=59999", 1),
+            DEFAULT_UI_FPS_ACTIVE_WINDOWS,
+            Some(60),
         ));
         assert!(runtime_stall_or_crash_observed(
             "scheduler long ready wait: task=uiserver elapsed_ms=500"
@@ -2613,12 +3069,16 @@ uiserver: update tick backlog=false input_drops=0 input_slow=0 input_errors=0";
 
     #[test]
     fn interactive_gtk_display_uses_absolute_pointer_and_hides_host_cursor() {
-        assert_eq!(qemu_display_backend(GuestDisplay::Headless), "none");
+        assert_eq!(
+            qemu_display_backend(GuestDisplay::Headless),
+            "egl-headless,rendernode=/dev/dri/renderD128"
+        );
         assert_eq!(
             qemu_display_backend(GuestDisplay::DvmGtk),
-            "gtk,gl=off,show-tabs=off,zoom-to-fit=off,grab-on-hover=on,show-cursor=off"
+            "gtk,gl=on,show-tabs=off,zoom-to-fit=off,grab-on-hover=on,show-cursor=off"
         );
-        assert!(dvm_gpu_device(GuestDisplay::DvmGtk).starts_with("virtio-gpu-pci,id="));
+        assert!(dvm_gpu_device(GuestDisplay::DvmGtk).starts_with("virtio-gpu-gl-pci,id="));
+        assert!(dvm_gpu_device(GuestDisplay::Headless).contains("hostmem=256M"));
         assert_eq!(dvm_pointer_device(), "virtio-tablet-pci,id=dvm-pointer");
     }
 
@@ -2648,15 +3108,35 @@ uiserver: update tick backlog=false input_drops=0 input_slow=0 input_errors=0";
         assert!(source.contains("UI_SET_ABSBIT, ABS_X"));
         assert!(source.contains("UI_SET_ABSBIT, ABS_Y"));
         assert!(source.contains("selftest->motion_phase == 0U"));
-        assert!(source.contains("#define INPUT_SELFTEST_CYCLES 3200U"));
+        assert!(source.contains("#define INPUT_SELFTEST_CYCLES 4000U"));
         assert!(source.contains("#define INPUT_SELFTEST_LEG_CYCLES 64U"));
-        assert!(source.contains("#define INPUT_SELFTEST_POLL_MS 5"));
+        assert!(source.contains("#define INPUT_SELFTEST_POLL_MS 10"));
+        assert!(source.contains("#define INPUT_RELAY_RR_PRIORITY 10"));
+        assert!(source.contains("#define INPUT_RELAY_RTTIME_SOFT_US 50000U"));
+        assert!(source.contains("#define INPUT_RELAY_RTTIME_HARD_US 100000U"));
+        assert!(source.contains("sched_setscheduler(0, SCHED_RR, &realtime)"));
+        assert!(source.contains("setrlimit(RLIMIT_RTTIME, &bounded_rttime)"));
+        assert!(source.contains("input_scheduler_leave(&scheduler)"));
         assert!(source.contains("#define INPUT_POINTER_FLUSH_MS 5"));
         assert!(source.contains("case 0U:\n        dx = 3;\n        dy = 0;"));
         assert!(source.contains("case 1U:\n        dx = 0;\n        dy = 3;"));
         assert!(source.contains("write_input_event(fd, EV_KEY, KEY_F12, 1)"));
         assert!(source.contains("write_input_event(fd, EV_ABS, ABS_X, selftest->pointer_x)"));
         assert!(!source.contains("write_input_event(fd, EV_KEY, KEY_A, 1)"));
+    }
+
+    #[test]
+    fn dvm_display_relay_has_bounded_authenticated_scheduler_admission() {
+        let source = include_str!(
+            "../../../driver-domains/linux/package/rustos-dvm-display/src/rustos-dvm-display.c"
+        );
+        assert!(source.contains("#define DISPLAY_RELAY_RR_PRIORITY 9"));
+        assert!(source.contains("#define DISPLAY_RELAY_RTTIME_SOFT_US 50000U"));
+        assert!(source.contains("#define DISPLAY_RELAY_RTTIME_HARD_US 100000U"));
+        assert!(source.contains("sched_setscheduler(0, SCHED_RR, &realtime)"));
+        assert!(source.contains("setrlimit(RLIMIT_RTTIME, &bounded_rttime)"));
+        assert!(source.contains("host_confirmed_peer_ready(shared)"));
+        assert!(source.contains("display_scheduler_leave(&scheduler)"));
     }
 
     #[test]
@@ -2681,7 +3161,7 @@ uiserver: update tick backlog=false input_drops=0 input_slow=0 input_errors=0";
 
         let hash = "0".repeat(64);
         let manifest = format!(
-            "schema=8\nid=rustos-linux-dvm-x86_64\narchitecture=x86_64\nboot=linux-bzimage+cpio-xz\ndata-plane=hostd-input-ring-msix\ncontrol-plane=agent-v1-control\ncontrol-protocol=agent-v1\ncontrol-state=control\ncontrol-transport=kvm-vsock\ncontrol-authentication=dvm-agent-hmac-sha256-v1\ncontrol-capabilities=health,device-inventory,driver-inventory,input-stream\ncontrol-contract-sha256={hash}\nbuildroot_version=2026.05\nlinux_version=6.12.94\nnvidia-open-version=580.173.02\nnvidia-open-sha256=8d8eb9001e05a9a8a663d3d5d304feb64ef2844ee185ccdfd952786820f46e1b\nnvidia-open-redistribute=no\ndisplay-kernel-modules=i915,xe,amdgpu,nvidia-drm\nmodule-signing-enforced=yes\nmodule-signing-cert-sha256={hash}\nkernel_sha256={hash}\nrootfs_sha256={hash}\nconfig_sha256={hash}\nkernel-config-sha256={hash}\nsources_lock_sha256={hash}\n"
+            "schema=8\nid=rustos-linux-dvm-x86_64\narchitecture=x86_64\nboot=linux-bzimage+cpio-xz\ndata-plane=hostd-input-ring-msix\ncontrol-plane=agent-v1-control\ncontrol-protocol=agent-v1\ncontrol-state=control\ncontrol-transport=kvm-vsock\ncontrol-authentication=dvm-agent-hmac-sha256-v1\ncontrol-capabilities=health,device-inventory,driver-inventory,display-evidence-v1,input-stream\ncontrol-contract-sha256={hash}\nbuildroot_version=2026.05\nlinux_version=6.12.94\nnvidia-open-version=580.173.02\nnvidia-open-sha256=8d8eb9001e05a9a8a663d3d5d304feb64ef2844ee185ccdfd952786820f46e1b\nnvidia-open-redistribute=no\ndisplay-kernel-modules=i915,xe,amdgpu,nvidia-drm\nmodule-signing-enforced=yes\nmodule-signing-cert-sha256={hash}\nkernel_sha256={hash}\nrootfs_sha256={hash}\nconfig_sha256={hash}\nkernel-config-sha256={hash}\nsources_lock_sha256={hash}\n"
         );
         let values = parse_manifest_text(&manifest, "manifest").unwrap();
         assert_eq!(validate_manifest_values(&values).unwrap(), contract);
@@ -2697,7 +3177,7 @@ uiserver: update tick backlog=false input_drops=0 input_slow=0 input_errors=0";
             "../../../driver-domains/linux/board/overlay/usr/share/rustos-dvm/control-plane-v1.env"
         );
         let invalid = contract_source.replace(
-            "CONTROL_CAPABILITIES=health,device-inventory,driver-inventory,input-stream",
+            "CONTROL_CAPABILITIES=health,device-inventory,driver-inventory,display-evidence-v1,input-stream",
             "CONTROL_CAPABILITIES=health,network-rx",
         );
         assert!(parse_dvm_control_contract_text(&invalid, "invalid contract").is_err());

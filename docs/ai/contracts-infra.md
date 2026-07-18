@@ -180,7 +180,7 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   logs under `build/kvm/`.
 - A successful smoke requires RustOS's default `rootd` readiness marker and
   the L0 host broker to complete the DVM
-  `health,device-inventory,driver-inventory,input-stream` handshake using launch-assigned KVM
+  `health,device-inventory,driver-inventory,display-evidence-v1,input-stream` handshake using launch-assigned KVM
   vsock CID `4`. L0 then attaches as the fixed ivshmem peer 1 only after
   RustOS has claimed peer 0, writes only fixed RDI3 session/key/pointer frames
   into the host-owned 128 KiB input ring, and signals the one RustOS MSI-X
@@ -197,7 +197,22 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   ingress markers. The composite device advertises pointer selection capability,
   emits one non-printable F12 keyboard proof, then emits pointer-only absolute positions;
   it never emits printable keys or clicks. It traces a 192-pixel axis-aligned
-  square for 3,200 cycles, with source polling no faster than 5 ms. A
+  square for 4,000 cycles (a bounded 40-second source window that covers the
+  public 30-second gate plus guest admission), with source polling no faster
+  than 10 ms. After L0 authenticates and requests the input stream, the agent
+  admits only that live streaming interval to guest `SCHED_RR` priority 10 and
+  first installs a 50 ms soft/100 ms hard `RLIMIT_RTTIME` continuous-CPU
+  ceiling. It reads the policy and priority back, fails the stream closed if
+  admission fails, and restores the prior policy/limit on exit; a runaway
+  relay therefore cannot indefinitely starve DVM KMS or recovery. Both the
+  KVM runner and physical supervisor boot this verified
+  `CONFIG_PREEMPT_DYNAMIC` kernel with `preempt=full`; artifact verification
+  also requires high-resolution timers and `CONFIG_HZ_1000`. The separate
+  GPU/KMS relay stays under the normal policy through device setup and enters
+  `SCHED_RR` priority 9 only after the host invitation is confirmed. It uses
+  the same 50/100 ms continuous-CPU ceiling, verifies the installed policy,
+  and restores it on every relay exit; display therefore cannot outrank the
+  priority-10 input relay or retain realtime authority while retrying. A
   `--min-ui-fps` proof requires three consecutive active one-second windows at
   the requested uiserver and DVM rate, at least 55 accepted events and 50
   presented cursor moves, zero loss/slow/error/backlog, at most 50 ms input
@@ -223,6 +238,25 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   without changing its extent length. `uiserver` emits one-second profile
   windows with integer `frame_hz_milli`; the runner requires `N * 1000`.
   Release images retain the disabled value.
+- Every KVM smoke now attaches `virtio-gpu-gl-pci` to the Linux DVM and uses
+  virgl through the exact AMD `/dev/dri/renderD128` host render node. The
+  launcher rejects a symlink, non-character device, non-`0x1002` vendor, or
+  non-`amdgpu` driver before QEMU starts. Headless runs use
+  `egl-headless,rendernode=/dev/dri/renderD128`; interactive runs use GTK with
+  GL enabled. The DVM fixed-command probe accepts only the `virtio_gpu` or
+  `amdgpu` DRM driver, rejects llvmpipe/softpipe/swrast, executes clear,
+  solid-quad, and transformed textured-quad through built-in GLES shaders,
+  fences every completion, verifies pixels plus a nonzero frame hash, and
+  keeps a one-second health submission alive. Before frame admission it runs
+  one built-in textured draw behind a separate GPU fence, rejects context
+  setup over 500,000 us, and reports the measured prime duration; this keeps
+  one-time shader/pipeline translation outside the per-frame SLA without
+  making it unbounded. The runner requires its virgl
+  marker to report at least 120 frames and 60,000 mHz with maximum GPU fence
+  completion at most 16,667 us. This is an execution-engine proof only: its
+  required `public-abi=0 ui-connected=0 scanout=0` fields keep the private
+  submit ABI, RustOS scene connection, KMS output handoff, foreign DMA-BUF
+  import, and physical AMD evidence as explicit failed gates.
 - `cargo xtask kvm-smoke --gui-dvm-surfaces` exercises the production V3
   `RSGUI002` three-slot GUI-DVM pool. The launch-local, owner-private
   `ivshmem-doorbell` broker gives exactly the RustOS compositor and GUI DVM one
@@ -270,7 +304,10 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   can request 640×480 before Linux DRM starts and force unnecessary scaling.
   QEMU's explicit 1600×900 mode is therefore authoritative. The 60 FPS proof
   requires an active GTK consumer and atomic three-buffer page-flip
-  completion. Linux 6.12 virtio-gpu cannot import the foreign SG-table
+  completion. The same consecutive uiserver profile windows must satisfy the
+  render-rate, input-gap/loss, backlog, and logical/presented-cursor predicates;
+  evidence from disjoint time ranges cannot be combined. Linux 6.12 virtio-gpu
+  cannot import the foreign SG-table
   DMA-BUF, so the standard virtual GPU cannot satisfy this gate; current QEMU
   vmware-svga also lacks the pitchlock capability required by vmwgfx. The DVM
   relay
@@ -338,18 +375,27 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
 - `rustos-hostd preflight-physical` adds the complete reversible runtime gate:
   exact display-only policy and QEMU digest, the self-contained schema-8 DVM
   bundle, a writable `/dev/iommu`, successful empty-IOAS allocate/destroy
-  ioctls, and the same live host-display safety check. `acquire --activate`
+  ioctls, the same live host-display safety check, and schema-3 proof that the
+  sole display-class function is the signed `amdgpu` `1002:1900` target. `acquire --activate`
   repeats this gate
   after signed-release verification and before it creates durable prepared
   state or changes any driver binding. A host lacking IOMMUFD therefore fails
   without detaching the assigned GPU.
-- `rustos-hostd relay-input` requires a matching strict
-  `driver-domain-policy-v2` file. The signed policy binds the production QEMU
+- `rustos-hostd relay-input` requires a matching strict device-policy file.
+  Schema 2 remains valid for non-physical input-only domains. The enabled
+  physical AMD display topology requires `driver-domain-policy-v3`. The signed policy binds the production QEMU
   digest and one transport per device class. `input-ring-msix` and
   `display-dmabuf-kms` are the admitted transports. The current commercial
   physical-device slice requires network and block to remain `disabled`; their
   virtual KVM test transports do not authorize physical assignment. The normal
   input command is a reconnecting L0 service; `--once` is diagnostics-only.
+- `rustos-hostd supervise` accepts physical readiness only after five distinct
+  authenticated `display-evidence-v1` samples meet the signed nominal-60-Hz
+  floor and page-flip/atomic-commit latency bounds. The relay sample is derived
+  from completed DRM page-flip events, declares direct DMA-BUF scanout and zero
+  relay CPU copy, and carries an advancing sequence plus DVM-monotonic age.
+  Wrong AMD identity, stale/restarted evidence, a CPU-copy path, low throughput,
+  or excessive latency fails setup or ongoing health and triggers bounded recovery.
 - `rustos-hostd acquire` remains read-only unless `--activate` is supplied
   together with a detached OpenPGP signature, an explicit pinned release
   keyring, a strict `release-authorization-v1` payload, the bound DVM artifact

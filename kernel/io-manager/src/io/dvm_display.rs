@@ -14,12 +14,22 @@ use driver_abi::{
     DisplayFramebufferRegistration, DisplayPixelFormat,
 };
 use driver_domain_protocol::{
+    DVM_GPU_ATLAS_COMMAND_SLOT_BYTES, DVM_GPU_ATLAS_CONTEXT_EPOCH_OFFSET,
+    DVM_GPU_ATLAS_CONTEXT_ID_OFFSET, DVM_GPU_ATLAS_DAMAGE_BYTES, DVM_GPU_ATLAS_POOL_HEADER_OFFSET,
+    DVM_GPU_ATLAS_PRIME_COMPLETION_OFFSET, DVM_GPU_ATLAS_PRIME_FENCE_OFFSET,
+    DVM_GPU_ATLAS_SUBMIT_BYTES, DVM_GPU_ATLAS_SUBMIT_FLAG_STAGED_COPY,
+    DVM_GPU_PRIME_COMPLETION_BYTES, DVM_GPU_RENDER_HEADER_BYTES, DVM_GPU_RENDER_MAX_BATCH_BYTES,
+    DVM_GPU_RENDER_MAX_IN_FLIGHT, DVM_GPU_RENDER_SOURCE_BYTES,
     DVM_GUI_SURFACE_POOL_DVM_RECORD_OFFSET, DVM_GUI_SURFACE_POOL_DVM_SEQUENCE_OFFSET,
     DVM_GUI_SURFACE_POOL_HEADER_BYTES, DVM_GUI_SURFACE_POOL_HOST_ACK_OFFSET,
     DVM_GUI_SURFACE_POOL_HOST_RECORD_OFFSET, DVM_GUI_SURFACE_POOL_INVITATION_OFFSET,
     DVM_GUI_SURFACE_POOL_READY_ACK_OFFSET, DVM_GUI_SURFACE_POOL_READY_CONFIRMATION_OFFSET,
-    DVM_GUI_SURFACE_SLOT_COUNT, DvmDisplayDamage, DvmGuiSurfaceMessage, DvmGuiSurfaceMessageKind,
-    DvmGuiSurfacePoolHeader,
+    DVM_GUI_SURFACE_SLOT_COUNT, DvmDisplayDamage, DvmGpuAtlasCompletion, DvmGpuAtlasDamage,
+    DvmGpuAtlasPoolHeader, DvmGpuAtlasSubmit, DvmGpuPrimeCompletion, DvmGpuPrimeCompletionStatus,
+    DvmGpuRenderBatchHeader, DvmGpuRenderSource, DvmGuiSurfaceMessage, DvmGuiSurfaceMessageKind,
+    DvmGuiSurfacePoolHeader, dvm_gpu_atlas_completion_ack_offset, dvm_gpu_atlas_completion_offset,
+    dvm_gpu_atlas_completion_sequence_offset, dvm_gpu_atlas_damage_is_valid,
+    dvm_gpu_atlas_invitation_offset,
 };
 
 const IVSHMEM_VENDOR_ID: u16 = 0x1af4;
@@ -28,7 +38,7 @@ const IVSHMEM_REGISTERS_BAR: usize = 0;
 const IVSHMEM_SHARED_MEMORY_BAR: usize = 2;
 const IVSHMEM_DOORBELL_OFFSET: usize = 12;
 const GUI_DVM_PIXEL_REGION_PHYS_ADDR: u64 = 0x1_0000_0000;
-const GUI_DVM_PIXEL_REGION_BYTES: u64 = 32 * 1024 * 1024;
+const GUI_DVM_PIXEL_REGION_BYTES: u64 = 128 * 1024 * 1024;
 const GUI_DVM_PEER_ID: u32 = 1;
 const GUI_DVM_CONTROL_VECTOR_INDEX: usize = 0;
 const GUI_DVM_OFFLINE_VECTOR_INDEX: usize = 1;
@@ -37,6 +47,12 @@ const GUI_SLOT_COUNT: usize = DVM_GUI_SURFACE_SLOT_COUNT as usize;
 const GUI_SLOT_FREE: u8 = 0;
 const GUI_SLOT_WRITING: u8 = 1;
 const GUI_SLOT_READY: u8 = 2;
+const GPU_SLOT_FREE: u8 = 0;
+const GPU_SLOT_WRITING: u8 = 1;
+const GPU_SLOT_SUBMITTED: u8 = 2;
+const GPU_CONTEXT_ID: u32 = 1;
+const GPU_INITIAL_CONTEXT_EPOCH: u32 = 1;
+const GPU_PRIME_FENCE_VALUE: u64 = 1;
 const MSIX_ENTRY_BYTES: usize = 16;
 const MSIX_ENTRY_ADDRESS_LOW_OFFSET: usize = 0;
 const MSIX_ENTRY_ADDRESS_HIGH_OFFSET: usize = 4;
@@ -66,6 +82,32 @@ static POOL_WIDTH: AtomicU32 = AtomicU32::new(0);
 static POOL_HEIGHT: AtomicU32 = AtomicU32::new(0);
 static POOL_STRIDE_BYTES: AtomicU32 = AtomicU32::new(0);
 static POOL_SLOT_BYTES: AtomicU64 = AtomicU64::new(0);
+static GPU_COMMAND_OFFSET: AtomicU64 = AtomicU64::new(0);
+static GPU_ATLAS_OFFSET: AtomicU64 = AtomicU64::new(0);
+static GPU_ATLAS_SLOT_BYTES: AtomicU64 = AtomicU64::new(0);
+static GPU_ATLAS_WIDTH: AtomicU32 = AtomicU32::new(0);
+static GPU_ATLAS_HEIGHT: AtomicU32 = AtomicU32::new(0);
+static GPU_ATLAS_STRIDE_BYTES: AtomicU32 = AtomicU32::new(0);
+static GPU_NEXT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static GPU_CONTEXT_EPOCH: AtomicU32 = AtomicU32::new(GPU_INITIAL_CONTEXT_EPOCH);
+static GPU_PRIME_DURATION_NS: AtomicU64 = AtomicU64::new(0);
+static GPU_SESSION_SUBMISSIONS: AtomicU64 = AtomicU64::new(0);
+static GPU_SUBMIT_LOCK: AtomicBool = AtomicBool::new(false);
+static GPU_SLOT_STATE: [AtomicU8; DVM_GPU_RENDER_MAX_IN_FLIGHT as usize] = [
+    AtomicU8::new(GPU_SLOT_FREE),
+    AtomicU8::new(GPU_SLOT_FREE),
+    AtomicU8::new(GPU_SLOT_FREE),
+];
+static GPU_SLOT_GENERATION: [AtomicU64; DVM_GPU_RENDER_MAX_IN_FLIGHT as usize] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static GPU_SLOT_SEQUENCE: [AtomicU64; DVM_GPU_RENDER_MAX_IN_FLIGHT as usize] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static GPU_SLOT_CONTEXT_ID: [AtomicU32; DVM_GPU_RENDER_MAX_IN_FLIGHT as usize] =
+    [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+static GPU_SLOT_CONTEXT_EPOCH: [AtomicU32; DVM_GPU_RENDER_MAX_IN_FLIGHT as usize] =
+    [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+static GPU_SLOT_SUBMIT_VALUE: [AtomicU64; DVM_GPU_RENDER_MAX_IN_FLIGHT as usize] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 static PUBLISHED_GENERATION: AtomicU64 = AtomicU64::new(0);
 static SLOT_STATE: [AtomicU8; GUI_SLOT_COUNT] = [
     AtomicU8::new(GUI_SLOT_FREE),
@@ -100,6 +142,19 @@ struct MappedGuiDvmPool {
     pixels: *mut u8,
     doorbell: *mut u8,
     header: DvmGuiSurfacePoolHeader,
+    atlas_header: DvmGpuAtlasPoolHeader,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GpuAtlasInfo {
+    pub width: u32,
+    pub height: u32,
+    pub stride_bytes: u32,
+    pub slot_count: u32,
+    pub context_id: u32,
+    pub context_epoch: u32,
+    pub prime_fence_value: u64,
+    pub prime_duration_ns: u64,
 }
 
 /// The display ABI must distinguish a transient saturated pool from a
@@ -110,6 +165,39 @@ pub(crate) enum DvmPresentOutcome {
     Presented,
     Backpressured,
     Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DvmGpuSubmitOutcome {
+    Submitted,
+    Backpressured,
+    Unavailable,
+    Invalid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DvmGpuCompletionOutcome {
+    Completed([u8; driver_domain_protocol::DVM_GPU_ATLAS_COMPLETION_SLOT_BYTES]),
+    Pending,
+    Unavailable,
+    Invalid,
+}
+
+struct GpuSubmitGuard;
+
+impl GpuSubmitGuard {
+    fn try_acquire() -> Option<Self> {
+        GPU_SUBMIT_LOCK
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for GpuSubmitGuard {
+    fn drop(&mut self) {
+        GPU_SUBMIT_LOCK.store(false, Ordering::Release);
+    }
 }
 
 /// Install only the host-created V3 three-slot GUI-DVM pool. The retired
@@ -186,6 +274,34 @@ fn try_install_serialized() -> bool {
     POOL_HEIGHT.store(pool.header.height, Ordering::Release);
     POOL_STRIDE_BYTES.store(pool.header.stride_bytes, Ordering::Release);
     POOL_SLOT_BYTES.store(pool.header.slot_bytes, Ordering::Release);
+    GPU_COMMAND_OFFSET.store(pool.atlas_header.command_offset, Ordering::Release);
+    GPU_ATLAS_OFFSET.store(pool.atlas_header.atlas_offset, Ordering::Release);
+    GPU_ATLAS_SLOT_BYTES.store(pool.atlas_header.atlas_slot_bytes, Ordering::Release);
+    GPU_ATLAS_WIDTH.store(pool.atlas_header.atlas_width, Ordering::Release);
+    GPU_ATLAS_HEIGHT.store(pool.atlas_header.atlas_height, Ordering::Release);
+    GPU_ATLAS_STRIDE_BYTES.store(pool.atlas_header.atlas_stride_bytes, Ordering::Release);
+    GPU_NEXT_SEQUENCE.store(0, Ordering::Release);
+    GPU_CONTEXT_EPOCH.store(GPU_INITIAL_CONTEXT_EPOCH, Ordering::Release);
+    GPU_PRIME_DURATION_NS.store(0, Ordering::Release);
+    GPU_SESSION_SUBMISSIONS.store(0, Ordering::Release);
+    GPU_SUBMIT_LOCK.store(false, Ordering::Release);
+    for slot in 0..DVM_GPU_RENDER_MAX_IN_FLIGHT as usize {
+        GPU_SLOT_STATE[slot].store(GPU_SLOT_FREE, Ordering::Release);
+        GPU_SLOT_GENERATION[slot].store(0, Ordering::Release);
+        GPU_SLOT_SEQUENCE[slot].store(0, Ordering::Release);
+        GPU_SLOT_CONTEXT_ID[slot].store(0, Ordering::Release);
+        GPU_SLOT_CONTEXT_EPOCH[slot].store(0, Ordering::Release);
+        GPU_SLOT_SUBMIT_VALUE[slot].store(0, Ordering::Release);
+        if let Some(offset) = dvm_gpu_atlas_invitation_offset(slot as u32) {
+            write_u64(offset, 0);
+        }
+        if let Some(offset) = dvm_gpu_atlas_completion_sequence_offset(slot as u32) {
+            write_u64(offset, 0);
+        }
+        if let Some(offset) = dvm_gpu_atlas_completion_ack_offset(slot as u32) {
+            write_u64(offset, 0);
+        }
+    }
     PUBLISHED_GENERATION.store(0, Ordering::Release);
     DROPPED_FRAMES.store(0, Ordering::Release);
     GUI_DVM_CONTROL_IRQ_PENDING.store(false, Ordering::Release);
@@ -209,14 +325,27 @@ fn try_install_serialized() -> bool {
     write_u64(DVM_GUI_SURFACE_POOL_INVITATION_OFFSET, 0);
     write_u64(DVM_GUI_SURFACE_POOL_READY_ACK_OFFSET, 0);
     write_u64(DVM_GUI_SURFACE_POOL_READY_CONFIRMATION_OFFSET, 0);
+    write_u32(DVM_GPU_ATLAS_CONTEXT_ID_OFFSET, GPU_CONTEXT_ID);
+    write_u32(
+        DVM_GPU_ATLAS_CONTEXT_EPOCH_OFFSET,
+        GPU_INITIAL_CONTEXT_EPOCH,
+    );
+    write_u64(DVM_GPU_ATLAS_PRIME_FENCE_OFFSET, GPU_PRIME_FENCE_VALUE);
+    write_bytes(
+        DVM_GPU_ATLAS_PRIME_COMPLETION_OFFSET,
+        &[0; DVM_GPU_PRIME_COMPLETION_BYTES],
+    );
     INSTALLED.store(true, Ordering::Release);
     crate::debug::info!(
         display,
-        "gui-dvm: cacheable-pixel provider published width={} height={} stride={} slot_bytes={} pixel_phys={:#x}",
+        "gui-dvm: cacheable-pixel provider published width={} height={} stride={} slot_bytes={} gpu_atlas={}x{} gpu_stride={} pixel_phys={:#x}",
         pool.header.width,
         pool.header.height,
         pool.header.stride_bytes,
         pool.header.slot_bytes,
+        pool.atlas_header.atlas_width,
+        pool.atlas_header.atlas_height,
+        pool.atlas_header.atlas_stride_bytes,
         GUI_DVM_PIXEL_REGION_PHYS_ADDR,
     );
     true
@@ -233,6 +362,379 @@ pub(crate) fn ensure_installed_before_present() {
         if retry.is_ok() {
             let _ = try_install();
         }
+    }
+}
+
+pub(crate) fn gpu_atlas_info() -> Option<GpuAtlasInfo> {
+    drain_dvm_control();
+    if !INSTALLED.load(Ordering::Acquire)
+        || TRANSPORT_REVOKED.load(Ordering::Acquire)
+        || !GUI_DVM_PEER_READY.load(Ordering::Acquire)
+    {
+        return None;
+    }
+    let info = GpuAtlasInfo {
+        width: GPU_ATLAS_WIDTH.load(Ordering::Acquire),
+        height: GPU_ATLAS_HEIGHT.load(Ordering::Acquire),
+        stride_bytes: GPU_ATLAS_STRIDE_BYTES.load(Ordering::Acquire),
+        slot_count: DVM_GPU_RENDER_MAX_IN_FLIGHT,
+        context_id: GPU_CONTEXT_ID,
+        context_epoch: GPU_CONTEXT_EPOCH.load(Ordering::Acquire),
+        prime_fence_value: GPU_PRIME_FENCE_VALUE,
+        prime_duration_ns: GPU_PRIME_DURATION_NS.load(Ordering::Acquire),
+    };
+    (info.width != 0
+        && info.height != 0
+        && info.stride_bytes >= info.width.saturating_mul(4)
+        && GPU_COMMAND_OFFSET.load(Ordering::Acquire) != 0
+        && GPU_ATLAS_OFFSET.load(Ordering::Acquire) != 0
+        && GPU_ATLAS_SLOT_BYTES.load(Ordering::Acquire) != 0
+        && info.context_epoch != 0
+        && info.prime_duration_ns != 0)
+        .then_some(info)
+}
+
+/// Publish one immutable private-compositor atlas snapshot and its bounded
+/// command batch. The DVM sees only the host-created slot; neither the user
+/// pointer nor a GPU address crosses the domain boundary.
+pub(crate) fn try_submit_gpu_atlas(
+    src_ptr: *const u8,
+    surface_token: u64,
+    binding_slot: u32,
+    width: u32,
+    height: u32,
+    stride_bytes: u32,
+    damage: &[DvmGpuAtlasDamage],
+    batch: &[u8],
+) -> DvmGpuSubmitOutcome {
+    if !INSTALLED.load(Ordering::Acquire) || TRANSPORT_REVOKED.load(Ordering::Acquire) {
+        return DvmGpuSubmitOutcome::Unavailable;
+    }
+    drain_dvm_control();
+    if TRANSPORT_REVOKED.load(Ordering::Acquire) {
+        return DvmGpuSubmitOutcome::Unavailable;
+    }
+    if !GUI_DVM_PEER_READY.load(Ordering::Acquire) {
+        return DvmGpuSubmitOutcome::Backpressured;
+    }
+    let Some(_submit_guard) = GpuSubmitGuard::try_acquire() else {
+        return DvmGpuSubmitOutcome::Backpressured;
+    };
+    let slot = binding_slot as usize;
+    let initial = GPU_SESSION_SUBMISSIONS.load(Ordering::Acquire) == 0;
+    if slot >= GPU_SLOT_STATE.len()
+        || src_ptr.is_null()
+        || surface_token == 0
+        || width != GPU_ATLAS_WIDTH.load(Ordering::Acquire)
+        || height != GPU_ATLAS_HEIGHT.load(Ordering::Acquire)
+        || stride_bytes != GPU_ATLAS_STRIDE_BYTES.load(Ordering::Acquire)
+        || !dvm_gpu_atlas_damage_is_valid(damage, width, height, initial)
+        || batch.len() < DVM_GPU_RENDER_HEADER_BYTES + DVM_GPU_RENDER_SOURCE_BYTES
+        || batch.len() > DVM_GPU_RENDER_MAX_BATCH_BYTES
+    {
+        return DvmGpuSubmitOutcome::Invalid;
+    }
+    if GPU_SLOT_STATE[slot]
+        .compare_exchange(
+            GPU_SLOT_FREE,
+            GPU_SLOT_WRITING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return DvmGpuSubmitOutcome::Backpressured;
+    }
+
+    let parsed = parse_gpu_batch(
+        batch,
+        surface_token,
+        binding_slot,
+        width,
+        height,
+        stride_bytes,
+    );
+    let Some((header, source)) = parsed else {
+        GPU_SLOT_STATE[slot].store(GPU_SLOT_FREE, Ordering::Release);
+        return DvmGpuSubmitOutcome::Invalid;
+    };
+    if header.context_id != GPU_CONTEXT_ID
+        || header.context_epoch != GPU_CONTEXT_EPOCH.load(Ordering::Acquire)
+    {
+        GPU_SLOT_STATE[slot].store(GPU_SLOT_FREE, Ordering::Release);
+        return DvmGpuSubmitOutcome::Invalid;
+    }
+    let Some(sequence) = next_gpu_sequence() else {
+        GPU_SLOT_STATE[slot].store(GPU_SLOT_FREE, Ordering::Release);
+        let control_sequence = GUI_DVM_ACKED_CONTROL_SEQUENCE.load(Ordering::Acquire);
+        revoke_transport("gpu-submit-sequence-exhausted", control_sequence);
+        return DvmGpuSubmitOutcome::Unavailable;
+    };
+    let Some(next_session_submissions) = GPU_SESSION_SUBMISSIONS
+        .load(Ordering::Acquire)
+        .checked_add(1)
+    else {
+        GPU_SLOT_STATE[slot].store(GPU_SLOT_FREE, Ordering::Release);
+        let control_sequence = GUI_DVM_ACKED_CONTROL_SEQUENCE.load(Ordering::Acquire);
+        revoke_transport("gpu-session-submit-counter-exhausted", control_sequence);
+        return DvmGpuSubmitOutcome::Unavailable;
+    };
+    let submit = DvmGpuAtlasSubmit {
+        slot: binding_slot,
+        batch_bytes: batch.len() as u32,
+        generation: source.generation,
+        sequence,
+        context_epoch: header.context_epoch,
+        flags: DVM_GPU_ATLAS_SUBMIT_FLAG_STAGED_COPY,
+        content_epoch: source.content_epoch,
+        damage_count: damage.len() as u32,
+    };
+    if !submit.matches_batch(header, source)
+        || !copy_gpu_atlas_and_batch(slot, src_ptr, damage, batch, submit)
+    {
+        GPU_SLOT_STATE[slot].store(GPU_SLOT_FREE, Ordering::Release);
+        return DvmGpuSubmitOutcome::Invalid;
+    }
+
+    GPU_SLOT_GENERATION[slot].store(source.generation, Ordering::Release);
+    GPU_SLOT_SEQUENCE[slot].store(sequence, Ordering::Release);
+    GPU_SLOT_CONTEXT_ID[slot].store(header.context_id, Ordering::Release);
+    GPU_SLOT_CONTEXT_EPOCH[slot].store(header.context_epoch, Ordering::Release);
+    GPU_SLOT_SUBMIT_VALUE[slot].store(header.submit_value, Ordering::Release);
+    GPU_SLOT_STATE[slot].store(GPU_SLOT_SUBMITTED, Ordering::Release);
+    let Some(invitation_offset) = dvm_gpu_atlas_invitation_offset(binding_slot) else {
+        GPU_SLOT_STATE[slot].store(GPU_SLOT_FREE, Ordering::Release);
+        return DvmGpuSubmitOutcome::Invalid;
+    };
+    write_u64(invitation_offset, sequence);
+    GPU_SESSION_SUBMISSIONS.store(next_session_submissions, Ordering::Release);
+    fence(Ordering::SeqCst);
+    signal_gpu_dvm();
+    DvmGpuSubmitOutcome::Submitted
+}
+
+pub(crate) fn query_gpu_atlas_completion(binding_slot: u32) -> DvmGpuCompletionOutcome {
+    if !INSTALLED.load(Ordering::Acquire) || TRANSPORT_REVOKED.load(Ordering::Acquire) {
+        return DvmGpuCompletionOutcome::Unavailable;
+    }
+    drain_dvm_control();
+    if TRANSPORT_REVOKED.load(Ordering::Acquire) {
+        return DvmGpuCompletionOutcome::Unavailable;
+    }
+    let slot = binding_slot as usize;
+    if slot >= GPU_SLOT_STATE.len() {
+        return DvmGpuCompletionOutcome::Invalid;
+    }
+    if GPU_SLOT_STATE[slot].load(Ordering::Acquire) != GPU_SLOT_SUBMITTED {
+        return DvmGpuCompletionOutcome::Pending;
+    }
+    let expected_sequence = GPU_SLOT_SEQUENCE[slot].load(Ordering::Acquire);
+    let Some(sequence_offset) = dvm_gpu_atlas_completion_sequence_offset(binding_slot) else {
+        return DvmGpuCompletionOutcome::Invalid;
+    };
+    let observed_sequence = read_u64(sequence_offset);
+    if observed_sequence == 0 || observed_sequence < expected_sequence {
+        return DvmGpuCompletionOutcome::Pending;
+    }
+    if observed_sequence > expected_sequence {
+        let control_sequence = GUI_DVM_ACKED_CONTROL_SEQUENCE.load(Ordering::Acquire);
+        revoke_transport("gpu-completion-sequence-ahead", control_sequence);
+        return DvmGpuCompletionOutcome::Unavailable;
+    }
+    let Some(completion_offset) = dvm_gpu_atlas_completion_offset(binding_slot) else {
+        return DvmGpuCompletionOutcome::Invalid;
+    };
+    let mut bytes = [0_u8; driver_domain_protocol::DVM_GPU_ATLAS_COMPLETION_SLOT_BYTES];
+    if read_bytes(completion_offset, &mut bytes).is_none() {
+        return DvmGpuCompletionOutcome::Unavailable;
+    }
+    fence(Ordering::Acquire);
+    let Some(completion) = DvmGpuAtlasCompletion::decode(&bytes) else {
+        let control_sequence = GUI_DVM_ACKED_CONTROL_SEQUENCE.load(Ordering::Acquire);
+        revoke_transport("gpu-completion-malformed", control_sequence);
+        return DvmGpuCompletionOutcome::Unavailable;
+    };
+    if completion.slot != binding_slot
+        || completion.generation != GPU_SLOT_GENERATION[slot].load(Ordering::Acquire)
+        || completion.sequence != expected_sequence
+        || completion.render.context_id != GPU_SLOT_CONTEXT_ID[slot].load(Ordering::Acquire)
+        || completion.render.context_epoch != GPU_SLOT_CONTEXT_EPOCH[slot].load(Ordering::Acquire)
+        || completion.render.submit_value != GPU_SLOT_SUBMIT_VALUE[slot].load(Ordering::Acquire)
+    {
+        let control_sequence = GUI_DVM_ACKED_CONTROL_SEQUENCE.load(Ordering::Acquire);
+        revoke_transport("gpu-completion-capability-mismatch", control_sequence);
+        return DvmGpuCompletionOutcome::Unavailable;
+    }
+    let Some(ack_offset) = dvm_gpu_atlas_completion_ack_offset(binding_slot) else {
+        return DvmGpuCompletionOutcome::Invalid;
+    };
+    write_u64(ack_offset, expected_sequence);
+    GPU_SLOT_GENERATION[slot].store(0, Ordering::Release);
+    GPU_SLOT_SEQUENCE[slot].store(0, Ordering::Release);
+    GPU_SLOT_CONTEXT_ID[slot].store(0, Ordering::Release);
+    GPU_SLOT_CONTEXT_EPOCH[slot].store(0, Ordering::Release);
+    GPU_SLOT_SUBMIT_VALUE[slot].store(0, Ordering::Release);
+    GPU_SLOT_STATE[slot].store(GPU_SLOT_FREE, Ordering::Release);
+    DvmGpuCompletionOutcome::Completed(bytes)
+}
+
+fn parse_gpu_batch(
+    batch: &[u8],
+    surface_token: u64,
+    binding_slot: u32,
+    width: u32,
+    height: u32,
+    stride_bytes: u32,
+) -> Option<(DvmGpuRenderBatchHeader, DvmGpuRenderSource)> {
+    let header_bytes: [u8; DVM_GPU_RENDER_HEADER_BYTES] =
+        batch.get(..DVM_GPU_RENDER_HEADER_BYTES)?.try_into().ok()?;
+    let header = DvmGpuRenderBatchHeader::decode(&header_bytes)?;
+    if header.source_count != 1 || header.encoded_batch_len()? != batch.len() {
+        return None;
+    }
+    let source_end = DVM_GPU_RENDER_HEADER_BYTES.checked_add(DVM_GPU_RENDER_SOURCE_BYTES)?;
+    let source_bytes: [u8; DVM_GPU_RENDER_SOURCE_BYTES] = batch
+        .get(DVM_GPU_RENDER_HEADER_BYTES..source_end)?
+        .try_into()
+        .ok()?;
+    let source = DvmGpuRenderSource::decode(&source_bytes)?;
+    (source.token == surface_token
+        && source.binding_slot == binding_slot
+        && source.width == width
+        && source.height == height
+        && source.stride_bytes == stride_bytes)
+        .then_some((header, source))
+}
+
+fn next_gpu_sequence() -> Option<u64> {
+    let mut current = GPU_NEXT_SEQUENCE.load(Ordering::Acquire);
+    loop {
+        let next = current.checked_add(1)?;
+        match GPU_NEXT_SEQUENCE.compare_exchange_weak(
+            current,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(next),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn copy_gpu_atlas_and_batch(
+    slot: usize,
+    src_ptr: *const u8,
+    damage: &[DvmGpuAtlasDamage],
+    batch: &[u8],
+    submit: DvmGpuAtlasSubmit,
+) -> bool {
+    let pixels = SHARED_PIXEL_ADDR.load(Ordering::Acquire);
+    let atlas_base = GPU_ATLAS_OFFSET.load(Ordering::Acquire);
+    let atlas_slot_bytes = GPU_ATLAS_SLOT_BYTES.load(Ordering::Acquire);
+    let command_base = GPU_COMMAND_OFFSET.load(Ordering::Acquire);
+    let Some(atlas_offset) = atlas_slot_bytes
+        .checked_mul(slot as u64)
+        .and_then(|offset| atlas_base.checked_add(offset))
+    else {
+        return false;
+    };
+    let Some(command_offset) = DVM_GPU_ATLAS_COMMAND_SLOT_BYTES
+        .checked_mul(slot as u64)
+        .and_then(|offset| command_base.checked_add(offset))
+    else {
+        return false;
+    };
+    let Some(damage_offset) = command_offset.checked_add(DVM_GPU_ATLAS_SUBMIT_BYTES as u64) else {
+        return false;
+    };
+    let Some(damage_bytes) = (damage.len() as u64).checked_mul(DVM_GPU_ATLAS_DAMAGE_BYTES as u64)
+    else {
+        return false;
+    };
+    let Some(batch_offset) = damage_offset.checked_add(damage_bytes) else {
+        return false;
+    };
+    let Some(batch_end) = batch_offset.checked_add(batch.len() as u64) else {
+        return false;
+    };
+    let Some(command_end) = command_offset.checked_add(DVM_GPU_ATLAS_COMMAND_SLOT_BYTES) else {
+        return false;
+    };
+    let region_bytes = GUI_DVM_PIXEL_REGION_BYTES;
+    if pixels == 0
+        || atlas_slot_bytes == 0
+        || atlas_offset
+            .checked_add(atlas_slot_bytes)
+            .is_none_or(|end| end > region_bytes)
+        || batch_end > region_bytes
+        || batch_end > command_end
+    {
+        return false;
+    }
+    let stride_bytes = GPU_ATLAS_STRIDE_BYTES.load(Ordering::Acquire) as usize;
+    let atlas_destination = (pixels as *mut u8).wrapping_add(atlas_offset as usize);
+    for rect in damage {
+        let Some(row_bytes) = (rect.width as usize).checked_mul(size_of::<u32>()) else {
+            return false;
+        };
+        let Some(x_bytes) = (rect.x as usize).checked_mul(size_of::<u32>()) else {
+            return false;
+        };
+        for row in rect.y as usize..(rect.y + rect.height) as usize {
+            let Some(row_offset) = row
+                .checked_mul(stride_bytes)
+                .and_then(|offset| offset.checked_add(x_bytes))
+            else {
+                return false;
+            };
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    src_ptr.add(row_offset),
+                    atlas_destination.add(row_offset),
+                    row_bytes,
+                );
+            }
+        }
+    }
+    unsafe {
+        for (index, rect) in damage.iter().copied().enumerate() {
+            let encoded = rect.encode();
+            ptr::copy_nonoverlapping(
+                encoded.as_ptr(),
+                (pixels as *mut u8)
+                    .add(damage_offset as usize + index * DVM_GPU_ATLAS_DAMAGE_BYTES),
+                encoded.len(),
+            );
+        }
+        ptr::copy_nonoverlapping(
+            batch.as_ptr(),
+            (pixels as *mut u8).add(batch_offset as usize),
+            batch.len(),
+        );
+        let encoded = submit.encode();
+        ptr::copy_nonoverlapping(
+            encoded.as_ptr(),
+            (pixels as *mut u8).add(command_offset as usize),
+            encoded.len(),
+        );
+    }
+    fence(Ordering::SeqCst);
+    true
+}
+
+fn signal_gpu_dvm() {
+    let doorbell = SHARED_DOORBELL_ADDR.load(Ordering::Acquire);
+    if doorbell == 0 || !GUI_DVM_PEER_READY.load(Ordering::Acquire) {
+        return;
+    }
+    fence(Ordering::SeqCst);
+    let value = (GUI_DVM_PEER_ID << 16).to_le();
+    unsafe {
+        (doorbell as *mut u8)
+            .add(IVSHMEM_DOORBELL_OFFSET)
+            .cast::<u32>()
+            .write_volatile(value);
     }
 }
 
@@ -541,9 +1043,23 @@ fn drain_dvm_control() {
     if GUI_DVM_OFFLINE_IRQ_PENDING.swap(false, Ordering::AcqRel) {
         GUI_DVM_PEER_READY.store(false, Ordering::Release);
         GUI_DVM_EXPECTED_INVITATION.store(0, Ordering::Release);
+        GPU_PRIME_DURATION_NS.store(0, Ordering::Release);
+        GPU_SESSION_SUBMISSIONS.store(0, Ordering::Release);
+        reset_gpu_slots();
         // A future relay must not mistake an old confirmation for approval of
         // a reused generation after DVM restart.
         write_u64(DVM_GUI_SURFACE_POOL_READY_CONFIRMATION_OFFSET, 0);
+        write_bytes(
+            DVM_GPU_ATLAS_PRIME_COMPLETION_OFFSET,
+            &[0; DVM_GPU_PRIME_COMPLETION_BYTES],
+        );
+        let next_epoch = GPU_CONTEXT_EPOCH.load(Ordering::Acquire).checked_add(1);
+        let Some(next_epoch) = next_epoch else {
+            revoke_transport("gpu-context-epoch-exhausted", 0);
+            return;
+        };
+        GPU_CONTEXT_EPOCH.store(next_epoch, Ordering::Release);
+        write_u32(DVM_GPU_ATLAS_CONTEXT_EPOCH_OFFSET, next_epoch);
     }
     if !GUI_DVM_CONTROL_IRQ_PENDING.swap(false, Ordering::AcqRel) {
         return;
@@ -551,6 +1067,11 @@ fn drain_dvm_control() {
     let expected = GUI_DVM_EXPECTED_INVITATION.load(Ordering::Acquire);
     let ready_ack = read_u64(DVM_GUI_SURFACE_POOL_READY_ACK_OFFSET);
     if expected != 0 && expected == ready_ack {
+        let Some(prime) = read_gpu_prime_completion() else {
+            revoke_transport("gpu-prime-completion-invalid", ready_ack);
+            return;
+        };
+        GPU_PRIME_DURATION_NS.store(prime.duration_ns, Ordering::Release);
         GUI_DVM_PEER_READY.store(true, Ordering::Release);
         write_u64(DVM_GUI_SURFACE_POOL_READY_CONFIRMATION_OFFSET, expected);
         // The first host present can legitimately precede Linux-DVM boot. In
@@ -596,7 +1117,39 @@ fn revoke_transport(reason: &str, sequence: u64) {
     GUI_DVM_EXPECTED_INVITATION.store(0, Ordering::Release);
     GUI_DVM_ACKED_CONTROL_SEQUENCE.store(sequence, Ordering::Release);
     write_u64(DVM_GUI_SURFACE_POOL_HOST_ACK_OFFSET, sequence);
+    reset_gpu_slots();
     crate::debug::warn!(display, "gui-dvm: transport revoked reason={}", reason);
+}
+
+fn reset_gpu_slots() {
+    for slot in 0..GPU_SLOT_STATE.len() {
+        GPU_SLOT_GENERATION[slot].store(0, Ordering::Release);
+        GPU_SLOT_SEQUENCE[slot].store(0, Ordering::Release);
+        GPU_SLOT_CONTEXT_ID[slot].store(0, Ordering::Release);
+        GPU_SLOT_CONTEXT_EPOCH[slot].store(0, Ordering::Release);
+        GPU_SLOT_SUBMIT_VALUE[slot].store(0, Ordering::Release);
+        GPU_SLOT_STATE[slot].store(GPU_SLOT_FREE, Ordering::Release);
+        if let Some(offset) = dvm_gpu_atlas_invitation_offset(slot as u32) {
+            write_u64(offset, 0);
+        }
+        if let Some(offset) = dvm_gpu_atlas_completion_sequence_offset(slot as u32) {
+            write_u64(offset, 0);
+        }
+        if let Some(offset) = dvm_gpu_atlas_completion_ack_offset(slot as u32) {
+            write_u64(offset, 0);
+        }
+    }
+}
+
+fn read_gpu_prime_completion() -> Option<DvmGpuPrimeCompletion> {
+    let mut bytes = [0_u8; DVM_GPU_PRIME_COMPLETION_BYTES];
+    read_bytes(DVM_GPU_ATLAS_PRIME_COMPLETION_OFFSET, &mut bytes)?;
+    let completion = DvmGpuPrimeCompletion::decode(&bytes)?;
+    (completion.context_id == GPU_CONTEXT_ID
+        && completion.context_epoch == GPU_CONTEXT_EPOCH.load(Ordering::Acquire)
+        && completion.status == DvmGpuPrimeCompletionStatus::Ready
+        && completion.fence_value == GPU_PRIME_FENCE_VALUE)
+        .then_some(completion)
 }
 
 fn signal_gui_dvm(generation: u64) {
@@ -655,6 +1208,10 @@ fn write_u64(offset: usize, value: u64) {
     write_bytes(offset, &value.to_le_bytes());
 }
 
+fn write_u32(offset: usize, value: u32) {
+    write_bytes(offset, &value.to_le_bytes());
+}
+
 fn read_u64(offset: usize) -> u64 {
     let mut bytes = [0_u8; size_of::<u64>()];
     if read_bytes(offset, &mut bytes).is_none() {
@@ -709,6 +1266,13 @@ pub(crate) fn on_framebuffer_installed(framebuffer_addr: u64) {
         SHARED_HEADER_ADDR.store(0, Ordering::Release);
         SHARED_PIXEL_ADDR.store(0, Ordering::Release);
         SHARED_DOORBELL_ADDR.store(0, Ordering::Release);
+        GPU_COMMAND_OFFSET.store(0, Ordering::Release);
+        GPU_ATLAS_OFFSET.store(0, Ordering::Release);
+        GPU_ATLAS_SLOT_BYTES.store(0, Ordering::Release);
+        GPU_ATLAS_WIDTH.store(0, Ordering::Release);
+        GPU_ATLAS_HEIGHT.store(0, Ordering::Release);
+        GPU_ATLAS_STRIDE_BYTES.store(0, Ordering::Release);
+        reset_gpu_slots();
         INSTALLED.store(false, Ordering::Release);
         TRANSPORT_REVOKED.store(true, Ordering::Release);
     }
@@ -881,16 +1445,43 @@ fn find_ivshmem_gui_pool() -> Option<MappedGuiDvmPool> {
             release_gui_mappings(control, doorbell);
             return false;
         }
+        let Some(atlas_header) = read_atlas_pool_header(control) else {
+            release_gui_mappings(control, doorbell);
+            return false;
+        };
+        let Some(pixel_atlas_header) = read_atlas_pool_header(pixels) else {
+            release_gui_mappings(control, doorbell);
+            return false;
+        };
+        if pixel_atlas_header != atlas_header
+            || !atlas_header_fits_resource(atlas_header, GUI_DVM_PIXEL_REGION_BYTES)
+        {
+            release_gui_mappings(control, doorbell);
+            return false;
+        }
         found = Some(MappedGuiDvmPool {
             device,
             control,
             pixels,
             doorbell,
             header,
+            atlas_header,
         });
         true
     });
     found
+}
+
+fn read_atlas_pool_header(mapped: *const u8) -> Option<DvmGpuAtlasPoolHeader> {
+    let mut bytes = [0_u8; DvmGpuAtlasPoolHeader::encoded_len()];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = unsafe {
+            mapped
+                .add(DVM_GPU_ATLAS_POOL_HEADER_OFFSET + index)
+                .read_volatile()
+        };
+    }
+    DvmGpuAtlasPoolHeader::decode(&bytes)
 }
 
 fn read_pool_header(mapped: *const u8) -> Option<DvmGuiSurfacePoolHeader> {
@@ -911,6 +1502,14 @@ fn header_fits_resource(header: DvmGuiSurfacePoolHeader, resource_len: u64) -> b
     last_slot
         .checked_add(header.slot_bytes)
         .is_some_and(|end| end <= header.region_bytes)
+}
+
+fn atlas_header_fits_resource(header: DvmGpuAtlasPoolHeader, resource_len: u64) -> bool {
+    header.region_bytes <= resource_len
+        && header
+            .atlas_slot_offset(DVM_GPU_RENDER_MAX_IN_FLIGHT - 1)
+            .and_then(|offset| offset.checked_add(header.atlas_slot_bytes))
+            .is_some_and(|end| end <= header.region_bytes)
 }
 
 fn warn_rejected(reason: &str) {

@@ -9,6 +9,23 @@ pub const DISPLAY_INFO_FLAG_PRIMARY_PROVIDER: u32 = 1 << 1;
 /// The physical scanout is owned by a driver-domain relay. It is usable for
 /// normal desktop presentation but is not an attested trusted-UI channel.
 pub const DISPLAY_INFO_FLAG_DVM_SCANOUT: u32 = 1 << 2;
+/// A private uiserver-only fixed atlas compositor transport is available.
+/// This does not expose an application graphics ABI.
+pub const DISPLAY_INFO_FLAG_GPU_COMPOSITOR: u32 = 1 << 3;
+pub const DISPLAY_SURFACE_FLAG_GPU_ATLAS: u32 = 1;
+pub const DISPLAY_GPU_ABI_VERSION: u32 = 3;
+pub const DISPLAY_GPU_INFO_FLAG_STAGED_COPY: u32 = 1;
+pub const DISPLAY_GPU_INFO_FLAG_DIRECT_DMABUF: u32 = 1 << 1;
+pub const DISPLAY_GPU_SUBMIT_FLAG_STAGED_COPY: u32 = 1;
+pub const DISPLAY_GPU_COMPLETION_BYTES: usize = 256;
+pub const DISPLAY_SURFACE_MAX_WIDTH: u32 = 7680;
+pub const DISPLAY_SURFACE_MAX_HEIGHT: u32 = 4320;
+/// Padded linear scanout pitch accepted by the private compositor surface ABI.
+/// A provider owns the actual pitch; width * bytes-per-pixel is only its floor.
+pub const DISPLAY_SURFACE_MAX_STRIDE_BYTES: u32 =
+    (DISPLAY_SURFACE_MAX_WIDTH * 4).div_ceil(4096) * 4096;
+pub const DISPLAY_SURFACE_MAX_MAPPING_BYTES: u64 =
+    DISPLAY_SURFACE_MAX_STRIDE_BYTES as u64 * DISPLAY_SURFACE_MAX_HEIGHT as u64;
 
 pub const PIXEL_FORMAT_BGRA8888: u32 = ui::PIXEL_FORMAT_BGRA8888;
 pub const INPUT_KIND_KEYBOARD: u16 = ui::INPUT_KIND_KEYBOARD;
@@ -87,6 +104,7 @@ pub struct DisplaySurfaceCreate {
     pub handle: u32,
     pub bytes_per_pixel: u32,
     pub stride_bytes: u32,
+    /// Request: zero. GPU-atlas response: the fixed physical binding slot.
     pub reserved: u32,
     pub mapping_len: u64,
     pub generation: u64,
@@ -136,6 +154,65 @@ pub struct DisplayPresentRectRequest {
     pub height: u32,
 }
 
+/// Private compositor limits returned only for the uiserver display path.
+/// Applications continue to use Wayland surfaces and never see GPU commands.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DisplayGpuInfo {
+    pub version: u32,
+    pub flags: u32,
+    pub atlas_width: u32,
+    pub atlas_height: u32,
+    pub atlas_stride_bytes: u32,
+    pub slot_count: u32,
+    pub max_commands: u32,
+    pub max_batch_bytes: u32,
+    pub generation: u64,
+    pub context_id: u32,
+    pub context_epoch: u32,
+    pub prime_fence_value: u64,
+    pub prime_duration_ns: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DisplayGpuDamage {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DisplayGpuSubmitRequest {
+    pub surface_handle: u32,
+    pub flags: u32,
+    pub batch_ptr: u64,
+    pub batch_len: u32,
+    pub damage_count: u32,
+    pub damage_ptr: u64,
+    pub reserved: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct DisplayGpuCompletionQuery {
+    pub surface_handle: u32,
+    pub reserved: u32,
+    pub completion: [u8; DISPLAY_GPU_COMPLETION_BYTES],
+}
+
+impl Default for DisplayGpuCompletionQuery {
+    fn default() -> Self {
+        Self {
+            surface_handle: 0,
+            reserved: 0,
+            completion: [0; DISPLAY_GPU_COMPLETION_BYTES],
+        }
+    }
+}
+
 impl DisplayPresentRectRequest {
     pub const fn new(surface_handle: u32, x: u32, y: u32, width: u32, height: u32) -> Self {
         Self {
@@ -155,3 +232,8 @@ pub const DISPLAY_IOCTL_CREATE_SURFACE: u64 =
 pub const DISPLAY_IOCTL_PRESENT: u64 = ioctl::iow::<DisplayPresentRequest>(DISPLAY_IOCTL_TYPE, 3);
 pub const DISPLAY_IOCTL_PRESENT_RECT: u64 =
     ioctl::iow::<DisplayPresentRectRequest>(DISPLAY_IOCTL_TYPE, 4);
+pub const DISPLAY_IOCTL_GPU_GET_INFO: u64 = ioctl::ior::<DisplayGpuInfo>(DISPLAY_IOCTL_TYPE, 5);
+pub const DISPLAY_IOCTL_GPU_SUBMIT: u64 =
+    ioctl::iow::<DisplayGpuSubmitRequest>(DISPLAY_IOCTL_TYPE, 6);
+pub const DISPLAY_IOCTL_GPU_QUERY_COMPLETION: u64 =
+    ioctl::iowr::<DisplayGpuCompletionQuery>(DISPLAY_IOCTL_TYPE, 7);

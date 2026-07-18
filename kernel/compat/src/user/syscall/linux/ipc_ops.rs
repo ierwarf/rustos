@@ -236,6 +236,62 @@ fn service_index(service_id: u64) -> Option<usize> {
     (index < MAX_SERVICE_ENDPOINTS).then_some(index)
 }
 
+fn process_owns_live_service_endpoint(process_id: u64, service_id: u64) -> bool {
+    let Some(index) = service_index(service_id) else {
+        return false;
+    };
+    SERVICE_ENDPOINTS[index].load(Ordering::Acquire) != 0
+        && SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire) == process_id
+        && !multitask::is_user_process_exiting(process_id)
+}
+
+/// Cross-class handoff is scheduler authority. Accept it only from the live
+/// netd endpoint and only on an exact compact-v2 local-socket wait/data reply.
+fn netd_response_requests_latency_handoff(response: &[u8], is_live_netd_owner: bool) -> bool {
+    if !is_live_netd_owner || response.len() < NETD_IPC_RESPONSE_HEADER_SIZE {
+        return false;
+    }
+    let version = u16::from_ne_bytes([response[0], response[1]]);
+    let op = u16::from_ne_bytes([response[2], response[3]]);
+    let status = i32::from_ne_bytes([response[4], response[5], response[6], response[7]]);
+    let reserved0 = u32::from_ne_bytes([response[8], response[9], response[10], response[11]]);
+    let value = u64::from_ne_bytes([
+        response[16],
+        response[17],
+        response[18],
+        response[19],
+        response[20],
+        response[21],
+        response[22],
+        response[23],
+    ]);
+    let payload_len =
+        u32::from_ne_bytes([response[24], response[25], response[26], response[27]]) as usize;
+    let flags = u32::from_ne_bytes([response[28], response[29], response[30], response[31]]);
+    let authorized_op = matches!(
+        op,
+        SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET
+            | SYSCALL_OFFLOAD_OP_LINUX_SENDTO
+            | SYSCALL_OFFLOAD_OP_LINUX_SENDMSG
+            | SYSCALL_OFFLOAD_OP_LINUX_RECVFROM
+            | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG
+    );
+    let successful_event_or_transfer = status == 0 && value != 0;
+    let completed_nonblocking_recv_drain = status == LINUX_EAGAIN as i32
+        && value == 0
+        && payload_len == 0
+        && matches!(
+            op,
+            SYSCALL_OFFLOAD_OP_LINUX_RECVFROM | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG
+        );
+    version == NETD_IPC_ABI_VERSION
+        && authorized_op
+        && (successful_event_or_transfer || completed_nonblocking_recv_drain)
+        && reserved0 == 0
+        && flags == NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF
+        && NETD_IPC_RESPONSE_HEADER_SIZE.checked_add(payload_len) == Some(response.len())
+}
+
 fn register_service_endpoint_waiter(waiter: ServiceEndpointWaiter) -> bool {
     let mut waiters = SERVICE_ENDPOINT_WAITERS.lock();
     waiters.retain(|current| current.task_id != waiter.task_id);
@@ -1105,6 +1161,9 @@ pub(super) fn syscall_linux_rustos_ipc_reply(
     let Some(receiver_process_id) = multitask::current_user_process_id() else {
         return linux_errno(LINUX_EINVAL);
     };
+    let live_netd_owner = process_owns_live_service_endpoint(receiver_process_id, IPC_SERVICE_NETD);
+    let latency_handoff =
+        netd_response_requests_latency_handoff(response.as_slice(), live_netd_owner);
     let task_id = match kernel_ipc_runtime::api::complete_endpoint_reply_for_process(
         KernelReplyHandle::from_raw(reply),
         receiver_process_id,
@@ -1119,8 +1178,15 @@ pub(super) fn syscall_linux_rustos_ipc_reply(
     // Direct hand-back to the caller: the service is about to wait on its
     // endpoint again, so donate the remaining quantum to the original caller
     // instead of round-robining away from a freshly-completed reply.
-    multitask::set_next_pick_hint(task_id);
-    multitask::request_deferred_reschedule();
+    if latency_handoff && multitask::set_next_latency_pick_hint(task_id) {
+        // The generic deferred-reschedule bit is intentionally cleared on
+        // syscall exit. Arm the existing user-return PIT edge so this trusted
+        // event wakeup is observed promptly without switching away from a
+        // live kernel syscall continuation.
+        multitask::request_user_return_reschedule();
+    } else {
+        multitask::set_next_pick_hint(task_id);
+    }
     log_slow_ipc_reply(
         "reply",
         reply,
@@ -1965,4 +2031,53 @@ fn log_slow_ipc_reply(
             response_len,
         );
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ready_netd_poll_response() -> [u8; NETD_IPC_RESPONSE_HEADER_SIZE] {
+        let mut response = [0_u8; NETD_IPC_RESPONSE_HEADER_SIZE];
+        response[0..2].copy_from_slice(&NETD_IPC_ABI_VERSION.to_ne_bytes());
+        response[2..4].copy_from_slice(&SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET.to_ne_bytes());
+        response[16..24].copy_from_slice(&1_u64.to_ne_bytes());
+        response[28..32].copy_from_slice(&NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF.to_ne_bytes());
+        response
+    }
+
+    #[test]
+    fn only_live_netd_authorized_socket_response_requests_latency_handoff() {
+        let response = ready_netd_poll_response();
+        assert!(netd_response_requests_latency_handoff(&response, true));
+        assert!(!netd_response_requests_latency_handoff(&response, false));
+
+        let mut wrong_op = response;
+        wrong_op[2..4].copy_from_slice(&SYSCALL_OFFLOAD_OP_LINUX_BIND.to_ne_bytes());
+        assert!(!netd_response_requests_latency_handoff(&wrong_op, true));
+
+        let mut local_data = response;
+        local_data[2..4].copy_from_slice(&SYSCALL_OFFLOAD_OP_LINUX_RECVMSG.to_ne_bytes());
+        assert!(netd_response_requests_latency_handoff(&local_data, true));
+
+        let mut no_readiness = response;
+        no_readiness[16..24].copy_from_slice(&0_u64.to_ne_bytes());
+        assert!(!netd_response_requests_latency_handoff(&no_readiness, true));
+
+        let mut completed_drain = no_readiness;
+        completed_drain[2..4].copy_from_slice(&SYSCALL_OFFLOAD_OP_LINUX_RECVMSG.to_ne_bytes());
+        completed_drain[4..8].copy_from_slice(&(LINUX_EAGAIN as i32).to_ne_bytes());
+        assert!(netd_response_requests_latency_handoff(
+            &completed_drain,
+            true
+        ));
+
+        let mut unknown_flags = response;
+        unknown_flags[28..32]
+            .copy_from_slice(&(NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF | (1 << 31)).to_ne_bytes());
+        assert!(!netd_response_requests_latency_handoff(
+            &unknown_flags,
+            true
+        ));
+    }
 }

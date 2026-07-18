@@ -1086,30 +1086,54 @@ pub fn call_inputd_read_request(request: &InputdIpcRequest) -> Result<InputdRead
 
 pub fn call_netd_ipc_request(request: &NetdIpcRequest) -> Result<NetdIpcResponse, i64> {
     let start_ticks = crate::arch::rtc::ticks();
-    let response = ipc_ops::call_service_endpoint(IPC_SERVICE_NETD, as_bytes(request))?;
+    let request_len = NETD_IPC_REQUEST_HEADER_SIZE
+        .checked_add(request.payload_len as usize)
+        .filter(|len| *len <= size_of::<NetdIpcRequest>())
+        .ok_or(LINUX_EINVAL)?;
+    let response =
+        ipc_ops::call_service_endpoint(IPC_SERVICE_NETD, &as_bytes(request)[..request_len])?;
+    let elapsed_ms = ticks_elapsed_ms(start_ticks, crate::arch::rtc::ticks());
     log_slow_service_call(
         "netd",
         request.op,
-        ticks_elapsed_ms(start_ticks, crate::arch::rtc::ticks()),
+        elapsed_ms,
         request.pid,
         request.tid,
         response.len() as i64,
         None,
     );
-    if response.len() != size_of::<NetdIpcResponse>() {
-        return Err(LINUX_EINVAL);
-    }
-    let response = read_unaligned::<NetdIpcResponse>(response.as_slice());
-    if response.version != NETD_IPC_ABI_VERSION
-        || response.op != request.op
-        || response.reserved0 != 0
+    if response.len() < NETD_IPC_RESPONSE_HEADER_SIZE
+        || response.len() > size_of::<NetdIpcResponse>()
     {
         return Err(LINUX_EINVAL);
     }
-    if response.status != 0 {
-        return Err(response.status.unsigned_abs() as i64);
+    let mut decoded = NetdIpcResponse::default();
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            response.as_ptr(),
+            (&mut decoded as *mut NetdIpcResponse).cast::<u8>(),
+            response.len(),
+        );
     }
-    Ok(response)
+    let expected_len = NETD_IPC_RESPONSE_HEADER_SIZE
+        .checked_add(decoded.payload_len as usize)
+        .ok_or(LINUX_EINVAL)?;
+    if response.len() != expected_len
+        || decoded.payload_len as usize > NETD_IPC_PAYLOAD_CAPACITY
+        || decoded.version != NETD_IPC_ABI_VERSION
+        || decoded.op != request.op
+        || decoded.reserved0 != 0
+        || decoded.reserved1 & !NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF != 0
+    {
+        return Err(LINUX_EINVAL);
+    }
+    if decoded.status != 0 {
+        return Err(decoded.status.unsigned_abs() as i64);
+    }
+    // The scheduling hint is consumed at the kernel IPC boundary and is not
+    // part of the Linux socket result exposed to compatibility callers.
+    decoded.reserved1 = 0;
+    Ok(decoded)
 }
 
 pub fn ensure_vfs_status(response: &VfsIpcResponse) -> Result<(), i64> {

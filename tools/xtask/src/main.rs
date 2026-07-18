@@ -1,6 +1,7 @@
 mod build;
 mod cli;
 mod config;
+mod dev;
 mod kvm;
 mod layering;
 mod package_manifest;

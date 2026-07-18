@@ -282,8 +282,16 @@ fn ioctl_display_device(
     arg: u64,
 ) -> Result<u64, DeviceSysopError> {
     match request {
-        device_abi::DISPLAY_IOCTL_PRESENT => ioctl_display_present(process_state, arg),
-        device_abi::DISPLAY_IOCTL_PRESENT_RECT => ioctl_display_present_rect(process_state, arg),
+        device_abi::DISPLAY_IOCTL_GET_INFO
+        | device_abi::DISPLAY_IOCTL_CREATE_SURFACE
+        | device_abi::DISPLAY_IOCTL_PRESENT
+        | device_abi::DISPLAY_IOCTL_PRESENT_RECT
+        | device_abi::DISPLAY_IOCTL_GPU_GET_INFO
+        | device_abi::DISPLAY_IOCTL_GPU_SUBMIT
+        | device_abi::DISPLAY_IOCTL_GPU_QUERY_COMPLETION => {
+            kernel_io_manager::api::device::ioctl_display_from_user(process_state, request, arg)
+                .map_err(map_device_error)
+        }
         DRM_IOCTL_VERSION => drm_ioctl_version(process_state, arg),
         DRM_IOCTL_GET_CAP => drm_ioctl_get_cap(process_state, arg),
         DRM_IOCTL_MODE_GETRESOURCES => drm_ioctl_get_resources(process_state, arg),
@@ -644,46 +652,6 @@ fn copy_user_u32_array(
     Ok(())
 }
 
-fn ioctl_display_present(
-    process_state: &mut UserProcessState,
-    arg: u64,
-) -> Result<u64, DeviceSysopError> {
-    let request = read_process_struct::<device_abi::DisplayPresentRequest>(process_state, arg)?;
-    if request.reserved != 0 {
-        return Err(DeviceSysopError::InvalidArgument);
-    }
-    let surface = process_surface(process_state, request.surface_handle)?;
-    present_surface(surface, None)?;
-    Ok(0)
-}
-
-fn ioctl_display_present_rect(
-    process_state: &mut UserProcessState,
-    arg: u64,
-) -> Result<u64, DeviceSysopError> {
-    let request = read_process_struct::<device_abi::DisplayPresentRectRequest>(process_state, arg)?;
-    if request.reserved != 0 || request.width == 0 || request.height == 0 {
-        return Err(DeviceSysopError::InvalidArgument);
-    }
-    let surface = process_surface(process_state, request.surface_handle)?;
-    let x_end = request
-        .x
-        .checked_add(request.width)
-        .ok_or(DeviceSysopError::InvalidArgument)?;
-    let y_end = request
-        .y
-        .checked_add(request.height)
-        .ok_or(DeviceSysopError::InvalidArgument)?;
-    if x_end > surface.width() || y_end > surface.height() {
-        return Err(DeviceSysopError::InvalidArgument);
-    }
-    present_surface(
-        surface,
-        Some((request.x, request.y, request.width, request.height)),
-    )?;
-    Ok(0)
-}
-
 fn process_surface(
     process_state: &UserProcessState,
     surface_fd: u32,
@@ -692,60 +660,6 @@ fn process_surface(
         Some(KernelHandle::DisplaySurface(surface)) => Ok(*surface),
         Some(_) => Err(DeviceSysopError::Unsupported),
         None => Err(DeviceSysopError::BadFileDescriptor),
-    }
-}
-
-fn present_surface(
-    surface: DisplaySurfaceHandle,
-    rect: Option<(u32, u32, u32, u32)>,
-) -> Result<(), DeviceSysopError> {
-    // Fast path: use the cached kernel pointer stashed when the shared region
-    // was first installed. This avoids contending for the global IPC objects
-    // mutex (which also disables interrupts) on every frame.
-    let (ptr, len) = surface
-        .shared_region_kernel_mapping()
-        .or_else(|| {
-            surface
-                .shared_region()
-                .and_then(crate::ipc::map_shared_region)
-        })
-        .ok_or(DeviceSysopError::InvalidArgument)?;
-    let frame_len =
-        usize::try_from(surface.frame_len()).map_err(|_| DeviceSysopError::InvalidArgument)?;
-    if len < frame_len {
-        return Err(DeviceSysopError::InvalidArgument);
-    }
-    let width = surface.width() as usize;
-    let height = surface.height() as usize;
-    let stride = surface.stride_bytes() as usize;
-    let presented = match rect {
-        Some((x, y, rect_width, rect_height)) => {
-            kernel_io_manager::api::io::gui::present_userspace_frame_rect_from_kernel_bgra8888(
-                ptr.cast_const(),
-                width,
-                height,
-                stride,
-                x as usize,
-                y as usize,
-                rect_width as usize,
-                rect_height as usize,
-            )
-        }
-        None => kernel_io_manager::api::io::gui::present_userspace_frame_from_kernel_bgra8888(
-            ptr.cast_const(),
-            width,
-            height,
-            stride,
-        ),
-    };
-    match presented {
-        kernel_io_manager::api::io::gui::GuiPresentOutcome::Presented => Ok(()),
-        kernel_io_manager::api::io::gui::GuiPresentOutcome::Backpressured => {
-            Err(DeviceSysopError::TryAgain)
-        }
-        kernel_io_manager::api::io::gui::GuiPresentOutcome::Unavailable => {
-            Err(DeviceSysopError::DisplayUnavailable)
-        }
     }
 }
 

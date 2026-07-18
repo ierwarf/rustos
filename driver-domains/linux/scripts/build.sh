@@ -16,6 +16,7 @@ readonly DL_DIR="$OUT_DIR/dl"
 readonly SRC_DIR="$OUT_DIR/src"
 readonly BUILD_DIR="$OUT_DIR/buildroot-output"
 readonly ARTIFACT_DIR="$OUT_DIR/artifacts"
+readonly DEV_OUTPUT_MARKER="$BUILD_DIR/.rustos-dvm-dev-output-v1"
 readonly LIBELF_SYSROOT="${RUSTOS_DVM_LIBELF_SYSROOT:-}"
 BUILDROOT_DIR=""
 LIBELF_INCLUDE_DIR=""
@@ -260,6 +261,65 @@ make_buildroot() {
         BR2_EXTERNAL="$ROOT" BR2_DL_DIR="$DL_DIR" "$@"
 }
 
+make_release_rootfs() {
+    local xz_threads=$JOBS
+
+    # Buildroot deliberately disables threaded xz for reproducible builds
+    # because its default block size depends on compression settings and host
+    # parallelism.  Fixing the block size makes the stream independent of the
+    # worker count while retaining the existing .cpio.xz boot/artifact ABI.
+    # +1 requests the multi-threaded stream format even on a one-job builder.
+    if test "$xz_threads" -eq 1; then
+        xz_threads=+1
+    fi
+    make_buildroot -j "$JOBS" \
+        "ROOTFS_CPIO_COMPRESS_CMD=xz -T $xz_threads --block-size=4MiB --memlimit-compress=70% -1 -C crc32 -c"
+}
+
+require_warm_dvm_configuration() {
+    local config_stamp="$BUILD_DIR/.rustos-config-input-v2.sha256"
+    local buildroot_marker="$BUILDROOT_DIR/.rustos-buildroot-sha256"
+    local current_config
+
+    # This is an inner-loop command.  It must not fetch, configure, clean, or
+    # silently rebuild a host toolchain: those integration operations can turn
+    # a small relay edit into an hour-long build.
+    test -d "$BUILDROOT_DIR" || die "no cached Buildroot source; run make build once before dev-*"
+    test -f "$buildroot_marker" && test "$(cat "$buildroot_marker")" = "$BUILDROOT_SHA256" \
+        || die "cached Buildroot source differs from sources.lock; run make build"
+    test -f "$BUILD_DIR/.config" && test -f "$config_stamp" \
+        || die "no cached DVM configuration; run make build once before dev-*"
+    require_kernel_build_headers
+    current_config="$(config_input_hash)"
+    test "$(cat "$config_stamp")" = "$current_config" \
+        || die "DVM configuration or toolchain inputs changed; run make build, not dev-*"
+    test -d "$BUILD_DIR/host/bin" \
+        || die "no cached DVM host toolchain; run make build, not dev-*"
+}
+
+mark_dev_output_dirty() {
+    local service=$1
+    local tmp="${DEV_OUTPUT_MARKER}.tmp"
+
+    mkdir -p "$(dirname -- "$DEV_OUTPUT_MARKER")"
+    {
+        printf 'format=rustos-dvm-dev-output-v1\n'
+        printf 'service=%s\n' "$service"
+        printf 'input-sha256=%s\n' "$(local_service_input_hash "$service")"
+    } >"$tmp"
+    mv -- "$tmp" "$DEV_OUTPUT_MARKER"
+}
+
+clear_dev_output_marker() {
+    rm -f -- "$DEV_OUTPUT_MARKER"
+}
+
+assert_release_output_is_current() {
+    if test -f "$DEV_OUTPUT_MARKER"; then
+        die "DVM target contains a dev-* package build; run the matching rebuild-* target before release verification"
+    fi
+}
+
 configure() {
     local stamp="$BUILD_DIR/.rustos-config-input-v2.sha256"
     local current
@@ -357,13 +417,14 @@ build() {
     configure
     verify_config
     prepare_mutable_inputs
-    make_buildroot -j "$JOBS"
+    make_release_rootfs
     verify_config
     verify_kernel_config
     verify_module_signatures
     write_manifest
     verify_release_artifacts
     commit_mutable_input_stamps
+    clear_dev_output_marker
 }
 
 rebuild_service() {
@@ -378,13 +439,33 @@ rebuild_service() {
     verify_config
     make_buildroot "${service}-dirclean"
     rm -f -- "$BUILD_DIR/images/rootfs.cpio.xz"
-    make_buildroot -j "$JOBS"
+    make_release_rootfs
     verify_config
     verify_kernel_config
     verify_module_signatures
     write_manifest
     verify_release_artifacts
     commit_mutable_input_stamps
+    clear_dev_output_marker
+}
+
+dev_build_service() {
+    local service=$1
+    local started_seconds=$SECONDS
+
+    case "$service" in
+        rustos-dvm-agent|rustos-dvm-display|rustos-dvm-net) ;;
+        *) die "unknown local DVM service: $service" ;;
+    esac
+    require_warm_dvm_configuration
+    # SITE_METHOD=local snapshots source during extraction. Removing only this
+    # package refreshes that snapshot, compiles it, and installs it into
+    # target/. It does not regenerate rootfs.cpio.xz or release artifacts.
+    make_buildroot "${service}-dirclean"
+    make_buildroot -j "$JOBS" "$service"
+    mark_dev_output_dirty "$service"
+    printf 'rustos-linux-dvm: dev package compile complete service=%s elapsed_s=%s release-artifacts=stale\n' \
+        "$service" "$((SECONDS - started_seconds))"
 }
 
 print_artifacts() {
@@ -456,7 +537,20 @@ main() {
             require_kernel_build_headers
             rebuild_service rustos-dvm-net
             ;;
+        dev-agent)
+            require_tool make
+            dev_build_service rustos-dvm-agent
+            ;;
+        dev-display)
+            require_tool make
+            dev_build_service rustos-dvm-display
+            ;;
+        dev-net)
+            require_tool make
+            dev_build_service rustos-dvm-net
+            ;;
         verify)
+            assert_release_output_is_current
             verify_config
             verify_kernel_config
             verify_module_signatures

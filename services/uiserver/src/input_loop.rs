@@ -13,13 +13,19 @@ use crate::app::{
 };
 use crate::profile;
 use crate::sys::{
-    boot_line, diag_line, read_input, require_background_thread_class, wait_for_input_ready,
-    InputEvent, INPUT_ACTION_NONE, INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION,
+    boot_line, diag_line, read_input, require_background_thread_class, InputEvent,
+    INPUT_ACTION_NONE, INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION,
 };
 use crate::wayland::WaylandCompositor;
 
 const SLOW_INPUT_READ_THRESHOLD_MS: u128 = 50;
-const INPUT_READER_IDLE_SLEEP: std::time::Duration = std::time::Duration::from_millis(1);
+// Until inputd exports a service-owned readiness object, its MSI-X ingestion
+// worker can move the last ring0-visible record into the service queue between
+// a generic poll probe and waiter registration.  The uiserver reader therefore
+// uses its already-nonblocking native input fd directly on a short cumulative
+// cadence.  This stays off the UI thread and bounds the pre-ABI lost-wake
+// window without granting uiserver transport-consumer authority.
+const INPUT_READER_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(4);
 const INPUT_READER_QUEUE_CAPACITY: usize = INPUT_EVENT_BATCH * 64;
 const INPUT_READER_WATCHDOG_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 const INPUT_READER_PANIC_THRESHOLD_MS: u64 = 3_000;
@@ -156,6 +162,34 @@ impl InputReaderStats {
     }
 }
 
+fn next_input_probe_deadline(previous: Instant, now: Instant) -> Instant {
+    let scheduled = previous
+        .checked_add(INPUT_READER_PROBE_INTERVAL)
+        .unwrap_or(now);
+    if scheduled > now {
+        scheduled
+    } else {
+        now.checked_add(INPUT_READER_PROBE_INTERVAL).unwrap_or(now)
+    }
+}
+
+fn wait_for_next_input_probe(stats: &InputReaderStats, deadline: &mut Instant) {
+    let now = Instant::now();
+    *deadline = next_input_probe_deadline(*deadline, now);
+    stats
+        .wait_started_ms
+        .store(stats.elapsed_ms(), Ordering::Release);
+    stats.wait_active.store(true, Ordering::Release);
+    stats.wait_attempts.fetch_add(1, Ordering::Relaxed);
+    if let Some(duration) = deadline.checked_duration_since(now) {
+        if !duration.is_zero() {
+            thread::sleep(duration);
+        }
+    }
+    stats.wait_active.store(false, Ordering::Release);
+    stats.completed_waits.fetch_add(1, Ordering::Relaxed);
+}
+
 pub(crate) fn start_input_reader(input_fds: Vec<OwnedFd>) -> InputReader {
     let (sender, receiver) = mpsc::sync_channel::<InputEvent>(INPUT_READER_QUEUE_CAPACITY);
     let (wake_sender, wake_receiver) = mpsc::sync_channel::<()>(1);
@@ -166,32 +200,11 @@ pub(crate) fn start_input_reader(input_fds: Vec<OwnedFd>) -> InputReader {
         .spawn(move || {
             boot_line("uiserver: input reader worker enter");
             let mut events = [InputEvent::default(); INPUT_EVENT_BATCH];
-            let mut first_wait = true;
+            let mut first_read = true;
+            let mut next_probe_deadline = Instant::now();
             loop {
-                reader_stats
-                    .wait_started_ms
-                    .store(reader_stats.elapsed_ms(), Ordering::Release);
-                reader_stats.wait_active.store(true, Ordering::Release);
-                reader_stats.wait_attempts.fetch_add(1, Ordering::Relaxed);
-                if first_wait {
-                    boot_line("uiserver: input reader first poll begin");
-                }
-                let wait_result = wait_for_input_ready(&input_fds);
-                if first_wait {
-                    boot_line("uiserver: input reader first poll returned");
-                    first_wait = false;
-                }
-                reader_stats.wait_active.store(false, Ordering::Release);
-                reader_stats.completed_waits.fetch_add(1, Ordering::Relaxed);
-                match wait_result {
-                    Ok(true) => {}
-                    Ok(false) => continue,
-                    Err(errno) => {
-                        reader_stats.errors.fetch_add(1, Ordering::Relaxed);
-                        diag_line(format!("uiserver: input readiness wait failed errno={errno}"));
-                        thread::sleep(INPUT_READER_IDLE_SLEEP);
-                        continue;
-                    }
+                if first_read {
+                    boot_line("uiserver: input reader first nonblocking read begin");
                 }
                 reader_stats
                     .read_started_ms
@@ -200,6 +213,10 @@ pub(crate) fn start_input_reader(input_fds: Vec<OwnedFd>) -> InputReader {
                 reader_stats.read_attempts.fetch_add(1, Ordering::Relaxed);
                 let read_started = Instant::now();
                 let result = read_input(&input_fds, &mut events);
+                if first_read {
+                    boot_line("uiserver: input reader first nonblocking read returned");
+                    first_read = false;
+                }
                 reader_stats.read_active.store(false, Ordering::Release);
                 reader_stats.completed_reads.fetch_add(1, Ordering::Relaxed);
                 let read_count = match result {
@@ -207,7 +224,7 @@ pub(crate) fn start_input_reader(input_fds: Vec<OwnedFd>) -> InputReader {
                     Err(errno) => {
                         reader_stats.errors.fetch_add(1, Ordering::Relaxed);
                         diag_line(format!("uiserver: input reader failed errno={errno}"));
-                        thread::sleep(INPUT_READER_IDLE_SLEEP);
+                        wait_for_next_input_probe(&reader_stats, &mut next_probe_deadline);
                         continue;
                     }
                 };
@@ -221,7 +238,7 @@ pub(crate) fn start_input_reader(input_fds: Vec<OwnedFd>) -> InputReader {
                     ));
                 }
                 if read_count == 0 {
-                    thread::sleep(INPUT_READER_IDLE_SLEEP);
+                    wait_for_next_input_probe(&reader_stats, &mut next_probe_deadline);
                     continue;
                 }
                 reader_stats
@@ -277,7 +294,7 @@ pub(crate) fn start_input_reader(input_fds: Vec<OwnedFd>) -> InputReader {
             let snapshot = watchdog_stats.snapshot();
             if snapshot.wait_active && snapshot.wait_elapsed_ms >= INPUT_READER_PANIC_THRESHOLD_MS {
                 diag_line(format!(
-                    "uiserver input watchdog panic: wait_for_input_ready blocked elapsed_ms={} wait_attempts={} completed_waits={} read_attempts={} completed_reads={} raw_events={} delivered_events={} queue_drops={} slow_reads={} errors={}",
+                    "uiserver input watchdog panic: bounded probe sleep stalled elapsed_ms={} wait_attempts={} completed_waits={} read_attempts={} completed_reads={} raw_events={} delivered_events={} queue_drops={} slow_reads={} errors={}",
                     snapshot.wait_elapsed_ms,
                     snapshot.wait_attempts,
                     snapshot.completed_waits,
@@ -592,7 +609,10 @@ pub(crate) fn sleep_until_input_or(events: &InputReader, deadline: Instant) {
 
 #[cfg(test)]
 mod tests {
-    use super::{InputReaderBatchCoalescer, INPUT_EVENT_BATCH};
+    use super::{
+        next_input_probe_deadline, InputReaderBatchCoalescer, INPUT_EVENT_BATCH,
+        INPUT_READER_PROBE_INTERVAL,
+    };
     use crate::sys::{
         InputEvent, INPUT_ACTION_NONE, INPUT_ACTION_PRESSED, INPUT_KIND_KEYBOARD,
         INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION,
@@ -666,5 +686,27 @@ mod tests {
         assert_eq!(events[0].kind, INPUT_KIND_POINTER_MOTION);
         assert_eq!(events[1].kind, INPUT_KIND_KEYBOARD);
         assert_eq!(events[2].kind, INPUT_KIND_POINTER_MOTION);
+    }
+
+    #[test]
+    fn input_reader_probe_deadline_does_not_accumulate_missed_slots() {
+        let base = std::time::Instant::now();
+        let missed = base + INPUT_READER_PROBE_INTERVAL * 4;
+
+        assert_eq!(
+            next_input_probe_deadline(base, missed),
+            missed + INPUT_READER_PROBE_INTERVAL
+        );
+    }
+
+    #[test]
+    fn input_reader_probe_deadline_preserves_the_next_future_slot() {
+        let base = std::time::Instant::now();
+        let now = base + INPUT_READER_PROBE_INTERVAL / 2;
+
+        assert_eq!(
+            next_input_probe_deadline(base, now),
+            base + INPUT_READER_PROBE_INTERVAL
+        );
     }
 }

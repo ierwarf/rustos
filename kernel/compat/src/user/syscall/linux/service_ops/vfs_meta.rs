@@ -521,6 +521,8 @@ fn ioctl_is_direct_display_present(request_number: u64) -> bool {
         request_number,
         rustos_user_abi::device::DISPLAY_IOCTL_PRESENT
             | rustos_user_abi::device::DISPLAY_IOCTL_PRESENT_RECT
+            | rustos_user_abi::device::DISPLAY_IOCTL_GPU_SUBMIT
+            | rustos_user_abi::device::DISPLAY_IOCTL_GPU_QUERY_COMPLETION
     )
 }
 
@@ -531,6 +533,9 @@ fn ioctl_is_display_policy_request(request_number: u64) -> bool {
             | rustos_user_abi::device::DISPLAY_IOCTL_CREATE_SURFACE
             | rustos_user_abi::device::DISPLAY_IOCTL_PRESENT
             | rustos_user_abi::device::DISPLAY_IOCTL_PRESENT_RECT
+            | rustos_user_abi::device::DISPLAY_IOCTL_GPU_GET_INFO
+            | rustos_user_abi::device::DISPLAY_IOCTL_GPU_SUBMIT
+            | rustos_user_abi::device::DISPLAY_IOCTL_GPU_QUERY_COMPLETION
     )
 }
 
@@ -1186,6 +1191,15 @@ mod tests {
         ));
         assert!(ioctl_is_display_policy_request(
             rustos_user_abi::device::DISPLAY_IOCTL_CREATE_SURFACE
+        ));
+        assert!(ioctl_is_display_policy_request(
+            rustos_user_abi::device::DISPLAY_IOCTL_GPU_GET_INFO
+        ));
+        assert!(ioctl_is_display_policy_request(
+            rustos_user_abi::device::DISPLAY_IOCTL_GPU_SUBMIT
+        ));
+        assert!(ioctl_is_display_policy_request(
+            rustos_user_abi::device::DISPLAY_IOCTL_GPU_QUERY_COMPLETION
         ));
         assert!(!ioctl_is_display_policy_request(
             rustos_user_abi::console::CONSOLE_IOCTL_GET_STATE

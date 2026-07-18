@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io::Write;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant as StdInstant};
 
@@ -19,6 +19,8 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_NETD_OP_SOCKET_NAMESPACE, COMMERCIAL_MAX_NETD_OP_SOCKET_OPTIONS,
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
     COMMERCIAL_MAX_PROTOCOL_NETD, IPC_SERVICE_NETD, NETD_IPC_ABI_VERSION,
+    NETD_IPC_REQUEST_HEADER_SIZE, NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF,
+    NETD_IPC_RESPONSE_HEADER_SIZE, NETD_POLL_MODE_QUERY, NETD_POLL_MODE_WAIT,
     NETD_RECVMSG_PAYLOAD_HEADER_SIZE, NETD_SENDMSG_PAYLOAD_HEADER_SIZE, NET_BROKER_OP_PACKET_RX,
     NET_BROKER_OP_PACKET_STATUS, NET_BROKER_OP_PACKET_TX, NET_BROKER_PACKET_MTU,
     NET_BROKER_PACKET_STATUS_ACTIVE, NET_BROKER_PACKET_STATUS_AWAITING_AUTHENTICATED_CONTROL,
@@ -42,14 +44,22 @@ use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
 const RECV_BACKOFF: Duration = Duration::from_millis(1);
-const MAX_PENDING_INET_REQUESTS: usize = 32;
-static PENDING_INET_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+/// Fixed endpoint front-end pool. Short local-socket requests from independent
+/// clients must not queue behind one receiver, while shared protocol state
+/// remains serialized by `NetState` and blocking INET work stays in its
+/// separate bounded pool.
+const NETD_REQUEST_WORKERS: usize = 4;
+const BLOCKING_WORKER_COUNT: usize = 8;
+const MAX_PENDING_BLOCKING_REQUESTS: usize = 32;
+static PENDING_BLOCKING_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_BLOCKING_WORKERS: AtomicUsize = AtomicUsize::new(0);
 const MAX_LISTEN_BACKLOG: usize = 128;
 const SOCKET_BUFFER_CAPACITY: usize = 1024 * 1024;
 const SOCKET_CONTROL_BUFFER_CAPACITY: usize = 64 * 1024;
 const INET_TCP_BUFFER_CAPACITY: usize = 16 * 1024;
 const INET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const INET_IO_POLL_BUDGET: usize = 256;
+const LOCAL_SOCKET_POLL_WAIT_BUDGET: Duration = Duration::from_secs(5);
 // A mapped aperture can appear before the L0-authenticated control relay has
 // delivered SESSION_START. Delay only that explicitly transitional state so a
 // boot-time client does not race into a fabricated permanent ENODEV. A truly
@@ -91,7 +101,23 @@ fn main() {
 }
 
 fn serve(endpoint: u64) {
+    start_blocking_workers();
+    for worker_index in 1..NETD_REQUEST_WORKERS {
+        let name = format!("netd-rpc-{worker_index}");
+        if thread::Builder::new()
+            .name(name)
+            .spawn(move || serve_request_loop(endpoint))
+            .is_err()
+        {
+            debug_line("netd: request worker unavailable");
+        }
+    }
+    serve_request_loop(endpoint);
+}
+
+fn serve_request_loop(endpoint: u64) {
     loop {
+        service_local_poll_waiters();
         let mut request = NetdIpcRequest::default();
         let mut reply_cap = 0_u64;
         let received = syscall4(
@@ -114,11 +140,15 @@ fn serve(endpoint: u64) {
             let commercial_request = unsafe {
                 &*((&request as *const NetdIpcRequest).cast::<CommercialMaxProtocolRequest>())
             };
-            let reply = reply_commercial_request(reply_cap, commercial_request);
-            if reply < 0 {
-                let _ = writeln!(std::io::stderr(), "netd: reply failed errno={}", -reply);
+            if commercial_request.header.version == COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
+                && commercial_request.header.protocol == COMMERCIAL_MAX_PROTOCOL_NETD
+            {
+                let reply = reply_commercial_request(reply_cap, commercial_request);
+                if reply < 0 {
+                    let _ = writeln!(std::io::stderr(), "netd: reply failed errno={}", -reply);
+                }
+                continue;
             }
-            continue;
         }
 
         let mut response = NetdIpcResponse {
@@ -127,28 +157,68 @@ fn serve(endpoint: u64) {
             ..NetdIpcResponse::default()
         };
         response.status = match validate_request(received as usize, &request) {
-            Ok(()) if is_blocking_inet_request(&request) => {
-                if spawn_blocking_inet_request(request, reply_cap) {
+            Ok(()) if is_deferred_local_poll_request(&request) => {
+                let status = handle_poll_socket(&request, &mut response);
+                if status == 0 && response.value == 0 {
+                    if defer_local_poll_request(request, reply_cap) {
+                        continue;
+                    }
+                    libc::EAGAIN
+                } else {
+                    if status == 0 {
+                        response.reserved1 = NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF;
+                    }
+                    status
+                }
+            }
+            Ok(()) if is_blocking_request(&request) => {
+                if enqueue_blocking_request(request, reply_cap) {
                     continue;
                 }
                 libc::EAGAIN
             }
-            Ok(()) => dispatch_request(&request, &mut response),
+            Ok(()) => {
+                let status = dispatch_request(&request, &mut response);
+                if local_socket_reply_requests_latency_handoff(&request, &response, status) {
+                    response.reserved1 = NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF;
+                }
+                status
+            }
             Err(errno) => errno,
         };
-        let reply = syscall3(
-            SYS_RUSTOS_IPC_REPLY,
-            reply_cap,
-            (&response as *const NetdIpcResponse) as u64,
-            size_of::<NetdIpcResponse>() as u64,
-        );
+        let reply = reply_netd_response(reply_cap, &response);
         if reply < 0 {
             let _ = writeln!(std::io::stderr(), "netd: reply failed errno={}", -reply);
         }
+        service_local_poll_waiters();
     }
 }
 
-fn is_blocking_inet_request(request: &NetdIpcRequest) -> bool {
+fn reply_netd_response(reply_cap: u64, response: &NetdIpcResponse) -> i64 {
+    let Some(response_len) = NETD_IPC_RESPONSE_HEADER_SIZE
+        .checked_add(response.payload_len as usize)
+        .filter(|len| *len <= size_of::<NetdIpcResponse>())
+    else {
+        return -(libc::EINVAL as i64);
+    };
+    syscall3(
+        SYS_RUSTOS_IPC_REPLY,
+        reply_cap,
+        (response as *const NetdIpcResponse) as u64,
+        response_len as u64,
+    )
+}
+
+fn is_deferred_local_poll_request(request: &NetdIpcRequest) -> bool {
+    request.op == SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET
+        && request.arg2 == NETD_POLL_MODE_WAIT
+        && !inet_socket_exists(request.socket_token)
+}
+
+fn is_blocking_request(request: &NetdIpcRequest) -> bool {
+    if request.op == SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET && request.arg2 == NETD_POLL_MODE_WAIT {
+        return inet_socket_exists(request.socket_token);
+    }
     let inet_operation = match request.op {
         SYSCALL_OFFLOAD_OP_LINUX_CONNECT => sockaddr_family(request) == Some(linux_abi::AF_INET),
         SYSCALL_OFFLOAD_OP_LINUX_SENDTO
@@ -162,40 +232,200 @@ fn is_blocking_inet_request(request: &NetdIpcRequest) -> bool {
         && request_msg_flags(request) & linux_abi::MSG_DONTWAIT == 0
 }
 
-fn spawn_blocking_inet_request(request: NetdIpcRequest, reply_cap: u64) -> bool {
-    if PENDING_INET_REQUESTS
+fn local_socket_reply_requests_latency_handoff(
+    request: &NetdIpcRequest,
+    response: &NetdIpcResponse,
+    status: i32,
+) -> bool {
+    if inet_socket_exists(request.socket_token) {
+        return false;
+    }
+    let is_send_or_recv = matches!(
+        request.op,
+        SYSCALL_OFFLOAD_OP_LINUX_SENDTO
+            | SYSCALL_OFFLOAD_OP_LINUX_SENDMSG
+            | SYSCALL_OFFLOAD_OP_LINUX_RECVFROM
+            | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG
+    );
+    if status == 0 && response.value != 0 && is_send_or_recv {
+        return true;
+    }
+    status == libc::EAGAIN
+        && matches!(
+            request.op,
+            SYSCALL_OFFLOAD_OP_LINUX_RECVFROM | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG
+        )
+        && consume_local_recv_drain_handoff(request.socket_token)
+}
+
+fn consume_local_recv_drain_handoff(socket_token: u64) -> bool {
+    let mut state = net_state().lock().unwrap();
+    let Some(socket) = state.sockets.get_mut(&socket_token) else {
+        return false;
+    };
+    let UnixSocketState::Connected(connected) = &mut socket.state else {
+        return false;
+    };
+    core::mem::take(&mut connected.recv_drain_handoff_armed)
+}
+
+struct BlockingRequest {
+    request: Box<NetdIpcRequest>,
+    reply_cap: u64,
+}
+
+struct BlockingRequestQueue {
+    requests: Mutex<VecDeque<BlockingRequest>>,
+    available: Condvar,
+}
+
+fn blocking_request_queue() -> &'static BlockingRequestQueue {
+    static QUEUE: OnceLock<BlockingRequestQueue> = OnceLock::new();
+    QUEUE.get_or_init(|| BlockingRequestQueue {
+        requests: Mutex::new(VecDeque::new()),
+        available: Condvar::new(),
+    })
+}
+
+fn start_blocking_workers() {
+    let queue = blocking_request_queue();
+    for index in 0..BLOCKING_WORKER_COUNT {
+        let spawned = thread::Builder::new()
+            .name(format!("netd-wait-{index}"))
+            .spawn(blocking_worker_loop);
+        if spawned.is_ok() {
+            ACTIVE_BLOCKING_WORKERS.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    if ACTIVE_BLOCKING_WORKERS.load(Ordering::Acquire) == 0 {
+        debug_line("netd: blocking worker pool unavailable");
+    } else {
+        queue.available.notify_all();
+    }
+}
+
+fn enqueue_blocking_request(request: NetdIpcRequest, reply_cap: u64) -> bool {
+    if ACTIVE_BLOCKING_WORKERS.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    if PENDING_BLOCKING_REQUESTS
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
-            (pending < MAX_PENDING_INET_REQUESTS).then_some(pending + 1)
+            (pending < MAX_PENDING_BLOCKING_REQUESTS).then_some(pending + 1)
         })
         .is_err()
     {
         return false;
     }
-    let spawned = thread::Builder::new()
-        .name(String::from("netd-inet-wait"))
-        .spawn(move || {
-            let mut response = NetdIpcResponse {
-                version: NETD_IPC_ABI_VERSION,
-                op: request.op,
-                ..NetdIpcResponse::default()
-            };
-            response.status = run_blocking_inet_request(&request, &mut response);
-            let _ = syscall3(
-                SYS_RUSTOS_IPC_REPLY,
-                reply_cap,
-                (&response as *const NetdIpcResponse) as u64,
-                size_of::<NetdIpcResponse>() as u64,
-            );
-            PENDING_INET_REQUESTS.fetch_sub(1, Ordering::AcqRel);
-        });
-    if spawned.is_err() {
-        PENDING_INET_REQUESTS.fetch_sub(1, Ordering::AcqRel);
+    let queue = blocking_request_queue();
+    let Ok(mut requests) = queue.requests.lock() else {
+        PENDING_BLOCKING_REQUESTS.fetch_sub(1, Ordering::AcqRel);
         return false;
-    }
+    };
+    requests.push_back(BlockingRequest {
+        request: Box::new(request),
+        reply_cap,
+    });
+    drop(requests);
+    queue.available.notify_one();
     true
 }
 
-fn run_blocking_inet_request(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
+fn blocking_worker_loop() {
+    let queue = blocking_request_queue();
+    loop {
+        let job = {
+            let mut requests = queue.requests.lock().unwrap();
+            while requests.is_empty() {
+                requests = queue.available.wait(requests).unwrap();
+            }
+            requests
+                .pop_front()
+                .expect("blocking request queue was nonempty")
+        };
+        let mut response = NetdIpcResponse {
+            version: NETD_IPC_ABI_VERSION,
+            op: job.request.op,
+            ..NetdIpcResponse::default()
+        };
+        response.status = run_blocking_request(&job.request, &mut response);
+        let _ = reply_netd_response(job.reply_cap, &response);
+        PENDING_BLOCKING_REQUESTS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct DeferredLocalPoll {
+    request: Box<NetdIpcRequest>,
+    reply_cap: u64,
+    deadline: StdInstant,
+}
+
+fn local_poll_waiters() -> &'static Mutex<VecDeque<DeferredLocalPoll>> {
+    static WAITERS: OnceLock<Mutex<VecDeque<DeferredLocalPoll>>> = OnceLock::new();
+    WAITERS.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+fn defer_local_poll_request(request: NetdIpcRequest, reply_cap: u64) -> bool {
+    let Ok(mut waiters) = local_poll_waiters().lock() else {
+        return false;
+    };
+    if waiters.len() >= MAX_PENDING_BLOCKING_REQUESTS {
+        return false;
+    }
+    waiters.push_back(DeferredLocalPoll {
+        request: Box::new(request),
+        reply_cap,
+        deadline: StdInstant::now() + LOCAL_SOCKET_POLL_WAIT_BUDGET,
+    });
+    true
+}
+
+/// Local AF_UNIX state is owned by this service loop, so readiness can be
+/// completed here without creating or waking an unrelated worker task. This
+/// preserves the IPC reply handoff from netd directly to the waiting client.
+fn service_local_poll_waiters() {
+    let pending = {
+        let Ok(mut waiters) = local_poll_waiters().lock() else {
+            return;
+        };
+        std::mem::take(&mut *waiters)
+    };
+    if pending.is_empty() {
+        return;
+    }
+
+    let now = StdInstant::now();
+    let mut still_waiting = VecDeque::new();
+    for waiter in pending {
+        let mut response = NetdIpcResponse {
+            version: NETD_IPC_ABI_VERSION,
+            op: waiter.request.op,
+            ..NetdIpcResponse::default()
+        };
+        response.status = if now >= waiter.deadline {
+            libc::EAGAIN
+        } else {
+            handle_poll_socket(&waiter.request, &mut response)
+        };
+        if response.status == 0 && response.value == 0 {
+            still_waiting.push_back(waiter);
+            continue;
+        }
+        if response.status == 0 {
+            response.reserved1 = NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF;
+        }
+        let _ = reply_netd_response(waiter.reply_cap, &response);
+    }
+    if !still_waiting.is_empty() {
+        if let Ok(mut waiters) = local_poll_waiters().lock() {
+            waiters.extend(still_waiting);
+        }
+    }
+}
+
+fn run_blocking_request(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
+    if request.op == SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET {
+        return wait_for_socket_readiness(request, response);
+    }
     if request.op == SYSCALL_OFFLOAD_OP_LINUX_CONNECT {
         let mut status = begin_inet_connect(request);
         let deadline = StdInstant::now() + INET_CONNECT_TIMEOUT;
@@ -265,7 +495,10 @@ fn dispatch_request(request: &NetdIpcRequest, response: &mut NetdIpcResponse) ->
 }
 
 fn validate_request(received: usize, request: &NetdIpcRequest) -> Result<(), i32> {
-    if received != size_of::<NetdIpcRequest>()
+    let expected_len = NETD_IPC_REQUEST_HEADER_SIZE.checked_add(request.payload_len as usize);
+    if received < NETD_IPC_REQUEST_HEADER_SIZE
+        || expected_len != Some(received)
+        || received > size_of::<NetdIpcRequest>()
         || request.version != NETD_IPC_ABI_VERSION
         || request.flags != 0
         || request.reserved1 != 0
@@ -273,6 +506,11 @@ fn validate_request(received: usize, request: &NetdIpcRequest) -> Result<(), i32
         || request.pid == 0
         || request.tid == 0
         || request.payload_len as usize > request.payload.len()
+    {
+        return Err(libc::EINVAL);
+    }
+    if request.op == SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET
+        && !matches!(request.arg2, NETD_POLL_MODE_QUERY | NETD_POLL_MODE_WAIT)
     {
         return Err(libc::EINVAL);
     }
@@ -326,6 +564,10 @@ struct ConnectedState {
     peer_read_closed: bool,
     peer_write_closed: bool,
     peer_credentials: Credentials,
+    /// A successful nonblocking read arms exactly one follow-up EAGAIN
+    /// handoff so drain-until-empty event loops can return to userspace
+    /// without granting a boost to an arbitrary empty-read spin loop.
+    recv_drain_handoff_armed: bool,
     recv_closed: bool,
     send_closed: bool,
 }
@@ -614,6 +856,7 @@ fn handle_socketpair(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -
                 peer_read_closed: false,
                 peer_write_closed: false,
                 peer_credentials: credentials,
+                recv_drain_handoff_armed: false,
                 recv_closed: false,
                 send_closed: false,
             }),
@@ -637,6 +880,7 @@ fn handle_socketpair(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -
                 peer_read_closed: false,
                 peer_write_closed: false,
                 peer_credentials: credentials,
+                recv_drain_handoff_armed: false,
                 recv_closed: false,
                 send_closed: false,
             }),
@@ -699,6 +943,7 @@ fn handle_close(request: &NetdIpcRequest) -> i32 {
             }
         }
     }
+    drop(state);
     0
 }
 
@@ -780,6 +1025,7 @@ fn handle_connect(request: &NetdIpcRequest) -> i32 {
         peer_read_closed: false,
         peer_write_closed: false,
         peer_credentials: credentials,
+        recv_drain_handoff_armed: false,
         recv_closed: false,
         send_closed: false,
     });
@@ -817,11 +1063,13 @@ fn handle_connect(request: &NetdIpcRequest) -> i32 {
                 peer_read_closed: false,
                 peer_write_closed: false,
                 peer_credentials: credentials,
+                recv_drain_handoff_armed: false,
                 recv_closed: false,
                 send_closed: false,
             }),
         },
     );
+    drop(state);
     0
 }
 
@@ -1156,12 +1404,19 @@ fn handle_poll_socket(request: &NetdIpcRequest, response: &mut NetdIpcResponse) 
     if inet_socket_exists(request.socket_token) {
         return handle_inet_poll(request, response);
     }
-    let requested = request.arg1 as u32;
-    let mut revents = 0_u32;
     let state = net_state().lock().unwrap();
-    let Some(socket) = state.sockets.get(&request.socket_token) else {
-        return libc::EBADF;
-    };
+    match unix_socket_revents(&state, request.socket_token, request.arg1 as u32) {
+        Ok(revents) => {
+            response.value = revents as u64;
+            0
+        }
+        Err(errno) => errno,
+    }
+}
+
+fn unix_socket_revents(state: &NetState, token: u64, requested: u32) -> Result<u32, i32> {
+    let socket = state.sockets.get(&token).ok_or(libc::EBADF)?;
+    let mut revents = 0_u32;
     match &socket.state {
         UnixSocketState::Listening { pending, .. } => {
             if requested & linux_abi::POLLIN as u32 != 0 && !pending.is_empty() {
@@ -1208,8 +1463,21 @@ fn handle_poll_socket(request: &NetdIpcRequest, response: &mut NetdIpcResponse) 
             revents |= linux_abi::POLLERR as u32;
         }
     }
-    response.value = revents as u64;
-    0
+    Ok(revents)
+}
+
+fn wait_for_socket_readiness(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
+    if !inet_socket_exists(request.socket_token) {
+        return libc::EBADF;
+    }
+    for _ in 0..INET_IO_POLL_BUDGET {
+        let status = handle_inet_poll(request, response);
+        if status != 0 || response.value != 0 {
+            return status;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    libc::EAGAIN
 }
 
 fn handle_getsockname(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
@@ -1329,21 +1597,38 @@ fn handle_shutdown(request: &NetdIpcRequest) -> i32 {
         stack.poll_budget(8);
         return 0;
     }
-    let Some(socket) = state.sockets.get_mut(&request.socket_token) else {
-        return libc::EBADF;
-    };
-    let UnixSocketState::Connected(connected) = &mut socket.state else {
-        return libc::ENOTCONN;
-    };
-    match request.arg1 {
-        linux_abi::SHUT_RD => connected.recv_closed = true,
-        linux_abi::SHUT_WR => connected.send_closed = true,
-        linux_abi::SHUT_RDWR => {
-            connected.recv_closed = true;
-            connected.send_closed = true;
+    let peer = {
+        let Some(socket) = state.sockets.get_mut(&request.socket_token) else {
+            return libc::EBADF;
+        };
+        let UnixSocketState::Connected(connected) = &mut socket.state else {
+            return libc::ENOTCONN;
+        };
+        match request.arg1 {
+            linux_abi::SHUT_RD => connected.recv_closed = true,
+            linux_abi::SHUT_WR => connected.send_closed = true,
+            linux_abi::SHUT_RDWR => {
+                connected.recv_closed = true;
+                connected.send_closed = true;
+            }
+            _ => return libc::EINVAL,
         }
-        _ => return libc::EINVAL,
+        connected.peer
+    };
+    if let Some(peer_socket) = state.sockets.get_mut(&peer) {
+        if let UnixSocketState::Connected(peer_connected) = &mut peer_socket.state {
+            match request.arg1 {
+                linux_abi::SHUT_RD => peer_connected.peer_read_closed = true,
+                linux_abi::SHUT_WR => peer_connected.peer_write_closed = true,
+                linux_abi::SHUT_RDWR => {
+                    peer_connected.peer_read_closed = true;
+                    peer_connected.peer_write_closed = true;
+                }
+                _ => unreachable!(),
+            }
+        }
     }
+    drop(state);
     0
 }
 
@@ -1405,6 +1690,7 @@ fn send_socket_message(
             .saturating_add(control.len());
         peer_connected.incoming_controls.push_back(control.to_vec());
     }
+    drop(state);
     Ok(write_len)
 }
 
@@ -1430,6 +1716,8 @@ fn recv_socket_bytes(request: &NetdIpcRequest, dest: &mut [u8]) -> Result<usize,
     for slot in &mut dest[..count] {
         *slot = connected.incoming_bytes.pop_front().unwrap_or_default();
     }
+    connected.recv_drain_handoff_armed = true;
+    drop(state);
     Ok(count)
 }
 
@@ -1466,9 +1754,11 @@ fn recvmsg_control_payload(request: &NetdIpcRequest) -> Result<Vec<u8>, i32> {
         return Err(libc::ENOTCONN);
     };
     let mut control = connected.incoming_controls.pop_front().unwrap_or_default();
+    let peer_credentials = connected.peer_credentials;
     connected.incoming_control_bytes = connected
         .incoming_control_bytes
         .saturating_sub(control.len());
+    drop(state);
     if !passcred {
         return Ok(control);
     }
@@ -1481,9 +1771,9 @@ fn recvmsg_control_payload(request: &NetdIpcRequest) -> Result<Vec<u8>, i32> {
         cmsg_type: linux_abi::SCM_CREDENTIALS as u32,
     };
     let credentials = linux_abi::LinuxUCred {
-        pid: connected.peer_credentials.pid,
-        uid: connected.peer_credentials.uid,
-        gid: connected.peer_credentials.gid,
+        pid: peer_credentials.pid,
+        uid: peer_credentials.uid,
+        gid: peer_credentials.gid,
     };
     write_plain_old_data(
         &mut control[start..start + size_of::<linux_abi::LinuxCmsghdr>()],
@@ -1727,6 +2017,111 @@ mod packet_provider_state_tests {
             Ok(PacketProviderState::Active)
         );
         assert_eq!(packet_provider_state_from_wire(99), Err(libc::EPROTO));
+    }
+}
+
+#[cfg(test)]
+mod local_socket_poll_tests {
+    use super::*;
+
+    fn connected_socket(peer: u64) -> UnixSocket {
+        UnixSocket {
+            owner: Credentials::default(),
+            refs: 1,
+            options: SocketOptions::default(),
+            bound_path: None,
+            local_path: None,
+            peer_path: None,
+            state: UnixSocketState::Connected(ConnectedState {
+                incoming_bytes: VecDeque::new(),
+                incoming_controls: VecDeque::new(),
+                incoming_control_bytes: 0,
+                peer,
+                peer_closed: false,
+                peer_read_closed: false,
+                peer_write_closed: false,
+                peer_credentials: Credentials::default(),
+                recv_drain_handoff_armed: false,
+                recv_closed: false,
+                send_closed: false,
+            }),
+        }
+    }
+
+    #[test]
+    fn unix_poll_readiness_tracks_data_space_and_peer_close() {
+        let mut state = NetState::new();
+        state.sockets.insert(1, connected_socket(2));
+        state.sockets.insert(2, connected_socket(1));
+
+        assert_eq!(
+            unix_socket_revents(&state, 1, linux_abi::POLLIN as u32).unwrap(),
+            0
+        );
+        assert_eq!(
+            unix_socket_revents(&state, 1, linux_abi::POLLOUT as u32).unwrap(),
+            linux_abi::POLLOUT as u32
+        );
+
+        let UnixSocketState::Connected(connected) = &mut state.sockets.get_mut(&1).unwrap().state
+        else {
+            unreachable!();
+        };
+        connected.incoming_bytes.push_back(1);
+        assert_eq!(
+            unix_socket_revents(&state, 1, linux_abi::POLLIN as u32).unwrap(),
+            linux_abi::POLLIN as u32
+        );
+
+        let UnixSocketState::Connected(connected) = &mut state.sockets.get_mut(&1).unwrap().state
+        else {
+            unreachable!();
+        };
+        connected.peer_closed = true;
+        assert_ne!(
+            unix_socket_revents(&state, 1, linux_abi::POLLIN as u32).unwrap()
+                & linux_abi::POLLHUP as u32,
+            0
+        );
+    }
+
+    #[test]
+    fn local_wait_is_deferred_without_consuming_a_worker() {
+        let wait = NetdIpcRequest {
+            op: SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET,
+            arg2: NETD_POLL_MODE_WAIT,
+            socket_token: u64::MAX,
+            ..NetdIpcRequest::default()
+        };
+        assert!(is_deferred_local_poll_request(&wait));
+        assert!(!is_blocking_request(&wait));
+
+        let query = NetdIpcRequest {
+            arg2: NETD_POLL_MODE_QUERY,
+            ..wait
+        };
+        assert!(!is_deferred_local_poll_request(&query));
+        assert!(!is_blocking_request(&query));
+    }
+
+    #[test]
+    fn netd_v2_rejects_the_retired_fixed_size_wire_frame() {
+        let request = NetdIpcRequest {
+            version: NETD_IPC_ABI_VERSION,
+            op: SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET,
+            pid: 1,
+            tid: 1,
+            arg2: NETD_POLL_MODE_QUERY,
+            ..NetdIpcRequest::default()
+        };
+        assert_eq!(
+            validate_request(NETD_IPC_REQUEST_HEADER_SIZE, &request),
+            Ok(())
+        );
+        assert_eq!(
+            validate_request(size_of::<NetdIpcRequest>(), &request),
+            Err(libc::EINVAL)
+        );
     }
 }
 

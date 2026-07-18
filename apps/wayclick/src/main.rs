@@ -1,12 +1,10 @@
 use std::arch::asm;
 use std::ffi::CString;
 use std::io;
-use std::mem::size_of;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::net::UnixStream;
 use std::ptr;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use wayland_client::protocol::{
     wl_buffer, wl_callback, wl_compositor, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool,
@@ -29,6 +27,13 @@ const DEFAULT_WAYLAND_DISPLAY: &str = "wayland-0";
 
 fn auto_exit_after_first_frame() -> bool {
     match std::env::var("RUSTOS_WAYCLICK_AUTO_EXIT") {
+        Ok(value) => !matches!(value.as_str(), "0" | "false" | "False" | "FALSE"),
+        Err(_) => false,
+    }
+}
+
+fn profile_enabled() -> bool {
+    match std::env::var("RUSTOS_WAYCLICK_PROFILE") {
         Ok(value) => !matches!(value.as_str(), "0" | "false" | "False" | "FALSE"),
         Err(_) => false,
     }
@@ -88,29 +93,25 @@ fn connect_wayland_with_retry() -> Result<Connection, ConnectError> {
     ensure_wayland_env_defaults();
     let mut last_error = None;
     for attempt in 0..MAX_CONNECT_ATTEMPTS {
-        let socket_path = configured_wayland_socket_path();
-        match connect_wayland_socket(socket_path.as_str()) {
+        match Connection::connect_to_env() {
             Ok(connection) => {
-                raw_stderr_line(&format!("wayclick: connected path={socket_path}"));
+                raw_stderr_line(&format!(
+                    "wayclick: connected path={}",
+                    configured_wayland_socket_path()
+                ));
                 return Ok(connection);
             }
-            Err(socket_errno) => match Connection::connect_to_env() {
-                Ok(connection) => {
-                    raw_stderr_line("wayclick: connected via env");
-                    return Ok(connection);
+            Err(err) => {
+                if attempt + 1 == MAX_CONNECT_ATTEMPTS {
+                    raw_stderr_line(&format!(
+                        "wayclick: wayland connect failed path={}",
+                        configured_wayland_socket_path()
+                    ));
+                    return Err(err);
                 }
-                Err(err) => {
-                    if attempt + 1 == MAX_CONNECT_ATTEMPTS {
-                        raw_stderr_line(&format!(
-                            "wayclick: default wayland socket connect path={} errno={socket_errno}",
-                            socket_path
-                        ));
-                        return Err(err);
-                    }
-                    last_error = Some(err);
-                    thread::sleep(Duration::from_millis(CONNECT_RETRY_DELAY_MILLIS));
-                }
-            },
+                last_error = Some(err);
+                thread::sleep(Duration::from_millis(CONNECT_RETRY_DELAY_MILLIS));
+            }
         }
     }
 
@@ -124,57 +125,6 @@ fn ensure_wayland_env_defaults() {
     if std::env::var_os("WAYLAND_DISPLAY").is_none() {
         std::env::set_var("WAYLAND_DISPLAY", DEFAULT_WAYLAND_DISPLAY);
     }
-}
-
-fn connect_wayland_socket(path: &str) -> Result<Connection, i32> {
-    let stream = connect_unix_stream_nonblocking(path)?;
-    Connection::from_socket(stream).map_err(|_| libc::EPROTO)
-}
-
-fn connect_unix_stream_nonblocking(path: &str) -> Result<UnixStream, i32> {
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            0,
-        )
-    };
-    if fd < 0 {
-        return Err(last_errno());
-    }
-
-    let path = CString::new(path).map_err(|_| libc::EINVAL)?;
-    let path_bytes = path.as_bytes_with_nul();
-    let mut addr = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
-    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    if path_bytes.len() > addr.sun_path.len() {
-        let _ = unsafe { libc::close(fd) };
-        return Err(libc::ENAMETOOLONG);
-    }
-    for (index, byte) in path_bytes.iter().enumerate() {
-        addr.sun_path[index] = *byte as libc::c_char;
-    }
-
-    let rc = unsafe {
-        libc::connect(
-            fd,
-            (&addr as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
-            size_of::<libc::sockaddr_un>() as libc::socklen_t,
-        )
-    };
-    if rc < 0 {
-        let errno = last_errno();
-        let _ = unsafe { libc::close(fd) };
-        return Err(errno);
-    }
-
-    Ok(unsafe { UnixStream::from_raw_fd(fd) })
-}
-
-fn last_errno() -> i32 {
-    std::io::Error::last_os_error()
-        .raw_os_error()
-        .unwrap_or(libc::EIO)
 }
 
 fn configured_wayland_socket_path() -> String {
@@ -212,22 +162,13 @@ fn main() {
 
     let mut state = GameState::new();
     while state.running {
-        match event_queue.dispatch_pending(&mut state) {
-            Ok(dispatched) if dispatched > 0 => continue,
-            Ok(_) => {}
-            Err(err) => {
-                raw_stderr_line(&format!("wayclick: dispatch failed: {err:?}"));
-                break;
-            }
-        }
-        if let Err(err) = event_queue.flush() {
+        if let Err(err) = event_queue.blocking_dispatch(&mut state) {
             raw_stderr_line(&format!("wayclick: dispatch failed: {err:?}"));
             break;
         }
-        if let Some(guard) = event_queue.prepare_read() {
-            let _ = guard.read();
-        }
-        thread::sleep(Duration::from_millis(1));
+        state
+            .profile
+            .maybe_emit(state.frame_callback.is_some(), state.redraw_pending);
     }
     raw_stderr_line("wayclick: main exit");
 }
@@ -257,6 +198,7 @@ struct GameState {
     target_x: i32,
     target_y: i32,
     target_radius: i32,
+    profile: FrameProfile,
 }
 
 impl GameState {
@@ -286,6 +228,7 @@ impl GameState {
             target_x: 0,
             target_y: 0,
             target_radius: 34,
+            profile: FrameProfile::new(),
         };
         state.reseed_target();
         state
@@ -326,6 +269,7 @@ impl GameState {
     }
 
     fn request_redraw(&mut self, qh: &QueueHandle<Self>) {
+        self.profile.redraw_requests = self.profile.redraw_requests.saturating_add(1);
         self.redraw_pending = true;
         self.try_redraw(qh);
     }
@@ -345,6 +289,7 @@ impl GameState {
         else {
             return;
         };
+        let redraw_started = Instant::now();
 
         let score = self.score;
         let streak = self.streak;
@@ -406,6 +351,103 @@ impl GameState {
         surface.attach(Some(&wl_buffer), 0, 0);
         surface.damage(0, 0, WIDTH as i32, HEIGHT as i32);
         surface.commit();
+        self.profile.commits = self.profile.commits.saturating_add(1);
+        self.profile.record_redraw(redraw_started.elapsed());
+    }
+}
+
+struct FrameProfile {
+    enabled: bool,
+    started_at: Instant,
+    last_callback_at: Option<Instant>,
+    redraw_requests: u64,
+    pointer_updates: u64,
+    commits: u64,
+    callbacks: u64,
+    buffer_releases: u64,
+    max_callback_gap_ms: u64,
+    redraw_micros: u64,
+    max_redraw_micros: u64,
+}
+
+impl FrameProfile {
+    fn new() -> Self {
+        Self {
+            enabled: profile_enabled(),
+            started_at: Instant::now(),
+            last_callback_at: None,
+            redraw_requests: 0,
+            pointer_updates: 0,
+            commits: 0,
+            callbacks: 0,
+            buffer_releases: 0,
+            max_callback_gap_ms: 0,
+            redraw_micros: 0,
+            max_redraw_micros: 0,
+        }
+    }
+
+    fn record_callback(&mut self) {
+        let now = Instant::now();
+        if let Some(previous) = self.last_callback_at.replace(now) {
+            self.max_callback_gap_ms = self
+                .max_callback_gap_ms
+                .max(now.duration_since(previous).as_millis() as u64);
+        }
+        self.callbacks = self.callbacks.saturating_add(1);
+    }
+
+    fn record_redraw(&mut self, elapsed: Duration) {
+        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        self.redraw_micros = self.redraw_micros.saturating_add(micros);
+        self.max_redraw_micros = self.max_redraw_micros.max(micros);
+    }
+
+    fn maybe_emit(&mut self, callback_in_flight: bool, redraw_pending: bool) {
+        if !self.enabled {
+            return;
+        }
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.started_at);
+        if elapsed < Duration::from_secs(1) {
+            return;
+        }
+        let elapsed_micros = u64::try_from(elapsed.as_micros())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let commit_hz_milli = self
+            .commits
+            .saturating_mul(1_000_000_000)
+            .saturating_div(elapsed_micros);
+        let callback_hz_milli = self
+            .callbacks
+            .saturating_mul(1_000_000_000)
+            .saturating_div(elapsed_micros);
+        raw_stderr_line(&format!(
+            "wayclick profile: elapsed_ms={} commit_hz_milli={} callback_hz_milli={} redraw_requests={} pointer_updates={} commits={} callbacks={} buffer_releases={} max_callback_gap_ms={} redraw_ms={} max_redraw_ms={} callback_in_flight={} redraw_pending={}",
+            elapsed_micros / 1_000,
+            commit_hz_milli,
+            callback_hz_milli,
+            self.redraw_requests,
+            self.pointer_updates,
+            self.commits,
+            self.callbacks,
+            self.buffer_releases,
+            self.max_callback_gap_ms,
+            self.redraw_micros / 1_000,
+            self.max_redraw_micros / 1_000,
+            u8::from(callback_in_flight),
+            u8::from(redraw_pending),
+        ));
+        self.started_at = now;
+        self.redraw_requests = 0;
+        self.pointer_updates = 0;
+        self.commits = 0;
+        self.callbacks = 0;
+        self.buffer_releases = 0;
+        self.max_callback_gap_ms = 0;
+        self.redraw_micros = 0;
+        self.max_redraw_micros = 0;
     }
 }
 
@@ -624,6 +666,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for GameState {
                 surface_y,
                 ..
             } => {
+                state.profile.pointer_updates = state.profile.pointer_updates.saturating_add(1);
                 state.pointer_inside = true;
                 state.cursor_x = surface_x;
                 state.cursor_y = surface_y;
@@ -638,6 +681,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for GameState {
                 surface_y,
                 ..
             } => {
+                state.profile.pointer_updates = state.profile.pointer_updates.saturating_add(1);
                 state.cursor_x = surface_x;
                 state.cursor_y = surface_y;
                 state.request_redraw(qh);
@@ -669,6 +713,7 @@ impl Dispatch<wl_callback::WlCallback, ()> for GameState {
                 .as_ref()
                 .is_some_and(|current| current.id() == callback.id());
             if in_flight {
+                state.profile.record_callback();
                 state.frame_callback = None;
                 if !state.first_frame_presented {
                     state.first_frame_presented = true;
@@ -677,6 +722,9 @@ impl Dispatch<wl_callback::WlCallback, ()> for GameState {
                         state.running = false;
                         return;
                     }
+                }
+                if state.profile.enabled {
+                    state.redraw_pending = true;
                 }
                 state.try_redraw(qh);
             }
@@ -694,6 +742,7 @@ impl Dispatch<wl_buffer::WlBuffer, usize> for GameState {
         qh: &QueueHandle<Self>,
     ) {
         if let wl_buffer::Event::Release = event {
+            state.profile.buffer_releases = state.profile.buffer_releases.saturating_add(1);
             if let Some(available) = state.buffer_available.get_mut(*index) {
                 *available = true;
             }

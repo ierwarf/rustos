@@ -10,7 +10,7 @@ use rustos_driver_domain_host::{
     DriverDomainPolicy, FileLeaseStore, HostControlListener, InputRingSink, IommuTopology,
     LaunchPlan, ReleaseAuthorization, SysfsVfioOps, ValidatedLease, VfioOps, VfioReleaseBinding,
     acquire_vfio_lease, inspect_vfio_lease, inspect_vfio_lease_preflight, restore_vfio_lease,
-    validate_host_display_assignment,
+    validate_host_display_assignment, validate_physical_display_assignment,
 };
 
 mod runtime;
@@ -222,6 +222,7 @@ fn main() -> Result<()> {
             let lease = validate_assignment_plan(&plan, &sysfs_root)?;
             preflight_physical_runtime_inputs(
                 &lease,
+                &sysfs_root,
                 &qemu,
                 &dvm_artifact_manifest,
                 &device_policy,
@@ -258,6 +259,28 @@ fn main() -> Result<()> {
                 result.driver_inventory.display_driver_bound,
                 result.driver_inventory.display_relay_ready,
             );
+            match result.display_evidence.as_ref() {
+                Some(evidence) => println!(
+                    "rustos-hostd: physical display evidence sequence={} age_ms={} identity={}:{:04x}:{:04x} guest_bdf={} mode={}x{} connector={} direct_scanout={} frame_hz_milli={} pageflips={} pageflip_latency_us_avg={} pageflip_latency_us_max={} atomic_commit_us_avg={} cpu_copy_us_avg={}",
+                    evidence.sample_sequence,
+                    evidence.sample_age_ms,
+                    evidence.driver,
+                    evidence.pci_vendor,
+                    evidence.pci_device,
+                    evidence.guest_pci_bdf,
+                    evidence.mode_width,
+                    evidence.mode_height,
+                    evidence.connector_id,
+                    evidence.direct_scanout,
+                    evidence.frame_hz_milli,
+                    evidence.pageflip_completions,
+                    evidence.pageflip_latency_us_avg,
+                    evidence.pageflip_latency_us_max,
+                    evidence.atomic_commit_us_avg,
+                    evidence.cpu_copy_us_avg,
+                ),
+                None => println!("rustos-hostd: physical display evidence unavailable"),
+            }
         }
         Command::RelayInput {
             plan,
@@ -337,6 +360,7 @@ fn main() -> Result<()> {
         } => {
             let lease = validate_assignment_plan(&plan, &sysfs_root)?;
             let mut ops = SysfsVfioOps::new(&sysfs_root);
+            let mut activation_policy = None;
             let release_binding = if activate {
                 let dvm_artifact_manifest =
                     required_path(dvm_artifact_manifest, "--dvm-artifact-manifest")?;
@@ -352,10 +376,12 @@ fn main() -> Result<()> {
                 )?;
                 preflight_physical_runtime_inputs(
                     &lease,
+                    &sysfs_root,
                     &qemu,
                     &dvm_artifact_manifest,
                     &device_policy,
                 )?;
+                activation_policy = Some(DriverDomainPolicy::from_env_file(&device_policy)?);
                 Some(binding)
             } else {
                 None
@@ -379,15 +405,25 @@ fn main() -> Result<()> {
             }
             let store = FileLeaseStore::new(state_root);
             store.create_prepared(&record, current_unix_time()?)?;
-            if let Err(error) = validate_host_display_assignment(&lease, &sysfs_root) {
+            let final_assignment_check = (|| {
+                validate_host_display_assignment(&lease, &sysfs_root)?;
+                let policy = activation_policy
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("missing activation device policy"))?;
+                let physical_display = policy.physical_display().ok_or_else(|| {
+                    anyhow::anyhow!("activation device policy is not physical schema 3")
+                })?;
+                validate_physical_display_assignment(&lease, &sysfs_root, physical_display)
+            })();
+            if let Err(error) = final_assignment_check {
                 let cleanup_error = store.remove(&record.domain_id).err();
                 if let Some(cleanup_error) = cleanup_error {
                     anyhow::bail!(
-                        "host display became active before VFIO binding: {error:#}; prepared lease cleanup failed: {cleanup_error:#}"
+                        "physical display assignment changed before VFIO binding: {error:#}; prepared lease cleanup failed: {cleanup_error:#}"
                     );
                 }
                 anyhow::bail!(
-                    "host display became active before VFIO binding; prepared lease removed: {error:#}"
+                    "physical display assignment changed before VFIO binding; prepared lease removed: {error:#}"
                 );
             }
             if let Err(error) = acquire_vfio_lease(&record, &mut ops, current_unix_time()?) {

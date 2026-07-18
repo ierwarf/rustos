@@ -40,6 +40,7 @@ pub const MAX_CONTROL_FRAME: usize = 4 * 1024;
 pub const LINUX_DVM_ROLE: &str = "linux-driver-domain";
 
 const INPUT_RELAY_MAX_SEQUENCE: u32 = u32::MAX - 1024;
+const INPUT_STREAM_REQUEST_ID: u32 = 5;
 // The Linux DVM relay coalesces relative pointer samples to 125Hz; L0 still
 // enforces the resulting physical transport budget against a compromised or
 // buggy DVM before it commits the fixed shared-memory input ring.
@@ -274,6 +275,7 @@ impl ControlContract {
                 "health",
                 "device-inventory",
                 "driver-inventory",
+                "display-evidence-v1",
                 "input-stream",
             ]
         {
@@ -438,6 +440,117 @@ pub struct DriverDomainPolicy {
     pub domain_id: String,
     qemu_sha256: String,
     transports: BTreeMap<DeviceClass, DeviceTransport>,
+    physical_display: Option<PhysicalDisplayPolicy>,
+}
+
+/// Signed admission and runtime-evidence thresholds for the enabled physical
+/// AMD display-DVM topology.  These values live in the device policy rather
+/// than CLI flags so an operator cannot weaken the release gate after signing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PhysicalDisplayPolicy {
+    driver: String,
+    pci_vendor: u16,
+    pci_device: u16,
+    min_frame_hz_milli: u64,
+    max_pageflip_latency_us: u64,
+    max_atomic_commit_us: u64,
+    max_sample_age_ms: u64,
+    required_consecutive_samples: u32,
+}
+
+impl PhysicalDisplayPolicy {
+    pub fn driver(&self) -> &str {
+        &self.driver
+    }
+
+    pub fn pci_vendor(&self) -> u16 {
+        self.pci_vendor
+    }
+
+    pub fn pci_device(&self) -> u16 {
+        self.pci_device
+    }
+
+    pub fn required_consecutive_samples(&self) -> u32 {
+        self.required_consecutive_samples
+    }
+
+    pub fn validate_evidence(&self, evidence: &DvmDisplayEvidence) -> Result<()> {
+        if evidence.driver != self.driver
+            || evidence.pci_vendor != self.pci_vendor
+            || evidence.pci_device != self.pci_device
+        {
+            bail!(
+                "DVM display evidence identity {} {:04x}:{:04x} does not match signed policy {} {:04x}:{:04x}",
+                evidence.driver,
+                evidence.pci_vendor,
+                evidence.pci_device,
+                self.driver,
+                self.pci_vendor,
+                self.pci_device
+            );
+        }
+        if !evidence.direct_scanout || evidence.cpu_copy_us_avg != 0 {
+            bail!("DVM display evidence does not prove zero-copy direct scanout");
+        }
+        if evidence.connector_id == 0 || evidence.mode_width == 0 || evidence.mode_height == 0 {
+            bail!("DVM display evidence omitted the active physical mode");
+        }
+        if evidence.sample_age_ms > self.max_sample_age_ms {
+            bail!(
+                "DVM display evidence is stale age_ms={} max={}",
+                evidence.sample_age_ms,
+                self.max_sample_age_ms
+            );
+        }
+        if evidence.window_ns < 500_000_000 || evidence.window_ns > 2_500_000_000 {
+            bail!(
+                "DVM display evidence window is outside the bounded sampling contract: {}ns",
+                evidence.window_ns
+            );
+        }
+        let computed_frame_hz_milli = evidence
+            .pageflip_completions
+            .checked_mul(1_000_000_000_000)
+            .ok_or_else(|| anyhow!("DVM display evidence frame-rate calculation overflow"))?
+            / evidence.window_ns;
+        if computed_frame_hz_milli != evidence.frame_hz_milli {
+            bail!(
+                "DVM display evidence frame rate is inconsistent reported={} computed={}",
+                evidence.frame_hz_milli,
+                computed_frame_hz_milli
+            );
+        }
+        if evidence.frame_hz_milli < self.min_frame_hz_milli {
+            bail!(
+                "DVM physical page-flip rate {}mHz is below signed minimum {}mHz",
+                evidence.frame_hz_milli,
+                self.min_frame_hz_milli
+            );
+        }
+        if evidence.pageflip_latency_us_avg > self.max_pageflip_latency_us
+            || evidence.pageflip_latency_us_max > self.max_pageflip_latency_us
+            || evidence.pageflip_latency_us_avg == 0
+            || evidence.pageflip_latency_us_max < evidence.pageflip_latency_us_avg
+        {
+            bail!(
+                "DVM physical page-flip latency avg={}us max={}us exceeds signed maximum {}us",
+                evidence.pageflip_latency_us_avg,
+                evidence.pageflip_latency_us_max,
+                self.max_pageflip_latency_us
+            );
+        }
+        if evidence.atomic_commit_us_avg == 0
+            || evidence.atomic_commit_us_avg > self.max_atomic_commit_us
+        {
+            bail!(
+                "DVM atomic commit latency {}us exceeds signed maximum {}us",
+                evidence.atomic_commit_us_avg,
+                self.max_atomic_commit_us
+            );
+        }
+        Ok(())
+    }
 }
 
 impl DriverDomainPolicy {
@@ -449,7 +562,7 @@ impl DriverDomainPolicy {
 
     pub fn parse(source: &str, label: &str) -> Result<Self> {
         let values = parse_launch_plan_values(source, label)?;
-        const REQUIRED: [&str; 7] = [
+        const REQUIRED_V2: [&str; 7] = [
             "DRIVER_DOMAIN_POLICY_SCHEMA",
             "DOMAIN_ID",
             "QEMU_SHA256",
@@ -458,13 +571,33 @@ impl DriverDomainPolicy {
             "BLOCK_TRANSPORT",
             "DISPLAY_TRANSPORT",
         ];
-        if values.len() != REQUIRED.len()
-            || values.keys().any(|key| !REQUIRED.contains(&key.as_str()))
+        const REQUIRED_V3: [&str; 15] = [
+            "DRIVER_DOMAIN_POLICY_SCHEMA",
+            "DOMAIN_ID",
+            "QEMU_SHA256",
+            "INPUT_TRANSPORT",
+            "NETWORK_TRANSPORT",
+            "BLOCK_TRANSPORT",
+            "DISPLAY_TRANSPORT",
+            "DISPLAY_DRIVER",
+            "DISPLAY_PCI_VENDOR",
+            "DISPLAY_PCI_DEVICE",
+            "DISPLAY_MIN_FRAME_HZ_MILLI",
+            "DISPLAY_MAX_PAGEFLIP_LATENCY_US",
+            "DISPLAY_MAX_ATOMIC_COMMIT_US",
+            "DISPLAY_MAX_SAMPLE_AGE_MS",
+            "DISPLAY_REQUIRED_CONSECUTIVE_SAMPLES",
+        ];
+        let schema = launch_plan_value(&values, "DRIVER_DOMAIN_POLICY_SCHEMA", label)?;
+        let required = match schema {
+            "2" => &REQUIRED_V2[..],
+            "3" => &REQUIRED_V3[..],
+            _ => bail!("unsupported {label} schema"),
+        };
+        if values.len() != required.len()
+            || values.keys().any(|key| !required.contains(&key.as_str()))
         {
             bail!("unsupported key in {label}");
-        }
-        if launch_plan_value(&values, "DRIVER_DOMAIN_POLICY_SCHEMA", label)? != "2" {
-            bail!("unsupported {label} schema");
         }
         let domain_id = launch_plan_value(&values, "DOMAIN_ID", label)?.to_owned();
         validate_domain_id(&domain_id, label)?;
@@ -482,10 +615,74 @@ impl DriverDomainPolicy {
                 DeviceTransport::parse(launch_plan_value(&values, key, label)?, key, label)?,
             );
         }
+        let physical_display = if schema == "3" {
+            if transports.get(&DeviceClass::Display) != Some(&DeviceTransport::DisplayDmaBufKms)
+                || transports.get(&DeviceClass::Network) != Some(&DeviceTransport::Disabled)
+                || transports.get(&DeviceClass::Block) != Some(&DeviceTransport::Disabled)
+            {
+                bail!("{label} schema 3 is reserved for the physical display-only DVM");
+            }
+            let driver = launch_plan_value(&values, "DISPLAY_DRIVER", label)?.to_owned();
+            if driver != "amdgpu" {
+                bail!("{label} physical display driver must be amdgpu");
+            }
+            let pci_vendor = parse_pci_id(
+                launch_plan_value(&values, "DISPLAY_PCI_VENDOR", label)?,
+                "DISPLAY_PCI_VENDOR",
+                label,
+            )?;
+            let pci_device = parse_pci_id(
+                launch_plan_value(&values, "DISPLAY_PCI_DEVICE", label)?,
+                "DISPLAY_PCI_DEVICE",
+                label,
+            )?;
+            if pci_vendor != 0x1002 {
+                bail!("{label} physical display vendor must be AMD 1002");
+            }
+            let min_frame_hz_milli =
+                parse_bounded_policy_u64(&values, "DISPLAY_MIN_FRAME_HZ_MILLI", 1, 240_000, label)?;
+            let max_pageflip_latency_us = parse_bounded_policy_u64(
+                &values,
+                "DISPLAY_MAX_PAGEFLIP_LATENCY_US",
+                1,
+                1_000_000,
+                label,
+            )?;
+            let max_atomic_commit_us = parse_bounded_policy_u64(
+                &values,
+                "DISPLAY_MAX_ATOMIC_COMMIT_US",
+                1,
+                1_000_000,
+                label,
+            )?;
+            let max_sample_age_ms =
+                parse_bounded_policy_u64(&values, "DISPLAY_MAX_SAMPLE_AGE_MS", 1, 10_000, label)?;
+            let required_consecutive_samples = u32::try_from(parse_bounded_policy_u64(
+                &values,
+                "DISPLAY_REQUIRED_CONSECUTIVE_SAMPLES",
+                2,
+                30,
+                label,
+            )?)
+            .expect("bounded display sample count fits u32");
+            Some(PhysicalDisplayPolicy {
+                driver,
+                pci_vendor,
+                pci_device,
+                min_frame_hz_milli,
+                max_pageflip_latency_us,
+                max_atomic_commit_us,
+                max_sample_age_ms,
+                required_consecutive_samples,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             domain_id,
             qemu_sha256,
             transports,
+            physical_display,
         })
     }
 
@@ -510,6 +707,33 @@ impl DriverDomainPolicy {
     pub fn qemu_sha256(&self) -> &str {
         &self.qemu_sha256
     }
+
+    pub fn physical_display(&self) -> Option<&PhysicalDisplayPolicy> {
+        self.physical_display.as_ref()
+    }
+}
+
+fn parse_pci_id(value: &str, key: &str, label: &str) -> Result<u16> {
+    if value.len() != 4 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("invalid {label} {key}");
+    }
+    u16::from_str_radix(value, 16).with_context(|| format!("invalid {label} {key}"))
+}
+
+fn parse_bounded_policy_u64(
+    values: &BTreeMap<String, String>,
+    key: &str,
+    minimum: u64,
+    maximum: u64,
+    label: &str,
+) -> Result<u64> {
+    let value = launch_plan_value(values, key, label)?
+        .parse::<u64>()
+        .with_context(|| format!("invalid {label} {key}"))?;
+    if !(minimum..=maximum).contains(&value) {
+        bail!("{label} {key} is outside {minimum}..={maximum}");
+    }
+    Ok(value)
 }
 
 /// Immutable inventory of every hardware-backed driver domain permitted on
@@ -950,6 +1174,94 @@ pub fn validate_host_display_assignment(lease: &ValidatedLease, sysfs_root: &Pat
         }
     }
     Ok(())
+}
+
+/// Bind the physical display release to one exact AMDGPU identity before any
+/// VFIO mutation.  The complete group may contain an AMD audio function, but
+/// a second display function or a network/storage function is out of scope and
+/// therefore rejected rather than inheriting display-DVM authority.
+pub fn validate_physical_display_assignment(
+    lease: &ValidatedLease,
+    sysfs_root: &Path,
+    policy: &PhysicalDisplayPolicy,
+) -> Result<()> {
+    let bdf = validate_physical_display_identity(lease, sysfs_root, policy)?;
+    let device = sysfs_root.join("bus/pci/devices").join(&bdf);
+    let driver_path = fs::canonicalize(device.join("driver"))
+        .with_context(|| format!("resolve current driver for physical display {bdf}"))?;
+    let driver = driver_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("invalid current driver for physical display {bdf}"))?;
+    if driver != policy.driver {
+        bail!(
+            "physical display {bdf} is bound to {driver:?}, expected {:?}",
+            policy.driver
+        );
+    }
+    Ok(())
+}
+
+/// Recheck the signed PCI identity even after the function is bound to
+/// `vfio-pci`.  This closes same-BDF device replacement between acquire and
+/// supervise without requiring the original host driver to remain bound.
+pub fn validate_physical_display_identity(
+    lease: &ValidatedLease,
+    sysfs_root: &Path,
+    policy: &PhysicalDisplayPolicy,
+) -> Result<String> {
+    let mut display_bdf = None;
+    for bdf in &lease.pci_bdfs {
+        let device = sysfs_root.join("bus/pci/devices").join(bdf);
+        let vendor = read_sysfs_pci_hex(&device.join("vendor"), 0xffff, "vendor", bdf)? as u16;
+        let device_id = read_sysfs_pci_hex(&device.join("device"), 0xffff, "device", bdf)? as u16;
+        let class = read_sysfs_pci_hex(&device.join("class"), 0xff_ffff, "class", bdf)?;
+        let base_class = class >> 16;
+        if matches!(base_class, 0x01 | 0x02) {
+            bail!(
+                "physical display IOMMU group contains excluded storage/network function {bdf} class={class:06x}"
+            );
+        }
+        if base_class != 0x03 {
+            if vendor != policy.pci_vendor || class >> 8 != 0x0403 {
+                bail!(
+                    "physical display IOMMU group contains unsupported companion function {bdf} vendor={vendor:04x} class={class:06x}"
+                );
+            }
+            continue;
+        }
+        if display_bdf.replace(bdf.as_str()).is_some() {
+            bail!("physical display IOMMU group contains more than one display function");
+        }
+        if vendor != policy.pci_vendor || device_id != policy.pci_device {
+            bail!(
+                "physical display {bdf} identity {vendor:04x}:{device_id:04x} does not match signed policy {:04x}:{:04x}",
+                policy.pci_vendor,
+                policy.pci_device
+            );
+        }
+    }
+    display_bdf.map(str::to_owned).ok_or_else(|| {
+        anyhow!("physical display IOMMU group contains no display-class PCI function")
+    })
+}
+
+fn read_sysfs_pci_hex(path: &Path, maximum: u32, field: &str, bdf: &str) -> Result<u32> {
+    let source = fs::read_to_string(path)
+        .with_context(|| format!("read PCI {field} for physical display assignment {bdf}"))?;
+    let value = source
+        .trim()
+        .strip_prefix("0x")
+        .ok_or_else(|| anyhow!("PCI {field} for {bdf} is missing 0x prefix"))?;
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("invalid PCI {field} for {bdf}");
+    }
+    let parsed =
+        u32::from_str_radix(value, 16).with_context(|| format!("invalid PCI {field} for {bdf}"))?;
+    if parsed > maximum {
+        bail!("out-of-range PCI {field} for {bdf}");
+    }
+    Ok(parsed)
 }
 
 /// Durable recovery record for one whole-IOMMU-group VFIO handoff.
@@ -1732,6 +2044,7 @@ pub struct ProbeResult {
     pub peer_cid: u32,
     pub inventory_count: u32,
     pub driver_inventory: DvmDriverInventory,
+    pub display_evidence: Option<DvmDisplayEvidence>,
 }
 
 /// DVM-local driver binding snapshot. These values prove only that the Linux
@@ -1743,6 +2056,30 @@ pub struct DvmDriverInventory {
     pub virtio_gpu_bound: bool,
     pub display_driver_bound: bool,
     pub display_relay_ready: bool,
+}
+
+/// One fresh, relay-produced physical page-flip sample returned through the
+/// launch-authenticated DVM control channel.  Absence is valid for non-display
+/// and virtual KVM probes, but a physical schema-3 policy never accepts it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DvmDisplayEvidence {
+    pub sample_sequence: u64,
+    pub sample_age_ms: u64,
+    pub driver: String,
+    pub pci_vendor: u16,
+    pub pci_device: u16,
+    pub guest_pci_bdf: String,
+    pub connector_id: u32,
+    pub mode_width: u32,
+    pub mode_height: u32,
+    pub direct_scanout: bool,
+    pub window_ns: u64,
+    pub frame_hz_milli: u64,
+    pub pageflip_completions: u64,
+    pub cpu_copy_us_avg: u64,
+    pub pageflip_latency_us_avg: u64,
+    pub pageflip_latency_us_max: u64,
+    pub atomic_commit_us_avg: u64,
 }
 
 /// Destination controlled by L0 for sanitized DVM input frames.
@@ -1950,6 +2287,8 @@ pub struct InputRelayResult {
 /// consume the fixed ring's cleanup reserve or starve inputd's bounded broker.
 struct InputRelayRate {
     window_started: Instant,
+    last_frame_at: Option<Instant>,
+    max_inter_frame_gap: Duration,
     total_frames: u32,
     key_frames: u32,
 }
@@ -1958,14 +2297,33 @@ impl InputRelayRate {
     fn new() -> Self {
         Self {
             window_started: Instant::now(),
+            last_frame_at: None,
+            max_inter_frame_gap: Duration::ZERO,
             total_frames: 0,
             key_frames: 0,
         }
     }
 
     fn admit(&mut self, event: LinuxEvdevInputEvent) -> Result<()> {
-        if self.window_started.elapsed() >= Duration::from_secs(1) {
-            self.window_started = Instant::now();
+        let now = Instant::now();
+        if let Some(previous) = self.last_frame_at {
+            self.max_inter_frame_gap = self
+                .max_inter_frame_gap
+                .max(now.saturating_duration_since(previous));
+        }
+        self.last_frame_at = Some(now);
+        if now.saturating_duration_since(self.window_started) >= Duration::from_secs(1) {
+            if std::env::var_os("RUSTOS_DVM_INPUT_PROFILE").as_deref()
+                == Some(std::ffi::OsStr::new("1"))
+            {
+                eprintln!(
+                    "rustos-dvm-input-relay: frames={} max_gap_us={}",
+                    self.total_frames,
+                    self.max_inter_frame_gap.as_micros()
+                );
+            }
+            self.window_started = now;
+            self.max_inter_frame_gap = Duration::ZERO;
             self.total_frames = 0;
             self.key_frames = 0;
         }
@@ -2103,7 +2461,7 @@ impl HostControlListener {
         // self-test that request arms uinput immediately, so this admission
         // prevents a boot-time producer from racing an uninstalled consumer.
         sink.wait_for_receiver_ready(receiver_timeout)?;
-        let ready = request(&mut connection, 4, "input-stream")?;
+        let ready = request(&mut connection, INPUT_STREAM_REQUEST_ID, "input-stream")?;
         if !has_exact_fields(
             &ready,
             &["id", "op", "status", "format", "keyboard", "pointer"],
@@ -2146,7 +2504,11 @@ impl HostControlListener {
                 Ok(message) => message,
                 Err(error) => break Err(error),
             };
-            let event = match parse_linux_evdev_input_event(&message, 4, "input-stream") {
+            let event = match parse_linux_evdev_input_event(
+                &message,
+                INPUT_STREAM_REQUEST_ID,
+                "input-stream",
+            ) {
                 Ok(event) => event,
                 Err(error) => break Err(error),
             };
@@ -2308,12 +2670,143 @@ impl HostControlListener {
             display_driver_bound: parse_driver_inventory_state(&drivers, "display-driver")?,
             display_relay_ready: parse_ready_inventory_state(&drivers, "display-relay")?,
         };
+        let display = request(connection, 4, "display-evidence-v1")?;
+        let display_evidence = parse_display_evidence(&display)?;
         Ok(ProbeResult {
             peer_cid: self.expected_dvm_cid,
             inventory_count,
             driver_inventory,
+            display_evidence,
         })
     }
+}
+
+fn parse_display_evidence(fields: &BTreeMap<String, String>) -> Result<Option<DvmDisplayEvidence>> {
+    const REQUIRED: [&str; 20] = [
+        "id",
+        "op",
+        "status",
+        "sample-sequence",
+        "sample-age-ms",
+        "driver",
+        "pci-vendor",
+        "pci-device",
+        "guest-pci-bdf",
+        "connector-id",
+        "mode-width",
+        "mode-height",
+        "direct-scanout",
+        "window-ns",
+        "frame-hz-milli",
+        "pageflip-completions",
+        "cpu-copy-us-avg",
+        "pageflip-latency-us-avg",
+        "pageflip-latency-us-max",
+        "atomic-commit-us-avg",
+    ];
+    if !has_exact_fields(fields, &REQUIRED)
+        || fields.get("op") != Some(&"display-evidence-v1".to_owned())
+    {
+        bail!("invalid Linux DVM display evidence response");
+    }
+    match fields.get("status").map(String::as_str) {
+        Some("unavailable") => {
+            for key in [
+                "sample-sequence",
+                "sample-age-ms",
+                "connector-id",
+                "mode-width",
+                "mode-height",
+                "window-ns",
+                "frame-hz-milli",
+                "pageflip-completions",
+                "cpu-copy-us-avg",
+                "pageflip-latency-us-avg",
+                "pageflip-latency-us-max",
+                "atomic-commit-us-avg",
+            ] {
+                if fields.get(key).map(String::as_str) != Some("0") {
+                    bail!("nonzero field in unavailable Linux DVM display evidence");
+                }
+            }
+            if fields.get("driver").map(String::as_str) != Some("missing")
+                || fields.get("pci-vendor").map(String::as_str) != Some("0000")
+                || fields.get("pci-device").map(String::as_str) != Some("0000")
+                || fields.get("guest-pci-bdf").map(String::as_str) != Some("none")
+                || fields.get("direct-scanout").map(String::as_str) != Some("no")
+            {
+                bail!("invalid unavailable Linux DVM display evidence sentinel");
+            }
+            Ok(None)
+        }
+        Some("ok") => {
+            let driver = fields
+                .get("driver")
+                .ok_or_else(|| anyhow!("Linux DVM display evidence omitted driver"))?
+                .to_owned();
+            validate_driver_name(&driver, "Linux DVM display evidence")?;
+            let pci_vendor = parse_pci_id_field(fields, "pci-vendor")?;
+            let pci_device = parse_pci_id_field(fields, "pci-device")?;
+            let guest_pci_bdf = fields
+                .get("guest-pci-bdf")
+                .ok_or_else(|| anyhow!("Linux DVM display evidence omitted guest PCI BDF"))?
+                .to_owned();
+            validate_pci_bdf(&guest_pci_bdf, "Linux DVM display evidence")?;
+            let evidence = DvmDisplayEvidence {
+                sample_sequence: parse_display_u64(fields, "sample-sequence")?,
+                sample_age_ms: parse_display_u64(fields, "sample-age-ms")?,
+                driver,
+                pci_vendor,
+                pci_device,
+                guest_pci_bdf,
+                connector_id: u32::try_from(parse_display_u64(fields, "connector-id")?)
+                    .context("Linux DVM display connector ID overflow")?,
+                mode_width: u32::try_from(parse_display_u64(fields, "mode-width")?)
+                    .context("Linux DVM display width overflow")?,
+                mode_height: u32::try_from(parse_display_u64(fields, "mode-height")?)
+                    .context("Linux DVM display height overflow")?,
+                direct_scanout: match fields.get("direct-scanout").map(String::as_str) {
+                    Some("yes") => true,
+                    Some("no") => false,
+                    _ => bail!("invalid Linux DVM direct-scanout evidence"),
+                },
+                window_ns: parse_display_u64(fields, "window-ns")?,
+                frame_hz_milli: parse_display_u64(fields, "frame-hz-milli")?,
+                pageflip_completions: parse_display_u64(fields, "pageflip-completions")?,
+                cpu_copy_us_avg: parse_display_u64(fields, "cpu-copy-us-avg")?,
+                pageflip_latency_us_avg: parse_display_u64(fields, "pageflip-latency-us-avg")?,
+                pageflip_latency_us_max: parse_display_u64(fields, "pageflip-latency-us-max")?,
+                atomic_commit_us_avg: parse_display_u64(fields, "atomic-commit-us-avg")?,
+            };
+            if evidence.sample_sequence == 0 || evidence.pageflip_completions == 0 {
+                bail!("Linux DVM display evidence lacks a completed physical page flip");
+            }
+            Ok(Some(evidence))
+        }
+        _ => bail!("invalid Linux DVM display evidence status"),
+    }
+}
+
+fn parse_pci_id_field(fields: &BTreeMap<String, String>, key: &str) -> Result<u16> {
+    let value = fields
+        .get(key)
+        .ok_or_else(|| anyhow!("Linux DVM display evidence omitted {key}"))?;
+    if value.len() != 4
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("invalid Linux DVM display evidence {key}");
+    }
+    u16::from_str_radix(value, 16).with_context(|| format!("invalid display evidence {key}"))
+}
+
+fn parse_display_u64(fields: &BTreeMap<String, String>, key: &str) -> Result<u64> {
+    fields
+        .get(key)
+        .ok_or_else(|| anyhow!("Linux DVM display evidence omitted {key}"))?
+        .parse::<u64>()
+        .with_context(|| format!("invalid Linux DVM display evidence {key}"))
 }
 
 fn parse_driver_inventory_state(fields: &BTreeMap<String, String>, key: &str) -> Result<bool> {
@@ -2884,16 +3377,17 @@ mod tests {
     use super::{
         CONTROL_PORT_FLOOR, CONTROL_SECRET_BYTES, ControlContract, ControlSecret, DeviceClass,
         DeviceTransport, DriverDomainFleetPolicy, DriverDomainPolicy, FileLeaseStore,
-        InputRelayRate, IommuTopology, LaunchPlan, LinuxEvdevInputEvent, LinuxEvdevKeyEvent,
-        ReleaseAuthorization, RustosInputFrame, ValidatedLease, VfioLeaseRecord, VfioLeaseState,
-        VfioOps, VfioReleaseBinding, acquire_vfio_lease, allocate_input_epoch, control_proof,
-        inspect_vfio_lease, inspect_vfio_lease_preflight, parse_linux_evdev_input_event,
-        parse_message, reset_vfio_group, restore_vfio_lease, validate_hello,
-        validate_host_display_assignment,
+        INPUT_STREAM_REQUEST_ID, InputRelayRate, IommuTopology, LaunchPlan, LinuxEvdevInputEvent,
+        LinuxEvdevKeyEvent, ReleaseAuthorization, RustosInputFrame, ValidatedLease,
+        VfioLeaseRecord, VfioLeaseState, VfioOps, VfioReleaseBinding, acquire_vfio_lease,
+        allocate_input_epoch, control_proof, inspect_vfio_lease, inspect_vfio_lease_preflight,
+        parse_display_evidence, parse_linux_evdev_input_event, parse_message, reset_vfio_group,
+        restore_vfio_lease, validate_hello, validate_host_display_assignment,
+        validate_physical_display_assignment,
     };
     use anyhow::Result;
 
-    const VALID: &str = "CONTROL_SCHEMA=1\nCONTROL_PROTOCOL=agent-v1\nCONTROL_STATE=control\nCONTROL_TRANSPORT=kvm-vsock\nCONTROL_AUTHENTICATION=dvm-agent-hmac-sha256-v1\nCONTROL_CAPABILITIES=health,device-inventory,driver-inventory,input-stream\n";
+    const VALID: &str = "CONTROL_SCHEMA=1\nCONTROL_PROTOCOL=agent-v1\nCONTROL_STATE=control\nCONTROL_TRANSPORT=kvm-vsock\nCONTROL_AUTHENTICATION=dvm-agent-hmac-sha256-v1\nCONTROL_CAPABILITIES=health,device-inventory,driver-inventory,display-evidence-v1,input-stream\n";
 
     #[test]
     fn relay_epochs_are_monotonic_and_fail_closed_before_reuse() {
@@ -2914,6 +3408,7 @@ mod tests {
                 "health",
                 "device-inventory",
                 "driver-inventory",
+                "display-evidence-v1",
                 "input-stream"
             ]
         );
@@ -2932,12 +3427,12 @@ mod tests {
     #[test]
     fn hello_is_bound_to_the_exact_control_contract() {
         let contract = ControlContract::parse(VALID, "test").unwrap();
-        let hello = "HELLO\nrole=linux-driver-domain\nprotocol=agent-v1\nstate=control\ntransport=kvm-vsock\nauthentication=dvm-agent-hmac-sha256-v1\ncapabilities=health,device-inventory,driver-inventory,input-stream";
+        let hello = "HELLO\nrole=linux-driver-domain\nprotocol=agent-v1\nstate=control\ntransport=kvm-vsock\nauthentication=dvm-agent-hmac-sha256-v1\ncapabilities=health,device-inventory,driver-inventory,display-evidence-v1,input-stream";
         assert!(validate_hello(hello, &contract).is_ok());
         assert!(
             validate_hello(
                 &hello.replace(
-                    "health,device-inventory,driver-inventory,input-stream",
+                    "health,device-inventory,driver-inventory,display-evidence-v1,input-stream",
                     "health"
                 ),
                 &contract
@@ -2951,7 +3446,7 @@ mod tests {
     fn control_secret_and_proof_bind_each_session() {
         assert!(ControlSecret::from_bytes([0; CONTROL_SECRET_BYTES]).is_err());
         let secret = ControlSecret::from_bytes([0x5a; CONTROL_SECRET_BYTES]).unwrap();
-        let hello = "HELLO\nrole=linux-driver-domain\nprotocol=agent-v1\nstate=control\ntransport=kvm-vsock\nauthentication=dvm-agent-hmac-sha256-v1\ncapabilities=health,device-inventory,driver-inventory,input-stream";
+        let hello = "HELLO\nrole=linux-driver-domain\nprotocol=agent-v1\nstate=control\ntransport=kvm-vsock\nauthentication=dvm-agent-hmac-sha256-v1\ncapabilities=health,device-inventory,driver-inventory,display-evidence-v1,input-stream";
         let first = control_proof(&secret, &[1; CONTROL_SECRET_BYTES], hello).unwrap();
         assert_eq!(
             first,
@@ -3014,36 +3509,119 @@ mod tests {
     }
 
     #[test]
+    fn display_evidence_is_exact_fresh_and_zero_copy() {
+        let policy = DriverDomainPolicy::parse(
+            &format!("DRIVER_DOMAIN_POLICY_SCHEMA=3\nDOMAIN_ID=linux-dvm-gpu0\nQEMU_SHA256={}\nINPUT_TRANSPORT=input-ring-msix\nNETWORK_TRANSPORT=disabled\nBLOCK_TRANSPORT=disabled\nDISPLAY_TRANSPORT=display-dmabuf-kms\nDISPLAY_DRIVER=amdgpu\nDISPLAY_PCI_VENDOR=1002\nDISPLAY_PCI_DEVICE=1900\nDISPLAY_MIN_FRAME_HZ_MILLI=59000\nDISPLAY_MAX_PAGEFLIP_LATENCY_US=25000\nDISPLAY_MAX_ATOMIC_COMMIT_US=2000\nDISPLAY_MAX_SAMPLE_AGE_MS=2000\nDISPLAY_REQUIRED_CONSECUTIVE_SAMPLES=5\n", "a".repeat(64)),
+            "evidence-policy",
+        )
+        .unwrap();
+        let message = parse_message(
+            "RESPONSE\nid=4\nop=display-evidence-v1\nstatus=ok\nsample-sequence=7\nsample-age-ms=20\ndriver=amdgpu\npci-vendor=1002\npci-device=1900\nguest-pci-bdf=0000:01:00.0\nconnector-id=78\nmode-width=1920\nmode-height=1080\ndirect-scanout=yes\nwindow-ns=1000000000\nframe-hz-milli=60000\npageflip-completions=60\ncpu-copy-us-avg=0\npageflip-latency-us-avg=16500\npageflip-latency-us-max=17100\natomic-commit-us-avg=40",
+        )
+        .unwrap();
+        let evidence = parse_display_evidence(&message.fields).unwrap().unwrap();
+        assert_eq!(evidence.driver, "amdgpu");
+        assert_eq!(evidence.pci_vendor, 0x1002);
+        assert!(evidence.direct_scanout);
+        policy
+            .physical_display()
+            .unwrap()
+            .validate_evidence(&evidence)
+            .unwrap();
+
+        let copied = parse_message(
+            "RESPONSE\nid=4\nop=display-evidence-v1\nstatus=ok\nsample-sequence=7\nsample-age-ms=20\ndriver=amdgpu\npci-vendor=1002\npci-device=1900\nguest-pci-bdf=0000:01:00.0\nconnector-id=78\nmode-width=1920\nmode-height=1080\ndirect-scanout=yes\nwindow-ns=1000000000\nframe-hz-milli=60000\npageflip-completions=60\ncpu-copy-us-avg=1\npageflip-latency-us-avg=16500\npageflip-latency-us-max=17100\natomic-commit-us-avg=40",
+        )
+        .unwrap();
+        let evidence = parse_display_evidence(&copied.fields).unwrap().unwrap();
+        assert!(
+            policy
+                .physical_display()
+                .unwrap()
+                .validate_evidence(&evidence)
+                .is_err()
+        );
+
+        let inconsistent = parse_message(
+            "RESPONSE\nid=4\nop=display-evidence-v1\nstatus=ok\nsample-sequence=8\nsample-age-ms=20\ndriver=amdgpu\npci-vendor=1002\npci-device=1900\nguest-pci-bdf=0000:01:00.0\nconnector-id=78\nmode-width=1920\nmode-height=1080\ndirect-scanout=yes\nwindow-ns=1000000000\nframe-hz-milli=60000\npageflip-completions=59\ncpu-copy-us-avg=0\npageflip-latency-us-avg=16500\npageflip-latency-us-max=17100\natomic-commit-us-avg=40",
+        )
+        .unwrap();
+        let evidence = parse_display_evidence(&inconsistent.fields)
+            .unwrap()
+            .unwrap();
+        assert!(
+            policy
+                .physical_display()
+                .unwrap()
+                .validate_evidence(&evidence)
+                .is_err()
+        );
+
+        let unavailable = parse_message(
+            "RESPONSE\nid=4\nop=display-evidence-v1\nstatus=unavailable\nsample-sequence=0\nsample-age-ms=0\ndriver=missing\npci-vendor=0000\npci-device=0000\nguest-pci-bdf=none\nconnector-id=0\nmode-width=0\nmode-height=0\ndirect-scanout=no\nwindow-ns=0\nframe-hz-milli=0\npageflip-completions=0\ncpu-copy-us-avg=0\npageflip-latency-us-avg=0\npageflip-latency-us-max=0\natomic-commit-us-avg=0",
+        )
+        .unwrap();
+        assert!(
+            parse_display_evidence(&unavailable.fields)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn input_stream_requires_bounded_exact_key_and_pointer_events() {
         let event =
-            parse_message("EVENT\nid=3\nop=input-stream\ntype=key\ncode=30\nvalue=1").unwrap();
+            parse_message("EVENT\nid=5\nop=input-stream\ntype=key\ncode=30\nvalue=1").unwrap();
         assert_eq!(
-            parse_linux_evdev_input_event(&event, 3, "input-stream").unwrap(),
+            parse_linux_evdev_input_event(&event, INPUT_STREAM_REQUEST_ID, "input-stream").unwrap(),
             super::LinuxEvdevInputEvent::Key(super::LinuxEvdevKeyEvent { code: 30, value: 1 })
         );
         let malformed =
-            parse_message("EVENT\nid=3\nop=input-stream\ntype=key\ncode=768\nvalue=1").unwrap();
-        assert!(parse_linux_evdev_input_event(&malformed, 3, "input-stream").is_err());
+            parse_message("EVENT\nid=5\nop=input-stream\ntype=key\ncode=768\nvalue=1").unwrap();
+        assert!(
+            parse_linux_evdev_input_event(&malformed, INPUT_STREAM_REQUEST_ID, "input-stream")
+                .is_err()
+        );
         let pointer = parse_message(
-            "EVENT\nid=3\nop=input-stream\ntype=pointer\ndx=-4\ndy=2\nwheel-v=1\nwheel-h=0\nbuttons=3",
+            "EVENT\nid=5\nop=input-stream\ntype=pointer\ndx=-4\ndy=2\nwheel-v=1\nwheel-h=0\nbuttons=3",
         )
         .unwrap();
-        assert!(parse_linux_evdev_input_event(&pointer, 3, "input-stream").is_ok());
+        assert!(
+            parse_linux_evdev_input_event(&pointer, INPUT_STREAM_REQUEST_ID, "input-stream")
+                .is_ok()
+        );
         let invalid_buttons = parse_message(
-            "EVENT\nid=3\nop=input-stream\ntype=pointer\ndx=0\ndy=0\nwheel-v=0\nwheel-h=0\nbuttons=32",
+            "EVENT\nid=5\nop=input-stream\ntype=pointer\ndx=0\ndy=0\nwheel-v=0\nwheel-h=0\nbuttons=32",
         )
         .unwrap();
-        assert!(parse_linux_evdev_input_event(&invalid_buttons, 3, "input-stream").is_err());
+        assert!(
+            parse_linux_evdev_input_event(
+                &invalid_buttons,
+                INPUT_STREAM_REQUEST_ID,
+                "input-stream"
+            )
+            .is_err()
+        );
         let position = parse_message(
-            "EVENT\nid=3\nop=input-stream\ntype=pointer-position\nx=800\ny=450\nwheel-v=0\nwheel-h=0\nbuttons=0",
+            "EVENT\nid=5\nop=input-stream\ntype=pointer-position\nx=800\ny=450\nwheel-v=0\nwheel-h=0\nbuttons=0",
         )
         .unwrap();
-        assert!(parse_linux_evdev_input_event(&position, 3, "input-stream").is_ok());
+        assert!(
+            parse_linux_evdev_input_event(&position, INPUT_STREAM_REQUEST_ID, "input-stream")
+                .is_ok()
+        );
         let invalid_position = parse_message(
-            "EVENT\nid=3\nop=input-stream\ntype=pointer-position\nx=1600\ny=450\nwheel-v=0\nwheel-h=0\nbuttons=0",
+            "EVENT\nid=5\nop=input-stream\ntype=pointer-position\nx=1600\ny=450\nwheel-v=0\nwheel-h=0\nbuttons=0",
         )
         .unwrap();
-        assert!(parse_linux_evdev_input_event(&invalid_position, 3, "input-stream").is_err());
+        assert!(
+            parse_linux_evdev_input_event(
+                &invalid_position,
+                INPUT_STREAM_REQUEST_ID,
+                "input-stream"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -3104,7 +3682,7 @@ mod tests {
         )
         .is_err());
         let display = DriverDomainPolicy::parse(
-            &format!("DRIVER_DOMAIN_POLICY_SCHEMA=2\nDOMAIN_ID=linux-dvm-gpu0\nQEMU_SHA256={}\nINPUT_TRANSPORT=input-ring-msix\nNETWORK_TRANSPORT=disabled\nBLOCK_TRANSPORT=disabled\nDISPLAY_TRANSPORT=display-dmabuf-kms\n", "a".repeat(64)),
+            &format!("DRIVER_DOMAIN_POLICY_SCHEMA=3\nDOMAIN_ID=linux-dvm-gpu0\nQEMU_SHA256={}\nINPUT_TRANSPORT=input-ring-msix\nNETWORK_TRANSPORT=disabled\nBLOCK_TRANSPORT=disabled\nDISPLAY_TRANSPORT=display-dmabuf-kms\nDISPLAY_DRIVER=amdgpu\nDISPLAY_PCI_VENDOR=1002\nDISPLAY_PCI_DEVICE=1900\nDISPLAY_MIN_FRAME_HZ_MILLI=59000\nDISPLAY_MAX_PAGEFLIP_LATENCY_US=25000\nDISPLAY_MAX_ATOMIC_COMMIT_US=2000\nDISPLAY_MAX_SAMPLE_AGE_MS=2000\nDISPLAY_REQUIRED_CONSECUTIVE_SAMPLES=5\n", "a".repeat(64)),
             "display-test",
         )
         .unwrap();
@@ -3112,6 +3690,12 @@ mod tests {
             display.transport_for(DeviceClass::Display),
             DeviceTransport::DisplayDmaBufKms
         );
+        assert_eq!(display.physical_display().unwrap().driver(), "amdgpu");
+        assert!(DriverDomainPolicy::parse(
+            &format!("DRIVER_DOMAIN_POLICY_SCHEMA=3\nDOMAIN_ID=linux-dvm-gpu0\nQEMU_SHA256={}\nINPUT_TRANSPORT=input-ring-msix\nNETWORK_TRANSPORT=disabled\nBLOCK_TRANSPORT=disabled\nDISPLAY_TRANSPORT=display-dmabuf-kms\nDISPLAY_DRIVER=amdgpu\nDISPLAY_PCI_VENDOR=10de\nDISPLAY_PCI_DEVICE=1900\nDISPLAY_MIN_FRAME_HZ_MILLI=59000\nDISPLAY_MAX_PAGEFLIP_LATENCY_US=25000\nDISPLAY_MAX_ATOMIC_COMMIT_US=2000\nDISPLAY_MAX_SAMPLE_AGE_MS=2000\nDISPLAY_REQUIRED_CONSECUTIVE_SAMPLES=5\n", "a".repeat(64)),
+            "wrong-vendor",
+        )
+        .is_err());
     }
 
     #[test]
@@ -3234,6 +3818,40 @@ mod tests {
 
         sysfs.write_connector_status("0000:65:00.0", "card0-eDP-1", "disconnected\n");
         validate_host_display_assignment(&lease, sysfs.path()).unwrap();
+    }
+
+    #[test]
+    fn physical_display_assignment_is_bound_to_exact_amdgpu_identity() {
+        let sysfs = TestSysfs::new(&[(18, &["0000:65:00.0", "0000:65:00.1"])]);
+        let lease = ValidatedLease {
+            domain_id: "linux-dvm-gpu0".to_owned(),
+            dvm_guest_cid: 4,
+            iommu_group: 18,
+            pci_bdfs: vec!["0000:65:00.0".to_owned(), "0000:65:00.1".to_owned()],
+        };
+        let policy = DriverDomainPolicy::parse(
+            &format!("DRIVER_DOMAIN_POLICY_SCHEMA=3\nDOMAIN_ID=linux-dvm-gpu0\nQEMU_SHA256={}\nINPUT_TRANSPORT=input-ring-msix\nNETWORK_TRANSPORT=disabled\nBLOCK_TRANSPORT=disabled\nDISPLAY_TRANSPORT=display-dmabuf-kms\nDISPLAY_DRIVER=amdgpu\nDISPLAY_PCI_VENDOR=1002\nDISPLAY_PCI_DEVICE=1900\nDISPLAY_MIN_FRAME_HZ_MILLI=59000\nDISPLAY_MAX_PAGEFLIP_LATENCY_US=25000\nDISPLAY_MAX_ATOMIC_COMMIT_US=2000\nDISPLAY_MAX_SAMPLE_AGE_MS=2000\nDISPLAY_REQUIRED_CONSECUTIVE_SAMPLES=5\n", "a".repeat(64)),
+            "physical-test",
+        )
+        .unwrap();
+        let display = policy.physical_display().unwrap();
+        sysfs.write_pci_attr("0000:65:00.0", "vendor", "0x1002\n");
+        sysfs.write_pci_attr("0000:65:00.0", "device", "0x1900\n");
+        sysfs.write_pci_attr("0000:65:00.0", "class", "0x030000\n");
+        sysfs.bind_driver("0000:65:00.0", "amdgpu");
+        sysfs.write_pci_attr("0000:65:00.1", "vendor", "0x1002\n");
+        sysfs.write_pci_attr("0000:65:00.1", "device", "0x1640\n");
+        sysfs.write_pci_attr("0000:65:00.1", "class", "0x040300\n");
+        validate_physical_display_assignment(&lease, sysfs.path(), display).unwrap();
+
+        sysfs.write_pci_attr("0000:65:00.1", "class", "0x0c0330\n");
+        assert!(validate_physical_display_assignment(&lease, sysfs.path(), display).is_err());
+        sysfs.write_pci_attr("0000:65:00.1", "class", "0x040300\n");
+        sysfs.write_pci_attr("0000:65:00.0", "device", "0xffff\n");
+        assert!(validate_physical_display_assignment(&lease, sysfs.path(), display).is_err());
+        sysfs.write_pci_attr("0000:65:00.0", "device", "0x1900\n");
+        sysfs.bind_driver("0000:65:00.0", "vfio-pci");
+        assert!(validate_physical_display_assignment(&lease, sysfs.path(), display).is_err());
     }
 
     #[test]
@@ -3519,6 +4137,14 @@ mod tests {
                 .join(connector);
             fs::create_dir_all(&connector).unwrap();
             fs::write(connector.join("status"), value).unwrap();
+        }
+
+        fn bind_driver(&self, bdf: &str, driver: &str) {
+            let driver_root = self.root.join("bus/pci/drivers").join(driver);
+            fs::create_dir_all(&driver_root).unwrap();
+            let link = self.root.join("bus/pci/devices").join(bdf).join("driver");
+            let _ = fs::remove_file(&link);
+            std::os::unix::fs::symlink(driver_root, link).unwrap();
         }
 
         fn path(&self) -> &Path {

@@ -3,6 +3,7 @@ use fs_err as fs;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::Result;
 use crate::config::Config;
@@ -26,28 +27,177 @@ struct GrubSigningMaterial {
     signing_key: String,
 }
 
-pub(crate) fn build(config: &Config) -> Result<()> {
+pub(crate) fn build(config: &Config, show_timings: bool) -> Result<()> {
+    let mut timings = StepTimings::new(show_timings);
     validate_workspace_layering(&config.root_dir)?;
+    timings.mark("layering");
     let manifests = load_manifests(&config.root_dir)?;
+    timings.mark("manifests");
+    validate_dvm_gpu_contract(config)?;
+    timings.mark("dvm-gpu-contract");
     ensure_targets(config)?;
+    timings.mark("targets");
     build_nucleus(config)?;
+    timings.mark("nucleus");
     build_efi(config)?;
+    timings.mark("efi");
     build_userspace_manifests(config, &manifests)?;
+    timings.mark("userspace");
     stage::stage(config)?;
+    timings.mark("stage");
+    timings.report("build");
     Ok(())
 }
 
-pub(crate) fn check(config: &Config) -> Result<()> {
+fn validate_dvm_gpu_contract(config: &Config) -> Result<()> {
+    let source_root = config
+        .root_dir
+        .join("driver-domains/linux/package/rustos-dvm-display/src");
+    let relay_path = source_root.join("rustos-dvm-display.c");
+    let module_path = source_root.join("rustos_dvm_ivshmem_uio.c");
+    let relay = fs::read_to_string(&relay_path)
+        .with_context(|| format!("read DVM GPU relay contract {}", relay_path.display()))?;
+    let module = fs::read_to_string(&module_path)
+        .with_context(|| format!("read DVM GPU module contract {}", module_path.display()))?;
+    let version = driver_domain_protocol::DVM_GPU_ATLAS_TRANSPORT_VERSION;
+    require_contract_token(
+        &relay,
+        &relay_path,
+        &format!("#define GPU_ATLAS_VERSION {version}U"),
+    )?;
+    require_contract_token(
+        &module,
+        &module_path,
+        &format!("#define RUSTOS_GPU_ATLAS_VERSION {version}"),
+    )?;
+    for (name, magic) in [
+        (
+            "GPU_RENDER_COMPLETION_MAGIC",
+            driver_domain_protocol::DVM_GPU_RENDER_COMPLETION_MAGIC,
+        ),
+        (
+            "GPU_PRIME_COMPLETION_MAGIC",
+            driver_domain_protocol::DVM_GPU_PRIME_COMPLETION_MAGIC,
+        ),
+        (
+            "GPU_PRESENT_COMPLETION_MAGIC",
+            driver_domain_protocol::DVM_GPU_PRESENT_COMPLETION_MAGIC,
+        ),
+    ] {
+        let magic = core::str::from_utf8(&magic)
+            .map_err(|_| anyhow!("Rust DVM GPU magic {name} is not ASCII"))?;
+        require_contract_token(&relay, &relay_path, &format!("#define {name} \"{magic}\""))?;
+        let module_name = format!("rustos_{}", name.to_ascii_lowercase());
+        require_contract_token(
+            &module,
+            &module_path,
+            &format!("static const u8 {module_name}[] = \"{magic}\";"),
+        )?;
+    }
+    for (name, value) in [
+        (
+            "RUSTOS_GPU_ATLAS_PRIME_COMPLETION_OFFSET",
+            driver_domain_protocol::DVM_GPU_ATLAS_PRIME_COMPLETION_OFFSET,
+        ),
+        (
+            "RUSTOS_GPU_ATLAS_CONTEXT_ID_OFFSET",
+            driver_domain_protocol::DVM_GPU_ATLAS_CONTEXT_ID_OFFSET,
+        ),
+        (
+            "RUSTOS_GPU_ATLAS_CONTEXT_EPOCH_OFFSET",
+            driver_domain_protocol::DVM_GPU_ATLAS_CONTEXT_EPOCH_OFFSET,
+        ),
+        (
+            "RUSTOS_GPU_ATLAS_PRIME_FENCE_OFFSET",
+            driver_domain_protocol::DVM_GPU_ATLAS_PRIME_FENCE_OFFSET,
+        ),
+    ] {
+        require_contract_token(&module, &module_path, &format!("#define {name} {value}"))?;
+        let relay_name = name.strip_prefix("RUSTOS_").unwrap_or(name);
+        require_contract_token(
+            &relay,
+            &relay_path,
+            &format!("#define {relay_name} {value}U"),
+        )?;
+    }
+    Ok(())
+}
+
+fn require_contract_token(contents: &str, path: &Path, token: &str) -> Result<()> {
+    if !contents.lines().any(|line| line.trim() == token) {
+        bail!(
+            "DVM GPU wire contract drift in {}: expected `{}`",
+            path.display(),
+            token
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn check(config: &Config, show_timings: bool) -> Result<()> {
+    let mut timings = StepTimings::new(show_timings);
     validate_workspace_layering(&config.root_dir)?;
+    timings.mark("layering");
     let manifests = load_manifests(&config.root_dir)?;
+    timings.mark("manifests");
     ensure_targets(config)?;
+    timings.mark("targets");
 
     run_cargo_kernel_check(config, &config.nucleus_package)?;
+    timings.mark("nucleus");
     check_nucleus_multiboot2_if_present(config)?;
+    timings.mark("multiboot2");
     check_os_target_manifests(config, &manifests)?;
+    timings.mark("os-targets");
     check_host_workspace(config, &manifests)?;
+    timings.mark("host-workspace");
 
+    timings.report("check");
     Ok(())
+}
+
+struct StepTimings {
+    enabled: bool,
+    started: Instant,
+    previous: Instant,
+    steps: Vec<(&'static str, Duration)>,
+}
+
+impl StepTimings {
+    fn new(enabled: bool) -> Self {
+        let now = Instant::now();
+        Self {
+            enabled,
+            started: now,
+            previous: now,
+            steps: Vec::new(),
+        }
+    }
+
+    fn mark(&mut self, name: &'static str) {
+        if !self.enabled {
+            return;
+        }
+        let now = Instant::now();
+        self.steps.push((name, now.duration_since(self.previous)));
+        self.previous = now;
+    }
+
+    fn report(&self, operation: &str) {
+        if !self.enabled {
+            return;
+        }
+        for (name, elapsed) in &self.steps {
+            eprintln!(
+                "xtask: timing {operation}.{name}={:.3}s",
+                elapsed.as_secs_f64()
+            );
+        }
+        eprintln!(
+            "xtask: timing {operation}.total={:.3}s",
+            self.started.elapsed().as_secs_f64()
+        );
+    }
 }
 
 fn check_os_target_manifests(config: &Config, manifests: &[PackageManifest]) -> Result<()> {

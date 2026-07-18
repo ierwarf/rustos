@@ -90,6 +90,13 @@ const SCHED_MAX_BURST_NS: u64 = 20_000_000;
 /// CPU-share boost: once the bound expires the oldest ready System task gets
 /// one turn, after which normal weighted vruntime resumes.
 const SYSTEM_READY_LATENCY_BOUND_MS: u64 = 10;
+/// A ready fair-class task must run soon enough to consume a compositor frame
+/// callback before the following 60 Hz refresh. The bound is per task, not a
+/// class-wide dispatch ratio: one User turn after a System burst can still
+/// become multi-second latency when several services and applications share
+/// that turn. Eight milliseconds leaves drawing and commit headroom inside a
+/// 16.67 ms frame while preserving the stricter IPC handoff path above it.
+const USER_READY_LATENCY_BOUND_MS: u64 = 8;
 // Initial vruntime offset for newly-spawned tasks relative to current
 // min_vruntime. Keep this near min-granularity: a larger multi-ms penalty
 // leaves freshly spawned services behind polling System peers during boot.
@@ -100,16 +107,20 @@ const SCHED_NEW_TASK_VRUNTIME_PENALTY_NS: u64 = SCHED_MIN_GRANULARITY_NS;
 /// than uiserver/inputd; deriving class from the number let those pollers
 /// crowd the interactive band and caused multi-second UI starvation.
 /// A critical service remains latency-favoured, but it cannot consume every
-/// dispatch indefinitely while ordinary work is ready. Eight System turns
-/// followed by one mandatory User turn reserve at least one ninth of dispatch
-/// opportunities for recovery and application work under a hostile input or
-/// GUI-DVM flood.
-const MAX_CONSECUTIVE_SYSTEM_DISPATCHES: u8 = 8;
+/// dispatch indefinitely while ordinary work is ready. Two System turns
+/// followed by one mandatory User turn match the checked scheduler model and
+/// preserve application CPU progress under a hostile input or GUI-DVM flood.
+const MAX_CONSECUTIVE_SYSTEM_DISPATCHES: u8 = 2;
+/// A task that slept on a real event may bypass ready System work for one
+/// wakeup turn. Cap the burst so many sleepers cannot starve the critical lane.
+const MAX_CONSECUTIVE_LATENCY_HANDOFFS: u8 = 8;
+const MAX_LATENCY_HANDOFF_HINTS: usize = 16;
 
 /// Priority bands. System work wins latency-sensitive selection until its
 /// bounded consecutive-dispatch reservation is exhausted; then one ready User
 /// task must run before System selection resumes. Within a class the existing
-/// CFS-style vruntime accounting decides fairness.
+/// CFS-style vruntime accounting decides fairness. A per-task User deadline
+/// additionally prevents one busy User task from hiding another ready client.
 ///
 /// This mirrors the way commercial microkernels structure mixed workloads:
 ///
@@ -265,6 +276,12 @@ pub(super) struct Scheduler {
     /// is ready but temporarily blocked by a higher scheduling class, and is
     /// cleared once consumed or once the target is no longer schedulable.
     next_pick_hint: Option<usize>,
+    /// Bounded FIFO of authority-checked event/data wakeups. Unlike a normal
+    /// donation hint, these may cross the System/User class boundary. A FIFO
+    /// prevents concurrent service replies from overwriting older wakeups.
+    latency_pick_hints: [Option<usize>; MAX_LATENCY_HANDOFF_HINTS],
+    latency_pick_hint_head: usize,
+    latency_pick_hint_len: usize,
     /// Spawn handoff hint, kept separate from IPC reply hints so the loader's
     /// reply to the supervisor cannot overwrite the freshly-created child.
     next_spawn_pick_hint: Option<usize>,
@@ -285,6 +302,7 @@ pub(super) struct Scheduler {
     /// dispatch, preventing a critical-lane flood from starving recovery or
     /// ordinary applications forever.
     system_dispatch_streak: u8,
+    latency_handoff_streak: u8,
     /// Fixed scheduler tick divisor. CFS-style scheduling accounts CPU share
     /// through vruntime weights; it must not also shorten/lengthen the hardware
     /// tick per task or low-weight services pay excessive interrupt overhead.
@@ -304,11 +322,15 @@ impl Scheduler {
             current_task: 0,
             pending_reap: false,
             next_pick_hint: None,
+            latency_pick_hints: [None; MAX_LATENCY_HANDOFF_HINTS],
+            latency_pick_hint_head: 0,
+            latency_pick_hint_len: 0,
             next_spawn_pick_hint: None,
             ipc_priority_donations: [None; MAX_TASK],
             last_min_vruntime_ns: 0,
             root_idle: false,
             system_dispatch_streak: 0,
+            latency_handoff_streak: 0,
             scheduler_tick_divisor: 0,
         }
     }
@@ -331,6 +353,49 @@ impl Scheduler {
         }
         self.apply_ipc_donation(slot);
         self.next_pick_hint = Some(slot);
+    }
+
+    pub(super) fn set_next_latency_pick_hint(&mut self, task_id: u64) -> bool {
+        let Some(slot) = self.find_task_slot(task_id) else {
+            return false;
+        };
+        // This queue exists only for the explicit cross-class exception.
+        // System tasks already win normal class selection and must not consume
+        // the bounded User wakeup budget.
+        if self.slot_class(slot) != Some(SchedClass::User) || !self.handoff_hint_eligible(slot) {
+            return false;
+        }
+        if (0..self.latency_pick_hint_len).any(|offset| {
+            let index = (self.latency_pick_hint_head + offset) % MAX_LATENCY_HANDOFF_HINTS;
+            self.latency_pick_hints[index] == Some(slot)
+        }) {
+            return true;
+        }
+        if self.latency_pick_hint_len >= MAX_LATENCY_HANDOFF_HINTS {
+            return false;
+        }
+        let tail =
+            (self.latency_pick_hint_head + self.latency_pick_hint_len) % MAX_LATENCY_HANDOFF_HINTS;
+        self.latency_pick_hints[tail] = Some(slot);
+        self.latency_pick_hint_len += 1;
+        true
+    }
+
+    fn remove_latency_pick_hint(&mut self, slot: usize) {
+        let mut compact = [None; MAX_LATENCY_HANDOFF_HINTS];
+        let mut retained = 0_usize;
+        for offset in 0..self.latency_pick_hint_len {
+            let index = (self.latency_pick_hint_head + offset) % MAX_LATENCY_HANDOFF_HINTS;
+            if let Some(candidate) = self.latency_pick_hints[index]
+                && candidate != slot
+            {
+                compact[retained] = Some(candidate);
+                retained += 1;
+            }
+        }
+        self.latency_pick_hints = compact;
+        self.latency_pick_hint_head = 0;
+        self.latency_pick_hint_len = retained;
     }
 
     /// Selects a runnable worker for a process-owned endpoint when the sender
@@ -593,6 +658,22 @@ impl Scheduler {
         self.pick_hint_ready_slot(self.next_pick_hint)
     }
 
+    fn take_next_latency_pick_hint_ready_slot(&mut self) -> Option<usize> {
+        if self.latency_handoff_streak >= MAX_CONSECUTIVE_LATENCY_HANDOFFS {
+            return None;
+        }
+        while self.latency_pick_hint_len != 0 {
+            let index = self.latency_pick_hint_head;
+            let hint = self.latency_pick_hints[index].take();
+            self.latency_pick_hint_head = (index + 1) % MAX_LATENCY_HANDOFF_HINTS;
+            self.latency_pick_hint_len -= 1;
+            if let Some(slot) = self.pick_hint_candidate_slot(hint) {
+                return Some(slot);
+            }
+        }
+        None
+    }
+
     fn take_next_spawn_pick_hint_ready_slot(&mut self) -> Option<usize> {
         if self.next_spawn_pick_hint.is_some()
             && self
@@ -641,10 +722,14 @@ impl Scheduler {
         self.current_task = ROOT_TASK_SLOT;
         self.pending_reap = false;
         self.next_pick_hint = None;
+        self.latency_pick_hints = [None; MAX_LATENCY_HANDOFF_HINTS];
+        self.latency_pick_hint_head = 0;
+        self.latency_pick_hint_len = 0;
         self.next_spawn_pick_hint = None;
         self.ipc_priority_donations = [None; MAX_TASK];
         self.root_idle = false;
         self.system_dispatch_streak = 0;
+        self.latency_handoff_streak = 0;
         self.scheduler_tick_divisor = main_thread_pit_divisor;
         self.reset_stack_storage(ROOT_TASK_SLOT)
             .expect("scheduler root stack allocation failed");
@@ -706,6 +791,7 @@ impl Scheduler {
         if self.next_pick_hint == Some(slot) {
             self.next_pick_hint = None;
         }
+        self.remove_latency_pick_hint(slot);
         if self.next_spawn_pick_hint == Some(slot) {
             self.next_spawn_pick_hint = None;
         }
@@ -965,11 +1051,6 @@ impl Scheduler {
     /// any class (including the current task and root) — in which case
     /// `dispatch_schedule` falls back to ROOT_TASK_SLOT.
     fn pick_min_vruntime(&self, current: usize) -> Option<usize> {
-        // Keep one candidate per priority band in a single fixed-table scan.
-        // The previous implementation rescanned all 128 slots once per empty
-        // higher band; because class resolution also walks live IPC donations,
-        // an ordinary User-only workload paid up to three full classification
-        // passes on every timer tick.
         let mut best_by_class = [None::<(usize, u64)>; SchedClass::COUNT];
         for slot in 0..MAX_TASK {
             if !self.is_fair_candidate_slot(slot) {
@@ -1038,17 +1119,31 @@ impl Scheduler {
             .map(|(slot, _, _)| slot)
     }
 
-    /// Returns one ready User task after a bounded System burst. The selected
-    /// User turn is not a best-effort hint: callers skip spawn/IPC handoff and
-    /// min-granularity retention for this turn, so a ready critical task cannot
-    /// silently bypass the reservation.
-    fn reserved_user_pick(&self, current: usize) -> Option<usize> {
-        self.user_reservation_due()
-            .then(|| self.pick_min_vruntime_in_class(current, SchedClass::User))
-            .flatten()
+    /// Returns one User task when either its per-task dispatch deadline has
+    /// expired or the class-wide System burst is exhausted. Deadline selection
+    /// uses the oldest ready task so multiple fair-class clients cannot hide
+    /// behind a single class reservation.
+    fn reserved_user_pick(&self, current: usize, now_ticks: u64) -> Option<usize> {
+        self.overdue_class_pick(
+            current,
+            now_ticks,
+            SchedClass::User,
+            USER_READY_LATENCY_BOUND_MS,
+        )
+        .or_else(|| {
+            self.user_reservation_due()
+                .then(|| self.pick_min_vruntime_in_class(current, SchedClass::User))
+                .flatten()
+        })
     }
 
-    fn overdue_system_pick(&self, current: usize, now_ticks: u64) -> Option<usize> {
+    fn overdue_class_pick(
+        &self,
+        current: usize,
+        now_ticks: u64,
+        class: SchedClass,
+        latency_bound_ms: u64,
+    ) -> Option<usize> {
         let mut oldest: Option<(usize, u64, u64)> = None;
         for slot in 0..MAX_TASK {
             if slot == current || !self.is_fair_candidate_slot(slot) {
@@ -1060,9 +1155,8 @@ impl Scheduler {
             if !context.ready
                 || context.ready_since_ticks == 0
                 || !self.context_is_schedulable(slot, context)
-                || self.slot_class(slot) != Some(SchedClass::System)
-                || Self::ticks_elapsed_ms(context.ready_since_ticks, now_ticks)
-                    < SYSTEM_READY_LATENCY_BOUND_MS
+                || self.slot_class(slot) != Some(class)
+                || Self::ticks_elapsed_ms(context.ready_since_ticks, now_ticks) < latency_bound_ms
             {
                 continue;
             }
@@ -1082,6 +1176,15 @@ impl Scheduler {
         oldest.map(|(slot, _, _)| slot)
     }
 
+    fn overdue_system_pick(&self, current: usize, now_ticks: u64) -> Option<usize> {
+        self.overdue_class_pick(
+            current,
+            now_ticks,
+            SchedClass::System,
+            SYSTEM_READY_LATENCY_BOUND_MS,
+        )
+    }
+
     fn user_reservation_due(&self) -> bool {
         self.system_dispatch_streak >= MAX_CONSECUTIVE_SYSTEM_DISPATCHES
     }
@@ -1093,6 +1196,16 @@ impl Scheduler {
                 .saturating_add(1)
                 .min(MAX_CONSECUTIVE_SYSTEM_DISPATCHES),
             Some(SchedClass::User | SchedClass::Idle) | None => 0,
+        };
+    }
+
+    fn record_latency_handoff(&mut self, latency_handoff: bool) {
+        self.latency_handoff_streak = if latency_handoff {
+            self.latency_handoff_streak
+                .saturating_add(1)
+                .min(MAX_CONSECUTIVE_LATENCY_HANDOFFS)
+        } else {
+            0
         };
     }
 
@@ -2154,9 +2267,9 @@ impl Scheduler {
         self.last_min_vruntime_ns = self.min_ready_vruntime();
 
         // Pick order:
-        //  1. Spawn handoff hint (if still ready/schedulable).
-        //  2. IPC donation hint (if still ready/schedulable).
-        //  3. CFS-like smallest vruntime among ready tasks.
+        //  1. Bounded wakeup handoff for a task that actually slept on IPC.
+        //  2. Spawn/IPC donation hints and mandatory User fairness.
+        //  3. CFS-like class selection among ready tasks.
         //  4. Root task as the unconditional fallback.
         // Hints short-circuit CFS only for direct handoff; otherwise vruntime
         // decides fairness.
@@ -2165,33 +2278,42 @@ impl Scheduler {
         // handoff before the unrelated User reservation; selecting a polling
         // User task here can otherwise strand the entire causal chain. Normal
         // yields and spawn hints still remain behind the bounded reservation.
-        let blocking_ipc_handoff = self.contexts[current_slot]
-            .is_some_and(|context| context.blocked)
-            .then(|| self.take_next_pick_hint_ready_slot())
-            .flatten();
-        let (next_idx, ipc_handoff, reserved_user_pick) = match blocking_ipc_handoff {
-            Some(receiver_slot) => (receiver_slot, true, None),
-            None => match self.reserved_user_pick(current_slot) {
-                Some(user_slot) => (user_slot, false, Some(user_slot)),
+        let latency_handoff = self.take_next_latency_pick_hint_ready_slot();
+        let (next_idx, ipc_handoff, reserved_user_pick, latency_handoff_pick) =
+            match latency_handoff {
+                Some(woken_slot) => (woken_slot, true, None, true),
                 None => {
-                    let spawn_hint = self.take_next_spawn_pick_hint_ready_slot();
-                    let hint = spawn_hint.or_else(|| self.take_next_pick_hint_ready_slot());
-                    let overdue = self.overdue_system_pick(current_slot, now_ticks);
-                    let cfs_pick = if voluntary_yield {
-                        self.pick_min_vruntime_excluding(current_slot)
-                            .or_else(|| self.pick_min_vruntime(current_slot))
-                    } else {
-                        self.pick_min_vruntime(current_slot)
+                    let blocking_ipc_handoff = self.contexts[current_slot]
+                        .is_some_and(|context| context.blocked)
+                        .then(|| self.take_next_pick_hint_ready_slot())
+                        .flatten();
+                    let (next_idx, ipc_handoff, reserved_user_pick) = match blocking_ipc_handoff {
+                        Some(receiver_slot) => (receiver_slot, true, None),
+                        None => match self.reserved_user_pick(current_slot, now_ticks) {
+                            Some(user_slot) => (user_slot, false, Some(user_slot)),
+                            None => {
+                                let spawn_hint = self.take_next_spawn_pick_hint_ready_slot();
+                                let hint =
+                                    spawn_hint.or_else(|| self.take_next_pick_hint_ready_slot());
+                                let overdue = self.overdue_system_pick(current_slot, now_ticks);
+                                let cfs_pick = if voluntary_yield {
+                                    self.pick_min_vruntime_excluding(current_slot)
+                                        .or_else(|| self.pick_min_vruntime(current_slot))
+                                } else {
+                                    self.pick_min_vruntime(current_slot)
+                                };
+                                match (hint, overdue, cfs_pick) {
+                                    (Some(hint_slot), _, _) => (hint_slot, true, None),
+                                    (None, Some(overdue_slot), _) => (overdue_slot, true, None),
+                                    (None, None, Some(slot)) => (slot, false, None),
+                                    (None, None, None) => (ROOT_TASK_SLOT, false, None),
+                                }
+                            }
+                        },
                     };
-                    match (hint, overdue, cfs_pick) {
-                        (Some(hint_slot), _, _) => (hint_slot, true, None),
-                        (None, Some(overdue_slot), _) => (overdue_slot, true, None),
-                        (None, None, Some(slot)) => (slot, false, None),
-                        (None, None, None) => (ROOT_TASK_SLOT, false, None),
-                    }
+                    (next_idx, ipc_handoff, reserved_user_pick, false)
                 }
-            },
-        };
+            };
 
         // Apply min-granularity guard: if the CFS pick differs from current
         // only by a few ns of vruntime advantage and current has not consumed
@@ -2224,6 +2346,7 @@ impl Scheduler {
                         context.exec_start_ticks = now_ticks;
                     }
                     self.record_dispatch_class(next_idx);
+                    self.record_latency_handoff(latency_handoff_pick);
                     self.current_task = next_idx;
                     return (next.saved_rsp, self.scheduler_tick_divisor);
                 }
@@ -3762,6 +3885,56 @@ mod tests {
     }
 
     #[test]
+    fn oldest_overdue_user_is_reserved_before_system_burst_exhaustion() {
+        let mut scheduler = Box::new(Scheduler::new());
+        let base = crate::memory::paging::USER_SPACE_BASE;
+        let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
+        let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
+        let mut allocate = |task_id, offset, weight| {
+            scheduler
+                .allocate_user_slot(
+                    task_id,
+                    ProcessAddressSpace::empty_for_tests(),
+                    UserTaskBootstrap::new(
+                        UserAbi::Linux,
+                        x86_64::VirtAddr::new(base + offset),
+                        x86_64::VirtAddr::new(base + offset + 0x1_000),
+                    ),
+                    None,
+                    weight,
+                    user_cs,
+                    user_ss,
+                    super::RFLAGS_RESERVED_BIT_1,
+                    false,
+                    noop_task_entry,
+                )
+                .expect("user slot")
+        };
+        let current = allocate(
+            75,
+            0x2_000,
+            crate::arch::pit::divisor_from_micros(2_000) | super::INTERACTIVE_PIT_DIVISOR_FLAG,
+        );
+        let newer_user = allocate(76, 0x4_000, crate::arch::pit::divisor_from_micros(100));
+        let older_user = allocate(77, 0x6_000, crate::arch::pit::divisor_from_micros(100));
+        scheduler.contexts[newer_user]
+            .as_mut()
+            .expect("newer user context")
+            .ready_since_ticks = 2;
+        scheduler.contexts[older_user]
+            .as_mut()
+            .expect("older user context")
+            .ready_since_ticks = 1;
+
+        assert!(!scheduler.user_reservation_due());
+        let now_ticks = crate::arch::rtc::ticks_per_second().saturating_mul(2);
+        assert_eq!(
+            scheduler.reserved_user_pick(current, now_ticks),
+            Some(older_user)
+        );
+    }
+
+    #[test]
     fn overdue_system_task_is_forced_after_latency_bound() {
         let mut scheduler = Box::new(Scheduler::new());
         let base = crate::memory::paging::USER_SPACE_BASE;
@@ -3881,5 +4054,91 @@ mod tests {
         scheduler.set_next_pick_hint(802);
         assert_eq!(scheduler.take_next_spawn_pick_hint_ready_slot(), Some(3));
         assert_eq!(scheduler.take_next_pick_hint_ready_slot(), Some(2));
+    }
+
+    #[test]
+    fn event_wait_handoff_is_fifo_deduplicated_and_burst_bounded() {
+        let mut scheduler = Box::new(Scheduler::new());
+        let base = crate::memory::paging::USER_SPACE_BASE;
+        let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
+        let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
+        let bootstrap = |offset| {
+            UserTaskBootstrap::new(
+                UserAbi::Linux,
+                x86_64::VirtAddr::new(base + offset),
+                x86_64::VirtAddr::new(base + offset + 0x1_000),
+            )
+        };
+        let user_slot = scheduler
+            .allocate_user_slot(
+                901,
+                ProcessAddressSpace::empty_for_tests(),
+                bootstrap(0x2_000),
+                None,
+                crate::arch::pit::divisor_from_micros(100),
+                user_cs,
+                user_ss,
+                super::RFLAGS_RESERVED_BIT_1,
+                false,
+                noop_task_entry,
+            )
+            .expect("user slot");
+        let system_slot = scheduler
+            .allocate_user_slot(
+                902,
+                ProcessAddressSpace::empty_for_tests(),
+                bootstrap(0x4_000),
+                None,
+                crate::arch::pit::divisor_from_micros(2_000) | super::INTERACTIVE_PIT_DIVISOR_FLAG,
+                user_cs,
+                user_ss,
+                super::RFLAGS_RESERVED_BIT_1,
+                false,
+                noop_task_entry,
+            )
+            .expect("system slot");
+        let second_user_slot = scheduler
+            .allocate_user_slot(
+                903,
+                ProcessAddressSpace::empty_for_tests(),
+                bootstrap(0x6_000),
+                None,
+                crate::arch::pit::divisor_from_micros(100),
+                user_cs,
+                user_ss,
+                super::RFLAGS_RESERVED_BIT_1,
+                false,
+                noop_task_entry,
+            )
+            .expect("second user slot");
+
+        assert_eq!(scheduler.slot_class(user_slot), Some(SchedClass::User));
+        assert_eq!(scheduler.slot_class(system_slot), Some(SchedClass::System));
+        assert_eq!(
+            scheduler.slot_class(second_user_slot),
+            Some(SchedClass::User)
+        );
+        assert!(scheduler.set_next_latency_pick_hint(901));
+        assert!(!scheduler.set_next_latency_pick_hint(902));
+        assert!(scheduler.set_next_latency_pick_hint(903));
+        assert!(scheduler.set_next_latency_pick_hint(901));
+        assert_eq!(
+            scheduler.take_next_latency_pick_hint_ready_slot(),
+            Some(user_slot)
+        );
+        assert_eq!(
+            scheduler.take_next_latency_pick_hint_ready_slot(),
+            Some(second_user_slot)
+        );
+        assert_eq!(scheduler.take_next_latency_pick_hint_ready_slot(), None);
+
+        assert!(scheduler.set_next_latency_pick_hint(901));
+        scheduler.latency_handoff_streak = super::MAX_CONSECUTIVE_LATENCY_HANDOFFS;
+        assert_eq!(scheduler.take_next_latency_pick_hint_ready_slot(), None);
+        scheduler.record_latency_handoff(false);
+        assert_eq!(
+            scheduler.take_next_latency_pick_hint_ready_slot(),
+            Some(user_slot)
+        );
     }
 }

@@ -6,6 +6,7 @@ use crate::config::{self as config_mod, Config};
 use crate::kvm;
 use crate::stage;
 use crate::testinfra;
+use crate::util::{default_root_dir, env_path};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -17,9 +18,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum XtaskCommand {
-    Build,
-    Check,
+    Build {
+        #[arg(long)]
+        timings: bool,
+    },
+    Check {
+        #[arg(long)]
+        timings: bool,
+    },
     Clean,
+    #[command(name = "dev-plan")]
+    DevPlan,
     #[command(name = "kvm-smoke", disable_help_flag = true)]
     KvmSmoke {
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
@@ -61,7 +70,6 @@ enum ConfigCommand {
 }
 
 pub(crate) fn run() -> Result<()> {
-    let config = Config::from_env()?;
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(err) if err.use_stderr() => return Err(err.into()),
@@ -71,10 +79,23 @@ pub(crate) fn run() -> Result<()> {
         }
     };
 
+    if matches!(&cli.command, Some(XtaskCommand::DevPlan)) {
+        let root = env_path("ROOT_DIR").unwrap_or_else(default_root_dir);
+        return crate::dev::print_plan(&root);
+    }
+    if cli.command.is_none() {
+        Cli::command().print_help()?;
+        println!();
+        return Ok(());
+    }
+
+    let config = Config::from_env()?;
+
     match cli.command {
-        Some(XtaskCommand::Build) => build::build(&config),
-        Some(XtaskCommand::Check) => build::check(&config),
+        Some(XtaskCommand::Build { timings }) => build::build(&config, timings),
+        Some(XtaskCommand::Check { timings }) => build::check(&config, timings),
         Some(XtaskCommand::Clean) => build::clean(&config),
+        Some(XtaskCommand::DevPlan) => unreachable!("dev-plan returned before loading config"),
         Some(XtaskCommand::KvmSmoke { args }) => kvm::kvm_smoke_command(&config, args.into_iter()),
         Some(XtaskCommand::KvmRun) => kvm::kvm_run_command(&config),
         Some(XtaskCommand::Selftest) => testinfra::selftest(&config),
@@ -93,10 +114,6 @@ pub(crate) fn run() -> Result<()> {
             ConfigCommand::Check => config_mod::check(&config),
             ConfigCommand::Show => config_mod::show(&config),
         },
-        None => {
-            Cli::command().print_help()?;
-            println!();
-            Ok(())
-        }
+        None => unreachable!("missing command returned before loading config"),
     }
 }

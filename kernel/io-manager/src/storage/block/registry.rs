@@ -65,14 +65,6 @@ fn register_partitions(root_id: u32) {
     }
 }
 
-pub(super) fn device_logical_block_size_locked(
-    devices: &[BlockDeviceRecord],
-    device_id: u32,
-) -> Option<usize> {
-    let record = devices.iter().find(|device| device.id == device_id)?;
-    Some(record.logical_block_size)
-}
-
 pub(super) fn device_block_count_locked(
     devices: &[BlockDeviceRecord],
     device_id: u32,

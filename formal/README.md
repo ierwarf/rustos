@@ -36,10 +36,13 @@ Run an individual model with:
 
     bash formal/run-tlc.sh endpoint-registry/EndpointRegistry
 
-The CI job uses one TLC worker and a fixed seed. This keeps each result
-reproducible and avoids accepting a liveness result from a multi-worker
-execution. The bounded models intentionally reach a finite cutoff, so the
-runner disables TLC's deadlock report; configured invariants remain mandatory.
+The runner uses TLC's automatic local worker count and a fixed fingerprint seed.
+This preserves exhaustive invariant checking while avoiding a repository-wide
+single-core bottleneck. Worker scheduling can change exploration order; use
+`TLC_WORKERS=1` when a serial reproduction is needed, or set any positive
+integer for a bounded worker count. The bounded models intentionally reach a
+finite cutoff, so the runner disables TLC's deadlock report; configured
+invariants remain mandatory.
 
 ## Models and required properties
 
@@ -53,7 +56,7 @@ runner disables TLC's deadlock report; configured invariants remain mandatory.
 | dma-iommu-isolation/DmaIommuIsolation | L0 hostd plus kernel I/O substrate | device ownership is exact, mappings remain in the assigned domain aperture, revocation removes mappings, and the finite map set stays bounded |
 | filesystem-content-integrity/FilesystemContentIntegrity | signed boot extent manifest plus kernel boot-volume reader | only bytes matching the manifest digest verify; corrupted content fails closed and an unavailable medium terminates the read |
 | network-payload-session/NetworkPayloadSession | DVM Ethernet transport plus netd | only bounded ARP/IPv4 payloads from an active authenticated epoch are delivered; malformed frames are dropped while advancing the sole consumer cursor |
-| scheduler-cpu-distribution/SchedulerCpuDistribution | `kernel-ps` scheduler | a representative continuously runnable User task receives a turn after the bounded System burst and per-task CPU accounting remains bounded in the checked horizon |
+| scheduler-cpu-distribution/SchedulerCpuDistribution | `kernel-ps` scheduler | every continuously runnable User task receives a turn after the two-dispatch System bound or its per-task ready-age limit; a bounded, deduplicated User latency FIFO drops stale owners and cannot exceed its eight-pick burst; per-task CPU accounting remains bounded in the checked horizon |
 | rootd-bootstrap/RootdBootstrap | rootd, loaderd, IPC endpoint wait | core dependency gate before initd; exact PID lease; endpoint/capability lifecycle; bounded waits; single initd launch |
 | endpoint-registry/EndpointRegistry | kernel compat IPC registry, rootd capability decision | publication is capability-complete; revoke/exit leave no authority; exact-PID wait cannot succeed on stale or foreign state |
 | endpoint-publication/EndpointPublication | kernel compat IPC registry, process-table exit marker | registry writers are serialized; an exit marker aborts in-flight publication; lookup/capability authority needs an exact running owner; cleanup leaves no terminal authority |
@@ -68,10 +71,10 @@ runner disables TLC's deadlock report; configured invariants remain mandatory.
 | dvm-input-revocation/DvmInputRevocation | RDI3 receiver, ring0 ingress queue, inputd, keyboard-core | every one-shot epoch start/end is a priority reset barrier; queued keys are bound to the current epoch; no key is delivered before its epoch reset; inputd releases all retired provider key state |
 | dvm-input-ring/DvmInputRing | L0 producer, fixed ivshmem ring, RustOS MSI-X leaf, inputd broker | only L0 advances producer and only the broker advances consumer; 2,048 fixed 32-byte slots retain cleanup reserve; continuous production requires both an armed vector and a successful policy-backed client poll; DVM tamper attempts cannot mutate the ring; IRQ only wakes; malformed/stale records cannot reach inputd; revoke clears transport/consumer readiness and decoder authority; a boot-wide bounded recovery budget reuses one pinned vector; fairness drains or revokes finite committed work |
 | trusted-ui-boundary/TrustedUiBoundary | DVM display/input provenance, GUI backend, uiserver trusted-UI status | a privileged prompt requires independently attested scanout and human input; DVM compromise, provider loss, or independent-attestation revocation cancels it; a DVM transport may never self-attest |
-| input-readiness/InputReadiness | ring0 ingress queue, poll/epoll substrate, inputd | arming/recheck cannot hide ingress; the poll STATS recheck or an authorized read transfers an ingress record to inputd; every record has exactly one ring0, policy, or delivered owner |
+| input-readiness/InputReadiness | ring0 ingress queue, finite poll substrate, inputd worker, uiserver direct reader | the MSI-X worker, finite STATS recheck, and authorized nonblocking read are explicit transfer races; every record has exactly one ring0, policy, or delivered owner and service policy drains under consumer fairness |
 | ui-frame-budget/UiFrameBudget | uiserver input loop, console-command worker, frame/present loop | console-policy IPC has bounded FIFO admission and one delivery owner; overload is recorded; an in-flight policy call cannot make local redraw debt wait; active-input feedback is eventually presented |
 | ui-input-motion/UiInputMotion | DVM KVM input selftest and uiserver present loop | the test pointer reverses both axes before permanent edge clamping; every initial cursor position yields bounded visible work, and every accepted visible-motion epoch is eventually presented |
-| dvm-input-selftest/DvmInputSelftest | DVM KVM selftest evdev selection and host input relay | the synthetic composite device cannot stream without absolute pointer capability; exactly one non-printable keyboard probe precedes pointer-only cycles; every generated position produces one pointer position and proves both routes |
+| dvm-input-selftest/DvmInputSelftest | DVM KVM selftest evdev selection, bounded guest scheduler admission, and host input relay | the synthetic composite device cannot emit without absolute pointer capability plus a verified SCHED_RR/RLIMIT_RTTIME guard; exactly one non-printable keyboard probe precedes pointer-only cycles; every generated position consumes one non-accumulating monotonic cadence permit, produces one pointer position, and proves both routes even when unrelated poll events remain ready |
 | dvm-absolute-pointer/DvmAbsolutePointer | DVM evdev agent, L0 RDI3 relay, ring0 decoder, inputd, uiserver | partial axis reports never publish; duplicate complete positions are idempotent; every position has exactly one pipeline owner; absolute coordinates stay bounded and cannot cause phantom UI motion; finite accepted work drains under fairness |
 | devmgrd-sessiond-isolation/DevmgrdSessiondIsolation | devmgrd receive loop and bounded sessiond ioctl workers | sessiond ioctls have bounded FIFO admission or EAGAIN; worker stalls never own devmgrd's receive loop; unrelated device traffic remains replyable |
 | vfio-release-authorization/VfioReleaseAuthorization | hostd release gate, durable VFIO lease | no topology preflight can bind a device; a pinned-key signature binds the exact group, CID, DVM artifact, and device policy; every bind mutation is within the signed validity window; restore leaves no authority |
@@ -79,10 +82,15 @@ runner disables TLC's deadlock report; configured invariants remain mandatory.
 | dvm-release-bundle/DvmReleaseBundle | DVM artifact writer, safe staging, xtask and hostd admission | exactly one strict 25-key manifest, one strict six-key control contract, and the other six co-located payloads must verify before atomic publication; unsafe/mutable paths, missing or corrupted companions, replacement, and post-publication mutation cannot grant launch authority; hostd independently reverifies and snapshots the published bundle |
 | dvm-display-driver-supply/DvmDisplayDriverSupply | pinned Linux DVM physical-display package and boot admission | KMS requires the exact open-module/GSP release selected only by a kernel PCI modalias plus a bound kernel-enforced module-signing certificate; UVM/compute authority is absent; relay readiness follows complete KMS initialization; firmware distribution requires an independent authorization and cannot mix releases |
 | dvm-amdgpu-supply/DvmAmdgpuSupply | AMD `1002:1900` DVM module, firmware, and KMS admission | KMS and relay readiness require the signed upstream amdgpu module, its bound certificate, kernel PCI modalias selection, and all twelve GC 11.0.1, PSP 13.0.4, SDMA 6.0.1, and VCN 4.0.2 firmware payloads; incomplete or revoked supply remains offline |
+| dvm-amdgpu-evidence/DvmAmdgpuEvidence | hostd schema-3 AMD policy and authenticated physical page-flip evidence | admission requires exact host and DVM `amdgpu` `1002:1900` identity plus consecutive fresh zero-copy samples meeting signed frame-rate and latency bounds; wrong identity, a failing sample, or stale sequence revokes readiness |
 | driver-domain-fleet/DriverDomainFleet | hostd fleet policy and signed release gate | a fleet member is exactly encoded; CIDs, IOMMU groups, and representative PCI functions are globally disjoint; policy is immutable after sealing; only a signed release bound to that fleet can activate a member |
 | ivshmem-pairing/IvshmemPairing | launch-private ivshmem broker and KVM launcher | the RustOS QEMU connection is observed as peer 0 before GUI-DVM launch; peer 1 cannot exist without peer 0; disconnect fails the complete pair closed and no reconnect can reuse the assignment |
 | gui-dvm-surface/GuiDvmSurface | RustOS compositor to the sole supported GUI-DVM transport | `RSGUI002` has exactly three host-provisioned slots, exact even PRESENT/RELEASE generations, one outstanding DVM control record, module-latched pre-boot invitations, offline confirmation clearing, saturated-pool re-invitation, and stale-slot reclamation. It asserts bounded backpressure without fabricating capacity. Multi-domain focus is unavailable and rejected by the source rather than modeled as authority. |
 | dvm-atomic-scanout/DvmAtomicScanout | Linux DVM DRM/KMS relay | root-only exporter open and all three read-only imports precede KMS/relay readiness without requiring a host invitation; each immutable slot is a direct DMA-BUF framebuffer, the new front remains pinned, the old front is released only after the replacement page-flip fence, device-write DMA authority is absent, and offline revokes the pool |
+| dvm-gpu-compositor/DvmGpuCompositor | uiserver private scene compiler and Linux DVM fixed GLES executor | a bounded OS-owned context admits only clear, solid-quad, and textured-quad commands with host-bound read-only source tokens; only a measured prime record for the current host-selected epoch enables the asynchronous three-entry queue; acquire, completion, release, and presentation are monotonic fence states; raw commands, application shaders, CPU fallback success, and device writes to RustOS sources are impossible; a 16.667 ms target miss retains the prior front and live epoch, while the separate 50 ms hard timeout or revoke invalidates the full epoch and stale completions cannot revive it |
+| dvm-display-scheduler/DvmDisplayScheduler | authenticated Linux DVM GPU/KMS relay scheduling | only a confirmed host invitation admits the current relay thread to bounded SCHED_RR; display priority remains below input, continuous realtime CPU is capped, blocking DRM/fence work resets the budget, and stop or hard-limit restores normal policy before retry |
+| dvm-gpu-admission/DvmGpuAdmission | uiserver provider admission, off-UI-thread GPU atlas initialization, and frame cadence | a mandatory DVM topology never reports software fallback as GPU success; CPU presentation remains live while the bounded worker initializes; only a current measured full-atlas/textured-draw prime, exact valid provider stride/mapping, retained scene, and completed first GPU frame promote the consumer; clear-only priming fails closed, each steady frame consumes one non-accumulating timer permit, initialization/first-frame timeout settles, and revoke requires a fresh epoch prime |
+| dvm-gpu-atlas-transport/DvmGpuAtlasTransport | uiserver atlas owner, fixed RustOS transport, and display-DVM executor | one atomic frame binds one immutable generation from exactly three source slots; the first update defines the full atlas, later bounded non-overlapping damage or command-only updates execute strictly in order; QEMU staged upload and physical read-only DMA-BUF modes cannot exchange evidence; source reuse requires the GPU fence, old-front reuse requires the later present fence, and revoke/reset removes every outstanding authority |
 | gui-dvm-install/GuiDvmInstall | GUI-DVM ivshmem installer in the I/O manager | one serialized installer owns both BAR mappings, two permanent MSI-X vectors, and provider registration. Every malformed, absent, or failed installation releases mappings before terminal rejection; a concurrent caller cannot allocate a second installation; a revoked transport never reopens or falls back. |
 | ipc-reply-deadline/IpcReplyDeadline | kernel IPC runtime and compat deadline wait | exact caller/reply ownership; one-shot reply completion; owner exit and deadline clear the waiter; every blocked control cycle carries a finite break; stale or late replies cannot revive authority |
 | scheduler-wakeup/SchedulerWakeup | kernel scheduler, current-task block API, timer IRQ | arm/wake/commit uses a fresh epoch; a wake before commit cannot become a block; blocked tasks own one unexpired timer; timer expiry precedes subsequent dispatch; retired tasks retain no scheduler or timer authority |
@@ -165,16 +173,16 @@ exists, the uiserver endpoint reports the two attestation blockers for every
 provider, with `DVM_SCANOUT` as additional provenance.
 
 `input-readiness` covers the availability boundary between the same ring0
-transport and its user-space policy owner. Ring0 poll wake is derived from the
-bounded ingress queue, so an eager periodic drain would leave a reader asleep
-after removing the only observable record. Instead, the poll recheck invokes
-`INPUTD_IPC_OP_STATS`, and inputd transfers ingress before reporting its
-service-owned queue. That non-consuming probe has a finite reply deadline: a
-retry sees either unchanged ingress or the policy record transferred just
-before cancellation. An authorized read retains the same transfer as a direct
-read operation. The model constrains every ingress record to a DVM-labelled
-Linux-key or pointer-packet kind; reader identity and key translation remain
-covered by the ABI, revocation model, and KVM input-stream gate.
+transport and its user-space policy owner. The model includes the dedicated
+MSI-X-woken inputd worker, which may move ingress into service policy without
+an application read. Finite poll rechecks invoke `INPUTD_IPC_OP_STATS`; the
+latency-sensitive uiserver reader instead issues authorized nonblocking reads
+on a bounded cumulative cadence. Both operations refresh ingress under the
+inputd queue lock, and every transfer retains exact ownership and provenance.
+The general indefinite-poll service readiness object remains a failed next-ABI
+gate rather than being inferred from a ring0 wake. Reader identity and key
+translation remain covered by the ABI, revocation model, and KVM input-stream
+gate.
 
 `ui-frame-budget` begins after that input ownership transfer. Keyboard routing
 and console focus updates cross the `uiserver -> devmgrd -> runtimed` policy

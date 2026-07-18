@@ -13,8 +13,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use rustos_driver_domain_host::{
     ControlContract, ControlSecret, DeviceClass, DeviceTransport, DriverDomainPolicy,
-    HostControlListener, SysfsVfioOps, ValidatedLease, VfioLeaseRecord, VfioLeaseState,
-    reset_vfio_group, restore_vfio_lease,
+    HostControlListener, PhysicalDisplayPolicy, SysfsVfioOps, ValidatedLease, VfioLeaseRecord,
+    VfioLeaseState, reset_vfio_group, restore_vfio_lease, validate_host_display_assignment,
+    validate_physical_display_assignment, validate_physical_display_identity,
 };
 use sha2::{Digest, Sha256};
 
@@ -347,7 +348,7 @@ pub fn verify_artifacts(manifest: &Path) -> Result<VerifiedArtifacts> {
         || manifest_value(&values, "control-transport")? != "kvm-vsock"
         || manifest_value(&values, "control-authentication")? != "dvm-agent-hmac-sha256-v1"
         || manifest_value(&values, "control-capabilities")?
-            != "health,device-inventory,driver-inventory,input-stream"
+            != "health,device-inventory,driver-inventory,display-evidence-v1,input-stream"
         || manifest_value(&values, "buildroot_version")? != "2026.05"
         || manifest_value(&values, "linux_version")? != "6.12.94"
         || manifest_value(&values, "nvidia-open-version")? != "580.173.02"
@@ -429,6 +430,7 @@ pub fn verify_artifacts(manifest: &Path) -> Result<VerifiedArtifacts> {
 /// authorized IOMMU group is detached from its host drivers.
 pub fn preflight_physical_runtime_inputs(
     lease: &ValidatedLease,
+    sysfs_root: &Path,
     qemu: &Path,
     artifact_manifest: &Path,
     device_policy: &Path,
@@ -443,6 +445,11 @@ pub fn preflight_physical_runtime_inputs(
     {
         bail!("physical runtime preflight requires display-dmabuf-kms with network/block disabled");
     }
+    let physical_display = policy
+        .physical_display()
+        .ok_or_else(|| anyhow!("physical runtime preflight requires device policy schema 3"))?;
+    validate_host_display_assignment(lease, sysfs_root)?;
+    validate_physical_display_assignment(lease, sysfs_root, physical_display)?;
     let (_, qemu_sha256) = verify_qemu(qemu)?;
     if qemu_sha256 != policy.qemu_sha256() {
         bail!("physical runtime QEMU digest does not match the signed device policy");
@@ -512,6 +519,20 @@ pub fn supervise_domain(
     {
         bail!("supervised physical DVM requires display-dmabuf-kms with network/block disabled");
     }
+    let physical_display = policy
+        .physical_display()
+        .ok_or_else(|| anyhow!("supervised physical DVM requires device policy schema 3"))?
+        .clone();
+    let display_bdf =
+        validate_physical_display_identity(&validated, sysfs_root, &physical_display)?;
+    if lease
+        .original_drivers
+        .get(&display_bdf)
+        .and_then(Option::as_deref)
+        != Some(physical_display.driver())
+    {
+        bail!("durable VFIO lease does not retain the signed physical display driver");
+    }
     ensure_private_regular_file(config.display_pixels)?;
     ensure_private_socket(config.display_doorbell)?;
     let (qemu, qemu_sha256) = verify_qemu(config.qemu)?;
@@ -571,10 +592,18 @@ pub fn supervise_domain(
             .write_all(&[1])
             .context("release durably recorded DVM launch gate")?;
         drop(launch_gate);
-        wait_for_display_readiness(&listener, config.setup_timeout)?;
+        let display_sample_sequence =
+            wait_for_display_readiness(&listener, config.setup_timeout, &physical_display)?;
         record.state = RuntimeState::Ready;
         store.write_record(&record)?;
-        let status = monitor_child(&mut child, &mut record, store, &listener)?;
+        let status = monitor_child(
+            &mut child,
+            &mut record,
+            store,
+            &listener,
+            &physical_display,
+            display_sample_sequence,
+        )?;
         require_successful_child_exit(status)
     })();
     let stop_error = if run_result.is_err() {
@@ -669,7 +698,7 @@ fn spawn_qemu_gated(
         .arg(&artifacts.rootfs)
         .args([
             "-append",
-            "console=ttyS0",
+            "console=ttyS0 preempt=full",
             "-display",
             "none",
             "-vga",
@@ -750,6 +779,8 @@ fn monitor_child(
     record: &mut RuntimeRecord,
     store: &RuntimeStore,
     listener: &HostControlListener,
+    display_policy: &PhysicalDisplayPolicy,
+    mut display_sample_sequence: u64,
 ) -> Result<ExitStatus> {
     let mut next_health = Instant::now() + HEALTH_INTERVAL;
     loop {
@@ -771,15 +802,34 @@ fn monitor_child(
             {
                 bail!("DVM lost direct display driver/relay readiness");
             }
+            let evidence = probe
+                .display_evidence
+                .as_ref()
+                .ok_or_else(|| anyhow!("DVM lost physical display evidence"))?;
+            display_policy.validate_evidence(evidence)?;
+            if evidence.sample_sequence <= display_sample_sequence {
+                bail!(
+                    "DVM physical display evidence stopped advancing sequence={} previous={}",
+                    evidence.sample_sequence,
+                    display_sample_sequence
+                );
+            }
+            display_sample_sequence = evidence.sample_sequence;
             next_health = Instant::now() + HEALTH_INTERVAL;
         }
         std::thread::sleep(SUPERVISOR_TICK);
     }
 }
 
-fn wait_for_display_readiness(listener: &HostControlListener, timeout: Duration) -> Result<()> {
+fn wait_for_display_readiness(
+    listener: &HostControlListener,
+    timeout: Duration,
+    display_policy: &PhysicalDisplayPolicy,
+) -> Result<u64> {
     let deadline = Instant::now() + timeout;
     let mut last_reason = "no authenticated DVM probe".to_owned();
+    let mut last_sequence = 0_u64;
+    let mut consecutive_samples = 0_u32;
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let attempt_timeout = remaining.min(HEALTH_TIMEOUT);
@@ -788,14 +838,48 @@ fn wait_for_display_readiness(listener: &HostControlListener, timeout: Duration)
                 if probe.driver_inventory.display_driver_bound
                     && probe.driver_inventory.display_relay_ready =>
             {
-                return Ok(());
+                match probe.display_evidence.as_ref() {
+                    Some(evidence) => match display_policy.validate_evidence(evidence) {
+                        Ok(()) if evidence.sample_sequence == last_sequence => {}
+                        Ok(()) => {
+                            consecutive_samples = if last_sequence == 0
+                                || last_sequence.checked_add(1) == Some(evidence.sample_sequence)
+                            {
+                                consecutive_samples + 1
+                            } else {
+                                1
+                            };
+                            last_sequence = evidence.sample_sequence;
+                            if consecutive_samples >= display_policy.required_consecutive_samples()
+                            {
+                                return Ok(last_sequence);
+                            }
+                        }
+                        Err(error) => {
+                            consecutive_samples = 0;
+                            last_reason = format!("{error:#}");
+                        }
+                    },
+                    None => {
+                        consecutive_samples = 0;
+                        last_reason = "physical display evidence unavailable".to_owned();
+                    }
+                }
             }
-            Ok(_) => last_reason = "display driver or direct relay not ready".to_owned(),
-            Err(error) => last_reason = format!("{error:#}"),
+            Ok(_) => {
+                consecutive_samples = 0;
+                last_reason = "display driver or direct relay not ready".to_owned();
+            }
+            Err(error) => {
+                consecutive_samples = 0;
+                last_reason = format!("{error:#}");
+            }
         }
         std::thread::sleep(SUPERVISOR_TICK);
     }
-    bail!("DVM failed authenticated direct-display readiness: {last_reason}")
+    bail!(
+        "DVM failed authenticated physical-display readiness after {consecutive_samples} consecutive samples: {last_reason}"
+    )
 }
 
 fn stop_child(child: &mut Child) -> Result<()> {

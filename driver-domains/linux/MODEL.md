@@ -43,21 +43,25 @@ successful empty-IOAS allocate/destroy ioctl probe without changing a binding.
 after signed-release admission and before it writes prepared state or detaches
 the group from its host drivers.
 
-`rustos-hostd relay-input` and the physical-device supervisor require a strict
-`driver-domain-policy-v2` file. Its domain ID must match the validated plan, its
-signed bytes bind the exact production QEMU SHA-256, and it enables exactly one
-named transport per class. Input uses `input-ring-msix`; the commercial display
-slice uses `display-dmabuf-kms`. Physical network and block remain disabled.
+`rustos-hostd relay-input` accepts the strict schema-2 input-only policy. The
+physical-device supervisor requires `driver-domain-policy-v3`: its domain ID
+must match the validated plan, its signed bytes bind the exact production QEMU
+SHA-256 plus `amdgpu` `1002:1900`, and it fixes the nominal-60-Hz page-flip and
+latency evidence thresholds. Input uses `input-ring-msix`; the commercial
+display slice uses `display-dmabuf-kms`. Physical network and block remain disabled.
 
 `rustos-hostd acquire --activate` requires a detached signature verified by a
-pinned keyring. The release binds the exact plan, DVM artifacts, schema-2 device
+pinned keyring. The release binds the exact plan, DVM artifacts, schema-3 device
 policy, fleet, and validity window before hostd writes a private `prepared`
 lease, snapshots every original driver/override, binds the complete group to
 `vfio-pci`, and atomically marks it active. Unsigned binding is unavailable.
 
 `rustos-hostd supervise` then resets the complete group, requires `/dev/iommu`,
 launches the signed QEMU with one IOMMUFD and every group function attached to
-it, and authenticates the DVM control channel within 30 seconds. A pre-exec
+it, and authenticates the DVM control channel within 30 seconds. Readiness then
+requires five fresh relay-owned `display-evidence-v1` samples proving direct
+DMA-BUF scanout, zero CPU copy, the exact AMD identity, and the signed
+throughput/page-flip/commit latency bounds. A pre-exec
 gate keeps QEMU from opening VFIO until the exact PID/start-time and all bound
 digests are fsync'd in the private runtime record. The launcher accepts only
 canonical trusted-owner launch files under non-mutable directory chains and
@@ -143,6 +147,58 @@ presentation path: `uiserver` submits only to the validated DVM pool, and a
 missing, malformed, or revoked provider is `Unavailable` rather than a
 boot-framebuffer or generic-provider fallback. The non-DVM direct-GPU test
 profile is diagnostic-only and cannot satisfy commercial GUI acceptance.
+
+The private compositor transport is deliberately narrower than an application
+graphics ABI. One atomic frame binds one immutable atlas generation from a
+three-slot RustOS-owned pool plus a bounded clear/solid/textured command list.
+The display provider owns pitch: uiserver accepts padding only when the surface
+pitch exactly matches the provider, remains pixel-aligned, and bounds
+`stride * height`. This follows the Linux DMA-BUF exchange rule that allocation
+may preserve the requested width while returning a wider aligned stride, and
+the Wayland `wl_shm` rule that a buffer carries an explicit row stride rather
+than an implied `width * bpp` value. Atlas allocation/mapping runs in a bounded
+worker; the existing CPU-presented surface remains live until the current-epoch
+prime, retained scene, and first GPU+KMS completion atomically promote the path.
+The prime is workload-representative rather than a clear-only readiness token:
+before advertising the epoch, the DVM performs one full provider-stride atlas
+upload, the fixed textured-quad GLES path, an EGL native completion fence, and
+the initial atomic KMS present under one 500 ms setup deadline. Steady frames
+remain independently limited to 16.667 ms. Thus shader or full-upload first-use
+cost cannot destroy an epoch after it was reported ready.
+Initialization or first-frame timeout is terminal, and malformed layers never
+hide behind the transient retained-scene wait.
+In QEMU, changed atlas rectangles take one explicit staged upload into the
+virtio-GPU texture and evidence is labelled `source-path=staged-copy
+zero-copy=0`. On physical AMD, the same logical source is a read-only DMA-BUF
+import labelled `source-path=dmabuf zero-copy=1`. The first path can prove real
+GPU composition but never physical zero copy. Atlas reuse follows the GPU
+completion fence; old output reuse follows the later KMS page-flip fence.
+Ring0 validates fixed records and slot epochs only; scene policy, packing, and
+fallback rejection remain in `uiserver`, while GLES/KMS execution remains in
+the DVM.
+
+The relay reports one-second windows from the per-frame completion point, not
+from an outer queue-drain boundary. Therefore a continuously non-empty queue
+cannot starve evidence. A passing virtual window has matching page-flip,
+GPU-fence, and present-fence counts, zero relay CPU-copy time, at least 60 FPS,
+at most 12 ms average GPU/atomic work, and at most 16.667 ms maximum GPU render
+time. Per-frame serial tracing is rate-limited and is not the acceptance
+counter. This matches DRM's explicit in/out-fence ordering; it does not convert
+QEMU staged copy into physical zero copy.
+
+The private compositor uses a cumulative 16 ms submission cadence when no
+provider vblank clock is exported. Input continues to coalesce while an early
+submission receives backpressure; it never falls through to CPU presentation.
+Missed cadence slots are skipped instead of accumulated, so a stalled frame
+cannot be followed by a GPU burst. This keeps a small margin above the 60 FPS
+gate without the previously observed 90-100 FPS saturation.
+
+References: [Linux DMA-BUF buffer exchange](https://docs.kernel.org/userspace-api/dma-buf-alloc-exchange.html),
+[Wayland `wl_shm` buffer stride](https://wayland.freedesktop.org/docs/html/apa.html),
+[Linux DRM/KMS userspace API](https://docs.kernel.org/gpu/drm-uapi.html),
+[Khronos EGL native-fence contract](https://registry.khronos.org/EGL/extensions/ANDROID/EGL_ANDROID_native_fence_sync.txt),
+and [Android SurfaceFlinger/HWC ownership](https://source.android.com/docs/core/graphics/surfaceflinger-windowmanager).
+
 Linux 6.12 virtio-gpu rejects the foreign SG-table DMA-BUF needed by direct
 scanout, and current QEMU vmware-svga cannot bind vmwgfx because pitchlock is
 absent. Therefore virtual KVM cannot close the direct-scanout gate; the required

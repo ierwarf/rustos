@@ -11,7 +11,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::app::{AppState, ConsoleWindow, CursorMotion, DesktopSurfaceCache};
-use crate::canvas::{Rect, SurfaceCanvas};
+use crate::canvas::{
+    render_cursor_bgra, Rect, SurfaceCanvas, CURSOR_TEXTURE_SIZE, CURSOR_VISUAL_RADIUS,
+};
+use crate::gpu_scene::{
+    GpuAtlasPacker, GpuLayerKind, GpuLayerTransform, GpuSceneError, GpuSceneLayer,
+    GpuTextureCapability, GpuTextureRegion,
+};
 use crate::layout::{
     clamp_window_rect, default_console_window_rect as layout_default_console_window_rect,
     launcher_button_rect as layout_launcher_button_rect, taskbar_rail_rect,
@@ -150,6 +156,440 @@ pub(crate) fn render_frame(state: &mut AppState) {
         &mut state.console_windows,
         &state.wayland_windows,
     );
+}
+
+pub(crate) struct GpuAtlasScene {
+    pub(crate) layers: Vec<GpuSceneLayer>,
+    pub(crate) cursor_source_rect: Rect,
+}
+
+/// Build the retained desktop/window portion of one private GPU frame. Each
+/// returned texture is an independently rasterized layer inside `atlas`; no
+/// layer is painted at its final destination and no inter-window z-order blend
+/// happens on the CPU. Dynamic dock entries are rasterized as one retained
+/// taskbar texture, while the premultiplied cursor occupies a stable atlas
+/// region so pointer movement normally changes commands without repacking the
+/// desktop scene.
+pub(crate) fn build_gpu_atlas_scene(
+    state: &mut AppState,
+    atlas_pixels: &mut [u32],
+    atlas_width: usize,
+    atlas_height: usize,
+    atlas_stride_pixels: usize,
+    atlas: GpuTextureCapability,
+) -> Result<GpuAtlasScene, GpuSceneError> {
+    if usize::try_from(atlas.width).ok() != Some(atlas_width)
+        || usize::try_from(atlas.height).ok() != Some(atlas_height)
+        || usize::try_from(atlas.stride_bytes).ok() != atlas_stride_pixels.checked_mul(4)
+    {
+        return Err(GpuSceneError::InvalidLayer);
+    }
+    refresh_desktop_surface(state);
+    if !state.desktop_cache.fully_valid() {
+        return Err(GpuSceneError::SceneNotReady);
+    }
+
+    let mut packer =
+        GpuAtlasPacker::new(atlas_pixels, atlas_width, atlas_height, atlas_stride_pixels)?;
+    let mut layers = Vec::new();
+    push_xrgb_gpu_layer(
+        &mut packer,
+        &mut layers,
+        atlas,
+        state.desktop_cache.pixels.as_slice(),
+        state.desktop_cache.width,
+        state.desktop_cache.height,
+        state.desktop_cache.width,
+        Rect {
+            x: 0,
+            y: 0,
+            width: state.surface.width as usize,
+            height: state.surface.height as usize,
+        },
+    )?;
+
+    let focused_wayland = state.focused_wayland_surface_id;
+    let focused_session = state.focused_session_handle;
+    for window in state
+        .wayland_windows
+        .iter()
+        .filter(|window| !window.minimized && Some(window.surface_id) != focused_wayland)
+    {
+        push_wayland_gpu_layer(&mut packer, &mut layers, atlas, window, false)?;
+    }
+    for window in state
+        .console_windows
+        .iter_mut()
+        .filter(|window| !window.minimized && window.session_handle != focused_session)
+    {
+        push_console_gpu_layer(&mut packer, &mut layers, atlas, window, false)?;
+    }
+    if let Some(surface_id) = focused_wayland {
+        if let Some(window) = state
+            .wayland_windows
+            .iter()
+            .find(|window| !window.minimized && window.surface_id == surface_id)
+        {
+            push_wayland_gpu_layer(&mut packer, &mut layers, atlas, window, true)?;
+        }
+    } else if focused_session != 0 {
+        if let Some(window) = state
+            .console_windows
+            .iter_mut()
+            .find(|window| !window.minimized && window.session_handle == focused_session)
+        {
+            push_console_gpu_layer(&mut packer, &mut layers, atlas, window, true)?;
+        }
+    }
+    push_dock_gpu_layer(&mut packer, &mut layers, atlas, state)?;
+    let mut cursor = vec![0_u32; CURSOR_TEXTURE_SIZE * CURSOR_TEXTURE_SIZE];
+    if !render_cursor_bgra(cursor.as_mut_slice(), state.cursor_motion) {
+        return Err(GpuSceneError::InvalidLayer);
+    }
+    let cursor_source_rect = packer.place_bgra(
+        cursor.as_slice(),
+        CURSOR_TEXTURE_SIZE,
+        CURSOR_TEXTURE_SIZE,
+        CURSOR_TEXTURE_SIZE,
+    )?;
+    Ok(GpuAtlasScene {
+        layers,
+        cursor_source_rect,
+    })
+}
+
+pub(crate) fn update_gpu_cursor_texture(
+    atlas_pixels: &mut [u32],
+    atlas_stride_pixels: usize,
+    source_rect: Rect,
+    motion: CursorMotion,
+) -> Result<(), GpuSceneError> {
+    if source_rect.width != CURSOR_TEXTURE_SIZE
+        || source_rect.height != CURSOR_TEXTURE_SIZE
+        || atlas_stride_pixels < source_rect.x.saturating_add(source_rect.width)
+    {
+        return Err(GpuSceneError::InvalidLayer);
+    }
+    let mut cursor = vec![0_u32; CURSOR_TEXTURE_SIZE * CURSOR_TEXTURE_SIZE];
+    if !render_cursor_bgra(cursor.as_mut_slice(), motion) {
+        return Err(GpuSceneError::InvalidLayer);
+    }
+    for row in 0..CURSOR_TEXTURE_SIZE {
+        let destination_start = (source_rect.y + row)
+            .checked_mul(atlas_stride_pixels)
+            .and_then(|offset| offset.checked_add(source_rect.x))
+            .ok_or(GpuSceneError::InvalidLayer)?;
+        let destination_end = destination_start
+            .checked_add(CURSOR_TEXTURE_SIZE)
+            .ok_or(GpuSceneError::InvalidLayer)?;
+        let source_start = row * CURSOR_TEXTURE_SIZE;
+        atlas_pixels
+            .get_mut(destination_start..destination_end)
+            .ok_or(GpuSceneError::InvalidLayer)?
+            .copy_from_slice(&cursor[source_start..source_start + CURSOR_TEXTURE_SIZE]);
+    }
+    Ok(())
+}
+
+pub(crate) fn gpu_cursor_layer(
+    atlas: GpuTextureCapability,
+    source_rect: Rect,
+    cursor_x: u32,
+    cursor_y: u32,
+    output_width: u32,
+    output_height: u32,
+) -> Option<GpuSceneLayer> {
+    let radius = CURSOR_VISUAL_RADIUS as i64;
+    let left = i64::from(cursor_x) - radius;
+    let top = i64::from(cursor_y) - radius;
+    let right = left + CURSOR_TEXTURE_SIZE as i64;
+    let bottom = top + CURSOR_TEXTURE_SIZE as i64;
+    let visible_left = left.max(0);
+    let visible_top = top.max(0);
+    let visible_right = right.min(i64::from(output_width));
+    let visible_bottom = bottom.min(i64::from(output_height));
+    if visible_left >= visible_right || visible_top >= visible_bottom {
+        return None;
+    }
+    let source = Rect {
+        x: source_rect.x + usize::try_from(visible_left - left).ok()?,
+        y: source_rect.y + usize::try_from(visible_top - top).ok()?,
+        width: usize::try_from(visible_right - visible_left).ok()?,
+        height: usize::try_from(visible_bottom - visible_top).ok()?,
+    };
+    Some(GpuSceneLayer {
+        destination: Rect {
+            x: usize::try_from(visible_left).ok()?,
+            y: usize::try_from(visible_top).ok()?,
+            width: source.width,
+            height: source.height,
+        },
+        opacity: u8::MAX,
+        source_over: true,
+        transform: GpuLayerTransform::flat(),
+        kind: GpuLayerKind::Texture {
+            region: GpuTextureRegion {
+                atlas,
+                source_rect: source,
+            },
+        },
+    })
+}
+
+fn push_dock_gpu_layer(
+    packer: &mut GpuAtlasPacker<'_>,
+    layers: &mut Vec<GpuSceneLayer>,
+    atlas: GpuTextureCapability,
+    state: &AppState,
+) -> Result<(), GpuSceneError> {
+    let destination =
+        taskbar_dirty_rect(state.surface.width, state.surface.height).intersect(Rect {
+            x: 0,
+            y: 0,
+            width: state.surface.width as usize,
+            height: state.surface.height as usize,
+        });
+    if destination.is_empty() {
+        return Ok(());
+    }
+    let pixel_count = destination
+        .width
+        .checked_mul(destination.height)
+        .ok_or(GpuSceneError::InvalidLayer)?;
+    let mut pixels = vec![0_u32; pixel_count];
+    for row in 0..destination.height {
+        let source_start = (destination.y + row)
+            .checked_mul(state.desktop_cache.width)
+            .and_then(|offset| offset.checked_add(destination.x))
+            .ok_or(GpuSceneError::InvalidLayer)?;
+        let source_end = source_start
+            .checked_add(destination.width)
+            .ok_or(GpuSceneError::InvalidLayer)?;
+        let destination_start = row * destination.width;
+        pixels[destination_start..destination_start + destination.width].copy_from_slice(
+            state
+                .desktop_cache
+                .pixels
+                .get(source_start..source_end)
+                .ok_or(GpuSceneError::InvalidLayer)?,
+        );
+    }
+    {
+        let mut canvas = SurfaceCanvas::new(
+            pixels.as_mut_slice(),
+            destination.width as u32,
+            destination.height as u32,
+            destination.width,
+        );
+        for (index, window) in state.console_windows.iter().enumerate() {
+            let rect = taskbar_slot_rect(state.surface.width, state.surface.height, index);
+            chrome::draw_dock_slot(
+                &mut canvas,
+                Rect {
+                    x: rect.x.saturating_sub(destination.x),
+                    y: rect.y.saturating_sub(destination.y),
+                    width: rect.width,
+                    height: rect.height,
+                },
+                window.title.as_str(),
+                !window.minimized && window.session_handle == state.focused_session_handle,
+                window.minimized,
+            );
+        }
+        for (index, window) in state.wayland_windows.iter().enumerate() {
+            let rect = taskbar_slot_rect(
+                state.surface.width,
+                state.surface.height,
+                state.console_windows.len().saturating_add(index),
+            );
+            chrome::draw_dock_slot(
+                &mut canvas,
+                Rect {
+                    x: rect.x.saturating_sub(destination.x),
+                    y: rect.y.saturating_sub(destination.y),
+                    width: rect.width,
+                    height: rect.height,
+                },
+                if window.title.is_empty() {
+                    "Wayland App"
+                } else {
+                    window.title.as_str()
+                },
+                !window.minimized && Some(window.surface_id) == state.focused_wayland_surface_id,
+                window.minimized,
+            );
+        }
+    }
+    push_xrgb_gpu_layer(
+        packer,
+        layers,
+        atlas,
+        pixels.as_slice(),
+        destination.width,
+        destination.height,
+        destination.width,
+        destination,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_xrgb_gpu_layer(
+    packer: &mut GpuAtlasPacker<'_>,
+    layers: &mut Vec<GpuSceneLayer>,
+    atlas: GpuTextureCapability,
+    pixels: &[u32],
+    width: usize,
+    height: usize,
+    stride_pixels: usize,
+    destination: Rect,
+) -> Result<(), GpuSceneError> {
+    if destination.width == 0
+        || destination.height == 0
+        || destination.width != width
+        || destination.height != height
+    {
+        return Err(GpuSceneError::InvalidLayer);
+    }
+    let source_rect = packer.place_xrgb(pixels, width, height, stride_pixels)?;
+    layers.push(GpuSceneLayer {
+        destination,
+        opacity: u8::MAX,
+        source_over: false,
+        transform: GpuLayerTransform::flat(),
+        kind: GpuLayerKind::Texture {
+            region: GpuTextureRegion { atlas, source_rect },
+        },
+    });
+    Ok(())
+}
+
+fn push_console_gpu_layer(
+    packer: &mut GpuAtlasPacker<'_>,
+    layers: &mut Vec<GpuSceneLayer>,
+    atlas: GpuTextureCapability,
+    window: &mut ConsoleWindow,
+    focused: bool,
+) -> Result<(), GpuSceneError> {
+    chrome::rebuild_console_window_surface(window, focused);
+    if !window.surface_cache.valid {
+        return Err(GpuSceneError::InvalidLayer);
+    }
+    push_xrgb_gpu_layer(
+        packer,
+        layers,
+        atlas,
+        window.surface_cache.pixels.as_slice(),
+        window.surface_cache.width,
+        window.surface_cache.height,
+        window.surface_cache.width,
+        window.frame,
+    )
+}
+
+fn push_wayland_gpu_layer(
+    packer: &mut GpuAtlasPacker<'_>,
+    layers: &mut Vec<GpuSceneLayer>,
+    atlas: GpuTextureCapability,
+    window: &WaylandWindowSnapshot,
+    focused: bool,
+) -> Result<(), GpuSceneError> {
+    let outer = wayland_window_outer_rect(window);
+    if outer.is_empty() {
+        return Ok(());
+    }
+    let local_outer = Rect {
+        x: 0,
+        y: 0,
+        width: outer.width,
+        height: outer.height,
+    };
+    let local_client = wayland_window_client_rect(local_outer);
+    let pixel_count = outer
+        .width
+        .checked_mul(outer.height)
+        .ok_or(GpuSceneError::InvalidLayer)?;
+    let mut pixels = vec![0_u32; pixel_count];
+    {
+        let mut canvas = SurfaceCanvas::new(
+            pixels.as_mut_slice(),
+            outer.width as u32,
+            outer.height as u32,
+            outer.width,
+        );
+        let title = if window.title.is_empty() {
+            "Wayland App"
+        } else {
+            window.title.as_str()
+        };
+        chrome::paint_window_chrome(&mut canvas, local_outer, local_client, title, focused);
+    }
+    composite_wayland_client(&mut pixels, outer.width, local_client, window)?;
+    push_xrgb_gpu_layer(
+        packer,
+        layers,
+        atlas,
+        pixels.as_slice(),
+        outer.width,
+        outer.height,
+        outer.width,
+        outer,
+    )
+}
+
+fn composite_wayland_client(
+    destination: &mut [u32],
+    destination_stride: usize,
+    destination_rect: Rect,
+    window: &WaylandWindowSnapshot,
+) -> Result<(), GpuSceneError> {
+    let width = window.width.min(destination_rect.width);
+    let height = window.height.min(destination_rect.height);
+    if width == 0 || height == 0 || window.stride_pixels < width {
+        return Ok(());
+    }
+    for row in 0..height {
+        let source_start = row
+            .checked_mul(window.stride_pixels)
+            .ok_or(GpuSceneError::InvalidLayer)?;
+        let source_end = source_start
+            .checked_add(width)
+            .ok_or(GpuSceneError::InvalidLayer)?;
+        let destination_start = (destination_rect.y + row)
+            .checked_mul(destination_stride)
+            .and_then(|offset| offset.checked_add(destination_rect.x))
+            .ok_or(GpuSceneError::InvalidLayer)?;
+        let destination_end = destination_start
+            .checked_add(width)
+            .ok_or(GpuSceneError::InvalidLayer)?;
+        let source = window
+            .pixels
+            .get(source_start..source_end)
+            .ok_or(GpuSceneError::InvalidLayer)?;
+        let destination = destination
+            .get_mut(destination_start..destination_end)
+            .ok_or(GpuSceneError::InvalidLayer)?;
+        for (destination, source) in destination.iter_mut().zip(source) {
+            let alpha = *source >> 24;
+            let inverse = 255_u32.saturating_sub(alpha);
+            let source_b = *source & 0xff;
+            let source_g = (*source >> 8) & 0xff;
+            let source_r = (*source >> 16) & 0xff;
+            let destination_b = *destination & 0xff;
+            let destination_g = (*destination >> 8) & 0xff;
+            let destination_r = (*destination >> 16) & 0xff;
+            let out_b = source_b
+                .saturating_add((destination_b * inverse + 127) / 255)
+                .min(255);
+            let out_g = source_g
+                .saturating_add((destination_g * inverse + 127) / 255)
+                .min(255);
+            let out_r = source_r
+                .saturating_add((destination_r * inverse + 127) / 255)
+                .min(255);
+            *destination = (out_r << 16) | (out_g << 8) | out_b;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn render_boot_frame(state: &mut AppState) {

@@ -53,6 +53,18 @@ pub fn syscall_linux_poll(fds_ptr: u64, nfds: u64, timeout_ms: i64) -> u64 {
         )
     };
     loop {
+        // A single indefinite socket wait does not need a separate QUERY:
+        // netd's WAIT operation first checks current readiness, then arms its
+        // bounded waiter only when no event is ready. Preserve that result
+        // directly instead of paying QUERY -> WAIT -> QUERY IPC roundtrips.
+        if can_block_on_input {
+            match block_current_poll_on_single_socket(fds_ptr, nfds) {
+                PollSocketBlockResult::Ready(ready) => return ready,
+                PollSocketBlockResult::BlockedOrRaced => continue,
+                PollSocketBlockResult::NoSingleSocket => {}
+                PollSocketBlockResult::Err(errno) => return linux_errno(errno),
+            }
+        }
         let result = syscall_linux_poll_once(fds_ptr, nfds);
         if is_linux_error(result) || result != 0 || timeout_ms == 0 {
             return result;
@@ -110,7 +122,9 @@ fn syscall_linux_poll_once(fds_ptr: u64, nfds: u64) -> u64 {
                     entry[0..4].copy_from_slice(&(-1_i32).to_le_bytes());
                     linux_abi::POLLNVAL as i16
                 }
-                Some(multitask::KernelHandle::Socket(_)) => match poll_socket_revents(fd, events) {
+                Some(
+                    multitask::KernelHandle::Socket(_) | multitask::KernelHandle::InetSocket(_),
+                ) => match poll_socket_revents(fd, events, NETD_POLL_MODE_QUERY) {
                     Ok(revents) => revents as i16,
                     Err(errno) => return linux_errno(errno),
                 },
@@ -137,12 +151,12 @@ fn syscall_linux_poll_once(fds_ptr: u64, nfds: u64) -> u64 {
     ready
 }
 
-fn poll_socket_revents(fd: u64, events: u32) -> Result<u32, i64> {
+fn poll_socket_revents(fd: u64, events: u32, mode: u64) -> Result<u32, i64> {
     let result = syscall_linux_net4(
         SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET,
         fd,
         events as u64,
-        0,
+        mode,
         0,
     );
     if is_linux_error(result) {
@@ -197,6 +211,51 @@ enum PollInputBlockResult {
     BlockedOrRaced,
     NoInputInterest,
     Err(i64),
+}
+
+enum PollSocketBlockResult {
+    Ready(u64),
+    BlockedOrRaced,
+    NoSingleSocket,
+    Err(i64),
+}
+
+/// A blocking Wayland dispatch waits on exactly one AF_UNIX socket. Route that
+/// common case through netd's bounded readiness waiter instead of issuing one
+/// synchronous readiness RPC per RTC tick. Multi-fd polls retain the bounded
+/// compatibility loop until a kernel-wide wait set can arm all providers
+/// atomically.
+fn block_current_poll_on_single_socket(fds_ptr: u64, nfds: u64) -> PollSocketBlockResult {
+    if nfds != 1 {
+        return PollSocketBlockResult::NoSingleSocket;
+    }
+    let mut entry = [0_u8; POLLFD_SIZE];
+    if let Err(err) = usermem::copy_from_current_user_exact(fds_ptr, &mut entry) {
+        return PollSocketBlockResult::Err(address_space_error_to_linux_errno(err));
+    }
+    let (fd, events) = match decode_pollfd(&entry) {
+        Ok(values) => values,
+        Err(errno) => return PollSocketBlockResult::Err(errno),
+    };
+    if fd < 0
+        || !matches!(
+            current_kernel_handle(fd as u64),
+            Some(multitask::KernelHandle::Socket(_) | multitask::KernelHandle::InetSocket(_))
+        )
+    {
+        return PollSocketBlockResult::NoSingleSocket;
+    }
+    match poll_socket_revents(fd as u64, events, NETD_POLL_MODE_WAIT) {
+        Ok(0) | Err(LINUX_EAGAIN) => PollSocketBlockResult::BlockedOrRaced,
+        Ok(revents) => {
+            entry[6..8].copy_from_slice(&(revents as i16).to_le_bytes());
+            if let Err(err) = usermem::write_current_user_bytes(fds_ptr, &entry) {
+                return PollSocketBlockResult::Err(address_space_error_to_linux_errno(err));
+            }
+            PollSocketBlockResult::Ready(1)
+        }
+        Err(errno) => PollSocketBlockResult::Err(errno),
+    }
 }
 
 fn block_current_poll_on_input(fds_ptr: u64, nfds: u64) -> PollInputBlockResult {

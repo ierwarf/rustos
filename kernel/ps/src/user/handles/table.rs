@@ -225,6 +225,16 @@ impl HandleTable {
             .count()
     }
 
+    pub fn gpu_atlas_slot_in_use(&self, slot: u32) -> bool {
+        self.entries.iter().flatten().any(|entry| {
+            matches!(
+                entry.handle(),
+                KernelHandle::DisplaySurface(surface)
+                    if surface.binding_slot() == Some(slot)
+            )
+        })
+    }
+
     pub fn ensure_entry_capacity(&mut self, index: usize) {
         if self.entries.len() <= index {
             self.entries.resize_with(index + 1, || None);

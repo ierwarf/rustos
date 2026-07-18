@@ -40,6 +40,12 @@ grep -qx 'CONFIG_MODULE_SIG_KEY="certs/signing_key.pem"' "$config" || {
 }
 require_enabled CONFIG_DEVTMPFS
 require_enabled CONFIG_DEVTMPFS_MOUNT
+require_enabled CONFIG_HIGH_RES_TIMERS
+require_enabled CONFIG_PREEMPT_DYNAMIC
+grep -qx 'CONFIG_HZ_1000=y' "$config" || {
+    echo "rustos-linux-dvm: 1 kHz scheduler timer is required" >&2
+    exit 1
+}
 require_enabled CONFIG_PCI
 require_enabled CONFIG_PCI_MSI
 require_enabled CONFIG_UIO

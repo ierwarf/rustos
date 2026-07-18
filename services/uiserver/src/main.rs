@@ -2,6 +2,8 @@ mod app;
 mod canvas;
 mod cursor_sprites;
 mod font;
+mod gpu_runtime;
+mod gpu_scene;
 mod input_loop;
 mod layout;
 mod profile;
@@ -188,7 +190,7 @@ fn cursor_move_update(
         return VisualUpdate::default();
     }
 
-    let mut update = VisualUpdate::partial(canvas::cursor_dirty_rect(
+    let mut update = VisualUpdate::cursor(canvas::cursor_dirty_rect(
         presented_cursor_x,
         presented_cursor_y,
         state.surface.width,
@@ -222,6 +224,47 @@ fn present_drawable_update(
     state: &mut AppState,
     drawable_update: &VisualUpdate,
 ) -> Result<PresentUpdateResult, i32> {
+    if !drawable_update.needs_full_redraw && drawable_update.partial_rects().is_empty() {
+        return Ok(PresentUpdateResult::Idle);
+    }
+
+    let gpu_started = Instant::now();
+    match state.present_gpu_update(drawable_update.scene_dirty()) {
+        Ok(true) => {
+            let elapsed = gpu_started.elapsed();
+            let pixel_count = u64::from(state.surface.width) * u64::from(state.surface.height);
+            profile::record_present(
+                drawable_update.needs_full_redraw,
+                1,
+                pixel_count,
+                Duration::ZERO,
+                elapsed,
+            );
+            if elapsed >= SLOW_PRESENT_THRESHOLD {
+                log_slow_present(
+                    state,
+                    elapsed,
+                    Duration::ZERO,
+                    elapsed,
+                    drawable_update.needs_full_redraw,
+                    None,
+                    1,
+                    pixel_count,
+                    0,
+                );
+            }
+            return Ok(PresentUpdateResult::Rendered {
+                deferred_update: VisualUpdate::default(),
+            });
+        }
+        Ok(false) => {}
+        Err(crate::sys::EAGAIN) => return Ok(PresentUpdateResult::Backpressured),
+        Err(err) if state.recover_if_stale_surface_error(err)? => {
+            return Ok(PresentUpdateResult::StaleSurface);
+        }
+        Err(err) => return Err(err),
+    }
+
     if drawable_update.needs_full_redraw {
         let render_started = Instant::now();
         render_frame(state);
@@ -261,10 +304,6 @@ fn present_drawable_update(
         return Ok(PresentUpdateResult::Rendered {
             deferred_update: VisualUpdate::default(),
         });
-    }
-
-    if drawable_update.partial_rects().is_empty() {
-        return Ok(PresentUpdateResult::Idle);
     }
 
     let render_rects = drawable_update.partial_rects().to_vec();
@@ -681,6 +720,20 @@ fn run() -> Result<(), i32> {
     boot_line("uiserver: run initialize begin");
     diag_line("uiserver: run initialize begin");
     boot_line("uiserver: run diagnostic worker ready");
+    // The private compiler contract does not depend on a live display provider.
+    // Prove it before display discovery so headless KVM can distinguish a
+    // compiler-contract failure from the intentionally absent live submit path.
+    if !gpu_scene::validate_boot_contract(64, 64) {
+        diag_line("uiserver: private gpu-scene compiler contract rejected");
+        return Err(libc::EPROTO);
+    }
+    const GPU_SCENE_READY: &str =
+        "uiserver: gpu-scene compiler ready contract=3 public-abi=0 dvm-submit=1";
+    // The service can still fail later when a headless boot has no display
+    // provider. Emit this contract proof synchronously before also queuing the
+    // normal asynchronous production diagnostic.
+    sys::debug_line(GPU_SCENE_READY);
+    diag_line(GPU_SCENE_READY);
     let mut state = AppState::initialize()?;
     // Input ingress is independent of runtime catalog and Wayland startup.
     // Arm it immediately after the display/input handles are validated so a
@@ -788,6 +841,10 @@ fn run() -> Result<(), i32> {
         watchdog.begin_loop(total_loop_count);
         let iteration_started = Instant::now();
         let mut phase_timings = LoopPhaseTimings::default();
+
+        if phase_result("gpu-completion", state.poll_gpu_completions())? {
+            pending_update.request_full();
+        }
 
         let mut background_ready = false;
         while let Ok(background) = desktop_background.try_recv() {
@@ -1033,7 +1090,7 @@ fn run() -> Result<(), i32> {
         if state.cursor_motion_active() && now >= next_cursor_motion_settle {
             let cursor_dirty_rect =
                 state.settle_cursor_motion(state.surface.width, state.surface.height);
-            pending_update.absorb(VisualUpdate::partial(cursor_dirty_rect));
+            pending_update.absorb(VisualUpdate::cursor(cursor_dirty_rect));
             next_cursor_motion_settle = now + CURSOR_MOTION_SETTLE_INTERVAL;
         }
         let drawable_update = prepare_drawable_update(
@@ -1168,7 +1225,6 @@ fn run() -> Result<(), i32> {
 
         let input_reader = input_events.snapshot();
         profile::record_input_health(
-            input.input_events,
             input_reader.last_delivery_age_ms,
             input_reader.queue_drops,
             input_reader.slow_reads,

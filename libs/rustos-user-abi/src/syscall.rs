@@ -191,7 +191,6 @@ pub const SYSCALL_OFFLOAD_OP_LINUX_MADVISE: u16 = 57;
 pub const SYSCALL_OFFLOAD_OP_LINUX_SIGALTSTACK: u16 = 58;
 pub const SYSCALL_OFFLOAD_OP_LINUX_BRK: u16 = 59;
 pub const SYSCALL_OFFLOAD_OP_LINUX_MMAP: u16 = 60;
-pub const SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET: u16 = 61;
 pub const SYSCALL_OFFLOAD_OP_LINUX_MPROTECT: u16 = 61;
 pub const SYSCALL_OFFLOAD_OP_LINUX_MUNMAP: u16 = 62;
 pub const SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE: u16 = 63;
@@ -199,6 +198,7 @@ pub const SYSCALL_OFFLOAD_OP_DRIVER_LOAD_POLICY: u16 = 64;
 pub const SYSCALL_OFFLOAD_OP_LINUX_PROCESS_EXIT: u16 = 65;
 pub const SYSCALL_OFFLOAD_OP_LINUX_FUTEX_POLICY: u16 = 66;
 pub const SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY: u16 = 67;
+pub const SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET: u16 = 68;
 pub const WIN32_SYSCALL_OFFLOAD_ABI_VERSION: u16 = 1;
 pub const SYSCALL_OFFLOAD_OP_WIN32_WRITE_FILE: u16 = 80;
 pub const SYSCALL_OFFLOAD_OP_WIN32_READ_FILE: u16 = 81;
@@ -310,8 +310,24 @@ pub const ROOTD_LEASE_STATE_RUNNING: u16 = 1;
 pub const ROOTD_LEASE_STATE_EXITED: u16 = 2;
 pub const ROOTD_LEASE_STATE_RESTART_PENDING: u16 = 3;
 pub const ROOTD_LEASE_STATE_FAILED: u16 = 4;
-pub const NETD_IPC_ABI_VERSION: u16 = 1;
+pub const NETD_IPC_ABI_VERSION: u16 = 2;
 pub const NETD_IPC_PAYLOAD_CAPACITY: usize = 32 * 1024;
+/// Netd v2 sends only the fixed header plus `payload_len`; the unused tail of
+/// the in-memory transport buffer is not copied through the kernel IPC path.
+pub const NETD_IPC_REQUEST_HEADER_SIZE: usize =
+    core::mem::size_of::<NetdIpcRequest>() - NETD_IPC_PAYLOAD_CAPACITY;
+pub const NETD_IPC_RESPONSE_HEADER_SIZE: usize =
+    core::mem::size_of::<NetdIpcResponse>() - NETD_IPC_PAYLOAD_CAPACITY;
+/// Trusted netd sets this only when completing an event-driven local-socket
+/// wait or a successful local-socket data transfer. The kernel may grant the
+/// awakened caller one bounded cross-class turn to finish the causal chain.
+pub const NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF: u32 = 1 << 0;
+/// Query readiness without waiting. This is the compatible default for the
+/// previously reserved `NetdIpcRequest::arg2` field on socket-poll requests.
+pub const NETD_POLL_MODE_QUERY: u64 = 0;
+/// Wait for a readiness transition inside netd. The wait is internally
+/// bounded and may return EAGAIN so the kernel can revalidate the descriptor.
+pub const NETD_POLL_MODE_WAIT: u64 = 1;
 pub const NETD_SENDMSG_PAYLOAD_HEADER_SIZE: usize = 16;
 pub const NETD_RECVMSG_PAYLOAD_HEADER_SIZE: usize = 16;
 pub const NET_BROKER_OP_PACKET_STATUS: u16 = 0x8001;
@@ -2405,9 +2421,12 @@ mod syscall_tests {
         IPC_MAX_INLINE_BYTES, LINUX_RLIMIT_SIZE, LINUX_SIGACTION_SIZE, LINUX_STATX_SIZE,
         LINUX_TIMESPEC_SIZE, LINUX_UTSNAME_SIZE, LinuxRlimit, LinuxSigActionWire,
         LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, LinuxTimespecWire, LinuxUtsName,
-        SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_STATX, SYSCALL_OFFLOAD_PATH_CAPACITY,
-        SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, VFS_IPC_ABI_VERSION, VFS_IPC_OP_OPENAT, VfsIpcRequest,
-        VfsIpcResponse,
+        NETD_IPC_PAYLOAD_CAPACITY, NETD_IPC_REQUEST_HEADER_SIZE, NETD_IPC_RESPONSE_HEADER_SIZE,
+        NetdIpcRequest, NetdIpcResponse, SYSCALL_OFFLOAD_ABI_VERSION,
+        SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY, SYSCALL_OFFLOAD_OP_LINUX_MPROTECT,
+        SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET, SYSCALL_OFFLOAD_OP_LINUX_STATX,
+        SYSCALL_OFFLOAD_PATH_CAPACITY, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, VFS_IPC_ABI_VERSION,
+        VFS_IPC_OP_OPENAT, VfsIpcRequest, VfsIpcResponse,
     };
 
     #[test]
@@ -2446,5 +2465,28 @@ mod syscall_tests {
         assert_eq!(vfs_response.version, VFS_IPC_ABI_VERSION);
         assert_eq!(vfs_response.op, VFS_IPC_OP_OPENAT);
         assert_eq!(vfs_response.reserved0, 0);
+    }
+
+    #[test]
+    fn socket_poll_owns_a_unique_offload_operation() {
+        assert_ne!(
+            SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET,
+            SYSCALL_OFFLOAD_OP_LINUX_MPROTECT
+        );
+        assert!(SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET > SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY);
+    }
+
+    #[test]
+    fn netd_v2_wire_headers_exclude_the_reserved_payload_tail() {
+        assert_eq!(NETD_IPC_REQUEST_HEADER_SIZE, 120);
+        assert_eq!(NETD_IPC_RESPONSE_HEADER_SIZE, 32);
+        assert_eq!(
+            size_of::<NetdIpcRequest>(),
+            NETD_IPC_REQUEST_HEADER_SIZE + NETD_IPC_PAYLOAD_CAPACITY
+        );
+        assert_eq!(
+            size_of::<NetdIpcResponse>(),
+            NETD_IPC_RESPONSE_HEADER_SIZE + NETD_IPC_PAYLOAD_CAPACITY
+        );
     }
 }

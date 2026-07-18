@@ -6,7 +6,7 @@ scope named below; it is never promoted into an implementation-wide claim.
 
 | Layer | Tool | What it establishes | What it does not establish |
 | --- | --- | --- | --- |
-| Concurrent contract | TLC, one worker and fixed seed | Every state in the configured finite model preserves its listed invariant | Rust source equivalence, CPU memory ordering, or hardware behavior |
+| Concurrent contract | TLC, automatic local workers and fixed fingerprint seed | Every state in the configured finite model preserves its listed invariant | Rust source equivalence, CPU memory ordering, hardware behavior, or identical state-discovery order across worker counts |
 | Inductive model theorem | TLAPS when a model carries a checked proof | The stated mathematical safety theorem | Temporal liveness not expressed by the checked theorem |
 | Rust boundary | Kani `#[kani::proof]` | The named harness over every symbolic value within its explicit unwind bounds | Whole-workspace concurrency, unmodeled I/O, compiler, or hardware correctness |
 | Unbounded proof kernel | Verus | The named state partition for all values in the Verus theorem | Equivalence to RustOS source unless a mapped Kani/test gate also exists |
@@ -29,7 +29,8 @@ not a bug. Keep it in `CONFORMANCE.md` until it is resolved.
 
 ## Tool pins and commands
 
-- TLC is pinned in `tla2tools.lock`; run `bash formal/run-all-tlc.sh`.
+- TLC is pinned in `tla2tools.lock`; run `bash formal/run-all-tlc.sh`. The
+  default is `TLC_WORKERS=auto`; set `TLC_WORKERS=1` for serial reproduction.
 - Kani is pinned in `kani.lock`; initialize it with `bash formal/setup-kani.sh`,
   then run `bash formal/run-kani.sh`.
 - Verus is pinned with archive hash in `verus.lock`; initialize it with

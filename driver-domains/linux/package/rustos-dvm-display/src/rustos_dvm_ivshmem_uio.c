@@ -21,6 +21,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
+#include <linux/overflow.h>
 #include <linux/scatterlist.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
@@ -36,7 +37,7 @@
 #define RUSTOS_DVM_HOST_OFFLINE_VECTOR 1
 #define RUSTOS_DVM_MSIX_VECTOR_COUNT 2
 #define RUSTOS_GUI_PIXEL_REGION_PHYS 0x100000000ULL
-#define RUSTOS_GUI_PIXEL_REGION_BYTES (32ULL * 1024ULL * 1024ULL)
+#define RUSTOS_GUI_PIXEL_REGION_BYTES (128ULL * 1024ULL * 1024ULL)
 
 #define RUSTOS_GUI_POOL_HEADER_BYTES 4096
 #define RUSTOS_GUI_POOL_VERSION 2
@@ -49,6 +50,29 @@
 #define RUSTOS_GUI_POOL_INVITATION_OFFSET 336
 #define RUSTOS_GUI_POOL_READY_ACK_OFFSET 344
 #define RUSTOS_GUI_POOL_READY_CONFIRMATION_OFFSET 352
+
+#define RUSTOS_GPU_ATLAS_HEADER_OFFSET 512
+#define RUSTOS_GPU_ATLAS_HEADER_BYTES 64
+#define RUSTOS_GPU_ATLAS_VERSION 3
+#define RUSTOS_GPU_ATLAS_SLOT_COUNT 3
+#define RUSTOS_GPU_ATLAS_COMMAND_SLOT_BYTES (36ULL * 1024ULL)
+#define RUSTOS_GPU_ATLAS_DAMAGE_BYTES 16
+#define RUSTOS_GPU_ATLAS_MAX_DAMAGE_RECTS 64
+#define RUSTOS_GPU_ATLAS_COMPLETION_BYTES 256
+#define RUSTOS_GPU_ATLAS_COMPLETION_POOL_OFFSET 1024
+#define RUSTOS_GPU_ATLAS_PRIME_COMPLETION_OFFSET 1792
+#define RUSTOS_GPU_ATLAS_INVITATION_OFFSET 2048
+#define RUSTOS_GPU_ATLAS_COMPLETION_SEQUENCE_OFFSET 2080
+#define RUSTOS_GPU_ATLAS_COMPLETION_ACK_OFFSET 2112
+#define RUSTOS_GPU_ATLAS_CONTEXT_ID_OFFSET 2144
+#define RUSTOS_GPU_ATLAS_CONTEXT_EPOCH_OFFSET 2148
+#define RUSTOS_GPU_ATLAS_PRIME_FENCE_OFFSET 2152
+#define RUSTOS_GPU_PRIME_COMPLETION_BYTES 64
+#define RUSTOS_GPU_RENDER_VERSION 1
+#define RUSTOS_GPU_PRIME_READY 1
+#define RUSTOS_GPU_PIPELINE_PRIME_MAX_NS (500ULL * 1000ULL * 1000ULL)
+#define RUSTOS_GPU_ATLAS_FLAG_DVM_READ_ONLY 1
+#define RUSTOS_GPU_ATLAS_EXPORT_FLAG 1
 
 #define RUSTOS_GUI_MESSAGE_VERSION 1
 #define RUSTOS_GUI_MESSAGE_KIND_PRESENT 1
@@ -74,8 +98,15 @@ struct rustos_dvm_ivshmem {
 	void __iomem *doorbell;
 	void __iomem *shared;
 	u64 slot_bytes;
+	u64 gpu_command_offset;
+	u64 gpu_atlas_offset;
+	u64 gpu_atlas_slot_bytes;
+	u32 gpu_atlas_width;
+	u32 gpu_atlas_height;
+	u32 gpu_atlas_stride;
 	atomic_t host_invited;
 	atomic_t relay_ready;
+	atomic_t gpu_prime_ready;
 	atomic64_t invitation_generation;
 	atomic64_t control_sequence;
 	struct mutex control_lock;
@@ -83,6 +114,12 @@ struct rustos_dvm_ivshmem {
 
 static const u8 rustos_gui_pool_magic[] = "RSGUI002";
 static const u8 rustos_gui_message_magic[] = "RSGUI001";
+static const u8 rustos_gpu_atlas_magic[] = "RSGPUA01";
+static const u8 rustos_gpu_submit_magic[] = "RSGPUQ01";
+static const u8 rustos_gpu_completion_magic[] = "RSGPUC01";
+static const u8 rustos_gpu_render_completion_magic[] = "RSGPUD01";
+static const u8 rustos_gpu_present_completion_magic[] = "RSGPUF01";
+static const u8 rustos_gpu_prime_completion_magic[] = "RSGPUP01";
 
 static struct sg_table *rustos_dvm_dmabuf_map(struct dma_buf_attachment *attachment,
 					      enum dma_data_direction direction)
@@ -195,15 +232,23 @@ static long rustos_dvm_dmabuf_ioctl(struct file *file, unsigned int command,
 	if (command != RUSTOS_DVM_DMABUF_IOCTL_EXPORT ||
 	    copy_from_user(&request, (void __user *)argument, sizeof(request)))
 		return -EINVAL;
-	if (!state || request.flags ||
-	    request.slot >= RUSTOS_GUI_POOL_SLOT_COUNT || !state->slot_bytes)
+	if (!state || request.flags & ~RUSTOS_GPU_ATLAS_EXPORT_FLAG ||
+    request.slot >= RUSTOS_GUI_POOL_SLOT_COUNT || !state->slot_bytes)
 		return -EPERM;
 	export = kzalloc(sizeof(*export), GFP_KERNEL);
 	if (!export)
 		return -ENOMEM;
-	export->phys = RUSTOS_GUI_PIXEL_REGION_PHYS + RUSTOS_GUI_POOL_HEADER_BYTES +
-		       request.slot * state->slot_bytes;
-	export->bytes = state->slot_bytes;
+	if (request.flags == RUSTOS_GPU_ATLAS_EXPORT_FLAG) {
+		if (!state->gpu_atlas_offset || !state->gpu_atlas_slot_bytes)
+			return -ENODEV;
+		export->phys = RUSTOS_GUI_PIXEL_REGION_PHYS + state->gpu_atlas_offset +
+			       request.slot * state->gpu_atlas_slot_bytes;
+		export->bytes = state->gpu_atlas_slot_bytes;
+	} else {
+		export->phys = RUSTOS_GUI_PIXEL_REGION_PHYS + RUSTOS_GUI_POOL_HEADER_BYTES +
+			       request.slot * state->slot_bytes;
+		export->bytes = state->slot_bytes;
+	}
 	info.ops = &rustos_dvm_dmabuf_ops;
 	info.size = export->bytes;
 	info.flags = O_RDONLY;
@@ -243,6 +288,53 @@ static u64 rustos_dvm_read_le64(const u8 *bytes)
 	for (index = 0; index < sizeof(value); index++)
 		value |= (u64)bytes[index] << (index * 8);
 	return value;
+}
+
+static bool rustos_dvm_valid_gpu_atlas_header(const u8 *bytes)
+{
+	u64 region_bytes;
+	u64 command_offset;
+	u64 command_bytes;
+	u64 command_end;
+	u64 atlas_offset;
+	u64 atlas_slot_bytes;
+	u64 atlas_bytes;
+	u64 atlas_end;
+	u32 width;
+	u32 height;
+	u32 stride;
+
+	if (memcmp(bytes, rustos_gpu_atlas_magic,
+		   sizeof(rustos_gpu_atlas_magic) - 1) ||
+	    rustos_dvm_read_le32(bytes + 8) != RUSTOS_GPU_ATLAS_VERSION ||
+	    rustos_dvm_read_le32(bytes + 12) != RUSTOS_GPU_ATLAS_HEADER_BYTES ||
+	    rustos_dvm_read_le32(bytes + 60) !=
+		    RUSTOS_GPU_ATLAS_FLAG_DVM_READ_ONLY)
+		return false;
+	region_bytes = rustos_dvm_read_le64(bytes + 16);
+	command_offset = rustos_dvm_read_le64(bytes + 24);
+	atlas_offset = rustos_dvm_read_le64(bytes + 32);
+	atlas_slot_bytes = rustos_dvm_read_le64(bytes + 40);
+	width = rustos_dvm_read_le32(bytes + 48);
+	height = rustos_dvm_read_le32(bytes + 52);
+	stride = rustos_dvm_read_le32(bytes + 56);
+	if (region_bytes != RUSTOS_GUI_PIXEL_REGION_BYTES ||
+	    !command_offset || command_offset & (PAGE_SIZE - 1) ||
+	    !atlas_offset || atlas_offset & (PAGE_SIZE - 1) ||
+	    !width || !height || width > 8192 || height > 8192 ||
+	    (u64)stride < (u64)width * 4 || stride & 3 ||
+	    atlas_slot_bytes != (u64)stride * height ||
+	    !atlas_slot_bytes || atlas_slot_bytes & (PAGE_SIZE - 1))
+		return false;
+	if (check_mul_overflow((u64)RUSTOS_GPU_ATLAS_COMMAND_SLOT_BYTES,
+			       (u64)RUSTOS_GPU_ATLAS_SLOT_COUNT,
+			       &command_bytes) ||
+	    check_add_overflow(command_offset, command_bytes, &command_end) ||
+	    check_mul_overflow(atlas_slot_bytes,
+			       (u64)RUSTOS_GPU_ATLAS_SLOT_COUNT, &atlas_bytes) ||
+	    check_add_overflow(atlas_offset, atlas_bytes, &atlas_end))
+		return false;
+	return command_end <= atlas_offset && atlas_end <= region_bytes;
 }
 
 static bool rustos_dvm_host_present_matches(struct rustos_dvm_ivshmem *state,
@@ -358,6 +450,58 @@ static ssize_t rustos_dvm_host_invited_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(rustos_dvm_host_invited);
 
+static bool rustos_dvm_valid_gpu_prime(struct rustos_dvm_ivshmem *state,
+					const u8 *record)
+{
+	u32 context_id;
+	u32 context_epoch;
+	u64 fence_value;
+	u64 duration_ns;
+
+	if (!state || !record ||
+	    memcmp(record, rustos_gpu_prime_completion_magic, 8) ||
+	    rustos_dvm_read_le32(record + 8) != RUSTOS_GPU_RENDER_VERSION ||
+	    rustos_dvm_read_le32(record + 12) != RUSTOS_GPU_PRIME_COMPLETION_BYTES ||
+	    rustos_dvm_read_le32(record + 24) != RUSTOS_GPU_PRIME_READY ||
+	    memchr_inv(record + 28, 0, 4) || memchr_inv(record + 48, 0, 16))
+		return false;
+	context_id = rustos_dvm_read_le32(record + 16);
+	context_epoch = rustos_dvm_read_le32(record + 20);
+	fence_value = rustos_dvm_read_le64(record + 32);
+	duration_ns = rustos_dvm_read_le64(record + 40);
+	return context_id != 0 && context_epoch != 0 && fence_value != 0 &&
+	       duration_ns != 0 && duration_ns <= RUSTOS_GPU_PIPELINE_PRIME_MAX_NS &&
+	       context_id == readl(state->shared + RUSTOS_GPU_ATLAS_CONTEXT_ID_OFFSET) &&
+	       context_epoch == readl(state->shared + RUSTOS_GPU_ATLAS_CONTEXT_EPOCH_OFFSET) &&
+	       fence_value == readq(state->shared + RUSTOS_GPU_ATLAS_PRIME_FENCE_OFFSET);
+}
+
+static ssize_t rustos_dvm_gpu_prime_store(struct device *dev,
+					   struct device_attribute *attr,
+					   const char *buf, size_t count)
+{
+	struct rustos_dvm_ivshmem *state = dev_get_drvdata(dev);
+	ssize_t result = count;
+
+	if (!state || count != RUSTOS_GPU_PRIME_COMPLETION_BYTES ||
+	    !rustos_dvm_valid_gpu_prime(state, (const u8 *)buf))
+		return -EPERM;
+	mutex_lock(&state->control_lock);
+	if (!atomic_read(&state->host_invited) || atomic_read(&state->relay_ready) ||
+	    atomic_read(&state->gpu_prime_ready)) {
+		result = -EAGAIN;
+		goto out;
+	}
+	memcpy_toio(state->shared + RUSTOS_GPU_ATLAS_PRIME_COMPLETION_OFFSET,
+		    buf, count);
+	wmb();
+	atomic_set(&state->gpu_prime_ready, 1);
+out:
+	mutex_unlock(&state->control_lock);
+	return result;
+}
+static DEVICE_ATTR_WO(rustos_dvm_gpu_prime);
+
 static ssize_t rustos_dvm_display_ready_store(struct device *dev,
 					       struct device_attribute *attr,
 					       const char *buf, size_t count)
@@ -367,6 +511,8 @@ static ssize_t rustos_dvm_display_ready_store(struct device *dev,
 
 	if (!state || count != 6 || memcmp(buf, "ready\n", 6))
 		return -EINVAL;
+	if (!atomic_read(&state->gpu_prime_ready))
+		return -EAGAIN;
 	if (atomic_cmpxchg(&state->host_invited, 1, 0) != 1)
 		return -EAGAIN;
 	generation = atomic64_read(&state->invitation_generation);
@@ -417,6 +563,158 @@ out:
 }
 static DEVICE_ATTR_WO(rustos_dvm_display_control);
 
+static bool rustos_dvm_valid_gpu_completion(struct rustos_dvm_ivshmem *state,
+					     const u8 *record)
+{
+	u8 command[64];
+	u8 batch_header[64];
+	void *mapped;
+	u32 slot;
+	u32 batch_bytes;
+	u32 damage_count;
+	u32 context_id;
+	u32 context_epoch;
+	u32 output_index;
+	u64 generation;
+	u64 sequence;
+	u64 submit_value;
+	u64 invitation;
+	u64 acknowledged;
+	u64 command_phys;
+	u64 damage_bytes;
+	u64 batch_phys;
+	u64 batch_end;
+	u64 slot_end;
+
+	if (!state || memcmp(record, rustos_gpu_completion_magic, 8) ||
+	    rustos_dvm_read_le32(record + 8) != RUSTOS_GPU_ATLAS_VERSION ||
+	    rustos_dvm_read_le32(record + 12) !=
+		    RUSTOS_GPU_ATLAS_COMPLETION_BYTES ||
+	    rustos_dvm_read_le32(record + 20) != 3 ||
+	    memchr_inv(record + 40, 0, 24) ||
+	    memchr_inv(record + 192, 0, 64))
+		return false;
+	slot = rustos_dvm_read_le32(record + 16);
+	generation = rustos_dvm_read_le64(record + 24);
+	sequence = rustos_dvm_read_le64(record + 32);
+	if (slot >= RUSTOS_GPU_ATLAS_SLOT_COUNT || !generation || !sequence)
+		return false;
+	invitation = readq(state->shared + RUSTOS_GPU_ATLAS_INVITATION_OFFSET +
+			   slot * sizeof(u64));
+	acknowledged = readq(state->shared + RUSTOS_GPU_ATLAS_COMPLETION_ACK_OFFSET +
+			     slot * sizeof(u64));
+	if (invitation != sequence || acknowledged == sequence ||
+	    readq(state->shared + RUSTOS_GPU_ATLAS_COMPLETION_SEQUENCE_OFFSET +
+		  slot * sizeof(u64)) != acknowledged)
+		return false;
+	if (check_mul_overflow((u64)slot,
+			       (u64)RUSTOS_GPU_ATLAS_COMMAND_SLOT_BYTES,
+			       &command_phys) ||
+	    check_add_overflow(command_phys, state->gpu_command_offset,
+			       &command_phys) ||
+	    check_add_overflow(command_phys, RUSTOS_GUI_PIXEL_REGION_PHYS,
+			       &command_phys))
+		return false;
+	mapped = memremap(command_phys, sizeof(command), MEMREMAP_WB);
+	if (!mapped)
+		return false;
+	memcpy(command, mapped, sizeof(command));
+	memunmap(mapped);
+	batch_bytes = rustos_dvm_read_le32(command + 20);
+	damage_count = rustos_dvm_read_le32(command + 56);
+	if (memcmp(command, rustos_gpu_submit_magic, 8) ||
+	    rustos_dvm_read_le32(command + 8) != RUSTOS_GPU_ATLAS_VERSION ||
+	    rustos_dvm_read_le32(command + 12) != 64 ||
+	    rustos_dvm_read_le32(command + 16) != slot ||
+	    rustos_dvm_read_le64(command + 24) != generation ||
+	    rustos_dvm_read_le64(command + 32) != sequence ||
+	    !rustos_dvm_read_le32(command + 40) ||
+	    (rustos_dvm_read_le32(command + 44) != 1 &&
+	     rustos_dvm_read_le32(command + 44) != 2) ||
+	    !rustos_dvm_read_le64(command + 48) ||
+	    damage_count > RUSTOS_GPU_ATLAS_MAX_DAMAGE_RECTS ||
+	    memchr_inv(command + 60, 0, 4) || batch_bytes < 128 ||
+	    check_mul_overflow((u64)damage_count,
+			       (u64)RUSTOS_GPU_ATLAS_DAMAGE_BYTES,
+			       &damage_bytes) ||
+	    check_add_overflow(command_phys, (u64)sizeof(command), &batch_phys) ||
+	    check_add_overflow(batch_phys, damage_bytes, &batch_phys) ||
+	    check_add_overflow(batch_phys, (u64)batch_bytes, &batch_end) ||
+	    check_add_overflow(command_phys,
+			       (u64)RUSTOS_GPU_ATLAS_COMMAND_SLOT_BYTES,
+			       &slot_end) || batch_end > slot_end)
+		return false;
+	mapped = memremap(batch_phys, sizeof(batch_header), MEMREMAP_WB);
+	if (!mapped)
+		return false;
+	memcpy(batch_header, mapped, sizeof(batch_header));
+	memunmap(mapped);
+	if (memcmp(batch_header, "RSGPU001", 8))
+		return false;
+	context_id = rustos_dvm_read_le32(batch_header + 24);
+	context_epoch = rustos_dvm_read_le32(batch_header + 28);
+	submit_value = rustos_dvm_read_le64(batch_header + 32);
+	if (!context_id || context_epoch != rustos_dvm_read_le32(command + 40) ||
+	    !submit_value ||
+	    memcmp(record + 64, rustos_gpu_render_completion_magic, 8) ||
+	    memcmp(record + 128, rustos_gpu_present_completion_magic, 8) ||
+	    rustos_dvm_read_le32(record + 64 + 16) != context_id ||
+	    rustos_dvm_read_le32(record + 128 + 16) != context_id ||
+	    rustos_dvm_read_le32(record + 64 + 20) != context_epoch ||
+	    rustos_dvm_read_le32(record + 128 + 20) != context_epoch ||
+	    rustos_dvm_read_le32(record + 64 + 24) != 1)
+		return false;
+	output_index = rustos_dvm_read_le32(record + 64 + 28);
+	return output_index < RUSTOS_GPU_ATLAS_SLOT_COUNT &&
+	       rustos_dvm_read_le32(record + 128 + 24) == output_index &&
+	       rustos_dvm_read_le64(record + 64 + 32) == submit_value &&
+	       rustos_dvm_read_le64(record + 64 + 40) == submit_value &&
+	       rustos_dvm_read_le64(record + 64 + 48) != 0 &&
+	       rustos_dvm_read_le64(record + 64 + 56) == submit_value &&
+	       rustos_dvm_read_le64(record + 128 + 32) == submit_value &&
+	       rustos_dvm_read_le64(record + 128 + 40) == submit_value &&
+	       rustos_dvm_read_le64(record + 128 + 48) < submit_value &&
+	       rustos_dvm_read_le64(record + 128 + 56) != 0;
+}
+
+static ssize_t rustos_dvm_gpu_completion_store(struct device *dev,
+					       struct device_attribute *attr,
+					       const char *buf, size_t count)
+{
+	struct rustos_dvm_ivshmem *state = dev_get_drvdata(dev);
+	u32 slot;
+	u64 sequence;
+	ssize_t result = count;
+
+	if (!state || count != RUSTOS_GPU_ATLAS_COMPLETION_BYTES ||
+	    !rustos_dvm_valid_gpu_completion(state, (const u8 *)buf))
+		return -EPERM;
+	slot = rustos_dvm_read_le32((const u8 *)buf + 16);
+	sequence = rustos_dvm_read_le64((const u8 *)buf + 32);
+	mutex_lock(&state->control_lock);
+	if (readq(state->shared + RUSTOS_GPU_ATLAS_INVITATION_OFFSET +
+		  slot * sizeof(u64)) != sequence ||
+	    readq(state->shared + RUSTOS_GPU_ATLAS_COMPLETION_ACK_OFFSET +
+		  slot * sizeof(u64)) == sequence) {
+		result = -EAGAIN;
+		goto out;
+	}
+	memcpy_toio(state->shared + RUSTOS_GPU_ATLAS_COMPLETION_POOL_OFFSET +
+		      slot * RUSTOS_GPU_ATLAS_COMPLETION_BYTES,
+		    buf, count);
+	wmb();
+	writeq(sequence,
+	       state->shared + RUSTOS_GPU_ATLAS_COMPLETION_SEQUENCE_OFFSET +
+		       slot * sizeof(u64));
+	wmb();
+	iowrite32(RUSTOS_DVM_HOST_CONTROL_VECTOR,
+		  state->doorbell + RUSTOS_IVSHMEM_DOORBELL_OFFSET);
+out:
+	mutex_unlock(&state->control_lock);
+	return result;
+}
+static DEVICE_ATTR_WO(rustos_dvm_gpu_completion);
+
 static ssize_t rustos_dvm_display_offline_store(struct device *dev,
 					 struct device_attribute *attr,
 					 const char *buf, size_t count)
@@ -427,8 +725,11 @@ static ssize_t rustos_dvm_display_offline_store(struct device *dev,
 		return -EINVAL;
 	atomic_set(&state->host_invited, 0);
 	atomic_set(&state->relay_ready, 0);
+	atomic_set(&state->gpu_prime_ready, 0);
 	atomic64_set(&state->invitation_generation, 0);
 	writeq(0, state->shared + RUSTOS_GUI_POOL_READY_ACK_OFFSET);
+	memset_io(state->shared + RUSTOS_GPU_ATLAS_PRIME_COMPLETION_OFFSET, 0,
+		  RUSTOS_GPU_PRIME_COMPLETION_BYTES);
 	wmb();
 	iowrite32(RUSTOS_DVM_HOST_OFFLINE_VECTOR,
 		  state->doorbell + RUSTOS_IVSHMEM_DOORBELL_OFFSET);
@@ -438,8 +739,10 @@ static DEVICE_ATTR_WO(rustos_dvm_display_offline);
 
 static struct attribute *rustos_dvm_ivshmem_attributes[] = {
 	&dev_attr_rustos_dvm_host_invited.attr,
+	&dev_attr_rustos_dvm_gpu_prime.attr,
 	&dev_attr_rustos_dvm_display_ready.attr,
 	&dev_attr_rustos_dvm_display_control.attr,
+	&dev_attr_rustos_dvm_gpu_completion.attr,
 	&dev_attr_rustos_dvm_display_offline.attr,
 	NULL,
 };
@@ -452,8 +755,8 @@ static int rustos_dvm_ivshmem_is_gui_pool(struct pci_dev *pdev)
 {
 	void __iomem *header;
 	void *pixel_header;
-	u8 bytes[RUSTOS_GUI_POOL_RECORD_BYTES];
-	u8 pixel_bytes[RUSTOS_GUI_POOL_RECORD_BYTES];
+	u8 bytes[RUSTOS_GPU_ATLAS_HEADER_OFFSET + RUSTOS_GPU_ATLAS_HEADER_BYTES];
+	u8 pixel_bytes[RUSTOS_GPU_ATLAS_HEADER_OFFSET + RUSTOS_GPU_ATLAS_HEADER_BYTES];
 	resource_size_t region_bytes;
 	int result = -ENODEV;
 
@@ -477,7 +780,12 @@ static int rustos_dvm_ivshmem_is_gui_pool(struct pci_dev *pdev)
 	    rustos_dvm_read_le32(bytes + 12) == RUSTOS_GUI_POOL_HEADER_BYTES &&
 	    rustos_dvm_read_le32(bytes + 44) == RUSTOS_GUI_POOL_SLOT_COUNT &&
 	    rustos_dvm_read_le64(bytes + 16) == RUSTOS_GUI_PIXEL_REGION_BYTES &&
-	    !memcmp(bytes, pixel_bytes, sizeof(bytes)))
+	    !memcmp(bytes, pixel_bytes, RUSTOS_GUI_POOL_RECORD_BYTES) &&
+	    !memcmp(bytes + RUSTOS_GPU_ATLAS_HEADER_OFFSET,
+		    pixel_bytes + RUSTOS_GPU_ATLAS_HEADER_OFFSET,
+		    RUSTOS_GPU_ATLAS_HEADER_BYTES) &&
+	    rustos_dvm_valid_gpu_atlas_header(
+		    bytes + RUSTOS_GPU_ATLAS_HEADER_OFFSET))
 		result = 0;
 	pci_iounmap(pdev, header);
 	return result;
@@ -522,7 +830,7 @@ static int rustos_dvm_ivshmem_probe(struct pci_dev *pdev,
 	if (!state->doorbell)
 		return -ENOMEM;
 	state->shared = pcim_iomap(pdev, RUSTOS_IVSHMEM_SHARED_BAR,
-				  RUSTOS_GUI_POOL_READY_CONFIRMATION_OFFSET + sizeof(u64));
+				  RUSTOS_GUI_POOL_HEADER_BYTES);
 	if (!state->shared)
 		return -ENOMEM;
 	state->slot_bytes = readq(state->shared + 48U);
@@ -531,8 +839,21 @@ static int rustos_dvm_ivshmem_probe(struct pci_dev *pdev,
 		(RUSTOS_GUI_PIXEL_REGION_BYTES - RUSTOS_GUI_POOL_HEADER_BYTES) /
 		RUSTOS_GUI_POOL_SLOT_COUNT)
 		return -EPROTO;
+	state->gpu_command_offset =
+		readq(state->shared + RUSTOS_GPU_ATLAS_HEADER_OFFSET + 24U);
+	state->gpu_atlas_offset =
+		readq(state->shared + RUSTOS_GPU_ATLAS_HEADER_OFFSET + 32U);
+	state->gpu_atlas_slot_bytes =
+		readq(state->shared + RUSTOS_GPU_ATLAS_HEADER_OFFSET + 40U);
+	state->gpu_atlas_width =
+		readl(state->shared + RUSTOS_GPU_ATLAS_HEADER_OFFSET + 48U);
+	state->gpu_atlas_height =
+		readl(state->shared + RUSTOS_GPU_ATLAS_HEADER_OFFSET + 52U);
+	state->gpu_atlas_stride =
+		readl(state->shared + RUSTOS_GPU_ATLAS_HEADER_OFFSET + 56U);
 	atomic_set(&state->host_invited, 0);
 	atomic_set(&state->relay_ready, 0);
+	atomic_set(&state->gpu_prime_ready, 0);
 	atomic64_set(&state->invitation_generation, 0);
 	atomic64_set(&state->control_sequence, 0);
 	mutex_init(&state->control_lock);

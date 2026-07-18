@@ -7,12 +7,14 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <linux/input.h>
 #include <linux/if_alg.h>
 #include <linux/uinput.h>
 #include <linux/vm_sockets.h>
 #include <poll.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +22,7 @@
 #include <time.h>
 #include <sys/socket.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
@@ -30,6 +33,7 @@
 #define READY_DIR "/run/rustos-dvm"
 #define READY_FILE READY_DIR "/ready"
 #define DISPLAY_READY_LOCK READY_DIR "/display-ready.lock"
+#define DISPLAY_EVIDENCE_FILE READY_DIR "/display-evidence-v1.env"
 #define CONTROL_PORT_FLOOR 49152U
 #define CONTROL_PORT_SPAN (UINT32_MAX - CONTROL_PORT_FLOOR + 1U)
 #define MAX_FRAME 4096U
@@ -45,12 +49,20 @@
 #define POINTER_BUTTON_MASK 0x1fU
 #define INPUT_SELFTEST_CMDLINE "rustos.dvm.input-selftest=1"
 #define INPUT_SELFTEST_NAME "RustOS DVM input selftest"
-#define INPUT_SELFTEST_CYCLES 3200U
-#define INPUT_SELFTEST_POLL_MS 5
+#define INPUT_SELFTEST_CYCLES 4000U
+#define INPUT_SELFTEST_POLL_MS 10
+#define INPUT_SELFTEST_INTERVAL_NS \
+    ((uint64_t)INPUT_SELFTEST_POLL_MS * 1000ULL * 1000ULL)
 #define INPUT_SELFTEST_LEG_CYCLES 64U
+#define INPUT_RELAY_RR_PRIORITY 10
+#define INPUT_RELAY_RTTIME_SOFT_US 50000U
+#define INPUT_RELAY_RTTIME_HARD_US 100000U
+// Forty seconds covers the public 30-second KVM gate plus bounded guest boot
+// and stream admission time. The synthetic producer still terminates and
+// therefore cannot become an unbounded DVM workload.
 // RDI3 uses a deliberately bounded serial transport. Coalescing relative
-// motion at 200Hz preserves responsive desktop input while remaining below
-// the fixed L0 256-frame/s admission budget; button state is forwarded immediately.
+// motion at 100Hz preserves responsive desktop input without outrunning the
+// measured end-to-end consumer; button state is forwarded immediately.
 #define INPUT_POINTER_FLUSH_MS 5
 #define INPUT_POINTER_FLUSH_NS ((uint64_t)INPUT_POINTER_FLUSH_MS * 1000000ULL)
 // The interactive KVM topology has a fixed 1600x900 DVM scanout. An absolute
@@ -63,6 +75,13 @@
 enum input_device_kind {
     INPUT_DEVICE_KEYBOARD,
     INPUT_DEVICE_POINTER,
+};
+
+struct input_scheduler_guard {
+    int active;
+    int saved_policy;
+    struct sched_param saved_param;
+    struct rlimit saved_rttime;
 };
 
 struct pointer_state {
@@ -95,9 +114,12 @@ struct input_selftest {
     int32_t pointer_y;
     unsigned int cycles_remaining;
     unsigned int motion_phase;
+    uint64_t next_emit_ns;
     int enabled;
     int armed;
 };
+
+static int monotonic_time_ns(uint64_t *out);
 
 struct control_contract {
     char schema[16];
@@ -105,12 +127,93 @@ struct control_contract {
     char state[32];
     char transport[32];
     char authentication[32];
-    char capabilities[64];
+    char capabilities[96];
+};
+
+struct display_evidence_sample {
+    uint64_t sequence;
+    uint64_t monotonic_ns;
+    uint64_t window_ns;
+    uint64_t pageflip_completions;
+    uint64_t frame_hz_milli;
+    uint64_t cpu_copy_us_avg;
+    uint64_t pageflip_latency_us_avg;
+    uint64_t pageflip_latency_us_max;
+    uint64_t atomic_commit_us_avg;
+    uint32_t connector_id;
+    uint32_t mode_width;
+    uint32_t mode_height;
 };
 
 static void die(const char *message) {
     fprintf(stderr, "rustos-dvm-agent: %s\n", message);
     exit(EXIT_FAILURE);
+}
+
+static int input_scheduler_leave(struct input_scheduler_guard *guard) {
+    int failed = 0;
+    int saved_errno = 0;
+
+    if (!guard->active) {
+        return 0;
+    }
+    if (sched_setscheduler(0, guard->saved_policy, &guard->saved_param) != 0) {
+        failed = 1;
+        saved_errno = errno;
+    }
+    if (setrlimit(RLIMIT_RTTIME, &guard->saved_rttime) != 0 && !failed) {
+        failed = 1;
+        saved_errno = errno;
+    }
+    guard->active = 0;
+    if (failed) {
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Input transport is the only latency-critical work in the control agent.
+ * Admit SCHED_RR only for an authenticated live stream and pair it with a
+ * strict continuous-CPU ceiling. A wedged or hostile loop is therefore killed
+ * by Linux rather than starving KMS, recovery, or the control plane forever.
+ */
+static int input_scheduler_enter(struct input_scheduler_guard *guard) {
+    struct rlimit bounded_rttime = {
+        .rlim_cur = INPUT_RELAY_RTTIME_SOFT_US,
+        .rlim_max = INPUT_RELAY_RTTIME_HARD_US,
+    };
+    struct sched_param realtime = {.sched_priority = INPUT_RELAY_RR_PRIORITY};
+    struct sched_param observed;
+    int observed_policy;
+    int saved_errno;
+
+    memset(guard, 0, sizeof(*guard));
+    guard->saved_policy = sched_getscheduler(0);
+    if (guard->saved_policy < 0 || sched_getparam(0, &guard->saved_param) != 0 ||
+        getrlimit(RLIMIT_RTTIME, &guard->saved_rttime) != 0) {
+        return -1;
+    }
+    if (setrlimit(RLIMIT_RTTIME, &bounded_rttime) != 0) {
+        return -1;
+    }
+    if (sched_setscheduler(0, SCHED_RR, &realtime) != 0) {
+        saved_errno = errno;
+        (void)setrlimit(RLIMIT_RTTIME, &guard->saved_rttime);
+        errno = saved_errno;
+        return -1;
+    }
+    guard->active = 1;
+    observed_policy = sched_getscheduler(0);
+    if (observed_policy != SCHED_RR || sched_getparam(0, &observed) != 0 ||
+        observed.sched_priority != INPUT_RELAY_RR_PRIORITY) {
+        saved_errno = errno != 0 ? errno : EINVAL;
+        (void)input_scheduler_leave(guard);
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
 }
 
 static int cmdline_has_option(const char *option) {
@@ -226,9 +329,23 @@ static int input_selftest_emit_cycle(struct input_selftest *selftest) {
     int fd = selftest->uinput_fd;
     int32_t dx;
     int32_t dy;
+    uint64_t now;
 
     if (!selftest->armed || selftest->cycles_remaining == 0) {
         return 0;
+    }
+    if (monotonic_time_ns(&now) != 0) {
+        return -1;
+    }
+    if (selftest->next_emit_ns != 0U && now < selftest->next_emit_ns) {
+        return 0;
+    }
+    if (selftest->next_emit_ns == 0U) {
+        selftest->next_emit_ns = now + INPUT_SELFTEST_INTERVAL_NS;
+    } else {
+        do {
+            selftest->next_emit_ns += INPUT_SELFTEST_INTERVAL_NS;
+        } while (selftest->next_emit_ns <= now);
     }
     /*
      * Trace a 192-pixel absolute square at constant speed. The former 24x16-pixel
@@ -295,6 +412,22 @@ static int input_selftest_emit_cycle(struct input_selftest *selftest) {
         fflush(stderr);
     }
     return 0;
+}
+
+static int input_selftest_timeout_ms(const struct input_selftest *selftest) {
+    uint64_t now;
+    uint64_t remaining_ns;
+    uint64_t remaining_ms;
+    if (!selftest->armed || selftest->cycles_remaining == 0U) {
+        return -1;
+    }
+    if (selftest->next_emit_ns == 0U || monotonic_time_ns(&now) != 0 ||
+        now >= selftest->next_emit_ns) {
+        return 0;
+    }
+    remaining_ns = selftest->next_emit_ns - now;
+    remaining_ms = (remaining_ns + 999999ULL) / 1000000ULL;
+    return remaining_ms > (uint64_t)INT_MAX ? INT_MAX : (int)remaining_ms;
 }
 
 static void copy_value(char *destination, size_t destination_size, const char *value) {
@@ -381,7 +514,7 @@ static void parse_contract(struct control_contract *contract) {
         strcmp(contract->state, "control") != 0 || strcmp(contract->transport, "kvm-vsock") != 0 ||
         strcmp(contract->authentication, "dvm-agent-hmac-sha256-v1") != 0 ||
         strcmp(contract->capabilities,
-               "health,device-inventory,driver-inventory,input-stream") != 0) {
+               "health,device-inventory,driver-inventory,display-evidence-v1,input-stream") != 0) {
         die("unsupported control contract");
     }
 }
@@ -689,7 +822,7 @@ static int virtio_driver_is_bound(const char *driver) {
     return 0;
 }
 
-static int supported_display_driver_is_bound(void) {
+static int display_driver_name(char driver_name[64]) {
     char target[PATH_MAX];
     const char *driver;
     ssize_t length = readlink("/sys/class/drm/card0/device/driver", target,
@@ -699,6 +832,16 @@ static int supported_display_driver_is_bound(void) {
     target[length] = '\0';
     driver = strrchr(target, '/');
     driver = driver == NULL ? target : driver + 1;
+    if (driver[0] == '\0' || strlen(driver) >= 64U)
+        return 0;
+    memcpy(driver_name, driver, strlen(driver) + 1U);
+    return 1;
+}
+
+static int supported_display_driver_is_bound(void) {
+    char driver[64];
+    if (!display_driver_name(driver))
+        return 0;
     return strcmp(driver, "virtio_gpu") == 0 || strcmp(driver, "i915") == 0 ||
            strcmp(driver, "xe") == 0 || strcmp(driver, "amdgpu") == 0 ||
            strcmp(driver, "nvidia") == 0;
@@ -884,6 +1027,150 @@ static int monotonic_time_ns(uint64_t *out) {
         return -1;
     }
     *out = ((uint64_t)now.tv_sec * 1000000000ULL) + (uint64_t)now.tv_nsec;
+    return 0;
+}
+
+static int read_exact_small_file(const char *path, char *buffer, size_t buffer_size,
+                                 int require_private_root) {
+    struct stat metadata;
+    ssize_t total = 0;
+    int fd;
+    if (path == NULL || buffer == NULL || buffer_size < 2U) {
+        errno = EINVAL;
+        return -1;
+    }
+    fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0)
+        return -1;
+    if (fstat(fd, &metadata) != 0 || !S_ISREG(metadata.st_mode) ||
+        (require_private_root && (metadata.st_uid != 0 || (metadata.st_mode & 0077) != 0))) {
+        int saved = errno == 0 ? EPERM : errno;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
+    while ((size_t)total < buffer_size - 1U) {
+        ssize_t bytes = read(fd, buffer + total, buffer_size - 1U - (size_t)total);
+        if (bytes < 0) {
+            if (errno == EINTR)
+                continue;
+            close(fd);
+            return -1;
+        }
+        if (bytes == 0)
+            break;
+        total += bytes;
+    }
+    if ((size_t)total == buffer_size - 1U) {
+        char extra;
+        ssize_t bytes = read(fd, &extra, 1U);
+        if (bytes != 0) {
+            int saved = bytes < 0 ? errno : EOVERFLOW;
+            close(fd);
+            errno = saved;
+            return -1;
+        }
+    }
+    if (close(fd) != 0)
+        return -1;
+    if (total <= 0) {
+        errno = EPROTO;
+        return -1;
+    }
+    buffer[total] = '\0';
+    return (int)total;
+}
+
+static int display_pci_hex_id(const char *attribute, char value[5]) {
+    char path[PATH_MAX];
+    char text[16];
+    int length;
+    size_t index;
+    if (snprintf(path, sizeof(path), "/sys/class/drm/card0/device/%s", attribute) >=
+        (int)sizeof(path)) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    length = read_exact_small_file(path, text, sizeof(text), 0);
+    if (!((length == 6) || (length == 7 && text[6] == '\n')) || text[0] != '0' ||
+        text[1] != 'x') {
+        errno = EPROTO;
+        return -1;
+    }
+    for (index = 0U; index < 4U; index++) {
+        char byte = text[index + 2U];
+        if (!((byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f'))) {
+            errno = EPROTO;
+            return -1;
+        }
+        value[index] = byte;
+    }
+    value[4] = '\0';
+    return 0;
+}
+
+static int display_guest_pci_bdf(char bdf[16]) {
+    char target[PATH_MAX];
+    const char *name;
+    ssize_t length = readlink("/sys/class/drm/card0/device", target, sizeof(target) - 1U);
+    unsigned int domain;
+    unsigned int bus;
+    unsigned int device;
+    unsigned int function;
+    char extra;
+    if (length <= 0 || (size_t)length >= sizeof(target))
+        return -1;
+    target[length] = '\0';
+    name = strrchr(target, '/');
+    name = name == NULL ? target : name + 1;
+    if (strlen(name) != 12U ||
+        sscanf(name, "%4x:%2x:%2x.%1x%c", &domain, &bus, &device, &function, &extra) != 4 ||
+        domain > 0xffffU || bus > 0xffU || device > 0x1fU || function > 7U) {
+        errno = EPROTO;
+        return -1;
+    }
+    memcpy(bdf, name, 13U);
+    return 0;
+}
+
+static int read_display_evidence(struct display_evidence_sample *sample, uint64_t *age_ms,
+                                 char driver[64], char vendor[5], char device[5], char bdf[16]) {
+    char state[1024];
+    char direct_scanout[4];
+    uint64_t now;
+    int length;
+    int consumed = 0;
+    if (sample == NULL || age_ms == NULL || !display_relay_is_ready() ||
+        !display_driver_name(driver) || display_pci_hex_id("vendor", vendor) != 0 ||
+        display_pci_hex_id("device", device) != 0 || display_guest_pci_bdf(bdf) != 0) {
+        return -1;
+    }
+    length = read_exact_small_file(DISPLAY_EVIDENCE_FILE, state, sizeof(state), 1);
+    if (length <= 0)
+        return -1;
+    memset(sample, 0, sizeof(*sample));
+    if (sscanf(
+            state,
+            "DISPLAY_EVIDENCE_SCHEMA=1\nSAMPLE_SEQUENCE=%" SCNu64
+            "\nSAMPLE_MONOTONIC_NS=%" SCNu64 "\nWINDOW_NS=%" SCNu64
+            "\nPAGEFLIP_COMPLETIONS=%" SCNu64 "\nFRAME_HZ_MILLI=%" SCNu64
+            "\nCPU_COPY_US_AVG=%" SCNu64 "\nPAGEFLIP_LATENCY_US_AVG=%" SCNu64
+            "\nPAGEFLIP_LATENCY_US_MAX=%" SCNu64 "\nATOMIC_COMMIT_US_AVG=%" SCNu64
+            "\nCONNECTOR_ID=%" SCNu32 "\nMODE_WIDTH=%" SCNu32 "\nMODE_HEIGHT=%" SCNu32
+            "\nDIRECT_SCANOUT=%3s\n%n",
+            &sample->sequence, &sample->monotonic_ns, &sample->window_ns,
+            &sample->pageflip_completions, &sample->frame_hz_milli,
+            &sample->cpu_copy_us_avg, &sample->pageflip_latency_us_avg,
+            &sample->pageflip_latency_us_max, &sample->atomic_commit_us_avg,
+            &sample->connector_id, &sample->mode_width, &sample->mode_height, direct_scanout,
+            &consumed) != 13 ||
+        consumed != length || strcmp(direct_scanout, "yes") != 0 || sample->sequence == 0U ||
+        sample->monotonic_ns == 0U || monotonic_time_ns(&now) != 0 ||
+        now < sample->monotonic_ns) {
+        errno = EPROTO;
+        return -1;
+    }
+    *age_ms = (now - sample->monotonic_ns) / 1000000ULL;
     return 0;
 }
 
@@ -1095,34 +1382,36 @@ static int stream_input_devices(int control_fd, int keyboard_fd, int pointer_fd,
     for (;;) {
         int ready;
         int timeout_ms;
+        int selftest_timeout_ms;
         unsigned int index;
         pollfds[0].revents = 0;
         pollfds[1].revents = 0;
         timeout_ms = pointer_flush_timeout_ms(&pointer);
-        if (selftest->armed && selftest->cycles_remaining > 0 &&
-            (timeout_ms < 0 || timeout_ms > INPUT_SELFTEST_POLL_MS)) {
-            timeout_ms = INPUT_SELFTEST_POLL_MS;
+        selftest_timeout_ms = input_selftest_timeout_ms(selftest);
+        if (selftest_timeout_ms >= 0 &&
+            (timeout_ms < 0 || timeout_ms > selftest_timeout_ms)) {
+            timeout_ms = selftest_timeout_ms;
         }
         ready = poll(pollfds, 2, timeout_ms);
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        /* Cadence is independent of poll idleness: unrelated keyboard,
+         * pointer, or control wakeups cannot starve the proof stream. */
+        if (input_selftest_emit_cycle(selftest) != 0) {
+            return -1;
+        }
         if (ready == 0) {
             if (pointer.pending && pointer_flush_timeout_ms(&pointer) == 0) {
                 if (send_pointer_packet(control_fd, request_id, &pointer) != 0) {
                     return -1;
                 }
-                // A pointer flush can wake sooner than the self-test cadence;
-                // do not make the synthetic test stream exceed its 200Hz rate.
                 continue;
-            }
-            if (input_selftest_emit_cycle(selftest) != 0) {
-                return -1;
             }
             continue;
-        }
-        if (ready <= 0) {
-            if (ready < 0 && errno == EINTR) {
-                continue;
-            }
-            return -1;
         }
         for (index = 0; index < 2; index++) {
             struct input_event event;
@@ -1216,6 +1505,41 @@ static int serve_connection(int fd, const struct control_contract *contract,
                      "RESPONSE\nid=%u\nop=driver-inventory\nstatus=ok\nvirtio-net=%s\n"
                      "virtio-gpu=%s\ndisplay-driver=%s\ndisplay-relay=%s",
                      id, virtio_net, virtio_gpu, display_driver, display_relay);
+        } else if (request_id(payload, "display-evidence-v1", &id) == 0) {
+            struct display_evidence_sample evidence;
+            uint64_t age_ms;
+            char driver[64];
+            char vendor[5];
+            char device[5];
+            char bdf[16];
+            if (read_display_evidence(&evidence, &age_ms, driver, vendor, device, bdf) == 0) {
+                snprintf(
+                    payload, sizeof(payload),
+                    "RESPONSE\nid=%u\nop=display-evidence-v1\nstatus=ok\n"
+                    "sample-sequence=%" PRIu64 "\nsample-age-ms=%" PRIu64
+                    "\ndriver=%s\npci-vendor=%s\npci-device=%s\nguest-pci-bdf=%s\n"
+                    "connector-id=%" PRIu32 "\nmode-width=%" PRIu32
+                    "\nmode-height=%" PRIu32 "\ndirect-scanout=yes\nwindow-ns=%" PRIu64
+                    "\nframe-hz-milli=%" PRIu64 "\npageflip-completions=%" PRIu64
+                    "\ncpu-copy-us-avg=%" PRIu64 "\npageflip-latency-us-avg=%" PRIu64
+                    "\npageflip-latency-us-max=%" PRIu64 "\natomic-commit-us-avg=%" PRIu64,
+                    id, evidence.sequence, age_ms, driver, vendor, device, bdf,
+                    evidence.connector_id, evidence.mode_width, evidence.mode_height,
+                    evidence.window_ns, evidence.frame_hz_milli,
+                    evidence.pageflip_completions, evidence.cpu_copy_us_avg,
+                    evidence.pageflip_latency_us_avg, evidence.pageflip_latency_us_max,
+                    evidence.atomic_commit_us_avg);
+            } else {
+                snprintf(
+                    payload, sizeof(payload),
+                    "RESPONSE\nid=%u\nop=display-evidence-v1\nstatus=unavailable\n"
+                    "sample-sequence=0\nsample-age-ms=0\ndriver=missing\npci-vendor=0000\n"
+                    "pci-device=0000\nguest-pci-bdf=none\nconnector-id=0\nmode-width=0\n"
+                    "mode-height=0\ndirect-scanout=no\nwindow-ns=0\nframe-hz-milli=0\n"
+                    "pageflip-completions=0\ncpu-copy-us-avg=0\npageflip-latency-us-avg=0\n"
+                    "pageflip-latency-us-max=0\natomic-commit-us-avg=0",
+                    id);
+            }
         } else if (request_id(payload, "input-stream", &id) == 0) {
             int keyboard_index = -1;
             int keyboard_fd = open_input_device(INPUT_DEVICE_KEYBOARD, -1, &keyboard_index);
@@ -1245,39 +1569,58 @@ static int serve_connection(int fd, const struct control_contract *contract,
                          "RESPONSE\nid=%u\nop=input-stream\nstatus=error\nreason=input-unavailable",
                          id);
             } else {
-                snprintf(payload, sizeof(payload),
-                         "RESPONSE\nid=%u\nop=input-stream\nstatus=ready\nformat=linux-evdev-v3"
-                         "\nkeyboard=event%d\npointer=event%d",
-                         id, keyboard_index, pointer_index);
-                if (send_frame(fd, payload) != 0) {
+                struct input_scheduler_guard scheduler;
+                if (input_scheduler_enter(&scheduler) != 0) {
                     close(keyboard_fd);
                     close(pointer_fd);
-                    return -1;
-                }
-                if (selftest->enabled) {
-                    selftest->armed = 1;
-                    selftest->cycles_remaining = INPUT_SELFTEST_CYCLES;
-                    /* Both evdev file descriptions are open now. Queue the
-                     * first cycle before entering poll(2), so readiness does
-                     * not depend on a timeout winning over unrelated input
-                     * wakeups during concurrent guest startup. Subsequent
-                     * cycles remain rate-limited by the normal poll loop. */
-                    if (input_selftest_emit_cycle(selftest) != 0) {
+                    snprintf(payload, sizeof(payload),
+                             "RESPONSE\nid=%u\nop=input-stream\nstatus=error"
+                             "\nreason=scheduler-unavailable",
+                             id);
+                } else {
+                    int stream_errno;
+                    snprintf(payload, sizeof(payload),
+                             "RESPONSE\nid=%u\nop=input-stream\nstatus=ready\nformat=linux-evdev-v3"
+                             "\nkeyboard=event%d\npointer=event%d",
+                             id, keyboard_index, pointer_index);
+                    if (send_frame(fd, payload) != 0) {
+                        (void)input_scheduler_leave(&scheduler);
                         close(keyboard_fd);
                         close(pointer_fd);
                         return -1;
                     }
-                    fprintf(stderr, "rustos-dvm-agent: input selftest stream armed\n");
-                    fflush(stderr);
-                }
-                if (stream_input_devices(fd, keyboard_fd, pointer_fd, id, selftest) != 0) {
+                    if (selftest->enabled) {
+                        selftest->armed = 1;
+                        selftest->cycles_remaining = INPUT_SELFTEST_CYCLES;
+                        selftest->next_emit_ns = 0U;
+                        /* Both evdev file descriptions are open now. Queue the
+                         * first cycle before entering poll(2), so readiness does
+                         * not depend on a timeout winning over unrelated input
+                         * wakeups during concurrent guest startup. Subsequent
+                         * cycles remain rate-limited by the normal poll loop. */
+                        if (input_selftest_emit_cycle(selftest) != 0) {
+                            (void)input_scheduler_leave(&scheduler);
+                            close(keyboard_fd);
+                            close(pointer_fd);
+                            return -1;
+                        }
+                        fprintf(stderr, "rustos-dvm-agent: input selftest stream armed\n");
+                        fflush(stderr);
+                    }
+                    if (stream_input_devices(fd, keyboard_fd, pointer_fd, id, selftest) == 0) {
+                        errno = EIO;
+                    }
+                    stream_errno = errno;
+                    if (input_scheduler_leave(&scheduler) != 0) {
+                        close(keyboard_fd);
+                        close(pointer_fd);
+                        return -1;
+                    }
                     close(keyboard_fd);
                     close(pointer_fd);
+                    errno = stream_errno;
                     return -1;
                 }
-                close(keyboard_fd);
-                close(pointer_fd);
-                return -1;
             }
         } else {
             return -1;

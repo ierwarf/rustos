@@ -180,6 +180,12 @@ pub fn set_next_pick_hint(task_id: u64) {
     interrupts::without_interrupts(|| unsafe { scheduler_mut().set_next_pick_hint(task_id) })
 }
 
+pub fn set_next_latency_pick_hint(task_id: u64) -> bool {
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().set_next_latency_pick_hint(task_id)
+    })
+}
+
 pub fn set_next_process_pick_hint(process_id: u64) -> Option<u64> {
     interrupts::without_interrupts(|| unsafe {
         scheduler_mut().set_next_process_pick_hint(process_id)

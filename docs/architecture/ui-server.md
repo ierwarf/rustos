@@ -64,6 +64,20 @@ all use the canonical Wayland protocol — the in-tree Wayland clients
 (`apps/wayclick`, console hosts) and the planned external clients should
 not need special wrappers.
 
+WayClick uses the normal client event queue and blocking dispatch loop. A
+`wl_surface.frame` callback is one-shot and becomes active with the matching
+surface commit; a buffer is reused only after `wl_buffer.release`. Profiling
+may request another representative redraw after each callback, but it does not
+replace the wire protocol or add a GPU-specific application API. This follows
+the upstream Wayland protocol and client event-loop contracts:
+<https://wayland.freedesktop.org/docs/html/apa.html> and
+<https://wayland.freedesktop.org/docs/html/apb.html>.
+
+The current bounded KVM proof keeps the contract honest: uiserver and the DVM
+relay can remain near the refresh rate while WayClick misses the 55 FPS gate on
+the service-owned AF_UNIX transport. That is an OS transport/scheduling
+performance failure, not permission to add a client-specific compositor path.
+
 ### Console Hosting
 
 Console-hosted programs (the shell, the PE demos) get a console session
@@ -141,6 +155,15 @@ compositor는 `/run/user/1000/wayland-0`로 standard Wayland socket을
 노출합니다. surface, buffer, frame callback, damage는 canonical Wayland
 protocol을 사용합니다. tree 내의 Wayland client (`apps/wayclick`, console
 host)와 예정된 외부 client에 별도 wrapper가 필요하지 않습니다.
+
+WayClick도 일반 client event queue와 blocking dispatch loop를 사용합니다.
+`wl_surface.frame` callback은 commit에 연결되는 one-shot이며,
+`wl_buffer.release`를 받은 뒤에만 buffer를 재사용합니다. profile 모드는
+callback마다 대표 redraw를 더 요청할 뿐 protocol이나 GPU 전용 app API를
+바꾸지 않습니다. 현재 KVM에서 uiserver/DVM relay가 refresh rate 근처를
+유지해도 WayClick의 55 FPS gate가 실패하는 것은 AF_UNIX transport와
+scheduler의 OS 성능 실패로 기록하며, client 전용 우회로를 만들 근거로
+삼지 않습니다.
 
 ### Console hosting
 

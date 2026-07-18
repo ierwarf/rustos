@@ -36,7 +36,7 @@ cargo xtask verify-dvm
 
 ```bash
 cargo xtask build
-cargo xtask build-dvm
+cargo xtask verify-dvm
 cargo xtask kvm-smoke --expect 'runtimed: bootstrap ui done'
 ```
 
@@ -55,6 +55,12 @@ emulated IDE controller.
 the hash-bound `agent-v1-control` handshake. Optional exercise flags prove the
 authenticated DVM input relay and bidirectional display/network shared-memory
 rings; startup alone is not success.
+
+`--min-ui-fps <fps>` patches only the private KVM disk to enable uiserver and
+WayClick profiles. It requires consecutive render/input windows, balanced
+WayClick commit/frame-callback/buffer-release windows with bounded callback
+gaps, and the requested DVM relay windows when GUI-DVM surfaces are enabled.
+It does not lower or infer one result from another.
 
 <a id="korean"></a>
 
@@ -85,7 +91,7 @@ surface는 `tools/xtask/src/cli.rs`에 있습니다.
 
 ```bash
 cargo xtask build
-cargo xtask build-dvm
+cargo xtask verify-dvm
 cargo xtask kvm-smoke --expect 'runtimed: bootstrap ui done'
 ```
 
@@ -99,3 +105,9 @@ private writable image이며, 저장소에 고정된 OVMF를 QEMU에 명시 경�
 hash-bound `agent-v1-control` handshake를 요구합니다. exercise option은 인증된
 DVM input relay와 양방향 display/network shared-memory ring을 검증하며, 단순히
 guest가 시작된 것만으로는 통과하지 않습니다.
+
+`--min-ui-fps <fps>`는 private KVM disk에서만 uiserver와 WayClick profile을
+활성화합니다. 연속 render/input window, callback gap이 제한되고 commit/
+frame-callback/buffer-release가 균형을 이룬 WayClick window, GUI-DVM surface를
+사용할 때 요청된 DVM relay window를 각각 요구합니다. 한 경로의 수치로
+다른 경로의 실패를 대신 통과시키지 않습니다.

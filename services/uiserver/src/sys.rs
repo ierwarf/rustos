@@ -20,16 +20,20 @@ use console_abi::{
 };
 pub(crate) use console_abi::{ConsoleSessionInfo, ConsoleStateInfo};
 pub(crate) use device_abi::{
-    DisplayInfo, DisplaySurfaceCreate, InputEvent, INPUT_ACTION_NONE, INPUT_ACTION_PRESSED,
+    DisplayGpuCompletionQuery, DisplayGpuInfo, DisplayInfo, DisplaySurfaceCreate, InputEvent,
+    DISPLAY_GPU_ABI_VERSION, DISPLAY_GPU_INFO_FLAG_STAGED_COPY,
+    DISPLAY_GPU_SUBMIT_FLAG_STAGED_COPY, INPUT_ACTION_NONE, INPUT_ACTION_PRESSED,
     INPUT_ACTION_RELEASED, INPUT_ACTION_REPEATED, INPUT_KIND_KEYBOARD, INPUT_KIND_POINTER_BUTTON,
     INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION, INPUT_KIND_POINTER_SCROLL,
     PIXEL_FORMAT_BGRA8888, POINTER_BUTTON_LEFT, POINTER_BUTTON_MIDDLE, POINTER_BUTTON_RIGHT,
     POINTER_BUTTON_X1, POINTER_BUTTON_X2,
 };
-use device_abi::{DisplayPresentRectRequest, DisplayPresentRequest};
+use device_abi::{
+    DisplayGpuDamage, DisplayGpuSubmitRequest, DisplayPresentRectRequest, DisplayPresentRequest,
+    DISPLAY_SURFACE_FLAG_GPU_ATLAS,
+};
 
 const SYS_READ: usize = 0;
-const SYS_POLL: usize = 7;
 const SYS_MMAP: usize = 9;
 const SYS_MUNMAP: usize = 11;
 const SYS_IOCTL: usize = 16;
@@ -48,15 +52,13 @@ const AT_FDCWD: isize = -100;
 const O_RDONLY: usize = 0;
 const O_RDWR: usize = 2;
 const O_NONBLOCK: usize = 0o4000;
-const POLLIN: i16 = 0x0001;
-const INPUT_READY_POLL_TIMEOUT_MS: isize = 8;
 
 const PROT_READ: usize = 0x1;
 const PROT_WRITE: usize = 0x2;
 
 const MAP_SHARED: usize = 0x01;
 const PAGE_SIZE: usize = 4096;
-const MAX_SURFACE_MAPPING_BYTES: usize = 128 * 1024 * 1024;
+const MAX_SURFACE_MAPPING_BYTES: usize = device_abi::DISPLAY_SURFACE_MAX_MAPPING_BYTES as usize;
 const MAX_SHARED_FD_MAPPING_BYTES: usize = 64 * 1024 * 1024;
 const DISPLAY_POLICY_MAX_WIDTH: u64 = 7680;
 const DISPLAY_POLICY_MAX_HEIGHT: u64 = 4320;
@@ -82,13 +84,8 @@ pub(crate) const MAX_CONSOLE_SNAPSHOT_BYTES: usize = 4096;
 pub(crate) const EAGAIN: i32 = 11;
 pub(crate) const ENOENT: i32 = 2;
 pub(crate) const EINVAL: i32 = 22;
+pub(crate) const ENODEV: i32 = 19;
 
-#[repr(C)]
-struct PollFd {
-    fd: i32,
-    events: i16,
-    revents: i16,
-}
 pub(crate) const ESTALE: i32 = 116;
 pub(crate) type ConsoleSessionHandle = u64;
 
@@ -435,6 +432,10 @@ const DISPLAY_IOCTL_GET_INFO: usize = device_abi::DISPLAY_IOCTL_GET_INFO as usiz
 const DISPLAY_IOCTL_CREATE_SURFACE: usize = device_abi::DISPLAY_IOCTL_CREATE_SURFACE as usize;
 const DISPLAY_IOCTL_PRESENT: usize = device_abi::DISPLAY_IOCTL_PRESENT as usize;
 const DISPLAY_IOCTL_PRESENT_RECT: usize = device_abi::DISPLAY_IOCTL_PRESENT_RECT as usize;
+const DISPLAY_IOCTL_GPU_GET_INFO: usize = device_abi::DISPLAY_IOCTL_GPU_GET_INFO as usize;
+const DISPLAY_IOCTL_GPU_SUBMIT: usize = device_abi::DISPLAY_IOCTL_GPU_SUBMIT as usize;
+const DISPLAY_IOCTL_GPU_QUERY_COMPLETION: usize =
+    device_abi::DISPLAY_IOCTL_GPU_QUERY_COMPLETION as usize;
 const CONSOLE_IOCTL_GET_STATE: usize = console_abi::CONSOLE_IOCTL_GET_STATE as usize;
 const CONSOLE_IOCTL_SNAPSHOT_SESSION_OUTPUT: usize =
     console_abi::CONSOLE_IOCTL_SNAPSHOT_SESSION_OUTPUT as usize;
@@ -447,6 +448,11 @@ pub(crate) struct SurfaceMapping {
     base: NonNull<u32>,
     len_bytes: usize,
 }
+
+// A surface mapping has unique ownership and is never aliased across the
+// initialization handoff. Moving it from the bounded GPU initialization
+// worker to the UI thread does not change the mapping or its process address.
+unsafe impl Send for SurfaceMapping {}
 
 impl SurfaceMapping {
     pub(crate) fn pixels_mut(&mut self) -> &mut [u32] {
@@ -627,6 +633,100 @@ pub(crate) fn display_create_surface(
     Ok(surface)
 }
 
+pub(crate) fn display_gpu_get_info(fd: RawFd) -> Result<DisplayGpuInfo, i32> {
+    let mut info = DisplayGpuInfo::default();
+    ioctl_with_mut(fd, DISPLAY_IOCTL_GPU_GET_INFO, &mut info)?;
+    if info.version != DISPLAY_GPU_ABI_VERSION
+        || info.flags != DISPLAY_GPU_INFO_FLAG_STAGED_COPY
+        || info.atlas_width == 0
+        || info.atlas_height == 0
+        || info.atlas_stride_bytes < info.atlas_width.saturating_mul(4)
+        || info.slot_count != driver_domain_protocol::DVM_GPU_RENDER_MAX_IN_FLIGHT
+        || info.max_commands != driver_domain_protocol::DVM_GPU_RENDER_MAX_COMMANDS
+        || info.max_batch_bytes as usize != driver_domain_protocol::DVM_GPU_RENDER_MAX_BATCH_BYTES
+        || info.generation == 0
+        || info.context_id == 0
+        || info.context_epoch == 0
+        || info.prime_fence_value == 0
+        || info.prime_duration_ns == 0
+        || info.prime_duration_ns
+            > u64::from(driver_domain_protocol::DVM_GPU_PIPELINE_PRIME_MAX_US) * 1_000
+    {
+        return Err(EINVAL);
+    }
+    Ok(info)
+}
+
+pub(crate) fn display_create_gpu_atlas_surface(
+    fd: RawFd,
+    info: DisplayGpuInfo,
+) -> Result<DisplaySurfaceCreate, i32> {
+    let mut surface =
+        DisplaySurfaceCreate::request(info.atlas_width, info.atlas_height, PIXEL_FORMAT_BGRA8888);
+    surface.flags = DISPLAY_SURFACE_FLAG_GPU_ATLAS;
+    ioctl_with_mut(fd, DISPLAY_IOCTL_CREATE_SURFACE, &mut surface)?;
+    if surface.flags != DISPLAY_SURFACE_FLAG_GPU_ATLAS
+        || surface.handle == 0
+        || surface.bytes_per_pixel != 4
+        || surface.stride_bytes != info.atlas_stride_bytes
+        || surface.reserved >= info.slot_count
+        || surface.mapping_len == 0
+        || surface.generation != info.generation
+    {
+        return Err(EINVAL);
+    }
+    Ok(surface)
+}
+
+pub(crate) fn display_gpu_submit(
+    fd: RawFd,
+    surface_handle: u32,
+    damage: &[driver_domain_protocol::DvmGpuAtlasDamage],
+    batch: &[u8],
+) -> Result<(), i32> {
+    if batch.is_empty()
+        || batch.len() > driver_domain_protocol::DVM_GPU_RENDER_MAX_BATCH_BYTES
+        || damage.len() > driver_domain_protocol::DVM_GPU_ATLAS_MAX_DAMAGE_RECTS as usize
+    {
+        return Err(EINVAL);
+    }
+    let damage: Vec<DisplayGpuDamage> = damage
+        .iter()
+        .map(|rect| DisplayGpuDamage {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+        })
+        .collect();
+    let mut request = DisplayGpuSubmitRequest {
+        surface_handle,
+        flags: DISPLAY_GPU_SUBMIT_FLAG_STAGED_COPY,
+        batch_ptr: batch.as_ptr() as u64,
+        batch_len: u32::try_from(batch.len()).map_err(|_| EINVAL)?,
+        damage_count: u32::try_from(damage.len()).map_err(|_| EINVAL)?,
+        damage_ptr: if damage.is_empty() {
+            0
+        } else {
+            damage.as_ptr() as u64
+        },
+        reserved: 0,
+    };
+    ioctl_with_mut(fd, DISPLAY_IOCTL_GPU_SUBMIT, &mut request)
+}
+
+pub(crate) fn display_gpu_query_completion(
+    fd: RawFd,
+    surface_handle: u32,
+) -> Result<DisplayGpuCompletionQuery, i32> {
+    let mut query = DisplayGpuCompletionQuery {
+        surface_handle,
+        ..DisplayGpuCompletionQuery::default()
+    };
+    ioctl_with_mut(fd, DISPLAY_IOCTL_GPU_QUERY_COMPLETION, &mut query)?;
+    Ok(query)
+}
+
 pub(crate) fn display_present(fd: RawFd, surface_handle: u32) -> Result<(), i32> {
     let mut request = DisplayPresentRequest::new(surface_handle);
     ioctl_with_mut(fd, DISPLAY_IOCTL_PRESENT, &mut request)
@@ -748,26 +848,6 @@ pub(crate) fn read_input(fds: &[OwnedFd], events: &mut [InputEvent]) -> Result<u
         }
     }
     Ok(written)
-}
-
-pub(crate) fn wait_for_input_ready(fds: &[OwnedFd]) -> Result<bool, i32> {
-    let mut poll_fds = Vec::with_capacity(fds.len());
-    for fd in fds {
-        poll_fds.push(PollFd {
-            fd: fd.as_raw_fd(),
-            events: POLLIN,
-            revents: 0,
-        });
-    }
-    let ready = poll(&mut poll_fds, INPUT_READY_POLL_TIMEOUT_MS)?;
-    if ready == 0 {
-        return Ok(false);
-    }
-    if poll_fds.iter().any(|fd| fd.revents & POLLIN != 0) {
-        Ok(true)
-    } else {
-        Err(5)
-    }
 }
 
 fn translate_linux_input_event(
@@ -1169,18 +1249,6 @@ fn openat(dirfd: isize, path: &CString, flags: usize, mode: usize) -> Result<Raw
 
 fn read(fd: RawFd, buffer: *mut c_void, len: usize) -> Result<usize, i32> {
     let result = unsafe { syscall3(SYS_READ, fd as usize, buffer as usize, len) };
-    syscall_usize(result)
-}
-
-fn poll(fds: &mut [PollFd], timeout_ms: isize) -> Result<usize, i32> {
-    let result = unsafe {
-        syscall3(
-            SYS_POLL,
-            fds.as_mut_ptr() as usize,
-            fds.len(),
-            timeout_ms as usize,
-        )
-    };
     syscall_usize(result)
 }
 

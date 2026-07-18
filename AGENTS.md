@@ -7,12 +7,18 @@ prefix every agent should load. Everything else is opened on demand.
 ## TL;DR
 
 1. Route the task through `docs/ai/task-router.md` before reading source.
-2. Use Serena MCP / ripgrep MCP for symbol- and pattern-scoped lookups; do not
+2. After edits, run `cargo xtask dev-plan` to separate fast checks from the
+   one-time stable change-set gates; the plan is routing, not evidence.
+   For one cached DVM relay source package, its `dev-*` command is only the
+   fast compile loop; batch the matching `rebuild-*` image/artifact refresh
+   once after the change set is stable. Never clean or rebuild a toolchain for
+   an ordinary relay edit.
+3. Use Serena MCP / ripgrep MCP for symbol- and pattern-scoped lookups; do not
    open whole files or whole subsystems.
-3. Sub-agents use **GPT-5.6 terra** with `xhigh` reasoning. Do not use GPT-5.5.
-4. Never bypass hooks (`--no-verify`, `--no-gpg-sign`, etc.). Treat hook output
+4. Sub-agents use **GPT-5.6 terra** with `xhigh` reasoning. Do not use GPT-5.5.
+5. Never bypass hooks (`--no-verify`, `--no-gpg-sign`, etc.). Treat hook output
    as primary evidence.
-5. RustOS is mid-evacuation from ring0 to user services. Push policy into
+6. RustOS is mid-evacuation from ring0 to user services. Push policy into
    `rootd` / `syscalld` / `vfsd` / `loaderd` / `netd` / `inputd` etc., not back
    into the kernel.
 

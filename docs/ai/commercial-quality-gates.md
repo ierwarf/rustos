@@ -58,7 +58,7 @@ runtime evidence also pass.
 | P1.1 | Scheduler and queue overload | Critical work has explicit admission, priority inheritance, bounded turns and queues, measurable wait/frame thresholds, and a guaranteed recovery/User share under flood. IRQ leaves policy and unbounded work to schedulable context. | scheduler admission/demotion/wakeup/IPC PI models, `kernel-ps` tests, UI profile and stall markers |
 | P1.2 | Storage and filesystem mutation | Boot substrate is descriptor/extent bounded; namespace, mount, metadata, and post-bootstrap storage policy stay in services. Power loss, partial write, media removal, and replay have explicit terminal results. | boot-volume model, manifest fuzz, storage fault tests; filesystem-content/crash-consistency model remains mandatory |
 | P1.3 | Network and message payloads | DVM Ethernet is only a bounded authenticated transport; `netd` owns socket policy, queue limits, cancellation, and peer namespaces. Payload length/checksum/fragment adversaries cannot escape their session. | DVM network models and KVM exercise; packet-payload and socket-backpressure models remain mandatory |
-| P1.4 | Display and input integrity | Only authenticated DVM ingress reaches inputd; UI policy never runs in IRQ context; scanout completion is a fence, not an ioctl return; queues coalesce only lossy motion and preserve edges. | input/display/scanout/frame-budget models and 60 FPS DVM profile gate |
+| P1.4 | Display and input integrity | Only authenticated DVM ingress reaches inputd; UI policy never runs in IRQ context; scanout completion is a fence, not an ioctl return; queues coalesce only lossy motion and preserve edges. The MSI-X worker owns input transport progress, while uiserver's dedicated reader uses authorized nonblocking reads on a non-accumulating 4 ms cadence until a service-owned readiness object closes the separate generic userspace-ABI gate. GPU composition admits only bounded OS-owned contexts, fixed commands, read-only source capabilities, explicit acquire/completion/release fences, and epoch-wide hard-timeout/revoke. The 16.667 ms frame target remains a strict performance gate, while a distinct 50 ms hard timeout prevents one scheduling-jitter miss from withdrawing the last valid front buffer or fabricating device loss. Built-in shader/pipeline priming is a separately fenced setup phase bounded to 500 ms, exercises a full provider-stride atlas upload plus the fixed textured draw and atomic present, and keeps frame admission closed until it succeeds; late atlas allocation runs off the UI thread while the current CPU-presented surface remains live, provider pitch is preserved exactly, and a separate first-frame deadline gates promotion. In the absence of an exported vblank clock, one non-accumulating 16 ms cadence permit coalesces display work without CPU fallback or post-stall bursts. Raw commands, malformed layers, application shaders, software rendering, CPU fallback, and clear-only priming cannot count as GPU success. | input/display/scanout/frame-budget/GPU-compositor/admission models, fixed-contract source tests, representative bounded-prime virgl execution proof, and 60 FPS DVM profile gate with matched GPU/present-fence counts |
 | P2 | Capacity, update, and operability | Boot time, steady-state CPU/memory/IO pressure, storage growth, update rollback, telemetry loss, and recovery budgets have published thresholds with reproducible collection commands. | bounded performance captures, pressure/latency counters, upgrade/rollback and long-duration soak gates |
 
 Current known release blockers must stay visible in `formal/COVERAGE.md` and
@@ -84,6 +84,25 @@ self-contained, immutable, safely staged release directory. Its
 non-redistributable firmware license, target
 connector, DMA fault, reset, and 60 FPS page-flip captures are separate failed
 release gates until evidence is filed.
+
+The pre-public-ABI GPU-composition gate is narrower and independently
+observable. RustOS already compiles bounded scene layers into the private fixed
+contract, and the Linux DVM executes the identical command vocabulary through
+virgl or AMDGPU GLES with explicit fences, pixel verification, a frame hash,
+bounded one-time pipeline-prime latency, and measured steady-state completion
+latency. The KVM proof must explicitly report that no
+public ABI, live RustOS UI connection, or scanout handoff exists. Therefore it
+cannot close the still-failed private submit transport, AppState layer adapter,
+GPU-output KMS handoff, foreign DMA-BUF zero-copy, application 3D ABI, or
+physical AMD capture gates.
+
+For the enabled AMD `1002:1900` slice, source admission now additionally
+requires the signed schema-3 `amdgpu` identity and five authenticated fresh
+relay samples proving direct DMA-BUF scanout, zero relay CPU copy, at least the
+59,000 mHz measurement floor around a nominal 60 Hz mode, at most 25 ms
+commit-to-page-flip latency, and at most 2 ms nonblocking atomic-commit time.
+This instrumentation and its finite model do not close the physical gate while
+the only available AMD function remains the active L0 boot display.
 
 The current implementation slice intentionally excludes trusted UI/multi-DVM
 focus authority and physical network/block DVM assignment. Their existing

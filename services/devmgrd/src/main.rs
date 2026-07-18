@@ -617,16 +617,19 @@ enum IoctlPolicyOwner {
 
 fn ioctl_policy_owner(request_number: u64) -> Option<IoctlPolicyOwner> {
     match request_number {
-        rustos_user_abi::device::DISPLAY_IOCTL_GET_INFO => Some(IoctlPolicyOwner::Uiserver(
+        rustos_user_abi::device::DISPLAY_IOCTL_GET_INFO
+        | rustos_user_abi::device::DISPLAY_IOCTL_GPU_GET_INFO => Some(IoctlPolicyOwner::Uiserver(
             COMMERCIAL_MAX_UISERVER_OP_DISPLAY_METADATA,
         )),
         rustos_user_abi::device::DISPLAY_IOCTL_CREATE_SURFACE => Some(IoctlPolicyOwner::Uiserver(
             COMMERCIAL_MAX_UISERVER_OP_SURFACE_POLICY,
         )),
         rustos_user_abi::device::DISPLAY_IOCTL_PRESENT
-        | rustos_user_abi::device::DISPLAY_IOCTL_PRESENT_RECT => Some(IoctlPolicyOwner::Uiserver(
-            COMMERCIAL_MAX_UISERVER_OP_PRESENT_POLICY,
-        )),
+        | rustos_user_abi::device::DISPLAY_IOCTL_PRESENT_RECT
+        | rustos_user_abi::device::DISPLAY_IOCTL_GPU_SUBMIT
+        | rustos_user_abi::device::DISPLAY_IOCTL_GPU_QUERY_COMPLETION => Some(
+            IoctlPolicyOwner::Uiserver(COMMERCIAL_MAX_UISERVER_OP_PRESENT_POLICY),
+        ),
         rustos_user_abi::console::CONSOLE_IOCTL_GET_STATE
         | rustos_user_abi::console::CONSOLE_IOCTL_SNAPSHOT_SESSIONS => Some(
             IoctlPolicyOwner::Sessiond(COMMERCIAL_MAX_SESSIOND_OP_SESSION_GRAPH),
@@ -678,6 +681,8 @@ fn ioctl_is_direct_hot_path(request_number: u64) -> bool {
         request_number,
         rustos_user_abi::device::DISPLAY_IOCTL_PRESENT
             | rustos_user_abi::device::DISPLAY_IOCTL_PRESENT_RECT
+            | rustos_user_abi::device::DISPLAY_IOCTL_GPU_SUBMIT
+            | rustos_user_abi::device::DISPLAY_IOCTL_GPU_QUERY_COMPLETION
     )
 }
 

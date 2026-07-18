@@ -673,6 +673,10 @@ struct WaylandState {
     pointer_y: u32,
     pointer_button_down: bool,
     dirty: bool,
+    callback_profile_started: Instant,
+    callback_profile_count: u64,
+    callback_profile_wait_micros: u64,
+    callback_profile_max_wait_micros: u64,
 }
 
 impl WaylandState {
@@ -693,6 +697,10 @@ impl WaylandState {
             pointer_y: display_height / 2,
             pointer_button_down: false,
             dirty: false,
+            callback_profile_started: Instant::now(),
+            callback_profile_count: 0,
+            callback_profile_wait_micros: 0,
+            callback_profile_max_wait_micros: 0,
         }
     }
 
@@ -841,9 +849,36 @@ impl WaylandState {
             for buffer in releases {
                 buffer.release();
             }
-            for callback in callbacks {
-                callback.done(time);
+            for pending in callbacks {
+                let wait_micros =
+                    u64::try_from(pending.requested_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+                self.callback_profile_count = self.callback_profile_count.saturating_add(1);
+                self.callback_profile_wait_micros = self
+                    .callback_profile_wait_micros
+                    .saturating_add(wait_micros);
+                self.callback_profile_max_wait_micros =
+                    self.callback_profile_max_wait_micros.max(wait_micros);
+                pending.callback.done(time);
             }
+        }
+        let profile_elapsed = self.callback_profile_started.elapsed();
+        if ui_profile_enabled() && profile_elapsed >= Duration::from_secs(1) {
+            let elapsed_micros = u64::try_from(profile_elapsed.as_micros())
+                .unwrap_or(u64::MAX)
+                .max(1);
+            crate::sys::profile_line(&format!(
+                "uiserver wayland callback profile: elapsed_ms={} callback_hz_milli={} avg_wait_ms={} max_wait_ms={}",
+                elapsed_micros / 1_000,
+                self.callback_profile_count
+                    .saturating_mul(1_000_000_000)
+                    .saturating_div(elapsed_micros),
+                self.callback_profile_wait_micros / self.callback_profile_count.max(1) / 1_000,
+                self.callback_profile_max_wait_micros / 1_000,
+            ));
+            self.callback_profile_started = Instant::now();
+            self.callback_profile_count = 0;
+            self.callback_profile_wait_micros = 0;
+            self.callback_profile_max_wait_micros = 0;
         }
     }
 
@@ -867,7 +902,7 @@ impl WaylandState {
     fn prune_surface_callbacks(surface: &mut WaylandSurfaceState) {
         surface
             .pending_callbacks
-            .retain(|callback| callback.is_alive());
+            .retain(|pending| pending.callback.is_alive());
     }
 
     fn surface_callback_count(surface: &mut WaylandSurfaceState) -> usize {
@@ -1625,7 +1660,7 @@ struct WaylandSurfaceState {
     current_buffer: Option<BufferData>,
     pending_damage: Rect,
     last_damage: Rect,
-    pending_callbacks: Vec<wl_callback::WlCallback>,
+    pending_callbacks: Vec<PendingFrameCallback>,
     pending_buffer_releases: Vec<wl_buffer::WlBuffer>,
     pixels: Arc<Vec<u32>>,
     width: usize,
@@ -1687,6 +1722,11 @@ struct KeyboardData;
 
 #[derive(Default)]
 struct CallbackData;
+
+struct PendingFrameCallback {
+    callback: wl_callback::WlCallback,
+    requested_at: Instant,
+}
 
 impl BufferData {
     fn copy_damage_into(
@@ -2344,7 +2384,10 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
 
                 let callback = data_init.init(callback, CallbackData);
                 if let Ok(mut surface) = data.shared.lock() {
-                    surface.pending_callbacks.push(callback);
+                    surface.pending_callbacks.push(PendingFrameCallback {
+                        callback,
+                        requested_at: Instant::now(),
+                    });
                 }
             }
             wl_surface::Request::Damage {

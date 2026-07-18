@@ -14,3 +14,4 @@ path = "apps/wayclick/wayclick.elf"
 display_name = "WayClick"
 weight_micros = 100
 console_hosted = false
+env = ["RUSTOS_WAYCLICK_PROFILE=0"]

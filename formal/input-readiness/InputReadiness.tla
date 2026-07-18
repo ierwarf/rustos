@@ -9,22 +9,23 @@ Concrete owners and source anchors:
       kernel/io-manager/src/input/{event_queue.rs,dvm_ring.rs}
   * poll arm/recheck/commit:
       kernel/compat/src/user/syscall/linux/service_ops/poll_epoll.rs
-  * input-policy ingestion on a poll probe or authorized read:
+  * event-driven input-policy ingestion plus poll/read refresh:
       services/inputd/src/main.rs
-  * endpoint wait/wake for those request-driven transfers:
+  * endpoint wait/wake for those transfers:
       services/inputd/src/main.rs (SYS_RUSTOS_IPC_RECV)
 
 The ownership boundary is deliberately narrow. Ring0 exposes wakeable bounded
-ingress, while inputd owns translation and its policy queue. A poll recheck
-uses the 16 ms-bounded INPUTD_IPC_OP_STATS request, which makes inputd first
-transfer ingress then report policy readiness. The kernel poll path can wake or
-ask that question but cannot consume a ring slot. An authorized read uses the
-same explicit inputd-owned transfer operation when it owns a real DVM ingress
-record.
+ingress, while inputd owns translation and its policy queue. Its MSI-X-woken
+worker can transfer ingress independently of an application. A finite poll
+rechecks the 16 ms-bounded INPUTD_IPC_OP_STATS request until its own deadline,
+so a record already moved to the service queue is still observed. The kernel
+poll path can wake or ask that question but cannot consume a ring slot.
 
-There is intentionally no idle background-drain action. It could consume the
-only ring0-observable record after a client armed poll but before it received a
-service-owned readiness result, leaving that client asleep.
+The latency-sensitive uiserver path uses an already-nonblocking native input fd
+on a fixed cumulative cadence until inputd exports a service-owned readiness
+object. An authorized direct read can therefore consume either service policy
+or ingress that raced the worker, without treating ring0 wake state as service
+queue readiness.
 
 The concrete arm/recheck path reads both decoded ingress and the raw fixed-ring
 producer/consumer state. This implements the model's `ArmPoll` observation of
@@ -32,7 +33,8 @@ producer/consumer state. This implements the model's `ArmPoll` observation of
 be lost merely because no waiter existed at interrupt time.
 Finite polls advance through one-tick RTC rechecks until `pollDeadline` rather
 than registering one task in independent input and timer waiter tables;
-indefinite polls retain the event-driven arm/recheck/commit path.
+the general indefinite-poll service-readiness object remains an explicit
+next-ABI gate and is not claimed by this finite/direct-reader model.
 
 The model abstracts authorization identity, key translation, and UI rendering;
 those are covered by the endpoint/input-revocation models and Rust/KVM tests.
@@ -41,7 +43,7 @@ those are covered by the endpoint/input-revocation models and Rust/KVM tests.
 CONSTANTS MaxIngress, MaxEvents, PollBound
 
 ReaderStates == {"idle", "armed", "recheck", "ready"}
-TransferReasons == {"poll-recheck", "authorized-read"}
+TransferReasons == {"ingestion-worker", "poll-recheck", "authorized-read"}
 NoOwner == "none"
 InputdBrokerOwner == "inputd-broker"
 DvmSource == "dvm"
@@ -111,6 +113,19 @@ ProduceIngress ==
         /\ UNCHANGED <<policyQueue, delivered, readPermit, pollDeadline, now, transferHistory,
                       lastTransferOwner, unprivilegedPollAttempted>>
 
+\* inputd's dedicated MSI-X-woken worker owns transport progress even when no
+\* application is polling. Moving a record here deliberately does not invent a
+\* kernel poll wake: finite poll and direct-read paths recheck service policy.
+BackgroundTransfer ==
+    /\ Len(ingress) > 0
+    /\ ingress' = <<>>
+    /\ policyQueue' = policyQueue \o ingress
+    /\ transferHistory' = Append(transferHistory,
+        [reason |-> "ingestion-worker", events |-> ingress])
+    /\ lastTransferOwner' = InputdBrokerOwner
+    /\ UNCHANGED <<delivered, readerState, readPermit, nextEvent, pollDeadline, now,
+                  unprivilegedPollAttempted>>
+
 \* The kernel's poll recheck asks inputd for STATS. inputd linearizes the
 \* ingress-to-policy transfer before reporting readable; a timeout with no
 \* ingress returns the reader to idle instead.
@@ -179,6 +194,24 @@ AuthorizedRead ==
     /\ lastTransferOwner' = InputdBrokerOwner
     /\ UNCHANGED <<nextEvent, now, unprivilegedPollAttempted>>
 
+\* uiserver's pre-readiness-object path is an authorized nonblocking read from
+\* the idle state. It refreshes ingress under inputd's queue lock, consumes at
+\* most one modeled record, and never requires a fabricated poll permit.
+AuthorizedNonblockingRead ==
+    /\ readerState = "idle"
+    /\ Len(policyQueue \o ingress) > 0
+    /\ ingress' = <<>>
+    /\ delivered' = Append(delivered, (policyQueue \o ingress)[1])
+    /\ policyQueue' = SubSeq(policyQueue \o ingress, 2, Len(policyQueue \o ingress))
+    /\ transferHistory' =
+        IF Len(ingress) = 0
+        THEN transferHistory
+        ELSE Append(transferHistory,
+            [reason |-> "authorized-read", events |-> ingress])
+    /\ lastTransferOwner' = InputdBrokerOwner
+    /\ UNCHANGED <<readerState, readPermit, nextEvent, pollDeadline, now,
+                  unprivilegedPollAttempted>>
+
 \* A non-inputd poll caller can observe a wake but has no ingest capability.
 \* Its drain attempt must not consume a ring0 ingress record, change the
 \* policy queue, or claim the consumer identity.
@@ -202,10 +235,12 @@ Tick ==
 Next ==
     \/ ArmPoll
     \/ ProduceIngress
+    \/ BackgroundTransfer
     \/ PollRecheck
     \/ ReadinessProbeTimeout
     \/ TransferThenProbeTimeout
     \/ AuthorizedRead
+    \/ AuthorizedNonblockingRead
     \/ UnprivilegedPollDrainAttempt
     \/ Tick
 
@@ -246,10 +281,6 @@ ReadPermitIsPositiveReadiness ==
     /\ (readPermit => readerState = "ready" /\ Len(policyQueue \o ingress) > 0)
     /\ (readerState = "idle" => ~readPermit)
 
-\* While a poll is waiting/rechecking, no prior service queue can be hidden.
-WaitingReaderHasNoHiddenPolicy ==
-    readerState \in {"armed", "recheck"} => Len(policyQueue) = 0
-
 \* Every source record has exactly one owner, and the number of represented
 \* records equals the producer sequence. This catches loss, duplication, and
 \* stale replay across ring0 ingress, inputd policy, and delivery.
@@ -265,9 +296,9 @@ DvmIngressOnly ==
         /\ record.source = DvmSource
         /\ record.kind \in DvmIngressKinds
 
-\* Every ingress transfer is attributed either to the poll STATS recheck or an
-\* authorized read. The exact records, not merely a count, must be witnessed
-\* and keep their DVM provenance after leaving ring0.
+\* Every ingress transfer is attributed to the ingestion worker, poll STATS
+\* recheck, or an authorized read. The exact records, not merely a count, must
+\* be witnessed and keep their DVM provenance after leaving ring0.
 EveryIngressTransferHasTrustedWitness ==
     /\ \A index \in 1..Len(transferHistory):
         /\ transferHistory[index].reason \in TransferReasons
@@ -283,12 +314,18 @@ OnlyInputdMovesIngress ==
 UnprivilegedPollCannotConsume ==
     unprivilegedPollAttempted => lastTransferOwner \in {NoOwner, InputdBrokerOwner}
 
-\* The timeout field and the Tick guard prove safety, but not that the timer
-\* interrupt and inputd recheck are dispatched.  Make both scheduling
-\* assumptions explicit, then check that a pending poll cannot persist.
+\* The timeout field and Tick guard prove safety, but not that the timer,
+\* inputd recheck, or authorized consumer is dispatched. Make those scheduler
+\* obligations explicit.
+ConsumeReadyInput == AuthorizedRead \/ AuthorizedNonblockingRead
+
 Spec == Init /\ [][Next]_vars /\ WF_vars(Tick) /\ WF_vars(ResolvePoll)
+       /\ WF_vars(ConsumeReadyInput)
 
 PendingPollEventuallyResolves ==
     readerState \in {"armed", "recheck"} ~>
         readerState \notin {"armed", "recheck"}
+
+ServicePolicyEventuallyDrains ==
+    Len(policyQueue) > 0 ~> Len(policyQueue) = 0
 ================================================================================

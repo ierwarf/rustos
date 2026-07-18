@@ -7,8 +7,11 @@ failure output as the primary debugging context.
 
 | Command | Use | Writes | Common failure meaning |
 | --- | --- | --- | --- |
+| `cargo xtask dev-plan` | classify all tracked and untracked changes into fast `now` checks and one-time `stable-batch` gates | none | non-UTF-8 path or unavailable Git worktree |
 | `cargo xtask check` | validate layering/manifests/workspace | `target/` | dependency layer violation, bad manifest, missing target |
+| `cargo xtask check --timings` | run the same check and print deterministic phase timings | `target/` | same as `check`; the slow phase identifies the next optimization target |
 | `cargo xtask build` | full OS build + stage | `target/`, `build/` | compile error, missing firmware/artifact, manifest staging error |
+| `cargo xtask build --timings` | run the same build and print phase timings | `target/`, `build/` | same as `build`; the slow phase identifies the next optimization target |
 | `cargo xtask build-user` | userspace packages only | `target/`, `build/artifacts` | service/app compile error |
 | `cargo xtask stage` | restage built artifacts | `build/image` | missing required artifact, bad install path |
 | `cargo xtask clean` | remove generated host/build/runtime outputs | removes `target/`, `build/`, `logs/` | stale generated artifact cleanup |
@@ -24,6 +27,9 @@ failure output as the primary debugging context.
 | `make -C driver-domains/linux rebuild-agent` | rebuild only the DVM control/input agent while preserving the Buildroot host toolchain | DVM package/artifacts only | agent compile or artifact refresh failure |
 | `make -C driver-domains/linux rebuild-display` | rebuild only the DVM display relay while preserving the Buildroot host toolchain | DVM package/artifacts only | display relay compile or artifact refresh failure |
 | `make -C driver-domains/linux rebuild-net` | rebuild only the DVM network relay while preserving the Buildroot host toolchain | DVM package/artifacts only | network relay compile or artifact refresh failure |
+| `make -C driver-domains/linux dev-agent` | compile only the cached DVM control/input package; no rootfs or artifact is created | `out/buildroot-output/target/` only | cold/stale configuration; run `build` first |
+| `make -C driver-domains/linux dev-display` | compile only the cached DVM display package; no rootfs or artifact is created | `out/buildroot-output/target/` only | cold/stale configuration; run `build` first |
+| `make -C driver-domains/linux dev-net` | compile only the cached DVM network package; no rootfs or artifact is created | `out/buildroot-output/target/` only | cold/stale configuration; run `build` first |
 | `cargo xtask kvm-smoke` | concurrently boot Linux DVM and RustOS with QEMU/KVM | `build/kvm/` | unavailable `/dev/kvm`, guest exit, missing readiness marker |
 | `cargo xtask kvm-run` | start the interactive Linux-DVM display session; it waits for an atomic three-buffer/page-flip-ready scanout before exposing the window, then records real pointer ingress and healthy idle UI ticks when QEMU closes | `build/kvm/` | unavailable GUI backend, `/dev/kvm`, display readiness failure, missing real pointer evidence, or a guest exit |
 | `cargo run -p rustos-hostd -- discover` | read host IOMMU groups | none | IOMMU unavailable or unreadable sysfs |
@@ -41,13 +47,47 @@ failure output as the primary debugging context.
 | `cargo xtask selftest` | host selftests for fault parsing, executable-image admission, ABI/layout, and runtime contracts | `target/` | contract/layout regression |
 | `cargo xtask fuzz-host --target all` | deterministic host fuzz smoke for fault rules, executable-image admission, project config, package/DVM manifests, and hostd launch-plan/device-policy/control-contract parsing | `logs/` on crash | parser panic or invariant bug |
 | `cargo xtask fuzz-host --target image-admission --iterations 1000` | exercise overflow, bounds, overlap, W^X, and entry-point admission without booting a guest | `logs/` on crash | shared ELF/PE admission panic or invariant bug |
+| `bash formal/run-tlc.sh <model/name>` | exhaustively run one changed finite TLA+ model with automatic local CPU parallelism | temporary files only | invariant violation, malformed model, or unavailable pinned TLC input |
+| `bash formal/run-all-tlc.sh` | run every PR-sized TLA+ model with automatic local CPU parallelism | temporary files only | at least one modeled contract failed |
+| `cargo test -p contract-tests` | active DVM transport, user ABI, keyboard, boot-random, and fault-rule layout tests | `target/` | active contract/layout regression |
+| `git diff --check` | whitespace sanity | none | trailing whitespace/conflict marker |
 
 Do not rerun `cargo xtask build-dvm` for RustOS-only, documentation, formal,
 manifest-consumer, or unrelated service changes. Reuse the verified artifact;
 for a local DVM relay source change, use the matching `rebuild-*` target above
 and then `cargo xtask verify-dvm`.
-| `cargo test -p contract-tests` | active DVM transport, user ABI, keyboard, boot-random, and fault-rule layout tests | `target/` | active contract/layout regression |
-| `git diff --check` | whitespace sanity | none | trailing whitespace/conflict marker |
+
+## DVM build-speed contract
+
+For a source-only edit under one local DVM relay package, `cargo xtask dev-plan`
+puts `make -C driver-domains/linux dev-*` in `now` and the matching
+`rebuild-*` in `stable-batch`. `dev-*` requires an unchanged, warm Buildroot
+configuration and source tree; it refuses to fetch, reconfigure, clean, or
+rebuild the host toolchain. It refreshes and compiles exactly one local package
+against the cached sysroot, but intentionally does not create a rootfs,
+manifest, or signed/release artifact.
+
+After `dev-*`, `make verify`, `cargo xtask verify-dvm`, and every KVM command
+fail closed until the matching `rebuild-*` succeeds. This prevents a fast
+package result from being mistaken for a release image. Keep `rebuild-*` for
+one stable change set, where it regenerates the rootfs and runs the full module
+signature and artifact verification. This follows Buildroot's distinction
+between package-only rebuilds and integration builds: <https://buildroot.org/downloads/manual/manual.html>.
+
+The integration rebuild still has to regenerate the immutable initramfs, but
+the repository wrapper overrides Buildroot's reproducible single-threaded
+`xz -9` with pinned-XZ, fixed-4-MiB-block, parallel `xz -1`. The measured
+454 MiB rootfs compression falls from about 79 seconds/144 MiB to about
+14 seconds/182 MiB without changing the `.cpio.xz` boot or artifact ABI.
+Do not call Buildroot directly: doing so bypasses this speed and reproducibility
+contract. XZ worker count may vary, but the fixed block partition and locked
+tool version keep the compressed stream independent of scheduling.
+
+`cargo xtask dev-plan` never executes the printed commands. `now` is the
+edit-loop set. `stable-batch` is ordered and should run once after the related
+source/config set settles. Override TLC parallelism only for diagnosis with
+`TLC_WORKERS=<positive integer>`; `TLC_WORKERS=1` is the serial reproducibility
+fallback.
 
 ## KVM smoke arguments
 
@@ -114,24 +154,29 @@ and then `cargo xtask verify-dvm`.
   Passing requires the normal app result plus nonzero producer and consumer
   counters in both bounded rings. It is an Ethernet transport proof, not a
   physical NIC assignment or an L0 network control plane.
-- `--min-ui-fps <fps>` enables `RUSTOS_UI_PROFILE` only in the private KVM
-  disk copy by replacing the equal-length disabled value in `uiserver.desktop`.
-  It never alters the release boot image and requires a `uiserver profile`
-  window whose `frame_hz_milli` meets the requested rate.
+- `--min-ui-fps <fps>` enables both `RUSTOS_UI_PROFILE` and
+  `RUSTOS_WAYCLICK_PROFILE` only in the private KVM disk copy by replacing the
+  equal-length disabled values. It never alters the release boot image. The
+  proof requires the requested number of consecutive one-second windows for
+  uiserver render/input health, balanced WayClick commit/frame-callback/
+  buffer-release progress with at most a 50 ms callback gap, and, when enabled,
+  DVM runtime plus atomic-page-flip relay throughput. One subsystem passing
+  cannot mask another subsystem's failure.
 
 ## L0 VFIO lifecycle
 
 - `rustos-hostd acquire --plan <file>` is dry-run by default. Production
   activation requires the detached release signature, pinned keyring, exact
-  artifact manifest, schema-2 device policy, and fleet policy. Unsigned device
+  artifact manifest, schema-3 AMD physical-display device policy, and fleet policy. Unsigned device
   binding is unavailable. Before writing a prepared lease or changing any
   driver binding, activation also runs the same physical runtime preflight
   against `--qemu`; an absent `/dev/iommu` therefore cannot detach the GPU.
 - `supervise` accepts only an already-active, signed display-only lease and a
   policy whose QEMU digest matches the root-owned executable. It uses one
   non-identity IOMMUFD VFIO address space, a durable pre-exec runtime identity,
-  authenticated readiness, bounded process teardown, and group reset before
-  launch and before restore.
+  authenticated readiness, five fresh consecutive physical page-flip evidence
+  samples meeting signed throughput/latency bounds, bounded process teardown,
+  and group reset before launch and before restore.
 - Never assign the host boot disk, active host display, or a mixed/protected
   IOMMU group. `recover` is the crash path; `release --activate` is only for a
   prepared lease or a known non-running active lease. Both retain the durable
