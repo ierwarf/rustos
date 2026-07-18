@@ -166,6 +166,15 @@ fn main() {
             raw_stderr_line(&format!("wayclick: dispatch failed: {err:?}"));
             break;
         }
+        // Frame callbacks enqueue the next attach/damage/commit batch while
+        // dispatching pending events. `blocking_dispatch` returns immediately
+        // in that case and would otherwise defer its implicit flush until the
+        // next loop iteration. Flush now so the standard Wayland request batch
+        // reaches the compositor in the same scheduling turn.
+        if let Err(err) = conn.flush() {
+            raw_stderr_line(&format!("wayclick: flush failed: {err:?}"));
+            break;
+        }
         state
             .profile
             .maybe_emit(state.frame_callback.is_some(), state.redraw_pending);

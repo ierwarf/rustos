@@ -804,54 +804,6 @@ fail:
     return -1;
 }
 
-int rustos_gpu_runtime_render_legacy(struct rustos_gpu_runtime *runtime,
-                                     const uint8_t *pixels, uint32_t width,
-                                     uint32_t height, uint32_t stride_bytes,
-                                     struct rustos_gpu_frame *frame) {
-    if (runtime == NULL || pixels == NULL || frame == NULL ||
-        width != runtime->output_width || height != runtime->output_height ||
-        width > runtime->atlas_width || height > runtime->atlas_height ||
-        stride_bytes < width * 4U || stride_bytes % 4U != 0U) {
-        errno = EINVAL;
-        return -1;
-    }
-    memset(frame, 0, sizeof(*frame));
-    frame->in_fence_fd = -1;
-    frame->budget_us = GPU_MAX_BUDGET_US;
-    runtime->stage = "gpu-legacy-atlas-upload";
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, runtime->source_texture);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(stride_bytes / 4U));
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)width, (GLsizei)height,
-                    GL_BGRA_EXT, GL_UNSIGNED_BYTE, pixels);
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-    runtime->stage = "gpu-legacy-render-clock";
-    if (monotonic_ns(&frame->render_started_ns) != 0)
-        return -1;
-    runtime->stage = "gpu-legacy-textured-draw";
-    glUseProgram(runtime->program);
-    glBindVertexArray(runtime->vertex_array);
-    glUniform2f(runtime->output_size_uniform, (GLfloat)runtime->output_width,
-                (GLfloat)runtime->output_height);
-    glUniform4f(runtime->rect_uniform, 0.0F, 0.0F,
-                (GLfloat)runtime->output_width, (GLfloat)runtime->output_height);
-    glUniform4f(runtime->color_uniform, 1.0F, 1.0F, 1.0F, 1.0F);
-    glUniform4f(runtime->transform_uniform, 0.0F, 0.0F, 0.0F, 0.0F);
-    glUniform1f(runtime->perspective_uniform, 0.0F);
-    glUniform4f(runtime->uv_rect_uniform, 0.0F, 0.0F,
-                (GLfloat)width / (GLfloat)runtime->atlas_width,
-                (GLfloat)height / (GLfloat)runtime->atlas_height);
-    glUniform1i(runtime->use_texture_uniform, 1);
-    glDisable(GL_BLEND);
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    if (glGetError() != GL_NO_ERROR) {
-        errno = EIO;
-        return -1;
-    }
-    return finish_frame(runtime, frame);
-}
-
 int rustos_gpu_runtime_render_batch(struct rustos_gpu_runtime *runtime,
                                     const uint8_t *atlas_pixels, size_t atlas_bytes,
                                     const struct rustos_gpu_damage *damage,

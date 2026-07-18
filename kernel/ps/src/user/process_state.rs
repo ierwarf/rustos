@@ -8,8 +8,8 @@ use x86_64::structures::paging::PageTableFlags;
 use crate::memory::paging::{self, AddressSpaceError, ProcessAddressSpace, UserRegion};
 use crate::user::handles::HandleTable;
 use crate::user::linux::{
-    LinuxMemoryMapState, LinuxProcessState, LinuxRuntimeProfile, LinuxSigAction, MAX_SIGNAL_NUMBER,
-    SIG_IGN,
+    CLOCK_MONOTONIC, CLOCK_REALTIME, LinuxMemoryMapState, LinuxProcessState, LinuxRuntimeProfile,
+    LinuxSigAction, MAX_SIGNAL_NUMBER, SIG_IGN,
 };
 use crate::user::memfd::MemfdMappingHold;
 
@@ -17,6 +17,8 @@ const PAGE_SIZE: u64 = 4096;
 const DEFAULT_MAPPING_GAP: u64 = 16 * 1024 * 1024;
 const ADMIN_REQUEST_PATH_CAPACITY: usize = 96;
 const PROCESS_EXEC_PATH_CAPACITY: usize = 192;
+const LINUX_CLOCK_ADMISSION_REALTIME: u8 = 1 << 0;
+const LINUX_CLOCK_ADMISSION_MONOTONIC: u8 = 1 << 1;
 pub const WINDOWS_TLS_SLOT_COUNT: usize = 64;
 pub const DEFAULT_DESKTOP_UID: u32 = 1000;
 pub const DEFAULT_DESKTOP_GID: u32 = 1000;
@@ -159,6 +161,11 @@ pub struct UserProcessState {
     linux_process_state: Option<LinuxProcessState>,
     linux_memory_map: Option<LinuxMemoryMapState>,
     linux_runtime_profile: Option<LinuxRuntimeProfile>,
+    /// Positive syscalld admission for immutable Linux clock IDs. The cache is
+    /// process-local, starts empty, and is reset by fork/exec. Unknown IDs are
+    /// never representable, so a service or caller cannot turn a malformed ID
+    /// into the kernel's monotonic fallback.
+    linux_clock_admission_mask: u8,
     linux_sigactions: [LinuxSigAction; MAX_SIGNAL_NUMBER + 1],
     windows_runtime: Option<WindowsProcessRuntimeState>,
     handles: HandleTable,
@@ -339,6 +346,7 @@ impl UserProcessState {
             linux_process_state,
             linux_memory_map,
             linux_runtime_profile,
+            linux_clock_admission_mask: 0,
             linux_sigactions: [LinuxSigAction::default(); MAX_SIGNAL_NUMBER + 1],
             windows_runtime,
             handles: HandleTable::new(),
@@ -381,6 +389,21 @@ impl UserProcessState {
 
     pub fn linux_runtime_profile(&self) -> Option<&LinuxRuntimeProfile> {
         self.linux_runtime_profile.as_ref()
+    }
+
+    pub fn linux_clock_admission_cached(&self, clock_id: u64) -> bool {
+        linux_clock_admission_bit(clock_id)
+            .is_some_and(|bit| self.linux_clock_admission_mask & bit != 0)
+    }
+
+    /// Records only a successful admission for one of the two immutable Linux
+    /// clock IDs supported by syscalld. Returns false for every unknown ID.
+    pub fn cache_linux_clock_admission(&mut self, clock_id: u64) -> bool {
+        let Some(bit) = linux_clock_admission_bit(clock_id) else {
+            return false;
+        };
+        self.linux_clock_admission_mask |= bit;
+        true
     }
 
     pub fn address_space_and_linux_process_state_mut(
@@ -506,6 +529,7 @@ impl UserProcessState {
             linux_process_state: self.linux_process_state,
             linux_memory_map: self.linux_memory_map.clone(),
             linux_runtime_profile: self.linux_runtime_profile.clone(),
+            linux_clock_admission_mask: 0,
             linux_sigactions: self.linux_sigactions,
             windows_runtime: self.windows_runtime,
             handles: self.handles.clone(),
@@ -715,11 +739,34 @@ fn align_up(value: u64) -> u64 {
     value.saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
 }
 
+fn linux_clock_admission_bit(clock_id: u64) -> Option<u8> {
+    match clock_id {
+        id if id == CLOCK_REALTIME as u64 => Some(LINUX_CLOCK_ADMISSION_REALTIME),
+        id if id == CLOCK_MONOTONIC as u64 => Some(LINUX_CLOCK_ADMISSION_MONOTONIC),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         DEFAULT_DESKTOP_GID, DEFAULT_DESKTOP_UID, PendingAdminRequestKind, ProcessSecurityContext,
+        UserProcessState,
     };
+    use crate::memory::paging::ProcessAddressSpace;
+    use crate::user::linux::{CLOCK_MONOTONIC, CLOCK_REALTIME, LinuxProcessState};
+
+    fn linux_process_state() -> UserProcessState {
+        UserProcessState::new(
+            ProcessAddressSpace::empty_for_tests(),
+            Some(LinuxProcessState::default()),
+            None,
+            None,
+            None,
+            false,
+            "/test.elf",
+        )
+    }
 
     #[test]
     fn non_admin_context_queues_file_access_request() {
@@ -748,5 +795,20 @@ mod tests {
         assert_eq!(admin.gid(), 0);
         assert_eq!(admin.euid(), 0);
         assert_eq!(admin.egid(), 0);
+    }
+
+    #[test]
+    fn linux_clock_admission_cache_is_exact_and_process_local() {
+        let mut state = linux_process_state();
+        assert!(!state.linux_clock_admission_cached(CLOCK_MONOTONIC as u64));
+        assert!(!state.linux_clock_admission_cached(CLOCK_REALTIME as u64));
+        assert!(!state.cache_linux_clock_admission(u64::MAX));
+
+        assert!(state.cache_linux_clock_admission(CLOCK_MONOTONIC as u64));
+        assert!(state.linux_clock_admission_cached(CLOCK_MONOTONIC as u64));
+        assert!(!state.linux_clock_admission_cached(CLOCK_REALTIME as u64));
+
+        let child = state.fork_clone(ProcessAddressSpace::empty_for_tests(), None);
+        assert!(!child.linux_clock_admission_cached(CLOCK_MONOTONIC as u64));
     }
 }

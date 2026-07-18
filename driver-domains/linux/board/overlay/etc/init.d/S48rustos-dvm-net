@@ -105,7 +105,7 @@ load_display_drivers() {
 }
 
 start_relays() {
-    mkdir -p "$run_dir"
+    mkdir -p "$run_dir" && chmod 0700 "$run_dir" || return 1
     # The Ethernet relay is independent. The display relay is admitted only
     # after the fixed-header MSI-X adapter is bound; generic UIO/INTx is not a
     # compatibility path because it cannot receive ivshmem doorbells. Do not

@@ -36,10 +36,6 @@ int rustos_gpu_runtime_open(int drm_fd, uint32_t output_width, uint32_t output_h
                             struct rustos_gpu_runtime **runtime_out);
 int rustos_gpu_runtime_render_prime(struct rustos_gpu_runtime *runtime,
                                     struct rustos_gpu_frame *frame);
-int rustos_gpu_runtime_render_legacy(struct rustos_gpu_runtime *runtime,
-                                     const uint8_t *pixels, uint32_t width,
-                                     uint32_t height, uint32_t stride_bytes,
-                                     struct rustos_gpu_frame *frame);
 int rustos_gpu_runtime_render_batch(struct rustos_gpu_runtime *runtime,
                                     const uint8_t *atlas_pixels, size_t atlas_bytes,
                                     const struct rustos_gpu_damage *damage,

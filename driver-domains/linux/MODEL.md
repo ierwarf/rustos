@@ -86,8 +86,12 @@ grant RustOS host authority.
 - DVM-local devices may use standard Linux virtio drivers, but they are not a
   RustOS guest-to-guest data plane.
 - The immutable `control-plane-v1.env` contract is carried in the DVM image,
-  hashed into its artifact manifest, and written by the agent to
-  `/run/rustos-dvm/ready`. In `state=control`, the agent connects only to the
+  hashed into its artifact manifest, and written by the initialized serving
+  agent to a complete locked inode before it is atomically installed at
+  `/run/rustos-dvm/ready`. The agent retains the inode lock for its lifetime;
+  local health validates the exact payload and metadata and rejects stale or
+  unlocked state after every exit path. The diagnostic `announce` command does
+  not publish readiness. In `state=control`, the agent connects only to the
   L0 host's KVM-vsock listener using its launch-assigned CID.
 - L0 validates the source CID and complete DVM contract, then sends a fresh
   challenge. The agent must return `dvm-agent-hmac-sha256-v1`, an HMAC-SHA256
@@ -170,8 +174,10 @@ hide behind the transient retained-scene wait.
 In QEMU, changed atlas rectangles take one explicit staged upload into the
 virtio-GPU texture and evidence is labelled `source-path=staged-copy
 zero-copy=0`. On physical AMD, the same logical source is a read-only DMA-BUF
-import labelled `source-path=dmabuf zero-copy=1`. The first path can prove real
-GPU composition but never physical zero copy. Atlas reuse follows the GPU
+import labelled `source-path=dmabuf zero-copy=1` only after the currently
+failed physical implementation and hardware-evidence gates are closed; the
+present source does not claim that path. The first path can prove real GPU
+composition but never physical zero copy. Atlas reuse follows the GPU
 completion fence; old output reuse follows the later KMS page-flip fence.
 Ring0 validates fixed records and slot epochs only; scene policy, packing, and
 fallback rejection remain in `uiserver`, while GLES/KMS execution remains in
@@ -185,6 +191,14 @@ at most 12 ms average GPU/atomic work, and at most 16.667 ms maximum GPU render
 time. Per-frame serial tracing is rate-limited and is not the acceptance
 counter. This matches DRM's explicit in/out-fence ordering; it does not convert
 QEMU staged copy into physical zero copy.
+
+DVM-local display health is process-owned rather than file-presence based. A
+singleton lock rejects a second relay; after a confirmed peer and completed GPU
+frame, the relay writes and fsyncs the exact state on one locked candidate inode
+and atomically installs it as `display-ready.lock`. The agent accepts the state
+only while that inode remains locked. Ordinary failure closes the ready lock
+before scheduler restoration, while process exit and the RT hard limit release
+all locks. The fixed candidate name bounds pre-rename crash residue.
 
 The private compositor uses a cumulative 16 ms submission cadence when no
 provider vblank clock is exported. Input continues to coalesce while an early

@@ -56,11 +56,26 @@ the hash-bound `agent-v1-control` handshake. Optional exercise flags prove the
 authenticated DVM input relay and bidirectional display/network shared-memory
 rings; startup alone is not success.
 
+`--gui-dvm-surfaces` now means the V3 control/pixel backing plus the private
+three-slot GPU atlas transport. In QEMU it proves only
+`source-path=staged-copy zero-copy=0` fixed-command GPU composition. It cannot
+claim physical DMA-BUF import or direct scanout, and no retired CPU-frame or
+zero-atlas relay is accepted as a fallback.
+
 `--min-ui-fps <fps>` patches only the private KVM disk to enable uiserver and
 WayClick profiles. It requires consecutive render/input windows, balanced
 WayClick commit/frame-callback/buffer-release windows with bounded callback
 gaps, and the requested DVM relay windows when GUI-DVM surfaces are enabled.
-It does not lower or infer one result from another.
+It does not lower or infer one result from another. A timeout reports the
+observed WayClick window count, commit/callback rate range, largest callback
+gap, and largest redraw time directly in the error so diagnosis does not
+require dumping the whole debug log. The observation includes non-one-second
+startup windows; use their elapsed time to distinguish provider admission delay
+from steady-state throughput rather than silently discarding either.
+When the private GPU proof is enabled, readiness also requires the exact
+priority-8 scheduler admission, 50/100 ms continuous-CPU limits, hard-limit
+termination action, and observed restoration to normal policy. Missing or
+forged scheduler fields fail the gate.
 
 <a id="korean"></a>
 
@@ -106,8 +121,21 @@ hash-bound `agent-v1-control` handshake를 요구합니다. exercise option은 �
 DVM input relay와 양방향 display/network shared-memory ring을 검증하며, 단순히
 guest가 시작된 것만으로는 통과하지 않습니다.
 
+`--gui-dvm-surfaces`는 V3 control/pixel backing과 private 3-slot GPU atlas
+transport를 뜻합니다. QEMU에서는 `source-path=staged-copy zero-copy=0`인
+fixed-command GPU composition만 증명합니다. 물리 DMA-BUF import나 direct
+scanout 증거로 간주하지 않으며, 폐기한 CPU-frame/zero-atlas relay를 fallback으로
+허용하지 않습니다.
+
 `--min-ui-fps <fps>`는 private KVM disk에서만 uiserver와 WayClick profile을
 활성화합니다. 연속 render/input window, callback gap이 제한되고 commit/
 frame-callback/buffer-release가 균형을 이룬 WayClick window, GUI-DVM surface를
 사용할 때 요청된 DVM relay window를 각각 요구합니다. 한 경로의 수치로
-다른 경로의 실패를 대신 통과시키지 않습니다.
+다른 경로의 실패를 대신 통과시키지 않습니다. timeout 오류에는 관측된
+WayClick window 수, commit/callback rate 범위, 최대 callback gap과 최대
+redraw 시간이 함께 표시됩니다. 이 관측에는 1초가 아닌 startup window도
+포함되므로 elapsed time으로 provider admission 지연과 steady-state 성능을
+구분하며, 어느 쪽도 숨기지 않습니다.
+private GPU proof가 켜진 경우 priority 8 admission, 50/100 ms 연속 CPU 제한,
+hard-limit 프로세스 종료 동작, normal policy 복귀 확인도 정확히 일치해야
+readiness가 통과합니다. scheduler 필드가 없거나 위조되면 실패합니다.

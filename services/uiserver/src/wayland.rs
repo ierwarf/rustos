@@ -276,7 +276,9 @@ impl WaylandCompositor {
         self.state.take_dirty()
     }
 
-    pub(crate) fn frame_presented(&mut self) {
+    /// Consume one compositor-issued frame permit by releasing copied SHM
+    /// buffers and sending the pending one-shot callbacks.
+    pub(crate) fn consume_frame_callback_permit(&mut self) {
         self.state.send_frame_callbacks();
         self.flush_clients();
     }
@@ -677,6 +679,10 @@ struct WaylandState {
     callback_profile_count: u64,
     callback_profile_wait_micros: u64,
     callback_profile_max_wait_micros: u64,
+    buffer_copy_profile_count: u64,
+    buffer_copy_profile_bytes: u64,
+    buffer_copy_profile_micros: u64,
+    buffer_copy_profile_max_micros: u64,
 }
 
 impl WaylandState {
@@ -701,6 +707,10 @@ impl WaylandState {
             callback_profile_count: 0,
             callback_profile_wait_micros: 0,
             callback_profile_max_wait_micros: 0,
+            buffer_copy_profile_count: 0,
+            buffer_copy_profile_bytes: 0,
+            buffer_copy_profile_micros: 0,
+            buffer_copy_profile_max_micros: 0,
         }
     }
 
@@ -823,6 +833,16 @@ impl WaylandState {
         u32::try_from(millis.min(u128::from(u32::MAX))).unwrap_or(u32::MAX)
     }
 
+    fn record_buffer_copy(&mut self, elapsed: Duration, bytes: usize) {
+        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        self.buffer_copy_profile_count = self.buffer_copy_profile_count.saturating_add(1);
+        self.buffer_copy_profile_bytes = self
+            .buffer_copy_profile_bytes
+            .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+        self.buffer_copy_profile_micros = self.buffer_copy_profile_micros.saturating_add(micros);
+        self.buffer_copy_profile_max_micros = self.buffer_copy_profile_max_micros.max(micros);
+    }
+
     fn send_frame_callbacks(&mut self) {
         let time = self.event_time_ms();
         for surface in &self.surfaces {
@@ -867,18 +887,26 @@ impl WaylandState {
                 .unwrap_or(u64::MAX)
                 .max(1);
             crate::sys::profile_line(&format!(
-                "uiserver wayland callback profile: elapsed_ms={} callback_hz_milli={} avg_wait_ms={} max_wait_ms={}",
+                "uiserver wayland callback profile: elapsed_ms={} callback_hz_milli={} avg_wait_ms={} max_wait_ms={} shm_copies={} shm_copy_bytes={} shm_copy_avg_us={} shm_copy_max_us={}",
                 elapsed_micros / 1_000,
                 self.callback_profile_count
                     .saturating_mul(1_000_000_000)
                     .saturating_div(elapsed_micros),
                 self.callback_profile_wait_micros / self.callback_profile_count.max(1) / 1_000,
                 self.callback_profile_max_wait_micros / 1_000,
+                self.buffer_copy_profile_count,
+                self.buffer_copy_profile_bytes,
+                self.buffer_copy_profile_micros / self.buffer_copy_profile_count.max(1),
+                self.buffer_copy_profile_max_micros,
             ));
             self.callback_profile_started = Instant::now();
             self.callback_profile_count = 0;
             self.callback_profile_wait_micros = 0;
             self.callback_profile_max_wait_micros = 0;
+            self.buffer_copy_profile_count = 0;
+            self.buffer_copy_profile_bytes = 0;
+            self.buffer_copy_profile_micros = 0;
+            self.buffer_copy_profile_max_micros = 0;
         }
     }
 
@@ -2494,17 +2522,26 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
                     let display_width = state.display_width;
                     let display_height = state.display_height;
                     if has_damage {
+                        let mut completed_copy = None;
                         if let Ok(mut surface) = data.shared.lock() {
                             let width = surface.width;
                             let height = surface.height;
                             let stride_pixels = surface.stride_pixels;
-                            if copy_source.copy_damage_into(
+                            let copy_started = Instant::now();
+                            let copied = copy_source.copy_damage_into(
                                 &mut surface.pixels,
                                 width,
                                 height,
                                 stride_pixels,
                                 committed_damage_rect,
-                            ) {
+                            );
+                            let copy_elapsed = copy_started.elapsed();
+                            if copied {
+                                let copied_bytes = committed_damage_rect
+                                    .width
+                                    .saturating_mul(committed_damage_rect.height)
+                                    .saturating_mul(std::mem::size_of::<u32>());
+                                completed_copy = Some((copy_elapsed, copied_bytes));
                                 surface.current_buffer = Some(copy_source.clone());
                                 surface.last_damage = committed_damage_rect;
                                 surface.content_version =
@@ -2516,11 +2553,20 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
                                 && !mapped
                                 && surface.toplevel.is_some();
                         }
+                        if let Some((elapsed, bytes)) = completed_copy {
+                            state.record_buffer_copy(elapsed, bytes);
+                        }
                     }
                     if !dirty {
+                        let copy_started = Instant::now();
                         let copied = copy_source.copy_pixels();
+                        let copy_elapsed = copy_started.elapsed();
                         if let Ok(mut surface) = data.shared.lock() {
                             if let Some((pixels, width, height, stride_pixels)) = copied {
+                                state.record_buffer_copy(
+                                    copy_elapsed,
+                                    pixels.len().saturating_mul(std::mem::size_of::<u32>()),
+                                );
                                 surface.current_buffer = Some(copy_source);
                                 surface.pixels = pixels;
                                 surface.width = width;

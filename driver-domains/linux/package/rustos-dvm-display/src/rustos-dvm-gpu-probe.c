@@ -17,11 +17,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <gbm.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -73,6 +75,9 @@
 #define GPU_PIPELINE_PRIME_TIMEOUT_US 500000U
 #define GPU_MIN_FPS_MILLI 60000ULL
 #define GPU_HEALTH_INTERVAL_SECONDS 1U
+#define GPU_PROOF_RR_PRIORITY 8
+#define GPU_PROOF_RTTIME_SOFT_US 50000U
+#define GPU_PROOF_RTTIME_HARD_US 100000U
 #ifndef GPU_EVIDENCE
 #define GPU_EVIDENCE "/run/rustos-dvm/gpu-compositor-evidence-v1.env"
 #endif
@@ -158,7 +163,105 @@ struct gpu_executor {
     uint64_t expected_submit;
 };
 
+struct proof_scheduler_guard {
+    int active;
+    int saved_policy;
+    struct sched_param saved_param;
+    struct rlimit saved_rttime;
+};
+
 static volatile sig_atomic_t stop_requested;
+
+static int proof_scheduler_leave(struct proof_scheduler_guard *guard) {
+    struct sched_param observed;
+    struct rlimit observed_rttime;
+    int observed_policy;
+    int saved_errno = 0;
+
+    if (guard == NULL || !guard->active)
+        return 0;
+    if (sched_setscheduler(0, guard->saved_policy, &guard->saved_param) != 0)
+        saved_errno = errno;
+    if (setrlimit(RLIMIT_RTTIME, &guard->saved_rttime) != 0 && saved_errno == 0)
+        saved_errno = errno;
+    guard->active = 0;
+    observed_policy = sched_getscheduler(0);
+    if ((observed_policy != guard->saved_policy || sched_getparam(0, &observed) != 0 ||
+         observed.sched_priority != guard->saved_param.sched_priority ||
+         getrlimit(RLIMIT_RTTIME, &observed_rttime) != 0 ||
+         observed_rttime.rlim_cur != guard->saved_rttime.rlim_cur ||
+         observed_rttime.rlim_max != guard->saved_rttime.rlim_max) &&
+        saved_errno == 0)
+        saved_errno = errno != 0 ? errno : EINVAL;
+    if (saved_errno != 0) {
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Only the bounded, post-prime performance proof receives realtime
+ * scheduling. Its priority remains below the authenticated display and input
+ * relays, and the exact prior normal policy is restored before evidence is
+ * published or the long-lived health loop begins. Exceeding the hard
+ * RLIMIT_RTTIME is deliberately different: Linux terminates the process, the
+ * init owner observes the dead PID, and no readiness evidence can exist.
+ */
+static int proof_scheduler_enter(struct proof_scheduler_guard *guard) {
+    struct rlimit bounded_rttime = {
+        .rlim_cur = GPU_PROOF_RTTIME_SOFT_US,
+        .rlim_max = GPU_PROOF_RTTIME_HARD_US,
+    };
+    struct sched_param realtime = {.sched_priority = GPU_PROOF_RR_PRIORITY};
+    struct sched_param observed;
+    struct rlimit observed_rttime;
+    int observed_policy;
+    int saved_errno;
+
+    if (guard == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(guard, 0, sizeof(*guard));
+    guard->saved_policy = sched_getscheduler(0);
+    if (guard->saved_policy < 0 || sched_getparam(0, &guard->saved_param) != 0 ||
+        getrlimit(RLIMIT_RTTIME, &guard->saved_rttime) != 0)
+        return -1;
+    if (guard->saved_policy != SCHED_OTHER || guard->saved_param.sched_priority != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (setrlimit(RLIMIT_RTTIME, &bounded_rttime) != 0)
+        return -1;
+    if (getrlimit(RLIMIT_RTTIME, &observed_rttime) != 0 ||
+        observed_rttime.rlim_cur != bounded_rttime.rlim_cur ||
+        observed_rttime.rlim_max != bounded_rttime.rlim_max) {
+        saved_errno = errno != 0 ? errno : EINVAL;
+        (void)setrlimit(RLIMIT_RTTIME, &guard->saved_rttime);
+        errno = saved_errno;
+        return -1;
+    }
+    if (sched_setscheduler(0, SCHED_RR, &realtime) != 0) {
+        saved_errno = errno;
+        (void)setrlimit(RLIMIT_RTTIME, &guard->saved_rttime);
+        errno = saved_errno;
+        return -1;
+    }
+    guard->active = 1;
+    observed_policy = sched_getscheduler(0);
+    if (observed_policy != SCHED_RR || sched_getparam(0, &observed) != 0 ||
+        observed.sched_priority != GPU_PROOF_RR_PRIORITY ||
+        getrlimit(RLIMIT_RTTIME, &observed_rttime) != 0 ||
+        observed_rttime.rlim_cur != bounded_rttime.rlim_cur ||
+        observed_rttime.rlim_max != bounded_rttime.rlim_max) {
+        saved_errno = errno != 0 ? errno : EINVAL;
+        (void)proof_scheduler_leave(guard);
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
+}
 
 static void request_stop(int signal_number) {
     (void)signal_number;
@@ -1201,6 +1304,10 @@ static int publish_evidence(const struct gpu_executor *executor, uint64_t prime_
         "GPU_PIPELINE_PRIME_US=%llu\nGPU_PIPELINE_PRIME_TIMEOUT_US=%u\n"
         "GPU_COMPLETION_FPS_MILLI=%llu\nGPU_COMPLETION_US_AVG=%llu\n"
         "GPU_COMPLETION_US_MAX=%llu\nWALL_FRAME_US_MAX=%llu\nPERFORMANCE_TARGET_MET=%s\n"
+        "PROOF_SCHEDULER_POLICY=rr\nPROOF_SCHEDULER_PRIORITY=%u\n"
+        "PROOF_RTTIME_SOFT_US=%u\nPROOF_RTTIME_HARD_US=%u\n"
+        "PROOF_RTTIME_HARD_ACTION=terminate\n"
+        "PROOF_SCHEDULER_RESTORED=normal\n"
         "FRAME_HASH_A=%016llx\n"
         "FRAME_HASH_B=%016llx\nFRAME_HASH_STABLE=yes\nFRAME_HASH_DYNAMIC=yes\n"
         "SOURCE_MODE=synthetic-read-only-contract\nPUBLIC_USERSPACE_ABI=no\n"
@@ -1209,6 +1316,7 @@ static int publish_evidence(const struct gpu_executor *executor, uint64_t prime_
         GPU_PIPELINE_PRIME_TIMEOUT_US, (unsigned long long)fps_milli,
         (unsigned long long)average_us, (unsigned long long)maximum_us,
         (unsigned long long)wall_maximum_us, performance_target_met ? "yes" : "no",
+        GPU_PROOF_RR_PRIORITY, GPU_PROOF_RTTIME_SOFT_US, GPU_PROOF_RTTIME_HARD_US,
         (unsigned long long)frame_hash_a,
         (unsigned long long)frame_hash_b);
     if (length <= 0 || (size_t)length >= sizeof(evidence)) {
@@ -1323,6 +1431,7 @@ static int run_initial_proof(struct gpu_executor *executor, uint64_t *fps_milli,
 
 static int serve(void) {
     struct gpu_executor executor;
+    struct proof_scheduler_guard proof_scheduler = {0};
     uint8_t batch[GPU_HEADER_BYTES + GPU_SOURCE_BYTES + 3U * GPU_COMMAND_BYTES];
     uint64_t fps_milli;
     uint64_t prime_started_ns;
@@ -1363,11 +1472,30 @@ static int serve(void) {
         unlink(GPU_PRIME_EVIDENCE);
         return -1;
     }
+    if (proof_scheduler_enter(&proof_scheduler) != 0) {
+        fprintf(stderr,
+                "rustos-dvm-gpu: proof scheduler unavailable policy=rr priority=%u errno=%d\n",
+                GPU_PROOF_RR_PRIORITY, errno);
+        close_executor(&executor);
+        unlink(GPU_PRIME_EVIDENCE);
+        return -1;
+    }
     if (run_initial_proof(&executor, &fps_milli, &average_us, &maximum_us,
                           &wall_maximum_us, &frame_hash_a, &frame_hash_b,
                           &performance_target_met) != 0) {
+        int saved = errno == 0 ? EIO : errno;
+        if (proof_scheduler_leave(&proof_scheduler) != 0)
+            fprintf(stderr, "rustos-dvm-gpu: proof scheduler restore failed errno=%d\n", errno);
         fprintf(stderr, "rustos-dvm-gpu: proof failed driver=%s renderer=%s errno=%d\n",
-                executor.driver, executor.renderer, errno);
+                executor.driver, executor.renderer, saved);
+        close_executor(&executor);
+        unlink(GPU_EVIDENCE);
+        unlink(GPU_PRIME_EVIDENCE);
+        errno = saved;
+        return -1;
+    }
+    if (proof_scheduler_leave(&proof_scheduler) != 0) {
+        fprintf(stderr, "rustos-dvm-gpu: proof scheduler restore failed errno=%d\n", errno);
         close_executor(&executor);
         unlink(GPU_EVIDENCE);
         unlink(GPU_PRIME_EVIDENCE);
@@ -1387,6 +1515,9 @@ static int serve(void) {
             "gpu-fence=1 acquire-fence=1 prime_us=%llu frames=%u fps_milli=%llu "
             "avg_us=%llu max_us=%llu wall_max_us=%llu frame_hash_a=%016llx "
             "frame_hash_b=%016llx hash-stable=1 hash-dynamic=1 negative=5 software=0 "
+            "scheduler=rr priority=%u rttime-soft-us=%u rttime-hard-us=%u "
+            "rttime-hard-action=terminate "
+            "scheduler-restored=normal "
             "performance-target=%d hardware=amd scope-public-abi=0 scope-ui-connected=0 "
             "scope-scanout=0\n",
             executor.driver, executor.renderer, (unsigned long long)((prime_ns + 999U) / 1000U),
@@ -1394,6 +1525,7 @@ static int serve(void) {
             (unsigned long long)fps_milli, (unsigned long long)average_us,
             (unsigned long long)maximum_us, (unsigned long long)wall_maximum_us,
             (unsigned long long)frame_hash_a, (unsigned long long)frame_hash_b,
+            GPU_PROOF_RR_PRIORITY, GPU_PROOF_RTTIME_SOFT_US, GPU_PROOF_RTTIME_HARD_US,
             performance_target_met);
     while (!stop_requested) {
         sleep(GPU_HEALTH_INTERVAL_SECONDS);

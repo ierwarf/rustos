@@ -53,12 +53,41 @@ fn validate_dvm_gpu_contract(config: &Config) -> Result<()> {
     let source_root = config
         .root_dir
         .join("driver-domains/linux/package/rustos-dvm-display/src");
+    let agent_path = config
+        .root_dir
+        .join("driver-domains/linux/package/rustos-dvm-agent/src/rustos-dvm-agent.c");
     let relay_path = source_root.join("rustos-dvm-display.c");
+    let probe_path = source_root.join("rustos-dvm-gpu-probe.c");
     let module_path = source_root.join("rustos_dvm_ivshmem_uio.c");
+    let runtime_path = source_root.join("rustos-dvm-gpu-runtime.c");
+    let runtime_header_path = source_root.join("rustos-dvm-gpu-runtime.h");
     let relay = fs::read_to_string(&relay_path)
         .with_context(|| format!("read DVM GPU relay contract {}", relay_path.display()))?;
+    let agent = fs::read_to_string(&agent_path)
+        .with_context(|| format!("read DVM agent display contract {}", agent_path.display()))?;
     let module = fs::read_to_string(&module_path)
         .with_context(|| format!("read DVM GPU module contract {}", module_path.display()))?;
+    let probe = fs::read_to_string(&probe_path)
+        .with_context(|| format!("read DVM GPU proof contract {}", probe_path.display()))?;
+    let runtime = fs::read_to_string(&runtime_path)
+        .with_context(|| format!("read DVM GPU runtime contract {}", runtime_path.display()))?;
+    let runtime_header = fs::read_to_string(&runtime_header_path).with_context(|| {
+        format!(
+            "read DVM GPU runtime header contract {}",
+            runtime_header_path.display()
+        )
+    })?;
+    for token in [
+        "\"DISPLAY_RELAY_SCHEMA=2\\n\"",
+        "\"STATE=ready\\n\"",
+        "\"MODE=gpu-compositor-staged-copy\\n\"",
+        "\"ZERO_COPY=0\\n\"",
+        "\"GPU_COMPOSITION=1\\n\"",
+        "\"EXPLICIT_FENCE=1\\n\";",
+    ] {
+        require_contract_token(&relay, &relay_path, token)?;
+        require_contract_token(&agent, &agent_path, token)?;
+    }
     let version = driver_domain_protocol::DVM_GPU_ATLAS_TRANSPORT_VERSION;
     require_contract_token(
         &relay,
@@ -120,6 +149,76 @@ fn validate_dvm_gpu_contract(config: &Config) -> Result<()> {
             &format!("#define {relay_name} {value}U"),
         )?;
     }
+    for token in [
+        "#define GPU_PROOF_RR_PRIORITY 8",
+        "#define GPU_PROOF_RTTIME_SOFT_US 50000U",
+        "#define GPU_PROOF_RTTIME_HARD_US 100000U",
+        "\"PROOF_RTTIME_HARD_ACTION=terminate\\n\"",
+        "\"PROOF_SCHEDULER_RESTORED=normal\\n\"",
+    ] {
+        require_contract_token(&probe, &probe_path, token)?;
+    }
+    for (contents, path) in [
+        (&relay, &relay_path),
+        (&probe, &probe_path),
+        (&agent, &agent_path),
+    ] {
+        require_contract_token(
+            contents,
+            path,
+            "if (guard->saved_policy != SCHED_OTHER || guard->saved_param.sched_priority != 0) {",
+        )?;
+        require_contract_token(
+            contents,
+            path,
+            "observed_rttime.rlim_cur != guard->saved_rttime.rlim_cur ||",
+        )?;
+    }
+    require_contract_token(
+        &relay,
+        &relay_path,
+        "return scheduler.fatal ? DISPLAY_SERVE_FATAL : DISPLAY_SERVE_RETRY;",
+    )?;
+    for token in [
+        "#define RUSTOS_DVM_DISPLAY_OWNER_NAME \"display-owner.lock\"",
+        "#define RUSTOS_DVM_DISPLAY_READY_CANDIDATE \".display-ready.next\"",
+        "owner_fd = claim_display_process_owner();",
+        "renameat(directory_fd, RUSTOS_DVM_DISPLAY_READY_CANDIDATE, directory_fd,",
+    ] {
+        require_contract_token(&relay, &relay_path, token)?;
+    }
+    require_contract_token(
+        &agent,
+        &agent_path,
+        "die(\"input scheduler restore failed\");",
+    )?;
+    for token in [
+        "#define READY_OWNER_NAME \"agent-owner.lock\"",
+        "#define READY_CANDIDATE_NAME \".ready.next\"",
+        "flock(guard->singleton_fd, LOCK_EX | LOCK_NB) != 0) {",
+        "renameat(directory_fd, READY_CANDIDATE_NAME, directory_fd, \"ready\") != 0) {",
+        "return local_health(&contract) ? EXIT_SUCCESS : EXIT_FAILURE;",
+    ] {
+        require_contract_token(&agent, &agent_path, token)?;
+    }
+    for (contents, path, token) in [
+        (&relay, &relay_path, "rustos_gpu_runtime_render_legacy"),
+        (&relay, &relay_path, "open_kms_display"),
+        (&relay, &relay_path, "RUSTOS_DVM_DMABUF_DEVICE"),
+        (&runtime, &runtime_path, "rustos_gpu_runtime_render_legacy"),
+        (
+            &runtime_header,
+            &runtime_header_path,
+            "rustos_gpu_runtime_render_legacy",
+        ),
+        (&relay, &relay_path, "MODE=dmabuf-direct-scanout"),
+        (&agent, &agent_path, "MODE=dmabuf-direct-scanout"),
+        (&agent, &agent_path, "access(READY_FILE"),
+        (&relay, &relay_path, "ftruncate(fd, 0)"),
+        (&relay, &relay_path, "unlink(RUSTOS_DVM_DISPLAY_READY_LOCK)"),
+    ] {
+        reject_contract_token(contents, path, token)?;
+    }
     Ok(())
 }
 
@@ -134,12 +233,25 @@ fn require_contract_token(contents: &str, path: &Path, token: &str) -> Result<()
     Ok(())
 }
 
+fn reject_contract_token(contents: &str, path: &Path, token: &str) -> Result<()> {
+    if contents.contains(token) {
+        bail!(
+            "retired DVM display path returned in {}: found `{}`",
+            path.display(),
+            token
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn check(config: &Config, show_timings: bool) -> Result<()> {
     let mut timings = StepTimings::new(show_timings);
     validate_workspace_layering(&config.root_dir)?;
     timings.mark("layering");
     let manifests = load_manifests(&config.root_dir)?;
     timings.mark("manifests");
+    validate_dvm_gpu_contract(config)?;
+    timings.mark("dvm-gpu-contract");
     ensure_targets(config)?;
     timings.mark("targets");
 
@@ -1160,8 +1272,24 @@ fn canonical_forward_dll_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{canonical_forward_dll_name, parse_def_exports, parse_objdump_imports};
+    use super::{
+        canonical_forward_dll_name, parse_def_exports, parse_objdump_imports, reject_contract_token,
+    };
     use fs_err as fs;
+    use std::path::Path;
+
+    #[test]
+    fn retired_dvm_display_path_guard_fails_closed() {
+        let path = Path::new("rustos-dvm-display.c");
+        assert!(reject_contract_token("active GPU path", path, "render_legacy").is_ok());
+        let error = reject_contract_token("render_legacy", path, "render_legacy")
+            .expect_err("retired renderer must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("retired DVM display path returned")
+        );
+    }
 
     #[test]
     fn parse_objdump_imports_stops_after_import_tables() {

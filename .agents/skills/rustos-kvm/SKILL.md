@@ -41,7 +41,16 @@ This enables uiserver and WayClick profiling only in the private KVM disk.
 Passing requires the same number of consecutive render/input windows, balanced
 WayClick commit/frame-callback/buffer-release windows with a bounded callback
 gap, and DVM runtime/relay windows. Never infer WayClick success from uiserver
-or relay FPS.
+or relay FPS. On failure, use the command's `wayclick-observed` range before
+opening logs; then extract only callback/SHM-copy and relay lines with the
+debug-log skill.
+
+`--gui-dvm-surfaces` proves the V3 shared backing and private GPU-atlas path in
+QEMU. Its accepted relay marker is explicitly
+`source-path=staged-copy zero-copy=0 gpu-composition=1`; it is not physical
+DMA-BUF import or direct scanout evidence. Treat a legacy
+`dmabuf-direct-scanout` marker as rejected, and never restore a CPU-frame
+renderer merely to make the virtual gate pass.
 
 ## Boundaries
 

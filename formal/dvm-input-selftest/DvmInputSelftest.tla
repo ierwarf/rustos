@@ -23,8 +23,12 @@ CONSTANTS MotionCycles, MaxClock
 
 Unopened == "unopened"
 Streaming == "streaming"
+Restoring == "restoring"
+Closed == "closed"
+Terminated == "terminated"
 NormalScheduler == "normal"
 BoundedRoundRobin == "bounded-rr"
+NoScheduler == "no-process"
 
 VARIABLES pointerCapability,
           vectorReady,
@@ -32,6 +36,9 @@ VARIABLES pointerCapability,
           streamState,
           schedulerPolicy,
           rtBudgetBounded,
+          admissionPending,
+          restoreFailed,
+          hardLimitReached,
           keyboardProbes,
           motionCycles,
           pointerPositions,
@@ -42,6 +49,7 @@ VARIABLES pointerCapability,
 
 vars == <<pointerCapability, vectorReady, policyConsumerReady,
           streamState, schedulerPolicy, rtBudgetBounded,
+          admissionPending, restoreFailed, hardLimitReached,
           keyboardProbes, motionCycles,
           pointerPositions, clock, emitPermit, keyboardIngress, pointerIngress>>
 
@@ -52,6 +60,9 @@ Init ==
     /\ streamState = Unopened
     /\ schedulerPolicy = NormalScheduler
     /\ rtBudgetBounded = FALSE
+    /\ admissionPending = FALSE
+    /\ restoreFailed = FALSE
+    /\ hardLimitReached = FALSE
     /\ keyboardProbes = 0
     /\ motionCycles = 0
     /\ pointerPositions = 0
@@ -65,6 +76,7 @@ ArmReceiverVector ==
     /\ vectorReady' = TRUE
     /\ UNCHANGED <<pointerCapability, policyConsumerReady, streamState,
                   schedulerPolicy, rtBudgetBounded,
+                  admissionPending, restoreFailed, hardLimitReached,
                   keyboardProbes, motionCycles, pointerPositions,
                   clock, emitPermit, keyboardIngress, pointerIngress>>
 
@@ -74,6 +86,7 @@ ObservePolicyConsumer ==
     /\ policyConsumerReady' = TRUE
     /\ UNCHANGED <<pointerCapability, vectorReady, streamState,
                   schedulerPolicy, rtBudgetBounded,
+                  admissionPending, restoreFailed, hardLimitReached,
                   keyboardProbes, motionCycles, pointerPositions,
                   clock, emitPermit, keyboardIngress, pointerIngress>>
 
@@ -91,6 +104,7 @@ OpenCompositeStream ==
     /\ emitPermit' = TRUE
     /\ UNCHANGED <<pointerCapability, vectorReady, policyConsumerReady,
                   schedulerPolicy, rtBudgetBounded,
+                  admissionPending, restoreFailed, hardLimitReached,
                   keyboardProbes, motionCycles,
                   pointerPositions, clock, keyboardIngress, pointerIngress>>
 
@@ -98,17 +112,65 @@ OpenCompositeStream ==
 The authenticated input stream receives a low SCHED_RR priority only after a
 strict RLIMIT_RTTIME ceiling is installed and read back. This bounds guest
 scheduling latency while a runaway relay is terminated instead of starving
-KMS or recovery indefinitely.
+KMS or recovery indefinitely. Limit installation and SCHED_RR admission are
+separate because either syscall or readback may fail. A rollback or final
+restore mismatch terminates the agent instead of reconnecting with uncertain
+realtime authority.
 *******************************************************************************)
-AdmitBoundedInputScheduler ==
+InstallInputBudget ==
     /\ streamState = Streaming
     /\ schedulerPolicy = NormalScheduler
     /\ ~rtBudgetBounded
-    /\ schedulerPolicy' = BoundedRoundRobin
+    /\ ~admissionPending
     /\ rtBudgetBounded' = TRUE
+    /\ admissionPending' = TRUE
     /\ UNCHANGED <<pointerCapability, vectorReady, policyConsumerReady,
-                  streamState, keyboardProbes, motionCycles, pointerPositions,
-                  clock, emitPermit, keyboardIngress, pointerIngress>>
+                  streamState, schedulerPolicy, restoreFailed,
+                  hardLimitReached, keyboardProbes, motionCycles,
+                  pointerPositions, clock, emitPermit, keyboardIngress,
+                  pointerIngress>>
+
+AdmitBoundedInputScheduler ==
+    /\ streamState = Streaming
+    /\ schedulerPolicy = NormalScheduler
+    /\ rtBudgetBounded
+    /\ admissionPending
+    /\ schedulerPolicy' = BoundedRoundRobin
+    /\ admissionPending' = FALSE
+    /\ UNCHANGED <<pointerCapability, vectorReady, policyConsumerReady,
+                  streamState, rtBudgetBounded, restoreFailed,
+                  hardLimitReached, keyboardProbes, motionCycles,
+                  pointerPositions, clock, emitPermit, keyboardIngress,
+                  pointerIngress>>
+
+RollbackInputAdmission ==
+    /\ streamState = Streaming
+    /\ schedulerPolicy = NormalScheduler
+    /\ rtBudgetBounded
+    /\ admissionPending
+    /\ streamState' = Closed
+    /\ rtBudgetBounded' = FALSE
+    /\ admissionPending' = FALSE
+    /\ emitPermit' = FALSE
+    /\ UNCHANGED <<pointerCapability, vectorReady, policyConsumerReady,
+                  schedulerPolicy, restoreFailed, hardLimitReached,
+                  keyboardProbes, motionCycles, pointerPositions, clock,
+                  keyboardIngress, pointerIngress>>
+
+FatalInputAdmissionRollback ==
+    /\ streamState = Streaming
+    /\ schedulerPolicy = NormalScheduler
+    /\ rtBudgetBounded
+    /\ admissionPending
+    /\ streamState' = Terminated
+    /\ schedulerPolicy' = NoScheduler
+    /\ rtBudgetBounded' = FALSE
+    /\ admissionPending' = FALSE
+    /\ restoreFailed' = TRUE
+    /\ emitPermit' = FALSE
+    /\ UNCHANGED <<pointerCapability, vectorReady, policyConsumerReady,
+                  hardLimitReached, keyboardProbes, motionCycles,
+                  pointerPositions, clock, keyboardIngress, pointerIngress>>
 
 (*******************************************************************************
 One F12-only probe establishes keyboard ingress.  It is bounded to one
@@ -119,19 +181,22 @@ EmitKeyboardProbe ==
     /\ streamState = Streaming
     /\ schedulerPolicy = BoundedRoundRobin
     /\ rtBudgetBounded
+    /\ ~admissionPending
     /\ keyboardProbes = 0
     /\ motionCycles = 0
     /\ keyboardProbes' = 1
     /\ keyboardIngress' = TRUE
     /\ UNCHANGED <<pointerCapability, vectorReady, policyConsumerReady,
                   streamState, motionCycles,
-                  schedulerPolicy, rtBudgetBounded, pointerPositions, clock,
+                  schedulerPolicy, rtBudgetBounded, admissionPending,
+                  restoreFailed, hardLimitReached, pointerPositions, clock,
                   emitPermit, pointerIngress>>
 
 EmitPointerPosition ==
     /\ streamState = Streaming
     /\ schedulerPolicy = BoundedRoundRobin
     /\ rtBudgetBounded
+    /\ ~admissionPending
     /\ keyboardProbes = 1
     /\ emitPermit
     /\ motionCycles < MotionCycles
@@ -141,34 +206,103 @@ EmitPointerPosition ==
     /\ pointerIngress' = TRUE
     /\ UNCHANGED <<pointerCapability, vectorReady, policyConsumerReady,
                   streamState, keyboardProbes, clock,
-                  schedulerPolicy, rtBudgetBounded, keyboardIngress>>
+                  schedulerPolicy, rtBudgetBounded, admissionPending,
+                  restoreFailed, hardLimitReached, keyboardIngress>>
 
 CadenceTick ==
     /\ streamState = Streaming
+    /\ schedulerPolicy = BoundedRoundRobin
+    /\ rtBudgetBounded
+    /\ ~admissionPending
     /\ ~emitPermit
     /\ clock < MaxClock
     /\ clock' = clock + 1
     /\ emitPermit' = TRUE
     /\ UNCHANGED <<pointerCapability, vectorReady, policyConsumerReady,
                   streamState, keyboardProbes, motionCycles, pointerPositions,
-                  schedulerPolicy, rtBudgetBounded,
+                  schedulerPolicy, rtBudgetBounded, admissionPending,
+                  restoreFailed, hardLimitReached,
                   keyboardIngress, pointerIngress>>
 
+RequestStreamStop ==
+    /\ streamState = Streaming
+    /\ schedulerPolicy = BoundedRoundRobin
+    /\ rtBudgetBounded
+    /\ ~admissionPending
+    /\ streamState' = Restoring
+    /\ emitPermit' = FALSE
+    /\ UNCHANGED <<pointerCapability, vectorReady, policyConsumerReady,
+                  schedulerPolicy, rtBudgetBounded, admissionPending,
+                  restoreFailed, hardLimitReached, keyboardProbes,
+                  motionCycles, pointerPositions, clock, keyboardIngress,
+                  pointerIngress>>
+
+RestoreInputScheduler ==
+    /\ streamState = Restoring
+    /\ schedulerPolicy = BoundedRoundRobin
+    /\ rtBudgetBounded
+    /\ streamState' = Closed
+    /\ schedulerPolicy' = NormalScheduler
+    /\ rtBudgetBounded' = FALSE
+    /\ UNCHANGED <<pointerCapability, vectorReady, policyConsumerReady,
+                  admissionPending, restoreFailed, hardLimitReached,
+                  keyboardProbes, motionCycles, pointerPositions, clock,
+                  emitPermit, keyboardIngress, pointerIngress>>
+
+FatalInputRestore ==
+    /\ streamState = Restoring
+    /\ schedulerPolicy = BoundedRoundRobin
+    /\ rtBudgetBounded
+    /\ streamState' = Terminated
+    /\ schedulerPolicy' = NoScheduler
+    /\ rtBudgetBounded' = FALSE
+    /\ restoreFailed' = TRUE
+    /\ UNCHANGED <<pointerCapability, vectorReady, policyConsumerReady,
+                  admissionPending, hardLimitReached, keyboardProbes,
+                  motionCycles, pointerPositions, clock, emitPermit,
+                  keyboardIngress, pointerIngress>>
+
+HardLimitStop ==
+    /\ streamState = Streaming
+    /\ schedulerPolicy = BoundedRoundRobin
+    /\ rtBudgetBounded
+    /\ streamState' = Terminated
+    /\ schedulerPolicy' = NoScheduler
+    /\ rtBudgetBounded' = FALSE
+    /\ admissionPending' = FALSE
+    /\ hardLimitReached' = TRUE
+    /\ emitPermit' = FALSE
+    /\ UNCHANGED <<pointerCapability, vectorReady, policyConsumerReady,
+                  restoreFailed, keyboardProbes, motionCycles,
+                  pointerPositions, clock, keyboardIngress, pointerIngress>>
+
 Idle == UNCHANGED vars
+
+AdmissionSettlement ==
+    AdmitBoundedInputScheduler \/ RollbackInputAdmission \/
+    FatalInputAdmissionRollback
+RestoreSettlement == RestoreInputScheduler \/ FatalInputRestore
 
 Next ==
     \/ ArmReceiverVector
     \/ ObservePolicyConsumer
     \/ OpenCompositeStream
+    \/ InstallInputBudget
     \/ AdmitBoundedInputScheduler
+    \/ RollbackInputAdmission
+    \/ FatalInputAdmissionRollback
     \/ EmitKeyboardProbe
     \/ EmitPointerPosition
     \/ CadenceTick
+    \/ RequestStreamStop
+    \/ RestoreInputScheduler
+    \/ FatalInputRestore
+    \/ HardLimitStop
     \/ Idle
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(ArmReceiverVector) /\
         WF_vars(ObservePolicyConsumer) /\ WF_vars(OpenCompositeStream) /\
-        WF_vars(AdmitBoundedInputScheduler) /\
+        WF_vars(AdmissionSettlement) /\ WF_vars(RestoreSettlement) /\
         WF_vars(EmitKeyboardProbe) /\ WF_vars(EmitPointerPosition) /\
         WF_vars(CadenceTick)
 
@@ -176,9 +310,12 @@ TypeOK ==
     /\ pointerCapability \in BOOLEAN
     /\ vectorReady \in BOOLEAN
     /\ policyConsumerReady \in BOOLEAN
-    /\ streamState \in {Unopened, Streaming}
-    /\ schedulerPolicy \in {NormalScheduler, BoundedRoundRobin}
+    /\ streamState \in {Unopened, Streaming, Restoring, Closed, Terminated}
+    /\ schedulerPolicy \in {NormalScheduler, BoundedRoundRobin, NoScheduler}
     /\ rtBudgetBounded \in BOOLEAN
+    /\ admissionPending \in BOOLEAN
+    /\ restoreFailed \in BOOLEAN
+    /\ hardLimitReached \in BOOLEAN
     /\ keyboardProbes \in 0..1
     /\ motionCycles \in 0..MotionCycles
     /\ pointerPositions \in 0..MotionCycles
@@ -207,9 +344,41 @@ PointerMotionRequiresTheOneKeyboardProof ==
         /\ keyboardIngress
 
 InputEmissionRequiresBoundedScheduler ==
-    keyboardProbes > 0 \/ motionCycles > 0 =>
+    streamState = Streaming /\ (keyboardProbes > 0 \/ motionCycles > 0) =>
         /\ schedulerPolicy = BoundedRoundRobin
         /\ rtBudgetBounded
+        /\ ~admissionPending
+
+PartialAdmissionCannotEmit ==
+    admissionPending =>
+        /\ streamState = Streaming
+        /\ schedulerPolicy = NormalScheduler
+        /\ rtBudgetBounded
+        /\ keyboardProbes = 0
+        /\ motionCycles = 0
+
+RestoringStreamCannotEmit ==
+    streamState = Restoring =>
+        /\ schedulerPolicy = BoundedRoundRobin
+        /\ rtBudgetBounded
+        /\ ~emitPermit
+
+TerminalSchedulerStateHasNoAuthority ==
+    streamState = Terminated =>
+        /\ schedulerPolicy = NoScheduler
+        /\ ~rtBudgetBounded
+        /\ ~admissionPending
+        /\ ~emitPermit
+
+RestoreFailureIsTerminal == restoreFailed => streamState = Terminated
+
+HardLimitIsTerminal == hardLimitReached => streamState = Terminated
+
+EveryStreamStopSettles ==
+    [](streamState = Restoring => <>
+        ((streamState = Closed /\ schedulerPolicy = NormalScheduler /\
+          ~rtBudgetBounded) \/
+         (streamState = Terminated /\ restoreFailed)))
 
 CompletedMotionEventuallyProvesBothRoutes ==
     motionCycles = MotionCycles => <>(keyboardIngress /\ pointerIngress)

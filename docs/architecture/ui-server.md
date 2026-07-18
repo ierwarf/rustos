@@ -77,6 +77,31 @@ The current bounded KVM proof keeps the contract honest: uiserver and the DVM
 relay can remain near the refresh rate while WayClick misses the 55 FPS gate on
 the service-owned AF_UNIX transport. That is an OS transport/scheduling
 performance failure, not permission to add a client-specific compositor path.
+uiserver therefore performs one coalesced present after input, Wayland, and
+runtime damage collection; the retired cursor-only early-present lane must not
+return. A successful real presentation grants one non-accumulating callback
+permit that is consumed before the next present, giving a standard client time
+to draw for the next refresh. Callback-only commits use a separate 16 ms
+cadence, so an invisible or backpressured client cannot create an unbounded
+loop. The rebuilt artifact's final signed capture had one 4.961-second startup
+window, then 20 settled one-second windows at 33.348--45.705 FPS with normally
+1--5 ms compositor callback wait and 0.488--2.074 ms average full-frame
+`wl_shm` copy time. Provider revoke, context loss, and `display not available`
+did not recur, but neither the startup delay nor the steady throughput passes
+its release gate.
+
+The remaining fault is in the OS userspace event/readiness boundary. The
+upstream Wayland server contract exposes one aggregate `poll_fd()` that a
+compositor must monitor before dispatching readable clients. uiserver instead
+dispatches nonblocking and, when idle, waits only for input or a deadline capped
+at 16 ms. RustOS's current Linux `epoll_wait` path also ignores the timeout and
+performs one vfsd readiness query. Correcting this is a general cross-provider
+wait-set ABI, not a local WayClick fix: timeout and lost-wake closure, fd
+lifetime, peer close, descriptor/credential transfer, bounded data rings, and
+revoke recovery must be one capability contract. Its scope is deliberately
+left as a failed next-ABI gate. Fuchsia's peered IOBuffer is a useful
+commercial-OS reference for the object shape, not an ABI to copy verbatim:
+<https://fuchsia.dev/fuchsia-src/reference/kernel_objects/io_buffer>.
 
 ### Console Hosting
 
@@ -164,6 +189,26 @@ callback마다 대표 redraw를 더 요청할 뿐 protocol이나 GPU 전용 app 
 유지해도 WayClick의 55 FPS gate가 실패하는 것은 AF_UNIX transport와
 scheduler의 OS 성능 실패로 기록하며, client 전용 우회로를 만들 근거로
 삼지 않습니다.
+uiserver는 input, Wayland, runtime damage를 모은 뒤 한 번만 present하며,
+폐기한 cursor-only early-present 경로를 다시 두지 않습니다. 실제 present
+성공은 누적되지 않는 callback permit 하나를 만들고, 다음 present 전에
+소비해 client가 다음 refresh용 frame을 미리 그릴 시간을 줍니다.
+callback-only commit은 별도 16 ms cadence를 사용합니다. 재빌드한 artifact의
+최종 서명 실행은 4.961초 startup window 하나와, 그 뒤 20개 1초 window에서
+WayClick 33.348--45.705 FPS, 보통 1--5 ms의 compositor callback wait,
+0.488--2.074 ms의 평균 full-frame `wl_shm` copy를 기록했습니다. provider
+revoke, context loss, `display not available`은 재발하지 않았지만 startup
+지연과 정상 운용 55 FPS gate는 모두 실패 상태입니다.
+
+남은 결함은 OS userspace event/readiness 경계입니다. upstream Wayland
+server는 compositor가 aggregate `poll_fd()`를 감시하고 readable일 때
+client를 dispatch할 것을 요구합니다. 현재 uiserver는 nonblocking dispatch
+후 input 또는 최대 16 ms deadline만 기다리고, RustOS Linux `epoll_wait`는
+timeout을 사용하지 않은 채 vfsd readiness query 한 번만 수행합니다.
+올바른 수정은 timeout/lost-wake, fd lifetime, peer close,
+descriptor/credential transfer, bounded data ring, revoke recovery를 함께
+다루는 범용 cross-provider wait-set ABI입니다. 범위가 크므로 WayClick 전용
+우회로를 만들지 않고 실패한 next-ABI gate로 남깁니다.
 
 ### Console hosting
 

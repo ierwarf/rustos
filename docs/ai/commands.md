@@ -120,14 +120,15 @@ fallback.
   RELEASE until the host ACK. The second reverse vector revokes availability;
   restart clears confirmation and a saturated pool re-invites its newest READY
   slot. The module exports each page-aligned slot as a DMA-BUF whose device
-  mapping is read-only; the relay imports all three slots directly as KMS
-  framebuffers. It performs no relay CPU copy, keeps the current front pinned,
-  and releases only the previous front after the replacement page-flip event.
-  V2, polling, synchronous `DirtyFB`, and a native-GPU fallback are rejected.
-  Linux 6.12 `virtio_gpu` rejects foreign SG-table DMA-BUF imports, so the
-  direct-scanout FPS gate cannot pass on the standard virtual KVM GPU. It must
-  run with an assigned physical i915, xe, amdgpu, or pinned NVIDIA-open
-  `nvidia-drm` device; there is no CPU-copy validation fallback. The NVIDIA
+  mapping is read-only. The module retains a DMA-BUF exporter, but the current
+  GPU-command relay does not import those GUI surface slots: the former branch
+  was unreachable under the mandatory nonzero V3 atlas header and has been
+  retired. QEMU validates staged atlas upload plus fixed GLES composition and
+  must report `source-path=staged-copy zero-copy=0`. Physical AMD read-only
+  atlas import and direct scanout require a new explicit authenticated relay
+  mode and are failed gates; this KVM command must not bind a physical GPU or
+  claim their evidence. V2, polling, synchronous `DirtyFB`, a CPU-frame
+  renderer, and a native-GPU fallback are rejected. The NVIDIA
   package admits only the exact 580.173.02 open-module/GSP pair and excludes
   UVM/CUDA; redistribution authorization remains a separate release gate.
   This KVM command does not imply physical GPU passthrough; the separate signed
@@ -161,7 +162,10 @@ fallback.
   uiserver render/input health, balanced WayClick commit/frame-callback/
   buffer-release progress with at most a 50 ms callback gap, and, when enabled,
   DVM runtime plus atomic-page-flip relay throughput. One subsystem passing
-  cannot mask another subsystem's failure.
+  cannot mask another subsystem's failure. Timeout diagnostics include the
+  observed WayClick rate range, callback gap, and redraw maximum before the
+  focused log paths. The range includes non-one-second startup windows; compare
+  their elapsed time with later one-second windows before attributing a stall.
 
 ## L0 VFIO lifecycle
 

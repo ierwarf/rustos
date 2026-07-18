@@ -24,20 +24,23 @@ whole-file reads.
 | Find first panic | `rg -n --max-count=1 'panic\|BUG\|fatal' logs/debugcon.log` |
 | Service startup failures | `rg -n 'service.*(failed\|crashed\|exit)' logs/debugcon.log \| tail -n 30` |
 | Stalls / watchdogs | `rg -n 'stall\|timeout\|deadline' logs/debugcon.log \| tail -n 30` |
-| UI / surface issues | `rg -n 'wayclick profile\|uiserver wayland callback profile\|uiserver profile\|display unavailable\|black frame' build/kvm/rustos-debugcon.log \| tail -n 30` |
+| UI / surface issues | `rg -n 'wayclick profile\|uiserver wayland callback profile\|uiserver profile\|display (not available\|unavailable)\|black frame' build/kvm/rustos-debugcon.log \| tail -n 30` |
 | IPC / broker round-trips | `rg -n 'BROKER\|ipc\|fast.?path' logs/debugcon.log \| tail -n 30` |
 
 For a slow Wayland client, compare three independent rates before editing:
 
-1. WayClick redraw time and commit/callback/release rate.
-2. uiserver callback wait and render/present rate.
-3. DVM atomic-page-flip relay rate.
+1. WayClick redraw time and balanced commit/callback/release rate.
+2. uiserver callback wait plus `shm_copy_avg_us`/`shm_copy_max_us`.
+3. uiserver render/present rate and input/cursor integrity.
+4. DVM atomic-page-flip relay rate and matched fence counts.
 
 Low WayClick redraw time plus low callback/commit rate while uiserver and the
 DVM stay near refresh rate points to OS transport or scheduling, not expensive
-application drawing. A callback without a matching buffer release is a
-different lifetime bug. Treat a `--min-ui-fps` failure as evidence; do not
-average independent good windows into success.
+application drawing. Low compositor callback wait but low client callback rate
+narrows it further to the client/server AF_UNIX data plane. High SHM copy time
+instead points to damage/copy amplification. A callback without a matching
+buffer release is a different lifetime bug. Treat a `--min-ui-fps` failure as
+evidence; do not average independent good windows into success.
 
 ## Reporting
 

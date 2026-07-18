@@ -49,6 +49,7 @@ const UI_INPUT_PULSE_INTERVAL: Duration = Duration::from_millis(40);
 const UI_WATCHDOG_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const UI_PHASE_PANIC_THRESHOLD_MS: u64 = 3_000;
 const WAYLAND_BACKLOG_SERVICE_INTERVAL: Duration = Duration::from_millis(4);
+const WAYLAND_FRAME_CALLBACK_INTERVAL: Duration = Duration::from_millis(16);
 const PARTIAL_RENDER_BUDGET: Duration = Duration::from_millis(8);
 const DISPLAY_BACKPRESSURE_RETRY_DELAY: Duration = Duration::from_millis(1);
 const SLOW_LOOP_THRESHOLD: Duration = Duration::from_millis(50);
@@ -56,11 +57,10 @@ const MAX_SLOW_LOOP_LOGS: usize = 16;
 
 const UI_PHASE_IDLE: usize = 0;
 const UI_PHASE_INPUT: usize = 1;
-const UI_PHASE_INPUT_PRESENT: usize = 2;
-const UI_PHASE_WAYLAND: usize = 3;
-const UI_PHASE_RUNTIME: usize = 4;
-const UI_PHASE_CONSOLE: usize = 5;
-const UI_PHASE_MAIN_PRESENT: usize = 6;
+const UI_PHASE_WAYLAND: usize = 2;
+const UI_PHASE_RUNTIME: usize = 3;
+const UI_PHASE_CONSOLE: usize = 4;
+const UI_PHASE_MAIN_PRESENT: usize = 5;
 
 static FRAME_SAMPLE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SLOW_CONSOLE_REFRESH_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -74,7 +74,6 @@ static SLOW_LOOP_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 #[derive(Default)]
 struct LoopPhaseTimings {
     input: Duration,
-    input_present: Duration,
     wayland: Duration,
     runtime: Duration,
     console: Duration,
@@ -85,13 +84,7 @@ struct LoopPhaseTimings {
 
 impl LoopPhaseTimings {
     fn total_excluding_sleep(&self) -> Duration {
-        self.input
-            + self.input_present
-            + self.wayland
-            + self.runtime
-            + self.console
-            + self.cursor
-            + self.main_present
+        self.input + self.wayland + self.runtime + self.console + self.cursor + self.main_present
     }
 }
 
@@ -172,7 +165,6 @@ fn elapsed_ms_since(started: Instant) -> u64 {
 fn ui_phase_name(phase: usize) -> &'static str {
     match phase {
         UI_PHASE_INPUT => "input",
-        UI_PHASE_INPUT_PRESENT => "input-present",
         UI_PHASE_WAYLAND => "wayland",
         UI_PHASE_RUNTIME => "runtime",
         UI_PHASE_CONSOLE => "console",
@@ -371,7 +363,6 @@ fn present_drawable_update(
 fn commit_rendered_update(
     phase: &str,
     state: &AppState,
-    wayland: &mut Option<WaylandCompositor>,
     pending_update: &mut VisualUpdate,
     deferred_update: VisualUpdate,
     presented_cursor_x: &mut u32,
@@ -380,9 +371,6 @@ fn commit_rendered_update(
     cursor_moves_window: &mut u64,
 ) {
     *frames_rendered_window = frames_rendered_window.saturating_add(1);
-    if let Some(compositor) = wayland.as_mut() {
-        compositor.frame_presented();
-    }
     let previous_presented_cursor_x = *presented_cursor_x;
     let previous_presented_cursor_y = *presented_cursor_y;
     let cursor_moved = previous_presented_cursor_x != state.cursor_x
@@ -678,10 +666,9 @@ fn log_slow_loop_iteration(
         return;
     }
     diag_line(format!(
-        "uiserver: slow loop iter_ms={} input_ms={} input_present_ms={} wayland_ms={} runtime_ms={} console_ms={} cursor_ms={} present_ms={} sleep_ms={} backlog={} console_windows={} wayland_windows={}",
+        "uiserver: slow loop iter_ms={} input_ms={} wayland_ms={} runtime_ms={} console_ms={} cursor_ms={} present_ms={} sleep_ms={} backlog={} console_windows={} wayland_windows={}",
         iteration_elapsed.as_millis(),
         timings.input.as_millis(),
-        timings.input_present.as_millis(),
         timings.wayland.as_millis(),
         timings.runtime.as_millis(),
         timings.console.as_millis(),
@@ -820,6 +807,13 @@ fn run() -> Result<(), i32> {
     let mut next_loop_summary = Instant::now() + UI_HEARTBEAT_INTERVAL;
     let mut next_input_pulse = Instant::now();
     let mut next_wayland_backlog_service = Instant::now();
+    let mut next_wayland_callback_pulse = Instant::now();
+    // The boot frame is a real presentation, so it grants exactly one
+    // non-accumulating Wayland repaint permit. Each later successful present
+    // replenishes it. Consuming the previous permit before the next present
+    // lets clients render in parallel with that present while preventing an
+    // unpaced callback loop when the display is backpressured.
+    let mut wayland_frame_permit = true;
     let mut loop_count = 0_u64;
     let mut total_loop_count = 0_u64;
     let mut frames_rendered_window = 0_u64;
@@ -926,84 +920,8 @@ fn run() -> Result<(), i32> {
         pending_update.absorb(input.visual_update);
         phase_timings.input = input_started.elapsed();
 
-        let input_present_started = Instant::now();
-        let drawable_update = prepare_drawable_update(
-            &state,
-            &pending_update,
-            presented_cursor_x,
-            presented_cursor_y,
-        );
-        log_cursor_pipeline_sample(
-            "input-present-ready",
-            &state,
-            &drawable_update,
-            0,
-            presented_cursor_x,
-            presented_cursor_y,
-            state.cursor_x != presented_cursor_x || state.cursor_y != presented_cursor_y,
-            false,
-        );
-        watchdog.enter(UI_PHASE_INPUT_PRESENT);
-        let rendered_input_update = match phase_result(
-            "input-present",
-            present_drawable_update(&mut state, &drawable_update),
-        )? {
-            PresentUpdateResult::Rendered { deferred_update } => {
-                commit_rendered_update(
-                    "input-present",
-                    &state,
-                    &mut wayland,
-                    &mut pending_update,
-                    deferred_update,
-                    &mut presented_cursor_x,
-                    &mut presented_cursor_y,
-                    &mut frames_rendered_window,
-                    &mut cursor_moves_window,
-                );
-                true
-            }
-            PresentUpdateResult::StaleSurface => {
-                watchdog.leave();
-                pending_update.request_full();
-                continue 'main_loop;
-            }
-            PresentUpdateResult::Backpressured => {
-                watchdog.leave();
-                // Pool saturation does not invalidate the local surface or
-                // its damage. Retain the exact pending update: promoting a
-                // cursor rectangle to a 1600x900 redraw multiplied traffic
-                // and made a transient three-slot flow-control event self-
-                // sustaining. A bounded yield prevents a System-class UI
-                // thread from spinning while the DVM returns a slot.
-                profile::record_backpressure_retry();
-                profile::maybe_emit();
-                thread::sleep(DISPLAY_BACKPRESSURE_RETRY_DELAY);
-                continue 'main_loop;
-            }
-            PresentUpdateResult::Idle => false,
-        };
-        watchdog.leave();
-        phase_timings.input_present = input_present_started.elapsed();
-        if rendered_input_update
-            && input.backlog_remaining
-            && Instant::now() < next_wayland_backlog_service
-        {
-            let iteration_elapsed = iteration_started.elapsed();
-            if iteration_elapsed >= SLOW_LOOP_THRESHOLD {
-                log_slow_loop_iteration(
-                    &state,
-                    iteration_elapsed,
-                    &phase_timings,
-                    input.backlog_remaining,
-                );
-            }
-            profile::maybe_emit();
-            continue 'main_loop;
-        }
-
         let wayland_started = Instant::now();
         let now = wayland_started;
-        let mut wayland_callback_only = false;
         let service_wayland = !input.backlog_remaining || now >= next_wayland_backlog_service;
         watchdog.enter(UI_PHASE_WAYLAND);
         if let Some(compositor) = wayland.as_mut() {
@@ -1020,10 +938,19 @@ fn run() -> Result<(), i32> {
                     pending_update.absorb(update);
                 }
                 let frame_callback_rect = compositor.pending_frame_callback_rect();
-                wayland_callback_only =
-                    pending_update.is_empty() && !frame_callback_rect.is_empty();
-                if wayland_callback_only {
+                let callback_only = pending_update.is_empty() && !frame_callback_rect.is_empty();
+                if callback_only {
                     log_wayland_callback_only(&state, frame_callback_rect);
+                }
+                let callback_now = Instant::now();
+                let callback_only_cadence_permit =
+                    callback_only && callback_now >= next_wayland_callback_pulse;
+                if !frame_callback_rect.is_empty()
+                    && (wayland_frame_permit || callback_only_cadence_permit)
+                {
+                    compositor.consume_frame_callback_permit();
+                    wayland_frame_permit = false;
+                    next_wayland_callback_pulse = callback_now + WAYLAND_FRAME_CALLBACK_INTERVAL;
                 }
                 next_wayland_backlog_service = now + WAYLAND_BACKLOG_SERVICE_INTERVAL;
             } else if input.backlog_remaining {
@@ -1190,7 +1117,6 @@ fn run() -> Result<(), i32> {
                 commit_rendered_update(
                     "main-present",
                     &state,
-                    &mut wayland,
                     &mut pending_update,
                     deferred_update,
                     &mut presented_cursor_x,
@@ -1198,6 +1124,7 @@ fn run() -> Result<(), i32> {
                     &mut frames_rendered_window,
                     &mut cursor_moves_window,
                 );
+                wayland_frame_permit = true;
                 true
             }
             PresentUpdateResult::StaleSurface => {
@@ -1216,11 +1143,6 @@ fn run() -> Result<(), i32> {
         };
         watchdog.leave();
 
-        if !rendered && wayland_callback_only {
-            if let Some(compositor) = wayland.as_mut() {
-                compositor.frame_presented();
-            }
-        }
         phase_timings.main_present = main_present_started.elapsed();
 
         let input_reader = input_events.snapshot();

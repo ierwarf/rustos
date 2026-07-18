@@ -32,6 +32,8 @@
 #define CONTROL_FILE "/usr/share/rustos-dvm/control-plane-v1.env"
 #define READY_DIR "/run/rustos-dvm"
 #define READY_FILE READY_DIR "/ready"
+#define READY_OWNER_NAME "agent-owner.lock"
+#define READY_CANDIDATE_NAME ".ready.next"
 #define DISPLAY_READY_LOCK READY_DIR "/display-ready.lock"
 #define DISPLAY_EVIDENCE_FILE READY_DIR "/display-evidence-v1.env"
 #define CONTROL_PORT_FLOOR 49152U
@@ -79,6 +81,7 @@ enum input_device_kind {
 
 struct input_scheduler_guard {
     int active;
+    int fatal;
     int saved_policy;
     struct sched_param saved_param;
     struct rlimit saved_rttime;
@@ -120,6 +123,7 @@ struct input_selftest {
 };
 
 static int monotonic_time_ns(uint64_t *out);
+static int read_all(int fd, void *buffer, size_t length);
 
 struct control_contract {
     char schema[16];
@@ -128,6 +132,11 @@ struct control_contract {
     char transport[32];
     char authentication[32];
     char capabilities[96];
+};
+
+struct ready_owner_guard {
+    int singleton_fd;
+    int ready_fd;
 };
 
 struct display_evidence_sample {
@@ -151,22 +160,32 @@ static void die(const char *message) {
 }
 
 static int input_scheduler_leave(struct input_scheduler_guard *guard) {
-    int failed = 0;
+    struct sched_param observed_param;
+    struct rlimit observed_rttime;
+    int observed_policy;
     int saved_errno = 0;
 
     if (!guard->active) {
-        return 0;
+        return guard->fatal ? -1 : 0;
     }
     if (sched_setscheduler(0, guard->saved_policy, &guard->saved_param) != 0) {
-        failed = 1;
         saved_errno = errno;
     }
-    if (setrlimit(RLIMIT_RTTIME, &guard->saved_rttime) != 0 && !failed) {
-        failed = 1;
+    if (setrlimit(RLIMIT_RTTIME, &guard->saved_rttime) != 0 && saved_errno == 0) {
         saved_errno = errno;
     }
     guard->active = 0;
-    if (failed) {
+    observed_policy = sched_getscheduler(0);
+    if ((observed_policy != guard->saved_policy || sched_getparam(0, &observed_param) != 0 ||
+         observed_param.sched_priority != guard->saved_param.sched_priority ||
+         getrlimit(RLIMIT_RTTIME, &observed_rttime) != 0 ||
+         observed_rttime.rlim_cur != guard->saved_rttime.rlim_cur ||
+         observed_rttime.rlim_max != guard->saved_rttime.rlim_max) &&
+        saved_errno == 0) {
+        saved_errno = errno != 0 ? errno : EINVAL;
+    }
+    if (saved_errno != 0) {
+        guard->fatal = 1;
         errno = saved_errno;
         return -1;
     }
@@ -186,6 +205,7 @@ static int input_scheduler_enter(struct input_scheduler_guard *guard) {
     };
     struct sched_param realtime = {.sched_priority = INPUT_RELAY_RR_PRIORITY};
     struct sched_param observed;
+    struct rlimit observed_rttime;
     int observed_policy;
     int saved_errno;
 
@@ -195,19 +215,36 @@ static int input_scheduler_enter(struct input_scheduler_guard *guard) {
         getrlimit(RLIMIT_RTTIME, &guard->saved_rttime) != 0) {
         return -1;
     }
+    if (guard->saved_policy != SCHED_OTHER || guard->saved_param.sched_priority != 0) {
+        errno = EINVAL;
+        return -1;
+    }
     if (setrlimit(RLIMIT_RTTIME, &bounded_rttime) != 0) {
+        return -1;
+    }
+    if (getrlimit(RLIMIT_RTTIME, &observed_rttime) != 0 ||
+        observed_rttime.rlim_cur != bounded_rttime.rlim_cur ||
+        observed_rttime.rlim_max != bounded_rttime.rlim_max) {
+        saved_errno = errno != 0 ? errno : EINVAL;
+        if (setrlimit(RLIMIT_RTTIME, &guard->saved_rttime) != 0)
+            guard->fatal = 1;
+        errno = saved_errno;
         return -1;
     }
     if (sched_setscheduler(0, SCHED_RR, &realtime) != 0) {
         saved_errno = errno;
-        (void)setrlimit(RLIMIT_RTTIME, &guard->saved_rttime);
+        if (setrlimit(RLIMIT_RTTIME, &guard->saved_rttime) != 0)
+            guard->fatal = 1;
         errno = saved_errno;
         return -1;
     }
     guard->active = 1;
     observed_policy = sched_getscheduler(0);
     if (observed_policy != SCHED_RR || sched_getparam(0, &observed) != 0 ||
-        observed.sched_priority != INPUT_RELAY_RR_PRIORITY) {
+        observed.sched_priority != INPUT_RELAY_RR_PRIORITY ||
+        getrlimit(RLIMIT_RTTIME, &observed_rttime) != 0 ||
+        observed_rttime.rlim_cur != bounded_rttime.rlim_cur ||
+        observed_rttime.rlim_max != bounded_rttime.rlim_max) {
         saved_errno = errno != 0 ? errno : EINVAL;
         (void)input_scheduler_leave(guard);
         errno = saved_errno;
@@ -519,25 +556,6 @@ static void parse_contract(struct control_contract *contract) {
     }
 }
 
-static void announce(const struct control_contract *contract) {
-    FILE *file;
-    if (mkdir(READY_DIR, 0700) != 0 && errno != EEXIST) {
-        die("create state directory failed");
-    }
-    file = fopen(READY_FILE, "we");
-    if (file == NULL) {
-        die("write ready file failed");
-    }
-    if (fprintf(file,
-                "schema=%s\nrole=linux-driver-domain\nprotocol=%s\nstate=%s\ntransport=%s\n"
-                "authentication=%s\ncapabilities=%s\n",
-                contract->schema, contract->protocol, contract->state, contract->transport,
-                contract->authentication, contract->capabilities) < 0 ||
-        fclose(file) != 0) {
-        die("write ready file failed");
-    }
-}
-
 static int write_all(int fd, const void *buffer, size_t length) {
     const unsigned char *cursor = buffer;
     while (length != 0) {
@@ -556,6 +574,160 @@ static int write_all(int fd, const void *buffer, size_t length) {
         length -= (size_t)written;
     }
     return 0;
+}
+
+static int format_ready_payload(const struct control_contract *contract, char *payload,
+                                size_t capacity, size_t *length) {
+    int formatted = snprintf(payload, capacity,
+                             "schema=%s\nrole=linux-driver-domain\nprotocol=%s\nstate=%s\n"
+                             "transport=%s\nauthentication=%s\ncapabilities=%s\n",
+                             contract->schema, contract->protocol, contract->state,
+                             contract->transport, contract->authentication,
+                             contract->capabilities);
+    if (formatted < 0 || (size_t)formatted >= capacity) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    *length = (size_t)formatted;
+    return 0;
+}
+
+static int open_ready_directory(int create) {
+    struct stat state;
+    int fd;
+
+    if (create && mkdir(READY_DIR, 0700) != 0 && errno != EEXIST) {
+        return -1;
+    }
+    fd = open(READY_DIR, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) {
+        return -1;
+    }
+    if (fstat(fd, &state) != 0 || !S_ISDIR(state.st_mode) || state.st_uid != geteuid() ||
+        (state.st_mode & 0777U) != 0700U) {
+        int saved = errno != 0 ? errno : EPERM;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
+    return fd;
+}
+
+/*
+ * Publish readiness as a locked inode, then atomically install that inode at
+ * READY_FILE. A health reader therefore observes either the old unlocked inode
+ * or the complete new locked inode, never stale contents paired with a new
+ * process's lock. A separate singleton lock bounds crash residue to one fixed
+ * candidate name and prevents concurrent publishers. Both returned
+ * descriptors are intentionally held for the full serve lifetime; Linux
+ * releases their locks on every process-exit path, including SIGKILL and
+ * RLIMIT_RTTIME termination.
+ */
+static int publish_ready(const struct control_contract *contract, struct ready_owner_guard *guard) {
+    char payload[512];
+    struct stat state;
+    size_t payload_length;
+    int directory_fd;
+    int candidate_created = 0;
+    int installed = 0;
+    int saved;
+
+    guard->singleton_fd = -1;
+    guard->ready_fd = -1;
+    if (format_ready_payload(contract, payload, sizeof(payload), &payload_length) != 0) {
+        return -1;
+    }
+    directory_fd = open_ready_directory(1);
+    if (directory_fd < 0) {
+        return -1;
+    }
+    guard->singleton_fd =
+        openat(directory_fd, READY_OWNER_NAME, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (guard->singleton_fd < 0 || fstat(guard->singleton_fd, &state) != 0 ||
+        !S_ISREG(state.st_mode) || state.st_uid != geteuid() ||
+        (state.st_mode & 0777U) != 0600U || state.st_nlink != 1 ||
+        flock(guard->singleton_fd, LOCK_EX | LOCK_NB) != 0) {
+        goto fail;
+    }
+    if (unlinkat(directory_fd, READY_CANDIDATE_NAME, 0) != 0 && errno != ENOENT) {
+        goto fail;
+    }
+    guard->ready_fd = openat(directory_fd, READY_CANDIDATE_NAME,
+                             O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (guard->ready_fd < 0) {
+        goto fail;
+    }
+    candidate_created = 1;
+    if (fstat(guard->ready_fd, &state) != 0 || !S_ISREG(state.st_mode) ||
+        state.st_uid != geteuid() || (state.st_mode & 0777U) != 0600U || state.st_nlink != 1 ||
+        flock(guard->ready_fd, LOCK_EX | LOCK_NB) != 0 ||
+        write_all(guard->ready_fd, payload, payload_length) != 0 || fsync(guard->ready_fd) != 0 ||
+        renameat(directory_fd, READY_CANDIDATE_NAME, directory_fd, "ready") != 0) {
+        goto fail;
+    }
+    candidate_created = 0;
+    installed = 1;
+    if (fsync(directory_fd) != 0) {
+        goto fail;
+    }
+    close(directory_fd);
+    return 0;
+
+fail:
+    saved = errno != 0 ? errno : EIO;
+    if (!installed && candidate_created) {
+        (void)unlinkat(directory_fd, READY_CANDIDATE_NAME, 0);
+    }
+    if (guard->ready_fd >= 0) {
+        close(guard->ready_fd);
+        guard->ready_fd = -1;
+    }
+    if (guard->singleton_fd >= 0) {
+        close(guard->singleton_fd);
+        guard->singleton_fd = -1;
+    }
+    close(directory_fd);
+    errno = saved;
+    return -1;
+}
+
+static int local_health(const struct control_contract *contract) {
+    char expected[512];
+    char observed[512];
+    struct stat state;
+    size_t expected_length;
+    int directory_fd;
+    int ready_fd;
+    int locked;
+    int saved;
+
+    if (format_ready_payload(contract, expected, sizeof(expected), &expected_length) != 0) {
+        return 0;
+    }
+    directory_fd = open_ready_directory(0);
+    if (directory_fd < 0) {
+        return 0;
+    }
+    ready_fd = openat(directory_fd, "ready", O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+    close(directory_fd);
+    if (ready_fd < 0) {
+        return 0;
+    }
+    if (fstat(ready_fd, &state) != 0 || !S_ISREG(state.st_mode) ||
+        state.st_uid != geteuid() || (state.st_mode & 0777U) != 0600U || state.st_nlink != 1 ||
+        state.st_size != (off_t)expected_length ||
+        read_all(ready_fd, observed, expected_length) != 0 ||
+        memcmp(observed, expected, expected_length) != 0) {
+        close(ready_fd);
+        return 0;
+    }
+    locked = flock(ready_fd, LOCK_EX | LOCK_NB);
+    saved = errno;
+    if (locked == 0) {
+        (void)flock(ready_fd, LOCK_UN);
+    }
+    close(ready_fd);
+    return locked != 0 && (saved == EWOULDBLOCK || saved == EAGAIN);
 }
 
 static int read_all(int fd, void *buffer, size_t length) {
@@ -849,7 +1021,12 @@ static int supported_display_driver_is_bound(void) {
 
 static int display_relay_is_ready(void) {
     static const char expected[] =
-        "DISPLAY_RELAY_SCHEMA=1\nSTATE=ready\nMODE=dmabuf-direct-scanout\n";
+        "DISPLAY_RELAY_SCHEMA=2\n"
+        "STATE=ready\n"
+        "MODE=gpu-compositor-staged-copy\n"
+        "ZERO_COPY=0\n"
+        "GPU_COMPOSITION=1\n"
+        "EXPLICIT_FENCE=1\n";
     char state[sizeof(expected)];
     int fd = open(DISPLAY_READY_LOCK, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     ssize_t length;
@@ -1571,6 +1748,8 @@ static int serve_connection(int fd, const struct control_contract *contract,
             } else {
                 struct input_scheduler_guard scheduler;
                 if (input_scheduler_enter(&scheduler) != 0) {
+                    if (scheduler.fatal)
+                        die("input scheduler admission rollback failed");
                     close(keyboard_fd);
                     close(pointer_fd);
                     snprintf(payload, sizeof(payload),
@@ -1584,7 +1763,8 @@ static int serve_connection(int fd, const struct control_contract *contract,
                              "\nkeyboard=event%d\npointer=event%d",
                              id, keyboard_index, pointer_index);
                     if (send_frame(fd, payload) != 0) {
-                        (void)input_scheduler_leave(&scheduler);
+                        if (input_scheduler_leave(&scheduler) != 0)
+                            die("input scheduler restore failed");
                         close(keyboard_fd);
                         close(pointer_fd);
                         return -1;
@@ -1599,7 +1779,8 @@ static int serve_connection(int fd, const struct control_contract *contract,
                          * wakeups during concurrent guest startup. Subsequent
                          * cycles remain rate-limited by the normal poll loop. */
                         if (input_selftest_emit_cycle(selftest) != 0) {
-                            (void)input_scheduler_leave(&scheduler);
+                            if (input_scheduler_leave(&scheduler) != 0)
+                                die("input scheduler restore failed");
                             close(keyboard_fd);
                             close(pointer_fd);
                             return -1;
@@ -1612,9 +1793,7 @@ static int serve_connection(int fd, const struct control_contract *contract,
                     }
                     stream_errno = errno;
                     if (input_scheduler_leave(&scheduler) != 0) {
-                        close(keyboard_fd);
-                        close(pointer_fd);
-                        return -1;
+                        die("input scheduler restore failed");
                     }
                     close(keyboard_fd);
                     close(pointer_fd);
@@ -1661,6 +1840,7 @@ static int connect_host(uint32_t control_port) {
 
 static void serve(const struct control_contract *contract) {
     struct input_selftest selftest;
+    struct ready_owner_guard ready_owner;
     unsigned char secret[CONTROL_SECRET_BYTES];
     uint32_t control_port;
 
@@ -1674,7 +1854,9 @@ static void serve(const struct control_contract *contract) {
     if (input_selftest_start(&selftest) != 0) {
         die("input selftest requested but uinput setup failed");
     }
-    announce(contract);
+    if (publish_ready(contract, &ready_owner) != 0) {
+        die("publish process-owned readiness failed");
+    }
     fprintf(stderr, "rustos-dvm-agent: ready protocol=%s state=%s\n", contract->protocol,
             contract->state);
     fflush(stderr);
@@ -1688,6 +1870,8 @@ static void serve(const struct control_contract *contract) {
         }
         sleep(1);
     }
+    close(ready_owner.ready_fd);
+    close(ready_owner.singleton_fd);
     input_selftest_destroy(&selftest);
 }
 
@@ -1695,12 +1879,12 @@ int main(int argc, char **argv) {
     struct control_contract contract;
     parse_contract(&contract);
     if (argc == 1 || strcmp(argv[1], "announce") == 0) {
-        announce(&contract);
-        printf("rustos-dvm-agent: ready protocol=%s state=%s\n", contract.protocol, contract.state);
+        printf("rustos-dvm-agent: contract protocol=%s state=%s\n", contract.protocol,
+               contract.state);
         return EXIT_SUCCESS;
     }
     if (strcmp(argv[1], "health") == 0) {
-        return access(READY_FILE, R_OK) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+        return local_health(&contract) ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     if (strcmp(argv[1], "serve") == 0) {
         serve(&contract);

@@ -200,8 +200,21 @@ pub fn syscall_linux_clock_gettime(clock_id: u64, timespec_ptr: u64) -> u64 {
     {
         return linux_errno(address_space_error_to_linux_errno(err));
     }
-    if let Err(errno) = request_syscalld_clock_gettime_admission(clock_id) {
-        return linux_errno(errno);
+    let cached = multitask::with_current_user_process_state(|_, _, process_state| {
+        process_state.linux_clock_admission_cached(clock_id)
+    })
+    .unwrap_or(false);
+    if !cached {
+        if let Err(errno) = request_syscalld_clock_gettime_admission(clock_id) {
+            return linux_errno(errno);
+        }
+        let cached = multitask::with_current_user_process_state_mut(|_, _, process_state| {
+            process_state.cache_linux_clock_admission(clock_id)
+        })
+        .unwrap_or(false);
+        if !cached {
+            return linux_errno(LINUX_EINVAL);
+        }
     }
     write_clock_timespec(clock_id, timespec_ptr)
 }

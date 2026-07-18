@@ -149,12 +149,15 @@ control/pixel headers, exposes only WB read-only pixel pages to its relay, and
 rejects writable VMAs. Each immutable slot is also exported as a read-only
 DMA-BUF. Standard DRM PRIME may request a bidirectional import, but the exporter
 maps its scatterlist as `DMA_TO_DEVICE`; device-to-memory mapping is rejected.
-The relay imports those three slots directly as KMS framebuffers, never copies
-pixels into a guest-owned scanout buffer, and keeps the current front slot
-pinned. It validates each release against the
-matching host record before it writes the one outstanding control sequence.
-Its MSI-X leaves only mark pending state in IRQ context; normal context checks
-the exact readiness invitation, confirmation, release generation, and ACK.
+The specification-only physical AMD mode requires the relay to import those
+three slots directly as KMS framebuffers, avoid a guest-owned scanout copy, and
+keep the current front slot pinned. The present runnable relay does not contain
+that DMA-BUF consumer; these are failed implementation and hardware gates, not
+claims about the staged-copy GPU-command path. A future consumer must validate
+each release against the matching host record before it writes the one
+outstanding control sequence. Its MSI-X leaf may only mark pending state in IRQ
+context; normal context must check the exact readiness invitation, confirmation,
+release generation, and ACK.
 Only a completed page-flip fences the replacement front and releases the old
 front; the new front is not reusable until a later fenced flip. An offline
 notification clears readiness confirmation and revokes all slot authority. If a restart finds all
@@ -203,17 +206,36 @@ only after that bounded setup phase; prime time cannot be reported as a
 completed frame. A target miss cannot be relabeled as success, but it also
 cannot manufacture device loss while the bounded fence wait is still live.
 
-The transport has two explicit, non-interchangeable evidence modes. QEMU uses
-`source-path=staged-copy zero-copy=0`: only damaged atlas rectangles are copied
-once into a virtio-GPU texture, after which the fixed GLES commands perform the
-actual composition into a DVM-private output. This is a valid GPU-composition
-test but can never satisfy the physical zero-copy gate. Physical AMD uses
-`source-path=dmabuf zero-copy=1`: the same atlas slot is imported read-only and
-sampled without a CPU or shadow-buffer copy. Direct scanout is a separate
-optimization admitted only for one opaque, untransformed, full-screen source;
-ordinary multi-layer frames still use GPU composition. GPU completion releases
-the atlas read lease. A later KMS page-flip/present fence releases the previous
-front output. Neither completion may be synthesized from command acceptance.
+The transport has two explicit, non-interchangeable evidence modes. QEMU
+implements `source-path=staged-copy zero-copy=0`: only damaged atlas rectangles
+are copied once into a virtio-GPU texture, after which the fixed GLES commands
+perform the actual composition into a DVM-private output. This is a valid
+GPU-composition test but can never satisfy the physical zero-copy gate. The
+physical AMD `source-path=dmabuf zero-copy=1` mode remains a specification and
+failed implementation gate: the module retains the read-only DMA-BUF exporter,
+but the old relay consumer was unreachable because the mandatory V3 atlas
+parser always selected the GPU-command branch. That dead branch and its
+CPU-composed-frame renderer were removed rather than claimed as hardware
+support. A future physical implementation must select an explicit authenticated
+mode and import the same atlas slot read-only; it must not infer a mode from an
+impossible zero-sized atlas or revive the retired renderer. Direct scanout is a
+separate future optimization admitted only for one opaque, untransformed,
+full-screen source; ordinary multi-layer frames still require GPU composition.
+The DVM relay-to-agent readiness lock is schema 2 and names the runnable mode
+exactly as `MODE=gpu-compositor-staged-copy`, `ZERO_COPY=0`,
+`GPU_COMPOSITION=1`, and `EXPLICIT_FENCE=1`. The agent accepts that complete
+payload while the relay holds its lock; the old direct-scanout label is
+rejected. `xtask check` cross-checks both C sources so readiness evidence cannot
+claim a transport that did not run. The display process first owns a singleton
+lock, writes and fsyncs the exact payload on one locked fixed-name candidate,
+and atomically renames that inode to the ready path. Ordinary failure closes
+the ready lock before scheduler restoration; process exit and the RT hard limit
+release all locks. The DVM agent uses the same process-owned pattern for local
+health: its diagnostic `announce` command cannot create readiness, and stale,
+partial, symlinked, malformed, or unlocked state fails closed.
+GPU completion releases the atlas read lease. A later KMS
+page-flip/present fence releases the previous front output. Neither completion
+may be synthesized from command acceptance.
 These ownership rules follow the consumer-owned dequeue/queue/acquire/release
 shape documented by [Android BufferQueue](https://source.android.com/docs/core/graphics/arch-bq-gralloc),
 the shared-buffer constraint/lifetime split used by [Fuchsia Flatland](https://fuchsia.dev/fuchsia-src/concepts/ui/scenic/life_of_a_flatland_image),
@@ -234,19 +256,33 @@ output pixels plus stable/dynamic frame-hash pairs, and keeps a bounded health
 submission active. QEMU uses virgl on an explicitly validated AMD host render
 node in both headless and GTK modes, then requires 120 proof frames at at least
 60 FPS with both GPU completion and wall-clock per-frame intervals no greater
-than 16.667 ms and three fresh health samples. Its scope declaration must say
+than 16.667 ms and three fresh health samples. Pipeline creation remains under
+normal scheduling. Only this finite post-prime measurement may enter Linux
+`SCHED_RR` priority 8, below the display relay at 9 and input relay at 10, with
+an exact 50/100 ms `RLIMIT_RTTIME`. All three DVM realtime guards first require
+`SCHED_OTHER` priority 0, read back the installed RT limit before entering
+`SCHED_RR`, and read back both the saved policy/priority and saved RT limit on
+exit. Success and ordinary GPU-proof failure must complete that restore before
+publishing evidence or entering the health loop. A display/input admission
+rollback or restore mismatch is fatal to the process and cannot enter the
+retry/reconnect loop. Crossing the hard limit also terminates the process. The
+agent and display ready-inode locks are then released automatically; the GPU
+proof publishes no success evidence before verified restoration. Its
+scope declaration must say
 `scope-public-abi=0`, `scope-ui-connected=0`, and `scope-scanout=0`; these are
 explicit limits of this isolated proof, not runtime evidence of an endpoint's
 absence. Functional fixed-command/hash/fence proof and performance acceptance
 are separate: a bounded proof with `performance-target=0` may allow the display
 relay to retain the last valid front, but it cannot satisfy the GPU readiness
 or release gate. Therefore the proof cannot be mistaken for end-to-end RustOS
-UI acceleration. Until the atlas compiler, private submit transport, live
-AppState-to-layer adapter, and GPU-output-to-KMS handoff all pass together, the
-existing CPU framebuffer path remains the active implementation and the GPU UI
-gate remains failed. The app-visible 2D/3D ABI is deliberately the next
-boundary, not part of this private compositor slice. Physical AMD zero-copy
-capture also remains a failed gate rather than a CPU fallback.
+UI acceleration. The pre-scheduler-hardening bounded QEMU artifact proves the atlas compiler,
+private submit transport, live AppState-to-layer adapter, fixed GLES executor,
+and GPU-output-to-KMS handoff together. The relay publishes readiness only
+after a validated command batch completes GPU and present fences; a
+CPU-composed snapshot can no longer activate it. The app-visible 2D/3D ABI is
+deliberately the next boundary, not part of this private compositor slice.
+Physical AMD read-only atlas import, direct scanout, and zero-copy capture remain
+failed gates rather than CPU fallbacks.
 
 The enabled physical release profile is AMDGPU-only. Its signed schema-3 device
 policy binds `amdgpu` plus PCI `1002:1900` and nominal-60-Hz throughput,
@@ -582,8 +618,28 @@ the bounded compatibility loop.
 This removes avoidable copies and waits, but standard AF_UNIX data still makes
 a synchronous compat-to-netd service round trip for every send/receive. The
 current WayClick KVM gate proves that this path does not yet sustain 55 FPS.
-A shared fast data plane would require a separately designed general userspace
-ABI; until that boundary is implemented and reviewed, the 55 FPS gate remains
+After removing uiserver's cursor-only early-present lane and moving frame
+callbacks onto a previous-presentation permit, the signed post-cleanup
+artifact's settled standard-client windows reach 35.894--41.776 FPS,
+compositor callback wait is normally 2--4 ms, and the private GPU proof reaches
+110.389 FPS with 9.057/14.392 ms average/maximum GPU time.
+The remaining limit is therefore not a private rendering API, ordinary
+`wl_shm` copy, or the GPU proof. uiserver currently dispatches Wayland clients
+nonblocking but waits only on input and a deadline capped at 16 ms; its Wayland
+backend aggregate poll fd is not part of that wait. Consequently a client
+commit made immediately after its frame callback cannot wake uiserver and
+waits for the next 16 ms compatibility poll. Linux `epoll_wait` also
+ignores its timeout argument and performs one vfsd query, while netd's
+event-driven wait covers only a single indefinite socket poll. A shared fast
+data/readiness plane requires a separately designed general userspace ABI:
+netd must mint the endpoint capability and own namespace/options policy; the
+data plane needs bounded asymmetric rings, monotonic readiness generations,
+ordered stream/short-I/O semantics, peer-close and shutdown, descriptor and
+credential transfer, fork/dup/exec lifetime, and revoke recovery. Designs such
+as Zircon IOBuffer show why the shared regions, endpoint lifetime, access
+rights, signaling, and peer closure must be one object contract:
+<https://fuchsia.dev/fuchsia-src/reference/kernel_objects/io_buffer>. Until
+that boundary is implemented, modeled, and reviewed, the 55 FPS gate remains
 failed rather than being hidden behind a special WayClick or compositor path.
 
 ## Process Policy Surface (`procd`)

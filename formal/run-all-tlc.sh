@@ -21,6 +21,7 @@ rootd-restart-backoff/RootdRestartBackoff
 post-init-supervisor-recovery/PostInitSupervisorRecovery
 dvm-control-relay/DvmControlRelay
 dvm-control-endpoint/DvmControlEndpoint
+dvm-agent-readiness/DvmAgentReadiness
 dvm-network-ring/DvmNetworkRing
 dvm-network-control/DvmNetworkControl
 dvm-input-revocation/DvmInputRevocation
@@ -30,6 +31,7 @@ input-readiness/InputReadiness
 input-ingestion-worker/InputIngestionWorker
 ui-frame-budget/UiFrameBudget
 wayland-accept-isolation/WaylandAcceptIsolation
+wayland-frame-pacing/WaylandFramePacing
 ui-input-motion/UiInputMotion
 dvm-input-selftest/DvmInputSelftest
 dvm-absolute-pointer/DvmAbsolutePointer
@@ -40,7 +42,9 @@ ivshmem-pairing/IvshmemPairing
 gui-dvm-surface/GuiDvmSurface
 dvm-atomic-scanout/DvmAtomicScanout
 dvm-gpu-compositor/DvmGpuCompositor
+dvm-gpu-proof-scheduler/DvmGpuProofScheduler
 dvm-display-scheduler/DvmDisplayScheduler
+dvm-display-readiness/DvmDisplayReadiness
 dvm-gpu-admission/DvmGpuAdmission
 dvm-gpu-atlas-transport/DvmGpuAtlasTransport
 dvm-commercial-lifecycle/DvmCommercialLifecycle

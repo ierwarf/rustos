@@ -37,6 +37,7 @@ passes TLC.
 | Core dependency or restart sequence starts initd incorrectly | rootd-bootstrap | services/rootd/src/main.rs |
 | A same-CID process lacks the per-launch challenge proof yet gains control authority; a foreign DVM, mismatched reply, stale input epoch, or out-of-order relay frame gains authority | dvm-control-relay | libs/driver-domain-host/src/lib.rs, driver-domains/linux/package/rustos-dvm-agent/src/rustos-dvm-agent.c, kernel/io-manager/src/input/dvm_frames.rs |
 | A same-CID unprivileged process discovers the static control listener and holds its setup slot, delaying the launch agent before HMAC validation | dvm-control-endpoint | libs/driver-domain-host/src/lib.rs, tools/{hostd,xtask}/src, driver-domains/linux/package/rustos-dvm-agent/src/rustos-dvm-agent.c |
+| A dead DVM control agent, stale or malformed ready file, unsafe state directory, partially written candidate, or one-shot announcement is accepted as live local readiness; repeated pre-rename crashes accumulate unbounded candidates | dvm-agent-readiness | driver-domains/linux/package/rustos-dvm-agent/src/rustos-dvm-agent.c and driver-domains/linux/board/overlay/etc/init.d/S50rustos-dvm |
 | A DVM forges an ivshmem counter, malformed receive slot, or post-install header and makes RustOS advance a cursor, exceed a fixed ring bound, or deliver the frame to network policy | dvm-network-ring | libs/driver-domain-protocol/src/lib.rs, kernel/io-manager/src/io/dvm_network.rs, driver-domains/linux/package/rustos-dvm-net/src/rustos-dvm-net.c |
 | A mapped DVM Ethernet aperture remains usable after its authenticated control session ends, a stale end tears down a newer session, or DVM-writable data-plane state creates network authority | dvm-network-control | libs/driver-domain-host/src/lib.rs, kernel/io-manager/src/input/dvm_frames.rs, kernel/io-manager/src/io/dvm_network.rs |
 | A DVM reconnect or disconnect retains old Ctrl/Alt/key/button state, a reset waits behind stale queued input, or a retired epoch injects into the next session | dvm-input-revocation | kernel/io-manager/src/input/dvm_frames.rs, kernel/io-manager/src/input/event_queue.rs, services/inputd/src/main.rs, drivers/libs/keyboard-core/src/lib.rs |
@@ -44,8 +45,9 @@ passes TLC.
 | A DVM-backed scanout/input path, a compromised DVM relay, or a lost presentation/input channel is mistaken for a trusted-attention path and permits a privileged prompt | trusted-ui-boundary | kernel/io-manager/src/io/dvm_display.rs, kernel/io-manager/src/io/gui.rs, libs/rustos-user-abi/src/{device,syscall}.rs, services/uiserver/src/sys.rs |
 | A generic `poll`/`epoll` caller drains the DVM ring, the MSI-X worker transfer is absent from the ownership model, a finite `STATS` reply or authorized direct read loses/replays an event, uiserver waits on ring0 after inputd has moved the only record to service policy, or a missed reader cadence accumulates burst credit | input-readiness | kernel/io-manager/src/input/event_queue.rs, kernel/compat/src/user/syscall/linux/{ipc_ops.rs,service_ops/poll_epoll.rs,service_ops/ipc_helpers.rs}, services/inputd/src/main.rs, services/uiserver/src/input_loop.rs |
 | A recovering console-policy service makes uiserver wait in the input/present loop, a keyboard burst grows an unbounded queue, a queue-full event disappears without telemetry, FIFO delivery is reordered, or a blocked console call prevents local input feedback | ui-frame-budget | services/uiserver/src/{input_loop.rs,main.rs}, services/uiserver/src/app/{input.rs,runtime.rs} |
+| Input and Wayland damage are split across redundant early presentations; a Wayland frame callback runs without a previous real presentation or damage-free cadence permit; missed timer pulses accumulate callback credit; or pending damage/callback work can remain live forever under the declared scheduler/timer fairness assumptions | wayland-frame-pacing | services/uiserver/src/{main.rs,wayland.rs} |
 | A DVM KVM selftest keeps sending accepted relative input after its pointer has clamped at a screen edge, producing a false low-FPS result instead of sustained visual work | ui-input-motion | driver-domains/linux/package/rustos-dvm-agent/src/rustos-dvm-agent.c, services/uiserver/src/{input_loop.rs,main.rs} |
-| A composite DVM selftest device is selected only as a keyboard, silently loses pointer events, emits before bounded guest scheduler admission, grants unbounded RT CPU authority, lets unrelated ready poll fds starve its monotonic cadence, accumulates catch-up bursts, or turns a long motion proof into repeated keyboard/console input | dvm-input-selftest | driver-domains/linux/package/rustos-dvm-agent/src/rustos-dvm-agent.c and tools/xtask/src/kvm.rs |
+| A composite DVM selftest device is selected only as a keyboard, silently loses pointer events, emits during partial scheduler admission, grants unbounded or unverified RT CPU authority, reconnects after an uncertain scheduler/RT-limit restore, lets unrelated ready poll fds starve its monotonic cadence, accumulates catch-up bursts, or turns a long motion proof into repeated keyboard/console input | dvm-input-selftest | driver-domains/linux/package/rustos-dvm-agent/src/rustos-dvm-agent.c and tools/xtask/src/{build/mod.rs,kvm.rs} |
 | A recovering sessiond call holds devmgrd's only receiver, starving unrelated input/device work; or a sessiond ioctl burst grows without bound, silently drops, or reorders work | devmgrd-sessiond-isolation | services/devmgrd/src/main.rs |
 | A topology-only VFIO preflight, unsigned/foreign/expired release authorization, retired durable-lease schema, partial IOMMU-group binding, or mismatched DVM artifact/device policy becomes an active device assignment | vfio-release-authorization | tools/hostd/src/main.rs and libs/driver-domain-host/src/lib.rs |
 | An absent, unopenable, or ioctl-incompatible IOMMUFD or invalid runtime input is discovered only after VFIO binding; a plan omission detaches the L0 boot display or a connected DRM display; a mutable/symlinked launch artifact changes after authorization; a physical display DVM executes before its exact runtime identity is durable, launches without a complete-group reset or non-identity IOMMUFD, reports ready without authenticated control, treats a signaled/nonzero child exit as success, restores a dirty/live device, signals a PID-reused process without an exact pidfd, or enables excluded physical network/block assignment | dvm-commercial-lifecycle | tools/hostd/src/{main.rs,runtime.rs} and libs/driver-domain-host/src/lib.rs |
@@ -55,9 +57,11 @@ passes TLC.
 | Another driver domain reuses a vsock CID, IOMMU group, or PCI function; a fleet policy changes after release binding; or a signed release names a different fleet | driver-domain-fleet | tools/hostd/src/main.rs and libs/driver-domain-host/src/lib.rs |
 | GUI-DVM scheduling races RustOS for ivshmem peer 0, a GUI DVM connects without the pinned RustOS peer, or either peer disconnects and a replacement reuses the stale pair | ivshmem-pairing | libs/driver-domain-host/src/ivshmem.rs and tools/xtask/src/kvm.rs |
 | A GUI-DVM overwrites a host-owned writing/ready surface; concurrent host writers advance the snapshot generation; accepts an odd, forged, stale, or unacknowledged release; loses a pre-module invitation or post-ready confirmation; retains readiness after offline; leaks stale startup slots; fabricates capacity under a saturated pool; reuses stale or different-source pixels for a damage-only snapshot; regresses the displayed generation; or treats an unavailable multi-domain focus authority as valid | gui-dvm-surface and gui-dvm-pixel-authority | tools/xtask/src/kvm.rs, kernel/io-manager/src/io/{dvm_display.rs,gui/backend.rs}, kernel/compat/src/user/{sysops/device.rs,syscall/linux/device_broker_ops.rs}, services/uiserver/src/main.rs, and driver-domains/linux/package/rustos-dvm-display/src/{rustos_dvm_ivshmem_uio.c,rustos-dvm-display.c} |
-| A GUI-DVM grants device-write DMA authority, returns the current direct-scanout slot, releases the old front before its replacement page-flip fence, reuses a stale generation, or retains DMA authority after offline | dvm-atomic-scanout | driver-domains/linux/package/rustos-dvm-display/src/{rustos-dvm-display.c,rustos_dvm_ivshmem_uio.c} |
+| A future physical GUI-DVM grants device-write DMA authority, returns the current direct-scanout slot, releases the old front before its replacement page-flip fence, reuses a stale generation, or retains DMA authority after offline | dvm-atomic-scanout (specification-only failed gate) | `rustos_dvm_ivshmem_uio.c` retains the read-only exporter substrate; the runnable userspace DMA-BUF consumer is intentionally absent until an explicit physical-AMD mode is implemented and verified |
 | A GPU compositor accepts an address, raw command buffer, application shader, unbounded work, fabricated/unmeasured pipeline prime, a prime or completion from a stale context epoch, more than three live submissions, execution before its acquire fence, device-write authority to a RustOS source, CPU fallback as GPU success, or source/output reuse before its release/present fence | dvm-gpu-compositor | libs/driver-domain-protocol/src/lib.rs, services/uiserver/src/{gpu_scene.rs,gpu_runtime.rs}, kernel/io-manager/src/io/dvm_display.rs, driver-domains/linux/package/rustos-dvm-display/src, and tools/xtask/src/{build/mod.rs,kvm.rs} |
-| The display-DVM relay enters realtime scheduling before host authentication, outranks input, runs without a continuous-CPU ceiling, or retains realtime policy after stop/hard-limit | dvm-display-scheduler | driver-domains/linux/package/rustos-dvm-display/src/rustos-dvm-display.c and tools/xtask/src/kvm.rs |
+| The private AMD/virtio GPU proof measures boot-time scheduler starvation as GPU latency; gains priority equal to or above the display/input relays; runs before exact 50/100 ms bound readback; publishes evidence before exact policy/limit restoration; survives a hard-limit or restore failure; or retains realtime authority in its long-lived health loop | dvm-gpu-proof-scheduler | driver-domains/linux/package/rustos-dvm-display/src/rustos-dvm-gpu-probe.c and tools/xtask/src/{build/mod.rs,kvm.rs} |
+| The display-DVM relay installs or enters realtime scheduling before host authentication, starts while admission is partial, outranks input, runs without exact continuous-CPU-bound readback, retries after uncertain policy/limit restoration, or survives a Linux hard-limit/restore failure with relay authority | dvm-display-scheduler | driver-domains/linux/package/rustos-dvm-display/src/rustos-dvm-display.c and tools/xtask/src/{build/mod.rs,kvm.rs} |
+| A duplicate display relay publishes readiness; a partial or stale ready file is accepted; a relay fault retains local health during scheduler restoration; a hard-limit/process exit retains readiness authority; or repeated pre-rename crashes accumulate candidate files | dvm-display-readiness | driver-domains/linux/package/rustos-dvm-display/src/rustos-dvm-display.c, driver-domains/linux/package/rustos-dvm-agent/src/rustos-dvm-agent.c, and tools/xtask/src/{build/mod.rs,kvm.rs} |
 | A late DVM GPU provider blocks the UI thread while allocating its atlas, promotes from a clear-only/unrepresentative or stale prime, promotes before the retained scene/first GPU frame, accepts a short or drifted provider pitch, hides a mandatory DVM path behind software success, or remains indefinitely armed after initialization/revoke | dvm-gpu-admission | services/uiserver/src/{gpu_runtime.rs,gpu_scene.rs,render.rs,sys.rs}, libs/rustos-user-abi/src/device.rs, kernel/{io-manager,ps} display-surface paths, and driver-domains/linux/package/rustos-dvm-display/src |
 | A private UI frame publishes commands without its immutable atlas generation, initializes a new DVM texture from partial/no damage, overlaps damage records, executes texture updates out of submission order, reuses an atlas while the DVM still has read authority, executes a QEMU frame without its staged upload, reports staged copy as zero copy, presents before the GPU fence, reuses the old front before the KMS present fence, or retains source authority across revoke/reset | dvm-gpu-atlas-transport | libs/driver-domain-protocol/src/lib.rs, services/uiserver/src/{gpu_scene.rs,gpu_runtime.rs}, kernel/io-manager/src/io/dvm_display.rs, and driver-domains/linux/package/rustos-dvm-display/src |
 | Concurrent GUI-DVM install calls allocate duplicate MSI-X vectors; malformed/absent BARs retain either mapping; an MSI/provider-registration failure retains mappings; or a revoked GUI transport reopens through a fallback path | gui-dvm-install | kernel/io-manager/src/io/dvm_display.rs |
@@ -164,21 +168,82 @@ correctly rejected rather than counted as an eight-window pass. The final
 five-window gate passed at 64.545, 62.495, 61.757, 63.194, and 62.550 FPS with
 equal page-flip/GPU-fence/present-fence counts of 65/63/62/64/63, zero relay CPU
 copy, and 12.605/12.777/13.495/15.091/12.407 ms maximum GPU render time.
-The separate standard Wayland client proof remains failed: restoring WayClick's
-normal blocking event dispatch and eliminating redundant/fixed-size netd IPC
-raised the observed frame loop from about 1 FPS to 8.8--14.3 FPS in the final
-30-second capture, while uiserver rendered at 53.7--60.8 FPS and the DVM relay
-remained ready. WayClick's own maximum redraw work was 10--38 ms, but callback
-gaps were 98--165 ms. The gate requires three
-consecutive balanced WayClick commit/frame-callback/buffer-release windows at
-55 FPS with at most a 50 ms callback gap; it does not infer client success from
-compositor or relay throughput. Per-call synchronous AF_UNIX service transport
-is still the measured bottleneck. A general shared userspace socket data plane
-is intentionally outside the current private compositor ABI, so this is a
-failed acceptance gate rather than a client-specific shortcut.
+The separate standard Wayland client proof remains failed. Restoring
+WayClick's normal blocking dispatch and compacting netd first raised the loop
+from about 1 FPS to 8.8--14.3 FPS. Caching only successful, immutable
+per-process syscalld admission for `CLOCK_MONOTONIC` then reached 18--23 FPS.
+The latest compositor change removed the retired cursor-only early-present
+lane, coalesces input and Wayland damage into one output turn, and consumes one
+permit from the previous real presentation before the next present. This
+matches the Wayland requirement to give a callback-driven client time to draw
+for the next refresh without creating an unpaced callback loop. Three bounded
+captures reached 35--43 FPS with balanced commit/callback/release counts;
+uiserver callback wait fell from 25--30 ms to normally 1--4 ms. The rebuilt
+schema-8 artifact's final signed 30-second capture separated a 4.961-second
+startup window at 0.403 commit FPS and 0.201 callback FPS from 20 settled
+one-second windows at 33.348--45.705 FPS. The largest settled callback gap was
+83 ms and the largest redraw was 24 ms. Compositor callback wait was normally
+1--5 ms and instrumented full-frame `wl_shm` copies averaged 0.488--2.074 ms,
+so application drawing, ordinary compositor copying, and the GPU are not the
+remaining steady-state limiter. The private DVM GPU proof completed 120 frames
+at 128.705 FPS with 7.769 ms average and 11.075 ms maximum GPU time, while the
+relay retained GPU composition, explicit fences, three scanout buffers, and no
+provider revoke, context loss, compositor-offline, or `display not available`
+marker. The exact 55-FPS command still failed. The gate requires three
+consecutive balanced WayClick windows at 55 FPS with at most a 50 ms callback
+gap and does not combine disjoint compositor, client, or relay windows.
+
+Source inspection isolates the remaining OS userspace event/readiness gap.
+uiserver dispatches Wayland clients nonblocking, but its idle wait listens only
+for input and a deadline capped by the 16 ms runtime cadence; it does not include
+the Wayland backend aggregate poll fd. The Linux compatibility `epoll_wait`
+entry point currently ignores its timeout argument and performs one vfsd
+readiness query. The existing event-driven netd wait covers only one indefinite
+socket poll, while a Wayland display requires an aggregate wait over multiple
+client fds. Closing that gap correctly requires a general capability-bound
+cross-provider wait-set/readiness ABI with timeout and lost-wake semantics, fd
+lifetime across dup/fork/exec, peer close, descriptor and credential transfer,
+bounded data rings, and revoke recovery. That scope is the failed next-ABI gate,
+not permission for a WayClick-specific shortcut.
+
+The relay cleanup also closed a source/model mismatch. The mandatory V3 atlas
+header is nonzero, so the former `serve_display` direct-DMA-BUF branch was
+unreachable, while a separate pre-command renderer could upload a CPU-composed
+GUI snapshot and publish display readiness before any bounded command batch.
+Both routes are removed. `cargo xtask check` now fails if their symbols return,
+matching `NoRawCommandOrCpuSuccess` and the admission requirement that only a
+validated command batch with GPU and present completion can activate the relay.
+The internal relay readiness lock is also schema 2 and reports only the actual
+`gpu-compositor-staged-copy` mode with zero-copy false, GPU composition true,
+and explicit fencing true; the agent and relay payloads are source-cross-checked.
+The kernel module's read-only DMA-BUF exporter remains substrate, not evidence:
+an explicit physical-AMD import mode and its hardware capture are still absent.
 The scope remains private (`scope-public-abi=0`): an application 3D ABI,
 physical read-only DMA-BUF import, zero-copy AMD scanout, and physical VFIO
 fault/reset/revoke evidence remain failed gates.
+
+The signed pre-scheduler-hardening post-cleanup schema-8 artifact was rebuilt
+and rerun for the full 30-second QEMU bound. GPU, display, input, runtime, and DVM-network
+readiness all succeeded. The private proof completed 120 frames at 110.389 FPS
+with 9.057 ms average and 14.392 ms maximum GPU time. The relay activated only
+as `source-path=staged-copy zero-copy=0 gpu-composition=1 explicit-fence=1
+scanout_buffers=3 cpu-final-compose=0`, recorded zero relay CPU copy, and emitted
+no retired direct-import/legacy-renderer, provider-revoke, context-loss,
+compositor-offline, or `display not available` marker. Performance remains a
+failed gate: after the 29.862 FPS startup sample, relay windows were
+50.730--59.105 FPS, while settled balanced WayClick commit/callback/release
+windows were 35.894--41.776 FPS. uiserver itself rendered at 53.789--57.886 FPS
+in those windows and its Wayland callback waits were normally 2--4 ms. The
+remaining deterministic frame loss is the userspace readiness boundary: after
+a callback, the client commit cannot wake uiserver and waits for its next 16 ms
+poll. Closing it requires the separately scoped cross-provider wait-set ABI;
+the result is not accepted as 55/60 FPS success.
+The later scheduler/readiness-hardening artifact passed incremental C
+compilation, schema-8 packaging, signature/artifact verification, and KVM input
+preparation, but was deliberately not booted or rerun for WayClick performance.
+Its fatal rollback/restore branches, process-owned atomic readiness, stale-file
+rejection, and teardown ordering therefore have source, negative guard, and TLC
+evidence only; no runtime fault-injection claim is made.
 Release additionally remains blocked on:
 ELF/PE multi-block corpus fuzz and native launch captures; page-table/TLB tests
 on target hardware; target captures proving the supervised IOMMUFD VFIO

@@ -38,6 +38,11 @@ When the user reports a syscall stall, slowdown, or unexpected IPC churn:
    broker IPC, scheduler hints can reduce wake delay but cannot provide a
    shared data fast path. Record the missing userspace ABI as a failed gate;
    do not add an application-specific ring or move socket policy into ring0.
+   Before calling that ABI a small patch, account for bounded ring ownership,
+   asymmetric mapping rights, readiness generations/lost-wake closure,
+   short-I/O ordering, dup/fork/exec, peer close/shutdown, descriptor and
+   credential transfer, revoke, and recovery. If these cross several owners,
+   stop and report the interface/model scope before implementing it.
 
 ## Common Patterns
 
